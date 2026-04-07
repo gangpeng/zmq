@@ -1,0 +1,139 @@
+# ZMQ Broker — Multi-Broker Cluster with MinIO S3
+#
+# Usage:
+#   docker-compose up -d          # Start 3-broker cluster + MinIO
+#   docker-compose logs -f        # View broker logs
+#   docker-compose down -v        # Stop and clean up
+#
+# Ports:
+#   MinIO S3:         9000  (API), 9001 (Console)
+#   Broker 1:         9092  (Kafka), 9090 (metrics)
+#   Broker 2:         9093  (Kafka), 9091 (metrics)
+#   Broker 3:         9094  (Kafka), 9095 (metrics)
+
+version: '3.8'
+
+services:
+  minio:
+    image: minio/minio:latest
+    container_name: zmq-minio
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    environment:
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD: minioadmin
+    command: server /data --console-address ":9001"
+    volumes:
+      - minio-data:/data
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  # Create the default bucket on startup
+  minio-init:
+    image: minio/mc:latest
+    depends_on:
+      minio:
+        condition: service_healthy
+    entrypoint: >
+      /bin/sh -c "
+      mc alias set local http://minio:9000 minioadmin minioadmin;
+      mc mb local/automq --ignore-existing;
+      echo 'Bucket automq created';
+      "
+
+  broker1:
+    build: .
+    container_name: zmq-broker-1
+    ports:
+      - "9092:9092"
+      - "9090:9090"
+    command: >
+      9092
+      --data-dir /data/automq
+      --s3-endpoint minio
+      --s3-port 9000
+      --s3-bucket automq
+      --metrics-port 9090
+      --node-id 0
+      --cluster-id automq-cluster
+      --voters 0@broker1:9092,1@broker2:9092,2@broker3:9092
+      --advertised-host broker1
+    volumes:
+      - broker1-data:/data/automq
+    depends_on:
+      minio-init:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:9090/health || exit 1"]
+      interval: 10s
+      timeout: 3s
+      start_period: 5s
+      retries: 3
+
+  broker2:
+    build: .
+    container_name: zmq-broker-2
+    ports:
+      - "9093:9092"
+      - "9091:9090"
+    command: >
+      9092
+      --data-dir /data/automq
+      --s3-endpoint minio
+      --s3-port 9000
+      --s3-bucket automq
+      --metrics-port 9090
+      --node-id 1
+      --cluster-id automq-cluster
+      --voters 0@broker1:9092,1@broker2:9092,2@broker3:9092
+      --advertised-host broker2
+    volumes:
+      - broker2-data:/data/automq
+    depends_on:
+      minio-init:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:9090/health || exit 1"]
+      interval: 10s
+      timeout: 3s
+      start_period: 5s
+      retries: 3
+
+  broker3:
+    build: .
+    container_name: zmq-broker-3
+    ports:
+      - "9094:9092"
+      - "9095:9090"
+    command: >
+      9092
+      --data-dir /data/automq
+      --s3-endpoint minio
+      --s3-port 9000
+      --s3-bucket automq
+      --metrics-port 9090
+      --node-id 2
+      --cluster-id automq-cluster
+      --voters 0@broker1:9092,1@broker2:9092,2@broker3:9092
+      --advertised-host broker3
+    volumes:
+      - broker3-data:/data/automq
+    depends_on:
+      minio-init:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:9090/health || exit 1"]
+      interval: 10s
+      timeout: 3s
+      start_period: 5s
+      retries: 3
+
+volumes:
+  minio-data:
+  broker1-data:
+  broker2-data:
+  broker3-data:

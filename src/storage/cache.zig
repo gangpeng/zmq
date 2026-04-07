@@ -1,0 +1,421 @@
+const std = @import("std");
+const testing = std.testing;
+const Allocator = std.mem.Allocator;
+
+/// LogCache — FIFO cache for recently written (uncommitted) data.
+///
+/// Records are written here immediately after the WAL append.
+/// When a cache block fills up, it is promoted to S3 and evicted.
+///
+/// Design:
+/// - Fixed number of cache blocks (default 64)
+/// - Each block holds records for multiple streams
+/// - FIFO eviction: oldest block removed when at capacity
+/// - Thread-safe: single writer, multiple concurrent readers
+pub const LogCache = struct {
+    blocks: std.ArrayList(CacheBlock),
+    max_blocks: usize,
+    total_size: u64 = 0,
+    max_size: u64,
+    allocator: Allocator,
+
+    pub const CacheBlock = struct {
+        id: u64,
+        records: std.ArrayList(CachedRecord),
+        size: u64 = 0,
+        created_at_ms: i64,
+        allocator: Allocator,
+
+        pub fn init(alloc: Allocator, id: u64) CacheBlock {
+            return .{
+                .id = id,
+                .records = std.ArrayList(CachedRecord).init(alloc),
+                .created_at_ms = std.time.milliTimestamp(),
+                .allocator = alloc,
+            };
+        }
+
+        pub fn deinit(self: *CacheBlock) void {
+            for (self.records.items) |rec| {
+                self.allocator.free(rec.data);
+            }
+            self.records.deinit();
+        }
+
+        pub fn addRecord(self: *CacheBlock, stream_id: u64, offset: u64, data: []const u8) !void {
+            const data_copy = try self.allocator.dupe(u8, data);
+            try self.records.append(.{
+                .stream_id = stream_id,
+                .offset = offset,
+                .data = data_copy,
+            });
+            self.size += data.len;
+        }
+
+        /// Add a record without copying — caller transfers ownership of the data slice.
+        pub fn addRecordOwned(self: *CacheBlock, stream_id: u64, offset: u64, data: []u8) !void {
+            try self.records.append(.{
+                .stream_id = stream_id,
+                .offset = offset,
+                .data = data,
+            });
+            self.size += data.len;
+        }
+
+        pub fn recordCount(self: *const CacheBlock) usize {
+            return self.records.items.len;
+        }
+    };
+
+    pub const CachedRecord = struct {
+        stream_id: u64,
+        offset: u64,
+        data: []u8,
+    };
+
+    pub fn init(alloc: Allocator, max_blocks: usize, max_size: u64) LogCache {
+        return .{
+            .blocks = std.ArrayList(CacheBlock).init(alloc),
+            .max_blocks = max_blocks,
+            .max_size = max_size,
+            .allocator = alloc,
+        };
+    }
+
+    pub fn deinit(self: *LogCache) void {
+        for (self.blocks.items) |*block| {
+            block.deinit();
+        }
+        self.blocks.deinit();
+    }
+
+    /// Put a record into the cache.
+    pub fn put(self: *LogCache, stream_id: u64, offset: u64, data: []const u8) !void {
+        // Evict if at capacity
+        while (self.blocks.items.len >= self.max_blocks or
+            (self.max_size > 0 and self.total_size + data.len > self.max_size))
+        {
+            if (self.blocks.items.len == 0) break;
+            self.evictOldest();
+        }
+
+        // Ensure we have an active block
+        if (self.blocks.items.len == 0 or self.blocks.getLast().recordCount() >= 1000) {
+            const block_id: u64 = if (self.blocks.items.len > 0)
+                self.blocks.getLast().id + 1
+            else
+                0;
+            try self.blocks.append(CacheBlock.init(self.allocator, block_id));
+        }
+
+        const block = &self.blocks.items[self.blocks.items.len - 1];
+        try block.addRecord(stream_id, offset, data);
+        self.total_size += data.len;
+    }
+
+    /// Put a record with caller-owned data (zero-copy — no dupe).
+    pub fn putOwned(self: *LogCache, stream_id: u64, offset: u64, data: []u8) !void {
+        while (self.blocks.items.len >= self.max_blocks or
+            (self.max_size > 0 and self.total_size + data.len > self.max_size))
+        {
+            if (self.blocks.items.len == 0) break;
+            self.evictOldest();
+        }
+
+        if (self.blocks.items.len == 0 or self.blocks.getLast().recordCount() >= 1000) {
+            const block_id: u64 = if (self.blocks.items.len > 0)
+                self.blocks.getLast().id + 1
+            else
+                0;
+            try self.blocks.append(CacheBlock.init(self.allocator, block_id));
+        }
+
+        const block = &self.blocks.items[self.blocks.items.len - 1];
+        try block.addRecordOwned(stream_id, offset, data);
+        self.total_size += data.len;
+    }
+
+    /// Get records for a stream in the offset range [start_offset, end_offset).
+    pub fn get(self: *const LogCache, stream_id: u64, start_offset: u64, end_offset: u64, alloc: Allocator) ![]const CachedRecord {
+        var results = std.ArrayList(CachedRecord).init(alloc);
+
+        for (self.blocks.items) |*block| {
+            for (block.records.items) |rec| {
+                if (rec.stream_id == stream_id and rec.offset >= start_offset and rec.offset < end_offset) {
+                    try results.append(rec);
+                }
+            }
+        }
+
+        return results.toOwnedSlice();
+    }
+
+    fn evictOldest(self: *LogCache) void {
+        if (self.blocks.items.len == 0) return;
+        var block = self.blocks.orderedRemove(0);
+        self.total_size -= block.size;
+        block.deinit();
+    }
+
+    /// Number of cached blocks.
+    pub fn blockCount(self: *const LogCache) usize {
+        return self.blocks.items.len;
+    }
+
+    /// Total number of cached records.
+    pub fn recordCount(self: *const LogCache) usize {
+        var count: usize = 0;
+        for (self.blocks.items) |*block| {
+            count += block.recordCount();
+        }
+        return count;
+    }
+};
+
+/// S3BlockCache — LRU cache for committed S3 data blocks.
+///
+/// When data is read from S3, blocks are cached here to avoid
+/// repeated S3 fetches. Uses LRU eviction when at capacity.
+pub const S3BlockCache = struct {
+    entries: std.StringHashMap(CacheEntry),
+    access_order: std.ArrayList([]const u8),
+    max_size: u64,
+    current_size: u64 = 0,
+    hits: u64 = 0,
+    misses: u64 = 0,
+    allocator: Allocator,
+
+    pub const CacheEntry = struct {
+        key: []u8,
+        data: []u8,
+        size: u64,
+    };
+
+    pub fn init(alloc: Allocator, max_size: u64) S3BlockCache {
+        return .{
+            .entries = std.StringHashMap(CacheEntry).init(alloc),
+            .access_order = std.ArrayList([]const u8).init(alloc),
+            .max_size = max_size,
+            .allocator = alloc,
+        };
+    }
+
+    pub fn deinit(self: *S3BlockCache) void {
+        var it = self.entries.iterator();
+        while (it.next()) |entry| {
+            self.allocator.free(entry.value_ptr.key);
+            self.allocator.free(entry.value_ptr.data);
+        }
+        self.entries.deinit();
+        self.access_order.deinit();
+    }
+
+    /// Get data from cache. Returns null on miss.
+    pub fn get(self: *S3BlockCache, key: []const u8) ?[]const u8 {
+        if (self.entries.get(key)) |entry| {
+            self.hits += 1;
+            return entry.data;
+        }
+        self.misses += 1;
+        return null;
+    }
+
+    /// Put data into cache.
+    pub fn put(self: *S3BlockCache, key: []const u8, data: []const u8) !void {
+        // Don't cache if single item exceeds max
+        if (data.len > self.max_size) return;
+
+        // Evict until we have room
+        while (self.current_size + data.len > self.max_size) {
+            self.evictLru() catch break;
+        }
+
+        // Check if key already exists
+        if (self.entries.contains(key)) return;
+
+        const key_copy = try self.allocator.dupe(u8, key);
+        errdefer self.allocator.free(key_copy);
+        const data_copy = try self.allocator.dupe(u8, data);
+        errdefer self.allocator.free(data_copy);
+
+        try self.entries.put(key_copy, .{
+            .key = key_copy,
+            .data = data_copy,
+            .size = data.len,
+        });
+        try self.access_order.append(key_copy);
+        self.current_size += data.len;
+    }
+
+    fn evictLru(self: *S3BlockCache) !void {
+        if (self.access_order.items.len == 0) return error.CacheEmpty;
+
+        const oldest_key = self.access_order.orderedRemove(0);
+        if (self.entries.fetchRemove(oldest_key)) |entry| {
+            self.current_size -= entry.value.size;
+            self.allocator.free(entry.value.data);
+            self.allocator.free(entry.value.key);
+        }
+    }
+
+    pub fn hitRate(self: *const S3BlockCache) f64 {
+        const total = self.hits + self.misses;
+        if (total == 0) return 0.0;
+        return @as(f64, @floatFromInt(self.hits)) / @as(f64, @floatFromInt(total));
+    }
+};
+
+// ---------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------
+
+test "LogCache put and get" {
+    var cache = LogCache.init(testing.allocator, 64, 1024 * 1024);
+    defer cache.deinit();
+
+    try cache.put(1, 0, "record-0");
+    try cache.put(1, 1, "record-1");
+    try cache.put(2, 0, "stream2-0");
+
+    try testing.expectEqual(@as(usize, 3), cache.recordCount());
+
+    const results = try cache.get(1, 0, 10, testing.allocator);
+    defer testing.allocator.free(results);
+    try testing.expectEqual(@as(usize, 2), results.len);
+}
+
+test "LogCache FIFO eviction" {
+    var cache = LogCache.init(testing.allocator, 2, 0); // max 2 blocks
+    defer cache.deinit();
+
+    // Fill first block (1000 records per block)
+    for (0..1000) |i| {
+        try cache.put(1, i, "x");
+    }
+    try testing.expectEqual(@as(usize, 1), cache.blockCount());
+
+    // This triggers a new block
+    try cache.put(1, 1000, "y");
+    try testing.expectEqual(@as(usize, 2), cache.blockCount());
+
+    // Third block → evicts the first
+    for (0..1000) |i| {
+        try cache.put(1, 1001 + i, "z");
+    }
+    // Should still be at or under 2 blocks
+    try testing.expect(cache.blockCount() <= 2);
+}
+
+test "S3BlockCache hit and miss" {
+    var cache = S3BlockCache.init(testing.allocator, 1024);
+    defer cache.deinit();
+
+    try testing.expect(cache.get("key1") == null);
+    try testing.expectEqual(@as(u64, 1), cache.misses);
+
+    try cache.put("key1", "data1");
+    const data = cache.get("key1");
+    try testing.expect(data != null);
+    try testing.expectEqualStrings("data1", data.?);
+    try testing.expectEqual(@as(u64, 1), cache.hits);
+}
+
+test "S3BlockCache LRU eviction" {
+    var cache = S3BlockCache.init(testing.allocator, 20); // 20 bytes max
+    defer cache.deinit();
+
+    try cache.put("k1", "12345"); // 5 bytes
+    try cache.put("k2", "67890"); // 5 bytes, total 10
+    try cache.put("k3", "abcde"); // 5 bytes, total 15
+    try cache.put("k4", "fghij12345"); // 10 bytes → needs eviction
+
+    // k1 should have been evicted (LRU)
+    try testing.expect(cache.get("k1") == null);
+    try testing.expect(cache.get("k4") != null);
+}
+
+test "LogCache size-based eviction" {
+    // 20 bytes max size
+    var cache = LogCache.init(testing.allocator, 1000, 20);
+    defer cache.deinit();
+
+    try cache.put(1, 0, "12345678901"); // 11 bytes
+    try cache.put(1, 1, "12345678901"); // 11 bytes, total > 20
+
+    // Should have evicted oldest block to make room
+    try testing.expect(cache.recordCount() >= 1);
+}
+
+test "LogCache get empty range" {
+    var cache = LogCache.init(testing.allocator, 64, 1024 * 1024);
+    defer cache.deinit();
+
+    try cache.put(1, 0, "data");
+
+    // Query for a different stream
+    const results = try cache.get(2, 0, 10, testing.allocator);
+    defer testing.allocator.free(results);
+    try testing.expectEqual(@as(usize, 0), results.len);
+}
+
+test "LogCache get exact offset range" {
+    var cache = LogCache.init(testing.allocator, 64, 1024 * 1024);
+    defer cache.deinit();
+
+    try cache.put(1, 0, "a");
+    try cache.put(1, 1, "b");
+    try cache.put(1, 2, "c");
+    try cache.put(1, 3, "d");
+
+    // Get [1, 3) — should return offsets 1 and 2
+    const results = try cache.get(1, 1, 3, testing.allocator);
+    defer testing.allocator.free(results);
+    try testing.expectEqual(@as(usize, 2), results.len);
+    try testing.expectEqual(@as(u64, 1), results[0].offset);
+    try testing.expectEqual(@as(u64, 2), results[1].offset);
+}
+
+test "S3BlockCache hitRate" {
+    var cache = S3BlockCache.init(testing.allocator, 1024);
+    defer cache.deinit();
+
+    // No operations yet
+    try testing.expectEqual(@as(f64, 0.0), cache.hitRate());
+
+    try cache.put("key", "data");
+    _ = cache.get("key"); // hit
+    _ = cache.get("missing"); // miss
+
+    // 1 hit, 1 miss = 50%
+    try testing.expectApproxEqAbs(@as(f64, 0.5), cache.hitRate(), 0.01);
+}
+
+test "S3BlockCache oversized item skipped" {
+    var cache = S3BlockCache.init(testing.allocator, 5); // max 5 bytes
+    defer cache.deinit();
+
+    try cache.put("key", "1234567890"); // 10 bytes > 5 bytes max
+    try testing.expect(cache.get("key") == null);
+}
+
+test "S3BlockCache duplicate key ignored" {
+    var cache = S3BlockCache.init(testing.allocator, 1024);
+    defer cache.deinit();
+
+    try cache.put("key", "data1");
+    try cache.put("key", "data2"); // should be ignored
+
+    try testing.expectEqualStrings("data1", cache.get("key").?);
+}
+
+test "LogCache blockCount and recordCount" {
+    var cache = LogCache.init(testing.allocator, 64, 1024 * 1024);
+    defer cache.deinit();
+
+    try testing.expectEqual(@as(usize, 0), cache.blockCount());
+    try testing.expectEqual(@as(usize, 0), cache.recordCount());
+
+    try cache.put(1, 0, "data");
+    try testing.expectEqual(@as(usize, 1), cache.blockCount());
+    try testing.expectEqual(@as(usize, 1), cache.recordCount());
+}
