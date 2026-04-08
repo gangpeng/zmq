@@ -62,9 +62,9 @@ pub fn main() !void {
     var cluster_id: []const u8 = "automq-cluster";
     var voters_str: ?[]const u8 = null;
     var num_workers: usize = 4;
-    /// Process roles: controller, broker, or controller,broker (default).
+    // Process roles: controller, broker, or controller,broker (default).
     var process_roles: ProcessRoles = ProcessRoles.combined;
-    /// Controller listener port (KRaft consensus + broker registration).
+    // Controller listener port (KRaft consensus + broker registration).
     var controller_port: u16 = 9093;
     // Configurable S3 WAL and performance parameters
     var s3_wal_batch_size: usize = 4 * 1024 * 1024;
