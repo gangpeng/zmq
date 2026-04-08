@@ -151,14 +151,18 @@ pub const PartitionStore = struct {
         }
         // Ensure S3 bucket exists (retry a few times for container startup)
         if (self.s3_client) |*client| {
+            // Re-initialize S3Storage with the current (stable) s3_client pointer
+            self.s3_storage = S3Storage.initReal(self.allocator, client);
+
             var s3_attempt: usize = 0;
             while (s3_attempt < 5) : (s3_attempt += 1) {
-                client.ensureBucket() catch |err| {
-                    log.warn("Failed to create S3 bucket (attempt {d}/5): {}", .{ s3_attempt + 1, err });
-                    std.time.sleep(1000 * 1_000_000); // 1 second
-                    continue;
-                };
-                break;
+                const result = client.ensureBucket();
+                if (result) |_| {
+                    break;
+                } else |err| {
+                    log.warn("S3 bucket create attempt {d}/5 failed: {}", .{ s3_attempt + 1, err });
+                    if (s3_attempt < 4) std.time.sleep(2 * 1_000_000_000); // 2 seconds
+                }
             }
         }
     }
@@ -178,8 +182,12 @@ pub const PartitionStore = struct {
     /// The S3Storage holds a pointer to the S3Client inside this struct;
     /// after a copy, that pointer is stale and must be updated.
     pub fn fixupInternalPointers(self: *PartitionStore) void {
-        if (self.s3_client != null and self.s3_storage != null) {
-            self.s3_storage = S3Storage.initReal(self.allocator, &self.s3_client.?);
+        // After the PartitionStore struct is copied (e.g., stack→heap),
+        // S3Storage's internal *S3Client pointer becomes stale.
+        // We null it out here; open() will use s3_client directly.
+        if (self.s3_client != null) {
+            self.s3_storage = null;
+        }
         }
     }
 
