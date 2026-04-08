@@ -1,4 +1,4 @@
-/// AutoMQ Kafka Connect
+/// ZMQ Kafka Connect
 ///
 /// Connector framework for data integration:
 /// - SourceConnector: reads from external systems

@@ -30,13 +30,17 @@ pub const Wal = struct {
 
     dir_path: []const u8,
     allocator: Allocator,
+    /// Active segment file being written to (rotated when segment_max_size is exceeded).
     current_segment: ?Segment = null,
+    /// Maximum bytes per segment file before rotating to a new one.
     segment_max_size: usize,
     total_bytes_written: u64 = 0,
     total_records_written: u64 = 0,
+    /// Metadata for all closed (immutable) segments.
     segments: std.ArrayList(SegmentMeta),
     fsync_policy: FsyncPolicy = .every_n_records,
-    fsync_interval: u64 = 100, // fsync every 100 records (batch durability)
+    /// Number of records between fsync calls (only used with every_n_records policy).
+    fsync_interval: u64 = 100,
 
     pub const FsyncPolicy = enum {
         /// Fsync after every record write (safest, slowest)
@@ -574,19 +578,20 @@ test "Wal empty recovery on fresh directory" {
 }
 
 // ---------------------------------------------------------------
-// S3 WAL Batcher — async batching for S3 WAL mode (Fix #1)
+// S3 WAL Batcher — async batching for S3 WAL mode
 // ---------------------------------------------------------------
 
 /// S3WalBatcher accumulates records into a buffer and uploads them to S3 in
 /// batches, rather than doing a synchronous S3 PUT per produce.
 ///
-/// Java AutoMQ batches WAL writes into "Bulk" objects uploaded asynchronously.
+/// ZMQ batches WAL writes into "Bulk" objects uploaded asynchronously,
+/// following the same approach as AutoMQ's WAL batching.
 /// This implementation provides the same semantics:
 /// - Accumulates records in a buffer (max 4MB or 250ms flush interval)
 /// - When threshold reached, uploads the batch to S3 as a single object
 /// - Tracks batch upload count for metrics
 ///
-/// Principle 2 fix: Write path durability.
+/// Write path durability:
 /// The batcher now tracks a `last_flushed_offset` so that produce() can
 /// verify data has reached S3 before acking. In sync mode, flushNow()
 /// is called directly from produce() to ensure durability. In async mode,
@@ -595,11 +600,17 @@ test "Wal empty recovery on fresh directory" {
 /// Since the Zig broker is single-threaded (epoll loop), flushes are triggered
 /// by the broker tick() rather than a background thread.
 pub const S3WalBatcher = struct {
+    /// Pending record entries waiting to be flushed to S3.
     buffer: std.ArrayList(BatchEntry),
+    /// Total bytes currently buffered (used for threshold-based flushing).
     buffer_size: usize = 0,
+    /// Timestamp of the last successful flush (for interval-based flushing).
     last_flush_ms: i64,
+    /// Number of successful batch uploads to S3.
     batch_upload_count: u64 = 0,
+    /// Number of failed batch uploads to S3.
     batch_upload_failures: u64 = 0,
+    /// Monotonic counter for generating unique S3 object keys.
     s3_object_counter: u64 = 0,
     allocator: Allocator,
     /// Track the highest offset that has been durably flushed to S3.
@@ -661,7 +672,7 @@ pub const S3WalBatcher = struct {
     }
 
     /// Append records to the batcher's buffer.
-    /// Principle 2 fix: Tracks the appended offset so flushNow() can verify durability.
+    /// Tracks the appended offset so flushNow() can verify durability.
     pub fn append(self: *S3WalBatcher, stream_id: u64, base_offset: u64, records: []const u8) !void {
         // Fencing check: reject writes if this batcher has been fenced
         if (self.is_fenced) return error.WalFenced;
@@ -689,7 +700,7 @@ pub const S3WalBatcher = struct {
 
     /// Force flush all buffered entries to S3 as a single batch object.
     /// Returns the S3 object bytes in ObjectWriter format (with index + footer).
-    /// Principle 2 fix: Updates last_flushed_offset on success.
+    /// Updates last_flushed_offset on success to confirm durability.
     pub fn flushBuild(self: *S3WalBatcher) !?[]u8 {
         if (self.buffer.items.len == 0) return null;
 
@@ -727,13 +738,13 @@ pub const S3WalBatcher = struct {
         self.batch_upload_count += 1;
         self.s3_object_counter += 1;
 
-        // Principle 2 fix: Update last_flushed_offset to mark data as durable
+        // Update last_flushed_offset to mark data as durable
         self.last_flushed_offset = self.last_appended_offset;
 
         return batch_data;
     }
 
-    /// Principle 2 fix: Synchronous flush — build batch data and upload to S3 immediately.
+    /// Synchronous flush — build batch data and upload to S3 immediately.
     /// Called directly from produce() in sync mode to ensure durability before acking.
     /// Returns true if flush succeeded (data is durable in S3).
     pub fn flushNow(self: *S3WalBatcher, s3_storage: anytype) bool {
@@ -874,15 +885,15 @@ pub const S3WalBatcher = struct {
     }
 };
 
-/// Principle 2 fix: WAL flush mode configuration.
-/// sync = flush after every produce (durable, matches Java behavior)
-/// async = batch flush from tick (fast but lossy)
+/// WAL flush mode configuration.
+/// sync = flush after every produce (durable, matches Java Kafka behavior)
+/// async = batch flush from tick (fast but may lose data on crash)
 pub const WalFlushMode = enum {
     sync,
     async_flush,
 };
 
-/// Principle 6 fix: S3 WAL configuration parameters.
+/// S3 WAL configuration parameters.
 pub const S3WalConfig = struct {
     batch_size: usize = 4 * 1024 * 1024, // 4MB default
     flush_interval_ms: i64 = 250,
@@ -898,7 +909,7 @@ test "S3WalBatcher basic append" {
 
     try testing.expectEqual(@as(usize, 2), batcher.pendingCount());
     try testing.expect(batcher.pendingBytes() > 0);
-    // Principle 2 fix: last_appended_offset should track highest offset
+    // last_appended_offset should track highest offset
     try testing.expectEqual(@as(u64, 2), batcher.last_appended_offset);
 }
 
@@ -1067,6 +1078,58 @@ test "S3WalBatcher setEpoch un-fences" {
     // Append succeeds with new epoch
     try batcher.append(1, 0, "data");
     try testing.expectEqual(@as(usize, 1), batcher.pendingCount());
+}
+
+test "S3WalBatcher fencing clears on setEpoch then fences again" {
+    var batcher = S3WalBatcher.init(testing.allocator);
+    defer batcher.deinit();
+
+    // Fence → un-fence → fence cycle (simulates repeated failover)
+    batcher.fence();
+    try testing.expect(batcher.is_fenced);
+
+    batcher.setEpoch(10);
+    try testing.expect(!batcher.is_fenced);
+    try batcher.append(1, 0, "data-epoch-10");
+
+    batcher.fence();
+    try testing.expect(batcher.is_fenced);
+    try testing.expectError(error.WalFenced, batcher.append(1, 1, "rejected"));
+
+    batcher.setEpoch(20);
+    try testing.expect(!batcher.is_fenced);
+    try batcher.append(1, 1, "data-epoch-20");
+    try testing.expectEqual(@as(usize, 3), batcher.pendingCount());
+}
+
+test "S3WalBatcher fenced batcher preserves buffered data" {
+    var batcher = S3WalBatcher.init(testing.allocator);
+    defer batcher.deinit();
+
+    // Append data before fencing
+    try batcher.append(1, 0, "pre-fence-data");
+    try testing.expectEqual(@as(usize, 1), batcher.pendingCount());
+
+    // Fence — should not destroy buffered data
+    batcher.fence();
+    try testing.expectEqual(@as(usize, 1), batcher.pendingCount());
+    try testing.expect(batcher.pendingBytes() > 0);
+
+    // But new appends are rejected
+    try testing.expectError(error.WalFenced, batcher.append(1, 1, "rejected"));
+    try testing.expectEqual(@as(usize, 1), batcher.pendingCount());
+}
+
+test "S3WalBatcher epoch monotonicity" {
+    var batcher = S3WalBatcher.init(testing.allocator);
+    defer batcher.deinit();
+
+    batcher.setEpoch(5);
+    try testing.expectEqual(@as(u64, 5), batcher.wal_epoch);
+
+    // Setting a lower epoch is allowed (controller decides policy)
+    batcher.setEpoch(3);
+    try testing.expectEqual(@as(u64, 3), batcher.wal_epoch);
 }
 
 test "S3WalBatcher epoch in object key" {

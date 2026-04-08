@@ -462,7 +462,7 @@ if __name__ == '__main__':
 
     # Start broker 0 and measure startup time
     # NOTE: No --data-dir flag → in-memory storage only (no local WAL fsync).
-    # This is fairer vs Java AutoMQ which uses S3-based WAL (HTTP to MinIO),
+    # This is fairer vs AutoMQ which uses S3-based WAL (HTTP to MinIO),
     # not local filesystem fsync. Both paths: in-memory → deferred S3.
     zig_cmd = lambda i: [
         zig_binary, str(ZIG_PORTS[i]),
@@ -556,7 +556,7 @@ if __name__ == '__main__':
     # JAVA
     # ════════════════════════════════════════════════════════════════
     print("\n" + "=" * 72)
-    print("  [3/4] JAVA AUTOMQ BENCHMARK (KRaft combined mode)")
+    print("  [3/4] AutoMQ BENCHMARK (KRaft combined mode)")
     print("=" * 72)
 
     clean_minio()
@@ -617,7 +617,7 @@ s3.wal.path={s3_bucket_uri}
         print(f"  Format stderr: {fmt_r.stderr[:300]}")
 
     # Start Java broker
-    print("  Starting Java AutoMQ broker...")
+    print("  Starting AutoMQ broker...")
     env["KAFKA_HEAP_OPTS"] = "-Xmx2g -Xms1g"
     env["LOG_DIR"] = "/tmp/bench-java/logs"
     env["AWS_ACCESS_KEY_ID"] = "minioadmin"
@@ -708,7 +708,7 @@ s3.wal.path={s3_bucket_uri}
     # COMPARISON
     # ════════════════════════════════════════════════════════════════
     print("\n" + "=" * 72)
-    print("  [4/4] COMPARISON: Zig vs Java AutoMQ")
+    print("  [4/4] COMPARISON: Zig vs AutoMQ")
     print("=" * 72)
 
     def cmp(label, zv, jv, unit="", higher_better=True):

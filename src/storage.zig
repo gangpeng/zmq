@@ -1,4 +1,4 @@
-/// AutoMQ Storage Engine
+/// ZMQ Storage Engine
 ///
 /// Multi-tier storage system:
 /// - WAL: durable local writes with fsync and crash recovery

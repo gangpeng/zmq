@@ -1,8 +1,8 @@
-# AutoMQ Zig Implementation — Key Design
+# ZMQ — Key Design
 
 ## Overview
 
-AutoMQ Zig is a high-performance, Kafka-compatible broker that reimplements AutoMQ's cloud-native architecture in Zig. Like Java AutoMQ, it separates compute from storage — brokers are stateless compute nodes that delegate all durability to S3. This eliminates inter-broker data replication (RF=1 always), enabling instant failover via metadata reassignment.
+ZMQ is a high-performance, Kafka-compatible broker that reimplements AutoMQ's cloud-native architecture in Zig. Like AutoMQ, it separates compute from storage — brokers are stateless compute nodes that delegate all durability to S3. This eliminates inter-broker data replication (RF=1 always), enabling instant failover via metadata reassignment.
 
 ### Performance Comparison
 
@@ -19,11 +19,170 @@ AutoMQ Zig is a high-performance, Kafka-compatible broker that reimplements Auto
 
 ---
 
+## Key Components and Interactions
+
+### Component Overview
+
+ZMQ is organized into distinct modules that interact through well-defined interfaces. The architecture follows Apache Kafka's KRaft model with separate controller and broker roles.
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                            ZMQ Process                                      │
+│                                                                             │
+│  ┌─────────────────────────────────────────────────────────────────────┐    │
+│  │                     Controller (controller.zig)                     │    │
+│  │  ┌──────────────┐  ┌─────────────────┐  ┌───────────────────────┐  │    │
+│  │  │  RaftState    │  │ BrokerRegistry  │  │  ElectionLoop         │  │    │
+│  │  │  (state.zig)  │  │ (broker_reg.zig)│  │  (election_loop.zig)  │  │    │
+│  │  │              │  │                 │  │                       │  │    │
+│  │  │ role/epoch   │  │ live brokers    │  │ 100ms poll:           │  │    │
+│  │  │ voters       │  │ epochs          │  │  election timeout?    │  │    │
+│  │  │ RaftLog      │  │ heartbeats      │  │  send heartbeats?     │  │    │
+│  │  │ commit_index │  │ fencing         │  │  count votes?         │  │    │
+│  │  └──────┬───────┘  └────────┬────────┘  └──────────┬────────────┘  │    │
+│  │         │                   │                      │               │    │
+│  │         │ Server :9093 (KRaft APIs 52-55, BrokerRegistration 62,   │    │
+│  │         │                  BrokerHeartbeat 63, ApiVersions 18)     │    │
+│  └─────────┼───────────────────┼──────────────────────┼───────────────┘    │
+│            │ setRaftState()    │ broker_registry ptr   │                    │
+│            ▼                   ▼                       │                    │
+│  ┌─────────────────────────────────────────────────────┼───────────────┐    │
+│  │                     Broker (handler.zig)             │               │    │
+│  │  ┌────────────────┐  ┌──────────────┐  ┌───────────┴─────────────┐ │    │
+│  │  │ PartitionStore │  │ Group        │  │ TxnCoordinator          │ │    │
+│  │  │ (part_store.zig)│ │ Coordinator  │  │ (txn_coordinator.zig)   │ │    │
+│  │  │                │  │ (group_co.zig)│ │                         │ │    │
+│  │  │ WAL+Cache+S3   │  │ JoinGroup    │  │ 2PC transactions        │ │    │
+│  │  │ produce/fetch  │  │ SyncGroup    │  │ control batches         │ │    │
+│  │  └───────┬────────┘  │ Heartbeat    │  │ producer epochs         │ │    │
+│  │          │           │ Offsets      │  └─────────────────────────┘ │    │
+│  │          │           └──────────────┘                              │    │
+│  │          │  ┌──────────────────────┐  ┌─────────────────────────┐  │    │
+│  │          │  │ FailoverController   │  │ AutoBalancer            │  │    │
+│  │          │  │ (failover.zig)       │  │ (auto_balancer.zig)     │  │    │
+│  │          │  │ WAL epoch fencing    │  │ traffic-aware moves     │  │    │
+│  │          │  └──────────────────────┘  └─────────────────────────┘  │    │
+│  │          │                                                         │    │
+│  │          │ Server :9092 (Kafka client APIs 0-47, 60-61, 18)        │    │
+│  └──────────┼─────────────────────────────────────────────────────────┘    │
+│             │                                                              │
+│             ▼                                                              │
+│  ┌──────────────────────────────────────────────────────────────────────┐   │
+│  │                     Storage Engine                                   │   │
+│  │  ┌──────────────┐ ┌──────────────┐ ┌──────────────┐ ┌────────────┐  │   │
+│  │  │ S3WalBatcher │ │ LogCache     │ │ S3BlockCache │ │ Compaction │  │   │
+│  │  │ (wal.zig)    │ │ (cache.zig)  │ │ (cache.zig)  │ │ Manager    │  │   │
+│  │  │              │ │              │ │              │ │(compact.zig)│  │   │
+│  │  │ batch→S3     │ │ FIFO hot data│ │ LRU S3 reads│ │ split+merge│  │   │
+│  │  │ epoch fence  │ │ zero-copy    │ │ hit/miss    │ │ write-before│  │   │
+│  │  │ sync/async   │ │              │ │             │ │ -delete     │  │   │
+│  │  └──────┬───────┘ └──────────────┘ └──────────────┘ └─────┬──────┘  │   │
+│  │         │              ▲  ObjectManager (stream.zig)       │         │   │
+│  │         │              │  Stream/SSO/SO metadata registry  │         │   │
+│  │         └──────────────┴───────────────────────────────────┘         │   │
+│  └──────────────────────────────┬───────────────────────────────────────┘   │
+│                                 │                                          │
+└─────────────────────────────────┼──────────────────────────────────────────┘
+                                  │
+                                  ▼
+                     ┌──────────────────────┐
+                     │    S3 / MinIO        │
+                     │  wal/epoch-N/bulk/NN │  ← StreamSetObjects
+                     │  data/so/{stream}/   │  ← StreamObjects
+                     └──────────────────────┘
+```
+
+### Component Descriptions
+
+| Component | File(s) | Responsibility |
+|-----------|---------|----------------|
+| **Controller** | `src/controller/controller.zig` | Owns `RaftState`. Handles KRaft APIs (Vote, BeginQuorumEpoch, EndQuorumEpoch, DescribeQuorum) and broker lifecycle (BrokerRegistration, BrokerHeartbeat). |
+| **BrokerRegistry** | `src/controller/broker_registry.zig` | Tracks live broker-only nodes. Assigns broker epochs for WAL fencing. Evicts brokers that miss heartbeats (30s timeout). |
+| **RaftState** | `src/raft/state.zig` | Raft consensus state machine: role (unattached/candidate/leader/follower), epoch, voted_for, RaftLog, commit_index. Handles vote requests with log-recency checks and epoch-based commit safety. |
+| **ElectionLoop** | `src/raft/election_loop.zig` | Background thread polling every 100ms. Checks election timeout, broadcasts vote requests, counts grants, sends leader heartbeats every ~500ms. |
+| **RaftClientPool** | `src/network/raft_client.zig` | TCP connections to controller peers. Sends Vote (API 52), BeginQuorumEpoch (API 53) RPCs. Also provides raw request transport for MetadataClient. |
+| **MetadataClient** | `src/controller/metadata_client.zig` | Broker-only nodes use this to discover the controller leader, register via BrokerRegistration (API 62), and heartbeat via BrokerHeartbeat (API 63). Implements lease-based staleness detection to self-fence on network partition. |
+| **Broker** | `src/broker/handler.zig` | Stateful Kafka broker. Dispatches all 44+ Kafka client APIs. Owns PartitionStore, GroupCoordinator, TxnCoordinator, QuotaManager, Metrics. Holds optional `?*RaftState` pointer (null in broker-only mode). |
+| **PartitionStore** | `src/broker/partition_store.zig` | Multi-tier storage engine: produce writes to WAL + LogCache + S3WalBatcher; fetch reads from LogCache → S3BlockCache → S3. Manages per-partition state (offsets, HW, LSO). |
+| **S3WalBatcher** | `src/storage/wal.zig` | Batches records and uploads to S3 via ObjectWriter format. Epoch-fenced: rejects writes after `fence()`. Two modes: sync (flush per produce) and async (flush on tick). |
+| **ObjectManager** | `src/storage/stream.zig` | Metadata registry for Streams, StreamSetObjects (multi-stream), and StreamObjects (per-stream). Resolves fetch queries by merging both object types sorted by offset. |
+| **CompactionManager** | `src/storage/compaction.zig` | Periodic compaction: force-splits multi-stream SSOs into per-stream SOs, then merges small SOs. Uses write-before-delete pattern for crash safety. |
+| **GroupCoordinator** | `src/broker/group_coordinator.zig` | Consumer group lifecycle: state machine (Empty → PreparingRebalance → CompletingRebalance → Stable), JoinGroup, SyncGroup (leader-only validation), Heartbeat (rebalance signaling), offset commit/fetch. |
+| **TxnCoordinator** | `src/broker/txn_coordinator.zig` | Exactly-once transactions: 2PC with AddPartitionsToTxn, EndTxn, WriteTxnMarkers. Builds control record batches for commit/abort markers. |
+| **FailoverController** | `src/broker/failover.zig` | Detects broker failures via heartbeat timeout (30s). Fences failed nodes by bumping WAL epoch and reassigning partitions. |
+| **AutoBalancer** | `src/broker/auto_balancer.zig` | Traffic-aware partition reassignment. Detects load imbalance (20% threshold), generates greedy move plan. Moves are metadata-only since data is in S3. |
+
+### How Components Interact
+
+**Produce path:** Client → Broker (handler.zig) → PartitionStore.produce() → S3WalBatcher.append() → flushNow() → S3 PUT + ObjectManager.commitStreamSetObject()
+
+**Fetch path:** Client → Broker → PartitionStore.fetchWithIsolation() → LogCache.get() → S3BlockCache.get() → ObjectManager.getObjects() → S3 GET + ObjectReader.parse()
+
+**Compaction:** Broker.tick() → CompactionManager.maybeCompact() → forceSplitAll() [SSOs → SOs] → mergeAll() [small SOs → large SOs]
+
+**Election:** ElectionLoop.run() → RaftState.startElection() → RaftClientPool.broadcastVoteRequest() → becomeLeader() or retry
+
+**Broker registration (broker-only):** MetadataClient.run() → discoverLeader() via DescribeQuorum (API 55) → registerWithController() via BrokerRegistration (API 62) → heartbeat loop via BrokerHeartbeat (API 63)
+
+**Failover:** FailoverController.tick() → detect heartbeat timeout → failoverNode() → S3WalBatcher.fence() + wal_epoch++ → partition reassignment
+
+**Consumer group:** Client JoinGroup → GroupCoordinator.joinGroup() → state → PreparingRebalance → timeout → CompletingRebalance → leader SyncGroup → Stable → Heartbeat loop
+
+---
+
+## Dual-Role Architecture (Controller vs Broker)
+
+ZMQ supports Apache Kafka's KRaft dual-role model via the `--process-roles` flag:
+
+| Mode | Flag | Description |
+|------|------|-------------|
+| **Controller** | `--process-roles controller` | Runs Raft consensus + metadata management. Listens on controller port (default 9093). No Kafka client APIs. |
+| **Broker** | `--process-roles broker` | Handles Kafka client requests. Listens on broker port (default 9092). Connects to controllers for metadata. |
+| **Combined** | `--process-roles controller,broker` (default) | Both roles in one process. Two TCP listeners on separate ports. Backward-compatible with single-node deployment. |
+
+```
+CONTROLLER-ONLY MODE                  BROKER-ONLY MODE
+┌────────────────────────┐           ┌────────────────────────┐
+│ Controller             │           │ Broker                 │
+│ ├─ RaftState (owned)   │◄──────────│ ├─ PartitionStore      │
+│ ├─ BrokerRegistry      │  register │ ├─ Groups, Txn, etc.   │
+│ ├─ ElectionLoop        │  heartbt  │ └─ MetadataClient ─────┘
+│ └─ Server :9093        │           │     (→ controllers)
+│    APIs: 52-55,62,63   │           │ Server :9092
+└────────────────────────┘           │ APIs: 0-47,60-61,18
+                                     └────────────────────────┘
+
+COMBINED MODE (default, backward-compatible)
+┌──────────────────────────────────────────┐
+│ Controller :9093    │  Broker :9092      │
+│ (KRaft APIs)        │  (Client APIs)     │
+│ Broker gets ptr ────┘                    │
+│ to Controller's RaftState                │
+└──────────────────────────────────────────┘
+```
+
+### Dynamic Broker Scaling
+
+This architecture enables dynamic broker scaling — the controller quorum is fixed, but broker-only nodes can be added or removed freely:
+
+1. **New broker starts** with `--process-roles broker --voters "0@c1:9093,1@c2:9093,2@c3:9093"`
+2. **MetadataClient discovers controller leader** via DescribeQuorum (API 55) to any voter
+3. **Broker registers** via BrokerRegistration (API 62) → controller assigns a broker epoch
+4. **Periodic heartbeats** via BrokerHeartbeat (API 63) every 2 seconds
+5. **Controller fences dead brokers** — if heartbeat stops for 30 seconds, the broker is evicted
+6. **Broker self-fences on network partition** — if no successful heartbeat within 30 seconds (lease expiry), the broker stops accepting produces to prevent split-brain
+
+### Network Partition Protection
+
+Broker-only nodes implement a **lease-based staleness check** (`controller_lease_ms`, default 30s). If the broker cannot heartbeat to any controller within the lease period, it self-fences by setting `is_fenced_by_controller = true`. All subsequent produce requests are rejected with NOT_LEADER_OR_FOLLOWER (error 6), telling clients to find another broker. When connectivity is restored and a heartbeat succeeds, the broker unfences automatically.
+
+---
+
 ## Write Path
 
 ### S3 Metadata Model: Streams, StreamSetObjects, and StreamObjects
 
-AutoMQ introduces a metadata layer between Kafka partitions and S3 objects. The Zig implementation (`src/storage/stream.zig`) includes full Stream, StreamSetObject, StreamObject, and ObjectManager data structures matching Java AutoMQ's architecture.
+AutoMQ introduces a metadata layer between Kafka partitions and S3 objects. The Zig implementation (`src/storage/stream.zig`) includes full Stream, StreamSetObject, StreamObject, and ObjectManager data structures matching AutoMQ's architecture.
 
 #### Stream
 
@@ -45,7 +204,7 @@ Kafka Partition (e.g., topic-A, partition 0)
       }
 ```
 
-Note: Java AutoMQ uses 4 streams per partition (log/tim/idx/txn). The Zig implementation simplifies this to a single stream per partition — the RecordBatch data includes all necessary information.
+Note: AutoMQ uses 4 streams per partition (log/tim/idx/txn). The Zig implementation simplifies this to a single stream per partition — the RecordBatch data includes all necessary information.
 
 Streams are managed by `ObjectManager` (`stream.ObjectManager`), which provides:
 - `createStreamWithId()` — called from `PartitionStore.ensurePartition()`
@@ -135,13 +294,34 @@ The `CompactionManager` runs periodically (configurable via `compaction_interval
 2. For each distinct `stream_id`, extract only that stream's data blocks
 3. Write a new StreamObject per stream via `ObjectWriter.build()`
 4. Upload each StreamObject to S3, register with `ObjectManager.commitStreamObject()`
-5. Delete the old SSO from S3, remove via `ObjectManager.removeStreamSetObject()`
+5. Remove the SSO from ObjectManager (so fetch queries stop returning it immediately)
+6. Delete the SSO from S3 (orphaned file if delete fails — cleaned up later)
 
 **Merge** — For each stream with ≥ `merge_min_object_count` (default 10) StreamObjects:
 1. Group contiguous StreamObjects up to `merge_max_size` (default 256MB)
-2. Read all SOs in the group, combine via `ObjectWriter`
-3. Upload the merged SO, register with ObjectManager
-4. Delete old SOs from S3 and ObjectManager
+2. Read ALL SOs in the group — **if any read fails, abort the entire merge** to prevent data loss
+3. Combine all blocks via `ObjectWriter`, upload the merged SO, register with ObjectManager
+4. Remove old SOs from ObjectManager (fetch queries immediately see only the merged SO)
+5. Delete old SOs from S3 (orphaned files if delete fails — logged as warnings)
+
+**Crash Safety — Write-Before-Delete Pattern:**
+
+Following AutoMQ's compaction design, ZMQ uses a strict write-before-delete ordering to ensure crash safety:
+
+```
+SAFE ORDER:                         CRASH SCENARIOS:
+1. Write new objects to S3          If crash after step 1-2:
+2. Register new objects in            → New objects exist but old also exist
+   ObjectManager                      → getObjects() may return both (overlap)
+3. Remove old objects from            → Next compaction cycle retries
+   ObjectManager                    If crash after step 3:
+4. Delete old objects from S3         → Orphaned files in S3 (harmless)
+                                      → No data duplication in queries
+                                    If crash after step 4:
+                                      → Clean completion
+```
+
+The key invariant: **ObjectManager is updated before S3 deletion**. This ensures fetch queries never see stale data, even if S3 deletions fail or the broker crashes mid-compaction.
 
 ```
 Before Compaction:                    After Compaction:
@@ -510,7 +690,7 @@ KRaft (Kafka Raft) serves as the cluster's **metadata consensus layer**. In the 
 | **Topic Config** | `Broker.topics` → `TopicConfig` | retention_ms, max_message_bytes, cleanup_policy, etc. |
 | **ACLs** | `Authorizer` rules | Authorization rules for SASL-authenticated clients |
 
-Note: Unlike Java AutoMQ which extends KRaft with stream-level metadata (S3StreamRecord, S3StreamSetObjectRecord, S3StreamObjectRecord, RangeRecord), the Zig implementation manages S3 object tracking directly in `PartitionStore` and `S3WalBatcher`. The design pattern is the same (metadata drives data location), but the Zig implementation uses a simpler per-partition model rather than the stream abstraction.
+Note: Unlike AutoMQ which extends KRaft with stream-level metadata (S3StreamRecord, S3StreamSetObjectRecord, S3StreamObjectRecord, RangeRecord), the Zig implementation manages S3 object tracking directly in `PartitionStore` and `S3WalBatcher`. The design pattern is the same (metadata drives data location), but the Zig implementation uses a simpler per-partition model rather than the stream abstraction.
 
 ### How KRaft Achieves High Availability and Consistency
 
@@ -603,55 +783,62 @@ On startup, `RaftState.loadPersistedLog()` replays entries from `{data_dir}/raft
 ## Architecture Summary
 
 ```
-┌─────────────────────────────────────────────────────────────────┐
-│                    Zig AutoMQ Broker (4.5 MB binary)            │
-│                                                                 │
-│  Network Layer (epoll, server.zig)  │  Background Tasks         │
-│  ┌───────────────────────────────┐  │  ┌─────────────────────┐  │
-│  │ TCP accept + recv + send      │  │  │ KRaft election loop │  │
-│  │ Kafka frame parsing           │  │  │  (election_loop.zig)│  │
-│  │ 44 API handlers (inline)     │  │  │ Failover heartbeat  │  │
-│  │ Produce / Fetch / Groups     │  │  │  (failover.zig)     │  │
-│  │ Transactions / Admin         │  │  │ S3 WAL batch flush  │  │
-│  └───────────────────────────────┘  │  │  (wal.zig)          │  │
-│                                     │  │ Auto-balancer check │  │
-│  Storage Engine                     │  │  (auto_balancer.zig)│  │
-│  ┌───────────────────────────────┐  │  │ S3 Compaction       │  │
-│  │ PartitionStore                │  │  │  (compaction.zig)   │  │
-│  │  (partition_store.zig)        │  │  │  SSO→SO split+merge │  │
-│  │  ├─ ObjectManager (stream.zig)│  │  │ Session timeout     │  │
-│  │  │   Stream/SSO/SO registry  │  │  │ Delayed fetch expiry│  │
-│  │  ├─ LogCache (cache.zig)     │  │  └─────────────────────┘  │
-│  │  │   FIFO, max_blocks/size   │  │                           │
-│  │  ├─ S3BlockCache (cache.zig) │  │  Security                 │
-│  │  │   LRU, hit/miss tracking  │  │  ┌─────────────────────┐  │
-│  │  ├─ Filesystem WAL (wal.zig) │  │  │ SASL/PLAIN+SCRAM256│  │
-│  │  │   CRC32C, batch fsync     │  │  │ ACL authorizer      │  │
-│  │  └─ S3WalBatcher (wal.zig)   │  │  │ 2-layer WAL epoch   │  │
-│  │     epoch-fenced writes      │  │  │  fencing            │  │
-│  │     sync/async flush modes   │  │  └─────────────────────┘  │
-│  └───────────────────────────────┘  │                           │
-└─────────────────┬───────────────────┴───────────────────────────┘
-                  │
-                  ▼
-┌─────────────────────────────────┐
-│         S3 / MinIO              │
-│                                 │
-│  wal/epoch-N/bulk/NNNNNNNNNN    │  ← StreamSetObjects (WAL batches)
-│  data/{topic}/{part}/obj-NNNN   │  ← StreamObjects (post-compaction)
-│  (durability: 99.999999999%)    │
-└─────────────────────────────────┘
+┌──────────────────────────────────────────────────────────────────────────┐
+│                    ZMQ Process (4.5 MB binary)                            │
+│           --process-roles controller,broker (default)                    │
+│                                                                          │
+│  Controller Port :9093                │  Broker Port :9092               │
+│  ┌─────────────────────────────────┐  │  ┌───────────────────────────┐  │
+│  │ Controller (controller.zig)     │  │  │ Broker (handler.zig)      │  │
+│  │  KRaft APIs:                    │  │  │  44 Kafka client APIs:    │  │
+│  │   Vote (52)                     │  │  │   Produce / Fetch         │  │
+│  │   BeginQuorumEpoch (53)         │  │  │   Groups / Transactions   │  │
+│  │   EndQuorumEpoch (54)           │  │  │   Admin / Metadata        │  │
+│  │   DescribeQuorum (55)           │  │  │                           │  │
+│  │  Broker lifecycle:              │  │  │  PartitionStore           │  │
+│  │   BrokerRegistration (62)       │  │  │   ├─ LogCache (FIFO)     │  │
+│  │   BrokerHeartbeat (63)          │  │  │   ├─ S3BlockCache (LRU)  │  │
+│  │                                 │  │  │   ├─ S3WalBatcher        │  │
+│  │  ┌─────────────┐ ┌───────────┐ │  │  │   │   (epoch-fenced)     │  │
+│  │  │ RaftState    │ │ Broker    │ │  │  │   └─ ObjectManager       │  │
+│  │  │ (owned)      │ │ Registry │ │  │  │       (SSO/SO registry)   │  │
+│  │  └──────┬───────┘ └──────────┘ │  │  │                           │  │
+│  └─────────┼───────────────────────┘  │  │  ┌─────────────────────┐ │  │
+│            │ ptr                      │  │  │ CompactionManager   │ │  │
+│            └──────────────────────────┼──│  │ (write-before-delete│ │  │
+│                                       │  │  │  crash-safe)        │ │  │
+│  Background Tasks                     │  │  └─────────────────────┘ │  │
+│  ┌─────────────────────────────────┐  │  └───────────────────────────┘  │
+│  │ ElectionLoop (100ms poll)       │  │                                  │
+│  │ FailoverController (30s timeout)│  │  Security                        │
+│  │ AutoBalancer (5min check)       │  │  ┌─────────────────────────┐    │
+│  │ MetricsServer (:9090)           │  │  │ SASL/PLAIN+SCRAM-256   │    │
+│  │ MetadataClient (broker-only)    │  │  │ ACL authorizer          │    │
+│  └─────────────────────────────────┘  │  │ WAL epoch fencing       │    │
+│                                       │  │ Controller lease fencing│    │
+│                                       │  └─────────────────────────┘    │
+└───────────────────────┬───────────────┴──────────────────────────────────┘
+                        │
+                        ▼
+           ┌──────────────────────┐
+           │      S3 / MinIO      │
+           │ wal/epoch-N/bulk/NN  │  ← StreamSetObjects (WAL batches)
+           │ data/so/{stream}/    │  ← StreamObjects (post-compaction)
+           │ (11 nines durability)│
+           └──────────────────────┘
 ```
 
 ### Design Principles Summary
 
-| # | Principle | How Satisfied in Zig |
-|---|-----------|---------------------|
-| 1 | **Kafka Protocol** | 44 API keys in `handler.zig`, flexible versions via `header.zig`, standard Kafka clients compatible |
-| 2 | **Write Durability** | S3 WAL sync mode (`S3WalBatcher.flushNow()`): ack only after S3 upload. 2-layer epoch fencing. |
-| 3 | **Read Consistency** | HW gated by `last_flushed_offset`. LSO for READ_COMMITTED via `fetchWithIsolation()`. 3-tier read cache. |
-| 4 | **Broker Failover** | `FailoverController`: 30s timeout → `wal_epoch++` → `is_fenced=true` → partition reassignment |
-| 5 | **Load Balancing** | `AutoBalancer.computeRebalancePlan()`: 20% threshold, greedy moves, metadata-only (no data copy) |
-| 6 | **Configuration** | 20+ tunable knobs via CLI and `ConfigFile` (`config.zig`): WAL, cache, compaction, S3 settings |
+| # | Principle | How Satisfied |
+|---|-----------|--------------|
+| 1 | **Kafka Protocol** | 44 API keys in `handler.zig`, flexible versions, standard Kafka clients compatible |
+| 2 | **Write Durability** | S3 WAL sync mode: ack only after S3 upload. 2-layer epoch fencing. Controller lease fencing. |
+| 3 | **Read Consistency** | HW gated by `last_flushed_offset`. LSO for READ_COMMITTED. 3-tier read cache. |
+| 4 | **Broker Failover** | `FailoverController` + `BrokerRegistry`: 30s timeout → WAL fence → partition reassignment |
+| 5 | **Load Balancing** | `AutoBalancer`: 20% threshold, greedy moves, metadata-only (no data copy) |
+| 6 | **Configuration** | 20+ tunable knobs via CLI and `ConfigFile`: WAL, cache, compaction, roles, S3 |
 | 7 | **Exactly-Once** | `TxnCoordinator`: 2PC transactions with control batch markers, producer epoch fencing |
-| 8 | **Consumer Groups** | `GroupCoordinator`: 3-phase state machine (PREPARING→COMPLETING→STABLE), `__consumer_offsets` persistence |
+| 8 | **Consumer Groups** | `GroupCoordinator`: state machine with leader-validated SyncGroup, rebalance signaling |
+| 9 | **Dual Roles** | `--process-roles controller\|broker\|controller,broker` — fixed controller quorum, dynamic broker scaling |
+| 10 | **Crash Safety** | Compaction uses write-before-delete. Merge aborts on partial read. S3 delete failures logged, not fatal. |

@@ -66,7 +66,7 @@ pub const TransactionCoordinator = struct {
     }
 
     /// InitProducerId: allocate or recover a producer ID + epoch.
-    /// Fix #5: Producer epoch fencing — increment epoch per call for existing transactional_id.
+    /// Producer epoch fencing — increment epoch per call for existing transactional_id.
     pub fn initProducerId(self: *TransactionCoordinator, transactional_id: ?[]const u8) !InitProducerIdResult {
         // Check if transactional_id already has a producer_id assigned (epoch fencing)
         if (transactional_id) |tid| {
@@ -119,11 +119,10 @@ pub const TransactionCoordinator = struct {
     };
 
     /// AddPartitionsToTxn: register partitions in an active transaction.
-    /// Fix #5: enforce timeout.
     pub fn addPartitionsToTxn(self: *TransactionCoordinator, producer_id: i64, topic: []const u8, partition: i32) !i16 {
         const txn = self.transactions.getPtr(producer_id) orelse return 48; // INVALID_PRODUCER_ID_MAPPING
 
-        // Enforce transaction timeout (fix #5)
+        // Enforce transaction timeout
         if (txn.status == .ongoing) {
             const elapsed = std.time.milliTimestamp() - txn.start_time_ms;
             if (elapsed > txn.timeout_ms) {
@@ -159,7 +158,6 @@ pub const TransactionCoordinator = struct {
     }
 
     /// WriteTxnMarkers: finalize the transaction by writing markers to all partitions.
-    /// Fix #5: Actually create COMMIT/ABORT control record bytes.
     /// Called after endTxn when all partitions have been prepared.
     pub fn writeTxnMarkers(self: *TransactionCoordinator, producer_id: i64) i16 {
         const txn = self.transactions.getPtr(producer_id) orelse return 48;
@@ -191,7 +189,7 @@ pub const TransactionCoordinator = struct {
         }
     }
 
-    /// Build a control record batch for COMMIT/ABORT markers (fix #5).
+    /// Build a control record batch for COMMIT/ABORT markers.
     /// Returns an allocated record batch with the control flag set in attributes.
     pub fn buildControlBatch(
         self: *TransactionCoordinator,

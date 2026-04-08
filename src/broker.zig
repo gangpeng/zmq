@@ -1,4 +1,4 @@
-/// AutoMQ Broker
+/// ZMQ Broker
 ///
 /// Full broker implementation:
 /// - Broker: stateful request handler for all Kafka APIs
@@ -21,9 +21,9 @@ pub const metrics = @import("broker/metrics.zig");
 pub const persistence = @import("broker/persistence.zig");
 pub const fetch_session = @import("broker/fetch_session.zig");
 pub const response_builder = @import("broker/response_builder.zig");
-// Principle 4 fix: Broker failure handling
+// Broker failure handling
 pub const failover = @import("broker/failover.zig");
-// Principle 5 fix: Load balancing & partition reassignment
+// Load balancing & partition reassignment
 pub const auto_balancer = @import("broker/auto_balancer.zig");
 
 pub const Broker = handler.Broker;
@@ -37,9 +37,9 @@ pub const MetricRegistry = metrics.MetricRegistry;
 pub const MetadataPersistence = persistence.MetadataPersistence;
 pub const FetchSessionManager = fetch_session.FetchSessionManager;
 pub const ResponseBuilder = response_builder.ResponseBuilder;
-// Principle 4 fix: Failover controller for broker failure handling
+// Failover controller for broker failure handling
 pub const FailoverController = failover.FailoverController;
-// Principle 5 fix: Auto-balancer for partition reassignment
+// Auto-balancer for partition reassignment
 pub const AutoBalancer = auto_balancer.AutoBalancer;
 
 test {

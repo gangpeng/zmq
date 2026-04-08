@@ -1,4 +1,4 @@
-/// AutoMQ Compression Codec Registry
+/// ZMQ Compression Codec Registry
 ///
 /// All Kafka compression types supported:
 /// - None (0): passthrough

@@ -2,13 +2,11 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 const log = std.log.scoped(.auto_balancer);
 
-/// Principle 5 fix: Load balancing & partition reassignment.
-///
 /// AutoBalancer computes partition assignments to balance load across nodes.
-/// In AutoMQ's cloud-native architecture, partition reassignment is a
+/// In ZMQ's cloud-native architecture, partition reassignment is a
 /// metadata-only operation since data lives in S3 — no data movement needed.
 ///
-/// Java AutoMQ implements automatic load balancing via traffic-aware partition
+/// AutoMQ implements automatic load balancing via traffic-aware partition
 /// reassignment. This implementation provides the same semantics:
 /// - Periodically compute partition load (bytes in/out per second)
 /// - Use a greedy algorithm to balance load across nodes
@@ -68,14 +66,14 @@ pub const AutoBalancer = struct {
         _ = self;
     }
 
-    /// Principle 5 fix: Check if it's time to rebalance.
+    /// Check if it's time to rebalance.
     pub fn shouldCheck(self: *const AutoBalancer) bool {
         if (!self.enabled) return false;
         const now = std.time.milliTimestamp();
         return (now - self.last_check_ms) >= self.check_interval_ms;
     }
 
-    /// Principle 5 fix: Compute partition assignments to balance load across nodes.
+    /// Compute partition assignments to balance load across nodes.
     /// Uses a simple greedy algorithm: sort partitions by load descending,
     /// assign each to the least-loaded node.
     pub fn computeRebalancePlan(

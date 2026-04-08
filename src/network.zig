@@ -1,4 +1,4 @@
-/// AutoMQ Network Layer
+/// ZMQ Network Layer
 ///
 /// TCP server for Kafka binary protocol + HTTP metrics endpoint + Raft RPC client.
 

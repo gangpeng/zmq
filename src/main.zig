@@ -9,6 +9,11 @@ const Broker = handler.Broker;
 const ConfigFile = @import("config.zig").ConfigFile;
 const ElectionLoop = @import("raft/election_loop.zig").ElectionLoop;
 const RaftClientPool = @import("network/raft_client.zig").RaftClientPool;
+const RaftState = @import("raft/state.zig").RaftState;
+const ProcessRoles = @import("roles.zig").ProcessRoles;
+const Controller = @import("controller/controller.zig").Controller;
+const MetadataClient = @import("controller/metadata_client.zig").MetadataClient;
+const handler_routing = @import("network/handler_routing.zig");
 
 pub const std_options = .{
     .log_level = .info,
@@ -16,6 +21,7 @@ pub const std_options = .{
 
 /// Global pointers for signal handler access.
 var global_server: ?*Server = null;
+var global_controller_server: ?*Server = null;
 var global_metrics_server: ?*MetricsServer = null;
 var global_shutdown: bool = false;
 
@@ -23,6 +29,7 @@ fn handleSignal(sig: i32) callconv(.C) void {
     _ = sig;
     global_shutdown = true;
     if (global_server) |s| s.stop();
+    if (global_controller_server) |s| s.stop();
     if (global_metrics_server) |m| m.stop();
 }
 
@@ -55,7 +62,11 @@ pub fn main() !void {
     var cluster_id: []const u8 = "automq-cluster";
     var voters_str: ?[]const u8 = null;
     var num_workers: usize = 4;
-    // Principle 6 fix: Configurable performance parameters via CLI
+    /// Process roles: controller, broker, or controller,broker (default).
+    var process_roles: ProcessRoles = ProcessRoles.combined;
+    /// Controller listener port (KRaft consensus + broker registration).
+    var controller_port: u16 = 9093;
+    // Configurable S3 WAL and performance parameters
     var s3_wal_batch_size: usize = 4 * 1024 * 1024;
     var s3_wal_flush_interval: i64 = 250;
     var s3_wal_flush_mode: []const u8 = "sync";
@@ -90,7 +101,11 @@ pub fn main() !void {
             voters_str = args.next();
         } else if (std.mem.eql(u8, arg, "--workers")) {
             if (args.next()) |w| num_workers = std.fmt.parseInt(usize, w, 10) catch 4;
-        // Principle 6 fix: S3 WAL and cache configuration CLI flags
+        } else if (std.mem.eql(u8, arg, "--process-roles")) {
+            if (args.next()) |r| process_roles = ProcessRoles.parse(r) catch ProcessRoles.combined;
+        } else if (std.mem.eql(u8, arg, "--controller-port")) {
+            if (args.next()) |p| controller_port = std.fmt.parseInt(u16, p, 10) catch 9093;
+        // S3 WAL and cache configuration CLI flags
         } else if (std.mem.eql(u8, arg, "--s3-wal-batch-size")) {
             if (args.next()) |v| s3_wal_batch_size = std.fmt.parseInt(usize, v, 10) catch s3_wal_batch_size;
         } else if (std.mem.eql(u8, arg, "--s3-wal-flush-interval")) {
@@ -124,13 +139,29 @@ pub fn main() !void {
         metrics_port = cfg.getInt(u16, "metrics.port", metrics_port);
         node_id = cfg.getInt(i32, "broker.id", node_id);
         cluster_id = cfg.getStringOr("cluster.id", cluster_id);
-        // Principle 6 fix: Load S3 WAL and cache config from config file
+        // Load S3 WAL and cache config from config file
         s3_wal_batch_size = @intCast(cfg.getInt(u64, "s3.wal.batch.size", @intCast(s3_wal_batch_size)));
         s3_wal_flush_interval = cfg.getInt(i64, "s3.wal.flush.interval.ms", s3_wal_flush_interval);
         if (cfg.getString("s3.wal.flush.mode")) |m| s3_wal_flush_mode = m;
         s3_block_cache_size = @intCast(cfg.getInt(u64, "s3.block.cache.size", @intCast(s3_block_cache_size)));
         cache_max_size = @intCast(cfg.getInt(u64, "log.cache.max.size", @intCast(cache_max_size)));
         compaction_interval = cfg.getInt(i64, "s3.compaction.interval.ms", compaction_interval);
+        // Process role and controller port from config file (CLI takes precedence)
+        if (cfg.getString("process.roles")) |r| {
+            process_roles = ProcessRoles.parse(r) catch process_roles;
+        }
+        controller_port = cfg.getInt(u16, "controller.listener.port", controller_port);
+    }
+
+    // Validate: broker-only mode requires --voters to know the controller quorum
+    if (process_roles.is_broker and !process_roles.is_controller and voters_str == null) {
+        try stdout.print("  ERROR: --voters is required for broker-only mode (process.roles=broker)\n", .{});
+        return;
+    }
+    // Validate: port conflict between broker and controller
+    if (process_roles.isCombined() and port == controller_port) {
+        try stdout.print("  ERROR: --port and --controller-port must differ in combined mode (both are {d})\n", .{port});
+        return;
     }
 
     // Ignore SIGPIPE — writing to a closed TCP socket must not kill the broker.
@@ -153,84 +184,216 @@ pub fn main() !void {
     try posix.sigaction(posix.SIG.INT, &sa, null);
     try posix.sigaction(posix.SIG.TERM, &sa, null);
 
-    // Principle 6 fix: Parse WAL flush mode string to enum
+    // Parse WAL flush mode string to enum
     const wal_flush_mode: handler.Broker.WalFlushMode = if (std.mem.eql(u8, s3_wal_flush_mode, "async"))
         .async_flush
     else
         .sync;
 
-    var broker = Broker.initWithConfig(alloc, node_id, port, .{
-        .data_dir = data_dir,
-        .s3_endpoint_host = s3_host,
-        .s3_endpoint_port = s3_port,
-        .s3_bucket = s3_bucket,
-        .advertised_host = advertised_host,
-        // Principle 6 fix: Pass through all configurable performance parameters
-        .s3_wal_batch_size = s3_wal_batch_size,
-        .s3_wal_flush_interval_ms = s3_wal_flush_interval,
-        .s3_wal_flush_mode = wal_flush_mode,
-        .cache_max_size = cache_max_size,
-        .s3_block_cache_size = s3_block_cache_size,
-        .compaction_interval_ms = compaction_interval,
-    });
-    defer {
-        log.info("Shutting down broker (persisting metadata)...", .{});
-        broker.deinit();
-    }
-    handler.setGlobalBroker(&broker);
-
-    broker.open() catch |err| {
-        try stdout.print("  ERROR: Failed to open storage: {}\n", .{err});
-        return;
-    };
-
-    // Register self as voter if no voters specified (single-node mode)
+    // ═══════════════════════════════════════════════════════════
+    // CONTROLLER COMPONENTS (if controller role)
+    // ═══════════════════════════════════════════════════════════
+    var controller: ?Controller = null;
     var raft_pool: ?RaftClientPool = null;
-    if (voters_str == null) {
-        broker.raft_state.addVoter(node_id) catch {};
-    } else {
-        // Parse voters: "0@localhost:9092,1@host2:9092,2@host3:9092"
-        raft_pool = RaftClientPool.init(alloc);
-        parseAndRegisterVoters(&broker, voters_str.?, &raft_pool.?);
-    }
-    defer if (raft_pool) |*pool| pool.deinit();
 
-    // Start KRaft election loop on background thread
-    var election_state = ElectionLoop{
-        .raft_state = &broker.raft_state,
-        .should_stop = &global_shutdown,
-        .raft_client_pool = if (raft_pool != null) &(raft_pool.?) else null,
-    };
-    if (election_state.raft_client_pool != null) {
-        log.info("Election loop: RaftClientPool configured with peers", .{});
-    } else {
-        log.info("Election loop: single-node mode (no RaftClientPool)", .{});
+    if (process_roles.is_controller) {
+        controller = Controller.init(alloc, node_id, cluster_id);
+
+        if (voters_str == null) {
+            // Single-node mode: register self as the only voter
+            controller.?.raft_state.addVoter(node_id) catch {};
+        } else {
+            // Multi-node mode: parse voters and create RPC pool
+            raft_pool = RaftClientPool.init(alloc);
+            parseAndRegisterVoters(&controller.?.raft_state, voters_str.?, &raft_pool.?);
+        }
+
+        handler_routing.setGlobalController(&controller.?);
     }
-    const election_thread = std.Thread.spawn(.{}, ElectionLoop.run, .{&election_state}) catch |err| {
-        try stdout.print("  WARNING: Failed to start election loop: {}\n", .{err});
-        return startMainServer(alloc, port, s3_host, s3_port, s3_bucket, data_dir, metrics_port, cluster_id, node_id, num_workers, stdout);
+    defer if (controller) |*c| c.deinit();
+    defer if (raft_pool) |*p| p.deinit();
+
+    // ═══════════════════════════════════════════════════════════
+    // BROKER COMPONENTS (if broker role)
+    // ═══════════════════════════════════════════════════════════
+    var broker: ?Broker = null;
+
+    if (process_roles.is_broker) {
+        broker = Broker.initWithConfig(alloc, node_id, port, .{
+            .data_dir = data_dir,
+            .s3_endpoint_host = s3_host,
+            .s3_endpoint_port = s3_port,
+            .s3_bucket = s3_bucket,
+            .advertised_host = advertised_host,
+            .s3_wal_batch_size = s3_wal_batch_size,
+            .s3_wal_flush_interval_ms = s3_wal_flush_interval,
+            .s3_wal_flush_mode = wal_flush_mode,
+            .cache_max_size = cache_max_size,
+            .s3_block_cache_size = s3_block_cache_size,
+            .compaction_interval_ms = compaction_interval,
+        });
+
+        // In combined mode, give broker a pointer to controller's RaftState
+        if (controller) |*c| {
+            broker.?.setRaftState(&c.raft_state);
+        }
+
+        broker.?.open() catch |err| {
+            try stdout.print("  ERROR: Failed to open storage: {}\n", .{err});
+            return;
+        };
+
+        handler.setGlobalBroker(&broker.?);
+        handler_routing.setGlobalBroker(&broker.?);
+    }
+    defer if (broker) |*b| {
+        log.info("Shutting down broker (persisting metadata)...", .{});
+        b.deinit();
     };
-    defer {
+
+    // ═══════════════════════════════════════════════════════════
+    // METADATA CLIENT (broker-only mode)
+    // ═══════════════════════════════════════════════════════════
+    var metadata_client: ?MetadataClient = null;
+
+    if (process_roles.is_broker and !process_roles.is_controller) {
+        metadata_client = MetadataClient.init(
+            alloc, node_id, advertised_host, port,
+            &broker.?.cached_leader_epoch,
+            &broker.?.is_fenced_by_controller,
+            &broker.?.last_successful_heartbeat_ms,
+            &global_shutdown,
+        );
+        if (voters_str) |vs| {
+            parseVotersIntoMetadataClient(&metadata_client.?, vs);
+        }
+    }
+    defer if (metadata_client) |*mc| mc.deinit();
+
+    // ═══════════════════════════════════════════════════════════
+    // BACKGROUND THREADS
+    // ═══════════════════════════════════════════════════════════
+
+    // Election loop (controller or combined mode only)
+    var election_state: ?ElectionLoop = null;
+    var election_thread: ?std.Thread = null;
+    if (process_roles.is_controller) {
+        election_state = ElectionLoop{
+            .raft_state = &controller.?.raft_state,
+            .should_stop = &global_shutdown,
+            .raft_client_pool = if (raft_pool != null) &(raft_pool.?) else null,
+        };
+        if (election_state.?.raft_client_pool != null) {
+            log.info("Election loop: RaftClientPool configured with peers", .{});
+        } else {
+            log.info("Election loop: single-node mode (no RaftClientPool)", .{});
+        }
+        election_thread = std.Thread.spawn(.{}, ElectionLoop.run, .{&election_state.?}) catch |err| {
+            try stdout.print("  WARNING: Failed to start election loop: {}\n", .{err});
+            return;
+        };
+    }
+    defer if (election_thread) |t| {
         global_shutdown = true;
-        election_thread.join();
-    }
-
-    // Start Prometheus metrics & health server on a separate thread
-    var metrics_server = MetricsServer.init(alloc, metrics_port, &broker.metrics);
-    global_metrics_server = &metrics_server;
-    const metrics_thread = std.Thread.spawn(.{}, MetricsServer.serve, .{&metrics_server}) catch |err| {
-        try stdout.print("  WARNING: Failed to start metrics server: {}\n", .{err});
-        return startMainServer(alloc, port, s3_host, s3_port, s3_bucket, data_dir, metrics_port, cluster_id, node_id, num_workers, stdout);
+        t.join();
     };
-    defer {
-        metrics_server.stop();
-        metrics_thread.join();
+
+    // MetadataClient loop (broker-only mode)
+    var mc_thread: ?std.Thread = null;
+    if (metadata_client != null) {
+        mc_thread = std.Thread.spawn(.{}, MetadataClient.run, .{&metadata_client.?}) catch |err| {
+            try stdout.print("  WARNING: Failed to start metadata client: {}\n", .{err});
+            return;
+        };
+    }
+    defer if (mc_thread) |t| {
+        global_shutdown = true;
+        t.join();
+    };
+
+    // Metrics server (broker mode only — controller-only doesn't need Kafka metrics)
+    var metrics_thread: ?std.Thread = null;
+    if (broker) |*b| {
+        var metrics_server = MetricsServer.init(alloc, metrics_port, &b.metrics);
+        global_metrics_server = &metrics_server;
+        metrics_thread = std.Thread.spawn(.{}, MetricsServer.serve, .{&metrics_server}) catch null;
+    }
+    defer if (metrics_thread) |t| {
+        if (global_metrics_server) |m| m.stop();
+        t.join();
+    };
+
+    // ═══════════════════════════════════════════════════════════
+    // TCP SERVERS
+    // ═══════════════════════════════════════════════════════════
+
+    // Print startup banner
+    const storage_mode: []const u8 = if (s3_host != null) "S3" else if (data_dir != null) "persistent" else "in-memory";
+    try stdout.print("  Node ID: {d}\n", .{node_id});
+    try stdout.print("  Cluster: {s}\n", .{cluster_id});
+    try stdout.print("  Roles: {s}\n", .{process_roles.name()});
+    if (process_roles.is_broker) {
+        try stdout.print("  Broker listening on 0.0.0.0:{d}\n", .{port});
+    }
+    if (process_roles.is_controller) {
+        try stdout.print("  Controller listening on 0.0.0.0:{d}\n", .{controller_port});
+    }
+    if (process_roles.is_broker) {
+        try stdout.print("  Metrics on 0.0.0.0:{d}/metrics\n", .{metrics_port});
+        try stdout.print("  Storage: {s}", .{storage_mode});
+        if (s3_host) |h| try stdout.print(" (s3://{s}:{d}/{s})", .{ h, s3_port, s3_bucket });
+        if (data_dir) |dir| try stdout.print(" (wal: {s})", .{dir});
+        try stdout.print("\n", .{});
+    }
+    try stdout.print("  Graceful shutdown: SIGINT/SIGTERM\n\n", .{});
+
+    // Controller server (on background thread if combined, main thread if controller-only)
+    var ctrl_thread: ?std.Thread = null;
+    if (process_roles.is_controller) {
+        if (process_roles.is_broker) {
+            // Combined mode: controller on background thread, broker on main thread
+            var ctrl_server = try Server.init(alloc, "0.0.0.0", controller_port, &handler_routing.controllerHandleRequest, num_workers);
+            global_controller_server = &ctrl_server;
+            ctrl_thread = std.Thread.spawn(.{}, Server.serve, .{&ctrl_server}) catch |err| {
+                try stdout.print("  WARNING: Failed to start controller server: {}\n", .{err});
+                return;
+            };
+        }
+    }
+    defer if (ctrl_thread) |t| {
+        if (global_controller_server) |cs| cs.stop();
+        t.join();
+    };
+
+    // Main server on the main thread
+    if (process_roles.is_broker) {
+        // Broker server on main thread
+        var server = try Server.init(alloc, "0.0.0.0", port, &handler_routing.brokerHandleRequest, num_workers);
+        global_server = &server;
+        defer {
+            server.stop();
+            global_server = null;
+        }
+        server.serve() catch |err| {
+            log.info("Broker server stopped: {}", .{err});
+        };
+    } else {
+        // Controller-only: controller server on main thread
+        var ctrl_server = try Server.init(alloc, "0.0.0.0", controller_port, &handler_routing.controllerHandleRequest, num_workers);
+        global_controller_server = &ctrl_server;
+        defer {
+            ctrl_server.stop();
+            global_controller_server = null;
+        }
+        ctrl_server.serve() catch |err| {
+            log.info("Controller server stopped: {}", .{err});
+        };
     }
 
-    try startMainServer(alloc, port, s3_host, s3_port, s3_bucket, data_dir, metrics_port, cluster_id, node_id, num_workers, stdout);
+    log.info("Server stopped.", .{});
 }
 
-fn parseAndRegisterVoters(broker: *Broker, voters: []const u8, pool: *RaftClientPool) void {
+fn parseAndRegisterVoters(raft: *RaftState, voters: []const u8, pool: *RaftClientPool) void {
     // Format: "0@localhost:9092,1@host2:9093"
     var start: usize = 0;
     for (voters, 0..) |c, i| {
@@ -241,10 +404,10 @@ fn parseAndRegisterVoters(broker: *Broker, voters: []const u8, pool: *RaftClient
             if (std.mem.indexOf(u8, entry, "@")) |at_pos| {
                 const id_str = entry[0..at_pos];
                 const voter_id = std.fmt.parseInt(i32, id_str, 10) catch continue;
-                broker.raft_state.addVoter(voter_id) catch continue;
+                raft.addVoter(voter_id) catch continue;
 
                 // Add peer to RaftClientPool (skip self)
-                if (voter_id != broker.raft_state.node_id) {
+                if (voter_id != raft.node_id) {
                     const addr_part = entry[at_pos + 1 ..];
                     if (std.mem.indexOf(u8, addr_part, ":")) |colon| {
                         const host = addr_part[0..colon];
@@ -259,30 +422,25 @@ fn parseAndRegisterVoters(broker: *Broker, voters: []const u8, pool: *RaftClient
     }
 }
 
-fn startMainServer(alloc: std.mem.Allocator, port: u16, s3_host: ?[]const u8, s3_port: u16, s3_bucket: []const u8, data_dir: ?[]const u8, metrics_port: u16, cluster_id: []const u8, node_id: i32, num_workers: usize, stdout: anytype) !void {
-    const storage_mode = if (s3_host != null) "S3" else if (data_dir != null) "persistent" else "in-memory";
-    try stdout.print("  Node ID: {d}\n", .{node_id});
-    try stdout.print("  Cluster: {s}\n", .{cluster_id});
-    try stdout.print("  Listening on 0.0.0.0:{d}\n", .{port});
-    try stdout.print("  Metrics on 0.0.0.0:{d}/metrics\n", .{metrics_port});
-    try stdout.print("  Endpoints: /health, /ready, /metrics\n", .{});
-    try stdout.print("  Storage: {s}", .{storage_mode});
-    if (s3_host) |h| try stdout.print(" (s3://{s}:{d}/{s})", .{ h, s3_port, s3_bucket });
-    if (data_dir) |dir| try stdout.print(" (wal: {s})", .{dir});
-    try stdout.print("\n", .{});
-    try stdout.print("  APIs: 41 Kafka APIs + KRaft consensus\n", .{});
-    try stdout.print("  Graceful shutdown: SIGINT/SIGTERM\n\n", .{});
-
-    var server = try Server.init(alloc, "0.0.0.0", port, &handler.handleRequest, num_workers);
-    global_server = &server;
-    defer {
-        server.stop();
-        global_server = null;
+fn parseVotersIntoMetadataClient(mc: *MetadataClient, voters: []const u8) void {
+    // Format: "0@localhost:9093,1@host2:9093"
+    var start: usize = 0;
+    for (voters, 0..) |c, i| {
+        if (c == ',' or i == voters.len - 1) {
+            const end = if (c == ',') i else i + 1;
+            const entry = voters[start..end];
+            if (std.mem.indexOf(u8, entry, "@")) |at_pos| {
+                const id_str = entry[0..at_pos];
+                const voter_id = std.fmt.parseInt(i32, id_str, 10) catch continue;
+                const addr_part = entry[at_pos + 1 ..];
+                if (std.mem.indexOf(u8, addr_part, ":")) |colon| {
+                    const host = addr_part[0..colon];
+                    const port_str = addr_part[colon + 1 ..];
+                    const voter_port = std.fmt.parseInt(u16, port_str, 10) catch continue;
+                    mc.addVoter(voter_id, host, voter_port) catch continue;
+                }
+            }
+            start = i + 1;
+        }
     }
-
-    server.serve() catch |err| {
-        log.info("Server stopped: {}", .{err});
-    };
-
-    log.info("Server stopped.", .{});
 }

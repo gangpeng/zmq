@@ -3,7 +3,7 @@ const testing = std.testing;
 
 /// Kafka API keys — every request type in the Kafka binary protocol.
 ///
-/// Standard Kafka API keys (0-73) plus AutoMQ extensions (10001+).
+/// Standard Kafka API keys (0-73) plus AutoMQ-compatible extensions (10001+).
 /// Each API key has a set of valid versions and flexible versions.
 pub const ApiKey = enum(i16) {
     // ---------------------------------------------------------------

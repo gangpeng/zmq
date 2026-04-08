@@ -112,7 +112,7 @@ pub const ConfigFile = struct {
 };
 
 /// Apply config file properties to BrokerConfig.
-/// Supports the following Kafka-standard properties (Fix #11):
+/// Supports the following Kafka-standard properties:
 /// - s3.endpoint.host, s3.endpoint.port, s3.bucket, s3.access.key, s3.secret.key
 /// - log.dirs (data directory)
 /// - num.partitions (default partition count for auto-created topics)
@@ -127,13 +127,13 @@ pub fn applyConfig(config: *@import("broker/handler.zig").Broker.BrokerConfig, c
     if (cfg.getString("s3.secret.key")) |k| config.s3_secret_key = k;
     if (cfg.getString("log.dirs")) |d| config.data_dir = d;
 
-    // Fix #11: Additional Kafka-standard config properties
+    // Additional Kafka-standard config properties
     config.default_num_partitions = cfg.getInt(i32, "num.partitions", config.default_num_partitions);
     config.default_replication_factor = cfg.getInt(i16, "default.replication.factor", config.default_replication_factor);
     config.auto_create_topics = cfg.getBool("auto.create.topics.enable", config.auto_create_topics);
     if (cfg.getString("advertised.host.name")) |h| config.advertised_host = h;
 
-    // Principle 6 fix: Apply S3 WAL and cache configuration from properties file
+    // Apply S3 WAL and cache configuration from properties file
     config.s3_wal_batch_size = @intCast(cfg.getInt(u64, "s3.wal.batch.size", @intCast(config.s3_wal_batch_size)));
     config.s3_wal_flush_interval_ms = cfg.getInt(i64, "s3.wal.flush.interval.ms", config.s3_wal_flush_interval_ms);
     if (cfg.getString("s3.wal.flush.mode")) |m| {

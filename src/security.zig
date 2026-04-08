@@ -1,4 +1,4 @@
-/// AutoMQ Security
+/// ZMQ Security
 ///
 /// - Authorizer: ACL-based authorization engine
 /// - SaslPlainAuthenticator: SASL/PLAIN username/password auth

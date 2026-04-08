@@ -1,4 +1,4 @@
-/// AutoMQ Core Utilities
+/// ZMQ Core Utilities
 ///
 /// Foundational types and functions used across all modules:
 /// - ByteBuffer: network-byte-order read/write cursors

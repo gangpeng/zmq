@@ -1,4 +1,4 @@
-/// AutoMQ CLI Tools
+/// ZMQ CLI Tools
 ///
 /// Command-line utilities for interacting with the broker:
 /// - KafkaClient: low-level wire protocol client

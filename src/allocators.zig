@@ -1,4 +1,4 @@
-/// AutoMQ Memory Allocators
+/// ZMQ Memory Allocators
 ///
 /// Three-tier allocation strategy:
 /// 1. Arena allocators: request-scoped lifecycle (allocate fast, free all at once)

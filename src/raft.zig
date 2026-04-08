@@ -1,4 +1,4 @@
-/// AutoMQ Raft Consensus (KRaft)
+/// ZMQ Raft Consensus (KRaft)
 ///
 /// Implements the Raft consensus protocol for cluster metadata management:
 /// - RaftState: state machine (Unattached/Candidate/Leader/Follower)

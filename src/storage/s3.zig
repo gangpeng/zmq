@@ -96,7 +96,7 @@ pub const MockS3 = struct {
 // S3 Object Format
 // ---------------------------------------------------------------
 
-/// AutoMQ S3 object format writer.
+/// ZMQ S3 object format writer.
 ///
 /// Format:
 ///   [DataBlock 0] [DataBlock 1] ... [DataBlock N]
@@ -186,7 +186,7 @@ pub const ObjectWriter = struct {
     }
 };
 
-/// S3 Object reader — parse the AutoMQ object format.
+/// S3 Object reader — parse the ZMQ/AutoMQ object format.
 pub const ObjectReader = struct {
     const FOOTER_MAGIC: u32 = 0x4155544F;
     const FOOTER_SIZE: usize = 16;

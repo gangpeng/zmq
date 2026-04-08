@@ -183,7 +183,7 @@ pub fn registerBrokerMetrics(registry: *MetricRegistry) !void {
     try registry.registerHistogram("kafka_server_request_latency_seconds", "Request processing latency");
     try registry.registerCounter("kafka_server_produce_requests_total", "Total produce requests");
     try registry.registerCounter("kafka_server_fetch_requests_total", "Total fetch requests");
-    // Fix #18: Per-API latency histograms
+    // Per-API latency histograms
     try registry.registerHistogram("kafka_server_produce_latency_seconds", "Produce request latency");
     try registry.registerHistogram("kafka_server_fetch_latency_seconds", "Fetch request latency");
     // Group/topic gauges (used by tick())

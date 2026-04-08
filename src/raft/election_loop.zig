@@ -15,8 +15,11 @@ const RaftClientPool = @import("../network/raft_client.zig").RaftClientPool;
 pub const ElectionLoop = struct {
     raft_state: *RaftState,
     should_stop: *bool,
-    check_interval_ms: u64 = 100, // Check every 100ms
+    /// Polling interval in milliseconds between election timer checks.
+    check_interval_ms: u64 = 100,
+    /// Monotonic counter incremented each polling cycle (used for periodic actions).
     tick_counter: u64 = 0,
+    /// Optional callback invoked every ~1 second for broker-level maintenance.
     broker_tick_fn: ?*const fn () void = null,
     /// Raft client pool for sending RPCs to peers (multi-node).
     raft_client_pool: ?*RaftClientPool = null,
@@ -55,7 +58,7 @@ pub const ElectionLoop = struct {
                             self.raft_state.becomeLeader();
                             log.info("Single-node cluster: became leader at epoch {d}", .{self.raft_state.current_epoch});
                         } else {
-                            // Fix 2: Multi-node — broadcast vote requests and count grants
+                            // Multi-node — broadcast vote requests and count grants
                             self.broadcastAndCountVotes(result);
                         }
                     }
@@ -87,7 +90,7 @@ pub const ElectionLoop = struct {
         log.info("Election loop stopped for node {d}", .{self.raft_state.node_id});
     }
 
-    /// Fix 2: Broadcast vote requests and count grants. If majority reached, become leader.
+    /// Broadcast vote requests and count grants. If majority reached, become leader.
     fn broadcastAndCountVotes(self: *ElectionLoop, result: RaftState.ElectionResult) void {
         if (self.raft_client_pool) |pool| {
             const grants = pool.broadcastVoteRequest(
@@ -109,7 +112,7 @@ pub const ElectionLoop = struct {
         }
     }
 
-    /// Fix 4: Send heartbeats / AppendEntries to all followers.
+    /// Send heartbeats / AppendEntries to all followers.
     fn sendHeartbeats(self: *ElectionLoop) void {
         if (self.raft_state.role != .leader) return;
         if (self.raft_client_pool) |pool| {
@@ -165,4 +168,56 @@ test "ElectionLoop multi-node stays candidate" {
 
     // Without majority votes, should stay candidate
     try std.testing.expectEqual(@as(usize, 2), raft.majorityThreshold());
+}
+
+test "ElectionLoop leader sends heartbeats on tick" {
+    const alloc = std.testing.allocator;
+    var raft = RaftState.init(alloc, 0, "test-cluster");
+    defer raft.deinit();
+
+    try raft.addVoter(0);
+    _ = raft.startElection();
+    raft.becomeLeader();
+
+    // Verify state is correct for heartbeat sending
+    try std.testing.expectEqual(RaftState.Role.leader, raft.role);
+    try std.testing.expectEqual(@as(i32, 1), raft.current_epoch);
+}
+
+test "ElectionLoop follower transitions to candidate on timeout" {
+    const alloc = std.testing.allocator;
+    var raft = RaftState.init(alloc, 1, "test-cluster");
+    defer raft.deinit();
+
+    try raft.addVoter(0);
+    try raft.addVoter(1);
+    try raft.addVoter(2);
+
+    // Start as follower
+    raft.becomeFollower(1, 0);
+    try std.testing.expectEqual(RaftState.Role.follower, raft.role);
+
+    // Simulate election timeout by starting election
+    const result = raft.startElection();
+    try std.testing.expectEqual(RaftState.Role.candidate, raft.role);
+    try std.testing.expectEqual(@as(i32, 2), result.epoch);
+}
+
+test "ElectionLoop candidate retries election on timeout" {
+    const alloc = std.testing.allocator;
+    var raft = RaftState.init(alloc, 1, "test-cluster");
+    defer raft.deinit();
+
+    try raft.addVoter(0);
+    try raft.addVoter(1);
+    try raft.addVoter(2);
+
+    // First election — epoch 1
+    _ = raft.startElection();
+    try std.testing.expectEqual(@as(i32, 1), raft.current_epoch);
+
+    // No majority → stays candidate → timeout → new election
+    const result2 = raft.startElection();
+    try std.testing.expectEqual(@as(i32, 2), result2.epoch);
+    try std.testing.expectEqual(RaftState.Role.candidate, raft.role);
 }

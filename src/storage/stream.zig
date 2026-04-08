@@ -214,7 +214,7 @@ pub const S3ObjectMetadata = struct {
 /// the stream-offset ranges they contain. It resolves fetch queries
 /// ("for stream X, offsets [A,B), which S3 objects have the data?").
 ///
-/// This matches Java AutoMQ's ObjectManager / S3ObjectControlManager.
+/// This matches AutoMQ's ObjectManager / S3ObjectControlManager.
 pub const ObjectManager = struct {
     allocator: Allocator,
     node_id: i32,

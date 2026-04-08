@@ -162,7 +162,7 @@ pub const RaftClient = struct {
         epoch: i32,
     };
 
-    /// Fix 4: Send AppendEntries (log replication / heartbeat) to a follower.
+    /// Send AppendEntries (log replication / heartbeat) to a follower.
     /// Sends a simplified AppendEntries-style message using BeginQuorumEpoch (API 53).
     /// For actual log data, entries are serialized after the header.
     pub fn sendAppendEntries(
@@ -295,6 +295,63 @@ pub const RaftClient = struct {
             return err;
         };
     }
+
+    /// Send a raw framed request and return the raw response bytes (caller-owned).
+    /// Used by MetadataClient for BrokerRegistration, BrokerHeartbeat, DescribeQuorum.
+    pub fn sendRawRequest(self: *RaftClient, request: []const u8, alloc: Allocator) ![]u8 {
+        self.ensureConnected() catch |err| {
+            return err;
+        };
+
+        const fd = self.fd.?;
+
+        // Build frame: [4-byte size] [request payload]
+        var frame_buf = try alloc.alloc(u8, 4 + request.len);
+        defer alloc.free(frame_buf);
+        var size_pos: usize = 0;
+        ser.writeI32(frame_buf, &size_pos, @intCast(request.len));
+        @memcpy(frame_buf[4..], request);
+
+        _ = posix.send(fd, frame_buf, 0) catch |err| {
+            self.disconnect();
+            return err;
+        };
+
+        // Read response frame: 4-byte size + payload
+        var resp_header: [4]u8 = undefined;
+        const hn = posix.recv(fd, &resp_header, 0) catch |err| {
+            self.disconnect();
+            return err;
+        };
+        if (hn < 4) {
+            self.disconnect();
+            return error.ShortRead;
+        }
+
+        var hpos: usize = 0;
+        const resp_size: usize = @intCast(@max(ser.readI32(&resp_header, &hpos), 0));
+        if (resp_size == 0 or resp_size > 1024 * 1024) {
+            self.disconnect();
+            return error.InvalidFrameSize;
+        }
+
+        const resp_buf = try alloc.alloc(u8, resp_size);
+        errdefer alloc.free(resp_buf);
+        var total_read: usize = 0;
+        while (total_read < resp_size) {
+            const n = posix.recv(fd, resp_buf[total_read..], 0) catch |err| {
+                self.disconnect();
+                return err;
+            };
+            if (n == 0) {
+                self.disconnect();
+                return error.ConnectionClosed;
+            }
+            total_read += n;
+        }
+
+        return resp_buf;
+    }
 };
 
 /// Pool of RaftClient connections to all peer brokers.
@@ -366,7 +423,7 @@ pub const RaftClientPool = struct {
         }
     }
 
-    /// Fix 4: Send AppendEntries to a specific follower.
+    /// Send AppendEntries to a specific follower.
     pub fn sendAppendEntriesToFollower(
         self: *RaftClientPool,
         follower_id: i32,
@@ -386,6 +443,44 @@ pub const RaftClientPool = struct {
             leader_commit,
             entries,
         ) catch false;
+    }
+
+    /// Send a raw request to a specific peer and return the response (caller-owned).
+    /// Used by MetadataClient for BrokerRegistration and BrokerHeartbeat.
+    pub fn sendRequest(self: *RaftClientPool, peer_id: i32, request: []const u8) ?[]u8 {
+        const client = self.clients.getPtr(peer_id) orelse return null;
+        return client.sendRawRequest(request, self.allocator) catch |err| {
+            log.warn("Raw RPC to peer {d} failed: {}", .{ peer_id, err });
+            return null;
+        };
+    }
+
+    /// Send DescribeQuorum (API 55) to a specific peer and return the raw response.
+    /// Used by MetadataClient to discover the controller leader.
+    pub fn sendDescribeQuorum(self: *RaftClientPool, peer_id: i32) ?[]u8 {
+        const client = self.clients.getPtr(peer_id) orelse return null;
+
+        // Build DescribeQuorum request (API 55, version 0)
+        var req_buf: [128]u8 = undefined;
+        var pos: usize = 0;
+
+        // Request header v1
+        ser.writeI16(&req_buf, &pos, 55); // api_key
+        ser.writeI16(&req_buf, &pos, 0); // api_version
+        ser.writeI32(&req_buf, &pos, client.next_correlation_id); // correlation_id
+        client.next_correlation_id += 1;
+        ser.writeString(&req_buf, &pos, "zmq-metadata-client"); // client_id
+
+        // DescribeQuorum body: topics array with __cluster_metadata, partition 0
+        ser.writeI32(&req_buf, &pos, 1); // num_topics = 1
+        ser.writeString(&req_buf, &pos, "__cluster_metadata");
+        ser.writeI32(&req_buf, &pos, 1); // num_partitions = 1
+        ser.writeI32(&req_buf, &pos, 0); // partition_index = 0
+
+        return client.sendRawRequest(req_buf[0..pos], self.allocator) catch |err| {
+            log.warn("DescribeQuorum to peer {d} failed: {}", .{ peer_id, err });
+            return null;
+        };
     }
 };
 

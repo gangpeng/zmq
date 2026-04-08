@@ -14,7 +14,7 @@ const MockS3 = @import("s3.zig").MockS3;
 /// CompactionManager periodically splits multi-stream StreamSetObjects into
 /// per-stream StreamObjects, and merges small StreamObjects into larger ones.
 ///
-/// This matches Java AutoMQ's CompactionManager:
+/// This matches AutoMQ's CompactionManager:
 /// - Force split: SSOs with multiple streams → per-stream SOs
 /// - Merge: many small SOs for same stream → fewer larger SOs
 /// - Cleanup: old SSOs deleted after data is fully split
@@ -196,12 +196,25 @@ pub const CompactionManager = struct {
             });
         }
 
-        // 7. Delete old SSO from S3 and remove from ObjectManager
-        // Re-read the key before deleting (the SSO entry might still be valid)
-        if (self.object_manager.stream_set_objects.get(sso_id)) |sso_final| {
-            self.deleteS3Object(sso_final.s3_key);
-        }
+        // 7. Remove SSO from ObjectManager first (so fetch queries no longer see it),
+        // then delete from S3. This is the write-before-delete pattern:
+        //   - All new SOs are registered (step 6) before SSO is removed
+        //   - If we crash after removing from ObjectManager but before S3 delete,
+        //     the SSO file becomes an orphan in S3 (harmless, wasted space)
+        //   - If we crash before removing from ObjectManager, the SSO and SOs both
+        //     exist in the index, but getObjects() prefers SOs over SSOs at the same
+        //     offset, so consumers won't see duplicates
+        const sso_key_copy = if (self.object_manager.stream_set_objects.get(sso_id)) |sso_final|
+            self.allocator.dupe(u8, sso_final.s3_key) catch null
+        else
+            null;
         self.object_manager.removeStreamSetObject(sso_id);
+        if (sso_key_copy) |key| {
+            defer self.allocator.free(key);
+            if (!self.deleteS3Object(key)) {
+                log.warn("Orphaned SSO in S3: '{s}' (will be cleaned up later)", .{key});
+            }
+        }
     }
 
     // ---- Phase 2: Merge ----
@@ -242,6 +255,9 @@ pub const CompactionManager = struct {
                     // Flush current merge group
                     self.mergeStreamObjects(sid, group.items) catch |err| {
                         log.warn("Merge failed for stream {d}: {}", .{ sid, err });
+                        group.clearRetainingCapacity();
+                        group_size = 0;
+                        continue;
                     };
                     merge_count += 1;
                     group.clearRetainingCapacity();
@@ -254,7 +270,10 @@ pub const CompactionManager = struct {
 
             // Merge remaining group if ≥ 2 objects
             if (group.items.len >= 2) {
-                try self.mergeStreamObjects(sid, group.items);
+                self.mergeStreamObjects(sid, group.items) catch |err| {
+                    log.warn("Merge failed for stream {d}: {}", .{ sid, err });
+                    continue;
+                };
                 merge_count += 1;
             }
         }
@@ -272,17 +291,27 @@ pub const CompactionManager = struct {
         var merged_start: u64 = std.math.maxInt(u64);
         var merged_end: u64 = 0;
 
-        // Read each SO, extract blocks, append to new writer
+        // Read each SO, extract blocks, append to new writer.
+        // If ANY SO fails to read, abort the entire merge to prevent data loss.
+        var read_failures: usize = 0;
         for (object_ids) |obj_id| {
-            const so = self.object_manager.stream_objects.get(obj_id) orelse continue;
+            const so = self.object_manager.stream_objects.get(obj_id) orelse {
+                read_failures += 1;
+                continue;
+            };
 
             const obj_data = self.getS3Object(so.s3_key) catch |err| {
-                log.warn("Failed to read SO {d} for merge: {}", .{ obj_id, err });
+                log.warn("Failed to read SO {d} for merge: {} — aborting merge", .{ obj_id, err });
+                read_failures += 1;
                 continue;
             };
             defer self.allocator.free(obj_data);
 
-            var reader = ObjectReader.parse(self.allocator, obj_data) catch continue;
+            var reader = ObjectReader.parse(self.allocator, obj_data) catch |err| {
+                log.warn("Failed to parse SO {d}: {} — aborting merge", .{ obj_id, err });
+                read_failures += 1;
+                continue;
+            };
             defer reader.deinit();
 
             for (reader.index_entries, 0..) |entry, i| {
@@ -300,6 +329,14 @@ pub const CompactionManager = struct {
             }
         }
 
+        // Abort if any SO failed to read — we can't safely delete old SOs
+        // if we didn't read all their data into the merged object.
+        if (read_failures > 0) {
+            log.warn("Merge aborted for stream {d}: {d}/{d} SOs failed to read", .{
+                stream_id, read_failures, object_ids.len,
+            });
+            return error.MergeAbortedPartialRead;
+        }
         if (merged_start == std.math.maxInt(u64)) return; // No data to merge
 
         // Write merged object
@@ -324,12 +361,28 @@ pub const CompactionManager = struct {
             merged_data.len,
         );
 
-        // Remove old SOs
+        // Remove old SOs: first collect S3 keys, then remove from ObjectManager,
+        // then delete from S3. This ensures fetch queries see the merged object
+        // and not the old SOs, even if S3 deletion fails (orphaned files).
+        var old_keys = std.ArrayList([]u8).init(self.allocator);
+        defer {
+            for (old_keys.items) |k| self.allocator.free(k);
+            old_keys.deinit();
+        }
         for (object_ids) |obj_id| {
             if (self.object_manager.stream_objects.get(obj_id)) |so| {
-                self.deleteS3Object(so.s3_key);
+                const key_copy = self.allocator.dupe(u8, so.s3_key) catch continue;
+                old_keys.append(key_copy) catch {
+                    self.allocator.free(key_copy);
+                };
             }
             self.object_manager.removeStreamObject(obj_id);
+        }
+        // Now delete from S3 (ObjectManager no longer references these)
+        for (old_keys.items) |key| {
+            if (!self.deleteS3Object(key)) {
+                log.warn("Orphaned SO in S3: '{s}'", .{key});
+            }
         }
 
         log.info("Merged {d} SOs into SO {d} for stream {d} [{d}..{d})", .{
@@ -363,15 +416,22 @@ pub const CompactionManager = struct {
         return error.NoS3Backend;
     }
 
-    fn deleteS3Object(self: *CompactionManager, key: []const u8) void {
+    /// Delete an S3 object. Returns true if deleted, false if failed.
+    /// Failures are logged but do not stop compaction — orphaned S3 objects
+    /// are cleaned up on the next compaction cycle.
+    fn deleteS3Object(self: *CompactionManager, key: []const u8) bool {
         if (self.mock_s3) |s3| {
             _ = s3.deleteObject(key);
-            return;
+            return true;
         }
         if (self.s3_storage) |s3| {
-            s3.deleteObject(key) catch {};
-            return;
+            s3.deleteObject(key) catch |err| {
+                log.warn("Failed to delete S3 object '{s}': {}", .{ key, err });
+                return false;
+            };
+            return true;
         }
+        return false;
     }
 };
 
@@ -678,4 +738,193 @@ test "CompactionManager merge preserves data integrity" {
         const block = reader.readBlock(i).?;
         try testing.expectEqualStrings(expected_blocks[i], block);
     }
+}
+
+test "CompactionManager split uses write-before-delete pattern" {
+    // Verify that after a split, the SSO is removed from ObjectManager
+    // (no duplicate data in fetch queries)
+    var om = ObjectManager.init(testing.allocator, 0);
+    defer om.deinit();
+
+    var mock_s3 = MockS3.init(testing.allocator);
+    defer mock_s3.deinit();
+
+    var writer = ObjectWriter.init(testing.allocator);
+    defer writer.deinit();
+    try writer.addDataBlock(1, 0, 10, 10, "stream1-data");
+    try writer.addDataBlock(2, 0, 5, 5, "stream2-data");
+    const obj_data = try writer.build();
+    defer testing.allocator.free(obj_data);
+
+    try mock_s3.putObject("sso/test/1", obj_data);
+    const ranges = [_]StreamOffsetRange{
+        .{ .stream_id = 1, .start_offset = 0, .end_offset = 10 },
+        .{ .stream_id = 2, .start_offset = 0, .end_offset = 5 },
+    };
+    try om.commitStreamSetObject(1, 0, 1, &ranges, "sso/test/1", obj_data.len);
+
+    var cm = CompactionManager.init(testing.allocator, &om);
+    cm.setMockS3(&mock_s3);
+    try cm.runCompaction();
+
+    // After split: SSO gone, 2 SOs exist
+    try testing.expectEqual(@as(usize, 0), om.getStreamSetObjectCount());
+    try testing.expectEqual(@as(usize, 2), om.getStreamObjectCount());
+
+    // Fetch for stream 1 should return exactly ONE object (not SSO + SO)
+    const r1 = try om.getObjects(1, 0, 100, 10);
+    defer testing.allocator.free(r1);
+    try testing.expectEqual(@as(usize, 1), r1.len);
+
+    // Fetch for stream 2 should also return exactly ONE object
+    const r2 = try om.getObjects(2, 0, 100, 10);
+    defer testing.allocator.free(r2);
+    try testing.expectEqual(@as(usize, 1), r2.len);
+}
+
+test "CompactionManager merge aborts if SO read fails" {
+    // If one SO can't be read from S3, the merge should abort entirely
+    // to prevent data loss (we can't merge what we can't read).
+    var om = ObjectManager.init(testing.allocator, 0);
+    defer om.deinit();
+
+    var mock_s3 = MockS3.init(testing.allocator);
+    defer mock_s3.deinit();
+
+    // Create 12 SOs, but delete one from S3 to simulate read failure
+    var i: u64 = 0;
+    while (i < 12) : (i += 1) {
+        var w = ObjectWriter.init(testing.allocator);
+        defer w.deinit();
+        try w.addDataBlock(1, i * 10, 10, 10, "data");
+        const d = try w.build();
+        defer testing.allocator.free(d);
+
+        const key = try std.fmt.allocPrint(testing.allocator, "so/fail/{d}", .{i});
+        defer testing.allocator.free(key);
+        try mock_s3.putObject(key, d);
+        try om.commitStreamObject(i + 1, 1, i * 10, (i + 1) * 10, key, d.len);
+    }
+
+    // Delete SO #5 from S3 (but keep in ObjectManager) to simulate S3 failure
+    _ = mock_s3.deleteObject("so/fail/5");
+
+    var cm = CompactionManager.init(testing.allocator, &om);
+    cm.setMockS3(&mock_s3);
+    cm.merge_min_object_count = 10;
+
+    // runCompaction should handle the merge failure gracefully
+    try cm.runCompaction();
+
+    // All 12 SOs should still exist (merge was aborted, no deletions)
+    try testing.expectEqual(@as(usize, 12), om.getStreamObjectCount());
+    try testing.expectEqual(@as(u64, 0), cm.total_merges);
+}
+
+test "CompactionManager merge removes old SOs from ObjectManager before S3" {
+    // Verify write-before-delete: merged SO registered and old SOs removed
+    // from ObjectManager before S3 deletion
+    var om = ObjectManager.init(testing.allocator, 0);
+    defer om.deinit();
+
+    var mock_s3 = MockS3.init(testing.allocator);
+    defer mock_s3.deinit();
+
+    var i: u64 = 0;
+    while (i < 12) : (i += 1) {
+        var w = ObjectWriter.init(testing.allocator);
+        defer w.deinit();
+        try w.addDataBlock(1, i * 10, 10, 10, "merge-data");
+        const d = try w.build();
+        defer testing.allocator.free(d);
+
+        const key = try std.fmt.allocPrint(testing.allocator, "so/merge/{d}", .{i});
+        defer testing.allocator.free(key);
+        try mock_s3.putObject(key, d);
+        try om.commitStreamObject(i + 1, 1, i * 10, (i + 1) * 10, key, d.len);
+    }
+
+    var cm = CompactionManager.init(testing.allocator, &om);
+    cm.setMockS3(&mock_s3);
+    cm.merge_min_object_count = 10;
+    try cm.runCompaction();
+
+    // After merge: exactly 1 SO in ObjectManager
+    try testing.expectEqual(@as(usize, 1), om.getStreamObjectCount());
+
+    // The merged SO should cover the full range
+    const results = try om.getObjects(1, 0, 200, 10);
+    defer testing.allocator.free(results);
+    try testing.expectEqual(@as(usize, 1), results.len);
+    try testing.expectEqual(@as(u64, 0), results[0].start_offset);
+    try testing.expectEqual(@as(u64, 120), results[0].end_offset);
+}
+
+test "CompactionManager deleteS3Object failure does not crash" {
+    var om = ObjectManager.init(testing.allocator, 0);
+    defer om.deinit();
+
+    // No S3 backend configured — deletes should return false (not crash)
+    var cm = CompactionManager.init(testing.allocator, &om);
+    const result = cm.deleteS3Object("nonexistent-key");
+    try testing.expect(!result);
+}
+
+test "CompactionManager split then merge preserves data end-to-end" {
+    // Full pipeline: create multi-stream SSO, split, then merge the resulting SOs
+    var om = ObjectManager.init(testing.allocator, 0);
+    defer om.deinit();
+
+    var mock_s3 = MockS3.init(testing.allocator);
+    defer mock_s3.deinit();
+
+    // Create 12 multi-stream SSOs (each has streams 1 and 2)
+    var j: u64 = 0;
+    while (j < 12) : (j += 1) {
+        var w = ObjectWriter.init(testing.allocator);
+        defer w.deinit();
+        try w.addDataBlock(1, j * 10, 10, 10, "s1-data");
+        try w.addDataBlock(2, j * 5, 5, 5, "s2-data");
+        const d = try w.build();
+        defer testing.allocator.free(d);
+
+        const key = try std.fmt.allocPrint(testing.allocator, "sso/e2e/{d}", .{j});
+        defer testing.allocator.free(key);
+        try mock_s3.putObject(key, d);
+
+        const ranges = [_]StreamOffsetRange{
+            .{ .stream_id = 1, .start_offset = j * 10, .end_offset = (j + 1) * 10 },
+            .{ .stream_id = 2, .start_offset = j * 5, .end_offset = (j + 1) * 5 },
+        };
+        try om.commitStreamSetObject(j + 1, 0, j + 1, &ranges, key, d.len);
+    }
+
+    try testing.expectEqual(@as(usize, 12), om.getStreamSetObjectCount());
+
+    var cm = CompactionManager.init(testing.allocator, &om);
+    cm.setMockS3(&mock_s3);
+    cm.merge_min_object_count = 10;
+
+    // Phase 1: Split all multi-stream SSOs
+    try cm.runCompaction();
+
+    // After split: 0 SSOs, 24 SOs (12 for stream 1, 12 for stream 2)
+    try testing.expectEqual(@as(usize, 0), om.getStreamSetObjectCount());
+    try testing.expectEqual(@as(usize, 24), om.getStreamObjectCount());
+
+    // Phase 2: Run again to merge (now each stream has 12 SOs ≥ threshold of 10)
+    cm.last_compaction_ms = 0; // Reset timer
+    try cm.runCompaction();
+
+    // After merge: each stream should have 1 merged SO = 2 total
+    try testing.expectEqual(@as(usize, 2), om.getStreamObjectCount());
+
+    // Verify both streams queryable
+    const r1 = try om.getObjects(1, 0, 200, 10);
+    defer testing.allocator.free(r1);
+    try testing.expect(r1.len >= 1);
+
+    const r2 = try om.getObjects(2, 0, 200, 10);
+    defer testing.allocator.free(r2);
+    try testing.expect(r2.len >= 1);
 }

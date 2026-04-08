@@ -6,7 +6,7 @@ const Allocator = std.mem.Allocator;
 const log = std.log.scoped(.server);
 const IoUring = linux.IoUring;
 
-/// Kafka TCP server — Phase 2b: io_uring + inline handler.
+/// Kafka TCP server.
 ///
 /// Uses Linux io_uring for batched, zero-syscall I/O:
 ///   - Single submit_and_wait() per loop iteration
@@ -116,7 +116,7 @@ pub const Server = struct {
         var ring = try IoUring.init(RING_ENTRIES, 0);
         defer ring.deinit();
 
-        log.info("AutoMQ broker listening on port {d} (io_uring)", .{self.listen_address.getPort()});
+        log.info("ZMQ broker listening on port {d} (io_uring)", .{self.listen_address.getPort()});
 
         // Connection state
         var connections = std.AutoHashMap(posix.socket_t, Connection).init(self.allocator);
@@ -345,7 +345,7 @@ pub const Server = struct {
         var listen_ev = linux.epoll_event{ .events = linux.EPOLL.IN, .data = .{ .fd = sock } };
         try posix.epoll_ctl(epfd, linux.EPOLL.CTL_ADD, sock, &listen_ev);
 
-        log.info("AutoMQ broker listening on port {d} (epoll fallback)", .{self.listen_address.getPort()});
+        log.info("ZMQ broker listening on port {d} (epoll fallback)", .{self.listen_address.getPort()});
 
         var connections = std.AutoHashMap(posix.socket_t, Connection).init(self.allocator);
         defer {

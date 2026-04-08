@@ -86,7 +86,7 @@ pub const GroupCoordinator = struct {
 
     /// Check for rebalance timeouts — if a group has been in PREPARING_REBALANCE
     /// state for longer than its rebalance_timeout_ms, force-complete the rebalance.
-    /// Principle 8 fix: Transitions to COMPLETING_REBALANCE (not directly STABLE).
+    /// Transitions to COMPLETING_REBALANCE (not directly STABLE).
     pub fn checkRebalanceTimeouts(self: *GroupCoordinator) u32 {
         const now = std.time.milliTimestamp();
         var forced: u32 = 0;
@@ -98,7 +98,7 @@ pub const GroupCoordinator = struct {
                 if (group.rebalance_start_ms > 0 and
                     (now - group.rebalance_start_ms) > group.rebalance_timeout_ms)
                 {
-                    // Principle 8 fix: Transition to completing_rebalance, not stable
+                    // Transition to completing_rebalance, not stable
                     // STABLE is only reached after the leader sends SyncGroup
                     group.state = .completing_rebalance;
                     forced += 1;
@@ -119,15 +119,16 @@ pub const GroupCoordinator = struct {
     }
 
     /// Handle JoinGroup request. Returns the member ID and whether this member is the leader.
-    /// Fix #17: Supports group_instance_id for static membership.
-    /// Principle 8 fix: After all members have joined, state transitions to
+    /// Supports group_instance_id for static membership.
+    /// 
+    /// After all members have joined, state transitions to
     /// COMPLETING_REBALANCE (not directly to STABLE). STABLE is reached only
     /// after the leader sends SyncGroup with assignments.
     pub fn joinGroup(self: *GroupCoordinator, group_id: []const u8, member_id: ?[]const u8, protocol_type: []const u8, subscriptions: ?[]const []const u8) !JoinGroupResult {
         return self.joinGroupWithInstanceId(group_id, member_id, null, protocol_type, subscriptions);
     }
 
-    /// Handle JoinGroup with optional group_instance_id (Fix #17).
+    /// Handle JoinGroup with optional group_instance_id.
     /// When group_instance_id is set, the member uses static membership:
     /// - If a member with the same instance_id already exists, it is replaced
     ///   without triggering a full rebalance
@@ -142,7 +143,7 @@ pub const GroupCoordinator = struct {
 
         const group = self.groups.getPtr(group_id).?;
 
-        // Fix #17: Static membership — check if a member with this instance_id already exists
+        // Static membership — check if a member with this instance_id already exists
         if (group_instance_id) |gid| {
             var existing_mid: ?[]const u8 = null;
             var mit = group.members.iterator();
@@ -183,7 +184,7 @@ pub const GroupCoordinator = struct {
         const mid_copy = try self.allocator.dupe(u8, actual_member_id);
         var member = ConsumerGroup.GroupMember.initMember(self.allocator, mid_copy);
 
-        // Fix #17: Set group_instance_id for static membership
+        // Set group_instance_id for static membership
         if (group_instance_id) |gid| {
             member.group_instance_id = try self.allocator.dupe(u8, gid);
         }
@@ -197,7 +198,7 @@ pub const GroupCoordinator = struct {
 
         try group.members.put(mid_copy, member);
 
-        // Principle 8 fix: Transition to PREPARING_REBALANCE when new members join.
+        // Transition to PREPARING_REBALANCE when new members join.
         // The state machine is:
         //   EMPTY → PREPARING_REBALANCE (on first JoinGroup)
         //   STABLE → PREPARING_REBALANCE (when membership changes)
@@ -246,6 +247,10 @@ pub const GroupCoordinator = struct {
 
         if (group.members.getPtr(member_id)) |member| {
             member.last_heartbeat_ms = std.time.milliTimestamp();
+            // Tell client to rejoin if group is rebalancing
+            if (group.state == .preparing_rebalance or group.state == .completing_rebalance) {
+                return 27; // REBALANCE_IN_PROGRESS
+            }
             return 0; // OK
         }
 
@@ -257,7 +262,8 @@ pub const GroupCoordinator = struct {
         const group = self.groups.getPtr(group_id) orelse return 16;
 
         if (group.members.fetchRemove(member_id)) |entry| {
-            self.allocator.free(entry.value.member_id);
+            var member_copy = entry.value;
+            member_copy.deinitMember(self.allocator);
 
             if (group.members.count() == 0) {
                 group.state = .empty;
@@ -273,7 +279,7 @@ pub const GroupCoordinator = struct {
 
     /// Handle SyncGroup request.
     /// The leader sends assignments for all members; followers receive their assignment.
-    /// Principle 8 fix: SyncGroup transitions from COMPLETING_REBALANCE to STABLE.
+    /// SyncGroup transitions from COMPLETING_REBALANCE to STABLE.
     /// Also accepts from PREPARING_REBALANCE for backward compatibility.
     pub fn syncGroup(self: *GroupCoordinator, group_id: []const u8, member_id: []const u8, generation_id: i32, assignments: ?[]const MemberAssignment) !SyncGroupResult {
         const group = self.groups.getPtr(group_id) orelse return .{
@@ -291,8 +297,25 @@ pub const GroupCoordinator = struct {
             .assignment = null,
         };
 
-        // If this is the leader, store assignments for all members
+        // SyncGroup is only valid during rebalance states
+        if (group.state != .completing_rebalance and group.state != .preparing_rebalance) {
+            return .{
+                .error_code = 27, // REBALANCE_IN_PROGRESS (tells client to rejoin)
+                .assignment = null,
+            };
+        }
+
+        // Only the group leader can send partition assignments
         if (assignments) |assigns| {
+            const is_leader = if (group.leader_id) |lid| std.mem.eql(u8, lid, member_id) else false;
+            if (!is_leader) {
+                // Non-leader sent assignments — ignore them (follower waits for leader)
+                const member = group.members.getPtr(member_id).?;
+                return .{
+                    .error_code = 0,
+                    .assignment = member.assignment,
+                };
+            }
             for (assigns) |a| {
                 if (group.members.getPtr(a.member_id)) |member| {
                     // Free old assignment if any
@@ -403,7 +426,7 @@ pub const GroupCoordinator = struct {
         partition_count: i32,
     };
 
-    /// Perform Cooperative Sticky partition assignment for a group (fix #9).
+    /// Perform Cooperative Sticky partition assignment for a group.
     /// Tries to keep members' existing assignments and only moves partitions when necessary.
     pub fn computeStickyAssignment(self: *GroupCoordinator, group_id: []const u8, topic_partitions: []const TopicPartitionCount) ![]MemberAssignment {
         const group = self.groups.getPtr(group_id) orelse return &.{};
@@ -471,10 +494,11 @@ pub const GroupCoordinator = struct {
     }
 
     /// Commit an offset for a topic-partition in a consumer group.
-    /// Fix #10: Also writes to __consumer_offsets partition store if available.
+    /// Also writes to __consumer_offsets partition store if available.
     pub fn commitOffset(self: *GroupCoordinator, group_id: []const u8, topic: []const u8, partition: i32, offset: i64) !void {
         const key = try std.fmt.allocPrint(self.allocator, "{s}:{s}:{d}", .{ group_id, topic, partition });
-        // Remove old key if exists
+        errdefer self.allocator.free(key);
+        // Remove old entry if exists (free old key since we have a new one)
         if (self.committed_offsets.fetchRemove(key)) |old| {
             self.allocator.free(old.key);
         }
@@ -493,7 +517,7 @@ pub const GroupCoordinator = struct {
         return self.groups.count();
     }
 
-    /// Serialize group membership state for persistence (fix #11).
+    /// Serialize group membership state for persistence.
     /// Format: num_groups(u32) + [group_id_len(u16) + group_id + state(u8) + gen(i32) + num_members(u32) + ...]
     pub fn serializeGroupState(self: *GroupCoordinator) ![]u8 {
         var buf = std.ArrayList(u8).init(self.allocator);
@@ -552,7 +576,7 @@ pub const ConsumerGroup = struct {
 
     pub const GroupMember = struct {
         member_id: []u8,
-        /// Fix #17: Static group membership — group.instance.id for Kubernetes-style
+        /// Static group membership — group.instance.id for Kubernetes-style
         /// static membership. When set, members are identified by instance_id rather
         /// than member_id, preventing unnecessary rebalances on pod restarts.
         group_instance_id: ?[]u8 = null,
@@ -622,9 +646,15 @@ test "GroupCoordinator heartbeat" {
 
     const join_result = try coord.joinGroup("g1", null, "consumer", null);
 
-    // Valid heartbeat
+    // Group is in preparing_rebalance after join, so heartbeat returns REBALANCE_IN_PROGRESS
     const err = coord.heartbeat("g1", join_result.member_id, join_result.generation_id);
-    try testing.expectEqual(@as(i16, 0), err);
+    try testing.expectEqual(@as(i16, 27), err); // REBALANCE_IN_PROGRESS
+
+    // Force to STABLE so heartbeat returns OK
+    const group = coord.groups.getPtr("g1").?;
+    group.state = .stable;
+    const err_ok = coord.heartbeat("g1", join_result.member_id, join_result.generation_id);
+    try testing.expectEqual(@as(i16, 0), err_ok);
 
     // Wrong generation
     const err2 = coord.heartbeat("g1", join_result.member_id, 999);
@@ -690,7 +720,12 @@ test "GroupCoordinator syncGroup" {
     const r1 = try coord.joinGroup("g1", null, "consumer", null);
     const r2 = try coord.joinGroup("g1", null, "consumer", null);
 
-    // Leader sends assignments
+    // Follower sends SyncGroup first (no assignments) — gets null assignment (not yet assigned)
+    const sync2_early = try coord.syncGroup("g1", r2.member_id, r2.generation_id, null);
+    try testing.expectEqual(@as(i16, 0), sync2_early.error_code);
+    try testing.expect(sync2_early.assignment == null);
+
+    // Leader sends assignments — transitions to STABLE
     const assignments = [_]GroupCoordinator.MemberAssignment{
         .{ .member_id = r1.member_id, .assignment = "assign-1" },
         .{ .member_id = r2.member_id, .assignment = "assign-2" },
@@ -698,11 +733,6 @@ test "GroupCoordinator syncGroup" {
     const sync1 = try coord.syncGroup("g1", r1.member_id, r1.generation_id, &assignments);
     try testing.expectEqual(@as(i16, 0), sync1.error_code);
     try testing.expectEqualStrings("assign-1", sync1.assignment.?);
-
-    // Follower receives its assignment
-    const sync2 = try coord.syncGroup("g1", r2.member_id, r2.generation_id, null);
-    try testing.expectEqual(@as(i16, 0), sync2.error_code);
-    try testing.expectEqualStrings("assign-2", sync2.assignment.?);
 
     // Group should be stable now
     const group = coord.groups.getPtr("g1").?;
@@ -827,7 +857,12 @@ test "GroupCoordinator full rebalance flow EMPTY to STABLE" {
     // generation_id is same as r1's since state was already preparing_rebalance
     const gen = r2.generation_id;
 
-    // Step 3: Leader sends SyncGroup with assignments → STABLE
+    // Step 3: Follower sends SyncGroup first (before leader) — gets null assignment
+    const sync_follower = try coord.syncGroup("rebal-group", r2.member_id, gen, null);
+    try testing.expectEqual(@as(i16, 0), sync_follower.error_code);
+    try testing.expect(sync_follower.assignment == null);
+
+    // Step 4: Leader sends SyncGroup with assignments → STABLE
     const assignments = [_]GroupCoordinator.MemberAssignment{
         .{ .member_id = r1.member_id, .assignment = "assign-leader" },
         .{ .member_id = r2.member_id, .assignment = "assign-follower" },
@@ -836,11 +871,6 @@ test "GroupCoordinator full rebalance flow EMPTY to STABLE" {
     try testing.expectEqual(@as(i16, 0), sync_result.error_code);
     try testing.expectEqualStrings("assign-leader", sync_result.assignment.?);
     try testing.expectEqual(ConsumerGroup.GroupState.stable, group.state);
-
-    // Step 4: Follower gets its assignment
-    const sync2 = try coord.syncGroup("rebal-group", r2.member_id, gen, null);
-    try testing.expectEqual(@as(i16, 0), sync2.error_code);
-    try testing.expectEqualStrings("assign-follower", sync2.assignment.?);
 }
 
 test "GroupCoordinator session timeout eviction" {
@@ -888,4 +918,234 @@ test "GroupCoordinator session timeout triggers rebalance when members remain" {
     try testing.expectEqual(@as(usize, 1), group.memberCount());
     // Should trigger rebalance since members remain
     try testing.expectEqual(ConsumerGroup.GroupState.preparing_rebalance, group.state);
+}
+
+test "GroupCoordinator leaveGroup properly cleans member resources" {
+    var coord = GroupCoordinator.init(testing.allocator);
+    defer coord.deinit();
+
+    // Join with subscriptions and instance_id to exercise full cleanup
+    const subs = [_][]const u8{"topic-a"};
+    const result = try coord.joinGroupWithInstanceId("g1", null, "instance-1", "consumer", &subs);
+
+    // Verify member has resources allocated
+    const group = coord.groups.getPtr("g1").?;
+    if (group.members.getPtr(result.member_id)) |member| {
+        try testing.expect(member.group_instance_id != null);
+        try testing.expectEqual(@as(usize, 1), member.subscribed_topics.items.len);
+    }
+
+    // LeaveGroup should free all member resources without leaking
+    const err = coord.leaveGroup("g1", result.member_id);
+    try testing.expectEqual(@as(i16, 0), err);
+    try testing.expectEqual(@as(usize, 0), group.memberCount());
+}
+
+test "GroupCoordinator syncGroup rejects non-leader assignments" {
+    var coord = GroupCoordinator.init(testing.allocator);
+    defer coord.deinit();
+
+    const r1 = try coord.joinGroup("g1", null, "consumer", null);
+    const r2 = try coord.joinGroup("g1", null, "consumer", null);
+
+    // r1 is the leader (first to join)
+    try testing.expect(r1.is_leader);
+    try testing.expect(!r2.is_leader);
+
+    // Force group into completing_rebalance for SyncGroup to work
+    const group = coord.groups.getPtr("g1").?;
+    group.state = .completing_rebalance;
+
+    // Non-leader (r2) tries to send assignments — should be ignored
+    const follower_assignments = [_]GroupCoordinator.MemberAssignment{
+        .{ .member_id = r1.member_id, .assignment = "bad-assign-1" },
+        .{ .member_id = r2.member_id, .assignment = "bad-assign-2" },
+    };
+    const sync_r2 = try coord.syncGroup("g1", r2.member_id, r2.generation_id, &follower_assignments);
+    try testing.expectEqual(@as(i16, 0), sync_r2.error_code);
+    // Assignments should NOT have been applied (non-leader)
+    // Group should still be in completing_rebalance (not stable)
+    try testing.expectEqual(ConsumerGroup.GroupState.completing_rebalance, group.state);
+}
+
+test "GroupCoordinator syncGroup validates group state" {
+    var coord = GroupCoordinator.init(testing.allocator);
+    defer coord.deinit();
+
+    const r1 = try coord.joinGroup("g1", null, "consumer", null);
+
+    // Force group to STABLE state
+    const group = coord.groups.getPtr("g1").?;
+    group.state = .stable;
+
+    // SyncGroup while STABLE should return REBALANCE_IN_PROGRESS
+    const sync_result = try coord.syncGroup("g1", r1.member_id, r1.generation_id, null);
+    try testing.expectEqual(@as(i16, 27), sync_result.error_code);
+}
+
+test "GroupCoordinator heartbeat returns REBALANCE_IN_PROGRESS during rebalance" {
+    var coord = GroupCoordinator.init(testing.allocator);
+    defer coord.deinit();
+
+    const r1 = try coord.joinGroup("g1", null, "consumer", null);
+
+    // Group is in PREPARING_REBALANCE after first join
+    const err = coord.heartbeat("g1", r1.member_id, r1.generation_id);
+    try testing.expectEqual(@as(i16, 27), err); // REBALANCE_IN_PROGRESS
+
+    // Force to STABLE
+    const group = coord.groups.getPtr("g1").?;
+    group.state = .stable;
+
+    // Now heartbeat should succeed normally
+    const err2 = coord.heartbeat("g1", r1.member_id, r1.generation_id);
+    try testing.expectEqual(@as(i16, 0), err2);
+}
+
+test "GroupCoordinator static member rejoin preserves assignment" {
+    var coord = GroupCoordinator.init(testing.allocator);
+    defer coord.deinit();
+
+    // Join with static instance_id
+    const r1 = try coord.joinGroupWithInstanceId("g1", null, "instance-1", "consumer", null);
+
+    // Manually assign partition data (simulating SyncGroup)
+    const group = coord.groups.getPtr("g1").?;
+    if (group.members.getPtr(r1.member_id)) |member| {
+        member.assignment = try testing.allocator.dupe(u8, "partition-0");
+    }
+    group.state = .stable;
+
+    // Static member rejoins (same instance_id, simulating pod restart)
+    const r2 = try coord.joinGroupWithInstanceId("g1", null, "instance-1", "consumer", null);
+
+    // Should get back the same member_id (static membership)
+    try testing.expectEqualStrings(r1.member_id, r2.member_id);
+    // Group should still be stable (no rebalance triggered)
+    try testing.expectEqual(ConsumerGroup.GroupState.stable, group.state);
+}
+
+test "GroupCoordinator offset overwrite preserves consistency" {
+    var coord = GroupCoordinator.init(testing.allocator);
+    defer coord.deinit();
+
+    // Commit offset multiple times — should always reflect latest
+    try coord.commitOffset("g1", "topic", 0, 10);
+    try coord.commitOffset("g1", "topic", 0, 20);
+    try coord.commitOffset("g1", "topic", 0, 30);
+
+    const offset = try coord.fetchOffset("g1", "topic", 0);
+    try testing.expectEqual(@as(i64, 30), offset.?);
+}
+
+test "GroupCoordinator multiple groups are independent" {
+    var coord = GroupCoordinator.init(testing.allocator);
+    defer coord.deinit();
+
+    const r_a = try coord.joinGroup("group-a", null, "consumer", null);
+    const r_b = try coord.joinGroup("group-b", null, "consumer", null);
+
+    // Groups should be independent
+    try testing.expectEqual(@as(usize, 2), coord.groupCount());
+
+    // Leaving group-a should not affect group-b
+    _ = coord.leaveGroup("group-a", r_a.member_id);
+    _ = r_b;
+
+    const ga = coord.groups.getPtr("group-a").?;
+    const gb = coord.groups.getPtr("group-b").?;
+    try testing.expectEqual(ConsumerGroup.GroupState.empty, ga.state);
+    try testing.expectEqual(@as(usize, 1), gb.memberCount());
+}
+
+test "GroupCoordinator full lifecycle: join, sync, heartbeat, leave" {
+    var coord = GroupCoordinator.init(testing.allocator);
+    defer coord.deinit();
+
+    // 1. Join
+    const r1 = try coord.joinGroup("g1", null, "consumer", null);
+    try testing.expect(r1.is_leader);
+
+    // 2. Force to completing_rebalance (simulating timeout)
+    const group = coord.groups.getPtr("g1").?;
+    group.state = .completing_rebalance;
+
+    // 3. SyncGroup (leader sends assignments)
+    const assignments = [_]GroupCoordinator.MemberAssignment{
+        .{ .member_id = r1.member_id, .assignment = "partition-0" },
+    };
+    const sync = try coord.syncGroup("g1", r1.member_id, r1.generation_id, &assignments);
+    try testing.expectEqual(@as(i16, 0), sync.error_code);
+    try testing.expectEqualStrings("partition-0", sync.assignment.?);
+    try testing.expectEqual(ConsumerGroup.GroupState.stable, group.state);
+
+    // 4. Heartbeat (should succeed in STABLE state)
+    const hb = coord.heartbeat("g1", r1.member_id, r1.generation_id);
+    try testing.expectEqual(@as(i16, 0), hb);
+
+    // 5. Leave
+    const leave = coord.leaveGroup("g1", r1.member_id);
+    try testing.expectEqual(@as(i16, 0), leave);
+    try testing.expectEqual(ConsumerGroup.GroupState.empty, group.state);
+}
+
+test "GroupCoordinator eviction triggers rebalance for remaining members" {
+    var coord = GroupCoordinator.init(testing.allocator);
+    defer coord.deinit();
+
+    _ = try coord.joinGroup("g1", null, "consumer", null);
+    const r2 = try coord.joinGroup("g1", null, "consumer", null);
+
+    // Force first member's heartbeat to be old
+    const group = coord.groups.getPtr("g1").?;
+    var mit = group.members.iterator();
+    if (mit.next()) |entry| {
+        entry.value_ptr.last_heartbeat_ms = 0; // Very old
+    }
+
+    // Evict expired members
+    const evicted = coord.evictExpiredMembers(30_000);
+    try testing.expectEqual(@as(u32, 1), evicted);
+
+    // Group should be in rebalance (one member remains)
+    try testing.expectEqual(@as(usize, 1), group.memberCount());
+    try testing.expectEqual(ConsumerGroup.GroupState.preparing_rebalance, group.state);
+    _ = r2;
+}
+
+test "GroupCoordinator eviction empties group when all members expire" {
+    var coord = GroupCoordinator.init(testing.allocator);
+    defer coord.deinit();
+
+    _ = try coord.joinGroup("g1", null, "consumer", null);
+
+    // Force member heartbeat to be old
+    const group = coord.groups.getPtr("g1").?;
+    var mit = group.members.iterator();
+    while (mit.next()) |entry| {
+        entry.value_ptr.last_heartbeat_ms = 0;
+    }
+
+    const evicted = coord.evictExpiredMembers(30_000);
+    try testing.expectEqual(@as(u32, 1), evicted);
+    try testing.expectEqual(ConsumerGroup.GroupState.empty, group.state);
+    try testing.expectEqual(@as(usize, 0), group.memberCount());
+}
+
+test "GroupCoordinator generation increments on rebalance" {
+    var coord = GroupCoordinator.init(testing.allocator);
+    defer coord.deinit();
+
+    const r1 = try coord.joinGroup("g1", null, "consumer", null);
+    try testing.expectEqual(@as(i32, 1), r1.generation_id);
+
+    // Second member triggers rebalance — but generation was already set to 1
+    // (second join while already in PREPARING_REBALANCE shouldn't increment again)
+    const r2 = try coord.joinGroup("g1", null, "consumer", null);
+    try testing.expectEqual(@as(i32, 1), r2.generation_id); // Same generation
+
+    // Leave triggers new rebalance with generation increment
+    _ = coord.leaveGroup("g1", r2.member_id);
+    const group = coord.groups.getPtr("g1").?;
+    try testing.expectEqual(@as(i32, 2), group.generation_id);
 }

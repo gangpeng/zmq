@@ -1,4 +1,4 @@
-/// AutoMQ Kafka Streams
+/// ZMQ Kafka Streams
 ///
 /// Stream processing client library:
 /// - Topology: DAG of processing nodes

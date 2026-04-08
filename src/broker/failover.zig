@@ -2,13 +2,11 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 const log = std.log.scoped(.failover);
 
-/// Principle 4 fix: Broker failure handling.
-///
 /// FailoverController detects failed nodes and reassigns their partitions.
-/// In AutoMQ's cloud-native architecture, data lives in S3, so failover
+/// In ZMQ's cloud-native architecture, data lives in S3, so failover
 /// only requires metadata reassignment — no data movement.
 ///
-/// Java AutoMQ uses WAL epoch fencing to prevent split-brain writes.
+/// AutoMQ uses WAL epoch fencing to prevent split-brain writes.
 /// This implementation provides the same semantics:
 /// - Each WAL writer has an epoch; only the current epoch can write
 /// - When a broker fails, its epoch is fenced (bumped) so stale writers
@@ -45,7 +43,7 @@ pub const FailoverController = struct {
         }
     };
 
-    /// Principle 4 fix: Failover timeout — 30 seconds matches Java AutoMQ default.
+    /// Failover timeout — 30 seconds matches AutoMQ default.
     const FAILOVER_TIMEOUT_MS: i64 = 30_000;
 
     pub fn init(alloc: Allocator, node_id: i32) FailoverController {
@@ -80,7 +78,7 @@ pub const FailoverController = struct {
         }
     }
 
-    /// Principle 4 fix: Check for failed nodes and trigger failover.
+    /// Check for failed nodes and trigger failover.
     /// Called from the broker's periodic tick().
     pub fn tick(self: *FailoverController, now_ms: i64) u32 {
         var failover_count: u32 = 0;
@@ -100,7 +98,7 @@ pub const FailoverController = struct {
         return failover_count;
     }
 
-    /// Principle 4 fix: Reassign all partitions from failed node to self.
+    /// Reassign all partitions from failed node to self.
     /// Since data is in S3, this is a metadata-only operation.
     fn failoverNode(self: *FailoverController, failed: *NodeState) void {
         // 1. Fence the failed node's WAL epoch
@@ -123,7 +121,7 @@ pub const FailoverController = struct {
         failed.owned_partitions.clearRetainingCapacity();
     }
 
-    /// Principle 4 fix: Reassign a partition to a target node.
+    /// Reassign a partition to a target node.
     /// Updates metadata so partition.leader = target, partition.isr = [target].
     pub fn reassignPartition(self: *FailoverController, partition: PartitionId, target: i32) void {
         _ = self;
@@ -131,11 +129,11 @@ pub const FailoverController = struct {
         // In production: update the metadata store so that
         //   partition.leader = target
         //   partition.isr = [target]
-        // Since we're single-node with RF=1 in AutoMQ, this is effectively a no-op
+        // Since we're single-node with RF=1 in ZMQ, this is effectively a no-op
         // but the infrastructure is in place for multi-node support.
     }
 
-    /// Principle 4 fix: WAL epoch fencing — check if our epoch is still valid.
+    /// WAL epoch fencing — check if our epoch is still valid.
     /// Returns true if the current epoch allows writes.
     pub fn isEpochValid(self: *const FailoverController) bool {
         // In single-node mode, our epoch is always valid.
@@ -246,4 +244,62 @@ test "FailoverController does not re-fence already fenced node" {
     _ = fc.tick(now); // First tick fences
     const count2 = fc.tick(now); // Second tick should not re-fence
     try testing.expectEqual(@as(u32, 0), count2);
+}
+
+test "FailoverController epoch bumps on each failover" {
+    var fc = FailoverController.init(testing.allocator, 0);
+    defer fc.deinit();
+
+    try fc.registerNode(1);
+    try fc.registerNode(2);
+
+    // Force both nodes to have old heartbeats
+    if (fc.known_nodes.getPtr(1)) |state| state.last_heartbeat_ms = 0;
+    if (fc.known_nodes.getPtr(2)) |state| state.last_heartbeat_ms = 0;
+
+    try testing.expectEqual(@as(u64, 1), fc.currentEpoch());
+
+    const now = std.time.milliTimestamp();
+    const count = fc.tick(now);
+    try testing.expectEqual(@as(u32, 2), count);
+
+    // Epoch should have bumped twice (once per failover)
+    try testing.expectEqual(@as(u64, 3), fc.currentEpoch());
+}
+
+test "FailoverController heartbeat un-fences previously fenced node" {
+    var fc = FailoverController.init(testing.allocator, 0);
+    defer fc.deinit();
+
+    try fc.registerNode(1);
+
+    // Force timeout and fence
+    if (fc.known_nodes.getPtr(1)) |state| state.last_heartbeat_ms = 0;
+    const now = std.time.milliTimestamp();
+    _ = fc.tick(now);
+
+    // Verify fenced
+    if (fc.known_nodes.get(1)) |state| {
+        try testing.expect(state.is_fenced);
+    }
+
+    // Heartbeat should un-fence
+    fc.recordHeartbeat(1);
+    if (fc.known_nodes.get(1)) |state| {
+        try testing.expect(!state.is_fenced);
+    }
+}
+
+test "FailoverController isEpochValid reflects self-fencing state" {
+    var fc = FailoverController.init(testing.allocator, 0);
+    defer fc.deinit();
+
+    try fc.registerNode(0);
+    try testing.expect(fc.isEpochValid());
+
+    // Manually fence self (simulates receiving higher epoch from another leader)
+    if (fc.known_nodes.getPtr(0)) |state| {
+        state.is_fenced = true;
+    }
+    try testing.expect(!fc.isEpochValid());
 }

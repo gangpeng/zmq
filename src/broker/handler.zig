@@ -18,9 +18,9 @@ const MetadataPersistence = @import("persistence.zig").MetadataPersistence;
 const RaftState = @import("../raft/state.zig").RaftState;
 const Authorizer = @import("../security/auth.zig").Authorizer;
 const FetchSessionManager = @import("fetch_session.zig").FetchSessionManager;
-// Principle 4 fix: Import failover controller
+// Import failover controller
 const FailoverController = @import("failover.zig").FailoverController;
-// Principle 5 fix: Import auto balancer
+// Import auto balancer
 const AutoBalancer = @import("auto_balancer.zig").AutoBalancer;
 // Stream/StreamSetObject/StreamObject metadata + compaction
 const ObjectManager = @import("../storage/stream.zig").ObjectManager;
@@ -31,7 +31,7 @@ const CompactionManager = @import("../storage/compaction.zig").CompactionManager
 /// Owns all broker-level state: partition storage, consumer group
 /// coordination, transactions, quotas, metrics.
 pub const Broker = struct {
-    // Fix #4/#18: No global mutex needed — the broker runs in a single-threaded
+    // No global mutex needed — the broker runs in a single-threaded
     // epoll/io_uring event loop with inline handler calls. Removing the mutex
     // eliminates unnecessary synchronization overhead.
     // If multi-threaded processing is added later, use per-partition locks instead.
@@ -41,42 +41,66 @@ pub const Broker = struct {
     quota_manager: QuotaManager,
     metrics: MetricRegistry,
     persistence: MetadataPersistence,
+    /// Map of topic name → topic metadata (partitions, replication factor, config).
     topics: std.StringHashMap(TopicInfo),
+    /// Idempotent producer deduplication: tracks last sequence number per producer+partition.
     producer_sequences: std.AutoHashMap(ProducerKey, i32),
     allocator: Allocator,
+    /// KRaft node ID for this broker in the cluster.
     node_id: i32,
+    /// Kafka protocol listener port.
     port: u16,
+    /// Whether to automatically create topics on first produce/fetch.
     auto_create_topics: bool,
+    /// Default number of partitions for auto-created topics.
     default_num_partitions: i32,
+    /// Default replication factor for auto-created topics.
     default_replication_factor: i16,
+    /// Hostname advertised to clients in metadata responses.
     advertised_host: []const u8,
-    raft_state: RaftState,
+    /// Raft consensus state. Non-null when this node has the controller role.
+    /// Null in broker-only mode (metadata comes from the controller via MetadataClient).
+    raft_state: ?*RaftState = null,
+    /// Cached leader epoch received from the controller (used in broker-only mode).
+    cached_leader_epoch: i32 = 0,
+    /// Set to true when the controller fences this broker (e.g., heartbeat timeout).
+    /// When fenced, the broker rejects all produce requests with NOT_LEADER_OR_FOLLOWER.
+    is_fenced_by_controller: bool = false,
+    /// Timestamp (ms) of the last successful controller heartbeat.
+    /// Used for staleness detection: if too old, the broker self-fences.
+    last_successful_heartbeat_ms: i64 = 0,
     authorizer: Authorizer,
+    /// KIP-227 incremental fetch session manager.
     fetch_sessions: FetchSessionManager,
+    /// Counter for S3 flush failures (used for monitoring/alerting).
     s3_flush_failures: u64 = 0,
-    /// Principle 4 fix: Failover controller for broker failure handling.
+    /// Failover controller for broker failure handling.
     failover_controller: FailoverController,
-    /// Principle 5 fix: Auto-balancer for partition reassignment.
+    /// Auto-balancer for partition reassignment.
     auto_balancer: AutoBalancer,
     /// Stream/StreamSetObject/StreamObject metadata registry + S3 object resolution.
     object_manager: ObjectManager,
     /// Compaction manager: splits multi-stream SSOs into per-stream SOs, merges small SOs.
     compaction_manager: ?CompactionManager = null,
-    /// Fix #3: Delayed fetch purgatory — stores fetch requests waiting for new data.
+    /// Delayed fetch purgatory — stores fetch requests waiting for new data.
     /// When a fetch returns empty and max_wait_ms > 0, the request is stored here
     /// and completed when new data arrives or the timeout expires.
     delayed_fetches: std.ArrayList(DelayedFetch) = undefined,
 
-    /// Fix #3: Delayed fetch entry for purgatory.
+    /// Delayed fetch entry for purgatory.
     pub const DelayedFetch = struct {
-        /// Client connection file descriptor (for sending the response)
+        /// Kafka protocol correlation ID for matching response to request.
         correlation_id: i32,
         topic: []u8,
         partition_id: i32,
+        /// Starting offset the client is fetching from.
         fetch_offset: u64,
         max_bytes: usize,
+        /// Wall-clock deadline (ms) after which the fetch expires without data.
         deadline_ms: i64,
+        /// Kafka API version of the original fetch request.
         api_version: i16,
+        /// Response header version matching the request's flexible version.
         resp_header_version: i16,
         /// Pre-serialized response header bytes needed to build the response
         client_id: ?[]u8,
@@ -95,7 +119,9 @@ pub const Broker = struct {
         name: []u8,
         num_partitions: i32,
         replication_factor: i16,
+        /// UUID v4 identifying this topic (all zeros until assigned).
         topic_id: [16]u8 = .{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 },
+        /// Per-topic configuration overrides (retention, max message size, etc.).
         config: TopicConfig = .{},
 
         /// Generate a random topic UUID (v4 UUID).
@@ -125,10 +151,11 @@ pub const Broker = struct {
         unclean_leader_election_enable: bool = false,
     };
 
-    /// Key for idempotent producer sequence tracking
+    /// Key for idempotent producer sequence tracking.
     pub const ProducerKey = struct {
         producer_id: i64,
-        partition_key: u64, // hash of topic+partition
+        /// Hash of "topic-partition" string to uniquely identify the target partition.
+        partition_key: u64,
     };
 
     pub const BrokerConfig = struct {
@@ -142,16 +169,16 @@ pub const Broker = struct {
         default_num_partitions: i32 = 1,
         default_replication_factor: i16 = 1,
         advertised_host: []const u8 = "localhost",
-        /// Fix #11: message.max.bytes — maximum record batch size (default 1MB)
+        /// message.max.bytes — maximum record batch size (default 1MB)
         message_max_bytes: i32 = 1048576,
-        /// Fix #11: log.retention.ms — retention time in ms (default 7 days, -1 = unlimited)
+        /// log.retention.ms — retention time in ms (default 7 days, -1 = unlimited)
         log_retention_ms: i64 = 604800000,
-        /// Fix #11: log.retention.bytes — retention size per partition (-1 = unlimited)
+        /// log.retention.bytes — retention size per partition (-1 = unlimited)
         log_retention_bytes: i64 = -1,
-        /// Fix #11: compression.type — broker-level compression ("producer" = passthrough)
+        /// compression.type — broker-level compression ("producer" = passthrough)
         compression_type: []const u8 = "producer",
 
-        // Principle 6 fix: S3 WAL performance configuration
+        // S3 WAL performance configuration
         /// S3 WAL batch size in bytes (default 4MB)
         s3_wal_batch_size: usize = 4 * 1024 * 1024,
         /// S3 WAL flush interval in milliseconds (default 250ms)
@@ -160,7 +187,7 @@ pub const Broker = struct {
         /// async = batch flush (fast but lossy). Default: sync for correctness.
         s3_wal_flush_mode: WalFlushMode = .sync,
 
-        // Principle 6 fix: Cache configuration
+        // Cache configuration
         /// Maximum number of blocks in the log cache (default 64)
         cache_max_blocks: usize = 64,
         /// Maximum log cache size in bytes (default 256MB)
@@ -168,13 +195,13 @@ pub const Broker = struct {
         /// S3 block cache size in bytes (default 64MB)
         s3_block_cache_size: u64 = 64 * 1024 * 1024,
 
-        // Principle 6 fix: Network configuration
+        // Network configuration
         /// Number of network/IO threads (default 3)
         network_threads: usize = 3,
         /// Number of IO processing threads (default 8)
         io_threads: usize = 8,
 
-        // Principle 6 fix: Compaction configuration
+        // Compaction configuration
         /// Log compaction interval in milliseconds (default 5 minutes)
         compaction_interval_ms: i64 = 300_000,
     };
@@ -194,7 +221,7 @@ pub const Broker = struct {
                 .s3_bucket = config.s3_bucket,
                 .s3_access_key = config.s3_access_key,
                 .s3_secret_key = config.s3_secret_key,
-                // Principle 6 fix: Pass through configurable cache parameters
+                // Pass through configurable cache parameters
                 .cache_max_blocks = config.cache_max_blocks,
                 .cache_max_size = config.cache_max_size,
             }),
@@ -212,18 +239,17 @@ pub const Broker = struct {
             .default_num_partitions = config.default_num_partitions,
             .default_replication_factor = config.default_replication_factor,
             .advertised_host = config.advertised_host,
-            .raft_state = RaftState.init(alloc, node_id, "automq-cluster"),
             .authorizer = Authorizer.init(alloc),
             .fetch_sessions = FetchSessionManager.init(alloc),
-            // Principle 4 fix: Initialize failover controller
+            // Initialize failover controller
             .failover_controller = FailoverController.init(alloc, node_id),
-            // Principle 5 fix: Initialize auto-balancer
+            // Initialize auto-balancer
             .auto_balancer = AutoBalancer.init(alloc),
             // Initialize ObjectManager for Stream/StreamSetObject/StreamObject tracking
             .object_manager = ObjectManager.init(alloc, node_id),
         };
 
-        // Fix #3: Initialize delayed fetch purgatory
+        // Initialize delayed fetch purgatory
         broker.delayed_fetches = std.ArrayList(DelayedFetch).init(alloc);
 
         // Wire ObjectManager into PartitionStore (and its S3WalBatcher)
@@ -242,6 +268,11 @@ pub const Broker = struct {
         metrics_mod.registerBrokerMetrics(&broker.metrics) catch {};
 
         return broker;
+    }
+
+    /// Wire in the Raft state (owned externally by Controller or main).
+    pub fn setRaftState(self: *Broker, raft: *RaftState) void {
+        self.raft_state = raft;
     }
 
     /// Open the broker (initializes storage, WAL, loads persisted metadata)
@@ -322,7 +353,7 @@ pub const Broker = struct {
             };
         }
 
-        // Fix #1: Flush S3 WAL batcher if threshold reached
+        // Flush S3 WAL batcher if threshold reached
         if (self.store.s3_wal_batcher) |*batcher| {
             if (batcher.shouldFlush()) {
                 if (batcher.flushBuild()) |batch_data| {
@@ -345,10 +376,10 @@ pub const Broker = struct {
             }
         }
 
-        // Fix #3: Expire delayed fetches
+        // Expire delayed fetches
         self.expireDelayedFetches();
 
-        // Principle 4 fix: Check for failed nodes and trigger failover
+        // Check for failed nodes and trigger failover
         const failovers = self.failover_controller.tick(std.time.milliTimestamp());
         if (failovers > 0) {
             log.info("Failover: {d} nodes failed over", .{failovers});
@@ -363,7 +394,7 @@ pub const Broker = struct {
         self.metrics.setGauge("kafka_server_topic_count", @floatFromInt(self.topics.count()));
         self.metrics.setGauge("kafka_server_member_count", @floatFromInt(self.groups.totalMemberCount()));
 
-        // Fix #10/#11: Periodically persist committed offsets and group state
+        // Periodically persist committed offsets and group state
         self.persistOffsets();
 
         // Run S3 object compaction (split multi-stream SSOs, merge small SOs)
@@ -389,16 +420,15 @@ pub const Broker = struct {
         self.txn_coordinator.deinit();
         self.quota_manager.deinit();
         self.metrics.deinit();
-        self.raft_state.deinit();
         self.authorizer.deinit();
         self.fetch_sessions.deinit();
-        // Principle 4 fix: Clean up failover controller
+        // Clean up failover controller
         self.failover_controller.deinit();
-        // Principle 5 fix: Clean up auto-balancer
+        // Clean up auto-balancer
         self.auto_balancer.deinit();
         // Clean up ObjectManager (streams, SSOs, SOs)
         self.object_manager.deinit();
-        // Fix #3: Clean up delayed fetches
+        // Clean up delayed fetches
         for (self.delayed_fetches.items) |*df| df.deinit(self.allocator);
         self.delayed_fetches.deinit();
     }
@@ -495,7 +525,7 @@ pub const Broker = struct {
         };
     }
 
-    /// Fix #3: Expire delayed fetches whose deadline has passed.
+    /// Expire delayed fetches whose deadline has passed.
     /// Called from tick() periodically.
     fn expireDelayedFetches(self: *Broker) void {
         var i: usize = 0;
@@ -512,7 +542,7 @@ pub const Broker = struct {
         }
     }
 
-    /// Fix #3: Check if any delayed fetches can be satisfied after a produce.
+    /// Check if any delayed fetches can be satisfied after a produce.
     /// Called after successfully producing to a partition.
     fn checkDelayedFetchesForPartition(self: *Broker, topic: []const u8, partition_id: i32) void {
         // Check if any delayed fetch is waiting on this partition
@@ -531,7 +561,7 @@ pub const Broker = struct {
         }
     }
 
-    /// Fix #10: Write an offset commit as a RecordBatch record to __consumer_offsets.
+    /// Write an offset commit as a RecordBatch record to __consumer_offsets.
     /// This makes offset commits durable in the same format as Java Kafka.
     /// The partition is hash(group_id) % 50.
     fn writeOffsetCommitRecord(self: *Broker, group_id: []const u8, topic: []const u8, partition_id: i32, offset: i64) void {
@@ -578,7 +608,7 @@ pub const Broker = struct {
     }
 
     /// Process a raw Kafka protocol request frame and return the response.
-    /// Fix #4/#18: No mutex needed — single-threaded event loop.
+    /// No mutex needed — single-threaded event loop.
     pub fn handleRequest(self: *Broker, request_bytes: []const u8) ?[]u8 {
 
         if (request_bytes.len < 8) {
@@ -602,7 +632,7 @@ pub const Broker = struct {
 
         log.debug("api_key={d} v={d} corr={d}", .{ api_key, api_version, req_header.correlation_id });
 
-        // Fix #7: Auth/ACL check before dispatch
+        // Auth/ACL check before dispatch
         if (self.authorizer.aclCount() > 0) {
             const principal = req_header.client_id orelse "anonymous";
             const resource_type = resourceTypeForApiKey(api_key);
@@ -631,7 +661,7 @@ pub const Broker = struct {
             self.metrics.incrementCounter(api_name);
         }
 
-        // Fix #18: Record per-API latency
+        // Record per-API latency
         const t_start = std.time.nanoTimestamp();
 
         const result = switch (api_key) {
@@ -639,7 +669,7 @@ pub const Broker = struct {
             1 => self.handleFetch(request_bytes, pos, &req_header, api_version, resp_header_version),
             2 => self.handleListOffsets(request_bytes, pos, &req_header, api_version, resp_header_version),
             3 => self.handleMetadata(request_bytes, pos, &req_header, api_version, resp_header_version),
-            // Principle 1 fix: Inter-broker RPCs — no-op success handlers for single-node RF=1
+            // Inter-broker RPCs — no-op success handlers for single-node RF=1
             4 => self.handleLeaderAndIsr(request_bytes, pos, &req_header, resp_header_version),
             5 => self.handleStopReplica(request_bytes, pos, &req_header, resp_header_version),
             6 => self.handleUpdateMetadata(request_bytes, pos, &req_header, resp_header_version),
@@ -661,7 +691,7 @@ pub const Broker = struct {
             22 => self.handleInitProducerId(request_bytes, pos, &req_header, api_version, resp_header_version),
             23 => self.handleOffsetForLeaderEpoch(request_bytes, pos, &req_header, api_version, resp_header_version),
             24 => self.handleAddPartitionsToTxn(request_bytes, pos, &req_header, api_version, resp_header_version),
-            // Principle 7 fix: AddOffsetsToTxn (key 25) — register __consumer_offsets partition in txn
+            // AddOffsetsToTxn (key 25) — register __consumer_offsets partition in txn
             25 => self.handleAddOffsetsToTxn(request_bytes, pos, &req_header, api_version, resp_header_version),
             26 => self.handleEndTxn(request_bytes, pos, &req_header, api_version, resp_header_version),
             27 => self.handleWriteTxnMarkers(request_bytes, pos, &req_header, api_version, resp_header_version),
@@ -674,12 +704,12 @@ pub const Broker = struct {
             35 => self.handleDescribeLogDirs(&req_header, resp_header_version),
             36 => self.handleSaslAuthenticate(request_bytes, pos, &req_header, api_version, resp_header_version),
             37 => self.handleCreatePartitions(request_bytes, pos, &req_header, api_version, resp_header_version),
-            // Principle 1 fix: IncrementalAlterConfigs (key 42) — parse and apply config entries
+            // IncrementalAlterConfigs (key 42) — parse and apply config entries
             42 => self.handleIncrementalAlterConfigs(request_bytes, pos, &req_header, api_version, resp_header_version),
             43 => self.handleElectLeaders(&req_header, resp_header_version),
             44 => self.handleAlterPartitionReassignments(request_bytes, pos, &req_header, resp_header_version),
             45 => self.handleListPartitionReassignments(request_bytes, pos, &req_header, resp_header_version),
-            // Principle 1 fix: OffsetDelete (key 47) — delete committed offsets
+            // OffsetDelete (key 47) — delete committed offsets
             47 => self.handleOffsetDelete(request_bytes, pos, &req_header, api_version, resp_header_version),
             60 => self.handleDescribeCluster(&req_header, resp_header_version),
             61 => self.handleDescribeProducers(&req_header, resp_header_version),
@@ -692,7 +722,7 @@ pub const Broker = struct {
 
         const t_done = std.time.nanoTimestamp();
 
-        // Fix #18: Record per-API latency in histogram
+        // Record per-API latency in histogram
         const latency_ns = t_done - t_start;
         const latency_secs: f64 = @as(f64, @floatFromInt(@max(latency_ns, 0))) / 1_000_000_000.0;
         self.metrics.observeHistogram("kafka_server_request_latency_seconds", latency_secs);
@@ -716,7 +746,7 @@ pub const Broker = struct {
             1 => .{ .min = 0, .max = 17 }, // Fetch
             2 => .{ .min = 0, .max = 8 }, // ListOffsets
             3 => .{ .min = 0, .max = 12 }, // Metadata
-            // Principle 1 fix: Inter-broker RPCs
+            // Inter-broker RPCs
             4 => .{ .min = 0, .max = 7 }, // LeaderAndIsr
             5 => .{ .min = 0, .max = 4 }, // StopReplica
             6 => .{ .min = 0, .max = 8 }, // UpdateMetadata
@@ -738,7 +768,7 @@ pub const Broker = struct {
             22 => .{ .min = 0, .max = 4 }, // InitProducerId
             23 => .{ .min = 0, .max = 4 }, // OffsetForLeaderEpoch
             24 => .{ .min = 0, .max = 4 }, // AddPartitionsToTxn
-            // Principle 7 fix: AddOffsetsToTxn
+            // AddOffsetsToTxn
             25 => .{ .min = 0, .max = 3 }, // AddOffsetsToTxn
             26 => .{ .min = 0, .max = 3 }, // EndTxn
             27 => .{ .min = 0, .max = 1 }, // WriteTxnMarkers
@@ -751,12 +781,12 @@ pub const Broker = struct {
             35 => .{ .min = 0, .max = 4 }, // DescribeLogDirs
             36 => .{ .min = 0, .max = 2 }, // SaslAuthenticate
             37 => .{ .min = 0, .max = 3 }, // CreatePartitions
-            // Principle 1 fix: IncrementalAlterConfigs
+            // IncrementalAlterConfigs
             42 => .{ .min = 0, .max = 1 }, // IncrementalAlterConfigs
             43 => .{ .min = 0, .max = 2 }, // ElectLeaders
             44 => .{ .min = 0, .max = 0 }, // AlterPartitionReassignments
             45 => .{ .min = 0, .max = 0 }, // ListPartitionReassignments
-            // Principle 1 fix: OffsetDelete
+            // OffsetDelete
             47 => .{ .min = 0, .max = 0 }, // OffsetDelete
             52 => .{ .min = 0, .max = 1 }, // Vote
             53 => .{ .min = 0, .max = 1 }, // BeginQuorumEpoch
@@ -775,7 +805,7 @@ pub const Broker = struct {
             1 => "kafka_server_fetch_requests_total",
             2 => "list_offsets",
             3 => "metadata",
-            // Principle 1 fix: Inter-broker RPC metric names
+            // Inter-broker RPC metric names
             4 => "leader_and_isr",
             5 => "stop_replica",
             6 => "update_metadata",
@@ -797,7 +827,7 @@ pub const Broker = struct {
             22 => "init_producer_id",
             23 => "offset_for_leader_epoch",
             24 => "add_partitions_to_txn",
-            // Principle 7 fix: AddOffsetsToTxn metric name
+            // AddOffsetsToTxn metric name
             25 => "add_offsets_to_txn",
             26 => "end_txn",
             27 => "write_txn_markers",
@@ -810,7 +840,7 @@ pub const Broker = struct {
             35 => "describe_log_dirs",
             36 => "sasl_authenticate",
             37 => "create_partitions",
-            // Principle 1 fix: IncrementalAlterConfigs metric name
+            // IncrementalAlterConfigs metric name
             42 => "incremental_alter_configs",
             43 => "elect_leaders",
             44 => "alter_partition_reassignments",
@@ -876,7 +906,7 @@ pub const Broker = struct {
             .{ .key = 1, .min = 0, .max = 17 }, // Fetch
             .{ .key = 2, .min = 0, .max = 8 }, // ListOffsets
             .{ .key = 3, .min = 0, .max = 12 }, // Metadata
-            // Principle 1 fix: Inter-broker RPCs
+            // Inter-broker RPCs
             .{ .key = 4, .min = 0, .max = 7 }, // LeaderAndIsr
             .{ .key = 5, .min = 0, .max = 4 }, // StopReplica
             .{ .key = 6, .min = 0, .max = 8 }, // UpdateMetadata
@@ -898,7 +928,7 @@ pub const Broker = struct {
             .{ .key = 22, .min = 0, .max = 4 }, // InitProducerId
             .{ .key = 23, .min = 0, .max = 4 }, // OffsetForLeaderEpoch
             .{ .key = 24, .min = 0, .max = 4 }, // AddPartitionsToTxn
-            // Principle 7 fix: AddOffsetsToTxn
+            // AddOffsetsToTxn
             .{ .key = 25, .min = 0, .max = 3 }, // AddOffsetsToTxn
             .{ .key = 26, .min = 0, .max = 3 }, // EndTxn
             .{ .key = 27, .min = 0, .max = 1 }, // WriteTxnMarkers
@@ -911,12 +941,12 @@ pub const Broker = struct {
             .{ .key = 35, .min = 0, .max = 4 }, // DescribeLogDirs
             .{ .key = 36, .min = 0, .max = 2 }, // SaslAuthenticate
             .{ .key = 37, .min = 0, .max = 3 }, // CreatePartitions
-            // Principle 1 fix: IncrementalAlterConfigs
+            // IncrementalAlterConfigs
             .{ .key = 42, .min = 0, .max = 1 }, // IncrementalAlterConfigs
             .{ .key = 43, .min = 0, .max = 2 }, // ElectLeaders
             .{ .key = 44, .min = 0, .max = 0 }, // AlterPartitionReassignments
             .{ .key = 45, .min = 0, .max = 0 }, // ListPartitionReassignments
-            // Principle 1 fix: OffsetDelete
+            // OffsetDelete
             .{ .key = 47, .min = 0, .max = 0 }, // OffsetDelete
             .{ .key = 60, .min = 0, .max = 1 }, // DescribeCluster
             .{ .key = 61, .min = 0, .max = 0 }, // DescribeProducers
@@ -956,7 +986,7 @@ pub const Broker = struct {
     }
 
     // ---------------------------------------------------------------
-    // Metadata (key 3) — Fix #6: Single-node mode
+    // Metadata (key 3) — Single-node mode
     // In single-node mode, this broker is the ONLY broker in the cluster.
     // All partitions have leader = self.node_id and ISR = [self.node_id].
     // Multi-broker Raft replication is NOT implemented — this is documented
@@ -1032,7 +1062,7 @@ pub const Broker = struct {
                 parts.append(.{
                     .partition_index = @intCast(pi),
                     .leader_id = self.node_id,
-                    .leader_epoch = self.raft_state.current_epoch,
+                    .leader_epoch = if (self.raft_state) |rs| rs.current_epoch else self.cached_leader_epoch,
                     .replica_nodes = &replicas,
                     .isr_nodes = &isr,
                 }) catch continue;
@@ -1074,6 +1104,13 @@ pub const Broker = struct {
     // Produce (key 0)
     // ---------------------------------------------------------------
     fn handleProduce(self: *Broker, request_bytes: []const u8, body_start: usize, req_header: *const RequestHeader, api_version: i16, resp_header_version: i16) ?[]u8 {
+        // Reject all produces if this broker has been fenced by the controller.
+        // Clients will receive NOT_LEADER_OR_FOLLOWER and refresh metadata.
+        if (self.is_fenced_by_controller) {
+            log.warn("Produce rejected: broker is fenced by controller", .{});
+            return self.handleNotController(req_header, resp_header_version);
+        }
+
         var pos = body_start;
         const flexible = api_version >= 9;
 
@@ -1095,7 +1132,7 @@ pub const Broker = struct {
         const acks = ser.readI16(request_bytes, &pos);
         _ = ser.readI32(request_bytes, &pos); // timeout_ms
 
-        // Fix #8: acks=-1 semantics — in single-node mode, self is the only ISR member,
+        // acks=-1 semantics — in single-node mode, self is the only ISR member,
         // so acks=-1 (all replicas) behaves identically to acks=1.
         if (acks == -1 and self.default_replication_factor > 1) {
             log.warn("acks=-1 with replication_factor={d}: single-node mode treats as acks=1", .{self.default_replication_factor});
@@ -1205,6 +1242,7 @@ pub const Broker = struct {
                 _ = self.ensureTopic(topic_name);
 
                 // Actually produce (skip if duplicate or CRC invalid)
+                var was_wal_fenced = false;
                 const produce_result = if (is_duplicate or !crc_valid)
                     null
                 else if (records) |rec|
@@ -1214,30 +1252,33 @@ pub const Broker = struct {
                             log.warn("Record batch too large for {s}-{d}", .{ topic_name, partition_idx });
                         } else if (err == error.WalFenced) {
                             log.warn("WAL fenced: rejecting produce to {s}-{d} (broker is no longer leader)", .{ topic_name, partition_idx });
+                            was_wal_fenced = true;
                         }
                         break :blk null;
                     }
                 else
                     null;
 
-                // Fix #13: Detect MessageTooLarge specifically for proper error code
+                // Detect MessageTooLarge specifically for proper error code
                 const produce_error_code: i16 = if (is_duplicate)
                     0 // idempotent success
                 else if (!crc_valid)
                     2 // CORRUPT_MESSAGE
                 else if (produce_result != null)
                     0 // success
+                else if (was_wal_fenced)
+                    6 // NOT_LEADER_OR_FOLLOWER — tells client to find the new leader
                 else if (records) |rec| blk: {
                     if (rec.len > 1048576) break :blk 10; // MESSAGE_TOO_LARGE
                     break :blk 1; // OFFSET_OUT_OF_RANGE (generic failure)
                 } else 1; // OFFSET_OUT_OF_RANGE
 
-                // Fix #3: Notify delayed fetches when new data arrives
+                // Notify delayed fetches when new data arrives
                 if (produce_result != null) {
                     self.checkDelayedFetchesForPartition(topic_name, partition_idx);
                 }
 
-                // Write partition response — Fix #15: use proper error codes
+                // Write partition response with proper error codes
                 ser.writeI32(resp_buf, &wpos, partition_idx); // index
                 if (is_duplicate) {
                     // Duplicate detection — return success (idempotent)
@@ -1277,12 +1318,12 @@ pub const Broker = struct {
             }
         }
 
-        // ThrottleTimeMs (v1+) — enforce produce quotas (Fix #16)
+        // ThrottleTimeMs (v1+) — enforce produce quotas
         if (api_version >= 1) {
             const client_id_str = req_header.client_id orelse "unknown";
             const throttle = self.quota_manager.recordProduce(client_id_str, request_bytes.len);
             ser.writeI32(resp_buf, &wpos, throttle);
-            // Fix #16: Track throttle metrics
+            // Track throttle metrics
             if (throttle > 0) {
                 self.metrics.incrementCounter("kafka_server_produce_throttle_total");
                 log.debug("Produce throttled {d}ms for client {s}", .{ throttle, client_id_str });
@@ -1320,10 +1361,10 @@ pub const Broker = struct {
         // Skip replica_id, max_wait_ms, min_bytes
         if (api_version <= 14) _ = ser.readI32(request_bytes, &pos); // replica_id
         const max_wait_ms = ser.readI32(request_bytes, &pos); // max_wait_ms
-        _ = max_wait_ms; // Fix #3: used for delayed fetch timeout (simplified implementation)
+        _ = max_wait_ms; // Used for delayed fetch timeout (simplified implementation)
         _ = ser.readI32(request_bytes, &pos); // min_bytes
         if (api_version >= 3) _ = ser.readI32(request_bytes, &pos); // max_bytes
-        // Fix #14: Parse isolation_level for READ_COMMITTED support
+        // Parse isolation_level for READ_COMMITTED support
         var isolation_level: i8 = 0;
         if (api_version >= 4) isolation_level = ser.readI8(request_bytes, &pos);
         var session_id: i32 = 0;
@@ -1351,7 +1392,7 @@ pub const Broker = struct {
         const resp_header = ResponseHeader{ .correlation_id = req_header.correlation_id };
         resp_header.serialize(resp_buf, &wpos, resp_header_version);
 
-        // ThrottleTimeMs (v1+) — enforce fetch quotas (Fix #16)
+        // ThrottleTimeMs (v1+) — enforce fetch quotas
         if (api_version >= 1) {
             const client_id_str = req_header.client_id orelse "unknown";
             const throttle = self.quota_manager.recordFetch(client_id_str, request_bytes.len);
@@ -1417,7 +1458,7 @@ pub const Broker = struct {
 
                 if (flexible) ser.skipTaggedFields(request_bytes, &pos) catch {};
 
-                // Fetch data — Fix #14: use isolation level
+                // Fetch data with isolation level
                 const fetch_result = self.store.fetchWithIsolation(topic_name, partition_idx, fetch_offset, 1024 * 1024, isolation_level) catch PartitionStore.FetchResult{
                     .error_code = 3,
                     .records = &.{},
@@ -1430,7 +1471,7 @@ pub const Broker = struct {
                 ser.writeI16(resp_buf, &wpos, fetch_result.error_code);
                 ser.writeI64(resp_buf, &wpos, fetch_result.high_watermark);
 
-                // Fix #14: Return actual last_stable_offset instead of -1
+                // Return actual last_stable_offset instead of -1
                 if (api_version >= 4) ser.writeI64(resp_buf, &wpos, fetch_result.last_stable_offset);
                 if (api_version >= 5) ser.writeI64(resp_buf, &wpos, 0); // log_start_offset
                 if (api_version >= 4) {
@@ -1520,7 +1561,7 @@ pub const Broker = struct {
                     }
                     ser.writeI64(resp_buf, &wpos, -1); // timestamp
                     ser.writeI64(resp_buf, &wpos, if (timestamp == -2) @as(i64, 0) else hw);
-                    if (api_version >= 4) ser.writeI32(resp_buf, &wpos, self.raft_state.current_epoch); // leader_epoch
+                    if (api_version >= 4) ser.writeI32(resp_buf, &wpos, if (self.raft_state) |rs| rs.current_epoch else self.cached_leader_epoch); // leader_epoch
                     if (flexible) ser.writeEmptyTaggedFields(resp_buf, &wpos);
                 }
                 if (flexible) ser.writeEmptyTaggedFields(resp_buf, &wpos);
@@ -1577,7 +1618,7 @@ pub const Broker = struct {
         _ = ser.readI32(request_bytes, &pos); // session_timeout
         if (api_version >= 1) _ = ser.readI32(request_bytes, &pos); // rebalance_timeout
         const req_member_id = readStr(request_bytes, &pos) catch null;
-        // Fix #17: Parse group_instance_id for static membership
+        // Parse group_instance_id for static membership
         var group_instance_id: ?[]const u8 = null;
         if (api_version >= 5) group_instance_id = readStr(request_bytes, &pos) catch null;
         const protocol_type = (readStr(request_bytes, &pos) catch null) orelse "consumer";
@@ -1741,7 +1782,7 @@ pub const Broker = struct {
                 const offset = ser.readI64(request_bytes, &pos);
                 self.groups.commitOffset(group_id, topic_name, partition_id, offset) catch {};
 
-                // Fix #10: Write offset commit as a RecordBatch to __consumer_offsets
+                // Write offset commit as a RecordBatch to __consumer_offsets
                 // The partition in __consumer_offsets is determined by hash(group_id) % 50
                 self.writeOffsetCommitRecord(group_id, topic_name, partition_id, offset);
 
@@ -2325,7 +2366,7 @@ pub const Broker = struct {
     }
 
     // ---------------------------------------------------------------
-    // EndTxn (key 26) — Fix #7: Write control batches to partition store
+    // EndTxn (key 26) — Write control batches to partition store
     // ---------------------------------------------------------------
     fn handleEndTxn(self: *Broker, request_bytes: []const u8, body_start: usize, req_header: *const RequestHeader, api_version: i16, resp_header_version: i16) ?[]u8 {
         _ = api_version;
@@ -2336,7 +2377,7 @@ pub const Broker = struct {
         const producer_epoch = ser.readI16(request_bytes, &pos);
         const committed = ser.readBool(request_bytes, &pos) catch false;
 
-        // Fix #7: Before completing the txn, get the partition list so we can write control batches
+        // Before completing the txn, get the partition list so we can write control batches
         const control_type: @import("txn_coordinator.zig").TransactionCoordinator.ControlRecordType = if (committed) .commit else .abort;
         if (self.txn_coordinator.getPartitions(producer_id)) |partitions| {
             // Write control batch to each partition in the transaction
@@ -2481,8 +2522,8 @@ pub const Broker = struct {
     }
 
     // ---------------------------------------------------------------
-    // Principle 1 fix: LeaderAndIsr (key 4) — inter-broker RPC no-op
-    // AutoMQ is single-node with RF=1, so this is a protocol-compatible no-op.
+    // LeaderAndIsr (key 4) — inter-broker RPC no-op
+    // ZMQ is single-node with RF=1, so this is a protocol-compatible no-op.
     // ---------------------------------------------------------------
     fn handleLeaderAndIsr(self: *Broker, request_bytes: []const u8, body_start: usize, req_header: *const RequestHeader, resp_header_version: i16) ?[]u8 {
         _ = request_bytes;
@@ -2498,7 +2539,7 @@ pub const Broker = struct {
     }
 
     // ---------------------------------------------------------------
-    // Principle 1 fix: StopReplica (key 5) — inter-broker RPC no-op
+    // StopReplica (key 5) — inter-broker RPC no-op
     // ---------------------------------------------------------------
     fn handleStopReplica(self: *Broker, request_bytes: []const u8, body_start: usize, req_header: *const RequestHeader, resp_header_version: i16) ?[]u8 {
         _ = request_bytes;
@@ -2514,7 +2555,7 @@ pub const Broker = struct {
     }
 
     // ---------------------------------------------------------------
-    // Principle 1 fix: UpdateMetadata (key 6) — inter-broker RPC no-op
+    // UpdateMetadata (key 6) — inter-broker RPC no-op
     // ---------------------------------------------------------------
     fn handleUpdateMetadata(self: *Broker, request_bytes: []const u8, body_start: usize, req_header: *const RequestHeader, resp_header_version: i16) ?[]u8 {
         _ = request_bytes;
@@ -2529,7 +2570,7 @@ pub const Broker = struct {
     }
 
     // ---------------------------------------------------------------
-    // Principle 1 fix: ControlledShutdown (key 7) — inter-broker RPC no-op
+    // ControlledShutdown (key 7) — inter-broker RPC no-op
     // ---------------------------------------------------------------
     fn handleControlledShutdown(self: *Broker, req_header: *const RequestHeader, resp_header_version: i16) ?[]u8 {
         var buf = self.allocator.alloc(u8, 64) catch return null;
@@ -2543,7 +2584,7 @@ pub const Broker = struct {
     }
 
     // ---------------------------------------------------------------
-    // Principle 7 fix: AddOffsetsToTxn (key 25) — register __consumer_offsets in txn
+    // AddOffsetsToTxn (key 25) — register __consumer_offsets in txn
     // Parses group_id, computes the __consumer_offsets partition, and adds it
     // to the transaction via txn_coordinator.addPartitionsToTxn.
     // ---------------------------------------------------------------
@@ -2559,7 +2600,7 @@ pub const Broker = struct {
         _ = producer_epoch;
         const group_id = (ser.readString(request_bytes, &pos) catch return null) orelse "";
 
-        // Principle 7 fix: Compute partition = hash(group_id) % 50 for __consumer_offsets
+        // Compute partition = hash(group_id) % 50 for __consumer_offsets
         var hasher = std.hash.Wyhash.init(0);
         hasher.update(group_id);
         const target_partition: i32 = @intCast(hasher.final() % 50);
@@ -2582,7 +2623,7 @@ pub const Broker = struct {
     }
 
     // ---------------------------------------------------------------
-    // Principle 1 fix: IncrementalAlterConfigs (key 42)
+    // IncrementalAlterConfigs (key 42)
     // Parse config entries and apply valid ones. Handles the same configs
     // as AlterConfigs, with incremental semantics (SET, DELETE, APPEND, SUBTRACT).
     // ---------------------------------------------------------------
@@ -2606,7 +2647,7 @@ pub const Broker = struct {
                 _ = ser.readI8(request_bytes, &pos); // config_operation (0=SET, 1=DELETE, 2=APPEND, 3=SUBTRACT)
                 const config_value = (ser.readString(request_bytes, &pos) catch break) orelse "";
 
-                // Principle 1 fix: Apply config changes to broker/topic
+                // Apply config changes to broker/topic
                 if (resource_type == 2) {
                     // TOPIC resource — apply topic-level config
                     if (self.topics.getPtr(resource_name)) |info| {
@@ -2648,7 +2689,7 @@ pub const Broker = struct {
     }
 
     // ---------------------------------------------------------------
-    // Principle 1 fix: OffsetDelete (key 47)
+    // OffsetDelete (key 47)
     // Delete committed offsets for specified topic-partitions from
     // the group coordinator.
     // ---------------------------------------------------------------
@@ -2681,7 +2722,7 @@ pub const Broker = struct {
             for (0..num_partitions) |_| {
                 const partition_id = ser.readI32(request_bytes, &pos);
 
-                // Principle 1 fix: Delete the committed offset from group coordinator
+                // Delete the committed offset from group coordinator
                 // Build the offset key and remove it
                 const key = std.fmt.allocPrint(self.allocator, "{s}:{s}:{d}", .{ group_id, topic_name, partition_id }) catch continue;
                 if (self.groups.committed_offsets.fetchRemove(key)) |old| {
@@ -2710,6 +2751,18 @@ pub const Broker = struct {
         var wpos: usize = 0;
         resp_header.serialize(buf, &wpos, resp_header_version);
         ser.writeI16(buf, &wpos, 35); // UNSUPPORTED_VERSION
+        return buf[0..wpos];
+    }
+
+    /// Return a NOT_CONTROLLER error response (error code 41).
+    /// Sent when a KRaft API is received on a broker-only node.
+    fn handleNotController(self: *Broker, req_header: *const RequestHeader, resp_header_version: i16) ?[]u8 {
+        const resp_header = ResponseHeader{ .correlation_id = req_header.correlation_id };
+        const header_size = resp_header.calcSize(resp_header_version);
+        const buf = self.allocator.alloc(u8, header_size + 2) catch return null;
+        var wpos: usize = 0;
+        resp_header.serialize(buf, &wpos, resp_header_version);
+        ser.writeI16(buf, &wpos, 41); // NOT_CONTROLLER
         return buf[0..wpos];
     }
 
@@ -2795,7 +2848,7 @@ pub const Broker = struct {
 
                 ser.writeI16(buf, &wpos, 0); // error_code
                 ser.writeI32(buf, &wpos, partition);
-                ser.writeI32(buf, &wpos, self.raft_state.current_epoch); // leader_epoch
+                ser.writeI32(buf, &wpos, if (self.raft_state) |rs| rs.current_epoch else self.cached_leader_epoch); // leader_epoch
                 ser.writeI64(buf, &wpos, end_offset); // end_offset
             }
         }
@@ -2805,7 +2858,7 @@ pub const Broker = struct {
     }
 
     // ---------------------------------------------------------------
-    // WriteTxnMarkers (key 27) — Principle 7 fix: Write actual control batches
+    // WriteTxnMarkers (key 27) — Write actual control batches
     // ---------------------------------------------------------------
     fn handleWriteTxnMarkers(self: *Broker, request_bytes: []const u8, body_start: usize, req_header: *const RequestHeader, api_version: i16, resp_header_version: i16) ?[]u8 {
         _ = api_version;
@@ -2826,7 +2879,7 @@ pub const Broker = struct {
             // Write markers for each topic-partition
             const num_topics = (ser.readArrayLen(request_bytes, &pos) catch 0) orelse 0;
 
-            // Principle 7 fix: Actually write control record batches to each partition
+            // Actually write control record batches to each partition
             // before transitioning state, not just updating the coordinator.
             const control_type: TxnCoordinator.ControlRecordType = if (committed) .commit else .abort;
             if (self.txn_coordinator.getPartitions(producer_id)) |partitions| {
@@ -3069,13 +3122,15 @@ pub const Broker = struct {
     // ---------------------------------------------------------------
     fn handleElectLeaders(self: *Broker, req_header: *const RequestHeader, resp_header_version: i16) ?[]u8 {
         // Trigger a leader election via Raft
-        if (self.raft_state.role != .leader) {
-            // If we're not the leader, start an election
-            _ = self.raft_state.startElection();
-            if (self.raft_state.quorumSize() <= 1) {
-                self.raft_state.becomeLeader();
+        if (self.raft_state) |raft| {
+            if (raft.role != .leader) {
+                // If we're not the leader, start an election
+                _ = raft.startElection();
+                if (raft.quorumSize() <= 1) {
+                    raft.becomeLeader();
+                }
+                log.info("Leader election triggered via ElectLeaders API", .{});
             }
-            log.info("Leader election triggered via ElectLeaders API", .{});
         }
 
         var buf = self.allocator.alloc(u8, 256) catch return null;
@@ -3105,7 +3160,7 @@ pub const Broker = struct {
     }
 
     // ---------------------------------------------------------------
-    // DescribeCluster (key 60) — Fix #19: Return actual broker state
+    // DescribeCluster (key 60) — Return actual broker state
     // ---------------------------------------------------------------
     fn handleDescribeCluster(self: *Broker, req_header: *const RequestHeader, resp_header_version: i16) ?[]u8 {
         var buf = self.allocator.alloc(u8, 512) catch return null;
@@ -3115,9 +3170,9 @@ pub const Broker = struct {
         ser.writeI32(buf, &wpos, 0); // throttle_time_ms
         ser.writeI16(buf, &wpos, 0); // error_code
         ser.writeString(buf, &wpos, ""); // error_message
-        ser.writeString(buf, &wpos, self.raft_state.cluster_id); // cluster_id — use actual cluster ID
+        ser.writeString(buf, &wpos, if (self.raft_state) |rs| rs.cluster_id else "zmq-cluster"); // cluster_id — use actual cluster ID
         ser.writeI32(buf, &wpos, self.node_id); // controller_id
-        // Brokers array: 1 broker (single-node mode, Fix #6)
+        // Brokers array: 1 broker (single-node mode)
         ser.writeArrayLen(buf, &wpos, 1);
         ser.writeI32(buf, &wpos, self.node_id); // broker_id
         ser.writeString(buf, &wpos, self.advertised_host); // host
@@ -3129,7 +3184,7 @@ pub const Broker = struct {
     }
 
     // ---------------------------------------------------------------
-    // DescribeProducers (key 61) — Fix #19: Return actual producer state
+    // DescribeProducers (key 61) — Return actual producer state
     // ---------------------------------------------------------------
     fn handleDescribeProducers(self: *Broker, req_header: *const RequestHeader, resp_header_version: i16) ?[]u8 {
         var buf = self.allocator.alloc(u8, 2048) catch return null;
@@ -3245,6 +3300,7 @@ pub const Broker = struct {
     // ---------------------------------------------------------------
     fn handleVote(self: *Broker, request_bytes: []const u8, start_pos: usize, req_header: *const RequestHeader, api_version: i16, resp_header_version: i16) ?[]u8 {
         _ = api_version;
+        const raft = self.raft_state orelse return self.handleNotController(req_header, resp_header_version);
         var pos = start_pos;
 
         // Vote (API 52) is always flexible — use compact serialization
@@ -3261,7 +3317,7 @@ pub const Broker = struct {
         const last_epoch = ser.readI32(request_bytes, &pos);
 
         // Process vote request through Raft state machine
-        const vote_result = self.raft_state.handleVoteRequest(
+        const vote_result = raft.handleVoteRequest(
             candidate_id,
             candidate_epoch,
             @intCast(last_epoch_end_offset),
@@ -3296,6 +3352,7 @@ pub const Broker = struct {
     // BeginQuorumEpoch (key 53) — KRaft leader heartbeat
     // ---------------------------------------------------------------
     fn handleBeginQuorumEpoch(self: *Broker, request_bytes: []const u8, start_pos: usize, req_header: *const RequestHeader, resp_header_version: i16) ?[]u8 {
+        const raft = self.raft_state orelse return self.handleNotController(req_header, resp_header_version);
         var pos = start_pos;
 
         // Parse simplified request body
@@ -3309,18 +3366,18 @@ pub const Broker = struct {
         const leader_epoch = ser.readI32(request_bytes, &pos);
 
         // Process through Raft state machine
-        if (leader_epoch >= self.raft_state.current_epoch) {
+        if (leader_epoch >= raft.current_epoch) {
             // Step down: if we were leader and a higher epoch arrives, we must stop writing
-            if (self.raft_state.role == .leader and leader_epoch > self.raft_state.current_epoch) {
+            if (raft.role == .leader and leader_epoch > raft.current_epoch) {
                 log.info("Stepping down: received higher epoch {d} from leader {d} (was leader at epoch {d})", .{
-                    leader_epoch, leader_id, self.raft_state.current_epoch,
+                    leader_epoch, leader_id, raft.current_epoch,
                 });
                 // Fence the S3 WAL batcher to prevent stale writes
                 if (self.store.s3_wal_batcher) |*batcher| {
                     batcher.fence();
                 }
             }
-            self.raft_state.becomeFollower(leader_epoch, leader_id);
+            raft.becomeFollower(leader_epoch, leader_id);
             log.info("Acknowledged leader {d} epoch={d}", .{ leader_id, leader_epoch });
         }
 
@@ -3339,15 +3396,16 @@ pub const Broker = struct {
     // EndQuorumEpoch (key 54) — KRaft leader step-down
     // ---------------------------------------------------------------
     fn handleEndQuorumEpoch(self: *Broker, request_bytes: []const u8, start_pos: usize, req_header: *const RequestHeader, resp_header_version: i16) ?[]u8 {
+        const raft = self.raft_state orelse return self.handleNotController(req_header, resp_header_version);
         var pos = start_pos;
         _ = request_bytes;
         _ = &pos;
 
         // When leader steps down, followers should start an election
-        if (self.raft_state.role == .follower) {
+        if (raft.role == .follower) {
             log.info("Leader stepped down, will start election", .{});
             // Reset election timer to trigger election soon
-            self.raft_state.election_timer.reset();
+            raft.election_timer.reset();
         }
 
         // Build response
@@ -3365,6 +3423,7 @@ pub const Broker = struct {
     // DescribeQuorum (key 55) — KRaft quorum info
     // ---------------------------------------------------------------
     fn handleDescribeQuorum(self: *Broker, req_header: *const RequestHeader, resp_header_version: i16) ?[]u8 {
+        const raft = self.raft_state orelse return self.handleNotController(req_header, resp_header_version);
         var buf = self.allocator.alloc(u8, 256) catch return null;
         var wpos: usize = 0;
         const rh = ResponseHeader{ .correlation_id = req_header.correlation_id };
@@ -3380,14 +3439,14 @@ pub const Broker = struct {
         // Partition 0
         ser.writeI16(buf, &wpos, 0); // error_code
         ser.writeI32(buf, &wpos, 0); // partition_index
-        ser.writeI32(buf, &wpos, self.raft_state.leader_id orelse -1); // leader_id
-        ser.writeI32(buf, &wpos, self.raft_state.current_epoch); // leader_epoch
-        ser.writeI64(buf, &wpos, @intCast(self.raft_state.log.lastOffset())); // high_watermark
+        ser.writeI32(buf, &wpos, raft.leader_id orelse -1); // leader_id
+        ser.writeI32(buf, &wpos, raft.current_epoch); // leader_epoch
+        ser.writeI64(buf, &wpos, @intCast(raft.log.lastOffset())); // high_watermark
 
         // Current voters array
-        const voter_count = self.raft_state.quorumSize();
+        const voter_count = raft.quorumSize();
         ser.writeI32(buf, &wpos, @intCast(voter_count));
-        var it = self.raft_state.voters.iterator();
+        var it = raft.voters.iterator();
         while (it.next()) |entry| {
             ser.writeI32(buf, &wpos, entry.key_ptr.*); // replica_id
             ser.writeI64(buf, &wpos, @intCast(entry.value_ptr.match_index)); // log_end_offset

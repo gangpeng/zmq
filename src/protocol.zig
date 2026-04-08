@@ -1,9 +1,9 @@
-/// AutoMQ Wire Protocol
+/// ZMQ Wire Protocol
 ///
 /// Kafka binary protocol implementation including:
 /// - Serialization primitives (compact/non-compact strings, arrays, bytes, tagged fields)
 /// - Request/Response headers (v0 and v1)
-/// - API key registry (all 74 standard + 18 AutoMQ extensions)
+/// - API key registry (all 74 standard + 18 AutoMQ-compatible extensions)
 /// - Protocol message types (ApiVersions, Metadata, etc.)
 /// - Record batch format (V0, V1, V2)
 /// - 230 auto-generated message structs with serialize/deserialize/calcSize

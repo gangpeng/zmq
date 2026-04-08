@@ -23,7 +23,7 @@ pub const S3Client = struct {
     delete_count: u64 = 0,
     bytes_uploaded: u64 = 0,
     bytes_downloaded: u64 = 0,
-    // Fix #14: Connection pool for keep-alive reuse
+    // Connection pool for keep-alive reuse
     // TODO: For HTTPS support, add OpenSSL FFI or use Zig's std.crypto.tls.Client
     //       (requires linking against libssl/libcrypto). HTTPS connections would wrap
     //       the raw socket with TLS before HTTP I/O.
@@ -358,7 +358,7 @@ pub const S3Client = struct {
             const part_status = try self.httpRequest("PUT", path, query, part_data, null, &part_resp);
             if (part_status < 200 or part_status >= 300) return error.S3PartUploadFailed;
 
-            // Fix #15: Parse actual ETag from response headers
+            // Parse actual ETag from response headers
             const etag_str = blk: {
                 const resp_str = part_resp[0..];
                 if (std.mem.indexOf(u8, resp_str, "ETag: ")) |etag_start| {
@@ -402,7 +402,7 @@ pub const S3Client = struct {
         log.info("Multipart upload completed: {s} ({d} parts, {d} bytes)", .{ key, num_parts, data.len });
     }
 
-    /// Fix #14: Connection with reuse support (keep-alive pooling).
+    /// Connection with reuse support (keep-alive pooling).
     /// For simple requests (httpRequestOnce), we still use Connection: close.
     /// A full connection pool would maintain multiple sockets per host.
     fn connect(self: *const S3Client) !std.posix.socket_t {

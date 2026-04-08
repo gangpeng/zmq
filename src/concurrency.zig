@@ -1,4 +1,4 @@
-/// AutoMQ Concurrency Primitives
+/// ZMQ Concurrency Primitives
 ///
 /// Zig equivalents of Java's concurrent utilities:
 /// - Channel(T): bounded MPMC queue (replaces BlockingQueue)

@@ -99,7 +99,7 @@ pub const TlsConnection = struct {
     }
 
     /// Perform the TLS handshake on this connection.
-    /// Fix #6: Returns error.TlsNotImplemented instead of silently pretending TLS works.
+    /// Returns error.TlsNotImplemented instead of silently pretending TLS works.
     /// A production implementation would use OpenSSL FFI (SSL_do_handshake).
     /// Zig's std.crypto provides TLS 1.3 primitives but not a full server-side
     /// TLS implementation, so this is a documented limitation.
@@ -165,7 +165,7 @@ pub const TlsContext = struct {
     }
 
     /// Create a new TLS connection from an accepted TCP socket.
-    /// Fix #6: Returns TlsNotImplemented for SSL/SASL_SSL protocols.
+    /// Returns TlsNotImplemented for SSL/SASL_SSL protocols.
     /// SASL auth (SASL_PLAINTEXT) is wired through the handler's
     /// SaslHandshake + SaslAuthenticate handlers — no TLS needed.
     pub fn wrapConnection(self: *TlsContext, fd: posix.fd_t) !TlsConnection {

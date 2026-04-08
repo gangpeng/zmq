@@ -30,33 +30,46 @@ const log = std.log.scoped(.partition_store);
 /// - Filesystem (Wal) for durable local writes
 /// - S3 (S3Client) for cloud-native cold storage
 pub const PartitionStore = struct {
+    /// Map of "topic-partition" key → partition state.
     partitions: std.StringHashMap(PartitionState),
+    /// In-memory WAL for testing (no disk I/O).
     memory_wal: ?MemoryWal,
+    /// Filesystem WAL for durable local writes.
     fs_wal: ?Wal,
+    /// FIFO in-memory cache for recent/hot record batches.
     cache: LogCache,
+    /// Real S3 storage backend (unified mock/real interface).
     s3_storage: ?S3Storage = null,
+    /// HTTP client for direct S3/MinIO operations.
     s3_client: ?S3Client = null,
+    /// In-memory S3 mock for unit tests.
     mock_s3: ?MockS3 = null,
+    /// Monotonic counter for generating unique S3 object keys.
     s3_object_counter: u64 = 0,
-    s3_wal_batcher: ?S3WalBatcher = null, // Fix #1: async S3 WAL batching
-    s3_block_cache: ?S3BlockCache = null, // Fix #12: LRU block cache for S3 reads
+    s3_wal_batcher: ?S3WalBatcher = null, // Async S3 WAL batching
+    s3_block_cache: ?S3BlockCache = null, // LRU block cache for S3 reads
     object_manager: ?*ObjectManager = null, // Stream/StreamSetObject/StreamObject metadata registry
     allocator: Allocator,
     data_dir: ?[]const u8,
+    /// Whether this store uses filesystem-backed WAL (true) or in-memory (false).
     use_filesystem: bool,
+    /// S3 WAL mode: when true, produce acks only after S3 write completes.
     s3_wal_mode: bool = false,
 
     pub const PartitionState = struct {
         topic: []u8,
         partition_id: i32,
+        /// Next offset to assign to incoming records (monotonically increasing).
         next_offset: u64 = 0,
+        /// Earliest available offset (records before this have been deleted/compacted).
         log_start_offset: u64 = 0,
+        /// Highest offset confirmed durable — consumers see up to this offset.
         high_watermark: u64 = 0,
-        /// Principle 3 fix: Last stable offset for READ_COMMITTED isolation.
+        /// Last stable offset for READ_COMMITTED isolation.
         /// LSO = HW for non-transactional data.
         /// For transactional data, LSO = min(first_unstable_txn_offset, HW).
         last_stable_offset: u64 = 0,
-        /// Principle 3 fix: First unstable transaction offset.
+        /// First unstable transaction offset.
         /// Set when a transaction is ongoing; cleared on commit/abort.
         first_unstable_txn_offset: ?u64 = null,
     };
@@ -106,12 +119,12 @@ pub const PartitionStore = struct {
             });
             store.s3_storage = S3Storage.initReal(alloc, &store.s3_client.?);
 
-            // Fix #1: Initialize S3 WAL batcher for async batching mode
+            // Initialize S3 WAL batcher for async batching mode
             if (config.s3_wal_mode) {
                 store.s3_wal_batcher = S3WalBatcher.init(alloc);
             }
 
-            // Fix #12: Initialize S3 block cache (64MB default)
+            // Initialize S3 block cache (64MB default)
             store.s3_block_cache = S3BlockCache.init(alloc, 64 * 1024 * 1024);
         }
 
@@ -119,7 +132,7 @@ pub const PartitionStore = struct {
     }
 
     /// Open the store (creates WAL directory, S3 bucket, etc.)
-    /// Fix #3: WAL replay on restart — recover records from WAL files.
+    /// WAL replay on restart — recover records from WAL files.
     pub fn open(self: *PartitionStore) !void {
         if (self.fs_wal) |*wal| {
             try wal.open();
@@ -205,13 +218,13 @@ pub const PartitionStore = struct {
 
     /// Produce: append records to a topic-partition.
     /// Implements multiple architectural fixes:
-    /// - Fix #1: S3 WAL batching (append to batcher, not synchronous PUT)
-    /// - Fix #2: Per-record offset (validate last_offset_delta matches record_count-1)
-    /// - Fix #5: Compression handling (detect and log, passthrough mode)
-    /// - Fix #9: Timestamp validation (validate first_timestamp range)
-    /// - Fix #13: Record size validation (check against message.max.bytes)
+    /// - S3 WAL batching (append to batcher, not synchronous PUT)
+    /// - Per-record offset (validate last_offset_delta matches record_count-1)
+    /// - Compression handling (detect and log, passthrough mode)
+    /// - Timestamp validation (validate first_timestamp range)
+    /// - Record size validation (check against message.max.bytes)
     pub fn produce(self: *PartitionStore, topic: []const u8, partition_id: i32, records: []const u8) !ProduceResult {
-        // Fix #13: Record size validation — reject oversized batches
+        // Record size validation — reject oversized batches
         if (records.len > MAX_MESSAGE_BYTES) {
             log.warn("Record batch too large: {d} bytes > max {d}", .{ records.len, MAX_MESSAGE_BYTES });
             return error.MessageTooLarge;
@@ -228,7 +241,7 @@ pub const PartitionStore = struct {
         // Parse record_count from RecordBatch header (fix #1: offset semantics)
         const record_count = parseRecordCount(records);
 
-        // Fix #2: Validate last_offset_delta matches record_count - 1
+        // Validate last_offset_delta matches record_count - 1
         // The last_offset_delta field at byte 23 should equal record_count - 1
         // for consumers to correctly compute per-record offsets
         if (records.len >= BATCH_HEADER_SIZE and records[16] == 2) {
@@ -239,7 +252,7 @@ pub const PartitionStore = struct {
             }
         }
 
-        // Fix #5: Compression detection and logging (passthrough mode)
+        // Compression detection and logging (passthrough mode)
         if (records.len >= BATCH_HEADER_SIZE and records[16] == 2) {
             const attributes = std.mem.readInt(i16, records[21..23], .big);
             const compression = @as(u3, @truncate(@as(u16, @bitCast(attributes)) & 0x07));
@@ -255,7 +268,7 @@ pub const PartitionStore = struct {
             }
         }
 
-        // Fix #9: Timestamp validation
+        // Timestamp validation
         if (records.len >= BATCH_HEADER_SIZE and records[16] == 2) {
             const first_timestamp = std.mem.readInt(i64, records[29..37], .big);
             if (first_timestamp > 0) {
@@ -301,14 +314,14 @@ pub const PartitionStore = struct {
         }
 
         // High watermark gating (fix #4): only advance HW after durable write
-        // Principle 3 fix: HW must only advance AFTER S3 WAL flush completes
+        // HW must only advance AFTER S3 WAL flush completes
         if (self.fs_wal) |*wal| {
             // HW advances on fsync batch completion
             if (state.next_offset % wal.fsync_interval == 0) {
                 state.high_watermark = state.next_offset;
             }
         } else if (!self.s3_wal_mode) {
-            // Principle 3 fix: For in-memory-only mode (no WAL at all),
+            // For in-memory-only mode (no WAL at all),
             // HW advances immediately (acceptable — no durability claim)
             state.high_watermark = state.next_offset;
         }
@@ -329,8 +342,8 @@ pub const PartitionStore = struct {
             }
         }
 
-        // Fix #1: S3 WAL mode — use batcher instead of synchronous PUT
-        // Principle 2 fix: Ensure produce only returns after data is durable in S3
+        // S3 WAL mode — use batcher instead of synchronous PUT
+        // Ensure produce only returns after data is durable in S3
         if (self.s3_wal_mode) {
             if (self.s3_wal_batcher) |*batcher| {
                 // Append to batcher buffer
@@ -339,14 +352,14 @@ pub const PartitionStore = struct {
                     return err;
                 };
 
-                // Principle 2 fix: In sync mode, flush to S3 immediately from produce()
-                // to ensure data is durable before acking. This matches Java AutoMQ
+                // In sync mode, flush to S3 immediately from produce()
+                // to ensure data is durable before acking. This matches AutoMQ's
                 // behavior where produce returns only after WAL write to S3.
                 if (batcher.flush_mode == .sync) {
                     if (self.s3_storage) |*s3| {
                         const flushed = batcher.flushNow(s3);
                         if (flushed) {
-                            // Principle 3 fix: Only advance HW after data is durable
+                            // Only advance HW after data is durable
                             state.high_watermark = state.next_offset;
                         } else {
                             log.warn("S3 WAL sync flush failed, HW not advanced", .{});
@@ -359,7 +372,7 @@ pub const PartitionStore = struct {
                         state.high_watermark = state.next_offset;
                     }
                 } else {
-                    // Principle 2 fix: async mode — HW advances immediately since data
+                    // Async mode — HW advances immediately since data
                     // is in the batcher. Less durable but faster.
                     state.high_watermark = state.next_offset;
                 }
@@ -377,12 +390,12 @@ pub const PartitionStore = struct {
                     log.warn("S3 WAL write-through failed: {}", .{err});
                     return err;
                 };
-                // Principle 3 fix: HW advances only after successful S3 write
+                // HW advances only after successful S3 write
                 state.high_watermark = state.next_offset;
             }
         }
 
-        // Principle 3 fix: Update last_stable_offset
+        // Update last_stable_offset
         // LSO = min(first_unstable_txn_offset, HW)
         if (state.first_unstable_txn_offset) |unstable| {
             state.last_stable_offset = @min(unstable, state.high_watermark);
@@ -397,7 +410,7 @@ pub const PartitionStore = struct {
         };
     }
 
-    /// Maximum record batch size in bytes (default 1MB, Fix #13).
+    /// Maximum record batch size in bytes (default 1MB).
     const MAX_MESSAGE_BYTES: usize = 1048576;
 
     /// Minimum batch header size for V2 records.
@@ -424,8 +437,8 @@ pub const PartitionStore = struct {
 
     /// Fetch: read records from a topic-partition starting at an offset.
     /// Multi-tier read: LogCache → S3BlockCache → S3
-    /// Fix #12: S3 block cache in front of direct S3 reads.
-    /// Fix #14: Support isolation_level parameter for READ_COMMITTED.
+    /// S3 block cache in front of direct S3 reads.
+    /// Support isolation_level parameter for READ_COMMITTED.
     pub fn fetch(self: *PartitionStore, topic: []const u8, partition_id: i32, start_offset: u64, max_bytes: usize) !FetchResult {
         return self.fetchWithIsolation(topic, partition_id, start_offset, max_bytes, 0);
     }
@@ -443,8 +456,8 @@ pub const PartitionStore = struct {
             .last_stable_offset = -1,
         };
 
-        // Fix #14: For READ_COMMITTED, cap the visible offset range to last_stable_offset
-        // Principle 3 fix: Use LSO (not HW) for READ_COMMITTED isolation.
+        // For READ_COMMITTED, cap the visible offset range to last_stable_offset
+        // Use LSO (not HW) for READ_COMMITTED isolation.
         // LSO = min(first_unstable_txn_offset, HW) — excludes uncommitted txn data.
         const effective_end_offset = if (isolation_level == 1)
             state.last_stable_offset // READ_COMMITTED: only up to last stable offset
@@ -480,12 +493,12 @@ pub const PartitionStore = struct {
                 .error_code = 0,
                 .records = buf,
                 .high_watermark = @intCast(state.high_watermark),
-                // Principle 3 fix: Return actual LSO instead of HW
+                // Return actual LSO instead of HW
                 .last_stable_offset = @intCast(state.last_stable_offset),
             };
         }
 
-        // Tier 2: Read from S3BlockCache (Fix #12)
+        // Tier 2: Read from S3BlockCache
         if (self.s3_block_cache) |*block_cache| {
             const cache_key = std.fmt.allocPrint(self.allocator, "{s}/{d}/{d}", .{
                 topic, partition_id, start_offset / 100,
@@ -600,7 +613,7 @@ pub const PartitionStore = struct {
                     self.allocator.free(obj_data);
                     log.info("S3 fallback read: {d} bytes for {s}-{d}", .{ s3_pos, topic, partition_id });
 
-                    // Fix #12: Cache the S3 result in the block cache
+                    // Cache the S3 result in the block cache
                     if (self.s3_block_cache) |*block_cache| {
                         const bc_key = std.fmt.allocPrint(self.allocator, "{s}/{d}/{d}", .{
                             topic, partition_id, start_offset / 100,
@@ -634,7 +647,7 @@ pub const PartitionStore = struct {
         error_code: i16,
         records: []const u8,
         high_watermark: i64,
-        /// Fix #14: Last stable offset for READ_COMMITTED isolation.
+        /// Last stable offset for READ_COMMITTED isolation.
         /// In single-node mode without ISR, LSO equals high watermark.
         last_stable_offset: i64 = -1,
     };
