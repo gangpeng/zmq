@@ -201,18 +201,25 @@ pub fn main() !void {
     var raft_pool: ?RaftClientPool = null;
 
     if (process_roles.is_controller) {
+        try stdout.print("  DEBUG: alloc.create(Controller)...\n", .{});
         const ctrl = try alloc.create(Controller);
+        try stdout.print("  DEBUG: Controller.init...\n", .{});
         ctrl.* = Controller.init(alloc, node_id, cluster_id);
         controller = ctrl;
+        try stdout.print("  DEBUG: controller initialized\n", .{});
 
         if (voters_str == null) {
+            try stdout.print("  DEBUG: single-node, adding self as voter\n", .{});
             ctrl.raft_state.addVoter(node_id) catch {};
         } else {
+            try stdout.print("  DEBUG: multi-node, parsing voters\n", .{});
             raft_pool = RaftClientPool.init(alloc);
             parseAndRegisterVoters(&ctrl.raft_state, voters_str.?, &raft_pool.?);
+            try stdout.print("  DEBUG: voters parsed\n", .{});
         }
 
         handler_routing.setGlobalController(ctrl);
+        try stdout.print("  DEBUG: controller setup complete\n", .{});
     }
     defer if (controller) |ctrl| {
         ctrl.deinit();
