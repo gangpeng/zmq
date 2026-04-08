@@ -61,7 +61,6 @@ pub const Controller = struct {
         var pos: usize = 0;
         const api_key = ser.readI16(request_bytes, &pos);
         const api_version = ser.readI16(request_bytes, &pos);
-        _ = api_version;
 
         const resp_header_version: i16 = if (api_key == 18 and api_version >= 3) 1 else 0;
 
