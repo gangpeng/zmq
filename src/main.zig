@@ -79,7 +79,9 @@ pub fn main() !void {
     _ = args.skip();
 
     while (args.next()) |arg| {
-        if (std.mem.eql(u8, arg, "--data-dir")) {
+        if (std.mem.eql(u8, arg, "--port")) {
+            if (args.next()) |p| port = std.fmt.parseInt(u16, p, 10) catch port;
+        } else if (std.mem.eql(u8, arg, "--data-dir")) {
             data_dir = args.next();
         } else if (std.mem.eql(u8, arg, "--s3-endpoint")) {
             s3_host = args.next();
@@ -154,6 +156,7 @@ pub fn main() !void {
     }
 
     // Validate: broker-only mode requires --voters to know the controller quorum
+    try stdout.print("  DEBUG: parsed args, roles={s} port={d} ctrl_port={d}\n", .{ process_roles.name(), port, controller_port });
     if (process_roles.is_broker and !process_roles.is_controller and voters_str == null) {
         try stdout.print("  ERROR: --voters is required for broker-only mode (process.roles=broker)\n", .{});
         return;
@@ -193,6 +196,7 @@ pub fn main() !void {
     // ═══════════════════════════════════════════════════════════
     // CONTROLLER COMPONENTS (if controller role)
     // ═══════════════════════════════════════════════════════════
+    try stdout.print("  DEBUG: initializing controller...\n", .{});
     var controller: ?*Controller = null;
     var raft_pool: ?RaftClientPool = null;
 
