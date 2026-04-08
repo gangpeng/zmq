@@ -633,6 +633,11 @@ pub const S3WalBatcher = struct {
     /// Optional: ObjectManager for registering flushed objects as StreamSetObjects.
     /// When set, flushNow() will register the flushed object with the ObjectManager.
     object_manager: ?*ObjectManager = null,
+    /// Group commit: partitions with unflushed data. stream_id → next_offset to set as HW.
+    /// Populated by trackPendingHW(), drained after successful flush by drainPendingHWUpdates().
+    pending_hw_updates: std.AutoHashMap(u64, u64),
+    /// Group commit: number of produce requests waiting on the current batch.
+    pending_produce_count: u32 = 0,
 
     pub const BatchEntry = struct {
         stream_id: u64,
@@ -649,10 +654,11 @@ pub const S3WalBatcher = struct {
             .buffer = std.ArrayList(BatchEntry).init(alloc),
             .last_flush_ms = std.time.milliTimestamp(),
             .allocator = alloc,
+            .pending_hw_updates = std.AutoHashMap(u64, u64).init(alloc),
         };
     }
 
-    /// Initialize with configuration (Principle 6 fix).
+    /// Initialize with configuration.
     pub fn initWithConfig(alloc: Allocator, config: S3WalConfig) S3WalBatcher {
         return .{
             .buffer = std.ArrayList(BatchEntry).init(alloc),
@@ -661,6 +667,7 @@ pub const S3WalBatcher = struct {
             .max_batch_size = config.batch_size,
             .flush_interval_ms = config.flush_interval_ms,
             .flush_mode = config.flush_mode,
+            .pending_hw_updates = std.AutoHashMap(u64, u64).init(alloc),
         };
     }
 
@@ -669,6 +676,7 @@ pub const S3WalBatcher = struct {
             entry.deinit(self.allocator);
         }
         self.buffer.deinit();
+        self.pending_hw_updates.deinit();
     }
 
     /// Append records to the batcher's buffer.
@@ -696,6 +704,30 @@ pub const S3WalBatcher = struct {
         const now = std.time.milliTimestamp();
         const time_elapsed = now - self.last_flush_ms;
         return self.buffer_size >= self.max_batch_size or time_elapsed >= self.flush_interval_ms;
+    }
+
+    /// Group commit: record that a partition needs HW advancement after the next flush.
+    /// Called from produce() in group_commit mode.
+    pub fn trackPendingHW(self: *S3WalBatcher, stream_id: u64, next_offset: u64) !void {
+        const gop = try self.pending_hw_updates.getOrPut(stream_id);
+        if (!gop.found_existing or next_offset > gop.value_ptr.*) {
+            gop.value_ptr.* = next_offset;
+        }
+        self.pending_produce_count += 1;
+    }
+
+    /// Group commit: return pending HW updates after a successful flush, and reset tracking.
+    /// Caller is responsible for deiniting the returned map.
+    pub fn drainPendingHWUpdates(self: *S3WalBatcher) std.AutoHashMap(u64, u64) {
+        const result = self.pending_hw_updates;
+        self.pending_hw_updates = std.AutoHashMap(u64, u64).init(self.allocator);
+        self.pending_produce_count = 0;
+        return result;
+    }
+
+    /// Group commit: returns true if there are produces waiting for an S3 flush.
+    pub fn hasPendingFlush(self: *const S3WalBatcher) bool {
+        return self.pending_produce_count > 0;
     }
 
     /// Force flush all buffered entries to S3 as a single batch object.
@@ -888,9 +920,11 @@ pub const S3WalBatcher = struct {
 /// WAL flush mode configuration.
 /// sync = flush after every produce (durable, matches Java Kafka behavior)
 /// async = batch flush from tick (fast but may lose data on crash)
+/// group_commit = batch flush at epoll boundary (AutoMQ-style, high throughput + durable)
 pub const WalFlushMode = enum {
     sync,
     async_flush,
+    group_commit,
 };
 
 /// S3 WAL configuration parameters.
@@ -1262,4 +1296,59 @@ test "S3WalBatcher setObjectManager" {
     try testing.expect(batcher.object_manager == null);
     batcher.setObjectManager(&om);
     try testing.expect(batcher.object_manager != null);
+}
+
+test "S3WalBatcher trackPendingHW accumulates per-stream max offsets" {
+    var batcher = S3WalBatcher.init(testing.allocator);
+    defer batcher.deinit();
+
+    // Track two different streams
+    try batcher.trackPendingHW(100, 5);
+    try batcher.trackPendingHW(200, 10);
+    try testing.expectEqual(@as(u32, 2), batcher.pending_produce_count);
+
+    // Update stream 100 with a higher offset
+    try batcher.trackPendingHW(100, 8);
+    try testing.expectEqual(@as(u32, 3), batcher.pending_produce_count);
+
+    // Lower offset should NOT replace existing
+    try batcher.trackPendingHW(200, 3);
+    try testing.expectEqual(@as(u32, 4), batcher.pending_produce_count);
+
+    // Verify values
+    try testing.expectEqual(@as(u64, 8), batcher.pending_hw_updates.get(100).?);
+    try testing.expectEqual(@as(u64, 10), batcher.pending_hw_updates.get(200).?);
+}
+
+test "S3WalBatcher drainPendingHWUpdates returns and resets" {
+    var batcher = S3WalBatcher.init(testing.allocator);
+    defer batcher.deinit();
+
+    try batcher.trackPendingHW(100, 5);
+    try batcher.trackPendingHW(200, 10);
+    try testing.expect(batcher.hasPendingFlush());
+
+    // Drain returns the updates
+    var updates = batcher.drainPendingHWUpdates();
+    defer updates.deinit();
+
+    try testing.expectEqual(@as(u64, 5), updates.get(100).?);
+    try testing.expectEqual(@as(u64, 10), updates.get(200).?);
+
+    // Batcher is now reset
+    try testing.expect(!batcher.hasPendingFlush());
+    try testing.expectEqual(@as(u32, 0), batcher.pending_produce_count);
+}
+
+test "S3WalBatcher hasPendingFlush" {
+    var batcher = S3WalBatcher.init(testing.allocator);
+    defer batcher.deinit();
+
+    try testing.expect(!batcher.hasPendingFlush());
+
+    try batcher.trackPendingHW(1, 0);
+    try testing.expect(batcher.hasPendingFlush());
+
+    _ = batcher.drainPendingHWUpdates();
+    try testing.expect(!batcher.hasPendingFlush());
 }

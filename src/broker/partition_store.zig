@@ -85,8 +85,14 @@ pub const PartitionStore = struct {
         s3_bucket: []const u8 = "automq",
         s3_access_key: []const u8 = "minioadmin",
         s3_secret_key: []const u8 = "minioadmin",
-        /// S3 WAL mode: produce only acks after S3 upload succeeds (write-through).
+        /// S3 WAL mode: use S3WalBatcher for batched, durable S3 writes.
         s3_wal_mode: bool = false,
+        /// S3 WAL batcher max batch size (default 4MB).
+        s3_wal_batch_size: usize = 4 * 1024 * 1024,
+        /// S3 WAL batcher flush interval in milliseconds (default 250ms).
+        s3_wal_flush_interval_ms: i64 = 250,
+        /// S3 WAL flush mode: sync, async_flush, or group_commit (default group_commit).
+        s3_wal_flush_mode: wal_mod.WalFlushMode = .group_commit,
     };
 
     /// Initialize with in-memory storage (for testing).
@@ -119,9 +125,13 @@ pub const PartitionStore = struct {
             });
             store.s3_storage = S3Storage.initReal(alloc, &store.s3_client.?);
 
-            // Initialize S3 WAL batcher for async batching mode
+            // Initialize S3 WAL batcher when S3 WAL mode is enabled
             if (config.s3_wal_mode) {
-                store.s3_wal_batcher = S3WalBatcher.init(alloc);
+                store.s3_wal_batcher = S3WalBatcher.initWithConfig(alloc, .{
+                    .batch_size = config.s3_wal_batch_size,
+                    .flush_interval_ms = config.s3_wal_flush_interval_ms,
+                    .flush_mode = config.s3_wal_flush_mode,
+                });
             }
 
             // Initialize S3 block cache (64MB default)
@@ -395,6 +405,15 @@ pub const PartitionStore = struct {
                         // advance HW anyway (testing/development scenario)
                         state.high_watermark = state.next_offset;
                     }
+                } else if (batcher.flush_mode == .group_commit) {
+                    // Group commit: defer S3 flush to epoll batch boundary.
+                    // Track which partitions need HW advancement after the flush.
+                    // The S3 PUT happens in Server's batch_flush_fn callback,
+                    // batching all produces from one epoll iteration into one S3 PUT.
+                    // NOTE: AutoMQ's ObjectWAL uses the same approach — produce acks
+                    // after S3 PUT, but many requests share one PUT via group commit.
+                    batcher.trackPendingHW(stream_id, state.next_offset) catch {};
+                    // HW is NOT advanced — consumers won't see data until S3 flush
                 } else {
                     // Async mode — HW advances immediately since data
                     // is in the batcher. Less durable but faster.
@@ -432,6 +451,28 @@ pub const PartitionStore = struct {
             .log_append_time_ms = -1, // caller can set if needed; avoids syscall per produce
             .log_start_offset = @intCast(state.log_start_offset),
         };
+    }
+
+    /// Apply deferred high-watermark updates after a successful S3 batch flush.
+    /// Called from Broker.flushPendingWal() in group_commit mode.
+    /// The hw_updates map contains stream_id → next_offset pairs.
+    pub fn applyDeferredHWUpdates(self: *PartitionStore, hw_updates: *std.AutoHashMap(u64, u64)) void {
+        var it = self.partitions.iterator();
+        while (it.next()) |entry| {
+            const state = entry.value_ptr;
+            const stream_id = hashPartitionKey(state.topic, state.partition_id);
+            if (hw_updates.get(stream_id)) |new_hw| {
+                if (new_hw > state.high_watermark) {
+                    state.high_watermark = new_hw;
+                    // Update LSO: min(first_unstable_txn, HW)
+                    if (state.first_unstable_txn_offset) |unstable| {
+                        state.last_stable_offset = @min(unstable, state.high_watermark);
+                    } else {
+                        state.last_stable_offset = state.high_watermark;
+                    }
+                }
+            }
+        }
     }
 
     /// Maximum record batch size in bytes (default 1MB).

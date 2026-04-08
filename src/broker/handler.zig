@@ -213,6 +213,8 @@ pub const Broker = struct {
     }
 
     pub fn initWithConfig(alloc: Allocator, node_id: i32, port: u16, config: BrokerConfig) Broker {
+        // Enable S3 WAL mode when S3 endpoint is configured
+        const s3_configured = config.s3_endpoint_host != null;
         var broker = Broker{
             .store = PartitionStore.initWithConfig(alloc, .{
                 .data_dir = config.data_dir,
@@ -224,6 +226,11 @@ pub const Broker = struct {
                 // Pass through configurable cache parameters
                 .cache_max_blocks = config.cache_max_blocks,
                 .cache_max_size = config.cache_max_size,
+                // Enable S3 WAL mode for batched, durable S3 writes
+                .s3_wal_mode = s3_configured,
+                .s3_wal_batch_size = config.s3_wal_batch_size,
+                .s3_wal_flush_interval_ms = config.s3_wal_flush_interval_ms,
+                .s3_wal_flush_mode = config.s3_wal_flush_mode,
             }),
             .groups = GroupCoordinator.init(alloc),
             .txn_coordinator = TxnCoordinator.init(alloc),
@@ -401,6 +408,39 @@ pub const Broker = struct {
         if (self.compaction_manager) |*cm| {
             cm.maybeCompact();
         }
+    }
+
+    /// Flush pending S3 WAL writes and advance HW for all affected partitions.
+    /// Called from the Server's batch_flush_fn callback at the end of each epoll iteration.
+    /// In group_commit mode, many produce requests share a single S3 PUT.
+    /// Only flushes when the batcher's threshold is met (size >= 4MB or time >= 250ms),
+    /// allowing records to accumulate across multiple epoll iterations for maximum batching.
+    /// Returns true if flush succeeded (or nothing to flush).
+    pub fn flushPendingWal(self: *Broker) bool {
+        const batcher = &(self.store.s3_wal_batcher orelse return true);
+        if (batcher.flush_mode != .group_commit) return true;
+        if (!batcher.hasPendingFlush()) return true;
+
+        // Only flush when batch threshold is met (size or time)
+        if (!batcher.shouldFlush()) return true;
+
+        // One S3 PUT for all accumulated produces in this batch
+        if (self.store.s3_storage) |*s3| {
+            const flushed = batcher.flushNow(s3);
+            if (flushed) {
+                // Apply deferred HW updates for all affected partitions
+                var hw_updates = batcher.drainPendingHWUpdates();
+                defer hw_updates.deinit();
+                self.store.applyDeferredHWUpdates(&hw_updates);
+                return true;
+            } else {
+                log.warn("Group commit S3 flush failed ({d} pending produces)", .{batcher.pending_produce_count});
+                self.s3_flush_failures += 1;
+                // Data stays in batcher, HW not advanced — will retry on next iteration
+                return false;
+            }
+        }
+        return true;
     }
 
     pub fn deinit(self: *Broker) void {

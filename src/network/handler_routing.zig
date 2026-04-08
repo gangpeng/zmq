@@ -42,3 +42,22 @@ pub fn brokerHandleRequest(request_bytes: []const u8, alloc: Allocator) ?[]u8 {
     }
     return null;
 }
+
+/// Group commit: flush pending S3 WAL writes after each epoll batch.
+/// Called from Server.batch_flush_fn at the end of each epoll iteration.
+pub fn brokerFlushPendingWal() void {
+    if (global_broker) |broker| {
+        _ = broker.flushPendingWal();
+    }
+}
+
+/// Group commit: check if there are pending S3 WAL writes.
+/// Used by the Server to reduce epoll timeout when a flush is pending.
+pub fn brokerHasPendingFlush() bool {
+    if (global_broker) |broker| {
+        if (broker.store.s3_wal_batcher) |*batcher| {
+            return batcher.hasPendingFlush();
+        }
+    }
+    return false;
+}

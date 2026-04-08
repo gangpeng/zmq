@@ -21,6 +21,10 @@ pub const Server = struct {
     handler: *const RequestHandler,
     running: bool = false,
     num_workers: usize,
+    /// Group commit: called after each epoll/io_uring iteration to flush pending S3 WAL writes.
+    batch_flush_fn: ?*const fn () void = null,
+    /// Group commit: returns true if there are pending WAL writes (used to reduce epoll timeout).
+    has_pending_flush_fn: ?*const fn () bool = null,
 
     const MAX_CONNECTIONS: usize = 100000;
     const IDLE_TIMEOUT_MS: i64 = 60_000;
@@ -241,6 +245,11 @@ pub const Server = struct {
                 }
             }
 
+            // Group commit flush point (io_uring path)
+            if (self.batch_flush_fn) |flush_fn| {
+                flush_fn();
+            }
+
             // Periodic idle eviction
             loop_count += 1;
             if (loop_count % 5000 == 0) {
@@ -358,7 +367,12 @@ pub const Server = struct {
         var loop_count: u64 = 0;
 
         while (self.running) {
-            const nready = posix.epoll_wait(epfd, &events, 100);
+            // Reduce epoll timeout when WAL flush is pending for low-latency group commit
+            const timeout: i32 = if (self.has_pending_flush_fn) |check|
+                (if (check()) @as(i32, 1) else 100)
+            else
+                100;
+            const nready = posix.epoll_wait(epfd, &events, timeout);
             const now_ms = std.time.milliTimestamp();
 
             for (events[0..nready]) |ev| {
@@ -421,6 +435,13 @@ pub const Server = struct {
                         }
                     }
                 }
+            }
+
+            // Group commit flush point: after processing all ready events,
+            // flush pending S3 WAL writes. All produces from all connections
+            // in this epoll iteration share a single S3 PUT.
+            if (self.batch_flush_fn) |flush_fn| {
+                flush_fn();
             }
 
             loop_count += 1;

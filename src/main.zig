@@ -69,7 +69,7 @@ pub fn main() !void {
     // Configurable S3 WAL and performance parameters
     var s3_wal_batch_size: usize = 4 * 1024 * 1024;
     var s3_wal_flush_interval: i64 = 250;
-    var s3_wal_flush_mode: []const u8 = "sync";
+    var s3_wal_flush_mode: []const u8 = "group_commit";
     var cache_max_size: u64 = 256 * 1024 * 1024;
     var s3_block_cache_size: u64 = 64 * 1024 * 1024;
     var compaction_interval: i64 = 300_000;
@@ -189,6 +189,8 @@ pub fn main() !void {
     // Parse WAL flush mode string to enum
     const wal_flush_mode: handler.Broker.WalFlushMode = if (std.mem.eql(u8, s3_wal_flush_mode, "async"))
         .async_flush
+    else if (std.mem.eql(u8, s3_wal_flush_mode, "group_commit"))
+        .group_commit
     else
         .sync;
 
@@ -391,6 +393,9 @@ pub fn main() !void {
     if (process_roles.is_broker) {
         // Broker server on main thread
         var server = try Server.init(alloc, "0.0.0.0", port, &handler_routing.brokerHandleRequest, num_workers);
+        // Wire up group commit flush callbacks for S3 WAL batching
+        server.batch_flush_fn = &handler_routing.brokerFlushPendingWal;
+        server.has_pending_flush_fn = &handler_routing.brokerHasPendingFlush;
         global_server = &server;
         defer {
             server.stop();

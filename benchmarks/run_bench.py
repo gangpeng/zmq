@@ -64,7 +64,8 @@ def produce_body(topic, partition, msg):
 
 def fetch_body(topic, partition, offset, max_bytes=1048576):
     topic_b = topic.encode()
-    body = struct.pack('>iii', -1, 5000, 1) + struct.pack('>i', 1)
+    # max_wait_ms=100 (low for benchmarking), min_bytes=1
+    body = struct.pack('>iii', -1, 100, 1) + struct.pack('>i', 1)
     body += struct.pack('>h', len(topic_b)) + topic_b
     body += struct.pack('>i', 1) + struct.pack('>iqi', partition, offset, max_bytes)
     return body
