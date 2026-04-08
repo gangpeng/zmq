@@ -79,6 +79,8 @@ pub const ElectionLoop = struct {
                     // Leader is active — send periodic heartbeats to followers
                     if (self.tick_counter % 5 == 0) { // heartbeat every ~500ms
                         self.sendHeartbeats();
+                        // Send AppendEntries and process responses to advance commit_index
+                        self.replicateAndCommit();
                     }
                 },
                 .resigned => {
@@ -117,6 +119,49 @@ pub const ElectionLoop = struct {
         if (self.raft_state.role != .leader) return;
         if (self.raft_client_pool) |pool| {
             pool.broadcastHeartbeat(self.raft_state.current_epoch, self.raft_state.node_id);
+        }
+    }
+
+    /// Send AppendEntries to each follower and process responses.
+    /// Updates match_index/next_index, advancing commit_index on majority ack.
+    fn replicateAndCommit(self: *ElectionLoop) void {
+        if (self.raft_client_pool == null) return;
+        const pool = self.raft_client_pool.?;
+        const raft = self.raft_state;
+        if (raft.role != .leader) return;
+
+        var vit = raft.voters.iterator();
+        while (vit.next()) |entry| {
+            const follower_id = entry.key_ptr.*;
+            if (follower_id == raft.node_id) continue; // Skip self
+
+            // Build and send AppendEntries
+            const ae_req = raft.getAppendEntriesForFollower(follower_id) orelse continue;
+            const success = pool.sendAppendEntriesToFollower(
+                follower_id,
+                ae_req.epoch,
+                ae_req.leader_id,
+                @intCast(ae_req.prev_log_offset),
+                ae_req.prev_log_epoch,
+                ae_req.leader_commit,
+                null, // entries sent via heartbeat for now
+            );
+
+            if (success) {
+                // Follower acknowledged — update match_index
+                raft.handleAppendEntriesResponse(follower_id, .{
+                    .success = true,
+                    .epoch = ae_req.epoch,
+                    .match_index = raft.log.lastOffset(),
+                });
+            } else {
+                // Follower rejected — decrement next_index for retry
+                raft.handleAppendEntriesResponse(follower_id, .{
+                    .success = false,
+                    .epoch = ae_req.epoch,
+                    .match_index = 0,
+                });
+            }
         }
     }
 };

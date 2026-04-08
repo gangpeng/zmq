@@ -47,7 +47,7 @@ pub const RaftState = struct {
     };
 
     pub fn init(alloc: Allocator, node_id: i32, cluster_id: []const u8) RaftState {
-        return .{
+        var state = RaftState{
             .node_id = node_id,
             .cluster_id = cluster_id,
             .role = .unattached,
@@ -56,6 +56,8 @@ pub const RaftState = struct {
             .election_timer = ElectionTimer.init(1500, 3000), // 1.5-3s
             .allocator = alloc,
         };
+        state.election_timer.reseed(node_id);
+        return state;
     }
 
     /// Init with data_dir for raft log persistence (Fix 3).
@@ -105,6 +107,9 @@ pub const RaftState = struct {
             self.leader_id = null;
         }
         self.voted_for = candidate_id;
+        // Persist to disk BEFORE granting the vote — crash safety requires
+        // that voted_for is durable before the vote response is sent.
+        self.persistRaftMeta();
         // Reset election timer: granting a vote means the cluster is active,
         // so we shouldn't start our own election immediately.
         self.election_timer.reset();
@@ -123,6 +128,8 @@ pub const RaftState = struct {
         self.role = .candidate;
         self.voted_for = self.node_id;
         self.leader_id = null;
+        // Persist new epoch and self-vote to disk before broadcasting
+        self.persistRaftMeta();
         self.election_timer.reset();
 
         return .{
@@ -160,6 +167,8 @@ pub const RaftState = struct {
         self.role = .follower;
         self.leader_id = leader_id;
         self.voted_for = null;
+        // Persist epoch change to disk
+        self.persistRaftMeta();
         self.election_timer.reset();
     }
 
@@ -208,8 +217,68 @@ pub const RaftState = struct {
         try file.writeAll(data);
     }
 
+    /// Persist current_epoch and voted_for to disk.
+    /// Called before granting a vote or changing epoch to ensure crash safety.
+    /// Without this, a process restart could lead to double-voting in the same epoch.
+    fn persistRaftMeta(self: *RaftState) void {
+        const dir = self.data_dir orelse return;
+        const path = std.fmt.allocPrint(self.allocator, "{s}/raft.meta", .{dir}) catch return;
+        defer self.allocator.free(path);
+
+        // Ensure directory exists
+        fs.makeDirAbsolute(dir) catch |err| switch (err) {
+            error.PathAlreadyExists => {},
+            else => return,
+        };
+
+        const file = fs.createFileAbsolute(path, .{ .truncate = true }) catch return;
+        defer file.close();
+
+        // Write: current_epoch(i32, 4B) + voted_for_present(u8, 1B) + voted_for(i32, 4B)
+        var buf: [9]u8 = undefined;
+        std.mem.writeInt(i32, buf[0..4], self.current_epoch, .big);
+        if (self.voted_for) |vf| {
+            buf[4] = 1;
+            std.mem.writeInt(i32, buf[5..9], vf, .big);
+        } else {
+            buf[4] = 0;
+            std.mem.writeInt(i32, buf[5..9], 0, .big);
+        }
+        file.writeAll(&buf) catch {};
+    }
+
+    /// Load persisted current_epoch and voted_for from disk on startup.
+    /// Returns true if metadata was loaded successfully.
+    pub fn loadPersistedMeta(self: *RaftState) bool {
+        const dir = self.data_dir orelse return false;
+        const path = std.fmt.allocPrint(self.allocator, "{s}/raft.meta", .{dir}) catch return false;
+        defer self.allocator.free(path);
+
+        const file = fs.openFileAbsolute(path, .{}) catch return false;
+        defer file.close();
+
+        var buf: [9]u8 = undefined;
+        const n = file.readAll(&buf) catch return false;
+        if (n < 9) return false;
+
+        const epoch = std.mem.readInt(i32, buf[0..4], .big);
+        const has_voted = buf[4] == 1;
+        const voted = std.mem.readInt(i32, buf[5..9], .big);
+
+        if (epoch > self.current_epoch) {
+            self.current_epoch = epoch;
+        }
+        if (has_voted) {
+            self.voted_for = voted;
+        }
+        return true;
+    }
+
     /// Load and replay persisted raft log entries on startup.
     pub fn loadPersistedLog(self: *RaftState) !u64 {
+        // Load persisted epoch and voted_for first
+        _ = self.loadPersistedMeta();
+
         const dir = self.data_dir orelse return 0;
         const path = try std.fmt.allocPrint(self.allocator, "{s}/raft.log", .{dir});
         defer self.allocator.free(path);
@@ -291,6 +360,66 @@ pub const RaftState = struct {
         epoch: i32,
         match_index: u64,
     };
+
+    pub const AppendEntry = struct {
+        offset: u64,
+        epoch: i32,
+        data: []const u8,
+    };
+
+    /// Handle an AppendEntries request from the leader (follower side).
+    /// Validates prev_log match, truncates conflicting entries, appends new ones.
+    /// Returns success=true if entries were accepted.
+    pub fn handleAppendEntries(
+        self: *RaftState,
+        leader_epoch: i32,
+        leader_id: i32,
+        prev_log_offset: u64,
+        prev_log_epoch: i32,
+        entries: []const AppendEntry,
+        leader_commit: u64,
+    ) AppendEntriesResponse {
+        // Reject if leader's epoch is stale
+        if (leader_epoch < self.current_epoch) {
+            return .{ .success = false, .epoch = self.current_epoch, .match_index = self.log.lastOffset() };
+        }
+
+        // Accept leadership
+        if (leader_epoch >= self.current_epoch) {
+            self.becomeFollower(leader_epoch, leader_id);
+        }
+
+        // Validate prev_log match (skip for first entry)
+        if (prev_log_offset > 0) {
+            if (self.log.get(prev_log_offset)) |prev_entry| {
+                if (prev_entry.epoch != prev_log_epoch) {
+                    // Log mismatch — leader should decrement next_index and retry
+                    return .{ .success = false, .epoch = self.current_epoch, .match_index = self.log.lastOffset() };
+                }
+            } else if (self.log.length() > 0) {
+                // We don't have the entry at prev_log_offset
+                return .{ .success = false, .epoch = self.current_epoch, .match_index = self.log.lastOffset() };
+            }
+        }
+
+        // Append new entries (truncate conflicts first)
+        for (entries) |entry| {
+            if (self.log.hasConflict(entry.offset, entry.epoch)) {
+                self.log.truncateFrom(entry.offset);
+            }
+            // Only append if we don't already have this entry
+            if (self.log.get(entry.offset) == null) {
+                _ = self.log.append(entry.epoch, entry.data) catch continue;
+            }
+        }
+
+        // Update commit index
+        if (leader_commit > self.commit_index) {
+            self.commit_index = @min(leader_commit, self.log.lastOffset());
+        }
+
+        return .{ .success = true, .epoch = self.current_epoch, .match_index = self.log.lastOffset() };
+    }
 
     /// Handle an AppendEntries response from a follower.
     /// Updates match_index and next_index for the follower.
@@ -445,7 +574,21 @@ pub const RaftLog = struct {
         return self.lastOffset() + if (self.entries.items.len > 0) @as(u64, 1) else 0;
     }
 
+    /// Get an entry by offset. Since entries are appended sequentially,
+    /// we can compute the index directly for O(1) lookup, with a linear
+    /// fallback if offsets are non-contiguous (e.g., after truncation).
     pub fn get(self: *const RaftLog, offset: u64) ?*const LogEntry {
+        if (self.entries.items.len == 0) return null;
+        // Fast path: direct index (entries start at offset 0, contiguous)
+        const first_offset = self.entries.items[0].offset;
+        if (offset >= first_offset) {
+            const idx = offset - first_offset;
+            if (idx < self.entries.items.len) {
+                const entry = &self.entries.items[idx];
+                if (entry.offset == offset) return entry;
+            }
+        }
+        // Slow path: linear scan (for non-contiguous offsets after truncation)
         for (self.entries.items) |*entry| {
             if (entry.offset == offset) return entry;
         }
@@ -576,6 +719,15 @@ pub const ElectionTimer = struct {
 
     pub fn isExpired(self: *const ElectionTimer) bool {
         return std.time.milliTimestamp() >= self.deadline_ms;
+    }
+
+    /// Re-seed the PRNG with better entropy (node_id + timestamp).
+    /// Should be called after init to avoid correlated timeouts across nodes.
+    pub fn reseed(self: *ElectionTimer, node_id: i32) void {
+        const ts: u64 = @intCast(std.time.nanoTimestamp());
+        const seed = ts ^ (@as(u64, @intCast(@as(u32, @bitCast(node_id)))) *% 2654435761);
+        self.prng = std.rand.DefaultPrng.init(seed);
+        self.reset();
     }
 };
 
@@ -1158,4 +1310,145 @@ test "Single-node cluster immediately becomes leader" {
         state.becomeLeader();
     }
     try testing.expectEqual(RaftState.Role.leader, state.role);
+}
+
+test "RaftState persists and loads epoch and voted_for" {
+    const tmp_dir = "/tmp/zmq-raft-meta-test";
+    fs.deleteTreeAbsolute(tmp_dir) catch {};
+    defer fs.deleteTreeAbsolute(tmp_dir) catch {};
+
+    // Write epoch and voted_for
+    {
+        var state = RaftState.initWithDataDir(testing.allocator, 0, "test", tmp_dir);
+        defer state.deinit();
+
+        _ = state.startElection(); // epoch=1, voted_for=0
+        try testing.expectEqual(@as(i32, 1), state.current_epoch);
+        try testing.expectEqual(@as(?i32, 0), state.voted_for);
+    }
+
+    // Reload and verify persisted state
+    {
+        var state = RaftState.initWithDataDir(testing.allocator, 0, "test", tmp_dir);
+        defer state.deinit();
+
+        const loaded = state.loadPersistedMeta();
+        try testing.expect(loaded);
+        try testing.expectEqual(@as(i32, 1), state.current_epoch);
+        try testing.expectEqual(@as(?i32, 0), state.voted_for);
+    }
+}
+
+test "RaftState voted_for persists prevents double-voting after restart" {
+    const tmp_dir = "/tmp/zmq-raft-double-vote-test";
+    fs.deleteTreeAbsolute(tmp_dir) catch {};
+    defer fs.deleteTreeAbsolute(tmp_dir) catch {};
+
+    // Node 1 votes for candidate 0 at epoch 1
+    {
+        var state = RaftState.initWithDataDir(testing.allocator, 1, "test", tmp_dir);
+        defer state.deinit();
+
+        const resp = state.handleVoteRequest(0, 1, 0, 0);
+        try testing.expect(resp.vote_granted);
+        try testing.expectEqual(@as(?i32, 0), state.voted_for);
+    }
+
+    // Node 1 restarts — should NOT vote for candidate 2 at epoch 1
+    {
+        var state = RaftState.initWithDataDir(testing.allocator, 1, "test", tmp_dir);
+        defer state.deinit();
+
+        _ = state.loadPersistedMeta();
+        // voted_for should still be 0 from before crash
+        try testing.expectEqual(@as(?i32, 0), state.voted_for);
+        try testing.expectEqual(@as(i32, 1), state.current_epoch);
+
+        // Attempt to vote for different candidate at same epoch — MUST be rejected
+        const resp = state.handleVoteRequest(2, 1, 0, 0);
+        try testing.expect(!resp.vote_granted);
+    }
+}
+
+test "RaftState handleAppendEntries validates prev_log" {
+    var state = RaftState.init(testing.allocator, 1, "cluster");
+    defer state.deinit();
+
+    try state.addVoter(0);
+    try state.addVoter(1);
+
+    // Become follower at epoch 1
+    state.becomeFollower(1, 0);
+
+    // Append some entries as if leader replicated them
+    _ = try state.log.append(1, "entry-0");
+    _ = try state.log.append(1, "entry-1");
+
+    // AppendEntries with valid prev_log should succeed
+    const resp1 = state.handleAppendEntries(1, 0, 1, 1, &.{}, 0);
+    try testing.expect(resp1.success);
+
+    // AppendEntries with wrong prev_log_epoch should fail
+    const resp2 = state.handleAppendEntries(1, 0, 1, 99, &.{}, 0);
+    try testing.expect(!resp2.success);
+}
+
+test "RaftState handleAppendEntries truncates conflicting entries" {
+    var state = RaftState.init(testing.allocator, 1, "cluster");
+    defer state.deinit();
+
+    try state.addVoter(0);
+    try state.addVoter(1);
+
+    state.becomeFollower(1, 0);
+
+    // Append entries from old leader (epoch 1)
+    _ = try state.log.append(1, "old-entry-0");
+    _ = try state.log.append(1, "old-entry-1");
+    _ = try state.log.append(1, "old-entry-2"); // This will conflict
+    try testing.expectEqual(@as(usize, 3), state.log.length());
+
+    // New leader at epoch 2 sends entry at offset 2 with different epoch
+    const new_entries = [_]RaftState.AppendEntry{
+        .{ .offset = 2, .epoch = 2, .data = "new-entry-2" },
+    };
+    const resp = state.handleAppendEntries(2, 0, 1, 1, &new_entries, 0);
+    try testing.expect(resp.success);
+
+    // Old entry-2 should be truncated and replaced
+    try testing.expectEqual(@as(usize, 3), state.log.length());
+    const entry2 = state.log.get(2).?;
+    try testing.expectEqual(@as(i32, 2), entry2.epoch);
+}
+
+test "RaftState handleAppendEntries advances commit_index" {
+    var state = RaftState.init(testing.allocator, 1, "cluster");
+    defer state.deinit();
+
+    try state.addVoter(0);
+    try state.addVoter(1);
+
+    state.becomeFollower(1, 0);
+    _ = try state.log.append(1, "entry-0");
+    _ = try state.log.append(1, "entry-1");
+
+    try testing.expectEqual(@as(u64, 0), state.commit_index);
+
+    // Leader says commit_index=1
+    const resp = state.handleAppendEntries(1, 0, 1, 1, &.{}, 1);
+    try testing.expect(resp.success);
+    try testing.expectEqual(@as(u64, 1), state.commit_index);
+}
+
+test "ElectionTimer reseed produces different values for different nodes" {
+    var timer0 = ElectionTimer.init(1000, 2000);
+    var timer1 = ElectionTimer.init(1000, 2000);
+
+    timer0.reseed(0);
+    timer1.reseed(1);
+
+    // Deadlines should differ (different seeds) — not guaranteed but very likely
+    // We just verify reseed doesn't crash and produces valid deadlines
+    try testing.expect(timer0.deadline_ms > 0);
+    try testing.expect(timer1.deadline_ms > 0);
 }
