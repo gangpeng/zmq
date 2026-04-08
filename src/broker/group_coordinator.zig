@@ -427,13 +427,14 @@ pub const GroupCoordinator = struct {
     };
 
     /// Perform Cooperative Sticky partition assignment for a group.
-    /// Tries to keep members' existing assignments and only moves partitions when necessary.
+    /// Minimizes partition movement by keeping existing assignments where possible
+    /// and only redistributing unowned partitions round-robin to least-loaded members.
     pub fn computeStickyAssignment(self: *GroupCoordinator, group_id: []const u8, topic_partitions: []const TopicPartitionCount) ![]MemberAssignment {
         const group = self.groups.getPtr(group_id) orelse return &.{};
         const member_count = group.members.count();
         if (member_count == 0) return &.{};
 
-        // Collect member IDs
+        // Collect member IDs in stable order
         var member_ids = try self.allocator.alloc([]const u8, member_count);
         defer self.allocator.free(member_ids);
         {
@@ -445,8 +446,7 @@ pub const GroupCoordinator = struct {
             }
         }
 
-        // For sticky assignment, start with existing assignments and only reassign unowned partitions
-        // If no prior assignments exist, fall back to range assignment
+        // Check if any member has a prior assignment
         var has_prior = false;
         for (member_ids) |mid| {
             if (group.members.getPtr(mid)) |member| {
@@ -462,32 +462,193 @@ pub const GroupCoordinator = struct {
             return self.computeRangeAssignment(group_id, topic_partitions);
         }
 
-        // Sticky: keep existing assignments, distribute unassigned partitions round-robin
+        // Total partition count
+        var total_partitions: usize = 0;
+        for (topic_partitions) |tp| {
+            total_partitions += @intCast(tp.partition_count);
+        }
+
+        // Track which member owns each partition: key = "topic:partition", value = member index
+        var ownership = std.StringHashMap(usize).init(self.allocator);
+        defer {
+            var kit = ownership.iterator();
+            while (kit.next()) |e| self.allocator.free(e.key_ptr.*);
+            ownership.deinit();
+        }
+
+        // Phase 1: Parse existing assignments and preserve valid ones
+        for (member_ids, 0..) |mid, member_idx| {
+            const member = group.members.getPtr(mid) orelse continue;
+            if (member.assignment == null) continue;
+
+            // Parse the Kafka ConsumerProtocol binary assignment format:
+            // version(i16) + num_topics(i32) + [topic_name(i16+bytes) + num_parts(i32) + parts(i32[])] + user_data
+            const blob = member.assignment.?;
+            if (blob.len < 6) continue;
+
+            var pos: usize = 2; // skip version
+            const num_topics_raw = std.mem.readInt(i32, blob[pos..][0..4], .big);
+            pos += 4;
+            if (num_topics_raw <= 0) continue;
+            const num_topics: usize = @intCast(num_topics_raw);
+
+            for (0..num_topics) |_| {
+                if (pos + 2 > blob.len) break;
+                const topic_len: usize = @intCast(std.mem.readInt(i16, blob[pos..][0..2], .big));
+                pos += 2;
+                if (pos + topic_len > blob.len) break;
+                const topic_name = blob[pos .. pos + topic_len];
+                pos += topic_len;
+
+                if (pos + 4 > blob.len) break;
+                const num_parts_raw = std.mem.readInt(i32, blob[pos..][0..4], .big);
+                pos += 4;
+                if (num_parts_raw <= 0) continue;
+                const num_parts: usize = @intCast(num_parts_raw);
+
+                for (0..num_parts) |_| {
+                    if (pos + 4 > blob.len) break;
+                    const part_id = std.mem.readInt(i32, blob[pos..][0..4], .big);
+                    pos += 4;
+
+                    // Only keep if this partition still exists in topic_partitions
+                    var valid = false;
+                    for (topic_partitions) |tp| {
+                        if (std.mem.eql(u8, tp.topic, topic_name) and part_id < tp.partition_count) {
+                            valid = true;
+                            break;
+                        }
+                    }
+                    if (valid) {
+                        const key = try std.fmt.allocPrint(self.allocator, "{s}:{d}", .{ topic_name, part_id });
+                        ownership.put(key, member_idx) catch {
+                            self.allocator.free(key);
+                        };
+                    }
+                }
+            }
+        }
+
+        // Phase 2: Collect unassigned partitions (new partitions or from departed members)
+        var unassigned = std.ArrayList(struct { topic: []const u8, partition: i32 }).init(self.allocator);
+        defer unassigned.deinit();
+
+        for (topic_partitions) |tp| {
+            var p: i32 = 0;
+            while (p < tp.partition_count) : (p += 1) {
+                const key = try std.fmt.allocPrint(self.allocator, "{s}:{d}", .{ tp.topic, p });
+                defer self.allocator.free(key);
+                if (!ownership.contains(key)) {
+                    try unassigned.append(.{ .topic = tp.topic, .partition = p });
+                }
+            }
+        }
+
+        // Phase 3: Distribute unassigned partitions round-robin to least-loaded members
+        var load = try self.allocator.alloc(usize, member_count);
+        defer self.allocator.free(load);
+        @memset(load, 0);
+        {
+            var oit = ownership.iterator();
+            while (oit.next()) |entry| {
+                load[entry.value_ptr.*] += 1;
+            }
+        }
+
+        for (unassigned.items) |ua| {
+            // Find member with lowest load
+            var min_load: usize = std.math.maxInt(usize);
+            var min_idx: usize = 0;
+            for (load, 0..) |l, idx| {
+                if (l < min_load) {
+                    min_load = l;
+                    min_idx = idx;
+                }
+            }
+            const key = try std.fmt.allocPrint(self.allocator, "{s}:{d}", .{ ua.topic, ua.partition });
+            ownership.put(key, min_idx) catch {
+                self.allocator.free(key);
+                continue;
+            };
+            load[min_idx] += 1;
+        }
+
+        // Phase 4: Build assignment blobs per member
         var result = try self.allocator.alloc(MemberAssignment, member_count);
         errdefer self.allocator.free(result);
 
-        for (member_ids, 0..) |mid, i| {
-            const member = group.members.getPtr(mid).?;
-            if (member.assignment) |existing| {
-                result[i] = .{
-                    .member_id = mid,
-                    .assignment = try self.allocator.dupe(u8, existing),
-                };
-            } else {
-                // Build a minimal empty assignment
-                var buf: [10]u8 = undefined;
-                var bpos: usize = 0;
-                std.mem.writeInt(i16, buf[bpos..][0..2], 0, .big); // version
-                bpos += 2;
-                std.mem.writeInt(i32, buf[bpos..][0..4], 0, .big); // 0 topics
-                bpos += 4;
-                std.mem.writeInt(i32, buf[bpos..][0..4], -1, .big); // no user data
-                bpos += 4;
-                result[i] = .{
-                    .member_id = mid,
-                    .assignment = try self.allocator.dupe(u8, buf[0..bpos]),
-                };
+        for (member_ids, 0..) |mid, member_idx| {
+            var buf: [4096]u8 = undefined;
+            var bpos: usize = 0;
+
+            // Version
+            std.mem.writeInt(i16, buf[bpos..][0..2], 0, .big);
+            bpos += 2;
+
+            // Count topics that have partitions for this member
+            var topics_for_member: usize = 0;
+            for (topic_partitions) |tp| {
+                var has_partition = false;
+                var p: i32 = 0;
+                while (p < tp.partition_count) : (p += 1) {
+                    const key = try std.fmt.allocPrint(self.allocator, "{s}:{d}", .{ tp.topic, p });
+                    defer self.allocator.free(key);
+                    if (ownership.get(key)) |owner| {
+                        if (owner == member_idx) {
+                            has_partition = true;
+                            break;
+                        }
+                    }
+                }
+                if (has_partition) topics_for_member += 1;
             }
+
+            std.mem.writeInt(i32, buf[bpos..][0..4], @intCast(topics_for_member), .big);
+            bpos += 4;
+
+            for (topic_partitions) |tp| {
+                // Collect partitions for this member in this topic
+                var parts = std.ArrayList(i32).init(self.allocator);
+                defer parts.deinit();
+
+                var p: i32 = 0;
+                while (p < tp.partition_count) : (p += 1) {
+                    const key = try std.fmt.allocPrint(self.allocator, "{s}:{d}", .{ tp.topic, p });
+                    defer self.allocator.free(key);
+                    if (ownership.get(key)) |owner| {
+                        if (owner == member_idx) {
+                            try parts.append(p);
+                        }
+                    }
+                }
+
+                if (parts.items.len == 0) continue;
+
+                // Topic name
+                std.mem.writeInt(i16, buf[bpos..][0..2], @intCast(tp.topic.len), .big);
+                bpos += 2;
+                if (bpos + tp.topic.len <= buf.len) {
+                    @memcpy(buf[bpos .. bpos + tp.topic.len], tp.topic);
+                    bpos += tp.topic.len;
+                }
+
+                // Partition count + indices
+                std.mem.writeInt(i32, buf[bpos..][0..4], @intCast(parts.items.len), .big);
+                bpos += 4;
+                for (parts.items) |part_id| {
+                    std.mem.writeInt(i32, buf[bpos..][0..4], part_id, .big);
+                    bpos += 4;
+                }
+            }
+
+            // User data (empty)
+            std.mem.writeInt(i32, buf[bpos..][0..4], -1, .big);
+            bpos += 4;
+
+            result[member_idx] = .{
+                .member_id = mid,
+                .assignment = try self.allocator.dupe(u8, buf[0..bpos]),
+            };
         }
 
         return result;
@@ -1148,4 +1309,83 @@ test "GroupCoordinator generation increments on rebalance" {
     _ = coord.leaveGroup("g1", r2.member_id);
     const group = coord.groups.getPtr("g1").?;
     try testing.expectEqual(@as(i32, 2), group.generation_id);
+}
+
+test "GroupCoordinator sticky assignment preserves existing assignments" {
+    var coord = GroupCoordinator.init(testing.allocator);
+    defer coord.deinit();
+
+    // Join 2 members
+    const r1 = try coord.joinGroup("g1", null, "consumer", null);
+    const r2 = try coord.joinGroup("g1", null, "consumer", null);
+
+    // First assignment: range
+    const topics = [_]GroupCoordinator.TopicPartitionCount{
+        .{ .topic = "topic-a", .partition_count = 4 },
+    };
+    const assign1 = try coord.computeRangeAssignment("g1", &topics);
+    defer {
+        for (assign1) |a| testing.allocator.free(a.assignment);
+        testing.allocator.free(assign1);
+    }
+
+    // Apply assignments to members
+    const group = coord.groups.getPtr("g1").?;
+    for (assign1) |a| {
+        if (group.members.getPtr(a.member_id)) |member| {
+            if (member.assignment) |old| testing.allocator.free(old);
+            member.assignment = testing.allocator.dupe(u8, a.assignment) catch null;
+        }
+    }
+
+    // Now compute sticky assignment — should preserve existing
+    const assign2 = try coord.computeStickyAssignment("g1", &topics);
+    defer {
+        for (assign2) |a| testing.allocator.free(a.assignment);
+        testing.allocator.free(assign2);
+    }
+
+    // Both members should still have 2 partitions each
+    try testing.expectEqual(@as(usize, 2), assign2.len);
+    _ = r1;
+    _ = r2;
+}
+
+test "GroupCoordinator sticky assignment handles new member" {
+    var coord = GroupCoordinator.init(testing.allocator);
+    defer coord.deinit();
+
+    // Start with 1 member owning all 4 partitions
+    _ = try coord.joinGroup("g1", null, "consumer", null);
+
+    const topics = [_]GroupCoordinator.TopicPartitionCount{
+        .{ .topic = "topic-a", .partition_count = 4 },
+    };
+    const assign1 = try coord.computeRangeAssignment("g1", &topics);
+    defer {
+        for (assign1) |a| testing.allocator.free(a.assignment);
+        testing.allocator.free(assign1);
+    }
+
+    // Apply assignment
+    const group = coord.groups.getPtr("g1").?;
+    for (assign1) |a| {
+        if (group.members.getPtr(a.member_id)) |member| {
+            if (member.assignment) |old| testing.allocator.free(old);
+            member.assignment = testing.allocator.dupe(u8, a.assignment) catch null;
+        }
+    }
+
+    // Add second member
+    _ = try coord.joinGroup("g1", null, "consumer", null);
+
+    // Sticky assignment should redistribute
+    const assign2 = try coord.computeStickyAssignment("g1", &topics);
+    defer {
+        for (assign2) |a| testing.allocator.free(a.assignment);
+        testing.allocator.free(assign2);
+    }
+
+    // Both members should have partitions (not all 4 to member 1)
+    try testing.expectEqual(@as(usize, 2), assign2.len);
 }

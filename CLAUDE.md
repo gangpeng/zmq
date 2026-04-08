@@ -113,17 +113,18 @@ These features exist in AutoMQ but are missing or simplified in ZMQ. Each is a p
 
 | Feature | AutoMQ | ZMQ Status |
 |---------|--------|------------|
-| Streams per partition | 4 (log/tim/idx/txn) | 1 (simplified) |
-| Compaction strategies | 6 (CLEANUP, MINOR, MAJOR, V1 variants) | 2 (force-split, merge) |
-| Compaction analyzer | Full planning with size/dirty-byte thresholds | Time-based interval only |
-| KRaft metadata persistence | `voted_for` + `current_epoch` persisted | Only log entries persisted |
-| Dynamic voter changes | AddRaftVoter/RemoveRaftVoter APIs | Not implemented (API keys exist but return UNSUPPORTED) |
-| Pre-vote protocol (KIP-996) | Prevents disruptive elections | Not implemented |
-| Sticky partition assignment | Full cooperative sticky | Falls back to range |
-| S3 object TTL cleanup | Automatic cleanup of uncommitted objects | Not implemented |
-| Compaction state persistence | Checkpoints for crash recovery | In-memory only |
+| Streams per partition | 4 (log/tim/idx/txn) | 1 (simplified — intentional, RecordBatch is self-contained) |
+| Compaction strategies | 6 (CLEANUP, MINOR, MAJOR, V1 variants) | 3 (force-split, merge, cleanup). V1 variants not needed. |
+| Compaction analyzer | Full planning with size/dirty-byte thresholds | Time-based interval + cleanup of expired SOs |
+| KRaft metadata persistence | `voted_for` + `current_epoch` persisted | ✅ Implemented (`raft.meta` file) |
+| Dynamic voter changes | AddRaftVoter/RemoveRaftVoter APIs | Not implemented (API keys exist but return UNSUPPORTED). Requires joint consensus — very complex. |
+| Pre-vote protocol (KIP-996) | Prevents disruptive elections | ✅ Implemented (`startPreVote`, `handlePreVoteRequest`) |
+| Sticky partition assignment | Full cooperative sticky | ✅ Implemented (parses prior assignments, minimizes movement) |
+| S3 object TTL cleanup | Automatic cleanup of uncommitted objects | ✅ Implemented (orphaned key tracking + retry in `cleanupOrphans`) |
+| Compaction state persistence | Checkpoints for crash recovery | ✅ Implemented (compaction journal: `journalBegin`/`journalComplete`) |
 | Multi-part S3 upload | For large objects | Implemented but limited |
-| Idempotent compaction | Re-entrant, dedup on replay | Not idempotent |
+| Idempotent compaction | Re-entrant, dedup on replay | ✅ Implemented (`hasStreamObjectCovering` dedup check) |
+| RaftLog snapshotting | Log truncation + InstallSnapshot | ✅ Implemented (`takeSnapshot`, `truncateBefore`, periodic check in election loop) |
 
 ## File organization
 

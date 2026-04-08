@@ -31,6 +31,11 @@ pub const RaftState = struct {
     /// Data directory for raft log persistence.
     data_dir: ?[]const u8 = null,
 
+    /// Offset of the last snapshot (entries before this have been compacted).
+    last_snapshot_offset: u64 = 0,
+    /// Epoch of the last snapshot.
+    last_snapshot_epoch: i32 = 0,
+
     pub const Role = enum {
         unattached,
         follower,
@@ -137,6 +142,49 @@ pub const RaftState = struct {
             .last_log_offset = self.log.lastOffset(),
             .last_log_epoch = self.log.lastEpoch(),
         };
+    }
+
+    /// Start a pre-vote phase (KIP-996). Does NOT increment epoch.
+    /// Returns the tentative next epoch and log info for pre-vote requests.
+    pub fn startPreVote(self: *RaftState) ElectionResult {
+        // Do NOT increment epoch — this is tentative
+        return .{
+            .epoch = self.current_epoch + 1, // Tentative next epoch
+            .last_log_offset = self.log.lastOffset(),
+            .last_log_epoch = self.log.lastEpoch(),
+        };
+    }
+
+    /// Handle a pre-vote request. Grants pre-vote if:
+    /// - Candidate's tentative epoch >= our current epoch
+    /// - Candidate's log is at least as up-to-date as ours
+    /// - We haven't received a recent heartbeat (leader might still be alive)
+    /// Does NOT change our epoch or voted_for.
+    pub fn handlePreVoteRequest(self: *RaftState, candidate_id: i32, candidate_epoch: i32, last_log_offset: u64, last_log_epoch: i32) VoteResponse {
+        _ = candidate_id;
+
+        // If candidate's tentative epoch is less than ours, reject
+        if (candidate_epoch < self.current_epoch) {
+            return .{ .vote_granted = false, .epoch = self.current_epoch };
+        }
+
+        // If we recently heard from a leader, reject (leader is still alive)
+        if (!self.election_timer.isExpired()) {
+            return .{ .vote_granted = false, .epoch = self.current_epoch };
+        }
+
+        // Check if candidate's log is at least as up-to-date
+        const our_last_epoch = self.log.lastEpoch();
+        const our_last_offset = self.log.lastOffset();
+        const log_ok = (last_log_epoch > our_last_epoch) or
+            (last_log_epoch == our_last_epoch and last_log_offset >= our_last_offset);
+
+        if (!log_ok) {
+            return .{ .vote_granted = false, .epoch = self.current_epoch };
+        }
+
+        // Grant pre-vote (does NOT change our state)
+        return .{ .vote_granted = true, .epoch = self.current_epoch };
     }
 
     pub const ElectionResult = struct {
@@ -278,6 +326,9 @@ pub const RaftState = struct {
     pub fn loadPersistedLog(self: *RaftState) !u64 {
         // Load persisted epoch and voted_for first
         _ = self.loadPersistedMeta();
+
+        // Load snapshot metadata (if any) to know which entries were compacted
+        _ = self.loadSnapshotMeta();
 
         const dir = self.data_dir orelse return 0;
         const path = try std.fmt.allocPrint(self.allocator, "{s}/raft.log", .{dir});
@@ -522,6 +573,64 @@ pub const RaftState = struct {
     pub fn majorityThreshold(self: *const RaftState) usize {
         return self.quorumSize() / 2 + 1;
     }
+
+    /// Create a snapshot at the current commit_index and truncate the log.
+    /// Only entries at or after commit_index are kept.
+    pub fn takeSnapshot(self: *RaftState) void {
+        if (self.commit_index == 0) return;
+        if (self.commit_index <= self.last_snapshot_offset) return;
+
+        // Record snapshot metadata
+        if (self.log.get(self.commit_index)) |entry| {
+            self.last_snapshot_epoch = entry.epoch;
+        }
+        self.last_snapshot_offset = self.commit_index;
+
+        // Truncate log entries before commit_index
+        self.log.truncateBefore(self.commit_index);
+
+        // Persist snapshot metadata
+        if (self.data_dir) |dir| {
+            self.persistSnapshotMeta(dir) catch {};
+        }
+    }
+
+    /// Check if the log is large enough to warrant a snapshot.
+    /// Returns true if log has more than max_entries entries.
+    pub fn shouldSnapshot(self: *const RaftState, max_entries: usize) bool {
+        return self.log.length() > max_entries;
+    }
+
+    fn persistSnapshotMeta(self: *RaftState, dir: []const u8) !void {
+        const path = try std.fmt.allocPrint(self.allocator, "{s}/snapshot.meta", .{dir});
+        defer self.allocator.free(path);
+
+        const file = try fs.createFileAbsolute(path, .{ .truncate = true });
+        defer file.close();
+
+        var buf: [16]u8 = undefined;
+        std.mem.writeInt(u64, buf[0..8], self.last_snapshot_offset, .big);
+        std.mem.writeInt(i32, buf[8..12], self.last_snapshot_epoch, .big);
+        std.mem.writeInt(i32, buf[12..16], self.current_epoch, .big);
+        try file.writeAll(&buf);
+    }
+
+    pub fn loadSnapshotMeta(self: *RaftState) bool {
+        const dir = self.data_dir orelse return false;
+        const path = std.fmt.allocPrint(self.allocator, "{s}/snapshot.meta", .{dir}) catch return false;
+        defer self.allocator.free(path);
+
+        const file = fs.openFileAbsolute(path, .{}) catch return false;
+        defer file.close();
+
+        var buf: [16]u8 = undefined;
+        const n = file.readAll(&buf) catch return false;
+        if (n < 16) return false;
+
+        self.last_snapshot_offset = std.mem.readInt(u64, buf[0..8], .big);
+        self.last_snapshot_epoch = std.mem.readInt(i32, buf[8..12], .big);
+        return true;
+    }
 };
 
 /// Raft log — append-only log of entries indexed by offset.
@@ -620,6 +729,20 @@ pub const RaftLog = struct {
             return entry.epoch != epoch;
         }
         return false; // No entry at that offset — no conflict
+    }
+
+    /// Truncate entries before a given offset (exclusive).
+    /// Keeps entries with offset >= keep_from.
+    /// Used by snapshotting to reclaim memory from committed entries.
+    pub fn truncateBefore(self: *RaftLog, keep_from: u64) void {
+        while (self.entries.items.len > 0) {
+            if (self.entries.items[0].offset < keep_from) {
+                self.allocator.free(self.entries.items[0].data);
+                _ = self.entries.orderedRemove(0);
+            } else {
+                break;
+            }
+        }
     }
 };
 
@@ -1440,6 +1563,70 @@ test "RaftState handleAppendEntries advances commit_index" {
     try testing.expectEqual(@as(u64, 1), state.commit_index);
 }
 
+test "RaftState pre-vote does not change epoch" {
+    var state = RaftState.init(testing.allocator, 0, "cluster");
+    defer state.deinit();
+    try state.addVoter(0);
+    try state.addVoter(1);
+
+    const before_epoch = state.current_epoch;
+    const result = state.startPreVote();
+    // Pre-vote should NOT change current_epoch
+    try testing.expectEqual(before_epoch, state.current_epoch);
+    // But should return tentative next epoch
+    try testing.expectEqual(before_epoch + 1, result.epoch);
+}
+
+test "RaftState pre-vote rejected when leader is alive" {
+    var state = RaftState.init(testing.allocator, 1, "cluster");
+    defer state.deinit();
+    try state.addVoter(0);
+    try state.addVoter(1);
+
+    // Simulate recent heartbeat (timer not expired)
+    state.election_timer.reset();
+
+    // Pre-vote should be rejected (we recently heard from leader)
+    const resp = state.handlePreVoteRequest(0, 1, 0, 0);
+    try testing.expect(!resp.vote_granted);
+}
+
+test "RaftState pre-vote granted when no leader heartbeat" {
+    var state = RaftState.init(testing.allocator, 1, "cluster");
+    defer state.deinit();
+    try state.addVoter(0);
+    try state.addVoter(1);
+
+    // Force election timer to expire (no recent heartbeat)
+    state.election_timer.deadline_ms = 0;
+
+    const resp = state.handlePreVoteRequest(0, 1, 0, 0);
+    try testing.expect(resp.vote_granted);
+    // Our state should NOT have changed
+    try testing.expectEqual(@as(?i32, null), state.voted_for);
+    try testing.expectEqual(@as(i32, 0), state.current_epoch);
+}
+
+test "RaftState pre-vote rejected for stale log" {
+    var state = RaftState.init(testing.allocator, 1, "cluster");
+    defer state.deinit();
+    try state.addVoter(0);
+    try state.addVoter(1);
+
+    // Give us a log entry
+    state.role = .leader;
+    state.current_epoch = 3;
+    _ = try state.appendEntry("data");
+    state.role = .follower;
+
+    // Force timer expired
+    state.election_timer.deadline_ms = 0;
+
+    // Candidate with empty log should be rejected
+    const resp = state.handlePreVoteRequest(0, 4, 0, 0);
+    try testing.expect(!resp.vote_granted);
+}
+
 test "ElectionTimer reseed produces different values for different nodes" {
     var timer0 = ElectionTimer.init(1000, 2000);
     var timer1 = ElectionTimer.init(1000, 2000);
@@ -1451,4 +1638,72 @@ test "ElectionTimer reseed produces different values for different nodes" {
     // We just verify reseed doesn't crash and produces valid deadlines
     try testing.expect(timer0.deadline_ms > 0);
     try testing.expect(timer1.deadline_ms > 0);
+}
+
+test "RaftLog truncateBefore removes old entries" {
+    var raft_log = RaftLog.init(testing.allocator);
+    defer raft_log.deinit();
+
+    _ = try raft_log.append(1, "e0");
+    _ = try raft_log.append(1, "e1");
+    _ = try raft_log.append(1, "e2");
+    _ = try raft_log.append(2, "e3");
+    _ = try raft_log.append(2, "e4");
+
+    try testing.expectEqual(@as(usize, 5), raft_log.length());
+
+    // Keep entries with offset >= 3
+    raft_log.truncateBefore(3);
+    try testing.expectEqual(@as(usize, 2), raft_log.length());
+    try testing.expectEqual(@as(u64, 3), raft_log.entries.items[0].offset);
+    try testing.expectEqual(@as(u64, 4), raft_log.entries.items[1].offset);
+}
+
+test "RaftState takeSnapshot truncates committed entries" {
+    var state = RaftState.init(testing.allocator, 0, "cluster");
+    defer state.deinit();
+
+    try state.addVoter(0);
+    _ = state.startElection();
+    state.becomeLeader();
+
+    // Append several entries
+    _ = try state.appendEntry("e0");
+    _ = try state.appendEntry("e1");
+    _ = try state.appendEntry("e2");
+    _ = try state.appendEntry("e3");
+    _ = try state.appendEntry("e4");
+
+    // Manually advance commit_index (simulating majority ack)
+    state.commit_index = 3;
+
+    try testing.expectEqual(@as(usize, 5), state.log.length());
+
+    // Take snapshot at commit_index=3
+    state.takeSnapshot();
+    try testing.expectEqual(@as(u64, 3), state.last_snapshot_offset);
+    // Entries 0,1,2 removed; entries 3,4 kept
+    try testing.expectEqual(@as(usize, 2), state.log.length());
+}
+
+test "RaftState shouldSnapshot checks log size" {
+    var state = RaftState.init(testing.allocator, 0, "cluster");
+    defer state.deinit();
+
+    try state.addVoter(0);
+    _ = state.startElection();
+    state.becomeLeader();
+
+    // Below threshold
+    try testing.expect(!state.shouldSnapshot(10));
+
+    // Add enough entries
+    var i: usize = 0;
+    while (i < 15) : (i += 1) {
+        _ = try state.appendEntry("data");
+    }
+
+    // Above threshold
+    try testing.expect(state.shouldSnapshot(10));
+    try testing.expect(!state.shouldSnapshot(20));
 }

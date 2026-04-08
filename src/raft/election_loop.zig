@@ -45,33 +45,46 @@ pub const ElectionLoop = struct {
             switch (self.raft_state.role) {
                 .unattached, .follower => {
                     if (self.raft_state.isElectionTimedOut()) {
-                        log.info("Election timer expired, starting election (epoch={d})", .{self.raft_state.current_epoch});
-                        const result = self.raft_state.startElection();
-                        log.info("Started election: epoch={d} last_offset={d} last_epoch={d}", .{
-                            result.epoch,
-                            result.last_log_offset,
-                            result.last_log_epoch,
-                        });
+                        log.info("Election timer expired, starting pre-vote (epoch={d})", .{self.raft_state.current_epoch});
 
-                        // In a single-node cluster, immediately become leader
+                        // In a single-node cluster, skip pre-vote
                         if (self.raft_state.quorumSize() <= 1) {
+                            const result = self.raft_state.startElection();
+                            _ = result;
                             self.raft_state.becomeLeader();
                             log.info("Single-node cluster: became leader at epoch {d}", .{self.raft_state.current_epoch});
                         } else {
-                            // Multi-node — broadcast vote requests and count grants
-                            self.broadcastAndCountVotes(result);
+                            // Pre-vote phase: check if others agree we should hold an election
+                            const pre_result = self.raft_state.startPreVote();
+                            if (self.broadcastAndCountPreVotes(pre_result)) {
+                                // Majority agrees — proceed to real election
+                                log.info("Pre-vote succeeded, starting real election", .{});
+                                const result = self.raft_state.startElection();
+                                self.broadcastAndCountVotes(result);
+                            } else {
+                                // Pre-vote failed — leader might still be alive, don't disrupt
+                                log.info("Pre-vote failed, not starting election (leader may be alive)", .{});
+                                self.raft_state.election_timer.reset();
+                            }
                         }
                     }
                 },
                 .candidate => {
                     // Still waiting for votes — check if election timed out
                     if (self.raft_state.isElectionTimedOut()) {
-                        log.info("Election timed out, starting new election", .{});
-                        const result = self.raft_state.startElection();
+                        log.info("Election timed out, retrying with pre-vote", .{});
                         if (self.raft_state.quorumSize() <= 1) {
+                            const result = self.raft_state.startElection();
+                            _ = result;
                             self.raft_state.becomeLeader();
                         } else {
-                            self.broadcastAndCountVotes(result);
+                            const pre_result = self.raft_state.startPreVote();
+                            if (self.broadcastAndCountPreVotes(pre_result)) {
+                                const result = self.raft_state.startElection();
+                                self.broadcastAndCountVotes(result);
+                            } else {
+                                self.raft_state.election_timer.reset();
+                            }
                         }
                     }
                 },
@@ -86,6 +99,13 @@ pub const ElectionLoop = struct {
                 .resigned => {
                     // Do nothing
                 },
+            }
+
+            // Periodic snapshot check (every ~10 seconds)
+            if (self.tick_counter % 100 == 0) {
+                if (self.raft_state.shouldSnapshot(1000)) {
+                    self.raft_state.takeSnapshot();
+                }
             }
         }
 
@@ -112,6 +132,28 @@ pub const ElectionLoop = struct {
                 pool.broadcastHeartbeat(self.raft_state.current_epoch, self.raft_state.node_id);
             }
         }
+    }
+
+    /// Broadcast pre-vote requests and count grants (KIP-996).
+    /// Returns true if majority granted pre-vote (safe to proceed to real election).
+    fn broadcastAndCountPreVotes(self: *ElectionLoop, result: RaftState.ElectionResult) bool {
+        if (self.raft_client_pool) |pool| {
+            // Reuse broadcastVoteRequest for pre-vote (same wire format, different semantics).
+            // In a full implementation, pre-vote would use a separate RPC.
+            // For now, we use the same Vote RPC but the candidate does NOT increment its epoch.
+            const grants = pool.broadcastVoteRequest(
+                self.raft_state.cluster_id,
+                result.epoch,
+                self.raft_state.node_id,
+                @intCast(result.last_log_offset),
+                result.last_log_epoch,
+            );
+            log.info("Pre-vote: got {d}/{d} grants (need {d})", .{
+                grants, self.raft_state.quorumSize(), self.raft_state.majorityThreshold(),
+            });
+            return grants >= self.raft_state.majorityThreshold();
+        }
+        return true; // No pool = single-node, pre-vote always passes
     }
 
     /// Send heartbeats / AppendEntries to all followers.

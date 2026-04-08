@@ -548,6 +548,17 @@ pub const ObjectManager = struct {
     pub fn streamCount(self: *const ObjectManager) usize {
         return self.streams.count();
     }
+
+    /// Check if a StreamObject already exists that covers the exact offset range.
+    /// Used for idempotent compaction — skip duplicate SOs.
+    pub fn hasStreamObjectCovering(self: *const ObjectManager, stream_id: u64, start_offset: u64, end_offset: u64) bool {
+        const so_ids = self.stream_object_index.get(stream_id) orelse return false;
+        for (so_ids.items) |obj_id| {
+            const so = self.stream_objects.get(obj_id) orelse continue;
+            if (so.start_offset == start_offset and so.end_offset == end_offset) return true;
+        }
+        return false;
+    }
 };
 
 // ---------------------------------------------------------------
@@ -937,4 +948,33 @@ test "ObjectManager commitStreamObject maintains sorted index" {
     try testing.expectEqual(@as(u64, 0), results[0].start_offset);
     try testing.expectEqual(@as(u64, 100), results[1].start_offset);
     try testing.expectEqual(@as(u64, 200), results[2].start_offset);
+}
+
+test "ObjectManager hasStreamObjectCovering" {
+    var om = ObjectManager.init(testing.allocator, 0);
+    defer om.deinit();
+
+    // No SOs yet — should return false
+    try testing.expect(!om.hasStreamObjectCovering(1, 0, 100));
+
+    // Add a SO for stream 1 covering [0, 100)
+    try om.commitStreamObject(1, 1, 0, 100, "so/1/0-1", 1024);
+
+    // Exact match — should return true
+    try testing.expect(om.hasStreamObjectCovering(1, 0, 100));
+
+    // Different start — should return false
+    try testing.expect(!om.hasStreamObjectCovering(1, 10, 100));
+
+    // Different end — should return false
+    try testing.expect(!om.hasStreamObjectCovering(1, 0, 50));
+
+    // Different stream — should return false
+    try testing.expect(!om.hasStreamObjectCovering(2, 0, 100));
+
+    // Add another SO for stream 1 covering [100, 200)
+    try om.commitStreamObject(2, 1, 100, 200, "so/1/100-2", 1024);
+    try testing.expect(om.hasStreamObjectCovering(1, 100, 200));
+    // Original still matches
+    try testing.expect(om.hasStreamObjectCovering(1, 0, 100));
 }
