@@ -4048,3 +4048,153 @@ test "Broker.handleRequest EndTxn (key=26) full transaction lifecycle" {
     const corr_id = ser.readI32(resp.?, &rpos);
     try testing.expectEqual(@as(i32, 70), corr_id);
 }
+
+test "Broker setRaftState wires raft state" {
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+
+    // Initially, raft_state should be null
+    try testing.expect(broker.raft_state == null);
+
+    var raft = RaftState.init(testing.allocator, 1, "test-cluster");
+    defer raft.deinit();
+
+    broker.setRaftState(&raft);
+    try testing.expect(broker.raft_state != null);
+    try testing.expectEqual(@as(i32, 1), broker.raft_state.?.node_id);
+}
+
+test "Broker flushPendingWal returns true in memory mode" {
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+
+    // In-memory broker has no S3 WAL batcher, so flushPendingWal should
+    // return true immediately (the no-op / early-return path).
+    const result = broker.flushPendingWal();
+    try testing.expect(result);
+}
+
+test "Broker tick runs without crash in memory mode" {
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+
+    // tick() evicts expired group members and checks rebalance timeouts.
+    // In-memory mode with no members, it should complete without error.
+    broker.tick();
+    broker.tick();
+    broker.tick();
+}
+
+test "Broker fenced by controller rejects produce" {
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+
+    // Fence the broker
+    broker.is_fenced_by_controller = true;
+
+    // Build a Produce v0 request
+    var buf: [512]u8 = undefined;
+    var pos = buildTestRequest(&buf, 0, 0, 100, 1);
+    ser.writeI16(&buf, &pos, 1); // acks = 1
+    ser.writeI32(&buf, &pos, 30000); // timeout_ms
+    ser.writeI32(&buf, &pos, 1); // topics array: 1 topic
+    ser.writeString(&buf, &pos, "fenced-topic");
+    ser.writeI32(&buf, &pos, 1); // partitions array: 1 partition
+    ser.writeI32(&buf, &pos, 0); // partition_index
+    const fake_records = "fake-record-batch-data";
+    ser.writeI32(&buf, &pos, @intCast(fake_records.len));
+    @memcpy(buf[pos .. pos + fake_records.len], fake_records);
+    pos += fake_records.len;
+
+    const resp = broker.handleRequest(buf[0..pos]);
+    try testing.expect(resp != null);
+    defer testing.allocator.free(resp.?);
+
+    var rpos: usize = 0;
+    const corr_id = ser.readI32(resp.?, &rpos);
+    try testing.expectEqual(@as(i32, 100), corr_id);
+
+    // handleNotController returns error code 41 (NOT_CONTROLLER) which tells
+    // the client to refresh metadata and find the correct leader.
+    const error_code = ser.readI16(resp.?, &rpos);
+    try testing.expectEqual(@as(i16, 41), error_code);
+}
+
+test "Broker handleRequest DeleteTopics (key=20)" {
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+
+    // First create a topic via ensureTopic so we have something to delete
+    try testing.expect(broker.ensureTopic("del-topic"));
+    try testing.expect(broker.topics.contains("del-topic"));
+
+    // DeleteTopics v0
+    var buf: [512]u8 = undefined;
+    var pos = buildTestRequest(&buf, 20, 0, 200, 1);
+    // topics array: 1 topic
+    ser.writeI32(&buf, &pos, 1);
+    ser.writeString(&buf, &pos, "del-topic");
+    ser.writeI32(&buf, &pos, 30000); // timeout_ms
+
+    const resp = broker.handleRequest(buf[0..pos]);
+    try testing.expect(resp != null);
+    defer testing.allocator.free(resp.?);
+
+    var rpos: usize = 0;
+    const corr_id = ser.readI32(resp.?, &rpos);
+    try testing.expectEqual(@as(i32, 200), corr_id);
+
+    // Topic should be removed after delete
+    try testing.expect(!broker.topics.contains("del-topic"));
+}
+
+test "Broker handleRequest DescribeConfigs (key=32)" {
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+
+    // Create a topic first so DescribeConfigs has something to describe
+    _ = broker.ensureTopic("cfg-topic");
+
+    // DescribeConfigs v0
+    var buf: [512]u8 = undefined;
+    var pos = buildTestRequest(&buf, 32, 0, 210, 1);
+    // resources array: 1 resource
+    ser.writeI32(&buf, &pos, 1);
+    ser.writeI8(&buf, &pos, 2); // resource_type = TOPIC
+    ser.writeString(&buf, &pos, "cfg-topic"); // resource_name
+    ser.writeI32(&buf, &pos, 0); // config_keys array (empty = all configs)
+
+    const resp = broker.handleRequest(buf[0..pos]);
+    try testing.expect(resp != null);
+    defer testing.allocator.free(resp.?);
+
+    var rpos: usize = 0;
+    const corr_id = ser.readI32(resp.?, &rpos);
+    try testing.expectEqual(@as(i32, 210), corr_id);
+}
+
+test "Broker handleRequest Heartbeat (key=12)" {
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+
+    // Heartbeat v0: group_id + generation_id + member_id
+    var buf: [512]u8 = undefined;
+    var pos = buildTestRequest(&buf, 12, 0, 220, 1);
+    ser.writeString(&buf, &pos, "hb-group"); // group_id
+    ser.writeI32(&buf, &pos, 1); // generation_id
+    ser.writeString(&buf, &pos, "member-1"); // member_id
+
+    const resp = broker.handleRequest(buf[0..pos]);
+    try testing.expect(resp != null);
+    defer testing.allocator.free(resp.?);
+
+    var rpos: usize = 0;
+    const corr_id = ser.readI32(resp.?, &rpos);
+    try testing.expectEqual(@as(i32, 220), corr_id);
+
+    // Heartbeat for unknown member should return an error code,
+    // but the response should still be well-formed.
+    const error_code = ser.readI16(resp.?, &rpos);
+    // Unknown member in unknown group — expect non-zero error
+    try testing.expect(error_code != 0);
+}

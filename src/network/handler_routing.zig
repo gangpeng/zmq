@@ -61,3 +61,114 @@ pub fn brokerHasPendingFlush() bool {
     }
     return false;
 }
+
+// ---------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------
+
+const testing = std.testing;
+const ser = @import("../protocol/serialization.zig");
+
+fn buildTestRequest(buf: []u8, api_key: i16, api_version: i16, correlation_id: i32, header_version: i16) usize {
+    var pos: usize = 0;
+    ser.writeI16(buf, &pos, api_key);
+    ser.writeI16(buf, &pos, api_version);
+    ser.writeI32(buf, &pos, correlation_id);
+    if (header_version >= 2) {
+        ser.writeCompactString(buf, &pos, "test-client");
+        ser.writeEmptyTaggedFields(buf, &pos);
+    } else if (header_version >= 1) {
+        ser.writeString(buf, &pos, "test-client");
+    }
+    return pos;
+}
+
+test "controllerHandleRequest returns null when no controller set" {
+    // Ensure clean state
+    global_controller = null;
+    defer {
+        global_controller = null;
+    }
+
+    var buf: [256]u8 = undefined;
+    const req_len = buildTestRequest(&buf, 18, 0, 42, 1);
+
+    const response = controllerHandleRequest(buf[0..req_len], testing.allocator);
+    try testing.expect(response == null);
+}
+
+test "brokerHandleRequest returns null when no broker set" {
+    global_broker = null;
+    defer {
+        global_broker = null;
+    }
+
+    var buf: [256]u8 = undefined;
+    const req_len = buildTestRequest(&buf, 18, 0, 42, 1);
+
+    const response = brokerHandleRequest(buf[0..req_len], testing.allocator);
+    try testing.expect(response == null);
+}
+
+test "setGlobalController enables request handling" {
+    var ctrl = Controller.init(testing.allocator, 1, "test-cluster");
+    defer ctrl.deinit();
+
+    setGlobalController(&ctrl);
+    defer {
+        global_controller = null;
+    }
+
+    var buf: [256]u8 = undefined;
+    const req_len = buildTestRequest(&buf, 18, 0, 42, 1);
+
+    const response = controllerHandleRequest(buf[0..req_len], testing.allocator);
+    try testing.expect(response != null);
+    defer testing.allocator.free(response.?);
+
+    // Verify correlation ID
+    var rpos: usize = 0;
+    const corr_id = ser.readI32(response.?, &rpos);
+    try testing.expectEqual(@as(i32, 42), corr_id);
+}
+
+test "setGlobalBroker enables request handling" {
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+
+    setGlobalBroker(&broker);
+    defer {
+        global_broker = null;
+    }
+
+    var buf: [256]u8 = undefined;
+    const req_len = buildTestRequest(&buf, 18, 0, 42, 1);
+
+    const response = brokerHandleRequest(buf[0..req_len], testing.allocator);
+    try testing.expect(response != null);
+    defer testing.allocator.free(response.?);
+
+    var rpos: usize = 0;
+    const corr_id = ser.readI32(response.?, &rpos);
+    try testing.expectEqual(@as(i32, 42), corr_id);
+}
+
+test "brokerFlushPendingWal no-op when no broker" {
+    global_broker = null;
+    defer {
+        global_broker = null;
+    }
+
+    // Should not crash
+    brokerFlushPendingWal();
+}
+
+test "brokerHasPendingFlush returns false when no broker" {
+    global_broker = null;
+    defer {
+        global_broker = null;
+    }
+
+    const result = brokerHasPendingFlush();
+    try testing.expect(!result);
+}

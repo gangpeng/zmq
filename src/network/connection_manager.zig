@@ -143,3 +143,62 @@ test "ConnectionManager activity tracking" {
     try testing.expectEqual(@as(u64, 275), info.bytes_sent);
     try testing.expectEqual(@as(u64, 2), info.requests_processed);
 }
+
+test "ConnectionManager removeConnection no-op for unknown ID" {
+    var mgr = ConnectionManager.init(testing.allocator, 100);
+    defer mgr.deinit();
+
+    // Remove non-existent connection — should not crash
+    mgr.removeConnection(999);
+    try testing.expectEqual(@as(usize, 0), mgr.count());
+}
+
+test "ConnectionManager setClientId sets and retrieves ID" {
+    var mgr = ConnectionManager.init(testing.allocator, 100);
+    defer mgr.deinit();
+
+    const id = try mgr.addConnection(10);
+    mgr.setClientId(id, "my-kafka-client");
+
+    const info = mgr.connections.get(id).?;
+    try testing.expect(info.client_id != null);
+    try testing.expectEqualStrings("my-kafka-client", info.client_id.?);
+}
+
+test "ConnectionManager setClientId no-op for unknown connection" {
+    var mgr = ConnectionManager.init(testing.allocator, 100);
+    defer mgr.deinit();
+
+    // Should not crash
+    mgr.setClientId(999, "unknown");
+    try testing.expectEqual(@as(usize, 0), mgr.count());
+}
+
+test "ConnectionManager findIdleConnections returns idle ones" {
+    var mgr = ConnectionManager.init(testing.allocator, 100);
+    defer mgr.deinit();
+
+    _ = try mgr.addConnection(10);
+    _ = try mgr.addConnection(11);
+    _ = try mgr.addConnection(12);
+
+    // With timeout_ms = 0, all connections are idle (since time has advanced)
+    var result_buf: [10]u64 = undefined;
+    const found = mgr.findIdleConnections(0, &result_buf);
+    try testing.expectEqual(@as(usize, 3), found);
+}
+
+test "ConnectionManager limit then remove allows new connection" {
+    var mgr = ConnectionManager.init(testing.allocator, 2);
+    defer mgr.deinit();
+
+    const id1 = try mgr.addConnection(10);
+    _ = try mgr.addConnection(11);
+    try testing.expectError(error.TooManyConnections, mgr.addConnection(12));
+
+    // Remove one, should allow new
+    mgr.removeConnection(id1);
+    const id3 = try mgr.addConnection(12);
+    try testing.expectEqual(@as(usize, 2), mgr.count());
+    try testing.expect(id3 > id1); // IDs are monotonically increasing
+}

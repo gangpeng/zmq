@@ -1983,3 +1983,222 @@ test "ConfigChangeEntry isConfigChange detects correctly" {
     try testing.expect(!RaftState.ConfigChangeEntry.isConfigChange("hello world"));
     try testing.expect(!RaftState.ConfigChangeEntry.isConfigChange(""));
 }
+
+// ---------------------------------------------------------------
+// Persistence and AppendEntries round-trip tests
+// ---------------------------------------------------------------
+
+test "RaftState loadPersistedMeta round-trip" {
+    const tmp_dir = "/tmp/zmq-raft-meta-roundtrip-test";
+    fs.deleteTreeAbsolute(tmp_dir) catch {};
+    defer fs.deleteTreeAbsolute(tmp_dir) catch {};
+
+    // Phase 1: start election to get epoch=1, voted_for=self, then drop state
+    {
+        var state = RaftState.initWithDataDir(testing.allocator, 5, "test-cluster", tmp_dir);
+        defer state.deinit();
+        try state.addVoter(5);
+        try state.addVoter(6);
+
+        _ = state.startElection(); // epoch=1, voted_for=5, persisted automatically
+        try testing.expectEqual(@as(i32, 1), state.current_epoch);
+        try testing.expectEqual(@as(?i32, 5), state.voted_for);
+    }
+
+    // Phase 2: fresh state, load from disk, verify epoch and voted_for survived
+    {
+        var state = RaftState.initWithDataDir(testing.allocator, 5, "test-cluster", tmp_dir);
+        defer state.deinit();
+
+        const loaded = state.loadPersistedMeta();
+        try testing.expect(loaded);
+        try testing.expectEqual(@as(i32, 1), state.current_epoch);
+        try testing.expectEqual(@as(?i32, 5), state.voted_for);
+    }
+}
+
+test "RaftState loadPersistedMeta returns false without file" {
+    const tmp_dir = "/tmp/zmq-raft-meta-nofile-test";
+    fs.deleteTreeAbsolute(tmp_dir) catch {};
+    defer fs.deleteTreeAbsolute(tmp_dir) catch {};
+
+    // Create the directory but do NOT write a raft.meta file
+    fs.makeDirAbsolute(tmp_dir) catch {};
+
+    var state = RaftState.initWithDataDir(testing.allocator, 1, "test-cluster", tmp_dir);
+    defer state.deinit();
+
+    const loaded = state.loadPersistedMeta();
+    try testing.expect(!loaded);
+    // Epoch should remain at default (0)
+    try testing.expectEqual(@as(i32, 0), state.current_epoch);
+    try testing.expectEqual(@as(?i32, null), state.voted_for);
+}
+
+test "RaftState loadPersistedLog replays entries" {
+    const tmp_dir = "/tmp/zmq-raft-log-replay-test";
+    fs.deleteTreeAbsolute(tmp_dir) catch {};
+    defer fs.deleteTreeAbsolute(tmp_dir) catch {};
+
+    // Phase 1: leader appends 3 entries, persisted to disk automatically
+    {
+        var state = RaftState.initWithDataDir(testing.allocator, 0, "test-cluster", tmp_dir);
+        defer state.deinit();
+        try state.addVoter(0);
+
+        _ = state.startElection();
+        state.becomeLeader();
+
+        _ = try state.appendEntry("alpha");
+        _ = try state.appendEntry("bravo");
+        _ = try state.appendEntry("charlie");
+        try testing.expectEqual(@as(usize, 3), state.log.length());
+    }
+
+    // Phase 2: fresh state, loadPersistedLog should recover all 3 entries
+    {
+        var state = RaftState.initWithDataDir(testing.allocator, 0, "test-cluster", tmp_dir);
+        defer state.deinit();
+
+        const recovered = try state.loadPersistedLog();
+        try testing.expectEqual(@as(u64, 3), recovered);
+        try testing.expectEqual(@as(usize, 3), state.log.length());
+
+        // Verify entry content survived the round-trip
+        const entry0 = state.log.get(0).?;
+        try testing.expectEqualStrings("alpha", entry0.data);
+        const entry2 = state.log.get(2).?;
+        try testing.expectEqualStrings("charlie", entry2.data);
+    }
+}
+
+test "RaftState loadPersistedLog handles empty log" {
+    const tmp_dir = "/tmp/zmq-raft-log-empty-test";
+    fs.deleteTreeAbsolute(tmp_dir) catch {};
+    defer fs.deleteTreeAbsolute(tmp_dir) catch {};
+
+    // Create the directory and an empty raft.log file
+    fs.makeDirAbsolute(tmp_dir) catch {};
+    {
+        const path = tmp_dir ++ "/raft.log";
+        const file = try fs.createFileAbsolute(path, .{ .truncate = true });
+        file.close();
+    }
+
+    var state = RaftState.initWithDataDir(testing.allocator, 0, "test-cluster", tmp_dir);
+    defer state.deinit();
+
+    const recovered = try state.loadPersistedLog();
+    try testing.expectEqual(@as(u64, 0), recovered);
+    try testing.expectEqual(@as(usize, 0), state.log.length());
+}
+
+test "RaftState getAppendEntriesForFollower returns null when not leader" {
+    var state = RaftState.init(testing.allocator, 1, "cluster");
+    defer state.deinit();
+
+    try state.addVoter(1);
+    try state.addVoter(2);
+
+    // Node is a follower — should return null
+    state.becomeFollower(1, 2);
+    try testing.expectEqual(RaftState.Role.follower, state.role);
+
+    const result = state.getAppendEntriesForFollower(2);
+    try testing.expect(result == null);
+}
+
+test "RaftState getAppendEntriesForFollower returns entries for lagging follower" {
+    var state = RaftState.init(testing.allocator, 1, "cluster");
+    defer state.deinit();
+
+    try state.addVoter(1);
+    try state.addVoter(2);
+
+    _ = state.startElection();
+    state.becomeLeader();
+
+    // Append 5 entries as leader
+    _ = try state.appendEntry("e0");
+    _ = try state.appendEntry("e1");
+    _ = try state.appendEntry("e2");
+    _ = try state.appendEntry("e3");
+    _ = try state.appendEntry("e4");
+
+    // After becomeLeader(), voter 2's next_index was initialized to lastOffset()+1
+    // at the time of becomeLeader (which was 0+1=1 since log was empty then).
+    // But we want to simulate a lagging follower. Manually set next_index to 2.
+    if (state.voters.getPtr(2)) |v| {
+        v.next_index = 2;
+    }
+
+    const result = state.getAppendEntriesForFollower(2);
+    try testing.expect(result != null);
+
+    const req = result.?;
+    try testing.expectEqual(@as(i32, 1), req.leader_id);
+    try testing.expectEqual(state.current_epoch, req.epoch);
+    try testing.expectEqual(@as(u64, 2), req.entries_start_index);
+    // Entries at offsets 2, 3, 4 should be pending for this follower
+    try testing.expectEqual(@as(usize, 3), req.entries_count);
+    // prev_log should reference the entry just before next_index (offset 1)
+    try testing.expectEqual(@as(u64, 1), req.prev_log_offset);
+    try testing.expectEqual(state.current_epoch, req.prev_log_epoch);
+    try testing.expectEqual(state.commit_index, req.leader_commit);
+}
+
+test "RaftState getAppendEntriesForFollower returns null for unknown voter" {
+    var state = RaftState.init(testing.allocator, 1, "cluster");
+    defer state.deinit();
+
+    try state.addVoter(1);
+    try state.addVoter(2);
+
+    _ = state.startElection();
+    state.becomeLeader();
+
+    _ = try state.appendEntry("data");
+
+    // Voter 999 is not in the cluster — should return null
+    const result = state.getAppendEntriesForFollower(999);
+    try testing.expect(result == null);
+}
+
+test "RaftState loadSnapshotMeta round-trip" {
+    const tmp_dir = "/tmp/zmq-raft-snapshot-roundtrip-test";
+    fs.deleteTreeAbsolute(tmp_dir) catch {};
+    defer fs.deleteTreeAbsolute(tmp_dir) catch {};
+
+    // Phase 1: leader appends entries, commits, takes snapshot
+    {
+        var state = RaftState.initWithDataDir(testing.allocator, 0, "test-cluster", tmp_dir);
+        defer state.deinit();
+        try state.addVoter(0);
+
+        _ = state.startElection();
+        state.becomeLeader();
+
+        _ = try state.appendEntry("snap-e0");
+        _ = try state.appendEntry("snap-e1");
+        _ = try state.appendEntry("snap-e2");
+        _ = try state.appendEntry("snap-e3");
+
+        // Manually advance commit_index to simulate majority ack
+        state.commit_index = 3;
+        state.takeSnapshot();
+
+        try testing.expectEqual(@as(u64, 3), state.last_snapshot_offset);
+        try testing.expectEqual(@as(i32, 1), state.last_snapshot_epoch);
+    }
+
+    // Phase 2: fresh state, loadSnapshotMeta should recover offset and epoch
+    {
+        var state = RaftState.initWithDataDir(testing.allocator, 0, "test-cluster", tmp_dir);
+        defer state.deinit();
+
+        const loaded = state.loadSnapshotMeta();
+        try testing.expect(loaded);
+        try testing.expectEqual(@as(u64, 3), state.last_snapshot_offset);
+        try testing.expectEqual(@as(i32, 1), state.last_snapshot_epoch);
+    }
+}

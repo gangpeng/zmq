@@ -392,3 +392,357 @@ pub const Controller = struct {
         return buf[0..wpos];
     }
 };
+
+// ---------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------
+
+const testing = std.testing;
+
+/// Build a test request with the given API key, version, and correlation ID.
+/// Uses the correct header version based on the API key and version.
+fn buildTestRequest(buf: []u8, api_key: i16, api_version: i16, correlation_id: i32, header_version: i16) usize {
+    var pos: usize = 0;
+    ser.writeI16(buf, &pos, api_key);
+    ser.writeI16(buf, &pos, api_version);
+    ser.writeI32(buf, &pos, correlation_id);
+    if (header_version >= 2) {
+        ser.writeCompactString(buf, &pos, "test-client");
+        ser.writeEmptyTaggedFields(buf, &pos);
+    } else if (header_version >= 1) {
+        ser.writeString(buf, &pos, "test-client");
+    }
+    return pos;
+}
+
+test "Controller init and deinit" {
+    var ctrl = Controller.init(testing.allocator, 1, "test-cluster");
+    defer ctrl.deinit();
+
+    try testing.expectEqual(@as(i32, 1), ctrl.node_id);
+    try testing.expectEqual(RaftState.Role.unattached, ctrl.raft_state.role);
+    try testing.expectEqual(@as(usize, 0), ctrl.broker_registry.count());
+}
+
+test "Controller handleRequest rejects too-short request" {
+    var ctrl = Controller.init(testing.allocator, 1, "test-cluster");
+    defer ctrl.deinit();
+
+    // Empty request
+    try testing.expect(ctrl.handleRequest("") == null);
+    // Only 4 bytes — less than minimum header (8 bytes needed)
+    try testing.expect(ctrl.handleRequest(&[_]u8{ 0, 0, 0, 0 }) == null);
+    // 7 bytes — still less than minimum
+    try testing.expect(ctrl.handleRequest(&[_]u8{ 0, 0, 0, 0, 0, 0, 0 }) == null);
+}
+
+test "Controller handleRequest ApiVersions returns supported APIs" {
+    var ctrl = Controller.init(testing.allocator, 1, "test-cluster");
+    defer ctrl.deinit();
+
+    // ApiVersions v0 uses request header v1, response header v0
+    var buf: [256]u8 = undefined;
+    const req_len = buildTestRequest(&buf, 18, 0, 42, 1);
+
+    const response = ctrl.handleRequest(buf[0..req_len]);
+    try testing.expect(response != null);
+    defer testing.allocator.free(response.?);
+
+    // Response header v0: just correlation_id (4 bytes)
+    var rpos: usize = 0;
+    const corr_id = ser.readI32(response.?, &rpos);
+    try testing.expectEqual(@as(i32, 42), corr_id);
+
+    // error_code
+    const error_code = ser.readI16(response.?, &rpos);
+    try testing.expectEqual(@as(i16, 0), error_code);
+
+    // Array of supported APIs — controller supports 9 APIs
+    const array_len = try ser.readArrayLen(response.?, &rpos);
+    try testing.expectEqual(@as(usize, 9), array_len.?);
+}
+
+test "Controller handleRequest unsupported API returns error" {
+    var ctrl = Controller.init(testing.allocator, 1, "test-cluster");
+    defer ctrl.deinit();
+
+    // Fetch (api_key=1) is not supported on controller port
+    // Fetch v0 is not flexible → request header v1, response header v0
+    var buf: [256]u8 = undefined;
+    const req_len = buildTestRequest(&buf, 1, 0, 77, 1);
+
+    const response = ctrl.handleRequest(buf[0..req_len]);
+    try testing.expect(response != null);
+    defer testing.allocator.free(response.?);
+
+    // Response header v0: correlation_id
+    var rpos: usize = 0;
+    const corr_id = ser.readI32(response.?, &rpos);
+    try testing.expectEqual(@as(i32, 77), corr_id);
+
+    // error_code: 35 (UNSUPPORTED_VERSION)
+    const error_code = ser.readI16(response.?, &rpos);
+    try testing.expectEqual(@as(i16, 35), error_code);
+}
+
+test "Controller handleRequest Vote grants to valid candidate" {
+    var ctrl = Controller.init(testing.allocator, 1, "test-cluster");
+    defer ctrl.deinit();
+
+    // Add voter 2 so the controller knows about candidate 2
+    try ctrl.raft_state.addVoter(2);
+
+    // Vote (52, v0) is flexible → request header v2, response header v1
+    var buf: [256]u8 = undefined;
+    var pos = buildTestRequest(&buf, 52, 0, 10, 2);
+
+    // Vote request body:
+    ser.writeCompactString(&buf, &pos, null); // cluster_id (null)
+    ser.writeI32(&buf, &pos, 2); // candidate_id
+    ser.writeI32(&buf, &pos, 1); // candidate_epoch
+    ser.writeI32(&buf, &pos, 2); // candidate_id (duplicate in wire format)
+    ser.writeI64(&buf, &pos, 0); // last_epoch_end_offset
+    ser.writeI32(&buf, &pos, 0); // last_epoch
+
+    const response = ctrl.handleRequest(buf[0..pos]);
+    try testing.expect(response != null);
+    defer testing.allocator.free(response.?);
+
+    // Response header v1: correlation_id (4 bytes) + tagged_fields (1 byte)
+    var rpos: usize = 0;
+    const corr_id = ser.readI32(response.?, &rpos);
+    try testing.expectEqual(@as(i32, 10), corr_id);
+    _ = try ser.readUnsignedVarint(response.?, &rpos); // skip tagged fields
+
+    // Vote response body: error_code (i16) + epoch (i32) + vote_granted (bool)
+    _ = ser.readI16(response.?, &rpos); // error_code
+    _ = ser.readI32(response.?, &rpos); // epoch
+    const vote_granted = try ser.readBool(response.?, &rpos);
+    try testing.expect(vote_granted);
+}
+
+test "Controller handleRequest Vote rejects stale epoch" {
+    var ctrl = Controller.init(testing.allocator, 1, "test-cluster");
+    defer ctrl.deinit();
+
+    // Put controller at epoch 5 as follower of node 2
+    try ctrl.raft_state.addVoter(1);
+    ctrl.raft_state.becomeFollower(5, 2);
+
+    // Add voter 3 so it can be a candidate
+    try ctrl.raft_state.addVoter(3);
+
+    // Vote from candidate 3 at stale epoch 3
+    var buf: [256]u8 = undefined;
+    var pos = buildTestRequest(&buf, 52, 0, 11, 2);
+
+    ser.writeCompactString(&buf, &pos, null); // cluster_id
+    ser.writeI32(&buf, &pos, 3); // candidate_id
+    ser.writeI32(&buf, &pos, 3); // candidate_epoch (stale — less than current 5)
+    ser.writeI32(&buf, &pos, 3); // candidate_id (duplicate)
+    ser.writeI64(&buf, &pos, 0); // last_epoch_end_offset
+    ser.writeI32(&buf, &pos, 0); // last_epoch
+
+    const response = ctrl.handleRequest(buf[0..pos]);
+    try testing.expect(response != null);
+    defer testing.allocator.free(response.?);
+
+    // Parse response: skip header v1
+    var rpos: usize = 0;
+    _ = ser.readI32(response.?, &rpos); // correlation_id
+    _ = try ser.readUnsignedVarint(response.?, &rpos); // tagged fields
+
+    _ = ser.readI16(response.?, &rpos); // error_code
+    _ = ser.readI32(response.?, &rpos); // epoch
+    const vote_granted = try ser.readBool(response.?, &rpos);
+    try testing.expect(!vote_granted);
+}
+
+test "Controller handleRequest BeginQuorumEpoch accepts higher epoch" {
+    var ctrl = Controller.init(testing.allocator, 1, "test-cluster");
+    defer ctrl.deinit();
+
+    // Controller starts at epoch 0 (unattached)
+    try testing.expectEqual(@as(i32, 0), ctrl.raft_state.current_epoch);
+
+    // BeginQuorumEpoch (53, v0) is flexible → header v2 / response v1
+    var buf: [256]u8 = undefined;
+    var pos = buildTestRequest(&buf, 53, 0, 20, 2);
+
+    // BeginQuorumEpoch body:
+    ser.writeI16(&buf, &pos, 0); // error_code
+    ser.writeI32(&buf, &pos, 0); // topics_len (0)
+    ser.writeI32(&buf, &pos, 2); // leader_id
+    ser.writeI32(&buf, &pos, 5); // leader_epoch
+
+    const response = ctrl.handleRequest(buf[0..pos]);
+    try testing.expect(response != null);
+    defer testing.allocator.free(response.?);
+
+    // Verify raft state was updated
+    try testing.expectEqual(RaftState.Role.follower, ctrl.raft_state.role);
+    try testing.expectEqual(@as(i32, 5), ctrl.raft_state.current_epoch);
+    try testing.expectEqual(@as(i32, 2), ctrl.raft_state.leader_id.?);
+}
+
+test "Controller handleRequest BeginQuorumEpoch ignores stale epoch" {
+    var ctrl = Controller.init(testing.allocator, 1, "test-cluster");
+    defer ctrl.deinit();
+
+    // Put controller at epoch 5
+    ctrl.raft_state.becomeFollower(5, 2);
+    try testing.expectEqual(@as(i32, 5), ctrl.raft_state.current_epoch);
+
+    // Send BeginQuorumEpoch with stale epoch 3
+    var buf: [256]u8 = undefined;
+    var pos = buildTestRequest(&buf, 53, 0, 21, 2);
+
+    ser.writeI16(&buf, &pos, 0); // error_code
+    ser.writeI32(&buf, &pos, 0); // topics_len
+    ser.writeI32(&buf, &pos, 3); // leader_id
+    ser.writeI32(&buf, &pos, 3); // leader_epoch (stale)
+
+    const response = ctrl.handleRequest(buf[0..pos]);
+    try testing.expect(response != null);
+    defer testing.allocator.free(response.?);
+
+    // Raft state should NOT have changed — epoch still 5
+    try testing.expectEqual(@as(i32, 5), ctrl.raft_state.current_epoch);
+}
+
+test "Controller handleRequest DescribeQuorum returns quorum info" {
+    var ctrl = Controller.init(testing.allocator, 1, "test-cluster");
+    defer ctrl.deinit();
+
+    // Add self as voter and become leader
+    try ctrl.raft_state.addVoter(1);
+    _ = ctrl.raft_state.startElection();
+    ctrl.raft_state.becomeLeader();
+
+    // DescribeQuorum (55, v0) is flexible → header v2 / response v1
+    var buf: [256]u8 = undefined;
+    const req_len = buildTestRequest(&buf, 55, 0, 30, 2);
+
+    const response = ctrl.handleRequest(buf[0..req_len]);
+    try testing.expect(response != null);
+    defer testing.allocator.free(response.?);
+
+    // Response header v1: correlation_id + tagged fields
+    var rpos: usize = 0;
+    const corr_id = ser.readI32(response.?, &rpos);
+    try testing.expectEqual(@as(i32, 30), corr_id);
+    _ = try ser.readUnsignedVarint(response.?, &rpos); // tagged fields
+
+    // error_code should be 0
+    const error_code = ser.readI16(response.?, &rpos);
+    try testing.expectEqual(@as(i16, 0), error_code);
+}
+
+test "Controller handleRequest BrokerRegistration registers broker" {
+    var ctrl = Controller.init(testing.allocator, 1, "test-cluster");
+    defer ctrl.deinit();
+
+    // BrokerRegistration (62, v0) is NOT flexible → header v1 / response v0
+    var buf: [256]u8 = undefined;
+    var pos = buildTestRequest(&buf, 62, 0, 40, 1);
+
+    // BrokerRegistration body:
+    ser.writeI32(&buf, &pos, 100); // broker_id
+    ser.writeString(&buf, &pos, "host1"); // host
+    ser.writeI32(&buf, &pos, 9092); // port
+
+    const response = ctrl.handleRequest(buf[0..pos]);
+    try testing.expect(response != null);
+    defer testing.allocator.free(response.?);
+
+    // Response header v0: correlation_id only (4 bytes)
+    var rpos: usize = 0;
+    const corr_id = ser.readI32(response.?, &rpos);
+    try testing.expectEqual(@as(i32, 40), corr_id);
+
+    // throttle_time_ms
+    const throttle = ser.readI32(response.?, &rpos);
+    try testing.expectEqual(@as(i32, 0), throttle);
+
+    // error_code
+    const error_code = ser.readI16(response.?, &rpos);
+    try testing.expectEqual(@as(i16, 0), error_code);
+
+    // broker_epoch (should be > 0)
+    const broker_epoch = ser.readI64(response.?, &rpos);
+    try testing.expect(broker_epoch > 0);
+
+    // Verify broker is registered
+    try testing.expectEqual(@as(usize, 1), ctrl.broker_registry.count());
+}
+
+test "Controller handleRequest BrokerHeartbeat reports active broker" {
+    var ctrl = Controller.init(testing.allocator, 1, "test-cluster");
+    defer ctrl.deinit();
+
+    // First, register a broker to get the epoch
+    var reg_buf: [256]u8 = undefined;
+    var reg_pos = buildTestRequest(&reg_buf, 62, 0, 40, 1);
+    ser.writeI32(&reg_buf, &reg_pos, 100); // broker_id
+    ser.writeString(&reg_buf, &reg_pos, "host1"); // host
+    ser.writeI32(&reg_buf, &reg_pos, 9092); // port
+
+    const reg_response = ctrl.handleRequest(reg_buf[0..reg_pos]);
+    try testing.expect(reg_response != null);
+    defer testing.allocator.free(reg_response.?);
+
+    // Parse broker_epoch from registration response
+    var reg_rpos: usize = 0;
+    _ = ser.readI32(reg_response.?, &reg_rpos); // correlation_id
+    _ = ser.readI32(reg_response.?, &reg_rpos); // throttle_time_ms
+    _ = ser.readI16(reg_response.?, &reg_rpos); // error_code
+    const broker_epoch = ser.readI64(reg_response.?, &reg_rpos);
+
+    // Now send a heartbeat with the correct epoch
+    // BrokerHeartbeat (63, v0) is NOT flexible → header v1 / response v0
+    var hb_buf: [256]u8 = undefined;
+    var hb_pos = buildTestRequest(&hb_buf, 63, 0, 50, 1);
+    ser.writeI32(&hb_buf, &hb_pos, 100); // broker_id
+    ser.writeI64(&hb_buf, &hb_pos, broker_epoch); // broker_epoch
+
+    const hb_response = ctrl.handleRequest(hb_buf[0..hb_pos]);
+    try testing.expect(hb_response != null);
+    defer testing.allocator.free(hb_response.?);
+
+    // Response header v0: correlation_id
+    var hb_rpos: usize = 0;
+    const corr_id = ser.readI32(hb_response.?, &hb_rpos);
+    try testing.expectEqual(@as(i32, 50), corr_id);
+
+    // throttle_time_ms
+    _ = ser.readI32(hb_response.?, &hb_rpos);
+
+    // error_code
+    const error_code = ser.readI16(hb_response.?, &hb_rpos);
+    try testing.expectEqual(@as(i16, 0), error_code);
+
+    // is_caught_up (bool, 1 byte)
+    _ = try ser.readBool(hb_response.?, &hb_rpos);
+
+    // is_fenced — should be false (0) since we just heartbeated
+    const is_fenced = try ser.readBool(hb_response.?, &hb_rpos);
+    try testing.expect(!is_fenced);
+}
+
+test "Controller tick evicts dead brokers" {
+    var ctrl = Controller.init(testing.allocator, 1, "test-cluster");
+    defer ctrl.deinit();
+
+    // Register a broker
+    _ = try ctrl.broker_registry.register(100, "host1", 9092);
+    try testing.expectEqual(@as(usize, 1), ctrl.broker_registry.count());
+
+    // Force the broker's last_heartbeat_ms to be 60 seconds in the past
+    if (ctrl.broker_registry.brokers.getPtr(100)) |info| {
+        info.last_heartbeat_ms = std.time.milliTimestamp() - 60_000;
+    }
+
+    // tick() calls evictExpired(30_000) — broker should be evicted
+    ctrl.tick();
+    try testing.expectEqual(@as(usize, 0), ctrl.broker_registry.count());
+}

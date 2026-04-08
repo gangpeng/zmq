@@ -1352,3 +1352,140 @@ test "S3WalBatcher hasPendingFlush" {
     _ = batcher.drainPendingHWUpdates();
     try testing.expect(!batcher.hasPendingFlush());
 }
+
+test "Wal appendSync forces immediate write" {
+    const tmp_dir = "/tmp/automq-wal-appendsync-test";
+    fs.deleteTreeAbsolute(tmp_dir) catch {};
+
+    // Write a record using appendSync (which appends + fsyncs)
+    {
+        var wal = Wal.init(testing.allocator, tmp_dir, 1024 * 1024);
+        defer wal.deinit();
+        try wal.open();
+
+        const offset = try wal.appendSync("hello-sync");
+        try testing.expectEqual(@as(u64, 0), offset);
+        try testing.expectEqual(@as(u64, 1), wal.total_records_written);
+    }
+
+    // Recover from disk — the record must be present because appendSync
+    // guarantees an fsync before returning.
+    {
+        var wal = Wal.init(testing.allocator, tmp_dir, 1024 * 1024);
+        defer wal.deinit();
+
+        const count = try wal.recover(&struct {
+            fn cb(_: []const u8, _: u64) void {}
+        }.cb);
+
+        try testing.expectEqual(@as(u64, 1), count);
+    }
+
+    fs.deleteTreeAbsolute(tmp_dir) catch {};
+}
+
+test "Wal sync explicit call succeeds" {
+    const tmp_dir = "/tmp/automq-wal-sync-test";
+    fs.deleteTreeAbsolute(tmp_dir) catch {};
+
+    {
+        var wal = Wal.init(testing.allocator, tmp_dir, 1024 * 1024);
+        defer wal.deinit();
+        try wal.open();
+
+        _ = try wal.append("data-1");
+        _ = try wal.append("data-2");
+        _ = try wal.append("data-3");
+
+        // Explicit sync should not error
+        try wal.sync();
+
+        try testing.expectEqual(@as(u64, 3), wal.total_records_written);
+    }
+
+    fs.deleteTreeAbsolute(tmp_dir) catch {};
+}
+
+test "Wal cleanupSegments removes old segments" {
+    const tmp_dir = "/tmp/automq-wal-cleanup-test";
+    fs.deleteTreeAbsolute(tmp_dir) catch {};
+
+    {
+        // Use a tiny segment size so each record triggers a rollover.
+        // Each record = 9 (header) + data_len bytes.
+        // "aaaaaaaaaa" is 10 bytes => 19 bytes per record.
+        // With segment_max_size=20, a second record won't fit, forcing a roll.
+        const small_segment: usize = 20;
+        var wal = Wal.init(testing.allocator, tmp_dir, small_segment);
+        defer wal.deinit();
+        try wal.open();
+
+        // Append 4 records — each goes into its own segment, creating 3 closed
+        // segments plus 1 active segment.
+        _ = try wal.append("aaaaaaaaaa"); // seg 0 — fits (19 bytes < 20)... actually next triggers roll
+        _ = try wal.append("bbbbbbbbbb"); // rolls seg 0 → closed, writes to seg 1
+        _ = try wal.append("cccccccccc"); // rolls seg 1 → closed, writes to seg 2
+        _ = try wal.append("dddddddddd"); // rolls seg 2 → closed, writes to seg 3
+
+        const count_before = wal.segmentCount();
+        try testing.expect(count_before >= 4);
+
+        // Remove closed segments with id <= 1 (segments 0 and 1)
+        const removed = try wal.cleanupSegments(1);
+        try testing.expect(removed >= 2);
+
+        const count_after = wal.segmentCount();
+        try testing.expect(count_after < count_before);
+    }
+
+    fs.deleteTreeAbsolute(tmp_dir) catch {};
+}
+
+test "Wal cleanupSegments no-op for empty WAL" {
+    const tmp_dir = "/tmp/automq-wal-cleanup-empty-test";
+    fs.deleteTreeAbsolute(tmp_dir) catch {};
+
+    {
+        var wal = Wal.init(testing.allocator, tmp_dir, 1024 * 1024);
+        defer wal.deinit();
+        try wal.open();
+
+        // No records appended — only the active segment exists, no closed segments.
+        // cleanupSegments should safely return 0.
+        const removed = try wal.cleanupSegments(0);
+        try testing.expectEqual(@as(u64, 0), removed);
+
+        // Segment count should still be 1 (the active segment)
+        try testing.expectEqual(@as(usize, 1), wal.segmentCount());
+    }
+
+    fs.deleteTreeAbsolute(tmp_dir) catch {};
+}
+
+test "Wal segmentCount includes active segment" {
+    const tmp_dir = "/tmp/automq-wal-segcount-test";
+    fs.deleteTreeAbsolute(tmp_dir) catch {};
+
+    {
+        var wal = Wal.init(testing.allocator, tmp_dir, 1024 * 1024);
+        defer wal.deinit();
+        try wal.open();
+
+        // After open, there is exactly 1 segment (the active one)
+        try testing.expectEqual(@as(usize, 1), wal.segmentCount());
+
+        // Use a small segment size to force rollover
+        wal.segment_max_size = 20;
+
+        // "aaaaaaaaaa" = 10 bytes + 9 header = 19 bytes.
+        // First record fits in the active segment.
+        _ = try wal.append("aaaaaaaaaa");
+        // Second record triggers rollover: old segment becomes closed, new active created.
+        _ = try wal.append("bbbbbbbbbb");
+
+        // Should now have >= 2: at least 1 closed + 1 active
+        try testing.expect(wal.segmentCount() >= 2);
+    }
+
+    fs.deleteTreeAbsolute(tmp_dir) catch {};
+}

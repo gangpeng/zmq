@@ -419,3 +419,126 @@ test "LogCache blockCount and recordCount" {
     try testing.expectEqual(@as(usize, 1), cache.blockCount());
     try testing.expectEqual(@as(usize, 1), cache.recordCount());
 }
+
+test "LogCache putOwned transfers ownership" {
+    var cache = LogCache.init(testing.allocator, 64, 1024 * 1024);
+    defer cache.deinit();
+
+    // Allocate 8 bytes and fill with data — ownership transfers to the cache.
+    const owned = try testing.allocator.alloc(u8, 8);
+    @memcpy(owned, "ownedDAT");
+
+    try cache.putOwned(1, 0, owned);
+
+    // get() should return the data we transferred.
+    const results = try cache.get(1, 0, 1, testing.allocator);
+    defer testing.allocator.free(results);
+    try testing.expectEqual(@as(usize, 1), results.len);
+    try testing.expectEqualStrings("ownedDAT", results[0].data);
+
+    // deinit frees the owned slice; testing.allocator will detect leaks if not freed.
+}
+
+test "LogCache block rollover at 1000 records" {
+    var cache = LogCache.init(testing.allocator, 64, 10 * 1024 * 1024);
+    defer cache.deinit();
+
+    // Put 1001 records — first 1000 fill block 0, record 1001 triggers a new block.
+    for (0..1001) |i| {
+        try cache.put(1, i, "r");
+    }
+
+    try testing.expectEqual(@as(usize, 2), cache.blockCount());
+    try testing.expectEqual(@as(usize, 1001), cache.recordCount());
+}
+
+test "LogCache get filters by stream_id" {
+    var cache = LogCache.init(testing.allocator, 64, 1024 * 1024);
+    defer cache.deinit();
+
+    // Interleave records for stream 1 and stream 2.
+    try cache.put(1, 0, "s1-a");
+    try cache.put(2, 0, "s2-a");
+    try cache.put(1, 1, "s1-b");
+    try cache.put(2, 1, "s2-b");
+    try cache.put(1, 2, "s1-c");
+
+    // Query stream 1 only — should return 3 records.
+    const results = try cache.get(1, 0, 100, testing.allocator);
+    defer testing.allocator.free(results);
+    try testing.expectEqual(@as(usize, 3), results.len);
+
+    // Verify every returned record belongs to stream 1.
+    for (results) |rec| {
+        try testing.expectEqual(@as(u64, 1), rec.stream_id);
+    }
+}
+
+test "LogCache combined size and block eviction" {
+    // max_blocks=2, max_size=200 — both constraints active.
+    var cache = LogCache.init(testing.allocator, 2, 200);
+    defer cache.deinit();
+
+    // Put data that fits in one block and within size budget.
+    // Each record is 10 bytes × 10 records = 100 bytes, 1 block.
+    for (0..10) |i| {
+        try cache.put(1, i, "0123456789");
+    }
+    try testing.expectEqual(@as(usize, 1), cache.blockCount());
+
+    // Add more data to approach the 200-byte limit (another 100 bytes).
+    // This still fits within max_blocks=2 and max_size=200.
+    for (10..20) |i| {
+        try cache.put(1, i, "0123456789");
+    }
+
+    // Adding more data should trigger eviction of the oldest block.
+    try cache.put(1, 20, "0123456789");
+
+    // After eviction, we should have at most 2 blocks.
+    try testing.expect(cache.blockCount() <= 2);
+
+    // The earliest offsets (block 0) should have been evicted.
+    const results = try cache.get(1, 0, 5, testing.allocator);
+    defer testing.allocator.free(results);
+    try testing.expectEqual(@as(usize, 0), results.len);
+}
+
+test "S3BlockCache eviction frees memory properly" {
+    // max_size=100 — can hold at most two 50-byte items.
+    var cache = S3BlockCache.init(testing.allocator, 100);
+    defer cache.deinit();
+
+    const data_50 = "01234567890123456789012345678901234567890123456789"; // 50 bytes
+
+    try cache.put("a", data_50); // 50 bytes, total 50
+    try cache.put("b", data_50); // 50 bytes, total 100
+    try cache.put("c", data_50); // needs eviction of "a" to fit
+
+    // "a" was evicted (LRU), "b" and "c" remain.
+    try testing.expect(cache.get("a") == null);
+    try testing.expect(cache.get("b") != null);
+    try testing.expect(cache.get("c") != null);
+
+    // current_size should be exactly 100 (two items of 50 bytes).
+    try testing.expectEqual(@as(u64, 100), cache.current_size);
+
+    // testing.allocator detects leaks — evicted data must have been freed.
+}
+
+test "S3BlockCache hit/miss counters accurate" {
+    var cache = S3BlockCache.init(testing.allocator, 1024);
+    defer cache.deinit();
+
+    try cache.put("item", "value");
+
+    _ = cache.get("item"); // hit
+    _ = cache.get("no-such-key"); // miss
+    _ = cache.get("also-missing"); // miss
+
+    try testing.expectEqual(@as(u64, 1), cache.hits);
+    try testing.expectEqual(@as(u64, 2), cache.misses);
+
+    // hitRate = 1 / 3 ≈ 0.333
+    try testing.expectApproxEqAbs(@as(f64, 1.0 / 3.0), cache.hitRate(), 0.001);
+}

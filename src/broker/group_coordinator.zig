@@ -1389,3 +1389,187 @@ test "GroupCoordinator sticky assignment handles new member" {
     // Both members should have partitions (not all 4 to member 1)
     try testing.expectEqual(@as(usize, 2), assign2.len);
 }
+
+test "GroupCoordinator evictExpiredMembers removes timed-out members" {
+    var coord = GroupCoordinator.init(testing.allocator);
+    defer coord.deinit();
+
+    // Join 3 members to a group
+    const r1 = try coord.joinGroup("timeout-group", null, "consumer", null);
+    const r2 = try coord.joinGroup("timeout-group", null, "consumer", null);
+    const r3 = try coord.joinGroup("timeout-group", null, "consumer", null);
+
+    const group = coord.groups.getPtr("timeout-group").?;
+    try testing.expectEqual(@as(usize, 3), group.memberCount());
+
+    // Expire members r1 and r2 by setting their heartbeat far in the past
+    if (group.members.getPtr(r1.member_id)) |m| {
+        m.last_heartbeat_ms = std.time.milliTimestamp() - 120_000; // 2 min ago
+    }
+    if (group.members.getPtr(r2.member_id)) |m| {
+        m.last_heartbeat_ms = std.time.milliTimestamp() - 90_000; // 1.5 min ago
+    }
+    // r3 keeps a recent heartbeat (already set by joinGroup)
+
+    // Evict with a 10-second timeout — r1 and r2 should be evicted, r3 survives
+    const evicted = coord.evictExpiredMembers(10_000);
+    try testing.expectEqual(@as(u32, 2), evicted);
+    try testing.expectEqual(@as(usize, 1), group.memberCount());
+
+    // r3 should still be in the group
+    try testing.expect(group.members.contains(r3.member_id));
+    try testing.expect(!group.members.contains(r1.member_id));
+    try testing.expect(!group.members.contains(r2.member_id));
+
+    // Group should be in preparing_rebalance (not empty, since r3 remains)
+    try testing.expectEqual(ConsumerGroup.GroupState.preparing_rebalance, group.state);
+}
+
+test "GroupCoordinator evictExpiredMembers skips active members" {
+    var coord = GroupCoordinator.init(testing.allocator);
+    defer coord.deinit();
+
+    // Join 2 members — both have fresh heartbeats from joinGroup
+    _ = try coord.joinGroup("active-group", null, "consumer", null);
+    _ = try coord.joinGroup("active-group", null, "consumer", null);
+
+    const group = coord.groups.getPtr("active-group").?;
+    try testing.expectEqual(@as(usize, 2), group.memberCount());
+
+    // Evict with a very large timeout (300 seconds) — nobody should be evicted
+    const evicted = coord.evictExpiredMembers(300_000);
+    try testing.expectEqual(@as(u32, 0), evicted);
+    try testing.expectEqual(@as(usize, 2), group.memberCount());
+
+    // State should remain preparing_rebalance (set by second joinGroup), not changed
+    try testing.expectEqual(ConsumerGroup.GroupState.preparing_rebalance, group.state);
+}
+
+test "GroupCoordinator computeRangeAssignment distributes evenly" {
+    var coord = GroupCoordinator.init(testing.allocator);
+    defer coord.deinit();
+
+    // Join 2 members
+    _ = try coord.joinGroup("range-group", null, "consumer", null);
+    _ = try coord.joinGroup("range-group", null, "consumer", null);
+
+    // 4 partitions across 2 members => 2 each
+    const topics = [_]GroupCoordinator.TopicPartitionCount{
+        .{ .topic = "test-topic", .partition_count = 4 },
+    };
+    const assignments = try coord.computeRangeAssignment("range-group", &topics);
+    defer {
+        for (assignments) |a| testing.allocator.free(a.assignment);
+        testing.allocator.free(assignments);
+    }
+
+    try testing.expectEqual(@as(usize, 2), assignments.len);
+
+    // Decode each assignment blob and verify partition count
+    // Binary format: version(i16) + num_topics(i32) + topic_name(i16+bytes) + num_parts(i32) + parts(i32[]) + user_data(i32)
+    for (assignments) |a| {
+        const blob = a.assignment;
+        // Skip version (2 bytes)
+        var pos: usize = 2;
+        // num_topics
+        const num_topics = std.mem.readInt(i32, blob[pos..][0..4], .big);
+        try testing.expectEqual(@as(i32, 1), num_topics);
+        pos += 4;
+        // topic name length
+        const topic_len: usize = @intCast(std.mem.readInt(i16, blob[pos..][0..2], .big));
+        pos += 2;
+        // topic name
+        try testing.expectEqualStrings("test-topic", blob[pos .. pos + topic_len]);
+        pos += topic_len;
+        // partition count for this member
+        const part_count = std.mem.readInt(i32, blob[pos..][0..4], .big);
+        try testing.expectEqual(@as(i32, 2), part_count);
+    }
+}
+
+test "GroupCoordinator leaveGroup cleans member resources" {
+    var coord = GroupCoordinator.init(testing.allocator);
+    defer coord.deinit();
+
+    // Join 2 members with subscriptions to exercise full cleanup
+    const subs = [_][]const u8{ "topic-x", "topic-y" };
+    const r1 = try coord.joinGroup("leave-group", null, "consumer", &subs);
+    const r2 = try coord.joinGroup("leave-group", null, "consumer", &subs);
+
+    try testing.expect(r1.is_leader);
+    const group = coord.groups.getPtr("leave-group").?;
+    try testing.expectEqual(@as(usize, 2), group.memberCount());
+
+    // Force to completing_rebalance + sync to give members assignments
+    group.state = .completing_rebalance;
+    const sync_assigns = [_]GroupCoordinator.MemberAssignment{
+        .{ .member_id = r1.member_id, .assignment = "assign-r1" },
+        .{ .member_id = r2.member_id, .assignment = "assign-r2" },
+    };
+    const sync_result = try coord.syncGroup("leave-group", r1.member_id, r1.generation_id, &sync_assigns);
+    try testing.expectEqual(@as(i16, 0), sync_result.error_code);
+    try testing.expectEqual(ConsumerGroup.GroupState.stable, group.state);
+
+    // Leave r1 (the leader) — group should rebalance, member removed, resources freed
+    const leave_err = coord.leaveGroup("leave-group", r1.member_id);
+    try testing.expectEqual(@as(i16, 0), leave_err);
+    try testing.expectEqual(@as(usize, 1), group.memberCount());
+    try testing.expect(!group.members.contains(r1.member_id));
+    try testing.expect(group.members.contains(r2.member_id));
+    // With remaining members, state transitions to preparing_rebalance
+    try testing.expectEqual(ConsumerGroup.GroupState.preparing_rebalance, group.state);
+    // Generation incremented on leave
+    try testing.expectEqual(@as(i32, r1.generation_id + 1), group.generation_id);
+
+    // Leave r2 (last member) — group becomes empty
+    const leave_err2 = coord.leaveGroup("leave-group", r2.member_id);
+    try testing.expectEqual(@as(i16, 0), leave_err2);
+    try testing.expectEqual(@as(usize, 0), group.memberCount());
+    try testing.expectEqual(ConsumerGroup.GroupState.empty, group.state);
+}
+
+test "GroupCoordinator multiple groups independent state and offsets" {
+    var coord = GroupCoordinator.init(testing.allocator);
+    defer coord.deinit();
+
+    // Create group-alpha with 2 members, group-beta with 1 member
+    const alpha1 = try coord.joinGroup("group-alpha", null, "consumer", null);
+    _ = try coord.joinGroup("group-alpha", null, "consumer", null);
+    const beta1 = try coord.joinGroup("group-beta", null, "consumer", null);
+
+    try testing.expectEqual(@as(usize, 2), coord.groupCount());
+
+    // Commit different offsets per group for same topic-partition
+    try coord.commitOffset("group-alpha", "shared-topic", 0, 100);
+    try coord.commitOffset("group-beta", "shared-topic", 0, 500);
+
+    // Verify offsets are independent
+    const alpha_offset = try coord.fetchOffset("group-alpha", "shared-topic", 0);
+    const beta_offset = try coord.fetchOffset("group-beta", "shared-topic", 0);
+    try testing.expectEqual(@as(i64, 100), alpha_offset.?);
+    try testing.expectEqual(@as(i64, 500), beta_offset.?);
+
+    // Force group-alpha to stable, leave group-beta's sole member
+    const ga = coord.groups.getPtr("group-alpha").?;
+    const gb = coord.groups.getPtr("group-beta").?;
+    ga.state = .completing_rebalance;
+    const sync_a = [_]GroupCoordinator.MemberAssignment{
+        .{ .member_id = alpha1.member_id, .assignment = "p0" },
+    };
+    _ = try coord.syncGroup("group-alpha", alpha1.member_id, alpha1.generation_id, &sync_a);
+    try testing.expectEqual(ConsumerGroup.GroupState.stable, ga.state);
+
+    // Leave group-beta member — should not affect group-alpha
+    _ = coord.leaveGroup("group-beta", beta1.member_id);
+    try testing.expectEqual(ConsumerGroup.GroupState.empty, gb.state);
+    try testing.expectEqual(ConsumerGroup.GroupState.stable, ga.state);
+    try testing.expectEqual(@as(usize, 2), ga.memberCount());
+
+    // Heartbeat on group-alpha still works
+    const hb = coord.heartbeat("group-alpha", alpha1.member_id, alpha1.generation_id);
+    try testing.expectEqual(@as(i16, 0), hb);
+
+    // Offsets are still correct after state changes
+    const alpha_offset2 = try coord.fetchOffset("group-alpha", "shared-topic", 0);
+    try testing.expectEqual(@as(i64, 100), alpha_offset2.?);
+}

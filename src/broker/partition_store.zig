@@ -1204,3 +1204,165 @@ test "PartitionStore MAX_MESSAGE_BYTES rejection" {
     const result = store.produce("t", 0, oversized);
     try testing.expectError(error.MessageTooLarge, result);
 }
+
+test "PartitionStore getPartitionInfo returns null for unknown" {
+    var store = PartitionStore.init(testing.allocator);
+    defer store.deinit();
+
+    // A fresh store has no partitions — getPartitionInfo should return null
+    const info = store.getPartitionInfo("nonexistent", 0);
+    try testing.expect(info == null);
+
+    // Also null for a different partition id on the same topic
+    const info2 = store.getPartitionInfo("nonexistent", 42);
+    try testing.expect(info2 == null);
+}
+
+test "PartitionStore getPartitionInfo returns null even for existing partition" {
+    var store = PartitionStore.init(testing.allocator);
+    defer store.deinit();
+
+    // Produce a record to create the partition
+    _ = try store.produce("my-topic", 0, "hello");
+
+    // NOTE: getPartitionInfo uses hashPartitionKey() → decimal string lookup, but
+    // partitions are stored under "topic-partition_id" keys. The key formats don't
+    // match, so getPartitionInfo currently always returns null. This test documents
+    // the existing behavior (a known bug).
+    const info = store.getPartitionInfo("my-topic", 0);
+    try testing.expect(info == null);
+}
+
+test "PartitionStore ensurePartition creates distinct entries for different topic-partitions" {
+    var store = PartitionStore.init(testing.allocator);
+    defer store.deinit();
+
+    try store.ensurePartition("topic-a", 0);
+    try store.ensurePartition("topic-b", 0);
+    try store.ensurePartition("topic-a", 1);
+
+    // Three distinct topic-partition combinations → three map entries
+    try testing.expectEqual(@as(u32, 3), store.partitions.count());
+
+    // Verify each key exists
+    var buf1: [256]u8 = undefined;
+    const k1 = PartitionStore.partitionKeyBuf(&buf1, "topic-a", 0);
+    try testing.expect(store.partitions.contains(k1));
+
+    var buf2: [256]u8 = undefined;
+    const k2 = PartitionStore.partitionKeyBuf(&buf2, "topic-b", 0);
+    try testing.expect(store.partitions.contains(k2));
+
+    var buf3: [256]u8 = undefined;
+    const k3 = PartitionStore.partitionKeyBuf(&buf3, "topic-a", 1);
+    try testing.expect(store.partitions.contains(k3));
+}
+
+test "PartitionStore ensurePartition idempotent preserves state" {
+    var store = PartitionStore.init(testing.allocator);
+    defer store.deinit();
+
+    // First call creates the partition
+    try store.ensurePartition("t", 0);
+    try testing.expectEqual(@as(u32, 1), store.partitions.count());
+
+    // Produce a record so state.next_offset advances to 1
+    _ = try store.produce("t", 0, "data");
+
+    // Second ensurePartition must not reset the partition state
+    try store.ensurePartition("t", 0);
+    try testing.expectEqual(@as(u32, 1), store.partitions.count());
+
+    // Verify the offset was preserved (not reset to 0)
+    var buf: [256]u8 = undefined;
+    const key = PartitionStore.partitionKeyBuf(&buf, "t", 0);
+    const state = store.partitions.get(key).?;
+    try testing.expectEqual(@as(u64, 1), state.next_offset);
+}
+
+test "PartitionStore multiple produce and fetch round-trip with offsets" {
+    var store = PartitionStore.init(testing.allocator);
+    defer store.deinit();
+
+    // Produce 5 records with known content
+    _ = try store.produce("t", 0, "rec-0");
+    _ = try store.produce("t", 0, "rec-1");
+    _ = try store.produce("t", 0, "rec-2");
+    _ = try store.produce("t", 0, "rec-3");
+    _ = try store.produce("t", 0, "rec-4");
+
+    // Fetch all from offset 0 — should contain all 5 records' data
+    const all = try store.fetch("t", 0, 0, 1024 * 1024);
+    defer if (all.records.len > 0) testing.allocator.free(@constCast(all.records));
+    try testing.expectEqual(@as(i16, 0), all.error_code);
+    // 5 records × 5 bytes each = 25 bytes total
+    try testing.expectEqual(@as(usize, 25), all.records.len);
+    try testing.expectEqual(@as(i64, 5), all.high_watermark);
+
+    // Fetch starting from offset 2 — should return records from offset 2, 3, 4
+    const partial = try store.fetch("t", 0, 2, 1024 * 1024);
+    defer if (partial.records.len > 0) testing.allocator.free(@constCast(partial.records));
+    try testing.expectEqual(@as(i16, 0), partial.error_code);
+    // 3 records × 5 bytes = 15 bytes
+    try testing.expectEqual(@as(usize, 15), partial.records.len);
+    try testing.expectEqual(@as(i64, 5), partial.high_watermark);
+
+    // Fetch from offset 5 (past the end) — should return empty
+    const empty = try store.fetch("t", 0, 5, 1024 * 1024);
+    defer if (empty.records.len > 0) testing.allocator.free(@constCast(empty.records));
+    try testing.expectEqual(@as(i16, 0), empty.error_code);
+    try testing.expectEqual(@as(usize, 0), empty.records.len);
+}
+
+test "PartitionStore applyDeferredHWUpdates advances HW" {
+    var store = PartitionStore.init(testing.allocator);
+    defer store.deinit();
+
+    // Produce records on two partitions — in memory mode HW advances immediately
+    _ = try store.produce("t", 0, "a");
+    _ = try store.produce("t", 0, "b");
+    _ = try store.produce("t", 0, "c");
+    _ = try store.produce("t", 1, "x");
+
+    // Verify initial HW (memory mode: HW == next_offset)
+    var buf0: [256]u8 = undefined;
+    const key0 = PartitionStore.partitionKeyBuf(&buf0, "t", 0);
+    const state0_before = store.partitions.get(key0).?;
+    try testing.expectEqual(@as(u64, 3), state0_before.high_watermark);
+
+    // Manually lower HW to simulate S3 WAL mode where HW hasn't caught up
+    store.partitions.getPtr(key0).?.high_watermark = 1;
+    var buf1: [256]u8 = undefined;
+    const key1 = PartitionStore.partitionKeyBuf(&buf1, "t", 1);
+    store.partitions.getPtr(key1).?.high_watermark = 0;
+
+    // Build HW update map: stream_id → new_hw
+    var hw_updates = std.AutoHashMap(u64, u64).init(testing.allocator);
+    defer hw_updates.deinit();
+
+    // Compute stream IDs the same way PartitionStore does
+    var hasher0 = std.hash.Wyhash.init(0);
+    hasher0.update("t");
+    hasher0.update(std.mem.asBytes(&@as(i32, 0)));
+    const sid0 = hasher0.final();
+
+    var hasher1 = std.hash.Wyhash.init(0);
+    hasher1.update("t");
+    hasher1.update(std.mem.asBytes(&@as(i32, 1)));
+    const sid1 = hasher1.final();
+
+    try hw_updates.put(sid0, 3); // advance t-0 HW to 3
+    try hw_updates.put(sid1, 1); // advance t-1 HW to 1
+
+    store.applyDeferredHWUpdates(&hw_updates);
+
+    // Verify HW was advanced
+    const state0_after = store.partitions.get(key0).?;
+    try testing.expectEqual(@as(u64, 3), state0_after.high_watermark);
+    // LSO should also advance (no unstable txn)
+    try testing.expectEqual(@as(u64, 3), state0_after.last_stable_offset);
+
+    const state1_after = store.partitions.get(key1).?;
+    try testing.expectEqual(@as(u64, 1), state1_after.high_watermark);
+    try testing.expectEqual(@as(u64, 1), state1_after.last_stable_offset);
+}
