@@ -101,8 +101,11 @@ See `DESIGN.md` for the full architecture with component diagram. Key points:
 ### Data flow
 ```
 Produce → Broker.handleProduce → PartitionStore.produce
-  → WAL + LogCache + S3WalBatcher.append
+  → WAL + LogCache + S3WalBatcher.append (+ trackPendingHW in group_commit mode)
+  → [group_commit: deferred to epoll batch boundary]
+  → Server.batch_flush_fn → Broker.flushPendingWal
   → S3WalBatcher.flushNow → S3 PUT + ObjectManager.commitStreamSetObject
+  → applyDeferredHWUpdates (HW advances for all flushed partitions)
 
 Fetch → Broker.handleFetch → PartitionStore.fetchWithIsolation
   → LogCache → S3BlockCache → ObjectManager.getObjects → S3 GET
@@ -166,7 +169,7 @@ src/
 │   ├── state.zig               # RaftState, RaftLog, ElectionTimer, MetadataImage
 │   └── election_loop.zig       # Background: elections, heartbeats, replication, snapshots
 ├── storage/
-│   ├── wal.zig                 # Filesystem WAL + S3WalBatcher (epoch-fenced)
+│   ├── wal.zig                 # Filesystem WAL + S3WalBatcher (group commit, epoch-fenced)
 │   ├── cache.zig               # LogCache (FIFO) + S3BlockCache (LRU)
 │   ├── s3.zig                  # ObjectWriter/Reader (DataBlocks + Index + Footer)
 │   ├── s3_client.zig           # HTTP S3 client with AWS SigV4

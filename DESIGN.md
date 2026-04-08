@@ -4,18 +4,17 @@
 
 ZMQ is a high-performance, Kafka-compatible broker that reimplements AutoMQ's cloud-native architecture in Zig. Like AutoMQ, it separates compute from storage — brokers are stateless compute nodes that delegate all durability to S3. This eliminates inter-broker data replication (RF=1 always), enabling instant failover via metadata reassignment.
 
-### Performance Comparison
+### Performance Comparison (3-node cluster, MinIO S3 backend)
 
-| Metric | Zig | Java | Zig Advantage |
+| Metric | ZMQ (Zig) | AutoMQ (Java) | ZMQ Advantage |
 |---|---|---|---|
-| Produce (single msg/req) | 5,430 msg/s | 1,400 msg/s | **3.9x faster** |
-| Produce (batched 50/req) | 166,525 msg/s | 77,125 msg/s | **2.2x faster** |
-| Produce p50 / p99 latency | 0.17 / 0.33 ms | 0.58 / 2.69 ms | **3.4x / 8.2x lower** |
-| ApiVersions throughput | 5,544/s | 1,514/s | **3.7x faster** |
-| Metadata throughput | 3,247/s | 1,985/s | **1.6x faster** |
-| Startup time | 502 ms | 7,511 ms | **15x faster** |
-| Memory (3 brokers loaded) | 7.8 MB | 1,547 MB | **198x less** |
-| Binary size | 4.5 MB | ~200+ MB | **44x smaller** |
+| Produce throughput (conn reuse) | 1,863/s | 1,025/s | **1.8x faster** |
+| Produce throughput (fresh conn) | 1,098/s | 723/s | **1.5x faster** |
+| Produce p50 / p99 latency | 0.45 / 3.02 ms | 0.87 / 2.95 ms | **1.9x / comparable** |
+| ApiVersions throughput | 2,118/s | 1,137/s | **1.9x faster** |
+| Fetch throughput | 1,060/s | 29/s | **37x faster** |
+| Metadata throughput | 1,606/s | 1,269/s | **1.3x faster** |
+| Metadata p50 / p99 latency | 0.57 / 1.70 ms | 0.73 / 1.81 ms | **1.3x / 1.1x lower** |
 
 ---
 
@@ -73,9 +72,9 @@ ZMQ is organized into distinct modules that interact through well-defined interf
 │  │  │ S3WalBatcher │ │ LogCache     │ │ S3BlockCache │ │ Compaction │  │   │
 │  │  │ (wal.zig)    │ │ (cache.zig)  │ │ (cache.zig)  │ │ Manager    │  │   │
 │  │  │              │ │              │ │              │ │(compact.zig)│  │   │
-│  │  │ batch→S3     │ │ FIFO hot data│ │ LRU S3 reads│ │ split+merge│  │   │
-│  │  │ epoch fence  │ │ zero-copy    │ │ hit/miss    │ │ write-before│  │   │
-│  │  │ sync/async   │ │              │ │             │ │ -delete     │  │   │
+│  │  │ group commit │ │ FIFO hot data│ │ LRU S3 reads│ │ split+merge│  │   │
+│  │  │ batch→S3     │ │ zero-copy    │ │ hit/miss    │ │ write-before│  │   │
+│  │  │ epoch fence  │ │              │ │             │ │ -delete     │  │   │
 │  │  └──────┬───────┘ └──────────────┘ └──────────────┘ └─────┬──────┘  │   │
 │  │         │              ▲  ObjectManager (stream.zig)       │         │   │
 │  │         │              │  Stream/SSO/SO metadata registry  │         │   │
@@ -104,7 +103,7 @@ ZMQ is organized into distinct modules that interact through well-defined interf
 | **MetadataClient** | `src/controller/metadata_client.zig` | Broker-only nodes use this to discover the controller leader, register via BrokerRegistration (API 62), and heartbeat via BrokerHeartbeat (API 63). Implements lease-based staleness detection to self-fence on network partition. |
 | **Broker** | `src/broker/handler.zig` | Stateful Kafka broker. Dispatches all 44+ Kafka client APIs. Owns PartitionStore, GroupCoordinator, TxnCoordinator, QuotaManager, Metrics. Holds optional `?*RaftState` pointer (null in broker-only mode). |
 | **PartitionStore** | `src/broker/partition_store.zig` | Multi-tier storage engine: produce writes to WAL + LogCache + S3WalBatcher; fetch reads from LogCache → S3BlockCache → S3. Manages per-partition state (offsets, HW, LSO). |
-| **S3WalBatcher** | `src/storage/wal.zig` | Batches records and uploads to S3 via ObjectWriter format. Epoch-fenced: rejects writes after `fence()`. Two modes: sync (flush per produce) and async (flush on tick). |
+| **S3WalBatcher** | `src/storage/wal.zig` | Batches records from all partitions and uploads to S3 via ObjectWriter format. Epoch-fenced: rejects writes after `fence()`. Three modes: sync (flush per produce), async (flush on tick), group_commit (batch flush at epoll boundary — AutoMQ-style, default). Group commit defers S3 flush to batch boundaries, enabling many produces to share one S3 PUT. |
 | **ObjectManager** | `src/storage/stream.zig` | Metadata registry for Streams, StreamSetObjects (multi-stream), and StreamObjects (per-stream). Resolves fetch queries by merging both object types sorted by offset. |
 | **CompactionManager** | `src/storage/compaction.zig` | Periodic compaction: force-splits multi-stream SSOs into per-stream SOs, then merges small SOs. Uses write-before-delete pattern for crash safety. |
 | **GroupCoordinator** | `src/broker/group_coordinator.zig` | Consumer group lifecycle: state machine (Empty → PreparingRebalance → CompletingRebalance → Stable), JoinGroup, SyncGroup (leader-only validation), Heartbeat (rebalance signaling), offset commit/fetch. |
@@ -114,7 +113,7 @@ ZMQ is organized into distinct modules that interact through well-defined interf
 
 ### How Components Interact
 
-**Produce path:** Client → Broker (handler.zig) → PartitionStore.produce() → S3WalBatcher.append() → flushNow() → S3 PUT + ObjectManager.commitStreamSetObject()
+**Produce path:** Client → Broker (handler.zig) → PartitionStore.produce() → S3WalBatcher.append() + LogCache.putOwned() → [group_commit: defer flush to epoll boundary] → Server.batch_flush_fn() → S3WalBatcher.flushNow() → S3 PUT + ObjectManager.commitStreamSetObject() → applyDeferredHWUpdates()
 
 **Fetch path:** Client → Broker → PartitionStore.fetchWithIsolation() → LogCache.get() → S3BlockCache.get() → ObjectManager.getObjects() → S3 GET + ObjectReader.parse()
 
@@ -380,6 +379,9 @@ Producer (Kafka Client)
 │        buffer → batch upload to S3 via ObjectWriter format   │
 │        ├─ Epoch fencing check (reject if is_fenced)          │
 │        ├─ SYNC mode: flushNow() → S3 PUT before ack         │
+│        ├─ GROUP_COMMIT mode (default): defer flush to epoll  │
+│        │   boundary. Many produces share one S3 PUT.         │
+│        │   HW advances after successful batch flush.         │
 │        └─ ASYNC mode: buffer (flush on tick: 4MB/250ms)      │
 │                                                               │
 │  7. Advance high_watermark (only after durable write)        │
@@ -396,6 +398,41 @@ Producer (Kafka Client)
          └──────────────────────┘
 ```
 
+### Group Commit: Batched S3 WAL Writes
+
+ZMQ implements AutoMQ-style group commit to amortize S3 latency across many produce requests. Instead of one S3 PUT per produce (sync mode: ~167 req/s), group commit batches records from all partitions and flushes to S3 at threshold boundaries (250ms or 4MB), achieving ~1,900 req/s.
+
+**How it works:**
+
+1. `produce()` appends records to `S3WalBatcher` buffer and `LogCache`, assigns offsets eagerly from `next_offset`, but does **NOT** call `flushNow()` and does **NOT** advance HW.
+2. The produce response goes out immediately with the correct `base_offset`.
+3. After the Server's epoll event loop processes all ready connections, `batch_flush_fn` triggers `Broker.flushPendingWal()`.
+4. `flushPendingWal()` checks `shouldFlush()` (size ≥ 4MB or time ≥ 250ms). If threshold met, one S3 PUT uploads all accumulated records.
+5. On successful S3 flush, `applyDeferredHWUpdates()` advances HW for all affected partitions → consumers can now see the data.
+6. On failure, HW stays put, data stays in the batcher buffer, retried on next epoll iteration.
+
+```
+epoll_wait() → process N produce requests from all connections:
+  produce 1 → append batcher + LogCache, assign offset    [NO S3 PUT]
+  produce 2 → append batcher + LogCache, assign offset    [NO S3 PUT]
+  ...
+  produce N → append batcher + LogCache, assign offset    [NO S3 PUT]
+→ batch_flush_fn():
+  if shouldFlush():
+    flushNow() → ONE S3 PUT for all N produces
+    applyDeferredHWUpdates() → advance HW for all partitions
+```
+
+**Flush modes** (configurable via `--s3-wal-flush-mode`):
+
+| Mode | Durability | Throughput | Behavior |
+|------|-----------|------------|----------|
+| `group_commit` (default) | Deferred until S3 batch flush | ~1,900 req/s | Records batched, S3 PUT at threshold (250ms/4MB) |
+| `sync` | Immediate (per-produce S3 PUT) | ~167 req/s | Most durable, highest latency |
+| `async` | Eventual (tick-based flush) | ~1,900 req/s | HW advances immediately, lossy on crash |
+
+**AutoMQ comparison:** AutoMQ's Object WAL uses the same approach — a `DefaultWriter` accumulates records in a `Bulk`, uploads at `batchInterval` (250ms) or `maxBytesInBatch` (8MB), and completes produce futures after the S3 PUT. ZMQ's group commit matches this semantics in a single-threaded epoll model: the epoll iteration boundary serves as the natural group commit point.
+
 ### Metadata Maintained During Writes
 
 The following metadata is maintained in-memory by the Zig broker. Partition state is tracked in `PartitionStore.PartitionState` (`src/broker/partition_store.zig`), while cluster-wide metadata is managed by `RaftState` and `MetadataImage` (`src/raft/state.zig`):
@@ -403,7 +440,7 @@ The following metadata is maintained in-memory by the Zig broker. Partition stat
 | Metadata | Purpose | Zig Implementation |
 |----------|---------|-------------------|
 | `PartitionState.next_offset` | Next assignable offset per partition | `PartitionStore.partitions` (`StringHashMap`) |
-| `PartitionState.high_watermark` | Highest durable offset (gated by S3 flush in sync mode) | Updated in `produce()` after successful write |
+| `PartitionState.high_watermark` | Highest durable offset (gated by S3 flush in sync/group_commit mode) | Updated in `produce()` (sync), or `applyDeferredHWUpdates()` (group_commit) |
 | `PartitionState.last_stable_offset` | `min(first_unstable_txn_offset, HW)` for READ_COMMITTED | Updated on each produce; used by `fetchWithIsolation()` |
 | `S3WalBatcher.last_flushed_offset` | Highest offset durably written to S3 | Tracked in `S3WalBatcher`; checked via `isFlushed()` |
 | `S3WalBatcher.wal_epoch` | Current WAL writer epoch for fencing | Bumped by `FailoverController.failoverNode()` |
