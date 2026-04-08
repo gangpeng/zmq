@@ -1,17 +1,21 @@
-# ZMQ Broker — Multi-Broker Cluster with MinIO S3
+# ZMQ — 3-Node Cluster with MinIO S3
+#
+# Each node runs in combined mode (controller + broker) with dual ports:
+#   - Controller port (9093 internal): KRaft consensus, voter RPCs
+#   - Broker port (9092 internal): Kafka client APIs (produce/fetch/etc.)
 #
 # Usage:
-#   docker-compose up -d          # Start 3-broker cluster + MinIO
-#   docker-compose logs -f        # View broker logs
-#   docker-compose down -v        # Stop and clean up
+#   docker compose up -d              # Start 3-node cluster + MinIO
+#   docker compose logs -f            # View logs
+#   python3 tests/e2e_test.py         # Run E2E tests
+#   python3 benchmarks/benchmark_compare.py  # Run benchmarks
+#   docker compose down -v            # Stop and clean up
 #
-# Ports:
-#   MinIO S3:         9000  (API), 9001 (Console)
-#   Broker 1:         9092  (Kafka), 9090 (metrics)
-#   Broker 2:         9093  (Kafka), 9091 (metrics)
-#   Broker 3:         9094  (Kafka), 9095 (metrics)
-
-version: '3.8'
+# External ports:
+#   MinIO S3:       9000 (API), 9001 (Console UI)
+#   Node 0:         19092 (broker), 19093 (controller), 19090 (metrics)
+#   Node 1:         19094 (broker), 19095 (controller), 19091 (metrics)
+#   Node 2:         19096 (broker), 19097 (controller), 19098 (metrics)
 
 services:
   minio:
@@ -32,7 +36,6 @@ services:
       timeout: 5s
       retries: 5
 
-  # Create the default bucket on startup
   minio-init:
     image: minio/mc:latest
     depends_on:
@@ -45,25 +48,28 @@ services:
       echo 'Bucket automq created';
       "
 
-  broker1:
+  node0:
     build: .
-    container_name: zmq-broker-1
+    container_name: zmq-node-0
     ports:
-      - "9092:9092"
-      - "9090:9090"
+      - "19092:9092"
+      - "19093:9093"
+      - "19090:9090"
     command: >
-      9092
-      --data-dir /data/automq
-      --s3-endpoint minio
-      --s3-port 9000
-      --s3-bucket automq
-      --metrics-port 9090
       --node-id 0
-      --cluster-id automq-cluster
-      --voters 0@broker1:9092,1@broker2:9092,2@broker3:9092
-      --advertised-host broker1
+      --process-roles controller,broker
+      --port 9092
+      --controller-port 9093
+      --data-dir /data/zmq
+      --s3-endpoint minio
+      --s3-port 9000
+      --s3-bucket automq
+      --metrics-port 9090
+      --cluster-id zmq-cluster
+      --voters 0@node0:9093,1@node1:9093,2@node2:9093
+      --advertised-host node0
     volumes:
-      - broker1-data:/data/automq
+      - node0-data:/data/zmq
     depends_on:
       minio-init:
         condition: service_completed_successfully
@@ -74,25 +80,28 @@ services:
       start_period: 5s
       retries: 3
 
-  broker2:
+  node1:
     build: .
-    container_name: zmq-broker-2
+    container_name: zmq-node-1
     ports:
-      - "9093:9092"
-      - "9091:9090"
+      - "19094:9092"
+      - "19095:9093"
+      - "19091:9090"
     command: >
-      9092
-      --data-dir /data/automq
-      --s3-endpoint minio
-      --s3-port 9000
-      --s3-bucket automq
-      --metrics-port 9090
       --node-id 1
-      --cluster-id automq-cluster
-      --voters 0@broker1:9092,1@broker2:9092,2@broker3:9092
-      --advertised-host broker2
+      --process-roles controller,broker
+      --port 9092
+      --controller-port 9093
+      --data-dir /data/zmq
+      --s3-endpoint minio
+      --s3-port 9000
+      --s3-bucket automq
+      --metrics-port 9090
+      --cluster-id zmq-cluster
+      --voters 0@node0:9093,1@node1:9093,2@node2:9093
+      --advertised-host node1
     volumes:
-      - broker2-data:/data/automq
+      - node1-data:/data/zmq
     depends_on:
       minio-init:
         condition: service_completed_successfully
@@ -103,25 +112,28 @@ services:
       start_period: 5s
       retries: 3
 
-  broker3:
+  node2:
     build: .
-    container_name: zmq-broker-3
+    container_name: zmq-node-2
     ports:
-      - "9094:9092"
-      - "9095:9090"
+      - "19096:9092"
+      - "19097:9093"
+      - "19098:9090"
     command: >
-      9092
-      --data-dir /data/automq
+      --node-id 2
+      --process-roles controller,broker
+      --port 9092
+      --controller-port 9093
+      --data-dir /data/zmq
       --s3-endpoint minio
       --s3-port 9000
       --s3-bucket automq
       --metrics-port 9090
-      --node-id 2
-      --cluster-id automq-cluster
-      --voters 0@broker1:9092,1@broker2:9092,2@broker3:9092
-      --advertised-host broker3
+      --cluster-id zmq-cluster
+      --voters 0@node0:9093,1@node1:9093,2@node2:9093
+      --advertised-host node2
     volumes:
-      - broker3-data:/data/automq
+      - node2-data:/data/zmq
     depends_on:
       minio-init:
         condition: service_completed_successfully
@@ -134,6 +146,6 @@ services:
 
 volumes:
   minio-data:
-  broker1-data:
-  broker2-data:
-  broker3-data:
+  node0-data:
+  node1-data:
+  node2-data:

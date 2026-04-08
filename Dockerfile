@@ -25,8 +25,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates
 
 COPY --from=builder /src/zig-out/bin/zmq /usr/local/bin/zmq
 
-# Default ports: 9092 (Kafka), 9090 (metrics/health)
-EXPOSE 9092 9090
+# Default ports: 9092 (Kafka broker), 9093 (KRaft controller), 9090 (metrics/health)
+EXPOSE 9092 9093 9090
 
 # Data directory for WAL and metadata
 VOLUME /data/automq
@@ -35,4 +35,4 @@ HEALTHCHECK --interval=10s --timeout=3s --start-period=5s --retries=3 \
     CMD curl -f http://localhost:9090/health || exit 1
 
 ENTRYPOINT ["zmq"]
-CMD ["9092", "--data-dir", "/data/automq", "--metrics-port", "9090"]
+CMD ["--port", "9092", "--controller-port", "9093", "--data-dir", "/data/automq", "--metrics-port", "9090"]

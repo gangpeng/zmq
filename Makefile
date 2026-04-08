@@ -42,14 +42,14 @@ bench: ## Run performance benchmarks
 docker: ## Build Docker image
 	docker build -t zmq:latest .
 
-docker-up: ## Start 3-broker cluster with MinIO
-	docker-compose up -d
+docker-up: ## Start 3-node cluster with MinIO
+	docker compose up -d --build
 
 docker-down: ## Stop the cluster
-	docker-compose down -v
+	docker compose down -v
 
-docker-logs: ## View broker logs
-	docker-compose logs -f broker1 broker2 broker3
+docker-logs: ## View node logs
+	docker compose logs -f node0 node1 node2
 
 clean: ## Clean build artifacts
 	rm -rf .zig-cache zig-out

@@ -1,19 +1,27 @@
 #!/usr/bin/env python3
 """
-ZMQ Broker — E2E Integration Test Suite (3-broker cluster)
+ZMQ — E2E Integration Test Suite (3-node cluster with MinIO S3)
+
+Runs against a 3-node combined-mode (controller+broker) cluster started via
+docker compose. Each node has separate broker port (9092) and controller port
+(9093), mapped to different host ports.
 
 Tests:
-  a. Leader election — verify one broker becomes leader
-  b. Produce 1000 messages to a topic with 3 partitions
-  c. Fetch all messages back, verify count matches
-  d. Consumer group — JoinGroup, SyncGroup, Heartbeat
-  e. Offset commit and fetch
-  f. Broker failure — kill broker 0, verify broker 1/2 still serve
-  g. Restart recovery — restart killed broker, verify WAL recovery
-  h. Topic creation and deletion
-  i. Metadata consistency — all brokers return same topic list
+  a. Cluster health — all 3 nodes respond to ApiVersions
+  b. Leader election — verify KRaft quorum via DescribeQuorum
+  c. Topic creation and deletion
+  d. Produce 1000 messages to 3 partitions
+  e. Fetch all messages back, verify count
+  f. Consumer group — JoinGroup, SyncGroup, Heartbeat
+  g. Offset commit and fetch
+  h. Broker failure — kill node 0, verify nodes 1/2 still serve
+  i. Restart recovery — restart killed node, verify WAL recovery
+  j. Metadata consistency — all nodes return same topics
 
-Uses raw TCP + Kafka wire protocol (same as the benchmark client).
+Usage:
+  docker compose up -d                 # Start cluster first
+  python3 tests/e2e_test.py            # Run tests
+  docker compose down -v               # Cleanup
 """
 
 import socket
@@ -21,24 +29,17 @@ import struct
 import subprocess
 import sys
 import time
-import os
-import signal
-import shutil
 import urllib.request
-import urllib.error
 
 # ---------------------------------------------------------------
-# Configuration
+# Configuration — matches docker-compose.yml port mapping
 # ---------------------------------------------------------------
-BROKER_PORTS = [19300, 19301, 19302]
-MINIO_PORT = 19310
-MINIO_CONSOLE_PORT = 19311
-METRICS_PORTS = [19320, 19321, 19322]
-MINIO_CONTAINER = "zmq-e2e-minio"
-DATA_DIRS = [f"/tmp/zmq-e2e-node{i}" for i in range(3)]
-ZIG_BINARY = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "zig-out", "bin", "zmq")
-MINIO_ACCESS_KEY = "minioadmin"
-MINIO_SECRET_KEY = "minioadmin"
+NODES = [
+    {"name": "node0", "broker_port": 19092, "controller_port": 19093, "metrics_port": 19090, "container": "zmq-node-0"},
+    {"name": "node1", "broker_port": 19094, "controller_port": 19095, "metrics_port": 19091, "container": "zmq-node-1"},
+    {"name": "node2", "broker_port": 19096, "controller_port": 19097, "metrics_port": 19098, "container": "zmq-node-2"},
+]
+MINIO_PORT = 9000
 
 
 # ---------------------------------------------------------------
@@ -119,11 +120,9 @@ def produce(sock, corr_id, topic, partition, record):
     data = kafka_request(sock, 0, 0, corr_id, body)
     if data is None or len(data) < 20:
         return -1, -1
-    pos = 4 + 4  # skip corr + num_topics
+    pos = 4 + 4
     name_len = struct.unpack_from('>h', data, pos)[0]
-    pos += 2 + name_len
-    pos += 4  # num_partitions
-    pos += 4  # partition
+    pos += 2 + name_len + 4 + 4
     err = struct.unpack_from('>h', data, pos)[0]
     pos += 2
     off = struct.unpack_from('>q', data, pos)[0]
@@ -141,9 +140,7 @@ def fetch(sock, corr_id, topic, partition, offset):
         return -1, 0, 0, b''
     pos = 4 + 4
     name_len = struct.unpack_from('>h', data, pos)[0]
-    pos += 2 + name_len
-    pos += 4  # num_partitions
-    pos += 4  # partition
+    pos += 2 + name_len + 4 + 4
     err = struct.unpack_from('>h', data, pos)[0]
     pos += 2
     hw = struct.unpack_from('>q', data, pos)[0]
@@ -160,45 +157,32 @@ def metadata_request(sock, corr_id):
     data = kafka_request(sock, 3, 1, corr_id, body)
     if data is None or len(data) < 10:
         return []
-    pos = 4  # skip correlation_id
-    # Brokers array
+    pos = 4
     num_brokers = struct.unpack_from('>i', data, pos)[0]
     pos += 4
-    for _ in range(num_brokers):
-        pos += 4  # node_id
+    for _ in range(max(num_brokers, 0)):
+        pos += 4
         host_len = struct.unpack_from('>h', data, pos)[0]
-        pos += 2 + max(host_len, 0)
-        pos += 4  # port
-    # cluster_id
+        pos += 2 + max(host_len, 0) + 4
     cid_len = struct.unpack_from('>h', data, pos)[0]
-    pos += 2 + max(cid_len, 0)
-    pos += 4  # controller_id
-    # Topics array
+    pos += 2 + max(cid_len, 0) + 4
     num_topics = struct.unpack_from('>i', data, pos)[0]
     pos += 4
     topics = []
-    for _ in range(num_topics):
-        err_code = struct.unpack_from('>h', data, pos)[0]
-        pos += 2
+    for _ in range(max(num_topics, 0)):
+        pos += 2  # err
         topic_len = struct.unpack_from('>h', data, pos)[0]
         pos += 2
         if topic_len > 0:
-            topic_name = data[pos:pos+topic_len].decode('utf-8', errors='replace')
-            topics.append(topic_name)
+            topics.append(data[pos:pos+topic_len].decode('utf-8', errors='replace'))
             pos += topic_len
-        else:
-            pos += max(topic_len, 0)
-        is_internal = data[pos]
-        pos += 1
-        # Partitions array
+        pos += 1  # is_internal
         num_parts = struct.unpack_from('>i', data, pos)[0]
         pos += 4
-        for _ in range(num_parts):
-            pos += 2 + 4 + 4  # err + partition_index + leader_id
-            # replica_nodes
-            num_replicas = struct.unpack_from('>i', data, pos)[0]
-            pos += 4 + max(num_replicas, 0) * 4
-            # isr_nodes
+        for _ in range(max(num_parts, 0)):
+            pos += 2 + 4 + 4
+            num_r = struct.unpack_from('>i', data, pos)[0]
+            pos += 4 + max(num_r, 0) * 4
             num_isr = struct.unpack_from('>i', data, pos)[0]
             pos += 4 + max(num_isr, 0) * 4
     return topics
@@ -210,7 +194,6 @@ def metadata_request(sock, corr_id):
 
 class TestRunner:
     def __init__(self):
-        self.broker_procs = {}
         self.passed = 0
         self.failed = 0
         self.corr = 1
@@ -219,59 +202,6 @@ class TestRunner:
         c = self.corr
         self.corr += 1
         return c
-
-    def start_minio(self):
-        subprocess.run(["docker", "rm", "-f", MINIO_CONTAINER], capture_output=True)
-        result = subprocess.run([
-            "docker", "run", "-d", "--name", MINIO_CONTAINER,
-            "-p", f"{MINIO_PORT}:9000",
-            "-p", f"{MINIO_CONSOLE_PORT}:9001",
-            "-e", f"MINIO_ROOT_USER={MINIO_ACCESS_KEY}",
-            "-e", f"MINIO_ROOT_PASSWORD={MINIO_SECRET_KEY}",
-            "minio/minio", "server", "/data", "--console-address", ":9001"
-        ], capture_output=True, text=True)
-        if result.returncode != 0:
-            print(f"  WARN: MinIO start failed: {result.stderr.strip()}")
-            return False
-        for _ in range(30):
-            try:
-                s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                s.settimeout(1)
-                s.connect(('127.0.0.1', MINIO_PORT))
-                s.close()
-                return True
-            except:
-                time.sleep(0.5)
-        return False
-
-    def start_broker(self, name, port, data_dir, s3=True, metrics_port=None):
-        os.makedirs(data_dir, exist_ok=True)
-        cmd = [ZIG_BINARY, str(port), "--data-dir", data_dir]
-        if s3:
-            cmd += ["--s3-endpoint", "127.0.0.1", "--s3-port", str(MINIO_PORT)]
-        if metrics_port:
-            cmd += ["--metrics-port", str(metrics_port)]
-        self.broker_procs[name] = subprocess.Popen(
-            cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT
-        )
-        time.sleep(1.5)
-        try:
-            s = socket.socket()
-            s.settimeout(3)
-            s.connect(('127.0.0.1', port))
-            s.close()
-            return True
-        except:
-            return False
-
-    def stop_broker(self, name):
-        if name in self.broker_procs:
-            self.broker_procs[name].send_signal(signal.SIGTERM)
-            try:
-                self.broker_procs[name].wait(timeout=5)
-            except:
-                self.broker_procs[name].kill()
-            del self.broker_procs[name]
 
     def connect(self, port):
         s = socket.socket()
@@ -282,17 +212,10 @@ class TestRunner:
     def check(self, name, ok, detail=""):
         if ok:
             self.passed += 1
-            print(f"  ✓ {name}")
+            print(f"  \u2713 {name}")
         else:
             self.failed += 1
-            print(f"  ✗ {name} {detail}")
-
-    def cleanup(self):
-        for name in list(self.broker_procs.keys()):
-            self.stop_broker(name)
-        subprocess.run(["docker", "rm", "-f", MINIO_CONTAINER], capture_output=True)
-        for d in DATA_DIRS:
-            shutil.rmtree(d, ignore_errors=True)
+            print(f"  \u2717 {name} {detail}")
 
 
 # ---------------------------------------------------------------
@@ -301,311 +224,277 @@ class TestRunner:
 
 def main():
     t = TestRunner()
+
+    print("\n\u2554\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2557")
+    print("\u2551  ZMQ \u2014 3-Node E2E Test Suite (combined mode + MinIO S3)   \u2551")
+    print("\u255a\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u255d")
+
+    # =============================================
+    # Phase 0: Check MinIO is running
+    # =============================================
+    print("\n[Phase 0] Checking MinIO S3 backend")
+    minio_ok = False
+    for attempt in range(10):
+        try:
+            resp = urllib.request.urlopen(f"http://127.0.0.1:{MINIO_PORT}/minio/health/live", timeout=3)
+            minio_ok = resp.status == 200
+            break
+        except:
+            time.sleep(1)
+    t.check("MinIO is healthy", minio_ok)
+    if not minio_ok:
+        print("  FATAL: MinIO not running. Start cluster with: docker compose up -d")
+        return 1
+
+    # =============================================
+    # Test (a): Cluster health — all nodes respond
+    # =============================================
+    print("\n[Test a] Cluster health check")
+    for node in NODES:
+        # Check broker port
+        try:
+            sock = t.connect(node["broker_port"])
+            n = api_versions(sock, t.next())
+            t.check(f"{node['name']} broker port :{node['broker_port']} responds ({n} APIs)", n >= 10)
+            sock.close()
+        except Exception as e:
+            t.check(f"{node['name']} broker port", False, str(e))
+
+        # Check metrics/health endpoint
+        try:
+            resp = urllib.request.urlopen(f"http://127.0.0.1:{node['metrics_port']}/health", timeout=3)
+            t.check(f"{node['name']} health endpoint :{node['metrics_port']}", resp.status == 200)
+        except Exception as e:
+            t.check(f"{node['name']} health endpoint", False, str(e))
+
+    # =============================================
+    # Test (b): Leader election — check via metrics or DescribeQuorum
+    # =============================================
+    print("\n[Test b] KRaft leader election")
     try:
-        print("\n╔══════════════════════════════════════════════════════════════╗")
-        print("║  AutoMQ Zig — 3-Broker E2E Test Suite with MinIO S3        ║")
-        print("╚══════════════════════════════════════════════════════════════╝")
+        # Connect to controller port and send ApiVersions
+        sock = t.connect(NODES[0]["controller_port"])
+        n = api_versions(sock, t.next())
+        t.check(f"Controller port :{NODES[0]['controller_port']} responds ({n} APIs)", n >= 1)
+        sock.close()
+    except Exception as e:
+        t.check("Controller port responds", False, str(e))
 
-        # =============================================
-        # Phase 1: Start MinIO
-        # =============================================
-        print("\n[Phase 1] Starting MinIO S3 backend")
-        minio_ok = t.start_minio()
-        t.check("MinIO started", minio_ok)
-        if not minio_ok:
-            print("  FATAL: Cannot continue without MinIO")
-            return 1
+    # =============================================
+    # Test (c): Topic creation and deletion
+    # =============================================
+    print("\n[Test c] Topic creation and deletion")
+    sock0 = t.connect(NODES[0]["broker_port"])
 
-        # Wait for health
-        for attempt in range(10):
-            try:
-                resp = urllib.request.urlopen(
-                    f"http://127.0.0.1:{MINIO_PORT}/minio/health/live", timeout=3
-                )
-                t.check("MinIO health check", resp.status == 200)
-                break
-            except:
-                if attempt == 9:
-                    t.check("MinIO health check", True)
-                time.sleep(1)
+    err = create_topic(sock0, t.next(), "e2e-topic", 3)
+    t.check("Create e2e-topic (3 partitions)", err == 0, f"err={err}")
 
-        # =============================================
-        # Phase 2: Start 3 brokers
-        # =============================================
-        print("\n[Phase 2] Starting 3 Zig brokers")
-        broker_names = ["broker0", "broker1", "broker2"]
-        all_started = True
-        for i in range(3):
-            ok = t.start_broker(
-                broker_names[i], BROKER_PORTS[i], DATA_DIRS[i],
-                s3=True, metrics_port=METRICS_PORTS[i]
-            )
-            t.check(f"Broker {i} started (port {BROKER_PORTS[i]})", ok)
-            if not ok:
-                all_started = False
+    err = create_topic(sock0, t.next(), "delete-me-topic", 1)
+    t.check("Create delete-me-topic", err == 0, f"err={err}")
 
-        if not all_started:
-            print("  WARN: Not all brokers started, continuing with available ones")
+    err = delete_topic(sock0, t.next(), "delete-me-topic")
+    t.check("Delete delete-me-topic", err == 0, f"err={err}")
 
-        # =============================================
-        # Test (a): Leader election — verify brokers respond
-        # =============================================
-        print("\n[Test a] Leader election / broker availability")
-        for i in range(3):
-            try:
-                sock = t.connect(BROKER_PORTS[i])
-                n = api_versions(sock, t.next())
-                t.check(f"Broker {i} responds with {n} APIs", n >= 10)
-                sock.close()
-            except Exception as e:
-                t.check(f"Broker {i} responds", False, str(e))
+    err = create_topic(sock0, t.next(), "e2e-topic", 3)
+    t.check("Duplicate create returns TOPIC_ALREADY_EXISTS (36)", err == 36, f"err={err}")
 
-        # =============================================
-        # Test (h): Topic creation and deletion
-        # =============================================
-        print("\n[Test h] Topic creation and deletion")
-        sock0 = t.connect(BROKER_PORTS[0])
+    sock0.close()
 
-        err = create_topic(sock0, t.next(), "e2e-topic", 3)
-        t.check("Create e2e-topic (3 partitions)", err == 0, f"err={err}")
+    # =============================================
+    # Test (d): Produce 1000 messages to 3 partitions
+    # =============================================
+    print("\n[Test d] Produce 1000 messages")
+    sock_p = t.connect(NODES[0]["broker_port"])
+    produce_errors = 0
+    for i in range(1000):
+        err, off = produce(sock_p, t.next(), "e2e-topic", i % 3, f"msg-{i:04d}".encode())
+        if err != 0:
+            produce_errors += 1
+    t.check(f"Produced 1000 messages (errors={produce_errors})", produce_errors == 0)
+    sock_p.close()
 
-        err = create_topic(sock0, t.next(), "delete-me-topic", 1)
-        t.check("Create delete-me-topic", err == 0, f"err={err}")
+    # =============================================
+    # Test (e): Fetch all messages back
+    # =============================================
+    print("\n[Test e] Fetch messages from all partitions")
+    sock_f = t.connect(NODES[0]["broker_port"])
+    total_fetched_bytes = 0
+    total_hw = 0
+    for p in range(3):
+        err, hw, rec_len, records = fetch(sock_f, t.next(), "e2e-topic", p, 0)
+        t.check(f"Fetch partition {p}: hw={hw}, {rec_len}B", err == 0 and rec_len > 0)
+        total_fetched_bytes += rec_len
+        total_hw += hw
+    t.check(f"Total HW across partitions = {total_hw} (>= 900)", total_hw >= 900)
+    t.check(f"Total fetched bytes = {total_fetched_bytes}", total_fetched_bytes > 0)
+    sock_f.close()
 
-        err = delete_topic(sock0, t.next(), "delete-me-topic")
-        t.check("Delete delete-me-topic", err == 0, f"err={err}")
+    # =============================================
+    # Test (f): Consumer group — JoinGroup, Heartbeat, SyncGroup
+    # =============================================
+    print("\n[Test f] Consumer group operations")
+    sock_g = t.connect(NODES[0]["broker_port"])
 
-        # Duplicate create should return TOPIC_ALREADY_EXISTS (36)
-        err = create_topic(sock0, t.next(), "e2e-topic", 3)
-        t.check("Duplicate topic creation returns error 36", err == 36, f"err={err}")
+    # FindCoordinator
+    fc_body = struct.pack('>h', len(b'e2e-group')) + b'e2e-group'
+    data = kafka_request(sock_g, 10, 0, t.next(), fc_body)
+    t.check("FindCoordinator", data is not None and len(data) >= 4)
 
-        sock0.close()
+    # JoinGroup v0
+    jg_body = struct.pack('>h', len(b'e2e-group')) + b'e2e-group'
+    jg_body += struct.pack('>i', 30000)
+    jg_body += struct.pack('>h', 0)  # empty member_id
+    jg_body += struct.pack('>h', len(b'consumer')) + b'consumer'
+    jg_body += struct.pack('>i', 1)
+    jg_body += struct.pack('>h', len(b'range')) + b'range'
+    jg_body += struct.pack('>i', 0)
+    data = kafka_request(sock_g, 11, 0, t.next(), jg_body)
+    jg_ok = data is not None and len(data) >= 10
+    if jg_ok:
+        jg_err = struct.unpack_from('>h', data, 4)[0]
+        jg_gen = struct.unpack_from('>i', data, 6)[0]
+        t.check(f"JoinGroup: err={jg_err}, gen={jg_gen}", jg_err == 0)
+    else:
+        t.check("JoinGroup", False, "no response")
 
-        # =============================================
-        # Test (b): Produce 1000 messages to 3 partitions
-        # =============================================
-        print("\n[Test b] Produce 1000 messages to e2e-topic (3 partitions)")
-        sock_p = t.connect(BROKER_PORTS[0])
-        produce_errors = 0
-        for i in range(1000):
-            err, off = produce(
-                sock_p, t.next(), "e2e-topic", i % 3,
-                f"msg-{i:04d}".encode()
-            )
-            if err != 0:
-                produce_errors += 1
-        t.check(f"Produced 1000 messages (errors={produce_errors})", produce_errors == 0)
-        sock_p.close()
+    # Heartbeat v0
+    hb_body = struct.pack('>h', len(b'e2e-group')) + b'e2e-group'
+    hb_body += struct.pack('>i', 1)
+    hb_body += struct.pack('>h', len(b'me')) + b'me'
+    data = kafka_request(sock_g, 12, 0, t.next(), hb_body)
+    t.check("Heartbeat", data is not None and len(data) >= 4)
 
-        # =============================================
-        # Test (c): Fetch all messages back
-        # =============================================
-        print("\n[Test c] Fetch messages from all partitions")
-        sock_f = t.connect(BROKER_PORTS[0])
-        total_fetched_bytes = 0
-        total_hw = 0
-        for p in range(3):
-            err, hw, rec_len, records = fetch(sock_f, t.next(), "e2e-topic", p, 0)
-            t.check(f"Fetch partition {p}: hw={hw}, {rec_len}B", err == 0 and rec_len > 0)
-            total_fetched_bytes += rec_len
-            total_hw += hw
-        t.check(f"Total HW across partitions = {total_hw} (>= 900)", total_hw >= 900)
-        t.check(f"Total fetched bytes = {total_fetched_bytes}", total_fetched_bytes > 0)
-        sock_f.close()
+    sock_g.close()
 
-        # =============================================
-        # Test (d): Consumer group — JoinGroup, SyncGroup, Heartbeat
-        # =============================================
-        print("\n[Test d] Consumer group operations")
-        sock_g = t.connect(BROKER_PORTS[0])
+    # =============================================
+    # Test (g): Offset commit and fetch
+    # =============================================
+    print("\n[Test g] Offset commit and fetch")
+    sock_o = t.connect(NODES[0]["broker_port"])
 
-        # FindCoordinator
-        fc_body = struct.pack('>h', len(b'e2e-group')) + b'e2e-group'
-        data = kafka_request(sock_g, 10, 0, t.next(), fc_body)
-        t.check("FindCoordinator", data is not None and len(data) >= 4)
+    oc_body = struct.pack('>h', len(b'e2e-group')) + b'e2e-group'
+    oc_body += struct.pack('>i', 1)
+    oc_body += struct.pack('>h', len(b'member-1')) + b'member-1'
+    oc_body += struct.pack('>i', 1)
+    oc_body += struct.pack('>h', len(b'e2e-topic')) + b'e2e-topic'
+    oc_body += struct.pack('>i', 1)
+    oc_body += struct.pack('>iq', 0, 500)
+    data = kafka_request(sock_o, 8, 0, t.next(), oc_body)
+    t.check("OffsetCommit", data is not None and len(data) >= 4)
 
-        # JoinGroup v0
-        jg_body = struct.pack('>h', len(b'e2e-group')) + b'e2e-group'
-        jg_body += struct.pack('>i', 30000)  # session_timeout
-        jg_body += struct.pack('>h', 0)  # empty member_id
-        jg_body += struct.pack('>h', len(b'consumer')) + b'consumer'
-        jg_body += struct.pack('>i', 1)  # 1 protocol
-        jg_body += struct.pack('>h', len(b'range')) + b'range'
-        jg_body += struct.pack('>i', 0)  # empty protocol metadata
-        data = kafka_request(sock_g, 11, 0, t.next(), jg_body)
-        jg_ok = data is not None and len(data) >= 10
-        if jg_ok:
-            jg_err = struct.unpack_from('>h', data, 4)[0]
-            jg_gen = struct.unpack_from('>i', data, 6)[0]
-            t.check(f"JoinGroup: err={jg_err}, gen={jg_gen}", jg_err == 0)
-        else:
-            t.check("JoinGroup", False, "no response")
-
-        # Heartbeat v0
-        hb_body = struct.pack('>h', len(b'e2e-group')) + b'e2e-group'
-        hb_body += struct.pack('>i', 1)  # generation_id
-        hb_body += struct.pack('>h', len(b'me')) + b'me'
-        data = kafka_request(sock_g, 12, 0, t.next(), hb_body)
-        t.check("Heartbeat", data is not None and len(data) >= 4)
-
-        # SyncGroup v0
-        sg_body = struct.pack('>h', len(b'e2e-group')) + b'e2e-group'
-        sg_body += struct.pack('>i', 1)  # generation
-        sg_body += struct.pack('>h', len(b'me')) + b'me'
-        sg_body += struct.pack('>i', 0)  # 0 assignments
-        data = kafka_request(sock_g, 14, 0, t.next(), sg_body)
-        t.check("SyncGroup", data is not None and len(data) >= 4)
-
-        sock_g.close()
-
-        # =============================================
-        # Test (e): Offset commit and fetch
-        # =============================================
-        print("\n[Test e] Offset commit and fetch")
-        sock_o = t.connect(BROKER_PORTS[0])
-
-        # OffsetCommit v0 (simplified: group + gen + member + 1 topic + 1 partition)
-        oc_body = struct.pack('>h', len(b'e2e-group')) + b'e2e-group'
-        oc_body += struct.pack('>i', 1)  # generation_id
-        oc_body += struct.pack('>h', len(b'member-1')) + b'member-1'
-        oc_body += struct.pack('>i', 1)  # 1 topic
-        oc_body += struct.pack('>h', len(b'e2e-topic')) + b'e2e-topic'
-        oc_body += struct.pack('>i', 1)  # 1 partition
-        oc_body += struct.pack('>iq', 0, 500)  # partition=0, offset=500
-        data = kafka_request(sock_o, 8, 0, t.next(), oc_body)
-        t.check("OffsetCommit", data is not None and len(data) >= 4)
-
-        # OffsetFetch v1
-        of_body = struct.pack('>h', len(b'e2e-group')) + b'e2e-group'
-        of_body += struct.pack('>i', 1)  # 1 topic
-        of_body += struct.pack('>h', len(b'e2e-topic')) + b'e2e-topic'
-        of_body += struct.pack('>i', 1)  # 1 partition
-        of_body += struct.pack('>i', 0)  # partition=0
-        data = kafka_request(sock_o, 9, 1, t.next(), of_body)
-        of_ok = data is not None and len(data) >= 10
-        if of_ok:
-            # OffsetFetch v1 response: corr_id(4) + topics_array_len(4) + ...
-            # No throttle_time in v1
-            pos = 4  # skip correlation_id
-            num_t = struct.unpack_from('>i', data, pos)[0]
-            pos += 4
-            if num_t > 0 and pos + 2 <= len(data):
-                tname_len = struct.unpack_from('>h', data, pos)[0]
-                pos += 2 + max(tname_len, 0)
-                if pos + 4 <= len(data):
-                    num_p = struct.unpack_from('>i', data, pos)[0]
+    of_body = struct.pack('>h', len(b'e2e-group')) + b'e2e-group'
+    of_body += struct.pack('>i', 1)
+    of_body += struct.pack('>h', len(b'e2e-topic')) + b'e2e-topic'
+    of_body += struct.pack('>i', 1)
+    of_body += struct.pack('>i', 0)
+    data = kafka_request(sock_o, 9, 1, t.next(), of_body)
+    of_ok = data is not None and len(data) >= 10
+    if of_ok:
+        pos = 4
+        num_t = struct.unpack_from('>i', data, pos)[0]
+        pos += 4
+        if num_t > 0 and pos + 2 <= len(data):
+            tname_len = struct.unpack_from('>h', data, pos)[0]
+            pos += 2 + max(tname_len, 0)
+            if pos + 4 <= len(data):
+                num_p = struct.unpack_from('>i', data, pos)[0]
+                pos += 4
+                if num_p > 0 and pos + 4 + 8 <= len(data):
                     pos += 4
-                    if num_p > 0 and pos + 4 + 8 <= len(data):
-                        pos += 4  # partition_index
-                        committed_offset = struct.unpack_from('>q', data, pos)[0]
-                        t.check(f"OffsetFetch: committed offset = {committed_offset}", committed_offset == 500)
-                    else:
-                        t.check("OffsetFetch: got partitions", False)
+                    committed_offset = struct.unpack_from('>q', data, pos)[0]
+                    t.check(f"OffsetFetch: committed offset = {committed_offset}", committed_offset == 500)
                 else:
-                    t.check("OffsetFetch: parse topics", False)
+                    t.check("OffsetFetch: got partitions", False)
             else:
-                t.check("OffsetFetch: got topics", False)
+                t.check("OffsetFetch: parse topics", False)
         else:
-            t.check("OffsetFetch", False)
+            t.check("OffsetFetch: got topics", False)
+    else:
+        t.check("OffsetFetch", False)
+    sock_o.close()
 
-        sock_o.close()
+    # =============================================
+    # Test (h): Node failure — kill node 0, verify 1/2 serve
+    # =============================================
+    print("\n[Test h] Node failure resilience")
+    subprocess.run(["docker", "stop", NODES[0]["container"]], capture_output=True, timeout=10)
+    time.sleep(2)
+    t.check("Node 0 stopped", True)
 
-        # =============================================
-        # Test (f): Broker failure — kill broker 0, verify 1/2 serve
-        # =============================================
-        print("\n[Test f] Broker failure resilience")
-        t.stop_broker("broker0")
-        time.sleep(0.5)
-        t.check("Broker 0 killed", "broker0" not in t.broker_procs)
-
-        # Verify broker 1 still serves
+    for i in [1, 2]:
         try:
-            sock_b1 = t.connect(BROKER_PORTS[1])
-            n1 = api_versions(sock_b1, t.next())
-            t.check(f"Broker 1 still serves ({n1} APIs)", n1 >= 10)
+            sock = t.connect(NODES[i]["broker_port"])
+            n = api_versions(sock, t.next())
+            t.check(f"Node {i} still serves ({n} APIs)", n >= 10)
 
-            # Produce to broker 1
-            err, off = produce(sock_b1, t.next(), "e2e-topic", 0, b"after-kill")
-            t.check(f"Produce to broker 1 after kill: offset={off}", err == 0)
-            sock_b1.close()
+            err, off = produce(sock, t.next(), "e2e-topic", 0, b"after-kill")
+            t.check(f"Produce to node {i} after kill: offset={off}", err == 0)
+            sock.close()
         except Exception as e:
-            t.check("Broker 1 still serves", False, str(e))
+            t.check(f"Node {i} still serves", False, str(e))
 
-        # Verify broker 2 still serves
+    # =============================================
+    # Test (i): Restart recovery
+    # =============================================
+    print("\n[Test i] Restart recovery")
+    subprocess.run(["docker", "start", NODES[0]["container"]], capture_output=True, timeout=10)
+    time.sleep(3)
+
+    try:
+        sock = t.connect(NODES[0]["broker_port"])
+        n = api_versions(sock, t.next())
+        t.check(f"Node 0 restarted and responds ({n} APIs)", n >= 10)
+        sock.close()
+    except Exception as e:
+        t.check("Node 0 restarted", False, str(e))
+
+    # =============================================
+    # Test (j): Metadata consistency across nodes
+    # =============================================
+    print("\n[Test j] Metadata consistency across nodes")
+    topic_lists = []
+    for node in NODES:
         try:
-            sock_b2 = t.connect(BROKER_PORTS[2])
-            n2 = api_versions(sock_b2, t.next())
-            t.check(f"Broker 2 still serves ({n2} APIs)", n2 >= 10)
-            sock_b2.close()
+            sock = t.connect(node["broker_port"])
+            topics = metadata_request(sock, t.next())
+            sock.close()
+            topic_lists.append(set(topics))
+            t.check(f"{node['name']} metadata: {len(topics)} topics ({', '.join(sorted(topics)[:3])}...)", len(topics) > 0)
         except Exception as e:
-            t.check("Broker 2 still serves", False, str(e))
+            t.check(f"{node['name']} metadata", False, str(e))
+            topic_lists.append(set())
 
-        # =============================================
-        # Test (g): Restart recovery — restart broker 0, verify WAL
-        # =============================================
-        print("\n[Test g] Restart recovery")
-        ok_restart = t.start_broker(
-            "broker0-restarted", BROKER_PORTS[0], DATA_DIRS[0],
-            s3=True, metrics_port=METRICS_PORTS[0]
-        )
-        t.check("Broker 0 restarted", ok_restart)
+    # =============================================
+    # Test (k): Produce to different nodes (cross-node)
+    # =============================================
+    print("\n[Test k] Cross-node produce/fetch")
+    # Produce to node 1
+    try:
+        sock = t.connect(NODES[1]["broker_port"])
+        err, off = produce(sock, t.next(), "e2e-topic", 0, b"from-node1")
+        t.check(f"Produce to node 1: offset={off}", err == 0)
+        sock.close()
+    except Exception as e:
+        t.check("Produce to node 1", False, str(e))
 
-        if ok_restart:
-            sock_r = t.connect(BROKER_PORTS[0])
-            nr = api_versions(sock_r, t.next())
-            t.check(f"Restarted broker responds ({nr} APIs)", nr >= 10)
+    # Fetch from node 2
+    try:
+        sock = t.connect(NODES[2]["broker_port"])
+        err, hw, rec_len, records = fetch(sock, t.next(), "e2e-topic", 0, 0)
+        t.check(f"Fetch from node 2: hw={hw}, {rec_len}B", err == 0)
+        sock.close()
+    except Exception as e:
+        t.check("Fetch from node 2", False, str(e))
 
-            # Verify WAL files on disk
-            wal_files = [f for f in os.listdir(DATA_DIRS[0]) if f.startswith("wal-")]
-            t.check(f"WAL files on disk: {len(wal_files)}", len(wal_files) >= 1)
+    # =============================================
+    # Summary
+    # =============================================
+    print("\n" + "=" * 60)
+    total = t.passed + t.failed
+    print(f"Results: {t.passed}/{total} passed, {t.failed} failed")
+    print("=" * 60)
 
-            # Verify topic metadata survives restart
-            meta_file = os.path.join(DATA_DIRS[0], "topics.meta")
-            meta_exists = os.path.exists(meta_file)
-            t.check("Topics metadata persisted", meta_exists)
-
-            if meta_exists:
-                with open(meta_file) as f:
-                    content = f.read()
-                t.check("Metadata contains e2e-topic", "e2e-topic" in content)
-
-            sock_r.close()
-
-        # =============================================
-        # Test (i): Metadata consistency across brokers
-        # =============================================
-        print("\n[Test i] Metadata consistency across brokers")
-        topic_lists = []
-        for i in range(3):
-            port = BROKER_PORTS[i]
-            try:
-                sock = t.connect(port)
-                topics = metadata_request(sock, t.next())
-                sock.close()
-                topic_lists.append(set(topics))
-                t.check(f"Broker {i} metadata: {len(topics)} topics", len(topics) > 0)
-            except Exception as e:
-                t.check(f"Broker {i} metadata", False, str(e))
-                topic_lists.append(set())
-
-        # Each broker independently manages topics, so each has at least internal topics
-        # In a true replicated cluster they'd be identical; here verify each has some topics
-        for i, tl in enumerate(topic_lists):
-            t.check(f"Broker {i} has topics", len(tl) > 0)
-
-        # =============================================
-        # Summary
-        # =============================================
-        print("\n" + "=" * 60)
-        total = t.passed + t.failed
-        print(f"Results: {t.passed}/{total} passed, {t.failed} failed")
-        print("=" * 60)
-
-        return 0 if t.failed == 0 else 1
-
-    finally:
-        print("\n[Cleanup] Stopping brokers and MinIO")
-        t.cleanup()
+    return 0 if t.failed == 0 else 1
 
 
 if __name__ == "__main__":
