@@ -134,6 +134,7 @@ pub const PartitionStore = struct {
     /// Open the store (creates WAL directory, S3 bucket, etc.)
     /// WAL replay on restart — recover records from WAL files.
     pub fn open(self: *PartitionStore) !void {
+        log.info("PartitionStore.open: starting (fs_wal={}, s3_client={})", .{ self.fs_wal != null, self.s3_client != null });
         if (self.fs_wal) |*wal| {
             try wal.open();
             // Replay WAL records into cache (fix #3)
@@ -149,6 +150,7 @@ pub const PartitionStore = struct {
                 log.warn("WAL recovery failed: {}", .{err});
             };
         }
+        log.info("PartitionStore.open: WAL done, checking S3...", .{});
         // Ensure S3 bucket exists (retry a few times for container startup)
         if (self.s3_client) |*client| {
             // Re-initialize S3Storage with the current (stable) s3_client pointer
