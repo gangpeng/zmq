@@ -81,6 +81,8 @@ pub const Controller = struct {
             55 => self.handleDescribeQuorum(&req_header, resp_header_version),
             62 => self.handleBrokerRegistration(request_bytes, pos, &req_header, resp_header_version),
             63 => self.handleBrokerHeartbeat(request_bytes, pos, &req_header, resp_header_version),
+            71 => self.handleAddRaftVoter(request_bytes, pos, &req_header, resp_header_version),
+            72 => self.handleRemoveRaftVoter(request_bytes, pos, &req_header, resp_header_version),
             else => self.handleUnsupported(&req_header, api_key, resp_header_version),
         };
     }
@@ -97,6 +99,8 @@ pub const Controller = struct {
             .{ .key = 55, .min = 0, .max = 1 }, // DescribeQuorum
             .{ .key = 62, .min = 0, .max = 0 }, // BrokerRegistration
             .{ .key = 63, .min = 0, .max = 0 }, // BrokerHeartbeat
+            .{ .key = 71, .min = 0, .max = 0 }, // AddRaftVoter
+            .{ .key = 72, .min = 0, .max = 0 }, // RemoveRaftVoter
         };
 
         var buf = self.allocator.alloc(u8, 256) catch return null;
@@ -294,6 +298,71 @@ pub const Controller = struct {
         ser.writeBool(buf, &wpos, false); // is_caught_up
         ser.writeBool(buf, &wpos, !is_active); // is_fenced
         ser.writeBool(buf, &wpos, false); // should_shut_down
+        if (resp_header_version >= 1) ser.writeEmptyTaggedFields(buf, &wpos);
+
+        return (self.allocator.realloc(buf, wpos) catch buf)[0..wpos];
+    }
+
+    // ---------------------------------------------------------------
+    // AddRaftVoter (key 71) — dynamic voter membership
+    // ---------------------------------------------------------------
+    fn handleAddRaftVoter(self: *Controller, request_bytes: []const u8, start_pos: usize, req_header: *const RequestHeader, resp_header_version: i16) ?[]u8 {
+        var pos = start_pos;
+
+        // Parse: voter_id
+        const voter_id = ser.readI32(request_bytes, &pos);
+
+        const offset = self.raft_state.proposeAddVoter(voter_id) catch |err| {
+            const error_code: i16 = switch (err) {
+                error.NotLeader => 41, // NOT_CONTROLLER
+                error.ConfigChangePending => 89, // CONCURRENT_TRANSACTIONS (reuse for pending config)
+                error.VoterAlreadyExists => 73, // DUPLICATE_RESOURCE
+                else => 1, // UNKNOWN_SERVER_ERROR
+            };
+            return self.errorResponse(req_header, resp_header_version, error_code);
+        };
+
+        log.info("AddRaftVoter: proposed adding node {d} at offset {d}", .{ voter_id, offset });
+
+        var buf = self.allocator.alloc(u8, 64) catch return null;
+        var wpos: usize = 0;
+        const rh = ResponseHeader{ .correlation_id = req_header.correlation_id };
+        rh.serialize(buf, &wpos, resp_header_version);
+        ser.writeI16(buf, &wpos, 0); // error_code: NONE
+        ser.writeI32(buf, &wpos, 0); // throttle_time_ms
+        if (resp_header_version >= 1) ser.writeEmptyTaggedFields(buf, &wpos);
+
+        return (self.allocator.realloc(buf, wpos) catch buf)[0..wpos];
+    }
+
+    // ---------------------------------------------------------------
+    // RemoveRaftVoter (key 72) — dynamic voter membership
+    // ---------------------------------------------------------------
+    fn handleRemoveRaftVoter(self: *Controller, request_bytes: []const u8, start_pos: usize, req_header: *const RequestHeader, resp_header_version: i16) ?[]u8 {
+        var pos = start_pos;
+
+        // Parse: voter_id
+        const voter_id = ser.readI32(request_bytes, &pos);
+
+        const offset = self.raft_state.proposeRemoveVoter(voter_id) catch |err| {
+            const error_code: i16 = switch (err) {
+                error.NotLeader => 41, // NOT_CONTROLLER
+                error.ConfigChangePending => 89, // CONCURRENT_TRANSACTIONS
+                error.VoterNotFound => 69, // RESOURCE_NOT_FOUND
+                error.CannotRemoveLastVoter => 87, // INVALID_REQUEST
+                else => 1,
+            };
+            return self.errorResponse(req_header, resp_header_version, error_code);
+        };
+
+        log.info("RemoveRaftVoter: proposed removing node {d} at offset {d}", .{ voter_id, offset });
+
+        var buf = self.allocator.alloc(u8, 64) catch return null;
+        var wpos: usize = 0;
+        const rh = ResponseHeader{ .correlation_id = req_header.correlation_id };
+        rh.serialize(buf, &wpos, resp_header_version);
+        ser.writeI16(buf, &wpos, 0); // error_code: NONE
+        ser.writeI32(buf, &wpos, 0); // throttle_time_ms
         if (resp_header_version >= 1) ser.writeEmptyTaggedFields(buf, &wpos);
 
         return (self.allocator.realloc(buf, wpos) catch buf)[0..wpos];

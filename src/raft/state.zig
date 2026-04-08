@@ -36,6 +36,13 @@ pub const RaftState = struct {
     /// Epoch of the last snapshot.
     last_snapshot_epoch: i32 = 0,
 
+    /// Whether there is a pending (uncommitted) config change entry in the log.
+    /// Only one config change can be in-flight at a time (Raft single-server rule).
+    pending_config_change: bool = false,
+
+    /// Offset of the last applied config change entry (null = none applied yet).
+    last_applied_config_offset: ?u64 = null,
+
     pub const Role = enum {
         unattached,
         follower,
@@ -418,6 +425,42 @@ pub const RaftState = struct {
         data: []const u8,
     };
 
+    /// Configuration change entry types for dynamic voter membership.
+    pub const ConfigChangeType = enum(u8) {
+        add_voter = 1,
+        remove_voter = 2,
+    };
+
+    /// A serialized config change entry stored in the Raft log.
+    /// Format: type(1B) + voter_id(4B) = 5 bytes
+    pub const ConfigChangeEntry = struct {
+        change_type: ConfigChangeType,
+        voter_id: i32,
+
+        pub fn serialize(self: ConfigChangeEntry) [5]u8 {
+            var buf: [5]u8 = undefined;
+            buf[0] = @intFromEnum(self.change_type);
+            std.mem.writeInt(i32, buf[1..5], self.voter_id, .big);
+            return buf;
+        }
+
+        pub fn deserialize(data: []const u8) ?ConfigChangeEntry {
+            if (data.len < 5) return null;
+            // Check for config change magic prefix
+            if (data[0] != 1 and data[0] != 2) return null;
+            return .{
+                .change_type = @enumFromInt(data[0]),
+                .voter_id = std.mem.readInt(i32, data[1..5], .big),
+            };
+        }
+
+        /// Check if a log entry is a config change (vs regular data).
+        pub fn isConfigChange(data: []const u8) bool {
+            if (data.len < 5) return false;
+            return data[0] == 1 or data[0] == 2;
+        }
+    };
+
     /// Handle an AppendEntries request from the leader (follower side).
     /// Validates prev_log match, truncates conflicting entries, appends new ones.
     /// Returns success=true if entries were accepted.
@@ -551,10 +594,95 @@ pub const RaftState = struct {
                 if (self.log.get(new_commit)) |entry| {
                     if (entry.epoch == self.current_epoch) {
                         self.commit_index = new_commit;
+                        // Apply any newly committed config changes
+                        self.applyCommittedConfigs();
                     }
                 } else if (new_commit == 0 and self.log.length() == 0) {
                     // Empty log edge case — commit_index stays at 0
                 }
+            }
+        }
+    }
+
+    /// Propose adding a voter to the cluster (leader only).
+    /// Returns the log offset of the config change entry, or error if:
+    /// - Not the leader
+    /// - A config change is already pending
+    /// - Voter already exists
+    pub fn proposeAddVoter(self: *RaftState, voter_id: i32) !u64 {
+        if (self.role != .leader) return error.NotLeader;
+        if (self.pending_config_change) return error.ConfigChangePending;
+        if (self.voters.contains(voter_id)) return error.VoterAlreadyExists;
+
+        const entry = ConfigChangeEntry{ .change_type = .add_voter, .voter_id = voter_id };
+        const data = entry.serialize();
+        const offset = try self.appendEntry(&data);
+        self.pending_config_change = true;
+
+        std.log.scoped(.raft).info("Proposed AddVoter: node {d} at offset {d}", .{ voter_id, offset });
+        return offset;
+    }
+
+    /// Propose removing a voter from the cluster (leader only).
+    /// Returns the log offset of the config change entry, or error if:
+    /// - Not the leader
+    /// - A config change is already pending
+    /// - Voter doesn't exist
+    /// - Removing would leave zero voters
+    pub fn proposeRemoveVoter(self: *RaftState, voter_id: i32) !u64 {
+        if (self.role != .leader) return error.NotLeader;
+        if (self.pending_config_change) return error.ConfigChangePending;
+        if (!self.voters.contains(voter_id)) return error.VoterNotFound;
+        if (self.voters.count() <= 1) return error.CannotRemoveLastVoter;
+
+        const entry = ConfigChangeEntry{ .change_type = .remove_voter, .voter_id = voter_id };
+        const data = entry.serialize();
+        const offset = try self.appendEntry(&data);
+        self.pending_config_change = true;
+
+        std.log.scoped(.raft).info("Proposed RemoveVoter: node {d} at offset {d}", .{ voter_id, offset });
+        return offset;
+    }
+
+    /// Remove a voter from the cluster (direct, not through Raft log).
+    /// Used internally by applyCommittedConfigs.
+    pub fn removeVoter(self: *RaftState, voter_id: i32) void {
+        _ = self.voters.fetchRemove(voter_id);
+    }
+
+    /// Apply any committed config change entries.
+    /// Called after commit_index advances. Scans newly committed entries
+    /// for config changes and applies them to the voter set.
+    pub fn applyCommittedConfigs(self: *RaftState) void {
+        for (self.log.entries.items) |entry| {
+            if (entry.offset > self.commit_index) break;
+            // Only process entries we haven't applied yet
+            if (self.last_applied_config_offset) |last_offset| {
+                if (entry.offset <= last_offset) continue;
+            }
+
+            if (ConfigChangeEntry.deserialize(entry.data)) |config| {
+                switch (config.change_type) {
+                    .add_voter => {
+                        self.voters.put(config.voter_id, .{ .node_id = config.voter_id }) catch {};
+                        std.log.scoped(.raft).info("Config applied: added voter {d} (now {d} voters)", .{
+                            config.voter_id, self.voters.count(),
+                        });
+                    },
+                    .remove_voter => {
+                        _ = self.voters.fetchRemove(config.voter_id);
+                        std.log.scoped(.raft).info("Config applied: removed voter {d} (now {d} voters)", .{
+                            config.voter_id, self.voters.count(),
+                        });
+                        // If we removed ourselves, step down
+                        if (config.voter_id == self.node_id and self.role == .leader) {
+                            std.log.scoped(.raft).info("Removed self from voters, stepping down", .{});
+                            self.role = .resigned;
+                        }
+                    },
+                }
+                self.last_applied_config_offset = entry.offset;
+                self.pending_config_change = false;
             }
         }
     }
@@ -1706,4 +1834,152 @@ test "RaftState shouldSnapshot checks log size" {
     // Above threshold
     try testing.expect(state.shouldSnapshot(10));
     try testing.expect(!state.shouldSnapshot(20));
+}
+
+test "RaftState proposeAddVoter appends config entry" {
+    var state = RaftState.init(testing.allocator, 0, "cluster");
+    defer state.deinit();
+
+    try state.addVoter(0);
+    _ = state.startElection();
+    state.becomeLeader();
+
+    // Propose adding voter 1
+    const offset = try state.proposeAddVoter(1);
+    try testing.expectEqual(@as(u64, 0), offset);
+    try testing.expect(state.pending_config_change);
+
+    // Verify it's in the log
+    try testing.expectEqual(@as(usize, 1), state.log.length());
+    const entry = state.log.get(0).?;
+    try testing.expect(RaftState.ConfigChangeEntry.isConfigChange(entry.data));
+}
+
+test "RaftState proposeAddVoter rejects duplicate" {
+    var state = RaftState.init(testing.allocator, 0, "cluster");
+    defer state.deinit();
+
+    try state.addVoter(0);
+    _ = state.startElection();
+    state.becomeLeader();
+
+    const result = state.proposeAddVoter(0); // Already a voter
+    try testing.expectError(error.VoterAlreadyExists, result);
+}
+
+test "RaftState proposeAddVoter rejects when config pending" {
+    var state = RaftState.init(testing.allocator, 0, "cluster");
+    defer state.deinit();
+
+    try state.addVoter(0);
+    _ = state.startElection();
+    state.becomeLeader();
+
+    _ = try state.proposeAddVoter(1); // First one succeeds
+    const result = state.proposeAddVoter(2); // Second rejected
+    try testing.expectError(error.ConfigChangePending, result);
+}
+
+test "RaftState proposeRemoveVoter works" {
+    var state = RaftState.init(testing.allocator, 0, "cluster");
+    defer state.deinit();
+
+    try state.addVoter(0);
+    try state.addVoter(1);
+    _ = state.startElection();
+    state.becomeLeader();
+
+    const offset = try state.proposeRemoveVoter(1);
+    try testing.expect(offset >= 0);
+    try testing.expect(state.pending_config_change);
+}
+
+test "RaftState proposeRemoveVoter rejects last voter" {
+    var state = RaftState.init(testing.allocator, 0, "cluster");
+    defer state.deinit();
+
+    try state.addVoter(0);
+    _ = state.startElection();
+    state.becomeLeader();
+
+    const result = state.proposeRemoveVoter(0);
+    try testing.expectError(error.CannotRemoveLastVoter, result);
+}
+
+test "RaftState applyCommittedConfigs adds voter" {
+    var state = RaftState.init(testing.allocator, 0, "cluster");
+    defer state.deinit();
+
+    try state.addVoter(0);
+    _ = state.startElection();
+    state.becomeLeader();
+
+    // Propose and commit
+    _ = try state.proposeAddVoter(1);
+    try testing.expectEqual(@as(usize, 1), state.voters.count()); // Not yet applied
+
+    // Simulate commit (manually advance commit_index)
+    state.commit_index = 0;
+    state.applyCommittedConfigs();
+
+    try testing.expectEqual(@as(usize, 2), state.voters.count());
+    try testing.expect(state.voters.contains(1));
+    try testing.expect(!state.pending_config_change);
+}
+
+test "RaftState applyCommittedConfigs removes voter" {
+    var state = RaftState.init(testing.allocator, 0, "cluster");
+    defer state.deinit();
+
+    try state.addVoter(0);
+    try state.addVoter(1);
+    _ = state.startElection();
+    state.becomeLeader();
+
+    _ = try state.proposeRemoveVoter(1);
+    state.commit_index = 0;
+    state.applyCommittedConfigs();
+
+    try testing.expectEqual(@as(usize, 1), state.voters.count());
+    try testing.expect(!state.voters.contains(1));
+}
+
+test "RaftState removing self causes resignation" {
+    var state = RaftState.init(testing.allocator, 0, "cluster");
+    defer state.deinit();
+
+    try state.addVoter(0);
+    try state.addVoter(1);
+    _ = state.startElection();
+    state.becomeLeader();
+
+    _ = try state.proposeRemoveVoter(0); // Remove self
+    state.commit_index = 0;
+    state.applyCommittedConfigs();
+
+    try testing.expectEqual(RaftState.Role.resigned, state.role);
+}
+
+test "ConfigChangeEntry serialize and deserialize round-trip" {
+    const add = RaftState.ConfigChangeEntry{ .change_type = .add_voter, .voter_id = 42 };
+    const buf = add.serialize();
+    const parsed = RaftState.ConfigChangeEntry.deserialize(&buf).?;
+    try testing.expectEqual(RaftState.ConfigChangeType.add_voter, parsed.change_type);
+    try testing.expectEqual(@as(i32, 42), parsed.voter_id);
+
+    const remove = RaftState.ConfigChangeEntry{ .change_type = .remove_voter, .voter_id = 7 };
+    const buf2 = remove.serialize();
+    const parsed2 = RaftState.ConfigChangeEntry.deserialize(&buf2).?;
+    try testing.expectEqual(RaftState.ConfigChangeType.remove_voter, parsed2.change_type);
+    try testing.expectEqual(@as(i32, 7), parsed2.voter_id);
+}
+
+test "ConfigChangeEntry isConfigChange detects correctly" {
+    const config = RaftState.ConfigChangeEntry{ .change_type = .add_voter, .voter_id = 1 };
+    const buf = config.serialize();
+    try testing.expect(RaftState.ConfigChangeEntry.isConfigChange(&buf));
+
+    // Regular data should NOT be detected as config change
+    try testing.expect(!RaftState.ConfigChangeEntry.isConfigChange("hello world"));
+    try testing.expect(!RaftState.ConfigChangeEntry.isConfigChange(""));
 }

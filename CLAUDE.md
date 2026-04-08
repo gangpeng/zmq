@@ -136,7 +136,6 @@ ObjectManager metadata is always updated BEFORE S3 objects are deleted. If the p
 | Streams per partition | 4 (log/tim/idx/txn) | 1 (intentional — RecordBatch is self-contained; time-index lookups scan linearly) |
 | Compaction strategies | 6 (CLEANUP, MINOR, MAJOR, V1 variants) | 3 (force-split, merge, cleanup). V1 variants handle AutoMQ-specific composite objects. |
 | Compaction analyzer | Full planning with size/dirty-byte thresholds | Time-based interval only. No adaptive scheduling. |
-| Dynamic voter changes | AddRaftVoter/RemoveRaftVoter APIs | Not implemented. Requires Raft joint consensus — very complex. |
 
 ## File organization
 
