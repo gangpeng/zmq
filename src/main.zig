@@ -156,7 +156,6 @@ pub fn main() !void {
     }
 
     // Validate: broker-only mode requires --voters to know the controller quorum
-    try stdout.print("  DEBUG: parsed args, roles={s} port={d} ctrl_port={d}\n", .{ process_roles.name(), port, controller_port });
     if (process_roles.is_broker and !process_roles.is_controller and voters_str == null) {
         try stdout.print("  ERROR: --voters is required for broker-only mode (process.roles=broker)\n", .{});
         return;
@@ -196,30 +195,22 @@ pub fn main() !void {
     // ═══════════════════════════════════════════════════════════
     // CONTROLLER COMPONENTS (if controller role)
     // ═══════════════════════════════════════════════════════════
-    try stdout.print("  DEBUG: initializing controller...\n", .{});
     var controller: ?*Controller = null;
     var raft_pool: ?RaftClientPool = null;
 
     if (process_roles.is_controller) {
-        try stdout.print("  DEBUG: alloc.create(Controller)...\n", .{});
         const ctrl = try alloc.create(Controller);
-        try stdout.print("  DEBUG: Controller.init...\n", .{});
         ctrl.* = Controller.init(alloc, node_id, cluster_id);
         controller = ctrl;
-        try stdout.print("  DEBUG: controller initialized\n", .{});
 
         if (voters_str == null) {
-            try stdout.print("  DEBUG: single-node, adding self as voter\n", .{});
             ctrl.raft_state.addVoter(node_id) catch {};
         } else {
-            try stdout.print("  DEBUG: multi-node, parsing voters\n", .{});
             raft_pool = RaftClientPool.init(alloc);
             parseAndRegisterVoters(&ctrl.raft_state, voters_str.?, &raft_pool.?);
-            try stdout.print("  DEBUG: voters parsed\n", .{});
         }
 
         handler_routing.setGlobalController(ctrl);
-        try stdout.print("  DEBUG: controller setup complete\n", .{});
     }
     defer if (controller) |ctrl| {
         ctrl.deinit();
@@ -233,9 +224,7 @@ pub fn main() !void {
     var broker: ?*Broker = null;
 
     if (process_roles.is_broker) {
-        try stdout.print("  DEBUG: alloc.create(Broker)...\n", .{});
         const brk = try alloc.create(Broker);
-        try stdout.print("  DEBUG: Broker.initWithConfig...\n", .{});
         brk.* = Broker.initWithConfig(alloc, node_id, port, .{
             .data_dir = data_dir,
             .s3_endpoint_host = s3_host,
@@ -258,22 +247,18 @@ pub fn main() !void {
         if (brk.compaction_manager) |*cm| {
             cm.object_manager = &brk.object_manager;
         }
-        try stdout.print("  DEBUG: broker created, setting raft state...\n", .{});
 
         if (controller) |ctrl| {
             brk.setRaftState(&ctrl.raft_state);
         }
-        try stdout.print("  DEBUG: opening broker storage...\n", .{});
 
         brk.open() catch |err| {
             try stdout.print("  ERROR: Failed to open storage: {}\n", .{err});
             return;
         };
-        try stdout.print("  DEBUG: broker opened, setting globals...\n", .{});
 
         handler.setGlobalBroker(brk);
         handler_routing.setGlobalBroker(brk);
-        try stdout.print("  DEBUG: broker setup complete\n", .{});
     }
     defer if (broker) |brk| {
         log.info("Shutting down broker (persisting metadata)...", .{});
