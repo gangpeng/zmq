@@ -104,7 +104,7 @@ pub const MetadataClient = struct {
 
         // Step 3: Periodic heartbeat loop
         while (!self.should_stop.*) {
-            std.time.sleep(2000 * std.time.ns_per_ms); // 2-second heartbeat interval
+            std.time.sleep(2000 * @as(u64, 1_000_000)); // 2-second heartbeat interval
             if (self.should_stop.*) break;
             self.sendHeartbeat();
         }
@@ -141,7 +141,7 @@ pub const MetadataClient = struct {
             log.warn("Failed to discover controller leader, retrying in {d}ms (attempt {d})", .{
                 backoff, attempt,
             });
-            std.time.sleep(backoff * 1_000_000);
+            std.time.sleep(backoff * @as(u64, 1_000_000));
         }
     }
 
