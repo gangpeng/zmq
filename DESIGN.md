@@ -4,7 +4,7 @@
 
 ZMQ is a high-performance, Kafka-compatible broker that reimplements AutoMQ's cloud-native architecture in Zig. Like AutoMQ, it separates compute from storage — brokers are stateless compute nodes that delegate all durability to S3. This eliminates inter-broker data replication (RF=1 always), enabling instant failover via metadata reassignment.
 
-### Performance Comparison (3-node cluster, MinIO S3 backend)
+### Performance Comparison — ZMQ vs AutoMQ (3-node cluster, MinIO S3 backend)
 
 | Metric | ZMQ (Zig) | AutoMQ (Java) | ZMQ Advantage |
 |---|---|---|---|
@@ -15,6 +15,21 @@ ZMQ is a high-performance, Kafka-compatible broker that reimplements AutoMQ's cl
 | Fetch throughput | 1,060/s | 29/s | **37x faster** |
 | Metadata throughput | 1,606/s | 1,269/s | **1.3x faster** |
 | Metadata p50 / p99 latency | 0.57 / 1.70 ms | 0.73 / 1.81 ms | **1.3x / 1.1x lower** |
+
+### Performance Comparison — ZMQ vs Apache Kafka (3-node cluster, ZMQ on S3 vs Kafka on local disk)
+
+| Metric | ZMQ (Zig + S3) | Apache Kafka 4.2 (local disk) | Result |
+|---|---|---|---|
+| ApiVersions throughput | 2,514/s | 1,390/s | **ZMQ 1.8x faster** |
+| Produce throughput (conn reuse) | 1,418/s | 954/s | **ZMQ 1.5x faster** |
+| Produce throughput (fresh conn) | 864/s | 610/s | **ZMQ 1.4x faster** |
+| Produce p50 / p99 latency | 0.63 / 3.26 ms | 0.94 / 2.49 ms | **ZMQ 1.5x lower p50** |
+| Fetch throughput | 893/s | 1,131/s | **Kafka 1.3x faster** |
+| Fetch p50 / p99 latency | 1.05 / 2.37 ms | 0.78 / 2.75 ms | Kafka lower p50, ZMQ lower p99 |
+| Metadata throughput | 1,927/s | 1,177/s | **ZMQ 1.6x faster** |
+| Metadata p50 / p99 latency | 0.49 / 1.03 ms | 0.76 / 3.23 ms | **ZMQ 1.6x / 3.1x lower** |
+
+> ZMQ wins 4 of 5 throughput benchmarks despite using S3 (via MinIO) while Kafka uses local disk. Kafka's fetch advantage is expected — local disk reads are inherently faster than S3 GETs. ZMQ's wins on produce, metadata, and API operations reflect Zig's lower per-request overhead vs the JVM. Benchmark: `python3 benchmarks/benchmark_compare.py --target zmq,kafka`
 
 ---
 

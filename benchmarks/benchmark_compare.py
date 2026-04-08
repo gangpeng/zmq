@@ -1,25 +1,32 @@
 #!/usr/bin/env python3
 """
-Benchmark comparison: ZMQ vs AutoMQ
+Benchmark comparison: ZMQ vs Apache Kafka vs AutoMQ
 
-Runs the same Kafka wire-protocol benchmarks against both systems using
+Runs the same Kafka wire-protocol benchmarks against all three systems using
 Docker Compose, then prints a side-by-side comparison table.
 
-Both systems use:
+All systems use:
   - 3-node cluster (combined controller+broker mode)
-  - MinIO S3 backend
   - Broker exposed on host port 19092
-  - Same Kafka protocol v0 requests, same iteration counts
+  - Same Kafka protocol requests, same iteration counts
+
+Storage backends:
+  - ZMQ:          MinIO S3
+  - Apache Kafka: Local disk (vanilla KRaft, no S3)
+  - AutoMQ:       MinIO S3
 
 Usage:
-  # Full comparison (manages Docker lifecycle automatically):
+  # Full 3-way comparison (manages Docker lifecycle automatically):
   python3 benchmarks/benchmark_compare.py
 
-  # Run only against ZMQ (cluster must already be up on port 19092):
+  # Run only against a single target (cluster must already be up on port 19092):
   python3 benchmarks/benchmark_compare.py --target zmq
-
-  # Run only against AutoMQ (cluster must already be up on port 19092):
+  python3 benchmarks/benchmark_compare.py --target kafka
   python3 benchmarks/benchmark_compare.py --target automq
+
+  # Run a subset of targets:
+  python3 benchmarks/benchmark_compare.py --target zmq,kafka
+  python3 benchmarks/benchmark_compare.py --target zmq,automq
 """
 
 import socket
@@ -34,9 +41,23 @@ import argparse
 BROKER_PORT = 19092
 PROJECT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 ZMQ_COMPOSE = os.path.join(PROJECT_DIR, "docker-compose.yml")
+KAFKA_COMPOSE = os.path.join(PROJECT_DIR, "benchmarks", "kafka-compose.yml")
 AUTOMQ_COMPOSE = os.path.join(PROJECT_DIR, "benchmarks", "automq-compose.yml")
 
-# Benchmark parameters — identical for both systems
+# All supported targets in display order
+ALL_TARGETS = ["zmq", "kafka", "automq"]
+TARGET_LABELS = {
+    "zmq": "ZMQ (Zig)",
+    "kafka": "Apache Kafka",
+    "automq": "AutoMQ (Java)",
+}
+TARGET_COMPOSE = {
+    "zmq": ZMQ_COMPOSE,
+    "kafka": KAFKA_COMPOSE,
+    "automq": AUTOMQ_COMPOSE,
+}
+
+# Benchmark parameters — identical for all systems
 ITERATIONS = {
     "api_versions": 5000,
     "produce_single": 5000,
@@ -52,7 +73,13 @@ WARMUP = {
     "metadata": 100,
 }
 
-# ── Kafka wire protocol helpers (v0, non-flexible) ──
+# ── Kafka wire protocol helpers ──
+# Uses lowest versions compatible with all three targets:
+#   - Produce v0: supported by ZMQ (0-11), Kafka 4.2 (0-13), AutoMQ (0-11)
+#   - Fetch v4:   Kafka 4.2 dropped v0-v3 (min=4); ZMQ (0-17), AutoMQ (0-17)
+#   - CreateTopics v2: Kafka 4.2 dropped v0-v1 (min=2); ZMQ (0-7), AutoMQ (0-7)
+#   - Metadata v1: all support it
+#   - ApiVersions v0: all support it
 
 def _recv_exact(sock, n):
     buf = b''
@@ -81,26 +108,136 @@ def kafka_request_fresh(port, api_key, api_version, corr_id, body=b''):
     return resp
 
 def create_topic(sock, corr_id, name, partitions=3):
+    """CreateTopics v2 — compatible with Kafka 4.2+ (which dropped v0-v1)."""
     name_b = name.encode()
-    body = struct.pack('>i', 1) + struct.pack('>h', len(name_b)) + name_b
-    body += struct.pack('>ih', partitions, 1) + struct.pack('>iii', 0, 0, 30000)
-    kafka_request_reuse(sock, 19, 0, corr_id, body)
+    # num_topics=1
+    body = struct.pack('>i', 1)
+    # topic name (string16)
+    body += struct.pack('>h', len(name_b)) + name_b
+    # num_partitions, replication_factor
+    body += struct.pack('>ih', partitions, 1)
+    # num_assignments=0 (empty array, non-nullable in v2)
+    body += struct.pack('>i', 0)
+    # num_configs=0
+    body += struct.pack('>i', 0)
+    # timeout_ms=30000, validate_only=false
+    body += struct.pack('>i', 30000) + struct.pack('>?', False)
+    kafka_request_reuse(sock, 19, 2, corr_id, body)
 
 def produce_body(topic, partition, msg):
+    """Produce v3 body with RecordBatch v2 format.
+
+    Produce v3+ is required because Kafka 4.2 rejects v0-v2 despite reporting
+    them as supported in ApiVersions.  v3 adds transactional_id (set to null).
+    The record payload uses RecordBatch (magic=2) with CRC32C.
+    """
     topic_b = topic.encode()
-    body = struct.pack('>hi', -1, 30000) + struct.pack('>i', 1)
+    if isinstance(msg, str):
+        msg = msg.encode()
+
+    # ── Build a single Record (inside the batch) ──
+    record = bytearray()
+    record.append(0)            # attributes
+    record.append(0)            # timestampDelta (varint 0)
+    record.append(0)            # offsetDelta (varint 0)
+    record.append(0x01)         # keyLength = -1 zigzag-varint
+    # (no key bytes)
+    _encode_varint_into(record, len(msg))  # valueLength
+    record.extend(msg)
+    record.append(0)            # headersCount (varint 0)
+
+    record_with_len = bytearray()
+    _encode_varint_into(record_with_len, len(record))
+    record_with_len.extend(record)
+
+    # ── Build RecordBatch header (after baseOffset + batchLength) ──
+    now_ms = int(time.monotonic() * 1000)
+    batch_body = bytearray()
+    batch_body.extend(struct.pack('>i', 0))     # partitionLeaderEpoch
+    batch_body.append(2)                         # magic = 2 (RecordBatch)
+    # CRC placeholder — 4 bytes, filled below
+    crc_offset = len(batch_body)
+    batch_body.extend(b'\x00\x00\x00\x00')
+    # Everything after CRC is included in the checksum
+    crc_start = len(batch_body)
+    batch_body.extend(struct.pack('>h', 0))     # attributes
+    batch_body.extend(struct.pack('>i', 0))     # lastOffsetDelta
+    batch_body.extend(struct.pack('>q', now_ms)) # firstTimestamp
+    batch_body.extend(struct.pack('>q', now_ms)) # maxTimestamp
+    batch_body.extend(struct.pack('>q', -1))    # producerId
+    batch_body.extend(struct.pack('>h', -1))    # producerEpoch
+    batch_body.extend(struct.pack('>i', -1))    # baseSequence
+    batch_body.extend(struct.pack('>i', 1))     # numRecords
+    batch_body.extend(record_with_len)
+
+    # Compute CRC32C over everything after the CRC field
+    crc = _crc32c(bytes(batch_body[crc_start:]))
+    struct.pack_into('>I', batch_body, crc_offset, crc)
+
+    # Full record set: baseOffset(8) + batchLength(4) + batch_body
+    records = struct.pack('>q', 0) + struct.pack('>i', len(batch_body)) + bytes(batch_body)
+
+    # ── Produce v3 request body ──
+    body = struct.pack('>h', -1)                 # transactionalId = null
+    body += struct.pack('>hi', -1, 30000)        # acks=-1, timeout=30s
+    body += struct.pack('>i', 1)                 # num_topics
     body += struct.pack('>h', len(topic_b)) + topic_b
-    body += struct.pack('>ii', 1, partition)
-    body += struct.pack('>i', len(msg)) + msg
+    body += struct.pack('>i', 1)                 # num_partitions
+    body += struct.pack('>i', partition)
+    body += struct.pack('>i', len(records)) + records
     return body
 
+# Produce version (v3 is minimum that works with Kafka 4.2)
+PRODUCE_VERSION = 3
+
+def _encode_varint_into(buf, value):
+    """Encode a signed int as zigzag varint, appending to buf."""
+    # Zigzag encode
+    value = (value << 1) ^ (value >> 31)
+    while value & ~0x7F:
+        buf.append((value & 0x7F) | 0x80)
+        value >>= 7
+    buf.append(value & 0x7F)
+
+def _crc32c(data):
+    """Compute CRC-32C (Castagnoli). Uses crcmod if available, else pure Python."""
+    try:
+        import crcmod
+        fn = crcmod.predefined.mkCrcFun('crc-32c')
+        return fn(data) & 0xFFFFFFFF
+    except ImportError:
+        pass
+    # Pure-Python fallback (slow but correct)
+    crc = 0xFFFFFFFF
+    poly = 0x82F63B78
+    for byte in data:
+        crc ^= byte
+        for _ in range(8):
+            if crc & 1:
+                crc = (crc >> 1) ^ poly
+            else:
+                crc >>= 1
+    return crc ^ 0xFFFFFFFF
+
 def fetch_body(topic, partition, offset, max_bytes=1048576):
+    """Fetch v4 body — compatible with Kafka 4.2+ (which dropped v0-v3)."""
     topic_b = topic.encode()
-    # max_wait_ms=100 (low for benchmarking), min_bytes=1
-    body = struct.pack('>iii', -1, 100, 1) + struct.pack('>i', 1)
+    # replica_id=-1, max_wait_ms=100, min_bytes=1, max_bytes
+    body = struct.pack('>iiii', -1, 100, 1, max_bytes)
+    # isolation_level=0 (READ_UNCOMMITTED) — added in v4
+    body += struct.pack('>b', 0)
+    # num_topics=1
+    body += struct.pack('>i', 1)
+    # topic name (string16)
     body += struct.pack('>h', len(topic_b)) + topic_b
-    body += struct.pack('>i', 1) + struct.pack('>iqi', partition, offset, max_bytes)
+    # num_partitions=1
+    body += struct.pack('>i', 1)
+    # partition, fetch_offset, partition_max_bytes
+    body += struct.pack('>iqi', partition, offset, max_bytes)
     return body
+
+# Fetch version used in benchmarks (v4 is minimum for Kafka 4.2 compat)
+FETCH_VERSION = 4
 
 # ── Benchmark runner ──
 
@@ -155,8 +292,9 @@ def wait_for_broker(port, timeout=120):
 
 def run_benchmarks(label):
     """Run the full benchmark suite. Returns results dict or None on failure."""
+    storage = "local disk" if "Kafka" in label else "MinIO S3"
     print(f"\n{'=' * 60}")
-    print(f"  {label} Benchmark — 3-Node Cluster + MinIO S3")
+    print(f"  {label} Benchmark — 3-Node Cluster + {storage}")
     print(f"{'=' * 60}")
 
     print(f"  Waiting for broker on port {BROKER_PORT}...", end="", flush=True)
@@ -195,8 +333,8 @@ def run_benchmarks(label):
     sock.settimeout(30)
     sock.connect(('127.0.0.1', BROKER_PORT))
     def produce_fn(i):
-        body = produce_body("bench-topic", i % 3, f"msg-{i:08d}".encode())
-        kafka_request_reuse(sock, 0, 0, i, body)
+        body = produce_body("bench-topic", i % 3, f"msg-{i:08d}")
+        kafka_request_reuse(sock, 0, PRODUCE_VERSION, i, body)
     results["produce_single"] = bench("Produce (reuse)", produce_fn,
                                        ITERATIONS["produce_single"], WARMUP["produce_single"])
     sock.close()
@@ -204,8 +342,8 @@ def run_benchmarks(label):
     # 3. Produce (fresh connection)
     print(f"\n  [3/5] Produce — single msg, fresh conn ({ITERATIONS['produce_fresh']} iters)")
     def produce_fresh_fn(i):
-        body = produce_body("bench-topic", i % 3, f"fresh-{i:08d}".encode())
-        kafka_request_fresh(BROKER_PORT, 0, 0, i, body)
+        body = produce_body("bench-topic", i % 3, f"fresh-{i:08d}")
+        kafka_request_fresh(BROKER_PORT, 0, PRODUCE_VERSION, i, body)
     results["produce_fresh"] = bench("Produce (fresh)", produce_fresh_fn,
                                       ITERATIONS["produce_fresh"], WARMUP["produce_fresh"])
 
@@ -216,7 +354,7 @@ def run_benchmarks(label):
     sock.connect(('127.0.0.1', BROKER_PORT))
     def fetch_fn(i):
         body = fetch_body("bench-topic", i % 3, 0)
-        kafka_request_reuse(sock, 1, 0, i, body)
+        kafka_request_reuse(sock, 1, FETCH_VERSION, i, body)
     results["fetch"] = bench("Fetch", fetch_fn,
                               ITERATIONS["fetch"], WARMUP["fetch"])
     sock.close()
@@ -257,11 +395,41 @@ def compose_down(compose_file, label):
         capture_output=True, cwd=PROJECT_DIR
     )
 
-def print_comparison(zmq_results, automq_results):
-    """Print side-by-side comparison table."""
-    print("\n" + "=" * 85)
-    print("  COMPARISON: ZMQ (Zig) vs AutoMQ (Java)")
-    print("=" * 85)
+def _ratio_str(val_a, val_b, higher_is_better=True):
+    """Format a ratio with arrow marker. Returns (ratio_text, marker)."""
+    if val_b == 0:
+        return "   inf  ", "▲" if higher_is_better else "▼"
+    ratio = val_a / val_b
+    if higher_is_better:
+        marker = "▲" if ratio >= 1.0 else "▼"
+    else:
+        marker = "▲" if ratio <= 1.0 else "▼"
+    return f"{ratio:>6.2f}x", marker
+
+def print_comparison(all_results):
+    """Print side-by-side comparison table for 2 or 3 systems."""
+    targets = [t for t in ALL_TARGETS if t in all_results]
+    if len(targets) < 2:
+        return
+
+    labels = [TARGET_LABELS[t] for t in targets]
+    short_labels = {
+        "zmq": "ZMQ",
+        "kafka": "Kafka",
+        "automq": "AutoMQ",
+    }
+
+    # Build ratio column headers: ZMQ vs each other target
+    ratio_pairs = []
+    if "zmq" in all_results:
+        for t in targets:
+            if t != "zmq":
+                ratio_pairs.append(("zmq", t))
+
+    print("\n" + "=" * (60 + 14 * len(targets) + 14 * len(ratio_pairs)))
+    title_parts = " vs ".join(labels)
+    print(f"  COMPARISON: {title_parts}")
+    print("=" * (60 + 14 * len(targets) + 14 * len(ratio_pairs)))
 
     benchmarks = [
         ("api_versions", "ApiVersions"),
@@ -272,79 +440,113 @@ def print_comparison(zmq_results, automq_results):
     ]
 
     # Header
-    print(f"\n  {'Benchmark':<22} {'Metric':<6} {'ZMQ':>12} {'AutoMQ':>12} {'ZMQ/AutoMQ':>12}")
-    print(f"  {'─'*22} {'─'*6} {'─'*12} {'─'*12} {'─'*12}")
+    hdr = f"  {'Benchmark':<22} {'Metric':<6}"
+    for t in targets:
+        hdr += f" {short_labels[t]:>12}"
+    for a, b in ratio_pairs:
+        hdr += f" {short_labels[a]+'/'+short_labels[b]:>14}"
+    print(f"\n{hdr}")
+
+    sep = f"  {'─'*22} {'─'*6}"
+    for _ in targets:
+        sep += f" {'─'*12}"
+    for _ in ratio_pairs:
+        sep += f" {'─'*14}"
+    print(sep)
 
     for key, label in benchmarks:
-        z = zmq_results.get(key, {})
-        a = automq_results.get(key, {})
+        results_for_key = {t: all_results[t].get(key, {}) for t in targets}
 
-        # Throughput row
-        zt = z.get("throughput", 0)
-        at = a.get("throughput", 0)
-        ratio = zt / at if at > 0 else float('inf')
-        marker = "▲" if ratio >= 1.0 else "▼"
-        print(f"  {label:<22} {'tput':<6} {zt:>10,.0f}/s {at:>10,.0f}/s {ratio:>8.2f}x {marker}")
+        for metric, metric_label, higher_is_better in [
+            ("throughput", "tput", True),
+            ("p50", "p50", False),
+            ("p99", "p99", False),
+        ]:
+            row_label = label if metric == "throughput" else ""
+            row = f"  {row_label:<22} {metric_label:<6}"
 
-        # p50 row
-        zp = z.get("p50", 0)
-        ap = a.get("p50", 0)
-        ratio_p = zp / ap if ap > 0 else float('inf')
-        marker_p = "▲" if ratio_p <= 1.0 else "▼"
-        print(f"  {'':<22} {'p50':<6} {zp:>10.2f}ms {ap:>10.2f}ms {ratio_p:>8.2f}x {marker_p}")
+            for t in targets:
+                val = results_for_key[t].get(metric, 0)
+                if metric == "throughput":
+                    row += f" {val:>10,.0f}/s"
+                else:
+                    row += f" {val:>10.2f}ms"
 
-        # p99 row
-        zp99 = z.get("p99", 0)
-        ap99 = a.get("p99", 0)
-        ratio_p99 = zp99 / ap99 if ap99 > 0 else float('inf')
-        marker_99 = "▲" if ratio_p99 <= 1.0 else "▼"
-        print(f"  {'':<22} {'p99':<6} {zp99:>10.2f}ms {ap99:>10.2f}ms {ratio_p99:>8.2f}x {marker_99}")
+            for a, b in ratio_pairs:
+                val_a = results_for_key[a].get(metric, 0)
+                val_b = results_for_key[b].get(metric, 0)
+                ratio_text, marker = _ratio_str(val_a, val_b, higher_is_better)
+                row += f"  {ratio_text} {marker}"
+
+            print(row)
+
         print()
 
-    print("─" * 85)
+    width = 60 + 14 * len(targets) + 14 * len(ratio_pairs)
+    print("─" * width)
     print("  ▲ = ZMQ wins (higher throughput or lower latency)")
-    print("  ▼ = AutoMQ wins")
-    print("  Ratio: throughput = ZMQ/AutoMQ (>1 = ZMQ faster)")
-    print("         latency   = ZMQ/AutoMQ (<1 = ZMQ faster)")
-    print("─" * 85)
+    print("  ▼ = Other system wins")
+    print("  Ratio: throughput = ZMQ/other  (>1 = ZMQ faster)")
+    print("         latency   = ZMQ/other  (<1 = ZMQ faster)")
+    print("─" * width)
 
 def main():
-    parser = argparse.ArgumentParser(description="Benchmark: ZMQ vs AutoMQ")
-    parser.add_argument("--target", choices=["zmq", "automq", "both"], default="both",
-                       help="Which system to benchmark (default: both)")
+    parser = argparse.ArgumentParser(
+        description="Benchmark: ZMQ vs Apache Kafka vs AutoMQ",
+        epilog="Examples:\n"
+               "  %(prog)s                        # 3-way comparison\n"
+               "  %(prog)s --target kafka          # Kafka only\n"
+               "  %(prog)s --target zmq,kafka      # ZMQ vs Kafka\n"
+               "  %(prog)s --target zmq,automq     # ZMQ vs AutoMQ (original)\n",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    parser.add_argument(
+        "--target",
+        default="all",
+        help="Comma-separated list of targets: zmq, kafka, automq, or 'all' (default: all)",
+    )
     args = parser.parse_args()
 
-    zmq_results = None
-    automq_results = None
-
-    if args.target in ("zmq", "both"):
-        if args.target == "both":
-            compose_down(ZMQ_COMPOSE, "ZMQ")
-            time.sleep(2)
-            if not compose_up(ZMQ_COMPOSE, "ZMQ", wait_secs=15):
-                print("  FATAL: ZMQ cluster failed to start")
+    # Parse target list
+    if args.target == "all" or args.target == "both":
+        targets = list(ALL_TARGETS)
+    else:
+        targets = [t.strip() for t in args.target.split(",")]
+        for t in targets:
+            if t not in ALL_TARGETS:
+                print(f"  ERROR: Unknown target '{t}'. Valid targets: {', '.join(ALL_TARGETS)}")
                 return 1
-        zmq_results = run_benchmarks("ZMQ (Zig)")
-        if args.target == "both":
-            compose_down(ZMQ_COMPOSE, "ZMQ")
+
+    manage_docker = len(targets) > 1
+    all_results = {}
+
+    for target in targets:
+        label = TARGET_LABELS[target]
+        compose_file = TARGET_COMPOSE[target]
+
+        if manage_docker:
+            compose_down(compose_file, label)
+            time.sleep(2)
+            wait_secs = 15
+            if not compose_up(compose_file, label, wait_secs=wait_secs):
+                print(f"  FATAL: {label} cluster failed to start")
+                return 1
+            # JVM-based systems need more startup time
+            if target in ("kafka", "automq"):
+                print(f"  {label} JVM startup takes ~30-60s, waiting...")
+
+        results = run_benchmarks(label)
+        if results:
+            all_results[target] = results
+
+        if manage_docker:
+            compose_down(compose_file, label)
             time.sleep(5)
 
-    if args.target in ("automq", "both"):
-        if args.target == "both":
-            compose_down(AUTOMQ_COMPOSE, "AutoMQ")
-            time.sleep(2)
-            if not compose_up(AUTOMQ_COMPOSE, "AutoMQ", wait_secs=15):
-                print("  FATAL: AutoMQ cluster failed to start")
-                return 1
-            # AutoMQ JVM needs more startup time
-            print("  AutoMQ JVM startup takes ~30-60s, waiting...")
-        automq_results = run_benchmarks("AutoMQ (Java)")
-        if args.target == "both":
-            compose_down(AUTOMQ_COMPOSE, "AutoMQ")
-
-    # Print individual results
-    for label, results in [("ZMQ", zmq_results), ("AutoMQ", automq_results)]:
-        if results and not (zmq_results and automq_results):
+    # Print individual results when only one target was run
+    if len(all_results) == 1:
+        for target, results in all_results.items():
+            label = TARGET_LABELS[target]
             print(f"\n{'=' * 60}")
             print(f"  {label} RESULTS")
             print(f"{'=' * 60}")
@@ -353,17 +555,16 @@ def main():
             for name, r in results.items():
                 print(f"  {name:<25} {r['throughput']:>10,.0f}/s {r['p50']:>6.2f}ms {r['p99']:>6.2f}ms")
 
-    # Print comparison
-    if zmq_results and automq_results:
-        print_comparison(zmq_results, automq_results)
+    # Print comparison when multiple targets were run
+    if len(all_results) >= 2:
+        print_comparison(all_results)
 
     # Save results
     results_file = os.path.join(PROJECT_DIR, "benchmarks", "results.json")
     saved = {"timestamp": time.strftime("%Y-%m-%d %H:%M:%S")}
-    if zmq_results:
-        saved["zmq"] = zmq_results
-    if automq_results:
-        saved["automq"] = automq_results
+    for target in ALL_TARGETS:
+        if target in all_results:
+            saved[target] = all_results[target]
     with open(results_file, "w") as f:
         json.dump(saved, f, indent=2)
     print(f"\n  Results saved to {results_file}")
