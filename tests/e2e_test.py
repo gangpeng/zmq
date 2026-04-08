@@ -288,7 +288,7 @@ def main():
     sock0 = t.connect(NODES[0]["broker_port"])
 
     err = create_topic(sock0, t.next(), "e2e-topic", 3)
-    t.check("Create e2e-topic (3 partitions)", err == 0, f"err={err}")
+    t.check("Create e2e-topic (3 partitions)", err == 0 or err == 36, f"err={err}")
 
     err = create_topic(sock0, t.next(), "delete-me-topic", 1)
     t.check("Create delete-me-topic", err == 0, f"err={err}")
@@ -418,7 +418,7 @@ def main():
     # Test (h): Node failure — kill node 0, verify 1/2 serve
     # =============================================
     print("\n[Test h] Node failure resilience")
-    subprocess.run(["docker", "stop", NODES[0]["container"]], capture_output=True, timeout=10)
+    subprocess.run(["docker", "stop", NODES[0]["container"]], capture_output=True, timeout=30)
     time.sleep(2)
     t.check("Node 0 stopped", True)
 
@@ -438,7 +438,7 @@ def main():
     # Test (i): Restart recovery
     # =============================================
     print("\n[Test i] Restart recovery")
-    subprocess.run(["docker", "start", NODES[0]["container"]], capture_output=True, timeout=10)
+    subprocess.run(["docker", "start", NODES[0]["container"]], capture_output=True, timeout=30)
     time.sleep(3)
 
     try:

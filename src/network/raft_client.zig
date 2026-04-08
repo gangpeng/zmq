@@ -41,10 +41,25 @@ pub const RaftClient = struct {
     }
 
     /// Ensure we have an active TCP connection to the peer.
+    /// Supports both numeric IPs ("127.0.0.1") and hostnames ("node0") via DNS resolution.
     fn ensureConnected(self: *RaftClient) !void {
         if (self.fd != null) return;
 
-        const addr = try std.net.Address.parseIp4(self.host, self.port);
+        // Try numeric IP first, fall back to DNS resolution for hostnames (e.g. "node0" in Docker)
+        const addr = std.net.Address.parseIp4(self.host, self.port) catch blk: {
+            const host_z = std.fmt.allocPrintZ(self.allocator, "{s}", .{self.host}) catch return error.OutOfMemory;
+            defer self.allocator.free(host_z);
+            const addr_list = std.net.getAddressList(self.allocator, host_z, self.port) catch |err| {
+                log.warn("DNS resolution failed for {s}:{d}: {}", .{ self.host, self.port, err });
+                return error.ConnectionRefused;
+            };
+            defer addr_list.deinit();
+            if (addr_list.addrs.len == 0) {
+                log.warn("No addresses found for {s}:{d}", .{ self.host, self.port });
+                return error.ConnectionRefused;
+            }
+            break :blk addr_list.addrs[0];
+        };
         const fd = try posix.socket(addr.any.family, posix.SOCK.STREAM, 0);
 
         posix.connect(fd, &addr.any, addr.getOsSockLen()) catch |err| {

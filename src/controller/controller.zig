@@ -58,14 +58,20 @@ pub const Controller = struct {
             return null;
         }
 
-        var pos: usize = 0;
-        const api_key = ser.readI16(request_bytes, &pos);
-        const api_version = ser.readI16(request_bytes, &pos);
+        // Peek at api_key and api_version to determine header version, then reset pos
+        // so RequestHeader.deserialize reads the full header from the start.
+        var peek_pos: usize = 0;
+        const api_key = ser.readI16(request_bytes, &peek_pos);
+        const api_version = ser.readI16(request_bytes, &peek_pos);
 
-        const resp_header_version: i16 = if (api_key == 18 and api_version >= 3) 1 else 0;
+        const req_header_version = header_mod.requestHeaderVersion(api_key, api_version);
+        const resp_header_version = header_mod.responseHeaderVersion(api_key, api_version);
 
-        var req_header = RequestHeader.deserialize(self.allocator, request_bytes, &pos, if (api_key == 18 and api_version >= 3) @as(i16, 2) else 1) catch {
-            log.warn("Controller: failed to parse request header", .{});
+        var pos: usize = 0; // start from beginning — deserialize reads api_key+api_version too
+        var req_header = RequestHeader.deserialize(self.allocator, request_bytes, &pos, req_header_version) catch {
+            log.warn("Controller: failed to parse request header (api_key={d} hdr_v={d} len={d})", .{
+                api_key, req_header_version, request_bytes.len,
+            });
             return null;
         };
         defer req_header.deinit(self.allocator);
