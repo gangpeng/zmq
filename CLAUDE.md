@@ -133,18 +133,11 @@ ObjectManager metadata is always updated BEFORE S3 objects are deleted. If the p
 
 | Feature | AutoMQ | ZMQ Status |
 |---------|--------|------------|
-| Streams per partition | 4 (log/tim/idx/txn) | 1 (simplified — intentional, RecordBatch is self-contained) |
-| Compaction strategies | 6 (CLEANUP, MINOR, MAJOR, V1 variants) | 3 (force-split, merge, cleanup). V1 variants not needed. |
-| Compaction analyzer | Full planning with size/dirty-byte thresholds | Time-based interval + cleanup of expired SOs |
-| KRaft metadata persistence | `voted_for` + `current_epoch` persisted | ✅ Implemented (`raft.meta` file) |
+| Streams per partition | 4 (log/tim/idx/txn) | 1 (intentional — RecordBatch is self-contained; time-index lookups scan linearly) |
+| Compaction strategies | 6 (CLEANUP, MINOR, MAJOR, V1 variants) | 3 (force-split, merge, cleanup). V1 variants handle AutoMQ-specific composite objects. |
+| Compaction analyzer | Full planning with size/dirty-byte thresholds | Time-based interval only. No adaptive scheduling. |
 | Dynamic voter changes | AddRaftVoter/RemoveRaftVoter APIs | Not implemented. Requires Raft joint consensus — very complex. |
-| Pre-vote protocol (KIP-996) | Prevents disruptive elections | ✅ Implemented (`startPreVote`, `handlePreVoteRequest`) |
-| Sticky partition assignment | Full cooperative sticky | ✅ Implemented (parses prior assignments, minimizes movement) |
-| S3 object TTL cleanup | Automatic cleanup of uncommitted objects | ✅ Implemented (orphaned key tracking + retry in `cleanupOrphans`) |
-| Compaction state persistence | Checkpoints for crash recovery | ✅ Implemented (compaction journal: `journalBegin`/`journalComplete`) |
-| Multi-part S3 upload | For large objects | Implemented but limited |
-| Idempotent compaction | Re-entrant, dedup on replay | ✅ Implemented (`hasStreamObjectCovering` dedup check) |
-| RaftLog snapshotting | Log truncation + InstallSnapshot | ✅ Implemented (`takeSnapshot`, `truncateBefore`, periodic in election loop) |
+| Multi-part S3 upload | Chunked uploads for large objects | Implemented but limited |
 
 ## File organization
 
