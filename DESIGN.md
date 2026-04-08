@@ -721,8 +721,12 @@ The Zig KRaft implementation (`src/raft/state.zig`, `src/raft/election_loop.zig`
 
 **Consistency Guarantees:**
 - **Linearizable writes**: All metadata changes go through the leader, serialized by offset in `RaftLog`
-- **Majority commit**: `commit_index` only advances to offset N when a majority have `match_index >= N`
-- **Vote safety**: Each voter grants at most one vote per epoch (`voted_for` field); candidate's log must be at least as up-to-date (epoch + offset comparison in `handleVoteRequest()`)
+- **Majority commit**: `commit_index` only advances to offset N when a majority have `match_index >= N` AND the entry at N has the current epoch (Raft Figure 8 safety)
+- **Vote safety**: Each voter grants at most one vote per epoch (`voted_for` field, persisted to `raft.meta`); candidate's log must be at least as up-to-date (epoch + offset comparison in `handleVoteRequest()`)
+- **Pre-vote (KIP-996)**: Before starting a real election, candidates run `startPreVote()` to check if a majority agrees the leader is unreachable. Prevents partitioned nodes from disrupting the cluster by incrementing the epoch unnecessarily.
+- **Persistence**: `current_epoch` and `voted_for` are persisted to `{data_dir}/raft.meta` before every vote grant or epoch change. Prevents double-voting after crash-restart.
+- **AppendEntries validation**: Followers validate `prev_log_offset` and `prev_log_epoch` match before accepting entries. Conflicting entries are truncated via `RaftLog.truncateFrom()`.
+- **Snapshotting**: `takeSnapshot()` periodically truncates committed log entries (threshold: 1000 entries). Snapshot metadata persisted to `{data_dir}/snapshot.meta`.
 
 **Controller Failover:**
 
@@ -731,13 +735,19 @@ T=0:   Controller 0 is leader (current_epoch=5)
 T=10:  Controller 0 crashes
 T=11:  ElectionTimer expires on Controller 1 (randomized 1.5-3s)
        (ElectionTimer.isExpired() returns true)
-T=11:  Controller 1 starts election:
+T=11:  Controller 1 starts pre-vote (KIP-996):
+         - startPreVote(): tentative epoch=6, does NOT increment current_epoch
+         - broadcastPreVoteRequest() to peers
+         - Controller 2 grants pre-vote (its timer also expired, no leader heartbeat)
+         - Majority pre-vote granted → proceed to real election
+T=11:  Controller 1 starts real election:
          - RaftState.startElection(): epoch=6, role=candidate, voted_for=self
+         - persistRaftMeta(): persist epoch=6 + voted_for to raft.meta
          - RaftClientPool.broadcastVoteRequest() sends Vote RPCs (API 52)
            to all peers
          - Controller 2 receives Vote(epoch=6):
              handleVoteRequest(): candidate_epoch(6) > current_epoch(5)
-             → grant vote, become follower at epoch=6
+             → grant vote, persist voted_for, become follower at epoch=6
          - Controller 1 gets 2/3 votes → majority reached
          - RaftState.becomeLeader(): role=leader, init next_index/match_index
 T=11:  Controller 1 becomes leader:
@@ -763,20 +773,24 @@ MetadataImage (in-memory, populated from Raft log and broker state)
 └── epoch: i64  (metadata version, incremented on changes)
 ```
 
-On startup, `RaftState.loadPersistedLog()` replays entries from `{data_dir}/raft.log` (format: `epoch(8B) + offset(8B) + len(4B) + data(lenB)`), recovering the full Raft log state. The `MetadataImage` is then rebuilt from the replayed log and broker registration.
+On startup, `RaftState.loadPersistedLog()` first restores `current_epoch` and `voted_for` from `{data_dir}/raft.meta`, then replays entries from `{data_dir}/raft.log` (format: `epoch(8B) + offset(8B) + len(4B) + data(lenB)`), recovering the full Raft log state. Snapshot metadata is loaded from `{data_dir}/snapshot.meta` to skip truncated entries. The `MetadataImage` is then rebuilt from the replayed log and broker registration.
 
 ### Zig KRaft Implementation Details
 
 | Component | File | Key Structures |
 |-----------|------|---------------|
 | **Raft state machine** | `src/raft/state.zig` | `RaftState` (role: unattached/candidate/leader/follower/resigned) |
-| **Vote handling** | `src/raft/state.zig` | `handleVoteRequest()` — epoch comparison, log up-to-date check, one-vote-per-epoch |
-| **Election loop** | `src/raft/election_loop.zig` | Background thread with `ElectionTimer` (1.5–3s randomized), vote counting |
-| **RPC transport** | `src/network/raft_client.zig` | `RaftClientPool` — TCP connections to all peers for Vote (52) and BeginQuorumEpoch (53) |
-| **Log persistence** | `src/raft/state.zig` | `persistEntry()` appends to `raft.log`; `loadPersistedLog()` replays on restart |
-| **Commit tracking** | `src/raft/state.zig` | `updateCommitIndex()` — median of match_index across majority |
+| **Vote handling** | `src/raft/state.zig` | `handleVoteRequest()` — epoch comparison, log up-to-date check, one-vote-per-epoch, persisted `voted_for` |
+| **Pre-vote (KIP-996)** | `src/raft/state.zig` | `startPreVote()`, `handlePreVoteRequest()` — tentative election without epoch increment |
+| **Election loop** | `src/raft/election_loop.zig` | Background thread: pre-vote → election → heartbeats → replication → snapshot |
+| **RPC transport** | `src/network/raft_client.zig` | `RaftClientPool` — TCP connections for Vote (52), BeginQuorumEpoch (53), AppendEntries |
+| **Log persistence** | `src/raft/state.zig` | `persistEntry()` → `raft.log`; `persistRaftMeta()` → `raft.meta` (epoch + voted_for) |
+| **Commit tracking** | `src/raft/state.zig` | `updateCommitIndex()` — median of match_index across majority, epoch check (Figure 8) |
+| **AppendEntries** | `src/raft/state.zig` | `handleAppendEntries()` — prev_log validation, conflict truncation, commit advancement |
+| **Snapshotting** | `src/raft/state.zig` | `takeSnapshot()`, `truncateBefore()` — periodic log compaction (>1000 entries) |
+| **Dynamic membership** | `src/raft/state.zig` | `proposeAddVoter()`/`proposeRemoveVoter()` — single-server changes via log entries (KIP-853) |
 | **Metadata view** | `src/raft/state.zig` | `MetadataImage` — topics, brokers, partitions via `StringHashMap`/`AutoHashMap` |
-| **Multi-node verified** | — | 3-node cluster successfully elects leader through Raft vote counting |
+| **Controller handlers** | `src/controller/controller.zig` | APIs 52-55 (KRaft), 62-63 (broker lifecycle), 71-72 (voter changes) |
 
 ---
 
@@ -798,25 +812,26 @@ On startup, `RaftState.loadPersistedLog()` replays entries from `{data_dir}/raft
 │  │  Broker lifecycle:              │  │  │  PartitionStore           │  │
 │  │   BrokerRegistration (62)       │  │  │   ├─ LogCache (FIFO)     │  │
 │  │   BrokerHeartbeat (63)          │  │  │   ├─ S3BlockCache (LRU)  │  │
-│  │                                 │  │  │   ├─ S3WalBatcher        │  │
-│  │  ┌─────────────┐ ┌───────────┐ │  │  │   │   (epoch-fenced)     │  │
-│  │  │ RaftState    │ │ Broker    │ │  │  │   └─ ObjectManager       │  │
-│  │  │ (owned)      │ │ Registry │ │  │  │       (SSO/SO registry)   │  │
-│  │  └──────┬───────┘ └──────────┘ │  │  │                           │  │
-│  └─────────┼───────────────────────┘  │  │  ┌─────────────────────┐ │  │
-│            │ ptr                      │  │  │ CompactionManager   │ │  │
-│            └──────────────────────────┼──│  │ (write-before-delete│ │  │
-│                                       │  │  │  crash-safe)        │ │  │
-│  Background Tasks                     │  │  └─────────────────────┘ │  │
-│  ┌─────────────────────────────────┐  │  └───────────────────────────┘  │
-│  │ ElectionLoop (100ms poll)       │  │                                  │
-│  │ FailoverController (30s timeout)│  │  Security                        │
-│  │ AutoBalancer (5min check)       │  │  ┌─────────────────────────┐    │
-│  │ MetricsServer (:9090)           │  │  │ SASL/PLAIN+SCRAM-256   │    │
-│  │ MetadataClient (broker-only)    │  │  │ ACL authorizer          │    │
-│  └─────────────────────────────────┘  │  │ WAL epoch fencing       │    │
-│                                       │  │ Controller lease fencing│    │
-│                                       │  └─────────────────────────┘    │
+│  │  Voter membership:              │  │  │   ├─ S3WalBatcher        │  │
+│  │   AddRaftVoter (71)             │  │  │   │   (epoch-fenced)     │  │
+│  │   RemoveRaftVoter (72)          │  │  │   └─ ObjectManager       │  │
+│  │                                 │  │  │       (SSO/SO registry)   │  │
+│  │  ┌─────────────┐ ┌───────────┐ │  │  │                           │  │
+│  │  │ RaftState    │ │ Broker    │ │  │  │  ┌─────────────────────┐ │  │
+│  │  │ (owned)      │ │ Registry │ │  │  │  │ CompactionManager   │ │  │
+│  │  └──────┬───────┘ └──────────┘ │  │  │  │ (write-before-delete│ │  │
+│  └─────────┼───────────────────────┘  │  │  │  crash-safe)        │ │  │
+│            │ ptr                      │  │  └─────────────────────┘ │  │
+│            └──────────────────────────┼──┘                              │
+│                                       │                                  │
+│  Background Tasks                     │  Security                        │
+│  ┌─────────────────────────────────┐  │  ┌─────────────────────────┐    │
+│  │ ElectionLoop (100ms poll)       │  │  │ SASL/PLAIN+SCRAM-256   │    │
+│  │ FailoverController (30s timeout)│  │  │ ACL authorizer          │    │
+│  │ AutoBalancer (5min check)       │  │  │ WAL epoch fencing       │    │
+│  │ MetricsServer (:9090)           │  │  │ Controller lease fencing│    │
+│  │ MetadataClient (broker-only)    │  │  └─────────────────────────┘    │
+│  └─────────────────────────────────┘  │                                  │
 └───────────────────────┬───────────────┴──────────────────────────────────┘
                         │
                         ▼
@@ -840,5 +855,5 @@ On startup, `RaftState.loadPersistedLog()` replays entries from `{data_dir}/raft
 | 6 | **Configuration** | 20+ tunable knobs via CLI and `ConfigFile`: WAL, cache, compaction, roles, S3 |
 | 7 | **Exactly-Once** | `TxnCoordinator`: 2PC transactions with control batch markers, producer epoch fencing |
 | 8 | **Consumer Groups** | `GroupCoordinator`: state machine with leader-validated SyncGroup, rebalance signaling |
-| 9 | **Dual Roles** | `--process-roles controller\|broker\|controller,broker` — fixed controller quorum, dynamic broker scaling |
-| 10 | **Crash Safety** | Compaction uses write-before-delete. Merge aborts on partial read. S3 delete failures logged, not fatal. |
+| 9 | **Dual Roles** | `--process-roles controller\|broker\|controller,broker` — dynamic broker scaling + dynamic voter changes (KIP-853) |
+| 10 | **Crash Safety** | Compaction write-before-delete. Merge aborts on partial read. Raft meta persisted. S3 orphan cleanup. |

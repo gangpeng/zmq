@@ -16,7 +16,7 @@ zig build -Doptimize=.ReleaseFast  # optimized build
 
 Single-file tests: `zig test src/raft/state.zig`
 
-The codebase currently has **426 unit tests** across 50+ files covering Raft consensus, consumer groups, compaction, failover, storage, protocol serialization, and more.
+The codebase currently has **436 unit tests** across 50+ files covering Raft consensus, consumer groups, compaction, failover, storage, protocol serialization, and more.
 
 ## Lessons learned during initial port
 
@@ -96,6 +96,7 @@ See `DESIGN.md` for the full architecture with component diagram. Key points:
 - **Snapshotting**: `takeSnapshot()` truncates committed log entries periodically (>1000 entries). Metadata persisted to `snapshot.meta`.
 - **Commit safety**: `updateCommitIndex()` only advances if the entry at the commit offset has the current epoch (Raft Figure 8).
 - **AppendEntries validation**: `handleAppendEntries()` validates prev_log match, truncates conflicting entries, advances follower commit_index.
+- **Dynamic voter changes**: `proposeAddVoter()`/`proposeRemoveVoter()` append config change entries to the Raft log. Applied on commit via `applyCommittedConfigs()`. One change at a time (single-server approach, KIP-853).
 
 ### Data flow
 ```
@@ -145,7 +146,7 @@ src/
 ├── roles.zig                   # ProcessRoles (controller/broker/combined)
 ├── config.zig                  # Properties file parser
 ├── controller/
-│   ├── controller.zig          # KRaft controller, API dispatch (52-55, 62, 63)
+│   ├── controller.zig          # KRaft controller, API dispatch (52-55, 62, 63, 71, 72)
 │   ├── broker_registry.zig     # Live broker tracking, epoch assignment, eviction
 │   └── metadata_client.zig     # Broker→controller: discover, register, heartbeat
 ├── broker/
