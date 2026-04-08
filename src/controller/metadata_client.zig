@@ -141,7 +141,7 @@ pub const MetadataClient = struct {
             log.warn("Failed to discover controller leader, retrying in {d}ms (attempt {d})", .{
                 backoff, attempt,
             });
-            std.time.sleep(backoff * std.time.ns_per_ms);
+            std.time.sleep(backoff * 1_000_000);
         }
     }
 

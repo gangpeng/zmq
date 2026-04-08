@@ -64,7 +64,7 @@ pub const Controller = struct {
 
         const resp_header_version: i16 = if (api_key == 18 and api_version >= 3) 1 else 0;
 
-        const req_header = RequestHeader.deserialize(self.allocator, request_bytes, &pos, if (api_key == 18 and api_version >= 3) @as(i16, 2) else 1) catch {
+        var req_header = RequestHeader.deserialize(self.allocator, request_bytes, &pos, if (api_key == 18 and api_version >= 3) @as(i16, 2) else 1) catch {
             log.warn("Controller: failed to parse request header", .{});
             return null;
         };
