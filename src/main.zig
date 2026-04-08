@@ -193,30 +193,33 @@ pub fn main() !void {
     // ═══════════════════════════════════════════════════════════
     // CONTROLLER COMPONENTS (if controller role)
     // ═══════════════════════════════════════════════════════════
-    var controller: ?Controller = null;
+    var controller: Controller = undefined;
+    var controller_active = false;
     var raft_pool: ?RaftClientPool = null;
 
     if (process_roles.is_controller) {
         controller = Controller.init(alloc, node_id, cluster_id);
+        controller_active = true;
 
         if (voters_str == null) {
             // Single-node mode: register self as the only voter
-            controller.?.raft_state.addVoter(node_id) catch {};
+            controller.raft_state.addVoter(node_id) catch {};
         } else {
             // Multi-node mode: parse voters and create RPC pool
             raft_pool = RaftClientPool.init(alloc);
-            parseAndRegisterVoters(&controller.?.raft_state, voters_str.?, &raft_pool.?);
+            parseAndRegisterVoters(&controller.raft_state, voters_str.?, &raft_pool.?);
         }
 
-        handler_routing.setGlobalController(&controller.?);
+        handler_routing.setGlobalController(&controller);
     }
-    defer if (controller) |*c| c.deinit();
+    defer if (controller_active) controller.deinit();
     defer if (raft_pool) |*p| p.deinit();
 
     // ═══════════════════════════════════════════════════════════
     // BROKER COMPONENTS (if broker role)
     // ═══════════════════════════════════════════════════════════
-    var broker: ?Broker = null;
+    var broker: Broker = undefined;
+    var broker_active = false;
 
     if (process_roles.is_broker) {
         broker = Broker.initWithConfig(alloc, node_id, port, .{
@@ -232,63 +235,66 @@ pub fn main() !void {
             .s3_block_cache_size = s3_block_cache_size,
             .compaction_interval_ms = compaction_interval,
         });
+        broker_active = true;
 
         // In combined mode, give broker a pointer to controller's RaftState
-        if (controller) |*c| {
-            broker.?.setRaftState(&c.raft_state);
+        if (controller_active) {
+            broker.setRaftState(&controller.raft_state);
         }
 
-        broker.?.open() catch |err| {
+        broker.open() catch |err| {
             try stdout.print("  ERROR: Failed to open storage: {}\n", .{err});
             return;
         };
 
-        handler.setGlobalBroker(&broker.?);
-        handler_routing.setGlobalBroker(&broker.?);
+        handler.setGlobalBroker(&broker);
+        handler_routing.setGlobalBroker(&broker);
     }
-    defer if (broker) |*b| {
+    defer if (broker_active) {
         log.info("Shutting down broker (persisting metadata)...", .{});
-        b.deinit();
+        broker.deinit();
     };
 
     // ═══════════════════════════════════════════════════════════
     // METADATA CLIENT (broker-only mode)
     // ═══════════════════════════════════════════════════════════
-    var metadata_client: ?MetadataClient = null;
+    var metadata_client: MetadataClient = undefined;
+    var metadata_client_active = false;
 
     if (process_roles.is_broker and !process_roles.is_controller) {
         metadata_client = MetadataClient.init(
             alloc, node_id, advertised_host, port,
-            &broker.?.cached_leader_epoch,
-            &broker.?.is_fenced_by_controller,
-            &broker.?.last_successful_heartbeat_ms,
+            &broker.cached_leader_epoch,
+            &broker.is_fenced_by_controller,
+            &broker.last_successful_heartbeat_ms,
             &global_shutdown,
         );
+        metadata_client_active = true;
         if (voters_str) |vs| {
-            parseVotersIntoMetadataClient(&metadata_client.?, vs);
+            parseVotersIntoMetadataClient(&metadata_client, vs);
         }
     }
-    defer if (metadata_client) |*mc| mc.deinit();
+    defer if (metadata_client_active) metadata_client.deinit();
 
     // ═══════════════════════════════════════════════════════════
     // BACKGROUND THREADS
     // ═══════════════════════════════════════════════════════════
 
     // Election loop (controller or combined mode only)
-    var election_state: ?ElectionLoop = null;
+    var election_state: ElectionLoop = undefined;
     var election_thread: ?std.Thread = null;
-    if (process_roles.is_controller) {
+    if (controller_active) {
         election_state = ElectionLoop{
-            .raft_state = &controller.?.raft_state,
+            .raft_state = &controller.raft_state,
             .should_stop = &global_shutdown,
             .raft_client_pool = if (raft_pool != null) &(raft_pool.?) else null,
         };
-        if (election_state.?.raft_client_pool != null) {
+        if (election_state.raft_client_pool != null) {
             log.info("Election loop: RaftClientPool configured with peers", .{});
         } else {
             log.info("Election loop: single-node mode (no RaftClientPool)", .{});
         }
-        election_thread = std.Thread.spawn(.{}, ElectionLoop.run, .{&election_state.?}) catch |err| {
+        election_thread = std.Thread.spawn(.{}, ElectionLoop.run, .{&election_state}) catch |err| {
             try stdout.print("  WARNING: Failed to start election loop: {}\n", .{err});
             return;
         };
@@ -300,8 +306,8 @@ pub fn main() !void {
 
     // MetadataClient loop (broker-only mode)
     var mc_thread: ?std.Thread = null;
-    if (metadata_client != null) {
-        mc_thread = std.Thread.spawn(.{}, MetadataClient.run, .{&metadata_client.?}) catch |err| {
+    if (metadata_client_active) {
+        mc_thread = std.Thread.spawn(.{}, MetadataClient.run, .{&metadata_client}) catch |err| {
             try stdout.print("  WARNING: Failed to start metadata client: {}\n", .{err});
             return;
         };
@@ -313,8 +319,8 @@ pub fn main() !void {
 
     // Metrics server (broker mode only — controller-only doesn't need Kafka metrics)
     var metrics_thread: ?std.Thread = null;
-    if (broker) |*b| {
-        var metrics_server = MetricsServer.init(alloc, metrics_port, &b.metrics);
+    if (broker_active) {
+        var metrics_server = MetricsServer.init(alloc, metrics_port, &broker.metrics);
         global_metrics_server = &metrics_server;
         metrics_thread = std.Thread.spawn(.{}, MetricsServer.serve, .{&metrics_server}) catch null;
     }
