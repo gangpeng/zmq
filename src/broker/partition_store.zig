@@ -188,7 +188,6 @@ pub const PartitionStore = struct {
         if (self.s3_client != null) {
             self.s3_storage = null;
         }
-        }
     }
 
     pub fn deinit(self: *PartitionStore) void {
