@@ -250,6 +250,9 @@ pub fn main() !void {
             .compaction_interval_ms = compaction_interval,
         });
         broker = brk;
+        // Re-wire internal pointers that became stale after the struct copy
+        // (S3Storage holds a pointer to S3Client which moved from stack to heap)
+        brk.store.fixupInternalPointers();
         try stdout.print("  DEBUG: broker created, setting raft state...\n", .{});
 
         if (controller) |ctrl| {

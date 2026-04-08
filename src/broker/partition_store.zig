@@ -166,6 +166,17 @@ pub const PartitionStore = struct {
         }
     }
 
+    /// Re-wire internal pointers after the struct has been moved/copied.
+    /// Must be called after assigning a PartitionStore to a new location
+    /// (e.g., heap allocation via `ptr.* = initWithConfig(...)`).
+    /// The S3Storage holds a pointer to the S3Client inside this struct;
+    /// after a copy, that pointer is stale and must be updated.
+    pub fn fixupInternalPointers(self: *PartitionStore) void {
+        if (self.s3_client != null and self.s3_storage != null) {
+            self.s3_storage = S3Storage.initReal(self.allocator, &self.s3_client.?);
+        }
+    }
+
     pub fn deinit(self: *PartitionStore) void {
         var it = self.partitions.iterator();
         while (it.next()) |entry| {
