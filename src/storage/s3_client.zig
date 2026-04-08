@@ -311,8 +311,15 @@ pub const S3Client = struct {
 
     /// Upload a large object using S3 multipart upload.
     /// Automatically splits data into 5MB parts.
+    ///
+    /// Improvements over naive multipart:
+    /// - Dynamic ETags list (no fixed-size array limit)
+    /// - Dynamic response buffers (handles large XML responses)
+    /// - Retries individual parts up to 3 times before aborting
+    /// - Calls AbortMultipartUpload on failure to avoid orphaned parts
     pub fn putObjectMultipart(self: *S3Client, key: []const u8, data: []const u8) !void {
         const PART_SIZE: usize = 5 * 1024 * 1024; // 5MB minimum part size
+        const MAX_PART_RETRIES: u32 = 3;
 
         // If data is small enough, use regular PutObject
         if (data.len <= PART_SIZE) {
@@ -323,66 +330,105 @@ pub const S3Client = struct {
         defer self.allocator.free(path);
 
         // Step 1: Initiate multipart upload
-        const init_path = try std.fmt.allocPrint(self.allocator, "{s}?uploads", .{path});
-        defer self.allocator.free(init_path);
+        const init_resp = try self.allocator.alloc(u8, 8192);
+        defer self.allocator.free(init_resp);
 
-        var resp_buf: [4096]u8 = undefined;
-        const init_status = try self.httpRequest("POST", init_path, "uploads", null, null, &resp_buf);
+        const init_status = try self.httpRequest("POST", path, "uploads", null, null, init_resp);
         if (init_status < 200 or init_status >= 300) return error.S3MultipartInitFailed;
 
-        // Parse UploadId from XML response (simplified)
+        // Parse UploadId from XML response
         const upload_id = blk: {
-            const resp_str = resp_buf[0..];
-            const id_start = std.mem.indexOf(u8, resp_str, "<UploadId>") orelse return error.S3MultipartInitFailed;
-            const id_end = std.mem.indexOf(u8, resp_str[id_start..], "</UploadId>") orelse return error.S3MultipartInitFailed;
-            break :blk resp_str[id_start + 10 .. id_start + id_end];
+            const id_start = std.mem.indexOf(u8, init_resp, "<UploadId>") orelse return error.S3MultipartInitFailed;
+            const search_from = id_start + 10;
+            const id_end = std.mem.indexOf(u8, init_resp[search_from..], "</UploadId>") orelse return error.S3MultipartInitFailed;
+            break :blk try self.allocator.dupe(u8, init_resp[search_from .. search_from + id_end]);
         };
+        defer self.allocator.free(upload_id);
 
-        // Step 2: Upload parts
+        // Step 2: Upload parts with retry and abort-on-failure
+        const num_parts = (data.len + PART_SIZE - 1) / PART_SIZE;
+
+        const PartEtag = struct { part: u32, etag: []u8 };
+        var etags = std.ArrayList(PartEtag).init(self.allocator);
+        defer {
+            for (etags.items) |e| self.allocator.free(e.etag);
+            etags.deinit();
+        }
+
+        // Use errdefer to abort on any failure after initiation
+        errdefer self.abortMultipartUpload(path, upload_id);
+
         var part_number: u32 = 1;
         var offset: usize = 0;
-        var etags: [2048]struct { part: u32, etag: []const u8 } = undefined;
-        var num_parts: usize = 0;
 
         while (offset < data.len) {
             const end = @min(offset + PART_SIZE, data.len);
             const part_data = data[offset..end];
 
-            const part_path = try std.fmt.allocPrint(self.allocator, "{s}?partNumber={d}&uploadId={s}", .{ path, part_number, upload_id });
-            defer self.allocator.free(part_path);
-
             const query = try std.fmt.allocPrint(self.allocator, "partNumber={d}&uploadId={s}", .{ part_number, upload_id });
             defer self.allocator.free(query);
 
-            var part_resp: [4096]u8 = undefined;
-            const part_status = try self.httpRequest("PUT", path, query, part_data, null, &part_resp);
-            if (part_status < 200 or part_status >= 300) return error.S3PartUploadFailed;
+            // Retry individual part uploads
+            var part_succeeded = false;
+            var attempt: u32 = 0;
+            while (attempt < MAX_PART_RETRIES) : (attempt += 1) {
+                const part_resp = self.allocator.alloc(u8, 4096) catch break;
+                defer self.allocator.free(part_resp);
 
-            // Parse actual ETag from response headers
-            const etag_str = blk: {
-                const resp_str = part_resp[0..];
-                if (std.mem.indexOf(u8, resp_str, "ETag: ")) |etag_start| {
-                    const etag_value_start = etag_start + 6;
-                    if (std.mem.indexOf(u8, resp_str[etag_value_start..], "\r\n")) |etag_end| {
-                        break :blk resp_str[etag_value_start .. etag_value_start + etag_end];
+                const part_status = self.httpRequest("PUT", path, query, part_data, null, part_resp) catch |err| {
+                    log.warn("Part {d}/{d} upload failed (attempt {d}/{d}): {}", .{
+                        part_number, num_parts, attempt + 1, MAX_PART_RETRIES, err,
+                    });
+                    if (attempt + 1 < MAX_PART_RETRIES) {
+                        const delay_ms: u64 = @as(u64, 200) << @intCast(attempt);
+                        std.time.sleep(delay_ms * std.time.ns_per_ms);
                     }
+                    continue;
+                };
+
+                if (part_status < 200 or part_status >= 300) {
+                    log.warn("Part {d}/{d} upload returned status {d} (attempt {d}/{d})", .{
+                        part_number, num_parts, part_status, attempt + 1, MAX_PART_RETRIES,
+                    });
+                    if (attempt + 1 < MAX_PART_RETRIES) {
+                        const delay_ms: u64 = @as(u64, 200) << @intCast(attempt);
+                        std.time.sleep(delay_ms * std.time.ns_per_ms);
+                    }
+                    continue;
                 }
-                // Fallback: use part number as placeholder
-                break :blk "";
-            };
-            etags[num_parts] = .{ .part = part_number, .etag = etag_str };
-            num_parts += 1;
+
+                // Parse ETag from response headers
+                const etag_owned = blk: {
+                    if (std.mem.indexOf(u8, part_resp, "ETag: ")) |etag_start| {
+                        const etag_value_start = etag_start + 6;
+                        if (std.mem.indexOf(u8, part_resp[etag_value_start..], "\r\n")) |etag_end| {
+                            break :blk self.allocator.dupe(u8, part_resp[etag_value_start .. etag_value_start + etag_end]) catch break :blk self.allocator.dupe(u8, "") catch break;
+                        }
+                    }
+                    break :blk self.allocator.dupe(u8, "") catch break;
+                };
+                try etags.append(.{ .part = part_number, .etag = etag_owned });
+
+                part_succeeded = true;
+                break;
+            }
+
+            if (!part_succeeded) {
+                log.err("Part {d}/{d} failed after {d} retries, aborting multipart upload for {s}", .{
+                    part_number, num_parts, MAX_PART_RETRIES, key,
+                });
+                return error.S3PartUploadFailed;
+            }
 
             offset = end;
             part_number += 1;
         }
 
         // Step 3: Complete multipart upload
-        // Build XML body with part ETags
         var complete_body = std.ArrayList(u8).init(self.allocator);
         defer complete_body.deinit();
         try complete_body.appendSlice("<CompleteMultipartUpload>");
-        for (etags[0..num_parts]) |etag| {
+        for (etags.items) |etag| {
             const part_xml = try std.fmt.allocPrint(self.allocator, "<Part><PartNumber>{d}</PartNumber><ETag>\"{s}\"</ETag></Part>", .{ etag.part, etag.etag });
             defer self.allocator.free(part_xml);
             try complete_body.appendSlice(part_xml);
@@ -392,14 +438,38 @@ pub const S3Client = struct {
         const complete_query = try std.fmt.allocPrint(self.allocator, "uploadId={s}", .{upload_id});
         defer self.allocator.free(complete_query);
 
-        var complete_resp: [4096]u8 = undefined;
-        const complete_status = try self.httpRequest("POST", path, complete_query, complete_body.items, null, &complete_resp);
-        if (complete_status < 200 or complete_status >= 300) return error.S3MultipartCompleteFailed;
+        const complete_resp = try self.allocator.alloc(u8, 8192);
+        defer self.allocator.free(complete_resp);
+
+        const complete_status = try self.httpRequest("POST", path, complete_query, complete_body.items, null, complete_resp);
+        if (complete_status < 200 or complete_status >= 300) {
+            log.err("CompleteMultipartUpload failed with status {d} for {s}", .{ complete_status, key });
+            return error.S3MultipartCompleteFailed;
+        }
 
         self.put_count += 1;
         self.bytes_uploaded += data.len;
 
         log.info("Multipart upload completed: {s} ({d} parts, {d} bytes)", .{ key, num_parts, data.len });
+    }
+
+    /// Abort a multipart upload to clean up partially uploaded parts.
+    /// Called when part upload fails to prevent orphaned S3 parts.
+    fn abortMultipartUpload(self: *S3Client, path: []const u8, upload_id: []const u8) void {
+        const query = std.fmt.allocPrint(self.allocator, "uploadId={s}", .{upload_id}) catch return;
+        defer self.allocator.free(query);
+
+        var resp_buf: [1024]u8 = undefined;
+        const status = self.httpRequest("DELETE", path, query, null, null, &resp_buf) catch |err| {
+            log.warn("Failed to abort multipart upload: {}", .{err});
+            return;
+        };
+
+        if (status >= 200 and status < 300) {
+            log.info("Aborted multipart upload for {s}", .{path});
+        } else {
+            log.warn("AbortMultipartUpload returned status {d} for {s}", .{ status, path });
+        }
     }
 
     /// Connection with reuse support (keep-alive pooling).
