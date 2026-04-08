@@ -497,7 +497,10 @@ pub const S3Client = struct {
         // Try numeric IP first, fall back to DNS resolution for hostnames (e.g. "minio" in Docker)
         const address = net.Address.parseIp4(self.host, self.port) catch blk: {
             // Hostname — resolve via system DNS (getaddrinfo)
-            const addr_list = try net.getAddressList(self.allocator, self.host, self.port);
+            // Allocate a null-terminated copy for the C FFI call
+            const host_z = std.fmt.allocPrintZ(self.allocator, "{s}", .{self.host}) catch return error.OutOfMemory;
+            defer self.allocator.free(host_z);
+            const addr_list = net.getAddressList(self.allocator, host_z, self.port) catch return error.UnknownHostName;
             defer addr_list.deinit();
             if (addr_list.addrs.len == 0) return error.UnknownHostName;
             break :blk addr_list.addrs[0];

@@ -149,11 +149,17 @@ pub const PartitionStore = struct {
                 log.warn("WAL recovery failed: {}", .{err});
             };
         }
-        // Ensure S3 bucket exists
+        // Ensure S3 bucket exists (retry a few times for container startup)
         if (self.s3_client) |*client| {
-            client.ensureBucket() catch |err| {
-                log.warn("Failed to create S3 bucket: {}", .{err});
-            };
+            var s3_attempt: usize = 0;
+            while (s3_attempt < 5) : (s3_attempt += 1) {
+                client.ensureBucket() catch |err| {
+                    log.warn("Failed to create S3 bucket (attempt {d}/5): {}", .{ s3_attempt + 1, err });
+                    std.time.sleep(1000 * 1_000_000); // 1 second
+                    continue;
+                };
+                break;
+            }
         }
     }
 
