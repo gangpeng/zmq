@@ -251,8 +251,13 @@ pub fn main() !void {
         });
         broker = brk;
         // Re-wire internal pointers that became stale after the struct copy
-        // (S3Storage holds a pointer to S3Client which moved from stack to heap)
+        // (PartitionStore holds pointers to ObjectManager/S3Client inside Broker,
+        // but those moved from initWithConfig's stack frame to the heap)
         brk.store.fixupInternalPointers();
+        brk.store.setObjectManager(&brk.object_manager);
+        if (brk.compaction_manager) |*cm| {
+            cm.object_manager = &brk.object_manager;
+        }
         try stdout.print("  DEBUG: broker created, setting raft state...\n", .{});
 
         if (controller) |ctrl| {
