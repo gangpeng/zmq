@@ -233,7 +233,9 @@ pub fn main() !void {
     var broker: ?*Broker = null;
 
     if (process_roles.is_broker) {
+        try stdout.print("  DEBUG: alloc.create(Broker)...\n", .{});
         const brk = try alloc.create(Broker);
+        try stdout.print("  DEBUG: Broker.initWithConfig...\n", .{});
         brk.* = Broker.initWithConfig(alloc, node_id, port, .{
             .data_dir = data_dir,
             .s3_endpoint_host = s3_host,
@@ -248,18 +250,22 @@ pub fn main() !void {
             .compaction_interval_ms = compaction_interval,
         });
         broker = brk;
+        try stdout.print("  DEBUG: broker created, setting raft state...\n", .{});
 
         if (controller) |ctrl| {
             brk.setRaftState(&ctrl.raft_state);
         }
+        try stdout.print("  DEBUG: opening broker storage...\n", .{});
 
         brk.open() catch |err| {
             try stdout.print("  ERROR: Failed to open storage: {}\n", .{err});
             return;
         };
+        try stdout.print("  DEBUG: broker opened, setting globals...\n", .{});
 
         handler.setGlobalBroker(brk);
         handler_routing.setGlobalBroker(brk);
+        try stdout.print("  DEBUG: broker setup complete\n", .{});
     }
     defer if (broker) |brk| {
         log.info("Shutting down broker (persisting metadata)...", .{});
