@@ -44,7 +44,7 @@ pub const Broker = struct {
     /// Map of topic name → topic metadata (partitions, replication factor, config).
     topics: std.StringHashMap(TopicInfo),
     /// Idempotent producer deduplication: tracks last sequence number per producer+partition.
-    producer_sequences: std.AutoHashMap(ProducerKey, i32),
+    producer_sequences: std.AutoHashMap(ProducerKey, ProducerSequenceState),
     allocator: Allocator,
     /// KRaft node ID for this broker in the cluster.
     node_id: i32,
@@ -74,6 +74,8 @@ pub const Broker = struct {
     fetch_sessions: FetchSessionManager,
     /// Counter for S3 flush failures (used for monitoring/alerting).
     s3_flush_failures: u64 = 0,
+    /// Dirty flag for producer sequence persistence.
+    producer_sequences_dirty: bool = false,
     /// Failover controller for broker failure handling.
     failover_controller: FailoverController,
     /// Auto-balancer for partition reassignment.
@@ -158,6 +160,14 @@ pub const Broker = struct {
         partition_key: u64,
     };
 
+    /// Tracks producer idempotency state per (producer_id, partition).
+    /// NOTE: AutoMQ/Kafka uses ProducerStateManager per partition to track
+    /// sequence numbers, epochs, and offsets for idempotent deduplication.
+    pub const ProducerSequenceState = struct {
+        last_sequence: i32,
+        producer_epoch: i16,
+    };
+
     pub const BrokerConfig = struct {
         data_dir: ?[]const u8 = null,
         s3_endpoint_host: ?[]const u8 = null,
@@ -238,7 +248,7 @@ pub const Broker = struct {
             .metrics = MetricRegistry.init(alloc),
             .persistence = MetadataPersistence.init(alloc, config.data_dir),
             .topics = std.StringHashMap(TopicInfo).init(alloc),
-            .producer_sequences = std.AutoHashMap(ProducerKey, i32).init(alloc),
+            .producer_sequences = std.AutoHashMap(ProducerKey, ProducerSequenceState).init(alloc),
             .allocator = alloc,
             .node_id = node_id,
             .port = port,
@@ -335,6 +345,35 @@ pub const Broker = struct {
 
             self.groups.commitOffset(group_id, topic, partition, entry.offset) catch {};
         }
+
+        // Load persisted transaction state
+        const txn_snapshot = try self.persistence.loadTransactions();
+        defer {
+            for (txn_snapshot.entries) |e| {
+                if (e.transactional_id) |tid| self.allocator.free(tid);
+            }
+            self.allocator.free(txn_snapshot.entries);
+        }
+        if (txn_snapshot.entries.len > 0 or txn_snapshot.next_producer_id > 1000) {
+            try self.txn_coordinator.restoreState(txn_snapshot);
+            log.info("Restored {d} transaction(s), next_producer_id={d}", .{ txn_snapshot.entries.len, txn_snapshot.next_producer_id });
+        }
+
+        // Load persisted producer sequences
+        const saved_sequences = try self.persistence.loadProducerSequences();
+        defer self.allocator.free(saved_sequences);
+        for (saved_sequences) |entry| {
+            self.producer_sequences.put(.{
+                .producer_id = entry.producer_id,
+                .partition_key = entry.partition_key,
+            }, .{
+                .last_sequence = entry.last_sequence,
+                .producer_epoch = entry.producer_epoch,
+            }) catch {};
+        }
+        if (saved_sequences.len > 0) {
+            log.info("Restored {d} producer sequence state(s)", .{saved_sequences.len});
+        }
     }
 
     /// Periodic maintenance — should be called every ~1 second.
@@ -350,6 +389,30 @@ pub const Broker = struct {
         const forced = self.groups.checkRebalanceTimeouts();
         if (forced > 0) {
             log.info("Force-completed {d} timed-out rebalances", .{forced});
+        }
+
+        // Expire timed-out transactions (auto-abort after timeout_ms).
+        // NOTE: AutoMQ/Kafka runs this check periodically to prevent resource leaks
+        // from abandoned producers that never call EndTxn.
+        const txn_expired = self.txn_coordinator.expireTransactions();
+        if (txn_expired > 0) {
+            log.info("Auto-aborted {d} timed-out transaction(s)", .{txn_expired});
+        }
+
+        // Persist transaction state if dirty
+        if (self.txn_coordinator.dirty) {
+            self.persistence.saveTransactions(&self.txn_coordinator) catch |err| {
+                log.warn("Failed to persist transaction state: {}", .{err});
+            };
+            self.txn_coordinator.dirty = false;
+        }
+
+        // Persist producer sequences if dirty
+        if (self.producer_sequences_dirty) {
+            self.persistence.saveProducerSequences(&self.producer_sequences) catch |err| {
+                log.warn("Failed to persist producer sequences: {}", .{err});
+            };
+            self.producer_sequences_dirty = false;
         }
 
         // Periodic S3 flush (if configured) — fix #8: log errors and retry
@@ -1265,13 +1328,25 @@ pub const Broker = struct {
                                     .producer_id = hdr.producer_id,
                                     .partition_key = @intCast(@as(u32, @bitCast(partition_idx))),
                                 };
-                                if (self.producer_sequences.get(pk)) |last_seq| {
-                                    if (hdr.base_sequence <= last_seq) {
-                                        is_duplicate = true;
+                                if (self.producer_sequences.get(pk)) |stored| {
+                                    if (hdr.producer_epoch < stored.producer_epoch) {
+                                        // Stale epoch — producer was fenced
+                                        is_duplicate = true; // Reject stale-epoch records
+                                    } else if (hdr.producer_epoch > stored.producer_epoch) {
+                                        // New epoch — accept (producer restarted)
+                                    } else {
+                                        // Same epoch — check sequence
+                                        if (hdr.base_sequence <= stored.last_sequence) {
+                                            is_duplicate = true;
+                                        }
                                     }
                                 }
                                 if (!is_duplicate) {
-                                    self.producer_sequences.put(pk, hdr.base_sequence) catch {};
+                                    self.producer_sequences.put(pk, .{
+                                        .last_sequence = hdr.base_sequence,
+                                        .producer_epoch = hdr.producer_epoch,
+                                    }) catch {};
+                                    self.producer_sequences_dirty = true;
                                 }
                             }
                         }
@@ -2360,7 +2435,6 @@ pub const Broker = struct {
         _ = transactional_id;
         const producer_id = ser.readI64(request_bytes, &pos);
         const producer_epoch = ser.readI16(request_bytes, &pos);
-        _ = producer_epoch;
 
         // Read topics array
         const topics_len = (ser.readArrayLen(request_bytes, &pos) catch 0) orelse 0;
@@ -2379,7 +2453,7 @@ pub const Broker = struct {
             for (0..parts_len) |_| {
                 if (te.num_partitions >= 32) break;
                 const partition = ser.readI32(request_bytes, &pos);
-                const err = self.txn_coordinator.addPartitionsToTxn(producer_id, topic, partition) catch 48;
+                const err = self.txn_coordinator.addPartitionsToTxn(producer_id, producer_epoch, topic, partition) catch 48;
                 te.partitions[te.num_partitions] = .{ .partition = partition, .error_code = err };
                 te.num_partitions += 1;
             }
@@ -2442,9 +2516,22 @@ pub const Broker = struct {
                     log.warn("Failed to write control batch for {s}-{d}: {}", .{ tp.topic, tp.partition, err });
                 };
             }
+
+            // Clear first_unstable_txn_offset on each partition so LSO advances.
+            // NOTE: AutoMQ/Kafka advances LSO after control batch markers are written.
+            // Without this, READ_COMMITTED consumers would never see committed data.
+            for (partitions) |tp| {
+                const pkey2 = std.fmt.allocPrint(self.allocator, "{s}-{d}", .{ tp.topic, tp.partition }) catch continue;
+                defer self.allocator.free(pkey2);
+                if (self.store.partitions.getPtr(pkey2)) |state| {
+                    state.first_unstable_txn_offset = null;
+                    // Recompute LSO = HW (no unstable transactions on this partition now)
+                    state.last_stable_offset = state.high_watermark;
+                }
+            }
         }
 
-        const error_code = self.txn_coordinator.endTxnComplete(producer_id, committed);
+        const error_code = self.txn_coordinator.endTxnComplete(producer_id, producer_epoch, committed);
 
         var buf = self.allocator.alloc(u8, 64) catch return null;
         var wpos: usize = 0;
@@ -2637,7 +2724,6 @@ pub const Broker = struct {
         _ = transactional_id;
         const producer_id = ser.readI64(request_bytes, &pos);
         const producer_epoch = ser.readI16(request_bytes, &pos);
-        _ = producer_epoch;
         const group_id = (ser.readString(request_bytes, &pos) catch return null) orelse "";
 
         // Compute partition = hash(group_id) % 50 for __consumer_offsets
@@ -2648,6 +2734,7 @@ pub const Broker = struct {
         // Add __consumer_offsets partition to the transaction
         const error_code = self.txn_coordinator.addPartitionsToTxn(
             producer_id,
+            producer_epoch,
             "__consumer_offsets",
             target_partition,
         ) catch 48; // INVALID_PRODUCER_ID_MAPPING on error
@@ -2943,6 +3030,18 @@ pub const Broker = struct {
                     _ = self.store.produce(tp.topic, tp.partition, control_batch) catch |err| {
                         log.warn("Principle 7: Failed to write control batch for {s}-{d}: {}", .{ tp.topic, tp.partition, err });
                     };
+                }
+
+                // Clear LSO on each partition after writing markers
+                // NOTE: AutoMQ/Kafka advances LSO after control batch markers are written.
+                // Must happen before writeTxnMarkers() which clears the partition list.
+                for (partitions) |tp| {
+                    const lso_key = std.fmt.allocPrint(self.allocator, "{s}-{d}", .{ tp.topic, tp.partition }) catch continue;
+                    defer self.allocator.free(lso_key);
+                    if (self.store.partitions.getPtr(lso_key)) |pstate| {
+                        pstate.first_unstable_txn_offset = null;
+                        pstate.last_stable_offset = pstate.high_watermark;
+                    }
                 }
             }
 
@@ -4030,7 +4129,7 @@ test "Broker.handleRequest EndTxn (key=26) full transaction lifecycle" {
     const pid = init_result.producer_id;
 
     // Add partition to transaction
-    _ = try broker.txn_coordinator.addPartitionsToTxn(pid, "txn-topic", 0);
+    _ = try broker.txn_coordinator.addPartitionsToTxn(pid, init_result.producer_epoch, "txn-topic", 0);
 
     // EndTxn v0 (commit)
     var buf: [512]u8 = undefined;

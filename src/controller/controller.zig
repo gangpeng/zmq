@@ -26,6 +26,12 @@ pub const Controller = struct {
     node_id: i32,
     cluster_id: []const u8,
 
+    /// Next producer ID to allocate. Controller owns the global PID counter.
+    /// NOTE: AutoMQ/Kafka uses ProducerIdManager on the controller to allocate
+    /// PID blocks to brokers. ZMQ simplifies by having the controller directly
+    /// manage a monotonic counter.
+    next_producer_id: i64 = 1000,
+
     pub fn init(alloc: Allocator, node_id: i32, cluster_id: []const u8) Controller {
         return .{
             .raft_state = RaftState.init(alloc, node_id, cluster_id),
@@ -88,6 +94,7 @@ pub const Controller = struct {
             63 => self.handleBrokerHeartbeat(request_bytes, pos, &req_header, resp_header_version),
             71 => self.handleAddRaftVoter(request_bytes, pos, &req_header, resp_header_version),
             72 => self.handleRemoveRaftVoter(request_bytes, pos, &req_header, resp_header_version),
+            67 => self.handleAllocateProducerIds(request_bytes, pos, &req_header, resp_header_version),
             else => self.handleUnsupported(&req_header, api_key, resp_header_version),
         };
     }
@@ -106,6 +113,7 @@ pub const Controller = struct {
             .{ .key = 63, .min = 0, .max = 0 }, // BrokerHeartbeat
             .{ .key = 71, .min = 0, .max = 0 }, // AddRaftVoter
             .{ .key = 72, .min = 0, .max = 0 }, // RemoveRaftVoter
+            .{ .key = 67, .min = 0, .max = 0 }, // AllocateProducerIds
         };
 
         var buf = self.allocator.alloc(u8, 256) catch return null;
@@ -374,6 +382,35 @@ pub const Controller = struct {
     }
 
     // ---------------------------------------------------------------
+    // AllocateProducerIds (key 67) — PID block allocation
+    // ---------------------------------------------------------------
+    fn handleAllocateProducerIds(self: *Controller, request_bytes: []const u8, start_pos: usize, req_header: *const RequestHeader, resp_header_version: i16) ?[]u8 {
+        var pos = start_pos;
+
+        const broker_id = ser.readI32(request_bytes, &pos);
+        const broker_epoch = ser.readI64(request_bytes, &pos);
+        _ = broker_id;
+        _ = broker_epoch;
+
+        // Allocate a block of 1000 producer IDs
+        const block_start = self.next_producer_id;
+        const block_len: i32 = 1000;
+        self.next_producer_id += block_len;
+
+        var buf = self.allocator.alloc(u8, 128) catch return null;
+        var wpos: usize = 0;
+        const rh = ResponseHeader{ .correlation_id = req_header.correlation_id };
+        rh.serialize(buf, &wpos, resp_header_version);
+        ser.writeI32(buf, &wpos, 0); // throttle_time_ms
+        ser.writeI16(buf, &wpos, 0); // error_code: NONE
+        ser.writeI64(buf, &wpos, block_start); // producer_id_start
+        ser.writeI32(buf, &wpos, block_len); // producer_id_len
+        if (resp_header_version >= 1) ser.writeEmptyTaggedFields(buf, &wpos);
+
+        return (self.allocator.realloc(buf, wpos) catch buf)[0..wpos];
+    }
+
+    // ---------------------------------------------------------------
     // Unsupported API
     // ---------------------------------------------------------------
     fn handleUnsupported(self: *Controller, req_header: *const RequestHeader, api_key: i16, resp_header_version: i16) ?[]u8 {
@@ -457,9 +494,9 @@ test "Controller handleRequest ApiVersions returns supported APIs" {
     const error_code = ser.readI16(response.?, &rpos);
     try testing.expectEqual(@as(i16, 0), error_code);
 
-    // Array of supported APIs — controller supports 9 APIs
+    // Array of supported APIs — controller supports 10 APIs
     const array_len = try ser.readArrayLen(response.?, &rpos);
-    try testing.expectEqual(@as(usize, 9), array_len.?);
+    try testing.expectEqual(@as(usize, 10), array_len.?);
 }
 
 test "Controller handleRequest unsupported API returns error" {
@@ -745,4 +782,68 @@ test "Controller tick evicts dead brokers" {
     // tick() calls evictExpired(30_000) — broker should be evicted
     ctrl.tick();
     try testing.expectEqual(@as(usize, 0), ctrl.broker_registry.count());
+}
+
+test "Controller handleRequest AllocateProducerIds returns block" {
+    var ctrl = Controller.init(testing.allocator, 1, "test-cluster");
+    defer ctrl.deinit();
+
+    // AllocateProducerIds (67, v0) is NOT flexible → header v1 / response v0
+    var buf: [256]u8 = undefined;
+    var pos = buildTestRequest(&buf, 67, 0, 60, 1);
+    ser.writeI32(&buf, &pos, 100); // broker_id
+    ser.writeI64(&buf, &pos, 1); // broker_epoch
+
+    const response = ctrl.handleRequest(buf[0..pos]);
+    try testing.expect(response != null);
+    defer testing.allocator.free(response.?);
+
+    // Parse: correlation_id, throttle_time_ms, error_code, producer_id_start, producer_id_len
+    var rpos: usize = 0;
+    _ = ser.readI32(response.?, &rpos); // correlation_id
+    _ = ser.readI32(response.?, &rpos); // throttle_time_ms
+    const error_code = ser.readI16(response.?, &rpos);
+    try testing.expectEqual(@as(i16, 0), error_code);
+    const pid_start = ser.readI64(response.?, &rpos);
+    try testing.expect(pid_start >= 1000);
+    const pid_len = ser.readI32(response.?, &rpos);
+    try testing.expectEqual(@as(i32, 1000), pid_len);
+}
+
+test "Controller AllocateProducerIds increments monotonically" {
+    var ctrl = Controller.init(testing.allocator, 1, "test-cluster");
+    defer ctrl.deinit();
+
+    // First allocation
+    var buf1: [256]u8 = undefined;
+    var pos1 = buildTestRequest(&buf1, 67, 0, 61, 1);
+    ser.writeI32(&buf1, &pos1, 100);
+    ser.writeI64(&buf1, &pos1, 1);
+    const resp1 = ctrl.handleRequest(buf1[0..pos1]);
+    try testing.expect(resp1 != null);
+    defer testing.allocator.free(resp1.?);
+
+    var rpos1: usize = 0;
+    _ = ser.readI32(resp1.?, &rpos1);
+    _ = ser.readI32(resp1.?, &rpos1);
+    _ = ser.readI16(resp1.?, &rpos1);
+    const start1 = ser.readI64(resp1.?, &rpos1);
+
+    // Second allocation
+    var buf2: [256]u8 = undefined;
+    var pos2 = buildTestRequest(&buf2, 67, 0, 62, 1);
+    ser.writeI32(&buf2, &pos2, 100);
+    ser.writeI64(&buf2, &pos2, 1);
+    const resp2 = ctrl.handleRequest(buf2[0..pos2]);
+    try testing.expect(resp2 != null);
+    defer testing.allocator.free(resp2.?);
+
+    var rpos2: usize = 0;
+    _ = ser.readI32(resp2.?, &rpos2);
+    _ = ser.readI32(resp2.?, &rpos2);
+    _ = ser.readI16(resp2.?, &rpos2);
+    const start2 = ser.readI64(resp2.?, &rpos2);
+
+    // Second block starts after first
+    try testing.expect(start2 >= start1 + 1000);
 }

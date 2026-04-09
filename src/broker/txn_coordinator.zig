@@ -13,6 +13,8 @@ pub const TransactionCoordinator = struct {
     transactions: std.AutoHashMap(i64, TransactionState),
     next_producer_id: i64 = 1000,
     allocator: Allocator,
+    /// Set to true when state changes; cleared after persistence save.
+    dirty: bool = false,
 
     pub const TxnStatus = enum {
         empty,
@@ -76,10 +78,35 @@ pub const TransactionCoordinator = struct {
                 if (txn.transactional_id) |existing_tid| {
                     if (std.mem.eql(u8, existing_tid, tid)) {
                         // Found existing — bump epoch (fence old producers)
+                        // Epoch overflow protection: if epoch would exceed i16 max,
+                        // allocate a new producer_id and reset epoch to 0.
+                        // NOTE: AutoMQ/Kafka resets when epoch approaches Short.MAX_VALUE.
+                        if (txn.producer_epoch >= std.math.maxInt(i16) - 1) {
+                            // Epoch exhausted — allocate fresh PID
+                            const new_pid = self.next_producer_id;
+                            self.next_producer_id += 1;
+                            const old_pid = txn.producer_id;
+                            txn.producer_id = new_pid;
+                            txn.producer_epoch = 0;
+                            txn.status = .empty;
+                            txn.partitions.clearRetainingCapacity();
+                            txn.start_time_ms = std.time.milliTimestamp();
+                            // Re-index under new PID
+                            const txn_copy = txn.*;
+                            _ = self.transactions.fetchRemove(old_pid);
+                            try self.transactions.put(new_pid, txn_copy);
+                            self.dirty = true;
+                            return .{
+                                .error_code = 0,
+                                .producer_id = new_pid,
+                                .producer_epoch = 0,
+                            };
+                        }
                         txn.producer_epoch += 1;
                         txn.status = .empty;
                         txn.partitions.clearRetainingCapacity();
                         txn.start_time_ms = std.time.milliTimestamp();
+                        self.dirty = true;
                         return .{
                             .error_code = 0,
                             .producer_id = txn.producer_id,
@@ -105,6 +132,7 @@ pub const TransactionCoordinator = struct {
             .start_time_ms = std.time.milliTimestamp(),
         });
 
+        self.dirty = true;
         return .{
             .error_code = 0,
             .producer_id = pid,
@@ -119,8 +147,14 @@ pub const TransactionCoordinator = struct {
     };
 
     /// AddPartitionsToTxn: register partitions in an active transaction.
-    pub fn addPartitionsToTxn(self: *TransactionCoordinator, producer_id: i64, topic: []const u8, partition: i32) !i16 {
+    /// Validates producer_epoch to reject fenced (zombie) producers.
+    /// Idempotent: adding the same topic-partition twice is a no-op.
+    pub fn addPartitionsToTxn(self: *TransactionCoordinator, producer_id: i64, producer_epoch: i16, topic: []const u8, partition: i32) !i16 {
         const txn = self.transactions.getPtr(producer_id) orelse return 48; // INVALID_PRODUCER_ID_MAPPING
+
+        // Epoch validation — reject fenced producers (zombie fencing).
+        // NOTE: AutoMQ/Kafka returns PRODUCER_FENCED (error 22) when epoch mismatches.
+        if (txn.producer_epoch != producer_epoch) return 22; // PRODUCER_FENCED
 
         // Enforce transaction timeout
         if (txn.status == .ongoing) {
@@ -138,13 +172,26 @@ pub const TransactionCoordinator = struct {
 
         if (txn.status != .ongoing) return 55; // INVALID_TXN_STATE
 
+        // Idempotent: skip if this topic-partition is already registered.
+        // NOTE: AutoMQ/Kafka silently accepts duplicate partition adds.
+        for (txn.partitions.items) |existing| {
+            if (existing.partition == partition and std.mem.eql(u8, existing.topic, topic)) {
+                return 0; // Already registered — success
+            }
+        }
+
         try txn.partitions.append(.{ .topic = topic, .partition = partition });
+        self.dirty = true;
         return 0;
     }
 
     /// EndTxn: commit or abort the transaction.
-    pub fn endTxn(self: *TransactionCoordinator, producer_id: i64, commit: bool) i16 {
+    /// Validates producer_epoch to reject fenced (zombie) producers.
+    pub fn endTxn(self: *TransactionCoordinator, producer_id: i64, producer_epoch: i16, commit: bool) i16 {
         const txn = self.transactions.getPtr(producer_id) orelse return 48;
+
+        // Epoch validation — reject fenced producers.
+        if (txn.producer_epoch != producer_epoch) return 22; // PRODUCER_FENCED
 
         if (txn.status != .ongoing) return 55;
 
@@ -154,6 +201,7 @@ pub const TransactionCoordinator = struct {
             txn.status = .prepare_abort;
         }
 
+        self.dirty = true;
         return 0;
     }
 
@@ -173,6 +221,7 @@ pub const TransactionCoordinator = struct {
                 }
                 txn.status = .complete_commit;
                 txn.partitions.clearRetainingCapacity();
+                self.dirty = true;
                 return 0;
             },
             .prepare_abort => {
@@ -183,6 +232,7 @@ pub const TransactionCoordinator = struct {
                 }
                 txn.status = .complete_abort;
                 txn.partitions.clearRetainingCapacity();
+                self.dirty = true;
                 return 0;
             },
             else => return 55, // INVALID_TXN_STATE
@@ -230,10 +280,49 @@ pub const TransactionCoordinator = struct {
 
     /// Complete the EndTxn by writing markers and transitioning to final state.
     /// This is a convenience method that combines endTxn + writeTxnMarkers.
-    pub fn endTxnComplete(self: *TransactionCoordinator, producer_id: i64, commit: bool) i16 {
-        const err1 = self.endTxn(producer_id, commit);
+    pub fn endTxnComplete(self: *TransactionCoordinator, producer_id: i64, producer_epoch: i16, commit: bool) i16 {
+        const err1 = self.endTxn(producer_id, producer_epoch, commit);
         if (err1 != 0) return err1;
         return self.writeTxnMarkers(producer_id);
+    }
+
+    /// Expire timed-out transactions by auto-aborting them.
+    /// Called periodically from Broker.tick().
+    /// NOTE: AutoMQ/Kafka uses transaction.timeout.ms (default 60s) to auto-abort
+    /// transactions that have been in ONGOING state too long. This prevents resource
+    /// leaks from abandoned producers.
+    pub fn expireTransactions(self: *TransactionCoordinator) u32 {
+        const now = std.time.milliTimestamp();
+        var expired_pids: [64]i64 = undefined;
+        var num_expired: usize = 0;
+
+        // Phase 1: Collect expired PIDs (can't mutate during iteration)
+        var it = self.transactions.iterator();
+        while (it.next()) |entry| {
+            const txn = entry.value_ptr;
+            if (txn.status == .ongoing) {
+                if (now - txn.start_time_ms > txn.timeout_ms) {
+                    if (num_expired < 64) {
+                        expired_pids[num_expired] = txn.producer_id;
+                        num_expired += 1;
+                    }
+                }
+            }
+        }
+
+        // Phase 2: Auto-abort each expired transaction
+        var aborted: u32 = 0;
+        for (expired_pids[0..num_expired]) |pid| {
+            if (self.transactions.getPtr(pid)) |txn| {
+                txn.status = .prepare_abort;
+                _ = self.writeTxnMarkers(pid);
+                aborted += 1;
+            }
+        }
+
+        if (aborted > 0) self.dirty = true;
+
+        return aborted;
     }
 
     /// Serialize transaction state for persistence to __transaction_state (fix #12).
@@ -278,6 +367,31 @@ pub const TransactionCoordinator = struct {
     pub fn transactionCount(self: *const TransactionCoordinator) usize {
         return self.transactions.count();
     }
+
+    /// Restore transaction state from persisted snapshot (called during Broker.open()).
+    /// NOTE: AutoMQ/Kafka loads from __transaction_state topic on coordinator startup.
+    /// ZMQ uses file-based persistence as a simplification.
+    pub fn restoreState(self: *TransactionCoordinator, snapshot: anytype) !void {
+        self.next_producer_id = snapshot.next_producer_id;
+
+        for (snapshot.entries) |entry| {
+            const tid_copy = if (entry.transactional_id) |tid|
+                try self.allocator.dupe(u8, tid)
+            else
+                null;
+
+            try self.transactions.put(entry.producer_id, .{
+                .producer_id = entry.producer_id,
+                .producer_epoch = entry.producer_epoch,
+                .transactional_id = tid_copy,
+                .status = @enumFromInt(entry.status),
+                .partitions = std.ArrayList(TransactionState.TopicPartition).init(self.allocator),
+                .start_time_ms = std.time.milliTimestamp(),
+                .timeout_ms = entry.timeout_ms,
+            });
+        }
+        self.dirty = false;
+    }
 };
 
 // ---------------------------------------------------------------
@@ -303,12 +417,12 @@ test "TransactionCoordinator full lifecycle" {
     const pid = result.producer_id;
 
     // Add partitions
-    const err1 = try coord.addPartitionsToTxn(pid, "topic-a", 0);
+    const err1 = try coord.addPartitionsToTxn(pid, result.producer_epoch, "topic-a", 0);
     try testing.expectEqual(@as(i16, 0), err1);
     try testing.expectEqual(TransactionCoordinator.TxnStatus.ongoing, coord.getStatus(pid).?);
 
     // Commit (two-phase)
-    const err2 = coord.endTxn(pid, true);
+    const err2 = coord.endTxn(pid, result.producer_epoch, true);
     try testing.expectEqual(@as(i16, 0), err2);
     try testing.expectEqual(TransactionCoordinator.TxnStatus.prepare_commit, coord.getStatus(pid).?);
 
@@ -325,8 +439,8 @@ test "TransactionCoordinator abort" {
     const result = try coord.initProducerId(null);
     const pid = result.producer_id;
 
-    _ = try coord.addPartitionsToTxn(pid, "topic", 0);
-    const err = coord.endTxnComplete(pid, false);
+    _ = try coord.addPartitionsToTxn(pid, result.producer_epoch, "topic", 0);
+    const err = coord.endTxnComplete(pid, result.producer_epoch, false);
     try testing.expectEqual(@as(i16, 0), err);
     try testing.expectEqual(TransactionCoordinator.TxnStatus.complete_abort, coord.getStatus(pid).?);
 }
@@ -335,7 +449,7 @@ test "TransactionCoordinator invalid producer id" {
     var coord = TransactionCoordinator.init(testing.allocator);
     defer coord.deinit();
 
-    const err = try coord.addPartitionsToTxn(9999, "topic", 0);
+    const err = try coord.addPartitionsToTxn(9999, 0, "topic", 0);
     try testing.expectEqual(@as(i16, 48), err); // INVALID_PRODUCER_ID_MAPPING
 }
 
@@ -348,7 +462,7 @@ test "TransactionCoordinator endTxn invalid state" {
 
     // endTxn on EMPTY state (never added partitions, so state is "empty")
     // addPartitions transitions from empty→ongoing, endTxn requires ongoing
-    const err = coord.endTxn(pid, true);
+    const err = coord.endTxn(pid, result.producer_epoch, true);
     try testing.expectEqual(@as(i16, 55), err); // INVALID_TXN_STATE
 }
 
@@ -359,14 +473,14 @@ test "TransactionCoordinator double commit fails" {
     const result = try coord.initProducerId("txn-double");
     const pid = result.producer_id;
 
-    _ = try coord.addPartitionsToTxn(pid, "topic", 0);
+    _ = try coord.addPartitionsToTxn(pid, result.producer_epoch, "topic", 0);
 
     // First commit succeeds
-    try testing.expectEqual(@as(i16, 0), coord.endTxn(pid, true));
+    try testing.expectEqual(@as(i16, 0), coord.endTxn(pid, result.producer_epoch, true));
     try testing.expectEqual(TransactionCoordinator.TxnStatus.prepare_commit, coord.getStatus(pid).?);
 
     // Second endTxn on prepare_commit state should fail
-    try testing.expectEqual(@as(i16, 55), coord.endTxn(pid, true)); // INVALID_TXN_STATE
+    try testing.expectEqual(@as(i16, 55), coord.endTxn(pid, result.producer_epoch, true)); // INVALID_TXN_STATE
 }
 
 test "TransactionCoordinator writeTxnMarkers invalid state" {
@@ -391,7 +505,7 @@ test "TransactionCoordinator endTxn on nonexistent producer" {
     var coord = TransactionCoordinator.init(testing.allocator);
     defer coord.deinit();
 
-    try testing.expectEqual(@as(i16, 48), coord.endTxn(9999, true));
+    try testing.expectEqual(@as(i16, 48), coord.endTxn(9999, 0, true));
 }
 
 test "TransactionCoordinator getPartitions" {
@@ -405,8 +519,8 @@ test "TransactionCoordinator getPartitions" {
     const parts0 = coord.getPartitions(pid).?;
     try testing.expectEqual(@as(usize, 0), parts0.len);
 
-    _ = try coord.addPartitionsToTxn(pid, "topic-a", 0);
-    _ = try coord.addPartitionsToTxn(pid, "topic-a", 1);
+    _ = try coord.addPartitionsToTxn(pid, result.producer_epoch, "topic-a", 0);
+    _ = try coord.addPartitionsToTxn(pid, result.producer_epoch, "topic-a", 1);
 
     const parts = coord.getPartitions(pid).?;
     try testing.expectEqual(@as(usize, 2), parts.len);
@@ -446,12 +560,12 @@ test "TransactionCoordinator commit clears partitions" {
     const result = try coord.initProducerId("txn-clear");
     const pid = result.producer_id;
 
-    _ = try coord.addPartitionsToTxn(pid, "topic", 0);
-    _ = try coord.addPartitionsToTxn(pid, "topic", 1);
+    _ = try coord.addPartitionsToTxn(pid, result.producer_epoch, "topic", 0);
+    _ = try coord.addPartitionsToTxn(pid, result.producer_epoch, "topic", 1);
 
     try testing.expectEqual(@as(usize, 2), coord.getPartitions(pid).?.len);
 
-    _ = coord.endTxnComplete(pid, true);
+    _ = coord.endTxnComplete(pid, result.producer_epoch, true);
 
     // After commit, partitions should be cleared
     try testing.expectEqual(@as(usize, 0), coord.getPartitions(pid).?.len);
@@ -527,4 +641,168 @@ test "TransactionCoordinator epoch fencing" {
 
     // Still only 1 transaction entry (reused)
     try testing.expectEqual(@as(usize, 1), coord.transactionCount());
+}
+
+// ---------------------------------------------------------------
+// Gap-fix tests: epoch validation, idempotent add, timeout, overflow
+// ---------------------------------------------------------------
+
+test "TransactionCoordinator addPartitionsToTxn validates epoch" {
+    var coord = TransactionCoordinator.init(testing.allocator);
+    defer coord.deinit();
+
+    const result = try coord.initProducerId("epoch-val");
+    const pid = result.producer_id;
+
+    // Correct epoch works
+    const ok = try coord.addPartitionsToTxn(pid, 0, "topic", 0);
+    try testing.expectEqual(@as(i16, 0), ok);
+
+    // Wrong epoch returns PRODUCER_FENCED (22)
+    const fenced = try coord.addPartitionsToTxn(pid, 99, "topic", 1);
+    try testing.expectEqual(@as(i16, 22), fenced);
+}
+
+test "TransactionCoordinator endTxn validates epoch" {
+    var coord = TransactionCoordinator.init(testing.allocator);
+    defer coord.deinit();
+
+    const result = try coord.initProducerId("epoch-end");
+    const pid = result.producer_id;
+
+    _ = try coord.addPartitionsToTxn(pid, result.producer_epoch, "topic", 0);
+
+    // Wrong epoch returns PRODUCER_FENCED (22)
+    const fenced = coord.endTxn(pid, 99, true);
+    try testing.expectEqual(@as(i16, 22), fenced);
+
+    // Correct epoch works
+    const ok = coord.endTxn(pid, result.producer_epoch, true);
+    try testing.expectEqual(@as(i16, 0), ok);
+}
+
+test "TransactionCoordinator addPartitionsToTxn idempotent" {
+    var coord = TransactionCoordinator.init(testing.allocator);
+    defer coord.deinit();
+
+    const result = try coord.initProducerId("idem-add");
+    const pid = result.producer_id;
+
+    // Add same partition twice
+    _ = try coord.addPartitionsToTxn(pid, result.producer_epoch, "topic-a", 0);
+    _ = try coord.addPartitionsToTxn(pid, result.producer_epoch, "topic-a", 0);
+
+    // Should have only 1 entry (idempotent)
+    const parts = coord.getPartitions(pid).?;
+    try testing.expectEqual(@as(usize, 1), parts.len);
+
+    // Different partition should be added
+    _ = try coord.addPartitionsToTxn(pid, result.producer_epoch, "topic-a", 1);
+    try testing.expectEqual(@as(usize, 2), coord.getPartitions(pid).?.len);
+}
+
+test "TransactionCoordinator expireTransactions auto-aborts" {
+    var coord = TransactionCoordinator.init(testing.allocator);
+    defer coord.deinit();
+
+    const result = try coord.initProducerId("expire-txn");
+    const pid = result.producer_id;
+
+    _ = try coord.addPartitionsToTxn(pid, result.producer_epoch, "topic", 0);
+    try testing.expectEqual(TransactionCoordinator.TxnStatus.ongoing, coord.getStatus(pid).?);
+
+    // Manipulate start_time to simulate timeout (set 120s in the past)
+    if (coord.transactions.getPtr(pid)) |txn| {
+        txn.start_time_ms = std.time.milliTimestamp() - 120_000;
+    }
+
+    const expired = coord.expireTransactions();
+    try testing.expectEqual(@as(u32, 1), expired);
+    // Transaction should be auto-aborted
+    try testing.expectEqual(TransactionCoordinator.TxnStatus.complete_abort, coord.getStatus(pid).?);
+}
+
+test "TransactionCoordinator expireTransactions skips active" {
+    var coord = TransactionCoordinator.init(testing.allocator);
+    defer coord.deinit();
+
+    const result = try coord.initProducerId("active-txn");
+    const pid = result.producer_id;
+
+    _ = try coord.addPartitionsToTxn(pid, result.producer_epoch, "topic", 0);
+
+    // Don't manipulate time — transaction is fresh
+    const expired = coord.expireTransactions();
+    try testing.expectEqual(@as(u32, 0), expired);
+    try testing.expectEqual(TransactionCoordinator.TxnStatus.ongoing, coord.getStatus(pid).?);
+}
+
+test "TransactionCoordinator epoch overflow allocates new PID" {
+    var coord = TransactionCoordinator.init(testing.allocator);
+    defer coord.deinit();
+
+    const r1 = try coord.initProducerId("overflow-txn");
+    const original_pid = r1.producer_id;
+
+    // Manually set epoch to near-max
+    if (coord.transactions.getPtr(original_pid)) |txn| {
+        txn.producer_epoch = std.math.maxInt(i16) - 1; // 32766
+    }
+
+    // Re-init should detect overflow, allocate new PID, reset epoch to 0
+    const r2 = try coord.initProducerId("overflow-txn");
+    try testing.expect(r2.producer_id != original_pid); // New PID
+    try testing.expectEqual(@as(i16, 0), r2.producer_epoch); // Epoch reset to 0
+
+    // Old PID should be gone, new PID should exist
+    try testing.expect(coord.getStatus(original_pid) == null);
+    try testing.expect(coord.getStatus(r2.producer_id) != null);
+    try testing.expectEqual(@as(usize, 1), coord.transactionCount());
+}
+
+test "TransactionCoordinator restoreState rebuilds from entries" {
+    var coord = TransactionCoordinator.init(testing.allocator);
+    defer coord.deinit();
+
+    const Persistence = @import("persistence.zig").MetadataPersistence;
+    var entries = [_]Persistence.TransactionEntry{
+        .{ .producer_id = 2000, .producer_epoch = 3, .status = 1, .timeout_ms = 60000, .transactional_id = null },
+        .{ .producer_id = 2001, .producer_epoch = 0, .status = 0, .timeout_ms = 30000, .transactional_id = null },
+    };
+
+    try coord.restoreState(.{ .next_producer_id = 3000, .entries = @as([]Persistence.TransactionEntry, &entries) });
+
+    try testing.expectEqual(@as(i64, 3000), coord.next_producer_id);
+    try testing.expectEqual(@as(usize, 2), coord.transactionCount());
+    try testing.expectEqual(TransactionCoordinator.TxnStatus.ongoing, coord.getStatus(2000).?);
+    try testing.expectEqual(TransactionCoordinator.TxnStatus.empty, coord.getStatus(2001).?);
+    try testing.expect(!coord.dirty);
+}
+
+test "TransactionCoordinator dirty flag tracks mutations" {
+    var coord = TransactionCoordinator.init(testing.allocator);
+    defer coord.deinit();
+
+    try testing.expect(!coord.dirty);
+
+    const r1 = try coord.initProducerId("dirty-test");
+    try testing.expect(coord.dirty);
+
+    coord.dirty = false;
+
+    // addPartitionsToTxn sets dirty
+    _ = try coord.addPartitionsToTxn(r1.producer_id, r1.producer_epoch, "topic", 0);
+    try testing.expect(coord.dirty);
+
+    coord.dirty = false;
+
+    // endTxn sets dirty
+    _ = coord.endTxn(r1.producer_id, r1.producer_epoch, true);
+    try testing.expect(coord.dirty);
+
+    coord.dirty = false;
+
+    // writeTxnMarkers sets dirty
+    _ = coord.writeTxnMarkers(r1.producer_id);
+    try testing.expect(coord.dirty);
 }
