@@ -147,6 +147,12 @@ pub fn applyConfig(config: *@import("broker/handler.zig").Broker.BrokerConfig, c
     config.s3_block_cache_size = @intCast(cfg.getInt(u64, "s3.block.cache.size", @intCast(config.s3_block_cache_size)));
     config.cache_max_size = @intCast(cfg.getInt(u64, "log.cache.max.size", @intCast(config.cache_max_size)));
     config.compaction_interval_ms = cfg.getInt(i64, "s3.compaction.interval.ms", config.compaction_interval_ms);
+
+    // Security configuration
+    config.sasl_enabled = cfg.getBool("sasl.enabled", config.sasl_enabled);
+    if (cfg.getString("sasl.users")) |u| config.sasl_users = u;
+    if (cfg.getString("super.users")) |u| config.super_users = u;
+    config.allow_everyone_if_no_acl = cfg.getBool("allow.everyone.if.no.acl.found", config.allow_everyone_if_no_acl);
 }
 
 // ---------------------------------------------------------------

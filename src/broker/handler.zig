@@ -16,7 +16,9 @@ const MetricRegistry = @import("metrics.zig").MetricRegistry;
 const metrics_mod = @import("metrics.zig");
 const MetadataPersistence = @import("persistence.zig").MetadataPersistence;
 const RaftState = @import("../raft/state.zig").RaftState;
-const Authorizer = @import("../security/auth.zig").Authorizer;
+const auth_mod = @import("../security/auth.zig");
+const Authorizer = auth_mod.Authorizer;
+const SaslPlainAuthenticator = auth_mod.SaslPlainAuthenticator;
 const FetchSessionManager = @import("fetch_session.zig").FetchSessionManager;
 // Import failover controller
 const FailoverController = @import("failover.zig").FailoverController;
@@ -70,6 +72,14 @@ pub const Broker = struct {
     /// Used for staleness detection: if too old, the broker self-fences.
     last_successful_heartbeat_ms: i64 = 0,
     authorizer: Authorizer,
+    /// SASL/PLAIN authenticator for client authentication.
+    sasl_authenticator: SaslPlainAuthenticator,
+    /// Whether SASL authentication is required for client connections.
+    sasl_enabled: bool = false,
+    /// Map of client_id → authenticated principal (from SASL handshake).
+    /// Used to resolve the real principal for ACL checks instead of trusting
+    /// the unauthenticated client_id header.
+    authenticated_sessions: std.StringHashMap([]u8),
     /// KIP-227 incremental fetch session manager.
     fetch_sessions: FetchSessionManager,
     /// Counter for S3 flush failures (used for monitoring/alerting).
@@ -214,6 +224,16 @@ pub const Broker = struct {
         // Compaction configuration
         /// Log compaction interval in milliseconds (default 5 minutes)
         compaction_interval_ms: i64 = 300_000,
+
+        // Security configuration
+        /// Enable SASL authentication (default: false for backward compatibility)
+        sasl_enabled: bool = false,
+        /// Comma-separated user:password pairs for SASL/PLAIN (e.g., "admin:secret,user1:pass1")
+        sasl_users: []const u8 = "",
+        /// Semicolon-separated principals that bypass ACLs (e.g., "User:admin;User:broker")
+        super_users: []const u8 = "",
+        /// Allow all operations when no ACLs are defined (default: true)
+        allow_everyone_if_no_acl: bool = true,
     };
 
     pub const WalFlushMode = @import("../storage/wal.zig").WalFlushMode;
@@ -257,6 +277,8 @@ pub const Broker = struct {
             .default_replication_factor = config.default_replication_factor,
             .advertised_host = config.advertised_host,
             .authorizer = Authorizer.init(alloc),
+            .sasl_authenticator = SaslPlainAuthenticator.init(alloc),
+            .authenticated_sessions = std.StringHashMap([]u8).init(alloc),
             .fetch_sessions = FetchSessionManager.init(alloc),
             // Initialize failover controller
             .failover_controller = FailoverController.init(alloc, node_id),
@@ -299,6 +321,32 @@ pub const Broker = struct {
         }
         if (broker.compaction_manager) |*cm| {
             cm.metrics = &broker.metrics;
+        }
+
+        // Configure security settings
+        broker.sasl_enabled = config.sasl_enabled;
+        broker.authorizer.allow_everyone_if_no_acl = config.allow_everyone_if_no_acl;
+
+        // Parse sasl.users: "user1:pass1,user2:pass2"
+        if (config.sasl_users.len > 0) {
+            var user_pairs = std.mem.splitSequence(u8, config.sasl_users, ",");
+            while (user_pairs.next()) |pair| {
+                if (std.mem.indexOf(u8, pair, ":")) |colon| {
+                    const username = pair[0..colon];
+                    const password = pair[colon + 1 ..];
+                    broker.sasl_authenticator.addUser(username, password) catch {};
+                }
+            }
+        }
+
+        // Parse super.users: "User:admin;User:broker"
+        if (config.super_users.len > 0) {
+            var su_iter = std.mem.splitSequence(u8, config.super_users, ";");
+            while (su_iter.next()) |su| {
+                if (su.len > 0) {
+                    broker.authorizer.addSuperUser(su) catch {};
+                }
+            }
         }
 
         return broker;
@@ -398,6 +446,33 @@ pub const Broker = struct {
         }
         if (saved_sequences.len > 0) {
             log.info("Restored {d} producer sequence state(s)", .{saved_sequences.len});
+        }
+
+        // Load persisted ACLs
+        const saved_acls = try self.persistence.loadAcls();
+        defer {
+            for (saved_acls) |entry| {
+                self.allocator.free(entry.principal);
+                self.allocator.free(entry.resource_name);
+                self.allocator.free(entry.host);
+            }
+            self.allocator.free(saved_acls);
+        }
+        for (saved_acls) |entry| {
+            self.authorizer.addAcl(
+                entry.principal,
+                @enumFromInt(entry.resource_type),
+                entry.resource_name,
+                @enumFromInt(entry.pattern_type),
+                @enumFromInt(entry.operation),
+                @enumFromInt(entry.permission),
+                entry.host,
+            ) catch |err| {
+                log.warn("Failed to restore ACL: {}", .{err});
+            };
+        }
+        if (saved_acls.len > 0) {
+            log.info("Restored {d} ACL(s) from acls.meta", .{saved_acls.len});
         }
     }
 
@@ -549,6 +624,14 @@ pub const Broker = struct {
         self.quota_manager.deinit();
         self.metrics.deinit();
         self.authorizer.deinit();
+        self.sasl_authenticator.deinit();
+        // Free authenticated session keys and values
+        var sess_it = self.authenticated_sessions.iterator();
+        while (sess_it.next()) |entry| {
+            self.allocator.free(entry.key_ptr.*);
+            self.allocator.free(entry.value_ptr.*);
+        }
+        self.authenticated_sessions.deinit();
         self.fetch_sessions.deinit();
         // Clean up failover controller
         self.failover_controller.deinit();
@@ -565,6 +648,13 @@ pub const Broker = struct {
     fn persistTopics(self: *Broker) void {
         self.persistence.saveTopics(&self.topics) catch |err| {
             log.warn("Failed to persist topics: {}", .{err});
+        };
+    }
+
+    /// Persist ACLs to disk.
+    fn persistAcls(self: *Broker) void {
+        self.persistence.saveAcls(self.authorizer.acls.items) catch |err| {
+            log.warn("Failed to persist ACLs: {}", .{err});
         };
     }
 
@@ -761,13 +851,16 @@ pub const Broker = struct {
         log.debug("api_key={d} v={d} corr={d}", .{ api_key, api_version, req_header.correlation_id });
 
         // Auth/ACL check before dispatch
-        if (self.authorizer.aclCount() > 0) {
-            const principal = req_header.client_id orelse "anonymous";
+        if (self.authorizer.aclCount() > 0 or !self.authorizer.allow_everyone_if_no_acl) {
+            const client_id = req_header.client_id orelse "anonymous";
+            // Use authenticated principal if SASL was completed, otherwise fall back to client_id
+            const principal = self.authenticated_sessions.get(client_id) orelse client_id;
             const resource_type = resourceTypeForApiKey(api_key);
             if (resource_type != .unknown) {
                 const operation = operationForApiKey(api_key);
-                // Use a generic resource name for now; a full impl would parse it from the request
-                const result = self.authorizer.authorize(principal, resource_type, "*", operation);
+                // Extract topic name for topic-specific ACL checks (Produce/Fetch)
+                const resource_name = extractTopicFromRequest(api_key, request_bytes, pos) orelse "*";
+                const result = self.authorizer.authorize(principal, resource_type, resource_name, operation);
                 if (result == .denied) {
                     return self.handleAuthorizationError(&req_header, resp_header_version);
                 }
@@ -1023,6 +1116,39 @@ pub const Broker = struct {
         ser.writeI16(buf, &wpos, 29);
         if (resp_header_version >= 1) ser.writeEmptyTaggedFields(buf, &wpos);
         return (self.allocator.realloc(buf, wpos) catch buf)[0..wpos];
+    }
+
+    /// Extract the first topic name from a Produce or Fetch request for topic-specific ACL checks.
+    /// Returns null for non-topic APIs or if parsing fails.
+    fn extractTopicFromRequest(api_key: i16, request_bytes: []const u8, body_start: usize) ?[]const u8 {
+        if (api_key != 0 and api_key != 1) return null; // Only Produce (0) and Fetch (1)
+        var pos = body_start;
+        if (api_key == 0) {
+            // Produce v0+: transactional_id (nullable string), acks (i16), timeout (i32), then topic array
+            _ = ser.readString(request_bytes, &pos) catch return null; // transactional_id
+            if (pos + 6 > request_bytes.len) return null;
+            pos += 2; // acks (i16)
+            pos += 4; // timeout_ms (i32)
+            const num_topics_opt = ser.readArrayLen(request_bytes, &pos) catch return null;
+            if (num_topics_opt) |num_topics| {
+                if (num_topics > 0) {
+                    return (ser.readString(request_bytes, &pos) catch null) orelse null;
+                }
+            }
+        } else {
+            // Fetch v0+: replica_id (i32), max_wait (i32), min_bytes (i32), then topic array
+            if (pos + 12 > request_bytes.len) return null;
+            pos += 4; // replica_id (i32)
+            pos += 4; // max_wait_ms (i32)
+            pos += 4; // min_bytes (i32)
+            const num_topics_opt = ser.readArrayLen(request_bytes, &pos) catch return null;
+            if (num_topics_opt) |num_topics| {
+                if (num_topics > 0) {
+                    return (ser.readString(request_bytes, &pos) catch null) orelse null;
+                }
+            }
+        }
+        return null;
     }
 
     // ---------------------------------------------------------------
@@ -2927,13 +3053,18 @@ pub const Broker = struct {
     fn handleSaslHandshake(self: *Broker, request_bytes: []const u8, body_start: usize, req_header: *const RequestHeader, resp_header_version: i16) ?[]u8 {
         var pos = body_start;
         const mechanism = (ser.readString(request_bytes, &pos) catch return null) orelse "";
-        _ = mechanism;
 
         var buf = self.allocator.alloc(u8, 128) catch return null;
         var wpos: usize = 0;
         const rh = ResponseHeader{ .correlation_id = req_header.correlation_id };
         rh.serialize(buf, &wpos, resp_header_version);
-        ser.writeI16(buf, &wpos, 0); // error_code = NONE (accept all)
+
+        // Validate the requested mechanism
+        if (std.mem.eql(u8, mechanism, "PLAIN")) {
+            ser.writeI16(buf, &wpos, 0); // error_code = NONE
+        } else {
+            ser.writeI16(buf, &wpos, 33); // error_code = UNSUPPORTED_SASL_MECHANISM
+        }
         // enabled_mechanisms array: [PLAIN]
         ser.writeArrayLen(buf, &wpos, 1);
         ser.writeString(buf, &wpos, "PLAIN");
@@ -2947,16 +3078,68 @@ pub const Broker = struct {
     fn handleSaslAuthenticate(self: *Broker, request_bytes: []const u8, body_start: usize, req_header: *const RequestHeader, api_version: i16, resp_header_version: i16) ?[]u8 {
         _ = api_version;
         var pos = body_start;
-        // auth_bytes contains the SASL/PLAIN credentials
-        _ = ser.readBytes(request_bytes, &pos) catch null;
+        // auth_bytes contains the SASL/PLAIN credentials: \0<username>\0<password>
+        const auth_bytes = ser.readBytes(request_bytes, &pos) catch null;
 
-        var buf = self.allocator.alloc(u8, 128) catch return null;
+        var buf = self.allocator.alloc(u8, 256) catch return null;
         var wpos: usize = 0;
         const rh = ResponseHeader{ .correlation_id = req_header.correlation_id };
         rh.serialize(buf, &wpos, resp_header_version);
-        ser.writeI16(buf, &wpos, 0); // error_code = NONE
-        ser.writeString(buf, &wpos, ""); // error_message
-        ser.writeBytesBuf(buf, &wpos, &.{}); // auth_bytes (empty response)
+
+        // If SASL is not enabled, accept all connections (backward compatible)
+        if (!self.sasl_enabled) {
+            ser.writeI16(buf, &wpos, 0); // error_code = NONE
+            ser.writeString(buf, &wpos, ""); // error_message
+            ser.writeBytesBuf(buf, &wpos, &.{}); // auth_bytes (empty response)
+            ser.writeI64(buf, &wpos, 0); // session_lifetime_ms
+            if (resp_header_version >= 1) ser.writeEmptyTaggedFields(buf, &wpos);
+            return (self.allocator.realloc(buf, wpos) catch buf)[0..wpos];
+        }
+
+        // Validate credentials using SaslPlainAuthenticator
+        if (auth_bytes) |token| {
+            const result = self.sasl_authenticator.authenticate(token);
+            if (result.success) {
+                // Store authenticated principal keyed by client_id
+                if (req_header.client_id) |client_id| {
+                    if (result.principal) |principal| {
+                        // Format as "User:<username>" to match Kafka principal format
+                        const full_principal = std.fmt.allocPrint(self.allocator, "User:{s}", .{principal}) catch {
+                            ser.writeI16(buf, &wpos, 58); // SASL_AUTHENTICATION_FAILED
+                            ser.writeString(buf, &wpos, "Internal error");
+                            ser.writeBytesBuf(buf, &wpos, &.{});
+                            ser.writeI64(buf, &wpos, 0);
+                            if (resp_header_version >= 1) ser.writeEmptyTaggedFields(buf, &wpos);
+                            return (self.allocator.realloc(buf, wpos) catch buf)[0..wpos];
+                        };
+                        const key = self.allocator.dupe(u8, client_id) catch {
+                            self.allocator.free(full_principal);
+                            ser.writeI16(buf, &wpos, 58);
+                            ser.writeString(buf, &wpos, "Internal error");
+                            ser.writeBytesBuf(buf, &wpos, &.{});
+                            ser.writeI64(buf, &wpos, 0);
+                            if (resp_header_version >= 1) ser.writeEmptyTaggedFields(buf, &wpos);
+                            return (self.allocator.realloc(buf, wpos) catch buf)[0..wpos];
+                        };
+                        self.authenticated_sessions.put(key, full_principal) catch {
+                            self.allocator.free(key);
+                            self.allocator.free(full_principal);
+                        };
+                    }
+                }
+                ser.writeI16(buf, &wpos, 0); // error_code = NONE
+                ser.writeString(buf, &wpos, ""); // error_message
+                ser.writeBytesBuf(buf, &wpos, &.{}); // auth_bytes
+                ser.writeI64(buf, &wpos, 0); // session_lifetime_ms
+                if (resp_header_version >= 1) ser.writeEmptyTaggedFields(buf, &wpos);
+                return (self.allocator.realloc(buf, wpos) catch buf)[0..wpos];
+            }
+        }
+
+        // Authentication failed
+        ser.writeI16(buf, &wpos, 58); // error_code = SASL_AUTHENTICATION_FAILED
+        ser.writeString(buf, &wpos, "Authentication failed");
+        ser.writeBytesBuf(buf, &wpos, &.{}); // auth_bytes
         ser.writeI64(buf, &wpos, 0); // session_lifetime_ms
         if (resp_header_version >= 1) ser.writeEmptyTaggedFields(buf, &wpos);
         return (self.allocator.realloc(buf, wpos) catch buf)[0..wpos];
@@ -3223,6 +3406,10 @@ pub const Broker = struct {
             ser.writeString(buf, &wpos, null); // error_message
         }
         if (resp_header_version >= 1) ser.writeEmptyTaggedFields(buf, &wpos);
+
+        // Persist ACLs after creation
+        self.persistAcls();
+
         return (self.allocator.realloc(buf, wpos) catch buf)[0..wpos];
     }
 
@@ -3231,16 +3418,54 @@ pub const Broker = struct {
     // ---------------------------------------------------------------
     fn handleDeleteAcls(self: *Broker, request_bytes: []const u8, body_start: usize, req_header: *const RequestHeader, api_version: i16, resp_header_version: i16) ?[]u8 {
         _ = api_version;
-        _ = request_bytes;
-        _ = body_start;
-        // Delete matching ACLs — simplified: return success with 0 matches
-        var buf = self.allocator.alloc(u8, 128) catch return null;
+        var pos = body_start;
+
+        // Parse filter array
+        const num_filters_opt = ser.readArrayLen(request_bytes, &pos) catch null;
+        const num_filters: usize = if (num_filters_opt) |n| @min(n, 64) else 0;
+
+        var buf = self.allocator.alloc(u8, 512) catch return null;
         var wpos: usize = 0;
         const rh = ResponseHeader{ .correlation_id = req_header.correlation_id };
         rh.serialize(buf, &wpos, resp_header_version);
         ser.writeI32(buf, &wpos, 0); // throttle_time_ms
-        ser.writeArrayLen(buf, &wpos, 0); // empty filter results
+        ser.writeArrayLen(buf, &wpos, @intCast(num_filters)); // filter results
+
+        var total_removed: usize = 0;
+        for (0..num_filters) |_| {
+            // Parse filter: resource_type (i8), resource_name (nullable string),
+            // pattern_type (i8), principal (nullable string), host (nullable string),
+            // operation (i8), permission (i8)
+            const rt_raw = ser.readI8(request_bytes, &pos);
+            const rn = (ser.readString(request_bytes, &pos) catch null) orelse "*";
+            const pt_raw = ser.readI8(request_bytes, &pos);
+            const principal = (ser.readString(request_bytes, &pos) catch null) orelse "*";
+            const host = (ser.readString(request_bytes, &pos) catch null) orelse "*";
+            const op_raw = ser.readI8(request_bytes, &pos);
+            const perm_raw = ser.readI8(request_bytes, &pos);
+
+            const resource_type: Authorizer.ResourceType = @enumFromInt(rt_raw);
+            const pattern_type: Authorizer.PatternType = @enumFromInt(pt_raw);
+            const operation: Authorizer.Operation = @enumFromInt(op_raw);
+            const permission: Authorizer.Permission = @enumFromInt(perm_raw);
+
+            const removed = self.authorizer.removeMatchingAcls(resource_type, rn, pattern_type, principal, host, operation, permission);
+            total_removed += removed;
+
+            // Write per-filter result: error_code (i16), error_message (nullable string), matching_acls array
+            ser.writeI16(buf, &wpos, 0); // error_code = NONE
+            ser.writeString(buf, &wpos, ""); // error_message
+            ser.writeArrayLen(buf, &wpos, @intCast(removed)); // matching_acls count
+            // NOTE: Kafka protocol expects per-match details; we return count only for simplicity
+        }
+
         if (resp_header_version >= 1) ser.writeEmptyTaggedFields(buf, &wpos);
+
+        // Persist ACLs after deletion
+        if (total_removed > 0) {
+            self.persistAcls();
+        }
+
         return (self.allocator.realloc(buf, wpos) catch buf)[0..wpos];
     }
 

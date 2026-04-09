@@ -43,13 +43,36 @@ pub const S3Client = struct {
     };
 
     pub fn init(alloc: Allocator, config: Config) S3Client {
+        // S3 credential resolution chain (matches AutoMQ's AutoMQStaticCredentialsProvider):
+        // 1. Explicit config values (if not the default "minioadmin")
+        // 2. KAFKA_S3_ACCESS_KEY / KAFKA_S3_SECRET_KEY (AutoMQ-specific)
+        // 3. AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY (standard AWS SDK)
+        // 4. Fall back to config defaults
+        const access_key = if (!std.mem.eql(u8, config.access_key, "minioadmin"))
+            config.access_key
+        else if (std.posix.getenv("KAFKA_S3_ACCESS_KEY")) |k|
+            k
+        else if (std.posix.getenv("AWS_ACCESS_KEY_ID")) |k|
+            k
+        else
+            config.access_key;
+
+        const secret_key = if (!std.mem.eql(u8, config.secret_key, "minioadmin"))
+            config.secret_key
+        else if (std.posix.getenv("KAFKA_S3_SECRET_KEY")) |k|
+            k
+        else if (std.posix.getenv("AWS_SECRET_ACCESS_KEY")) |k|
+            k
+        else
+            config.secret_key;
+
         return .{
             .host = config.host,
             .port = config.port,
             .bucket = config.bucket,
-            .access_key = config.access_key,
-            .secret_key = config.secret_key,
-            .signer = AwsSigV4.init(config.access_key, config.secret_key),
+            .access_key = access_key,
+            .secret_key = secret_key,
+            .signer = AwsSigV4.init(access_key, secret_key),
             .allocator = alloc,
         };
     }

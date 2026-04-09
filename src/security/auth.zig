@@ -10,6 +10,13 @@ const log = std.log.scoped(.auth);
 pub const Authorizer = struct {
     acls: std.ArrayList(AclEntry),
     allocator: Allocator,
+    /// Principals that bypass all ACL checks (e.g., "User:admin").
+    /// Matches AutoMQ/Kafka's super.users configuration.
+    super_users: std.StringHashMap(void),
+    /// When true (default), allow all operations if no ACLs are defined.
+    /// When false, deny all operations when no ACLs match.
+    /// Matches Kafka's allow.everyone.if.no.acl.found configuration.
+    allow_everyone_if_no_acl: bool = true,
 
     pub const ResourceType = enum(i8) {
         unknown = 0,
@@ -65,6 +72,7 @@ pub const Authorizer = struct {
     pub fn init(alloc: Allocator) Authorizer {
         return .{
             .acls = std.ArrayList(AclEntry).init(alloc),
+            .super_users = std.StringHashMap(void).init(alloc),
             .allocator = alloc,
         };
     }
@@ -76,6 +84,11 @@ pub const Authorizer = struct {
             self.allocator.free(entry.host);
         }
         self.acls.deinit();
+        var su_it = self.super_users.keyIterator();
+        while (su_it.next()) |key| {
+            self.allocator.free(key.*);
+        }
+        self.super_users.deinit();
     }
 
     /// Add an ACL entry.
@@ -92,10 +105,82 @@ pub const Authorizer = struct {
         log.info("ACL added: principal={s} resource={s} op={d} permission={d}", .{ principal, resource_name, @intFromEnum(operation), @intFromEnum(permission) });
     }
 
+    /// Add a super user principal that bypasses all ACL checks.
+    pub fn addSuperUser(self: *Authorizer, principal: []const u8) !void {
+        const key = try self.allocator.dupe(u8, principal);
+        try self.super_users.put(key, {});
+        log.info("Super user added: {s}", .{principal});
+    }
+
+    /// Remove ACL entries matching the given filter criteria.
+    /// A filter field value of null or wildcard means "match any".
+    /// Returns the number of entries removed.
+    pub fn removeMatchingAcls(
+        self: *Authorizer,
+        filter_resource_type: ResourceType,
+        filter_resource_name: ?[]const u8,
+        filter_pattern_type: PatternType,
+        filter_principal: ?[]const u8,
+        filter_host: ?[]const u8,
+        filter_operation: Operation,
+        filter_permission: Permission,
+    ) usize {
+        var removed: usize = 0;
+        var i: usize = 0;
+        while (i < self.acls.items.len) {
+            const acl = self.acls.items[i];
+            const matches = aclMatchesFilter(acl, filter_resource_type, filter_resource_name, filter_pattern_type, filter_principal, filter_host, filter_operation, filter_permission);
+            if (matches) {
+                self.allocator.free(acl.principal);
+                self.allocator.free(acl.resource_name);
+                self.allocator.free(acl.host);
+                _ = self.acls.orderedRemove(i);
+                removed += 1;
+            } else {
+                i += 1;
+            }
+        }
+        if (removed > 0) {
+            log.info("Removed {d} ACL entries matching filter", .{removed});
+        }
+        return removed;
+    }
+
+    fn aclMatchesFilter(
+        acl: AclEntry,
+        filter_resource_type: ResourceType,
+        filter_resource_name: ?[]const u8,
+        filter_pattern_type: PatternType,
+        filter_principal: ?[]const u8,
+        filter_host: ?[]const u8,
+        filter_operation: Operation,
+        filter_permission: Permission,
+    ) bool {
+        if (filter_resource_type != .any and filter_resource_type != .unknown and acl.resource_type != filter_resource_type) return false;
+        if (filter_resource_name) |name| {
+            if (!std.mem.eql(u8, name, "*") and !std.mem.eql(u8, name, acl.resource_name)) return false;
+        }
+        if (filter_pattern_type != .any and filter_pattern_type != .unknown and acl.pattern_type != filter_pattern_type) return false;
+        if (filter_principal) |p| {
+            if (!std.mem.eql(u8, p, "*") and !std.mem.eql(u8, p, acl.principal)) return false;
+        }
+        if (filter_host) |h| {
+            if (!std.mem.eql(u8, h, "*") and !std.mem.eql(u8, h, acl.host)) return false;
+        }
+        if (filter_operation != .any and filter_operation != .unknown and acl.operation != filter_operation) return false;
+        if (filter_permission != .any and filter_permission != .unknown and acl.permission != filter_permission) return false;
+        return true;
+    }
+
     /// Check if an operation is authorized.
     pub fn authorize(self: *const Authorizer, principal: []const u8, resource_type: ResourceType, resource_name: []const u8, operation: Operation) AuthResult {
-        // If no ACLs exist, allow everything (open access mode)
-        if (self.acls.items.len == 0) return .allowed;
+        // Super users bypass all ACL checks
+        if (self.super_users.contains(principal)) return .allowed;
+
+        // If no ACLs exist, behavior depends on allow_everyone_if_no_acl
+        if (self.acls.items.len == 0) {
+            return if (self.allow_everyone_if_no_acl) .allowed else .denied;
+        }
 
         var explicitly_denied = false;
         var explicitly_allowed = false;
@@ -495,4 +580,69 @@ test "PBKDF2 basic" {
         }
     }
     try testing.expect(!all_zero);
+}
+
+test "Authorizer super user bypasses deny" {
+    var auth = Authorizer.init(testing.allocator);
+    defer auth.deinit();
+
+    try auth.addSuperUser("User:admin");
+    try auth.addAcl("User:admin", .topic, "secret", .literal, .read, .deny, "*");
+
+    // Super user bypasses ACLs even with explicit deny
+    try testing.expectEqual(Authorizer.AuthResult.allowed, auth.authorize("User:admin", .topic, "secret", .read));
+    // Non-super user is denied
+    try testing.expectEqual(Authorizer.AuthResult.denied, auth.authorize("User:regular", .topic, "secret", .read));
+}
+
+test "Authorizer allow_everyone_if_no_acl=false denies" {
+    var auth = Authorizer.init(testing.allocator);
+    defer auth.deinit();
+    auth.allow_everyone_if_no_acl = false;
+
+    // With no ACLs and allow_everyone=false, deny everything
+    try testing.expectEqual(Authorizer.AuthResult.denied, auth.authorize("User:alice", .topic, "test", .read));
+}
+
+test "Authorizer allow_everyone_if_no_acl=true allows" {
+    var auth = Authorizer.init(testing.allocator);
+    defer auth.deinit();
+    auth.allow_everyone_if_no_acl = true;
+
+    // Default: with no ACLs, allow everything
+    try testing.expectEqual(Authorizer.AuthResult.allowed, auth.authorize("User:alice", .topic, "test", .read));
+}
+
+test "Authorizer removeMatchingAcls" {
+    var auth = Authorizer.init(testing.allocator);
+    defer auth.deinit();
+
+    try auth.addAcl("User:alice", .topic, "test", .literal, .read, .allow, "*");
+    try auth.addAcl("User:alice", .topic, "test", .literal, .write, .allow, "*");
+    try auth.addAcl("User:bob", .topic, "test", .literal, .read, .allow, "*");
+
+    try testing.expectEqual(@as(usize, 3), auth.aclCount());
+
+    // Remove only alice's read ACL
+    const removed = auth.removeMatchingAcls(.topic, "test", .literal, "User:alice", null, .read, .any);
+    try testing.expectEqual(@as(usize, 1), removed);
+    try testing.expectEqual(@as(usize, 2), auth.aclCount());
+
+    // Alice can still write but not read
+    try testing.expectEqual(Authorizer.AuthResult.denied, auth.authorize("User:alice", .topic, "test", .read));
+    try testing.expectEqual(Authorizer.AuthResult.allowed, auth.authorize("User:alice", .topic, "test", .write));
+}
+
+test "Authorizer removeMatchingAcls wildcard filter" {
+    var auth = Authorizer.init(testing.allocator);
+    defer auth.deinit();
+
+    try auth.addAcl("User:alice", .topic, "t1", .literal, .read, .allow, "*");
+    try auth.addAcl("User:alice", .topic, "t2", .literal, .read, .allow, "*");
+    try auth.addAcl("User:bob", .topic, "t1", .literal, .read, .allow, "*");
+
+    // Remove all of alice's ACLs (wildcard resource name and operation)
+    const removed = auth.removeMatchingAcls(.any, null, .any, "User:alice", null, .any, .any);
+    try testing.expectEqual(@as(usize, 2), removed);
+    try testing.expectEqual(@as(usize, 1), auth.aclCount());
 }

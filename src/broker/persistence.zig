@@ -3,6 +3,7 @@ const testing = std.testing;
 const Allocator = std.mem.Allocator;
 const fs = std.fs;
 const log = std.log.scoped(.persistence);
+const Authorizer = @import("../security/auth.zig").Authorizer;
 
 /// Persists broker metadata (topics, offsets) to a JSON file in the data directory.
 /// Loaded on startup, saved on changes.
@@ -331,6 +332,89 @@ pub const MetadataPersistence = struct {
         }
 
         log.info("Loaded {d} producer sequences from producer_state.meta", .{entries.items.len});
+        return entries.toOwnedSlice();
+    }
+
+    /// Save ACL entries to disk.
+    /// Format: principal\tresource_type\tresource_name\tpattern_type\toperation\tpermission\thost
+    pub fn saveAcls(self: *MetadataPersistence, acls: []const Authorizer.AclEntry) !void {
+        const dir = self.data_dir orelse return;
+
+        const path = try std.fmt.allocPrint(self.allocator, "{s}/acls.meta", .{dir});
+        defer self.allocator.free(path);
+
+        const file = try fs.createFileAbsolute(path, .{ .truncate = true });
+        defer file.close();
+
+        const writer = file.writer();
+        for (acls) |acl| {
+            try writer.print("{s}\t{d}\t{s}\t{d}\t{d}\t{d}\t{s}\n", .{
+                acl.principal,
+                @intFromEnum(acl.resource_type),
+                acl.resource_name,
+                @intFromEnum(acl.pattern_type),
+                @intFromEnum(acl.operation),
+                @intFromEnum(acl.permission),
+                acl.host,
+            });
+        }
+    }
+
+    pub const AclEntry = struct {
+        principal: []u8,
+        resource_type: i8,
+        resource_name: []u8,
+        pattern_type: i8,
+        operation: i8,
+        permission: i8,
+        host: []u8,
+    };
+
+    /// Load ACL entries from disk.
+    pub fn loadAcls(self: *MetadataPersistence) ![]AclEntry {
+        const dir = self.data_dir orelse return &.{};
+
+        const path = try std.fmt.allocPrint(self.allocator, "{s}/acls.meta", .{dir});
+        defer self.allocator.free(path);
+
+        const file = fs.openFileAbsolute(path, .{}) catch |err| {
+            log.debug("No acls.meta found: {}", .{err});
+            return &.{};
+        };
+        defer file.close();
+
+        const content = file.readToEndAlloc(self.allocator, 1024 * 1024) catch |err| {
+            log.warn("Failed to read acls.meta: {}", .{err});
+            return &.{};
+        };
+        defer self.allocator.free(content);
+
+        var entries = std.ArrayList(AclEntry).init(self.allocator);
+
+        var lines = std.mem.splitSequence(u8, content, "\n");
+        while (lines.next()) |line| {
+            if (line.len == 0) continue;
+            var fields = std.mem.splitSequence(u8, line, "\t");
+            const principal = fields.next() orelse continue;
+            const rt_str = fields.next() orelse continue;
+            const rn = fields.next() orelse continue;
+            const pt_str = fields.next() orelse continue;
+            const op_str = fields.next() orelse continue;
+            const perm_str = fields.next() orelse continue;
+            const host = fields.next() orelse continue;
+
+            try entries.append(.{
+                .principal = try self.allocator.dupe(u8, principal),
+                .resource_type = std.fmt.parseInt(i8, rt_str, 10) catch continue,
+                .resource_name = try self.allocator.dupe(u8, rn),
+                .pattern_type = std.fmt.parseInt(i8, pt_str, 10) catch continue,
+                .operation = std.fmt.parseInt(i8, op_str, 10) catch continue,
+                .permission = std.fmt.parseInt(i8, perm_str, 10) catch continue,
+                .host = try self.allocator.dupe(u8, host),
+            });
+        }
+
+        log.info("Loaded {d} ACLs from acls.meta", .{entries.items.len});
         return entries.toOwnedSlice();
     }
 };
