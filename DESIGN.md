@@ -846,6 +846,186 @@ On startup, `RaftState.loadPersistedLog()` first restores `current_epoch` and `v
 
 ---
 
+## Exactly-Once Transactions
+
+### What Transactions Provide
+
+Kafka transactions enable **exactly-once semantics (EOS)** for produce-consume pipelines. A producer can atomically write to multiple partitions — either all records become visible to consumers or none do. The Zig implementation (`src/broker/txn_coordinator.zig`) follows Apache Kafka's two-phase commit (2PC) protocol with producer epoch fencing for zombie prevention.
+
+### Transaction State Machine
+
+The `TransactionCoordinator` manages per-producer transaction lifecycle through a strict state machine:
+
+```
+                    initProducerId()
+                          │
+                          ▼
+                    ┌───────────┐
+                    │   Empty   │  (producer registered, no active txn)
+                    └─────┬─────┘
+                          │ addPartitionsToTxn()
+                          ▼
+                    ┌───────────┐
+         ┌─────────│  Ongoing   │─────────┐
+         │         └───────────┘          │
+         │ endTxn(commit=true)            │ endTxn(commit=false)
+         ▼                                ▼
+   ┌──────────────┐                ┌──────────────┐
+   │PrepareCommit │                │PrepareAbort  │
+   └──────┬───────┘                └──────┬───────┘
+          │ writeTxnMarkers()             │ writeTxnMarkers()
+          ▼                               ▼
+   ┌───────────────┐               ┌──────────────┐
+   │CompleteCommit │               │CompleteAbort │
+   └───────────────┘               └──────────────┘
+```
+
+- **Empty → Ongoing**: First `addPartitionsToTxn()` call transitions to `ongoing` and records the transaction start time.
+- **Ongoing → PrepareCommit/PrepareAbort**: `endTxn()` marks the transaction for commit or abort.
+- **PrepareCommit → CompleteCommit**: `writeTxnMarkers()` writes COMMIT control record batches to each enrolled partition, then clears the partition list.
+- **PrepareAbort → CompleteAbort**: Same as above, but writes ABORT markers instead.
+
+Invalid state transitions return error 55 (`INVALID_TXN_STATE`). For example, calling `endTxn()` on an `empty` transaction (no partitions added) or calling it twice on the same transaction both fail.
+
+### Transaction Protocol Flow
+
+A complete transaction involves four Kafka API calls, handled by `Broker` (`src/broker/handler.zig`):
+
+```
+Producer                        Broker (handler.zig)              TxnCoordinator
+   │                                │                                    │
+   │ InitProducerId (API 22)        │                                    │
+   │ {transactional_id: "my-txn"}   │                                    │
+   │──────────────────────────────► │  initProducerId("my-txn")         │
+   │                                │──────────────────────────────────►│
+   │                                │  ◄── {pid=1000, epoch=0}          │
+   │ ◄─── {producer_id, epoch}      │                                    │
+   │                                │                                    │
+   │ Produce (API 0)                │                                    │
+   │ {pid, epoch, txn records}      │                                    │
+   │──────────────────────────────► │  PartitionStore.produce()         │
+   │                                │  + addPartitionsToTxn(pid, epoch, │
+   │                                │    topic, partition)              │
+   │                                │──────────────────────────────────►│
+   │ ◄─── {base_offset}             │                                    │
+   │                                │                                    │
+   │ AddPartitionsToTxn (API 24)    │                                    │
+   │ {pid, epoch, topic, partition} │                                    │
+   │──────────────────────────────► │  addPartitionsToTxn()             │
+   │                                │──────────────────────────────────►│
+   │ ◄─── {error: 0}                │                                    │
+   │                                │                                    │
+   │ EndTxn (API 26)                │                                    │
+   │ {pid, epoch, committed=true}   │                                    │
+   │──────────────────────────────► │  For each partition:              │
+   │                                │    buildControlBatch(COMMIT)      │
+   │                                │    PartitionStore.produce(marker) │
+   │                                │  endTxnComplete(pid, epoch, true) │
+   │                                │──────────────────────────────────►│
+   │ ◄─── {error: 0}                │  LSO advances → consumers see data│
+```
+
+### Producer Epoch Fencing (Zombie Prevention)
+
+Each transactional producer is assigned a monotonically increasing `producer_epoch`. When a producer reconnects with the same `transactional_id`, the epoch is bumped:
+
+```
+initProducerId("my-txn")  → pid=1000, epoch=0
+initProducerId("my-txn")  → pid=1000, epoch=1  (bumped)
+initProducerId("my-txn")  → pid=1000, epoch=2  (bumped again)
+```
+
+All subsequent operations (`addPartitionsToTxn`, `endTxn`) validate the epoch. If the epoch doesn't match, the request is rejected with `PRODUCER_FENCED` (error 22). This prevents "zombie" producers — old instances that are still running after a restart or failover — from corrupting the transaction.
+
+**Epoch overflow protection**: When the epoch approaches `i16` max (32767), the coordinator allocates a fresh `producer_id` and resets the epoch to 0. This matches AutoMQ/Kafka's behavior where epoch exhaustion triggers PID reallocation.
+
+### Control Record Batches
+
+Transaction commit/abort is made visible to consumers through **control record batches** — special RecordBatch records with two attribute flags set:
+
+```
+Control Batch attributes:
+  bit 4 (0x10) — TRANSACTIONAL_MASK: batch is part of a transaction
+  bit 5 (0x20) — CONTROL_MASK:      batch is a control record (not user data)
+
+Control record value format:
+  [version: i16 = 0] [control_type: i16]
+    control_type = 0 → ABORT
+    control_type = 1 → COMMIT
+```
+
+`buildControlBatch()` constructs these batches using the standard `RecordBatch` format from `protocol/record_batch.zig`, with the producer's `producer_id` and `producer_epoch` embedded in the batch header. This allows consumers to correlate control markers with the transaction's data records.
+
+During `handleEndTxn()`, the broker writes a control batch to every partition enrolled in the transaction, then advances `last_stable_offset` to `high_watermark` for those partitions. Without this, `READ_COMMITTED` consumers would never see committed data.
+
+### READ_COMMITTED Isolation and Last Stable Offset
+
+Transactions interact with the read path through the **Last Stable Offset (LSO)**, tracked per partition in `PartitionStore.PartitionState`:
+
+```
+LSO = min(first_unstable_txn_offset, high_watermark)
+```
+
+- **`first_unstable_txn_offset`**: The offset of the earliest record belonging to an in-progress (uncommitted) transaction. Set when a transactional produce arrives; cleared when the transaction commits or aborts.
+- **`high_watermark`**: The highest durably written offset (gated by S3 flush).
+
+```
+Partition data:       [0] [1] [2] [3] [4] [5] [6] [7]
+                       │   │   │   │   │   │   │   │
+                       ok  ok  TXN TXN ok  TXN TXN  │
+                                ▲                     │
+                    first_unstable_txn_offset=2     HW=8
+                                │
+                           LSO = min(2, 8) = 2
+
+READ_UNCOMMITTED (isolation=0): sees offsets 0..7 (up to next_offset)
+READ_COMMITTED   (isolation=1): sees offsets 0..1 (up to LSO=2)
+```
+
+After the transaction commits (control batch written, LSO advanced):
+```
+                       [0] [1] [2] [3] [4] [5] [6] [7]
+                        ok  ok  ok  ok  ok  ok  ok   │
+                                                    HW=8
+                           LSO = min(∞, 8) = 8
+
+READ_COMMITTED: sees offsets 0..7  ← data now visible
+```
+
+This is implemented in `PartitionStore.fetchWithIsolation()`: when `isolation_level == 1` (READ_COMMITTED), the effective end offset is capped to `last_stable_offset` rather than `next_offset`.
+
+### Transaction Timeout and Auto-Abort
+
+Transactions that remain in `ongoing` state beyond their timeout (default 60s, configurable per transaction via `timeout_ms`) are automatically aborted by `expireTransactions()`, called periodically from `Broker.tick()`:
+
+1. Scan all transactions for `status == .ongoing` where `(now - start_time_ms) > timeout_ms`
+2. Transition expired transactions to `prepare_abort`
+3. Call `writeTxnMarkers()` to finalize the abort
+
+This prevents resource leaks from abandoned producers (e.g., a producer that crashes mid-transaction). AutoMQ/Kafka implements the same behavior via `transaction.timeout.ms` (default 60s).
+
+### Transaction State Persistence
+
+Transaction state is persisted to disk for crash recovery, managed by `MetadataPersistence` (`src/broker/persistence.zig`):
+
+- `serializeState()` encodes all active transactions: `producer_id`, `producer_epoch`, `status`, `transactional_id`, and partition count.
+- `restoreState()` rebuilds the in-memory `TransactionCoordinator` from persisted snapshots on broker startup.
+- A `dirty` flag tracks whether state has changed since the last save. `Broker.tick()` checks this flag and persists when needed.
+
+**NOTE**: AutoMQ/Kafka persists transaction state to the `__transaction_state` internal topic, which is replicated via KRaft. ZMQ uses file-based persistence as a simplification — transaction state is local to each broker rather than replicated. This means transaction recovery after failover requires the same broker to restart.
+
+### Known Gaps vs AutoMQ
+
+| Feature | AutoMQ/Kafka | ZMQ Status |
+|---------|-------------|------------|
+| Transaction state topic | `__transaction_state` (replicated) | File-based persistence (local to broker) |
+| Transaction coordinator discovery | Hash `transactional_id` to partition of `__transaction_state` → coordinator is the partition leader | Single coordinator per broker (all transactions handled locally) |
+| Idempotent producer dedup | Full per-partition sequence tracking with ProducerStateManager | `producer_sequences` HashMap in `Broker` (basic dedup) |
+| AddOffsetsToTxn (API 25) | Enrolls `__consumer_offsets` partitions in the transaction for consume-transform-produce EOS | Not yet implemented |
+| Cross-broker transactions | Transaction coordinator writes markers to remote partitions | Single-broker scope only |
+
+---
+
 ## Architecture Summary
 
 ```
