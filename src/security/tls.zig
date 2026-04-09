@@ -3,12 +3,13 @@ const testing = std.testing;
 const posix = std.posix;
 const log = std.log.scoped(.tls);
 const Allocator = std.mem.Allocator;
+const OpenSslLib = @import("openssl.zig").OpenSslLib;
 
 /// TLS configuration for the broker.
 ///
 /// Supports both client-facing (data plane) and inter-broker (control plane)
-/// TLS connections. Uses OpenSSL/BoringSSL via C FFI for production, or
-/// Zig's std.crypto for basic TLS operations.
+/// TLS connections. Uses OpenSSL via runtime dlopen — no compile-time C
+/// headers required, just libssl.so.3 at runtime.
 ///
 /// Kafka TLS modes:
 /// - PLAINTEXT (port 9092): No TLS
@@ -55,6 +56,15 @@ pub const TlsConfig = struct {
         tls_1_1,
         tls_1_2,
         tls_1_3,
+
+        pub fn toOpenSsl(self: TlsVersion) c_int {
+            return switch (self) {
+                .tls_1_0 => 0x0301,
+                .tls_1_1 => 0x0302,
+                .tls_1_2 => OpenSslLib.TLS1_2_VERSION,
+                .tls_1_3 => OpenSslLib.TLS1_3_VERSION,
+            };
+        }
     };
 
     /// Check if TLS is needed for this protocol.
@@ -82,12 +92,14 @@ pub const TlsConfig = struct {
 
 /// TLS connection state for a single client connection.
 ///
-/// Wraps the raw TCP socket with TLS encryption/decryption.
-/// In a production implementation, this would use OpenSSL's SSL_read/SSL_write.
-/// For now, provides the interface that the network layer needs.
+/// Wraps the raw TCP socket with TLS encryption/decryption via OpenSSL.
+/// Handles non-blocking TLS handshake (SSL_accept returns WANT_READ/WANT_WRITE)
+/// and encrypted I/O (SSL_read/SSL_write).
 pub const TlsConnection = struct {
     inner_fd: posix.fd_t,
     tls_established: bool = false,
+    ssl_ptr: ?*anyopaque = null,
+    openssl: ?*OpenSslLib = null,
     peer_cert_subject: ?[]const u8 = null,
     allocator: Allocator,
 
@@ -98,47 +110,108 @@ pub const TlsConnection = struct {
         };
     }
 
+    /// Initialize with an OpenSSL SSL object for real TLS.
+    pub fn initWithSsl(alloc: Allocator, fd: posix.fd_t, ssl: *anyopaque, openssl: *OpenSslLib) TlsConnection {
+        return .{
+            .inner_fd = fd,
+            .ssl_ptr = ssl,
+            .openssl = openssl,
+            .allocator = alloc,
+        };
+    }
+
     /// Perform the TLS handshake on this connection.
-    /// Returns error.TlsNotImplemented instead of silently pretending TLS works.
-    /// A production implementation would use OpenSSL FFI (SSL_do_handshake).
-    /// Zig's std.crypto provides TLS 1.3 primitives but not a full server-side
-    /// TLS implementation, so this is a documented limitation.
+    /// For non-blocking sockets, may return WantRead or WantWrite — the caller
+    /// should re-arm epoll and retry when the socket is ready.
     pub fn doHandshake(self: *TlsConnection) !void {
-        _ = self;
-        log.err("TLS handshake attempted but TLS is not implemented. " ++
-            "Use PLAINTEXT or SASL_PLAINTEXT protocol, or provide an OpenSSL-backed build.", .{});
-        return error.TlsNotImplemented;
+        const ssl = self.ssl_ptr orelse {
+            log.err("TLS handshake attempted but no SSL object — TLS not configured.", .{});
+            return error.TlsNotImplemented;
+        };
+        const ossl = self.openssl orelse return error.TlsNotImplemented;
+
+        const ret = ossl.SSL_accept(ssl);
+        if (ret == 1) {
+            self.tls_established = true;
+            log.info("TLS handshake completed on fd={d}", .{self.inner_fd});
+            return;
+        }
+
+        const err = ossl.SSL_get_error(ssl, ret);
+        switch (err) {
+            OpenSslLib.SSL_ERROR_WANT_READ => return error.WantRead,
+            OpenSslLib.SSL_ERROR_WANT_WRITE => return error.WantWrite,
+            else => {
+                const err_str = ossl.getErrorString();
+                const err_msg: []const u8 = std.mem.sliceTo(&err_str, 0);
+                log.err("TLS handshake failed on fd={d}: {s}", .{ self.inner_fd, err_msg });
+                return error.TlsHandshakeFailed;
+            },
+        }
     }
 
     /// Read decrypted data from the TLS connection.
-    /// In a real implementation, this calls SSL_read().
     pub fn read(self: *TlsConnection, buf: []u8) !usize {
-        if (!self.tls_established) return error.TlsNotEstablished;
-        // Passthrough to raw socket for now
-        return posix.recv(self.inner_fd, buf, 0) catch return error.ReadError;
+        const ssl = self.ssl_ptr orelse {
+            if (!self.tls_established) return error.TlsNotEstablished;
+            return posix.recv(self.inner_fd, buf, 0) catch return error.ReadError;
+        };
+        const ossl = self.openssl orelse return error.TlsNotEstablished;
+
+        const len: c_int = @intCast(@min(buf.len, std.math.maxInt(c_int)));
+        const ret = ossl.SSL_read(ssl, buf.ptr, len);
+        if (ret > 0) return @intCast(ret);
+
+        const err = ossl.SSL_get_error(ssl, ret);
+        switch (err) {
+            OpenSslLib.SSL_ERROR_WANT_READ => return error.WouldBlock,
+            OpenSslLib.SSL_ERROR_WANT_WRITE => return error.WouldBlock,
+            OpenSslLib.SSL_ERROR_ZERO_RETURN => return 0, // Clean shutdown
+            else => return error.ReadError,
+        }
     }
 
     /// Write encrypted data to the TLS connection.
-    /// In a real implementation, this calls SSL_write().
     pub fn write(self: *TlsConnection, data: []const u8) !usize {
-        if (!self.tls_established) return error.TlsNotEstablished;
-        // Passthrough to raw socket for now
-        return posix.send(self.inner_fd, data, 0) catch return error.WriteError;
+        const ssl = self.ssl_ptr orelse {
+            if (!self.tls_established) return error.TlsNotEstablished;
+            return posix.send(self.inner_fd, data, 0) catch return error.WriteError;
+        };
+        const ossl = self.openssl orelse return error.TlsNotEstablished;
+
+        const len: c_int = @intCast(@min(data.len, std.math.maxInt(c_int)));
+        const ret = ossl.SSL_write(ssl, data.ptr, len);
+        if (ret > 0) return @intCast(ret);
+
+        const err = ossl.SSL_get_error(ssl, ret);
+        switch (err) {
+            OpenSslLib.SSL_ERROR_WANT_WRITE => return error.WouldBlock,
+            OpenSslLib.SSL_ERROR_WANT_READ => return error.WouldBlock,
+            else => return error.WriteError,
+        }
     }
 
     pub fn deinit(self: *TlsConnection) void {
-        // In real implementation: SSL_shutdown() + SSL_free()
-        _ = self;
+        if (self.ssl_ptr) |ssl| {
+            if (self.openssl) |ossl| {
+                _ = ossl.SSL_shutdown(ssl);
+                ossl.SSL_free(ssl);
+            }
+            self.ssl_ptr = null;
+        }
     }
 };
 
 /// TLS context — shared across all connections.
 /// Holds the server certificate, private key, and trusted CAs.
 ///
-/// In a real implementation, this wraps OpenSSL's SSL_CTX.
+/// Wraps OpenSSL's SSL_CTX. Created once at broker startup, used to
+/// create per-connection SSL objects via createSsl().
 pub const TlsContext = struct {
     config: TlsConfig,
     initialized: bool = false,
+    ssl_ctx: ?*anyopaque = null,
+    openssl: ?OpenSslLib = null,
     allocator: Allocator,
 
     pub fn init(alloc: Allocator, config: TlsConfig) !TlsContext {
@@ -149,45 +222,123 @@ pub const TlsContext = struct {
 
         if (config.needsTls()) {
             try config.validate();
-            // TODO: Load certificates and initialize OpenSSL context
-            // SSL_CTX_new(TLS_server_method())
-            // SSL_CTX_use_certificate_chain_file()
-            // SSL_CTX_use_PrivateKey_file()
-            // SSL_CTX_load_verify_locations()
+
+            // Load OpenSSL at runtime
+            var ossl = OpenSslLib.load() catch |err| {
+                log.err("Cannot initialize TLS: OpenSSL not available ({s})", .{@errorName(err)});
+                return error.TlsNotAvailable;
+            };
+            errdefer ossl.close();
+
+            // Create SSL_CTX
+            const method = ossl.TLS_server_method() orelse return error.TlsInitFailed;
+            const ssl_ctx = ossl.SSL_CTX_new(method) orelse return error.TlsInitFailed;
+            errdefer ossl.SSL_CTX_free(ssl_ctx);
+
+            // Set protocol version constraints
+            _ = ossl.setMinProtoVersion(ssl_ctx, config.min_tls_version.toOpenSsl());
+            _ = ossl.setMaxProtoVersion(ssl_ctx, config.max_tls_version.toOpenSsl());
+
+            // Load certificate chain
+            if (config.cert_file) |cert_path| {
+                const cert_z = std.fmt.allocPrintZ(alloc, "{s}", .{cert_path}) catch return error.OutOfMemory;
+                defer alloc.free(cert_z);
+                if (ossl.SSL_CTX_use_certificate_chain_file(ssl_ctx, cert_z) != 1) {
+                    const err_str = ossl.getErrorString();
+                    log.err("Failed to load certificate: {s}", .{std.mem.sliceTo(&err_str, 0)});
+                    return error.CertificateLoadFailed;
+                }
+                log.info("Loaded certificate: {s}", .{cert_path});
+            }
+
+            // Load private key
+            if (config.key_file) |key_path| {
+                const key_z = std.fmt.allocPrintZ(alloc, "{s}", .{key_path}) catch return error.OutOfMemory;
+                defer alloc.free(key_z);
+                if (ossl.SSL_CTX_use_PrivateKey_file(ssl_ctx, key_z, OpenSslLib.SSL_FILETYPE_PEM) != 1) {
+                    const err_str = ossl.getErrorString();
+                    log.err("Failed to load private key: {s}", .{std.mem.sliceTo(&err_str, 0)});
+                    return error.PrivateKeyLoadFailed;
+                }
+
+                // Verify cert/key match
+                if (ossl.SSL_CTX_check_private_key(ssl_ctx) != 1) {
+                    log.err("Certificate and private key do not match", .{});
+                    return error.CertKeyMismatch;
+                }
+                log.info("Loaded private key: {s}", .{key_path});
+            }
+
+            // Load CA certificates for client verification (mTLS)
+            if (config.ca_file) |ca_path| {
+                const ca_z = std.fmt.allocPrintZ(alloc, "{s}", .{ca_path}) catch return error.OutOfMemory;
+                defer alloc.free(ca_z);
+                if (ossl.SSL_CTX_load_verify_locations(ssl_ctx, ca_z, null) != 1) {
+                    log.warn("Failed to load CA file: {s}", .{ca_path});
+                }
+            }
+
+            // Set client certificate verification mode
+            const verify_mode: c_int = switch (config.client_auth) {
+                .none => OpenSslLib.SSL_VERIFY_NONE,
+                .requested => OpenSslLib.SSL_VERIFY_PEER,
+                .required => OpenSslLib.SSL_VERIFY_PEER | OpenSslLib.SSL_VERIFY_FAIL_IF_NO_PEER_CERT,
+            };
+            ossl.SSL_CTX_set_verify(ssl_ctx, verify_mode, null);
+
+            ctx.ssl_ctx = ssl_ctx;
+            ctx.openssl = ossl;
             ctx.initialized = true;
-            log.info("TLS context initialized (min={s}, max={s})", .{
+
+            log.info("TLS context initialized (min={s}, max={s}, client_auth={s})", .{
                 @tagName(config.min_tls_version),
                 @tagName(config.max_tls_version),
+                @tagName(config.client_auth),
             });
         }
 
         return ctx;
     }
 
-    /// Create a new TLS connection from an accepted TCP socket.
-    /// Returns TlsNotImplemented for SSL/SASL_SSL protocols.
-    /// SASL auth (SASL_PLAINTEXT) is wired through the handler's
-    /// SaslHandshake + SaslAuthenticate handlers — no TLS needed.
-    pub fn wrapConnection(self: *TlsContext, fd: posix.fd_t) !TlsConnection {
-        if (!self.initialized) return error.TlsNotInitialized;
-        var conn = TlsConnection.init(self.allocator, fd);
-        try conn.doHandshake();
-        return conn;
+    /// Create a new SSL object for an accepted connection.
+    /// The SSL object is bound to the fd and ready for SSL_accept().
+    pub fn createSsl(self: *TlsContext, fd: posix.fd_t) !*anyopaque {
+        const ossl = &(self.openssl orelse return error.TlsNotInitialized);
+        const ssl_ctx = self.ssl_ctx orelse return error.TlsNotInitialized;
+
+        const ssl = ossl.SSL_new(ssl_ctx) orelse return error.SslCreateFailed;
+        errdefer ossl.SSL_free(ssl);
+
+        if (ossl.SSL_set_fd(ssl, @intCast(fd)) != 1) {
+            return error.SslSetFdFailed;
+        }
+
+        return ssl;
+    }
+
+    /// Get a mutable reference to the OpenSSL library.
+    pub fn getOpenSsl(self: *TlsContext) ?*OpenSslLib {
+        if (self.openssl != null) return &self.openssl.?;
+        return null;
     }
 
     pub fn deinit(self: *TlsContext) void {
-        // In real implementation: SSL_CTX_free()
+        if (self.ssl_ctx) |ctx| {
+            if (self.openssl) |*ossl| {
+                ossl.SSL_CTX_free(ctx);
+                ossl.close();
+            }
+        }
+        self.ssl_ctx = null;
+        self.openssl = null;
         self.initialized = false;
     }
 };
 
 /// Generate a self-signed certificate for development/testing.
-/// Returns paths to the generated cert and key files.
 pub fn generateSelfSignedCert(alloc: Allocator, output_dir: []const u8) !struct { cert: []const u8, key: []const u8 } {
     _ = alloc;
     _ = output_dir;
-    // TODO: Use openssl CLI or C FFI to generate self-signed cert
-    // openssl req -x509 -newkey rsa:2048 -keyout key.pem -out cert.pem -days 365 -nodes
     return error.NotImplemented;
 }
 
@@ -243,7 +394,7 @@ test "TlsContext init plaintext" {
     const config = TlsConfig{};
     var ctx = try TlsContext.init(testing.allocator, config);
     defer ctx.deinit();
-    try testing.expect(!ctx.initialized); // Not needed for plaintext
+    try testing.expect(!ctx.initialized);
 }
 
 test "TlsConnection init" {

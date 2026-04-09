@@ -14,6 +14,8 @@ const ProcessRoles = @import("roles.zig").ProcessRoles;
 const Controller = @import("controller/controller.zig").Controller;
 const MetadataClient = @import("controller/metadata_client.zig").MetadataClient;
 const handler_routing = @import("network/handler_routing.zig");
+const TlsConfig = @import("security/tls.zig").TlsConfig;
+const TlsContext = @import("security/tls.zig").TlsContext;
 
 pub const std_options = .{
     .log_level = .info,
@@ -73,6 +75,11 @@ pub fn main() !void {
     var cache_max_size: u64 = 256 * 1024 * 1024;
     var s3_block_cache_size: u64 = 64 * 1024 * 1024;
     var compaction_interval: i64 = 300_000;
+    // TLS configuration
+    var security_protocol: []const u8 = "plaintext";
+    var tls_cert_file: ?[]const u8 = null;
+    var tls_key_file: ?[]const u8 = null;
+    var tls_ca_file: ?[]const u8 = null;
 
     var args = try std.process.argsWithAllocator(alloc);
     defer args.deinit();
@@ -120,6 +127,14 @@ pub fn main() !void {
             if (args.next()) |v| s3_block_cache_size = std.fmt.parseInt(u64, v, 10) catch s3_block_cache_size;
         } else if (std.mem.eql(u8, arg, "--compaction-interval")) {
             if (args.next()) |v| compaction_interval = std.fmt.parseInt(i64, v, 10) catch compaction_interval;
+        } else if (std.mem.eql(u8, arg, "--security-protocol")) {
+            if (args.next()) |v| security_protocol = v;
+        } else if (std.mem.eql(u8, arg, "--tls-cert-file")) {
+            tls_cert_file = args.next();
+        } else if (std.mem.eql(u8, arg, "--tls-key-file")) {
+            tls_key_file = args.next();
+        } else if (std.mem.eql(u8, arg, "--tls-ca-file")) {
+            tls_ca_file = args.next();
         } else {
             port = std.fmt.parseInt(u16, arg, 10) catch port;
         }
@@ -391,8 +406,40 @@ pub fn main() !void {
 
     // Main server on the main thread
     if (process_roles.is_broker) {
+        // Initialize TLS if configured
+        const tls_protocol: TlsConfig.SecurityProtocol = if (std.mem.eql(u8, security_protocol, "ssl"))
+            .ssl
+        else if (std.mem.eql(u8, security_protocol, "sasl_ssl"))
+            .sasl_ssl
+        else if (std.mem.eql(u8, security_protocol, "sasl_plaintext"))
+            .sasl_plaintext
+        else
+            .plaintext;
+
+        var tls_config = TlsConfig{
+            .protocol = tls_protocol,
+            .cert_file = tls_cert_file,
+            .key_file = tls_key_file,
+            .ca_file = tls_ca_file,
+        };
+        tls_config.enabled = tls_config.needsTls();
+
+        var tls_ctx: ?TlsContext = null;
+        if (tls_config.needsTls()) {
+            tls_ctx = TlsContext.init(alloc, tls_config) catch |err| {
+                try stdout.print("  ERROR: Failed to initialize TLS: {s}\n", .{@errorName(err)});
+                try stdout.print("  Make sure cert and key files are valid PEM format.\n", .{});
+                return;
+            };
+            try stdout.print("  TLS enabled: protocol={s}\n", .{security_protocol});
+        }
+        defer if (tls_ctx) |*ctx| ctx.deinit();
+
         // Broker server on main thread
         var server = try Server.init(alloc, "0.0.0.0", port, &handler_routing.brokerHandleRequest, num_workers);
+        if (tls_ctx) |*ctx| {
+            server.tls_context = ctx;
+        }
         // Wire up group commit flush callbacks for S3 WAL batching
         server.batch_flush_fn = &handler_routing.brokerFlushPendingWal;
         server.has_pending_flush_fn = &handler_routing.brokerHasPendingFlush;

@@ -122,7 +122,11 @@ pub fn build(b: *std.Build) void {
     // exe.linkSystemLibrary("lz4");
     // exe.linkSystemLibrary("zstd");
     // exe.linkSystemLibrary("snappy");
-    // exe.linkLibC();
+
+    // Link libc for TLS support (dlopen/dlsym to load OpenSSL at runtime).
+    // This does NOT link OpenSSL at compile time — OpenSSL is loaded dynamically
+    // at runtime only if TLS is configured. libc is needed for the dl* functions.
+    exe.linkLibC();
 
     b.installArtifact(exe);
 
@@ -165,6 +169,8 @@ pub fn build(b: *std.Build) void {
             .target = target,
             .optimize = optimize,
         });
+        // Link libc for modules that use dlopen (security module's OpenSSL bindings)
+        t.linkLibC();
 
         const run_t = b.addRunArtifact(t);
         test_step.dependOn(&run_t.step);

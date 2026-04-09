@@ -4,6 +4,12 @@ const posix = std.posix;
 const linux = std.os.linux;
 const Allocator = std.mem.Allocator;
 const log = std.log.scoped(.server);
+const TlsContext = @import("../security/tls.zig").TlsContext;
+const OpenSslLib = @import("../security/openssl.zig").OpenSslLib;
+
+/// Global OpenSSL reference for connection cleanup (set when TLS is enabled).
+/// Connection.deinit needs this to call SSL_shutdown/SSL_free.
+var global_openssl: ?*const OpenSslLib = null;
 const IoUring = linux.IoUring;
 
 /// Kafka TCP server.
@@ -21,6 +27,8 @@ pub const Server = struct {
     handler: *const RequestHandler,
     running: bool = false,
     num_workers: usize,
+    /// TLS context for SSL/SASL_SSL connections (null for plaintext).
+    tls_context: ?*TlsContext = null,
     /// Group commit: called after each epoll/io_uring iteration to flush pending S3 WAL writes.
     batch_flush_fn: ?*const fn () void = null,
     /// Group commit: returns true if there are pending WAL writes (used to reduce epoll timeout).
@@ -45,6 +53,10 @@ pub const Server = struct {
         recv_pending: bool = false, // io_uring recv submitted
         send_pending: bool = false, // io_uring send submitted
         closed: bool = false,
+        /// OpenSSL SSL* for TLS connections (null for plaintext).
+        ssl_ptr: ?*anyopaque = null,
+        /// Whether the TLS handshake has completed.
+        tls_handshake_done: bool = true, // true for plaintext (no handshake needed)
 
         fn init(alloc: Allocator, fd: posix.socket_t) Connection {
             return .{
@@ -56,6 +68,14 @@ pub const Server = struct {
         }
 
         fn deinit(self: *Connection) void {
+            // Clean up SSL object before closing socket
+            if (self.ssl_ptr) |ssl| {
+                if (global_openssl) |ossl| {
+                    _ = ossl.SSL_shutdown(ssl);
+                    ossl.SSL_free(ssl);
+                }
+                self.ssl_ptr = null;
+            }
             self.recv_buf.deinit();
             self.send_buf.deinit();
             if (!self.closed) {
@@ -400,7 +420,27 @@ pub const Server = struct {
                         connections.put(client_fd, Connection.init(self.allocator, client_fd)) catch {
                             posix.epoll_ctl(epfd, linux.EPOLL.CTL_DEL, client_fd, null) catch {};
                             posix.close(client_fd);
+                            continue;
                         };
+
+                        // Set up TLS for SSL/SASL_SSL connections
+                        if (self.tls_context) |tls_ctx| {
+                            if (connections.getPtr(client_fd)) |conn| {
+                                const ssl = tls_ctx.createSsl(client_fd) catch {
+                                    log.warn("Failed to create SSL for fd={d}", .{client_fd});
+                                    posix.epoll_ctl(epfd, linux.EPOLL.CTL_DEL, client_fd, null) catch {};
+                                    conn.deinit();
+                                    _ = connections.remove(client_fd);
+                                    continue;
+                                };
+                                conn.ssl_ptr = ssl;
+                                conn.tls_handshake_done = false;
+                                // Set global OpenSSL ref for connection cleanup
+                                if (tls_ctx.getOpenSsl()) |ossl| {
+                                    global_openssl = ossl;
+                                }
+                            }
+                        }
                     }
                 } else {
                     if (ev.events & (linux.EPOLL.ERR | linux.EPOLL.HUP | linux.EPOLL.RDHUP) != 0) {
@@ -472,11 +512,48 @@ pub const Server = struct {
         const conn = connections.getPtr(fd) orelse return;
         conn.last_activity_ms = now_ms;
 
+        // If TLS handshake is pending, continue it instead of reading frames
+        if (!conn.tls_handshake_done) {
+            if (conn.ssl_ptr) |ssl| {
+                if (self.tls_context) |tls_ctx| {
+                    if (tls_ctx.getOpenSsl()) |ossl| {
+                        const ret = ossl.SSL_accept(ssl);
+                        if (ret == 1) {
+                            conn.tls_handshake_done = true;
+                            log.info("TLS handshake completed on fd={d}", .{fd});
+                            return;
+                        }
+                        const err = ossl.SSL_get_error(ssl, ret);
+                        if (err == OpenSslLib.SSL_ERROR_WANT_READ or err == OpenSslLib.SSL_ERROR_WANT_WRITE) {
+                            return; // Need more data, retry on next event
+                        }
+                        log.warn("TLS handshake failed on fd={d}", .{fd});
+                        return error.TlsHandshakeFailed;
+                    }
+                }
+            }
+            return;
+        }
+
         if (conn.recv_buf.items.len > MAX_RECV_BUFFER) return error.BufferOverflow;
         if (conn.send_buf.items.len > MAX_SEND_BUFFER) return;
 
         var read_buf: [16384]u8 = undefined;
-        const bytes_read = posix.read(fd, &read_buf) catch |err| switch (err) {
+
+        // Use SSL_read for TLS connections, posix.read for plaintext
+        const bytes_read = if (conn.ssl_ptr) |ssl| blk: {
+            if (self.tls_context) |tls_ctx| {
+                if (tls_ctx.getOpenSsl()) |ossl| {
+                    const ret = ossl.SSL_read(ssl, &read_buf, @intCast(read_buf.len));
+                    if (ret > 0) break :blk @as(usize, @intCast(ret));
+                    const err = ossl.SSL_get_error(ssl, ret);
+                    if (err == OpenSslLib.SSL_ERROR_WANT_READ or err == OpenSslLib.SSL_ERROR_WANT_WRITE) return;
+                    if (err == OpenSslLib.SSL_ERROR_ZERO_RETURN) return error.ConnectionClosed;
+                    return error.ReadError;
+                }
+            }
+            return error.ReadError;
+        } else posix.read(fd, &read_buf) catch |err| switch (err) {
             error.WouldBlock => return,
             else => return err,
         };
@@ -492,12 +569,27 @@ pub const Server = struct {
         }
     }
 
-    fn flushSendBuffer(_: *Server, fd: posix.socket_t, conn: *Connection) !void {
+    fn flushSendBuffer(self: *Server, fd: posix.socket_t, conn: *Connection) !void {
         if (conn.send_buf.items.len == 0) return;
-        const bytes_written = posix.write(fd, conn.send_buf.items) catch |err| switch (err) {
+
+        // Use SSL_write for TLS connections, posix.write for plaintext
+        const bytes_written = if (conn.ssl_ptr) |ssl| blk: {
+            if (self.tls_context) |tls_ctx| {
+                if (tls_ctx.getOpenSsl()) |ossl| {
+                    const len: c_int = @intCast(@min(conn.send_buf.items.len, std.math.maxInt(c_int)));
+                    const ret = ossl.SSL_write(ssl, conn.send_buf.items.ptr, len);
+                    if (ret > 0) break :blk @as(usize, @intCast(ret));
+                    const err = ossl.SSL_get_error(ssl, ret);
+                    if (err == OpenSslLib.SSL_ERROR_WANT_WRITE or err == OpenSslLib.SSL_ERROR_WANT_READ) return;
+                    return error.WriteError;
+                }
+            }
+            return error.WriteError;
+        } else posix.write(fd, conn.send_buf.items) catch |err| switch (err) {
             error.WouldBlock => return,
             else => return err,
         };
+
         const remaining = conn.send_buf.items.len - bytes_written;
         if (remaining > 0) {
             std.mem.copyForwards(u8, conn.send_buf.items[0..remaining], conn.send_buf.items[bytes_written..]);
