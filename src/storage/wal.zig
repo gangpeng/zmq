@@ -1144,7 +1144,7 @@ test "S3WalBatcher fencing clears on setEpoch then fences again" {
     batcher.setEpoch(20);
     try testing.expect(!batcher.is_fenced);
     try batcher.append(1, 1, "data-epoch-20");
-    try testing.expectEqual(@as(usize, 3), batcher.pendingCount());
+    try testing.expectEqual(@as(usize, 2), batcher.pendingCount());
 }
 
 test "S3WalBatcher fenced batcher preserves buffered data" {

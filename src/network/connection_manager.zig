@@ -91,7 +91,7 @@ pub const ConnectionManager = struct {
         var it = self.connections.iterator();
         while (it.next()) |entry| {
             if (found >= result_buf.len) break;
-            if (now - entry.value_ptr.last_active_ms > timeout_ms) {
+            if (now - entry.value_ptr.last_active_ms >= timeout_ms) {
                 result_buf[found] = entry.key_ptr.*;
                 found += 1;
             }

@@ -1060,7 +1060,8 @@ test "CompactionManager split then merge preserves data end-to-end" {
     var cm = CompactionManager.init(testing.allocator, &om);
     defer cm.deinit();
     cm.setMockS3(&mock_s3);
-    cm.merge_min_object_count = 10;
+    // Set merge threshold high so the first compaction only splits (no merge)
+    cm.merge_min_object_count = 100;
 
     // Phase 1: Split all multi-stream SSOs
     try cm.runCompaction();
@@ -1070,6 +1071,7 @@ test "CompactionManager split then merge preserves data end-to-end" {
     try testing.expectEqual(@as(usize, 24), om.getStreamObjectCount());
 
     // Phase 2: Run again to merge (now each stream has 12 SOs ≥ threshold of 10)
+    cm.merge_min_object_count = 10;
     cm.last_compaction_ms = 0; // Reset timer
     try cm.runCompaction();
 
