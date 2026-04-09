@@ -73,8 +73,12 @@ pub const FailoverController = struct {
     /// Record a heartbeat from a node.
     pub fn recordHeartbeat(self: *FailoverController, nid: i32) void {
         if (self.known_nodes.getPtr(nid)) |state| {
+            const was_fenced = state.is_fenced;
             state.last_heartbeat_ms = std.time.milliTimestamp();
             state.is_fenced = false;
+            if (was_fenced) {
+                log.info("Node {d} un-fenced after heartbeat", .{nid});
+            }
         }
     }
 

@@ -318,7 +318,9 @@ pub const Broker = struct {
 
             // Ensure partitions exist in storage
             for (0..@as(usize, @intCast(entry.num_partitions))) |pi| {
-                self.store.ensurePartition(entry.name, @intCast(pi)) catch {};
+                self.store.ensurePartition(entry.name, @intCast(pi)) catch |err| {
+                    log.warn("Failed to ensure partition {s}-{d}: {}", .{ entry.name, pi, err });
+                };
             }
 
             log.info("Loaded persisted topic '{s}' ({d} partitions)", .{ entry.name, entry.num_partitions });
@@ -343,7 +345,9 @@ pub const Broker = struct {
             const partition_str = parts.next() orelse continue;
             const partition = std.fmt.parseInt(i32, partition_str, 10) catch continue;
 
-            self.groups.commitOffset(group_id, topic, partition, entry.offset) catch {};
+            self.groups.commitOffset(group_id, topic, partition, entry.offset) catch |err| {
+                log.warn("Failed to restore offset for {s}/{s}-{d}: {}", .{ group_id, topic, partition, err });
+            };
         }
 
         // Load persisted transaction state
@@ -369,7 +373,9 @@ pub const Broker = struct {
             }, .{
                 .last_sequence = entry.last_sequence,
                 .producer_epoch = entry.producer_epoch,
-            }) catch {};
+            }) catch |err| {
+                log.warn("Failed to restore producer sequence pid={d}: {}", .{ entry.producer_id, err });
+            };
         }
         if (saved_sequences.len > 0) {
             log.info("Restored {d} producer sequence state(s)", .{saved_sequences.len});
@@ -1210,7 +1216,7 @@ pub const Broker = struct {
         // Reject all produces if this broker has been fenced by the controller.
         // Clients will receive NOT_LEADER_OR_FOLLOWER and refresh metadata.
         if (self.is_fenced_by_controller) {
-            log.warn("Produce rejected: broker is fenced by controller", .{});
+            log.info("Produce rejected: broker is fenced by controller", .{});
             return self.handleNotController(req_header, resp_header_version);
         }
 
@@ -1574,11 +1580,14 @@ pub const Broker = struct {
                 if (flexible) ser.skipTaggedFields(request_bytes, &pos) catch {};
 
                 // Fetch data with isolation level
-                const fetch_result = self.store.fetchWithIsolation(topic_name, partition_idx, fetch_offset, 1024 * 1024, isolation_level) catch PartitionStore.FetchResult{
-                    .error_code = 3,
-                    .records = &.{},
-                    .high_watermark = 0,
-                    .last_stable_offset = -1,
+                const fetch_result = self.store.fetchWithIsolation(topic_name, partition_idx, fetch_offset, 1024 * 1024, isolation_level) catch |err| blk: {
+                    log.debug("Fetch failed for {s}-{d} at offset {d}: {}", .{ topic_name, partition_idx, fetch_offset, err });
+                    break :blk PartitionStore.FetchResult{
+                        .error_code = 3,
+                        .records = &.{},
+                        .high_watermark = 0,
+                        .last_stable_offset = -1,
+                    };
                 };
 
                 // Write partition response

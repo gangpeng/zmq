@@ -2,6 +2,7 @@ const std = @import("std");
 const testing = std.testing;
 const Allocator = std.mem.Allocator;
 const fs = std.fs;
+const log = std.log.scoped(.persistence);
 
 /// Persists broker metadata (topics, offsets) to a JSON file in the data directory.
 /// Loaded on startup, saved on changes.
@@ -38,10 +39,16 @@ pub const MetadataPersistence = struct {
         const path = try std.fmt.allocPrint(self.allocator, "{s}/topics.meta", .{dir});
         defer self.allocator.free(path);
 
-        const file = fs.openFileAbsolute(path, .{}) catch return &.{};
+        const file = fs.openFileAbsolute(path, .{}) catch |err| {
+            log.debug("No topics.meta found: {}", .{err});
+            return &.{};
+        };
         defer file.close();
 
-        const content = file.readToEndAlloc(self.allocator, 1024 * 1024) catch return &.{};
+        const content = file.readToEndAlloc(self.allocator, 1024 * 1024) catch |err| {
+            log.warn("Failed to read topics.meta: {}", .{err});
+            return &.{};
+        };
         defer self.allocator.free(content);
 
         var entries = std.ArrayList(TopicEntry).init(self.allocator);
@@ -65,6 +72,7 @@ pub const MetadataPersistence = struct {
             });
         }
 
+        log.info("Loaded {d} topics from topics.meta", .{entries.items.len});
         return entries.toOwnedSlice();
     }
 
@@ -92,10 +100,16 @@ pub const MetadataPersistence = struct {
         const path = try std.fmt.allocPrint(self.allocator, "{s}/offsets.meta", .{dir});
         defer self.allocator.free(path);
 
-        const file = fs.openFileAbsolute(path, .{}) catch return &.{};
+        const file = fs.openFileAbsolute(path, .{}) catch |err| {
+            log.debug("No offsets.meta found: {}", .{err});
+            return &.{};
+        };
         defer file.close();
 
-        const content = file.readToEndAlloc(self.allocator, 1024 * 1024) catch return &.{};
+        const content = file.readToEndAlloc(self.allocator, 1024 * 1024) catch |err| {
+            log.warn("Failed to read offsets.meta: {}", .{err});
+            return &.{};
+        };
         defer self.allocator.free(content);
 
         var entries = std.ArrayList(OffsetEntry).init(self.allocator);
@@ -113,6 +127,7 @@ pub const MetadataPersistence = struct {
             });
         }
 
+        log.info("Loaded {d} offsets from offsets.meta", .{entries.items.len});
         return entries.toOwnedSlice();
     }
 
@@ -184,10 +199,16 @@ pub const MetadataPersistence = struct {
         const path = try std.fmt.allocPrint(self.allocator, "{s}/transactions.meta", .{dir});
         defer self.allocator.free(path);
 
-        const file = fs.openFileAbsolute(path, .{}) catch return .{ .next_producer_id = 1000, .entries = &.{} };
+        const file = fs.openFileAbsolute(path, .{}) catch |err| {
+            log.debug("No transactions.meta found: {}", .{err});
+            return .{ .next_producer_id = 1000, .entries = &.{} };
+        };
         defer file.close();
 
-        const content = file.readToEndAlloc(self.allocator, 1024 * 1024) catch return .{ .next_producer_id = 1000, .entries = &.{} };
+        const content = file.readToEndAlloc(self.allocator, 1024 * 1024) catch |err| {
+            log.warn("Failed to read transactions.meta: {}", .{err});
+            return .{ .next_producer_id = 1000, .entries = &.{} };
+        };
         defer self.allocator.free(content);
 
         var entries = std.ArrayList(TransactionEntry).init(self.allocator);
@@ -235,6 +256,7 @@ pub const MetadataPersistence = struct {
             });
         }
 
+        log.info("Loaded {d} transactions from transactions.meta (next_pid={d})", .{ entries.items.len, next_pid });
         return .{
             .next_producer_id = next_pid,
             .entries = try entries.toOwnedSlice(),
@@ -271,10 +293,16 @@ pub const MetadataPersistence = struct {
         const path = try std.fmt.allocPrint(self.allocator, "{s}/producer_state.meta", .{dir});
         defer self.allocator.free(path);
 
-        const file = fs.openFileAbsolute(path, .{}) catch return &.{};
+        const file = fs.openFileAbsolute(path, .{}) catch |err| {
+            log.debug("No producer_state.meta found: {}", .{err});
+            return &.{};
+        };
         defer file.close();
 
-        const content = file.readToEndAlloc(self.allocator, 1024 * 1024) catch return &.{};
+        const content = file.readToEndAlloc(self.allocator, 1024 * 1024) catch |err| {
+            log.warn("Failed to read producer_state.meta: {}", .{err});
+            return &.{};
+        };
         defer self.allocator.free(content);
 
         var entries = std.ArrayList(ProducerSequenceEntry).init(self.allocator);
@@ -302,6 +330,7 @@ pub const MetadataPersistence = struct {
             });
         }
 
+        log.info("Loaded {d} producer sequences from producer_state.meta", .{entries.items.len});
         return entries.toOwnedSlice();
     }
 };

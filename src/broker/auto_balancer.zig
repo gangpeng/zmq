@@ -139,8 +139,13 @@ pub const AutoBalancer = struct {
 
         if (plan.moveCount() > 0) {
             log.info("Rebalance plan: {d} partition moves", .{plan.moveCount()});
+            for (plan.moves.items) |move| {
+                log.info("Rebalance: moving {s}-{d} from node {d} to node {d}", .{ move.topic, move.partition_id, move.from_node, move.to_node });
+            }
             return plan;
         }
+
+        log.debug("Load balanced: no partition moves needed", .{});
 
         plan.deinit();
         return null;

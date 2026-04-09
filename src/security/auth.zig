@@ -1,6 +1,7 @@
 const std = @import("std");
 const testing = std.testing;
 const Allocator = std.mem.Allocator;
+const log = std.log.scoped(.auth);
 
 /// ACL (Access Control List) authorization engine.
 ///
@@ -88,6 +89,7 @@ pub const Authorizer = struct {
             .permission = permission,
             .host = try self.allocator.dupe(u8, host),
         });
+        log.info("ACL added: principal={s} resource={s} op={d} permission={d}", .{ principal, resource_name, @intFromEnum(operation), @intFromEnum(permission) });
     }
 
     /// Check if an operation is authorized.
@@ -112,8 +114,15 @@ pub const Authorizer = struct {
         }
 
         // Deny takes precedence
-        if (explicitly_denied) return .denied;
-        if (explicitly_allowed) return .allowed;
+        if (explicitly_denied) {
+            log.warn("Authorization denied: principal={s} resource={s} op={d} (explicit deny)", .{ principal, resource_name, @intFromEnum(operation) });
+            return .denied;
+        }
+        if (explicitly_allowed) {
+            log.debug("Authorization granted: principal={s} resource={s} op={d}", .{ principal, resource_name, @intFromEnum(operation) });
+            return .allowed;
+        }
+        log.warn("Authorization denied: principal={s} resource={s} op={d} (no matching allow)", .{ principal, resource_name, @intFromEnum(operation) });
         return .denied; // Default deny when ACLs exist
     }
 
@@ -192,16 +201,22 @@ pub const SaslPlainAuthenticator = struct {
             }
         }
 
-        if (part_count < 3) return .{ .success = false, .principal = null };
+        if (part_count < 3) {
+            log.warn("SASL/PLAIN authentication failed: malformed token ({d} parts, expected 3)", .{part_count});
+            return .{ .success = false, .principal = null };
+        }
 
         const username = parts[1];
         const password = parts[2];
 
         if (self.credentials.get(username)) |stored_pass| {
             if (std.mem.eql(u8, password, stored_pass)) {
+                log.info("Authentication success: user={s}", .{username});
                 return .{ .success = true, .principal = username };
             }
         }
+
+        log.warn("Authentication failed: user={s}", .{username});
 
         return .{ .success = false, .principal = null };
     }

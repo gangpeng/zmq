@@ -203,7 +203,9 @@ pub const Wal = struct {
             const meta = &self.segments.items[i];
             if (meta.id <= up_to_segment_id) {
                 // Delete the file
-                fs.deleteFileAbsolute(meta.path) catch {};
+                fs.deleteFileAbsolute(meta.path) catch |err| {
+                    log.warn("Failed to delete WAL segment {s}: {}", .{ meta.path, err });
+                };
                 self.allocator.free(meta.path);
                 _ = self.segments.orderedRemove(i);
                 removed += 1;
@@ -222,6 +224,7 @@ pub const Wal = struct {
     /// Recover records from the WAL directory.
     /// Calls `callback` for each valid record found.
     pub fn recover(self: *Wal, callback: *const fn (data: []const u8, offset: u64) void) !u64 {
+        log.info("Starting WAL recovery from {s}", .{self.dir_path});
         var dir = try fs.openDirAbsolute(self.dir_path, .{ .iterate = true });
         defer dir.close();
 
@@ -278,7 +281,10 @@ pub const Wal = struct {
                 computed_crc = crc32c.update(computed_crc, content[pos + HEADER_SIZE .. pos + HEADER_SIZE + record_len]);
                 computed_crc ^= 0xFFFFFFFF;
 
-                if (computed_crc != stored_crc) break; // Corruption — stop here
+                if (computed_crc != stored_crc) {
+                    log.warn("WAL corruption detected: CRC mismatch at offset {d} in {s}", .{ pos, filename });
+                    break; // Corruption — stop here
+                }
 
                 const data = content[pos + HEADER_SIZE .. pos + HEADER_SIZE + record_len];
                 callback(data, total_offset);
@@ -289,6 +295,7 @@ pub const Wal = struct {
             }
         }
 
+        log.info("WAL recovery complete: {d} records recovered", .{recovered});
         return recovered;
     }
 };
@@ -683,7 +690,10 @@ pub const S3WalBatcher = struct {
     /// Tracks the appended offset so flushNow() can verify durability.
     pub fn append(self: *S3WalBatcher, stream_id: u64, base_offset: u64, records: []const u8) !void {
         // Fencing check: reject writes if this batcher has been fenced
-        if (self.is_fenced) return error.WalFenced;
+        if (self.is_fenced) {
+            log.debug("S3WAL append rejected: batcher is fenced (epoch={d})", .{self.wal_epoch});
+            return error.WalFenced;
+        }
 
         const data_copy = try self.allocator.dupe(u8, records);
         try self.buffer.append(.{
@@ -854,6 +864,7 @@ pub const S3WalBatcher = struct {
 
     /// Update the WAL epoch — called when this node becomes the new owner after failover.
     pub fn setEpoch(self: *S3WalBatcher, new_epoch: u64) void {
+        log.info("S3 WAL epoch updated: {d} -> {d}", .{ self.wal_epoch, new_epoch });
         self.wal_epoch = new_epoch;
         self.is_fenced = false; // Un-fence with new epoch
     }

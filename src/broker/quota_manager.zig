@@ -1,6 +1,7 @@
 const std = @import("std");
 const testing = std.testing;
 const Allocator = std.mem.Allocator;
+const log = std.log.scoped(.quota);
 
 /// Client quota manager.
 ///
@@ -66,6 +67,7 @@ pub const QuotaManager = struct {
             .fetch_rate_limit = fetch_rate,
             .request_rate_limit = request_rate,
         });
+        log.info("Quota set for client {s}: produce={d:.0}/s, fetch={d:.0}/s, request={d:.0}/s", .{ client_id, produce_rate, fetch_rate, request_rate });
     }
 
     /// Record produce bytes and return throttle time in ms (0 = no throttle).
@@ -114,6 +116,7 @@ pub const QuotaManager = struct {
             // Calculate throttle time
             const excess = rate - limit;
             const throttle_ms: i32 = @intFromFloat(@min(excess / limit * 1000.0, 30000.0));
+            log.info("Client {s} throttled for {d}ms: rate {d:.0}/s exceeds limit {d:.0}/s", .{ client_id, @max(throttle_ms, 1), rate, limit });
             return @max(throttle_ms, 1);
         }
 

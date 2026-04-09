@@ -2,6 +2,7 @@ const std = @import("std");
 const testing = std.testing;
 const Allocator = std.mem.Allocator;
 const fs = std.fs;
+const log = std.log.scoped(.raft);
 
 /// KRaft Raft consensus state machine.
 ///
@@ -93,11 +94,13 @@ pub const RaftState = struct {
     pub fn handleVoteRequest(self: *RaftState, candidate_id: i32, candidate_epoch: i32, last_log_offset: u64, last_log_epoch: i32) VoteResponse {
         // If candidate's epoch is less than ours, reject
         if (candidate_epoch < self.current_epoch) {
+            log.debug("Vote rejected from node {d}: stale epoch {d} < {d}", .{ candidate_id, candidate_epoch, self.current_epoch });
             return .{ .vote_granted = false, .epoch = self.current_epoch };
         }
 
         // If we already voted for someone else this epoch, reject
         if (candidate_epoch == self.current_epoch and self.voted_for != null and self.voted_for.? != candidate_id) {
+            log.debug("Vote rejected from node {d}: already voted for {?d} in epoch {d}", .{ candidate_id, self.voted_for, self.current_epoch });
             return .{ .vote_granted = false, .epoch = self.current_epoch };
         }
 
@@ -109,6 +112,7 @@ pub const RaftState = struct {
             (last_log_epoch == our_last_epoch and last_log_offset >= our_last_offset);
 
         if (!log_ok) {
+            log.debug("Vote rejected from node {d}: log not up-to-date (candidate epoch={d}/offset={d}, ours epoch={d}/offset={d})", .{ candidate_id, last_log_epoch, last_log_offset, our_last_epoch, our_last_offset });
             return .{ .vote_granted = false, .epoch = self.current_epoch };
         }
 
@@ -125,6 +129,7 @@ pub const RaftState = struct {
         // Reset election timer: granting a vote means the cluster is active,
         // so we shouldn't start our own election immediately.
         self.election_timer.reset();
+        log.info("Vote granted to node {d} for epoch {d}", .{ candidate_id, self.current_epoch });
 
         return .{ .vote_granted = true, .epoch = self.current_epoch };
     }
@@ -143,6 +148,7 @@ pub const RaftState = struct {
         // Persist new epoch and self-vote to disk before broadcasting
         self.persistRaftMeta();
         self.election_timer.reset();
+        log.info("Starting election: node {d} becoming candidate for epoch {d}", .{ self.node_id, self.current_epoch });
 
         return .{
             .epoch = self.current_epoch,
@@ -155,6 +161,7 @@ pub const RaftState = struct {
     /// Returns the tentative next epoch and log info for pre-vote requests.
     pub fn startPreVote(self: *RaftState) ElectionResult {
         // Do NOT increment epoch — this is tentative
+        log.info("Starting pre-vote: node {d} for tentative epoch {d}", .{ self.node_id, self.current_epoch + 1 });
         return .{
             .epoch = self.current_epoch + 1, // Tentative next epoch
             .last_log_offset = self.log.lastOffset(),
@@ -204,6 +211,7 @@ pub const RaftState = struct {
     pub fn becomeLeader(self: *RaftState) void {
         self.role = .leader;
         self.leader_id = self.node_id;
+        log.info("Node {d} became leader in epoch {d}", .{ self.node_id, self.current_epoch });
 
         // Initialize next_index for all voters
         var it = self.voters.iterator();
@@ -217,7 +225,10 @@ pub const RaftState = struct {
     /// Only accepts epoch >= current_epoch. Lower epochs are ignored
     /// (they represent stale messages from a previous leader).
     pub fn becomeFollower(self: *RaftState, epoch: i32, leader_id: i32) void {
-        if (epoch < self.current_epoch) return; // Ignore stale epoch
+        if (epoch < self.current_epoch) {
+            log.debug("Ignoring stale becomeFollower: epoch {d} < current {d}", .{ epoch, self.current_epoch });
+            return;
+        }
         self.current_epoch = epoch;
         self.role = .follower;
         self.leader_id = leader_id;
@@ -225,6 +236,7 @@ pub const RaftState = struct {
         // Persist epoch change to disk
         self.persistRaftMeta();
         self.election_timer.reset();
+        log.info("Node {d} became follower: epoch={d}, leader={d}", .{ self.node_id, epoch, leader_id });
     }
 
     /// Append an entry to the log (leader only).
@@ -236,7 +248,7 @@ pub const RaftState = struct {
         // Persist to disk
         if (self.data_dir) |dir| {
             self.persistEntry(dir, self.current_epoch, offset, data) catch |err| {
-                std.log.scoped(.raft).warn("Failed to persist raft log entry: {}", .{err});
+                log.warn("Failed to persist raft log entry: {}", .{err});
             };
         }
 
@@ -299,7 +311,9 @@ pub const RaftState = struct {
             buf[4] = 0;
             std.mem.writeInt(i32, buf[5..9], 0, .big);
         }
-        file.writeAll(&buf) catch {};
+        file.writeAll(&buf) catch |err| {
+            log.warn("Failed to persist raft.meta (epoch={d}, voted_for={?d}): {}", .{ self.current_epoch, self.voted_for, err });
+        };
     }
 
     /// Load persisted current_epoch and voted_for from disk on startup.
@@ -326,6 +340,7 @@ pub const RaftState = struct {
         if (has_voted) {
             self.voted_for = voted;
         }
+        log.info("Loaded raft.meta: epoch={d}, voted_for={?d}", .{ self.current_epoch, self.voted_for });
         return true;
     }
 
@@ -338,6 +353,7 @@ pub const RaftState = struct {
         _ = self.loadSnapshotMeta();
 
         const dir = self.data_dir orelse return 0;
+        log.info("Starting Raft log recovery from {s}", .{dir});
         const path = try std.fmt.allocPrint(self.allocator, "{s}/raft.log", .{dir});
         defer self.allocator.free(path);
 
@@ -356,7 +372,10 @@ pub const RaftState = struct {
             pos += 20;
             if (pos + data_len > content.len) break;
             const data = content[pos .. pos + data_len];
-            _ = self.log.append(epoch, data) catch break;
+            _ = self.log.append(epoch, data) catch |err| {
+                log.warn("Raft log recovery truncated at entry {d}: {}", .{ recovered, err });
+                break;
+            };
             pos += data_len;
             recovered += 1;
 
@@ -364,6 +383,7 @@ pub const RaftState = struct {
             if (epoch > self.current_epoch) self.current_epoch = epoch;
         }
 
+        log.info("Raft log recovery complete: {d} entries recovered, epoch={d}", .{ recovered, self.current_epoch });
         return recovered;
     }
 
@@ -475,6 +495,7 @@ pub const RaftState = struct {
     ) AppendEntriesResponse {
         // Reject if leader's epoch is stale
         if (leader_epoch < self.current_epoch) {
+            log.debug("AppendEntries rejected: stale epoch {d} < {d} from leader {d}", .{ leader_epoch, self.current_epoch, leader_id });
             return .{ .success = false, .epoch = self.current_epoch, .match_index = self.log.lastOffset() };
         }
 
@@ -488,6 +509,7 @@ pub const RaftState = struct {
             if (self.log.get(prev_log_offset)) |prev_entry| {
                 if (prev_entry.epoch != prev_log_epoch) {
                     // Log mismatch — leader should decrement next_index and retry
+                    log.debug("AppendEntries log mismatch at offset {d}: expected epoch {d}, got {d}", .{ prev_log_offset, prev_log_epoch, prev_entry.epoch });
                     return .{ .success = false, .epoch = self.current_epoch, .match_index = self.log.lastOffset() };
                 }
             } else if (self.log.length() > 0) {
@@ -619,7 +641,7 @@ pub const RaftState = struct {
         const offset = try self.appendEntry(&data);
         self.pending_config_change = true;
 
-        std.log.scoped(.raft).info("Proposed AddVoter: node {d} at offset {d}", .{ voter_id, offset });
+        log.info("Proposed AddVoter: node {d} at offset {d}", .{ voter_id, offset });
         return offset;
     }
 
@@ -640,7 +662,7 @@ pub const RaftState = struct {
         const offset = try self.appendEntry(&data);
         self.pending_config_change = true;
 
-        std.log.scoped(.raft).info("Proposed RemoveVoter: node {d} at offset {d}", .{ voter_id, offset });
+        log.info("Proposed RemoveVoter: node {d} at offset {d}", .{ voter_id, offset });
         return offset;
     }
 
@@ -665,18 +687,18 @@ pub const RaftState = struct {
                 switch (config.change_type) {
                     .add_voter => {
                         self.voters.put(config.voter_id, .{ .node_id = config.voter_id }) catch {};
-                        std.log.scoped(.raft).info("Config applied: added voter {d} (now {d} voters)", .{
+                        log.info("Config applied: added voter {d} (now {d} voters)", .{
                             config.voter_id, self.voters.count(),
                         });
                     },
                     .remove_voter => {
                         _ = self.voters.fetchRemove(config.voter_id);
-                        std.log.scoped(.raft).info("Config applied: removed voter {d} (now {d} voters)", .{
+                        log.info("Config applied: removed voter {d} (now {d} voters)", .{
                             config.voter_id, self.voters.count(),
                         });
                         // If we removed ourselves, step down
                         if (config.voter_id == self.node_id and self.role == .leader) {
-                            std.log.scoped(.raft).info("Removed self from voters, stepping down", .{});
+                            log.info("Removed self from voters, stepping down", .{});
                             self.role = .resigned;
                         }
                     },

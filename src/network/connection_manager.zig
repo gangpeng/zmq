@@ -1,5 +1,6 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
+const log = std.log.scoped(.connections);
 
 /// Connection manager tracks all active client connections.
 ///
@@ -38,6 +39,7 @@ pub const ConnectionManager = struct {
     /// Register a new connection. Returns the connection ID or error if at limit.
     pub fn addConnection(self: *ConnectionManager, fd: std.posix.socket_t) !u64 {
         if (self.connections.count() >= self.max_connections) {
+            log.warn("Connection rejected: limit reached ({d}/{d})", .{ self.connections.count(), self.max_connections });
             return error.TooManyConnections;
         }
 

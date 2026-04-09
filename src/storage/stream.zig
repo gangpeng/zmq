@@ -52,6 +52,7 @@ pub const Stream = struct {
     /// Called when ownership transfers to a new broker.
     /// Closes the current range, bumps epoch, starts a new range.
     pub fn transferOwnership(self: *Stream, new_node_id: i32) !void {
+        const old_node = self.node_id;
         // Close current range
         if (self.ranges.items.len > 0) {
             self.ranges.items[self.ranges.items.len - 1].end_offset = self.end_offset;
@@ -65,6 +66,7 @@ pub const Stream = struct {
             .end_offset = self.end_offset,
             .node_id = new_node_id,
         });
+        log.info("Stream {d} ownership transferred: node {d} -> {d}, epoch={d}", .{ self.stream_id, old_node, new_node_id, self.epoch });
     }
 
     /// Called after produce appends records to this stream.
@@ -300,6 +302,7 @@ pub const ObjectManager = struct {
             .node_id = node_id,
         });
         try self.streams.put(stream_id, stream);
+        log.debug("Stream created: id={d}, node={d}", .{ stream_id, node_id });
         return self.streams.getPtr(stream_id).?;
     }
 

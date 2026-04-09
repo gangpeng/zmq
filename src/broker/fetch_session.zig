@@ -1,6 +1,7 @@
 const std = @import("std");
 const testing = std.testing;
 const Allocator = std.mem.Allocator;
+const log = std.log.scoped(.fetch_session);
 
 /// KIP-227 Incremental Fetch Sessions.
 ///
@@ -45,6 +46,7 @@ pub const FetchSessionManager = struct {
             if (self.sessions.fetchRemove(session_id)) |removed| {
                 var session = removed.value;
                 session.deinit();
+                log.debug("Fetch session closed: id={d}", .{session_id});
             }
             return .{ .session_id = 0, .epoch = 0, .is_new = false, .is_closed = true };
         }
@@ -57,6 +59,7 @@ pub const FetchSessionManager = struct {
             var new_session = FetchSession.init(self.allocator);
             new_session.epoch = 1;
             try self.sessions.put(new_id, new_session);
+            log.debug("Fetch session created: id={d}", .{new_id});
             return .{ .session_id = new_id, .epoch = 1, .is_new = true, .is_closed = false };
         }
 

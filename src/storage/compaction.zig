@@ -122,6 +122,9 @@ pub const CompactionManager = struct {
 
     /// Clean up S3 objects that were orphaned by previous failed deletions.
     fn cleanupOrphans(self: *CompactionManager) void {
+        if (self.orphaned_keys.items.len > 0) {
+            log.info("Cleaning up {d} orphaned S3 objects from previous cycle", .{self.orphaned_keys.items.len});
+        }
         var i: usize = 0;
         while (i < self.orphaned_keys.items.len) {
             const key = self.orphaned_keys.items[i];
@@ -493,10 +496,16 @@ pub const CompactionManager = struct {
     /// Write a journal entry before starting a compaction operation.
     fn journalBegin(self: *CompactionManager, op: []const u8, object_id: u64) void {
         const dir = self.journal_path orelse return;
-        const path = std.fmt.allocPrint(self.allocator, "{s}/compaction.journal", .{dir}) catch return;
+        const path = std.fmt.allocPrint(self.allocator, "{s}/compaction.journal", .{dir}) catch |err| {
+            log.warn("Failed to allocate compaction journal path: {}", .{err});
+            return;
+        };
         defer self.allocator.free(path);
 
-        const file = fs.createFileAbsolute(path, .{ .truncate = true }) catch return;
+        const file = fs.createFileAbsolute(path, .{ .truncate = true }) catch |err| {
+            log.warn("Failed to create compaction journal: {}", .{err});
+            return;
+        };
         defer file.close();
 
         var buf: [64]u8 = undefined;
@@ -508,15 +517,22 @@ pub const CompactionManager = struct {
         pos += op.len;
         std.mem.writeInt(u64, buf[pos..][0..8], object_id, .big);
         pos += 8;
-        file.writeAll(buf[0..pos]) catch {};
+        file.writeAll(buf[0..pos]) catch |err| {
+            log.warn("Failed to write compaction journal: {}", .{err});
+        };
     }
 
     /// Clear the journal after successful completion.
     fn journalComplete(self: *CompactionManager) void {
         const dir = self.journal_path orelse return;
-        const path = std.fmt.allocPrint(self.allocator, "{s}/compaction.journal", .{dir}) catch return;
+        const path = std.fmt.allocPrint(self.allocator, "{s}/compaction.journal", .{dir}) catch |err| {
+            log.warn("Failed to allocate journal path for cleanup: {}", .{err});
+            return;
+        };
         defer self.allocator.free(path);
-        fs.deleteFileAbsolute(path) catch {};
+        fs.deleteFileAbsolute(path) catch |err| {
+            log.warn("Failed to delete compaction journal: {}", .{err});
+        };
     }
 
     // ---- S3 helpers (abstract over MockS3 vs S3Storage) ----
