@@ -2,7 +2,7 @@ const std = @import("std");
 const net = std.net;
 const posix = std.posix;
 const Allocator = std.mem.Allocator;
-const MetricRegistry = @import("../broker/metrics.zig").MetricRegistry;
+const MetricRegistry = @import("../core/metric_registry.zig").MetricRegistry;
 
 /// HTTP server for Prometheus metrics and health endpoints.
 /// Listens on a separate port and serves:

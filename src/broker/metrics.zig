@@ -1,177 +1,9 @@
 const std = @import("std");
 const testing = std.testing;
-const Allocator = std.mem.Allocator;
 
-/// Metric registry for broker observability.
-///
-/// Supports counters, gauges, and histograms.
-/// Exports metrics in Prometheus exposition format.
-pub const MetricRegistry = struct {
-    counters: std.StringHashMap(Counter),
-    gauges: std.StringHashMap(Gauge),
-    histograms: std.StringHashMap(Histogram),
-    allocator: Allocator,
-
-    pub const Counter = struct {
-        name: []u8,
-        help: []u8,
-        value: u64 = 0,
-    };
-
-    pub const Gauge = struct {
-        name: []u8,
-        help: []u8,
-        value: f64 = 0,
-    };
-
-    pub const Histogram = struct {
-        name: []u8,
-        help: []u8,
-        count: u64 = 0,
-        sum: f64 = 0,
-        buckets: [BUCKET_COUNT]u64 = [_]u64{0} ** BUCKET_COUNT,
-
-        const BUCKET_COUNT = 11;
-        const bucket_bounds = [BUCKET_COUNT]f64{ 0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 5.0, 10.0 };
-
-        pub fn observe(self: *Histogram, value: f64) void {
-            self.count += 1;
-            self.sum += value;
-            for (bucket_bounds, 0..) |bound, i| {
-                if (value <= bound) {
-                    self.buckets[i] += 1;
-                }
-            }
-        }
-    };
-
-    pub fn init(alloc: Allocator) MetricRegistry {
-        return .{
-            .counters = std.StringHashMap(Counter).init(alloc),
-            .gauges = std.StringHashMap(Gauge).init(alloc),
-            .histograms = std.StringHashMap(Histogram).init(alloc),
-            .allocator = alloc,
-        };
-    }
-
-    pub fn deinit(self: *MetricRegistry) void {
-        var cit = self.counters.iterator();
-        while (cit.next()) |e| {
-            self.allocator.free(e.value_ptr.name);
-            self.allocator.free(e.value_ptr.help);
-            self.allocator.free(e.key_ptr.*);
-        }
-        self.counters.deinit();
-
-        var git = self.gauges.iterator();
-        while (git.next()) |e| {
-            self.allocator.free(e.value_ptr.name);
-            self.allocator.free(e.value_ptr.help);
-            self.allocator.free(e.key_ptr.*);
-        }
-        self.gauges.deinit();
-
-        var hit = self.histograms.iterator();
-        while (hit.next()) |e| {
-            self.allocator.free(e.value_ptr.name);
-            self.allocator.free(e.value_ptr.help);
-            self.allocator.free(e.key_ptr.*);
-        }
-        self.histograms.deinit();
-    }
-
-    /// Register a counter metric.
-    pub fn registerCounter(self: *MetricRegistry, name: []const u8, help: []const u8) !void {
-        const key = try self.allocator.dupe(u8, name);
-        errdefer self.allocator.free(key);
-        try self.counters.put(key, .{
-            .name = try self.allocator.dupe(u8, name),
-            .help = try self.allocator.dupe(u8, help),
-        });
-    }
-
-    /// Register a gauge metric.
-    pub fn registerGauge(self: *MetricRegistry, name: []const u8, help: []const u8) !void {
-        const key = try self.allocator.dupe(u8, name);
-        errdefer self.allocator.free(key);
-        try self.gauges.put(key, .{
-            .name = try self.allocator.dupe(u8, name),
-            .help = try self.allocator.dupe(u8, help),
-        });
-    }
-
-    /// Register a histogram metric.
-    pub fn registerHistogram(self: *MetricRegistry, name: []const u8, help: []const u8) !void {
-        const key = try self.allocator.dupe(u8, name);
-        errdefer self.allocator.free(key);
-        try self.histograms.put(key, .{
-            .name = try self.allocator.dupe(u8, name),
-            .help = try self.allocator.dupe(u8, help),
-        });
-    }
-
-    /// Increment a counter.
-    pub fn incrementCounter(self: *MetricRegistry, name: []const u8) void {
-        if (self.counters.getPtr(name)) |c| c.value += 1;
-    }
-
-    /// Add to a counter.
-    pub fn addCounter(self: *MetricRegistry, name: []const u8, delta: u64) void {
-        if (self.counters.getPtr(name)) |c| c.value += delta;
-    }
-
-    /// Set a gauge value.
-    pub fn setGauge(self: *MetricRegistry, name: []const u8, value: f64) void {
-        if (self.gauges.getPtr(name)) |g| g.value = value;
-    }
-
-    /// Observe a histogram value.
-    pub fn observeHistogram(self: *MetricRegistry, name: []const u8, value: f64) void {
-        if (self.histograms.getPtr(name)) |h| h.observe(value);
-    }
-
-    /// Export all metrics in Prometheus exposition format.
-    pub fn exportPrometheus(self: *const MetricRegistry, alloc: Allocator) ![]u8 {
-        var buf = std.ArrayList(u8).init(alloc);
-        const writer = buf.writer();
-
-        // Counters
-        var cit = self.counters.iterator();
-        while (cit.next()) |entry| {
-            const c = entry.value_ptr;
-            try writer.print("# HELP {s} {s}\n", .{ c.name, c.help });
-            try writer.print("# TYPE {s} counter\n", .{c.name});
-            try writer.print("{s} {d}\n\n", .{ c.name, c.value });
-        }
-
-        // Gauges
-        var git = self.gauges.iterator();
-        while (git.next()) |entry| {
-            const g = entry.value_ptr;
-            try writer.print("# HELP {s} {s}\n", .{ g.name, g.help });
-            try writer.print("# TYPE {s} gauge\n", .{g.name});
-            try writer.print("{s} {d:.6}\n\n", .{ g.name, g.value });
-        }
-
-        // Histograms
-        var hit = self.histograms.iterator();
-        while (hit.next()) |entry| {
-            const h = entry.value_ptr;
-            try writer.print("# HELP {s} {s}\n", .{ h.name, h.help });
-            try writer.print("# TYPE {s} histogram\n", .{h.name});
-            var cumulative: u64 = 0;
-            for (Histogram.bucket_bounds, 0..) |bound, i| {
-                cumulative += h.buckets[i];
-                try writer.print("{s}_bucket{{le=\"{d:.3}\"}} {d}\n", .{ h.name, bound, cumulative });
-            }
-            try writer.print("{s}_bucket{{le=\"+Inf\"}} {d}\n", .{ h.name, h.count });
-            try writer.print("{s}_sum {d:.6}\n", .{ h.name, h.sum });
-            try writer.print("{s}_count {d}\n\n", .{ h.name, h.count });
-        }
-
-        return buf.toOwnedSlice();
-    }
-};
+/// MetricRegistry is defined in core to avoid circular dependencies between
+/// broker, storage, and raft modules. Re-exported here for backward compatibility.
+pub const MetricRegistry = @import("../core/metric_registry.zig").MetricRegistry;
 
 /// Register standard broker metrics.
 pub fn registerBrokerMetrics(registry: *MetricRegistry) !void {
@@ -192,61 +24,54 @@ pub fn registerBrokerMetrics(registry: *MetricRegistry) !void {
     try registry.registerGauge("kafka_server_member_count", "Number of consumer group members");
 }
 
+/// Register S3 I/O metrics (labeled by operation type).
+pub fn registerS3Metrics(registry: *MetricRegistry) !void {
+    try registry.registerLabeledCounter("s3_requests_total", "Total S3 requests", &.{"operation"});
+    try registry.registerLabeledCounter("s3_request_errors_total", "Failed S3 requests", &.{"operation"});
+    try registry.registerLabeledHistogram("s3_request_duration_seconds", "S3 request latency", &.{"operation"});
+    try registry.registerLabeledCounter("s3_bytes_total", "Total S3 bytes transferred", &.{"direction"});
+}
+
+/// Register compaction metrics.
+pub fn registerCompactionMetrics(registry: *MetricRegistry) !void {
+    try registry.registerCounter("compaction_cycles_total", "Total compaction cycles completed");
+    try registry.registerHistogram("compaction_cycle_duration_seconds", "Duration of compaction cycles");
+    try registry.registerCounter("compaction_splits_total", "Total SSOs split into SOs");
+    try registry.registerCounter("compaction_merges_total", "Total merge operations");
+    try registry.registerCounter("compaction_cleanups_total", "Total cleanup deletions");
+    try registry.registerCounter("compaction_errors_total", "Failed compaction operations");
+    try registry.registerGauge("compaction_orphaned_keys", "Orphaned S3 keys pending retry");
+}
+
+/// Register cache metrics (labeled by cache type and result).
+pub fn registerCacheMetrics(registry: *MetricRegistry) !void {
+    try registry.registerLabeledCounter("cache_operations_total", "Cache lookup operations", &.{ "cache", "result" });
+    try registry.registerLabeledCounter("cache_evictions_total", "Cache evictions", &.{"cache"});
+    try registry.registerGauge("log_cache_size_bytes", "LogCache current memory usage");
+    try registry.registerGauge("log_cache_entries", "LogCache current entry count");
+    try registry.registerGauge("s3_block_cache_size_bytes", "S3BlockCache current memory usage");
+    try registry.registerGauge("s3_block_cache_entries", "S3BlockCache current entry count");
+}
+
+/// Register Raft consensus metrics.
+pub fn registerRaftMetrics(registry: *MetricRegistry) !void {
+    try registry.registerCounter("raft_elections_started_total", "Elections started");
+    try registry.registerCounter("raft_pre_votes_started_total", "Pre-vote rounds started");
+    try registry.registerCounter("raft_votes_granted_total", "Votes granted to other candidates");
+    try registry.registerCounter("raft_votes_rejected_total", "Votes rejected");
+    try registry.registerCounter("raft_leader_elections_won_total", "Times this node became leader");
+    try registry.registerCounter("raft_epoch_changes_total", "Epoch transitions");
+    try registry.registerCounter("raft_log_entries_appended_total", "Entries appended to Raft log");
+    try registry.registerCounter("raft_log_entries_committed_total", "Entries committed");
+    try registry.registerCounter("raft_snapshots_taken_total", "Snapshot compactions");
+    try registry.registerGauge("raft_current_epoch", "Current Raft epoch");
+    try registry.registerGauge("raft_commit_index", "Current Raft commit index");
+    try registry.registerGauge("raft_role", "Current Raft role (0=unattached, 1=follower, 2=candidate, 3=leader)");
+}
+
 // ---------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------
-
-test "MetricRegistry counter" {
-    var registry = MetricRegistry.init(testing.allocator);
-    defer registry.deinit();
-
-    try registry.registerCounter("requests_total", "Total requests");
-    registry.incrementCounter("requests_total");
-    registry.incrementCounter("requests_total");
-    registry.addCounter("requests_total", 5);
-
-    const counter = registry.counters.get("requests_total").?;
-    try testing.expectEqual(@as(u64, 7), counter.value);
-}
-
-test "MetricRegistry gauge" {
-    var registry = MetricRegistry.init(testing.allocator);
-    defer registry.deinit();
-
-    try registry.registerGauge("connections", "Active connections");
-    registry.setGauge("connections", 42.0);
-
-    const gauge = registry.gauges.get("connections").?;
-    try testing.expectEqual(@as(f64, 42.0), gauge.value);
-}
-
-test "MetricRegistry histogram" {
-    var registry = MetricRegistry.init(testing.allocator);
-    defer registry.deinit();
-
-    try registry.registerHistogram("latency", "Request latency");
-    registry.observeHistogram("latency", 0.003);
-    registry.observeHistogram("latency", 0.05);
-    registry.observeHistogram("latency", 1.5);
-
-    const h = registry.histograms.get("latency").?;
-    try testing.expectEqual(@as(u64, 3), h.count);
-    try testing.expect(h.sum > 1.5);
-}
-
-test "MetricRegistry prometheus export" {
-    var registry = MetricRegistry.init(testing.allocator);
-    defer registry.deinit();
-
-    try registry.registerCounter("test_counter", "A test counter");
-    registry.addCounter("test_counter", 42);
-
-    const output = try registry.exportPrometheus(testing.allocator);
-    defer testing.allocator.free(output);
-
-    try testing.expect(std.mem.indexOf(u8, output, "test_counter 42") != null);
-    try testing.expect(std.mem.indexOf(u8, output, "# TYPE test_counter counter") != null);
-}
 
 test "registerBrokerMetrics" {
     var registry = MetricRegistry.init(testing.allocator);
@@ -256,4 +81,48 @@ test "registerBrokerMetrics" {
     try testing.expect(registry.counters.contains("kafka_server_requests_total"));
     try testing.expect(registry.gauges.contains("kafka_server_active_connections"));
     try testing.expect(registry.histograms.contains("kafka_server_request_latency_seconds"));
+}
+
+test "registerS3Metrics" {
+    var registry = MetricRegistry.init(testing.allocator);
+    defer registry.deinit();
+
+    try registerS3Metrics(&registry);
+    try testing.expect(registry.labeled_counter_meta.contains("s3_requests_total"));
+    try testing.expect(registry.labeled_counter_meta.contains("s3_request_errors_total"));
+    try testing.expect(registry.labeled_histogram_meta.contains("s3_request_duration_seconds"));
+    try testing.expect(registry.labeled_counter_meta.contains("s3_bytes_total"));
+}
+
+test "registerCompactionMetrics" {
+    var registry = MetricRegistry.init(testing.allocator);
+    defer registry.deinit();
+
+    try registerCompactionMetrics(&registry);
+    try testing.expect(registry.counters.contains("compaction_cycles_total"));
+    try testing.expect(registry.histograms.contains("compaction_cycle_duration_seconds"));
+    try testing.expect(registry.counters.contains("compaction_splits_total"));
+    try testing.expect(registry.gauges.contains("compaction_orphaned_keys"));
+}
+
+test "registerCacheMetrics" {
+    var registry = MetricRegistry.init(testing.allocator);
+    defer registry.deinit();
+
+    try registerCacheMetrics(&registry);
+    try testing.expect(registry.labeled_counter_meta.contains("cache_operations_total"));
+    try testing.expect(registry.labeled_counter_meta.contains("cache_evictions_total"));
+    try testing.expect(registry.gauges.contains("log_cache_size_bytes"));
+    try testing.expect(registry.gauges.contains("s3_block_cache_size_bytes"));
+}
+
+test "registerRaftMetrics" {
+    var registry = MetricRegistry.init(testing.allocator);
+    defer registry.deinit();
+
+    try registerRaftMetrics(&registry);
+    try testing.expect(registry.counters.contains("raft_elections_started_total"));
+    try testing.expect(registry.counters.contains("raft_votes_granted_total"));
+    try testing.expect(registry.gauges.contains("raft_current_epoch"));
+    try testing.expect(registry.gauges.contains("raft_role"));
 }

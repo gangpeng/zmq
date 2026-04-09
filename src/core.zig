@@ -12,11 +12,13 @@ pub const varint = @import("core/varint.zig");
 pub const crc32c = @import("core/crc32c.zig");
 pub const uuid = @import("core/uuid.zig");
 pub const time_utils = @import("core/time_utils.zig");
+pub const metric_registry = @import("core/metric_registry.zig");
 
 pub const ByteBuffer = byte_buffer.ByteBuffer;
 pub const Varint = varint;
 pub const Crc32c = crc32c;
 pub const Uuid = uuid.Uuid;
+pub const MetricRegistry = metric_registry.MetricRegistry;
 
 test {
     @import("std").testing.refAllDecls(@This());

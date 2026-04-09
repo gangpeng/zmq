@@ -3,6 +3,7 @@ const testing = std.testing;
 const Allocator = std.mem.Allocator;
 const fs = std.fs;
 const log = std.log.scoped(.raft);
+const MetricRegistry = @import("../core/metric_registry.zig").MetricRegistry;
 
 /// KRaft Raft consensus state machine.
 ///
@@ -43,6 +44,9 @@ pub const RaftState = struct {
 
     /// Offset of the last applied config change entry (null = none applied yet).
     last_applied_config_offset: ?u64 = null,
+
+    /// Optional Prometheus metric registry for Raft consensus observability.
+    metrics: ?*MetricRegistry = null,
 
     pub const Role = enum {
         unattached,
@@ -95,12 +99,14 @@ pub const RaftState = struct {
         // If candidate's epoch is less than ours, reject
         if (candidate_epoch < self.current_epoch) {
             log.debug("Vote rejected from node {d}: stale epoch {d} < {d}", .{ candidate_id, candidate_epoch, self.current_epoch });
+            if (self.metrics) |m| m.incrementCounter("raft_votes_rejected_total");
             return .{ .vote_granted = false, .epoch = self.current_epoch };
         }
 
         // If we already voted for someone else this epoch, reject
         if (candidate_epoch == self.current_epoch and self.voted_for != null and self.voted_for.? != candidate_id) {
             log.debug("Vote rejected from node {d}: already voted for {?d} in epoch {d}", .{ candidate_id, self.voted_for, self.current_epoch });
+            if (self.metrics) |m| m.incrementCounter("raft_votes_rejected_total");
             return .{ .vote_granted = false, .epoch = self.current_epoch };
         }
 
@@ -113,6 +119,7 @@ pub const RaftState = struct {
 
         if (!log_ok) {
             log.debug("Vote rejected from node {d}: log not up-to-date (candidate epoch={d}/offset={d}, ours epoch={d}/offset={d})", .{ candidate_id, last_log_epoch, last_log_offset, our_last_epoch, our_last_offset });
+            if (self.metrics) |m| m.incrementCounter("raft_votes_rejected_total");
             return .{ .vote_granted = false, .epoch = self.current_epoch };
         }
 
@@ -130,6 +137,11 @@ pub const RaftState = struct {
         // so we shouldn't start our own election immediately.
         self.election_timer.reset();
         log.info("Vote granted to node {d} for epoch {d}", .{ candidate_id, self.current_epoch });
+
+        if (self.metrics) |m| {
+            m.incrementCounter("raft_votes_granted_total");
+            m.setGauge("raft_current_epoch", @floatFromInt(self.current_epoch));
+        }
 
         return .{ .vote_granted = true, .epoch = self.current_epoch };
     }
@@ -150,6 +162,12 @@ pub const RaftState = struct {
         self.election_timer.reset();
         log.info("Starting election: node {d} becoming candidate for epoch {d}", .{ self.node_id, self.current_epoch });
 
+        if (self.metrics) |m| {
+            m.incrementCounter("raft_elections_started_total");
+            m.setGauge("raft_current_epoch", @floatFromInt(self.current_epoch));
+            m.setGauge("raft_role", 2.0); // candidate
+        }
+
         return .{
             .epoch = self.current_epoch,
             .last_log_offset = self.log.lastOffset(),
@@ -162,6 +180,9 @@ pub const RaftState = struct {
     pub fn startPreVote(self: *RaftState) ElectionResult {
         // Do NOT increment epoch — this is tentative
         log.info("Starting pre-vote: node {d} for tentative epoch {d}", .{ self.node_id, self.current_epoch + 1 });
+        if (self.metrics) |m| {
+            m.incrementCounter("raft_pre_votes_started_total");
+        }
         return .{
             .epoch = self.current_epoch + 1, // Tentative next epoch
             .last_log_offset = self.log.lastOffset(),
@@ -213,6 +234,11 @@ pub const RaftState = struct {
         self.leader_id = self.node_id;
         log.info("Node {d} became leader in epoch {d}", .{ self.node_id, self.current_epoch });
 
+        if (self.metrics) |m| {
+            m.incrementCounter("raft_leader_elections_won_total");
+            m.setGauge("raft_role", 3.0); // leader
+        }
+
         // Initialize next_index for all voters
         var it = self.voters.iterator();
         while (it.next()) |entry| {
@@ -237,6 +263,12 @@ pub const RaftState = struct {
         self.persistRaftMeta();
         self.election_timer.reset();
         log.info("Node {d} became follower: epoch={d}, leader={d}", .{ self.node_id, epoch, leader_id });
+
+        if (self.metrics) |m| {
+            m.incrementCounter("raft_epoch_changes_total");
+            m.setGauge("raft_current_epoch", @floatFromInt(epoch));
+            m.setGauge("raft_role", 1.0); // follower
+        }
     }
 
     /// Append an entry to the log (leader only).
@@ -250,6 +282,10 @@ pub const RaftState = struct {
             self.persistEntry(dir, self.current_epoch, offset, data) catch |err| {
                 log.warn("Failed to persist raft log entry: {}", .{err});
             };
+        }
+
+        if (self.metrics) |m| {
+            m.incrementCounter("raft_log_entries_appended_total");
         }
 
         return offset;
@@ -615,9 +651,14 @@ pub const RaftState = struct {
             if (new_commit > self.commit_index) {
                 if (self.log.get(new_commit)) |entry| {
                     if (entry.epoch == self.current_epoch) {
+                        const old_commit = self.commit_index;
                         self.commit_index = new_commit;
                         // Apply any newly committed config changes
                         self.applyCommittedConfigs();
+                        if (self.metrics) |m| {
+                            m.addCounter("raft_log_entries_committed_total", new_commit - old_commit);
+                            m.setGauge("raft_commit_index", @floatFromInt(new_commit));
+                        }
                     }
                 } else if (new_commit == 0 and self.log.length() == 0) {
                     // Empty log edge case — commit_index stays at 0
@@ -742,6 +783,10 @@ pub const RaftState = struct {
         // Persist snapshot metadata
         if (self.data_dir) |dir| {
             self.persistSnapshotMeta(dir) catch {};
+        }
+
+        if (self.metrics) |m| {
+            m.incrementCounter("raft_snapshots_taken_total");
         }
     }
 

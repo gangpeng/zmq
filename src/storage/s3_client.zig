@@ -4,6 +4,7 @@ const Allocator = std.mem.Allocator;
 const net = std.net;
 const log = std.log.scoped(.s3);
 const AwsSigV4 = @import("aws_sigv4.zig").AwsSigV4;
+const MetricRegistry = @import("../core/metric_registry.zig").MetricRegistry;
 
 /// S3-compatible HTTP client for MinIO.
 ///
@@ -23,6 +24,10 @@ pub const S3Client = struct {
     delete_count: u64 = 0,
     bytes_uploaded: u64 = 0,
     bytes_downloaded: u64 = 0,
+    /// Optional Prometheus metric registry for S3 I/O observability.
+    /// When set, records s3_requests_total, s3_request_errors_total,
+    /// s3_request_duration_seconds, and s3_bytes_total.
+    metrics: ?*MetricRegistry = null,
     // Connection pool for keep-alive reuse
     // TODO: For HTTPS support, add OpenSSL FFI or use Zig's std.crypto.tls.Client
     //       (requires linking against libssl/libcrypto). HTTPS connections would wrap
@@ -60,22 +65,33 @@ pub const S3Client = struct {
 
     /// Upload an object.
     pub fn putObject(self: *S3Client, key: []const u8, data: []const u8) !void {
+        const start_ns = std.time.nanoTimestamp();
         const path = try std.fmt.allocPrint(self.allocator, "/{s}/{s}", .{ self.bucket, key });
         defer self.allocator.free(path);
 
         var resp_buf: [4096]u8 = undefined;
-        const status = try self.httpRequest("PUT", path, "", data, null, &resp_buf);
+        const status = self.httpRequest("PUT", path, "", data, null, &resp_buf) catch |err| {
+            self.recordS3Error("put");
+            self.recordS3Duration("put", start_ns);
+            return err;
+        };
 
         if (status < 200 or status >= 300) {
+            self.recordS3Error("put");
+            self.recordS3Duration("put", start_ns);
             return error.S3PutFailed;
         }
 
         self.put_count += 1;
         self.bytes_uploaded += data.len;
+        self.recordS3Request("put");
+        self.recordS3Bytes("upload", data.len);
+        self.recordS3Duration("put", start_ns);
     }
 
     /// Download an object. Caller owns returned slice.
     pub fn getObject(self: *S3Client, key: []const u8) ![]u8 {
+        const start_ns = std.time.nanoTimestamp();
         const path = try std.fmt.allocPrint(self.allocator, "/{s}/{s}", .{ self.bucket, key });
         defer self.allocator.free(path);
 
@@ -121,12 +137,28 @@ pub const S3Client = struct {
 
         // Parse HTTP response — find \r\n\r\n header/body separator
         const resp_data = response.items;
-        const header_end = std.mem.indexOf(u8, resp_data, "\r\n\r\n") orelse return error.S3GetFailed;
+        const header_end = std.mem.indexOf(u8, resp_data, "\r\n\r\n") orelse {
+            self.recordS3Error("get");
+            self.recordS3Duration("get", start_ns);
+            return error.S3GetFailed;
+        };
 
         // Check status
-        if (resp_data.len < 12) return error.S3GetFailed;
-        const status_code = std.fmt.parseInt(u16, resp_data[9..12], 10) catch return error.S3GetFailed;
-        if (status_code < 200 or status_code >= 300) return error.S3GetFailed;
+        if (resp_data.len < 12) {
+            self.recordS3Error("get");
+            self.recordS3Duration("get", start_ns);
+            return error.S3GetFailed;
+        }
+        const status_code = std.fmt.parseInt(u16, resp_data[9..12], 10) catch {
+            self.recordS3Error("get");
+            self.recordS3Duration("get", start_ns);
+            return error.S3GetFailed;
+        };
+        if (status_code < 200 or status_code >= 300) {
+            self.recordS3Error("get");
+            self.recordS3Duration("get", start_ns);
+            return error.S3GetFailed;
+        }
 
         // Extract body
         const body_start = header_end + 4;
@@ -135,12 +167,19 @@ pub const S3Client = struct {
         // Check for chunked transfer encoding
         const headers_str = resp_data[0..header_end];
         if (std.mem.indexOf(u8, headers_str, "Transfer-Encoding: chunked") != null) {
-            return try self.decodeChunked(body);
+            const chunked_result = try self.decodeChunked(body);
+            self.recordS3Request("get");
+            self.recordS3Bytes("download", chunked_result.len);
+            self.recordS3Duration("get", start_ns);
+            return chunked_result;
         }
 
         const result = try self.allocator.dupe(u8, body);
         self.get_count += 1;
         self.bytes_downloaded += result.len;
+        self.recordS3Request("get");
+        self.recordS3Bytes("download", result.len);
+        self.recordS3Duration("get", start_ns);
         return result;
     }
 
@@ -237,12 +276,19 @@ pub const S3Client = struct {
 
     /// Delete an object.
     pub fn deleteObject(self: *S3Client, key: []const u8) !void {
+        const start_ns = std.time.nanoTimestamp();
         const path = try std.fmt.allocPrint(self.allocator, "/{s}/{s}", .{ self.bucket, key });
         defer self.allocator.free(path);
 
         var resp_buf: [4096]u8 = undefined;
-        _ = try self.httpRequest("DELETE", path, "", null, null, &resp_buf);
+        _ = self.httpRequest("DELETE", path, "", null, null, &resp_buf) catch |err| {
+            self.recordS3Error("delete");
+            self.recordS3Duration("delete", start_ns);
+            return err;
+        };
         self.delete_count += 1;
+        self.recordS3Request("delete");
+        self.recordS3Duration("delete", start_ns);
     }
 
     /// Check if an object exists.
@@ -252,6 +298,7 @@ pub const S3Client = struct {
 
         var resp_buf: [4096]u8 = undefined;
         const status = try self.httpRequest("HEAD", path, "", null, null, &resp_buf);
+        self.recordS3Request("head");
         return status >= 200 and status < 300;
     }
 
@@ -603,6 +650,39 @@ pub const S3Client = struct {
 
         const status = std.fmt.parseInt(u16, resp_buf[9..12], 10) catch return error.S3RequestFailed;
         return status;
+    }
+
+    // ---- Metrics helpers ----
+
+    /// Record a successful S3 request in the Prometheus metric registry.
+    fn recordS3Request(self: *S3Client, operation: []const u8) void {
+        if (self.metrics) |m| {
+            m.incrementLabeledCounter("s3_requests_total", &.{operation});
+        }
+    }
+
+    /// Record a failed S3 request.
+    fn recordS3Error(self: *S3Client, operation: []const u8) void {
+        if (self.metrics) |m| {
+            m.incrementLabeledCounter("s3_requests_total", &.{operation});
+            m.incrementLabeledCounter("s3_request_errors_total", &.{operation});
+        }
+    }
+
+    /// Record S3 request duration in seconds.
+    fn recordS3Duration(self: *S3Client, operation: []const u8, start_ns: i128) void {
+        if (self.metrics) |m| {
+            const elapsed_ns = std.time.nanoTimestamp() - start_ns;
+            const elapsed_secs: f64 = @as(f64, @floatFromInt(elapsed_ns)) / 1_000_000_000.0;
+            m.observeLabeledHistogram("s3_request_duration_seconds", &.{operation}, elapsed_secs);
+        }
+    }
+
+    /// Record S3 bytes transferred.
+    fn recordS3Bytes(self: *S3Client, direction: []const u8, bytes: usize) void {
+        if (self.metrics) |m| {
+            m.addLabeledCounter("s3_bytes_total", &.{direction}, @intCast(bytes));
+        }
     }
 };
 

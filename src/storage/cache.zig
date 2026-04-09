@@ -1,6 +1,7 @@
 const std = @import("std");
 const testing = std.testing;
 const Allocator = std.mem.Allocator;
+const MetricRegistry = @import("../core/metric_registry.zig").MetricRegistry;
 
 /// LogCache — FIFO cache for recently written (uncommitted) data.
 ///
@@ -18,6 +19,8 @@ pub const LogCache = struct {
     total_size: u64 = 0,
     max_size: u64,
     allocator: Allocator,
+    /// Optional Prometheus metric registry for cache observability.
+    metrics: ?*MetricRegistry = null,
 
     pub const CacheBlock = struct {
         id: u64,
@@ -111,6 +114,7 @@ pub const LogCache = struct {
         const block = &self.blocks.items[self.blocks.items.len - 1];
         try block.addRecord(stream_id, offset, data);
         self.total_size += data.len;
+        self.updateLogCacheGauges();
     }
 
     /// Put a record with caller-owned data (zero-copy — no dupe).
@@ -133,10 +137,11 @@ pub const LogCache = struct {
         const block = &self.blocks.items[self.blocks.items.len - 1];
         try block.addRecordOwned(stream_id, offset, data);
         self.total_size += data.len;
+        self.updateLogCacheGauges();
     }
 
     /// Get records for a stream in the offset range [start_offset, end_offset).
-    pub fn get(self: *const LogCache, stream_id: u64, start_offset: u64, end_offset: u64, alloc: Allocator) ![]const CachedRecord {
+    pub fn get(self: *LogCache, stream_id: u64, start_offset: u64, end_offset: u64, alloc: Allocator) ![]const CachedRecord {
         var results = std.ArrayList(CachedRecord).init(alloc);
 
         for (self.blocks.items) |*block| {
@@ -147,7 +152,15 @@ pub const LogCache = struct {
             }
         }
 
-        return results.toOwnedSlice();
+        const slice = try results.toOwnedSlice();
+        if (self.metrics) |m| {
+            if (slice.len > 0) {
+                m.incrementLabeledCounter("cache_operations_total", &.{ "log", "hit" });
+            } else {
+                m.incrementLabeledCounter("cache_operations_total", &.{ "log", "miss" });
+            }
+        }
+        return slice;
     }
 
     fn evictOldest(self: *LogCache) void {
@@ -155,6 +168,9 @@ pub const LogCache = struct {
         var block = self.blocks.orderedRemove(0);
         self.total_size -= block.size;
         block.deinit();
+        if (self.metrics) |m| {
+            m.incrementLabeledCounter("cache_evictions_total", &.{"log"});
+        }
     }
 
     /// Number of cached blocks.
@@ -170,6 +186,14 @@ pub const LogCache = struct {
         }
         return count;
     }
+
+    /// Update Prometheus gauges for LogCache size and entry count.
+    fn updateLogCacheGauges(self: *LogCache) void {
+        if (self.metrics) |m| {
+            m.setGauge("log_cache_size_bytes", @floatFromInt(self.total_size));
+            m.setGauge("log_cache_entries", @floatFromInt(self.recordCount()));
+        }
+    }
 };
 
 /// S3BlockCache — LRU cache for committed S3 data blocks.
@@ -184,6 +208,8 @@ pub const S3BlockCache = struct {
     hits: u64 = 0,
     misses: u64 = 0,
     allocator: Allocator,
+    /// Optional Prometheus metric registry for cache observability.
+    metrics: ?*MetricRegistry = null,
 
     pub const CacheEntry = struct {
         key: []u8,
@@ -214,9 +240,15 @@ pub const S3BlockCache = struct {
     pub fn get(self: *S3BlockCache, key: []const u8) ?[]const u8 {
         if (self.entries.get(key)) |entry| {
             self.hits += 1;
+            if (self.metrics) |m| {
+                m.incrementLabeledCounter("cache_operations_total", &.{ "s3_block", "hit" });
+            }
             return entry.data;
         }
         self.misses += 1;
+        if (self.metrics) |m| {
+            m.incrementLabeledCounter("cache_operations_total", &.{ "s3_block", "miss" });
+        }
         return null;
     }
 
@@ -245,6 +277,7 @@ pub const S3BlockCache = struct {
         });
         try self.access_order.append(key_copy);
         self.current_size += data.len;
+        self.updateS3CacheGauges();
     }
 
     fn evictLru(self: *S3BlockCache) !void {
@@ -256,12 +289,23 @@ pub const S3BlockCache = struct {
             self.allocator.free(entry.value.data);
             self.allocator.free(entry.value.key);
         }
+        if (self.metrics) |m| {
+            m.incrementLabeledCounter("cache_evictions_total", &.{"s3_block"});
+        }
     }
 
     pub fn hitRate(self: *const S3BlockCache) f64 {
         const total = self.hits + self.misses;
         if (total == 0) return 0.0;
         return @as(f64, @floatFromInt(self.hits)) / @as(f64, @floatFromInt(total));
+    }
+
+    /// Update Prometheus gauges for S3BlockCache size and entry count.
+    fn updateS3CacheGauges(self: *S3BlockCache) void {
+        if (self.metrics) |m| {
+            m.setGauge("s3_block_cache_size_bytes", @floatFromInt(self.current_size));
+            m.setGauge("s3_block_cache_entries", @floatFromInt(self.entries.count()));
+        }
     }
 };
 

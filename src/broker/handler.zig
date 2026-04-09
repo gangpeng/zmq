@@ -283,6 +283,23 @@ pub const Broker = struct {
 
         // Register standard broker metrics
         metrics_mod.registerBrokerMetrics(&broker.metrics) catch {};
+        // Register subsystem metrics (S3, compaction, cache, Raft)
+        metrics_mod.registerS3Metrics(&broker.metrics) catch {};
+        metrics_mod.registerCompactionMetrics(&broker.metrics) catch {};
+        metrics_mod.registerCacheMetrics(&broker.metrics) catch {};
+        metrics_mod.registerRaftMetrics(&broker.metrics) catch {};
+
+        // Wire metrics registry into subsystems
+        broker.store.cache.metrics = &broker.metrics;
+        if (broker.store.s3_client) |*c| {
+            c.metrics = &broker.metrics;
+        }
+        if (broker.store.s3_block_cache) |*bc| {
+            bc.metrics = &broker.metrics;
+        }
+        if (broker.compaction_manager) |*cm| {
+            cm.metrics = &broker.metrics;
+        }
 
         return broker;
     }
@@ -290,6 +307,8 @@ pub const Broker = struct {
     /// Wire in the Raft state (owned externally by Controller or main).
     pub fn setRaftState(self: *Broker, raft: *RaftState) void {
         self.raft_state = raft;
+        // Wire metrics into the Raft state for consensus observability
+        raft.metrics = &self.metrics;
     }
 
     /// Open the broker (initializes storage, WAL, loads persisted metadata)

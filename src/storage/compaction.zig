@@ -11,6 +11,7 @@ const ObjectWriter = @import("s3.zig").ObjectWriter;
 const ObjectReader = @import("s3.zig").ObjectReader;
 const S3Storage = @import("s3_client.zig").S3Storage;
 const MockS3 = @import("s3.zig").MockS3;
+const MetricRegistry = @import("../core/metric_registry.zig").MetricRegistry;
 
 /// CompactionManager periodically splits multi-stream StreamSetObjects into
 /// per-stream StreamObjects, and merges small StreamObjects into larger ones.
@@ -52,6 +53,9 @@ pub const CompactionManager = struct {
     /// Path to the compaction journal file (tracks in-progress operations).
     journal_path: ?[]const u8 = null,
 
+    /// Optional Prometheus metric registry for compaction observability.
+    metrics: ?*MetricRegistry = null,
+
     pub fn init(
         allocator: Allocator,
         object_manager: *ObjectManager,
@@ -89,15 +93,24 @@ pub const CompactionManager = struct {
 
         self.runCompaction() catch |err| {
             log.warn("Compaction failed: {}", .{err});
+            if (self.metrics) |m| {
+                m.incrementCounter("compaction_errors_total");
+            }
         };
     }
 
     /// Full compaction cycle: cleanup orphans → force-split → merge → cleanup expired.
     pub fn runCompaction(self: *CompactionManager) !void {
+        const start_ns = std.time.nanoTimestamp();
         log.info("Starting compaction cycle (SSOs={d}, SOs={d})", .{
             self.object_manager.getStreamSetObjectCount(),
             self.object_manager.getStreamObjectCount(),
         });
+
+        // Report orphaned keys gauge at start of cycle
+        if (self.metrics) |m| {
+            m.setGauge("compaction_orphaned_keys", @floatFromInt(self.orphaned_keys.items.len));
+        }
 
         self.cleanupOrphans();
 
@@ -116,6 +129,18 @@ pub const CompactionManager = struct {
 
         self.total_splits += splits;
         self.total_merges += merges;
+
+        // Record Prometheus metrics
+        if (self.metrics) |m| {
+            m.incrementCounter("compaction_cycles_total");
+            m.addCounter("compaction_splits_total", splits);
+            m.addCounter("compaction_merges_total", merges);
+            m.addCounter("compaction_cleanups_total", cleanups);
+            const elapsed_ns = std.time.nanoTimestamp() - start_ns;
+            const elapsed_secs: f64 = @as(f64, @floatFromInt(elapsed_ns)) / 1_000_000_000.0;
+            m.observeHistogram("compaction_cycle_duration_seconds", elapsed_secs);
+            m.setGauge("compaction_orphaned_keys", @floatFromInt(self.orphaned_keys.items.len));
+        }
 
         log.info("Compaction complete: {d} splits, {d} merges, {d} cleanups", .{ splits, merges, cleanups });
     }
