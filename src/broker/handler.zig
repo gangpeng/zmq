@@ -19,6 +19,8 @@ const RaftState = @import("../raft/state.zig").RaftState;
 const auth_mod = @import("../security/auth.zig");
 const Authorizer = auth_mod.Authorizer;
 const SaslPlainAuthenticator = auth_mod.SaslPlainAuthenticator;
+const OAuthBearerAuthenticator = auth_mod.OAuthBearerAuthenticator;
+const ScramSha256Authenticator = auth_mod.ScramSha256Authenticator;
 const FetchSessionManager = @import("fetch_session.zig").FetchSessionManager;
 // Import failover controller
 const FailoverController = @import("failover.zig").FailoverController;
@@ -74,12 +76,21 @@ pub const Broker = struct {
     authorizer: Authorizer,
     /// SASL/PLAIN authenticator for client authentication.
     sasl_authenticator: SaslPlainAuthenticator,
+    /// SCRAM-SHA-256 authenticator for challenge-response authentication.
+    scram_authenticator: ScramSha256Authenticator,
+    /// OAUTHBEARER authenticator for JWT-based authentication.
+    oauth_authenticator: OAuthBearerAuthenticator,
     /// Whether SASL authentication is required for client connections.
     sasl_enabled: bool = false,
     /// Map of client_id → authenticated principal (from SASL handshake).
     /// Used to resolve the real principal for ACL checks instead of trusting
     /// the unauthenticated client_id header.
     authenticated_sessions: std.StringHashMap([]u8),
+    /// Map of client_id → negotiated SASL mechanism name.
+    /// Tracks which mechanism each client selected during SaslHandshake.
+    sasl_mechanisms: std.StringHashMap([]u8),
+    /// Comma-separated list of enabled SASL mechanisms (e.g., "PLAIN,SCRAM-SHA-256,OAUTHBEARER").
+    sasl_enabled_mechanisms: []const u8 = "PLAIN",
     /// KIP-227 incremental fetch session manager.
     fetch_sessions: FetchSessionManager,
     /// Counter for S3 flush failures (used for monitoring/alerting).
@@ -235,6 +246,13 @@ pub const Broker = struct {
         /// Allow all operations when no ACLs are defined (default: true)
         allow_everyone_if_no_acl: bool = true,
 
+        /// Comma-separated SASL mechanisms to enable (e.g., "PLAIN,SCRAM-SHA-256,OAUTHBEARER")
+        sasl_enabled_mechanisms: []const u8 = "PLAIN",
+        /// Expected issuer for OAUTHBEARER tokens (empty = no validation)
+        oauth_issuer: []const u8 = "",
+        /// Expected audience for OAUTHBEARER tokens (empty = no validation)
+        oauth_audience: []const u8 = "",
+
         // TLS configuration (used by main.zig to create TlsConfig)
         /// Security protocol: "plaintext", "ssl", "sasl_plaintext", "sasl_ssl"
         security_protocol: []const u8 = "plaintext",
@@ -290,7 +308,10 @@ pub const Broker = struct {
             .advertised_host = config.advertised_host,
             .authorizer = Authorizer.init(alloc),
             .sasl_authenticator = SaslPlainAuthenticator.init(alloc),
+            .scram_authenticator = ScramSha256Authenticator.init(alloc),
+            .oauth_authenticator = OAuthBearerAuthenticator.init(),
             .authenticated_sessions = std.StringHashMap([]u8).init(alloc),
+            .sasl_mechanisms = std.StringHashMap([]u8).init(alloc),
             .fetch_sessions = FetchSessionManager.init(alloc),
             // Initialize failover controller
             .failover_controller = FailoverController.init(alloc, node_id),
@@ -349,6 +370,15 @@ pub const Broker = struct {
                     broker.sasl_authenticator.addUser(username, password) catch {};
                 }
             }
+        }
+
+        // Configure multi-mechanism SASL settings
+        broker.sasl_enabled_mechanisms = config.sasl_enabled_mechanisms;
+        if (config.oauth_issuer.len > 0 or config.oauth_audience.len > 0) {
+            broker.oauth_authenticator = OAuthBearerAuthenticator.initWithConfig(
+                if (config.oauth_issuer.len > 0) config.oauth_issuer else null,
+                if (config.oauth_audience.len > 0) config.oauth_audience else null,
+            );
         }
 
         // Parse super.users: "User:admin;User:broker"
@@ -637,6 +667,14 @@ pub const Broker = struct {
         self.metrics.deinit();
         self.authorizer.deinit();
         self.sasl_authenticator.deinit();
+        self.scram_authenticator.deinit();
+        // Free SASL mechanism negotiation map
+        var mech_it = self.sasl_mechanisms.iterator();
+        while (mech_it.next()) |entry| {
+            self.allocator.free(entry.key_ptr.*);
+            self.allocator.free(entry.value_ptr.*);
+        }
+        self.sasl_mechanisms.deinit();
         // Free authenticated session keys and values
         var sess_it = self.authenticated_sessions.iterator();
         while (sess_it.next()) |entry| {
@@ -3066,22 +3104,77 @@ pub const Broker = struct {
         var pos = body_start;
         const mechanism = (ser.readString(request_bytes, &pos) catch return null) orelse "";
 
-        var buf = self.allocator.alloc(u8, 128) catch return null;
+        var buf = self.allocator.alloc(u8, 256) catch return null;
         var wpos: usize = 0;
         const rh = ResponseHeader{ .correlation_id = req_header.correlation_id };
         rh.serialize(buf, &wpos, resp_header_version);
 
-        // Validate the requested mechanism
-        if (std.mem.eql(u8, mechanism, "PLAIN")) {
+        // Check if the requested mechanism is enabled in sasl_enabled_mechanisms
+        const is_enabled = isMechanismEnabled(self.sasl_enabled_mechanisms, mechanism);
+        if (is_enabled) {
             ser.writeI16(buf, &wpos, 0); // error_code = NONE
         } else {
             ser.writeI16(buf, &wpos, 33); // error_code = UNSUPPORTED_SASL_MECHANISM
         }
-        // enabled_mechanisms array: [PLAIN]
-        ser.writeArrayLen(buf, &wpos, 1);
-        ser.writeString(buf, &wpos, "PLAIN");
+
+        // Store the negotiated mechanism for this client so handleSaslAuthenticate
+        // knows which authenticator to use
+        if (is_enabled) {
+            if (req_header.client_id) |client_id| {
+                const key = self.allocator.dupe(u8, client_id) catch {
+                    log.warn("SASL handshake: failed to store mechanism for client", .{});
+                    return (self.allocator.realloc(buf, wpos) catch buf)[0..wpos];
+                };
+                const val = self.allocator.dupe(u8, mechanism) catch {
+                    self.allocator.free(key);
+                    log.warn("SASL handshake: failed to store mechanism for client", .{});
+                    return (self.allocator.realloc(buf, wpos) catch buf)[0..wpos];
+                };
+                // Remove old entry if client re-handshakes
+                if (self.sasl_mechanisms.fetchRemove(key)) |old| {
+                    self.allocator.free(old.key);
+                    self.allocator.free(old.value);
+                }
+                self.sasl_mechanisms.put(key, val) catch {
+                    self.allocator.free(key);
+                    self.allocator.free(val);
+                    log.warn("SASL handshake: failed to store mechanism for client", .{});
+                };
+            }
+        }
+
+        // Advertise all enabled mechanisms
+        const mech_count = countMechanisms(self.sasl_enabled_mechanisms);
+        ser.writeArrayLen(buf, &wpos, @intCast(mech_count));
+        writeMechanismNames(self.sasl_enabled_mechanisms, buf, &wpos);
         if (resp_header_version >= 1) ser.writeEmptyTaggedFields(buf, &wpos);
         return (self.allocator.realloc(buf, wpos) catch buf)[0..wpos];
+    }
+
+    /// Check whether a given mechanism name appears in the comma-separated enabled list.
+    fn isMechanismEnabled(enabled: []const u8, mechanism: []const u8) bool {
+        var iter = std.mem.splitSequence(u8, enabled, ",");
+        while (iter.next()) |m| {
+            if (std.mem.eql(u8, m, mechanism)) return true;
+        }
+        return false;
+    }
+
+    /// Count the number of mechanisms in a comma-separated list.
+    fn countMechanisms(enabled: []const u8) usize {
+        if (enabled.len == 0) return 0;
+        var count: usize = 0;
+        var iter = std.mem.splitSequence(u8, enabled, ",");
+        while (iter.next()) |_| count += 1;
+        return count;
+    }
+
+    /// Write each mechanism name from the comma-separated list into the response buffer.
+    fn writeMechanismNames(enabled: []const u8, buf: []u8, wpos: *usize) void {
+        var iter = std.mem.splitSequence(u8, enabled, ",");
+        while (iter.next()) |m| {
+            ser.writeString(buf, wpos, m);
+        }
     }
 
     // ---------------------------------------------------------------
@@ -3090,10 +3183,10 @@ pub const Broker = struct {
     fn handleSaslAuthenticate(self: *Broker, request_bytes: []const u8, body_start: usize, req_header: *const RequestHeader, api_version: i16, resp_header_version: i16) ?[]u8 {
         _ = api_version;
         var pos = body_start;
-        // auth_bytes contains the SASL/PLAIN credentials: \0<username>\0<password>
+        // auth_bytes contains the SASL credentials (format depends on mechanism)
         const auth_bytes = ser.readBytes(request_bytes, &pos) catch null;
 
-        var buf = self.allocator.alloc(u8, 256) catch return null;
+        var buf = self.allocator.alloc(u8, 512) catch return null;
         var wpos: usize = 0;
         const rh = ResponseHeader{ .correlation_id = req_header.correlation_id };
         rh.serialize(buf, &wpos, resp_header_version);
@@ -3108,12 +3201,60 @@ pub const Broker = struct {
             return (self.allocator.realloc(buf, wpos) catch buf)[0..wpos];
         }
 
-        // Validate credentials using SaslPlainAuthenticator
-        if (auth_bytes) |token| {
-            const result = self.sasl_authenticator.authenticate(token);
-            if (result.success) {
-                // Store authenticated principal keyed by client_id
-                if (req_header.client_id) |client_id| {
+        // Determine which mechanism this client negotiated during SaslHandshake
+        const client_id = req_header.client_id orelse "anonymous";
+        const mechanism = self.sasl_mechanisms.get(client_id) orelse "PLAIN";
+
+        if (std.mem.eql(u8, mechanism, "OAUTHBEARER")) {
+            // OAUTHBEARER: parse JWT from SASL token (KIP-255)
+            if (auth_bytes) |token| {
+                const result = self.oauth_authenticator.authenticate(self.allocator, token);
+                if (result.success) {
+                    if (result.principal) |principal| {
+                        // Format as "User:<sub-claim>" to match Kafka principal format
+                        const full_principal = std.fmt.allocPrint(self.allocator, "User:{s}", .{principal}) catch {
+                            ser.writeI16(buf, &wpos, 58); // SASL_AUTHENTICATION_FAILED
+                            ser.writeString(buf, &wpos, "Internal error");
+                            ser.writeBytesBuf(buf, &wpos, &.{});
+                            ser.writeI64(buf, &wpos, 0);
+                            if (resp_header_version >= 1) ser.writeEmptyTaggedFields(buf, &wpos);
+                            return (self.allocator.realloc(buf, wpos) catch buf)[0..wpos];
+                        };
+                        self.storeAuthenticatedPrincipal(client_id, full_principal);
+                    }
+                    ser.writeI16(buf, &wpos, 0); // error_code = NONE
+                    ser.writeString(buf, &wpos, ""); // error_message
+                    ser.writeBytesBuf(buf, &wpos, &.{}); // auth_bytes
+                    ser.writeI64(buf, &wpos, 0); // session_lifetime_ms
+                    if (resp_header_version >= 1) ser.writeEmptyTaggedFields(buf, &wpos);
+                    return (self.allocator.realloc(buf, wpos) catch buf)[0..wpos];
+                }
+            }
+            // OAUTHBEARER authentication failed
+            ser.writeI16(buf, &wpos, 58); // error_code = SASL_AUTHENTICATION_FAILED
+            ser.writeString(buf, &wpos, "OAUTHBEARER authentication failed");
+            ser.writeBytesBuf(buf, &wpos, &.{});
+            ser.writeI64(buf, &wpos, 0);
+            if (resp_header_version >= 1) ser.writeEmptyTaggedFields(buf, &wpos);
+            return (self.allocator.realloc(buf, wpos) catch buf)[0..wpos];
+        } else if (std.mem.eql(u8, mechanism, "SCRAM-SHA-256")) {
+            // SCRAM-SHA-256: RFC 5802 / RFC 7677
+            // Full SCRAM requires a 4-message exchange across multiple SaslAuthenticate calls.
+            // TODO: Implement multi-round SCRAM state machine (client-first → server-first →
+            // client-final → server-final). For now, return an error indicating the mechanism
+            // is not yet fully supported for multi-round exchange.
+            log.warn("SCRAM-SHA-256 authentication attempted but multi-round exchange not yet implemented", .{});
+            ser.writeI16(buf, &wpos, 58); // error_code = SASL_AUTHENTICATION_FAILED
+            ser.writeString(buf, &wpos, "SCRAM-SHA-256 multi-round exchange not yet implemented");
+            ser.writeBytesBuf(buf, &wpos, &.{});
+            ser.writeI64(buf, &wpos, 0);
+            if (resp_header_version >= 1) ser.writeEmptyTaggedFields(buf, &wpos);
+            return (self.allocator.realloc(buf, wpos) catch buf)[0..wpos];
+        } else {
+            // PLAIN (default) — existing SASL/PLAIN authentication path
+            if (auth_bytes) |token| {
+                const result = self.sasl_authenticator.authenticate(token);
+                if (result.success) {
                     if (result.principal) |principal| {
                         // Format as "User:<username>" to match Kafka principal format
                         const full_principal = std.fmt.allocPrint(self.allocator, "User:{s}", .{principal}) catch {
@@ -3124,37 +3265,45 @@ pub const Broker = struct {
                             if (resp_header_version >= 1) ser.writeEmptyTaggedFields(buf, &wpos);
                             return (self.allocator.realloc(buf, wpos) catch buf)[0..wpos];
                         };
-                        const key = self.allocator.dupe(u8, client_id) catch {
-                            self.allocator.free(full_principal);
-                            ser.writeI16(buf, &wpos, 58);
-                            ser.writeString(buf, &wpos, "Internal error");
-                            ser.writeBytesBuf(buf, &wpos, &.{});
-                            ser.writeI64(buf, &wpos, 0);
-                            if (resp_header_version >= 1) ser.writeEmptyTaggedFields(buf, &wpos);
-                            return (self.allocator.realloc(buf, wpos) catch buf)[0..wpos];
-                        };
-                        self.authenticated_sessions.put(key, full_principal) catch {
-                            self.allocator.free(key);
-                            self.allocator.free(full_principal);
-                        };
+                        self.storeAuthenticatedPrincipal(client_id, full_principal);
                     }
+                    ser.writeI16(buf, &wpos, 0); // error_code = NONE
+                    ser.writeString(buf, &wpos, ""); // error_message
+                    ser.writeBytesBuf(buf, &wpos, &.{}); // auth_bytes
+                    ser.writeI64(buf, &wpos, 0); // session_lifetime_ms
+                    if (resp_header_version >= 1) ser.writeEmptyTaggedFields(buf, &wpos);
+                    return (self.allocator.realloc(buf, wpos) catch buf)[0..wpos];
                 }
-                ser.writeI16(buf, &wpos, 0); // error_code = NONE
-                ser.writeString(buf, &wpos, ""); // error_message
-                ser.writeBytesBuf(buf, &wpos, &.{}); // auth_bytes
-                ser.writeI64(buf, &wpos, 0); // session_lifetime_ms
-                if (resp_header_version >= 1) ser.writeEmptyTaggedFields(buf, &wpos);
-                return (self.allocator.realloc(buf, wpos) catch buf)[0..wpos];
             }
-        }
 
-        // Authentication failed
-        ser.writeI16(buf, &wpos, 58); // error_code = SASL_AUTHENTICATION_FAILED
-        ser.writeString(buf, &wpos, "Authentication failed");
-        ser.writeBytesBuf(buf, &wpos, &.{}); // auth_bytes
-        ser.writeI64(buf, &wpos, 0); // session_lifetime_ms
-        if (resp_header_version >= 1) ser.writeEmptyTaggedFields(buf, &wpos);
-        return (self.allocator.realloc(buf, wpos) catch buf)[0..wpos];
+            // PLAIN authentication failed
+            ser.writeI16(buf, &wpos, 58); // error_code = SASL_AUTHENTICATION_FAILED
+            ser.writeString(buf, &wpos, "Authentication failed");
+            ser.writeBytesBuf(buf, &wpos, &.{}); // auth_bytes
+            ser.writeI64(buf, &wpos, 0); // session_lifetime_ms
+            if (resp_header_version >= 1) ser.writeEmptyTaggedFields(buf, &wpos);
+            return (self.allocator.realloc(buf, wpos) catch buf)[0..wpos];
+        }
+    }
+
+    /// Store an authenticated principal in the session map.
+    /// Takes ownership of `full_principal` — caller must not free it on success.
+    fn storeAuthenticatedPrincipal(self: *Broker, client_id: []const u8, full_principal: []u8) void {
+        const key = self.allocator.dupe(u8, client_id) catch {
+            self.allocator.free(full_principal);
+            log.warn("Failed to store authenticated principal: allocation failed", .{});
+            return;
+        };
+        // Remove old session entry if client re-authenticates
+        if (self.authenticated_sessions.fetchRemove(key)) |old| {
+            self.allocator.free(old.key);
+            self.allocator.free(old.value);
+        }
+        self.authenticated_sessions.put(key, full_principal) catch {
+            self.allocator.free(key);
+            self.allocator.free(full_principal);
+            log.warn("Failed to store authenticated principal: map insertion failed", .{});
+        };
     }
 
     // ---------------------------------------------------------------

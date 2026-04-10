@@ -153,6 +153,9 @@ pub fn applyConfig(config: *@import("broker/handler.zig").Broker.BrokerConfig, c
     if (cfg.getString("sasl.users")) |u| config.sasl_users = u;
     if (cfg.getString("super.users")) |u| config.super_users = u;
     config.allow_everyone_if_no_acl = cfg.getBool("allow.everyone.if.no.acl.found", config.allow_everyone_if_no_acl);
+    if (cfg.getString("sasl.enabled.mechanisms")) |m| config.sasl_enabled_mechanisms = m;
+    if (cfg.getString("sasl.oauthbearer.expected.issuer")) |i| config.oauth_issuer = i;
+    if (cfg.getString("sasl.oauthbearer.expected.audience")) |a| config.oauth_audience = a;
 
     // TLS configuration from config file
     // NOTE: AutoMQ uses Java's ssl.* properties (JKS keystore format). ZMQ uses
