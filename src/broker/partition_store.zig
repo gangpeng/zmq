@@ -1403,13 +1403,10 @@ test "PartitionStore applyDeferredHWUpdates advances HW" {
 }
 
 test "applyRetention time-based advances log_start_offset past expired objects" {
-    const stream_mod = @import("../storage/stream.zig");
-    const ObjectManager = stream_mod.ObjectManager;
-
     var om = ObjectManager.init(testing.allocator, 1);
     defer om.deinit();
 
-    var store = PartitionStore.init(testing.allocator, null);
+    var store = PartitionStore.init(testing.allocator);
     defer store.deinit();
     store.object_manager = &om;
 
@@ -1417,14 +1414,18 @@ test "applyRetention time-based advances log_start_offset past expired objects" 
     _ = try store.produce("retention-topic", 0, "record-data");
 
     // Get the stream_id that was created for this partition
-    const stream_id = hashPartitionKey("retention-topic", 0);
+    // (replicate hashPartitionKey logic since it's a private method)
+    var hasher = std.hash.Wyhash.init(0);
+    hasher.update("retention-topic");
+    hasher.update(std.mem.asBytes(&@as(i32, 0)));
+    const stream_id = hasher.final();
 
     // Register StreamObjects with known timestamps
     try om.commitStreamObjectWithTimestamp(10, stream_id, 0, 50, "so/old", 1024, 1000); // old: ts=1000
     try om.commitStreamObjectWithTimestamp(11, stream_id, 50, 100, "so/recent", 1024, 5000); // recent: ts=5000
 
     // Apply time-based retention: cutoff at ts=2000 → only first object expired
-    const policy = RetentionPolicy{
+    const policy = PartitionStore.RetentionPolicy{
         .retention_ms = 1, // tiny retention
         .retention_bytes = -1,
         .cleanup_policy = .delete,
@@ -1445,18 +1446,18 @@ test "applyRetention time-based advances log_start_offset past expired objects" 
 }
 
 test "applyRetention size-based trims when exceeding retention_bytes" {
-    const stream_mod = @import("../storage/stream.zig");
-    const ObjectManager = stream_mod.ObjectManager;
-
     var om = ObjectManager.init(testing.allocator, 1);
     defer om.deinit();
 
-    var store = PartitionStore.init(testing.allocator, null);
+    var store = PartitionStore.init(testing.allocator);
     defer store.deinit();
     store.object_manager = &om;
 
     _ = try store.produce("size-topic", 0, "record");
-    const stream_id = hashPartitionKey("size-topic", 0);
+    var hasher = std.hash.Wyhash.init(0);
+    hasher.update("size-topic");
+    hasher.update(std.mem.asBytes(&@as(i32, 0)));
+    const stream_id = hasher.final();
 
     // Register 3 objects totaling 3000 bytes
     try om.commitStreamObject(10, stream_id, 0, 100, "so/1", 1000);
@@ -1464,7 +1465,7 @@ test "applyRetention size-based trims when exceeding retention_bytes" {
     try om.commitStreamObject(12, stream_id, 200, 300, "so/3", 1000);
 
     // Size budget = 2000 → need to drop first object (1000 bytes)
-    const policy = RetentionPolicy{
+    const policy = PartitionStore.RetentionPolicy{
         .retention_ms = -1, // no time retention
         .retention_bytes = 2000,
         .cleanup_policy = .delete,
@@ -1479,10 +1480,10 @@ test "applyRetention size-based trims when exceeding retention_bytes" {
 }
 
 test "applyRetention returns 0 when no ObjectManager is set" {
-    var store = PartitionStore.init(testing.allocator, null);
+    var store = PartitionStore.init(testing.allocator);
     defer store.deinit();
 
-    const policy = RetentionPolicy{
+    const policy = PartitionStore.RetentionPolicy{
         .retention_ms = 1000,
         .retention_bytes = -1,
         .cleanup_policy = .delete,

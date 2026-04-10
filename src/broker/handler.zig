@@ -611,6 +611,20 @@ pub const Broker = struct {
             }
         }
 
+        // Clean up WAL segments that have been durably flushed to S3.
+        // NOTE: AutoMQ trims WAL after S3 upload confirmation in
+        // S3Storage.commitStreamSetObject(). ZMQ does it in tick() since
+        // the single-threaded model makes WAL cleanup non-urgent.
+        if (self.store.s3_wal_batcher) |*batcher| {
+            if (batcher.last_flushed_segment_id > 0) {
+                if (self.store.fs_wal) |*wal| {
+                    _ = wal.cleanupSegments(batcher.last_flushed_segment_id - 1) catch |err| {
+                        log.warn("WAL segment cleanup failed: {}", .{err});
+                    };
+                }
+            }
+        }
+
         // Expire delayed fetches
         self.expireDelayedFetches();
 
@@ -660,7 +674,6 @@ pub const Broker = struct {
     /// retention per-partition. ZMQ delegates to ObjectManager which
     /// checks StreamObject timestamps/sizes per-stream.
     fn enforceRetentionPolicies(self: *Broker) void {
-        const PartitionStore = @import("partition_store.zig").PartitionStore;
         var total_trimmed: u64 = 0;
 
         var topic_it = self.topics.iterator();
@@ -5202,4 +5215,74 @@ test "Broker shutdownFlushWal returns true when no S3 batcher" {
     // Without S3 storage configured, shutdownFlushWal is a no-op
     const result = broker.shutdownFlushWal();
     try testing.expect(result);
+}
+
+test "Broker tick WAL cleanup skips when no fs_wal" {
+    const wal_mod = @import("../storage/wal.zig");
+    const S3WalBatcher = wal_mod.S3WalBatcher;
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+
+    // Wire up an S3WalBatcher with last_flushed_segment_id > 0
+    // but no fs_wal (the common in-memory test configuration).
+    // tick() should not crash — it checks for fs_wal before calling cleanupSegments.
+    broker.store.s3_wal_batcher = S3WalBatcher.init(testing.allocator);
+    broker.store.s3_wal_batcher.?.last_flushed_segment_id = 5;
+    defer {
+        broker.store.s3_wal_batcher.?.deinit();
+        broker.store.s3_wal_batcher = null;
+    }
+    // fs_wal is null by default in memory mode — verify that
+    try testing.expect(broker.store.fs_wal == null);
+
+    broker.tick();
+    broker.tick();
+}
+
+test "Broker tick WAL cleanup removes flushed segments" {
+    const wal_mod = @import("../storage/wal.zig");
+    const Wal = wal_mod.Wal;
+    const S3WalBatcher = wal_mod.S3WalBatcher;
+    const fs = std.fs;
+
+    const tmp_dir = "/tmp/zmq-broker-wal-cleanup-test";
+    fs.deleteTreeAbsolute(tmp_dir) catch {};
+    defer fs.deleteTreeAbsolute(tmp_dir) catch {};
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+
+    // Set up a real filesystem WAL with tiny segments (each record triggers rollover)
+    const small_segment: usize = 20;
+    broker.store.fs_wal = Wal.init(testing.allocator, tmp_dir, small_segment);
+    defer {
+        if (broker.store.fs_wal) |*wal| wal.deinit();
+        broker.store.fs_wal = null;
+    }
+    try broker.store.fs_wal.?.open();
+
+    // Write 4 records to create multiple closed segments
+    _ = try broker.store.fs_wal.?.append("aaaaaaaaaa"); // seg 0
+    _ = try broker.store.fs_wal.?.append("bbbbbbbbbb"); // rolls seg 0, writes seg 1
+    _ = try broker.store.fs_wal.?.append("cccccccccc"); // rolls seg 1, writes seg 2
+    _ = try broker.store.fs_wal.?.append("dddddddddd"); // rolls seg 2, writes seg 3
+
+    const segments_before = broker.store.fs_wal.?.segmentCount();
+    try testing.expect(segments_before >= 4);
+
+    // Set up S3WalBatcher with last_flushed_segment_id = 2
+    // This means segments with ID <= 1 are safe to clean up.
+    broker.store.s3_wal_batcher = S3WalBatcher.init(testing.allocator);
+    broker.store.s3_wal_batcher.?.last_flushed_segment_id = 2;
+    defer {
+        broker.store.s3_wal_batcher.?.deinit();
+        broker.store.s3_wal_batcher = null;
+    }
+
+    // tick() should clean up WAL segments with ID <= 1
+    broker.tick();
+
+    const segments_after = broker.store.fs_wal.?.segmentCount();
+    try testing.expect(segments_after < segments_before);
 }

@@ -640,6 +640,16 @@ pub const S3WalBatcher = struct {
     /// Optional: ObjectManager for registering flushed objects as StreamSetObjects.
     /// When set, flushNow() will register the flushed object with the ObjectManager.
     object_manager: ?*ObjectManager = null,
+    /// Tracks the S3 object counter value at the time of the last successful
+    /// S3 upload. Used by the broker tick() to determine which local WAL
+    /// segments can be safely deleted — segments with ID < last_flushed_segment_id
+    /// have been durably flushed to S3 and are no longer needed for recovery.
+    ///
+    /// NOTE: AutoMQ trims WAL after S3 upload confirmation in
+    /// S3Storage.commitStreamSetObject(). ZMQ tracks the counter here
+    /// and defers cleanup to tick() since the single-threaded model makes
+    /// WAL segment deletion non-urgent.
+    last_flushed_segment_id: u64 = 0,
     /// Group commit: partitions with unflushed data. stream_id → next_offset to set as HW.
     /// Populated by trackPendingHW(), drained after successful flush by drainPendingHWUpdates().
     pending_hw_updates: std.AutoHashMap(u64, u64),
@@ -843,6 +853,10 @@ pub const S3WalBatcher = struct {
                     };
                 }
             }
+
+            // Track the flushed segment so tick() can clean up local WAL files.
+            // s3_object_counter was already incremented by flushBuild().
+            self.last_flushed_segment_id = self.s3_object_counter;
 
             return true; // Data is now durable in S3
         }
@@ -1362,6 +1376,75 @@ test "S3WalBatcher hasPendingFlush" {
 
     _ = batcher.drainPendingHWUpdates();
     try testing.expect(!batcher.hasPendingFlush());
+}
+
+test "S3WalBatcher last_flushed_segment_id defaults to 0" {
+    var batcher = S3WalBatcher.init(testing.allocator);
+    defer batcher.deinit();
+
+    try testing.expectEqual(@as(u64, 0), batcher.last_flushed_segment_id);
+}
+
+test "S3WalBatcher last_flushed_segment_id tracks after flushNow" {
+    const MockS3 = @import("s3.zig").MockS3;
+
+    var batcher = S3WalBatcher.init(testing.allocator);
+    defer batcher.deinit();
+    var mock_s3 = MockS3.init(testing.allocator);
+    defer mock_s3.deinit();
+
+    // Before any flush, last_flushed_segment_id is 0
+    try testing.expectEqual(@as(u64, 0), batcher.last_flushed_segment_id);
+
+    // First flush
+    try batcher.append(1, 0, "record-a");
+    const flushed1 = batcher.flushNow(&mock_s3);
+    try testing.expect(flushed1);
+    // s3_object_counter was incremented to 1 by flushBuild(), so last_flushed_segment_id = 1
+    try testing.expectEqual(@as(u64, 1), batcher.last_flushed_segment_id);
+
+    // Second flush
+    try batcher.append(1, 1, "record-b");
+    const flushed2 = batcher.flushNow(&mock_s3);
+    try testing.expect(flushed2);
+    // s3_object_counter was incremented to 2, so last_flushed_segment_id = 2
+    try testing.expectEqual(@as(u64, 2), batcher.last_flushed_segment_id);
+}
+
+test "S3WalBatcher last_flushed_segment_id unchanged on empty flush" {
+    const MockS3 = @import("s3.zig").MockS3;
+
+    var batcher = S3WalBatcher.init(testing.allocator);
+    defer batcher.deinit();
+    var mock_s3 = MockS3.init(testing.allocator);
+    defer mock_s3.deinit();
+
+    // Flush one batch to set last_flushed_segment_id
+    try batcher.append(1, 0, "data");
+    _ = batcher.flushNow(&mock_s3);
+    try testing.expectEqual(@as(u64, 1), batcher.last_flushed_segment_id);
+
+    // Empty flush should not change last_flushed_segment_id
+    const flushed = batcher.flushNow(&mock_s3);
+    try testing.expect(flushed);
+    try testing.expectEqual(@as(u64, 1), batcher.last_flushed_segment_id);
+}
+
+test "S3WalBatcher last_flushed_segment_id unchanged when fenced" {
+    const MockS3 = @import("s3.zig").MockS3;
+
+    var batcher = S3WalBatcher.init(testing.allocator);
+    defer batcher.deinit();
+    var mock_s3 = MockS3.init(testing.allocator);
+    defer mock_s3.deinit();
+
+    try batcher.append(1, 0, "data");
+    batcher.fence();
+
+    // Fenced flush fails, last_flushed_segment_id stays at 0
+    const flushed = batcher.flushNow(&mock_s3);
+    try testing.expect(!flushed);
+    try testing.expectEqual(@as(u64, 0), batcher.last_flushed_segment_id);
 }
 
 test "Wal appendSync forces immediate write" {

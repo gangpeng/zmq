@@ -12,6 +12,23 @@ pub const StreamState = enum(u8) {
     closed,
 };
 
+/// S3 object lifecycle states matching AutoMQ's S3ObjectControlManager.
+///
+/// NOTE: AutoMQ uses a full S3ObjectControlManager with HashedWheelTimer
+/// for TTL tracking. ZMQ integrates state tracking directly into the
+/// ObjectManager for simplicity in the single-threaded event loop model.
+/// The DESTROYED state is not represented here because destroyed objects
+/// are removed from metadata entirely.
+pub const S3ObjectState = enum(u8) {
+    /// Allocated but not yet written to S3. Auto-expires after prepared_ttl_ms.
+    prepared = 0,
+    /// Written to S3 and metadata committed. Normal live state.
+    committed = 1,
+    /// Scheduled for deletion. Retains for mark_destroyed_retention_ms
+    /// so consumers can finish reading before physical delete.
+    mark_destroyed = 2,
+};
+
 pub const StreamRange = struct {
     epoch: u64,
     start_offset: u64,
@@ -133,6 +150,10 @@ pub const StreamSetObject = struct {
     object_size: u64,
     s3_key: []const u8, // owned, heap-allocated
     stream_ranges: std.ArrayList(StreamOffsetRange),
+    /// Lifecycle state: prepared → committed → mark_destroyed → (removed).
+    state: S3ObjectState = .committed,
+    /// Timestamp (ms) when state last changed. Used for TTL/retention checks.
+    state_changed_ms: i64 = 0,
 
     pub fn deinit(self: *StreamSetObject, allocator: Allocator) void {
         allocator.free(self.s3_key);
@@ -191,6 +212,10 @@ pub const StreamObject = struct {
     /// to drive ListOffsets-by-timestamp and time-based retention. ZMQ stores
     /// it per-object for simpler retention scanning.
     max_timestamp_ms: i64 = 0,
+    /// Lifecycle state: prepared → committed → mark_destroyed → (removed).
+    state: S3ObjectState = .committed,
+    /// Timestamp (ms) when state last changed. Used for TTL/retention checks.
+    state_changed_ms: i64 = 0,
 
     pub fn deinit(self: *StreamObject, allocator: Allocator) void {
         allocator.free(self.s3_key);
@@ -409,6 +434,221 @@ pub const ObjectManager = struct {
         return id;
     }
 
+    // ---- S3 Object Lifecycle ----
+
+    /// Allocate a prepared S3 object ID. The object must be committed within
+    /// prepared_ttl_ms (default 60 min) or it will be auto-expired.
+    /// The caller should later call commitStreamObject/commitStreamSetObject
+    /// to transition the object to committed state.
+    pub fn prepareObject(self: *ObjectManager) u64 {
+        return self.allocateObjectId();
+    }
+
+    /// Mark a committed object for destruction. It will be physically deleted
+    /// after mark_destroyed_retention_ms (default 10 min) to give consumers
+    /// time to finish reading in-flight data.
+    ///
+    /// NOTE: AutoMQ's S3ObjectControlManager uses a HashedWheelTimer to track
+    /// destruction delay. ZMQ checks timestamps during compaction cycles instead,
+    /// trading sub-second precision for implementation simplicity (compaction
+    /// runs every 5 minutes, so the effective delay is retention_ms ± 5 min).
+    pub fn markDestroyed(self: *ObjectManager, object_id: u64) void {
+        self.markDestroyedAt(object_id, std.time.milliTimestamp());
+    }
+
+    /// Mark a committed object for destruction with an explicit timestamp.
+    /// Separated from markDestroyed() for testability — tests can inject
+    /// controlled timestamps without depending on wall-clock time.
+    pub fn markDestroyedAt(self: *ObjectManager, object_id: u64, now_ms: i64) void {
+        if (self.stream_objects.getPtr(object_id)) |so| {
+            if (so.state != .committed) {
+                log.warn("markDestroyed on SO {d} in state {}, expected committed", .{ object_id, @intFromEnum(so.state) });
+                return;
+            }
+            so.state = .mark_destroyed;
+            so.state_changed_ms = now_ms;
+            log.debug("SO {d} marked for destruction (stream={d}, offsets=[{d}..{d}))", .{
+                object_id, so.stream_id, so.start_offset, so.end_offset,
+            });
+            return;
+        }
+        if (self.stream_set_objects.getPtr(object_id)) |sso| {
+            if (sso.state != .committed) {
+                log.warn("markDestroyed on SSO {d} in state {}, expected committed", .{ object_id, @intFromEnum(sso.state) });
+                return;
+            }
+            sso.state = .mark_destroyed;
+            sso.state_changed_ms = now_ms;
+            log.debug("SSO {d} marked for destruction", .{object_id});
+            return;
+        }
+        log.warn("markDestroyed: object {d} not found", .{object_id});
+    }
+
+    /// Register a prepared StreamObject that has not yet been committed.
+    /// The object starts in .prepared state with a timestamp for TTL tracking.
+    /// The caller must later commit the object by calling commitPreparedStreamObject().
+    pub fn registerPreparedStreamObject(
+        self: *ObjectManager,
+        object_id: u64,
+        stream_id: u64,
+        s3_key: []const u8,
+    ) !void {
+        return self.registerPreparedStreamObjectAt(object_id, stream_id, s3_key, std.time.milliTimestamp());
+    }
+
+    /// Register a prepared StreamObject with an explicit timestamp for testability.
+    pub fn registerPreparedStreamObjectAt(
+        self: *ObjectManager,
+        object_id: u64,
+        stream_id: u64,
+        s3_key: []const u8,
+        now_ms: i64,
+    ) !void {
+        if (object_id >= self.next_object_id) {
+            self.next_object_id = object_id + 1;
+        }
+        const key_copy = try self.allocator.dupe(u8, s3_key);
+
+        try self.stream_objects.put(object_id, .{
+            .object_id = object_id,
+            .stream_id = stream_id,
+            .start_offset = 0,
+            .end_offset = 0,
+            .object_size = 0,
+            .s3_key = key_copy,
+            .state = .prepared,
+            .state_changed_ms = now_ms,
+        });
+        // Prepared objects are not added to stream_object_index because they
+        // have no valid offset range yet and should not appear in fetch queries.
+    }
+
+    /// Expire prepared objects that have exceeded their TTL.
+    /// Returns the count of expired objects.
+    ///
+    /// Prepared objects are allocated with prepareObject()/registerPreparedStreamObject()
+    /// but never committed (e.g., the producer crashed between allocation and S3 upload).
+    /// This prevents leaked object IDs from accumulating indefinitely.
+    pub fn expirePreparedObjects(self: *ObjectManager, prepared_ttl_ms: i64) u64 {
+        return self.expirePreparedObjectsAt(prepared_ttl_ms, std.time.milliTimestamp());
+    }
+
+    /// Expire prepared objects with an explicit "now" timestamp for testability.
+    pub fn expirePreparedObjectsAt(self: *ObjectManager, prepared_ttl_ms: i64, now_ms: i64) u64 {
+        var expired_count: u64 = 0;
+
+        // Collect expired SO IDs (can't modify map while iterating)
+        var expired_so_ids = std.ArrayList(u64).init(self.allocator);
+        defer expired_so_ids.deinit();
+        {
+            var it = self.stream_objects.iterator();
+            while (it.next()) |entry| {
+                const so = entry.value_ptr;
+                if (so.state == .prepared and so.state_changed_ms > 0 and
+                    now_ms - so.state_changed_ms >= prepared_ttl_ms)
+                {
+                    expired_so_ids.append(so.object_id) catch continue;
+                }
+            }
+        }
+        for (expired_so_ids.items) |obj_id| {
+            log.info("Expiring prepared SO {d} (exceeded TTL of {d}ms)", .{ obj_id, prepared_ttl_ms });
+            self.removeStreamObject(obj_id);
+            expired_count += 1;
+        }
+
+        // Collect expired SSO IDs
+        var expired_sso_ids = std.ArrayList(u64).init(self.allocator);
+        defer expired_sso_ids.deinit();
+        {
+            var it = self.stream_set_objects.iterator();
+            while (it.next()) |entry| {
+                const sso = entry.value_ptr;
+                if (sso.state == .prepared and sso.state_changed_ms > 0 and
+                    now_ms - sso.state_changed_ms >= prepared_ttl_ms)
+                {
+                    expired_sso_ids.append(sso.object_id) catch continue;
+                }
+            }
+        }
+        for (expired_sso_ids.items) |obj_id| {
+            log.info("Expiring prepared SSO {d} (exceeded TTL of {d}ms)", .{ obj_id, prepared_ttl_ms });
+            self.removeStreamSetObject(obj_id);
+            expired_count += 1;
+        }
+
+        return expired_count;
+    }
+
+    /// Find mark_destroyed objects ready for physical deletion (retention period elapsed).
+    /// Returns list of s3_keys to delete and removes those objects from metadata.
+    /// Caller owns the returned slice and each key within it.
+    ///
+    /// Write-before-delete: objects are removed from metadata (this function) BEFORE
+    /// the caller deletes them from S3. If the process crashes after metadata removal
+    /// but before S3 delete, the S3 objects become orphans (cleaned up next cycle).
+    pub fn collectDestroyedObjects(self: *ObjectManager, retention_ms: i64, allocator: Allocator) ![][]u8 {
+        return self.collectDestroyedObjectsAt(retention_ms, allocator, std.time.milliTimestamp());
+    }
+
+    /// Collect destroyed objects with an explicit "now" timestamp for testability.
+    pub fn collectDestroyedObjectsAt(self: *ObjectManager, retention_ms: i64, allocator: Allocator, now_ms: i64) ![][]u8 {
+        var keys = std.ArrayList([]u8).init(allocator);
+        errdefer {
+            for (keys.items) |k| allocator.free(k);
+            keys.deinit();
+        }
+
+        // Collect SO IDs ready for destruction
+        var ready_so_ids = std.ArrayList(u64).init(self.allocator);
+        defer ready_so_ids.deinit();
+        {
+            var it = self.stream_objects.iterator();
+            while (it.next()) |entry| {
+                const so = entry.value_ptr;
+                if (so.state == .mark_destroyed and so.state_changed_ms > 0 and
+                    now_ms - so.state_changed_ms >= retention_ms)
+                {
+                    ready_so_ids.append(so.object_id) catch continue;
+                }
+            }
+        }
+        for (ready_so_ids.items) |obj_id| {
+            if (self.stream_objects.get(obj_id)) |so| {
+                const key_copy = try allocator.dupe(u8, so.s3_key);
+                try keys.append(key_copy);
+                log.info("Collecting destroyed SO {d} for physical deletion (key='{s}')", .{ obj_id, so.s3_key });
+            }
+            self.removeStreamObject(obj_id);
+        }
+
+        // Collect SSO IDs ready for destruction
+        var ready_sso_ids = std.ArrayList(u64).init(self.allocator);
+        defer ready_sso_ids.deinit();
+        {
+            var it = self.stream_set_objects.iterator();
+            while (it.next()) |entry| {
+                const sso = entry.value_ptr;
+                if (sso.state == .mark_destroyed and sso.state_changed_ms > 0 and
+                    now_ms - sso.state_changed_ms >= retention_ms)
+                {
+                    ready_sso_ids.append(sso.object_id) catch continue;
+                }
+            }
+        }
+        for (ready_sso_ids.items) |obj_id| {
+            if (self.stream_set_objects.get(obj_id)) |sso| {
+                const key_copy = try allocator.dupe(u8, sso.s3_key);
+                try keys.append(key_copy);
+                log.info("Collecting destroyed SSO {d} for physical deletion (key='{s}')", .{ obj_id, sso.s3_key });
+            }
+            self.removeStreamSetObject(obj_id);
+        }
+
+        return try keys.toOwnedSlice();
+    }
+
     // ---- Object registration ----
 
     /// Register a StreamSetObject (multi-stream WAL flush output).
@@ -558,6 +798,8 @@ pub const ObjectManager = struct {
 
     /// For stream X, offsets [start_offset, end_offset), return all S3 objects
     /// containing relevant data. Results are sorted by start_offset.
+    /// Only returns objects in .committed state — prepared and mark_destroyed
+    /// objects are excluded from fetch results.
     /// Caller owns the returned slice.
     pub fn getObjects(
         self: *ObjectManager,
@@ -569,11 +811,12 @@ pub const ObjectManager = struct {
         var results = std.ArrayList(S3ObjectMetadata).init(self.allocator);
         errdefer results.deinit();
 
-        // 1. Collect StreamObjects that overlap [start_offset, end_offset)
+        // 1. Collect committed StreamObjects that overlap [start_offset, end_offset)
         if (self.stream_object_index.get(stream_id)) |so_ids| {
             for (so_ids.items) |obj_id| {
                 if (results.items.len >= limit) break;
                 const so = self.stream_objects.get(obj_id) orelse continue;
+                if (so.state != .committed) continue;
                 // Check overlap
                 if (so.end_offset <= start_offset) continue;
                 if (so.start_offset >= end_offset) break; // sorted, no more matches
@@ -588,11 +831,12 @@ pub const ObjectManager = struct {
             }
         }
 
-        // 2. Collect StreamSetObjects with ranges for this stream overlapping
+        // 2. Collect committed StreamSetObjects with ranges for this stream overlapping
         if (self.stream_sso_index.get(stream_id)) |sso_ids| {
             for (sso_ids.items) |obj_id| {
                 if (results.items.len >= limit) break;
                 const sso = self.stream_set_objects.get(obj_id) orelse continue;
+                if (sso.state != .committed) continue;
                 for (sso.stream_ranges.items) |range| {
                     if (range.stream_id != stream_id) continue;
                     if (range.end_offset <= start_offset) continue;
@@ -641,12 +885,15 @@ pub const ObjectManager = struct {
         return self.streams.count();
     }
 
-    /// Check if a StreamObject already exists that covers the exact offset range.
+    /// Check if a committed StreamObject already exists that covers the exact offset range.
     /// Used for idempotent compaction — skip duplicate SOs.
+    /// Only checks committed objects: if a previous SO was mark_destroyed, we should
+    /// re-create it from the SSO data.
     pub fn hasStreamObjectCovering(self: *const ObjectManager, stream_id: u64, start_offset: u64, end_offset: u64) bool {
         const so_ids = self.stream_object_index.get(stream_id) orelse return false;
         for (so_ids.items) |obj_id| {
             const so = self.stream_objects.get(obj_id) orelse continue;
+            if (so.state != .committed) continue;
             if (so.start_offset == start_offset and so.end_offset == end_offset) return true;
         }
         return false;
@@ -656,7 +903,9 @@ pub const ObjectManager = struct {
 
     /// Snapshot format version. Bumped when the binary layout changes.
     /// Forward compatibility: loadSnapshot rejects unknown versions.
-    const SNAPSHOT_VERSION: u8 = 1;
+    /// v1: initial format
+    /// v2: added S3ObjectState (u8) and state_changed_ms (i64) to SO and SSO
+    const SNAPSHOT_VERSION: u8 = 2;
 
     /// Serialize all ObjectManager state (streams, SOs, SSOs, orphaned keys) to
     /// a binary buffer suitable for writing to disk. The caller owns the returned
@@ -689,6 +938,9 @@ pub const ObjectManager = struct {
     ///     [8 bytes] start_offset (u64)
     ///     [8 bytes] end_offset (u64)
     ///     [8 bytes] object_size (u64)
+    ///     [8 bytes] max_timestamp_ms (i64)
+    ///     [1 byte]  s3_object_state (u8: 0=prepared, 1=committed, 2=mark_destroyed) [v2+]
+    ///     [8 bytes] state_changed_ms (i64) [v2+]
     ///     [2 bytes] key_len (u16)
     ///     [key_len] s3_key bytes
     ///   --- StreamSetObjects ---
@@ -699,6 +951,8 @@ pub const ObjectManager = struct {
     ///     [8 bytes] order_id (u64)
     ///     [8 bytes] data_time_ms (i64)
     ///     [8 bytes] object_size (u64)
+    ///     [1 byte]  s3_object_state (u8: 0=prepared, 1=committed, 2=mark_destroyed) [v2+]
+    ///     [8 bytes] state_changed_ms (i64) [v2+]
     ///     [2 bytes] key_len (u16)
     ///     [key_len] s3_key bytes
     ///     [4 bytes] range_count (u32)
@@ -734,6 +988,7 @@ pub const ObjectManager = struct {
         while (so_it.next()) |entry| {
             const so = entry.value_ptr;
             size += 8 + 8 + 8 + 8 + 8 + 8; // fixed fields (incl. max_timestamp_ms)
+            size += 1 + 8; // state (u8) + state_changed_ms (i64)
             size += 2 + so.s3_key.len; // key_len + key
         }
 
@@ -743,6 +998,7 @@ pub const ObjectManager = struct {
         while (sso_it.next()) |entry| {
             const sso = entry.value_ptr;
             size += 8 + 4 + 8 + 8 + 8; // fixed fields
+            size += 1 + 8; // state (u8) + state_changed_ms (i64)
             size += 2 + sso.s3_key.len; // key_len + key
             size += 4; // range_count
             size += sso.stream_ranges.items.len * (8 + 8 + 8); // ranges
@@ -798,6 +1054,9 @@ pub const ObjectManager = struct {
             writeU64(buf, &pos, so.end_offset);
             writeU64(buf, &pos, so.object_size);
             writeI64(buf, &pos, so.max_timestamp_ms);
+            buf[pos] = @intFromEnum(so.state);
+            pos += 1;
+            writeI64(buf, &pos, so.state_changed_ms);
             writeU16(buf, &pos, @intCast(so.s3_key.len));
             @memcpy(buf[pos .. pos + so.s3_key.len], so.s3_key);
             pos += so.s3_key.len;
@@ -813,6 +1072,9 @@ pub const ObjectManager = struct {
             writeU64(buf, &pos, sso.order_id);
             writeI64(buf, &pos, sso.data_time_ms);
             writeU64(buf, &pos, sso.object_size);
+            buf[pos] = @intFromEnum(sso.state);
+            pos += 1;
+            writeI64(buf, &pos, sso.state_changed_ms);
             writeU16(buf, &pos, @intCast(sso.s3_key.len));
             @memcpy(buf[pos .. pos + sso.s3_key.len], sso.s3_key);
             pos += sso.s3_key.len;
@@ -847,10 +1109,10 @@ pub const ObjectManager = struct {
 
         var pos: usize = 0;
 
-        // Version check
+        // Version check — accept v1 (legacy) and v2 (with lifecycle state)
         const version = data[pos];
         pos += 1;
-        if (version != SNAPSHOT_VERSION) return error.UnsupportedSnapshotVersion;
+        if (version != 1 and version != 2) return error.UnsupportedSnapshotVersion;
 
         // next_object_id, next_order_id
         self.next_object_id = readU64(data, &pos) orelse return error.CorruptSnapshot;
@@ -916,6 +1178,19 @@ pub const ObjectManager = struct {
             const end_offset = readU64(data, &pos) orelse return error.CorruptSnapshot;
             const object_size = readU64(data, &pos) orelse return error.CorruptSnapshot;
             const max_timestamp_ms = readI64(data, &pos) orelse return error.CorruptSnapshot;
+
+            // v2 added lifecycle state fields
+            var so_state: S3ObjectState = .committed;
+            var so_state_changed_ms: i64 = 0;
+            if (version >= 2) {
+                if (pos >= data.len) return error.CorruptSnapshot;
+                const state_byte = data[pos];
+                pos += 1;
+                if (state_byte > 2) return error.CorruptSnapshot;
+                so_state = @enumFromInt(state_byte);
+                so_state_changed_ms = readI64(data, &pos) orelse return error.CorruptSnapshot;
+            }
+
             const key_len = readU16(data, &pos) orelse return error.CorruptSnapshot;
             if (pos + key_len > data.len) return error.CorruptSnapshot;
             const s3_key = data[pos .. pos + key_len];
@@ -923,6 +1198,12 @@ pub const ObjectManager = struct {
 
             // Use commitStreamObjectWithTimestamp to rebuild both primary store and secondary index
             try self.commitStreamObjectWithTimestamp(object_id, stream_id, start_offset, end_offset, s3_key, object_size, max_timestamp_ms);
+
+            // Restore lifecycle state after commit (commit sets state to .committed by default)
+            if (self.stream_objects.getPtr(object_id)) |so_ptr| {
+                so_ptr.state = so_state;
+                so_ptr.state_changed_ms = so_state_changed_ms;
+            }
         }
 
         // --- StreamSetObjects ---
@@ -934,6 +1215,19 @@ pub const ObjectManager = struct {
             const order_id = readU64(data, &pos) orelse return error.CorruptSnapshot;
             const data_time_ms = readI64(data, &pos) orelse return error.CorruptSnapshot;
             const object_size = readU64(data, &pos) orelse return error.CorruptSnapshot;
+
+            // v2 added lifecycle state fields
+            var sso_state: S3ObjectState = .committed;
+            var sso_state_changed_ms: i64 = 0;
+            if (version >= 2) {
+                if (pos >= data.len) return error.CorruptSnapshot;
+                const state_byte = data[pos];
+                pos += 1;
+                if (state_byte > 2) return error.CorruptSnapshot;
+                sso_state = @enumFromInt(state_byte);
+                sso_state_changed_ms = readI64(data, &pos) orelse return error.CorruptSnapshot;
+            }
+
             const key_len = readU16(data, &pos) orelse return error.CorruptSnapshot;
             if (pos + key_len > data.len) return error.CorruptSnapshot;
             const s3_key = data[pos .. pos + key_len];
@@ -955,8 +1249,8 @@ pub const ObjectManager = struct {
             }
 
             // commitStreamSetObject duplicates the key and ranges, and sets data_time_ms
-            // to now. We need to preserve the original data_time_ms, so we register
-            // directly instead of calling commitStreamSetObject.
+            // to now. We need to preserve the original data_time_ms and lifecycle state,
+            // so we register directly instead of calling commitStreamSetObject.
             if (object_id >= self.next_object_id) {
                 self.next_object_id = object_id + 1;
             }
@@ -975,6 +1269,8 @@ pub const ObjectManager = struct {
                 .object_size = object_size,
                 .s3_key = key_copy,
                 .stream_ranges = range_list,
+                .state = sso_state,
+                .state_changed_ms = sso_state_changed_ms,
             });
 
             // Rebuild secondary SSO index
@@ -1512,7 +1808,7 @@ test "ObjectManager snapshot roundtrip — empty state" {
 
     // Verify version byte is present
     try testing.expect(snap.len >= 1);
-    try testing.expectEqual(@as(u8, 1), snap[0]);
+    try testing.expectEqual(@as(u8, 2), snap[0]);
 
     // Load into a fresh ObjectManager
     var om2 = ObjectManager.init(testing.allocator, 0);
@@ -1705,14 +2001,18 @@ test "ObjectManager snapshot — corrupt data detected" {
     // Empty buffer
     try testing.expectError(error.CorruptSnapshot, om.loadSnapshot(""));
 
-    // Just a version byte, missing everything else
+    // Just a version byte (v1 or v2), missing everything else
     try testing.expectError(error.CorruptSnapshot, om.loadSnapshot(&[_]u8{1}));
+    try testing.expectError(error.CorruptSnapshot, om.loadSnapshot(&[_]u8{2}));
 
     // Wrong version
     try testing.expectError(error.UnsupportedSnapshotVersion, om.loadSnapshot(&[_]u8{99}));
 
-    // Version 0 is also unsupported
+    // Version 0 is unsupported
     try testing.expectError(error.UnsupportedSnapshotVersion, om.loadSnapshot(&[_]u8{0}));
+
+    // Version 3 is unsupported
+    try testing.expectError(error.UnsupportedSnapshotVersion, om.loadSnapshot(&[_]u8{3}));
 
     // Valid header but truncated after next_object_id (missing next_order_id + rest)
     var truncated: [9]u8 = undefined;
@@ -1840,7 +2140,7 @@ test "ObjectManager snapshot — version header present" {
     defer testing.allocator.free(snap);
 
     // First byte must be the version
-    try testing.expectEqual(@as(u8, 1), snap[0]);
+    try testing.expectEqual(@as(u8, 2), snap[0]);
 
     // Minimum size: version(1) + next_object_id(8) + next_order_id(8) +
     // stream_count(4) + so_count(4) + sso_count(4) + orphan_count(4) = 33
@@ -1979,4 +2279,287 @@ test "ObjectManager StreamObject max_timestamp_ms persists through snapshot" {
 
     const so = om2.stream_objects.get(1).?;
     try testing.expectEqual(@as(i64, 42000), so.max_timestamp_ms);
+}
+
+// ---------------------------------------------------------------
+// S3 Object Lifecycle tests
+// ---------------------------------------------------------------
+
+test "S3ObjectState enum values" {
+    try testing.expectEqual(@as(u8, 0), @intFromEnum(S3ObjectState.prepared));
+    try testing.expectEqual(@as(u8, 1), @intFromEnum(S3ObjectState.committed));
+    try testing.expectEqual(@as(u8, 2), @intFromEnum(S3ObjectState.mark_destroyed));
+}
+
+test "ObjectManager markDestroyed transitions SO state" {
+    var om = ObjectManager.init(testing.allocator, 0);
+    defer om.deinit();
+
+    try om.commitStreamObject(1, 1, 0, 100, "so/1/0-1", 1024);
+
+    // Initially committed
+    const so = om.stream_objects.get(1).?;
+    try testing.expectEqual(S3ObjectState.committed, so.state);
+    try testing.expectEqual(@as(i64, 0), so.state_changed_ms);
+
+    // Mark destroyed
+    om.markDestroyedAt(1, 5000);
+
+    const so2 = om.stream_objects.get(1).?;
+    try testing.expectEqual(S3ObjectState.mark_destroyed, so2.state);
+    try testing.expectEqual(@as(i64, 5000), so2.state_changed_ms);
+}
+
+test "ObjectManager markDestroyed transitions SSO state" {
+    var om = ObjectManager.init(testing.allocator, 0);
+    defer om.deinit();
+
+    const ranges = [_]StreamOffsetRange{
+        .{ .stream_id = 1, .start_offset = 0, .end_offset = 50 },
+    };
+    try om.commitStreamSetObject(10, 0, 1, &ranges, "sso/10", 512);
+
+    // Initially committed
+    const sso = om.stream_set_objects.get(10).?;
+    try testing.expectEqual(S3ObjectState.committed, sso.state);
+
+    // Mark destroyed
+    om.markDestroyedAt(10, 7000);
+
+    const sso2 = om.stream_set_objects.get(10).?;
+    try testing.expectEqual(S3ObjectState.mark_destroyed, sso2.state);
+    try testing.expectEqual(@as(i64, 7000), sso2.state_changed_ms);
+}
+
+test "ObjectManager markDestroyed ignores non-committed objects" {
+    var om = ObjectManager.init(testing.allocator, 0);
+    defer om.deinit();
+
+    // Register a prepared object
+    try om.registerPreparedStreamObjectAt(1, 1, "so/prepared/1", 1000);
+
+    // Attempt to mark it destroyed — should be a no-op (warning logged)
+    om.markDestroyedAt(1, 5000);
+
+    const so = om.stream_objects.get(1).?;
+    try testing.expectEqual(S3ObjectState.prepared, so.state);
+    try testing.expectEqual(@as(i64, 1000), so.state_changed_ms);
+}
+
+test "ObjectManager markDestroyed on nonexistent object is no-op" {
+    var om = ObjectManager.init(testing.allocator, 0);
+    defer om.deinit();
+
+    // Should not crash — just logs a warning
+    om.markDestroyedAt(999, 5000);
+}
+
+test "ObjectManager getObjects excludes mark_destroyed objects" {
+    var om = ObjectManager.init(testing.allocator, 0);
+    defer om.deinit();
+
+    try om.commitStreamObject(1, 1, 0, 100, "so/1/0-1", 1024);
+    try om.commitStreamObject(2, 1, 100, 200, "so/1/100-2", 1024);
+
+    // Mark first object for destruction
+    om.markDestroyedAt(1, 5000);
+
+    // Fetch should only return the committed object
+    const results = try om.getObjects(1, 0, 300, 10);
+    defer testing.allocator.free(results);
+    try testing.expectEqual(@as(usize, 1), results.len);
+    try testing.expectEqual(@as(u64, 100), results[0].start_offset);
+    try testing.expectEqual(@as(u64, 200), results[0].end_offset);
+}
+
+test "ObjectManager getObjects excludes prepared objects" {
+    var om = ObjectManager.init(testing.allocator, 0);
+    defer om.deinit();
+
+    // Register a prepared SO (not yet committed, no valid offsets)
+    try om.registerPreparedStreamObjectAt(1, 1, "so/prepared/1", 1000);
+
+    // Commit a real SO
+    try om.commitStreamObject(2, 1, 0, 100, "so/1/0-2", 1024);
+
+    // Fetch should only return the committed object
+    const results = try om.getObjects(1, 0, 200, 10);
+    defer testing.allocator.free(results);
+    try testing.expectEqual(@as(usize, 1), results.len);
+    try testing.expectEqual(@as(u64, 2), results[0].object_id);
+}
+
+test "ObjectManager collectDestroyedObjects returns keys after retention" {
+    var om = ObjectManager.init(testing.allocator, 0);
+    defer om.deinit();
+
+    try om.commitStreamObject(1, 1, 0, 100, "so/1/0-1", 1024);
+    try om.commitStreamObject(2, 1, 100, 200, "so/1/100-2", 2048);
+
+    // Mark both destroyed at time 1000
+    om.markDestroyedAt(1, 1000);
+    om.markDestroyedAt(2, 1000);
+
+    // At time 5000 with 10000ms retention — not yet ready
+    const keys_early = try om.collectDestroyedObjectsAt(10000, testing.allocator, 5000);
+    defer testing.allocator.free(keys_early);
+    try testing.expectEqual(@as(usize, 0), keys_early.len);
+
+    // Both objects should still exist
+    try testing.expectEqual(@as(usize, 2), om.getStreamObjectCount());
+
+    // At time 12000 with 10000ms retention — ready (1000 + 10000 = 11000 < 12000)
+    const keys = try om.collectDestroyedObjectsAt(10000, testing.allocator, 12000);
+    defer {
+        for (keys) |k| testing.allocator.free(k);
+        testing.allocator.free(keys);
+    }
+    try testing.expectEqual(@as(usize, 2), keys.len);
+
+    // Objects should be removed from metadata
+    try testing.expectEqual(@as(usize, 0), om.getStreamObjectCount());
+}
+
+test "ObjectManager collectDestroyedObjects does not affect committed objects" {
+    var om = ObjectManager.init(testing.allocator, 0);
+    defer om.deinit();
+
+    try om.commitStreamObject(1, 1, 0, 100, "so/1/0-1", 1024);
+    try om.commitStreamObject(2, 1, 100, 200, "so/1/100-2", 2048);
+
+    // Only mark the first one destroyed
+    om.markDestroyedAt(1, 1000);
+
+    // Collect at a time well past retention
+    const keys = try om.collectDestroyedObjectsAt(100, testing.allocator, 50000);
+    defer {
+        for (keys) |k| testing.allocator.free(k);
+        testing.allocator.free(keys);
+    }
+
+    // Only 1 key returned (the mark_destroyed one)
+    try testing.expectEqual(@as(usize, 1), keys.len);
+    try testing.expectEqualStrings("so/1/0-1", keys[0]);
+
+    // The committed one is still there
+    try testing.expectEqual(@as(usize, 1), om.getStreamObjectCount());
+    const so = om.stream_objects.get(2).?;
+    try testing.expectEqual(S3ObjectState.committed, so.state);
+}
+
+test "ObjectManager expirePreparedObjects cleans stale prepared SOs" {
+    var om = ObjectManager.init(testing.allocator, 0);
+    defer om.deinit();
+
+    // Register prepared objects at time 1000
+    try om.registerPreparedStreamObjectAt(1, 1, "so/prep/1", 1000);
+    try om.registerPreparedStreamObjectAt(2, 2, "so/prep/2", 1000);
+
+    // Also commit a normal object — should not be affected
+    try om.commitStreamObject(3, 1, 0, 100, "so/1/0-3", 1024);
+
+    try testing.expectEqual(@as(usize, 3), om.getStreamObjectCount());
+
+    // At time 2000 with 3600000ms TTL (1 hour) — not yet expired
+    const expired_early = om.expirePreparedObjectsAt(3600000, 2000);
+    try testing.expectEqual(@as(u64, 0), expired_early);
+    try testing.expectEqual(@as(usize, 3), om.getStreamObjectCount());
+
+    // At time 3601001 with 3600000ms TTL — both prepared objects have expired
+    const expired = om.expirePreparedObjectsAt(3600000, 3601001);
+    try testing.expectEqual(@as(u64, 2), expired);
+
+    // Only the committed object remains
+    try testing.expectEqual(@as(usize, 1), om.getStreamObjectCount());
+    const so = om.stream_objects.get(3).?;
+    try testing.expectEqual(S3ObjectState.committed, so.state);
+}
+
+test "ObjectManager prepareObject allocates unique IDs" {
+    var om = ObjectManager.init(testing.allocator, 0);
+    defer om.deinit();
+
+    const id1 = om.prepareObject();
+    const id2 = om.prepareObject();
+    const id3 = om.prepareObject();
+
+    try testing.expect(id1 < id2);
+    try testing.expect(id2 < id3);
+}
+
+test "ObjectManager lifecycle snapshot roundtrip preserves state" {
+    var om = ObjectManager.init(testing.allocator, 0);
+    defer om.deinit();
+
+    // Create a committed SO
+    try om.commitStreamObject(1, 1, 0, 100, "so/1/0-1", 1024);
+
+    // Create a mark_destroyed SO
+    try om.commitStreamObject(2, 1, 100, 200, "so/1/100-2", 2048);
+    om.markDestroyedAt(2, 5000);
+
+    // Create a prepared SO
+    try om.registerPreparedStreamObjectAt(3, 2, "so/prep/3", 3000);
+
+    // Create a mark_destroyed SSO
+    const ranges = [_]StreamOffsetRange{
+        .{ .stream_id = 3, .start_offset = 0, .end_offset = 50 },
+    };
+    try om.commitStreamSetObject(10, 0, 1, &ranges, "sso/10", 512);
+    om.markDestroyedAt(10, 8000);
+
+    // Snapshot
+    const snap = try om.takeSnapshot(&.{});
+    defer testing.allocator.free(snap);
+
+    // Load into fresh ObjectManager
+    var om2 = ObjectManager.init(testing.allocator, 0);
+    defer om2.deinit();
+    const orphans = try om2.loadSnapshot(snap);
+    defer testing.allocator.free(orphans);
+
+    // Verify SO states preserved
+    const so1 = om2.stream_objects.get(1).?;
+    try testing.expectEqual(S3ObjectState.committed, so1.state);
+    try testing.expectEqual(@as(i64, 0), so1.state_changed_ms);
+
+    const so2 = om2.stream_objects.get(2).?;
+    try testing.expectEqual(S3ObjectState.mark_destroyed, so2.state);
+    try testing.expectEqual(@as(i64, 5000), so2.state_changed_ms);
+
+    const so3 = om2.stream_objects.get(3).?;
+    try testing.expectEqual(S3ObjectState.prepared, so3.state);
+    try testing.expectEqual(@as(i64, 3000), so3.state_changed_ms);
+
+    // Verify SSO state preserved
+    const sso = om2.stream_set_objects.get(10).?;
+    try testing.expectEqual(S3ObjectState.mark_destroyed, sso.state);
+    try testing.expectEqual(@as(i64, 8000), sso.state_changed_ms);
+}
+
+test "ObjectManager collectDestroyedObjects handles mixed SO and SSO" {
+    var om = ObjectManager.init(testing.allocator, 0);
+    defer om.deinit();
+
+    // Create a committed SO and mark it destroyed
+    try om.commitStreamObject(1, 1, 0, 100, "so/1/0-1", 1024);
+    om.markDestroyedAt(1, 1000);
+
+    // Create a committed SSO and mark it destroyed
+    const ranges = [_]StreamOffsetRange{
+        .{ .stream_id = 2, .start_offset = 0, .end_offset = 50 },
+    };
+    try om.commitStreamSetObject(10, 0, 1, &ranges, "sso/10", 512);
+    om.markDestroyedAt(10, 1000);
+
+    // Collect after retention
+    const keys = try om.collectDestroyedObjectsAt(5000, testing.allocator, 10000);
+    defer {
+        for (keys) |k| testing.allocator.free(k);
+        testing.allocator.free(keys);
+    }
+
+    try testing.expectEqual(@as(usize, 2), keys.len);
+    try testing.expectEqual(@as(usize, 0), om.getStreamObjectCount());
+    try testing.expectEqual(@as(usize, 0), om.getStreamSetObjectCount());
 }

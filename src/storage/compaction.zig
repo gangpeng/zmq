@@ -45,6 +45,21 @@ pub const CompactionManager = struct {
     total_splits: u64 = 0,
     total_merges: u64 = 0,
     total_cleanups: u64 = 0,
+    total_destroyed: u64 = 0,
+    total_expired_prepared: u64 = 0,
+
+    /// Retention period (ms) for mark_destroyed objects before physical S3 delete.
+    /// Default 10 minutes — gives consumers time to finish reading in-flight data.
+    ///
+    /// NOTE: AutoMQ uses 10 minutes in S3ObjectControlManager. The effective delay
+    /// in ZMQ is mark_destroyed_retention_ms ± compaction_interval_ms because
+    /// lifecycle checks only run during compaction cycles.
+    mark_destroyed_retention_ms: i64 = 10 * 60 * 1000,
+
+    /// TTL (ms) for prepared objects that were never committed.
+    /// Default 60 minutes — if a producer crashes between prepareObject() and
+    /// commitStreamObject(), the stale allocation is cleaned up here.
+    prepared_ttl_ms: i64 = 60 * 60 * 1000,
 
     /// S3 keys that failed to delete during compaction (orphaned files).
     /// Cleaned up on the next compaction cycle.
@@ -99,7 +114,13 @@ pub const CompactionManager = struct {
         };
     }
 
-    /// Full compaction cycle: cleanup orphans → force-split → merge → cleanup expired.
+    /// Full compaction cycle: cleanup orphans → force-split → merge →
+    /// mark expired → destroy marked → expire prepared.
+    ///
+    /// NOTE: AutoMQ's CompactionManager uses separate timers for each phase.
+    /// ZMQ runs all phases sequentially in one cycle for simplicity. The lifecycle
+    /// phases (destroy marked, expire prepared) are added after the core compaction
+    /// phases to match AutoMQ's S3ObjectControlManager behavior.
     pub fn runCompaction(self: *CompactionManager) !void {
         const start_ns = std.time.nanoTimestamp();
         log.info("Starting compaction cycle (SSOs={d}, SOs={d})", .{
@@ -127,6 +148,22 @@ pub const CompactionManager = struct {
         self.total_cleanups += cleanups;
         self.journalComplete();
 
+        // Lifecycle Phase 1: Physically delete mark_destroyed objects whose
+        // retention period has elapsed. This gives consumers a grace period
+        // to finish reading data before it disappears from S3.
+        self.journalBegin("destroy", 0);
+        const destroyed = self.cleanupDestroyed();
+        self.total_destroyed += destroyed;
+        self.journalComplete();
+
+        // Lifecycle Phase 2: Expire prepared objects that were never committed
+        // (e.g., producer crashed between prepareObject and commitStreamObject).
+        const expired_prepared = self.object_manager.expirePreparedObjects(self.prepared_ttl_ms);
+        self.total_expired_prepared += expired_prepared;
+        if (expired_prepared > 0) {
+            log.info("Expired {d} prepared objects (TTL={d}ms)", .{ expired_prepared, self.prepared_ttl_ms });
+        }
+
         self.total_splits += splits;
         self.total_merges += merges;
 
@@ -136,13 +173,17 @@ pub const CompactionManager = struct {
             m.addCounter("compaction_splits_total", splits);
             m.addCounter("compaction_merges_total", merges);
             m.addCounter("compaction_cleanups_total", cleanups);
+            m.addCounter("compaction_destroyed_total", destroyed);
+            m.addCounter("compaction_expired_prepared_total", expired_prepared);
             const elapsed_ns = std.time.nanoTimestamp() - start_ns;
             const elapsed_secs: f64 = @as(f64, @floatFromInt(elapsed_ns)) / 1_000_000_000.0;
             m.observeHistogram("compaction_cycle_duration_seconds", elapsed_secs);
             m.setGauge("compaction_orphaned_keys", @floatFromInt(self.orphaned_keys.items.len));
         }
 
-        log.info("Compaction complete: {d} splits, {d} merges, {d} cleanups", .{ splits, merges, cleanups });
+        log.info("Compaction complete: {d} splits, {d} merges, {d} cleanups, {d} destroyed, {d} expired prepared", .{
+            splits, merges, cleanups, destroyed, expired_prepared,
+        });
     }
 
     /// Clean up S3 objects that were orphaned by previous failed deletions.
@@ -175,6 +216,9 @@ pub const CompactionManager = struct {
 
         var it = self.object_manager.stream_set_objects.iterator();
         while (it.next()) |entry| {
+            // Only split committed SSOs — skip prepared (not yet uploaded) and
+            // mark_destroyed (pending deletion, don't create new SOs from them)
+            if (entry.value_ptr.state != .committed) continue;
             if (!entry.value_ptr.isSingleStream()) {
                 try to_split.append(entry.value_ptr.object_id);
             }
@@ -331,6 +375,8 @@ pub const CompactionManager = struct {
 
             for (so_ids) |obj_id| {
                 const so = self.object_manager.stream_objects.get(obj_id) orelse continue;
+                // Only merge committed objects — skip prepared and mark_destroyed
+                if (so.state != .committed) continue;
 
                 if (group_size + so.object_size > self.merge_max_size and group.items.len > 1) {
                     // Flush current merge group
@@ -475,8 +521,15 @@ pub const CompactionManager = struct {
 
     // ---- Phase 3: Cleanup Expired ----
 
-    /// Phase 3: Clean up expired StreamObjects whose data is fully behind
-    /// the stream's start_offset (retention-trimmed data).
+    /// Phase 3: Mark expired StreamObjects for destruction. Objects whose data
+    /// is fully behind the stream's start_offset (retention-trimmed) transition
+    /// to mark_destroyed state instead of being immediately deleted.
+    ///
+    /// NOTE: AutoMQ's S3ObjectControlManager delays physical S3 deletion by
+    /// 10 minutes after marking an object destroyed. This gives consumers that
+    /// are mid-fetch time to complete their reads. ZMQ achieves the same by
+    /// setting mark_destroyed state here and physically deleting in
+    /// cleanupDestroyed() after mark_destroyed_retention_ms has elapsed.
     fn cleanupExpired(self: *CompactionManager) !u64 {
         var cleanup_count: u64 = 0;
 
@@ -485,35 +538,54 @@ pub const CompactionManager = struct {
             const stream_id = entry.key_ptr.*;
             const stream = self.object_manager.streams.get(stream_id) orelse continue;
 
-            // Find SOs that are fully behind the stream's start_offset
-            var to_remove = std.ArrayList(u64).init(self.allocator);
-            defer to_remove.deinit();
-
+            // Find committed SOs that are fully behind the stream's start_offset
             for (entry.value_ptr.items) |obj_id| {
                 const so = self.object_manager.stream_objects.get(obj_id) orelse continue;
+                if (so.state != .committed) continue;
                 if (so.end_offset <= stream.start_offset) {
-                    try to_remove.append(obj_id);
-                }
-            }
-
-            for (to_remove.items) |obj_id| {
-                if (self.object_manager.stream_objects.get(obj_id)) |so| {
-                    const key_copy = self.allocator.dupe(u8, so.s3_key) catch continue;
-                    self.object_manager.removeStreamObject(obj_id);
-                    if (!self.deleteS3Object(key_copy)) {
-                        self.orphaned_keys.append(key_copy) catch self.allocator.free(key_copy);
-                    } else {
-                        self.allocator.free(key_copy);
-                    }
+                    self.object_manager.markDestroyed(obj_id);
                     cleanup_count += 1;
                 }
             }
         }
 
         if (cleanup_count > 0) {
-            log.info("Cleaned up {d} expired StreamObjects", .{cleanup_count});
+            log.info("Marked {d} expired StreamObjects for destruction", .{cleanup_count});
         }
         return cleanup_count;
+    }
+
+    // ---- Phase 4: Destroy Marked Objects ----
+
+    /// Phase 4: Physically delete mark_destroyed objects whose retention period
+    /// has elapsed. Uses write-before-delete: collectDestroyedObjects removes
+    /// objects from metadata first, then we delete from S3. Failed S3 deletes
+    /// are tracked in orphaned_keys for retry on the next cycle.
+    fn cleanupDestroyed(self: *CompactionManager) u64 {
+        const keys = self.object_manager.collectDestroyedObjects(
+            self.mark_destroyed_retention_ms,
+            self.allocator,
+        ) catch |err| {
+            log.warn("Failed to collect destroyed objects: {}", .{err});
+            return 0;
+        };
+        defer self.allocator.free(keys);
+
+        var destroyed_count: u64 = 0;
+        for (keys) |key| {
+            if (!self.deleteS3Object(key)) {
+                log.warn("Orphaned destroyed object in S3: '{s}'", .{key});
+                self.orphaned_keys.append(key) catch self.allocator.free(key);
+            } else {
+                self.allocator.free(key);
+            }
+            destroyed_count += 1;
+        }
+
+        if (destroyed_count > 0) {
+            log.info("Physically deleted {d} destroyed objects from S3", .{destroyed_count});
+        }
+        return destroyed_count;
     }
 
     // ---- Compaction Journal ----
@@ -1145,7 +1217,7 @@ test "CompactionManager cleans up orphaned S3 keys" {
     try testing.expectEqual(@as(u64, 2), cm.total_cleanups);
 }
 
-test "CompactionManager cleanupExpired removes retention-trimmed SOs" {
+test "CompactionManager cleanupExpired marks retention-trimmed SOs for destruction" {
     var om = ObjectManager.init(testing.allocator, 0);
     defer om.deinit();
 
@@ -1187,10 +1259,13 @@ test "CompactionManager cleanupExpired removes retention-trimmed SOs" {
     var cm = CompactionManager.init(testing.allocator, &om);
     defer cm.deinit();
     cm.setMockS3(&mock_s3);
+    // Use zero retention so destroy happens in the same cycle
+    cm.mark_destroyed_retention_ms = 0;
 
     try cm.runCompaction();
 
-    // The two expired SOs (end_offset <= 100) should be removed
+    // The two expired SOs (end_offset <= 100) should be marked destroyed
+    // and then physically deleted (retention=0)
     // The live SO (start_offset=100, end_offset=150) should remain
     try testing.expectEqual(@as(usize, 1), om.getStreamObjectCount());
 
@@ -1261,4 +1336,163 @@ test "CompactionManager idempotent split skips existing SOs" {
     const r2 = try om.getObjects(2, 0, 100, 10);
     defer testing.allocator.free(r2);
     try testing.expectEqual(@as(usize, 1), r2.len);
+}
+
+// ---------------------------------------------------------------
+// S3 Object Lifecycle — Compaction integration tests
+// ---------------------------------------------------------------
+
+test "CompactionManager cleanupExpired uses markDestroyed not immediate delete" {
+    // After cleanupExpired, objects should be in mark_destroyed state,
+    // NOT removed from ObjectManager. They remain visible to ObjectManager
+    // (though hidden from getObjects) until cleanupDestroyed runs.
+    var om = ObjectManager.init(testing.allocator, 0);
+    defer om.deinit();
+
+    var mock_s3 = MockS3.init(testing.allocator);
+    defer mock_s3.deinit();
+
+    const stream = try om.createStreamWithId(1, 0);
+    stream.advanceEndOffset(200);
+    stream.trim(100);
+
+    var w1 = ObjectWriter.init(testing.allocator);
+    defer w1.deinit();
+    try w1.addDataBlock(1, 0, 50, 50, "expired-data");
+    const d1 = try w1.build();
+    defer testing.allocator.free(d1);
+    try mock_s3.putObject("so/1/0-expired", d1);
+    try om.commitStreamObject(10, 1, 0, 50, "so/1/0-expired", d1.len);
+
+    var w2 = ObjectWriter.init(testing.allocator);
+    defer w2.deinit();
+    try w2.addDataBlock(1, 100, 50, 50, "live-data");
+    const d2 = try w2.build();
+    defer testing.allocator.free(d2);
+    try mock_s3.putObject("so/1/100-live", d2);
+    try om.commitStreamObject(11, 1, 100, 150, "so/1/100-live", d2.len);
+
+    var cm = CompactionManager.init(testing.allocator, &om);
+    defer cm.deinit();
+    cm.setMockS3(&mock_s3);
+    // Large retention so destroy phase does NOT fire this cycle
+    cm.mark_destroyed_retention_ms = 999_999_999;
+
+    try cm.runCompaction();
+
+    // Expired SO should be mark_destroyed, not removed
+    try testing.expectEqual(@as(usize, 2), om.getStreamObjectCount());
+    const expired_so = om.stream_objects.get(10).?;
+    try testing.expectEqual(stream_mod.S3ObjectState.mark_destroyed, expired_so.state);
+
+    // Live SO should still be committed
+    const live_so = om.stream_objects.get(11).?;
+    try testing.expectEqual(stream_mod.S3ObjectState.committed, live_so.state);
+
+    // getObjects should only return the committed (live) one
+    const results = try om.getObjects(1, 0, 300, 10);
+    defer testing.allocator.free(results);
+    try testing.expectEqual(@as(usize, 1), results.len);
+    try testing.expectEqual(@as(u64, 100), results[0].start_offset);
+}
+
+test "CompactionManager cleanupDestroyed deletes after retention period" {
+    // Verify that mark_destroyed objects are NOT deleted before retention
+    // expires, and ARE deleted after.
+    var om = ObjectManager.init(testing.allocator, 0);
+    defer om.deinit();
+
+    var mock_s3 = MockS3.init(testing.allocator);
+    defer mock_s3.deinit();
+
+    var w1 = ObjectWriter.init(testing.allocator);
+    defer w1.deinit();
+    try w1.addDataBlock(1, 0, 50, 50, "data");
+    const d1 = try w1.build();
+    defer testing.allocator.free(d1);
+    try mock_s3.putObject("so/1/0-10", d1);
+    try om.commitStreamObject(10, 1, 0, 50, "so/1/0-10", d1.len);
+
+    // Mark destroyed with a known timestamp
+    om.markDestroyedAt(10, 1000);
+
+    var cm = CompactionManager.init(testing.allocator, &om);
+    defer cm.deinit();
+    cm.setMockS3(&mock_s3);
+    // 10 second retention for test
+    cm.mark_destroyed_retention_ms = 10_000;
+
+    // Try to collect at time 5000 (only 4 seconds elapsed) — too early
+    const keys_early = try om.collectDestroyedObjectsAt(10_000, testing.allocator, 5000);
+    defer testing.allocator.free(keys_early);
+    try testing.expectEqual(@as(usize, 0), keys_early.len);
+    try testing.expectEqual(@as(usize, 1), om.getStreamObjectCount());
+
+    // At time 12000 (11 seconds elapsed) — should be ready
+    const keys = try om.collectDestroyedObjectsAt(10_000, testing.allocator, 12000);
+    defer {
+        for (keys) |k| testing.allocator.free(k);
+        testing.allocator.free(keys);
+    }
+    try testing.expectEqual(@as(usize, 1), keys.len);
+    try testing.expectEqualStrings("so/1/0-10", keys[0]);
+    try testing.expectEqual(@as(usize, 0), om.getStreamObjectCount());
+}
+
+test "CompactionManager lifecycle end-to-end: mark → retain → destroy" {
+    // Full lifecycle: committed → cleanupExpired marks destroyed → retention
+    // period → cleanupDestroyed physically deletes.
+    var om = ObjectManager.init(testing.allocator, 0);
+    defer om.deinit();
+
+    var mock_s3 = MockS3.init(testing.allocator);
+    defer mock_s3.deinit();
+
+    const stream = try om.createStreamWithId(1, 0);
+    stream.advanceEndOffset(200);
+    stream.trim(100);
+
+    var w1 = ObjectWriter.init(testing.allocator);
+    defer w1.deinit();
+    try w1.addDataBlock(1, 0, 50, 50, "expired-data");
+    const d1 = try w1.build();
+    defer testing.allocator.free(d1);
+    try mock_s3.putObject("so/1/0-expired", d1);
+    try om.commitStreamObject(10, 1, 0, 50, "so/1/0-expired", d1.len);
+
+    var w2 = ObjectWriter.init(testing.allocator);
+    defer w2.deinit();
+    try w2.addDataBlock(1, 100, 50, 50, "live-data");
+    const d2 = try w2.build();
+    defer testing.allocator.free(d2);
+    try mock_s3.putObject("so/1/100-live", d2);
+    try om.commitStreamObject(11, 1, 100, 150, "so/1/100-live", d2.len);
+
+    // Cycle 1: mark destroyed (with large retention so destroy doesn't fire)
+    var cm = CompactionManager.init(testing.allocator, &om);
+    defer cm.deinit();
+    cm.setMockS3(&mock_s3);
+    cm.mark_destroyed_retention_ms = 999_999_999;
+
+    try cm.runCompaction();
+
+    // Expired SO is mark_destroyed but still in ObjectManager
+    try testing.expectEqual(@as(usize, 2), om.getStreamObjectCount());
+    try testing.expectEqual(@as(u64, 0), cm.total_destroyed);
+
+    // Cycle 2: now set retention to 0 so destroy fires immediately
+    cm.mark_destroyed_retention_ms = 0;
+    cm.last_compaction_ms = 0;
+
+    try cm.runCompaction();
+
+    // Expired SO should now be physically gone
+    try testing.expectEqual(@as(usize, 1), om.getStreamObjectCount());
+    try testing.expectEqual(@as(u64, 1), cm.total_destroyed);
+
+    // Only live SO remains
+    const results = try om.getObjects(1, 0, 300, 10);
+    defer testing.allocator.free(results);
+    try testing.expectEqual(@as(usize, 1), results.len);
+    try testing.expectEqual(@as(u64, 100), results[0].start_offset);
 }
