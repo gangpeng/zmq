@@ -4,8 +4,10 @@ const posix = std.posix;
 const linux = std.os.linux;
 const Allocator = std.mem.Allocator;
 const log = std.log.scoped(.server);
-const TlsContext = @import("../security/tls.zig").TlsContext;
+const tls_mod = @import("../security/tls.zig");
+const TlsContext = tls_mod.TlsContext;
 const OpenSslLib = @import("../security/openssl.zig").OpenSslLib;
+const MetricRegistry = @import("../core/metric_registry.zig").MetricRegistry;
 
 /// Global OpenSSL reference for connection cleanup (set when TLS is enabled).
 /// Connection.deinit needs this to call SSL_shutdown/SSL_free.
@@ -35,6 +37,18 @@ pub const Server = struct {
     batch_flush_fn: ?*const fn () void = null,
     /// Group commit: returns true if there are pending WAL writes (used to reduce epoll timeout).
     has_pending_flush_fn: ?*const fn () bool = null,
+    /// Metric registry for tracking active connections. Set by the Broker on startup.
+    metrics: ?*MetricRegistry = null,
+    /// Set to true when the server enters the connection drain phase of graceful shutdown.
+    /// During drain: no new connections are accepted, existing connections are given time
+    /// to complete in-flight requests and flush send buffers, then the server exits.
+    draining: bool = false,
+    /// Timestamp (ms) when draining started. Used to enforce drain_timeout_ms.
+    drain_start_ms: i64 = 0,
+    /// Maximum time (ms) to wait for in-flight requests to complete during drain.
+    drain_timeout_ms: i64 = 30_000,
+    /// Number of in-flight connections at the start of drain (for logging progress).
+    drain_initial_connections: usize = 0,
 
     const MAX_CONNECTIONS: usize = 100000;
     const IDLE_TIMEOUT_MS: i64 = 60_000;
@@ -45,6 +59,7 @@ pub const Server = struct {
 
     const Connection = struct {
         fd: posix.socket_t,
+        allocator: Allocator,
         recv_buf: std.ArrayList(u8),
         send_buf: std.ArrayList(u8),
         recv_cursor: usize = 0,
@@ -59,10 +74,17 @@ pub const Server = struct {
         ssl_ptr: ?*anyopaque = null,
         /// Whether the TLS handshake has completed.
         tls_handshake_done: bool = true, // true for plaintext (no handshake needed)
+        /// Timestamp (ms) when TLS handshake was initiated. Used to enforce
+        /// the 30s handshake timeout and prevent slow-client DoS.
+        handshake_start_ms: i64 = 0,
+        /// Extracted mTLS client principal (e.g., "User:kafka-client-1").
+        /// Heap-allocated by post-handshake validation. Freed on deinit.
+        mtls_principal: ?[]u8 = null,
 
         fn init(alloc: Allocator, fd: posix.socket_t) Connection {
             return .{
                 .fd = fd,
+                .allocator = alloc,
                 .recv_buf = std.ArrayList(u8).init(alloc),
                 .send_buf = std.ArrayList(u8).init(alloc),
                 .last_activity_ms = std.time.milliTimestamp(),
@@ -70,6 +92,11 @@ pub const Server = struct {
         }
 
         fn deinit(self: *Connection) void {
+            // Free the heap-allocated mTLS principal
+            if (self.mtls_principal) |principal| {
+                self.allocator.free(principal);
+                self.mtls_principal = null;
+            }
             // Clean up SSL object before closing socket
             if (self.ssl_ptr) |ssl| {
                 if (global_openssl) |ossl| {
@@ -290,6 +317,11 @@ pub const Server = struct {
                     }
                 }
             }
+
+            // Update active connections gauge after each io_uring iteration
+            if (self.metrics) |m| {
+                m.setGauge("kafka_network_connections_active", @floatFromInt(connections.count()));
+            }
         }
 
         posix.close(sock);
@@ -388,10 +420,23 @@ pub const Server = struct {
 
         var events: [256]linux.epoll_event = undefined;
         var loop_count: u64 = 0;
+        var listener_removed_from_epoll = false;
 
         while (self.running) {
-            // Reduce epoll timeout when WAL flush is pending for low-latency group commit
-            const timeout: i32 = if (self.has_pending_flush_fn) |check|
+            // When draining, stop accepting new connections by removing the
+            // listener socket from epoll. This is done once at the start of drain.
+            if (self.draining and !listener_removed_from_epoll) {
+                posix.epoll_ctl(epfd, linux.EPOLL.CTL_DEL, sock, null) catch {};
+                listener_removed_from_epoll = true;
+                self.drain_initial_connections = connections.count();
+                log.info("Drain phase: stopped accepting, {d} connections in flight", .{self.drain_initial_connections});
+            }
+
+            // Reduce epoll timeout when WAL flush is pending for low-latency group commit.
+            // During drain, use short timeout to check completion promptly.
+            const timeout: i32 = if (self.draining)
+                @as(i32, 50)
+            else if (self.has_pending_flush_fn) |check|
                 (if (check()) @as(i32, 1) else 100)
             else
                 100;
@@ -402,6 +447,9 @@ pub const Server = struct {
                 const fd = ev.data.fd;
 
                 if (fd == sock) {
+                    // During drain, the listener is already removed from epoll,
+                    // but handle any residual events by skipping accept.
+                    if (self.draining) continue;
                     // Accept
                     while (true) {
                         var addr: posix.sockaddr = undefined;
@@ -438,6 +486,10 @@ pub const Server = struct {
                                 };
                                 conn.ssl_ptr = ssl;
                                 conn.tls_handshake_done = false;
+                                // Record handshake start time for timeout enforcement.
+                                // Connections that don't complete the handshake within 30s
+                                // are forcibly closed to prevent slow-client DoS attacks.
+                                conn.handshake_start_ms = std.time.milliTimestamp();
                                 // Set global OpenSSL ref for connection cleanup
                                 if (tls_ctx.getOpenSsl()) |ossl| {
                                     global_openssl = ossl;
@@ -504,7 +556,18 @@ pub const Server = struct {
                 defer to_close.deinit();
                 var idle_it = connections.iterator();
                 while (idle_it.next()) |entry| {
-                    if (entry.value_ptr.isIdle(now_ms)) {
+                    const c = entry.value_ptr;
+                    if (c.isIdle(now_ms)) {
+                        to_close.append(entry.key_ptr.*) catch {};
+                    }
+                    // Enforce TLS handshake timeout (30s) to prevent slow-client DoS.
+                    // An attacker that opens many connections and trickles ClientHello
+                    // bytes one at a time can exhaust server resources. This forces
+                    // incomplete handshakes to be closed.
+                    else if (!c.tls_handshake_done and tls_mod.isHandshakeTimedOut(c.handshake_start_ms, now_ms)) {
+                        log.warn("TLS handshake timeout on fd={d} (started {d}ms ago)", .{
+                            c.fd, now_ms - c.handshake_start_ms,
+                        });
                         to_close.append(entry.key_ptr.*) catch {};
                     }
                 }
@@ -514,6 +577,37 @@ pub const Server = struct {
                         var conn = entry.value;
                         conn.deinit();
                     }
+                }
+            }
+
+            // Update active connections gauge after each epoll iteration
+            if (self.metrics) |m| {
+                m.setGauge("kafka_network_connections_active", @floatFromInt(connections.count()));
+            }
+
+            // Check if drain phase is complete (all connections done or timeout elapsed).
+            // During drain, connections with empty send buffers (no in-flight response)
+            // are closed proactively to speed up shutdown.
+            if (self.draining) {
+                // Close connections that have finished sending (no pending data)
+                var drain_close = std.ArrayList(posix.socket_t).init(self.allocator);
+                defer drain_close.deinit();
+                var drain_it = connections.iterator();
+                while (drain_it.next()) |entry| {
+                    if (entry.value_ptr.send_buf.items.len == 0) {
+                        drain_close.append(entry.key_ptr.*) catch {};
+                    }
+                }
+                for (drain_close.items) |drain_fd| {
+                    posix.epoll_ctl(epfd, linux.EPOLL.CTL_DEL, drain_fd, null) catch {};
+                    if (connections.fetchRemove(drain_fd)) |entry| {
+                        var conn = entry.value;
+                        conn.deinit();
+                    }
+                }
+
+                if (self.isDrainComplete(connections.count(), now_ms)) {
+                    self.running = false;
                 }
             }
         }
@@ -531,10 +625,29 @@ pub const Server = struct {
             if (conn.ssl_ptr) |ssl| {
                 if (self.tls_context) |tls_ctx| {
                     if (tls_ctx.getOpenSsl()) |ossl| {
+                        // Check handshake timeout before attempting SSL_accept
+                        if (tls_mod.isHandshakeTimedOut(conn.handshake_start_ms, now_ms)) {
+                            log.warn("TLS handshake timeout on fd={d}", .{fd});
+                            return error.TlsHandshakeFailed;
+                        }
+
                         const ret = ossl.SSL_accept(ssl);
                         if (ret == 1) {
                             conn.tls_handshake_done = true;
-                            log.info("TLS handshake completed on fd={d}", .{fd});
+
+                            // Post-handshake validation: certificate chain, expiry, principal extraction.
+                            // Validates the peer certificate and extracts the mTLS principal
+                            // for ACL checks. Rejects expired or untrusted certificates.
+                            const principal = tls_mod.validatePeerCertificatePostHandshake(ossl, ssl, fd, self.allocator) catch |err| {
+                                log.warn("TLS post-handshake validation failed on fd={d}: {s}", .{ fd, @errorName(err) });
+                                return error.TlsHandshakeFailed;
+                            };
+                            if (principal) |p| {
+                                conn.mtls_principal = p;
+                                log.info("TLS handshake completed on fd={d}, principal={s}", .{ fd, p });
+                            } else {
+                                log.info("TLS handshake completed on fd={d}", .{fd});
+                            }
                             return;
                         }
                         const err = ossl.SSL_get_error(ssl, ret);
@@ -627,10 +740,31 @@ pub const Server = struct {
         log.info("Server shutting down", .{});
     }
 
-    pub fn gracefulStop(self: *Server, drain_timeout_ms: u64) void {
-        self.running = false;
-        log.info("Draining connections for {d}ms...", .{drain_timeout_ms});
-        std.time.sleep(drain_timeout_ms * std.time.ns_per_ms);
+    /// Initiate graceful shutdown: stop accepting new connections and drain in-flight requests.
+    /// The epoll loop will detect `draining=true` and give existing connections up to
+    /// `drain_timeout_ms` to complete, then set `running=false` to exit the loop.
+    /// This is safe to call from a signal handler or another thread.
+    pub fn initiateGracefulDrain(self: *Server) void {
+        if (self.draining) return; // Already draining
+        self.draining = true;
+        self.drain_start_ms = std.time.milliTimestamp();
+        log.info("Graceful shutdown initiated: draining connections (timeout={d}ms)", .{self.drain_timeout_ms});
+    }
+
+    /// Returns true if drain phase is complete: either all connections are done
+    /// or the drain timeout has elapsed.
+    fn isDrainComplete(self: *Server, active_connections: usize, now_ms: i64) bool {
+        if (!self.draining) return false;
+        if (active_connections == 0) {
+            log.info("Drain complete: all connections closed", .{});
+            return true;
+        }
+        const elapsed = now_ms - self.drain_start_ms;
+        if (elapsed >= self.drain_timeout_ms) {
+            log.info("Drain timeout reached ({d}ms): {d} connections still active, closing", .{ elapsed, active_connections });
+            return true;
+        }
+        return false;
     }
 
     pub const ServerStats = struct {
@@ -641,3 +775,95 @@ pub const Server = struct {
         total_bytes_out: u64,
     };
 };
+
+// ---------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------
+
+const testing = std.testing;
+
+fn testHandler(_: []const u8, _: Allocator) ?[]u8 {
+    return null;
+}
+
+test "Server init creates valid server" {
+    var server = try Server.init(testing.allocator, "127.0.0.1", 0, &testHandler, 4);
+    try testing.expect(!server.running);
+    try testing.expect(!server.draining);
+    try testing.expectEqual(@as(i64, 30_000), server.drain_timeout_ms);
+}
+
+test "Server stop sets running to false" {
+    var server = try Server.init(testing.allocator, "127.0.0.1", 0, &testHandler, 4);
+    server.running = true;
+    server.stop();
+    try testing.expect(!server.running);
+}
+
+test "Server initiateGracefulDrain sets draining flag" {
+    var server = try Server.init(testing.allocator, "127.0.0.1", 0, &testHandler, 4);
+    server.running = true;
+
+    try testing.expect(!server.draining);
+    server.initiateGracefulDrain();
+    try testing.expect(server.draining);
+    try testing.expect(server.drain_start_ms > 0);
+    // running should still be true during drain (epoll loop continues for in-flight work)
+    try testing.expect(server.running);
+}
+
+test "Server initiateGracefulDrain is idempotent" {
+    var server = try Server.init(testing.allocator, "127.0.0.1", 0, &testHandler, 4);
+    server.running = true;
+
+    server.initiateGracefulDrain();
+    const first_drain_start = server.drain_start_ms;
+    // Small sleep to ensure timestamp would change
+    std.time.sleep(1_000_000); // 1ms
+    server.initiateGracefulDrain();
+    // drain_start_ms should not change on second call
+    try testing.expectEqual(first_drain_start, server.drain_start_ms);
+}
+
+test "Server isDrainComplete returns false when not draining" {
+    var server = try Server.init(testing.allocator, "127.0.0.1", 0, &testHandler, 4);
+    try testing.expect(!server.isDrainComplete(5, std.time.milliTimestamp()));
+}
+
+test "Server isDrainComplete returns true when no connections" {
+    var server = try Server.init(testing.allocator, "127.0.0.1", 0, &testHandler, 4);
+    server.draining = true;
+    server.drain_start_ms = std.time.milliTimestamp();
+    try testing.expect(server.isDrainComplete(0, std.time.milliTimestamp()));
+}
+
+test "Server isDrainComplete returns true on timeout" {
+    var server = try Server.init(testing.allocator, "127.0.0.1", 0, &testHandler, 4);
+    server.draining = true;
+    server.drain_timeout_ms = 100;
+    // Simulate drain started 200ms ago
+    server.drain_start_ms = std.time.milliTimestamp() - 200;
+    try testing.expect(server.isDrainComplete(5, std.time.milliTimestamp()));
+}
+
+test "Server isDrainComplete returns false when connections active and timeout not reached" {
+    var server = try Server.init(testing.allocator, "127.0.0.1", 0, &testHandler, 4);
+    server.draining = true;
+    server.drain_timeout_ms = 30_000;
+    server.drain_start_ms = std.time.milliTimestamp();
+    try testing.expect(!server.isDrainComplete(5, std.time.milliTimestamp()));
+}
+
+test "Server double signal: first drains, second force-stops" {
+    var server = try Server.init(testing.allocator, "127.0.0.1", 0, &testHandler, 4);
+    server.running = true;
+
+    // First signal: initiate drain
+    server.initiateGracefulDrain();
+    try testing.expect(server.draining);
+    try testing.expect(server.running);
+
+    // Second signal: force stop
+    server.stop();
+    try testing.expect(!server.running);
+}

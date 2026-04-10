@@ -21,6 +21,7 @@ const Authorizer = auth_mod.Authorizer;
 const SaslPlainAuthenticator = auth_mod.SaslPlainAuthenticator;
 const OAuthBearerAuthenticator = auth_mod.OAuthBearerAuthenticator;
 const ScramSha256Authenticator = auth_mod.ScramSha256Authenticator;
+const ScramStateMachine = auth_mod.ScramStateMachine;
 const FetchSessionManager = @import("fetch_session.zig").FetchSessionManager;
 // Import failover controller
 const FailoverController = @import("failover.zig").FailoverController;
@@ -29,6 +30,7 @@ const AutoBalancer = @import("auto_balancer.zig").AutoBalancer;
 // Stream/StreamSetObject/StreamObject metadata + compaction
 const ObjectManager = @import("../storage/stream.zig").ObjectManager;
 const CompactionManager = @import("../storage/compaction.zig").CompactionManager;
+const JsonLogger = @import("../core/json_logger.zig").JsonLogger;
 
 /// Stateful Kafka broker.
 ///
@@ -70,6 +72,11 @@ pub const Broker = struct {
     /// Set to true when the controller fences this broker (e.g., heartbeat timeout).
     /// When fenced, the broker rejects all produce requests with NOT_LEADER_OR_FOLLOWER.
     is_fenced_by_controller: bool = false,
+    /// Set to true when the broker is shutting down gracefully.
+    /// When set, new produce/fetch requests are rejected with NOT_LEADER_OR_FOLLOWER (error 6),
+    /// which tells clients to refresh metadata and reconnect to another broker.
+    /// ApiVersions (key 18) is still allowed so clients can probe connectivity.
+    is_shutting_down: bool = false,
     /// Timestamp (ms) of the last successful controller heartbeat.
     /// Used for staleness detection: if too old, the broker self-fences.
     last_successful_heartbeat_ms: i64 = 0,
@@ -91,6 +98,9 @@ pub const Broker = struct {
     sasl_mechanisms: std.StringHashMap([]u8),
     /// Comma-separated list of enabled SASL mechanisms (e.g., "PLAIN,SCRAM-SHA-256,OAUTHBEARER").
     sasl_enabled_mechanisms: []const u8 = "PLAIN",
+    /// Per-connection SCRAM-SHA-256 state machines for multi-round authentication.
+    /// Maps client_id → ScramStateMachine tracking the exchange progress.
+    scram_sessions: std.StringHashMap(ScramStateMachine),
     /// KIP-227 incremental fetch session manager.
     fetch_sessions: FetchSessionManager,
     /// Counter for S3 flush failures (used for monitoring/alerting).
@@ -109,6 +119,8 @@ pub const Broker = struct {
     /// When a fetch returns empty and max_wait_ms > 0, the request is stored here
     /// and completed when new data arrives or the timeout expires.
     delayed_fetches: std.ArrayList(DelayedFetch) = undefined,
+    /// Structured JSON logger for production-critical log statements.
+    json_logger: JsonLogger = undefined,
 
     /// Delayed fetch entry for purgatory.
     pub const DelayedFetch = struct {
@@ -312,6 +324,7 @@ pub const Broker = struct {
             .oauth_authenticator = OAuthBearerAuthenticator.init(),
             .authenticated_sessions = std.StringHashMap([]u8).init(alloc),
             .sasl_mechanisms = std.StringHashMap([]u8).init(alloc),
+            .scram_sessions = std.StringHashMap(ScramStateMachine).init(alloc),
             .fetch_sessions = FetchSessionManager.init(alloc),
             // Initialize failover controller
             .failover_controller = FailoverController.init(alloc, node_id),
@@ -323,6 +336,9 @@ pub const Broker = struct {
 
         // Initialize delayed fetch purgatory
         broker.delayed_fetches = std.ArrayList(DelayedFetch).init(alloc);
+
+        // Initialize structured JSON logger
+        broker.json_logger = JsonLogger.init(alloc);
 
         // Wire ObjectManager into PartitionStore (and its S3WalBatcher)
         broker.store.setObjectManager(&broker.object_manager);
@@ -355,6 +371,9 @@ pub const Broker = struct {
         if (broker.compaction_manager) |*cm| {
             cm.metrics = &broker.metrics;
         }
+
+        // Wire metrics registry into group coordinator for consumer lag tracking
+        broker.groups.metrics = &broker.metrics;
 
         // Configure security settings
         broker.sasl_enabled = config.sasl_enabled;
@@ -557,10 +576,11 @@ pub const Broker = struct {
             self.producer_sequences_dirty = false;
         }
 
-        // Periodic S3 flush (if configured) — fix #8: log errors and retry
+        // Periodic S3 flush (if configured)
         if (self.store.s3_storage != null) {
             self.store.flushAllToS3() catch |err| {
                 log.warn("S3 flush failed, will retry: {}", .{err});
+                self.json_logger.log(.warn, "S3 flush failed, will retry", null);
                 self.s3_flush_failures += 1;
             };
         }
@@ -648,6 +668,34 @@ pub const Broker = struct {
         return true;
     }
 
+    /// Force flush all buffered WAL data to S3 during graceful shutdown.
+    /// Unlike flushPendingWal() which respects batch thresholds, this flushes
+    /// unconditionally to ensure no data is lost on shutdown.
+    /// Returns true if flush succeeded (or nothing to flush).
+    pub fn shutdownFlushWal(self: *Broker) bool {
+        const batcher = &(self.store.s3_wal_batcher orelse return true);
+
+        if (batcher.buffer.items.len == 0) return true;
+
+        log.info("Shutdown: flushing {d} pending WAL entries to S3", .{batcher.buffer.items.len});
+
+        if (self.store.s3_storage) |*s3| {
+            const flushed = batcher.flushNow(s3);
+            if (flushed) {
+                var hw_updates = batcher.drainPendingHWUpdates();
+                defer hw_updates.deinit();
+                self.store.applyDeferredHWUpdates(&hw_updates);
+                log.info("Shutdown: WAL flush to S3 complete", .{});
+                return true;
+            } else {
+                log.warn("Shutdown: WAL flush to S3 failed", .{});
+                self.s3_flush_failures += 1;
+                return false;
+            }
+        }
+        return true;
+    }
+
     pub fn deinit(self: *Broker) void {
         // Save state before shutdown
         self.persistTopics();
@@ -675,6 +723,13 @@ pub const Broker = struct {
             self.allocator.free(entry.value_ptr.*);
         }
         self.sasl_mechanisms.deinit();
+        // Free SCRAM session state machines
+        var scram_it = self.scram_sessions.iterator();
+        while (scram_it.next()) |entry| {
+            self.allocator.free(entry.key_ptr.*);
+            entry.value_ptr.deinit();
+        }
+        self.scram_sessions.deinit();
         // Free authenticated session keys and values
         var sess_it = self.authenticated_sessions.iterator();
         while (sess_it.next()) |entry| {
@@ -692,6 +747,8 @@ pub const Broker = struct {
         // Clean up delayed fetches
         for (self.delayed_fetches.items) |*df| df.deinit(self.allocator);
         self.delayed_fetches.deinit();
+        // Clean up structured JSON logger
+        self.json_logger.deinit();
     }
 
     /// Persist current topic metadata to disk (best-effort).
@@ -880,7 +937,7 @@ pub const Broker = struct {
     pub fn handleRequest(self: *Broker, request_bytes: []const u8) ?[]u8 {
 
         if (request_bytes.len < 8) {
-            log.warn("Request too short: {d} bytes", .{request_bytes.len});
+            self.json_logger.log(.warn, "Request too short", null);
             return null;
         }
 
@@ -894,11 +951,20 @@ pub const Broker = struct {
 
         var req_header = RequestHeader.deserialize(self.allocator, request_bytes, &pos, req_header_version) catch |err| {
             log.warn("Failed to parse request header: {}", .{err});
+            self.json_logger.log(.warn, "Failed to parse request header", null);
             return null;
         };
         defer req_header.deinit(self.allocator);
 
         log.debug("api_key={d} v={d} corr={d}", .{ api_key, api_version, req_header.correlation_id });
+
+        // During graceful shutdown, reject all data-path requests with NOT_LEADER_OR_FOLLOWER.
+        // This tells Kafka clients to refresh metadata and reconnect to another broker.
+        // ApiVersions (key 18) is still allowed so clients can detect the broker is alive
+        // and perform version negotiation during reconnection.
+        if (self.is_shutting_down and api_key != 18) {
+            return self.handleShutdownReject(&req_header, resp_header_version);
+        }
 
         // Auth/ACL check before dispatch
         if (self.authorizer.aclCount() > 0 or !self.authorizer.allow_everyone_if_no_acl) {
@@ -1000,9 +1066,72 @@ pub const Broker = struct {
 
         if (result) |resp| {
             self.metrics.addCounter("kafka_server_bytes_out_total", resp.len);
+
+            // Track per-API error counters. Extract top-level error_code from the response.
+            // Response format: correlation_id(4) [+ tagged_fields for flexible] + [throttle_time] + error_code(2).
+            // We use a helper to find the error_code offset per API.
+            const error_code = extractResponseErrorCode(resp, api_key, api_version, resp_header_version);
+            if (error_code != 0) {
+                var ec_buf: [8]u8 = undefined;
+                const ec_str = std.fmt.bufPrint(&ec_buf, "{d}", .{error_code}) catch "?";
+                const api_name_for_err = apiKeyName(api_key);
+                const name_str = if (api_name_for_err.len > 0) api_name_for_err else "unknown";
+                self.metrics.incrementLabeledCounter("kafka_server_api_errors_total", &.{ name_str, ec_str });
+
+                // Structured JSON log for API errors
+                self.json_logger.logWithFields(.warn, "API error", req_header.correlation_id, &.{ "api", name_str, "error_code", ec_str });
+            }
         }
 
         return result;
+    }
+
+    /// Extract the top-level error_code from a Kafka response.
+    /// Returns 0 if no error or if the API doesn't have a simple top-level error_code
+    /// (e.g., Produce and Fetch use per-partition error codes).
+    fn extractResponseErrorCode(resp: []const u8, api_key: i16, api_version: i16, resp_header_version: i16) i16 {
+        // Skip correlation_id (4 bytes)
+        var offset: usize = 4;
+
+        // Flexible responses (header v1) have tagged fields after correlation_id
+        if (resp_header_version >= 1) {
+            // Tagged fields: varint length, typically 0x00 (1 byte for empty)
+            if (offset >= resp.len) return 0;
+            const tag_byte = resp[offset];
+            if (tag_byte == 0) {
+                offset += 1;
+            } else {
+                // Complex tagged fields — skip parsing, not worth it for error detection
+                return 0;
+            }
+        }
+
+        // APIs with throttle_time_ms before error_code
+        const has_throttle = switch (api_key) {
+            // Most APIs v1+ have throttle_time_ms; for simplicity track the common ones
+            8, 9, 10, 11, 12, 13, 14, 22, 25, 26 => api_version >= 1,
+            18 => false, // ApiVersions: error_code is right after header
+            else => false,
+        };
+
+        if (has_throttle) {
+            offset += 4; // throttle_time_ms (i32)
+        }
+
+        // APIs where we can reliably extract a top-level error_code
+        switch (api_key) {
+            // Produce (0), Fetch (1) — per-partition errors, skip
+            0, 1 => return 0,
+            // Metadata (3) — no top-level error_code
+            3 => return 0,
+            // These APIs have a top-level error_code at this position
+            10, 11, 12, 13, 14, 18, 22, 25, 26 => {},
+            // Other APIs — attempt extraction but don't fail
+            else => {},
+        }
+
+        if (offset + 2 > resp.len) return 0;
+        return @bitCast(std.mem.readInt(u16, resp[offset..][0..2], .big));
     }
 
     /// Check if an API key + version combination is supported.
@@ -1411,7 +1540,7 @@ pub const Broker = struct {
         // Reject all produces if this broker has been fenced by the controller.
         // Clients will receive NOT_LEADER_OR_FOLLOWER and refresh metadata.
         if (self.is_fenced_by_controller) {
-            log.info("Produce rejected: broker is fenced by controller", .{});
+            self.json_logger.log(.warn, "Produce rejected: broker fenced by controller", req_header.correlation_id);
             return self.handleNotController(req_header, resp_header_version);
         }
 
@@ -2099,7 +2228,18 @@ pub const Broker = struct {
             for (0..num_partitions) |_| {
                 const partition_id = ser.readI32(request_bytes, &pos);
                 const offset = ser.readI64(request_bytes, &pos);
-                self.groups.commitOffset(group_id, topic_name, partition_id, offset) catch {};
+
+                // Look up the log end offset (next_offset) for lag computation
+                const leo: ?i64 = blk: {
+                    const stream_key = std.fmt.allocPrint(self.allocator, "{s}-{d}", .{ topic_name, partition_id }) catch break :blk null;
+                    defer self.allocator.free(stream_key);
+                    if (self.store.partitions.getPtr(stream_key)) |state| {
+                        break :blk @intCast(state.next_offset);
+                    }
+                    break :blk null;
+                };
+
+                self.groups.commitOffsetWithLag(group_id, topic_name, partition_id, offset, leo) catch {};
 
                 // Write offset commit as a RecordBatch to __consumer_offsets
                 // The partition in __consumer_offsets is determined by hash(group_id) % 50
@@ -3097,6 +3237,19 @@ pub const Broker = struct {
         return buf[0..wpos];
     }
 
+    /// Return NOT_LEADER_OR_FOLLOWER (error code 6) during graceful shutdown.
+    /// Clients receiving this error will refresh metadata and reconnect to another broker,
+    /// achieving seamless traffic migration during rolling restarts.
+    fn handleShutdownReject(self: *Broker, req_header: *const RequestHeader, resp_header_version: i16) ?[]u8 {
+        const resp_header = ResponseHeader{ .correlation_id = req_header.correlation_id };
+        const header_size = resp_header.calcSize(resp_header_version);
+        const buf = self.allocator.alloc(u8, header_size + 2) catch return null;
+        var wpos: usize = 0;
+        resp_header.serialize(buf, &wpos, resp_header_version);
+        ser.writeI16(buf, &wpos, 6); // NOT_LEADER_OR_FOLLOWER
+        return buf[0..wpos];
+    }
+
     // ---------------------------------------------------------------
     // SaslHandshake (key 17)
     // ---------------------------------------------------------------
@@ -3239,17 +3392,122 @@ pub const Broker = struct {
             return (self.allocator.realloc(buf, wpos) catch buf)[0..wpos];
         } else if (std.mem.eql(u8, mechanism, "SCRAM-SHA-256")) {
             // SCRAM-SHA-256: RFC 5802 / RFC 7677
-            // Full SCRAM requires a 4-message exchange across multiple SaslAuthenticate calls.
-            // TODO: Implement multi-round SCRAM state machine (client-first → server-first →
-            // client-final → server-final). For now, return an error indicating the mechanism
-            // is not yet fully supported for multi-round exchange.
-            log.warn("SCRAM-SHA-256 authentication attempted but multi-round exchange not yet implemented", .{});
-            ser.writeI16(buf, &wpos, 58); // error_code = SASL_AUTHENTICATION_FAILED
-            ser.writeString(buf, &wpos, "SCRAM-SHA-256 multi-round exchange not yet implemented");
-            ser.writeBytesBuf(buf, &wpos, &.{});
-            ser.writeI64(buf, &wpos, 0);
-            if (resp_header_version >= 1) ser.writeEmptyTaggedFields(buf, &wpos);
-            return (self.allocator.realloc(buf, wpos) catch buf)[0..wpos];
+            // Multi-round exchange: client-first → server-first → client-final → server-final.
+            // Each SaslAuthenticate call progresses the per-connection ScramStateMachine.
+            const token = auth_bytes orelse {
+                ser.writeI16(buf, &wpos, 58); // SASL_AUTHENTICATION_FAILED
+                ser.writeString(buf, &wpos, "Missing SCRAM auth bytes");
+                ser.writeBytesBuf(buf, &wpos, &.{});
+                ser.writeI64(buf, &wpos, 0);
+                if (resp_header_version >= 1) ser.writeEmptyTaggedFields(buf, &wpos);
+                return (self.allocator.realloc(buf, wpos) catch buf)[0..wpos];
+            };
+
+            // Look up or create SCRAM session for this client
+            const scram_entry = self.scram_sessions.getPtr(client_id);
+            if (scram_entry) |sm| {
+                // Existing session — this should be the client-final-message (round 2)
+                if (sm.state == .server_first_sent) {
+                    if (sm.handleClientFinal(&self.scram_authenticator, token)) |server_final| {
+                        defer self.allocator.free(server_final);
+                        // Authentication succeeded — store principal and return server-final
+                        if (sm.username) |username| {
+                            const full_principal = std.fmt.allocPrint(self.allocator, "User:{s}", .{username}) catch {
+                                ser.writeI16(buf, &wpos, 58);
+                                ser.writeString(buf, &wpos, "Internal error");
+                                ser.writeBytesBuf(buf, &wpos, &.{});
+                                ser.writeI64(buf, &wpos, 0);
+                                if (resp_header_version >= 1) ser.writeEmptyTaggedFields(buf, &wpos);
+                                return (self.allocator.realloc(buf, wpos) catch buf)[0..wpos];
+                            };
+                            self.storeAuthenticatedPrincipal(client_id, full_principal);
+                        }
+                        ser.writeI16(buf, &wpos, 0); // error_code = NONE
+                        ser.writeString(buf, &wpos, ""); // error_message
+                        ser.writeBytesBuf(buf, &wpos, server_final); // server-final-message
+                        ser.writeI64(buf, &wpos, 0); // session_lifetime_ms
+                        if (resp_header_version >= 1) ser.writeEmptyTaggedFields(buf, &wpos);
+                        // Clean up the completed SCRAM session
+                        if (self.scram_sessions.fetchRemove(client_id)) |old| {
+                            self.allocator.free(old.key);
+                            var old_sm = old.value;
+                            old_sm.deinit();
+                        }
+                        return (self.allocator.realloc(buf, wpos) catch buf)[0..wpos];
+                    } else {
+                        // Client proof verification failed
+                        ser.writeI16(buf, &wpos, 58); // SASL_AUTHENTICATION_FAILED
+                        ser.writeString(buf, &wpos, "SCRAM-SHA-256 authentication failed");
+                        ser.writeBytesBuf(buf, &wpos, &.{});
+                        ser.writeI64(buf, &wpos, 0);
+                        if (resp_header_version >= 1) ser.writeEmptyTaggedFields(buf, &wpos);
+                        // Clean up the failed session
+                        if (self.scram_sessions.fetchRemove(client_id)) |old| {
+                            self.allocator.free(old.key);
+                            var old_sm = old.value;
+                            old_sm.deinit();
+                        }
+                        return (self.allocator.realloc(buf, wpos) catch buf)[0..wpos];
+                    }
+                } else {
+                    // Unexpected state — session exists but not in server_first_sent
+                    ser.writeI16(buf, &wpos, 58);
+                    ser.writeString(buf, &wpos, "SCRAM-SHA-256 unexpected state");
+                    ser.writeBytesBuf(buf, &wpos, &.{});
+                    ser.writeI64(buf, &wpos, 0);
+                    if (resp_header_version >= 1) ser.writeEmptyTaggedFields(buf, &wpos);
+                    if (self.scram_sessions.fetchRemove(client_id)) |old| {
+                        self.allocator.free(old.key);
+                        var old_sm = old.value;
+                        old_sm.deinit();
+                    }
+                    return (self.allocator.realloc(buf, wpos) catch buf)[0..wpos];
+                }
+            } else {
+                // No existing session — this is the client-first-message (round 1)
+                var sm = ScramStateMachine.init(self.allocator);
+                if (sm.handleClientFirst(&self.scram_authenticator, token)) |server_first| {
+                    defer self.allocator.free(server_first);
+                    // Store the state machine for this client's next round
+                    const key = self.allocator.dupe(u8, client_id) catch {
+                        sm.deinit();
+                        ser.writeI16(buf, &wpos, 58);
+                        ser.writeString(buf, &wpos, "Internal error");
+                        ser.writeBytesBuf(buf, &wpos, &.{});
+                        ser.writeI64(buf, &wpos, 0);
+                        if (resp_header_version >= 1) ser.writeEmptyTaggedFields(buf, &wpos);
+                        return (self.allocator.realloc(buf, wpos) catch buf)[0..wpos];
+                    };
+                    self.scram_sessions.put(key, sm) catch {
+                        self.allocator.free(key);
+                        sm.deinit();
+                        ser.writeI16(buf, &wpos, 58);
+                        ser.writeString(buf, &wpos, "Internal error");
+                        ser.writeBytesBuf(buf, &wpos, &.{});
+                        ser.writeI64(buf, &wpos, 0);
+                        if (resp_header_version >= 1) ser.writeEmptyTaggedFields(buf, &wpos);
+                        return (self.allocator.realloc(buf, wpos) catch buf)[0..wpos];
+                    };
+                    // Return server-first-message to client (intermediate challenge)
+                    // Kafka sends error_code=0 for SCRAM challenge responses; the client
+                    // knows the exchange is not yet complete from the SCRAM state machine.
+                    ser.writeI16(buf, &wpos, 0); // error_code = NONE (continue exchange)
+                    ser.writeString(buf, &wpos, ""); // error_message
+                    ser.writeBytesBuf(buf, &wpos, server_first); // server-first-message
+                    ser.writeI64(buf, &wpos, 0);
+                    if (resp_header_version >= 1) ser.writeEmptyTaggedFields(buf, &wpos);
+                    return (self.allocator.realloc(buf, wpos) catch buf)[0..wpos];
+                } else {
+                    // Failed to parse client-first (unknown user, bad format, etc.)
+                    sm.deinit();
+                    ser.writeI16(buf, &wpos, 58); // SASL_AUTHENTICATION_FAILED
+                    ser.writeString(buf, &wpos, "SCRAM-SHA-256 authentication failed");
+                    ser.writeBytesBuf(buf, &wpos, &.{});
+                    ser.writeI64(buf, &wpos, 0);
+                    if (resp_header_version >= 1) ser.writeEmptyTaggedFields(buf, &wpos);
+                    return (self.allocator.realloc(buf, wpos) catch buf)[0..wpos];
+                }
+            }
         } else {
             // PLAIN (default) — existing SASL/PLAIN authentication path
             if (auth_bytes) |token| {
@@ -4710,4 +4968,177 @@ test "Broker handleRequest Heartbeat (key=12)" {
     const error_code = ser.readI16(resp.?, &rpos);
     // Unknown member in unknown group — expect non-zero error
     try testing.expect(error_code != 0);
+}
+
+test "Broker kafka_server_api_errors_total is registered" {
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+
+    try testing.expect(broker.metrics.labeled_counter_meta.contains("kafka_server_api_errors_total"));
+}
+
+test "Broker kafka_consumer_lag is registered" {
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+
+    try testing.expect(broker.metrics.labeled_gauge_meta.contains("kafka_consumer_lag"));
+}
+
+test "Broker kafka_network_connections_active is registered" {
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+
+    try testing.expect(broker.metrics.gauges.contains("kafka_network_connections_active"));
+}
+
+test "Broker error counter increments on API error" {
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+
+    // Send a Heartbeat for an unknown group — this will return error code 16
+    var buf: [512]u8 = undefined;
+    var pos = buildTestRequest(&buf, 12, 0, 300, 1);
+    ser.writeString(&buf, &pos, "nonexistent-group");
+    ser.writeI32(&buf, &pos, 1);
+    ser.writeString(&buf, &pos, "unknown-member");
+
+    const resp = broker.handleRequest(buf[0..pos]);
+    try testing.expect(resp != null);
+    defer testing.allocator.free(resp.?);
+
+    // Verify the error counter was incremented
+    // Heartbeat for unknown group returns error 16 (COORDINATOR_NOT_AVAILABLE)
+    const key = "kafka_server_api_errors_total{heartbeat,16}";
+    const entry = broker.metrics.labeled_counters.get(key);
+    try testing.expect(entry != null);
+    try testing.expect(entry.?.value >= 1);
+}
+
+test "Broker consumer lag computed on offset commit" {
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+
+    // Produce records to create a partition with next_offset > 0
+    _ = broker.ensureTopic("lag-topic");
+
+    // Directly commit offset with lag via the coordinator
+    try broker.groups.commitOffsetWithLag("test-group", "lag-topic", 0, 5, 10);
+
+    // Verify the lag metric was set (10 - 5 = 5)
+    const key = "kafka_consumer_lag{test-group,lag-topic,0}";
+    const entry = broker.metrics.labeled_gauges.get(key);
+    try testing.expect(entry != null);
+    try testing.expectEqual(@as(f64, 5.0), entry.?.value);
+}
+
+test "Broker extractResponseErrorCode finds error in Heartbeat response" {
+    // Heartbeat v0 response: correlation_id(4) + error_code(2)
+    // Response header v0 (non-flexible): no tagged fields
+    var resp: [6]u8 = undefined;
+    std.mem.writeInt(u32, resp[0..4], 42, .big); // correlation_id
+    std.mem.writeInt(u16, resp[4..6], @bitCast(@as(i16, 16)), .big); // error_code = 16
+    const ec = Broker.extractResponseErrorCode(&resp, 12, 0, 0);
+    try testing.expectEqual(@as(i16, 16), ec);
+}
+
+test "Broker extractResponseErrorCode returns 0 for Produce" {
+    // Produce has per-partition error codes, not a top-level one
+    var resp: [10]u8 = undefined;
+    @memset(&resp, 0);
+    const ec = Broker.extractResponseErrorCode(&resp, 0, 0, 0);
+    try testing.expectEqual(@as(i16, 0), ec);
+}
+
+test "Broker json_logger is initialized" {
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+
+    // Verify json_logger can be used without crashing
+    broker.json_logger.log(.info, "test log", 42);
+}
+
+test "Broker is_shutting_down rejects Produce with NOT_LEADER_OR_FOLLOWER" {
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+
+    broker.is_shutting_down = true;
+
+    // Build a Produce v0 request
+    var buf: [256]u8 = undefined;
+    const req_len = buildTestRequest(&buf, 0, 0, 99, 1);
+
+    const response = broker.handleRequest(buf[0..req_len]);
+    try testing.expect(response != null);
+    defer testing.allocator.free(response.?);
+
+    // Parse correlation ID
+    var rpos: usize = 0;
+    const corr_id = ser.readI32(response.?, &rpos);
+    try testing.expectEqual(@as(i32, 99), corr_id);
+
+    // Parse error code — should be NOT_LEADER_OR_FOLLOWER (6)
+    const error_code = ser.readI16(response.?, &rpos);
+    try testing.expectEqual(@as(i16, 6), error_code);
+}
+
+test "Broker is_shutting_down allows ApiVersions (key 18)" {
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+
+    broker.is_shutting_down = true;
+
+    // Build an ApiVersions v0 request (non-flexible, header v1)
+    var buf: [256]u8 = undefined;
+    const req_len = buildTestRequest(&buf, 18, 0, 77, 1);
+
+    const response = broker.handleRequest(buf[0..req_len]);
+    try testing.expect(response != null);
+    defer testing.allocator.free(response.?);
+
+    // Parse correlation ID — should match
+    var rpos: usize = 0;
+    const corr_id = ser.readI32(response.?, &rpos);
+    try testing.expectEqual(@as(i32, 77), corr_id);
+
+    // Parse error code — should be 0 (NONE), not 6
+    const error_code = ser.readI16(response.?, &rpos);
+    try testing.expectEqual(@as(i16, 0), error_code);
+}
+
+test "Broker is_shutting_down rejects Fetch with NOT_LEADER_OR_FOLLOWER" {
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+
+    broker.is_shutting_down = true;
+
+    // Build a Fetch v0 request (api_key=1)
+    var buf: [256]u8 = undefined;
+    const req_len = buildTestRequest(&buf, 1, 0, 55, 1);
+
+    const response = broker.handleRequest(buf[0..req_len]);
+    try testing.expect(response != null);
+    defer testing.allocator.free(response.?);
+
+    var rpos: usize = 0;
+    const corr_id = ser.readI32(response.?, &rpos);
+    try testing.expectEqual(@as(i32, 55), corr_id);
+
+    const error_code = ser.readI16(response.?, &rpos);
+    try testing.expectEqual(@as(i16, 6), error_code);
+}
+
+test "Broker is_shutting_down defaults to false" {
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+
+    try testing.expect(!broker.is_shutting_down);
+}
+
+test "Broker shutdownFlushWal returns true when no S3 batcher" {
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+
+    // Without S3 storage configured, shutdownFlushWal is a no-op
+    const result = broker.shutdownFlushWal();
+    try testing.expect(result);
 }

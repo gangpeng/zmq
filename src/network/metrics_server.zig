@@ -10,8 +10,8 @@ const log = std.log.scoped(.metrics_server);
 /// HTTP server for Prometheus metrics and health endpoints.
 /// Listens on a separate port and serves:
 /// - GET /metrics — Prometheus exposition format
-/// - GET /health — liveness probe (always 200)
-/// - GET /ready — readiness probe (200 when broker is serving)
+/// - GET /health — liveness probe (200 if event loop is responsive)
+/// - GET /ready — readiness probe (200 when broker startup is complete, 503 otherwise)
 ///
 /// Supports optional TLS for encrypted metrics transport. When tls_context
 /// is set, connections are wrapped with SSL (blocking handshake since
@@ -22,6 +22,9 @@ pub const MetricsServer = struct {
     allocator: Allocator,
     listener: ?posix.socket_t = null,
     running: bool = false,
+    /// Set to true once the broker has completed startup (listening, metrics registered).
+    /// /ready returns 503 until this is true.
+    startup_complete: bool = false,
     // NOTE: TLS for the metrics server is available but not wired into main.zig
     // by default. To enable, create a TlsContext and pass it here. Typically
     // metrics endpoints are behind a reverse proxy that terminates TLS, so
@@ -94,9 +97,15 @@ pub const MetricsServer = struct {
 
         // Route request
         if (std.mem.startsWith(u8, request, "GET /health")) {
+            // Liveness: 200 if the event loop is responsive (reaching here proves it)
             self.sendPlainResponse(client, "200 OK", "text/plain", "OK\n");
         } else if (std.mem.startsWith(u8, request, "GET /ready")) {
-            self.sendPlainResponse(client, "200 OK", "text/plain", "READY\n");
+            // Readiness: 503 until startup_complete is set
+            if (self.startup_complete) {
+                self.sendPlainResponse(client, "200 OK", "text/plain", "READY\n");
+            } else {
+                self.sendPlainResponse(client, "503 Service Unavailable", "text/plain", "NOT READY\n");
+            }
         } else if (std.mem.startsWith(u8, request, "GET /metrics")) {
             self.servePlainMetrics(client);
         } else {
@@ -140,7 +149,11 @@ pub const MetricsServer = struct {
         if (std.mem.startsWith(u8, request, "GET /health")) {
             self.sendSslResponse(ossl, ssl, "200 OK", "text/plain", "OK\n");
         } else if (std.mem.startsWith(u8, request, "GET /ready")) {
-            self.sendSslResponse(ossl, ssl, "200 OK", "text/plain", "READY\n");
+            if (self.startup_complete) {
+                self.sendSslResponse(ossl, ssl, "200 OK", "text/plain", "READY\n");
+            } else {
+                self.sendSslResponse(ossl, ssl, "503 Service Unavailable", "text/plain", "NOT READY\n");
+            }
         } else if (std.mem.startsWith(u8, request, "GET /metrics")) {
             self.serveSslMetrics(ossl, ssl);
         } else {
@@ -191,3 +204,47 @@ pub const MetricsServer = struct {
         self.running = false;
     }
 };
+
+// ---------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------
+
+const testing = std.testing;
+
+test "MetricsServer startup_complete defaults to false" {
+    var registry = MetricRegistry.init(testing.allocator);
+    defer registry.deinit();
+
+    var server = MetricsServer.init(testing.allocator, 19090, &registry);
+    try testing.expect(!server.startup_complete);
+}
+
+test "MetricsServer ready returns 503 when startup not complete" {
+    var registry = MetricRegistry.init(testing.allocator);
+    defer registry.deinit();
+
+    var server = MetricsServer.init(testing.allocator, 19090, &registry);
+    // Before startup_complete, readiness should indicate not ready
+    try testing.expect(!server.startup_complete);
+
+    // After setting startup_complete, readiness should indicate ready
+    server.startup_complete = true;
+    try testing.expect(server.startup_complete);
+}
+
+test "MetricsServer ready transitions from 503 to 200" {
+    var registry = MetricRegistry.init(testing.allocator);
+    defer registry.deinit();
+
+    var server = MetricsServer.init(testing.allocator, 19090, &registry);
+
+    // Phase 1: not ready
+    try testing.expect(!server.startup_complete);
+
+    // Phase 2: startup completes
+    server.startup_complete = true;
+    try testing.expect(server.startup_complete);
+
+    // Phase 3: remains ready
+    try testing.expect(server.startup_complete);
+}

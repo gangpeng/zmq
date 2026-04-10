@@ -54,6 +54,32 @@ pub const OpenSslLib = struct {
     /// X509_free(x509) — free an X509 object obtained from SSL_get1_peer_certificate
     X509_free: ?*const fn (?*anyopaque) void = null,
 
+    // -- Hostname verification & certificate validation --
+    // SSL_set1_host(ssl, hostname) → int — enables hostname verification against
+    // the peer certificate's SAN/CN. OpenSSL 1.1.0+.
+    // NOTE: AutoMQ (Java) uses SSLParameters.setEndpointIdentificationAlgorithm("HTTPS")
+    // which verifies hostname against SANs per RFC 6125. SSL_set1_host provides
+    // equivalent verification via OpenSSL's X509_check_host under the hood.
+    SSL_set1_host: ?*const fn (?*anyopaque, [*:0]const u8) c_int = null,
+    /// SSL_set_hostflags(ssl, flags) — configure hostname check flags (e.g. partial wildcards)
+    SSL_set_hostflags: ?*const fn (?*anyopaque, c_uint) void = null,
+    /// SSL_get_verify_result(ssl) → long — returns X509_V_OK (0) if chain verification passed
+    SSL_get_verify_result: ?*const fn (?*anyopaque) c_long = null,
+    /// X509_get_notAfter(x509) → ASN1_TIME* — pointer to the certificate's expiry time.
+    /// In OpenSSL 1.1.0+ this is X509_get0_notAfter (returns const internal pointer).
+    X509_get0_notAfter: ?*const fn (?*anyopaque) ?*anyopaque = null,
+    /// X509_get_notBefore(x509) → ASN1_TIME* — pointer to the certificate's start time.
+    X509_get0_notBefore: ?*const fn (?*anyopaque) ?*anyopaque = null,
+    /// X509_cmp_current_time(asn1_time) → int
+    ///   < 0: asn1_time is before current time (expired for notAfter)
+    ///   > 0: asn1_time is after current time (still valid for notAfter)
+    ///   = 0: error
+    X509_cmp_current_time: ?*const fn (?*anyopaque) c_int = null,
+    /// X509_get_issuer_name(x509) → X509_NAME* (internal pointer, do NOT free)
+    X509_get_issuer_name: ?*const fn (?*anyopaque) ?*anyopaque = null,
+    /// X509_get_serialNumber(x509) → ASN1_INTEGER* (internal pointer, do NOT free)
+    X509_get_serialNumber: ?*const fn (?*anyopaque) ?*anyopaque = null,
+
     // -- libcrypto function pointers --
     OPENSSL_init_ssl: *const fn (u64, ?*anyopaque) c_int,
     ERR_get_error: *const fn () c_ulong,
@@ -74,6 +100,15 @@ pub const OpenSslLib = struct {
     pub const TLS1_3_VERSION: c_int = 0x0304;
     pub const OPENSSL_INIT_LOAD_SSL_STRINGS: u64 = 0x00200000;
     pub const OPENSSL_INIT_LOAD_CRYPTO_STRINGS: u64 = 0x00000002;
+
+    /// X509_V_OK — certificate verification succeeded
+    pub const X509_V_OK: c_long = 0;
+    /// X509_V_ERR_CERT_HAS_EXPIRED
+    pub const X509_V_ERR_CERT_HAS_EXPIRED: c_long = 10;
+    /// X509_V_ERR_CERT_NOT_YET_VALID
+    pub const X509_V_ERR_CERT_NOT_YET_VALID: c_long = 9;
+    /// X509_CHECK_FLAG_NO_PARTIAL_WILDCARDS — stricter hostname matching
+    pub const X509_CHECK_FLAG_NO_PARTIAL_WILDCARDS: c_uint = 0x4;
 
     /// SSL_CTX_ctrl command codes (macros SSL_CTX_set_min/max_proto_version)
     pub const SSL_CTRL_SET_MIN_PROTO_VERSION: c_int = 123;
@@ -110,6 +145,105 @@ pub const OpenSslLib = struct {
         const name = get_name_fn(x509) orelse return null;
         const result = name_oneline_fn(name, buf.ptr, @intCast(buf.len)) orelse return null;
         return std.mem.sliceTo(result, 0);
+    }
+
+    /// Enable hostname verification on an SSL connection (client-side).
+    /// Must be called BEFORE the TLS handshake (SSL_connect). OpenSSL will then
+    /// verify the peer certificate's SAN/CN against the given hostname during
+    /// the handshake. Returns true on success.
+    pub fn setHostnameVerification(self: *const OpenSslLib, ssl: ?*anyopaque, hostname: [*:0]const u8) bool {
+        const set_host_fn = self.SSL_set1_host orelse {
+            log.warn("SSL_set1_host not available — hostname verification disabled", .{});
+            return false;
+        };
+        // Use strict wildcard matching (no partial wildcards like f*.example.com)
+        if (self.SSL_set_hostflags) |set_flags_fn| {
+            set_flags_fn(ssl, X509_CHECK_FLAG_NO_PARTIAL_WILDCARDS);
+        }
+        return set_host_fn(ssl, hostname) == 1;
+    }
+
+    /// Check whether the peer certificate chain was verified successfully.
+    /// Must be called AFTER the TLS handshake completes. Returns the OpenSSL
+    /// verification result code (X509_V_OK = 0 means success).
+    pub fn getVerifyResult(self: *const OpenSslLib, ssl: ?*anyopaque) c_long {
+        const verify_fn = self.SSL_get_verify_result orelse return -1;
+        return verify_fn(ssl);
+    }
+
+    /// Check whether the peer certificate has expired or is not yet valid.
+    /// Returns .valid, .expired, .not_yet_valid, or .unknown.
+    /// Must be called AFTER the TLS handshake completes.
+    pub fn checkPeerCertExpiry(self: *const OpenSslLib, ssl: ?*anyopaque) CertExpiryStatus {
+        const get_cert_fn = self.SSL_get1_peer_certificate orelse return .unknown;
+        const free_fn = self.X509_free orelse return .unknown;
+        const get_not_after_fn = self.X509_get0_notAfter orelse return .unknown;
+        const get_not_before_fn = self.X509_get0_notBefore orelse return .unknown;
+        const cmp_time_fn = self.X509_cmp_current_time orelse return .unknown;
+
+        const x509 = get_cert_fn(ssl) orelse return .no_certificate;
+        defer free_fn(x509);
+
+        // Check notBefore: if result > 0, notBefore is in the future → cert not yet valid
+        const not_before = get_not_before_fn(x509) orelse return .unknown;
+        const before_cmp = cmp_time_fn(not_before);
+        if (before_cmp > 0) return .not_yet_valid;
+
+        // Check notAfter: if result < 0, notAfter is in the past → cert expired
+        const not_after = get_not_after_fn(x509) orelse return .unknown;
+        const after_cmp = cmp_time_fn(not_after);
+        if (after_cmp < 0) return .expired;
+        if (after_cmp == 0) return .unknown; // 0 means error in X509_cmp_current_time
+
+        return .valid;
+    }
+
+    /// Result of certificate expiry check.
+    pub const CertExpiryStatus = enum {
+        valid,
+        expired,
+        not_yet_valid,
+        no_certificate,
+        unknown,
+
+        pub fn isValid(self: CertExpiryStatus) bool {
+            return self == .valid;
+        }
+    };
+
+    /// Extract the mTLS client principal from the peer certificate subject DN.
+    /// Returns a Kafka-style principal string "User:CN=..." or the full subject
+    /// if CN is not present. The caller owns the returned string.
+    /// Returns null if no peer certificate or extraction functions unavailable.
+    pub fn extractMtlsPrincipal(self: *const OpenSslLib, ssl: ?*anyopaque, allocator: std.mem.Allocator) ?[]u8 {
+        var subject_buf: [1024]u8 = undefined;
+        const subject_dn = self.getPeerCertSubject(ssl, &subject_buf) orelse return null;
+
+        // Extract CN from subject DN (format: "/C=US/ST=.../CN=client-name/...")
+        // Kafka convention: principal is "User:<CN value>"
+        if (extractCnFromDn(subject_dn)) |cn| {
+            return std.fmt.allocPrint(allocator, "User:{s}", .{cn}) catch null;
+        }
+
+        // Fallback: use the entire subject DN as the principal identity
+        return std.fmt.allocPrint(allocator, "User:{s}", .{subject_dn}) catch null;
+    }
+
+    /// Parse the CN (Common Name) field from an X509 subject DN string.
+    /// Input format: "/C=US/ST=State/O=Org/CN=some-name/..."
+    /// Returns just the CN value ("some-name") or null if not found.
+    pub fn extractCnFromDn(dn: []const u8) ?[]const u8 {
+        // Look for "/CN=" prefix (standard OpenSSL oneline format)
+        const cn_prefix = "/CN=";
+        const cn_start_idx = std.mem.indexOf(u8, dn, cn_prefix) orelse return null;
+        const value_start = cn_start_idx + cn_prefix.len;
+        if (value_start >= dn.len) return null;
+
+        // CN value ends at the next '/' or end of string
+        const remaining = dn[value_start..];
+        const end_idx = std.mem.indexOf(u8, remaining, "/") orelse remaining.len;
+        if (end_idx == 0) return null;
+        return remaining[0..end_idx];
     }
 
     // -- C dlopen/dlsym/dlclose --
@@ -202,6 +336,21 @@ pub const OpenSslLib = struct {
         self.X509_NAME_oneline = lookupFn(crypto_handle, @TypeOf(self.X509_NAME_oneline.?), "X509_NAME_oneline") catch null;
         self.X509_free = lookupFn(crypto_handle, @TypeOf(self.X509_free.?), "X509_free") catch null;
 
+        // Hostname verification and certificate validation (optional — soft-fail).
+        // SSL_set1_host is available in OpenSSL 1.1.0+. It configures the SSL
+        // object to verify the peer certificate's SAN/CN against the hostname
+        // during the handshake.
+        self.SSL_set1_host = lookupFn(ssl_handle, @TypeOf(self.SSL_set1_host.?), "SSL_set1_host") catch null;
+        self.SSL_set_hostflags = lookupFn(ssl_handle, @TypeOf(self.SSL_set_hostflags.?), "SSL_set_hostflags") catch null;
+        self.SSL_get_verify_result = lookupFn(ssl_handle, @TypeOf(self.SSL_get_verify_result.?), "SSL_get_verify_result") catch null;
+
+        // Certificate time inspection (from libcrypto)
+        self.X509_get0_notAfter = lookupFn(crypto_handle, @TypeOf(self.X509_get0_notAfter.?), "X509_get0_notAfter") catch null;
+        self.X509_get0_notBefore = lookupFn(crypto_handle, @TypeOf(self.X509_get0_notBefore.?), "X509_get0_notBefore") catch null;
+        self.X509_cmp_current_time = lookupFn(crypto_handle, @TypeOf(self.X509_cmp_current_time.?), "X509_cmp_current_time") catch null;
+        self.X509_get_issuer_name = lookupFn(crypto_handle, @TypeOf(self.X509_get_issuer_name.?), "X509_get_issuer_name") catch null;
+        self.X509_get_serialNumber = lookupFn(crypto_handle, @TypeOf(self.X509_get_serialNumber.?), "X509_get_serialNumber") catch null;
+
         // Load libcrypto/libssl init functions
         self.OPENSSL_init_ssl = try lookupFn(ssl_handle, @TypeOf(self.OPENSSL_init_ssl), "OPENSSL_init_ssl");
         self.ERR_get_error = try lookupFn(crypto_handle, @TypeOf(self.ERR_get_error), "ERR_get_error");
@@ -263,4 +412,65 @@ test "OpenSslLib error string does not crash" {
     defer lib.close();
     const err_str = lib.getErrorString();
     _ = err_str;
+}
+
+test "OpenSslLib hostname verification functions loaded" {
+    var lib = OpenSslLib.load() catch return;
+    defer lib.close();
+
+    // SSL_set1_host should be available on OpenSSL 1.1.0+
+    try testing.expect(lib.SSL_set1_host != null);
+    try testing.expect(lib.SSL_get_verify_result != null);
+}
+
+test "OpenSslLib certificate time functions loaded" {
+    var lib = OpenSslLib.load() catch return;
+    defer lib.close();
+
+    // X509 time functions should be available on any modern OpenSSL
+    try testing.expect(lib.X509_get0_notAfter != null);
+    try testing.expect(lib.X509_get0_notBefore != null);
+    try testing.expect(lib.X509_cmp_current_time != null);
+}
+
+test "extractCnFromDn parses standard DN" {
+    // Standard OpenSSL oneline format
+    const dn = "/C=US/ST=California/O=ZMQ/CN=kafka-client-1";
+    const cn = OpenSslLib.extractCnFromDn(dn);
+    try testing.expect(cn != null);
+    try testing.expectEqualStrings("kafka-client-1", cn.?);
+}
+
+test "extractCnFromDn handles CN in middle" {
+    const dn = "/C=US/CN=broker-node/O=ZMQ";
+    const cn = OpenSslLib.extractCnFromDn(dn);
+    try testing.expect(cn != null);
+    try testing.expectEqualStrings("broker-node", cn.?);
+}
+
+test "extractCnFromDn returns null for missing CN" {
+    const dn = "/C=US/ST=California/O=ZMQ";
+    const cn = OpenSslLib.extractCnFromDn(dn);
+    try testing.expect(cn == null);
+}
+
+test "extractCnFromDn handles empty CN value" {
+    const dn = "/C=US/CN=/O=ZMQ";
+    const cn = OpenSslLib.extractCnFromDn(dn);
+    try testing.expect(cn == null);
+}
+
+test "extractCnFromDn handles CN at end without trailing slash" {
+    const dn = "/O=ZMQ/CN=my-service";
+    const cn = OpenSslLib.extractCnFromDn(dn);
+    try testing.expect(cn != null);
+    try testing.expectEqualStrings("my-service", cn.?);
+}
+
+test "CertExpiryStatus isValid" {
+    try testing.expect(OpenSslLib.CertExpiryStatus.valid.isValid());
+    try testing.expect(!OpenSslLib.CertExpiryStatus.expired.isValid());
+    try testing.expect(!OpenSslLib.CertExpiryStatus.not_yet_valid.isValid());
+    try testing.expect(!OpenSslLib.CertExpiryStatus.no_certificate.isValid());
+    try testing.expect(!OpenSslLib.CertExpiryStatus.unknown.isValid());
 }

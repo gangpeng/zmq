@@ -13,12 +13,14 @@ pub const crc32c = @import("core/crc32c.zig");
 pub const uuid = @import("core/uuid.zig");
 pub const time_utils = @import("core/time_utils.zig");
 pub const metric_registry = @import("core/metric_registry.zig");
+pub const json_logger = @import("core/json_logger.zig");
 
 pub const ByteBuffer = byte_buffer.ByteBuffer;
 pub const Varint = varint;
 pub const Crc32c = crc32c;
 pub const Uuid = uuid.Uuid;
 pub const MetricRegistry = metric_registry.MetricRegistry;
+pub const JsonLogger = json_logger.JsonLogger;
 
 test {
     @import("std").testing.refAllDecls(@This());

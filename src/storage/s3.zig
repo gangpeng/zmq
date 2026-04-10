@@ -1,6 +1,7 @@
 const std = @import("std");
 const testing = std.testing;
 const Allocator = std.mem.Allocator;
+const crc32c = @import("../core/crc32c.zig");
 
 /// In-memory S3 mock for testing.
 ///
@@ -98,10 +99,18 @@ pub const MockS3 = struct {
 
 /// ZMQ S3 object format writer.
 ///
-/// Format:
+/// Format v2 (current):
 ///   [DataBlock 0] [DataBlock 1] ... [DataBlock N]
 ///   [IndexBlock: DataBlockIndex entries (36 bytes each)]
-///   [Footer: index_position(8) + index_size(4) + magic(4)]
+///   [Footer: index_position(8) + index_size(4) + magic_v2(4) + crc32c(4)]
+///
+/// The CRC32C covers all bytes before it (data blocks + index + footer fields + magic).
+/// This detects silent bit-rot corruption that would otherwise go unnoticed.
+///
+/// Format v1 (legacy, read-only):
+///   [DataBlock 0] [DataBlock 1] ... [DataBlock N]
+///   [IndexBlock: DataBlockIndex entries (36 bytes each)]
+///   [Footer: index_position(8) + index_size(4) + magic_v1(4)]
 ///
 /// DataBlockIndex entry (36 bytes):
 ///   stream_id: u64
@@ -111,8 +120,10 @@ pub const MockS3 = struct {
 ///   block_position: u64
 ///   block_size: u32
 pub const ObjectWriter = struct {
-    const FOOTER_MAGIC: u32 = 0x4155544F; // "AUTO"
-    const FOOTER_SIZE: usize = 16; // index_position(8) + index_size(4) + magic(4)
+    const FOOTER_MAGIC_V1: u32 = 0x4155544F; // "AUTO" — legacy format without CRC
+    const FOOTER_MAGIC_V2: u32 = 0x41555432; // "AUT2" — current format with CRC32C
+    const FOOTER_SIZE_V1: usize = 16; // index_position(8) + index_size(4) + magic(4)
+    const FOOTER_SIZE_V2: usize = 20; // index_position(8) + index_size(4) + magic(4) + crc32c(4)
     const INDEX_ENTRY_SIZE: usize = 36;
 
     data: std.ArrayList(u8),
@@ -158,6 +169,7 @@ pub const ObjectWriter = struct {
     }
 
     /// Finalize and return the complete S3 object bytes.
+    /// Writes v2 format: data blocks + index + footer (with magic_v2) + CRC32C.
     pub fn build(self: *ObjectWriter) ![]u8 {
         const index_position = self.data.items.len;
 
@@ -175,21 +187,40 @@ pub const ObjectWriter = struct {
 
         const index_size: u32 = @intCast(self.index_entries.items.len * INDEX_ENTRY_SIZE);
 
-        // Write footer
-        var footer: [FOOTER_SIZE]u8 = undefined;
-        std.mem.writeInt(u64, footer[0..8], @intCast(index_position), .big);
-        std.mem.writeInt(u32, footer[8..12], index_size, .big);
-        std.mem.writeInt(u32, footer[12..16], FOOTER_MAGIC, .big);
-        try self.data.appendSlice(&footer);
+        // Write footer (first 12 bytes: index_position + index_size)
+        var footer_prefix: [12]u8 = undefined;
+        std.mem.writeInt(u64, footer_prefix[0..8], @intCast(index_position), .big);
+        std.mem.writeInt(u32, footer_prefix[8..12], index_size, .big);
+        try self.data.appendSlice(&footer_prefix);
+
+        // Write v2 magic
+        var magic_buf: [4]u8 = undefined;
+        std.mem.writeInt(u32, &magic_buf, FOOTER_MAGIC_V2, .big);
+        try self.data.appendSlice(&magic_buf);
+
+        // Compute CRC32C over all bytes written so far (data + index + footer prefix + magic)
+        const checksum = crc32c.compute(self.data.items);
+
+        // Append CRC32C as final 4 bytes
+        var crc_buf: [4]u8 = undefined;
+        std.mem.writeInt(u32, &crc_buf, checksum, .big);
+        try self.data.appendSlice(&crc_buf);
 
         return try self.data.toOwnedSlice();
     }
 };
 
 /// S3 Object reader — parse the ZMQ/AutoMQ object format.
+///
+/// Supports both v1 (legacy, no CRC) and v2 (with CRC32C checksum).
+/// Detection: tries v2 first (magic_v2 at len-8), falls back to v1 (magic_v1 at len-4).
+/// For v2 objects, verifies the CRC32C checksum and returns error.ChecksumMismatch
+/// if the data has been corrupted (bit-rot, truncation, etc.).
 pub const ObjectReader = struct {
-    const FOOTER_MAGIC: u32 = 0x4155544F;
-    const FOOTER_SIZE: usize = 16;
+    const FOOTER_MAGIC_V1: u32 = 0x4155544F; // "AUTO"
+    const FOOTER_MAGIC_V2: u32 = 0x41555432; // "AUT2"
+    const FOOTER_SIZE_V1: usize = 16;
+    const FOOTER_SIZE_V2: usize = 20;
     const INDEX_ENTRY_SIZE: usize = 36;
 
     data: []const u8,
@@ -197,19 +228,77 @@ pub const ObjectReader = struct {
     index_size: u32,
     index_entries: []ObjectWriter.DataBlockIndex,
     allocator: Allocator,
+    has_checksum: bool,
 
     pub fn parse(alloc: Allocator, data: []const u8) !ObjectReader {
-        if (data.len < FOOTER_SIZE) return error.ObjectTooSmall;
+        // Try v2 format first (20-byte footer: index_pos(8) + index_size(4) + magic_v2(4) + crc(4))
+        if (data.len >= FOOTER_SIZE_V2) {
+            const magic_offset = data.len - 8; // magic is 8 bytes from end (before 4-byte CRC)
+            const magic = std.mem.readInt(u32, data[magic_offset..][0..4], .big);
+            if (magic == FOOTER_MAGIC_V2) {
+                return parseV2(alloc, data);
+            }
+        }
 
-        // Read footer
-        const footer_start = data.len - FOOTER_SIZE;
-        const magic = std.mem.readInt(u32, data[footer_start + 12 ..][0..4], .big);
-        if (magic != FOOTER_MAGIC) return error.InvalidMagic;
+        // Fall back to v1 format (16-byte footer: index_pos(8) + index_size(4) + magic_v1(4))
+        if (data.len >= FOOTER_SIZE_V1) {
+            const magic_offset = data.len - 4; // magic is last 4 bytes
+            const magic = std.mem.readInt(u32, data[magic_offset..][0..4], .big);
+            if (magic == FOOTER_MAGIC_V1) {
+                return parseV1(alloc, data);
+            }
+        }
 
-        const index_position = std.mem.readInt(u64, data[footer_start ..][0..8], .big);
+        if (data.len < FOOTER_SIZE_V1) return error.ObjectTooSmall;
+        return error.InvalidMagic;
+    }
+
+    /// Parse v2 format: validates CRC32C checksum before returning.
+    fn parseV2(alloc: Allocator, data: []const u8) !ObjectReader {
+        // CRC is the last 4 bytes, computed over everything before it
+        const crc_offset = data.len - 4;
+        const stored_crc = std.mem.readInt(u32, data[crc_offset..][0..4], .big);
+        const computed_crc = crc32c.compute(data[0..crc_offset]);
+
+        if (stored_crc != computed_crc) return error.ChecksumMismatch;
+
+        // Footer fields are at: [len-20..len-12] = index_pos, [len-12..len-8] = index_size
+        const footer_start = data.len - FOOTER_SIZE_V2;
+        const index_position = std.mem.readInt(u64, data[footer_start..][0..8], .big);
         const index_size = std.mem.readInt(u32, data[footer_start + 8 ..][0..4], .big);
 
-        // Parse index entries
+        const entries = try parseIndexEntries(alloc, data, index_position, index_size);
+
+        return .{
+            .data = data,
+            .index_position = index_position,
+            .index_size = index_size,
+            .index_entries = entries,
+            .allocator = alloc,
+            .has_checksum = true,
+        };
+    }
+
+    /// Parse v1 format (legacy): no checksum verification.
+    fn parseV1(alloc: Allocator, data: []const u8) !ObjectReader {
+        const footer_start = data.len - FOOTER_SIZE_V1;
+        const index_position = std.mem.readInt(u64, data[footer_start..][0..8], .big);
+        const index_size = std.mem.readInt(u32, data[footer_start + 8 ..][0..4], .big);
+
+        const entries = try parseIndexEntries(alloc, data, index_position, index_size);
+
+        return .{
+            .data = data,
+            .index_position = index_position,
+            .index_size = index_size,
+            .index_entries = entries,
+            .allocator = alloc,
+            .has_checksum = false,
+        };
+    }
+
+    /// Shared index parsing logic for both v1 and v2.
+    fn parseIndexEntries(alloc: Allocator, data: []const u8, index_position: u64, index_size: u32) ![]ObjectWriter.DataBlockIndex {
         const entry_count = index_size / INDEX_ENTRY_SIZE;
         var entries = try alloc.alloc(ObjectWriter.DataBlockIndex, entry_count);
 
@@ -226,13 +315,7 @@ pub const ObjectReader = struct {
             pos += INDEX_ENTRY_SIZE;
         }
 
-        return .{
-            .data = data,
-            .index_position = index_position,
-            .index_size = index_size,
-            .index_entries = entries,
-            .allocator = alloc,
-        };
+        return entries;
     }
 
     pub fn deinit(self: *ObjectReader) void {
@@ -348,8 +431,8 @@ test "ObjectReader.parse too-small buffer" {
 }
 
 test "ObjectReader.parse invalid magic" {
-    // Create a buffer with valid footer size but wrong magic
-    var buf: [ObjectWriter.FOOTER_SIZE]u8 = undefined;
+    // Create a buffer with valid v1 footer size but wrong magic — neither v1 nor v2
+    var buf: [ObjectWriter.FOOTER_SIZE_V1]u8 = undefined;
     std.mem.writeInt(u64, buf[0..8], 0, .big); // index_position
     std.mem.writeInt(u32, buf[8..12], 0, .big); // index_size
     std.mem.writeInt(u32, buf[12..16], 0xDEADBEEF, .big); // wrong magic
@@ -446,4 +529,162 @@ test "MockS3 objectSize" {
     try s3.putObject("key", "12345");
     try testing.expectEqual(@as(u64, 5), s3.objectSize("key").?);
     try testing.expect(s3.objectSize("missing") == null);
+}
+
+test "ObjectWriter v2 writes CRC32C checksum" {
+    var writer = ObjectWriter.init(testing.allocator);
+    defer writer.deinit();
+
+    try writer.addDataBlock(1, 0, 5, 5, "hello");
+    const obj_data = try writer.build();
+    defer testing.allocator.free(obj_data);
+
+    // Verify v2 magic is at offset len-8
+    const magic = std.mem.readInt(u32, obj_data[obj_data.len - 8 ..][0..4], .big);
+    try testing.expectEqual(ObjectWriter.FOOTER_MAGIC_V2, magic);
+
+    // Verify CRC32C is at last 4 bytes and matches
+    const stored_crc = std.mem.readInt(u32, obj_data[obj_data.len - 4 ..][0..4], .big);
+    const computed_crc = crc32c.compute(obj_data[0 .. obj_data.len - 4]);
+    try testing.expectEqual(computed_crc, stored_crc);
+}
+
+test "ObjectReader v2 round-trip with checksum verification" {
+    var writer = ObjectWriter.init(testing.allocator);
+    defer writer.deinit();
+
+    try writer.addDataBlock(1, 0, 10, 10, "block1-data-stream1");
+    try writer.addDataBlock(2, 0, 3, 3, "block3-stream2");
+
+    const obj_data = try writer.build();
+    defer testing.allocator.free(obj_data);
+
+    var reader = try ObjectReader.parse(testing.allocator, obj_data);
+    defer reader.deinit();
+
+    try testing.expect(reader.has_checksum);
+    try testing.expectEqual(@as(usize, 2), reader.index_entries.len);
+    try testing.expectEqualStrings("block1-data-stream1", reader.readBlock(0).?);
+    try testing.expectEqualStrings("block3-stream2", reader.readBlock(1).?);
+}
+
+test "ObjectReader v2 detects corrupted data via CRC mismatch" {
+    var writer = ObjectWriter.init(testing.allocator);
+    defer writer.deinit();
+
+    try writer.addDataBlock(1, 0, 5, 5, "original-data");
+    const obj_data = try writer.build();
+    defer testing.allocator.free(obj_data);
+
+    // Corrupt a byte in the data block region (simulate bit-rot)
+    obj_data[0] ^= 0xFF;
+
+    const result = ObjectReader.parse(testing.allocator, obj_data);
+    try testing.expectError(error.ChecksumMismatch, result);
+}
+
+test "ObjectReader v2 detects corrupted index via CRC mismatch" {
+    var writer = ObjectWriter.init(testing.allocator);
+    defer writer.deinit();
+
+    try writer.addDataBlock(1, 0, 5, 5, "some-data");
+    const obj_data = try writer.build();
+    defer testing.allocator.free(obj_data);
+
+    // Corrupt a byte in the index region (after data, before footer)
+    // Index starts after "some-data" (9 bytes), so byte 10 is in the index
+    const data_len = "some-data".len;
+    if (obj_data.len > data_len + 5) {
+        obj_data[data_len + 2] ^= 0xFF;
+    }
+
+    const result = ObjectReader.parse(testing.allocator, obj_data);
+    try testing.expectError(error.ChecksumMismatch, result);
+}
+
+test "ObjectReader v2 detects corrupted footer via CRC mismatch" {
+    var writer = ObjectWriter.init(testing.allocator);
+    defer writer.deinit();
+
+    try writer.addDataBlock(1, 0, 5, 5, "footer-test");
+    const obj_data = try writer.build();
+    defer testing.allocator.free(obj_data);
+
+    // Corrupt the index_position field in the footer (byte at len-20)
+    const footer_pos = obj_data.len - ObjectWriter.FOOTER_SIZE_V2;
+    obj_data[footer_pos] ^= 0xFF;
+
+    const result = ObjectReader.parse(testing.allocator, obj_data);
+    try testing.expectError(error.ChecksumMismatch, result);
+}
+
+test "ObjectReader backward compatibility with v1 format" {
+    // Manually construct a v1-format object (no CRC, old magic)
+    const block_data = "legacy-block-data";
+    var data_buf = std.ArrayList(u8).init(testing.allocator);
+    defer data_buf.deinit();
+
+    // Data block
+    try data_buf.appendSlice(block_data);
+    const index_position = data_buf.items.len;
+
+    // Index entry (36 bytes) for stream_id=1, start_offset=0, end_offset_delta=5, record_count=5
+    var idx_buf: [36]u8 = undefined;
+    std.mem.writeInt(u64, idx_buf[0..8], 1, .big); // stream_id
+    std.mem.writeInt(u64, idx_buf[8..16], 0, .big); // start_offset
+    std.mem.writeInt(u32, idx_buf[16..20], 5, .big); // end_offset_delta
+    std.mem.writeInt(u32, idx_buf[20..24], 5, .big); // record_count
+    std.mem.writeInt(u64, idx_buf[24..32], 0, .big); // block_position
+    std.mem.writeInt(u32, idx_buf[32..36], @intCast(block_data.len), .big); // block_size
+    try data_buf.appendSlice(&idx_buf);
+
+    // v1 footer: index_position(8) + index_size(4) + magic_v1(4) = 16 bytes
+    var footer: [16]u8 = undefined;
+    std.mem.writeInt(u64, footer[0..8], @intCast(index_position), .big);
+    std.mem.writeInt(u32, footer[8..12], 36, .big); // one entry = 36 bytes
+    std.mem.writeInt(u32, footer[12..16], 0x4155544F, .big); // "AUTO" v1 magic
+    try data_buf.appendSlice(&footer);
+
+    const obj_data = try data_buf.toOwnedSlice();
+    defer testing.allocator.free(obj_data);
+
+    // Parse should succeed as v1 (no checksum)
+    var reader = try ObjectReader.parse(testing.allocator, obj_data);
+    defer reader.deinit();
+
+    try testing.expect(!reader.has_checksum);
+    try testing.expectEqual(@as(usize, 1), reader.index_entries.len);
+    try testing.expectEqualStrings(block_data, reader.readBlock(0).?);
+}
+
+test "ObjectWriter empty build with CRC" {
+    var writer = ObjectWriter.init(testing.allocator);
+    defer writer.deinit();
+
+    const obj_data = try writer.build();
+    defer testing.allocator.free(obj_data);
+
+    // Empty object should be exactly FOOTER_SIZE_V2 = 20 bytes
+    try testing.expectEqual(@as(usize, ObjectWriter.FOOTER_SIZE_V2), obj_data.len);
+
+    var reader = try ObjectReader.parse(testing.allocator, obj_data);
+    defer reader.deinit();
+
+    try testing.expect(reader.has_checksum);
+    try testing.expectEqual(@as(usize, 0), reader.index_entries.len);
+}
+
+test "ObjectReader v2 corrupted CRC bytes themselves" {
+    var writer = ObjectWriter.init(testing.allocator);
+    defer writer.deinit();
+
+    try writer.addDataBlock(1, 0, 3, 3, "crc-test");
+    const obj_data = try writer.build();
+    defer testing.allocator.free(obj_data);
+
+    // Corrupt the CRC field itself (last 4 bytes) — flips a bit in stored checksum
+    obj_data[obj_data.len - 1] ^= 0x01;
+
+    const result = ObjectReader.parse(testing.allocator, obj_data);
+    try testing.expectError(error.ChecksumMismatch, result);
 }

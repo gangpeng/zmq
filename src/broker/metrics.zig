@@ -22,6 +22,20 @@ pub fn registerBrokerMetrics(registry: *MetricRegistry) !void {
     try registry.registerGauge("kafka_server_group_count", "Number of consumer groups");
     try registry.registerGauge("kafka_server_topic_count", "Number of topics");
     try registry.registerGauge("kafka_server_member_count", "Number of consumer group members");
+    // Per-API error counter (labeled by api name and error code)
+    try registry.registerLabeledCounter(
+        "kafka_server_api_errors_total",
+        "Total API errors by API name and error code",
+        &.{ "api", "error_code" },
+    );
+    // Consumer lag gauge (labeled by group, topic, partition)
+    try registry.registerLabeledGauge(
+        "kafka_consumer_lag",
+        "Consumer group lag per partition",
+        &.{ "group", "topic", "partition" },
+    );
+    // Active network connections gauge
+    try registry.registerGauge("kafka_network_connections_active", "Number of active network connections");
 }
 
 /// Register S3 I/O metrics (labeled by operation type).
@@ -81,6 +95,10 @@ test "registerBrokerMetrics" {
     try testing.expect(registry.counters.contains("kafka_server_requests_total"));
     try testing.expect(registry.gauges.contains("kafka_server_active_connections"));
     try testing.expect(registry.histograms.contains("kafka_server_request_latency_seconds"));
+    // Sprint 5: per-API error counter, consumer lag, active connections
+    try testing.expect(registry.labeled_counter_meta.contains("kafka_server_api_errors_total"));
+    try testing.expect(registry.labeled_gauge_meta.contains("kafka_consumer_lag"));
+    try testing.expect(registry.gauges.contains("kafka_network_connections_active"));
 }
 
 test "registerS3Metrics" {

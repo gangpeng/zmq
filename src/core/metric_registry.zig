@@ -20,6 +20,10 @@ pub const MetricRegistry = struct {
     labeled_histograms: std.StringHashMap(LabeledHistogramEntry),
     /// Metadata for labeled histogram families (keyed by base name)
     labeled_histogram_meta: std.StringHashMap(LabeledMeta),
+    /// Labeled gauges keyed by "name{label1=\"val1\",label2=\"val2\"}"
+    labeled_gauges: std.StringHashMap(LabeledGaugeEntry),
+    /// Metadata for labeled gauge families (keyed by base name)
+    labeled_gauge_meta: std.StringHashMap(LabeledMeta),
     allocator: Allocator,
     mutex: std.Thread.Mutex = .{},
 
@@ -68,6 +72,11 @@ pub const MetricRegistry = struct {
         value: u64 = 0,
     };
 
+    /// A single labeled gauge instance (one specific label combination).
+    pub const LabeledGaugeEntry = struct {
+        value: f64 = 0,
+    };
+
     /// A single labeled histogram instance (one specific label combination).
     pub const LabeledHistogramEntry = struct {
         count: u64 = 0,
@@ -94,6 +103,8 @@ pub const MetricRegistry = struct {
             .labeled_counter_meta = std.StringHashMap(LabeledMeta).init(alloc),
             .labeled_histograms = std.StringHashMap(LabeledHistogramEntry).init(alloc),
             .labeled_histogram_meta = std.StringHashMap(LabeledMeta).init(alloc),
+            .labeled_gauges = std.StringHashMap(LabeledGaugeEntry).init(alloc),
+            .labeled_gauge_meta = std.StringHashMap(LabeledMeta).init(alloc),
             .allocator = alloc,
         };
     }
@@ -156,6 +167,23 @@ pub const MetricRegistry = struct {
             self.allocator.free(e.key_ptr.*);
         }
         self.labeled_histogram_meta.deinit();
+
+        // Free labeled gauges
+        var lgit = self.labeled_gauges.iterator();
+        while (lgit.next()) |e| {
+            self.allocator.free(e.key_ptr.*);
+        }
+        self.labeled_gauges.deinit();
+
+        var lgmit = self.labeled_gauge_meta.iterator();
+        while (lgmit.next()) |e| {
+            self.allocator.free(e.value_ptr.name);
+            self.allocator.free(e.value_ptr.help);
+            for (e.value_ptr.label_names) |ln| self.allocator.free(ln);
+            self.allocator.free(e.value_ptr.label_names);
+            self.allocator.free(e.key_ptr.*);
+        }
+        self.labeled_gauge_meta.deinit();
     }
 
     /// Register a counter metric.
@@ -216,6 +244,24 @@ pub const MetricRegistry = struct {
             duped_names[i] = try self.allocator.dupe(u8, ln);
         }
         try self.labeled_histogram_meta.put(key, .{
+            .name = try self.allocator.dupe(u8, name),
+            .help = try self.allocator.dupe(u8, help),
+            .label_names = duped_names,
+        });
+    }
+
+    /// Register a labeled gauge family.
+    /// label_names defines the label keys (e.g., &.{"group", "topic", "partition"}).
+    /// Individual label value combinations are created on first set.
+    pub fn registerLabeledGauge(self: *MetricRegistry, name: []const u8, help: []const u8, label_names: []const []const u8) !void {
+        const key = try self.allocator.dupe(u8, name);
+        errdefer self.allocator.free(key);
+        const duped_names = try self.allocator.alloc([]u8, label_names.len);
+        errdefer self.allocator.free(duped_names);
+        for (label_names, 0..) |ln, i| {
+            duped_names[i] = try self.allocator.dupe(u8, ln);
+        }
+        try self.labeled_gauge_meta.put(key, .{
             .name = try self.allocator.dupe(u8, name),
             .help = try self.allocator.dupe(u8, help),
             .label_names = duped_names,
@@ -299,6 +345,22 @@ pub const MetricRegistry = struct {
         }
     }
 
+    /// Set a labeled gauge value. Creates the label combination on first use.
+    /// label_values must match the label_names order from registration.
+    pub fn setLabeledGauge(self: *MetricRegistry, name: []const u8, label_values: []const []const u8, value: f64) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        const key = buildLabelKey(self.allocator, name, label_values) catch return;
+        if (self.labeled_gauges.getPtr(key)) |entry| {
+            self.allocator.free(key);
+            entry.value = value;
+        } else {
+            self.labeled_gauges.put(key, .{ .value = value }) catch {
+                self.allocator.free(key);
+            };
+        }
+    }
+
     /// Build a label key like: "name{label1=\"val1\",label2=\"val2\"}"
     fn buildLabelKey(alloc: Allocator, name: []const u8, label_values: []const []const u8) ![]u8 {
         var buf = std.ArrayList(u8).init(alloc);
@@ -362,6 +424,9 @@ pub const MetricRegistry = struct {
         // Labeled histograms — group by base metric name
         try self.exportLabeledHistograms(writer);
 
+        // Labeled gauges — group by base metric name
+        try self.exportLabeledGauges(writer);
+
         return buf.toOwnedSlice();
     }
 
@@ -422,6 +487,31 @@ pub const MetricRegistry = struct {
                     try writer.print("{s}_bucket{{{s},le=\"+Inf\"}} {d}\n", .{ meta.name, labels_str, h.count });
                     try writer.print("{s}_sum{{{s}}} {d:.6}\n", .{ meta.name, labels_str, h.sum });
                     try writer.print("{s}_count{{{s}}} {d}\n", .{ meta.name, labels_str, h.count });
+                }
+            }
+            try writer.writeByte('\n');
+        }
+    }
+
+    /// Export labeled gauges grouped by base metric name.
+    fn exportLabeledGauges(self: *const MetricRegistry, writer: anytype) !void {
+        var meta_it = self.labeled_gauge_meta.iterator();
+        while (meta_it.next()) |meta_entry| {
+            const meta = meta_entry.value_ptr;
+            try writer.print("# HELP {s} {s}\n", .{ meta.name, meta.help });
+            try writer.print("# TYPE {s} gauge\n", .{meta.name});
+
+            var lg_it = self.labeled_gauges.iterator();
+            while (lg_it.next()) |lg_entry| {
+                const full_key = lg_entry.key_ptr.*;
+                if (std.mem.startsWith(u8, full_key, meta.name) and
+                    full_key.len > meta.name.len and
+                    full_key[meta.name.len] == '{')
+                {
+                    const label_part = full_key[meta.name.len..];
+                    const labels_str = self.buildLabelsString(meta.label_names, label_part) catch continue;
+                    defer self.allocator.free(labels_str);
+                    try writer.print("{s}{{{s}}} {d:.6}\n", .{ meta.name, labels_str, lg_entry.value_ptr.value });
                 }
             }
             try writer.writeByte('\n');
@@ -597,4 +687,32 @@ test "MetricRegistry addLabeledCounter" {
     const download_key = "s3_bytes_total{download}";
     try testing.expectEqual(@as(u64, 3072), registry.labeled_counters.get(upload_key).?.value);
     try testing.expectEqual(@as(u64, 4096), registry.labeled_counters.get(download_key).?.value);
+}
+
+test "MetricRegistry labeled gauge" {
+    var registry = MetricRegistry.init(testing.allocator);
+    defer registry.deinit();
+
+    try registry.registerLabeledGauge("kafka_consumer_lag", "Consumer lag", &.{ "group", "topic", "partition" });
+
+    registry.setLabeledGauge("kafka_consumer_lag", &.{ "my-group", "my-topic", "0" }, 42.0);
+    registry.setLabeledGauge("kafka_consumer_lag", &.{ "my-group", "my-topic", "1" }, 17.0);
+
+    // Verify internal state
+    const key0 = "kafka_consumer_lag{my-group,my-topic,0}";
+    const key1 = "kafka_consumer_lag{my-group,my-topic,1}";
+    try testing.expectEqual(@as(f64, 42.0), registry.labeled_gauges.get(key0).?.value);
+    try testing.expectEqual(@as(f64, 17.0), registry.labeled_gauges.get(key1).?.value);
+
+    // Update existing value
+    registry.setLabeledGauge("kafka_consumer_lag", &.{ "my-group", "my-topic", "0" }, 5.0);
+    try testing.expectEqual(@as(f64, 5.0), registry.labeled_gauges.get(key0).?.value);
+
+    // Verify Prometheus export
+    const output = try registry.exportPrometheus(testing.allocator);
+    defer testing.allocator.free(output);
+
+    try testing.expect(std.mem.indexOf(u8, output, "# TYPE kafka_consumer_lag gauge") != null);
+    try testing.expect(std.mem.indexOf(u8, output, "group=\"my-group\",topic=\"my-topic\",partition=\"0\"") != null);
+    try testing.expect(std.mem.indexOf(u8, output, "group=\"my-group\",topic=\"my-topic\",partition=\"1\"") != null);
 }

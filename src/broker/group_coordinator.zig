@@ -2,6 +2,7 @@ const std = @import("std");
 const testing = std.testing;
 const Allocator = std.mem.Allocator;
 const log = std.log.scoped(.group_coordinator);
+const MetricRegistry = @import("../core/metric_registry.zig").MetricRegistry;
 
 /// Consumer group coordinator.
 ///
@@ -14,6 +15,9 @@ pub const GroupCoordinator = struct {
     groups: std.StringHashMap(ConsumerGroup),
     committed_offsets: std.StringHashMap(i64),
     allocator: Allocator,
+    /// Optional metric registry for emitting consumer lag.
+    /// Wired by the Broker after initialization.
+    metrics: ?*MetricRegistry = null,
 
     pub fn init(alloc: Allocator) GroupCoordinator {
         return .{
@@ -668,6 +672,12 @@ pub const GroupCoordinator = struct {
     /// Commit an offset for a topic-partition in a consumer group.
     /// Also writes to __consumer_offsets partition store if available.
     pub fn commitOffset(self: *GroupCoordinator, group_id: []const u8, topic: []const u8, partition: i32, offset: i64) !void {
+        return self.commitOffsetWithLag(group_id, topic, partition, offset, null);
+    }
+
+    /// Commit an offset and optionally emit consumer lag metric.
+    /// When log_end_offset is provided, lag = log_end_offset - committed_offset.
+    pub fn commitOffsetWithLag(self: *GroupCoordinator, group_id: []const u8, topic: []const u8, partition: i32, offset: i64, log_end_offset: ?i64) !void {
         const key = try std.fmt.allocPrint(self.allocator, "{s}:{s}:{d}", .{ group_id, topic, partition });
         errdefer self.allocator.free(key);
         // Remove old entry if exists (free old key since we have a new one)
@@ -675,6 +685,19 @@ pub const GroupCoordinator = struct {
             self.allocator.free(old.key);
         }
         try self.committed_offsets.put(key, offset);
+
+        // Emit consumer lag metric when both metrics registry and LEO are available
+        if (self.metrics) |m| {
+            var part_buf: [16]u8 = undefined;
+            const part_str = std.fmt.bufPrint(&part_buf, "{d}", .{partition}) catch return;
+            if (log_end_offset) |leo| {
+                const lag: f64 = @floatFromInt(@max(leo - offset, 0));
+                m.setLabeledGauge("kafka_consumer_lag", &.{ group_id, topic, part_str }, lag);
+            } else {
+                // Without LEO, set lag to 0 (best effort — exact lag computed when LEO is available)
+                m.setLabeledGauge("kafka_consumer_lag", &.{ group_id, topic, part_str }, 0.0);
+            }
+        }
     }
 
     /// Fetch committed offset for a topic-partition in a consumer group.
@@ -1583,4 +1606,76 @@ test "GroupCoordinator multiple groups independent state and offsets" {
     // Offsets are still correct after state changes
     const alpha_offset2 = try coord.fetchOffset("group-alpha", "shared-topic", 0);
     try testing.expectEqual(@as(i64, 100), alpha_offset2.?);
+}
+
+test "GroupCoordinator commitOffsetWithLag emits lag metric" {
+    var registry = MetricRegistry.init(testing.allocator);
+    defer registry.deinit();
+
+    try registry.registerLabeledGauge("kafka_consumer_lag", "Consumer lag", &.{ "group", "topic", "partition" });
+
+    var coord = GroupCoordinator.init(testing.allocator);
+    defer coord.deinit();
+    coord.metrics = &registry;
+
+    // Commit offset 5 with LEO 10 → lag = 5
+    try coord.commitOffsetWithLag("test-grp", "test-topic", 0, 5, 10);
+
+    const key = "kafka_consumer_lag{test-grp,test-topic,0}";
+    const entry = registry.labeled_gauges.get(key);
+    try testing.expect(entry != null);
+    try testing.expectEqual(@as(f64, 5.0), entry.?.value);
+}
+
+test "GroupCoordinator commitOffsetWithLag updates lag on subsequent commits" {
+    var registry = MetricRegistry.init(testing.allocator);
+    defer registry.deinit();
+
+    try registry.registerLabeledGauge("kafka_consumer_lag", "Consumer lag", &.{ "group", "topic", "partition" });
+
+    var coord = GroupCoordinator.init(testing.allocator);
+    defer coord.deinit();
+    coord.metrics = &registry;
+
+    // Initial commit: lag = 10 - 3 = 7
+    try coord.commitOffsetWithLag("grp1", "topic1", 0, 3, 10);
+
+    const key = "kafka_consumer_lag{grp1,topic1,0}";
+    try testing.expectEqual(@as(f64, 7.0), registry.labeled_gauges.get(key).?.value);
+
+    // Consumer catches up: lag = 10 - 10 = 0
+    try coord.commitOffsetWithLag("grp1", "topic1", 0, 10, 10);
+    try testing.expectEqual(@as(f64, 0.0), registry.labeled_gauges.get(key).?.value);
+}
+
+test "GroupCoordinator commitOffsetWithLag handles null LEO" {
+    var registry = MetricRegistry.init(testing.allocator);
+    defer registry.deinit();
+
+    try registry.registerLabeledGauge("kafka_consumer_lag", "Consumer lag", &.{ "group", "topic", "partition" });
+
+    var coord = GroupCoordinator.init(testing.allocator);
+    defer coord.deinit();
+    coord.metrics = &registry;
+
+    // Commit without LEO → lag defaults to 0
+    try coord.commitOffsetWithLag("grp2", "topic2", 1, 5, null);
+
+    const key = "kafka_consumer_lag{grp2,topic2,1}";
+    const entry = registry.labeled_gauges.get(key);
+    try testing.expect(entry != null);
+    try testing.expectEqual(@as(f64, 0.0), entry.?.value);
+}
+
+test "GroupCoordinator commitOffsetWithLag without metrics does not crash" {
+    var coord = GroupCoordinator.init(testing.allocator);
+    defer coord.deinit();
+
+    // No metrics wired — should not crash
+    try coord.commitOffsetWithLag("grp3", "topic3", 0, 5, 10);
+    try coord.commitOffset("grp3", "topic3", 1, 3);
+
+    // Offset should still be committed
+    const offset = try coord.fetchOffset("grp3", "topic3", 0);
+    try testing.expectEqual(@as(i64, 5), offset.?);
 }

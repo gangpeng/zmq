@@ -95,6 +95,13 @@ pub fn build(b: *std.Build) void {
     broker_mod.addImport("concurrency", concurrency_mod);
     broker_mod.addImport("compression", compression_mod);
 
+    // Security (TLS, SASL/PLAIN, SCRAM-SHA-256, ACL, JWT)
+    const security_mod = b.addModule("security", .{
+        .root_source_file = b.path("src/security.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
     // ---------------------------------------------------------------
     // Main executable – the AutoMQ broker
     // ---------------------------------------------------------------
@@ -174,6 +181,23 @@ pub fn build(b: *std.Build) void {
 
         const run_t = b.addRunArtifact(t);
         test_step.dependOn(&run_t.step);
+    }
+
+    // Integration test: production readiness validation
+    {
+        const integration_test = b.addTest(.{
+            .root_source_file = b.path("tests/production_readiness_test.zig"),
+            .target = target,
+            .optimize = optimize,
+        });
+        integration_test.root_module.addImport("core", core_mod);
+        integration_test.root_module.addImport("storage", storage_mod);
+        integration_test.root_module.addImport("security", security_mod);
+        integration_test.root_module.addImport("network", network_mod);
+        integration_test.linkLibC();
+
+        const run_integration = b.addRunArtifact(integration_test);
+        test_step.dependOn(&run_integration.step);
     }
 
     // ---------------------------------------------------------------

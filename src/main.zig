@@ -26,12 +26,28 @@ var global_server: ?*Server = null;
 var global_controller_server: ?*Server = null;
 var global_metrics_server: ?*MetricsServer = null;
 var global_shutdown: bool = false;
+/// Global broker pointer for shutdown WAL flush/snapshot.
+var global_broker_ptr: ?*Broker = null;
+/// Global controller pointer for Raft snapshot during shutdown.
+var global_controller_ptr: ?*Controller = null;
 
 fn handleSignal(sig: i32) callconv(.C) void {
     _ = sig;
+    if (global_shutdown) {
+        // Second signal: force immediate shutdown (no drain)
+        if (global_server) |s| s.stop();
+        if (global_controller_server) |s| s.stop();
+        if (global_metrics_server) |m| m.stop();
+        return;
+    }
     global_shutdown = true;
-    if (global_server) |s| s.stop();
-    if (global_controller_server) |s| s.stop();
+    // Tell the broker to reject new requests during drain
+    if (global_broker_ptr) |brk| {
+        brk.is_shutting_down = true;
+    }
+    // Initiate graceful drain on all servers (stop accepting, wait for in-flight)
+    if (global_server) |s| s.initiateGracefulDrain();
+    if (global_controller_server) |s| s.initiateGracefulDrain();
     if (global_metrics_server) |m| m.stop();
 }
 
@@ -237,10 +253,12 @@ pub fn main() !void {
         }
 
         handler_routing.setGlobalController(ctrl);
+        global_controller_ptr = ctrl;
     }
     defer if (controller) |ctrl| {
         ctrl.deinit();
         alloc.destroy(ctrl);
+        global_controller_ptr = null;
     };
     defer if (raft_pool) |*p| p.deinit();
 
@@ -285,11 +303,13 @@ pub fn main() !void {
 
         handler.setGlobalBroker(brk);
         handler_routing.setGlobalBroker(brk);
+        global_broker_ptr = brk;
     }
     defer if (broker) |brk| {
         log.info("Shutting down broker (persisting metadata)...", .{});
         brk.deinit();
         alloc.destroy(brk);
+        global_broker_ptr = null;
     };
 
     // ═══════════════════════════════════════════════════════════
@@ -457,6 +477,10 @@ pub fn main() !void {
         if (tls_ctx) |*ctx| {
             server.tls_context = ctx;
         }
+        // Wire metrics registry into server for active connection tracking
+        if (broker) |brk| {
+            server.metrics = &brk.metrics;
+        }
         // Wire up group commit flush callbacks for S3 WAL batching
         server.batch_flush_fn = &handler_routing.brokerFlushPendingWal;
         server.has_pending_flush_fn = &handler_routing.brokerHasPendingFlush;
@@ -465,9 +489,18 @@ pub fn main() !void {
             server.stop();
             global_server = null;
         }
+        // Signal readiness after all setup is complete
+        if (global_metrics_server) |ms| {
+            ms.startup_complete = true;
+        }
         server.serve() catch |err| {
             log.info("Broker server stopped: {}", .{err});
         };
+
+        // Graceful shutdown sequence: flush WAL and take snapshots before exit.
+        // The server's epoll loop has exited (connections drained or timeout),
+        // so we now persist all in-flight data to S3.
+        performGracefulShutdown(broker, controller);
     } else {
         // Controller-only: controller server on main thread
         var ctrl_server = try Server.init(alloc, "0.0.0.0", controller_port, &handler_routing.controllerHandleRequest, num_workers);
@@ -479,9 +512,42 @@ pub fn main() !void {
         ctrl_server.serve() catch |err| {
             log.info("Controller server stopped: {}", .{err});
         };
+
+        // Controller-only shutdown: take Raft snapshot
+        performGracefulShutdown(null, controller);
     }
 
     log.info("Server stopped.", .{});
+}
+
+/// Graceful shutdown sequence: flush pending data and take snapshots.
+///
+/// Called after the server's epoll loop has exited (connections drained or drain
+/// timeout reached). This ensures all buffered WAL data reaches S3 and metadata
+/// snapshots are persisted before the process exits.
+///
+/// Shutdown order follows AutoMQ's approach:
+/// 1. Flush WAL to S3 (ensures no produce data is lost)
+/// 2. Take Raft snapshot (persists committed log entries)
+/// 3. Broker deinit (persist topics, offsets) happens in defer
+fn performGracefulShutdown(broker_opt: ?*Broker, controller_opt: ?*Controller) void {
+    log.info("Graceful shutdown: starting cleanup sequence", .{});
+
+    // Step 1: Flush pending WAL data to S3
+    if (broker_opt) |brk| {
+        const wal_ok = brk.shutdownFlushWal();
+        if (!wal_ok) {
+            log.warn("Graceful shutdown: WAL flush failed, some data may not have reached S3", .{});
+        }
+    }
+
+    // Step 2: Take Raft snapshot (truncates committed log, persists metadata)
+    if (controller_opt) |ctrl| {
+        ctrl.raft_state.takeSnapshot();
+        log.info("Graceful shutdown: Raft snapshot taken (commit_index={d})", .{ctrl.raft_state.commit_index});
+    }
+
+    log.info("Graceful shutdown: cleanup sequence complete", .{});
 }
 
 fn parseAndRegisterVoters(raft: *RaftState, voters: []const u8, pool: *RaftClientPool) void {
