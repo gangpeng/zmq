@@ -48,6 +48,11 @@ pub const RaftState = struct {
     /// Optional Prometheus metric registry for Raft consensus observability.
     metrics: ?*MetricRegistry = null,
 
+    /// Serialized PreparedObjectRegistry data to persist alongside Raft snapshot.
+    /// Set by the broker before calling takeSnapshot(), cleared after persistence.
+    /// Ownership: caller-owned; RaftState does NOT free this on deinit.
+    prepared_registry_data: ?[]const u8 = null,
+
     pub const Role = enum {
         unattached,
         follower,
@@ -783,6 +788,14 @@ pub const RaftState = struct {
         // Persist snapshot metadata
         if (self.data_dir) |dir| {
             self.persistSnapshotMeta(dir) catch {};
+
+            // Persist prepared object registry alongside the Raft snapshot.
+            // This ensures prepared objects survive Raft log truncation.
+            if (self.prepared_registry_data) |reg_data| {
+                self.persistPreparedRegistry(dir, reg_data) catch |err| {
+                    log.warn("Failed to persist prepared.snapshot: {}", .{err});
+                };
+            }
         }
 
         if (self.metrics) |m| {
@@ -825,6 +838,45 @@ pub const RaftState = struct {
         self.last_snapshot_offset = std.mem.readInt(u64, buf[0..8], .big);
         self.last_snapshot_epoch = std.mem.readInt(i32, buf[8..12], .big);
         return true;
+    }
+
+    /// Persist the PreparedObjectRegistry binary data to {data_dir}/prepared.snapshot.
+    fn persistPreparedRegistry(self: *RaftState, dir: []const u8, data: []const u8) !void {
+        const path = try std.fmt.allocPrint(self.allocator, "{s}/prepared.snapshot", .{dir});
+        defer self.allocator.free(path);
+
+        const file = try fs.createFileAbsolute(path, .{ .truncate = true });
+        defer file.close();
+
+        try file.writeAll(data);
+        log.info("Persisted prepared.snapshot ({d} bytes)", .{data.len});
+    }
+
+    /// Load persisted PreparedObjectRegistry data from {data_dir}/prepared.snapshot.
+    /// Returns the raw bytes (caller-owned) or null if the file doesn't exist.
+    pub fn loadPreparedRegistry(self: *RaftState) ?[]u8 {
+        const dir = self.data_dir orelse return null;
+        const path = std.fmt.allocPrint(self.allocator, "{s}/prepared.snapshot", .{dir}) catch return null;
+        defer self.allocator.free(path);
+
+        const file = fs.openFileAbsolute(path, .{}) catch return null;
+        defer file.close();
+
+        const stat = file.stat() catch return null;
+        if (stat.size == 0) return null;
+
+        const buf = self.allocator.alloc(u8, stat.size) catch return null;
+        const n = file.readAll(buf) catch {
+            self.allocator.free(buf);
+            return null;
+        };
+        if (n != stat.size) {
+            self.allocator.free(buf);
+            return null;
+        }
+
+        log.info("Loaded prepared.snapshot ({d} bytes)", .{n});
+        return buf;
     }
 };
 

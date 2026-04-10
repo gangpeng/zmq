@@ -664,6 +664,11 @@ pub const Broker = struct {
         if (self.compaction_manager) |*cm| {
             cm.maybeCompact();
         }
+
+        // Rotate dual-buffer prepared object registry if the 60-minute interval
+        // has elapsed. This discards the oldest buffer and moves current → previous,
+        // matching AutoMQ's ScheduledExecutorService-based rotation.
+        self.object_manager.prepared_registry.maybeRotate();
     }
 
     /// Enforce retention policies for all topics.

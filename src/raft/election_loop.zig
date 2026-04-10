@@ -23,6 +23,12 @@ pub const ElectionLoop = struct {
     broker_tick_fn: ?*const fn () void = null,
     /// Raft client pool for sending RPCs to peers (multi-node).
     raft_client_pool: ?*RaftClientPool = null,
+    /// Optional callback invoked before each Raft snapshot to serialize the
+    /// PreparedObjectRegistry. Returns serialized data that is set on
+    /// raft_state.prepared_registry_data before takeSnapshot() persists it.
+    pre_snapshot_fn: ?*const fn () ?[]const u8 = null,
+    /// Allocator for freeing pre_snapshot_fn results.
+    snapshot_allocator: ?std.mem.Allocator = null,
 
     pub fn run(self: *ElectionLoop) void {
         log.info("Election loop started for node {d}", .{self.raft_state.node_id});
@@ -104,7 +110,19 @@ pub const ElectionLoop = struct {
             // Periodic snapshot check (every ~10 seconds)
             if (self.tick_counter % 100 == 0) {
                 if (self.raft_state.shouldSnapshot(1000)) {
+                    // Serialize prepared object registry before snapshot so it
+                    // survives Raft log truncation
+                    if (self.pre_snapshot_fn) |pre_fn| {
+                        self.raft_state.prepared_registry_data = pre_fn();
+                    }
                     self.raft_state.takeSnapshot();
+                    // Free serialized data after persistence
+                    if (self.raft_state.prepared_registry_data) |d| {
+                        if (self.snapshot_allocator) |sa| {
+                            sa.free(d);
+                        }
+                        self.raft_state.prepared_registry_data = null;
+                    }
                 }
             }
         }

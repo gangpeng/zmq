@@ -31,6 +31,16 @@ var global_broker_ptr: ?*Broker = null;
 /// Global controller pointer for Raft snapshot during shutdown.
 var global_controller_ptr: ?*Controller = null;
 
+/// Callback for ElectionLoop: serialize the PreparedObjectRegistry before
+/// each Raft snapshot so prepared objects survive log truncation.
+fn serializePreparedRegistry() ?[]const u8 {
+    const brk = global_broker_ptr orelse return null;
+    return brk.object_manager.prepared_registry.serialize(brk.allocator) catch |err| {
+        log.warn("Failed to serialize prepared registry for snapshot: {}", .{err});
+        return null;
+    };
+}
+
 fn handleSignal(sig: i32) callconv(.C) void {
     _ = sig;
     if (global_shutdown) {
@@ -301,6 +311,18 @@ pub fn main() !void {
             return;
         };
 
+        // Load persisted PreparedObjectRegistry from the Raft data directory.
+        // This restores prepared object tracking that survived across a restart,
+        // protecting against data loss when the Raft log is truncated by a snapshot.
+        if (controller) |ctrl| {
+            if (ctrl.raft_state.loadPreparedRegistry()) |reg_data| {
+                defer alloc.free(reg_data);
+                brk.object_manager.prepared_registry.deserialize(reg_data) catch |err| {
+                    log.warn("Failed to load prepared.snapshot: {s}", .{@errorName(err)});
+                };
+            }
+        }
+
         handler.setGlobalBroker(brk);
         handler_routing.setGlobalBroker(brk);
         global_broker_ptr = brk;
@@ -350,6 +372,8 @@ pub fn main() !void {
             .raft_state = &ctrl.raft_state,
             .should_stop = &global_shutdown,
             .raft_client_pool = if (raft_pool != null) &(raft_pool.?) else null,
+            .pre_snapshot_fn = if (broker != null) &serializePreparedRegistry else null,
+            .snapshot_allocator = if (broker != null) alloc else null,
         };
         if (election_state.raft_client_pool != null) {
             log.info("Election loop: RaftClientPool configured with peers", .{});
@@ -543,9 +567,20 @@ fn performGracefulShutdown(broker_opt: ?*Broker, controller_opt: ?*Controller) v
         }
     }
 
-    // Step 2: Take Raft snapshot (truncates committed log, persists metadata)
+    // Step 2: Serialize prepared object registry and take Raft snapshot.
+    // The prepared registry must be serialized BEFORE the snapshot truncates the
+    // Raft log, because prepared entries in the truncated log portion would be lost.
     if (controller_opt) |ctrl| {
+        if (broker_opt) |brk| {
+            const reg_data = brk.object_manager.prepared_registry.serialize(ctrl.raft_state.allocator) catch null;
+            ctrl.raft_state.prepared_registry_data = reg_data;
+        }
         ctrl.raft_state.takeSnapshot();
+        // Free the serialized data after snapshot persistence
+        if (ctrl.raft_state.prepared_registry_data) |d| {
+            ctrl.raft_state.allocator.free(d);
+            ctrl.raft_state.prepared_registry_data = null;
+        }
         log.info("Graceful shutdown: Raft snapshot taken (commit_index={d})", .{ctrl.raft_state.commit_index});
     }
 

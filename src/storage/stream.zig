@@ -268,6 +268,10 @@ pub const ObjectManager = struct {
     // Secondary index: streamId → list of StreamSetObject IDs containing this stream
     stream_sso_index: std.AutoHashMap(u64, std.ArrayList(u64)),
 
+    /// Dual-buffer registry that tracks prepared object IDs across Raft snapshot
+    /// truncations. See PreparedObjectRegistry for the AutoMQ design rationale.
+    prepared_registry: PreparedObjectRegistry,
+
     pub fn init(allocator: Allocator, node_id: i32) ObjectManager {
         return .{
             .allocator = allocator,
@@ -277,6 +281,7 @@ pub const ObjectManager = struct {
             .stream_objects = std.AutoHashMap(u64, StreamObject).init(allocator),
             .stream_object_index = std.AutoHashMap(u64, std.ArrayList(u64)).init(allocator),
             .stream_sso_index = std.AutoHashMap(u64, std.ArrayList(u64)).init(allocator),
+            .prepared_registry = PreparedObjectRegistry.init(allocator),
         };
     }
 
@@ -314,6 +319,8 @@ pub const ObjectManager = struct {
             entry.value_ptr.deinit();
         }
         self.stream_sso_index.deinit();
+
+        self.prepared_registry.deinit();
     }
 
     // ---- Stream lifecycle ----
@@ -522,6 +529,9 @@ pub const ObjectManager = struct {
         });
         // Prepared objects are not added to stream_object_index because they
         // have no valid offset range yet and should not appear in fetch queries.
+
+        // Track in dual-buffer registry so prepared state survives Raft snapshot truncation
+        self.prepared_registry.trackPreparedAt(object_id, now_ms);
     }
 
     /// Expire prepared objects that have exceeded their TTL.
@@ -555,6 +565,7 @@ pub const ObjectManager = struct {
         for (expired_so_ids.items) |obj_id| {
             log.info("Expiring prepared SO {d} (exceeded TTL of {d}ms)", .{ obj_id, prepared_ttl_ms });
             self.removeStreamObject(obj_id);
+            self.prepared_registry.untrackPrepared(obj_id);
             expired_count += 1;
         }
 
@@ -575,6 +586,7 @@ pub const ObjectManager = struct {
         for (expired_sso_ids.items) |obj_id| {
             log.info("Expiring prepared SSO {d} (exceeded TTL of {d}ms)", .{ obj_id, prepared_ttl_ms });
             self.removeStreamSetObject(obj_id);
+            self.prepared_registry.untrackPrepared(obj_id);
             expired_count += 1;
         }
 
@@ -690,6 +702,9 @@ pub const ObjectManager = struct {
             }
             try gop.value_ptr.append(object_id);
         }
+
+        // Object committed — remove from prepared tracking (if it was prepared)
+        self.prepared_registry.untrackPrepared(object_id);
     }
 
     /// Register a StreamObject (single-stream, compaction output).
@@ -723,6 +738,13 @@ pub const ObjectManager = struct {
             self.next_object_id = object_id + 1;
         }
 
+        // Free old entry's s3_key if this object was previously registered as
+        // prepared (prepared → committed lifecycle). Without this, the dupe'd
+        // key from registerPreparedStreamObjectAt() would leak.
+        if (self.stream_objects.getPtr(object_id)) |old| {
+            self.allocator.free(old.s3_key);
+        }
+
         const key_copy = try self.allocator.dupe(u8, s3_key);
 
         try self.stream_objects.put(object_id, .{
@@ -751,9 +773,10 @@ pub const ObjectManager = struct {
             }
         }
         try gop.value_ptr.insert(insert_pos, object_id);
-    }
 
-    /// Remove a StreamSetObject from the registry.
+        // Object committed — remove from prepared tracking (if it was prepared)
+        self.prepared_registry.untrackPrepared(object_id);
+    }
     pub fn removeStreamSetObject(self: *ObjectManager, object_id: u64) void {
         if (self.stream_set_objects.fetchRemove(object_id)) |kv| {
             var sso = kv.value;
@@ -1371,6 +1394,291 @@ pub const ObjectManager = struct {
         if (pos.* + 2 > data.len) return null;
         const value = std.mem.littleToNative(u16, @as(*align(1) const u16, @ptrCast(data.ptr + pos.*)).*);
         pos.* += 2;
+        return value;
+    }
+};
+
+// ---------------------------------------------------------------
+// PreparedObjectRegistry — dual-buffer for snapshot safety
+// ---------------------------------------------------------------
+
+/// Dual-buffer registry for prepared S3 objects.
+///
+/// NOTE: AutoMQ uses `preparedObjects0`/`preparedObjects1` in the controller's
+/// S3ObjectControlManager, swapped every 60 minutes via a ScheduledExecutorService.
+/// ZMQ uses the same dual-buffer approach but driven by the broker's tick() timer.
+///
+/// The dual-buffer protects against losing prepared object tracking when the Raft
+/// log is truncated by a snapshot. Prepared entries in the truncated portion of the
+/// log would be lost — but the dual-buffer preserves them until the next rotation.
+/// On controller restart, the surviving buffer is loaded from the persisted snapshot.
+pub const PreparedObjectRegistry = struct {
+    /// Current buffer — new prepared objects are tracked here.
+    current: std.AutoHashMap(u64, PreparedEntry),
+    /// Previous buffer — preserved from the last rotation, contains older prepared
+    /// objects that may have been in the Raft log section that was truncated.
+    previous: std.AutoHashMap(u64, PreparedEntry),
+    /// Timestamp (ms) of the last buffer rotation.
+    last_rotation_ms: i64,
+    /// Rotation interval in milliseconds (default 60 minutes, matching AutoMQ).
+    rotation_interval_ms: i64,
+    allocator: Allocator,
+
+    pub const PreparedEntry = struct {
+        object_id: u64,
+        prepared_at_ms: i64,
+    };
+
+    /// Binary format version for PreparedObjectRegistry snapshots.
+    /// Separate from ObjectManager's SNAPSHOT_VERSION since this is an
+    /// independent file (prepared.snapshot).
+    const REGISTRY_VERSION: u8 = 1;
+
+    pub fn init(alloc: Allocator) PreparedObjectRegistry {
+        return .{
+            .current = std.AutoHashMap(u64, PreparedEntry).init(alloc),
+            .previous = std.AutoHashMap(u64, PreparedEntry).init(alloc),
+            .last_rotation_ms = std.time.milliTimestamp(),
+            .rotation_interval_ms = 60 * 60 * 1000, // 60 minutes
+            .allocator = alloc,
+        };
+    }
+
+    /// Init with an explicit start time for testability.
+    pub fn initWithTime(alloc: Allocator, now_ms: i64) PreparedObjectRegistry {
+        return .{
+            .current = std.AutoHashMap(u64, PreparedEntry).init(alloc),
+            .previous = std.AutoHashMap(u64, PreparedEntry).init(alloc),
+            .last_rotation_ms = now_ms,
+            .rotation_interval_ms = 60 * 60 * 1000,
+            .allocator = alloc,
+        };
+    }
+
+    pub fn deinit(self: *PreparedObjectRegistry) void {
+        self.current.deinit();
+        self.previous.deinit();
+    }
+
+    /// Register a newly prepared object in the current buffer.
+    pub fn trackPrepared(self: *PreparedObjectRegistry, object_id: u64) void {
+        self.trackPreparedAt(object_id, std.time.milliTimestamp());
+    }
+
+    /// Register a newly prepared object with an explicit timestamp for testability.
+    pub fn trackPreparedAt(self: *PreparedObjectRegistry, object_id: u64, now_ms: i64) void {
+        self.current.put(object_id, .{
+            .object_id = object_id,
+            .prepared_at_ms = now_ms,
+        }) catch |err| {
+            log.warn("Failed to track prepared object {d}: {}", .{ object_id, err });
+        };
+    }
+
+    /// Remove a prepared object from both buffers (called when committed or expired).
+    pub fn untrackPrepared(self: *PreparedObjectRegistry, object_id: u64) void {
+        _ = self.current.remove(object_id);
+        _ = self.previous.remove(object_id);
+    }
+
+    /// Rotate buffers if the rotation interval has elapsed.
+    /// Discards the previous buffer, moves current to previous, creates a new current.
+    pub fn maybeRotate(self: *PreparedObjectRegistry) void {
+        self.maybeRotateAt(std.time.milliTimestamp());
+    }
+
+    /// Rotate with an explicit timestamp for testability.
+    pub fn maybeRotateAt(self: *PreparedObjectRegistry, now_ms: i64) void {
+        if (now_ms - self.last_rotation_ms < self.rotation_interval_ms) return;
+
+        // Discard the previous buffer, move current → previous
+        self.previous.deinit();
+        self.previous = self.current;
+        self.current = std.AutoHashMap(u64, PreparedEntry).init(self.allocator);
+        self.last_rotation_ms = now_ms;
+
+        log.debug("PreparedObjectRegistry rotated: previous={d} entries", .{self.previous.count()});
+    }
+
+    /// Get all tracked prepared object IDs from both buffers.
+    /// Caller owns the returned slice.
+    pub fn getAllPreparedIds(self: *const PreparedObjectRegistry, alloc: Allocator) ![]u64 {
+        // Use a set to deduplicate IDs that appear in both buffers
+        // (an object tracked before rotation exists in both)
+        var id_set = std.AutoHashMap(u64, void).init(alloc);
+        defer id_set.deinit();
+
+        var cur_it = self.current.iterator();
+        while (cur_it.next()) |entry| {
+            try id_set.put(entry.key_ptr.*, {});
+        }
+        var prev_it = self.previous.iterator();
+        while (prev_it.next()) |entry| {
+            try id_set.put(entry.key_ptr.*, {});
+        }
+
+        var result = try alloc.alloc(u64, id_set.count());
+        var i: usize = 0;
+        var set_it = id_set.keyIterator();
+        while (set_it.next()) |key| {
+            result[i] = key.*;
+            i += 1;
+        }
+        return result;
+    }
+
+    /// Return the total number of unique prepared IDs across both buffers.
+    pub fn count(self: *const PreparedObjectRegistry) usize {
+        // Count unique IDs — entries in current may also be in previous after rotation
+        var total = self.previous.count();
+        var cur_it = self.current.iterator();
+        while (cur_it.next()) |entry| {
+            if (!self.previous.contains(entry.key_ptr.*)) {
+                total += 1;
+            }
+        }
+        return total;
+    }
+
+    /// Check whether a given object ID is tracked in either buffer.
+    pub fn contains(self: *const PreparedObjectRegistry, object_id: u64) bool {
+        return self.current.contains(object_id) or self.previous.contains(object_id);
+    }
+
+    /// Serialize to binary for persistence alongside Raft snapshot.
+    ///
+    /// Format:
+    ///   [1 byte]  version
+    ///   [8 bytes] last_rotation_ms (i64)
+    ///   [8 bytes] rotation_interval_ms (i64)
+    ///   [4 bytes] current_count (u32)
+    ///   For each current entry:
+    ///     [8 bytes] object_id (u64)
+    ///     [8 bytes] prepared_at_ms (i64)
+    ///   [4 bytes] previous_count (u32)
+    ///   For each previous entry:
+    ///     [8 bytes] object_id (u64)
+    ///     [8 bytes] prepared_at_ms (i64)
+    pub fn serialize(self: *const PreparedObjectRegistry, alloc: Allocator) ![]u8 {
+        const entry_size = 16; // 8 (object_id) + 8 (prepared_at_ms)
+        const size: usize = 1 + 8 + 8 + 4 + (self.current.count() * entry_size) + 4 + (self.previous.count() * entry_size);
+
+        var buf = try alloc.alloc(u8, size);
+        errdefer alloc.free(buf);
+        var pos: usize = 0;
+
+        // Version
+        buf[pos] = REGISTRY_VERSION;
+        pos += 1;
+
+        // Timestamps
+        writeI64(buf, &pos, self.last_rotation_ms);
+        writeI64(buf, &pos, self.rotation_interval_ms);
+
+        // Current buffer
+        writeU32(buf, &pos, @intCast(self.current.count()));
+        var cur_it = self.current.iterator();
+        while (cur_it.next()) |entry| {
+            writeU64(buf, &pos, entry.value_ptr.object_id);
+            writeI64(buf, &pos, entry.value_ptr.prepared_at_ms);
+        }
+
+        // Previous buffer
+        writeU32(buf, &pos, @intCast(self.previous.count()));
+        var prev_it = self.previous.iterator();
+        while (prev_it.next()) |entry| {
+            writeU64(buf, &pos, entry.value_ptr.object_id);
+            writeI64(buf, &pos, entry.value_ptr.prepared_at_ms);
+        }
+
+        std.debug.assert(pos == size);
+        return buf;
+    }
+
+    /// Deserialize from binary produced by serialize(). Replaces current state.
+    pub fn deserialize(self: *PreparedObjectRegistry, data: []const u8) !void {
+        if (data.len < 1) return error.CorruptSnapshot;
+
+        var pos: usize = 0;
+
+        const version = data[pos];
+        pos += 1;
+        if (version != REGISTRY_VERSION) return error.UnsupportedSnapshotVersion;
+
+        const last_rotation = readI64(data, &pos) orelse return error.CorruptSnapshot;
+        const rotation_interval = readI64(data, &pos) orelse return error.CorruptSnapshot;
+
+        // Current buffer
+        const cur_count = readU32(data, &pos) orelse return error.CorruptSnapshot;
+        var new_current = std.AutoHashMap(u64, PreparedEntry).init(self.allocator);
+        errdefer new_current.deinit();
+        var ci: u32 = 0;
+        while (ci < cur_count) : (ci += 1) {
+            const oid = readU64(data, &pos) orelse return error.CorruptSnapshot;
+            const ts = readI64(data, &pos) orelse return error.CorruptSnapshot;
+            try new_current.put(oid, .{ .object_id = oid, .prepared_at_ms = ts });
+        }
+
+        // Previous buffer
+        const prev_count = readU32(data, &pos) orelse return error.CorruptSnapshot;
+        var new_previous = std.AutoHashMap(u64, PreparedEntry).init(self.allocator);
+        errdefer new_previous.deinit();
+        var pi: u32 = 0;
+        while (pi < prev_count) : (pi += 1) {
+            const oid = readU64(data, &pos) orelse return error.CorruptSnapshot;
+            const ts = readI64(data, &pos) orelse return error.CorruptSnapshot;
+            try new_previous.put(oid, .{ .object_id = oid, .prepared_at_ms = ts });
+        }
+
+        if (pos != data.len) return error.CorruptSnapshot;
+
+        // Success — replace internal state atomically
+        self.current.deinit();
+        self.previous.deinit();
+        self.current = new_current;
+        self.previous = new_previous;
+        self.last_rotation_ms = last_rotation;
+        self.rotation_interval_ms = rotation_interval;
+
+        log.info("PreparedObjectRegistry loaded: current={d}, previous={d}", .{ cur_count, prev_count });
+    }
+
+    // Re-use ObjectManager's binary helpers (they are private to ObjectManager,
+    // so we define local wrappers that delegate to the same encoding).
+
+    fn writeU64(buf: []u8, pos: *usize, value: u64) void {
+        @as(*align(1) u64, @ptrCast(buf.ptr + pos.*)).* = std.mem.nativeToLittle(u64, value);
+        pos.* += 8;
+    }
+
+    fn writeI64(buf: []u8, pos: *usize, value: i64) void {
+        @as(*align(1) i64, @ptrCast(buf.ptr + pos.*)).* = std.mem.nativeToLittle(i64, value);
+        pos.* += 8;
+    }
+
+    fn writeU32(buf: []u8, pos: *usize, value: u32) void {
+        @as(*align(1) u32, @ptrCast(buf.ptr + pos.*)).* = std.mem.nativeToLittle(u32, value);
+        pos.* += 4;
+    }
+
+    fn readU64(data: []const u8, pos: *usize) ?u64 {
+        if (pos.* + 8 > data.len) return null;
+        const value = std.mem.littleToNative(u64, @as(*align(1) const u64, @ptrCast(data.ptr + pos.*)).*);
+        pos.* += 8;
+        return value;
+    }
+
+    fn readI64(data: []const u8, pos: *usize) ?i64 {
+        if (pos.* + 8 > data.len) return null;
+        const value = std.mem.littleToNative(i64, @as(*align(1) const i64, @ptrCast(data.ptr + pos.*)).*);
+        pos.* += 8;
+        return value;
+    }
+
+    fn readU32(data: []const u8, pos: *usize) ?u32 {
+        if (pos.* + 4 > data.len) return null;
+        const value = std.mem.littleToNative(u32, @as(*align(1) const u32, @ptrCast(data.ptr + pos.*)).*);
+        pos.* += 4;
         return value;
     }
 };
@@ -2562,4 +2870,320 @@ test "ObjectManager collectDestroyedObjects handles mixed SO and SSO" {
     try testing.expectEqual(@as(usize, 2), keys.len);
     try testing.expectEqual(@as(usize, 0), om.getStreamObjectCount());
     try testing.expectEqual(@as(usize, 0), om.getStreamSetObjectCount());
+}
+
+// ---------------------------------------------------------------
+// PreparedObjectRegistry Tests
+// ---------------------------------------------------------------
+
+test "PreparedObjectRegistry tracks objects in current buffer" {
+    var reg = PreparedObjectRegistry.initWithTime(testing.allocator, 1000);
+    defer reg.deinit();
+
+    reg.trackPreparedAt(10, 1000);
+    reg.trackPreparedAt(20, 1001);
+    reg.trackPreparedAt(30, 1002);
+
+    try testing.expect(reg.contains(10));
+    try testing.expect(reg.contains(20));
+    try testing.expect(reg.contains(30));
+    try testing.expect(!reg.contains(99));
+    try testing.expectEqual(@as(usize, 3), reg.count());
+}
+
+test "PreparedObjectRegistry untrack removes from both buffers" {
+    var reg = PreparedObjectRegistry.initWithTime(testing.allocator, 1000);
+    defer reg.deinit();
+
+    // Track objects before rotation
+    reg.trackPreparedAt(10, 1000);
+    reg.trackPreparedAt(20, 1001);
+
+    // Force rotation — moves current to previous
+    reg.rotation_interval_ms = 100;
+    reg.maybeRotateAt(1200);
+
+    // Object 10 and 20 are now in the previous buffer
+    try testing.expect(reg.contains(10));
+    try testing.expect(reg.contains(20));
+
+    // Track another object in the new current buffer
+    reg.trackPreparedAt(30, 1200);
+
+    // Untrack 10 — should remove from previous
+    reg.untrackPrepared(10);
+    try testing.expect(!reg.contains(10));
+    try testing.expect(reg.contains(20));
+    try testing.expect(reg.contains(30));
+
+    // Untrack 30 — should remove from current
+    reg.untrackPrepared(30);
+    try testing.expect(!reg.contains(30));
+
+    try testing.expectEqual(@as(usize, 1), reg.count());
+}
+
+test "PreparedObjectRegistry getAllPreparedIds returns union of both buffers" {
+    var reg = PreparedObjectRegistry.initWithTime(testing.allocator, 1000);
+    defer reg.deinit();
+
+    // Add objects, rotate, add more
+    reg.trackPreparedAt(10, 1000);
+    reg.trackPreparedAt(20, 1001);
+
+    reg.rotation_interval_ms = 100;
+    reg.maybeRotateAt(1200);
+
+    reg.trackPreparedAt(30, 1200);
+    reg.trackPreparedAt(40, 1201);
+
+    const ids = try reg.getAllPreparedIds(testing.allocator);
+    defer testing.allocator.free(ids);
+
+    // Should have 4 unique IDs from both buffers
+    try testing.expectEqual(@as(usize, 4), ids.len);
+
+    // Verify all expected IDs are present (order is not guaranteed)
+    var found = [_]bool{ false, false, false, false };
+    for (ids) |id| {
+        if (id == 10) found[0] = true;
+        if (id == 20) found[1] = true;
+        if (id == 30) found[2] = true;
+        if (id == 40) found[3] = true;
+    }
+    try testing.expect(found[0]);
+    try testing.expect(found[1]);
+    try testing.expect(found[2]);
+    try testing.expect(found[3]);
+}
+
+test "PreparedObjectRegistry rotation discards previous buffer" {
+    var reg = PreparedObjectRegistry.initWithTime(testing.allocator, 1000);
+    defer reg.deinit();
+    reg.rotation_interval_ms = 100;
+
+    // Epoch 1: add objects
+    reg.trackPreparedAt(10, 1000);
+    reg.trackPreparedAt(20, 1001);
+
+    // First rotation: current → previous
+    reg.maybeRotateAt(1200);
+    try testing.expect(reg.contains(10));
+    try testing.expect(reg.contains(20));
+
+    // Epoch 2: add new objects
+    reg.trackPreparedAt(30, 1200);
+
+    // Second rotation: previous (10,20) discarded, current (30) → previous
+    reg.maybeRotateAt(1400);
+    try testing.expect(!reg.contains(10));
+    try testing.expect(!reg.contains(20));
+    try testing.expect(reg.contains(30));
+    try testing.expectEqual(@as(usize, 1), reg.count());
+}
+
+test "PreparedObjectRegistry rotation respects interval" {
+    var reg = PreparedObjectRegistry.initWithTime(testing.allocator, 1000);
+    defer reg.deinit();
+    reg.rotation_interval_ms = 500;
+
+    reg.trackPreparedAt(10, 1000);
+
+    // Not enough time has passed — should NOT rotate
+    reg.maybeRotateAt(1200);
+    try testing.expectEqual(@as(i64, 1000), reg.last_rotation_ms);
+
+    // Now enough time has passed — should rotate
+    reg.maybeRotateAt(1600);
+    try testing.expectEqual(@as(i64, 1600), reg.last_rotation_ms);
+    try testing.expect(reg.contains(10)); // Still visible in previous
+}
+
+test "PreparedObjectRegistry serialize and deserialize roundtrip" {
+    var reg = PreparedObjectRegistry.initWithTime(testing.allocator, 5000);
+    defer reg.deinit();
+    reg.rotation_interval_ms = 3600_000;
+
+    // Populate current buffer
+    reg.trackPreparedAt(100, 5000);
+    reg.trackPreparedAt(200, 5001);
+    reg.trackPreparedAt(300, 5002);
+
+    // Force rotation to get objects into previous
+    reg.rotation_interval_ms = 100;
+    reg.maybeRotateAt(5200);
+
+    // Add more to current
+    reg.trackPreparedAt(400, 5200);
+    reg.trackPreparedAt(500, 5201);
+
+    // Serialize
+    const data = try reg.serialize(testing.allocator);
+    defer testing.allocator.free(data);
+
+    // Deserialize into a new registry
+    var reg2 = PreparedObjectRegistry.initWithTime(testing.allocator, 0);
+    defer reg2.deinit();
+    try reg2.deserialize(data);
+
+    // Verify all objects survived
+    try testing.expect(reg2.contains(100));
+    try testing.expect(reg2.contains(200));
+    try testing.expect(reg2.contains(300));
+    try testing.expect(reg2.contains(400));
+    try testing.expect(reg2.contains(500));
+    try testing.expectEqual(@as(usize, 5), reg2.count());
+
+    // Verify timestamps preserved
+    try testing.expectEqual(@as(i64, 5200), reg2.last_rotation_ms);
+
+    // Verify current vs previous buffer placement
+    try testing.expectEqual(@as(usize, 2), reg2.current.count());
+    try testing.expectEqual(@as(usize, 3), reg2.previous.count());
+}
+
+test "PreparedObjectRegistry deserialize rejects corrupt data" {
+    var reg = PreparedObjectRegistry.initWithTime(testing.allocator, 0);
+    defer reg.deinit();
+
+    // Empty data
+    try testing.expectError(error.CorruptSnapshot, reg.deserialize(""));
+
+    // Wrong version
+    var bad_version = [_]u8{99};
+    try testing.expectError(error.UnsupportedSnapshotVersion, reg.deserialize(&bad_version));
+
+    // Truncated data (valid version but not enough bytes for header)
+    var truncated = [_]u8{ 1, 0, 0 };
+    try testing.expectError(error.CorruptSnapshot, reg.deserialize(&truncated));
+}
+
+test "PreparedObjectRegistry serialize empty registry roundtrip" {
+    var reg = PreparedObjectRegistry.initWithTime(testing.allocator, 1000);
+    defer reg.deinit();
+
+    const data = try reg.serialize(testing.allocator);
+    defer testing.allocator.free(data);
+
+    var reg2 = PreparedObjectRegistry.initWithTime(testing.allocator, 0);
+    defer reg2.deinit();
+    try reg2.deserialize(data);
+
+    try testing.expectEqual(@as(usize, 0), reg2.count());
+    try testing.expectEqual(@as(i64, 1000), reg2.last_rotation_ms);
+}
+
+test "PreparedObjectRegistry getAllPreparedIds deduplicates across buffers" {
+    // An object tracked before rotation exists in both buffers
+    // (it stays in previous and could be re-tracked in current)
+    var reg = PreparedObjectRegistry.initWithTime(testing.allocator, 1000);
+    defer reg.deinit();
+    reg.rotation_interval_ms = 100;
+
+    reg.trackPreparedAt(10, 1000);
+    reg.maybeRotateAt(1200);
+
+    // Re-track the same object in current buffer
+    reg.trackPreparedAt(10, 1200);
+
+    // Should appear only once in getAllPreparedIds
+    const ids = try reg.getAllPreparedIds(testing.allocator);
+    defer testing.allocator.free(ids);
+    try testing.expectEqual(@as(usize, 1), ids.len);
+    try testing.expectEqual(@as(u64, 10), ids[0]);
+}
+
+test "ObjectManager registerPreparedStreamObject tracks in prepared_registry" {
+    var om = ObjectManager.init(testing.allocator, 0);
+    defer om.deinit();
+
+    try om.registerPreparedStreamObjectAt(42, 1, "so/42", 5000);
+
+    // Verify the object is tracked in the dual-buffer registry
+    try testing.expect(om.prepared_registry.contains(42));
+    try testing.expectEqual(@as(usize, 1), om.prepared_registry.count());
+}
+
+test "ObjectManager commitStreamObject untracks from prepared_registry" {
+    var om = ObjectManager.init(testing.allocator, 0);
+    defer om.deinit();
+
+    // Register as prepared
+    try om.registerPreparedStreamObjectAt(42, 1, "so/42", 5000);
+    try testing.expect(om.prepared_registry.contains(42));
+
+    // Commit the same object — should untrack
+    try om.commitStreamObject(42, 1, 0, 100, "so/42", 1024);
+    try testing.expect(!om.prepared_registry.contains(42));
+    try testing.expectEqual(@as(usize, 0), om.prepared_registry.count());
+}
+
+test "ObjectManager commitStreamSetObject untracks from prepared_registry" {
+    var om = ObjectManager.init(testing.allocator, 0);
+    defer om.deinit();
+
+    // Track a prepared object manually (SSOs don't use registerPreparedStreamObject,
+    // but the registry is a general safety net)
+    om.prepared_registry.trackPreparedAt(55, 5000);
+    try testing.expect(om.prepared_registry.contains(55));
+
+    // Commit as SSO — should untrack
+    const ranges = [_]StreamOffsetRange{
+        .{ .stream_id = 1, .start_offset = 0, .end_offset = 50 },
+    };
+    try om.commitStreamSetObject(55, 0, 1, &ranges, "sso/55", 512);
+    try testing.expect(!om.prepared_registry.contains(55));
+}
+
+test "ObjectManager expirePreparedObjects untracks from prepared_registry" {
+    var om = ObjectManager.init(testing.allocator, 0);
+    defer om.deinit();
+
+    // Register a prepared object at t=1000
+    try om.registerPreparedStreamObjectAt(42, 1, "so/42", 1000);
+    try testing.expect(om.prepared_registry.contains(42));
+
+    // Expire with TTL=500 at t=2000 — object has been prepared for 1000ms > 500ms TTL
+    const expired = om.expirePreparedObjectsAt(500, 2000);
+    try testing.expectEqual(@as(u64, 1), expired);
+
+    // Should be gone from both the object store AND the prepared registry
+    try testing.expectEqual(@as(usize, 0), om.getStreamObjectCount());
+    try testing.expect(!om.prepared_registry.contains(42));
+}
+
+test "PreparedObjectRegistry survives simulated Raft snapshot cycle" {
+    // Simulate the full lifecycle: track → serialize → "crash" → deserialize → verify
+    var om = ObjectManager.init(testing.allocator, 0);
+    defer om.deinit();
+
+    // Register several prepared objects
+    try om.registerPreparedStreamObjectAt(10, 1, "so/10", 1000);
+    try om.registerPreparedStreamObjectAt(20, 2, "so/20", 1001);
+    try om.registerPreparedStreamObjectAt(30, 3, "so/30", 1002);
+
+    // Commit one of them (simulating normal flow)
+    try om.commitStreamObject(10, 1, 0, 100, "so/10", 1024);
+
+    // Objects 20 and 30 are still prepared
+    try testing.expect(!om.prepared_registry.contains(10));
+    try testing.expect(om.prepared_registry.contains(20));
+    try testing.expect(om.prepared_registry.contains(30));
+
+    // Serialize the registry (as would happen before Raft snapshot)
+    const snapshot_data = try om.prepared_registry.serialize(testing.allocator);
+    defer testing.allocator.free(snapshot_data);
+
+    // Simulate crash and restart — create a fresh ObjectManager
+    var om2 = ObjectManager.init(testing.allocator, 0);
+    defer om2.deinit();
+
+    // Load the prepared registry snapshot
+    try om2.prepared_registry.deserialize(snapshot_data);
+
+    // Verify the surviving prepared objects are tracked
+    try testing.expect(!om2.prepared_registry.contains(10)); // was committed
+    try testing.expect(om2.prepared_registry.contains(20));
+    try testing.expect(om2.prepared_registry.contains(30));
+    try testing.expectEqual(@as(usize, 2), om2.prepared_registry.count());
 }
