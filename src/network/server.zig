@@ -29,6 +29,8 @@ pub const Server = struct {
     num_workers: usize,
     /// TLS context for SSL/SASL_SSL connections (null for plaintext).
     tls_context: ?*TlsContext = null,
+    /// Stored epoll fd for TLS handshake re-arming (set during serveEpoll).
+    epoll_fd: ?i32 = null,
     /// Group commit: called after each epoll/io_uring iteration to flush pending S3 WAL writes.
     batch_flush_fn: ?*const fn () void = null,
     /// Group commit: returns true if there are pending WAL writes (used to reduce epoll timeout).
@@ -370,6 +372,7 @@ pub const Server = struct {
 
         const epfd = try posix.epoll_create1(linux.EPOLL.CLOEXEC);
         defer posix.close(epfd);
+        self.epoll_fd = epfd;
 
         var listen_ev = linux.epoll_event{ .events = linux.EPOLL.IN, .data = .{ .fd = sock } };
         try posix.epoll_ctl(epfd, linux.EPOLL.CTL_ADD, sock, &listen_ev);
@@ -464,13 +467,24 @@ pub const Server = struct {
 
                     if (ev.events & linux.EPOLL.OUT != 0) {
                         if (connections.getPtr(fd)) |conn| {
-                            self.flushSendBuffer(fd, conn) catch {};
-                            if (conn.send_buf.items.len == 0) {
-                                var mod_ev = linux.epoll_event{
-                                    .events = linux.EPOLL.IN | linux.EPOLL.RDHUP,
-                                    .data = .{ .fd = fd },
+                            // If TLS handshake is pending, retry SSL_accept on write-ready
+                            if (!conn.tls_handshake_done) {
+                                self.handleReadEpoll(fd, &connections, now_ms) catch {
+                                    posix.epoll_ctl(epfd, linux.EPOLL.CTL_DEL, fd, null) catch {};
+                                    if (connections.fetchRemove(fd)) |entry| {
+                                        var c = entry.value;
+                                        c.deinit();
+                                    }
                                 };
-                                posix.epoll_ctl(epfd, linux.EPOLL.CTL_MOD, fd, &mod_ev) catch {};
+                            } else {
+                                self.flushSendBuffer(fd, conn) catch {};
+                                if (conn.send_buf.items.len == 0) {
+                                    var mod_ev = linux.epoll_event{
+                                        .events = linux.EPOLL.IN | linux.EPOLL.RDHUP,
+                                        .data = .{ .fd = fd },
+                                    };
+                                    posix.epoll_ctl(epfd, linux.EPOLL.CTL_MOD, fd, &mod_ev) catch {};
+                                }
                             }
                         }
                     }
@@ -524,8 +538,19 @@ pub const Server = struct {
                             return;
                         }
                         const err = ossl.SSL_get_error(ssl, ret);
-                        if (err == OpenSslLib.SSL_ERROR_WANT_READ or err == OpenSslLib.SSL_ERROR_WANT_WRITE) {
-                            return; // Need more data, retry on next event
+                        if (err == OpenSslLib.SSL_ERROR_WANT_READ) {
+                            return; // epoll IN is already armed, will retry
+                        }
+                        if (err == OpenSslLib.SSL_ERROR_WANT_WRITE) {
+                            // Must arm EPOLL.OUT so the handshake can continue
+                            // when the socket becomes writable
+                            const epfd = self.epoll_fd orelse return;
+                            var mod_ev = linux.epoll_event{
+                                .events = linux.EPOLL.IN | linux.EPOLL.OUT | linux.EPOLL.RDHUP,
+                                .data = .{ .fd = fd },
+                            };
+                            posix.epoll_ctl(epfd, linux.EPOLL.CTL_MOD, fd, &mod_ev) catch {};
+                            return;
                         }
                         log.warn("TLS handshake failed on fd={d}", .{fd});
                         return error.TlsHandshakeFailed;

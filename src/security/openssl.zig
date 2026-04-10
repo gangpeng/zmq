@@ -18,6 +18,7 @@ pub const OpenSslLib = struct {
 
     // -- libssl function pointers --
     TLS_server_method: *const fn () ?*anyopaque,
+    TLS_client_method: *const fn () ?*anyopaque,
     SSL_CTX_new: *const fn (?*anyopaque) ?*anyopaque,
     SSL_CTX_free: *const fn (?*anyopaque) void,
     SSL_CTX_use_certificate_chain_file: *const fn (?*anyopaque, [*:0]const u8) c_int,
@@ -33,10 +34,25 @@ pub const OpenSslLib = struct {
     SSL_free: *const fn (?*anyopaque) void,
     SSL_set_fd: *const fn (?*anyopaque, c_int) c_int,
     SSL_accept: *const fn (?*anyopaque) c_int,
+    SSL_connect: *const fn (?*anyopaque) c_int,
     SSL_read: *const fn (?*anyopaque, [*]u8, c_int) c_int,
     SSL_write: *const fn (?*anyopaque, [*]const u8, c_int) c_int,
     SSL_shutdown: *const fn (?*anyopaque) c_int,
     SSL_get_error: *const fn (?*anyopaque, c_int) c_int,
+    SSL_CTX_set_cipher_list: *const fn (?*anyopaque, [*:0]const u8) c_int,
+
+    // -- Peer certificate inspection (mTLS) --
+    // Available for extracting client certificate subject when mTLS is enabled.
+    // In OpenSSL 3.x, SSL_get_peer_certificate was renamed to SSL_get1_peer_certificate.
+    // We load SSL_get1_peer_certificate first, falling back to SSL_get_peer_certificate.
+    /// SSL_get1_peer_certificate(ssl) → X509* (caller must X509_free)
+    SSL_get1_peer_certificate: ?*const fn (?*anyopaque) ?*anyopaque = null,
+    /// X509_get_subject_name(x509) → X509_NAME* (internal pointer, do NOT free)
+    X509_get_subject_name: ?*const fn (?*anyopaque) ?*anyopaque = null,
+    /// X509_NAME_oneline(name, buf, size) → char* (NUL-terminated string in buf)
+    X509_NAME_oneline: ?*const fn (?*anyopaque, [*]u8, c_int) ?[*:0]u8 = null,
+    /// X509_free(x509) — free an X509 object obtained from SSL_get1_peer_certificate
+    X509_free: ?*const fn (?*anyopaque) void = null,
 
     // -- libcrypto function pointers --
     OPENSSL_init_ssl: *const fn (u64, ?*anyopaque) c_int,
@@ -71,6 +87,29 @@ pub const OpenSslLib = struct {
     /// Convenience: SSL_CTX_set_max_proto_version via SSL_CTX_ctrl
     pub fn setMaxProtoVersion(self: *const OpenSslLib, ctx: ?*anyopaque, version: c_int) bool {
         return self.SSL_CTX_ctrl(ctx, SSL_CTRL_SET_MAX_PROTO_VERSION, @as(c_long, version), null) != 0;
+    }
+
+    /// Convenience: SSL_CTX_set_cipher_list wrapper
+    pub fn setCipherList(self: *const OpenSslLib, ctx: ?*anyopaque, ciphers: [*:0]const u8) bool {
+        return self.SSL_CTX_set_cipher_list(ctx, ciphers) == 1;
+    }
+
+    /// Convenience: Get the peer certificate's subject DN as a string.
+    /// Returns null if no peer cert is available or if the extraction functions
+    /// were not loaded (e.g., older OpenSSL without SSL_get1_peer_certificate).
+    /// Caller must call X509_free on the returned cert when done via freePeerCert.
+    pub fn getPeerCertSubject(self: *const OpenSslLib, ssl: ?*anyopaque, buf: []u8) ?[]const u8 {
+        const get_cert_fn = self.SSL_get1_peer_certificate orelse return null;
+        const get_name_fn = self.X509_get_subject_name orelse return null;
+        const name_oneline_fn = self.X509_NAME_oneline orelse return null;
+        const free_fn = self.X509_free orelse return null;
+
+        const x509 = get_cert_fn(ssl) orelse return null;
+        defer free_fn(x509);
+
+        const name = get_name_fn(x509) orelse return null;
+        const result = name_oneline_fn(name, buf.ptr, @intCast(buf.len)) orelse return null;
+        return std.mem.sliceTo(result, 0);
     }
 
     // -- C dlopen/dlsym/dlclose --
@@ -108,6 +147,7 @@ pub const OpenSslLib = struct {
             .ssl_handle = ssl_handle,
             .crypto_handle = crypto_handle,
             .TLS_server_method = undefined,
+            .TLS_client_method = undefined,
             .SSL_CTX_new = undefined,
             .SSL_CTX_free = undefined,
             .SSL_CTX_use_certificate_chain_file = undefined,
@@ -120,10 +160,12 @@ pub const OpenSslLib = struct {
             .SSL_free = undefined,
             .SSL_set_fd = undefined,
             .SSL_accept = undefined,
+            .SSL_connect = undefined,
             .SSL_read = undefined,
             .SSL_write = undefined,
             .SSL_shutdown = undefined,
             .SSL_get_error = undefined,
+            .SSL_CTX_set_cipher_list = undefined,
             .OPENSSL_init_ssl = undefined,
             .ERR_get_error = undefined,
             .ERR_error_string_n = undefined,
@@ -131,6 +173,7 @@ pub const OpenSslLib = struct {
 
         // Load libssl functions
         self.TLS_server_method = try lookupFn(ssl_handle, @TypeOf(self.TLS_server_method), "TLS_server_method");
+        self.TLS_client_method = try lookupFn(ssl_handle, @TypeOf(self.TLS_client_method), "TLS_client_method");
         self.SSL_CTX_new = try lookupFn(ssl_handle, @TypeOf(self.SSL_CTX_new), "SSL_CTX_new");
         self.SSL_CTX_free = try lookupFn(ssl_handle, @TypeOf(self.SSL_CTX_free), "SSL_CTX_free");
         self.SSL_CTX_use_certificate_chain_file = try lookupFn(ssl_handle, @TypeOf(self.SSL_CTX_use_certificate_chain_file), "SSL_CTX_use_certificate_chain_file");
@@ -143,10 +186,21 @@ pub const OpenSslLib = struct {
         self.SSL_free = try lookupFn(ssl_handle, @TypeOf(self.SSL_free), "SSL_free");
         self.SSL_set_fd = try lookupFn(ssl_handle, @TypeOf(self.SSL_set_fd), "SSL_set_fd");
         self.SSL_accept = try lookupFn(ssl_handle, @TypeOf(self.SSL_accept), "SSL_accept");
+        self.SSL_connect = try lookupFn(ssl_handle, @TypeOf(self.SSL_connect), "SSL_connect");
         self.SSL_read = try lookupFn(ssl_handle, @TypeOf(self.SSL_read), "SSL_read");
         self.SSL_write = try lookupFn(ssl_handle, @TypeOf(self.SSL_write), "SSL_write");
         self.SSL_shutdown = try lookupFn(ssl_handle, @TypeOf(self.SSL_shutdown), "SSL_shutdown");
         self.SSL_get_error = try lookupFn(ssl_handle, @TypeOf(self.SSL_get_error), "SSL_get_error");
+        self.SSL_CTX_set_cipher_list = try lookupFn(ssl_handle, @TypeOf(self.SSL_CTX_set_cipher_list), "SSL_CTX_set_cipher_list");
+
+        // Peer certificate functions (optional — soft-fail if not found).
+        // OpenSSL 3.x renamed SSL_get_peer_certificate → SSL_get1_peer_certificate.
+        // Try the new name first, then fall back to the old name.
+        self.SSL_get1_peer_certificate = lookupFn(ssl_handle, @TypeOf(self.SSL_get1_peer_certificate.?), "SSL_get1_peer_certificate") catch
+            lookupFn(ssl_handle, @TypeOf(self.SSL_get1_peer_certificate.?), "SSL_get_peer_certificate") catch null;
+        self.X509_get_subject_name = lookupFn(crypto_handle, @TypeOf(self.X509_get_subject_name.?), "X509_get_subject_name") catch null;
+        self.X509_NAME_oneline = lookupFn(crypto_handle, @TypeOf(self.X509_NAME_oneline.?), "X509_NAME_oneline") catch null;
+        self.X509_free = lookupFn(crypto_handle, @TypeOf(self.X509_free.?), "X509_free") catch null;
 
         // Load libcrypto/libssl init functions
         self.OPENSSL_init_ssl = try lookupFn(ssl_handle, @TypeOf(self.OPENSSL_init_ssl), "OPENSSL_init_ssl");

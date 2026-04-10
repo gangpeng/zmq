@@ -80,6 +80,7 @@ pub fn main() !void {
     var tls_cert_file: ?[]const u8 = null;
     var tls_key_file: ?[]const u8 = null;
     var tls_ca_file: ?[]const u8 = null;
+    var tls_client_auth_str: []const u8 = "none";
 
     var args = try std.process.argsWithAllocator(alloc);
     defer args.deinit();
@@ -135,6 +136,8 @@ pub fn main() !void {
             tls_key_file = args.next();
         } else if (std.mem.eql(u8, arg, "--tls-ca-file")) {
             tls_ca_file = args.next();
+        } else if (std.mem.eql(u8, arg, "--tls-client-auth")) {
+            if (args.next()) |v| tls_client_auth_str = v;
         } else {
             port = std.fmt.parseInt(u16, arg, 10) catch port;
         }
@@ -168,6 +171,12 @@ pub fn main() !void {
             process_roles = ProcessRoles.parse(r) catch process_roles;
         }
         controller_port = cfg.getInt(u16, "controller.listener.port", controller_port);
+        // TLS configuration from config file (CLI flags take precedence)
+        if (cfg.getString("security.protocol")) |p| security_protocol = p;
+        if (cfg.getString("ssl.certfile")) |f| tls_cert_file = f;
+        if (cfg.getString("ssl.keyfile")) |f| tls_key_file = f;
+        if (cfg.getString("ssl.cafile")) |f| tls_ca_file = f;
+        if (cfg.getString("ssl.client.auth")) |a| tls_client_auth_str = a;
     }
 
     // Validate: broker-only mode requires --voters to know the controller quorum
@@ -416,11 +425,19 @@ pub fn main() !void {
         else
             .plaintext;
 
+        const client_auth: TlsConfig.ClientAuth = if (std.mem.eql(u8, tls_client_auth_str, "required"))
+            .required
+        else if (std.mem.eql(u8, tls_client_auth_str, "requested"))
+            .requested
+        else
+            .none;
+
         var tls_config = TlsConfig{
             .protocol = tls_protocol,
             .cert_file = tls_cert_file,
             .key_file = tls_key_file,
             .ca_file = tls_ca_file,
+            .client_auth = client_auth,
         };
         tls_config.enabled = tls_config.needsTls();
 

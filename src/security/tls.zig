@@ -239,6 +239,17 @@ pub const TlsContext = struct {
             _ = ossl.setMinProtoVersion(ssl_ctx, config.min_tls_version.toOpenSsl());
             _ = ossl.setMaxProtoVersion(ssl_ctx, config.max_tls_version.toOpenSsl());
 
+            // Configure cipher suites: strong ciphers only (matches Kafka's default).
+            // ECDHE and DHE provide forward secrecy; AESGCM and CHACHA20 are modern
+            // AEAD ciphers. Explicitly exclude anonymous ciphers, MD5, and DSS.
+            // NOTE: AutoMQ uses Java's default SSL cipher suite list (JSSE). ZMQ
+            // explicitly sets strong ciphers because OpenSSL's defaults may include
+            // weaker ciphers depending on the system build.
+            const default_ciphers = "ECDHE+AESGCM:ECDHE+CHACHA20:DHE+AESGCM:DHE+CHACHA20:!aNULL:!MD5:!DSS";
+            if (!ossl.setCipherList(ssl_ctx, default_ciphers)) {
+                log.warn("Failed to set cipher list, using OpenSSL defaults", .{});
+            }
+
             // Load certificate chain
             if (config.cert_file) |cert_path| {
                 const cert_z = std.fmt.allocPrintZ(alloc, "{s}", .{cert_path}) catch return error.OutOfMemory;
@@ -335,6 +346,129 @@ pub const TlsContext = struct {
     }
 };
 
+/// Client-side TLS context for outbound connections (Raft RPC, broker→controller).
+///
+/// Unlike TlsContext (server-side), this uses TLS_client_method and SSL_connect
+/// instead of TLS_server_method and SSL_accept. Shared across all outbound
+/// connections from a single node.
+pub const TlsClientContext = struct {
+    ssl_ctx: ?*anyopaque = null,
+    openssl: ?OpenSslLib = null,
+    initialized: bool = false,
+
+    pub fn init(config: TlsConfig) !TlsClientContext {
+        if (!config.needsTls()) return TlsClientContext{};
+
+        var ossl = OpenSslLib.load() catch |err| {
+            log.err("Cannot initialize client TLS: OpenSSL not available ({s})", .{@errorName(err)});
+            return error.TlsNotAvailable;
+        };
+        errdefer ossl.close();
+
+        const method = ossl.TLS_client_method() orelse return error.TlsInitFailed;
+        const ssl_ctx = ossl.SSL_CTX_new(method) orelse return error.TlsInitFailed;
+        errdefer ossl.SSL_CTX_free(ssl_ctx);
+
+        // Set protocol version constraints
+        _ = ossl.setMinProtoVersion(ssl_ctx, config.min_tls_version.toOpenSsl());
+        _ = ossl.setMaxProtoVersion(ssl_ctx, config.max_tls_version.toOpenSsl());
+
+        // If CA file set, load for server certificate verification
+        if (config.ca_file) |ca_path| {
+            const ca_z = std.fmt.allocPrintZ(std.heap.page_allocator, "{s}", .{ca_path}) catch return error.OutOfMemory;
+            defer std.heap.page_allocator.free(ca_z);
+            if (ossl.SSL_CTX_load_verify_locations(ssl_ctx, ca_z, null) != 1) {
+                log.warn("Failed to load CA for client TLS: {s}", .{ca_path});
+            } else {
+                log.info("Client TLS: loaded CA file: {s}", .{ca_path});
+            }
+        }
+
+        // If client cert/key set (mTLS), load them
+        if (config.cert_file) |cert_path| {
+            const cert_z = std.fmt.allocPrintZ(std.heap.page_allocator, "{s}", .{cert_path}) catch return error.OutOfMemory;
+            defer std.heap.page_allocator.free(cert_z);
+            if (ossl.SSL_CTX_use_certificate_chain_file(ssl_ctx, cert_z) != 1) {
+                const err_str = ossl.getErrorString();
+                log.err("Failed to load client certificate: {s}", .{std.mem.sliceTo(&err_str, 0)});
+                return error.CertificateLoadFailed;
+            }
+            log.info("Client TLS: loaded certificate: {s}", .{cert_path});
+        }
+
+        if (config.key_file) |key_path| {
+            const key_z = std.fmt.allocPrintZ(std.heap.page_allocator, "{s}", .{key_path}) catch return error.OutOfMemory;
+            defer std.heap.page_allocator.free(key_z);
+            if (ossl.SSL_CTX_use_PrivateKey_file(ssl_ctx, key_z, OpenSslLib.SSL_FILETYPE_PEM) != 1) {
+                const err_str = ossl.getErrorString();
+                log.err("Failed to load client private key: {s}", .{std.mem.sliceTo(&err_str, 0)});
+                return error.PrivateKeyLoadFailed;
+            }
+
+            // Verify cert/key match
+            if (ossl.SSL_CTX_check_private_key(ssl_ctx) != 1) {
+                log.err("Client certificate and private key do not match", .{});
+                return error.CertKeyMismatch;
+            }
+            log.info("Client TLS: loaded private key: {s}", .{key_path});
+        }
+
+        log.info("Client TLS context initialized (min={s}, max={s})", .{
+            @tagName(config.min_tls_version),
+            @tagName(config.max_tls_version),
+        });
+
+        return TlsClientContext{
+            .ssl_ctx = ssl_ctx,
+            .openssl = ossl,
+            .initialized = true,
+        };
+    }
+
+    /// Create an SSL object for a client connection and perform SSL_connect.
+    /// For blocking sockets (Raft client), this does a blocking handshake.
+    pub fn wrapConnection(self: *TlsClientContext, fd: posix.fd_t) !*anyopaque {
+        const ossl = &(self.openssl orelse return error.TlsNotInitialized);
+        const ssl = ossl.SSL_new(self.ssl_ctx orelse return error.TlsNotInitialized) orelse return error.SslCreateFailed;
+        errdefer ossl.SSL_free(ssl);
+
+        if (ossl.SSL_set_fd(ssl, @intCast(fd)) != 1) {
+            return error.SslSetFdFailed;
+        }
+
+        const ret = ossl.SSL_connect(ssl);
+        if (ret != 1) {
+            const ssl_err = ossl.SSL_get_error(ssl, ret);
+            const err_str = ossl.getErrorString();
+            log.err("TLS client handshake failed on fd={d}: ssl_error={d} {s}", .{
+                fd, ssl_err, std.mem.sliceTo(&err_str, 0),
+            });
+            return error.TlsHandshakeFailed;
+        }
+
+        log.info("TLS client handshake completed on fd={d}", .{fd});
+        return ssl;
+    }
+
+    /// Get a mutable reference to the OpenSSL library.
+    pub fn getOpenSsl(self: *TlsClientContext) ?*OpenSslLib {
+        if (self.openssl != null) return &self.openssl.?;
+        return null;
+    }
+
+    pub fn deinit(self: *TlsClientContext) void {
+        if (self.ssl_ctx) |ctx| {
+            if (self.openssl) |*ossl| {
+                ossl.SSL_CTX_free(ctx);
+                ossl.close();
+            }
+        }
+        self.ssl_ctx = null;
+        self.openssl = null;
+        self.initialized = false;
+    }
+};
+
 /// Generate a self-signed certificate for development/testing.
 pub fn generateSelfSignedCert(alloc: Allocator, output_dir: []const u8) !struct { cert: []const u8, key: []const u8 } {
     _ = alloc;
@@ -402,4 +536,19 @@ test "TlsConnection init" {
     defer conn.deinit();
     try testing.expect(!conn.tls_established);
     try testing.expectEqual(@as(posix.fd_t, 42), conn.inner_fd);
+}
+
+test "TlsClientContext init plaintext returns uninitialized" {
+    const config = TlsConfig{};
+    var ctx = try TlsClientContext.init(config);
+    defer ctx.deinit();
+    try testing.expect(!ctx.initialized);
+    try testing.expect(ctx.ssl_ctx == null);
+}
+
+test "TlsClientContext getOpenSsl returns null when uninitialized" {
+    const config = TlsConfig{};
+    var ctx = try TlsClientContext.init(config);
+    defer ctx.deinit();
+    try testing.expect(ctx.getOpenSsl() == null);
 }

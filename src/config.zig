@@ -153,6 +153,16 @@ pub fn applyConfig(config: *@import("broker/handler.zig").Broker.BrokerConfig, c
     if (cfg.getString("sasl.users")) |u| config.sasl_users = u;
     if (cfg.getString("super.users")) |u| config.super_users = u;
     config.allow_everyone_if_no_acl = cfg.getBool("allow.everyone.if.no.acl.found", config.allow_everyone_if_no_acl);
+
+    // TLS configuration from config file
+    // NOTE: AutoMQ uses Java's ssl.* properties (JKS keystore format). ZMQ uses
+    // PEM-based cert/key files because Zig/OpenSSL has no JKS support. The property
+    // names (ssl.certfile, ssl.keyfile, etc.) follow the PEM convention.
+    if (cfg.getString("security.protocol")) |p| config.security_protocol = p;
+    if (cfg.getString("ssl.certfile")) |f| config.tls_cert_file = f;
+    if (cfg.getString("ssl.keyfile")) |f| config.tls_key_file = f;
+    if (cfg.getString("ssl.cafile")) |f| config.tls_ca_file = f;
+    if (cfg.getString("ssl.client.auth")) |a| config.tls_client_auth = a;
 }
 
 // ---------------------------------------------------------------

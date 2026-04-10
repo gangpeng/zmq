@@ -6,6 +6,7 @@ const ser = @import("../protocol/serialization.zig");
 const header_mod = @import("../protocol/header.zig");
 const RequestHeader = header_mod.RequestHeader;
 const RaftClientPool = @import("../network/raft_client.zig").RaftClientPool;
+const TlsClientContext = @import("../security/tls.zig").TlsClientContext;
 
 /// MetadataClient connects a broker-only node to the controller quorum.
 ///
@@ -87,6 +88,14 @@ pub const MetadataClient = struct {
     pub fn addVoter(self: *MetadataClient, node_id: i32, host: []const u8, port: u16) !void {
         try self.voters.append(.{ .node_id = node_id, .host = host, .port = port });
         try self.controller_pool.addPeer(node_id, host, port);
+    }
+
+    /// Set a TLS client context for encrypted connections to the controller.
+    /// Must be called before run() to take effect on all voter connections.
+    /// The TLS context propagates automatically to all RaftClients in the pool.
+    pub fn setTlsContext(self: *MetadataClient, ctx: *TlsClientContext) void {
+        self.controller_pool.setTlsContext(ctx);
+        log.info("MetadataClient TLS enabled for broker {d}", .{self.broker_id});
     }
 
     /// Background loop: discover leader, register, then heartbeat.
@@ -446,5 +455,36 @@ test "MetadataClient parseDescribeQuorumResponse no leader" {
 
     const info = mc.parseDescribeQuorumResponse(resp[0..wpos]);
     try testing.expect(info == null);
+}
+
+test "MetadataClient setTlsContext propagates to controller pool" {
+    var cached_epoch: i32 = 0;
+    var is_fenced: bool = false;
+    var last_hb: i64 = 0;
+    var should_stop: bool = false;
+
+    var mc = MetadataClient.init(
+        testing.allocator, 100, "localhost", 9092,
+        &cached_epoch, &is_fenced, &last_hb, &should_stop,
+    );
+    defer mc.deinit();
+
+    try mc.addVoter(1, "controller1", 9093);
+
+    // Before setting TLS, pool should have no TLS context
+    try testing.expect(mc.controller_pool.tls_client_ctx == null);
+
+    // Set TLS context
+    var tls_ctx = TlsClientContext{};
+    defer tls_ctx.deinit();
+    mc.setTlsContext(&tls_ctx);
+
+    // Pool should now have TLS context
+    try testing.expect(mc.controller_pool.tls_client_ctx != null);
+
+    // Client in pool should also have TLS context
+    const client = mc.controller_pool.getClient(1);
+    try testing.expect(client != null);
+    try testing.expect(client.?.tls_ctx != null);
 }
 

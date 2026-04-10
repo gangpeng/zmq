@@ -234,6 +234,18 @@ pub const Broker = struct {
         super_users: []const u8 = "",
         /// Allow all operations when no ACLs are defined (default: true)
         allow_everyone_if_no_acl: bool = true,
+
+        // TLS configuration (used by main.zig to create TlsConfig)
+        /// Security protocol: "plaintext", "ssl", "sasl_plaintext", "sasl_ssl"
+        security_protocol: []const u8 = "plaintext",
+        /// Path to PEM-encoded server certificate chain
+        tls_cert_file: ?[]const u8 = null,
+        /// Path to PEM-encoded server private key
+        tls_key_file: ?[]const u8 = null,
+        /// Path to PEM-encoded CA certificate(s) for client verification (mTLS)
+        tls_ca_file: ?[]const u8 = null,
+        /// Client certificate auth mode: "none", "requested", "required"
+        tls_client_auth: []const u8 = "none",
     };
 
     pub const WalFlushMode = @import("../storage/wal.zig").WalFlushMode;

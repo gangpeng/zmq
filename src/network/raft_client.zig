@@ -4,6 +4,8 @@ const log = std.log.scoped(.raft_client);
 const Allocator = std.mem.Allocator;
 const ser = @import("../protocol/serialization.zig");
 const header_mod = @import("../protocol/header.zig");
+const OpenSslLib = @import("../security/openssl.zig").OpenSslLib;
+const TlsClientContext = @import("../security/tls.zig").TlsClientContext;
 
 /// RPC client for sending Raft protocol messages to other brokers.
 /// Each RaftClient represents a connection to a single peer broker.
@@ -19,6 +21,12 @@ pub const RaftClient = struct {
     fd: ?posix.fd_t = null,
     allocator: Allocator,
     next_correlation_id: i32 = 1,
+    /// SSL object for this connection (non-null when TLS handshake succeeded)
+    ssl_ptr: ?*anyopaque = null,
+    /// Reference to loaded OpenSSL library (for SSL_read/SSL_write/SSL_shutdown)
+    openssl: ?*const OpenSslLib = null,
+    /// Shared client TLS context for creating SSL objects on connect
+    tls_ctx: ?*TlsClientContext = null,
 
     pub fn init(alloc: Allocator, peer_id: i32, host: []const u8, port: u16) RaftClient {
         return .{
@@ -34,6 +42,15 @@ pub const RaftClient = struct {
     }
 
     pub fn disconnect(self: *RaftClient) void {
+        // TLS shutdown before closing the socket
+        if (self.ssl_ptr) |ssl| {
+            if (self.openssl) |ossl| {
+                _ = ossl.SSL_shutdown(ssl);
+                ossl.SSL_free(ssl);
+            }
+            self.ssl_ptr = null;
+            self.openssl = null;
+        }
         if (self.fd) |fd| {
             posix.close(fd);
             self.fd = null;
@@ -69,6 +86,49 @@ pub const RaftClient = struct {
 
         self.fd = fd;
         log.info("Connected to peer {d} at {s}:{d}", .{ self.peer_id, self.host, self.port });
+
+        // TLS handshake if a client TLS context is configured
+        if (self.tls_ctx) |tls| {
+            if (tls.initialized) {
+                const ssl = tls.wrapConnection(fd) catch |err| {
+                    log.warn("TLS handshake to peer {d} failed: {}", .{ self.peer_id, err });
+                    posix.close(fd);
+                    self.fd = null;
+                    return error.ConnectionRefused;
+                };
+                self.ssl_ptr = ssl;
+                self.openssl = if (tls.getOpenSsl()) |ossl| ossl else null;
+            }
+        }
+    }
+
+    /// Send data over the connection, using SSL_write if TLS is active.
+    fn sslSend(self: *RaftClient, data: []const u8) !usize {
+        if (self.ssl_ptr) |ssl| {
+            const ossl = self.openssl orelse return error.TlsNotInitialized;
+            const len: c_int = @intCast(@min(data.len, std.math.maxInt(c_int)));
+            const ret = ossl.SSL_write(ssl, data.ptr, len);
+            if (ret > 0) return @intCast(ret);
+            const ssl_err = ossl.SSL_get_error(ssl, ret);
+            log.warn("SSL_write failed: ssl_error={d}", .{ssl_err});
+            return error.WriteError;
+        }
+        return posix.send(self.fd.?, data, 0);
+    }
+
+    /// Receive data from the connection, using SSL_read if TLS is active.
+    fn sslRecv(self: *RaftClient, buf: []u8) !usize {
+        if (self.ssl_ptr) |ssl| {
+            const ossl = self.openssl orelse return error.TlsNotInitialized;
+            const len: c_int = @intCast(@min(buf.len, std.math.maxInt(c_int)));
+            const ret = ossl.SSL_read(ssl, buf.ptr, len);
+            if (ret > 0) return @intCast(ret);
+            const ssl_err = ossl.SSL_get_error(ssl, ret);
+            if (ssl_err == OpenSslLib.SSL_ERROR_ZERO_RETURN) return 0;
+            log.warn("SSL_read failed: ssl_error={d}", .{ssl_err});
+            return error.ReadError;
+        }
+        return posix.recv(self.fd.?, buf, 0);
     }
 
     /// Send a Vote request (API key 52) and get the response.
@@ -129,15 +189,14 @@ pub const RaftClient = struct {
         ser.writeI32(&req_buf, &size_pos, frame_size);
 
         // Send
-        const fd = self.fd.?;
-        _ = posix.send(fd, req_buf[0..pos], 0) catch |err| {
+        _ = self.sslSend(req_buf[0..pos]) catch |err| {
             self.disconnect();
             return err;
         };
 
         // Read response
         var resp_buf: [256]u8 = undefined;
-        const n = posix.recv(fd, &resp_buf, 0) catch |err| {
+        const n = self.sslRecv(&resp_buf) catch |err| {
             self.disconnect();
             return err;
         };
@@ -238,15 +297,14 @@ pub const RaftClient = struct {
         var size_pos: usize = 0;
         ser.writeI32(&req_buf, &size_pos, frame_size);
 
-        const fd = self.fd.?;
-        _ = posix.send(fd, req_buf[0..pos], 0) catch |err| {
+        _ = self.sslSend(req_buf[0..pos]) catch |err| {
             self.disconnect();
             return err;
         };
 
         // Read and parse response
         var resp_buf: [256]u8 = undefined;
-        const n = posix.recv(fd, &resp_buf, 0) catch |err| {
+        const n = self.sslRecv(&resp_buf) catch |err| {
             self.disconnect();
             return err;
         };
@@ -297,15 +355,14 @@ pub const RaftClient = struct {
         var size_pos: usize = 0;
         ser.writeI32(&req_buf, &size_pos, frame_size);
 
-        const fd = self.fd.?;
-        _ = posix.send(fd, req_buf[0..pos], 0) catch |err| {
+        _ = self.sslSend(req_buf[0..pos]) catch |err| {
             self.disconnect();
             return err;
         };
 
         // Read and discard response
         var resp_buf: [256]u8 = undefined;
-        _ = posix.recv(fd, &resp_buf, 0) catch |err| {
+        _ = self.sslRecv(&resp_buf) catch |err| {
             self.disconnect();
             return err;
         };
@@ -318,8 +375,6 @@ pub const RaftClient = struct {
             return err;
         };
 
-        const fd = self.fd.?;
-
         // Build frame: [4-byte size] [request payload]
         var frame_buf = try alloc.alloc(u8, 4 + request.len);
         defer alloc.free(frame_buf);
@@ -327,14 +382,14 @@ pub const RaftClient = struct {
         ser.writeI32(frame_buf, &size_pos, @intCast(request.len));
         @memcpy(frame_buf[4..], request);
 
-        _ = posix.send(fd, frame_buf, 0) catch |err| {
+        _ = self.sslSend(frame_buf) catch |err| {
             self.disconnect();
             return err;
         };
 
         // Read response frame: 4-byte size + payload
         var resp_header: [4]u8 = undefined;
-        const hn = posix.recv(fd, &resp_header, 0) catch |err| {
+        const hn = self.sslRecv(&resp_header) catch |err| {
             self.disconnect();
             return err;
         };
@@ -354,7 +409,7 @@ pub const RaftClient = struct {
         errdefer alloc.free(resp_buf);
         var total_read: usize = 0;
         while (total_read < resp_size) {
-            const n = posix.recv(fd, resp_buf[total_read..], 0) catch |err| {
+            const n = self.sslRecv(resp_buf[total_read..]) catch |err| {
                 self.disconnect();
                 return err;
             };
@@ -373,6 +428,8 @@ pub const RaftClient = struct {
 pub const RaftClientPool = struct {
     clients: std.AutoHashMap(i32, RaftClient),
     allocator: Allocator,
+    /// Shared client TLS context, propagated to each RaftClient on addPeer
+    tls_client_ctx: ?*TlsClientContext = null,
 
     pub fn init(alloc: Allocator) RaftClientPool {
         return .{
@@ -384,15 +441,29 @@ pub const RaftClientPool = struct {
     pub fn deinit(self: *RaftClientPool) void {
         var it = self.clients.iterator();
         while (it.next()) |entry| {
+            // Free the duped host string allocated in addPeer
+            self.allocator.free(entry.value_ptr.host);
             entry.value_ptr.deinit();
         }
         self.clients.deinit();
     }
 
+    /// Set the TLS context for all future (and existing) peer connections.
+    pub fn setTlsContext(self: *RaftClientPool, ctx: *TlsClientContext) void {
+        self.tls_client_ctx = ctx;
+        // Update existing clients
+        var it = self.clients.iterator();
+        while (it.next()) |entry| {
+            entry.value_ptr.tls_ctx = ctx;
+        }
+    }
+
     /// Add a peer broker to the pool. Dupes the host string for safety.
     pub fn addPeer(self: *RaftClientPool, peer_id: i32, host: []const u8, port: u16) !void {
         const host_owned = try self.allocator.dupe(u8, host);
-        try self.clients.put(peer_id, RaftClient.init(self.allocator, peer_id, host_owned, port));
+        var client = RaftClient.init(self.allocator, peer_id, host_owned, port);
+        client.tls_ctx = self.tls_client_ctx;
+        try self.clients.put(peer_id, client);
     }
 
     /// Get the client for a specific peer.
@@ -524,4 +595,34 @@ test "RaftClient init" {
 
     try std.testing.expectEqual(@as(i32, 1), client.peer_id);
     try std.testing.expect(client.fd == null);
+    try std.testing.expect(client.ssl_ptr == null);
+    try std.testing.expect(client.tls_ctx == null);
+}
+
+test "RaftClientPool setTlsContext propagates to existing clients" {
+    var pool = RaftClientPool.init(std.testing.allocator);
+    defer pool.deinit();
+
+    try pool.addPeer(1, "localhost", 9093);
+
+    // Before setting TLS context, clients should have null tls_ctx
+    const c1 = pool.getClient(1);
+    try std.testing.expect(c1 != null);
+    try std.testing.expect(c1.?.tls_ctx == null);
+
+    // Create an uninitialized TlsClientContext and set it on the pool
+    var tls_ctx = TlsClientContext{};
+    defer tls_ctx.deinit();
+    pool.setTlsContext(&tls_ctx);
+
+    // Existing client should now have the TLS context
+    const c1_after = pool.getClient(1);
+    try std.testing.expect(c1_after != null);
+    try std.testing.expect(c1_after.?.tls_ctx != null);
+
+    // New clients should also inherit it
+    try pool.addPeer(2, "localhost", 9094);
+    const c2 = pool.getClient(2);
+    try std.testing.expect(c2 != null);
+    try std.testing.expect(c2.?.tls_ctx != null);
 }
