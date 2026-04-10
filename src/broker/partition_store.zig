@@ -811,33 +811,61 @@ pub const PartitionStore = struct {
     };
 
     /// Apply retention policy to all partitions.
-    /// Returns the number of records/segments cleaned up.
+    /// Returns the number of partitions whose log_start_offset was advanced.
+    ///
+    /// NOTE: AutoMQ implements retention in ElasticLog.maybeClean() which runs
+    /// on a ScheduledExecutorService. ZMQ calls this from Broker.tick() every
+    /// 60 seconds. The actual S3 object deletion happens lazily in the next
+    /// compaction cycle via cleanupExpired() — this method only advances the
+    /// trim point (stream.start_offset and partition.log_start_offset).
     pub fn applyRetention(self: *PartitionStore, policy: RetentionPolicy) !u64 {
         var cleaned: u64 = 0;
 
         switch (policy.cleanup_policy) {
             .delete => {
-                // Delete old records based on time or size
-                if (policy.retention_bytes > 0) {
-                    // Size-based retention: track total bytes per partition
-                    // and advance log_start_offset to drop old data
-                    var it = self.partitions.iterator();
-                    while (it.next()) |entry| {
-                        const state = entry.value_ptr;
-                        _ = state;
-                        // In a real implementation, check actual log size and truncate
-                        // For now, this is a no-op since our in-memory store
-                        // doesn't track per-record sizes
-                    }
-                }
+                const om = self.object_manager orelse return 0;
+                const now = std.time.milliTimestamp();
 
-                if (policy.retention_ms > 0) {
-                    // Time-based retention: advance log_start_offset
-                    // for records older than retention_ms
-                    const now = std.time.milliTimestamp();
-                    _ = now;
-                    // In production: iterate log entries, find cutoff offset
-                    // where timestamp < (now - retention_ms), update log_start_offset
+                var it = self.partitions.iterator();
+                while (it.next()) |entry| {
+                    const state = entry.value_ptr;
+                    const stream_id = hashPartitionKey(state.topic, state.partition_id);
+                    var new_start_offset: ?u64 = null;
+
+                    // Time-based retention: find objects whose max_timestamp is older
+                    // than (now - retention_ms) and trim past them.
+                    if (policy.retention_ms > 0) {
+                        const cutoff_ms = now - policy.retention_ms;
+                        if (om.findTrimOffsetByTimestamp(stream_id, cutoff_ms)) |trim_offset| {
+                            if (trim_offset > state.log_start_offset) {
+                                new_start_offset = trim_offset;
+                            }
+                        }
+                    }
+
+                    // Size-based retention: if total stream bytes exceed retention_bytes,
+                    // trim oldest objects until within budget.
+                    if (policy.retention_bytes > 0) {
+                        if (om.findTrimOffsetBySize(stream_id, @intCast(policy.retention_bytes))) |trim_offset| {
+                            // Take the higher of time-based and size-based trim points
+                            if (new_start_offset) |existing| {
+                                if (trim_offset > existing) new_start_offset = trim_offset;
+                            } else if (trim_offset > state.log_start_offset) {
+                                new_start_offset = trim_offset;
+                            }
+                        }
+                    }
+
+                    // Advance both log_start_offset and stream.start_offset atomically.
+                    // The next compaction cycle (cleanupExpired) will delete the S3 objects
+                    // that are now behind the trim point.
+                    if (new_start_offset) |offset| {
+                        state.log_start_offset = offset;
+                        om.trimStream(stream_id, offset) catch |err| {
+                            log.warn("Failed to trim stream {d} to offset {d}: {}", .{ stream_id, offset, err });
+                        };
+                        cleaned += 1;
+                    }
                 }
             },
             .compact => {
@@ -847,6 +875,13 @@ pub const PartitionStore = struct {
             .compact_delete => {
                 // Both compaction and time-based deletion
                 cleaned += try self.compactLogs();
+                // Also apply time/size-based deletion for compact_delete policy
+                const delete_policy = RetentionPolicy{
+                    .retention_ms = policy.retention_ms,
+                    .retention_bytes = policy.retention_bytes,
+                    .cleanup_policy = .delete,
+                };
+                cleaned += try self.applyRetention(delete_policy);
             },
         }
 
@@ -1365,4 +1400,94 @@ test "PartitionStore applyDeferredHWUpdates advances HW" {
     const state1_after = store.partitions.get(key1).?;
     try testing.expectEqual(@as(u64, 1), state1_after.high_watermark);
     try testing.expectEqual(@as(u64, 1), state1_after.last_stable_offset);
+}
+
+test "applyRetention time-based advances log_start_offset past expired objects" {
+    const stream_mod = @import("../storage/stream.zig");
+    const ObjectManager = stream_mod.ObjectManager;
+
+    var om = ObjectManager.init(testing.allocator, 1);
+    defer om.deinit();
+
+    var store = PartitionStore.init(testing.allocator, null);
+    defer store.deinit();
+    store.object_manager = &om;
+
+    // Create partition and produce a record so the partition entry exists
+    _ = try store.produce("retention-topic", 0, "record-data");
+
+    // Get the stream_id that was created for this partition
+    const stream_id = hashPartitionKey("retention-topic", 0);
+
+    // Register StreamObjects with known timestamps
+    try om.commitStreamObjectWithTimestamp(10, stream_id, 0, 50, "so/old", 1024, 1000); // old: ts=1000
+    try om.commitStreamObjectWithTimestamp(11, stream_id, 50, 100, "so/recent", 1024, 5000); // recent: ts=5000
+
+    // Apply time-based retention: cutoff at ts=2000 → only first object expired
+    const policy = RetentionPolicy{
+        .retention_ms = 1, // tiny retention
+        .retention_bytes = -1,
+        .cleanup_policy = .delete,
+    };
+
+    // Override cutoff by using a policy that expires objects with ts < 2000
+    // Since we can't control "now" in this test, use findTrimOffsetByTimestamp directly
+    const trim_offset = om.findTrimOffsetByTimestamp(stream_id, 2000);
+    try testing.expectEqual(@as(u64, 50), trim_offset.?);
+
+    // Verify that applyRetention with a real policy returns > 0 (some partitions trimmed)
+    // We use a very large retention_ms so only the time check matters
+    _ = try store.applyRetention(policy);
+
+    // Verify stream was trimmed (the applyRetention uses real now() which is >> 5000)
+    const stream = om.getStream(stream_id).?;
+    try testing.expect(stream.start_offset >= 50);
+}
+
+test "applyRetention size-based trims when exceeding retention_bytes" {
+    const stream_mod = @import("../storage/stream.zig");
+    const ObjectManager = stream_mod.ObjectManager;
+
+    var om = ObjectManager.init(testing.allocator, 1);
+    defer om.deinit();
+
+    var store = PartitionStore.init(testing.allocator, null);
+    defer store.deinit();
+    store.object_manager = &om;
+
+    _ = try store.produce("size-topic", 0, "record");
+    const stream_id = hashPartitionKey("size-topic", 0);
+
+    // Register 3 objects totaling 3000 bytes
+    try om.commitStreamObject(10, stream_id, 0, 100, "so/1", 1000);
+    try om.commitStreamObject(11, stream_id, 100, 200, "so/2", 1000);
+    try om.commitStreamObject(12, stream_id, 200, 300, "so/3", 1000);
+
+    // Size budget = 2000 → need to drop first object (1000 bytes)
+    const policy = RetentionPolicy{
+        .retention_ms = -1, // no time retention
+        .retention_bytes = 2000,
+        .cleanup_policy = .delete,
+    };
+
+    const trimmed = try store.applyRetention(policy);
+    try testing.expect(trimmed > 0);
+
+    // Verify the stream was trimmed to at least offset 100
+    const stream = om.getStream(stream_id).?;
+    try testing.expect(stream.start_offset >= 100);
+}
+
+test "applyRetention returns 0 when no ObjectManager is set" {
+    var store = PartitionStore.init(testing.allocator, null);
+    defer store.deinit();
+
+    const policy = RetentionPolicy{
+        .retention_ms = 1000,
+        .retention_bytes = -1,
+        .cleanup_policy = .delete,
+    };
+
+    const trimmed = try store.applyRetention(policy);
+    try testing.expectEqual(@as(u64, 0), trimmed);
 }

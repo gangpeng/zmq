@@ -37,6 +37,11 @@ pub const Server = struct {
     batch_flush_fn: ?*const fn () void = null,
     /// Group commit: returns true if there are pending WAL writes (used to reduce epoll timeout).
     has_pending_flush_fn: ?*const fn () bool = null,
+    /// Periodic tick: called ~once per second from the epoll loop for broker maintenance
+    /// (retention enforcement, compaction scheduling, session eviction, metrics).
+    /// NOTE: AutoMQ runs similar periodic tasks via a ScheduledExecutorService.
+    /// ZMQ uses a callback from the single-threaded event loop instead.
+    tick_fn: ?*const fn () void = null,
     /// Metric registry for tracking active connections. Set by the Broker on startup.
     metrics: ?*MetricRegistry = null,
     /// Set to true when the server enters the connection drain phase of graceful shutdown.
@@ -421,6 +426,7 @@ pub const Server = struct {
         var events: [256]linux.epoll_event = undefined;
         var loop_count: u64 = 0;
         var listener_removed_from_epoll = false;
+        var last_tick_ms: i64 = std.time.milliTimestamp();
 
         while (self.running) {
             // When draining, stop accepting new connections by removing the
@@ -548,6 +554,16 @@ pub const Server = struct {
             // in this epoll iteration share a single S3 PUT.
             if (self.batch_flush_fn) |flush_fn| {
                 flush_fn();
+            }
+
+            // Periodic tick: call broker maintenance roughly once per second.
+            // Handles retention enforcement, compaction scheduling, consumer group
+            // session eviction, transaction expiry, metrics, and failover checks.
+            if (self.tick_fn) |tick| {
+                if (now_ms - last_tick_ms >= 1000) {
+                    tick();
+                    last_tick_ms = now_ms;
+                }
             }
 
             loop_count += 1;

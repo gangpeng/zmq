@@ -62,6 +62,18 @@ pub fn brokerHasPendingFlush() bool {
     return false;
 }
 
+/// Periodic maintenance: called ~once per second from the Server's epoll loop.
+/// Delegates to Broker.tick() which handles retention enforcement, compaction,
+/// consumer group session eviction, transaction expiry, and metrics updates.
+///
+/// NOTE: AutoMQ runs these tasks on dedicated ScheduledExecutorService threads.
+/// ZMQ runs them inline on the event loop because it's single-threaded.
+pub fn brokerTick() void {
+    if (global_broker) |broker| {
+        broker.tick();
+    }
+}
+
 // ---------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------
@@ -171,4 +183,14 @@ test "brokerHasPendingFlush returns false when no broker" {
 
     const result = brokerHasPendingFlush();
     try testing.expect(!result);
+}
+
+test "brokerTick no-op when no broker" {
+    global_broker = null;
+    defer {
+        global_broker = null;
+    }
+
+    // Should not crash
+    brokerTick();
 }

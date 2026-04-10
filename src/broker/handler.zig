@@ -107,6 +107,9 @@ pub const Broker = struct {
     s3_flush_failures: u64 = 0,
     /// Dirty flag for producer sequence persistence.
     producer_sequences_dirty: bool = false,
+    /// Timestamp of last retention enforcement run.
+    /// Retention runs every 60 seconds (matching AutoMQ's LogCleaner interval).
+    last_retention_check_ms: i64 = 0,
     /// Failover controller for broker failure handling.
     failover_controller: FailoverController,
     /// Auto-balancer for partition reassignment.
@@ -629,9 +632,67 @@ pub const Broker = struct {
         // Periodically persist committed offsets and group state
         self.persistOffsets();
 
+        // Enforce log retention policies every 60 seconds.
+        // Advances stream.start_offset for partitions where data has exceeded
+        // the configured retention_ms or retention_bytes. The actual S3 object
+        // deletion happens in the compaction cycle below (cleanupExpired).
+        //
+        // NOTE: AutoMQ runs this in LogCleaner on a dedicated thread every 60s.
+        // ZMQ runs it inline on the event loop since it only updates offsets
+        // (no I/O), and compaction handles the actual S3 deletes.
+        const now_ms = std.time.milliTimestamp();
+        if (now_ms - self.last_retention_check_ms >= 60_000) {
+            self.last_retention_check_ms = now_ms;
+            self.enforceRetentionPolicies();
+        }
+
         // Run S3 object compaction (split multi-stream SSOs, merge small SOs)
         if (self.compaction_manager) |*cm| {
             cm.maybeCompact();
+        }
+    }
+
+    /// Enforce retention policies for all topics.
+    /// Iterates topics, builds a RetentionPolicy from each topic's config,
+    /// and calls PartitionStore.applyRetention() to advance trim points.
+    ///
+    /// NOTE: AutoMQ's LogCleaner iterates all LogSegments and checks
+    /// retention per-partition. ZMQ delegates to ObjectManager which
+    /// checks StreamObject timestamps/sizes per-stream.
+    fn enforceRetentionPolicies(self: *Broker) void {
+        const PartitionStore = @import("partition_store.zig").PartitionStore;
+        var total_trimmed: u64 = 0;
+
+        var topic_it = self.topics.iterator();
+        while (topic_it.next()) |entry| {
+            const info = entry.value_ptr;
+            const config = info.config;
+
+            // Build retention policy from per-topic config
+            const policy = PartitionStore.RetentionPolicy{
+                .retention_ms = config.retention_ms,
+                .retention_bytes = config.retention_bytes,
+                .cleanup_policy = if (std.mem.eql(u8, config.cleanup_policy, "compact"))
+                    .compact
+                else if (std.mem.eql(u8, config.cleanup_policy, "compact,delete"))
+                    .compact_delete
+                else
+                    .delete,
+            };
+
+            // Skip topics with unlimited retention and no size limit
+            if (policy.retention_ms <= 0 and policy.retention_bytes <= 0) continue;
+            if (policy.cleanup_policy != .delete and policy.cleanup_policy != .compact_delete) continue;
+
+            const trimmed = self.store.applyRetention(policy) catch |err| {
+                log.warn("Retention enforcement failed for topic {s}: {}", .{ entry.key_ptr.*, err });
+                continue;
+            };
+            total_trimmed += trimmed;
+        }
+
+        if (total_trimmed > 0) {
+            log.info("Retention enforcement: trimmed {d} partition(s)", .{total_trimmed});
         }
     }
 

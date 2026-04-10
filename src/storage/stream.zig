@@ -182,6 +182,15 @@ pub const StreamObject = struct {
     end_offset: u64,
     object_size: u64,
     s3_key: []const u8, // owned, heap-allocated
+    /// Maximum record timestamp (milliseconds since epoch) in this object.
+    /// Used by time-based retention to find the trim point without parsing
+    /// raw RecordBatch data. Populated from RecordBatch.max_timestamp during
+    /// force-split or from StreamSetObject.data_time_ms.
+    ///
+    /// NOTE: AutoMQ tracks this in the Stream layer (ElasticLog) and uses it
+    /// to drive ListOffsets-by-timestamp and time-based retention. ZMQ stores
+    /// it per-object for simpler retention scanning.
+    max_timestamp_ms: i64 = 0,
 
     pub fn deinit(self: *StreamObject, allocator: Allocator) void {
         allocator.free(self.s3_key);
@@ -329,6 +338,69 @@ pub const ObjectManager = struct {
         stream.trim(new_start_offset);
     }
 
+    /// Compute total bytes of all StreamObjects for a given stream.
+    /// Used by size-based retention to check if a partition exceeds retention_bytes.
+    pub fn getStreamTotalBytes(self: *const ObjectManager, stream_id: u64) u64 {
+        const obj_ids = self.stream_object_index.get(stream_id) orelse return 0;
+        var total: u64 = 0;
+        for (obj_ids.items) |obj_id| {
+            if (self.stream_objects.get(obj_id)) |so| {
+                total += so.object_size;
+            }
+        }
+        return total;
+    }
+
+    /// Find the trim offset for time-based retention.
+    /// Returns the end_offset of the last StreamObject whose max_timestamp_ms
+    /// is entirely before `cutoff_ms`, or null if no objects qualify.
+    ///
+    /// After trimming to this offset, all objects with timestamps before the
+    /// retention cutoff will be eligible for cleanup by cleanupExpired().
+    pub fn findTrimOffsetByTimestamp(self: *const ObjectManager, stream_id: u64, cutoff_ms: i64) ?u64 {
+        const obj_ids = self.stream_object_index.get(stream_id) orelse return null;
+        var trim_offset: ?u64 = null;
+
+        // Objects in stream_object_index are sorted by start_offset (ascending).
+        // Walk from oldest to newest, collecting objects that are entirely expired.
+        for (obj_ids.items) |obj_id| {
+            const so = self.stream_objects.get(obj_id) orelse continue;
+            if (so.max_timestamp_ms > 0 and so.max_timestamp_ms < cutoff_ms) {
+                trim_offset = so.end_offset;
+            } else {
+                // Once we hit an object that is NOT expired, stop — all
+                // subsequent objects are newer (sorted by start_offset).
+                break;
+            }
+        }
+
+        return trim_offset;
+    }
+
+    /// Find the trim offset for size-based retention.
+    /// Returns the end_offset to trim to so that the total remaining bytes
+    /// are at most `max_bytes`, or null if already within the limit.
+    ///
+    /// Walks from the oldest objects and accumulates bytes to drop until the
+    /// remaining total fits within the budget.
+    pub fn findTrimOffsetBySize(self: *const ObjectManager, stream_id: u64, max_bytes: u64) ?u64 {
+        const obj_ids = self.stream_object_index.get(stream_id) orelse return null;
+        const total = self.getStreamTotalBytes(stream_id);
+        if (total <= max_bytes) return null;
+
+        var excess = total - max_bytes;
+        var trim_offset: ?u64 = null;
+
+        for (obj_ids.items) |obj_id| {
+            const so = self.stream_objects.get(obj_id) orelse continue;
+            trim_offset = so.end_offset;
+            if (so.object_size >= excess) break;
+            excess -= so.object_size;
+        }
+
+        return trim_offset;
+    }
+
     // ---- Object ID allocation ----
 
     pub fn allocateObjectId(self: *ObjectManager) u64 {
@@ -390,6 +462,22 @@ pub const ObjectManager = struct {
         s3_key: []const u8,
         object_size: u64,
     ) !void {
+        return self.commitStreamObjectWithTimestamp(object_id, stream_id, start_offset, end_offset, s3_key, object_size, 0);
+    }
+
+    /// Register a StreamObject with an explicit max timestamp.
+    /// The timestamp is used by time-based retention to find objects older than
+    /// the retention period without parsing raw RecordBatch data.
+    pub fn commitStreamObjectWithTimestamp(
+        self: *ObjectManager,
+        object_id: u64,
+        stream_id: u64,
+        start_offset: u64,
+        end_offset: u64,
+        s3_key: []const u8,
+        object_size: u64,
+        max_timestamp_ms: i64,
+    ) !void {
         // Ensure next_object_id stays ahead of any committed ID
         if (object_id >= self.next_object_id) {
             self.next_object_id = object_id + 1;
@@ -404,6 +492,7 @@ pub const ObjectManager = struct {
             .end_offset = end_offset,
             .object_size = object_size,
             .s3_key = key_copy,
+            .max_timestamp_ms = max_timestamp_ms,
         });
 
         // Update stream_object_index — insert maintaining sorted order by start_offset
@@ -644,7 +733,7 @@ pub const ObjectManager = struct {
         var so_it = self.stream_objects.iterator();
         while (so_it.next()) |entry| {
             const so = entry.value_ptr;
-            size += 8 + 8 + 8 + 8 + 8; // fixed fields
+            size += 8 + 8 + 8 + 8 + 8 + 8; // fixed fields (incl. max_timestamp_ms)
             size += 2 + so.s3_key.len; // key_len + key
         }
 
@@ -708,6 +797,7 @@ pub const ObjectManager = struct {
             writeU64(buf, &pos, so.start_offset);
             writeU64(buf, &pos, so.end_offset);
             writeU64(buf, &pos, so.object_size);
+            writeI64(buf, &pos, so.max_timestamp_ms);
             writeU16(buf, &pos, @intCast(so.s3_key.len));
             @memcpy(buf[pos .. pos + so.s3_key.len], so.s3_key);
             pos += so.s3_key.len;
@@ -825,13 +915,14 @@ pub const ObjectManager = struct {
             const start_offset = readU64(data, &pos) orelse return error.CorruptSnapshot;
             const end_offset = readU64(data, &pos) orelse return error.CorruptSnapshot;
             const object_size = readU64(data, &pos) orelse return error.CorruptSnapshot;
+            const max_timestamp_ms = readI64(data, &pos) orelse return error.CorruptSnapshot;
             const key_len = readU16(data, &pos) orelse return error.CorruptSnapshot;
             if (pos + key_len > data.len) return error.CorruptSnapshot;
             const s3_key = data[pos .. pos + key_len];
             pos += key_len;
 
-            // Use commitStreamObject to rebuild both primary store and secondary index
-            try self.commitStreamObject(object_id, stream_id, start_offset, end_offset, s3_key, object_size);
+            // Use commitStreamObjectWithTimestamp to rebuild both primary store and secondary index
+            try self.commitStreamObjectWithTimestamp(object_id, stream_id, start_offset, end_offset, s3_key, object_size, max_timestamp_ms);
         }
 
         // --- StreamSetObjects ---
@@ -1786,4 +1877,106 @@ test "ObjectManager snapshot — SSO data_time_ms preserved" {
     try testing.expectEqual(@as(u64, 1024), restored_sso.object_size);
     try testing.expectEqual(@as(i32, 0), restored_sso.node_id);
     try testing.expectEqual(@as(u64, 1), restored_sso.order_id);
+}
+
+// ---------------------------------------------------------------
+// Retention query helper tests
+// ---------------------------------------------------------------
+
+test "ObjectManager getStreamTotalBytes sums all StreamObject sizes" {
+    var om = ObjectManager.init(testing.allocator, 1);
+    defer om.deinit();
+    _ = try om.createStream(1);
+
+    try om.commitStreamObject(1, 1, 0, 100, "so/1", 1024);
+    try om.commitStreamObject(2, 1, 100, 200, "so/2", 2048);
+    try om.commitStreamObject(3, 1, 200, 300, "so/3", 512);
+
+    try testing.expectEqual(@as(u64, 3584), om.getStreamTotalBytes(1));
+    // Unknown stream returns 0
+    try testing.expectEqual(@as(u64, 0), om.getStreamTotalBytes(999));
+}
+
+test "ObjectManager findTrimOffsetByTimestamp finds correct cutoff" {
+    var om = ObjectManager.init(testing.allocator, 1);
+    defer om.deinit();
+    _ = try om.createStream(1);
+
+    // Three objects with ascending timestamps
+    try om.commitStreamObjectWithTimestamp(1, 1, 0, 100, "so/1", 1024, 1000); // ts=1000
+    try om.commitStreamObjectWithTimestamp(2, 1, 100, 200, "so/2", 1024, 2000); // ts=2000
+    try om.commitStreamObjectWithTimestamp(3, 1, 200, 300, "so/3", 1024, 3000); // ts=3000
+
+    // Cutoff at 1500: only object 1 (ts=1000) is expired → trim to 100
+    try testing.expectEqual(@as(u64, 100), om.findTrimOffsetByTimestamp(1, 1500).?);
+
+    // Cutoff at 2500: objects 1 and 2 expired → trim to 200
+    try testing.expectEqual(@as(u64, 200), om.findTrimOffsetByTimestamp(1, 2500).?);
+
+    // Cutoff at 3500: all expired → trim to 300
+    try testing.expectEqual(@as(u64, 300), om.findTrimOffsetByTimestamp(1, 3500).?);
+
+    // Cutoff at 500: nothing expired → null
+    try testing.expect(om.findTrimOffsetByTimestamp(1, 500) == null);
+
+    // Unknown stream → null
+    try testing.expect(om.findTrimOffsetByTimestamp(999, 5000) == null);
+}
+
+test "ObjectManager findTrimOffsetByTimestamp skips objects with zero timestamp" {
+    var om = ObjectManager.init(testing.allocator, 1);
+    defer om.deinit();
+    _ = try om.createStream(1);
+
+    // Object with no timestamp (legacy/unknown) should NOT be trimmed by time
+    try om.commitStreamObjectWithTimestamp(1, 1, 0, 100, "so/1", 1024, 0);
+    try om.commitStreamObjectWithTimestamp(2, 1, 100, 200, "so/2", 1024, 2000);
+
+    // Cutoff at 5000: object 1 has ts=0, treated as "unknown" → skip → stop
+    // Object 1 blocks trimming even though object 2 would qualify
+    try testing.expect(om.findTrimOffsetByTimestamp(1, 5000) == null);
+}
+
+test "ObjectManager findTrimOffsetBySize trims oldest objects first" {
+    var om = ObjectManager.init(testing.allocator, 1);
+    defer om.deinit();
+    _ = try om.createStream(1);
+
+    try om.commitStreamObject(1, 1, 0, 100, "so/1", 1000);
+    try om.commitStreamObject(2, 1, 100, 200, "so/2", 1000);
+    try om.commitStreamObject(3, 1, 200, 300, "so/3", 1000);
+
+    // Total = 3000. Max budget = 2000 → need to drop 1000 → trim first object
+    try testing.expectEqual(@as(u64, 100), om.findTrimOffsetBySize(1, 2000).?);
+
+    // Max budget = 1000 → need to drop 2000 → trim first two objects
+    try testing.expectEqual(@as(u64, 200), om.findTrimOffsetBySize(1, 1000).?);
+
+    // Max budget = 500 → need to drop 2500 → trim all three
+    try testing.expectEqual(@as(u64, 300), om.findTrimOffsetBySize(1, 500).?);
+
+    // Max budget = 3000 → nothing to drop
+    try testing.expect(om.findTrimOffsetBySize(1, 3000) == null);
+
+    // Max budget = 5000 → nothing to drop (under budget)
+    try testing.expect(om.findTrimOffsetBySize(1, 5000) == null);
+}
+
+test "ObjectManager StreamObject max_timestamp_ms persists through snapshot" {
+    var om = ObjectManager.init(testing.allocator, 1);
+    defer om.deinit();
+    _ = try om.createStream(1);
+
+    try om.commitStreamObjectWithTimestamp(1, 1, 0, 100, "so/1", 1024, 42000);
+
+    const snap = try om.takeSnapshot(&.{});
+    defer testing.allocator.free(snap);
+
+    var om2 = ObjectManager.init(testing.allocator, 1);
+    defer om2.deinit();
+    const orphans = try om2.loadSnapshot(snap);
+    defer testing.allocator.free(orphans);
+
+    const so = om2.stream_objects.get(1).?;
+    try testing.expectEqual(@as(i64, 42000), so.max_timestamp_ms);
 }

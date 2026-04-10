@@ -484,6 +484,8 @@ pub fn main() !void {
         // Wire up group commit flush callbacks for S3 WAL batching
         server.batch_flush_fn = &handler_routing.brokerFlushPendingWal;
         server.has_pending_flush_fn = &handler_routing.brokerHasPendingFlush;
+        // Wire up periodic tick for broker maintenance (retention, compaction, sessions)
+        server.tick_fn = &handler_routing.brokerTick;
         global_server = &server;
         defer {
             server.stop();
