@@ -355,28 +355,19 @@ pub const Broker = struct {
             }
         }
 
-        // Register standard broker metrics
+        // Register standard broker metrics (does not take &self pointers,
+        // only registers names in the MetricRegistry's hash maps)
         metrics_mod.registerBrokerMetrics(&broker.metrics) catch {};
-        // Register subsystem metrics (S3, compaction, cache, Raft)
         metrics_mod.registerS3Metrics(&broker.metrics) catch {};
         metrics_mod.registerCompactionMetrics(&broker.metrics) catch {};
         metrics_mod.registerCacheMetrics(&broker.metrics) catch {};
         metrics_mod.registerRaftMetrics(&broker.metrics) catch {};
 
-        // Wire metrics registry into subsystems
-        broker.store.cache.metrics = &broker.metrics;
-        if (broker.store.s3_client) |*c| {
-            c.metrics = &broker.metrics;
-        }
-        if (broker.store.s3_block_cache) |*bc| {
-            bc.metrics = &broker.metrics;
-        }
-        if (broker.compaction_manager) |*cm| {
-            cm.metrics = &broker.metrics;
-        }
-
-        // Wire metrics registry into group coordinator for consumer lag tracking
-        broker.groups.metrics = &broker.metrics;
+        // NOTE: Do NOT wire &broker.metrics into subsystems here!
+        // This function returns a Broker by value which gets moved to its
+        // final heap location via alloc.create(). Any &broker.X pointers
+        // captured here would become dangling. Call wireInternalPointers()
+        // after the Broker is at its final address.
 
         // Configure security settings
         broker.sasl_enabled = config.sasl_enabled;
@@ -421,6 +412,31 @@ pub const Broker = struct {
         self.raft_state = raft;
         // Wire metrics into the Raft state for consensus observability
         raft.metrics = &self.metrics;
+    }
+
+    /// Establish internal self-referencing pointers after the Broker struct
+    /// is at its final heap address. Must be called once after alloc.create(Broker)
+    /// + assignment.
+    ///
+    /// During initWithConfig(), the Broker is constructed as a stack value and
+    /// then moved to the heap via `brk.* = Broker.initWithConfig(...)`. Any
+    /// pointers from subsystems to &broker.metrics (or other Broker fields)
+    /// captured during init would become dangling after the move. This method
+    /// re-wires them to point at the final heap address.
+    pub fn wireInternalPointers(self: *Broker) void {
+        // Wire metrics registry into subsystems
+        self.store.cache.metrics = &self.metrics;
+        if (self.store.s3_client) |*c| {
+            c.metrics = &self.metrics;
+        }
+        if (self.store.s3_block_cache) |*bc| {
+            bc.metrics = &self.metrics;
+        }
+        if (self.compaction_manager) |*cm| {
+            cm.metrics = &self.metrics;
+        }
+        // Wire metrics into group coordinator for consumer lag tracking
+        self.groups.metrics = &self.metrics;
     }
 
     /// Open the broker (initializes storage, WAL, loads persisted metadata)

@@ -73,9 +73,10 @@ pub fn main() !void {
         \\
     , .{});
 
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer _ = gpa.deinit();
-    const alloc = gpa.allocator();
+    // Use libc malloc which is inherently thread-safe and avoids GPA
+    // debug-mode overhead that can trigger false protection faults under
+    // concurrent access from background threads (ElectionLoop, MetadataClient).
+    const alloc = std.heap.c_allocator;
 
     // Parse CLI
     var port: u16 = 9092;
@@ -301,6 +302,10 @@ pub fn main() !void {
         if (brk.compaction_manager) |*cm| {
             cm.object_manager = &brk.object_manager;
         }
+        // Re-wire metrics pointers from subsystems (cache, s3_client, groups)
+        // to the heap-allocated Broker. These were dangling since initWithConfig
+        // built the Broker on the stack before moving it to the heap.
+        brk.wireInternalPointers();
 
         if (controller) |ctrl| {
             brk.setRaftState(&ctrl.raft_state);
