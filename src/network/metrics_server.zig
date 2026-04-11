@@ -215,7 +215,7 @@ test "MetricsServer startup_complete defaults to false" {
     var registry = MetricRegistry.init(testing.allocator);
     defer registry.deinit();
 
-    var server = MetricsServer.init(testing.allocator, 19090, &registry);
+    const server = MetricsServer.init(testing.allocator, 19090, &registry);
     try testing.expect(!server.startup_complete);
 }
 
@@ -223,7 +223,7 @@ test "MetricsServer ready returns 503 when startup not complete" {
     var registry = MetricRegistry.init(testing.allocator);
     defer registry.deinit();
 
-    var server = MetricsServer.init(testing.allocator, 19090, &registry);
+    const server = MetricsServer.init(testing.allocator, 19090, &registry);
     // Before startup_complete, readiness should indicate not ready
     try testing.expect(!server.startup_complete);
 
@@ -236,7 +236,7 @@ test "MetricsServer ready transitions from 503 to 200" {
     var registry = MetricRegistry.init(testing.allocator);
     defer registry.deinit();
 
-    var server = MetricsServer.init(testing.allocator, 19090, &registry);
+    const server = MetricsServer.init(testing.allocator, 19090, &registry);
 
     // Phase 1: not ready
     try testing.expect(!server.startup_complete);

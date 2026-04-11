@@ -591,22 +591,8 @@ pub const Broker = struct {
         // Flush S3 WAL batcher if threshold reached
         if (self.store.s3_wal_batcher) |*batcher| {
             if (batcher.shouldFlush()) {
-                if (batcher.flushBuild()) |batch_data| {
-                    if (self.store.s3_storage) |*s3| {
-                        const obj_key = batcher.currentObjectKey(self.allocator) catch null;
-                        if (obj_key) |ok| {
-                            defer self.allocator.free(ok);
-                            s3.putObject(ok, batch_data) catch |err| {
-                                log.warn("S3 WAL batch flush failed: {}", .{err});
-                                batcher.batch_upload_failures += 1;
-                            };
-                        }
-                        self.allocator.free(batch_data);
-                    } else {
-                        self.allocator.free(batch_data);
-                    }
-                } else |err| {
-                    log.warn("S3 WAL batch build failed: {}", .{err});
+                if (self.store.s3_storage) |*s3| {
+                    _ = batcher.flushNow(s3);
                 }
             }
         }

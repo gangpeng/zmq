@@ -278,8 +278,8 @@ pub const MetadataPersistence = struct {
         var it = sequences.iterator();
         while (it.next()) |entry| {
             try writer.print("{d}\t{d}\t{d}\t{d}\n", .{
-                entry.value_ptr.producer_id,
-                entry.key_ptr.*,
+                entry.key_ptr.producer_id,
+                entry.key_ptr.partition_key,
                 entry.value_ptr.last_sequence,
                 entry.value_ptr.producer_epoch,
             });

@@ -803,21 +803,21 @@ fn testHandler(_: []const u8, _: Allocator) ?[]u8 {
 }
 
 test "Server init creates valid server" {
-    var server = try Server.init(testing.allocator, "127.0.0.1", 0, &testHandler, 4);
+    const server = try Server.init(testing.allocator, "127.0.0.1", 0, &testHandler, 4);
     try testing.expect(!server.running);
     try testing.expect(!server.draining);
     try testing.expectEqual(@as(i64, 30_000), server.drain_timeout_ms);
 }
 
 test "Server stop sets running to false" {
-    var server = try Server.init(testing.allocator, "127.0.0.1", 0, &testHandler, 4);
+    const server = try Server.init(testing.allocator, "127.0.0.1", 0, &testHandler, 4);
     server.running = true;
     server.stop();
     try testing.expect(!server.running);
 }
 
 test "Server initiateGracefulDrain sets draining flag" {
-    var server = try Server.init(testing.allocator, "127.0.0.1", 0, &testHandler, 4);
+    const server = try Server.init(testing.allocator, "127.0.0.1", 0, &testHandler, 4);
     server.running = true;
 
     try testing.expect(!server.draining);
@@ -829,7 +829,7 @@ test "Server initiateGracefulDrain sets draining flag" {
 }
 
 test "Server initiateGracefulDrain is idempotent" {
-    var server = try Server.init(testing.allocator, "127.0.0.1", 0, &testHandler, 4);
+    const server = try Server.init(testing.allocator, "127.0.0.1", 0, &testHandler, 4);
     server.running = true;
 
     server.initiateGracefulDrain();
@@ -842,19 +842,19 @@ test "Server initiateGracefulDrain is idempotent" {
 }
 
 test "Server isDrainComplete returns false when not draining" {
-    var server = try Server.init(testing.allocator, "127.0.0.1", 0, &testHandler, 4);
+    const server = try Server.init(testing.allocator, "127.0.0.1", 0, &testHandler, 4);
     try testing.expect(!server.isDrainComplete(5, std.time.milliTimestamp()));
 }
 
 test "Server isDrainComplete returns true when no connections" {
-    var server = try Server.init(testing.allocator, "127.0.0.1", 0, &testHandler, 4);
+    const server = try Server.init(testing.allocator, "127.0.0.1", 0, &testHandler, 4);
     server.draining = true;
     server.drain_start_ms = std.time.milliTimestamp();
     try testing.expect(server.isDrainComplete(0, std.time.milliTimestamp()));
 }
 
 test "Server isDrainComplete returns true on timeout" {
-    var server = try Server.init(testing.allocator, "127.0.0.1", 0, &testHandler, 4);
+    const server = try Server.init(testing.allocator, "127.0.0.1", 0, &testHandler, 4);
     server.draining = true;
     server.drain_timeout_ms = 100;
     // Simulate drain started 200ms ago
@@ -863,7 +863,7 @@ test "Server isDrainComplete returns true on timeout" {
 }
 
 test "Server isDrainComplete returns false when connections active and timeout not reached" {
-    var server = try Server.init(testing.allocator, "127.0.0.1", 0, &testHandler, 4);
+    const server = try Server.init(testing.allocator, "127.0.0.1", 0, &testHandler, 4);
     server.draining = true;
     server.drain_timeout_ms = 30_000;
     server.drain_start_ms = std.time.milliTimestamp();
@@ -871,7 +871,7 @@ test "Server isDrainComplete returns false when connections active and timeout n
 }
 
 test "Server double signal: first drains, second force-stops" {
-    var server = try Server.init(testing.allocator, "127.0.0.1", 0, &testHandler, 4);
+    const server = try Server.init(testing.allocator, "127.0.0.1", 0, &testHandler, 4);
     server.running = true;
 
     // First signal: initiate drain
