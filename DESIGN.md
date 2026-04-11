@@ -119,8 +119,8 @@ ZMQ is organized into distinct modules that interact through well-defined interf
 | **Broker** | `src/broker/handler.zig` | Stateful Kafka broker. Dispatches all 44+ Kafka client APIs. Owns PartitionStore, GroupCoordinator, TxnCoordinator, QuotaManager, Metrics. Holds optional `?*RaftState` pointer (null in broker-only mode). |
 | **PartitionStore** | `src/broker/partition_store.zig` | Multi-tier storage engine: produce writes to WAL + LogCache + S3WalBatcher; fetch reads from LogCache → S3BlockCache → S3. Manages per-partition state (offsets, HW, LSO). |
 | **S3WalBatcher** | `src/storage/wal.zig` | Batches records from all partitions and uploads to S3 via ObjectWriter format. Epoch-fenced: rejects writes after `fence()`. Three modes: sync (flush per produce), async (flush on tick), group_commit (batch flush at epoll boundary — AutoMQ-style, default). Group commit defers S3 flush to batch boundaries, enabling many produces to share one S3 PUT. |
-| **ObjectManager** | `src/storage/stream.zig` | Metadata registry for Streams, StreamSetObjects (multi-stream), and StreamObjects (per-stream). Resolves fetch queries by merging both object types sorted by offset. |
-| **CompactionManager** | `src/storage/compaction.zig` | Periodic compaction: force-splits multi-stream SSOs into per-stream SOs, then merges small SOs. Uses write-before-delete pattern for crash safety. |
+| **ObjectManager** | `src/storage/stream.zig` | Metadata registry for Streams, StreamSetObjects (multi-stream), and StreamObjects (per-stream). Resolves fetch queries by merging both object types sorted by offset. Tracks S3 object lifecycle states (prepared→committed→mark_destroyed). Includes PreparedObjectRegistry (dual-buffer) for KRaft snapshot safety. |
+| **CompactionManager** | `src/storage/compaction.zig` | 5-phase compaction: orphan cleanup → force-split SSOs → merge small SOs → mark expired as destroyed (10-min consumer-safe buffer) → expire stale prepared objects (60-min TTL). Uses write-before-delete pattern for crash safety. |
 | **GroupCoordinator** | `src/broker/group_coordinator.zig` | Consumer group lifecycle: state machine (Empty → PreparingRebalance → CompletingRebalance → Stable), JoinGroup, SyncGroup (leader-only validation), Heartbeat (rebalance signaling), offset commit/fetch. |
 | **TxnCoordinator** | `src/broker/txn_coordinator.zig` | Exactly-once transactions: 2PC with AddPartitionsToTxn, EndTxn, WriteTxnMarkers. Builds control record batches for commit/abort markers. |
 | **FailoverController** | `src/broker/failover.zig` | Detects broker failures via heartbeat timeout (30s). Fences failed nodes by bumping WAL epoch and reassigning partitions. |
@@ -132,7 +132,9 @@ ZMQ is organized into distinct modules that interact through well-defined interf
 
 **Fetch path:** Client → Broker → PartitionStore.fetchWithIsolation() → LogCache.get() → S3BlockCache.get() → ObjectManager.getObjects() → S3 GET + ObjectReader.parse()
 
-**Compaction:** Broker.tick() → CompactionManager.maybeCompact() → forceSplitAll() [SSOs → SOs] → mergeAll() [small SOs → large SOs]
+**Compaction:** Broker.tick() → CompactionManager.maybeCompact() → forceSplitAll() [SSOs → SOs] → mergeAll() [small SOs → large SOs] → cleanupExpired() [mark expired → mark_destroyed] → cleanupDestroyed() [physical S3 delete after 10-min retention] → expirePrepared() [clean 60-min stale prepared objects]
+
+**Data Expiration:** Broker.tick() every 60s → enforceRetentionPolicies() → applyRetention() → findTrimOffsetByTimestamp/Size → advance log_start_offset + stream.start_offset → next compaction cycle deletes expired S3 objects
 
 **Election:** ElectionLoop.run() → RaftState.startElection() → RaftClientPool.broadcastVoteRequest() → becomeLeader() or retry
 
@@ -656,6 +658,50 @@ When a broker restarts after a clean shutdown or crash, implemented in `Wal.reco
 
 ---
 
+## Data Expiration
+
+ZMQ implements AutoMQ's 5-layer data expiration system. All code is AI-generated.
+
+### Layer 1: Automatic Retention Enforcement
+
+Standard Kafka retention configs (`log.retention.ms`, `log.retention.bytes`, per-topic overrides) are enforced automatically. `Broker.tick()` calls `enforceRetentionPolicies()` every 60 seconds, which:
+- **Time-based**: `ObjectManager.findTrimOffsetByTimestamp()` scans StreamObjects to find the cutoff where `max_timestamp_ms < (now - retention_ms)`
+- **Size-based**: `ObjectManager.findTrimOffsetBySize()` drops oldest objects until total bytes fits within `retention_bytes`
+- Advances both `log_start_offset` and `stream.start_offset` atomically
+
+### Layer 2: Compaction Cleanup
+
+`CompactionManager.cleanupExpired()` runs every 5 minutes and marks StreamObjects behind `stream.start_offset` as `mark_destroyed` (not immediately deleted — see Layer 3).
+
+### Layer 3: S3 Object Lifecycle State Machine
+
+Every S3 object tracks its lifecycle state (`S3ObjectState` enum):
+
+```
+PREPARED (60-min TTL) → COMMITTED → MARK_DESTROYED (10-min retention) → [physical S3 delete]
+```
+
+- **PREPARED**: Object ID allocated but not yet written to S3. Auto-expired after 60 minutes if not committed (prevents S3 leaks from crashed prepare→commit flows).
+- **COMMITTED**: Normal live object. Served by fetch queries.
+- **MARK_DESTROYED**: Scheduled for deletion. Retained for 10 minutes so consumers can finish in-flight reads before physical S3 deletion.
+- `getObjects()` automatically filters out non-committed objects from fetch results.
+
+### Layer 4: WAL Cleanup
+
+After each successful S3 WAL batch upload, `S3WalBatcher.last_flushed_segment_id` is updated. `Broker.tick()` calls `wal.cleanupSegments()` to remove local WAL segment files that have been durably uploaded to S3.
+
+### Layer 5: Dual-Buffer Prepared Object Registry
+
+`PreparedObjectRegistry` maintains two rotating hash maps (`current` and `previous`) of prepared object IDs, swapped every 60 minutes. This protects against losing prepared object tracking when the Raft log is truncated by a snapshot:
+
+- New prepared objects are tracked in `current`
+- Every 60 minutes: `previous` is discarded, `current` becomes `previous`, fresh `current` created
+- Serialized to `{data_dir}/prepared.snapshot` alongside every Raft snapshot
+- Loaded on startup to restore prepared object tracking across restarts
+- `ElectionLoop.pre_snapshot_fn` callback serializes the registry before each periodic Raft snapshot
+
+---
+
 ## Auto Load Balancing
 
 ### How It Works
@@ -1023,6 +1069,33 @@ Transaction state is persisted to disk for crash recovery, managed by `MetadataP
 | Idempotent producer dedup | Full per-partition sequence tracking with ProducerStateManager | `producer_sequences` HashMap in `Broker` (basic dedup) |
 | AddOffsetsToTxn (API 25) | Enrolls `__consumer_offsets` partitions in the transaction for consume-transform-produce EOS | Not yet implemented |
 | Cross-broker transactions | Transaction coordinator writes markers to remote partitions | Single-broker scope only |
+
+---
+
+## Security
+
+All security code is AI-generated. ZMQ supports multiple authentication and encryption mechanisms.
+
+### TLS Encryption
+- **Server TLS**: Runtime OpenSSL loading via `dlopen`/`dlsym` (no compile-time dependency). Strong cipher suites (ECDHE+AESGCM, CHACHA20). TLS 1.2/1.3.
+- **Hostname Verification**: `SSL_set1_host()` called before `SSL_connect()` for RFC 6125 SAN/CN matching.
+- **Certificate Validation**: Chain verification via `SSL_get_verify_result()`, expiry checking via `X509_get0_notAfter` + `X509_cmp_current_time`.
+- **mTLS**: Client certificate principal extraction from subject DN (`"User:<CN>"` format) for ACL authorization.
+- **Handshake Timeout**: 30-second timeout prevents slow-client DoS.
+
+### SASL Authentication
+- **PLAIN**: Password hashed with PBKDF2-HMAC-SHA256 (4096 iterations, random 16-byte salt). Constant-time comparison.
+- **SCRAM-SHA-256**: Full RFC 5802 4-message exchange: `client-first → server-first → client-final → server-final`. Per-connection `ScramStateMachine` tracks exchange state. Existing `ScramSha256Authenticator.verifyClientProof()` used for proof verification.
+- **OAUTHBEARER**: JWT parsing with issuer/audience/expiry claim validation.
+
+### ACL Authorization
+Kafka-compliant model: `(Principal, Operation, Resource, PatternType) → Allow/Deny`. Supports 11 operations, 6 resource types, literal and prefix pattern matching. Deny takes precedence over allow. Super-user bypass.
+
+### Observability
+- **45 Prometheus metric types** exported at `/metrics` endpoint
+- **Structured JSON logging** (NDJSON with ISO 8601 timestamps, correlation IDs)
+- **Health probe** (`/health`): 200 if event loop responsive
+- **Ready probe** (`/ready`): 503 until startup completes, then 200
 
 ---
 

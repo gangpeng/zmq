@@ -15,7 +15,7 @@ A ground-up reimplementation of [AutoMQ](https://github.com/AutoMQ/automq) in Zi
 
 ZMQ is a **full port of AutoMQ from Java to Zig**, aiming to deliver the same cloud-native Kafka experience with the performance characteristics of a systems language:
 
-- **~23,000 lines of hand-written Zig** across 293 source files
+- **~38,000 lines of AI-generated Zig** (plus ~33,000 lines of auto-generated protocol structs) across 303 source files
 - **Zero external dependencies** — everything is built on Zig's standard library
 - **Single static binary** — no JVM, no GC pauses, no classpath
 - **Sub-second startup** — broker is ready to serve in milliseconds
@@ -57,16 +57,16 @@ ZMQ is a **full port of AutoMQ from Java to Zig**, aiming to deliver the same cl
 | `compression` | Gzip, LZ4, Zstd, Snappy codec wrappers |
 | `protocol` | Code-generated Kafka message types (230+ message schemas), headers, record batches |
 | `network` | io_uring/epoll TCP server, TLS, connection management |
-| `storage` | Write-ahead log (WAL), LogCache, S3BlockCache, S3 object format |
+| `storage` | Write-ahead log (WAL), LogCache, S3BlockCache, S3 object format with CRC32C checksums, S3 object lifecycle (prepared→committed→mark_destroyed), data expiration |
 | `raft` | KRaft state machine, leader election, log replication |
 | `broker` | Kafka API request handlers, delayed operation purgatory, partition management |
-| `security` | SASL authentication (PLAIN, SCRAM-SHA-256) |
+| `security` | SASL authentication (PLAIN, SCRAM-SHA-256, OAUTHBEARER), TLS with hostname/cert validation, mTLS, ACL authorization |
 | `streams` | Kafka Streams-compatible processing primitives |
 | `connect` | Kafka Connect-compatible connector framework |
 | `config` | Configuration file parser (Kafka-style `key=value` properties) |
 | `tools` | CLI admin tools |
 | `coordinator` | Group coordinator and transaction coordinator |
-| `metrics` | Prometheus-compatible metrics and health endpoints |
+| `metrics` | Prometheus-compatible metrics (45+ metric types), structured JSON logging, /health and /ready probes |
 
 ### Multi-Tier Storage
 
@@ -275,7 +275,7 @@ make e2e
 make bench
 ```
 
-The E2E test suite (`tests/e2e_test.py`) covers:
+The E2E test suite (`tests/e2e_test.py`) and cluster validation test (`tests/cluster_validation_test.py`) cover:
 
 - Leader election verification
 - Produce 1,000 messages across 3 partitions
@@ -285,6 +285,43 @@ The E2E test suite (`tests/e2e_test.py`) covers:
 - Broker failure and recovery
 - Topic creation and deletion
 - Metadata consistency across brokers
+
+## Production Readiness
+
+ZMQ includes production-grade features across five dimensions. All code is AI-generated using Claude.
+
+### Security
+- **TLS**: Hostname verification (SSL_set1_host), certificate chain validation, expiry checking, 30s handshake timeout
+- **mTLS**: Client certificate principal extraction from subject DN for ACL authorization
+- **SASL/PLAIN**: Password authentication with PBKDF2-hashed credential storage
+- **SCRAM-SHA-256**: Full RFC 5802 multi-round authentication exchange
+- **OAUTHBEARER**: JWT claim extraction (issuer, audience, expiry validation)
+- **ACL Authorization**: Kafka-compliant model (allow/deny, resource types, prefix matching, super-users)
+
+### Data Durability
+- **CRC32C checksums** on all S3 objects (v2 format) with backward-compatible v1 reading
+- **S3 GET retry** with exponential backoff (100ms, 200ms, 400ms)
+- **ObjectManager metadata persistence** via binary snapshot (survives broker restart)
+- **Graceful shutdown**: SIGTERM drains connections (30s), flushes WAL to S3, takes Raft snapshot
+
+### Data Expiration (AutoMQ parity — all 5 layers)
+- **Layer 1**: Automatic time-based and size-based retention enforcement (every 60s)
+- **Layer 2**: Compaction cleanup of expired S3 objects (every 5 min)
+- **Layer 3**: S3 object lifecycle state machine (prepared → committed → mark_destroyed), 10-minute consumer-safe deletion buffer, 60-minute prepared object TTL
+- **Layer 4**: WAL segment cleanup after S3 upload confirmation
+- **Layer 5**: Dual-buffer prepared object registry for KRaft snapshot safety
+
+### Observability
+- **45 Prometheus metric types** at `/metrics` (request latency, error rates, consumer lag, Raft consensus, compaction, cache hit/miss)
+- **Per-API error counters** (`kafka_server_api_errors_total{api,error_code}`)
+- **Consumer lag gauge** (`kafka_consumer_lag{group,topic,partition}`)
+- **Health/Ready probes**: `/health` (liveness), `/ready` (503 until startup completes)
+- **Structured JSON logging** (NDJSON format with ISO 8601 timestamps and correlation IDs)
+
+### High Availability
+- **Graceful shutdown**: SIGTERM → drain connections → flush WAL → Raft snapshot → exit
+- **Double-signal force quit**: Second SIGTERM kills immediately
+- **Request rejection during shutdown**: Returns NOT_LEADER_OR_FOLLOWER (error 6) to redirect clients
 
 ## Configuration File
 
@@ -318,7 +355,7 @@ The broker supports Kafka-style `key=value` properties files. See [`config/serve
 │   ├── storage/            # WAL, LogCache, S3BlockCache, S3 client
 │   ├── raft/               # KRaft consensus, election, replication
 │   ├── broker/             # Request handlers, purgatory, partitions
-│   ├── security/           # SASL (PLAIN, SCRAM-SHA-256)
+│   ├── security/           # SASL (PLAIN, SCRAM-SHA-256, OAUTHBEARER), TLS, ACL, JWT
 │   ├── coordinator/        # Group & transaction coordinators
 │   ├── streams/            # Stream processing primitives
 │   ├── connect/            # Connector framework
@@ -326,7 +363,9 @@ The broker supports Kafka-style `key=value` properties files. See [`config/serve
 │   ├── config/             # Config file parser
 │   └── tools/              # Admin CLI tools
 ├── tests/
-│   └── e2e_test.py         # 9-scenario E2E integration test suite
+│   ├── e2e_test.py         # 9-scenario E2E integration test suite
+│   ├── cluster_validation_test.py # 16-phase cluster validation (wire protocol, stress, observability)
+│   └── production_readiness_test.zig # Cross-cutting integration tests
 ├── benchmarks/
 │   ├── main.zig            # Performance benchmarks
 │   └── benchmark_compare.py# Java vs Zig comparison tool

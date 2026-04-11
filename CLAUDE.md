@@ -2,7 +2,7 @@
 
 ## What this project is
 
-ZMQ is a Zig reimplementation of [AutoMQ](https://github.com/AutoMQ/automq), a cloud-native Apache Kafka built on S3 object storage. The AutoMQ Java codebase (~500K+ lines) is the **source of truth** for architectural decisions. ZMQ should match AutoMQ's design as closely as Zig's idioms allow.
+ZMQ is a Zig reimplementation of [AutoMQ](https://github.com/AutoMQ/automq), a cloud-native Apache Kafka built on S3 object storage. The AutoMQ Java codebase (~500K+ lines) is the **source of truth** for architectural decisions. ZMQ should match AutoMQ's design as closely as Zig's idioms allow. All ZMQ code is AI-generated using Claude.
 
 Key files: `DESIGN.md` (architecture), `README.md` (overview), `src/` (all source code).
 
@@ -16,7 +16,7 @@ zig build -Doptimize=.ReleaseFast  # optimized build
 
 Single-file tests: `zig test src/raft/state.zig`
 
-The codebase currently has **436 unit tests** across 50+ files covering Raft consensus, consumer groups, compaction, failover, storage, protocol serialization, and more.
+The codebase currently has **675 unit tests** across 73 source files (303 including generated) covering Raft consensus, consumer groups, compaction, failover, storage, protocol serialization, security (TLS, SCRAM, ACL), observability (metrics, JSON logging, health probes), data expiration (lifecycle state machine, dual-buffer registry), and more. All code is AI-generated.
 
 ## Lessons learned during initial port
 
@@ -112,18 +112,35 @@ Fetch → Broker.handleFetch → PartitionStore.fetchWithIsolation
 
 Compaction → CompactionManager.maybeCompact (every 5 min)
   → cleanupOrphans: retry failed S3 deletes from previous cycle
-  → forceSplitAll: SSO (multi-stream) → SOs (per-stream) [idempotent]
-  → mergeAll: many small SOs → fewer large SOs [aborts on partial read]
-  → cleanupExpired: remove SOs behind retention trim point
-  → Write-before-delete: register new, remove old from index, then delete from S3
+  → forceSplitAll: SSO (multi-stream) → SOs (per-stream) [idempotent, committed only]
+  → mergeAll: many small SOs → fewer large SOs [aborts on partial read, committed only]
+  → cleanupExpired: mark SOs behind retention trim point as mark_destroyed
+  → cleanupDestroyed: physically delete mark_destroyed objects past 10-min retention
+  → expirePrepared: clean prepared objects past 60-min TTL
+  → Write-before-delete: register new, mark old as destroyed, then delete from S3
   → Journal: journalBegin/journalComplete track in-progress operations
+
+Retention → Broker.tick() every 60 seconds
+  → enforceRetentionPolicies: iterate topics, build RetentionPolicy from config
+  → applyRetention: findTrimOffsetByTimestamp / findTrimOffsetBySize
+  → advance log_start_offset + stream.start_offset
+  → next compaction cycle cleans up expired S3 objects
+
+Data Expiration (matching AutoMQ's 5-layer system):
+  → Layer 1: Automatic time/size retention enforcement via tick()
+  → Layer 2: Compaction cleanup of objects behind stream.start_offset
+  → Layer 3: S3 object lifecycle (prepared→committed→mark_destroyed)
+  → Layer 4: WAL segment cleanup after S3 upload confirmation
+  → Layer 5: Dual-buffer PreparedObjectRegistry for KRaft snapshot safety
 ```
 
 ### Crash safety invariant
 ObjectManager metadata is always updated BEFORE S3 objects are deleted. If the process crashes:
 - After writing new objects but before removing old from index: next compaction retries (harmless overlap). Idempotency check (`hasStreamObjectCovering`) prevents duplicate SOs.
 - After removing old from index but before S3 delete: orphaned S3 files tracked in `orphaned_keys`, retried on next compaction cycle.
+- After marking objects as mark_destroyed but before physical S3 delete: 10-minute retention buffer protects consumers still reading. Physical deletion retried on next compaction cycle.
 - Never: data in index pointing to deleted S3 objects (would cause data loss).
+- Prepared objects survive Raft log truncation via dual-buffer PreparedObjectRegistry persisted to `prepared.snapshot`.
 
 ### Consumer group safety
 - **State machine**: Empty → PreparingRebalance → CompletingRebalance → Stable
@@ -138,8 +155,12 @@ ObjectManager metadata is always updated BEFORE S3 objects are deleted. If the p
 | Feature | AutoMQ | ZMQ Status |
 |---------|--------|------------|
 | Streams per partition | 4 (log/tim/idx/txn) | 1 (intentional — RecordBatch is self-contained; time-index lookups scan linearly) |
-| Compaction strategies | 6 (CLEANUP, MINOR, MAJOR, V1 variants) | 3 (force-split, merge, cleanup). V1 variants handle AutoMQ-specific composite objects. |
+| Compaction strategies | 6 (CLEANUP, MINOR, MAJOR, V1 variants) | 5 phases (orphan cleanup, force-split, merge, mark-destroy, expire-prepared). V1 variants not needed. |
 | Compaction analyzer | Full planning with size/dirty-byte thresholds | Time-based interval only. No adaptive scheduling. |
+| Data expiration | 5-layer system (retention → compaction → lifecycle → WAL cleanup → dual-buffer) | All 5 layers implemented. |
+| Partition reassignment | Controller reassigns on broker failure | Stub only — reassignPartition() logs but doesn't update metadata |
+| Metadata replication | BrokerRegistry replicated through Raft | In-memory only, not replicated — lost on controller failover |
+| InstallSnapshot RPC | Followers that lag behind get snapshot transfer | Not implemented — lagging followers never catch up |
 
 ## File organization
 
@@ -191,9 +212,13 @@ src/
 │   ├── messages/               # Hand-written message types
 │   └── generated/              # 200+ auto-generated message structs
 ├── security/
-│   ├── auth.zig                # SASL/PLAIN, SCRAM-SHA-256, ACL authorizer
-│   └── tls.zig                 # TLS connection wrapper (documented limitation)
+│   ├── auth.zig                # SASL/PLAIN, SCRAM-SHA-256 (RFC 5802), OAUTHBEARER, ACL authorizer
+│   ├── tls.zig                 # TLS: hostname verification, cert validation, mTLS principal extraction
+│   ├── openssl.zig             # Runtime OpenSSL bindings (dlopen/dlsym)
+│   └── jwt.zig                 # JWT parsing and claim extraction
 ├── core/                       # ByteBuffer, CRC32C, UUID, Varint, Time
+│   ├── metric_registry.zig     # Prometheus registry: counters, gauges, histograms, labeled metrics
+│   └── json_logger.zig         # Structured NDJSON logging with correlation IDs
 ├── allocators/                 # Pool allocator, tracking allocator
 ├── compression.zig             # Gzip, Snappy, LZ4, Zstd codecs
 ├── streams/                    # Kafka Streams client (Topology, KStream, stores)
