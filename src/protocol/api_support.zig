@@ -34,10 +34,6 @@ pub const broker_supported_apis = [_]BrokerApiSupport{
     .{ .key = 1, .name = "Fetch", .metric = "kafka_server_fetch_requests_total", .min = 0, .max = 17 },
     .{ .key = 2, .name = "ListOffsets", .metric = "list_offsets", .min = 0, .max = 8 },
     .{ .key = 3, .name = "Metadata", .metric = "metadata", .min = 0, .max = 12 },
-    .{ .key = 4, .name = "LeaderAndIsr", .metric = "leader_and_isr", .min = 0, .max = 7 },
-    .{ .key = 5, .name = "StopReplica", .metric = "stop_replica", .min = 0, .max = 4 },
-    .{ .key = 6, .name = "UpdateMetadata", .metric = "update_metadata", .min = 0, .max = 8 },
-    .{ .key = 7, .name = "ControlledShutdown", .metric = "controlled_shutdown", .min = 0, .max = 3 },
     .{ .key = 8, .name = "OffsetCommit", .metric = "offset_commit", .min = 0, .max = 9 },
     .{ .key = 9, .name = "OffsetFetch", .metric = "offset_fetch", .min = 0, .max = 9 },
     .{ .key = 10, .name = "FindCoordinator", .metric = "find_coordinator", .min = 0, .max = 6 },
@@ -282,6 +278,17 @@ test "broker supported APIs do not advertise versions beyond generated schemas" 
         try testing.expect(api.min >= schema.min);
         try testing.expect(api.max <= schema.max);
     }
+}
+
+test "broker support catalog does not advertise no-op inter-broker RPCs" {
+    try testing.expect(findGeneratedRequest(4) != null);
+    try testing.expect(findGeneratedRequest(5) != null);
+    try testing.expect(findGeneratedRequest(6) != null);
+    try testing.expect(findGeneratedRequest(7) != null);
+    try testing.expect(findBrokerSupport(4) == null);
+    try testing.expect(findBrokerSupport(5) == null);
+    try testing.expect(findBrokerSupport(6) == null);
+    try testing.expect(findBrokerSupport(7) == null);
 }
 
 test "canonical API support covers corrected Kafka and AutoMQ extension keys" {

@@ -1448,7 +1448,8 @@ pub const Broker = struct {
             1 => self.handleFetch(request_bytes, pos, &req_header, api_version, resp_header_version),
             2 => self.handleListOffsets(request_bytes, pos, &req_header, api_version, resp_header_version),
             3 => self.handleMetadata(request_bytes, pos, &req_header, api_version, resp_header_version),
-            // Inter-broker RPCs — no-op success handlers for single-node RF=1
+            // Non-advertised legacy inter-broker RPCs. Version validation
+            // rejects them until real controller-backed semantics exist.
             4 => self.handleLeaderAndIsr(request_bytes, pos, &req_header, resp_header_version),
             5 => self.handleStopReplica(request_bytes, pos, &req_header, resp_header_version),
             6 => self.handleUpdateMetadata(request_bytes, pos, &req_header, resp_header_version),
@@ -6791,6 +6792,10 @@ test "Broker.isVersionSupported" {
     try testing.expect(Broker.isVersionSupported(1, 0));
     try testing.expect(Broker.isVersionSupported(1, 17));
     try testing.expect(!Broker.isVersionSupported(1, 18));
+    try testing.expect(!Broker.isVersionSupported(4, 0));
+    try testing.expect(!Broker.isVersionSupported(5, 0));
+    try testing.expect(!Broker.isVersionSupported(6, 0));
+    try testing.expect(!Broker.isVersionSupported(7, 0));
     try testing.expect(Broker.isVersionSupported(42, 2));
     try testing.expect(!Broker.isVersionSupported(42, 3));
     try testing.expect(Broker.isVersionSupported(44, 1));

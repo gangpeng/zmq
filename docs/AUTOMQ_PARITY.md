@@ -10,7 +10,7 @@ operator-facing behavior.
 
 - Zig toolchain target: Zig 0.16.0.
 - Generated protocol request schemas: 110 entries in `src/protocol/api_support.zig`.
-- Broker-advertised APIs: 71 entries in `api_support.broker_supported_apis`.
+- Broker-advertised APIs: 67 entries in `api_support.broker_supported_apis`.
 - AutoMQ extension API keys 501-519 and 600-602 are broker-dispatched and
   advertised. Stream/object APIs have `ObjectManager` side effects; KV,
   node, router, license, manifest, snapshot, and group-link APIs are backed by
@@ -52,7 +52,7 @@ operator-facing behavior.
 | Area | Current status | Required to call complete |
 | --- | --- | --- |
 | Kafka ApiVersions/version catalog | In progress. Canonical table now drives advertised APIs and version checks, including AutoMQ extensions. | Keep catalog generated or audited against schemas and handler dispatch in CI. |
-| Kafka broker APIs | Partial. 71 advertised APIs; many handlers are simplified single-node semantics. | Full schema-valid decode/encode and Kafka-compatible semantics for every advertised version. |
+| Kafka broker APIs | Partial. 67 advertised APIs; many handlers are simplified single-node semantics. | Full schema-valid decode/encode and Kafka-compatible semantics for every advertised version. |
 | Kafka generated schemas | Broad. 110 request schemas generated. | Round-trip tests and golden fixtures for every generated request/response pair. |
 | AutoMQ extension APIs | Implemented locally. Keys 501-519 and 600-602 dispatch through generated schemas; stream/object APIs mutate ObjectManager and controller-like APIs mutate persisted local broker metadata. | Replace local-only controller semantics with quorum-backed metadata, failover, and client compatibility fixtures. |
 | S3 WAL | Partial. Sync durability path exists and failed uploads are not acknowledged. Filesystem WAL produces now fsync before ack, advance HW on durable write, and replay after local broker restart. Flushed S3 WAL objects can rebuild stream-set metadata idempotently when the local object snapshot is missing, including paginated and XML-escaped ListObjectsV2 responses. S3 WAL object upload has bounded retry for transient put failures, fetch returns storage errors for unreadable indexed S3 objects, malformed object indexes fail cleanly, interleaved stream-set objects fetch only the requested stream blocks, partition offsets are repaired from recovered stream metadata, and multipart completion rejects malformed part ETags. | S3 crash/restart recovery, idempotent retry, fencing, provider matrix, and fault injection. |
@@ -144,7 +144,9 @@ Status: completed for the initial catalog and DeleteGroups slice.
 - Add three-node tests for leader election, controller failover, broker restart,
   reassignment, and scale in/out.
 - Replace single-node no-op inter-broker handlers with real controller-backed
-  behavior or stop advertising them.
+  behavior or stop advertising them. Status: legacy inter-broker keys 4-7 are
+  no longer advertised by ApiVersions; handlers remain non-advertised until
+  controller-backed semantics are implemented.
 - Validate rack-aware routing and auto-balancer decisions under load.
 
 ### Phase 5: Production Gates
