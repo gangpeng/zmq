@@ -943,8 +943,8 @@ pub const S3WalBatcher = struct {
             };
             defer self.allocator.free(obj_key);
 
-            s3_storage.putObject(obj_key, data) catch |err| {
-                log.warn("S3 WAL sync flush upload failed: {}", .{err});
+            self.putObjectWithRetry(s3_storage, obj_key, data) catch |err| {
+                log.warn("S3 WAL sync flush upload failed after retries: {}", .{err});
                 self.batch_upload_failures += 1;
                 return false;
             };
@@ -974,6 +974,21 @@ pub const S3WalBatcher = struct {
         }
 
         return true; // Nothing to flush — consider it "durable"
+    }
+
+    fn putObjectWithRetry(_: *S3WalBatcher, s3_storage: anytype, key: []const u8, data: []const u8) !void {
+        const max_attempts: u32 = 3;
+        var attempt: u32 = 0;
+        while (attempt < max_attempts) : (attempt += 1) {
+            s3_storage.putObject(key, data) catch |err| {
+                if (attempt + 1 >= max_attempts) return err;
+                const delay_ms: u64 = @as(u64, 10) << @intCast(attempt);
+                log.debug("S3 WAL upload retry {d}/{d} in {d}ms for {s}", .{ attempt + 1, max_attempts, delay_ms, key });
+                @import("time_compat").sleep(delay_ms * std.time.ns_per_ms);
+                continue;
+            };
+            return;
+        }
     }
 
     /// Check if data up to the given offset has been flushed to S3.
@@ -1218,6 +1233,31 @@ test "S3WalBatcher flushNow preserves buffer on upload failure" {
     try testing.expectEqual(@as(u64, 0), batcher.batch_upload_count);
     try testing.expectEqual(@as(u64, 1), batcher.batch_upload_failures);
     try testing.expect(!batcher.isFlushed(1));
+}
+
+test "S3WalBatcher flushNow retries transient upload failure" {
+    const FlakyS3 = struct {
+        attempts: u32 = 0,
+
+        pub fn putObject(self: *@This(), _: []const u8, _: []const u8) !void {
+            self.attempts += 1;
+            if (self.attempts < 3) return error.InjectedPutFailure;
+        }
+    };
+
+    var batcher = S3WalBatcher.init(testing.allocator);
+    defer batcher.deinit();
+    var flaky_s3 = FlakyS3{};
+
+    try batcher.append(1, 0, "record-a");
+
+    const flushed = batcher.flushNow(&flaky_s3);
+    try testing.expect(flushed);
+    try testing.expectEqual(@as(u32, 3), flaky_s3.attempts);
+    try testing.expectEqual(@as(usize, 0), batcher.pendingCount());
+    try testing.expectEqual(@as(u64, 1), batcher.batch_upload_count);
+    try testing.expectEqual(@as(u64, 0), batcher.batch_upload_failures);
+    try testing.expect(batcher.isFlushed(1));
 }
 
 test "S3WalBatcher fencing rejects appends" {
