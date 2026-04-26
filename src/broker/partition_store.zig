@@ -772,9 +772,7 @@ pub const PartitionStore = struct {
 
         // Tier 2: Read from S3BlockCache
         if (self.s3_block_cache) |*block_cache| {
-            const cache_key = std.fmt.allocPrint(self.allocator, "{s}/{d}/{d}", .{
-                topic, partition_id, start_offset / 100,
-            }) catch null;
+            const cache_key = self.s3BlockCacheKey(topic, partition_id, start_offset, effective_end_offset, max_bytes, isolation_level) catch null;
             if (cache_key) |ck| {
                 defer self.allocator.free(ck);
                 if (block_cache.get(ck)) |cached_data| {
@@ -850,9 +848,7 @@ pub const PartitionStore = struct {
                     const result_data = result_list.toOwnedSlice() catch &.{};
                     // Cache in S3BlockCache
                     if (self.s3_block_cache) |*block_cache| {
-                        const bc_key = std.fmt.allocPrint(self.allocator, "{s}/{d}/{d}", .{
-                            topic, partition_id, start_offset / 100,
-                        }) catch null;
+                        const bc_key = self.s3BlockCacheKey(topic, partition_id, start_offset, effective_end_offset, max_bytes, isolation_level) catch null;
                         if (bc_key) |bck| {
                             defer self.allocator.free(bck);
                             block_cache.put(bck, result_data) catch {};
@@ -910,9 +906,7 @@ pub const PartitionStore = struct {
 
                     // Cache the S3 result in the block cache
                     if (self.s3_block_cache) |*block_cache| {
-                        const bc_key = std.fmt.allocPrint(self.allocator, "{s}/{d}/{d}", .{
-                            topic, partition_id, start_offset / 100,
-                        }) catch null;
+                        const bc_key = self.s3BlockCacheKey(topic, partition_id, start_offset, effective_end_offset, max_bytes, isolation_level) catch null;
                         if (bc_key) |bck| {
                             defer self.allocator.free(bck);
                             block_cache.put(bck, s3_buf[0..s3_pos]) catch {};
@@ -936,6 +930,17 @@ pub const PartitionStore = struct {
             .high_watermark = @intCast(state.high_watermark),
             .last_stable_offset = @intCast(state.last_stable_offset),
         };
+    }
+
+    fn s3BlockCacheKey(self: *PartitionStore, topic: []const u8, partition_id: i32, start_offset: u64, end_offset: u64, max_bytes: usize, isolation_level: i8) ![]u8 {
+        return try std.fmt.allocPrint(self.allocator, "{s}/{d}/start-{d}/end-{d}/max-{d}/iso-{d}", .{
+            topic,
+            partition_id,
+            start_offset,
+            end_offset,
+            max_bytes,
+            isolation_level,
+        });
     }
 
     fn storageErrorFetchResult(state: PartitionState) FetchResult {
@@ -1404,6 +1409,46 @@ test "PartitionStore fetch filters interleaved S3 WAL stream blocks" {
     defer if (b_result.records.len > 0) testing.allocator.free(@constCast(b_result.records));
     try testing.expectEqual(@as(i16, 0), b_result.error_code);
     try testing.expectEqualStrings("b0", b_result.records);
+}
+
+test "PartitionStore S3 block cache keys exact fetch window" {
+    var mock_s3 = MockS3.init(testing.allocator);
+    defer mock_s3.deinit();
+    var s3_storage = S3Storage.initMock(testing.allocator, &mock_s3);
+
+    const stream_id = PartitionStore.hashPartitionKey("cache-window-topic", 0);
+    {
+        var batcher = S3WalBatcher.init(testing.allocator);
+        defer batcher.deinit();
+
+        try batcher.append(stream_id, 0, "a");
+        try batcher.append(stream_id, 1, "b");
+        try testing.expect(batcher.flushNow(&s3_storage));
+    }
+
+    var object_manager = ObjectManager.init(testing.allocator, 1);
+    defer object_manager.deinit();
+
+    var store = PartitionStore.init(testing.allocator);
+    defer store.deinit();
+    store.s3_storage = s3_storage;
+    store.s3_block_cache = S3BlockCache.init(testing.allocator, 1024);
+    store.object_manager = &object_manager;
+
+    try testing.expectEqual(@as(u64, 1), try store.recoverS3WalObjects());
+    try store.ensurePartition("cache-window-topic", 0);
+    try testing.expect(store.repairPartitionStatesFromObjectManager());
+
+    const all_records = try store.fetch("cache-window-topic", 0, 0, 1024);
+    defer if (all_records.records.len > 0) testing.allocator.free(@constCast(all_records.records));
+    try testing.expectEqual(@as(i16, 0), all_records.error_code);
+    try testing.expectEqualStrings("ab", all_records.records);
+
+    const tail_records = try store.fetch("cache-window-topic", 0, 1, 1024);
+    defer if (tail_records.records.len > 0) testing.allocator.free(@constCast(tail_records.records));
+    try testing.expectEqual(@as(i16, 0), tail_records.error_code);
+    try testing.expectEqualStrings("b", tail_records.records);
+    try testing.expectEqual(@as(usize, 2), store.s3_block_cache.?.entries.count());
 }
 
 test "PartitionStore returns storage error for unreadable ObjectManager S3 object" {

@@ -55,7 +55,7 @@ operator-facing behavior.
 | Kafka broker APIs | Partial. 67 advertised APIs; many handlers are simplified single-node semantics. ElectLeaders now decodes the generated request and returns per-request partition results instead of blanket success. | Full schema-valid decode/encode and Kafka-compatible semantics for every advertised version. |
 | Kafka generated schemas | Broad. 110 request schemas generated. | Round-trip tests and golden fixtures for every generated request/response pair. |
 | AutoMQ extension APIs | Implemented locally. Keys 501-519 and 600-602 dispatch through generated schemas; stream/object APIs mutate ObjectManager and controller-like APIs mutate persisted local broker metadata. | Replace local-only controller semantics with quorum-backed metadata, failover, and client compatibility fixtures. |
-| S3 WAL | Partial. Sync durability path exists and failed uploads are not acknowledged. Filesystem WAL produces now fsync before ack, advance HW on durable write, and replay after local broker restart. Flushed S3 WAL objects can rebuild stream-set metadata idempotently when the local object snapshot is missing, including paginated and XML-escaped ListObjectsV2 responses. S3 WAL object upload has bounded retry for transient put failures, fetch returns storage errors for unreadable indexed S3 objects, malformed object indexes fail cleanly, interleaved stream-set objects fetch only the requested stream blocks, partition offsets are repaired from recovered stream metadata, and multipart completion rejects malformed part ETags. | S3 crash/restart recovery, idempotent retry, fencing, provider matrix, and fault injection. |
+| S3 WAL | Partial. Sync durability path exists and failed uploads are not acknowledged. Filesystem WAL produces now fsync before ack, advance HW on durable write, and replay after local broker restart. Flushed S3 WAL objects can rebuild stream-set metadata idempotently when the local object snapshot is missing, including paginated and XML-escaped ListObjectsV2 responses. S3 WAL object upload has bounded retry for transient put failures, fetch returns storage errors for unreadable indexed S3 objects, malformed object indexes fail cleanly, interleaved stream-set objects fetch only the requested stream blocks, S3 block-cache keys include the exact visible fetch window, partition offsets are repaired from recovered stream metadata, and multipart completion rejects malformed part ETags. | S3 crash/restart recovery, idempotent retry, fencing, provider matrix, and fault injection. |
 | S3Stream object lifecycle | Improved. Create/open/close/delete/trim/describe plus prepare/commit SO/SSO are wired to ObjectManager; object/prepared snapshots and partition offset/HW/LSO state are persisted locally and covered by broker restart tests. | Match full AutoMQ recovery, fencing, prepared-object expiry, quorum-backed object-state replay, and S3-backed metadata durability. |
 | Controller/KRaft | Partial. Local Raft/controller scaffolding exists. | Multi-node quorum, broker registration, heartbeats, fencing, metadata snapshots, rolling restart. |
 | Stateless brokers | Partial. Local cache/state still has single-node assumptions. | Rebuild broker state from shared storage/controller metadata without data loss or manual repair. |
@@ -135,8 +135,10 @@ Status: completed for the initial catalog and DeleteGroups slice.
   recovered S3 stream metadata when partition_state.meta is missing or stale;
   interleaved stream-set objects now fetch by matched index so one partition
   cannot read another partition's S3 blocks; malformed object indexes and block
-  ranges now fail with parser errors instead of traps or bogus reads; multipart
-  upload rejects missing or malformed part ETags before completion. Remaining durability work is crash/fault recovery
+  ranges now fail with parser errors instead of traps or bogus reads; S3 block
+  cache keys include start/end/max-bytes/isolation so cached S3 data is not
+  reused for the wrong visible fetch window; multipart upload rejects missing or
+  malformed part ETags before completion. Remaining durability work is crash/fault recovery
   against quorum/controller metadata, deeper multipart fault injection, and
   provider compatibility coverage.
 
