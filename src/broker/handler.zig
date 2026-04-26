@@ -499,6 +499,7 @@ pub const Broker = struct {
 
     /// Open the broker (initializes storage, WAL, loads persisted metadata)
     pub fn open(self: *Broker) !void {
+        self.wireInternalPointers();
         try self.store.open();
         try self.restoreObjectManagerSnapshot();
 
@@ -614,6 +615,18 @@ pub const Broker = struct {
             log.info("Restored {d} ACL(s) from acls.meta", .{saved_acls.len});
         }
 
+        // Load persisted partition offsets and visibility state after topics and
+        // internal partitions exist.
+        const saved_partition_states = try self.persistence.loadPartitionStates();
+        defer {
+            for (saved_partition_states) |entry| self.allocator.free(entry.topic);
+            self.allocator.free(saved_partition_states);
+        }
+        try self.restorePartitionStates(saved_partition_states);
+        if (saved_partition_states.len > 0) {
+            log.info("Restored {d} partition state(s) from partition_state.meta", .{saved_partition_states.len});
+        }
+
         // Load local AutoMQ controller-style metadata (KV namespace, node registry,
         // license, zone router state, and group promotions).
         var auto_mq_snapshot = try self.persistence.loadAutoMqMetadata();
@@ -682,6 +695,7 @@ pub const Broker = struct {
             if (batcher.shouldFlush()) {
                 if (self.store.s3_storage) |*s3| {
                     if (batcher.flushNow(s3)) {
+                        self.persistPartitionStates();
                         self.persistObjectManagerSnapshot();
                     }
                 }
@@ -792,6 +806,8 @@ pub const Broker = struct {
 
         if (total_trimmed > 0) {
             log.info("Retention enforcement: trimmed {d} partition(s)", .{total_trimmed});
+            self.persistPartitionStates();
+            self.persistObjectManagerSnapshot();
         }
     }
 
@@ -813,6 +829,7 @@ pub const Broker = struct {
                 var hw_updates = batcher.drainPendingHWUpdates();
                 defer hw_updates.deinit();
                 self.store.applyDeferredHWUpdates(&hw_updates);
+                self.persistPartitionStates();
                 self.persistObjectManagerSnapshot();
                 return true;
             } else {
@@ -842,6 +859,7 @@ pub const Broker = struct {
                 var hw_updates = batcher.drainPendingHWUpdates();
                 defer hw_updates.deinit();
                 self.store.applyDeferredHWUpdates(&hw_updates);
+                self.persistPartitionStates();
                 self.persistObjectManagerSnapshot();
                 log.info("Shutdown: WAL flush to S3 complete", .{});
                 return true;
@@ -858,6 +876,7 @@ pub const Broker = struct {
         // Save state before shutdown
         self.persistTopics();
         self.persistOffsets();
+        self.persistPartitionStates();
         self.persistAutoMqMetadata();
         self.persistObjectManagerSnapshot();
 
@@ -1212,6 +1231,49 @@ pub const Broker = struct {
         };
     }
 
+    /// Persist per-partition offsets/HW/LSO to disk (best-effort).
+    fn persistPartitionStates(self: *Broker) void {
+        self.persistence.savePartitionStates(&self.store.partitions) catch |err| {
+            log.warn("Failed to persist partition states: {}", .{err});
+        };
+    }
+
+    fn restorePartitionStates(self: *Broker, entries: []const MetadataPersistence.PartitionStateEntry) !void {
+        for (entries) |entry| {
+            if (entry.partition_id < 0) continue;
+            if (!self.topics.contains(entry.topic)) continue;
+
+            self.store.ensurePartition(entry.topic, entry.partition_id) catch |err| {
+                log.warn("Failed to ensure partition for restored state {s}-{d}: {}", .{ entry.topic, entry.partition_id, err });
+                continue;
+            };
+
+            const pkey = std.fmt.allocPrint(self.allocator, "{s}-{d}", .{ entry.topic, entry.partition_id }) catch continue;
+            defer self.allocator.free(pkey);
+
+            if (self.store.partitions.getPtr(pkey)) |state| {
+                state.next_offset = entry.next_offset;
+                state.log_start_offset = @min(entry.log_start_offset, state.next_offset);
+                state.high_watermark = @min(@max(entry.high_watermark, state.log_start_offset), state.next_offset);
+                state.first_unstable_txn_offset = if (entry.first_unstable_txn_offset) |unstable|
+                    @min(@max(unstable, state.log_start_offset), state.next_offset)
+                else
+                    null;
+
+                state.last_stable_offset = @min(@max(entry.last_stable_offset, state.log_start_offset), state.high_watermark);
+                if (state.first_unstable_txn_offset) |unstable| {
+                    state.last_stable_offset = @min(@max(unstable, state.log_start_offset), state.high_watermark);
+                }
+
+                const stream_id = PartitionStore.hashPartitionKey(entry.topic, entry.partition_id);
+                if (self.object_manager.getStream(stream_id)) |stream| {
+                    stream.advanceEndOffset(state.next_offset);
+                    stream.trim(state.log_start_offset);
+                }
+            }
+        }
+    }
+
     /// Expire delayed fetches whose deadline has passed.
     /// Called from tick() periodically.
     fn expireDelayedFetches(self: *Broker) void {
@@ -1291,7 +1353,9 @@ pub const Broker = struct {
         // Write to __consumer_offsets partition store
         _ = self.store.produce("__consumer_offsets", target_partition, batch) catch |err| {
             log.debug("Failed to write offset commit record: {}", .{err});
+            return;
         };
+        self.persistPartitionStates();
     }
 
     /// Process a raw Kafka protocol request frame and return the response.
@@ -1917,6 +1981,7 @@ pub const Broker = struct {
         }
 
         var object_metadata_dirty = false;
+        var partition_state_dirty = false;
         for (0..num_topics) |_| {
             // Read topic name
             const topic_name = if (flexible)
@@ -2052,6 +2117,7 @@ pub const Broker = struct {
                 if (produce_result != null) {
                     self.checkDelayedFetchesForPartition(topic_name, partition_idx);
                     object_metadata_dirty = true;
+                    partition_state_dirty = true;
                 }
 
                 // Write partition response with proper error codes
@@ -2112,6 +2178,7 @@ pub const Broker = struct {
         }
 
         log.debug("Produce: {d} topics, acks={d}, response {d} bytes", .{ num_topics, acks, wpos });
+        if (partition_state_dirty) self.persistPartitionStates();
         if (object_metadata_dirty) self.persistObjectManagerSnapshot();
 
         // acks=0: fire-and-forget — don't send a response
@@ -3073,6 +3140,7 @@ pub const Broker = struct {
         ser.writeI32(buf, &wpos, 0); // throttle_time_ms
         ser.writeArrayLen(buf, &wpos, num_topics);
 
+        var mutated = false;
         for (0..num_topics) |_| {
             const topic = (ser.readString(request_bytes, &pos) catch break) orelse "";
             const num_parts = (ser.readArrayLen(request_bytes, &pos) catch 0) orelse 0;
@@ -3092,7 +3160,10 @@ pub const Broker = struct {
                 if (self.store.partitions.getPtr(pkey)) |state| {
                     if (delete_offset > 0 and @as(u64, @intCast(delete_offset)) > state.log_start_offset) {
                         state.log_start_offset = @intCast(delete_offset);
+                        const stream_id = PartitionStore.hashPartitionKey(topic, partition);
+                        self.object_manager.trimStream(stream_id, state.log_start_offset) catch {};
                         low_watermark = delete_offset;
+                        mutated = true;
                     } else {
                         low_watermark = @intCast(state.log_start_offset);
                     }
@@ -3102,6 +3173,10 @@ pub const Broker = struct {
                 ser.writeI64(buf, &wpos, low_watermark); // low_watermark
                 ser.writeI16(buf, &wpos, 0); // error_code
             }
+        }
+        if (mutated) {
+            self.persistPartitionStates();
+            self.persistObjectManagerSnapshot();
         }
 
         if (resp_header_version >= 1) ser.writeEmptyTaggedFields(buf, &wpos);
@@ -3176,6 +3251,7 @@ pub const Broker = struct {
 
         // Before completing the txn, get the partition list so we can write control batches
         const control_type: @import("txn_coordinator.zig").TransactionCoordinator.ControlRecordType = if (committed) .commit else .abort;
+        var partition_state_dirty = false;
         if (self.txn_coordinator.getPartitions(producer_id)) |partitions| {
             // Write control batch to each partition in the transaction
             for (partitions) |tp| {
@@ -3197,7 +3273,9 @@ pub const Broker = struct {
                 // Write the control batch to the partition store
                 _ = self.store.produce(tp.topic, tp.partition, control_batch) catch |err| {
                     log.warn("Failed to write control batch for {s}-{d}: {}", .{ tp.topic, tp.partition, err });
+                    continue;
                 };
+                partition_state_dirty = true;
             }
 
             // Clear first_unstable_txn_offset on each partition so LSO advances.
@@ -3210,8 +3288,13 @@ pub const Broker = struct {
                     state.first_unstable_txn_offset = null;
                     // Recompute LSO = HW (no unstable transactions on this partition now)
                     state.last_stable_offset = state.high_watermark;
+                    partition_state_dirty = true;
                 }
             }
+        }
+        if (partition_state_dirty) {
+            self.persistPartitionStates();
+            self.persistObjectManagerSnapshot();
         }
 
         const error_code = self.txn_coordinator.endTxnComplete(producer_id, producer_epoch, committed);
@@ -4902,6 +4985,7 @@ pub const Broker = struct {
             // Actually write control record batches to each partition
             // before transitioning state, not just updating the coordinator.
             const control_type: TxnCoordinator.ControlRecordType = if (committed) .commit else .abort;
+            var partition_state_dirty = false;
             if (self.txn_coordinator.getPartitions(producer_id)) |partitions| {
                 for (partitions) |tp| {
                     const pkey = std.fmt.allocPrint(self.allocator, "{s}-{d}", .{ tp.topic, tp.partition }) catch continue;
@@ -4922,7 +5006,9 @@ pub const Broker = struct {
                     // Write the control batch to the partition store
                     _ = self.store.produce(tp.topic, tp.partition, control_batch) catch |err| {
                         log.warn("Principle 7: Failed to write control batch for {s}-{d}: {}", .{ tp.topic, tp.partition, err });
+                        continue;
                     };
+                    partition_state_dirty = true;
                 }
 
                 // Clear LSO on each partition after writing markers
@@ -4934,8 +5020,13 @@ pub const Broker = struct {
                     if (self.store.partitions.getPtr(lso_key)) |pstate| {
                         pstate.first_unstable_txn_offset = null;
                         pstate.last_stable_offset = pstate.high_watermark;
+                        partition_state_dirty = true;
                     }
                 }
+            }
+            if (partition_state_dirty) {
+                self.persistPartitionStates();
+                self.persistObjectManagerSnapshot();
             }
 
             // Now complete the state transition
@@ -6456,6 +6547,92 @@ test "Broker restores AutoMQ stream object snapshot after restart" {
         try testing.expectEqual(@as(usize, 1), objects.len);
         try testing.expectEqual(@as(u64, @intCast(committed_object_id)), objects[0].object_id);
     }
+}
+
+test "Broker restores partition state after restart" {
+    const fs = @import("fs_compat");
+    const tmp_dir = "/tmp/zmq-partition-state-restart-test";
+    fs.deleteTreeAbsolute(tmp_dir) catch {};
+    try fs.makeDirAbsolute(tmp_dir);
+    defer fs.deleteTreeAbsolute(tmp_dir) catch {};
+
+    {
+        var broker = Broker.initWithConfig(testing.allocator, 1, 9092, .{ .data_dir = tmp_dir });
+        defer broker.deinit();
+        try broker.open();
+
+        try testing.expect(broker.ensureTopic("pstate-topic"));
+        _ = try broker.store.produce("pstate-topic", 0, "record-0");
+        _ = try broker.store.produce("pstate-topic", 0, "record-1");
+
+        const pkey = try std.fmt.allocPrint(testing.allocator, "{s}-{d}", .{ "pstate-topic", 0 });
+        defer testing.allocator.free(pkey);
+        const state = broker.store.partitions.getPtr(pkey).?;
+        state.log_start_offset = 1;
+        state.high_watermark = 2;
+        state.first_unstable_txn_offset = 1;
+        state.last_stable_offset = 1;
+
+        const stream_id = PartitionStore.hashPartitionKey("pstate-topic", 0);
+        broker.object_manager.trimStream(stream_id, 1) catch {};
+        broker.persistPartitionStates();
+        broker.persistObjectManagerSnapshot();
+    }
+
+    {
+        var broker = Broker.initWithConfig(testing.allocator, 1, 9092, .{ .data_dir = tmp_dir });
+        defer broker.deinit();
+        try broker.open();
+
+        const pkey = try std.fmt.allocPrint(testing.allocator, "{s}-{d}", .{ "pstate-topic", 0 });
+        defer testing.allocator.free(pkey);
+        const state = broker.store.partitions.get(pkey).?;
+        try testing.expectEqual(@as(u64, 2), state.next_offset);
+        try testing.expectEqual(@as(u64, 1), state.log_start_offset);
+        try testing.expectEqual(@as(u64, 2), state.high_watermark);
+        try testing.expectEqual(@as(u64, 1), state.last_stable_offset);
+        try testing.expectEqual(@as(u64, 1), state.first_unstable_txn_offset.?);
+
+        const stream_id = PartitionStore.hashPartitionKey("pstate-topic", 0);
+        const stream = broker.object_manager.getStream(stream_id).?;
+        try testing.expectEqual(@as(u64, 1), stream.start_offset);
+        try testing.expectEqual(@as(u64, 2), stream.end_offset);
+    }
+}
+
+test "Broker clamps invalid restored partition state invariants" {
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+
+    try testing.expect(broker.ensureTopic("clamp-topic"));
+
+    const topic = try testing.allocator.dupe(u8, "clamp-topic");
+    defer testing.allocator.free(topic);
+    const entries = [_]MetadataPersistence.PartitionStateEntry{.{
+        .topic = topic,
+        .partition_id = 0,
+        .next_offset = 10,
+        .log_start_offset = 8,
+        .high_watermark = 3,
+        .last_stable_offset = 2,
+        .first_unstable_txn_offset = 1,
+    }};
+
+    try broker.restorePartitionStates(&entries);
+
+    const pkey = try std.fmt.allocPrint(testing.allocator, "{s}-{d}", .{ "clamp-topic", 0 });
+    defer testing.allocator.free(pkey);
+    const state = broker.store.partitions.get(pkey).?;
+    try testing.expectEqual(@as(u64, 10), state.next_offset);
+    try testing.expectEqual(@as(u64, 8), state.log_start_offset);
+    try testing.expectEqual(@as(u64, 8), state.high_watermark);
+    try testing.expectEqual(@as(u64, 8), state.last_stable_offset);
+    try testing.expectEqual(@as(u64, 8), state.first_unstable_txn_offset.?);
+
+    const stream_id = PartitionStore.hashPartitionKey("clamp-topic", 0);
+    const stream = broker.object_manager.getStream(stream_id).?;
+    try testing.expectEqual(@as(u64, 8), stream.start_offset);
+    try testing.expectEqual(@as(u64, 10), stream.end_offset);
 }
 
 test "Broker.handleRequest InitProducerId (key=22, v0)" {

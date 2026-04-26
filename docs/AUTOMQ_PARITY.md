@@ -20,7 +20,7 @@ operator-facing behavior.
 - S3 WAL/object storage paths exist, but full AutoMQ S3Stream lifecycle
   compatibility, crash recovery, fencing, and cross-provider validation are
   incomplete. Stream/object metadata now has local file snapshot/restart
-  coverage.
+  coverage, and partition offset/HW/LSO state is snapshotted for local restart.
 
 ## Parity Gates
 
@@ -53,7 +53,7 @@ operator-facing behavior.
 | Kafka generated schemas | Broad. 110 request schemas generated. | Round-trip tests and golden fixtures for every generated request/response pair. |
 | AutoMQ extension APIs | Implemented locally. Keys 501-519 and 600-602 dispatch through generated schemas; stream/object APIs mutate ObjectManager and controller-like APIs mutate persisted local broker metadata. | Replace local-only controller semantics with quorum-backed metadata, failover, and client compatibility fixtures. |
 | S3 WAL | Partial. Sync durability path exists and failed uploads are not acknowledged. | Crash/restart recovery, idempotent retry, fencing, provider matrix, and fault injection. |
-| S3Stream object lifecycle | Improved. Create/open/close/delete/trim/describe plus prepare/commit SO/SSO are wired to ObjectManager; object/prepared snapshots are persisted locally and covered by broker restart tests. | Match full AutoMQ recovery, fencing, prepared-object expiry, quorum-backed object-state replay, and S3-backed metadata durability. |
+| S3Stream object lifecycle | Improved. Create/open/close/delete/trim/describe plus prepare/commit SO/SSO are wired to ObjectManager; object/prepared snapshots and partition offset/HW/LSO state are persisted locally and covered by broker restart tests. | Match full AutoMQ recovery, fencing, prepared-object expiry, quorum-backed object-state replay, and S3-backed metadata durability. |
 | Controller/KRaft | Partial. Local Raft/controller scaffolding exists. | Multi-node quorum, broker registration, heartbeats, fencing, metadata snapshots, rolling restart. |
 | Stateless brokers | Partial. Local cache/state still has single-node assumptions. | Rebuild broker state from shared storage/controller metadata without data loss or manual repair. |
 | Reassignment/autobalancing | Partial. Basic handlers and balancer code exist. | Real partition movement semantics, convergence tests, and load/rack-aware placement. |
@@ -116,6 +116,9 @@ Status: completed for the initial catalog and DeleteGroups slice.
   configured durability mode.
 - Add metadata snapshot/replay tests for topics, offsets, transactions,
   producers, and expanded stream/object state under crash/fault scenarios.
+- Status: local partition offset/HW/LSO snapshots now reload across restart and
+  clamp stale/corrupt invariants; remaining durability work is crash/fault
+  recovery against shared S3/controller metadata.
 
 ### Phase 4: Multi-Node AutoMQ Behavior
 

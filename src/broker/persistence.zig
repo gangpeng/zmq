@@ -274,6 +274,16 @@ pub const MetadataPersistence = struct {
         producer_epoch: i16,
     };
 
+    pub const PartitionStateEntry = struct {
+        topic: []u8,
+        partition_id: i32,
+        next_offset: u64,
+        log_start_offset: u64,
+        high_watermark: u64,
+        last_stable_offset: u64,
+        first_unstable_txn_offset: ?u64,
+    };
+
     /// Save transaction state to disk.
     /// NOTE: AutoMQ/Kafka persists to __transaction_state topic on coordinator startup.
     /// ZMQ uses file-based persistence as a simplification.
@@ -453,6 +463,123 @@ pub const MetadataPersistence = struct {
         }
 
         log.info("Loaded {d} producer sequences from producer_state.meta", .{entries.items.len});
+        return entries.toOwnedSlice();
+    }
+
+    /// Save per-partition offset and visibility state to disk.
+    /// Format: partition_state.meta TSV with hex-encoded topic names.
+    pub fn savePartitionStates(self: *MetadataPersistence, partitions: anytype) !void {
+        const dir = self.data_dir orelse return;
+
+        const path = try std.fmt.allocPrint(self.allocator, "{s}/partition_state.meta", .{dir});
+        defer self.allocator.free(path);
+
+        const file = try fs.createFileAbsolute(path, .{ .truncate = true });
+        defer file.close();
+        const writer = file.writer();
+
+        var it = partitions.iterator();
+        while (it.next()) |entry| {
+            const state = entry.value_ptr;
+            try file.writeAll("partition\t");
+            try writeHex(file, state.topic);
+            try writer.print("\t{d}\t{d}\t{d}\t{d}\t{d}\t", .{
+                state.partition_id,
+                state.next_offset,
+                state.log_start_offset,
+                state.high_watermark,
+                state.last_stable_offset,
+            });
+            if (state.first_unstable_txn_offset) |offset| {
+                try writer.print("{d}\n", .{offset});
+            } else {
+                try file.writeAll("null\n");
+            }
+        }
+    }
+
+    /// Load per-partition offset and visibility state from disk.
+    pub fn loadPartitionStates(self: *MetadataPersistence) ![]PartitionStateEntry {
+        const dir = self.data_dir orelse return &.{};
+
+        const path = try std.fmt.allocPrint(self.allocator, "{s}/partition_state.meta", .{dir});
+        defer self.allocator.free(path);
+
+        const file = fs.openFileAbsolute(path, .{}) catch |err| {
+            log.debug("No partition_state.meta found: {}", .{err});
+            return &.{};
+        };
+        defer file.close();
+
+        const content = file.readToEndAlloc(self.allocator, 4 * 1024 * 1024) catch |err| {
+            log.warn("Failed to read partition_state.meta: {}", .{err});
+            return &.{};
+        };
+        defer self.allocator.free(content);
+
+        var entries = std.array_list.Managed(PartitionStateEntry).init(self.allocator);
+        errdefer {
+            for (entries.items) |entry| self.allocator.free(entry.topic);
+            entries.deinit();
+        }
+
+        var lines = std.mem.splitSequence(u8, content, "\n");
+        while (lines.next()) |line| {
+            if (line.len == 0) continue;
+
+            var fields = std.mem.splitSequence(u8, line, "\t");
+            const tag = fields.next() orelse continue;
+            if (!std.mem.eql(u8, tag, "partition")) continue;
+
+            const topic_hex = fields.next() orelse continue;
+            const partition_str = fields.next() orelse continue;
+            const next_offset_str = fields.next() orelse continue;
+            const log_start_str = fields.next() orelse continue;
+            const hw_str = fields.next() orelse continue;
+            const lso_str = fields.next() orelse continue;
+            const unstable_str = fields.next() orelse "null";
+
+            const topic = decodeHexAlloc(self.allocator, topic_hex) catch continue;
+            const partition_id = std.fmt.parseInt(i32, partition_str, 10) catch {
+                self.allocator.free(topic);
+                continue;
+            };
+            const next_offset = std.fmt.parseInt(u64, next_offset_str, 10) catch {
+                self.allocator.free(topic);
+                continue;
+            };
+            const log_start_offset = std.fmt.parseInt(u64, log_start_str, 10) catch {
+                self.allocator.free(topic);
+                continue;
+            };
+            const high_watermark = std.fmt.parseInt(u64, hw_str, 10) catch {
+                self.allocator.free(topic);
+                continue;
+            };
+            const last_stable_offset = std.fmt.parseInt(u64, lso_str, 10) catch {
+                self.allocator.free(topic);
+                continue;
+            };
+            const first_unstable_txn_offset: ?u64 = if (std.mem.eql(u8, unstable_str, "null"))
+                null
+            else
+                std.fmt.parseInt(u64, unstable_str, 10) catch null;
+
+            entries.append(.{
+                .topic = topic,
+                .partition_id = partition_id,
+                .next_offset = next_offset,
+                .log_start_offset = log_start_offset,
+                .high_watermark = high_watermark,
+                .last_stable_offset = last_stable_offset,
+                .first_unstable_txn_offset = first_unstable_txn_offset,
+            }) catch |err| {
+                self.allocator.free(topic);
+                return err;
+            };
+        }
+
+        log.info("Loaded {d} partition states from partition_state.meta", .{entries.items.len});
         return entries.toOwnedSlice();
     }
 
@@ -946,6 +1073,87 @@ test "MetadataPersistence load producer sequences missing file" {
     var persistence = MetadataPersistence.init(testing.allocator, tmp_dir);
 
     const loaded = try persistence.loadProducerSequences();
+    try testing.expectEqual(@as(usize, 0), loaded.len);
+}
+
+test "MetadataPersistence save and load partition states round-trip" {
+    const tmp_dir = "/tmp/automq-partition-state-test";
+    fs.deleteTreeAbsolute(tmp_dir) catch {};
+    fs.makeDirAbsolute(tmp_dir) catch {};
+    defer fs.deleteTreeAbsolute(tmp_dir) catch {};
+
+    var persistence = MetadataPersistence.init(testing.allocator, tmp_dir);
+
+    const PartitionState = struct {
+        topic: []const u8,
+        partition_id: i32,
+        next_offset: u64,
+        log_start_offset: u64,
+        high_watermark: u64,
+        last_stable_offset: u64,
+        first_unstable_txn_offset: ?u64,
+    };
+    var partitions = std.StringHashMap(PartitionState).init(testing.allocator);
+    defer partitions.deinit();
+
+    try partitions.put("topic\tA-0", .{
+        .topic = "topic\tA",
+        .partition_id = 0,
+        .next_offset = 12,
+        .log_start_offset = 3,
+        .high_watermark = 10,
+        .last_stable_offset = 8,
+        .first_unstable_txn_offset = 8,
+    });
+    try partitions.put("topic-B-1", .{
+        .topic = "topic-B",
+        .partition_id = 1,
+        .next_offset = 7,
+        .log_start_offset = 0,
+        .high_watermark = 7,
+        .last_stable_offset = 7,
+        .first_unstable_txn_offset = null,
+    });
+
+    try persistence.savePartitionStates(&partitions);
+
+    const loaded = try persistence.loadPartitionStates();
+    defer {
+        for (loaded) |entry| testing.allocator.free(entry.topic);
+        testing.allocator.free(loaded);
+    }
+
+    try testing.expectEqual(@as(usize, 2), loaded.len);
+    var found_a = false;
+    var found_b = false;
+    for (loaded) |entry| {
+        if (std.mem.eql(u8, entry.topic, "topic\tA")) {
+            found_a = true;
+            try testing.expectEqual(@as(i32, 0), entry.partition_id);
+            try testing.expectEqual(@as(u64, 12), entry.next_offset);
+            try testing.expectEqual(@as(u64, 3), entry.log_start_offset);
+            try testing.expectEqual(@as(u64, 10), entry.high_watermark);
+            try testing.expectEqual(@as(u64, 8), entry.last_stable_offset);
+            try testing.expectEqual(@as(u64, 8), entry.first_unstable_txn_offset.?);
+        } else if (std.mem.eql(u8, entry.topic, "topic-B")) {
+            found_b = true;
+            try testing.expectEqual(@as(i32, 1), entry.partition_id);
+            try testing.expect(entry.first_unstable_txn_offset == null);
+        }
+    }
+    try testing.expect(found_a);
+    try testing.expect(found_b);
+}
+
+test "MetadataPersistence load partition states missing file" {
+    const tmp_dir = "/tmp/automq-partition-state-missing-test";
+    fs.deleteTreeAbsolute(tmp_dir) catch {};
+    fs.makeDirAbsolute(tmp_dir) catch {};
+    defer fs.deleteTreeAbsolute(tmp_dir) catch {};
+
+    var persistence = MetadataPersistence.init(testing.allocator, tmp_dir);
+
+    const loaded = try persistence.loadPartitionStates();
     try testing.expectEqual(@as(usize, 0), loaded.len);
 }
 
