@@ -1009,7 +1009,7 @@ fn parseListObjectPage(alloc: Allocator, xml: []const u8) !ListObjectPage {
         const key_start = pos + start_rel + "<Key>".len;
         const end_rel = std.mem.indexOf(u8, xml[key_start..], "</Key>") orelse break;
         const key_end = key_start + end_rel;
-        const key_copy = try alloc.dupe(u8, xml[key_start..key_end]);
+        const key_copy = try decodeXmlTextAlloc(alloc, xml[key_start..key_end]);
         errdefer alloc.free(key_copy);
         try keys.append(key_copy);
         pos = key_end + "</Key>".len;
@@ -1031,7 +1031,42 @@ fn parseXmlTagValue(alloc: Allocator, xml: []const u8, comptime tag: []const u8)
     const end_rel = std.mem.indexOf(u8, xml[value_start..], close_tag) orelse return null;
     const value = xml[value_start .. value_start + end_rel];
     if (value.len == 0) return null;
-    return try alloc.dupe(u8, value);
+    return try decodeXmlTextAlloc(alloc, value);
+}
+
+fn decodeXmlTextAlloc(alloc: Allocator, text: []const u8) ![]u8 {
+    var out = std.array_list.Managed(u8).init(alloc);
+    errdefer out.deinit();
+
+    var pos: usize = 0;
+    while (pos < text.len) {
+        if (text[pos] != '&') {
+            try out.append(text[pos]);
+            pos += 1;
+            continue;
+        }
+
+        if (std.mem.startsWith(u8, text[pos..], "&amp;")) {
+            try out.append('&');
+            pos += "&amp;".len;
+        } else if (std.mem.startsWith(u8, text[pos..], "&lt;")) {
+            try out.append('<');
+            pos += "&lt;".len;
+        } else if (std.mem.startsWith(u8, text[pos..], "&gt;")) {
+            try out.append('>');
+            pos += "&gt;".len;
+        } else if (std.mem.startsWith(u8, text[pos..], "&quot;")) {
+            try out.append('"');
+            pos += "&quot;".len;
+        } else if (std.mem.startsWith(u8, text[pos..], "&apos;")) {
+            try out.append('\'');
+            pos += "&apos;".len;
+        } else {
+            return error.InvalidXmlEntity;
+        }
+    }
+
+    return try out.toOwnedSlice();
 }
 
 // ---------------------------------------------------------------
@@ -1173,6 +1208,22 @@ test "S3Storage parses ListObjects continuation token" {
     try testing.expectEqual(@as(usize, 1), page.keys.len);
     try testing.expectEqualStrings("wal/epoch-0/bulk/0000000001", page.keys[0]);
     try testing.expectEqualStrings("opaque-token-1", page.next_continuation_token.?);
+}
+
+test "S3Storage decodes ListObjects XML entities" {
+    const xml =
+        \\<ListBucketResult>
+        \\  <Contents><Key>wal/epoch-0/bulk/a&amp;b&quot;c&apos;d</Key></Contents>
+        \\  <NextContinuationToken>next&amp;token</NextContinuationToken>
+        \\</ListBucketResult>
+    ;
+
+    var page = try parseListObjectPage(testing.allocator, xml);
+    defer page.deinit(testing.allocator);
+
+    try testing.expectEqual(@as(usize, 1), page.keys.len);
+    try testing.expectEqualStrings("wal/epoch-0/bulk/a&b\"c'd", page.keys[0]);
+    try testing.expectEqualStrings("next&token", page.next_continuation_token.?);
 }
 
 test "S3Client getObject retry structure" {
