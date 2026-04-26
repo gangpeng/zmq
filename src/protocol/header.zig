@@ -2,6 +2,7 @@ const std = @import("std");
 const testing = std.testing;
 const Allocator = std.mem.Allocator;
 const ser = @import("serialization.zig");
+const api_support = @import("api_support.zig");
 
 /// Kafka request/response headers.
 ///
@@ -14,9 +15,9 @@ const ser = @import("serialization.zig");
 /// Response Header v0: correlation_id: int32
 /// Response Header v1 (flexible): correlation_id: int32, tagged_fields
 ///
-/// The header version depends on the API key and its version — flexible versions
-/// of an API use header v1/v1, non-flexible use header v0/v0.
-
+/// The header version depends on the API key and its version: flexible request
+/// versions use request header v2 and response header v1; non-flexible versions
+/// use request header v1 and response header v0.
 pub const RequestHeader = struct {
     api_key: i16,
     api_version: i16,
@@ -149,16 +150,14 @@ pub const ResponseHeader = struct {
 /// Flexible versions use header v2 (which has tagged fields).
 /// Non-flexible use header v1 (legacy, no tagged fields in header).
 ///
-/// NOTE: ApiVersions is special — it always uses header v0 for the request
-/// even in flexible versions, to maintain bootstrap compatibility.
+/// NOTE: ApiVersions is special only for responses: request v0-v2 use header v1
+/// and request v3+ uses header v2, but the response header is always v0.
 pub fn requestHeaderVersion(api_key: i16, api_version: i16) i16 {
-    // ApiVersions (key 18) is special — always header v0 for request (never v2)
-    // to allow version negotiation to work even with old brokers
+    // ApiVersions (key 18) follows the request header schema rule directly.
     if (api_key == 18) return if (api_version >= 3) 2 else 1;
 
     // For all other APIs, check if the version is a flexible version.
-    // The exact mapping is derived from the JSON schemas' "flexibleVersions" fields.
-    // See isFlexibleVersion() for the complete per-API mapping.
+    // The mapping is derived from the JSON schemas' "flexibleVersions" fields.
     return if (isFlexibleVersion(api_key, api_version)) 2 else 1;
 }
 
@@ -169,63 +168,84 @@ pub fn responseHeaderVersion(api_key: i16, api_version: i16) i16 {
     return if (isFlexibleVersion(api_key, api_version)) 1 else 0;
 }
 
+pub const FlexibleVersionRule = struct {
+    min_key: i16,
+    max_key: i16,
+    first_flexible_version: ?i16,
+
+    fn appliesTo(self: FlexibleVersionRule, api_key: i16) bool {
+        return api_key >= self.min_key and api_key <= self.max_key;
+    }
+};
+
+/// Request/response flexible-version rules from the generated JSON schemas.
+/// A null first_flexible_version means the API is explicitly never flexible.
+pub const flexible_version_rules = [_]FlexibleVersionRule{
+    .{ .min_key = 0, .max_key = 0, .first_flexible_version = 9 }, // Produce
+    .{ .min_key = 1, .max_key = 1, .first_flexible_version = 12 }, // Fetch
+    .{ .min_key = 2, .max_key = 2, .first_flexible_version = 6 }, // ListOffsets
+    .{ .min_key = 3, .max_key = 3, .first_flexible_version = 9 }, // Metadata
+    .{ .min_key = 4, .max_key = 4, .first_flexible_version = 4 }, // LeaderAndIsr
+    .{ .min_key = 5, .max_key = 5, .first_flexible_version = 2 }, // StopReplica
+    .{ .min_key = 6, .max_key = 6, .first_flexible_version = 6 }, // UpdateMetadata
+    .{ .min_key = 7, .max_key = 7, .first_flexible_version = 3 }, // ControlledShutdown
+    .{ .min_key = 8, .max_key = 8, .first_flexible_version = 8 }, // OffsetCommit
+    .{ .min_key = 9, .max_key = 9, .first_flexible_version = 6 }, // OffsetFetch
+    .{ .min_key = 10, .max_key = 10, .first_flexible_version = 3 }, // FindCoordinator
+    .{ .min_key = 11, .max_key = 11, .first_flexible_version = 6 }, // JoinGroup
+    .{ .min_key = 12, .max_key = 12, .first_flexible_version = 4 }, // Heartbeat
+    .{ .min_key = 13, .max_key = 13, .first_flexible_version = 4 }, // LeaveGroup
+    .{ .min_key = 14, .max_key = 14, .first_flexible_version = 4 }, // SyncGroup
+    .{ .min_key = 15, .max_key = 15, .first_flexible_version = 5 }, // DescribeGroups
+    .{ .min_key = 16, .max_key = 16, .first_flexible_version = 3 }, // ListGroups
+    .{ .min_key = 17, .max_key = 17, .first_flexible_version = null }, // SaslHandshake
+    .{ .min_key = 18, .max_key = 18, .first_flexible_version = 3 }, // ApiVersions
+    .{ .min_key = 19, .max_key = 19, .first_flexible_version = 5 }, // CreateTopics
+    .{ .min_key = 20, .max_key = 20, .first_flexible_version = 4 }, // DeleteTopics
+    .{ .min_key = 21, .max_key = 21, .first_flexible_version = 2 }, // DeleteRecords
+    .{ .min_key = 22, .max_key = 22, .first_flexible_version = 2 }, // InitProducerId
+    .{ .min_key = 23, .max_key = 23, .first_flexible_version = 4 }, // OffsetForLeaderEpoch
+    .{ .min_key = 24, .max_key = 24, .first_flexible_version = 3 }, // AddPartitionsToTxn
+    .{ .min_key = 25, .max_key = 25, .first_flexible_version = 3 }, // AddOffsetsToTxn
+    .{ .min_key = 26, .max_key = 26, .first_flexible_version = 3 }, // EndTxn
+    .{ .min_key = 27, .max_key = 27, .first_flexible_version = 1 }, // WriteTxnMarkers
+    .{ .min_key = 28, .max_key = 28, .first_flexible_version = 3 }, // TxnOffsetCommit
+    .{ .min_key = 29, .max_key = 29, .first_flexible_version = 2 }, // DescribeAcls
+    .{ .min_key = 30, .max_key = 30, .first_flexible_version = 2 }, // CreateAcls
+    .{ .min_key = 31, .max_key = 31, .first_flexible_version = 2 }, // DeleteAcls
+    .{ .min_key = 32, .max_key = 32, .first_flexible_version = 4 }, // DescribeConfigs
+    .{ .min_key = 33, .max_key = 33, .first_flexible_version = 2 }, // AlterConfigs
+    .{ .min_key = 35, .max_key = 35, .first_flexible_version = 2 }, // DescribeLogDirs
+    .{ .min_key = 36, .max_key = 36, .first_flexible_version = 2 }, // SaslAuthenticate
+    .{ .min_key = 37, .max_key = 37, .first_flexible_version = 2 }, // CreatePartitions
+    .{ .min_key = 42, .max_key = 42, .first_flexible_version = 2 }, // DeleteGroups
+    .{ .min_key = 43, .max_key = 43, .first_flexible_version = 2 }, // ElectLeaders
+    .{ .min_key = 44, .max_key = 44, .first_flexible_version = 1 }, // IncrementalAlterConfigs
+    .{ .min_key = 45, .max_key = 45, .first_flexible_version = 0 }, // AlterPartitionReassignments
+    .{ .min_key = 46, .max_key = 46, .first_flexible_version = 0 }, // ListPartitionReassignments
+    .{ .min_key = 47, .max_key = 47, .first_flexible_version = null }, // OffsetDelete
+    .{ .min_key = 52, .max_key = 52, .first_flexible_version = 0 }, // Vote
+    .{ .min_key = 53, .max_key = 53, .first_flexible_version = 1 }, // BeginQuorumEpoch
+    .{ .min_key = 54, .max_key = 54, .first_flexible_version = 1 }, // EndQuorumEpoch
+    .{ .min_key = 55, .max_key = 55, .first_flexible_version = 0 }, // DescribeQuorum
+    .{ .min_key = 60, .max_key = 60, .first_flexible_version = 0 }, // DescribeCluster
+    .{ .min_key = 61, .max_key = 61, .first_flexible_version = 0 }, // DescribeProducers
+    .{ .min_key = 501, .max_key = 519, .first_flexible_version = 0 }, // AutoMQ extensions
+    .{ .min_key = 600, .max_key = 602, .first_flexible_version = 0 }, // AutoMQ extensions
+};
+
+pub fn findFlexibleVersionRule(api_key: i16) ?FlexibleVersionRule {
+    for (flexible_version_rules) |rule| {
+        if (rule.appliesTo(api_key)) return rule;
+    }
+    return null;
+}
+
 /// Check if a given API version is a flexible version.
-/// Derived from the "flexibleVersions" field in each API's JSON schema.
-/// This mapping covers broker-supported Kafka API keys.
-fn isFlexibleVersion(api_key: i16, api_version: i16) bool {
-    return switch (api_key) {
-        0 => api_version >= 9, // Produce: 9+
-        1 => api_version >= 12, // Fetch: 12+
-        2 => api_version >= 6, // ListOffsets: 6+
-        3 => api_version >= 9, // Metadata: 9+
-        4 => api_version >= 4, // LeaderAndIsr: 4+
-        5 => api_version >= 2, // StopReplica: 2+
-        6 => api_version >= 6, // UpdateMetadata: 6+
-        7 => api_version >= 3, // ControlledShutdown: 3+
-        8 => api_version >= 8, // OffsetCommit: 8+
-        9 => api_version >= 6, // OffsetFetch: 6+
-        10 => api_version >= 3, // FindCoordinator: 3+
-        11 => api_version >= 6, // JoinGroup: 6+
-        12 => api_version >= 4, // Heartbeat: 4+
-        13 => api_version >= 4, // LeaveGroup: 4+
-        14 => api_version >= 4, // SyncGroup: 4+
-        15 => api_version >= 5, // DescribeGroups: 5+
-        16 => api_version >= 3, // ListGroups: 3+
-        17 => false, // SaslHandshake: never flexible
-        18 => api_version >= 3, // ApiVersions: 3+
-        19 => api_version >= 5, // CreateTopics: 5+
-        20 => api_version >= 4, // DeleteTopics: 4+
-        21 => api_version >= 2, // DeleteRecords: 2+
-        22 => api_version >= 2, // InitProducerId: 2+
-        23 => api_version >= 4, // OffsetForLeaderEpoch: 4+
-        24 => api_version >= 3, // AddPartitionsToTxn: 3+
-        25 => api_version >= 3, // AddOffsetsToTxn: 3+
-        26 => api_version >= 3, // EndTxn: 3+
-        27 => api_version >= 1, // WriteTxnMarkers: 1+
-        28 => api_version >= 3, // TxnOffsetCommit: 3+
-        29 => api_version >= 2, // DescribeAcls: 2+
-        30 => api_version >= 2, // CreateAcls: 2+
-        31 => api_version >= 2, // DeleteAcls: 2+
-        32 => api_version >= 4, // DescribeConfigs: 4+
-        33 => api_version >= 2, // AlterConfigs: 2+
-        35 => api_version >= 2, // DescribeLogDirs: 2+
-        36 => api_version >= 2, // SaslAuthenticate: 2+
-        37 => api_version >= 2, // CreatePartitions: 2+
-        42 => api_version >= 2, // DeleteGroups: 2+
-        43 => api_version >= 2, // ElectLeaders: 2+
-        44 => api_version >= 1, // IncrementalAlterConfigs: 1+
-        45 => true, // AlterPartitionReassignments: 0+ (always flexible)
-        46 => true, // ListPartitionReassignments: 0+ (always flexible)
-        52 => true, // Vote: 0+ (always flexible)
-        53 => true, // BeginQuorumEpoch: 0+ (always flexible)
-        54 => true, // EndQuorumEpoch: 0+ (always flexible)
-        55 => true, // DescribeQuorum: 0+ (always flexible)
-        60 => true, // DescribeCluster: 0+ (always flexible)
-        61 => true, // DescribeProducers: 0+ (always flexible)
-        501...519 => true, // AutoMQ extension APIs: 0+ (always flexible)
-        600...602 => true, // AutoMQ extension APIs: 0+ (always flexible)
-        else => false, // Unknown API: conservative default
-    };
+pub fn isFlexibleVersion(api_key: i16, api_version: i16) bool {
+    const rule = findFlexibleVersionRule(api_key) orelse return false;
+    const first = rule.first_flexible_version orelse return false;
+    return api_version >= first;
 }
 
 fn taggedFieldsSize(fields: []const ser.TaggedField) usize {
@@ -328,6 +348,48 @@ test "header version mapping matches shifted Kafka API keys" {
 
     try testing.expectEqual(@as(i16, 2), requestHeaderVersion(25, 3)); // AddOffsetsToTxn flexible versions.
     try testing.expectEqual(@as(i16, 1), responseHeaderVersion(25, 3));
+}
+
+test "flexible version catalog is sorted and non-overlapping" {
+    var previous_max_key: ?i16 = null;
+    for (flexible_version_rules) |rule| {
+        try testing.expect(rule.min_key <= rule.max_key);
+        if (previous_max_key) |prev| {
+            try testing.expect(rule.min_key > prev);
+        }
+        if (rule.first_flexible_version) |first| {
+            try testing.expect(first >= 0);
+        }
+        previous_max_key = rule.max_key;
+    }
+}
+
+test "advertised APIs have explicit header flexible-version rules" {
+    for (api_support.broker_supported_apis) |api| {
+        const rule = findFlexibleVersionRule(api.key) orelse return error.MissingHeaderFlexibleVersionRule;
+
+        var version = api.min;
+        while (version <= api.max) : (version += 1) {
+            const flexible = if (rule.first_flexible_version) |first| version >= first else false;
+            const expected_request_header: i16 = if (flexible) 2 else 1;
+            const expected_response_header: i16 = if (api.key == 18) 0 else if (flexible) 1 else 0;
+
+            try testing.expectEqual(expected_request_header, requestHeaderVersion(api.key, version));
+            try testing.expectEqual(expected_response_header, responseHeaderVersion(api.key, version));
+        }
+    }
+}
+
+test "KRaft quorum APIs use non-flexible v0 and flexible v1 headers" {
+    try testing.expectEqual(@as(i16, 1), requestHeaderVersion(53, 0));
+    try testing.expectEqual(@as(i16, 0), responseHeaderVersion(53, 0));
+    try testing.expectEqual(@as(i16, 2), requestHeaderVersion(53, 1));
+    try testing.expectEqual(@as(i16, 1), responseHeaderVersion(53, 1));
+
+    try testing.expectEqual(@as(i16, 1), requestHeaderVersion(54, 0));
+    try testing.expectEqual(@as(i16, 0), responseHeaderVersion(54, 0));
+    try testing.expectEqual(@as(i16, 2), requestHeaderVersion(54, 1));
+    try testing.expectEqual(@as(i16, 1), responseHeaderVersion(54, 1));
 }
 
 test "RequestHeader null client_id" {

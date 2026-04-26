@@ -47,6 +47,24 @@ operator-facing behavior.
 8. Performance: sustained produce/fetch throughput, tail latency, S3 request
    volume, recovery time, and memory usage have repeatable benchmark gates.
 
+## Remaining Gap Backlog
+
+This backlog is the execution order for closing the remaining AutoMQ-completion
+gaps. Each item should land as a small, verified tranche with tests and a commit.
+
+| Priority | Gap | Required completion gate | Status |
+| --- | --- | --- | --- |
+| P0 | Advertised API audit | ApiVersions, request/response header versions, generated schema ranges, dispatch coverage, malformed-frame tests, golden fixtures, and client compatibility matrix all fail closed when an advertised API drifts. | In progress. Current tranche adds an explicit header flexible-version catalog and advertised-API coverage tests. |
+| P0 | Quorum-backed AutoMQ/controller metadata | Replace local-only AutoMQ KV/node/router/license/manifest/group/object metadata with quorum-backed records, snapshots, replay, fencing, and failover tests. | Not started. |
+| P0 | S3/MinIO crash and fault-injection harness | Exercise produce/flush/restart/fetch/rebuild with transient 5xx, timeout, partial multipart, bad ETag, checksum, range-read, list inconsistency, and provider-specific behavior. | Partial local/S3-object recovery coverage exists; fault matrix is incomplete. |
+| P1 | Multi-node KRaft and broker lifecycle | Broker registration, heartbeat, fencing/unfencing, controller failover, rolling restart, and leader epoch behavior are covered by three-node tests. | Not started beyond local scaffolding and generated handlers. |
+| P1 | Stateless broker replacement | A replacement broker can rebuild state from shared storage and quorum metadata without local disk metadata or manual repair. | Partial S3/object repair exists; quorum metadata rebuild is missing. |
+| P1 | Real reassignment and autobalancing | Partition movement, rack-aware placement, load convergence, and scale in/out semantics are implemented and tested under load. | Handler compatibility only. |
+| P1 | Consumer group and transaction coordinator failover | Rebalances, offset lifecycle, transactions, idempotent producers, fencing, and coordinator migration survive restart and failover. | Partial single-node coordinator behavior. |
+| P2 | Security gates | TLS/SASL/OAuth/SCRAM/ACL interop, negative cases, cert rotation, and authz coverage exist for every advertised API. | Partial components exist. |
+| P2 | Observability gates | Metrics, structured logs, readiness/liveness, dashboards, and alertable SLOs match the documented operational contract. | Partial components exist. |
+| P2 | Performance and client matrix gates | Repeatable benchmarks and Java/librdkafka/Go/Python/Kafka CLI compatibility suites pass across supported versions. | Not started. |
+
 ## Capability Matrix
 
 | Area | Current status | Required to call complete |
