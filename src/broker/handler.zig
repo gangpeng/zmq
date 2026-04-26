@@ -1491,8 +1491,8 @@ pub const Broker = struct {
             60 => self.handleDescribeCluster(request_bytes, pos, &req_header, api_version, resp_header_version),
             61 => self.handleDescribeProducers(request_bytes, pos, &req_header, api_version, resp_header_version),
             52 => self.handleVote(request_bytes, pos, &req_header, api_version, resp_header_version),
-            53 => self.handleBeginQuorumEpoch(request_bytes, pos, &req_header, resp_header_version),
-            54 => self.handleEndQuorumEpoch(request_bytes, pos, &req_header, resp_header_version),
+            53 => self.handleBeginQuorumEpoch(request_bytes, pos, &req_header, api_version, resp_header_version),
+            54 => self.handleEndQuorumEpoch(request_bytes, pos, &req_header, api_version, resp_header_version),
             55 => self.handleDescribeQuorum(request_bytes, pos, &req_header, api_version, resp_header_version),
             501 => self.handleCreateStreams(request_bytes, pos, &req_header, api_version, resp_header_version),
             502 => self.handleOpenStreams(request_bytes, pos, &req_header, api_version, resp_header_version),
@@ -5917,6 +5917,121 @@ pub const Broker = struct {
         return true;
     }
 
+    fn validateBeginQuorumEpochRequestFrame(buf: []const u8, start_pos: usize, api_version: i16) bool {
+        const flexible = api_version >= 1;
+        var pos = start_pos;
+
+        if (!skipKafkaString(buf, &pos, flexible)) return false; // cluster_id
+        if (flexible and !skipFixedBytes(buf, &pos, 4)) return false; // voter_id
+        if (!skipBeginQuorumTopics(buf, &pos, flexible)) return false;
+        if (flexible and !skipQuorumLeaderEndpoints(buf, &pos)) return false;
+        if (flexible) ser.skipTaggedFields(buf, &pos) catch return false;
+        return true;
+    }
+
+    fn validateEndQuorumEpochRequestFrame(buf: []const u8, start_pos: usize, api_version: i16) bool {
+        const flexible = api_version >= 1;
+        var pos = start_pos;
+
+        if (!skipKafkaString(buf, &pos, flexible)) return false; // cluster_id
+        if (!skipEndQuorumTopics(buf, &pos, flexible)) return false;
+        if (flexible and !skipQuorumLeaderEndpoints(buf, &pos)) return false;
+        if (flexible) ser.skipTaggedFields(buf, &pos) catch return false;
+        return true;
+    }
+
+    fn skipBeginQuorumTopics(buf: []const u8, pos: *usize, flexible: bool) bool {
+        const topic_count = readKafkaArrayCount(buf, pos, flexible) orelse return false;
+        for (0..topic_count) |_| {
+            if (!skipKafkaString(buf, pos, flexible)) return false; // topic_name
+            const partition_count = readKafkaArrayCount(buf, pos, flexible) orelse return false;
+            for (0..partition_count) |_| {
+                if (!skipFixedBytes(buf, pos, 4)) return false; // partition_index
+                if (flexible and !skipFixedBytes(buf, pos, 16)) return false; // voter_directory_id
+                if (!skipFixedBytes(buf, pos, 8)) return false; // leader_id + leader_epoch
+                if (flexible) ser.skipTaggedFields(buf, pos) catch return false;
+            }
+            if (flexible) ser.skipTaggedFields(buf, pos) catch return false;
+        }
+        return true;
+    }
+
+    fn skipEndQuorumTopics(buf: []const u8, pos: *usize, flexible: bool) bool {
+        const topic_count = readKafkaArrayCount(buf, pos, flexible) orelse return false;
+        for (0..topic_count) |_| {
+            if (!skipKafkaString(buf, pos, flexible)) return false; // topic_name
+            const partition_count = readKafkaArrayCount(buf, pos, flexible) orelse return false;
+            for (0..partition_count) |_| {
+                if (!skipFixedBytes(buf, pos, 12)) return false; // partition_index + leader_id + leader_epoch
+                if (!skipKafkaI32Array(buf, pos, flexible)) return false; // preferred_successors
+                if (flexible and !skipEndQuorumPreferredCandidates(buf, pos)) return false;
+                if (flexible) ser.skipTaggedFields(buf, pos) catch return false;
+            }
+            if (flexible) ser.skipTaggedFields(buf, pos) catch return false;
+        }
+        return true;
+    }
+
+    fn skipEndQuorumPreferredCandidates(buf: []const u8, pos: *usize) bool {
+        const candidate_count = readKafkaArrayCount(buf, pos, true) orelse return false;
+        for (0..candidate_count) |_| {
+            if (!skipFixedBytes(buf, pos, 20)) return false; // candidate_id + candidate_directory_id
+            ser.skipTaggedFields(buf, pos) catch return false;
+        }
+        return true;
+    }
+
+    fn skipQuorumLeaderEndpoints(buf: []const u8, pos: *usize) bool {
+        const endpoint_count = readKafkaArrayCount(buf, pos, true) orelse return false;
+        for (0..endpoint_count) |_| {
+            if (!skipKafkaString(buf, pos, true)) return false; // name
+            if (!skipKafkaString(buf, pos, true)) return false; // host
+            if (!skipFixedBytes(buf, pos, 2)) return false; // port
+            ser.skipTaggedFields(buf, pos) catch return false;
+        }
+        return true;
+    }
+
+    fn skipKafkaI32Array(buf: []const u8, pos: *usize, flexible: bool) bool {
+        const item_count = readKafkaArrayCount(buf, pos, flexible) orelse return false;
+        if (item_count > (buf.len - pos.*) / 4) return false;
+        pos.* += item_count * 4;
+        return true;
+    }
+
+    fn readKafkaArrayCount(buf: []const u8, pos: *usize, flexible: bool) ?usize {
+        const item_count = if (flexible)
+            (ser.readCompactArrayLen(buf, pos) catch return null) orelse 0
+        else
+            readLegacyArrayCount(buf, pos) orelse return null;
+        if (item_count > buf.len - pos.* + 1) return null;
+        return item_count;
+    }
+
+    fn readLegacyArrayCount(buf: []const u8, pos: *usize) ?usize {
+        if (pos.* > buf.len or 4 > buf.len - pos.*) return null;
+        const len = std.mem.readInt(i32, buf[pos.*..][0..4], .big);
+        pos.* += 4;
+        if (len < 0) return 0;
+        return @intCast(len);
+    }
+
+    fn skipKafkaString(buf: []const u8, pos: *usize, flexible: bool) bool {
+        if (flexible) {
+            _ = ser.readCompactString(buf, pos) catch return false;
+            return true;
+        }
+
+        if (pos.* > buf.len or 2 > buf.len - pos.*) return false;
+        const len = std.mem.readInt(i16, buf[pos.*..][0..2], .big);
+        pos.* += 2;
+        if (len < 0) return true;
+        const string_len: usize = @intCast(len);
+        if (string_len > buf.len - pos.*) return false;
+        pos.* += string_len;
+        return true;
+    }
+
     fn skipCompactI32Array(buf: []const u8, pos: *usize) bool {
         const item_count = (ser.readCompactArrayLen(buf, pos) catch return false) orelse 0;
         if (item_count > (buf.len - pos.*) / 4) return false;
@@ -5986,72 +6101,114 @@ pub const Broker = struct {
     // ---------------------------------------------------------------
     // BeginQuorumEpoch (key 53) — KRaft leader heartbeat
     // ---------------------------------------------------------------
-    fn handleBeginQuorumEpoch(self: *Broker, request_bytes: []const u8, start_pos: usize, req_header: *const RequestHeader, resp_header_version: i16) ?[]u8 {
-        const raft = self.raft_state orelse return self.handleNotController(req_header, resp_header_version);
-        var pos = start_pos;
+    fn handleBeginQuorumEpoch(self: *Broker, request_bytes: []const u8, start_pos: usize, req_header: *const RequestHeader, api_version: i16, resp_header_version: i16) ?[]u8 {
+        const Req = generated.begin_quorum_epoch_request.BeginQuorumEpochRequest;
+        const Resp = generated.begin_quorum_epoch_response.BeginQuorumEpochResponse;
 
-        // Parse simplified request body
-        const error_code = ser.readI16(request_bytes, &pos);
-        _ = error_code;
-        // Skip topics array
-        const topics_len = ser.readArrayLen(request_bytes, &pos) catch 0;
-        _ = topics_len;
-        // Leader info
-        const leader_id = ser.readI32(request_bytes, &pos);
-        const leader_epoch = ser.readI32(request_bytes, &pos);
-
-        // Process through Raft state machine
-        if (leader_epoch >= raft.current_epoch) {
-            // Step down: if we were leader and a higher epoch arrives, we must stop writing
-            if (raft.role == .leader and leader_epoch > raft.current_epoch) {
-                log.info("Stepping down: received higher epoch {d} from leader {d} (was leader at epoch {d})", .{
-                    leader_epoch, leader_id, raft.current_epoch,
-                });
-                // Fence the S3 WAL batcher to prevent stale writes
-                if (self.store.s3_wal_batcher) |*batcher| {
-                    batcher.fence();
-                }
-            }
-            raft.becomeFollower(leader_epoch, leader_id);
-            log.info("Acknowledged leader {d} epoch={d}", .{ leader_id, leader_epoch });
+        if (!validateBeginQuorumEpochRequestFrame(request_bytes, start_pos, api_version)) {
+            log.warn("Malformed BeginQuorumEpoch request", .{});
+            return null;
         }
 
-        // Build response
-        var buf = self.allocator.alloc(u8, 64) catch return null;
-        var wpos: usize = 0;
-        const rh = ResponseHeader{ .correlation_id = req_header.correlation_id };
-        rh.serialize(buf, &wpos, resp_header_version);
-        ser.writeI16(buf, &wpos, 0); // error_code: NONE
-        ser.writeI32(buf, &wpos, 0); // topics array len = 0
+        var pos = start_pos;
+        var req = Req.deserialize(self.allocator, request_bytes, &pos, api_version) catch |err| {
+            log.warn("Failed to decode BeginQuorumEpoch request: {}", .{err});
+            return null;
+        };
+        defer self.freeBeginQuorumEpochRequest(&req);
 
-        return (self.allocator.realloc(buf, wpos) catch buf)[0..wpos];
+        var error_code: i16 = @intFromEnum(ErrorCode.not_controller);
+        if (self.raft_state) |raft| {
+            const ObservedLeader = struct {
+                id: i32,
+                epoch: i32,
+            };
+            var observed_leader: ?ObservedLeader = null;
+            for (req.topics) |topic| {
+                for (topic.partitions) |partition| {
+                    if (observed_leader == null or partition.leader_epoch > observed_leader.?.epoch) {
+                        observed_leader = .{ .id = partition.leader_id, .epoch = partition.leader_epoch };
+                    }
+                }
+            }
+
+            if (observed_leader) |leader| {
+                if (leader.epoch >= raft.current_epoch) {
+                    if (raft.role == .leader and leader.epoch > raft.current_epoch) {
+                        log.info("Stepping down: received higher epoch {d} from leader {d} (was leader at epoch {d})", .{
+                            leader.epoch, leader.id, raft.current_epoch,
+                        });
+                        if (self.store.s3_wal_batcher) |*batcher| {
+                            batcher.fence();
+                        }
+                    }
+                    raft.becomeFollower(leader.epoch, leader.id);
+                    log.info("Acknowledged leader {d} epoch={d}", .{ leader.id, leader.epoch });
+                }
+            }
+            error_code = @intFromEnum(ErrorCode.none);
+        }
+
+        const resp = Resp{
+            .error_code = error_code,
+            .topics = &.{},
+        };
+        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
     }
 
     // ---------------------------------------------------------------
     // EndQuorumEpoch (key 54) — KRaft leader step-down
     // ---------------------------------------------------------------
-    fn handleEndQuorumEpoch(self: *Broker, request_bytes: []const u8, start_pos: usize, req_header: *const RequestHeader, resp_header_version: i16) ?[]u8 {
-        const raft = self.raft_state orelse return self.handleNotController(req_header, resp_header_version);
-        var pos = start_pos;
-        _ = request_bytes;
-        _ = &pos;
+    fn handleEndQuorumEpoch(self: *Broker, request_bytes: []const u8, start_pos: usize, req_header: *const RequestHeader, api_version: i16, resp_header_version: i16) ?[]u8 {
+        const Req = generated.end_quorum_epoch_request.EndQuorumEpochRequest;
+        const Resp = generated.end_quorum_epoch_response.EndQuorumEpochResponse;
 
-        // When leader steps down, followers should start an election
-        if (raft.role == .follower) {
-            log.info("Leader stepped down, will start election", .{});
-            // Reset election timer to trigger election soon
-            raft.election_timer.reset();
+        if (!validateEndQuorumEpochRequestFrame(request_bytes, start_pos, api_version)) {
+            log.warn("Malformed EndQuorumEpoch request", .{});
+            return null;
         }
 
-        // Build response
-        var buf = self.allocator.alloc(u8, 64) catch return null;
-        var wpos: usize = 0;
-        const rh = ResponseHeader{ .correlation_id = req_header.correlation_id };
-        rh.serialize(buf, &wpos, resp_header_version);
-        ser.writeI16(buf, &wpos, 0); // error_code
-        ser.writeI32(buf, &wpos, 0); // topics array len = 0
+        var pos = start_pos;
+        var req = Req.deserialize(self.allocator, request_bytes, &pos, api_version) catch |err| {
+            log.warn("Failed to decode EndQuorumEpoch request: {}", .{err});
+            return null;
+        };
+        defer self.freeEndQuorumEpochRequest(&req);
 
-        return (self.allocator.realloc(buf, wpos) catch buf)[0..wpos];
+        var error_code: i16 = @intFromEnum(ErrorCode.not_controller);
+        if (self.raft_state) |raft| {
+            if (raft.role == .follower) {
+                log.info("Leader stepped down, will start election", .{});
+                raft.election_timer.reset();
+            }
+            error_code = @intFromEnum(ErrorCode.none);
+        }
+
+        const resp = Resp{
+            .error_code = error_code,
+            .topics = &.{},
+        };
+        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+    }
+
+    fn freeBeginQuorumEpochRequest(self: *Broker, req: *generated.begin_quorum_epoch_request.BeginQuorumEpochRequest) void {
+        for (req.topics) |topic| {
+            if (topic.partitions.len > 0) self.allocator.free(topic.partitions);
+        }
+        if (req.topics.len > 0) self.allocator.free(req.topics);
+        if (req.leader_endpoints.len > 0) self.allocator.free(req.leader_endpoints);
+    }
+
+    fn freeEndQuorumEpochRequest(self: *Broker, req: *generated.end_quorum_epoch_request.EndQuorumEpochRequest) void {
+        for (req.topics) |topic| {
+            for (topic.partitions) |partition| {
+                if (partition.preferred_successors.len > 0) self.allocator.free(partition.preferred_successors);
+                if (partition.preferred_candidates.len > 0) self.allocator.free(partition.preferred_candidates);
+            }
+            if (topic.partitions.len > 0) self.allocator.free(topic.partitions);
+        }
+        if (req.topics.len > 0) self.allocator.free(req.topics);
+        if (req.leader_endpoints.len > 0) self.allocator.free(req.leader_endpoints);
     }
 
     // ---------------------------------------------------------------
@@ -7854,6 +8011,88 @@ test "Broker.handleRequest DescribeQuorum rejects truncated request" {
     var buf: [128]u8 = undefined;
     const req_len = buildTestRequest(&buf, 55, 2, 5504, header_mod.requestHeaderVersion(55, 2));
     try testing.expect(broker.handleRequest(buf[0..req_len]) == null);
+}
+
+test "Broker.handleRequest BeginQuorumEpoch returns generated not-controller responses" {
+    const Req = generated.begin_quorum_epoch_request.BeginQuorumEpochRequest;
+    const Resp = generated.begin_quorum_epoch_response.BeginQuorumEpochResponse;
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+
+    const versions = [_]i16{ 0, 1 };
+    for (versions, 0..) |version, index| {
+        const req = Req{};
+        var buf: [512]u8 = undefined;
+        var pos = buildTestRequest(&buf, 53, version, 5300 + @as(i32, @intCast(index)), header_mod.requestHeaderVersion(53, version));
+        req.serialize(&buf, &pos, version);
+
+        const response = broker.handleRequest(buf[0..pos]);
+        try testing.expect(response != null);
+        defer testing.allocator.free(response.?);
+
+        var rpos: usize = 0;
+        var response_header = try ResponseHeader.deserialize(testing.allocator, response.?, &rpos, header_mod.responseHeaderVersion(53, version));
+        defer response_header.deinit(testing.allocator);
+        try testing.expectEqual(5300 + @as(i32, @intCast(index)), response_header.correlation_id);
+
+        const resp = try Resp.deserialize(testing.allocator, response.?, &rpos, version);
+        defer if (resp.topics.len > 0) testing.allocator.free(resp.topics);
+        try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.not_controller)), resp.error_code);
+        try testing.expectEqual(@as(usize, 0), resp.topics.len);
+    }
+}
+
+test "Broker.handleRequest EndQuorumEpoch returns generated not-controller responses" {
+    const Req = generated.end_quorum_epoch_request.EndQuorumEpochRequest;
+    const Resp = generated.end_quorum_epoch_response.EndQuorumEpochResponse;
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+
+    const versions = [_]i16{ 0, 1 };
+    for (versions, 0..) |version, index| {
+        const req = Req{};
+        var buf: [512]u8 = undefined;
+        var pos = buildTestRequest(&buf, 54, version, 5400 + @as(i32, @intCast(index)), header_mod.requestHeaderVersion(54, version));
+        req.serialize(&buf, &pos, version);
+
+        const response = broker.handleRequest(buf[0..pos]);
+        try testing.expect(response != null);
+        defer testing.allocator.free(response.?);
+
+        var rpos: usize = 0;
+        var response_header = try ResponseHeader.deserialize(testing.allocator, response.?, &rpos, header_mod.responseHeaderVersion(54, version));
+        defer response_header.deinit(testing.allocator);
+        try testing.expectEqual(5400 + @as(i32, @intCast(index)), response_header.correlation_id);
+
+        const resp = try Resp.deserialize(testing.allocator, response.?, &rpos, version);
+        defer if (resp.topics.len > 0) testing.allocator.free(resp.topics);
+        try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.not_controller)), resp.error_code);
+        try testing.expectEqual(@as(usize, 0), resp.topics.len);
+    }
+}
+
+test "Broker.handleRequest BeginQuorumEpoch and EndQuorumEpoch reject truncated requests" {
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+
+    const cases = [_]struct {
+        api_key: i16,
+        version: i16,
+        correlation_id: i32,
+    }{
+        .{ .api_key = 53, .version = 0, .correlation_id = 5302 },
+        .{ .api_key = 53, .version = 1, .correlation_id = 5303 },
+        .{ .api_key = 54, .version = 0, .correlation_id = 5402 },
+        .{ .api_key = 54, .version = 1, .correlation_id = 5403 },
+    };
+
+    for (cases) |case| {
+        var buf: [128]u8 = undefined;
+        const req_len = buildTestRequest(&buf, case.api_key, case.version, case.correlation_id, header_mod.requestHeaderVersion(case.api_key, case.version));
+        try testing.expect(broker.handleRequest(buf[0..req_len]) == null);
+    }
 }
 
 test "Broker.handleRequest ElectLeaders returns requested partition results" {
