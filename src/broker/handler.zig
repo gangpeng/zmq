@@ -1485,7 +1485,7 @@ pub const Broker = struct {
             36 => self.handleSaslAuthenticate(request_bytes, pos, &req_header, api_version, resp_header_version),
             37 => self.handleCreatePartitions(request_bytes, pos, &req_header, api_version, resp_header_version),
             42 => self.handleDeleteGroups(request_bytes, pos, &req_header, api_version, resp_header_version),
-            43 => self.handleElectLeaders(&req_header, resp_header_version),
+            43 => self.handleElectLeaders(request_bytes, pos, &req_header, api_version, resp_header_version),
             44 => self.handleIncrementalAlterConfigs(request_bytes, pos, &req_header, api_version, resp_header_version),
             45 => self.handleAlterPartitionReassignments(request_bytes, pos, &req_header, resp_header_version),
             46 => self.handleListPartitionReassignments(request_bytes, pos, &req_header, resp_header_version),
@@ -5301,43 +5301,122 @@ pub const Broker = struct {
     // ---------------------------------------------------------------
     // ElectLeaders (key 43)
     // ---------------------------------------------------------------
-    fn handleElectLeaders(self: *Broker, req_header: *const RequestHeader, resp_header_version: i16) ?[]u8 {
+    fn handleElectLeaders(self: *Broker, request_bytes: []const u8, body_start: usize, req_header: *const RequestHeader, api_version: i16, resp_header_version: i16) ?[]u8 {
+        const Req = generated.elect_leaders_request.ElectLeadersRequest;
+        const Resp = generated.elect_leaders_response.ElectLeadersResponse;
+        const Result = Resp.ReplicaElectionResult;
+        const PartitionResult = Result.PartitionResult;
+
+        var pos = body_start;
+        var req = Req.deserialize(self.allocator, request_bytes, &pos, api_version) catch |err| {
+            log.warn("Failed to decode ElectLeaders request: {}", .{err});
+            return null;
+        };
+        defer self.freeElectLeadersRequest(&req);
+
+        const top_error: i16 = if (req.election_type == 0 or req.election_type == 1)
+            @intFromEnum(ErrorCode.none)
+        else
+            @intFromEnum(ErrorCode.invalid_request);
+
         // Trigger a leader election via Raft
-        if (self.raft_state) |raft| {
-            if (raft.role != .leader) {
-                // If we're not the leader, start an election
-                _ = raft.startElection();
-                if (raft.quorumSize() <= 1) {
-                    raft.becomeLeader();
+        if (top_error == 0) {
+            if (self.raft_state) |raft| {
+                if (raft.role != .leader) {
+                    // If we're not the leader, start an election
+                    _ = raft.startElection();
+                    if (raft.quorumSize() <= 1) {
+                        raft.becomeLeader();
+                    }
+                    log.info("Leader election triggered via ElectLeaders API", .{});
                 }
-                log.info("Leader election triggered via ElectLeaders API", .{});
             }
         }
 
-        var buf = self.allocator.alloc(u8, 256) catch return null;
-        var wpos: usize = 0;
+        var results = std.array_list.Managed(Result).init(self.allocator);
+        defer {
+            for (results.items) |result| self.allocator.free(result.partition_result);
+            results.deinit();
+        }
+
+        if (top_error == 0) {
+            if (req.topic_partitions.len == 0) {
+                var tit = self.topics.iterator();
+                while (tit.next()) |entry| {
+                    const info = entry.value_ptr;
+                    const partition_count: usize = @intCast(info.num_partitions);
+                    const partition_results = self.allocator.alloc(PartitionResult, partition_count) catch return null;
+                    for (0..partition_count) |pi| {
+                        partition_results[pi] = .{
+                            .partition_id = @intCast(pi),
+                            .error_code = @intFromEnum(ErrorCode.none),
+                            .error_message = null,
+                        };
+                    }
+                    results.append(.{ .topic = info.name, .partition_result = partition_results }) catch {
+                        self.allocator.free(partition_results);
+                        return null;
+                    };
+                }
+            } else {
+                for (req.topic_partitions) |topic_partitions| {
+                    const topic_name = topic_partitions.topic orelse "";
+                    const info = self.topics.get(topic_name);
+                    const requested_count = topic_partitions.partitions.len;
+                    const partition_count: usize = if (requested_count > 0) requested_count else if (info) |topic_info| @intCast(topic_info.num_partitions) else 1;
+
+                    const partition_results = self.allocator.alloc(PartitionResult, partition_count) catch return null;
+
+                    if (info) |topic_info| {
+                        for (0..partition_count) |i| {
+                            const partition_id: i32 = if (requested_count > 0) topic_partitions.partitions[i] else @intCast(i);
+                            const error_code: i16 = if (partition_id >= 0 and partition_id < topic_info.num_partitions)
+                                @intFromEnum(ErrorCode.none)
+                            else
+                                @intFromEnum(ErrorCode.unknown_topic_or_partition);
+                            partition_results[i] = .{
+                                .partition_id = partition_id,
+                                .error_code = error_code,
+                                .error_message = null,
+                            };
+                        }
+                    } else {
+                        for (0..partition_count) |i| {
+                            partition_results[i] = .{
+                                .partition_id = if (requested_count > 0) topic_partitions.partitions[i] else -1,
+                                .error_code = @intFromEnum(ErrorCode.unknown_topic_or_partition),
+                                .error_message = null,
+                            };
+                        }
+                    }
+
+                    results.append(.{ .topic = topic_partitions.topic, .partition_result = partition_results }) catch {
+                        self.allocator.free(partition_results);
+                        return null;
+                    };
+                }
+            }
+        }
+
+        const resp_body = Resp{
+            .throttle_time_ms = 0,
+            .error_code = top_error,
+            .replica_election_results = results.items,
+        };
         const rh = ResponseHeader{ .correlation_id = req_header.correlation_id };
+        const needed = rh.calcSize(resp_header_version) + resp_body.calcSize(api_version);
+        var buf = self.allocator.alloc(u8, needed) catch return null;
+        var wpos: usize = 0;
         rh.serialize(buf, &wpos, resp_header_version);
-        ser.writeI32(buf, &wpos, 0); // throttle_time_ms
-        ser.writeI16(buf, &wpos, 0); // error_code
-
-        // Return results for all topic-partitions (this broker is leader of all)
-        const topic_count = self.topics.count();
-        ser.writeArrayLen(buf, &wpos, topic_count);
-        var tit = self.topics.iterator();
-        while (tit.next()) |entry| {
-            const info = entry.value_ptr;
-            ser.writeString(buf, &wpos, info.name);
-            ser.writeArrayLen(buf, &wpos, @intCast(info.num_partitions));
-            for (0..@as(usize, @intCast(info.num_partitions))) |pi| {
-                ser.writeI32(buf, &wpos, @intCast(pi));
-                ser.writeI16(buf, &wpos, 0); // error_code = NONE (election succeeded)
-                ser.writeString(buf, &wpos, null); // error_message
-            }
-        }
-
-        if (resp_header_version >= 1) ser.writeEmptyTaggedFields(buf, &wpos);
+        resp_body.serialize(buf, &wpos, api_version);
         return (self.allocator.realloc(buf, wpos) catch buf)[0..wpos];
+    }
+
+    fn freeElectLeadersRequest(self: *Broker, req: *generated.elect_leaders_request.ElectLeadersRequest) void {
+        for (req.topic_partitions) |topic_partitions| {
+            if (topic_partitions.partitions.len > 0) self.allocator.free(topic_partitions.partitions);
+        }
+        if (req.topic_partitions.len > 0) self.allocator.free(req.topic_partitions);
     }
 
     // ---------------------------------------------------------------
@@ -6829,7 +6908,7 @@ test "Broker correlation ID preservation across APIs" {
     defer broker.deinit();
 
     // Test that every API handler correctly echoes back the correlation_id
-    const api_keys = [_]i16{ 18, 16, 35, 43, 60, 61, 55 };
+    const api_keys = [_]i16{ 18, 16, 35, 60, 61, 55 };
     for (api_keys) |api_key| {
         const version: i16 = 0;
         const header_ver = header_mod.requestHeaderVersion(api_key, version);
@@ -6843,6 +6922,56 @@ test "Broker correlation ID preservation across APIs" {
             try testing.expectEqual(@as(i32, 12345), corr_id);
         }
     }
+}
+
+test "Broker.handleRequest ElectLeaders returns requested partition results" {
+    const Req = generated.elect_leaders_request.ElectLeadersRequest;
+    const Resp = generated.elect_leaders_response.ElectLeadersResponse;
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+    try testing.expect(broker.ensureTopic("elect-topic"));
+
+    const partitions = [_]i32{ 0, 5 };
+    const topics = [_]Req.TopicPartitions{.{
+        .topic = "elect-topic",
+        .partitions = &partitions,
+    }};
+    const req = Req{
+        .election_type = 0,
+        .topic_partitions = &topics,
+        .timeout_ms = 1000,
+    };
+
+    var buf: [1024]u8 = undefined;
+    var pos = buildTestRequest(&buf, 43, 2, 4300, 2);
+    req.serialize(&buf, &pos, 2);
+
+    const response = broker.handleRequest(buf[0..pos]);
+    try testing.expect(response != null);
+    defer testing.allocator.free(response.?);
+
+    var rpos: usize = 0;
+    var response_header = try ResponseHeader.deserialize(testing.allocator, response.?, &rpos, 1);
+    defer response_header.deinit(testing.allocator);
+    try testing.expectEqual(@as(i32, 4300), response_header.correlation_id);
+
+    const resp = try Resp.deserialize(testing.allocator, response.?, &rpos, 2);
+    defer {
+        for (resp.replica_election_results) |result| {
+            if (result.partition_result.len > 0) testing.allocator.free(result.partition_result);
+        }
+        if (resp.replica_election_results.len > 0) testing.allocator.free(resp.replica_election_results);
+    }
+
+    try testing.expectEqual(@as(i16, 0), resp.error_code);
+    try testing.expectEqual(@as(usize, 1), resp.replica_election_results.len);
+    try testing.expectEqualStrings("elect-topic", resp.replica_election_results[0].topic.?);
+    try testing.expectEqual(@as(usize, 2), resp.replica_election_results[0].partition_result.len);
+    try testing.expectEqual(@as(i32, 0), resp.replica_election_results[0].partition_result[0].partition_id);
+    try testing.expectEqual(@as(i16, 0), resp.replica_election_results[0].partition_result[0].error_code);
+    try testing.expectEqual(@as(i32, 5), resp.replica_election_results[0].partition_result[1].partition_id);
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.unknown_topic_or_partition)), resp.replica_election_results[0].partition_result[1].error_code);
 }
 
 // ---------------------------------------------------------------
