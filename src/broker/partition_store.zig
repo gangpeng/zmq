@@ -216,8 +216,8 @@ pub const PartitionStore = struct {
             defer self.allocator.free(object_data);
 
             var reader = ObjectReader.parse(self.allocator, object_data) catch |err| {
-                log.warn("Skipping unreadable S3 WAL object {s}: {}", .{ key, err });
-                continue;
+                log.warn("Failed to parse S3 WAL object {s}: {}", .{ key, err });
+                return err;
             };
             defer reader.deinit();
 
@@ -1449,6 +1449,24 @@ test "PartitionStore S3 block cache keys exact fetch window" {
     try testing.expectEqual(@as(i16, 0), tail_records.error_code);
     try testing.expectEqualStrings("b", tail_records.records);
     try testing.expectEqual(@as(usize, 2), store.s3_block_cache.?.entries.count());
+}
+
+test "PartitionStore fails S3 WAL recovery on unreadable object" {
+    var mock_s3 = MockS3.init(testing.allocator);
+    defer mock_s3.deinit();
+    var s3_storage = S3Storage.initMock(testing.allocator, &mock_s3);
+    try s3_storage.putObject("wal/bad-object", "not-an-object-writer-payload");
+
+    var object_manager = ObjectManager.init(testing.allocator, 1);
+    defer object_manager.deinit();
+
+    var store = PartitionStore.init(testing.allocator);
+    defer store.deinit();
+    store.s3_storage = s3_storage;
+    store.object_manager = &object_manager;
+
+    try testing.expectError(error.InvalidMagic, store.recoverS3WalObjects());
+    try testing.expectEqual(@as(usize, 0), object_manager.getStreamSetObjectCount());
 }
 
 test "PartitionStore returns storage error for unreadable ObjectManager S3 object" {

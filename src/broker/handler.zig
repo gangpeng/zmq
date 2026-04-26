@@ -503,10 +503,7 @@ pub const Broker = struct {
         try self.store.open();
         const restored_object_snapshot = try self.restoreObjectManagerSnapshot();
         if (!restored_object_snapshot) {
-            const recovered_s3_objects = self.store.recoverS3WalObjects() catch |err| blk: {
-                log.warn("Failed to rebuild ObjectManager from S3 WAL objects: {}", .{err});
-                break :blk 0;
-            };
+            const recovered_s3_objects = try self.store.recoverS3WalObjects();
             if (recovered_s3_objects > 0) {
                 log.info("Rebuilt {d} S3 WAL object(s) into ObjectManager", .{recovered_s3_objects});
                 self.persistObjectManagerSnapshot();
@@ -6783,6 +6780,19 @@ test "Broker rebuilds ObjectManager from S3 WAL objects when snapshot is missing
 
     try testing.expectEqual(@as(usize, 1), broker.object_manager.getStreamSetObjectCount());
     try testing.expectEqual(@as(u64, 2), broker.object_manager.getStream(stream_id).?.end_offset);
+}
+
+test "Broker open fails on unreadable S3 WAL object without snapshot" {
+    var mock_s3 = storage.MockS3.init(testing.allocator);
+    defer mock_s3.deinit();
+    var s3_storage = storage.S3Storage.initMock(testing.allocator, &mock_s3);
+    try s3_storage.putObject("wal/bad-object", "not-an-object-writer-payload");
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+    broker.store.s3_storage = s3_storage;
+
+    try testing.expectError(error.InvalidMagic, broker.open());
 }
 
 test "Broker repairs partition offsets from recovered S3 WAL objects" {
