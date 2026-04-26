@@ -1488,7 +1488,7 @@ pub const Broker = struct {
             46 => self.handleListPartitionReassignments(request_bytes, pos, &req_header, api_version, resp_header_version),
             // OffsetDelete (key 47) — delete committed offsets
             47 => self.handleOffsetDelete(request_bytes, pos, &req_header, api_version, resp_header_version),
-            60 => self.handleDescribeCluster(&req_header, resp_header_version),
+            60 => self.handleDescribeCluster(request_bytes, pos, &req_header, api_version, resp_header_version),
             61 => self.handleDescribeProducers(request_bytes, pos, &req_header, api_version, resp_header_version),
             52 => self.handleVote(request_bytes, pos, &req_header, api_version, resp_header_version),
             53 => self.handleBeginQuorumEpoch(request_bytes, pos, &req_header, resp_header_version),
@@ -5532,25 +5532,60 @@ pub const Broker = struct {
     // ---------------------------------------------------------------
     // DescribeCluster (key 60) — Return actual broker state
     // ---------------------------------------------------------------
-    fn handleDescribeCluster(self: *Broker, req_header: *const RequestHeader, resp_header_version: i16) ?[]u8 {
-        var buf = self.allocator.alloc(u8, 512) catch return null;
-        var wpos: usize = 0;
+    fn handleDescribeCluster(self: *Broker, request_bytes: []const u8, body_start: usize, req_header: *const RequestHeader, api_version: i16, resp_header_version: i16) ?[]u8 {
+        const Req = generated.describe_cluster_request.DescribeClusterRequest;
+        const Resp = generated.describe_cluster_response.DescribeClusterResponse;
+        const BrokerInfo = Resp.DescribeClusterBroker;
+
+        if (!validateDescribeClusterRequestFrame(request_bytes, body_start, api_version)) {
+            log.warn("Malformed DescribeCluster request", .{});
+            return null;
+        }
+
+        var pos = body_start;
+        const req = Req.deserialize(self.allocator, request_bytes, &pos, api_version) catch |err| {
+            log.warn("Failed to decode DescribeCluster request: {}", .{err});
+            return null;
+        };
+
+        const endpoint_type = if (api_version >= 1) req.endpoint_type else 1;
+        const endpoint_error: i16 = if (endpoint_type == 1 or endpoint_type == 2)
+            @intFromEnum(ErrorCode.none)
+        else
+            @intFromEnum(ErrorCode.invalid_request);
+
+        const brokers = [_]BrokerInfo{.{
+            .broker_id = self.node_id,
+            .host = self.advertised_host,
+            .port = @intCast(self.port),
+            .rack = null,
+        }};
+        const resp_body = Resp{
+            .throttle_time_ms = 0,
+            .error_code = endpoint_error,
+            .error_message = null,
+            .endpoint_type = endpoint_type,
+            .cluster_id = if (self.raft_state) |rs| rs.cluster_id else "zmq-cluster",
+            .controller_id = self.node_id,
+            .brokers = if (endpoint_error == 0) &brokers else &.{},
+            .cluster_authorized_operations = if (req.include_cluster_authorized_operations) 0 else std.math.minInt(i32),
+        };
+
         const rh = ResponseHeader{ .correlation_id = req_header.correlation_id };
+        const needed = rh.calcSize(resp_header_version) + resp_body.calcSize(api_version);
+        var buf = self.allocator.alloc(u8, needed) catch return null;
+        var wpos: usize = 0;
         rh.serialize(buf, &wpos, resp_header_version);
-        ser.writeI32(buf, &wpos, 0); // throttle_time_ms
-        ser.writeI16(buf, &wpos, 0); // error_code
-        ser.writeString(buf, &wpos, ""); // error_message
-        ser.writeString(buf, &wpos, if (self.raft_state) |rs| rs.cluster_id else "zmq-cluster"); // cluster_id — use actual cluster ID
-        ser.writeI32(buf, &wpos, self.node_id); // controller_id
-        // Brokers array: 1 broker (single-node mode)
-        ser.writeArrayLen(buf, &wpos, 1);
-        ser.writeI32(buf, &wpos, self.node_id); // broker_id
-        ser.writeString(buf, &wpos, self.advertised_host); // host
-        ser.writeI32(buf, &wpos, @as(i32, self.port)); // port
-        ser.writeString(buf, &wpos, ""); // rack (no rack awareness in single-node)
-        ser.writeI32(buf, &wpos, 0); // cluster_authorized_operations
-        if (resp_header_version >= 1) ser.writeEmptyTaggedFields(buf, &wpos);
+        resp_body.serialize(buf, &wpos, api_version);
         return (self.allocator.realloc(buf, wpos) catch buf)[0..wpos];
+    }
+
+    fn validateDescribeClusterRequestFrame(buf: []const u8, start_pos: usize, api_version: i16) bool {
+        var pos = start_pos;
+        if (!skipFixedBytes(buf, &pos, 1)) return false; // include_cluster_authorized_operations
+        if (api_version >= 1 and !skipFixedBytes(buf, &pos, 1)) return false; // endpoint_type
+        ser.skipTaggedFields(buf, &pos) catch return false;
+        return true;
     }
 
     // ---------------------------------------------------------------
@@ -7270,6 +7305,9 @@ test "Broker correlation ID preservation across APIs" {
         if (api_key == 35) {
             const req = generated.describe_log_dirs_request.DescribeLogDirsRequest{};
             req.serialize(&buf, &req_len, version);
+        } else if (api_key == 60) {
+            const req = generated.describe_cluster_request.DescribeClusterRequest{};
+            req.serialize(&buf, &req_len, version);
         } else if (api_key == 61) {
             const req = generated.describe_producers_request.DescribeProducersRequest{};
             req.serialize(&buf, &req_len, version);
@@ -7463,6 +7501,89 @@ test "Broker.handleRequest partition reassignment APIs reject truncated requests
     var list_buf: [128]u8 = undefined;
     const list_len = buildTestRequest(&list_buf, 46, 0, 4601, header_mod.requestHeaderVersion(46, 0));
     try testing.expect(broker.handleRequest(list_buf[0..list_len]) == null);
+}
+
+test "Broker.handleRequest DescribeCluster uses generated endpoint-scoped response" {
+    const Req = generated.describe_cluster_request.DescribeClusterRequest;
+    const Resp = generated.describe_cluster_response.DescribeClusterResponse;
+
+    var broker = Broker.init(testing.allocator, 7, 19092);
+    defer broker.deinit();
+    broker.advertised_host = "broker.example";
+
+    const req = Req{
+        .include_cluster_authorized_operations = false,
+        .endpoint_type = 2,
+    };
+
+    var buf: [512]u8 = undefined;
+    var pos = buildTestRequest(&buf, 60, 1, 6001, header_mod.requestHeaderVersion(60, 1));
+    req.serialize(&buf, &pos, 1);
+
+    const response = broker.handleRequest(buf[0..pos]);
+    try testing.expect(response != null);
+    defer testing.allocator.free(response.?);
+
+    var rpos: usize = 0;
+    var response_header = try ResponseHeader.deserialize(testing.allocator, response.?, &rpos, header_mod.responseHeaderVersion(60, 1));
+    defer response_header.deinit(testing.allocator);
+    try testing.expectEqual(@as(i32, 6001), response_header.correlation_id);
+
+    const resp = try Resp.deserialize(testing.allocator, response.?, &rpos, 1);
+    defer if (resp.brokers.len > 0) testing.allocator.free(resp.brokers);
+
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.none)), resp.error_code);
+    try testing.expectEqual(@as(i8, 2), resp.endpoint_type);
+    try testing.expectEqualStrings("zmq-cluster", resp.cluster_id.?);
+    try testing.expectEqual(@as(i32, 7), resp.controller_id);
+    try testing.expectEqual(@as(i32, std.math.minInt(i32)), resp.cluster_authorized_operations);
+    try testing.expectEqual(@as(usize, 1), resp.brokers.len);
+    try testing.expectEqual(@as(i32, 7), resp.brokers[0].broker_id);
+    try testing.expectEqualStrings("broker.example", resp.brokers[0].host.?);
+    try testing.expectEqual(@as(i32, 19092), resp.brokers[0].port);
+}
+
+test "Broker.handleRequest DescribeCluster rejects malformed endpoint request" {
+    const Req = generated.describe_cluster_request.DescribeClusterRequest;
+    const Resp = generated.describe_cluster_response.DescribeClusterResponse;
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+
+    const req = Req{
+        .include_cluster_authorized_operations = true,
+        .endpoint_type = 9,
+    };
+
+    var buf: [256]u8 = undefined;
+    var pos = buildTestRequest(&buf, 60, 1, 6002, header_mod.requestHeaderVersion(60, 1));
+    req.serialize(&buf, &pos, 1);
+
+    const response = broker.handleRequest(buf[0..pos]);
+    try testing.expect(response != null);
+    defer testing.allocator.free(response.?);
+
+    var rpos: usize = 0;
+    var response_header = try ResponseHeader.deserialize(testing.allocator, response.?, &rpos, header_mod.responseHeaderVersion(60, 1));
+    defer response_header.deinit(testing.allocator);
+    try testing.expectEqual(@as(i32, 6002), response_header.correlation_id);
+
+    const resp = try Resp.deserialize(testing.allocator, response.?, &rpos, 1);
+    defer if (resp.brokers.len > 0) testing.allocator.free(resp.brokers);
+
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.invalid_request)), resp.error_code);
+    try testing.expectEqual(@as(i8, 9), resp.endpoint_type);
+    try testing.expectEqual(@as(usize, 0), resp.brokers.len);
+    try testing.expectEqual(@as(i32, 0), resp.cluster_authorized_operations);
+}
+
+test "Broker.handleRequest DescribeCluster rejects truncated request" {
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+
+    var buf: [128]u8 = undefined;
+    const req_len = buildTestRequest(&buf, 60, 1, 6003, header_mod.requestHeaderVersion(60, 1));
+    try testing.expect(broker.handleRequest(buf[0..req_len]) == null);
 }
 
 test "Broker.handleRequest ElectLeaders returns requested partition results" {

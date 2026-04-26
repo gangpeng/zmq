@@ -52,7 +52,7 @@ operator-facing behavior.
 | Area | Current status | Required to call complete |
 | --- | --- | --- |
 | Kafka ApiVersions/version catalog | In progress. Canonical table now drives advertised APIs and version checks, including AutoMQ extensions. | Keep catalog generated or audited against schemas and handler dispatch in CI. |
-| Kafka broker APIs | Partial. 67 advertised APIs; many handlers are simplified single-node semantics. DescribeLogDirs, partition reassignment APIs, ElectLeaders, and DescribeProducers now decode generated requests and return request-scoped generated responses instead of blanket hand-encoded results. | Full schema-valid decode/encode and Kafka-compatible semantics for every advertised version. |
+| Kafka broker APIs | Partial. 67 advertised APIs; many handlers are simplified single-node semantics. DescribeLogDirs, partition reassignment APIs, DescribeCluster, ElectLeaders, and DescribeProducers now decode generated requests and return request-scoped generated responses instead of blanket hand-encoded results. | Full schema-valid decode/encode and Kafka-compatible semantics for every advertised version. |
 | Kafka generated schemas | Broad. 110 request schemas generated. | Round-trip tests and golden fixtures for every generated request/response pair. |
 | AutoMQ extension APIs | Implemented locally. Keys 501-519 and 600-602 dispatch through generated schemas; stream/object APIs mutate ObjectManager and controller-like APIs mutate persisted local broker metadata. | Replace local-only controller semantics with quorum-backed metadata, failover, and client compatibility fixtures. |
 | S3 WAL | Partial. Sync durability path exists and failed uploads are not acknowledged. Filesystem WAL produces now fsync before ack, advance HW on durable write, and replay after local broker restart. Flushed S3 WAL objects can rebuild stream-set metadata idempotently when the local object snapshot is missing, including paginated and XML-escaped ListObjectsV2 responses. S3 WAL recovery now fails closed on unreadable WAL objects instead of silently skipping them. S3 WAL object upload has bounded retry for transient put failures, fetch returns storage errors for unreadable indexed S3 objects, malformed object indexes fail cleanly, interleaved stream-set objects fetch only the requested stream blocks, S3 block-cache keys include the exact visible fetch window, partition offsets are repaired from recovered stream metadata, and multipart completion rejects malformed part ETags. | S3 crash/restart recovery, idempotent retry, fencing, provider matrix, and fault injection. |
@@ -95,11 +95,13 @@ Status: completed for the initial catalog and DeleteGroups slice.
   requested topics/partitions. AlterPartitionReassignments and
   ListPartitionReassignments now decode generated requests, reject malformed
   frames, and return generated single-node responses instead of manual compact
-  writes. ElectLeaders now uses generated request/response schemas and returns
-  requested topic-partition results with per-partition errors under single-node
-  semantics. DescribeProducers now uses generated request/response schemas,
-  rejects malformed frames, and returns only requested topic-partition results
-  with unknown topic/partition errors under single-node semantics.
+  writes. DescribeCluster now decodes generated requests, rejects malformed
+  frames, and returns generated endpoint-scoped single-node metadata.
+  ElectLeaders now uses generated request/response schemas and returns requested
+  topic-partition results with per-partition errors under single-node semantics.
+  DescribeProducers now uses generated request/response schemas, rejects
+  malformed frames, and returns only requested topic-partition results with
+  unknown topic/partition errors under single-node semantics.
 
 ### Phase 2: AutoMQ S3Stream APIs
 
