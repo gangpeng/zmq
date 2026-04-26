@@ -215,6 +215,94 @@ pub const generated_request_apis = [_]GeneratedRequestApi{
     .{ .key = 602, .name = "AutomqUpdateGroupRequest", .min = 0, .max = 0 },
 };
 
+/// API keys with broker handler switch cases.
+///
+/// Version support still comes only from broker_supported_apis. This table makes
+/// handler drift measurable: an API may not be advertised unless it has a switch
+/// case, and non-advertised switch cases must be explicitly documented.
+pub const broker_handler_api_keys = [_]i16{
+    0,
+    1,
+    2,
+    3,
+    4,
+    5,
+    6,
+    7,
+    8,
+    9,
+    10,
+    11,
+    12,
+    13,
+    14,
+    15,
+    16,
+    17,
+    18,
+    19,
+    20,
+    21,
+    22,
+    23,
+    24,
+    25,
+    26,
+    27,
+    28,
+    29,
+    30,
+    31,
+    32,
+    33,
+    35,
+    36,
+    37,
+    42,
+    43,
+    44,
+    45,
+    46,
+    47,
+    52,
+    53,
+    54,
+    55,
+    60,
+    61,
+    501,
+    502,
+    503,
+    504,
+    505,
+    506,
+    507,
+    508,
+    509,
+    510,
+    511,
+    512,
+    513,
+    514,
+    515,
+    516,
+    517,
+    518,
+    519,
+    600,
+    601,
+    602,
+};
+
+/// Handler cases that intentionally remain non-advertised until real
+/// controller-backed semantics replace local/no-op legacy behavior.
+pub const non_advertised_handler_api_keys = [_]i16{
+    4, // LeaderAndIsr
+    5, // StopReplica
+    6, // UpdateMetadata
+    7, // ControlledShutdown
+};
+
 pub fn findBrokerSupport(api_key: i16) ?BrokerApiSupport {
     for (broker_supported_apis) |api| {
         if (api.key == api_key) return api;
@@ -249,6 +337,20 @@ pub fn findGeneratedRequest(api_key: i16) ?GeneratedRequestApi {
     return null;
 }
 
+pub fn hasBrokerHandler(api_key: i16) bool {
+    for (broker_handler_api_keys) |key| {
+        if (key == api_key) return true;
+    }
+    return false;
+}
+
+pub fn isNonAdvertisedHandlerApi(api_key: i16) bool {
+    for (non_advertised_handler_api_keys) |key| {
+        if (key == api_key) return true;
+    }
+    return false;
+}
+
 pub fn isGeneratedAutoMqExtension(api_key: i16) bool {
     return findGeneratedRequest(api_key) != null and api_key >= 501;
 }
@@ -272,11 +374,40 @@ test "generated request API catalog is sorted and unique" {
     }
 }
 
+test "broker handler API table is sorted and unique" {
+    var previous: ?i16 = null;
+    for (broker_handler_api_keys) |key| {
+        if (previous) |prev| try testing.expect(key > prev);
+        previous = key;
+    }
+}
+
 test "broker supported APIs do not advertise versions beyond generated schemas" {
     for (broker_supported_apis) |api| {
         const schema = findGeneratedRequest(api.key) orelse return error.MissingGeneratedRequestSchema;
         try testing.expect(api.min >= schema.min);
         try testing.expect(api.max <= schema.max);
+    }
+}
+
+test "broker supported APIs have handler switch coverage" {
+    for (broker_supported_apis) |api| {
+        try testing.expect(hasBrokerHandler(api.key));
+    }
+}
+
+test "non-advertised handler cases are explicit legacy inter-broker RPCs" {
+    for (broker_handler_api_keys) |key| {
+        if (findBrokerSupport(key) != null) continue;
+
+        try testing.expect(isNonAdvertisedHandlerApi(key));
+        try testing.expect(findGeneratedRequest(key) != null);
+        try testing.expect(!isBrokerVersionSupported(key, findGeneratedRequest(key).?.min));
+    }
+
+    for (non_advertised_handler_api_keys) |key| {
+        try testing.expect(hasBrokerHandler(key));
+        try testing.expect(findBrokerSupport(key) == null);
     }
 }
 
