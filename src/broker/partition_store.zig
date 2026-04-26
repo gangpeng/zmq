@@ -829,13 +829,14 @@ pub const PartitionStore = struct {
                     };
                     defer reader.deinit();
 
-                    const entries = reader.findEntries(stream_id, start_offset, effective_end_offset);
-                    if (entries.len == 0) {
+                    const entry_indexes = try reader.findEntryIndexes(self.allocator, stream_id, start_offset, effective_end_offset);
+                    defer self.allocator.free(entry_indexes);
+                    if (entry_indexes.len == 0) {
                         s3_read_failed = true;
                         continue;
                     }
-                    for (entries, 0..) |_, idx| {
-                        if (reader.readBlock(idx)) |block| {
+                    for (entry_indexes) |entry_index| {
+                        if (reader.readBlock(entry_index)) |block| {
                             try result_list.appendSlice(block);
                             if (max_bytes > 0 and result_list.items.len >= max_bytes) break;
                         } else {
@@ -886,18 +887,19 @@ pub const PartitionStore = struct {
                 };
                 defer reader.deinit();
 
-                const entries = reader.findEntries(stream_id, start_offset, effective_end_offset);
-                if (entries.len > 0) {
+                const entry_indexes = try reader.findEntryIndexes(self.allocator, stream_id, start_offset, effective_end_offset);
+                defer self.allocator.free(entry_indexes);
+                if (entry_indexes.len > 0) {
                     var s3_size: usize = 0;
-                    for (entries) |entry| s3_size += entry.block_size;
+                    for (entry_indexes) |entry_index| s3_size += reader.index_entries[entry_index].block_size;
 
                     const s3_buf = self.allocator.alloc(u8, s3_size) catch {
                         self.allocator.free(obj_data);
                         return .{ .error_code = 0, .records = &.{}, .high_watermark = @intCast(state.high_watermark), .last_stable_offset = @intCast(state.high_watermark) };
                     };
                     var s3_pos: usize = 0;
-                    for (entries, 0..) |_, i| {
-                        if (reader.readBlock(i)) |block| {
+                    for (entry_indexes) |entry_index| {
+                        if (reader.readBlock(entry_index)) |block| {
                             @memcpy(s3_buf[s3_pos .. s3_pos + block.len], block);
                             s3_pos += block.len;
                         }
@@ -1361,6 +1363,47 @@ test "PartitionStore rebuilds S3 WAL metadata and fetches object data" {
     defer if (result.records.len > 0) testing.allocator.free(@constCast(result.records));
     try testing.expectEqual(@as(i16, 0), result.error_code);
     try testing.expectEqualStrings("ab", result.records);
+}
+
+test "PartitionStore fetch filters interleaved S3 WAL stream blocks" {
+    var mock_s3 = MockS3.init(testing.allocator);
+    defer mock_s3.deinit();
+    var s3_storage = S3Storage.initMock(testing.allocator, &mock_s3);
+
+    const stream_a = PartitionStore.hashPartitionKey("interleaved-a", 0);
+    const stream_b = PartitionStore.hashPartitionKey("interleaved-b", 0);
+    {
+        var batcher = S3WalBatcher.init(testing.allocator);
+        defer batcher.deinit();
+
+        try batcher.append(stream_a, 0, "a0");
+        try batcher.append(stream_b, 0, "b0");
+        try batcher.append(stream_a, 1, "a1");
+        try testing.expect(batcher.flushNow(&s3_storage));
+    }
+
+    var object_manager = ObjectManager.init(testing.allocator, 1);
+    defer object_manager.deinit();
+
+    var store = PartitionStore.init(testing.allocator);
+    defer store.deinit();
+    store.s3_storage = s3_storage;
+    store.object_manager = &object_manager;
+
+    try testing.expectEqual(@as(u64, 1), try store.recoverS3WalObjects());
+    try store.ensurePartition("interleaved-a", 0);
+    try store.ensurePartition("interleaved-b", 0);
+    try testing.expect(store.repairPartitionStatesFromObjectManager());
+
+    const a_result = try store.fetch("interleaved-a", 0, 0, 1024);
+    defer if (a_result.records.len > 0) testing.allocator.free(@constCast(a_result.records));
+    try testing.expectEqual(@as(i16, 0), a_result.error_code);
+    try testing.expectEqualStrings("a0a1", a_result.records);
+
+    const b_result = try store.fetch("interleaved-b", 0, 0, 1024);
+    defer if (b_result.records.len > 0) testing.allocator.free(@constCast(b_result.records));
+    try testing.expectEqual(@as(i16, 0), b_result.error_code);
+    try testing.expectEqualStrings("b0", b_result.records);
 }
 
 test "PartitionStore returns storage error for unreadable ObjectManager S3 object" {

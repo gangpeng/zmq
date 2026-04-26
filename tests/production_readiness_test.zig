@@ -231,15 +231,17 @@ test "S3 object CRC32C roundtrip: write, read, verify checksum" {
     try testing.expectEqualStrings("partition-0-records-batch-2", reader.readBlock(1).?);
     try testing.expectEqualStrings("partition-1-records-batch-1", reader.readBlock(2).?);
 
-    // Verify findEntries works for stream 1 (should find 2 blocks)
-    const s1_entries = reader.findEntries(1, 0, 200);
-    try testing.expectEqual(@as(usize, 2), s1_entries.len);
-    try testing.expectEqual(@as(u64, 0), s1_entries[0].start_offset);
-    try testing.expectEqual(@as(u64, 100), s1_entries[1].start_offset);
+    // Verify index lookup works for stream 1 (should find 2 blocks)
+    const s1_indexes = try reader.findEntryIndexes(alloc, 1, 0, 200);
+    defer alloc.free(s1_indexes);
+    try testing.expectEqual(@as(usize, 2), s1_indexes.len);
+    try testing.expectEqual(@as(u64, 0), reader.index_entries[s1_indexes[0]].start_offset);
+    try testing.expectEqual(@as(u64, 100), reader.index_entries[s1_indexes[1]].start_offset);
 
-    // Verify findEntries for stream 2 (should find 1 block)
-    const s2_entries = reader.findEntries(2, 0, 200);
-    try testing.expectEqual(@as(usize, 1), s2_entries.len);
+    // Verify index lookup for stream 2 (should find 1 block)
+    const s2_indexes = try reader.findEntryIndexes(alloc, 2, 0, 200);
+    defer alloc.free(s2_indexes);
+    try testing.expectEqual(@as(usize, 1), s2_indexes.len);
 }
 
 test "S3 object CRC32C detects bit-rot corruption" {

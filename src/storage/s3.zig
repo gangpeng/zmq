@@ -358,28 +358,23 @@ pub const ObjectReader = struct {
         return self.data[start..end];
     }
 
-    /// Find index entries for a given stream and offset range.
-    pub fn findEntries(self: *const ObjectReader, stream_id: u64, start_offset: u64, end_offset: u64) []const ObjectWriter.DataBlockIndex {
-        // Simple linear scan — can be optimized with binary search
-        var start_idx: usize = 0;
-        var end_idx: usize = 0;
-        var found_start = false;
+    /// Find global index positions for blocks from one stream that overlap the
+    /// requested offset range. Returning positions instead of a slice is
+    /// required because StreamSetObjects can interleave entries from many
+    /// streams in a single object.
+    pub fn findEntryIndexes(self: *const ObjectReader, alloc: Allocator, stream_id: u64, start_offset: u64, end_offset: u64) ![]usize {
+        var indexes = std.array_list.Managed(usize).init(alloc);
+        errdefer indexes.deinit();
 
         for (self.index_entries, 0..) |entry, i| {
             if (entry.stream_id != stream_id) continue;
-            const entry_end = entry.start_offset + entry.end_offset_delta;
-            if (!found_start and entry_end > start_offset) {
-                start_idx = i;
-                found_start = true;
-            }
-            if (found_start) {
-                end_idx = i + 1;
-                if (entry.start_offset >= end_offset) break;
-            }
+            const entry_end = std.math.add(u64, entry.start_offset, entry.end_offset_delta) catch std.math.maxInt(u64);
+            if (entry_end <= start_offset) continue;
+            if (entry.start_offset >= end_offset) continue;
+            try indexes.append(i);
         }
 
-        if (!found_start) return &.{};
-        return self.index_entries[start_idx..end_idx];
+        return try indexes.toOwnedSlice();
     }
 };
 
@@ -440,14 +435,45 @@ test "ObjectWriter and ObjectReader round-trip" {
     try testing.expectEqualStrings("block3-stream2", block2);
 
     // Find entries for stream 1 in offset range [0, 20)
-    const entries = reader.findEntries(1, 0, 20);
-    try testing.expectEqual(@as(usize, 2), entries.len);
-    try testing.expectEqual(@as(u64, 0), entries[0].start_offset);
-    try testing.expectEqual(@as(u64, 10), entries[1].start_offset);
+    const entry_indexes = try reader.findEntryIndexes(testing.allocator, 1, 0, 20);
+    defer testing.allocator.free(entry_indexes);
+    try testing.expectEqual(@as(usize, 2), entry_indexes.len);
+    try testing.expectEqual(@as(u64, 0), reader.index_entries[entry_indexes[0]].start_offset);
+    try testing.expectEqual(@as(u64, 10), reader.index_entries[entry_indexes[1]].start_offset);
 
     // Find entries for stream 2
-    const s2_entries = reader.findEntries(2, 0, 10);
-    try testing.expectEqual(@as(usize, 1), s2_entries.len);
+    const s2_entry_indexes = try reader.findEntryIndexes(testing.allocator, 2, 0, 10);
+    defer testing.allocator.free(s2_entry_indexes);
+    try testing.expectEqual(@as(usize, 1), s2_entry_indexes.len);
+}
+
+test "ObjectReader.findEntryIndexes filters interleaved streams" {
+    var writer = ObjectWriter.init(testing.allocator);
+    defer writer.deinit();
+
+    try writer.addDataBlock(1, 0, 1, 1, "s1-0");
+    try writer.addDataBlock(2, 0, 1, 1, "s2-0");
+    try writer.addDataBlock(1, 1, 1, 1, "s1-1");
+
+    const obj_data = try writer.build();
+    defer testing.allocator.free(obj_data);
+
+    var reader = try ObjectReader.parse(testing.allocator, obj_data);
+    defer reader.deinit();
+
+    const s1_indexes = try reader.findEntryIndexes(testing.allocator, 1, 0, 2);
+    defer testing.allocator.free(s1_indexes);
+    try testing.expectEqual(@as(usize, 2), s1_indexes.len);
+    try testing.expectEqual(@as(usize, 0), s1_indexes[0]);
+    try testing.expectEqual(@as(usize, 2), s1_indexes[1]);
+    try testing.expectEqualStrings("s1-0", reader.readBlock(s1_indexes[0]).?);
+    try testing.expectEqualStrings("s1-1", reader.readBlock(s1_indexes[1]).?);
+
+    const s2_indexes = try reader.findEntryIndexes(testing.allocator, 2, 0, 1);
+    defer testing.allocator.free(s2_indexes);
+    try testing.expectEqual(@as(usize, 1), s2_indexes.len);
+    try testing.expectEqual(@as(usize, 1), s2_indexes[0]);
+    try testing.expectEqualStrings("s2-0", reader.readBlock(s2_indexes[0]).?);
 }
 
 test "ObjectReader.parse too-small buffer" {
@@ -484,7 +510,7 @@ test "ObjectReader.readBlock out of bounds" {
     try testing.expect(reader.readBlock(99) == null);
 }
 
-test "ObjectReader.findEntries no match" {
+test "ObjectReader.findEntryIndexes no match" {
     var writer = ObjectWriter.init(testing.allocator);
     defer writer.deinit();
 
@@ -496,8 +522,9 @@ test "ObjectReader.findEntries no match" {
     defer reader.deinit();
 
     // Search for non-existent stream
-    const entries = reader.findEntries(999, 0, 100);
-    try testing.expectEqual(@as(usize, 0), entries.len);
+    const entry_indexes = try reader.findEntryIndexes(testing.allocator, 999, 0, 100);
+    defer testing.allocator.free(entry_indexes);
+    try testing.expectEqual(@as(usize, 0), entry_indexes.len);
 }
 
 test "ObjectWriter empty build" {
