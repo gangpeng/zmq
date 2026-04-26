@@ -1493,7 +1493,7 @@ pub const Broker = struct {
             52 => self.handleVote(request_bytes, pos, &req_header, api_version, resp_header_version),
             53 => self.handleBeginQuorumEpoch(request_bytes, pos, &req_header, resp_header_version),
             54 => self.handleEndQuorumEpoch(request_bytes, pos, &req_header, resp_header_version),
-            55 => self.handleDescribeQuorum(&req_header, resp_header_version),
+            55 => self.handleDescribeQuorum(request_bytes, pos, &req_header, api_version, resp_header_version),
             501 => self.handleCreateStreams(request_bytes, pos, &req_header, api_version, resp_header_version),
             502 => self.handleOpenStreams(request_bytes, pos, &req_header, api_version, resp_header_version),
             503 => self.handleCloseStreams(request_bytes, pos, &req_header, api_version, resp_header_version),
@@ -6057,39 +6057,191 @@ pub const Broker = struct {
     // ---------------------------------------------------------------
     // DescribeQuorum (key 55) — KRaft quorum info
     // ---------------------------------------------------------------
-    fn handleDescribeQuorum(self: *Broker, req_header: *const RequestHeader, resp_header_version: i16) ?[]u8 {
-        const raft = self.raft_state orelse return self.handleNotController(req_header, resp_header_version);
-        var buf = self.allocator.alloc(u8, 256) catch return null;
-        var wpos: usize = 0;
-        const rh = ResponseHeader{ .correlation_id = req_header.correlation_id };
-        rh.serialize(buf, &wpos, resp_header_version);
+    fn handleDescribeQuorum(self: *Broker, request_bytes: []const u8, body_start: usize, req_header: *const RequestHeader, api_version: i16, resp_header_version: i16) ?[]u8 {
+        const Req = generated.describe_quorum_request.DescribeQuorumRequest;
+        const Resp = generated.describe_quorum_response.DescribeQuorumResponse;
+        const Node = Resp.Node;
+        const Listener = Node.Listener;
 
-        // DescribeQuorum response body
-        ser.writeI16(buf, &wpos, 0); // error_code
-        // Topics array — one topic (__cluster_metadata)
-        ser.writeI32(buf, &wpos, 1);
-        ser.writeString(buf, &wpos, "__cluster_metadata");
-        // Partitions array — one partition
-        ser.writeI32(buf, &wpos, 1);
-        // Partition 0
-        ser.writeI16(buf, &wpos, 0); // error_code
-        ser.writeI32(buf, &wpos, 0); // partition_index
-        ser.writeI32(buf, &wpos, raft.leader_id orelse -1); // leader_id
-        ser.writeI32(buf, &wpos, raft.current_epoch); // leader_epoch
-        ser.writeI64(buf, &wpos, @intCast(raft.log.lastOffset())); // high_watermark
-
-        // Current voters array
-        const voter_count = raft.quorumSize();
-        ser.writeI32(buf, &wpos, @intCast(voter_count));
-        var it = raft.voters.iterator();
-        while (it.next()) |entry| {
-            ser.writeI32(buf, &wpos, entry.key_ptr.*); // replica_id
-            ser.writeI64(buf, &wpos, @intCast(entry.value_ptr.match_index)); // log_end_offset
+        if (!validateDescribeQuorumRequestFrame(request_bytes, body_start)) {
+            log.warn("Malformed DescribeQuorum request", .{});
+            return null;
         }
-        // Observers array (empty)
-        ser.writeI32(buf, &wpos, 0);
 
+        var pos = body_start;
+        var req = Req.deserialize(self.allocator, request_bytes, &pos, api_version) catch |err| {
+            log.warn("Failed to decode DescribeQuorum request: {}", .{err});
+            return null;
+        };
+        defer self.freeDescribeQuorumRequest(&req);
+
+        const rh = ResponseHeader{ .correlation_id = req_header.correlation_id };
+        const raft = self.raft_state;
+        const topics = if (raft) |rs| (self.collectDescribeQuorumTopics(&req, rs, api_version) catch return null) else &.{};
+        defer {
+            self.freeDescribeQuorumTopics(topics);
+            if (topics.len > 0) self.allocator.free(topics);
+        }
+
+        const listeners = [_]Listener{.{
+            .name = "PLAINTEXT",
+            .host = self.advertised_host,
+            .port = self.port,
+        }};
+        const nodes = [_]Node{.{
+            .node_id = self.node_id,
+            .listeners = &listeners,
+        }};
+        const resp_body = Resp{
+            .error_code = if (raft == null) @intFromEnum(ErrorCode.not_controller) else @intFromEnum(ErrorCode.none),
+            .error_message = null,
+            .topics = topics,
+            .nodes = if (api_version >= 2 and raft != null) &nodes else &.{},
+        };
+
+        const needed = rh.calcSize(resp_header_version) + resp_body.calcSize(api_version);
+        var buf = self.allocator.alloc(u8, needed) catch return null;
+        var wpos: usize = 0;
+        rh.serialize(buf, &wpos, resp_header_version);
+        resp_body.serialize(buf, &wpos, api_version);
         return (self.allocator.realloc(buf, wpos) catch buf)[0..wpos];
+    }
+
+    fn validateDescribeQuorumRequestFrame(buf: []const u8, start_pos: usize) bool {
+        var pos = start_pos;
+        const topic_count = (ser.readCompactArrayLen(buf, &pos) catch return false) orelse 0;
+        for (0..topic_count) |_| {
+            _ = ser.readCompactString(buf, &pos) catch return false;
+            const partition_count = (ser.readCompactArrayLen(buf, &pos) catch return false) orelse 0;
+            for (0..partition_count) |_| {
+                if (!skipFixedBytes(buf, &pos, 4)) return false; // partition_index
+                ser.skipTaggedFields(buf, &pos) catch return false;
+            }
+            ser.skipTaggedFields(buf, &pos) catch return false;
+        }
+        ser.skipTaggedFields(buf, &pos) catch return false;
+        return true;
+    }
+
+    fn freeDescribeQuorumRequest(self: *Broker, req: *generated.describe_quorum_request.DescribeQuorumRequest) void {
+        for (req.topics) |topic| {
+            if (topic.partitions.len > 0) self.allocator.free(topic.partitions);
+        }
+        if (req.topics.len > 0) self.allocator.free(req.topics);
+    }
+
+    fn collectDescribeQuorumTopics(self: *Broker, req: *const generated.describe_quorum_request.DescribeQuorumRequest, raft: *RaftState, api_version: i16) ![]generated.describe_quorum_response.DescribeQuorumResponse.TopicData {
+        const Topic = generated.describe_quorum_response.DescribeQuorumResponse.TopicData;
+
+        var topics = std.array_list.Managed(Topic).init(self.allocator);
+        errdefer {
+            self.freeDescribeQuorumTopics(topics.items);
+            topics.deinit();
+        }
+
+        if (req.topics.len == 0) {
+            const partitions = try self.collectDescribeQuorumPartitions("__cluster_metadata", &[_]generated.describe_quorum_request.DescribeQuorumRequest.TopicData.PartitionData{.{ .partition_index = 0 }}, raft, api_version);
+            topics.append(.{
+                .topic_name = "__cluster_metadata",
+                .partitions = partitions,
+            }) catch |err| {
+                self.freeDescribeQuorumPartitions(partitions);
+                if (partitions.len > 0) self.allocator.free(partitions);
+                return err;
+            };
+        } else {
+            for (req.topics) |topic_req| {
+                const topic_name = topic_req.topic_name orelse "";
+                const partitions = try self.collectDescribeQuorumPartitions(topic_name, topic_req.partitions, raft, api_version);
+                topics.append(.{
+                    .topic_name = topic_req.topic_name,
+                    .partitions = partitions,
+                }) catch |err| {
+                    self.freeDescribeQuorumPartitions(partitions);
+                    if (partitions.len > 0) self.allocator.free(partitions);
+                    return err;
+                };
+            }
+        }
+
+        if (topics.items.len == 0) return &.{};
+        return topics.toOwnedSlice();
+    }
+
+    fn collectDescribeQuorumPartitions(self: *Broker, topic_name: []const u8, requested_partitions: []const generated.describe_quorum_request.DescribeQuorumRequest.TopicData.PartitionData, raft: *RaftState, api_version: i16) ![]generated.describe_quorum_response.DescribeQuorumResponse.TopicData.PartitionData {
+        const Partition = generated.describe_quorum_response.DescribeQuorumResponse.TopicData.PartitionData;
+
+        var partitions = std.array_list.Managed(Partition).init(self.allocator);
+        errdefer {
+            self.freeDescribeQuorumPartitions(partitions.items);
+            partitions.deinit();
+        }
+
+        for (requested_partitions) |partition_req| {
+            const partition = try self.describeQuorumPartition(topic_name, partition_req.partition_index, raft, api_version);
+            partitions.append(partition) catch |err| {
+                if (partition.current_voters.len > 0) self.allocator.free(partition.current_voters);
+                return err;
+            };
+        }
+
+        if (partitions.items.len == 0) return &.{};
+        return partitions.toOwnedSlice();
+    }
+
+    fn describeQuorumPartition(self: *Broker, topic_name: []const u8, partition_index: i32, raft: *RaftState, api_version: i16) !generated.describe_quorum_response.DescribeQuorumResponse.TopicData.PartitionData {
+        const Partition = generated.describe_quorum_response.DescribeQuorumResponse.TopicData.PartitionData;
+
+        if (!std.mem.eql(u8, topic_name, "__cluster_metadata") or partition_index != 0) {
+            return Partition{
+                .partition_index = partition_index,
+                .error_code = @intFromEnum(ErrorCode.unknown_topic_or_partition),
+                .error_message = if (api_version >= 2) "Unknown quorum partition" else null,
+                .leader_id = -1,
+                .leader_epoch = raft.current_epoch,
+                .high_watermark = @intCast(raft.commit_index),
+                .current_voters = &.{},
+                .observers = &.{},
+            };
+        }
+
+        const voters = try self.allocator.alloc(generated.describe_quorum_response.ReplicaState, raft.quorumSize());
+        var voter_index: usize = 0;
+        var voter_it = raft.voters.iterator();
+        while (voter_it.next()) |entry| {
+            voters[voter_index] = .{
+                .replica_id = entry.key_ptr.*,
+                .log_end_offset = @intCast(entry.value_ptr.match_index),
+                .last_fetch_timestamp = -1,
+                .last_caught_up_timestamp = if (entry.key_ptr.* == raft.node_id) @import("time_compat").milliTimestamp() else -1,
+            };
+            voter_index += 1;
+        }
+
+        return Partition{
+            .partition_index = partition_index,
+            .error_code = @intFromEnum(ErrorCode.none),
+            .error_message = null,
+            .leader_id = raft.leader_id orelse -1,
+            .leader_epoch = raft.current_epoch,
+            .high_watermark = @intCast(raft.commit_index),
+            .current_voters = voters,
+            .observers = &.{},
+        };
+    }
+
+    fn freeDescribeQuorumTopics(self: *Broker, topics: []const generated.describe_quorum_response.DescribeQuorumResponse.TopicData) void {
+        for (topics) |topic| {
+            self.freeDescribeQuorumPartitions(topic.partitions);
+            if (topic.partitions.len > 0) self.allocator.free(topic.partitions);
+        }
+    }
+
+    fn freeDescribeQuorumPartitions(self: *Broker, partitions: []const generated.describe_quorum_response.DescribeQuorumResponse.TopicData.PartitionData) void {
+        for (partitions) |partition| {
+            if (partition.current_voters.len > 0) self.allocator.free(partition.current_voters);
+            if (partition.observers.len > 0) self.allocator.free(partition.observers);
+        }
     }
 };
 
@@ -7305,6 +7457,9 @@ test "Broker correlation ID preservation across APIs" {
         if (api_key == 35) {
             const req = generated.describe_log_dirs_request.DescribeLogDirsRequest{};
             req.serialize(&buf, &req_len, version);
+        } else if (api_key == 55) {
+            const req = generated.describe_quorum_request.DescribeQuorumRequest{};
+            req.serialize(&buf, &req_len, version);
         } else if (api_key == 60) {
             const req = generated.describe_cluster_request.DescribeClusterRequest{};
             req.serialize(&buf, &req_len, version);
@@ -7583,6 +7738,121 @@ test "Broker.handleRequest DescribeCluster rejects truncated request" {
 
     var buf: [128]u8 = undefined;
     const req_len = buildTestRequest(&buf, 60, 1, 6003, header_mod.requestHeaderVersion(60, 1));
+    try testing.expect(broker.handleRequest(buf[0..req_len]) == null);
+}
+
+test "Broker.handleRequest DescribeQuorum returns request-scoped generated quorum state" {
+    const Req = generated.describe_quorum_request.DescribeQuorumRequest;
+    const Resp = generated.describe_quorum_response.DescribeQuorumResponse;
+
+    var raft = RaftState.init(testing.allocator, 5, "quorum-cluster");
+    defer raft.deinit();
+    try raft.addVoter(5);
+    try raft.addVoter(6);
+    raft.current_epoch = 3;
+    raft.commit_index = 4;
+    raft.becomeLeader();
+    if (raft.voters.getPtr(5)) |voter| voter.match_index = 4;
+    if (raft.voters.getPtr(6)) |voter| voter.match_index = 2;
+
+    var broker = Broker.init(testing.allocator, 5, 19093);
+    defer broker.deinit();
+    broker.advertised_host = "controller.example";
+    broker.raft_state = &raft;
+
+    const partitions = [_]Req.TopicData.PartitionData{
+        .{ .partition_index = 0 },
+        .{ .partition_index = 1 },
+    };
+    const topics = [_]Req.TopicData{.{
+        .topic_name = "__cluster_metadata",
+        .partitions = &partitions,
+    }};
+    const req = Req{ .topics = &topics };
+
+    var buf: [1024]u8 = undefined;
+    var pos = buildTestRequest(&buf, 55, 2, 5502, header_mod.requestHeaderVersion(55, 2));
+    req.serialize(&buf, &pos, 2);
+
+    const response = broker.handleRequest(buf[0..pos]);
+    try testing.expect(response != null);
+    defer testing.allocator.free(response.?);
+
+    var rpos: usize = 0;
+    var response_header = try ResponseHeader.deserialize(testing.allocator, response.?, &rpos, header_mod.responseHeaderVersion(55, 2));
+    defer response_header.deinit(testing.allocator);
+    try testing.expectEqual(@as(i32, 5502), response_header.correlation_id);
+
+    const resp = try Resp.deserialize(testing.allocator, response.?, &rpos, 2);
+    defer {
+        for (resp.topics) |topic| {
+            for (topic.partitions) |partition| {
+                if (partition.current_voters.len > 0) testing.allocator.free(partition.current_voters);
+                if (partition.observers.len > 0) testing.allocator.free(partition.observers);
+            }
+            if (topic.partitions.len > 0) testing.allocator.free(topic.partitions);
+        }
+        if (resp.topics.len > 0) testing.allocator.free(resp.topics);
+        for (resp.nodes) |node| {
+            if (node.listeners.len > 0) testing.allocator.free(node.listeners);
+        }
+        if (resp.nodes.len > 0) testing.allocator.free(resp.nodes);
+    }
+
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.none)), resp.error_code);
+    try testing.expectEqual(@as(usize, 1), resp.topics.len);
+    try testing.expectEqualStrings("__cluster_metadata", resp.topics[0].topic_name.?);
+    try testing.expectEqual(@as(usize, 2), resp.topics[0].partitions.len);
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.none)), resp.topics[0].partitions[0].error_code);
+    try testing.expectEqual(@as(i32, 5), resp.topics[0].partitions[0].leader_id);
+    try testing.expectEqual(@as(i32, 3), resp.topics[0].partitions[0].leader_epoch);
+    try testing.expectEqual(@as(i64, 4), resp.topics[0].partitions[0].high_watermark);
+    try testing.expectEqual(@as(usize, 2), resp.topics[0].partitions[0].current_voters.len);
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.unknown_topic_or_partition)), resp.topics[0].partitions[1].error_code);
+    try testing.expectEqual(@as(usize, 1), resp.nodes.len);
+    try testing.expectEqual(@as(i32, 5), resp.nodes[0].node_id);
+    try testing.expectEqual(@as(usize, 1), resp.nodes[0].listeners.len);
+    try testing.expectEqualStrings("controller.example", resp.nodes[0].listeners[0].host.?);
+}
+
+test "Broker.handleRequest DescribeQuorum returns generated not-controller response" {
+    const Req = generated.describe_quorum_request.DescribeQuorumRequest;
+    const Resp = generated.describe_quorum_response.DescribeQuorumResponse;
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+
+    const req = Req{};
+    var buf: [256]u8 = undefined;
+    var pos = buildTestRequest(&buf, 55, 2, 5503, header_mod.requestHeaderVersion(55, 2));
+    req.serialize(&buf, &pos, 2);
+
+    const response = broker.handleRequest(buf[0..pos]);
+    try testing.expect(response != null);
+    defer testing.allocator.free(response.?);
+
+    var rpos: usize = 0;
+    var response_header = try ResponseHeader.deserialize(testing.allocator, response.?, &rpos, header_mod.responseHeaderVersion(55, 2));
+    defer response_header.deinit(testing.allocator);
+    try testing.expectEqual(@as(i32, 5503), response_header.correlation_id);
+
+    const resp = try Resp.deserialize(testing.allocator, response.?, &rpos, 2);
+    defer {
+        if (resp.topics.len > 0) testing.allocator.free(resp.topics);
+        if (resp.nodes.len > 0) testing.allocator.free(resp.nodes);
+    }
+
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.not_controller)), resp.error_code);
+    try testing.expectEqual(@as(usize, 0), resp.topics.len);
+    try testing.expectEqual(@as(usize, 0), resp.nodes.len);
+}
+
+test "Broker.handleRequest DescribeQuorum rejects truncated request" {
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+
+    var buf: [128]u8 = undefined;
+    const req_len = buildTestRequest(&buf, 55, 2, 5504, header_mod.requestHeaderVersion(55, 2));
     try testing.expect(broker.handleRequest(buf[0..req_len]) == null);
 }
 

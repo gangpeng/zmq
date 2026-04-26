@@ -72,7 +72,7 @@ pub const broker_supported_apis = [_]BrokerApiSupport{
     .{ .key = 52, .name = "Vote", .metric = "vote", .min = 0, .max = 1 },
     .{ .key = 53, .name = "BeginQuorumEpoch", .metric = "begin_quorum_epoch", .min = 0, .max = 1 },
     .{ .key = 54, .name = "EndQuorumEpoch", .metric = "end_quorum_epoch", .min = 0, .max = 1 },
-    .{ .key = 55, .name = "DescribeQuorum", .metric = "describe_quorum", .min = 0, .max = 1 },
+    .{ .key = 55, .name = "DescribeQuorum", .metric = "describe_quorum", .min = 0, .max = 2 },
     .{ .key = 60, .name = "DescribeCluster", .metric = "describe_cluster", .min = 0, .max = 1 },
     .{ .key = 61, .name = "DescribeProducers", .metric = "describe_producers", .min = 0, .max = 0 },
     .{ .key = 501, .name = "CreateStreams", .metric = "automq_create_streams", .min = 0, .max = 1 },
