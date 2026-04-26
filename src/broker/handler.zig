@@ -324,6 +324,11 @@ pub const Broker = struct {
 
     pub const WalFlushMode = storage.wal.WalFlushMode;
 
+    fn defaultAutoMqNextNodeId(node_id: i32) i32 {
+        if (node_id == std.math.maxInt(i32)) return std.math.maxInt(i32);
+        return @max(node_id + 1, 1);
+    }
+
     pub fn init(alloc: Allocator, node_id: i32, port: u16) Broker {
         return initWithConfig(alloc, node_id, port, .{});
     }
@@ -357,7 +362,7 @@ pub const Broker = struct {
             .topics = std.StringHashMap(TopicInfo).init(alloc),
             .auto_mq_kvs = std.StringHashMap([]u8).init(alloc),
             .auto_mq_nodes = std.AutoHashMap(i32, AutoMqNodeMetadata).init(alloc),
-            .auto_mq_next_node_id = @max(node_id + 1, 1),
+            .auto_mq_next_node_id = defaultAutoMqNextNodeId(node_id),
             .auto_mq_group_promotions = std.StringHashMap(AutoMqGroupPromotion).init(alloc),
             .producer_sequences = std.AutoHashMap(ProducerKey, ProducerSequenceState).init(alloc),
             .allocator = alloc,
@@ -607,6 +612,20 @@ pub const Broker = struct {
         if (saved_acls.len > 0) {
             log.info("Restored {d} ACL(s) from acls.meta", .{saved_acls.len});
         }
+
+        // Load local AutoMQ controller-style metadata (KV namespace, node registry,
+        // license, zone router state, and group promotions).
+        var auto_mq_snapshot = try self.persistence.loadAutoMqMetadata();
+        defer self.persistence.freeAutoMqMetadataSnapshot(&auto_mq_snapshot);
+        try self.restoreAutoMqMetadata(auto_mq_snapshot);
+        if (auto_mq_snapshot.kvs.len > 0 or auto_mq_snapshot.nodes.len > 0 or auto_mq_snapshot.group_promotions.len > 0 or auto_mq_snapshot.license != null or auto_mq_snapshot.zone_router_metadata != null) {
+            log.info("Restored AutoMQ metadata (kvs={d}, nodes={d}, groups={d}, next_node_id={d})", .{
+                auto_mq_snapshot.kvs.len,
+                auto_mq_snapshot.nodes.len,
+                auto_mq_snapshot.group_promotions.len,
+                self.auto_mq_next_node_id,
+            });
+        }
     }
 
     /// Periodic maintenance — should be called every ~1 second.
@@ -830,6 +849,7 @@ pub const Broker = struct {
         // Save state before shutdown
         self.persistTopics();
         self.persistOffsets();
+        self.persistAutoMqMetadata();
 
         var it = self.topics.iterator();
         while (it.next()) |entry| {
@@ -837,24 +857,9 @@ pub const Broker = struct {
             self.allocator.free(entry.key_ptr.*);
         }
         self.topics.deinit();
-        var kv_it = self.auto_mq_kvs.iterator();
-        while (kv_it.next()) |entry| {
-            self.allocator.free(entry.key_ptr.*);
-            self.allocator.free(entry.value_ptr.*);
-        }
+        self.clearAutoMqMetadata();
         self.auto_mq_kvs.deinit();
-        var node_it = self.auto_mq_nodes.iterator();
-        while (node_it.next()) |entry| {
-            entry.value_ptr.deinit(self.allocator);
-        }
         self.auto_mq_nodes.deinit();
-        if (self.auto_mq_license) |license| self.allocator.free(license);
-        if (self.auto_mq_zone_router_metadata) |metadata| self.allocator.free(metadata);
-        var group_promotion_it = self.auto_mq_group_promotions.iterator();
-        while (group_promotion_it.next()) |entry| {
-            self.allocator.free(entry.key_ptr.*);
-            entry.value_ptr.deinit(self.allocator);
-        }
         self.auto_mq_group_promotions.deinit();
         self.producer_sequences.deinit();
         self.store.deinit();
@@ -912,6 +917,109 @@ pub const Broker = struct {
         self.persistence.saveAcls(self.authorizer.acls.items) catch |err| {
             log.warn("Failed to persist ACLs: {}", .{err});
         };
+    }
+
+    /// Persist local AutoMQ controller-style metadata to disk (best-effort).
+    fn persistAutoMqMetadata(self: *Broker) void {
+        self.persistence.saveAutoMqMetadata(
+            &self.auto_mq_kvs,
+            &self.auto_mq_nodes,
+            self.auto_mq_next_node_id,
+            self.auto_mq_license,
+            self.auto_mq_zone_router_metadata,
+            self.auto_mq_zone_router_epoch,
+            &self.auto_mq_group_promotions,
+        ) catch |err| {
+            log.warn("Failed to persist AutoMQ metadata: {}", .{err});
+        };
+    }
+
+    fn clearAutoMqMetadata(self: *Broker) void {
+        var kv_it = self.auto_mq_kvs.iterator();
+        while (kv_it.next()) |entry| {
+            self.allocator.free(entry.key_ptr.*);
+            self.allocator.free(entry.value_ptr.*);
+        }
+        self.auto_mq_kvs.clearRetainingCapacity();
+
+        var node_it = self.auto_mq_nodes.iterator();
+        while (node_it.next()) |entry| {
+            entry.value_ptr.deinit(self.allocator);
+        }
+        self.auto_mq_nodes.clearRetainingCapacity();
+
+        if (self.auto_mq_license) |license| self.allocator.free(license);
+        self.auto_mq_license = null;
+        if (self.auto_mq_zone_router_metadata) |metadata| self.allocator.free(metadata);
+        self.auto_mq_zone_router_metadata = null;
+        self.auto_mq_zone_router_epoch = 0;
+        self.auto_mq_next_node_id = defaultAutoMqNextNodeId(self.node_id);
+
+        var group_promotion_it = self.auto_mq_group_promotions.iterator();
+        while (group_promotion_it.next()) |entry| {
+            self.allocator.free(entry.key_ptr.*);
+            entry.value_ptr.deinit(self.allocator);
+        }
+        self.auto_mq_group_promotions.clearRetainingCapacity();
+    }
+
+    fn restoreAutoMqMetadata(self: *Broker, snapshot: MetadataPersistence.AutoMqMetadataSnapshot) !void {
+        self.clearAutoMqMetadata();
+        errdefer self.clearAutoMqMetadata();
+        self.auto_mq_next_node_id = @max(snapshot.next_node_id, defaultAutoMqNextNodeId(self.node_id));
+        self.auto_mq_zone_router_epoch = snapshot.zone_router_epoch;
+
+        if (snapshot.license) |license| {
+            self.auto_mq_license = try self.allocator.dupe(u8, license);
+        }
+        if (snapshot.zone_router_metadata) |metadata| {
+            self.auto_mq_zone_router_metadata = try self.allocator.dupe(u8, metadata);
+        }
+
+        for (snapshot.kvs) |entry| {
+            const key_copy = try self.allocator.dupe(u8, entry.key);
+            const value_copy = self.allocator.dupe(u8, entry.value) catch |err| {
+                self.allocator.free(key_copy);
+                return err;
+            };
+            self.auto_mq_kvs.put(key_copy, value_copy) catch |err| {
+                self.allocator.free(key_copy);
+                self.allocator.free(value_copy);
+                return err;
+            };
+        }
+
+        for (snapshot.nodes) |entry| {
+            if (entry.node_id < 0) continue;
+            const wal_config_copy = try self.allocator.dupe(u8, entry.wal_config);
+            self.auto_mq_nodes.put(entry.node_id, .{
+                .node_epoch = entry.node_epoch,
+                .wal_config = wal_config_copy,
+            }) catch |err| {
+                self.allocator.free(wal_config_copy);
+                return err;
+            };
+            if (entry.node_id < std.math.maxInt(i32) and entry.node_id >= self.auto_mq_next_node_id) {
+                self.auto_mq_next_node_id = entry.node_id + 1;
+            }
+        }
+
+        for (snapshot.group_promotions) |entry| {
+            if (entry.group_id.len == 0) continue;
+            const group_copy = try self.allocator.dupe(u8, entry.group_id);
+            const link_copy = self.allocator.dupe(u8, entry.link_id) catch |err| {
+                self.allocator.free(group_copy);
+                return err;
+            };
+            self.auto_mq_group_promotions.put(group_copy, .{
+                .link_id = link_copy,
+                .promoted = entry.promoted,
+            }) catch |err| {
+                self.allocator.free(group_copy);
+                self.allocator.free(link_copy);
+                return err;
+            };
+        }
     }
 
     /// Auto-create a topic if auto.create.topics.enable is true.
@@ -2481,7 +2589,10 @@ pub const Broker = struct {
                 error_code = 36;
             } else {
                 const name_copy = self.allocator.dupe(u8, topic_name) catch return null;
-                const key_copy = self.allocator.dupe(u8, topic_name) catch { self.allocator.free(name_copy); return null; };
+                const key_copy = self.allocator.dupe(u8, topic_name) catch {
+                    self.allocator.free(name_copy);
+                    return null;
+                };
                 self.topics.put(key_copy, .{
                     .name = name_copy,
                     .num_partitions = actual_partitions,
@@ -3619,6 +3730,7 @@ pub const Broker = struct {
         };
 
         const responses = arena_alloc.alloc(ItemResp, req.put_kv_requests.len) catch return null;
+        var mutated = false;
         for (req.put_kv_requests, 0..) |item, i| {
             const key = item.key orelse "";
             const value = item.value orelse "";
@@ -3635,6 +3747,7 @@ pub const Broker = struct {
                 self.allocator.free(existing.*);
                 existing.* = value_copy;
                 responses[i] = .{ .error_code = 0, .value = existing.* };
+                mutated = true;
             } else {
                 const key_copy = self.allocator.dupe(u8, key) catch return null;
                 const value_copy = self.allocator.dupe(u8, value) catch {
@@ -3647,8 +3760,10 @@ pub const Broker = struct {
                     return null;
                 };
                 responses[i] = .{ .error_code = 0, .value = value_copy };
+                mutated = true;
             }
         }
+        if (mutated) self.persistAutoMqMetadata();
 
         const resp = Resp{ .error_code = 0, .throttle_time_ms = 0, .put_kv_responses = responses };
         return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
@@ -3668,6 +3783,7 @@ pub const Broker = struct {
         };
 
         const responses = arena_alloc.alloc(ItemResp, req.delete_kv_requests.len) catch return null;
+        var mutated = false;
         for (req.delete_kv_requests, 0..) |item, i| {
             const key = item.key orelse "";
             if (key.len == 0) {
@@ -3679,10 +3795,12 @@ pub const Broker = struct {
                 self.allocator.free(removed.key);
                 self.allocator.free(removed.value);
                 responses[i] = .{ .error_code = 0, .value = response_value };
+                mutated = true;
             } else {
                 responses[i] = .{ .error_code = errorCode(.resource_not_found), .value = null };
             }
         }
+        if (mutated) self.persistAutoMqMetadata();
 
         const resp = Resp{ .error_code = 0, .throttle_time_ms = 0, .delete_kv_responses = responses };
         return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
@@ -3733,7 +3851,7 @@ pub const Broker = struct {
             return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
         };
 
-        if (req.node_id < 0) {
+        if (req.node_id < 0 or req.node_id == std.math.maxInt(i32)) {
             const resp = Resp{ .error_code = errorCode(.invalid_request), .throttle_time_ms = 0 };
             return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
         }
@@ -3751,6 +3869,7 @@ pub const Broker = struct {
             };
         }
         if (req.node_id >= self.auto_mq_next_node_id) self.auto_mq_next_node_id = req.node_id + 1;
+        self.persistAutoMqMetadata();
 
         const resp = Resp{ .error_code = 0, .throttle_time_ms = 0 };
         return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
@@ -3831,14 +3950,18 @@ pub const Broker = struct {
             return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
         };
 
+        var mutated = false;
         if (req.metadata) |metadata| {
             const metadata_copy = self.allocator.dupe(u8, metadata) catch return null;
             if (self.auto_mq_zone_router_metadata) |old| self.allocator.free(old);
             self.auto_mq_zone_router_metadata = metadata_copy;
+            mutated = true;
         }
         if (api_version >= 1 and req.route_epoch > self.auto_mq_zone_router_epoch) {
             self.auto_mq_zone_router_epoch = req.route_epoch;
+            mutated = true;
         }
+        if (mutated) self.persistAutoMqMetadata();
 
         const default_route = std.fmt.allocPrint(arena_alloc, "{{\"node_id\":{d},\"epoch\":{d}}}", .{ self.node_id, self.auto_mq_zone_router_epoch }) catch return null;
         const responses = arena_alloc.alloc(ItemResp, 1) catch return null;
@@ -3916,6 +4039,7 @@ pub const Broker = struct {
         const license_copy = self.allocator.dupe(u8, license) catch return null;
         if (self.auto_mq_license) |old| self.allocator.free(old);
         self.auto_mq_license = license_copy;
+        self.persistAutoMqMetadata();
 
         const resp = Resp{ .error_code = 0, .throttle_time_ms = 0, .error_message = "" };
         return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
@@ -3970,8 +4094,14 @@ pub const Broker = struct {
             return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
         };
 
+        if (self.auto_mq_next_node_id == std.math.maxInt(i32)) {
+            const resp = Resp{ .error_code = errorCode(.invalid_request), .throttle_time_ms = 0, .node_id = -1 };
+            return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+        }
+
         const node_id = self.auto_mq_next_node_id;
         self.auto_mq_next_node_id += 1;
+        self.persistAutoMqMetadata();
         const resp = Resp{ .error_code = 0, .throttle_time_ms = 0, .node_id = node_id };
         return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
     }
@@ -4048,6 +4178,7 @@ pub const Broker = struct {
             return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
         }
 
+        var mutated = false;
         if (req.promoted) {
             const link_copy = self.allocator.dupe(u8, link_id) catch return null;
             if (self.auto_mq_group_promotions.getPtr(group_id)) |existing| {
@@ -4064,11 +4195,14 @@ pub const Broker = struct {
                     return null;
                 };
             }
+            mutated = true;
         } else if (self.auto_mq_group_promotions.fetchRemove(group_id)) |removed| {
             self.allocator.free(removed.key);
             var promotion = removed.value;
             promotion.deinit(self.allocator);
+            mutated = true;
         }
+        if (mutated) self.persistAutoMqMetadata();
 
         const resp = Resp{ .group_id = req.group_id, .error_code = 0, .error_message = null, .throttle_time_ms = 0 };
         return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
@@ -5959,6 +6093,95 @@ test "Broker AutoMQ router snapshot describe and group APIs" {
     const update_group_resp = try UpdateGroupResp.deserialize(testing.allocator, response.?, &rpos, 0);
     try testing.expectEqual(@as(i16, 0), update_group_resp.error_code);
     try testing.expectEqual(@as(u32, 1), broker.auto_mq_group_promotions.count());
+}
+
+test "Broker restores AutoMQ metadata after restart" {
+    const fs = @import("fs_compat");
+    const tmp_dir = "/tmp/zmq-automq-metadata-restart-test";
+    fs.deleteTreeAbsolute(tmp_dir) catch {};
+    try fs.makeDirAbsolute(tmp_dir);
+    defer fs.deleteTreeAbsolute(tmp_dir) catch {};
+
+    const PutReq = generated.put_k_vs_request.PutKVsRequest;
+    const RegisterReq = generated.automq_register_node_request.AutomqRegisterNodeRequest;
+    const ZoneReq = generated.automq_zone_router_request.AutomqZoneRouterRequest;
+    const UpdateLicenseReq = generated.update_license_request.UpdateLicenseRequest;
+    const NextNodeReq = generated.get_next_node_id_request.GetNextNodeIdRequest;
+    const UpdateGroupReq = generated.automq_update_group_request.AutomqUpdateGroupRequest;
+
+    {
+        var broker = Broker.initWithConfig(testing.allocator, 1, 9092, .{ .data_dir = tmp_dir });
+        defer broker.deinit();
+        try broker.open();
+
+        var owned_responses = std.array_list.Managed([]u8).init(testing.allocator);
+        defer {
+            for (owned_responses.items) |resp| testing.allocator.free(resp);
+            owned_responses.deinit();
+        }
+
+        var buf: [2048]u8 = undefined;
+        var pos = buildTestRequest(&buf, 510, 0, 5100, 2);
+        const put_items = [_]PutReq.PutKVRequest{.{ .key = "alpha", .value = "beta", .overwrite = true }};
+        const put_req = PutReq{ .put_kv_requests = &put_items };
+        put_req.serialize(&buf, &pos, 0);
+        var response = broker.handleRequest(buf[0..pos]);
+        try testing.expect(response != null);
+        try owned_responses.append(response.?);
+
+        pos = buildTestRequest(&buf, 513, 0, 5130, 2);
+        const register_req = RegisterReq{ .node_id = 7, .node_epoch = 3, .wal_config = "wal://node-7" };
+        register_req.serialize(&buf, &pos, 0);
+        response = broker.handleRequest(buf[0..pos]);
+        try testing.expect(response != null);
+        try owned_responses.append(response.?);
+
+        pos = buildTestRequest(&buf, 515, 1, 5150, 2);
+        const zone_req = ZoneReq{ .metadata = "route-data", .route_epoch = 4, .version = 1 };
+        zone_req.serialize(&buf, &pos, 1);
+        response = broker.handleRequest(buf[0..pos]);
+        try testing.expect(response != null);
+        try owned_responses.append(response.?);
+
+        pos = buildTestRequest(&buf, 517, 0, 5170, 2);
+        const update_license_req = UpdateLicenseReq{ .license = "test-license" };
+        update_license_req.serialize(&buf, &pos, 0);
+        response = broker.handleRequest(buf[0..pos]);
+        try testing.expect(response != null);
+        try owned_responses.append(response.?);
+
+        pos = buildTestRequest(&buf, 600, 0, 6000, 2);
+        const next_node_req = NextNodeReq{ .cluster_id = "zmq-cluster" };
+        next_node_req.serialize(&buf, &pos, 0);
+        response = broker.handleRequest(buf[0..pos]);
+        try testing.expect(response != null);
+        try owned_responses.append(response.?);
+
+        pos = buildTestRequest(&buf, 602, 0, 6020, 2);
+        const update_group_req = UpdateGroupReq{ .link_id = "link-a", .group_id = "group-a", .promoted = true };
+        update_group_req.serialize(&buf, &pos, 0);
+        response = broker.handleRequest(buf[0..pos]);
+        try testing.expect(response != null);
+        try owned_responses.append(response.?);
+    }
+
+    {
+        var broker = Broker.initWithConfig(testing.allocator, 1, 9092, .{ .data_dir = tmp_dir });
+        defer broker.deinit();
+        try broker.open();
+
+        try testing.expectEqualStrings("beta", broker.auto_mq_kvs.get("alpha").?);
+        const node = broker.auto_mq_nodes.get(7).?;
+        try testing.expectEqual(@as(i64, 3), node.node_epoch);
+        try testing.expectEqualStrings("wal://node-7", node.wal_config);
+        try testing.expectEqual(@as(i32, 9), broker.auto_mq_next_node_id);
+        try testing.expectEqualStrings("test-license", broker.auto_mq_license.?);
+        try testing.expectEqualStrings("route-data", broker.auto_mq_zone_router_metadata.?);
+        try testing.expectEqual(@as(i64, 4), broker.auto_mq_zone_router_epoch);
+        const promotion = broker.auto_mq_group_promotions.get("group-a").?;
+        try testing.expectEqualStrings("link-a", promotion.link_id);
+        try testing.expect(promotion.promoted);
+    }
 }
 
 test "Broker.handleRequest InitProducerId (key=22, v0)" {

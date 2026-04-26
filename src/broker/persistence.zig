@@ -22,6 +22,110 @@ pub const MetadataPersistence = struct {
         return .{ .data_dir = data_dir, .allocator = alloc };
     }
 
+    pub const AutoMqKvEntry = struct {
+        key: []u8,
+        value: []u8,
+    };
+
+    pub const AutoMqNodeEntry = struct {
+        node_id: i32,
+        node_epoch: i64,
+        wal_config: []u8,
+    };
+
+    pub const AutoMqGroupPromotionEntry = struct {
+        group_id: []u8,
+        link_id: []u8,
+        promoted: bool,
+    };
+
+    pub const AutoMqMetadataSnapshot = struct {
+        next_node_id: i32,
+        zone_router_epoch: i64,
+        license: ?[]u8,
+        zone_router_metadata: ?[]u8,
+        kvs: []AutoMqKvEntry,
+        nodes: []AutoMqNodeEntry,
+        group_promotions: []AutoMqGroupPromotionEntry,
+    };
+
+    fn emptyAutoMqMetadataSnapshot() AutoMqMetadataSnapshot {
+        return .{
+            .next_node_id = 1,
+            .zone_router_epoch = 0,
+            .license = null,
+            .zone_router_metadata = null,
+            .kvs = &.{},
+            .nodes = &.{},
+            .group_promotions = &.{},
+        };
+    }
+
+    fn writeHex(file: fs.File, bytes: []const u8) !void {
+        const alphabet = "0123456789abcdef";
+        var pair: [2]u8 = undefined;
+        for (bytes) |byte| {
+            pair[0] = alphabet[byte >> 4];
+            pair[1] = alphabet[byte & 0x0f];
+            try file.writeAll(&pair);
+        }
+    }
+
+    fn decodeHexNibble(byte: u8) ?u8 {
+        return switch (byte) {
+            '0'...'9' => byte - '0',
+            'a'...'f' => byte - 'a' + 10,
+            'A'...'F' => byte - 'A' + 10,
+            else => null,
+        };
+    }
+
+    fn decodeHexAlloc(allocator: Allocator, text: []const u8) ![]u8 {
+        if (text.len % 2 != 0) return error.InvalidHex;
+        const out = try allocator.alloc(u8, text.len / 2);
+        errdefer allocator.free(out);
+
+        var i: usize = 0;
+        while (i < out.len) : (i += 1) {
+            const high = decodeHexNibble(text[i * 2]) orelse return error.InvalidHex;
+            const low = decodeHexNibble(text[i * 2 + 1]) orelse return error.InvalidHex;
+            out[i] = (high << 4) | low;
+        }
+        return out;
+    }
+
+    fn freeAutoMqKvEntries(allocator: Allocator, entries: []AutoMqKvEntry) void {
+        for (entries) |entry| {
+            allocator.free(entry.key);
+            allocator.free(entry.value);
+        }
+        if (entries.len > 0) allocator.free(entries);
+    }
+
+    fn freeAutoMqNodeEntries(allocator: Allocator, entries: []AutoMqNodeEntry) void {
+        for (entries) |entry| {
+            allocator.free(entry.wal_config);
+        }
+        if (entries.len > 0) allocator.free(entries);
+    }
+
+    fn freeAutoMqGroupPromotionEntries(allocator: Allocator, entries: []AutoMqGroupPromotionEntry) void {
+        for (entries) |entry| {
+            allocator.free(entry.group_id);
+            allocator.free(entry.link_id);
+        }
+        if (entries.len > 0) allocator.free(entries);
+    }
+
+    pub fn freeAutoMqMetadataSnapshot(self: *MetadataPersistence, snapshot: *AutoMqMetadataSnapshot) void {
+        if (snapshot.license) |license| self.allocator.free(license);
+        if (snapshot.zone_router_metadata) |metadata| self.allocator.free(metadata);
+        freeAutoMqKvEntries(self.allocator, snapshot.kvs);
+        freeAutoMqNodeEntries(self.allocator, snapshot.nodes);
+        freeAutoMqGroupPromotionEntries(self.allocator, snapshot.group_promotions);
+        snapshot.* = emptyAutoMqMetadataSnapshot();
+    }
+
     /// Save topic metadata to disk.
     pub fn saveTopics(self: *MetadataPersistence, topics: anytype) !void {
         const dir = self.data_dir orelse return;
@@ -434,6 +538,197 @@ pub const MetadataPersistence = struct {
         log.info("Loaded {d} ACLs from acls.meta", .{entries.items.len});
         return entries.toOwnedSlice();
     }
+
+    /// Save local AutoMQ controller-style metadata to disk.
+    /// Format is line-oriented TSV. Binary/string fields are hex encoded so tabs
+    /// and newlines in metadata payloads do not corrupt parsing.
+    pub fn saveAutoMqMetadata(
+        self: *MetadataPersistence,
+        kvs: anytype,
+        nodes: anytype,
+        next_node_id: i32,
+        license: ?[]const u8,
+        zone_router_metadata: ?[]const u8,
+        zone_router_epoch: i64,
+        group_promotions: anytype,
+    ) !void {
+        const dir = self.data_dir orelse return;
+
+        const path = try std.fmt.allocPrint(self.allocator, "{s}/automq.meta", .{dir});
+        defer self.allocator.free(path);
+
+        const file = try fs.createFileAbsolute(path, .{ .truncate = true });
+        defer file.close();
+        const writer = file.writer();
+
+        try writer.print("version\t1\n", .{});
+        try writer.print("next_node_id\t{d}\n", .{next_node_id});
+        try writer.print("zone_router_epoch\t{d}\n", .{zone_router_epoch});
+        if (license) |value| {
+            try file.writeAll("license\t");
+            try writeHex(file, value);
+            try file.writeAll("\n");
+        }
+        if (zone_router_metadata) |value| {
+            try file.writeAll("zone_router_metadata\t");
+            try writeHex(file, value);
+            try file.writeAll("\n");
+        }
+
+        var kv_it = kvs.iterator();
+        while (kv_it.next()) |entry| {
+            try file.writeAll("kv\t");
+            try writeHex(file, entry.key_ptr.*);
+            try file.writeAll("\t");
+            try writeHex(file, entry.value_ptr.*);
+            try file.writeAll("\n");
+        }
+
+        var node_it = nodes.iterator();
+        while (node_it.next()) |entry| {
+            try writer.print("node\t{d}\t{d}\t", .{ entry.key_ptr.*, entry.value_ptr.node_epoch });
+            try writeHex(file, entry.value_ptr.wal_config);
+            try file.writeAll("\n");
+        }
+
+        var group_it = group_promotions.iterator();
+        while (group_it.next()) |entry| {
+            try file.writeAll("group\t");
+            try writeHex(file, entry.key_ptr.*);
+            try file.writeAll("\t");
+            try writeHex(file, entry.value_ptr.link_id);
+            try writer.print("\t{d}\n", .{@intFromBool(entry.value_ptr.promoted)});
+        }
+    }
+
+    /// Load local AutoMQ controller-style metadata from disk.
+    /// Returns an empty/default snapshot if no data directory or metadata file exists.
+    pub fn loadAutoMqMetadata(self: *MetadataPersistence) !AutoMqMetadataSnapshot {
+        const dir = self.data_dir orelse return emptyAutoMqMetadataSnapshot();
+
+        const path = try std.fmt.allocPrint(self.allocator, "{s}/automq.meta", .{dir});
+        defer self.allocator.free(path);
+
+        const file = fs.openFileAbsolute(path, .{}) catch |err| {
+            log.debug("No automq.meta found: {}", .{err});
+            return emptyAutoMqMetadataSnapshot();
+        };
+        defer file.close();
+
+        const content = file.readToEndAlloc(self.allocator, 4 * 1024 * 1024) catch |err| {
+            log.warn("Failed to read automq.meta: {}", .{err});
+            return emptyAutoMqMetadataSnapshot();
+        };
+        defer self.allocator.free(content);
+
+        var next_node_id: i32 = 1;
+        var zone_router_epoch: i64 = 0;
+        var license: ?[]u8 = null;
+        var zone_router_metadata: ?[]u8 = null;
+        var kvs = std.array_list.Managed(AutoMqKvEntry).init(self.allocator);
+        var nodes = std.array_list.Managed(AutoMqNodeEntry).init(self.allocator);
+        var group_promotions = std.array_list.Managed(AutoMqGroupPromotionEntry).init(self.allocator);
+        defer kvs.deinit();
+        defer nodes.deinit();
+        defer group_promotions.deinit();
+        errdefer {
+            if (license) |value| self.allocator.free(value);
+            if (zone_router_metadata) |value| self.allocator.free(value);
+            for (kvs.items) |entry| {
+                self.allocator.free(entry.key);
+                self.allocator.free(entry.value);
+            }
+            for (nodes.items) |entry| self.allocator.free(entry.wal_config);
+            for (group_promotions.items) |entry| {
+                self.allocator.free(entry.group_id);
+                self.allocator.free(entry.link_id);
+            }
+        }
+
+        var lines = std.mem.splitSequence(u8, content, "\n");
+        while (lines.next()) |line| {
+            if (line.len == 0) continue;
+
+            var fields = std.mem.splitSequence(u8, line, "\t");
+            const tag = fields.next() orelse continue;
+
+            if (std.mem.eql(u8, tag, "version")) {
+                continue;
+            } else if (std.mem.eql(u8, tag, "next_node_id")) {
+                const value = fields.next() orelse continue;
+                next_node_id = std.fmt.parseInt(i32, value, 10) catch next_node_id;
+            } else if (std.mem.eql(u8, tag, "zone_router_epoch")) {
+                const value = fields.next() orelse continue;
+                zone_router_epoch = std.fmt.parseInt(i64, value, 10) catch zone_router_epoch;
+            } else if (std.mem.eql(u8, tag, "license")) {
+                const encoded = fields.next() orelse continue;
+                const decoded = decodeHexAlloc(self.allocator, encoded) catch continue;
+                if (license) |old| self.allocator.free(old);
+                license = decoded;
+            } else if (std.mem.eql(u8, tag, "zone_router_metadata")) {
+                const encoded = fields.next() orelse continue;
+                const decoded = decodeHexAlloc(self.allocator, encoded) catch continue;
+                if (zone_router_metadata) |old| self.allocator.free(old);
+                zone_router_metadata = decoded;
+            } else if (std.mem.eql(u8, tag, "kv")) {
+                const key_hex = fields.next() orelse continue;
+                const value_hex = fields.next() orelse continue;
+                const key = decodeHexAlloc(self.allocator, key_hex) catch continue;
+                const value = decodeHexAlloc(self.allocator, value_hex) catch {
+                    self.allocator.free(key);
+                    continue;
+                };
+                kvs.append(.{ .key = key, .value = value }) catch |err| {
+                    self.allocator.free(key);
+                    self.allocator.free(value);
+                    return err;
+                };
+            } else if (std.mem.eql(u8, tag, "node")) {
+                const node_id_str = fields.next() orelse continue;
+                const node_epoch_str = fields.next() orelse continue;
+                const wal_config_hex = fields.next() orelse continue;
+                const node_id = std.fmt.parseInt(i32, node_id_str, 10) catch continue;
+                const node_epoch = std.fmt.parseInt(i64, node_epoch_str, 10) catch continue;
+                const wal_config = decodeHexAlloc(self.allocator, wal_config_hex) catch continue;
+                nodes.append(.{ .node_id = node_id, .node_epoch = node_epoch, .wal_config = wal_config }) catch |err| {
+                    self.allocator.free(wal_config);
+                    return err;
+                };
+            } else if (std.mem.eql(u8, tag, "group")) {
+                const group_id_hex = fields.next() orelse continue;
+                const link_id_hex = fields.next() orelse continue;
+                const promoted_str = fields.next() orelse continue;
+                const promoted_int = std.fmt.parseInt(u8, promoted_str, 10) catch continue;
+                const group_id = decodeHexAlloc(self.allocator, group_id_hex) catch continue;
+                const link_id = decodeHexAlloc(self.allocator, link_id_hex) catch {
+                    self.allocator.free(group_id);
+                    continue;
+                };
+                group_promotions.append(.{ .group_id = group_id, .link_id = link_id, .promoted = promoted_int != 0 }) catch |err| {
+                    self.allocator.free(group_id);
+                    self.allocator.free(link_id);
+                    return err;
+                };
+            }
+        }
+
+        const kv_slice = try kvs.toOwnedSlice();
+        errdefer freeAutoMqKvEntries(self.allocator, kv_slice);
+        const node_slice = try nodes.toOwnedSlice();
+        errdefer freeAutoMqNodeEntries(self.allocator, node_slice);
+        const group_slice = try group_promotions.toOwnedSlice();
+
+        log.info("Loaded AutoMQ metadata from automq.meta (kvs={d}, nodes={d}, groups={d}, next_node_id={d})", .{ kv_slice.len, node_slice.len, group_slice.len, next_node_id });
+        return .{
+            .next_node_id = next_node_id,
+            .zone_router_epoch = zone_router_epoch,
+            .license = license,
+            .zone_router_metadata = zone_router_metadata,
+            .kvs = kv_slice,
+            .nodes = node_slice,
+            .group_promotions = group_slice,
+        };
+    }
 };
 
 // ---------------------------------------------------------------
@@ -588,4 +883,81 @@ test "MetadataPersistence load producer sequences missing file" {
 
     const loaded = try persistence.loadProducerSequences();
     try testing.expectEqual(@as(usize, 0), loaded.len);
+}
+
+test "MetadataPersistence save and load AutoMQ metadata round-trip" {
+    const tmp_dir = "/tmp/automq-local-metadata-test";
+    fs.deleteTreeAbsolute(tmp_dir) catch {};
+    fs.makeDirAbsolute(tmp_dir) catch {};
+    defer fs.deleteTreeAbsolute(tmp_dir) catch {};
+
+    var persistence = MetadataPersistence.init(testing.allocator, tmp_dir);
+
+    var kvs = std.StringHashMap([]const u8).init(testing.allocator);
+    defer kvs.deinit();
+    try kvs.put("alpha\tkey", "beta\nvalue\x00tail");
+
+    const Node = struct {
+        node_epoch: i64,
+        wal_config: []const u8,
+    };
+    var nodes = std.AutoHashMap(i32, Node).init(testing.allocator);
+    defer nodes.deinit();
+    try nodes.put(7, .{ .node_epoch = 3, .wal_config = "wal://node-7\tcfg" });
+
+    const GroupPromotion = struct {
+        link_id: []const u8,
+        promoted: bool,
+    };
+    var groups = std.StringHashMap(GroupPromotion).init(testing.allocator);
+    defer groups.deinit();
+    try groups.put("group\nA", .{ .link_id = "link\tA", .promoted = true });
+
+    try persistence.saveAutoMqMetadata(
+        &kvs,
+        &nodes,
+        12,
+        "license\npayload",
+        "router\tmetadata",
+        44,
+        &groups,
+    );
+
+    var snapshot = try persistence.loadAutoMqMetadata();
+    defer persistence.freeAutoMqMetadataSnapshot(&snapshot);
+
+    try testing.expectEqual(@as(i32, 12), snapshot.next_node_id);
+    try testing.expectEqual(@as(i64, 44), snapshot.zone_router_epoch);
+    try testing.expectEqualStrings("license\npayload", snapshot.license.?);
+    try testing.expectEqualStrings("router\tmetadata", snapshot.zone_router_metadata.?);
+    try testing.expectEqual(@as(usize, 1), snapshot.kvs.len);
+    try testing.expectEqualStrings("alpha\tkey", snapshot.kvs[0].key);
+    try testing.expectEqualSlices(u8, "beta\nvalue\x00tail", snapshot.kvs[0].value);
+    try testing.expectEqual(@as(usize, 1), snapshot.nodes.len);
+    try testing.expectEqual(@as(i32, 7), snapshot.nodes[0].node_id);
+    try testing.expectEqual(@as(i64, 3), snapshot.nodes[0].node_epoch);
+    try testing.expectEqualStrings("wal://node-7\tcfg", snapshot.nodes[0].wal_config);
+    try testing.expectEqual(@as(usize, 1), snapshot.group_promotions.len);
+    try testing.expectEqualStrings("group\nA", snapshot.group_promotions[0].group_id);
+    try testing.expectEqualStrings("link\tA", snapshot.group_promotions[0].link_id);
+    try testing.expect(snapshot.group_promotions[0].promoted);
+}
+
+test "MetadataPersistence load AutoMQ metadata missing file" {
+    const tmp_dir = "/tmp/automq-local-metadata-missing-test";
+    fs.deleteTreeAbsolute(tmp_dir) catch {};
+    fs.makeDirAbsolute(tmp_dir) catch {};
+    defer fs.deleteTreeAbsolute(tmp_dir) catch {};
+
+    var persistence = MetadataPersistence.init(testing.allocator, tmp_dir);
+    var snapshot = try persistence.loadAutoMqMetadata();
+    defer persistence.freeAutoMqMetadataSnapshot(&snapshot);
+
+    try testing.expectEqual(@as(i32, 1), snapshot.next_node_id);
+    try testing.expectEqual(@as(i64, 0), snapshot.zone_router_epoch);
+    try testing.expect(snapshot.license == null);
+    try testing.expect(snapshot.zone_router_metadata == null);
+    try testing.expectEqual(@as(usize, 0), snapshot.kvs.len);
+    try testing.expectEqual(@as(usize, 0), snapshot.nodes.len);
+    try testing.expectEqual(@as(usize, 0), snapshot.group_promotions.len);
 }
