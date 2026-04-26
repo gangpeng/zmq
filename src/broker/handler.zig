@@ -500,6 +500,7 @@ pub const Broker = struct {
     /// Open the broker (initializes storage, WAL, loads persisted metadata)
     pub fn open(self: *Broker) !void {
         try self.store.open();
+        try self.restoreObjectManagerSnapshot();
 
         // Load persisted topics
         const saved_topics = try self.persistence.loadTopics();
@@ -680,7 +681,9 @@ pub const Broker = struct {
         if (self.store.s3_wal_batcher) |*batcher| {
             if (batcher.shouldFlush()) {
                 if (self.store.s3_storage) |*s3| {
-                    _ = batcher.flushNow(s3);
+                    if (batcher.flushNow(s3)) {
+                        self.persistObjectManagerSnapshot();
+                    }
                 }
             }
         }
@@ -736,7 +739,11 @@ pub const Broker = struct {
 
         // Run S3 object compaction (split multi-stream SSOs, merge small SOs)
         if (self.compaction_manager) |*cm| {
+            const before_compaction_ms = cm.last_compaction_ms;
             cm.maybeCompact();
+            if (cm.last_compaction_ms != before_compaction_ms) {
+                self.persistObjectManagerSnapshot();
+            }
         }
 
         // Rotate dual-buffer prepared object registry if the 60-minute interval
@@ -806,6 +813,7 @@ pub const Broker = struct {
                 var hw_updates = batcher.drainPendingHWUpdates();
                 defer hw_updates.deinit();
                 self.store.applyDeferredHWUpdates(&hw_updates);
+                self.persistObjectManagerSnapshot();
                 return true;
             } else {
                 log.warn("Group commit S3 flush failed ({d} pending produces)", .{batcher.pending_produce_count});
@@ -834,6 +842,7 @@ pub const Broker = struct {
                 var hw_updates = batcher.drainPendingHWUpdates();
                 defer hw_updates.deinit();
                 self.store.applyDeferredHWUpdates(&hw_updates);
+                self.persistObjectManagerSnapshot();
                 log.info("Shutdown: WAL flush to S3 complete", .{});
                 return true;
             } else {
@@ -850,6 +859,7 @@ pub const Broker = struct {
         self.persistTopics();
         self.persistOffsets();
         self.persistAutoMqMetadata();
+        self.persistObjectManagerSnapshot();
 
         var it = self.topics.iterator();
         while (it.next()) |entry| {
@@ -932,6 +942,98 @@ pub const Broker = struct {
         ) catch |err| {
             log.warn("Failed to persist AutoMQ metadata: {}", .{err});
         };
+    }
+
+    /// Persist stream/object metadata snapshots to disk (best-effort).
+    fn persistObjectManagerSnapshot(self: *Broker) void {
+        var empty_orphans = [_][]const u8{};
+        const orphaned_keys: []const []const u8 = if (self.compaction_manager) |*cm|
+            cm.orphaned_keys.items
+        else
+            empty_orphans[0..];
+
+        const object_snapshot = self.object_manager.takeSnapshot(orphaned_keys) catch |err| {
+            log.warn("Failed to build ObjectManager snapshot: {}", .{err});
+            return;
+        };
+        defer self.allocator.free(object_snapshot);
+
+        self.persistence.saveObjectManagerSnapshot(object_snapshot) catch |err| {
+            log.warn("Failed to persist ObjectManager snapshot: {}", .{err});
+        };
+
+        const prepared_snapshot = self.object_manager.prepared_registry.serialize(self.allocator) catch |err| {
+            log.warn("Failed to build prepared object registry snapshot: {}", .{err});
+            return;
+        };
+        defer self.allocator.free(prepared_snapshot);
+
+        self.persistence.savePreparedObjectRegistrySnapshot(prepared_snapshot) catch |err| {
+            log.warn("Failed to persist prepared object registry snapshot: {}", .{err});
+        };
+    }
+
+    fn freeOrphanedKeys(self: *Broker, keys: [][]u8) void {
+        for (keys) |key| self.allocator.free(key);
+        self.allocator.free(keys);
+    }
+
+    fn attachOrphanedKeysToCompaction(self: *Broker, keys: [][]u8) !void {
+        if (self.compaction_manager) |*cm| {
+            var moved: usize = 0;
+            while (moved < keys.len) : (moved += 1) {
+                cm.orphaned_keys.append(keys[moved]) catch |err| {
+                    var remaining = moved;
+                    while (remaining < keys.len) : (remaining += 1) {
+                        self.allocator.free(keys[remaining]);
+                    }
+                    self.allocator.free(keys);
+                    return err;
+                };
+            }
+            self.allocator.free(keys);
+        } else {
+            self.freeOrphanedKeys(keys);
+        }
+    }
+
+    fn rebuildPreparedRegistryFromObjectSnapshot(self: *Broker) void {
+        var so_it = self.object_manager.stream_objects.iterator();
+        while (so_it.next()) |entry| {
+            const so = entry.value_ptr;
+            if (so.state == .prepared) {
+                self.object_manager.prepared_registry.trackPreparedAt(so.object_id, so.state_changed_ms);
+            }
+        }
+
+        var sso_it = self.object_manager.stream_set_objects.iterator();
+        while (sso_it.next()) |entry| {
+            const sso = entry.value_ptr;
+            if (sso.state == .prepared) {
+                self.object_manager.prepared_registry.trackPreparedAt(sso.object_id, sso.state_changed_ms);
+            }
+        }
+    }
+
+    fn restoreObjectManagerSnapshot(self: *Broker) !void {
+        const object_snapshot = try self.persistence.loadObjectManagerSnapshot() orelse {
+            if (try self.persistence.loadPreparedObjectRegistrySnapshot()) |prepared_snapshot| {
+                defer self.allocator.free(prepared_snapshot);
+                try self.object_manager.prepared_registry.deserialize(prepared_snapshot);
+            }
+            return;
+        };
+        defer self.allocator.free(object_snapshot);
+
+        const orphaned_keys = try self.object_manager.loadSnapshot(object_snapshot);
+        try self.attachOrphanedKeysToCompaction(orphaned_keys);
+
+        if (try self.persistence.loadPreparedObjectRegistrySnapshot()) |prepared_snapshot| {
+            defer self.allocator.free(prepared_snapshot);
+            try self.object_manager.prepared_registry.deserialize(prepared_snapshot);
+        } else {
+            self.rebuildPreparedRegistryFromObjectSnapshot();
+        }
     }
 
     fn clearAutoMqMetadata(self: *Broker) void {
@@ -1055,6 +1157,7 @@ pub const Broker = struct {
 
         log.info("Auto-created topic '{s}' with {d} partitions", .{ topic_name, self.default_num_partitions });
         self.persistTopics();
+        self.persistObjectManagerSnapshot();
         return true;
     }
 
@@ -1813,6 +1916,7 @@ pub const Broker = struct {
             ser.writeArrayLen(resp_buf, &wpos, num_topics);
         }
 
+        var object_metadata_dirty = false;
         for (0..num_topics) |_| {
             // Read topic name
             const topic_name = if (flexible)
@@ -1904,6 +2008,7 @@ pub const Broker = struct {
 
                 // Auto-create topic if needed
                 _ = self.ensureTopic(topic_name);
+                object_metadata_dirty = true;
 
                 // Actually produce (skip if duplicate or CRC invalid)
                 var was_wal_fenced = false;
@@ -1946,6 +2051,7 @@ pub const Broker = struct {
                 // Notify delayed fetches when new data arrives
                 if (produce_result != null) {
                     self.checkDelayedFetchesForPartition(topic_name, partition_idx);
+                    object_metadata_dirty = true;
                 }
 
                 // Write partition response with proper error codes
@@ -2006,6 +2112,7 @@ pub const Broker = struct {
         }
 
         log.debug("Produce: {d} topics, acks={d}, response {d} bytes", .{ num_topics, acks, wpos });
+        if (object_metadata_dirty) self.persistObjectManagerSnapshot();
 
         // acks=0: fire-and-forget — don't send a response
         if (acks == 0) {
@@ -2602,6 +2709,7 @@ pub const Broker = struct {
                 for (0..@intCast(actual_partitions)) |pi| self.store.ensurePartition(topic_name, @intCast(pi)) catch {};
                 log.info("Created topic '{s}' ({d} partitions)", .{ topic_name, actual_partitions });
                 self.persistTopics();
+                self.persistObjectManagerSnapshot();
             }
 
             if (flexible) ser.writeCompactString(resp_buf, &wpos, topic_name) else ser.writeString(resp_buf, &wpos, topic_name);
@@ -2804,6 +2912,8 @@ pub const Broker = struct {
             } else if (self.topics.fetchRemove(topic_name)) |removed| {
                 const info = removed.value;
                 for (0..@as(usize, @intCast(info.num_partitions))) |pi| {
+                    const stream_id = PartitionStore.hashPartitionKey(topic_name, @intCast(pi));
+                    self.object_manager.deleteStream(stream_id) catch {};
                     const pkey = std.fmt.allocPrint(self.allocator, "{s}-{d}", .{ topic_name, pi }) catch continue;
                     defer self.allocator.free(pkey);
                     if (self.store.partitions.fetchRemove(pkey)) |se| {
@@ -2815,6 +2925,7 @@ pub const Broker = struct {
                 self.allocator.free(removed.key);
                 log.info("Deleted topic '{s}' ({d} partitions)", .{ topic_name, info.num_partitions });
                 self.persistTopics();
+                self.persistObjectManagerSnapshot();
             } else {
                 error_code = 3;
             }
@@ -3175,6 +3286,7 @@ pub const Broker = struct {
 
         var results: [64]struct { name: []const u8, error_code: i16 } = undefined;
         var count: usize = 0;
+        var mutated = false;
 
         for (0..num_topics) |_| {
             if (count >= 64) break;
@@ -3190,12 +3302,14 @@ pub const Broker = struct {
             // Update topic partition count
             if (self.topics.getPtr(topic_name)) |info| {
                 if (new_total_count > info.num_partitions) {
+                    const old_total_count = info.num_partitions;
                     info.num_partitions = new_total_count;
                     // Ensure new partitions exist in store
-                    for (@intCast(info.num_partitions)..@as(usize, @intCast(new_total_count))) |pi| {
+                    for (@as(usize, @intCast(old_total_count))..@as(usize, @intCast(new_total_count))) |pi| {
                         self.store.ensurePartition(topic_name, @intCast(pi)) catch {};
                     }
                     results[count] = .{ .name = topic_name, .error_code = 0 };
+                    mutated = true;
                 } else {
                     results[count] = .{ .name = topic_name, .error_code = 37 }; // INVALID_PARTITIONS
                 }
@@ -3203,6 +3317,10 @@ pub const Broker = struct {
                 results[count] = .{ .name = topic_name, .error_code = 3 }; // UNKNOWN_TOPIC_OR_PARTITION
             }
             count += 1;
+        }
+        if (mutated) {
+            self.persistTopics();
+            self.persistObjectManagerSnapshot();
         }
 
         var buf = self.allocator.alloc(u8, 2048) catch return null;
@@ -3379,6 +3497,7 @@ pub const Broker = struct {
         };
 
         const responses = arena_alloc.alloc(ItemResp, req.create_stream_requests.len) catch return null;
+        var mutated = false;
         for (req.create_stream_requests, 0..) |item, i| {
             const owner_node = if (item.node_id != 0) item.node_id else if (req.node_id != 0) req.node_id else self.node_id;
             const stream = self.object_manager.createStream(owner_node) catch |err| {
@@ -3386,7 +3505,9 @@ pub const Broker = struct {
                 continue;
             };
             responses[i] = .{ .error_code = 0, .stream_id = u64ToI64(stream.stream_id) };
+            mutated = true;
         }
+        if (mutated) self.persistObjectManagerSnapshot();
 
         const resp = Resp{ .error_code = 0, .throttle_time_ms = 0, .create_stream_responses = responses };
         return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
@@ -3407,6 +3528,7 @@ pub const Broker = struct {
         };
 
         const responses = arena_alloc.alloc(ItemResp, req.open_stream_requests.len) catch return null;
+        var mutated = false;
         for (req.open_stream_requests, 0..) |item, i| {
             const stream_id = i64ToU64(item.stream_id) orelse {
                 responses[i] = .{ .error_code = errorCode(.invalid_request), .start_offset = -1, .next_offset = -1 };
@@ -3423,7 +3545,9 @@ pub const Broker = struct {
                 .start_offset = u64ToI64(stream.start_offset),
                 .next_offset = u64ToI64(stream.end_offset),
             };
+            mutated = true;
         }
+        if (mutated) self.persistObjectManagerSnapshot();
 
         const resp = Resp{ .error_code = 0, .throttle_time_ms = 0, .open_stream_responses = responses };
         return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
@@ -3444,6 +3568,7 @@ pub const Broker = struct {
         };
 
         const responses = arena_alloc.alloc(ItemResp, req.close_stream_requests.len) catch return null;
+        var mutated = false;
         for (req.close_stream_requests, 0..) |item, i| {
             const stream_id = i64ToU64(item.stream_id) orelse {
                 responses[i] = .{ .error_code = errorCode(.invalid_request) };
@@ -3462,7 +3587,9 @@ pub const Broker = struct {
                 continue;
             };
             responses[i] = .{ .error_code = 0 };
+            mutated = true;
         }
+        if (mutated) self.persistObjectManagerSnapshot();
 
         const resp = Resp{ .error_code = 0, .throttle_time_ms = 0, .close_stream_responses = responses };
         return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
@@ -3483,6 +3610,7 @@ pub const Broker = struct {
         };
 
         const responses = arena_alloc.alloc(ItemResp, req.delete_stream_requests.len) catch return null;
+        var mutated = false;
         for (req.delete_stream_requests, 0..) |item, i| {
             const stream_id = i64ToU64(item.stream_id) orelse {
                 responses[i] = .{ .error_code = errorCode(.invalid_request) };
@@ -3493,7 +3621,9 @@ pub const Broker = struct {
                 continue;
             };
             responses[i] = .{ .error_code = 0 };
+            mutated = true;
         }
+        if (mutated) self.persistObjectManagerSnapshot();
 
         const resp = Resp{ .error_code = 0, .throttle_time_ms = 0, .delete_stream_responses = responses };
         return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
@@ -3521,6 +3651,7 @@ pub const Broker = struct {
             const object_id = self.object_manager.prepareObject();
             if (i == 0) first_id = object_id;
         }
+        self.persistObjectManagerSnapshot();
 
         const resp = Resp{ .error_code = 0, .throttle_time_ms = 0, .first_s3_object_id = u64ToI64(first_id) };
         return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
@@ -3575,6 +3706,7 @@ pub const Broker = struct {
             const resp = Resp{ .error_code = streamErrorCode(err), .throttle_time_ms = 0 };
             return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
         };
+        var mutated = true;
 
         for (req.stream_objects) |stream_object| {
             const so_object_id = i64ToU64(stream_object.object_id) orelse continue;
@@ -3586,11 +3718,16 @@ pub const Broker = struct {
             const so_key = self.makeStreamObjectKey(so_object_id, stream_id, start_offset, end_offset) catch return null;
             defer self.allocator.free(so_key);
             self.object_manager.commitStreamObject(so_object_id, stream_id, start_offset, end_offset, so_key, so_size) catch {};
+            mutated = true;
         }
 
         for (req.compacted_object_ids) |compacted_id| {
-            if (i64ToU64(compacted_id)) |id| self.object_manager.markDestroyed(id);
+            if (i64ToU64(compacted_id)) |id| {
+                self.object_manager.markDestroyed(id);
+                mutated = true;
+            }
         }
+        if (mutated) self.persistObjectManagerSnapshot();
 
         const resp = Resp{ .error_code = 0, .throttle_time_ms = 0, .attributes = req.attributes };
         return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
@@ -3638,19 +3775,27 @@ pub const Broker = struct {
             const resp = Resp{ .error_code = streamErrorCode(err), .throttle_time_ms = 0 };
             return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
         };
+        var mutated = true;
 
         if (api_version >= 1 and req.operations.len > 0) {
             const count = @min(req.source_object_ids.len, req.operations.len);
             for (0..count) |i| {
                 if (req.operations[i] == 0) {
-                    if (i64ToU64(req.source_object_ids[i])) |source_id| self.object_manager.markDestroyed(source_id);
+                    if (i64ToU64(req.source_object_ids[i])) |source_id| {
+                        self.object_manager.markDestroyed(source_id);
+                        mutated = true;
+                    }
                 }
             }
         } else {
             for (req.source_object_ids) |source_id_raw| {
-                if (i64ToU64(source_id_raw)) |source_id| self.object_manager.markDestroyed(source_id);
+                if (i64ToU64(source_id_raw)) |source_id| {
+                    self.object_manager.markDestroyed(source_id);
+                    mutated = true;
+                }
             }
         }
+        if (mutated) self.persistObjectManagerSnapshot();
 
         const resp = Resp{ .error_code = 0, .throttle_time_ms = 0 };
         return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
@@ -3820,6 +3965,7 @@ pub const Broker = struct {
         };
 
         const responses = arena_alloc.alloc(ItemResp, req.trim_stream_requests.len) catch return null;
+        var mutated = false;
         for (req.trim_stream_requests, 0..) |item, i| {
             const stream_id = i64ToU64(item.stream_id) orelse {
                 responses[i] = .{ .error_code = errorCode(.invalid_request) };
@@ -3834,7 +3980,9 @@ pub const Broker = struct {
                 continue;
             };
             responses[i] = .{ .error_code = 0 };
+            mutated = true;
         }
+        if (mutated) self.persistObjectManagerSnapshot();
 
         const resp = Resp{ .error_code = 0, .throttle_time_ms = 0, .trim_stream_responses = responses };
         return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
@@ -6181,6 +6329,132 @@ test "Broker restores AutoMQ metadata after restart" {
         const promotion = broker.auto_mq_group_promotions.get("group-a").?;
         try testing.expectEqualStrings("link-a", promotion.link_id);
         try testing.expect(promotion.promoted);
+    }
+}
+
+test "Broker restores AutoMQ stream object snapshot after restart" {
+    const fs = @import("fs_compat");
+    const tmp_dir = "/tmp/zmq-object-manager-restart-test";
+    fs.deleteTreeAbsolute(tmp_dir) catch {};
+    try fs.makeDirAbsolute(tmp_dir);
+    defer fs.deleteTreeAbsolute(tmp_dir) catch {};
+
+    const CreateReq = generated.create_streams_request.CreateStreamsRequest;
+    const CreateResp = generated.create_streams_response.CreateStreamsResponse;
+    const PrepareReq = generated.prepare_s3_object_request.PrepareS3ObjectRequest;
+    const PrepareResp = generated.prepare_s3_object_response.PrepareS3ObjectResponse;
+    const CommitReq = generated.commit_stream_object_request.CommitStreamObjectRequest;
+    const TrimReq = generated.trim_streams_request.TrimStreamsRequest;
+
+    var stream_id: i64 = 0;
+    var committed_object_id: i64 = 0;
+    var prepared_only_object_id: i64 = 0;
+
+    {
+        var broker = Broker.initWithConfig(testing.allocator, 1, 9092, .{ .data_dir = tmp_dir });
+        defer broker.deinit();
+        try broker.open();
+
+        var owned_responses = std.array_list.Managed([]u8).init(testing.allocator);
+        defer {
+            for (owned_responses.items) |resp| testing.allocator.free(resp);
+            owned_responses.deinit();
+        }
+
+        var buf: [4096]u8 = undefined;
+        var pos = buildTestRequest(&buf, 501, 0, 5010, 2);
+        const create_items = [_]CreateReq.CreateStreamRequest{.{ .node_id = 1 }};
+        const create_req = CreateReq{ .node_id = 1, .node_epoch = 1, .create_stream_requests = &create_items };
+        create_req.serialize(&buf, &pos, 0);
+        var response = broker.handleRequest(buf[0..pos]);
+        try testing.expect(response != null);
+        try owned_responses.append(response.?);
+
+        var rpos: usize = 0;
+        var create_header = try ResponseHeader.deserialize(testing.allocator, response.?, &rpos, 1);
+        defer create_header.deinit(testing.allocator);
+        const create_resp = try CreateResp.deserialize(testing.allocator, response.?, &rpos, 0);
+        defer testing.allocator.free(create_resp.create_stream_responses);
+        try testing.expectEqual(@as(i16, 0), create_resp.error_code);
+        stream_id = create_resp.create_stream_responses[0].stream_id;
+
+        pos = buildTestRequest(&buf, 505, 0, 5050, 2);
+        const prepare_req = PrepareReq{ .node_id = 1, .prepared_count = 1, .time_to_live_in_ms = 60_000 };
+        prepare_req.serialize(&buf, &pos, 0);
+        response = broker.handleRequest(buf[0..pos]);
+        try testing.expect(response != null);
+        try owned_responses.append(response.?);
+
+        rpos = 0;
+        var prepare_header = try ResponseHeader.deserialize(testing.allocator, response.?, &rpos, 1);
+        defer prepare_header.deinit(testing.allocator);
+        const prepare_resp = try PrepareResp.deserialize(testing.allocator, response.?, &rpos, 0);
+        try testing.expectEqual(@as(i16, 0), prepare_resp.error_code);
+        committed_object_id = prepare_resp.first_s3_object_id;
+
+        pos = buildTestRequest(&buf, 507, 1, 5070, 2);
+        const source_ids = [_]i64{};
+        const operations = [_]i8{};
+        const commit_req = CommitReq{
+            .node_id = 1,
+            .node_epoch = 1,
+            .object_id = committed_object_id,
+            .object_size = 128,
+            .stream_id = stream_id,
+            .start_offset = 0,
+            .end_offset = 10,
+            .source_object_ids = &source_ids,
+            .stream_epoch = 1,
+            .attributes = 0,
+            .operations = &operations,
+        };
+        commit_req.serialize(&buf, &pos, 1);
+        response = broker.handleRequest(buf[0..pos]);
+        try testing.expect(response != null);
+        try owned_responses.append(response.?);
+
+        pos = buildTestRequest(&buf, 505, 0, 5051, 2);
+        prepare_req.serialize(&buf, &pos, 0);
+        response = broker.handleRequest(buf[0..pos]);
+        try testing.expect(response != null);
+        try owned_responses.append(response.?);
+
+        rpos = 0;
+        var prepare_only_header = try ResponseHeader.deserialize(testing.allocator, response.?, &rpos, 1);
+        defer prepare_only_header.deinit(testing.allocator);
+        const prepare_only_resp = try PrepareResp.deserialize(testing.allocator, response.?, &rpos, 0);
+        try testing.expectEqual(@as(i16, 0), prepare_only_resp.error_code);
+        prepared_only_object_id = prepare_only_resp.first_s3_object_id;
+
+        pos = buildTestRequest(&buf, 512, 0, 5120, 2);
+        const trim_items = [_]TrimReq.TrimStreamRequest{.{ .stream_id = stream_id, .stream_epoch = 1, .new_start_offset = 5 }};
+        const trim_req = TrimReq{ .node_id = 1, .node_epoch = 1, .trim_stream_requests = &trim_items };
+        trim_req.serialize(&buf, &pos, 0);
+        response = broker.handleRequest(buf[0..pos]);
+        try testing.expect(response != null);
+        try owned_responses.append(response.?);
+    }
+
+    {
+        var broker = Broker.initWithConfig(testing.allocator, 1, 9092, .{ .data_dir = tmp_dir });
+        defer broker.deinit();
+        try broker.open();
+
+        const restored_stream = broker.object_manager.getStream(@intCast(stream_id)).?;
+        try testing.expectEqual(@as(u64, 5), restored_stream.start_offset);
+        try testing.expectEqual(@as(u64, 10), restored_stream.end_offset);
+
+        const restored_so = broker.object_manager.stream_objects.get(@intCast(committed_object_id)).?;
+        try testing.expectEqual(@as(u64, @intCast(stream_id)), restored_so.stream_id);
+        try testing.expectEqual(@as(u64, 0), restored_so.start_offset);
+        try testing.expectEqual(@as(u64, 10), restored_so.end_offset);
+        try testing.expect(broker.object_manager.prepared_registry.contains(@intCast(prepared_only_object_id)));
+        try testing.expect(broker.object_manager.next_object_id > @as(u64, @intCast(prepared_only_object_id)));
+
+        const objects = try broker.object_manager.getObjects(@intCast(stream_id), 0, 10, 10);
+        defer testing.allocator.free(objects);
+        try testing.expectEqual(@as(usize, 1), objects.len);
+        try testing.expectEqual(@as(u64, @intCast(committed_object_id)), objects[0].object_id);
     }
 }
 

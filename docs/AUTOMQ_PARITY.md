@@ -14,11 +14,13 @@ operator-facing behavior.
 - AutoMQ extension API keys 501-519 and 600-602 are broker-dispatched and
   advertised. Stream/object APIs have `ObjectManager` side effects; KV,
   node, router, license, manifest, snapshot, and group-link APIs are backed by
-  local broker metadata with single-node semantics.
+  persisted local broker metadata with single-node semantics.
 - Kafka protocol support is functional for common single-node broker paths, but
   semantic parity across all generated APIs and versions is incomplete.
 - S3 WAL/object storage paths exist, but full AutoMQ S3Stream lifecycle
-  compatibility, recovery, fencing, and cross-provider validation are incomplete.
+  compatibility, crash recovery, fencing, and cross-provider validation are
+  incomplete. Stream/object metadata now has local file snapshot/restart
+  coverage.
 
 ## Parity Gates
 
@@ -49,9 +51,9 @@ operator-facing behavior.
 | Kafka ApiVersions/version catalog | In progress. Canonical table now drives advertised APIs and version checks, including AutoMQ extensions. | Keep catalog generated or audited against schemas and handler dispatch in CI. |
 | Kafka broker APIs | Partial. 71 advertised APIs; many handlers are simplified single-node semantics. | Full schema-valid decode/encode and Kafka-compatible semantics for every advertised version. |
 | Kafka generated schemas | Broad. 110 request schemas generated. | Round-trip tests and golden fixtures for every generated request/response pair. |
-| AutoMQ extension APIs | Implemented locally. Keys 501-519 and 600-602 dispatch through generated schemas; stream/object APIs mutate ObjectManager and controller-like APIs mutate local broker metadata. | Replace local-only controller semantics with quorum-backed metadata, persistence, failover, and client compatibility fixtures. |
+| AutoMQ extension APIs | Implemented locally. Keys 501-519 and 600-602 dispatch through generated schemas; stream/object APIs mutate ObjectManager and controller-like APIs mutate persisted local broker metadata. | Replace local-only controller semantics with quorum-backed metadata, failover, and client compatibility fixtures. |
 | S3 WAL | Partial. Sync durability path exists and failed uploads are not acknowledged. | Crash/restart recovery, idempotent retry, fencing, provider matrix, and fault injection. |
-| S3Stream object lifecycle | Improved. Create/open/close/delete/trim/describe plus prepare/commit SO/SSO are wired to ObjectManager. | Match full AutoMQ recovery, fencing, prepared-object expiry, object-state replay, and S3-backed metadata durability. |
+| S3Stream object lifecycle | Improved. Create/open/close/delete/trim/describe plus prepare/commit SO/SSO are wired to ObjectManager; object/prepared snapshots are persisted locally and covered by broker restart tests. | Match full AutoMQ recovery, fencing, prepared-object expiry, quorum-backed object-state replay, and S3-backed metadata durability. |
 | Controller/KRaft | Partial. Local Raft/controller scaffolding exists. | Multi-node quorum, broker registration, heartbeats, fencing, metadata snapshots, rolling restart. |
 | Stateless brokers | Partial. Local cache/state still has single-node assumptions. | Rebuild broker state from shared storage/controller metadata without data loss or manual repair. |
 | Reassignment/autobalancing | Partial. Basic handlers and balancer code exist. | Real partition movement semantics, convergence tests, and load/rack-aware placement. |
@@ -98,9 +100,9 @@ Status: completed for the initial catalog and DeleteGroups slice.
 - Added local metadata backing for Get/Put/DeleteKVs, node registration/listing,
   next node ID allocation, zone router metadata, partition snapshot export,
   license update/describe, cluster manifest export, and group promotion state.
-- Remaining gap: controller-style metadata is in-process only. To call this
-  production AutoMQ-complete, move this state behind persisted/quorum metadata
-  and add multi-node compatibility tests.
+- Remaining gap: controller-style metadata is locally persisted only. To call
+  this production AutoMQ-complete, move this state behind quorum metadata and add
+  multi-node compatibility tests.
 - Add state-machine tests for prepared, committed, destroyed, expired, and
   compacted objects.
 
@@ -113,7 +115,7 @@ Status: completed for the initial catalog and DeleteGroups slice.
 - Prove the ack path never acknowledges records that are not durable under the
   configured durability mode.
 - Add metadata snapshot/replay tests for topics, offsets, transactions,
-  producers, and stream/object state.
+  producers, and expanded stream/object state under crash/fault scenarios.
 
 ### Phase 4: Multi-Node AutoMQ Behavior
 

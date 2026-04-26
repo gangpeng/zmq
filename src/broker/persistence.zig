@@ -729,6 +729,70 @@ pub const MetadataPersistence = struct {
             .group_promotions = group_slice,
         };
     }
+
+    /// Save a binary ObjectManager snapshot to disk.
+    pub fn saveObjectManagerSnapshot(self: *MetadataPersistence, snapshot: []const u8) !void {
+        const dir = self.data_dir orelse return;
+
+        const path = try std.fmt.allocPrint(self.allocator, "{s}/objects.snapshot", .{dir});
+        defer self.allocator.free(path);
+
+        const file = try fs.createFileAbsolute(path, .{ .truncate = true });
+        defer file.close();
+        try file.writeAll(snapshot);
+    }
+
+    /// Load a binary ObjectManager snapshot from disk.
+    /// Returns null if no data directory or snapshot file exists.
+    pub fn loadObjectManagerSnapshot(self: *MetadataPersistence) !?[]u8 {
+        const dir = self.data_dir orelse return null;
+
+        const path = try std.fmt.allocPrint(self.allocator, "{s}/objects.snapshot", .{dir});
+        defer self.allocator.free(path);
+
+        const file = fs.openFileAbsolute(path, .{}) catch |err| {
+            log.debug("No objects.snapshot found: {}", .{err});
+            return null;
+        };
+        defer file.close();
+
+        return file.readToEndAlloc(self.allocator, 64 * 1024 * 1024) catch |err| {
+            log.warn("Failed to read objects.snapshot: {}", .{err});
+            return null;
+        };
+    }
+
+    /// Save the PreparedObjectRegistry binary snapshot to disk.
+    pub fn savePreparedObjectRegistrySnapshot(self: *MetadataPersistence, snapshot: []const u8) !void {
+        const dir = self.data_dir orelse return;
+
+        const path = try std.fmt.allocPrint(self.allocator, "{s}/prepared.snapshot", .{dir});
+        defer self.allocator.free(path);
+
+        const file = try fs.createFileAbsolute(path, .{ .truncate = true });
+        defer file.close();
+        try file.writeAll(snapshot);
+    }
+
+    /// Load the PreparedObjectRegistry binary snapshot from disk.
+    /// Returns null if no data directory or snapshot file exists.
+    pub fn loadPreparedObjectRegistrySnapshot(self: *MetadataPersistence) !?[]u8 {
+        const dir = self.data_dir orelse return null;
+
+        const path = try std.fmt.allocPrint(self.allocator, "{s}/prepared.snapshot", .{dir});
+        defer self.allocator.free(path);
+
+        const file = fs.openFileAbsolute(path, .{}) catch |err| {
+            log.debug("No prepared.snapshot found: {}", .{err});
+            return null;
+        };
+        defer file.close();
+
+        return file.readToEndAlloc(self.allocator, 1024 * 1024) catch |err| {
+            log.warn("Failed to read prepared.snapshot: {}", .{err});
+            return null;
+        };
+    }
 };
 
 // ---------------------------------------------------------------

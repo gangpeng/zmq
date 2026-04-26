@@ -741,6 +741,9 @@ pub const ObjectManager = struct {
                 gop.value_ptr.* = std.array_list.Managed(u64).init(self.allocator);
             }
             try gop.value_ptr.append(object_id);
+            if (self.streams.getPtr(r.stream_id)) |stream| {
+                stream.advanceEndOffset(r.end_offset);
+            }
         }
 
         // Object committed — remove from prepared tracking (if it was prepared)
@@ -809,6 +812,10 @@ pub const ObjectManager = struct {
             }
         }
         try gop.value_ptr.insert(insert_pos, object_id);
+
+        if (self.streams.getPtr(stream_id)) |stream| {
+            stream.advanceEndOffset(end_offset);
+        }
 
         // Object committed — remove from prepared tracking (if it was prepared)
         self.prepared_registry.untrackPrepared(object_id);
@@ -2108,6 +2115,21 @@ test "ObjectManager commitStreamObject maintains sorted index" {
     try testing.expectEqual(@as(u64, 0), results[0].start_offset);
     try testing.expectEqual(@as(u64, 100), results[1].start_offset);
     try testing.expectEqual(@as(u64, 200), results[2].start_offset);
+}
+
+test "ObjectManager committed objects advance stream end offset" {
+    var om = ObjectManager.init(testing.allocator, 0);
+    defer om.deinit();
+
+    _ = try om.createStreamWithId(10, 1);
+    try om.commitStreamObject(1, 10, 0, 5, "so/1", 100);
+    try testing.expectEqual(@as(u64, 5), om.getStream(10).?.end_offset);
+    try testing.expectEqual(@as(u64, 5), om.getStream(10).?.ranges.items[0].end_offset);
+
+    const ranges = [_]StreamOffsetRange{.{ .stream_id = 10, .start_offset = 5, .end_offset = 9 }};
+    try om.commitStreamSetObject(2, 1, 1, &ranges, "sso/2", 200);
+    try testing.expectEqual(@as(u64, 9), om.getStream(10).?.end_offset);
+    try testing.expectEqual(@as(u64, 9), om.getStream(10).?.ranges.items[0].end_offset);
 }
 
 test "ObjectManager hasStreamObjectCovering" {
