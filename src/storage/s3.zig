@@ -91,6 +91,32 @@ pub const MockS3 = struct {
         if (self.objects.get(key)) |obj| return obj.size;
         return null;
     }
+
+    /// Return owned object keys matching prefix, sorted for deterministic recovery.
+    pub fn listObjectKeys(self: *const MockS3, alloc: Allocator, prefix: []const u8) ![][]u8 {
+        var keys = std.array_list.Managed([]u8).init(alloc);
+        errdefer {
+            for (keys.items) |key| alloc.free(key);
+            keys.deinit();
+        }
+
+        var it = self.objects.keyIterator();
+        while (it.next()) |key_ptr| {
+            if (std.mem.startsWith(u8, key_ptr.*, prefix)) {
+                const key_copy = try alloc.dupe(u8, key_ptr.*);
+                errdefer alloc.free(key_copy);
+                try keys.append(key_copy);
+            }
+        }
+
+        std.mem.sort([]u8, keys.items, {}, struct {
+            fn lessThan(_: void, a: []u8, b: []u8) bool {
+                return std.mem.lessThan(u8, a, b);
+            }
+        }.lessThan);
+
+        return try keys.toOwnedSlice();
+    }
 };
 
 // ---------------------------------------------------------------
@@ -529,6 +555,25 @@ test "MockS3 objectSize" {
     try s3.putObject("key", "12345");
     try testing.expectEqual(@as(u64, 5), s3.objectSize("key").?);
     try testing.expect(s3.objectSize("missing") == null);
+}
+
+test "MockS3 listObjectKeys filters and sorts" {
+    var s3 = MockS3.init(testing.allocator);
+    defer s3.deinit();
+
+    try s3.putObject("wal/epoch-0/bulk/0000000002", "b");
+    try s3.putObject("data/topic/0/obj", "ignored");
+    try s3.putObject("wal/epoch-0/bulk/0000000001", "a");
+
+    const keys = try s3.listObjectKeys(testing.allocator, "wal/");
+    defer {
+        for (keys) |key| testing.allocator.free(key);
+        testing.allocator.free(keys);
+    }
+
+    try testing.expectEqual(@as(usize, 2), keys.len);
+    try testing.expectEqualStrings("wal/epoch-0/bulk/0000000001", keys[0]);
+    try testing.expectEqualStrings("wal/epoch-0/bulk/0000000002", keys[1]);
 }
 
 test "ObjectWriter v2 writes CRC32C checksum" {

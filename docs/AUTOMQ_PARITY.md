@@ -22,6 +22,8 @@ operator-facing behavior.
   incomplete. Stream/object metadata now has local file snapshot/restart
   coverage, partition offset/HW/LSO state is snapshotted for local restart, and
   filesystem WAL segments replay into the fetch cache after broker restart.
+  If the local object snapshot is absent, flushed S3 WAL objects can rebuild
+  ObjectManager stream-set metadata from their object indexes.
 
 ## Parity Gates
 
@@ -53,7 +55,7 @@ operator-facing behavior.
 | Kafka broker APIs | Partial. 71 advertised APIs; many handlers are simplified single-node semantics. | Full schema-valid decode/encode and Kafka-compatible semantics for every advertised version. |
 | Kafka generated schemas | Broad. 110 request schemas generated. | Round-trip tests and golden fixtures for every generated request/response pair. |
 | AutoMQ extension APIs | Implemented locally. Keys 501-519 and 600-602 dispatch through generated schemas; stream/object APIs mutate ObjectManager and controller-like APIs mutate persisted local broker metadata. | Replace local-only controller semantics with quorum-backed metadata, failover, and client compatibility fixtures. |
-| S3 WAL | Partial. Sync durability path exists and failed uploads are not acknowledged. Filesystem WAL produces now fsync before ack, advance HW on durable write, and replay after local broker restart. | S3 crash/restart recovery, idempotent retry, fencing, provider matrix, and fault injection. |
+| S3 WAL | Partial. Sync durability path exists and failed uploads are not acknowledged. Filesystem WAL produces now fsync before ack, advance HW on durable write, and replay after local broker restart. Flushed S3 WAL objects can rebuild stream-set metadata when the local object snapshot is missing. | S3 crash/restart recovery, idempotent retry, fencing, provider matrix, and fault injection. |
 | S3Stream object lifecycle | Improved. Create/open/close/delete/trim/describe plus prepare/commit SO/SSO are wired to ObjectManager; object/prepared snapshots and partition offset/HW/LSO state are persisted locally and covered by broker restart tests. | Match full AutoMQ recovery, fencing, prepared-object expiry, quorum-backed object-state replay, and S3-backed metadata durability. |
 | Controller/KRaft | Partial. Local Raft/controller scaffolding exists. | Multi-node quorum, broker registration, heartbeats, fencing, metadata snapshots, rolling restart. |
 | Stateless brokers | Partial. Local cache/state still has single-node assumptions. | Rebuild broker state from shared storage/controller metadata without data loss or manual repair. |
@@ -120,8 +122,10 @@ Status: completed for the initial catalog and DeleteGroups slice.
 - Status: local partition offset/HW/LSO snapshots now reload across restart and
   clamp stale/corrupt invariants; filesystem WAL records now replay into
   LogCache and broker-level fetch after restart; filesystem WAL acks now wait
-  for fsync and advance HW only after that barrier. Remaining durability work is
-  crash/fault recovery against shared S3/controller metadata.
+  for fsync and advance HW only after that barrier; S3 WAL object indexes now
+  rebuild ObjectManager stream-set metadata if the local snapshot is absent.
+  Remaining durability work is crash/fault recovery against quorum/controller
+  metadata, idempotent S3 retry, and provider fault-injection coverage.
 
 ### Phase 4: Multi-Node AutoMQ Behavior
 

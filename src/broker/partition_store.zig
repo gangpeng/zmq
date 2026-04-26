@@ -192,6 +192,82 @@ pub const PartitionStore = struct {
         }
     }
 
+    /// Rebuild ObjectManager StreamSetObject metadata from S3 WAL objects.
+    /// Used when local object-manager snapshots are unavailable during restart
+    /// or broker replacement. The S3 object payload remains the source of truth;
+    /// this reconstructs stream ranges from the ObjectWriter index.
+    pub fn recoverS3WalObjects(self: *PartitionStore) !u64 {
+        const om = self.object_manager orelse return 0;
+        if (self.s3_storage == null) return 0;
+
+        var s3 = &self.s3_storage.?;
+        const keys = try s3.listObjectKeys("wal/");
+        defer {
+            for (keys) |key| self.allocator.free(key);
+            self.allocator.free(keys);
+        }
+
+        var recovered: u64 = 0;
+        for (keys) |key| {
+            const object_data = (try s3.getObject(key)) orelse continue;
+            defer self.allocator.free(object_data);
+
+            var reader = ObjectReader.parse(self.allocator, object_data) catch |err| {
+                log.warn("Skipping unreadable S3 WAL object {s}: {}", .{ key, err });
+                continue;
+            };
+            defer reader.deinit();
+
+            const ranges = try self.streamRangesFromObjectIndex(reader.index_entries);
+            defer self.allocator.free(ranges);
+            if (ranges.len == 0) continue;
+
+            for (ranges) |range| {
+                if (om.getStream(range.stream_id) == null) {
+                    _ = try om.createStreamWithId(range.stream_id, om.node_id);
+                }
+            }
+
+            const object_id = om.allocateObjectId();
+            const order_id = om.next_order_id;
+            om.next_order_id += 1;
+            try om.commitStreamSetObject(object_id, om.node_id, order_id, ranges, key, object_data.len);
+            recovered += 1;
+        }
+
+        return recovered;
+    }
+
+    fn streamRangesFromObjectIndex(self: *PartitionStore, entries: []const ObjectWriter.DataBlockIndex) ![]stream_mod.StreamOffsetRange {
+        var range_map = std.AutoHashMap(u64, stream_mod.StreamOffsetRange).init(self.allocator);
+        defer range_map.deinit();
+
+        for (entries) |entry| {
+            const end_offset = std.math.add(u64, entry.start_offset, entry.end_offset_delta) catch std.math.maxInt(u64);
+            var gop = try range_map.getOrPut(entry.stream_id);
+            if (!gop.found_existing) {
+                gop.value_ptr.* = .{
+                    .stream_id = entry.stream_id,
+                    .start_offset = entry.start_offset,
+                    .end_offset = end_offset,
+                };
+            } else {
+                gop.value_ptr.start_offset = @min(gop.value_ptr.start_offset, entry.start_offset);
+                gop.value_ptr.end_offset = @max(gop.value_ptr.end_offset, end_offset);
+            }
+        }
+
+        var ranges = try self.allocator.alloc(stream_mod.StreamOffsetRange, range_map.count());
+        var i: usize = 0;
+        var it = range_map.valueIterator();
+        while (it.next()) |range| {
+            ranges[i] = range.*;
+            i += 1;
+        }
+
+        return ranges;
+    }
+
     /// Re-wire internal pointers after the struct has been moved/copied.
     /// Must be called after assigning a PartitionStore to a new location
     /// (e.g., heap allocation via `ptr.* = initWithConfig(...)`).
@@ -1139,6 +1215,48 @@ test "PartitionStore restores filesystem WAL records into fetch cache" {
         try testing.expectEqual(@as(i16, 0), result.error_code);
         try testing.expectEqualStrings("alphabeta", result.records);
     }
+}
+
+test "PartitionStore rebuilds S3 WAL metadata and fetches object data" {
+    var mock_s3 = MockS3.init(testing.allocator);
+    defer mock_s3.deinit();
+    var s3_storage = S3Storage.initMock(testing.allocator, &mock_s3);
+
+    const stream_id = PartitionStore.hashPartitionKey("s3-recover-topic", 0);
+    {
+        var batcher = S3WalBatcher.init(testing.allocator);
+        defer batcher.deinit();
+
+        try batcher.append(stream_id, 0, "a");
+        try batcher.append(stream_id, 1, "b");
+        try testing.expect(batcher.flushNow(&s3_storage));
+    }
+
+    var object_manager = ObjectManager.init(testing.allocator, 1);
+    defer object_manager.deinit();
+
+    var store = PartitionStore.init(testing.allocator);
+    defer store.deinit();
+    store.s3_storage = s3_storage;
+    store.object_manager = &object_manager;
+
+    const recovered = try store.recoverS3WalObjects();
+    try testing.expectEqual(@as(u64, 1), recovered);
+    try testing.expectEqual(@as(usize, 1), object_manager.getStreamSetObjectCount());
+    try testing.expectEqual(@as(u64, 2), object_manager.getStream(stream_id).?.end_offset);
+
+    try store.ensurePartition("s3-recover-topic", 0);
+    var key_buf: [256]u8 = undefined;
+    const key = PartitionStore.partitionKeyBuf(&key_buf, "s3-recover-topic", 0);
+    const state = store.partitions.getPtr(key).?;
+    state.next_offset = 2;
+    state.high_watermark = 2;
+    state.last_stable_offset = 2;
+
+    const result = try store.fetch("s3-recover-topic", 0, 0, 1024);
+    defer if (result.records.len > 0) testing.allocator.free(@constCast(result.records));
+    try testing.expectEqual(@as(i16, 0), result.error_code);
+    try testing.expectEqualStrings("ab", result.records);
 }
 
 test "PartitionStore produce offset increments correctly" {

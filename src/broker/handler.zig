@@ -501,7 +501,17 @@ pub const Broker = struct {
     pub fn open(self: *Broker) !void {
         self.wireInternalPointers();
         try self.store.open();
-        try self.restoreObjectManagerSnapshot();
+        const restored_object_snapshot = try self.restoreObjectManagerSnapshot();
+        if (!restored_object_snapshot) {
+            const recovered_s3_objects = self.store.recoverS3WalObjects() catch |err| blk: {
+                log.warn("Failed to rebuild ObjectManager from S3 WAL objects: {}", .{err});
+                break :blk 0;
+            };
+            if (recovered_s3_objects > 0) {
+                log.info("Rebuilt {d} S3 WAL object(s) into ObjectManager", .{recovered_s3_objects});
+                self.persistObjectManagerSnapshot();
+            }
+        }
 
         // Load persisted topics
         const saved_topics = try self.persistence.loadTopics();
@@ -1034,13 +1044,13 @@ pub const Broker = struct {
         }
     }
 
-    fn restoreObjectManagerSnapshot(self: *Broker) !void {
+    fn restoreObjectManagerSnapshot(self: *Broker) !bool {
         const object_snapshot = try self.persistence.loadObjectManagerSnapshot() orelse {
             if (try self.persistence.loadPreparedObjectRegistrySnapshot()) |prepared_snapshot| {
                 defer self.allocator.free(prepared_snapshot);
                 try self.object_manager.prepared_registry.deserialize(prepared_snapshot);
             }
-            return;
+            return false;
         };
         defer self.allocator.free(object_snapshot);
 
@@ -1053,6 +1063,7 @@ pub const Broker = struct {
         } else {
             self.rebuildPreparedRegistryFromObjectSnapshot();
         }
+        return true;
     }
 
     fn clearAutoMqMetadata(self: *Broker) void {
@@ -6664,6 +6675,30 @@ test "Broker fetches filesystem WAL records after restart" {
         try testing.expectEqual(@as(i16, 0), result.error_code);
         try testing.expectEqualStrings("xy", result.records);
     }
+}
+
+test "Broker rebuilds ObjectManager from S3 WAL objects when snapshot is missing" {
+    var mock_s3 = storage.MockS3.init(testing.allocator);
+    defer mock_s3.deinit();
+    var s3_storage = storage.S3Storage.initMock(testing.allocator, &mock_s3);
+
+    const stream_id = PartitionStore.hashPartitionKey("broker-s3-recover-topic", 0);
+    {
+        var batcher = storage.wal.S3WalBatcher.init(testing.allocator);
+        defer batcher.deinit();
+        try batcher.append(stream_id, 0, "a");
+        try batcher.append(stream_id, 1, "b");
+        try testing.expect(batcher.flushNow(&s3_storage));
+    }
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+    broker.store.s3_storage = s3_storage;
+
+    try broker.open();
+
+    try testing.expectEqual(@as(usize, 1), broker.object_manager.getStreamSetObjectCount());
+    try testing.expectEqual(@as(u64, 2), broker.object_manager.getStream(stream_id).?.end_offset);
 }
 
 test "Broker.handleRequest InitProducerId (key=22, v0)" {

@@ -892,6 +892,17 @@ pub const S3Storage = struct {
         return null;
     }
 
+    pub fn listObjectKeys(self: *S3Storage, prefix: []const u8) ![][]u8 {
+        if (self.client) |c| {
+            const xml = try c.listObjects(prefix);
+            defer self.allocator.free(xml);
+            return try parseListObjectKeys(self.allocator, xml);
+        } else if (self.mock) |m| {
+            return try m.listObjectKeys(self.allocator, prefix);
+        }
+        return try self.allocator.alloc([]u8, 0);
+    }
+
     pub fn deleteObject(self: *S3Storage, key: []const u8) !void {
         if (self.client) |c| {
             try c.deleteObject(key);
@@ -900,6 +911,33 @@ pub const S3Storage = struct {
         }
     }
 };
+
+fn parseListObjectKeys(alloc: Allocator, xml: []const u8) ![][]u8 {
+    var keys = std.array_list.Managed([]u8).init(alloc);
+    errdefer {
+        for (keys.items) |key| alloc.free(key);
+        keys.deinit();
+    }
+
+    var pos: usize = 0;
+    while (std.mem.indexOf(u8, xml[pos..], "<Key>")) |start_rel| {
+        const key_start = pos + start_rel + "<Key>".len;
+        const end_rel = std.mem.indexOf(u8, xml[key_start..], "</Key>") orelse break;
+        const key_end = key_start + end_rel;
+        const key_copy = try alloc.dupe(u8, xml[key_start..key_end]);
+        errdefer alloc.free(key_copy);
+        try keys.append(key_copy);
+        pos = key_end + "</Key>".len;
+    }
+
+    std.mem.sort([]u8, keys.items, {}, struct {
+        fn lessThan(_: void, a: []u8, b: []u8) bool {
+            return std.mem.lessThan(u8, a, b);
+        }
+    }.lessThan);
+
+    return try keys.toOwnedSlice();
+}
 
 // ---------------------------------------------------------------
 // Tests
@@ -964,6 +1002,45 @@ test "S3Storage mock mode" {
     try storage.deleteObject("key1");
     const data2 = try storage.getObject("key1");
     try testing.expect(data2 == null);
+}
+
+test "S3Storage lists mock object keys" {
+    var mock = @import("s3.zig").MockS3.init(testing.allocator);
+    defer mock.deinit();
+
+    var storage = S3Storage.initMock(testing.allocator, &mock);
+    try storage.putObject("wal/epoch-0/bulk/0000000002", "b");
+    try storage.putObject("wal/epoch-0/bulk/0000000001", "a");
+    try storage.putObject("other/key", "ignored");
+
+    const keys = try storage.listObjectKeys("wal/");
+    defer {
+        for (keys) |key| testing.allocator.free(key);
+        testing.allocator.free(keys);
+    }
+
+    try testing.expectEqual(@as(usize, 2), keys.len);
+    try testing.expectEqualStrings("wal/epoch-0/bulk/0000000001", keys[0]);
+    try testing.expectEqualStrings("wal/epoch-0/bulk/0000000002", keys[1]);
+}
+
+test "S3Storage parses ListObjects keys" {
+    const xml =
+        \\<ListBucketResult>
+        \\  <Contents><Key>wal/epoch-0/bulk/0000000002</Key></Contents>
+        \\  <Contents><Key>wal/epoch-0/bulk/0000000001</Key></Contents>
+        \\</ListBucketResult>
+    ;
+
+    const keys = try parseListObjectKeys(testing.allocator, xml);
+    defer {
+        for (keys) |key| testing.allocator.free(key);
+        testing.allocator.free(keys);
+    }
+
+    try testing.expectEqual(@as(usize, 2), keys.len);
+    try testing.expectEqualStrings("wal/epoch-0/bulk/0000000001", keys[0]);
+    try testing.expectEqualStrings("wal/epoch-0/bulk/0000000002", keys[1]);
 }
 
 test "S3Client getObject retry structure" {
