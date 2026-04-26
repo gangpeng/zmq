@@ -209,6 +209,8 @@ pub const PartitionStore = struct {
 
         var recovered: u64 = 0;
         for (keys) |key| {
+            if (objectManagerHasS3Key(om, key)) continue;
+
             const object_data = (try s3.getObject(key)) orelse continue;
             defer self.allocator.free(object_data);
 
@@ -236,6 +238,20 @@ pub const PartitionStore = struct {
         }
 
         return recovered;
+    }
+
+    fn objectManagerHasS3Key(om: *ObjectManager, key: []const u8) bool {
+        var sso_it = om.stream_set_objects.iterator();
+        while (sso_it.next()) |entry| {
+            if (std.mem.eql(u8, entry.value_ptr.s3_key, key)) return true;
+        }
+
+        var so_it = om.stream_objects.iterator();
+        while (so_it.next()) |entry| {
+            if (std.mem.eql(u8, entry.value_ptr.s3_key, key)) return true;
+        }
+
+        return false;
     }
 
     fn streamRangesFromObjectIndex(self: *PartitionStore, entries: []const ObjectWriter.DataBlockIndex) ![]stream_mod.StreamOffsetRange {
@@ -1244,6 +1260,10 @@ test "PartitionStore rebuilds S3 WAL metadata and fetches object data" {
     try testing.expectEqual(@as(u64, 1), recovered);
     try testing.expectEqual(@as(usize, 1), object_manager.getStreamSetObjectCount());
     try testing.expectEqual(@as(u64, 2), object_manager.getStream(stream_id).?.end_offset);
+
+    const recovered_again = try store.recoverS3WalObjects();
+    try testing.expectEqual(@as(u64, 0), recovered_again);
+    try testing.expectEqual(@as(usize, 1), object_manager.getStreamSetObjectCount());
 
     try store.ensurePartition("s3-recover-topic", 0);
     var key_buf: [256]u8 = undefined;
