@@ -1,6 +1,5 @@
 const std = @import("std");
 const testing = std.testing;
-const crypto = std.crypto;
 
 /// 128-bit UUID as used by Kafka (e.g., topic IDs, producer IDs).
 ///
@@ -14,7 +13,7 @@ pub const Uuid = struct {
     /// Generate a random (v4) UUID.
     pub fn random() Uuid {
         var bytes: [16]u8 = undefined;
-        crypto.random.bytes(&bytes);
+        @import("random_compat").bytes(&bytes);
 
         // Set version 4 (random)
         bytes[6] = (bytes[6] & 0x0F) | 0x40;

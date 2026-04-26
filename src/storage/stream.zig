@@ -50,14 +50,14 @@ pub const Stream = struct {
     end_offset: u64 = 0,
     state: StreamState = .opened,
     node_id: i32,
-    ranges: std.ArrayList(StreamRange),
+    ranges: std.array_list.Managed(StreamRange),
     allocator: Allocator,
 
     pub fn init(allocator: Allocator, stream_id: u64, node_id: i32) Stream {
         return .{
             .stream_id = stream_id,
             .node_id = node_id,
-            .ranges = std.ArrayList(StreamRange).init(allocator),
+            .ranges = std.array_list.Managed(StreamRange).init(allocator),
             .allocator = allocator,
         };
     }
@@ -149,7 +149,7 @@ pub const StreamSetObject = struct {
     data_time_ms: i64,
     object_size: u64,
     s3_key: []const u8, // owned, heap-allocated
-    stream_ranges: std.ArrayList(StreamOffsetRange),
+    stream_ranges: std.array_list.Managed(StreamOffsetRange),
     /// Lifecycle state: prepared → committed → mark_destroyed → (removed).
     state: S3ObjectState = .committed,
     /// Timestamp (ms) when state last changed. Used for TTL/retention checks.
@@ -263,10 +263,10 @@ pub const ObjectManager = struct {
     stream_objects: std.AutoHashMap(u64, StreamObject),
 
     // Secondary index: streamId → sorted list of StreamObject IDs (by start_offset)
-    stream_object_index: std.AutoHashMap(u64, std.ArrayList(u64)),
+    stream_object_index: std.AutoHashMap(u64, std.array_list.Managed(u64)),
 
     // Secondary index: streamId → list of StreamSetObject IDs containing this stream
-    stream_sso_index: std.AutoHashMap(u64, std.ArrayList(u64)),
+    stream_sso_index: std.AutoHashMap(u64, std.array_list.Managed(u64)),
 
     /// Dual-buffer registry that tracks prepared object IDs across Raft snapshot
     /// truncations. See PreparedObjectRegistry for the AutoMQ design rationale.
@@ -279,8 +279,8 @@ pub const ObjectManager = struct {
             .streams = std.AutoHashMap(u64, Stream).init(allocator),
             .stream_set_objects = std.AutoHashMap(u64, StreamSetObject).init(allocator),
             .stream_objects = std.AutoHashMap(u64, StreamObject).init(allocator),
-            .stream_object_index = std.AutoHashMap(u64, std.ArrayList(u64)).init(allocator),
-            .stream_sso_index = std.AutoHashMap(u64, std.ArrayList(u64)).init(allocator),
+            .stream_object_index = std.AutoHashMap(u64, std.array_list.Managed(u64)).init(allocator),
+            .stream_sso_index = std.AutoHashMap(u64, std.array_list.Managed(u64)).init(allocator),
             .prepared_registry = PreparedObjectRegistry.init(allocator),
         };
     }
@@ -334,6 +334,8 @@ pub const ObjectManager = struct {
 
     /// Create a new stream with a specific stream_id.
     pub fn createStreamWithId(self: *ObjectManager, stream_id: u64, node_id: i32) !*Stream {
+        if (self.streams.contains(stream_id)) return error.DuplicateStream;
+
         var stream = Stream.init(self.allocator, stream_id, node_id);
         // Create the initial range
         try stream.ranges.append(.{
@@ -355,6 +357,8 @@ pub const ObjectManager = struct {
     /// Open a stream with a new epoch (used during failover).
     pub fn openStream(self: *ObjectManager, stream_id: u64, epoch: u64) !void {
         const stream = self.streams.getPtr(stream_id) orelse return error.StreamNotFound;
+        if (epoch < stream.epoch) return error.StaleStreamEpoch;
+        if (stream.state == .opened and epoch == stream.epoch) return;
         try stream.open(epoch);
     }
 
@@ -368,6 +372,37 @@ pub const ObjectManager = struct {
     pub fn trimStream(self: *ObjectManager, stream_id: u64, new_start_offset: u64) !void {
         const stream = self.streams.getPtr(stream_id) orelse return error.StreamNotFound;
         stream.trim(new_start_offset);
+    }
+
+    /// Delete a stream's metadata and its dedicated StreamObjects.
+    ///
+    /// Shared StreamSetObjects are kept because they may contain ranges for
+    /// other streams; this stream's SSO index is removed so future lookups do
+    /// not expose deleted stream data.
+    pub fn deleteStream(self: *ObjectManager, stream_id: u64) !void {
+        if (self.streams.fetchRemove(stream_id)) |kv| {
+            var stream = kv.value;
+            stream.deinit();
+        } else {
+            return error.StreamNotFound;
+        }
+
+        if (self.stream_object_index.fetchRemove(stream_id)) |kv| {
+            var object_ids = kv.value;
+            for (object_ids.items) |object_id| {
+                if (self.stream_objects.fetchRemove(object_id)) |removed| {
+                    var so = removed.value;
+                    so.deinit(self.allocator);
+                    self.prepared_registry.untrackPrepared(object_id);
+                }
+            }
+            object_ids.deinit();
+        }
+
+        if (self.stream_sso_index.fetchRemove(stream_id)) |kv| {
+            var sso_ids = kv.value;
+            sso_ids.deinit();
+        }
     }
 
     /// Compute total bytes of all StreamObjects for a given stream.
@@ -448,7 +483,9 @@ pub const ObjectManager = struct {
     /// The caller should later call commitStreamObject/commitStreamSetObject
     /// to transition the object to committed state.
     pub fn prepareObject(self: *ObjectManager) u64 {
-        return self.allocateObjectId();
+        const object_id = self.allocateObjectId();
+        self.prepared_registry.trackPrepared(object_id);
+        return object_id;
     }
 
     /// Mark a committed object for destruction. It will be physically deleted
@@ -460,7 +497,7 @@ pub const ObjectManager = struct {
     /// trading sub-second precision for implementation simplicity (compaction
     /// runs every 5 minutes, so the effective delay is retention_ms ± 5 min).
     pub fn markDestroyed(self: *ObjectManager, object_id: u64) void {
-        self.markDestroyedAt(object_id, std.time.milliTimestamp());
+        self.markDestroyedAt(object_id, @import("time_compat").milliTimestamp());
     }
 
     /// Mark a committed object for destruction with an explicit timestamp.
@@ -501,7 +538,7 @@ pub const ObjectManager = struct {
         stream_id: u64,
         s3_key: []const u8,
     ) !void {
-        return self.registerPreparedStreamObjectAt(object_id, stream_id, s3_key, std.time.milliTimestamp());
+        return self.registerPreparedStreamObjectAt(object_id, stream_id, s3_key, @import("time_compat").milliTimestamp());
     }
 
     /// Register a prepared StreamObject with an explicit timestamp for testability.
@@ -541,7 +578,7 @@ pub const ObjectManager = struct {
     /// but never committed (e.g., the producer crashed between allocation and S3 upload).
     /// This prevents leaked object IDs from accumulating indefinitely.
     pub fn expirePreparedObjects(self: *ObjectManager, prepared_ttl_ms: i64) u64 {
-        return self.expirePreparedObjectsAt(prepared_ttl_ms, std.time.milliTimestamp());
+        return self.expirePreparedObjectsAt(prepared_ttl_ms, @import("time_compat").milliTimestamp());
     }
 
     /// Expire prepared objects with an explicit "now" timestamp for testability.
@@ -549,7 +586,7 @@ pub const ObjectManager = struct {
         var expired_count: u64 = 0;
 
         // Collect expired SO IDs (can't modify map while iterating)
-        var expired_so_ids = std.ArrayList(u64).init(self.allocator);
+        var expired_so_ids = std.array_list.Managed(u64).init(self.allocator);
         defer expired_so_ids.deinit();
         {
             var it = self.stream_objects.iterator();
@@ -570,7 +607,7 @@ pub const ObjectManager = struct {
         }
 
         // Collect expired SSO IDs
-        var expired_sso_ids = std.ArrayList(u64).init(self.allocator);
+        var expired_sso_ids = std.array_list.Managed(u64).init(self.allocator);
         defer expired_sso_ids.deinit();
         {
             var it = self.stream_set_objects.iterator();
@@ -601,19 +638,19 @@ pub const ObjectManager = struct {
     /// the caller deletes them from S3. If the process crashes after metadata removal
     /// but before S3 delete, the S3 objects become orphans (cleaned up next cycle).
     pub fn collectDestroyedObjects(self: *ObjectManager, retention_ms: i64, allocator: Allocator) ![][]u8 {
-        return self.collectDestroyedObjectsAt(retention_ms, allocator, std.time.milliTimestamp());
+        return self.collectDestroyedObjectsAt(retention_ms, allocator, @import("time_compat").milliTimestamp());
     }
 
     /// Collect destroyed objects with an explicit "now" timestamp for testability.
     pub fn collectDestroyedObjectsAt(self: *ObjectManager, retention_ms: i64, allocator: Allocator, now_ms: i64) ![][]u8 {
-        var keys = std.ArrayList([]u8).init(allocator);
+        var keys = std.array_list.Managed([]u8).init(allocator);
         errdefer {
             for (keys.items) |k| allocator.free(k);
             keys.deinit();
         }
 
         // Collect SO IDs ready for destruction
-        var ready_so_ids = std.ArrayList(u64).init(self.allocator);
+        var ready_so_ids = std.array_list.Managed(u64).init(self.allocator);
         defer ready_so_ids.deinit();
         {
             var it = self.stream_objects.iterator();
@@ -636,7 +673,7 @@ pub const ObjectManager = struct {
         }
 
         // Collect SSO IDs ready for destruction
-        var ready_sso_ids = std.ArrayList(u64).init(self.allocator);
+        var ready_sso_ids = std.array_list.Managed(u64).init(self.allocator);
         defer ready_sso_ids.deinit();
         {
             var it = self.stream_set_objects.iterator();
@@ -673,11 +710,14 @@ pub const ObjectManager = struct {
         s3_key: []const u8,
         object_size: u64,
     ) !void {
+        self.removeStreamSetObject(object_id);
+        self.removeStreamObject(object_id);
+
         // Ensure next_object_id stays ahead of any committed ID
         if (object_id >= self.next_object_id) {
             self.next_object_id = object_id + 1;
         }
-        var range_list = std.ArrayList(StreamOffsetRange).init(self.allocator);
+        var range_list = std.array_list.Managed(StreamOffsetRange).init(self.allocator);
         for (ranges) |r| {
             try range_list.append(r);
         }
@@ -688,7 +728,7 @@ pub const ObjectManager = struct {
             .object_id = object_id,
             .node_id = node_id,
             .order_id = order_id,
-            .data_time_ms = std.time.milliTimestamp(),
+            .data_time_ms = @import("time_compat").milliTimestamp(),
             .object_size = object_size,
             .s3_key = key_copy,
             .stream_ranges = range_list,
@@ -698,7 +738,7 @@ pub const ObjectManager = struct {
         for (ranges) |r| {
             var gop = try self.stream_sso_index.getOrPut(r.stream_id);
             if (!gop.found_existing) {
-                gop.value_ptr.* = std.ArrayList(u64).init(self.allocator);
+                gop.value_ptr.* = std.array_list.Managed(u64).init(self.allocator);
             }
             try gop.value_ptr.append(object_id);
         }
@@ -733,16 +773,12 @@ pub const ObjectManager = struct {
         object_size: u64,
         max_timestamp_ms: i64,
     ) !void {
+        self.removeStreamObject(object_id);
+        self.removeStreamSetObject(object_id);
+
         // Ensure next_object_id stays ahead of any committed ID
         if (object_id >= self.next_object_id) {
             self.next_object_id = object_id + 1;
-        }
-
-        // Free old entry's s3_key if this object was previously registered as
-        // prepared (prepared → committed lifecycle). Without this, the dupe'd
-        // key from registerPreparedStreamObjectAt() would leak.
-        if (self.stream_objects.getPtr(object_id)) |old| {
-            self.allocator.free(old.s3_key);
         }
 
         const key_copy = try self.allocator.dupe(u8, s3_key);
@@ -760,7 +796,7 @@ pub const ObjectManager = struct {
         // Update stream_object_index — insert maintaining sorted order by start_offset
         var gop = try self.stream_object_index.getOrPut(stream_id);
         if (!gop.found_existing) {
-            gop.value_ptr.* = std.ArrayList(u64).init(self.allocator);
+            gop.value_ptr.* = std.array_list.Managed(u64).init(self.allocator);
         }
 
         // Find insertion point to maintain sorted order
@@ -795,6 +831,7 @@ pub const ObjectManager = struct {
                 }
             }
             sso.deinit(self.allocator);
+            self.prepared_registry.untrackPrepared(object_id);
         }
     }
 
@@ -814,6 +851,7 @@ pub const ObjectManager = struct {
                 }
             }
             so.deinit(self.allocator);
+            self.prepared_registry.untrackPrepared(object_id);
         }
     }
 
@@ -831,7 +869,7 @@ pub const ObjectManager = struct {
         end_offset: u64,
         limit: u32,
     ) ![]S3ObjectMetadata {
-        var results = std.ArrayList(S3ObjectMetadata).init(self.allocator);
+        var results = std.array_list.Managed(S3ObjectMetadata).init(self.allocator);
         errdefer results.deinit();
 
         // 1. Collect committed StreamObjects that overlap [start_offset, end_offset)
@@ -1157,7 +1195,7 @@ pub const ObjectManager = struct {
             const node_id = readI32(data, &pos) orelse return error.CorruptSnapshot;
             const range_count = readU32(data, &pos) orelse return error.CorruptSnapshot;
 
-            var ranges = std.ArrayList(StreamRange).init(self.allocator);
+            var ranges = std.array_list.Managed(StreamRange).init(self.allocator);
             errdefer ranges.deinit();
             var ri: u32 = 0;
             while (ri < range_count) : (ri += 1) {
@@ -1277,7 +1315,7 @@ pub const ObjectManager = struct {
             if (object_id >= self.next_object_id) {
                 self.next_object_id = object_id + 1;
             }
-            var range_list = std.ArrayList(StreamOffsetRange).init(self.allocator);
+            var range_list = std.array_list.Managed(StreamOffsetRange).init(self.allocator);
             for (ranges_buf[0..range_count]) |r| {
                 try range_list.append(r);
             }
@@ -1300,7 +1338,7 @@ pub const ObjectManager = struct {
             for (ranges_buf[0..range_count]) |r| {
                 var gop = try self.stream_sso_index.getOrPut(r.stream_id);
                 if (!gop.found_existing) {
-                    gop.value_ptr.* = std.ArrayList(u64).init(self.allocator);
+                    gop.value_ptr.* = std.array_list.Managed(u64).init(self.allocator);
                 }
                 try gop.value_ptr.append(object_id);
             }
@@ -1438,7 +1476,7 @@ pub const PreparedObjectRegistry = struct {
         return .{
             .current = std.AutoHashMap(u64, PreparedEntry).init(alloc),
             .previous = std.AutoHashMap(u64, PreparedEntry).init(alloc),
-            .last_rotation_ms = std.time.milliTimestamp(),
+            .last_rotation_ms = @import("time_compat").milliTimestamp(),
             .rotation_interval_ms = 60 * 60 * 1000, // 60 minutes
             .allocator = alloc,
         };
@@ -1462,7 +1500,7 @@ pub const PreparedObjectRegistry = struct {
 
     /// Register a newly prepared object in the current buffer.
     pub fn trackPrepared(self: *PreparedObjectRegistry, object_id: u64) void {
-        self.trackPreparedAt(object_id, std.time.milliTimestamp());
+        self.trackPreparedAt(object_id, @import("time_compat").milliTimestamp());
     }
 
     /// Register a newly prepared object with an explicit timestamp for testability.
@@ -1484,7 +1522,7 @@ pub const PreparedObjectRegistry = struct {
     /// Rotate buffers if the rotation interval has elapsed.
     /// Discards the previous buffer, moves current to previous, creates a new current.
     pub fn maybeRotate(self: *PreparedObjectRegistry) void {
-        self.maybeRotateAt(std.time.milliTimestamp());
+        self.maybeRotateAt(@import("time_compat").milliTimestamp());
     }
 
     /// Rotate with an explicit timestamp for testability.
@@ -1735,7 +1773,7 @@ test "Stream close" {
 }
 
 test "StreamSetObject isSingleStream" {
-    var ranges = std.ArrayList(StreamOffsetRange).init(testing.allocator);
+    var ranges = std.array_list.Managed(StreamOffsetRange).init(testing.allocator);
     defer ranges.deinit();
 
     try ranges.append(.{ .stream_id = 1, .start_offset = 0, .end_offset = 10 });
@@ -1755,7 +1793,7 @@ test "StreamSetObject isSingleStream" {
 }
 
 test "StreamSetObject multi-stream" {
-    var ranges = std.ArrayList(StreamOffsetRange).init(testing.allocator);
+    var ranges = std.array_list.Managed(StreamOffsetRange).init(testing.allocator);
     defer ranges.deinit();
 
     try ranges.append(.{ .stream_id = 1, .start_offset = 0, .end_offset = 10 });
@@ -2458,7 +2496,7 @@ test "ObjectManager snapshot — version header present" {
 test "ObjectManager snapshot — SSO data_time_ms preserved" {
     // Verify that data_time_ms (a field not set by commitStreamSetObject's
     // caller) survives the roundtrip. commitStreamSetObject uses
-    // std.time.milliTimestamp() so we register directly to control the value.
+    // @import("time_compat").milliTimestamp() so we register directly to control the value.
     var om = ObjectManager.init(testing.allocator, 0);
     defer om.deinit();
 

@@ -3,7 +3,7 @@ const testing = std.testing;
 
 /// MetricRegistry is defined in core to avoid circular dependencies between
 /// broker, storage, and raft modules. Re-exported here for backward compatibility.
-pub const MetricRegistry = @import("../core/metric_registry.zig").MetricRegistry;
+pub const MetricRegistry = @import("core").MetricRegistry;
 
 /// Register standard broker metrics.
 pub fn registerBrokerMetrics(registry: *MetricRegistry) !void {

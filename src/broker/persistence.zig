@@ -1,9 +1,16 @@
 const std = @import("std");
 const testing = std.testing;
 const Allocator = std.mem.Allocator;
-const fs = std.fs;
+const fs = @import("fs_compat");
 const log = std.log.scoped(.persistence);
-const Authorizer = @import("../security/auth.zig").Authorizer;
+const Authorizer = @import("security").auth.Authorizer;
+
+fn hasComptimeField(comptime T: type, comptime field_name: []const u8) bool {
+    return switch (@typeInfo(T)) {
+        .@"struct" => @hasField(T, field_name),
+        else => false,
+    };
+}
 
 /// Persists broker metadata (topics, offsets) to a JSON file in the data directory.
 /// Loaded on startup, saved on changes.
@@ -52,7 +59,7 @@ pub const MetadataPersistence = struct {
         };
         defer self.allocator.free(content);
 
-        var entries = std.ArrayList(TopicEntry).init(self.allocator);
+        var entries = std.array_list.Managed(TopicEntry).init(self.allocator);
 
         var lines = std.mem.splitSequence(u8, content, "\n");
         while (lines.next()) |line| {
@@ -113,7 +120,7 @@ pub const MetadataPersistence = struct {
         };
         defer self.allocator.free(content);
 
-        var entries = std.ArrayList(OffsetEntry).init(self.allocator);
+        var entries = std.array_list.Managed(OffsetEntry).init(self.allocator);
 
         var lines = std.mem.splitSequence(u8, content, "\n");
         while (lines.next()) |line| {
@@ -212,7 +219,7 @@ pub const MetadataPersistence = struct {
         };
         defer self.allocator.free(content);
 
-        var entries = std.ArrayList(TransactionEntry).init(self.allocator);
+        var entries = std.array_list.Managed(TransactionEntry).init(self.allocator);
         var next_pid: i64 = 1000;
 
         var lines = std.mem.splitSequence(u8, content, "\n");
@@ -277,11 +284,21 @@ pub const MetadataPersistence = struct {
         const writer = file.writer();
         var it = sequences.iterator();
         while (it.next()) |entry| {
+            const key = entry.key_ptr.*;
+            const value = entry.value_ptr.*;
+            const producer_id = if (comptime hasComptimeField(@TypeOf(key), "producer_id"))
+                key.producer_id
+            else
+                value.producer_id;
+            const partition_key = if (comptime hasComptimeField(@TypeOf(key), "partition_key"))
+                key.partition_key
+            else
+                key;
             try writer.print("{d}\t{d}\t{d}\t{d}\n", .{
-                entry.key_ptr.producer_id,
-                entry.key_ptr.partition_key,
-                entry.value_ptr.last_sequence,
-                entry.value_ptr.producer_epoch,
+                producer_id,
+                partition_key,
+                value.last_sequence,
+                value.producer_epoch,
             });
         }
     }
@@ -306,7 +323,7 @@ pub const MetadataPersistence = struct {
         };
         defer self.allocator.free(content);
 
-        var entries = std.ArrayList(ProducerSequenceEntry).init(self.allocator);
+        var entries = std.array_list.Managed(ProducerSequenceEntry).init(self.allocator);
 
         var lines = std.mem.splitSequence(u8, content, "\n");
         while (lines.next()) |line| {
@@ -389,7 +406,7 @@ pub const MetadataPersistence = struct {
         };
         defer self.allocator.free(content);
 
-        var entries = std.ArrayList(AclEntry).init(self.allocator);
+        var entries = std.array_list.Managed(AclEntry).init(self.allocator);
 
         var lines = std.mem.splitSequence(u8, content, "\n");
         while (lines.next()) |line| {

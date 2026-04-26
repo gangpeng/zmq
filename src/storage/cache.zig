@@ -1,7 +1,7 @@
 const std = @import("std");
 const testing = std.testing;
 const Allocator = std.mem.Allocator;
-const MetricRegistry = @import("../core/metric_registry.zig").MetricRegistry;
+const MetricRegistry = @import("core").MetricRegistry;
 
 /// LogCache — FIFO cache for recently written (uncommitted) data.
 ///
@@ -14,7 +14,7 @@ const MetricRegistry = @import("../core/metric_registry.zig").MetricRegistry;
 /// - FIFO eviction: oldest block removed when at capacity
 /// - Thread-safe: single writer, multiple concurrent readers
 pub const LogCache = struct {
-    blocks: std.ArrayList(CacheBlock),
+    blocks: std.array_list.Managed(CacheBlock),
     max_blocks: usize,
     total_size: u64 = 0,
     max_size: u64,
@@ -24,7 +24,7 @@ pub const LogCache = struct {
 
     pub const CacheBlock = struct {
         id: u64,
-        records: std.ArrayList(CachedRecord),
+        records: std.array_list.Managed(CachedRecord),
         size: u64 = 0,
         created_at_ms: i64,
         allocator: Allocator,
@@ -32,8 +32,8 @@ pub const LogCache = struct {
         pub fn init(alloc: Allocator, id: u64) CacheBlock {
             return .{
                 .id = id,
-                .records = std.ArrayList(CachedRecord).init(alloc),
-                .created_at_ms = std.time.milliTimestamp(),
+                .records = std.array_list.Managed(CachedRecord).init(alloc),
+                .created_at_ms = @import("time_compat").milliTimestamp(),
                 .allocator = alloc,
             };
         }
@@ -78,7 +78,7 @@ pub const LogCache = struct {
 
     pub fn init(alloc: Allocator, max_blocks: usize, max_size: u64) LogCache {
         return .{
-            .blocks = std.ArrayList(CacheBlock).init(alloc),
+            .blocks = std.array_list.Managed(CacheBlock).init(alloc),
             .max_blocks = max_blocks,
             .max_size = max_size,
             .allocator = alloc,
@@ -142,7 +142,7 @@ pub const LogCache = struct {
 
     /// Get records for a stream in the offset range [start_offset, end_offset).
     pub fn get(self: *LogCache, stream_id: u64, start_offset: u64, end_offset: u64, alloc: Allocator) ![]const CachedRecord {
-        var results = std.ArrayList(CachedRecord).init(alloc);
+        var results = std.array_list.Managed(CachedRecord).init(alloc);
 
         for (self.blocks.items) |*block| {
             for (block.records.items) |rec| {
@@ -202,7 +202,7 @@ pub const LogCache = struct {
 /// repeated S3 fetches. Uses LRU eviction when at capacity.
 pub const S3BlockCache = struct {
     entries: std.StringHashMap(CacheEntry),
-    access_order: std.ArrayList([]const u8),
+    access_order: std.array_list.Managed([]const u8),
     max_size: u64,
     current_size: u64 = 0,
     hits: u64 = 0,
@@ -220,7 +220,7 @@ pub const S3BlockCache = struct {
     pub fn init(alloc: Allocator, max_size: u64) S3BlockCache {
         return .{
             .entries = std.StringHashMap(CacheEntry).init(alloc),
-            .access_order = std.ArrayList([]const u8).init(alloc),
+            .access_order = std.array_list.Managed([]const u8).init(alloc),
             .max_size = max_size,
             .allocator = alloc,
         };

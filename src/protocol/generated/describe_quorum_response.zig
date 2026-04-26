@@ -8,6 +8,73 @@ const std = @import("std");
 const ser = @import("../serialization.zig");
 const Allocator = std.mem.Allocator;
 
+pub const ReplicaState = struct {
+    ///
+    /// Versions: 0+
+    replica_id: i32 = 0,
+    ///
+    /// Versions: 2+
+    replica_directory_id: [16]u8 = .{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 },
+    /// The last known log end offset of the follower or -1 if it is unknown
+    /// Versions: 0+
+    log_end_offset: i64 = 0,
+    /// The last known leader wall clock time time when a follower fetched from the leader. This is reported as -1 both for the current leader or if it is unknown for a voter
+    /// Versions: 1+
+    last_fetch_timestamp: i64 = -1,
+    /// The leader wall clock append time of the offset for which the follower made the most recent fetch request. This is reported as the current time for the leader and -1 if unknown for a voter
+    /// Versions: 1+
+    last_caught_up_timestamp: i64 = -1,
+
+    pub fn serialize(self: *const ReplicaState, buf: []u8, pos: *usize, version: i16) void {
+        ser.writeI32(buf, pos, self.replica_id);
+        if (version >= 2) {
+            ser.writeUuid(buf, pos, self.replica_directory_id);
+        }
+        ser.writeI64(buf, pos, self.log_end_offset);
+        if (version >= 1) {
+            ser.writeI64(buf, pos, self.last_fetch_timestamp);
+        }
+        if (version >= 1) {
+            ser.writeI64(buf, pos, self.last_caught_up_timestamp);
+        }
+        ser.writeEmptyTaggedFields(buf, pos);
+    }
+
+    pub fn deserialize(_: Allocator, buf: []const u8, pos: *usize, version: i16) !ReplicaState {
+        var result = ReplicaState{};
+        result.replica_id = ser.readI32(buf, pos);
+        if (version >= 2) {
+            result.replica_directory_id = try ser.readUuid(buf, pos);
+        }
+        result.log_end_offset = ser.readI64(buf, pos);
+        if (version >= 1) {
+            result.last_fetch_timestamp = ser.readI64(buf, pos);
+        }
+        if (version >= 1) {
+            result.last_caught_up_timestamp = ser.readI64(buf, pos);
+        }
+        try ser.skipTaggedFields(buf, pos);
+        return result;
+    }
+
+    pub fn calcSize(_: *const ReplicaState, version: i16) usize {
+        var size: usize = 0;
+        size += 4;
+        if (version >= 2) {
+            size += 16;
+        }
+        size += 8;
+        if (version >= 1) {
+            size += 8;
+        }
+        if (version >= 1) {
+            size += 8;
+        }
+        size += 1;
+        return size;
+    }
+};
+
 pub const DescribeQuorumResponse = struct {
     pub const TopicData = struct {
         pub const PartitionData = struct {
@@ -56,7 +123,7 @@ pub const DescribeQuorumResponse = struct {
                 ser.writeEmptyTaggedFields(buf, pos);
             }
 
-            pub fn deserialize(_: Allocator, buf: []const u8, pos: *usize, version: i16) !PartitionData {
+            pub fn deserialize(alloc: Allocator, buf: []const u8, pos: *usize, version: i16) !PartitionData {
                 var result = PartitionData{};
                 result.partition_index = ser.readI32(buf, pos);
                 result.error_code = ser.readI16(buf, pos);
@@ -67,9 +134,21 @@ pub const DescribeQuorumResponse = struct {
                 result.leader_epoch = ser.readI32(buf, pos);
                 result.high_watermark = ser.readI64(buf, pos);
                 const current_voters_len: usize = (try ser.readCompactArrayLen(buf, pos)) orelse 0;
-                _ = current_voters_len;
+                if (current_voters_len > 0) {
+                    const current_voters_items = try alloc.alloc(ReplicaState, current_voters_len);
+                    for (current_voters_items) |*item| {
+                        item.* = try ReplicaState.deserialize(alloc, buf, pos, version);
+                    }
+                    result.current_voters = current_voters_items;
+                }
                 const observers_len: usize = (try ser.readCompactArrayLen(buf, pos)) orelse 0;
-                _ = observers_len;
+                if (observers_len > 0) {
+                    const observers_items = try alloc.alloc(ReplicaState, observers_len);
+                    for (observers_items) |*item| {
+                        item.* = try ReplicaState.deserialize(alloc, buf, pos, version);
+                    }
+                    result.observers = observers_items;
+                }
                 try ser.skipTaggedFields(buf, pos);
                 return result;
             }
@@ -85,7 +164,13 @@ pub const DescribeQuorumResponse = struct {
                 size += 4;
                 size += 8;
                 size += ser.unsignedVarintSize(self.current_voters.len + 1);
+                for (self.current_voters) |item| {
+                    size += item.calcSize(version);
+                }
                 size += ser.unsignedVarintSize(self.observers.len + 1);
+                for (self.observers) |item| {
+                    size += item.calcSize(version);
+                }
                 size += 1;
                 return size;
             }

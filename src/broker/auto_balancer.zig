@@ -31,7 +31,7 @@ pub const AutoBalancer = struct {
     };
 
     pub const RebalancePlan = struct {
-        moves: std.ArrayList(PartitionMove),
+        moves: std.array_list.Managed(PartitionMove),
 
         pub const PartitionMove = struct {
             topic: []const u8,
@@ -41,7 +41,7 @@ pub const AutoBalancer = struct {
         };
 
         pub fn init(alloc: Allocator) RebalancePlan {
-            return .{ .moves = std.ArrayList(PartitionMove).init(alloc) };
+            return .{ .moves = std.array_list.Managed(PartitionMove).init(alloc) };
         }
 
         pub fn deinit(self: *RebalancePlan) void {
@@ -58,7 +58,7 @@ pub const AutoBalancer = struct {
             .allocator = alloc,
             .enabled = true,
             .check_interval_ms = 300_000, // 5 minutes default
-            .last_check_ms = std.time.milliTimestamp(),
+            .last_check_ms = @import("time_compat").milliTimestamp(),
         };
     }
 
@@ -69,7 +69,7 @@ pub const AutoBalancer = struct {
     /// Check if it's time to rebalance.
     pub fn shouldCheck(self: *const AutoBalancer) bool {
         if (!self.enabled) return false;
-        const now = std.time.milliTimestamp();
+        const now = @import("time_compat").milliTimestamp();
         return (now - self.last_check_ms) >= self.check_interval_ms;
     }
 
@@ -135,7 +135,7 @@ pub const AutoBalancer = struct {
             }
         }
 
-        self.last_check_ms = std.time.milliTimestamp();
+        self.last_check_ms = @import("time_compat").milliTimestamp();
 
         if (plan.moveCount() > 0) {
             log.info("Rebalance plan: {d} partition moves", .{plan.moveCount()});

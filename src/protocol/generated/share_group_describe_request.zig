@@ -25,11 +25,15 @@ pub const ShareGroupDescribeRequest = struct {
         ser.writeEmptyTaggedFields(buf, pos);
     }
 
-    pub fn deserialize(_: Allocator, buf: []const u8, pos: *usize, _: i16) !ShareGroupDescribeRequest {
+    pub fn deserialize(alloc: Allocator, buf: []const u8, pos: *usize, _: i16) !ShareGroupDescribeRequest {
         var result = ShareGroupDescribeRequest{};
         const group_ids_len: usize = (try ser.readCompactArrayLen(buf, pos)) orelse 0;
-        for (0..group_ids_len) |_| {
-            _ = try ser.readCompactString(buf, pos);
+        if (group_ids_len > 0) {
+            const group_ids_items = try alloc.alloc(?[]const u8, group_ids_len);
+            for (group_ids_items) |*item| {
+                item.* = try ser.readCompactString(buf, pos);
+            }
+            result.group_ids = group_ids_items;
         }
         result.include_authorized_operations = try ser.readBool(buf, pos);
         try ser.skipTaggedFields(buf, pos);

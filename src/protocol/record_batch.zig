@@ -1,7 +1,7 @@
 const std = @import("std");
 const testing = std.testing;
 const Allocator = std.mem.Allocator;
-const crc32c = @import("../core/crc32c.zig");
+const crc32c = @import("core").crc32c;
 
 /// Kafka Record Batch format.
 ///

@@ -26,12 +26,16 @@ pub const DescribeProducersRequest = struct {
             ser.writeEmptyTaggedFields(buf, pos);
         }
 
-        pub fn deserialize(_: Allocator, buf: []const u8, pos: *usize, _: i16) !TopicRequest {
+        pub fn deserialize(alloc: Allocator, buf: []const u8, pos: *usize, _: i16) !TopicRequest {
             var result = TopicRequest{};
             result.name = try ser.readCompactString(buf, pos);
             const partition_indexes_len: usize = (try ser.readCompactArrayLen(buf, pos)) orelse 0;
             if (partition_indexes_len > 0) {
-                pos.* += partition_indexes_len * 4;
+                const partition_indexes_items = try alloc.alloc(i32, partition_indexes_len);
+                for (partition_indexes_items) |*item| {
+                    item.* = ser.readI32(buf, pos);
+                }
+                result.partition_indexes = partition_indexes_items;
             }
             try ser.skipTaggedFields(buf, pos);
             return result;

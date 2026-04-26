@@ -1,7 +1,8 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
-const ser = @import("../protocol/serialization.zig");
-const header_mod = @import("../protocol/header.zig");
+const protocol = @import("protocol");
+const ser = protocol.serialization;
+const header_mod = protocol.header;
 const ResponseHeader = header_mod.ResponseHeader;
 
 /// Response builder utility for constructing Kafka response frames.

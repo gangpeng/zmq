@@ -27,14 +27,18 @@ pub const CreatePartitionsRequest = struct {
                 if (version >= 2) ser.writeEmptyTaggedFields(buf, pos);
             }
 
-            pub fn deserialize(_: Allocator, buf: []const u8, pos: *usize, version: i16) !CreatePartitionsAssignment {
+            pub fn deserialize(alloc: Allocator, buf: []const u8, pos: *usize, version: i16) !CreatePartitionsAssignment {
                 var result = CreatePartitionsAssignment{};
                 const broker_ids_len: usize = if (version >= 2)
                     (try ser.readCompactArrayLen(buf, pos)) orelse 0
                 else
                     (try ser.readArrayLen(buf, pos)) orelse 0;
                 if (broker_ids_len > 0) {
-                    pos.* += broker_ids_len * 4;
+                    const broker_ids_items = try alloc.alloc(i32, broker_ids_len);
+                    for (broker_ids_items) |*item| {
+                        item.* = ser.readI32(buf, pos);
+                    }
+                    result.broker_ids = broker_ids_items;
                 }
                 if (version >= 2) try ser.skipTaggedFields(buf, pos);
                 return result;

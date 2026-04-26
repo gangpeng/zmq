@@ -2,11 +2,12 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 const log = std.log.scoped(.metadata_client);
 
-const ser = @import("../protocol/serialization.zig");
-const header_mod = @import("../protocol/header.zig");
+const protocol = @import("protocol");
+const ser = protocol.serialization;
+const header_mod = protocol.header;
 const RequestHeader = header_mod.RequestHeader;
-const RaftClientPool = @import("../network/raft_client.zig").RaftClientPool;
-const TlsClientContext = @import("../security/tls.zig").TlsClientContext;
+const RaftClientPool = @import("network").RaftClientPool;
+const TlsClientContext = @import("security").tls.TlsClientContext;
 
 /// MetadataClient connects a broker-only node to the controller quorum.
 ///
@@ -21,7 +22,7 @@ pub const MetadataClient = struct {
     /// Connections to controller voters.
     controller_pool: RaftClientPool,
     /// Parsed voter addresses for connection.
-    voters: std.ArrayList(VoterAddress),
+    voters: std.array_list.Managed(VoterAddress),
     /// Currently known controller leader ID.
     leader_id: ?i32 = null,
     /// Our broker node ID.
@@ -67,7 +68,7 @@ pub const MetadataClient = struct {
     ) MetadataClient {
         return .{
             .controller_pool = RaftClientPool.init(alloc),
-            .voters = std.ArrayList(VoterAddress).init(alloc),
+            .voters = std.array_list.Managed(VoterAddress).init(alloc),
             .broker_id = broker_id,
             .advertised_host = host,
             .advertised_port = port,
@@ -113,7 +114,7 @@ pub const MetadataClient = struct {
 
         // Step 3: Periodic heartbeat loop
         while (!self.should_stop.*) {
-            std.time.sleep(2000 * @as(u64, 1_000_000)); // 2-second heartbeat interval
+            @import("time_compat").sleep(2000 * @as(u64, 1_000_000)); // 2-second heartbeat interval
             if (self.should_stop.*) break;
             self.sendHeartbeat();
         }
@@ -150,7 +151,7 @@ pub const MetadataClient = struct {
             log.warn("Failed to discover controller leader, retrying in {d}ms (attempt {d})", .{
                 backoff, attempt,
             });
-            std.time.sleep(backoff * @as(u64, 1_000_000));
+            @import("time_compat").sleep(backoff * @as(u64, 1_000_000));
         }
     }
 
@@ -232,7 +233,7 @@ pub const MetadataClient = struct {
     fn sendHeartbeat(self: *MetadataClient) void {
         // Staleness check: if no successful heartbeat within lease period,
         // self-fence to prevent split-brain writes during network partition.
-        const now = std.time.milliTimestamp();
+        const now = @import("time_compat").milliTimestamp();
         if (self.last_heartbeat_ms.* > 0 and (now - self.last_heartbeat_ms.*) > self.controller_lease_ms) {
             if (!self.is_fenced.*) {
                 log.warn("Controller lease expired ({d}ms since last heartbeat), self-fencing broker", .{
@@ -293,7 +294,7 @@ pub const MetadataClient = struct {
                         log.info("Controller unfenced this broker (id={d}), resuming writes", .{self.broker_id});
                     }
                     self.is_fenced.* = false;
-                    self.last_heartbeat_ms.* = std.time.milliTimestamp();
+                    self.last_heartbeat_ms.* = @import("time_compat").milliTimestamp();
                 }
 
                 // Act on shutdown request
@@ -307,7 +308,7 @@ pub const MetadataClient = struct {
                 _ = ser.readI32(response, &rpos); // throttle_time_ms
                 const error_code = ser.readI16(response, &rpos);
                 if (error_code == 0) {
-                    self.last_heartbeat_ms.* = std.time.milliTimestamp();
+                    self.last_heartbeat_ms.* = @import("time_compat").milliTimestamp();
                     self.is_fenced.* = false;
                 } else {
                     log.warn("Heartbeat error: code={d}, re-registering", .{error_code});
@@ -330,7 +331,7 @@ const testing = std.testing;
 test "MetadataClient staleness detection fences broker" {
     var cached_epoch: i32 = 0;
     var is_fenced: bool = false;
-    var last_hb: i64 = std.time.milliTimestamp() - 60_000; // 60s ago
+    var last_hb: i64 = @import("time_compat").milliTimestamp() - 60_000; // 60s ago
     var should_stop: bool = false;
 
     var mc = MetadataClient.init(
@@ -346,7 +347,7 @@ test "MetadataClient staleness detection fences broker" {
     // and lease 10s, the broker should be fenced.
     // Since there's no leader_id, it will try discoverLeader which loops,
     // so we test the staleness logic directly.
-    const now = std.time.milliTimestamp();
+    const now = @import("time_compat").milliTimestamp();
     if (last_hb > 0 and (now - last_hb) > mc.controller_lease_ms) {
         is_fenced = true;
     }
@@ -356,7 +357,7 @@ test "MetadataClient staleness detection fences broker" {
 test "MetadataClient fresh heartbeat prevents fencing" {
     var cached_epoch: i32 = 0;
     var is_fenced: bool = false;
-    var last_hb: i64 = std.time.milliTimestamp(); // Just now
+    var last_hb: i64 = @import("time_compat").milliTimestamp(); // Just now
     var should_stop: bool = false;
 
     var mc = MetadataClient.init(
@@ -368,7 +369,7 @@ test "MetadataClient fresh heartbeat prevents fencing" {
     mc.controller_lease_ms = 30_000;
 
     // Fresh heartbeat — should NOT be fenced
-    const now = std.time.milliTimestamp();
+    const now = @import("time_compat").milliTimestamp();
     if (last_hb > 0 and (now - last_hb) > mc.controller_lease_ms) {
         is_fenced = true;
     }
@@ -389,9 +390,9 @@ test "MetadataClient zero last_heartbeat skips staleness check" {
 
     // With last_hb == 0, staleness check should be skipped
     // (broker just started, hasn't registered yet)
-    const now = std.time.milliTimestamp();
+    const now = @import("time_compat").milliTimestamp();
     _ = now;
-    if (last_hb > 0 and (std.time.milliTimestamp() - last_hb) > mc.controller_lease_ms) {
+    if (last_hb > 0 and (@import("time_compat").milliTimestamp() - last_hb) > mc.controller_lease_ms) {
         is_fenced = true;
     }
     try testing.expect(!is_fenced);
@@ -487,4 +488,3 @@ test "MetadataClient setTlsContext propagates to controller pool" {
     try testing.expect(client != null);
     try testing.expect(client.?.tls_ctx != null);
 }
-

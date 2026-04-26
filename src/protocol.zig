@@ -9,6 +9,7 @@
 /// - 230 auto-generated message structs with serialize/deserialize/calcSize
 
 pub const api_key = @import("protocol/api_key.zig");
+pub const api_support = @import("protocol/api_support.zig");
 pub const serialization = @import("protocol/serialization.zig");
 pub const header = @import("protocol/header.zig");
 pub const messages = @import("protocol/messages.zig");
@@ -17,6 +18,7 @@ pub const generated = @import("protocol/generated_index.zig");
 pub const error_codes = @import("protocol/error_codes.zig");
 
 pub const ApiKey = api_key.ApiKey;
+pub const ApiSupport = api_support;
 pub const RequestHeader = header.RequestHeader;
 pub const ResponseHeader = header.ResponseHeader;
 pub const TaggedField = serialization.TaggedField;

@@ -1,7 +1,7 @@
 const std = @import("std");
 const testing = std.testing;
 const Allocator = std.mem.Allocator;
-const crc32c = @import("../core/crc32c.zig");
+const crc32c = @import("core").crc32c;
 
 /// In-memory S3 mock for testing.
 ///
@@ -126,8 +126,8 @@ pub const ObjectWriter = struct {
     const FOOTER_SIZE_V2: usize = 20; // index_position(8) + index_size(4) + magic(4) + crc32c(4)
     const INDEX_ENTRY_SIZE: usize = 36;
 
-    data: std.ArrayList(u8),
-    index_entries: std.ArrayList(DataBlockIndex),
+    data: std.array_list.Managed(u8),
+    index_entries: std.array_list.Managed(DataBlockIndex),
     allocator: Allocator,
 
     pub const DataBlockIndex = struct {
@@ -141,8 +141,8 @@ pub const ObjectWriter = struct {
 
     pub fn init(alloc: Allocator) ObjectWriter {
         return .{
-            .data = std.ArrayList(u8).init(alloc),
-            .index_entries = std.ArrayList(DataBlockIndex).init(alloc),
+            .data = std.array_list.Managed(u8).init(alloc),
+            .index_entries = std.array_list.Managed(DataBlockIndex).init(alloc),
             .allocator = alloc,
         };
     }
@@ -621,7 +621,7 @@ test "ObjectReader v2 detects corrupted footer via CRC mismatch" {
 test "ObjectReader backward compatibility with v1 format" {
     // Manually construct a v1-format object (no CRC, old magic)
     const block_data = "legacy-block-data";
-    var data_buf = std.ArrayList(u8).init(testing.allocator);
+    var data_buf = std.array_list.Managed(u8).init(testing.allocator);
     defer data_buf.deinit();
 
     // Data block

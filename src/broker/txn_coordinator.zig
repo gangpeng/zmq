@@ -31,7 +31,7 @@ pub const TransactionCoordinator = struct {
         producer_epoch: i16,
         transactional_id: ?[]u8,
         status: TxnStatus = .empty,
-        partitions: std.ArrayList(TopicPartition),
+        partitions: std.array_list.Managed(TopicPartition),
         start_time_ms: i64,
         timeout_ms: i32 = 60000,
 
@@ -90,7 +90,7 @@ pub const TransactionCoordinator = struct {
                             txn.producer_epoch = 0;
                             txn.status = .empty;
                             txn.partitions.clearRetainingCapacity();
-                            txn.start_time_ms = std.time.milliTimestamp();
+                            txn.start_time_ms = @import("time_compat").milliTimestamp();
                             // Re-index under new PID
                             const txn_copy = txn.*;
                             _ = self.transactions.fetchRemove(old_pid);
@@ -105,7 +105,7 @@ pub const TransactionCoordinator = struct {
                         txn.producer_epoch += 1;
                         txn.status = .empty;
                         txn.partitions.clearRetainingCapacity();
-                        txn.start_time_ms = std.time.milliTimestamp();
+                        txn.start_time_ms = @import("time_compat").milliTimestamp();
                         self.dirty = true;
                         return .{
                             .error_code = 0,
@@ -128,8 +128,8 @@ pub const TransactionCoordinator = struct {
             .producer_epoch = epoch,
             .transactional_id = tid_copy,
             .status = .empty,
-            .partitions = std.ArrayList(TransactionState.TopicPartition).init(self.allocator),
-            .start_time_ms = std.time.milliTimestamp(),
+            .partitions = std.array_list.Managed(TransactionState.TopicPartition).init(self.allocator),
+            .start_time_ms = @import("time_compat").milliTimestamp(),
         });
 
         self.dirty = true;
@@ -158,7 +158,7 @@ pub const TransactionCoordinator = struct {
 
         // Enforce transaction timeout
         if (txn.status == .ongoing) {
-            const elapsed = std.time.milliTimestamp() - txn.start_time_ms;
+            const elapsed = @import("time_compat").milliTimestamp() - txn.start_time_ms;
             if (elapsed > txn.timeout_ms) {
                 txn.status = .prepare_abort;
                 return 55; // INVALID_TXN_STATE (timed out)
@@ -167,7 +167,7 @@ pub const TransactionCoordinator = struct {
 
         if (txn.status == .empty) {
             txn.status = .ongoing;
-            txn.start_time_ms = std.time.milliTimestamp();
+            txn.start_time_ms = @import("time_compat").milliTimestamp();
         }
 
         if (txn.status != .ongoing) return 55; // INVALID_TXN_STATE
@@ -256,7 +256,7 @@ pub const TransactionCoordinator = struct {
         std.mem.writeInt(i16, value_buf[0..2], 0, .big); // version
         std.mem.writeInt(i16, value_buf[2..4], @intFromEnum(control_type), .big);
 
-        const rec_batch = @import("../protocol/record_batch.zig");
+        const rec_batch = @import("protocol").record_batch;
         const records = [_]rec_batch.Record{
             .{
                 .offset_delta = 0,
@@ -272,8 +272,8 @@ pub const TransactionCoordinator = struct {
             producer_id,
             producer_epoch,
             0,
-            std.time.milliTimestamp(),
-            std.time.milliTimestamp(),
+            @import("time_compat").milliTimestamp(),
+            @import("time_compat").milliTimestamp(),
             attributes,
         );
     }
@@ -292,7 +292,7 @@ pub const TransactionCoordinator = struct {
     /// transactions that have been in ONGOING state too long. This prevents resource
     /// leaks from abandoned producers.
     pub fn expireTransactions(self: *TransactionCoordinator) u32 {
-        const now = std.time.milliTimestamp();
+        const now = @import("time_compat").milliTimestamp();
         var expired_pids: [64]i64 = undefined;
         var num_expired: usize = 0;
 
@@ -328,8 +328,8 @@ pub const TransactionCoordinator = struct {
     /// Serialize transaction state for persistence to __transaction_state (fix #12).
     /// Returns allocated bytes that represent the current state.
     pub fn serializeState(self: *TransactionCoordinator) ![]u8 {
-        var buf = std.ArrayList(u8).init(self.allocator);
-        const writer = buf.writer();
+        var buf = std.array_list.Managed(u8).init(self.allocator);
+        const writer = @import("list_compat").writer(&buf);
 
         var it = self.transactions.iterator();
         while (it.next()) |entry| {
@@ -385,8 +385,8 @@ pub const TransactionCoordinator = struct {
                 .producer_epoch = entry.producer_epoch,
                 .transactional_id = tid_copy,
                 .status = @enumFromInt(entry.status),
-                .partitions = std.ArrayList(TransactionState.TopicPartition).init(self.allocator),
-                .start_time_ms = std.time.milliTimestamp(),
+                .partitions = std.array_list.Managed(TransactionState.TopicPartition).init(self.allocator),
+                .start_time_ms = @import("time_compat").milliTimestamp(),
                 .timeout_ms = entry.timeout_ms,
             });
         }
@@ -588,7 +588,7 @@ test "TransactionCoordinator buildControlBatch produces valid batch" {
     defer testing.allocator.free(batch_data);
 
     // Verify it's a valid RecordBatch
-    const rec_batch = @import("../protocol/record_batch.zig");
+    const rec_batch = @import("protocol").record_batch;
     try testing.expect(batch_data.len >= rec_batch.BATCH_HEADER_SIZE);
 
     const header = try rec_batch.RecordBatchHeader.parse(batch_data);
@@ -612,7 +612,7 @@ test "TransactionCoordinator buildControlBatch abort" {
     const batch_data = try coord.buildControlBatch(pid, epoch, .abort, 10);
     defer testing.allocator.free(batch_data);
 
-    const rec_batch = @import("../protocol/record_batch.zig");
+    const rec_batch = @import("protocol").record_batch;
     const header = try rec_batch.RecordBatchHeader.parse(batch_data);
     try testing.expect(header.isTransactional());
     try testing.expect(header.isControlBatch());
@@ -713,7 +713,7 @@ test "TransactionCoordinator expireTransactions auto-aborts" {
 
     // Manipulate start_time to simulate timeout (set 120s in the past)
     if (coord.transactions.getPtr(pid)) |txn| {
-        txn.start_time_ms = std.time.milliTimestamp() - 120_000;
+        txn.start_time_ms = @import("time_compat").milliTimestamp() - 120_000;
     }
 
     const expired = coord.expireTransactions();

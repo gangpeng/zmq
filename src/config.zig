@@ -1,7 +1,7 @@
 const std = @import("std");
 const testing = std.testing;
 const Allocator = std.mem.Allocator;
-const fs = std.fs;
+const fs = @import("fs_compat");
 
 /// Kafka-style properties file parser (server.properties format).
 ///
@@ -113,18 +113,19 @@ pub const ConfigFile = struct {
 
 /// Apply config file properties to BrokerConfig.
 /// Supports the following Kafka-standard properties:
-/// - s3.endpoint.host, s3.endpoint.port, s3.bucket, s3.access.key, s3.secret.key
+/// - s3.endpoint.host, s3.endpoint.port, s3.bucket, s3.access.key, s3.secret.key, s3.tls.ca.file
 /// - log.dirs (data directory)
 /// - num.partitions (default partition count for auto-created topics)
 /// - default.replication.factor
 /// - auto.create.topics.enable
 /// - advertised.listeners (host extraction)
-pub fn applyConfig(config: *@import("broker/handler.zig").Broker.BrokerConfig, cfg: *const ConfigFile) void {
+pub fn applyConfig(config: *@import("broker").Broker.BrokerConfig, cfg: *const ConfigFile) void {
     if (cfg.getString("s3.endpoint.host")) |h| config.s3_endpoint_host = h;
     config.s3_endpoint_port = cfg.getInt(u16, "s3.endpoint.port", config.s3_endpoint_port);
     if (cfg.getString("s3.bucket")) |b| config.s3_bucket = b;
     if (cfg.getString("s3.access.key")) |k| config.s3_access_key = k;
     if (cfg.getString("s3.secret.key")) |k| config.s3_secret_key = k;
+    if (cfg.getString("s3.tls.ca.file")) |f| config.s3_tls_ca_file = f;
     if (cfg.getString("log.dirs")) |d| config.data_dir = d;
 
     // Additional Kafka-standard config properties
@@ -140,6 +141,8 @@ pub fn applyConfig(config: *@import("broker/handler.zig").Broker.BrokerConfig, c
         const std_mem = @import("std").mem;
         if (std_mem.eql(u8, m, "async")) {
             config.s3_wal_flush_mode = .async_flush;
+        } else if (std_mem.eql(u8, m, "group_commit")) {
+            config.s3_wal_flush_mode = .group_commit;
         } else {
             config.s3_wal_flush_mode = .sync;
         }

@@ -138,7 +138,7 @@ pub const TlsConnection = struct {
             .ssl_ptr = ssl,
             .openssl = openssl,
             .allocator = alloc,
-            .handshake_start_ms = std.time.milliTimestamp(),
+            .handshake_start_ms = @import("time_compat").milliTimestamp(),
         };
     }
 
@@ -255,7 +255,7 @@ pub const TlsConnection = struct {
     pub fn read(self: *TlsConnection, buf: []u8) !usize {
         const ssl = self.ssl_ptr orelse {
             if (!self.tls_established) return error.TlsNotEstablished;
-            return posix.recv(self.inner_fd, buf, 0) catch return error.ReadError;
+            return @import("posix_compat").recv(self.inner_fd, buf, 0) catch return error.ReadError;
         };
         const ossl = self.openssl orelse return error.TlsNotEstablished;
 
@@ -276,7 +276,7 @@ pub const TlsConnection = struct {
     pub fn write(self: *TlsConnection, data: []const u8) !usize {
         const ssl = self.ssl_ptr orelse {
             if (!self.tls_established) return error.TlsNotEstablished;
-            return posix.send(self.inner_fd, data, 0) catch return error.WriteError;
+            return @import("posix_compat").send(self.inner_fd, data, 0) catch return error.WriteError;
         };
         const ossl = self.openssl orelse return error.TlsNotEstablished;
 
@@ -358,7 +358,7 @@ pub const TlsContext = struct {
 
             // Load certificate chain
             if (config.cert_file) |cert_path| {
-                const cert_z = std.fmt.allocPrintZ(alloc, "{s}", .{cert_path}) catch return error.OutOfMemory;
+                const cert_z = alloc.dupeZ(u8, cert_path) catch return error.OutOfMemory;
                 defer alloc.free(cert_z);
                 if (ossl.SSL_CTX_use_certificate_chain_file(ssl_ctx, cert_z) != 1) {
                     const err_str = ossl.getErrorString();
@@ -370,7 +370,7 @@ pub const TlsContext = struct {
 
             // Load private key
             if (config.key_file) |key_path| {
-                const key_z = std.fmt.allocPrintZ(alloc, "{s}", .{key_path}) catch return error.OutOfMemory;
+                const key_z = alloc.dupeZ(u8, key_path) catch return error.OutOfMemory;
                 defer alloc.free(key_z);
                 if (ossl.SSL_CTX_use_PrivateKey_file(ssl_ctx, key_z, OpenSslLib.SSL_FILETYPE_PEM) != 1) {
                     const err_str = ossl.getErrorString();
@@ -388,7 +388,7 @@ pub const TlsContext = struct {
 
             // Load CA certificates for client verification (mTLS)
             if (config.ca_file) |ca_path| {
-                const ca_z = std.fmt.allocPrintZ(alloc, "{s}", .{ca_path}) catch return error.OutOfMemory;
+                const ca_z = alloc.dupeZ(u8, ca_path) catch return error.OutOfMemory;
                 defer alloc.free(ca_z);
                 if (ossl.SSL_CTX_load_verify_locations(ssl_ctx, ca_z, null) != 1) {
                     log.warn("Failed to load CA file: {s}", .{ca_path});
@@ -481,18 +481,24 @@ pub const TlsClientContext = struct {
 
         // If CA file set, load for server certificate verification
         if (config.ca_file) |ca_path| {
-            const ca_z = std.fmt.allocPrintZ(std.heap.page_allocator, "{s}", .{ca_path}) catch return error.OutOfMemory;
+            const ca_z = std.heap.page_allocator.dupeZ(u8, ca_path) catch return error.OutOfMemory;
             defer std.heap.page_allocator.free(ca_z);
             if (ossl.SSL_CTX_load_verify_locations(ssl_ctx, ca_z, null) != 1) {
                 log.warn("Failed to load CA for client TLS: {s}", .{ca_path});
             } else {
                 log.info("Client TLS: loaded CA file: {s}", .{ca_path});
             }
+        } else if (ossl.SSL_CTX_set_default_verify_paths) |load_default_paths| {
+            if (load_default_paths(ssl_ctx) != 1) {
+                log.warn("Client TLS: failed to load default CA paths", .{});
+            }
         }
+
+        ossl.SSL_CTX_set_verify(ssl_ctx, OpenSslLib.SSL_VERIFY_PEER, null);
 
         // If client cert/key set (mTLS), load them
         if (config.cert_file) |cert_path| {
-            const cert_z = std.fmt.allocPrintZ(std.heap.page_allocator, "{s}", .{cert_path}) catch return error.OutOfMemory;
+            const cert_z = std.heap.page_allocator.dupeZ(u8, cert_path) catch return error.OutOfMemory;
             defer std.heap.page_allocator.free(cert_z);
             if (ossl.SSL_CTX_use_certificate_chain_file(ssl_ctx, cert_z) != 1) {
                 const err_str = ossl.getErrorString();
@@ -503,7 +509,7 @@ pub const TlsClientContext = struct {
         }
 
         if (config.key_file) |key_path| {
-            const key_z = std.fmt.allocPrintZ(std.heap.page_allocator, "{s}", .{key_path}) catch return error.OutOfMemory;
+            const key_z = std.heap.page_allocator.dupeZ(u8, key_path) catch return error.OutOfMemory;
             defer std.heap.page_allocator.free(key_z);
             if (ossl.SSL_CTX_use_PrivateKey_file(ssl_ctx, key_z, OpenSslLib.SSL_FILETYPE_PEM) != 1) {
                 const err_str = ossl.getErrorString();

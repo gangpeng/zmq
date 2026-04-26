@@ -34,7 +34,7 @@ pub const ElectLeadersRequest = struct {
             if (version >= 2) ser.writeEmptyTaggedFields(buf, pos);
         }
 
-        pub fn deserialize(_: Allocator, buf: []const u8, pos: *usize, version: i16) !TopicPartitions {
+        pub fn deserialize(alloc: Allocator, buf: []const u8, pos: *usize, version: i16) !TopicPartitions {
             var result = TopicPartitions{};
             result.topic = if (version >= 2)
                 try ser.readCompactString(buf, pos)
@@ -45,7 +45,11 @@ pub const ElectLeadersRequest = struct {
             else
                 (try ser.readArrayLen(buf, pos)) orelse 0;
             if (partitions_len > 0) {
-                pos.* += partitions_len * 4;
+                const partitions_items = try alloc.alloc(i32, partitions_len);
+                for (partitions_items) |*item| {
+                    item.* = ser.readI32(buf, pos);
+                }
+                result.partitions = partitions_items;
             }
             if (version >= 2) try ser.skipTaggedFields(buf, pos);
             return result;

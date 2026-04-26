@@ -45,7 +45,7 @@ pub const FindCoordinatorRequest = struct {
         if (version >= 3) ser.writeEmptyTaggedFields(buf, pos);
     }
 
-    pub fn deserialize(_: Allocator, buf: []const u8, pos: *usize, version: i16) !FindCoordinatorRequest {
+    pub fn deserialize(alloc: Allocator, buf: []const u8, pos: *usize, version: i16) !FindCoordinatorRequest {
         var result = FindCoordinatorRequest{};
         result.key = if (version >= 3)
             try ser.readCompactString(buf, pos)
@@ -59,12 +59,15 @@ pub const FindCoordinatorRequest = struct {
                 (try ser.readCompactArrayLen(buf, pos)) orelse 0
             else
                 (try ser.readArrayLen(buf, pos)) orelse 0;
-            for (0..coordinator_keys_len) |_| {
-                if (version >= 3) {
-                    _ = try ser.readCompactString(buf, pos);
-                } else {
-                    _ = try ser.readString(buf, pos);
+            if (coordinator_keys_len > 0) {
+                const coordinator_keys_items = try alloc.alloc(?[]const u8, coordinator_keys_len);
+                for (coordinator_keys_items) |*item| {
+                    item.* = if (version >= 3)
+                        try ser.readCompactString(buf, pos)
+                    else
+                        try ser.readString(buf, pos);
                 }
+                result.coordinator_keys = coordinator_keys_items;
             }
         }
         if (version >= 3) try ser.skipTaggedFields(buf, pos);

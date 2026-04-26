@@ -31,7 +31,7 @@ pub const CreateTopicsRequest = struct {
                 if (version >= 5) ser.writeEmptyTaggedFields(buf, pos);
             }
 
-            pub fn deserialize(_: Allocator, buf: []const u8, pos: *usize, version: i16) !CreatableReplicaAssignment {
+            pub fn deserialize(alloc: Allocator, buf: []const u8, pos: *usize, version: i16) !CreatableReplicaAssignment {
                 var result = CreatableReplicaAssignment{};
                 result.partition_index = ser.readI32(buf, pos);
                 const broker_ids_len: usize = if (version >= 5)
@@ -39,7 +39,11 @@ pub const CreateTopicsRequest = struct {
                 else
                     (try ser.readArrayLen(buf, pos)) orelse 0;
                 if (broker_ids_len > 0) {
-                    pos.* += broker_ids_len * 4;
+                    const broker_ids_items = try alloc.alloc(i32, broker_ids_len);
+                    for (broker_ids_items) |*item| {
+                        item.* = ser.readI32(buf, pos);
+                    }
+                    result.broker_ids = broker_ids_items;
                 }
                 if (version >= 5) try ser.skipTaggedFields(buf, pos);
                 return result;

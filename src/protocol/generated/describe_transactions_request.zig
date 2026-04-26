@@ -21,11 +21,15 @@ pub const DescribeTransactionsRequest = struct {
         ser.writeEmptyTaggedFields(buf, pos);
     }
 
-    pub fn deserialize(_: Allocator, buf: []const u8, pos: *usize, _: i16) !DescribeTransactionsRequest {
+    pub fn deserialize(alloc: Allocator, buf: []const u8, pos: *usize, _: i16) !DescribeTransactionsRequest {
         var result = DescribeTransactionsRequest{};
         const transactional_ids_len: usize = (try ser.readCompactArrayLen(buf, pos)) orelse 0;
-        for (0..transactional_ids_len) |_| {
-            _ = try ser.readCompactString(buf, pos);
+        if (transactional_ids_len > 0) {
+            const transactional_ids_items = try alloc.alloc(?[]const u8, transactional_ids_len);
+            for (transactional_ids_items) |*item| {
+                item.* = try ser.readCompactString(buf, pos);
+            }
+            result.transactional_ids = transactional_ids_items;
         }
         try ser.skipTaggedFields(buf, pos);
         return result;

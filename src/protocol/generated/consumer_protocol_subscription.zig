@@ -29,7 +29,7 @@ pub const ConsumerProtocolSubscription = struct {
             }
         }
 
-        pub fn deserialize(_: Allocator, buf: []const u8, pos: *usize, version: i16) !TopicPartition {
+        pub fn deserialize(alloc: Allocator, buf: []const u8, pos: *usize, version: i16) !TopicPartition {
             var result = TopicPartition{};
             if (version >= 1) {
                 result.topic = try ser.readString(buf, pos);
@@ -37,7 +37,11 @@ pub const ConsumerProtocolSubscription = struct {
             if (version >= 1) {
                 const partitions_len: usize = (try ser.readArrayLen(buf, pos)) orelse 0;
                 if (partitions_len > 0) {
-                    pos.* += partitions_len * 4;
+                    const partitions_items = try alloc.alloc(i32, partitions_len);
+                    for (partitions_items) |*item| {
+                        item.* = ser.readI32(buf, pos);
+                    }
+                    result.partitions = partitions_items;
                 }
             }
             return result;
@@ -95,8 +99,12 @@ pub const ConsumerProtocolSubscription = struct {
     pub fn deserialize(alloc: Allocator, buf: []const u8, pos: *usize, version: i16) !ConsumerProtocolSubscription {
         var result = ConsumerProtocolSubscription{};
         const topics_len: usize = (try ser.readArrayLen(buf, pos)) orelse 0;
-        for (0..topics_len) |_| {
-            _ = try ser.readString(buf, pos);
+        if (topics_len > 0) {
+            const topics_items = try alloc.alloc(?[]const u8, topics_len);
+            for (topics_items) |*item| {
+                item.* = try ser.readString(buf, pos);
+            }
+            result.topics = topics_items;
         }
         result.user_data = try ser.readBytes(buf, pos);
         if (version >= 1) {

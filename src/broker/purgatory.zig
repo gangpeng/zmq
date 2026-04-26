@@ -19,7 +19,7 @@ pub const TimerWheel = struct {
     allocator: Allocator,
 
     pub const Bucket = struct {
-        entries: std.ArrayList(TimerEntry),
+        entries: std.array_list.Managed(TimerEntry),
     };
 
     pub const TimerEntry = struct {
@@ -32,14 +32,14 @@ pub const TimerWheel = struct {
     pub fn init(alloc: Allocator, num_buckets: usize, tick_ms: i64) !TimerWheel {
         const buckets = try alloc.alloc(Bucket, num_buckets);
         for (buckets) |*bucket| {
-            bucket.entries = std.ArrayList(TimerEntry).init(alloc);
+            bucket.entries = std.array_list.Managed(TimerEntry).init(alloc);
         }
 
         return .{
             .buckets = buckets,
             .num_buckets = num_buckets,
             .tick_ms = tick_ms,
-            .current_time_ms = std.time.milliTimestamp(),
+            .current_time_ms = @import("time_compat").milliTimestamp(),
             .allocator = alloc,
         };
     }
@@ -53,7 +53,7 @@ pub const TimerWheel = struct {
 
     /// Schedule a delayed operation.
     pub fn schedule(self: *TimerWheel, id: u64, delay_ms: i64, callback: *const fn (u64) void) !void {
-        const deadline = std.time.milliTimestamp() + delay_ms;
+        const deadline = @import("time_compat").milliTimestamp() + delay_ms;
         const ticks_from_now: u64 = @intCast(@max(@divFloor(delay_ms, self.tick_ms), 1));
         const bucket_idx = (self.current_tick + ticks_from_now) % self.num_buckets;
 
@@ -83,7 +83,7 @@ pub const TimerWheel = struct {
                 continue;
             }
 
-            if (std.time.milliTimestamp() >= entry.deadline_ms) {
+            if (@import("time_compat").milliTimestamp() >= entry.deadline_ms) {
                 entry.callback(entry.id);
                 _ = bucket.entries.swapRemove(i);
                 self.total_timers -= 1;
@@ -159,7 +159,7 @@ test "DelayedOperation creation" {
     const op = DelayedOperation{
         .id = 42,
         .op_type = .delayed_fetch,
-        .deadline_ms = std.time.milliTimestamp() + 5000,
+        .deadline_ms = @import("time_compat").milliTimestamp() + 5000,
     };
 
     try testing.expectEqual(@as(u64, 42), op.id);

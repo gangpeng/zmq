@@ -1,6 +1,7 @@
 const std = @import("std");
 const testing = std.testing;
 const Allocator = std.mem.Allocator;
+const fs = @import("fs_compat");
 
 /// Kafka Connect — connector framework.
 ///
@@ -78,16 +79,16 @@ pub const SinkConnector = struct {
 
 /// Standalone Connect worker — runs connectors in a single process.
 pub const StandaloneWorker = struct {
-    source_connectors: std.ArrayList(SourceConnector),
-    sink_connectors: std.ArrayList(SinkConnector),
+    source_connectors: std.array_list.Managed(SourceConnector),
+    sink_connectors: std.array_list.Managed(SinkConnector),
     records_produced: u64 = 0,
     records_consumed: u64 = 0,
     allocator: Allocator,
 
     pub fn init(alloc: Allocator) StandaloneWorker {
         return .{
-            .source_connectors = std.ArrayList(SourceConnector).init(alloc),
-            .sink_connectors = std.ArrayList(SinkConnector).init(alloc),
+            .source_connectors = std.array_list.Managed(SourceConnector).init(alloc),
+            .sink_connectors = std.array_list.Managed(SinkConnector).init(alloc),
             .allocator = alloc,
         };
     }
@@ -148,7 +149,7 @@ pub const FileSourceConnector = struct {
 
     /// Read all lines from the file and return as ConnectRecords.
     pub fn readAll(self: *FileSourceConnector) ![]ConnectRecord {
-        const file = try std.fs.openFileAbsolute(self.file_path, .{});
+        const file = try fs.openFileAbsolute(self.file_path, .{});
         defer file.close();
 
         const content = try file.readToEndAlloc(self.allocator, 100 * 1024 * 1024); // max 100MB
@@ -172,7 +173,7 @@ pub const FileSourceConnector = struct {
                     records[idx] = .{
                         .topic = self.topic,
                         .value = try self.allocator.dupe(u8, line),
-                        .timestamp = std.time.milliTimestamp(),
+                        .timestamp = @import("time_compat").milliTimestamp(),
                     };
                     idx += 1;
                 }
@@ -185,7 +186,7 @@ pub const FileSourceConnector = struct {
             records[idx] = .{
                 .topic = self.topic,
                 .value = try self.allocator.dupe(u8, content[start..]),
-                .timestamp = std.time.milliTimestamp(),
+                .timestamp = @import("time_compat").milliTimestamp(),
             };
             idx += 1;
         }
@@ -210,7 +211,7 @@ pub const FileSinkConnector = struct {
 
     /// Write records to the output file.
     pub fn writeRecords(self: *FileSinkConnector, records: []const ConnectRecord) !void {
-        const file = try std.fs.createFileAbsolute(self.file_path, .{
+        const file = try fs.createFileAbsolute(self.file_path, .{
             .truncate = false,
         });
         defer file.close();
@@ -230,16 +231,16 @@ pub const FileSinkConnector = struct {
 
 /// Connector manager — manages lifecycle of all connectors.
 pub const ConnectorManager = struct {
-    workers: std.ArrayList(StandaloneWorker),
-    file_sources: std.ArrayList(FileSourceConnector),
-    file_sinks: std.ArrayList(FileSinkConnector),
+    workers: std.array_list.Managed(StandaloneWorker),
+    file_sources: std.array_list.Managed(FileSourceConnector),
+    file_sinks: std.array_list.Managed(FileSinkConnector),
     allocator: Allocator,
 
     pub fn init(alloc: Allocator) ConnectorManager {
         return .{
-            .workers = std.ArrayList(StandaloneWorker).init(alloc),
-            .file_sources = std.ArrayList(FileSourceConnector).init(alloc),
-            .file_sinks = std.ArrayList(FileSinkConnector).init(alloc),
+            .workers = std.array_list.Managed(StandaloneWorker).init(alloc),
+            .file_sources = std.array_list.Managed(FileSourceConnector).init(alloc),
+            .file_sinks = std.array_list.Managed(FileSinkConnector).init(alloc),
             .allocator = alloc,
         };
     }

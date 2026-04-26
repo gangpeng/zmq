@@ -34,15 +34,23 @@ pub const ListTransactionsRequest = struct {
         ser.writeEmptyTaggedFields(buf, pos);
     }
 
-    pub fn deserialize(_: Allocator, buf: []const u8, pos: *usize, version: i16) !ListTransactionsRequest {
+    pub fn deserialize(alloc: Allocator, buf: []const u8, pos: *usize, version: i16) !ListTransactionsRequest {
         var result = ListTransactionsRequest{};
         const state_filters_len: usize = (try ser.readCompactArrayLen(buf, pos)) orelse 0;
-        for (0..state_filters_len) |_| {
-            _ = try ser.readCompactString(buf, pos);
+        if (state_filters_len > 0) {
+            const state_filters_items = try alloc.alloc(?[]const u8, state_filters_len);
+            for (state_filters_items) |*item| {
+                item.* = try ser.readCompactString(buf, pos);
+            }
+            result.state_filters = state_filters_items;
         }
         const producer_id_filters_len: usize = (try ser.readCompactArrayLen(buf, pos)) orelse 0;
         if (producer_id_filters_len > 0) {
-            pos.* += producer_id_filters_len * 8;
+            const producer_id_filters_items = try alloc.alloc(i64, producer_id_filters_len);
+            for (producer_id_filters_items) |*item| {
+                item.* = ser.readI64(buf, pos);
+            }
+            result.producer_id_filters = producer_id_filters_items;
         }
         if (version >= 1) {
             result.duration_filter = ser.readI64(buf, pos);

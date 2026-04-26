@@ -97,6 +97,12 @@ pub fn readU8(buf: []const u8, pos: *usize) u8 {
     return val;
 }
 
+pub fn readU16(buf: []const u8, pos: *usize) u16 {
+    const val = std.mem.readInt(u16, buf[pos.*..][0..2], .big);
+    pos.* += 2;
+    return val;
+}
+
 pub fn readI16(buf: []const u8, pos: *usize) i16 {
     const val = std.mem.readInt(i16, buf[pos.*..][0..2], .big);
     pos.* += 2;
@@ -111,6 +117,12 @@ pub fn readI32(buf: []const u8, pos: *usize) i32 {
 
 pub fn readI64(buf: []const u8, pos: *usize) i64 {
     const val = std.mem.readInt(i64, buf[pos.*..][0..8], .big);
+    pos.* += 8;
+    return val;
+}
+
+pub fn readU64(buf: []const u8, pos: *usize) u64 {
+    const val = std.mem.readInt(u64, buf[pos.*..][0..8], .big);
     pos.* += 8;
     return val;
 }
@@ -258,6 +270,11 @@ pub fn writeU8(buf: []u8, pos: *usize, val: u8) void {
     pos.* += 1;
 }
 
+pub fn writeU16(buf: []u8, pos: *usize, val: u16) void {
+    std.mem.writeInt(u16, buf[pos.*..][0..2], val, .big);
+    pos.* += 2;
+}
+
 pub fn writeI8(buf: []u8, pos: *usize, val: i8) void {
     writeU8(buf, pos, @bitCast(val));
 }
@@ -274,6 +291,11 @@ pub fn writeI32(buf: []u8, pos: *usize, val: i32) void {
 
 pub fn writeI64(buf: []u8, pos: *usize, val: i64) void {
     std.mem.writeInt(i64, buf[pos.*..][0..8], val, .big);
+    pos.* += 8;
+}
+
+pub fn writeU64(buf: []u8, pos: *usize, val: u64) void {
+    std.mem.writeInt(u64, buf[pos.*..][0..8], val, .big);
     pos.* += 8;
 }
 

@@ -8,6 +8,48 @@ const std = @import("std");
 const ser = @import("../serialization.zig");
 const Allocator = std.mem.Allocator;
 
+pub const TopicPartitions = struct {
+    /// The topic ID.
+    /// Versions: 0+
+    topic_id: [16]u8 = .{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 },
+    /// The partitions.
+    /// Versions: 0+
+    partitions: []const i32 = &.{},
+
+    pub fn serialize(self: *const TopicPartitions, buf: []u8, pos: *usize, _: i16) void {
+        ser.writeUuid(buf, pos, self.topic_id);
+        ser.writeCompactArrayLen(buf, pos, self.partitions.len);
+        for (self.partitions) |item| {
+            ser.writeI32(buf, pos, item);
+        }
+        ser.writeEmptyTaggedFields(buf, pos);
+    }
+
+    pub fn deserialize(alloc: Allocator, buf: []const u8, pos: *usize, _: i16) !TopicPartitions {
+        var result = TopicPartitions{};
+        result.topic_id = try ser.readUuid(buf, pos);
+        const partitions_len: usize = (try ser.readCompactArrayLen(buf, pos)) orelse 0;
+        if (partitions_len > 0) {
+            const partitions_items = try alloc.alloc(i32, partitions_len);
+            for (partitions_items) |*item| {
+                item.* = ser.readI32(buf, pos);
+            }
+            result.partitions = partitions_items;
+        }
+        try ser.skipTaggedFields(buf, pos);
+        return result;
+    }
+
+    pub fn calcSize(self: *const TopicPartitions, _: i16) usize {
+        var size: usize = 0;
+        size += 16;
+        size += ser.unsignedVarintSize(self.partitions.len + 1);
+        size += self.partitions.len * 4;
+        size += 1;
+        return size;
+    }
+};
+
 pub const ConsumerGroupHeartbeatResponse = struct {
     pub const Assignment = struct {
         /// The partitions assigned to the member that can be used immediately.
@@ -22,17 +64,26 @@ pub const ConsumerGroupHeartbeatResponse = struct {
             ser.writeEmptyTaggedFields(buf, pos);
         }
 
-        pub fn deserialize(_: Allocator, buf: []const u8, pos: *usize, _: i16) !Assignment {
+        pub fn deserialize(alloc: Allocator, buf: []const u8, pos: *usize, version: i16) !Assignment {
             var result = Assignment{};
             const topic_partitions_len: usize = (try ser.readCompactArrayLen(buf, pos)) orelse 0;
-            _ = topic_partitions_len;
+            if (topic_partitions_len > 0) {
+                const topic_partitions_items = try alloc.alloc(TopicPartitions, topic_partitions_len);
+                for (topic_partitions_items) |*item| {
+                    item.* = try TopicPartitions.deserialize(alloc, buf, pos, version);
+                }
+                result.topic_partitions = topic_partitions_items;
+            }
             try ser.skipTaggedFields(buf, pos);
             return result;
         }
 
-        pub fn calcSize(self: *const Assignment, _: i16) usize {
+        pub fn calcSize(self: *const Assignment, version: i16) usize {
             var size: usize = 0;
             size += ser.unsignedVarintSize(self.topic_partitions.len + 1);
+            for (self.topic_partitions) |item| {
+                size += item.calcSize(version);
+            }
             size += 1;
             return size;
         }
@@ -58,7 +109,7 @@ pub const ConsumerGroupHeartbeatResponse = struct {
     heartbeat_interval_ms: i32 = 0,
     /// null if not provided; the assignment otherwise.
     /// Versions: 0+
-    assignment: Assignment = null,
+    assignment: ?Assignment = null,
 
     pub fn serialize(self: *const ConsumerGroupHeartbeatResponse, buf: []u8, pos: *usize, version: i16) void {
         ser.writeI32(buf, pos, self.throttle_time_ms);
@@ -67,7 +118,12 @@ pub const ConsumerGroupHeartbeatResponse = struct {
         ser.writeCompactString(buf, pos, self.member_id);
         ser.writeI32(buf, pos, self.member_epoch);
         ser.writeI32(buf, pos, self.heartbeat_interval_ms);
-        self.assignment.serialize(buf, pos, version);
+        if (self.assignment) |value| {
+            ser.writeUnsignedVarint(buf, pos, 1);
+            value.serialize(buf, pos, version);
+        } else {
+            ser.writeUnsignedVarint(buf, pos, 0);
+        }
         ser.writeEmptyTaggedFields(buf, pos);
     }
 
@@ -79,7 +135,9 @@ pub const ConsumerGroupHeartbeatResponse = struct {
         result.member_id = try ser.readCompactString(buf, pos);
         result.member_epoch = ser.readI32(buf, pos);
         result.heartbeat_interval_ms = ser.readI32(buf, pos);
-        result.assignment = try Assignment.deserialize(alloc, buf, pos, version);
+        if ((try ser.readUnsignedVarint(buf, pos)) != 0) {
+            result.assignment = try Assignment.deserialize(alloc, buf, pos, version);
+        }
         try ser.skipTaggedFields(buf, pos);
         return result;
     }
@@ -92,7 +150,11 @@ pub const ConsumerGroupHeartbeatResponse = struct {
         size += ser.compactStringSize(self.member_id);
         size += 4;
         size += 4;
-        size += self.assignment.calcSize(version);
+        if (self.assignment) |value| {
+            size += 1 + value.calcSize(version);
+        } else {
+            size += 1;
+        }
         size += 1;
         return size;
     }

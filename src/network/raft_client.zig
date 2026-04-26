@@ -2,10 +2,12 @@ const std = @import("std");
 const posix = std.posix;
 const log = std.log.scoped(.raft_client);
 const Allocator = std.mem.Allocator;
-const ser = @import("../protocol/serialization.zig");
-const header_mod = @import("../protocol/header.zig");
-const OpenSslLib = @import("../security/openssl.zig").OpenSslLib;
-const TlsClientContext = @import("../security/tls.zig").TlsClientContext;
+const net = @import("net_compat");
+const protocol = @import("protocol");
+const ser = protocol.serialization;
+const header_mod = protocol.header;
+const OpenSslLib = @import("security").openssl.OpenSslLib;
+const TlsClientContext = @import("security").tls.TlsClientContext;
 
 /// RPC client for sending Raft protocol messages to other brokers.
 /// Each RaftClient represents a connection to a single peer broker.
@@ -52,7 +54,7 @@ pub const RaftClient = struct {
             self.openssl = null;
         }
         if (self.fd) |fd| {
-            posix.close(fd);
+            @import("posix_compat").close(fd);
             self.fd = null;
         }
     }
@@ -63,10 +65,8 @@ pub const RaftClient = struct {
         if (self.fd != null) return;
 
         // Try numeric IP first, fall back to DNS resolution for hostnames (e.g. "node0" in Docker)
-        const addr = std.net.Address.parseIp4(self.host, self.port) catch blk: {
-            const host_z = std.fmt.allocPrintZ(self.allocator, "{s}", .{self.host}) catch return error.OutOfMemory;
-            defer self.allocator.free(host_z);
-            const addr_list = std.net.getAddressList(self.allocator, host_z, self.port) catch |err| {
+        const addr = net.Address.parseIp4(self.host, self.port) catch blk: {
+            const addr_list = net.getAddressList(self.allocator, self.host, self.port) catch |err| {
                 log.warn("DNS resolution failed for {s}:{d}: {}", .{ self.host, self.port, err });
                 return error.ConnectionRefused;
             };
@@ -77,10 +77,10 @@ pub const RaftClient = struct {
             }
             break :blk addr_list.addrs[0];
         };
-        const fd = try posix.socket(addr.any.family, posix.SOCK.STREAM, 0);
+        const fd = try @import("posix_compat").socket(addr.any.family, posix.SOCK.STREAM, 0);
 
-        posix.connect(fd, &addr.any, addr.getOsSockLen()) catch |err| {
-            posix.close(fd);
+        @import("posix_compat").connect(fd, &addr.any, addr.getOsSockLen()) catch |err| {
+            @import("posix_compat").close(fd);
             return err;
         };
 
@@ -92,7 +92,7 @@ pub const RaftClient = struct {
             if (tls.initialized) {
                 const ssl = tls.wrapConnection(fd) catch |err| {
                     log.warn("TLS handshake to peer {d} failed: {}", .{ self.peer_id, err });
-                    posix.close(fd);
+                    @import("posix_compat").close(fd);
                     self.fd = null;
                     return error.ConnectionRefused;
                 };
@@ -113,7 +113,7 @@ pub const RaftClient = struct {
             log.warn("SSL_write failed: ssl_error={d}", .{ssl_err});
             return error.WriteError;
         }
-        return posix.send(self.fd.?, data, 0);
+        return @import("posix_compat").send(self.fd.?, data, 0);
     }
 
     /// Receive data from the connection, using SSL_read if TLS is active.
@@ -128,7 +128,7 @@ pub const RaftClient = struct {
             log.warn("SSL_read failed: ssl_error={d}", .{ssl_err});
             return error.ReadError;
         }
-        return posix.recv(self.fd.?, buf, 0);
+        return @import("posix_compat").recv(self.fd.?, buf, 0);
     }
 
     /// Send a Vote request (API key 52) and get the response.

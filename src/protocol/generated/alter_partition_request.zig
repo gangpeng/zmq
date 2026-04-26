@@ -99,7 +99,11 @@ pub const AlterPartitionRequest = struct {
                 result.leader_epoch = ser.readI32(buf, pos);
                 const new_isr_len: usize = (try ser.readCompactArrayLen(buf, pos)) orelse 0;
                 if (new_isr_len > 0) {
-                    pos.* += new_isr_len * 4;
+                    const new_isr_items = try alloc.alloc(i32, new_isr_len);
+                    for (new_isr_items) |*item| {
+                        item.* = ser.readI32(buf, pos);
+                    }
+                    result.new_isr = new_isr_items;
                 }
                 if (version >= 3) {
                     const new_isr_with_epochs_len: usize = (try ser.readCompactArrayLen(buf, pos)) orelse 0;

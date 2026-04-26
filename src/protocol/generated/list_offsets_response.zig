@@ -53,7 +53,7 @@ pub const ListOffsetsResponse = struct {
                 if (version >= 6) ser.writeEmptyTaggedFields(buf, pos);
             }
 
-            pub fn deserialize(_: Allocator, buf: []const u8, pos: *usize, version: i16) !ListOffsetsPartitionResponse {
+            pub fn deserialize(alloc: Allocator, buf: []const u8, pos: *usize, version: i16) !ListOffsetsPartitionResponse {
                 var result = ListOffsetsPartitionResponse{};
                 result.partition_index = ser.readI32(buf, pos);
                 result.error_code = ser.readI16(buf, pos);
@@ -62,7 +62,11 @@ pub const ListOffsetsResponse = struct {
                 else
                     (try ser.readArrayLen(buf, pos)) orelse 0;
                 if (old_style_offsets_len > 0) {
-                    pos.* += old_style_offsets_len * 8;
+                    const old_style_offsets_items = try alloc.alloc(i64, old_style_offsets_len);
+                    for (old_style_offsets_items) |*item| {
+                        item.* = ser.readI64(buf, pos);
+                    }
+                    result.old_style_offsets = old_style_offsets_items;
                 }
                 if (version >= 1) {
                     result.timestamp = ser.readI64(buf, pos);

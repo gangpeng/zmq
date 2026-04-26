@@ -25,12 +25,16 @@ pub const ConsumerProtocolAssignment = struct {
             }
         }
 
-        pub fn deserialize(_: Allocator, buf: []const u8, pos: *usize, _: i16) !TopicPartition {
+        pub fn deserialize(alloc: Allocator, buf: []const u8, pos: *usize, _: i16) !TopicPartition {
             var result = TopicPartition{};
             result.topic = try ser.readString(buf, pos);
             const partitions_len: usize = (try ser.readArrayLen(buf, pos)) orelse 0;
             if (partitions_len > 0) {
-                pos.* += partitions_len * 4;
+                const partitions_items = try alloc.alloc(i32, partitions_len);
+                for (partitions_items) |*item| {
+                    item.* = ser.readI32(buf, pos);
+                }
+                result.partitions = partitions_items;
             }
             return result;
         }

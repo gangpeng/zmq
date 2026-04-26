@@ -142,9 +142,9 @@ pub fn produceMessage(alloc: Allocator, host: []const u8, port: u16, topic: []co
     rpos += 2;
     std.mem.writeInt(i32, record_buf[rpos..][0..4], 0, .big); // lastOffsetDelta
     rpos += 4;
-    std.mem.writeInt(i64, record_buf[rpos..][0..8], std.time.milliTimestamp(), .big); // baseTimestamp
+    std.mem.writeInt(i64, record_buf[rpos..][0..8], @import("time_compat").milliTimestamp(), .big); // baseTimestamp
     rpos += 8;
-    std.mem.writeInt(i64, record_buf[rpos..][0..8], std.time.milliTimestamp(), .big); // maxTimestamp
+    std.mem.writeInt(i64, record_buf[rpos..][0..8], @import("time_compat").milliTimestamp(), .big); // maxTimestamp
     rpos += 8;
     std.mem.writeInt(i64, record_buf[rpos..][0..8], -1, .big); // producerId
     rpos += 8;

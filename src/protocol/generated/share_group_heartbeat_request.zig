@@ -37,15 +37,19 @@ pub const ShareGroupHeartbeatRequest = struct {
         ser.writeEmptyTaggedFields(buf, pos);
     }
 
-    pub fn deserialize(_: Allocator, buf: []const u8, pos: *usize, _: i16) !ShareGroupHeartbeatRequest {
+    pub fn deserialize(alloc: Allocator, buf: []const u8, pos: *usize, _: i16) !ShareGroupHeartbeatRequest {
         var result = ShareGroupHeartbeatRequest{};
         result.group_id = try ser.readCompactString(buf, pos);
         result.member_id = try ser.readCompactString(buf, pos);
         result.member_epoch = ser.readI32(buf, pos);
         result.rack_id = try ser.readCompactString(buf, pos);
         const subscribed_topic_names_len: usize = (try ser.readCompactArrayLen(buf, pos)) orelse 0;
-        for (0..subscribed_topic_names_len) |_| {
-            _ = try ser.readCompactString(buf, pos);
+        if (subscribed_topic_names_len > 0) {
+            const subscribed_topic_names_items = try alloc.alloc(?[]const u8, subscribed_topic_names_len);
+            for (subscribed_topic_names_items) |*item| {
+                item.* = try ser.readCompactString(buf, pos);
+            }
+            result.subscribed_topic_names = subscribed_topic_names_items;
         }
         try ser.skipTaggedFields(buf, pos);
         return result;

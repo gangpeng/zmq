@@ -42,7 +42,7 @@ pub const DescribeConfigsRequest = struct {
             if (version >= 4) ser.writeEmptyTaggedFields(buf, pos);
         }
 
-        pub fn deserialize(_: Allocator, buf: []const u8, pos: *usize, version: i16) !DescribeConfigsResource {
+        pub fn deserialize(alloc: Allocator, buf: []const u8, pos: *usize, version: i16) !DescribeConfigsResource {
             var result = DescribeConfigsResource{};
             result.resource_type = ser.readI8(buf, pos);
             result.resource_name = if (version >= 4)
@@ -53,12 +53,15 @@ pub const DescribeConfigsRequest = struct {
                 (try ser.readCompactArrayLen(buf, pos)) orelse 0
             else
                 (try ser.readArrayLen(buf, pos)) orelse 0;
-            for (0..configuration_keys_len) |_| {
-                if (version >= 4) {
-                    _ = try ser.readCompactString(buf, pos);
-                } else {
-                    _ = try ser.readString(buf, pos);
+            if (configuration_keys_len > 0) {
+                const configuration_keys_items = try alloc.alloc(?[]const u8, configuration_keys_len);
+                for (configuration_keys_items) |*item| {
+                    item.* = if (version >= 4)
+                        try ser.readCompactString(buf, pos)
+                    else
+                        try ser.readString(buf, pos);
                 }
+                result.configuration_keys = configuration_keys_items;
             }
             if (version >= 4) try ser.skipTaggedFields(buf, pos);
             return result;

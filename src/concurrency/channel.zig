@@ -21,9 +21,9 @@ pub fn Channel(comptime T: type) type {
         tail: usize, // write position
         count: usize,
         capacity: usize,
-        mutex: std.Thread.Mutex,
-        not_empty: std.Thread.Condition,
-        not_full: std.Thread.Condition,
+        mutex: @import("mutex_compat").Mutex,
+        not_empty: @import("mutex_compat").Condition,
+        not_full: @import("mutex_compat").Condition,
         closed: bool,
         allocator: Allocator,
 

@@ -25,7 +25,7 @@ pub const TrackingAllocator = struct {
 
     const AllocationInfo = struct {
         size: usize,
-        alignment: u8,
+        alignment: std.mem.Alignment,
     };
 
     pub fn init(backing: Allocator) TrackingAllocator {
@@ -50,6 +50,7 @@ pub const TrackingAllocator = struct {
             .vtable = &.{
                 .alloc = alloc,
                 .resize = resize,
+                .remap = remap,
                 .free = free,
             },
         };
@@ -77,7 +78,7 @@ pub const TrackingAllocator = struct {
         };
     }
 
-    fn alloc(ctx: *anyopaque, len: usize, ptr_align: u8, _: usize) ?[*]u8 {
+    fn alloc(ctx: *anyopaque, len: usize, ptr_align: std.mem.Alignment, _: usize) ?[*]u8 {
         const self: *TrackingAllocator = @ptrCast(@alignCast(ctx));
         const result = self.backing.rawAlloc(len, ptr_align, @returnAddress()) orelse return null;
 
@@ -98,7 +99,7 @@ pub const TrackingAllocator = struct {
         return result;
     }
 
-    fn resize(ctx: *anyopaque, buf: []u8, buf_align: u8, new_len: usize, _: usize) bool {
+    fn resize(ctx: *anyopaque, buf: []u8, buf_align: std.mem.Alignment, new_len: usize, _: usize) bool {
         const self: *TrackingAllocator = @ptrCast(@alignCast(ctx));
 
         if (self.backing.rawResize(buf, buf_align, new_len, @returnAddress())) {
@@ -116,7 +117,29 @@ pub const TrackingAllocator = struct {
         return false;
     }
 
-    fn free(ctx: *anyopaque, buf: []u8, buf_align: u8, _: usize) void {
+    fn remap(ctx: *anyopaque, buf: []u8, buf_align: std.mem.Alignment, new_len: usize, _: usize) ?[*]u8 {
+        const self: *TrackingAllocator = @ptrCast(@alignCast(ctx));
+
+        const result = self.backing.rawRemap(buf, buf_align, new_len, @returnAddress()) orelse return null;
+        const old_addr = @intFromPtr(buf.ptr);
+        const new_addr = @intFromPtr(result);
+
+        if (self.allocations.fetchRemove(old_addr)) |entry| {
+            self.current_usage -= entry.value.size;
+            self.current_usage += new_len;
+            self.allocations.put(new_addr, .{
+                .size = new_len,
+                .alignment = buf_align,
+            }) catch {};
+            if (self.current_usage > self.peak_usage) {
+                self.peak_usage = self.current_usage;
+            }
+        }
+
+        return result;
+    }
+
+    fn free(ctx: *anyopaque, buf: []u8, buf_align: std.mem.Alignment, _: usize) void {
         const self: *TrackingAllocator = @ptrCast(@alignCast(ctx));
 
         const addr = @intFromPtr(buf.ptr);

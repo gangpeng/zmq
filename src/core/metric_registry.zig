@@ -25,7 +25,7 @@ pub const MetricRegistry = struct {
     /// Metadata for labeled gauge families (keyed by base name)
     labeled_gauge_meta: std.StringHashMap(LabeledMeta),
     allocator: Allocator,
-    mutex: std.Thread.Mutex = .{},
+    mutex: @import("mutex_compat").Mutex = .{},
 
     pub const Counter = struct {
         name: []u8,
@@ -363,9 +363,9 @@ pub const MetricRegistry = struct {
 
     /// Build a label key like: "name{label1=\"val1\",label2=\"val2\"}"
     fn buildLabelKey(alloc: Allocator, name: []const u8, label_values: []const []const u8) ![]u8 {
-        var buf = std.ArrayList(u8).init(alloc);
+        var buf = std.array_list.Managed(u8).init(alloc);
         errdefer buf.deinit();
-        const writer = buf.writer();
+        const writer = @import("list_compat").writer(&buf);
         try writer.writeAll(name);
         try writer.writeByte('{');
         for (label_values, 0..) |val, i| {
@@ -381,8 +381,8 @@ pub const MetricRegistry = struct {
         self.mutex.lock();
         defer self.mutex.unlock();
 
-        var buf = std.ArrayList(u8).init(alloc);
-        const writer = buf.writer();
+        var buf = std.array_list.Managed(u8).init(alloc);
+        const writer = @import("list_compat").writer(&buf);
 
         // Counters
         var cit = self.counters.iterator();
@@ -532,9 +532,9 @@ pub const MetricRegistry = struct {
         if (label_part.len < 2) return try self.allocator.dupe(u8, "");
         const inner = label_part[1 .. label_part.len - 1]; // strip { and }
 
-        var result = std.ArrayList(u8).init(self.allocator);
+        var result = std.array_list.Managed(u8).init(self.allocator);
         errdefer result.deinit();
-        const writer = result.writer();
+        const writer = @import("list_compat").writer(&result);
 
         var val_iter = std.mem.splitSequence(u8, inner, ",");
         var i: usize = 0;

@@ -78,7 +78,9 @@ def type_to_zig(kafka_type, nullable=False):
         'records': '?[]const u8',
         'uuid': '[16]u8',
     }
-    return type_map.get(base, base)
+    if base in type_map:
+        return type_map[base]
+    return f'?{base}' if nullable else base
 
 
 def is_primitive(kafka_type):
@@ -247,19 +249,20 @@ def has_any_non_tagged_fields(fields):
 
 def needs_allocator(fields):
     """Check if deserialization needs an allocator.
-    True if any field is an array of structs (needs alloc for slice allocation)
-    or a nested struct (even non-array, since the nested struct's deserialize
+    True if any field is an array (needs alloc for slice allocation) or a
+    nested/common struct (even non-array, since the nested struct's deserialize
     takes an allocator parameter)."""
     for f in fields:
         if 'tag' in f:
             continue
         kafka_type = f['type']
         inner = kafka_type[2:] if kafka_type.startswith('[]') else kafka_type
-        # Array of structs — needs alloc to allocate the slice
-        if kafka_type.startswith('[]') and not is_primitive(inner) and 'fields' in f:
+        # Arrays are materialized instead of skipped so deserialized messages
+        # round-trip and tests catch bad array handling.
+        if kafka_type.startswith('[]'):
             return True
-        # Non-array nested struct — needs to forward alloc
-        if not kafka_type.startswith('[]') and not is_primitive(inner) and 'fields' in f:
+        # Non-array nested/common struct — needs to forward alloc
+        if not kafka_type.startswith('[]') and not is_primitive(inner):
             return True
     return False
 
@@ -291,6 +294,7 @@ class CodeGen:
         self.valid_versions = schema.get('validVersions', '0')
         self.flexible_versions = schema.get('flexibleVersions', 'none')
         self.fields = schema.get('fields', [])
+        self.common_structs = schema.get('commonStructs', [])
 
         self.min_ver, self.max_ver = parse_version_range(self.valid_versions)
         self.flex_min, _ = parse_version_range(self.flexible_versions)
@@ -316,6 +320,10 @@ class CodeGen:
         lines.append('const ser = @import("../serialization.zig");')
         lines.append('const Allocator = std.mem.Allocator;')
         lines.append('')
+
+        for common in self.common_structs:
+            lines.extend(self._gen_struct(common['name'], common.get('fields', []), 0))
+            lines.append('')
 
         lines.extend(self._gen_struct(self.name, self.fields, 0))
         lines.append('')
@@ -359,14 +367,14 @@ class CodeGen:
                 if kafka_type.startswith('[]'):
                     zig_type = f'[]const {inner}'  # always non-nullable arrays
                 else:
-                    zig_type = inner
+                    zig_type = f'?{inner}' if nullable else inner
 
             default = default_value_zig(kafka_type, field.get('default'), nullable)
             # All arrays default to empty slice
             if kafka_type.startswith('[]'):
                 default = '&.{}'
 
-            lines.append(f'{pad}    /// {about}')
+            lines.append(f'{pad}    /// {about}' if about else f'{pad}    ///')
             lines.append(f'{pad}    /// Versions: {versions}')
             lines.append(f'{pad}    {zig_name}: {zig_type} = {default},')
 
@@ -489,7 +497,7 @@ class CodeGen:
                 uses_version = True
             # Nested structs or struct arrays forward version
             inner = kafka_type[2:] if kafka_type.startswith('[]') else kafka_type
-            if not is_primitive(inner) and 'fields' in field:
+            if not is_primitive(inner):
                 uses_version = True  # Forward version to inner struct's serialize
             if kafka_type.startswith('[]') and not is_primitive(inner):
                 uses_version = True  # Forward version to array element serialize
@@ -521,9 +529,18 @@ class CodeGen:
                 # Array of primitives
                 prim_type = kafka_type[2:]
                 self._gen_write_array_of_primitives(lines, extra_pad, field_expr, prim_type)
-            elif not is_primitive(kafka_type) and 'fields' in field:
-                # Nested struct (non-array)
-                lines.append(f'{extra_pad}{field_expr}.serialize(buf, pos, version);')
+            elif not is_primitive(kafka_type):
+                # Nested/common struct (non-array)
+                nullable = 'nullableVersions' in field
+                if nullable:
+                    lines.append(f'{extra_pad}if ({field_expr}) |value| {{')
+                    lines.append(f'{extra_pad}    ser.writeUnsignedVarint(buf, pos, 1);')
+                    lines.append(f'{extra_pad}    value.serialize(buf, pos, version);')
+                    lines.append(f'{extra_pad}}} else {{')
+                    lines.append(f'{extra_pad}    ser.writeUnsignedVarint(buf, pos, 0);')
+                    lines.append(f'{extra_pad}}}')
+                else:
+                    lines.append(f'{extra_pad}{field_expr}.serialize(buf, pos, version);')
             else:
                 # Primitive / string / bytes
                 self._gen_write_primitive(lines, extra_pad, field_expr, kafka_type)
@@ -600,7 +617,7 @@ class CodeGen:
                 uses_version = True
             # Nested structs or struct arrays forward version
             inner = kafka_type[2:] if kafka_type.startswith('[]') else kafka_type
-            if not is_primitive(inner) and 'fields' in field:
+            if not is_primitive(inner):
                 uses_version = True
 
         version_param = 'version: i16' if uses_version else '_: i16'
@@ -633,9 +650,14 @@ class CodeGen:
 
             if kafka_type.startswith('[]'):
                 self._gen_read_array(lines, extra_pad, zig_name, inner, field, nullable)
-            elif not is_primitive(kafka_type) and 'fields' in field:
-                # Nested struct (non-array)
-                lines.append(f'{extra_pad}result.{zig_name} = try {inner}.deserialize(alloc, buf, pos, version);')
+            elif not is_primitive(kafka_type):
+                # Nested/common struct (non-array)
+                if nullable:
+                    lines.append(f'{extra_pad}if ((try ser.readUnsignedVarint(buf, pos)) != 0) {{')
+                    lines.append(f'{extra_pad}    result.{zig_name} = try {inner}.deserialize(alloc, buf, pos, version);')
+                    lines.append(f'{extra_pad}}}')
+                else:
+                    lines.append(f'{extra_pad}result.{zig_name} = try {inner}.deserialize(alloc, buf, pos, version);')
             elif kafka_type in ('string', 'bytes', 'records') and self._has_flex_versions():
                 fc = self._flex_check()
                 read_flex, _ = get_read_expr(kafka_type, True, nullable)
@@ -667,8 +689,9 @@ class CodeGen:
     def _gen_read_array(self, lines, pad, zig_name, inner, field, nullable):
         """Generate array deserialization with proper allocation."""
         kafka_type = field['type']
-        is_struct = not is_primitive(inner) and 'fields' in field
+        is_struct = not is_primitive(inner)
         fc = self._flex_check()
+        item_type = type_to_zig(inner)
 
         # Read array length
         if fc:
@@ -691,30 +714,32 @@ class CodeGen:
             lines.append(f'{pad}    result.{zig_name} = {zig_name}_items;')
             lines.append(f'{pad}}}')
         else:
-            # Array of primitives — skip elements by advancing pos
-            prim_size = get_fixed_size(inner)
-            if prim_size is not None:
-                lines.append(f'{pad}if ({zig_name}_len > 0) {{')
-                lines.append(f'{pad}    pos.* += {zig_name}_len * {prim_size};')
-                lines.append(f'{pad}}}')
-            elif inner in ('string', 'bytes', 'records'):
-                # Variable-length: skip each element
-                read_flex, _ = get_read_expr(inner, True)
-                read_nonflex, _ = get_read_expr(inner, False)
-                lines.append(f'{pad}for (0..{zig_name}_len) |_| {{')
+            # Array of primitives — allocate and read elements.
+            read_flex, flex_needs_try = get_read_expr(inner, True)
+            read_nonflex, nonflex_needs_try = get_read_expr(inner, False)
+            lines.append(f'{pad}if ({zig_name}_len > 0) {{')
+            lines.append(f'{pad}    const {zig_name}_items = try alloc.alloc({item_type}, {zig_name}_len);')
+            lines.append(f'{pad}    for ({zig_name}_items) |*item| {{')
+            if inner in ('string', 'bytes', 'records'):
                 if fc:
-                    lines.append(f'{pad}    if ({fc}) {{')
-                    lines.append(f'{pad}        _ = try {read_flex};')
-                    lines.append(f'{pad}    }} else {{')
-                    lines.append(f'{pad}        _ = try {read_nonflex};')
-                    lines.append(f'{pad}    }}')
+                    lines.append(f'{pad}        item.* = if ({fc})')
+                    lines.append(f'{pad}            try {read_flex}')
+                    lines.append(f'{pad}        else')
+                    lines.append(f'{pad}            try {read_nonflex};')
                 elif self._is_always_flexible():
-                    lines.append(f'{pad}    _ = try {read_flex};')
+                    lines.append(f'{pad}        item.* = try {read_flex};')
                 else:
-                    lines.append(f'{pad}    _ = try {read_nonflex};')
-                lines.append(f'{pad}}}')
+                    lines.append(f'{pad}        item.* = try {read_nonflex};')
             else:
-                lines.append(f'{pad}_ = {zig_name}_len;')
+                if read_nonflex:
+                    prefix = 'try ' if nonflex_needs_try else ''
+                    lines.append(f'{pad}        item.* = {prefix}{read_nonflex};')
+                elif read_flex:
+                    prefix = 'try ' if flex_needs_try else ''
+                    lines.append(f'{pad}        item.* = {prefix}{read_flex};')
+            lines.append(f'{pad}    }}')
+            lines.append(f'{pad}    result.{zig_name} = {zig_name}_items;')
+            lines.append(f'{pad}}}')
 
     def _gen_calc_size(self, struct_name, fields, indent):
         """Generate calcSize method."""
@@ -740,7 +765,7 @@ class CodeGen:
                 if self._flex_check() is not None:
                     uses_version = True
             inner = kafka_type[2:] if kafka_type.startswith('[]') else kafka_type
-            if not is_primitive(inner) and 'fields' in field:
+            if not is_primitive(inner):
                 uses_self = True
                 uses_version = True  # Forward version to inner struct's calcSize
 
@@ -763,9 +788,17 @@ class CodeGen:
 
             if kafka_type.startswith('[]'):
                 self._gen_size_array(lines, extra_pad, field_expr, inner, field)
-            elif not is_primitive(kafka_type) and 'fields' in field:
-                # Nested struct
-                lines.append(f'{extra_pad}size += {field_expr}.calcSize(version);')
+            elif not is_primitive(kafka_type):
+                # Nested/common struct
+                nullable = 'nullableVersions' in field
+                if nullable:
+                    lines.append(f'{extra_pad}if ({field_expr}) |value| {{')
+                    lines.append(f'{extra_pad}    size += 1 + value.calcSize(version);')
+                    lines.append(f'{extra_pad}}} else {{')
+                    lines.append(f'{extra_pad}    size += 1;')
+                    lines.append(f'{extra_pad}}}')
+                else:
+                    lines.append(f'{extra_pad}size += {field_expr}.calcSize(version);')
             elif kafka_type in ('string', 'bytes', 'records') and self._has_flex_versions():
                 sz_flex = get_size_expr(kafka_type, True, field_expr)
                 sz_nonflex = get_size_expr(kafka_type, False, field_expr)
@@ -789,7 +822,7 @@ class CodeGen:
 
     def _gen_size_array(self, lines, pad, field_expr, inner, field):
         """Generate size computation for an array field."""
-        is_struct = not is_primitive(inner) and 'fields' in field
+        is_struct = not is_primitive(inner)
 
         # Array length encoding size
         self._gen_flex_branch(lines, pad,

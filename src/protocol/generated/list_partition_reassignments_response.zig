@@ -41,20 +41,32 @@ pub const ListPartitionReassignmentsResponse = struct {
                 ser.writeEmptyTaggedFields(buf, pos);
             }
 
-            pub fn deserialize(_: Allocator, buf: []const u8, pos: *usize, _: i16) !OngoingPartitionReassignment {
+            pub fn deserialize(alloc: Allocator, buf: []const u8, pos: *usize, _: i16) !OngoingPartitionReassignment {
                 var result = OngoingPartitionReassignment{};
                 result.partition_index = ser.readI32(buf, pos);
                 const replicas_len: usize = (try ser.readCompactArrayLen(buf, pos)) orelse 0;
                 if (replicas_len > 0) {
-                    pos.* += replicas_len * 4;
+                    const replicas_items = try alloc.alloc(i32, replicas_len);
+                    for (replicas_items) |*item| {
+                        item.* = ser.readI32(buf, pos);
+                    }
+                    result.replicas = replicas_items;
                 }
                 const adding_replicas_len: usize = (try ser.readCompactArrayLen(buf, pos)) orelse 0;
                 if (adding_replicas_len > 0) {
-                    pos.* += adding_replicas_len * 4;
+                    const adding_replicas_items = try alloc.alloc(i32, adding_replicas_len);
+                    for (adding_replicas_items) |*item| {
+                        item.* = ser.readI32(buf, pos);
+                    }
+                    result.adding_replicas = adding_replicas_items;
                 }
                 const removing_replicas_len: usize = (try ser.readCompactArrayLen(buf, pos)) orelse 0;
                 if (removing_replicas_len > 0) {
-                    pos.* += removing_replicas_len * 4;
+                    const removing_replicas_items = try alloc.alloc(i32, removing_replicas_len);
+                    for (removing_replicas_items) |*item| {
+                        item.* = ser.readI32(buf, pos);
+                    }
+                    result.removing_replicas = removing_replicas_items;
                 }
                 try ser.skipTaggedFields(buf, pos);
                 return result;

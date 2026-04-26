@@ -29,18 +29,21 @@ pub const DeleteGroupsRequest = struct {
         if (version >= 2) ser.writeEmptyTaggedFields(buf, pos);
     }
 
-    pub fn deserialize(_: Allocator, buf: []const u8, pos: *usize, version: i16) !DeleteGroupsRequest {
+    pub fn deserialize(alloc: Allocator, buf: []const u8, pos: *usize, version: i16) !DeleteGroupsRequest {
         var result = DeleteGroupsRequest{};
         const groups_names_len: usize = if (version >= 2)
             (try ser.readCompactArrayLen(buf, pos)) orelse 0
         else
             (try ser.readArrayLen(buf, pos)) orelse 0;
-        for (0..groups_names_len) |_| {
-            if (version >= 2) {
-                _ = try ser.readCompactString(buf, pos);
-            } else {
-                _ = try ser.readString(buf, pos);
+        if (groups_names_len > 0) {
+            const groups_names_items = try alloc.alloc(?[]const u8, groups_names_len);
+            for (groups_names_items) |*item| {
+                item.* = if (version >= 2)
+                    try ser.readCompactString(buf, pos)
+                else
+                    try ser.readString(buf, pos);
             }
+            result.groups_names = groups_names_items;
         }
         if (version >= 2) try ser.skipTaggedFields(buf, pos);
         return result;

@@ -56,7 +56,7 @@ pub const GetTelemetrySubscriptionsResponse = struct {
         ser.writeEmptyTaggedFields(buf, pos);
     }
 
-    pub fn deserialize(_: Allocator, buf: []const u8, pos: *usize, _: i16) !GetTelemetrySubscriptionsResponse {
+    pub fn deserialize(alloc: Allocator, buf: []const u8, pos: *usize, _: i16) !GetTelemetrySubscriptionsResponse {
         var result = GetTelemetrySubscriptionsResponse{};
         result.throttle_time_ms = ser.readI32(buf, pos);
         result.error_code = ser.readI16(buf, pos);
@@ -64,14 +64,22 @@ pub const GetTelemetrySubscriptionsResponse = struct {
         result.subscription_id = ser.readI32(buf, pos);
         const accepted_compression_types_len: usize = (try ser.readCompactArrayLen(buf, pos)) orelse 0;
         if (accepted_compression_types_len > 0) {
-            pos.* += accepted_compression_types_len * 1;
+            const accepted_compression_types_items = try alloc.alloc(i8, accepted_compression_types_len);
+            for (accepted_compression_types_items) |*item| {
+                item.* = ser.readI8(buf, pos);
+            }
+            result.accepted_compression_types = accepted_compression_types_items;
         }
         result.push_interval_ms = ser.readI32(buf, pos);
         result.telemetry_max_bytes = ser.readI32(buf, pos);
         result.delta_temporality = try ser.readBool(buf, pos);
         const requested_metrics_len: usize = (try ser.readCompactArrayLen(buf, pos)) orelse 0;
-        for (0..requested_metrics_len) |_| {
-            _ = try ser.readCompactString(buf, pos);
+        if (requested_metrics_len > 0) {
+            const requested_metrics_items = try alloc.alloc(?[]const u8, requested_metrics_len);
+            for (requested_metrics_items) |*item| {
+                item.* = try ser.readCompactString(buf, pos);
+            }
+            result.requested_metrics = requested_metrics_items;
         }
         try ser.skipTaggedFields(buf, pos);
         return result;

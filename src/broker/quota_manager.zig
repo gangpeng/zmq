@@ -84,7 +84,7 @@ pub const QuotaManager = struct {
 
     fn recordAndThrottle(self: *QuotaManager, client_id: []const u8, bytes: u64, qtype: QuotaType) i32 {
         const quota = self.client_quotas.getPtr(client_id) orelse return 0;
-        const now = std.time.milliTimestamp();
+        const now = @import("time_compat").milliTimestamp();
 
         const window = switch (qtype) {
             .produce => &quota.produce_window,

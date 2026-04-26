@@ -1,9 +1,9 @@
 const std = @import("std");
 const testing = std.testing;
 const Allocator = std.mem.Allocator;
-const fs = std.fs;
+const fs = @import("fs_compat");
 const log = std.log.scoped(.raft);
-const MetricRegistry = @import("../core/metric_registry.zig").MetricRegistry;
+const MetricRegistry = @import("core").MetricRegistry;
 
 /// KRaft Raft consensus state machine.
 ///
@@ -598,7 +598,7 @@ pub const RaftState = struct {
         if (response.success) {
             voter.match_index = response.match_index;
             voter.next_index = response.match_index + 1;
-            voter.last_heartbeat_ms = std.time.milliTimestamp();
+            voter.last_heartbeat_ms = @import("time_compat").milliTimestamp();
 
             // Recompute commit index after match_index update
             self.updateCommitIndex();
@@ -882,7 +882,7 @@ pub const RaftState = struct {
 
 /// Raft log — append-only log of entries indexed by offset.
 pub const RaftLog = struct {
-    entries: std.ArrayList(LogEntry),
+    entries: std.array_list.Managed(LogEntry),
     allocator: Allocator,
 
     pub const LogEntry = struct {
@@ -893,7 +893,7 @@ pub const RaftLog = struct {
 
     pub fn init(alloc: Allocator) RaftLog {
         return .{
-            .entries = std.ArrayList(LogEntry).init(alloc),
+            .entries = std.array_list.Managed(LogEntry).init(alloc),
             .allocator = alloc,
         };
     }
@@ -1068,14 +1068,14 @@ pub const ElectionTimer = struct {
     min_timeout_ms: i64,
     max_timeout_ms: i64,
     deadline_ms: i64,
-    prng: std.rand.DefaultPrng,
+    prng: std.Random.DefaultPrng,
 
     pub fn init(min_ms: i64, max_ms: i64) ElectionTimer {
         var timer = ElectionTimer{
             .min_timeout_ms = min_ms,
             .max_timeout_ms = max_ms,
             .deadline_ms = 0,
-            .prng = std.rand.DefaultPrng.init(@intCast(std.time.milliTimestamp())),
+            .prng = std.Random.DefaultPrng.init(@intCast(@import("time_compat").milliTimestamp())),
         };
         timer.reset();
         return timer;
@@ -1084,19 +1084,19 @@ pub const ElectionTimer = struct {
     pub fn reset(self: *ElectionTimer) void {
         const range: u64 = @intCast(self.max_timeout_ms - self.min_timeout_ms);
         const jitter = self.prng.random().intRangeAtMost(u64, 0, range);
-        self.deadline_ms = std.time.milliTimestamp() + self.min_timeout_ms + @as(i64, @intCast(jitter));
+        self.deadline_ms = @import("time_compat").milliTimestamp() + self.min_timeout_ms + @as(i64, @intCast(jitter));
     }
 
     pub fn isExpired(self: *const ElectionTimer) bool {
-        return std.time.milliTimestamp() >= self.deadline_ms;
+        return @import("time_compat").milliTimestamp() >= self.deadline_ms;
     }
 
     /// Re-seed the PRNG with better entropy (node_id + timestamp).
     /// Should be called after init to avoid correlated timeouts across nodes.
     pub fn reseed(self: *ElectionTimer, node_id: i32) void {
-        const ts: u64 = @intCast(std.time.nanoTimestamp());
+        const ts: u64 = @intCast(@import("time_compat").nanoTimestamp());
         const seed = ts ^ (@as(u64, @intCast(@as(u32, @bitCast(node_id)))) *% 2654435761);
-        self.prng = std.rand.DefaultPrng.init(seed);
+        self.prng = std.Random.DefaultPrng.init(seed);
         self.reset();
     }
 };

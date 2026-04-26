@@ -1,6 +1,6 @@
 # ZMQ
 
-A ground-up reimplementation of [AutoMQ](https://github.com/AutoMQ/automq) in Zig — a cloud-native, S3-backed Apache Kafka alternative with dramatically lower resource usage, instant startup, and zero external dependencies.
+An experimental Zig implementation inspired by [AutoMQ](https://github.com/AutoMQ/automq): a cloud-native, S3-backed Kafka-compatible broker prototype with a small runtime footprint.
 
 ```
   ┌─────────────────────────────────────────────┐
@@ -13,14 +13,21 @@ A ground-up reimplementation of [AutoMQ](https://github.com/AutoMQ/automq) in Zi
 
 [AutoMQ](https://github.com/AutoMQ/automq) is an open-source streaming platform that reimagines Apache Kafka for the cloud. It replaces Kafka's traditional local-disk storage with **S3-compatible object storage** (AWS S3, MinIO, etc.), turning brokers into stateless, elastically scalable nodes.
 
-ZMQ is a **full port of AutoMQ from Java to Zig**, aiming to deliver the same cloud-native Kafka experience with the performance characteristics of a systems language:
+ZMQ is a work-in-progress implementation of AutoMQ-style storage and Kafka protocol handling in Zig. It is useful for development, protocol experiments, and local MinIO-backed clusters, but it is not yet a production-equivalent replacement for AutoMQ.
 
 - **~38,000 lines of AI-generated Zig** (plus ~33,000 lines of auto-generated protocol structs) across 303 source files
-- **Zero external dependencies** — everything is built on Zig's standard library
-- **Single static binary** — no JVM, no GC pauses, no classpath
+- **No JVM** — a single Zig broker binary with no Java classpath or GC
 - **Sub-second startup** — broker is ready to serve in milliseconds
-- **Tiny memory footprint** — runs comfortably in containers with 64 MB RAM
-- **100% Kafka wire protocol compatible** — works with existing Kafka clients
+- **S3/MinIO-backed WAL and object storage path** — with sync durability as the default S3 WAL mode
+- **Kafka wire protocol coverage for common broker APIs** — compatibility is partial and should be validated against your client/version mix
+
+## Status And Gaps
+
+This repository intentionally does not claim full AutoMQ parity. Major remaining gaps include production-grade controller quorum behavior, complete Kafka protocol semantics across every API/version, full AutoMQ stream/object lifecycle compatibility, mature rebalance/failover behavior, broad S3 provider coverage, and exhaustive performance/chaos validation.
+
+Current S3 support covers HTTP and HTTPS endpoints, AWS SigV4 signing, single-part and multipart uploads, object reads, deletes, ranges, and listing. HTTPS uses runtime-loaded OpenSSL and system CA paths or an optional CA file; verify this in your target container/base image.
+
+The tracked parity plan and acceptance matrix live in `docs/AUTOMQ_PARITY.md`.
 
 ## Architecture
 
@@ -79,7 +86,7 @@ Data flows through four tiers, balancing latency and cost:
 
 ## Prerequisites
 
-- **Zig 0.13.0** — [Install Zig](https://ziglang.org/download/)
+- **Zig 0.16.0** — [Install Zig](https://ziglang.org/download/)
 - **Docker & Docker Compose** — for MinIO and multi-broker clusters
 - **Python 3** — only for running E2E tests and protocol codegen (optional)
 
@@ -125,9 +132,12 @@ The broker binary is output to `./zig-out/bin/zmq`.
 |------|---------|-------------|
 | `[port]` | `9092` | Kafka listener port (positional argument) |
 | `--data-dir` | *(none — in-memory)* | WAL and metadata directory |
-| `--s3-endpoint` | *(none)* | S3/MinIO hostname |
+| `--s3-endpoint` | *(none)* | S3/MinIO hostname, optionally with `http://` or `https://` |
 | `--s3-port` | `9000` | S3/MinIO port |
 | `--s3-bucket` | `automq` | S3 bucket name |
+| `--s3-access-key` | `minioadmin` | S3 access key (env vars also supported) |
+| `--s3-secret-key` | `minioadmin` | S3 secret key (env vars also supported) |
+| `--s3-ca-file` | *(none)* | CA bundle/path for HTTPS S3 endpoints |
 | `--metrics-port` | `9090` | Prometheus metrics & health endpoint port |
 | `--node-id` | `0` | Broker node ID |
 | `--cluster-id` | `automq-cluster` | Cluster identifier |
@@ -137,7 +147,7 @@ The broker binary is output to `./zig-out/bin/zmq`.
 | `--config` | *(none)* | Path to `server.properties` config file |
 | `--s3-wal-batch-size` | `4194304` (4 MB) | WAL batch size before S3 flush |
 | `--s3-wal-flush-interval` | `250` | WAL flush interval in ms |
-| `--s3-wal-flush-mode` | `sync` | WAL flush mode (`sync` or `async`) |
+| `--s3-wal-flush-mode` | `sync` | WAL flush mode (`sync`, `async`, or `group_commit`; `sync` is the durable default) |
 | `--cache-max-size` | `268435456` (256 MB) | LogCache max size |
 | `--s3-block-cache-size` | `67108864` (64 MB) | S3 block cache size |
 | `--compaction-interval` | `300000` (5 min) | S3 compaction interval in ms |
@@ -401,6 +411,6 @@ This project is licensed under the [Apache License 2.0](LICENSE).
 
 ## Acknowledgments
 
-- [AutoMQ](https://github.com/AutoMQ/automq) — the original Java implementation this project is ported from
+- [AutoMQ](https://github.com/AutoMQ/automq) — the original Java implementation this project is based on
 - [Apache Kafka](https://kafka.apache.org/) — the protocol and API specification
 - [Zig](https://ziglang.org/) — the programming language

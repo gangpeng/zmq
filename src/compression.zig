@@ -2,7 +2,7 @@
 ///
 /// All Kafka compression types supported:
 /// - None (0): passthrough
-/// - Gzip (1): via Zig std.compress.gzip (real compression)
+/// - Gzip (1): via Zig std.compress.flate (real compression)
 /// - Snappy (2): native Zig implementation (decompression)
 /// - LZ4 (3): native Zig LZ4 block decompression
 /// - Zstd (4): native Zig implementation (simple framing)
@@ -50,25 +50,29 @@ pub fn decompress(alloc: Allocator, codec: CompressionType, data: []const u8) ![
 // Gzip — real compression via Zig stdlib
 // ---------------------------------------------------------------
 fn compressGzip(alloc: Allocator, data: []const u8) ![]u8 {
-    var result = std.ArrayList(u8).init(alloc);
+    var result: std.Io.Writer.Allocating = .init(alloc);
     errdefer result.deinit();
-    var comp = try std.compress.gzip.compressor(result.writer(), .{});
-    try comp.writer().writeAll(data);
+    try result.ensureUnusedCapacity(64);
+
+    const history = try alloc.alloc(u8, std.compress.flate.max_window_len);
+    defer alloc.free(history);
+
+    var comp = try std.compress.flate.Compress.init(&result.writer, history, .gzip, .default);
+    try comp.writer.writeAll(data);
     try comp.finish();
     return result.toOwnedSlice();
 }
 
 fn decompressGzip(alloc: Allocator, data: []const u8) ![]u8 {
-    var result = std.ArrayList(u8).init(alloc);
+    var result: std.Io.Writer.Allocating = .init(alloc);
     errdefer result.deinit();
-    var fbs = std.io.fixedBufferStream(data);
-    var dec = std.compress.gzip.decompressor(fbs.reader());
-    while (true) {
-        var buf: [4096]u8 = undefined;
-        const n = dec.reader().read(&buf) catch break;
-        if (n == 0) break;
-        try result.appendSlice(buf[0..n]);
-    }
+
+    const window = try alloc.alloc(u8, std.compress.flate.max_window_len);
+    defer alloc.free(window);
+
+    var input: std.Io.Reader = .fixed(data);
+    var dec = std.compress.flate.Decompress.init(&input, .gzip, window);
+    _ = try dec.reader.streamRemaining(&result.writer);
     return result.toOwnedSlice();
 }
 
@@ -80,7 +84,7 @@ fn decompressGzip(alloc: Allocator, data: []const u8) ![]u8 {
 // ---------------------------------------------------------------
 fn compressSnappy(alloc: Allocator, data: []const u8) ![]u8 {
     // Simple literal-only compression (valid Snappy, just uncompressed)
-    var result = std.ArrayList(u8).init(alloc);
+    var result = std.array_list.Managed(u8).init(alloc);
     errdefer result.deinit();
 
     // Write uncompressed length as varint
@@ -278,22 +282,15 @@ fn decompressZstd(alloc: Allocator, data: []const u8) ![]u8 {
     // Check for Zstd magic number (0xFD2FB528)
     if (data.len >= 4 and data[0] == 0x28 and data[1] == 0xB5 and data[2] == 0x2F and data[3] == 0xFD) {
         // Real Zstd frame — try Zig's built-in decompressor
-        var result = std.ArrayList(u8).init(alloc);
+        var result: std.Io.Writer.Allocating = .init(alloc);
         errdefer result.deinit();
-        var fbs = std.io.fixedBufferStream(data);
 
-        // Zig 0.13 zstd decompressor needs a window buffer
-        var window_buf: [8 * 1024 * 1024]u8 = undefined;
-        var dec = std.compress.zstd.decompressor(fbs.reader(), .{
-            .window_buffer = &window_buf,
-        });
+        const window = try alloc.alloc(u8, std.compress.zstd.default_window_len + std.compress.zstd.block_size_max);
+        defer alloc.free(window);
 
-        while (true) {
-            var buf: [4096]u8 = undefined;
-            const n = dec.reader().read(&buf) catch break;
-            if (n == 0) break;
-            try result.appendSlice(buf[0..n]);
-        }
+        var input: std.Io.Reader = .fixed(data);
+        var dec: std.compress.zstd.Decompress = .init(&input, window, .{});
+        _ = try dec.reader.streamRemaining(&result.writer);
         return result.toOwnedSlice();
     }
 

@@ -68,7 +68,7 @@ pub const CommitStreamObjectRequest = struct {
         ser.writeEmptyTaggedFields(buf, pos);
     }
 
-    pub fn deserialize(_: Allocator, buf: []const u8, pos: *usize, version: i16) !CommitStreamObjectRequest {
+    pub fn deserialize(alloc: Allocator, buf: []const u8, pos: *usize, version: i16) !CommitStreamObjectRequest {
         var result = CommitStreamObjectRequest{};
         result.node_id = ser.readI32(buf, pos);
         result.node_epoch = ser.readI64(buf, pos);
@@ -79,7 +79,11 @@ pub const CommitStreamObjectRequest = struct {
         result.end_offset = ser.readI64(buf, pos);
         const source_object_ids_len: usize = (try ser.readCompactArrayLen(buf, pos)) orelse 0;
         if (source_object_ids_len > 0) {
-            pos.* += source_object_ids_len * 8;
+            const source_object_ids_items = try alloc.alloc(i64, source_object_ids_len);
+            for (source_object_ids_items) |*item| {
+                item.* = ser.readI64(buf, pos);
+            }
+            result.source_object_ids = source_object_ids_items;
         }
         result.stream_epoch = ser.readI64(buf, pos);
         if (version >= 1) {
@@ -88,7 +92,11 @@ pub const CommitStreamObjectRequest = struct {
         if (version >= 1) {
             const operations_len: usize = (try ser.readCompactArrayLen(buf, pos)) orelse 0;
             if (operations_len > 0) {
-                pos.* += operations_len * 1;
+                const operations_items = try alloc.alloc(i8, operations_len);
+                for (operations_items) |*item| {
+                    item.* = ser.readI8(buf, pos);
+                }
+                result.operations = operations_items;
             }
         }
         try ser.skipTaggedFields(buf, pos);

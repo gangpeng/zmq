@@ -8,6 +8,220 @@ const std = @import("std");
 const ser = @import("../serialization.zig");
 const Allocator = std.mem.Allocator;
 
+pub const LeaderAndIsrPartitionState = struct {
+    /// The topic name.  This is only present in v0 or v1.
+    /// Versions: 0-1
+    topic_name: ?[]const u8 = null,
+    /// The partition index.
+    /// Versions: 0+
+    partition_index: i32 = 0,
+    /// The controller epoch.
+    /// Versions: 0+
+    controller_epoch: i32 = 0,
+    /// The broker ID of the leader.
+    /// Versions: 0+
+    leader: i32 = 0,
+    /// The leader epoch.
+    /// Versions: 0+
+    leader_epoch: i32 = 0,
+    /// The in-sync replica IDs.
+    /// Versions: 0+
+    isr: []const i32 = &.{},
+    /// The current epoch for the partition. The epoch is a monotonically increasing value which is incremented after every partition change. (Since the LeaderAndIsr request is only used by the legacy controller, this corresponds to the zkVersion)
+    /// Versions: 0+
+    partition_epoch: i32 = 0,
+    /// The replica IDs.
+    /// Versions: 0+
+    replicas: []const i32 = &.{},
+    /// The replica IDs that we are adding this partition to, or null if no replicas are being added.
+    /// Versions: 3+
+    adding_replicas: []const i32 = &.{},
+    /// The replica IDs that we are removing this partition from, or null if no replicas are being removed.
+    /// Versions: 3+
+    removing_replicas: []const i32 = &.{},
+    /// Whether the replica should have existed on the broker or not.
+    /// Versions: 1+
+    is_new: bool = false,
+    /// 1 if the partition is recovering from an unclean leader election; 0 otherwise.
+    /// Versions: 6+
+    leader_recovery_state: i8 = 0,
+
+    pub fn serialize(self: *const LeaderAndIsrPartitionState, buf: []u8, pos: *usize, version: i16) void {
+        if (version >= 4) {
+            ser.writeCompactString(buf, pos, self.topic_name);
+        } else {
+            ser.writeString(buf, pos, self.topic_name);
+        }
+        ser.writeI32(buf, pos, self.partition_index);
+        ser.writeI32(buf, pos, self.controller_epoch);
+        ser.writeI32(buf, pos, self.leader);
+        ser.writeI32(buf, pos, self.leader_epoch);
+        if (version >= 4) {
+            ser.writeCompactArrayLen(buf, pos, self.isr.len);
+        } else {
+            ser.writeArrayLen(buf, pos, self.isr.len);
+        }
+        for (self.isr) |item| {
+            ser.writeI32(buf, pos, item);
+        }
+        ser.writeI32(buf, pos, self.partition_epoch);
+        if (version >= 4) {
+            ser.writeCompactArrayLen(buf, pos, self.replicas.len);
+        } else {
+            ser.writeArrayLen(buf, pos, self.replicas.len);
+        }
+        for (self.replicas) |item| {
+            ser.writeI32(buf, pos, item);
+        }
+        if (version >= 3) {
+            if (version >= 4) {
+                ser.writeCompactArrayLen(buf, pos, self.adding_replicas.len);
+            } else {
+                ser.writeArrayLen(buf, pos, self.adding_replicas.len);
+            }
+            for (self.adding_replicas) |item| {
+                ser.writeI32(buf, pos, item);
+            }
+        }
+        if (version >= 3) {
+            if (version >= 4) {
+                ser.writeCompactArrayLen(buf, pos, self.removing_replicas.len);
+            } else {
+                ser.writeArrayLen(buf, pos, self.removing_replicas.len);
+            }
+            for (self.removing_replicas) |item| {
+                ser.writeI32(buf, pos, item);
+            }
+        }
+        if (version >= 1) {
+            ser.writeBool(buf, pos, self.is_new);
+        }
+        if (version >= 6) {
+            ser.writeI8(buf, pos, self.leader_recovery_state);
+        }
+        if (version >= 4) ser.writeEmptyTaggedFields(buf, pos);
+    }
+
+    pub fn deserialize(alloc: Allocator, buf: []const u8, pos: *usize, version: i16) !LeaderAndIsrPartitionState {
+        var result = LeaderAndIsrPartitionState{};
+        result.topic_name = if (version >= 4)
+            try ser.readCompactString(buf, pos)
+        else
+            try ser.readString(buf, pos);
+        result.partition_index = ser.readI32(buf, pos);
+        result.controller_epoch = ser.readI32(buf, pos);
+        result.leader = ser.readI32(buf, pos);
+        result.leader_epoch = ser.readI32(buf, pos);
+        const isr_len: usize = if (version >= 4)
+            (try ser.readCompactArrayLen(buf, pos)) orelse 0
+        else
+            (try ser.readArrayLen(buf, pos)) orelse 0;
+        if (isr_len > 0) {
+            const isr_items = try alloc.alloc(i32, isr_len);
+            for (isr_items) |*item| {
+                item.* = ser.readI32(buf, pos);
+            }
+            result.isr = isr_items;
+        }
+        result.partition_epoch = ser.readI32(buf, pos);
+        const replicas_len: usize = if (version >= 4)
+            (try ser.readCompactArrayLen(buf, pos)) orelse 0
+        else
+            (try ser.readArrayLen(buf, pos)) orelse 0;
+        if (replicas_len > 0) {
+            const replicas_items = try alloc.alloc(i32, replicas_len);
+            for (replicas_items) |*item| {
+                item.* = ser.readI32(buf, pos);
+            }
+            result.replicas = replicas_items;
+        }
+        if (version >= 3) {
+            const adding_replicas_len: usize = if (version >= 4)
+                (try ser.readCompactArrayLen(buf, pos)) orelse 0
+            else
+                (try ser.readArrayLen(buf, pos)) orelse 0;
+            if (adding_replicas_len > 0) {
+                const adding_replicas_items = try alloc.alloc(i32, adding_replicas_len);
+                for (adding_replicas_items) |*item| {
+                    item.* = ser.readI32(buf, pos);
+                }
+                result.adding_replicas = adding_replicas_items;
+            }
+        }
+        if (version >= 3) {
+            const removing_replicas_len: usize = if (version >= 4)
+                (try ser.readCompactArrayLen(buf, pos)) orelse 0
+            else
+                (try ser.readArrayLen(buf, pos)) orelse 0;
+            if (removing_replicas_len > 0) {
+                const removing_replicas_items = try alloc.alloc(i32, removing_replicas_len);
+                for (removing_replicas_items) |*item| {
+                    item.* = ser.readI32(buf, pos);
+                }
+                result.removing_replicas = removing_replicas_items;
+            }
+        }
+        if (version >= 1) {
+            result.is_new = try ser.readBool(buf, pos);
+        }
+        if (version >= 6) {
+            result.leader_recovery_state = ser.readI8(buf, pos);
+        }
+        if (version >= 4) try ser.skipTaggedFields(buf, pos);
+        return result;
+    }
+
+    pub fn calcSize(self: *const LeaderAndIsrPartitionState, version: i16) usize {
+        var size: usize = 0;
+        if (version >= 4) {
+            size += ser.compactStringSize(self.topic_name);
+        } else {
+            size += ser.stringSize(self.topic_name);
+        }
+        size += 4;
+        size += 4;
+        size += 4;
+        size += 4;
+        if (version >= 4) {
+            size += ser.unsignedVarintSize(self.isr.len + 1);
+        } else {
+            size += 4;
+        }
+        size += self.isr.len * 4;
+        size += 4;
+        if (version >= 4) {
+            size += ser.unsignedVarintSize(self.replicas.len + 1);
+        } else {
+            size += 4;
+        }
+        size += self.replicas.len * 4;
+        if (version >= 3) {
+            if (version >= 4) {
+                size += ser.unsignedVarintSize(self.adding_replicas.len + 1);
+            } else {
+                size += 4;
+            }
+            size += self.adding_replicas.len * 4;
+        }
+        if (version >= 3) {
+            if (version >= 4) {
+                size += ser.unsignedVarintSize(self.removing_replicas.len + 1);
+            } else {
+                size += 4;
+            }
+            size += self.removing_replicas.len * 4;
+        }
+        if (version >= 1) {
+            size += 1;
+        }
+        if (version >= 6) {
+            size += 1;
+        }
+        if (version >= 4) size += 1;
+        return size;
+    }
+};
+
 pub const LeaderAndIsrRequest = struct {
     pub const LeaderAndIsrTopicState = struct {
         /// The topic name.
@@ -44,7 +258,7 @@ pub const LeaderAndIsrRequest = struct {
             if (version >= 4) ser.writeEmptyTaggedFields(buf, pos);
         }
 
-        pub fn deserialize(_: Allocator, buf: []const u8, pos: *usize, version: i16) !LeaderAndIsrTopicState {
+        pub fn deserialize(alloc: Allocator, buf: []const u8, pos: *usize, version: i16) !LeaderAndIsrTopicState {
             var result = LeaderAndIsrTopicState{};
             if (version >= 2) {
                 result.topic_name = if (version >= 4)
@@ -60,7 +274,13 @@ pub const LeaderAndIsrRequest = struct {
                     (try ser.readCompactArrayLen(buf, pos)) orelse 0
                 else
                     (try ser.readArrayLen(buf, pos)) orelse 0;
-                _ = partition_states_len;
+                if (partition_states_len > 0) {
+                    const partition_states_items = try alloc.alloc(LeaderAndIsrPartitionState, partition_states_len);
+                    for (partition_states_items) |*item| {
+                        item.* = try LeaderAndIsrPartitionState.deserialize(alloc, buf, pos, version);
+                    }
+                    result.partition_states = partition_states_items;
+                }
             }
             if (version >= 4) try ser.skipTaggedFields(buf, pos);
             return result;
@@ -83,6 +303,9 @@ pub const LeaderAndIsrRequest = struct {
                     size += ser.unsignedVarintSize(self.partition_states.len + 1);
                 } else {
                     size += 4;
+                }
+                for (self.partition_states) |item| {
+                    size += item.calcSize(version);
                 }
             }
             if (version >= 4) size += 1;
@@ -221,7 +444,13 @@ pub const LeaderAndIsrRequest = struct {
             (try ser.readCompactArrayLen(buf, pos)) orelse 0
         else
             (try ser.readArrayLen(buf, pos)) orelse 0;
-        _ = ungrouped_partition_states_len;
+        if (ungrouped_partition_states_len > 0) {
+            const ungrouped_partition_states_items = try alloc.alloc(LeaderAndIsrPartitionState, ungrouped_partition_states_len);
+            for (ungrouped_partition_states_items) |*item| {
+                item.* = try LeaderAndIsrPartitionState.deserialize(alloc, buf, pos, version);
+            }
+            result.ungrouped_partition_states = ungrouped_partition_states_items;
+        }
         if (version >= 2) {
             const topic_states_len: usize = if (version >= 4)
                 (try ser.readCompactArrayLen(buf, pos)) orelse 0
@@ -267,6 +496,9 @@ pub const LeaderAndIsrRequest = struct {
             size += ser.unsignedVarintSize(self.ungrouped_partition_states.len + 1);
         } else {
             size += 4;
+        }
+        for (self.ungrouped_partition_states) |item| {
+            size += item.calcSize(version);
         }
         if (version >= 2) {
             if (version >= 4) {

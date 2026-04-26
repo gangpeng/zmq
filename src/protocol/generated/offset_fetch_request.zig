@@ -34,7 +34,7 @@ pub const OffsetFetchRequest = struct {
             if (version >= 6) ser.writeEmptyTaggedFields(buf, pos);
         }
 
-        pub fn deserialize(_: Allocator, buf: []const u8, pos: *usize, version: i16) !OffsetFetchRequestTopic {
+        pub fn deserialize(alloc: Allocator, buf: []const u8, pos: *usize, version: i16) !OffsetFetchRequestTopic {
             var result = OffsetFetchRequestTopic{};
             result.name = if (version >= 6)
                 try ser.readCompactString(buf, pos)
@@ -45,7 +45,11 @@ pub const OffsetFetchRequest = struct {
             else
                 (try ser.readArrayLen(buf, pos)) orelse 0;
             if (partition_indexes_len > 0) {
-                pos.* += partition_indexes_len * 4;
+                const partition_indexes_items = try alloc.alloc(i32, partition_indexes_len);
+                for (partition_indexes_items) |*item| {
+                    item.* = ser.readI32(buf, pos);
+                }
+                result.partition_indexes = partition_indexes_items;
             }
             if (version >= 6) try ser.skipTaggedFields(buf, pos);
             return result;
@@ -99,7 +103,7 @@ pub const OffsetFetchRequest = struct {
                 if (version >= 6) ser.writeEmptyTaggedFields(buf, pos);
             }
 
-            pub fn deserialize(_: Allocator, buf: []const u8, pos: *usize, version: i16) !OffsetFetchRequestTopics {
+            pub fn deserialize(alloc: Allocator, buf: []const u8, pos: *usize, version: i16) !OffsetFetchRequestTopics {
                 var result = OffsetFetchRequestTopics{};
                 if (version >= 8) {
                     result.name = if (version >= 6)
@@ -113,7 +117,11 @@ pub const OffsetFetchRequest = struct {
                     else
                         (try ser.readArrayLen(buf, pos)) orelse 0;
                     if (partition_indexes_len > 0) {
-                        pos.* += partition_indexes_len * 4;
+                        const partition_indexes_items = try alloc.alloc(i32, partition_indexes_len);
+                        for (partition_indexes_items) |*item| {
+                            item.* = ser.readI32(buf, pos);
+                        }
+                        result.partition_indexes = partition_indexes_items;
                     }
                 }
                 if (version >= 6) try ser.skipTaggedFields(buf, pos);

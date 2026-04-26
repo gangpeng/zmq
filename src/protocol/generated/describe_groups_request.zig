@@ -35,18 +35,21 @@ pub const DescribeGroupsRequest = struct {
         if (version >= 5) ser.writeEmptyTaggedFields(buf, pos);
     }
 
-    pub fn deserialize(_: Allocator, buf: []const u8, pos: *usize, version: i16) !DescribeGroupsRequest {
+    pub fn deserialize(alloc: Allocator, buf: []const u8, pos: *usize, version: i16) !DescribeGroupsRequest {
         var result = DescribeGroupsRequest{};
         const groups_len: usize = if (version >= 5)
             (try ser.readCompactArrayLen(buf, pos)) orelse 0
         else
             (try ser.readArrayLen(buf, pos)) orelse 0;
-        for (0..groups_len) |_| {
-            if (version >= 5) {
-                _ = try ser.readCompactString(buf, pos);
-            } else {
-                _ = try ser.readString(buf, pos);
+        if (groups_len > 0) {
+            const groups_items = try alloc.alloc(?[]const u8, groups_len);
+            for (groups_items) |*item| {
+                item.* = if (version >= 5)
+                    try ser.readCompactString(buf, pos)
+                else
+                    try ser.readString(buf, pos);
             }
+            result.groups = groups_items;
         }
         if (version >= 3) {
             result.include_authorized_operations = try ser.readBool(buf, pos);

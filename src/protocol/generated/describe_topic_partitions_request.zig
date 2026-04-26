@@ -73,7 +73,7 @@ pub const DescribeTopicPartitionsRequest = struct {
     response_partition_limit: i32 = 2000,
     /// The first topic and partition index to fetch details for.
     /// Versions: 0+
-    cursor: Cursor = null,
+    cursor: ?Cursor = null,
 
     pub fn serialize(self: *const DescribeTopicPartitionsRequest, buf: []u8, pos: *usize, version: i16) void {
         ser.writeCompactArrayLen(buf, pos, self.topics.len);
@@ -81,7 +81,12 @@ pub const DescribeTopicPartitionsRequest = struct {
             item.serialize(buf, pos, version);
         }
         ser.writeI32(buf, pos, self.response_partition_limit);
-        self.cursor.serialize(buf, pos, version);
+        if (self.cursor) |value| {
+            ser.writeUnsignedVarint(buf, pos, 1);
+            value.serialize(buf, pos, version);
+        } else {
+            ser.writeUnsignedVarint(buf, pos, 0);
+        }
         ser.writeEmptyTaggedFields(buf, pos);
     }
 
@@ -96,7 +101,9 @@ pub const DescribeTopicPartitionsRequest = struct {
             result.topics = topics_items;
         }
         result.response_partition_limit = ser.readI32(buf, pos);
-        result.cursor = try Cursor.deserialize(alloc, buf, pos, version);
+        if ((try ser.readUnsignedVarint(buf, pos)) != 0) {
+            result.cursor = try Cursor.deserialize(alloc, buf, pos, version);
+        }
         try ser.skipTaggedFields(buf, pos);
         return result;
     }
@@ -108,7 +115,11 @@ pub const DescribeTopicPartitionsRequest = struct {
             size += item.calcSize(version);
         }
         size += 4;
-        size += self.cursor.calcSize(version);
+        if (self.cursor) |value| {
+            size += 1 + value.calcSize(version);
+        } else {
+            size += 1;
+        }
         size += 1;
         return size;
     }

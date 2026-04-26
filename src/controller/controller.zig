@@ -2,11 +2,12 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 const log = std.log.scoped(.controller);
 
-const ser = @import("../protocol/serialization.zig");
-const header_mod = @import("../protocol/header.zig");
+const protocol = @import("protocol");
+const ser = protocol.serialization;
+const header_mod = protocol.header;
 const RequestHeader = header_mod.RequestHeader;
 const ResponseHeader = header_mod.ResponseHeader;
-const RaftState = @import("../raft/state.zig").RaftState;
+const RaftState = @import("raft").RaftState;
 const BrokerRegistry = @import("broker_registry.zig").BrokerRegistry;
 
 /// KRaft metadata controller.
@@ -776,7 +777,7 @@ test "Controller tick evicts dead brokers" {
 
     // Force the broker's last_heartbeat_ms to be 60 seconds in the past
     if (ctrl.broker_registry.brokers.getPtr(100)) |info| {
-        info.last_heartbeat_ms = std.time.milliTimestamp() - 60_000;
+        info.last_heartbeat_ms = @import("time_compat").milliTimestamp() - 60_000;
     }
 
     // tick() calls evictExpired(30_000) — broker should be evicted

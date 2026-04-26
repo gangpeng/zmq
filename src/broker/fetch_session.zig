@@ -119,7 +119,7 @@ pub const FetchSession = struct {
         return .{
             .partition_hwm = std.StringHashMap(i64).init(alloc),
             .allocator = alloc,
-            .created_ms = std.time.milliTimestamp(),
+            .created_ms = @import("time_compat").milliTimestamp(),
         };
     }
 

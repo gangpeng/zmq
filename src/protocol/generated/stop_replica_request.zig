@@ -80,7 +80,7 @@ pub const StopReplicaRequest = struct {
             if (version >= 2) ser.writeEmptyTaggedFields(buf, pos);
         }
 
-        pub fn deserialize(_: Allocator, buf: []const u8, pos: *usize, version: i16) !StopReplicaTopicV1 {
+        pub fn deserialize(alloc: Allocator, buf: []const u8, pos: *usize, version: i16) !StopReplicaTopicV1 {
             var result = StopReplicaTopicV1{};
             if (version >= 1 and version <= 2) {
                 result.name = if (version >= 2)
@@ -94,7 +94,11 @@ pub const StopReplicaRequest = struct {
                 else
                     (try ser.readArrayLen(buf, pos)) orelse 0;
                 if (partition_indexes_len > 0) {
-                    pos.* += partition_indexes_len * 4;
+                    const partition_indexes_items = try alloc.alloc(i32, partition_indexes_len);
+                    for (partition_indexes_items) |*item| {
+                        item.* = ser.readI32(buf, pos);
+                    }
+                    result.partition_indexes = partition_indexes_items;
                 }
             }
             if (version >= 2) try ser.skipTaggedFields(buf, pos);

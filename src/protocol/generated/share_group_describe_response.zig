@@ -8,6 +8,92 @@ const std = @import("std");
 const ser = @import("../serialization.zig");
 const Allocator = std.mem.Allocator;
 
+pub const TopicPartitions = struct {
+    /// The topic ID.
+    /// Versions: 0+
+    topic_id: [16]u8 = .{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 },
+    /// The topic name.
+    /// Versions: 0+
+    topic_name: ?[]const u8 = null,
+    /// The partitions.
+    /// Versions: 0+
+    partitions: []const i32 = &.{},
+
+    pub fn serialize(self: *const TopicPartitions, buf: []u8, pos: *usize, _: i16) void {
+        ser.writeUuid(buf, pos, self.topic_id);
+        ser.writeCompactString(buf, pos, self.topic_name);
+        ser.writeCompactArrayLen(buf, pos, self.partitions.len);
+        for (self.partitions) |item| {
+            ser.writeI32(buf, pos, item);
+        }
+        ser.writeEmptyTaggedFields(buf, pos);
+    }
+
+    pub fn deserialize(alloc: Allocator, buf: []const u8, pos: *usize, _: i16) !TopicPartitions {
+        var result = TopicPartitions{};
+        result.topic_id = try ser.readUuid(buf, pos);
+        result.topic_name = try ser.readCompactString(buf, pos);
+        const partitions_len: usize = (try ser.readCompactArrayLen(buf, pos)) orelse 0;
+        if (partitions_len > 0) {
+            const partitions_items = try alloc.alloc(i32, partitions_len);
+            for (partitions_items) |*item| {
+                item.* = ser.readI32(buf, pos);
+            }
+            result.partitions = partitions_items;
+        }
+        try ser.skipTaggedFields(buf, pos);
+        return result;
+    }
+
+    pub fn calcSize(self: *const TopicPartitions, _: i16) usize {
+        var size: usize = 0;
+        size += 16;
+        size += ser.compactStringSize(self.topic_name);
+        size += ser.unsignedVarintSize(self.partitions.len + 1);
+        size += self.partitions.len * 4;
+        size += 1;
+        return size;
+    }
+};
+
+pub const Assignment = struct {
+    /// The assigned topic-partitions to the member.
+    /// Versions: 0+
+    topic_partitions: []const TopicPartitions = &.{},
+
+    pub fn serialize(self: *const Assignment, buf: []u8, pos: *usize, version: i16) void {
+        ser.writeCompactArrayLen(buf, pos, self.topic_partitions.len);
+        for (self.topic_partitions) |item| {
+            item.serialize(buf, pos, version);
+        }
+        ser.writeEmptyTaggedFields(buf, pos);
+    }
+
+    pub fn deserialize(alloc: Allocator, buf: []const u8, pos: *usize, version: i16) !Assignment {
+        var result = Assignment{};
+        const topic_partitions_len: usize = (try ser.readCompactArrayLen(buf, pos)) orelse 0;
+        if (topic_partitions_len > 0) {
+            const topic_partitions_items = try alloc.alloc(TopicPartitions, topic_partitions_len);
+            for (topic_partitions_items) |*item| {
+                item.* = try TopicPartitions.deserialize(alloc, buf, pos, version);
+            }
+            result.topic_partitions = topic_partitions_items;
+        }
+        try ser.skipTaggedFields(buf, pos);
+        return result;
+    }
+
+    pub fn calcSize(self: *const Assignment, version: i16) usize {
+        var size: usize = 0;
+        size += ser.unsignedVarintSize(self.topic_partitions.len + 1);
+        for (self.topic_partitions) |item| {
+            size += item.calcSize(version);
+        }
+        size += 1;
+        return size;
+    }
+};
+
 pub const ShareGroupDescribeResponse = struct {
     pub const DescribedGroup = struct {
         pub const Member = struct {
@@ -33,7 +119,7 @@ pub const ShareGroupDescribeResponse = struct {
             /// Versions: 0+
             assignment: Assignment = .{},
 
-            pub fn serialize(self: *const Member, buf: []u8, pos: *usize, _: i16) void {
+            pub fn serialize(self: *const Member, buf: []u8, pos: *usize, version: i16) void {
                 ser.writeCompactString(buf, pos, self.member_id);
                 ser.writeCompactString(buf, pos, self.rack_id);
                 ser.writeI32(buf, pos, self.member_epoch);
@@ -43,10 +129,11 @@ pub const ShareGroupDescribeResponse = struct {
                 for (self.subscribed_topic_names) |item| {
                     ser.writeCompactString(buf, pos, item);
                 }
+                self.assignment.serialize(buf, pos, version);
                 ser.writeEmptyTaggedFields(buf, pos);
             }
 
-            pub fn deserialize(_: Allocator, buf: []const u8, pos: *usize, _: i16) !Member {
+            pub fn deserialize(alloc: Allocator, buf: []const u8, pos: *usize, version: i16) !Member {
                 var result = Member{};
                 result.member_id = try ser.readCompactString(buf, pos);
                 result.rack_id = try ser.readCompactString(buf, pos);
@@ -54,14 +141,19 @@ pub const ShareGroupDescribeResponse = struct {
                 result.client_id = try ser.readCompactString(buf, pos);
                 result.client_host = try ser.readCompactString(buf, pos);
                 const subscribed_topic_names_len: usize = (try ser.readCompactArrayLen(buf, pos)) orelse 0;
-                for (0..subscribed_topic_names_len) |_| {
-                    _ = try ser.readCompactString(buf, pos);
+                if (subscribed_topic_names_len > 0) {
+                    const subscribed_topic_names_items = try alloc.alloc(?[]const u8, subscribed_topic_names_len);
+                    for (subscribed_topic_names_items) |*item| {
+                        item.* = try ser.readCompactString(buf, pos);
+                    }
+                    result.subscribed_topic_names = subscribed_topic_names_items;
                 }
+                result.assignment = try Assignment.deserialize(alloc, buf, pos, version);
                 try ser.skipTaggedFields(buf, pos);
                 return result;
             }
 
-            pub fn calcSize(self: *const Member, _: i16) usize {
+            pub fn calcSize(self: *const Member, version: i16) usize {
                 var size: usize = 0;
                 size += ser.compactStringSize(self.member_id);
                 size += ser.compactStringSize(self.rack_id);
@@ -72,6 +164,7 @@ pub const ShareGroupDescribeResponse = struct {
                 for (self.subscribed_topic_names) |item| {
                     size += ser.compactStringSize(item);
                 }
+                size += self.assignment.calcSize(version);
                 size += 1;
                 return size;
             }

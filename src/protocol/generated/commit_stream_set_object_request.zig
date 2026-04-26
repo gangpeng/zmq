@@ -194,7 +194,11 @@ pub const CommitStreamSetObjectRequest = struct {
         }
         const compacted_object_ids_len: usize = (try ser.readCompactArrayLen(buf, pos)) orelse 0;
         if (compacted_object_ids_len > 0) {
-            pos.* += compacted_object_ids_len * 8;
+            const compacted_object_ids_items = try alloc.alloc(i64, compacted_object_ids_len);
+            for (compacted_object_ids_items) |*item| {
+                item.* = ser.readI64(buf, pos);
+            }
+            result.compacted_object_ids = compacted_object_ids_items;
         }
         result.failover_mode = try ser.readBool(buf, pos);
         if (version >= 1) {

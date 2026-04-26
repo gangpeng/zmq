@@ -1,5 +1,5 @@
 const std = @import("std");
-const fs = std.fs;
+const fs = @import("fs_compat");
 const testing = std.testing;
 const Allocator = std.mem.Allocator;
 const log = std.log.scoped(.compaction);
@@ -11,7 +11,7 @@ const ObjectWriter = @import("s3.zig").ObjectWriter;
 const ObjectReader = @import("s3.zig").ObjectReader;
 const S3Storage = @import("s3_client.zig").S3Storage;
 const MockS3 = @import("s3.zig").MockS3;
-const MetricRegistry = @import("../core/metric_registry.zig").MetricRegistry;
+const MetricRegistry = @import("core").MetricRegistry;
 
 /// CompactionManager periodically splits multi-stream StreamSetObjects into
 /// per-stream StreamObjects, and merges small StreamObjects into larger ones.
@@ -63,7 +63,7 @@ pub const CompactionManager = struct {
 
     /// S3 keys that failed to delete during compaction (orphaned files).
     /// Cleaned up on the next compaction cycle.
-    orphaned_keys: std.ArrayList([]u8),
+    orphaned_keys: std.array_list.Managed([]u8),
 
     /// Path to the compaction journal file (tracks in-progress operations).
     journal_path: ?[]const u8 = null,
@@ -78,7 +78,7 @@ pub const CompactionManager = struct {
         return .{
             .allocator = allocator,
             .object_manager = object_manager,
-            .orphaned_keys = std.ArrayList([]u8).init(allocator),
+            .orphaned_keys = std.array_list.Managed([]u8).init(allocator),
         };
     }
 
@@ -102,7 +102,7 @@ pub const CompactionManager = struct {
 
     /// Called from Broker.tick(). Checks if enough time has elapsed and runs compaction.
     pub fn maybeCompact(self: *CompactionManager) void {
-        const now = std.time.milliTimestamp();
+        const now = @import("time_compat").milliTimestamp();
         if (now - self.last_compaction_ms < self.compaction_interval_ms) return;
         self.last_compaction_ms = now;
 
@@ -122,7 +122,7 @@ pub const CompactionManager = struct {
     /// phases (destroy marked, expire prepared) are added after the core compaction
     /// phases to match AutoMQ's S3ObjectControlManager behavior.
     pub fn runCompaction(self: *CompactionManager) !void {
-        const start_ns = std.time.nanoTimestamp();
+        const start_ns = @import("time_compat").nanoTimestamp();
         log.info("Starting compaction cycle (SSOs={d}, SOs={d})", .{
             self.object_manager.getStreamSetObjectCount(),
             self.object_manager.getStreamObjectCount(),
@@ -175,7 +175,7 @@ pub const CompactionManager = struct {
             m.addCounter("compaction_cleanups_total", cleanups);
             m.addCounter("compaction_destroyed_total", destroyed);
             m.addCounter("compaction_expired_prepared_total", expired_prepared);
-            const elapsed_ns = std.time.nanoTimestamp() - start_ns;
+            const elapsed_ns = @import("time_compat").nanoTimestamp() - start_ns;
             const elapsed_secs: f64 = @as(f64, @floatFromInt(elapsed_ns)) / 1_000_000_000.0;
             m.observeHistogram("compaction_cycle_duration_seconds", elapsed_secs);
             m.setGauge("compaction_orphaned_keys", @floatFromInt(self.orphaned_keys.items.len));
@@ -211,7 +211,7 @@ pub const CompactionManager = struct {
         var split_count: u64 = 0;
 
         // Collect SSO IDs to split (can't modify map while iterating)
-        var to_split = std.ArrayList(u64).init(self.allocator);
+        var to_split = std.array_list.Managed(u64).init(self.allocator);
         defer to_split.deinit();
 
         var it = self.object_manager.stream_set_objects.iterator();
@@ -349,7 +349,7 @@ pub const CompactionManager = struct {
         var merge_count: u64 = 0;
 
         // Collect stream IDs to consider (can't modify while iterating)
-        var stream_ids = std.ArrayList(u64).init(self.allocator);
+        var stream_ids = std.array_list.Managed(u64).init(self.allocator);
         defer stream_ids.deinit();
 
         var it = self.object_manager.stream_object_index.iterator();
@@ -369,7 +369,7 @@ pub const CompactionManager = struct {
             defer self.allocator.free(so_ids);
 
             // Group contiguous objects for merging
-            var group = std.ArrayList(u64).init(self.allocator);
+            var group = std.array_list.Managed(u64).init(self.allocator);
             defer group.deinit();
             var group_size: u64 = 0;
 
@@ -491,7 +491,7 @@ pub const CompactionManager = struct {
         // Remove old SOs: first collect S3 keys, then remove from ObjectManager,
         // then delete from S3. This ensures fetch queries see the merged object
         // and not the old SOs, even if S3 deletion fails (orphaned files).
-        var old_keys = std.ArrayList([]u8).init(self.allocator);
+        var old_keys = std.array_list.Managed([]u8).init(self.allocator);
         defer {
             for (old_keys.items) |k| self.allocator.free(k);
             old_keys.deinit();

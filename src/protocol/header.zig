@@ -171,7 +171,7 @@ pub fn responseHeaderVersion(api_key: i16, api_version: i16) i16 {
 
 /// Check if a given API version is a flexible version.
 /// Derived from the "flexibleVersions" field in each API's JSON schema.
-/// This mapping covers all 37 supported Kafka API keys.
+/// This mapping covers broker-supported Kafka API keys.
 fn isFlexibleVersion(api_key: i16, api_version: i16) bool {
     return switch (api_key) {
         0 => api_version >= 9, // Produce: 9+
@@ -199,6 +199,7 @@ fn isFlexibleVersion(api_key: i16, api_version: i16) bool {
         22 => api_version >= 2, // InitProducerId: 2+
         23 => api_version >= 4, // OffsetForLeaderEpoch: 4+
         24 => api_version >= 3, // AddPartitionsToTxn: 3+
+        25 => api_version >= 3, // AddOffsetsToTxn: 3+
         26 => api_version >= 3, // EndTxn: 3+
         27 => api_version >= 1, // WriteTxnMarkers: 1+
         28 => api_version >= 3, // TxnOffsetCommit: 3+
@@ -210,15 +211,19 @@ fn isFlexibleVersion(api_key: i16, api_version: i16) bool {
         35 => api_version >= 2, // DescribeLogDirs: 2+
         36 => api_version >= 2, // SaslAuthenticate: 2+
         37 => api_version >= 2, // CreatePartitions: 2+
+        42 => api_version >= 2, // DeleteGroups: 2+
         43 => api_version >= 2, // ElectLeaders: 2+
-        44 => true, // AlterPartitionReassignments: 0+ (always flexible)
-        45 => true, // ListPartitionReassignments: 0+ (always flexible)
+        44 => api_version >= 1, // IncrementalAlterConfigs: 1+
+        45 => true, // AlterPartitionReassignments: 0+ (always flexible)
+        46 => true, // ListPartitionReassignments: 0+ (always flexible)
         52 => true, // Vote: 0+ (always flexible)
         53 => true, // BeginQuorumEpoch: 0+ (always flexible)
         54 => true, // EndQuorumEpoch: 0+ (always flexible)
         55 => true, // DescribeQuorum: 0+ (always flexible)
         60 => true, // DescribeCluster: 0+ (always flexible)
         61 => true, // DescribeProducers: 0+ (always flexible)
+        501...519 => true, // AutoMQ extension APIs: 0+ (always flexible)
+        600...602 => true, // AutoMQ extension APIs: 0+ (always flexible)
         else => false, // Unknown API: conservative default
     };
 }
@@ -309,6 +314,20 @@ test "ResponseHeader v1 round-trip" {
 
     try testing.expectEqual(@as(i32, 99), read_header.correlation_id);
     try testing.expectEqual(@as(usize, 5), rpos); // 4 + varint(0)
+}
+
+test "header version mapping matches shifted Kafka API keys" {
+    try testing.expectEqual(@as(i16, 1), requestHeaderVersion(42, 1)); // DeleteGroups v1 is non-flexible.
+    try testing.expectEqual(@as(i16, 2), requestHeaderVersion(42, 2));
+    try testing.expectEqual(@as(i16, 1), responseHeaderVersion(42, 2));
+
+    try testing.expectEqual(@as(i16, 1), requestHeaderVersion(44, 0)); // IncrementalAlterConfigs v0 is non-flexible.
+    try testing.expectEqual(@as(i16, 2), requestHeaderVersion(44, 1));
+    try testing.expectEqual(@as(i16, 2), requestHeaderVersion(45, 0));
+    try testing.expectEqual(@as(i16, 2), requestHeaderVersion(46, 0));
+
+    try testing.expectEqual(@as(i16, 2), requestHeaderVersion(25, 3)); // AddOffsetsToTxn flexible versions.
+    try testing.expectEqual(@as(i16, 1), responseHeaderVersion(25, 3));
 }
 
 test "RequestHeader null client_id" {

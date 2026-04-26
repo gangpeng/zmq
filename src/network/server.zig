@@ -1,13 +1,13 @@
 const std = @import("std");
-const net = std.net;
+const net = @import("net_compat");
 const posix = std.posix;
 const linux = std.os.linux;
 const Allocator = std.mem.Allocator;
 const log = std.log.scoped(.server);
-const tls_mod = @import("../security/tls.zig");
+const tls_mod = @import("security").tls;
 const TlsContext = tls_mod.TlsContext;
-const OpenSslLib = @import("../security/openssl.zig").OpenSslLib;
-const MetricRegistry = @import("../core/metric_registry.zig").MetricRegistry;
+const OpenSslLib = @import("security").openssl.OpenSslLib;
+const MetricRegistry = @import("core").MetricRegistry;
 
 /// Global OpenSSL reference for connection cleanup (set when TLS is enabled).
 /// Connection.deinit needs this to call SSL_shutdown/SSL_free.
@@ -65,8 +65,8 @@ pub const Server = struct {
     const Connection = struct {
         fd: posix.socket_t,
         allocator: Allocator,
-        recv_buf: std.ArrayList(u8),
-        send_buf: std.ArrayList(u8),
+        recv_buf: std.array_list.Managed(u8),
+        send_buf: std.array_list.Managed(u8),
         recv_cursor: usize = 0,
         last_activity_ms: i64 = 0,
         request_count: u64 = 0,
@@ -90,9 +90,9 @@ pub const Server = struct {
             return .{
                 .fd = fd,
                 .allocator = alloc,
-                .recv_buf = std.ArrayList(u8).init(alloc),
-                .send_buf = std.ArrayList(u8).init(alloc),
-                .last_activity_ms = std.time.milliTimestamp(),
+                .recv_buf = std.array_list.Managed(u8).init(alloc),
+                .send_buf = std.array_list.Managed(u8).init(alloc),
+                .last_activity_ms = @import("time_compat").milliTimestamp(),
             };
         }
 
@@ -113,7 +113,7 @@ pub const Server = struct {
             self.recv_buf.deinit();
             self.send_buf.deinit();
             if (!self.closed) {
-                posix.close(self.fd);
+                @import("posix_compat").close(self.fd);
                 self.closed = true;
             }
         }
@@ -159,13 +159,13 @@ pub const Server = struct {
 
     fn serveIoUring(self: *Server) !void {
         // Socket setup
-        const sock = try posix.socket(posix.AF.INET, posix.SOCK.STREAM, 0);
-        errdefer posix.close(sock);
+        const sock = try @import("posix_compat").socket(posix.AF.INET, posix.SOCK.STREAM, 0);
+        errdefer @import("posix_compat").close(sock);
 
         const optval: i32 = 1;
         try posix.setsockopt(sock, posix.SOL.SOCKET, posix.SO.REUSEADDR, std.mem.asBytes(&optval));
-        try posix.bind(sock, &self.listen_address.any, self.listen_address.getOsSockLen());
-        try posix.listen(sock, 1024);
+        try @import("posix_compat").bind(sock, &self.listen_address.any, self.listen_address.getOsSockLen());
+        try @import("posix_compat").listen(sock, 1024);
 
         self.listener = sock;
         self.running = true;
@@ -206,7 +206,7 @@ pub const Server = struct {
                 continue;
             };
 
-            const now_ms = std.time.milliTimestamp();
+            const now_ms = @import("time_compat").milliTimestamp();
 
             for (cqes[0..completed]) |*cqe| {
                 const user_data = cqe.user_data;
@@ -225,7 +225,7 @@ pub const Server = struct {
                         // io_uring handles non-blocking I/O inherently — no need for fcntl
 
                         connections.put(client_fd, Connection.init(self.allocator, client_fd)) catch {
-                            posix.close(client_fd);
+                            @import("posix_compat").close(client_fd);
                         };
 
                         // Assign recv buffer slot
@@ -307,7 +307,7 @@ pub const Server = struct {
             // Periodic idle eviction
             loop_count += 1;
             if (loop_count % 5000 == 0) {
-                var to_close = std.ArrayList(posix.socket_t).init(self.allocator);
+                var to_close = std.array_list.Managed(posix.socket_t).init(self.allocator);
                 defer to_close.deinit();
                 var idle_it = connections.iterator();
                 while (idle_it.next()) |entry| {
@@ -329,7 +329,7 @@ pub const Server = struct {
             }
         }
 
-        posix.close(sock);
+        @import("posix_compat").close(sock);
         self.listener = null;
     }
 
@@ -396,23 +396,23 @@ pub const Server = struct {
     // ── Epoll fallback ───────────────────────────────────────────────
 
     fn serveEpoll(self: *Server) !void {
-        const sock = try posix.socket(posix.AF.INET, posix.SOCK.STREAM | posix.SOCK.NONBLOCK, 0);
-        errdefer posix.close(sock);
+        const sock = try @import("posix_compat").socket(posix.AF.INET, posix.SOCK.STREAM | posix.SOCK.NONBLOCK, 0);
+        errdefer @import("posix_compat").close(sock);
 
         const optval: i32 = 1;
         try posix.setsockopt(sock, posix.SOL.SOCKET, posix.SO.REUSEADDR, std.mem.asBytes(&optval));
-        try posix.bind(sock, &self.listen_address.any, self.listen_address.getOsSockLen());
-        try posix.listen(sock, 1024);
+        try @import("posix_compat").bind(sock, &self.listen_address.any, self.listen_address.getOsSockLen());
+        try @import("posix_compat").listen(sock, 1024);
 
         self.listener = sock;
         self.running = true;
 
-        const epfd = try posix.epoll_create1(linux.EPOLL.CLOEXEC);
-        defer posix.close(epfd);
+        const epfd = try @import("posix_compat").epoll_create1(linux.EPOLL.CLOEXEC);
+        defer @import("posix_compat").close(epfd);
         self.epoll_fd = epfd;
 
         var listen_ev = linux.epoll_event{ .events = linux.EPOLL.IN, .data = .{ .fd = sock } };
-        try posix.epoll_ctl(epfd, linux.EPOLL.CTL_ADD, sock, &listen_ev);
+        try @import("posix_compat").epoll_ctl(epfd, linux.EPOLL.CTL_ADD, sock, &listen_ev);
 
         log.info("ZMQ broker listening on port {d} (epoll fallback)", .{self.listen_address.getPort()});
 
@@ -426,13 +426,13 @@ pub const Server = struct {
         var events: [256]linux.epoll_event = undefined;
         var loop_count: u64 = 0;
         var listener_removed_from_epoll = false;
-        var last_tick_ms: i64 = std.time.milliTimestamp();
+        var last_tick_ms: i64 = @import("time_compat").milliTimestamp();
 
         while (self.running) {
             // When draining, stop accepting new connections by removing the
             // listener socket from epoll. This is done once at the start of drain.
             if (self.draining and !listener_removed_from_epoll) {
-                posix.epoll_ctl(epfd, linux.EPOLL.CTL_DEL, sock, null) catch {};
+                @import("posix_compat").epoll_ctl(epfd, linux.EPOLL.CTL_DEL, sock, null) catch {};
                 listener_removed_from_epoll = true;
                 self.drain_initial_connections = connections.count();
                 log.info("Drain phase: stopped accepting, {d} connections in flight", .{self.drain_initial_connections});
@@ -446,8 +446,8 @@ pub const Server = struct {
                 (if (check()) @as(i32, 1) else 100)
             else
                 100;
-            const nready = posix.epoll_wait(epfd, &events, timeout);
-            const now_ms = std.time.milliTimestamp();
+            const nready = @import("posix_compat").epoll_wait(epfd, &events, timeout);
+            const now_ms = @import("time_compat").milliTimestamp();
 
             for (events[0..nready]) |ev| {
                 const fd = ev.data.fd;
@@ -460,7 +460,7 @@ pub const Server = struct {
                     while (true) {
                         var addr: posix.sockaddr = undefined;
                         var addr_len: posix.socklen_t = @sizeOf(posix.sockaddr);
-                        const client_fd = posix.accept(sock, &addr, &addr_len, posix.SOCK.NONBLOCK) catch break;
+                        const client_fd = @import("posix_compat").accept(sock, &addr, &addr_len, posix.SOCK.NONBLOCK) catch break;
 
                         const nodelay: i32 = 1;
                         posix.setsockopt(client_fd, posix.IPPROTO.TCP, std.posix.TCP.NODELAY, std.mem.asBytes(&nodelay)) catch {};
@@ -469,14 +469,14 @@ pub const Server = struct {
                             .events = linux.EPOLL.IN | linux.EPOLL.RDHUP,
                             .data = .{ .fd = client_fd },
                         };
-                        posix.epoll_ctl(epfd, linux.EPOLL.CTL_ADD, client_fd, &client_ev) catch {
-                            posix.close(client_fd);
+                        @import("posix_compat").epoll_ctl(epfd, linux.EPOLL.CTL_ADD, client_fd, &client_ev) catch {
+                            @import("posix_compat").close(client_fd);
                             continue;
                         };
 
                         connections.put(client_fd, Connection.init(self.allocator, client_fd)) catch {
-                            posix.epoll_ctl(epfd, linux.EPOLL.CTL_DEL, client_fd, null) catch {};
-                            posix.close(client_fd);
+                            @import("posix_compat").epoll_ctl(epfd, linux.EPOLL.CTL_DEL, client_fd, null) catch {};
+                            @import("posix_compat").close(client_fd);
                             continue;
                         };
 
@@ -485,7 +485,7 @@ pub const Server = struct {
                             if (connections.getPtr(client_fd)) |conn| {
                                 const ssl = tls_ctx.createSsl(client_fd) catch {
                                     log.warn("Failed to create SSL for fd={d}", .{client_fd});
-                                    posix.epoll_ctl(epfd, linux.EPOLL.CTL_DEL, client_fd, null) catch {};
+                                    @import("posix_compat").epoll_ctl(epfd, linux.EPOLL.CTL_DEL, client_fd, null) catch {};
                                     conn.deinit();
                                     _ = connections.remove(client_fd);
                                     continue;
@@ -495,7 +495,7 @@ pub const Server = struct {
                                 // Record handshake start time for timeout enforcement.
                                 // Connections that don't complete the handshake within 30s
                                 // are forcibly closed to prevent slow-client DoS attacks.
-                                conn.handshake_start_ms = std.time.milliTimestamp();
+                                conn.handshake_start_ms = @import("time_compat").milliTimestamp();
                                 // Set global OpenSSL ref for connection cleanup
                                 if (tls_ctx.getOpenSsl()) |ossl| {
                                     global_openssl = ossl;
@@ -505,7 +505,7 @@ pub const Server = struct {
                     }
                 } else {
                     if (ev.events & (linux.EPOLL.ERR | linux.EPOLL.HUP | linux.EPOLL.RDHUP) != 0) {
-                        posix.epoll_ctl(epfd, linux.EPOLL.CTL_DEL, fd, null) catch {};
+                        @import("posix_compat").epoll_ctl(epfd, linux.EPOLL.CTL_DEL, fd, null) catch {};
                         if (connections.fetchRemove(fd)) |entry| {
                             var conn = entry.value;
                             conn.deinit();
@@ -515,7 +515,7 @@ pub const Server = struct {
 
                     if (ev.events & linux.EPOLL.IN != 0) {
                         self.handleReadEpoll(fd, &connections, now_ms) catch {
-                            posix.epoll_ctl(epfd, linux.EPOLL.CTL_DEL, fd, null) catch {};
+                            @import("posix_compat").epoll_ctl(epfd, linux.EPOLL.CTL_DEL, fd, null) catch {};
                             if (connections.fetchRemove(fd)) |entry| {
                                 var conn = entry.value;
                                 conn.deinit();
@@ -528,7 +528,7 @@ pub const Server = struct {
                             // If TLS handshake is pending, retry SSL_accept on write-ready
                             if (!conn.tls_handshake_done) {
                                 self.handleReadEpoll(fd, &connections, now_ms) catch {
-                                    posix.epoll_ctl(epfd, linux.EPOLL.CTL_DEL, fd, null) catch {};
+                                    @import("posix_compat").epoll_ctl(epfd, linux.EPOLL.CTL_DEL, fd, null) catch {};
                                     if (connections.fetchRemove(fd)) |entry| {
                                         var c = entry.value;
                                         c.deinit();
@@ -541,7 +541,7 @@ pub const Server = struct {
                                         .events = linux.EPOLL.IN | linux.EPOLL.RDHUP,
                                         .data = .{ .fd = fd },
                                     };
-                                    posix.epoll_ctl(epfd, linux.EPOLL.CTL_MOD, fd, &mod_ev) catch {};
+                                    @import("posix_compat").epoll_ctl(epfd, linux.EPOLL.CTL_MOD, fd, &mod_ev) catch {};
                                 }
                             }
                         }
@@ -568,7 +568,7 @@ pub const Server = struct {
 
             loop_count += 1;
             if (loop_count % 5000 == 0) {
-                var to_close = std.ArrayList(posix.socket_t).init(self.allocator);
+                var to_close = std.array_list.Managed(posix.socket_t).init(self.allocator);
                 defer to_close.deinit();
                 var idle_it = connections.iterator();
                 while (idle_it.next()) |entry| {
@@ -588,7 +588,7 @@ pub const Server = struct {
                     }
                 }
                 for (to_close.items) |idle_fd| {
-                    posix.epoll_ctl(epfd, linux.EPOLL.CTL_DEL, idle_fd, null) catch {};
+                    @import("posix_compat").epoll_ctl(epfd, linux.EPOLL.CTL_DEL, idle_fd, null) catch {};
                     if (connections.fetchRemove(idle_fd)) |entry| {
                         var conn = entry.value;
                         conn.deinit();
@@ -606,7 +606,7 @@ pub const Server = struct {
             // are closed proactively to speed up shutdown.
             if (self.draining) {
                 // Close connections that have finished sending (no pending data)
-                var drain_close = std.ArrayList(posix.socket_t).init(self.allocator);
+                var drain_close = std.array_list.Managed(posix.socket_t).init(self.allocator);
                 defer drain_close.deinit();
                 var drain_it = connections.iterator();
                 while (drain_it.next()) |entry| {
@@ -615,7 +615,7 @@ pub const Server = struct {
                     }
                 }
                 for (drain_close.items) |drain_fd| {
-                    posix.epoll_ctl(epfd, linux.EPOLL.CTL_DEL, drain_fd, null) catch {};
+                    @import("posix_compat").epoll_ctl(epfd, linux.EPOLL.CTL_DEL, drain_fd, null) catch {};
                     if (connections.fetchRemove(drain_fd)) |entry| {
                         var conn = entry.value;
                         conn.deinit();
@@ -628,7 +628,7 @@ pub const Server = struct {
             }
         }
 
-        posix.close(sock);
+        @import("posix_compat").close(sock);
         self.listener = null;
     }
 
@@ -678,7 +678,7 @@ pub const Server = struct {
                                 .events = linux.EPOLL.IN | linux.EPOLL.OUT | linux.EPOLL.RDHUP,
                                 .data = .{ .fd = fd },
                             };
-                            posix.epoll_ctl(epfd, linux.EPOLL.CTL_MOD, fd, &mod_ev) catch {};
+                            @import("posix_compat").epoll_ctl(epfd, linux.EPOLL.CTL_MOD, fd, &mod_ev) catch {};
                             return;
                         }
                         log.warn("TLS handshake failed on fd={d}", .{fd});
@@ -739,7 +739,7 @@ pub const Server = struct {
                 }
             }
             return error.WriteError;
-        } else posix.write(fd, conn.send_buf.items) catch |err| switch (err) {
+        } else @import("posix_compat").write(fd, conn.send_buf.items) catch |err| switch (err) {
             error.WouldBlock => return,
             else => return err,
         };
@@ -763,7 +763,7 @@ pub const Server = struct {
     pub fn initiateGracefulDrain(self: *Server) void {
         if (self.draining) return; // Already draining
         self.draining = true;
-        self.drain_start_ms = std.time.milliTimestamp();
+        self.drain_start_ms = @import("time_compat").milliTimestamp();
         log.info("Graceful shutdown initiated: draining connections (timeout={d}ms)", .{self.drain_timeout_ms});
     }
 
@@ -810,14 +810,14 @@ test "Server init creates valid server" {
 }
 
 test "Server stop sets running to false" {
-    const server = try Server.init(testing.allocator, "127.0.0.1", 0, &testHandler, 4);
+    var server = try Server.init(testing.allocator, "127.0.0.1", 0, &testHandler, 4);
     server.running = true;
     server.stop();
     try testing.expect(!server.running);
 }
 
 test "Server initiateGracefulDrain sets draining flag" {
-    const server = try Server.init(testing.allocator, "127.0.0.1", 0, &testHandler, 4);
+    var server = try Server.init(testing.allocator, "127.0.0.1", 0, &testHandler, 4);
     server.running = true;
 
     try testing.expect(!server.draining);
@@ -829,49 +829,49 @@ test "Server initiateGracefulDrain sets draining flag" {
 }
 
 test "Server initiateGracefulDrain is idempotent" {
-    const server = try Server.init(testing.allocator, "127.0.0.1", 0, &testHandler, 4);
+    var server = try Server.init(testing.allocator, "127.0.0.1", 0, &testHandler, 4);
     server.running = true;
 
     server.initiateGracefulDrain();
     const first_drain_start = server.drain_start_ms;
     // Small sleep to ensure timestamp would change
-    std.time.sleep(1_000_000); // 1ms
+    @import("time_compat").sleep(1_000_000); // 1ms
     server.initiateGracefulDrain();
     // drain_start_ms should not change on second call
     try testing.expectEqual(first_drain_start, server.drain_start_ms);
 }
 
 test "Server isDrainComplete returns false when not draining" {
-    const server = try Server.init(testing.allocator, "127.0.0.1", 0, &testHandler, 4);
-    try testing.expect(!server.isDrainComplete(5, std.time.milliTimestamp()));
+    var server = try Server.init(testing.allocator, "127.0.0.1", 0, &testHandler, 4);
+    try testing.expect(!server.isDrainComplete(5, @import("time_compat").milliTimestamp()));
 }
 
 test "Server isDrainComplete returns true when no connections" {
-    const server = try Server.init(testing.allocator, "127.0.0.1", 0, &testHandler, 4);
+    var server = try Server.init(testing.allocator, "127.0.0.1", 0, &testHandler, 4);
     server.draining = true;
-    server.drain_start_ms = std.time.milliTimestamp();
-    try testing.expect(server.isDrainComplete(0, std.time.milliTimestamp()));
+    server.drain_start_ms = @import("time_compat").milliTimestamp();
+    try testing.expect(server.isDrainComplete(0, @import("time_compat").milliTimestamp()));
 }
 
 test "Server isDrainComplete returns true on timeout" {
-    const server = try Server.init(testing.allocator, "127.0.0.1", 0, &testHandler, 4);
+    var server = try Server.init(testing.allocator, "127.0.0.1", 0, &testHandler, 4);
     server.draining = true;
     server.drain_timeout_ms = 100;
     // Simulate drain started 200ms ago
-    server.drain_start_ms = std.time.milliTimestamp() - 200;
-    try testing.expect(server.isDrainComplete(5, std.time.milliTimestamp()));
+    server.drain_start_ms = @import("time_compat").milliTimestamp() - 200;
+    try testing.expect(server.isDrainComplete(5, @import("time_compat").milliTimestamp()));
 }
 
 test "Server isDrainComplete returns false when connections active and timeout not reached" {
-    const server = try Server.init(testing.allocator, "127.0.0.1", 0, &testHandler, 4);
+    var server = try Server.init(testing.allocator, "127.0.0.1", 0, &testHandler, 4);
     server.draining = true;
     server.drain_timeout_ms = 30_000;
-    server.drain_start_ms = std.time.milliTimestamp();
-    try testing.expect(!server.isDrainComplete(5, std.time.milliTimestamp()));
+    server.drain_start_ms = @import("time_compat").milliTimestamp();
+    try testing.expect(!server.isDrainComplete(5, @import("time_compat").milliTimestamp()));
 }
 
 test "Server double signal: first drains, second force-stops" {
-    const server = try Server.init(testing.allocator, "127.0.0.1", 0, &testHandler, 4);
+    var server = try Server.init(testing.allocator, "127.0.0.1", 0, &testHandler, 4);
     server.running = true;
 
     // First signal: initiate drain

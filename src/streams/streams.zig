@@ -22,8 +22,8 @@ pub const Record = struct {
 
 /// Topology — directed acyclic graph of processing nodes.
 pub const Topology = struct {
-    nodes: std.ArrayList(Node),
-    edges: std.ArrayList(Edge),
+    nodes: std.array_list.Managed(Node),
+    edges: std.array_list.Managed(Edge),
     allocator: Allocator,
 
     pub const NodeType = enum { source, processor, sink };
@@ -41,8 +41,8 @@ pub const Topology = struct {
 
     pub fn init(alloc: Allocator) Topology {
         return .{
-            .nodes = std.ArrayList(Node).init(alloc),
-            .edges = std.ArrayList(Edge).init(alloc),
+            .nodes = std.array_list.Managed(Node).init(alloc),
+            .edges = std.array_list.Managed(Edge).init(alloc),
             .allocator = alloc,
         };
     }
@@ -99,13 +99,13 @@ pub const Topology = struct {
 
 /// Processor context — passed to processor functions.
 pub const ProcessorContext = struct {
-    output_records: std.ArrayList(Record),
+    output_records: std.array_list.Managed(Record),
     state_store: *KeyValueStore,
     allocator: Allocator,
 
     pub fn init(alloc: Allocator, store: *KeyValueStore) ProcessorContext {
         return .{
-            .output_records = std.ArrayList(Record).init(alloc),
+            .output_records = std.array_list.Managed(Record).init(alloc),
             .state_store = store,
             .allocator = alloc,
         };
@@ -177,12 +177,12 @@ pub const KeyValueStore = struct {
 ///
 /// Wraps a series of records with transformation operations.
 pub const KStream = struct {
-    records: std.ArrayList(Record),
+    records: std.array_list.Managed(Record),
     allocator: Allocator,
 
     pub fn init(alloc: Allocator) KStream {
         return .{
-            .records = std.ArrayList(Record).init(alloc),
+            .records = std.array_list.Managed(Record).init(alloc),
             .allocator = alloc,
         };
     }
@@ -243,13 +243,13 @@ pub const KStream = struct {
     }
 
     /// GroupByKey: group records by their key. Returns a map of key → records.
-    pub fn groupByKey(self: *const KStream, alloc: Allocator) !std.StringHashMap(std.ArrayList(Record)) {
-        var groups = std.StringHashMap(std.ArrayList(Record)).init(alloc);
+    pub fn groupByKey(self: *const KStream, alloc: Allocator) !std.StringHashMap(std.array_list.Managed(Record)) {
+        var groups = std.StringHashMap(std.array_list.Managed(Record)).init(alloc);
         for (self.records.items) |rec| {
             const key = rec.key orelse continue;
             const entry = try groups.getOrPut(key);
             if (!entry.found_existing) {
-                entry.value_ptr.* = std.ArrayList(Record).init(alloc);
+                entry.value_ptr.* = std.array_list.Managed(Record).init(alloc);
             }
             try entry.value_ptr.append(rec);
         }
@@ -338,7 +338,7 @@ pub const WindowStore = struct {
     pub const WindowBucket = struct {
         window_start: i64,
         window_end: i64,
-        values: std.ArrayList([]u8),
+        values: std.array_list.Managed([]u8),
     };
 
     pub fn init(alloc: Allocator, name: []const u8, window_size_ms: i64) WindowStore {
@@ -370,7 +370,7 @@ pub const WindowStore = struct {
             entry.value_ptr.* = .{
                 .window_start = window_start,
                 .window_end = window_start + self.window_size_ms,
-                .values = std.ArrayList([]u8).init(self.allocator),
+                .values = std.array_list.Managed([]u8).init(self.allocator),
             };
         } else {
             self.allocator.free(window_key);

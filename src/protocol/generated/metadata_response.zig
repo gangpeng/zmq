@@ -140,7 +140,7 @@ pub const MetadataResponse = struct {
                 if (version >= 9) ser.writeEmptyTaggedFields(buf, pos);
             }
 
-            pub fn deserialize(_: Allocator, buf: []const u8, pos: *usize, version: i16) !MetadataResponsePartition {
+            pub fn deserialize(alloc: Allocator, buf: []const u8, pos: *usize, version: i16) !MetadataResponsePartition {
                 var result = MetadataResponsePartition{};
                 result.error_code = ser.readI16(buf, pos);
                 result.partition_index = ser.readI32(buf, pos);
@@ -153,14 +153,22 @@ pub const MetadataResponse = struct {
                 else
                     (try ser.readArrayLen(buf, pos)) orelse 0;
                 if (replica_nodes_len > 0) {
-                    pos.* += replica_nodes_len * 4;
+                    const replica_nodes_items = try alloc.alloc(i32, replica_nodes_len);
+                    for (replica_nodes_items) |*item| {
+                        item.* = ser.readI32(buf, pos);
+                    }
+                    result.replica_nodes = replica_nodes_items;
                 }
                 const isr_nodes_len: usize = if (version >= 9)
                     (try ser.readCompactArrayLen(buf, pos)) orelse 0
                 else
                     (try ser.readArrayLen(buf, pos)) orelse 0;
                 if (isr_nodes_len > 0) {
-                    pos.* += isr_nodes_len * 4;
+                    const isr_nodes_items = try alloc.alloc(i32, isr_nodes_len);
+                    for (isr_nodes_items) |*item| {
+                        item.* = ser.readI32(buf, pos);
+                    }
+                    result.isr_nodes = isr_nodes_items;
                 }
                 if (version >= 5) {
                     const offline_replicas_len: usize = if (version >= 9)
@@ -168,7 +176,11 @@ pub const MetadataResponse = struct {
                     else
                         (try ser.readArrayLen(buf, pos)) orelse 0;
                     if (offline_replicas_len > 0) {
-                        pos.* += offline_replicas_len * 4;
+                        const offline_replicas_items = try alloc.alloc(i32, offline_replicas_len);
+                        for (offline_replicas_items) |*item| {
+                            item.* = ser.readI32(buf, pos);
+                        }
+                        result.offline_replicas = offline_replicas_items;
                     }
                 }
                 if (version >= 9) try ser.skipTaggedFields(buf, pos);

@@ -2,24 +2,53 @@ const std = @import("std");
 const posix = std.posix;
 const log = std.log.scoped(.main);
 
-const Server = @import("network/server.zig").Server;
-const MetricsServer = @import("network/metrics_server.zig").MetricsServer;
-const handler = @import("broker/handler.zig");
-const Broker = handler.Broker;
+const network = @import("network");
+const Server = network.Server;
+const MetricsServer = network.MetricsServer;
+const RaftClientPool = network.RaftClientPool;
+const broker_mod = @import("broker");
+const handler = broker_mod.handler;
+const Broker = broker_mod.Broker;
 const ConfigFile = @import("config.zig").ConfigFile;
-const ElectionLoop = @import("raft/election_loop.zig").ElectionLoop;
-const RaftClientPool = @import("network/raft_client.zig").RaftClientPool;
-const RaftState = @import("raft/state.zig").RaftState;
+const raft_mod = @import("raft");
+const ElectionLoop = raft_mod.ElectionLoop;
+const RaftState = raft_mod.RaftState;
 const ProcessRoles = @import("roles.zig").ProcessRoles;
 const Controller = @import("controller/controller.zig").Controller;
 const MetadataClient = @import("controller/metadata_client.zig").MetadataClient;
 const handler_routing = @import("network/handler_routing.zig");
-const TlsConfig = @import("security/tls.zig").TlsConfig;
-const TlsContext = @import("security/tls.zig").TlsContext;
+const security = @import("security");
+const TlsConfig = security.tls.TlsConfig;
+const TlsContext = security.tls.TlsContext;
 
-pub const std_options = .{
+pub const std_options: std.Options = .{
     .log_level = .info,
 };
+
+const Stdout = struct {
+    fn print(_: *Stdout, comptime fmt: []const u8, args: anytype) !void {
+        var stack_buf: [8192]u8 = undefined;
+        const text = std.fmt.bufPrint(&stack_buf, fmt, args) catch {
+            const heap_text = try std.fmt.allocPrint(std.heap.c_allocator, fmt, args);
+            defer std.heap.c_allocator.free(heap_text);
+            try writeAll(posix.STDOUT_FILENO, heap_text);
+            return;
+        };
+        try writeAll(posix.STDOUT_FILENO, text);
+    }
+};
+
+fn writeAll(fd: posix.fd_t, bytes: []const u8) !void {
+    var written: usize = 0;
+    while (written < bytes.len) {
+        const rc = std.os.linux.write(fd, bytes[written..].ptr, bytes.len - written);
+        switch (std.os.linux.errno(rc)) {
+            .SUCCESS => written += @intCast(rc),
+            .INTR => {},
+            else => return error.WriteFailed,
+        }
+    }
+}
 
 /// Global pointers for signal handler access.
 var global_server: ?*Server = null;
@@ -41,7 +70,7 @@ fn serializePreparedRegistry() ?[]const u8 {
     };
 }
 
-fn handleSignal(sig: i32) callconv(.C) void {
+fn handleSignal(sig: posix.SIG) callconv(.c) void {
     _ = sig;
     if (global_shutdown) {
         // Second signal: force immediate shutdown (no drain)
@@ -61,8 +90,8 @@ fn handleSignal(sig: i32) callconv(.C) void {
     if (global_metrics_server) |m| m.stop();
 }
 
-pub fn main() !void {
-    const stdout = std.io.getStdOut().writer();
+pub fn main(init: std.process.Init) !void {
+    var stdout = Stdout{};
     try stdout.print(
         \\
         \\  ┌─────────────────────────────────────────────┐
@@ -85,6 +114,9 @@ pub fn main() !void {
     var s3_host: ?[]const u8 = null;
     var s3_port: u16 = 9000;
     var s3_bucket: []const u8 = "automq";
+    var s3_access_key: []const u8 = "minioadmin";
+    var s3_secret_key: []const u8 = "minioadmin";
+    var s3_tls_ca_file: ?[]const u8 = null;
     var node_id: i32 = 0;
     var config_path: ?[]const u8 = null;
     var advertised_host: []const u8 = "localhost";
@@ -98,7 +130,7 @@ pub fn main() !void {
     // Configurable S3 WAL and performance parameters
     var s3_wal_batch_size: usize = 4 * 1024 * 1024;
     var s3_wal_flush_interval: i64 = 250;
-    var s3_wal_flush_mode: []const u8 = "group_commit";
+    var s3_wal_flush_mode: []const u8 = "sync";
     var cache_max_size: u64 = 256 * 1024 * 1024;
     var s3_block_cache_size: u64 = 64 * 1024 * 1024;
     var compaction_interval: i64 = 300_000;
@@ -109,7 +141,7 @@ pub fn main() !void {
     var tls_ca_file: ?[]const u8 = null;
     var tls_client_auth_str: []const u8 = "none";
 
-    var args = try std.process.argsWithAllocator(alloc);
+    var args = try std.process.Args.Iterator.initAllocator(init.minimal.args, alloc);
     defer args.deinit();
     _ = args.skip();
 
@@ -124,6 +156,12 @@ pub fn main() !void {
             if (args.next()) |p| s3_port = std.fmt.parseInt(u16, p, 10) catch 9000;
         } else if (std.mem.eql(u8, arg, "--s3-bucket")) {
             if (args.next()) |b| s3_bucket = b;
+        } else if (std.mem.eql(u8, arg, "--s3-access-key")) {
+            if (args.next()) |k| s3_access_key = k;
+        } else if (std.mem.eql(u8, arg, "--s3-secret-key")) {
+            if (args.next()) |k| s3_secret_key = k;
+        } else if (std.mem.eql(u8, arg, "--s3-ca-file")) {
+            s3_tls_ca_file = args.next();
         } else if (std.mem.eql(u8, arg, "--metrics-port")) {
             if (args.next()) |p| metrics_port = std.fmt.parseInt(u16, p, 10) catch 9090;
         } else if (std.mem.eql(u8, arg, "--node-id")) {
@@ -182,6 +220,9 @@ pub fn main() !void {
         if (s3_host == null) s3_host = cfg.getString("s3.endpoint.host");
         s3_port = cfg.getInt(u16, "s3.endpoint.port", s3_port);
         s3_bucket = cfg.getStringOr("s3.bucket", s3_bucket);
+        s3_access_key = cfg.getStringOr("s3.access.key", s3_access_key);
+        s3_secret_key = cfg.getStringOr("s3.secret.key", s3_secret_key);
+        if (s3_tls_ca_file == null) s3_tls_ca_file = cfg.getString("s3.tls.ca.file");
         port = cfg.getInt(u16, "listeners.port", port);
         metrics_port = cfg.getInt(u16, "metrics.port", metrics_port);
         node_id = cfg.getInt(i32, "broker.id", node_id);
@@ -218,24 +259,24 @@ pub fn main() !void {
     }
 
     // Ignore SIGPIPE — writing to a closed TCP socket must not kill the broker.
-    // Without this, posix.write() on a disconnected client sends SIGPIPE which
+    // Without this, @import("posix_compat").write() on a disconnected client sends SIGPIPE which
     // terminates the process (the default action). We want write() to return
     // error.BrokenPipe instead so the event loop can close the connection cleanly.
     const sigpipe_sa = posix.Sigaction{
         .handler = .{ .handler = posix.SIG.IGN },
-        .mask = posix.empty_sigset,
+        .mask = posix.sigemptyset(),
         .flags = 0,
     };
-    try posix.sigaction(posix.SIG.PIPE, &sigpipe_sa, null);
+    posix.sigaction(posix.SIG.PIPE, &sigpipe_sa, null);
 
     // Install signal handlers for graceful shutdown
     const sa = posix.Sigaction{
         .handler = .{ .handler = handleSignal },
-        .mask = posix.empty_sigset,
+        .mask = posix.sigemptyset(),
         .flags = 0,
     };
-    try posix.sigaction(posix.SIG.INT, &sa, null);
-    try posix.sigaction(posix.SIG.TERM, &sa, null);
+    posix.sigaction(posix.SIG.INT, &sa, null);
+    posix.sigaction(posix.SIG.TERM, &sa, null);
 
     // Parse WAL flush mode string to enum
     const wal_flush_mode: handler.Broker.WalFlushMode = if (std.mem.eql(u8, s3_wal_flush_mode, "async"))
@@ -285,6 +326,9 @@ pub fn main() !void {
             .s3_endpoint_host = s3_host,
             .s3_endpoint_port = s3_port,
             .s3_bucket = s3_bucket,
+            .s3_access_key = s3_access_key,
+            .s3_secret_key = s3_secret_key,
+            .s3_tls_ca_file = s3_tls_ca_file,
             .advertised_host = advertised_host,
             .s3_wal_batch_size = s3_wal_batch_size,
             .s3_wal_flush_interval_ms = s3_wal_flush_interval,

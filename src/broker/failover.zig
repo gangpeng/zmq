@@ -27,14 +27,14 @@ pub const FailoverController = struct {
         node_id: i32,
         last_heartbeat_ms: i64,
         is_fenced: bool,
-        owned_partitions: std.ArrayList(PartitionId),
+        owned_partitions: std.array_list.Managed(PartitionId),
 
         pub fn init(alloc: Allocator, nid: i32) NodeState {
             return .{
                 .node_id = nid,
-                .last_heartbeat_ms = std.time.milliTimestamp(),
+                .last_heartbeat_ms = @import("time_compat").milliTimestamp(),
                 .is_fenced = false,
-                .owned_partitions = std.ArrayList(PartitionId).init(alloc),
+                .owned_partitions = std.array_list.Managed(PartitionId).init(alloc),
             };
         }
 
@@ -74,7 +74,7 @@ pub const FailoverController = struct {
     pub fn recordHeartbeat(self: *FailoverController, nid: i32) void {
         if (self.known_nodes.getPtr(nid)) |state| {
             const was_fenced = state.is_fenced;
-            state.last_heartbeat_ms = std.time.milliTimestamp();
+            state.last_heartbeat_ms = @import("time_compat").milliTimestamp();
             state.is_fenced = false;
             if (was_fenced) {
                 log.info("Node {d} un-fenced after heartbeat", .{nid});
@@ -191,7 +191,7 @@ test "FailoverController heartbeat prevents failover" {
     fc.recordHeartbeat(1);
 
     // Tick with current time — node 1 just heartbeated, no failover
-    const now = std.time.milliTimestamp();
+    const now = @import("time_compat").milliTimestamp();
     const count = fc.tick(now);
     try testing.expectEqual(@as(u32, 0), count);
 }
@@ -207,7 +207,7 @@ test "FailoverController detects timeout and fences node" {
     }
 
     // Tick with current time — should detect failure
-    const now = std.time.milliTimestamp();
+    const now = @import("time_compat").milliTimestamp();
     const count = fc.tick(now);
     try testing.expectEqual(@as(u32, 1), count);
 
@@ -230,7 +230,7 @@ test "FailoverController does not failover self" {
         state.last_heartbeat_ms = 0;
     }
 
-    const now = std.time.milliTimestamp();
+    const now = @import("time_compat").milliTimestamp();
     const count = fc.tick(now);
     try testing.expectEqual(@as(u32, 0), count);
 }
@@ -244,7 +244,7 @@ test "FailoverController does not re-fence already fenced node" {
         state.last_heartbeat_ms = 0;
     }
 
-    const now = std.time.milliTimestamp();
+    const now = @import("time_compat").milliTimestamp();
     _ = fc.tick(now); // First tick fences
     const count2 = fc.tick(now); // Second tick should not re-fence
     try testing.expectEqual(@as(u32, 0), count2);
@@ -263,7 +263,7 @@ test "FailoverController epoch bumps on each failover" {
 
     try testing.expectEqual(@as(u64, 1), fc.currentEpoch());
 
-    const now = std.time.milliTimestamp();
+    const now = @import("time_compat").milliTimestamp();
     const count = fc.tick(now);
     try testing.expectEqual(@as(u32, 2), count);
 
@@ -279,7 +279,7 @@ test "FailoverController heartbeat un-fences previously fenced node" {
 
     // Force timeout and fence
     if (fc.known_nodes.getPtr(1)) |state| state.last_heartbeat_ms = 0;
-    const now = std.time.milliTimestamp();
+    const now = @import("time_compat").milliTimestamp();
     _ = fc.tick(now);
 
     // Verify fenced

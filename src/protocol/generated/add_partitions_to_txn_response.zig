@@ -8,6 +8,103 @@ const std = @import("std");
 const ser = @import("../serialization.zig");
 const Allocator = std.mem.Allocator;
 
+pub const AddPartitionsToTxnTopicResult = struct {
+    /// The topic name.
+    /// Versions: 0+
+    name: ?[]const u8 = null,
+    /// The results for each partition
+    /// Versions: 0+
+    results_by_partition: []const AddPartitionsToTxnPartitionResult = &.{},
+
+    pub fn serialize(self: *const AddPartitionsToTxnTopicResult, buf: []u8, pos: *usize, version: i16) void {
+        if (version >= 3) {
+            ser.writeCompactString(buf, pos, self.name);
+        } else {
+            ser.writeString(buf, pos, self.name);
+        }
+        if (version >= 3) {
+            ser.writeCompactArrayLen(buf, pos, self.results_by_partition.len);
+        } else {
+            ser.writeArrayLen(buf, pos, self.results_by_partition.len);
+        }
+        for (self.results_by_partition) |item| {
+            item.serialize(buf, pos, version);
+        }
+        if (version >= 3) ser.writeEmptyTaggedFields(buf, pos);
+    }
+
+    pub fn deserialize(alloc: Allocator, buf: []const u8, pos: *usize, version: i16) !AddPartitionsToTxnTopicResult {
+        var result = AddPartitionsToTxnTopicResult{};
+        result.name = if (version >= 3)
+            try ser.readCompactString(buf, pos)
+        else
+            try ser.readString(buf, pos);
+        const results_by_partition_len: usize = if (version >= 3)
+            (try ser.readCompactArrayLen(buf, pos)) orelse 0
+        else
+            (try ser.readArrayLen(buf, pos)) orelse 0;
+        if (results_by_partition_len > 0) {
+            const results_by_partition_items = try alloc.alloc(AddPartitionsToTxnPartitionResult, results_by_partition_len);
+            for (results_by_partition_items) |*item| {
+                item.* = try AddPartitionsToTxnPartitionResult.deserialize(alloc, buf, pos, version);
+            }
+            result.results_by_partition = results_by_partition_items;
+        }
+        if (version >= 3) try ser.skipTaggedFields(buf, pos);
+        return result;
+    }
+
+    pub fn calcSize(self: *const AddPartitionsToTxnTopicResult, version: i16) usize {
+        var size: usize = 0;
+        if (version >= 3) {
+            size += ser.compactStringSize(self.name);
+        } else {
+            size += ser.stringSize(self.name);
+        }
+        if (version >= 3) {
+            size += ser.unsignedVarintSize(self.results_by_partition.len + 1);
+        } else {
+            size += 4;
+        }
+        for (self.results_by_partition) |item| {
+            size += item.calcSize(version);
+        }
+        if (version >= 3) size += 1;
+        return size;
+    }
+};
+
+pub const AddPartitionsToTxnPartitionResult = struct {
+    /// The partition indexes.
+    /// Versions: 0+
+    partition_index: i32 = 0,
+    /// The response error code.
+    /// Versions: 0+
+    partition_error_code: i16 = 0,
+
+    pub fn serialize(self: *const AddPartitionsToTxnPartitionResult, buf: []u8, pos: *usize, version: i16) void {
+        ser.writeI32(buf, pos, self.partition_index);
+        ser.writeI16(buf, pos, self.partition_error_code);
+        if (version >= 3) ser.writeEmptyTaggedFields(buf, pos);
+    }
+
+    pub fn deserialize(_: Allocator, buf: []const u8, pos: *usize, version: i16) !AddPartitionsToTxnPartitionResult {
+        var result = AddPartitionsToTxnPartitionResult{};
+        result.partition_index = ser.readI32(buf, pos);
+        result.partition_error_code = ser.readI16(buf, pos);
+        if (version >= 3) try ser.skipTaggedFields(buf, pos);
+        return result;
+    }
+
+    pub fn calcSize(_: *const AddPartitionsToTxnPartitionResult, version: i16) usize {
+        var size: usize = 0;
+        size += 4;
+        size += 2;
+        if (version >= 3) size += 1;
+        return size;
+    }
+};
+
 pub const AddPartitionsToTxnResponse = struct {
     pub const AddPartitionsToTxnResult = struct {
         /// The transactional id corresponding to the transaction.
@@ -38,7 +135,7 @@ pub const AddPartitionsToTxnResponse = struct {
             if (version >= 3) ser.writeEmptyTaggedFields(buf, pos);
         }
 
-        pub fn deserialize(_: Allocator, buf: []const u8, pos: *usize, version: i16) !AddPartitionsToTxnResult {
+        pub fn deserialize(alloc: Allocator, buf: []const u8, pos: *usize, version: i16) !AddPartitionsToTxnResult {
             var result = AddPartitionsToTxnResult{};
             if (version >= 4) {
                 result.transactional_id = if (version >= 3)
@@ -51,7 +148,13 @@ pub const AddPartitionsToTxnResponse = struct {
                     (try ser.readCompactArrayLen(buf, pos)) orelse 0
                 else
                     (try ser.readArrayLen(buf, pos)) orelse 0;
-                _ = topic_results_len;
+                if (topic_results_len > 0) {
+                    const topic_results_items = try alloc.alloc(AddPartitionsToTxnTopicResult, topic_results_len);
+                    for (topic_results_items) |*item| {
+                        item.* = try AddPartitionsToTxnTopicResult.deserialize(alloc, buf, pos, version);
+                    }
+                    result.topic_results = topic_results_items;
+                }
             }
             if (version >= 3) try ser.skipTaggedFields(buf, pos);
             return result;
@@ -71,6 +174,9 @@ pub const AddPartitionsToTxnResponse = struct {
                     size += ser.unsignedVarintSize(self.topic_results.len + 1);
                 } else {
                     size += 4;
+                }
+                for (self.topic_results) |item| {
+                    size += item.calcSize(version);
                 }
             }
             if (version >= 3) size += 1;
@@ -140,7 +246,13 @@ pub const AddPartitionsToTxnResponse = struct {
             (try ser.readCompactArrayLen(buf, pos)) orelse 0
         else
             (try ser.readArrayLen(buf, pos)) orelse 0;
-        _ = results_by_topic_v3_and_below_len;
+        if (results_by_topic_v3_and_below_len > 0) {
+            const results_by_topic_v3_and_below_items = try alloc.alloc(AddPartitionsToTxnTopicResult, results_by_topic_v3_and_below_len);
+            for (results_by_topic_v3_and_below_items) |*item| {
+                item.* = try AddPartitionsToTxnTopicResult.deserialize(alloc, buf, pos, version);
+            }
+            result.results_by_topic_v3_and_below = results_by_topic_v3_and_below_items;
+        }
         if (version >= 3) try ser.skipTaggedFields(buf, pos);
         return result;
     }
@@ -165,6 +277,9 @@ pub const AddPartitionsToTxnResponse = struct {
             size += ser.unsignedVarintSize(self.results_by_topic_v3_and_below.len + 1);
         } else {
             size += 4;
+        }
+        for (self.results_by_topic_v3_and_below) |item| {
+            size += item.calcSize(version);
         }
         if (version >= 3) size += 1;
         return size;

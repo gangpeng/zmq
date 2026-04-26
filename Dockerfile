@@ -4,10 +4,11 @@
 
 FROM debian:bookworm-slim AS builder
 
-# Install Zig 0.13.0
+# Install Zig 0.16.0
 RUN apt-get update && apt-get install -y curl xz-utils && \
-    curl -L https://ziglang.org/download/0.13.0/zig-linux-x86_64-0.13.0.tar.xz | tar xJ -C /opt && \
-    ln -s /opt/zig-linux-x86_64-0.13.0/zig /usr/local/bin/zig
+    curl -L https://ziglang.org/download/0.16.0/zig-x86_64-linux-0.16.0.tar.xz | tar xJ -C /opt && \
+    ln -s /opt/zig-x86_64-linux-0.16.0/zig /usr/local/bin/zig && \
+    rm -rf /var/lib/apt/lists/*
 
 WORKDIR /src
 COPY build.zig ./
@@ -19,7 +20,7 @@ RUN zig build -Doptimize=ReleaseFast
 # Stage 2: Minimal runtime
 FROM debian:bookworm-slim
 
-RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates && \
+RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates curl libssl3 && \
     rm -rf /var/lib/apt/lists/* && \
     mkdir -p /data/automq
 

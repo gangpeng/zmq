@@ -52,7 +52,7 @@ pub const BrokerRegistry = struct {
     pub fn register(self: *BrokerRegistry, broker_id: i32, host: []const u8, port: u16) !i64 {
         const epoch = self.next_broker_epoch;
         self.next_broker_epoch += 1;
-        const now = std.time.milliTimestamp();
+        const now = @import("time_compat").milliTimestamp();
 
         // If re-registering, free old host string
         if (self.brokers.getPtr(broker_id)) |existing| {
@@ -88,7 +88,7 @@ pub const BrokerRegistry = struct {
             return false;
         }
 
-        entry.last_heartbeat_ms = std.time.milliTimestamp();
+        entry.last_heartbeat_ms = @import("time_compat").milliTimestamp();
         // Unfence after first successful heartbeat
         if (entry.fenced) {
             entry.fenced = false;
@@ -100,7 +100,7 @@ pub const BrokerRegistry = struct {
     /// Evict brokers that haven't sent a heartbeat within timeout_ms.
     /// Returns the number of evicted brokers.
     pub fn evictExpired(self: *BrokerRegistry, timeout_ms: i64) usize {
-        const now = std.time.milliTimestamp();
+        const now = @import("time_compat").milliTimestamp();
         var to_evict: [64]i32 = undefined;
         var evict_count: usize = 0;
 
@@ -188,7 +188,7 @@ test "BrokerRegistry evict expired" {
 
     // Force expiration by setting last_heartbeat_ms to the past
     if (registry.brokers.getPtr(100)) |info| {
-        info.last_heartbeat_ms = std.time.milliTimestamp() - 60_000;
+        info.last_heartbeat_ms = @import("time_compat").milliTimestamp() - 60_000;
     }
 
     const evicted = registry.evictExpired(30_000);
@@ -250,7 +250,7 @@ test "BrokerRegistry eviction does not affect healthy brokers" {
 
     // Force only broker 101 to expire
     if (registry.brokers.getPtr(101)) |info| {
-        info.last_heartbeat_ms = std.time.milliTimestamp() - 60_000;
+        info.last_heartbeat_ms = @import("time_compat").milliTimestamp() - 60_000;
     }
 
     const evicted = registry.evictExpired(30_000);

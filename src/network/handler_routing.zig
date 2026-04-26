@@ -1,7 +1,7 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const Controller = @import("../controller/controller.zig").Controller;
-const Broker = @import("../broker/handler.zig").Broker;
+const Broker = @import("broker").Broker;
 
 /// Handler routing for dual-port architecture.
 ///
@@ -79,7 +79,7 @@ pub fn brokerTick() void {
 // ---------------------------------------------------------------
 
 const testing = std.testing;
-const ser = @import("../protocol/serialization.zig");
+const ser = @import("protocol").serialization;
 
 fn buildTestRequest(buf: []u8, api_key: i16, api_version: i16, correlation_id: i32, header_version: i16) usize {
     var pos: usize = 0;

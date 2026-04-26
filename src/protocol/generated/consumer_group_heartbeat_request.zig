@@ -26,12 +26,16 @@ pub const ConsumerGroupHeartbeatRequest = struct {
             ser.writeEmptyTaggedFields(buf, pos);
         }
 
-        pub fn deserialize(_: Allocator, buf: []const u8, pos: *usize, _: i16) !TopicPartitions {
+        pub fn deserialize(alloc: Allocator, buf: []const u8, pos: *usize, _: i16) !TopicPartitions {
             var result = TopicPartitions{};
             result.topic_id = try ser.readUuid(buf, pos);
             const partitions_len: usize = (try ser.readCompactArrayLen(buf, pos)) orelse 0;
             if (partitions_len > 0) {
-                pos.* += partitions_len * 4;
+                const partitions_items = try alloc.alloc(i32, partitions_len);
+                for (partitions_items) |*item| {
+                    item.* = ser.readI32(buf, pos);
+                }
+                result.partitions = partitions_items;
             }
             try ser.skipTaggedFields(buf, pos);
             return result;
@@ -103,8 +107,12 @@ pub const ConsumerGroupHeartbeatRequest = struct {
         result.rack_id = try ser.readCompactString(buf, pos);
         result.rebalance_timeout_ms = ser.readI32(buf, pos);
         const subscribed_topic_names_len: usize = (try ser.readCompactArrayLen(buf, pos)) orelse 0;
-        for (0..subscribed_topic_names_len) |_| {
-            _ = try ser.readCompactString(buf, pos);
+        if (subscribed_topic_names_len > 0) {
+            const subscribed_topic_names_items = try alloc.alloc(?[]const u8, subscribed_topic_names_len);
+            for (subscribed_topic_names_items) |*item| {
+                item.* = try ser.readCompactString(buf, pos);
+            }
+            result.subscribed_topic_names = subscribed_topic_names_items;
         }
         result.server_assignor = try ser.readCompactString(buf, pos);
         const topic_partitions_len: usize = (try ser.readCompactArrayLen(buf, pos)) orelse 0;

@@ -1,21 +1,22 @@
 const std = @import("std");
 const testing = std.testing;
 const Allocator = std.mem.Allocator;
-const fs = std.fs;
+const fs = @import("fs_compat");
 
-const wal_mod = @import("../storage/wal.zig");
-const MemoryWal = wal_mod.MemoryWal;
-const Wal = wal_mod.Wal;
+const storage = @import("storage");
+const wal_mod = storage.wal;
+const MemoryWal = storage.MemoryWal;
+const Wal = storage.Wal;
 const S3WalBatcher = wal_mod.S3WalBatcher;
-const LogCache = @import("../storage/cache.zig").LogCache;
-const S3BlockCache = @import("../storage/cache.zig").S3BlockCache;
-const S3Storage = @import("../storage/s3_client.zig").S3Storage;
-const S3Client = @import("../storage/s3_client.zig").S3Client;
-const ObjectWriter = @import("../storage/s3.zig").ObjectWriter;
-const ObjectReader = @import("../storage/s3.zig").ObjectReader;
-const MockS3 = @import("../storage/s3.zig").MockS3;
-const RecordBatchHeader = @import("../protocol/record_batch.zig").RecordBatchHeader;
-const stream_mod = @import("../storage/stream.zig");
+const LogCache = storage.LogCache;
+const S3BlockCache = storage.S3BlockCache;
+const S3Storage = storage.S3Storage;
+const S3Client = storage.S3Client;
+const ObjectWriter = storage.ObjectWriter;
+const ObjectReader = storage.ObjectReader;
+const MockS3 = storage.MockS3;
+const RecordBatchHeader = @import("protocol").RecordBatchHeader;
+const stream_mod = storage.stream;
 const ObjectManager = stream_mod.ObjectManager;
 const log = std.log.scoped(.partition_store);
 
@@ -85,14 +86,15 @@ pub const PartitionStore = struct {
         s3_bucket: []const u8 = "automq",
         s3_access_key: []const u8 = "minioadmin",
         s3_secret_key: []const u8 = "minioadmin",
+        s3_tls_ca_file: ?[]const u8 = null,
         /// S3 WAL mode: use S3WalBatcher for batched, durable S3 writes.
         s3_wal_mode: bool = false,
         /// S3 WAL batcher max batch size (default 4MB).
         s3_wal_batch_size: usize = 4 * 1024 * 1024,
         /// S3 WAL batcher flush interval in milliseconds (default 250ms).
         s3_wal_flush_interval_ms: i64 = 250,
-        /// S3 WAL flush mode: sync, async_flush, or group_commit (default group_commit).
-        s3_wal_flush_mode: wal_mod.WalFlushMode = .group_commit,
+        /// S3 WAL flush mode: sync, async_flush, or group_commit (default sync).
+        s3_wal_flush_mode: wal_mod.WalFlushMode = .sync,
     };
 
     /// Initialize with in-memory storage (for testing).
@@ -122,6 +124,7 @@ pub const PartitionStore = struct {
                 .bucket = config.s3_bucket,
                 .access_key = config.s3_access_key,
                 .secret_key = config.s3_secret_key,
+                .tls_ca_file = config.s3_tls_ca_file,
             });
             store.s3_storage = S3Storage.initReal(alloc, &store.s3_client.?);
 
@@ -171,7 +174,7 @@ pub const PartitionStore = struct {
                     break;
                 } else |err| {
                     log.warn("S3 bucket create attempt {d}/5 failed: {}", .{ s3_attempt + 1, err });
-                    if (s3_attempt < 4) std.time.sleep(2 * 1_000_000_000); // 2 seconds
+                    if (s3_attempt < 4) @import("time_compat").sleep(2 * 1_000_000_000); // 2 seconds
                 }
             }
         }
@@ -306,7 +309,7 @@ pub const PartitionStore = struct {
         if (records.len >= BATCH_HEADER_SIZE and records[16] == 2) {
             const first_timestamp = std.mem.readInt(i64, records[29..37], .big);
             if (first_timestamp > 0) {
-                const now = std.time.milliTimestamp();
+                const now = @import("time_compat").milliTimestamp();
                 // Reject timestamps more than 7 days in the future (sensible default)
                 const max_drift_ms: i64 = 7 * 24 * 60 * 60 * 1000;
                 if (first_timestamp > now + max_drift_ms) {
@@ -316,50 +319,28 @@ pub const PartitionStore = struct {
             }
         }
 
-        // Write to WAL (filesystem only)
-        if (self.fs_wal) |*wal| {
-            _ = try wal.append(records);
-        }
-        // Also track in memory WAL (for totalRecords() in memory mode)
-        if (self.memory_wal) |*mwal| {
-            _ = try mwal.append(records);
-        }
-
-        // Write to LogCache with base_offset rewritten (fix #2)
         const stream_id = hashPartitionKey(topic, partition_id);
-        const data_owned = try self.allocator.dupe(u8, records);
+
+        // Rewrite base_offset once and persist the broker-assigned bytes to all
+        // local/S3 tiers. The original client batch may contain an arbitrary
+        // base offset and must not be stored verbatim.
+        var data_for_cache: ?[]u8 = try self.allocator.dupe(u8, records);
+        errdefer if (data_for_cache) |data| self.allocator.free(data);
+
+        const data_owned = data_for_cache.?;
         // Rewrite base_offset field (first 8 bytes of RecordBatch) to broker-assigned offset
         if (data_owned.len >= 8) {
             std.mem.writeInt(i64, data_owned[0..8], @intCast(base_offset), .big);
         }
-        self.cache.putOwned(stream_id, base_offset, data_owned) catch |err| {
-            self.allocator.free(data_owned);
-            return err;
-        };
 
-        // Advance offset by record_count (fix #1)
-        state.next_offset += record_count;
-
-        // Update Stream.end_offset in ObjectManager
-        if (self.object_manager) |om| {
-            if (om.getStream(stream_id)) |s| {
-                s.advanceEndOffset(state.next_offset);
-            }
-        }
-
-        // High watermark gating (fix #4): only advance HW after durable write
-        // HW must only advance AFTER S3 WAL flush completes
+        // Write to WAL (filesystem only)
         if (self.fs_wal) |*wal| {
-            // HW advances on fsync batch completion
-            if (state.next_offset % wal.fsync_interval == 0) {
-                state.high_watermark = state.next_offset;
-            }
-        } else if (!self.s3_wal_mode) {
-            // For in-memory-only mode (no WAL at all),
-            // HW advances immediately (acceptable — no durability claim)
-            state.high_watermark = state.next_offset;
+            _ = try wal.append(data_owned);
         }
-        // Note: For S3 WAL mode, HW is advanced AFTER successful S3 flush below
+        // Also track in memory WAL (for totalRecords() in memory mode)
+        if (self.memory_wal) |*mwal| {
+            _ = try mwal.append(data_owned);
+        }
 
         // Upload to S3 if configured (best-effort, non-blocking for non-WAL mode)
         if (!self.s3_wal_mode) {
@@ -369,7 +350,7 @@ pub const PartitionStore = struct {
                 }) catch "";
                 if (obj_key.len > 0) {
                     defer self.allocator.free(obj_key);
-                    client.putObject(obj_key, records) catch |err| {
+                    client.putObject(obj_key, data_owned) catch |err| {
                         log.warn("S3 upload failed for {s}: {}", .{ obj_key, err });
                     };
                 }
@@ -378,46 +359,29 @@ pub const PartitionStore = struct {
 
         // S3 WAL mode — use batcher instead of synchronous PUT
         // Ensure produce only returns after data is durable in S3
+        var s3_wal_durable = false;
         if (self.s3_wal_mode) {
             if (self.s3_wal_batcher) |*batcher| {
                 // Append to batcher buffer
-                batcher.append(stream_id, base_offset, records) catch |err| {
+                batcher.append(stream_id, base_offset, data_owned) catch |err| {
                     log.warn("S3 WAL batcher append failed: {}", .{err});
                     return err;
                 };
 
-                // In sync mode, flush to S3 immediately from produce()
-                // to ensure data is durable before acking. This matches AutoMQ's
-                // behavior where produce returns only after WAL write to S3.
-                if (batcher.flush_mode == .sync) {
-                    if (self.s3_storage) |*s3| {
-                        const flushed = batcher.flushNow(s3);
-                        if (flushed) {
-                            // Only advance HW after data is durable
-                            state.high_watermark = state.next_offset;
-                        } else {
-                            log.warn("S3 WAL sync flush failed, HW not advanced", .{});
-                            // Data is in batcher buffer but not yet durable
-                            // HW stays at previous value — consumers won't see unflushed data
-                        }
-                    } else {
-                        // No S3 storage configured but S3 WAL mode requested —
-                        // advance HW anyway (testing/development scenario)
-                        state.high_watermark = state.next_offset;
+                if (batcher.flush_mode == .sync or batcher.flush_mode == .group_commit) {
+                    const flushed = if (self.s3_storage) |*s3|
+                        batcher.flushNow(s3)
+                    else
+                        return error.S3StorageUnavailable;
+                    if (!flushed) {
+                        log.warn("S3 WAL flush failed; produce will not be acknowledged", .{});
+                        return error.S3WalFlushFailed;
                     }
-                } else if (batcher.flush_mode == .group_commit) {
-                    // Group commit: defer S3 flush to epoll batch boundary.
-                    // Track which partitions need HW advancement after the flush.
-                    // The S3 PUT happens in Server's batch_flush_fn callback,
-                    // batching all produces from one epoll iteration into one S3 PUT.
-                    // NOTE: AutoMQ's ObjectWAL uses the same approach — produce acks
-                    // after S3 PUT, but many requests share one PUT via group commit.
-                    batcher.trackPendingHW(stream_id, state.next_offset) catch {};
-                    // HW is NOT advanced — consumers won't see data until S3 flush
+                    s3_wal_durable = true;
                 } else {
                     // Async mode — HW advances immediately since data
                     // is in the batcher. Less durable but faster.
-                    state.high_watermark = state.next_offset;
+                    s3_wal_durable = true;
                 }
             } else if (self.s3_storage) |*s3| {
                 // Fallback: synchronous S3 PUT (legacy behavior)
@@ -429,13 +393,44 @@ pub const PartitionStore = struct {
                     .log_start_offset = @intCast(state.log_start_offset),
                 };
                 defer self.allocator.free(obj_key);
-                s3.putObject(obj_key, records) catch |err| {
+                s3.putObject(obj_key, data_owned) catch |err| {
                     log.warn("S3 WAL write-through failed: {}", .{err});
                     return err;
                 };
-                // HW advances only after successful S3 write
+                s3_wal_durable = true;
+            } else {
+                return error.S3StorageUnavailable;
+            }
+        }
+
+        // Write to LogCache only after required durable writes have succeeded.
+        try self.cache.putOwned(stream_id, base_offset, data_owned);
+        data_for_cache = null;
+
+        // Advance offset by record_count (fix #1)
+        state.next_offset += record_count;
+
+        // Update Stream.end_offset in ObjectManager
+        if (self.object_manager) |om| {
+            if (om.getStream(stream_id)) |s| {
+                s.advanceEndOffset(state.next_offset);
+            }
+        }
+
+        // High watermark gating (fix #4): only advance HW after durable write.
+        if (self.s3_wal_mode) {
+            if (s3_wal_durable) {
                 state.high_watermark = state.next_offset;
             }
+        } else if (self.fs_wal) |*wal| {
+            // HW advances on fsync batch completion
+            if (state.next_offset % wal.fsync_interval == 0) {
+                state.high_watermark = state.next_offset;
+            }
+        } else {
+            // For in-memory-only mode (no WAL at all),
+            // HW advances immediately (acceptable — no durability claim)
+            state.high_watermark = state.next_offset;
         }
 
         // Update last_stable_offset
@@ -590,7 +585,7 @@ pub const PartitionStore = struct {
             defer if (s3_metas.len > 0) self.allocator.free(s3_metas);
 
             if (s3_metas.len > 0) {
-                var result_list = std.ArrayList(u8).init(self.allocator);
+                var result_list = std.array_list.Managed(u8).init(self.allocator);
                 defer result_list.deinit();
 
                 for (s3_metas) |meta| {
@@ -729,7 +724,7 @@ pub const PartitionStore = struct {
         return 0;
     }
 
-    fn hashPartitionKey(topic: []const u8, partition_id: i32) u64 {
+    pub fn hashPartitionKey(topic: []const u8, partition_id: i32) u64 {
         var hasher = std.hash.Wyhash.init(0);
         hasher.update(topic);
         hasher.update(std.mem.asBytes(&partition_id));
@@ -824,7 +819,7 @@ pub const PartitionStore = struct {
         switch (policy.cleanup_policy) {
             .delete => {
                 const om = self.object_manager orelse return 0;
-                const now = std.time.milliTimestamp();
+                const now = @import("time_compat").milliTimestamp();
 
                 var it = self.partitions.iterator();
                 while (it.next()) |entry| {
@@ -899,7 +894,7 @@ pub const PartitionStore = struct {
     /// and removes superseded entries from the cache.
     fn compactLogs(self: *PartitionStore) !u64 {
         var compacted: u64 = 0;
-        const rec_batch = @import("../protocol/record_batch.zig");
+        const rec_batch = @import("protocol").record_batch;
 
         var it = self.partitions.iterator();
         while (it.next()) |entry| {
@@ -941,9 +936,8 @@ pub const PartitionStore = struct {
 
     /// Get partition info for monitoring/admin purposes.
     pub fn getPartitionInfo(self: *const PartitionStore, topic: []const u8, partition_id: i32) ?PartitionInfo {
-        const key = hashPartitionKey(topic, partition_id);
-        var key_buf: [128]u8 = undefined;
-        const key_str = std.fmt.bufPrint(&key_buf, "{d}", .{key}) catch return null;
+        var key_buf: [256]u8 = undefined;
+        const key_str = partitionKeyBuf(&key_buf, topic, partition_id);
 
         if (self.partitions.get(key_str)) |state| {
             return .{
@@ -1253,19 +1247,18 @@ test "PartitionStore getPartitionInfo returns null for unknown" {
     try testing.expect(info2 == null);
 }
 
-test "PartitionStore getPartitionInfo returns null even for existing partition" {
+test "PartitionStore getPartitionInfo returns existing partition state" {
     var store = PartitionStore.init(testing.allocator);
     defer store.deinit();
 
     // Produce a record to create the partition
     _ = try store.produce("my-topic", 0, "hello");
 
-    // NOTE: getPartitionInfo uses hashPartitionKey() → decimal string lookup, but
-    // partitions are stored under "topic-partition_id" keys. The key formats don't
-    // match, so getPartitionInfo currently always returns null. This test documents
-    // the existing behavior (a known bug).
     const info = store.getPartitionInfo("my-topic", 0);
-    try testing.expect(info == null);
+    try testing.expect(info != null);
+    try testing.expectEqualStrings("my-topic", info.?.topic);
+    try testing.expectEqual(@as(i32, 0), info.?.partition_id);
+    try testing.expectEqual(@as(i64, 1), info.?.next_offset);
 }
 
 test "PartitionStore ensurePartition creates distinct entries for different topic-partitions" {
@@ -1414,7 +1407,7 @@ test "applyRetention time-based advances log_start_offset past expired objects" 
     _ = try store.produce("retention-topic", 0, "record-data");
 
     // Get the stream_id that was created for this partition
-    // (replicate hashPartitionKey logic since it's a private method)
+    // Use the same public stream-id mapping as broker/admin handlers.
     var hasher = std.hash.Wyhash.init(0);
     hasher.update("retention-topic");
     hasher.update(std.mem.asBytes(&@as(i32, 0)));

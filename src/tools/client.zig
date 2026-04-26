@@ -1,7 +1,7 @@
 const std = @import("std");
 const testing = std.testing;
 const Allocator = std.mem.Allocator;
-const net = std.net;
+const net = @import("net_compat");
 const ser = @import("../protocol/serialization.zig");
 
 /// Kafka CLI client — connects to broker via wire protocol.
@@ -21,13 +21,13 @@ pub const KafkaClient = struct {
     }
 
     pub fn connect(self: *KafkaClient) !void {
-        self.sock = try std.posix.socket(std.posix.AF.INET, std.posix.SOCK.STREAM, 0);
-        try std.posix.connect(self.sock.?, &self.address.any, self.address.getOsSockLen());
+        self.sock = try @import("posix_compat").socket(std.posix.AF.INET, std.posix.SOCK.STREAM, 0);
+        try @import("posix_compat").connect(self.sock.?, &self.address.any, self.address.getOsSockLen());
     }
 
     pub fn close(self: *KafkaClient) void {
         if (self.sock) |s| {
-            std.posix.close(s);
+            @import("posix_compat").close(s);
             self.sock = null;
         }
     }
@@ -50,9 +50,9 @@ pub const KafkaClient = struct {
         var size_buf: [4]u8 = undefined;
         std.mem.writeInt(u32, &size_buf, frame_size, .big);
 
-        _ = try std.posix.write(sock, &size_buf);
-        _ = try std.posix.write(sock, header_buf[0..hpos]);
-        if (body.len > 0) _ = try std.posix.write(sock, body);
+        _ = try @import("posix_compat").write(sock, &size_buf);
+        _ = try @import("posix_compat").write(sock, header_buf[0..hpos]);
+        if (body.len > 0) _ = try @import("posix_compat").write(sock, body);
 
         // Read response
         var resp_size_buf: [4]u8 = undefined;

@@ -78,8 +78,12 @@ pub const ListTransactionsResponse = struct {
         result.throttle_time_ms = ser.readI32(buf, pos);
         result.error_code = ser.readI16(buf, pos);
         const unknown_state_filters_len: usize = (try ser.readCompactArrayLen(buf, pos)) orelse 0;
-        for (0..unknown_state_filters_len) |_| {
-            _ = try ser.readCompactString(buf, pos);
+        if (unknown_state_filters_len > 0) {
+            const unknown_state_filters_items = try alloc.alloc(?[]const u8, unknown_state_filters_len);
+            for (unknown_state_filters_items) |*item| {
+                item.* = try ser.readCompactString(buf, pos);
+            }
+            result.unknown_state_filters = unknown_state_filters_items;
         }
         const transaction_states_len: usize = (try ser.readCompactArrayLen(buf, pos)) orelse 0;
         if (transaction_states_len > 0) {

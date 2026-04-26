@@ -119,12 +119,15 @@ pub const DeleteTopicsRequest = struct {
             (try ser.readCompactArrayLen(buf, pos)) orelse 0
         else
             (try ser.readArrayLen(buf, pos)) orelse 0;
-        for (0..topic_names_len) |_| {
-            if (version >= 4) {
-                _ = try ser.readCompactString(buf, pos);
-            } else {
-                _ = try ser.readString(buf, pos);
+        if (topic_names_len > 0) {
+            const topic_names_items = try alloc.alloc(?[]const u8, topic_names_len);
+            for (topic_names_items) |*item| {
+                item.* = if (version >= 4)
+                    try ser.readCompactString(buf, pos)
+                else
+                    try ser.readString(buf, pos);
             }
+            result.topic_names = topic_names_items;
         }
         result.timeout_ms = ser.readI32(buf, pos);
         if (version >= 4) try ser.skipTaggedFields(buf, pos);

@@ -1,7 +1,7 @@
 const std = @import("std");
 const log = std.log.scoped(.election);
 const RaftState = @import("state.zig").RaftState;
-const RaftClientPool = @import("../network/raft_client.zig").RaftClientPool;
+const RaftClientPool = @import("network").RaftClientPool;
 
 /// Election loop that runs on a background thread.
 ///
@@ -35,7 +35,7 @@ pub const ElectionLoop = struct {
 
         while (!self.should_stop.*) {
             // Sleep for check interval
-            std.time.sleep(self.check_interval_ms * std.time.ns_per_ms);
+            @import("time_compat").sleep(self.check_interval_ms * std.time.ns_per_ms);
 
             if (self.should_stop.*) break;
 

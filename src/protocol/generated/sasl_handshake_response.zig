@@ -24,12 +24,16 @@ pub const SaslHandshakeResponse = struct {
         }
     }
 
-    pub fn deserialize(_: Allocator, buf: []const u8, pos: *usize, _: i16) !SaslHandshakeResponse {
+    pub fn deserialize(alloc: Allocator, buf: []const u8, pos: *usize, _: i16) !SaslHandshakeResponse {
         var result = SaslHandshakeResponse{};
         result.error_code = ser.readI16(buf, pos);
         const mechanisms_len: usize = (try ser.readArrayLen(buf, pos)) orelse 0;
-        for (0..mechanisms_len) |_| {
-            _ = try ser.readString(buf, pos);
+        if (mechanisms_len > 0) {
+            const mechanisms_items = try alloc.alloc(?[]const u8, mechanisms_len);
+            for (mechanisms_items) |*item| {
+                item.* = try ser.readString(buf, pos);
+            }
+            result.mechanisms = mechanisms_items;
         }
         return result;
     }

@@ -1,10 +1,17 @@
 const std = @import("std");
 const testing = std.testing;
 const Allocator = std.mem.Allocator;
-const net = std.net;
+const net = @import("net_compat");
 const log = std.log.scoped(.s3);
 const AwsSigV4 = @import("aws_sigv4.zig").AwsSigV4;
-const MetricRegistry = @import("../core/metric_registry.zig").MetricRegistry;
+const MetricRegistry = @import("core").MetricRegistry;
+const security = @import("security");
+const TlsClientContext = security.tls.TlsClientContext;
+
+fn getenv(name: [:0]const u8) ?[]const u8 {
+    const value = std.c.getenv(name.ptr) orelse return null;
+    return std.mem.span(value);
+}
 
 /// S3-compatible HTTP client for MinIO.
 ///
@@ -17,6 +24,8 @@ pub const S3Client = struct {
     bucket: []const u8,
     access_key: []const u8,
     secret_key: []const u8,
+    scheme: Scheme = .http,
+    tls_ca_file: ?[]const u8 = null,
     signer: AwsSigV4,
     allocator: Allocator,
     put_count: u64 = 0,
@@ -28,11 +37,14 @@ pub const S3Client = struct {
     /// When set, records s3_requests_total, s3_request_errors_total,
     /// s3_request_duration_seconds, and s3_bytes_total.
     metrics: ?*MetricRegistry = null,
-    // Connection pool for keep-alive reuse
-    // TODO: For HTTPS support, add OpenSSL FFI or use Zig's std.crypto.tls.Client
-    //       (requires linking against libssl/libcrypto). HTTPS connections would wrap
-    //       the raw socket with TLS before HTTP I/O.
+    // Connection pool for keep-alive reuse. Currently unused because requests
+    // use Connection: close to keep response framing simple and correct.
     pooled_socket: ?std.posix.socket_t = null,
+
+    pub const Scheme = enum {
+        http,
+        https,
+    };
 
     pub const Config = struct {
         host: []const u8 = "127.0.0.1",
@@ -40,9 +52,12 @@ pub const S3Client = struct {
         bucket: []const u8 = "automq",
         access_key: []const u8 = "minioadmin",
         secret_key: []const u8 = "minioadmin",
+        scheme: Scheme = .http,
+        tls_ca_file: ?[]const u8 = null,
     };
 
     pub fn init(alloc: Allocator, config: Config) S3Client {
+        const endpoint = normalizeEndpoint(config.host, config.port, config.scheme);
         // S3 credential resolution chain (matches AutoMQ's AutoMQStaticCredentialsProvider):
         // 1. Explicit config values (if not the default "minioadmin")
         // 2. KAFKA_S3_ACCESS_KEY / KAFKA_S3_SECRET_KEY (AutoMQ-specific)
@@ -50,31 +65,83 @@ pub const S3Client = struct {
         // 4. Fall back to config defaults
         const access_key = if (!std.mem.eql(u8, config.access_key, "minioadmin"))
             config.access_key
-        else if (std.posix.getenv("KAFKA_S3_ACCESS_KEY")) |k|
+        else if (getenv("KAFKA_S3_ACCESS_KEY")) |k|
             k
-        else if (std.posix.getenv("AWS_ACCESS_KEY_ID")) |k|
+        else if (getenv("AWS_ACCESS_KEY_ID")) |k|
             k
         else
             config.access_key;
 
         const secret_key = if (!std.mem.eql(u8, config.secret_key, "minioadmin"))
             config.secret_key
-        else if (std.posix.getenv("KAFKA_S3_SECRET_KEY")) |k|
+        else if (getenv("KAFKA_S3_SECRET_KEY")) |k|
             k
-        else if (std.posix.getenv("AWS_SECRET_ACCESS_KEY")) |k|
+        else if (getenv("AWS_SECRET_ACCESS_KEY")) |k|
             k
         else
             config.secret_key;
 
         return .{
-            .host = config.host,
-            .port = config.port,
+            .host = endpoint.host,
+            .port = endpoint.port,
             .bucket = config.bucket,
             .access_key = access_key,
             .secret_key = secret_key,
+            .scheme = endpoint.scheme,
+            .tls_ca_file = config.tls_ca_file,
             .signer = AwsSigV4.init(access_key, secret_key),
             .allocator = alloc,
         };
+    }
+
+    const Endpoint = struct {
+        host: []const u8,
+        port: u16,
+        scheme: Scheme,
+    };
+
+    fn normalizeEndpoint(raw_host: []const u8, configured_port: u16, configured_scheme: Scheme) Endpoint {
+        var host = raw_host;
+        var port = configured_port;
+        var scheme = configured_scheme;
+        var scheme_from_host = false;
+        var port_from_host = false;
+
+        if (std.mem.startsWith(u8, host, "https://")) {
+            host = host["https://".len..];
+            scheme = .https;
+            scheme_from_host = true;
+        } else if (std.mem.startsWith(u8, host, "http://")) {
+            host = host["http://".len..];
+            scheme = .http;
+            scheme_from_host = true;
+        }
+
+        if (std.mem.indexOfScalar(u8, host, '/')) |slash| {
+            host = host[0..slash];
+        }
+
+        var colon_count: usize = 0;
+        for (host) |ch| {
+            if (ch == ':') colon_count += 1;
+        }
+        if (colon_count == 1) {
+            if (std.mem.lastIndexOfScalar(u8, host, ':')) |colon| {
+                if (colon + 1 < host.len) {
+                    if (std.fmt.parseInt(u16, host[colon + 1 ..], 10)) |parsed_port| {
+                        port = parsed_port;
+                        host = host[0..colon];
+                        port_from_host = true;
+                    } else |_| {}
+                }
+            }
+        }
+
+        if (scheme_from_host and scheme == .https and !port_from_host and configured_port == 9000) {
+            port = 443;
+        }
+
+        return .{ .host = host, .port = port, .scheme = scheme };
     }
 
     /// Ensure the bucket exists.
@@ -83,12 +150,15 @@ pub const S3Client = struct {
         defer self.allocator.free(path);
 
         var resp_buf: [4096]u8 = undefined;
-        _ = try self.httpRequest("PUT", path, "", null, null, &resp_buf);
+        const status = try self.httpRequest("PUT", path, "", null, null, &resp_buf);
+        if ((status < 200 or status >= 300) and status != 409) {
+            return error.S3EnsureBucketFailed;
+        }
     }
 
     /// Upload an object.
     pub fn putObject(self: *S3Client, key: []const u8, data: []const u8) !void {
-        const start_ns = std.time.nanoTimestamp();
+        const start_ns = @import("time_compat").nanoTimestamp();
         const path = try std.fmt.allocPrint(self.allocator, "/{s}/{s}", .{ self.bucket, key });
         defer self.allocator.free(path);
 
@@ -117,7 +187,7 @@ pub const S3Client = struct {
     /// on transient failures (connection errors, non-2xx responses).
     pub fn getObject(self: *S3Client, key: []const u8) ![]u8 {
         const MAX_RETRIES: u32 = 3;
-        const start_ns = std.time.nanoTimestamp();
+        const start_ns = @import("time_compat").nanoTimestamp();
         var attempt: u32 = 0;
 
         while (true) {
@@ -138,7 +208,7 @@ pub const S3Client = struct {
                 // Exponential backoff: 100ms, 200ms, 400ms...
                 const delay_ms: u64 = @as(u64, 100) << @intCast(attempt - 1);
                 log.debug("S3 GetObject retry {d}/{d} in {d}ms for key {s}", .{ attempt, MAX_RETRIES, delay_ms, key });
-                std.time.sleep(delay_ms * std.time.ns_per_ms);
+                @import("time_compat").sleep(delay_ms * std.time.ns_per_ms);
             }
         }
     }
@@ -148,73 +218,14 @@ pub const S3Client = struct {
         const path = try std.fmt.allocPrint(self.allocator, "/{s}/{s}", .{ self.bucket, key });
         defer self.allocator.free(path);
 
-        const sock = try self.connect();
-        defer std.posix.close(sock);
+        var response = try self.sendRequest("GET", path, "", null, null, 1024 * 1024 * 1024);
+        defer response.deinit(self.allocator);
 
-        // Build signed request
-        var date_buf: [8]u8 = undefined;
-        var datetime_buf: [16]u8 = undefined;
-        AwsSigV4.currentDateTime(&date_buf, &datetime_buf);
-
-        const host_header = try std.fmt.allocPrint(self.allocator, "{s}:{d}", .{ self.host, self.port });
-        defer self.allocator.free(host_header);
-
-        const auth = try self.signer.sign(
-            self.allocator,
-            "GET",
-            path,
-            "",
-            host_header,
-            AwsSigV4.EMPTY_PAYLOAD_HASH,
-            &date_buf,
-            &datetime_buf,
-        );
-        defer self.allocator.free(auth);
-
-        const req = try std.fmt.allocPrint(self.allocator, "GET {s} HTTP/1.1\r\nHost: {s}\r\nAuthorization: {s}\r\nx-amz-date: {s}\r\nx-amz-content-sha256: {s}\r\nConnection: close\r\n\r\n", .{ path, host_header, auth, datetime_buf, AwsSigV4.EMPTY_PAYLOAD_HASH });
-        defer self.allocator.free(req);
-
-        _ = try std.posix.write(sock, req);
-
-        // Read full response
-        var response = std.ArrayList(u8).init(self.allocator);
-        defer response.deinit();
-
-        var read_buf: [8192]u8 = undefined;
-        while (true) {
-            const n = std.posix.read(sock, &read_buf) catch break;
-            if (n == 0) break;
-            try response.appendSlice(read_buf[0..n]);
-        }
-
-        // Parse HTTP response — find \r\n\r\n header/body separator
-        const resp_data = response.items;
-        const header_end = std.mem.indexOf(u8, resp_data, "\r\n\r\n") orelse {
-            return error.S3GetFailed;
-        };
-
-        // Check status
-        if (resp_data.len < 12) {
-            return error.S3GetFailed;
-        }
-        const status_code = std.fmt.parseInt(u16, resp_data[9..12], 10) catch {
-            return error.S3GetFailed;
-        };
-        if (status_code < 200 or status_code >= 300) {
+        if (response.status < 200 or response.status >= 300) {
             return error.S3GetFailed;
         }
 
-        // Extract body
-        const body_start = header_end + 4;
-        const body = resp_data[body_start..];
-
-        // Check for chunked transfer encoding
-        const headers_str = resp_data[0..header_end];
-        if (std.mem.indexOf(u8, headers_str, "Transfer-Encoding: chunked") != null) {
-            return try self.decodeChunked(body);
-        }
-
-        const result = try self.allocator.dupe(u8, body);
+        const result = try self.responseBodyOwned(&response);
         self.get_count += 1;
         self.bytes_downloaded += result.len;
         return result;
@@ -222,107 +233,71 @@ pub const S3Client = struct {
 
     /// List objects in the bucket with optional prefix. Returns XML response body.
     pub fn listObjects(self: *S3Client, prefix: ?[]const u8) ![]u8 {
-        const query = if (prefix) |p|
-            try std.fmt.allocPrint(self.allocator, "list-type=2&prefix={s}", .{p})
-        else
-            try self.allocator.dupe(u8, "list-type=2");
+        var encoded_prefix: ?[]u8 = null;
+        defer if (encoded_prefix) |p| self.allocator.free(p);
+
+        const query = if (prefix) |p| blk: {
+            encoded_prefix = try self.uriEncode(p);
+            break :blk try std.fmt.allocPrint(self.allocator, "list-type=2&prefix={s}", .{encoded_prefix.?});
+        } else try self.allocator.dupe(u8, "list-type=2");
         defer self.allocator.free(query);
 
         const path = try std.fmt.allocPrint(self.allocator, "/{s}", .{self.bucket});
         defer self.allocator.free(path);
 
-        const full_path = try std.fmt.allocPrint(self.allocator, "{s}?{s}", .{ path, query });
-        defer self.allocator.free(full_path);
+        var response = try self.sendRequest("GET", path, query, null, null, 64 * 1024 * 1024);
+        defer response.deinit(self.allocator);
 
-        const sock = try self.connect();
-        defer std.posix.close(sock);
+        if (response.status < 200 or response.status >= 300) return error.S3ListFailed;
 
-        var date_buf: [8]u8 = undefined;
-        var datetime_buf: [16]u8 = undefined;
-        AwsSigV4.currentDateTime(&date_buf, &datetime_buf);
-
-        const host_header = try std.fmt.allocPrint(self.allocator, "{s}:{d}", .{ self.host, self.port });
-        defer self.allocator.free(host_header);
-
-        const auth = try self.signer.sign(
-            self.allocator,
-            "GET",
-            path,
-            query,
-            host_header,
-            AwsSigV4.EMPTY_PAYLOAD_HASH,
-            &date_buf,
-            &datetime_buf,
-        );
-        defer self.allocator.free(auth);
-
-        const req = try std.fmt.allocPrint(self.allocator, "GET {s} HTTP/1.1\r\nHost: {s}\r\nAuthorization: {s}\r\nx-amz-date: {s}\r\nx-amz-content-sha256: {s}\r\nConnection: close\r\n\r\n", .{ full_path, host_header, auth, datetime_buf, AwsSigV4.EMPTY_PAYLOAD_HASH });
-        defer self.allocator.free(req);
-
-        _ = try std.posix.write(sock, req);
-
-        var response = std.ArrayList(u8).init(self.allocator);
-        defer response.deinit();
-
-        var read_buf: [8192]u8 = undefined;
-        while (true) {
-            const n = std.posix.read(sock, &read_buf) catch break;
-            if (n == 0) break;
-            try response.appendSlice(read_buf[0..n]);
-        }
-
-        const resp_data = response.items;
-        const header_end = std.mem.indexOf(u8, resp_data, "\r\n\r\n") orelse return error.S3ListFailed;
-        if (resp_data.len < 12) return error.S3ListFailed;
-        const status_code = std.fmt.parseInt(u16, resp_data[9..12], 10) catch return error.S3ListFailed;
-        if (status_code < 200 or status_code >= 300) return error.S3ListFailed;
-
-        const body_start = header_end + 4;
-        const body = resp_data[body_start..];
-
-        const headers_str = resp_data[0..header_end];
-        if (std.mem.indexOf(u8, headers_str, "Transfer-Encoding: chunked") != null) {
-            return try self.decodeChunked(body);
-        }
-
-        return try self.allocator.dupe(u8, body);
+        return try self.responseBodyOwned(&response);
     }
 
     fn decodeChunked(self: *S3Client, data: []const u8) ![]u8 {
-        var result = std.ArrayList(u8).init(self.allocator);
+        var result = std.array_list.Managed(u8).init(self.allocator);
+        errdefer result.deinit();
         var pos: usize = 0;
 
         while (pos < data.len) {
-            const line_end = std.mem.indexOf(u8, data[pos..], "\r\n") orelse break;
-            const chunk_size_str = data[pos .. pos + line_end];
-            const chunk_size = std.fmt.parseInt(usize, chunk_size_str, 16) catch break;
-
-            if (chunk_size == 0) break;
+            const line_end = std.mem.indexOf(u8, data[pos..], "\r\n") orelse return error.InvalidChunkedEncoding;
+            const chunk_size_line = data[pos .. pos + line_end];
+            const chunk_size_token = if (std.mem.indexOfScalar(u8, chunk_size_line, ';')) |semi|
+                chunk_size_line[0..semi]
+            else
+                chunk_size_line;
+            const chunk_size = std.fmt.parseInt(usize, std.mem.trim(u8, chunk_size_token, " \t"), 16) catch return error.InvalidChunkedEncoding;
 
             pos += line_end + 2;
-            if (pos + chunk_size > data.len) break;
+            if (chunk_size == 0) return result.toOwnedSlice();
+
+            if (pos + chunk_size + 2 > data.len) return error.InvalidChunkedEncoding;
 
             try result.appendSlice(data[pos .. pos + chunk_size]);
-            pos += chunk_size + 2;
+            pos += chunk_size;
+            if (!std.mem.eql(u8, data[pos .. pos + 2], "\r\n")) return error.InvalidChunkedEncoding;
+            pos += 2;
         }
 
-        self.get_count += 1;
-        self.bytes_downloaded += result.items.len;
-        return result.toOwnedSlice();
+        return error.InvalidChunkedEncoding;
     }
 
     /// Delete an object.
     pub fn deleteObject(self: *S3Client, key: []const u8) !void {
-        const start_ns = std.time.nanoTimestamp();
+        const start_ns = @import("time_compat").nanoTimestamp();
         const path = try std.fmt.allocPrint(self.allocator, "/{s}/{s}", .{ self.bucket, key });
         defer self.allocator.free(path);
 
         var resp_buf: [4096]u8 = undefined;
-        _ = self.httpRequest("DELETE", path, "", null, null, &resp_buf) catch |err| {
+        const status = self.httpRequest("DELETE", path, "", null, null, &resp_buf) catch |err| {
             self.recordS3Error("delete");
             self.recordS3Duration("delete", start_ns);
             return err;
         };
+        if (status < 200 or status >= 300) {
+            self.recordS3Error("delete");
+            self.recordS3Duration("delete", start_ns);
+            return error.S3DeleteFailed;
+        }
         self.delete_count += 1;
         self.recordS3Request("delete");
         self.recordS3Duration("delete", start_ns);
@@ -342,52 +317,24 @@ pub const S3Client = struct {
     /// Read a range of bytes from an S3 object.
     /// Returns the requested byte range, or error if the object doesn't exist.
     pub fn getObjectRange(self: *S3Client, key: []const u8, offset: u64, length: u64) ![]u8 {
+        if (length == 0) return try self.allocator.alloc(u8, 0);
+        if (offset > std.math.maxInt(u64) - (length - 1)) return error.S3RangeInvalid;
+
         const path = try std.fmt.allocPrint(self.allocator, "/{s}/{s}", .{ self.bucket, key });
         defer self.allocator.free(path);
 
         const range_header = try std.fmt.allocPrint(self.allocator, "bytes={d}-{d}", .{ offset, offset + length - 1 });
         defer self.allocator.free(range_header);
 
-        const sock = try self.connect();
-        defer std.posix.close(sock);
+        if (length > std.math.maxInt(usize) - 8192) return error.S3ResponseTooLarge;
+        const max_response_size: usize = @intCast(length + 8192);
+        var response = try self.sendRequest("GET", path, "", null, range_header, max_response_size);
+        defer response.deinit(self.allocator);
 
-        var date_buf: [8]u8 = undefined;
-        var datetime_buf: [16]u8 = undefined;
-        AwsSigV4.currentDateTime(&date_buf, &datetime_buf);
-
-        const host_header = try std.fmt.allocPrint(self.allocator, "{s}:{d}", .{ self.host, self.port });
-        defer self.allocator.free(host_header);
-
-        const auth = try self.signer.sign(self.allocator, "GET", path, "", host_header, AwsSigV4.EMPTY_PAYLOAD_HASH, &date_buf, &datetime_buf);
-        defer self.allocator.free(auth);
-
-        const req = try std.fmt.allocPrint(self.allocator, "GET {s} HTTP/1.1\r\nHost: {s}\r\nAuthorization: {s}\r\nx-amz-date: {s}\r\nx-amz-content-sha256: {s}\r\nRange: {s}\r\nConnection: close\r\n\r\n", .{ path, host_header, auth, datetime_buf, AwsSigV4.EMPTY_PAYLOAD_HASH, range_header });
-        defer self.allocator.free(req);
-
-        _ = try std.posix.write(sock, req);
-
-        var response = std.ArrayList(u8).init(self.allocator);
-        defer response.deinit();
-
-        var read_buf: [8192]u8 = undefined;
-        while (true) {
-            const n = std.posix.read(sock, &read_buf) catch break;
-            if (n == 0) break;
-            try response.appendSlice(read_buf[0..n]);
-        }
-
-        const resp_data = response.items;
-        const header_end = std.mem.indexOf(u8, resp_data, "\r\n\r\n") orelse return error.S3GetFailed;
-
-        if (resp_data.len < 12) return error.S3GetFailed;
-        const status_code = std.fmt.parseInt(u16, resp_data[9..12], 10) catch return error.S3GetFailed;
         // 206 = Partial Content, 200 = Full content
-        if (status_code != 206 and status_code != 200) return error.S3GetFailed;
+        if (response.status != 206 and response.status != 200) return error.S3GetFailed;
 
-        const body_start = header_end + 4;
-        const body = resp_data[body_start..];
-
-        const result = try self.allocator.dupe(u8, body);
+        const result = try self.responseBodyOwned(&response);
         self.get_count += 1;
         self.bytes_downloaded += result.len;
         return result;
@@ -433,7 +380,7 @@ pub const S3Client = struct {
         const num_parts = (data.len + PART_SIZE - 1) / PART_SIZE;
 
         const PartEtag = struct { part: u32, etag: []u8 };
-        var etags = std.ArrayList(PartEtag).init(self.allocator);
+        var etags = std.array_list.Managed(PartEtag).init(self.allocator);
         defer {
             for (etags.items) |e| self.allocator.free(e.etag);
             etags.deinit();
@@ -449,7 +396,10 @@ pub const S3Client = struct {
             const end = @min(offset + PART_SIZE, data.len);
             const part_data = data[offset..end];
 
-            const query = try std.fmt.allocPrint(self.allocator, "partNumber={d}&uploadId={s}", .{ part_number, upload_id });
+            const upload_id_q = try self.uriEncode(upload_id);
+            defer self.allocator.free(upload_id_q);
+
+            const query = try std.fmt.allocPrint(self.allocator, "partNumber={d}&uploadId={s}", .{ part_number, upload_id_q });
             defer self.allocator.free(query);
 
             // Retry individual part uploads
@@ -465,7 +415,7 @@ pub const S3Client = struct {
                     });
                     if (attempt + 1 < MAX_PART_RETRIES) {
                         const delay_ms: u64 = @as(u64, 200) << @intCast(attempt);
-                        std.time.sleep(delay_ms * std.time.ns_per_ms);
+                        @import("time_compat").sleep(delay_ms * std.time.ns_per_ms);
                     }
                     continue;
                 };
@@ -476,20 +426,16 @@ pub const S3Client = struct {
                     });
                     if (attempt + 1 < MAX_PART_RETRIES) {
                         const delay_ms: u64 = @as(u64, 200) << @intCast(attempt);
-                        std.time.sleep(delay_ms * std.time.ns_per_ms);
+                        @import("time_compat").sleep(delay_ms * std.time.ns_per_ms);
                     }
                     continue;
                 }
 
-                // Parse ETag from response headers
-                const etag_owned = blk: {
-                    if (std.mem.indexOf(u8, part_resp, "ETag: ")) |etag_start| {
-                        const etag_value_start = etag_start + 6;
-                        if (std.mem.indexOf(u8, part_resp[etag_value_start..], "\r\n")) |etag_end| {
-                            break :blk self.allocator.dupe(u8, part_resp[etag_value_start .. etag_value_start + etag_end]) catch break :blk self.allocator.dupe(u8, "") catch break;
-                        }
-                    }
-                    break :blk self.allocator.dupe(u8, "") catch break;
+                // Parse ETag from response headers. S3 requires the exact ETag
+                // value in CompleteMultipartUpload, including quotes if present.
+                const etag_owned = (try self.responseHeaderValueOwned(part_resp, "ETag")) orelse {
+                    log.warn("Part {d}/{d} upload returned no ETag", .{ part_number, num_parts });
+                    continue;
                 };
                 try etags.append(.{ .part = part_number, .etag = etag_owned });
 
@@ -509,17 +455,20 @@ pub const S3Client = struct {
         }
 
         // Step 3: Complete multipart upload
-        var complete_body = std.ArrayList(u8).init(self.allocator);
+        var complete_body = std.array_list.Managed(u8).init(self.allocator);
         defer complete_body.deinit();
         try complete_body.appendSlice("<CompleteMultipartUpload>");
         for (etags.items) |etag| {
-            const part_xml = try std.fmt.allocPrint(self.allocator, "<Part><PartNumber>{d}</PartNumber><ETag>\"{s}\"</ETag></Part>", .{ etag.part, etag.etag });
+            const part_xml = try std.fmt.allocPrint(self.allocator, "<Part><PartNumber>{d}</PartNumber><ETag>{s}</ETag></Part>", .{ etag.part, etag.etag });
             defer self.allocator.free(part_xml);
             try complete_body.appendSlice(part_xml);
         }
         try complete_body.appendSlice("</CompleteMultipartUpload>");
 
-        const complete_query = try std.fmt.allocPrint(self.allocator, "uploadId={s}", .{upload_id});
+        const complete_upload_id_q = try self.uriEncode(upload_id);
+        defer self.allocator.free(complete_upload_id_q);
+
+        const complete_query = try std.fmt.allocPrint(self.allocator, "uploadId={s}", .{complete_upload_id_q});
         defer self.allocator.free(complete_query);
 
         const complete_resp = try self.allocator.alloc(u8, 8192);
@@ -540,7 +489,10 @@ pub const S3Client = struct {
     /// Abort a multipart upload to clean up partially uploaded parts.
     /// Called when part upload fails to prevent orphaned S3 parts.
     fn abortMultipartUpload(self: *S3Client, path: []const u8, upload_id: []const u8) void {
-        const query = std.fmt.allocPrint(self.allocator, "uploadId={s}", .{upload_id}) catch return;
+        const upload_id_q = self.uriEncode(upload_id) catch return;
+        defer self.allocator.free(upload_id_q);
+
+        const query = std.fmt.allocPrint(self.allocator, "uploadId={s}", .{upload_id_q}) catch return;
         defer self.allocator.free(query);
 
         var resp_buf: [1024]u8 = undefined;
@@ -556,53 +508,133 @@ pub const S3Client = struct {
         }
     }
 
-    /// Connection with reuse support (keep-alive pooling).
-    /// For simple requests (httpRequestOnce), we still use Connection: close.
-    /// A full connection pool would maintain multiple sockets per host.
-    fn connect(self: *const S3Client) !std.posix.socket_t {
-        // Check for pooled socket (basic single-connection pool)
-        if (self.pooled_socket) |sock| {
-            // Verify socket is still valid by attempting a zero-byte read
-            var test_buf: [1]u8 = undefined;
-            const result = std.posix.recv(sock, &test_buf, std.posix.MSG.PEEK | std.posix.MSG.DONTWAIT) catch {
-                // Socket is dead, create new one
-                std.posix.close(sock);
-                const mutable_self = @constCast(self);
-                mutable_self.pooled_socket = null;
-                return connectNew(self);
-            };
-            _ = result;
-            return sock;
+    const S3Connection = struct {
+        fd: std.posix.socket_t,
+        tls_ctx: ?TlsClientContext = null,
+        ssl: ?*anyopaque = null,
+
+        fn close(self: *S3Connection) void {
+            if (self.ssl) |ssl| {
+                if (self.tls_ctx) |*ctx| {
+                    if (ctx.getOpenSsl()) |ossl| {
+                        _ = ossl.SSL_shutdown(ssl);
+                        ossl.SSL_free(ssl);
+                    }
+                }
+                self.ssl = null;
+            }
+            if (self.tls_ctx) |*ctx| {
+                ctx.deinit();
+                self.tls_ctx = null;
+            }
+            @import("posix_compat").close(self.fd);
         }
-        return connectNew(self);
+
+        fn writeAll(self: *S3Connection, data: []const u8) !void {
+            var offset: usize = 0;
+            while (offset < data.len) {
+                const remaining = data[offset..];
+                const n = if (self.ssl) |ssl| blk: {
+                    const ctx = &(self.tls_ctx orelse return error.S3WriteFailed);
+                    const ossl = ctx.getOpenSsl() orelse return error.S3WriteFailed;
+                    const len: c_int = @intCast(@min(remaining.len, std.math.maxInt(c_int)));
+                    const ret = ossl.SSL_write(ssl, remaining.ptr, len);
+                    if (ret <= 0) return error.S3WriteFailed;
+                    break :blk @as(usize, @intCast(ret));
+                } else try @import("posix_compat").write(self.fd, remaining);
+
+                if (n == 0) return error.S3WriteFailed;
+                offset += n;
+            }
+        }
+
+        fn read(self: *S3Connection, buf: []u8) !usize {
+            if (self.ssl) |ssl| {
+                const ctx = &(self.tls_ctx orelse return error.S3ReadFailed);
+                const ossl = ctx.getOpenSsl() orelse return error.S3ReadFailed;
+                const len: c_int = @intCast(@min(buf.len, std.math.maxInt(c_int)));
+                const ret = ossl.SSL_read(ssl, buf.ptr, len);
+                if (ret > 0) return @intCast(ret);
+                const ssl_err = ossl.SSL_get_error(ssl, ret);
+                if (ssl_err == @import("security").openssl.OpenSslLib.SSL_ERROR_ZERO_RETURN) return 0;
+                return error.S3ReadFailed;
+            }
+            return std.posix.read(self.fd, buf);
+        }
+    };
+
+    fn connect(self: *const S3Client) !S3Connection {
+        const fd = try self.connectTcp();
+        errdefer @import("posix_compat").close(fd);
+
+        if (self.scheme == .https) {
+            var tls_ctx = try TlsClientContext.init(.{
+                .protocol = .ssl,
+                .ca_file = self.tls_ca_file,
+            });
+            errdefer tls_ctx.deinit();
+
+            const host_z = try self.allocator.dupeZ(u8, self.host);
+            defer self.allocator.free(host_z);
+
+            const ssl = try tls_ctx.wrapConnectionWithHostname(fd, host_z);
+            return .{
+                .fd = fd,
+                .tls_ctx = tls_ctx,
+                .ssl = ssl,
+            };
+        }
+
+        return .{ .fd = fd };
     }
 
-    fn connectNew(self: *const S3Client) !std.posix.socket_t {
+    fn connectTcp(self: *const S3Client) !std.posix.socket_t {
         // Try numeric IP first, fall back to DNS resolution for hostnames (e.g. "minio" in Docker)
         const address = net.Address.parseIp4(self.host, self.port) catch blk: {
             // Hostname — resolve via system DNS (getaddrinfo)
-            // Allocate a null-terminated copy for the C FFI call
-            const host_z = std.fmt.allocPrintZ(self.allocator, "{s}", .{self.host}) catch return error.OutOfMemory;
-            defer self.allocator.free(host_z);
-            const addr_list = net.getAddressList(self.allocator, host_z, self.port) catch return error.UnknownHostName;
+            const addr_list = net.getAddressList(self.allocator, self.host, self.port) catch return error.UnknownHostName;
             defer addr_list.deinit();
             if (addr_list.addrs.len == 0) return error.UnknownHostName;
             break :blk addr_list.addrs[0];
         };
-        const sock = try std.posix.socket(std.posix.AF.INET, std.posix.SOCK.STREAM, 0);
-        errdefer std.posix.close(sock);
-        try std.posix.connect(sock, &address.any, address.getOsSockLen());
+        const sock = try @import("posix_compat").socket(address.any.family, std.posix.SOCK.STREAM, 0);
+        errdefer @import("posix_compat").close(sock);
+        try @import("posix_compat").connect(sock, &address.any, address.getOsSockLen());
         return sock;
     }
+
+    const HttpResponse = struct {
+        data: []u8,
+        status: u16,
+        header_end: usize,
+
+        fn deinit(self: *HttpResponse, alloc: Allocator) void {
+            alloc.free(self.data);
+            self.data = &.{};
+        }
+
+        fn headers(self: *const HttpResponse) []const u8 {
+            return self.data[0..self.header_end];
+        }
+
+        fn body(self: *const HttpResponse) []const u8 {
+            return self.data[self.header_end + 4 ..];
+        }
+    };
 
     fn httpRequest(self: *S3Client, method: []const u8, path: []const u8, query: []const u8, body: ?[]const u8, range_header: ?[]const u8, resp_buf: []u8) !u16 {
         // Retry with exponential backoff
         const MAX_RETRIES: u32 = 3;
         var attempt: u32 = 0;
         while (true) {
-            const result = self.httpRequestOnce(method, path, query, body, range_header, resp_buf);
-            if (result) |status| {
-                return status;
+            const result = self.sendRequestOnce(method, path, query, body, range_header, resp_buf.len);
+            if (result) |response| {
+                var resp = response;
+                defer resp.deinit(self.allocator);
+                @memset(resp_buf, 0);
+                const copy_len = @min(resp_buf.len, resp.data.len);
+                @memcpy(resp_buf[0..copy_len], resp.data[0..copy_len]);
+                return resp.status;
             } else |err| {
                 attempt += 1;
                 if (attempt >= MAX_RETRIES) {
@@ -612,14 +644,34 @@ pub const S3Client = struct {
                 // Exponential backoff: 100ms, 200ms, 400ms...
                 const delay_ms: u64 = @as(u64, 100) << @intCast(attempt - 1);
                 log.debug("S3 request retry {d}/{d} in {d}ms", .{ attempt, MAX_RETRIES, delay_ms });
-                std.time.sleep(delay_ms * std.time.ns_per_ms);
+                @import("time_compat").sleep(delay_ms * std.time.ns_per_ms);
             }
         }
     }
 
-    fn httpRequestOnce(self: *S3Client, method: []const u8, path: []const u8, query: []const u8, body: ?[]const u8, range_header: ?[]const u8, resp_buf: []u8) !u16 {
-        const sock = try self.connect();
-        defer std.posix.close(sock);
+    fn sendRequest(self: *S3Client, method: []const u8, path: []const u8, query: []const u8, body: ?[]const u8, range_header: ?[]const u8, max_response_size: usize) !HttpResponse {
+        const MAX_RETRIES: u32 = 3;
+        var attempt: u32 = 0;
+        while (true) {
+            const result = self.sendRequestOnce(method, path, query, body, range_header, max_response_size);
+            if (result) |response| {
+                return response;
+            } else |err| {
+                attempt += 1;
+                if (attempt >= MAX_RETRIES) {
+                    log.warn("S3 request failed after {d} retries: {s} {s}", .{ MAX_RETRIES, method, path });
+                    return err;
+                }
+                const delay_ms: u64 = @as(u64, 100) << @intCast(attempt - 1);
+                log.debug("S3 request retry {d}/{d} in {d}ms", .{ attempt, MAX_RETRIES, delay_ms });
+                @import("time_compat").sleep(delay_ms * std.time.ns_per_ms);
+            }
+        }
+    }
+
+    fn sendRequestOnce(self: *S3Client, method: []const u8, path: []const u8, query: []const u8, body: ?[]const u8, range_header: ?[]const u8, max_response_size: usize) !HttpResponse {
+        var conn = try self.connect();
+        defer conn.close();
 
         // Get current datetime for signing
         var date_buf: [8]u8 = undefined;
@@ -651,11 +703,14 @@ pub const S3Client = struct {
         defer self.allocator.free(auth);
 
         // Build request
-        var req_buf = std.ArrayList(u8).init(self.allocator);
+        var req_buf = std.array_list.Managed(u8).init(self.allocator);
         defer req_buf.deinit();
-        const writer = req_buf.writer();
+        const writer = @import("list_compat").writer(&req_buf);
 
-        try writer.print("{s} {s} HTTP/1.1\r\n", .{ method, path });
+        const target = try requestTarget(self.allocator, path, query);
+        defer self.allocator.free(target);
+
+        try writer.print("{s} {s} HTTP/1.1\r\n", .{ method, target });
         try writer.print("Host: {s}\r\n", .{host_header});
         try writer.print("Authorization: {s}\r\n", .{auth});
         try writer.print("x-amz-date: {s}\r\n", .{datetime_buf});
@@ -669,24 +724,96 @@ pub const S3Client = struct {
         }
         try writer.print("Connection: close\r\n\r\n", .{});
 
-        _ = try std.posix.write(sock, req_buf.items);
+        try conn.writeAll(req_buf.items);
         if (body) |b| {
-            _ = try std.posix.write(sock, b);
+            try conn.writeAll(b);
         }
 
-        // Read response
-        var total_read: usize = 0;
-        while (total_read < resp_buf.len) {
-            const n = std.posix.read(sock, resp_buf[total_read..]) catch break;
+        var response = std.array_list.Managed(u8).init(self.allocator);
+        errdefer response.deinit();
+
+        var read_buf: [8192]u8 = undefined;
+        while (true) {
+            const n = try conn.read(&read_buf);
             if (n == 0) break;
-            total_read += n;
-            if (std.mem.indexOf(u8, resp_buf[0..total_read], "\r\n") != null) break;
+            if (response.items.len + n > max_response_size) return error.S3ResponseTooLarge;
+            try response.appendSlice(read_buf[0..n]);
         }
 
-        if (total_read < 12) return error.S3RequestFailed;
+        const data = try response.toOwnedSlice();
+        errdefer self.allocator.free(data);
 
-        const status = std.fmt.parseInt(u16, resp_buf[9..12], 10) catch return error.S3RequestFailed;
-        return status;
+        if (data.len < 12) return error.S3RequestFailed;
+        const header_end = std.mem.indexOf(u8, data, "\r\n\r\n") orelse return error.S3RequestFailed;
+        const status = std.fmt.parseInt(u16, data[9..12], 10) catch return error.S3RequestFailed;
+
+        return .{
+            .data = data,
+            .status = status,
+            .header_end = header_end,
+        };
+    }
+
+    fn requestTarget(alloc: Allocator, path: []const u8, query: []const u8) ![]u8 {
+        if (query.len == 0) return try alloc.dupe(u8, path);
+        return try std.fmt.allocPrint(alloc, "{s}?{s}", .{ path, query });
+    }
+
+    fn uriEncode(self: *S3Client, value: []const u8) ![]u8 {
+        var out = std.array_list.Managed(u8).init(self.allocator);
+        errdefer out.deinit();
+
+        for (value) |ch| {
+            const unreserved =
+                (ch >= 'A' and ch <= 'Z') or
+                (ch >= 'a' and ch <= 'z') or
+                (ch >= '0' and ch <= '9') or
+                ch == '-' or ch == '_' or ch == '.' or ch == '~';
+            if (unreserved) {
+                try out.append(ch);
+            } else {
+                const hex = std.fmt.bytesToHex([_]u8{ch}, .upper);
+                try out.append('%');
+                try out.appendSlice(&hex);
+            }
+        }
+
+        return out.toOwnedSlice();
+    }
+
+    fn headerValue(headers: []const u8, name: []const u8) ?[]const u8 {
+        var lines = std.mem.splitSequence(u8, headers, "\r\n");
+        _ = lines.next();
+        while (lines.next()) |line| {
+            const colon = std.mem.indexOfScalar(u8, line, ':') orelse continue;
+            const key = std.mem.trim(u8, line[0..colon], " \t");
+            if (std.ascii.eqlIgnoreCase(key, name)) {
+                return std.mem.trim(u8, line[colon + 1 ..], " \t");
+            }
+        }
+        return null;
+    }
+
+    fn responseHeaderValueOwned(self: *S3Client, response_data: []const u8, name: []const u8) !?[]u8 {
+        const header_end = std.mem.indexOf(u8, response_data, "\r\n\r\n") orelse return null;
+        const value = headerValue(response_data[0..header_end], name) orelse return null;
+        return try self.allocator.dupe(u8, value);
+    }
+
+    fn isChunked(headers: []const u8) bool {
+        const value = headerValue(headers, "Transfer-Encoding") orelse return false;
+        var tokens = std.mem.splitScalar(u8, value, ',');
+        while (tokens.next()) |token| {
+            if (std.ascii.eqlIgnoreCase(std.mem.trim(u8, token, " \t"), "chunked")) return true;
+        }
+        return false;
+    }
+
+    fn responseBodyOwned(self: *S3Client, response: *const HttpResponse) ![]u8 {
+        if (isChunked(response.headers())) {
+            return try self.decodeChunked(response.body());
+        }
+        return try self.allocator.dupe(u8, response.body());
     }
 
     // ---- Metrics helpers ----
@@ -709,7 +836,7 @@ pub const S3Client = struct {
     /// Record S3 request duration in seconds.
     fn recordS3Duration(self: *S3Client, operation: []const u8, start_ns: i128) void {
         if (self.metrics) |m| {
-            const elapsed_ns = std.time.nanoTimestamp() - start_ns;
+            const elapsed_ns = @import("time_compat").nanoTimestamp() - start_ns;
             const elapsed_secs: f64 = @as(f64, @floatFromInt(elapsed_ns)) / 1_000_000_000.0;
             m.observeLabeledHistogram("s3_request_duration_seconds", &.{operation}, elapsed_secs);
         }
@@ -783,6 +910,40 @@ test "S3Client init" {
     try testing.expectEqualStrings("127.0.0.1", client.host);
     try testing.expectEqual(@as(u16, 9000), client.port);
     try testing.expectEqual(@as(u64, 0), client.put_count);
+}
+
+test "S3Client normalizes endpoint scheme and port" {
+    const https_client = S3Client.init(testing.allocator, .{ .host = "https://s3.example.com/my-bucket" });
+    try testing.expectEqualStrings("s3.example.com", https_client.host);
+    try testing.expectEqual(S3Client.Scheme.https, https_client.scheme);
+    try testing.expectEqual(@as(u16, 443), https_client.port);
+
+    const minio_client = S3Client.init(testing.allocator, .{ .host = "http://minio:9000" });
+    try testing.expectEqualStrings("minio", minio_client.host);
+    try testing.expectEqual(S3Client.Scheme.http, minio_client.scheme);
+    try testing.expectEqual(@as(u16, 9000), minio_client.port);
+}
+
+test "S3Client request target includes canonical query" {
+    const target = try S3Client.requestTarget(testing.allocator, "/bucket", "list-type=2&prefix=wal%2F");
+    defer testing.allocator.free(target);
+    try testing.expectEqualStrings("/bucket?list-type=2&prefix=wal%2F", target);
+}
+
+test "S3Client uriEncode encodes query values" {
+    var client = S3Client.init(testing.allocator, .{});
+    const encoded = try client.uriEncode("wal/path id=1");
+    defer testing.allocator.free(encoded);
+    try testing.expectEqualStrings("wal%2Fpath%20id%3D1", encoded);
+}
+
+test "S3Client decodeChunked validates framing" {
+    var client = S3Client.init(testing.allocator, .{});
+    const decoded = try client.decodeChunked("5\r\nhello\r\n6;ext=1\r\n world\r\n0\r\n\r\n");
+    defer testing.allocator.free(decoded);
+    try testing.expectEqualStrings("hello world", decoded);
+
+    try testing.expectError(error.InvalidChunkedEncoding, client.decodeChunked("5\r\nabc\r\n0\r\n\r\n"));
 }
 
 test "S3Storage mock mode" {

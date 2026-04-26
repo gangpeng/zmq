@@ -105,7 +105,11 @@ pub const EndQuorumEpochRequest = struct {
                 else
                     (try ser.readArrayLen(buf, pos)) orelse 0;
                 if (preferred_successors_len > 0) {
-                    pos.* += preferred_successors_len * 4;
+                    const preferred_successors_items = try alloc.alloc(i32, preferred_successors_len);
+                    for (preferred_successors_items) |*item| {
+                        item.* = ser.readI32(buf, pos);
+                    }
+                    result.preferred_successors = preferred_successors_items;
                 }
                 if (version >= 1) {
                     const preferred_candidates_len: usize = if (version >= 1)

@@ -69,7 +69,7 @@ pub const JwtToken = struct {
     /// Check if the token has expired.
     pub fn isExpired(self: *const JwtToken) bool {
         const exp = self.expires_at orelse return false; // No exp = never expires
-        const now = std.time.timestamp();
+        const now = @import("time_compat").timestamp();
         return now > exp;
     }
 

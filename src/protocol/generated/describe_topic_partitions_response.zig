@@ -67,7 +67,7 @@ pub const DescribeTopicPartitionsResponse = struct {
                 ser.writeEmptyTaggedFields(buf, pos);
             }
 
-            pub fn deserialize(_: Allocator, buf: []const u8, pos: *usize, _: i16) !DescribeTopicPartitionsResponsePartition {
+            pub fn deserialize(alloc: Allocator, buf: []const u8, pos: *usize, _: i16) !DescribeTopicPartitionsResponsePartition {
                 var result = DescribeTopicPartitionsResponsePartition{};
                 result.error_code = ser.readI16(buf, pos);
                 result.partition_index = ser.readI32(buf, pos);
@@ -75,23 +75,43 @@ pub const DescribeTopicPartitionsResponse = struct {
                 result.leader_epoch = ser.readI32(buf, pos);
                 const replica_nodes_len: usize = (try ser.readCompactArrayLen(buf, pos)) orelse 0;
                 if (replica_nodes_len > 0) {
-                    pos.* += replica_nodes_len * 4;
+                    const replica_nodes_items = try alloc.alloc(i32, replica_nodes_len);
+                    for (replica_nodes_items) |*item| {
+                        item.* = ser.readI32(buf, pos);
+                    }
+                    result.replica_nodes = replica_nodes_items;
                 }
                 const isr_nodes_len: usize = (try ser.readCompactArrayLen(buf, pos)) orelse 0;
                 if (isr_nodes_len > 0) {
-                    pos.* += isr_nodes_len * 4;
+                    const isr_nodes_items = try alloc.alloc(i32, isr_nodes_len);
+                    for (isr_nodes_items) |*item| {
+                        item.* = ser.readI32(buf, pos);
+                    }
+                    result.isr_nodes = isr_nodes_items;
                 }
                 const eligible_leader_replicas_len: usize = (try ser.readCompactArrayLen(buf, pos)) orelse 0;
                 if (eligible_leader_replicas_len > 0) {
-                    pos.* += eligible_leader_replicas_len * 4;
+                    const eligible_leader_replicas_items = try alloc.alloc(i32, eligible_leader_replicas_len);
+                    for (eligible_leader_replicas_items) |*item| {
+                        item.* = ser.readI32(buf, pos);
+                    }
+                    result.eligible_leader_replicas = eligible_leader_replicas_items;
                 }
                 const last_known_elr_len: usize = (try ser.readCompactArrayLen(buf, pos)) orelse 0;
                 if (last_known_elr_len > 0) {
-                    pos.* += last_known_elr_len * 4;
+                    const last_known_elr_items = try alloc.alloc(i32, last_known_elr_len);
+                    for (last_known_elr_items) |*item| {
+                        item.* = ser.readI32(buf, pos);
+                    }
+                    result.last_known_elr = last_known_elr_items;
                 }
                 const offline_replicas_len: usize = (try ser.readCompactArrayLen(buf, pos)) orelse 0;
                 if (offline_replicas_len > 0) {
-                    pos.* += offline_replicas_len * 4;
+                    const offline_replicas_items = try alloc.alloc(i32, offline_replicas_len);
+                    for (offline_replicas_items) |*item| {
+                        item.* = ser.readI32(buf, pos);
+                    }
+                    result.offline_replicas = offline_replicas_items;
                 }
                 try ser.skipTaggedFields(buf, pos);
                 return result;
@@ -224,7 +244,7 @@ pub const DescribeTopicPartitionsResponse = struct {
     topics: []const DescribeTopicPartitionsResponseTopic = &.{},
     /// The next topic and partition index to fetch details for.
     /// Versions: 0+
-    next_cursor: Cursor = null,
+    next_cursor: ?Cursor = null,
 
     pub fn serialize(self: *const DescribeTopicPartitionsResponse, buf: []u8, pos: *usize, version: i16) void {
         ser.writeI32(buf, pos, self.throttle_time_ms);
@@ -232,7 +252,12 @@ pub const DescribeTopicPartitionsResponse = struct {
         for (self.topics) |item| {
             item.serialize(buf, pos, version);
         }
-        self.next_cursor.serialize(buf, pos, version);
+        if (self.next_cursor) |value| {
+            ser.writeUnsignedVarint(buf, pos, 1);
+            value.serialize(buf, pos, version);
+        } else {
+            ser.writeUnsignedVarint(buf, pos, 0);
+        }
         ser.writeEmptyTaggedFields(buf, pos);
     }
 
@@ -247,7 +272,9 @@ pub const DescribeTopicPartitionsResponse = struct {
             }
             result.topics = topics_items;
         }
-        result.next_cursor = try Cursor.deserialize(alloc, buf, pos, version);
+        if ((try ser.readUnsignedVarint(buf, pos)) != 0) {
+            result.next_cursor = try Cursor.deserialize(alloc, buf, pos, version);
+        }
         try ser.skipTaggedFields(buf, pos);
         return result;
     }
@@ -259,7 +286,11 @@ pub const DescribeTopicPartitionsResponse = struct {
         for (self.topics) |item| {
             size += item.calcSize(version);
         }
-        size += self.next_cursor.calcSize(version);
+        if (self.next_cursor) |value| {
+            size += 1 + value.calcSize(version);
+        } else {
+            size += 1;
+        }
         size += 1;
         return size;
     }

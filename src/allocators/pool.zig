@@ -24,7 +24,7 @@ pub fn PoolAllocator(comptime slot_size: usize) type {
         /// Create a new pool with the given number of slots.
         pub fn init(backing: Allocator, num_slots: usize) !Self {
             const total_size = aligned_slot_size * num_slots;
-            const slots = try backing.alignedAlloc(u8, @alignOf(usize), total_size);
+            const slots = try backing.alignedAlloc(u8, .of(usize), total_size);
 
             // Initialize free list: each slot points to the next
             var free_head: ?*usize = null;

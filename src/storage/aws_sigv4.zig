@@ -84,8 +84,7 @@ pub const AwsSigV4 = struct {
         var sig_raw: [HmacSha256.mac_length]u8 = undefined;
         HmacSha256.create(&sig_raw, string_to_sign, &k_signing);
 
-        var signature: [64]u8 = undefined;
-        _ = std.fmt.bufPrint(&signature, "{}", .{std.fmt.fmtSliceHexLower(&sig_raw)}) catch unreachable;
+        const signature = std.fmt.bytesToHex(sig_raw, .lower);
 
         // Step 5: Authorization Header
         return try std.fmt.allocPrint(alloc, "AWS4-HMAC-SHA256 Credential={s}/{s}, SignedHeaders={s}, Signature={s}", .{
@@ -100,7 +99,7 @@ pub const AwsSigV4 = struct {
     pub fn sha256Hex(data: []const u8, out: *[64]u8) void {
         var hash: [Sha256.digest_length]u8 = undefined;
         Sha256.hash(data, &hash, .{});
-        _ = std.fmt.bufPrint(out, "{}", .{std.fmt.fmtSliceHexLower(&hash)}) catch unreachable;
+        out.* = std.fmt.bytesToHex(hash, .lower);
     }
 
     /// Hash of empty payload.
@@ -108,7 +107,7 @@ pub const AwsSigV4 = struct {
 
     /// Get current date/time in ISO 8601 format for AWS.
     pub fn currentDateTime(date_buf: *[8]u8, datetime_buf: *[16]u8) void {
-        const epoch_seconds = @as(u64, @intCast(@divTrunc(std.time.milliTimestamp(), 1000)));
+        const epoch_seconds = @as(u64, @intCast(@divTrunc(@import("time_compat").milliTimestamp(), 1000)));
         const epoch = std.time.epoch.EpochSeconds{ .secs = epoch_seconds };
         const day = epoch.getDaySeconds();
         const year_day = epoch.getEpochDay().calculateYearDay();

@@ -17,42 +17,44 @@ pub const OpenSslLib = struct {
     crypto_handle: *anyopaque,
 
     // -- libssl function pointers --
-    TLS_server_method: *const fn () ?*anyopaque,
-    TLS_client_method: *const fn () ?*anyopaque,
-    SSL_CTX_new: *const fn (?*anyopaque) ?*anyopaque,
-    SSL_CTX_free: *const fn (?*anyopaque) void,
-    SSL_CTX_use_certificate_chain_file: *const fn (?*anyopaque, [*:0]const u8) c_int,
-    SSL_CTX_use_PrivateKey_file: *const fn (?*anyopaque, [*:0]const u8, c_int) c_int,
-    SSL_CTX_check_private_key: *const fn (?*anyopaque) c_int,
-    SSL_CTX_load_verify_locations: *const fn (?*anyopaque, ?[*:0]const u8, ?[*:0]const u8) c_int,
-    SSL_CTX_set_verify: *const fn (?*anyopaque, c_int, ?*anyopaque) void,
+    TLS_server_method: *const fn () callconv(.c) ?*anyopaque,
+    TLS_client_method: *const fn () callconv(.c) ?*anyopaque,
+    SSL_CTX_new: *const fn (?*anyopaque) callconv(.c) ?*anyopaque,
+    SSL_CTX_free: *const fn (?*anyopaque) callconv(.c) void,
+    SSL_CTX_use_certificate_chain_file: *const fn (?*anyopaque, [*:0]const u8) callconv(.c) c_int,
+    SSL_CTX_use_PrivateKey_file: *const fn (?*anyopaque, [*:0]const u8, c_int) callconv(.c) c_int,
+    SSL_CTX_check_private_key: *const fn (?*anyopaque) callconv(.c) c_int,
+    SSL_CTX_load_verify_locations: *const fn (?*anyopaque, ?[*:0]const u8, ?[*:0]const u8) callconv(.c) c_int,
+    SSL_CTX_set_verify: *const fn (?*anyopaque, c_int, ?*anyopaque) callconv(.c) void,
+    /// SSL_CTX_set_default_verify_paths(ctx) → int — load system CA paths.
+    SSL_CTX_set_default_verify_paths: ?*const fn (?*anyopaque) callconv(.c) c_int = null,
 
     /// SSL_CTX_ctrl(ctx, cmd, larg, parg) → long — generic control function
     /// Used for set_min/max_proto_version (macros in OpenSSL headers)
-    SSL_CTX_ctrl: *const fn (?*anyopaque, c_int, c_long, ?*anyopaque) c_long,
-    SSL_new: *const fn (?*anyopaque) ?*anyopaque,
-    SSL_free: *const fn (?*anyopaque) void,
-    SSL_set_fd: *const fn (?*anyopaque, c_int) c_int,
-    SSL_accept: *const fn (?*anyopaque) c_int,
-    SSL_connect: *const fn (?*anyopaque) c_int,
-    SSL_read: *const fn (?*anyopaque, [*]u8, c_int) c_int,
-    SSL_write: *const fn (?*anyopaque, [*]const u8, c_int) c_int,
-    SSL_shutdown: *const fn (?*anyopaque) c_int,
-    SSL_get_error: *const fn (?*anyopaque, c_int) c_int,
-    SSL_CTX_set_cipher_list: *const fn (?*anyopaque, [*:0]const u8) c_int,
+    SSL_CTX_ctrl: *const fn (?*anyopaque, c_int, c_long, ?*anyopaque) callconv(.c) c_long,
+    SSL_new: *const fn (?*anyopaque) callconv(.c) ?*anyopaque,
+    SSL_free: *const fn (?*anyopaque) callconv(.c) void,
+    SSL_set_fd: *const fn (?*anyopaque, c_int) callconv(.c) c_int,
+    SSL_accept: *const fn (?*anyopaque) callconv(.c) c_int,
+    SSL_connect: *const fn (?*anyopaque) callconv(.c) c_int,
+    SSL_read: *const fn (?*anyopaque, [*]u8, c_int) callconv(.c) c_int,
+    SSL_write: *const fn (?*anyopaque, [*]const u8, c_int) callconv(.c) c_int,
+    SSL_shutdown: *const fn (?*anyopaque) callconv(.c) c_int,
+    SSL_get_error: *const fn (?*anyopaque, c_int) callconv(.c) c_int,
+    SSL_CTX_set_cipher_list: *const fn (?*anyopaque, [*:0]const u8) callconv(.c) c_int,
 
     // -- Peer certificate inspection (mTLS) --
     // Available for extracting client certificate subject when mTLS is enabled.
     // In OpenSSL 3.x, SSL_get_peer_certificate was renamed to SSL_get1_peer_certificate.
     // We load SSL_get1_peer_certificate first, falling back to SSL_get_peer_certificate.
     /// SSL_get1_peer_certificate(ssl) → X509* (caller must X509_free)
-    SSL_get1_peer_certificate: ?*const fn (?*anyopaque) ?*anyopaque = null,
+    SSL_get1_peer_certificate: ?*const fn (?*anyopaque) callconv(.c) ?*anyopaque = null,
     /// X509_get_subject_name(x509) → X509_NAME* (internal pointer, do NOT free)
-    X509_get_subject_name: ?*const fn (?*anyopaque) ?*anyopaque = null,
+    X509_get_subject_name: ?*const fn (?*anyopaque) callconv(.c) ?*anyopaque = null,
     /// X509_NAME_oneline(name, buf, size) → char* (NUL-terminated string in buf)
-    X509_NAME_oneline: ?*const fn (?*anyopaque, [*]u8, c_int) ?[*:0]u8 = null,
+    X509_NAME_oneline: ?*const fn (?*anyopaque, [*]u8, c_int) callconv(.c) ?[*:0]u8 = null,
     /// X509_free(x509) — free an X509 object obtained from SSL_get1_peer_certificate
-    X509_free: ?*const fn (?*anyopaque) void = null,
+    X509_free: ?*const fn (?*anyopaque) callconv(.c) void = null,
 
     // -- Hostname verification & certificate validation --
     // SSL_set1_host(ssl, hostname) → int — enables hostname verification against
@@ -60,30 +62,30 @@ pub const OpenSslLib = struct {
     // NOTE: AutoMQ (Java) uses SSLParameters.setEndpointIdentificationAlgorithm("HTTPS")
     // which verifies hostname against SANs per RFC 6125. SSL_set1_host provides
     // equivalent verification via OpenSSL's X509_check_host under the hood.
-    SSL_set1_host: ?*const fn (?*anyopaque, [*:0]const u8) c_int = null,
+    SSL_set1_host: ?*const fn (?*anyopaque, [*:0]const u8) callconv(.c) c_int = null,
     /// SSL_set_hostflags(ssl, flags) — configure hostname check flags (e.g. partial wildcards)
-    SSL_set_hostflags: ?*const fn (?*anyopaque, c_uint) void = null,
+    SSL_set_hostflags: ?*const fn (?*anyopaque, c_uint) callconv(.c) void = null,
     /// SSL_get_verify_result(ssl) → long — returns X509_V_OK (0) if chain verification passed
-    SSL_get_verify_result: ?*const fn (?*anyopaque) c_long = null,
+    SSL_get_verify_result: ?*const fn (?*anyopaque) callconv(.c) c_long = null,
     /// X509_get_notAfter(x509) → ASN1_TIME* — pointer to the certificate's expiry time.
     /// In OpenSSL 1.1.0+ this is X509_get0_notAfter (returns const internal pointer).
-    X509_get0_notAfter: ?*const fn (?*anyopaque) ?*anyopaque = null,
+    X509_get0_notAfter: ?*const fn (?*anyopaque) callconv(.c) ?*anyopaque = null,
     /// X509_get_notBefore(x509) → ASN1_TIME* — pointer to the certificate's start time.
-    X509_get0_notBefore: ?*const fn (?*anyopaque) ?*anyopaque = null,
+    X509_get0_notBefore: ?*const fn (?*anyopaque) callconv(.c) ?*anyopaque = null,
     /// X509_cmp_current_time(asn1_time) → int
     ///   < 0: asn1_time is before current time (expired for notAfter)
     ///   > 0: asn1_time is after current time (still valid for notAfter)
     ///   = 0: error
-    X509_cmp_current_time: ?*const fn (?*anyopaque) c_int = null,
+    X509_cmp_current_time: ?*const fn (?*anyopaque) callconv(.c) c_int = null,
     /// X509_get_issuer_name(x509) → X509_NAME* (internal pointer, do NOT free)
-    X509_get_issuer_name: ?*const fn (?*anyopaque) ?*anyopaque = null,
+    X509_get_issuer_name: ?*const fn (?*anyopaque) callconv(.c) ?*anyopaque = null,
     /// X509_get_serialNumber(x509) → ASN1_INTEGER* (internal pointer, do NOT free)
-    X509_get_serialNumber: ?*const fn (?*anyopaque) ?*anyopaque = null,
+    X509_get_serialNumber: ?*const fn (?*anyopaque) callconv(.c) ?*anyopaque = null,
 
     // -- libcrypto function pointers --
-    OPENSSL_init_ssl: *const fn (u64, ?*anyopaque) c_int,
-    ERR_get_error: *const fn () c_ulong,
-    ERR_error_string_n: *const fn (c_ulong, [*]u8, usize) void,
+    OPENSSL_init_ssl: *const fn (u64, ?*anyopaque) callconv(.c) c_int,
+    ERR_get_error: *const fn () callconv(.c) c_ulong,
+    ERR_error_string_n: *const fn (c_ulong, [*]u8, usize) callconv(.c) void,
 
     // -- OpenSSL constants --
     pub const SSL_FILETYPE_PEM: c_int = 1;
@@ -257,7 +259,7 @@ pub const OpenSslLib = struct {
             log.err("OpenSSL symbol not found: {s}", .{name});
             return error.SymbolNotFound;
         };
-        return @ptrCast(ptr);
+        return @ptrCast(@alignCast(ptr));
     }
 
     /// Load OpenSSL libraries at runtime.
@@ -315,6 +317,7 @@ pub const OpenSslLib = struct {
         self.SSL_CTX_check_private_key = try lookupFn(ssl_handle, @TypeOf(self.SSL_CTX_check_private_key), "SSL_CTX_check_private_key");
         self.SSL_CTX_load_verify_locations = try lookupFn(ssl_handle, @TypeOf(self.SSL_CTX_load_verify_locations), "SSL_CTX_load_verify_locations");
         self.SSL_CTX_set_verify = try lookupFn(ssl_handle, @TypeOf(self.SSL_CTX_set_verify), "SSL_CTX_set_verify");
+        self.SSL_CTX_set_default_verify_paths = lookupFn(ssl_handle, @TypeOf(self.SSL_CTX_set_default_verify_paths.?), "SSL_CTX_set_default_verify_paths") catch null;
         self.SSL_CTX_ctrl = try lookupFn(ssl_handle, @TypeOf(self.SSL_CTX_ctrl), "SSL_CTX_ctrl");
         self.SSL_new = try lookupFn(ssl_handle, @TypeOf(self.SSL_new), "SSL_new");
         self.SSL_free = try lookupFn(ssl_handle, @TypeOf(self.SSL_free), "SSL_free");

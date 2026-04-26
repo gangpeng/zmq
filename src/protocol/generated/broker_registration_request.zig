@@ -173,7 +173,11 @@ pub const BrokerRegistrationRequest = struct {
         if (version >= 2) {
             const log_dirs_len: usize = (try ser.readCompactArrayLen(buf, pos)) orelse 0;
             if (log_dirs_len > 0) {
-                pos.* += log_dirs_len * 16;
+                const log_dirs_items = try alloc.alloc([16]u8, log_dirs_len);
+                for (log_dirs_items) |*item| {
+                    item.* = try ser.readUuid(buf, pos);
+                }
+                result.log_dirs = log_dirs_items;
             }
         }
         if (version >= 3) {

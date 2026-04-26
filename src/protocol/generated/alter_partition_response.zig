@@ -49,7 +49,7 @@ pub const AlterPartitionResponse = struct {
                 ser.writeEmptyTaggedFields(buf, pos);
             }
 
-            pub fn deserialize(_: Allocator, buf: []const u8, pos: *usize, version: i16) !PartitionData {
+            pub fn deserialize(alloc: Allocator, buf: []const u8, pos: *usize, version: i16) !PartitionData {
                 var result = PartitionData{};
                 result.partition_index = ser.readI32(buf, pos);
                 result.error_code = ser.readI16(buf, pos);
@@ -57,7 +57,11 @@ pub const AlterPartitionResponse = struct {
                 result.leader_epoch = ser.readI32(buf, pos);
                 const isr_len: usize = (try ser.readCompactArrayLen(buf, pos)) orelse 0;
                 if (isr_len > 0) {
-                    pos.* += isr_len * 4;
+                    const isr_items = try alloc.alloc(i32, isr_len);
+                    for (isr_items) |*item| {
+                        item.* = ser.readI32(buf, pos);
+                    }
+                    result.isr = isr_items;
                 }
                 if (version >= 1) {
                     result.leader_recovery_state = ser.readI8(buf, pos);

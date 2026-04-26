@@ -8,6 +8,43 @@ const std = @import("std");
 const ser = @import("../serialization.zig");
 const Allocator = std.mem.Allocator;
 
+pub const Voter = struct {
+    ///
+    /// Versions: 0+
+    voter_id: i32 = 0,
+    /// The directory id of the voter
+    /// Versions: 1+
+    voter_directory_id: [16]u8 = .{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 },
+
+    pub fn serialize(self: *const Voter, buf: []u8, pos: *usize, version: i16) void {
+        ser.writeI32(buf, pos, self.voter_id);
+        if (version >= 1) {
+            ser.writeUuid(buf, pos, self.voter_directory_id);
+        }
+        ser.writeEmptyTaggedFields(buf, pos);
+    }
+
+    pub fn deserialize(_: Allocator, buf: []const u8, pos: *usize, version: i16) !Voter {
+        var result = Voter{};
+        result.voter_id = ser.readI32(buf, pos);
+        if (version >= 1) {
+            result.voter_directory_id = try ser.readUuid(buf, pos);
+        }
+        try ser.skipTaggedFields(buf, pos);
+        return result;
+    }
+
+    pub fn calcSize(_: *const Voter, version: i16) usize {
+        var size: usize = 0;
+        size += 4;
+        if (version >= 1) {
+            size += 16;
+        }
+        size += 1;
+        return size;
+    }
+};
+
 pub const LeaderChangeMessage = struct {
     /// The version of the leader change message
     /// Versions: 0+
@@ -36,24 +73,42 @@ pub const LeaderChangeMessage = struct {
         ser.writeEmptyTaggedFields(buf, pos);
     }
 
-    pub fn deserialize(_: Allocator, buf: []const u8, pos: *usize, _: i16) !LeaderChangeMessage {
+    pub fn deserialize(alloc: Allocator, buf: []const u8, pos: *usize, version: i16) !LeaderChangeMessage {
         var result = LeaderChangeMessage{};
         result.version = ser.readI16(buf, pos);
         result.leader_id = ser.readI32(buf, pos);
         const voters_len: usize = (try ser.readCompactArrayLen(buf, pos)) orelse 0;
-        _ = voters_len;
+        if (voters_len > 0) {
+            const voters_items = try alloc.alloc(Voter, voters_len);
+            for (voters_items) |*item| {
+                item.* = try Voter.deserialize(alloc, buf, pos, version);
+            }
+            result.voters = voters_items;
+        }
         const granting_voters_len: usize = (try ser.readCompactArrayLen(buf, pos)) orelse 0;
-        _ = granting_voters_len;
+        if (granting_voters_len > 0) {
+            const granting_voters_items = try alloc.alloc(Voter, granting_voters_len);
+            for (granting_voters_items) |*item| {
+                item.* = try Voter.deserialize(alloc, buf, pos, version);
+            }
+            result.granting_voters = granting_voters_items;
+        }
         try ser.skipTaggedFields(buf, pos);
         return result;
     }
 
-    pub fn calcSize(self: *const LeaderChangeMessage, _: i16) usize {
+    pub fn calcSize(self: *const LeaderChangeMessage, version: i16) usize {
         var size: usize = 0;
         size += 2;
         size += 4;
         size += ser.unsignedVarintSize(self.voters.len + 1);
+        for (self.voters) |item| {
+            size += item.calcSize(version);
+        }
         size += ser.unsignedVarintSize(self.granting_voters.len + 1);
+        for (self.granting_voters) |item| {
+            size += item.calcSize(version);
+        }
         size += 1;
         return size;
     }

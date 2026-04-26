@@ -2,7 +2,7 @@ const std = @import("std");
 const testing = std.testing;
 const Allocator = std.mem.Allocator;
 const log = std.log.scoped(.group_coordinator);
-const MetricRegistry = @import("../core/metric_registry.zig").MetricRegistry;
+const MetricRegistry = @import("core").MetricRegistry;
 
 /// Consumer group coordinator.
 ///
@@ -46,7 +46,7 @@ pub const GroupCoordinator = struct {
     /// Should be called periodically (e.g., every 1 second).
     /// Returns the number of members evicted.
     pub fn evictExpiredMembers(self: *GroupCoordinator, session_timeout_ms: i64) u32 {
-        const now = std.time.milliTimestamp();
+        const now = @import("time_compat").milliTimestamp();
         var evicted: u32 = 0;
 
         var git = self.groups.iterator();
@@ -55,7 +55,7 @@ pub const GroupCoordinator = struct {
             if (group.state == .dead or group.state == .empty) continue;
 
             // Collect expired members
-            var expired = std.ArrayList([]const u8).init(self.allocator);
+            var expired = std.array_list.Managed([]const u8).init(self.allocator);
             defer expired.deinit();
 
             var mit = group.members.iterator();
@@ -82,7 +82,7 @@ pub const GroupCoordinator = struct {
             } else if (expired.items.len > 0) {
                 // Trigger rebalance if members were evicted
                 group.state = .preparing_rebalance;
-                group.rebalance_start_ms = std.time.milliTimestamp();
+                group.rebalance_start_ms = @import("time_compat").milliTimestamp();
                 group.generation_id += 1;
                 log.info("Group rebalance triggered: {d} members evicted, generation={d}", .{ expired.items.len, group.generation_id });
             }
@@ -95,7 +95,7 @@ pub const GroupCoordinator = struct {
     /// state for longer than its rebalance_timeout_ms, force-complete the rebalance.
     /// Transitions to COMPLETING_REBALANCE (not directly STABLE).
     pub fn checkRebalanceTimeouts(self: *GroupCoordinator) u32 {
-        const now = std.time.milliTimestamp();
+        const now = @import("time_compat").milliTimestamp();
         var forced: u32 = 0;
 
         var git = self.groups.iterator();
@@ -169,7 +169,7 @@ pub const GroupCoordinator = struct {
             if (existing_mid) |emid| {
                 // Static member rejoin — update heartbeat, don't trigger rebalance
                 if (group.members.getPtr(emid)) |existing_member| {
-                    existing_member.last_heartbeat_ms = std.time.milliTimestamp();
+                    existing_member.last_heartbeat_ms = @import("time_compat").milliTimestamp();
                     const is_leader = if (group.leader_id) |lid| std.mem.eql(u8, lid, emid) else false;
                     return .{
                         .error_code = 0,
@@ -218,7 +218,7 @@ pub const GroupCoordinator = struct {
         if (group.state == .empty or group.state == .stable) {
             group.state = .preparing_rebalance;
             group.generation_id += 1;
-            group.rebalance_start_ms = std.time.milliTimestamp();
+            group.rebalance_start_ms = @import("time_compat").milliTimestamp();
             log.info("Group {s} transitioning to preparing_rebalance: generation={d}", .{ group_id, group.generation_id });
         }
 
@@ -257,7 +257,7 @@ pub const GroupCoordinator = struct {
         if (group.generation_id != generation_id) return 22; // ILLEGAL_GENERATION
 
         if (group.members.getPtr(member_id)) |member| {
-            member.last_heartbeat_ms = std.time.milliTimestamp();
+            member.last_heartbeat_ms = @import("time_compat").milliTimestamp();
             // Tell client to rejoin if group is rebalancing
             if (group.state == .preparing_rebalance or group.state == .completing_rebalance) {
                 log.debug("Heartbeat: signaling REBALANCE_IN_PROGRESS to member {s} in group {s}", .{ member_id, group_id });
@@ -289,6 +289,49 @@ pub const GroupCoordinator = struct {
         }
 
         return 25; // UNKNOWN_MEMBER_ID
+    }
+
+    /// Delete an empty consumer group and its committed offsets.
+    ///
+    /// Kafka DeleteGroups must not remove groups with active members. Returning
+    /// Kafka error codes here keeps the broker handler thin and testable.
+    pub fn deleteGroup(self: *GroupCoordinator, group_id: []const u8) i16 {
+        if (group_id.len == 0) return 24; // INVALID_GROUP_ID
+
+        const group = self.groups.getPtr(group_id) orelse return 69; // GROUP_ID_NOT_FOUND
+        if (group.members.count() > 0) return 68; // NON_EMPTY_GROUP
+
+        self.deleteCommittedOffsetsForGroup(group_id);
+
+        if (self.groups.fetchRemove(group_id)) |entry| {
+            var group_copy = entry.value;
+            group_copy.deinit();
+            self.allocator.free(entry.key);
+            return 0;
+        }
+        return 69; // GROUP_ID_NOT_FOUND
+    }
+
+    fn deleteCommittedOffsetsForGroup(self: *GroupCoordinator, group_id: []const u8) void {
+        while (true) {
+            var key_to_remove: ?[]const u8 = null;
+            var it = self.committed_offsets.iterator();
+            while (it.next()) |entry| {
+                const key = entry.key_ptr.*;
+                if (key.len > group_id.len and
+                    key[group_id.len] == ':' and
+                    std.mem.startsWith(u8, key, group_id))
+                {
+                    key_to_remove = key;
+                    break;
+                }
+            }
+
+            const key = key_to_remove orelse break;
+            if (self.committed_offsets.fetchRemove(key)) |old| {
+                self.allocator.free(old.key);
+            }
+        }
     }
 
     /// Handle SyncGroup request.
@@ -545,7 +588,7 @@ pub const GroupCoordinator = struct {
         }
 
         // Phase 2: Collect unassigned partitions (new partitions or from departed members)
-        var unassigned = std.ArrayList(struct { topic: []const u8, partition: i32 }).init(self.allocator);
+        var unassigned = std.array_list.Managed(struct { topic: []const u8, partition: i32 }).init(self.allocator);
         defer unassigned.deinit();
 
         for (topic_partitions) |tp| {
@@ -623,7 +666,7 @@ pub const GroupCoordinator = struct {
 
             for (topic_partitions) |tp| {
                 // Collect partitions for this member in this topic
-                var parts = std.ArrayList(i32).init(self.allocator);
+                var parts = std.array_list.Managed(i32).init(self.allocator);
                 defer parts.deinit();
 
                 var p: i32 = 0;
@@ -715,8 +758,8 @@ pub const GroupCoordinator = struct {
     /// Serialize group membership state for persistence.
     /// Format: num_groups(u32) + [group_id_len(u16) + group_id + state(u8) + gen(i32) + num_members(u32) + ...]
     pub fn serializeGroupState(self: *GroupCoordinator) ![]u8 {
-        var buf = std.ArrayList(u8).init(self.allocator);
-        const writer = buf.writer();
+        var buf = std.array_list.Managed(u8).init(self.allocator);
+        const writer = @import("list_compat").writer(&buf);
 
         try writer.writeInt(u32, @intCast(self.groups.count()), .big);
 
@@ -777,14 +820,14 @@ pub const ConsumerGroup = struct {
         group_instance_id: ?[]u8 = null,
         last_heartbeat_ms: i64 = 0,
         assignment: ?[]u8 = null,
-        subscribed_topics: std.ArrayList([]u8),
+        subscribed_topics: std.array_list.Managed([]u8),
         protocol_name: ?[]u8 = null,
 
         pub fn initMember(alloc: Allocator, mid: []u8) GroupMember {
             return .{
                 .member_id = mid,
-                .last_heartbeat_ms = std.time.milliTimestamp(),
-                .subscribed_topics = std.ArrayList([]u8).init(alloc),
+                .last_heartbeat_ms = @import("time_compat").milliTimestamp(),
+                .subscribed_topics = std.array_list.Managed([]u8).init(alloc),
             };
         }
 
@@ -1011,6 +1054,22 @@ test "GroupCoordinator totalMemberCount" {
     try testing.expectEqual(@as(usize, 2), coord.totalMemberCount());
 }
 
+test "GroupCoordinator deleteGroup enforces emptiness and removes offsets" {
+    var coord = GroupCoordinator.init(testing.allocator);
+    defer coord.deinit();
+
+    try testing.expectEqual(@as(i16, 69), coord.deleteGroup("missing"));
+
+    const join = try coord.joinGroup("delete-me", null, "consumer", null);
+    try coord.commitOffset("delete-me", "topic-a", 0, 42);
+    try testing.expectEqual(@as(i16, 68), coord.deleteGroup("delete-me"));
+
+    try testing.expectEqual(@as(i16, 0), coord.leaveGroup("delete-me", join.member_id));
+    try testing.expectEqual(@as(i16, 0), coord.deleteGroup("delete-me"));
+    try testing.expectEqual(@as(usize, 0), coord.groupCount());
+    try testing.expect((try coord.fetchOffset("delete-me", "topic-a", 0)) == null);
+}
+
 test "GroupCoordinator join with subscriptions" {
     var coord = GroupCoordinator.init(testing.allocator);
     defer coord.deinit();
@@ -1081,7 +1140,7 @@ test "GroupCoordinator session timeout eviction" {
 
     // Artificially set the last heartbeat to far in the past
     const member = group.members.getPtr(r1.member_id).?;
-    member.last_heartbeat_ms = std.time.milliTimestamp() - 60000; // 60 seconds ago
+    member.last_heartbeat_ms = @import("time_compat").milliTimestamp() - 60000; // 60 seconds ago
 
     // Evict with a 30-second timeout — member should be evicted
     const evicted = coord.evictExpiredMembers(30000);
@@ -1106,7 +1165,7 @@ test "GroupCoordinator session timeout triggers rebalance when members remain" {
 
     // Expire only the first member
     const m1 = group.members.getPtr(r1.member_id).?;
-    m1.last_heartbeat_ms = std.time.milliTimestamp() - 60000;
+    m1.last_heartbeat_ms = @import("time_compat").milliTimestamp() - 60000;
 
     const evicted = coord.evictExpiredMembers(30000);
     try testing.expectEqual(@as(u32, 1), evicted);
@@ -1438,10 +1497,10 @@ test "GroupCoordinator evictExpiredMembers removes timed-out members" {
 
     // Expire members r1 and r2 by setting their heartbeat far in the past
     if (group.members.getPtr(r1.member_id)) |m| {
-        m.last_heartbeat_ms = std.time.milliTimestamp() - 120_000; // 2 min ago
+        m.last_heartbeat_ms = @import("time_compat").milliTimestamp() - 120_000; // 2 min ago
     }
     if (group.members.getPtr(r2.member_id)) |m| {
-        m.last_heartbeat_ms = std.time.milliTimestamp() - 90_000; // 1.5 min ago
+        m.last_heartbeat_ms = @import("time_compat").milliTimestamp() - 90_000; // 1.5 min ago
     }
     // r3 keeps a recent heartbeat (already set by joinGroup)
 

@@ -1,8 +1,8 @@
 const std = @import("std");
 const testing = std.testing;
 const Allocator = std.mem.Allocator;
-const fs = std.fs;
-const crc32c = @import("../core/crc32c.zig");
+const fs = @import("fs_compat");
+const crc32c = @import("core").crc32c;
 const log = std.log.scoped(.wal);
 const ObjectWriter = @import("s3.zig").ObjectWriter;
 const stream_mod = @import("stream.zig");
@@ -37,7 +37,7 @@ pub const Wal = struct {
     total_bytes_written: u64 = 0,
     total_records_written: u64 = 0,
     /// Metadata for all closed (immutable) segments.
-    segments: std.ArrayList(SegmentMeta),
+    segments: std.array_list.Managed(SegmentMeta),
     fsync_policy: FsyncPolicy = .every_n_records,
     /// Number of records between fsync calls (only used with every_n_records policy).
     fsync_interval: u64 = 100,
@@ -73,7 +73,7 @@ pub const Wal = struct {
             .dir_path = dir_path,
             .allocator = alloc,
             .segment_max_size = segment_max_size,
-            .segments = std.ArrayList(SegmentMeta).init(alloc),
+            .segments = std.array_list.Managed(SegmentMeta).init(alloc),
         };
     }
 
@@ -232,7 +232,7 @@ pub const Wal = struct {
         var total_offset: u64 = 0;
 
         // Collect and sort WAL files
-        var files = std.ArrayList([]const u8).init(self.allocator);
+        var files = std.array_list.Managed([]const u8).init(self.allocator);
         defer {
             for (files.items) |f| self.allocator.free(f);
             files.deinit();
@@ -302,7 +302,7 @@ pub const Wal = struct {
 
 /// In-memory WAL for testing (no filesystem dependency).
 pub const MemoryWal = struct {
-    records: std.ArrayList(Record),
+    records: std.array_list.Managed(Record),
     allocator: Allocator,
     total_bytes: u64 = 0,
 
@@ -313,7 +313,7 @@ pub const MemoryWal = struct {
 
     pub fn init(alloc: Allocator) MemoryWal {
         return .{
-            .records = std.ArrayList(Record).init(alloc),
+            .records = std.array_list.Managed(Record).init(alloc),
             .allocator = alloc,
         };
     }
@@ -457,7 +457,7 @@ test "Wal CRC corruption detection during recovery" {
         var wal = Wal.init(testing.allocator, tmp_dir, 1024 * 1024);
         defer wal.deinit();
 
-        var recovered_data = std.ArrayList([]const u8).init(testing.allocator);
+        var recovered_data = std.array_list.Managed([]const u8).init(testing.allocator);
         defer recovered_data.deinit();
 
         const count = try wal.recover(&struct {
@@ -608,7 +608,7 @@ test "Wal empty recovery on fresh directory" {
 /// by the broker tick() rather than a background thread.
 pub const S3WalBatcher = struct {
     /// Pending record entries waiting to be flushed to S3.
-    buffer: std.ArrayList(BatchEntry),
+    buffer: std.array_list.Managed(BatchEntry),
     /// Total bytes currently buffered (used for threshold-based flushing).
     buffer_size: usize = 0,
     /// Timestamp of the last successful flush (for interval-based flushing).
@@ -668,8 +668,8 @@ pub const S3WalBatcher = struct {
 
     pub fn init(alloc: Allocator) S3WalBatcher {
         return .{
-            .buffer = std.ArrayList(BatchEntry).init(alloc),
-            .last_flush_ms = std.time.milliTimestamp(),
+            .buffer = std.array_list.Managed(BatchEntry).init(alloc),
+            .last_flush_ms = @import("time_compat").milliTimestamp(),
             .allocator = alloc,
             .pending_hw_updates = std.AutoHashMap(u64, u64).init(alloc),
         };
@@ -678,8 +678,8 @@ pub const S3WalBatcher = struct {
     /// Initialize with configuration.
     pub fn initWithConfig(alloc: Allocator, config: S3WalConfig) S3WalBatcher {
         return .{
-            .buffer = std.ArrayList(BatchEntry).init(alloc),
-            .last_flush_ms = std.time.milliTimestamp(),
+            .buffer = std.array_list.Managed(BatchEntry).init(alloc),
+            .last_flush_ms = @import("time_compat").milliTimestamp(),
             .allocator = alloc,
             .max_batch_size = config.batch_size,
             .flush_interval_ms = config.flush_interval_ms,
@@ -712,8 +712,9 @@ pub const S3WalBatcher = struct {
             .data = data_copy,
         });
         self.buffer_size += records.len;
-        if (base_offset + 1 > self.last_appended_offset) {
-            self.last_appended_offset = base_offset + 1;
+        const next_offset = base_offset + recordCountFromData(records);
+        if (next_offset > self.last_appended_offset) {
+            self.last_appended_offset = next_offset;
         }
     }
 
@@ -721,7 +722,7 @@ pub const S3WalBatcher = struct {
     /// Called from the broker's periodic tick.
     pub fn shouldFlush(self: *const S3WalBatcher) bool {
         if (self.buffer.items.len == 0) return false;
-        const now = std.time.milliTimestamp();
+        const now = @import("time_compat").milliTimestamp();
         const time_elapsed = now - self.last_flush_ms;
         return self.buffer_size >= self.max_batch_size or time_elapsed >= self.flush_interval_ms;
     }
@@ -750,10 +751,15 @@ pub const S3WalBatcher = struct {
         return self.pending_produce_count > 0;
     }
 
-    /// Force flush all buffered entries to S3 as a single batch object.
-    /// Returns the S3 object bytes in ObjectWriter format (with index + footer).
-    /// Updates last_flushed_offset on success to confirm durability.
-    pub fn flushBuild(self: *S3WalBatcher) !?[]u8 {
+    fn recordCountFromData(data: []const u8) u64 {
+        if (data.len >= 61 and data[16] == 2) {
+            const rc = std.mem.readInt(i32, data[57..61], .big);
+            if (rc > 0) return @intCast(rc);
+        }
+        return 1;
+    }
+
+    fn buildBatchData(self: *S3WalBatcher) !?[]u8 {
         if (self.buffer.items.len == 0) return null;
 
         // Build S3 object using ObjectWriter format (indexed, with footer)
@@ -764,10 +770,7 @@ pub const S3WalBatcher = struct {
 
         for (self.buffer.items) |entry| {
             // Parse record_count from RecordBatch header if possible (V2 format)
-            const record_count: u32 = if (entry.data.len >= 61 and entry.data[16] == 2) blk: {
-                const rc = std.mem.readInt(i32, entry.data[57..61], .big);
-                break :blk if (rc > 0) @intCast(rc) else 1;
-            } else 1;
+            const record_count: u32 = @intCast(recordCountFromData(entry.data));
 
             try writer.addDataBlock(
                 entry.stream_id,
@@ -778,20 +781,34 @@ pub const S3WalBatcher = struct {
             );
         }
 
-        const batch_data = try writer.build();
+        return try writer.build();
+    }
 
+    fn markFlushSuccess(self: *S3WalBatcher) void {
         // Clear the buffer
         for (self.buffer.items) |*entry| {
             entry.deinit(self.allocator);
         }
         self.buffer.clearRetainingCapacity();
         self.buffer_size = 0;
-        self.last_flush_ms = std.time.milliTimestamp();
+        self.last_flush_ms = @import("time_compat").milliTimestamp();
         self.batch_upload_count += 1;
         self.s3_object_counter += 1;
 
         // Update last_flushed_offset to mark data as durable
         self.last_flushed_offset = self.last_appended_offset;
+        self.last_flushed_segment_id = self.s3_object_counter;
+    }
+
+    /// Force flush all buffered entries to an S3 object payload.
+    /// Returns ObjectWriter bytes and marks the current buffer flushed.
+    ///
+    /// This helper is used by unit tests and offline object construction. The
+    /// production upload path uses flushNow(), which marks success only after
+    /// the S3 PUT has completed.
+    pub fn flushBuild(self: *S3WalBatcher) !?[]u8 {
+        const batch_data = try self.buildBatchData();
+        if (batch_data != null) self.markFlushSuccess();
 
         return batch_data;
     }
@@ -813,7 +830,7 @@ pub const S3WalBatcher = struct {
             null;
         defer if (ranges) |r| self.allocator.free(r);
 
-        const batch_data = self.flushBuild() catch |err| {
+        const batch_data = self.buildBatchData() catch |err| {
             log.warn("S3 WAL sync flush build failed: {}", .{err});
             self.batch_upload_failures += 1;
             return false;
@@ -823,7 +840,7 @@ pub const S3WalBatcher = struct {
             defer self.allocator.free(data);
 
             // Include epoch in S3 object key for fencing traceability
-            const obj_key = self.currentObjectKey(self.allocator) catch {
+            const obj_key = self.nextObjectKey(self.allocator) catch {
                 self.batch_upload_failures += 1;
                 return false;
             };
@@ -834,6 +851,8 @@ pub const S3WalBatcher = struct {
                 self.batch_upload_failures += 1;
                 return false;
             };
+
+            self.markFlushSuccess();
 
             // Register as StreamSetObject in ObjectManager
             if (self.object_manager) |om| {
@@ -853,10 +872,6 @@ pub const S3WalBatcher = struct {
                     };
                 }
             }
-
-            // Track the flushed segment so tick() can clean up local WAL files.
-            // s3_object_counter was already incremented by flushBuild().
-            self.last_flushed_segment_id = self.s3_object_counter;
 
             return true; // Data is now durable in S3
         }
@@ -888,6 +903,10 @@ pub const S3WalBatcher = struct {
         return try std.fmt.allocPrint(alloc, "wal/epoch-{d}/bulk/{d:0>10}", .{ self.wal_epoch, self.s3_object_counter });
     }
 
+    fn nextObjectKey(self: *const S3WalBatcher, alloc: Allocator) ![]u8 {
+        return try std.fmt.allocPrint(alloc, "wal/epoch-{d}/bulk/{d:0>10}", .{ self.wal_epoch, self.s3_object_counter + 1 });
+    }
+
     /// Number of entries currently buffered.
     pub fn pendingCount(self: *const S3WalBatcher) usize {
         return self.buffer.items.len;
@@ -912,10 +931,7 @@ pub const S3WalBatcher = struct {
 
         for (self.buffer.items) |entry| {
             // Parse record_count from RecordBatch header if possible
-            const record_count: u64 = if (entry.data.len >= 61 and entry.data[16] == 2) blk: {
-                const rc = std.mem.readInt(i32, entry.data[57..61], .big);
-                break :blk if (rc > 0) @intCast(rc) else 1;
-            } else 1;
+            const record_count = recordCountFromData(entry.data);
 
             const end_offset = entry.base_offset + record_count;
             var gop = try range_map.getOrPut(entry.stream_id);
@@ -945,7 +961,8 @@ pub const S3WalBatcher = struct {
 /// WAL flush mode configuration.
 /// sync = flush after every produce (durable, matches Java Kafka behavior)
 /// async = batch flush from tick (fast but may lose data on crash)
-/// group_commit = batch flush at epoll boundary (AutoMQ-style, high throughput + durable)
+/// group_commit = reserved for response-delayed group commit; currently handled
+/// like sync by PartitionStore so produce responses are not sent before S3 durability.
 pub const WalFlushMode = enum {
     sync,
     async_flush,
@@ -1083,6 +1100,27 @@ test "S3WalBatcher flushNow empty returns true" {
     const flushed = batcher.flushNow(&mock_s3);
     try testing.expect(flushed);
     try testing.expectEqual(@as(usize, 0), mock_s3.objectCount());
+}
+
+test "S3WalBatcher flushNow preserves buffer on upload failure" {
+    const FailingS3 = struct {
+        pub fn putObject(_: *@This(), _: []const u8, _: []const u8) !void {
+            return error.InjectedPutFailure;
+        }
+    };
+
+    var batcher = S3WalBatcher.init(testing.allocator);
+    defer batcher.deinit();
+    var failing_s3 = FailingS3{};
+
+    try batcher.append(1, 0, "record-a");
+
+    const flushed = batcher.flushNow(&failing_s3);
+    try testing.expect(!flushed);
+    try testing.expectEqual(@as(usize, 1), batcher.pendingCount());
+    try testing.expectEqual(@as(u64, 0), batcher.batch_upload_count);
+    try testing.expectEqual(@as(u64, 1), batcher.batch_upload_failures);
+    try testing.expect(!batcher.isFlushed(1));
 }
 
 test "S3WalBatcher fencing rejects appends" {
@@ -1374,7 +1412,8 @@ test "S3WalBatcher hasPendingFlush" {
     try batcher.trackPendingHW(1, 0);
     try testing.expect(batcher.hasPendingFlush());
 
-    _ = batcher.drainPendingHWUpdates();
+    var updates = batcher.drainPendingHWUpdates();
+    defer updates.deinit();
     try testing.expect(!batcher.hasPendingFlush());
 }
 

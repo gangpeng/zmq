@@ -8,6 +8,266 @@ const std = @import("std");
 const ser = @import("../serialization.zig");
 const Allocator = std.mem.Allocator;
 
+pub const LogMetadata = struct {
+    /// The segment list
+    /// Versions: 0+
+    segments: []const SegmentMetadata = &.{},
+    ///
+    /// Versions: 0+
+    stream_map: []const StreamMapping = &.{},
+
+    pub fn serialize(self: *const LogMetadata, buf: []u8, pos: *usize, version: i16) void {
+        ser.writeCompactArrayLen(buf, pos, self.segments.len);
+        for (self.segments) |item| {
+            item.serialize(buf, pos, version);
+        }
+        ser.writeCompactArrayLen(buf, pos, self.stream_map.len);
+        for (self.stream_map) |item| {
+            item.serialize(buf, pos, version);
+        }
+        ser.writeEmptyTaggedFields(buf, pos);
+    }
+
+    pub fn deserialize(alloc: Allocator, buf: []const u8, pos: *usize, version: i16) !LogMetadata {
+        var result = LogMetadata{};
+        const segments_len: usize = (try ser.readCompactArrayLen(buf, pos)) orelse 0;
+        if (segments_len > 0) {
+            const segments_items = try alloc.alloc(SegmentMetadata, segments_len);
+            for (segments_items) |*item| {
+                item.* = try SegmentMetadata.deserialize(alloc, buf, pos, version);
+            }
+            result.segments = segments_items;
+        }
+        const stream_map_len: usize = (try ser.readCompactArrayLen(buf, pos)) orelse 0;
+        if (stream_map_len > 0) {
+            const stream_map_items = try alloc.alloc(StreamMapping, stream_map_len);
+            for (stream_map_items) |*item| {
+                item.* = try StreamMapping.deserialize(alloc, buf, pos, version);
+            }
+            result.stream_map = stream_map_items;
+        }
+        try ser.skipTaggedFields(buf, pos);
+        return result;
+    }
+
+    pub fn calcSize(self: *const LogMetadata, version: i16) usize {
+        var size: usize = 0;
+        size += ser.unsignedVarintSize(self.segments.len + 1);
+        for (self.segments) |item| {
+            size += item.calcSize(version);
+        }
+        size += ser.unsignedVarintSize(self.stream_map.len + 1);
+        for (self.stream_map) |item| {
+            size += item.calcSize(version);
+        }
+        size += 1;
+        return size;
+    }
+};
+
+pub const StreamMapping = struct {
+    /// The streamName
+    /// Versions: 0+
+    name: ?[]const u8 = null,
+    /// The stream id
+    /// Versions: 0+
+    stream_id: i64 = 0,
+
+    pub fn serialize(self: *const StreamMapping, buf: []u8, pos: *usize, _: i16) void {
+        ser.writeCompactString(buf, pos, self.name);
+        ser.writeI64(buf, pos, self.stream_id);
+        ser.writeEmptyTaggedFields(buf, pos);
+    }
+
+    pub fn deserialize(_: Allocator, buf: []const u8, pos: *usize, _: i16) !StreamMapping {
+        var result = StreamMapping{};
+        result.name = try ser.readCompactString(buf, pos);
+        result.stream_id = ser.readI64(buf, pos);
+        try ser.skipTaggedFields(buf, pos);
+        return result;
+    }
+
+    pub fn calcSize(self: *const StreamMapping, _: i16) usize {
+        var size: usize = 0;
+        size += ser.compactStringSize(self.name);
+        size += 8;
+        size += 1;
+        return size;
+    }
+};
+
+pub const LogOffsetMetadata = struct {
+    /// The message logic offset
+    /// Versions: 0+
+    message_offset: i64 = 0,
+    /// The message relative physical offset
+    /// Versions: 0+
+    relative_position_in_segment: i32 = 0,
+
+    pub fn serialize(self: *const LogOffsetMetadata, buf: []u8, pos: *usize, _: i16) void {
+        ser.writeI64(buf, pos, self.message_offset);
+        ser.writeI32(buf, pos, self.relative_position_in_segment);
+        ser.writeEmptyTaggedFields(buf, pos);
+    }
+
+    pub fn deserialize(_: Allocator, buf: []const u8, pos: *usize, _: i16) !LogOffsetMetadata {
+        var result = LogOffsetMetadata{};
+        result.message_offset = ser.readI64(buf, pos);
+        result.relative_position_in_segment = ser.readI32(buf, pos);
+        try ser.skipTaggedFields(buf, pos);
+        return result;
+    }
+
+    pub fn calcSize(_: *const LogOffsetMetadata, _: i16) usize {
+        var size: usize = 0;
+        size += 8;
+        size += 4;
+        size += 1;
+        return size;
+    }
+};
+
+pub const SegmentMetadata = struct {
+    /// The segment base offset
+    /// Versions: 0+
+    base_offset: i64 = 0,
+    /// The segment create timestamp
+    /// Versions: 0+
+    create_timestamp: i64 = 0,
+    /// The segment last modified timestamp
+    /// Versions: 0+
+    last_modified_timestamp: i64 = 0,
+    /// The segment's stream suffix
+    /// Versions: 0+
+    stream_suffix: ?[]const u8 = null,
+    /// The segment size
+    /// Versions: 0+
+    log_size: i32 = 0,
+    /// The segment log stream slice range
+    /// Versions: 0+
+    log: SliceRange = .{},
+    /// The segment time stream slice range
+    /// Versions: 0+
+    time: SliceRange = .{},
+    /// The segment transaction stream slice range
+    /// Versions: 0+
+    transaction: SliceRange = .{},
+    /// The segment first batch timestamp
+    /// Versions: 0+
+    first_batch_timestamp: i64 = 0,
+    /// The segment last timestamp index entry
+    /// Versions: 0+
+    time_index_last_entry: TimestampOffsetData = .{},
+
+    pub fn serialize(self: *const SegmentMetadata, buf: []u8, pos: *usize, version: i16) void {
+        ser.writeI64(buf, pos, self.base_offset);
+        ser.writeI64(buf, pos, self.create_timestamp);
+        ser.writeI64(buf, pos, self.last_modified_timestamp);
+        ser.writeCompactString(buf, pos, self.stream_suffix);
+        ser.writeI32(buf, pos, self.log_size);
+        self.log.serialize(buf, pos, version);
+        self.time.serialize(buf, pos, version);
+        self.transaction.serialize(buf, pos, version);
+        ser.writeI64(buf, pos, self.first_batch_timestamp);
+        self.time_index_last_entry.serialize(buf, pos, version);
+        ser.writeEmptyTaggedFields(buf, pos);
+    }
+
+    pub fn deserialize(alloc: Allocator, buf: []const u8, pos: *usize, version: i16) !SegmentMetadata {
+        var result = SegmentMetadata{};
+        result.base_offset = ser.readI64(buf, pos);
+        result.create_timestamp = ser.readI64(buf, pos);
+        result.last_modified_timestamp = ser.readI64(buf, pos);
+        result.stream_suffix = try ser.readCompactString(buf, pos);
+        result.log_size = ser.readI32(buf, pos);
+        result.log = try SliceRange.deserialize(alloc, buf, pos, version);
+        result.time = try SliceRange.deserialize(alloc, buf, pos, version);
+        result.transaction = try SliceRange.deserialize(alloc, buf, pos, version);
+        result.first_batch_timestamp = ser.readI64(buf, pos);
+        result.time_index_last_entry = try TimestampOffsetData.deserialize(alloc, buf, pos, version);
+        try ser.skipTaggedFields(buf, pos);
+        return result;
+    }
+
+    pub fn calcSize(self: *const SegmentMetadata, version: i16) usize {
+        var size: usize = 0;
+        size += 8;
+        size += 8;
+        size += 8;
+        size += ser.compactStringSize(self.stream_suffix);
+        size += 4;
+        size += self.log.calcSize(version);
+        size += self.time.calcSize(version);
+        size += self.transaction.calcSize(version);
+        size += 8;
+        size += self.time_index_last_entry.calcSize(version);
+        size += 1;
+        return size;
+    }
+};
+
+pub const SliceRange = struct {
+    /// The range start offset
+    /// Versions: 0+
+    start: i64 = 0,
+    /// The range end offset
+    /// Versions: 0+
+    end: i64 = 0,
+
+    pub fn serialize(self: *const SliceRange, buf: []u8, pos: *usize, _: i16) void {
+        ser.writeI64(buf, pos, self.start);
+        ser.writeI64(buf, pos, self.end);
+        ser.writeEmptyTaggedFields(buf, pos);
+    }
+
+    pub fn deserialize(_: Allocator, buf: []const u8, pos: *usize, _: i16) !SliceRange {
+        var result = SliceRange{};
+        result.start = ser.readI64(buf, pos);
+        result.end = ser.readI64(buf, pos);
+        try ser.skipTaggedFields(buf, pos);
+        return result;
+    }
+
+    pub fn calcSize(_: *const SliceRange, _: i16) usize {
+        var size: usize = 0;
+        size += 8;
+        size += 8;
+        size += 1;
+        return size;
+    }
+};
+
+pub const TimestampOffsetData = struct {
+    /// The range start offset
+    /// Versions: 0+
+    timestamp: i64 = 0,
+    /// The range end offset
+    /// Versions: 0+
+    offset: i64 = 0,
+
+    pub fn serialize(self: *const TimestampOffsetData, buf: []u8, pos: *usize, _: i16) void {
+        ser.writeI64(buf, pos, self.timestamp);
+        ser.writeI64(buf, pos, self.offset);
+        ser.writeEmptyTaggedFields(buf, pos);
+    }
+
+    pub fn deserialize(_: Allocator, buf: []const u8, pos: *usize, _: i16) !TimestampOffsetData {
+        var result = TimestampOffsetData{};
+        result.timestamp = ser.readI64(buf, pos);
+        result.offset = ser.readI64(buf, pos);
+        try ser.skipTaggedFields(buf, pos);
+        return result;
+    }
+
+    pub fn calcSize(_: *const TimestampOffsetData, _: i16) usize {
+        var size: usize = 0;
+        size += 8;
+        size += 8;
+        size += 1;
+        return size;
+    }
+};
+
 pub const AutomqGetPartitionSnapshotResponse = struct {
     pub const Topic = struct {
         pub const PartitionSnapshot = struct {
@@ -53,29 +313,53 @@ pub const AutomqGetPartitionSnapshotResponse = struct {
             operation: i16 = 0,
             /// The log metadata
             /// Versions: 0+
-            log_metadata: LogMetadata = null,
+            log_metadata: ?LogMetadata = null,
             /// The partition first unstable offset
             /// Versions: 0+
-            first_unstable_offset: LogOffsetMetadata = null,
+            first_unstable_offset: ?LogOffsetMetadata = null,
             /// The partition log end offset
             /// Versions: 0+
-            log_end_offset: LogOffsetMetadata = null,
+            log_end_offset: ?LogOffsetMetadata = null,
             /// 
             /// Versions: 0+
             stream_metadata: []const StreamMetadata = &.{},
             /// The last segment's last time index
             /// Versions: 1+
-            last_timestamp_offset: TimestampOffsetData = null,
+            last_timestamp_offset: ?TimestampOffsetData = null,
 
             pub fn serialize(self: *const PartitionSnapshot, buf: []u8, pos: *usize, version: i16) void {
                 ser.writeI32(buf, pos, self.partition_index);
                 ser.writeI32(buf, pos, self.leader_epoch);
                 ser.writeI16(buf, pos, self.operation);
+                if (self.log_metadata) |value| {
+                    ser.writeUnsignedVarint(buf, pos, 1);
+                    value.serialize(buf, pos, version);
+                } else {
+                    ser.writeUnsignedVarint(buf, pos, 0);
+                }
+                if (self.first_unstable_offset) |value| {
+                    ser.writeUnsignedVarint(buf, pos, 1);
+                    value.serialize(buf, pos, version);
+                } else {
+                    ser.writeUnsignedVarint(buf, pos, 0);
+                }
+                if (self.log_end_offset) |value| {
+                    ser.writeUnsignedVarint(buf, pos, 1);
+                    value.serialize(buf, pos, version);
+                } else {
+                    ser.writeUnsignedVarint(buf, pos, 0);
+                }
                 ser.writeCompactArrayLen(buf, pos, self.stream_metadata.len);
                 for (self.stream_metadata) |item| {
                     item.serialize(buf, pos, version);
                 }
                 if (version >= 1) {
+                    if (self.last_timestamp_offset) |value| {
+                        ser.writeUnsignedVarint(buf, pos, 1);
+                        value.serialize(buf, pos, version);
+                    } else {
+                        ser.writeUnsignedVarint(buf, pos, 0);
+                    }
                 }
                 ser.writeEmptyTaggedFields(buf, pos);
             }
@@ -85,6 +369,15 @@ pub const AutomqGetPartitionSnapshotResponse = struct {
                 result.partition_index = ser.readI32(buf, pos);
                 result.leader_epoch = ser.readI32(buf, pos);
                 result.operation = ser.readI16(buf, pos);
+                if ((try ser.readUnsignedVarint(buf, pos)) != 0) {
+                    result.log_metadata = try LogMetadata.deserialize(alloc, buf, pos, version);
+                }
+                if ((try ser.readUnsignedVarint(buf, pos)) != 0) {
+                    result.first_unstable_offset = try LogOffsetMetadata.deserialize(alloc, buf, pos, version);
+                }
+                if ((try ser.readUnsignedVarint(buf, pos)) != 0) {
+                    result.log_end_offset = try LogOffsetMetadata.deserialize(alloc, buf, pos, version);
+                }
                 const stream_metadata_len: usize = (try ser.readCompactArrayLen(buf, pos)) orelse 0;
                 if (stream_metadata_len > 0) {
                     const stream_metadata_items = try alloc.alloc(StreamMetadata, stream_metadata_len);
@@ -94,6 +387,9 @@ pub const AutomqGetPartitionSnapshotResponse = struct {
                     result.stream_metadata = stream_metadata_items;
                 }
                 if (version >= 1) {
+                    if ((try ser.readUnsignedVarint(buf, pos)) != 0) {
+                        result.last_timestamp_offset = try TimestampOffsetData.deserialize(alloc, buf, pos, version);
+                    }
                 }
                 try ser.skipTaggedFields(buf, pos);
                 return result;
@@ -104,11 +400,31 @@ pub const AutomqGetPartitionSnapshotResponse = struct {
                 size += 4;
                 size += 4;
                 size += 2;
+                if (self.log_metadata) |value| {
+                    size += 1 + value.calcSize(version);
+                } else {
+                    size += 1;
+                }
+                if (self.first_unstable_offset) |value| {
+                    size += 1 + value.calcSize(version);
+                } else {
+                    size += 1;
+                }
+                if (self.log_end_offset) |value| {
+                    size += 1 + value.calcSize(version);
+                } else {
+                    size += 1;
+                }
                 size += ser.unsignedVarintSize(self.stream_metadata.len + 1);
                 for (self.stream_metadata) |item| {
                     size += item.calcSize(version);
                 }
                 if (version >= 1) {
+                    if (self.last_timestamp_offset) |value| {
+                        size += 1 + value.calcSize(version);
+                    } else {
+                        size += 1;
+                    }
                 }
                 size += 1;
                 return size;

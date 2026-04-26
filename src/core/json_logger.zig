@@ -14,9 +14,9 @@ const Allocator = std.mem.Allocator;
 pub const JsonLogger = struct {
     allocator: Allocator,
     /// Output buffer for building JSON log lines. Reused across calls to avoid allocation.
-    output: std.ArrayList(u8),
+    output: std.array_list.Managed(u8),
     /// Optional writer for testing — when null, writes to stderr.
-    test_writer: ?*std.ArrayList(u8) = null,
+    test_writer: ?*std.array_list.Managed(u8) = null,
 
     pub const Level = enum {
         debug,
@@ -37,14 +37,14 @@ pub const JsonLogger = struct {
     pub fn init(alloc: Allocator) JsonLogger {
         return .{
             .allocator = alloc,
-            .output = std.ArrayList(u8).init(alloc),
+            .output = std.array_list.Managed(u8).init(alloc),
         };
     }
 
-    pub fn initWithWriter(alloc: Allocator, writer: *std.ArrayList(u8)) JsonLogger {
+    pub fn initWithWriter(alloc: Allocator, writer: *std.array_list.Managed(u8)) JsonLogger {
         return .{
             .allocator = alloc,
-            .output = std.ArrayList(u8).init(alloc),
+            .output = std.array_list.Managed(u8).init(alloc),
             .test_writer = writer,
         };
     }
@@ -62,7 +62,7 @@ pub const JsonLogger = struct {
     /// Fields are passed as pairs: &.{ "api_key", "18", "client_id", "test-client" }
     pub fn logWithFields(self: *JsonLogger, level: Level, msg: []const u8, correlation_id: ?i32, fields: []const []const u8) void {
         self.output.clearRetainingCapacity();
-        const writer = self.output.writer();
+        const writer = @import("list_compat").writer(&self.output);
 
         writer.writeAll("{\"ts\":\"") catch return;
         self.writeTimestamp(writer) catch return;
@@ -92,14 +92,14 @@ pub const JsonLogger = struct {
         if (self.test_writer) |tw| {
             tw.appendSlice(self.output.items) catch {};
         } else {
-            std.io.getStdErr().writeAll(self.output.items) catch {};
+            writeAllStderr(self.output.items) catch {};
         }
     }
 
     /// Write ISO 8601 timestamp in UTC.
     fn writeTimestamp(self: *JsonLogger, writer: anytype) !void {
         _ = self;
-        const ts_ms = std.time.milliTimestamp();
+        const ts_ms = @import("time_compat").milliTimestamp();
         // Convert to epoch seconds and milliseconds
         const ts_s = @divTrunc(ts_ms, 1000);
         const ms_frac: u64 = @intCast(@mod(ts_ms, 1000));
@@ -142,10 +142,19 @@ pub const JsonLogger = struct {
         }
     }
 
+    fn writeAllStderr(bytes: []const u8) !void {
+        var remaining = bytes;
+        while (remaining.len > 0) {
+            const written = try @import("posix_compat").write(2, remaining);
+            if (written == 0) return error.WriteFailed;
+            remaining = remaining[written..];
+        }
+    }
+
     /// Format a JSON log line into an allocator-owned buffer (for testing).
     pub fn formatLine(self: *JsonLogger, alloc: Allocator, level: Level, msg: []const u8, correlation_id: ?i32) ![]u8 {
-        var buf = std.ArrayList(u8).init(alloc);
-        const writer = buf.writer();
+        var buf = std.array_list.Managed(u8).init(alloc);
+        const writer = @import("list_compat").writer(&buf);
 
         try writer.writeAll("{\"ts\":\"");
         try self.writeTimestamp(writer);
@@ -169,7 +178,7 @@ pub const JsonLogger = struct {
 // ---------------------------------------------------------------
 
 test "JsonLogger produces valid JSON output" {
-    var output_buf = std.ArrayList(u8).init(testing.allocator);
+    var output_buf = std.array_list.Managed(u8).init(testing.allocator);
     defer output_buf.deinit();
 
     var logger = JsonLogger.initWithWriter(testing.allocator, &output_buf);
@@ -190,7 +199,7 @@ test "JsonLogger produces valid JSON output" {
 }
 
 test "JsonLogger handles null correlation_id" {
-    var output_buf = std.ArrayList(u8).init(testing.allocator);
+    var output_buf = std.array_list.Managed(u8).init(testing.allocator);
     defer output_buf.deinit();
 
     var logger = JsonLogger.initWithWriter(testing.allocator, &output_buf);
@@ -206,7 +215,7 @@ test "JsonLogger handles null correlation_id" {
 }
 
 test "JsonLogger escapes special characters" {
-    var output_buf = std.ArrayList(u8).init(testing.allocator);
+    var output_buf = std.array_list.Managed(u8).init(testing.allocator);
     defer output_buf.deinit();
 
     var logger = JsonLogger.initWithWriter(testing.allocator, &output_buf);
@@ -219,7 +228,7 @@ test "JsonLogger escapes special characters" {
 }
 
 test "JsonLogger logWithFields includes extra fields" {
-    var output_buf = std.ArrayList(u8).init(testing.allocator);
+    var output_buf = std.array_list.Managed(u8).init(testing.allocator);
     defer output_buf.deinit();
 
     var logger = JsonLogger.initWithWriter(testing.allocator, &output_buf);
@@ -234,7 +243,7 @@ test "JsonLogger logWithFields includes extra fields" {
 }
 
 test "JsonLogger all log levels" {
-    var output_buf = std.ArrayList(u8).init(testing.allocator);
+    var output_buf = std.array_list.Managed(u8).init(testing.allocator);
     defer output_buf.deinit();
 
     var logger = JsonLogger.initWithWriter(testing.allocator, &output_buf);
@@ -269,7 +278,7 @@ test "JsonLogger formatLine returns allocator-owned buffer" {
 }
 
 test "JsonLogger timestamp has ISO 8601 format" {
-    var output_buf = std.ArrayList(u8).init(testing.allocator);
+    var output_buf = std.array_list.Managed(u8).init(testing.allocator);
     defer output_buf.deinit();
 
     var logger = JsonLogger.initWithWriter(testing.allocator, &output_buf);

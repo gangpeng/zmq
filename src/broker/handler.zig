@@ -2,12 +2,18 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 const log = std.log.scoped(.broker);
 
-const ser = @import("../protocol/serialization.zig");
-const header_mod = @import("../protocol/header.zig");
-const api_versions_mod = @import("../protocol/messages/api_versions.zig");
+const protocol = @import("protocol");
+const ser = protocol.serialization;
+const header_mod = protocol.header;
+const api_support = protocol.api_support;
+const generated = protocol.generated;
+const ErrorCode = protocol.ErrorCode;
+const api_versions_mod = protocol.messages.api_versions;
+const delete_groups_mod = protocol.generated.delete_groups_response;
 const RequestHeader = header_mod.RequestHeader;
 const ResponseHeader = header_mod.ResponseHeader;
 const ApiVersionsResponse = api_versions_mod.ApiVersionsResponse;
+const DeleteGroupsResponse = delete_groups_mod.DeleteGroupsResponse;
 const PartitionStore = @import("partition_store.zig").PartitionStore;
 const GroupCoordinator = @import("group_coordinator.zig").GroupCoordinator;
 const TxnCoordinator = @import("txn_coordinator.zig").TransactionCoordinator;
@@ -15,8 +21,8 @@ const QuotaManager = @import("quota_manager.zig").QuotaManager;
 const MetricRegistry = @import("metrics.zig").MetricRegistry;
 const metrics_mod = @import("metrics.zig");
 const MetadataPersistence = @import("persistence.zig").MetadataPersistence;
-const RaftState = @import("../raft/state.zig").RaftState;
-const auth_mod = @import("../security/auth.zig");
+const RaftState = @import("raft").RaftState;
+const auth_mod = @import("security").auth;
 const Authorizer = auth_mod.Authorizer;
 const SaslPlainAuthenticator = auth_mod.SaslPlainAuthenticator;
 const OAuthBearerAuthenticator = auth_mod.OAuthBearerAuthenticator;
@@ -28,9 +34,10 @@ const FailoverController = @import("failover.zig").FailoverController;
 // Import auto balancer
 const AutoBalancer = @import("auto_balancer.zig").AutoBalancer;
 // Stream/StreamSetObject/StreamObject metadata + compaction
-const ObjectManager = @import("../storage/stream.zig").ObjectManager;
-const CompactionManager = @import("../storage/compaction.zig").CompactionManager;
-const JsonLogger = @import("../core/json_logger.zig").JsonLogger;
+const storage = @import("storage");
+const ObjectManager = storage.ObjectManager;
+const CompactionManager = storage.CompactionManager;
+const JsonLogger = @import("core").JsonLogger;
 
 /// Stateful Kafka broker.
 ///
@@ -49,6 +56,20 @@ pub const Broker = struct {
     persistence: MetadataPersistence,
     /// Map of topic name → topic metadata (partitions, replication factor, config).
     topics: std.StringHashMap(TopicInfo),
+    /// AutoMQ controller KV namespace. Values are owned by this map.
+    auto_mq_kvs: std.StringHashMap([]u8),
+    /// AutoMQ node registry keyed by node_id.
+    auto_mq_nodes: std.AutoHashMap(i32, AutoMqNodeMetadata),
+    /// Next node ID returned by AutoMQ GetNextNodeId.
+    auto_mq_next_node_id: i32 = 1,
+    /// Last license payload supplied through AutoMQ UpdateLicense.
+    auto_mq_license: ?[]u8 = null,
+    /// Last zone router metadata blob supplied by clients.
+    auto_mq_zone_router_metadata: ?[]u8 = null,
+    /// Latest zone router epoch accepted by the broker.
+    auto_mq_zone_router_epoch: i64 = 0,
+    /// AutoMQ link/group promotion state keyed by group_id.
+    auto_mq_group_promotions: std.StringHashMap(AutoMqGroupPromotion),
     /// Idempotent producer deduplication: tracks last sequence number per producer+partition.
     producer_sequences: std.AutoHashMap(ProducerKey, ProducerSequenceState),
     allocator: Allocator,
@@ -121,7 +142,7 @@ pub const Broker = struct {
     /// Delayed fetch purgatory — stores fetch requests waiting for new data.
     /// When a fetch returns empty and max_wait_ms > 0, the request is stored here
     /// and completed when new data arrives or the timeout expires.
-    delayed_fetches: std.ArrayList(DelayedFetch) = undefined,
+    delayed_fetches: std.array_list.Managed(DelayedFetch) = undefined,
     /// Structured JSON logger for production-critical log statements.
     json_logger: JsonLogger = undefined,
 
@@ -149,7 +170,7 @@ pub const Broker = struct {
         }
 
         pub fn isExpired(self: *const DelayedFetch) bool {
-            return std.time.milliTimestamp() >= self.deadline_ms;
+            return @import("time_compat").milliTimestamp() >= self.deadline_ms;
         }
     };
 
@@ -165,11 +186,30 @@ pub const Broker = struct {
         /// Generate a random topic UUID (v4 UUID).
         pub fn generateTopicId() [16]u8 {
             var uuid: [16]u8 = undefined;
-            std.crypto.random.bytes(&uuid);
+            @import("random_compat").bytes(&uuid);
             // Set version 4 (random) and variant bits
             uuid[6] = (uuid[6] & 0x0f) | 0x40; // version 4
             uuid[8] = (uuid[8] & 0x3f) | 0x80; // variant 1
             return uuid;
+        }
+    };
+
+    pub const AutoMqNodeMetadata = struct {
+        node_epoch: i64,
+        wal_config: []u8,
+        state: []const u8 = "ACTIVE",
+
+        pub fn deinit(self: *AutoMqNodeMetadata, alloc: Allocator) void {
+            alloc.free(self.wal_config);
+        }
+    };
+
+    pub const AutoMqGroupPromotion = struct {
+        link_id: []u8,
+        promoted: bool,
+
+        pub fn deinit(self: *AutoMqGroupPromotion, alloc: Allocator) void {
+            alloc.free(self.link_id);
         }
     };
 
@@ -211,6 +251,7 @@ pub const Broker = struct {
         s3_bucket: []const u8 = "automq",
         s3_access_key: []const u8 = "minioadmin",
         s3_secret_key: []const u8 = "minioadmin",
+        s3_tls_ca_file: ?[]const u8 = null,
         auto_create_topics: bool = true,
         default_num_partitions: i32 = 1,
         default_replication_factor: i16 = 1,
@@ -281,7 +322,7 @@ pub const Broker = struct {
         tls_client_auth: []const u8 = "none",
     };
 
-    pub const WalFlushMode = @import("../storage/wal.zig").WalFlushMode;
+    pub const WalFlushMode = storage.wal.WalFlushMode;
 
     pub fn init(alloc: Allocator, node_id: i32, port: u16) Broker {
         return initWithConfig(alloc, node_id, port, .{});
@@ -298,6 +339,7 @@ pub const Broker = struct {
                 .s3_bucket = config.s3_bucket,
                 .s3_access_key = config.s3_access_key,
                 .s3_secret_key = config.s3_secret_key,
+                .s3_tls_ca_file = config.s3_tls_ca_file,
                 // Pass through configurable cache parameters
                 .cache_max_blocks = config.cache_max_blocks,
                 .cache_max_size = config.cache_max_size,
@@ -313,6 +355,10 @@ pub const Broker = struct {
             .metrics = MetricRegistry.init(alloc),
             .persistence = MetadataPersistence.init(alloc, config.data_dir),
             .topics = std.StringHashMap(TopicInfo).init(alloc),
+            .auto_mq_kvs = std.StringHashMap([]u8).init(alloc),
+            .auto_mq_nodes = std.AutoHashMap(i32, AutoMqNodeMetadata).init(alloc),
+            .auto_mq_next_node_id = @max(node_id + 1, 1),
+            .auto_mq_group_promotions = std.StringHashMap(AutoMqGroupPromotion).init(alloc),
             .producer_sequences = std.AutoHashMap(ProducerKey, ProducerSequenceState).init(alloc),
             .allocator = alloc,
             .node_id = node_id,
@@ -338,13 +384,14 @@ pub const Broker = struct {
         };
 
         // Initialize delayed fetch purgatory
-        broker.delayed_fetches = std.ArrayList(DelayedFetch).init(alloc);
+        broker.delayed_fetches = std.array_list.Managed(DelayedFetch).init(alloc);
 
         // Initialize structured JSON logger
         broker.json_logger = JsonLogger.init(alloc);
 
-        // Wire ObjectManager into PartitionStore (and its S3WalBatcher)
-        broker.store.setObjectManager(&broker.object_manager);
+        // ObjectManager is wired after the Broker reaches its final address.
+        // Setting self-references here would leave dangling pointers when the
+        // Broker value is returned from this function.
 
         // Initialize CompactionManager if S3 storage is configured
         if (broker.store.s3_storage != null) {
@@ -424,6 +471,8 @@ pub const Broker = struct {
     /// captured during init would become dangling after the move. This method
     /// re-wires them to point at the final heap address.
     pub fn wireInternalPointers(self: *Broker) void {
+        self.store.setObjectManager(&self.object_manager);
+
         // Wire metrics registry into subsystems
         self.store.cache.metrics = &self.metrics;
         if (self.store.s3_client) |*c| {
@@ -433,6 +482,10 @@ pub const Broker = struct {
             bc.metrics = &self.metrics;
         }
         if (self.compaction_manager) |*cm| {
+            cm.object_manager = &self.object_manager;
+            if (self.store.s3_storage) |*storage_ref| {
+                cm.s3_storage = storage_ref;
+            }
             cm.metrics = &self.metrics;
         }
         // Wire metrics into group coordinator for consumer lag tracking
@@ -631,7 +684,7 @@ pub const Broker = struct {
         self.expireDelayedFetches();
 
         // Check for failed nodes and trigger failover
-        const failovers = self.failover_controller.tick(std.time.milliTimestamp());
+        const failovers = self.failover_controller.tick(@import("time_compat").milliTimestamp());
         if (failovers > 0) {
             log.info("Failover: {d} nodes failed over", .{failovers});
             // Sync WAL epoch with failover controller
@@ -656,7 +709,7 @@ pub const Broker = struct {
         // NOTE: AutoMQ runs this in LogCleaner on a dedicated thread every 60s.
         // ZMQ runs it inline on the event loop since it only updates offsets
         // (no I/O), and compaction handles the actual S3 deletes.
-        const now_ms = std.time.milliTimestamp();
+        const now_ms = @import("time_compat").milliTimestamp();
         if (now_ms - self.last_retention_check_ms >= 60_000) {
             self.last_retention_check_ms = now_ms;
             self.enforceRetentionPolicies();
@@ -717,18 +770,14 @@ pub const Broker = struct {
     }
 
     /// Flush pending S3 WAL writes and advance HW for all affected partitions.
-    /// Called from the Server's batch_flush_fn callback at the end of each epoll iteration.
-    /// In group_commit mode, many produce requests share a single S3 PUT.
-    /// Only flushes when the batcher's threshold is met (size >= 4MB or time >= 250ms),
-    /// allowing records to accumulate across multiple epoll iterations for maximum batching.
+    /// Called from the Server's batch_flush_fn callback. The current produce
+    /// path flushes group_commit writes before returning success, so this is
+    /// primarily a safety net for future response-delayed batching.
     /// Returns true if flush succeeded (or nothing to flush).
     pub fn flushPendingWal(self: *Broker) bool {
         const batcher = &(self.store.s3_wal_batcher orelse return true);
         if (batcher.flush_mode != .group_commit) return true;
         if (!batcher.hasPendingFlush()) return true;
-
-        // Only flush when batch threshold is met (size or time)
-        if (!batcher.shouldFlush()) return true;
 
         // One S3 PUT for all accumulated produces in this batch
         if (self.store.s3_storage) |*s3| {
@@ -788,6 +837,25 @@ pub const Broker = struct {
             self.allocator.free(entry.key_ptr.*);
         }
         self.topics.deinit();
+        var kv_it = self.auto_mq_kvs.iterator();
+        while (kv_it.next()) |entry| {
+            self.allocator.free(entry.key_ptr.*);
+            self.allocator.free(entry.value_ptr.*);
+        }
+        self.auto_mq_kvs.deinit();
+        var node_it = self.auto_mq_nodes.iterator();
+        while (node_it.next()) |entry| {
+            entry.value_ptr.deinit(self.allocator);
+        }
+        self.auto_mq_nodes.deinit();
+        if (self.auto_mq_license) |license| self.allocator.free(license);
+        if (self.auto_mq_zone_router_metadata) |metadata| self.allocator.free(metadata);
+        var group_promotion_it = self.auto_mq_group_promotions.iterator();
+        while (group_promotion_it.next()) |entry| {
+            self.allocator.free(entry.key_ptr.*);
+            entry.value_ptr.deinit(self.allocator);
+        }
+        self.auto_mq_group_promotions.deinit();
         self.producer_sequences.deinit();
         self.store.deinit();
         self.groups.deinit();
@@ -849,6 +917,8 @@ pub const Broker = struct {
     /// Auto-create a topic if auto.create.topics.enable is true.
     /// Returns true if topic existed or was created.
     fn ensureTopic(self: *Broker, topic_name: []const u8) bool {
+        self.wireInternalPointers();
+
         if (self.topics.contains(topic_name)) return true;
         if (!self.auto_create_topics) return false;
 
@@ -985,7 +1055,7 @@ pub const Broker = struct {
         const target_partition: i32 = @intCast(hasher.final() % 50);
 
         // Build a RecordBatch
-        const rec_batch = @import("../protocol/record_batch.zig");
+        const rec_batch = protocol.record_batch;
         const records = [_]rec_batch.Record{
             .{
                 .offset_delta = 0,
@@ -1001,8 +1071,8 @@ pub const Broker = struct {
             -1, // producer_id (non-transactional)
             -1, // producer_epoch
             -1, // base_sequence
-            std.time.milliTimestamp(),
-            std.time.milliTimestamp(),
+            @import("time_compat").milliTimestamp(),
+            @import("time_compat").milliTimestamp(),
             0, // attributes (no compression)
         ) catch return;
         defer self.allocator.free(batch);
@@ -1016,6 +1086,7 @@ pub const Broker = struct {
     /// Process a raw Kafka protocol request frame and return the response.
     /// No mutex needed — single-threaded event loop.
     pub fn handleRequest(self: *Broker, request_bytes: []const u8) ?[]u8 {
+        self.wireInternalPointers();
 
         if (request_bytes.len < 8) {
             self.json_logger.log(.warn, "Request too short", null);
@@ -1080,7 +1151,7 @@ pub const Broker = struct {
         }
 
         // Record per-API latency
-        const t_start = std.time.nanoTimestamp();
+        const t_start = @import("time_compat").nanoTimestamp();
 
         const result = switch (api_key) {
             0 => self.handleProduce(request_bytes, pos, &req_header, api_version, resp_header_version),
@@ -1122,11 +1193,11 @@ pub const Broker = struct {
             35 => self.handleDescribeLogDirs(&req_header, resp_header_version),
             36 => self.handleSaslAuthenticate(request_bytes, pos, &req_header, api_version, resp_header_version),
             37 => self.handleCreatePartitions(request_bytes, pos, &req_header, api_version, resp_header_version),
-            // IncrementalAlterConfigs (key 42) — parse and apply config entries
-            42 => self.handleIncrementalAlterConfigs(request_bytes, pos, &req_header, api_version, resp_header_version),
+            42 => self.handleDeleteGroups(request_bytes, pos, &req_header, api_version, resp_header_version),
             43 => self.handleElectLeaders(&req_header, resp_header_version),
-            44 => self.handleAlterPartitionReassignments(request_bytes, pos, &req_header, resp_header_version),
-            45 => self.handleListPartitionReassignments(request_bytes, pos, &req_header, resp_header_version),
+            44 => self.handleIncrementalAlterConfigs(request_bytes, pos, &req_header, api_version, resp_header_version),
+            45 => self.handleAlterPartitionReassignments(request_bytes, pos, &req_header, resp_header_version),
+            46 => self.handleListPartitionReassignments(request_bytes, pos, &req_header, resp_header_version),
             // OffsetDelete (key 47) — delete committed offsets
             47 => self.handleOffsetDelete(request_bytes, pos, &req_header, api_version, resp_header_version),
             60 => self.handleDescribeCluster(&req_header, resp_header_version),
@@ -1135,10 +1206,32 @@ pub const Broker = struct {
             53 => self.handleBeginQuorumEpoch(request_bytes, pos, &req_header, resp_header_version),
             54 => self.handleEndQuorumEpoch(request_bytes, pos, &req_header, resp_header_version),
             55 => self.handleDescribeQuorum(&req_header, resp_header_version),
+            501 => self.handleCreateStreams(request_bytes, pos, &req_header, api_version, resp_header_version),
+            502 => self.handleOpenStreams(request_bytes, pos, &req_header, api_version, resp_header_version),
+            503 => self.handleCloseStreams(request_bytes, pos, &req_header, api_version, resp_header_version),
+            504 => self.handleDeleteStreams(request_bytes, pos, &req_header, api_version, resp_header_version),
+            505 => self.handlePrepareS3Object(request_bytes, pos, &req_header, api_version, resp_header_version),
+            506 => self.handleCommitStreamSetObject(request_bytes, pos, &req_header, api_version, resp_header_version),
+            507 => self.handleCommitStreamObject(request_bytes, pos, &req_header, api_version, resp_header_version),
+            508 => self.handleGetOpeningStreams(request_bytes, pos, &req_header, api_version, resp_header_version),
+            509 => self.handleGetKVs(request_bytes, pos, &req_header, api_version, resp_header_version),
+            510 => self.handlePutKVs(request_bytes, pos, &req_header, api_version, resp_header_version),
+            511 => self.handleDeleteKVs(request_bytes, pos, &req_header, api_version, resp_header_version),
+            512 => self.handleTrimStreams(request_bytes, pos, &req_header, api_version, resp_header_version),
+            513 => self.handleAutomqRegisterNode(request_bytes, pos, &req_header, api_version, resp_header_version),
+            514 => self.handleAutomqGetNodes(request_bytes, pos, &req_header, api_version, resp_header_version),
+            515 => self.handleAutomqZoneRouter(request_bytes, pos, &req_header, api_version, resp_header_version),
+            516 => self.handleAutomqGetPartitionSnapshot(request_bytes, pos, &req_header, api_version, resp_header_version),
+            517 => self.handleUpdateLicense(request_bytes, pos, &req_header, api_version, resp_header_version),
+            518 => self.handleDescribeLicense(request_bytes, pos, &req_header, api_version, resp_header_version),
+            519 => self.handleExportClusterManifest(request_bytes, pos, &req_header, api_version, resp_header_version),
+            600 => self.handleGetNextNodeId(request_bytes, pos, &req_header, api_version, resp_header_version),
+            601 => self.handleDescribeStreams(request_bytes, pos, &req_header, api_version, resp_header_version),
+            602 => self.handleAutomqUpdateGroup(request_bytes, pos, &req_header, api_version, resp_header_version),
             else => self.handleUnsupported(&req_header, api_key, resp_header_version),
         };
 
-        const t_done = std.time.nanoTimestamp();
+        const t_done = @import("time_compat").nanoTimestamp();
 
         // Record per-API latency in histogram
         const latency_ns = t_done - t_start;
@@ -1187,6 +1280,19 @@ pub const Broker = struct {
             }
         }
 
+        // AutomqUpdateGroup starts with group_id before error_code.
+        if (api_key == 602) {
+            var p = offset;
+            const raw_len = ser.readUnsignedVarint(resp, &p) catch return 0;
+            if (raw_len > 0) {
+                const len = raw_len - 1;
+                if (p + len > resp.len) return 0;
+                p += len;
+            }
+            if (p + 2 > resp.len) return 0;
+            return @bitCast(std.mem.readInt(u16, resp[p..][0..2], .big));
+        }
+
         // APIs with throttle_time_ms before error_code
         const has_throttle = switch (api_key) {
             // Most APIs v1+ have throttle_time_ms; for simplicity track the common ones
@@ -1217,132 +1323,26 @@ pub const Broker = struct {
 
     /// Check if an API key + version combination is supported.
     fn isVersionSupported(api_key: i16, api_version: i16) bool {
-        const range = getVersionRange(api_key);
-        return api_version >= range.min and api_version <= range.max;
+        return api_support.isBrokerVersionSupported(api_key, api_version);
     }
 
-    fn getVersionRange(api_key: i16) struct { min: i16, max: i16 } {
-        return switch (api_key) {
-            0 => .{ .min = 0, .max = 11 }, // Produce
-            1 => .{ .min = 0, .max = 17 }, // Fetch
-            2 => .{ .min = 0, .max = 8 }, // ListOffsets
-            3 => .{ .min = 0, .max = 12 }, // Metadata
-            // Inter-broker RPCs
-            4 => .{ .min = 0, .max = 7 }, // LeaderAndIsr
-            5 => .{ .min = 0, .max = 4 }, // StopReplica
-            6 => .{ .min = 0, .max = 8 }, // UpdateMetadata
-            7 => .{ .min = 0, .max = 3 }, // ControlledShutdown
-            8 => .{ .min = 0, .max = 9 }, // OffsetCommit
-            9 => .{ .min = 0, .max = 9 }, // OffsetFetch
-            10 => .{ .min = 0, .max = 6 }, // FindCoordinator
-            11 => .{ .min = 0, .max = 9 }, // JoinGroup
-            12 => .{ .min = 0, .max = 4 }, // Heartbeat
-            13 => .{ .min = 0, .max = 5 }, // LeaveGroup
-            14 => .{ .min = 0, .max = 5 }, // SyncGroup
-            15 => .{ .min = 0, .max = 5 }, // DescribeGroups
-            16 => .{ .min = 0, .max = 4 }, // ListGroups
-            17 => .{ .min = 0, .max = 1 }, // SaslHandshake
-            18 => .{ .min = 0, .max = 4 }, // ApiVersions
-            19 => .{ .min = 0, .max = 7 }, // CreateTopics
-            20 => .{ .min = 0, .max = 6 }, // DeleteTopics
-            21 => .{ .min = 0, .max = 2 }, // DeleteRecords
-            22 => .{ .min = 0, .max = 4 }, // InitProducerId
-            23 => .{ .min = 0, .max = 4 }, // OffsetForLeaderEpoch
-            24 => .{ .min = 0, .max = 4 }, // AddPartitionsToTxn
-            // AddOffsetsToTxn
-            25 => .{ .min = 0, .max = 3 }, // AddOffsetsToTxn
-            26 => .{ .min = 0, .max = 3 }, // EndTxn
-            27 => .{ .min = 0, .max = 1 }, // WriteTxnMarkers
-            28 => .{ .min = 0, .max = 3 }, // TxnOffsetCommit
-            29 => .{ .min = 0, .max = 3 }, // DescribeAcls
-            30 => .{ .min = 0, .max = 3 }, // CreateAcls
-            31 => .{ .min = 0, .max = 3 }, // DeleteAcls
-            32 => .{ .min = 0, .max = 4 }, // DescribeConfigs
-            33 => .{ .min = 0, .max = 2 }, // AlterConfigs
-            35 => .{ .min = 0, .max = 4 }, // DescribeLogDirs
-            36 => .{ .min = 0, .max = 2 }, // SaslAuthenticate
-            37 => .{ .min = 0, .max = 3 }, // CreatePartitions
-            // IncrementalAlterConfigs
-            42 => .{ .min = 0, .max = 1 }, // IncrementalAlterConfigs
-            43 => .{ .min = 0, .max = 2 }, // ElectLeaders
-            44 => .{ .min = 0, .max = 0 }, // AlterPartitionReassignments
-            45 => .{ .min = 0, .max = 0 }, // ListPartitionReassignments
-            // OffsetDelete
-            47 => .{ .min = 0, .max = 0 }, // OffsetDelete
-            52 => .{ .min = 0, .max = 1 }, // Vote
-            53 => .{ .min = 0, .max = 1 }, // BeginQuorumEpoch
-            54 => .{ .min = 0, .max = 1 }, // EndQuorumEpoch
-            55 => .{ .min = 0, .max = 1 }, // DescribeQuorum
-            60 => .{ .min = 0, .max = 1 }, // DescribeCluster
-            61 => .{ .min = 0, .max = 0 }, // DescribeProducers
-            else => .{ .min = -1, .max = -1 }, // Unknown API
-        };
+    fn getVersionRange(api_key: i16) api_support.VersionRange {
+        return api_support.brokerVersionRange(api_key);
     }
 
     /// Get a human-readable name for an API key (used for metrics).
     fn apiKeyName(api_key: i16) []const u8 {
-        return switch (api_key) {
-            0 => "kafka_server_produce_requests_total",
-            1 => "kafka_server_fetch_requests_total",
-            2 => "list_offsets",
-            3 => "metadata",
-            // Inter-broker RPC metric names
-            4 => "leader_and_isr",
-            5 => "stop_replica",
-            6 => "update_metadata",
-            7 => "controlled_shutdown",
-            8 => "offset_commit",
-            9 => "offset_fetch",
-            10 => "find_coordinator",
-            11 => "join_group",
-            12 => "heartbeat",
-            13 => "leave_group",
-            14 => "sync_group",
-            15 => "describe_groups",
-            16 => "list_groups",
-            17 => "sasl_handshake",
-            18 => "api_versions",
-            19 => "create_topics",
-            20 => "delete_topics",
-            21 => "delete_records",
-            22 => "init_producer_id",
-            23 => "offset_for_leader_epoch",
-            24 => "add_partitions_to_txn",
-            // AddOffsetsToTxn metric name
-            25 => "add_offsets_to_txn",
-            26 => "end_txn",
-            27 => "write_txn_markers",
-            28 => "txn_offset_commit",
-            29 => "describe_acls",
-            30 => "create_acls",
-            31 => "delete_acls",
-            32 => "describe_configs",
-            33 => "alter_configs",
-            35 => "describe_log_dirs",
-            36 => "sasl_authenticate",
-            37 => "create_partitions",
-            // IncrementalAlterConfigs metric name
-            42 => "incremental_alter_configs",
-            43 => "elect_leaders",
-            44 => "alter_partition_reassignments",
-            45 => "list_partition_reassignments",
-            52 => "vote",
-            53 => "begin_quorum_epoch",
-            54 => "end_quorum_epoch",
-            55 => "describe_quorum",
-            60 => "describe_cluster",
-            61 => "describe_producers",
-            else => "",
-        };
+        return api_support.brokerMetricName(api_key);
     }
 
     /// Map API key to the corresponding ACL resource type (fix #7).
     fn resourceTypeForApiKey(api_key: i16) Authorizer.ResourceType {
         return switch (api_key) {
             0, 1, 2 => .topic, // Produce, Fetch, ListOffsets
-            8, 9, 10, 11, 12, 13, 14, 15, 16 => .group, // group-related
+            8, 9, 10, 11, 12, 13, 14, 15, 16, 42, 47 => .group, // group-related
             22, 24, 26, 27, 28 => .transactional_id, // txn-related
-            3, 18, 19, 20, 32, 33, 35, 37 => .cluster, // metadata/admin
+            3, 18, 19, 20, 32, 33, 35, 37, 43, 44, 45, 46 => .cluster, // metadata/admin
+            501...519, 600...602 => .cluster, // AutoMQ stream/object/controller extensions
             else => .unknown,
         };
     }
@@ -1352,16 +1352,19 @@ pub const Broker = struct {
         return switch (api_key) {
             0 => .write, // Produce
             1 => .read, // Fetch
-            2, 9, 15, 16, 23, 29, 32, 35, 55, 60, 61 => .describe, // ListOffsets, OffsetFetch, Describe*
+            2, 9, 15, 16, 23, 29, 32, 35, 46, 55, 60, 61 => .describe, // ListOffsets, OffsetFetch, Describe*
             3, 18 => .describe, // Metadata, ApiVersions
             8 => .read, // OffsetCommit
             10, 11, 12, 13, 14 => .read, // Group ops
             19, 37 => .create, // CreateTopics, CreatePartitions
-            20 => .delete, // DeleteTopics
+            20, 42, 47 => .delete, // DeleteTopics, DeleteGroups, OffsetDelete
             22, 24, 26, 27, 28 => .write, // Txn ops
             30 => .alter, // CreateAcls
             31 => .alter, // DeleteAcls
-            33 => .alter, // AlterConfigs
+            33, 43, 44, 45 => .alter, // Alter/admin APIs
+            501, 502, 503, 508, 514, 516, 518, 601 => .describe, // AutoMQ reads/lifecycle probes
+            504, 511 => .delete, // AutoMQ deletes
+            505, 506, 507, 510, 512, 513, 515, 517, 519, 600, 602 => .alter, // AutoMQ mutations
             else => .any,
         };
     }
@@ -1415,62 +1418,7 @@ pub const Broker = struct {
     // ApiVersions (key 18)
     // ---------------------------------------------------------------
     fn handleApiVersions(self: *Broker, req_header: *const RequestHeader, api_version: i16, resp_header_version: i16) ?[]u8 {
-        const supported = [_]struct { key: i16, min: i16, max: i16 }{
-            .{ .key = 0, .min = 0, .max = 11 }, // Produce
-            .{ .key = 1, .min = 0, .max = 17 }, // Fetch
-            .{ .key = 2, .min = 0, .max = 8 }, // ListOffsets
-            .{ .key = 3, .min = 0, .max = 12 }, // Metadata
-            // Inter-broker RPCs
-            .{ .key = 4, .min = 0, .max = 7 }, // LeaderAndIsr
-            .{ .key = 5, .min = 0, .max = 4 }, // StopReplica
-            .{ .key = 6, .min = 0, .max = 8 }, // UpdateMetadata
-            .{ .key = 7, .min = 0, .max = 3 }, // ControlledShutdown
-            .{ .key = 8, .min = 0, .max = 9 }, // OffsetCommit
-            .{ .key = 9, .min = 0, .max = 9 }, // OffsetFetch
-            .{ .key = 10, .min = 0, .max = 6 }, // FindCoordinator
-            .{ .key = 11, .min = 0, .max = 9 }, // JoinGroup
-            .{ .key = 12, .min = 0, .max = 4 }, // Heartbeat
-            .{ .key = 13, .min = 0, .max = 5 }, // LeaveGroup
-            .{ .key = 14, .min = 0, .max = 5 }, // SyncGroup
-            .{ .key = 15, .min = 0, .max = 5 }, // DescribeGroups
-            .{ .key = 16, .min = 0, .max = 4 }, // ListGroups
-            .{ .key = 17, .min = 0, .max = 1 }, // SaslHandshake
-            .{ .key = 18, .min = 0, .max = 4 }, // ApiVersions
-            .{ .key = 19, .min = 0, .max = 7 }, // CreateTopics
-            .{ .key = 20, .min = 0, .max = 6 }, // DeleteTopics
-            .{ .key = 21, .min = 0, .max = 2 }, // DeleteRecords
-            .{ .key = 22, .min = 0, .max = 4 }, // InitProducerId
-            .{ .key = 23, .min = 0, .max = 4 }, // OffsetForLeaderEpoch
-            .{ .key = 24, .min = 0, .max = 4 }, // AddPartitionsToTxn
-            // AddOffsetsToTxn
-            .{ .key = 25, .min = 0, .max = 3 }, // AddOffsetsToTxn
-            .{ .key = 26, .min = 0, .max = 3 }, // EndTxn
-            .{ .key = 27, .min = 0, .max = 1 }, // WriteTxnMarkers
-            .{ .key = 28, .min = 0, .max = 3 }, // TxnOffsetCommit
-            .{ .key = 29, .min = 0, .max = 3 }, // DescribeAcls
-            .{ .key = 30, .min = 0, .max = 3 }, // CreateAcls
-            .{ .key = 31, .min = 0, .max = 3 }, // DeleteAcls
-            .{ .key = 32, .min = 0, .max = 4 }, // DescribeConfigs
-            .{ .key = 33, .min = 0, .max = 2 }, // AlterConfigs
-            .{ .key = 35, .min = 0, .max = 4 }, // DescribeLogDirs
-            .{ .key = 36, .min = 0, .max = 2 }, // SaslAuthenticate
-            .{ .key = 37, .min = 0, .max = 3 }, // CreatePartitions
-            // IncrementalAlterConfigs
-            .{ .key = 42, .min = 0, .max = 1 }, // IncrementalAlterConfigs
-            .{ .key = 43, .min = 0, .max = 2 }, // ElectLeaders
-            .{ .key = 44, .min = 0, .max = 0 }, // AlterPartitionReassignments
-            .{ .key = 45, .min = 0, .max = 0 }, // ListPartitionReassignments
-            // OffsetDelete
-            .{ .key = 47, .min = 0, .max = 0 }, // OffsetDelete
-            .{ .key = 60, .min = 0, .max = 1 }, // DescribeCluster
-            .{ .key = 61, .min = 0, .max = 0 }, // DescribeProducers
-            // KRaft Raft consensus APIs
-            .{ .key = 52, .min = 0, .max = 1 }, // Vote
-            .{ .key = 53, .min = 0, .max = 1 }, // BeginQuorumEpoch
-            .{ .key = 54, .min = 0, .max = 1 }, // EndQuorumEpoch
-            .{ .key = 55, .min = 0, .max = 1 }, // DescribeQuorum
-        };
-
+        const supported = api_support.broker_supported_apis;
         var api_keys_list: [supported.len]ApiVersionsResponse.ApiVersion = undefined;
         for (supported, 0..) |s, i| {
             api_keys_list[i] = .{ .api_key = s.key, .min_version = s.min, .max_version = s.max };
@@ -1499,6 +1447,88 @@ pub const Broker = struct {
         return buf;
     }
 
+    fn serializeGeneratedResponse(self: *Broker, req_header: *const RequestHeader, resp_header_version: i16, resp_body: anytype, body_version: i16) ?[]u8 {
+        const resp_header = ResponseHeader{ .correlation_id = req_header.correlation_id };
+        const header_size = resp_header.calcSize(resp_header_version);
+        const body_size = resp_body.calcSize(body_version);
+        const total_size = header_size + body_size;
+
+        const buf = self.allocator.alloc(u8, total_size) catch return null;
+        var wpos: usize = 0;
+        resp_header.serialize(buf, &wpos, resp_header_version);
+        resp_body.serialize(buf, &wpos, body_version);
+        return buf[0..wpos];
+    }
+
+    fn parseGeneratedRequest(comptime RequestType: type, allocator: Allocator, request_bytes: []const u8, body_start: usize, api_version: i16) !RequestType {
+        if (body_start > request_bytes.len) return error.BufferUnderflow;
+        var pos = body_start;
+        return RequestType.deserialize(allocator, request_bytes, &pos, api_version);
+    }
+
+    fn errorCode(code: ErrorCode) i16 {
+        return code.toInt();
+    }
+
+    fn invalidStreamId(stream_id: i64) bool {
+        return stream_id < 0;
+    }
+
+    fn i64ToU64(value: i64) ?u64 {
+        if (value < 0) return null;
+        return @intCast(value);
+    }
+
+    fn u64ToI64(value: u64) i64 {
+        if (value > @as(u64, @intCast(std.math.maxInt(i64)))) return std.math.maxInt(i64);
+        return @intCast(value);
+    }
+
+    fn streamErrorCode(err: anyerror) i16 {
+        return switch (err) {
+            error.StreamNotFound => errorCode(.resource_not_found),
+            error.DuplicateStream => errorCode(.duplicate_resource),
+            error.StaleStreamEpoch => errorCode(.fenced_leader_epoch),
+            error.OffsetOutOfRange => errorCode(.position_out_of_range),
+            else => errorCode(.kafka_storage_error),
+        };
+    }
+
+    fn makeStreamObjectKey(self: *Broker, object_id: u64, stream_id: u64, start_offset: u64, end_offset: u64) ![]u8 {
+        return try std.fmt.allocPrint(self.allocator, "so/{d}/{d}-{d}-{d}", .{ stream_id, start_offset, end_offset, object_id });
+    }
+
+    fn makeStreamSetObjectKey(self: *Broker, object_id: u64, node_id: i32) ![]u8 {
+        return try std.fmt.allocPrint(self.allocator, "sso/{d}/{d}", .{ node_id, object_id });
+    }
+
+    fn hasOpeningStreamsForNode(self: *Broker, node_id: i32) bool {
+        var it = self.object_manager.streams.iterator();
+        while (it.next()) |entry| {
+            const stream = entry.value_ptr;
+            if (stream.node_id == node_id and stream.state == .opened) return true;
+        }
+        return false;
+    }
+
+    fn findTopicPartitionForStream(self: *Broker, stream_id: u64) ?struct { topic_id: [16]u8, topic_name: []const u8, partition_index: i32 } {
+        var topic_it = self.topics.iterator();
+        while (topic_it.next()) |entry| {
+            const info = entry.value_ptr;
+            var pi: i32 = 0;
+            while (pi < info.num_partitions) : (pi += 1) {
+                if (PartitionStore.hashPartitionKey(info.name, pi) == stream_id) {
+                    return .{
+                        .topic_id = info.topic_id,
+                        .topic_name = info.name,
+                        .partition_index = pi,
+                    };
+                }
+            }
+        }
+        return null;
+    }
+
     // ---------------------------------------------------------------
     // Metadata (key 3) — Single-node mode
     // In single-node mode, this broker is the ONLY broker in the cluster.
@@ -1508,14 +1538,14 @@ pub const Broker = struct {
     // the metadata response will be populated from the Raft cluster state.
     // ---------------------------------------------------------------
     fn handleMetadata(self: *Broker, request_bytes: []const u8, body_start: usize, req_header: *const RequestHeader, api_version: i16, resp_header_version: i16) ?[]u8 {
-        const metadata_mod = @import("../protocol/messages/metadata.zig");
+        const metadata_mod = protocol.messages.metadata;
         const MetadataResponse = metadata_mod.MetadataResponse;
 
         // Parse requested topics
         var pos = body_start;
         const flexible = api_version >= 9;
         var requested_all = true;
-        var requested_topics = std.ArrayList([]const u8).init(self.allocator);
+        var requested_topics = std.array_list.Managed([]const u8).init(self.allocator);
         defer requested_topics.deinit();
 
         const num_req_topics = if (flexible)
@@ -1542,7 +1572,7 @@ pub const Broker = struct {
         };
 
         // Build topic metadata from our known topics
-        var topic_list = std.ArrayList(MetadataResponse.MetadataResponseTopic).init(self.allocator);
+        var topic_list = std.array_list.Managed(MetadataResponse.MetadataResponseTopic).init(self.allocator);
         defer topic_list.deinit();
 
         // Auto-create requested topics that don't exist
@@ -1567,7 +1597,7 @@ pub const Broker = struct {
                 }
                 if (!found) continue;
             }
-            var parts = std.ArrayList(MetadataResponse.MetadataResponsePartition).init(self.allocator);
+            var parts = std.array_list.Managed(MetadataResponse.MetadataResponsePartition).init(self.allocator);
             defer parts.deinit();
 
             for (0..@intCast(info.num_partitions)) |pi| {
@@ -1718,8 +1748,8 @@ pub const Broker = struct {
                 var crc_valid = true;
                 if (records) |rec| {
                     if (rec.len >= 53) { // Minimum V2 record batch header
-                        const rec_batch = @import("../protocol/record_batch.zig");
-                        const crc32c = @import("../core/crc32c.zig");
+                        const rec_batch = protocol.record_batch;
+                        const crc32c = @import("core").crc32c;
                         const batch_header = rec_batch.RecordBatchHeader.parse(rec) catch null;
                         if (batch_header) |hdr| {
                             // CRC-32C validation: covers bytes from attributes (offset 21) to end
@@ -1769,6 +1799,7 @@ pub const Broker = struct {
 
                 // Actually produce (skip if duplicate or CRC invalid)
                 var was_wal_fenced = false;
+                var was_storage_error = false;
                 const produce_result = if (is_duplicate or !crc_valid)
                     null
                 else if (records) |rec|
@@ -1779,6 +1810,9 @@ pub const Broker = struct {
                         } else if (err == error.WalFenced) {
                             log.warn("WAL fenced: rejecting produce to {s}-{d} (broker is no longer leader)", .{ topic_name, partition_idx });
                             was_wal_fenced = true;
+                        } else if (err == error.S3WalFlushFailed or err == error.S3StorageUnavailable) {
+                            log.warn("S3 WAL storage error for {s}-{d}: {}", .{ topic_name, partition_idx, err });
+                            was_storage_error = true;
                         }
                         break :blk null;
                     }
@@ -1794,6 +1828,8 @@ pub const Broker = struct {
                     0 // success
                 else if (was_wal_fenced)
                     6 // NOT_LEADER_OR_FOLLOWER — tells client to find the new leader
+                else if (was_storage_error)
+                    56 // KAFKA_STORAGE_ERROR
                 else if (records) |rec| blk: {
                     if (rec.len > 1048576) break :blk 10; // MESSAGE_TOO_LARGE
                     break :blk 1; // OFFSET_OUT_OF_RANGE (generic failure)
@@ -3175,7 +3211,871 @@ pub const Broker = struct {
     }
 
     // ---------------------------------------------------------------
-    // IncrementalAlterConfigs (key 42)
+    // DeleteGroups (key 42)
+    // ---------------------------------------------------------------
+    fn handleDeleteGroups(self: *Broker, request_bytes: []const u8, body_start: usize, req_header: *const RequestHeader, api_version: i16, resp_header_version: i16) ?[]u8 {
+        var pos = body_start;
+        const flexible = api_version >= 2;
+        const num_groups = if (flexible)
+            (ser.readCompactArrayLen(request_bytes, &pos) catch return null) orelse 0
+        else
+            (ser.readArrayLen(request_bytes, &pos) catch return null) orelse 0;
+
+        var results = std.array_list.Managed(DeleteGroupsResponse.DeletableGroupResult).init(self.allocator);
+        defer results.deinit();
+
+        for (0..num_groups) |_| {
+            const group_id = if (flexible)
+                (ser.readCompactString(request_bytes, &pos) catch return null) orelse ""
+            else
+                (ser.readString(request_bytes, &pos) catch return null) orelse "";
+
+            const error_code = self.groups.deleteGroup(group_id);
+            results.append(.{ .group_id = group_id, .error_code = error_code }) catch return null;
+        }
+
+        if (flexible) ser.skipTaggedFields(request_bytes, &pos) catch return null;
+
+        const resp_body = DeleteGroupsResponse{
+            .throttle_time_ms = 0,
+            .results = results.items,
+        };
+        const body_version: i16 = @min(api_version, 2);
+        const resp_header = ResponseHeader{ .correlation_id = req_header.correlation_id };
+        const total_size = resp_header.calcSize(resp_header_version) + resp_body.calcSize(body_version);
+        const buf = self.allocator.alloc(u8, total_size) catch return null;
+        var wpos: usize = 0;
+        resp_header.serialize(buf, &wpos, resp_header_version);
+        resp_body.serialize(buf, &wpos, body_version);
+        return buf[0..wpos];
+    }
+
+    // ---------------------------------------------------------------
+    // AutoMQ extension APIs (keys 501-519, 600-602)
+    // ---------------------------------------------------------------
+    fn handleCreateStreams(self: *Broker, request_bytes: []const u8, body_start: usize, req_header: *const RequestHeader, api_version: i16, resp_header_version: i16) ?[]u8 {
+        const Req = generated.create_streams_request.CreateStreamsRequest;
+        const Resp = generated.create_streams_response.CreateStreamsResponse;
+        const ItemResp = Resp.CreateStreamResponse;
+
+        var arena = std.heap.ArenaAllocator.init(self.allocator);
+        defer arena.deinit();
+        const arena_alloc = arena.allocator();
+
+        const req = parseGeneratedRequest(Req, arena_alloc, request_bytes, body_start, api_version) catch {
+            const resp = Resp{ .error_code = errorCode(.invalid_request), .throttle_time_ms = 0 };
+            return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+        };
+
+        const responses = arena_alloc.alloc(ItemResp, req.create_stream_requests.len) catch return null;
+        for (req.create_stream_requests, 0..) |item, i| {
+            const owner_node = if (item.node_id != 0) item.node_id else if (req.node_id != 0) req.node_id else self.node_id;
+            const stream = self.object_manager.createStream(owner_node) catch |err| {
+                responses[i] = .{ .error_code = streamErrorCode(err), .stream_id = -1 };
+                continue;
+            };
+            responses[i] = .{ .error_code = 0, .stream_id = u64ToI64(stream.stream_id) };
+        }
+
+        const resp = Resp{ .error_code = 0, .throttle_time_ms = 0, .create_stream_responses = responses };
+        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+    }
+
+    fn handleOpenStreams(self: *Broker, request_bytes: []const u8, body_start: usize, req_header: *const RequestHeader, api_version: i16, resp_header_version: i16) ?[]u8 {
+        const Req = generated.open_streams_request.OpenStreamsRequest;
+        const Resp = generated.open_streams_response.OpenStreamsResponse;
+        const ItemResp = Resp.OpenStreamResponse;
+
+        var arena = std.heap.ArenaAllocator.init(self.allocator);
+        defer arena.deinit();
+        const arena_alloc = arena.allocator();
+
+        const req = parseGeneratedRequest(Req, arena_alloc, request_bytes, body_start, api_version) catch {
+            const resp = Resp{ .error_code = errorCode(.invalid_request), .throttle_time_ms = 0 };
+            return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+        };
+
+        const responses = arena_alloc.alloc(ItemResp, req.open_stream_requests.len) catch return null;
+        for (req.open_stream_requests, 0..) |item, i| {
+            const stream_id = i64ToU64(item.stream_id) orelse {
+                responses[i] = .{ .error_code = errorCode(.invalid_request), .start_offset = -1, .next_offset = -1 };
+                continue;
+            };
+            const requested_epoch: u64 = @intCast(@max(item.stream_epoch, 0));
+            self.object_manager.openStream(stream_id, requested_epoch) catch |err| {
+                responses[i] = .{ .error_code = streamErrorCode(err), .start_offset = -1, .next_offset = -1 };
+                continue;
+            };
+            const stream = self.object_manager.getStream(stream_id).?;
+            responses[i] = .{
+                .error_code = 0,
+                .start_offset = u64ToI64(stream.start_offset),
+                .next_offset = u64ToI64(stream.end_offset),
+            };
+        }
+
+        const resp = Resp{ .error_code = 0, .throttle_time_ms = 0, .open_stream_responses = responses };
+        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+    }
+
+    fn handleCloseStreams(self: *Broker, request_bytes: []const u8, body_start: usize, req_header: *const RequestHeader, api_version: i16, resp_header_version: i16) ?[]u8 {
+        const Req = generated.close_streams_request.CloseStreamsRequest;
+        const Resp = generated.close_streams_response.CloseStreamsResponse;
+        const ItemResp = Resp.CloseStreamResponse;
+
+        var arena = std.heap.ArenaAllocator.init(self.allocator);
+        defer arena.deinit();
+        const arena_alloc = arena.allocator();
+
+        const req = parseGeneratedRequest(Req, arena_alloc, request_bytes, body_start, api_version) catch {
+            const resp = Resp{ .error_code = errorCode(.invalid_request), .throttle_time_ms = 0 };
+            return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+        };
+
+        const responses = arena_alloc.alloc(ItemResp, req.close_stream_requests.len) catch return null;
+        for (req.close_stream_requests, 0..) |item, i| {
+            const stream_id = i64ToU64(item.stream_id) orelse {
+                responses[i] = .{ .error_code = errorCode(.invalid_request) };
+                continue;
+            };
+            const stream = self.object_manager.getStream(stream_id) orelse {
+                responses[i] = .{ .error_code = errorCode(.resource_not_found) };
+                continue;
+            };
+            if (item.stream_epoch >= 0 and @as(u64, @intCast(item.stream_epoch)) != stream.epoch) {
+                responses[i] = .{ .error_code = errorCode(.fenced_leader_epoch) };
+                continue;
+            }
+            self.object_manager.closeStream(stream_id) catch |err| {
+                responses[i] = .{ .error_code = streamErrorCode(err) };
+                continue;
+            };
+            responses[i] = .{ .error_code = 0 };
+        }
+
+        const resp = Resp{ .error_code = 0, .throttle_time_ms = 0, .close_stream_responses = responses };
+        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+    }
+
+    fn handleDeleteStreams(self: *Broker, request_bytes: []const u8, body_start: usize, req_header: *const RequestHeader, api_version: i16, resp_header_version: i16) ?[]u8 {
+        const Req = generated.delete_streams_request.DeleteStreamsRequest;
+        const Resp = generated.delete_streams_response.DeleteStreamsResponse;
+        const ItemResp = Resp.DeleteStreamResponse;
+
+        var arena = std.heap.ArenaAllocator.init(self.allocator);
+        defer arena.deinit();
+        const arena_alloc = arena.allocator();
+
+        const req = parseGeneratedRequest(Req, arena_alloc, request_bytes, body_start, api_version) catch {
+            const resp = Resp{ .error_code = errorCode(.invalid_request), .throttle_time_ms = 0 };
+            return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+        };
+
+        const responses = arena_alloc.alloc(ItemResp, req.delete_stream_requests.len) catch return null;
+        for (req.delete_stream_requests, 0..) |item, i| {
+            const stream_id = i64ToU64(item.stream_id) orelse {
+                responses[i] = .{ .error_code = errorCode(.invalid_request) };
+                continue;
+            };
+            self.object_manager.deleteStream(stream_id) catch |err| {
+                responses[i] = .{ .error_code = streamErrorCode(err) };
+                continue;
+            };
+            responses[i] = .{ .error_code = 0 };
+        }
+
+        const resp = Resp{ .error_code = 0, .throttle_time_ms = 0, .delete_stream_responses = responses };
+        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+    }
+
+    fn handlePrepareS3Object(self: *Broker, request_bytes: []const u8, body_start: usize, req_header: *const RequestHeader, api_version: i16, resp_header_version: i16) ?[]u8 {
+        const Req = generated.prepare_s3_object_request.PrepareS3ObjectRequest;
+        const Resp = generated.prepare_s3_object_response.PrepareS3ObjectResponse;
+
+        var arena = std.heap.ArenaAllocator.init(self.allocator);
+        defer arena.deinit();
+        const req = parseGeneratedRequest(Req, arena.allocator(), request_bytes, body_start, api_version) catch {
+            const resp = Resp{ .error_code = errorCode(.invalid_request), .throttle_time_ms = 0, .first_s3_object_id = -1 };
+            return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+        };
+
+        if (req.prepared_count <= 0) {
+            const resp = Resp{ .error_code = errorCode(.invalid_request), .throttle_time_ms = 0, .first_s3_object_id = -1 };
+            return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+        }
+
+        var first_id: u64 = 0;
+        var i: i32 = 0;
+        while (i < req.prepared_count) : (i += 1) {
+            const object_id = self.object_manager.prepareObject();
+            if (i == 0) first_id = object_id;
+        }
+
+        const resp = Resp{ .error_code = 0, .throttle_time_ms = 0, .first_s3_object_id = u64ToI64(first_id) };
+        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+    }
+
+    fn handleCommitStreamSetObject(self: *Broker, request_bytes: []const u8, body_start: usize, req_header: *const RequestHeader, api_version: i16, resp_header_version: i16) ?[]u8 {
+        const Req = generated.commit_stream_set_object_request.CommitStreamSetObjectRequest;
+        const Resp = generated.commit_stream_set_object_response.CommitStreamSetObjectResponse;
+
+        var arena = std.heap.ArenaAllocator.init(self.allocator);
+        defer arena.deinit();
+        const arena_alloc = arena.allocator();
+        const req = parseGeneratedRequest(Req, arena_alloc, request_bytes, body_start, api_version) catch {
+            const resp = Resp{ .error_code = errorCode(.invalid_request), .throttle_time_ms = 0 };
+            return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+        };
+
+        const object_id = i64ToU64(req.object_id) orelse {
+            const resp = Resp{ .error_code = errorCode(.invalid_request), .throttle_time_ms = 0 };
+            return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+        };
+        const object_size = i64ToU64(req.object_size) orelse {
+            const resp = Resp{ .error_code = errorCode(.invalid_request), .throttle_time_ms = 0 };
+            return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+        };
+        const order_id = i64ToU64(req.order_id) orelse object_id;
+
+        const ranges = arena_alloc.alloc(storage.stream.StreamOffsetRange, req.object_stream_ranges.len) catch return null;
+        for (req.object_stream_ranges, 0..) |range_req, i| {
+            const stream_id = i64ToU64(range_req.stream_id) orelse {
+                const resp = Resp{ .error_code = errorCode(.invalid_request), .throttle_time_ms = 0 };
+                return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+            };
+            const start_offset = i64ToU64(range_req.start_offset) orelse {
+                const resp = Resp{ .error_code = errorCode(.invalid_request), .throttle_time_ms = 0 };
+                return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+            };
+            const end_offset = i64ToU64(range_req.end_offset) orelse {
+                const resp = Resp{ .error_code = errorCode(.invalid_request), .throttle_time_ms = 0 };
+                return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+            };
+            if (start_offset > end_offset or self.object_manager.getStream(stream_id) == null) {
+                const resp = Resp{ .error_code = errorCode(.resource_not_found), .throttle_time_ms = 0 };
+                return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+            }
+            ranges[i] = .{ .stream_id = stream_id, .start_offset = start_offset, .end_offset = end_offset };
+        }
+
+        const sso_key = self.makeStreamSetObjectKey(object_id, req.node_id) catch return null;
+        defer self.allocator.free(sso_key);
+        self.object_manager.commitStreamSetObject(object_id, req.node_id, order_id, ranges, sso_key, object_size) catch |err| {
+            const resp = Resp{ .error_code = streamErrorCode(err), .throttle_time_ms = 0 };
+            return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+        };
+
+        for (req.stream_objects) |stream_object| {
+            const so_object_id = i64ToU64(stream_object.object_id) orelse continue;
+            const stream_id = i64ToU64(stream_object.stream_id) orelse continue;
+            const start_offset = i64ToU64(stream_object.start_offset) orelse continue;
+            const end_offset = i64ToU64(stream_object.end_offset) orelse continue;
+            const so_size = i64ToU64(stream_object.object_size) orelse continue;
+            if (start_offset > end_offset or self.object_manager.getStream(stream_id) == null) continue;
+            const so_key = self.makeStreamObjectKey(so_object_id, stream_id, start_offset, end_offset) catch return null;
+            defer self.allocator.free(so_key);
+            self.object_manager.commitStreamObject(so_object_id, stream_id, start_offset, end_offset, so_key, so_size) catch {};
+        }
+
+        for (req.compacted_object_ids) |compacted_id| {
+            if (i64ToU64(compacted_id)) |id| self.object_manager.markDestroyed(id);
+        }
+
+        const resp = Resp{ .error_code = 0, .throttle_time_ms = 0, .attributes = req.attributes };
+        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+    }
+
+    fn handleCommitStreamObject(self: *Broker, request_bytes: []const u8, body_start: usize, req_header: *const RequestHeader, api_version: i16, resp_header_version: i16) ?[]u8 {
+        const Req = generated.commit_stream_object_request.CommitStreamObjectRequest;
+        const Resp = generated.commit_stream_object_response.CommitStreamObjectResponse;
+
+        var arena = std.heap.ArenaAllocator.init(self.allocator);
+        defer arena.deinit();
+        const req = parseGeneratedRequest(Req, arena.allocator(), request_bytes, body_start, api_version) catch {
+            const resp = Resp{ .error_code = errorCode(.invalid_request), .throttle_time_ms = 0 };
+            return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+        };
+
+        const object_id = i64ToU64(req.object_id) orelse {
+            const resp = Resp{ .error_code = errorCode(.invalid_request), .throttle_time_ms = 0 };
+            return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+        };
+        const object_size = i64ToU64(req.object_size) orelse {
+            const resp = Resp{ .error_code = errorCode(.invalid_request), .throttle_time_ms = 0 };
+            return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+        };
+        const stream_id = i64ToU64(req.stream_id) orelse {
+            const resp = Resp{ .error_code = errorCode(.invalid_request), .throttle_time_ms = 0 };
+            return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+        };
+        const start_offset = i64ToU64(req.start_offset) orelse {
+            const resp = Resp{ .error_code = errorCode(.invalid_request), .throttle_time_ms = 0 };
+            return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+        };
+        const end_offset = i64ToU64(req.end_offset) orelse {
+            const resp = Resp{ .error_code = errorCode(.invalid_request), .throttle_time_ms = 0 };
+            return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+        };
+        if (start_offset > end_offset or self.object_manager.getStream(stream_id) == null) {
+            const resp = Resp{ .error_code = errorCode(.resource_not_found), .throttle_time_ms = 0 };
+            return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+        }
+
+        const key = self.makeStreamObjectKey(object_id, stream_id, start_offset, end_offset) catch return null;
+        defer self.allocator.free(key);
+        self.object_manager.commitStreamObject(object_id, stream_id, start_offset, end_offset, key, object_size) catch |err| {
+            const resp = Resp{ .error_code = streamErrorCode(err), .throttle_time_ms = 0 };
+            return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+        };
+
+        if (api_version >= 1 and req.operations.len > 0) {
+            const count = @min(req.source_object_ids.len, req.operations.len);
+            for (0..count) |i| {
+                if (req.operations[i] == 0) {
+                    if (i64ToU64(req.source_object_ids[i])) |source_id| self.object_manager.markDestroyed(source_id);
+                }
+            }
+        } else {
+            for (req.source_object_ids) |source_id_raw| {
+                if (i64ToU64(source_id_raw)) |source_id| self.object_manager.markDestroyed(source_id);
+            }
+        }
+
+        const resp = Resp{ .error_code = 0, .throttle_time_ms = 0 };
+        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+    }
+
+    fn handleGetOpeningStreams(self: *Broker, request_bytes: []const u8, body_start: usize, req_header: *const RequestHeader, api_version: i16, resp_header_version: i16) ?[]u8 {
+        const Req = generated.get_opening_streams_request.GetOpeningStreamsRequest;
+        const Resp = generated.get_opening_streams_response.GetOpeningStreamsResponse;
+        const StreamMetadata = Resp.StreamMetadata;
+
+        var arena = std.heap.ArenaAllocator.init(self.allocator);
+        defer arena.deinit();
+        const arena_alloc = arena.allocator();
+        const req = parseGeneratedRequest(Req, arena_alloc, request_bytes, body_start, api_version) catch {
+            const resp = Resp{ .error_code = errorCode(.invalid_request), .throttle_time_ms = 0 };
+            return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+        };
+
+        var streams = std.array_list.Managed(StreamMetadata).init(arena_alloc);
+        var it = self.object_manager.streams.iterator();
+        while (it.next()) |entry| {
+            const stream = entry.value_ptr;
+            if (stream.state != .opened) continue;
+            if (req.node_id >= 0 and stream.node_id != req.node_id) continue;
+            streams.append(.{
+                .stream_id = u64ToI64(stream.stream_id),
+                .epoch = u64ToI64(stream.epoch),
+                .start_offset = u64ToI64(stream.start_offset),
+                .end_offset = u64ToI64(stream.end_offset),
+            }) catch return null;
+        }
+
+        const resp = Resp{ .error_code = 0, .throttle_time_ms = 0, .stream_metadata_list = streams.items };
+        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+    }
+
+    fn handleGetKVs(self: *Broker, request_bytes: []const u8, body_start: usize, req_header: *const RequestHeader, api_version: i16, resp_header_version: i16) ?[]u8 {
+        const Req = generated.get_k_vs_request.GetKVsRequest;
+        const Resp = generated.get_k_vs_response.GetKVsResponse;
+        const ItemResp = Resp.GetKVResponse;
+
+        var arena = std.heap.ArenaAllocator.init(self.allocator);
+        defer arena.deinit();
+        const arena_alloc = arena.allocator();
+        const req = parseGeneratedRequest(Req, arena_alloc, request_bytes, body_start, api_version) catch {
+            const resp = Resp{ .error_code = errorCode(.invalid_request), .throttle_time_ms = 0 };
+            return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+        };
+
+        const responses = arena_alloc.alloc(ItemResp, req.get_key_requests.len) catch return null;
+        for (req.get_key_requests, 0..) |item, i| {
+            const key = item.key orelse "";
+            if (key.len == 0) {
+                responses[i] = .{ .error_code = errorCode(.invalid_request), .value = null };
+            } else if (self.auto_mq_kvs.get(key)) |value| {
+                responses[i] = .{ .error_code = 0, .value = value };
+            } else {
+                responses[i] = .{ .error_code = errorCode(.resource_not_found), .value = null };
+            }
+        }
+
+        const resp = Resp{ .error_code = 0, .throttle_time_ms = 0, .get_kv_responses = responses };
+        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+    }
+
+    fn handlePutKVs(self: *Broker, request_bytes: []const u8, body_start: usize, req_header: *const RequestHeader, api_version: i16, resp_header_version: i16) ?[]u8 {
+        const Req = generated.put_k_vs_request.PutKVsRequest;
+        const Resp = generated.put_k_vs_response.PutKVsResponse;
+        const ItemResp = Resp.PutKVResponse;
+
+        var arena = std.heap.ArenaAllocator.init(self.allocator);
+        defer arena.deinit();
+        const arena_alloc = arena.allocator();
+        const req = parseGeneratedRequest(Req, arena_alloc, request_bytes, body_start, api_version) catch {
+            const resp = Resp{ .error_code = errorCode(.invalid_request), .throttle_time_ms = 0 };
+            return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+        };
+
+        const responses = arena_alloc.alloc(ItemResp, req.put_kv_requests.len) catch return null;
+        for (req.put_kv_requests, 0..) |item, i| {
+            const key = item.key orelse "";
+            const value = item.value orelse "";
+            if (key.len == 0) {
+                responses[i] = .{ .error_code = errorCode(.invalid_request), .value = null };
+                continue;
+            }
+            if (self.auto_mq_kvs.getPtr(key)) |existing| {
+                if (!item.overwrite) {
+                    responses[i] = .{ .error_code = errorCode(.duplicate_resource), .value = existing.* };
+                    continue;
+                }
+                const value_copy = self.allocator.dupe(u8, value) catch return null;
+                self.allocator.free(existing.*);
+                existing.* = value_copy;
+                responses[i] = .{ .error_code = 0, .value = existing.* };
+            } else {
+                const key_copy = self.allocator.dupe(u8, key) catch return null;
+                const value_copy = self.allocator.dupe(u8, value) catch {
+                    self.allocator.free(key_copy);
+                    return null;
+                };
+                self.auto_mq_kvs.put(key_copy, value_copy) catch {
+                    self.allocator.free(key_copy);
+                    self.allocator.free(value_copy);
+                    return null;
+                };
+                responses[i] = .{ .error_code = 0, .value = value_copy };
+            }
+        }
+
+        const resp = Resp{ .error_code = 0, .throttle_time_ms = 0, .put_kv_responses = responses };
+        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+    }
+
+    fn handleDeleteKVs(self: *Broker, request_bytes: []const u8, body_start: usize, req_header: *const RequestHeader, api_version: i16, resp_header_version: i16) ?[]u8 {
+        const Req = generated.delete_k_vs_request.DeleteKVsRequest;
+        const Resp = generated.delete_k_vs_response.DeleteKVsResponse;
+        const ItemResp = Resp.DeleteKVResponse;
+
+        var arena = std.heap.ArenaAllocator.init(self.allocator);
+        defer arena.deinit();
+        const arena_alloc = arena.allocator();
+        const req = parseGeneratedRequest(Req, arena_alloc, request_bytes, body_start, api_version) catch {
+            const resp = Resp{ .error_code = errorCode(.invalid_request), .throttle_time_ms = 0 };
+            return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+        };
+
+        const responses = arena_alloc.alloc(ItemResp, req.delete_kv_requests.len) catch return null;
+        for (req.delete_kv_requests, 0..) |item, i| {
+            const key = item.key orelse "";
+            if (key.len == 0) {
+                responses[i] = .{ .error_code = errorCode(.invalid_request), .value = null };
+                continue;
+            }
+            if (self.auto_mq_kvs.fetchRemove(key)) |removed| {
+                const response_value = arena_alloc.dupe(u8, removed.value) catch return null;
+                self.allocator.free(removed.key);
+                self.allocator.free(removed.value);
+                responses[i] = .{ .error_code = 0, .value = response_value };
+            } else {
+                responses[i] = .{ .error_code = errorCode(.resource_not_found), .value = null };
+            }
+        }
+
+        const resp = Resp{ .error_code = 0, .throttle_time_ms = 0, .delete_kv_responses = responses };
+        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+    }
+
+    fn handleTrimStreams(self: *Broker, request_bytes: []const u8, body_start: usize, req_header: *const RequestHeader, api_version: i16, resp_header_version: i16) ?[]u8 {
+        const Req = generated.trim_streams_request.TrimStreamsRequest;
+        const Resp = generated.trim_streams_response.TrimStreamsResponse;
+        const ItemResp = Resp.TrimStreamResponse;
+
+        var arena = std.heap.ArenaAllocator.init(self.allocator);
+        defer arena.deinit();
+        const arena_alloc = arena.allocator();
+        const req = parseGeneratedRequest(Req, arena_alloc, request_bytes, body_start, api_version) catch {
+            const resp = Resp{ .error_code = errorCode(.invalid_request), .throttle_time_ms = 0 };
+            return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+        };
+
+        const responses = arena_alloc.alloc(ItemResp, req.trim_stream_requests.len) catch return null;
+        for (req.trim_stream_requests, 0..) |item, i| {
+            const stream_id = i64ToU64(item.stream_id) orelse {
+                responses[i] = .{ .error_code = errorCode(.invalid_request) };
+                continue;
+            };
+            const new_start_offset = i64ToU64(item.new_start_offset) orelse {
+                responses[i] = .{ .error_code = errorCode(.invalid_request) };
+                continue;
+            };
+            self.object_manager.trimStream(stream_id, new_start_offset) catch |err| {
+                responses[i] = .{ .error_code = streamErrorCode(err) };
+                continue;
+            };
+            responses[i] = .{ .error_code = 0 };
+        }
+
+        const resp = Resp{ .error_code = 0, .throttle_time_ms = 0, .trim_stream_responses = responses };
+        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+    }
+
+    fn handleAutomqRegisterNode(self: *Broker, request_bytes: []const u8, body_start: usize, req_header: *const RequestHeader, api_version: i16, resp_header_version: i16) ?[]u8 {
+        const Req = generated.automq_register_node_request.AutomqRegisterNodeRequest;
+        const Resp = generated.automq_register_node_response.AutomqRegisterNodeResponse;
+
+        var arena = std.heap.ArenaAllocator.init(self.allocator);
+        defer arena.deinit();
+        const req = parseGeneratedRequest(Req, arena.allocator(), request_bytes, body_start, api_version) catch {
+            const resp = Resp{ .error_code = errorCode(.invalid_request), .throttle_time_ms = 0 };
+            return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+        };
+
+        if (req.node_id < 0) {
+            const resp = Resp{ .error_code = errorCode(.invalid_request), .throttle_time_ms = 0 };
+            return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+        }
+
+        const wal_config = req.wal_config orelse "";
+        const wal_config_copy = self.allocator.dupe(u8, wal_config) catch return null;
+
+        if (self.auto_mq_nodes.getPtr(req.node_id)) |node| {
+            node.deinit(self.allocator);
+            node.* = .{ .node_epoch = req.node_epoch, .wal_config = wal_config_copy };
+        } else {
+            self.auto_mq_nodes.put(req.node_id, .{ .node_epoch = req.node_epoch, .wal_config = wal_config_copy }) catch {
+                self.allocator.free(wal_config_copy);
+                return null;
+            };
+        }
+        if (req.node_id >= self.auto_mq_next_node_id) self.auto_mq_next_node_id = req.node_id + 1;
+
+        const resp = Resp{ .error_code = 0, .throttle_time_ms = 0 };
+        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+    }
+
+    fn handleAutomqGetNodes(self: *Broker, request_bytes: []const u8, body_start: usize, req_header: *const RequestHeader, api_version: i16, resp_header_version: i16) ?[]u8 {
+        const Req = generated.automq_get_nodes_request.AutomqGetNodesRequest;
+        const Resp = generated.automq_get_nodes_response.AutomqGetNodesResponse;
+        const NodeMetadata = Resp.NodeMetadata;
+
+        var arena = std.heap.ArenaAllocator.init(self.allocator);
+        defer arena.deinit();
+        const arena_alloc = arena.allocator();
+        const req = parseGeneratedRequest(Req, arena_alloc, request_bytes, body_start, api_version) catch {
+            const resp = Resp{ .error_code = errorCode(.invalid_request), .throttle_time_ms = 0 };
+            return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+        };
+
+        var nodes = std.array_list.Managed(NodeMetadata).init(arena_alloc);
+        const include_self_synthetic = self.auto_mq_nodes.get(self.node_id) == null;
+
+        if (req.node_ids.len == 0) {
+            var it = self.auto_mq_nodes.iterator();
+            while (it.next()) |entry| {
+                nodes.append(.{
+                    .node_id = entry.key_ptr.*,
+                    .node_epoch = entry.value_ptr.node_epoch,
+                    .wal_config = entry.value_ptr.wal_config,
+                    .state = entry.value_ptr.state,
+                    .has_opening_streams = self.hasOpeningStreamsForNode(entry.key_ptr.*),
+                }) catch return null;
+            }
+            if (include_self_synthetic) {
+                nodes.append(.{
+                    .node_id = self.node_id,
+                    .node_epoch = 0,
+                    .wal_config = "local",
+                    .state = "ACTIVE",
+                    .has_opening_streams = self.hasOpeningStreamsForNode(self.node_id),
+                }) catch return null;
+            }
+        } else {
+            for (req.node_ids) |node_id| {
+                if (self.auto_mq_nodes.get(node_id)) |node| {
+                    nodes.append(.{
+                        .node_id = node_id,
+                        .node_epoch = node.node_epoch,
+                        .wal_config = node.wal_config,
+                        .state = node.state,
+                        .has_opening_streams = self.hasOpeningStreamsForNode(node_id),
+                    }) catch return null;
+                } else if (node_id == self.node_id) {
+                    nodes.append(.{
+                        .node_id = self.node_id,
+                        .node_epoch = 0,
+                        .wal_config = "local",
+                        .state = "ACTIVE",
+                        .has_opening_streams = self.hasOpeningStreamsForNode(self.node_id),
+                    }) catch return null;
+                }
+            }
+        }
+
+        const resp = Resp{ .error_code = 0, .throttle_time_ms = 0, .nodes = nodes.items };
+        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+    }
+
+    fn handleAutomqZoneRouter(self: *Broker, request_bytes: []const u8, body_start: usize, req_header: *const RequestHeader, api_version: i16, resp_header_version: i16) ?[]u8 {
+        const Req = generated.automq_zone_router_request.AutomqZoneRouterRequest;
+        const Resp = generated.automq_zone_router_response.AutomqZoneRouterResponse;
+        const ItemResp = Resp.Response;
+
+        var arena = std.heap.ArenaAllocator.init(self.allocator);
+        defer arena.deinit();
+        const arena_alloc = arena.allocator();
+        const req = parseGeneratedRequest(Req, arena_alloc, request_bytes, body_start, api_version) catch {
+            const resp = Resp{ .error_code = errorCode(.invalid_request), .throttle_time_ms = 0 };
+            return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+        };
+
+        if (req.metadata) |metadata| {
+            const metadata_copy = self.allocator.dupe(u8, metadata) catch return null;
+            if (self.auto_mq_zone_router_metadata) |old| self.allocator.free(old);
+            self.auto_mq_zone_router_metadata = metadata_copy;
+        }
+        if (api_version >= 1 and req.route_epoch > self.auto_mq_zone_router_epoch) {
+            self.auto_mq_zone_router_epoch = req.route_epoch;
+        }
+
+        const default_route = std.fmt.allocPrint(arena_alloc, "{{\"node_id\":{d},\"epoch\":{d}}}", .{ self.node_id, self.auto_mq_zone_router_epoch }) catch return null;
+        const responses = arena_alloc.alloc(ItemResp, 1) catch return null;
+        responses[0] = .{ .data = self.auto_mq_zone_router_metadata orelse default_route };
+
+        const resp = Resp{ .error_code = 0, .throttle_time_ms = 0, .responses = responses };
+        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+    }
+
+    fn handleAutomqGetPartitionSnapshot(self: *Broker, request_bytes: []const u8, body_start: usize, req_header: *const RequestHeader, api_version: i16, resp_header_version: i16) ?[]u8 {
+        const Req = generated.automq_get_partition_snapshot_request.AutomqGetPartitionSnapshotRequest;
+        const Resp = generated.automq_get_partition_snapshot_response.AutomqGetPartitionSnapshotResponse;
+        const Topic = Resp.Topic;
+        const PartitionSnapshot = Topic.PartitionSnapshot;
+        const StreamMetadata = PartitionSnapshot.StreamMetadata;
+        const LogOffsetMetadata = generated.automq_get_partition_snapshot_response.LogOffsetMetadata;
+
+        var arena = std.heap.ArenaAllocator.init(self.allocator);
+        defer arena.deinit();
+        const arena_alloc = arena.allocator();
+        const req = parseGeneratedRequest(Req, arena_alloc, request_bytes, body_start, api_version) catch {
+            const resp = Resp{ .error_code = errorCode(.invalid_request), .throttle_time_ms = 0 };
+            return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+        };
+
+        var topics = std.array_list.Managed(Topic).init(arena_alloc);
+        var topic_it = self.topics.iterator();
+        while (topic_it.next()) |entry| {
+            const info = entry.value_ptr;
+            const partitions = arena_alloc.alloc(PartitionSnapshot, @intCast(@max(info.num_partitions, 0))) catch return null;
+            var pi: i32 = 0;
+            while (pi < info.num_partitions) : (pi += 1) {
+                const stream_id = PartitionStore.hashPartitionKey(info.name, pi);
+                const stream_metadata = arena_alloc.alloc(StreamMetadata, 1) catch return null;
+                const partition_info = self.store.getPartitionInfo(info.name, pi);
+                const end_offset = if (partition_info) |p| p.next_offset else 0;
+                stream_metadata[0] = .{ .stream_id = u64ToI64(stream_id), .end_offset = end_offset };
+                partitions[@intCast(pi)] = .{
+                    .partition_index = pi,
+                    .leader_epoch = if (self.raft_state) |rs| rs.current_epoch else self.cached_leader_epoch,
+                    .operation = 0,
+                    .log_end_offset = LogOffsetMetadata{ .message_offset = end_offset, .relative_position_in_segment = 0 },
+                    .stream_metadata = stream_metadata,
+                };
+            }
+            topics.append(.{ .topic_id = info.topic_id, .partitions = partitions }) catch return null;
+        }
+
+        const next_epoch = req.session_epoch + 1;
+        const resp = Resp{
+            .error_code = 0,
+            .throttle_time_ms = 0,
+            .session_id = req.session_id,
+            .session_epoch = next_epoch,
+            .topics = topics.items,
+            .confirm_wal_end_offset = null,
+            .confirm_wal_config = null,
+            .confirm_wal_delta_data = null,
+        };
+        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+    }
+
+    fn handleUpdateLicense(self: *Broker, request_bytes: []const u8, body_start: usize, req_header: *const RequestHeader, api_version: i16, resp_header_version: i16) ?[]u8 {
+        const Req = generated.update_license_request.UpdateLicenseRequest;
+        const Resp = generated.update_license_response.UpdateLicenseResponse;
+
+        var arena = std.heap.ArenaAllocator.init(self.allocator);
+        defer arena.deinit();
+        const req = parseGeneratedRequest(Req, arena.allocator(), request_bytes, body_start, api_version) catch {
+            const resp = Resp{ .error_code = errorCode(.invalid_request), .throttle_time_ms = 0, .error_message = "invalid request" };
+            return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+        };
+
+        const license = req.license orelse "";
+        const license_copy = self.allocator.dupe(u8, license) catch return null;
+        if (self.auto_mq_license) |old| self.allocator.free(old);
+        self.auto_mq_license = license_copy;
+
+        const resp = Resp{ .error_code = 0, .throttle_time_ms = 0, .error_message = "" };
+        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+    }
+
+    fn handleDescribeLicense(self: *Broker, request_bytes: []const u8, body_start: usize, req_header: *const RequestHeader, api_version: i16, resp_header_version: i16) ?[]u8 {
+        const Req = generated.describe_license_request.DescribeLicenseRequest;
+        const Resp = generated.describe_license_response.DescribeLicenseResponse;
+
+        var arena = std.heap.ArenaAllocator.init(self.allocator);
+        defer arena.deinit();
+        _ = parseGeneratedRequest(Req, arena.allocator(), request_bytes, body_start, api_version) catch {
+            const resp = Resp{ .error_code = errorCode(.invalid_request), .throttle_time_ms = 0, .error_message = "invalid request", .license = "" };
+            return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+        };
+
+        const resp = Resp{ .error_code = 0, .throttle_time_ms = 0, .error_message = "", .license = self.auto_mq_license orelse "" };
+        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+    }
+
+    fn handleExportClusterManifest(self: *Broker, request_bytes: []const u8, body_start: usize, req_header: *const RequestHeader, api_version: i16, resp_header_version: i16) ?[]u8 {
+        const Req = generated.export_cluster_manifest_request.ExportClusterManifestRequest;
+        const Resp = generated.export_cluster_manifest_response.ExportClusterManifestResponse;
+
+        var arena = std.heap.ArenaAllocator.init(self.allocator);
+        defer arena.deinit();
+        const arena_alloc = arena.allocator();
+        _ = parseGeneratedRequest(Req, arena_alloc, request_bytes, body_start, api_version) catch {
+            const resp = Resp{ .error_code = errorCode(.invalid_request), .throttle_time_ms = 0, .manifest = "" };
+            return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+        };
+
+        const manifest = std.fmt.allocPrint(arena_alloc, "{{\"cluster_id\":\"zmq-cluster\",\"node_id\":{d},\"topics\":{d},\"streams\":{d},\"nodes\":{d}}}", .{
+            self.node_id,
+            self.topics.count(),
+            self.object_manager.streamCount(),
+            self.auto_mq_nodes.count() + @intFromBool(self.auto_mq_nodes.get(self.node_id) == null),
+        }) catch return null;
+
+        const resp = Resp{ .error_code = 0, .throttle_time_ms = 0, .manifest = manifest };
+        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+    }
+
+    fn handleGetNextNodeId(self: *Broker, request_bytes: []const u8, body_start: usize, req_header: *const RequestHeader, api_version: i16, resp_header_version: i16) ?[]u8 {
+        const Req = generated.get_next_node_id_request.GetNextNodeIdRequest;
+        const Resp = generated.get_next_node_id_response.GetNextNodeIdResponse;
+
+        var arena = std.heap.ArenaAllocator.init(self.allocator);
+        defer arena.deinit();
+        _ = parseGeneratedRequest(Req, arena.allocator(), request_bytes, body_start, api_version) catch {
+            const resp = Resp{ .error_code = errorCode(.invalid_request), .throttle_time_ms = 0, .node_id = -1 };
+            return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+        };
+
+        const node_id = self.auto_mq_next_node_id;
+        self.auto_mq_next_node_id += 1;
+        const resp = Resp{ .error_code = 0, .throttle_time_ms = 0, .node_id = node_id };
+        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+    }
+
+    fn handleDescribeStreams(self: *Broker, request_bytes: []const u8, body_start: usize, req_header: *const RequestHeader, api_version: i16, resp_header_version: i16) ?[]u8 {
+        const Req = generated.describe_streams_request.DescribeStreamsRequest;
+        const Resp = generated.describe_streams_response.DescribeStreamsResponse;
+        const StreamMetadata = Resp.StreamMetadata;
+
+        var arena = std.heap.ArenaAllocator.init(self.allocator);
+        defer arena.deinit();
+        const arena_alloc = arena.allocator();
+        const req = parseGeneratedRequest(Req, arena_alloc, request_bytes, body_start, api_version) catch {
+            const resp = Resp{ .error_code = errorCode(.invalid_request), .throttle_time_ms = 0 };
+            return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+        };
+
+        var stream_ids = std.array_list.Managed(u64).init(arena_alloc);
+        if (req.stream_id >= 0) {
+            stream_ids.append(@intCast(req.stream_id)) catch return null;
+        }
+        for (req.topic_partitions) |topic_req| {
+            const topic_name = topic_req.topic_name orelse continue;
+            for (topic_req.partitions) |partition_req| {
+                if (partition_req.partition_index < 0) continue;
+                stream_ids.append(PartitionStore.hashPartitionKey(topic_name, partition_req.partition_index)) catch return null;
+            }
+        }
+        if (stream_ids.items.len == 0) {
+            var it = self.object_manager.streams.iterator();
+            while (it.next()) |entry| {
+                const stream = entry.value_ptr;
+                if (req.node_id >= 0 and stream.node_id != req.node_id) continue;
+                stream_ids.append(stream.stream_id) catch return null;
+            }
+        }
+
+        var metadata = std.array_list.Managed(StreamMetadata).init(arena_alloc);
+        for (stream_ids.items) |stream_id| {
+            const stream = self.object_manager.getStream(stream_id) orelse continue;
+            const mapping = self.findTopicPartitionForStream(stream_id);
+            metadata.append(.{
+                .stream_id = u64ToI64(stream.stream_id),
+                .node_id = stream.node_id,
+                .state = if (stream.state == .opened) "OPENED" else "CLOSED",
+                .topic_id = if (mapping) |m| m.topic_id else .{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 },
+                .topic_name = if (mapping) |m| m.topic_name else null,
+                .partition_index = if (mapping) |m| m.partition_index else -1,
+                .epoch = u64ToI64(stream.epoch),
+                .start_offset = u64ToI64(stream.start_offset),
+                .end_offset = u64ToI64(stream.end_offset),
+            }) catch return null;
+        }
+
+        const resp = Resp{ .error_code = 0, .throttle_time_ms = 0, .stream_metadata_list = metadata.items };
+        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+    }
+
+    fn handleAutomqUpdateGroup(self: *Broker, request_bytes: []const u8, body_start: usize, req_header: *const RequestHeader, api_version: i16, resp_header_version: i16) ?[]u8 {
+        const Req = generated.automq_update_group_request.AutomqUpdateGroupRequest;
+        const Resp = generated.automq_update_group_response.AutomqUpdateGroupResponse;
+
+        var arena = std.heap.ArenaAllocator.init(self.allocator);
+        defer arena.deinit();
+        const req = parseGeneratedRequest(Req, arena.allocator(), request_bytes, body_start, api_version) catch {
+            const resp = Resp{ .group_id = null, .error_code = errorCode(.invalid_request), .error_message = "invalid request", .throttle_time_ms = 0 };
+            return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+        };
+
+        const group_id = req.group_id orelse "";
+        const link_id = req.link_id orelse "";
+        if (group_id.len == 0) {
+            const resp = Resp{ .group_id = req.group_id, .error_code = errorCode(.invalid_request), .error_message = "group_id is required", .throttle_time_ms = 0 };
+            return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+        }
+
+        if (req.promoted) {
+            const link_copy = self.allocator.dupe(u8, link_id) catch return null;
+            if (self.auto_mq_group_promotions.getPtr(group_id)) |existing| {
+                existing.deinit(self.allocator);
+                existing.* = .{ .link_id = link_copy, .promoted = true };
+            } else {
+                const group_copy = self.allocator.dupe(u8, group_id) catch {
+                    self.allocator.free(link_copy);
+                    return null;
+                };
+                self.auto_mq_group_promotions.put(group_copy, .{ .link_id = link_copy, .promoted = true }) catch {
+                    self.allocator.free(group_copy);
+                    self.allocator.free(link_copy);
+                    return null;
+                };
+            }
+        } else if (self.auto_mq_group_promotions.fetchRemove(group_id)) |removed| {
+            self.allocator.free(removed.key);
+            var promotion = removed.value;
+            promotion.deinit(self.allocator);
+        }
+
+        const resp = Resp{ .group_id = req.group_id, .error_code = 0, .error_message = null, .throttle_time_ms = 0 };
+        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+    }
+
+    // ---------------------------------------------------------------
+    // IncrementalAlterConfigs (key 44)
     // Parse config entries and apply valid ones. Handles the same configs
     // as AlterConfigs, with incremental semantics (SET, DELETE, APPEND, SUBTRACT).
     // ---------------------------------------------------------------
@@ -4123,7 +5023,7 @@ pub const Broker = struct {
     }
 
     // ---------------------------------------------------------------
-    // AlterPartitionReassignments (key 44) — flexible versions only
+    // AlterPartitionReassignments (key 45) — flexible versions only
     // ---------------------------------------------------------------
     fn handleAlterPartitionReassignments(self: *Broker, request_bytes: []const u8, body_start: usize, req_header: *const RequestHeader, resp_header_version: i16) ?[]u8 {
         var pos = body_start;
@@ -4168,7 +5068,7 @@ pub const Broker = struct {
     }
 
     // ---------------------------------------------------------------
-    // ListPartitionReassignments (key 45) — flexible versions only
+    // ListPartitionReassignments (key 46) — flexible versions only
     // ---------------------------------------------------------------
     fn handleListPartitionReassignments(self: *Broker, request_bytes: []const u8, body_start: usize, req_header: *const RequestHeader, resp_header_version: i16) ?[]u8 {
         _ = request_bytes;
@@ -4419,6 +5319,41 @@ test "Broker.handleRequest ApiVersions v0 (non-flexible)" {
     // Parse ApiVersions response body
     const error_code = ser.readI16(response.?, &rpos);
     try testing.expectEqual(@as(i16, 0), error_code);
+
+    const api_count = (try ser.readArrayLen(response.?, &rpos)).?;
+    var saw_delete_groups = false;
+    var saw_incremental_alter_configs = false;
+    var saw_alter_reassignments = false;
+    var saw_list_reassignments = false;
+    var saw_create_streams = false;
+    var saw_update_group = false;
+    for (0..api_count) |_| {
+        const key = ser.readI16(response.?, &rpos);
+        _ = ser.readI16(response.?, &rpos);
+        const max_version = ser.readI16(response.?, &rpos);
+        if (key == 42) {
+            saw_delete_groups = true;
+            try testing.expectEqual(@as(i16, 2), max_version);
+        } else if (key == 44) {
+            saw_incremental_alter_configs = true;
+        } else if (key == 45) {
+            saw_alter_reassignments = true;
+        } else if (key == 46) {
+            saw_list_reassignments = true;
+        } else if (key == 501) {
+            saw_create_streams = true;
+            try testing.expectEqual(@as(i16, 1), max_version);
+        } else if (key == 602) {
+            saw_update_group = true;
+            try testing.expectEqual(@as(i16, 0), max_version);
+        }
+    }
+    try testing.expect(saw_delete_groups);
+    try testing.expect(saw_incremental_alter_configs);
+    try testing.expect(saw_alter_reassignments);
+    try testing.expect(saw_list_reassignments);
+    try testing.expect(saw_create_streams);
+    try testing.expect(saw_update_group);
 }
 
 test "Broker.handleRequest ApiVersions v3 (flexible)" {
@@ -4543,6 +5478,489 @@ test "Broker.handleRequest ListGroups (key=16)" {
     try testing.expectEqual(@as(i32, 400), corr_id);
 }
 
+test "Broker.handleRequest DeleteGroups v2 deletes empty group" {
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+
+    const join = try broker.groups.joinGroup("delete-me", null, "consumer", null);
+    try testing.expectEqual(@as(i16, 0), broker.groups.leaveGroup("delete-me", join.member_id));
+    try testing.expectEqual(@as(usize, 1), broker.groups.groupCount());
+
+    var buf: [256]u8 = undefined;
+    var pos = buildTestRequest(&buf, 42, 2, 4200, 2);
+    ser.writeCompactArrayLen(&buf, &pos, 1);
+    ser.writeCompactString(&buf, &pos, "delete-me");
+    ser.writeEmptyTaggedFields(&buf, &pos);
+
+    const response = broker.handleRequest(buf[0..pos]);
+    try testing.expect(response != null);
+    defer testing.allocator.free(response.?);
+
+    var rpos: usize = 0;
+    var resp_header = try ResponseHeader.deserialize(testing.allocator, response.?, &rpos, 1);
+    defer resp_header.deinit(testing.allocator);
+    try testing.expectEqual(@as(i32, 4200), resp_header.correlation_id);
+    try testing.expectEqual(@as(i32, 0), ser.readI32(response.?, &rpos));
+
+    const result_count = (try ser.readCompactArrayLen(response.?, &rpos)).?;
+    try testing.expectEqual(@as(usize, 1), result_count);
+    const group_id = (try ser.readCompactString(response.?, &rpos)).?;
+    try testing.expectEqualStrings("delete-me", group_id);
+    try testing.expectEqual(@as(i16, 0), ser.readI16(response.?, &rpos));
+    try testing.expectEqual(@as(usize, 0), broker.groups.groupCount());
+}
+
+test "Broker AutoMQ stream object lifecycle APIs" {
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+    var owned_responses = std.array_list.Managed([]u8).init(testing.allocator);
+    defer {
+        for (owned_responses.items) |resp| testing.allocator.free(resp);
+        owned_responses.deinit();
+    }
+
+    const CreateReq = generated.create_streams_request.CreateStreamsRequest;
+    const CreateResp = generated.create_streams_response.CreateStreamsResponse;
+    const PrepareReq = generated.prepare_s3_object_request.PrepareS3ObjectRequest;
+    const PrepareResp = generated.prepare_s3_object_response.PrepareS3ObjectResponse;
+    const CommitReq = generated.commit_stream_object_request.CommitStreamObjectRequest;
+    const CommitResp = generated.commit_stream_object_response.CommitStreamObjectResponse;
+    const TrimReq = generated.trim_streams_request.TrimStreamsRequest;
+    const TrimResp = generated.trim_streams_response.TrimStreamsResponse;
+    const CloseReq = generated.close_streams_request.CloseStreamsRequest;
+    const CloseResp = generated.close_streams_response.CloseStreamsResponse;
+    const DeleteReq = generated.delete_streams_request.DeleteStreamsRequest;
+    const DeleteResp = generated.delete_streams_response.DeleteStreamsResponse;
+
+    var buf: [2048]u8 = undefined;
+    var pos = buildTestRequest(&buf, 501, 0, 5010, 2);
+    const create_items = [_]CreateReq.CreateStreamRequest{.{ .node_id = 1 }};
+    const create_req = CreateReq{ .node_id = 1, .node_epoch = 1, .create_stream_requests = &create_items };
+    create_req.serialize(&buf, &pos, 0);
+    var response = broker.handleRequest(buf[0..pos]);
+    try testing.expect(response != null);
+    try owned_responses.append(response.?);
+
+    var rpos: usize = 0;
+    var create_header = try ResponseHeader.deserialize(testing.allocator, response.?, &rpos, 1);
+    defer create_header.deinit(testing.allocator);
+    const create_resp = try CreateResp.deserialize(testing.allocator, response.?, &rpos, 0);
+    defer testing.allocator.free(create_resp.create_stream_responses);
+    try testing.expectEqual(@as(i16, 0), create_resp.error_code);
+    try testing.expectEqual(@as(usize, 1), create_resp.create_stream_responses.len);
+    const stream_id = create_resp.create_stream_responses[0].stream_id;
+    try testing.expect(stream_id > 0);
+    try testing.expectEqual(@as(usize, 1), broker.object_manager.streamCount());
+
+    pos = buildTestRequest(&buf, 505, 0, 5050, 2);
+    const prepare_req = PrepareReq{ .node_id = 1, .prepared_count = 1, .time_to_live_in_ms = 60_000 };
+    prepare_req.serialize(&buf, &pos, 0);
+    response = broker.handleRequest(buf[0..pos]);
+    try testing.expect(response != null);
+    try owned_responses.append(response.?);
+
+    rpos = 0;
+    var prepare_header = try ResponseHeader.deserialize(testing.allocator, response.?, &rpos, 1);
+    defer prepare_header.deinit(testing.allocator);
+    const prepare_resp = try PrepareResp.deserialize(testing.allocator, response.?, &rpos, 0);
+    try testing.expectEqual(@as(i16, 0), prepare_resp.error_code);
+    try testing.expect(prepare_resp.first_s3_object_id > 0);
+
+    pos = buildTestRequest(&buf, 507, 1, 5070, 2);
+    const source_ids = [_]i64{};
+    const operations = [_]i8{};
+    const commit_req = CommitReq{
+        .node_id = 1,
+        .node_epoch = 1,
+        .object_id = prepare_resp.first_s3_object_id,
+        .object_size = 128,
+        .stream_id = stream_id,
+        .start_offset = 0,
+        .end_offset = 10,
+        .source_object_ids = &source_ids,
+        .stream_epoch = 1,
+        .attributes = 7,
+        .operations = &operations,
+    };
+    commit_req.serialize(&buf, &pos, 1);
+    response = broker.handleRequest(buf[0..pos]);
+    try testing.expect(response != null);
+    try owned_responses.append(response.?);
+
+    rpos = 0;
+    var commit_header = try ResponseHeader.deserialize(testing.allocator, response.?, &rpos, 1);
+    defer commit_header.deinit(testing.allocator);
+    const commit_resp = try CommitResp.deserialize(testing.allocator, response.?, &rpos, 1);
+    try testing.expectEqual(@as(i16, 0), commit_resp.error_code);
+    try testing.expectEqual(@as(usize, 1), broker.object_manager.getStreamObjectCount());
+
+    pos = buildTestRequest(&buf, 512, 0, 5120, 2);
+    const trim_items = [_]TrimReq.TrimStreamRequest{.{ .stream_id = stream_id, .stream_epoch = 1, .new_start_offset = 5 }};
+    const trim_req = TrimReq{ .node_id = 1, .node_epoch = 1, .trim_stream_requests = &trim_items };
+    trim_req.serialize(&buf, &pos, 0);
+    response = broker.handleRequest(buf[0..pos]);
+    try testing.expect(response != null);
+    try owned_responses.append(response.?);
+
+    rpos = 0;
+    var trim_header = try ResponseHeader.deserialize(testing.allocator, response.?, &rpos, 1);
+    defer trim_header.deinit(testing.allocator);
+    const trim_resp = try TrimResp.deserialize(testing.allocator, response.?, &rpos, 0);
+    defer testing.allocator.free(trim_resp.trim_stream_responses);
+    try testing.expectEqual(@as(i16, 0), trim_resp.trim_stream_responses[0].error_code);
+    try testing.expectEqual(@as(u64, 5), broker.object_manager.getStream(@intCast(stream_id)).?.start_offset);
+
+    pos = buildTestRequest(&buf, 503, 0, 5030, 2);
+    const close_items = [_]CloseReq.CloseStreamRequest{.{ .stream_id = stream_id, .stream_epoch = 1 }};
+    const close_req = CloseReq{ .node_id = 1, .node_epoch = 1, .close_stream_requests = &close_items };
+    close_req.serialize(&buf, &pos, 0);
+    response = broker.handleRequest(buf[0..pos]);
+    try testing.expect(response != null);
+    try owned_responses.append(response.?);
+
+    rpos = 0;
+    var close_header = try ResponseHeader.deserialize(testing.allocator, response.?, &rpos, 1);
+    defer close_header.deinit(testing.allocator);
+    const close_resp = try CloseResp.deserialize(testing.allocator, response.?, &rpos, 0);
+    defer testing.allocator.free(close_resp.close_stream_responses);
+    try testing.expectEqual(@as(i16, 0), close_resp.close_stream_responses[0].error_code);
+
+    pos = buildTestRequest(&buf, 504, 0, 5040, 2);
+    const delete_items = [_]DeleteReq.DeleteStreamRequest{.{ .stream_id = stream_id, .stream_epoch = 1 }};
+    const delete_req = DeleteReq{ .node_id = 1, .node_epoch = 1, .delete_stream_requests = &delete_items };
+    delete_req.serialize(&buf, &pos, 0);
+    response = broker.handleRequest(buf[0..pos]);
+    try testing.expect(response != null);
+    try owned_responses.append(response.?);
+
+    rpos = 0;
+    var delete_header = try ResponseHeader.deserialize(testing.allocator, response.?, &rpos, 1);
+    defer delete_header.deinit(testing.allocator);
+    const delete_resp = try DeleteResp.deserialize(testing.allocator, response.?, &rpos, 0);
+    defer testing.allocator.free(delete_resp.delete_stream_responses);
+    try testing.expectEqual(@as(i16, 0), delete_resp.delete_stream_responses[0].error_code);
+    try testing.expectEqual(@as(usize, 0), broker.object_manager.streamCount());
+    try testing.expectEqual(@as(usize, 0), broker.object_manager.getStreamObjectCount());
+}
+
+test "Broker AutoMQ KV APIs round-trip" {
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+    var owned_responses = std.array_list.Managed([]u8).init(testing.allocator);
+    defer {
+        for (owned_responses.items) |resp| testing.allocator.free(resp);
+        owned_responses.deinit();
+    }
+
+    const PutReq = generated.put_k_vs_request.PutKVsRequest;
+    const PutResp = generated.put_k_vs_response.PutKVsResponse;
+    const GetReq = generated.get_k_vs_request.GetKVsRequest;
+    const GetResp = generated.get_k_vs_response.GetKVsResponse;
+    const DeleteReq = generated.delete_k_vs_request.DeleteKVsRequest;
+    const DeleteResp = generated.delete_k_vs_response.DeleteKVsResponse;
+
+    var buf: [1024]u8 = undefined;
+    var pos = buildTestRequest(&buf, 510, 0, 5100, 2);
+    const put_items = [_]PutReq.PutKVRequest{.{ .key = "alpha", .value = "beta", .overwrite = false }};
+    const put_req = PutReq{ .put_kv_requests = &put_items };
+    put_req.serialize(&buf, &pos, 0);
+    var response = broker.handleRequest(buf[0..pos]);
+    try testing.expect(response != null);
+    try owned_responses.append(response.?);
+
+    var rpos: usize = 0;
+    var put_header = try ResponseHeader.deserialize(testing.allocator, response.?, &rpos, 1);
+    defer put_header.deinit(testing.allocator);
+    const put_resp = try PutResp.deserialize(testing.allocator, response.?, &rpos, 0);
+    defer testing.allocator.free(put_resp.put_kv_responses);
+    try testing.expectEqual(@as(i16, 0), put_resp.put_kv_responses[0].error_code);
+
+    pos = buildTestRequest(&buf, 509, 0, 5090, 2);
+    const get_items = [_]GetReq.GetKVRequest{.{ .key = "alpha" }};
+    const get_req = GetReq{ .get_key_requests = &get_items };
+    get_req.serialize(&buf, &pos, 0);
+    response = broker.handleRequest(buf[0..pos]);
+    try testing.expect(response != null);
+    try owned_responses.append(response.?);
+
+    rpos = 0;
+    var get_header = try ResponseHeader.deserialize(testing.allocator, response.?, &rpos, 1);
+    defer get_header.deinit(testing.allocator);
+    const get_resp = try GetResp.deserialize(testing.allocator, response.?, &rpos, 0);
+    defer testing.allocator.free(get_resp.get_kv_responses);
+    try testing.expectEqual(@as(i16, 0), get_resp.get_kv_responses[0].error_code);
+    try testing.expectEqualStrings("beta", get_resp.get_kv_responses[0].value.?);
+
+    pos = buildTestRequest(&buf, 511, 0, 5110, 2);
+    const delete_items = [_]DeleteReq.DeleteKVRequest{.{ .key = "alpha" }};
+    const delete_req = DeleteReq{ .delete_kv_requests = &delete_items };
+    delete_req.serialize(&buf, &pos, 0);
+    response = broker.handleRequest(buf[0..pos]);
+    try testing.expect(response != null);
+    try owned_responses.append(response.?);
+
+    rpos = 0;
+    var delete_header = try ResponseHeader.deserialize(testing.allocator, response.?, &rpos, 1);
+    defer delete_header.deinit(testing.allocator);
+    const delete_resp = try DeleteResp.deserialize(testing.allocator, response.?, &rpos, 0);
+    defer testing.allocator.free(delete_resp.delete_kv_responses);
+    try testing.expectEqual(@as(i16, 0), delete_resp.delete_kv_responses[0].error_code);
+    try testing.expectEqualStrings("beta", delete_resp.delete_kv_responses[0].value.?);
+    try testing.expectEqual(@as(u32, 0), broker.auto_mq_kvs.count());
+}
+
+test "Broker AutoMQ node license and manifest APIs" {
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+    var owned_responses = std.array_list.Managed([]u8).init(testing.allocator);
+    defer {
+        for (owned_responses.items) |resp| testing.allocator.free(resp);
+        owned_responses.deinit();
+    }
+
+    const RegisterReq = generated.automq_register_node_request.AutomqRegisterNodeRequest;
+    const RegisterResp = generated.automq_register_node_response.AutomqRegisterNodeResponse;
+    const GetNodesReq = generated.automq_get_nodes_request.AutomqGetNodesRequest;
+    const GetNodesResp = generated.automq_get_nodes_response.AutomqGetNodesResponse;
+    const NextNodeReq = generated.get_next_node_id_request.GetNextNodeIdRequest;
+    const NextNodeResp = generated.get_next_node_id_response.GetNextNodeIdResponse;
+    const UpdateLicenseReq = generated.update_license_request.UpdateLicenseRequest;
+    const UpdateLicenseResp = generated.update_license_response.UpdateLicenseResponse;
+    const DescribeLicenseReq = generated.describe_license_request.DescribeLicenseRequest;
+    const DescribeLicenseResp = generated.describe_license_response.DescribeLicenseResponse;
+    const ManifestReq = generated.export_cluster_manifest_request.ExportClusterManifestRequest;
+    const ManifestResp = generated.export_cluster_manifest_response.ExportClusterManifestResponse;
+
+    var buf: [2048]u8 = undefined;
+    var pos = buildTestRequest(&buf, 513, 0, 5130, 2);
+    const register_req = RegisterReq{ .node_id = 7, .node_epoch = 3, .wal_config = "wal://node-7" };
+    register_req.serialize(&buf, &pos, 0);
+    var response = broker.handleRequest(buf[0..pos]);
+    try testing.expect(response != null);
+    try owned_responses.append(response.?);
+    var rpos: usize = 0;
+    var register_header = try ResponseHeader.deserialize(testing.allocator, response.?, &rpos, 1);
+    defer register_header.deinit(testing.allocator);
+    const register_resp = try RegisterResp.deserialize(testing.allocator, response.?, &rpos, 0);
+    try testing.expectEqual(@as(i16, 0), register_resp.error_code);
+
+    pos = buildTestRequest(&buf, 514, 0, 5140, 2);
+    const node_ids = [_]i32{7};
+    const get_nodes_req = GetNodesReq{ .node_ids = &node_ids };
+    get_nodes_req.serialize(&buf, &pos, 0);
+    response = broker.handleRequest(buf[0..pos]);
+    try testing.expect(response != null);
+    try owned_responses.append(response.?);
+    rpos = 0;
+    var get_nodes_header = try ResponseHeader.deserialize(testing.allocator, response.?, &rpos, 1);
+    defer get_nodes_header.deinit(testing.allocator);
+    const get_nodes_resp = try GetNodesResp.deserialize(testing.allocator, response.?, &rpos, 0);
+    defer testing.allocator.free(get_nodes_resp.nodes);
+    try testing.expectEqual(@as(usize, 1), get_nodes_resp.nodes.len);
+    try testing.expectEqual(@as(i32, 7), get_nodes_resp.nodes[0].node_id);
+    try testing.expectEqualStrings("wal://node-7", get_nodes_resp.nodes[0].wal_config.?);
+
+    pos = buildTestRequest(&buf, 600, 0, 6000, 2);
+    const next_node_req = NextNodeReq{ .cluster_id = "zmq-cluster" };
+    next_node_req.serialize(&buf, &pos, 0);
+    response = broker.handleRequest(buf[0..pos]);
+    try testing.expect(response != null);
+    try owned_responses.append(response.?);
+    rpos = 0;
+    var next_node_header = try ResponseHeader.deserialize(testing.allocator, response.?, &rpos, 1);
+    defer next_node_header.deinit(testing.allocator);
+    const next_node_resp = try NextNodeResp.deserialize(testing.allocator, response.?, &rpos, 0);
+    try testing.expectEqual(@as(i32, 8), next_node_resp.node_id);
+
+    pos = buildTestRequest(&buf, 517, 0, 5170, 2);
+    const update_license_req = UpdateLicenseReq{ .license = "test-license" };
+    update_license_req.serialize(&buf, &pos, 0);
+    response = broker.handleRequest(buf[0..pos]);
+    try testing.expect(response != null);
+    try owned_responses.append(response.?);
+    rpos = 0;
+    var update_license_header = try ResponseHeader.deserialize(testing.allocator, response.?, &rpos, 1);
+    defer update_license_header.deinit(testing.allocator);
+    const update_license_resp = try UpdateLicenseResp.deserialize(testing.allocator, response.?, &rpos, 0);
+    try testing.expectEqual(@as(i16, 0), update_license_resp.error_code);
+
+    pos = buildTestRequest(&buf, 518, 0, 5180, 2);
+    const describe_license_req = DescribeLicenseReq{};
+    describe_license_req.serialize(&buf, &pos, 0);
+    response = broker.handleRequest(buf[0..pos]);
+    try testing.expect(response != null);
+    try owned_responses.append(response.?);
+    rpos = 0;
+    var describe_license_header = try ResponseHeader.deserialize(testing.allocator, response.?, &rpos, 1);
+    defer describe_license_header.deinit(testing.allocator);
+    const describe_license_resp = try DescribeLicenseResp.deserialize(testing.allocator, response.?, &rpos, 0);
+    try testing.expectEqualStrings("test-license", describe_license_resp.license.?);
+
+    pos = buildTestRequest(&buf, 519, 0, 5190, 2);
+    const manifest_req = ManifestReq{};
+    manifest_req.serialize(&buf, &pos, 0);
+    response = broker.handleRequest(buf[0..pos]);
+    try testing.expect(response != null);
+    try owned_responses.append(response.?);
+    rpos = 0;
+    var manifest_header = try ResponseHeader.deserialize(testing.allocator, response.?, &rpos, 1);
+    defer manifest_header.deinit(testing.allocator);
+    const manifest_resp = try ManifestResp.deserialize(testing.allocator, response.?, &rpos, 0);
+    try testing.expect(std.mem.indexOf(u8, manifest_resp.manifest.?, "\"cluster_id\":\"zmq-cluster\"") != null);
+}
+
+test "Broker AutoMQ router snapshot describe and group APIs" {
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+    var owned_responses = std.array_list.Managed([]u8).init(testing.allocator);
+    defer {
+        for (owned_responses.items) |resp| testing.allocator.free(resp);
+        owned_responses.deinit();
+    }
+
+    const OpenReq = generated.open_streams_request.OpenStreamsRequest;
+    const OpenResp = generated.open_streams_response.OpenStreamsResponse;
+    const OpeningReq = generated.get_opening_streams_request.GetOpeningStreamsRequest;
+    const OpeningResp = generated.get_opening_streams_response.GetOpeningStreamsResponse;
+    const CommitSsoReq = generated.commit_stream_set_object_request.CommitStreamSetObjectRequest;
+    const CommitSsoResp = generated.commit_stream_set_object_response.CommitStreamSetObjectResponse;
+    const DescribeReq = generated.describe_streams_request.DescribeStreamsRequest;
+    const DescribeResp = generated.describe_streams_response.DescribeStreamsResponse;
+    const ZoneReq = generated.automq_zone_router_request.AutomqZoneRouterRequest;
+    const ZoneResp = generated.automq_zone_router_response.AutomqZoneRouterResponse;
+    const SnapshotReq = generated.automq_get_partition_snapshot_request.AutomqGetPartitionSnapshotRequest;
+    const SnapshotResp = generated.automq_get_partition_snapshot_response.AutomqGetPartitionSnapshotResponse;
+    const UpdateGroupReq = generated.automq_update_group_request.AutomqUpdateGroupRequest;
+    const UpdateGroupResp = generated.automq_update_group_response.AutomqUpdateGroupResponse;
+
+    try testing.expect(broker.ensureTopic("snap-topic"));
+    const stream = try broker.object_manager.createStream(1);
+    const stream_id: i64 = @intCast(stream.stream_id);
+
+    var buf: [4096]u8 = undefined;
+    var pos = buildTestRequest(&buf, 502, 1, 5020, 2);
+    const open_items = [_]OpenReq.OpenStreamRequest{.{ .stream_id = stream_id, .stream_epoch = 1 }};
+    const open_req = OpenReq{ .node_id = 1, .node_epoch = 1, .open_stream_requests = &open_items };
+    open_req.serialize(&buf, &pos, 1);
+    var response = broker.handleRequest(buf[0..pos]);
+    try testing.expect(response != null);
+    try owned_responses.append(response.?);
+    var rpos: usize = 0;
+    var open_header = try ResponseHeader.deserialize(testing.allocator, response.?, &rpos, 1);
+    defer open_header.deinit(testing.allocator);
+    const open_resp = try OpenResp.deserialize(testing.allocator, response.?, &rpos, 1);
+    defer testing.allocator.free(open_resp.open_stream_responses);
+    try testing.expectEqual(@as(i16, 0), open_resp.open_stream_responses[0].error_code);
+
+    pos = buildTestRequest(&buf, 508, 0, 5080, 2);
+    const opening_req = OpeningReq{ .node_id = 1, .node_epoch = 1, .failover_mode = false };
+    opening_req.serialize(&buf, &pos, 0);
+    response = broker.handleRequest(buf[0..pos]);
+    try testing.expect(response != null);
+    try owned_responses.append(response.?);
+    rpos = 0;
+    var opening_header = try ResponseHeader.deserialize(testing.allocator, response.?, &rpos, 1);
+    defer opening_header.deinit(testing.allocator);
+    const opening_resp = try OpeningResp.deserialize(testing.allocator, response.?, &rpos, 0);
+    defer testing.allocator.free(opening_resp.stream_metadata_list);
+    try testing.expect(opening_resp.stream_metadata_list.len >= 1);
+
+    const sso_object_id = broker.object_manager.prepareObject();
+    pos = buildTestRequest(&buf, 506, 1, 5060, 2);
+    const ranges = [_]CommitSsoReq.ObjectStreamRange{.{
+        .stream_id = stream_id,
+        .stream_epoch = 1,
+        .start_offset = 0,
+        .end_offset = 10,
+    }};
+    const stream_objects = [_]CommitSsoReq.StreamObject{};
+    const compacted = [_]i64{};
+    const commit_sso_req = CommitSsoReq{
+        .node_id = 1,
+        .node_epoch = 1,
+        .object_id = @intCast(sso_object_id),
+        .order_id = 1,
+        .object_size = 512,
+        .object_stream_ranges = &ranges,
+        .stream_objects = &stream_objects,
+        .compacted_object_ids = &compacted,
+        .failover_mode = false,
+        .attributes = 9,
+    };
+    commit_sso_req.serialize(&buf, &pos, 1);
+    response = broker.handleRequest(buf[0..pos]);
+    try testing.expect(response != null);
+    try owned_responses.append(response.?);
+    rpos = 0;
+    var commit_sso_header = try ResponseHeader.deserialize(testing.allocator, response.?, &rpos, 1);
+    defer commit_sso_header.deinit(testing.allocator);
+    const commit_sso_resp = try CommitSsoResp.deserialize(testing.allocator, response.?, &rpos, 1);
+    try testing.expectEqual(@as(i16, 0), commit_sso_resp.error_code);
+    try testing.expectEqual(@as(usize, 1), broker.object_manager.getStreamSetObjectCount());
+
+    pos = buildTestRequest(&buf, 601, 0, 6010, 2);
+    const describe_req = DescribeReq{ .node_id = 1, .stream_id = stream_id };
+    describe_req.serialize(&buf, &pos, 0);
+    response = broker.handleRequest(buf[0..pos]);
+    try testing.expect(response != null);
+    try owned_responses.append(response.?);
+    rpos = 0;
+    var describe_header = try ResponseHeader.deserialize(testing.allocator, response.?, &rpos, 1);
+    defer describe_header.deinit(testing.allocator);
+    const describe_resp = try DescribeResp.deserialize(testing.allocator, response.?, &rpos, 0);
+    defer testing.allocator.free(describe_resp.stream_metadata_list);
+    try testing.expectEqual(@as(usize, 1), describe_resp.stream_metadata_list.len);
+    try testing.expectEqual(stream_id, describe_resp.stream_metadata_list[0].stream_id);
+
+    pos = buildTestRequest(&buf, 515, 1, 5150, 2);
+    const zone_req = ZoneReq{ .metadata = "route-data", .route_epoch = 4, .version = 1 };
+    zone_req.serialize(&buf, &pos, 1);
+    response = broker.handleRequest(buf[0..pos]);
+    try testing.expect(response != null);
+    try owned_responses.append(response.?);
+    rpos = 0;
+    var zone_header = try ResponseHeader.deserialize(testing.allocator, response.?, &rpos, 1);
+    defer zone_header.deinit(testing.allocator);
+    const zone_resp = try ZoneResp.deserialize(testing.allocator, response.?, &rpos, 1);
+    defer testing.allocator.free(zone_resp.responses);
+    try testing.expectEqualStrings("route-data", zone_resp.responses[0].data.?);
+
+    pos = buildTestRequest(&buf, 516, 2, 5160, 2);
+    const snapshot_req = SnapshotReq{ .session_id = 11, .session_epoch = 2, .request_commit = false, .version = 2 };
+    snapshot_req.serialize(&buf, &pos, 2);
+    response = broker.handleRequest(buf[0..pos]);
+    try testing.expect(response != null);
+    try owned_responses.append(response.?);
+    rpos = 0;
+    var snapshot_header = try ResponseHeader.deserialize(testing.allocator, response.?, &rpos, 1);
+    defer snapshot_header.deinit(testing.allocator);
+    const snapshot_resp = try SnapshotResp.deserialize(testing.allocator, response.?, &rpos, 2);
+    defer {
+        for (snapshot_resp.topics) |topic| {
+            for (topic.partitions) |partition| {
+                if (partition.stream_metadata.len > 0) testing.allocator.free(partition.stream_metadata);
+            }
+            if (topic.partitions.len > 0) testing.allocator.free(topic.partitions);
+        }
+        if (snapshot_resp.topics.len > 0) testing.allocator.free(snapshot_resp.topics);
+    }
+    try testing.expectEqual(@as(i16, 0), snapshot_resp.error_code);
+    try testing.expect(snapshot_resp.topics.len >= 1);
+
+    pos = buildTestRequest(&buf, 602, 0, 6020, 2);
+    const update_group_req = UpdateGroupReq{ .link_id = "link-a", .group_id = "group-a", .promoted = true };
+    update_group_req.serialize(&buf, &pos, 0);
+    response = broker.handleRequest(buf[0..pos]);
+    try testing.expect(response != null);
+    try owned_responses.append(response.?);
+    rpos = 0;
+    var update_group_header = try ResponseHeader.deserialize(testing.allocator, response.?, &rpos, 1);
+    defer update_group_header.deinit(testing.allocator);
+    const update_group_resp = try UpdateGroupResp.deserialize(testing.allocator, response.?, &rpos, 0);
+    try testing.expectEqual(@as(i16, 0), update_group_resp.error_code);
+    try testing.expectEqual(@as(u32, 1), broker.auto_mq_group_promotions.count());
+}
+
 test "Broker.handleRequest InitProducerId (key=22, v0)" {
     var broker = Broker.init(testing.allocator, 1, 9092);
     defer broker.deinit();
@@ -4574,6 +5992,11 @@ test "Broker.isVersionSupported" {
     try testing.expect(Broker.isVersionSupported(1, 0));
     try testing.expect(Broker.isVersionSupported(1, 17));
     try testing.expect(!Broker.isVersionSupported(1, 18));
+    try testing.expect(Broker.isVersionSupported(42, 2));
+    try testing.expect(!Broker.isVersionSupported(42, 3));
+    try testing.expect(Broker.isVersionSupported(44, 1));
+    try testing.expect(Broker.isVersionSupported(45, 0));
+    try testing.expect(Broker.isVersionSupported(46, 0));
 }
 
 test "Broker.ensureTopic auto-create" {
@@ -5225,7 +6648,7 @@ test "Broker shutdownFlushWal returns true when no S3 batcher" {
 }
 
 test "Broker tick WAL cleanup skips when no fs_wal" {
-    const wal_mod = @import("../storage/wal.zig");
+    const wal_mod = storage.wal;
     const S3WalBatcher = wal_mod.S3WalBatcher;
 
     var broker = Broker.init(testing.allocator, 1, 9092);
@@ -5248,10 +6671,10 @@ test "Broker tick WAL cleanup skips when no fs_wal" {
 }
 
 test "Broker tick WAL cleanup removes flushed segments" {
-    const wal_mod = @import("../storage/wal.zig");
+    const wal_mod = storage.wal;
     const Wal = wal_mod.Wal;
     const S3WalBatcher = wal_mod.S3WalBatcher;
-    const fs = std.fs;
+    const fs = @import("fs_compat");
 
     const tmp_dir = "/tmp/zmq-broker-wal-cleanup-test";
     fs.deleteTreeAbsolute(tmp_dir) catch {};

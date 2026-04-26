@@ -8,13 +8,13 @@ const testing = std.testing;
 
 /// Get the current wall-clock time in milliseconds since Unix epoch.
 pub fn currentTimeMillis() i64 {
-    const ts = std.time.milliTimestamp();
+    const ts = @import("time_compat").milliTimestamp();
     return ts;
 }
 
 /// Get a monotonic timestamp in nanoseconds (for measuring durations).
 pub fn monotonicNanos() u64 {
-    return @intCast(std.time.nanoTimestamp());
+    return @intCast(@import("time_compat").nanoTimestamp());
 }
 
 /// Get a monotonic timestamp in milliseconds.

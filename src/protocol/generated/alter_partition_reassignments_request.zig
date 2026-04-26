@@ -27,12 +27,16 @@ pub const AlterPartitionReassignmentsRequest = struct {
                 ser.writeEmptyTaggedFields(buf, pos);
             }
 
-            pub fn deserialize(_: Allocator, buf: []const u8, pos: *usize, _: i16) !ReassignablePartition {
+            pub fn deserialize(alloc: Allocator, buf: []const u8, pos: *usize, _: i16) !ReassignablePartition {
                 var result = ReassignablePartition{};
                 result.partition_index = ser.readI32(buf, pos);
                 const replicas_len: usize = (try ser.readCompactArrayLen(buf, pos)) orelse 0;
                 if (replicas_len > 0) {
-                    pos.* += replicas_len * 4;
+                    const replicas_items = try alloc.alloc(i32, replicas_len);
+                    for (replicas_items) |*item| {
+                        item.* = ser.readI32(buf, pos);
+                    }
+                    result.replicas = replicas_items;
                 }
                 try ser.skipTaggedFields(buf, pos);
                 return result;

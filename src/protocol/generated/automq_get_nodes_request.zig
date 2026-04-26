@@ -21,11 +21,15 @@ pub const AutomqGetNodesRequest = struct {
         ser.writeEmptyTaggedFields(buf, pos);
     }
 
-    pub fn deserialize(_: Allocator, buf: []const u8, pos: *usize, _: i16) !AutomqGetNodesRequest {
+    pub fn deserialize(alloc: Allocator, buf: []const u8, pos: *usize, _: i16) !AutomqGetNodesRequest {
         var result = AutomqGetNodesRequest{};
         const node_ids_len: usize = (try ser.readCompactArrayLen(buf, pos)) orelse 0;
         if (node_ids_len > 0) {
-            pos.* += node_ids_len * 4;
+            const node_ids_items = try alloc.alloc(i32, node_ids_len);
+            for (node_ids_items) |*item| {
+                item.* = ser.readI32(buf, pos);
+            }
+            result.node_ids = node_ids_items;
         }
         try ser.skipTaggedFields(buf, pos);
         return result;

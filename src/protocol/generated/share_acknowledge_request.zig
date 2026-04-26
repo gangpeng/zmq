@@ -32,13 +32,17 @@ pub const ShareAcknowledgeRequest = struct {
                     ser.writeEmptyTaggedFields(buf, pos);
                 }
 
-                pub fn deserialize(_: Allocator, buf: []const u8, pos: *usize, _: i16) !AcknowledgementBatch {
+                pub fn deserialize(alloc: Allocator, buf: []const u8, pos: *usize, _: i16) !AcknowledgementBatch {
                     var result = AcknowledgementBatch{};
                     result.first_offset = ser.readI64(buf, pos);
                     result.last_offset = ser.readI64(buf, pos);
                     const acknowledge_types_len: usize = (try ser.readCompactArrayLen(buf, pos)) orelse 0;
                     if (acknowledge_types_len > 0) {
-                        pos.* += acknowledge_types_len * 1;
+                        const acknowledge_types_items = try alloc.alloc(i8, acknowledge_types_len);
+                        for (acknowledge_types_items) |*item| {
+                            item.* = ser.readI8(buf, pos);
+                        }
+                        result.acknowledge_types = acknowledge_types_items;
                     }
                     try ser.skipTaggedFields(buf, pos);
                     return result;

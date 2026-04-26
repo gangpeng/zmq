@@ -46,7 +46,7 @@ pub const ConnectionManager = struct {
         const id = self.next_id;
         self.next_id += 1;
 
-        const now = std.time.milliTimestamp();
+        const now = @import("time_compat").milliTimestamp();
         try self.connections.put(id, .{
             .id = id,
             .fd = fd,
@@ -65,7 +65,7 @@ pub const ConnectionManager = struct {
     /// Update last active timestamp and request count.
     pub fn recordActivity(self: *ConnectionManager, id: u64, bytes_in: u64, bytes_out: u64) void {
         if (self.connections.getPtr(id)) |info| {
-            info.last_active_ms = std.time.milliTimestamp();
+            info.last_active_ms = @import("time_compat").milliTimestamp();
             info.bytes_received += bytes_in;
             info.bytes_sent += bytes_out;
             info.requests_processed += 1;
@@ -86,7 +86,7 @@ pub const ConnectionManager = struct {
 
     /// Find connections idle longer than `timeout_ms` and return their IDs.
     pub fn findIdleConnections(self: *const ConnectionManager, timeout_ms: i64, result_buf: []u64) usize {
-        const now = std.time.milliTimestamp();
+        const now = @import("time_compat").milliTimestamp();
         var found: usize = 0;
         var it = self.connections.iterator();
         while (it.next()) |entry| {

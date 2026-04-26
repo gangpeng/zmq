@@ -8,7 +8,7 @@ const log = std.log.scoped(.auth);
 /// Implements the Kafka ACL model:
 ///   (Principal, Permission, Operation, Resource, PatternType) → Allow/Deny
 pub const Authorizer = struct {
-    acls: std.ArrayList(AclEntry),
+    acls: std.array_list.Managed(AclEntry),
     allocator: Allocator,
     /// Principals that bypass all ACL checks (e.g., "User:admin").
     /// Matches AutoMQ/Kafka's super.users configuration.
@@ -71,7 +71,7 @@ pub const Authorizer = struct {
 
     pub fn init(alloc: Allocator) Authorizer {
         return .{
-            .acls = std.ArrayList(AclEntry).init(alloc),
+            .acls = std.array_list.Managed(AclEntry).init(alloc),
             .super_users = std.StringHashMap(void).init(alloc),
             .allocator = alloc,
         };
@@ -275,7 +275,7 @@ pub const SaslPlainAuthenticator = struct {
 
         // Generate random salt
         var salt: [16]u8 = undefined;
-        std.crypto.random.bytes(&salt);
+        @import("random_compat").bytes(&salt);
 
         // Hash password with PBKDF2
         var hash: [32]u8 = undefined;
@@ -465,7 +465,7 @@ pub const ScramSha256Authenticator = struct {
 
         // Generate random salt
         var salt: [32]u8 = undefined;
-        std.crypto.random.bytes(&salt);
+        @import("random_compat").bytes(&salt);
 
         const iterations: u32 = 4096;
 
@@ -657,7 +657,7 @@ pub const ScramStateMachine = struct {
 
         // Generate server nonce (24 random bytes, base64-encoded)
         var server_nonce_raw: [24]u8 = undefined;
-        std.crypto.random.bytes(&server_nonce_raw);
+        @import("random_compat").bytes(&server_nonce_raw);
         const server_nonce_b64 = base64Encode(self.allocator, &server_nonce_raw) catch {
             self.state = .failed;
             return null;

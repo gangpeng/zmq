@@ -48,19 +48,22 @@ pub const ListGroupsRequest = struct {
         if (version >= 3) ser.writeEmptyTaggedFields(buf, pos);
     }
 
-    pub fn deserialize(_: Allocator, buf: []const u8, pos: *usize, version: i16) !ListGroupsRequest {
+    pub fn deserialize(alloc: Allocator, buf: []const u8, pos: *usize, version: i16) !ListGroupsRequest {
         var result = ListGroupsRequest{};
         if (version >= 4) {
             const states_filter_len: usize = if (version >= 3)
                 (try ser.readCompactArrayLen(buf, pos)) orelse 0
             else
                 (try ser.readArrayLen(buf, pos)) orelse 0;
-            for (0..states_filter_len) |_| {
-                if (version >= 3) {
-                    _ = try ser.readCompactString(buf, pos);
-                } else {
-                    _ = try ser.readString(buf, pos);
+            if (states_filter_len > 0) {
+                const states_filter_items = try alloc.alloc(?[]const u8, states_filter_len);
+                for (states_filter_items) |*item| {
+                    item.* = if (version >= 3)
+                        try ser.readCompactString(buf, pos)
+                    else
+                        try ser.readString(buf, pos);
                 }
+                result.states_filter = states_filter_items;
             }
         }
         if (version >= 5) {
@@ -68,12 +71,15 @@ pub const ListGroupsRequest = struct {
                 (try ser.readCompactArrayLen(buf, pos)) orelse 0
             else
                 (try ser.readArrayLen(buf, pos)) orelse 0;
-            for (0..types_filter_len) |_| {
-                if (version >= 3) {
-                    _ = try ser.readCompactString(buf, pos);
-                } else {
-                    _ = try ser.readString(buf, pos);
+            if (types_filter_len > 0) {
+                const types_filter_items = try alloc.alloc(?[]const u8, types_filter_len);
+                for (types_filter_items) |*item| {
+                    item.* = if (version >= 3)
+                        try ser.readCompactString(buf, pos)
+                    else
+                        try ser.readString(buf, pos);
                 }
+                result.types_filter = types_filter_items;
             }
         }
         if (version >= 3) try ser.skipTaggedFields(buf, pos);

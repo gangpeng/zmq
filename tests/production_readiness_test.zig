@@ -62,7 +62,7 @@ test "TLS handshake timeout enforcement" {
     defer conn.deinit();
 
     // New connection: not timed out (handshake_start_ms defaults to 0)
-    try testing.expect(!conn.isHandshakeTimedOut(std.time.milliTimestamp()));
+    try testing.expect(!conn.isHandshakeTimedOut(@import("time_compat").milliTimestamp()));
 
     // Simulated stale connection: started 31 seconds ago
     conn.handshake_start_ms = 1000;
@@ -423,7 +423,7 @@ test "JSON logger produces structured NDJSON output" {
     // Sprint 5: Structured logging for production observability
     const alloc = testing.allocator;
 
-    var output_buf = std.ArrayList(u8).init(alloc);
+    var output_buf = std.array_list.Managed(u8).init(alloc);
     defer output_buf.deinit();
 
     var logger = JsonLogger.initWithWriter(alloc, &output_buf);
@@ -463,7 +463,7 @@ test "JSON logger escapes special characters in messages" {
     // Sprint 5: Verify JSON escaping produces safe output
     const alloc = testing.allocator;
 
-    var output_buf = std.ArrayList(u8).init(alloc);
+    var output_buf = std.array_list.Managed(u8).init(alloc);
     defer output_buf.deinit();
 
     var logger = JsonLogger.initWithWriter(alloc, &output_buf);

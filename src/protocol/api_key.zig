@@ -1,9 +1,9 @@
 const std = @import("std");
 const testing = std.testing;
 
-/// Kafka API keys — every request type in the Kafka binary protocol.
+/// Kafka API keys and AutoMQ protocol extensions.
 ///
-/// Standard Kafka API keys (0-73) plus AutoMQ-compatible extensions (10001+).
+/// Values are aligned with the JSON schemas in src/protocol/schemas.
 /// Each API key has a set of valid versions and flexible versions.
 pub const ApiKey = enum(i16) {
     // ---------------------------------------------------------------
@@ -80,32 +80,49 @@ pub const ApiKey = enum(i16) {
     consumer_group_heartbeat = 68,
     consumer_group_describe = 69,
     controller_registration = 70,
-    add_raft_voter = 71,
-    remove_raft_voter = 72,
-    update_raft_voter = 73,
+    get_telemetry_subscriptions = 71,
+    push_telemetry = 72,
+    assign_replicas_to_dirs = 73,
+    list_client_metrics_resources = 74,
+    describe_topic_partitions = 75,
+    share_group_heartbeat = 76,
+    share_group_describe = 77,
+    share_fetch = 78,
+    share_acknowledge = 79,
+    add_raft_voter = 80,
+    remove_raft_voter = 81,
+    update_raft_voter = 82,
+    initialize_share_group_state = 83,
+    read_share_group_state = 84,
+    write_share_group_state = 85,
+    delete_share_group_state = 86,
+    read_share_group_state_summary = 87,
 
     // ---------------------------------------------------------------
     // AutoMQ Extension APIs
     // ---------------------------------------------------------------
-    // These use API keys 10001+ to avoid conflicts with upstream Kafka
-    create_streams = 10001,
-    delete_streams = 10002,
-    open_streams = 10003,
-    close_streams = 10004,
-    trim_streams = 10005,
-    describe_streams = 10006,
-    prepare_s3_object = 10007,
-    commit_stream_set_object = 10008,
-    commit_stream_object = 10009,
-    get_objects = 10010,
-    get_opening_streams = 10011,
-    get_kvs = 10012,
-    put_kvs = 10013,
-    delete_kvs = 10014,
-    get_next_node_id = 10015,
-    describe_cluster_ext = 10016,
-    automq_register_node = 10017,
-    automq_zone_router = 10018,
+    create_streams = 501,
+    open_streams = 502,
+    close_streams = 503,
+    delete_streams = 504,
+    prepare_s3_object = 505,
+    commit_stream_set_object = 506,
+    commit_stream_object = 507,
+    get_opening_streams = 508,
+    get_kvs = 509,
+    put_kvs = 510,
+    delete_kvs = 511,
+    trim_streams = 512,
+    automq_register_node = 513,
+    automq_get_nodes = 514,
+    automq_zone_router = 515,
+    automq_get_partition_snapshot = 516,
+    update_license = 517,
+    describe_license = 518,
+    export_cluster_manifest = 519,
+    get_next_node_id = 600,
+    describe_streams = 601,
+    automq_update_group = 602,
 
     _,
 
@@ -183,35 +200,78 @@ pub const ApiKey = enum(i16) {
             .consumer_group_heartbeat => "ConsumerGroupHeartbeat",
             .consumer_group_describe => "ConsumerGroupDescribe",
             .controller_registration => "ControllerRegistration",
+            .get_telemetry_subscriptions => "GetTelemetrySubscriptions",
+            .push_telemetry => "PushTelemetry",
+            .assign_replicas_to_dirs => "AssignReplicasToDirs",
+            .list_client_metrics_resources => "ListClientMetricsResources",
+            .describe_topic_partitions => "DescribeTopicPartitions",
+            .share_group_heartbeat => "ShareGroupHeartbeat",
+            .share_group_describe => "ShareGroupDescribe",
+            .share_fetch => "ShareFetch",
+            .share_acknowledge => "ShareAcknowledge",
             .add_raft_voter => "AddRaftVoter",
             .remove_raft_voter => "RemoveRaftVoter",
             .update_raft_voter => "UpdateRaftVoter",
+            .initialize_share_group_state => "InitializeShareGroupState",
+            .read_share_group_state => "ReadShareGroupState",
+            .write_share_group_state => "WriteShareGroupState",
+            .delete_share_group_state => "DeleteShareGroupState",
+            .read_share_group_state_summary => "ReadShareGroupStateSummary",
             // AutoMQ extensions
             .create_streams => "CreateStreams",
-            .delete_streams => "DeleteStreams",
             .open_streams => "OpenStreams",
             .close_streams => "CloseStreams",
-            .trim_streams => "TrimStreams",
-            .describe_streams => "DescribeStreams",
+            .delete_streams => "DeleteStreams",
             .prepare_s3_object => "PrepareS3Object",
             .commit_stream_set_object => "CommitStreamSetObject",
             .commit_stream_object => "CommitStreamObject",
-            .get_objects => "GetObjects",
             .get_opening_streams => "GetOpeningStreams",
             .get_kvs => "GetKvs",
             .put_kvs => "PutKvs",
             .delete_kvs => "DeleteKvs",
-            .get_next_node_id => "GetNextNodeId",
-            .describe_cluster_ext => "DescribeClusterExt",
+            .trim_streams => "TrimStreams",
             .automq_register_node => "AutomqRegisterNode",
+            .automq_get_nodes => "AutomqGetNodes",
             .automq_zone_router => "AutomqZoneRouter",
+            .automq_get_partition_snapshot => "AutomqGetPartitionSnapshot",
+            .update_license => "UpdateLicense",
+            .describe_license => "DescribeLicense",
+            .export_cluster_manifest => "ExportClusterManifest",
+            .get_next_node_id => "GetNextNodeId",
+            .describe_streams => "DescribeStreams",
+            .automq_update_group => "AutomqUpdateGroup",
             else => "Unknown",
         };
     }
 
     /// Whether this API key is an AutoMQ extension.
     pub fn isAutomqExtension(self: ApiKey) bool {
-        return @intFromEnum(self) >= 10001;
+        return switch (self) {
+            .create_streams,
+            .open_streams,
+            .close_streams,
+            .delete_streams,
+            .prepare_s3_object,
+            .commit_stream_set_object,
+            .commit_stream_object,
+            .get_opening_streams,
+            .get_kvs,
+            .put_kvs,
+            .delete_kvs,
+            .trim_streams,
+            .automq_register_node,
+            .automq_get_nodes,
+            .automq_zone_router,
+            .automq_get_partition_snapshot,
+            .update_license,
+            .describe_license,
+            .export_cluster_manifest,
+            .get_next_node_id,
+            .describe_streams,
+            .automq_update_group,
+            => true,
+            else => false,
+        };
     }
 
     /// Whether this API key is a KRaft/Raft protocol API.
@@ -240,6 +300,11 @@ test "ApiKey from raw value" {
 
     const raft_key: ApiKey = @enumFromInt(52);
     try testing.expectEqual(ApiKey.vote, raft_key);
+
+    try testing.expectEqual(ApiKey.get_telemetry_subscriptions, @as(ApiKey, @enumFromInt(71)));
+    try testing.expectEqual(ApiKey.add_raft_voter, @as(ApiKey, @enumFromInt(80)));
+    try testing.expectEqual(ApiKey.create_streams, @as(ApiKey, @enumFromInt(501)));
+    try testing.expectEqual(ApiKey.get_next_node_id, @as(ApiKey, @enumFromInt(600)));
 }
 
 test "ApiKey isAutomqExtension" {
