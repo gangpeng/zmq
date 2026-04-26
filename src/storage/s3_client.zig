@@ -231,15 +231,32 @@ pub const S3Client = struct {
         return result;
     }
 
-    /// List objects in the bucket with optional prefix. Returns XML response body.
+    /// List one ListObjectsV2 page in the bucket with optional prefix.
     pub fn listObjects(self: *S3Client, prefix: ?[]const u8) ![]u8 {
+        return try self.listObjectsPage(prefix, null);
+    }
+
+    /// List one ListObjectsV2 page in the bucket with optional prefix and continuation token.
+    pub fn listObjectsPage(self: *S3Client, prefix: ?[]const u8, continuation_token: ?[]const u8) ![]u8 {
         var encoded_prefix: ?[]u8 = null;
         defer if (encoded_prefix) |p| self.allocator.free(p);
+        var encoded_token: ?[]u8 = null;
+        defer if (encoded_token) |t| self.allocator.free(t);
 
-        const query = if (prefix) |p| blk: {
-            encoded_prefix = try self.uriEncode(p);
-            break :blk try std.fmt.allocPrint(self.allocator, "list-type=2&prefix={s}", .{encoded_prefix.?});
-        } else try self.allocator.dupe(u8, "list-type=2");
+        const query = blk: {
+            if (prefix) |p| encoded_prefix = try self.uriEncode(p);
+            if (continuation_token) |token| encoded_token = try self.uriEncode(token);
+
+            if (encoded_prefix != null and encoded_token != null) {
+                break :blk try std.fmt.allocPrint(self.allocator, "list-type=2&prefix={s}&continuation-token={s}", .{ encoded_prefix.?, encoded_token.? });
+            } else if (encoded_prefix != null) {
+                break :blk try std.fmt.allocPrint(self.allocator, "list-type=2&prefix={s}", .{encoded_prefix.?});
+            } else if (encoded_token != null) {
+                break :blk try std.fmt.allocPrint(self.allocator, "list-type=2&continuation-token={s}", .{encoded_token.?});
+            } else {
+                break :blk try self.allocator.dupe(u8, "list-type=2");
+            }
+        };
         defer self.allocator.free(query);
 
         const path = try std.fmt.allocPrint(self.allocator, "/{s}", .{self.bucket});
@@ -894,9 +911,39 @@ pub const S3Storage = struct {
 
     pub fn listObjectKeys(self: *S3Storage, prefix: []const u8) ![][]u8 {
         if (self.client) |c| {
-            const xml = try c.listObjects(prefix);
-            defer self.allocator.free(xml);
-            return try parseListObjectKeys(self.allocator, xml);
+            var all_keys = std.array_list.Managed([]u8).init(self.allocator);
+            errdefer {
+                for (all_keys.items) |key| self.allocator.free(key);
+                all_keys.deinit();
+            }
+
+            var continuation_token: ?[]u8 = null;
+            defer if (continuation_token) |token| self.allocator.free(token);
+
+            while (true) {
+                const xml = try c.listObjectsPage(prefix, continuation_token);
+                defer self.allocator.free(xml);
+
+                var page = try parseListObjectPage(self.allocator, xml);
+                defer page.deinit(self.allocator);
+
+                try all_keys.appendSlice(page.keys);
+                self.allocator.free(page.keys);
+                page.keys = &.{};
+
+                const next_token = page.next_continuation_token orelse break;
+                page.next_continuation_token = null;
+                if (continuation_token) |old| self.allocator.free(old);
+                continuation_token = next_token;
+            }
+
+            std.mem.sort([]u8, all_keys.items, {}, struct {
+                fn lessThan(_: void, a: []u8, b: []u8) bool {
+                    return std.mem.lessThan(u8, a, b);
+                }
+            }.lessThan);
+
+            return try all_keys.toOwnedSlice();
         } else if (self.mock) |m| {
             return try m.listObjectKeys(self.allocator, prefix);
         }
@@ -912,7 +959,34 @@ pub const S3Storage = struct {
     }
 };
 
+const ListObjectPage = struct {
+    keys: [][]u8,
+    next_continuation_token: ?[]u8,
+
+    fn deinit(self: *ListObjectPage, alloc: Allocator) void {
+        for (self.keys) |key| alloc.free(key);
+        if (self.keys.len > 0) alloc.free(self.keys);
+        if (self.next_continuation_token) |token| alloc.free(token);
+        self.* = .{ .keys = &.{}, .next_continuation_token = null };
+    }
+};
+
 fn parseListObjectKeys(alloc: Allocator, xml: []const u8) ![][]u8 {
+    const page = try parseListObjectPage(alloc, xml);
+    defer {
+        if (page.next_continuation_token) |token| alloc.free(token);
+    }
+
+    std.mem.sort([]u8, page.keys, {}, struct {
+        fn lessThan(_: void, a: []u8, b: []u8) bool {
+            return std.mem.lessThan(u8, a, b);
+        }
+    }.lessThan);
+
+    return page.keys;
+}
+
+fn parseListObjectPage(alloc: Allocator, xml: []const u8) !ListObjectPage {
     var keys = std.array_list.Managed([]u8).init(alloc);
     errdefer {
         for (keys.items) |key| alloc.free(key);
@@ -930,13 +1004,23 @@ fn parseListObjectKeys(alloc: Allocator, xml: []const u8) ![][]u8 {
         pos = key_end + "</Key>".len;
     }
 
-    std.mem.sort([]u8, keys.items, {}, struct {
-        fn lessThan(_: void, a: []u8, b: []u8) bool {
-            return std.mem.lessThan(u8, a, b);
-        }
-    }.lessThan);
+    const next_token = try parseXmlTagValue(alloc, xml, "NextContinuationToken");
 
-    return try keys.toOwnedSlice();
+    return .{
+        .keys = try keys.toOwnedSlice(),
+        .next_continuation_token = next_token,
+    };
+}
+
+fn parseXmlTagValue(alloc: Allocator, xml: []const u8, comptime tag: []const u8) !?[]u8 {
+    const open_tag = "<" ++ tag ++ ">";
+    const close_tag = "</" ++ tag ++ ">";
+    const start = std.mem.indexOf(u8, xml, open_tag) orelse return null;
+    const value_start = start + open_tag.len;
+    const end_rel = std.mem.indexOf(u8, xml[value_start..], close_tag) orelse return null;
+    const value = xml[value_start .. value_start + end_rel];
+    if (value.len == 0) return null;
+    return try alloc.dupe(u8, value);
 }
 
 // ---------------------------------------------------------------
@@ -1041,6 +1125,23 @@ test "S3Storage parses ListObjects keys" {
     try testing.expectEqual(@as(usize, 2), keys.len);
     try testing.expectEqualStrings("wal/epoch-0/bulk/0000000001", keys[0]);
     try testing.expectEqualStrings("wal/epoch-0/bulk/0000000002", keys[1]);
+}
+
+test "S3Storage parses ListObjects continuation token" {
+    const xml =
+        \\<ListBucketResult>
+        \\  <IsTruncated>true</IsTruncated>
+        \\  <Contents><Key>wal/epoch-0/bulk/0000000001</Key></Contents>
+        \\  <NextContinuationToken>opaque-token-1</NextContinuationToken>
+        \\</ListBucketResult>
+    ;
+
+    var page = try parseListObjectPage(testing.allocator, xml);
+    defer page.deinit(testing.allocator);
+
+    try testing.expectEqual(@as(usize, 1), page.keys.len);
+    try testing.expectEqualStrings("wal/epoch-0/bulk/0000000001", page.keys[0]);
+    try testing.expectEqualStrings("opaque-token-1", page.next_continuation_token.?);
 }
 
 test "S3Client getObject retry structure" {
