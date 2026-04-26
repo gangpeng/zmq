@@ -1484,8 +1484,8 @@ pub const Broker = struct {
             42 => self.handleDeleteGroups(request_bytes, pos, &req_header, api_version, resp_header_version),
             43 => self.handleElectLeaders(request_bytes, pos, &req_header, api_version, resp_header_version),
             44 => self.handleIncrementalAlterConfigs(request_bytes, pos, &req_header, api_version, resp_header_version),
-            45 => self.handleAlterPartitionReassignments(request_bytes, pos, &req_header, resp_header_version),
-            46 => self.handleListPartitionReassignments(request_bytes, pos, &req_header, resp_header_version),
+            45 => self.handleAlterPartitionReassignments(request_bytes, pos, &req_header, api_version, resp_header_version),
+            46 => self.handleListPartitionReassignments(request_bytes, pos, &req_header, api_version, resp_header_version),
             // OffsetDelete (key 47) — delete committed offsets
             47 => self.handleOffsetDelete(request_bytes, pos, &req_header, api_version, resp_header_version),
             60 => self.handleDescribeCluster(&req_header, resp_header_version),
@@ -5716,66 +5716,183 @@ pub const Broker = struct {
     // ---------------------------------------------------------------
     // AlterPartitionReassignments (key 45) — flexible versions only
     // ---------------------------------------------------------------
-    fn handleAlterPartitionReassignments(self: *Broker, request_bytes: []const u8, body_start: usize, req_header: *const RequestHeader, resp_header_version: i16) ?[]u8 {
+    fn handleAlterPartitionReassignments(self: *Broker, request_bytes: []const u8, body_start: usize, req_header: *const RequestHeader, api_version: i16, resp_header_version: i16) ?[]u8 {
+        const Req = generated.alter_partition_reassignments_request.AlterPartitionReassignmentsRequest;
+        const Resp = generated.alter_partition_reassignments_response.AlterPartitionReassignmentsResponse;
+        const TopicResponse = Resp.ReassignableTopicResponse;
+        const PartitionResponse = TopicResponse.ReassignablePartitionResponse;
+
         var pos = body_start;
-        _ = ser.readI32(request_bytes, &pos); // timeout_ms
+        if (!validateAlterPartitionReassignmentsRequestFrame(request_bytes, body_start)) {
+            log.warn("Malformed AlterPartitionReassignments request", .{});
+            return null;
+        }
+        var req = Req.deserialize(self.allocator, request_bytes, &pos, api_version) catch |err| {
+            log.warn("Failed to decode AlterPartitionReassignments request: {}", .{err});
+            return null;
+        };
+        defer self.freeAlterPartitionReassignmentsRequest(&req);
 
-        // Parse topics array (compact)
-        const num_topics = (ser.readCompactArrayLen(request_bytes, &pos) catch 0) orelse 0;
-
-        var buf = self.allocator.alloc(u8, 2048) catch return null;
-        var wpos: usize = 0;
-        const rh = ResponseHeader{ .correlation_id = req_header.correlation_id };
-        rh.serialize(buf, &wpos, resp_header_version);
-        ser.writeI32(buf, &wpos, 0); // throttle_time_ms
-        ser.writeI16(buf, &wpos, 0); // error_code
-        ser.writeCompactString(buf, &wpos, null); // error_message
-
-        // Return per-topic responses (single-node: reassignment is no-op)
-        ser.writeCompactArrayLen(buf, &wpos, num_topics);
-        for (0..num_topics) |_| {
-            const topic_name = (ser.readCompactString(request_bytes, &pos) catch break) orelse "";
-            const num_parts = (ser.readCompactArrayLen(request_bytes, &pos) catch 0) orelse 0;
-
-            ser.writeCompactString(buf, &wpos, topic_name);
-            ser.writeCompactArrayLen(buf, &wpos, num_parts);
-            for (0..num_parts) |_| {
-                const part_idx = ser.readI32(request_bytes, &pos);
-                // Skip replicas array
-                const n_replicas = (ser.readCompactArrayLen(request_bytes, &pos) catch 0) orelse 0;
-                pos += n_replicas * 4;
-                ser.skipTaggedFields(request_bytes, &pos) catch {};
-
-                ser.writeI32(buf, &wpos, part_idx);
-                ser.writeI16(buf, &wpos, 85); // NO_REASSIGNMENT_IN_PROGRESS (single-node)
-                ser.writeCompactString(buf, &wpos, null);
-                ser.writeEmptyTaggedFields(buf, &wpos);
-            }
-            ser.writeEmptyTaggedFields(buf, &wpos);
+        const responses = self.allocator.alloc(TopicResponse, req.topics.len) catch return null;
+        var response_init: usize = 0;
+        defer {
+            self.freeAlterPartitionReassignmentsResponses(responses[0..response_init]);
+            if (responses.len > 0) self.allocator.free(responses);
         }
 
-        ser.writeEmptyTaggedFields(buf, &wpos);
+        for (req.topics) |topic_req| {
+            const topic_name = topic_req.name orelse "";
+            const topic_info = self.topics.get(topic_name);
+            const partitions = self.allocator.alloc(PartitionResponse, topic_req.partitions.len) catch return null;
+            var transferred = false;
+            defer {
+                if (!transferred and partitions.len > 0) self.allocator.free(partitions);
+            }
+
+            for (topic_req.partitions, 0..) |partition_req, i| {
+                partitions[i] = .{
+                    .partition_index = partition_req.partition_index,
+                    .error_code = self.alterPartitionReassignmentError(topic_info, partition_req),
+                    .error_message = null,
+                };
+            }
+
+            responses[response_init] = .{
+                .name = topic_req.name,
+                .partitions = partitions,
+            };
+            response_init += 1;
+            transferred = true;
+        }
+
+        const resp_body = Resp{
+            .throttle_time_ms = 0,
+            .error_code = @intFromEnum(ErrorCode.none),
+            .error_message = null,
+            .responses = responses[0..response_init],
+        };
+        const rh = ResponseHeader{ .correlation_id = req_header.correlation_id };
+        const needed = rh.calcSize(resp_header_version) + resp_body.calcSize(api_version);
+        var buf = self.allocator.alloc(u8, needed) catch return null;
+        var wpos: usize = 0;
+        rh.serialize(buf, &wpos, resp_header_version);
+        resp_body.serialize(buf, &wpos, api_version);
         return (self.allocator.realloc(buf, wpos) catch buf)[0..wpos];
+    }
+
+    fn freeAlterPartitionReassignmentsRequest(self: *Broker, req: *generated.alter_partition_reassignments_request.AlterPartitionReassignmentsRequest) void {
+        for (req.topics) |topic| {
+            for (topic.partitions) |partition| {
+                if (partition.replicas.len > 0) self.allocator.free(partition.replicas);
+            }
+            if (topic.partitions.len > 0) self.allocator.free(topic.partitions);
+        }
+        if (req.topics.len > 0) self.allocator.free(req.topics);
+    }
+
+    fn freeAlterPartitionReassignmentsResponses(self: *Broker, responses: []const generated.alter_partition_reassignments_response.AlterPartitionReassignmentsResponse.ReassignableTopicResponse) void {
+        for (responses) |response| {
+            if (response.partitions.len > 0) self.allocator.free(response.partitions);
+        }
+    }
+
+    fn alterPartitionReassignmentError(self: *Broker, topic_info: ?TopicInfo, partition_req: generated.alter_partition_reassignments_request.AlterPartitionReassignmentsRequest.ReassignableTopic.ReassignablePartition) i16 {
+        const info = topic_info orelse return @intFromEnum(ErrorCode.unknown_topic_or_partition);
+        if (partition_req.partition_index < 0 or partition_req.partition_index >= info.num_partitions) {
+            return @intFromEnum(ErrorCode.unknown_topic_or_partition);
+        }
+        if (partition_req.replicas.len == 0) {
+            return @intFromEnum(ErrorCode.no_reassignment_in_progress);
+        }
+        if (partition_req.replicas.len == 1 and partition_req.replicas[0] == self.node_id) {
+            return @intFromEnum(ErrorCode.none);
+        }
+        return @intFromEnum(ErrorCode.invalid_replica_assignment);
     }
 
     // ---------------------------------------------------------------
     // ListPartitionReassignments (key 46) — flexible versions only
     // ---------------------------------------------------------------
-    fn handleListPartitionReassignments(self: *Broker, request_bytes: []const u8, body_start: usize, req_header: *const RequestHeader, resp_header_version: i16) ?[]u8 {
-        _ = request_bytes;
-        _ = body_start;
+    fn handleListPartitionReassignments(self: *Broker, request_bytes: []const u8, body_start: usize, req_header: *const RequestHeader, api_version: i16, resp_header_version: i16) ?[]u8 {
+        const Req = generated.list_partition_reassignments_request.ListPartitionReassignmentsRequest;
+        const Resp = generated.list_partition_reassignments_response.ListPartitionReassignmentsResponse;
+
+        var pos = body_start;
+        if (!validateListPartitionReassignmentsRequestFrame(request_bytes, body_start)) {
+            log.warn("Malformed ListPartitionReassignments request", .{});
+            return null;
+        }
+        var req = Req.deserialize(self.allocator, request_bytes, &pos, api_version) catch |err| {
+            log.warn("Failed to decode ListPartitionReassignments request: {}", .{err});
+            return null;
+        };
+        defer self.freeListPartitionReassignmentsRequest(&req);
 
         // Single-node broker: no reassignments in progress
-        var buf = self.allocator.alloc(u8, 128) catch return null;
-        var wpos: usize = 0;
+        const resp_body = Resp{
+            .throttle_time_ms = 0,
+            .error_code = @intFromEnum(ErrorCode.none),
+            .error_message = null,
+            .topics = &.{},
+        };
         const rh = ResponseHeader{ .correlation_id = req_header.correlation_id };
+        const needed = rh.calcSize(resp_header_version) + resp_body.calcSize(api_version);
+        var buf = self.allocator.alloc(u8, needed) catch return null;
+        var wpos: usize = 0;
         rh.serialize(buf, &wpos, resp_header_version);
-        ser.writeI32(buf, &wpos, 0); // throttle_time_ms
-        ser.writeI16(buf, &wpos, 0); // error_code
-        ser.writeCompactString(buf, &wpos, null); // error_message
-        ser.writeCompactArrayLen(buf, &wpos, 0); // 0 topics with reassignments
-        ser.writeEmptyTaggedFields(buf, &wpos);
+        resp_body.serialize(buf, &wpos, api_version);
         return (self.allocator.realloc(buf, wpos) catch buf)[0..wpos];
+    }
+
+    fn freeListPartitionReassignmentsRequest(self: *Broker, req: *generated.list_partition_reassignments_request.ListPartitionReassignmentsRequest) void {
+        for (req.topics) |topic| {
+            if (topic.partition_indexes.len > 0) self.allocator.free(topic.partition_indexes);
+        }
+        if (req.topics.len > 0) self.allocator.free(req.topics);
+    }
+
+    fn validateAlterPartitionReassignmentsRequestFrame(buf: []const u8, start_pos: usize) bool {
+        var pos = start_pos;
+        if (!skipFixedBytes(buf, &pos, 4)) return false; // timeout_ms
+        const topic_count = (ser.readCompactArrayLen(buf, &pos) catch return false) orelse 0;
+        for (0..topic_count) |_| {
+            _ = ser.readCompactString(buf, &pos) catch return false;
+            const partition_count = (ser.readCompactArrayLen(buf, &pos) catch return false) orelse 0;
+            for (0..partition_count) |_| {
+                if (!skipFixedBytes(buf, &pos, 4)) return false; // partition_index
+                if (!skipCompactI32Array(buf, &pos)) return false; // replicas
+                ser.skipTaggedFields(buf, &pos) catch return false;
+            }
+            ser.skipTaggedFields(buf, &pos) catch return false;
+        }
+        ser.skipTaggedFields(buf, &pos) catch return false;
+        return true;
+    }
+
+    fn validateListPartitionReassignmentsRequestFrame(buf: []const u8, start_pos: usize) bool {
+        var pos = start_pos;
+        if (!skipFixedBytes(buf, &pos, 4)) return false; // timeout_ms
+        const topic_count = (ser.readCompactArrayLen(buf, &pos) catch return false) orelse 0;
+        for (0..topic_count) |_| {
+            _ = ser.readCompactString(buf, &pos) catch return false;
+            if (!skipCompactI32Array(buf, &pos)) return false; // partition_indexes
+            ser.skipTaggedFields(buf, &pos) catch return false;
+        }
+        ser.skipTaggedFields(buf, &pos) catch return false;
+        return true;
+    }
+
+    fn skipCompactI32Array(buf: []const u8, pos: *usize) bool {
+        const item_count = (ser.readCompactArrayLen(buf, pos) catch return false) orelse 0;
+        if (item_count > (buf.len - pos.*) / 4) return false;
+        pos.* += item_count * 4;
+        return true;
+    }
+
+    fn skipFixedBytes(buf: []const u8, pos: *usize, len: usize) bool {
+        if (pos.* > buf.len or len > buf.len - pos.*) return false;
+        pos.* += len;
+        return true;
     }
 
     // ---------------------------------------------------------------
@@ -7228,6 +7345,124 @@ test "Broker.handleRequest DescribeLogDirs rejects truncated request" {
     var buf: [128]u8 = undefined;
     const req_len = buildTestRequest(&buf, 35, 2, 3503, header_mod.requestHeaderVersion(35, 2));
     try testing.expect(broker.handleRequest(buf[0..req_len]) == null);
+}
+
+test "Broker.handleRequest AlterPartitionReassignments returns request-scoped single-node results" {
+    const Req = generated.alter_partition_reassignments_request.AlterPartitionReassignmentsRequest;
+    const Resp = generated.alter_partition_reassignments_response.AlterPartitionReassignmentsResponse;
+    const PartitionReq = Req.ReassignableTopic.ReassignablePartition;
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+    broker.default_num_partitions = 2;
+    try testing.expect(broker.ensureTopic("reassign-topic"));
+
+    const local_replicas = [_]i32{1};
+    const remote_replicas = [_]i32{2};
+    const partitions = [_]PartitionReq{
+        .{ .partition_index = 0, .replicas = &local_replicas },
+        .{ .partition_index = 1, .replicas = &remote_replicas },
+        .{ .partition_index = 2, .replicas = &local_replicas },
+        .{ .partition_index = 0, .replicas = &.{} },
+    };
+    const topics = [_]Req.ReassignableTopic{.{
+        .name = "reassign-topic",
+        .partitions = &partitions,
+    }};
+    const req = Req{
+        .timeout_ms = 1000,
+        .topics = &topics,
+    };
+
+    var buf: [1024]u8 = undefined;
+    var pos = buildTestRequest(&buf, 45, 0, 4500, header_mod.requestHeaderVersion(45, 0));
+    req.serialize(&buf, &pos, 0);
+
+    const response = broker.handleRequest(buf[0..pos]);
+    try testing.expect(response != null);
+    defer testing.allocator.free(response.?);
+
+    var rpos: usize = 0;
+    var response_header = try ResponseHeader.deserialize(testing.allocator, response.?, &rpos, header_mod.responseHeaderVersion(45, 0));
+    defer response_header.deinit(testing.allocator);
+    try testing.expectEqual(@as(i32, 4500), response_header.correlation_id);
+
+    const resp = try Resp.deserialize(testing.allocator, response.?, &rpos, 0);
+    defer {
+        for (resp.responses) |topic| {
+            if (topic.partitions.len > 0) testing.allocator.free(topic.partitions);
+        }
+        if (resp.responses.len > 0) testing.allocator.free(resp.responses);
+    }
+
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.none)), resp.error_code);
+    try testing.expectEqual(@as(usize, 1), resp.responses.len);
+    try testing.expectEqualStrings("reassign-topic", resp.responses[0].name.?);
+    try testing.expectEqual(@as(usize, 4), resp.responses[0].partitions.len);
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.none)), resp.responses[0].partitions[0].error_code);
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.invalid_replica_assignment)), resp.responses[0].partitions[1].error_code);
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.unknown_topic_or_partition)), resp.responses[0].partitions[2].error_code);
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.no_reassignment_in_progress)), resp.responses[0].partitions[3].error_code);
+}
+
+test "Broker.handleRequest ListPartitionReassignments decodes request and returns no ongoing reassignments" {
+    const Req = generated.list_partition_reassignments_request.ListPartitionReassignmentsRequest;
+    const Resp = generated.list_partition_reassignments_response.ListPartitionReassignmentsResponse;
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+
+    const partitions = [_]i32{ 0, 1 };
+    const topics = [_]Req.ListPartitionReassignmentsTopics{.{
+        .name = "reassign-topic",
+        .partition_indexes = &partitions,
+    }};
+    const req = Req{
+        .timeout_ms = 1000,
+        .topics = &topics,
+    };
+
+    var buf: [512]u8 = undefined;
+    var pos = buildTestRequest(&buf, 46, 0, 4600, header_mod.requestHeaderVersion(46, 0));
+    req.serialize(&buf, &pos, 0);
+
+    const response = broker.handleRequest(buf[0..pos]);
+    try testing.expect(response != null);
+    defer testing.allocator.free(response.?);
+
+    var rpos: usize = 0;
+    var response_header = try ResponseHeader.deserialize(testing.allocator, response.?, &rpos, header_mod.responseHeaderVersion(46, 0));
+    defer response_header.deinit(testing.allocator);
+    try testing.expectEqual(@as(i32, 4600), response_header.correlation_id);
+
+    const resp = try Resp.deserialize(testing.allocator, response.?, &rpos, 0);
+    defer {
+        for (resp.topics) |topic| {
+            for (topic.partitions) |partition| {
+                if (partition.replicas.len > 0) testing.allocator.free(partition.replicas);
+                if (partition.adding_replicas.len > 0) testing.allocator.free(partition.adding_replicas);
+                if (partition.removing_replicas.len > 0) testing.allocator.free(partition.removing_replicas);
+            }
+            if (topic.partitions.len > 0) testing.allocator.free(topic.partitions);
+        }
+        if (resp.topics.len > 0) testing.allocator.free(resp.topics);
+    }
+
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.none)), resp.error_code);
+    try testing.expectEqual(@as(usize, 0), resp.topics.len);
+}
+
+test "Broker.handleRequest partition reassignment APIs reject truncated requests" {
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+
+    var alter_buf: [128]u8 = undefined;
+    const alter_len = buildTestRequest(&alter_buf, 45, 0, 4501, header_mod.requestHeaderVersion(45, 0));
+    try testing.expect(broker.handleRequest(alter_buf[0..alter_len]) == null);
+
+    var list_buf: [128]u8 = undefined;
+    const list_len = buildTestRequest(&list_buf, 46, 0, 4601, header_mod.requestHeaderVersion(46, 0));
+    try testing.expect(broker.handleRequest(list_buf[0..list_len]) == null);
 }
 
 test "Broker.handleRequest ElectLeaders returns requested partition results" {
