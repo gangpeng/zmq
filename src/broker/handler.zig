@@ -5940,6 +5940,32 @@ pub const Broker = struct {
         return true;
     }
 
+    fn validateVoteRequestFrame(buf: []const u8, start_pos: usize, api_version: i16) bool {
+        var pos = start_pos;
+
+        if (!skipKafkaString(buf, &pos, true)) return false; // cluster_id
+        if (api_version >= 1 and !skipFixedBytes(buf, &pos, 4)) return false; // voter_id
+        if (!skipVoteTopics(buf, &pos, api_version)) return false;
+        ser.skipTaggedFields(buf, &pos) catch return false;
+        return true;
+    }
+
+    fn skipVoteTopics(buf: []const u8, pos: *usize, api_version: i16) bool {
+        const topic_count = readKafkaArrayCount(buf, pos, true) orelse return false;
+        for (0..topic_count) |_| {
+            if (!skipKafkaString(buf, pos, true)) return false; // topic_name
+            const partition_count = readKafkaArrayCount(buf, pos, true) orelse return false;
+            for (0..partition_count) |_| {
+                if (!skipFixedBytes(buf, pos, 12)) return false; // partition_index + candidate_epoch + candidate_id
+                if (api_version >= 1 and !skipFixedBytes(buf, pos, 32)) return false; // candidate + voter directory IDs
+                if (!skipFixedBytes(buf, pos, 12)) return false; // last_offset_epoch + last_offset
+                ser.skipTaggedFields(buf, pos) catch return false;
+            }
+            ser.skipTaggedFields(buf, pos) catch return false;
+        }
+        return true;
+    }
+
     fn skipBeginQuorumTopics(buf: []const u8, pos: *usize, flexible: bool) bool {
         const topic_count = readKafkaArrayCount(buf, pos, flexible) orelse return false;
         for (0..topic_count) |_| {
@@ -6049,53 +6075,87 @@ pub const Broker = struct {
     // Vote (key 52) — KRaft consensus
     // ---------------------------------------------------------------
     fn handleVote(self: *Broker, request_bytes: []const u8, start_pos: usize, req_header: *const RequestHeader, api_version: i16, resp_header_version: i16) ?[]u8 {
-        _ = api_version;
-        const raft = self.raft_state orelse return self.handleNotController(req_header, resp_header_version);
+        const Req = generated.vote_request.VoteRequest;
+        const Resp = generated.vote_response.VoteResponse;
+        const TopicResult = Resp.TopicData;
+        const PartitionResult = TopicResult.PartitionData;
+
+        if (!validateVoteRequestFrame(request_bytes, start_pos, api_version)) {
+            log.warn("Malformed Vote request", .{});
+            return null;
+        }
+
         var pos = start_pos;
+        var req = Req.deserialize(self.allocator, request_bytes, &pos, api_version) catch |err| {
+            log.warn("Failed to decode Vote request: {}", .{err});
+            return null;
+        };
+        defer self.freeVoteRequest(&req);
 
-        // Vote (API 52) is always flexible — use compact serialization
-        // Body: cluster_id (compact string), voter_id (int32), candidate_epoch (int32),
-        // candidate_id (int32), last_epoch_end_offset (int64), last_epoch (int32)
-        const cluster_id = ser.readCompactString(request_bytes, &pos) catch null;
-        _ = cluster_id;
+        const raft = self.raft_state;
+        var topics = std.array_list.Managed(TopicResult).init(self.allocator);
+        defer {
+            self.freeVoteResponseTopics(topics.items);
+            topics.deinit();
+        }
 
-        // Read candidate fields directly (no topics array in Vote v0)
-        const candidate_id = ser.readI32(request_bytes, &pos);
-        const candidate_epoch = ser.readI32(request_bytes, &pos);
-        _ = ser.readI32(request_bytes, &pos); // duplicate candidate_id in wire format
-        const last_epoch_end_offset = ser.readI64(request_bytes, &pos);
-        const last_epoch = ser.readI32(request_bytes, &pos);
+        const top_error: i16 = if (raft == null) @intFromEnum(ErrorCode.not_controller) else @intFromEnum(ErrorCode.none);
+        if (raft) |rs| {
+            for (req.topics) |topic| {
+                const partitions = self.allocator.alloc(PartitionResult, topic.partitions.len) catch return null;
+                errdefer self.allocator.free(partitions);
 
-        // Process vote request through Raft state machine
-        const vote_result = raft.handleVoteRequest(
-            candidate_id,
-            candidate_epoch,
-            @intCast(last_epoch_end_offset),
-            last_epoch,
-        );
+                for (topic.partitions, 0..) |partition, idx| {
+                    const last_offset: u64 = if (partition.last_offset < 0) 0 else @intCast(partition.last_offset);
+                    const vote_result = rs.handleVoteRequest(
+                        partition.candidate_id,
+                        partition.candidate_epoch,
+                        last_offset,
+                        partition.last_offset_epoch,
+                    );
+                    partitions[idx] = .{
+                        .partition_index = partition.partition_index,
+                        .error_code = if (vote_result.vote_granted) @intFromEnum(ErrorCode.none) else @intFromEnum(ErrorCode.invalid_record),
+                        .leader_id = rs.leader_id orelse -1,
+                        .leader_epoch = vote_result.epoch,
+                        .vote_granted = vote_result.vote_granted,
+                    };
 
-        log.info("Vote request from candidate {d} epoch={d}: granted={}", .{
-            candidate_id,
-            candidate_epoch,
-            vote_result.vote_granted,
-        });
+                    log.info("Vote request from candidate {d} epoch={d}: granted={}", .{
+                        partition.candidate_id,
+                        partition.candidate_epoch,
+                        vote_result.vote_granted,
+                    });
+                }
 
-        // Build Vote response
-        var buf = self.allocator.alloc(u8, 128) catch return null;
-        var wpos: usize = 0;
-        const rh = ResponseHeader{ .correlation_id = req_header.correlation_id };
-        rh.serialize(buf, &wpos, resp_header_version);
+                topics.append(.{
+                    .topic_name = topic.topic_name,
+                    .partitions = partitions,
+                }) catch {
+                    self.allocator.free(partitions);
+                    return null;
+                };
+            }
+        }
 
-        // Vote response body (flexible):
-        ser.writeI16(buf, &wpos, if (vote_result.vote_granted) @as(i16, 0) else @as(i16, 87)); // NONE or INVALID_RECORD
-        // leader_epoch
-        ser.writeI32(buf, &wpos, vote_result.epoch);
-        // Vote granted
-        ser.writeBool(buf, &wpos, vote_result.vote_granted);
-        // Tagged fields
-        ser.writeEmptyTaggedFields(buf, &wpos);
+        const resp = Resp{
+            .error_code = top_error,
+            .topics = topics.items,
+        };
+        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+    }
 
-        return (self.allocator.realloc(buf, wpos) catch buf)[0..wpos];
+    fn freeVoteRequest(self: *Broker, req: *generated.vote_request.VoteRequest) void {
+        for (req.topics) |topic| {
+            if (topic.partitions.len > 0) self.allocator.free(topic.partitions);
+        }
+        if (req.topics.len > 0) self.allocator.free(req.topics);
+    }
+
+    fn freeVoteResponseTopics(self: *Broker, topics: []const generated.vote_response.VoteResponse.TopicData) void {
+        for (topics) |topic| {
+            if (topic.partitions.len > 0) self.allocator.free(topic.partitions);
+        }
     }
 
     // ---------------------------------------------------------------
@@ -8011,6 +8071,103 @@ test "Broker.handleRequest DescribeQuorum rejects truncated request" {
     var buf: [128]u8 = undefined;
     const req_len = buildTestRequest(&buf, 55, 2, 5504, header_mod.requestHeaderVersion(55, 2));
     try testing.expect(broker.handleRequest(buf[0..req_len]) == null);
+}
+
+test "Broker.handleRequest Vote returns request-scoped generated response" {
+    const Req = generated.vote_request.VoteRequest;
+    const Resp = generated.vote_response.VoteResponse;
+
+    var raft = RaftState.init(testing.allocator, 5, "vote-cluster");
+    defer raft.deinit();
+
+    var broker = Broker.init(testing.allocator, 5, 19094);
+    defer broker.deinit();
+    broker.raft_state = &raft;
+
+    const partitions = [_]Req.TopicData.PartitionData{.{
+        .partition_index = 0,
+        .candidate_epoch = 1,
+        .candidate_id = 7,
+        .last_offset_epoch = 0,
+        .last_offset = 0,
+    }};
+    const topics = [_]Req.TopicData{.{
+        .topic_name = "__cluster_metadata",
+        .partitions = &partitions,
+    }};
+    const req = Req{ .topics = &topics };
+
+    var buf: [1024]u8 = undefined;
+    var pos = buildTestRequest(&buf, 52, 0, 5200, header_mod.requestHeaderVersion(52, 0));
+    req.serialize(&buf, &pos, 0);
+
+    const response = broker.handleRequest(buf[0..pos]);
+    try testing.expect(response != null);
+    defer testing.allocator.free(response.?);
+
+    var rpos: usize = 0;
+    var response_header = try ResponseHeader.deserialize(testing.allocator, response.?, &rpos, header_mod.responseHeaderVersion(52, 0));
+    defer response_header.deinit(testing.allocator);
+    try testing.expectEqual(@as(i32, 5200), response_header.correlation_id);
+
+    const resp = try Resp.deserialize(testing.allocator, response.?, &rpos, 0);
+    defer {
+        for (resp.topics) |topic| {
+            if (topic.partitions.len > 0) testing.allocator.free(topic.partitions);
+        }
+        if (resp.topics.len > 0) testing.allocator.free(resp.topics);
+    }
+
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.none)), resp.error_code);
+    try testing.expectEqual(@as(usize, 1), resp.topics.len);
+    try testing.expectEqualStrings("__cluster_metadata", resp.topics[0].topic_name.?);
+    try testing.expectEqual(@as(usize, 1), resp.topics[0].partitions.len);
+    try testing.expectEqual(@as(i32, 0), resp.topics[0].partitions[0].partition_index);
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.none)), resp.topics[0].partitions[0].error_code);
+    try testing.expectEqual(@as(i32, 1), resp.topics[0].partitions[0].leader_epoch);
+    try testing.expect(resp.topics[0].partitions[0].vote_granted);
+}
+
+test "Broker.handleRequest Vote returns generated not-controller responses" {
+    const Req = generated.vote_request.VoteRequest;
+    const Resp = generated.vote_response.VoteResponse;
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+
+    const versions = [_]i16{ 0, 1 };
+    for (versions, 0..) |version, index| {
+        const req = Req{};
+        var buf: [512]u8 = undefined;
+        var pos = buildTestRequest(&buf, 52, version, 5210 + @as(i32, @intCast(index)), header_mod.requestHeaderVersion(52, version));
+        req.serialize(&buf, &pos, version);
+
+        const response = broker.handleRequest(buf[0..pos]);
+        try testing.expect(response != null);
+        defer testing.allocator.free(response.?);
+
+        var rpos: usize = 0;
+        var response_header = try ResponseHeader.deserialize(testing.allocator, response.?, &rpos, header_mod.responseHeaderVersion(52, version));
+        defer response_header.deinit(testing.allocator);
+        try testing.expectEqual(5210 + @as(i32, @intCast(index)), response_header.correlation_id);
+
+        const resp = try Resp.deserialize(testing.allocator, response.?, &rpos, version);
+        defer if (resp.topics.len > 0) testing.allocator.free(resp.topics);
+        try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.not_controller)), resp.error_code);
+        try testing.expectEqual(@as(usize, 0), resp.topics.len);
+    }
+}
+
+test "Broker.handleRequest Vote rejects truncated requests" {
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+
+    const versions = [_]i16{ 0, 1 };
+    for (versions, 0..) |version, index| {
+        var buf: [128]u8 = undefined;
+        const req_len = buildTestRequest(&buf, 52, version, 5220 + @as(i32, @intCast(index)), header_mod.requestHeaderVersion(52, version));
+        try testing.expect(broker.handleRequest(buf[0..req_len]) == null);
+    }
 }
 
 test "Broker.handleRequest BeginQuorumEpoch returns generated not-controller responses" {
