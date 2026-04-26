@@ -396,11 +396,16 @@ pub const PartitionStore = struct {
             std.mem.writeInt(i64, data_owned[0..8], @intCast(base_offset), .big);
         }
 
-        // Write to WAL (filesystem only)
+        var fs_wal_durable = false;
+
+        // Write to WAL (filesystem only). A successful produce must not be
+        // acknowledged until the local durability barrier has completed.
         if (self.fs_wal) |*wal| {
             const wal_record = try self.encodeFilesystemWalRecord(topic, partition_id, base_offset, data_owned);
             defer self.allocator.free(wal_record);
             _ = try wal.append(wal_record);
+            try wal.sync();
+            fs_wal_durable = true;
         }
         // Also track in memory WAL (for totalRecords() in memory mode)
         if (self.memory_wal) |*mwal| {
@@ -487,11 +492,8 @@ pub const PartitionStore = struct {
             if (s3_wal_durable) {
                 state.high_watermark = state.next_offset;
             }
-        } else if (self.fs_wal) |*wal| {
-            // HW advances on fsync batch completion
-            if (state.next_offset % wal.fsync_interval == 0) {
-                state.high_watermark = state.next_offset;
-            }
+        } else if (self.fs_wal != null) {
+            if (fs_wal_durable) state.high_watermark = state.next_offset;
         } else {
             // For in-memory-only mode (no WAL at all),
             // HW advances immediately (acceptable — no durability claim)
@@ -1090,6 +1092,9 @@ test "PartitionStore filesystem mode" {
         try store.sync();
 
         try testing.expectEqual(@as(u64, 2), store.totalRecords());
+        const result = try store.fetch("fs-topic", 0, 0, 1024);
+        defer if (result.records.len > 0) testing.allocator.free(@constCast(result.records));
+        try testing.expectEqual(@as(i64, 2), result.high_watermark);
     }
 
     fs.deleteTreeAbsolute(tmp_dir) catch {};
