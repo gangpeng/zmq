@@ -128,8 +128,10 @@ Status: completed for the initial catalog and DeleteGroups slice.
   are skipped during rebuild so repeated recovery is idempotent; S3 WAL object
   upload now has bounded transient-failure retry; fetch returns
   KAFKA_STORAGE_ERROR for unreadable indexed S3 objects instead of silently
-  returning an empty success; multipart upload rejects missing or malformed part
-  ETags before completion. Remaining durability work is crash/fault recovery
+  returning an empty success; partition next offset/HW/LSO are repaired from
+  recovered S3 stream metadata when partition_state.meta is missing or stale;
+  multipart upload rejects missing or malformed part ETags before completion.
+  Remaining durability work is crash/fault recovery
   against quorum/controller metadata, deeper multipart fault injection, and
   provider compatibility coverage.
 

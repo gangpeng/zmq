@@ -285,6 +285,58 @@ pub const PartitionStore = struct {
         return ranges;
     }
 
+    /// Advance local partition visibility state from recovered ObjectManager
+    /// streams. This is used after restart when S3 WAL object metadata was
+    /// rebuilt but partition_state.meta is missing or stale.
+    pub fn repairPartitionStatesFromObjectManager(self: *PartitionStore) bool {
+        const om = self.object_manager orelse return false;
+
+        var repaired = false;
+        var it = self.partitions.iterator();
+        while (it.next()) |entry| {
+            const state = entry.value_ptr;
+            const stream_id = hashPartitionKey(state.topic, state.partition_id);
+            const stream = om.getStream(stream_id) orelse continue;
+
+            const before_next_offset = state.next_offset;
+            const before_log_start_offset = state.log_start_offset;
+            const before_high_watermark = state.high_watermark;
+            const before_last_stable_offset = state.last_stable_offset;
+            const before_first_unstable_txn_offset = state.first_unstable_txn_offset;
+
+            if (stream.end_offset > state.next_offset) {
+                state.next_offset = stream.end_offset;
+            }
+            if (stream.start_offset > state.log_start_offset) {
+                state.log_start_offset = @min(stream.start_offset, state.next_offset);
+            }
+
+            state.log_start_offset = @min(state.log_start_offset, state.next_offset);
+            state.high_watermark = @min(@max(state.high_watermark, state.log_start_offset), state.next_offset);
+            if (stream.end_offset > state.high_watermark) {
+                state.high_watermark = @min(stream.end_offset, state.next_offset);
+            }
+
+            if (state.first_unstable_txn_offset) |unstable| {
+                state.first_unstable_txn_offset = @min(@max(unstable, state.log_start_offset), state.next_offset);
+                state.last_stable_offset = @min(state.first_unstable_txn_offset.?, state.high_watermark);
+            } else {
+                state.last_stable_offset = state.high_watermark;
+            }
+
+            if (state.next_offset != before_next_offset or
+                state.log_start_offset != before_log_start_offset or
+                state.high_watermark != before_high_watermark or
+                state.last_stable_offset != before_last_stable_offset or
+                state.first_unstable_txn_offset != before_first_unstable_txn_offset)
+            {
+                repaired = true;
+            }
+        }
+
+        return repaired;
+    }
+
     /// Re-wire internal pointers after the struct has been moved/copied.
     /// Must be called after assigning a PartitionStore to a new location
     /// (e.g., heap allocation via `ptr.* = initWithConfig(...)`).
@@ -1297,12 +1349,13 @@ test "PartitionStore rebuilds S3 WAL metadata and fetches object data" {
     try testing.expectEqual(@as(usize, 1), object_manager.getStreamSetObjectCount());
 
     try store.ensurePartition("s3-recover-topic", 0);
+    try testing.expect(store.repairPartitionStatesFromObjectManager());
     var key_buf: [256]u8 = undefined;
     const key = PartitionStore.partitionKeyBuf(&key_buf, "s3-recover-topic", 0);
     const state = store.partitions.getPtr(key).?;
-    state.next_offset = 2;
-    state.high_watermark = 2;
-    state.last_stable_offset = 2;
+    try testing.expectEqual(@as(u64, 2), state.next_offset);
+    try testing.expectEqual(@as(u64, 2), state.high_watermark);
+    try testing.expectEqual(@as(u64, 2), state.last_stable_offset);
 
     const result = try store.fetch("s3-recover-topic", 0, 0, 1024);
     defer if (result.records.len > 0) testing.allocator.free(@constCast(result.records));

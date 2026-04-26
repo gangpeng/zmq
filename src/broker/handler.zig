@@ -636,6 +636,10 @@ pub const Broker = struct {
         if (saved_partition_states.len > 0) {
             log.info("Restored {d} partition state(s) from partition_state.meta", .{saved_partition_states.len});
         }
+        if (self.store.repairPartitionStatesFromObjectManager()) {
+            log.info("Repaired partition state from recovered ObjectManager streams", .{});
+            self.persistPartitionStates();
+        }
 
         // Load local AutoMQ controller-style metadata (KV namespace, node registry,
         // license, zone router state, and group promotions).
@@ -6699,6 +6703,61 @@ test "Broker rebuilds ObjectManager from S3 WAL objects when snapshot is missing
 
     try testing.expectEqual(@as(usize, 1), broker.object_manager.getStreamSetObjectCount());
     try testing.expectEqual(@as(u64, 2), broker.object_manager.getStream(stream_id).?.end_offset);
+}
+
+test "Broker repairs partition offsets from recovered S3 WAL objects" {
+    const fs = @import("fs_compat");
+    const tmp_dir = "/tmp/zmq-broker-s3-partition-repair-test";
+    fs.deleteTreeAbsolute(tmp_dir) catch {};
+    try fs.makeDirAbsolute(tmp_dir);
+    defer fs.deleteTreeAbsolute(tmp_dir) catch {};
+
+    var mock_s3 = storage.MockS3.init(testing.allocator);
+    defer mock_s3.deinit();
+    var s3_storage = storage.S3Storage.initMock(testing.allocator, &mock_s3);
+
+    const stream_id = PartitionStore.hashPartitionKey("broker-s3-repair-topic", 0);
+    {
+        var batcher = storage.wal.S3WalBatcher.init(testing.allocator);
+        defer batcher.deinit();
+        try batcher.append(stream_id, 0, "a");
+        try batcher.append(stream_id, 1, "b");
+        try testing.expect(batcher.flushNow(&s3_storage));
+    }
+
+    {
+        var broker = Broker.initWithConfig(testing.allocator, 1, 9092, .{ .data_dir = tmp_dir });
+        defer broker.deinit();
+        try broker.open();
+        try testing.expect(broker.ensureTopic("broker-s3-repair-topic"));
+    }
+
+    const objects_snapshot_path = try std.fmt.allocPrint(testing.allocator, "{s}/objects.snapshot", .{tmp_dir});
+    defer testing.allocator.free(objects_snapshot_path);
+    fs.deleteFileAbsolute(objects_snapshot_path) catch {};
+
+    const partition_state_path = try std.fmt.allocPrint(testing.allocator, "{s}/partition_state.meta", .{tmp_dir});
+    defer testing.allocator.free(partition_state_path);
+    fs.deleteFileAbsolute(partition_state_path) catch {};
+
+    {
+        var broker = Broker.initWithConfig(testing.allocator, 1, 9092, .{ .data_dir = tmp_dir });
+        defer broker.deinit();
+        broker.store.s3_storage = s3_storage;
+        try broker.open();
+
+        const pkey = try std.fmt.allocPrint(testing.allocator, "{s}-{d}", .{ "broker-s3-repair-topic", 0 });
+        defer testing.allocator.free(pkey);
+        const state = broker.store.partitions.get(pkey).?;
+        try testing.expectEqual(@as(u64, 2), state.next_offset);
+        try testing.expectEqual(@as(u64, 2), state.high_watermark);
+        try testing.expectEqual(@as(u64, 2), state.last_stable_offset);
+
+        const result = try broker.store.fetch("broker-s3-repair-topic", 0, 0, 1024);
+        defer if (result.records.len > 0) testing.allocator.free(@constCast(result.records));
+        try testing.expectEqual(@as(i16, 0), result.error_code);
+        try testing.expectEqualStrings("ab", result.records);
+    }
 }
 
 test "Broker.handleRequest InitProducerId (key=22, v0)" {
