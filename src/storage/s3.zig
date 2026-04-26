@@ -293,7 +293,7 @@ pub const ObjectReader = struct {
         const index_position = std.mem.readInt(u64, data[footer_start..][0..8], .big);
         const index_size = std.mem.readInt(u32, data[footer_start + 8 ..][0..4], .big);
 
-        const entries = try parseIndexEntries(alloc, data, index_position, index_size);
+        const entries = try parseIndexEntries(alloc, data, index_position, index_size, footer_start);
 
         return .{
             .data = data,
@@ -311,7 +311,7 @@ pub const ObjectReader = struct {
         const index_position = std.mem.readInt(u64, data[footer_start..][0..8], .big);
         const index_size = std.mem.readInt(u32, data[footer_start + 8 ..][0..4], .big);
 
-        const entries = try parseIndexEntries(alloc, data, index_position, index_size);
+        const entries = try parseIndexEntries(alloc, data, index_position, index_size, footer_start);
 
         return .{
             .data = data,
@@ -324,11 +324,18 @@ pub const ObjectReader = struct {
     }
 
     /// Shared index parsing logic for both v1 and v2.
-    fn parseIndexEntries(alloc: Allocator, data: []const u8, index_position: u64, index_size: u32) ![]ObjectWriter.DataBlockIndex {
+    fn parseIndexEntries(alloc: Allocator, data: []const u8, index_position: u64, index_size: u32, index_limit: usize) ![]ObjectWriter.DataBlockIndex {
+        if (index_size % INDEX_ENTRY_SIZE != 0) return error.InvalidIndexSize;
+        const index_start = std.math.cast(usize, index_position) orelse return error.InvalidIndexPosition;
+        if (index_start > index_limit) return error.InvalidIndexPosition;
+        const index_end = std.math.add(usize, index_start, index_size) catch return error.InvalidIndexBounds;
+        if (index_end > index_limit) return error.InvalidIndexBounds;
+
         const entry_count = index_size / INDEX_ENTRY_SIZE;
         var entries = try alloc.alloc(ObjectWriter.DataBlockIndex, entry_count);
+        errdefer alloc.free(entries);
 
-        var pos = @as(usize, @intCast(index_position));
+        var pos = index_start;
         for (0..entry_count) |i| {
             entries[i] = .{
                 .stream_id = std.mem.readInt(u64, data[pos..][0..8], .big),
@@ -338,6 +345,9 @@ pub const ObjectReader = struct {
                 .block_position = std.mem.readInt(u64, data[pos + 24 ..][0..8], .big),
                 .block_size = std.mem.readInt(u32, data[pos + 32 ..][0..4], .big),
             };
+            const block_start = std.math.cast(usize, entries[i].block_position) orelse return error.InvalidBlockPosition;
+            const block_end = std.math.add(usize, block_start, entries[i].block_size) catch return error.InvalidBlockBounds;
+            if (block_end > index_start) return error.InvalidBlockBounds;
             pos += INDEX_ENTRY_SIZE;
         }
 
@@ -727,6 +737,48 @@ test "ObjectReader backward compatibility with v1 format" {
     try testing.expect(!reader.has_checksum);
     try testing.expectEqual(@as(usize, 1), reader.index_entries.len);
     try testing.expectEqualStrings(block_data, reader.readBlock(0).?);
+}
+
+test "ObjectReader rejects malformed v1 index bounds" {
+    var bad_index_size: [ObjectWriter.FOOTER_SIZE_V1]u8 = undefined;
+    std.mem.writeInt(u64, bad_index_size[0..8], 0, .big);
+    std.mem.writeInt(u32, bad_index_size[8..12], 1, .big);
+    std.mem.writeInt(u32, bad_index_size[12..16], ObjectWriter.FOOTER_MAGIC_V1, .big);
+    try testing.expectError(error.InvalidIndexSize, ObjectReader.parse(testing.allocator, &bad_index_size));
+
+    var bad_index_position: [ObjectWriter.FOOTER_SIZE_V1]u8 = undefined;
+    std.mem.writeInt(u64, bad_index_position[0..8], 1, .big);
+    std.mem.writeInt(u32, bad_index_position[8..12], 0, .big);
+    std.mem.writeInt(u32, bad_index_position[12..16], ObjectWriter.FOOTER_MAGIC_V1, .big);
+    try testing.expectError(error.InvalidIndexPosition, ObjectReader.parse(testing.allocator, &bad_index_position));
+}
+
+test "ObjectReader rejects v1 block ranges outside data section" {
+    var data_buf = std.array_list.Managed(u8).init(testing.allocator);
+    defer data_buf.deinit();
+
+    try data_buf.appendSlice("data");
+    const index_position = data_buf.items.len;
+
+    var idx_buf: [ObjectWriter.INDEX_ENTRY_SIZE]u8 = undefined;
+    std.mem.writeInt(u64, idx_buf[0..8], 1, .big);
+    std.mem.writeInt(u64, idx_buf[8..16], 0, .big);
+    std.mem.writeInt(u32, idx_buf[16..20], 1, .big);
+    std.mem.writeInt(u32, idx_buf[20..24], 1, .big);
+    std.mem.writeInt(u64, idx_buf[24..32], 0, .big);
+    std.mem.writeInt(u32, idx_buf[32..36], 5, .big);
+    try data_buf.appendSlice(&idx_buf);
+
+    var footer: [ObjectWriter.FOOTER_SIZE_V1]u8 = undefined;
+    std.mem.writeInt(u64, footer[0..8], @intCast(index_position), .big);
+    std.mem.writeInt(u32, footer[8..12], ObjectWriter.INDEX_ENTRY_SIZE, .big);
+    std.mem.writeInt(u32, footer[12..16], ObjectWriter.FOOTER_MAGIC_V1, .big);
+    try data_buf.appendSlice(&footer);
+
+    const obj_data = try data_buf.toOwnedSlice();
+    defer testing.allocator.free(obj_data);
+
+    try testing.expectError(error.InvalidBlockBounds, ObjectReader.parse(testing.allocator, obj_data));
 }
 
 test "ObjectWriter empty build with CRC" {
