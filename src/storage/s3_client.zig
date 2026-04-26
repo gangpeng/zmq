@@ -454,6 +454,11 @@ pub const S3Client = struct {
                     log.warn("Part {d}/{d} upload returned no ETag", .{ part_number, num_parts });
                     continue;
                 };
+                if (!isValidMultipartEtag(etag_owned)) {
+                    log.warn("Part {d}/{d} upload returned invalid ETag '{s}'", .{ part_number, num_parts, etag_owned });
+                    self.allocator.free(etag_owned);
+                    continue;
+                }
                 try etags.append(.{ .part = part_number, .etag = etag_owned });
 
                 part_succeeded = true;
@@ -817,6 +822,12 @@ pub const S3Client = struct {
         return try self.allocator.dupe(u8, value);
     }
 
+    fn isValidMultipartEtag(etag: []const u8) bool {
+        if (etag.len == 0) return false;
+        if (std.mem.indexOfAny(u8, etag, "\r\n<>") != null) return false;
+        return true;
+    }
+
     fn isChunked(headers: []const u8) bool {
         const value = headerValue(headers, "Transfer-Encoding") orelse return false;
         var tokens = std.mem.splitScalar(u8, value, ',');
@@ -1066,6 +1077,26 @@ test "S3Client decodeChunked validates framing" {
     try testing.expectEqualStrings("hello world", decoded);
 
     try testing.expectError(error.InvalidChunkedEncoding, client.decodeChunked("5\r\nabc\r\n0\r\n\r\n"));
+}
+
+test "S3Client multipart ETag validation" {
+    try testing.expect(S3Client.isValidMultipartEtag("\"abc123\""));
+    try testing.expect(S3Client.isValidMultipartEtag("abc123-2"));
+    try testing.expect(!S3Client.isValidMultipartEtag(""));
+    try testing.expect(!S3Client.isValidMultipartEtag("abc\r\nx-bad: 1"));
+    try testing.expect(!S3Client.isValidMultipartEtag("<bad>"));
+}
+
+test "S3Client responseHeaderValueOwned trims ETag" {
+    var client = S3Client.init(testing.allocator, .{});
+    const response =
+        "HTTP/1.1 200 OK\r\n" ++
+        "ETag:   \"abc123\"   \r\n" ++
+        "\r\n";
+
+    const etag = (try client.responseHeaderValueOwned(response, "ETag")).?;
+    defer testing.allocator.free(etag);
+    try testing.expectEqualStrings("\"abc123\"", etag);
 }
 
 test "S3Storage mock mode" {
