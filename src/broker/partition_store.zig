@@ -58,6 +58,7 @@ pub const PartitionStore = struct {
     s3_wal_mode: bool = false,
 
     const FS_WAL_RECORD_MAGIC = [_]u8{ 'Z', 'M', 'Q', 'P', 'W', 'A', 'L', 1 };
+    const KAFKA_STORAGE_ERROR: i16 = 56;
 
     pub const PartitionState = struct {
         topic: []u8,
@@ -746,12 +747,16 @@ pub const PartitionStore = struct {
             if (s3_metas.len > 0) {
                 var result_list = std.array_list.Managed(u8).init(self.allocator);
                 defer result_list.deinit();
+                var s3_read_failed = false;
 
                 for (s3_metas) |meta| {
                     // Read each S3 object and extract relevant blocks
                     const obj_data = blk: {
                         if (self.s3_storage) |*s3| {
-                            break :blk s3.getObject(meta.s3_key) catch null;
+                            break :blk s3.getObject(meta.s3_key) catch |err| {
+                                log.warn("S3 fetch failed for {s}: {}", .{ meta.s3_key, err });
+                                break :blk null;
+                            };
                         } else if (self.mock_s3) |*ms3| {
                             if (ms3.getObject(meta.s3_key)) |d| {
                                 break :blk self.allocator.dupe(u8, d) catch null;
@@ -759,17 +764,30 @@ pub const PartitionStore = struct {
                         }
                         break :blk null;
                     };
-                    if (obj_data == null) continue;
+                    if (obj_data == null) {
+                        s3_read_failed = true;
+                        continue;
+                    }
                     defer self.allocator.free(obj_data.?);
 
-                    var reader = ObjectReader.parse(self.allocator, obj_data.?) catch continue;
+                    var reader = ObjectReader.parse(self.allocator, obj_data.?) catch |err| {
+                        log.warn("S3 object parse failed for {s}: {}", .{ meta.s3_key, err });
+                        s3_read_failed = true;
+                        continue;
+                    };
                     defer reader.deinit();
 
                     const entries = reader.findEntries(stream_id, start_offset, effective_end_offset);
+                    if (entries.len == 0) {
+                        s3_read_failed = true;
+                        continue;
+                    }
                     for (entries, 0..) |_, idx| {
                         if (reader.readBlock(idx)) |block| {
-                            result_list.appendSlice(block) catch {};
+                            try result_list.appendSlice(block);
                             if (max_bytes > 0 and result_list.items.len >= max_bytes) break;
+                        } else {
+                            s3_read_failed = true;
                         }
                     }
                     if (max_bytes > 0 and result_list.items.len >= max_bytes) break;
@@ -794,6 +812,10 @@ pub const PartitionStore = struct {
                         .last_stable_offset = @intCast(state.last_stable_offset),
                     };
                 }
+
+                if (s3_read_failed) {
+                    return storageErrorFetchResult(state);
+                }
             }
         }
 
@@ -808,7 +830,7 @@ pub const PartitionStore = struct {
                 // Parse S3 object and extract records for requested offset range
                 var reader = ObjectReader.parse(self.allocator, obj_data) catch {
                     self.allocator.free(obj_data);
-                    return .{ .error_code = 0, .records = &.{}, .high_watermark = @intCast(state.high_watermark), .last_stable_offset = @intCast(state.high_watermark) };
+                    return storageErrorFetchResult(state);
                 };
                 defer reader.deinit();
 
@@ -856,6 +878,15 @@ pub const PartitionStore = struct {
 
         return .{
             .error_code = 0,
+            .records = &.{},
+            .high_watermark = @intCast(state.high_watermark),
+            .last_stable_offset = @intCast(state.last_stable_offset),
+        };
+    }
+
+    fn storageErrorFetchResult(state: PartitionState) FetchResult {
+        return .{
+            .error_code = KAFKA_STORAGE_ERROR,
             .records = &.{},
             .high_watermark = @intCast(state.high_watermark),
             .last_stable_offset = @intCast(state.last_stable_offset),
@@ -1277,6 +1308,41 @@ test "PartitionStore rebuilds S3 WAL metadata and fetches object data" {
     defer if (result.records.len > 0) testing.allocator.free(@constCast(result.records));
     try testing.expectEqual(@as(i16, 0), result.error_code);
     try testing.expectEqualStrings("ab", result.records);
+}
+
+test "PartitionStore returns storage error for unreadable ObjectManager S3 object" {
+    var mock_s3 = MockS3.init(testing.allocator);
+    defer mock_s3.deinit();
+    var s3_storage = S3Storage.initMock(testing.allocator, &mock_s3);
+    try s3_storage.putObject("wal/bad-object", "not-an-object-writer-payload");
+
+    var object_manager = ObjectManager.init(testing.allocator, 1);
+    defer object_manager.deinit();
+
+    var store = PartitionStore.init(testing.allocator);
+    defer store.deinit();
+    store.s3_storage = s3_storage;
+    store.object_manager = &object_manager;
+    try store.ensurePartition("bad-s3-topic", 0);
+
+    const stream_id = PartitionStore.hashPartitionKey("bad-s3-topic", 0);
+    const ranges = [_]stream_mod.StreamOffsetRange{.{
+        .stream_id = stream_id,
+        .start_offset = 0,
+        .end_offset = 1,
+    }};
+    try object_manager.commitStreamSetObject(100, 1, 1, &ranges, "wal/bad-object", 28);
+
+    var key_buf: [256]u8 = undefined;
+    const key = PartitionStore.partitionKeyBuf(&key_buf, "bad-s3-topic", 0);
+    const state = store.partitions.getPtr(key).?;
+    state.next_offset = 1;
+    state.high_watermark = 1;
+    state.last_stable_offset = 1;
+
+    const result = try store.fetch("bad-s3-topic", 0, 0, 1024);
+    try testing.expectEqual(PartitionStore.KAFKA_STORAGE_ERROR, result.error_code);
+    try testing.expectEqual(@as(usize, 0), result.records.len);
 }
 
 test "PartitionStore produce offset increments correctly" {
