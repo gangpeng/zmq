@@ -57,6 +57,8 @@ pub const PartitionStore = struct {
     /// S3 WAL mode: when true, produce acks only after S3 write completes.
     s3_wal_mode: bool = false,
 
+    const FS_WAL_RECORD_MAGIC = [_]u8{ 'Z', 'M', 'Q', 'P', 'W', 'A', 'L', 1 };
+
     pub const PartitionState = struct {
         topic: []u8,
         partition_id: i32,
@@ -149,14 +151,15 @@ pub const PartitionStore = struct {
     pub fn open(self: *PartitionStore) !void {
         if (self.fs_wal) |*wal| {
             try wal.open();
-            // Replay WAL records into cache (fix #3)
-            _ = wal.recover(&struct {
-                fn cb(data: []const u8, _: u64) void {
-                    // During recovery, records are replayed into the WAL's internal state.
-                    // The partition store's cache is re-populated on the next produce/fetch
-                    // since we recover the WAL contents but the offset tracking is
-                    // restored from persisted metadata (via Broker.open).
-                    _ = data;
+            // Replay partition-aware WAL records into LogCache so locally
+            // acknowledged filesystem WAL data remains fetchable after restart.
+            _ = wal.recoverWithContext(self, struct {
+                fn cb(store: *PartitionStore, data: []const u8, _: u64) !void {
+                    const decoded = PartitionStore.decodeFilesystemWalRecord(data) orelse return;
+                    const stream_id = PartitionStore.hashPartitionKey(decoded.topic, decoded.partition_id);
+                    const owned = try store.allocator.dupe(u8, decoded.records);
+                    errdefer store.allocator.free(owned);
+                    try store.cache.putOwned(stream_id, decoded.base_offset, owned);
                 }
             }.cb) catch |err| {
                 log.warn("WAL recovery failed: {}", .{err});
@@ -253,6 +256,66 @@ pub const PartitionStore = struct {
         }
     }
 
+    const FilesystemWalRecord = struct {
+        topic: []const u8,
+        partition_id: i32,
+        base_offset: u64,
+        records: []const u8,
+    };
+
+    fn encodeFilesystemWalRecord(self: *PartitionStore, topic: []const u8, partition_id: i32, base_offset: u64, records: []const u8) ![]u8 {
+        if (topic.len > std.math.maxInt(u16)) return error.TopicNameTooLong;
+        if (records.len > std.math.maxInt(u32)) return error.RecordTooLarge;
+
+        const total_len = FS_WAL_RECORD_MAGIC.len + 2 + topic.len + 4 + 8 + 4 + records.len;
+        var buf = try self.allocator.alloc(u8, total_len);
+        errdefer self.allocator.free(buf);
+
+        var pos: usize = 0;
+        @memcpy(buf[pos .. pos + FS_WAL_RECORD_MAGIC.len], FS_WAL_RECORD_MAGIC[0..]);
+        pos += FS_WAL_RECORD_MAGIC.len;
+        std.mem.writeInt(u16, buf[pos..][0..2], @intCast(topic.len), .big);
+        pos += 2;
+        @memcpy(buf[pos .. pos + topic.len], topic);
+        pos += topic.len;
+        std.mem.writeInt(i32, buf[pos..][0..4], partition_id, .big);
+        pos += 4;
+        std.mem.writeInt(u64, buf[pos..][0..8], base_offset, .big);
+        pos += 8;
+        std.mem.writeInt(u32, buf[pos..][0..4], @intCast(records.len), .big);
+        pos += 4;
+        @memcpy(buf[pos .. pos + records.len], records);
+
+        return buf;
+    }
+
+    fn decodeFilesystemWalRecord(data: []const u8) ?FilesystemWalRecord {
+        if (data.len < FS_WAL_RECORD_MAGIC.len + 2 + 4 + 8 + 4) return null;
+        if (!std.mem.eql(u8, data[0..FS_WAL_RECORD_MAGIC.len], FS_WAL_RECORD_MAGIC[0..])) return null;
+
+        var pos: usize = FS_WAL_RECORD_MAGIC.len;
+        const topic_len = std.mem.readInt(u16, data[pos..][0..2], .big);
+        pos += 2;
+        if (pos + topic_len + 4 + 8 + 4 > data.len) return null;
+
+        const topic = data[pos .. pos + topic_len];
+        pos += topic_len;
+        const partition_id = std.mem.readInt(i32, data[pos..][0..4], .big);
+        pos += 4;
+        const base_offset = std.mem.readInt(u64, data[pos..][0..8], .big);
+        pos += 8;
+        const records_len = std.mem.readInt(u32, data[pos..][0..4], .big);
+        pos += 4;
+        if (pos + records_len != data.len) return null;
+
+        return .{
+            .topic = topic,
+            .partition_id = partition_id,
+            .base_offset = base_offset,
+            .records = data[pos .. pos + records_len],
+        };
+    }
+
     /// Produce: append records to a topic-partition.
     /// Implements multiple architectural fixes:
     /// - S3 WAL batching (append to batcher, not synchronous PUT)
@@ -335,7 +398,9 @@ pub const PartitionStore = struct {
 
         // Write to WAL (filesystem only)
         if (self.fs_wal) |*wal| {
-            _ = try wal.append(data_owned);
+            const wal_record = try self.encodeFilesystemWalRecord(topic, partition_id, base_offset, data_owned);
+            defer self.allocator.free(wal_record);
+            _ = try wal.append(wal_record);
         }
         // Also track in memory WAL (for totalRecords() in memory mode)
         if (self.memory_wal) |*mwal| {
@@ -1028,6 +1093,47 @@ test "PartitionStore filesystem mode" {
     }
 
     fs.deleteTreeAbsolute(tmp_dir) catch {};
+}
+
+test "PartitionStore restores filesystem WAL records into fetch cache" {
+    const tmp_dir = "/tmp/automq-store-wal-replay-test";
+    fs.deleteTreeAbsolute(tmp_dir) catch {};
+    defer fs.deleteTreeAbsolute(tmp_dir) catch {};
+
+    {
+        var store = PartitionStore.initWithConfig(testing.allocator, .{
+            .data_dir = tmp_dir,
+            .wal_segment_size = 1024 * 1024,
+        });
+        defer store.deinit();
+        try store.open();
+
+        _ = try store.produce("replay-topic", 0, "alpha");
+        _ = try store.produce("replay-topic", 0, "beta");
+        try store.sync();
+    }
+
+    {
+        var store = PartitionStore.initWithConfig(testing.allocator, .{
+            .data_dir = tmp_dir,
+            .wal_segment_size = 1024 * 1024,
+        });
+        defer store.deinit();
+        try store.open();
+        try store.ensurePartition("replay-topic", 0);
+
+        var key_buf: [256]u8 = undefined;
+        const key = PartitionStore.partitionKeyBuf(&key_buf, "replay-topic", 0);
+        const state = store.partitions.getPtr(key).?;
+        state.next_offset = 2;
+        state.high_watermark = 2;
+        state.last_stable_offset = 2;
+
+        const result = try store.fetch("replay-topic", 0, 0, 1024);
+        defer if (result.records.len > 0) testing.allocator.free(@constCast(result.records));
+        try testing.expectEqual(@as(i16, 0), result.error_code);
+        try testing.expectEqualStrings("alphabeta", result.records);
+    }
 }
 
 test "PartitionStore produce offset increments correctly" {

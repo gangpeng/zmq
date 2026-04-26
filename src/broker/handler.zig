@@ -6635,6 +6635,37 @@ test "Broker clamps invalid restored partition state invariants" {
     try testing.expectEqual(@as(u64, 10), stream.end_offset);
 }
 
+test "Broker fetches filesystem WAL records after restart" {
+    const fs = @import("fs_compat");
+    const tmp_dir = "/tmp/zmq-broker-wal-replay-test";
+    fs.deleteTreeAbsolute(tmp_dir) catch {};
+    try fs.makeDirAbsolute(tmp_dir);
+    defer fs.deleteTreeAbsolute(tmp_dir) catch {};
+
+    {
+        var broker = Broker.initWithConfig(testing.allocator, 1, 9092, .{ .data_dir = tmp_dir });
+        defer broker.deinit();
+        try broker.open();
+
+        try testing.expect(broker.ensureTopic("wal-replay-topic"));
+        _ = try broker.store.produce("wal-replay-topic", 0, "x");
+        _ = try broker.store.produce("wal-replay-topic", 0, "y");
+        try broker.store.sync();
+        broker.persistPartitionStates();
+    }
+
+    {
+        var broker = Broker.initWithConfig(testing.allocator, 1, 9092, .{ .data_dir = tmp_dir });
+        defer broker.deinit();
+        try broker.open();
+
+        const result = try broker.store.fetch("wal-replay-topic", 0, 0, 1024);
+        defer if (result.records.len > 0) testing.allocator.free(@constCast(result.records));
+        try testing.expectEqual(@as(i16, 0), result.error_code);
+        try testing.expectEqualStrings("xy", result.records);
+    }
+}
+
 test "Broker.handleRequest InitProducerId (key=22, v0)" {
     var broker = Broker.init(testing.allocator, 1, 9092);
     defer broker.deinit();

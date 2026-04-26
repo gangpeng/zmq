@@ -41,6 +41,8 @@ pub const Wal = struct {
     fsync_policy: FsyncPolicy = .every_n_records,
     /// Number of records between fsync calls (only used with every_n_records policy).
     fsync_interval: u64 = 100,
+    /// Next segment id to allocate. Initialized from existing WAL files on open.
+    next_segment_id: u64 = 0,
 
     pub const FsyncPolicy = enum {
         /// Fsync after every record write (safest, slowest)
@@ -95,8 +97,12 @@ pub const Wal = struct {
             else => return err,
         };
 
-        // Open a new segment
-        try self.rollSegment();
+        // Preserve existing segments for recovery, then append future writes to
+        // a fresh segment. Reusing segment 0 with truncate would destroy
+        // acknowledged records before recover() can replay them.
+        try self.loadExistingSegments();
+        try self.openSegment(self.next_segment_id);
+        self.next_segment_id += 1;
     }
 
     /// Append a record to the WAL. Returns the byte offset of the record.
@@ -170,6 +176,7 @@ pub const Wal = struct {
             seg.file.close();
             // Record metadata
             const path = try std.fmt.allocPrint(self.allocator, "{s}/wal-{d:0>20}.log", .{ self.dir_path, seg.id });
+            errdefer self.allocator.free(path);
             try self.segments.append(.{
                 .id = seg.id,
                 .size = seg.size,
@@ -178,8 +185,11 @@ pub const Wal = struct {
             });
         }
 
-        // Open new segment
-        const seg_id = self.segments.items.len;
+        try self.openSegment(self.next_segment_id);
+        self.next_segment_id += 1;
+    }
+
+    fn openSegment(self: *Wal, seg_id: u64) !void {
         const filename = try std.fmt.allocPrint(self.allocator, "{s}/wal-{d:0>20}.log", .{ self.dir_path, seg_id });
         defer self.allocator.free(filename);
 
@@ -191,6 +201,55 @@ pub const Wal = struct {
             .file = file,
             .id = seg_id,
         };
+    }
+
+    fn loadExistingSegments(self: *Wal) !void {
+        var dir = try fs.openDirAbsolute(self.dir_path, .{ .iterate = true });
+        defer dir.close();
+
+        var max_id: ?u64 = null;
+        var total_size: u64 = 0;
+
+        var it = dir.iterate();
+        while (try it.next()) |entry| {
+            if (!std.mem.startsWith(u8, entry.name, "wal-") or !std.mem.endsWith(u8, entry.name, ".log")) {
+                continue;
+            }
+            const id_part = entry.name[4 .. entry.name.len - 4];
+            const id = std.fmt.parseInt(u64, id_part, 10) catch continue;
+
+            const path = try std.fmt.allocPrint(self.allocator, "{s}/{s}", .{ self.dir_path, entry.name });
+            errdefer self.allocator.free(path);
+
+            const file = fs.openFileAbsolute(path, .{}) catch {
+                self.allocator.free(path);
+                continue;
+            };
+            const stat = file.stat() catch {
+                file.close();
+                self.allocator.free(path);
+                continue;
+            };
+            file.close();
+
+            try self.segments.append(.{
+                .id = id,
+                .size = stat.size,
+                .record_count = 0,
+                .path = path,
+            });
+            total_size += stat.size;
+            if (max_id == null or id > max_id.?) max_id = id;
+        }
+
+        std.mem.sort(SegmentMeta, self.segments.items, {}, struct {
+            fn lessThan(_: void, a: SegmentMeta, b: SegmentMeta) bool {
+                return a.id < b.id;
+            }
+        }.lessThan);
+
+        self.total_bytes_written = total_size;
+        self.next_segment_id = if (max_id) |id| id + 1 else 0;
     }
 
     /// Remove old WAL segments that have been flushed to S3.
@@ -224,6 +283,18 @@ pub const Wal = struct {
     /// Recover records from the WAL directory.
     /// Calls `callback` for each valid record found.
     pub fn recover(self: *Wal, callback: *const fn (data: []const u8, offset: u64) void) !u64 {
+        return self.recoverWithContext(callback, struct {
+            fn cb(cb_fn: *const fn (data: []const u8, offset: u64) void, data: []const u8, offset: u64) !void {
+                cb_fn(data, offset);
+            }
+        }.cb);
+    }
+
+    pub fn recoverWithContext(
+        self: *Wal,
+        context: anytype,
+        comptime callback: fn (@TypeOf(context), data: []const u8, offset: u64) anyerror!void,
+    ) !u64 {
         log.info("Starting WAL recovery from {s}", .{self.dir_path});
         var dir = try fs.openDirAbsolute(self.dir_path, .{ .iterate = true });
         defer dir.close();
@@ -287,7 +358,7 @@ pub const Wal = struct {
                 }
 
                 const data = content[pos + HEADER_SIZE .. pos + HEADER_SIZE + record_len];
-                callback(data, total_offset);
+                try callback(context, data, total_offset);
 
                 pos += HEADER_SIZE + record_len;
                 total_offset += HEADER_SIZE + record_len;
@@ -419,6 +490,32 @@ test "Wal filesystem append and recover" {
 
     // Clean up
     fs.deleteTreeAbsolute(tmp_dir) catch {};
+}
+
+test "Wal open preserves existing segments for recovery" {
+    const tmp_dir = "/tmp/automq-wal-open-preserve-test";
+    fs.deleteTreeAbsolute(tmp_dir) catch {};
+    defer fs.deleteTreeAbsolute(tmp_dir) catch {};
+
+    {
+        var wal = Wal.init(testing.allocator, tmp_dir, 1024 * 1024);
+        defer wal.deinit();
+        try wal.open();
+        _ = try wal.append("record-before-restart");
+        try wal.sync();
+    }
+
+    {
+        var wal = Wal.init(testing.allocator, tmp_dir, 1024 * 1024);
+        defer wal.deinit();
+        try wal.open();
+
+        const count = try wal.recover(&struct {
+            fn cb(_: []const u8, _: u64) void {}
+        }.cb);
+        try testing.expectEqual(@as(u64, 1), count);
+        try testing.expect(wal.segmentCount() >= 2);
+    }
 }
 
 test "Wal CRC corruption detection during recovery" {
