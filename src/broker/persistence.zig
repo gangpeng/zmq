@@ -142,6 +142,7 @@ pub const MetadataPersistence = struct {
             const info = entry.value_ptr;
             try writer.print("{s}\t{d}\t{d}\n", .{ info.name, info.num_partitions, info.replication_factor });
         }
+        try file.sync();
     }
 
     /// Load topic metadata from disk. Returns list of (name, partitions, rf) tuples.
@@ -203,6 +204,7 @@ pub const MetadataPersistence = struct {
         while (it.next()) |entry| {
             try writer.print("{s}\t{d}\n", .{ entry.key_ptr.*, entry.value_ptr.* });
         }
+        try file.sync();
     }
 
     /// Load committed offsets from disk.
@@ -311,6 +313,7 @@ pub const MetadataPersistence = struct {
                 tid_str,
             });
         }
+        try file.sync();
     }
 
     /// Load transaction state from disk.
@@ -415,6 +418,7 @@ pub const MetadataPersistence = struct {
                 value.producer_epoch,
             });
         }
+        try file.sync();
     }
 
     /// Load producer sequence state from disk.
@@ -496,6 +500,7 @@ pub const MetadataPersistence = struct {
                 try file.writeAll("null\n");
             }
         }
+        try file.sync();
     }
 
     /// Load per-partition offset and visibility state from disk.
@@ -606,6 +611,7 @@ pub const MetadataPersistence = struct {
                 acl.host,
             });
         }
+        try file.sync();
     }
 
     pub const AclEntry = struct {
@@ -726,6 +732,7 @@ pub const MetadataPersistence = struct {
             try writeHex(file, entry.value_ptr.link_id);
             try writer.print("\t{d}\n", .{@intFromBool(entry.value_ptr.promoted)});
         }
+        try file.sync();
     }
 
     /// Load local AutoMQ controller-style metadata from disk.
@@ -867,6 +874,7 @@ pub const MetadataPersistence = struct {
         const file = try fs.createFileAbsolute(path, .{ .truncate = true });
         defer file.close();
         try file.writeAll(snapshot);
+        try file.sync();
     }
 
     /// Load a binary ObjectManager snapshot from disk.
@@ -899,6 +907,7 @@ pub const MetadataPersistence = struct {
         const file = try fs.createFileAbsolute(path, .{ .truncate = true });
         defer file.close();
         try file.writeAll(snapshot);
+        try file.sync();
     }
 
     /// Load the PreparedObjectRegistry binary snapshot from disk.
