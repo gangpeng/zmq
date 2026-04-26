@@ -1478,7 +1478,7 @@ pub const Broker = struct {
             31 => self.handleDeleteAcls(request_bytes, pos, &req_header, api_version, resp_header_version),
             32 => self.handleDescribeConfigs(request_bytes, pos, &req_header, api_version, resp_header_version),
             33 => self.handleAlterConfigs(request_bytes, pos, &req_header, api_version, resp_header_version),
-            35 => self.handleDescribeLogDirs(&req_header, resp_header_version),
+            35 => self.handleDescribeLogDirs(request_bytes, pos, &req_header, api_version, resp_header_version),
             36 => self.handleSaslAuthenticate(request_bytes, pos, &req_header, api_version, resp_header_version),
             37 => self.handleCreatePartitions(request_bytes, pos, &req_header, api_version, resp_header_version),
             42 => self.handleDeleteGroups(request_bytes, pos, &req_header, api_version, resp_header_version),
@@ -5258,41 +5258,154 @@ pub const Broker = struct {
     // ---------------------------------------------------------------
     // DescribeLogDirs (key 35)
     // ---------------------------------------------------------------
-    fn handleDescribeLogDirs(self: *Broker, req_header: *const RequestHeader, resp_header_version: i16) ?[]u8 {
-        var buf = self.allocator.alloc(u8, 4096) catch return null;
-        var wpos: usize = 0;
+    fn handleDescribeLogDirs(self: *Broker, request_bytes: []const u8, body_start: usize, req_header: *const RequestHeader, api_version: i16, resp_header_version: i16) ?[]u8 {
+        const Req = generated.describe_log_dirs_request.DescribeLogDirsRequest;
+        const Resp = generated.describe_log_dirs_response.DescribeLogDirsResponse;
+        const Result = Resp.DescribeLogDirsResult;
+
+        var pos = body_start;
+        var req = Req.deserialize(self.allocator, request_bytes, &pos, api_version) catch |err| {
+            log.warn("Failed to decode DescribeLogDirs request: {}", .{err});
+            return null;
+        };
+        defer self.freeDescribeLogDirsRequest(&req);
+
         const rh = ResponseHeader{ .correlation_id = req_header.correlation_id };
-        rh.serialize(buf, &wpos, resp_header_version);
-        ser.writeI32(buf, &wpos, 0); // throttle_time_ms
-
         const log_dir = if (self.store.data_dir) |d| d else "/data/automq";
+        const topics = self.collectDescribeLogDirsTopics(&req) catch return null;
+        defer {
+            self.freeDescribeLogDirsTopics(topics);
+            if (topics.len > 0) self.allocator.free(topics);
+        }
 
-        // One log dir entry with actual topic/partition info
-        ser.writeArrayLen(buf, &wpos, 1);
-        ser.writeI16(buf, &wpos, 0); // error_code
-        ser.writeString(buf, &wpos, log_dir);
+        const results = [_]Result{.{
+            .error_code = @intFromEnum(ErrorCode.none),
+            .log_dir = log_dir,
+            .topics = topics,
+            .total_bytes = -1,
+            .usable_bytes = -1,
+        }};
+        const resp_body = Resp{
+            .throttle_time_ms = 0,
+            .error_code = @intFromEnum(ErrorCode.none),
+            .results = &results,
+        };
 
-        // Return topics with their partition sizes
-        const topic_count = self.topics.count();
-        ser.writeArrayLen(buf, &wpos, topic_count);
+        const needed = rh.calcSize(resp_header_version) + resp_body.calcSize(api_version);
+        var buf = self.allocator.alloc(u8, needed) catch return null;
+        var wpos: usize = 0;
+        rh.serialize(buf, &wpos, resp_header_version);
+        resp_body.serialize(buf, &wpos, api_version);
+        return (self.allocator.realloc(buf, wpos) catch buf)[0..wpos];
+    }
 
-        var topic_iter = self.topics.iterator();
-        while (topic_iter.next()) |entry| {
-            const info = entry.value_ptr;
-            ser.writeString(buf, &wpos, info.name);
+    fn freeDescribeLogDirsRequest(self: *Broker, req: *generated.describe_log_dirs_request.DescribeLogDirsRequest) void {
+        for (req.topics) |topic| {
+            if (topic.partitions.len > 0) self.allocator.free(topic.partitions);
+        }
+        if (req.topics.len > 0) self.allocator.free(req.topics);
+    }
 
-            const num_parts: usize = @intCast(info.num_partitions);
-            ser.writeArrayLen(buf, &wpos, num_parts);
-            for (0..num_parts) |pi| {
-                ser.writeI32(buf, &wpos, @intCast(pi)); // partition
-                ser.writeI64(buf, &wpos, @intCast(self.store.totalRecords())); // size (bytes, approximated)
-                ser.writeI64(buf, &wpos, 0); // offset_lag
-                ser.writeBool(buf, &wpos, false); // is_future_key
+    fn collectDescribeLogDirsTopics(self: *Broker, req: *const generated.describe_log_dirs_request.DescribeLogDirsRequest) ![]generated.describe_log_dirs_response.DescribeLogDirsResponse.DescribeLogDirsResult.DescribeLogDirsTopic {
+        const Topic = generated.describe_log_dirs_response.DescribeLogDirsResponse.DescribeLogDirsResult.DescribeLogDirsTopic;
+
+        var topics = std.array_list.Managed(Topic).init(self.allocator);
+        errdefer {
+            self.freeDescribeLogDirsTopics(topics.items);
+            topics.deinit();
+        }
+
+        if (req.topics.len == 0) {
+            var topic_iter = self.topics.iterator();
+            while (topic_iter.next()) |entry| {
+                const info = entry.value_ptr;
+                const partitions = try self.collectDescribeLogDirsPartitions(info.name, info.*, &.{});
+                topics.append(.{
+                    .name = info.name,
+                    .partitions = partitions,
+                }) catch |err| {
+                    if (partitions.len > 0) self.allocator.free(partitions);
+                    return err;
+                };
+            }
+        } else {
+            for (req.topics) |topic_req| {
+                const topic_name = topic_req.topic orelse "";
+                const info = self.topics.get(topic_name);
+                const partitions = try self.collectDescribeLogDirsPartitions(topic_name, info, topic_req.partitions);
+                topics.append(.{
+                    .name = topic_req.topic,
+                    .partitions = partitions,
+                }) catch |err| {
+                    if (partitions.len > 0) self.allocator.free(partitions);
+                    return err;
+                };
             }
         }
 
-        if (resp_header_version >= 1) ser.writeEmptyTaggedFields(buf, &wpos);
-        return (self.allocator.realloc(buf, wpos) catch buf)[0..wpos];
+        if (topics.items.len == 0) return &.{};
+        return topics.toOwnedSlice();
+    }
+
+    fn collectDescribeLogDirsPartitions(self: *Broker, topic_name: []const u8, topic_info: ?TopicInfo, requested_partitions: []const i32) ![]generated.describe_log_dirs_response.DescribeLogDirsResponse.DescribeLogDirsResult.DescribeLogDirsTopic.DescribeLogDirsPartition {
+        const Partition = generated.describe_log_dirs_response.DescribeLogDirsResponse.DescribeLogDirsResult.DescribeLogDirsTopic.DescribeLogDirsPartition;
+        const info = topic_info orelse return &.{};
+
+        var partitions = std.array_list.Managed(Partition).init(self.allocator);
+        errdefer partitions.deinit();
+
+        if (requested_partitions.len == 0) {
+            const num_parts: usize = @intCast(@max(info.num_partitions, 0));
+            for (0..num_parts) |partition_index| {
+                try partitions.append(self.describeLogDirPartition(topic_name, @intCast(partition_index)));
+            }
+        } else {
+            for (requested_partitions) |partition_index| {
+                if (partition_index < 0 or partition_index >= info.num_partitions) continue;
+                try partitions.append(self.describeLogDirPartition(topic_name, partition_index));
+            }
+        }
+
+        if (partitions.items.len == 0) return &.{};
+        return partitions.toOwnedSlice();
+    }
+
+    fn describeLogDirPartition(self: *Broker, topic_name: []const u8, partition_index: i32) generated.describe_log_dirs_response.DescribeLogDirsResponse.DescribeLogDirsResult.DescribeLogDirsTopic.DescribeLogDirsPartition {
+        return .{
+            .partition_index = partition_index,
+            .partition_size = self.estimateLogDirPartitionSize(topic_name, partition_index),
+            .offset_lag = 0,
+            .is_future_key = false,
+        };
+    }
+
+    fn estimateLogDirPartitionSize(self: *Broker, topic_name: []const u8, partition_index: i32) i64 {
+        const stream_id = PartitionStore.hashPartitionKey(topic_name, partition_index);
+        var cached_bytes: u64 = 0;
+        for (self.store.cache.blocks.items) |block| {
+            for (block.records.items) |record| {
+                if (record.stream_id == stream_id) cached_bytes += record.data.len;
+            }
+        }
+        if (cached_bytes > 0) return clampU64ToI64(cached_bytes);
+
+        var key_buf: [256]u8 = undefined;
+        const key = std.fmt.bufPrint(&key_buf, "{s}-{d}", .{ topic_name, partition_index }) catch return 0;
+        if (self.store.partitions.get(key)) |state| {
+            return clampU64ToI64(state.next_offset);
+        }
+        return 0;
+    }
+
+    fn clampU64ToI64(value: u64) i64 {
+        const max_i64: u64 = @intCast(std.math.maxInt(i64));
+        return if (value > max_i64) std.math.maxInt(i64) else @intCast(value);
+    }
+
+    fn freeDescribeLogDirsTopics(self: *Broker, topics: []const generated.describe_log_dirs_response.DescribeLogDirsResponse.DescribeLogDirsResult.DescribeLogDirsTopic) void {
+        for (topics) |topic| {
+            if (topic.partitions.len > 0) self.allocator.free(topic.partitions);
+        }
     }
 
     // ---------------------------------------------------------------
@@ -7037,7 +7150,10 @@ test "Broker correlation ID preservation across APIs" {
         const header_ver = header_mod.requestHeaderVersion(api_key, version);
         var buf: [256]u8 = undefined;
         var req_len = buildTestRequest(&buf, api_key, version, 12345, header_ver);
-        if (api_key == 61) {
+        if (api_key == 35) {
+            const req = generated.describe_log_dirs_request.DescribeLogDirsRequest{};
+            req.serialize(&buf, &req_len, version);
+        } else if (api_key == 61) {
             const req = generated.describe_producers_request.DescribeProducersRequest{};
             req.serialize(&buf, &req_len, version);
         }
@@ -7049,6 +7165,69 @@ test "Broker correlation ID preservation across APIs" {
             try testing.expectEqual(@as(i32, 12345), corr_id);
         }
     }
+}
+
+test "Broker.handleRequest DescribeLogDirs scopes flexible response to requested topics" {
+    const Req = generated.describe_log_dirs_request.DescribeLogDirsRequest;
+    const Resp = generated.describe_log_dirs_response.DescribeLogDirsResponse;
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+    try testing.expect(broker.ensureTopic("log-topic"));
+    try testing.expect(broker.ensureTopic("other-topic"));
+    _ = try broker.store.produce("log-topic", 0, "abc");
+    _ = try broker.store.produce("other-topic", 0, "xyz");
+
+    const log_partitions = [_]i32{ 0, 2 };
+    const missing_partitions = [_]i32{0};
+    const topics = [_]Req.DescribableLogDirTopic{
+        .{ .topic = "log-topic", .partitions = &log_partitions },
+        .{ .topic = "missing-topic", .partitions = &missing_partitions },
+    };
+    const req = Req{ .topics = &topics };
+
+    var buf: [1024]u8 = undefined;
+    var pos = buildTestRequest(&buf, 35, 2, 3502, header_mod.requestHeaderVersion(35, 2));
+    req.serialize(&buf, &pos, 2);
+
+    const response = broker.handleRequest(buf[0..pos]);
+    try testing.expect(response != null);
+    defer testing.allocator.free(response.?);
+
+    var rpos: usize = 0;
+    var response_header = try ResponseHeader.deserialize(testing.allocator, response.?, &rpos, header_mod.responseHeaderVersion(35, 2));
+    defer response_header.deinit(testing.allocator);
+    try testing.expectEqual(@as(i32, 3502), response_header.correlation_id);
+
+    const resp = try Resp.deserialize(testing.allocator, response.?, &rpos, 2);
+    defer {
+        for (resp.results) |result| {
+            for (result.topics) |topic| {
+                if (topic.partitions.len > 0) testing.allocator.free(topic.partitions);
+            }
+            if (result.topics.len > 0) testing.allocator.free(result.topics);
+        }
+        if (resp.results.len > 0) testing.allocator.free(resp.results);
+    }
+
+    try testing.expectEqual(@as(usize, 1), resp.results.len);
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.none)), resp.results[0].error_code);
+    try testing.expectEqual(@as(usize, 2), resp.results[0].topics.len);
+    try testing.expectEqualStrings("log-topic", resp.results[0].topics[0].name.?);
+    try testing.expectEqual(@as(usize, 1), resp.results[0].topics[0].partitions.len);
+    try testing.expectEqual(@as(i32, 0), resp.results[0].topics[0].partitions[0].partition_index);
+    try testing.expectEqual(@as(i64, 3), resp.results[0].topics[0].partitions[0].partition_size);
+    try testing.expectEqualStrings("missing-topic", resp.results[0].topics[1].name.?);
+    try testing.expectEqual(@as(usize, 0), resp.results[0].topics[1].partitions.len);
+}
+
+test "Broker.handleRequest DescribeLogDirs rejects truncated request" {
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+
+    var buf: [128]u8 = undefined;
+    const req_len = buildTestRequest(&buf, 35, 2, 3503, header_mod.requestHeaderVersion(35, 2));
+    try testing.expect(broker.handleRequest(buf[0..req_len]) == null);
 }
 
 test "Broker.handleRequest ElectLeaders returns requested partition results" {
