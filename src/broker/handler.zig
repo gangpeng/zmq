@@ -1489,7 +1489,7 @@ pub const Broker = struct {
             // OffsetDelete (key 47) — delete committed offsets
             47 => self.handleOffsetDelete(request_bytes, pos, &req_header, api_version, resp_header_version),
             60 => self.handleDescribeCluster(&req_header, resp_header_version),
-            61 => self.handleDescribeProducers(&req_header, resp_header_version),
+            61 => self.handleDescribeProducers(request_bytes, pos, &req_header, api_version, resp_header_version),
             52 => self.handleVote(request_bytes, pos, &req_header, api_version, resp_header_version),
             53 => self.handleBeginQuorumEpoch(request_bytes, pos, &req_header, resp_header_version),
             54 => self.handleEndQuorumEpoch(request_bytes, pos, &req_header, resp_header_version),
@@ -2057,7 +2057,7 @@ pub const Broker = struct {
                             if (hdr.producer_id >= 0) {
                                 const pk = ProducerKey{
                                     .producer_id = hdr.producer_id,
-                                    .partition_key = @intCast(@as(u32, @bitCast(partition_idx))),
+                                    .partition_key = PartitionStore.hashPartitionKey(topic_name, partition_idx),
                                 };
                                 if (self.producer_sequences.get(pk)) |stored| {
                                     if (hdr.producer_epoch < stored.producer_epoch) {
@@ -5441,50 +5441,163 @@ pub const Broker = struct {
     }
 
     // ---------------------------------------------------------------
-    // DescribeProducers (key 61) — Return actual producer state
+    // DescribeProducers (key 61) — Return request-scoped producer state
     // ---------------------------------------------------------------
-    fn handleDescribeProducers(self: *Broker, req_header: *const RequestHeader, resp_header_version: i16) ?[]u8 {
-        var buf = self.allocator.alloc(u8, 2048) catch return null;
-        var wpos: usize = 0;
-        const rh = ResponseHeader{ .correlation_id = req_header.correlation_id };
-        rh.serialize(buf, &wpos, resp_header_version);
-        ser.writeI32(buf, &wpos, 0); // throttle_time_ms
+    fn handleDescribeProducers(self: *Broker, request_bytes: []const u8, body_start: usize, req_header: *const RequestHeader, api_version: i16, resp_header_version: i16) ?[]u8 {
+        const Req = generated.describe_producers_request.DescribeProducersRequest;
+        const Resp = generated.describe_producers_response.DescribeProducersResponse;
+        const TopicResponse = Resp.TopicResponse;
+        const PartitionResponse = TopicResponse.PartitionResponse;
 
-        // Return active producers from the transaction coordinator
-        const txn_count = self.txn_coordinator.transactionCount();
-        if (txn_count > 0) {
-            // Group by "active" producers (simplified — one topic entry)
-            ser.writeArrayLen(buf, &wpos, 1);
-            ser.writeString(buf, &wpos, "__all_producers");
+        var pos = body_start;
+        var req = Req.deserialize(self.allocator, request_bytes, &pos, api_version) catch |err| {
+            log.warn("Failed to decode DescribeProducers request: {}", .{err});
+            return null;
+        };
+        defer self.freeDescribeProducersRequest(&req);
 
-            // Collect active producers
-            ser.writeArrayLen(buf, &wpos, 1); // 1 partition entry
-            ser.writeI32(buf, &wpos, 0); // partition_index
-            ser.writeI16(buf, &wpos, 0); // error_code
-            ser.writeString(buf, &wpos, null); // error_message
-
-            // Active producers
-            var active_count: usize = 0;
-            var it = self.txn_coordinator.transactions.iterator();
-            while (it.next()) |_| active_count += 1;
-
-            ser.writeArrayLen(buf, &wpos, active_count);
-            var it2 = self.txn_coordinator.transactions.iterator();
-            while (it2.next()) |entry| {
-                const txn = entry.value_ptr;
-                ser.writeI64(buf, &wpos, txn.producer_id);
-                ser.writeI32(buf, &wpos, 0); // producer_epoch
-                ser.writeI32(buf, &wpos, -1); // last_sequence
-                ser.writeI64(buf, &wpos, txn.start_time_ms); // last_timestamp
-                ser.writeI32(buf, &wpos, if (txn.status == .ongoing) @as(i32, 0) else -1); // coordinator_epoch
-                ser.writeI64(buf, &wpos, txn.start_time_ms); // current_txn_start_offset
-            }
-        } else {
-            ser.writeArrayLen(buf, &wpos, 0);
+        const topic_responses = self.allocator.alloc(TopicResponse, req.topics.len) catch return null;
+        var topic_init: usize = 0;
+        defer {
+            self.freeDescribeProducersTopicResponses(topic_responses[0..topic_init]);
+            if (topic_responses.len > 0) self.allocator.free(topic_responses);
         }
 
-        if (resp_header_version >= 1) ser.writeEmptyTaggedFields(buf, &wpos);
+        for (req.topics) |topic_req| {
+            const topic_name = topic_req.name orelse "";
+            const topic_info = self.topics.get(topic_name);
+            const partition_responses = self.allocator.alloc(PartitionResponse, topic_req.partition_indexes.len) catch return null;
+            var partition_init: usize = 0;
+            var transferred = false;
+            defer {
+                if (!transferred) {
+                    self.freeDescribeProducersPartitions(partition_responses[0..partition_init]);
+                    if (partition_responses.len > 0) self.allocator.free(partition_responses);
+                }
+            }
+
+            for (topic_req.partition_indexes) |partition_index| {
+                const partition_error: i16 = if (topic_info) |info|
+                    if (partition_index >= 0 and partition_index < info.num_partitions)
+                        @intFromEnum(ErrorCode.none)
+                    else
+                        @intFromEnum(ErrorCode.unknown_topic_or_partition)
+                else
+                    @intFromEnum(ErrorCode.unknown_topic_or_partition);
+
+                const active_producers = if (partition_error == 0)
+                    (self.collectDescribeProducerStates(topic_name, partition_index) catch return null)
+                else
+                    &[_]generated.describe_producers_response.DescribeProducersResponse.TopicResponse.PartitionResponse.ProducerState{};
+
+                partition_responses[partition_init] = .{
+                    .partition_index = partition_index,
+                    .error_code = partition_error,
+                    .error_message = null,
+                    .active_producers = active_producers,
+                };
+                partition_init += 1;
+            }
+
+            topic_responses[topic_init] = .{
+                .name = topic_req.name,
+                .partitions = partition_responses,
+            };
+            topic_init += 1;
+            transferred = true;
+        }
+
+        const resp_body = Resp{
+            .throttle_time_ms = 0,
+            .topics = topic_responses[0..topic_init],
+        };
+        const rh = ResponseHeader{ .correlation_id = req_header.correlation_id };
+        const needed = rh.calcSize(resp_header_version) + resp_body.calcSize(api_version);
+        var buf = self.allocator.alloc(u8, needed) catch return null;
+        var wpos: usize = 0;
+        rh.serialize(buf, &wpos, resp_header_version);
+        resp_body.serialize(buf, &wpos, api_version);
         return (self.allocator.realloc(buf, wpos) catch buf)[0..wpos];
+    }
+
+    fn freeDescribeProducersRequest(self: *Broker, req: *generated.describe_producers_request.DescribeProducersRequest) void {
+        for (req.topics) |topic| {
+            if (topic.partition_indexes.len > 0) self.allocator.free(topic.partition_indexes);
+        }
+        if (req.topics.len > 0) self.allocator.free(req.topics);
+    }
+
+    fn freeDescribeProducersTopicResponses(self: *Broker, topics: []const generated.describe_producers_response.DescribeProducersResponse.TopicResponse) void {
+        for (topics) |topic| {
+            self.freeDescribeProducersPartitions(topic.partitions);
+            if (topic.partitions.len > 0) self.allocator.free(topic.partitions);
+        }
+    }
+
+    fn freeDescribeProducersPartitions(self: *Broker, partitions: []const generated.describe_producers_response.DescribeProducersResponse.TopicResponse.PartitionResponse) void {
+        for (partitions) |partition| {
+            if (partition.active_producers.len > 0) self.allocator.free(partition.active_producers);
+        }
+    }
+
+    fn collectDescribeProducerStates(self: *Broker, topic: []const u8, partition_index: i32) ![]generated.describe_producers_response.DescribeProducersResponse.TopicResponse.PartitionResponse.ProducerState {
+        const ProducerState = generated.describe_producers_response.DescribeProducersResponse.TopicResponse.PartitionResponse.ProducerState;
+
+        var states = std.array_list.Managed(ProducerState).init(self.allocator);
+        errdefer states.deinit();
+
+        const partition_key = PartitionStore.hashPartitionKey(topic, partition_index);
+        var seq_it = self.producer_sequences.iterator();
+        while (seq_it.next()) |entry| {
+            if (entry.key_ptr.partition_key != partition_key) continue;
+            const state = entry.value_ptr.*;
+            try states.append(.{
+                .producer_id = entry.key_ptr.producer_id,
+                .producer_epoch = @intCast(state.producer_epoch),
+                .last_sequence = state.last_sequence,
+                .last_timestamp = -1,
+                .coordinator_epoch = 0,
+                .current_txn_start_offset = -1,
+            });
+        }
+
+        var txn_it = self.txn_coordinator.transactions.iterator();
+        while (txn_it.next()) |entry| {
+            const txn = entry.value_ptr;
+            var matches_partition = false;
+            for (txn.partitions.items) |tp| {
+                if (tp.partition == partition_index and std.mem.eql(u8, tp.topic, topic)) {
+                    matches_partition = true;
+                    break;
+                }
+            }
+            if (!matches_partition) continue;
+
+            if (findDescribeProducerState(states.items, txn.producer_id)) |idx| {
+                states.items[idx].producer_epoch = @intCast(txn.producer_epoch);
+                states.items[idx].last_timestamp = txn.start_time_ms;
+                states.items[idx].coordinator_epoch = if (txn.status == .ongoing) 0 else -1;
+            } else {
+                try states.append(.{
+                    .producer_id = txn.producer_id,
+                    .producer_epoch = @intCast(txn.producer_epoch),
+                    .last_sequence = -1,
+                    .last_timestamp = txn.start_time_ms,
+                    .coordinator_epoch = if (txn.status == .ongoing) 0 else -1,
+                    .current_txn_start_offset = -1,
+                });
+            }
+        }
+
+        if (states.items.len == 0) return &.{};
+        return states.toOwnedSlice();
+    }
+
+    fn findDescribeProducerState(states: []const generated.describe_producers_response.DescribeProducersResponse.TopicResponse.PartitionResponse.ProducerState, producer_id: i64) ?usize {
+        for (states, 0..) |state, idx| {
+            if (state.producer_id == producer_id) return idx;
+        }
+        return null;
     }
 
     // ---------------------------------------------------------------
@@ -6923,7 +7036,11 @@ test "Broker correlation ID preservation across APIs" {
         const version: i16 = 0;
         const header_ver = header_mod.requestHeaderVersion(api_key, version);
         var buf: [256]u8 = undefined;
-        const req_len = buildTestRequest(&buf, api_key, version, 12345, header_ver);
+        var req_len = buildTestRequest(&buf, api_key, version, 12345, header_ver);
+        if (api_key == 61) {
+            const req = generated.describe_producers_request.DescribeProducersRequest{};
+            req.serialize(&buf, &req_len, version);
+        }
 
         if (broker.handleRequest(buf[0..req_len])) |response| {
             defer testing.allocator.free(response);
@@ -6982,6 +7099,87 @@ test "Broker.handleRequest ElectLeaders returns requested partition results" {
     try testing.expectEqual(@as(i16, 0), resp.replica_election_results[0].partition_result[0].error_code);
     try testing.expectEqual(@as(i32, 5), resp.replica_election_results[0].partition_result[1].partition_id);
     try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.unknown_topic_or_partition)), resp.replica_election_results[0].partition_result[1].error_code);
+}
+
+test "Broker.handleRequest DescribeProducers returns only requested topic partitions" {
+    const Req = generated.describe_producers_request.DescribeProducersRequest;
+    const Resp = generated.describe_producers_response.DescribeProducersResponse;
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+    try testing.expect(broker.ensureTopic("producer-topic"));
+    try testing.expect(broker.ensureTopic("other-topic"));
+
+    try broker.producer_sequences.put(.{
+        .producer_id = 61001,
+        .partition_key = PartitionStore.hashPartitionKey("producer-topic", 0),
+    }, .{
+        .last_sequence = 7,
+        .producer_epoch = 2,
+    });
+    try broker.producer_sequences.put(.{
+        .producer_id = 61002,
+        .partition_key = PartitionStore.hashPartitionKey("other-topic", 0),
+    }, .{
+        .last_sequence = 99,
+        .producer_epoch = 1,
+    });
+
+    const producer_partitions = [_]i32{ 0, 2 };
+    const missing_partitions = [_]i32{0};
+    const topics = [_]Req.TopicRequest{
+        .{ .name = "producer-topic", .partition_indexes = &producer_partitions },
+        .{ .name = "missing-topic", .partition_indexes = &missing_partitions },
+    };
+    const req = Req{ .topics = &topics };
+
+    var buf: [1024]u8 = undefined;
+    var pos = buildTestRequest(&buf, 61, 0, 6100, header_mod.requestHeaderVersion(61, 0));
+    req.serialize(&buf, &pos, 0);
+
+    const response = broker.handleRequest(buf[0..pos]);
+    try testing.expect(response != null);
+    defer testing.allocator.free(response.?);
+
+    var rpos: usize = 0;
+    var response_header = try ResponseHeader.deserialize(testing.allocator, response.?, &rpos, header_mod.responseHeaderVersion(61, 0));
+    defer response_header.deinit(testing.allocator);
+    try testing.expectEqual(@as(i32, 6100), response_header.correlation_id);
+
+    const resp = try Resp.deserialize(testing.allocator, response.?, &rpos, 0);
+    defer {
+        for (resp.topics) |topic| {
+            for (topic.partitions) |partition| {
+                if (partition.active_producers.len > 0) testing.allocator.free(partition.active_producers);
+            }
+            if (topic.partitions.len > 0) testing.allocator.free(topic.partitions);
+        }
+        if (resp.topics.len > 0) testing.allocator.free(resp.topics);
+    }
+
+    try testing.expectEqual(@as(usize, 2), resp.topics.len);
+    try testing.expectEqualStrings("producer-topic", resp.topics[0].name.?);
+    try testing.expectEqual(@as(usize, 2), resp.topics[0].partitions.len);
+    try testing.expectEqual(@as(i32, 0), resp.topics[0].partitions[0].partition_index);
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.none)), resp.topics[0].partitions[0].error_code);
+    try testing.expectEqual(@as(usize, 1), resp.topics[0].partitions[0].active_producers.len);
+    try testing.expectEqual(@as(i64, 61001), resp.topics[0].partitions[0].active_producers[0].producer_id);
+    try testing.expectEqual(@as(i32, 2), resp.topics[0].partitions[0].active_producers[0].producer_epoch);
+    try testing.expectEqual(@as(i32, 7), resp.topics[0].partitions[0].active_producers[0].last_sequence);
+    try testing.expectEqual(@as(i32, 2), resp.topics[0].partitions[1].partition_index);
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.unknown_topic_or_partition)), resp.topics[0].partitions[1].error_code);
+    try testing.expectEqual(@as(usize, 0), resp.topics[0].partitions[1].active_producers.len);
+    try testing.expectEqualStrings("missing-topic", resp.topics[1].name.?);
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.unknown_topic_or_partition)), resp.topics[1].partitions[0].error_code);
+}
+
+test "Broker.handleRequest DescribeProducers rejects truncated request" {
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+
+    var buf: [128]u8 = undefined;
+    const req_len = buildTestRequest(&buf, 61, 0, 6101, header_mod.requestHeaderVersion(61, 0));
+    try testing.expect(broker.handleRequest(buf[0..req_len]) == null);
 }
 
 // ---------------------------------------------------------------
