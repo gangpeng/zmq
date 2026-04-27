@@ -5150,47 +5150,80 @@ pub const Broker = struct {
     // TxnOffsetCommit (key 28)
     // ---------------------------------------------------------------
     fn handleTxnOffsetCommit(self: *Broker, request_bytes: []const u8, body_start: usize, req_header: *const RequestHeader, api_version: i16, resp_header_version: i16) ?[]u8 {
-        _ = api_version;
-        var pos = body_start;
-        const transactional_id = (ser.readString(request_bytes, &pos) catch return null) orelse "";
-        _ = transactional_id;
-        const group_id = (ser.readString(request_bytes, &pos) catch return null) orelse "";
-        const producer_id = ser.readI64(request_bytes, &pos);
-        _ = producer_id;
-        const producer_epoch = ser.readI16(request_bytes, &pos);
-        _ = producer_epoch;
+        const Req = generated.txn_offset_commit_request.TxnOffsetCommitRequest;
+        const Resp = generated.txn_offset_commit_response.TxnOffsetCommitResponse;
+        const TopicResponse = Resp.TxnOffsetCommitResponseTopic;
+        const PartitionResponse = TopicResponse.TxnOffsetCommitResponsePartition;
 
-        // Parse topics and commit offsets
-        const num_topics = (ser.readArrayLen(request_bytes, &pos) catch 0) orelse 0;
-
-        var buf = self.allocator.alloc(u8, 4096) catch return null;
-        var wpos: usize = 0;
-        const rh = ResponseHeader{ .correlation_id = req_header.correlation_id };
-        rh.serialize(buf, &wpos, resp_header_version);
-        ser.writeI32(buf, &wpos, 0); // throttle_time_ms
-        ser.writeArrayLen(buf, &wpos, num_topics);
-
-        for (0..num_topics) |_| {
-            const topic = (ser.readString(request_bytes, &pos) catch break) orelse "";
-            const num_parts = (ser.readArrayLen(request_bytes, &pos) catch 0) orelse 0;
-
-            ser.writeString(buf, &wpos, topic);
-            ser.writeArrayLen(buf, &wpos, num_parts);
-
-            for (0..num_parts) |_| {
-                const partition = ser.readI32(request_bytes, &pos);
-                const offset = ser.readI64(request_bytes, &pos);
-
-                // Commit the offset through the group coordinator
-                self.groups.commitOffset(group_id, topic, partition, offset) catch {};
-
-                ser.writeI32(buf, &wpos, partition);
-                ser.writeI16(buf, &wpos, 0); // error_code = NONE
-            }
+        if (!validateTxnOffsetCommitRequestFrame(request_bytes, body_start, api_version)) {
+            log.warn("Malformed TxnOffsetCommit request", .{});
+            return null;
         }
 
-        if (resp_header_version >= 1) ser.writeEmptyTaggedFields(buf, &wpos);
-        return (self.allocator.realloc(buf, wpos) catch buf)[0..wpos];
+        var pos = body_start;
+        var req = Req.deserialize(self.allocator, request_bytes, &pos, api_version) catch |err| {
+            log.warn("Failed to decode TxnOffsetCommit request: {}", .{err});
+            return null;
+        };
+        defer self.freeTxnOffsetCommitRequest(&req);
+
+        const group_id = req.group_id orelse "";
+        const topics = self.allocator.alloc(TopicResponse, req.topics.len) catch return null;
+        var topics_init: usize = 0;
+        defer {
+            self.freeTxnOffsetCommitTopics(topics[0..topics_init]);
+            if (topics.len > 0) self.allocator.free(topics);
+        }
+
+        for (req.topics) |topic_req| {
+            const partitions = self.allocator.alloc(PartitionResponse, topic_req.partitions.len) catch return null;
+            var transferred = false;
+            defer {
+                if (!transferred and partitions.len > 0) self.allocator.free(partitions);
+            }
+
+            const topic = topic_req.name orelse "";
+            for (topic_req.partitions, 0..) |partition_req, partition_idx| {
+                const error_code: i16 = blk: {
+                    self.groups.commitOffset(group_id, topic, partition_req.partition_index, partition_req.committed_offset) catch |err| {
+                        log.warn("TxnOffsetCommit failed for {s}:{s}:{d}: {}", .{ group_id, topic, partition_req.partition_index, err });
+                        break :blk @intFromEnum(ErrorCode.kafka_storage_error);
+                    };
+                    break :blk @intFromEnum(ErrorCode.none);
+                };
+
+                partitions[partition_idx] = .{
+                    .partition_index = partition_req.partition_index,
+                    .error_code = error_code,
+                };
+            }
+
+            topics[topics_init] = .{
+                .name = topic_req.name,
+                .partitions = partitions,
+            };
+            topics_init += 1;
+            transferred = true;
+        }
+
+        const resp = Resp{
+            .throttle_time_ms = 0,
+            .topics = topics[0..topics_init],
+        };
+        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+    }
+
+    fn freeTxnOffsetCommitRequest(self: *Broker, req: *generated.txn_offset_commit_request.TxnOffsetCommitRequest) void {
+        for (req.topics) |topic| {
+            if (topic.partitions.len > 0) self.allocator.free(topic.partitions);
+        }
+        if (req.topics.len > 0) self.allocator.free(req.topics);
+    }
+
+    fn freeTxnOffsetCommitTopics(self: *Broker, topics: []const generated.txn_offset_commit_response.TxnOffsetCommitResponse.TxnOffsetCommitResponseTopic) void {
+        for (topics) |topic| {
+            if (topic.partitions.len > 0) self.allocator.free(topic.partitions);
+        }
     }
 
     // ---------------------------------------------------------------
@@ -6046,6 +6079,35 @@ pub const Broker = struct {
                 if (!skipFixedBytes(buf, &pos, 4)) return false; // partition
                 if (api_version >= 2 and !skipFixedBytes(buf, &pos, 4)) return false; // current_leader_epoch
                 if (!skipFixedBytes(buf, &pos, 4)) return false; // leader_epoch
+                if (flexible) ser.skipTaggedFields(buf, &pos) catch return false;
+            }
+            if (flexible) ser.skipTaggedFields(buf, &pos) catch return false;
+        }
+        if (flexible) ser.skipTaggedFields(buf, &pos) catch return false;
+        return true;
+    }
+
+    fn validateTxnOffsetCommitRequestFrame(buf: []const u8, start_pos: usize, api_version: i16) bool {
+        const flexible = api_version >= 3;
+        var pos = start_pos;
+
+        if (!skipKafkaString(buf, &pos, flexible)) return false; // transactional_id
+        if (!skipKafkaString(buf, &pos, flexible)) return false; // group_id
+        if (!skipFixedBytes(buf, &pos, 10)) return false; // producer_id + producer_epoch
+        if (api_version >= 3) {
+            if (!skipFixedBytes(buf, &pos, 4)) return false; // generation_id
+            if (!skipKafkaString(buf, &pos, true)) return false; // member_id
+            if (!skipKafkaString(buf, &pos, true)) return false; // group_instance_id
+        }
+
+        const topic_count = readKafkaArrayCount(buf, &pos, flexible) orelse return false;
+        for (0..topic_count) |_| {
+            if (!skipKafkaString(buf, &pos, flexible)) return false; // topic name
+            const partition_count = readKafkaArrayCount(buf, &pos, flexible) orelse return false;
+            for (0..partition_count) |_| {
+                if (!skipFixedBytes(buf, &pos, 12)) return false; // partition_index + committed_offset
+                if (api_version >= 2 and !skipFixedBytes(buf, &pos, 4)) return false; // committed_leader_epoch
+                if (!skipKafkaString(buf, &pos, flexible)) return false; // committed_metadata
                 if (flexible) ser.skipTaggedFields(buf, &pos) catch return false;
             }
             if (flexible) ser.skipTaggedFields(buf, &pos) catch return false;
@@ -6968,6 +7030,74 @@ test "Broker.handleRequest OffsetForLeaderEpoch rejects truncated request" {
 
     var buf: [128]u8 = undefined;
     const req_len = buildTestRequest(&buf, 23, 4, 2305, header_mod.requestHeaderVersion(23, 4));
+    try testing.expect(broker.handleRequest(buf[0..req_len]) == null);
+}
+
+test "Broker.handleRequest TxnOffsetCommit v3 returns generated response and commits offsets" {
+    const Req = generated.txn_offset_commit_request.TxnOffsetCommitRequest;
+    const Resp = generated.txn_offset_commit_response.TxnOffsetCommitResponse;
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+
+    const partitions = [_]Req.TxnOffsetCommitRequestTopic.TxnOffsetCommitRequestPartition{.{
+        .partition_index = 0,
+        .committed_offset = 123,
+        .committed_leader_epoch = 7,
+        .committed_metadata = "txn metadata",
+    }};
+    const topics = [_]Req.TxnOffsetCommitRequestTopic{.{
+        .name = "txn-offset-topic",
+        .partitions = &partitions,
+    }};
+    const req = Req{
+        .transactional_id = "txn-id",
+        .group_id = "txn-offset-group",
+        .producer_id = 99,
+        .producer_epoch = 3,
+        .generation_id = -1,
+        .member_id = "",
+        .group_instance_id = null,
+        .topics = &topics,
+    };
+
+    var buf: [512]u8 = undefined;
+    var pos = buildTestRequest(&buf, 28, 3, 2803, header_mod.requestHeaderVersion(28, 3));
+    req.serialize(&buf, &pos, 3);
+
+    const response = broker.handleRequest(buf[0..pos]);
+    try testing.expect(response != null);
+    defer testing.allocator.free(response.?);
+
+    var rpos: usize = 0;
+    var response_header = try ResponseHeader.deserialize(testing.allocator, response.?, &rpos, header_mod.responseHeaderVersion(28, 3));
+    defer response_header.deinit(testing.allocator);
+    try testing.expectEqual(@as(i32, 2803), response_header.correlation_id);
+
+    const resp = try Resp.deserialize(testing.allocator, response.?, &rpos, 3);
+    defer {
+        for (resp.topics) |topic| {
+            if (topic.partitions.len > 0) testing.allocator.free(topic.partitions);
+        }
+        if (resp.topics.len > 0) testing.allocator.free(resp.topics);
+    }
+
+    try testing.expectEqual(response.?.len, rpos);
+    try testing.expectEqual(@as(i32, 0), resp.throttle_time_ms);
+    try testing.expectEqual(@as(usize, 1), resp.topics.len);
+    try testing.expectEqualStrings("txn-offset-topic", resp.topics[0].name.?);
+    try testing.expectEqual(@as(usize, 1), resp.topics[0].partitions.len);
+    try testing.expectEqual(@as(i32, 0), resp.topics[0].partitions[0].partition_index);
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.none)), resp.topics[0].partitions[0].error_code);
+    try testing.expectEqual(@as(?i64, 123), try broker.groups.fetchOffset("txn-offset-group", "txn-offset-topic", 0));
+}
+
+test "Broker.handleRequest TxnOffsetCommit rejects truncated request" {
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+
+    var buf: [128]u8 = undefined;
+    const req_len = buildTestRequest(&buf, 28, 3, 2804, header_mod.requestHeaderVersion(28, 3));
     try testing.expect(broker.handleRequest(buf[0..req_len]) == null);
 }
 
