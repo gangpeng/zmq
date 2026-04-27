@@ -9870,6 +9870,33 @@ fn buildTestRequest(buf: []u8, api_key: i16, api_version: i16, correlation_id: i
     return pos;
 }
 
+fn appendInternalRaftAppendEntriesPayload(
+    buf: []u8,
+    pos: *usize,
+    leader_id: i32,
+    leader_epoch: i32,
+    prev_log_offset: i64,
+    prev_log_epoch: i32,
+    leader_commit: i64,
+    entries_start_index: i64,
+    records: []const []const u8,
+) void {
+    ser.writeString(buf, pos, "");
+    ser.writeI32(buf, pos, 0);
+    ser.writeI32(buf, pos, leader_id);
+    ser.writeI32(buf, pos, leader_epoch);
+    ser.writeI64(buf, pos, prev_log_offset);
+    ser.writeI32(buf, pos, prev_log_epoch);
+    ser.writeI64(buf, pos, leader_commit);
+    ser.writeI64(buf, pos, entries_start_index);
+    ser.writeI32(buf, pos, @intCast(records.len));
+    for (records) |record| {
+        ser.writeI32(buf, pos, @intCast(record.len));
+        @memcpy(buf[pos.* .. pos.* + record.len], record);
+        pos.* += record.len;
+    }
+}
+
 fn freeDeserializedDescribeConfigsResponse(resp: *const generated.describe_configs_response.DescribeConfigsResponse) void {
     for (resp.results) |result| {
         for (result.configs) |config| {
@@ -13564,18 +13591,8 @@ test "Broker.handleRequest BeginQuorumEpoch applies internal AutoMQ AppendEntrie
 
     var buf: [2048]u8 = undefined;
     var pos = buildTestRequest(&buf, 53, 0, 5305, header_mod.requestHeaderVersion(53, 0));
-    ser.writeString(&buf, &pos, "");
-    ser.writeI32(&buf, &pos, 0);
-    ser.writeI32(&buf, &pos, 1); // leader_id
-    ser.writeI32(&buf, &pos, 1); // leader_epoch
-    ser.writeI64(&buf, &pos, 0); // prev_log_offset
-    ser.writeI32(&buf, &pos, 0); // prev_log_epoch
-    ser.writeI64(&buf, &pos, 0); // leader_commit
-    ser.writeI64(&buf, &pos, 0); // entries_start_index
-    ser.writeI32(&buf, &pos, 1); // entry_count
-    ser.writeI32(&buf, &pos, @intCast(record.len));
-    @memcpy(buf[pos .. pos + record.len], record);
-    pos += record.len;
+    const records = [_][]const u8{record};
+    appendInternalRaftAppendEntriesPayload(&buf, &pos, 1, 1, 0, 0, 0, 0, &records);
 
     const response = broker.handleRequest(buf[0..pos]);
     try testing.expect(response != null);
@@ -13619,18 +13636,8 @@ test "Broker replays replicated AutoMQ object metadata AppendEntries payload" {
 
     var buf: [4096]u8 = undefined;
     var pos = buildTestRequest(&buf, 53, 0, 5306, header_mod.requestHeaderVersion(53, 0));
-    ser.writeString(&buf, &pos, "");
-    ser.writeI32(&buf, &pos, 0);
-    ser.writeI32(&buf, &pos, 1); // leader_id
-    ser.writeI32(&buf, &pos, 1); // leader_epoch
-    ser.writeI64(&buf, &pos, 0); // prev_log_offset
-    ser.writeI32(&buf, &pos, 0); // prev_log_epoch
-    ser.writeI64(&buf, &pos, 0); // leader_commit
-    ser.writeI64(&buf, &pos, 0); // entries_start_index
-    ser.writeI32(&buf, &pos, 1); // entry_count
-    ser.writeI32(&buf, &pos, @intCast(record.len));
-    @memcpy(buf[pos .. pos + record.len], record);
-    pos += record.len;
+    const records = [_][]const u8{record};
+    appendInternalRaftAppendEntriesPayload(&buf, &pos, 1, 1, 0, 0, 0, 0, &records);
 
     const response = follower.handleRequest(buf[0..pos]);
     try testing.expect(response != null);
@@ -13652,6 +13659,120 @@ test "Broker replays replicated AutoMQ object metadata AppendEntries payload" {
     try testing.expectEqual(stream_id, restored_object.stream_id);
     try testing.expectEqual(@as(u64, 10), restored_object.end_offset);
     try testing.expect(follower.object_manager.prepared_registry.contains(prepared_only_object_id));
+}
+
+test "Broker replays replicated AutoMQ state after follower promotion" {
+    const AppendResp = generated.begin_quorum_epoch_response.BeginQuorumEpochResponse;
+    const GetReq = generated.get_k_vs_request.GetKVsRequest;
+    const GetResp = generated.get_k_vs_response.GetKVsResponse;
+
+    var raft = RaftState.init(testing.allocator, 2, "automq-failover-replay");
+    defer raft.deinit();
+    try raft.addVoter(1);
+    try raft.addVoter(2);
+    raft.becomeFollower(1, 1);
+
+    var source = Broker.init(testing.allocator, 1, 19094);
+    defer source.deinit();
+    const kv_record = try source.buildAutoMqPutKvRecord("alpha", "beta");
+    defer source.allocator.free(kv_record);
+    const node_record = try source.buildAutoMqRegisterNodeRecord(7, 3, "wal://node-7");
+    defer source.allocator.free(node_record);
+    const zone_record = try source.buildAutoMqZoneRouterRecord("route-data", 4);
+    defer source.allocator.free(zone_record);
+    const license_record = try source.buildAutoMqSetLicenseRecord("test-license");
+    defer source.allocator.free(license_record);
+    const next_node_record = try source.buildAutoMqSetNextNodeIdRecord(9);
+    defer source.allocator.free(next_node_record);
+    const group_record = try source.buildAutoMqUpdateGroupRecord("group-a", "link-a", true);
+    defer source.allocator.free(group_record);
+
+    const stream = try source.object_manager.createStream(1);
+    const stream_id = stream.stream_id;
+    const committed_object_id = source.object_manager.prepareObject();
+    try source.object_manager.commitStreamObject(committed_object_id, stream_id, 0, 10, "so/1/0-10", 128);
+    const object_record = try source.buildAutoMqObjectMetadataRecord();
+    defer source.allocator.free(object_record);
+
+    const records = [_][]const u8{
+        kv_record,
+        node_record,
+        zone_record,
+        license_record,
+        next_node_record,
+        group_record,
+        object_record,
+    };
+
+    {
+        var follower = Broker.init(testing.allocator, 2, 19095);
+        defer follower.deinit();
+        follower.setRaftState(&raft);
+
+        var append_buf: [8192]u8 = undefined;
+        var append_pos = buildTestRequest(&append_buf, 53, 0, 5307, header_mod.requestHeaderVersion(53, 0));
+        appendInternalRaftAppendEntriesPayload(&append_buf, &append_pos, 1, 1, 0, 0, @intCast(records.len - 1), 0, &records);
+
+        const response = follower.handleRequest(append_buf[0..append_pos]);
+        try testing.expect(response != null);
+        defer testing.allocator.free(response.?);
+
+        var rpos: usize = 0;
+        var response_header = try ResponseHeader.deserialize(testing.allocator, response.?, &rpos, header_mod.responseHeaderVersion(53, 0));
+        defer response_header.deinit(testing.allocator);
+        const append_resp = try AppendResp.deserialize(testing.allocator, response.?, &rpos, 0);
+        defer if (append_resp.topics.len > 0) testing.allocator.free(append_resp.topics);
+
+        try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.none)), append_resp.error_code);
+        try testing.expectEqual(records.len, raft.log.length());
+        try testing.expectEqual(@as(u64, @intCast(records.len - 1)), raft.commit_index);
+    }
+
+    raft.metrics = null;
+    _ = raft.startElection();
+    raft.becomeLeader();
+    try testing.expectEqual(.leader, raft.role);
+
+    {
+        var promoted = Broker.initWithConfig(testing.allocator, 2, 19095, .{});
+        defer promoted.deinit();
+        promoted.setRaftState(&raft);
+        try promoted.open();
+
+        try testing.expectEqualStrings("beta", promoted.auto_mq_kvs.get("alpha").?);
+        const node = promoted.auto_mq_nodes.get(7).?;
+        try testing.expectEqual(@as(i64, 3), node.node_epoch);
+        try testing.expectEqualStrings("wal://node-7", node.wal_config);
+        try testing.expectEqual(@as(i32, 9), promoted.auto_mq_next_node_id);
+        try testing.expectEqualStrings("test-license", promoted.auto_mq_license.?);
+        try testing.expectEqualStrings("route-data", promoted.auto_mq_zone_router_metadata.?);
+        const promotion = promoted.auto_mq_group_promotions.get("group-a").?;
+        try testing.expectEqualStrings("link-a", promotion.link_id);
+        try testing.expect(promotion.promoted);
+
+        const restored_stream = promoted.object_manager.getStream(stream_id).?;
+        try testing.expectEqual(@as(u64, 10), restored_stream.end_offset);
+        const restored_object = promoted.object_manager.stream_objects.get(committed_object_id).?;
+        try testing.expectEqual(stream_id, restored_object.stream_id);
+
+        var get_buf: [512]u8 = undefined;
+        var get_pos = buildTestRequest(&get_buf, 509, 0, 5097, 2);
+        const get_items = [_]GetReq.GetKVRequest{.{ .key = "alpha" }};
+        const get_req = GetReq{ .get_key_requests = &get_items };
+        get_req.serialize(&get_buf, &get_pos, 0);
+
+        const get_response = promoted.handleRequest(get_buf[0..get_pos]);
+        try testing.expect(get_response != null);
+        defer testing.allocator.free(get_response.?);
+
+        var get_rpos: usize = 0;
+        var get_header = try ResponseHeader.deserialize(testing.allocator, get_response.?, &get_rpos, 1);
+        defer get_header.deinit(testing.allocator);
+        const get_resp = try GetResp.deserialize(testing.allocator, get_response.?, &get_rpos, 0);
+        defer testing.allocator.free(get_resp.get_kv_responses);
+        try testing.expectEqual(@as(i16, 0), get_resp.get_kv_responses[0].error_code);
+        try testing.expectEqualStrings("beta", get_resp.get_kv_responses[0].value.?);
+    }
 }
 
 test "Broker.handleRequest EndQuorumEpoch returns generated not-controller responses" {
