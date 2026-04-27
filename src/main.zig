@@ -365,6 +365,11 @@ pub fn main(init: std.process.Init) !void {
         if (controller) |ctrl| {
             brk.setRaftState(&ctrl.raft_state);
         }
+        if (!process_roles.is_controller) {
+            // Broker-only nodes must prove controller registration/heartbeat
+            // before accepting produce requests.
+            brk.is_fenced_by_controller = true;
+        }
 
         brk.open() catch |err| {
             try stdout.print("  ERROR: Failed to open storage: {}\n", .{err});

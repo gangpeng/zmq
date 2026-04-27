@@ -270,8 +270,12 @@ pub const MetadataClient = struct {
         }
 
         const leader = self.leader_id orelse {
-            // Re-discover leader
+            // Re-discover leader and register with the newly discovered
+            // controller before attempting heartbeats with an old epoch.
             self.discoverLeader();
+            if (self.leader_id != null and !self.should_stop.*) {
+                self.registerWithController();
+            }
             return;
         };
 
@@ -294,18 +298,27 @@ pub const MetadataClient = struct {
             var resp_header = ResponseHeader.deserialize(self.allocator, response, &rpos, header_mod.responseHeaderVersion(63, 0)) catch {
                 log.warn("Malformed BrokerHeartbeat response header", .{});
                 self.leader_id = null;
+                self.is_fenced.* = true;
                 return;
             };
             defer resp_header.deinit(self.allocator);
             const resp = Resp.deserialize(self.allocator, response, &rpos, 0) catch {
                 log.warn("Malformed BrokerHeartbeat response body", .{});
                 self.leader_id = null;
+                self.is_fenced.* = true;
                 return;
             };
 
+            if (resp.error_code == @intFromEnum(protocol.ErrorCode.broker_id_not_registered)) {
+                log.warn("Controller does not know broker {d}, re-registering", .{self.broker_id});
+                self.is_fenced.* = true;
+                self.registerWithController();
+                return;
+            }
+
             if (resp.error_code != 0) {
-                log.warn("Heartbeat error: code={d}, re-registering", .{resp.error_code});
-                self.leader_id = null; // Force leader re-discovery
+                log.warn("Heartbeat error: code={d}, self-fencing", .{resp.error_code});
+                self.is_fenced.* = true;
                 return;
             }
 
@@ -329,6 +342,7 @@ pub const MetadataClient = struct {
         } else {
             log.warn("Heartbeat failed to controller {d}, re-discovering leader", .{leader});
             self.leader_id = null; // Force re-discovery on next heartbeat
+            self.is_fenced.* = true;
         }
     }
 };

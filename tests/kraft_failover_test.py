@@ -14,6 +14,7 @@ Run:
 Optional environment:
     ZMQ_BIN                         ./zig-out/bin/zmq
     ZMQ_KRAFT_CONTROLLER_PORT_BASE  39093
+    ZMQ_KRAFT_BROKER_PORT           39092
 """
 
 import os
@@ -29,6 +30,7 @@ import time
 RUN_ENABLED = os.environ.get("ZMQ_RUN_KRAFT_FAILOVER_TESTS") == "1"
 ZMQ_BIN = os.environ.get("ZMQ_BIN", "./zig-out/bin/zmq")
 PORT_BASE = int(os.environ.get("ZMQ_KRAFT_CONTROLLER_PORT_BASE", "39093"))
+BROKER_PORT = int(os.environ.get("ZMQ_KRAFT_BROKER_PORT", "39092"))
 CLUSTER_ID = f"zmq-kraft-failover-{os.getpid()}-{int(time.time())}"
 
 
@@ -167,6 +169,85 @@ def api_versions_count(port):
     return count
 
 
+def create_topic(port, name, correlation_id):
+    body = struct.pack(">i", 1)
+    body += write_string(name)
+    body += struct.pack(">i", 1)  # partitions
+    body += struct.pack(">h", 1)  # replication factor
+    body += struct.pack(">i", 0)  # replica assignment count
+    body += struct.pack(">i", 0)  # configs count
+    body += struct.pack(">i", 30000)
+    response = controller_request(port, 19, 0, correlation_id, body)
+    payload = response[4:]
+    if len(payload) < 8:
+        raise TestError("CreateTopics response too short")
+    pos = 4
+    name_len = struct.unpack_from(">h", payload, pos)[0]
+    pos += 2 + max(name_len, 0)
+    error_code = struct.unpack_from(">h", payload, pos)[0]
+    if error_code not in (0, 36):  # NONE or TOPIC_ALREADY_EXISTS
+        raise TestError(f"CreateTopics error_code={error_code}")
+
+
+def wait_for_topic(port, name):
+    deadline = time.time() + 20
+    correlation_id = 3000
+    last_error = None
+    while time.time() < deadline:
+        try:
+            create_topic(port, name, correlation_id)
+            return
+        except Exception as exc:
+            last_error = exc
+            correlation_id += 1
+            time.sleep(0.25)
+    raise TestError(f"topic {name!r} was not created: {last_error}")
+
+
+def produce(port, topic, payload, correlation_id):
+    body = struct.pack(">h", 1)  # acks
+    body += struct.pack(">i", 30000)
+    body += struct.pack(">i", 1)
+    body += write_string(topic)
+    body += struct.pack(">i", 1)
+    body += struct.pack(">i", 0)
+    body += struct.pack(">i", len(payload)) + payload
+
+    response = controller_request(port, 0, 0, correlation_id, body)
+    payload_body = response[4:]
+    if len(payload_body) < 24:
+        raise TestError("Produce response too short")
+    pos = 4
+    name_len = struct.unpack_from(">h", payload_body, pos)[0]
+    pos += 2 + max(name_len, 0)
+    partitions = struct.unpack_from(">i", payload_body, pos)[0]
+    if partitions != 1:
+        raise TestError(f"Produce partition response count={partitions}")
+    pos += 4
+    partition = struct.unpack_from(">i", payload_body, pos)[0]
+    pos += 4
+    error_code = struct.unpack_from(">h", payload_body, pos)[0]
+    pos += 2
+    base_offset = struct.unpack_from(">q", payload_body, pos)[0]
+    if partition != 0 or error_code != 0:
+        raise TestError(f"Produce partition={partition} error_code={error_code}")
+    return base_offset
+
+
+def wait_for_produce(port, topic, payload, timeout=45):
+    deadline = time.time() + timeout
+    correlation_id = 4000
+    last_error = None
+    while time.time() < deadline:
+        try:
+            return produce(port, topic, payload, correlation_id)
+        except Exception as exc:
+            last_error = exc
+            correlation_id += 1
+            time.sleep(0.5)
+    raise TestError(f"produce did not succeed within {timeout}s: {last_error}")
+
+
 def describe_quorum_body():
     body = bytearray()
     body += write_compact_array_len(1)
@@ -253,6 +334,21 @@ def wait_for_ready(proc, port, log_path):
     raise TestError(f"controller on {port} did not become ready: {last_error}\n{tail(log_path)}")
 
 
+def wait_for_broker_ready(proc, port, log_path):
+    deadline = time.time() + 30
+    last_error = None
+    while time.time() < deadline:
+        if proc.poll() is not None:
+            raise TestError(f"broker on {port} exited early with code {proc.returncode}\n{tail(log_path)}")
+        try:
+            if api_versions_count(port) > 0:
+                return
+        except Exception as exc:
+            last_error = exc
+        time.sleep(0.25)
+    raise TestError(f"broker on {port} did not become ready: {last_error}\n{tail(log_path)}")
+
+
 def wait_for_leader(processes, forbidden_leaders=frozenset(), timeout=45):
     deadline = time.time() + timeout
     correlation = 1000
@@ -327,6 +423,37 @@ def start_controller(tmp, node_id, port, voters):
     return {"proc": proc, "port": port, "log_path": log_path}
 
 
+def start_broker(tmp, voters):
+    data_dir = os.path.join(tmp, "broker-100")
+    log_path = os.path.join(tmp, "broker-100.log")
+    os.makedirs(data_dir, exist_ok=True)
+    log_file = open(log_path, "ab", buffering=0)
+    args = [
+        ZMQ_BIN,
+        "--node-id",
+        "100",
+        "--process-roles",
+        "broker",
+        "--port",
+        str(BROKER_PORT),
+        "--metrics-port",
+        str(BROKER_PORT + 1000),
+        "--data-dir",
+        data_dir,
+        "--cluster-id",
+        CLUSTER_ID,
+        "--voters",
+        voters,
+        "--advertised-host",
+        "localhost",
+        "--workers",
+        "1",
+    ]
+    proc = subprocess.Popen(args, stdout=log_file, stderr=subprocess.STDOUT)
+    proc._zmq_log_file = log_file
+    return {"proc": proc, "port": BROKER_PORT, "log_path": log_path}
+
+
 def stop_process(proc, crash=False):
     if proc is None:
         return
@@ -356,6 +483,7 @@ def main():
 
     tmp = tempfile.mkdtemp(prefix="zmq-kraft-failover-")
     processes = {}
+    broker = None
     try:
         ports = {node_id: PORT_BASE + node_id for node_id in range(3)}
         voters = ",".join(f"{node_id}@127.0.0.1:{port}" for node_id, port in ports.items())
@@ -371,6 +499,12 @@ def main():
         if sorted(initial["voters"]) != [0, 1, 2]:
             raise TestError(f"unexpected voter set from DescribeQuorum: {initial['voters']}")
 
+        broker = start_broker(tmp, voters)
+        wait_for_broker_ready(broker["proc"], broker["port"], broker["log_path"])
+        topic = f"kraft-failover-{os.getpid()}-{int(time.time())}"
+        wait_for_topic(broker["port"], topic)
+        first_offset = wait_for_produce(broker["port"], topic, b"before-controller-failover")
+
         stop_process(processes[leader_id]["proc"], crash=True)
         replacement_leader, after = wait_for_leader(processes, forbidden_leaders={leader_id})
         alive = {node_id for node_id, info in processes.items() if info["proc"].poll() is None}
@@ -380,12 +514,18 @@ def main():
             raise TestError(f"leader epoch did not advance: before={initial} after={after}")
 
         wait_for_all_alive_to_report(processes, replacement_leader)
+        second_offset = wait_for_produce(broker["port"], topic, b"after-controller-failover")
+        if second_offset <= first_offset:
+            raise TestError(f"broker did not continue after failover: {second_offset} <= {first_offset}")
+
         print(
             "ok: KRaft controller failover harness passed "
             f"(old_leader={leader_id}, new_leader={replacement_leader}, epoch={after['leader_epoch']})"
         )
         return 0
     finally:
+        if broker is not None:
+            stop_process(broker.get("proc"))
         for info in processes.values():
             stop_process(info.get("proc"))
         shutil.rmtree(tmp, ignore_errors=True)
