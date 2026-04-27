@@ -70,6 +70,17 @@ fn serializePreparedRegistry() ?[]const u8 {
     };
 }
 
+/// Callback for ElectionLoop: append a complete AutoMQ metadata/ObjectManager
+/// snapshot record before Raft truncates committed metadata records.
+fn prepareAutoMqMetadataSnapshot() bool {
+    const brk = global_broker_ptr orelse return true;
+    brk.prepareAutoMqMetadataSnapshotForRaftCompaction() catch |err| {
+        log.warn("Failed to prepare AutoMQ metadata snapshot before Raft compaction: {}", .{err});
+        return false;
+    };
+    return true;
+}
+
 fn handleSignal(sig: posix.SIG) callconv(.c) void {
     _ = sig;
     if (global_shutdown) {
@@ -180,7 +191,7 @@ pub fn main(init: std.process.Init) !void {
             if (args.next()) |r| process_roles = ProcessRoles.parse(r) catch ProcessRoles.combined;
         } else if (std.mem.eql(u8, arg, "--controller-port")) {
             if (args.next()) |p| controller_port = std.fmt.parseInt(u16, p, 10) catch 9093;
-        // S3 WAL and cache configuration CLI flags
+            // S3 WAL and cache configuration CLI flags
         } else if (std.mem.eql(u8, arg, "--s3-wal-batch-size")) {
             if (args.next()) |v| s3_wal_batch_size = std.fmt.parseInt(usize, v, 10) catch s3_wal_batch_size;
         } else if (std.mem.eql(u8, arg, "--s3-wal-flush-interval")) {
@@ -392,7 +403,10 @@ pub fn main(init: std.process.Init) !void {
         if (broker) |brk| {
             const mc = try alloc.create(MetadataClient);
             mc.* = MetadataClient.init(
-                alloc, node_id, advertised_host, port,
+                alloc,
+                node_id,
+                advertised_host,
+                port,
                 &brk.cached_leader_epoch,
                 &brk.is_fenced_by_controller,
                 &brk.last_successful_heartbeat_ms,
@@ -422,6 +436,7 @@ pub fn main(init: std.process.Init) !void {
             .should_stop = &global_shutdown,
             .raft_client_pool = if (raft_pool != null) &(raft_pool.?) else null,
             .pre_snapshot_fn = if (broker != null) &serializePreparedRegistry else null,
+            .prepare_snapshot_fn = if (broker != null) &prepareAutoMqMetadataSnapshot else null,
             .snapshot_allocator = if (broker != null) alloc else null,
         };
         if (election_state.raft_client_pool != null) {
@@ -620,17 +635,26 @@ fn performGracefulShutdown(broker_opt: ?*Broker, controller_opt: ?*Controller) v
     // The prepared registry must be serialized BEFORE the snapshot truncates the
     // Raft log, because prepared entries in the truncated log portion would be lost.
     if (controller_opt) |ctrl| {
+        var can_snapshot = true;
         if (broker_opt) |brk| {
+            brk.prepareAutoMqMetadataSnapshotForRaftCompaction() catch |err| {
+                log.warn("Graceful shutdown: skipping Raft snapshot because AutoMQ metadata snapshot failed: {}", .{err});
+                can_snapshot = false;
+            };
             const reg_data = brk.object_manager.prepared_registry.serialize(ctrl.raft_state.allocator) catch null;
             ctrl.raft_state.prepared_registry_data = reg_data;
         }
-        ctrl.raft_state.takeSnapshot();
+        if (can_snapshot) {
+            ctrl.raft_state.takeSnapshot();
+        }
         // Free the serialized data after snapshot persistence
         if (ctrl.raft_state.prepared_registry_data) |d| {
             ctrl.raft_state.allocator.free(d);
             ctrl.raft_state.prepared_registry_data = null;
         }
-        log.info("Graceful shutdown: Raft snapshot taken (commit_index={d})", .{ctrl.raft_state.commit_index});
+        if (can_snapshot) {
+            log.info("Graceful shutdown: Raft snapshot taken (commit_index={d})", .{ctrl.raft_state.commit_index});
+        }
     }
 
     log.info("Graceful shutdown: cleanup sequence complete", .{});

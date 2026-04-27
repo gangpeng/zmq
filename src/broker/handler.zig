@@ -1816,6 +1816,7 @@ pub const Broker = struct {
         set_zone_router = 5,
         set_next_node_id = 6,
         update_group = 7,
+        full_snapshot = 8,
     };
 
     fn autoMqRecordKindFromByte(byte: u8) !AutoMqMetadataRecordKind {
@@ -1827,6 +1828,7 @@ pub const Broker = struct {
             5 => .set_zone_router,
             6 => .set_next_node_id,
             7 => .update_group,
+            8 => .full_snapshot,
             else => error.InvalidAutoMqMetadataRecord,
         };
     }
@@ -1861,6 +1863,11 @@ pub const Broker = struct {
         pos.* += 8;
     }
 
+    fn writeRecordU32(buf: []u8, pos: *usize, value: u32) void {
+        std.mem.writeInt(u32, buf[pos.*..][0..4], value, .big);
+        pos.* += 4;
+    }
+
     fn writeRecordBool(buf: []u8, pos: *usize, value: bool) void {
         buf[pos.*] = if (value) 1 else 0;
         pos.* += 1;
@@ -1885,6 +1892,13 @@ pub const Broker = struct {
         if (pos.* + 8 > data.len) return error.InvalidAutoMqMetadataRecord;
         const value = std.mem.readInt(i64, data[pos.*..][0..8], .big);
         pos.* += 8;
+        return value;
+    }
+
+    fn readRecordU32(data: []const u8, pos: *usize) !u32 {
+        if (pos.* + 4 > data.len) return error.InvalidAutoMqMetadataRecord;
+        const value = std.mem.readInt(u32, data[pos.*..][0..4], .big);
+        pos.* += 4;
         return value;
     }
 
@@ -1986,6 +2000,88 @@ pub const Broker = struct {
         return record.buf;
     }
 
+    fn autoMqFullSnapshotPayloadSize(self: *Broker, object_snapshot: []const u8, prepared_snapshot: []const u8) !usize {
+        var payload_len: usize = 4 + 8; // next_node_id + zone_router_epoch
+        payload_len = try checkedAddSize(payload_len, 1 + if (self.auto_mq_license) |value| try autoMqBytesFieldSize(value) else 0);
+        payload_len = try checkedAddSize(payload_len, 1 + if (self.auto_mq_zone_router_metadata) |value| try autoMqBytesFieldSize(value) else 0);
+
+        payload_len = try checkedAddSize(payload_len, 4); // kv count
+        var kv_it = self.auto_mq_kvs.iterator();
+        while (kv_it.next()) |entry| {
+            payload_len = try checkedAddSize(payload_len, try autoMqBytesFieldSize(entry.key_ptr.*));
+            payload_len = try checkedAddSize(payload_len, try autoMqBytesFieldSize(entry.value_ptr.*));
+        }
+
+        payload_len = try checkedAddSize(payload_len, 4); // node count
+        var node_it = self.auto_mq_nodes.iterator();
+        while (node_it.next()) |entry| {
+            payload_len = try checkedAddSize(payload_len, 12);
+            payload_len = try checkedAddSize(payload_len, try autoMqBytesFieldSize(entry.value_ptr.wal_config));
+        }
+
+        payload_len = try checkedAddSize(payload_len, 4); // group count
+        var group_it = self.auto_mq_group_promotions.iterator();
+        while (group_it.next()) |entry| {
+            payload_len = try checkedAddSize(payload_len, try autoMqBytesFieldSize(entry.key_ptr.*));
+            payload_len = try checkedAddSize(payload_len, try autoMqBytesFieldSize(entry.value_ptr.link_id));
+            payload_len = try checkedAddSize(payload_len, 1);
+        }
+
+        payload_len = try checkedAddSize(payload_len, try autoMqBytesFieldSize(object_snapshot));
+        payload_len = try checkedAddSize(payload_len, try autoMqBytesFieldSize(prepared_snapshot));
+        return payload_len;
+    }
+
+    fn buildAutoMqFullSnapshotRecord(self: *Broker) ![]u8 {
+        var empty_orphans = [_][]const u8{};
+        const orphaned_keys: []const []const u8 = if (self.compaction_manager) |*cm|
+            cm.orphaned_keys.items
+        else
+            empty_orphans[0..];
+
+        const object_snapshot = try self.object_manager.takeSnapshot(orphaned_keys);
+        defer self.allocator.free(object_snapshot);
+        const prepared_snapshot = try self.object_manager.prepared_registry.serialize(self.allocator);
+        defer self.allocator.free(prepared_snapshot);
+
+        var record = try self.allocAutoMqMetadataRecord(.full_snapshot, try self.autoMqFullSnapshotPayloadSize(object_snapshot, prepared_snapshot));
+        writeRecordI32(record.buf, &record.pos, self.auto_mq_next_node_id);
+        writeRecordI64(record.buf, &record.pos, self.auto_mq_zone_router_epoch);
+
+        writeRecordBool(record.buf, &record.pos, self.auto_mq_license != null);
+        if (self.auto_mq_license) |value| try writeRecordBytes(record.buf, &record.pos, value);
+        writeRecordBool(record.buf, &record.pos, self.auto_mq_zone_router_metadata != null);
+        if (self.auto_mq_zone_router_metadata) |value| try writeRecordBytes(record.buf, &record.pos, value);
+
+        writeRecordU32(record.buf, &record.pos, self.auto_mq_kvs.count());
+        var kv_it = self.auto_mq_kvs.iterator();
+        while (kv_it.next()) |entry| {
+            try writeRecordBytes(record.buf, &record.pos, entry.key_ptr.*);
+            try writeRecordBytes(record.buf, &record.pos, entry.value_ptr.*);
+        }
+
+        writeRecordU32(record.buf, &record.pos, self.auto_mq_nodes.count());
+        var node_it = self.auto_mq_nodes.iterator();
+        while (node_it.next()) |entry| {
+            writeRecordI32(record.buf, &record.pos, entry.key_ptr.*);
+            writeRecordI64(record.buf, &record.pos, entry.value_ptr.node_epoch);
+            try writeRecordBytes(record.buf, &record.pos, entry.value_ptr.wal_config);
+        }
+
+        writeRecordU32(record.buf, &record.pos, self.auto_mq_group_promotions.count());
+        var group_it = self.auto_mq_group_promotions.iterator();
+        while (group_it.next()) |entry| {
+            try writeRecordBytes(record.buf, &record.pos, entry.key_ptr.*);
+            try writeRecordBytes(record.buf, &record.pos, entry.value_ptr.link_id);
+            writeRecordBool(record.buf, &record.pos, entry.value_ptr.promoted);
+        }
+
+        try writeRecordBytes(record.buf, &record.pos, object_snapshot);
+        try writeRecordBytes(record.buf, &record.pos, prepared_snapshot);
+        std.debug.assert(record.pos == record.buf.len);
+        return record.buf;
+    }
+
     fn commitAutoMqMetadataRecord(self: *Broker, record: []const u8) !void {
         const raft = self.raft_state orelse return;
         if (raft.role != .leader) return error.NotController;
@@ -2003,6 +2099,25 @@ pub const Broker = struct {
         const record = try self.buildAutoMqPutKvRecord(key, value);
         defer self.allocator.free(record);
         try self.commitAutoMqMetadataRecord(record);
+    }
+
+    fn commitAutoMqFullSnapshotRecord(self: *Broker) !void {
+        const record = try self.buildAutoMqFullSnapshotRecord();
+        defer self.allocator.free(record);
+        try self.commitAutoMqMetadataRecord(record);
+    }
+
+    pub fn prepareAutoMqMetadataSnapshotForRaftCompaction(self: *Broker) !void {
+        const raft = self.raft_state orelse return;
+        if (raft.role != .leader) return error.NotController;
+        if (raft.quorumSize() > 1) return error.QuorumCommitPending;
+        try self.commitAutoMqFullSnapshotRecord();
+    }
+
+    fn compactAutoMqQuorumMetadataSnapshot(self: *Broker) !void {
+        const raft = self.raft_state orelse return;
+        try self.prepareAutoMqMetadataSnapshotForRaftCompaction();
+        raft.takeSnapshot();
     }
 
     fn commitAutoMqDeleteKvRecord(self: *Broker, key: []const u8) !void {
@@ -2127,6 +2242,98 @@ pub const Broker = struct {
         }
     }
 
+    fn applyAutoMqFullSnapshotRecord(self: *Broker, data: []const u8, pos: *usize) !void {
+        const next_node_id = try readRecordI32(data, pos);
+        const zone_router_epoch = try readRecordI64(data, pos);
+
+        const has_license = try readRecordBool(data, pos);
+        const license = if (has_license) try readRecordBytes(data, pos) else null;
+        const has_zone_router_metadata = try readRecordBool(data, pos);
+        const zone_router_metadata = if (has_zone_router_metadata) try readRecordBytes(data, pos) else null;
+
+        const kv_count = try readRecordU32(data, pos);
+        const kv_start = pos.*;
+        var i: u32 = 0;
+        while (i < kv_count) : (i += 1) {
+            _ = try readRecordBytes(data, pos);
+            _ = try readRecordBytes(data, pos);
+        }
+
+        const node_count = try readRecordU32(data, pos);
+        const node_start = pos.*;
+        i = 0;
+        while (i < node_count) : (i += 1) {
+            _ = try readRecordI32(data, pos);
+            _ = try readRecordI64(data, pos);
+            _ = try readRecordBytes(data, pos);
+        }
+
+        const group_count = try readRecordU32(data, pos);
+        const group_start = pos.*;
+        i = 0;
+        while (i < group_count) : (i += 1) {
+            _ = try readRecordBytes(data, pos);
+            _ = try readRecordBytes(data, pos);
+            _ = try readRecordBool(data, pos);
+        }
+
+        const object_snapshot = try readRecordBytes(data, pos);
+        const prepared_snapshot = try readRecordBytes(data, pos);
+        if (pos.* != data.len) return error.InvalidAutoMqMetadataRecord;
+
+        var replacement_object_manager = ObjectManager.init(self.allocator, self.node_id);
+        var replacement_object_manager_moved = false;
+        errdefer if (!replacement_object_manager_moved) replacement_object_manager.deinit();
+        const orphaned_keys = try replacement_object_manager.loadSnapshot(object_snapshot);
+        var orphaned_keys_consumed = false;
+        errdefer if (!orphaned_keys_consumed) self.freeOrphanedKeys(orphaned_keys);
+        try replacement_object_manager.prepared_registry.deserialize(prepared_snapshot);
+
+        self.clearAutoMqMetadata();
+        errdefer self.clearAutoMqMetadata();
+        self.auto_mq_next_node_id = @max(next_node_id, defaultAutoMqNextNodeId(self.node_id));
+        self.auto_mq_zone_router_epoch = zone_router_epoch;
+        if (license) |value| try self.setAutoMqLicenseFromRecord(value);
+        if (zone_router_metadata) |value| {
+            const metadata_copy = try self.allocator.dupe(u8, value);
+            self.auto_mq_zone_router_metadata = metadata_copy;
+        }
+
+        pos.* = kv_start;
+        i = 0;
+        while (i < kv_count) : (i += 1) {
+            const key = try readRecordBytes(data, pos);
+            const value = try readRecordBytes(data, pos);
+            try self.putAutoMqKvFromRecord(key, value);
+        }
+
+        pos.* = node_start;
+        i = 0;
+        while (i < node_count) : (i += 1) {
+            const node_id = try readRecordI32(data, pos);
+            const node_epoch = try readRecordI64(data, pos);
+            const wal_config = try readRecordBytes(data, pos);
+            try self.registerAutoMqNodeFromRecord(node_id, node_epoch, wal_config);
+        }
+
+        pos.* = group_start;
+        i = 0;
+        while (i < group_count) : (i += 1) {
+            const group_id = try readRecordBytes(data, pos);
+            const link_id = try readRecordBytes(data, pos);
+            const promoted = try readRecordBool(data, pos);
+            try self.updateAutoMqGroupFromRecord(group_id, link_id, promoted);
+        }
+
+        self.object_manager.deinit();
+        self.object_manager = replacement_object_manager;
+        replacement_object_manager_moved = true;
+        self.wireInternalPointers();
+        orphaned_keys_consumed = true;
+        try self.attachOrphanedKeysToCompaction(orphaned_keys);
+        pos.* = data.len;
+    }
+
     fn applyAutoMqMetadataRecord(self: *Broker, data: []const u8) !void {
         if (!isAutoMqMetadataRecord(data)) return;
 
@@ -2177,6 +2384,9 @@ pub const Broker = struct {
                 const promoted = try readRecordBool(data, &pos);
                 if (pos != data.len) return error.InvalidAutoMqMetadataRecord;
                 try self.updateAutoMqGroupFromRecord(group_id, link_id, promoted);
+            },
+            .full_snapshot => {
+                try self.applyAutoMqFullSnapshotRecord(data, &pos);
             },
         }
     }
@@ -11982,6 +12192,80 @@ test "Broker replays committed AutoMQ metadata quorum records" {
         const promotion = broker.auto_mq_group_promotions.get("group-a").?;
         try testing.expectEqualStrings("link-a", promotion.link_id);
         try testing.expect(promotion.promoted);
+    }
+}
+
+test "Broker compacts AutoMQ quorum metadata into replayable full snapshot" {
+    var raft = RaftState.init(testing.allocator, 1, "automq-metadata-compaction");
+    defer raft.deinit();
+    try raft.addVoter(1);
+    _ = raft.startElection();
+    raft.becomeLeader();
+
+    var stream_id: u64 = 0;
+    var committed_object_id: u64 = 0;
+    var prepared_only_object_id: u64 = 0;
+    {
+        var broker = Broker.initWithConfig(testing.allocator, 1, 9092, .{});
+        defer broker.deinit();
+        broker.setRaftState(&raft);
+        try broker.open();
+
+        try broker.commitAutoMqPutKvRecord("alpha", "beta");
+        try broker.putAutoMqKvFromRecord("alpha", "beta");
+        try broker.commitAutoMqRegisterNodeRecord(7, 3, "wal://node-7");
+        try broker.registerAutoMqNodeFromRecord(7, 3, "wal://node-7");
+        try broker.commitAutoMqZoneRouterRecord("route-data", 4);
+        try broker.setAutoMqZoneRouterFromRecord("route-data", 4);
+        try broker.commitAutoMqSetLicenseRecord("test-license");
+        try broker.setAutoMqLicenseFromRecord("test-license");
+        try broker.commitAutoMqSetNextNodeIdRecord(9);
+        broker.setAutoMqNextNodeIdFromRecord(9);
+        try broker.commitAutoMqUpdateGroupRecord("group-a", "link-a", true);
+        try broker.updateAutoMqGroupFromRecord("group-a", "link-a", true);
+
+        const stream = try broker.object_manager.createStream(1);
+        stream_id = stream.stream_id;
+        committed_object_id = broker.object_manager.prepareObject();
+        try broker.object_manager.commitStreamObject(committed_object_id, stream_id, 0, 10, "so/1/0-10", 128);
+        prepared_only_object_id = broker.object_manager.prepareObject();
+        try broker.commitAutoMqObjectMetadataRecord();
+
+        const pre_compaction_len = raft.log.length();
+        try testing.expect(pre_compaction_len >= 7);
+        try broker.compactAutoMqQuorumMetadataSnapshot();
+
+        try testing.expectEqual(raft.commit_index, raft.last_snapshot_offset);
+        try testing.expect(raft.log.length() < pre_compaction_len);
+        try testing.expectEqual(@as(usize, 1), raft.log.length());
+        try testing.expect(Broker.isAutoMqMetadataRecord(raft.log.entries.items[0].data));
+    }
+
+    {
+        var broker = Broker.initWithConfig(testing.allocator, 1, 9092, .{});
+        defer broker.deinit();
+        broker.setRaftState(&raft);
+        try broker.open();
+
+        try testing.expectEqualStrings("beta", broker.auto_mq_kvs.get("alpha").?);
+        const node = broker.auto_mq_nodes.get(7).?;
+        try testing.expectEqual(@as(i64, 3), node.node_epoch);
+        try testing.expectEqualStrings("wal://node-7", node.wal_config);
+        try testing.expectEqual(@as(i32, 9), broker.auto_mq_next_node_id);
+        try testing.expectEqualStrings("test-license", broker.auto_mq_license.?);
+        try testing.expectEqualStrings("route-data", broker.auto_mq_zone_router_metadata.?);
+        try testing.expectEqual(@as(i64, 4), broker.auto_mq_zone_router_epoch);
+        const promotion = broker.auto_mq_group_promotions.get("group-a").?;
+        try testing.expectEqualStrings("link-a", promotion.link_id);
+        try testing.expect(promotion.promoted);
+
+        const restored_stream = broker.object_manager.getStream(stream_id).?;
+        try testing.expectEqual(@as(u64, 10), restored_stream.end_offset);
+        const restored_object = broker.object_manager.stream_objects.get(committed_object_id).?;
+        try testing.expectEqual(stream_id, restored_object.stream_id);
+        try testing.expectEqual(@as(u64, 10), restored_object.end_offset);
+        try testing.expect(broker.object_manager.prepared_registry.contains(prepared_only_object_id));
+        try testing.expect(broker.object_manager.next_object_id > prepared_only_object_id);
     }
 }
 

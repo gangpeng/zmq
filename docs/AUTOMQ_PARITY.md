@@ -16,9 +16,11 @@ operator-facing behavior.
   node, router, license, node-id allocation, and group-link mutations append
   committed Raft metadata records when a Raft state is attached. Stream/object
   metadata mutations append committed Raft snapshot records for attached
-  single-node leaders. Attached non-leaders reject these metadata mutations,
-  and local snapshot compatibility remains for single-node mode. Manifest and
-  partition snapshot APIs are read-side views.
+  single-node leaders. Single-node leaders can compact AutoMQ metadata/object
+  records into a replayable full snapshot before Raft log truncation. Attached
+  non-leaders reject these metadata mutations, and local snapshot compatibility
+  remains for single-node mode. Manifest and partition snapshot APIs are
+  read-side views.
 - Kafka protocol support is functional for common single-node broker paths, but
   semantic parity across all generated APIs and versions is incomplete.
 - S3 WAL/object storage paths exist, but full AutoMQ S3Stream lifecycle
@@ -59,7 +61,7 @@ gaps. Each item should land as a small, verified tranche with tests and a commit
 | Priority | Gap | Required completion gate | Status |
 | --- | --- | --- | --- |
 | P0 | Advertised API audit | ApiVersions, request/response header versions, generated schema ranges, dispatch coverage, malformed-frame tests, golden fixtures, and client compatibility matrix all fail closed when an advertised API drifts. | In progress. Header flexible-version and handler-switch coverage are explicit and tested; ApiVersions catalog fixtures plus AddPartitionsToTxn, AddOffsetsToTxn, CreateTopics, DeleteTopics, DeleteRecords, DescribeConfigs, DescribeGroups, EndTxn, Fetch, FindCoordinator, Heartbeat, InitProducerId, JoinGroup, LeaveGroup, ListGroups, ListOffsets, Metadata, Produce, SaslHandshake, SaslAuthenticate, SyncGroup, OffsetCommit, OffsetFetch, OffsetForLeaderEpoch, WriteTxnMarkers, TxnOffsetCommit, DescribeAcls/CreateAcls/DeleteAcls, AlterConfigs/IncrementalAlterConfigs, CreatePartitions, Vote, Begin/EndQuorumEpoch, and OffsetDelete generated/malformed coverage are in place. Client matrix coverage remains. |
-| P0 | Quorum-backed AutoMQ/controller metadata | Replace local-only AutoMQ KV/node/router/license/manifest/group/object metadata with quorum-backed records, snapshots, replay, fencing, and failover tests. | In progress. KV/node/router/license/node-id/group mutations now append committed Raft records for attached single-node leaders. ObjectManager stream/object mutations now append committed Raft snapshot records. Both paths replay on broker open and reject attached non-leader mutations. Raft snapshot compaction, multi-node replication/failover replay, and client compatibility remain. |
+| P0 | Quorum-backed AutoMQ/controller metadata | Replace local-only AutoMQ KV/node/router/license/manifest/group/object metadata with quorum-backed records, snapshots, replay, fencing, and failover tests. | In progress. KV/node/router/license/node-id/group mutations now append committed Raft records for attached single-node leaders. ObjectManager stream/object mutations now append committed Raft snapshot records. Both paths replay on broker open and reject attached non-leader mutations. Single-node leaders now append a full AutoMQ metadata/ObjectManager snapshot record before Raft snapshot truncation and replay it after compaction. Multi-node replication/failover replay and client compatibility remain. |
 | P0 | S3/MinIO crash and fault-injection harness | Exercise produce/flush/restart/fetch/rebuild with transient 5xx, timeout, partial multipart, bad ETag, checksum, range-read, list inconsistency, and provider-specific behavior. | Partial local/S3-object recovery coverage exists; fault matrix is incomplete. |
 | P1 | Multi-node KRaft and broker lifecycle | Broker registration, heartbeat, fencing/unfencing, controller failover, rolling restart, and leader epoch behavior are covered by three-node tests. | Not started beyond local scaffolding and generated handlers. |
 | P1 | Stateless broker replacement | A replacement broker can rebuild state from shared storage and quorum metadata without local disk metadata or manual repair. | Partial S3/object repair exists; quorum metadata rebuild is missing. |
@@ -76,7 +78,7 @@ gaps. Each item should land as a small, verified tranche with tests and a commit
 | Kafka ApiVersions/version catalog | In progress. Canonical table now drives advertised APIs and version checks, including AutoMQ extensions. | Keep catalog generated or audited against schemas and handler dispatch in CI. |
 | Kafka broker APIs | Partial. 67 advertised APIs; many handlers are simplified single-node semantics. DescribeLogDirs, partition reassignment APIs, DescribeCluster, DescribeQuorum, ElectLeaders, and DescribeProducers now decode generated requests and return request-scoped generated responses instead of blanket hand-encoded results. | Full schema-valid decode/encode and Kafka-compatible semantics for every advertised version. |
 | Kafka generated schemas | Broad. 110 request schemas generated. | Round-trip tests and golden fixtures for every generated request/response pair. |
-| AutoMQ extension APIs | Implemented locally with quorum-backed metadata starting. Keys 501-519 and 600-602 dispatch through generated schemas; stream/object mutations can be backed by committed Raft snapshot records; KV/node/router/license/node-id/group mutations can be backed by committed Raft records; attached non-leaders fail closed for these metadata mutations. | Finish multi-node replication/failover, Raft snapshot compaction, and client compatibility fixtures. |
+| AutoMQ extension APIs | Implemented locally with quorum-backed metadata starting. Keys 501-519 and 600-602 dispatch through generated schemas; stream/object mutations can be backed by committed Raft snapshot records; KV/node/router/license/node-id/group mutations can be backed by committed Raft records; attached non-leaders fail closed for these metadata mutations; single-node leaders compact these records through a replayable full snapshot record before Raft truncation. | Finish multi-node replication/failover and client compatibility fixtures. |
 | S3 WAL | Partial. Sync durability path exists and failed uploads are not acknowledged. Filesystem WAL produces now fsync before ack, advance HW on durable write, and replay after local broker restart. Flushed S3 WAL objects can rebuild stream-set metadata idempotently when the local object snapshot is missing, including paginated and XML-escaped ListObjectsV2 responses. S3 WAL recovery now fails closed on unreadable WAL objects instead of silently skipping them. S3 WAL object upload has bounded retry for transient put failures, fetch returns storage errors for unreadable indexed S3 objects, malformed object indexes fail cleanly, interleaved stream-set objects fetch only the requested stream blocks, S3 block-cache keys include the exact visible fetch window, partition offsets are repaired from recovered stream metadata, and multipart completion rejects malformed part ETags. | S3 crash/restart recovery, idempotent retry, fencing, provider matrix, and fault injection. |
 | S3Stream object lifecycle | Improved. Create/open/close/delete/trim/describe plus prepare/commit SO/SSO are wired to ObjectManager; object/prepared snapshots and partition offset/HW/LSO state are persisted locally with fsync and covered by broker restart tests. | Match full AutoMQ recovery, fencing, prepared-object expiry, quorum-backed object-state replay, and S3-backed metadata durability. |
 | Controller/KRaft | Partial. Local Raft/controller scaffolding exists. | Multi-node quorum, broker registration, heartbeats, fencing, metadata snapshots, rolling restart. |
@@ -142,8 +144,9 @@ Status: completed for the initial catalog and DeleteGroups slice.
 - Controller-style KV/node/router/license/node-id/group mutations now have a
   committed Raft record path with replay and non-leader fencing. Stream/object
   mutations now have a committed Raft snapshot path with replay and non-leader
-  fencing. Remaining gap: compact these records into Raft snapshots and add
-  multi-node replication/failover compatibility tests.
+  fencing. Single-node leaders now compact these records by appending a full
+  AutoMQ metadata/ObjectManager snapshot record before Raft truncation. Remaining
+  gap: add multi-node replication/failover compatibility tests.
 - Add state-machine tests for prepared, committed, destroyed, expired, and
   compacted objects.
 

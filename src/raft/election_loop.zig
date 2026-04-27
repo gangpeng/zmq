@@ -27,6 +27,10 @@ pub const ElectionLoop = struct {
     /// PreparedObjectRegistry. Returns serialized data that is set on
     /// raft_state.prepared_registry_data before takeSnapshot() persists it.
     pre_snapshot_fn: ?*const fn () ?[]const u8 = null,
+    /// Optional callback invoked before snapshot truncation. Return false to
+    /// skip this snapshot when the broker cannot first materialize a complete
+    /// state-machine snapshot into the committed log.
+    prepare_snapshot_fn: ?*const fn () bool = null,
     /// Allocator for freeing pre_snapshot_fn results.
     snapshot_allocator: ?std.mem.Allocator = null,
 
@@ -110,6 +114,12 @@ pub const ElectionLoop = struct {
             // Periodic snapshot check (every ~10 seconds)
             if (self.tick_counter % 100 == 0) {
                 if (self.raft_state.shouldSnapshot(1000)) {
+                    if (self.prepare_snapshot_fn) |prepare_fn| {
+                        if (!prepare_fn()) {
+                            log.warn("Skipping Raft snapshot because broker state-machine snapshot preparation failed", .{});
+                            continue;
+                        }
+                    }
                     // Serialize prepared object registry before snapshot so it
                     // survives Raft log truncation
                     if (self.pre_snapshot_fn) |pre_fn| {
