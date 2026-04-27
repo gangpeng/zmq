@@ -4958,50 +4958,98 @@ pub const Broker = struct {
     // OffsetForLeaderEpoch (key 23)
     // ---------------------------------------------------------------
     fn handleOffsetForLeaderEpoch(self: *Broker, request_bytes: []const u8, body_start: usize, req_header: *const RequestHeader, api_version: i16, resp_header_version: i16) ?[]u8 {
-        _ = api_version;
+        const Req = generated.offset_for_leader_epoch_request.OffsetForLeaderEpochRequest;
+        const Resp = generated.offset_for_leader_epoch_response.OffsetForLeaderEpochResponse;
+        const TopicResult = Resp.OffsetForLeaderTopicResult;
+        const PartitionResult = TopicResult.EpochEndOffset;
+
+        if (!validateOffsetForLeaderEpochRequestFrame(request_bytes, body_start, api_version)) {
+            log.warn("Malformed OffsetForLeaderEpoch request", .{});
+            return null;
+        }
+
         var pos = body_start;
-        // v2+: replica_id
-        _ = ser.readI32(request_bytes, &pos); // replica_id
+        var req = Req.deserialize(self.allocator, request_bytes, &pos, api_version) catch |err| {
+            log.warn("Failed to decode OffsetForLeaderEpoch request: {}", .{err});
+            return null;
+        };
+        defer self.freeOffsetForLeaderEpochRequest(&req);
 
-        const num_topics = (ser.readArrayLen(request_bytes, &pos) catch 0) orelse 0;
+        const topics = self.allocator.alloc(TopicResult, req.topics.len) catch return null;
+        var topics_init: usize = 0;
+        defer {
+            self.freeOffsetForLeaderEpochTopics(topics[0..topics_init]);
+            if (topics.len > 0) self.allocator.free(topics);
+        }
 
-        var buf = self.allocator.alloc(u8, 4096) catch return null;
-        var wpos: usize = 0;
-        const rh = ResponseHeader{ .correlation_id = req_header.correlation_id };
-        rh.serialize(buf, &wpos, resp_header_version);
-        ser.writeI32(buf, &wpos, 0); // throttle_time_ms
-        ser.writeArrayLen(buf, &wpos, num_topics);
+        for (req.topics) |topic_req| {
+            const partitions = self.allocator.alloc(PartitionResult, topic_req.partitions.len) catch return null;
+            var transferred = false;
+            defer {
+                if (!transferred and partitions.len > 0) self.allocator.free(partitions);
+            }
 
-        for (0..num_topics) |_| {
-            const topic = (ser.readString(request_bytes, &pos) catch break) orelse "";
-            const num_parts = (ser.readArrayLen(request_bytes, &pos) catch 0) orelse 0;
+            const topic = topic_req.topic orelse "";
+            for (topic_req.partitions, 0..) |partition_req, partition_idx| {
+                partitions[partition_idx] = self.offsetForLeaderEpochResult(topic, partition_req, api_version);
+            }
 
-            ser.writeString(buf, &wpos, topic);
-            ser.writeArrayLen(buf, &wpos, num_parts);
+            topics[topics_init] = .{
+                .topic = topic_req.topic,
+                .partitions = partitions,
+            };
+            topics_init += 1;
+            transferred = true;
+        }
 
-            for (0..num_parts) |_| {
-                const partition = ser.readI32(request_bytes, &pos);
-                _ = ser.readI32(request_bytes, &pos); // current_leader_epoch
-                const leader_epoch = ser.readI32(request_bytes, &pos);
-                _ = leader_epoch;
+        const resp = Resp{
+            .throttle_time_ms = 0,
+            .topics = topics[0..topics_init],
+        };
+        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+    }
 
-                // Get the end offset for this leader epoch
-                const pkey = std.fmt.allocPrint(self.allocator, "{s}-{d}", .{ topic, partition }) catch continue;
-                defer self.allocator.free(pkey);
-                const end_offset: i64 = if (self.store.partitions.get(pkey)) |state|
-                    @intCast(state.high_watermark)
-                else
-                    -1;
+    fn freeOffsetForLeaderEpochRequest(self: *Broker, req: *generated.offset_for_leader_epoch_request.OffsetForLeaderEpochRequest) void {
+        for (req.topics) |topic| {
+            if (topic.partitions.len > 0) self.allocator.free(topic.partitions);
+        }
+        if (req.topics.len > 0) self.allocator.free(req.topics);
+    }
 
-                ser.writeI16(buf, &wpos, 0); // error_code
-                ser.writeI32(buf, &wpos, partition);
-                ser.writeI32(buf, &wpos, if (self.raft_state) |rs| rs.current_epoch else self.cached_leader_epoch); // leader_epoch
-                ser.writeI64(buf, &wpos, end_offset); // end_offset
+    fn freeOffsetForLeaderEpochTopics(self: *Broker, topics: []const generated.offset_for_leader_epoch_response.OffsetForLeaderEpochResponse.OffsetForLeaderTopicResult) void {
+        for (topics) |topic| {
+            if (topic.partitions.len > 0) self.allocator.free(topic.partitions);
+        }
+    }
+
+    fn offsetForLeaderEpochResult(self: *Broker, topic: []const u8, partition_req: generated.offset_for_leader_epoch_request.OffsetForLeaderEpochRequest.OffsetForLeaderTopic.OffsetForLeaderPartition, api_version: i16) generated.offset_for_leader_epoch_response.OffsetForLeaderEpochResponse.OffsetForLeaderTopicResult.EpochEndOffset {
+        const current_epoch = if (self.raft_state) |rs| rs.current_epoch else self.cached_leader_epoch;
+        const state = self.partitionState(topic, partition_req.partition);
+        var error_code: i16 = if (state == null)
+            @intFromEnum(ErrorCode.unknown_topic_or_partition)
+        else
+            @intFromEnum(ErrorCode.none);
+
+        if (error_code == 0 and api_version >= 2 and partition_req.current_leader_epoch >= 0) {
+            if (partition_req.current_leader_epoch > current_epoch) {
+                error_code = @intFromEnum(ErrorCode.unknown_leader_epoch);
+            } else if (partition_req.current_leader_epoch < current_epoch) {
+                error_code = @intFromEnum(ErrorCode.fenced_leader_epoch);
             }
         }
 
-        if (resp_header_version >= 1) ser.writeEmptyTaggedFields(buf, &wpos);
-        return (self.allocator.realloc(buf, wpos) catch buf)[0..wpos];
+        return .{
+            .error_code = error_code,
+            .partition = partition_req.partition,
+            .leader_epoch = if (error_code == 0) current_epoch else -1,
+            .end_offset = if (error_code == 0) clampU64ToI64(state.?.high_watermark) else -1,
+        };
+    }
+
+    fn partitionState(self: *Broker, topic: []const u8, partition_index: i32) ?PartitionStore.PartitionState {
+        var key_buf: [512]u8 = undefined;
+        const key = std.fmt.bufPrint(&key_buf, "{s}-{d}", .{ topic, partition_index }) catch return null;
+        return self.store.partitions.get(key);
     }
 
     // ---------------------------------------------------------------
@@ -5985,6 +6033,27 @@ pub const Broker = struct {
         return true;
     }
 
+    fn validateOffsetForLeaderEpochRequestFrame(buf: []const u8, start_pos: usize, api_version: i16) bool {
+        const flexible = api_version >= 4;
+        var pos = start_pos;
+
+        if (api_version >= 3 and !skipFixedBytes(buf, &pos, 4)) return false; // replica_id
+        const topic_count = readKafkaArrayCount(buf, &pos, flexible) orelse return false;
+        for (0..topic_count) |_| {
+            if (!skipKafkaString(buf, &pos, flexible)) return false; // topic
+            const partition_count = readKafkaArrayCount(buf, &pos, flexible) orelse return false;
+            for (0..partition_count) |_| {
+                if (!skipFixedBytes(buf, &pos, 4)) return false; // partition
+                if (api_version >= 2 and !skipFixedBytes(buf, &pos, 4)) return false; // current_leader_epoch
+                if (!skipFixedBytes(buf, &pos, 4)) return false; // leader_epoch
+                if (flexible) ser.skipTaggedFields(buf, &pos) catch return false;
+            }
+            if (flexible) ser.skipTaggedFields(buf, &pos) catch return false;
+        }
+        if (flexible) ser.skipTaggedFields(buf, &pos) catch return false;
+        return true;
+    }
+
     fn validateVoteRequestFrame(buf: []const u8, start_pos: usize, api_version: i16) bool {
         var pos = start_pos;
 
@@ -6778,6 +6847,128 @@ test "Broker.handleRequest DeleteGroups v2 deletes empty group" {
     try testing.expectEqualStrings("delete-me", group_id);
     try testing.expectEqual(@as(i16, 0), ser.readI16(response.?, &rpos));
     try testing.expectEqual(@as(usize, 0), broker.groups.groupCount());
+}
+
+test "Broker.handleRequest OffsetForLeaderEpoch v0 returns generated legacy response" {
+    const Req = generated.offset_for_leader_epoch_request.OffsetForLeaderEpochRequest;
+    const Resp = generated.offset_for_leader_epoch_response.OffsetForLeaderEpochResponse;
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+    try testing.expect(broker.ensureTopic("leader-epoch-topic"));
+    broker.store.partitions.getPtr("leader-epoch-topic-0").?.high_watermark = 7;
+
+    const partitions = [_]Req.OffsetForLeaderTopic.OffsetForLeaderPartition{.{
+        .partition = 0,
+        .leader_epoch = 0,
+    }};
+    const topics = [_]Req.OffsetForLeaderTopic{.{
+        .topic = "leader-epoch-topic",
+        .partitions = &partitions,
+    }};
+    const req = Req{ .topics = &topics };
+
+    var buf: [512]u8 = undefined;
+    var pos = buildTestRequest(&buf, 23, 0, 2300, header_mod.requestHeaderVersion(23, 0));
+    req.serialize(&buf, &pos, 0);
+
+    const response = broker.handleRequest(buf[0..pos]);
+    try testing.expect(response != null);
+    defer testing.allocator.free(response.?);
+
+    var rpos: usize = 0;
+    var response_header = try ResponseHeader.deserialize(testing.allocator, response.?, &rpos, header_mod.responseHeaderVersion(23, 0));
+    defer response_header.deinit(testing.allocator);
+    try testing.expectEqual(@as(i32, 2300), response_header.correlation_id);
+
+    const resp = try Resp.deserialize(testing.allocator, response.?, &rpos, 0);
+    defer {
+        for (resp.topics) |topic| {
+            if (topic.partitions.len > 0) testing.allocator.free(topic.partitions);
+        }
+        if (resp.topics.len > 0) testing.allocator.free(resp.topics);
+    }
+
+    try testing.expectEqual(response.?.len, rpos);
+    try testing.expectEqual(@as(usize, 1), resp.topics.len);
+    try testing.expectEqualStrings("leader-epoch-topic", resp.topics[0].topic.?);
+    try testing.expectEqual(@as(usize, 1), resp.topics[0].partitions.len);
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.none)), resp.topics[0].partitions[0].error_code);
+    try testing.expectEqual(@as(i32, 0), resp.topics[0].partitions[0].partition);
+    try testing.expectEqual(@as(i32, -1), resp.topics[0].partitions[0].leader_epoch);
+    try testing.expectEqual(@as(i64, 7), resp.topics[0].partitions[0].end_offset);
+}
+
+test "Broker.handleRequest OffsetForLeaderEpoch v4 returns generated flexible response" {
+    const Req = generated.offset_for_leader_epoch_request.OffsetForLeaderEpochRequest;
+    const Resp = generated.offset_for_leader_epoch_response.OffsetForLeaderEpochResponse;
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+    broker.cached_leader_epoch = 5;
+    try testing.expect(broker.ensureTopic("leader-epoch-flex-topic"));
+    broker.store.partitions.getPtr("leader-epoch-flex-topic-0").?.high_watermark = 9;
+
+    const partitions = [_]Req.OffsetForLeaderTopic.OffsetForLeaderPartition{
+        .{
+            .partition = 0,
+            .current_leader_epoch = 5,
+            .leader_epoch = 4,
+        },
+        .{
+            .partition = 0,
+            .current_leader_epoch = 4,
+            .leader_epoch = 3,
+        },
+    };
+    const topics = [_]Req.OffsetForLeaderTopic{.{
+        .topic = "leader-epoch-flex-topic",
+        .partitions = &partitions,
+    }};
+    const req = Req{
+        .replica_id = -1,
+        .topics = &topics,
+    };
+
+    var buf: [512]u8 = undefined;
+    var pos = buildTestRequest(&buf, 23, 4, 2304, header_mod.requestHeaderVersion(23, 4));
+    req.serialize(&buf, &pos, 4);
+
+    const response = broker.handleRequest(buf[0..pos]);
+    try testing.expect(response != null);
+    defer testing.allocator.free(response.?);
+
+    var rpos: usize = 0;
+    var response_header = try ResponseHeader.deserialize(testing.allocator, response.?, &rpos, header_mod.responseHeaderVersion(23, 4));
+    defer response_header.deinit(testing.allocator);
+    try testing.expectEqual(@as(i32, 2304), response_header.correlation_id);
+
+    const resp = try Resp.deserialize(testing.allocator, response.?, &rpos, 4);
+    defer {
+        for (resp.topics) |topic| {
+            if (topic.partitions.len > 0) testing.allocator.free(topic.partitions);
+        }
+        if (resp.topics.len > 0) testing.allocator.free(resp.topics);
+    }
+
+    try testing.expectEqual(response.?.len, rpos);
+    try testing.expectEqual(@as(i32, 0), resp.throttle_time_ms);
+    try testing.expectEqual(@as(usize, 2), resp.topics[0].partitions.len);
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.none)), resp.topics[0].partitions[0].error_code);
+    try testing.expectEqual(@as(i32, 5), resp.topics[0].partitions[0].leader_epoch);
+    try testing.expectEqual(@as(i64, 9), resp.topics[0].partitions[0].end_offset);
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.fenced_leader_epoch)), resp.topics[0].partitions[1].error_code);
+    try testing.expectEqual(@as(i32, -1), resp.topics[0].partitions[1].leader_epoch);
+    try testing.expectEqual(@as(i64, -1), resp.topics[0].partitions[1].end_offset);
+}
+
+test "Broker.handleRequest OffsetForLeaderEpoch rejects truncated request" {
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+
+    var buf: [128]u8 = undefined;
+    const req_len = buildTestRequest(&buf, 23, 4, 2305, header_mod.requestHeaderVersion(23, 4));
+    try testing.expect(broker.handleRequest(buf[0..req_len]) == null);
 }
 
 test "Broker.handleRequest OffsetDelete returns generated response and deletes offsets" {
