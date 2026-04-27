@@ -3453,62 +3453,120 @@ pub const Broker = struct {
     // CreatePartitions (key 37)
     // ---------------------------------------------------------------
     fn handleCreatePartitions(self: *Broker, request_bytes: []const u8, body_start: usize, req_header: *const RequestHeader, api_version: i16, resp_header_version: i16) ?[]u8 {
-        _ = api_version;
-        var pos = body_start;
-        const num_topics = (ser.readArrayLen(request_bytes, &pos) catch 0) orelse 0;
+        const Req = generated.create_partitions_request.CreatePartitionsRequest;
+        const Resp = generated.create_partitions_response.CreatePartitionsResponse;
+        const TopicResult = Resp.CreatePartitionsTopicResult;
 
-        var results: [64]struct { name: []const u8, error_code: i16 } = undefined;
-        var count: usize = 0;
-        var mutated = false;
-
-        for (0..num_topics) |_| {
-            if (count >= 64) break;
-            const topic_name = (ser.readString(request_bytes, &pos) catch break) orelse "";
-            const new_total_count = ser.readI32(request_bytes, &pos);
-            // Skip assignments array
-            const num_assigns = (ser.readArrayLen(request_bytes, &pos) catch 0) orelse 0;
-            for (0..num_assigns) |_| {
-                const num_broker_ids = (ser.readArrayLen(request_bytes, &pos) catch 0) orelse 0;
-                pos += num_broker_ids * 4;
-            }
-
-            // Update topic partition count
-            if (self.topics.getPtr(topic_name)) |info| {
-                if (new_total_count > info.num_partitions) {
-                    const old_total_count = info.num_partitions;
-                    info.num_partitions = new_total_count;
-                    // Ensure new partitions exist in store
-                    for (@as(usize, @intCast(old_total_count))..@as(usize, @intCast(new_total_count))) |pi| {
-                        self.store.ensurePartition(topic_name, @intCast(pi)) catch {};
-                    }
-                    results[count] = .{ .name = topic_name, .error_code = 0 };
-                    mutated = true;
-                } else {
-                    results[count] = .{ .name = topic_name, .error_code = 37 }; // INVALID_PARTITIONS
-                }
-            } else {
-                results[count] = .{ .name = topic_name, .error_code = 3 }; // UNKNOWN_TOPIC_OR_PARTITION
-            }
-            count += 1;
+        if (!validateCreatePartitionsRequestFrame(request_bytes, body_start, api_version)) {
+            log.warn("Malformed CreatePartitions request", .{});
+            return null;
         }
+
+        var pos = body_start;
+        var req = Req.deserialize(self.allocator, request_bytes, &pos, api_version) catch |err| {
+            log.warn("Failed to decode CreatePartitions request: {}", .{err});
+            return null;
+        };
+        defer self.freeCreatePartitionsRequest(&req);
+
+        const results = self.allocator.alloc(TopicResult, req.topics.len) catch return null;
+        defer if (results.len > 0) self.allocator.free(results);
+
+        var mutated = false;
+        for (req.topics, 0..) |topic_req, i| {
+            const result = self.applyCreatePartitionsTopic(topic_req, req.validate_only);
+            results[i] = .{
+                .name = topic_req.name,
+                .error_code = result.error_code,
+                .error_message = result.error_message,
+            };
+            if (result.mutated) mutated = true;
+        }
+
         if (mutated) {
             self.persistTopics();
             self.persistObjectManagerSnapshot();
         }
 
-        var buf = self.allocator.alloc(u8, 2048) catch return null;
-        var wpos: usize = 0;
-        const rh = ResponseHeader{ .correlation_id = req_header.correlation_id };
-        rh.serialize(buf, &wpos, resp_header_version);
-        ser.writeI32(buf, &wpos, 0); // throttle_time_ms
-        ser.writeArrayLen(buf, &wpos, count);
-        for (0..count) |i| {
-            ser.writeString(buf, &wpos, results[i].name);
-            ser.writeI16(buf, &wpos, results[i].error_code);
-            ser.writeString(buf, &wpos, null); // error_message
+        const resp = Resp{
+            .throttle_time_ms = 0,
+            .results = results,
+        };
+        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+    }
+
+    fn freeCreatePartitionsRequest(self: *Broker, req: *generated.create_partitions_request.CreatePartitionsRequest) void {
+        for (req.topics) |topic| {
+            for (topic.assignments) |assignment| {
+                if (assignment.broker_ids.len > 0) self.allocator.free(assignment.broker_ids);
+            }
+            if (topic.assignments.len > 0) self.allocator.free(topic.assignments);
         }
-        if (resp_header_version >= 1) ser.writeEmptyTaggedFields(buf, &wpos);
-        return (self.allocator.realloc(buf, wpos) catch buf)[0..wpos];
+        if (req.topics.len > 0) self.allocator.free(req.topics);
+    }
+
+    const CreatePartitionsTopicResult = struct {
+        error_code: i16,
+        error_message: ?[]const u8 = null,
+        mutated: bool = false,
+    };
+
+    fn applyCreatePartitionsTopic(self: *Broker, topic_req: generated.create_partitions_request.CreatePartitionsRequest.CreatePartitionsTopic, validate_only: bool) CreatePartitionsTopicResult {
+        const topic_name = topic_req.name orelse return .{
+            .error_code = @intFromEnum(ErrorCode.invalid_request),
+            .error_message = "Missing topic name",
+        };
+
+        const info = self.topics.getPtr(topic_name) orelse return .{
+            .error_code = @intFromEnum(ErrorCode.unknown_topic_or_partition),
+            .error_message = "Unknown topic",
+        };
+
+        if (topic_req.count <= info.num_partitions) {
+            return .{
+                .error_code = @intFromEnum(ErrorCode.invalid_partitions),
+                .error_message = "New partition count must be larger than existing count",
+            };
+        }
+
+        const added_count: usize = @intCast(topic_req.count - info.num_partitions);
+        if (topic_req.assignments.len > 0) {
+            if (topic_req.assignments.len != added_count) {
+                return .{
+                    .error_code = @intFromEnum(ErrorCode.invalid_replica_assignment),
+                    .error_message = "Assignment count must match new partitions",
+                };
+            }
+            for (topic_req.assignments) |assignment| {
+                if (assignment.broker_ids.len != 1 or assignment.broker_ids[0] != self.node_id) {
+                    return .{
+                        .error_code = @intFromEnum(ErrorCode.invalid_replica_assignment),
+                        .error_message = "Only single-node assignments to this broker are supported",
+                    };
+                }
+            }
+        }
+
+        if (validate_only) {
+            return .{ .error_code = @intFromEnum(ErrorCode.none) };
+        }
+
+        const old_total_count = info.num_partitions;
+        info.num_partitions = topic_req.count;
+        for (@as(usize, @intCast(old_total_count))..@as(usize, @intCast(topic_req.count))) |pi| {
+            self.store.ensurePartition(topic_name, @intCast(pi)) catch |err| {
+                log.warn("Failed to create partition {s}-{d}: {}", .{ topic_name, pi, err });
+                return .{
+                    .error_code = @intFromEnum(ErrorCode.kafka_storage_error),
+                    .error_message = "Failed to create partition storage",
+                };
+            };
+        }
+
+        return .{
+            .error_code = @intFromEnum(ErrorCode.none),
+            .mutated = true,
+        };
     }
 
     // ---------------------------------------------------------------
@@ -6612,6 +6670,26 @@ pub const Broker = struct {
         return true;
     }
 
+    fn validateCreatePartitionsRequestFrame(buf: []const u8, start_pos: usize, api_version: i16) bool {
+        const flexible = api_version >= 2;
+        var pos = start_pos;
+
+        const topic_count = readKafkaArrayCount(buf, &pos, flexible) orelse return false;
+        for (0..topic_count) |_| {
+            if (!skipKafkaString(buf, &pos, flexible)) return false; // topic name
+            if (!skipFixedBytes(buf, &pos, 4)) return false; // count
+            const assignment_count = readKafkaArrayCount(buf, &pos, flexible) orelse return false;
+            for (0..assignment_count) |_| {
+                if (!skipKafkaI32Array(buf, &pos, flexible)) return false; // broker_ids
+                if (flexible) ser.skipTaggedFields(buf, &pos) catch return false;
+            }
+            if (flexible) ser.skipTaggedFields(buf, &pos) catch return false;
+        }
+        if (!skipFixedBytes(buf, &pos, 5)) return false; // timeout_ms + validate_only
+        if (flexible) ser.skipTaggedFields(buf, &pos) catch return false;
+        return true;
+    }
+
     fn validateIncrementalAlterConfigsRequestFrame(buf: []const u8, start_pos: usize, api_version: i16) bool {
         const flexible = api_version >= 1;
         var pos = start_pos;
@@ -7991,6 +8069,100 @@ test "Broker.handleRequest AlterConfigs rejects truncated request" {
 
     var buf: [128]u8 = undefined;
     const req_len = buildTestRequest(&buf, 33, 2, 3304, header_mod.requestHeaderVersion(33, 2));
+    try testing.expect(broker.handleRequest(buf[0..req_len]) == null);
+}
+
+test "Broker.handleRequest CreatePartitions v2 returns generated response and expands topic" {
+    const Req = generated.create_partitions_request.CreatePartitionsRequest;
+    const Resp = generated.create_partitions_response.CreatePartitionsResponse;
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+    try testing.expect(broker.ensureTopic("create-partitions-topic"));
+
+    const topics = [_]Req.CreatePartitionsTopic{.{
+        .name = "create-partitions-topic",
+        .count = 3,
+        .assignments = &.{},
+    }};
+    const req = Req{
+        .topics = &topics,
+        .timeout_ms = 30000,
+        .validate_only = false,
+    };
+
+    var buf: [512]u8 = undefined;
+    var pos = buildTestRequest(&buf, 37, 2, 3702, header_mod.requestHeaderVersion(37, 2));
+    req.serialize(&buf, &pos, 2);
+
+    const response = broker.handleRequest(buf[0..pos]);
+    try testing.expect(response != null);
+    defer testing.allocator.free(response.?);
+
+    var rpos: usize = 0;
+    var response_header = try ResponseHeader.deserialize(testing.allocator, response.?, &rpos, header_mod.responseHeaderVersion(37, 2));
+    defer response_header.deinit(testing.allocator);
+    try testing.expectEqual(@as(i32, 3702), response_header.correlation_id);
+
+    const resp = try Resp.deserialize(testing.allocator, response.?, &rpos, 2);
+    defer if (resp.results.len > 0) testing.allocator.free(resp.results);
+
+    try testing.expectEqual(response.?.len, rpos);
+    try testing.expectEqual(@as(i32, 0), resp.throttle_time_ms);
+    try testing.expectEqual(@as(usize, 1), resp.results.len);
+    try testing.expectEqualStrings("create-partitions-topic", resp.results[0].name.?);
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.none)), resp.results[0].error_code);
+    try testing.expectEqual(@as(i32, 3), broker.topics.get("create-partitions-topic").?.num_partitions);
+    try testing.expect(broker.store.partitions.contains("create-partitions-topic-2"));
+}
+
+test "Broker.handleRequest CreatePartitions validate_only does not expand topic" {
+    const Req = generated.create_partitions_request.CreatePartitionsRequest;
+    const Resp = generated.create_partitions_response.CreatePartitionsResponse;
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+    try testing.expect(broker.ensureTopic("create-partitions-validate-topic"));
+
+    const before = broker.topics.get("create-partitions-validate-topic").?.num_partitions;
+    const topics = [_]Req.CreatePartitionsTopic{.{
+        .name = "create-partitions-validate-topic",
+        .count = before + 2,
+        .assignments = &.{},
+    }};
+    const req = Req{
+        .topics = &topics,
+        .timeout_ms = 30000,
+        .validate_only = true,
+    };
+
+    var buf: [512]u8 = undefined;
+    var pos = buildTestRequest(&buf, 37, 2, 3703, header_mod.requestHeaderVersion(37, 2));
+    req.serialize(&buf, &pos, 2);
+
+    const response = broker.handleRequest(buf[0..pos]);
+    try testing.expect(response != null);
+    defer testing.allocator.free(response.?);
+
+    var rpos: usize = 0;
+    var response_header = try ResponseHeader.deserialize(testing.allocator, response.?, &rpos, header_mod.responseHeaderVersion(37, 2));
+    defer response_header.deinit(testing.allocator);
+    try testing.expectEqual(@as(i32, 3703), response_header.correlation_id);
+
+    const resp = try Resp.deserialize(testing.allocator, response.?, &rpos, 2);
+    defer if (resp.results.len > 0) testing.allocator.free(resp.results);
+
+    try testing.expectEqual(response.?.len, rpos);
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.none)), resp.results[0].error_code);
+    try testing.expectEqual(before, broker.topics.get("create-partitions-validate-topic").?.num_partitions);
+}
+
+test "Broker.handleRequest CreatePartitions rejects truncated request" {
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+
+    var buf: [128]u8 = undefined;
+    const req_len = buildTestRequest(&buf, 37, 2, 3704, header_mod.requestHeaderVersion(37, 2));
     try testing.expect(broker.handleRequest(buf[0..req_len]) == null);
 }
 
