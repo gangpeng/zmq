@@ -2664,47 +2664,42 @@ pub const Broker = struct {
     // OffsetCommit (key 8)
     // ---------------------------------------------------------------
     fn handleOffsetCommit(self: *Broker, request_bytes: []const u8, body_start: usize, req_header: *const RequestHeader, api_version: i16, resp_header_version: i16) ?[]u8 {
-        var pos = body_start;
-        const flexible = api_version >= 8;
-        const group_id = if (flexible)
-            ((ser.readCompactString(request_bytes, &pos) catch return null) orelse "")
-        else
-            ((ser.readString(request_bytes, &pos) catch return null) orelse "");
-        _ = ser.readI32(request_bytes, &pos); // generation_id
-        if (flexible) {
-            _ = ser.readCompactString(request_bytes, &pos) catch return null; // member_id
-        } else {
-            _ = ser.readString(request_bytes, &pos) catch return null; // member_id
+        const Req = generated.offset_commit_request.OffsetCommitRequest;
+        const Resp = generated.offset_commit_response.OffsetCommitResponse;
+        const TopicResponse = Resp.OffsetCommitResponseTopic;
+        const PartitionResponse = TopicResponse.OffsetCommitResponsePartition;
+
+        if (!validateOffsetCommitRequestFrame(request_bytes, body_start, api_version)) {
+            log.warn("Malformed OffsetCommit request", .{});
+            return null;
         }
 
-        const num_topics = if (flexible)
-            (ser.readCompactArrayLen(request_bytes, &pos) catch return null) orelse 0
-        else
-            @as(usize, @intCast(@max(ser.readI32(request_bytes, &pos), 0)));
+        var pos = body_start;
+        var req = Req.deserialize(self.allocator, request_bytes, &pos, api_version) catch |err| {
+            log.warn("Failed to decode OffsetCommit request: {}", .{err});
+            return null;
+        };
+        defer self.freeOffsetCommitRequest(&req);
 
-        var resp_buf = self.allocator.alloc(u8, 4096) catch return null;
-        var wpos: usize = 0;
-        const resp_header = ResponseHeader{ .correlation_id = req_header.correlation_id };
-        resp_header.serialize(resp_buf, &wpos, resp_header_version);
-        if (api_version >= 3) ser.writeI32(resp_buf, &wpos, 0); // throttle_time_ms
-        if (flexible) ser.writeCompactArrayLen(resp_buf, &wpos, num_topics) else ser.writeArrayLen(resp_buf, &wpos, num_topics);
+        const topics = self.allocator.alloc(TopicResponse, req.topics.len) catch return null;
+        var topics_init: usize = 0;
+        defer {
+            self.freeOffsetCommitTopics(topics[0..topics_init]);
+            if (topics.len > 0) self.allocator.free(topics);
+        }
 
-        for (0..num_topics) |_| {
-            const topic_name = if (flexible)
-                ((ser.readCompactString(request_bytes, &pos) catch return null) orelse "")
-            else
-                ((ser.readString(request_bytes, &pos) catch return null) orelse "");
-            if (flexible) ser.writeCompactString(resp_buf, &wpos, topic_name) else ser.writeString(resp_buf, &wpos, topic_name);
+        const group_id = req.group_id orelse "";
+        for (req.topics) |topic_req| {
+            const partitions = self.allocator.alloc(PartitionResponse, topic_req.partitions.len) catch return null;
+            var transferred = false;
+            defer {
+                if (!transferred and partitions.len > 0) self.allocator.free(partitions);
+            }
 
-            const num_partitions = if (flexible)
-                (ser.readCompactArrayLen(request_bytes, &pos) catch return null) orelse 0
-            else
-                @as(usize, @intCast(@max(ser.readI32(request_bytes, &pos), 0)));
-            if (flexible) ser.writeCompactArrayLen(resp_buf, &wpos, num_partitions) else ser.writeArrayLen(resp_buf, &wpos, num_partitions);
-
-            for (0..num_partitions) |_| {
-                const partition_id = ser.readI32(request_bytes, &pos);
-                const offset = ser.readI64(request_bytes, &pos);
+            const topic_name = topic_req.name orelse "";
+            for (topic_req.partitions, 0..) |partition_req, partition_idx| {
+                const partition_id = partition_req.partition_index;
+                const offset = partition_req.committed_offset;
 
                 // Look up the log end offset (next_offset) for lag computation
                 const leo: ?i64 = blk: {
@@ -2722,16 +2717,40 @@ pub const Broker = struct {
                 // The partition in __consumer_offsets is determined by hash(group_id) % 50
                 self.writeOffsetCommitRecord(group_id, topic_name, partition_id, offset);
 
-                ser.writeI32(resp_buf, &wpos, partition_id);
-                ser.writeI16(resp_buf, &wpos, 0);
-                if (flexible) ser.writeEmptyTaggedFields(resp_buf, &wpos);
+                partitions[partition_idx] = .{
+                    .partition_index = partition_id,
+                    .error_code = @intFromEnum(ErrorCode.none),
+                };
             }
-            if (flexible) ser.writeEmptyTaggedFields(resp_buf, &wpos);
+
+            topics[topics_init] = .{
+                .name = topic_req.name,
+                .partitions = partitions,
+            };
+            topics_init += 1;
+            transferred = true;
         }
 
-        if (resp_header_version >= 1) ser.writeEmptyTaggedFields(resp_buf, &wpos);
         self.persistOffsets();
-        return (self.allocator.realloc(resp_buf, wpos) catch resp_buf)[0..wpos];
+
+        const resp = Resp{
+            .throttle_time_ms = 0,
+            .topics = topics[0..topics_init],
+        };
+        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+    }
+
+    fn freeOffsetCommitRequest(self: *Broker, req: *generated.offset_commit_request.OffsetCommitRequest) void {
+        for (req.topics) |topic| {
+            if (topic.partitions.len > 0) self.allocator.free(topic.partitions);
+        }
+        if (req.topics.len > 0) self.allocator.free(req.topics);
+    }
+
+    fn freeOffsetCommitTopics(self: *Broker, topics: []const generated.offset_commit_response.OffsetCommitResponse.OffsetCommitResponseTopic) void {
+        for (topics) |topic| {
+            if (topic.partitions.len > 0) self.allocator.free(topic.partitions);
+        }
     }
 
     // ---------------------------------------------------------------
@@ -7131,6 +7150,39 @@ pub const Broker = struct {
         return true;
     }
 
+    fn validateOffsetCommitRequestFrame(buf: []const u8, start_pos: usize, api_version: i16) bool {
+        const flexible = api_version >= 8;
+        var pos = start_pos;
+
+        if (!skipKafkaString(buf, &pos, flexible)) return false; // group_id
+        if (api_version >= 1) {
+            if (!skipFixedBytes(buf, &pos, 4)) return false; // generation_id_or_member_epoch
+            if (!skipKafkaString(buf, &pos, flexible)) return false; // member_id
+        }
+        if (api_version >= 7) {
+            if (!skipKafkaString(buf, &pos, flexible)) return false; // group_instance_id
+        }
+        if (api_version >= 2 and api_version <= 4) {
+            if (!skipFixedBytes(buf, &pos, 8)) return false; // retention_time_ms
+        }
+
+        const topic_count = readKafkaArrayCount(buf, &pos, flexible) orelse return false;
+        for (0..topic_count) |_| {
+            if (!skipKafkaString(buf, &pos, flexible)) return false; // topic name
+            const partition_count = readKafkaArrayCount(buf, &pos, flexible) orelse return false;
+            for (0..partition_count) |_| {
+                if (!skipFixedBytes(buf, &pos, 12)) return false; // partition_index + committed_offset
+                if (api_version >= 6 and !skipFixedBytes(buf, &pos, 4)) return false; // committed_leader_epoch
+                if (api_version == 1 and !skipFixedBytes(buf, &pos, 8)) return false; // commit_timestamp
+                if (!skipKafkaString(buf, &pos, flexible)) return false; // committed_metadata
+                if (flexible) ser.skipTaggedFields(buf, &pos) catch return false;
+            }
+            if (flexible) ser.skipTaggedFields(buf, &pos) catch return false;
+        }
+        if (flexible) ser.skipTaggedFields(buf, &pos) catch return false;
+        return true;
+    }
+
     fn validateInitProducerIdRequestFrame(buf: []const u8, start_pos: usize, api_version: i16) bool {
         const flexible = api_version >= 2;
         var pos = start_pos;
@@ -11489,10 +11541,10 @@ test "Broker.handleRequest OffsetCommit and OffsetFetch round-trip" {
     var broker = Broker.init(testing.allocator, 1, 9092);
     defer broker.deinit();
 
-    // OffsetCommit (key=8, v0)
+    // OffsetCommit (key=8, v5)
     {
         var buf: [512]u8 = undefined;
-        var pos = buildTestRequest(&buf, 8, 0, 40, 1);
+        var pos = buildTestRequest(&buf, 8, 5, 40, header_mod.requestHeaderVersion(8, 5));
         ser.writeString(&buf, &pos, "oc-group"); // group_id
         ser.writeI32(&buf, &pos, 1); // generation_id
         ser.writeString(&buf, &pos, "member-1"); // member_id
@@ -11503,6 +11555,7 @@ test "Broker.handleRequest OffsetCommit and OffsetFetch round-trip" {
         ser.writeI32(&buf, &pos, 1);
         ser.writeI32(&buf, &pos, 0); // partition_index
         ser.writeI64(&buf, &pos, 42); // committed offset
+        ser.writeString(&buf, &pos, null); // committed metadata
 
         const resp = broker.handleRequest(buf[0..pos]);
         try testing.expect(resp != null);
@@ -11533,6 +11586,74 @@ test "Broker.handleRequest OffsetCommit and OffsetFetch round-trip" {
     // Verify offset was persisted in group coordinator
     const committed = try broker.groups.fetchOffset("oc-group", "oc-topic", 0);
     try testing.expectEqual(@as(i64, 42), committed.?);
+}
+
+test "Broker.handleRequest OffsetCommit v8 returns generated response and commits offset" {
+    const Req = generated.offset_commit_request.OffsetCommitRequest;
+    const Resp = generated.offset_commit_response.OffsetCommitResponse;
+    const Topic = Req.OffsetCommitRequestTopic;
+    const Partition = Topic.OffsetCommitRequestPartition;
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+
+    const partitions = [_]Partition{.{
+        .partition_index = 0,
+        .committed_offset = 77,
+        .committed_leader_epoch = -1,
+        .committed_metadata = "generated-meta",
+    }};
+    const topics = [_]Topic{.{
+        .name = "oc-generated-topic",
+        .partitions = &partitions,
+    }};
+    const req = Req{
+        .group_id = "oc-generated-group",
+        .generation_id_or_member_epoch = 1,
+        .member_id = "member-1",
+        .group_instance_id = null,
+        .topics = &topics,
+    };
+
+    var buf: [512]u8 = undefined;
+    var pos = buildTestRequest(&buf, 8, 8, 808, header_mod.requestHeaderVersion(8, 8));
+    req.serialize(&buf, &pos, 8);
+
+    const response = broker.handleRequest(buf[0..pos]);
+    try testing.expect(response != null);
+    defer testing.allocator.free(response.?);
+
+    var rpos: usize = 0;
+    var response_header = try ResponseHeader.deserialize(testing.allocator, response.?, &rpos, header_mod.responseHeaderVersion(8, 8));
+    defer response_header.deinit(testing.allocator);
+    try testing.expectEqual(@as(i32, 808), response_header.correlation_id);
+
+    const resp = try Resp.deserialize(testing.allocator, response.?, &rpos, 8);
+    defer {
+        for (resp.topics) |topic| {
+            if (topic.partitions.len > 0) testing.allocator.free(topic.partitions);
+        }
+        if (resp.topics.len > 0) testing.allocator.free(resp.topics);
+    }
+    try testing.expectEqual(response.?.len, rpos);
+    try testing.expectEqual(@as(i32, 0), resp.throttle_time_ms);
+    try testing.expectEqual(@as(usize, 1), resp.topics.len);
+    try testing.expectEqualStrings("oc-generated-topic", resp.topics[0].name.?);
+    try testing.expectEqual(@as(usize, 1), resp.topics[0].partitions.len);
+    try testing.expectEqual(@as(i32, 0), resp.topics[0].partitions[0].partition_index);
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.none)), resp.topics[0].partitions[0].error_code);
+
+    const committed = try broker.groups.fetchOffset("oc-generated-group", "oc-generated-topic", 0);
+    try testing.expectEqual(@as(i64, 77), committed.?);
+}
+
+test "Broker.handleRequest OffsetCommit rejects truncated request" {
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+
+    var buf: [128]u8 = undefined;
+    const req_len = buildTestRequest(&buf, 8, 8, 809, header_mod.requestHeaderVersion(8, 8));
+    try testing.expect(broker.handleRequest(buf[0..req_len]) == null);
 }
 
 test "Broker.handleRequest CreateTopics (key=19) creates topic" {
