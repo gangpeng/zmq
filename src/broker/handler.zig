@@ -5390,56 +5390,176 @@ pub const Broker = struct {
     // DeleteAcls (key 31)
     // ---------------------------------------------------------------
     fn handleDeleteAcls(self: *Broker, request_bytes: []const u8, body_start: usize, req_header: *const RequestHeader, api_version: i16, resp_header_version: i16) ?[]u8 {
-        _ = api_version;
+        const Req = generated.delete_acls_request.DeleteAclsRequest;
+        const Resp = generated.delete_acls_response.DeleteAclsResponse;
+        const FilterResult = Resp.DeleteAclsFilterResult;
+
+        if (!validateDeleteAclsRequestFrame(request_bytes, body_start, api_version)) {
+            log.warn("Malformed DeleteAcls request", .{});
+            return null;
+        }
+
         var pos = body_start;
+        var req = Req.deserialize(self.allocator, request_bytes, &pos, api_version) catch |err| {
+            log.warn("Failed to decode DeleteAcls request: {}", .{err});
+            return null;
+        };
+        defer self.freeDeleteAclsRequest(&req);
 
-        // Parse filter array
-        const num_filters_opt = ser.readArrayLen(request_bytes, &pos) catch null;
-        const num_filters: usize = if (num_filters_opt) |n| @min(n, 64) else 0;
-
-        var buf = self.allocator.alloc(u8, 512) catch return null;
-        var wpos: usize = 0;
-        const rh = ResponseHeader{ .correlation_id = req_header.correlation_id };
-        rh.serialize(buf, &wpos, resp_header_version);
-        ser.writeI32(buf, &wpos, 0); // throttle_time_ms
-        ser.writeArrayLen(buf, &wpos, @intCast(num_filters)); // filter results
-
-        var total_removed: usize = 0;
-        for (0..num_filters) |_| {
-            // Parse filter: resource_type (i8), resource_name (nullable string),
-            // pattern_type (i8), principal (nullable string), host (nullable string),
-            // operation (i8), permission (i8)
-            const rt_raw = ser.readI8(request_bytes, &pos);
-            const rn = (ser.readString(request_bytes, &pos) catch null) orelse "*";
-            const pt_raw = ser.readI8(request_bytes, &pos);
-            const principal = (ser.readString(request_bytes, &pos) catch null) orelse "*";
-            const host = (ser.readString(request_bytes, &pos) catch null) orelse "*";
-            const op_raw = ser.readI8(request_bytes, &pos);
-            const perm_raw = ser.readI8(request_bytes, &pos);
-
-            const resource_type: Authorizer.ResourceType = @enumFromInt(rt_raw);
-            const pattern_type: Authorizer.PatternType = @enumFromInt(pt_raw);
-            const operation: Authorizer.Operation = @enumFromInt(op_raw);
-            const permission: Authorizer.Permission = @enumFromInt(perm_raw);
-
-            const removed = self.authorizer.removeMatchingAcls(resource_type, rn, pattern_type, principal, host, operation, permission);
-            total_removed += removed;
-
-            // Write per-filter result: error_code (i16), error_message (nullable string), matching_acls array
-            ser.writeI16(buf, &wpos, 0); // error_code = NONE
-            ser.writeString(buf, &wpos, ""); // error_message
-            ser.writeArrayLen(buf, &wpos, @intCast(removed)); // matching_acls count
-            // NOTE: Kafka protocol expects per-match details; we return count only for simplicity
+        const filter_results = self.allocator.alloc(FilterResult, req.filters.len) catch return null;
+        var filter_results_init: usize = 0;
+        defer {
+            self.freeDeleteAclsFilterResults(filter_results[0..filter_results_init]);
+            if (filter_results.len > 0) self.allocator.free(filter_results);
         }
 
-        if (resp_header_version >= 1) ser.writeEmptyTaggedFields(buf, &wpos);
-
-        // Persist ACLs after deletion
-        if (total_removed > 0) {
-            self.persistAcls();
+        var mutated = false;
+        for (req.filters) |filter| {
+            filter_results[filter_results_init] = self.deleteAclsFilterResult(filter, api_version) catch return null;
+            if (filter_results[filter_results_init].error_code == @intFromEnum(ErrorCode.none) and filter_results[filter_results_init].matching_acls.len > 0) mutated = true;
+            filter_results_init += 1;
         }
 
-        return (self.allocator.realloc(buf, wpos) catch buf)[0..wpos];
+        if (mutated) self.persistAcls();
+
+        const resp = Resp{
+            .throttle_time_ms = 0,
+            .filter_results = filter_results[0..filter_results_init],
+        };
+        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+    }
+
+    fn freeDeleteAclsRequest(self: *Broker, req: *generated.delete_acls_request.DeleteAclsRequest) void {
+        if (req.filters.len > 0) self.allocator.free(req.filters);
+    }
+
+    fn deleteAclsFilterResult(self: *Broker, filter: generated.delete_acls_request.DeleteAclsRequest.DeleteAclsFilter, api_version: i16) !generated.delete_acls_response.DeleteAclsResponse.DeleteAclsFilterResult {
+        const resource_type = aclResourceType(filter.resource_type_filter) orelse return invalidDeleteAclsFilterResult("Invalid ACL resource type");
+        const pattern_type = aclPatternType(if (api_version >= 1) filter.pattern_type_filter else @intFromEnum(Authorizer.PatternType.literal)) orelse return invalidDeleteAclsFilterResult("Invalid ACL pattern type");
+        const operation = aclOperation(filter.operation) orelse return invalidDeleteAclsFilterResult("Invalid ACL operation");
+        const permission = aclPermission(filter.permission_type) orelse return invalidDeleteAclsFilterResult("Invalid ACL permission type");
+
+        const matching_acls = try self.collectDeleteAclsMatchingAcls(
+            resource_type,
+            filter.resource_name_filter,
+            pattern_type,
+            filter.principal_filter,
+            filter.host_filter,
+            operation,
+            permission,
+        );
+        _ = self.authorizer.removeMatchingAcls(
+            resource_type,
+            filter.resource_name_filter,
+            pattern_type,
+            filter.principal_filter,
+            filter.host_filter,
+            operation,
+            permission,
+        );
+
+        return .{
+            .error_code = @intFromEnum(ErrorCode.none),
+            .error_message = null,
+            .matching_acls = matching_acls,
+        };
+    }
+
+    fn invalidDeleteAclsFilterResult(message: []const u8) generated.delete_acls_response.DeleteAclsResponse.DeleteAclsFilterResult {
+        return .{
+            .error_code = @intFromEnum(ErrorCode.invalid_request),
+            .error_message = message,
+            .matching_acls = &.{},
+        };
+    }
+
+    fn collectDeleteAclsMatchingAcls(
+        self: *Broker,
+        filter_resource_type: Authorizer.ResourceType,
+        filter_resource_name: ?[]const u8,
+        filter_pattern_type: Authorizer.PatternType,
+        filter_principal: ?[]const u8,
+        filter_host: ?[]const u8,
+        filter_operation: Authorizer.Operation,
+        filter_permission: Authorizer.Permission,
+    ) ![]generated.delete_acls_response.DeleteAclsResponse.DeleteAclsFilterResult.DeleteAclsMatchingAcl {
+        const MatchingAcl = generated.delete_acls_response.DeleteAclsResponse.DeleteAclsFilterResult.DeleteAclsMatchingAcl;
+
+        var matches = std.array_list.Managed(MatchingAcl).init(self.allocator);
+        errdefer {
+            self.freeDeleteAclsMatchingAcls(matches.items);
+            matches.deinit();
+        }
+
+        for (self.authorizer.acls.items) |acl| {
+            if (!brokerAclMatchesFilter(acl, filter_resource_type, filter_resource_name, filter_pattern_type, filter_principal, filter_host, filter_operation, filter_permission)) continue;
+
+            const resource_name = try self.allocator.dupe(u8, acl.resource_name);
+            errdefer self.allocator.free(resource_name);
+            const principal = try self.allocator.dupe(u8, acl.principal);
+            errdefer self.allocator.free(principal);
+            const host = try self.allocator.dupe(u8, acl.host);
+            errdefer self.allocator.free(host);
+
+            try matches.append(.{
+                .error_code = @intFromEnum(ErrorCode.none),
+                .error_message = null,
+                .resource_type = @intFromEnum(acl.resource_type),
+                .resource_name = resource_name,
+                .pattern_type = @intFromEnum(acl.pattern_type),
+                .principal = principal,
+                .host = host,
+                .operation = @intFromEnum(acl.operation),
+                .permission_type = @intFromEnum(acl.permission),
+            });
+        }
+
+        if (matches.items.len == 0) {
+            matches.deinit();
+            return &.{};
+        }
+        return try matches.toOwnedSlice();
+    }
+
+    fn freeDeleteAclsFilterResults(self: *Broker, results: []const generated.delete_acls_response.DeleteAclsResponse.DeleteAclsFilterResult) void {
+        for (results) |result| {
+            self.freeDeleteAclsMatchingAcls(result.matching_acls);
+            if (result.matching_acls.len > 0) self.allocator.free(result.matching_acls);
+        }
+    }
+
+    fn freeDeleteAclsMatchingAcls(self: *Broker, matches: []const generated.delete_acls_response.DeleteAclsResponse.DeleteAclsFilterResult.DeleteAclsMatchingAcl) void {
+        for (matches) |match| {
+            if (match.resource_name) |resource_name| self.allocator.free(@constCast(resource_name));
+            if (match.principal) |principal| self.allocator.free(@constCast(principal));
+            if (match.host) |host| self.allocator.free(@constCast(host));
+        }
+    }
+
+    fn brokerAclMatchesFilter(
+        acl: Authorizer.AclEntry,
+        filter_resource_type: Authorizer.ResourceType,
+        filter_resource_name: ?[]const u8,
+        filter_pattern_type: Authorizer.PatternType,
+        filter_principal: ?[]const u8,
+        filter_host: ?[]const u8,
+        filter_operation: Authorizer.Operation,
+        filter_permission: Authorizer.Permission,
+    ) bool {
+        if (filter_resource_type != .any and filter_resource_type != .unknown and acl.resource_type != filter_resource_type) return false;
+        if (filter_resource_name) |name| {
+            if (!std.mem.eql(u8, name, "*") and !std.mem.eql(u8, name, acl.resource_name)) return false;
+        }
+        if (filter_pattern_type != .any and filter_pattern_type != .unknown and acl.pattern_type != filter_pattern_type) return false;
+        if (filter_principal) |principal| {
+            if (!std.mem.eql(u8, principal, "*") and !std.mem.eql(u8, principal, acl.principal)) return false;
+        }
+        if (filter_host) |host| {
+            if (!std.mem.eql(u8, host, "*") and !std.mem.eql(u8, host, acl.host)) return false;
+        }
+        if (filter_operation != .any and filter_operation != .unknown and acl.operation != filter_operation) return false;
+        if (filter_permission != .any and filter_permission != .unknown and acl.permission != filter_permission) return false;
+        return true;
     }
 
     // ---------------------------------------------------------------
@@ -6202,6 +6322,24 @@ pub const Broker = struct {
             if (api_version >= 1 and !skipFixedBytes(buf, &pos, 1)) return false; // resource_pattern_type
             if (!skipKafkaString(buf, &pos, flexible)) return false; // principal
             if (!skipKafkaString(buf, &pos, flexible)) return false; // host
+            if (!skipFixedBytes(buf, &pos, 2)) return false; // operation + permission_type
+            if (flexible) ser.skipTaggedFields(buf, &pos) catch return false;
+        }
+        if (flexible) ser.skipTaggedFields(buf, &pos) catch return false;
+        return true;
+    }
+
+    fn validateDeleteAclsRequestFrame(buf: []const u8, start_pos: usize, api_version: i16) bool {
+        const flexible = api_version >= 2;
+        var pos = start_pos;
+
+        const filter_count = readKafkaArrayCount(buf, &pos, flexible) orelse return false;
+        for (0..filter_count) |_| {
+            if (!skipFixedBytes(buf, &pos, 1)) return false; // resource_type_filter
+            if (!skipKafkaString(buf, &pos, flexible)) return false; // resource_name_filter
+            if (api_version >= 1 and !skipFixedBytes(buf, &pos, 1)) return false; // pattern_type_filter
+            if (!skipKafkaString(buf, &pos, flexible)) return false; // principal_filter
+            if (!skipKafkaString(buf, &pos, flexible)) return false; // host_filter
             if (!skipFixedBytes(buf, &pos, 2)) return false; // operation + permission_type
             if (flexible) ser.skipTaggedFields(buf, &pos) catch return false;
         }
@@ -7282,6 +7420,113 @@ test "Broker.handleRequest CreateAcls rejects truncated request" {
 
     var buf: [128]u8 = undefined;
     const req_len = buildTestRequest(&buf, 30, 2, 3004, header_mod.requestHeaderVersion(30, 2));
+    try testing.expect(broker.handleRequest(buf[0..req_len]) == null);
+}
+
+test "Broker.handleRequest DeleteAcls v2 returns generated matching ACL details" {
+    const Req = generated.delete_acls_request.DeleteAclsRequest;
+    const Resp = generated.delete_acls_response.DeleteAclsResponse;
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+    try broker.authorizer.addAcl("User:bob", .topic, "acl-delete-topic", .literal, .read, .allow, "*");
+
+    const filters = [_]Req.DeleteAclsFilter{.{
+        .resource_type_filter = @intFromEnum(Authorizer.ResourceType.topic),
+        .resource_name_filter = "acl-delete-topic",
+        .pattern_type_filter = @intFromEnum(Authorizer.PatternType.literal),
+        .principal_filter = "User:bob",
+        .host_filter = "*",
+        .operation = @intFromEnum(Authorizer.Operation.read),
+        .permission_type = @intFromEnum(Authorizer.Permission.allow),
+    }};
+    const req = Req{ .filters = &filters };
+
+    var buf: [512]u8 = undefined;
+    var pos = buildTestRequest(&buf, 31, 2, 3102, header_mod.requestHeaderVersion(31, 2));
+    req.serialize(&buf, &pos, 2);
+
+    const response = broker.handleRequest(buf[0..pos]);
+    try testing.expect(response != null);
+    defer testing.allocator.free(response.?);
+
+    var rpos: usize = 0;
+    var response_header = try ResponseHeader.deserialize(testing.allocator, response.?, &rpos, header_mod.responseHeaderVersion(31, 2));
+    defer response_header.deinit(testing.allocator);
+    try testing.expectEqual(@as(i32, 3102), response_header.correlation_id);
+
+    const resp = try Resp.deserialize(testing.allocator, response.?, &rpos, 2);
+    defer {
+        for (resp.filter_results) |result| {
+            if (result.matching_acls.len > 0) testing.allocator.free(result.matching_acls);
+        }
+        if (resp.filter_results.len > 0) testing.allocator.free(resp.filter_results);
+    }
+
+    try testing.expectEqual(response.?.len, rpos);
+    try testing.expectEqual(@as(i32, 0), resp.throttle_time_ms);
+    try testing.expectEqual(@as(usize, 1), resp.filter_results.len);
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.none)), resp.filter_results[0].error_code);
+    try testing.expectEqual(@as(usize, 1), resp.filter_results[0].matching_acls.len);
+    try testing.expectEqualStrings("acl-delete-topic", resp.filter_results[0].matching_acls[0].resource_name.?);
+    try testing.expectEqualStrings("User:bob", resp.filter_results[0].matching_acls[0].principal.?);
+    try testing.expectEqual(@as(i8, @intFromEnum(Authorizer.Operation.read)), resp.filter_results[0].matching_acls[0].operation);
+    try testing.expectEqual(@as(usize, 0), broker.authorizer.aclCount());
+}
+
+test "Broker.handleRequest DeleteAcls returns invalid_request for unknown enum" {
+    const Req = generated.delete_acls_request.DeleteAclsRequest;
+    const Resp = generated.delete_acls_response.DeleteAclsResponse;
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+    try broker.authorizer.addAcl("User:bob", .topic, "acl-delete-topic", .literal, .read, .allow, "*");
+
+    const filters = [_]Req.DeleteAclsFilter{.{
+        .resource_type_filter = 127,
+        .resource_name_filter = "acl-delete-topic",
+        .pattern_type_filter = @intFromEnum(Authorizer.PatternType.literal),
+        .principal_filter = "User:bob",
+        .host_filter = "*",
+        .operation = @intFromEnum(Authorizer.Operation.read),
+        .permission_type = @intFromEnum(Authorizer.Permission.allow),
+    }};
+    const req = Req{ .filters = &filters };
+
+    var buf: [512]u8 = undefined;
+    var pos = buildTestRequest(&buf, 31, 2, 3103, header_mod.requestHeaderVersion(31, 2));
+    req.serialize(&buf, &pos, 2);
+
+    const response = broker.handleRequest(buf[0..pos]);
+    try testing.expect(response != null);
+    defer testing.allocator.free(response.?);
+
+    var rpos: usize = 0;
+    var response_header = try ResponseHeader.deserialize(testing.allocator, response.?, &rpos, header_mod.responseHeaderVersion(31, 2));
+    defer response_header.deinit(testing.allocator);
+    try testing.expectEqual(@as(i32, 3103), response_header.correlation_id);
+
+    const resp = try Resp.deserialize(testing.allocator, response.?, &rpos, 2);
+    defer {
+        for (resp.filter_results) |result| {
+            if (result.matching_acls.len > 0) testing.allocator.free(result.matching_acls);
+        }
+        if (resp.filter_results.len > 0) testing.allocator.free(resp.filter_results);
+    }
+
+    try testing.expectEqual(response.?.len, rpos);
+    try testing.expectEqual(@as(usize, 1), resp.filter_results.len);
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.invalid_request)), resp.filter_results[0].error_code);
+    try testing.expectEqual(@as(usize, 0), resp.filter_results[0].matching_acls.len);
+    try testing.expectEqual(@as(usize, 1), broker.authorizer.aclCount());
+}
+
+test "Broker.handleRequest DeleteAcls rejects truncated request" {
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+
+    var buf: [128]u8 = undefined;
+    const req_len = buildTestRequest(&buf, 31, 2, 3104, header_mod.requestHeaderVersion(31, 2));
     try testing.expect(broker.handleRequest(buf[0..req_len]) == null);
 }
 
