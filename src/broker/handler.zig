@@ -3730,87 +3730,219 @@ pub const Broker = struct {
     // ---------------------------------------------------------------
     // DescribeConfigs (key 32)
     // ---------------------------------------------------------------
+    const DescribeConfigsRequest = generated.describe_configs_request.DescribeConfigsRequest;
+    const DescribeConfigsResponse = generated.describe_configs_response.DescribeConfigsResponse;
+    const DescribeConfigsResult = DescribeConfigsResponse.DescribeConfigsResult;
+    const DescribeConfigEntry = DescribeConfigsResult.DescribeConfigsResourceResult;
+
+    const CONFIG_RESOURCE_TOPIC: i8 = 2;
+    const CONFIG_SOURCE_DYNAMIC_TOPIC: i8 = 1;
+    const CONFIG_SOURCE_STATIC_BROKER: i8 = 4;
+    const CONFIG_SOURCE_DEFAULT: i8 = 5;
+    const CONFIG_TYPE_BOOLEAN: i8 = 1;
+    const CONFIG_TYPE_STRING: i8 = 2;
+    const CONFIG_TYPE_INT: i8 = 3;
+    const CONFIG_TYPE_LONG: i8 = 5;
+    const CONFIG_TYPE_LIST: i8 = 7;
+
     fn handleDescribeConfigs(self: *Broker, request_bytes: []const u8, body_start: usize, req_header: *const RequestHeader, api_version: i16, resp_header_version: i16) ?[]u8 {
-        _ = api_version;
-        var pos = body_start;
-        const num_resources = (ser.readArrayLen(request_bytes, &pos) catch 0) orelse 0;
+        const Req = DescribeConfigsRequest;
+        const Resp = DescribeConfigsResponse;
 
-        var resp_buf = self.allocator.alloc(u8, 8192) catch return null;
-        var wpos: usize = 0;
-        const resp_header = ResponseHeader{ .correlation_id = req_header.correlation_id };
-        resp_header.serialize(resp_buf, &wpos, resp_header_version);
-        ser.writeI32(resp_buf, &wpos, 0); // throttle_time_ms
-
-        if (num_resources == 0) {
-            ser.writeArrayLen(resp_buf, &wpos, 0);
-        } else {
-            ser.writeArrayLen(resp_buf, &wpos, num_resources);
-
-            for (0..num_resources) |_| {
-                const resource_type = ser.readI8(request_bytes, &pos);
-                const resource_name = (ser.readString(request_bytes, &pos) catch break) orelse "";
-                // Skip config_keys array if present
-                const num_keys = (ser.readArrayLen(request_bytes, &pos) catch 0) orelse 0;
-                for (0..num_keys) |_| {
-                    _ = ser.readString(request_bytes, &pos) catch break;
-                }
-
-                ser.writeI16(resp_buf, &wpos, 0); // error_code
-                ser.writeString(resp_buf, &wpos, null); // error_message
-                ser.writeI8(resp_buf, &wpos, resource_type);
-                ser.writeString(resp_buf, &wpos, resource_name);
-
-                if (resource_type == 2) {
-                    // TOPIC — return per-topic configuration
-                    if (self.topics.get(resource_name)) |info| {
-                        const tc = info.config;
-                        const topic_configs = [_]struct { name: []const u8, value: []const u8 }{
-                            .{ .name = "retention.ms", .value = "604800000" },
-                            .{ .name = "retention.bytes", .value = "-1" },
-                            .{ .name = "max.message.bytes", .value = "1048576" },
-                            .{ .name = "segment.bytes", .value = "1073741824" },
-                            .{ .name = "cleanup.policy", .value = tc.cleanup_policy },
-                            .{ .name = "compression.type", .value = tc.compression_type },
-                            .{ .name = "min.insync.replicas", .value = "1" },
-                        };
-                        ser.writeArrayLen(resp_buf, &wpos, topic_configs.len);
-                        for (topic_configs) |cfg| {
-                            ser.writeString(resp_buf, &wpos, cfg.name);
-                            ser.writeString(resp_buf, &wpos, cfg.value);
-                            ser.writeBool(resp_buf, &wpos, false);
-                            ser.writeBool(resp_buf, &wpos, true); // is_default
-                            ser.writeBool(resp_buf, &wpos, false);
-                        }
-                    } else {
-                        ser.writeArrayLen(resp_buf, &wpos, 0);
-                    }
-                } else {
-                    // BROKER — return broker-level configuration
-                    const broker_configs = [_]struct { name: []const u8, value: []const u8 }{
-                        .{ .name = "broker.id", .value = "0" },
-                        .{ .name = "log.retention.hours", .value = "168" },
-                        .{ .name = "num.partitions", .value = "1" },
-                        .{ .name = "auto.create.topics.enable", .value = if (self.auto_create_topics) "true" else "false" },
-                        .{ .name = "min.insync.replicas", .value = "1" },
-                        .{ .name = "message.max.bytes", .value = "1048576" },
-                        .{ .name = "log.segment.bytes", .value = "1073741824" },
-                        .{ .name = "log.cleanup.policy", .value = "delete" },
-                        .{ .name = "compression.type", .value = "producer" },
-                    };
-                    ser.writeArrayLen(resp_buf, &wpos, broker_configs.len);
-                    for (broker_configs) |cfg| {
-                        ser.writeString(resp_buf, &wpos, cfg.name);
-                        ser.writeString(resp_buf, &wpos, cfg.value);
-                        ser.writeBool(resp_buf, &wpos, false);
-                        ser.writeBool(resp_buf, &wpos, true);
-                        ser.writeBool(resp_buf, &wpos, false);
-                    }
-                }
-            }
+        if (!validateDescribeConfigsRequestFrame(request_bytes, body_start, api_version)) {
+            log.warn("Malformed DescribeConfigs request", .{});
+            return null;
         }
 
-        if (resp_header_version >= 1) ser.writeEmptyTaggedFields(resp_buf, &wpos);
-        return (self.allocator.realloc(resp_buf, wpos) catch resp_buf)[0..wpos];
+        var pos = body_start;
+        var req = Req.deserialize(self.allocator, request_bytes, &pos, api_version) catch |err| {
+            log.warn("Malformed DescribeConfigs request: {}", .{err});
+            return null;
+        };
+        defer self.freeDescribeConfigsRequest(&req);
+
+        var results: []DescribeConfigsResult = &.{};
+        if (req.resources.len > 0) {
+            results = self.allocator.alloc(DescribeConfigsResult, req.resources.len) catch return null;
+        }
+        var results_init: usize = 0;
+        defer {
+            self.freeDescribeConfigsResults(results[0..results_init]);
+            if (results.len > 0) self.allocator.free(results);
+        }
+
+        for (req.resources) |resource| {
+            results[results_init] = self.buildDescribeConfigsResult(resource, req.include_documentation) catch return null;
+            results_init += 1;
+        }
+
+        const resp = Resp{
+            .throttle_time_ms = 0,
+            .results = results[0..results_init],
+        };
+        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+    }
+
+    fn freeDescribeConfigsRequest(self: *Broker, req: *const DescribeConfigsRequest) void {
+        for (req.resources) |resource| {
+            if (resource.configuration_keys.len > 0) self.allocator.free(resource.configuration_keys);
+        }
+        if (req.resources.len > 0) self.allocator.free(req.resources);
+    }
+
+    fn freeDescribeConfigsResults(self: *Broker, results: []const DescribeConfigsResult) void {
+        for (results) |result| {
+            for (result.configs) |config| {
+                if (config.value) |value| self.allocator.free(value);
+            }
+            if (result.configs.len > 0) self.allocator.free(result.configs);
+        }
+    }
+
+    fn buildDescribeConfigsResult(self: *Broker, resource: DescribeConfigsRequest.DescribeConfigsResource, include_documentation: bool) !DescribeConfigsResult {
+        const resource_name = resource.resource_name orelse "";
+
+        if (resource.resource_type == CONFIG_RESOURCE_TOPIC) {
+            const topic_info = self.topics.get(resource_name) orelse return .{
+                .error_code = @intFromEnum(ErrorCode.unknown_topic_or_partition),
+                .error_message = "Unknown topic",
+                .resource_type = resource.resource_type,
+                .resource_name = resource.resource_name,
+                .configs = &.{},
+            };
+
+            return .{
+                .error_code = @intFromEnum(ErrorCode.none),
+                .error_message = null,
+                .resource_type = resource.resource_type,
+                .resource_name = resource.resource_name,
+                .configs = try self.buildTopicDescribeConfigs(&topic_info.config, resource.configuration_keys, include_documentation),
+            };
+        }
+
+        return .{
+            .error_code = @intFromEnum(ErrorCode.none),
+            .error_message = null,
+            .resource_type = resource.resource_type,
+            .resource_name = resource.resource_name,
+            .configs = try self.buildBrokerDescribeConfigs(resource.configuration_keys, include_documentation),
+        };
+    }
+
+    fn buildTopicDescribeConfigs(self: *Broker, config: *const TopicConfig, keys: []const ?[]const u8, include_documentation: bool) ![]DescribeConfigEntry {
+        const defaults = TopicConfig{};
+        var count: usize = 0;
+        if (configKeyRequested(keys, "retention.ms")) count += 1;
+        if (configKeyRequested(keys, "retention.bytes")) count += 1;
+        if (configKeyRequested(keys, "max.message.bytes")) count += 1;
+        if (configKeyRequested(keys, "segment.bytes")) count += 1;
+        if (configKeyRequested(keys, "cleanup.policy")) count += 1;
+        if (configKeyRequested(keys, "compression.type")) count += 1;
+        if (configKeyRequested(keys, "min.insync.replicas")) count += 1;
+        if (count == 0) return &.{};
+
+        var configs = try self.allocator.alloc(DescribeConfigEntry, count);
+        var configs_init: usize = 0;
+        errdefer {
+            for (configs[0..configs_init]) |entry| {
+                if (entry.value) |value| self.allocator.free(value);
+            }
+            self.allocator.free(configs);
+        }
+
+        if (configKeyRequested(keys, "retention.ms")) try self.appendDescribeConfigI64(configs, &configs_init, "retention.ms", config.retention_ms, CONFIG_TYPE_LONG, topicConfigSource(config.retention_ms != defaults.retention_ms), include_documentation, "Retention time in milliseconds.");
+        if (configKeyRequested(keys, "retention.bytes")) try self.appendDescribeConfigI64(configs, &configs_init, "retention.bytes", config.retention_bytes, CONFIG_TYPE_LONG, topicConfigSource(config.retention_bytes != defaults.retention_bytes), include_documentation, "Retention size in bytes.");
+        if (configKeyRequested(keys, "max.message.bytes")) try self.appendDescribeConfigI32(configs, &configs_init, "max.message.bytes", config.max_message_bytes, CONFIG_TYPE_INT, topicConfigSource(config.max_message_bytes != defaults.max_message_bytes), include_documentation, "Maximum record batch size in bytes.");
+        if (configKeyRequested(keys, "segment.bytes")) try self.appendDescribeConfigI64(configs, &configs_init, "segment.bytes", config.segment_bytes, CONFIG_TYPE_LONG, topicConfigSource(config.segment_bytes != defaults.segment_bytes), include_documentation, "Log segment size in bytes.");
+        if (configKeyRequested(keys, "cleanup.policy")) try self.appendDescribeConfigString(configs, &configs_init, "cleanup.policy", config.cleanup_policy, CONFIG_TYPE_LIST, topicConfigSource(!std.mem.eql(u8, config.cleanup_policy, defaults.cleanup_policy)), include_documentation, "Cleanup policy for old records.");
+        if (configKeyRequested(keys, "compression.type")) try self.appendDescribeConfigString(configs, &configs_init, "compression.type", config.compression_type, CONFIG_TYPE_STRING, topicConfigSource(!std.mem.eql(u8, config.compression_type, defaults.compression_type)), include_documentation, "Compression type used for records.");
+        if (configKeyRequested(keys, "min.insync.replicas")) try self.appendDescribeConfigI32(configs, &configs_init, "min.insync.replicas", config.min_insync_replicas, CONFIG_TYPE_INT, topicConfigSource(config.min_insync_replicas != defaults.min_insync_replicas), include_documentation, "Minimum in-sync replicas required for acks=all.");
+
+        return configs;
+    }
+
+    fn buildBrokerDescribeConfigs(self: *Broker, keys: []const ?[]const u8, include_documentation: bool) ![]DescribeConfigEntry {
+        var count: usize = 0;
+        if (configKeyRequested(keys, "broker.id")) count += 1;
+        if (configKeyRequested(keys, "log.retention.hours")) count += 1;
+        if (configKeyRequested(keys, "num.partitions")) count += 1;
+        if (configKeyRequested(keys, "auto.create.topics.enable")) count += 1;
+        if (configKeyRequested(keys, "min.insync.replicas")) count += 1;
+        if (configKeyRequested(keys, "message.max.bytes")) count += 1;
+        if (configKeyRequested(keys, "log.segment.bytes")) count += 1;
+        if (configKeyRequested(keys, "log.cleanup.policy")) count += 1;
+        if (configKeyRequested(keys, "compression.type")) count += 1;
+        if (count == 0) return &.{};
+
+        var configs = try self.allocator.alloc(DescribeConfigEntry, count);
+        var configs_init: usize = 0;
+        errdefer {
+            for (configs[0..configs_init]) |entry| {
+                if (entry.value) |value| self.allocator.free(value);
+            }
+            self.allocator.free(configs);
+        }
+
+        if (configKeyRequested(keys, "broker.id")) try self.appendDescribeConfigI32(configs, &configs_init, "broker.id", self.node_id, CONFIG_TYPE_INT, CONFIG_SOURCE_STATIC_BROKER, include_documentation, "Broker node id.");
+        if (configKeyRequested(keys, "log.retention.hours")) try self.appendDescribeConfigI32(configs, &configs_init, "log.retention.hours", 168, CONFIG_TYPE_INT, CONFIG_SOURCE_DEFAULT, include_documentation, "Default log retention in hours.");
+        if (configKeyRequested(keys, "num.partitions")) try self.appendDescribeConfigI32(configs, &configs_init, "num.partitions", self.default_num_partitions, CONFIG_TYPE_INT, CONFIG_SOURCE_DEFAULT, include_documentation, "Default number of partitions for auto-created topics.");
+        if (configKeyRequested(keys, "auto.create.topics.enable")) try self.appendDescribeConfigBool(configs, &configs_init, "auto.create.topics.enable", self.auto_create_topics, CONFIG_TYPE_BOOLEAN, CONFIG_SOURCE_DEFAULT, include_documentation, "Whether topics are auto-created on first use.");
+        if (configKeyRequested(keys, "min.insync.replicas")) try self.appendDescribeConfigI32(configs, &configs_init, "min.insync.replicas", 1, CONFIG_TYPE_INT, CONFIG_SOURCE_DEFAULT, include_documentation, "Default minimum in-sync replicas required for acks=all.");
+        if (configKeyRequested(keys, "message.max.bytes")) try self.appendDescribeConfigI32(configs, &configs_init, "message.max.bytes", 1048576, CONFIG_TYPE_INT, CONFIG_SOURCE_DEFAULT, include_documentation, "Maximum record batch size in bytes.");
+        if (configKeyRequested(keys, "log.segment.bytes")) try self.appendDescribeConfigI64(configs, &configs_init, "log.segment.bytes", 1073741824, CONFIG_TYPE_LONG, CONFIG_SOURCE_DEFAULT, include_documentation, "Default log segment size in bytes.");
+        if (configKeyRequested(keys, "log.cleanup.policy")) try self.appendDescribeConfigString(configs, &configs_init, "log.cleanup.policy", "delete", CONFIG_TYPE_LIST, CONFIG_SOURCE_DEFAULT, include_documentation, "Default cleanup policy for old records.");
+        if (configKeyRequested(keys, "compression.type")) try self.appendDescribeConfigString(configs, &configs_init, "compression.type", "producer", CONFIG_TYPE_STRING, CONFIG_SOURCE_DEFAULT, include_documentation, "Default compression type used for records.");
+
+        return configs;
+    }
+
+    fn appendDescribeConfigI64(self: *Broker, configs: []DescribeConfigEntry, index: *usize, name: []const u8, value: i64, config_type: i8, config_source: i8, include_documentation: bool, documentation: []const u8) !void {
+        const value_text = try std.fmt.allocPrint(self.allocator, "{d}", .{value});
+        self.appendDescribeConfigValue(configs, index, name, value_text, config_type, config_source, include_documentation, documentation);
+    }
+
+    fn appendDescribeConfigI32(self: *Broker, configs: []DescribeConfigEntry, index: *usize, name: []const u8, value: i32, config_type: i8, config_source: i8, include_documentation: bool, documentation: []const u8) !void {
+        const value_text = try std.fmt.allocPrint(self.allocator, "{d}", .{value});
+        self.appendDescribeConfigValue(configs, index, name, value_text, config_type, config_source, include_documentation, documentation);
+    }
+
+    fn appendDescribeConfigBool(self: *Broker, configs: []DescribeConfigEntry, index: *usize, name: []const u8, value: bool, config_type: i8, config_source: i8, include_documentation: bool, documentation: []const u8) !void {
+        const value_text = try self.allocator.dupe(u8, if (value) "true" else "false");
+        self.appendDescribeConfigValue(configs, index, name, value_text, config_type, config_source, include_documentation, documentation);
+    }
+
+    fn appendDescribeConfigString(self: *Broker, configs: []DescribeConfigEntry, index: *usize, name: []const u8, value: []const u8, config_type: i8, config_source: i8, include_documentation: bool, documentation: []const u8) !void {
+        const value_text = try self.allocator.dupe(u8, value);
+        self.appendDescribeConfigValue(configs, index, name, value_text, config_type, config_source, include_documentation, documentation);
+    }
+
+    fn appendDescribeConfigValue(_: *Broker, configs: []DescribeConfigEntry, index: *usize, name: []const u8, value: []const u8, config_type: i8, config_source: i8, include_documentation: bool, documentation: []const u8) void {
+        configs[index.*] = .{
+            .name = name,
+            .value = value,
+            .read_only = false,
+            .is_default = config_source == CONFIG_SOURCE_DEFAULT,
+            .config_source = config_source,
+            .is_sensitive = false,
+            .synonyms = &.{},
+            .config_type = config_type,
+            .documentation = if (include_documentation) documentation else null,
+        };
+        index.* += 1;
+    }
+
+    fn configKeyRequested(keys: []const ?[]const u8, name: []const u8) bool {
+        if (keys.len == 0) return true;
+        for (keys) |maybe_key| {
+            if (maybe_key) |key| {
+                if (std.mem.eql(u8, key, name)) return true;
+            }
+        }
+        return false;
+    }
+
+    fn topicConfigSource(is_dynamic: bool) i8 {
+        return if (is_dynamic) CONFIG_SOURCE_DYNAMIC_TOPIC else CONFIG_SOURCE_DEFAULT;
     }
 
     // ---------------------------------------------------------------
@@ -7924,6 +8056,28 @@ pub const Broker = struct {
         return true;
     }
 
+    fn validateDescribeConfigsRequestFrame(buf: []const u8, start_pos: usize, api_version: i16) bool {
+        const flexible = api_version >= 4;
+        var pos = start_pos;
+
+        const resource_count = readKafkaArrayCount(buf, &pos, flexible) orelse return false;
+        for (0..resource_count) |_| {
+            if (!skipFixedBytes(buf, &pos, 1)) return false; // resource_type
+            if (!skipKafkaString(buf, &pos, flexible)) return false; // resource_name
+
+            const config_key_count = readKafkaArrayCount(buf, &pos, flexible) orelse return false;
+            for (0..config_key_count) |_| {
+                if (!skipKafkaString(buf, &pos, flexible)) return false; // configuration key
+            }
+            if (flexible) ser.skipTaggedFields(buf, &pos) catch return false;
+        }
+
+        if (api_version >= 1 and !skipFixedBytes(buf, &pos, 1)) return false; // include_synonyms
+        if (api_version >= 3 and !skipFixedBytes(buf, &pos, 1)) return false; // include_documentation
+        if (flexible) ser.skipTaggedFields(buf, &pos) catch return false;
+        return true;
+    }
+
     fn validateAlterConfigsRequestFrame(buf: []const u8, start_pos: usize, api_version: i16) bool {
         const flexible = api_version >= 2;
         var pos = start_pos;
@@ -8653,6 +8807,16 @@ fn buildTestRequest(buf: []u8, api_key: i16, api_version: i16, correlation_id: i
         ser.writeString(buf, &pos, "test-client");
     }
     return pos;
+}
+
+fn freeDeserializedDescribeConfigsResponse(resp: *const generated.describe_configs_response.DescribeConfigsResponse) void {
+    for (resp.results) |result| {
+        for (result.configs) |config| {
+            if (config.synonyms.len > 0) testing.allocator.free(config.synonyms);
+        }
+        if (result.configs.len > 0) testing.allocator.free(result.configs);
+    }
+    if (resp.results.len > 0) testing.allocator.free(resp.results);
 }
 
 fn expectApiVersionsResponseMatchesCatalog(response: []const u8, api_version: i16, correlation_id: i32) !void {
@@ -12941,29 +13105,98 @@ test "Broker.handleRequest DeleteRecords rejects truncated request" {
     try testing.expect(broker.handleRequest(buf[0..req_len]) == null);
 }
 
-test "Broker handleRequest DescribeConfigs (key=32)" {
+test "Broker.handleRequest DescribeConfigs v0 returns generated topic configs" {
+    const Resp = generated.describe_configs_response.DescribeConfigsResponse;
+
     var broker = Broker.init(testing.allocator, 1, 9092);
     defer broker.deinit();
 
-    // Create a topic first so DescribeConfigs has something to describe
     _ = broker.ensureTopic("cfg-topic");
+    broker.topics.getPtr("cfg-topic").?.config.retention_ms = 1234;
 
-    // DescribeConfigs v0
     var buf: [512]u8 = undefined;
     var pos = buildTestRequest(&buf, 32, 0, 210, 1);
-    // resources array: 1 resource
     ser.writeI32(&buf, &pos, 1);
     ser.writeI8(&buf, &pos, 2); // resource_type = TOPIC
-    ser.writeString(&buf, &pos, "cfg-topic"); // resource_name
-    ser.writeI32(&buf, &pos, 0); // config_keys array (empty = all configs)
+    ser.writeString(&buf, &pos, "cfg-topic");
+    ser.writeI32(&buf, &pos, 0);
 
-    const resp = broker.handleRequest(buf[0..pos]);
-    try testing.expect(resp != null);
-    defer testing.allocator.free(resp.?);
+    const response = broker.handleRequest(buf[0..pos]);
+    try testing.expect(response != null);
+    defer testing.allocator.free(response.?);
 
     var rpos: usize = 0;
-    const corr_id = ser.readI32(resp.?, &rpos);
-    try testing.expectEqual(@as(i32, 210), corr_id);
+    var response_header = try ResponseHeader.deserialize(testing.allocator, response.?, &rpos, header_mod.responseHeaderVersion(32, 0));
+    defer response_header.deinit(testing.allocator);
+    try testing.expectEqual(@as(i32, 210), response_header.correlation_id);
+
+    const resp = try Resp.deserialize(testing.allocator, response.?, &rpos, 0);
+    defer freeDeserializedDescribeConfigsResponse(&resp);
+
+    try testing.expectEqual(response.?.len, rpos);
+    try testing.expectEqual(@as(i32, 0), resp.throttle_time_ms);
+    try testing.expectEqual(@as(usize, 1), resp.results.len);
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.none)), resp.results[0].error_code);
+    try testing.expectEqual(@as(i8, 2), resp.results[0].resource_type);
+    try testing.expectEqualStrings("cfg-topic", resp.results[0].resource_name.?);
+    try testing.expectEqual(@as(usize, 7), resp.results[0].configs.len);
+    try testing.expectEqualStrings("retention.ms", resp.results[0].configs[0].name.?);
+    try testing.expectEqualStrings("1234", resp.results[0].configs[0].value.?);
+}
+
+test "Broker.handleRequest DescribeConfigs v4 filters keys and preserves flexible framing" {
+    const Req = generated.describe_configs_request.DescribeConfigsRequest;
+    const Resource = Req.DescribeConfigsResource;
+    const Resp = generated.describe_configs_response.DescribeConfigsResponse;
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+
+    _ = broker.ensureTopic("cfg-topic-v4");
+    const keys = [_]?[]const u8{"cleanup.policy"};
+    const resources = [_]Resource{.{
+        .resource_type = 2,
+        .resource_name = "cfg-topic-v4",
+        .configuration_keys = &keys,
+    }};
+    const req = Req{
+        .resources = &resources,
+        .include_synonyms = true,
+        .include_documentation = true,
+    };
+
+    var buf: [512]u8 = undefined;
+    var pos = buildTestRequest(&buf, 32, 4, 3204, header_mod.requestHeaderVersion(32, 4));
+    req.serialize(&buf, &pos, 4);
+
+    const response = broker.handleRequest(buf[0..pos]);
+    try testing.expect(response != null);
+    defer testing.allocator.free(response.?);
+
+    var rpos: usize = 0;
+    var response_header = try ResponseHeader.deserialize(testing.allocator, response.?, &rpos, header_mod.responseHeaderVersion(32, 4));
+    defer response_header.deinit(testing.allocator);
+    try testing.expectEqual(@as(i32, 3204), response_header.correlation_id);
+
+    const resp = try Resp.deserialize(testing.allocator, response.?, &rpos, 4);
+    defer freeDeserializedDescribeConfigsResponse(&resp);
+
+    try testing.expectEqual(response.?.len, rpos);
+    try testing.expectEqual(@as(usize, 1), resp.results.len);
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.none)), resp.results[0].error_code);
+    try testing.expectEqual(@as(usize, 1), resp.results[0].configs.len);
+    try testing.expectEqualStrings("cleanup.policy", resp.results[0].configs[0].name.?);
+    try testing.expectEqualStrings("delete", resp.results[0].configs[0].value.?);
+    try testing.expect(resp.results[0].configs[0].documentation != null);
+}
+
+test "Broker.handleRequest DescribeConfigs rejects truncated request" {
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+
+    var buf: [128]u8 = undefined;
+    const req_len = buildTestRequest(&buf, 32, 4, 3205, header_mod.requestHeaderVersion(32, 4));
+    try testing.expect(broker.handleRequest(buf[0..req_len]) == null);
 }
 
 test "Broker handleRequest Heartbeat (key=12)" {
