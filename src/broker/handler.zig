@@ -1461,7 +1461,7 @@ pub const Broker = struct {
             15 => self.handleDescribeGroups(request_bytes, pos, &req_header, resp_header_version),
             16 => self.handleListGroups(&req_header, resp_header_version),
             17 => self.handleSaslHandshake(request_bytes, pos, &req_header, resp_header_version),
-            18 => self.handleApiVersions(&req_header, api_version, resp_header_version),
+            18 => self.handleApiVersions(request_bytes, pos, &req_header, api_version, resp_header_version),
             19 => self.handleCreateTopics(request_bytes, pos, &req_header, api_version, resp_header_version),
             20 => self.handleDeleteTopics(request_bytes, pos, &req_header, api_version, resp_header_version),
             21 => self.handleDeleteRecords(request_bytes, pos, &req_header, api_version, resp_header_version),
@@ -1705,7 +1705,16 @@ pub const Broker = struct {
     // ---------------------------------------------------------------
     // ApiVersions (key 18)
     // ---------------------------------------------------------------
-    fn handleApiVersions(self: *Broker, req_header: *const RequestHeader, api_version: i16, resp_header_version: i16) ?[]u8 {
+    fn handleApiVersions(self: *Broker, request_bytes: []const u8, body_start: usize, req_header: *const RequestHeader, api_version: i16, resp_header_version: i16) ?[]u8 {
+        const Req = generated.api_versions_request.ApiVersionsRequest;
+        const body_version: i16 = @min(api_version, 4);
+
+        var pos = body_start;
+        _ = Req.deserialize(self.allocator, request_bytes, &pos, body_version) catch |err| {
+            log.warn("Malformed ApiVersions request: {}", .{err});
+            return null;
+        };
+
         const supported = api_support.broker_supported_apis;
         var api_keys_list: [supported.len]ApiVersionsResponse.ApiVersion = undefined;
         for (supported, 0..) |s, i| {
@@ -1718,7 +1727,6 @@ pub const Broker = struct {
             .throttle_time_ms = 0,
         };
 
-        const body_version: i16 = @min(api_version, 4);
         return self.serializeResponse(req_header, resp_header_version, &resp_body, body_version);
     }
 
@@ -6500,6 +6508,34 @@ fn buildTestRequest(buf: []u8, api_key: i16, api_version: i16, correlation_id: i
     return pos;
 }
 
+fn expectApiVersionsResponseMatchesCatalog(response: []const u8, api_version: i16, correlation_id: i32) !void {
+    const Resp = generated.api_versions_response.ApiVersionsResponse;
+    const body_version: i16 = @min(api_version, 4);
+
+    var rpos: usize = 0;
+    var response_header = try ResponseHeader.deserialize(testing.allocator, response, &rpos, header_mod.responseHeaderVersion(18, api_version));
+    defer response_header.deinit(testing.allocator);
+    try testing.expectEqual(correlation_id, response_header.correlation_id);
+
+    const resp = try Resp.deserialize(testing.allocator, response, &rpos, body_version);
+    defer if (resp.api_keys.len > 0) testing.allocator.free(resp.api_keys);
+
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.none)), resp.error_code);
+    try testing.expectEqual(api_support.broker_supported_apis.len, resp.api_keys.len);
+    if (body_version >= 1) {
+        try testing.expectEqual(@as(i32, 0), resp.throttle_time_ms);
+    }
+
+    for (api_support.broker_supported_apis, 0..) |expected, i| {
+        const actual = resp.api_keys[i];
+        try testing.expectEqual(expected.key, actual.api_key);
+        try testing.expectEqual(expected.min, actual.min_version);
+        try testing.expectEqual(expected.max, actual.max_version);
+    }
+
+    try testing.expectEqual(response.len, rpos);
+}
+
 test "Broker.handleRequest rejects too-short request" {
     var broker = Broker.init(testing.allocator, 1, 9092);
     defer broker.deinit();
@@ -6523,70 +6559,55 @@ test "Broker.handleRequest ApiVersions v0 (non-flexible)" {
     try testing.expect(response != null);
     defer testing.allocator.free(response.?);
 
-    // Parse the response header
-    var rpos: usize = 0;
-    const corr_id = ser.readI32(response.?, &rpos);
-    try testing.expectEqual(@as(i32, 42), corr_id);
-
-    // Parse ApiVersions response body
-    const error_code = ser.readI16(response.?, &rpos);
-    try testing.expectEqual(@as(i16, 0), error_code);
-
-    const api_count = (try ser.readArrayLen(response.?, &rpos)).?;
-    var saw_delete_groups = false;
-    var saw_incremental_alter_configs = false;
-    var saw_alter_reassignments = false;
-    var saw_list_reassignments = false;
-    var saw_create_streams = false;
-    var saw_update_group = false;
-    for (0..api_count) |_| {
-        const key = ser.readI16(response.?, &rpos);
-        _ = ser.readI16(response.?, &rpos);
-        const max_version = ser.readI16(response.?, &rpos);
-        if (key == 42) {
-            saw_delete_groups = true;
-            try testing.expectEqual(@as(i16, 2), max_version);
-        } else if (key == 44) {
-            saw_incremental_alter_configs = true;
-        } else if (key == 45) {
-            saw_alter_reassignments = true;
-        } else if (key == 46) {
-            saw_list_reassignments = true;
-        } else if (key == 501) {
-            saw_create_streams = true;
-            try testing.expectEqual(@as(i16, 1), max_version);
-        } else if (key == 602) {
-            saw_update_group = true;
-            try testing.expectEqual(@as(i16, 0), max_version);
-        }
-    }
-    try testing.expect(saw_delete_groups);
-    try testing.expect(saw_incremental_alter_configs);
-    try testing.expect(saw_alter_reassignments);
-    try testing.expect(saw_list_reassignments);
-    try testing.expect(saw_create_streams);
-    try testing.expect(saw_update_group);
+    try expectApiVersionsResponseMatchesCatalog(response.?, 0, 42);
 }
 
 test "Broker.handleRequest ApiVersions v3 (flexible)" {
     var broker = Broker.init(testing.allocator, 1, 9092);
     defer broker.deinit();
 
-    var buf: [256]u8 = undefined;
-    const req_len = buildTestRequest(&buf, 18, 3, 100, 2);
+    const req = generated.api_versions_request.ApiVersionsRequest{
+        .client_software_name = "zmq",
+        .client_software_version = "0.1.0",
+    };
+    var buf: [512]u8 = undefined;
+    var req_len = buildTestRequest(&buf, 18, 3, 100, 2);
+    req.serialize(&buf, &req_len, 3);
 
     const response = broker.handleRequest(buf[0..req_len]);
     try testing.expect(response != null);
     defer testing.allocator.free(response.?);
 
-    // Response header v0 for ApiVersions — just correlation_id
-    var rpos: usize = 0;
-    const corr_id = ser.readI32(response.?, &rpos);
-    try testing.expectEqual(@as(i32, 100), corr_id);
+    try expectApiVersionsResponseMatchesCatalog(response.?, 3, 100);
+}
 
-    // Error code
-    const error_code = ser.readI16(response.?, &rpos);
-    try testing.expectEqual(@as(i16, 0), error_code);
+test "Broker.handleRequest ApiVersions v4 generated catalog fixture" {
+    const req = generated.api_versions_request.ApiVersionsRequest{
+        .client_software_name = "java",
+        .client_software_version = "4.0.0",
+    };
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+
+    var buf: [512]u8 = undefined;
+    var req_len = buildTestRequest(&buf, 18, 4, 104, header_mod.requestHeaderVersion(18, 4));
+    req.serialize(&buf, &req_len, 4);
+
+    const response = broker.handleRequest(buf[0..req_len]);
+    try testing.expect(response != null);
+    defer testing.allocator.free(response.?);
+
+    try expectApiVersionsResponseMatchesCatalog(response.?, 4, 104);
+}
+
+test "Broker.handleRequest ApiVersions v3 rejects truncated request body" {
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+
+    var buf: [128]u8 = undefined;
+    const req_len = buildTestRequest(&buf, 18, 3, 105, header_mod.requestHeaderVersion(18, 3));
+    try testing.expect(broker.handleRequest(buf[0..req_len]) == null);
 }
 
 test "Broker.handleRequest Metadata (key=3, v1)" {
