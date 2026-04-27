@@ -413,6 +413,16 @@ pub fn build(b: *std.Build) void {
         client_matrix_step.dependOn(&run_client_matrix.step);
     }
 
+    // External multi-process KRaft/controller failover harness. The Python test
+    // skips unless ZMQ_RUN_KRAFT_FAILOVER_TESTS=1 is set, so this step is safe
+    // to run in normal local/CI environments.
+    const kraft_failover_step = b.step("test-kraft-failover", "Run gated KRaft controller failover harness");
+    {
+        const run_kraft_failover = b.addSystemCommand(&.{ "python3", "tests/kraft_failover_test.py" });
+        run_kraft_failover.step.dependOn(b.getInstallStep());
+        kraft_failover_step.dependOn(&run_kraft_failover.step);
+    }
+
     // ---------------------------------------------------------------
     // Benchmark step
     // ---------------------------------------------------------------

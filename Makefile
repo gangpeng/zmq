@@ -4,7 +4,7 @@
 ZIG ?= zig
 ZIG_FLAGS ?=
 
-.PHONY: build test run clean e2e s3-crash client-matrix docker bench help codegen
+.PHONY: build test run clean e2e s3-crash client-matrix kraft-failover docker bench help codegen
 
 help: ## Show this help
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | sort | awk 'BEGIN {FS = ":.*?## "}; {printf "  \033[36m%-15s\033[0m %s\n", $$1, $$2}'
@@ -41,6 +41,9 @@ s3-crash: build ## Run gated S3 broker process crash/restart test (requires MinI
 
 client-matrix: build ## Run gated real Kafka client compatibility matrix
 	ZMQ_BIN=./zig-out/bin/zmq python3 tests/client_matrix_test.py
+
+kraft-failover: build ## Run gated KRaft controller failover test
+	ZMQ_BIN=./zig-out/bin/zmq python3 tests/kraft_failover_test.py
 
 bench: ## Run performance benchmarks
 	$(ZIG) build bench $(ZIG_FLAGS)
