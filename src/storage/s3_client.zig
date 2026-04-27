@@ -512,6 +512,10 @@ pub const S3Client = struct {
             log.warn("CompleteMultipartUpload failed with status {d} for {s}", .{ complete_status, key });
             return error.S3MultipartCompleteFailed;
         }
+        if (isMultipartCompleteEmbeddedError(complete_resp)) {
+            log.warn("CompleteMultipartUpload returned embedded S3 error for {s}", .{key});
+            return error.S3MultipartCompleteFailed;
+        }
 
         self.put_count += 1;
         self.bytes_uploaded += data.len;
@@ -851,6 +855,11 @@ pub const S3Client = struct {
         if (etag.len == 0) return false;
         if (std.mem.indexOfAny(u8, etag, "\r\n<>") != null) return false;
         return true;
+    }
+
+    fn isMultipartCompleteEmbeddedError(response_data: []const u8) bool {
+        return std.mem.indexOf(u8, response_data, "<Error>") != null or
+            std.mem.indexOf(u8, response_data, "<Error ") != null;
     }
 
     fn isChunked(headers: []const u8) bool {
@@ -1212,6 +1221,7 @@ const MultipartTestServer = struct {
         bad_etag_then_success,
         persistent_bad_etag,
         complete_failure,
+        complete_embedded_error,
     };
 
     fn deinit(self: *MultipartTestServer) void {
@@ -1245,6 +1255,10 @@ const MultipartTestServer = struct {
             self.complete_count += 1;
             if (self.complete_body.len > 0) self.allocator.free(self.complete_body);
             self.complete_body = try self.allocator.dupe(u8, body orelse "");
+            if (self.mode == .complete_embedded_error) {
+                writeResponse(resp_buf, "HTTP/1.1 200 OK\r\n\r\n<Error><Code>EntityTooSmall</Code><Message>part too small</Message></Error>");
+                return 200;
+            }
             writeResponse(resp_buf, "<CompleteMultipartUploadResult/>");
             return if (self.mode == .complete_failure) 500 else 200;
         }
@@ -1275,6 +1289,10 @@ const MultipartTestServer = struct {
                 return 200;
             },
             .complete_failure => {
+                writeValidPartEtag(resp_buf, part_number);
+                return 200;
+            },
+            .complete_embedded_error => {
                 writeValidPartEtag(resp_buf, part_number);
                 return 200;
             },
@@ -1367,6 +1385,28 @@ test "S3Client multipart aborts after complete failure" {
     try testing.expectEqual(@as(u32, 2), server.part_put_count);
     try testing.expectEqual(@as(u32, 1), server.part1_attempts);
     try testing.expectEqual(@as(u32, 1), server.part2_attempts);
+    try testing.expectEqual(@as(u32, 1), server.complete_count);
+    try testing.expectEqual(@as(u32, 1), server.abort_count);
+    try testing.expect(std.mem.indexOf(u8, server.complete_body, "<ETag>\"part-1\"</ETag>") != null);
+    try testing.expectEqual(@as(u64, 0), client.put_count);
+    try testing.expectEqual(@as(u64, 0), client.bytes_uploaded);
+}
+
+test "S3Client multipart aborts after embedded complete error" {
+    var server = MultipartTestServer{ .allocator = testing.allocator, .mode = .complete_embedded_error };
+    defer server.deinit();
+
+    var client = S3Client.init(testing.allocator, .{});
+    client.test_http_ctx = &server;
+    client.test_http_request = MultipartTestServer.request;
+
+    const data = try allocMultipartTestData(testing.allocator);
+    defer testing.allocator.free(data);
+
+    try testing.expectError(error.S3MultipartCompleteFailed, client.putObjectMultipart("large-object", data));
+
+    try testing.expectEqual(@as(u32, 1), server.init_count);
+    try testing.expectEqual(@as(u32, 2), server.part_put_count);
     try testing.expectEqual(@as(u32, 1), server.complete_count);
     try testing.expectEqual(@as(u32, 1), server.abort_count);
     try testing.expect(std.mem.indexOf(u8, server.complete_body, "<ETag>\"part-1\"</ETag>") != null);
