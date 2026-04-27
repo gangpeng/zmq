@@ -3522,65 +3522,181 @@ pub const Broker = struct {
     // DeleteTopics (key 20)
     // ---------------------------------------------------------------
     fn handleDeleteTopics(self: *Broker, request_bytes: []const u8, body_start: usize, req_header: *const RequestHeader, api_version: i16, resp_header_version: i16) ?[]u8 {
-        var pos = body_start;
-        const flexible = api_version >= 4;
-        const num_topics = if (flexible)
-            (ser.readCompactArrayLen(request_bytes, &pos) catch return null) orelse 0
-        else
-            @as(usize, @intCast(@max(ser.readI32(request_bytes, &pos), 0)));
+        const Req = generated.delete_topics_request.DeleteTopicsRequest;
+        const Resp = generated.delete_topics_response.DeleteTopicsResponse;
+        const TopicResult = Resp.DeletableTopicResult;
 
-        var resp_buf = self.allocator.alloc(u8, 4096) catch return null;
-        var wpos: usize = 0;
-        const resp_header = ResponseHeader{ .correlation_id = req_header.correlation_id };
-        resp_header.serialize(resp_buf, &wpos, resp_header_version);
-        if (api_version >= 1) ser.writeI32(resp_buf, &wpos, 0); // throttle_time_ms
-        if (flexible) ser.writeCompactArrayLen(resp_buf, &wpos, num_topics) else ser.writeArrayLen(resp_buf, &wpos, num_topics);
-
-        for (0..num_topics) |_| {
-            const topic_name = if (flexible)
-                ((ser.readCompactString(request_bytes, &pos) catch return null) orelse "")
-            else
-                ((ser.readString(request_bytes, &pos) catch return null) orelse "");
-
-            var error_code: i16 = 0;
-
-            if (std.mem.startsWith(u8, topic_name, "__")) {
-                error_code = 73; // TOPIC_DELETION_DISABLED
-            } else if (self.topics.fetchRemove(topic_name)) |removed| {
-                const info = removed.value;
-                for (0..@as(usize, @intCast(info.num_partitions))) |pi| {
-                    const stream_id = PartitionStore.hashPartitionKey(topic_name, @intCast(pi));
-                    self.object_manager.deleteStream(stream_id) catch {};
-                    const pkey = std.fmt.allocPrint(self.allocator, "{s}-{d}", .{ topic_name, pi }) catch continue;
-                    defer self.allocator.free(pkey);
-                    if (self.store.partitions.fetchRemove(pkey)) |se| {
-                        self.allocator.free(se.value.topic);
-                        self.allocator.free(se.key);
-                    }
-                }
-                self.allocator.free(info.name);
-                self.allocator.free(removed.key);
-                log.info("Deleted topic '{s}' ({d} partitions)", .{ topic_name, info.num_partitions });
-                self.persistTopics();
-                self.persistObjectManagerSnapshot();
-            } else {
-                error_code = 3;
-            }
-
-            if (flexible) ser.writeCompactString(resp_buf, &wpos, topic_name) else ser.writeString(resp_buf, &wpos, topic_name);
-            if (api_version >= 6) {
-                // v6+: topic_id
-                ser.writeUuid(resp_buf, &wpos, .{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 });
-            }
-            ser.writeI16(resp_buf, &wpos, error_code);
-            if (api_version >= 5) {
-                if (flexible) ser.writeCompactString(resp_buf, &wpos, null) else ser.writeString(resp_buf, &wpos, null); // error_message
-            }
-            if (flexible) ser.writeEmptyTaggedFields(resp_buf, &wpos);
+        if (!validateDeleteTopicsRequestFrame(request_bytes, body_start, api_version)) {
+            log.warn("Malformed DeleteTopics request", .{});
+            return null;
         }
 
-        if (resp_header_version >= 1) ser.writeEmptyTaggedFields(resp_buf, &wpos);
-        return (self.allocator.realloc(resp_buf, wpos) catch resp_buf)[0..wpos];
+        var pos = body_start;
+        var req = Req.deserialize(self.allocator, request_bytes, &pos, api_version) catch |err| {
+            log.warn("Malformed DeleteTopics request: {}", .{err});
+            return null;
+        };
+        defer self.freeDeleteTopicsRequest(&req);
+
+        const response_count = if (api_version >= 6) req.topics.len else req.topic_names.len;
+        var responses: []TopicResult = &.{};
+        if (response_count > 0) {
+            responses = self.allocator.alloc(TopicResult, response_count) catch return null;
+        }
+        var owned_response_names: []?[]u8 = &.{};
+        if (response_count > 0) {
+            owned_response_names = self.allocator.alloc(?[]u8, response_count) catch {
+                self.allocator.free(responses);
+                return null;
+            };
+            @memset(owned_response_names, null);
+        }
+
+        var responses_init: usize = 0;
+        var deleted_any = false;
+        defer {
+            for (owned_response_names) |maybe_name| {
+                if (maybe_name) |name| self.allocator.free(name);
+            }
+            if (owned_response_names.len > 0) self.allocator.free(owned_response_names);
+            if (responses.len > 0) self.allocator.free(responses);
+        }
+
+        if (api_version >= 6) {
+            for (req.topics) |topic_req| {
+                var response_name = topic_req.name;
+                if (response_name == null) {
+                    if (self.findTopicNameById(topic_req.topic_id)) |found_name| {
+                        const name_copy = self.allocator.dupe(u8, found_name) catch return null;
+                        owned_response_names[responses_init] = name_copy;
+                        response_name = name_copy;
+                    }
+                }
+
+                const topic_name = response_name orelse "";
+                const outcome = if (topic_name.len > 0)
+                    self.deleteTopicByName(topic_name)
+                else
+                    DeleteTopicOutcome{
+                        .error_code = @intFromEnum(ErrorCode.unknown_topic_or_partition),
+                        .topic_id = topic_req.topic_id,
+                        .deleted = false,
+                    };
+                if (outcome.deleted) deleted_any = true;
+
+                responses[responses_init] = .{
+                    .name = response_name,
+                    .topic_id = if (!isZeroUuid(outcome.topic_id)) outcome.topic_id else topic_req.topic_id,
+                    .error_code = outcome.error_code,
+                    .error_message = null,
+                };
+                responses_init += 1;
+            }
+        } else {
+            for (req.topic_names) |topic_name_opt| {
+                const topic_name = topic_name_opt orelse "";
+                const outcome = self.deleteTopicByName(topic_name);
+                if (outcome.deleted) deleted_any = true;
+
+                responses[responses_init] = .{
+                    .name = topic_name_opt,
+                    .topic_id = outcome.topic_id,
+                    .error_code = outcome.error_code,
+                    .error_message = null,
+                };
+                responses_init += 1;
+            }
+        }
+
+        if (deleted_any) {
+            self.persistTopics();
+            self.persistObjectManagerSnapshot();
+        }
+
+        const resp = Resp{
+            .throttle_time_ms = 0,
+            .responses = responses[0..responses_init],
+        };
+        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+    }
+
+    const DeleteTopicOutcome = struct {
+        error_code: i16,
+        topic_id: [16]u8,
+        deleted: bool,
+    };
+
+    fn freeDeleteTopicsRequest(self: *Broker, req: *const generated.delete_topics_request.DeleteTopicsRequest) void {
+        if (req.topics.len > 0) self.allocator.free(req.topics);
+        if (req.topic_names.len > 0) self.allocator.free(req.topic_names);
+    }
+
+    fn findTopicNameById(self: *const Broker, topic_id: [16]u8) ?[]const u8 {
+        if (isZeroUuid(topic_id)) return null;
+        var it = self.topics.iterator();
+        while (it.next()) |entry| {
+            if (std.mem.eql(u8, &entry.value_ptr.topic_id, &topic_id)) {
+                return entry.key_ptr.*;
+            }
+        }
+        return null;
+    }
+
+    fn deleteTopicByName(self: *Broker, topic_name: []const u8) DeleteTopicOutcome {
+        if (topic_name.len == 0) {
+            return .{
+                .error_code = @intFromEnum(ErrorCode.invalid_topic_exception),
+                .topic_id = zeroUuid(),
+                .deleted = false,
+            };
+        }
+
+        if (std.mem.startsWith(u8, topic_name, "__")) {
+            const topic_id = if (self.topics.get(topic_name)) |info| info.topic_id else zeroUuid();
+            return .{
+                .error_code = @intFromEnum(ErrorCode.topic_deletion_disabled),
+                .topic_id = topic_id,
+                .deleted = false,
+            };
+        }
+
+        if (self.topics.fetchRemove(topic_name)) |removed| {
+            const info = removed.value;
+            const topic_id = info.topic_id;
+            for (0..@as(usize, @intCast(info.num_partitions))) |pi| {
+                const stream_id = PartitionStore.hashPartitionKey(topic_name, @intCast(pi));
+                self.object_manager.deleteStream(stream_id) catch {};
+                const pkey = std.fmt.allocPrint(self.allocator, "{s}-{d}", .{ topic_name, pi }) catch continue;
+                defer self.allocator.free(pkey);
+                if (self.store.partitions.fetchRemove(pkey)) |se| {
+                    self.allocator.free(se.value.topic);
+                    self.allocator.free(se.key);
+                }
+            }
+            self.allocator.free(info.name);
+            self.allocator.free(removed.key);
+            log.info("Deleted topic '{s}' ({d} partitions)", .{ topic_name, info.num_partitions });
+            return .{
+                .error_code = @intFromEnum(ErrorCode.none),
+                .topic_id = topic_id,
+                .deleted = true,
+            };
+        }
+
+        return .{
+            .error_code = @intFromEnum(ErrorCode.unknown_topic_or_partition),
+            .topic_id = zeroUuid(),
+            .deleted = false,
+        };
+    }
+
+    fn zeroUuid() [16]u8 {
+        return .{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 };
+    }
+
+    fn isZeroUuid(uuid: [16]u8) bool {
+        const zero = zeroUuid();
+        return std.mem.eql(u8, &uuid, &zero);
     }
 
     // ---------------------------------------------------------------
@@ -7779,6 +7895,29 @@ pub const Broker = struct {
 
         if (!skipFixedBytes(buf, &pos, 4)) return false; // timeout_ms
         if (api_version >= 1 and !skipFixedBytes(buf, &pos, 1)) return false; // validate_only
+        if (flexible) ser.skipTaggedFields(buf, &pos) catch return false;
+        return true;
+    }
+
+    fn validateDeleteTopicsRequestFrame(buf: []const u8, start_pos: usize, api_version: i16) bool {
+        const flexible = api_version >= 4;
+        var pos = start_pos;
+
+        if (api_version >= 6) {
+            const topic_count = readKafkaArrayCount(buf, &pos, true) orelse return false;
+            for (0..topic_count) |_| {
+                if (!skipKafkaString(buf, &pos, true)) return false; // name
+                if (!skipFixedBytes(buf, &pos, 16)) return false; // topic_id
+                ser.skipTaggedFields(buf, &pos) catch return false;
+            }
+        } else {
+            const topic_count = readKafkaArrayCount(buf, &pos, flexible) orelse return false;
+            for (0..topic_count) |_| {
+                if (!skipKafkaString(buf, &pos, flexible)) return false; // topic name
+            }
+        }
+
+        if (!skipFixedBytes(buf, &pos, 4)) return false; // timeout_ms
         if (flexible) ser.skipTaggedFields(buf, &pos) catch return false;
         return true;
     }
@@ -12584,6 +12723,61 @@ test "Broker handleRequest DeleteTopics (key=20)" {
 
     // Topic should be removed after delete
     try testing.expect(!broker.topics.contains("del-topic"));
+}
+
+test "Broker.handleRequest DeleteTopics v6 deletes by topic id and returns generated response" {
+    const Req = generated.delete_topics_request.DeleteTopicsRequest;
+    const Resp = generated.delete_topics_response.DeleteTopicsResponse;
+    const Topic = Req.DeleteTopicState;
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+
+    try testing.expect(broker.ensureTopic("dt-v6-topic"));
+    const topic_id = broker.topics.get("dt-v6-topic").?.topic_id;
+
+    const topics = [_]Topic{.{
+        .name = null,
+        .topic_id = topic_id,
+    }};
+    const req = Req{
+        .topics = &topics,
+        .timeout_ms = 30000,
+    };
+
+    var buf: [512]u8 = undefined;
+    var pos = buildTestRequest(&buf, 20, 6, 2006, header_mod.requestHeaderVersion(20, 6));
+    req.serialize(&buf, &pos, 6);
+
+    const response = broker.handleRequest(buf[0..pos]);
+    try testing.expect(response != null);
+    defer testing.allocator.free(response.?);
+
+    var rpos: usize = 0;
+    var response_header = try ResponseHeader.deserialize(testing.allocator, response.?, &rpos, header_mod.responseHeaderVersion(20, 6));
+    defer response_header.deinit(testing.allocator);
+    try testing.expectEqual(@as(i32, 2006), response_header.correlation_id);
+
+    const resp = try Resp.deserialize(testing.allocator, response.?, &rpos, 6);
+    defer {
+        if (resp.responses.len > 0) testing.allocator.free(resp.responses);
+    }
+    try testing.expectEqual(response.?.len, rpos);
+    try testing.expectEqual(@as(i32, 0), resp.throttle_time_ms);
+    try testing.expectEqual(@as(usize, 1), resp.responses.len);
+    try testing.expectEqualStrings("dt-v6-topic", resp.responses[0].name.?);
+    try testing.expectEqualSlices(u8, &topic_id, &resp.responses[0].topic_id);
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.none)), resp.responses[0].error_code);
+    try testing.expect(!broker.topics.contains("dt-v6-topic"));
+}
+
+test "Broker.handleRequest DeleteTopics rejects truncated request" {
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+
+    var buf: [128]u8 = undefined;
+    const req_len = buildTestRequest(&buf, 20, 6, 2007, header_mod.requestHeaderVersion(20, 6));
+    try testing.expect(broker.handleRequest(buf[0..req_len]) == null);
 }
 
 test "Broker handleRequest DescribeConfigs (key=32)" {

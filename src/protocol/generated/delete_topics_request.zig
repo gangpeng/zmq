@@ -84,16 +84,18 @@ pub const DeleteTopicsRequest = struct {
                 item.serialize(buf, pos, version);
             }
         }
-        if (version >= 4) {
-            ser.writeCompactArrayLen(buf, pos, self.topic_names.len);
-        } else {
-            ser.writeArrayLen(buf, pos, self.topic_names.len);
-        }
-        for (self.topic_names) |item| {
+        if (version <= 5) {
             if (version >= 4) {
-                ser.writeCompactString(buf, pos, item);
+                ser.writeCompactArrayLen(buf, pos, self.topic_names.len);
             } else {
-                ser.writeString(buf, pos, item);
+                ser.writeArrayLen(buf, pos, self.topic_names.len);
+            }
+            for (self.topic_names) |item| {
+                if (version >= 4) {
+                    ser.writeCompactString(buf, pos, item);
+                } else {
+                    ser.writeString(buf, pos, item);
+                }
             }
         }
         ser.writeI32(buf, pos, self.timeout_ms);
@@ -115,19 +117,21 @@ pub const DeleteTopicsRequest = struct {
                 result.topics = topics_items;
             }
         }
-        const topic_names_len: usize = if (version >= 4)
-            (try ser.readCompactArrayLen(buf, pos)) orelse 0
-        else
-            (try ser.readArrayLen(buf, pos)) orelse 0;
-        if (topic_names_len > 0) {
-            const topic_names_items = try alloc.alloc(?[]const u8, topic_names_len);
-            for (topic_names_items) |*item| {
-                item.* = if (version >= 4)
-                    try ser.readCompactString(buf, pos)
-                else
-                    try ser.readString(buf, pos);
+        if (version <= 5) {
+            const topic_names_len: usize = if (version >= 4)
+                (try ser.readCompactArrayLen(buf, pos)) orelse 0
+            else
+                (try ser.readArrayLen(buf, pos)) orelse 0;
+            if (topic_names_len > 0) {
+                const topic_names_items = try alloc.alloc(?[]const u8, topic_names_len);
+                for (topic_names_items) |*item| {
+                    item.* = if (version >= 4)
+                        try ser.readCompactString(buf, pos)
+                    else
+                        try ser.readString(buf, pos);
+                }
+                result.topic_names = topic_names_items;
             }
-            result.topic_names = topic_names_items;
         }
         result.timeout_ms = ser.readI32(buf, pos);
         if (version >= 4) try ser.skipTaggedFields(buf, pos);
@@ -146,16 +150,18 @@ pub const DeleteTopicsRequest = struct {
                 size += item.calcSize(version);
             }
         }
-        if (version >= 4) {
-            size += ser.unsignedVarintSize(self.topic_names.len + 1);
-        } else {
-            size += 4;
-        }
-        for (self.topic_names) |item| {
+        if (version <= 5) {
             if (version >= 4) {
-                size += ser.compactStringSize(item);
+                size += ser.unsignedVarintSize(self.topic_names.len + 1);
             } else {
-                size += ser.stringSize(item);
+                size += 4;
+            }
+            for (self.topic_names) |item| {
+                if (version >= 4) {
+                    size += ser.compactStringSize(item);
+                } else {
+                    size += ser.stringSize(item);
+                }
             }
         }
         size += 4;
