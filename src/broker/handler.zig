@@ -3740,15 +3740,20 @@ pub const Broker = struct {
     // to the transaction via txn_coordinator.addPartitionsToTxn.
     // ---------------------------------------------------------------
     fn handleAddOffsetsToTxn(self: *Broker, request_bytes: []const u8, body_start: usize, req_header: *const RequestHeader, api_version: i16, resp_header_version: i16) ?[]u8 {
-        _ = api_version;
-        var pos = body_start;
+        const Req = generated.add_offsets_to_txn_request.AddOffsetsToTxnRequest;
+        const Resp = generated.add_offsets_to_txn_response.AddOffsetsToTxnResponse;
 
-        // Parse: transactional_id, producer_id, producer_epoch, group_id
-        const transactional_id = (ser.readString(request_bytes, &pos) catch return null) orelse "";
-        _ = transactional_id;
-        const producer_id = ser.readI64(request_bytes, &pos);
-        const producer_epoch = ser.readI16(request_bytes, &pos);
-        const group_id = (ser.readString(request_bytes, &pos) catch return null) orelse "";
+        if (!validateAddOffsetsToTxnRequestFrame(request_bytes, body_start, api_version)) {
+            log.warn("Malformed AddOffsetsToTxn request", .{});
+            return null;
+        }
+
+        var pos = body_start;
+        const req = Req.deserialize(self.allocator, request_bytes, &pos, api_version) catch |err| {
+            log.warn("Failed to decode AddOffsetsToTxn request: {}", .{err});
+            return null;
+        };
+        const group_id = req.group_id orelse "";
 
         // Compute partition = hash(group_id) % 50 for __consumer_offsets
         var hasher = std.hash.Wyhash.init(0);
@@ -3757,20 +3762,17 @@ pub const Broker = struct {
 
         // Add __consumer_offsets partition to the transaction
         const error_code = self.txn_coordinator.addPartitionsToTxn(
-            producer_id,
-            producer_epoch,
+            req.producer_id,
+            req.producer_epoch,
             "__consumer_offsets",
             target_partition,
         ) catch 48; // INVALID_PRODUCER_ID_MAPPING on error
 
-        var buf = self.allocator.alloc(u8, 64) catch return null;
-        var wpos: usize = 0;
-        const rh = ResponseHeader{ .correlation_id = req_header.correlation_id };
-        rh.serialize(buf, &wpos, resp_header_version);
-        ser.writeI32(buf, &wpos, 0); // throttle_time_ms
-        ser.writeI16(buf, &wpos, error_code);
-        if (resp_header_version >= 1) ser.writeEmptyTaggedFields(buf, &wpos);
-        return (self.allocator.realloc(buf, wpos) catch buf)[0..wpos];
+        const resp = Resp{
+            .throttle_time_ms = 0,
+            .error_code = error_code,
+        };
+        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
     }
 
     // ---------------------------------------------------------------
@@ -6905,6 +6907,17 @@ pub const Broker = struct {
         return true;
     }
 
+    fn validateAddOffsetsToTxnRequestFrame(buf: []const u8, start_pos: usize, api_version: i16) bool {
+        const flexible = api_version >= 3;
+        var pos = start_pos;
+
+        if (!skipKafkaString(buf, &pos, flexible)) return false; // transactional_id
+        if (!skipFixedBytes(buf, &pos, 10)) return false; // producer_id + producer_epoch
+        if (!skipKafkaString(buf, &pos, flexible)) return false; // group_id
+        if (flexible) ser.skipTaggedFields(buf, &pos) catch return false;
+        return true;
+    }
+
     fn validateListGroupsRequestFrame(buf: []const u8, start_pos: usize, api_version: i16) bool {
         const flexible = api_version >= 3;
         var pos = start_pos;
@@ -9922,6 +9935,64 @@ test "Broker.handleRequest InitProducerId rejects truncated request" {
 
     var buf: [128]u8 = undefined;
     const req_len = buildTestRequest(&buf, 22, 4, 2205, header_mod.requestHeaderVersion(22, 4));
+    try testing.expect(broker.handleRequest(buf[0..req_len]) == null);
+}
+
+test "Broker.handleRequest AddOffsetsToTxn v3 returns generated response and registers offsets partition" {
+    const Req = generated.add_offsets_to_txn_request.AddOffsetsToTxnRequest;
+    const Resp = generated.add_offsets_to_txn_response.AddOffsetsToTxnResponse;
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+
+    const init_result = try broker.txn_coordinator.initProducerId("txn-add-offsets");
+    const group_id = "group-add-offsets";
+    const req = Req{
+        .transactional_id = "txn-add-offsets",
+        .producer_id = init_result.producer_id,
+        .producer_epoch = init_result.producer_epoch,
+        .group_id = group_id,
+    };
+
+    var buf: [512]u8 = undefined;
+    var pos = buildTestRequest(&buf, 25, 3, 2503, header_mod.requestHeaderVersion(25, 3));
+    req.serialize(&buf, &pos, 3);
+
+    const response = broker.handleRequest(buf[0..pos]);
+    try testing.expect(response != null);
+    defer testing.allocator.free(response.?);
+
+    var rpos: usize = 0;
+    var response_header = try ResponseHeader.deserialize(testing.allocator, response.?, &rpos, header_mod.responseHeaderVersion(25, 3));
+    defer response_header.deinit(testing.allocator);
+    try testing.expectEqual(@as(i32, 2503), response_header.correlation_id);
+
+    const resp = try Resp.deserialize(testing.allocator, response.?, &rpos, 3);
+    try testing.expectEqual(response.?.len, rpos);
+    try testing.expectEqual(@as(i32, 0), resp.throttle_time_ms);
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.none)), resp.error_code);
+
+    var hasher = std.hash.Wyhash.init(0);
+    hasher.update(group_id);
+    const expected_partition: i32 = @intCast(hasher.final() % 50);
+    const partitions_opt = broker.txn_coordinator.getPartitions(init_result.producer_id);
+    try testing.expect(partitions_opt != null);
+
+    var found_offsets_partition = false;
+    for (partitions_opt.?) |partition| {
+        if (partition.partition == expected_partition and std.mem.eql(u8, partition.topic, "__consumer_offsets")) {
+            found_offsets_partition = true;
+        }
+    }
+    try testing.expect(found_offsets_partition);
+}
+
+test "Broker.handleRequest AddOffsetsToTxn rejects truncated request" {
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+
+    var buf: [128]u8 = undefined;
+    const req_len = buildTestRequest(&buf, 25, 3, 2504, header_mod.requestHeaderVersion(25, 3));
     try testing.expect(broker.handleRequest(buf[0..req_len]) == null);
 }
 
