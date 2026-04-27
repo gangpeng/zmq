@@ -1372,6 +1372,57 @@ test "PartitionStore rebuilds S3 WAL metadata and fetches object data" {
     try testing.expectEqualStrings("ab", result.records);
 }
 
+test "PartitionStore rebuilds S3 WAL data after local store replacement" {
+    var mock_s3 = MockS3.init(testing.allocator);
+    defer mock_s3.deinit();
+    const s3_storage = S3Storage.initMock(testing.allocator, &mock_s3);
+
+    {
+        var producer_store = PartitionStore.init(testing.allocator);
+        defer producer_store.deinit();
+        producer_store.s3_wal_mode = true;
+        producer_store.s3_storage = s3_storage;
+        producer_store.s3_wal_batcher = S3WalBatcher.init(testing.allocator);
+
+        const first = try producer_store.produce("s3-replacement-topic", 0, "a");
+        const second = try producer_store.produce("s3-replacement-topic", 0, "b");
+        try testing.expectEqual(@as(i64, 0), first.base_offset);
+        try testing.expectEqual(@as(i64, 1), second.base_offset);
+
+        var key_buf: [256]u8 = undefined;
+        const key = PartitionStore.partitionKeyBuf(&key_buf, "s3-replacement-topic", 0);
+        const state = producer_store.partitions.getPtr(key).?;
+        try testing.expectEqual(@as(u64, 2), state.next_offset);
+        try testing.expectEqual(@as(u64, 2), state.high_watermark);
+    }
+
+    try testing.expectEqual(@as(usize, 2), mock_s3.objectCount());
+
+    var object_manager = ObjectManager.init(testing.allocator, 1);
+    defer object_manager.deinit();
+
+    var replacement_store = PartitionStore.init(testing.allocator);
+    defer replacement_store.deinit();
+    replacement_store.s3_storage = s3_storage;
+    replacement_store.object_manager = &object_manager;
+
+    try testing.expectEqual(@as(u64, 2), try replacement_store.recoverS3WalObjects());
+    try replacement_store.ensurePartition("s3-replacement-topic", 0);
+    try testing.expect(replacement_store.repairPartitionStatesFromObjectManager());
+
+    var key_buf: [256]u8 = undefined;
+    const key = PartitionStore.partitionKeyBuf(&key_buf, "s3-replacement-topic", 0);
+    const state = replacement_store.partitions.getPtr(key).?;
+    try testing.expectEqual(@as(u64, 2), state.next_offset);
+    try testing.expectEqual(@as(u64, 2), state.high_watermark);
+    try testing.expectEqual(@as(u64, 2), state.last_stable_offset);
+
+    const result = try replacement_store.fetch("s3-replacement-topic", 0, 0, 1024);
+    defer if (result.records.len > 0) testing.allocator.free(@constCast(result.records));
+    try testing.expectEqual(@as(i16, 0), result.error_code);
+    try testing.expectEqualStrings("ab", result.records);
+}
+
 test "PartitionStore fetch filters interleaved S3 WAL stream blocks" {
     var mock_s3 = MockS3.init(testing.allocator);
     defer mock_s3.deinit();
