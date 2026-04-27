@@ -518,9 +518,51 @@ def main():
         if second_offset <= first_offset:
             raise TestError(f"broker did not continue after failover: {second_offset} <= {first_offset}")
 
+        restart_controller_id = next(
+            node_id for node_id in sorted(alive) if node_id != replacement_leader
+        )
+        stop_process(processes[restart_controller_id]["proc"])
+        processes[restart_controller_id] = start_controller(
+            tmp, restart_controller_id, ports[restart_controller_id], voters
+        )
+        wait_for_ready(
+            processes[restart_controller_id]["proc"],
+            processes[restart_controller_id]["port"],
+            processes[restart_controller_id]["log_path"],
+        )
+        wait_for_all_alive_to_report(processes, replacement_leader)
+        restarted_quorum = describe_quorum(
+            processes[restart_controller_id]["port"], 5000 + restart_controller_id
+        )
+        if restarted_quorum["leader_id"] != replacement_leader:
+            raise TestError(
+                f"restarted controller {restart_controller_id} did not rejoin leader "
+                f"{replacement_leader}: {restarted_quorum}"
+            )
+
+        third_offset = wait_for_produce(
+            broker["port"], topic, b"after-controller-rolling-restart"
+        )
+        if third_offset <= second_offset:
+            raise TestError(
+                f"broker did not continue after controller restart: {third_offset} <= {second_offset}"
+            )
+
+        stop_process(broker["proc"])
+        broker = start_broker(tmp, voters)
+        wait_for_broker_ready(broker["proc"], broker["port"], broker["log_path"])
+        fourth_offset = wait_for_produce(
+            broker["port"], topic, b"after-broker-rolling-restart"
+        )
+        if fourth_offset <= third_offset:
+            raise TestError(
+                f"broker did not continue after broker restart: {fourth_offset} <= {third_offset}"
+            )
+
         print(
             "ok: KRaft controller failover harness passed "
-            f"(old_leader={leader_id}, new_leader={replacement_leader}, epoch={after['leader_epoch']})"
+            f"(old_leader={leader_id}, new_leader={replacement_leader}, "
+            f"restarted_controller={restart_controller_id}, epoch={after['leader_epoch']})"
         )
         return 0
     finally:
