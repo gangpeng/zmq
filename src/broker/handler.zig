@@ -3121,56 +3121,49 @@ pub const Broker = struct {
     // CreateTopics (key 19)
     // ---------------------------------------------------------------
     fn handleCreateTopics(self: *Broker, request_bytes: []const u8, body_start: usize, req_header: *const RequestHeader, api_version: i16, resp_header_version: i16) ?[]u8 {
+        const Req = generated.create_topics_request.CreateTopicsRequest;
+        const Resp = generated.create_topics_response.CreateTopicsResponse;
+        const TopicResult = Resp.CreatableTopicResult;
+
+        if (!validateCreateTopicsRequestFrame(request_bytes, body_start, api_version)) {
+            log.warn("Malformed CreateTopics request", .{});
+            return null;
+        }
+
         var pos = body_start;
-        const flexible = api_version >= 5;
-        const readStr = if (flexible) &ser.readCompactString else &ser.readString;
+        var req = Req.deserialize(self.allocator, request_bytes, &pos, api_version) catch |err| {
+            log.warn("Malformed CreateTopics request: {}", .{err});
+            return null;
+        };
+        defer self.freeCreateTopicsRequest(&req);
 
-        const num_topics = if (flexible)
-            (ser.readCompactArrayLen(request_bytes, &pos) catch return null) orelse 0
-        else
-            @as(usize, @intCast(@max(ser.readI32(request_bytes, &pos), 0)));
+        var topics: []TopicResult = &.{};
+        if (req.topics.len > 0) {
+            topics = self.allocator.alloc(TopicResult, req.topics.len) catch return null;
+        }
+        var topics_init: usize = 0;
+        var created_any = false;
+        defer {
+            if (topics.len > 0) self.allocator.free(topics);
+        }
 
-        var resp_buf = self.allocator.alloc(u8, 4096) catch return null;
-        var wpos: usize = 0;
-        const resp_header = ResponseHeader{ .correlation_id = req_header.correlation_id };
-        resp_header.serialize(resp_buf, &wpos, resp_header_version);
-        if (api_version >= 2) ser.writeI32(resp_buf, &wpos, 0); // throttle_time_ms
-        if (flexible) ser.writeCompactArrayLen(resp_buf, &wpos, num_topics) else ser.writeArrayLen(resp_buf, &wpos, num_topics);
+        for (req.topics) |topic_req| {
+            const topic_name = topic_req.name orelse "";
+            const actual_partitions = self.createTopicsPartitionCount(&topic_req);
+            const actual_rf = self.createTopicsReplicationFactor(&topic_req);
+            var error_code: i16 = @intFromEnum(ErrorCode.none);
 
-        for (0..num_topics) |_| {
-            const topic_name = (readStr(request_bytes, &pos) catch return null) orelse "";
-            const num_partitions = ser.readI32(request_bytes, &pos);
-            const replication_factor = ser.readI16(request_bytes, &pos);
-
-            // Skip assignments and configs arrays
-            const num_assignments = if (flexible)
-                (ser.readCompactArrayLen(request_bytes, &pos) catch 0) orelse 0
-            else
-                @as(usize, @intCast(@max(ser.readI32(request_bytes, &pos), 0)));
-            for (0..num_assignments) |_| {
-                _ = ser.readI32(request_bytes, &pos);
-                const nbi = if (flexible) (ser.readCompactArrayLen(request_bytes, &pos) catch 0) orelse 0 else @as(usize, @intCast(@max(ser.readI32(request_bytes, &pos), 0)));
-                pos += nbi * 4;
-                if (flexible) ser.skipTaggedFields(request_bytes, &pos) catch {};
-            }
-            const num_configs = if (flexible)
-                (ser.readCompactArrayLen(request_bytes, &pos) catch 0) orelse 0
-            else
-                @as(usize, @intCast(@max(ser.readI32(request_bytes, &pos), 0)));
-            for (0..num_configs) |_| {
-                _ = readStr(request_bytes, &pos) catch break;
-                _ = readStr(request_bytes, &pos) catch break;
-                if (flexible) ser.skipTaggedFields(request_bytes, &pos) catch {};
-            }
-            if (flexible) ser.skipTaggedFields(request_bytes, &pos) catch {};
-
-            const actual_partitions: i32 = if (num_partitions <= 0) self.default_num_partitions else num_partitions;
-            const actual_rf: i16 = if (replication_factor <= 0) self.default_replication_factor else replication_factor;
-
-            var error_code: i16 = 0;
-            if (self.topics.contains(topic_name)) {
-                error_code = 36;
-            } else {
+            if (topic_name.len == 0) {
+                error_code = @intFromEnum(ErrorCode.invalid_topic_exception);
+            } else if (self.topics.contains(topic_name)) {
+                error_code = @intFromEnum(ErrorCode.topic_already_exists);
+            } else if (hasInvalidCreateTopicAssignments(topic_req.assignments)) {
+                error_code = @intFromEnum(ErrorCode.invalid_replica_assignment);
+            } else if (actual_partitions <= 0) {
+                error_code = @intFromEnum(ErrorCode.invalid_partitions);
+            } else if (actual_rf <= 0) {
+                error_code = @intFromEnum(ErrorCode.invalid_replication_factor);
+            } else if (!req.validate_only) {
                 const name_copy = self.allocator.dupe(u8, topic_name) catch return null;
                 const key_copy = self.allocator.dupe(u8, topic_name) catch {
                     self.allocator.free(name_copy);
@@ -3181,36 +3174,81 @@ pub const Broker = struct {
                     .num_partitions = actual_partitions,
                     .replication_factor = actual_rf,
                     .topic_id = TopicInfo.generateTopicId(),
-                }) catch return null;
-                for (0..@intCast(actual_partitions)) |pi| self.store.ensurePartition(topic_name, @intCast(pi)) catch {};
+                }) catch {
+                    self.allocator.free(key_copy);
+                    self.allocator.free(name_copy);
+                    return null;
+                };
+
+                for (0..@intCast(actual_partitions)) |pi| {
+                    self.store.ensurePartition(topic_name, @intCast(pi)) catch {};
+                }
                 log.info("Created topic '{s}' ({d} partitions)", .{ topic_name, actual_partitions });
-                self.persistTopics();
-                self.persistObjectManagerSnapshot();
+                created_any = true;
             }
 
-            if (flexible) ser.writeCompactString(resp_buf, &wpos, topic_name) else ser.writeString(resp_buf, &wpos, topic_name);
-            if (api_version >= 7) {
-                // v7+: topic_id UUID
-                if (self.topics.get(topic_name)) |info| {
-                    ser.writeUuid(resp_buf, &wpos, info.topic_id);
-                } else {
-                    ser.writeUuid(resp_buf, &wpos, .{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 });
-                }
-            }
-            ser.writeI16(resp_buf, &wpos, error_code);
-            if (api_version >= 1) {
-                if (flexible) ser.writeCompactString(resp_buf, &wpos, null) else ser.writeString(resp_buf, &wpos, null); // error_message
-            }
-            if (api_version >= 5) {
-                ser.writeI32(resp_buf, &wpos, actual_partitions); // num_partitions
-                ser.writeI16(resp_buf, &wpos, actual_rf); // replication_factor
-                if (flexible) ser.writeCompactArrayLen(resp_buf, &wpos, 0) else ser.writeArrayLen(resp_buf, &wpos, 0); // configs
-            }
-            if (flexible) ser.writeEmptyTaggedFields(resp_buf, &wpos);
+            topics[topics_init] = .{
+                .name = topic_req.name,
+                .topic_id = if (self.topics.get(topic_name)) |info| info.topic_id else .{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 },
+                .error_code = error_code,
+                .error_message = null,
+                .num_partitions = actual_partitions,
+                .replication_factor = actual_rf,
+                .configs = &.{},
+            };
+            topics_init += 1;
         }
 
-        if (resp_header_version >= 1) ser.writeEmptyTaggedFields(resp_buf, &wpos);
-        return (self.allocator.realloc(resp_buf, wpos) catch resp_buf)[0..wpos];
+        if (created_any) {
+            self.persistTopics();
+            self.persistObjectManagerSnapshot();
+        }
+
+        const resp = Resp{
+            .throttle_time_ms = 0,
+            .topics = topics[0..topics_init],
+        };
+        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+    }
+
+    fn freeCreateTopicsRequest(self: *Broker, req: *const generated.create_topics_request.CreateTopicsRequest) void {
+        for (req.topics) |topic| {
+            for (topic.assignments) |assignment| {
+                if (assignment.broker_ids.len > 0) self.allocator.free(assignment.broker_ids);
+            }
+            if (topic.assignments.len > 0) self.allocator.free(topic.assignments);
+            if (topic.configs.len > 0) self.allocator.free(topic.configs);
+        }
+        if (req.topics.len > 0) self.allocator.free(req.topics);
+    }
+
+    fn createTopicsPartitionCount(self: *const Broker, topic_req: *const generated.create_topics_request.CreateTopicsRequest.CreatableTopic) i32 {
+        if (topic_req.assignments.len > 0) {
+            var max_partition: i32 = -1;
+            for (topic_req.assignments) |assignment| {
+                if (assignment.partition_index > max_partition) max_partition = assignment.partition_index;
+            }
+            return max_partition + 1;
+        }
+        return if (topic_req.num_partitions <= 0) self.default_num_partitions else topic_req.num_partitions;
+    }
+
+    fn createTopicsReplicationFactor(self: *const Broker, topic_req: *const generated.create_topics_request.CreateTopicsRequest.CreatableTopic) i16 {
+        if (topic_req.assignments.len > 0 and topic_req.assignments[0].broker_ids.len > 0) {
+            const max_i16_as_usize: usize = @intCast(std.math.maxInt(i16));
+            return @intCast(@min(topic_req.assignments[0].broker_ids.len, max_i16_as_usize));
+        }
+        return if (topic_req.replication_factor <= 0) self.default_replication_factor else topic_req.replication_factor;
+    }
+
+    fn hasInvalidCreateTopicAssignments(assignments: []const generated.create_topics_request.CreateTopicsRequest.CreatableTopic.CreatableReplicaAssignment) bool {
+        for (assignments, 0..) |assignment, assignment_idx| {
+            if (assignment.partition_index < 0) return true;
+            for (assignments[assignment_idx + 1 ..]) |other| {
+                if (assignment.partition_index == other.partition_index) return true;
+            }
+        }
+        return false;
     }
 
     // ---------------------------------------------------------------
@@ -7710,6 +7748,37 @@ pub const Broker = struct {
             if (flexible) ser.skipTaggedFields(buf, &pos) catch return false;
         }
         if (!skipFixedBytes(buf, &pos, 1)) return false; // validate_only
+        if (flexible) ser.skipTaggedFields(buf, &pos) catch return false;
+        return true;
+    }
+
+    fn validateCreateTopicsRequestFrame(buf: []const u8, start_pos: usize, api_version: i16) bool {
+        const flexible = api_version >= 5;
+        var pos = start_pos;
+
+        const topic_count = readKafkaArrayCount(buf, &pos, flexible) orelse return false;
+        for (0..topic_count) |_| {
+            if (!skipKafkaString(buf, &pos, flexible)) return false; // name
+            if (!skipFixedBytes(buf, &pos, 6)) return false; // num_partitions + replication_factor
+
+            const assignment_count = readKafkaArrayCount(buf, &pos, flexible) orelse return false;
+            for (0..assignment_count) |_| {
+                if (!skipFixedBytes(buf, &pos, 4)) return false; // partition_index
+                if (!skipKafkaI32Array(buf, &pos, flexible)) return false; // broker_ids
+                if (flexible) ser.skipTaggedFields(buf, &pos) catch return false;
+            }
+
+            const config_count = readKafkaArrayCount(buf, &pos, flexible) orelse return false;
+            for (0..config_count) |_| {
+                if (!skipKafkaString(buf, &pos, flexible)) return false; // config name
+                if (!skipKafkaString(buf, &pos, flexible)) return false; // config value
+                if (flexible) ser.skipTaggedFields(buf, &pos) catch return false;
+            }
+            if (flexible) ser.skipTaggedFields(buf, &pos) catch return false;
+        }
+
+        if (!skipFixedBytes(buf, &pos, 4)) return false; // timeout_ms
+        if (api_version >= 1 and !skipFixedBytes(buf, &pos, 1)) return false; // validate_only
         if (flexible) ser.skipTaggedFields(buf, &pos) catch return false;
         return true;
     }
@@ -12253,6 +12322,111 @@ test "Broker.handleRequest CreateTopics (key=19) creates topic" {
     try testing.expect(broker.topics.contains("new-ct-topic"));
     const info = broker.topics.get("new-ct-topic").?;
     try testing.expectEqual(@as(i32, 3), info.num_partitions);
+}
+
+test "Broker.handleRequest CreateTopics v7 returns generated response" {
+    const Req = generated.create_topics_request.CreateTopicsRequest;
+    const Resp = generated.create_topics_response.CreateTopicsResponse;
+    const Topic = Req.CreatableTopic;
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+
+    const topics = [_]Topic{.{
+        .name = "ct-generated-topic",
+        .num_partitions = 2,
+        .replication_factor = 1,
+    }};
+    const req = Req{
+        .topics = &topics,
+        .timeout_ms = 30000,
+        .validate_only = false,
+    };
+
+    var buf: [512]u8 = undefined;
+    var pos = buildTestRequest(&buf, 19, 7, 1907, header_mod.requestHeaderVersion(19, 7));
+    req.serialize(&buf, &pos, 7);
+
+    const response = broker.handleRequest(buf[0..pos]);
+    try testing.expect(response != null);
+    defer testing.allocator.free(response.?);
+
+    var rpos: usize = 0;
+    var response_header = try ResponseHeader.deserialize(testing.allocator, response.?, &rpos, header_mod.responseHeaderVersion(19, 7));
+    defer response_header.deinit(testing.allocator);
+    try testing.expectEqual(@as(i32, 1907), response_header.correlation_id);
+
+    const resp = try Resp.deserialize(testing.allocator, response.?, &rpos, 7);
+    defer {
+        for (resp.topics) |topic| {
+            if (topic.configs.len > 0) testing.allocator.free(topic.configs);
+        }
+        if (resp.topics.len > 0) testing.allocator.free(resp.topics);
+    }
+    try testing.expectEqual(response.?.len, rpos);
+    try testing.expectEqual(@as(i32, 0), resp.throttle_time_ms);
+    try testing.expectEqual(@as(usize, 1), resp.topics.len);
+    try testing.expectEqualStrings("ct-generated-topic", resp.topics[0].name.?);
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.none)), resp.topics[0].error_code);
+    try testing.expectEqual(@as(i32, 2), resp.topics[0].num_partitions);
+    try testing.expectEqual(@as(i16, 1), resp.topics[0].replication_factor);
+    try testing.expect(!std.mem.eql(u8, &resp.topics[0].topic_id, &[_]u8{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 }));
+    try testing.expect(broker.topics.contains("ct-generated-topic"));
+}
+
+test "Broker.handleRequest CreateTopics validate_only does not create topic" {
+    const Req = generated.create_topics_request.CreateTopicsRequest;
+    const Resp = generated.create_topics_response.CreateTopicsResponse;
+    const Topic = Req.CreatableTopic;
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+
+    const topics = [_]Topic{.{
+        .name = "ct-validate-only-topic",
+        .num_partitions = 1,
+        .replication_factor = 1,
+    }};
+    const req = Req{
+        .topics = &topics,
+        .timeout_ms = 30000,
+        .validate_only = true,
+    };
+
+    var buf: [512]u8 = undefined;
+    var pos = buildTestRequest(&buf, 19, 5, 1905, header_mod.requestHeaderVersion(19, 5));
+    req.serialize(&buf, &pos, 5);
+
+    const response = broker.handleRequest(buf[0..pos]);
+    try testing.expect(response != null);
+    defer testing.allocator.free(response.?);
+
+    var rpos: usize = 0;
+    var response_header = try ResponseHeader.deserialize(testing.allocator, response.?, &rpos, header_mod.responseHeaderVersion(19, 5));
+    defer response_header.deinit(testing.allocator);
+    try testing.expectEqual(@as(i32, 1905), response_header.correlation_id);
+
+    const resp = try Resp.deserialize(testing.allocator, response.?, &rpos, 5);
+    defer {
+        for (resp.topics) |topic| {
+            if (topic.configs.len > 0) testing.allocator.free(topic.configs);
+        }
+        if (resp.topics.len > 0) testing.allocator.free(resp.topics);
+    }
+    try testing.expectEqual(response.?.len, rpos);
+    try testing.expectEqual(@as(usize, 1), resp.topics.len);
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.none)), resp.topics[0].error_code);
+    try testing.expectEqual(@as(i32, 1), resp.topics[0].num_partitions);
+    try testing.expect(!broker.topics.contains("ct-validate-only-topic"));
+}
+
+test "Broker.handleRequest CreateTopics rejects truncated request" {
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+
+    var buf: [128]u8 = undefined;
+    const req_len = buildTestRequest(&buf, 19, 7, 1908, header_mod.requestHeaderVersion(19, 7));
+    try testing.expect(broker.handleRequest(buf[0..req_len]) == null);
 }
 
 test "Broker.handleRequest AddPartitionsToTxn (key=24) after InitProducerId" {
