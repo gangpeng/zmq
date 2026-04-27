@@ -552,11 +552,6 @@ pub const PartitionStore = struct {
             try wal.sync();
             fs_wal_durable = true;
         }
-        // Also track in memory WAL (for totalRecords() in memory mode)
-        if (self.memory_wal) |*mwal| {
-            _ = try mwal.append(data_owned);
-        }
-
         // Upload to S3 if configured (best-effort, non-blocking for non-WAL mode)
         if (!self.s3_wal_mode) {
             if (self.s3_client) |*client| {
@@ -590,6 +585,7 @@ pub const PartitionStore = struct {
                         return error.S3StorageUnavailable;
                     if (!flushed) {
                         log.warn("S3 WAL flush failed; produce will not be acknowledged", .{});
+                        batcher.discardPending();
                         return error.S3WalFlushFailed;
                     }
                     s3_wal_durable = true;
@@ -616,6 +612,12 @@ pub const PartitionStore = struct {
             } else {
                 return error.S3StorageUnavailable;
             }
+        }
+
+        // Track in memory WAL only after required durability barriers have
+        // succeeded, so failed S3-WAL produces do not look acknowledged locally.
+        if (self.memory_wal) |*mwal| {
+            _ = try mwal.append(data_owned);
         }
 
         // Write to LogCache only after required durable writes have succeeded.
@@ -1603,6 +1605,51 @@ test "PartitionStore returns storage error for injected ObjectManager S3 get fau
     defer if (recovered.records.len > 0) testing.allocator.free(@constCast(recovered.records));
     try testing.expectEqual(@as(i16, 0), recovered.error_code);
     try testing.expectEqualStrings("a", recovered.records);
+}
+
+test "PartitionStore S3 WAL failed sync produce is not visible or retained" {
+    var mock_s3 = MockS3.init(testing.allocator);
+    defer mock_s3.deinit();
+    const s3_storage = S3Storage.initMock(testing.allocator, &mock_s3);
+
+    var store = PartitionStore.init(testing.allocator);
+    defer store.deinit();
+    store.s3_wal_mode = true;
+    store.s3_storage = s3_storage;
+    store.s3_wal_batcher = S3WalBatcher.init(testing.allocator);
+
+    mock_s3.failNextPutObjects(3);
+    try testing.expectError(error.S3WalFlushFailed, store.produce("s3-ack-topic", 0, "rec-a"));
+
+    var key_buf: [256]u8 = undefined;
+    const key = PartitionStore.partitionKeyBuf(&key_buf, "s3-ack-topic", 0);
+    const failed_state = store.partitions.getPtr(key).?;
+    try testing.expectEqual(@as(u64, 0), failed_state.next_offset);
+    try testing.expectEqual(@as(u64, 0), failed_state.high_watermark);
+    try testing.expectEqual(@as(usize, 0), store.memory_wal.?.recordCount());
+    try testing.expectEqual(@as(usize, 0), store.s3_wal_batcher.?.pendingCount());
+    try testing.expectEqual(@as(usize, 0), mock_s3.objectCount());
+
+    const invisible = try store.fetch("s3-ack-topic", 0, 0, 1024);
+    try testing.expectEqual(@as(i16, 0), invisible.error_code);
+    try testing.expectEqual(@as(usize, 0), invisible.records.len);
+    try testing.expectEqual(@as(i64, 0), invisible.high_watermark);
+
+    const produced = try store.produce("s3-ack-topic", 0, "rec-a");
+    try testing.expectEqual(@as(i64, 0), produced.base_offset);
+
+    const durable_state = store.partitions.getPtr(key).?;
+    try testing.expectEqual(@as(u64, 1), durable_state.next_offset);
+    try testing.expectEqual(@as(u64, 1), durable_state.high_watermark);
+    try testing.expectEqual(@as(usize, 1), store.memory_wal.?.recordCount());
+    try testing.expectEqual(@as(usize, 0), store.s3_wal_batcher.?.pendingCount());
+    try testing.expectEqual(@as(usize, 1), mock_s3.objectCount());
+
+    const visible = try store.fetch("s3-ack-topic", 0, 0, 1024);
+    defer if (visible.records.len > 0) testing.allocator.free(@constCast(visible.records));
+    try testing.expectEqual(@as(i16, 0), visible.error_code);
+    try testing.expectEqual(@as(i64, 1), visible.high_watermark);
+    try testing.expectEqualStrings("rec-a", visible.records);
 }
 
 test "PartitionStore produce offset increments correctly" {

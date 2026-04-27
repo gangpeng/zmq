@@ -976,6 +976,22 @@ pub const S3WalBatcher = struct {
         return true; // Nothing to flush — consider it "durable"
     }
 
+    /// Drop unacknowledged buffered data after a caller-visible failed flush.
+    ///
+    /// flushNow() itself preserves data so low-level callers can retry. Broker
+    /// produce uses this after returning an error to avoid retrying the same
+    /// broker-assigned offsets twice.
+    pub fn discardPending(self: *S3WalBatcher) void {
+        for (self.buffer.items) |*entry| {
+            entry.deinit(self.allocator);
+        }
+        self.buffer.clearRetainingCapacity();
+        self.buffer_size = 0;
+        self.last_appended_offset = self.last_flushed_offset;
+        self.pending_hw_updates.clearRetainingCapacity();
+        self.pending_produce_count = 0;
+    }
+
     fn putObjectWithRetry(_: *S3WalBatcher, s3_storage: anytype, key: []const u8, data: []const u8) !void {
         const max_attempts: u32 = 3;
         var attempt: u32 = 0;
