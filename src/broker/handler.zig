@@ -2872,51 +2872,51 @@ pub const Broker = struct {
     // SyncGroup (key 14)
     // ---------------------------------------------------------------
     fn handleSyncGroup(self: *Broker, request_bytes: []const u8, body_start: usize, req_header: *const RequestHeader, api_version: i16, resp_header_version: i16) ?[]u8 {
-        var pos = body_start;
-        const flexible = api_version >= 4;
-        const readStr = if (flexible) &ser.readCompactString else &ser.readString;
-        const group_id = (readStr(request_bytes, &pos) catch return null) orelse "";
-        const generation_id = ser.readI32(request_bytes, &pos);
-        const member_id = (readStr(request_bytes, &pos) catch return null) orelse "";
-        if (api_version >= 3) _ = readStr(request_bytes, &pos) catch null; // group_instance_id
-        if (api_version >= 5) _ = readStr(request_bytes, &pos) catch null; // protocol_type
-        if (api_version >= 5) _ = readStr(request_bytes, &pos) catch null; // protocol_name
-
+        const Req = generated.sync_group_request.SyncGroupRequest;
+        const Resp = generated.sync_group_response.SyncGroupResponse;
         const GroupCoord = @import("group_coordinator.zig").GroupCoordinator;
-        const num_assignments = if (flexible)
-            (ser.readCompactArrayLen(request_bytes, &pos) catch 0) orelse 0
-        else
-            @as(usize, @intCast(@max(ser.readI32(request_bytes, &pos), 0)));
-        var assignments_buf: [64]GroupCoord.MemberAssignment = undefined;
-        var assign_count: usize = 0;
 
-        for (0..num_assignments) |_| {
-            if (assign_count >= 64) break;
-            const a_member = (readStr(request_bytes, &pos) catch break) orelse "";
-            const a_data = if (flexible) (ser.readCompactBytes(request_bytes, &pos) catch break) orelse "" else (ser.readBytes(request_bytes, &pos) catch break) orelse "";
-            if (flexible) ser.skipTaggedFields(request_bytes, &pos) catch {};
-            assignments_buf[assign_count] = .{ .member_id = a_member, .assignment = a_data };
-            assign_count += 1;
+        if (!validateSyncGroupRequestFrame(request_bytes, body_start, api_version)) {
+            log.warn("Malformed SyncGroup request", .{});
+            return null;
         }
 
-        const assignments: ?[]const GroupCoord.MemberAssignment = if (assign_count > 0) assignments_buf[0..assign_count] else null;
-        const result = self.groups.syncGroup(group_id, member_id, generation_id, assignments) catch blk: {
-            break :blk GroupCoord.SyncGroupResult{ .error_code = 16, .assignment = null };
+        var pos = body_start;
+        var req = Req.deserialize(self.allocator, request_bytes, &pos, api_version) catch |err| {
+            log.warn("Failed to decode SyncGroup request: {}", .{err});
+            return null;
+        };
+        defer self.freeSyncGroupRequest(&req);
+
+        var assignment_buf: []GroupCoord.MemberAssignment = &.{};
+        if (req.assignments.len > 0) {
+            assignment_buf = self.allocator.alloc(GroupCoord.MemberAssignment, req.assignments.len) catch return null;
+            for (req.assignments, 0..) |assignment, idx| {
+                assignment_buf[idx] = .{
+                    .member_id = assignment.member_id orelse "",
+                    .assignment = assignment.assignment orelse "",
+                };
+            }
+        }
+        defer if (assignment_buf.len > 0) self.allocator.free(assignment_buf);
+
+        const assignments: ?[]const GroupCoord.MemberAssignment = if (assignment_buf.len > 0) assignment_buf else null;
+        const result = self.groups.syncGroup(req.group_id orelse "", req.member_id orelse "", req.generation_id, assignments) catch blk: {
+            break :blk GroupCoord.SyncGroupResult{ .error_code = @intFromEnum(ErrorCode.not_coordinator), .assignment = null };
         };
 
-        var resp_buf = self.allocator.alloc(u8, 1024) catch return null;
-        var wpos: usize = 0;
-        const resp_header = ResponseHeader{ .correlation_id = req_header.correlation_id };
-        resp_header.serialize(resp_buf, &wpos, resp_header_version);
-        if (api_version >= 1) ser.writeI32(resp_buf, &wpos, 0); // throttle_time_ms
-        ser.writeI16(resp_buf, &wpos, result.error_code);
-        if (api_version >= 5) {
-            if (flexible) ser.writeCompactString(resp_buf, &wpos, "consumer") else ser.writeString(resp_buf, &wpos, "consumer"); // protocol_type
-            if (flexible) ser.writeCompactString(resp_buf, &wpos, "range") else ser.writeString(resp_buf, &wpos, "range"); // protocol_name
-        }
-        if (flexible) ser.writeCompactBytes(resp_buf, &wpos, result.assignment) else ser.writeBytesBuf(resp_buf, &wpos, result.assignment);
-        if (resp_header_version >= 1) ser.writeEmptyTaggedFields(resp_buf, &wpos);
-        return (self.allocator.realloc(resp_buf, wpos) catch resp_buf)[0..wpos];
+        const resp = Resp{
+            .throttle_time_ms = 0,
+            .error_code = result.error_code,
+            .protocol_type = "consumer",
+            .protocol_name = "range",
+            .assignment = result.assignment,
+        };
+        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+    }
+
+    fn freeSyncGroupRequest(self: *Broker, req: *generated.sync_group_request.SyncGroupRequest) void {
+        if (req.assignments.len > 0) self.allocator.free(req.assignments);
     }
 
     // ---------------------------------------------------------------
@@ -6953,6 +6953,31 @@ pub const Broker = struct {
         return skipKafkaString(buf, &pos, false);
     }
 
+    fn validateSyncGroupRequestFrame(buf: []const u8, start_pos: usize, api_version: i16) bool {
+        const flexible = api_version >= 4;
+        var pos = start_pos;
+
+        if (!skipKafkaString(buf, &pos, flexible)) return false; // group_id
+        if (!skipFixedBytes(buf, &pos, 4)) return false; // generation_id
+        if (!skipKafkaString(buf, &pos, flexible)) return false; // member_id
+        if (api_version >= 3) {
+            if (!skipKafkaString(buf, &pos, flexible)) return false; // group_instance_id
+        }
+        if (api_version >= 5) {
+            if (!skipKafkaString(buf, &pos, true)) return false; // protocol_type
+            if (!skipKafkaString(buf, &pos, true)) return false; // protocol_name
+        }
+
+        const assignment_count = readKafkaArrayCount(buf, &pos, flexible) orelse return false;
+        for (0..assignment_count) |_| {
+            if (!skipKafkaString(buf, &pos, flexible)) return false; // member_id
+            if (!skipKafkaBytes(buf, &pos, flexible)) return false; // assignment
+            if (flexible) ser.skipTaggedFields(buf, &pos) catch return false;
+        }
+        if (flexible) ser.skipTaggedFields(buf, &pos) catch return false;
+        return true;
+    }
+
     fn validateHeartbeatRequestFrame(buf: []const u8, start_pos: usize, api_version: i16) bool {
         const flexible = api_version >= 4;
         var pos = start_pos;
@@ -7286,6 +7311,15 @@ pub const Broker = struct {
         const string_len: usize = @intCast(len);
         if (string_len > buf.len - pos.*) return false;
         pos.* += string_len;
+        return true;
+    }
+
+    fn skipKafkaBytes(buf: []const u8, pos: *usize, flexible: bool) bool {
+        if (flexible) {
+            _ = ser.readCompactBytes(buf, pos) catch return false;
+        } else {
+            _ = ser.readBytes(buf, pos) catch return false;
+        }
         return true;
     }
 
@@ -11154,6 +11188,64 @@ test "Broker.handleRequest SyncGroup (key=14) after JoinGroup" {
     // After SyncGroup, group should be STABLE
     const group = broker.groups.groups.getPtr("sg-group").?;
     try testing.expectEqual(@import("group_coordinator.zig").ConsumerGroup.GroupState.stable, group.state);
+}
+
+test "Broker.handleRequest SyncGroup v5 returns generated response" {
+    const Req = generated.sync_group_request.SyncGroupRequest;
+    const Assignment = Req.SyncGroupRequestAssignment;
+    const Resp = generated.sync_group_response.SyncGroupResponse;
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+
+    const join_result = try broker.groups.joinGroup("sg-generated-group", null, "consumer", null);
+    const assignment_data = "generated-assignment";
+    const assignments = [_]Assignment{.{
+        .member_id = join_result.member_id,
+        .assignment = assignment_data,
+    }};
+    const req = Req{
+        .group_id = "sg-generated-group",
+        .generation_id = join_result.generation_id,
+        .member_id = join_result.member_id,
+        .group_instance_id = null,
+        .protocol_type = "consumer",
+        .protocol_name = "range",
+        .assignments = &assignments,
+    };
+
+    var buf: [512]u8 = undefined;
+    var pos = buildTestRequest(&buf, 14, 5, 1405, header_mod.requestHeaderVersion(14, 5));
+    req.serialize(&buf, &pos, 5);
+
+    const response = broker.handleRequest(buf[0..pos]);
+    try testing.expect(response != null);
+    defer testing.allocator.free(response.?);
+
+    var rpos: usize = 0;
+    var response_header = try ResponseHeader.deserialize(testing.allocator, response.?, &rpos, header_mod.responseHeaderVersion(14, 5));
+    defer response_header.deinit(testing.allocator);
+    try testing.expectEqual(@as(i32, 1405), response_header.correlation_id);
+
+    const resp = try Resp.deserialize(testing.allocator, response.?, &rpos, 5);
+    try testing.expectEqual(response.?.len, rpos);
+    try testing.expectEqual(@as(i32, 0), resp.throttle_time_ms);
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.none)), resp.error_code);
+    try testing.expectEqualStrings("consumer", resp.protocol_type.?);
+    try testing.expectEqualStrings("range", resp.protocol_name.?);
+    try testing.expectEqualStrings(assignment_data, resp.assignment.?);
+
+    const group = broker.groups.groups.getPtr("sg-generated-group").?;
+    try testing.expectEqual(@import("group_coordinator.zig").ConsumerGroup.GroupState.stable, group.state);
+}
+
+test "Broker.handleRequest SyncGroup rejects truncated request" {
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+
+    var buf: [128]u8 = undefined;
+    const req_len = buildTestRequest(&buf, 14, 5, 1406, header_mod.requestHeaderVersion(14, 5));
+    try testing.expect(broker.handleRequest(buf[0..req_len]) == null);
 }
 
 test "Broker.handleRequest OffsetCommit and OffsetFetch round-trip" {
