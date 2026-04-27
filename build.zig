@@ -290,6 +290,7 @@ pub fn build(b: *std.Build) void {
         .{ "src/storage.zig", "storage" },
         .{ "src/raft.zig", "raft" },
         .{ "src/broker.zig", "broker" },
+        .{ "src/controller/controller.zig", "controller" },
         .{ "src/security.zig", "security" },
         .{ "src/streams.zig", "streams" },
         .{ "src/connect.zig", "connect" },

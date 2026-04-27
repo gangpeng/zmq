@@ -142,100 +142,76 @@ pub const RaftClient = struct {
         last_log_offset: i64,
         last_log_epoch: i32,
     ) !VoteResult {
-        self.ensureConnected() catch |err| {
-            log.warn("Cannot connect to peer {d}: {}", .{ self.peer_id, err });
-            return err;
-        };
+        const Req = generated.vote_request.VoteRequest;
+        const Resp = generated.vote_response.VoteResponse;
 
         const corr_id = self.next_correlation_id;
         self.next_correlation_id += 1;
 
-        // Build Vote request (API key 52, version 0)
-        // Request header v2 (flexible) + body
+        // Build Vote request (API key 52, version 0) with generated KRaft
+        // schema framing. Vote v0 is flexible and uses request header v2.
         const api_key: i16 = 52;
         const api_version: i16 = 0;
-
-        // Serialize request
         var req_buf: [512]u8 = undefined;
         var pos: usize = 0;
 
-        // Reserve 4 bytes for frame size
-        pos = 4;
-
-        // Request header (v2 = flexible)
         ser.writeI16(&req_buf, &pos, api_key);
         ser.writeI16(&req_buf, &pos, api_version);
         ser.writeI32(&req_buf, &pos, corr_id);
         ser.writeCompactString(&req_buf, &pos, "raft-client"); // client_id
         ser.writeEmptyTaggedFields(&req_buf, &pos); // header tagged fields
 
-        // Vote request body:
-        // cluster_id (compact string), topics array (compact, empty), tagged fields
-        ser.writeCompactString(&req_buf, &pos, cluster_id);
-        // Voter ID
-        ser.writeI32(&req_buf, &pos, candidate_id);
-        // Candidate epoch
-        ser.writeI32(&req_buf, &pos, candidate_epoch);
-        // Candidate ID
-        ser.writeI32(&req_buf, &pos, candidate_id);
-        // Last epoch end offset
-        ser.writeI64(&req_buf, &pos, last_log_offset);
-        // Last epoch
-        ser.writeI32(&req_buf, &pos, last_log_epoch);
-        ser.writeEmptyTaggedFields(&req_buf, &pos); // body tagged fields
-
-        // Write frame size at beginning
-        const frame_size: i32 = @intCast(pos - 4);
-        var size_pos: usize = 0;
-        ser.writeI32(&req_buf, &size_pos, frame_size);
-
-        // Send
-        _ = self.sslSend(req_buf[0..pos]) catch |err| {
-            self.disconnect();
-            return err;
+        const partitions = [_]Req.TopicData.PartitionData{.{
+            .partition_index = 0,
+            .candidate_epoch = candidate_epoch,
+            .candidate_id = candidate_id,
+            .last_offset_epoch = last_log_epoch,
+            .last_offset = last_log_offset,
+        }};
+        const topics = [_]Req.TopicData{.{ .topic_name = "__cluster_metadata", .partitions = &partitions }};
+        const req = Req{
+            .cluster_id = cluster_id,
+            .topics = &topics,
         };
+        req.serialize(&req_buf, &pos, api_version);
 
-        // Read response
-        var resp_buf: [256]u8 = undefined;
-        const n = self.sslRecv(&resp_buf) catch |err| {
-            self.disconnect();
-            return err;
+        const response = try self.sendRawRequest(req_buf[0..pos], self.allocator);
+        defer self.allocator.free(response);
+
+        var rpos: usize = 0;
+        var resp_header = try header_mod.ResponseHeader.deserialize(
+            self.allocator,
+            response,
+            &rpos,
+            header_mod.responseHeaderVersion(api_key, api_version),
+        );
+        defer resp_header.deinit(self.allocator);
+
+        var resp = try Resp.deserialize(self.allocator, response, &rpos, api_version);
+        defer self.freeVoteResponse(&resp);
+
+        if (resp.error_code != 0 or resp.topics.len == 0 or resp.topics[0].partitions.len == 0) {
+            return .{ .vote_granted = false, .epoch = candidate_epoch };
+        }
+
+        const partition = resp.topics[0].partitions[0];
+        return .{
+            .vote_granted = partition.vote_granted,
+            .epoch = partition.leader_epoch,
         };
-
-        if (n < 8) {
-            self.disconnect();
-            return error.ShortRead;
-        }
-
-        // Parse response: skip 4-byte frame size
-        var rpos: usize = 4;
-        // Response header v1 (flexible): correlation_id(4) + tagged_fields
-        const resp_corr = ser.readI32(&resp_buf, &rpos);
-        _ = resp_corr;
-        ser.skipTaggedFields(&resp_buf, &rpos) catch {};
-
-        // Vote response body: error_code(i16) + leader_epoch(i32) + vote_granted(bool) + tagged_fields
-        if (rpos + 2 > n) {
-            self.disconnect();
-            return error.ShortRead;
-        }
-        const error_code = ser.readI16(&resp_buf, &rpos);
-
-        // Parse leader_epoch and vote_granted if available
-        var granted = (error_code == 0);
-        if (rpos + 4 + 1 <= n) {
-            const leader_epoch = ser.readI32(&resp_buf, &rpos);
-            _ = leader_epoch;
-            granted = ser.readBool(&resp_buf, &rpos) catch granted;
-        }
-
-        return .{ .vote_granted = granted, .epoch = candidate_epoch };
     }
 
     pub const VoteResult = struct {
         vote_granted: bool,
         epoch: i32,
     };
+
+    fn freeVoteResponse(self: *RaftClient, resp: *generated.vote_response.VoteResponse) void {
+        for (resp.topics) |topic| {
+            if (topic.partitions.len > 0) self.allocator.free(topic.partitions);
+        }
+        if (resp.topics.len > 0) self.allocator.free(resp.topics);
+    }
 
     /// Send AppendEntries (log replication / heartbeat) to a follower.
     /// Sends a simplified AppendEntries-style message using BeginQuorumEpoch (API 53).
@@ -358,49 +334,33 @@ pub const RaftClient = struct {
         leader_epoch: i32,
         leader_id: i32,
     ) !void {
-        self.ensureConnected() catch |err| {
-            log.warn("Cannot connect to peer {d}: {}", .{ self.peer_id, err });
-            return err;
-        };
+        const Req = generated.begin_quorum_epoch_request.BeginQuorumEpochRequest;
 
         const corr_id = self.next_correlation_id;
         self.next_correlation_id += 1;
 
         var req_buf: [512]u8 = undefined;
-        var pos: usize = 4; // skip frame size
+        var pos: usize = 0;
 
-        // Request header v1 (non-flexible for this API)
         ser.writeI16(&req_buf, &pos, 53); // api_key
         ser.writeI16(&req_buf, &pos, 0); // version
         ser.writeI32(&req_buf, &pos, corr_id);
         ser.writeString(&req_buf, &pos, "raft-client"); // client_id
 
-        // BeginQuorumEpoch body:
-        // Error code
-        ser.writeI16(&req_buf, &pos, 0);
-        // Topics array (int32 len = 0)
-        ser.writeI32(&req_buf, &pos, 0);
-        // Leader ID
-        ser.writeI32(&req_buf, &pos, leader_id);
-        // Leader epoch
-        ser.writeI32(&req_buf, &pos, leader_epoch);
-
-        // Write frame size
-        const frame_size: i32 = @intCast(pos - 4);
-        var size_pos: usize = 0;
-        ser.writeI32(&req_buf, &size_pos, frame_size);
-
-        _ = self.sslSend(req_buf[0..pos]) catch |err| {
-            self.disconnect();
-            return err;
+        const partitions = [_]Req.TopicData.PartitionData{.{
+            .partition_index = 0,
+            .leader_id = leader_id,
+            .leader_epoch = leader_epoch,
+        }};
+        const topics = [_]Req.TopicData{.{ .topic_name = "__cluster_metadata", .partitions = &partitions }};
+        const req = Req{
+            .cluster_id = "",
+            .topics = &topics,
         };
+        req.serialize(&req_buf, &pos, 0);
 
-        // Read and discard response
-        var resp_buf: [256]u8 = undefined;
-        _ = self.sslRecv(&resp_buf) catch |err| {
-            self.disconnect();
-            return err;
-        };
+        const response = try self.sendRawRequest(req_buf[0..pos], self.allocator);
+        self.allocator.free(response);
     }
 
     /// Send a raw framed request and return the raw response bytes (caller-owned).

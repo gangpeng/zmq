@@ -90,9 +90,9 @@ pub const Controller = struct {
 
         return switch (api_key) {
             18 => self.handleApiVersions(&req_header, api_version, resp_header_version),
-            52 => self.handleVote(request_bytes, pos, &req_header, resp_header_version),
-            53 => self.handleBeginQuorumEpoch(request_bytes, pos, &req_header, resp_header_version),
-            54 => self.handleEndQuorumEpoch(request_bytes, pos, &req_header, resp_header_version),
+            52 => self.handleVote(request_bytes, pos, &req_header, api_version, resp_header_version),
+            53 => self.handleBeginQuorumEpoch(request_bytes, pos, &req_header, api_version, resp_header_version),
+            54 => self.handleEndQuorumEpoch(request_bytes, pos, &req_header, api_version, resp_header_version),
             55 => self.handleDescribeQuorum(request_bytes, pos, &req_header, api_version, resp_header_version),
             62 => self.handleBrokerRegistration(request_bytes, pos, &req_header, api_version, resp_header_version),
             63 => self.handleBrokerHeartbeat(request_bytes, pos, &req_header, api_version, resp_header_version),
@@ -130,89 +130,244 @@ pub const Controller = struct {
     // ---------------------------------------------------------------
     // Vote (key 52) — KRaft consensus
     // ---------------------------------------------------------------
-    fn handleVote(self: *Controller, request_bytes: []const u8, start_pos: usize, req_header: *const RequestHeader, resp_header_version: i16) ?[]u8 {
+    fn handleVote(self: *Controller, request_bytes: []const u8, start_pos: usize, req_header: *const RequestHeader, api_version: i16, resp_header_version: i16) ?[]u8 {
+        const Req = generated.vote_request.VoteRequest;
+        const Resp = generated.vote_response.VoteResponse;
+        const TopicResult = Resp.TopicData;
+        const PartitionResult = TopicResult.PartitionData;
+
+        if (!validateVoteRequestFrame(request_bytes, start_pos, api_version)) {
+            log.warn("Malformed Vote request", .{});
+            const resp = Resp{ .error_code = ErrorCode.invalid_request.toInt(), .topics = &.{} };
+            return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+        }
+
         var pos = start_pos;
+        var req = Req.deserialize(self.allocator, request_bytes, &pos, api_version) catch |err| {
+            log.warn("Failed to decode Vote request: {}", .{err});
+            const resp = Resp{ .error_code = ErrorCode.invalid_request.toInt(), .topics = &.{} };
+            return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+        };
+        defer self.freeVoteRequest(&req);
 
-        const cluster_id = ser.readCompactString(request_bytes, &pos) catch null;
-        _ = cluster_id;
+        const topics = self.allocator.alloc(TopicResult, req.topics.len) catch return null;
+        for (topics) |*topic| {
+            topic.* = .{ .topic_name = null, .partitions = &.{} };
+        }
+        defer {
+            self.freeVoteResponseTopics(topics);
+            if (topics.len > 0) self.allocator.free(topics);
+        }
 
-        const candidate_id = ser.readI32(request_bytes, &pos);
-        const candidate_epoch = ser.readI32(request_bytes, &pos);
-        _ = ser.readI32(request_bytes, &pos); // duplicate candidate_id in wire format
-        const last_epoch_end_offset = ser.readI64(request_bytes, &pos);
-        const last_epoch = ser.readI32(request_bytes, &pos);
+        for (req.topics, 0..) |topic, topic_index| {
+            const partitions = self.allocator.alloc(PartitionResult, topic.partitions.len) catch return null;
+            errdefer self.allocator.free(partitions);
 
-        const vote_result = self.raft_state.handleVoteRequest(
-            candidate_id,
-            candidate_epoch,
-            @intCast(last_epoch_end_offset),
-            last_epoch,
-        );
+            for (topic.partitions, 0..) |partition, partition_index| {
+                const last_offset: u64 = if (partition.last_offset < 0) 0 else @intCast(partition.last_offset);
+                const vote_result = self.raft_state.handleVoteRequest(
+                    partition.candidate_id,
+                    partition.candidate_epoch,
+                    last_offset,
+                    partition.last_offset_epoch,
+                );
+                partitions[partition_index] = .{
+                    .partition_index = partition.partition_index,
+                    .error_code = if (vote_result.vote_granted) ErrorCode.none.toInt() else ErrorCode.invalid_record.toInt(),
+                    .leader_id = self.raft_state.leader_id orelse -1,
+                    .leader_epoch = vote_result.epoch,
+                    .vote_granted = vote_result.vote_granted,
+                };
 
-        log.info("Vote request from candidate {d} epoch={d}: granted={}", .{
-            candidate_id, candidate_epoch, vote_result.vote_granted,
-        });
+                log.info("Vote request from candidate {d} epoch={d}: granted={}", .{
+                    partition.candidate_id,
+                    partition.candidate_epoch,
+                    vote_result.vote_granted,
+                });
+            }
 
-        var buf = self.allocator.alloc(u8, 128) catch return null;
-        var wpos: usize = 0;
-        const rh = ResponseHeader{ .correlation_id = req_header.correlation_id };
-        rh.serialize(buf, &wpos, resp_header_version);
-        ser.writeI16(buf, &wpos, if (vote_result.vote_granted) @as(i16, 0) else @as(i16, 87));
-        ser.writeI32(buf, &wpos, vote_result.epoch);
-        ser.writeBool(buf, &wpos, vote_result.vote_granted);
-        ser.writeEmptyTaggedFields(buf, &wpos);
+            topics[topic_index] = .{
+                .topic_name = topic.topic_name,
+                .partitions = partitions,
+            };
+        }
 
-        return (self.allocator.realloc(buf, wpos) catch buf)[0..wpos];
+        const resp = Resp{
+            .error_code = ErrorCode.none.toInt(),
+            .topics = topics,
+        };
+        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+    }
+
+    fn freeVoteRequest(self: *Controller, req: *generated.vote_request.VoteRequest) void {
+        for (req.topics) |topic| {
+            if (topic.partitions.len > 0) self.allocator.free(topic.partitions);
+        }
+        if (req.topics.len > 0) self.allocator.free(req.topics);
+    }
+
+    fn freeVoteResponseTopics(self: *Controller, topics: []const generated.vote_response.VoteResponse.TopicData) void {
+        for (topics) |topic| {
+            if (topic.partitions.len > 0) self.allocator.free(topic.partitions);
+        }
     }
 
     // ---------------------------------------------------------------
     // BeginQuorumEpoch (key 53) — KRaft leader heartbeat
     // ---------------------------------------------------------------
-    fn handleBeginQuorumEpoch(self: *Controller, request_bytes: []const u8, start_pos: usize, req_header: *const RequestHeader, resp_header_version: i16) ?[]u8 {
-        var pos = start_pos;
+    fn handleBeginQuorumEpoch(self: *Controller, request_bytes: []const u8, start_pos: usize, req_header: *const RequestHeader, api_version: i16, resp_header_version: i16) ?[]u8 {
+        const Req = generated.begin_quorum_epoch_request.BeginQuorumEpochRequest;
+        const Resp = generated.begin_quorum_epoch_response.BeginQuorumEpochResponse;
 
-        const error_code = ser.readI16(request_bytes, &pos);
-        _ = error_code;
-        const topics_len = ser.readArrayLen(request_bytes, &pos) catch 0;
-        _ = topics_len;
-        const leader_id = ser.readI32(request_bytes, &pos);
-        const leader_epoch = ser.readI32(request_bytes, &pos);
-
-        if (leader_epoch >= self.raft_state.current_epoch) {
-            self.raft_state.becomeFollower(leader_epoch, leader_id);
-            log.info("Acknowledged leader {d} epoch={d}", .{ leader_id, leader_epoch });
+        if (!validateBeginQuorumEpochRequestFrame(request_bytes, start_pos, api_version)) {
+            log.warn("Malformed BeginQuorumEpoch request", .{});
+            const resp = Resp{ .error_code = ErrorCode.invalid_request.toInt(), .topics = &.{} };
+            return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
         }
 
-        var buf = self.allocator.alloc(u8, 64) catch return null;
-        var wpos: usize = 0;
-        const rh = ResponseHeader{ .correlation_id = req_header.correlation_id };
-        rh.serialize(buf, &wpos, resp_header_version);
-        ser.writeI16(buf, &wpos, 0); // error_code: NONE
-        ser.writeI32(buf, &wpos, 0); // topics array len = 0
+        var pos = start_pos;
+        var req = Req.deserialize(self.allocator, request_bytes, &pos, api_version) catch |err| {
+            log.warn("Failed to decode BeginQuorumEpoch request: {}", .{err});
+            const resp = Resp{ .error_code = ErrorCode.invalid_request.toInt(), .topics = &.{} };
+            return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+        };
+        defer self.freeBeginQuorumEpochRequest(&req);
 
-        return (self.allocator.realloc(buf, wpos) catch buf)[0..wpos];
+        if (pos < request_bytes.len) {
+            const append_response = self.applyInternalRaftAppendEntriesPayload(request_bytes, &pos) catch |err| {
+                log.warn("Failed to apply internal AppendEntries payload: {}", .{err});
+                const resp = Resp{ .error_code = ErrorCode.invalid_request.toInt(), .topics = &.{} };
+                return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+            };
+            const resp = Resp{
+                .error_code = if (append_response.success) ErrorCode.none.toInt() else ErrorCode.kafka_storage_error.toInt(),
+                .topics = &.{},
+            };
+            return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+        }
+
+        const ObservedLeader = struct {
+            id: i32,
+            epoch: i32,
+        };
+        var observed_leader: ?ObservedLeader = null;
+        for (req.topics) |topic| {
+            for (topic.partitions) |partition| {
+                if (observed_leader == null or partition.leader_epoch > observed_leader.?.epoch) {
+                    observed_leader = .{ .id = partition.leader_id, .epoch = partition.leader_epoch };
+                }
+            }
+        }
+
+        if (observed_leader) |leader| {
+            if (leader.epoch >= self.raft_state.current_epoch) {
+                self.raft_state.becomeFollower(leader.epoch, leader.id);
+                log.info("Acknowledged leader {d} epoch={d}", .{ leader.id, leader.epoch });
+            }
+        }
+
+        const resp = Resp{ .error_code = ErrorCode.none.toInt(), .topics = &.{} };
+        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
     }
 
     // ---------------------------------------------------------------
     // EndQuorumEpoch (key 54) — KRaft leader step-down
     // ---------------------------------------------------------------
-    fn handleEndQuorumEpoch(self: *Controller, request_bytes: []const u8, start_pos: usize, req_header: *const RequestHeader, resp_header_version: i16) ?[]u8 {
-        _ = request_bytes;
-        _ = start_pos;
+    fn handleEndQuorumEpoch(self: *Controller, request_bytes: []const u8, start_pos: usize, req_header: *const RequestHeader, api_version: i16, resp_header_version: i16) ?[]u8 {
+        const Req = generated.end_quorum_epoch_request.EndQuorumEpochRequest;
+        const Resp = generated.end_quorum_epoch_response.EndQuorumEpochResponse;
+
+        if (!validateEndQuorumEpochRequestFrame(request_bytes, start_pos, api_version)) {
+            log.warn("Malformed EndQuorumEpoch request", .{});
+            const resp = Resp{ .error_code = ErrorCode.invalid_request.toInt(), .topics = &.{} };
+            return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+        }
+
+        var pos = start_pos;
+        var req = Req.deserialize(self.allocator, request_bytes, &pos, api_version) catch |err| {
+            log.warn("Failed to decode EndQuorumEpoch request: {}", .{err});
+            const resp = Resp{ .error_code = ErrorCode.invalid_request.toInt(), .topics = &.{} };
+            return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+        };
+        defer self.freeEndQuorumEpochRequest(&req);
 
         if (self.raft_state.role == .follower) {
             log.info("Leader stepped down, will start election", .{});
             self.raft_state.election_timer.reset();
         }
 
-        var buf = self.allocator.alloc(u8, 64) catch return null;
-        var wpos: usize = 0;
-        const rh = ResponseHeader{ .correlation_id = req_header.correlation_id };
-        rh.serialize(buf, &wpos, resp_header_version);
-        ser.writeI16(buf, &wpos, 0); // error_code
-        ser.writeI32(buf, &wpos, 0); // topics array len = 0
+        const resp = Resp{ .error_code = ErrorCode.none.toInt(), .topics = &.{} };
+        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+    }
 
-        return (self.allocator.realloc(buf, wpos) catch buf)[0..wpos];
+    fn applyInternalRaftAppendEntriesPayload(self: *Controller, request_bytes: []const u8, pos: *usize) !RaftState.AppendEntriesResponse {
+        const leader_id = try readRecordI32(request_bytes, pos);
+        const leader_epoch = try readRecordI32(request_bytes, pos);
+
+        if (pos.* == request_bytes.len) {
+            if (leader_epoch >= self.raft_state.current_epoch) {
+                self.raft_state.becomeFollower(leader_epoch, leader_id);
+            }
+            return .{ .success = true, .epoch = self.raft_state.current_epoch, .match_index = self.raft_state.log.lastOffset() };
+        }
+
+        const prev_log_offset_raw = try readRecordI64(request_bytes, pos);
+        const prev_log_epoch = try readRecordI32(request_bytes, pos);
+        const leader_commit_raw = try readRecordI64(request_bytes, pos);
+        const entries_start_index_raw = try readRecordI64(request_bytes, pos);
+        const entry_count_raw = try readRecordI32(request_bytes, pos);
+        if (prev_log_offset_raw < 0 or leader_commit_raw < 0 or entries_start_index_raw < 0 or entry_count_raw < 0) {
+            return error.InvalidAutoMqMetadataRecord;
+        }
+
+        const entry_count: usize = @intCast(entry_count_raw);
+        const entries = try self.allocator.alloc(RaftState.AppendEntry, entry_count);
+        defer self.allocator.free(entries);
+
+        const entries_start_index: u64 = @intCast(entries_start_index_raw);
+        for (entries, 0..) |*entry, i| {
+            const entry_len_raw = try readRecordI32(request_bytes, pos);
+            if (entry_len_raw < 0) return error.InvalidAutoMqMetadataRecord;
+            const entry_len: usize = @intCast(entry_len_raw);
+            if (pos.* + entry_len > request_bytes.len) return error.InvalidAutoMqMetadataRecord;
+            const offset = std.math.add(u64, entries_start_index, @as(u64, @intCast(i))) catch return error.InvalidAutoMqMetadataRecord;
+            entry.* = .{
+                .offset = offset,
+                .epoch = leader_epoch,
+                .data = request_bytes[pos.* .. pos.* + entry_len],
+            };
+            pos.* += entry_len;
+        }
+        if (pos.* != request_bytes.len) return error.InvalidAutoMqMetadataRecord;
+
+        return self.raft_state.handleAppendEntries(
+            leader_epoch,
+            leader_id,
+            @intCast(prev_log_offset_raw),
+            prev_log_epoch,
+            entries,
+            @intCast(leader_commit_raw),
+        );
+    }
+
+    fn freeBeginQuorumEpochRequest(self: *Controller, req: *generated.begin_quorum_epoch_request.BeginQuorumEpochRequest) void {
+        for (req.topics) |topic| {
+            if (topic.partitions.len > 0) self.allocator.free(topic.partitions);
+        }
+        if (req.topics.len > 0) self.allocator.free(req.topics);
+        if (req.leader_endpoints.len > 0) self.allocator.free(req.leader_endpoints);
+    }
+
+    fn freeEndQuorumEpochRequest(self: *Controller, req: *generated.end_quorum_epoch_request.EndQuorumEpochRequest) void {
+        for (req.topics) |topic| {
+            for (topic.partitions) |partition| {
+                if (partition.preferred_successors.len > 0) self.allocator.free(partition.preferred_successors);
+                if (partition.preferred_candidates.len > 0) self.allocator.free(partition.preferred_candidates);
+            }
+            if (topic.partitions.len > 0) self.allocator.free(topic.partitions);
+        }
+        if (req.topics.len > 0) self.allocator.free(req.topics);
+        if (req.leader_endpoints.len > 0) self.allocator.free(req.leader_endpoints);
     }
 
     // ---------------------------------------------------------------
@@ -505,6 +660,166 @@ pub const Controller = struct {
     }
 };
 
+fn validateVoteRequestFrame(buf: []const u8, start_pos: usize, api_version: i16) bool {
+    var pos = start_pos;
+    if (!skipKafkaString(buf, &pos, true)) return false; // cluster_id
+    if (api_version >= 1 and !skipFixedBytes(buf, &pos, 4)) return false; // voter_id
+    if (!skipVoteTopics(buf, &pos, api_version)) return false;
+    ser.skipTaggedFields(buf, &pos) catch return false;
+    return pos == buf.len;
+}
+
+fn validateBeginQuorumEpochRequestFrame(buf: []const u8, start_pos: usize, api_version: i16) bool {
+    const flexible = api_version >= 1;
+    var pos = start_pos;
+
+    if (!skipKafkaString(buf, &pos, flexible)) return false; // cluster_id
+    if (flexible and !skipFixedBytes(buf, &pos, 4)) return false; // voter_id
+    if (!skipBeginQuorumTopics(buf, &pos, flexible)) return false;
+    if (flexible and !skipQuorumLeaderEndpoints(buf, &pos)) return false;
+    if (flexible) ser.skipTaggedFields(buf, &pos) catch return false;
+    return pos <= buf.len;
+}
+
+fn validateEndQuorumEpochRequestFrame(buf: []const u8, start_pos: usize, api_version: i16) bool {
+    const flexible = api_version >= 1;
+    var pos = start_pos;
+
+    if (!skipKafkaString(buf, &pos, flexible)) return false; // cluster_id
+    if (!skipEndQuorumTopics(buf, &pos, flexible)) return false;
+    if (flexible and !skipQuorumLeaderEndpoints(buf, &pos)) return false;
+    if (flexible) ser.skipTaggedFields(buf, &pos) catch return false;
+    return pos == buf.len;
+}
+
+fn skipVoteTopics(buf: []const u8, pos: *usize, api_version: i16) bool {
+    const topic_count = readKafkaArrayCount(buf, pos, true) orelse return false;
+    for (0..topic_count) |_| {
+        if (!skipKafkaString(buf, pos, true)) return false; // topic_name
+        const partition_count = readKafkaArrayCount(buf, pos, true) orelse return false;
+        for (0..partition_count) |_| {
+            if (!skipFixedBytes(buf, pos, 12)) return false; // partition_index + candidate_epoch + candidate_id
+            if (api_version >= 1 and !skipFixedBytes(buf, pos, 32)) return false; // candidate + voter directory IDs
+            if (!skipFixedBytes(buf, pos, 12)) return false; // last_offset_epoch + last_offset
+            ser.skipTaggedFields(buf, pos) catch return false;
+        }
+        ser.skipTaggedFields(buf, pos) catch return false;
+    }
+    return true;
+}
+
+fn skipBeginQuorumTopics(buf: []const u8, pos: *usize, flexible: bool) bool {
+    const topic_count = readKafkaArrayCount(buf, pos, flexible) orelse return false;
+    for (0..topic_count) |_| {
+        if (!skipKafkaString(buf, pos, flexible)) return false; // topic_name
+        const partition_count = readKafkaArrayCount(buf, pos, flexible) orelse return false;
+        for (0..partition_count) |_| {
+            if (!skipFixedBytes(buf, pos, 4)) return false; // partition_index
+            if (flexible and !skipFixedBytes(buf, pos, 16)) return false; // voter_directory_id
+            if (!skipFixedBytes(buf, pos, 8)) return false; // leader_id + leader_epoch
+            if (flexible) ser.skipTaggedFields(buf, pos) catch return false;
+        }
+        if (flexible) ser.skipTaggedFields(buf, pos) catch return false;
+    }
+    return true;
+}
+
+fn skipEndQuorumTopics(buf: []const u8, pos: *usize, flexible: bool) bool {
+    const topic_count = readKafkaArrayCount(buf, pos, flexible) orelse return false;
+    for (0..topic_count) |_| {
+        if (!skipKafkaString(buf, pos, flexible)) return false; // topic_name
+        const partition_count = readKafkaArrayCount(buf, pos, flexible) orelse return false;
+        for (0..partition_count) |_| {
+            if (!skipFixedBytes(buf, pos, 12)) return false; // partition_index + leader_id + leader_epoch
+            if (!skipKafkaI32Array(buf, pos, flexible)) return false; // preferred_successors
+            if (flexible and !skipEndQuorumPreferredCandidates(buf, pos)) return false;
+            if (flexible) ser.skipTaggedFields(buf, pos) catch return false;
+        }
+        if (flexible) ser.skipTaggedFields(buf, pos) catch return false;
+    }
+    return true;
+}
+
+fn skipEndQuorumPreferredCandidates(buf: []const u8, pos: *usize) bool {
+    const candidate_count = readKafkaArrayCount(buf, pos, true) orelse return false;
+    for (0..candidate_count) |_| {
+        if (!skipFixedBytes(buf, pos, 20)) return false; // candidate_id + candidate_directory_id
+        ser.skipTaggedFields(buf, pos) catch return false;
+    }
+    return true;
+}
+
+fn skipQuorumLeaderEndpoints(buf: []const u8, pos: *usize) bool {
+    const endpoint_count = readKafkaArrayCount(buf, pos, true) orelse return false;
+    for (0..endpoint_count) |_| {
+        if (!skipKafkaString(buf, pos, true)) return false; // name
+        if (!skipKafkaString(buf, pos, true)) return false; // host
+        if (!skipFixedBytes(buf, pos, 2)) return false; // port
+        ser.skipTaggedFields(buf, pos) catch return false;
+    }
+    return true;
+}
+
+fn skipKafkaI32Array(buf: []const u8, pos: *usize, flexible: bool) bool {
+    const item_count = readKafkaArrayCount(buf, pos, flexible) orelse return false;
+    if (item_count > (buf.len - pos.*) / 4) return false;
+    pos.* += item_count * 4;
+    return true;
+}
+
+fn readKafkaArrayCount(buf: []const u8, pos: *usize, flexible: bool) ?usize {
+    const item_count = if (flexible)
+        (ser.readCompactArrayLen(buf, pos) catch return null) orelse 0
+    else
+        readLegacyArrayCount(buf, pos) orelse return null;
+    if (pos.* > buf.len or item_count > buf.len - pos.* + 1) return null;
+    return item_count;
+}
+
+fn readLegacyArrayCount(buf: []const u8, pos: *usize) ?usize {
+    if (pos.* > buf.len or 4 > buf.len - pos.*) return null;
+    const len = std.mem.readInt(i32, buf[pos.*..][0..4], .big);
+    pos.* += 4;
+    if (len < 0) return 0;
+    return @intCast(len);
+}
+
+fn skipKafkaString(buf: []const u8, pos: *usize, flexible: bool) bool {
+    if (flexible) {
+        _ = ser.readCompactString(buf, pos) catch return false;
+        return true;
+    }
+
+    if (pos.* > buf.len or 2 > buf.len - pos.*) return false;
+    const len = std.mem.readInt(i16, buf[pos.*..][0..2], .big);
+    pos.* += 2;
+    if (len < 0) return true;
+    const string_len: usize = @intCast(len);
+    if (string_len > buf.len - pos.*) return false;
+    pos.* += string_len;
+    return true;
+}
+
+fn skipFixedBytes(buf: []const u8, pos: *usize, len: usize) bool {
+    if (pos.* > buf.len or len > buf.len - pos.*) return false;
+    pos.* += len;
+    return true;
+}
+
+fn readRecordI32(data: []const u8, pos: *usize) !i32 {
+    if (pos.* + 4 > data.len) return error.InvalidAutoMqMetadataRecord;
+    const value = std.mem.readInt(i32, data[pos.*..][0..4], .big);
+    pos.* += 4;
+    return value;
+}
+
+fn readRecordI64(data: []const u8, pos: *usize) !i64 {
+    if (pos.* + 8 > data.len) return error.InvalidAutoMqMetadataRecord;
+    const value = std.mem.readInt(i64, data[pos.*..][0..8], .big);
+    pos.* += 8;
+    return value;
+}
+
 // ---------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------
@@ -525,6 +840,13 @@ fn buildTestRequest(buf: []u8, api_key: i16, api_version: i16, correlation_id: i
         ser.writeString(buf, &pos, "test-client");
     }
     return pos;
+}
+
+fn freeDeserializedVoteResponse(resp: *const generated.vote_response.VoteResponse) void {
+    for (resp.topics) |topic| {
+        if (topic.partitions.len > 0) testing.allocator.free(topic.partitions);
+    }
+    if (resp.topics.len > 0) testing.allocator.free(resp.topics);
 }
 
 test "Controller init and deinit" {
@@ -598,6 +920,9 @@ test "Controller handleRequest unsupported API returns error" {
 }
 
 test "Controller handleRequest Vote grants to valid candidate" {
+    const Req = generated.vote_request.VoteRequest;
+    const Resp = generated.vote_response.VoteResponse;
+
     var ctrl = Controller.init(testing.allocator, 1, "test-cluster");
     defer ctrl.deinit();
 
@@ -608,32 +933,38 @@ test "Controller handleRequest Vote grants to valid candidate" {
     var buf: [256]u8 = undefined;
     var pos = buildTestRequest(&buf, 52, 0, 10, 2);
 
-    // Vote request body:
-    ser.writeCompactString(&buf, &pos, null); // cluster_id (null)
-    ser.writeI32(&buf, &pos, 2); // candidate_id
-    ser.writeI32(&buf, &pos, 1); // candidate_epoch
-    ser.writeI32(&buf, &pos, 2); // candidate_id (duplicate in wire format)
-    ser.writeI64(&buf, &pos, 0); // last_epoch_end_offset
-    ser.writeI32(&buf, &pos, 0); // last_epoch
+    const partitions = [_]Req.TopicData.PartitionData{.{
+        .partition_index = 0,
+        .candidate_epoch = 1,
+        .candidate_id = 2,
+        .last_offset_epoch = 0,
+        .last_offset = 0,
+    }};
+    const topics = [_]Req.TopicData{.{ .topic_name = "__cluster_metadata", .partitions = &partitions }};
+    const req = Req{ .cluster_id = null, .topics = &topics };
+    req.serialize(&buf, &pos, 0);
 
     const response = ctrl.handleRequest(buf[0..pos]);
     try testing.expect(response != null);
     defer testing.allocator.free(response.?);
 
-    // Response header v1: correlation_id (4 bytes) + tagged_fields (1 byte)
     var rpos: usize = 0;
-    const corr_id = ser.readI32(response.?, &rpos);
-    try testing.expectEqual(@as(i32, 10), corr_id);
-    _ = try ser.readUnsignedVarint(response.?, &rpos); // skip tagged fields
+    var resp_header = try ResponseHeader.deserialize(testing.allocator, response.?, &rpos, header_mod.responseHeaderVersion(52, 0));
+    defer resp_header.deinit(testing.allocator);
+    try testing.expectEqual(@as(i32, 10), resp_header.correlation_id);
 
-    // Vote response body: error_code (i16) + epoch (i32) + vote_granted (bool)
-    _ = ser.readI16(response.?, &rpos); // error_code
-    _ = ser.readI32(response.?, &rpos); // epoch
-    const vote_granted = try ser.readBool(response.?, &rpos);
-    try testing.expect(vote_granted);
+    const resp = try Resp.deserialize(testing.allocator, response.?, &rpos, 0);
+    defer freeDeserializedVoteResponse(&resp);
+    try testing.expectEqual(ErrorCode.none.toInt(), resp.error_code);
+    try testing.expectEqual(@as(usize, 1), resp.topics.len);
+    try testing.expectEqual(@as(usize, 1), resp.topics[0].partitions.len);
+    try testing.expect(resp.topics[0].partitions[0].vote_granted);
 }
 
 test "Controller handleRequest Vote rejects stale epoch" {
+    const Req = generated.vote_request.VoteRequest;
+    const Resp = generated.vote_response.VoteResponse;
+
     var ctrl = Controller.init(testing.allocator, 1, "test-cluster");
     defer ctrl.deinit();
 
@@ -648,29 +979,62 @@ test "Controller handleRequest Vote rejects stale epoch" {
     var buf: [256]u8 = undefined;
     var pos = buildTestRequest(&buf, 52, 0, 11, 2);
 
-    ser.writeCompactString(&buf, &pos, null); // cluster_id
-    ser.writeI32(&buf, &pos, 3); // candidate_id
-    ser.writeI32(&buf, &pos, 3); // candidate_epoch (stale — less than current 5)
-    ser.writeI32(&buf, &pos, 3); // candidate_id (duplicate)
-    ser.writeI64(&buf, &pos, 0); // last_epoch_end_offset
-    ser.writeI32(&buf, &pos, 0); // last_epoch
+    const partitions = [_]Req.TopicData.PartitionData{.{
+        .partition_index = 0,
+        .candidate_epoch = 3,
+        .candidate_id = 3,
+        .last_offset_epoch = 0,
+        .last_offset = 0,
+    }};
+    const topics = [_]Req.TopicData{.{ .topic_name = "__cluster_metadata", .partitions = &partitions }};
+    const req = Req{ .cluster_id = null, .topics = &topics };
+    req.serialize(&buf, &pos, 0);
 
     const response = ctrl.handleRequest(buf[0..pos]);
     try testing.expect(response != null);
     defer testing.allocator.free(response.?);
 
-    // Parse response: skip header v1
     var rpos: usize = 0;
-    _ = ser.readI32(response.?, &rpos); // correlation_id
-    _ = try ser.readUnsignedVarint(response.?, &rpos); // tagged fields
+    var resp_header = try ResponseHeader.deserialize(testing.allocator, response.?, &rpos, header_mod.responseHeaderVersion(52, 0));
+    defer resp_header.deinit(testing.allocator);
+    try testing.expectEqual(@as(i32, 11), resp_header.correlation_id);
 
-    _ = ser.readI16(response.?, &rpos); // error_code
-    _ = ser.readI32(response.?, &rpos); // epoch
-    const vote_granted = try ser.readBool(response.?, &rpos);
-    try testing.expect(!vote_granted);
+    const resp = try Resp.deserialize(testing.allocator, response.?, &rpos, 0);
+    defer freeDeserializedVoteResponse(&resp);
+    try testing.expectEqual(ErrorCode.none.toInt(), resp.error_code);
+    try testing.expectEqual(@as(usize, 1), resp.topics.len);
+    try testing.expectEqual(@as(usize, 1), resp.topics[0].partitions.len);
+    try testing.expect(!resp.topics[0].partitions[0].vote_granted);
+}
+
+test "Controller handleRequest Vote rejects malformed generated request" {
+    const Resp = generated.vote_response.VoteResponse;
+
+    var ctrl = Controller.init(testing.allocator, 1, "test-cluster");
+    defer ctrl.deinit();
+
+    var buf: [64]u8 = undefined;
+    var pos = buildTestRequest(&buf, 52, 0, 12, 2);
+    ser.writeCompactString(&buf, &pos, null); // cluster_id
+    ser.writeCompactArrayLen(&buf, &pos, 1); // one topic declared, body truncated
+
+    const response = ctrl.handleRequest(buf[0..pos]);
+    try testing.expect(response != null);
+    defer testing.allocator.free(response.?);
+
+    var rpos: usize = 0;
+    var resp_header = try ResponseHeader.deserialize(testing.allocator, response.?, &rpos, header_mod.responseHeaderVersion(52, 0));
+    defer resp_header.deinit(testing.allocator);
+    try testing.expectEqual(@as(i32, 12), resp_header.correlation_id);
+
+    const resp = try Resp.deserialize(testing.allocator, response.?, &rpos, 0);
+    defer freeDeserializedVoteResponse(&resp);
+    try testing.expectEqual(ErrorCode.invalid_request.toInt(), resp.error_code);
 }
 
 test "Controller handleRequest BeginQuorumEpoch accepts higher epoch" {
+    const Req = generated.begin_quorum_epoch_request.BeginQuorumEpochRequest;
+
     var ctrl = Controller.init(testing.allocator, 1, "test-cluster");
     defer ctrl.deinit();
 
@@ -680,11 +1044,14 @@ test "Controller handleRequest BeginQuorumEpoch accepts higher epoch" {
     var buf: [256]u8 = undefined;
     var pos = buildTestRequest(&buf, 53, 0, 20, header_mod.requestHeaderVersion(53, 0));
 
-    // BeginQuorumEpoch body:
-    ser.writeI16(&buf, &pos, 0); // error_code
-    ser.writeI32(&buf, &pos, 0); // topics_len (0)
-    ser.writeI32(&buf, &pos, 2); // leader_id
-    ser.writeI32(&buf, &pos, 5); // leader_epoch
+    const partitions = [_]Req.TopicData.PartitionData{.{
+        .partition_index = 0,
+        .leader_id = 2,
+        .leader_epoch = 5,
+    }};
+    const topics = [_]Req.TopicData{.{ .topic_name = "__cluster_metadata", .partitions = &partitions }};
+    const req = Req{ .cluster_id = "", .topics = &topics };
+    req.serialize(&buf, &pos, 0);
 
     const response = ctrl.handleRequest(buf[0..pos]);
     try testing.expect(response != null);
@@ -697,6 +1064,8 @@ test "Controller handleRequest BeginQuorumEpoch accepts higher epoch" {
 }
 
 test "Controller handleRequest BeginQuorumEpoch ignores stale epoch" {
+    const Req = generated.begin_quorum_epoch_request.BeginQuorumEpochRequest;
+
     var ctrl = Controller.init(testing.allocator, 1, "test-cluster");
     defer ctrl.deinit();
 
@@ -708,10 +1077,14 @@ test "Controller handleRequest BeginQuorumEpoch ignores stale epoch" {
     var buf: [256]u8 = undefined;
     var pos = buildTestRequest(&buf, 53, 0, 21, header_mod.requestHeaderVersion(53, 0));
 
-    ser.writeI16(&buf, &pos, 0); // error_code
-    ser.writeI32(&buf, &pos, 0); // topics_len
-    ser.writeI32(&buf, &pos, 3); // leader_id
-    ser.writeI32(&buf, &pos, 3); // leader_epoch (stale)
+    const partitions = [_]Req.TopicData.PartitionData{.{
+        .partition_index = 0,
+        .leader_id = 3,
+        .leader_epoch = 3,
+    }};
+    const topics = [_]Req.TopicData{.{ .topic_name = "__cluster_metadata", .partitions = &partitions }};
+    const req = Req{ .cluster_id = "", .topics = &topics };
+    req.serialize(&buf, &pos, 0);
 
     const response = ctrl.handleRequest(buf[0..pos]);
     try testing.expect(response != null);
@@ -719,6 +1092,39 @@ test "Controller handleRequest BeginQuorumEpoch ignores stale epoch" {
 
     // Raft state should NOT have changed — epoch still 5
     try testing.expectEqual(@as(i32, 5), ctrl.raft_state.current_epoch);
+}
+
+test "Controller handleRequest BeginQuorumEpoch applies internal AppendEntries payload" {
+    const Req = generated.begin_quorum_epoch_request.BeginQuorumEpochRequest;
+
+    var ctrl = Controller.init(testing.allocator, 1, "test-cluster");
+    defer ctrl.deinit();
+
+    var buf: [256]u8 = undefined;
+    var pos = buildTestRequest(&buf, 53, 0, 22, header_mod.requestHeaderVersion(53, 0));
+    const req = Req{ .cluster_id = "", .topics = &.{} };
+    req.serialize(&buf, &pos, 0);
+
+    const record = "raft-entry";
+    ser.writeI32(&buf, &pos, 2); // leader_id
+    ser.writeI32(&buf, &pos, 1); // leader_epoch
+    ser.writeI64(&buf, &pos, 0); // prev_log_offset
+    ser.writeI32(&buf, &pos, 0); // prev_log_epoch
+    ser.writeI64(&buf, &pos, 0); // leader_commit
+    ser.writeI64(&buf, &pos, 0); // entries_start_index
+    ser.writeI32(&buf, &pos, 1); // entry_count
+    ser.writeI32(&buf, &pos, @intCast(record.len));
+    @memcpy(buf[pos .. pos + record.len], record);
+    pos += record.len;
+
+    const response = ctrl.handleRequest(buf[0..pos]);
+    try testing.expect(response != null);
+    defer testing.allocator.free(response.?);
+
+    try testing.expectEqual(RaftState.Role.follower, ctrl.raft_state.role);
+    try testing.expectEqual(@as(i32, 1), ctrl.raft_state.current_epoch);
+    try testing.expectEqual(@as(usize, 1), ctrl.raft_state.log.length());
+    try testing.expectEqualStrings(record, ctrl.raft_state.log.entries.items[0].data);
 }
 
 test "Controller handleRequest DescribeQuorum returns quorum info" {
