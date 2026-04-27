@@ -70,12 +70,35 @@ fn serializePreparedRegistry() ?[]const u8 {
     };
 }
 
-/// Callback for ElectionLoop: append a complete AutoMQ metadata/ObjectManager
-/// snapshot record before Raft truncates committed metadata records.
-fn prepareAutoMqMetadataSnapshot() bool {
-    const brk = global_broker_ptr orelse return true;
+/// Callback for ElectionLoop: append complete controller and AutoMQ metadata
+/// snapshot records before Raft truncates committed metadata records.
+fn prepareRaftMetadataSnapshot() bool {
+    if (global_controller_ptr) |ctrl| {
+        ctrl.prepareControllerMetadataSnapshotForRaftCompaction() catch |err| {
+            log.warn("Failed to prepare controller metadata snapshot before Raft compaction: {}", .{err});
+            return false;
+        };
+    }
+    if (global_broker_ptr) |brk| {
+        brk.prepareAutoMqMetadataSnapshotForRaftCompaction() catch |err| {
+            log.warn("Failed to prepare AutoMQ metadata snapshot before Raft compaction: {}", .{err});
+            return false;
+        };
+    }
+    return true;
+}
+
+fn prepareControllerMetadataSnapshotForShutdown(ctrl: *Controller) bool {
+    ctrl.prepareControllerMetadataSnapshotForRaftCompaction() catch |err| {
+        log.warn("Graceful shutdown: skipping controller metadata snapshot: {}", .{err});
+        return false;
+    };
+    return true;
+}
+
+fn prepareAutoMqMetadataSnapshotForShutdown(brk: *Broker) bool {
     brk.prepareAutoMqMetadataSnapshotForRaftCompaction() catch |err| {
-        log.warn("Failed to prepare AutoMQ metadata snapshot before Raft compaction: {}", .{err});
+        log.warn("Graceful shutdown: skipping Raft snapshot because AutoMQ metadata snapshot failed: {}", .{err});
         return false;
     };
     return true;
@@ -461,7 +484,7 @@ pub fn main(init: std.process.Init) !void {
             .should_stop = &global_shutdown,
             .raft_client_pool = if (raft_pool != null) &(raft_pool.?) else null,
             .pre_snapshot_fn = if (broker != null) &serializePreparedRegistry else null,
-            .prepare_snapshot_fn = if (broker != null) &prepareAutoMqMetadataSnapshot else null,
+            .prepare_snapshot_fn = &prepareRaftMetadataSnapshot,
             .snapshot_allocator = if (broker != null) alloc else null,
         };
         if (election_state.raft_client_pool != null) {
@@ -661,11 +684,9 @@ fn performGracefulShutdown(broker_opt: ?*Broker, controller_opt: ?*Controller) v
     // Raft log, because prepared entries in the truncated log portion would be lost.
     if (controller_opt) |ctrl| {
         var can_snapshot = true;
+        if (!prepareControllerMetadataSnapshotForShutdown(ctrl)) can_snapshot = false;
         if (broker_opt) |brk| {
-            brk.prepareAutoMqMetadataSnapshotForRaftCompaction() catch |err| {
-                log.warn("Graceful shutdown: skipping Raft snapshot because AutoMQ metadata snapshot failed: {}", .{err});
-                can_snapshot = false;
-            };
+            if (!prepareAutoMqMetadataSnapshotForShutdown(brk)) can_snapshot = false;
             const reg_data = brk.object_manager.prepared_registry.serialize(ctrl.raft_state.allocator) catch null;
             ctrl.raft_state.prepared_registry_data = reg_data;
         }

@@ -499,6 +499,7 @@ pub const Controller = struct {
     const ControllerMetadataRecordKind = enum(u8) {
         broker_registration = 1,
         producer_id_allocation = 2,
+        full_snapshot = 3,
     };
 
     fn controllerBytesFieldSize(bytes: []const u8) !usize {
@@ -519,6 +520,7 @@ pub const Controller = struct {
         return switch (byte) {
             1 => .broker_registration,
             2 => .producer_id_allocation,
+            3 => .full_snapshot,
             else => error.InvalidAutoMqMetadataRecord,
         };
     }
@@ -540,6 +542,40 @@ pub const Controller = struct {
         writeRecordI32(buf, &pos, @intCast(port));
         writeRecordBool(buf, &pos, true);
         try writeRecordBytes(buf, &pos, host);
+        std.debug.assert(pos == buf.len);
+        return buf;
+    }
+
+    fn buildControllerFullSnapshotRecord(self: *Controller) ![]u8 {
+        if (self.broker_registry.count() > std.math.maxInt(u32)) return error.RecordTooLarge;
+
+        var total_len = try checkedAddSize(controller_metadata_record_magic.len, 1);
+        total_len = try checkedAddSize(total_len, 8 + 8 + 4);
+        var it = self.broker_registry.brokers.iterator();
+        while (it.next()) |entry| {
+            total_len = try checkedAddSize(total_len, 4 + 8 + 4 + 1);
+            total_len = try checkedAddSize(total_len, try controllerBytesFieldSize(entry.value_ptr.host));
+        }
+
+        const buf = try self.allocator.alloc(u8, total_len);
+        var pos: usize = 0;
+        @memcpy(buf[pos .. pos + controller_metadata_record_magic.len], controller_metadata_record_magic);
+        pos += controller_metadata_record_magic.len;
+        buf[pos] = @intFromEnum(ControllerMetadataRecordKind.full_snapshot);
+        pos += 1;
+        writeRecordI64(buf, &pos, self.next_producer_id);
+        writeRecordI64(buf, &pos, self.broker_registry.next_broker_epoch);
+        writeRecordU32(buf, &pos, @intCast(self.broker_registry.count()));
+
+        it = self.broker_registry.brokers.iterator();
+        while (it.next()) |entry| {
+            const broker = entry.value_ptr;
+            writeRecordI32(buf, &pos, broker.broker_id);
+            writeRecordI64(buf, &pos, broker.broker_epoch);
+            writeRecordI32(buf, &pos, @intCast(broker.port));
+            writeRecordBool(buf, &pos, broker.fenced);
+            try writeRecordBytes(buf, &pos, broker.host);
+        }
         std.debug.assert(pos == buf.len);
         return buf;
     }
@@ -595,6 +631,49 @@ pub const Controller = struct {
         self.next_producer_id = @max(self.next_producer_id, next_producer_id);
     }
 
+    fn applyControllerFullSnapshotRecord(self: *Controller, data: []const u8, pos: *usize) !void {
+        const next_producer_id = try readRecordI64(data, pos);
+        const next_broker_epoch = try readRecordI64(data, pos);
+        const broker_count = try readRecordU32(data, pos);
+        if (next_producer_id <= 0 or next_broker_epoch <= 0) return error.InvalidAutoMqMetadataRecord;
+
+        const brokers_start = pos.*;
+        var scan_pos = brokers_start;
+        var i: u32 = 0;
+        while (i < broker_count) : (i += 1) {
+            _ = try readRecordI32(data, &scan_pos);
+            _ = try readRecordI64(data, &scan_pos);
+            const port_raw = try readRecordI32(data, &scan_pos);
+            if (port_raw < 0 or port_raw > std.math.maxInt(u16)) return error.InvalidAutoMqMetadataRecord;
+            _ = try readRecordBool(data, &scan_pos);
+            _ = try readRecordBytes(data, &scan_pos);
+        }
+        if (scan_pos != data.len) return error.InvalidAutoMqMetadataRecord;
+
+        self.broker_registry.deinit();
+        self.broker_registry = BrokerRegistry.init(self.allocator);
+        self.next_producer_id = next_producer_id;
+
+        pos.* = brokers_start;
+        i = 0;
+        while (i < broker_count) : (i += 1) {
+            const broker_id = try readRecordI32(data, pos);
+            const broker_epoch = try readRecordI64(data, pos);
+            const port_raw = try readRecordI32(data, pos);
+            const fenced = try readRecordBool(data, pos);
+            const host = try readRecordBytes(data, pos);
+            try self.broker_registry.registerWithEpoch(
+                broker_id,
+                host,
+                @intCast(port_raw),
+                broker_epoch,
+                fenced,
+            );
+        }
+        self.broker_registry.next_broker_epoch = @max(self.broker_registry.next_broker_epoch, next_broker_epoch);
+        pos.* = data.len;
+    }
+
     fn applyControllerMetadataRecord(self: *Controller, data: []const u8) !void {
         if (!isControllerMetadataRecord(data)) return;
         var pos = controller_metadata_record_magic.len;
@@ -605,6 +684,7 @@ pub const Controller = struct {
         switch (kind) {
             .broker_registration => try self.applyBrokerRegistrationRecord(data, &pos),
             .producer_id_allocation => try self.applyProducerIdAllocationRecord(data, &pos),
+            .full_snapshot => try self.applyControllerFullSnapshotRecord(data, &pos),
         }
     }
 
@@ -626,8 +706,19 @@ pub const Controller = struct {
     pub fn replayCommittedControllerMetadataRecords(self: *Controller) !usize {
         self.broker_registry.deinit();
         self.broker_registry = BrokerRegistry.init(self.allocator);
+        self.next_producer_id = 1000;
         self.last_applied_controller_metadata_offset = null;
         return self.applyCommittedControllerMetadataRecords();
+    }
+
+    pub fn prepareControllerMetadataSnapshotForRaftCompaction(self: *Controller) !void {
+        if (self.raft_state.role != .leader) return error.NotController;
+        if (self.raft_state.quorumSize() > 1) return error.QuorumCommitPending;
+
+        const record = try self.buildControllerFullSnapshotRecord();
+        defer self.allocator.free(record);
+        const offset = try self.appendControllerMetadataRecord(record);
+        self.last_applied_controller_metadata_offset = offset;
     }
 
     // ---------------------------------------------------------------
@@ -1087,6 +1178,11 @@ fn writeRecordI64(buf: []u8, pos: *usize, value: i64) void {
     pos.* += 8;
 }
 
+fn writeRecordU32(buf: []u8, pos: *usize, value: u32) void {
+    std.mem.writeInt(u32, buf[pos.*..][0..4], value, .big);
+    pos.* += 4;
+}
+
 fn writeRecordBool(buf: []u8, pos: *usize, value: bool) void {
     buf[pos.*] = if (value) 1 else 0;
     pos.* += 1;
@@ -1119,6 +1215,13 @@ fn readRecordBytes(data: []const u8, pos: *usize) ![]const u8 {
     const bytes = data[pos.* .. pos.* + len];
     pos.* += len;
     return bytes;
+}
+
+fn readRecordU32(data: []const u8, pos: *usize) !u32 {
+    if (pos.* + 4 > data.len) return error.InvalidAutoMqMetadataRecord;
+    const value = std.mem.readInt(u32, data[pos.*..][0..4], .big);
+    pos.* += 4;
+    return value;
 }
 
 // ---------------------------------------------------------------
@@ -1845,6 +1948,41 @@ test "Controller initWithDataDir replays durable producer id allocations" {
         try testing.expectEqual(@as(i64, 2000), resp.producer_id_start);
         try testing.expectEqual(@as(i64, 3000), ctrl.next_producer_id);
     }
+}
+
+test "Controller full snapshot survives Raft log compaction" {
+    var ctrl = Controller.init(testing.allocator, 1, "controller-snapshot");
+    defer ctrl.deinit();
+    try makeTestControllerLeader(&ctrl);
+
+    const broker_epoch = ctrl.broker_registry.next_broker_epoch;
+    const broker_record = try ctrl.buildBrokerRegistrationRecord(100, "host1", 9092, broker_epoch);
+    defer ctrl.allocator.free(broker_record);
+    var offset = try ctrl.appendControllerMetadataRecord(broker_record);
+    try ctrl.broker_registry.registerWithEpoch(100, "host1", 9092, broker_epoch, false);
+    ctrl.last_applied_controller_metadata_offset = offset;
+
+    const pid_record = try ctrl.buildProducerIdAllocationRecord(2000);
+    defer ctrl.allocator.free(pid_record);
+    offset = try ctrl.appendControllerMetadataRecord(pid_record);
+    ctrl.next_producer_id = 2000;
+    ctrl.last_applied_controller_metadata_offset = offset;
+
+    try ctrl.prepareControllerMetadataSnapshotForRaftCompaction();
+    try testing.expectEqual(@as(usize, 3), ctrl.raft_state.log.length());
+    try testing.expectEqual(@as(u64, 2), ctrl.raft_state.commit_index);
+
+    ctrl.raft_state.takeSnapshot();
+    try testing.expectEqual(@as(usize, 1), ctrl.raft_state.log.length());
+    try testing.expectEqual(@as(u64, 2), ctrl.raft_state.log.entries.items[0].offset);
+
+    try testing.expectEqual(@as(usize, 1), try ctrl.replayCommittedControllerMetadataRecords());
+    try testing.expectEqual(@as(usize, 1), ctrl.broker_registry.count());
+    try testing.expectEqual(@as(i64, 2000), ctrl.next_producer_id);
+    const broker = ctrl.broker_registry.brokers.get(100).?;
+    try testing.expectEqual(@as(i64, 1), broker.broker_epoch);
+    try testing.expectEqualStrings("host1", broker.host);
+    try testing.expect(!broker.fenced);
 }
 
 test "Controller handleRequest AddRaftVoter uses generated key 80" {
