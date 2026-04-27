@@ -3141,26 +3141,28 @@ pub const Broker = struct {
     // InitProducerId (key 22)
     // ---------------------------------------------------------------
     fn handleInitProducerId(self: *Broker, request_bytes: []const u8, body_start: usize, req_header: *const RequestHeader, api_version: i16, resp_header_version: i16) ?[]u8 {
-        _ = api_version;
+        const Req = generated.init_producer_id_request.InitProducerIdRequest;
+        const Resp = generated.init_producer_id_response.InitProducerIdResponse;
+
+        if (!validateInitProducerIdRequestFrame(request_bytes, body_start, api_version)) {
+            log.warn("Malformed InitProducerId request", .{});
+            return null;
+        }
+
         var pos = body_start;
-        // Parse transactional_id (nullable string)
-        const transactional_id = ser.readString(request_bytes, &pos) catch null;
-        const timeout_ms = ser.readI32(request_bytes, &pos);
-        _ = timeout_ms;
+        const req = Req.deserialize(self.allocator, request_bytes, &pos, api_version) catch |err| {
+            log.warn("Failed to decode InitProducerId request: {}", .{err});
+            return null;
+        };
 
-        // Allocate a producer ID for idempotent/transactional producers
-        const result = self.txn_coordinator.initProducerId(transactional_id) catch return null;
-
-        var resp_buf = self.allocator.alloc(u8, 64) catch return null;
-        var wpos: usize = 0;
-        const resp_header = ResponseHeader{ .correlation_id = req_header.correlation_id };
-        resp_header.serialize(resp_buf, &wpos, resp_header_version);
-        ser.writeI32(resp_buf, &wpos, 0); // throttle_time_ms
-        ser.writeI16(resp_buf, &wpos, result.error_code); // error_code
-        ser.writeI64(resp_buf, &wpos, result.producer_id); // producer_id
-        ser.writeI16(resp_buf, &wpos, result.producer_epoch); // producer_epoch
-        if (resp_header_version >= 1) ser.writeEmptyTaggedFields(resp_buf, &wpos);
-        return (self.allocator.realloc(resp_buf, wpos) catch resp_buf)[0..wpos];
+        const result = self.txn_coordinator.initProducerId(req.transactional_id) catch return null;
+        const resp = Resp{
+            .throttle_time_ms = 0,
+            .error_code = result.error_code,
+            .producer_id = result.producer_id,
+            .producer_epoch = result.producer_epoch,
+        };
+        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
     }
 
     // ---------------------------------------------------------------
@@ -6890,6 +6892,19 @@ pub const Broker = struct {
         return true;
     }
 
+    fn validateInitProducerIdRequestFrame(buf: []const u8, start_pos: usize, api_version: i16) bool {
+        const flexible = api_version >= 2;
+        var pos = start_pos;
+
+        if (!skipKafkaString(buf, &pos, flexible)) return false; // transactional_id
+        if (!skipFixedBytes(buf, &pos, 4)) return false; // transaction_timeout_ms
+        if (api_version >= 3) {
+            if (!skipFixedBytes(buf, &pos, 10)) return false; // producer_id + producer_epoch
+        }
+        if (flexible) ser.skipTaggedFields(buf, &pos) catch return false;
+        return true;
+    }
+
     fn validateListGroupsRequestFrame(buf: []const u8, start_pos: usize, api_version: i16) bool {
         const flexible = api_version >= 3;
         var pos = start_pos;
@@ -9863,6 +9878,51 @@ test "Broker.handleRequest InitProducerId (key=22, v0)" {
     var rpos: usize = 0;
     const corr_id = ser.readI32(response.?, &rpos);
     try testing.expectEqual(@as(i32, 500), corr_id);
+}
+
+test "Broker.handleRequest InitProducerId v4 returns generated response" {
+    const Req = generated.init_producer_id_request.InitProducerIdRequest;
+    const Resp = generated.init_producer_id_response.InitProducerIdResponse;
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+
+    const req = Req{
+        .transactional_id = "init-generated-txn",
+        .transaction_timeout_ms = 60000,
+        .producer_id = -1,
+        .producer_epoch = -1,
+    };
+
+    var buf: [512]u8 = undefined;
+    var pos = buildTestRequest(&buf, 22, 4, 2204, header_mod.requestHeaderVersion(22, 4));
+    req.serialize(&buf, &pos, 4);
+
+    const response = broker.handleRequest(buf[0..pos]);
+    try testing.expect(response != null);
+    defer testing.allocator.free(response.?);
+
+    var rpos: usize = 0;
+    var response_header = try ResponseHeader.deserialize(testing.allocator, response.?, &rpos, header_mod.responseHeaderVersion(22, 4));
+    defer response_header.deinit(testing.allocator);
+    try testing.expectEqual(@as(i32, 2204), response_header.correlation_id);
+
+    const resp = try Resp.deserialize(testing.allocator, response.?, &rpos, 4);
+    try testing.expectEqual(response.?.len, rpos);
+    try testing.expectEqual(@as(i32, 0), resp.throttle_time_ms);
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.none)), resp.error_code);
+    try testing.expect(resp.producer_id >= 1);
+    try testing.expectEqual(@as(i16, 0), resp.producer_epoch);
+    try testing.expect(broker.txn_coordinator.getStatus(resp.producer_id) != null);
+}
+
+test "Broker.handleRequest InitProducerId rejects truncated request" {
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+
+    var buf: [128]u8 = undefined;
+    const req_len = buildTestRequest(&buf, 22, 4, 2205, header_mod.requestHeaderVersion(22, 4));
+    try testing.expect(broker.handleRequest(buf[0..req_len]) == null);
 }
 
 test "Broker.isVersionSupported" {
