@@ -4466,64 +4466,145 @@ pub const Broker = struct {
     // as AlterConfigs, with incremental semantics (SET, DELETE, APPEND, SUBTRACT).
     // ---------------------------------------------------------------
     fn handleIncrementalAlterConfigs(self: *Broker, request_bytes: []const u8, body_start: usize, req_header: *const RequestHeader, api_version: i16, resp_header_version: i16) ?[]u8 {
-        _ = api_version;
+        const Req = generated.incremental_alter_configs_request.IncrementalAlterConfigsRequest;
+        const Resp = generated.incremental_alter_configs_response.IncrementalAlterConfigsResponse;
+        const ResourceResponse = Resp.AlterConfigsResourceResponse;
+
+        if (!validateIncrementalAlterConfigsRequestFrame(request_bytes, body_start, api_version)) {
+            log.warn("Malformed IncrementalAlterConfigs request", .{});
+            return null;
+        }
+
         var pos = body_start;
-        const num_resources = (ser.readArrayLen(request_bytes, &pos) catch 0) orelse 0;
+        var req = Req.deserialize(self.allocator, request_bytes, &pos, api_version) catch |err| {
+            log.warn("Failed to decode IncrementalAlterConfigs request: {}", .{err});
+            return null;
+        };
+        defer self.freeIncrementalAlterConfigsRequest(&req);
 
-        var results: [32]struct { resource_type: i8, resource_name: []const u8, error_code: i16 } = undefined;
-        var count: usize = 0;
+        const responses = self.allocator.alloc(ResourceResponse, req.resources.len) catch return null;
+        defer if (responses.len > 0) self.allocator.free(responses);
 
-        for (0..num_resources) |_| {
-            if (count >= 32) break;
-            const resource_type = ser.readI8(request_bytes, &pos);
-            const resource_name = (ser.readString(request_bytes, &pos) catch break) orelse "";
-
-            // Parse config entries with incremental operations
-            const num_configs = (ser.readArrayLen(request_bytes, &pos) catch 0) orelse 0;
-            for (0..num_configs) |_| {
-                const config_name = (ser.readString(request_bytes, &pos) catch break) orelse "";
-                _ = ser.readI8(request_bytes, &pos); // config_operation (0=SET, 1=DELETE, 2=APPEND, 3=SUBTRACT)
-                const config_value = (ser.readString(request_bytes, &pos) catch break) orelse "";
-
-                // Apply config changes to broker/topic
-                if (resource_type == 2) {
-                    // TOPIC resource — apply topic-level config
-                    if (self.topics.getPtr(resource_name)) |info| {
-                        if (std.mem.eql(u8, config_name, "retention.ms")) {
-                            info.config.retention_ms = std.fmt.parseInt(i64, config_value, 10) catch info.config.retention_ms;
-                        } else if (std.mem.eql(u8, config_name, "retention.bytes")) {
-                            info.config.retention_bytes = std.fmt.parseInt(i64, config_value, 10) catch info.config.retention_bytes;
-                        } else if (std.mem.eql(u8, config_name, "max.message.bytes")) {
-                            info.config.max_message_bytes = std.fmt.parseInt(i32, config_value, 10) catch info.config.max_message_bytes;
-                        } else if (std.mem.eql(u8, config_name, "min.insync.replicas")) {
-                            info.config.min_insync_replicas = std.fmt.parseInt(i32, config_value, 10) catch info.config.min_insync_replicas;
-                        }
-                    }
-                }
-            }
-
-            results[count] = .{
-                .resource_type = resource_type,
-                .resource_name = resource_name,
-                .error_code = 0, // SUCCESS
+        var mutated = false;
+        for (req.resources, 0..) |resource, i| {
+            const result = self.applyIncrementalAlterConfigsResource(resource, req.validate_only);
+            responses[i] = .{
+                .error_code = result.error_code,
+                .error_message = result.error_message,
+                .resource_type = resource.resource_type,
+                .resource_name = resource.resource_name,
             };
-            count += 1;
+            if (result.mutated) mutated = true;
         }
 
-        var buf = self.allocator.alloc(u8, 1024) catch return null;
-        var wpos: usize = 0;
-        const rh = ResponseHeader{ .correlation_id = req_header.correlation_id };
-        rh.serialize(buf, &wpos, resp_header_version);
-        ser.writeI32(buf, &wpos, 0); // throttle_time_ms
-        ser.writeArrayLen(buf, &wpos, count);
-        for (0..count) |i| {
-            ser.writeI16(buf, &wpos, results[i].error_code);
-            ser.writeString(buf, &wpos, null); // error_message
-            ser.writeI8(buf, &wpos, results[i].resource_type);
-            ser.writeString(buf, &wpos, results[i].resource_name);
+        if (mutated) {
+            self.persistTopics();
+            self.persistObjectManagerSnapshot();
         }
-        if (resp_header_version >= 1) ser.writeEmptyTaggedFields(buf, &wpos);
-        return (self.allocator.realloc(buf, wpos) catch buf)[0..wpos];
+
+        const resp = Resp{
+            .throttle_time_ms = 0,
+            .responses = responses,
+        };
+        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+    }
+
+    fn freeIncrementalAlterConfigsRequest(self: *Broker, req: *generated.incremental_alter_configs_request.IncrementalAlterConfigsRequest) void {
+        for (req.resources) |resource| {
+            if (resource.configs.len > 0) self.allocator.free(resource.configs);
+        }
+        if (req.resources.len > 0) self.allocator.free(req.resources);
+    }
+
+    const IncrementalAlterConfigResult = struct {
+        error_code: i16,
+        error_message: ?[]const u8 = null,
+        mutated: bool = false,
+    };
+
+    fn applyIncrementalAlterConfigsResource(self: *Broker, resource: generated.incremental_alter_configs_request.IncrementalAlterConfigsRequest.AlterConfigsResource, validate_only: bool) IncrementalAlterConfigResult {
+        if (resource.resource_type != 2) {
+            return .{
+                .error_code = @intFromEnum(ErrorCode.invalid_request),
+                .error_message = "Unsupported config resource type",
+            };
+        }
+
+        const topic_name = resource.resource_name orelse "";
+        const topic_info = self.topics.getPtr(topic_name) orelse return .{
+            .error_code = @intFromEnum(ErrorCode.unknown_topic_or_partition),
+            .error_message = "Unknown topic",
+        };
+
+        var updated = false;
+        for (resource.configs) |config| {
+            const result = applyIncrementalTopicConfig(topic_info, config, validate_only);
+            if (result.error_code != @intFromEnum(ErrorCode.none)) return result;
+            if (result.mutated) updated = true;
+        }
+
+        return .{
+            .error_code = @intFromEnum(ErrorCode.none),
+            .error_message = null,
+            .mutated = updated,
+        };
+    }
+
+    fn applyIncrementalTopicConfig(topic_info: *TopicInfo, config: generated.incremental_alter_configs_request.IncrementalAlterConfigsRequest.AlterConfigsResource.AlterableConfig, validate_only: bool) IncrementalAlterConfigResult {
+        const name = config.name orelse return .{
+            .error_code = @intFromEnum(ErrorCode.invalid_config),
+            .error_message = "Missing config name",
+        };
+
+        if (config.config_operation < 0 or config.config_operation > 3) {
+            return .{
+                .error_code = @intFromEnum(ErrorCode.invalid_config),
+                .error_message = "Invalid config operation",
+            };
+        }
+
+        if (config.config_operation == 2 or config.config_operation == 3) {
+            return .{
+                .error_code = @intFromEnum(ErrorCode.invalid_config),
+                .error_message = "Append/subtract not supported for scalar topic configs",
+            };
+        }
+
+        const defaults = TopicConfig{};
+        const is_delete = config.config_operation == 1;
+        const value = config.value orelse "";
+
+        if (std.mem.eql(u8, name, "retention.ms")) {
+            const parsed = if (is_delete) defaults.retention_ms else std.fmt.parseInt(i64, value, 10) catch return invalidTopicConfigValue();
+            if (!validate_only) topic_info.config.retention_ms = parsed;
+        } else if (std.mem.eql(u8, name, "retention.bytes")) {
+            const parsed = if (is_delete) defaults.retention_bytes else std.fmt.parseInt(i64, value, 10) catch return invalidTopicConfigValue();
+            if (!validate_only) topic_info.config.retention_bytes = parsed;
+        } else if (std.mem.eql(u8, name, "max.message.bytes")) {
+            const parsed = if (is_delete) defaults.max_message_bytes else std.fmt.parseInt(i32, value, 10) catch return invalidTopicConfigValue();
+            if (!validate_only) topic_info.config.max_message_bytes = parsed;
+        } else if (std.mem.eql(u8, name, "min.insync.replicas")) {
+            const parsed = if (is_delete) defaults.min_insync_replicas else std.fmt.parseInt(i32, value, 10) catch return invalidTopicConfigValue();
+            if (!validate_only) topic_info.config.min_insync_replicas = parsed;
+        } else {
+            return .{
+                .error_code = @intFromEnum(ErrorCode.invalid_config),
+                .error_message = "Unsupported topic config",
+            };
+        }
+
+        return .{
+            .error_code = @intFromEnum(ErrorCode.none),
+            .error_message = null,
+            .mutated = !validate_only,
+        };
+    }
+
+    fn invalidTopicConfigValue() IncrementalAlterConfigResult {
+        return .{
+            .error_code = @intFromEnum(ErrorCode.invalid_config),
+            .error_message = "Invalid topic config value",
+        };
     }
 
     // ---------------------------------------------------------------
@@ -6347,6 +6428,28 @@ pub const Broker = struct {
         return true;
     }
 
+    fn validateIncrementalAlterConfigsRequestFrame(buf: []const u8, start_pos: usize, api_version: i16) bool {
+        const flexible = api_version >= 1;
+        var pos = start_pos;
+
+        const resource_count = readKafkaArrayCount(buf, &pos, flexible) orelse return false;
+        for (0..resource_count) |_| {
+            if (!skipFixedBytes(buf, &pos, 1)) return false; // resource_type
+            if (!skipKafkaString(buf, &pos, flexible)) return false; // resource_name
+            const config_count = readKafkaArrayCount(buf, &pos, flexible) orelse return false;
+            for (0..config_count) |_| {
+                if (!skipKafkaString(buf, &pos, flexible)) return false; // config name
+                if (!skipFixedBytes(buf, &pos, 1)) return false; // config_operation
+                if (!skipKafkaString(buf, &pos, flexible)) return false; // value
+                if (flexible) ser.skipTaggedFields(buf, &pos) catch return false;
+            }
+            if (flexible) ser.skipTaggedFields(buf, &pos) catch return false;
+        }
+        if (!skipFixedBytes(buf, &pos, 1)) return false; // validate_only
+        if (flexible) ser.skipTaggedFields(buf, &pos) catch return false;
+        return true;
+    }
+
     fn validateVoteRequestFrame(buf: []const u8, start_pos: usize, api_version: i16) bool {
         var pos = start_pos;
 
@@ -7527,6 +7630,150 @@ test "Broker.handleRequest DeleteAcls rejects truncated request" {
 
     var buf: [128]u8 = undefined;
     const req_len = buildTestRequest(&buf, 31, 2, 3104, header_mod.requestHeaderVersion(31, 2));
+    try testing.expect(broker.handleRequest(buf[0..req_len]) == null);
+}
+
+test "Broker.handleRequest IncrementalAlterConfigs v1 returns generated response and updates topic config" {
+    const Req = generated.incremental_alter_configs_request.IncrementalAlterConfigsRequest;
+    const Resp = generated.incremental_alter_configs_response.IncrementalAlterConfigsResponse;
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+    try testing.expect(broker.ensureTopic("inc-cfg-topic"));
+
+    const configs = [_]Req.AlterConfigsResource.AlterableConfig{.{
+        .name = "retention.ms",
+        .config_operation = 0,
+        .value = "1234",
+    }};
+    const resources = [_]Req.AlterConfigsResource{.{
+        .resource_type = 2,
+        .resource_name = "inc-cfg-topic",
+        .configs = &configs,
+    }};
+    const req = Req{
+        .resources = &resources,
+        .validate_only = false,
+    };
+
+    var buf: [512]u8 = undefined;
+    var pos = buildTestRequest(&buf, 44, 1, 4401, header_mod.requestHeaderVersion(44, 1));
+    req.serialize(&buf, &pos, 1);
+
+    const response = broker.handleRequest(buf[0..pos]);
+    try testing.expect(response != null);
+    defer testing.allocator.free(response.?);
+
+    var rpos: usize = 0;
+    var response_header = try ResponseHeader.deserialize(testing.allocator, response.?, &rpos, header_mod.responseHeaderVersion(44, 1));
+    defer response_header.deinit(testing.allocator);
+    try testing.expectEqual(@as(i32, 4401), response_header.correlation_id);
+
+    const resp = try Resp.deserialize(testing.allocator, response.?, &rpos, 1);
+    defer if (resp.responses.len > 0) testing.allocator.free(resp.responses);
+
+    try testing.expectEqual(response.?.len, rpos);
+    try testing.expectEqual(@as(i32, 0), resp.throttle_time_ms);
+    try testing.expectEqual(@as(usize, 1), resp.responses.len);
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.none)), resp.responses[0].error_code);
+    try testing.expectEqual(@as(i8, 2), resp.responses[0].resource_type);
+    try testing.expectEqualStrings("inc-cfg-topic", resp.responses[0].resource_name.?);
+    try testing.expectEqual(@as(i64, 1234), broker.topics.get("inc-cfg-topic").?.config.retention_ms);
+}
+
+test "Broker.handleRequest IncrementalAlterConfigs validate_only does not mutate" {
+    const Req = generated.incremental_alter_configs_request.IncrementalAlterConfigsRequest;
+    const Resp = generated.incremental_alter_configs_response.IncrementalAlterConfigsResponse;
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+    try testing.expect(broker.ensureTopic("inc-cfg-validate-topic"));
+
+    const before = broker.topics.get("inc-cfg-validate-topic").?.config.max_message_bytes;
+    const configs = [_]Req.AlterConfigsResource.AlterableConfig{.{
+        .name = "max.message.bytes",
+        .config_operation = 0,
+        .value = "2048",
+    }};
+    const resources = [_]Req.AlterConfigsResource{.{
+        .resource_type = 2,
+        .resource_name = "inc-cfg-validate-topic",
+        .configs = &configs,
+    }};
+    const req = Req{
+        .resources = &resources,
+        .validate_only = true,
+    };
+
+    var buf: [512]u8 = undefined;
+    var pos = buildTestRequest(&buf, 44, 1, 4402, header_mod.requestHeaderVersion(44, 1));
+    req.serialize(&buf, &pos, 1);
+
+    const response = broker.handleRequest(buf[0..pos]);
+    try testing.expect(response != null);
+    defer testing.allocator.free(response.?);
+
+    var rpos: usize = 0;
+    var response_header = try ResponseHeader.deserialize(testing.allocator, response.?, &rpos, header_mod.responseHeaderVersion(44, 1));
+    defer response_header.deinit(testing.allocator);
+    try testing.expectEqual(@as(i32, 4402), response_header.correlation_id);
+
+    const resp = try Resp.deserialize(testing.allocator, response.?, &rpos, 1);
+    defer if (resp.responses.len > 0) testing.allocator.free(resp.responses);
+
+    try testing.expectEqual(response.?.len, rpos);
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.none)), resp.responses[0].error_code);
+    try testing.expectEqual(before, broker.topics.get("inc-cfg-validate-topic").?.config.max_message_bytes);
+}
+
+test "Broker.handleRequest IncrementalAlterConfigs rejects invalid config value" {
+    const Req = generated.incremental_alter_configs_request.IncrementalAlterConfigsRequest;
+    const Resp = generated.incremental_alter_configs_response.IncrementalAlterConfigsResponse;
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+    try testing.expect(broker.ensureTopic("inc-cfg-invalid-topic"));
+
+    const before = broker.topics.get("inc-cfg-invalid-topic").?.config.retention_ms;
+    const configs = [_]Req.AlterConfigsResource.AlterableConfig{.{
+        .name = "retention.ms",
+        .config_operation = 0,
+        .value = "not-a-number",
+    }};
+    const resources = [_]Req.AlterConfigsResource{.{
+        .resource_type = 2,
+        .resource_name = "inc-cfg-invalid-topic",
+        .configs = &configs,
+    }};
+    const req = Req{ .resources = &resources };
+
+    var buf: [512]u8 = undefined;
+    var pos = buildTestRequest(&buf, 44, 1, 4403, header_mod.requestHeaderVersion(44, 1));
+    req.serialize(&buf, &pos, 1);
+
+    const response = broker.handleRequest(buf[0..pos]);
+    try testing.expect(response != null);
+    defer testing.allocator.free(response.?);
+
+    var rpos: usize = 0;
+    var response_header = try ResponseHeader.deserialize(testing.allocator, response.?, &rpos, header_mod.responseHeaderVersion(44, 1));
+    defer response_header.deinit(testing.allocator);
+    try testing.expectEqual(@as(i32, 4403), response_header.correlation_id);
+
+    const resp = try Resp.deserialize(testing.allocator, response.?, &rpos, 1);
+    defer if (resp.responses.len > 0) testing.allocator.free(resp.responses);
+
+    try testing.expectEqual(response.?.len, rpos);
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.invalid_config)), resp.responses[0].error_code);
+    try testing.expectEqual(before, broker.topics.get("inc-cfg-invalid-topic").?.config.retention_ms);
+}
+
+test "Broker.handleRequest IncrementalAlterConfigs rejects truncated request" {
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+
+    var buf: [128]u8 = undefined;
+    const req_len = buildTestRequest(&buf, 44, 1, 4404, header_mod.requestHeaderVersion(44, 1));
     try testing.expect(broker.handleRequest(buf[0..req_len]) == null);
 }
 
