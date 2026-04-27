@@ -2003,6 +2003,10 @@ pub const Broker = struct {
     // Produce (key 0)
     // ---------------------------------------------------------------
     fn handleProduce(self: *Broker, request_bytes: []const u8, body_start: usize, req_header: *const RequestHeader, api_version: i16, resp_header_version: i16) ?[]u8 {
+        const Req = generated.produce_request.ProduceRequest;
+        const Resp = generated.produce_response.ProduceResponse;
+        const TopicResult = Resp.TopicProduceResponse;
+
         // Reject all produces if this broker has been fenced by the controller.
         // Clients will receive NOT_LEADER_OR_FOLLOWER and refresh metadata.
         if (self.is_fenced_by_controller) {
@@ -2010,269 +2014,237 @@ pub const Broker = struct {
             return self.handleNotController(req_header, resp_header_version);
         }
 
-        var pos = body_start;
-        const flexible = api_version >= 9;
-
-        // Parse transactional_id (v3+)
-        if (api_version >= 3) {
-            if (flexible) {
-                _ = ser.readCompactString(request_bytes, &pos) catch return null;
-            } else {
-                _ = ser.readString(request_bytes, &pos) catch return null;
-            }
-        }
-
-        // Bounds-check before unchecked integer reads
-        if (pos + 10 > request_bytes.len) {
-            log.warn("Produce request too short for header fields: need {d} bytes at pos {d}, have {d}", .{ 10, pos, request_bytes.len });
+        if (!validateProduceRequestFrame(request_bytes, body_start, api_version)) {
+            log.warn("Malformed Produce request", .{});
             return null;
         }
 
-        const acks = ser.readI16(request_bytes, &pos);
-        _ = ser.readI32(request_bytes, &pos); // timeout_ms
+        var pos = body_start;
+        var req = Req.deserialize(self.allocator, request_bytes, &pos, api_version) catch |err| {
+            log.warn("Malformed Produce request: {}", .{err});
+            return null;
+        };
+        defer self.freeProduceRequest(&req);
 
         // acks=-1 semantics — in single-node mode, self is the only ISR member,
         // so acks=-1 (all replicas) behaves identically to acks=1.
-        if (acks == -1 and self.default_replication_factor > 1) {
+        if (req.acks == -1 and self.default_replication_factor > 1) {
             log.warn("acks=-1 with replication_factor={d}: single-node mode treats as acks=1", .{self.default_replication_factor});
         }
 
-        // Topics array
-        const num_topics = if (flexible)
-            (ser.readCompactArrayLen(request_bytes, &pos) catch return null) orelse 0
-        else
-            @as(usize, @intCast(@max(ser.readI32(request_bytes, &pos), 0)));
-
-        // Build response — right-sized for typical produce responses.
-        const produce_resp_size = @max(@as(usize, 128), 16 + num_topics * (20 + 6 * 30));
-        const resp_buf = self.allocator.alloc(u8, produce_resp_size) catch return null;
-        var resp_buf_owned = true;
-        defer if (resp_buf_owned) self.allocator.free(resp_buf);
-
-        var wpos: usize = 0;
-        const resp_header = ResponseHeader{ .correlation_id = req_header.correlation_id };
-        resp_header.serialize(resp_buf, &wpos, resp_header_version);
-
-        // Responses array header
-        if (flexible) {
-            ser.writeCompactArrayLen(resp_buf, &wpos, num_topics);
-        } else {
-            ser.writeArrayLen(resp_buf, &wpos, num_topics);
+        var responses: []TopicResult = &.{};
+        if (req.topic_data.len > 0) {
+            responses = self.allocator.alloc(TopicResult, req.topic_data.len) catch return null;
+        }
+        var responses_init: usize = 0;
+        defer {
+            self.freeProduceResponseTopics(responses[0..responses_init]);
+            if (responses.len > 0) self.allocator.free(responses);
         }
 
         var object_metadata_dirty = false;
         var partition_state_dirty = false;
-        for (0..num_topics) |_| {
-            // Read topic name
-            const topic_name = if (flexible)
-                (ser.readCompactString(request_bytes, &pos) catch return null) orelse ""
-            else
-                (ser.readString(request_bytes, &pos) catch return null) orelse "";
-
-            // Write topic name in response
-            if (flexible) {
-                ser.writeCompactString(resp_buf, &wpos, topic_name);
-            } else {
-                ser.writeString(resp_buf, &wpos, topic_name);
-            }
-
-            // Partitions array
-            const num_partitions = if (flexible)
-                (ser.readCompactArrayLen(request_bytes, &pos) catch return null) orelse 0
-            else blk: {
-                if (pos + 4 > request_bytes.len) return null;
-                break :blk @as(usize, @intCast(@max(ser.readI32(request_bytes, &pos), 0)));
-            };
-
-            if (flexible) {
-                ser.writeCompactArrayLen(resp_buf, &wpos, num_partitions);
-            } else {
-                ser.writeArrayLen(resp_buf, &wpos, num_partitions);
-            }
-
-            for (0..num_partitions) |_| {
-                if (pos + 4 > request_bytes.len) return null;
-                const partition_idx = ser.readI32(request_bytes, &pos);
-
-                // Read records (bytes)
-                const records = if (flexible)
-                    (ser.readCompactBytes(request_bytes, &pos) catch return null)
-                else
-                    (ser.readBytes(request_bytes, &pos) catch return null);
-
-                // Idempotent producer dedup + CRC validation
-                var is_duplicate = false;
-                var crc_valid = true;
-                if (records) |rec| {
-                    if (rec.len >= 53) { // Minimum V2 record batch header
-                        const rec_batch = protocol.record_batch;
-                        const crc32c = @import("core").crc32c;
-                        const batch_header = rec_batch.RecordBatchHeader.parse(rec) catch null;
-                        if (batch_header) |hdr| {
-                            // CRC-32C validation: covers bytes from attributes (offset 21) to end
-                            if (hdr.crc != 0 and rec.len > 21) {
-                                const computed_crc = crc32c.compute(rec[21..]);
-                                if (computed_crc != @as(u32, @bitCast(hdr.crc))) {
-                                    crc_valid = false;
-                                    log.warn("CRC mismatch on produce: expected={x} computed={x}", .{
-                                        @as(u32, @bitCast(hdr.crc)), computed_crc,
-                                    });
-                                }
-                            }
-
-                            // Idempotent dedup
-                            if (hdr.producer_id >= 0) {
-                                const pk = ProducerKey{
-                                    .producer_id = hdr.producer_id,
-                                    .partition_key = PartitionStore.hashPartitionKey(topic_name, partition_idx),
-                                };
-                                if (self.producer_sequences.get(pk)) |stored| {
-                                    if (hdr.producer_epoch < stored.producer_epoch) {
-                                        // Stale epoch — producer was fenced
-                                        is_duplicate = true; // Reject stale-epoch records
-                                    } else if (hdr.producer_epoch > stored.producer_epoch) {
-                                        // New epoch — accept (producer restarted)
-                                    } else {
-                                        // Same epoch — check sequence
-                                        if (hdr.base_sequence <= stored.last_sequence) {
-                                            is_duplicate = true;
-                                        }
-                                    }
-                                }
-                                if (!is_duplicate) {
-                                    self.producer_sequences.put(pk, .{
-                                        .last_sequence = hdr.base_sequence,
-                                        .producer_epoch = hdr.producer_epoch,
-                                    }) catch {};
-                                    self.producer_sequences_dirty = true;
-                                }
-                            }
-                        }
-                    }
-                }
-
-                // Auto-create topic if needed
-                _ = self.ensureTopic(topic_name);
-                object_metadata_dirty = true;
-
-                // Actually produce (skip if duplicate or CRC invalid)
-                var was_wal_fenced = false;
-                var was_storage_error = false;
-                const produce_result = if (is_duplicate or !crc_valid)
-                    null
-                else if (records) |rec|
-                    self.store.produce(topic_name, partition_idx, rec) catch |err| blk: {
-                        // Map storage errors to proper Kafka error codes
-                        if (err == error.MessageTooLarge) {
-                            log.warn("Record batch too large for {s}-{d}", .{ topic_name, partition_idx });
-                        } else if (err == error.WalFenced) {
-                            log.warn("WAL fenced: rejecting produce to {s}-{d} (broker is no longer leader)", .{ topic_name, partition_idx });
-                            was_wal_fenced = true;
-                        } else if (err == error.S3WalFlushFailed or err == error.S3StorageUnavailable) {
-                            log.warn("S3 WAL storage error for {s}-{d}: {}", .{ topic_name, partition_idx, err });
-                            was_storage_error = true;
-                        }
-                        break :blk null;
-                    }
-                else
-                    null;
-
-                // Detect MessageTooLarge specifically for proper error code
-                const produce_error_code: i16 = if (is_duplicate)
-                    0 // idempotent success
-                else if (!crc_valid)
-                    2 // CORRUPT_MESSAGE
-                else if (produce_result != null)
-                    0 // success
-                else if (was_wal_fenced)
-                    6 // NOT_LEADER_OR_FOLLOWER — tells client to find the new leader
-                else if (was_storage_error)
-                    56 // KAFKA_STORAGE_ERROR
-                else if (records) |rec| blk: {
-                    if (rec.len > 1048576) break :blk 10; // MESSAGE_TOO_LARGE
-                    break :blk 1; // OFFSET_OUT_OF_RANGE (generic failure)
-                } else 1; // OFFSET_OUT_OF_RANGE
-
-                // Notify delayed fetches when new data arrives
-                if (produce_result != null) {
-                    self.checkDelayedFetchesForPartition(topic_name, partition_idx);
-                    object_metadata_dirty = true;
-                    partition_state_dirty = true;
-                }
-
-                // Write partition response with proper error codes
-                ser.writeI32(resp_buf, &wpos, partition_idx); // index
-                if (is_duplicate) {
-                    // Duplicate detection — return success (idempotent)
-                    ser.writeI16(resp_buf, &wpos, 0);
-                    ser.writeI64(resp_buf, &wpos, -1);
-                    if (api_version >= 2) ser.writeI64(resp_buf, &wpos, -1);
-                    if (api_version >= 5) ser.writeI64(resp_buf, &wpos, -1);
-                } else if (produce_result) |result| {
-                    ser.writeI16(resp_buf, &wpos, 0); // no error
-                    ser.writeI64(resp_buf, &wpos, result.base_offset);
-                    if (api_version >= 2) ser.writeI64(resp_buf, &wpos, result.log_append_time_ms);
-                    if (api_version >= 5) ser.writeI64(resp_buf, &wpos, result.log_start_offset);
-                } else {
-                    ser.writeI16(resp_buf, &wpos, produce_error_code);
-                    ser.writeI64(resp_buf, &wpos, -1);
-                    if (api_version >= 2) ser.writeI64(resp_buf, &wpos, -1);
-                    if (api_version >= 5) ser.writeI64(resp_buf, &wpos, -1);
-                }
-
-                if (api_version >= 8) {
-                    // RecordErrors (empty) + ErrorMessage (null)
-                    if (flexible) {
-                        ser.writeCompactArrayLen(resp_buf, &wpos, 0);
-                        ser.writeCompactString(resp_buf, &wpos, null);
-                    } else {
-                        ser.writeArrayLen(resp_buf, &wpos, 0);
-                        ser.writeString(resp_buf, &wpos, null);
-                    }
-                }
-
-                if (flexible) ser.writeEmptyTaggedFields(resp_buf, &wpos);
-            }
-
-            if (flexible) {
-                ser.skipTaggedFields(request_bytes, &pos) catch {};
-                ser.writeEmptyTaggedFields(resp_buf, &wpos);
-            }
+        for (req.topic_data) |topic_req| {
+            responses[responses_init] = self.buildProduceTopicResponse(topic_req, &object_metadata_dirty, &partition_state_dirty) catch return null;
+            responses_init += 1;
         }
 
         // ThrottleTimeMs (v1+) — enforce produce quotas
+        var throttle_time_ms: i32 = 0;
         if (api_version >= 1) {
             const client_id_str = req_header.client_id orelse "unknown";
-            const throttle = self.quota_manager.recordProduce(client_id_str, request_bytes.len);
-            ser.writeI32(resp_buf, &wpos, throttle);
+            throttle_time_ms = self.quota_manager.recordProduce(client_id_str, request_bytes.len);
             // Track throttle metrics
-            if (throttle > 0) {
+            if (throttle_time_ms > 0) {
                 self.metrics.incrementCounter("kafka_server_produce_throttle_total");
-                log.debug("Produce throttled {d}ms for client {s}", .{ throttle, client_id_str });
+                log.debug("Produce throttled {d}ms for client {s}", .{ throttle_time_ms, client_id_str });
             }
         }
 
-        if (flexible) {
-            ser.skipTaggedFields(request_bytes, &pos) catch {};
-            ser.writeEmptyTaggedFields(resp_buf, &wpos);
-        }
-
-        log.debug("Produce: {d} topics, acks={d}, response {d} bytes", .{ num_topics, acks, wpos });
+        log.debug("Produce: {d} topics, acks={d}", .{ req.topic_data.len, req.acks });
         if (partition_state_dirty) self.persistPartitionStates();
         if (object_metadata_dirty) self.persistObjectManagerSnapshot();
 
         // acks=0: fire-and-forget — don't send a response
-        if (acks == 0) {
-            // resp_buf_owned is true, defer will free resp_buf
+        if (req.acks == 0) {
             return null;
         }
 
-        // Transfer ownership to caller: shrink to exact size needed.
-        // realloc cannot fail when shrinking with the GPA, but if it somehow
-        // does the defer will free resp_buf and we return null (no response).
-        const result = self.allocator.realloc(resp_buf, wpos) catch return null;
-        resp_buf_owned = false;
-        return result;
+        const resp = Resp{
+            .responses = responses[0..responses_init],
+            .throttle_time_ms = throttle_time_ms,
+        };
+        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+    }
+
+    fn freeProduceRequest(self: *Broker, req: *const generated.produce_request.ProduceRequest) void {
+        for (req.topic_data) |topic| {
+            if (topic.partition_data.len > 0) self.allocator.free(topic.partition_data);
+        }
+        if (req.topic_data.len > 0) self.allocator.free(req.topic_data);
+    }
+
+    fn freeProduceResponseTopics(self: *Broker, topics: []const generated.produce_response.ProduceResponse.TopicProduceResponse) void {
+        for (topics) |topic| {
+            if (topic.partition_responses.len > 0) self.allocator.free(topic.partition_responses);
+        }
+    }
+
+    fn buildProduceTopicResponse(self: *Broker, topic_req: generated.produce_request.ProduceRequest.TopicProduceData, object_metadata_dirty: *bool, partition_state_dirty: *bool) !generated.produce_response.ProduceResponse.TopicProduceResponse {
+        const Resp = generated.produce_response.ProduceResponse;
+        const PartitionResult = Resp.TopicProduceResponse.PartitionProduceResponse;
+
+        var partitions: []PartitionResult = &.{};
+        if (topic_req.partition_data.len > 0) {
+            partitions = try self.allocator.alloc(PartitionResult, topic_req.partition_data.len);
+        }
+        errdefer if (partitions.len > 0) self.allocator.free(partitions);
+
+        const topic_name = topic_req.name orelse "";
+        for (topic_req.partition_data, 0..) |partition_req, partition_index| {
+            partitions[partition_index] = self.buildProducePartitionResponse(topic_name, partition_req, object_metadata_dirty, partition_state_dirty);
+        }
+
+        return .{
+            .name = topic_req.name,
+            .partition_responses = partitions,
+        };
+    }
+
+    fn buildProducePartitionResponse(self: *Broker, topic_name: []const u8, partition_req: generated.produce_request.ProduceRequest.TopicProduceData.PartitionProduceData, object_metadata_dirty: *bool, partition_state_dirty: *bool) generated.produce_response.ProduceResponse.TopicProduceResponse.PartitionProduceResponse {
+        // Idempotent producer dedup + CRC validation
+        var is_duplicate = false;
+        var crc_valid = true;
+        if (partition_req.records) |rec| {
+            if (rec.len >= 53) { // Minimum V2 record batch header
+                const rec_batch = protocol.record_batch;
+                const crc32c = @import("core").crc32c;
+                const batch_header = rec_batch.RecordBatchHeader.parse(rec) catch null;
+                if (batch_header) |hdr| {
+                    // CRC-32C validation: covers bytes from attributes (offset 21) to end
+                    if (hdr.crc != 0 and rec.len > 21) {
+                        const computed_crc = crc32c.compute(rec[21..]);
+                        if (computed_crc != @as(u32, @bitCast(hdr.crc))) {
+                            crc_valid = false;
+                            log.warn("CRC mismatch on produce: expected={x} computed={x}", .{
+                                @as(u32, @bitCast(hdr.crc)), computed_crc,
+                            });
+                        }
+                    }
+
+                    // Idempotent dedup
+                    if (hdr.producer_id >= 0) {
+                        const pk = ProducerKey{
+                            .producer_id = hdr.producer_id,
+                            .partition_key = PartitionStore.hashPartitionKey(topic_name, partition_req.index),
+                        };
+                        if (self.producer_sequences.get(pk)) |stored| {
+                            if (hdr.producer_epoch < stored.producer_epoch) {
+                                // Stale epoch — producer was fenced
+                                is_duplicate = true; // Reject stale-epoch records
+                            } else if (hdr.producer_epoch > stored.producer_epoch) {
+                                // New epoch — accept (producer restarted)
+                            } else {
+                                // Same epoch — check sequence
+                                if (hdr.base_sequence <= stored.last_sequence) {
+                                    is_duplicate = true;
+                                }
+                            }
+                        }
+                        if (!is_duplicate) {
+                            self.producer_sequences.put(pk, .{
+                                .last_sequence = hdr.base_sequence,
+                                .producer_epoch = hdr.producer_epoch,
+                            }) catch {};
+                            self.producer_sequences_dirty = true;
+                        }
+                    }
+                }
+            }
+        }
+
+        // Auto-create topic if needed
+        _ = self.ensureTopic(topic_name);
+        object_metadata_dirty.* = true;
+
+        // Actually produce (skip if duplicate or CRC invalid)
+        var was_wal_fenced = false;
+        var was_storage_error = false;
+        const produce_result = if (is_duplicate or !crc_valid)
+            null
+        else if (partition_req.records) |rec|
+            self.store.produce(topic_name, partition_req.index, rec) catch |err| blk: {
+                // Map storage errors to proper Kafka error codes
+                if (err == error.MessageTooLarge) {
+                    log.warn("Record batch too large for {s}-{d}", .{ topic_name, partition_req.index });
+                } else if (err == error.WalFenced) {
+                    log.warn("WAL fenced: rejecting produce to {s}-{d} (broker is no longer leader)", .{ topic_name, partition_req.index });
+                    was_wal_fenced = true;
+                } else if (err == error.S3WalFlushFailed or err == error.S3StorageUnavailable) {
+                    log.warn("S3 WAL storage error for {s}-{d}: {}", .{ topic_name, partition_req.index, err });
+                    was_storage_error = true;
+                }
+                break :blk null;
+            }
+        else
+            null;
+
+        // Detect MessageTooLarge specifically for proper error code
+        const produce_error_code: i16 = if (is_duplicate)
+            @intFromEnum(ErrorCode.none) // idempotent success
+        else if (!crc_valid)
+            @intFromEnum(ErrorCode.corrupt_message)
+        else if (produce_result != null)
+            @intFromEnum(ErrorCode.none)
+        else if (was_wal_fenced)
+            @intFromEnum(ErrorCode.not_leader_or_follower)
+        else if (was_storage_error)
+            @intFromEnum(ErrorCode.kafka_storage_error)
+        else if (partition_req.records) |rec| blk: {
+            if (rec.len > 1048576) break :blk @intFromEnum(ErrorCode.message_too_large);
+            break :blk @intFromEnum(ErrorCode.offset_out_of_range);
+        } else @intFromEnum(ErrorCode.offset_out_of_range);
+
+        // Notify delayed fetches when new data arrives
+        if (produce_result != null) {
+            self.checkDelayedFetchesForPartition(topic_name, partition_req.index);
+            object_metadata_dirty.* = true;
+            partition_state_dirty.* = true;
+        }
+
+        if (is_duplicate) {
+            return .{
+                .index = partition_req.index,
+                .error_code = @intFromEnum(ErrorCode.none),
+                .base_offset = -1,
+                .log_append_time_ms = -1,
+                .log_start_offset = -1,
+                .record_errors = &.{},
+                .error_message = null,
+            };
+        }
+
+        if (produce_result) |result| {
+            return .{
+                .index = partition_req.index,
+                .error_code = @intFromEnum(ErrorCode.none),
+                .base_offset = result.base_offset,
+                .log_append_time_ms = result.log_append_time_ms,
+                .log_start_offset = result.log_start_offset,
+                .record_errors = &.{},
+                .error_message = null,
+            };
+        }
+
+        return .{
+            .index = partition_req.index,
+            .error_code = produce_error_code,
+            .base_offset = -1,
+            .log_append_time_ms = -1,
+            .log_start_offset = -1,
+            .record_errors = &.{},
+            .error_message = null,
+        };
     }
 
     // ---------------------------------------------------------------
@@ -7806,6 +7778,29 @@ pub const Broker = struct {
         return true;
     }
 
+    fn validateProduceRequestFrame(buf: []const u8, start_pos: usize, api_version: i16) bool {
+        const flexible = api_version >= 9;
+        var pos = start_pos;
+
+        if (api_version >= 3 and !skipKafkaString(buf, &pos, flexible)) return false; // transactional_id
+        if (!skipFixedBytes(buf, &pos, 6)) return false; // acks + timeout_ms
+
+        const topic_count = readKafkaArrayCount(buf, &pos, flexible) orelse return false;
+        for (0..topic_count) |_| {
+            if (!skipKafkaString(buf, &pos, flexible)) return false; // topic name
+            const partition_count = readKafkaArrayCount(buf, &pos, flexible) orelse return false;
+            for (0..partition_count) |_| {
+                if (!skipFixedBytes(buf, &pos, 4)) return false; // partition_index
+                if (!skipKafkaBytes(buf, &pos, flexible)) return false; // records
+                if (flexible) ser.skipTaggedFields(buf, &pos) catch return false;
+            }
+            if (flexible) ser.skipTaggedFields(buf, &pos) catch return false;
+        }
+
+        if (flexible) ser.skipTaggedFields(buf, &pos) catch return false;
+        return true;
+    }
+
     fn validateSaslHandshakeRequestFrame(buf: []const u8, start_pos: usize) bool {
         var pos = start_pos;
         return skipKafkaString(buf, &pos, false);
@@ -8944,6 +8939,16 @@ fn freeDeserializedMetadataResponse(resp: *const generated.metadata_response.Met
     if (resp.topics.len > 0) testing.allocator.free(resp.topics);
 }
 
+fn freeDeserializedProduceResponse(resp: *const generated.produce_response.ProduceResponse) void {
+    for (resp.responses) |topic| {
+        for (topic.partition_responses) |partition| {
+            if (partition.record_errors.len > 0) testing.allocator.free(partition.record_errors);
+        }
+        if (topic.partition_responses.len > 0) testing.allocator.free(topic.partition_responses);
+    }
+    if (resp.responses.len > 0) testing.allocator.free(resp.responses);
+}
+
 fn expectApiVersionsResponseMatchesCatalog(response: []const u8, api_version: i16, correlation_id: i32) !void {
     const Resp = generated.api_versions_response.ApiVersionsResponse;
     const body_version: i16 = @min(api_version, 4);
@@ -9353,22 +9358,20 @@ test "Broker.handleRequest SaslAuthenticate rejects truncated request" {
     try testing.expect(broker.handleRequest(buf[0..req_len]) == null);
 }
 
-test "Broker.handleRequest Produce v0 minimal" {
+test "Broker.handleRequest Produce v0 returns generated response" {
+    const Resp = generated.produce_response.ProduceResponse;
+
     var broker = Broker.init(testing.allocator, 1, 9092);
     defer broker.deinit();
 
     var buf: [512]u8 = undefined;
-    var pos = buildTestRequest(&buf, 0, 0, 300, 1);
-    // Produce v0 body: acks(i16) + timeout(i32) + topics array
+    var pos = buildTestRequest(&buf, 0, 0, 300, header_mod.requestHeaderVersion(0, 0));
     ser.writeI16(&buf, &pos, 1); // acks = 1
-    ser.writeI32(&buf, &pos, 30000); // timeout_ms
-    // topics array: 1 topic
+    ser.writeI32(&buf, &pos, 30000);
     ser.writeI32(&buf, &pos, 1);
     ser.writeString(&buf, &pos, "test-topic");
-    // partitions array: 1 partition
     ser.writeI32(&buf, &pos, 1);
     ser.writeI32(&buf, &pos, 0); // partition_index
-    // records (bytes): put some dummy data
     const fake_records = "fake-record-batch-data";
     ser.writeI32(&buf, &pos, @intCast(fake_records.len));
     @memcpy(buf[pos .. pos + fake_records.len], fake_records);
@@ -9379,8 +9382,76 @@ test "Broker.handleRequest Produce v0 minimal" {
     defer testing.allocator.free(response.?);
 
     var rpos: usize = 0;
-    const corr_id = ser.readI32(response.?, &rpos);
-    try testing.expectEqual(@as(i32, 300), corr_id);
+    var response_header = try ResponseHeader.deserialize(testing.allocator, response.?, &rpos, header_mod.responseHeaderVersion(0, 0));
+    defer response_header.deinit(testing.allocator);
+    try testing.expectEqual(@as(i32, 300), response_header.correlation_id);
+
+    const resp = try Resp.deserialize(testing.allocator, response.?, &rpos, 0);
+    defer freeDeserializedProduceResponse(&resp);
+
+    try testing.expectEqual(response.?.len, rpos);
+    try testing.expectEqual(@as(usize, 1), resp.responses.len);
+    try testing.expectEqualStrings("test-topic", resp.responses[0].name.?);
+    try testing.expectEqual(@as(usize, 1), resp.responses[0].partition_responses.len);
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.none)), resp.responses[0].partition_responses[0].error_code);
+    try testing.expectEqual(@as(i64, 0), resp.responses[0].partition_responses[0].base_offset);
+}
+
+test "Broker.handleRequest Produce v9 returns generated flexible response" {
+    const Req = generated.produce_request.ProduceRequest;
+    const Topic = Req.TopicProduceData;
+    const Partition = Topic.PartitionProduceData;
+    const Resp = generated.produce_response.ProduceResponse;
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+
+    const records = "flex-records";
+    const partitions = [_]Partition{.{
+        .index = 0,
+        .records = records,
+    }};
+    const topics = [_]Topic{.{
+        .name = "produce-v9-topic",
+        .partition_data = &partitions,
+    }};
+    const req = Req{
+        .transactional_id = null,
+        .acks = 1,
+        .timeout_ms = 30000,
+        .topic_data = &topics,
+    };
+
+    var buf: [512]u8 = undefined;
+    var pos = buildTestRequest(&buf, 0, 9, 309, header_mod.requestHeaderVersion(0, 9));
+    req.serialize(&buf, &pos, 9);
+
+    const response = broker.handleRequest(buf[0..pos]);
+    try testing.expect(response != null);
+    defer testing.allocator.free(response.?);
+
+    var rpos: usize = 0;
+    var response_header = try ResponseHeader.deserialize(testing.allocator, response.?, &rpos, header_mod.responseHeaderVersion(0, 9));
+    defer response_header.deinit(testing.allocator);
+    try testing.expectEqual(@as(i32, 309), response_header.correlation_id);
+
+    const resp = try Resp.deserialize(testing.allocator, response.?, &rpos, 9);
+    defer freeDeserializedProduceResponse(&resp);
+
+    try testing.expectEqual(response.?.len, rpos);
+    try testing.expectEqual(@as(usize, 1), resp.responses.len);
+    try testing.expectEqualStrings("produce-v9-topic", resp.responses[0].name.?);
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.none)), resp.responses[0].partition_responses[0].error_code);
+    try testing.expectEqual(@as(i32, 0), resp.throttle_time_ms);
+}
+
+test "Broker.handleRequest Produce rejects truncated request" {
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+
+    var buf: [128]u8 = undefined;
+    const req_len = buildTestRequest(&buf, 0, 9, 310, header_mod.requestHeaderVersion(0, 9));
+    try testing.expect(broker.handleRequest(buf[0..req_len]) == null);
 }
 
 test "Broker.handleRequest ListGroups v4 returns generated filtered groups" {
