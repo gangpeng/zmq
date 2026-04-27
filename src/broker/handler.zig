@@ -1599,6 +1599,8 @@ pub const Broker = struct {
             0, 1 => return 0,
             // Metadata (3) — no top-level error_code
             3 => return 0,
+            // WriteTxnMarkers (27) — marker/partition-scoped errors only
+            27 => return 0,
             // These APIs have a top-level error_code at this position
             10, 11, 12, 13, 14, 18, 22, 25, 26 => {},
             // Other APIs — attempt extraction but don't fail
@@ -5137,94 +5139,168 @@ pub const Broker = struct {
     // WriteTxnMarkers (key 27) — Write actual control batches
     // ---------------------------------------------------------------
     fn handleWriteTxnMarkers(self: *Broker, request_bytes: []const u8, body_start: usize, req_header: *const RequestHeader, api_version: i16, resp_header_version: i16) ?[]u8 {
-        _ = api_version;
+        const Req = generated.write_txn_markers_request.WriteTxnMarkersRequest;
+        const Resp = generated.write_txn_markers_response.WriteTxnMarkersResponse;
+        const MarkerResult = Resp.WritableTxnMarkerResult;
+        const TopicResult = MarkerResult.WritableTxnMarkerTopicResult;
+        const PartitionResult = TopicResult.WritableTxnMarkerPartitionResult;
+
+        if (!validateWriteTxnMarkersRequestFrame(request_bytes, body_start, api_version)) {
+            log.warn("Malformed WriteTxnMarkers request", .{});
+            return null;
+        }
+
         var pos = body_start;
-        const num_markers = (ser.readArrayLen(request_bytes, &pos) catch 0) orelse 0;
+        var req = Req.deserialize(self.allocator, request_bytes, &pos, api_version) catch |err| {
+            log.warn("Failed to decode WriteTxnMarkers request: {}", .{err});
+            return null;
+        };
+        defer self.freeWriteTxnMarkersRequest(&req);
 
-        var buf = self.allocator.alloc(u8, 2048) catch return null;
-        var wpos: usize = 0;
-        const rh = ResponseHeader{ .correlation_id = req_header.correlation_id };
-        rh.serialize(buf, &wpos, resp_header_version);
-        ser.writeArrayLen(buf, &wpos, num_markers);
+        const markers = self.allocator.alloc(MarkerResult, req.markers.len) catch return null;
+        var markers_init: usize = 0;
+        defer {
+            self.freeWriteTxnMarkersResults(markers[0..markers_init]);
+            if (markers.len > 0) self.allocator.free(markers);
+        }
 
-        for (0..num_markers) |_| {
-            const producer_id = ser.readI64(request_bytes, &pos);
-            const producer_epoch = ser.readI16(request_bytes, &pos);
-            const committed = ser.readBool(request_bytes, &pos) catch false;
+        var partition_state_dirty = false;
+        for (req.markers) |marker| {
+            const topics = self.allocator.alloc(TopicResult, marker.topics.len) catch return null;
+            var topics_init: usize = 0;
+            var topics_transferred = false;
+            defer {
+                if (!topics_transferred) {
+                    self.freeWriteTxnMarkerTopicResults(topics[0..topics_init]);
+                    if (topics.len > 0) self.allocator.free(topics);
+                }
+            }
 
-            // Write markers for each topic-partition
-            const num_topics = (ser.readArrayLen(request_bytes, &pos) catch 0) orelse 0;
+            for (marker.topics) |topic_req| {
+                const partitions = self.allocator.alloc(PartitionResult, topic_req.partition_indexes.len) catch return null;
+                var partitions_transferred = false;
+                defer if (!partitions_transferred and partitions.len > 0) self.allocator.free(partitions);
 
-            // Actually write control record batches to each partition
-            // before transitioning state, not just updating the coordinator.
-            const control_type: TxnCoordinator.ControlRecordType = if (committed) .commit else .abort;
-            var partition_state_dirty = false;
-            if (self.txn_coordinator.getPartitions(producer_id)) |partitions| {
-                for (partitions) |tp| {
-                    const pkey = std.fmt.allocPrint(self.allocator, "{s}-{d}", .{ tp.topic, tp.partition }) catch continue;
-                    defer self.allocator.free(pkey);
-                    const base_off: i64 = if (self.store.partitions.get(pkey)) |state|
-                        @intCast(state.next_offset)
-                    else
-                        0;
-
-                    const control_batch = self.txn_coordinator.buildControlBatch(
-                        producer_id,
-                        producer_epoch,
-                        control_type,
-                        base_off,
-                    ) catch continue;
-                    defer self.allocator.free(control_batch);
-
-                    // Write the control batch to the partition store
-                    _ = self.store.produce(tp.topic, tp.partition, control_batch) catch |err| {
-                        log.warn("Principle 7: Failed to write control batch for {s}-{d}: {}", .{ tp.topic, tp.partition, err });
-                        continue;
+                const topic = topic_req.name orelse "";
+                for (topic_req.partition_indexes, 0..) |partition_index, partition_idx| {
+                    const write_result = self.writeTxnMarkerPartition(marker, topic, partition_index);
+                    partitions[partition_idx] = .{
+                        .partition_index = partition_index,
+                        .error_code = write_result.error_code,
                     };
-                    partition_state_dirty = true;
+                    if (write_result.mutated) partition_state_dirty = true;
                 }
 
-                // Clear LSO on each partition after writing markers
-                // NOTE: AutoMQ/Kafka advances LSO after control batch markers are written.
-                // Must happen before writeTxnMarkers() which clears the partition list.
-                for (partitions) |tp| {
-                    const lso_key = std.fmt.allocPrint(self.allocator, "{s}-{d}", .{ tp.topic, tp.partition }) catch continue;
-                    defer self.allocator.free(lso_key);
-                    if (self.store.partitions.getPtr(lso_key)) |pstate| {
-                        pstate.first_unstable_txn_offset = null;
-                        pstate.last_stable_offset = pstate.high_watermark;
-                        partition_state_dirty = true;
-                    }
-                }
-            }
-            if (partition_state_dirty) {
-                self.persistPartitionStates();
-                self.persistObjectManagerSnapshot();
+                topics[topics_init] = .{
+                    .name = topic_req.name,
+                    .partitions = partitions,
+                };
+                topics_init += 1;
+                partitions_transferred = true;
             }
 
-            // Now complete the state transition
-            _ = self.txn_coordinator.writeTxnMarkers(producer_id);
+            const coordinator_error = self.completeLocalWriteTxnMarkerState(marker.producer_id);
+            if (coordinator_error != @intFromEnum(ErrorCode.none)) {
+                applyWriteTxnMarkerError(topics[0..topics_init], coordinator_error);
+            }
 
-            ser.writeI64(buf, &wpos, producer_id);
-            ser.writeArrayLen(buf, &wpos, num_topics);
+            markers[markers_init] = .{
+                .producer_id = marker.producer_id,
+                .topics = topics[0..topics_init],
+            };
+            markers_init += 1;
+            topics_transferred = true;
+        }
 
-            for (0..num_topics) |_| {
-                const topic = (ser.readString(request_bytes, &pos) catch break) orelse "";
-                const num_parts = (ser.readArrayLen(request_bytes, &pos) catch 0) orelse 0;
+        if (partition_state_dirty) {
+            self.persistPartitionStates();
+            self.persistObjectManagerSnapshot();
+        }
 
-                ser.writeString(buf, &wpos, topic);
-                ser.writeArrayLen(buf, &wpos, num_parts);
+        const resp = Resp{ .markers = markers[0..markers_init] };
+        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+    }
 
-                for (0..num_parts) |_| {
-                    const partition = ser.readI32(request_bytes, &pos);
-                    ser.writeI32(buf, &wpos, partition);
-                    ser.writeI16(buf, &wpos, 0); // error_code = NONE
+    fn freeWriteTxnMarkersRequest(self: *Broker, req: *generated.write_txn_markers_request.WriteTxnMarkersRequest) void {
+        for (req.markers) |marker| {
+            for (marker.topics) |topic| {
+                if (topic.partition_indexes.len > 0) self.allocator.free(topic.partition_indexes);
+            }
+            if (marker.topics.len > 0) self.allocator.free(marker.topics);
+        }
+        if (req.markers.len > 0) self.allocator.free(req.markers);
+    }
+
+    fn freeWriteTxnMarkersResults(self: *Broker, markers: []const generated.write_txn_markers_response.WriteTxnMarkersResponse.WritableTxnMarkerResult) void {
+        for (markers) |marker| {
+            self.freeWriteTxnMarkerTopicResults(marker.topics);
+            if (marker.topics.len > 0) self.allocator.free(marker.topics);
+        }
+    }
+
+    fn freeWriteTxnMarkerTopicResults(self: *Broker, topics: []const generated.write_txn_markers_response.WriteTxnMarkersResponse.WritableTxnMarkerResult.WritableTxnMarkerTopicResult) void {
+        for (topics) |topic| {
+            if (topic.partitions.len > 0) self.allocator.free(topic.partitions);
+        }
+    }
+
+    const TxnMarkerPartitionWriteResult = struct {
+        error_code: i16,
+        mutated: bool = false,
+    };
+
+    fn writeTxnMarkerPartition(self: *Broker, marker: generated.write_txn_markers_request.WriteTxnMarkersRequest.WritableTxnMarker, topic: []const u8, partition_index: i32) TxnMarkerPartitionWriteResult {
+        if (topic.len == 0 or partition_index < 0) {
+            return .{ .error_code = @intFromEnum(ErrorCode.invalid_request) };
+        }
+
+        const control_type: TxnCoordinator.ControlRecordType = if (marker.transaction_result) .commit else .abort;
+        const base_offset = if (self.partitionState(topic, partition_index)) |state| clampU64ToI64(state.next_offset) else 0;
+        const control_batch = self.txn_coordinator.buildControlBatch(
+            marker.producer_id,
+            marker.producer_epoch,
+            control_type,
+            base_offset,
+        ) catch |err| {
+            log.warn("Failed to build transaction marker batch for {s}-{d}: {}", .{ topic, partition_index, err });
+            return .{ .error_code = @intFromEnum(ErrorCode.kafka_storage_error) };
+        };
+        defer self.allocator.free(control_batch);
+
+        _ = self.store.produce(topic, partition_index, control_batch) catch |err| {
+            log.warn("Failed to write transaction marker batch for {s}-{d}: {}", .{ topic, partition_index, err });
+            return .{ .error_code = @intFromEnum(ErrorCode.kafka_storage_error) };
+        };
+
+        var key_buf: [512]u8 = undefined;
+        const key = std.fmt.bufPrint(&key_buf, "{s}-{d}", .{ topic, partition_index }) catch return .{ .error_code = @intFromEnum(ErrorCode.none), .mutated = true };
+        if (self.store.partitions.getPtr(key)) |pstate| {
+            pstate.first_unstable_txn_offset = null;
+            pstate.last_stable_offset = pstate.high_watermark;
+        }
+
+        return .{
+            .error_code = @intFromEnum(ErrorCode.none),
+            .mutated = true,
+        };
+    }
+
+    fn completeLocalWriteTxnMarkerState(self: *Broker, producer_id: i64) i16 {
+        if (self.txn_coordinator.getStatus(producer_id) == null) {
+            return @intFromEnum(ErrorCode.none);
+        }
+        return self.txn_coordinator.writeTxnMarkers(producer_id);
+    }
+
+    fn applyWriteTxnMarkerError(topics: []generated.write_txn_markers_response.WriteTxnMarkersResponse.WritableTxnMarkerResult.WritableTxnMarkerTopicResult, error_code: i16) void {
+        for (topics) |*topic| {
+            const partitions: []generated.write_txn_markers_response.WriteTxnMarkersResponse.WritableTxnMarkerResult.WritableTxnMarkerTopicResult.WritableTxnMarkerPartitionResult = @constCast(topic.partitions);
+            for (partitions) |*partition| {
+                if (partition.error_code == @intFromEnum(ErrorCode.none)) {
+                    partition.error_code = error_code;
                 }
             }
         }
-
-        if (resp_header_version >= 1) ser.writeEmptyTaggedFields(buf, &wpos);
-        return (self.allocator.realloc(buf, wpos) catch buf)[0..wpos];
     }
 
     // ---------------------------------------------------------------
@@ -6363,6 +6439,26 @@ pub const Broker = struct {
         return true;
     }
 
+    fn validateWriteTxnMarkersRequestFrame(buf: []const u8, start_pos: usize, api_version: i16) bool {
+        const flexible = api_version >= 1;
+        var pos = start_pos;
+
+        const marker_count = readKafkaArrayCount(buf, &pos, flexible) orelse return false;
+        for (0..marker_count) |_| {
+            if (!skipFixedBytes(buf, &pos, 11)) return false; // producer_id + producer_epoch + transaction_result
+            const topic_count = readKafkaArrayCount(buf, &pos, flexible) orelse return false;
+            for (0..topic_count) |_| {
+                if (!skipKafkaString(buf, &pos, flexible)) return false; // topic name
+                if (!skipKafkaI32Array(buf, &pos, flexible)) return false; // partition_indexes
+                if (flexible) ser.skipTaggedFields(buf, &pos) catch return false;
+            }
+            if (!skipFixedBytes(buf, &pos, 4)) return false; // coordinator_epoch
+            if (flexible) ser.skipTaggedFields(buf, &pos) catch return false;
+        }
+        if (flexible) ser.skipTaggedFields(buf, &pos) catch return false;
+        return true;
+    }
+
     fn validateTxnOffsetCommitRequestFrame(buf: []const u8, start_pos: usize, api_version: i16) bool {
         const flexible = api_version >= 3;
         var pos = start_pos;
@@ -7364,6 +7460,83 @@ test "Broker.handleRequest OffsetForLeaderEpoch rejects truncated request" {
 
     var buf: [128]u8 = undefined;
     const req_len = buildTestRequest(&buf, 23, 4, 2305, header_mod.requestHeaderVersion(23, 4));
+    try testing.expect(broker.handleRequest(buf[0..req_len]) == null);
+}
+
+test "Broker.handleRequest WriteTxnMarkers v1 returns generated response and writes control batch" {
+    const Req = generated.write_txn_markers_request.WriteTxnMarkersRequest;
+    const Resp = generated.write_txn_markers_response.WriteTxnMarkersResponse;
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+    try testing.expect(broker.ensureTopic("txn-marker-topic"));
+
+    const init_result = try broker.txn_coordinator.initProducerId("txn-marker");
+    const pid = init_result.producer_id;
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.none)), try broker.txn_coordinator.addPartitionsToTxn(pid, init_result.producer_epoch, "txn-marker-topic", 0));
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.none)), broker.txn_coordinator.endTxn(pid, init_result.producer_epoch, true));
+
+    const partition_indexes = [_]i32{0};
+    const topics = [_]Req.WritableTxnMarker.WritableTxnMarkerTopic{.{
+        .name = "txn-marker-topic",
+        .partition_indexes = &partition_indexes,
+    }};
+    const markers = [_]Req.WritableTxnMarker{.{
+        .producer_id = pid,
+        .producer_epoch = init_result.producer_epoch,
+        .transaction_result = true,
+        .topics = &topics,
+        .coordinator_epoch = 0,
+    }};
+    const req = Req{ .markers = &markers };
+
+    var buf: [512]u8 = undefined;
+    var pos = buildTestRequest(&buf, 27, 1, 2701, header_mod.requestHeaderVersion(27, 1));
+    req.serialize(&buf, &pos, 1);
+
+    const response = broker.handleRequest(buf[0..pos]);
+    try testing.expect(response != null);
+    defer testing.allocator.free(response.?);
+
+    var rpos: usize = 0;
+    var response_header = try ResponseHeader.deserialize(testing.allocator, response.?, &rpos, header_mod.responseHeaderVersion(27, 1));
+    defer response_header.deinit(testing.allocator);
+    try testing.expectEqual(@as(i32, 2701), response_header.correlation_id);
+
+    const resp = try Resp.deserialize(testing.allocator, response.?, &rpos, 1);
+    defer {
+        for (resp.markers) |marker| {
+            for (marker.topics) |topic| {
+                if (topic.partitions.len > 0) testing.allocator.free(topic.partitions);
+            }
+            if (marker.topics.len > 0) testing.allocator.free(marker.topics);
+        }
+        if (resp.markers.len > 0) testing.allocator.free(resp.markers);
+    }
+
+    try testing.expectEqual(response.?.len, rpos);
+    try testing.expectEqual(@as(usize, 1), resp.markers.len);
+    try testing.expectEqual(pid, resp.markers[0].producer_id);
+    try testing.expectEqual(@as(usize, 1), resp.markers[0].topics.len);
+    try testing.expectEqualStrings("txn-marker-topic", resp.markers[0].topics[0].name.?);
+    try testing.expectEqual(@as(usize, 1), resp.markers[0].topics[0].partitions.len);
+    try testing.expectEqual(@as(i32, 0), resp.markers[0].topics[0].partitions[0].partition_index);
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.none)), resp.markers[0].topics[0].partitions[0].error_code);
+    try testing.expectEqual(TxnCoordinator.TxnStatus.complete_commit, broker.txn_coordinator.getStatus(pid).?);
+
+    const state = broker.store.partitions.get("txn-marker-topic-0").?;
+    try testing.expectEqual(@as(u64, 1), state.next_offset);
+    try testing.expectEqual(@as(u64, 1), state.high_watermark);
+    try testing.expectEqual(@as(u64, 1), state.last_stable_offset);
+    try testing.expect(state.first_unstable_txn_offset == null);
+}
+
+test "Broker.handleRequest WriteTxnMarkers rejects truncated request" {
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+
+    var buf: [128]u8 = undefined;
+    const req_len = buildTestRequest(&buf, 27, 1, 2702, header_mod.requestHeaderVersion(27, 1));
     try testing.expect(broker.handleRequest(buf[0..req_len]) == null);
 }
 
