@@ -9442,6 +9442,75 @@ pub const Broker = struct {
     // ---------------------------------------------------------------
     // BeginQuorumEpoch (key 53) — KRaft leader heartbeat
     // ---------------------------------------------------------------
+    fn applyInternalRaftAppendEntriesPayload(self: *Broker, request_bytes: []const u8, pos: *usize) !RaftState.AppendEntriesResponse {
+        const raft = self.raft_state orelse return error.NotController;
+
+        const leader_id = try readRecordI32(request_bytes, pos);
+        const leader_epoch = try readRecordI32(request_bytes, pos);
+
+        if (pos.* == request_bytes.len) {
+            if (leader_epoch >= raft.current_epoch) {
+                if (raft.role == .leader and leader_epoch > raft.current_epoch) {
+                    log.info("Stepping down: received higher epoch {d} from leader {d} (was leader at epoch {d})", .{
+                        leader_epoch, leader_id, raft.current_epoch,
+                    });
+                    if (self.store.s3_wal_batcher) |*batcher| {
+                        batcher.fence();
+                    }
+                }
+                raft.becomeFollower(leader_epoch, leader_id);
+            }
+            return .{ .success = true, .epoch = raft.current_epoch, .match_index = raft.log.lastOffset() };
+        }
+
+        const prev_log_offset_raw = try readRecordI64(request_bytes, pos);
+        const prev_log_epoch = try readRecordI32(request_bytes, pos);
+        const leader_commit_raw = try readRecordI64(request_bytes, pos);
+        const entries_start_index_raw = try readRecordI64(request_bytes, pos);
+        const entry_count_raw = try readRecordI32(request_bytes, pos);
+        if (prev_log_offset_raw < 0 or leader_commit_raw < 0 or entries_start_index_raw < 0 or entry_count_raw < 0) {
+            return error.InvalidAutoMqMetadataRecord;
+        }
+
+        const entry_count: usize = @intCast(entry_count_raw);
+        const entries = try self.allocator.alloc(RaftState.AppendEntry, entry_count);
+        defer self.allocator.free(entries);
+
+        const entries_start_index: u64 = @intCast(entries_start_index_raw);
+        for (entries, 0..) |*entry, i| {
+            const entry_len_raw = try readRecordI32(request_bytes, pos);
+            if (entry_len_raw < 0) return error.InvalidAutoMqMetadataRecord;
+            const entry_len: usize = @intCast(entry_len_raw);
+            if (pos.* + entry_len > request_bytes.len) return error.InvalidAutoMqMetadataRecord;
+            const offset = std.math.add(u64, entries_start_index, @as(u64, @intCast(i))) catch return error.InvalidAutoMqMetadataRecord;
+            entry.* = .{
+                .offset = offset,
+                .epoch = leader_epoch,
+                .data = request_bytes[pos.* .. pos.* + entry_len],
+            };
+            pos.* += entry_len;
+        }
+        if (pos.* != request_bytes.len) return error.InvalidAutoMqMetadataRecord;
+
+        if (raft.role == .leader and leader_epoch > raft.current_epoch) {
+            log.info("Stepping down: received higher epoch {d} from leader {d} (was leader at epoch {d})", .{
+                leader_epoch, leader_id, raft.current_epoch,
+            });
+            if (self.store.s3_wal_batcher) |*batcher| {
+                batcher.fence();
+            }
+        }
+
+        return raft.handleAppendEntries(
+            leader_epoch,
+            leader_id,
+            @intCast(prev_log_offset_raw),
+            prev_log_epoch,
+            entries,
+            @intCast(leader_commit_raw),
+        );
+    }
+
     fn handleBeginQuorumEpoch(self: *Broker, request_bytes: []const u8, start_pos: usize, req_header: *const RequestHeader, api_version: i16, resp_header_version: i16) ?[]u8 {
         const Req = generated.begin_quorum_epoch_request.BeginQuorumEpochRequest;
         const Resp = generated.begin_quorum_epoch_response.BeginQuorumEpochResponse;
@@ -9457,6 +9526,26 @@ pub const Broker = struct {
             return null;
         };
         defer self.freeBeginQuorumEpochRequest(&req);
+
+        if (pos < request_bytes.len) {
+            const append_response = self.applyInternalRaftAppendEntriesPayload(request_bytes, &pos) catch |err| {
+                log.warn("Failed to apply internal AppendEntries payload: {}", .{err});
+                const resp = Resp{
+                    .error_code = switch (err) {
+                        error.NotController => errorCode(.not_controller),
+                        error.InvalidAutoMqMetadataRecord => errorCode(.invalid_request),
+                        else => errorCode(.kafka_storage_error),
+                    },
+                    .topics = &.{},
+                };
+                return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+            };
+            const resp = Resp{
+                .error_code = if (append_response.success) errorCode(.none) else errorCode(.kafka_storage_error),
+                .topics = &.{},
+            };
+            return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+        }
 
         var error_code: i16 = @intFromEnum(ErrorCode.not_controller);
         if (self.raft_state) |raft| {
@@ -13455,6 +13544,54 @@ test "Broker.handleRequest BeginQuorumEpoch returns generated not-controller res
         try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.not_controller)), resp.error_code);
         try testing.expectEqual(@as(usize, 0), resp.topics.len);
     }
+}
+
+test "Broker.handleRequest BeginQuorumEpoch applies internal AutoMQ AppendEntries payload" {
+    const Resp = generated.begin_quorum_epoch_response.BeginQuorumEpochResponse;
+
+    var raft = RaftState.init(testing.allocator, 2, "automq-appendentries");
+    defer raft.deinit();
+    try raft.addVoter(1);
+    try raft.addVoter(2);
+    raft.becomeFollower(1, 1);
+
+    var broker = Broker.init(testing.allocator, 2, 19095);
+    defer broker.deinit();
+    broker.setRaftState(&raft);
+
+    const record = try broker.buildAutoMqPutKvRecord("alpha", "beta");
+    defer broker.allocator.free(record);
+
+    var buf: [2048]u8 = undefined;
+    var pos = buildTestRequest(&buf, 53, 0, 5305, header_mod.requestHeaderVersion(53, 0));
+    ser.writeString(&buf, &pos, "");
+    ser.writeI32(&buf, &pos, 0);
+    ser.writeI32(&buf, &pos, 1); // leader_id
+    ser.writeI32(&buf, &pos, 1); // leader_epoch
+    ser.writeI64(&buf, &pos, 0); // prev_log_offset
+    ser.writeI32(&buf, &pos, 0); // prev_log_epoch
+    ser.writeI64(&buf, &pos, 0); // leader_commit
+    ser.writeI64(&buf, &pos, 0); // entries_start_index
+    ser.writeI32(&buf, &pos, 1); // entry_count
+    ser.writeI32(&buf, &pos, @intCast(record.len));
+    @memcpy(buf[pos .. pos + record.len], record);
+    pos += record.len;
+
+    const response = broker.handleRequest(buf[0..pos]);
+    try testing.expect(response != null);
+    defer testing.allocator.free(response.?);
+
+    var rpos: usize = 0;
+    var response_header = try ResponseHeader.deserialize(testing.allocator, response.?, &rpos, header_mod.responseHeaderVersion(53, 0));
+    defer response_header.deinit(testing.allocator);
+    const resp = try Resp.deserialize(testing.allocator, response.?, &rpos, 0);
+    defer if (resp.topics.len > 0) testing.allocator.free(resp.topics);
+
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.none)), resp.error_code);
+    try testing.expectEqual(@as(usize, 1), raft.log.length());
+    try testing.expectEqual(@as(u64, 0), raft.commit_index);
+    try testing.expectEqual(@as(usize, 1), try broker.replayCommittedAutoMqMetadataRecords());
+    try testing.expectEqualStrings("beta", broker.auto_mq_kvs.get("alpha").?);
 }
 
 test "Broker.handleRequest EndQuorumEpoch returns generated not-controller responses" {

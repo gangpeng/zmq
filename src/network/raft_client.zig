@@ -246,6 +246,7 @@ pub const RaftClient = struct {
         prev_log_offset: i64,
         prev_log_epoch: i32,
         leader_commit: u64,
+        entries_start_index: u64,
         entries: ?[]const []const u8,
     ) !bool {
         self.ensureConnected() catch |err| {
@@ -256,65 +257,98 @@ pub const RaftClient = struct {
         const corr_id = self.next_correlation_id;
         self.next_correlation_id += 1;
 
-        var req_buf: [8192]u8 = undefined;
+        const client_id = "raft-client";
+        var total_len: usize = 4 + 2 + 2 + 4 + ser.stringSize(client_id) + 2 + 4 + 4 + 4 + 8 + 4 + 8 + 8 + 4;
+        if (entries) |ents| {
+            for (ents) |entry_data| {
+                if (entry_data.len > std.math.maxInt(i32)) return error.MessageTooLarge;
+                total_len += 4 + entry_data.len;
+            }
+        }
+
+        var req_buf = try self.allocator.alloc(u8, total_len);
+        defer self.allocator.free(req_buf);
         var pos: usize = 4; // skip frame size
 
         // Use API key 53 (BeginQuorumEpoch) for heartbeats / append entries
         // Request header v1 (non-flexible)
-        ser.writeI16(&req_buf, &pos, 53); // api_key
-        ser.writeI16(&req_buf, &pos, 0); // version
-        ser.writeI32(&req_buf, &pos, corr_id);
-        ser.writeString(&req_buf, &pos, "raft-client");
+        ser.writeI16(req_buf, &pos, 53); // api_key
+        ser.writeI16(req_buf, &pos, 0); // version
+        ser.writeI32(req_buf, &pos, corr_id);
+        ser.writeString(req_buf, &pos, client_id);
 
-        // Body: error_code + topics_count(0) + leader_id + leader_epoch
-        // We repurpose the body to carry append entries metadata
-        ser.writeI16(&req_buf, &pos, 0); // error_code
-        ser.writeI32(&req_buf, &pos, 0); // empty topics array
+        // BeginQuorumEpoch v0 body with empty cluster_id/topics, followed by
+        // ZMQ's internal AppendEntries payload.
+        ser.writeString(req_buf, &pos, ""); // cluster_id
+        ser.writeI32(req_buf, &pos, 0); // empty topics array
 
-        ser.writeI32(&req_buf, &pos, leader_id);
-        ser.writeI32(&req_buf, &pos, leader_epoch);
+        ser.writeI32(req_buf, &pos, leader_id);
+        ser.writeI32(req_buf, &pos, leader_epoch);
         // Extra fields for append entries
-        ser.writeI64(&req_buf, &pos, prev_log_offset);
-        ser.writeI32(&req_buf, &pos, prev_log_epoch);
-        ser.writeI64(&req_buf, &pos, @intCast(leader_commit));
+        ser.writeI64(req_buf, &pos, prev_log_offset);
+        ser.writeI32(req_buf, &pos, prev_log_epoch);
+        ser.writeI64(req_buf, &pos, @intCast(leader_commit));
+        ser.writeI64(req_buf, &pos, @intCast(entries_start_index));
 
         // Write entry count and data
         if (entries) |ents| {
-            ser.writeI32(&req_buf, &pos, @intCast(ents.len));
+            ser.writeI32(req_buf, &pos, @intCast(ents.len));
             for (ents) |entry_data| {
-                ser.writeI32(&req_buf, &pos, @intCast(entry_data.len));
-                if (pos + entry_data.len <= req_buf.len) {
-                    @memcpy(req_buf[pos .. pos + entry_data.len], entry_data);
-                    pos += entry_data.len;
-                }
+                ser.writeI32(req_buf, &pos, @intCast(entry_data.len));
+                @memcpy(req_buf[pos .. pos + entry_data.len], entry_data);
+                pos += entry_data.len;
             }
         } else {
-            ser.writeI32(&req_buf, &pos, 0);
+            ser.writeI32(req_buf, &pos, 0);
         }
+        std.debug.assert(pos == req_buf.len);
 
         // Write frame size
         const frame_size: i32 = @intCast(pos - 4);
         var size_pos: usize = 0;
-        ser.writeI32(&req_buf, &size_pos, frame_size);
+        ser.writeI32(req_buf, &size_pos, frame_size);
 
-        _ = self.sslSend(req_buf[0..pos]) catch |err| {
+        _ = self.sslSend(req_buf) catch |err| {
             self.disconnect();
             return err;
         };
 
-        // Read and parse response
-        var resp_buf: [256]u8 = undefined;
-        const n = self.sslRecv(&resp_buf) catch |err| {
+        var resp_header: [4]u8 = undefined;
+        const hn = self.sslRecv(&resp_header) catch |err| {
             self.disconnect();
             return err;
         };
-
-        if (n < 8) {
+        if (hn < 4) {
             self.disconnect();
             return error.ShortRead;
         }
 
-        return true; // Heartbeat/append acknowledged
+        var hpos: usize = 0;
+        const resp_size: usize = @intCast(@max(ser.readI32(&resp_header, &hpos), 0));
+        if (resp_size < 6 or resp_size > 1024 * 1024) {
+            self.disconnect();
+            return error.InvalidFrameSize;
+        }
+
+        var resp_buf = try self.allocator.alloc(u8, resp_size);
+        defer self.allocator.free(resp_buf);
+        var total_read: usize = 0;
+        while (total_read < resp_size) {
+            const n = self.sslRecv(resp_buf[total_read..]) catch |err| {
+                self.disconnect();
+                return err;
+            };
+            if (n == 0) {
+                self.disconnect();
+                return error.ConnectionClosed;
+            }
+            total_read += n;
+        }
+
+        var rpos: usize = 0;
+        _ = ser.readI32(resp_buf, &rpos); // correlation_id
+        const error_code = ser.readI16(resp_buf, &rpos);
+        return error_code == 0;
     }
 
     /// Send a BeginQuorumEpoch request (API key 53) as a heartbeat.
@@ -518,6 +552,7 @@ pub const RaftClientPool = struct {
         prev_log_offset: i64,
         prev_log_epoch: i32,
         leader_commit: u64,
+        entries_start_index: u64,
         entries: ?[]const []const u8,
     ) bool {
         const client = self.clients.getPtr(follower_id) orelse return false;
@@ -527,6 +562,7 @@ pub const RaftClientPool = struct {
             prev_log_offset,
             prev_log_epoch,
             leader_commit,
+            entries_start_index,
             entries,
         ) catch false;
     }

@@ -207,6 +207,15 @@ pub const ElectionLoop = struct {
 
             // Build and send AppendEntries
             const ae_req = raft.getAppendEntriesForFollower(follower_id) orelse continue;
+            var entry_buf: [128][]const u8 = undefined;
+            var entry_count: usize = 0;
+            for (raft.log.entries.items) |log_entry| {
+                if (log_entry.offset < ae_req.entries_start_index) continue;
+                if (entry_count >= entry_buf.len) break;
+                entry_buf[entry_count] = log_entry.data;
+                entry_count += 1;
+            }
+            const sent_entries: ?[]const []const u8 = if (entry_count > 0) entry_buf[0..entry_count] else null;
             const success = pool.sendAppendEntriesToFollower(
                 follower_id,
                 ae_req.epoch,
@@ -214,15 +223,20 @@ pub const ElectionLoop = struct {
                 @intCast(ae_req.prev_log_offset),
                 ae_req.prev_log_epoch,
                 ae_req.leader_commit,
-                null, // entries sent via heartbeat for now
+                ae_req.entries_start_index,
+                sent_entries,
             );
 
             if (success) {
                 // Follower acknowledged — update match_index
+                const match_index = if (entry_count > 0)
+                    ae_req.entries_start_index + entry_count - 1
+                else
+                    ae_req.prev_log_offset;
                 raft.handleAppendEntriesResponse(follower_id, .{
                     .success = true,
                     .epoch = ae_req.epoch,
-                    .match_index = raft.log.lastOffset(),
+                    .match_index = match_index,
                 });
             } else {
                 // Follower rejected — decrement next_index for retry
