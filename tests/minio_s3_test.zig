@@ -161,3 +161,53 @@ test "MinIO S3 WAL objects rebuild metadata and fetch records" {
     try testing.expectEqual(@as(i16, 0), result.error_code);
     try testing.expectEqualStrings("live-alive-b", result.records);
 }
+
+test "MinIO PartitionStore S3 WAL produce rebuilds and resumes" {
+    var client = try initMinioClient();
+    var s3 = storage.S3Storage.initReal(testing.allocator, &client);
+    cleanupPrefix(&s3, "wal/");
+    defer cleanupPrefix(&s3, "wal/");
+
+    const topic = "minio-store-resume-topic";
+
+    {
+        var producer_store = broker.PartitionStore.init(testing.allocator);
+        defer producer_store.deinit();
+        producer_store.s3_wal_mode = true;
+        producer_store.s3_storage = s3;
+        producer_store.s3_wal_batcher = storage.wal.S3WalBatcher.init(testing.allocator);
+
+        const first = try producer_store.produce(topic, 0, "live-a");
+        const second = try producer_store.produce(topic, 0, "live-b");
+        try testing.expectEqual(@as(i64, 0), first.base_offset);
+        try testing.expectEqual(@as(i64, 1), second.base_offset);
+    }
+
+    var object_manager = storage.ObjectManager.init(testing.allocator, 1);
+    defer object_manager.deinit();
+
+    var replacement_store = broker.PartitionStore.init(testing.allocator);
+    defer replacement_store.deinit();
+    replacement_store.s3_wal_mode = true;
+    replacement_store.s3_storage = s3;
+    replacement_store.s3_wal_batcher = storage.wal.S3WalBatcher.init(testing.allocator);
+    replacement_store.setObjectManager(&object_manager);
+
+    try testing.expectEqual(@as(u64, 2), try replacement_store.recoverS3WalObjects());
+    try replacement_store.ensurePartition(topic, 0);
+    try testing.expect(replacement_store.repairPartitionStatesFromObjectManager());
+    try testing.expectEqual(@as(u64, 2), replacement_store.s3_wal_batcher.?.s3_object_counter);
+
+    const recovered = try replacement_store.fetch(topic, 0, 0, 1024);
+    defer if (recovered.records.len > 0) testing.allocator.free(@constCast(recovered.records));
+    try testing.expectEqual(@as(i16, 0), recovered.error_code);
+    try testing.expectEqualStrings("live-alive-b", recovered.records);
+
+    const third = try replacement_store.produce(topic, 0, "live-c");
+    try testing.expectEqual(@as(i64, 2), third.base_offset);
+
+    const merged = try replacement_store.fetch(topic, 0, 0, 1024);
+    defer if (merged.records.len > 0) testing.allocator.free(@constCast(merged.records));
+    try testing.expectEqual(@as(i16, 0), merged.error_code);
+    try testing.expectEqualStrings("live-alive-blive-c", merged.records);
+}

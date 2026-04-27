@@ -193,6 +193,24 @@ pub const PartitionStore = struct {
         }
     }
 
+    /// Seed the S3 WAL object-key counter from already durable WAL objects.
+    /// A replacement broker must do this before accepting writes, otherwise a
+    /// fresh batcher can reuse an existing key and overwrite acknowledged data.
+    pub fn syncS3WalObjectCounter(self: *PartitionStore) !void {
+        if (self.s3_wal_batcher == null or self.s3_storage == null) return;
+
+        var s3 = &self.s3_storage.?;
+        const keys = try s3.listObjectKeys("wal/");
+        defer {
+            for (keys) |key| self.allocator.free(key);
+            self.allocator.free(keys);
+        }
+
+        for (keys) |key| {
+            self.s3_wal_batcher.?.observeObjectKey(key);
+        }
+    }
+
     /// Rebuild ObjectManager StreamSetObject metadata from S3 WAL objects.
     /// Used when local object-manager snapshots are unavailable during restart
     /// or broker replacement. The S3 object payload remains the source of truth;
@@ -210,6 +228,9 @@ pub const PartitionStore = struct {
 
         var recovered: u64 = 0;
         for (keys) |key| {
+            if (self.s3_wal_batcher) |*batcher| {
+                batcher.observeObjectKey(key);
+            }
             if (objectManagerHasS3Key(om, key)) continue;
 
             const object_data = (try s3.getObject(key)) orelse continue;
@@ -746,7 +767,11 @@ pub const PartitionStore = struct {
 
         var total_size: usize = 0;
         var records_to_include: usize = cached_records.len;
+        var min_cached_offset: ?u64 = null;
         for (cached_records, 0..) |rec, i| {
+            if (min_cached_offset == null or rec.offset < min_cached_offset.?) {
+                min_cached_offset = rec.offset;
+            }
             const new_total = total_size + rec.data.len;
             // Honor max_bytes: include at least one record, then stop if exceeded (fix #17)
             if (i > 0 and max_bytes > 0 and new_total > max_bytes) {
@@ -756,36 +781,27 @@ pub const PartitionStore = struct {
             total_size = new_total;
         }
 
-        if (total_size > 0) {
-            const buf = try self.allocator.alloc(u8, total_size);
-            var pos: usize = 0;
-            for (cached_records[0..records_to_include]) |rec| {
-                @memcpy(buf[pos .. pos + rec.data.len], rec.data);
-                pos += rec.data.len;
-            }
-            return .{
-                .error_code = 0,
-                .records = buf,
-                .high_watermark = @intCast(state.high_watermark),
-                // Return actual LSO instead of HW
-                .last_stable_offset = @intCast(state.last_stable_offset),
-            };
+        const cache_fetch_deferred = total_size > 0 and self.object_manager != null and min_cached_offset.? > start_offset;
+        if (total_size > 0 and !cache_fetch_deferred) {
+            return try self.buildCachedFetchResult(cached_records, records_to_include, total_size, state);
         }
 
         // Tier 2: Read from S3BlockCache
-        if (self.s3_block_cache) |*block_cache| {
-            const cache_key = self.s3BlockCacheKey(topic, partition_id, start_offset, effective_end_offset, max_bytes, isolation_level) catch null;
-            if (cache_key) |ck| {
-                defer self.allocator.free(ck);
-                if (block_cache.get(ck)) |cached_data| {
-                    const result_buf = self.allocator.dupe(u8, cached_data) catch null;
-                    if (result_buf) |rb| {
-                        return .{
-                            .error_code = 0,
-                            .records = rb,
-                            .high_watermark = @intCast(state.high_watermark),
-                            .last_stable_offset = @intCast(state.last_stable_offset),
-                        };
+        if (!cache_fetch_deferred) {
+            if (self.s3_block_cache) |*block_cache| {
+                const cache_key = self.s3BlockCacheKey(topic, partition_id, start_offset, effective_end_offset, max_bytes, isolation_level) catch null;
+                if (cache_key) |ck| {
+                    defer self.allocator.free(ck);
+                    if (block_cache.get(ck)) |cached_data| {
+                        const result_buf = self.allocator.dupe(u8, cached_data) catch null;
+                        if (result_buf) |rb| {
+                            return .{
+                                .error_code = 0,
+                                .records = rb,
+                                .high_watermark = @intCast(state.high_watermark),
+                                .last_stable_offset = @intCast(state.last_stable_offset),
+                            };
+                        }
                     }
                 }
             }
@@ -800,6 +816,7 @@ pub const PartitionStore = struct {
                 var result_list = std.array_list.Managed(u8).init(self.allocator);
                 defer result_list.deinit();
                 var s3_read_failed = false;
+                var max_s3_end_offset: u64 = start_offset;
 
                 for (s3_metas) |meta| {
                     // Read each S3 object and extract relevant blocks
@@ -837,6 +854,9 @@ pub const PartitionStore = struct {
                     }
                     for (entry_indexes) |entry_index| {
                         if (reader.readBlock(entry_index)) |block| {
+                            const index_entry = reader.index_entries[entry_index];
+                            const block_end = std.math.add(u64, index_entry.start_offset, index_entry.end_offset_delta) catch std.math.maxInt(u64);
+                            max_s3_end_offset = @max(max_s3_end_offset, block_end);
                             try result_list.appendSlice(block);
                             if (max_bytes > 0 and result_list.items.len >= max_bytes) break;
                         } else {
@@ -847,6 +867,12 @@ pub const PartitionStore = struct {
                 }
 
                 if (result_list.items.len > 0) {
+                    if (s3_read_failed) {
+                        return storageErrorFetchResult(state);
+                    }
+                    if (cache_fetch_deferred and max_s3_end_offset < effective_end_offset) {
+                        try self.appendCachedRecordsFromOffset(&result_list, cached_records, max_s3_end_offset, max_bytes);
+                    }
                     const result_data = result_list.toOwnedSlice() catch &.{};
                     // Cache in S3BlockCache
                     if (self.s3_block_cache) |*block_cache| {
@@ -926,6 +952,10 @@ pub const PartitionStore = struct {
             }
         }
 
+        if (cache_fetch_deferred) {
+            return try self.buildCachedFetchResult(cached_records, records_to_include, total_size, state);
+        }
+
         return .{
             .error_code = 0,
             .records = &.{},
@@ -952,6 +982,31 @@ pub const PartitionStore = struct {
             .high_watermark = @intCast(state.high_watermark),
             .last_stable_offset = @intCast(state.last_stable_offset),
         };
+    }
+
+    fn buildCachedFetchResult(self: *PartitionStore, cached_records: []const LogCache.CachedRecord, records_to_include: usize, total_size: usize, state: PartitionState) !FetchResult {
+        const buf = try self.allocator.alloc(u8, total_size);
+        var pos: usize = 0;
+        for (cached_records[0..records_to_include]) |rec| {
+            @memcpy(buf[pos .. pos + rec.data.len], rec.data);
+            pos += rec.data.len;
+        }
+        return .{
+            .error_code = 0,
+            .records = buf,
+            .high_watermark = @intCast(state.high_watermark),
+            .last_stable_offset = @intCast(state.last_stable_offset),
+        };
+    }
+
+    fn appendCachedRecordsFromOffset(self: *PartitionStore, result_list: *std.array_list.Managed(u8), cached_records: []const LogCache.CachedRecord, start_offset: u64, max_bytes: usize) !void {
+        _ = self;
+        for (cached_records) |rec| {
+            if (rec.offset < start_offset) continue;
+            const new_total = result_list.items.len + rec.data.len;
+            if (result_list.items.len > 0 and max_bytes > 0 and new_total > max_bytes) break;
+            try result_list.appendSlice(rec.data);
+        }
     }
 
     pub const FetchResult = struct {

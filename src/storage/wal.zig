@@ -1031,6 +1031,42 @@ pub const S3WalBatcher = struct {
         return try std.fmt.allocPrint(alloc, "wal/epoch-{d}/bulk/{d:0>10}", .{ self.wal_epoch, self.s3_object_counter });
     }
 
+    const ParsedObjectKey = struct {
+        epoch: u64,
+        counter: u64,
+    };
+
+    fn parseObjectKey(key: []const u8) ?ParsedObjectKey {
+        const prefix = "wal/epoch-";
+        if (!std.mem.startsWith(u8, key, prefix)) return null;
+
+        const rest = key[prefix.len..];
+        const sep = std.mem.indexOf(u8, rest, "/bulk/") orelse return null;
+        if (sep == 0) return null;
+
+        const counter_text = rest[sep + "/bulk/".len ..];
+        if (counter_text.len == 0 or std.mem.indexOfScalar(u8, counter_text, '/') != null) return null;
+
+        return .{
+            .epoch = std.fmt.parseInt(u64, rest[0..sep], 10) catch return null,
+            .counter = std.fmt.parseInt(u64, counter_text, 10) catch return null,
+        };
+    }
+
+    /// Advance the local object-key generator from an existing WAL object key.
+    /// This prevents a restarted broker from overwriting acknowledged WAL
+    /// objects with a reset counter.
+    pub fn observeObjectKey(self: *S3WalBatcher, key: []const u8) void {
+        const parsed = parseObjectKey(key) orelse return;
+        if (parsed.epoch > self.wal_epoch) {
+            self.wal_epoch = parsed.epoch;
+            self.s3_object_counter = 0;
+        }
+        if (parsed.epoch == self.wal_epoch and parsed.counter > self.s3_object_counter) {
+            self.s3_object_counter = parsed.counter;
+        }
+    }
+
     fn nextObjectKey(self: *const S3WalBatcher, alloc: Allocator) ![]u8 {
         return try std.fmt.allocPrint(alloc, "wal/epoch-{d}/bulk/{d:0>10}", .{ self.wal_epoch, self.s3_object_counter + 1 });
     }
@@ -1115,6 +1151,32 @@ test "S3WalBatcher basic append" {
     try testing.expect(batcher.pendingBytes() > 0);
     // last_appended_offset should track highest offset
     try testing.expectEqual(@as(u64, 2), batcher.last_appended_offset);
+}
+
+test "S3WalBatcher observes existing object keys before next flush" {
+    var batcher = S3WalBatcher.init(testing.allocator);
+    defer batcher.deinit();
+
+    batcher.observeObjectKey("data/not-wal");
+    try testing.expectEqual(@as(u64, 0), batcher.wal_epoch);
+    try testing.expectEqual(@as(u64, 0), batcher.s3_object_counter);
+
+    batcher.observeObjectKey("wal/epoch-0/bulk/0000000017");
+    try testing.expectEqual(@as(u64, 0), batcher.wal_epoch);
+    try testing.expectEqual(@as(u64, 17), batcher.s3_object_counter);
+
+    batcher.observeObjectKey("wal/epoch-1/bulk/0000000004");
+    try testing.expectEqual(@as(u64, 1), batcher.wal_epoch);
+    try testing.expectEqual(@as(u64, 4), batcher.s3_object_counter);
+
+    batcher.observeObjectKey("wal/epoch-1/bulk/0000000009");
+    const next_key = try batcher.currentObjectKey(testing.allocator);
+    defer testing.allocator.free(next_key);
+    try testing.expectEqualStrings("wal/epoch-1/bulk/0000000009", next_key);
+
+    const upload_key = try batcher.nextObjectKey(testing.allocator);
+    defer testing.allocator.free(upload_key);
+    try testing.expectEqualStrings("wal/epoch-1/bulk/0000000010", upload_key);
 }
 
 test "S3WalBatcher flush builds ObjectWriter format" {

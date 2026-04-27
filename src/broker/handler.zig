@@ -501,6 +501,7 @@ pub const Broker = struct {
     pub fn open(self: *Broker) !void {
         self.wireInternalPointers();
         try self.store.open();
+        try self.store.syncS3WalObjectCounter();
         const restored_object_snapshot = try self.restoreObjectManagerSnapshot();
         if (!restored_object_snapshot) {
             const recovered_s3_objects = try self.store.recoverS3WalObjects();
@@ -12754,6 +12755,55 @@ test "Broker repairs partition offsets from recovered S3 WAL objects" {
         defer if (result.records.len > 0) testing.allocator.free(@constCast(result.records));
         try testing.expectEqual(@as(i16, 0), result.error_code);
         try testing.expectEqualStrings("ab", result.records);
+    }
+}
+
+test "Broker resumes S3 WAL writes after stateless replacement" {
+    var mock_s3 = storage.MockS3.init(testing.allocator);
+    defer mock_s3.deinit();
+    const s3_storage = storage.S3Storage.initMock(testing.allocator, &mock_s3);
+    const topic = "broker-s3-resume-topic";
+
+    {
+        var broker = Broker.init(testing.allocator, 1, 9092);
+        defer broker.deinit();
+        broker.store.s3_wal_mode = true;
+        broker.store.s3_storage = s3_storage;
+        broker.store.s3_wal_batcher = storage.wal.S3WalBatcher.init(testing.allocator);
+
+        try broker.open();
+        try testing.expect(broker.ensureTopic(topic));
+        const produced = try broker.store.produce(topic, 0, "first-");
+        try testing.expectEqual(@as(i64, 0), produced.base_offset);
+    }
+
+    try testing.expectEqual(@as(usize, 1), mock_s3.objectCount());
+
+    {
+        var broker = Broker.init(testing.allocator, 1, 9092);
+        defer broker.deinit();
+        broker.store.s3_wal_mode = true;
+        broker.store.s3_storage = s3_storage;
+        broker.store.s3_wal_batcher = storage.wal.S3WalBatcher.init(testing.allocator);
+
+        try broker.open();
+        try testing.expect(broker.ensureTopic(topic));
+        try testing.expect(broker.store.repairPartitionStatesFromObjectManager());
+        try testing.expectEqual(@as(u64, 1), broker.store.s3_wal_batcher.?.s3_object_counter);
+
+        const recovered = try broker.store.fetch(topic, 0, 0, 1024);
+        defer if (recovered.records.len > 0) testing.allocator.free(@constCast(recovered.records));
+        try testing.expectEqual(@as(i16, 0), recovered.error_code);
+        try testing.expectEqualStrings("first-", recovered.records);
+
+        const produced = try broker.store.produce(topic, 0, "second");
+        try testing.expectEqual(@as(i64, 1), produced.base_offset);
+        try testing.expectEqual(@as(usize, 2), mock_s3.objectCount());
+
+        const merged = try broker.store.fetch(topic, 0, 0, 1024);
+        defer if (merged.records.len > 0) testing.allocator.free(@constCast(merged.records));
+        try testing.expectEqual(@as(i16, 0), merged.error_code);
+        try testing.expectEqualStrings("first-second", merged.records);
     }
 }
 
