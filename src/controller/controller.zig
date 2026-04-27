@@ -498,6 +498,7 @@ pub const Controller = struct {
 
     const ControllerMetadataRecordKind = enum(u8) {
         broker_registration = 1,
+        producer_id_allocation = 2,
     };
 
     fn controllerBytesFieldSize(bytes: []const u8) !usize {
@@ -517,6 +518,7 @@ pub const Controller = struct {
     fn controllerRecordKindFromByte(byte: u8) !ControllerMetadataRecordKind {
         return switch (byte) {
             1 => .broker_registration,
+            2 => .producer_id_allocation,
             else => error.InvalidAutoMqMetadataRecord,
         };
     }
@@ -538,6 +540,21 @@ pub const Controller = struct {
         writeRecordI32(buf, &pos, @intCast(port));
         writeRecordBool(buf, &pos, true);
         try writeRecordBytes(buf, &pos, host);
+        std.debug.assert(pos == buf.len);
+        return buf;
+    }
+
+    fn buildProducerIdAllocationRecord(self: *Controller, next_producer_id: i64) ![]u8 {
+        var total_len = try checkedAddSize(controller_metadata_record_magic.len, 1);
+        total_len = try checkedAddSize(total_len, 8);
+
+        const buf = try self.allocator.alloc(u8, total_len);
+        var pos: usize = 0;
+        @memcpy(buf[pos .. pos + controller_metadata_record_magic.len], controller_metadata_record_magic);
+        pos += controller_metadata_record_magic.len;
+        buf[pos] = @intFromEnum(ControllerMetadataRecordKind.producer_id_allocation);
+        pos += 1;
+        writeRecordI64(buf, &pos, next_producer_id);
         std.debug.assert(pos == buf.len);
         return buf;
     }
@@ -571,6 +588,13 @@ pub const Controller = struct {
         );
     }
 
+    fn applyProducerIdAllocationRecord(self: *Controller, data: []const u8, pos: *usize) !void {
+        const next_producer_id = try readRecordI64(data, pos);
+        if (pos.* != data.len) return error.InvalidAutoMqMetadataRecord;
+        if (next_producer_id <= 0) return error.InvalidAutoMqMetadataRecord;
+        self.next_producer_id = @max(self.next_producer_id, next_producer_id);
+    }
+
     fn applyControllerMetadataRecord(self: *Controller, data: []const u8) !void {
         if (!isControllerMetadataRecord(data)) return;
         var pos = controller_metadata_record_magic.len;
@@ -580,6 +604,7 @@ pub const Controller = struct {
 
         switch (kind) {
             .broker_registration => try self.applyBrokerRegistrationRecord(data, &pos),
+            .producer_id_allocation => try self.applyProducerIdAllocationRecord(data, &pos),
         }
     }
 
@@ -822,10 +847,33 @@ pub const Controller = struct {
         _ = req.broker_id;
         _ = req.broker_epoch;
 
+        if (self.raft_state.role != .leader) {
+            const resp = Resp{ .error_code = ErrorCode.not_controller.toInt(), .producer_id_start = -1, .producer_id_len = 0 };
+            return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+        }
+
         // Allocate a block of 1000 producer IDs
         const block_start = self.next_producer_id;
         const block_len: i32 = 1000;
-        self.next_producer_id += block_len;
+        const next_producer_id = block_start + block_len;
+
+        const record = self.buildProducerIdAllocationRecord(next_producer_id) catch {
+            const resp = Resp{ .error_code = ErrorCode.kafka_storage_error.toInt(), .producer_id_start = -1, .producer_id_len = 0 };
+            return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+        };
+        defer self.allocator.free(record);
+
+        const offset = self.appendControllerMetadataRecord(record) catch |err| {
+            const error_code: i16 = switch (err) {
+                error.NotController => ErrorCode.not_controller.toInt(),
+                else => ErrorCode.kafka_storage_error.toInt(),
+            };
+            const resp = Resp{ .error_code = error_code, .producer_id_start = -1, .producer_id_len = 0 };
+            return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+        };
+
+        self.next_producer_id = next_producer_id;
+        self.last_applied_controller_metadata_offset = offset;
 
         const resp = Resp{
             .throttle_time_ms = 0,
@@ -1385,6 +1433,7 @@ test "Controller handleRequest BeginQuorumEpoch applies internal AppendEntries p
 
     var ctrl = Controller.init(testing.allocator, 1, "test-cluster");
     defer ctrl.deinit();
+    try makeTestControllerLeader(&ctrl);
 
     var buf: [256]u8 = undefined;
     var pos = buildTestRequest(&buf, 53, 0, 22, header_mod.requestHeaderVersion(53, 0));
@@ -1716,6 +1765,7 @@ test "Controller handleRequest AllocateProducerIds returns block" {
 
     var ctrl = Controller.init(testing.allocator, 1, "test-cluster");
     defer ctrl.deinit();
+    try makeTestControllerLeader(&ctrl);
 
     var buf: [256]u8 = undefined;
     var pos = buildTestRequest(&buf, 67, 0, 60, header_mod.requestHeaderVersion(67, 0));
@@ -1733,6 +1783,68 @@ test "Controller handleRequest AllocateProducerIds returns block" {
     try testing.expectEqual(@as(i16, 0), resp.error_code);
     try testing.expect(resp.producer_id_start >= 1000);
     try testing.expectEqual(@as(i32, 1000), resp.producer_id_len);
+}
+
+test "Controller initWithDataDir replays durable producer id allocations" {
+    const Req = generated.allocate_producer_ids_request.AllocateProducerIdsRequest;
+    const Resp = generated.allocate_producer_ids_response.AllocateProducerIdsResponse;
+
+    const tmp_dir = "/tmp/zmq-controller-producer-id-replay-test";
+    fs.deleteTreeAbsolute(tmp_dir) catch {};
+    defer fs.deleteTreeAbsolute(tmp_dir) catch {};
+
+    {
+        var ctrl = Controller.initWithDataDir(testing.allocator, 1, "controller-producer-id-restart", tmp_dir);
+        defer ctrl.deinit();
+        try makeTestControllerLeader(&ctrl);
+
+        var buf: [256]u8 = undefined;
+        var pos = buildTestRequest(&buf, 67, 0, 6710, header_mod.requestHeaderVersion(67, 0));
+        const req = Req{ .broker_id = 100, .broker_epoch = 1 };
+        req.serialize(&buf, &pos, 0);
+
+        const response = ctrl.handleRequest(buf[0..pos]);
+        try testing.expect(response != null);
+        defer testing.allocator.free(response.?);
+
+        var rpos: usize = 0;
+        var resp_header = try ResponseHeader.deserialize(testing.allocator, response.?, &rpos, header_mod.responseHeaderVersion(67, 0));
+        defer resp_header.deinit(testing.allocator);
+        const resp = try Resp.deserialize(testing.allocator, response.?, &rpos, 0);
+        try testing.expectEqual(ErrorCode.none.toInt(), resp.error_code);
+        try testing.expectEqual(@as(i64, 1000), resp.producer_id_start);
+        try testing.expectEqual(@as(i64, 2000), ctrl.next_producer_id);
+    }
+
+    {
+        var ctrl = Controller.initWithDataDir(testing.allocator, 1, "controller-producer-id-restart", tmp_dir);
+        defer ctrl.deinit();
+
+        const recovered = try ctrl.raft_state.loadPersistedLog();
+        try testing.expectEqual(@as(u64, 1), recovered);
+        ctrl.raft_state.commit_index = ctrl.raft_state.log.lastOffset();
+        try testing.expectEqual(@as(usize, 1), try ctrl.replayCommittedControllerMetadataRecords());
+        try testing.expectEqual(@as(i64, 2000), ctrl.next_producer_id);
+
+        try makeTestControllerLeader(&ctrl);
+
+        var buf: [256]u8 = undefined;
+        var pos = buildTestRequest(&buf, 67, 0, 6711, header_mod.requestHeaderVersion(67, 0));
+        const req = Req{ .broker_id = 100, .broker_epoch = 1 };
+        req.serialize(&buf, &pos, 0);
+
+        const response = ctrl.handleRequest(buf[0..pos]);
+        try testing.expect(response != null);
+        defer testing.allocator.free(response.?);
+
+        var rpos: usize = 0;
+        var resp_header = try ResponseHeader.deserialize(testing.allocator, response.?, &rpos, header_mod.responseHeaderVersion(67, 0));
+        defer resp_header.deinit(testing.allocator);
+        const resp = try Resp.deserialize(testing.allocator, response.?, &rpos, 0);
+        try testing.expectEqual(ErrorCode.none.toInt(), resp.error_code);
+        try testing.expectEqual(@as(i64, 2000), resp.producer_id_start);
+        try testing.expectEqual(@as(i64, 3000), ctrl.next_producer_id);
+    }
 }
 
 test "Controller handleRequest AddRaftVoter uses generated key 80" {
@@ -1822,6 +1934,7 @@ test "Controller AllocateProducerIds increments monotonically" {
 
     var ctrl = Controller.init(testing.allocator, 1, "test-cluster");
     defer ctrl.deinit();
+    try makeTestControllerLeader(&ctrl);
 
     // First allocation
     var buf1: [256]u8 = undefined;
