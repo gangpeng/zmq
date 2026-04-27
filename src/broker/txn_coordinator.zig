@@ -40,8 +40,16 @@ pub const TransactionCoordinator = struct {
             partition: i32,
         };
 
+        pub fn clearPartitions(self: *TransactionState, alloc: Allocator) void {
+            for (self.partitions.items) |tp| {
+                alloc.free(tp.topic);
+            }
+            self.partitions.clearRetainingCapacity();
+        }
+
         pub fn deinit(self: *TransactionState, alloc: Allocator) void {
             if (self.transactional_id) |tid| alloc.free(tid);
+            self.clearPartitions(alloc);
             self.partitions.deinit();
         }
     };
@@ -89,7 +97,7 @@ pub const TransactionCoordinator = struct {
                             txn.producer_id = new_pid;
                             txn.producer_epoch = 0;
                             txn.status = .empty;
-                            txn.partitions.clearRetainingCapacity();
+                            txn.clearPartitions(self.allocator);
                             txn.start_time_ms = @import("time_compat").milliTimestamp();
                             // Re-index under new PID
                             const txn_copy = txn.*;
@@ -104,7 +112,7 @@ pub const TransactionCoordinator = struct {
                         }
                         txn.producer_epoch += 1;
                         txn.status = .empty;
-                        txn.partitions.clearRetainingCapacity();
+                        txn.clearPartitions(self.allocator);
                         txn.start_time_ms = @import("time_compat").milliTimestamp();
                         self.dirty = true;
                         return .{
@@ -180,9 +188,23 @@ pub const TransactionCoordinator = struct {
             }
         }
 
-        try txn.partitions.append(.{ .topic = topic, .partition = partition });
+        const topic_copy = try self.allocator.dupe(u8, topic);
+        errdefer self.allocator.free(topic_copy);
+        try txn.partitions.append(.{ .topic = topic_copy, .partition = partition });
         self.dirty = true;
         return 0;
+    }
+
+    pub fn verifyPartitionInTxn(self: *const TransactionCoordinator, producer_id: i64, producer_epoch: i16, topic: []const u8, partition: i32) i16 {
+        const txn = self.transactions.get(producer_id) orelse return 48; // INVALID_PRODUCER_ID_MAPPING
+        if (txn.producer_epoch != producer_epoch) return 22; // PRODUCER_FENCED
+        if (txn.status != .ongoing) return 55; // INVALID_TXN_STATE
+        for (txn.partitions.items) |existing| {
+            if (existing.partition == partition and std.mem.eql(u8, existing.topic, topic)) {
+                return 0;
+            }
+        }
+        return 55; // INVALID_TXN_STATE
     }
 
     /// EndTxn: commit or abort the transaction.
@@ -220,7 +242,7 @@ pub const TransactionCoordinator = struct {
                     // For now, the transaction state transition is the important part
                 }
                 txn.status = .complete_commit;
-                txn.partitions.clearRetainingCapacity();
+                txn.clearPartitions(self.allocator);
                 self.dirty = true;
                 return 0;
             },
@@ -231,7 +253,7 @@ pub const TransactionCoordinator = struct {
                     // with ControlRecordType.abort = 0
                 }
                 txn.status = .complete_abort;
-                txn.partitions.clearRetainingCapacity();
+                txn.clearPartitions(self.allocator);
                 self.dirty = true;
                 return 0;
             },
@@ -699,6 +721,37 @@ test "TransactionCoordinator addPartitionsToTxn idempotent" {
     // Different partition should be added
     _ = try coord.addPartitionsToTxn(pid, result.producer_epoch, "topic-a", 1);
     try testing.expectEqual(@as(usize, 2), coord.getPartitions(pid).?.len);
+}
+
+test "TransactionCoordinator verifyPartitionInTxn validates existing partitions without mutation" {
+    var coord = TransactionCoordinator.init(testing.allocator);
+    defer coord.deinit();
+
+    const result = try coord.initProducerId("verify-add");
+    const pid = result.producer_id;
+
+    _ = try coord.addPartitionsToTxn(pid, result.producer_epoch, "topic-a", 0);
+    try testing.expectEqual(@as(i16, 0), coord.verifyPartitionInTxn(pid, result.producer_epoch, "topic-a", 0));
+    try testing.expectEqual(@as(i16, 55), coord.verifyPartitionInTxn(pid, result.producer_epoch, "topic-a", 1));
+    try testing.expectEqual(@as(i16, 22), coord.verifyPartitionInTxn(pid, result.producer_epoch + 1, "topic-a", 0));
+    try testing.expectEqual(@as(usize, 1), coord.getPartitions(pid).?.len);
+}
+
+test "TransactionCoordinator addPartitionsToTxn owns topic names" {
+    var coord = TransactionCoordinator.init(testing.allocator);
+    defer coord.deinit();
+
+    const result = try coord.initProducerId("owned-topic");
+    const pid = result.producer_id;
+    const topic_buf = try testing.allocator.dupe(u8, "owned-topic-a");
+    defer testing.allocator.free(topic_buf);
+
+    _ = try coord.addPartitionsToTxn(pid, result.producer_epoch, topic_buf, 0);
+    @memset(topic_buf, 'x');
+
+    const parts = coord.getPartitions(pid).?;
+    try testing.expectEqual(@as(usize, 1), parts.len);
+    try testing.expectEqualStrings("owned-topic-a", parts[0].topic);
 }
 
 test "TransactionCoordinator expireTransactions auto-aborts" {

@@ -212,13 +212,15 @@ pub const AddPartitionsToTxnResponse = struct {
                 item.serialize(buf, pos, version);
             }
         }
-        if (version >= 3) {
-            ser.writeCompactArrayLen(buf, pos, self.results_by_topic_v3_and_below.len);
-        } else {
-            ser.writeArrayLen(buf, pos, self.results_by_topic_v3_and_below.len);
-        }
-        for (self.results_by_topic_v3_and_below) |item| {
-            item.serialize(buf, pos, version);
+        if (version <= 3) {
+            if (version >= 3) {
+                ser.writeCompactArrayLen(buf, pos, self.results_by_topic_v3_and_below.len);
+            } else {
+                ser.writeArrayLen(buf, pos, self.results_by_topic_v3_and_below.len);
+            }
+            for (self.results_by_topic_v3_and_below) |item| {
+                item.serialize(buf, pos, version);
+            }
         }
         if (version >= 3) ser.writeEmptyTaggedFields(buf, pos);
     }
@@ -242,16 +244,18 @@ pub const AddPartitionsToTxnResponse = struct {
                 result.results_by_transaction = results_by_transaction_items;
             }
         }
-        const results_by_topic_v3_and_below_len: usize = if (version >= 3)
-            (try ser.readCompactArrayLen(buf, pos)) orelse 0
-        else
-            (try ser.readArrayLen(buf, pos)) orelse 0;
-        if (results_by_topic_v3_and_below_len > 0) {
-            const results_by_topic_v3_and_below_items = try alloc.alloc(AddPartitionsToTxnTopicResult, results_by_topic_v3_and_below_len);
-            for (results_by_topic_v3_and_below_items) |*item| {
-                item.* = try AddPartitionsToTxnTopicResult.deserialize(alloc, buf, pos, version);
+        if (version <= 3) {
+            const results_by_topic_v3_and_below_len: usize = if (version >= 3)
+                (try ser.readCompactArrayLen(buf, pos)) orelse 0
+            else
+                (try ser.readArrayLen(buf, pos)) orelse 0;
+            if (results_by_topic_v3_and_below_len > 0) {
+                const results_by_topic_v3_and_below_items = try alloc.alloc(AddPartitionsToTxnTopicResult, results_by_topic_v3_and_below_len);
+                for (results_by_topic_v3_and_below_items) |*item| {
+                    item.* = try AddPartitionsToTxnTopicResult.deserialize(alloc, buf, pos, version);
+                }
+                result.results_by_topic_v3_and_below = results_by_topic_v3_and_below_items;
             }
-            result.results_by_topic_v3_and_below = results_by_topic_v3_and_below_items;
         }
         if (version >= 3) try ser.skipTaggedFields(buf, pos);
         return result;
@@ -273,13 +277,15 @@ pub const AddPartitionsToTxnResponse = struct {
                 size += item.calcSize(version);
             }
         }
-        if (version >= 3) {
-            size += ser.unsignedVarintSize(self.results_by_topic_v3_and_below.len + 1);
-        } else {
-            size += 4;
-        }
-        for (self.results_by_topic_v3_and_below) |item| {
-            size += item.calcSize(version);
+        if (version <= 3) {
+            if (version >= 3) {
+                size += ser.unsignedVarintSize(self.results_by_topic_v3_and_below.len + 1);
+            } else {
+                size += 4;
+            }
+            for (self.results_by_topic_v3_and_below) |item| {
+                size += item.calcSize(version);
+            }
         }
         if (version >= 3) size += 1;
         return size;

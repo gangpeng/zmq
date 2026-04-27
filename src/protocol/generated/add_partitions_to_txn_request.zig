@@ -214,20 +214,28 @@ pub const AddPartitionsToTxnRequest = struct {
                 item.serialize(buf, pos, version);
             }
         }
-        if (version >= 3) {
-            ser.writeCompactString(buf, pos, self.v3_and_below_transactional_id);
-        } else {
-            ser.writeString(buf, pos, self.v3_and_below_transactional_id);
+        if (version <= 3) {
+            if (version >= 3) {
+                ser.writeCompactString(buf, pos, self.v3_and_below_transactional_id);
+            } else {
+                ser.writeString(buf, pos, self.v3_and_below_transactional_id);
+            }
         }
-        ser.writeI64(buf, pos, self.v3_and_below_producer_id);
-        ser.writeI16(buf, pos, self.v3_and_below_producer_epoch);
-        if (version >= 3) {
-            ser.writeCompactArrayLen(buf, pos, self.v3_and_below_topics.len);
-        } else {
-            ser.writeArrayLen(buf, pos, self.v3_and_below_topics.len);
+        if (version <= 3) {
+            ser.writeI64(buf, pos, self.v3_and_below_producer_id);
         }
-        for (self.v3_and_below_topics) |item| {
-            item.serialize(buf, pos, version);
+        if (version <= 3) {
+            ser.writeI16(buf, pos, self.v3_and_below_producer_epoch);
+        }
+        if (version <= 3) {
+            if (version >= 3) {
+                ser.writeCompactArrayLen(buf, pos, self.v3_and_below_topics.len);
+            } else {
+                ser.writeArrayLen(buf, pos, self.v3_and_below_topics.len);
+            }
+            for (self.v3_and_below_topics) |item| {
+                item.serialize(buf, pos, version);
+            }
         }
         if (version >= 3) ser.writeEmptyTaggedFields(buf, pos);
     }
@@ -247,22 +255,30 @@ pub const AddPartitionsToTxnRequest = struct {
                 result.transactions = transactions_items;
             }
         }
-        result.v3_and_below_transactional_id = if (version >= 3)
-            try ser.readCompactString(buf, pos)
-        else
-            try ser.readString(buf, pos);
-        result.v3_and_below_producer_id = ser.readI64(buf, pos);
-        result.v3_and_below_producer_epoch = ser.readI16(buf, pos);
-        const v3_and_below_topics_len: usize = if (version >= 3)
-            (try ser.readCompactArrayLen(buf, pos)) orelse 0
-        else
-            (try ser.readArrayLen(buf, pos)) orelse 0;
-        if (v3_and_below_topics_len > 0) {
-            const v3_and_below_topics_items = try alloc.alloc(AddPartitionsToTxnTopic, v3_and_below_topics_len);
-            for (v3_and_below_topics_items) |*item| {
-                item.* = try AddPartitionsToTxnTopic.deserialize(alloc, buf, pos, version);
+        if (version <= 3) {
+            result.v3_and_below_transactional_id = if (version >= 3)
+                try ser.readCompactString(buf, pos)
+            else
+                try ser.readString(buf, pos);
+        }
+        if (version <= 3) {
+            result.v3_and_below_producer_id = ser.readI64(buf, pos);
+        }
+        if (version <= 3) {
+            result.v3_and_below_producer_epoch = ser.readI16(buf, pos);
+        }
+        if (version <= 3) {
+            const v3_and_below_topics_len: usize = if (version >= 3)
+                (try ser.readCompactArrayLen(buf, pos)) orelse 0
+            else
+                (try ser.readArrayLen(buf, pos)) orelse 0;
+            if (v3_and_below_topics_len > 0) {
+                const v3_and_below_topics_items = try alloc.alloc(AddPartitionsToTxnTopic, v3_and_below_topics_len);
+                for (v3_and_below_topics_items) |*item| {
+                    item.* = try AddPartitionsToTxnTopic.deserialize(alloc, buf, pos, version);
+                }
+                result.v3_and_below_topics = v3_and_below_topics_items;
             }
-            result.v3_and_below_topics = v3_and_below_topics_items;
         }
         if (version >= 3) try ser.skipTaggedFields(buf, pos);
         return result;
@@ -280,20 +296,28 @@ pub const AddPartitionsToTxnRequest = struct {
                 size += item.calcSize(version);
             }
         }
-        if (version >= 3) {
-            size += ser.compactStringSize(self.v3_and_below_transactional_id);
-        } else {
-            size += ser.stringSize(self.v3_and_below_transactional_id);
+        if (version <= 3) {
+            if (version >= 3) {
+                size += ser.compactStringSize(self.v3_and_below_transactional_id);
+            } else {
+                size += ser.stringSize(self.v3_and_below_transactional_id);
+            }
         }
-        size += 8;
-        size += 2;
-        if (version >= 3) {
-            size += ser.unsignedVarintSize(self.v3_and_below_topics.len + 1);
-        } else {
-            size += 4;
+        if (version <= 3) {
+            size += 8;
         }
-        for (self.v3_and_below_topics) |item| {
-            size += item.calcSize(version);
+        if (version <= 3) {
+            size += 2;
+        }
+        if (version <= 3) {
+            if (version >= 3) {
+                size += ser.unsignedVarintSize(self.v3_and_below_topics.len + 1);
+            } else {
+                size += 4;
+            }
+            for (self.v3_and_below_topics) |item| {
+                size += item.calcSize(version);
+            }
         }
         if (version >= 3) size += 1;
         return size;

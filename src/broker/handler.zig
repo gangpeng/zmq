@@ -3313,54 +3313,147 @@ pub const Broker = struct {
     // AddPartitionsToTxn (key 24)
     // ---------------------------------------------------------------
     fn handleAddPartitionsToTxn(self: *Broker, request_bytes: []const u8, body_start: usize, req_header: *const RequestHeader, api_version: i16, resp_header_version: i16) ?[]u8 {
-        _ = api_version;
+        const Req = generated.add_partitions_to_txn_request.AddPartitionsToTxnRequest;
+        const Resp = generated.add_partitions_to_txn_response.AddPartitionsToTxnResponse;
+        const TxnResult = Resp.AddPartitionsToTxnResult;
+
+        if (!validateAddPartitionsToTxnRequestFrame(request_bytes, body_start, api_version)) {
+            log.warn("Malformed AddPartitionsToTxn request", .{});
+            return null;
+        }
+
         var pos = body_start;
-        const transactional_id = (ser.readString(request_bytes, &pos) catch return null) orelse "";
-        _ = transactional_id;
-        const producer_id = ser.readI64(request_bytes, &pos);
-        const producer_epoch = ser.readI16(request_bytes, &pos);
+        var req = Req.deserialize(self.allocator, request_bytes, &pos, api_version) catch |err| {
+            log.warn("Failed to decode AddPartitionsToTxn request: {}", .{err});
+            return null;
+        };
+        defer self.freeAddPartitionsToTxnRequest(&req);
 
-        // Read topics array
-        const topics_len = (ser.readArrayLen(request_bytes, &pos) catch 0) orelse 0;
-        var topic_errors: [32]struct { topic: []const u8, partitions: [32]struct { partition: i32, error_code: i16 }, num_partitions: usize } = undefined;
-        var num_topics: usize = 0;
-
-        for (0..topics_len) |_| {
-            if (num_topics >= 32) break;
-            const topic = (ser.readString(request_bytes, &pos) catch break) orelse "";
-            const parts_len = (ser.readArrayLen(request_bytes, &pos) catch 0) orelse 0;
-
-            var te = &topic_errors[num_topics];
-            te.topic = topic;
-            te.num_partitions = 0;
-
-            for (0..parts_len) |_| {
-                if (te.num_partitions >= 32) break;
-                const partition = ser.readI32(request_bytes, &pos);
-                const err = self.txn_coordinator.addPartitionsToTxn(producer_id, producer_epoch, topic, partition) catch 48;
-                te.partitions[te.num_partitions] = .{ .partition = partition, .error_code = err };
-                te.num_partitions += 1;
+        if (api_version >= 4) {
+            const txn_results = self.allocator.alloc(TxnResult, req.transactions.len) catch return null;
+            var txn_results_init: usize = 0;
+            defer {
+                self.freeAddPartitionsToTxnResults(txn_results[0..txn_results_init]);
+                if (txn_results.len > 0) self.allocator.free(txn_results);
             }
-            num_topics += 1;
+
+            for (req.transactions) |txn_req| {
+                const topic_results = self.buildAddPartitionsToTxnTopicResults(txn_req.producer_id, txn_req.producer_epoch, txn_req.verify_only, txn_req.topics) catch return null;
+                var transferred = false;
+                defer {
+                    if (!transferred) {
+                        self.freeAddPartitionsToTxnTopicResults(topic_results);
+                        if (topic_results.len > 0) self.allocator.free(topic_results);
+                    }
+                }
+
+                txn_results[txn_results_init] = .{
+                    .transactional_id = txn_req.transactional_id,
+                    .topic_results = topic_results,
+                };
+                txn_results_init += 1;
+                transferred = true;
+            }
+
+            const resp = Resp{
+                .throttle_time_ms = 0,
+                .error_code = @intFromEnum(ErrorCode.none),
+                .results_by_transaction = txn_results[0..txn_results_init],
+            };
+            return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
         }
 
-        var buf = self.allocator.alloc(u8, 2048) catch return null;
-        var wpos: usize = 0;
-        const rh = ResponseHeader{ .correlation_id = req_header.correlation_id };
-        rh.serialize(buf, &wpos, resp_header_version);
-        ser.writeI32(buf, &wpos, 0); // throttle_time_ms
-        ser.writeArrayLen(buf, &wpos, num_topics);
-        for (0..num_topics) |i| {
-            const te = &topic_errors[i];
-            ser.writeString(buf, &wpos, te.topic);
-            ser.writeArrayLen(buf, &wpos, te.num_partitions);
-            for (0..te.num_partitions) |j| {
-                ser.writeI32(buf, &wpos, te.partitions[j].partition);
-                ser.writeI16(buf, &wpos, te.partitions[j].error_code);
-            }
+        const topic_results = self.buildAddPartitionsToTxnTopicResults(
+            req.v3_and_below_producer_id,
+            req.v3_and_below_producer_epoch,
+            false,
+            req.v3_and_below_topics,
+        ) catch return null;
+        defer {
+            self.freeAddPartitionsToTxnTopicResults(topic_results);
+            if (topic_results.len > 0) self.allocator.free(topic_results);
         }
-        if (resp_header_version >= 1) ser.writeEmptyTaggedFields(buf, &wpos);
-        return (self.allocator.realloc(buf, wpos) catch buf)[0..wpos];
+
+        const resp = Resp{
+            .throttle_time_ms = 0,
+            .results_by_topic_v3_and_below = topic_results,
+        };
+        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+    }
+
+    fn buildAddPartitionsToTxnTopicResults(
+        self: *Broker,
+        producer_id: i64,
+        producer_epoch: i16,
+        verify_only: bool,
+        topic_reqs: []const generated.add_partitions_to_txn_request.AddPartitionsToTxnTopic,
+    ) ![]generated.add_partitions_to_txn_response.AddPartitionsToTxnTopicResult {
+        const TopicResult = generated.add_partitions_to_txn_response.AddPartitionsToTxnTopicResult;
+        const PartitionResult = generated.add_partitions_to_txn_response.AddPartitionsToTxnPartitionResult;
+
+        const topic_results = try self.allocator.alloc(TopicResult, topic_reqs.len);
+        var topic_results_init: usize = 0;
+        errdefer {
+            self.freeAddPartitionsToTxnTopicResults(topic_results[0..topic_results_init]);
+            if (topic_results.len > 0) self.allocator.free(topic_results);
+        }
+
+        for (topic_reqs) |topic_req| {
+            const partition_results = try self.allocator.alloc(PartitionResult, topic_req.partitions.len);
+            var transferred = false;
+            defer {
+                if (!transferred and partition_results.len > 0) self.allocator.free(partition_results);
+            }
+
+            const topic = topic_req.name orelse "";
+            for (topic_req.partitions, 0..) |partition, partition_idx| {
+                const error_code = if (verify_only)
+                    self.txn_coordinator.verifyPartitionInTxn(producer_id, producer_epoch, topic, partition)
+                else
+                    self.txn_coordinator.addPartitionsToTxn(producer_id, producer_epoch, topic, partition) catch 48;
+                partition_results[partition_idx] = .{
+                    .partition_index = partition,
+                    .partition_error_code = error_code,
+                };
+            }
+
+            topic_results[topic_results_init] = .{
+                .name = topic_req.name,
+                .results_by_partition = partition_results,
+            };
+            topic_results_init += 1;
+            transferred = true;
+        }
+
+        return topic_results;
+    }
+
+    fn freeAddPartitionsToTxnRequest(self: *Broker, req: *generated.add_partitions_to_txn_request.AddPartitionsToTxnRequest) void {
+        for (req.transactions) |txn| {
+            for (txn.topics) |topic| {
+                if (topic.partitions.len > 0) self.allocator.free(topic.partitions);
+            }
+            if (txn.topics.len > 0) self.allocator.free(txn.topics);
+        }
+        if (req.transactions.len > 0) self.allocator.free(req.transactions);
+
+        for (req.v3_and_below_topics) |topic| {
+            if (topic.partitions.len > 0) self.allocator.free(topic.partitions);
+        }
+        if (req.v3_and_below_topics.len > 0) self.allocator.free(req.v3_and_below_topics);
+    }
+
+    fn freeAddPartitionsToTxnResults(self: *Broker, results: []const generated.add_partitions_to_txn_response.AddPartitionsToTxnResponse.AddPartitionsToTxnResult) void {
+        for (results) |result| {
+            self.freeAddPartitionsToTxnTopicResults(result.topic_results);
+            if (result.topic_results.len > 0) self.allocator.free(result.topic_results);
+        }
+    }
+
+    fn freeAddPartitionsToTxnTopicResults(self: *Broker, topics: []const generated.add_partitions_to_txn_response.AddPartitionsToTxnTopicResult) void {
+        for (topics) |topic| {
+            if (topic.results_by_partition.len > 0) self.allocator.free(topic.results_by_partition);
+        }
     }
 
     // ---------------------------------------------------------------
@@ -6921,6 +7014,28 @@ pub const Broker = struct {
         return true;
     }
 
+    fn validateAddPartitionsToTxnRequestFrame(buf: []const u8, start_pos: usize, api_version: i16) bool {
+        const flexible = api_version >= 3;
+        var pos = start_pos;
+
+        if (api_version >= 4) {
+            const transaction_count = readKafkaArrayCount(buf, &pos, true) orelse return false;
+            for (0..transaction_count) |_| {
+                if (!skipKafkaString(buf, &pos, true)) return false; // transactional_id
+                if (!skipFixedBytes(buf, &pos, 11)) return false; // producer_id + producer_epoch + verify_only
+                if (!skipAddPartitionsToTxnTopics(buf, &pos, true)) return false;
+                ser.skipTaggedFields(buf, &pos) catch return false;
+            }
+        } else {
+            if (!skipKafkaString(buf, &pos, flexible)) return false; // transactional_id
+            if (!skipFixedBytes(buf, &pos, 10)) return false; // producer_id + producer_epoch
+            if (!skipAddPartitionsToTxnTopics(buf, &pos, flexible)) return false;
+        }
+
+        if (flexible) ser.skipTaggedFields(buf, &pos) catch return false;
+        return true;
+    }
+
     fn validateEndTxnRequestFrame(buf: []const u8, start_pos: usize, api_version: i16) bool {
         const flexible = api_version >= 3;
         var pos = start_pos;
@@ -6928,6 +7043,16 @@ pub const Broker = struct {
         if (!skipKafkaString(buf, &pos, flexible)) return false; // transactional_id
         if (!skipFixedBytes(buf, &pos, 11)) return false; // producer_id + producer_epoch + committed
         if (flexible) ser.skipTaggedFields(buf, &pos) catch return false;
+        return true;
+    }
+
+    fn skipAddPartitionsToTxnTopics(buf: []const u8, pos: *usize, flexible: bool) bool {
+        const topic_count = readKafkaArrayCount(buf, pos, flexible) orelse return false;
+        for (0..topic_count) |_| {
+            if (!skipKafkaString(buf, pos, flexible)) return false; // topic name
+            if (!skipKafkaI32Array(buf, pos, flexible)) return false; // partitions
+            if (flexible) ser.skipTaggedFields(buf, pos) catch return false;
+        }
         return true;
     }
 
@@ -9948,6 +10073,70 @@ test "Broker.handleRequest InitProducerId rejects truncated request" {
 
     var buf: [128]u8 = undefined;
     const req_len = buildTestRequest(&buf, 22, 4, 2205, header_mod.requestHeaderVersion(22, 4));
+    try testing.expect(broker.handleRequest(buf[0..req_len]) == null);
+}
+
+test "Broker.handleRequest AddPartitionsToTxn v4 returns generated response and registers partitions" {
+    const Req = generated.add_partitions_to_txn_request.AddPartitionsToTxnRequest;
+    const Topic = generated.add_partitions_to_txn_request.AddPartitionsToTxnTopic;
+    const Txn = Req.AddPartitionsToTxnTransaction;
+    const Resp = generated.add_partitions_to_txn_response.AddPartitionsToTxnResponse;
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+
+    const init_result = try broker.txn_coordinator.initProducerId("txn-add-parts-generated");
+    const partitions = [_]i32{ 0, 1 };
+    const topics = [_]Topic{.{
+        .name = "txn-add-parts-topic",
+        .partitions = &partitions,
+    }};
+    const txns = [_]Txn{.{
+        .transactional_id = "txn-add-parts-generated",
+        .producer_id = init_result.producer_id,
+        .producer_epoch = init_result.producer_epoch,
+        .verify_only = false,
+        .topics = &topics,
+    }};
+    const req = Req{ .transactions = &txns };
+
+    var buf: [512]u8 = undefined;
+    var pos = buildTestRequest(&buf, 24, 4, 2404, header_mod.requestHeaderVersion(24, 4));
+    req.serialize(&buf, &pos, 4);
+
+    const response = broker.handleRequest(buf[0..pos]);
+    try testing.expect(response != null);
+    defer testing.allocator.free(response.?);
+
+    var rpos: usize = 0;
+    var response_header = try ResponseHeader.deserialize(testing.allocator, response.?, &rpos, header_mod.responseHeaderVersion(24, 4));
+    defer response_header.deinit(testing.allocator);
+    try testing.expectEqual(@as(i32, 2404), response_header.correlation_id);
+
+    const resp = try Resp.deserialize(testing.allocator, response.?, &rpos, 4);
+    defer {
+        broker.freeAddPartitionsToTxnResults(resp.results_by_transaction);
+        if (resp.results_by_transaction.len > 0) testing.allocator.free(resp.results_by_transaction);
+    }
+    try testing.expectEqual(response.?.len, rpos);
+    try testing.expectEqual(@as(i32, 0), resp.throttle_time_ms);
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.none)), resp.error_code);
+    try testing.expectEqual(@as(usize, 1), resp.results_by_transaction.len);
+    try testing.expectEqualStrings("txn-add-parts-generated", resp.results_by_transaction[0].transactional_id.?);
+    try testing.expectEqual(@as(usize, 1), resp.results_by_transaction[0].topic_results.len);
+    try testing.expectEqualStrings("txn-add-parts-topic", resp.results_by_transaction[0].topic_results[0].name.?);
+    try testing.expectEqual(@as(usize, 2), resp.results_by_transaction[0].topic_results[0].results_by_partition.len);
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.none)), resp.results_by_transaction[0].topic_results[0].results_by_partition[0].partition_error_code);
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.none)), resp.results_by_transaction[0].topic_results[0].results_by_partition[1].partition_error_code);
+    try testing.expectEqual(@as(usize, 2), broker.txn_coordinator.getPartitions(init_result.producer_id).?.len);
+}
+
+test "Broker.handleRequest AddPartitionsToTxn rejects truncated request" {
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+
+    var buf: [128]u8 = undefined;
+    const req_len = buildTestRequest(&buf, 24, 4, 2405, header_mod.requestHeaderVersion(24, 4));
     try testing.expect(broker.handleRequest(buf[0..req_len]) == null);
 }
 
