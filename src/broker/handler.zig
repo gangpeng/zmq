@@ -4532,50 +4532,73 @@ pub const Broker = struct {
     // the group coordinator.
     // ---------------------------------------------------------------
     fn handleOffsetDelete(self: *Broker, request_bytes: []const u8, body_start: usize, req_header: *const RequestHeader, api_version: i16, resp_header_version: i16) ?[]u8 {
-        _ = api_version;
-        var pos = body_start;
+        const Req = generated.offset_delete_request.OffsetDeleteRequest;
+        const Resp = generated.offset_delete_response.OffsetDeleteResponse;
+        const TopicResult = Resp.OffsetDeleteResponseTopic;
+        const PartitionResult = TopicResult.OffsetDeleteResponsePartition;
 
-        // Parse: group_id
-        const group_id = (ser.readString(request_bytes, &pos) catch return null) orelse "";
-
-        // Parse topics array
-        const num_topics = (ser.readArrayLen(request_bytes, &pos) catch 0) orelse 0;
-
-        var buf = self.allocator.alloc(u8, 4096) catch return null;
-        var wpos: usize = 0;
-        const rh = ResponseHeader{ .correlation_id = req_header.correlation_id };
-        rh.serialize(buf, &wpos, resp_header_version);
-        ser.writeI16(buf, &wpos, 0); // error_code = NONE
-        ser.writeI32(buf, &wpos, 0); // throttle_time_ms
-
-        ser.writeArrayLen(buf, &wpos, num_topics);
-
-        for (0..num_topics) |_| {
-            const topic_name = (ser.readString(request_bytes, &pos) catch break) orelse "";
-            const num_partitions = (ser.readArrayLen(request_bytes, &pos) catch 0) orelse 0;
-
-            ser.writeString(buf, &wpos, topic_name);
-            ser.writeArrayLen(buf, &wpos, num_partitions);
-
-            for (0..num_partitions) |_| {
-                const partition_id = ser.readI32(request_bytes, &pos);
-
-                // Delete the committed offset from group coordinator
-                // Build the offset key and remove it
-                const key = std.fmt.allocPrint(self.allocator, "{s}:{s}:{d}", .{ group_id, topic_name, partition_id }) catch continue;
-                if (self.groups.committed_offsets.fetchRemove(key)) |old| {
-                    self.allocator.free(old.key);
-                } else {
-                    self.allocator.free(key);
-                }
-
-                ser.writeI32(buf, &wpos, partition_id);
-                ser.writeI16(buf, &wpos, 0); // error_code = NONE
-            }
+        if (!validateOffsetDeleteRequestFrame(request_bytes, body_start)) {
+            log.warn("Malformed OffsetDelete request", .{});
+            return null;
         }
 
-        if (resp_header_version >= 1) ser.writeEmptyTaggedFields(buf, &wpos);
-        return (self.allocator.realloc(buf, wpos) catch buf)[0..wpos];
+        var pos = body_start;
+        var req = Req.deserialize(self.allocator, request_bytes, &pos, api_version) catch |err| {
+            log.warn("Failed to decode OffsetDelete request: {}", .{err});
+            return null;
+        };
+        defer self.freeOffsetDeleteRequest(&req);
+
+        const group_id = req.group_id orelse "";
+        var topics = self.allocator.alloc(TopicResult, req.topics.len) catch return null;
+        defer {
+            self.freeOffsetDeleteResponseTopics(topics);
+            if (topics.len > 0) self.allocator.free(topics);
+        }
+
+        for (req.topics, 0..) |topic, topic_index| {
+            const topic_name = topic.name orelse "";
+            const partitions = self.allocator.alloc(PartitionResult, topic.partitions.len) catch return null;
+            errdefer self.allocator.free(partitions);
+
+            for (topic.partitions, 0..) |partition, partition_index| {
+                const key = std.fmt.allocPrint(self.allocator, "{s}:{s}:{d}", .{ group_id, topic_name, partition.partition_index }) catch return null;
+                if (self.groups.committed_offsets.fetchRemove(key)) |old| {
+                    self.allocator.free(old.key);
+                }
+                self.allocator.free(key);
+
+                partitions[partition_index] = .{
+                    .partition_index = partition.partition_index,
+                    .error_code = @intFromEnum(ErrorCode.none),
+                };
+            }
+
+            topics[topic_index] = .{
+                .name = topic.name,
+                .partitions = partitions,
+            };
+        }
+
+        const resp = Resp{
+            .error_code = @intFromEnum(ErrorCode.none),
+            .throttle_time_ms = 0,
+            .topics = topics,
+        };
+        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+    }
+
+    fn freeOffsetDeleteRequest(self: *Broker, req: *generated.offset_delete_request.OffsetDeleteRequest) void {
+        for (req.topics) |topic| {
+            if (topic.partitions.len > 0) self.allocator.free(topic.partitions);
+        }
+        if (req.topics.len > 0) self.allocator.free(req.topics);
+    }
+
+    fn freeOffsetDeleteResponseTopics(self: *Broker, topics: []const generated.offset_delete_response.OffsetDeleteResponse.OffsetDeleteResponseTopic) void {
+        for (topics) |topic| {
+            if (topic.partitions.len > 0) self.allocator.free(topic.partitions);
+        }
     }
 
     // ---------------------------------------------------------------
@@ -5948,6 +5971,20 @@ pub const Broker = struct {
         return true;
     }
 
+    fn validateOffsetDeleteRequestFrame(buf: []const u8, start_pos: usize) bool {
+        var pos = start_pos;
+
+        if (!skipKafkaString(buf, &pos, false)) return false; // group_id
+        const topic_count = readKafkaArrayCount(buf, &pos, false) orelse return false;
+        for (0..topic_count) |_| {
+            if (!skipKafkaString(buf, &pos, false)) return false; // topic name
+            const partition_count = readKafkaArrayCount(buf, &pos, false) orelse return false;
+            if (partition_count > (buf.len - pos) / 4) return false;
+            pos += partition_count * 4;
+        }
+        return true;
+    }
+
     fn validateVoteRequestFrame(buf: []const u8, start_pos: usize, api_version: i16) bool {
         var pos = start_pos;
 
@@ -6741,6 +6778,71 @@ test "Broker.handleRequest DeleteGroups v2 deletes empty group" {
     try testing.expectEqualStrings("delete-me", group_id);
     try testing.expectEqual(@as(i16, 0), ser.readI16(response.?, &rpos));
     try testing.expectEqual(@as(usize, 0), broker.groups.groupCount());
+}
+
+test "Broker.handleRequest OffsetDelete returns generated response and deletes offsets" {
+    const Req = generated.offset_delete_request.OffsetDeleteRequest;
+    const Resp = generated.offset_delete_response.OffsetDeleteResponse;
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+
+    const committed_key = try testing.allocator.dupe(u8, "delete-offset-group:delete-offset-topic:0");
+    try broker.groups.committed_offsets.put(committed_key, 42);
+
+    const partitions = [_]Req.OffsetDeleteRequestTopic.OffsetDeleteRequestPartition{
+        .{ .partition_index = 0 },
+        .{ .partition_index = 1 },
+    };
+    const topics = [_]Req.OffsetDeleteRequestTopic{.{
+        .name = "delete-offset-topic",
+        .partitions = &partitions,
+    }};
+    const req = Req{
+        .group_id = "delete-offset-group",
+        .topics = &topics,
+    };
+
+    var buf: [512]u8 = undefined;
+    var pos = buildTestRequest(&buf, 47, 0, 4700, header_mod.requestHeaderVersion(47, 0));
+    req.serialize(&buf, &pos, 0);
+
+    const response = broker.handleRequest(buf[0..pos]);
+    try testing.expect(response != null);
+    defer testing.allocator.free(response.?);
+
+    var rpos: usize = 0;
+    var response_header = try ResponseHeader.deserialize(testing.allocator, response.?, &rpos, header_mod.responseHeaderVersion(47, 0));
+    defer response_header.deinit(testing.allocator);
+    try testing.expectEqual(@as(i32, 4700), response_header.correlation_id);
+
+    const resp = try Resp.deserialize(testing.allocator, response.?, &rpos, 0);
+    defer {
+        for (resp.topics) |topic| {
+            if (topic.partitions.len > 0) testing.allocator.free(topic.partitions);
+        }
+        if (resp.topics.len > 0) testing.allocator.free(resp.topics);
+    }
+
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.none)), resp.error_code);
+    try testing.expectEqual(@as(i32, 0), resp.throttle_time_ms);
+    try testing.expectEqual(@as(usize, 1), resp.topics.len);
+    try testing.expectEqualStrings("delete-offset-topic", resp.topics[0].name.?);
+    try testing.expectEqual(@as(usize, 2), resp.topics[0].partitions.len);
+    try testing.expectEqual(@as(i32, 0), resp.topics[0].partitions[0].partition_index);
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.none)), resp.topics[0].partitions[0].error_code);
+    try testing.expectEqual(@as(i32, 1), resp.topics[0].partitions[1].partition_index);
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.none)), resp.topics[0].partitions[1].error_code);
+    try testing.expect(!broker.groups.committed_offsets.contains("delete-offset-group:delete-offset-topic:0"));
+}
+
+test "Broker.handleRequest OffsetDelete rejects truncated request" {
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+
+    var buf: [128]u8 = undefined;
+    const req_len = buildTestRequest(&buf, 47, 0, 4701, header_mod.requestHeaderVersion(47, 0));
+    try testing.expect(broker.handleRequest(buf[0..req_len]) == null);
 }
 
 test "Broker AutoMQ stream object lifecycle APIs" {
