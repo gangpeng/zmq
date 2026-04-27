@@ -6,6 +6,7 @@ const net = @import("net_compat");
 const protocol = @import("protocol");
 const ser = protocol.serialization;
 const header_mod = protocol.header;
+const generated = protocol.generated;
 const OpenSslLib = @import("security").openssl.OpenSslLib;
 const TlsClientContext = @import("security").tls.TlsClientContext;
 
@@ -581,23 +582,25 @@ pub const RaftClientPool = struct {
     /// Used by MetadataClient to discover the controller leader.
     pub fn sendDescribeQuorum(self: *RaftClientPool, peer_id: i32) ?[]u8 {
         const client = self.clients.getPtr(peer_id) orelse return null;
+        const Req = generated.describe_quorum_request.DescribeQuorumRequest;
 
         // Build DescribeQuorum request (API 55, version 0)
         var req_buf: [128]u8 = undefined;
         var pos: usize = 0;
 
-        // Request header v1
+        // Request header v2 because DescribeQuorum v0 is flexible.
         ser.writeI16(&req_buf, &pos, 55); // api_key
         ser.writeI16(&req_buf, &pos, 0); // api_version
         ser.writeI32(&req_buf, &pos, client.next_correlation_id); // correlation_id
         client.next_correlation_id += 1;
-        ser.writeString(&req_buf, &pos, "zmq-metadata-client"); // client_id
+        ser.writeCompactString(&req_buf, &pos, "zmq-metadata-client"); // client_id
+        ser.writeEmptyTaggedFields(&req_buf, &pos);
 
         // DescribeQuorum body: topics array with __cluster_metadata, partition 0
-        ser.writeI32(&req_buf, &pos, 1); // num_topics = 1
-        ser.writeString(&req_buf, &pos, "__cluster_metadata");
-        ser.writeI32(&req_buf, &pos, 1); // num_partitions = 1
-        ser.writeI32(&req_buf, &pos, 0); // partition_index = 0
+        const partitions = [_]Req.TopicData.PartitionData{.{ .partition_index = 0 }};
+        const topics = [_]Req.TopicData{.{ .topic_name = "__cluster_metadata", .partitions = &partitions }};
+        const req = Req{ .topics = &topics };
+        req.serialize(&req_buf, &pos, 0);
 
         return client.sendRawRequest(req_buf[0..pos], self.allocator) catch |err| {
             log.warn("DescribeQuorum to peer {d} failed: {}", .{ peer_id, err });

@@ -25,6 +25,17 @@ pub const GeneratedRequestApi = struct {
     max: i16,
 };
 
+pub const ControllerApiSupport = struct {
+    key: i16,
+    name: []const u8,
+    min: i16,
+    max: i16,
+
+    pub fn range(self: ControllerApiSupport) VersionRange {
+        return .{ .min = self.min, .max = self.max };
+    }
+};
+
 /// APIs that the broker dispatches and advertises through ApiVersions.
 ///
 /// Keep this table sorted by key. It is the single source of truth for
@@ -97,6 +108,23 @@ pub const broker_supported_apis = [_]BrokerApiSupport{
     .{ .key = 600, .name = "GetNextNodeId", .metric = "automq_get_next_node_id", .min = 0, .max = 0 },
     .{ .key = 601, .name = "DescribeStreams", .metric = "automq_describe_streams", .min = 0, .max = 0 },
     .{ .key = 602, .name = "AutomqUpdateGroup", .metric = "automq_update_group", .min = 0, .max = 0 },
+};
+
+/// APIs that the controller port dispatches and advertises through ApiVersions.
+///
+/// Keep this table sorted by key. Dynamic Raft voter APIs must use the
+/// generated Kafka keys 80/81/82 rather than telemetry keys 71/72.
+pub const controller_supported_apis = [_]ControllerApiSupport{
+    .{ .key = 18, .name = "ApiVersions", .min = 0, .max = 4 },
+    .{ .key = 52, .name = "Vote", .min = 0, .max = 1 },
+    .{ .key = 53, .name = "BeginQuorumEpoch", .min = 0, .max = 1 },
+    .{ .key = 54, .name = "EndQuorumEpoch", .min = 0, .max = 1 },
+    .{ .key = 55, .name = "DescribeQuorum", .min = 0, .max = 2 },
+    .{ .key = 62, .name = "BrokerRegistration", .min = 0, .max = 0 },
+    .{ .key = 63, .name = "BrokerHeartbeat", .min = 0, .max = 0 },
+    .{ .key = 67, .name = "AllocateProducerIds", .min = 0, .max = 0 },
+    .{ .key = 80, .name = "AddRaftVoter", .min = 0, .max = 0 },
+    .{ .key = 81, .name = "RemoveRaftVoter", .min = 0, .max = 0 },
 };
 
 /// Request schemas present in src/protocol/schemas. This is intentionally
@@ -303,6 +331,21 @@ pub const non_advertised_handler_api_keys = [_]i16{
     7, // ControlledShutdown
 };
 
+/// Controller handler switch cases. Version support comes from
+/// controller_supported_apis; this table only audits dispatch drift.
+pub const controller_handler_api_keys = [_]i16{
+    18,
+    52,
+    53,
+    54,
+    55,
+    62,
+    63,
+    67,
+    80,
+    81,
+};
+
 pub fn findBrokerSupport(api_key: i16) ?BrokerApiSupport {
     for (broker_supported_apis) |api| {
         if (api.key == api_key) return api;
@@ -330,6 +373,23 @@ pub fn brokerApiName(api_key: i16) []const u8 {
     return "Unknown";
 }
 
+pub fn findControllerSupport(api_key: i16) ?ControllerApiSupport {
+    for (controller_supported_apis) |api| {
+        if (api.key == api_key) return api;
+    }
+    return null;
+}
+
+pub fn controllerVersionRange(api_key: i16) VersionRange {
+    if (findControllerSupport(api_key)) |api| return api.range();
+    return .{ .min = -1, .max = -1 };
+}
+
+pub fn isControllerVersionSupported(api_key: i16, api_version: i16) bool {
+    const range = controllerVersionRange(api_key);
+    return api_version >= range.min and api_version <= range.max;
+}
+
 pub fn findGeneratedRequest(api_key: i16) ?GeneratedRequestApi {
     for (generated_request_apis) |api| {
         if (api.key == api_key) return api;
@@ -339,6 +399,13 @@ pub fn findGeneratedRequest(api_key: i16) ?GeneratedRequestApi {
 
 pub fn hasBrokerHandler(api_key: i16) bool {
     for (broker_handler_api_keys) |key| {
+        if (key == api_key) return true;
+    }
+    return false;
+}
+
+pub fn hasControllerHandler(api_key: i16) bool {
+    for (controller_handler_api_keys) |key| {
         if (key == api_key) return true;
     }
     return false;
@@ -365,13 +432,19 @@ fn countOccurrences(haystack: []const u8, needle: []const u8) usize {
     return count;
 }
 
-fn handleRequestSwitchBody(source: []const u8) ?[]const u8 {
-    const start_marker = "const result = switch (api_key) {";
-    const end_marker = "            else => self.handleUnsupported";
+fn switchBody(source: []const u8, start_marker: []const u8, end_marker: []const u8) ?[]const u8 {
     const start = std.mem.indexOf(u8, source, start_marker) orelse return null;
     const body_start = start + start_marker.len;
     const end_rel = std.mem.indexOf(u8, source[body_start..], end_marker) orelse return null;
     return source[body_start .. body_start + end_rel];
+}
+
+fn brokerHandleRequestSwitchBody(source: []const u8) ?[]const u8 {
+    return switchBody(source, "const result = switch (api_key) {", "            else => self.handleUnsupported");
+}
+
+fn controllerHandleRequestSwitchBody(source: []const u8) ?[]const u8 {
+    return switchBody(source, "return switch (api_key) {", "            else => self.handleUnsupported");
 }
 
 fn switchCaseKey(line: []const u8) ?i16 {
@@ -395,6 +468,15 @@ test "broker API support table is sorted and unique" {
     for (broker_supported_apis) |api| {
         try testing.expect(api.min <= api.max);
         try testing.expect(api.metric.len > 0);
+        if (previous) |prev| try testing.expect(api.key > prev);
+        previous = api.key;
+    }
+}
+
+test "controller API support table is sorted and unique" {
+    var previous: ?i16 = null;
+    for (controller_supported_apis) |api| {
+        try testing.expect(api.min <= api.max);
         if (previous) |prev| try testing.expect(api.key > prev);
         previous = api.key;
     }
@@ -426,9 +508,17 @@ test "broker handler API table is sorted and unique" {
     }
 }
 
+test "controller handler API table is sorted and unique" {
+    var previous: ?i16 = null;
+    for (controller_handler_api_keys) |key| {
+        if (previous) |prev| try testing.expect(key > prev);
+        previous = key;
+    }
+}
+
 test "broker handler switch matches audited handler API table" {
     const handler_source = @embedFile("../broker/handler.zig");
-    const switch_body = handleRequestSwitchBody(handler_source) orelse return error.MissingBrokerHandlerSwitch;
+    const switch_body = brokerHandleRequestSwitchBody(handler_source) orelse return error.MissingBrokerHandlerSwitch;
 
     for (broker_handler_api_keys) |key| {
         try testing.expect(handleRequestSwitchHasCase(switch_body, key));
@@ -441,6 +531,21 @@ test "broker handler switch matches audited handler API table" {
     }
 }
 
+test "controller handler switch matches audited handler API table" {
+    const controller_source = @embedFile("../controller/controller.zig");
+    const switch_body = controllerHandleRequestSwitchBody(controller_source) orelse return error.MissingControllerHandlerSwitch;
+
+    for (controller_handler_api_keys) |key| {
+        try testing.expect(handleRequestSwitchHasCase(switch_body, key));
+    }
+
+    var lines = std.mem.splitScalar(u8, switch_body, '\n');
+    while (lines.next()) |line| {
+        const key = switchCaseKey(line) orelse continue;
+        try testing.expect(hasControllerHandler(key));
+    }
+}
+
 test "broker supported APIs do not advertise versions beyond generated schemas" {
     for (broker_supported_apis) |api| {
         const schema = findGeneratedRequest(api.key) orelse return error.MissingGeneratedRequestSchema;
@@ -449,9 +554,28 @@ test "broker supported APIs do not advertise versions beyond generated schemas" 
     }
 }
 
+test "controller supported APIs do not advertise versions beyond generated schemas" {
+    for (controller_supported_apis) |api| {
+        const schema = findGeneratedRequest(api.key) orelse return error.MissingGeneratedRequestSchema;
+        try testing.expect(api.min >= schema.min);
+        try testing.expect(api.max <= schema.max);
+    }
+
+    try testing.expect(findControllerSupport(71) == null);
+    try testing.expect(findControllerSupport(72) == null);
+    try testing.expectEqualStrings("AddRaftVoter", findControllerSupport(80).?.name);
+    try testing.expectEqualStrings("RemoveRaftVoter", findControllerSupport(81).?.name);
+}
+
 test "broker supported APIs have handler switch coverage" {
     for (broker_supported_apis) |api| {
         try testing.expect(hasBrokerHandler(api.key));
+    }
+}
+
+test "controller supported APIs have handler switch coverage" {
+    for (controller_supported_apis) |api| {
+        try testing.expect(hasControllerHandler(api.key));
     }
 }
 

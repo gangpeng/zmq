@@ -4,8 +4,9 @@ const log = std.log.scoped(.metadata_client);
 
 const protocol = @import("protocol");
 const ser = protocol.serialization;
+const generated = protocol.generated;
 const header_mod = protocol.header;
-const RequestHeader = header_mod.RequestHeader;
+const ResponseHeader = header_mod.ResponseHeader;
 const RaftClientPool = @import("network").RaftClientPool;
 const TlsClientContext = @import("security").tls.TlsClientContext;
 
@@ -132,6 +133,7 @@ pub const MetadataClient = struct {
             for (self.voters.items) |voter| {
                 // Try to send DescribeQuorum to this voter
                 if (self.controller_pool.sendDescribeQuorum(voter.node_id)) |response| {
+                    defer self.allocator.free(response);
                     // Parse the DescribeQuorum response to find leader_id and leader_epoch
                     if (self.parseDescribeQuorumResponse(response)) |info| {
                         self.leader_id = info.leader_id;
@@ -141,7 +143,6 @@ pub const MetadataClient = struct {
                         });
                         return;
                     }
-                    self.allocator.free(response);
                 }
             }
 
@@ -161,35 +162,45 @@ pub const MetadataClient = struct {
     };
 
     fn parseDescribeQuorumResponse(self: *MetadataClient, response: []const u8) ?QuorumInfo {
-        _ = self;
-        if (response.len < 20) return null;
+        const Resp = generated.describe_quorum_response.DescribeQuorumResponse;
 
-        // Skip response header and parse leader info
-        // The exact layout depends on the wire format — simplified parsing
         var pos: usize = 0;
-        // Skip correlation_id (4 bytes) + error_code (2) + topics array header
-        pos += 4; // correlation_id
-        const err = ser.readI16(response, &pos);
-        if (err != 0) return null;
+        var header = ResponseHeader.deserialize(self.allocator, response, &pos, header_mod.responseHeaderVersion(55, 0)) catch return null;
+        defer header.deinit(self.allocator);
 
-        // Skip topics array: num_topics (4), topic name string, num_partitions (4)
-        _ = ser.readI32(response, &pos); // num_topics
-        _ = ser.readString(response, &pos) catch return null; // topic name
-        _ = ser.readI32(response, &pos); // num_partitions
+        var resp = Resp.deserialize(self.allocator, response, &pos, 0) catch return null;
+        defer self.freeDescribeQuorumResponse(&resp);
 
-        // Parse first partition
-        _ = ser.readI16(response, &pos); // error_code
-        _ = ser.readI32(response, &pos); // partition_index
-        const leader_id = ser.readI32(response, &pos);
-        const leader_epoch = ser.readI32(response, &pos);
+        if (resp.error_code != 0) return null;
+        if (resp.topics.len == 0 or resp.topics[0].partitions.len == 0) return null;
+
+        const partition = resp.topics[0].partitions[0];
+        if (partition.error_code != 0) return null;
+        const leader_id = partition.leader_id;
+        const leader_epoch = partition.leader_epoch;
 
         if (leader_id < 0) return null; // No leader elected yet
 
         return .{ .leader_id = leader_id, .leader_epoch = leader_epoch };
     }
 
+    fn freeDescribeQuorumResponse(self: *MetadataClient, resp: *generated.describe_quorum_response.DescribeQuorumResponse) void {
+        for (resp.topics) |topic| {
+            for (topic.partitions) |partition| {
+                if (partition.current_voters.len > 0) self.allocator.free(partition.current_voters);
+                if (partition.observers.len > 0) self.allocator.free(partition.observers);
+            }
+            if (topic.partitions.len > 0) self.allocator.free(topic.partitions);
+        }
+        if (resp.topics.len > 0) self.allocator.free(resp.topics);
+        if (resp.nodes.len > 0) self.allocator.free(resp.nodes);
+    }
+
     /// Register this broker with the controller leader.
     fn registerWithController(self: *MetadataClient) void {
+        const Req = generated.broker_registration_request.BrokerRegistrationRequest;
+        const Resp = generated.broker_registration_response.BrokerRegistrationResponse;
+
         const leader = self.leader_id orelse {
             log.warn("Cannot register: no controller leader known", .{});
             return;
@@ -199,30 +210,42 @@ pub const MetadataClient = struct {
         var buf: [512]u8 = undefined;
         var wpos: usize = 0;
 
-        // Request header
         ser.writeI16(&buf, &wpos, 62); // api_key
         ser.writeI16(&buf, &wpos, 0); // api_version
         ser.writeI32(&buf, &wpos, 1); // correlation_id
-        ser.writeString(&buf, &wpos, "zmq-broker"); // client_id
+        ser.writeCompactString(&buf, &wpos, "zmq-broker"); // client_id
+        ser.writeEmptyTaggedFields(&buf, &wpos);
 
-        // Request body: broker_id, host, port
-        ser.writeI32(&buf, &wpos, self.broker_id);
-        ser.writeString(&buf, &wpos, self.advertised_host);
-        ser.writeI32(&buf, &wpos, @as(i32, self.advertised_port));
+        const listeners = [_]Req.Listener{.{
+            .name = "PLAINTEXT",
+            .host = self.advertised_host,
+            .port = self.advertised_port,
+            .security_protocol = 0,
+        }};
+        const req = Req{
+            .broker_id = self.broker_id,
+            .cluster_id = null,
+            .listeners = &listeners,
+        };
+        req.serialize(&buf, &wpos, 0);
 
         if (self.controller_pool.sendRequest(leader, buf[0..wpos])) |response| {
             defer self.allocator.free(response);
-            // Parse response: skip header (4 bytes corr_id) + throttle_time (4) + error_code (2) + broker_epoch (8)
-            if (response.len >= 18) {
-                var rpos: usize = 4; // skip correlation_id
-                _ = ser.readI32(response, &rpos); // throttle_time_ms
-                const error_code = ser.readI16(response, &rpos);
-                if (error_code == 0) {
-                    self.broker_epoch = ser.readI64(response, &rpos);
-                    log.info("Registered with controller: broker_epoch={d}", .{self.broker_epoch});
-                } else {
-                    log.warn("BrokerRegistration failed: error_code={d}", .{error_code});
-                }
+            var rpos: usize = 0;
+            var resp_header = ResponseHeader.deserialize(self.allocator, response, &rpos, header_mod.responseHeaderVersion(62, 0)) catch {
+                log.warn("Malformed BrokerRegistration response header", .{});
+                return;
+            };
+            defer resp_header.deinit(self.allocator);
+            const resp = Resp.deserialize(self.allocator, response, &rpos, 0) catch {
+                log.warn("Malformed BrokerRegistration response body", .{});
+                return;
+            };
+            if (resp.error_code == 0) {
+                self.broker_epoch = resp.broker_epoch;
+                log.info("Registered with controller: broker_epoch={d}", .{self.broker_epoch});
+            } else {
+                log.warn("BrokerRegistration failed: error_code={d}", .{resp.error_code});
             }
         } else {
             log.warn("Failed to send BrokerRegistration to controller {d}", .{leader});
@@ -231,6 +254,9 @@ pub const MetadataClient = struct {
 
     /// Send a heartbeat to the controller leader.
     fn sendHeartbeat(self: *MetadataClient) void {
+        const Req = generated.broker_heartbeat_request.BrokerHeartbeatRequest;
+        const Resp = generated.broker_heartbeat_response.BrokerHeartbeatResponse;
+
         // Staleness check: if no successful heartbeat within lease period,
         // self-fence to prevent split-brain writes during network partition.
         const now = @import("time_compat").milliTimestamp();
@@ -253,67 +279,52 @@ pub const MetadataClient = struct {
         var buf: [256]u8 = undefined;
         var wpos: usize = 0;
 
-        // Request header
         ser.writeI16(&buf, &wpos, 63); // api_key
         ser.writeI16(&buf, &wpos, 0); // api_version
         ser.writeI32(&buf, &wpos, 2); // correlation_id
-        ser.writeString(&buf, &wpos, "zmq-broker"); // client_id
+        ser.writeCompactString(&buf, &wpos, "zmq-broker"); // client_id
+        ser.writeEmptyTaggedFields(&buf, &wpos);
 
-        // Request body: broker_id, broker_epoch
-        ser.writeI32(&buf, &wpos, self.broker_id);
-        ser.writeI64(&buf, &wpos, self.broker_epoch);
+        const req = Req{ .broker_id = self.broker_id, .broker_epoch = self.broker_epoch };
+        req.serialize(&buf, &wpos, 0);
 
         if (self.controller_pool.sendRequest(leader, buf[0..wpos])) |response| {
             defer self.allocator.free(response);
-            // Parse response: throttle_time(4) + error_code(2) + is_caught_up(1) + is_fenced(1) + should_shut_down(1)
-            if (response.len >= 13) {
-                var rpos: usize = 4; // skip correlation_id
-                _ = ser.readI32(response, &rpos); // throttle_time_ms
-                const error_code = ser.readI16(response, &rpos);
-                if (error_code != 0) {
-                    log.warn("Heartbeat error: code={d}, re-registering", .{error_code});
-                    self.leader_id = null; // Force leader re-discovery
-                    return;
-                }
+            var rpos: usize = 0;
+            var resp_header = ResponseHeader.deserialize(self.allocator, response, &rpos, header_mod.responseHeaderVersion(63, 0)) catch {
+                log.warn("Malformed BrokerHeartbeat response header", .{});
+                self.leader_id = null;
+                return;
+            };
+            defer resp_header.deinit(self.allocator);
+            const resp = Resp.deserialize(self.allocator, response, &rpos, 0) catch {
+                log.warn("Malformed BrokerHeartbeat response body", .{});
+                self.leader_id = null;
+                return;
+            };
 
-                // Parse the three boolean flags
-                const is_caught_up = ser.readBool(response, &rpos) catch false;
-                _ = is_caught_up;
-                const broker_is_fenced = ser.readBool(response, &rpos) catch false;
-                const should_shut_down = ser.readBool(response, &rpos) catch false;
+            if (resp.error_code != 0) {
+                log.warn("Heartbeat error: code={d}, re-registering", .{resp.error_code});
+                self.leader_id = null; // Force leader re-discovery
+                return;
+            }
 
-                // Act on fencing: controller says we're fenced
-                if (broker_is_fenced) {
-                    if (!self.is_fenced.*) {
-                        log.warn("Controller fenced this broker (id={d}), rejecting writes", .{self.broker_id});
-                    }
-                    self.is_fenced.* = true;
-                } else {
-                    // Successful heartbeat — we're alive and unfenced
-                    if (self.is_fenced.*) {
-                        log.info("Controller unfenced this broker (id={d}), resuming writes", .{self.broker_id});
-                    }
-                    self.is_fenced.* = false;
-                    self.last_heartbeat_ms.* = @import("time_compat").milliTimestamp();
+            if (resp.is_fenced) {
+                if (!self.is_fenced.*) {
+                    log.warn("Controller fenced this broker (id={d}), rejecting writes", .{self.broker_id});
                 }
+                self.is_fenced.* = true;
+            } else {
+                if (self.is_fenced.*) {
+                    log.info("Controller unfenced this broker (id={d}), resuming writes", .{self.broker_id});
+                }
+                self.is_fenced.* = false;
+                self.last_heartbeat_ms.* = @import("time_compat").milliTimestamp();
+            }
 
-                // Act on shutdown request
-                if (should_shut_down) {
-                    log.warn("Controller requested shutdown for broker {d}", .{self.broker_id});
-                    self.should_stop.* = true;
-                }
-            } else if (response.len >= 10) {
-                // Shorter response (no boolean flags) — treat as success if error_code == 0
-                var rpos: usize = 4;
-                _ = ser.readI32(response, &rpos); // throttle_time_ms
-                const error_code = ser.readI16(response, &rpos);
-                if (error_code == 0) {
-                    self.last_heartbeat_ms.* = @import("time_compat").milliTimestamp();
-                    self.is_fenced.* = false;
-                } else {
-                    log.warn("Heartbeat error: code={d}, re-registering", .{error_code});
-                    self.leader_id = null;
-                }
+            if (resp.should_shut_down) {
+                log.warn("Controller requested shutdown for broker {d}", .{self.broker_id});
+                self.should_stop.* = true;
             }
         } else {
             log.warn("Heartbeat failed to controller {d}, re-discovering leader", .{leader});
@@ -335,8 +346,14 @@ test "MetadataClient staleness detection fences broker" {
     var should_stop: bool = false;
 
     var mc = MetadataClient.init(
-        testing.allocator, 100, "localhost", 9092,
-        &cached_epoch, &is_fenced, &last_hb, &should_stop,
+        testing.allocator,
+        100,
+        "localhost",
+        9092,
+        &cached_epoch,
+        &is_fenced,
+        &last_hb,
+        &should_stop,
     );
     defer mc.deinit();
 
@@ -361,8 +378,14 @@ test "MetadataClient fresh heartbeat prevents fencing" {
     var should_stop: bool = false;
 
     var mc = MetadataClient.init(
-        testing.allocator, 100, "localhost", 9092,
-        &cached_epoch, &is_fenced, &last_hb, &should_stop,
+        testing.allocator,
+        100,
+        "localhost",
+        9092,
+        &cached_epoch,
+        &is_fenced,
+        &last_hb,
+        &should_stop,
     );
     defer mc.deinit();
 
@@ -383,8 +406,14 @@ test "MetadataClient zero last_heartbeat skips staleness check" {
     var should_stop: bool = false;
 
     var mc = MetadataClient.init(
-        testing.allocator, 100, "localhost", 9092,
-        &cached_epoch, &is_fenced, &last_hb, &should_stop,
+        testing.allocator,
+        100,
+        "localhost",
+        9092,
+        &cached_epoch,
+        &is_fenced,
+        &last_hb,
+        &should_stop,
     );
     defer mc.deinit();
 
@@ -399,29 +428,42 @@ test "MetadataClient zero last_heartbeat skips staleness check" {
 }
 
 test "MetadataClient parseDescribeQuorumResponse valid" {
+    const Resp = generated.describe_quorum_response.DescribeQuorumResponse;
+
     var cached_epoch: i32 = 0;
     var is_fenced: bool = false;
     var last_hb: i64 = 0;
     var should_stop: bool = false;
 
     var mc = MetadataClient.init(
-        testing.allocator, 100, "localhost", 9092,
-        &cached_epoch, &is_fenced, &last_hb, &should_stop,
+        testing.allocator,
+        100,
+        "localhost",
+        9092,
+        &cached_epoch,
+        &is_fenced,
+        &last_hb,
+        &should_stop,
     );
     defer mc.deinit();
 
-    // Build a mock DescribeQuorum response
+    // Build a generated DescribeQuorum v0 response.
     var resp: [128]u8 = undefined;
     var wpos: usize = 0;
-    ser.writeI32(&resp, &wpos, 1); // correlation_id
-    ser.writeI16(&resp, &wpos, 0); // error_code = NONE
-    ser.writeI32(&resp, &wpos, 1); // num_topics = 1
-    ser.writeString(&resp, &wpos, "__cluster_metadata");
-    ser.writeI32(&resp, &wpos, 1); // num_partitions = 1
-    ser.writeI16(&resp, &wpos, 0); // partition error_code
-    ser.writeI32(&resp, &wpos, 0); // partition_index
-    ser.writeI32(&resp, &wpos, 2); // leader_id = 2
-    ser.writeI32(&resp, &wpos, 7); // leader_epoch = 7
+    const header = ResponseHeader{ .correlation_id = 1 };
+    header.serialize(&resp, &wpos, header_mod.responseHeaderVersion(55, 0));
+    const voters = [_]generated.describe_quorum_response.ReplicaState{.{ .replica_id = 2, .log_end_offset = 0 }};
+    const partitions = [_]Resp.TopicData.PartitionData{.{
+        .partition_index = 0,
+        .error_code = 0,
+        .leader_id = 2,
+        .leader_epoch = 7,
+        .high_watermark = 0,
+        .current_voters = &voters,
+    }};
+    const topics = [_]Resp.TopicData{.{ .topic_name = "__cluster_metadata", .partitions = &partitions }};
+    const body = Resp{ .error_code = 0, .topics = &topics };
+    body.serialize(&resp, &wpos, 0);
 
     const info = mc.parseDescribeQuorumResponse(resp[0..wpos]);
     try testing.expect(info != null);
@@ -430,29 +472,40 @@ test "MetadataClient parseDescribeQuorumResponse valid" {
 }
 
 test "MetadataClient parseDescribeQuorumResponse no leader" {
+    const Resp = generated.describe_quorum_response.DescribeQuorumResponse;
+
     var cached_epoch: i32 = 0;
     var is_fenced: bool = false;
     var last_hb: i64 = 0;
     var should_stop: bool = false;
 
     var mc = MetadataClient.init(
-        testing.allocator, 100, "localhost", 9092,
-        &cached_epoch, &is_fenced, &last_hb, &should_stop,
+        testing.allocator,
+        100,
+        "localhost",
+        9092,
+        &cached_epoch,
+        &is_fenced,
+        &last_hb,
+        &should_stop,
     );
     defer mc.deinit();
 
     // Build a response with leader_id = -1 (no leader)
     var resp: [128]u8 = undefined;
     var wpos: usize = 0;
-    ser.writeI32(&resp, &wpos, 1); // correlation_id
-    ser.writeI16(&resp, &wpos, 0); // error_code
-    ser.writeI32(&resp, &wpos, 1); // num_topics
-    ser.writeString(&resp, &wpos, "__cluster_metadata");
-    ser.writeI32(&resp, &wpos, 1); // num_partitions
-    ser.writeI16(&resp, &wpos, 0); // partition error_code
-    ser.writeI32(&resp, &wpos, 0); // partition_index
-    ser.writeI32(&resp, &wpos, -1); // leader_id = -1 (no leader)
-    ser.writeI32(&resp, &wpos, 0); // leader_epoch
+    const header = ResponseHeader{ .correlation_id = 1 };
+    header.serialize(&resp, &wpos, header_mod.responseHeaderVersion(55, 0));
+    const partitions = [_]Resp.TopicData.PartitionData{.{
+        .partition_index = 0,
+        .error_code = 0,
+        .leader_id = -1,
+        .leader_epoch = 0,
+        .high_watermark = 0,
+    }};
+    const topics = [_]Resp.TopicData{.{ .topic_name = "__cluster_metadata", .partitions = &partitions }};
+    const body = Resp{ .error_code = 0, .topics = &topics };
+    body.serialize(&resp, &wpos, 0);
 
     const info = mc.parseDescribeQuorumResponse(resp[0..wpos]);
     try testing.expect(info == null);
@@ -465,8 +518,14 @@ test "MetadataClient setTlsContext propagates to controller pool" {
     var should_stop: bool = false;
 
     var mc = MetadataClient.init(
-        testing.allocator, 100, "localhost", 9092,
-        &cached_epoch, &is_fenced, &last_hb, &should_stop,
+        testing.allocator,
+        100,
+        "localhost",
+        9092,
+        &cached_epoch,
+        &is_fenced,
+        &last_hb,
+        &should_stop,
     );
     defer mc.deinit();
 

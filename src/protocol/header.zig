@@ -215,21 +215,21 @@ pub const flexible_version_rules = [_]FlexibleVersionRule{
     .{ .min_key = 31, .max_key = 31, .first_flexible_version = 2 }, // DeleteAcls
     .{ .min_key = 32, .max_key = 32, .first_flexible_version = 4 }, // DescribeConfigs
     .{ .min_key = 33, .max_key = 33, .first_flexible_version = 2 }, // AlterConfigs
+    .{ .min_key = 34, .max_key = 34, .first_flexible_version = 2 }, // AlterReplicaLogDirs
     .{ .min_key = 35, .max_key = 35, .first_flexible_version = 2 }, // DescribeLogDirs
     .{ .min_key = 36, .max_key = 36, .first_flexible_version = 2 }, // SaslAuthenticate
     .{ .min_key = 37, .max_key = 37, .first_flexible_version = 2 }, // CreatePartitions
+    .{ .min_key = 38, .max_key = 41, .first_flexible_version = 2 }, // DelegationToken APIs
     .{ .min_key = 42, .max_key = 42, .first_flexible_version = 2 }, // DeleteGroups
     .{ .min_key = 43, .max_key = 43, .first_flexible_version = 2 }, // ElectLeaders
     .{ .min_key = 44, .max_key = 44, .first_flexible_version = 1 }, // IncrementalAlterConfigs
     .{ .min_key = 45, .max_key = 45, .first_flexible_version = 0 }, // AlterPartitionReassignments
     .{ .min_key = 46, .max_key = 46, .first_flexible_version = 0 }, // ListPartitionReassignments
     .{ .min_key = 47, .max_key = 47, .first_flexible_version = null }, // OffsetDelete
-    .{ .min_key = 52, .max_key = 52, .first_flexible_version = 0 }, // Vote
-    .{ .min_key = 53, .max_key = 53, .first_flexible_version = 1 }, // BeginQuorumEpoch
-    .{ .min_key = 54, .max_key = 54, .first_flexible_version = 1 }, // EndQuorumEpoch
-    .{ .min_key = 55, .max_key = 55, .first_flexible_version = 0 }, // DescribeQuorum
-    .{ .min_key = 60, .max_key = 60, .first_flexible_version = 0 }, // DescribeCluster
-    .{ .min_key = 61, .max_key = 61, .first_flexible_version = 0 }, // DescribeProducers
+    .{ .min_key = 48, .max_key = 49, .first_flexible_version = 1 }, // ClientQuotas
+    .{ .min_key = 50, .max_key = 52, .first_flexible_version = 0 }, // SCRAM and Vote
+    .{ .min_key = 53, .max_key = 54, .first_flexible_version = 1 }, // Begin/EndQuorumEpoch
+    .{ .min_key = 55, .max_key = 87, .first_flexible_version = 0 }, // KRaft/controller and newer Kafka APIs
     .{ .min_key = 501, .max_key = 519, .first_flexible_version = 0 }, // AutoMQ extensions
     .{ .min_key = 600, .max_key = 602, .first_flexible_version = 0 }, // AutoMQ extensions
 };
@@ -380,6 +380,22 @@ test "advertised APIs have explicit header flexible-version rules" {
     }
 }
 
+test "controller advertised APIs have explicit header flexible-version rules" {
+    for (api_support.controller_supported_apis) |api| {
+        const rule = findFlexibleVersionRule(api.key) orelse return error.MissingHeaderFlexibleVersionRule;
+
+        var version = api.min;
+        while (version <= api.max) : (version += 1) {
+            const flexible = if (rule.first_flexible_version) |first| version >= first else false;
+            const expected_request_header: i16 = if (flexible) 2 else 1;
+            const expected_response_header: i16 = if (api.key == 18) 0 else if (flexible) 1 else 0;
+
+            try testing.expectEqual(expected_request_header, requestHeaderVersion(api.key, version));
+            try testing.expectEqual(expected_response_header, responseHeaderVersion(api.key, version));
+        }
+    }
+}
+
 test "KRaft quorum APIs use non-flexible v0 and flexible v1 headers" {
     try testing.expectEqual(@as(i16, 1), requestHeaderVersion(53, 0));
     try testing.expectEqual(@as(i16, 0), responseHeaderVersion(53, 0));
@@ -390,6 +406,21 @@ test "KRaft quorum APIs use non-flexible v0 and flexible v1 headers" {
     try testing.expectEqual(@as(i16, 0), responseHeaderVersion(54, 0));
     try testing.expectEqual(@as(i16, 2), requestHeaderVersion(54, 1));
     try testing.expectEqual(@as(i16, 1), responseHeaderVersion(54, 1));
+}
+
+test "controller lifecycle APIs use generated flexible v0 headers" {
+    try testing.expectEqual(@as(i16, 2), requestHeaderVersion(62, 0));
+    try testing.expectEqual(@as(i16, 1), responseHeaderVersion(62, 0));
+    try testing.expectEqual(@as(i16, 2), requestHeaderVersion(63, 0));
+    try testing.expectEqual(@as(i16, 1), responseHeaderVersion(63, 0));
+    try testing.expectEqual(@as(i16, 2), requestHeaderVersion(67, 0));
+    try testing.expectEqual(@as(i16, 1), responseHeaderVersion(67, 0));
+    try testing.expectEqual(@as(i16, 2), requestHeaderVersion(80, 0));
+    try testing.expectEqual(@as(i16, 1), responseHeaderVersion(80, 0));
+    try testing.expectEqual(@as(i16, 2), requestHeaderVersion(81, 0));
+    try testing.expectEqual(@as(i16, 1), responseHeaderVersion(81, 0));
+    try testing.expectEqual(@as(i16, 2), requestHeaderVersion(82, 0));
+    try testing.expectEqual(@as(i16, 1), responseHeaderVersion(82, 0));
 }
 
 test "RequestHeader null client_id" {

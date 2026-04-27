@@ -4,9 +4,12 @@ const log = std.log.scoped(.controller);
 
 const protocol = @import("protocol");
 const ser = protocol.serialization;
+const generated = protocol.generated;
+const api_support = protocol.api_support;
 const header_mod = protocol.header;
 const RequestHeader = header_mod.RequestHeader;
 const ResponseHeader = header_mod.ResponseHeader;
+const ErrorCode = protocol.ErrorCode;
 const RaftState = @import("raft").RaftState;
 const BrokerRegistry = @import("broker_registry.zig").BrokerRegistry;
 
@@ -86,16 +89,16 @@ pub const Controller = struct {
         log.debug("Controller api_key={d} corr={d}", .{ api_key, req_header.correlation_id });
 
         return switch (api_key) {
-            18 => self.handleApiVersions(&req_header, resp_header_version),
+            18 => self.handleApiVersions(&req_header, api_version, resp_header_version),
             52 => self.handleVote(request_bytes, pos, &req_header, resp_header_version),
             53 => self.handleBeginQuorumEpoch(request_bytes, pos, &req_header, resp_header_version),
             54 => self.handleEndQuorumEpoch(request_bytes, pos, &req_header, resp_header_version),
-            55 => self.handleDescribeQuorum(&req_header, resp_header_version),
-            62 => self.handleBrokerRegistration(request_bytes, pos, &req_header, resp_header_version),
-            63 => self.handleBrokerHeartbeat(request_bytes, pos, &req_header, resp_header_version),
-            71 => self.handleAddRaftVoter(request_bytes, pos, &req_header, resp_header_version),
-            72 => self.handleRemoveRaftVoter(request_bytes, pos, &req_header, resp_header_version),
-            67 => self.handleAllocateProducerIds(request_bytes, pos, &req_header, resp_header_version),
+            55 => self.handleDescribeQuorum(request_bytes, pos, &req_header, api_version, resp_header_version),
+            62 => self.handleBrokerRegistration(request_bytes, pos, &req_header, api_version, resp_header_version),
+            63 => self.handleBrokerHeartbeat(request_bytes, pos, &req_header, api_version, resp_header_version),
+            67 => self.handleAllocateProducerIds(request_bytes, pos, &req_header, api_version, resp_header_version),
+            80 => self.handleAddRaftVoter(request_bytes, pos, &req_header, api_version, resp_header_version),
+            81 => self.handleRemoveRaftVoter(request_bytes, pos, &req_header, api_version, resp_header_version),
             else => self.handleUnsupported(&req_header, api_key, resp_header_version),
         };
     }
@@ -103,36 +106,25 @@ pub const Controller = struct {
     // ---------------------------------------------------------------
     // ApiVersions (key 18) — controller-scoped
     // ---------------------------------------------------------------
-    fn handleApiVersions(self: *Controller, req_header: *const RequestHeader, resp_header_version: i16) ?[]u8 {
-        const supported = [_]struct { key: i16, min: i16, max: i16 }{
-            .{ .key = 18, .min = 0, .max = 4 }, // ApiVersions
-            .{ .key = 52, .min = 0, .max = 1 }, // Vote
-            .{ .key = 53, .min = 0, .max = 1 }, // BeginQuorumEpoch
-            .{ .key = 54, .min = 0, .max = 1 }, // EndQuorumEpoch
-            .{ .key = 55, .min = 0, .max = 1 }, // DescribeQuorum
-            .{ .key = 62, .min = 0, .max = 0 }, // BrokerRegistration
-            .{ .key = 63, .min = 0, .max = 0 }, // BrokerHeartbeat
-            .{ .key = 71, .min = 0, .max = 0 }, // AddRaftVoter
-            .{ .key = 72, .min = 0, .max = 0 }, // RemoveRaftVoter
-            .{ .key = 67, .min = 0, .max = 0 }, // AllocateProducerIds
-        };
+    fn handleApiVersions(self: *Controller, req_header: *const RequestHeader, api_version: i16, resp_header_version: i16) ?[]u8 {
+        const Resp = generated.api_versions_response.ApiVersionsResponse;
+        const supported = api_support.controller_supported_apis;
 
-        var buf = self.allocator.alloc(u8, 256) catch return null;
-        var wpos: usize = 0;
-        const rh = ResponseHeader{ .correlation_id = req_header.correlation_id };
-        rh.serialize(buf, &wpos, resp_header_version);
-
-        ser.writeI16(buf, &wpos, 0); // error_code: NONE
-        ser.writeArrayLen(buf, &wpos, supported.len);
-        for (supported) |s| {
-            ser.writeI16(buf, &wpos, s.key);
-            ser.writeI16(buf, &wpos, s.min);
-            ser.writeI16(buf, &wpos, s.max);
+        var api_keys_list: [supported.len]Resp.ApiVersion = undefined;
+        for (supported, 0..) |api, i| {
+            api_keys_list[i] = .{
+                .api_key = api.key,
+                .min_version = api.min,
+                .max_version = api.max,
+            };
         }
-        ser.writeI32(buf, &wpos, 0); // throttle_time_ms
-        if (resp_header_version >= 1) ser.writeEmptyTaggedFields(buf, &wpos);
 
-        return (self.allocator.realloc(buf, wpos) catch buf)[0..wpos];
+        const resp = Resp{
+            .error_code = 0,
+            .api_keys = api_keys_list[0..],
+            .throttle_time_ms = 0,
+        };
+        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
     }
 
     // ---------------------------------------------------------------
@@ -226,189 +218,258 @@ pub const Controller = struct {
     // ---------------------------------------------------------------
     // DescribeQuorum (key 55) — KRaft quorum info
     // ---------------------------------------------------------------
-    fn handleDescribeQuorum(self: *Controller, req_header: *const RequestHeader, resp_header_version: i16) ?[]u8 {
-        var buf = self.allocator.alloc(u8, 512) catch return null;
-        var wpos: usize = 0;
-        const rh = ResponseHeader{ .correlation_id = req_header.correlation_id };
-        rh.serialize(buf, &wpos, resp_header_version);
+    fn handleDescribeQuorum(self: *Controller, request_bytes: []const u8, start_pos: usize, req_header: *const RequestHeader, api_version: i16, resp_header_version: i16) ?[]u8 {
+        const Req = generated.describe_quorum_request.DescribeQuorumRequest;
+        const Resp = generated.describe_quorum_response.DescribeQuorumResponse;
+        const Topic = Resp.TopicData;
+        const Partition = Topic.PartitionData;
+        const ReplicaState = generated.describe_quorum_response.ReplicaState;
 
-        ser.writeI16(buf, &wpos, 0); // error_code
-        // Topics array — one topic (__cluster_metadata)
-        ser.writeI32(buf, &wpos, 1);
-        ser.writeString(buf, &wpos, "__cluster_metadata");
-        // Partitions array — one partition
-        ser.writeI32(buf, &wpos, 1);
-        ser.writeI16(buf, &wpos, 0); // error_code
-        ser.writeI32(buf, &wpos, 0); // partition_index
-        ser.writeI32(buf, &wpos, self.raft_state.leader_id orelse -1);
-        ser.writeI32(buf, &wpos, self.raft_state.current_epoch);
-        ser.writeI64(buf, &wpos, @intCast(self.raft_state.log.lastOffset()));
+        var pos = start_pos;
+        var req = Req.deserialize(self.allocator, request_bytes, &pos, api_version) catch |err| {
+            log.warn("Failed to decode DescribeQuorum request: {}", .{err});
+            const resp = Resp{ .error_code = ErrorCode.invalid_request.toInt(), .topics = &.{} };
+            return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+        };
+        defer self.freeDescribeQuorumRequest(&req);
 
-        // Voters array
         const voter_count = self.raft_state.quorumSize();
-        ser.writeI32(buf, &wpos, @intCast(voter_count));
+        const voters = self.allocator.alloc(ReplicaState, voter_count) catch return null;
+        defer self.allocator.free(voters);
 
+        var voter_index: usize = 0;
         var vit = self.raft_state.voters.iterator();
-        while (vit.next()) |entry| {
-            ser.writeI32(buf, &wpos, entry.key_ptr.*); // replica_id
-            ser.writeI64(buf, &wpos, @intCast(entry.value_ptr.match_index)); // log_end_offset
+        while (vit.next()) |entry| : (voter_index += 1) {
+            voters[voter_index] = .{
+                .replica_id = entry.key_ptr.*,
+                .log_end_offset = @intCast(entry.value_ptr.match_index),
+                .last_fetch_timestamp = -1,
+                .last_caught_up_timestamp = -1,
+            };
         }
 
-        // Observers array (empty — broker-only nodes are not tracked here yet)
-        ser.writeI32(buf, &wpos, 0);
+        const requested_topics = if (req.topics.len == 0) 1 else req.topics.len;
+        const topics = self.allocator.alloc(Topic, requested_topics) catch return null;
+        for (topics) |*topic| {
+            topic.* = .{ .topic_name = null, .partitions = &.{} };
+        }
+        defer {
+            for (topics) |topic| {
+                if (topic.partitions.len > 0) self.allocator.free(topic.partitions);
+            }
+            self.allocator.free(topics);
+        }
 
-        return (self.allocator.realloc(buf, wpos) catch buf)[0..wpos];
+        if (req.topics.len == 0) {
+            const partitions = self.allocator.alloc(Partition, 1) catch return null;
+            partitions[0] = self.describeQuorumPartition(0, voters, api_version);
+            topics[0] = .{
+                .topic_name = "__cluster_metadata",
+                .partitions = partitions,
+            };
+        } else {
+            for (req.topics, 0..) |topic_req, topic_index| {
+                const partition_count = if (topic_req.partitions.len == 0) 1 else topic_req.partitions.len;
+                const partitions = self.allocator.alloc(Partition, partition_count) catch return null;
+                if (topic_req.partitions.len == 0) {
+                    partitions[0] = self.describeQuorumPartition(0, voters, api_version);
+                } else {
+                    for (topic_req.partitions, 0..) |partition_req, partition_index| {
+                        partitions[partition_index] = self.describeQuorumPartition(partition_req.partition_index, voters, api_version);
+                    }
+                }
+                topics[topic_index] = .{
+                    .topic_name = topic_req.topic_name,
+                    .partitions = partitions,
+                };
+            }
+        }
+
+        const resp = Resp{
+            .error_code = 0,
+            .topics = topics,
+            .nodes = &.{},
+        };
+        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+    }
+
+    fn describeQuorumPartition(self: *Controller, partition_index: i32, voters: []const generated.describe_quorum_response.ReplicaState, api_version: i16) generated.describe_quorum_response.DescribeQuorumResponse.TopicData.PartitionData {
+        _ = api_version;
+        return .{
+            .partition_index = partition_index,
+            .error_code = 0,
+            .leader_id = self.raft_state.leader_id orelse -1,
+            .leader_epoch = self.raft_state.current_epoch,
+            .high_watermark = @intCast(self.raft_state.log.lastOffset()),
+            .current_voters = voters,
+            .observers = &.{},
+        };
+    }
+
+    fn freeDescribeQuorumRequest(self: *Controller, req: *generated.describe_quorum_request.DescribeQuorumRequest) void {
+        for (req.topics) |topic| {
+            if (topic.partitions.len > 0) self.allocator.free(topic.partitions);
+        }
+        if (req.topics.len > 0) self.allocator.free(req.topics);
     }
 
     // ---------------------------------------------------------------
     // BrokerRegistration (key 62) — broker lifecycle
     // ---------------------------------------------------------------
-    fn handleBrokerRegistration(self: *Controller, request_bytes: []const u8, start_pos: usize, req_header: *const RequestHeader, resp_header_version: i16) ?[]u8 {
+    fn handleBrokerRegistration(self: *Controller, request_bytes: []const u8, start_pos: usize, req_header: *const RequestHeader, api_version: i16, resp_header_version: i16) ?[]u8 {
+        const Req = generated.broker_registration_request.BrokerRegistrationRequest;
+        const Resp = generated.broker_registration_response.BrokerRegistrationResponse;
         var pos = start_pos;
 
-        // Simplified parsing: broker_id, host (as string), port
-        const broker_id = ser.readI32(request_bytes, &pos);
-        const host = (ser.readString(request_bytes, &pos) catch null) orelse "unknown";
-        const broker_port = ser.readI32(request_bytes, &pos);
+        var req = Req.deserialize(self.allocator, request_bytes, &pos, api_version) catch |err| {
+            log.warn("Failed to decode BrokerRegistration request: {}", .{err});
+            const resp = Resp{ .error_code = ErrorCode.invalid_request.toInt(), .broker_epoch = -1 };
+            return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+        };
+        defer self.freeBrokerRegistrationRequest(&req);
+
+        const listener = if (req.listeners.len > 0) req.listeners[0] else null;
+        const host = if (listener) |l| (l.host orelse "unknown") else "unknown";
+        const broker_port: u16 = if (listener) |l| l.port else 0;
 
         const broker_epoch = self.broker_registry.register(
-            broker_id,
+            req.broker_id,
             host,
-            @intCast(broker_port),
+            broker_port,
         ) catch {
-            log.warn("BrokerRegistration failed for broker {d}", .{broker_id});
-            return self.errorResponse(req_header, resp_header_version, 1); // UNKNOWN_SERVER_ERROR
+            log.warn("BrokerRegistration failed for broker {d}", .{req.broker_id});
+            const resp = Resp{ .error_code = ErrorCode.invalid_request.toInt(), .broker_epoch = -1 };
+            return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
         };
 
-        var buf = self.allocator.alloc(u8, 64) catch return null;
-        var wpos: usize = 0;
-        const rh = ResponseHeader{ .correlation_id = req_header.correlation_id };
-        rh.serialize(buf, &wpos, resp_header_version);
-        ser.writeI32(buf, &wpos, 0); // throttle_time_ms
-        ser.writeI16(buf, &wpos, 0); // error_code: NONE
-        ser.writeI64(buf, &wpos, broker_epoch);
-        if (resp_header_version >= 1) ser.writeEmptyTaggedFields(buf, &wpos);
+        const resp = Resp{ .throttle_time_ms = 0, .error_code = 0, .broker_epoch = broker_epoch };
+        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+    }
 
-        return (self.allocator.realloc(buf, wpos) catch buf)[0..wpos];
+    fn freeBrokerRegistrationRequest(self: *Controller, req: *generated.broker_registration_request.BrokerRegistrationRequest) void {
+        if (req.listeners.len > 0) self.allocator.free(req.listeners);
+        if (req.features.len > 0) self.allocator.free(req.features);
+        if (req.log_dirs.len > 0) self.allocator.free(req.log_dirs);
     }
 
     // ---------------------------------------------------------------
     // BrokerHeartbeat (key 63) — broker liveness
     // ---------------------------------------------------------------
-    fn handleBrokerHeartbeat(self: *Controller, request_bytes: []const u8, start_pos: usize, req_header: *const RequestHeader, resp_header_version: i16) ?[]u8 {
+    fn handleBrokerHeartbeat(self: *Controller, request_bytes: []const u8, start_pos: usize, req_header: *const RequestHeader, api_version: i16, resp_header_version: i16) ?[]u8 {
+        const Req = generated.broker_heartbeat_request.BrokerHeartbeatRequest;
+        const Resp = generated.broker_heartbeat_response.BrokerHeartbeatResponse;
         var pos = start_pos;
 
-        const broker_id = ser.readI32(request_bytes, &pos);
-        const broker_epoch = ser.readI64(request_bytes, &pos);
+        const req = Req.deserialize(self.allocator, request_bytes, &pos, api_version) catch |err| {
+            log.warn("Failed to decode BrokerHeartbeat request: {}", .{err});
+            const resp = Resp{ .error_code = ErrorCode.invalid_request.toInt(), .is_caught_up = false, .is_fenced = true, .should_shut_down = false };
+            return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+        };
 
-        const is_active = self.broker_registry.heartbeat(broker_id, broker_epoch) catch false;
+        const is_active = self.broker_registry.heartbeat(req.broker_id, req.broker_epoch) catch false;
 
-        var buf = self.allocator.alloc(u8, 64) catch return null;
-        var wpos: usize = 0;
-        const rh = ResponseHeader{ .correlation_id = req_header.correlation_id };
-        rh.serialize(buf, &wpos, resp_header_version);
-        ser.writeI32(buf, &wpos, 0); // throttle_time_ms
-        ser.writeI16(buf, &wpos, 0); // error_code
-        ser.writeBool(buf, &wpos, false); // is_caught_up
-        ser.writeBool(buf, &wpos, !is_active); // is_fenced
-        ser.writeBool(buf, &wpos, false); // should_shut_down
-        if (resp_header_version >= 1) ser.writeEmptyTaggedFields(buf, &wpos);
-
-        return (self.allocator.realloc(buf, wpos) catch buf)[0..wpos];
+        const resp = Resp{
+            .throttle_time_ms = 0,
+            .error_code = 0,
+            .is_caught_up = true,
+            .is_fenced = !is_active,
+            .should_shut_down = false,
+        };
+        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
     }
 
     // ---------------------------------------------------------------
-    // AddRaftVoter (key 71) — dynamic voter membership
+    // AddRaftVoter (key 80) — dynamic voter membership
     // ---------------------------------------------------------------
-    fn handleAddRaftVoter(self: *Controller, request_bytes: []const u8, start_pos: usize, req_header: *const RequestHeader, resp_header_version: i16) ?[]u8 {
+    fn handleAddRaftVoter(self: *Controller, request_bytes: []const u8, start_pos: usize, req_header: *const RequestHeader, api_version: i16, resp_header_version: i16) ?[]u8 {
+        const Req = generated.add_raft_voter_request.AddRaftVoterRequest;
+        const Resp = generated.add_raft_voter_response.AddRaftVoterResponse;
         var pos = start_pos;
 
-        // Parse: voter_id
-        const voter_id = ser.readI32(request_bytes, &pos);
+        const req = Req.deserialize(self.allocator, request_bytes, &pos, api_version) catch |err| {
+            log.warn("Failed to decode AddRaftVoter request: {}", .{err});
+            const resp = Resp{ .error_code = ErrorCode.invalid_request.toInt(), .error_message = "malformed AddRaftVoter request" };
+            return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+        };
+        defer if (req.listeners.len > 0) self.allocator.free(req.listeners);
 
-        const offset = self.raft_state.proposeAddVoter(voter_id) catch |err| {
+        const offset = self.raft_state.proposeAddVoter(req.voter_id) catch |err| {
             const error_code: i16 = switch (err) {
-                error.NotLeader => 41, // NOT_CONTROLLER
-                error.ConfigChangePending => 89, // CONCURRENT_TRANSACTIONS (reuse for pending config)
-                error.VoterAlreadyExists => 73, // DUPLICATE_RESOURCE
-                else => 1, // UNKNOWN_SERVER_ERROR
+                error.NotLeader => ErrorCode.not_controller.toInt(),
+                error.ConfigChangePending => ErrorCode.concurrent_transactions.toInt(),
+                error.VoterAlreadyExists => ErrorCode.duplicate_resource.toInt(),
+                else => ErrorCode.invalid_request.toInt(),
             };
-            return self.errorResponse(req_header, resp_header_version, error_code);
+            const resp = Resp{ .error_code = error_code, .error_message = null };
+            return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
         };
 
-        log.info("AddRaftVoter: proposed adding node {d} at offset {d}", .{ voter_id, offset });
+        log.info("AddRaftVoter: proposed adding node {d} at offset {d}", .{ req.voter_id, offset });
 
-        var buf = self.allocator.alloc(u8, 64) catch return null;
-        var wpos: usize = 0;
-        const rh = ResponseHeader{ .correlation_id = req_header.correlation_id };
-        rh.serialize(buf, &wpos, resp_header_version);
-        ser.writeI16(buf, &wpos, 0); // error_code: NONE
-        ser.writeI32(buf, &wpos, 0); // throttle_time_ms
-        if (resp_header_version >= 1) ser.writeEmptyTaggedFields(buf, &wpos);
-
-        return (self.allocator.realloc(buf, wpos) catch buf)[0..wpos];
+        const resp = Resp{ .throttle_time_ms = 0, .error_code = 0, .error_message = null };
+        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
     }
 
     // ---------------------------------------------------------------
-    // RemoveRaftVoter (key 72) — dynamic voter membership
+    // RemoveRaftVoter (key 81) — dynamic voter membership
     // ---------------------------------------------------------------
-    fn handleRemoveRaftVoter(self: *Controller, request_bytes: []const u8, start_pos: usize, req_header: *const RequestHeader, resp_header_version: i16) ?[]u8 {
+    fn handleRemoveRaftVoter(self: *Controller, request_bytes: []const u8, start_pos: usize, req_header: *const RequestHeader, api_version: i16, resp_header_version: i16) ?[]u8 {
+        const Req = generated.remove_raft_voter_request.RemoveRaftVoterRequest;
+        const Resp = generated.remove_raft_voter_response.RemoveRaftVoterResponse;
         var pos = start_pos;
 
-        // Parse: voter_id
-        const voter_id = ser.readI32(request_bytes, &pos);
-
-        const offset = self.raft_state.proposeRemoveVoter(voter_id) catch |err| {
-            const error_code: i16 = switch (err) {
-                error.NotLeader => 41, // NOT_CONTROLLER
-                error.ConfigChangePending => 89, // CONCURRENT_TRANSACTIONS
-                error.VoterNotFound => 69, // RESOURCE_NOT_FOUND
-                error.CannotRemoveLastVoter => 87, // INVALID_REQUEST
-                else => 1,
-            };
-            return self.errorResponse(req_header, resp_header_version, error_code);
+        const req = Req.deserialize(self.allocator, request_bytes, &pos, api_version) catch |err| {
+            log.warn("Failed to decode RemoveRaftVoter request: {}", .{err});
+            const resp = Resp{ .error_code = ErrorCode.invalid_request.toInt(), .error_message = "malformed RemoveRaftVoter request" };
+            return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
         };
 
-        log.info("RemoveRaftVoter: proposed removing node {d} at offset {d}", .{ voter_id, offset });
+        const offset = self.raft_state.proposeRemoveVoter(req.voter_id) catch |err| {
+            const error_code: i16 = switch (err) {
+                error.NotLeader => ErrorCode.not_controller.toInt(),
+                error.ConfigChangePending => ErrorCode.concurrent_transactions.toInt(),
+                error.VoterNotFound => ErrorCode.resource_not_found.toInt(),
+                error.CannotRemoveLastVoter => ErrorCode.invalid_request.toInt(),
+                else => ErrorCode.invalid_request.toInt(),
+            };
+            const resp = Resp{ .error_code = error_code, .error_message = null };
+            return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+        };
 
-        var buf = self.allocator.alloc(u8, 64) catch return null;
-        var wpos: usize = 0;
-        const rh = ResponseHeader{ .correlation_id = req_header.correlation_id };
-        rh.serialize(buf, &wpos, resp_header_version);
-        ser.writeI16(buf, &wpos, 0); // error_code: NONE
-        ser.writeI32(buf, &wpos, 0); // throttle_time_ms
-        if (resp_header_version >= 1) ser.writeEmptyTaggedFields(buf, &wpos);
+        log.info("RemoveRaftVoter: proposed removing node {d} at offset {d}", .{ req.voter_id, offset });
 
-        return (self.allocator.realloc(buf, wpos) catch buf)[0..wpos];
+        const resp = Resp{ .throttle_time_ms = 0, .error_code = 0, .error_message = null };
+        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
     }
 
     // ---------------------------------------------------------------
     // AllocateProducerIds (key 67) — PID block allocation
     // ---------------------------------------------------------------
-    fn handleAllocateProducerIds(self: *Controller, request_bytes: []const u8, start_pos: usize, req_header: *const RequestHeader, resp_header_version: i16) ?[]u8 {
+    fn handleAllocateProducerIds(self: *Controller, request_bytes: []const u8, start_pos: usize, req_header: *const RequestHeader, api_version: i16, resp_header_version: i16) ?[]u8 {
+        const Req = generated.allocate_producer_ids_request.AllocateProducerIdsRequest;
+        const Resp = generated.allocate_producer_ids_response.AllocateProducerIdsResponse;
         var pos = start_pos;
 
-        const broker_id = ser.readI32(request_bytes, &pos);
-        const broker_epoch = ser.readI64(request_bytes, &pos);
-        _ = broker_id;
-        _ = broker_epoch;
+        const req = Req.deserialize(self.allocator, request_bytes, &pos, api_version) catch |err| {
+            log.warn("Failed to decode AllocateProducerIds request: {}", .{err});
+            const resp = Resp{ .error_code = ErrorCode.invalid_request.toInt(), .producer_id_start = -1, .producer_id_len = 0 };
+            return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+        };
+        _ = req.broker_id;
+        _ = req.broker_epoch;
 
         // Allocate a block of 1000 producer IDs
         const block_start = self.next_producer_id;
         const block_len: i32 = 1000;
         self.next_producer_id += block_len;
 
-        var buf = self.allocator.alloc(u8, 128) catch return null;
-        var wpos: usize = 0;
-        const rh = ResponseHeader{ .correlation_id = req_header.correlation_id };
-        rh.serialize(buf, &wpos, resp_header_version);
-        ser.writeI32(buf, &wpos, 0); // throttle_time_ms
-        ser.writeI16(buf, &wpos, 0); // error_code: NONE
-        ser.writeI64(buf, &wpos, block_start); // producer_id_start
-        ser.writeI32(buf, &wpos, block_len); // producer_id_len
-        if (resp_header_version >= 1) ser.writeEmptyTaggedFields(buf, &wpos);
-
-        return (self.allocator.realloc(buf, wpos) catch buf)[0..wpos];
+        const resp = Resp{
+            .throttle_time_ms = 0,
+            .error_code = 0,
+            .producer_id_start = block_start,
+            .producer_id_len = block_len,
+        };
+        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
     }
 
     // ---------------------------------------------------------------
@@ -417,6 +478,19 @@ pub const Controller = struct {
     fn handleUnsupported(self: *Controller, req_header: *const RequestHeader, api_key: i16, resp_header_version: i16) ?[]u8 {
         log.warn("Unsupported API on controller port: {d}", .{api_key});
         return self.errorResponse(req_header, resp_header_version, 35); // UNSUPPORTED_VERSION
+    }
+
+    fn serializeGeneratedResponse(self: *Controller, req_header: *const RequestHeader, resp_header_version: i16, resp_body: anytype, body_version: i16) ?[]u8 {
+        const resp_header = ResponseHeader{ .correlation_id = req_header.correlation_id };
+        const header_size = resp_header.calcSize(resp_header_version);
+        const body_size = resp_body.calcSize(body_version);
+        const total_size = header_size + body_size;
+
+        const buf = self.allocator.alloc(u8, total_size) catch return null;
+        var wpos: usize = 0;
+        resp_header.serialize(buf, &wpos, resp_header_version);
+        resp_body.serialize(buf, &wpos, body_version);
+        return buf[0..wpos];
     }
 
     /// Build a simple error response.
@@ -603,9 +677,8 @@ test "Controller handleRequest BeginQuorumEpoch accepts higher epoch" {
     // Controller starts at epoch 0 (unattached)
     try testing.expectEqual(@as(i32, 0), ctrl.raft_state.current_epoch);
 
-    // BeginQuorumEpoch (53, v0) is flexible → header v2 / response v1
     var buf: [256]u8 = undefined;
-    var pos = buildTestRequest(&buf, 53, 0, 20, 2);
+    var pos = buildTestRequest(&buf, 53, 0, 20, header_mod.requestHeaderVersion(53, 0));
 
     // BeginQuorumEpoch body:
     ser.writeI16(&buf, &pos, 0); // error_code
@@ -633,7 +706,7 @@ test "Controller handleRequest BeginQuorumEpoch ignores stale epoch" {
 
     // Send BeginQuorumEpoch with stale epoch 3
     var buf: [256]u8 = undefined;
-    var pos = buildTestRequest(&buf, 53, 0, 21, 2);
+    var pos = buildTestRequest(&buf, 53, 0, 21, header_mod.requestHeaderVersion(53, 0));
 
     ser.writeI16(&buf, &pos, 0); // error_code
     ser.writeI32(&buf, &pos, 0); // topics_len
@@ -658,8 +731,13 @@ test "Controller handleRequest DescribeQuorum returns quorum info" {
     ctrl.raft_state.becomeLeader();
 
     // DescribeQuorum (55, v0) is flexible → header v2 / response v1
+    const Req = generated.describe_quorum_request.DescribeQuorumRequest;
+    const Resp = generated.describe_quorum_response.DescribeQuorumResponse;
+
     var buf: [256]u8 = undefined;
-    const req_len = buildTestRequest(&buf, 55, 0, 30, 2);
+    var req_len = buildTestRequest(&buf, 55, 0, 30, 2);
+    const req = Req{};
+    req.serialize(&buf, &req_len, 0);
 
     const response = ctrl.handleRequest(buf[0..req_len]);
     try testing.expect(response != null);
@@ -671,59 +749,68 @@ test "Controller handleRequest DescribeQuorum returns quorum info" {
     try testing.expectEqual(@as(i32, 30), corr_id);
     _ = try ser.readUnsignedVarint(response.?, &rpos); // tagged fields
 
-    // error_code should be 0
-    const error_code = ser.readI16(response.?, &rpos);
-    try testing.expectEqual(@as(i16, 0), error_code);
+    const resp = try Resp.deserialize(testing.allocator, response.?, &rpos, 0);
+    defer {
+        for (resp.topics) |topic| {
+            if (topic.partitions.len > 0) {
+                for (topic.partitions) |partition| {
+                    if (partition.current_voters.len > 0) testing.allocator.free(partition.current_voters);
+                    if (partition.observers.len > 0) testing.allocator.free(partition.observers);
+                }
+                testing.allocator.free(topic.partitions);
+            }
+        }
+        if (resp.topics.len > 0) testing.allocator.free(resp.topics);
+    }
+    try testing.expectEqual(@as(i16, 0), resp.error_code);
+    try testing.expectEqual(@as(i32, 1), resp.topics[0].partitions[0].leader_id);
 }
 
 test "Controller handleRequest BrokerRegistration registers broker" {
+    const Req = generated.broker_registration_request.BrokerRegistrationRequest;
+    const Resp = generated.broker_registration_response.BrokerRegistrationResponse;
+
     var ctrl = Controller.init(testing.allocator, 1, "test-cluster");
     defer ctrl.deinit();
 
-    // BrokerRegistration (62, v0) is NOT flexible → header v1 / response v0
     var buf: [256]u8 = undefined;
-    var pos = buildTestRequest(&buf, 62, 0, 40, 1);
-
-    // BrokerRegistration body:
-    ser.writeI32(&buf, &pos, 100); // broker_id
-    ser.writeString(&buf, &pos, "host1"); // host
-    ser.writeI32(&buf, &pos, 9092); // port
+    var pos = buildTestRequest(&buf, 62, 0, 40, header_mod.requestHeaderVersion(62, 0));
+    const listeners = [_]Req.Listener{.{ .name = "PLAINTEXT", .host = "host1", .port = 9092, .security_protocol = 0 }};
+    const req = Req{ .broker_id = 100, .cluster_id = "test-cluster", .listeners = &listeners };
+    req.serialize(&buf, &pos, 0);
 
     const response = ctrl.handleRequest(buf[0..pos]);
     try testing.expect(response != null);
     defer testing.allocator.free(response.?);
 
-    // Response header v0: correlation_id only (4 bytes)
     var rpos: usize = 0;
-    const corr_id = ser.readI32(response.?, &rpos);
-    try testing.expectEqual(@as(i32, 40), corr_id);
+    var resp_header = try ResponseHeader.deserialize(testing.allocator, response.?, &rpos, header_mod.responseHeaderVersion(62, 0));
+    defer resp_header.deinit(testing.allocator);
+    try testing.expectEqual(@as(i32, 40), resp_header.correlation_id);
 
-    // throttle_time_ms
-    const throttle = ser.readI32(response.?, &rpos);
-    try testing.expectEqual(@as(i32, 0), throttle);
-
-    // error_code
-    const error_code = ser.readI16(response.?, &rpos);
-    try testing.expectEqual(@as(i16, 0), error_code);
-
-    // broker_epoch (should be > 0)
-    const broker_epoch = ser.readI64(response.?, &rpos);
-    try testing.expect(broker_epoch > 0);
+    const resp = try Resp.deserialize(testing.allocator, response.?, &rpos, 0);
+    try testing.expectEqual(@as(i16, 0), resp.error_code);
+    try testing.expect(resp.broker_epoch > 0);
 
     // Verify broker is registered
     try testing.expectEqual(@as(usize, 1), ctrl.broker_registry.count());
 }
 
 test "Controller handleRequest BrokerHeartbeat reports active broker" {
+    const RegReq = generated.broker_registration_request.BrokerRegistrationRequest;
+    const RegResp = generated.broker_registration_response.BrokerRegistrationResponse;
+    const HbReq = generated.broker_heartbeat_request.BrokerHeartbeatRequest;
+    const HbResp = generated.broker_heartbeat_response.BrokerHeartbeatResponse;
+
     var ctrl = Controller.init(testing.allocator, 1, "test-cluster");
     defer ctrl.deinit();
 
     // First, register a broker to get the epoch
     var reg_buf: [256]u8 = undefined;
-    var reg_pos = buildTestRequest(&reg_buf, 62, 0, 40, 1);
-    ser.writeI32(&reg_buf, &reg_pos, 100); // broker_id
-    ser.writeString(&reg_buf, &reg_pos, "host1"); // host
-    ser.writeI32(&reg_buf, &reg_pos, 9092); // port
+    var reg_pos = buildTestRequest(&reg_buf, 62, 0, 40, header_mod.requestHeaderVersion(62, 0));
+    const listeners = [_]RegReq.Listener{.{ .name = "PLAINTEXT", .host = "host1", .port = 9092, .security_protocol = 0 }};
+    const reg_req = RegReq{ .broker_id = 100, .cluster_id = "test-cluster", .listeners = &listeners };
+    reg_req.serialize(&reg_buf, &reg_pos, 0);
 
     const reg_response = ctrl.handleRequest(reg_buf[0..reg_pos]);
     try testing.expect(reg_response != null);
@@ -731,40 +818,28 @@ test "Controller handleRequest BrokerHeartbeat reports active broker" {
 
     // Parse broker_epoch from registration response
     var reg_rpos: usize = 0;
-    _ = ser.readI32(reg_response.?, &reg_rpos); // correlation_id
-    _ = ser.readI32(reg_response.?, &reg_rpos); // throttle_time_ms
-    _ = ser.readI16(reg_response.?, &reg_rpos); // error_code
-    const broker_epoch = ser.readI64(reg_response.?, &reg_rpos);
+    var reg_header = try ResponseHeader.deserialize(testing.allocator, reg_response.?, &reg_rpos, header_mod.responseHeaderVersion(62, 0));
+    defer reg_header.deinit(testing.allocator);
+    const reg_resp = try RegResp.deserialize(testing.allocator, reg_response.?, &reg_rpos, 0);
+    const broker_epoch = reg_resp.broker_epoch;
 
-    // Now send a heartbeat with the correct epoch
-    // BrokerHeartbeat (63, v0) is NOT flexible → header v1 / response v0
     var hb_buf: [256]u8 = undefined;
-    var hb_pos = buildTestRequest(&hb_buf, 63, 0, 50, 1);
-    ser.writeI32(&hb_buf, &hb_pos, 100); // broker_id
-    ser.writeI64(&hb_buf, &hb_pos, broker_epoch); // broker_epoch
+    var hb_pos = buildTestRequest(&hb_buf, 63, 0, 50, header_mod.requestHeaderVersion(63, 0));
+    const hb_req = HbReq{ .broker_id = 100, .broker_epoch = broker_epoch };
+    hb_req.serialize(&hb_buf, &hb_pos, 0);
 
     const hb_response = ctrl.handleRequest(hb_buf[0..hb_pos]);
     try testing.expect(hb_response != null);
     defer testing.allocator.free(hb_response.?);
 
-    // Response header v0: correlation_id
     var hb_rpos: usize = 0;
-    const corr_id = ser.readI32(hb_response.?, &hb_rpos);
-    try testing.expectEqual(@as(i32, 50), corr_id);
+    var hb_header = try ResponseHeader.deserialize(testing.allocator, hb_response.?, &hb_rpos, header_mod.responseHeaderVersion(63, 0));
+    defer hb_header.deinit(testing.allocator);
+    try testing.expectEqual(@as(i32, 50), hb_header.correlation_id);
 
-    // throttle_time_ms
-    _ = ser.readI32(hb_response.?, &hb_rpos);
-
-    // error_code
-    const error_code = ser.readI16(hb_response.?, &hb_rpos);
-    try testing.expectEqual(@as(i16, 0), error_code);
-
-    // is_caught_up (bool, 1 byte)
-    _ = try ser.readBool(hb_response.?, &hb_rpos);
-
-    // is_fenced — should be false (0) since we just heartbeated
-    const is_fenced = try ser.readBool(hb_response.?, &hb_rpos);
-    try testing.expect(!is_fenced);
+    const hb_resp = try HbResp.deserialize(testing.allocator, hb_response.?, &hb_rpos, 0);
+    try testing.expectEqual(@as(i16, 0), hb_resp.error_code);
+    try testing.expect(!hb_resp.is_fenced);
 }
 
 test "Controller tick evicts dead brokers" {
@@ -786,64 +861,147 @@ test "Controller tick evicts dead brokers" {
 }
 
 test "Controller handleRequest AllocateProducerIds returns block" {
+    const Req = generated.allocate_producer_ids_request.AllocateProducerIdsRequest;
+    const Resp = generated.allocate_producer_ids_response.AllocateProducerIdsResponse;
+
     var ctrl = Controller.init(testing.allocator, 1, "test-cluster");
     defer ctrl.deinit();
 
-    // AllocateProducerIds (67, v0) is NOT flexible → header v1 / response v0
     var buf: [256]u8 = undefined;
-    var pos = buildTestRequest(&buf, 67, 0, 60, 1);
-    ser.writeI32(&buf, &pos, 100); // broker_id
-    ser.writeI64(&buf, &pos, 1); // broker_epoch
+    var pos = buildTestRequest(&buf, 67, 0, 60, header_mod.requestHeaderVersion(67, 0));
+    const req = Req{ .broker_id = 100, .broker_epoch = 1 };
+    req.serialize(&buf, &pos, 0);
 
     const response = ctrl.handleRequest(buf[0..pos]);
     try testing.expect(response != null);
     defer testing.allocator.free(response.?);
 
-    // Parse: correlation_id, throttle_time_ms, error_code, producer_id_start, producer_id_len
     var rpos: usize = 0;
-    _ = ser.readI32(response.?, &rpos); // correlation_id
-    _ = ser.readI32(response.?, &rpos); // throttle_time_ms
-    const error_code = ser.readI16(response.?, &rpos);
-    try testing.expectEqual(@as(i16, 0), error_code);
-    const pid_start = ser.readI64(response.?, &rpos);
-    try testing.expect(pid_start >= 1000);
-    const pid_len = ser.readI32(response.?, &rpos);
-    try testing.expectEqual(@as(i32, 1000), pid_len);
+    var resp_header = try ResponseHeader.deserialize(testing.allocator, response.?, &rpos, header_mod.responseHeaderVersion(67, 0));
+    defer resp_header.deinit(testing.allocator);
+    const resp = try Resp.deserialize(testing.allocator, response.?, &rpos, 0);
+    try testing.expectEqual(@as(i16, 0), resp.error_code);
+    try testing.expect(resp.producer_id_start >= 1000);
+    try testing.expectEqual(@as(i32, 1000), resp.producer_id_len);
+}
+
+test "Controller handleRequest AddRaftVoter uses generated key 80" {
+    const Req = generated.add_raft_voter_request.AddRaftVoterRequest;
+    const Resp = generated.add_raft_voter_response.AddRaftVoterResponse;
+
+    var ctrl = Controller.init(testing.allocator, 1, "test-cluster");
+    defer ctrl.deinit();
+    try ctrl.raft_state.addVoter(1);
+    _ = ctrl.raft_state.startElection();
+    ctrl.raft_state.becomeLeader();
+
+    var buf: [256]u8 = undefined;
+    var pos = buildTestRequest(&buf, 80, 0, 80, header_mod.requestHeaderVersion(80, 0));
+    const req = Req{ .cluster_id = "test-cluster", .timeout_ms = 1000, .voter_id = 2 };
+    req.serialize(&buf, &pos, 0);
+
+    const response = ctrl.handleRequest(buf[0..pos]);
+    try testing.expect(response != null);
+    defer testing.allocator.free(response.?);
+
+    var rpos: usize = 0;
+    var resp_header = try ResponseHeader.deserialize(testing.allocator, response.?, &rpos, header_mod.responseHeaderVersion(80, 0));
+    defer resp_header.deinit(testing.allocator);
+    try testing.expectEqual(@as(i32, 80), resp_header.correlation_id);
+
+    const resp = try Resp.deserialize(testing.allocator, response.?, &rpos, 0);
+    try testing.expectEqual(ErrorCode.none.toInt(), resp.error_code);
+    try testing.expect(ctrl.raft_state.pending_config_change);
+}
+
+test "Controller handleRequest RemoveRaftVoter uses generated key 81" {
+    const Req = generated.remove_raft_voter_request.RemoveRaftVoterRequest;
+    const Resp = generated.remove_raft_voter_response.RemoveRaftVoterResponse;
+
+    var ctrl = Controller.init(testing.allocator, 1, "test-cluster");
+    defer ctrl.deinit();
+    try ctrl.raft_state.addVoter(1);
+    try ctrl.raft_state.addVoter(2);
+    _ = ctrl.raft_state.startElection();
+    ctrl.raft_state.becomeLeader();
+
+    var buf: [256]u8 = undefined;
+    var pos = buildTestRequest(&buf, 81, 0, 81, header_mod.requestHeaderVersion(81, 0));
+    const req = Req{ .cluster_id = "test-cluster", .voter_id = 2 };
+    req.serialize(&buf, &pos, 0);
+
+    const response = ctrl.handleRequest(buf[0..pos]);
+    try testing.expect(response != null);
+    defer testing.allocator.free(response.?);
+
+    var rpos: usize = 0;
+    var resp_header = try ResponseHeader.deserialize(testing.allocator, response.?, &rpos, header_mod.responseHeaderVersion(81, 0));
+    defer resp_header.deinit(testing.allocator);
+    try testing.expectEqual(@as(i32, 81), resp_header.correlation_id);
+
+    const resp = try Resp.deserialize(testing.allocator, response.?, &rpos, 0);
+    try testing.expectEqual(ErrorCode.none.toInt(), resp.error_code);
+    try testing.expect(ctrl.raft_state.pending_config_change);
+}
+
+test "Controller rejects telemetry keys 71 and 72 instead of treating them as Raft voter APIs" {
+    var ctrl = Controller.init(testing.allocator, 1, "test-cluster");
+    defer ctrl.deinit();
+
+    const cases = [_]i16{ 71, 72 };
+    for (cases, 0..) |api_key, i| {
+        var buf: [128]u8 = undefined;
+        const corr: i32 = 7100 + @as(i32, @intCast(i));
+        const req_len = buildTestRequest(&buf, api_key, 0, corr, header_mod.requestHeaderVersion(api_key, 0));
+
+        const response = ctrl.handleRequest(buf[0..req_len]);
+        try testing.expect(response != null);
+        defer testing.allocator.free(response.?);
+
+        var rpos: usize = 0;
+        var resp_header = try ResponseHeader.deserialize(testing.allocator, response.?, &rpos, header_mod.responseHeaderVersion(api_key, 0));
+        defer resp_header.deinit(testing.allocator);
+        try testing.expectEqual(corr, resp_header.correlation_id);
+        try testing.expectEqual(@as(i16, 35), ser.readI16(response.?, &rpos));
+    }
 }
 
 test "Controller AllocateProducerIds increments monotonically" {
+    const Req = generated.allocate_producer_ids_request.AllocateProducerIdsRequest;
+    const Resp = generated.allocate_producer_ids_response.AllocateProducerIdsResponse;
+
     var ctrl = Controller.init(testing.allocator, 1, "test-cluster");
     defer ctrl.deinit();
 
     // First allocation
     var buf1: [256]u8 = undefined;
-    var pos1 = buildTestRequest(&buf1, 67, 0, 61, 1);
-    ser.writeI32(&buf1, &pos1, 100);
-    ser.writeI64(&buf1, &pos1, 1);
+    var pos1 = buildTestRequest(&buf1, 67, 0, 61, header_mod.requestHeaderVersion(67, 0));
+    const req1 = Req{ .broker_id = 100, .broker_epoch = 1 };
+    req1.serialize(&buf1, &pos1, 0);
     const resp1 = ctrl.handleRequest(buf1[0..pos1]);
     try testing.expect(resp1 != null);
     defer testing.allocator.free(resp1.?);
 
     var rpos1: usize = 0;
-    _ = ser.readI32(resp1.?, &rpos1);
-    _ = ser.readI32(resp1.?, &rpos1);
-    _ = ser.readI16(resp1.?, &rpos1);
-    const start1 = ser.readI64(resp1.?, &rpos1);
+    var header1 = try ResponseHeader.deserialize(testing.allocator, resp1.?, &rpos1, header_mod.responseHeaderVersion(67, 0));
+    defer header1.deinit(testing.allocator);
+    const body1 = try Resp.deserialize(testing.allocator, resp1.?, &rpos1, 0);
+    const start1 = body1.producer_id_start;
 
     // Second allocation
     var buf2: [256]u8 = undefined;
-    var pos2 = buildTestRequest(&buf2, 67, 0, 62, 1);
-    ser.writeI32(&buf2, &pos2, 100);
-    ser.writeI64(&buf2, &pos2, 1);
+    var pos2 = buildTestRequest(&buf2, 67, 0, 62, header_mod.requestHeaderVersion(67, 0));
+    const req2 = Req{ .broker_id = 100, .broker_epoch = 1 };
+    req2.serialize(&buf2, &pos2, 0);
     const resp2 = ctrl.handleRequest(buf2[0..pos2]);
     try testing.expect(resp2 != null);
     defer testing.allocator.free(resp2.?);
 
     var rpos2: usize = 0;
-    _ = ser.readI32(resp2.?, &rpos2);
-    _ = ser.readI32(resp2.?, &rpos2);
-    _ = ser.readI16(resp2.?, &rpos2);
-    const start2 = ser.readI64(resp2.?, &rpos2);
+    var header2 = try ResponseHeader.deserialize(testing.allocator, resp2.?, &rpos2, header_mod.responseHeaderVersion(67, 0));
+    defer header2.deinit(testing.allocator);
+    const body2 = try Resp.deserialize(testing.allocator, resp2.?, &rpos2, 0);
+    const start2 = body2.producer_id_start;
 
     // Second block starts after first
     try testing.expect(start2 >= start1 + 1000);
