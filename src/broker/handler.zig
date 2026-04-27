@@ -3817,58 +3817,135 @@ pub const Broker = struct {
     // DeleteRecords (key 21)
     // ---------------------------------------------------------------
     fn handleDeleteRecords(self: *Broker, request_bytes: []const u8, body_start: usize, req_header: *const RequestHeader, api_version: i16, resp_header_version: i16) ?[]u8 {
-        _ = api_version;
+        const Req = generated.delete_records_request.DeleteRecordsRequest;
+        const Resp = generated.delete_records_response.DeleteRecordsResponse;
+        const TopicResult = Resp.DeleteRecordsTopicResult;
+        const PartitionResult = TopicResult.DeleteRecordsPartitionResult;
+
+        if (!validateDeleteRecordsRequestFrame(request_bytes, body_start, api_version)) {
+            log.warn("Malformed DeleteRecords request", .{});
+            return null;
+        }
+
         var pos = body_start;
-        const num_topics = (ser.readArrayLen(request_bytes, &pos) catch 0) orelse 0;
+        var req = Req.deserialize(self.allocator, request_bytes, &pos, api_version) catch |err| {
+            log.warn("Malformed DeleteRecords request: {}", .{err});
+            return null;
+        };
+        defer self.freeDeleteRecordsRequest(&req);
 
-        var buf = self.allocator.alloc(u8, 4096) catch return null;
-        var wpos: usize = 0;
-        const rh = ResponseHeader{ .correlation_id = req_header.correlation_id };
-        rh.serialize(buf, &wpos, resp_header_version);
-        ser.writeI32(buf, &wpos, 0); // throttle_time_ms
-        ser.writeArrayLen(buf, &wpos, num_topics);
-
+        var topics: []TopicResult = &.{};
+        if (req.topics.len > 0) {
+            topics = self.allocator.alloc(TopicResult, req.topics.len) catch return null;
+        }
+        var topics_init: usize = 0;
         var mutated = false;
-        for (0..num_topics) |_| {
-            const topic = (ser.readString(request_bytes, &pos) catch break) orelse "";
-            const num_parts = (ser.readArrayLen(request_bytes, &pos) catch 0) orelse 0;
+        defer {
+            self.freeDeleteRecordsResponseTopics(topics[0..topics_init]);
+            if (topics.len > 0) self.allocator.free(topics);
+        }
 
-            ser.writeString(buf, &wpos, topic);
-            ser.writeArrayLen(buf, &wpos, num_parts);
-
-            for (0..num_parts) |_| {
-                const partition = ser.readI32(request_bytes, &pos);
-                const delete_offset = ser.readI64(request_bytes, &pos);
-
-                // Update log_start_offset for the partition
-                const pkey = std.fmt.allocPrint(self.allocator, "{s}-{d}", .{ topic, partition }) catch continue;
-                defer self.allocator.free(pkey);
-
-                var low_watermark: i64 = 0;
-                if (self.store.partitions.getPtr(pkey)) |state| {
-                    if (delete_offset > 0 and @as(u64, @intCast(delete_offset)) > state.log_start_offset) {
-                        state.log_start_offset = @intCast(delete_offset);
-                        const stream_id = PartitionStore.hashPartitionKey(topic, partition);
-                        self.object_manager.trimStream(stream_id, state.log_start_offset) catch {};
-                        low_watermark = delete_offset;
-                        mutated = true;
-                    } else {
-                        low_watermark = @intCast(state.log_start_offset);
-                    }
+        for (req.topics) |topic_req| {
+            var partitions: []const PartitionResult = &.{};
+            if (topic_req.partitions.len > 0) {
+                const writable = self.allocator.alloc(PartitionResult, topic_req.partitions.len) catch return null;
+                var transferred = false;
+                defer {
+                    if (!transferred and writable.len > 0) self.allocator.free(writable);
                 }
 
-                ser.writeI32(buf, &wpos, partition);
-                ser.writeI64(buf, &wpos, low_watermark); // low_watermark
-                ser.writeI16(buf, &wpos, 0); // error_code
+                const topic_name = topic_req.name orelse "";
+                for (topic_req.partitions, 0..) |partition_req, partition_idx| {
+                    const trim_result = self.trimDeleteRecordsPartition(topic_name, partition_req.partition_index, partition_req.offset);
+                    if (trim_result.mutated) mutated = true;
+                    writable[partition_idx] = .{
+                        .partition_index = partition_req.partition_index,
+                        .low_watermark = trim_result.low_watermark,
+                        .error_code = trim_result.error_code,
+                    };
+                }
+                partitions = writable;
+                transferred = true;
             }
+
+            topics[topics_init] = .{
+                .name = topic_req.name,
+                .partitions = partitions,
+            };
+            topics_init += 1;
         }
+
         if (mutated) {
             self.persistPartitionStates();
             self.persistObjectManagerSnapshot();
         }
 
-        if (resp_header_version >= 1) ser.writeEmptyTaggedFields(buf, &wpos);
-        return (self.allocator.realloc(buf, wpos) catch buf)[0..wpos];
+        const resp = Resp{
+            .throttle_time_ms = 0,
+            .topics = topics[0..topics_init],
+        };
+        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+    }
+
+    const DeleteRecordsTrimResult = struct {
+        low_watermark: i64,
+        error_code: i16,
+        mutated: bool,
+    };
+
+    fn freeDeleteRecordsRequest(self: *Broker, req: *const generated.delete_records_request.DeleteRecordsRequest) void {
+        for (req.topics) |topic| {
+            if (topic.partitions.len > 0) self.allocator.free(topic.partitions);
+        }
+        if (req.topics.len > 0) self.allocator.free(req.topics);
+    }
+
+    fn freeDeleteRecordsResponseTopics(self: *Broker, topics: []const generated.delete_records_response.DeleteRecordsResponse.DeleteRecordsTopicResult) void {
+        for (topics) |topic| {
+            if (topic.partitions.len > 0) self.allocator.free(topic.partitions);
+        }
+    }
+
+    fn trimDeleteRecordsPartition(self: *Broker, topic: []const u8, partition: i32, delete_offset: i64) DeleteRecordsTrimResult {
+        if (delete_offset < 0) {
+            return .{
+                .low_watermark = -1,
+                .error_code = @intFromEnum(ErrorCode.offset_out_of_range),
+                .mutated = false,
+            };
+        }
+
+        const pkey = std.fmt.allocPrint(self.allocator, "{s}-{d}", .{ topic, partition }) catch {
+            return .{
+                .low_watermark = -1,
+                .error_code = @intFromEnum(ErrorCode.kafka_storage_error),
+                .mutated = false,
+            };
+        };
+        defer self.allocator.free(pkey);
+
+        const state = self.store.partitions.getPtr(pkey) orelse return .{
+            .low_watermark = -1,
+            .error_code = @intFromEnum(ErrorCode.unknown_topic_or_partition),
+            .mutated = false,
+        };
+
+        if (@as(u64, @intCast(delete_offset)) > state.log_start_offset) {
+            state.log_start_offset = @intCast(delete_offset);
+            const stream_id = PartitionStore.hashPartitionKey(topic, partition);
+            self.object_manager.trimStream(stream_id, state.log_start_offset) catch {};
+            return .{
+                .low_watermark = delete_offset,
+                .error_code = @intFromEnum(ErrorCode.none),
+                .mutated = true,
+            };
+        }
+
+        return .{
+            .low_watermark = @intCast(state.log_start_offset),
+            .error_code = @intFromEnum(ErrorCode.none),
+            .mutated = false,
+        };
     }
 
     // ---------------------------------------------------------------
@@ -7915,6 +7992,26 @@ pub const Broker = struct {
             for (0..topic_count) |_| {
                 if (!skipKafkaString(buf, &pos, flexible)) return false; // topic name
             }
+        }
+
+        if (!skipFixedBytes(buf, &pos, 4)) return false; // timeout_ms
+        if (flexible) ser.skipTaggedFields(buf, &pos) catch return false;
+        return true;
+    }
+
+    fn validateDeleteRecordsRequestFrame(buf: []const u8, start_pos: usize, api_version: i16) bool {
+        const flexible = api_version >= 2;
+        var pos = start_pos;
+
+        const topic_count = readKafkaArrayCount(buf, &pos, flexible) orelse return false;
+        for (0..topic_count) |_| {
+            if (!skipKafkaString(buf, &pos, flexible)) return false; // topic name
+            const partition_count = readKafkaArrayCount(buf, &pos, flexible) orelse return false;
+            for (0..partition_count) |_| {
+                if (!skipFixedBytes(buf, &pos, 12)) return false; // partition_index + offset
+                if (flexible) ser.skipTaggedFields(buf, &pos) catch return false;
+            }
+            if (flexible) ser.skipTaggedFields(buf, &pos) catch return false;
         }
 
         if (!skipFixedBytes(buf, &pos, 4)) return false; // timeout_ms
@@ -12777,6 +12874,70 @@ test "Broker.handleRequest DeleteTopics rejects truncated request" {
 
     var buf: [128]u8 = undefined;
     const req_len = buildTestRequest(&buf, 20, 6, 2007, header_mod.requestHeaderVersion(20, 6));
+    try testing.expect(broker.handleRequest(buf[0..req_len]) == null);
+}
+
+test "Broker.handleRequest DeleteRecords v2 returns generated response and trims partition" {
+    const Req = generated.delete_records_request.DeleteRecordsRequest;
+    const Resp = generated.delete_records_response.DeleteRecordsResponse;
+    const Topic = Req.DeleteRecordsTopic;
+    const Partition = Topic.DeleteRecordsPartition;
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+
+    try testing.expect(broker.ensureTopic("dr-generated-topic"));
+
+    const partitions = [_]Partition{.{
+        .partition_index = 0,
+        .offset = 5,
+    }};
+    const topics = [_]Topic{.{
+        .name = "dr-generated-topic",
+        .partitions = &partitions,
+    }};
+    const req = Req{
+        .topics = &topics,
+        .timeout_ms = 30000,
+    };
+
+    var buf: [512]u8 = undefined;
+    var pos = buildTestRequest(&buf, 21, 2, 2102, header_mod.requestHeaderVersion(21, 2));
+    req.serialize(&buf, &pos, 2);
+
+    const response = broker.handleRequest(buf[0..pos]);
+    try testing.expect(response != null);
+    defer testing.allocator.free(response.?);
+
+    var rpos: usize = 0;
+    var response_header = try ResponseHeader.deserialize(testing.allocator, response.?, &rpos, header_mod.responseHeaderVersion(21, 2));
+    defer response_header.deinit(testing.allocator);
+    try testing.expectEqual(@as(i32, 2102), response_header.correlation_id);
+
+    const resp = try Resp.deserialize(testing.allocator, response.?, &rpos, 2);
+    defer {
+        broker.freeDeleteRecordsResponseTopics(resp.topics);
+        if (resp.topics.len > 0) testing.allocator.free(resp.topics);
+    }
+    try testing.expectEqual(response.?.len, rpos);
+    try testing.expectEqual(@as(i32, 0), resp.throttle_time_ms);
+    try testing.expectEqual(@as(usize, 1), resp.topics.len);
+    try testing.expectEqualStrings("dr-generated-topic", resp.topics[0].name.?);
+    try testing.expectEqual(@as(usize, 1), resp.topics[0].partitions.len);
+    try testing.expectEqual(@as(i64, 5), resp.topics[0].partitions[0].low_watermark);
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.none)), resp.topics[0].partitions[0].error_code);
+
+    const pkey = try std.fmt.allocPrint(testing.allocator, "{s}-{d}", .{ "dr-generated-topic", 0 });
+    defer testing.allocator.free(pkey);
+    try testing.expectEqual(@as(u64, 5), broker.store.partitions.getPtr(pkey).?.log_start_offset);
+}
+
+test "Broker.handleRequest DeleteRecords rejects truncated request" {
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+
+    var buf: [128]u8 = undefined;
+    const req_len = buildTestRequest(&buf, 21, 2, 2103, header_mod.requestHeaderVersion(21, 2));
     try testing.expect(broker.handleRequest(buf[0..req_len]) == null);
 }
 
