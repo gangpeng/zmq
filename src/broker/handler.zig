@@ -2251,161 +2251,145 @@ pub const Broker = struct {
     // Fetch (key 1)
     // ---------------------------------------------------------------
     fn handleFetch(self: *Broker, request_bytes: []const u8, body_start: usize, req_header: *const RequestHeader, api_version: i16, resp_header_version: i16) ?[]u8 {
-        var pos = body_start;
-        const flexible = api_version >= 12;
+        const Req = generated.fetch_request.FetchRequest;
+        const Resp = generated.fetch_response.FetchResponse;
+        const TopicResult = Resp.FetchableTopicResponse;
 
-        // Skip replica_id, max_wait_ms, min_bytes
-        if (api_version <= 14) _ = ser.readI32(request_bytes, &pos); // replica_id
-        const max_wait_ms = ser.readI32(request_bytes, &pos); // max_wait_ms
-        _ = max_wait_ms; // Used for delayed fetch timeout (simplified implementation)
-        _ = ser.readI32(request_bytes, &pos); // min_bytes
-        if (api_version >= 3) _ = ser.readI32(request_bytes, &pos); // max_bytes
-        // Parse isolation_level for READ_COMMITTED support
-        var isolation_level: i8 = 0;
-        if (api_version >= 4) isolation_level = ser.readI8(request_bytes, &pos);
-        var session_id: i32 = 0;
-        var session_epoch: i32 = 0;
-        if (api_version >= 7) {
-            session_id = ser.readI32(request_bytes, &pos);
-            session_epoch = ser.readI32(request_bytes, &pos);
+        if (!validateFetchRequestFrame(request_bytes, body_start, api_version)) {
+            log.warn("Malformed Fetch request", .{});
+            return null;
         }
+
+        var pos = body_start;
+        var req = Req.deserialize(self.allocator, request_bytes, &pos, api_version) catch |err| {
+            log.warn("Malformed Fetch request: {}", .{err});
+            return null;
+        };
+        defer self.freeFetchRequest(&req);
 
         // Manage fetch session (KIP-227)
-        const session_result = self.fetch_sessions.getOrCreate(session_id, session_epoch) catch null;
+        const session_result = self.fetch_sessions.getOrCreate(req.session_id, req.session_epoch) catch null;
         const resp_session_id: i32 = if (session_result) |sr| sr.session_id else 0;
 
-        // Topics array
-        const num_topics = if (flexible)
-            (ser.readCompactArrayLen(request_bytes, &pos) catch return null) orelse 0
-        else
-            @as(usize, @intCast(@max(ser.readI32(request_bytes, &pos), 0)));
-
-        const resp_buf = self.allocator.alloc(u8, 1024 * 1024) catch return null; // 1MB initial
-        var resp_buf_owned = true;
-        defer if (resp_buf_owned) self.allocator.free(resp_buf);
-
-        var wpos: usize = 0;
-        const resp_header = ResponseHeader{ .correlation_id = req_header.correlation_id };
-        resp_header.serialize(resp_buf, &wpos, resp_header_version);
-
         // ThrottleTimeMs (v1+) — enforce fetch quotas
+        var throttle_time_ms: i32 = 0;
         if (api_version >= 1) {
             const client_id_str = req_header.client_id orelse "unknown";
-            const throttle = self.quota_manager.recordFetch(client_id_str, request_bytes.len);
-            ser.writeI32(resp_buf, &wpos, throttle);
-            if (throttle > 0) {
+            throttle_time_ms = self.quota_manager.recordFetch(client_id_str, request_bytes.len);
+            if (throttle_time_ms > 0) {
                 self.metrics.incrementCounter("kafka_server_fetch_throttle_total");
-                log.debug("Fetch throttled {d}ms for client {s}", .{ throttle, client_id_str });
-            }
-        }
-        // ErrorCode (v7+)
-        if (api_version >= 7) ser.writeI16(resp_buf, &wpos, 0);
-        // SessionId (v7+) — return the fetch session ID
-        if (api_version >= 7) ser.writeI32(resp_buf, &wpos, resp_session_id);
-
-        // Responses array
-        if (flexible) {
-            ser.writeCompactArrayLen(resp_buf, &wpos, num_topics);
-        } else {
-            ser.writeArrayLen(resp_buf, &wpos, num_topics);
-        }
-
-        for (0..num_topics) |_| {
-            // Read topic name/id
-            var topic_name: []const u8 = "";
-            if (api_version <= 12) {
-                if (flexible) {
-                    topic_name = (ser.readCompactString(request_bytes, &pos) catch return null) orelse "";
-                } else {
-                    topic_name = (ser.readString(request_bytes, &pos) catch return null) orelse "";
-                }
-            }
-            if (api_version >= 13) {
-                _ = ser.readUuid(request_bytes, &pos) catch return null; // topic_id
-            }
-
-            // Write topic in response
-            if (api_version <= 12) {
-                if (flexible) ser.writeCompactString(resp_buf, &wpos, topic_name) else ser.writeString(resp_buf, &wpos, topic_name);
-            }
-            if (api_version >= 13) {
-                ser.writeUuid(resp_buf, &wpos, [_]u8{0} ** 16);
-            }
-
-            // Partitions
-            const num_partitions = if (flexible)
-                (ser.readCompactArrayLen(request_bytes, &pos) catch return null) orelse 0
-            else
-                @as(usize, @intCast(@max(ser.readI32(request_bytes, &pos), 0)));
-
-            if (flexible) {
-                ser.writeCompactArrayLen(resp_buf, &wpos, num_partitions);
-            } else {
-                ser.writeArrayLen(resp_buf, &wpos, num_partitions);
-            }
-
-            for (0..num_partitions) |_| {
-                const partition_idx = ser.readI32(request_bytes, &pos);
-                if (api_version >= 9) _ = ser.readI32(request_bytes, &pos); // current_leader_epoch
-                const fetch_offset: u64 = @intCast(ser.readI64(request_bytes, &pos));
-                if (api_version >= 12) _ = ser.readI32(request_bytes, &pos); // last_fetched_epoch
-                if (api_version >= 5) _ = ser.readI64(request_bytes, &pos); // log_start_offset
-                _ = ser.readI32(request_bytes, &pos); // partition_max_bytes
-
-                if (flexible) ser.skipTaggedFields(request_bytes, &pos) catch {};
-
-                // Fetch data with isolation level
-                const fetch_result = self.store.fetchWithIsolation(topic_name, partition_idx, fetch_offset, 1024 * 1024, isolation_level) catch |err| blk: {
-                    log.debug("Fetch failed for {s}-{d} at offset {d}: {}", .{ topic_name, partition_idx, fetch_offset, err });
-                    break :blk PartitionStore.FetchResult{
-                        .error_code = 3,
-                        .records = &.{},
-                        .high_watermark = 0,
-                        .last_stable_offset = -1,
-                    };
-                };
-
-                // Write partition response
-                ser.writeI32(resp_buf, &wpos, partition_idx);
-                ser.writeI16(resp_buf, &wpos, fetch_result.error_code);
-                ser.writeI64(resp_buf, &wpos, fetch_result.high_watermark);
-
-                // Return actual last_stable_offset instead of -1
-                if (api_version >= 4) ser.writeI64(resp_buf, &wpos, fetch_result.last_stable_offset);
-                if (api_version >= 5) ser.writeI64(resp_buf, &wpos, 0); // log_start_offset
-                if (api_version >= 4) {
-                    // Aborted transactions (empty)
-                    if (flexible) ser.writeCompactArrayLen(resp_buf, &wpos, 0) else ser.writeArrayLen(resp_buf, &wpos, 0);
-                }
-                if (api_version >= 11) ser.writeI32(resp_buf, &wpos, -1); // preferred_read_replica
-
-                // Records bytes
-                if (fetch_result.records.len > 0) {
-                    if (flexible) {
-                        ser.writeCompactBytes(resp_buf, &wpos, fetch_result.records);
-                    } else {
-                        ser.writeBytesBuf(resp_buf, &wpos, fetch_result.records);
-                    }
-                    self.allocator.free(@constCast(fetch_result.records));
-                } else {
-                    if (flexible) ser.writeCompactBytes(resp_buf, &wpos, null) else ser.writeBytesBuf(resp_buf, &wpos, null);
-                }
-
-                if (flexible) ser.writeEmptyTaggedFields(resp_buf, &wpos);
-            }
-
-            if (flexible) {
-                ser.skipTaggedFields(request_bytes, &pos) catch {};
-                ser.writeEmptyTaggedFields(resp_buf, &wpos);
+                log.debug("Fetch throttled {d}ms for client {s}", .{ throttle_time_ms, client_id_str });
             }
         }
 
-        if (flexible) ser.writeEmptyTaggedFields(resp_buf, &wpos);
+        var responses: []TopicResult = &.{};
+        if (req.topics.len > 0) {
+            responses = self.allocator.alloc(TopicResult, req.topics.len) catch return null;
+        }
+        var responses_init: usize = 0;
+        defer {
+            self.freeFetchResponseTopics(responses[0..responses_init]);
+            if (responses.len > 0) self.allocator.free(responses);
+        }
 
-        log.info("Fetch: {d} topics, response {d} bytes", .{ num_topics, wpos });
-        const result = self.allocator.realloc(resp_buf, wpos) catch return null;
-        resp_buf_owned = false;
-        return result;
+        for (req.topics) |topic| {
+            responses[responses_init] = self.buildFetchTopicResponse(topic, req.isolation_level, api_version) catch return null;
+            responses_init += 1;
+        }
+
+        log.info("Fetch: {d} topics", .{req.topics.len});
+        const resp = Resp{
+            .throttle_time_ms = throttle_time_ms,
+            .error_code = @intFromEnum(ErrorCode.none),
+            .session_id = resp_session_id,
+            .responses = responses[0..responses_init],
+        };
+        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+    }
+
+    fn freeFetchRequest(self: *Broker, req: *const generated.fetch_request.FetchRequest) void {
+        for (req.topics) |topic| {
+            if (topic.partitions.len > 0) self.allocator.free(topic.partitions);
+        }
+        if (req.topics.len > 0) self.allocator.free(req.topics);
+
+        for (req.forgotten_topics_data) |topic| {
+            if (topic.partitions.len > 0) self.allocator.free(topic.partitions);
+        }
+        if (req.forgotten_topics_data.len > 0) self.allocator.free(req.forgotten_topics_data);
+    }
+
+    fn freeFetchResponseTopics(self: *Broker, topics: []const generated.fetch_response.FetchResponse.FetchableTopicResponse) void {
+        for (topics) |topic| {
+            for (topic.partitions) |partition| {
+                if (partition.aborted_transactions.len > 0) self.allocator.free(partition.aborted_transactions);
+                if (partition.records) |records| {
+                    if (records.len > 0) self.allocator.free(@constCast(records));
+                }
+            }
+            if (topic.partitions.len > 0) self.allocator.free(topic.partitions);
+        }
+    }
+
+    fn buildFetchTopicResponse(self: *Broker, topic_req: generated.fetch_request.FetchRequest.FetchTopic, isolation_level: i8, api_version: i16) !generated.fetch_response.FetchResponse.FetchableTopicResponse {
+        const Resp = generated.fetch_response.FetchResponse;
+        const PartitionResult = Resp.FetchableTopicResponse.PartitionData;
+
+        var partitions: []PartitionResult = &.{};
+        if (topic_req.partitions.len > 0) {
+            partitions = try self.allocator.alloc(PartitionResult, topic_req.partitions.len);
+        }
+        var partitions_init: usize = 0;
+        errdefer {
+            for (partitions[0..partitions_init]) |partition| {
+                if (partition.records) |records| {
+                    if (records.len > 0) self.allocator.free(@constCast(records));
+                }
+            }
+            if (partitions.len > 0) self.allocator.free(partitions);
+        }
+
+        const topic_name = self.resolveFetchTopicName(topic_req, api_version);
+        for (topic_req.partitions) |partition_req| {
+            partitions[partitions_init] = self.buildFetchPartitionResponse(topic_name, partition_req, isolation_level);
+            partitions_init += 1;
+        }
+
+        return .{
+            .topic = topic_req.topic,
+            .topic_id = if (api_version >= 13) topic_req.topic_id else zeroUuid(),
+            .partitions = partitions[0..partitions_init],
+        };
+    }
+
+    fn resolveFetchTopicName(self: *Broker, topic_req: generated.fetch_request.FetchRequest.FetchTopic, api_version: i16) []const u8 {
+        if (api_version <= 12) return topic_req.topic orelse "";
+        if (self.findTopicById(topic_req.topic_id)) |topic_info| return topic_info.name;
+        return "";
+    }
+
+    fn buildFetchPartitionResponse(self: *Broker, topic_name: []const u8, partition_req: generated.fetch_request.FetchRequest.FetchTopic.FetchPartition, isolation_level: i8) generated.fetch_response.FetchResponse.FetchableTopicResponse.PartitionData {
+        const fetch_offset: u64 = if (partition_req.fetch_offset < 0) 0 else @intCast(partition_req.fetch_offset);
+        const fetch_result = self.store.fetchWithIsolation(topic_name, partition_req.partition, fetch_offset, 1024 * 1024, isolation_level) catch |err| blk: {
+            log.debug("Fetch failed for {s}-{d} at offset {d}: {}", .{ topic_name, partition_req.partition, fetch_offset, err });
+            break :blk PartitionStore.FetchResult{
+                .error_code = @intFromEnum(ErrorCode.unknown_topic_or_partition),
+                .records = &.{},
+                .high_watermark = 0,
+                .last_stable_offset = -1,
+            };
+        };
+
+        return .{
+            .partition_index = partition_req.partition,
+            .error_code = fetch_result.error_code,
+            .high_watermark = fetch_result.high_watermark,
+            .last_stable_offset = fetch_result.last_stable_offset,
+            .log_start_offset = 0,
+            .aborted_transactions = &.{},
+            .preferred_read_replica = -1,
+            .records = if (fetch_result.records.len > 0) fetch_result.records else null,
+        };
     }
 
     // ---------------------------------------------------------------
@@ -7801,6 +7785,49 @@ pub const Broker = struct {
         return true;
     }
 
+    fn validateFetchRequestFrame(buf: []const u8, start_pos: usize, api_version: i16) bool {
+        const flexible = api_version >= 12;
+        var pos = start_pos;
+
+        if (api_version <= 14 and !skipFixedBytes(buf, &pos, 4)) return false; // replica_id
+        if (!skipFixedBytes(buf, &pos, 8)) return false; // max_wait_ms + min_bytes
+        if (api_version >= 3 and !skipFixedBytes(buf, &pos, 4)) return false; // max_bytes
+        if (api_version >= 4 and !skipFixedBytes(buf, &pos, 1)) return false; // isolation_level
+        if (api_version >= 7 and !skipFixedBytes(buf, &pos, 8)) return false; // session_id + session_epoch
+
+        const topic_count = readKafkaArrayCount(buf, &pos, flexible) orelse return false;
+        for (0..topic_count) |_| {
+            if (api_version <= 12 and !skipKafkaString(buf, &pos, flexible)) return false; // topic
+            if (api_version >= 13 and !skipFixedBytes(buf, &pos, 16)) return false; // topic_id
+
+            const partition_count = readKafkaArrayCount(buf, &pos, flexible) orelse return false;
+            for (0..partition_count) |_| {
+                if (!skipFixedBytes(buf, &pos, 4)) return false; // partition
+                if (api_version >= 9 and !skipFixedBytes(buf, &pos, 4)) return false; // current_leader_epoch
+                if (!skipFixedBytes(buf, &pos, 8)) return false; // fetch_offset
+                if (api_version >= 12 and !skipFixedBytes(buf, &pos, 4)) return false; // last_fetched_epoch
+                if (api_version >= 5 and !skipFixedBytes(buf, &pos, 8)) return false; // log_start_offset
+                if (!skipFixedBytes(buf, &pos, 4)) return false; // partition_max_bytes
+                if (flexible) ser.skipTaggedFields(buf, &pos) catch return false;
+            }
+            if (flexible) ser.skipTaggedFields(buf, &pos) catch return false;
+        }
+
+        if (api_version >= 7) {
+            const forgotten_topic_count = readKafkaArrayCount(buf, &pos, flexible) orelse return false;
+            for (0..forgotten_topic_count) |_| {
+                if (api_version >= 7 and api_version <= 12 and !skipKafkaString(buf, &pos, flexible)) return false; // topic
+                if (api_version >= 13 and !skipFixedBytes(buf, &pos, 16)) return false; // topic_id
+                if (!skipKafkaI32Array(buf, &pos, flexible)) return false; // partitions
+                if (flexible) ser.skipTaggedFields(buf, &pos) catch return false;
+            }
+        }
+
+        if (api_version >= 11 and !skipKafkaString(buf, &pos, flexible)) return false; // rack_id
+        if (flexible) ser.skipTaggedFields(buf, &pos) catch return false;
+        return true;
+    }
+
     fn validateSaslHandshakeRequestFrame(buf: []const u8, start_pos: usize) bool {
         var pos = start_pos;
         return skipKafkaString(buf, &pos, false);
@@ -8945,6 +8972,16 @@ fn freeDeserializedProduceResponse(resp: *const generated.produce_response.Produ
             if (partition.record_errors.len > 0) testing.allocator.free(partition.record_errors);
         }
         if (topic.partition_responses.len > 0) testing.allocator.free(topic.partition_responses);
+    }
+    if (resp.responses.len > 0) testing.allocator.free(resp.responses);
+}
+
+fn freeDeserializedFetchResponse(resp: *const generated.fetch_response.FetchResponse) void {
+    for (resp.responses) |topic| {
+        for (topic.partitions) |partition| {
+            if (partition.aborted_transactions.len > 0) testing.allocator.free(partition.aborted_transactions);
+        }
+        if (topic.partitions.len > 0) testing.allocator.free(topic.partitions);
     }
     if (resp.responses.len > 0) testing.allocator.free(resp.responses);
 }
@@ -12411,7 +12448,9 @@ test "Broker.handleRequest DescribeProducers rejects truncated request" {
 // HIGH-priority gap tests: handler wire-protocol round-trips
 // ---------------------------------------------------------------
 
-test "Broker.handleRequest Fetch (key=1) returns produced data" {
+test "Broker.handleRequest Fetch v0 returns generated produced data" {
+    const Resp = generated.fetch_response.FetchResponse;
+
     var broker = Broker.init(testing.allocator, 1, 9092);
     defer broker.deinit();
 
@@ -12452,11 +12491,92 @@ test "Broker.handleRequest Fetch (key=1) returns produced data" {
         try testing.expect(resp != null);
         defer testing.allocator.free(resp.?);
 
-        // Parse response: correlation_id
         var rpos: usize = 0;
-        const corr_id = ser.readI32(resp.?, &rpos);
-        try testing.expectEqual(@as(i32, 2), corr_id);
+        var response_header = try ResponseHeader.deserialize(testing.allocator, resp.?, &rpos, header_mod.responseHeaderVersion(1, 0));
+        defer response_header.deinit(testing.allocator);
+        try testing.expectEqual(@as(i32, 2), response_header.correlation_id);
+
+        const fetch_resp = try Resp.deserialize(testing.allocator, resp.?, &rpos, 0);
+        defer freeDeserializedFetchResponse(&fetch_resp);
+
+        try testing.expectEqual(resp.?.len, rpos);
+        try testing.expectEqual(@as(usize, 1), fetch_resp.responses.len);
+        try testing.expectEqualStrings("fetch-test", fetch_resp.responses[0].topic.?);
+        try testing.expectEqual(@as(usize, 1), fetch_resp.responses[0].partitions.len);
+        try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.none)), fetch_resp.responses[0].partitions[0].error_code);
+        try testing.expect(fetch_resp.responses[0].partitions[0].records != null);
+        try testing.expect(fetch_resp.responses[0].partitions[0].records.?.len > 0);
     }
+}
+
+test "Broker.handleRequest Fetch v12 returns generated flexible response" {
+    const Req = generated.fetch_request.FetchRequest;
+    const Topic = Req.FetchTopic;
+    const Partition = Topic.FetchPartition;
+    const Resp = generated.fetch_response.FetchResponse;
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+
+    _ = broker.store.produce("fetch-v12-topic", 0, "v12-record") catch {};
+
+    const partitions = [_]Partition{.{
+        .partition = 0,
+        .current_leader_epoch = -1,
+        .fetch_offset = 0,
+        .last_fetched_epoch = -1,
+        .log_start_offset = 0,
+        .partition_max_bytes = 1048576,
+    }};
+    const topics = [_]Topic{.{
+        .topic = "fetch-v12-topic",
+        .partitions = &partitions,
+    }};
+    const req = Req{
+        .replica_id = -1,
+        .max_wait_ms = 500,
+        .min_bytes = 1,
+        .max_bytes = 1048576,
+        .isolation_level = 0,
+        .session_id = 0,
+        .session_epoch = 0,
+        .topics = &topics,
+        .rack_id = "",
+    };
+
+    var buf: [512]u8 = undefined;
+    var pos = buildTestRequest(&buf, 1, 12, 112, header_mod.requestHeaderVersion(1, 12));
+    req.serialize(&buf, &pos, 12);
+
+    const response = broker.handleRequest(buf[0..pos]);
+    try testing.expect(response != null);
+    defer testing.allocator.free(response.?);
+
+    var rpos: usize = 0;
+    var response_header = try ResponseHeader.deserialize(testing.allocator, response.?, &rpos, header_mod.responseHeaderVersion(1, 12));
+    defer response_header.deinit(testing.allocator);
+    try testing.expectEqual(@as(i32, 112), response_header.correlation_id);
+
+    const resp = try Resp.deserialize(testing.allocator, response.?, &rpos, 12);
+    defer freeDeserializedFetchResponse(&resp);
+
+    try testing.expectEqual(response.?.len, rpos);
+    try testing.expectEqual(@as(i32, 0), resp.throttle_time_ms);
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.none)), resp.error_code);
+    try testing.expect(resp.session_id != 0);
+    try testing.expectEqual(@as(usize, 1), resp.responses.len);
+    try testing.expectEqualStrings("fetch-v12-topic", resp.responses[0].topic.?);
+    try testing.expect(resp.responses[0].partitions[0].records != null);
+    try testing.expect(resp.responses[0].partitions[0].records.?.len > 0);
+}
+
+test "Broker.handleRequest Fetch rejects truncated request" {
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+
+    var buf: [128]u8 = undefined;
+    const req_len = buildTestRequest(&buf, 1, 12, 113, header_mod.requestHeaderVersion(1, 12));
+    try testing.expect(broker.handleRequest(buf[0..req_len]) == null);
 }
 
 test "Broker.handleRequest ListOffsets v1 returns generated latest offset" {

@@ -137,10 +137,12 @@ pub const FetchRequest = struct {
         partitions: []const FetchPartition = &.{},
 
         pub fn serialize(self: *const FetchTopic, buf: []u8, pos: *usize, version: i16) void {
-            if (version >= 12) {
-                ser.writeCompactString(buf, pos, self.topic);
-            } else {
-                ser.writeString(buf, pos, self.topic);
+            if (version <= 12) {
+                if (version >= 12) {
+                    ser.writeCompactString(buf, pos, self.topic);
+                } else {
+                    ser.writeString(buf, pos, self.topic);
+                }
             }
             if (version >= 13) {
                 ser.writeUuid(buf, pos, self.topic_id);
@@ -158,10 +160,12 @@ pub const FetchRequest = struct {
 
         pub fn deserialize(alloc: Allocator, buf: []const u8, pos: *usize, version: i16) !FetchTopic {
             var result = FetchTopic{};
-            result.topic = if (version >= 12)
-                try ser.readCompactString(buf, pos)
-            else
-                try ser.readString(buf, pos);
+            if (version <= 12) {
+                result.topic = if (version >= 12)
+                    try ser.readCompactString(buf, pos)
+                else
+                    try ser.readString(buf, pos);
+            }
             if (version >= 13) {
                 result.topic_id = try ser.readUuid(buf, pos);
             }
@@ -182,10 +186,12 @@ pub const FetchRequest = struct {
 
         pub fn calcSize(self: *const FetchTopic, version: i16) usize {
             var size: usize = 0;
-            if (version >= 12) {
-                size += ser.compactStringSize(self.topic);
-            } else {
-                size += ser.stringSize(self.topic);
+            if (version <= 12) {
+                if (version >= 12) {
+                    size += ser.compactStringSize(self.topic);
+                } else {
+                    size += ser.stringSize(self.topic);
+                }
             }
             if (version >= 13) {
                 size += 16;
@@ -302,7 +308,7 @@ pub const FetchRequest = struct {
     min_bytes: i32 = 0,
     /// The maximum bytes to fetch.  See KIP-74 for cases where this limit may not be honored.
     /// Versions: 3+
-    max_bytes: i32 = "0x7fffffff",
+    max_bytes: i32 = 2147483647,
     /// This setting controls the visibility of transactional records. Using READ_UNCOMMITTED (isolation_level = 0) makes all records visible. With READ_COMMITTED (isolation_level = 1), non-transactional and COMMITTED transactional records are visible. To be more concrete, READ_COMMITTED returns all data from offsets smaller than the current LSO (last stable offset), and enables the inclusion of the list of aborted transactions in the result, which allows consumers to discard ABORTED transactional records
     /// Versions: 4+
     isolation_level: i8 = 0,
@@ -323,7 +329,9 @@ pub const FetchRequest = struct {
     rack_id: ?[]const u8 = "",
 
     pub fn serialize(self: *const FetchRequest, buf: []u8, pos: *usize, version: i16) void {
-        ser.writeI32(buf, pos, self.replica_id);
+        if (version <= 14) {
+            ser.writeI32(buf, pos, self.replica_id);
+        }
         ser.writeI32(buf, pos, self.max_wait_ms);
         ser.writeI32(buf, pos, self.min_bytes);
         if (version >= 3) {
@@ -368,7 +376,9 @@ pub const FetchRequest = struct {
 
     pub fn deserialize(alloc: Allocator, buf: []const u8, pos: *usize, version: i16) !FetchRequest {
         var result = FetchRequest{};
-        result.replica_id = ser.readI32(buf, pos);
+        if (version <= 14) {
+            result.replica_id = ser.readI32(buf, pos);
+        }
         result.max_wait_ms = ser.readI32(buf, pos);
         result.min_bytes = ser.readI32(buf, pos);
         if (version >= 3) {
@@ -419,7 +429,9 @@ pub const FetchRequest = struct {
 
     pub fn calcSize(self: *const FetchRequest, version: i16) usize {
         var size: usize = 0;
-        size += 4;
+        if (version <= 14) {
+            size += 4;
+        }
         size += 4;
         size += 4;
         if (version >= 3) {

@@ -12,10 +12,10 @@ pub const FetchResponse = struct {
     pub const FetchableTopicResponse = struct {
         pub const PartitionData = struct {
             pub const EpochEndOffset = struct {
-                /// 
+                ///
                 /// Versions: 12+
                 epoch: i32 = -1,
-                /// 
+                ///
                 /// Versions: 12+
                 end_offset: i64 = -1,
 
@@ -98,10 +98,10 @@ pub const FetchResponse = struct {
             };
 
             pub const SnapshotId = struct {
-                /// 
+                ///
                 /// Versions: 0+
                 end_offset: i64 = -1,
-                /// 
+                ///
                 /// Versions: 0+
                 epoch: i32 = -1,
 
@@ -307,10 +307,12 @@ pub const FetchResponse = struct {
         partitions: []const PartitionData = &.{},
 
         pub fn serialize(self: *const FetchableTopicResponse, buf: []u8, pos: *usize, version: i16) void {
-            if (version >= 12) {
-                ser.writeCompactString(buf, pos, self.topic);
-            } else {
-                ser.writeString(buf, pos, self.topic);
+            if (version <= 12) {
+                if (version >= 12) {
+                    ser.writeCompactString(buf, pos, self.topic);
+                } else {
+                    ser.writeString(buf, pos, self.topic);
+                }
             }
             if (version >= 13) {
                 ser.writeUuid(buf, pos, self.topic_id);
@@ -328,10 +330,12 @@ pub const FetchResponse = struct {
 
         pub fn deserialize(alloc: Allocator, buf: []const u8, pos: *usize, version: i16) !FetchableTopicResponse {
             var result = FetchableTopicResponse{};
-            result.topic = if (version >= 12)
-                try ser.readCompactString(buf, pos)
-            else
-                try ser.readString(buf, pos);
+            if (version <= 12) {
+                result.topic = if (version >= 12)
+                    try ser.readCompactString(buf, pos)
+                else
+                    try ser.readString(buf, pos);
+            }
             if (version >= 13) {
                 result.topic_id = try ser.readUuid(buf, pos);
             }
@@ -352,10 +356,12 @@ pub const FetchResponse = struct {
 
         pub fn calcSize(self: *const FetchableTopicResponse, version: i16) usize {
             var size: usize = 0;
-            if (version >= 12) {
-                size += ser.compactStringSize(self.topic);
-            } else {
-                size += ser.stringSize(self.topic);
+            if (version <= 12) {
+                if (version >= 12) {
+                    size += ser.compactStringSize(self.topic);
+                } else {
+                    size += ser.stringSize(self.topic);
+                }
             }
             if (version >= 13) {
                 size += 16;
