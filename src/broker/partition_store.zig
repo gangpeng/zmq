@@ -1469,6 +1469,70 @@ test "PartitionStore fails S3 WAL recovery on unreadable object" {
     try testing.expectEqual(@as(usize, 0), object_manager.getStreamSetObjectCount());
 }
 
+test "PartitionStore S3 WAL recovery fails closed then retries after injected get fault" {
+    var mock_s3 = MockS3.init(testing.allocator);
+    defer mock_s3.deinit();
+    var s3_storage = S3Storage.initMock(testing.allocator, &mock_s3);
+
+    const stream_id = PartitionStore.hashPartitionKey("s3-get-fault-topic", 0);
+    {
+        var batcher = S3WalBatcher.init(testing.allocator);
+        defer batcher.deinit();
+
+        try batcher.append(stream_id, 0, "a");
+        try testing.expect(batcher.flushNow(&s3_storage));
+    }
+
+    var object_manager = ObjectManager.init(testing.allocator, 1);
+    defer object_manager.deinit();
+
+    var store = PartitionStore.init(testing.allocator);
+    defer store.deinit();
+    store.s3_storage = s3_storage;
+    store.object_manager = &object_manager;
+
+    mock_s3.failNextGetObjects(1);
+    try testing.expectError(error.InjectedGetFailure, store.recoverS3WalObjects());
+    try testing.expectEqual(@as(usize, 0), object_manager.getStreamSetObjectCount());
+
+    try testing.expectEqual(@as(u64, 1), try store.recoverS3WalObjects());
+    try testing.expectEqual(@as(usize, 1), object_manager.getStreamSetObjectCount());
+}
+
+test "PartitionStore S3 WAL recovery handles injected list fault and later consistency" {
+    var mock_s3 = MockS3.init(testing.allocator);
+    defer mock_s3.deinit();
+    var s3_storage = S3Storage.initMock(testing.allocator, &mock_s3);
+
+    const stream_id = PartitionStore.hashPartitionKey("s3-list-fault-topic", 0);
+    {
+        var batcher = S3WalBatcher.init(testing.allocator);
+        defer batcher.deinit();
+
+        try batcher.append(stream_id, 0, "a");
+        try testing.expect(batcher.flushNow(&s3_storage));
+    }
+
+    var object_manager = ObjectManager.init(testing.allocator, 1);
+    defer object_manager.deinit();
+
+    var store = PartitionStore.init(testing.allocator);
+    defer store.deinit();
+    store.s3_storage = s3_storage;
+    store.object_manager = &object_manager;
+
+    mock_s3.failNextListObjects(1);
+    try testing.expectError(error.InjectedListFailure, store.recoverS3WalObjects());
+    try testing.expectEqual(@as(usize, 0), object_manager.getStreamSetObjectCount());
+
+    mock_s3.omitFirstResultFromNextLists(1);
+    try testing.expectEqual(@as(u64, 0), try store.recoverS3WalObjects());
+    try testing.expectEqual(@as(usize, 0), object_manager.getStreamSetObjectCount());
+
+    try testing.expectEqual(@as(u64, 1), try store.recoverS3WalObjects());
+    try testing.expectEqual(@as(usize, 1), object_manager.getStreamSetObjectCount());
+}
+
 test "PartitionStore returns storage error for unreadable ObjectManager S3 object" {
     var mock_s3 = MockS3.init(testing.allocator);
     defer mock_s3.deinit();
@@ -1502,6 +1566,43 @@ test "PartitionStore returns storage error for unreadable ObjectManager S3 objec
     const result = try store.fetch("bad-s3-topic", 0, 0, 1024);
     try testing.expectEqual(PartitionStore.KAFKA_STORAGE_ERROR, result.error_code);
     try testing.expectEqual(@as(usize, 0), result.records.len);
+}
+
+test "PartitionStore returns storage error for injected ObjectManager S3 get fault" {
+    var mock_s3 = MockS3.init(testing.allocator);
+    defer mock_s3.deinit();
+    var s3_storage = S3Storage.initMock(testing.allocator, &mock_s3);
+
+    const stream_id = PartitionStore.hashPartitionKey("fetch-get-fault-topic", 0);
+    {
+        var batcher = S3WalBatcher.init(testing.allocator);
+        defer batcher.deinit();
+
+        try batcher.append(stream_id, 0, "a");
+        try testing.expect(batcher.flushNow(&s3_storage));
+    }
+
+    var object_manager = ObjectManager.init(testing.allocator, 1);
+    defer object_manager.deinit();
+
+    var store = PartitionStore.init(testing.allocator);
+    defer store.deinit();
+    store.s3_storage = s3_storage;
+    store.object_manager = &object_manager;
+
+    try testing.expectEqual(@as(u64, 1), try store.recoverS3WalObjects());
+    try store.ensurePartition("fetch-get-fault-topic", 0);
+    try testing.expect(store.repairPartitionStatesFromObjectManager());
+
+    mock_s3.failNextGetObjects(1);
+    const failed = try store.fetch("fetch-get-fault-topic", 0, 0, 1024);
+    try testing.expectEqual(PartitionStore.KAFKA_STORAGE_ERROR, failed.error_code);
+    try testing.expectEqual(@as(usize, 0), failed.records.len);
+
+    const recovered = try store.fetch("fetch-get-fault-topic", 0, 0, 1024);
+    defer if (recovered.records.len > 0) testing.allocator.free(@constCast(recovered.records));
+    try testing.expectEqual(@as(i16, 0), recovered.error_code);
+    try testing.expectEqualStrings("a", recovered.records);
 }
 
 test "PartitionStore produce offset increments correctly" {

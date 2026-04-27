@@ -910,10 +910,27 @@ pub const S3Storage = struct {
         if (self.client) |c| {
             return c.getObject(key) catch |err| {
                 log.warn("S3 GetObject failed for key '{s}': {}", .{ key, err });
-                return null;
+                return err;
             };
         } else if (self.mock) |m| {
-            if (m.getObject(key)) |data| {
+            if (try m.getObjectOrError(key)) |data| {
+                return try self.allocator.dupe(u8, data);
+            }
+        }
+        return null;
+    }
+
+    pub fn getObjectRange(self: *S3Storage, key: []const u8, offset: u64, length: u64) !?[]u8 {
+        if (self.client) |c| {
+            return c.getObjectRange(key, offset, length) catch |err| {
+                log.warn("S3 GetObjectRange failed for key '{s}' offset={d} length={d}: {}", .{ key, offset, length, err });
+                return err;
+            };
+        } else if (self.mock) |m| {
+            const start = std.math.cast(usize, offset) orelse return error.S3RangeInvalid;
+            const len = std.math.cast(usize, length) orelse return error.S3RangeInvalid;
+            const end = std.math.add(usize, start, len) catch return error.S3RangeInvalid;
+            if (try m.getObjectRangeOrError(key, start, end)) |data| {
                 return try self.allocator.dupe(u8, data);
             }
         }
@@ -965,7 +982,7 @@ pub const S3Storage = struct {
         if (self.client) |c| {
             try c.deleteObject(key);
         } else if (self.mock) |m| {
-            _ = m.deleteObject(key);
+            _ = try m.deleteObjectOrError(key);
         }
     }
 };
@@ -1172,6 +1189,38 @@ test "S3Storage lists mock object keys" {
     try testing.expectEqual(@as(usize, 2), keys.len);
     try testing.expectEqualStrings("wal/epoch-0/bulk/0000000001", keys[0]);
     try testing.expectEqualStrings("wal/epoch-0/bulk/0000000002", keys[1]);
+}
+
+test "S3Storage mock mode propagates injected operation failures" {
+    var mock = @import("s3.zig").MockS3.init(testing.allocator);
+    defer mock.deinit();
+
+    var storage = S3Storage.initMock(testing.allocator, &mock);
+    try storage.putObject("key", "0123456789");
+
+    mock.failNextGetObjects(1);
+    try testing.expectError(error.InjectedGetFailure, storage.getObject("key"));
+
+    const data = (try storage.getObject("key")).?;
+    defer testing.allocator.free(data);
+    try testing.expectEqualStrings("0123456789", data);
+
+    mock.failNextRangeReads(1);
+    try testing.expectError(error.InjectedRangeFailure, storage.getObjectRange("key", 2, 4));
+
+    const range = (try storage.getObjectRange("key", 2, 4)).?;
+    defer testing.allocator.free(range);
+    try testing.expectEqualStrings("2345", range);
+
+    mock.failNextListObjects(1);
+    try testing.expectError(error.InjectedListFailure, storage.listObjectKeys(""));
+
+    mock.failNextDeleteObjects(1);
+    try testing.expectError(error.InjectedDeleteFailure, storage.deleteObject("key"));
+    try testing.expect(mock.getObject("key") != null);
+
+    try storage.deleteObject("key");
+    try testing.expect(mock.getObject("key") == null);
 }
 
 test "S3Storage parses ListObjects keys" {

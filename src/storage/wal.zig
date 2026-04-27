@@ -1260,6 +1260,26 @@ test "S3WalBatcher flushNow retries transient upload failure" {
     try testing.expect(batcher.isFlushed(1));
 }
 
+test "S3WalBatcher flushNow retries injected MockS3 put failures" {
+    const MockS3 = @import("s3.zig").MockS3;
+
+    var batcher = S3WalBatcher.init(testing.allocator);
+    defer batcher.deinit();
+    var mock_s3 = MockS3.init(testing.allocator);
+    defer mock_s3.deinit();
+
+    mock_s3.failNextPutObjects(2);
+    try batcher.append(1, 0, "record-a");
+
+    const flushed = batcher.flushNow(&mock_s3);
+    try testing.expect(flushed);
+    try testing.expectEqual(@as(usize, 0), batcher.pendingCount());
+    try testing.expectEqual(@as(u64, 1), batcher.batch_upload_count);
+    try testing.expectEqual(@as(u64, 0), batcher.batch_upload_failures);
+    try testing.expect(batcher.isFlushed(1));
+    try testing.expectEqual(@as(usize, 1), mock_s3.objectCount());
+}
+
 test "S3WalBatcher fencing rejects appends" {
     var batcher = S3WalBatcher.init(testing.allocator);
     defer batcher.deinit();

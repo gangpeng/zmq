@@ -12,6 +12,19 @@ pub const MockS3 = struct {
     allocator: Allocator,
     put_count: u64 = 0,
     get_count: u64 = 0,
+    range_get_count: u64 = 0,
+    delete_count: u64 = 0,
+    list_count: u64 = 0,
+    faults: FaultInjection = .{},
+
+    pub const FaultInjection = struct {
+        put_failures_remaining: u32 = 0,
+        get_failures_remaining: u32 = 0,
+        range_failures_remaining: u32 = 0,
+        delete_failures_remaining: u32 = 0,
+        list_failures_remaining: u32 = 0,
+        list_omit_first_result_remaining: u32 = 0,
+    };
 
     const Object = struct {
         key: []u8,
@@ -35,7 +48,39 @@ pub const MockS3 = struct {
         self.objects.deinit();
     }
 
+    pub fn failNextPutObjects(self: *MockS3, count: u32) void {
+        self.faults.put_failures_remaining = count;
+    }
+
+    pub fn failNextGetObjects(self: *MockS3, count: u32) void {
+        self.faults.get_failures_remaining = count;
+    }
+
+    pub fn failNextRangeReads(self: *MockS3, count: u32) void {
+        self.faults.range_failures_remaining = count;
+    }
+
+    pub fn failNextDeleteObjects(self: *MockS3, count: u32) void {
+        self.faults.delete_failures_remaining = count;
+    }
+
+    pub fn failNextListObjects(self: *MockS3, count: u32) void {
+        self.faults.list_failures_remaining = count;
+    }
+
+    pub fn omitFirstResultFromNextLists(self: *MockS3, count: u32) void {
+        self.faults.list_omit_first_result_remaining = count;
+    }
+
+    fn consumeFailure(counter: *u32) bool {
+        if (counter.* == 0) return false;
+        counter.* -= 1;
+        return true;
+    }
+
     pub fn putObject(self: *MockS3, key: []const u8, data: []const u8) !void {
+        if (consumeFailure(&self.faults.put_failures_remaining)) return error.InjectedPutFailure;
+
         // Remove existing if present
         if (self.objects.fetchRemove(key)) |existing| {
             self.allocator.free(existing.value.key);
@@ -56,7 +101,12 @@ pub const MockS3 = struct {
     }
 
     pub fn getObject(self: *MockS3, key: []const u8) ?[]const u8 {
+        return self.getObjectOrError(key) catch null;
+    }
+
+    pub fn getObjectOrError(self: *MockS3, key: []const u8) !?[]const u8 {
         self.get_count += 1;
+        if (consumeFailure(&self.faults.get_failures_remaining)) return error.InjectedGetFailure;
         if (self.objects.get(key)) |obj| {
             return obj.data;
         }
@@ -65,7 +115,13 @@ pub const MockS3 = struct {
 
     /// Range read: get bytes [start, end) from an object.
     pub fn getObjectRange(self: *MockS3, key: []const u8, start: usize, end: usize) ?[]const u8 {
+        return self.getObjectRangeOrError(key, start, end) catch null;
+    }
+
+    pub fn getObjectRangeOrError(self: *MockS3, key: []const u8, start: usize, end: usize) !?[]const u8 {
         self.get_count += 1;
+        self.range_get_count += 1;
+        if (consumeFailure(&self.faults.range_failures_remaining)) return error.InjectedRangeFailure;
         if (self.objects.get(key)) |obj| {
             if (start >= obj.data.len) return null;
             const actual_end = @min(end, obj.data.len);
@@ -75,6 +131,12 @@ pub const MockS3 = struct {
     }
 
     pub fn deleteObject(self: *MockS3, key: []const u8) bool {
+        return self.deleteObjectOrError(key) catch false;
+    }
+
+    pub fn deleteObjectOrError(self: *MockS3, key: []const u8) !bool {
+        self.delete_count += 1;
+        if (consumeFailure(&self.faults.delete_failures_remaining)) return error.InjectedDeleteFailure;
         if (self.objects.fetchRemove(key)) |existing| {
             self.allocator.free(existing.value.key);
             self.allocator.free(existing.value.data);
@@ -93,7 +155,12 @@ pub const MockS3 = struct {
     }
 
     /// Return owned object keys matching prefix, sorted for deterministic recovery.
-    pub fn listObjectKeys(self: *const MockS3, alloc: Allocator, prefix: []const u8) ![][]u8 {
+    pub fn listObjectKeys(self: *MockS3, alloc: Allocator, prefix: []const u8) ![][]u8 {
+        self.list_count += 1;
+        if (consumeFailure(&self.faults.list_failures_remaining)) return error.InjectedListFailure;
+
+        const omit_first = consumeFailure(&self.faults.list_omit_first_result_remaining);
+        var omitted = false;
         var keys = std.array_list.Managed([]u8).init(alloc);
         errdefer {
             for (keys.items) |key| alloc.free(key);
@@ -103,6 +170,10 @@ pub const MockS3 = struct {
         var it = self.objects.keyIterator();
         while (it.next()) |key_ptr| {
             if (std.mem.startsWith(u8, key_ptr.*, prefix)) {
+                if (omit_first and !omitted) {
+                    omitted = true;
+                    continue;
+                }
                 const key_copy = try alloc.dupe(u8, key_ptr.*);
                 errdefer alloc.free(key_copy);
                 try keys.append(key_copy);
@@ -583,6 +654,55 @@ test "MockS3 delete nonexistent" {
     defer s3.deinit();
 
     try testing.expect(!s3.deleteObject("nonexistent"));
+}
+
+test "MockS3 injected put failures are bounded and non-destructive" {
+    var s3 = MockS3.init(testing.allocator);
+    defer s3.deinit();
+
+    s3.failNextPutObjects(2);
+    try testing.expectError(error.InjectedPutFailure, s3.putObject("key", "value"));
+    try testing.expectError(error.InjectedPutFailure, s3.putObject("key", "value"));
+    try testing.expectEqual(@as(usize, 0), s3.objectCount());
+    try testing.expectEqual(@as(u64, 0), s3.put_count);
+
+    try s3.putObject("key", "value");
+    try testing.expectEqual(@as(usize, 1), s3.objectCount());
+    try testing.expectEqual(@as(u64, 1), s3.put_count);
+    try testing.expectEqualStrings("value", s3.getObject("key").?);
+}
+
+test "MockS3 injected read list and delete failures surface through error-aware APIs" {
+    var s3 = MockS3.init(testing.allocator);
+    defer s3.deinit();
+
+    try s3.putObject("prefix/a", "alpha");
+    try s3.putObject("prefix/b", "bravo");
+
+    s3.failNextGetObjects(1);
+    try testing.expectError(error.InjectedGetFailure, s3.getObjectOrError("prefix/a"));
+    try testing.expectEqualStrings("alpha", (try s3.getObjectOrError("prefix/a")).?);
+
+    s3.failNextRangeReads(1);
+    try testing.expectError(error.InjectedRangeFailure, s3.getObjectRangeOrError("prefix/a", 0, 2));
+    try testing.expectEqualStrings("al", (try s3.getObjectRangeOrError("prefix/a", 0, 2)).?);
+
+    s3.failNextListObjects(1);
+    try testing.expectError(error.InjectedListFailure, s3.listObjectKeys(testing.allocator, "prefix/"));
+
+    s3.omitFirstResultFromNextLists(1);
+    const omitted_keys = try s3.listObjectKeys(testing.allocator, "prefix/");
+    defer {
+        for (omitted_keys) |key| testing.allocator.free(key);
+        testing.allocator.free(omitted_keys);
+    }
+    try testing.expectEqual(@as(usize, 1), omitted_keys.len);
+
+    s3.failNextDeleteObjects(1);
+    try testing.expectError(error.InjectedDeleteFailure, s3.deleteObjectOrError("prefix/a"));
+    try testing.expect(s3.getObject("prefix/a") != null);
+    try testing.expect(try s3.deleteObjectOrError("prefix/a"));
+    try testing.expect(s3.getObject("prefix/a") == null);
 }
 
 test "MockS3 objectSize" {

@@ -663,8 +663,7 @@ pub const CompactionManager = struct {
     /// are cleaned up on the next compaction cycle.
     fn deleteS3Object(self: *CompactionManager, key: []const u8) bool {
         if (self.mock_s3) |s3| {
-            _ = s3.deleteObject(key);
-            return true;
+            return s3.deleteObject(key);
         }
         if (self.s3_storage) |s3| {
             s3.deleteObject(key) catch |err| {
@@ -1202,8 +1201,7 @@ test "CompactionManager cleans up orphaned S3 keys" {
     try cm.orphaned_keys.append(key1);
     try cm.orphaned_keys.append(key2);
 
-    // Put objects in S3 so deleteObject succeeds (MockS3 always returns true for delete,
-    // but let's add them for realism)
+    // Put objects in S3 so deleteObject succeeds.
     try mock_s3.putObject("orphan/key1", "data1");
     try mock_s3.putObject("orphan/key2", "data2");
 
@@ -1215,6 +1213,35 @@ test "CompactionManager cleans up orphaned S3 keys" {
     // Orphaned keys should be cleaned up
     try testing.expectEqual(@as(usize, 0), cm.orphaned_keys.items.len);
     try testing.expectEqual(@as(u64, 2), cm.total_cleanups);
+}
+
+test "CompactionManager keeps orphaned S3 keys after injected delete failure" {
+    var om = ObjectManager.init(testing.allocator, 0);
+    defer om.deinit();
+
+    var mock_s3 = MockS3.init(testing.allocator);
+    defer mock_s3.deinit();
+
+    var cm = CompactionManager.init(testing.allocator, &om);
+    defer cm.deinit();
+    cm.setMockS3(&mock_s3);
+
+    const key = try testing.allocator.dupe(u8, "orphan/delete-fault");
+    try cm.orphaned_keys.append(key);
+    try mock_s3.putObject("orphan/delete-fault", "data");
+
+    mock_s3.failNextDeleteObjects(1);
+    try cm.runCompaction();
+
+    try testing.expectEqual(@as(usize, 1), cm.orphaned_keys.items.len);
+    try testing.expectEqual(@as(u64, 0), cm.total_cleanups);
+    try testing.expect(mock_s3.getObject("orphan/delete-fault") != null);
+
+    try cm.runCompaction();
+
+    try testing.expectEqual(@as(usize, 0), cm.orphaned_keys.items.len);
+    try testing.expectEqual(@as(u64, 1), cm.total_cleanups);
+    try testing.expect(mock_s3.getObject("orphan/delete-fault") == null);
 }
 
 test "CompactionManager cleanupExpired marks retention-trimmed SOs for destruction" {
