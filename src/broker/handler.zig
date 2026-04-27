@@ -3336,50 +3336,117 @@ pub const Broker = struct {
     // AlterConfigs (key 33)
     // ---------------------------------------------------------------
     fn handleAlterConfigs(self: *Broker, request_bytes: []const u8, body_start: usize, req_header: *const RequestHeader, api_version: i16, resp_header_version: i16) ?[]u8 {
-        _ = api_version;
+        const Req = generated.alter_configs_request.AlterConfigsRequest;
+        const Resp = generated.alter_configs_response.AlterConfigsResponse;
+        const ResourceResponse = Resp.AlterConfigsResourceResponse;
+
+        if (!validateAlterConfigsRequestFrame(request_bytes, body_start, api_version)) {
+            log.warn("Malformed AlterConfigs request", .{});
+            return null;
+        }
+
         var pos = body_start;
-        const num_resources = (ser.readArrayLen(request_bytes, &pos) catch 0) orelse 0;
+        var req = Req.deserialize(self.allocator, request_bytes, &pos, api_version) catch |err| {
+            log.warn("Failed to decode AlterConfigs request: {}", .{err});
+            return null;
+        };
+        defer self.freeAlterConfigsRequest(&req);
 
-        var results: [32]struct { resource_type: i8, resource_name: []const u8, error_code: i16 } = undefined;
-        var count: usize = 0;
+        const responses = self.allocator.alloc(ResourceResponse, req.resources.len) catch return null;
+        defer if (responses.len > 0) self.allocator.free(responses);
 
-        for (0..num_resources) |_| {
-            if (count >= 32) break;
-            const resource_type = ser.readI8(request_bytes, &pos);
-            const resource_name = (ser.readString(request_bytes, &pos) catch break) orelse "";
-
-            // Parse config entries
-            const num_configs = (ser.readArrayLen(request_bytes, &pos) catch 0) orelse 0;
-            for (0..num_configs) |_| {
-                const config_name = (ser.readString(request_bytes, &pos) catch break) orelse "";
-                const config_value = (ser.readString(request_bytes, &pos) catch break) orelse "";
-                _ = config_name;
-                _ = config_value;
-                // In production: apply config changes to broker/topic
-            }
-
-            results[count] = .{
-                .resource_type = resource_type,
-                .resource_name = resource_name,
-                .error_code = 0,
+        var mutated = false;
+        for (req.resources, 0..) |resource, i| {
+            const result = self.applyAlterConfigsResource(resource, req.validate_only);
+            responses[i] = .{
+                .error_code = result.error_code,
+                .error_message = result.error_message,
+                .resource_type = resource.resource_type,
+                .resource_name = resource.resource_name,
             };
-            count += 1;
+            if (result.mutated) mutated = true;
         }
 
-        var buf = self.allocator.alloc(u8, 1024) catch return null;
-        var wpos: usize = 0;
-        const rh = ResponseHeader{ .correlation_id = req_header.correlation_id };
-        rh.serialize(buf, &wpos, resp_header_version);
-        ser.writeI32(buf, &wpos, 0); // throttle_time_ms
-        ser.writeArrayLen(buf, &wpos, count);
-        for (0..count) |i| {
-            ser.writeI16(buf, &wpos, results[i].error_code);
-            ser.writeString(buf, &wpos, null); // error_message
-            ser.writeI8(buf, &wpos, results[i].resource_type);
-            ser.writeString(buf, &wpos, results[i].resource_name);
+        if (mutated) {
+            self.persistTopics();
+            self.persistObjectManagerSnapshot();
         }
-        if (resp_header_version >= 1) ser.writeEmptyTaggedFields(buf, &wpos);
-        return (self.allocator.realloc(buf, wpos) catch buf)[0..wpos];
+
+        const resp = Resp{
+            .throttle_time_ms = 0,
+            .responses = responses,
+        };
+        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+    }
+
+    fn freeAlterConfigsRequest(self: *Broker, req: *generated.alter_configs_request.AlterConfigsRequest) void {
+        for (req.resources) |resource| {
+            if (resource.configs.len > 0) self.allocator.free(resource.configs);
+        }
+        if (req.resources.len > 0) self.allocator.free(req.resources);
+    }
+
+    fn applyAlterConfigsResource(self: *Broker, resource: generated.alter_configs_request.AlterConfigsRequest.AlterConfigsResource, validate_only: bool) IncrementalAlterConfigResult {
+        if (resource.resource_type != 2) {
+            return .{
+                .error_code = @intFromEnum(ErrorCode.invalid_request),
+                .error_message = "Unsupported config resource type",
+            };
+        }
+
+        const topic_name = resource.resource_name orelse "";
+        const topic_info = self.topics.getPtr(topic_name) orelse return .{
+            .error_code = @intFromEnum(ErrorCode.unknown_topic_or_partition),
+            .error_message = "Unknown topic",
+        };
+
+        var updated = false;
+        for (resource.configs) |config| {
+            const result = applyAlterTopicConfig(topic_info, config, validate_only);
+            if (result.error_code != @intFromEnum(ErrorCode.none)) return result;
+            if (result.mutated) updated = true;
+        }
+
+        return .{
+            .error_code = @intFromEnum(ErrorCode.none),
+            .error_message = null,
+            .mutated = updated,
+        };
+    }
+
+    fn applyAlterTopicConfig(topic_info: *TopicInfo, config: generated.alter_configs_request.AlterConfigsRequest.AlterConfigsResource.AlterableConfig, validate_only: bool) IncrementalAlterConfigResult {
+        const name = config.name orelse return .{
+            .error_code = @intFromEnum(ErrorCode.invalid_config),
+            .error_message = "Missing config name",
+        };
+
+        const defaults = TopicConfig{};
+        const value = config.value;
+
+        if (std.mem.eql(u8, name, "retention.ms")) {
+            const parsed = if (value) |v| std.fmt.parseInt(i64, v, 10) catch return invalidTopicConfigValue() else defaults.retention_ms;
+            if (!validate_only) topic_info.config.retention_ms = parsed;
+        } else if (std.mem.eql(u8, name, "retention.bytes")) {
+            const parsed = if (value) |v| std.fmt.parseInt(i64, v, 10) catch return invalidTopicConfigValue() else defaults.retention_bytes;
+            if (!validate_only) topic_info.config.retention_bytes = parsed;
+        } else if (std.mem.eql(u8, name, "max.message.bytes")) {
+            const parsed = if (value) |v| std.fmt.parseInt(i32, v, 10) catch return invalidTopicConfigValue() else defaults.max_message_bytes;
+            if (!validate_only) topic_info.config.max_message_bytes = parsed;
+        } else if (std.mem.eql(u8, name, "min.insync.replicas")) {
+            const parsed = if (value) |v| std.fmt.parseInt(i32, v, 10) catch return invalidTopicConfigValue() else defaults.min_insync_replicas;
+            if (!validate_only) topic_info.config.min_insync_replicas = parsed;
+        } else {
+            return .{
+                .error_code = @intFromEnum(ErrorCode.invalid_config),
+                .error_message = "Unsupported topic config",
+            };
+        }
+
+        return .{
+            .error_code = @intFromEnum(ErrorCode.none),
+            .error_message = null,
+            .mutated = !validate_only,
+        };
     }
 
     // ---------------------------------------------------------------
@@ -6524,6 +6591,27 @@ pub const Broker = struct {
         return true;
     }
 
+    fn validateAlterConfigsRequestFrame(buf: []const u8, start_pos: usize, api_version: i16) bool {
+        const flexible = api_version >= 2;
+        var pos = start_pos;
+
+        const resource_count = readKafkaArrayCount(buf, &pos, flexible) orelse return false;
+        for (0..resource_count) |_| {
+            if (!skipFixedBytes(buf, &pos, 1)) return false; // resource_type
+            if (!skipKafkaString(buf, &pos, flexible)) return false; // resource_name
+            const config_count = readKafkaArrayCount(buf, &pos, flexible) orelse return false;
+            for (0..config_count) |_| {
+                if (!skipKafkaString(buf, &pos, flexible)) return false; // config name
+                if (!skipKafkaString(buf, &pos, flexible)) return false; // value
+                if (flexible) ser.skipTaggedFields(buf, &pos) catch return false;
+            }
+            if (flexible) ser.skipTaggedFields(buf, &pos) catch return false;
+        }
+        if (!skipFixedBytes(buf, &pos, 1)) return false; // validate_only
+        if (flexible) ser.skipTaggedFields(buf, &pos) catch return false;
+        return true;
+    }
+
     fn validateIncrementalAlterConfigsRequestFrame(buf: []const u8, start_pos: usize, api_version: i16) bool {
         const flexible = api_version >= 1;
         var pos = start_pos;
@@ -7803,6 +7891,106 @@ test "Broker.handleRequest DeleteAcls rejects truncated request" {
 
     var buf: [128]u8 = undefined;
     const req_len = buildTestRequest(&buf, 31, 2, 3104, header_mod.requestHeaderVersion(31, 2));
+    try testing.expect(broker.handleRequest(buf[0..req_len]) == null);
+}
+
+test "Broker.handleRequest AlterConfigs v2 returns generated response and updates topic config" {
+    const Req = generated.alter_configs_request.AlterConfigsRequest;
+    const Resp = generated.alter_configs_response.AlterConfigsResponse;
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+    try testing.expect(broker.ensureTopic("alter-cfg-topic"));
+
+    const configs = [_]Req.AlterConfigsResource.AlterableConfig{.{
+        .name = "min.insync.replicas",
+        .value = "2",
+    }};
+    const resources = [_]Req.AlterConfigsResource{.{
+        .resource_type = 2,
+        .resource_name = "alter-cfg-topic",
+        .configs = &configs,
+    }};
+    const req = Req{
+        .resources = &resources,
+        .validate_only = false,
+    };
+
+    var buf: [512]u8 = undefined;
+    var pos = buildTestRequest(&buf, 33, 2, 3302, header_mod.requestHeaderVersion(33, 2));
+    req.serialize(&buf, &pos, 2);
+
+    const response = broker.handleRequest(buf[0..pos]);
+    try testing.expect(response != null);
+    defer testing.allocator.free(response.?);
+
+    var rpos: usize = 0;
+    var response_header = try ResponseHeader.deserialize(testing.allocator, response.?, &rpos, header_mod.responseHeaderVersion(33, 2));
+    defer response_header.deinit(testing.allocator);
+    try testing.expectEqual(@as(i32, 3302), response_header.correlation_id);
+
+    const resp = try Resp.deserialize(testing.allocator, response.?, &rpos, 2);
+    defer if (resp.responses.len > 0) testing.allocator.free(resp.responses);
+
+    try testing.expectEqual(response.?.len, rpos);
+    try testing.expectEqual(@as(i32, 0), resp.throttle_time_ms);
+    try testing.expectEqual(@as(usize, 1), resp.responses.len);
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.none)), resp.responses[0].error_code);
+    try testing.expectEqual(@as(i8, 2), resp.responses[0].resource_type);
+    try testing.expectEqualStrings("alter-cfg-topic", resp.responses[0].resource_name.?);
+    try testing.expectEqual(@as(i32, 2), broker.topics.get("alter-cfg-topic").?.config.min_insync_replicas);
+}
+
+test "Broker.handleRequest AlterConfigs validate_only does not mutate" {
+    const Req = generated.alter_configs_request.AlterConfigsRequest;
+    const Resp = generated.alter_configs_response.AlterConfigsResponse;
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+    try testing.expect(broker.ensureTopic("alter-cfg-validate-topic"));
+
+    const before = broker.topics.get("alter-cfg-validate-topic").?.config.retention_bytes;
+    const configs = [_]Req.AlterConfigsResource.AlterableConfig{.{
+        .name = "retention.bytes",
+        .value = "4096",
+    }};
+    const resources = [_]Req.AlterConfigsResource{.{
+        .resource_type = 2,
+        .resource_name = "alter-cfg-validate-topic",
+        .configs = &configs,
+    }};
+    const req = Req{
+        .resources = &resources,
+        .validate_only = true,
+    };
+
+    var buf: [512]u8 = undefined;
+    var pos = buildTestRequest(&buf, 33, 2, 3303, header_mod.requestHeaderVersion(33, 2));
+    req.serialize(&buf, &pos, 2);
+
+    const response = broker.handleRequest(buf[0..pos]);
+    try testing.expect(response != null);
+    defer testing.allocator.free(response.?);
+
+    var rpos: usize = 0;
+    var response_header = try ResponseHeader.deserialize(testing.allocator, response.?, &rpos, header_mod.responseHeaderVersion(33, 2));
+    defer response_header.deinit(testing.allocator);
+    try testing.expectEqual(@as(i32, 3303), response_header.correlation_id);
+
+    const resp = try Resp.deserialize(testing.allocator, response.?, &rpos, 2);
+    defer if (resp.responses.len > 0) testing.allocator.free(resp.responses);
+
+    try testing.expectEqual(response.?.len, rpos);
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.none)), resp.responses[0].error_code);
+    try testing.expectEqual(before, broker.topics.get("alter-cfg-validate-topic").?.config.retention_bytes);
+}
+
+test "Broker.handleRequest AlterConfigs rejects truncated request" {
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+
+    var buf: [128]u8 = undefined;
+    const req_len = buildTestRequest(&buf, 33, 2, 3304, header_mod.requestHeaderVersion(33, 2));
     try testing.expect(broker.handleRequest(buf[0..req_len]) == null);
 }
 
