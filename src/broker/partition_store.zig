@@ -246,6 +246,8 @@ pub const PartitionStore = struct {
             defer self.allocator.free(ranges);
             if (ranges.len == 0) continue;
 
+            try self.rejectOverlappingS3WalRanges(om, key, ranges);
+
             for (ranges) |range| {
                 if (om.getStream(range.stream_id) == null) {
                     _ = try om.createStreamWithId(range.stream_id, om.node_id);
@@ -260,6 +262,22 @@ pub const PartitionStore = struct {
         }
 
         return recovered;
+    }
+
+    fn rejectOverlappingS3WalRanges(self: *PartitionStore, om: *ObjectManager, key: []const u8, ranges: []const stream_mod.StreamOffsetRange) !void {
+        for (ranges) |range| {
+            if (range.end_offset <= range.start_offset) {
+                log.warn("S3 WAL object {s} has invalid stream range {d}[{d},{d})", .{ key, range.stream_id, range.start_offset, range.end_offset });
+                return error.InvalidS3WalRange;
+            }
+
+            const overlaps = try om.getObjects(range.stream_id, range.start_offset, range.end_offset, 1);
+            defer if (overlaps.len > 0) self.allocator.free(overlaps);
+            if (overlaps.len > 0) {
+                log.warn("S3 WAL object {s} overlaps existing stream range {d}[{d},{d})", .{ key, range.stream_id, range.start_offset, range.end_offset });
+                return error.S3WalOffsetOverlap;
+            }
+        }
     }
 
     fn objectManagerHasS3Key(om: *ObjectManager, key: []const u8) bool {
@@ -1476,6 +1494,37 @@ test "PartitionStore rebuilds S3 WAL data after local store replacement" {
     defer if (result.records.len > 0) testing.allocator.free(@constCast(result.records));
     try testing.expectEqual(@as(i16, 0), result.error_code);
     try testing.expectEqualStrings("ab", result.records);
+}
+
+test "PartitionStore fails S3 WAL recovery on overlapping object ranges" {
+    var mock_s3 = MockS3.init(testing.allocator);
+    defer mock_s3.deinit();
+    var s3_storage = S3Storage.initMock(testing.allocator, &mock_s3);
+
+    const stream_id = PartitionStore.hashPartitionKey("s3-overlap-topic", 0);
+    {
+        var batcher = S3WalBatcher.init(testing.allocator);
+        defer batcher.deinit();
+        try batcher.append(stream_id, 0, "first");
+        try testing.expect(batcher.flushNow(&s3_storage));
+    }
+    {
+        var stale_batcher = S3WalBatcher.init(testing.allocator);
+        defer stale_batcher.deinit();
+        stale_batcher.setEpoch(1);
+        try stale_batcher.append(stream_id, 0, "stale");
+        try testing.expect(stale_batcher.flushNow(&s3_storage));
+    }
+
+    var object_manager = ObjectManager.init(testing.allocator, 1);
+    defer object_manager.deinit();
+
+    var store = PartitionStore.init(testing.allocator);
+    defer store.deinit();
+    store.s3_storage = s3_storage;
+    store.object_manager = &object_manager;
+
+    try testing.expectError(error.S3WalOffsetOverlap, store.recoverS3WalObjects());
 }
 
 test "PartitionStore fetch filters interleaved S3 WAL stream blocks" {
