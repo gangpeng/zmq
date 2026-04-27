@@ -278,8 +278,11 @@ zig build test --summary all
 # or
 make test
 
-# Run E2E integration tests (starts MinIO + 3 brokers automatically)
+# Run E2E integration tests against a running Docker cluster
 make e2e
+
+# Run gated S3 broker-process crash/replacement harness against MinIO
+ZMQ_RUN_PROCESS_CRASH_TESTS=1 make s3-crash
 
 # Run performance benchmarks
 make bench
@@ -393,6 +396,7 @@ The broker supports Kafka-style `key=value` properties files. See [`config/serve
   run-s3          Run with MinIO S3 backend
   run-cluster     Run 3-node cluster (requires 3 terminals)
   e2e             Run E2E tests with MinIO (requires Docker)
+  s3-crash        Run gated S3 broker process crash/restart test (requires MinIO)
   bench           Run performance benchmarks
   docker          Build Docker image
   docker-up       Start 3-broker cluster with MinIO

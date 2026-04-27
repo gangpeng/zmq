@@ -392,6 +392,16 @@ pub fn build(b: *std.Build) void {
         minio_test_step.dependOn(&run_minio.step);
     }
 
+    // External broker-process crash/restart harness. The Python test skips
+    // unless ZMQ_RUN_PROCESS_CRASH_TESTS=1 is set, so the build step is safe to
+    // execute in local/CI environments without MinIO.
+    const s3_process_crash_step = b.step("test-s3-process-crash", "Run gated S3 broker process crash/restart harness");
+    {
+        const run_s3_process_crash = b.addSystemCommand(&.{ "python3", "tests/s3_process_crash_test.py" });
+        run_s3_process_crash.step.dependOn(b.getInstallStep());
+        s3_process_crash_step.dependOn(&run_s3_process_crash.step);
+    }
+
     // ---------------------------------------------------------------
     // Benchmark step
     // ---------------------------------------------------------------

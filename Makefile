@@ -4,7 +4,7 @@
 ZIG ?= zig
 ZIG_FLAGS ?=
 
-.PHONY: build test run clean e2e docker bench help codegen
+.PHONY: build test run clean e2e s3-crash docker bench help codegen
 
 help: ## Show this help
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | sort | awk 'BEGIN {FS = ":.*?## "}; {printf "  \033[36m%-15s\033[0m %s\n", $$1, $$2}'
@@ -35,6 +35,9 @@ codegen: ## Regenerate protocol structs from JSON schemas
 
 e2e: build ## Run E2E tests with MinIO (requires Docker)
 	python3 tests/e2e_test.py
+
+s3-crash: build ## Run gated S3 broker process crash/restart test (requires MinIO)
+	ZMQ_BIN=./zig-out/bin/zmq python3 tests/s3_process_crash_test.py
 
 bench: ## Run performance benchmarks
 	$(ZIG) build bench $(ZIG_FLAGS)
