@@ -509,6 +509,11 @@ pub const Broker = struct {
                 self.persistObjectManagerSnapshot();
             }
         }
+        const replayed_object_records = try self.replayCommittedAutoMqObjectMetadataRecords();
+        if (replayed_object_records > 0) {
+            log.info("Replayed {d} committed AutoMQ object metadata quorum snapshot(s)", .{replayed_object_records});
+            self.persistObjectManagerSnapshot();
+        }
 
         // Load persisted topics
         const saved_topics = try self.persistence.loadTopics();
@@ -2185,6 +2190,99 @@ pub const Broker = struct {
             if (!isAutoMqMetadataRecord(entry.data)) continue;
             if (applied == 0) self.clearAutoMqMetadata();
             try self.applyAutoMqMetadataRecord(entry.data);
+            applied += 1;
+        }
+        return applied;
+    }
+
+    const auto_mq_object_record_magic = "ZMQOBJ2";
+
+    fn isAutoMqObjectMetadataRecord(data: []const u8) bool {
+        return data.len >= auto_mq_object_record_magic.len and
+            std.mem.eql(u8, data[0..auto_mq_object_record_magic.len], auto_mq_object_record_magic);
+    }
+
+    fn ensureAutoMqObjectMutationAllowed(self: *Broker) !void {
+        const raft = self.raft_state orelse return;
+        if (raft.role != .leader) return error.NotController;
+        if (raft.quorumSize() > 1) return error.QuorumCommitPending;
+    }
+
+    fn autoMqObjectMutationErrorCode(self: *Broker) ?i16 {
+        self.ensureAutoMqObjectMutationAllowed() catch |err| return autoMqQuorumErrorCode(err);
+        return null;
+    }
+
+    fn buildAutoMqObjectMetadataRecord(self: *Broker) ![]u8 {
+        var empty_orphans = [_][]const u8{};
+        const orphaned_keys: []const []const u8 = if (self.compaction_manager) |*cm|
+            cm.orphaned_keys.items
+        else
+            empty_orphans[0..];
+
+        const object_snapshot = try self.object_manager.takeSnapshot(orphaned_keys);
+        defer self.allocator.free(object_snapshot);
+        const prepared_snapshot = try self.object_manager.prepared_registry.serialize(self.allocator);
+        defer self.allocator.free(prepared_snapshot);
+
+        const object_size = try autoMqBytesFieldSize(object_snapshot);
+        const prepared_size = try autoMqBytesFieldSize(prepared_snapshot);
+        const payload_len = try checkedAddSize(object_size, prepared_size);
+        const total_len = try checkedAddSize(auto_mq_object_record_magic.len, payload_len);
+        const buf = try self.allocator.alloc(u8, total_len);
+        var pos: usize = 0;
+        @memcpy(buf[pos .. pos + auto_mq_object_record_magic.len], auto_mq_object_record_magic);
+        pos += auto_mq_object_record_magic.len;
+        try writeRecordBytes(buf, &pos, object_snapshot);
+        try writeRecordBytes(buf, &pos, prepared_snapshot);
+        std.debug.assert(pos == buf.len);
+        return buf;
+    }
+
+    fn commitAutoMqObjectMetadataRecord(self: *Broker) !void {
+        const raft = self.raft_state orelse return;
+        if (raft.role != .leader) return error.NotController;
+        if (raft.quorumSize() > 1) return error.QuorumCommitPending;
+
+        const record = try self.buildAutoMqObjectMetadataRecord();
+        defer self.allocator.free(record);
+        const offset = try raft.appendEntry(record);
+        raft.commit_index = offset;
+    }
+
+    fn persistObjectManagerMutation(self: *Broker) !void {
+        try self.commitAutoMqObjectMetadataRecord();
+        self.persistObjectManagerSnapshot();
+    }
+
+    fn resetObjectManagerForQuorumSnapshot(self: *Broker) void {
+        self.object_manager.deinit();
+        self.object_manager = ObjectManager.init(self.allocator, self.node_id);
+        self.wireInternalPointers();
+    }
+
+    fn applyAutoMqObjectMetadataRecord(self: *Broker, data: []const u8) !void {
+        if (!isAutoMqObjectMetadataRecord(data)) return;
+
+        var pos = auto_mq_object_record_magic.len;
+        const object_snapshot = try readRecordBytes(data, &pos);
+        const prepared_snapshot = try readRecordBytes(data, &pos);
+        if (pos != data.len) return error.InvalidAutoMqMetadataRecord;
+
+        self.resetObjectManagerForQuorumSnapshot();
+        const orphaned_keys = try self.object_manager.loadSnapshot(object_snapshot);
+        try self.attachOrphanedKeysToCompaction(orphaned_keys);
+        try self.object_manager.prepared_registry.deserialize(prepared_snapshot);
+    }
+
+    fn replayCommittedAutoMqObjectMetadataRecords(self: *Broker) !usize {
+        const raft = self.raft_state orelse return 0;
+
+        var applied: usize = 0;
+        for (raft.log.entries.items) |entry| {
+            if (entry.offset > raft.commit_index) break;
+            if (!isAutoMqObjectMetadataRecord(entry.data)) continue;
+            try self.applyAutoMqObjectMetadataRecord(entry.data);
             applied += 1;
         }
         return applied;
@@ -5155,6 +5253,14 @@ pub const Broker = struct {
         };
 
         const responses = arena_alloc.alloc(ItemResp, req.create_stream_requests.len) catch return null;
+        if (self.autoMqObjectMutationErrorCode()) |err_code| {
+            for (responses) |*response| {
+                response.* = .{ .error_code = err_code, .stream_id = -1 };
+            }
+            const resp = Resp{ .error_code = 0, .throttle_time_ms = 0, .create_stream_responses = responses };
+            return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+        }
+
         var mutated = false;
         for (req.create_stream_requests, 0..) |item, i| {
             const owner_node = if (item.node_id != 0) item.node_id else if (req.node_id != 0) req.node_id else self.node_id;
@@ -5165,7 +5271,14 @@ pub const Broker = struct {
             responses[i] = .{ .error_code = 0, .stream_id = u64ToI64(stream.stream_id) };
             mutated = true;
         }
-        if (mutated) self.persistObjectManagerSnapshot();
+        if (mutated) {
+            self.persistObjectManagerMutation() catch |err| {
+                const err_code = autoMqQuorumErrorCode(err);
+                for (responses) |*response| {
+                    if (response.error_code == 0) response.error_code = err_code;
+                }
+            };
+        }
 
         const resp = Resp{ .error_code = 0, .throttle_time_ms = 0, .create_stream_responses = responses };
         return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
@@ -5186,6 +5299,14 @@ pub const Broker = struct {
         };
 
         const responses = arena_alloc.alloc(ItemResp, req.open_stream_requests.len) catch return null;
+        if (self.autoMqObjectMutationErrorCode()) |err_code| {
+            for (responses) |*response| {
+                response.* = .{ .error_code = err_code, .start_offset = -1, .next_offset = -1 };
+            }
+            const resp = Resp{ .error_code = 0, .throttle_time_ms = 0, .open_stream_responses = responses };
+            return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+        }
+
         var mutated = false;
         for (req.open_stream_requests, 0..) |item, i| {
             const stream_id = i64ToU64(item.stream_id) orelse {
@@ -5205,7 +5326,14 @@ pub const Broker = struct {
             };
             mutated = true;
         }
-        if (mutated) self.persistObjectManagerSnapshot();
+        if (mutated) {
+            self.persistObjectManagerMutation() catch |err| {
+                const err_code = autoMqQuorumErrorCode(err);
+                for (responses) |*response| {
+                    if (response.error_code == 0) response.error_code = err_code;
+                }
+            };
+        }
 
         const resp = Resp{ .error_code = 0, .throttle_time_ms = 0, .open_stream_responses = responses };
         return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
@@ -5226,6 +5354,14 @@ pub const Broker = struct {
         };
 
         const responses = arena_alloc.alloc(ItemResp, req.close_stream_requests.len) catch return null;
+        if (self.autoMqObjectMutationErrorCode()) |err_code| {
+            for (responses) |*response| {
+                response.* = .{ .error_code = err_code };
+            }
+            const resp = Resp{ .error_code = 0, .throttle_time_ms = 0, .close_stream_responses = responses };
+            return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+        }
+
         var mutated = false;
         for (req.close_stream_requests, 0..) |item, i| {
             const stream_id = i64ToU64(item.stream_id) orelse {
@@ -5247,7 +5383,14 @@ pub const Broker = struct {
             responses[i] = .{ .error_code = 0 };
             mutated = true;
         }
-        if (mutated) self.persistObjectManagerSnapshot();
+        if (mutated) {
+            self.persistObjectManagerMutation() catch |err| {
+                const err_code = autoMqQuorumErrorCode(err);
+                for (responses) |*response| {
+                    if (response.error_code == 0) response.error_code = err_code;
+                }
+            };
+        }
 
         const resp = Resp{ .error_code = 0, .throttle_time_ms = 0, .close_stream_responses = responses };
         return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
@@ -5268,6 +5411,14 @@ pub const Broker = struct {
         };
 
         const responses = arena_alloc.alloc(ItemResp, req.delete_stream_requests.len) catch return null;
+        if (self.autoMqObjectMutationErrorCode()) |err_code| {
+            for (responses) |*response| {
+                response.* = .{ .error_code = err_code };
+            }
+            const resp = Resp{ .error_code = 0, .throttle_time_ms = 0, .delete_stream_responses = responses };
+            return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+        }
+
         var mutated = false;
         for (req.delete_stream_requests, 0..) |item, i| {
             const stream_id = i64ToU64(item.stream_id) orelse {
@@ -5281,7 +5432,14 @@ pub const Broker = struct {
             responses[i] = .{ .error_code = 0 };
             mutated = true;
         }
-        if (mutated) self.persistObjectManagerSnapshot();
+        if (mutated) {
+            self.persistObjectManagerMutation() catch |err| {
+                const err_code = autoMqQuorumErrorCode(err);
+                for (responses) |*response| {
+                    if (response.error_code == 0) response.error_code = err_code;
+                }
+            };
+        }
 
         const resp = Resp{ .error_code = 0, .throttle_time_ms = 0, .delete_stream_responses = responses };
         return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
@@ -5302,6 +5460,10 @@ pub const Broker = struct {
             const resp = Resp{ .error_code = errorCode(.invalid_request), .throttle_time_ms = 0, .first_s3_object_id = -1 };
             return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
         }
+        if (self.autoMqObjectMutationErrorCode()) |err_code| {
+            const resp = Resp{ .error_code = err_code, .throttle_time_ms = 0, .first_s3_object_id = -1 };
+            return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+        }
 
         var first_id: u64 = 0;
         var i: i32 = 0;
@@ -5309,7 +5471,10 @@ pub const Broker = struct {
             const object_id = self.object_manager.prepareObject();
             if (i == 0) first_id = object_id;
         }
-        self.persistObjectManagerSnapshot();
+        self.persistObjectManagerMutation() catch |err| {
+            const resp = Resp{ .error_code = autoMqQuorumErrorCode(err), .throttle_time_ms = 0, .first_s3_object_id = -1 };
+            return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+        };
 
         const resp = Resp{ .error_code = 0, .throttle_time_ms = 0, .first_s3_object_id = u64ToI64(first_id) };
         return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
@@ -5357,6 +5522,10 @@ pub const Broker = struct {
             }
             ranges[i] = .{ .stream_id = stream_id, .start_offset = start_offset, .end_offset = end_offset };
         }
+        if (self.autoMqObjectMutationErrorCode()) |err_code| {
+            const resp = Resp{ .error_code = err_code, .throttle_time_ms = 0 };
+            return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+        }
 
         const sso_key = self.makeStreamSetObjectKey(object_id, req.node_id) catch return null;
         defer self.allocator.free(sso_key);
@@ -5385,7 +5554,12 @@ pub const Broker = struct {
                 mutated = true;
             }
         }
-        if (mutated) self.persistObjectManagerSnapshot();
+        if (mutated) {
+            self.persistObjectManagerMutation() catch |err| {
+                const resp = Resp{ .error_code = autoMqQuorumErrorCode(err), .throttle_time_ms = 0 };
+                return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+            };
+        }
 
         const resp = Resp{ .error_code = 0, .throttle_time_ms = 0, .attributes = req.attributes };
         return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
@@ -5426,6 +5600,10 @@ pub const Broker = struct {
             const resp = Resp{ .error_code = errorCode(.resource_not_found), .throttle_time_ms = 0 };
             return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
         }
+        if (self.autoMqObjectMutationErrorCode()) |err_code| {
+            const resp = Resp{ .error_code = err_code, .throttle_time_ms = 0 };
+            return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+        }
 
         const key = self.makeStreamObjectKey(object_id, stream_id, start_offset, end_offset) catch return null;
         defer self.allocator.free(key);
@@ -5453,7 +5631,12 @@ pub const Broker = struct {
                 }
             }
         }
-        if (mutated) self.persistObjectManagerSnapshot();
+        if (mutated) {
+            self.persistObjectManagerMutation() catch |err| {
+                const resp = Resp{ .error_code = autoMqQuorumErrorCode(err), .throttle_time_ms = 0 };
+                return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+            };
+        }
 
         const resp = Resp{ .error_code = 0, .throttle_time_ms = 0 };
         return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
@@ -5636,6 +5819,14 @@ pub const Broker = struct {
         };
 
         const responses = arena_alloc.alloc(ItemResp, req.trim_stream_requests.len) catch return null;
+        if (self.autoMqObjectMutationErrorCode()) |err_code| {
+            for (responses) |*response| {
+                response.* = .{ .error_code = err_code };
+            }
+            const resp = Resp{ .error_code = 0, .throttle_time_ms = 0, .trim_stream_responses = responses };
+            return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+        }
+
         var mutated = false;
         for (req.trim_stream_requests, 0..) |item, i| {
             const stream_id = i64ToU64(item.stream_id) orelse {
@@ -5653,7 +5844,14 @@ pub const Broker = struct {
             responses[i] = .{ .error_code = 0 };
             mutated = true;
         }
-        if (mutated) self.persistObjectManagerSnapshot();
+        if (mutated) {
+            self.persistObjectManagerMutation() catch |err| {
+                const err_code = autoMqQuorumErrorCode(err);
+                for (responses) |*response| {
+                    if (response.error_code == 0) response.error_code = err_code;
+                }
+            };
+        }
 
         const resp = Resp{ .error_code = 0, .throttle_time_ms = 0, .trim_stream_responses = responses };
         return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
@@ -11141,6 +11339,149 @@ test "Broker AutoMQ stream object lifecycle APIs" {
     try testing.expectEqual(@as(i16, 0), delete_resp.delete_stream_responses[0].error_code);
     try testing.expectEqual(@as(usize, 0), broker.object_manager.streamCount());
     try testing.expectEqual(@as(usize, 0), broker.object_manager.getStreamObjectCount());
+}
+
+test "Broker replays committed AutoMQ object metadata quorum snapshots" {
+    var raft = RaftState.init(testing.allocator, 1, "automq-object-quorum");
+    defer raft.deinit();
+    try raft.addVoter(1);
+    _ = raft.startElection();
+    raft.becomeLeader();
+
+    const CreateReq = generated.create_streams_request.CreateStreamsRequest;
+    const CreateResp = generated.create_streams_response.CreateStreamsResponse;
+    const PrepareReq = generated.prepare_s3_object_request.PrepareS3ObjectRequest;
+    const PrepareResp = generated.prepare_s3_object_response.PrepareS3ObjectResponse;
+    const CommitReq = generated.commit_stream_object_request.CommitStreamObjectRequest;
+    const CommitResp = generated.commit_stream_object_response.CommitStreamObjectResponse;
+
+    var stream_id: i64 = 0;
+    var object_id: i64 = 0;
+    {
+        var broker = Broker.initWithConfig(testing.allocator, 1, 9092, .{});
+        defer broker.deinit();
+        broker.setRaftState(&raft);
+        try broker.open();
+
+        var owned_responses = std.array_list.Managed([]u8).init(testing.allocator);
+        defer {
+            for (owned_responses.items) |resp| testing.allocator.free(resp);
+            owned_responses.deinit();
+        }
+
+        var buf: [2048]u8 = undefined;
+        var pos = buildTestRequest(&buf, 501, 0, 8501, 2);
+        const create_items = [_]CreateReq.CreateStreamRequest{.{ .node_id = 1 }};
+        const create_req = CreateReq{ .node_id = 1, .node_epoch = 1, .create_stream_requests = &create_items };
+        create_req.serialize(&buf, &pos, 0);
+        var response = broker.handleRequest(buf[0..pos]);
+        try testing.expect(response != null);
+        try owned_responses.append(response.?);
+
+        var rpos: usize = 0;
+        var create_header = try ResponseHeader.deserialize(testing.allocator, response.?, &rpos, 1);
+        defer create_header.deinit(testing.allocator);
+        const create_resp = try CreateResp.deserialize(testing.allocator, response.?, &rpos, 0);
+        defer testing.allocator.free(create_resp.create_stream_responses);
+        try testing.expectEqual(@as(i16, 0), create_resp.create_stream_responses[0].error_code);
+        stream_id = create_resp.create_stream_responses[0].stream_id;
+
+        pos = buildTestRequest(&buf, 505, 0, 8505, 2);
+        const prepare_req = PrepareReq{ .node_id = 1, .prepared_count = 1, .time_to_live_in_ms = 60_000 };
+        prepare_req.serialize(&buf, &pos, 0);
+        response = broker.handleRequest(buf[0..pos]);
+        try testing.expect(response != null);
+        try owned_responses.append(response.?);
+
+        rpos = 0;
+        var prepare_header = try ResponseHeader.deserialize(testing.allocator, response.?, &rpos, 1);
+        defer prepare_header.deinit(testing.allocator);
+        const prepare_resp = try PrepareResp.deserialize(testing.allocator, response.?, &rpos, 0);
+        try testing.expectEqual(@as(i16, 0), prepare_resp.error_code);
+        object_id = prepare_resp.first_s3_object_id;
+
+        pos = buildTestRequest(&buf, 507, 1, 8507, 2);
+        const source_ids = [_]i64{};
+        const operations = [_]i8{};
+        const commit_req = CommitReq{
+            .node_id = 1,
+            .node_epoch = 1,
+            .object_id = object_id,
+            .object_size = 128,
+            .stream_id = stream_id,
+            .start_offset = 0,
+            .end_offset = 10,
+            .source_object_ids = &source_ids,
+            .stream_epoch = 1,
+            .attributes = 0,
+            .operations = &operations,
+        };
+        commit_req.serialize(&buf, &pos, 1);
+        response = broker.handleRequest(buf[0..pos]);
+        try testing.expect(response != null);
+        try owned_responses.append(response.?);
+
+        rpos = 0;
+        var commit_header = try ResponseHeader.deserialize(testing.allocator, response.?, &rpos, 1);
+        defer commit_header.deinit(testing.allocator);
+        const commit_resp = try CommitResp.deserialize(testing.allocator, response.?, &rpos, 1);
+        try testing.expectEqual(@as(i16, 0), commit_resp.error_code);
+        try testing.expectEqual(raft.log.lastOffset(), raft.commit_index);
+        try testing.expect(raft.log.length() >= 3);
+    }
+
+    {
+        var broker = Broker.initWithConfig(testing.allocator, 1, 9092, .{});
+        defer broker.deinit();
+        broker.setRaftState(&raft);
+        try broker.open();
+
+        const restored_stream = broker.object_manager.getStream(@intCast(stream_id)).?;
+        try testing.expectEqual(@as(u64, 0), restored_stream.start_offset);
+        try testing.expectEqual(@as(u64, 10), restored_stream.end_offset);
+        const restored_object = broker.object_manager.stream_objects.get(@intCast(object_id)).?;
+        try testing.expectEqual(@as(u64, @intCast(stream_id)), restored_object.stream_id);
+        try testing.expectEqual(@as(u64, 10), restored_object.end_offset);
+        try testing.expect(!broker.object_manager.prepared_registry.contains(@intCast(object_id)));
+    }
+}
+
+test "Broker rejects AutoMQ object metadata mutation when not leader" {
+    var raft = RaftState.init(testing.allocator, 1, "automq-object-follower");
+    defer raft.deinit();
+    try raft.addVoter(1);
+    raft.becomeFollower(2, 2);
+
+    var broker = Broker.initWithConfig(testing.allocator, 1, 9092, .{});
+    defer broker.deinit();
+    broker.setRaftState(&raft);
+    try broker.open();
+    const initial_stream_count = broker.object_manager.streamCount();
+
+    const CreateReq = generated.create_streams_request.CreateStreamsRequest;
+    const CreateResp = generated.create_streams_response.CreateStreamsResponse;
+
+    var buf: [512]u8 = undefined;
+    var pos = buildTestRequest(&buf, 501, 0, 8601, 2);
+    const create_items = [_]CreateReq.CreateStreamRequest{.{ .node_id = 1 }};
+    const create_req = CreateReq{ .node_id = 1, .node_epoch = 1, .create_stream_requests = &create_items };
+    create_req.serialize(&buf, &pos, 0);
+
+    const response = broker.handleRequest(buf[0..pos]);
+    try testing.expect(response != null);
+    defer testing.allocator.free(response.?);
+
+    var rpos: usize = 0;
+    var create_header = try ResponseHeader.deserialize(testing.allocator, response.?, &rpos, 1);
+    defer create_header.deinit(testing.allocator);
+    const create_resp = try CreateResp.deserialize(testing.allocator, response.?, &rpos, 0);
+    defer testing.allocator.free(create_resp.create_stream_responses);
+
+    try testing.expectEqual(@as(i16, 0), create_resp.error_code);
+    try testing.expectEqual(@as(usize, 1), create_resp.create_stream_responses.len);
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.not_controller)), create_resp.create_stream_responses[0].error_code);
+    try testing.expectEqual(initial_stream_count, broker.object_manager.streamCount());
+    try testing.expectEqual(@as(usize, 0), raft.log.length());
 }
 
 test "Broker AutoMQ KV APIs round-trip" {
