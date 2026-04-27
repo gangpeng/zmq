@@ -1839,110 +1839,164 @@ pub const Broker = struct {
     // the metadata response will be populated from the Raft cluster state.
     // ---------------------------------------------------------------
     fn handleMetadata(self: *Broker, request_bytes: []const u8, body_start: usize, req_header: *const RequestHeader, api_version: i16, resp_header_version: i16) ?[]u8 {
-        const metadata_mod = protocol.messages.metadata;
-        const MetadataResponse = metadata_mod.MetadataResponse;
+        const Req = generated.metadata_request.MetadataRequest;
+        const Resp = generated.metadata_response.MetadataResponse;
+        const BrokerResult = Resp.MetadataResponseBroker;
+        const TopicResult = Resp.MetadataResponseTopic;
 
-        // Parse requested topics
-        var pos = body_start;
-        const flexible = api_version >= 9;
-        var requested_all = true;
-        var requested_topics = std.array_list.Managed([]const u8).init(self.allocator);
-        defer requested_topics.deinit();
-
-        const num_req_topics = if (flexible)
-            (ser.readCompactArrayLen(request_bytes, &pos) catch 0) orelse 0
-        else blk: {
-            const n = ser.readI32(request_bytes, &pos);
-            if (n < 0) break :blk @as(usize, 0); // null = all topics
-            break :blk @as(usize, @intCast(n));
-        };
-
-        if (num_req_topics > 0) {
-            requested_all = false;
-            for (0..num_req_topics) |_| {
-                const tn = if (flexible)
-                    (ser.readCompactString(request_bytes, &pos) catch break) orelse ""
-                else
-                    (ser.readString(request_bytes, &pos) catch break) orelse "";
-                if (tn.len > 0) requested_topics.append(tn) catch {};
-            }
+        if (!validateMetadataRequestFrame(request_bytes, body_start, api_version)) {
+            log.warn("Malformed Metadata request", .{});
+            return null;
         }
 
-        var brokers = [_]MetadataResponse.MetadataResponseBroker{
+        var pos = body_start;
+        var req = Req.deserialize(self.allocator, request_bytes, &pos, api_version) catch |err| {
+            log.warn("Malformed Metadata request: {}", .{err});
+            return null;
+        };
+        defer self.freeMetadataRequest(&req);
+
+        const brokers = [_]BrokerResult{
             .{ .node_id = self.node_id, .host = self.advertised_host, .port = @intCast(self.port) },
         };
 
-        // Build topic metadata from our known topics
-        var topic_list = std.array_list.Managed(MetadataResponse.MetadataResponseTopic).init(self.allocator);
-        defer topic_list.deinit();
+        const requested_all = req.topics.len == 0;
+        var topics: []TopicResult = &.{};
+        if (requested_all) {
+            topics = self.allocator.alloc(TopicResult, self.topics.count()) catch return null;
+        } else {
+            topics = self.allocator.alloc(TopicResult, req.topics.len) catch return null;
+        }
+        var topics_init: usize = 0;
+        defer {
+            self.freeMetadataResponseTopics(topics[0..topics_init]);
+            if (topics.len > 0) self.allocator.free(topics);
+        }
 
-        // Auto-create requested topics that don't exist
-        if (!requested_all) {
-            for (requested_topics.items) |rt| {
-                _ = self.ensureTopic(rt);
+        if (requested_all) {
+            var topics_iter = self.topics.iterator();
+            while (topics_iter.next()) |entry| {
+                topics[topics_init] = self.buildMetadataTopicResponse(entry.value_ptr) catch return null;
+                topics_init += 1;
+            }
+        } else {
+            for (req.topics) |topic_req| {
+                topics[topics_init] = self.buildRequestedMetadataTopicResponse(topic_req, req.allow_auto_topic_creation, api_version) catch return null;
+                topics_init += 1;
             }
         }
 
-        var topics_iter = self.topics.iterator();
-        while (topics_iter.next()) |entry| {
-            const info = entry.value_ptr;
-
-            // Filter: if specific topics were requested, only include those
-            if (!requested_all) {
-                var found = false;
-                for (requested_topics.items) |rt| {
-                    if (std.mem.eql(u8, rt, info.name)) {
-                        found = true;
-                        break;
-                    }
-                }
-                if (!found) continue;
-            }
-            var parts = std.array_list.Managed(MetadataResponse.MetadataResponsePartition).init(self.allocator);
-            defer parts.deinit();
-
-            for (0..@intCast(info.num_partitions)) |pi| {
-                var replicas = [_]i32{self.node_id};
-                var isr = [_]i32{self.node_id};
-                parts.append(.{
-                    .partition_index = @intCast(pi),
-                    .leader_id = self.node_id,
-                    .leader_epoch = if (self.raft_state) |rs| rs.current_epoch else self.cached_leader_epoch,
-                    .replica_nodes = &replicas,
-                    .isr_nodes = &isr,
-                }) catch continue;
-            }
-
-            topic_list.append(.{
-                .name = info.name,
-                .topic_id = info.topic_id,
-                .is_internal = std.mem.startsWith(u8, info.name, "__"),
-                .partitions = parts.toOwnedSlice() catch &.{},
-            }) catch continue;
-        }
-
-        const resp_body = MetadataResponse{
+        const resp = Resp{
+            .throttle_time_ms = 0,
             .brokers = &brokers,
             .cluster_id = "zmq-cluster",
             .controller_id = self.node_id,
-            .topics = topic_list.items,
+            .topics = topics[0..topics_init],
         };
+        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+    }
 
-        const resp_header = ResponseHeader{ .correlation_id = req_header.correlation_id };
-        // Dynamic buffer — topics can be large
-        const estimated_size = 256 + self.topics.count() * 128;
-        const buf = self.allocator.alloc(u8, @max(estimated_size, 8192)) catch return null;
-        var wpos: usize = 0;
-        resp_header.serialize(buf, &wpos, resp_header_version);
-        const body_version: i16 = @min(api_version, 12);
-        resp_body.serialize(buf, &wpos, body_version);
+    fn freeMetadataRequest(self: *Broker, req: *const generated.metadata_request.MetadataRequest) void {
+        if (req.topics.len > 0) self.allocator.free(req.topics);
+    }
 
-        // Free partition slices we allocated
-        for (topic_list.items) |topic| {
+    fn freeMetadataResponseTopics(self: *Broker, topics: []const generated.metadata_response.MetadataResponse.MetadataResponseTopic) void {
+        for (topics) |topic| {
+            for (topic.partitions) |partition| {
+                if (partition.replica_nodes.len > 0) self.allocator.free(partition.replica_nodes);
+                if (partition.isr_nodes.len > 0) self.allocator.free(partition.isr_nodes);
+            }
             if (topic.partitions.len > 0) self.allocator.free(topic.partitions);
         }
+    }
 
-        return (self.allocator.realloc(buf, wpos) catch buf)[0..wpos];
+    fn buildRequestedMetadataTopicResponse(self: *Broker, topic_req: generated.metadata_request.MetadataRequest.MetadataRequestTopic, allow_auto_topic_creation: bool, api_version: i16) !generated.metadata_response.MetadataResponse.MetadataResponseTopic {
+        if (api_version >= 10 and !isZeroUuid(topic_req.topic_id)) {
+            if (self.findTopicById(topic_req.topic_id)) |topic_info| {
+                return self.buildMetadataTopicResponse(topic_info);
+            }
+            return self.buildMissingMetadataTopicResponse(topic_req.name, topic_req.topic_id, @intFromEnum(ErrorCode.unknown_topic_id));
+        }
+
+        const topic_name = topic_req.name orelse "";
+        if (topic_name.len == 0) {
+            return self.buildMissingMetadataTopicResponse(topic_req.name, topic_req.topic_id, @intFromEnum(ErrorCode.invalid_topic_exception));
+        }
+
+        if (!self.topics.contains(topic_name) and allow_auto_topic_creation) {
+            _ = self.ensureTopic(topic_name);
+        }
+
+        if (self.topics.getPtr(topic_name)) |topic_info| {
+            return self.buildMetadataTopicResponse(topic_info);
+        }
+        return self.buildMissingMetadataTopicResponse(topic_req.name, topic_req.topic_id, @intFromEnum(ErrorCode.unknown_topic_or_partition));
+    }
+
+    fn findTopicById(self: *Broker, topic_id: [16]u8) ?*TopicInfo {
+        var topics_iter = self.topics.iterator();
+        while (topics_iter.next()) |entry| {
+            if (std.mem.eql(u8, &entry.value_ptr.topic_id, &topic_id)) return entry.value_ptr;
+        }
+        return null;
+    }
+
+    fn buildMissingMetadataTopicResponse(_: *Broker, name: ?[]const u8, topic_id: [16]u8, error_code: i16) !generated.metadata_response.MetadataResponse.MetadataResponseTopic {
+        return .{
+            .error_code = error_code,
+            .name = name,
+            .topic_id = topic_id,
+            .is_internal = false,
+            .partitions = &.{},
+        };
+    }
+
+    fn buildMetadataTopicResponse(self: *Broker, topic_info: *const TopicInfo) !generated.metadata_response.MetadataResponse.MetadataResponseTopic {
+        const Resp = generated.metadata_response.MetadataResponse;
+        const PartitionResult = Resp.MetadataResponseTopic.MetadataResponsePartition;
+
+        const partition_count: usize = @intCast(topic_info.num_partitions);
+        var partitions: []PartitionResult = &.{};
+        if (partition_count > 0) {
+            partitions = try self.allocator.alloc(PartitionResult, partition_count);
+        }
+        var partitions_init: usize = 0;
+        errdefer {
+            for (partitions[0..partitions_init]) |partition| {
+                if (partition.replica_nodes.len > 0) self.allocator.free(partition.replica_nodes);
+                if (partition.isr_nodes.len > 0) self.allocator.free(partition.isr_nodes);
+            }
+            if (partitions.len > 0) self.allocator.free(partitions);
+        }
+
+        for (0..partition_count) |partition_index| {
+            const replicas = try self.allocator.alloc(i32, 1);
+            errdefer self.allocator.free(replicas);
+            replicas[0] = self.node_id;
+
+            const isr = try self.allocator.alloc(i32, 1);
+            errdefer self.allocator.free(isr);
+            isr[0] = self.node_id;
+
+            partitions[partitions_init] = .{
+                .error_code = @intFromEnum(ErrorCode.none),
+                .partition_index = @intCast(partition_index),
+                .leader_id = self.node_id,
+                .leader_epoch = if (self.raft_state) |rs| rs.current_epoch else self.cached_leader_epoch,
+                .replica_nodes = replicas,
+                .isr_nodes = isr,
+                .offline_replicas = &.{},
+            };
+            partitions_init += 1;
+        }
+
+        return .{
+            .error_code = @intFromEnum(ErrorCode.none),
+            .name = topic_info.name,
+            .topic_id = topic_info.topic_id,
+            .is_internal = std.mem.startsWith(u8, topic_info.name, "__"),
+            .partitions = partitions[0..partitions_init],
+        };
     }
 
     // ---------------------------------------------------------------
@@ -7732,6 +7786,26 @@ pub const Broker = struct {
         return true;
     }
 
+    fn validateMetadataRequestFrame(buf: []const u8, start_pos: usize, api_version: i16) bool {
+        const flexible = api_version >= 9;
+        var pos = start_pos;
+
+        const topics = readKafkaArrayHeader(buf, &pos, flexible) orelse return false;
+        if (!topics.is_null) {
+            for (0..topics.count) |_| {
+                if (api_version >= 10 and !skipFixedBytes(buf, &pos, 16)) return false; // topic_id
+                if (!skipKafkaString(buf, &pos, flexible)) return false; // topic_name
+                if (flexible) ser.skipTaggedFields(buf, &pos) catch return false;
+            }
+        }
+
+        if (api_version >= 4 and !skipFixedBytes(buf, &pos, 1)) return false; // allow_auto_topic_creation
+        if (api_version >= 8 and api_version <= 10 and !skipFixedBytes(buf, &pos, 1)) return false; // include_cluster_authorized_operations
+        if (api_version >= 8 and !skipFixedBytes(buf, &pos, 1)) return false; // include_topic_authorized_operations
+        if (flexible) ser.skipTaggedFields(buf, &pos) catch return false;
+        return true;
+    }
+
     fn validateSaslHandshakeRequestFrame(buf: []const u8, start_pos: usize) bool {
         var pos = start_pos;
         return skipKafkaString(buf, &pos, false);
@@ -8857,6 +8931,19 @@ fn freeDeserializedListOffsetsResponse(resp: *const generated.list_offsets_respo
     if (resp.topics.len > 0) testing.allocator.free(resp.topics);
 }
 
+fn freeDeserializedMetadataResponse(resp: *const generated.metadata_response.MetadataResponse) void {
+    if (resp.brokers.len > 0) testing.allocator.free(resp.brokers);
+    for (resp.topics) |topic| {
+        for (topic.partitions) |partition| {
+            if (partition.replica_nodes.len > 0) testing.allocator.free(partition.replica_nodes);
+            if (partition.isr_nodes.len > 0) testing.allocator.free(partition.isr_nodes);
+            if (partition.offline_replicas.len > 0) testing.allocator.free(partition.offline_replicas);
+        }
+        if (topic.partitions.len > 0) testing.allocator.free(topic.partitions);
+    }
+    if (resp.topics.len > 0) testing.allocator.free(resp.topics);
+}
+
 fn expectApiVersionsResponseMatchesCatalog(response: []const u8, api_version: i16, correlation_id: i32) !void {
     const Resp = generated.api_versions_response.ApiVersionsResponse;
     const body_version: i16 = @min(api_version, 4);
@@ -8959,14 +9046,16 @@ test "Broker.handleRequest ApiVersions v3 rejects truncated request body" {
     try testing.expect(broker.handleRequest(buf[0..req_len]) == null);
 }
 
-test "Broker.handleRequest Metadata (key=3, v1)" {
+test "Broker.handleRequest Metadata v1 returns generated all-topic response" {
+    const Resp = generated.metadata_response.MetadataResponse;
+
     var broker = Broker.init(testing.allocator, 1, 9092);
     defer broker.deinit();
 
-    // Build a metadata request for all topics (num_topics = -1)
+    _ = broker.ensureTopic("meta-v1-topic");
+
     var buf: [256]u8 = undefined;
-    var pos = buildTestRequest(&buf, 3, 1, 55, 1);
-    // Metadata request body: topics array with -1 (null = all topics)
+    var pos = buildTestRequest(&buf, 3, 1, 55, header_mod.requestHeaderVersion(3, 1));
     ser.writeI32(&buf, &pos, -1);
 
     const response = broker.handleRequest(buf[0..pos]);
@@ -8974,8 +9063,79 @@ test "Broker.handleRequest Metadata (key=3, v1)" {
     defer testing.allocator.free(response.?);
 
     var rpos: usize = 0;
-    const corr_id = ser.readI32(response.?, &rpos);
-    try testing.expectEqual(@as(i32, 55), corr_id);
+    var response_header = try ResponseHeader.deserialize(testing.allocator, response.?, &rpos, header_mod.responseHeaderVersion(3, 1));
+    defer response_header.deinit(testing.allocator);
+    try testing.expectEqual(@as(i32, 55), response_header.correlation_id);
+
+    const resp = try Resp.deserialize(testing.allocator, response.?, &rpos, 1);
+    defer freeDeserializedMetadataResponse(&resp);
+
+    try testing.expectEqual(response.?.len, rpos);
+    try testing.expectEqual(@as(usize, 1), resp.brokers.len);
+    try testing.expectEqual(@as(i32, 1), resp.brokers[0].node_id);
+    try testing.expectEqualStrings("localhost", resp.brokers[0].host.?);
+    try testing.expectEqual(@as(i32, 9092), resp.brokers[0].port);
+    try testing.expectEqual(@as(i32, 1), resp.controller_id);
+    try testing.expectEqual(@as(usize, 1), resp.topics.len);
+    try testing.expectEqualStrings("meta-v1-topic", resp.topics[0].name.?);
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.none)), resp.topics[0].error_code);
+    try testing.expectEqual(@as(usize, 1), resp.topics[0].partitions.len);
+    try testing.expectEqual(@as(i32, 1), resp.topics[0].partitions[0].leader_id);
+}
+
+test "Broker.handleRequest Metadata v12 returns generated flexible topic metadata" {
+    const Req = generated.metadata_request.MetadataRequest;
+    const Topic = Req.MetadataRequestTopic;
+    const Resp = generated.metadata_response.MetadataResponse;
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+
+    _ = broker.ensureTopic("meta-v12-topic");
+    const topics = [_]Topic{.{
+        .name = "meta-v12-topic",
+    }};
+    const req = Req{
+        .topics = &topics,
+        .allow_auto_topic_creation = false,
+        .include_topic_authorized_operations = true,
+    };
+
+    var buf: [512]u8 = undefined;
+    var pos = buildTestRequest(&buf, 3, 12, 312, header_mod.requestHeaderVersion(3, 12));
+    req.serialize(&buf, &pos, 12);
+
+    const response = broker.handleRequest(buf[0..pos]);
+    try testing.expect(response != null);
+    defer testing.allocator.free(response.?);
+
+    var rpos: usize = 0;
+    var response_header = try ResponseHeader.deserialize(testing.allocator, response.?, &rpos, header_mod.responseHeaderVersion(3, 12));
+    defer response_header.deinit(testing.allocator);
+    try testing.expectEqual(@as(i32, 312), response_header.correlation_id);
+
+    const resp = try Resp.deserialize(testing.allocator, response.?, &rpos, 12);
+    defer freeDeserializedMetadataResponse(&resp);
+
+    try testing.expectEqual(response.?.len, rpos);
+    try testing.expectEqual(@as(i32, 0), resp.throttle_time_ms);
+    try testing.expectEqualStrings("zmq-cluster", resp.cluster_id.?);
+    try testing.expectEqual(@as(usize, 1), resp.topics.len);
+    try testing.expectEqualStrings("meta-v12-topic", resp.topics[0].name.?);
+    const zero_uuid = [_]u8{0} ** 16;
+    try testing.expect(!std.mem.eql(u8, &resp.topics[0].topic_id, &zero_uuid));
+    try testing.expectEqual(@as(usize, 1), resp.topics[0].partitions.len);
+    try testing.expectEqual(@as(usize, 1), resp.topics[0].partitions[0].replica_nodes.len);
+    try testing.expectEqual(@as(i32, 1), resp.topics[0].partitions[0].replica_nodes[0]);
+}
+
+test "Broker.handleRequest Metadata rejects truncated request" {
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+
+    var buf: [128]u8 = undefined;
+    const req_len = buildTestRequest(&buf, 3, 12, 313, header_mod.requestHeaderVersion(3, 12));
+    try testing.expect(broker.handleRequest(buf[0..req_len]) == null);
 }
 
 test "Broker.handleRequest unsupported API returns error response" {
