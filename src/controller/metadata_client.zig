@@ -316,6 +316,13 @@ pub const MetadataClient = struct {
                 return;
             }
 
+            if (resp.error_code == @intFromEnum(protocol.ErrorCode.not_controller)) {
+                log.warn("Heartbeat reached a non-leader controller, re-discovering leader", .{});
+                self.leader_id = null;
+                self.is_fenced.* = true;
+                return;
+            }
+
             if (resp.error_code != 0) {
                 log.warn("Heartbeat error: code={d}, self-fencing", .{resp.error_code});
                 self.is_fenced.* = true;

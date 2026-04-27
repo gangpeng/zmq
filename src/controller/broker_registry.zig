@@ -51,7 +51,14 @@ pub const BrokerRegistry = struct {
     /// Called when a broker sends BrokerRegistration (API 62).
     pub fn register(self: *BrokerRegistry, broker_id: i32, host: []const u8, port: u16) !i64 {
         const epoch = self.next_broker_epoch;
-        self.next_broker_epoch += 1;
+        try self.registerWithEpoch(broker_id, host, port, epoch, true);
+        return epoch;
+    }
+
+    /// Install a registration that already has a controller-assigned epoch.
+    /// Used by Raft metadata replay on follower promotion/restart.
+    pub fn registerWithEpoch(self: *BrokerRegistry, broker_id: i32, host: []const u8, port: u16, broker_epoch: i64, fenced: bool) !void {
+        if (broker_epoch <= 0) return error.InvalidBrokerEpoch;
         const now = @import("time_compat").milliTimestamp();
 
         // If re-registering, free old host string
@@ -66,13 +73,13 @@ pub const BrokerRegistry = struct {
             .broker_id = broker_id,
             .host = host_copy,
             .port = port,
-            .broker_epoch = epoch,
+            .broker_epoch = broker_epoch,
             .last_heartbeat_ms = now,
-            .fenced = true, // Fenced until first heartbeat
+            .fenced = fenced,
         });
 
-        log.info("Broker {d} registered: {s}:{d} epoch={d}", .{ broker_id, host, port, epoch });
-        return epoch;
+        if (broker_epoch >= self.next_broker_epoch) self.next_broker_epoch = broker_epoch + 1;
+        log.info("Broker {d} registered: {s}:{d} epoch={d}", .{ broker_id, host, port, broker_epoch });
     }
 
     /// Process a heartbeat from a broker. Returns true if the broker is active.
@@ -211,6 +218,23 @@ test "BrokerRegistry re-register replaces old entry" {
     if (registry.brokers.get(100)) |info| {
         try testing.expectEqualStrings("host2", info.host);
         try testing.expectEqual(@as(u16, 9093), info.port);
+    }
+}
+
+test "BrokerRegistry registerWithEpoch replays durable registration" {
+    var registry = BrokerRegistry.init(testing.allocator);
+    defer registry.deinit();
+
+    try registry.registerWithEpoch(100, "host1", 9092, 7, true);
+    try testing.expectEqual(@as(usize, 1), registry.count());
+    try testing.expectEqual(@as(i64, 8), registry.next_broker_epoch);
+
+    if (registry.brokers.get(100)) |info| {
+        try testing.expectEqual(@as(i64, 7), info.broker_epoch);
+        try testing.expectEqualStrings("host1", info.host);
+        try testing.expect(info.fenced);
+    } else {
+        return error.TestUnexpectedResult;
     }
 }
 

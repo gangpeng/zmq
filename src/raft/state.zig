@@ -323,6 +323,7 @@ pub const RaftState = struct {
         std.mem.writeInt(u32, header[16..20], @intCast(data.len), .big);
         try file.writeAll(&header);
         try file.writeAll(data);
+        try file.sync();
     }
 
     /// Persist current_epoch and voted_for to disk.
@@ -566,7 +567,12 @@ pub const RaftState = struct {
             }
             // Only append if we don't already have this entry
             if (self.log.get(entry.offset) == null) {
-                _ = self.log.append(entry.epoch, entry.data) catch continue;
+                const appended_offset = self.log.append(entry.epoch, entry.data) catch continue;
+                if (self.data_dir) |dir| {
+                    self.persistEntry(dir, entry.epoch, appended_offset, entry.data) catch |err| {
+                        log.warn("Failed to persist follower raft log entry: {}", .{err});
+                    };
+                }
             }
         }
 
@@ -1808,6 +1814,34 @@ test "RaftState handleAppendEntries advances commit_index" {
     const resp = state.handleAppendEntries(1, 0, 1, 1, &.{}, 1);
     try testing.expect(resp.success);
     try testing.expectEqual(@as(u64, 1), state.commit_index);
+}
+
+test "RaftState handleAppendEntries persists follower entries" {
+    const tmp_dir = "/tmp/zmq-raft-follower-append-persist-test";
+    fs.deleteTreeAbsolute(tmp_dir) catch {};
+    defer fs.deleteTreeAbsolute(tmp_dir) catch {};
+
+    {
+        var state = RaftState.initWithDataDir(testing.allocator, 1, "cluster", tmp_dir);
+        defer state.deinit();
+
+        const entries = [_]RaftState.AppendEntry{
+            .{ .offset = 0, .epoch = 3, .data = "replicated-controller-record" },
+        };
+        const resp = state.handleAppendEntries(3, 0, 0, 0, &entries, 0);
+        try testing.expect(resp.success);
+        try testing.expectEqual(@as(usize, 1), state.log.length());
+    }
+
+    {
+        var state = RaftState.initWithDataDir(testing.allocator, 1, "cluster", tmp_dir);
+        defer state.deinit();
+
+        const recovered = try state.loadPersistedLog();
+        try testing.expectEqual(@as(u64, 1), recovered);
+        try testing.expectEqual(@as(usize, 1), state.log.length());
+        try testing.expectEqualStrings("replicated-controller-record", state.log.entries.items[0].data);
+    }
 }
 
 test "RaftState pre-vote does not change epoch" {

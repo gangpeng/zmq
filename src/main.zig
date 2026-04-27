@@ -305,8 +305,28 @@ pub fn main(init: std.process.Init) !void {
 
     if (process_roles.is_controller) {
         const ctrl = try alloc.create(Controller);
-        ctrl.* = Controller.init(alloc, node_id, cluster_id);
+        ctrl.* = if (data_dir) |dir|
+            Controller.initWithDataDir(alloc, node_id, cluster_id, dir)
+        else
+            Controller.init(alloc, node_id, cluster_id);
         controller = ctrl;
+
+        if (data_dir != null) {
+            const recovered = ctrl.raft_state.loadPersistedLog() catch |err| blk: {
+                log.warn("Controller Raft log recovery failed: {}", .{err});
+                break :blk 0;
+            };
+            if (recovered > 0) {
+                // This implementation persists only the log image, not a separate
+                // commit-index file. On local restart, replay the durable image so
+                // controller broker metadata is not lost across rolling restarts.
+                ctrl.raft_state.commit_index = ctrl.raft_state.log.lastOffset();
+                ctrl.raft_state.applyCommittedConfigs();
+                _ = ctrl.replayCommittedControllerMetadataRecords() catch |err| {
+                    log.warn("Controller metadata replay failed: {}", .{err});
+                };
+            }
+        }
 
         if (voters_str == null) {
             ctrl.raft_state.addVoter(node_id) catch {};

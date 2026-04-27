@@ -1,6 +1,7 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const log = std.log.scoped(.controller);
+const fs = @import("fs_compat");
 
 const protocol = @import("protocol");
 const ser = protocol.serialization;
@@ -36,9 +37,22 @@ pub const Controller = struct {
     /// manage a monotonic counter.
     next_producer_id: i64 = 1000,
 
+    /// Last controller metadata log offset applied to broker_registry.
+    last_applied_controller_metadata_offset: ?u64 = null,
+
     pub fn init(alloc: Allocator, node_id: i32, cluster_id: []const u8) Controller {
         return .{
             .raft_state = RaftState.init(alloc, node_id, cluster_id),
+            .allocator = alloc,
+            .node_id = node_id,
+            .cluster_id = cluster_id,
+            .broker_registry = BrokerRegistry.init(alloc),
+        };
+    }
+
+    pub fn initWithDataDir(alloc: Allocator, node_id: i32, cluster_id: []const u8, data_dir: []const u8) Controller {
+        return .{
+            .raft_state = RaftState.initWithDataDir(alloc, node_id, cluster_id, data_dir),
             .allocator = alloc,
             .node_id = node_id,
             .cluster_id = cluster_id,
@@ -325,6 +339,10 @@ pub const Controller = struct {
         defer self.allocator.free(entries);
 
         const entries_start_index: u64 = @intCast(entries_start_index_raw);
+        const rewrites_applied_metadata = if (self.last_applied_controller_metadata_offset) |last_applied|
+            entry_count > 0 and entries_start_index <= last_applied
+        else
+            false;
         for (entries, 0..) |*entry, i| {
             const entry_len_raw = try readRecordI32(request_bytes, pos);
             if (entry_len_raw < 0) return error.InvalidAutoMqMetadataRecord;
@@ -340,7 +358,7 @@ pub const Controller = struct {
         }
         if (pos.* != request_bytes.len) return error.InvalidAutoMqMetadataRecord;
 
-        return self.raft_state.handleAppendEntries(
+        const append_response = self.raft_state.handleAppendEntries(
             leader_epoch,
             leader_id,
             @intCast(prev_log_offset_raw),
@@ -348,6 +366,14 @@ pub const Controller = struct {
             entries,
             @intCast(leader_commit_raw),
         );
+        if (append_response.success) {
+            if (rewrites_applied_metadata) {
+                _ = try self.replayCommittedControllerMetadataRecords();
+            } else {
+                _ = try self.applyCommittedControllerMetadataRecords();
+            }
+        }
+        return append_response;
     }
 
     fn freeBeginQuorumEpochRequest(self: *Controller, req: *generated.begin_quorum_epoch_request.BeginQuorumEpochRequest) void {
@@ -468,6 +494,117 @@ pub const Controller = struct {
         if (req.topics.len > 0) self.allocator.free(req.topics);
     }
 
+    const controller_metadata_record_magic = "ZMQCTRL2";
+
+    const ControllerMetadataRecordKind = enum(u8) {
+        broker_registration = 1,
+    };
+
+    fn controllerBytesFieldSize(bytes: []const u8) !usize {
+        if (bytes.len > std.math.maxInt(u32)) return error.RecordTooLarge;
+        return 4 + bytes.len;
+    }
+
+    fn checkedAddSize(a: usize, b: usize) !usize {
+        return std.math.add(usize, a, b) catch error.RecordTooLarge;
+    }
+
+    fn isControllerMetadataRecord(data: []const u8) bool {
+        return data.len >= controller_metadata_record_magic.len and
+            std.mem.eql(u8, data[0..controller_metadata_record_magic.len], controller_metadata_record_magic);
+    }
+
+    fn controllerRecordKindFromByte(byte: u8) !ControllerMetadataRecordKind {
+        return switch (byte) {
+            1 => .broker_registration,
+            else => error.InvalidAutoMqMetadataRecord,
+        };
+    }
+
+    fn buildBrokerRegistrationRecord(self: *Controller, broker_id: i32, host: []const u8, port: u16, broker_epoch: i64) ![]u8 {
+        const host_size = try controllerBytesFieldSize(host);
+        var total_len = try checkedAddSize(controller_metadata_record_magic.len, 1);
+        total_len = try checkedAddSize(total_len, 4 + 8 + 4 + 1);
+        total_len = try checkedAddSize(total_len, host_size);
+
+        const buf = try self.allocator.alloc(u8, total_len);
+        var pos: usize = 0;
+        @memcpy(buf[pos .. pos + controller_metadata_record_magic.len], controller_metadata_record_magic);
+        pos += controller_metadata_record_magic.len;
+        buf[pos] = @intFromEnum(ControllerMetadataRecordKind.broker_registration);
+        pos += 1;
+        writeRecordI32(buf, &pos, broker_id);
+        writeRecordI64(buf, &pos, broker_epoch);
+        writeRecordI32(buf, &pos, @intCast(port));
+        writeRecordBool(buf, &pos, true);
+        try writeRecordBytes(buf, &pos, host);
+        std.debug.assert(pos == buf.len);
+        return buf;
+    }
+
+    fn appendControllerMetadataRecord(self: *Controller, record: []const u8) !u64 {
+        if (self.raft_state.role != .leader) return error.NotController;
+        const offset = try self.raft_state.appendEntry(record);
+        if (self.raft_state.quorumSize() <= 1) {
+            self.raft_state.commit_index = offset;
+        } else {
+            self.raft_state.updateCommitIndex();
+        }
+        return offset;
+    }
+
+    fn applyBrokerRegistrationRecord(self: *Controller, data: []const u8, pos: *usize) !void {
+        const broker_id = try readRecordI32(data, pos);
+        const broker_epoch = try readRecordI64(data, pos);
+        const port_raw = try readRecordI32(data, pos);
+        const fenced = try readRecordBool(data, pos);
+        const host = try readRecordBytes(data, pos);
+        if (pos.* != data.len) return error.InvalidAutoMqMetadataRecord;
+        if (port_raw < 0 or port_raw > std.math.maxInt(u16)) return error.InvalidAutoMqMetadataRecord;
+
+        try self.broker_registry.registerWithEpoch(
+            broker_id,
+            host,
+            @intCast(port_raw),
+            broker_epoch,
+            fenced,
+        );
+    }
+
+    fn applyControllerMetadataRecord(self: *Controller, data: []const u8) !void {
+        if (!isControllerMetadataRecord(data)) return;
+        var pos = controller_metadata_record_magic.len;
+        if (pos + 1 > data.len) return error.InvalidAutoMqMetadataRecord;
+        const kind = try controllerRecordKindFromByte(data[pos]);
+        pos += 1;
+
+        switch (kind) {
+            .broker_registration => try self.applyBrokerRegistrationRecord(data, &pos),
+        }
+    }
+
+    pub fn applyCommittedControllerMetadataRecords(self: *Controller) !usize {
+        var applied: usize = 0;
+        for (self.raft_state.log.entries.items) |entry| {
+            if (entry.offset > self.raft_state.commit_index) break;
+            if (self.last_applied_controller_metadata_offset) |last_offset| {
+                if (entry.offset <= last_offset) continue;
+            }
+            if (!isControllerMetadataRecord(entry.data)) continue;
+            try self.applyControllerMetadataRecord(entry.data);
+            self.last_applied_controller_metadata_offset = entry.offset;
+            applied += 1;
+        }
+        return applied;
+    }
+
+    pub fn replayCommittedControllerMetadataRecords(self: *Controller) !usize {
+        self.broker_registry.deinit();
+        self.broker_registry = BrokerRegistry.init(self.allocator);
+        self.last_applied_controller_metadata_offset = null;
+        return self.applyCommittedControllerMetadataRecords();
+    }
+
     // ---------------------------------------------------------------
     // BrokerRegistration (key 62) — broker lifecycle
     // ---------------------------------------------------------------
@@ -487,15 +624,41 @@ pub const Controller = struct {
         const host = if (listener) |l| (l.host orelse "unknown") else "unknown";
         const broker_port: u16 = if (listener) |l| l.port else 0;
 
-        const broker_epoch = self.broker_registry.register(
+        if (self.raft_state.role != .leader) {
+            const resp = Resp{ .error_code = ErrorCode.not_controller.toInt(), .broker_epoch = -1 };
+            return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+        }
+
+        const broker_epoch = self.broker_registry.next_broker_epoch;
+        const record = self.buildBrokerRegistrationRecord(req.broker_id, host, broker_port, broker_epoch) catch {
+            log.warn("BrokerRegistration record build failed for broker {d}", .{req.broker_id});
+            const resp = Resp{ .error_code = ErrorCode.kafka_storage_error.toInt(), .broker_epoch = -1 };
+            return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+        };
+        defer self.allocator.free(record);
+
+        const offset = self.appendControllerMetadataRecord(record) catch |err| {
+            const error_code: i16 = switch (err) {
+                error.NotController => ErrorCode.not_controller.toInt(),
+                else => ErrorCode.kafka_storage_error.toInt(),
+            };
+            log.warn("BrokerRegistration metadata append failed for broker {d}: {}", .{ req.broker_id, err });
+            const resp = Resp{ .error_code = error_code, .broker_epoch = -1 };
+            return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+        };
+
+        self.broker_registry.registerWithEpoch(
             req.broker_id,
             host,
             broker_port,
+            broker_epoch,
+            true,
         ) catch {
             log.warn("BrokerRegistration failed for broker {d}", .{req.broker_id});
             const resp = Resp{ .error_code = ErrorCode.invalid_request.toInt(), .broker_epoch = -1 };
             return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
         };
+        self.last_applied_controller_metadata_offset = offset;
 
         const resp = Resp{ .throttle_time_ms = 0, .error_code = 0, .broker_epoch = broker_epoch };
         return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
@@ -518,6 +681,29 @@ pub const Controller = struct {
         const req = Req.deserialize(self.allocator, request_bytes, &pos, api_version) catch |err| {
             log.warn("Failed to decode BrokerHeartbeat request: {}", .{err});
             const resp = Resp{ .error_code = ErrorCode.invalid_request.toInt(), .is_caught_up = false, .is_fenced = true, .should_shut_down = false };
+            return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+        };
+
+        if (self.raft_state.role != .leader) {
+            const resp = Resp{
+                .throttle_time_ms = 0,
+                .error_code = ErrorCode.not_controller.toInt(),
+                .is_caught_up = false,
+                .is_fenced = true,
+                .should_shut_down = false,
+            };
+            return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+        }
+
+        _ = self.applyCommittedControllerMetadataRecords() catch |err| {
+            log.warn("Failed to apply controller metadata before heartbeat: {}", .{err});
+            const resp = Resp{
+                .throttle_time_ms = 0,
+                .error_code = ErrorCode.kafka_storage_error.toInt(),
+                .is_caught_up = false,
+                .is_fenced = true,
+                .should_shut_down = false,
+            };
             return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
         };
 
@@ -843,6 +1029,50 @@ fn readRecordI64(data: []const u8, pos: *usize) !i64 {
     return value;
 }
 
+fn writeRecordI32(buf: []u8, pos: *usize, value: i32) void {
+    std.mem.writeInt(i32, buf[pos.*..][0..4], value, .big);
+    pos.* += 4;
+}
+
+fn writeRecordI64(buf: []u8, pos: *usize, value: i64) void {
+    std.mem.writeInt(i64, buf[pos.*..][0..8], value, .big);
+    pos.* += 8;
+}
+
+fn writeRecordBool(buf: []u8, pos: *usize, value: bool) void {
+    buf[pos.*] = if (value) 1 else 0;
+    pos.* += 1;
+}
+
+fn writeRecordBytes(buf: []u8, pos: *usize, bytes: []const u8) !void {
+    if (bytes.len > std.math.maxInt(u32)) return error.RecordTooLarge;
+    std.mem.writeInt(u32, buf[pos.*..][0..4], @intCast(bytes.len), .big);
+    pos.* += 4;
+    @memcpy(buf[pos.* .. pos.* + bytes.len], bytes);
+    pos.* += bytes.len;
+}
+
+fn readRecordBool(data: []const u8, pos: *usize) !bool {
+    if (pos.* + 1 > data.len) return error.InvalidAutoMqMetadataRecord;
+    const byte = data[pos.*];
+    pos.* += 1;
+    return switch (byte) {
+        0 => false,
+        1 => true,
+        else => error.InvalidAutoMqMetadataRecord,
+    };
+}
+
+fn readRecordBytes(data: []const u8, pos: *usize) ![]const u8 {
+    if (pos.* + 4 > data.len) return error.InvalidAutoMqMetadataRecord;
+    const len: usize = @intCast(std.mem.readInt(u32, data[pos.*..][0..4], .big));
+    pos.* += 4;
+    if (pos.* + len > data.len) return error.InvalidAutoMqMetadataRecord;
+    const bytes = data[pos.* .. pos.* + len];
+    pos.* += len;
+    return bytes;
+}
+
 // ---------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------
@@ -863,6 +1093,39 @@ fn buildTestRequest(buf: []u8, api_key: i16, api_version: i16, correlation_id: i
         ser.writeString(buf, &pos, "test-client");
     }
     return pos;
+}
+
+fn makeTestControllerLeader(ctrl: *Controller) !void {
+    try ctrl.raft_state.addVoter(ctrl.node_id);
+    _ = ctrl.raft_state.startElection();
+    ctrl.raft_state.becomeLeader();
+}
+
+fn appendInternalRaftAppendEntriesPayload(
+    buf: []u8,
+    pos: *usize,
+    leader_id: i32,
+    leader_epoch: i32,
+    prev_log_offset: i64,
+    prev_log_epoch: i32,
+    leader_commit: i64,
+    entries_start_index: i64,
+    records: []const []const u8,
+) void {
+    ser.writeString(buf, pos, "");
+    ser.writeI32(buf, pos, 0);
+    ser.writeI32(buf, pos, leader_id);
+    ser.writeI32(buf, pos, leader_epoch);
+    ser.writeI64(buf, pos, prev_log_offset);
+    ser.writeI32(buf, pos, prev_log_epoch);
+    ser.writeI64(buf, pos, leader_commit);
+    ser.writeI64(buf, pos, entries_start_index);
+    ser.writeI32(buf, pos, @intCast(records.len));
+    for (records) |record| {
+        ser.writeI32(buf, pos, @intCast(record.len));
+        @memcpy(buf[pos.* .. pos.* + record.len], record);
+        pos.* += record.len;
+    }
 }
 
 fn freeDeserializedVoteResponse(resp: *const generated.vote_response.VoteResponse) void {
@@ -1201,6 +1464,7 @@ test "Controller handleRequest BrokerRegistration registers broker" {
 
     var ctrl = Controller.init(testing.allocator, 1, "test-cluster");
     defer ctrl.deinit();
+    try makeTestControllerLeader(&ctrl);
 
     var buf: [256]u8 = undefined;
     var pos = buildTestRequest(&buf, 62, 0, 40, header_mod.requestHeaderVersion(62, 0));
@@ -1233,6 +1497,7 @@ test "Controller handleRequest BrokerHeartbeat reports active broker" {
 
     var ctrl = Controller.init(testing.allocator, 1, "test-cluster");
     defer ctrl.deinit();
+    try makeTestControllerLeader(&ctrl);
 
     // First, register a broker to get the epoch
     var reg_buf: [256]u8 = undefined;
@@ -1277,6 +1542,7 @@ test "Controller handleRequest BrokerHeartbeat reports unknown broker for re-reg
 
     var ctrl = Controller.init(testing.allocator, 1, "test-cluster");
     defer ctrl.deinit();
+    try makeTestControllerLeader(&ctrl);
 
     var hb_buf: [256]u8 = undefined;
     var hb_pos = buildTestRequest(&hb_buf, 63, 0, 51, header_mod.requestHeaderVersion(63, 0));
@@ -1303,6 +1569,7 @@ test "Controller handleRequest BrokerHeartbeat reports stale broker epoch" {
 
     var ctrl = Controller.init(testing.allocator, 1, "test-cluster");
     defer ctrl.deinit();
+    try makeTestControllerLeader(&ctrl);
 
     const epoch = try ctrl.broker_registry.register(100, "host1", 9092);
 
@@ -1323,6 +1590,106 @@ test "Controller handleRequest BrokerHeartbeat reports stale broker epoch" {
     const hb_resp = try HbResp.deserialize(testing.allocator, hb_response.?, &hb_rpos, 0);
     try testing.expectEqual(ErrorCode.stale_broker_epoch.toInt(), hb_resp.error_code);
     try testing.expect(hb_resp.is_fenced);
+}
+
+test "Controller replays replicated broker registration after follower promotion" {
+    const AppendResp = generated.begin_quorum_epoch_response.BeginQuorumEpochResponse;
+    const HbReq = generated.broker_heartbeat_request.BrokerHeartbeatRequest;
+    const HbResp = generated.broker_heartbeat_response.BrokerHeartbeatResponse;
+
+    var leader = Controller.init(testing.allocator, 1, "controller-metadata-replication");
+    defer leader.deinit();
+    try makeTestControllerLeader(&leader);
+
+    const broker_epoch = leader.broker_registry.next_broker_epoch;
+    const record = try leader.buildBrokerRegistrationRecord(100, "host1", 9092, broker_epoch);
+    defer leader.allocator.free(record);
+    const offset = try leader.appendControllerMetadataRecord(record);
+    try leader.broker_registry.registerWithEpoch(100, "host1", 9092, broker_epoch, true);
+    leader.last_applied_controller_metadata_offset = offset;
+
+    var follower = Controller.init(testing.allocator, 2, "controller-metadata-replication");
+    defer follower.deinit();
+    try follower.raft_state.addVoter(1);
+    try follower.raft_state.addVoter(2);
+    follower.raft_state.becomeFollower(leader.raft_state.current_epoch, 1);
+
+    var append_buf: [1024]u8 = undefined;
+    var append_pos = buildTestRequest(&append_buf, 53, 0, 5308, header_mod.requestHeaderVersion(53, 0));
+    const records = [_][]const u8{record};
+    appendInternalRaftAppendEntriesPayload(&append_buf, &append_pos, 1, leader.raft_state.current_epoch, 0, 0, @intCast(offset), 0, &records);
+
+    const append_response = follower.handleRequest(append_buf[0..append_pos]);
+    try testing.expect(append_response != null);
+    defer testing.allocator.free(append_response.?);
+
+    var append_rpos: usize = 0;
+    var append_header = try ResponseHeader.deserialize(testing.allocator, append_response.?, &append_rpos, header_mod.responseHeaderVersion(53, 0));
+    defer append_header.deinit(testing.allocator);
+    const append_resp = try AppendResp.deserialize(testing.allocator, append_response.?, &append_rpos, 0);
+    defer if (append_resp.topics.len > 0) testing.allocator.free(append_resp.topics);
+    try testing.expectEqual(ErrorCode.none.toInt(), append_resp.error_code);
+    try testing.expectEqual(@as(usize, 1), follower.broker_registry.count());
+
+    _ = follower.raft_state.startElection();
+    follower.raft_state.becomeLeader();
+
+    var hb_buf: [256]u8 = undefined;
+    var hb_pos = buildTestRequest(&hb_buf, 63, 0, 5309, header_mod.requestHeaderVersion(63, 0));
+    const hb_req = HbReq{ .broker_id = 100, .broker_epoch = broker_epoch };
+    hb_req.serialize(&hb_buf, &hb_pos, 0);
+
+    const hb_response = follower.handleRequest(hb_buf[0..hb_pos]);
+    try testing.expect(hb_response != null);
+    defer testing.allocator.free(hb_response.?);
+
+    var hb_rpos: usize = 0;
+    var hb_header = try ResponseHeader.deserialize(testing.allocator, hb_response.?, &hb_rpos, header_mod.responseHeaderVersion(63, 0));
+    defer hb_header.deinit(testing.allocator);
+    const hb_resp = try HbResp.deserialize(testing.allocator, hb_response.?, &hb_rpos, 0);
+    try testing.expectEqual(ErrorCode.none.toInt(), hb_resp.error_code);
+    try testing.expect(!hb_resp.is_fenced);
+}
+
+test "Controller initWithDataDir replays durable broker registrations" {
+    const Req = generated.broker_registration_request.BrokerRegistrationRequest;
+
+    const tmp_dir = "/tmp/zmq-controller-metadata-replay-test";
+    fs.deleteTreeAbsolute(tmp_dir) catch {};
+    defer fs.deleteTreeAbsolute(tmp_dir) catch {};
+
+    {
+        var ctrl = Controller.initWithDataDir(testing.allocator, 1, "controller-metadata-restart", tmp_dir);
+        defer ctrl.deinit();
+        try makeTestControllerLeader(&ctrl);
+
+        var buf: [256]u8 = undefined;
+        var pos = buildTestRequest(&buf, 62, 0, 5310, header_mod.requestHeaderVersion(62, 0));
+        const listeners = [_]Req.Listener{.{ .name = "PLAINTEXT", .host = "host1", .port = 9092, .security_protocol = 0 }};
+        const req = Req{ .broker_id = 100, .cluster_id = "controller-metadata-restart", .listeners = &listeners };
+        req.serialize(&buf, &pos, 0);
+
+        const response = ctrl.handleRequest(buf[0..pos]);
+        try testing.expect(response != null);
+        testing.allocator.free(response.?);
+        try testing.expectEqual(@as(usize, 1), ctrl.broker_registry.count());
+    }
+
+    {
+        var ctrl = Controller.initWithDataDir(testing.allocator, 1, "controller-metadata-restart", tmp_dir);
+        defer ctrl.deinit();
+
+        const recovered = try ctrl.raft_state.loadPersistedLog();
+        try testing.expectEqual(@as(u64, 1), recovered);
+        ctrl.raft_state.commit_index = ctrl.raft_state.log.lastOffset();
+        try testing.expectEqual(@as(usize, 1), try ctrl.replayCommittedControllerMetadataRecords());
+        try testing.expectEqual(@as(usize, 1), ctrl.broker_registry.count());
+
+        const info = ctrl.broker_registry.brokers.get(100).?;
+        try testing.expectEqual(@as(i64, 1), info.broker_epoch);
+        try testing.expectEqualStrings("host1", info.host);
+        try testing.expectEqual(@as(u16, 9092), info.port);
+    }
 }
 
 test "Controller tick evicts dead brokers" {
