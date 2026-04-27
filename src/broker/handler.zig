@@ -1460,7 +1460,7 @@ pub const Broker = struct {
             14 => self.handleSyncGroup(request_bytes, pos, &req_header, api_version, resp_header_version),
             15 => self.handleDescribeGroups(request_bytes, pos, &req_header, resp_header_version),
             16 => self.handleListGroups(request_bytes, pos, &req_header, api_version, resp_header_version),
-            17 => self.handleSaslHandshake(request_bytes, pos, &req_header, resp_header_version),
+            17 => self.handleSaslHandshake(request_bytes, pos, &req_header, api_version, resp_header_version),
             18 => self.handleApiVersions(request_bytes, pos, &req_header, api_version, resp_header_version),
             19 => self.handleCreateTopics(request_bytes, pos, &req_header, api_version, resp_header_version),
             20 => self.handleDeleteTopics(request_bytes, pos, &req_header, api_version, resp_header_version),
@@ -4936,55 +4936,72 @@ pub const Broker = struct {
     // ---------------------------------------------------------------
     // SaslHandshake (key 17)
     // ---------------------------------------------------------------
-    fn handleSaslHandshake(self: *Broker, request_bytes: []const u8, body_start: usize, req_header: *const RequestHeader, resp_header_version: i16) ?[]u8 {
+    fn handleSaslHandshake(self: *Broker, request_bytes: []const u8, body_start: usize, req_header: *const RequestHeader, api_version: i16, resp_header_version: i16) ?[]u8 {
+        const Req = generated.sasl_handshake_request.SaslHandshakeRequest;
+        const Resp = generated.sasl_handshake_response.SaslHandshakeResponse;
+
+        if (!validateSaslHandshakeRequestFrame(request_bytes, body_start)) {
+            log.warn("Malformed SaslHandshake request", .{});
+            return null;
+        }
+
         var pos = body_start;
-        const mechanism = (ser.readString(request_bytes, &pos) catch return null) orelse "";
+        const req = Req.deserialize(self.allocator, request_bytes, &pos, api_version) catch |err| {
+            log.warn("Failed to decode SaslHandshake request: {}", .{err});
+            return null;
+        };
 
-        var buf = self.allocator.alloc(u8, 256) catch return null;
-        var wpos: usize = 0;
-        const rh = ResponseHeader{ .correlation_id = req_header.correlation_id };
-        rh.serialize(buf, &wpos, resp_header_version);
-
-        // Check if the requested mechanism is enabled in sasl_enabled_mechanisms
+        const mechanism = req.mechanism orelse "";
         const is_enabled = isMechanismEnabled(self.sasl_enabled_mechanisms, mechanism);
         if (is_enabled) {
-            ser.writeI16(buf, &wpos, 0); // error_code = NONE
-        } else {
-            ser.writeI16(buf, &wpos, 33); // error_code = UNSUPPORTED_SASL_MECHANISM
+            self.storeSaslMechanism(req_header.client_id, mechanism);
         }
 
-        // Store the negotiated mechanism for this client so handleSaslAuthenticate
-        // knows which authenticator to use
-        if (is_enabled) {
-            if (req_header.client_id) |client_id| {
-                const key = self.allocator.dupe(u8, client_id) catch {
-                    log.warn("SASL handshake: failed to store mechanism for client", .{});
-                    return (self.allocator.realloc(buf, wpos) catch buf)[0..wpos];
-                };
-                const val = self.allocator.dupe(u8, mechanism) catch {
-                    self.allocator.free(key);
-                    log.warn("SASL handshake: failed to store mechanism for client", .{});
-                    return (self.allocator.realloc(buf, wpos) catch buf)[0..wpos];
-                };
-                // Remove old entry if client re-handshakes
-                if (self.sasl_mechanisms.fetchRemove(key)) |old| {
-                    self.allocator.free(old.key);
-                    self.allocator.free(old.value);
-                }
-                self.sasl_mechanisms.put(key, val) catch {
-                    self.allocator.free(key);
-                    self.allocator.free(val);
-                    log.warn("SASL handshake: failed to store mechanism for client", .{});
-                };
-            }
+        const mechanisms = self.collectSaslMechanisms() catch return null;
+        defer if (mechanisms.len > 0) self.allocator.free(mechanisms);
+
+        const resp = Resp{
+            .error_code = if (is_enabled) @intFromEnum(ErrorCode.none) else @intFromEnum(ErrorCode.unsupported_sasl_mechanism),
+            .mechanisms = mechanisms,
+        };
+        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+    }
+
+    fn storeSaslMechanism(self: *Broker, maybe_client_id: ?[]const u8, mechanism: []const u8) void {
+        const client_id = maybe_client_id orelse return;
+        if (self.sasl_mechanisms.fetchRemove(client_id)) |old| {
+            self.allocator.free(old.key);
+            self.allocator.free(old.value);
         }
 
-        // Advertise all enabled mechanisms
-        const mech_count = countMechanisms(self.sasl_enabled_mechanisms);
-        ser.writeArrayLen(buf, &wpos, @intCast(mech_count));
-        writeMechanismNames(self.sasl_enabled_mechanisms, buf, &wpos);
-        if (resp_header_version >= 1) ser.writeEmptyTaggedFields(buf, &wpos);
-        return (self.allocator.realloc(buf, wpos) catch buf)[0..wpos];
+        const key = self.allocator.dupe(u8, client_id) catch {
+            log.warn("SASL handshake: failed to store mechanism for client", .{});
+            return;
+        };
+        const val = self.allocator.dupe(u8, mechanism) catch {
+            self.allocator.free(key);
+            log.warn("SASL handshake: failed to store mechanism for client", .{});
+            return;
+        };
+        self.sasl_mechanisms.put(key, val) catch {
+            self.allocator.free(key);
+            self.allocator.free(val);
+            log.warn("SASL handshake: failed to store mechanism for client", .{});
+        };
+    }
+
+    fn collectSaslMechanisms(self: *Broker) ![]?[]const u8 {
+        const count = countMechanisms(self.sasl_enabled_mechanisms);
+        if (count == 0) return &.{};
+
+        const mechanisms = try self.allocator.alloc(?[]const u8, count);
+        var i: usize = 0;
+        var iter = std.mem.splitSequence(u8, self.sasl_enabled_mechanisms, ",");
+        while (iter.next()) |mechanism| {
+            mechanisms[i] = mechanism;
+            i += 1;
+        }
+        return mechanisms;
     }
 
     /// Check whether a given mechanism name appears in the comma-separated enabled list.
@@ -6815,6 +6832,11 @@ pub const Broker = struct {
         return true;
     }
 
+    fn validateSaslHandshakeRequestFrame(buf: []const u8, start_pos: usize) bool {
+        var pos = start_pos;
+        return skipKafkaString(buf, &pos, false);
+    }
+
     fn validateListGroupsRequestFrame(buf: []const u8, start_pos: usize, api_version: i16) bool {
         const flexible = api_version >= 3;
         var pos = start_pos;
@@ -7708,6 +7730,82 @@ test "Broker.handleRequest FindCoordinator rejects truncated request" {
 
     var buf: [128]u8 = undefined;
     const req_len = buildTestRequest(&buf, 10, 4, 1005, header_mod.requestHeaderVersion(10, 4));
+    try testing.expect(broker.handleRequest(buf[0..req_len]) == null);
+}
+
+test "Broker.handleRequest SaslHandshake v1 returns generated mechanisms and stores selection" {
+    const Req = generated.sasl_handshake_request.SaslHandshakeRequest;
+    const Resp = generated.sasl_handshake_response.SaslHandshakeResponse;
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+    broker.sasl_enabled_mechanisms = "PLAIN,SCRAM-SHA-256";
+
+    const req = Req{ .mechanism = "SCRAM-SHA-256" };
+
+    var buf: [256]u8 = undefined;
+    var pos = buildTestRequest(&buf, 17, 1, 1701, header_mod.requestHeaderVersion(17, 1));
+    req.serialize(&buf, &pos, 1);
+
+    const response = broker.handleRequest(buf[0..pos]);
+    try testing.expect(response != null);
+    defer testing.allocator.free(response.?);
+
+    var rpos: usize = 0;
+    var response_header = try ResponseHeader.deserialize(testing.allocator, response.?, &rpos, header_mod.responseHeaderVersion(17, 1));
+    defer response_header.deinit(testing.allocator);
+    try testing.expectEqual(@as(i32, 1701), response_header.correlation_id);
+
+    const resp = try Resp.deserialize(testing.allocator, response.?, &rpos, 1);
+    defer if (resp.mechanisms.len > 0) testing.allocator.free(resp.mechanisms);
+
+    try testing.expectEqual(response.?.len, rpos);
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.none)), resp.error_code);
+    try testing.expectEqual(@as(usize, 2), resp.mechanisms.len);
+    try testing.expectEqualStrings("PLAIN", resp.mechanisms[0].?);
+    try testing.expectEqualStrings("SCRAM-SHA-256", resp.mechanisms[1].?);
+    try testing.expectEqualStrings("SCRAM-SHA-256", broker.sasl_mechanisms.get("test-client").?);
+}
+
+test "Broker.handleRequest SaslHandshake returns unsupported mechanism in generated response" {
+    const Req = generated.sasl_handshake_request.SaslHandshakeRequest;
+    const Resp = generated.sasl_handshake_response.SaslHandshakeResponse;
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+    broker.sasl_enabled_mechanisms = "PLAIN";
+
+    const req = Req{ .mechanism = "OAUTHBEARER" };
+
+    var buf: [256]u8 = undefined;
+    var pos = buildTestRequest(&buf, 17, 1, 1702, header_mod.requestHeaderVersion(17, 1));
+    req.serialize(&buf, &pos, 1);
+
+    const response = broker.handleRequest(buf[0..pos]);
+    try testing.expect(response != null);
+    defer testing.allocator.free(response.?);
+
+    var rpos: usize = 0;
+    var response_header = try ResponseHeader.deserialize(testing.allocator, response.?, &rpos, header_mod.responseHeaderVersion(17, 1));
+    defer response_header.deinit(testing.allocator);
+    try testing.expectEqual(@as(i32, 1702), response_header.correlation_id);
+
+    const resp = try Resp.deserialize(testing.allocator, response.?, &rpos, 1);
+    defer if (resp.mechanisms.len > 0) testing.allocator.free(resp.mechanisms);
+
+    try testing.expectEqual(response.?.len, rpos);
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.unsupported_sasl_mechanism)), resp.error_code);
+    try testing.expectEqual(@as(usize, 1), resp.mechanisms.len);
+    try testing.expectEqualStrings("PLAIN", resp.mechanisms[0].?);
+    try testing.expect(broker.sasl_mechanisms.get("test-client") == null);
+}
+
+test "Broker.handleRequest SaslHandshake rejects truncated request" {
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+
+    var buf: [128]u8 = undefined;
+    const req_len = buildTestRequest(&buf, 17, 1, 1703, header_mod.requestHeaderVersion(17, 1));
     try testing.expect(broker.handleRequest(buf[0..req_len]) == null);
 }
 
