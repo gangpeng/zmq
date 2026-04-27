@@ -1458,7 +1458,7 @@ pub const Broker = struct {
             12 => self.handleHeartbeat(request_bytes, pos, &req_header, api_version, resp_header_version),
             13 => self.handleLeaveGroup(request_bytes, pos, &req_header, api_version, resp_header_version),
             14 => self.handleSyncGroup(request_bytes, pos, &req_header, api_version, resp_header_version),
-            15 => self.handleDescribeGroups(request_bytes, pos, &req_header, resp_header_version),
+            15 => self.handleDescribeGroups(request_bytes, pos, &req_header, api_version, resp_header_version),
             16 => self.handleListGroups(request_bytes, pos, &req_header, api_version, resp_header_version),
             17 => self.handleSaslHandshake(request_bytes, pos, &req_header, api_version, resp_header_version),
             18 => self.handleApiVersions(request_bytes, pos, &req_header, api_version, resp_header_version),
@@ -2922,71 +2922,134 @@ pub const Broker = struct {
     // ---------------------------------------------------------------
     // DescribeGroups (key 15)
     // ---------------------------------------------------------------
-    fn handleDescribeGroups(self: *Broker, request_bytes: []const u8, body_start: usize, req_header: *const RequestHeader, resp_header_version: i16) ?[]u8 {
-        var pos = body_start;
-        // Parse requested group IDs
-        const num_groups = (ser.readArrayLen(request_bytes, &pos) catch 0) orelse 0;
+    fn handleDescribeGroups(self: *Broker, request_bytes: []const u8, body_start: usize, req_header: *const RequestHeader, api_version: i16, resp_header_version: i16) ?[]u8 {
+        const Req = generated.describe_groups_request.DescribeGroupsRequest;
+        const Resp = generated.describe_groups_response.DescribeGroupsResponse;
 
-        var resp_buf = self.allocator.alloc(u8, 8192) catch return null;
-        var wpos: usize = 0;
-        const resp_header = ResponseHeader{ .correlation_id = req_header.correlation_id };
-        resp_header.serialize(resp_buf, &wpos, resp_header_version);
-
-        if (num_groups > 0) {
-            // Describe specific groups
-            ser.writeArrayLen(resp_buf, &wpos, num_groups);
-            for (0..num_groups) |_| {
-                const gid = (ser.readString(request_bytes, &pos) catch break) orelse "";
-                if (self.groups.groups.getPtr(gid)) |group| {
-                    self.writeGroupDescription(resp_buf, &wpos, group);
-                } else {
-                    // Group not found
-                    ser.writeI16(resp_buf, &wpos, 69); // GROUP_ID_NOT_FOUND
-                    ser.writeString(resp_buf, &wpos, gid);
-                    ser.writeString(resp_buf, &wpos, "Dead");
-                    ser.writeString(resp_buf, &wpos, "");
-                    ser.writeString(resp_buf, &wpos, "");
-                    ser.writeArrayLen(resp_buf, &wpos, 0);
-                }
-            }
-        } else {
-            // Return all groups
-            const group_count = self.groups.groupCount();
-            ser.writeArrayLen(resp_buf, &wpos, group_count);
-            var git = self.groups.groups.iterator();
-            while (git.next()) |entry| {
-                self.writeGroupDescription(resp_buf, &wpos, entry.value_ptr);
-            }
+        if (!validateDescribeGroupsRequestFrame(request_bytes, body_start, api_version)) {
+            log.warn("Malformed DescribeGroups request", .{});
+            return null;
         }
 
-        if (resp_header_version >= 1) ser.writeEmptyTaggedFields(resp_buf, &wpos);
-        return (self.allocator.realloc(resp_buf, wpos) catch resp_buf)[0..wpos];
+        var pos = body_start;
+        var req = Req.deserialize(self.allocator, request_bytes, &pos, api_version) catch |err| {
+            log.warn("Failed to decode DescribeGroups request: {}", .{err});
+            return null;
+        };
+        defer self.freeDescribeGroupsRequest(&req);
+
+        const described_groups = self.collectDescribedGroups(req) catch return null;
+        defer {
+            self.freeDescribedGroups(described_groups);
+            if (described_groups.len > 0) self.allocator.free(described_groups);
+        }
+
+        const resp = Resp{
+            .throttle_time_ms = 0,
+            .groups = described_groups,
+        };
+        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
     }
 
-    fn writeGroupDescription(self: *Broker, buf: []u8, wpos: *usize, group: *const @import("group_coordinator.zig").ConsumerGroup) void {
-        _ = self;
-        ser.writeI16(buf, wpos, 0); // error_code
-        ser.writeString(buf, wpos, group.group_id);
-        ser.writeString(buf, wpos, switch (group.state) {
-            .empty => "Empty",
-            .preparing_rebalance => "PreparingRebalance",
-            .completing_rebalance => "CompletingRebalance",
-            .stable => "Stable",
-            .dead => "Dead",
-        });
-        ser.writeString(buf, wpos, "consumer"); // protocol_type
-        ser.writeString(buf, wpos, "range"); // protocol (assignment strategy)
-        ser.writeArrayLen(buf, wpos, group.memberCount());
+    fn freeDescribeGroupsRequest(self: *Broker, req: *generated.describe_groups_request.DescribeGroupsRequest) void {
+        if (req.groups.len > 0) self.allocator.free(req.groups);
+    }
 
-        var mit = group.members.iterator();
-        while (mit.next()) |mentry| {
-            const member = mentry.value_ptr;
-            ser.writeString(buf, wpos, member.member_id);
-            ser.writeString(buf, wpos, "zmq-client"); // client_id
-            ser.writeString(buf, wpos, "/127.0.0.1"); // client_host
-            ser.writeBytesBuf(buf, wpos, null); // metadata
-            ser.writeBytesBuf(buf, wpos, member.assignment); // assignment
+    fn collectDescribedGroups(self: *Broker, req: generated.describe_groups_request.DescribeGroupsRequest) ![]generated.describe_groups_response.DescribeGroupsResponse.DescribedGroup {
+        const DescribedGroup = generated.describe_groups_response.DescribeGroupsResponse.DescribedGroup;
+
+        if (req.groups.len > 0) {
+            const groups = try self.allocator.alloc(DescribedGroup, req.groups.len);
+            var groups_init: usize = 0;
+            errdefer {
+                self.freeDescribedGroups(groups[0..groups_init]);
+                if (groups.len > 0) self.allocator.free(groups);
+            }
+
+            for (req.groups) |requested_group| {
+                const group_id = requested_group orelse "";
+                groups[groups_init] = try self.describeGroup(group_id, req.include_authorized_operations);
+                groups_init += 1;
+            }
+            return groups;
         }
+
+        const group_count = self.groups.groupCount();
+        if (group_count == 0) return &.{};
+
+        const groups = try self.allocator.alloc(DescribedGroup, group_count);
+        var groups_init: usize = 0;
+        errdefer {
+            self.freeDescribedGroups(groups[0..groups_init]);
+            if (groups.len > 0) self.allocator.free(groups);
+        }
+
+        var git = self.groups.groups.iterator();
+        while (git.next()) |entry| {
+            groups[groups_init] = try self.describeExistingGroup(entry.value_ptr, req.include_authorized_operations);
+            groups_init += 1;
+        }
+        return groups;
+    }
+
+    fn describeGroup(self: *Broker, group_id: []const u8, include_authorized_operations: bool) !generated.describe_groups_response.DescribeGroupsResponse.DescribedGroup {
+        if (self.groups.groups.getPtr(group_id)) |group| {
+            return self.describeExistingGroup(group, include_authorized_operations);
+        }
+        return .{
+            .error_code = @intFromEnum(ErrorCode.group_id_not_found),
+            .group_id = group_id,
+            .group_state = "Dead",
+            .protocol_type = "",
+            .protocol_data = "",
+            .members = &.{},
+            .authorized_operations = describeGroupsAuthorizedOps(include_authorized_operations),
+        };
+    }
+
+    fn describeExistingGroup(self: *Broker, group: *const @import("group_coordinator.zig").ConsumerGroup, include_authorized_operations: bool) !generated.describe_groups_response.DescribeGroupsResponse.DescribedGroup {
+        const Member = generated.describe_groups_response.DescribeGroupsResponse.DescribedGroup.DescribedGroupMember;
+
+        var members: []Member = &.{};
+        if (group.memberCount() > 0) {
+            members = try self.allocator.alloc(Member, group.memberCount());
+            var member_idx: usize = 0;
+            errdefer if (members.len > 0) self.allocator.free(members);
+
+            var mit = group.members.iterator();
+            while (mit.next()) |mentry| {
+                const member = mentry.value_ptr;
+                members[member_idx] = .{
+                    .member_id = member.member_id,
+                    .group_instance_id = member.group_instance_id,
+                    .client_id = "zmq-client",
+                    .client_host = "/127.0.0.1",
+                    .member_metadata = null,
+                    .member_assignment = member.assignment,
+                };
+                member_idx += 1;
+            }
+        }
+
+        return .{
+            .error_code = @intFromEnum(ErrorCode.none),
+            .group_id = group.group_id,
+            .group_state = consumerGroupStateName(group.state),
+            .protocol_type = "consumer",
+            .protocol_data = "range",
+            .members = members,
+            .authorized_operations = describeGroupsAuthorizedOps(include_authorized_operations),
+        };
+    }
+
+    fn freeDescribedGroups(self: *Broker, groups: []const generated.describe_groups_response.DescribeGroupsResponse.DescribedGroup) void {
+        for (groups) |group| {
+            if (group.members.len > 0) self.allocator.free(group.members);
+        }
+    }
+
+    fn describeGroupsAuthorizedOps(include_authorized_operations: bool) i32 {
+        return if (include_authorized_operations) 0 else std.math.minInt(i32);
     }
 
     // ---------------------------------------------------------------
@@ -6974,6 +7037,19 @@ pub const Broker = struct {
             if (!skipKafkaBytes(buf, &pos, flexible)) return false; // assignment
             if (flexible) ser.skipTaggedFields(buf, &pos) catch return false;
         }
+        if (flexible) ser.skipTaggedFields(buf, &pos) catch return false;
+        return true;
+    }
+
+    fn validateDescribeGroupsRequestFrame(buf: []const u8, start_pos: usize, api_version: i16) bool {
+        const flexible = api_version >= 5;
+        var pos = start_pos;
+
+        const group_count = readKafkaArrayCount(buf, &pos, flexible) orelse return false;
+        for (0..group_count) |_| {
+            if (!skipKafkaString(buf, &pos, flexible)) return false; // group_id
+        }
+        if (api_version >= 3 and !skipFixedBytes(buf, &pos, 1)) return false; // include_authorized_operations
         if (flexible) ser.skipTaggedFields(buf, &pos) catch return false;
         return true;
     }
@@ -11245,6 +11321,67 @@ test "Broker.handleRequest SyncGroup rejects truncated request" {
 
     var buf: [128]u8 = undefined;
     const req_len = buildTestRequest(&buf, 14, 5, 1406, header_mod.requestHeaderVersion(14, 5));
+    try testing.expect(broker.handleRequest(buf[0..req_len]) == null);
+}
+
+test "Broker.handleRequest DescribeGroups v5 returns generated response" {
+    const Req = generated.describe_groups_request.DescribeGroupsRequest;
+    const Resp = generated.describe_groups_response.DescribeGroupsResponse;
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+
+    _ = try broker.groups.joinGroup("dg-generated-group", null, "consumer", null);
+
+    const groups = [_]?[]const u8{ "dg-generated-group", "missing-group" };
+    const req = Req{
+        .groups = &groups,
+        .include_authorized_operations = true,
+    };
+
+    var buf: [512]u8 = undefined;
+    var pos = buildTestRequest(&buf, 15, 5, 1505, header_mod.requestHeaderVersion(15, 5));
+    req.serialize(&buf, &pos, 5);
+
+    const response = broker.handleRequest(buf[0..pos]);
+    try testing.expect(response != null);
+    defer testing.allocator.free(response.?);
+
+    var rpos: usize = 0;
+    var response_header = try ResponseHeader.deserialize(testing.allocator, response.?, &rpos, header_mod.responseHeaderVersion(15, 5));
+    defer response_header.deinit(testing.allocator);
+    try testing.expectEqual(@as(i32, 1505), response_header.correlation_id);
+
+    const resp = try Resp.deserialize(testing.allocator, response.?, &rpos, 5);
+    defer {
+        broker.freeDescribedGroups(resp.groups);
+        if (resp.groups.len > 0) testing.allocator.free(resp.groups);
+    }
+    try testing.expectEqual(response.?.len, rpos);
+    try testing.expectEqual(@as(i32, 0), resp.throttle_time_ms);
+    try testing.expectEqual(@as(usize, 2), resp.groups.len);
+
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.none)), resp.groups[0].error_code);
+    try testing.expectEqualStrings("dg-generated-group", resp.groups[0].group_id.?);
+    try testing.expectEqualStrings("PreparingRebalance", resp.groups[0].group_state.?);
+    try testing.expectEqualStrings("consumer", resp.groups[0].protocol_type.?);
+    try testing.expectEqualStrings("range", resp.groups[0].protocol_data.?);
+    try testing.expectEqual(@as(usize, 1), resp.groups[0].members.len);
+    try testing.expectEqualStrings("zmq-client", resp.groups[0].members[0].client_id.?);
+    try testing.expectEqual(@as(i32, 0), resp.groups[0].authorized_operations);
+
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.group_id_not_found)), resp.groups[1].error_code);
+    try testing.expectEqualStrings("missing-group", resp.groups[1].group_id.?);
+    try testing.expectEqualStrings("Dead", resp.groups[1].group_state.?);
+    try testing.expectEqual(@as(usize, 0), resp.groups[1].members.len);
+}
+
+test "Broker.handleRequest DescribeGroups rejects truncated request" {
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+
+    var buf: [128]u8 = undefined;
+    const req_len = buildTestRequest(&buf, 15, 5, 1506, header_mod.requestHeaderVersion(15, 5));
     try testing.expect(broker.handleRequest(buf[0..req_len]) == null);
 }
 
