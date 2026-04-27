@@ -362,7 +362,7 @@ pub const S3Client = struct {
         // 206 = Partial Content, 200 = Full content
         if (response.status != 206 and response.status != 200) return error.S3GetFailed;
 
-        const result = try self.responseBodyOwned(&response);
+        const result = try self.exactRangeBody(response.status, offset, length, try self.responseBodyOwned(&response));
         self.get_count += 1;
         self.bytes_downloaded += result.len;
         return result;
@@ -878,6 +878,25 @@ pub const S3Client = struct {
         return try self.allocator.dupe(u8, response.body());
     }
 
+    fn exactRangeBody(self: *S3Client, status: u16, requested_offset: u64, requested_length: u64, body: []u8) ![]u8 {
+        errdefer self.allocator.free(body);
+
+        const requested_len = std.math.cast(usize, requested_length) orelse return error.S3RangeInvalid;
+        if (status == 206) {
+            if (body.len != requested_len) return error.S3RangeLengthMismatch;
+            return body;
+        }
+
+        const start = std.math.cast(usize, requested_offset) orelse return error.S3RangeInvalid;
+        const end = std.math.add(usize, start, requested_len) catch return error.S3RangeInvalid;
+        if (end > body.len) return error.S3RangeLengthMismatch;
+        if (start == 0 and end == body.len) return body;
+
+        const exact = try self.allocator.dupe(u8, body[start..end]);
+        self.allocator.free(body);
+        return exact;
+    }
+
     // ---- Metrics helpers ----
 
     /// Record a successful S3 request in the Prometheus metric registry.
@@ -1184,6 +1203,26 @@ test "S3Client decodeChunked validates framing" {
     try testing.expectEqualStrings("hello world", decoded);
 
     try testing.expectError(error.InvalidChunkedEncoding, client.decodeChunked("5\r\nabc\r\n0\r\n\r\n"));
+}
+
+test "S3Client range body returns exact requested window" {
+    var client = S3Client.init(testing.allocator, .{});
+
+    const partial_body = try testing.allocator.dupe(u8, "range");
+    const partial = try client.exactRangeBody(206, 10, 5, partial_body);
+    defer testing.allocator.free(partial);
+    try testing.expectEqualStrings("range", partial);
+
+    const full_body = try testing.allocator.dupe(u8, "0123456789");
+    const sliced = try client.exactRangeBody(200, 2, 4, full_body);
+    defer testing.allocator.free(sliced);
+    try testing.expectEqualStrings("2345", sliced);
+
+    const short_body = try testing.allocator.dupe(u8, "abc");
+    try testing.expectError(error.S3RangeLengthMismatch, client.exactRangeBody(206, 0, 4, short_body));
+
+    const ignored_range_body = try testing.allocator.dupe(u8, "abcd");
+    try testing.expectError(error.S3RangeLengthMismatch, client.exactRangeBody(200, 2, 4, ignored_range_body));
 }
 
 test "S3Client multipart ETag validation" {
