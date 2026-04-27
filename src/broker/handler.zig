@@ -2574,29 +2574,27 @@ pub const Broker = struct {
     // Heartbeat (key 12)
     // ---------------------------------------------------------------
     fn handleHeartbeat(self: *Broker, request_bytes: []const u8, body_start: usize, req_header: *const RequestHeader, api_version: i16, resp_header_version: i16) ?[]u8 {
+        const Req = generated.heartbeat_request.HeartbeatRequest;
+        const Resp = generated.heartbeat_response.HeartbeatResponse;
+
+        if (!validateHeartbeatRequestFrame(request_bytes, body_start, api_version)) {
+            log.warn("Malformed Heartbeat request", .{});
+            return null;
+        }
+
         var pos = body_start;
-        const flexible = api_version >= 4;
-        const group_id = if (flexible)
-            ((ser.readCompactString(request_bytes, &pos) catch return null) orelse "")
-        else
-            ((ser.readString(request_bytes, &pos) catch return null) orelse "");
-        const generation_id = ser.readI32(request_bytes, &pos);
-        const member_id = if (flexible)
-            ((ser.readCompactString(request_bytes, &pos) catch return null) orelse "")
-        else
-            ((ser.readString(request_bytes, &pos) catch return null) orelse "");
-        if (flexible) ser.skipTaggedFields(request_bytes, &pos) catch {};
+        const req = Req.deserialize(self.allocator, request_bytes, &pos, api_version) catch |err| {
+            log.warn("Failed to decode Heartbeat request: {}", .{err});
+            return null;
+        };
 
-        const error_code = self.groups.heartbeat(group_id, member_id, generation_id);
+        const error_code = self.groups.heartbeat(req.group_id orelse "", req.member_id orelse "", req.generation_id);
 
-        var resp_buf = self.allocator.alloc(u8, 64) catch return null;
-        var wpos: usize = 0;
-        const resp_header = ResponseHeader{ .correlation_id = req_header.correlation_id };
-        resp_header.serialize(resp_buf, &wpos, resp_header_version);
-        if (api_version >= 1) ser.writeI32(resp_buf, &wpos, 0); // throttle_time_ms
-        ser.writeI16(resp_buf, &wpos, error_code);
-        if (resp_header_version >= 1) ser.writeEmptyTaggedFields(resp_buf, &wpos);
-        return (self.allocator.realloc(resp_buf, wpos) catch resp_buf)[0..wpos];
+        const resp = Resp{
+            .throttle_time_ms = 0,
+            .error_code = error_code,
+        };
+        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
     }
 
     // ---------------------------------------------------------------
@@ -6837,6 +6835,20 @@ pub const Broker = struct {
         return skipKafkaString(buf, &pos, false);
     }
 
+    fn validateHeartbeatRequestFrame(buf: []const u8, start_pos: usize, api_version: i16) bool {
+        const flexible = api_version >= 4;
+        var pos = start_pos;
+
+        if (!skipKafkaString(buf, &pos, flexible)) return false; // group_id
+        if (!skipFixedBytes(buf, &pos, 4)) return false; // generation_id
+        if (!skipKafkaString(buf, &pos, flexible)) return false; // member_id
+        if (api_version >= 3) {
+            if (!skipKafkaString(buf, &pos, flexible)) return false; // group_instance_id
+        }
+        if (flexible) ser.skipTaggedFields(buf, &pos) catch return false;
+        return true;
+    }
+
     fn validateListGroupsRequestFrame(buf: []const u8, start_pos: usize, api_version: i16) bool {
         const flexible = api_version >= 3;
         var pos = start_pos;
@@ -11010,6 +11022,83 @@ test "Broker handleRequest Heartbeat (key=12)" {
     const error_code = ser.readI16(resp.?, &rpos);
     // Unknown member in unknown group — expect non-zero error
     try testing.expect(error_code != 0);
+}
+
+test "Broker.handleRequest Heartbeat v4 returns generated success response" {
+    const Req = generated.heartbeat_request.HeartbeatRequest;
+    const Resp = generated.heartbeat_response.HeartbeatResponse;
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+
+    const join = try broker.groups.joinGroup("hb-generated-group", null, "consumer", null);
+    broker.groups.groups.getPtr("hb-generated-group").?.state = .stable;
+
+    const req = Req{
+        .group_id = "hb-generated-group",
+        .generation_id = join.generation_id,
+        .member_id = join.member_id,
+        .group_instance_id = "instance-1",
+    };
+
+    var buf: [512]u8 = undefined;
+    var pos = buildTestRequest(&buf, 12, 4, 1204, header_mod.requestHeaderVersion(12, 4));
+    req.serialize(&buf, &pos, 4);
+
+    const response = broker.handleRequest(buf[0..pos]);
+    try testing.expect(response != null);
+    defer testing.allocator.free(response.?);
+
+    var rpos: usize = 0;
+    var response_header = try ResponseHeader.deserialize(testing.allocator, response.?, &rpos, header_mod.responseHeaderVersion(12, 4));
+    defer response_header.deinit(testing.allocator);
+    try testing.expectEqual(@as(i32, 1204), response_header.correlation_id);
+
+    const resp = try Resp.deserialize(testing.allocator, response.?, &rpos, 4);
+    try testing.expectEqual(response.?.len, rpos);
+    try testing.expectEqual(@as(i32, 0), resp.throttle_time_ms);
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.none)), resp.error_code);
+}
+
+test "Broker.handleRequest Heartbeat v4 returns generated unknown-group error" {
+    const Req = generated.heartbeat_request.HeartbeatRequest;
+    const Resp = generated.heartbeat_response.HeartbeatResponse;
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+
+    const req = Req{
+        .group_id = "missing-group",
+        .generation_id = 1,
+        .member_id = "member-1",
+        .group_instance_id = null,
+    };
+
+    var buf: [512]u8 = undefined;
+    var pos = buildTestRequest(&buf, 12, 4, 1205, header_mod.requestHeaderVersion(12, 4));
+    req.serialize(&buf, &pos, 4);
+
+    const response = broker.handleRequest(buf[0..pos]);
+    try testing.expect(response != null);
+    defer testing.allocator.free(response.?);
+
+    var rpos: usize = 0;
+    var response_header = try ResponseHeader.deserialize(testing.allocator, response.?, &rpos, header_mod.responseHeaderVersion(12, 4));
+    defer response_header.deinit(testing.allocator);
+    try testing.expectEqual(@as(i32, 1205), response_header.correlation_id);
+
+    const resp = try Resp.deserialize(testing.allocator, response.?, &rpos, 4);
+    try testing.expectEqual(response.?.len, rpos);
+    try testing.expectEqual(@as(i16, 16), resp.error_code);
+}
+
+test "Broker.handleRequest Heartbeat rejects truncated request" {
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+
+    var buf: [128]u8 = undefined;
+    const req_len = buildTestRequest(&buf, 12, 4, 1206, header_mod.requestHeaderVersion(12, 4));
+    try testing.expect(broker.handleRequest(buf[0..req_len]) == null);
 }
 
 test "Broker kafka_server_api_errors_total is registered" {
