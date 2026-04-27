@@ -1473,7 +1473,7 @@ pub const Broker = struct {
             26 => self.handleEndTxn(request_bytes, pos, &req_header, api_version, resp_header_version),
             27 => self.handleWriteTxnMarkers(request_bytes, pos, &req_header, api_version, resp_header_version),
             28 => self.handleTxnOffsetCommit(request_bytes, pos, &req_header, api_version, resp_header_version),
-            29 => self.handleDescribeAcls(&req_header, resp_header_version),
+            29 => self.handleDescribeAcls(request_bytes, pos, &req_header, api_version, resp_header_version),
             30 => self.handleCreateAcls(request_bytes, pos, &req_header, api_version, resp_header_version),
             31 => self.handleDeleteAcls(request_bytes, pos, &req_header, api_version, resp_header_version),
             32 => self.handleDescribeConfigs(request_bytes, pos, &req_header, api_version, resp_header_version),
@@ -5511,31 +5511,110 @@ pub const Broker = struct {
     // ---------------------------------------------------------------
     // DescribeAcls (key 29)
     // ---------------------------------------------------------------
-    fn handleDescribeAcls(self: *Broker, req_header: *const RequestHeader, resp_header_version: i16) ?[]u8 {
-        var buf = self.allocator.alloc(u8, 4096) catch return null;
-        var wpos: usize = 0;
-        const rh = ResponseHeader{ .correlation_id = req_header.correlation_id };
-        rh.serialize(buf, &wpos, resp_header_version);
-        ser.writeI32(buf, &wpos, 0); // throttle_time_ms
-        ser.writeI16(buf, &wpos, 0); // error_code = NONE
-        ser.writeString(buf, &wpos, null); // error_message
+    fn handleDescribeAcls(self: *Broker, request_bytes: []const u8, body_start: usize, req_header: *const RequestHeader, api_version: i16, resp_header_version: i16) ?[]u8 {
+        const Req = generated.describe_acls_request.DescribeAclsRequest;
 
-        // Return all ACLs from the authorizer
-        const acl_count = self.authorizer.aclCount();
-        ser.writeArrayLen(buf, &wpos, acl_count);
-        for (self.authorizer.acls.items) |acl| {
-            ser.writeI8(buf, &wpos, @intFromEnum(acl.resource_type));
-            ser.writeString(buf, &wpos, acl.resource_name);
-            ser.writeI8(buf, &wpos, @intFromEnum(acl.pattern_type));
-            // ACL entries sub-array (1 entry per ACL)
-            ser.writeArrayLen(buf, &wpos, 1);
-            ser.writeString(buf, &wpos, acl.principal);
-            ser.writeString(buf, &wpos, acl.host);
-            ser.writeI8(buf, &wpos, @intFromEnum(acl.operation));
-            ser.writeI8(buf, &wpos, @intFromEnum(acl.permission));
+        if (!validateDescribeAclsRequestFrame(request_bytes, body_start, api_version)) {
+            log.warn("Malformed DescribeAcls request", .{});
+            return null;
         }
-        if (resp_header_version >= 1) ser.writeEmptyTaggedFields(buf, &wpos);
-        return (self.allocator.realloc(buf, wpos) catch buf)[0..wpos];
+
+        var pos = body_start;
+        const req = Req.deserialize(self.allocator, request_bytes, &pos, api_version) catch |err| {
+            log.warn("Failed to decode DescribeAcls request: {}", .{err});
+            return null;
+        };
+
+        const resp = self.describeAclsResponse(req, api_version) catch return null;
+        defer self.freeDescribeAclsResources(resp.resources);
+
+        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+    }
+
+    fn describeAclsResponse(self: *Broker, req: generated.describe_acls_request.DescribeAclsRequest, api_version: i16) !generated.describe_acls_response.DescribeAclsResponse {
+        const resource_type = aclResourceType(req.resource_type_filter) orelse return invalidDescribeAclsResponse("Invalid ACL resource type");
+        const pattern_type = aclPatternType(if (api_version >= 1) req.pattern_type_filter else @intFromEnum(Authorizer.PatternType.literal)) orelse return invalidDescribeAclsResponse("Invalid ACL pattern type");
+        const operation = aclOperation(req.operation) orelse return invalidDescribeAclsResponse("Invalid ACL operation");
+        const permission = aclPermission(req.permission_type) orelse return invalidDescribeAclsResponse("Invalid ACL permission type");
+
+        const resources = try self.collectDescribeAclsResources(
+            resource_type,
+            req.resource_name_filter,
+            pattern_type,
+            req.principal_filter,
+            req.host_filter,
+            operation,
+            permission,
+        );
+
+        return .{
+            .throttle_time_ms = 0,
+            .error_code = @intFromEnum(ErrorCode.none),
+            .error_message = null,
+            .resources = resources,
+        };
+    }
+
+    fn invalidDescribeAclsResponse(message: []const u8) generated.describe_acls_response.DescribeAclsResponse {
+        return .{
+            .throttle_time_ms = 0,
+            .error_code = @intFromEnum(ErrorCode.invalid_request),
+            .error_message = message,
+            .resources = &.{},
+        };
+    }
+
+    fn collectDescribeAclsResources(
+        self: *Broker,
+        filter_resource_type: Authorizer.ResourceType,
+        filter_resource_name: ?[]const u8,
+        filter_pattern_type: Authorizer.PatternType,
+        filter_principal: ?[]const u8,
+        filter_host: ?[]const u8,
+        filter_operation: Authorizer.Operation,
+        filter_permission: Authorizer.Permission,
+    ) ![]generated.describe_acls_response.DescribeAclsResponse.DescribeAclsResource {
+        const Resource = generated.describe_acls_response.DescribeAclsResponse.DescribeAclsResource;
+        const AclDescription = Resource.AclDescription;
+
+        var resources = std.array_list.Managed(Resource).init(self.allocator);
+        errdefer {
+            self.freeDescribeAclsResources(resources.items);
+            resources.deinit();
+        }
+
+        for (self.authorizer.acls.items) |acl| {
+            if (!brokerAclMatchesFilter(acl, filter_resource_type, filter_resource_name, filter_pattern_type, filter_principal, filter_host, filter_operation, filter_permission)) continue;
+
+            const acls = try self.allocator.alloc(AclDescription, 1);
+            errdefer self.allocator.free(acls);
+            acls[0] = .{
+                .principal = acl.principal,
+                .host = acl.host,
+                .operation = @intFromEnum(acl.operation),
+                .permission_type = @intFromEnum(acl.permission),
+            };
+
+            try resources.append(.{
+                .resource_type = @intFromEnum(acl.resource_type),
+                .resource_name = acl.resource_name,
+                .pattern_type = @intFromEnum(acl.pattern_type),
+                .acls = acls,
+            });
+        }
+
+        if (resources.items.len == 0) {
+            resources.deinit();
+            return &.{};
+        }
+        return try resources.toOwnedSlice();
+    }
+
+    fn freeDescribeAclsResources(self: *Broker, resources: []const generated.describe_acls_response.DescribeAclsResponse.DescribeAclsResource) void {
+        for (resources) |resource| {
+            if (resource.acls.len > 0) self.allocator.free(resource.acls);
+        }
+        if (resources.len > 0) self.allocator.free(resources);
     }
 
     // ---------------------------------------------------------------
@@ -6627,6 +6706,20 @@ pub const Broker = struct {
             if (!skipFixedBytes(buf, &pos, 2)) return false; // operation + permission_type
             if (flexible) ser.skipTaggedFields(buf, &pos) catch return false;
         }
+        if (flexible) ser.skipTaggedFields(buf, &pos) catch return false;
+        return true;
+    }
+
+    fn validateDescribeAclsRequestFrame(buf: []const u8, start_pos: usize, api_version: i16) bool {
+        const flexible = api_version >= 2;
+        var pos = start_pos;
+
+        if (!skipFixedBytes(buf, &pos, 1)) return false; // resource_type_filter
+        if (!skipKafkaString(buf, &pos, flexible)) return false; // resource_name_filter
+        if (api_version >= 1 and !skipFixedBytes(buf, &pos, 1)) return false; // pattern_type_filter
+        if (!skipKafkaString(buf, &pos, flexible)) return false; // principal_filter
+        if (!skipKafkaString(buf, &pos, flexible)) return false; // host_filter
+        if (!skipFixedBytes(buf, &pos, 2)) return false; // operation + permission_type
         if (flexible) ser.skipTaggedFields(buf, &pos) catch return false;
         return true;
     }
@@ -7771,6 +7864,108 @@ test "Broker.handleRequest TxnOffsetCommit rejects truncated request" {
 
     var buf: [128]u8 = undefined;
     const req_len = buildTestRequest(&buf, 28, 3, 2804, header_mod.requestHeaderVersion(28, 3));
+    try testing.expect(broker.handleRequest(buf[0..req_len]) == null);
+}
+
+test "Broker.handleRequest DescribeAcls v2 returns generated filtered ACLs" {
+    const Req = generated.describe_acls_request.DescribeAclsRequest;
+    const Resp = generated.describe_acls_response.DescribeAclsResponse;
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+    try broker.authorizer.addAcl("User:alice", .topic, "acl-desc-topic", .literal, .read, .allow, "*");
+    try broker.authorizer.addAcl("User:bob", .topic, "acl-desc-topic", .literal, .write, .allow, "*");
+
+    const req = Req{
+        .resource_type_filter = @intFromEnum(Authorizer.ResourceType.topic),
+        .resource_name_filter = "acl-desc-topic",
+        .pattern_type_filter = @intFromEnum(Authorizer.PatternType.literal),
+        .principal_filter = "User:alice",
+        .host_filter = "*",
+        .operation = @intFromEnum(Authorizer.Operation.read),
+        .permission_type = @intFromEnum(Authorizer.Permission.allow),
+    };
+
+    var buf: [512]u8 = undefined;
+    var pos = buildTestRequest(&buf, 29, 2, 2902, header_mod.requestHeaderVersion(29, 2));
+    req.serialize(&buf, &pos, 2);
+
+    const response = broker.handleRequest(buf[0..pos]);
+    try testing.expect(response != null);
+    defer testing.allocator.free(response.?);
+
+    var rpos: usize = 0;
+    var response_header = try ResponseHeader.deserialize(testing.allocator, response.?, &rpos, header_mod.responseHeaderVersion(29, 2));
+    defer response_header.deinit(testing.allocator);
+    try testing.expectEqual(@as(i32, 2902), response_header.correlation_id);
+
+    const resp = try Resp.deserialize(testing.allocator, response.?, &rpos, 2);
+    defer {
+        for (resp.resources) |resource| {
+            if (resource.acls.len > 0) testing.allocator.free(resource.acls);
+        }
+        if (resp.resources.len > 0) testing.allocator.free(resp.resources);
+    }
+
+    try testing.expectEqual(response.?.len, rpos);
+    try testing.expectEqual(@as(i32, 0), resp.throttle_time_ms);
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.none)), resp.error_code);
+    try testing.expectEqual(@as(usize, 1), resp.resources.len);
+    try testing.expectEqual(@as(i8, @intFromEnum(Authorizer.ResourceType.topic)), resp.resources[0].resource_type);
+    try testing.expectEqualStrings("acl-desc-topic", resp.resources[0].resource_name.?);
+    try testing.expectEqual(@as(i8, @intFromEnum(Authorizer.PatternType.literal)), resp.resources[0].pattern_type);
+    try testing.expectEqual(@as(usize, 1), resp.resources[0].acls.len);
+    try testing.expectEqualStrings("User:alice", resp.resources[0].acls[0].principal.?);
+    try testing.expectEqualStrings("*", resp.resources[0].acls[0].host.?);
+    try testing.expectEqual(@as(i8, @intFromEnum(Authorizer.Operation.read)), resp.resources[0].acls[0].operation);
+    try testing.expectEqual(@as(i8, @intFromEnum(Authorizer.Permission.allow)), resp.resources[0].acls[0].permission_type);
+}
+
+test "Broker.handleRequest DescribeAcls returns invalid_request for unknown enum" {
+    const Req = generated.describe_acls_request.DescribeAclsRequest;
+    const Resp = generated.describe_acls_response.DescribeAclsResponse;
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+    try broker.authorizer.addAcl("User:alice", .topic, "acl-desc-topic", .literal, .read, .allow, "*");
+
+    const req = Req{
+        .resource_type_filter = 127,
+        .resource_name_filter = "acl-desc-topic",
+        .pattern_type_filter = @intFromEnum(Authorizer.PatternType.literal),
+        .principal_filter = "User:alice",
+        .host_filter = "*",
+        .operation = @intFromEnum(Authorizer.Operation.read),
+        .permission_type = @intFromEnum(Authorizer.Permission.allow),
+    };
+
+    var buf: [512]u8 = undefined;
+    var pos = buildTestRequest(&buf, 29, 2, 2903, header_mod.requestHeaderVersion(29, 2));
+    req.serialize(&buf, &pos, 2);
+
+    const response = broker.handleRequest(buf[0..pos]);
+    try testing.expect(response != null);
+    defer testing.allocator.free(response.?);
+
+    var rpos: usize = 0;
+    var response_header = try ResponseHeader.deserialize(testing.allocator, response.?, &rpos, header_mod.responseHeaderVersion(29, 2));
+    defer response_header.deinit(testing.allocator);
+    try testing.expectEqual(@as(i32, 2903), response_header.correlation_id);
+
+    const resp = try Resp.deserialize(testing.allocator, response.?, &rpos, 2);
+    defer if (resp.resources.len > 0) testing.allocator.free(resp.resources);
+
+    try testing.expectEqual(response.?.len, rpos);
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.invalid_request)), resp.error_code);
+    try testing.expectEqual(@as(usize, 0), resp.resources.len);
+}
+
+test "Broker.handleRequest DescribeAcls rejects truncated request" {
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+
+    var buf: [128]u8 = undefined;
+    const req_len = buildTestRequest(&buf, 29, 2, 2904, header_mod.requestHeaderVersion(29, 2));
     try testing.expect(broker.handleRequest(buf[0..req_len]) == null);
 }
 
