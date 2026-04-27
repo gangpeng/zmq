@@ -402,6 +402,16 @@ pub fn build(b: *std.Build) void {
         s3_process_crash_step.dependOn(&run_s3_process_crash.step);
     }
 
+    // External Kafka-client compatibility matrix. The Python test skips unless
+    // ZMQ_RUN_CLIENT_MATRIX=1 is set and requires a running broker plus client
+    // binaries such as kcat or Kafka CLI tools.
+    const client_matrix_step = b.step("test-client-matrix", "Run gated Kafka client compatibility matrix");
+    {
+        const run_client_matrix = b.addSystemCommand(&.{ "python3", "tests/client_matrix_test.py" });
+        run_client_matrix.step.dependOn(b.getInstallStep());
+        client_matrix_step.dependOn(&run_client_matrix.step);
+    }
+
     // ---------------------------------------------------------------
     // Benchmark step
     // ---------------------------------------------------------------
