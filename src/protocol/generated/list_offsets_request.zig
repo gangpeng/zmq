@@ -30,7 +30,9 @@ pub const ListOffsetsRequest = struct {
                     ser.writeI32(buf, pos, self.current_leader_epoch);
                 }
                 ser.writeI64(buf, pos, self.timestamp);
-                ser.writeI32(buf, pos, self.max_num_offsets);
+                if (version == 0) {
+                    ser.writeI32(buf, pos, self.max_num_offsets);
+                }
                 if (version >= 6) ser.writeEmptyTaggedFields(buf, pos);
             }
 
@@ -41,7 +43,9 @@ pub const ListOffsetsRequest = struct {
                     result.current_leader_epoch = ser.readI32(buf, pos);
                 }
                 result.timestamp = ser.readI64(buf, pos);
-                result.max_num_offsets = ser.readI32(buf, pos);
+                if (version == 0) {
+                    result.max_num_offsets = ser.readI32(buf, pos);
+                }
                 if (version >= 6) try ser.skipTaggedFields(buf, pos);
                 return result;
             }
@@ -53,7 +57,9 @@ pub const ListOffsetsRequest = struct {
                     size += 4;
                 }
                 size += 8;
-                size += 4;
+                if (version == 0) {
+                    size += 4;
+                }
                 if (version >= 6) size += 1;
                 return size;
             }

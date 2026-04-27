@@ -2386,65 +2386,115 @@ pub const Broker = struct {
     // ListOffsets (key 2)
     // ---------------------------------------------------------------
     fn handleListOffsets(self: *Broker, request_bytes: []const u8, body_start: usize, req_header: *const RequestHeader, api_version: i16, resp_header_version: i16) ?[]u8 {
-        var pos = body_start;
-        const flexible = api_version >= 6;
-        _ = ser.readI32(request_bytes, &pos); // replica_id
-        if (api_version >= 2) _ = ser.readI8(request_bytes, &pos); // isolation_level
+        const Req = generated.list_offsets_request.ListOffsetsRequest;
+        const Resp = generated.list_offsets_response.ListOffsetsResponse;
+        const TopicResult = Resp.ListOffsetsTopicResponse;
 
-        const num_req_topics = if (flexible)
-            (ser.readCompactArrayLen(request_bytes, &pos) catch 0) orelse 0
-        else
-            (ser.readArrayLen(request_bytes, &pos) catch 0) orelse 0;
-
-        var resp_buf = self.allocator.alloc(u8, 8192) catch return null;
-        var wpos: usize = 0;
-        const resp_header = ResponseHeader{ .correlation_id = req_header.correlation_id };
-        resp_header.serialize(resp_buf, &wpos, resp_header_version);
-        if (api_version >= 2) ser.writeI32(resp_buf, &wpos, 0); // throttle_time_ms
-
-        if (num_req_topics > 0) {
-            if (flexible) ser.writeCompactArrayLen(resp_buf, &wpos, num_req_topics) else ser.writeArrayLen(resp_buf, &wpos, num_req_topics);
-            for (0..num_req_topics) |_| {
-                const topic_name = if (flexible)
-                    ((ser.readCompactString(request_bytes, &pos) catch break) orelse "")
-                else
-                    ((ser.readString(request_bytes, &pos) catch break) orelse "");
-                if (flexible) ser.writeCompactString(resp_buf, &wpos, topic_name) else ser.writeString(resp_buf, &wpos, topic_name);
-
-                const num_parts = if (flexible)
-                    (ser.readCompactArrayLen(request_bytes, &pos) catch 0) orelse 0
-                else
-                    (ser.readArrayLen(request_bytes, &pos) catch 0) orelse 0;
-                if (flexible) ser.writeCompactArrayLen(resp_buf, &wpos, num_parts) else ser.writeArrayLen(resp_buf, &wpos, num_parts);
-
-                for (0..num_parts) |_| {
-                    const part_idx = ser.readI32(request_bytes, &pos);
-                    if (api_version >= 4) _ = ser.readI32(request_bytes, &pos); // current_leader_epoch
-                    const timestamp = ser.readI64(request_bytes, &pos);
-                    if (flexible) ser.skipTaggedFields(request_bytes, &pos) catch {};
-
-                    const pkey = std.fmt.allocPrint(self.allocator, "{s}-{d}", .{ topic_name, part_idx }) catch continue;
-                    defer self.allocator.free(pkey);
-                    const hw: i64 = if (self.store.partitions.get(pkey)) |state| @intCast(state.high_watermark) else 0;
-
-                    ser.writeI32(resp_buf, &wpos, part_idx);
-                    ser.writeI16(resp_buf, &wpos, 0); // error_code
-                    if (api_version == 0) {
-                        ser.writeI64(resp_buf, &wpos, -1); // old_style_offsets (not used)
-                    }
-                    ser.writeI64(resp_buf, &wpos, -1); // timestamp
-                    ser.writeI64(resp_buf, &wpos, if (timestamp == -2) @as(i64, 0) else hw);
-                    if (api_version >= 4) ser.writeI32(resp_buf, &wpos, if (self.raft_state) |rs| rs.current_epoch else self.cached_leader_epoch); // leader_epoch
-                    if (flexible) ser.writeEmptyTaggedFields(resp_buf, &wpos);
-                }
-                if (flexible) ser.writeEmptyTaggedFields(resp_buf, &wpos);
-            }
-        } else {
-            if (flexible) ser.writeCompactArrayLen(resp_buf, &wpos, 0) else ser.writeArrayLen(resp_buf, &wpos, 0);
+        if (!validateListOffsetsRequestFrame(request_bytes, body_start, api_version)) {
+            log.warn("Malformed ListOffsets request", .{});
+            return null;
         }
 
-        if (resp_header_version >= 1) ser.writeEmptyTaggedFields(resp_buf, &wpos);
-        return (self.allocator.realloc(resp_buf, wpos) catch resp_buf)[0..wpos];
+        var pos = body_start;
+        var req = Req.deserialize(self.allocator, request_bytes, &pos, api_version) catch |err| {
+            log.warn("Malformed ListOffsets request: {}", .{err});
+            return null;
+        };
+        defer self.freeListOffsetsRequest(&req);
+
+        var topics: []TopicResult = &.{};
+        if (req.topics.len > 0) {
+            topics = self.allocator.alloc(TopicResult, req.topics.len) catch return null;
+        }
+        var topics_init: usize = 0;
+        defer {
+            self.freeListOffsetsResponseTopics(topics[0..topics_init], api_version);
+            if (topics.len > 0) self.allocator.free(topics);
+        }
+
+        for (req.topics) |topic| {
+            topics[topics_init] = self.buildListOffsetsTopicResponse(topic, api_version) catch return null;
+            topics_init += 1;
+        }
+
+        const resp = Resp{
+            .throttle_time_ms = 0,
+            .topics = topics[0..topics_init],
+        };
+        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+    }
+
+    fn freeListOffsetsRequest(self: *Broker, req: *const generated.list_offsets_request.ListOffsetsRequest) void {
+        for (req.topics) |topic| {
+            if (topic.partitions.len > 0) self.allocator.free(topic.partitions);
+        }
+        if (req.topics.len > 0) self.allocator.free(req.topics);
+    }
+
+    fn freeListOffsetsResponseTopics(self: *Broker, topics: []const generated.list_offsets_response.ListOffsetsResponse.ListOffsetsTopicResponse, api_version: i16) void {
+        for (topics) |topic| {
+            if (api_version == 0) {
+                for (topic.partitions) |partition| {
+                    if (partition.old_style_offsets.len > 0) self.allocator.free(partition.old_style_offsets);
+                }
+            }
+            if (topic.partitions.len > 0) self.allocator.free(topic.partitions);
+        }
+    }
+
+    fn buildListOffsetsTopicResponse(self: *Broker, topic: generated.list_offsets_request.ListOffsetsRequest.ListOffsetsTopic, api_version: i16) !generated.list_offsets_response.ListOffsetsResponse.ListOffsetsTopicResponse {
+        const Resp = generated.list_offsets_response.ListOffsetsResponse;
+        const PartitionResult = Resp.ListOffsetsTopicResponse.ListOffsetsPartitionResponse;
+
+        var partitions: []PartitionResult = &.{};
+        if (topic.partitions.len > 0) {
+            partitions = try self.allocator.alloc(PartitionResult, topic.partitions.len);
+        }
+        var partitions_init: usize = 0;
+        errdefer {
+            if (api_version == 0) {
+                for (partitions[0..partitions_init]) |partition| {
+                    if (partition.old_style_offsets.len > 0) self.allocator.free(partition.old_style_offsets);
+                }
+            }
+            if (partitions.len > 0) self.allocator.free(partitions);
+        }
+
+        const topic_name = topic.name orelse "";
+        for (topic.partitions) |partition_req| {
+            partitions[partitions_init] = try self.buildListOffsetsPartitionResponse(topic_name, partition_req, api_version);
+            partitions_init += 1;
+        }
+
+        return .{
+            .name = topic.name,
+            .partitions = partitions[0..partitions_init],
+        };
+    }
+
+    fn buildListOffsetsPartitionResponse(self: *Broker, topic_name: []const u8, partition_req: generated.list_offsets_request.ListOffsetsRequest.ListOffsetsTopic.ListOffsetsPartition, api_version: i16) !generated.list_offsets_response.ListOffsetsResponse.ListOffsetsTopicResponse.ListOffsetsPartitionResponse {
+        const pkey = try std.fmt.allocPrint(self.allocator, "{s}-{d}", .{ topic_name, partition_req.partition_index });
+        defer self.allocator.free(pkey);
+
+        const offset = if (self.store.partitions.get(pkey)) |state|
+            if (partition_req.timestamp == -2) @as(i64, @intCast(state.log_start_offset)) else @as(i64, @intCast(state.high_watermark))
+        else
+            0;
+
+        var old_style_offsets: []i64 = &.{};
+        if (api_version == 0) {
+            old_style_offsets = try self.allocator.alloc(i64, 1);
+            old_style_offsets[0] = offset;
+        }
+
+        return .{
+            .partition_index = partition_req.partition_index,
+            .error_code = @intFromEnum(ErrorCode.none),
+            .old_style_offsets = old_style_offsets,
+            .timestamp = -1,
+            .offset = offset,
+            .leader_epoch = if (self.raft_state) |rs| rs.current_epoch else self.cached_leader_epoch,
+        };
     }
 
     // ---------------------------------------------------------------
@@ -7657,6 +7707,31 @@ pub const Broker = struct {
         return true;
     }
 
+    fn validateListOffsetsRequestFrame(buf: []const u8, start_pos: usize, api_version: i16) bool {
+        const flexible = api_version >= 6;
+        var pos = start_pos;
+
+        if (!skipFixedBytes(buf, &pos, 4)) return false; // replica_id
+        if (api_version >= 2 and !skipFixedBytes(buf, &pos, 1)) return false; // isolation_level
+
+        const topic_count = readKafkaArrayCount(buf, &pos, flexible) orelse return false;
+        for (0..topic_count) |_| {
+            if (!skipKafkaString(buf, &pos, flexible)) return false; // topic name
+            const partition_count = readKafkaArrayCount(buf, &pos, flexible) orelse return false;
+            for (0..partition_count) |_| {
+                if (!skipFixedBytes(buf, &pos, 4)) return false; // partition_index
+                if (api_version >= 4 and !skipFixedBytes(buf, &pos, 4)) return false; // current_leader_epoch
+                if (!skipFixedBytes(buf, &pos, 8)) return false; // timestamp
+                if (api_version == 0 and !skipFixedBytes(buf, &pos, 4)) return false; // max_num_offsets
+                if (flexible) ser.skipTaggedFields(buf, &pos) catch return false;
+            }
+            if (flexible) ser.skipTaggedFields(buf, &pos) catch return false;
+        }
+
+        if (flexible) ser.skipTaggedFields(buf, &pos) catch return false;
+        return true;
+    }
+
     fn validateSaslHandshakeRequestFrame(buf: []const u8, start_pos: usize) bool {
         var pos = start_pos;
         return skipKafkaString(buf, &pos, false);
@@ -8770,6 +8845,16 @@ fn freeDeserializedDescribeConfigsResponse(resp: *const generated.describe_confi
         if (result.configs.len > 0) testing.allocator.free(result.configs);
     }
     if (resp.results.len > 0) testing.allocator.free(resp.results);
+}
+
+fn freeDeserializedListOffsetsResponse(resp: *const generated.list_offsets_response.ListOffsetsResponse) void {
+    for (resp.topics) |topic| {
+        for (topic.partitions) |partition| {
+            if (partition.old_style_offsets.len > 0) testing.allocator.free(partition.old_style_offsets);
+        }
+        if (topic.partitions.len > 0) testing.allocator.free(topic.partitions);
+    }
+    if (resp.topics.len > 0) testing.allocator.free(resp.topics);
 }
 
 fn expectApiVersionsResponseMatchesCatalog(response: []const u8, api_version: i16, correlation_id: i32) !void {
@@ -12143,32 +12228,156 @@ test "Broker.handleRequest Fetch (key=1) returns produced data" {
     }
 }
 
-test "Broker.handleRequest ListOffsets (key=2) returns offsets" {
+test "Broker.handleRequest ListOffsets v1 returns generated latest offset" {
+    const Req = generated.list_offsets_request.ListOffsetsRequest;
+    const Topic = Req.ListOffsetsTopic;
+    const Partition = Topic.ListOffsetsPartition;
+    const Resp = generated.list_offsets_response.ListOffsetsResponse;
+
     var broker = Broker.init(testing.allocator, 1, 9092);
     defer broker.deinit();
 
-    // Produce to create topic/partition state
     _ = broker.store.produce("lo-test", 0, "data") catch {};
 
-    // ListOffsets v1
-    var buf: [512]u8 = undefined;
-    var pos = buildTestRequest(&buf, 2, 1, 10, 1);
-    ser.writeI32(&buf, &pos, -1); // replica_id
-    // topics array: 1 topic
-    ser.writeI32(&buf, &pos, 1);
-    ser.writeString(&buf, &pos, "lo-test");
-    // partitions array: 1 partition
-    ser.writeI32(&buf, &pos, 1);
-    ser.writeI32(&buf, &pos, 0); // partition_index
-    ser.writeI64(&buf, &pos, -1); // timestamp = -1 (latest)
+    const partitions = [_]Partition{.{
+        .partition_index = 0,
+        .timestamp = -1,
+    }};
+    const topics = [_]Topic{.{
+        .name = "lo-test",
+        .partitions = &partitions,
+    }};
+    const req = Req{
+        .replica_id = -1,
+        .topics = &topics,
+    };
 
-    const resp = broker.handleRequest(buf[0..pos]);
-    try testing.expect(resp != null);
-    defer testing.allocator.free(resp.?);
+    var buf: [512]u8 = undefined;
+    var pos = buildTestRequest(&buf, 2, 1, 10, header_mod.requestHeaderVersion(2, 1));
+    req.serialize(&buf, &pos, 1);
+
+    const response = broker.handleRequest(buf[0..pos]);
+    try testing.expect(response != null);
+    defer testing.allocator.free(response.?);
 
     var rpos: usize = 0;
-    const corr_id = ser.readI32(resp.?, &rpos);
-    try testing.expectEqual(@as(i32, 10), corr_id);
+    var response_header = try ResponseHeader.deserialize(testing.allocator, response.?, &rpos, header_mod.responseHeaderVersion(2, 1));
+    defer response_header.deinit(testing.allocator);
+    try testing.expectEqual(@as(i32, 10), response_header.correlation_id);
+
+    const resp = try Resp.deserialize(testing.allocator, response.?, &rpos, 1);
+    defer freeDeserializedListOffsetsResponse(&resp);
+
+    try testing.expectEqual(response.?.len, rpos);
+    try testing.expectEqual(@as(usize, 1), resp.topics.len);
+    try testing.expectEqualStrings("lo-test", resp.topics[0].name.?);
+    try testing.expectEqual(@as(usize, 1), resp.topics[0].partitions.len);
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.none)), resp.topics[0].partitions[0].error_code);
+    try testing.expectEqual(@as(i64, 1), resp.topics[0].partitions[0].offset);
+}
+
+test "Broker.handleRequest ListOffsets v0 returns old-style offsets" {
+    const Req = generated.list_offsets_request.ListOffsetsRequest;
+    const Topic = Req.ListOffsetsTopic;
+    const Partition = Topic.ListOffsetsPartition;
+    const Resp = generated.list_offsets_response.ListOffsetsResponse;
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+
+    _ = broker.store.produce("lo-v0-test", 0, "data") catch {};
+
+    const partitions = [_]Partition{.{
+        .partition_index = 0,
+        .timestamp = -1,
+        .max_num_offsets = 1,
+    }};
+    const topics = [_]Topic{.{
+        .name = "lo-v0-test",
+        .partitions = &partitions,
+    }};
+    const req = Req{
+        .replica_id = -1,
+        .topics = &topics,
+    };
+
+    var buf: [512]u8 = undefined;
+    var pos = buildTestRequest(&buf, 2, 0, 20, header_mod.requestHeaderVersion(2, 0));
+    req.serialize(&buf, &pos, 0);
+
+    const response = broker.handleRequest(buf[0..pos]);
+    try testing.expect(response != null);
+    defer testing.allocator.free(response.?);
+
+    var rpos: usize = 0;
+    var response_header = try ResponseHeader.deserialize(testing.allocator, response.?, &rpos, header_mod.responseHeaderVersion(2, 0));
+    defer response_header.deinit(testing.allocator);
+    try testing.expectEqual(@as(i32, 20), response_header.correlation_id);
+
+    const resp = try Resp.deserialize(testing.allocator, response.?, &rpos, 0);
+    defer freeDeserializedListOffsetsResponse(&resp);
+
+    try testing.expectEqual(response.?.len, rpos);
+    try testing.expectEqual(@as(usize, 1), resp.topics[0].partitions[0].old_style_offsets.len);
+    try testing.expectEqual(@as(i64, 1), resp.topics[0].partitions[0].old_style_offsets[0]);
+}
+
+test "Broker.handleRequest ListOffsets v6 returns generated flexible earliest offset" {
+    const Req = generated.list_offsets_request.ListOffsetsRequest;
+    const Topic = Req.ListOffsetsTopic;
+    const Partition = Topic.ListOffsetsPartition;
+    const Resp = generated.list_offsets_response.ListOffsetsResponse;
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+
+    _ = broker.store.produce("lo-v6-test", 0, "data") catch {};
+
+    const partitions = [_]Partition{.{
+        .partition_index = 0,
+        .current_leader_epoch = -1,
+        .timestamp = -2,
+    }};
+    const topics = [_]Topic{.{
+        .name = "lo-v6-test",
+        .partitions = &partitions,
+    }};
+    const req = Req{
+        .replica_id = -1,
+        .isolation_level = 0,
+        .topics = &topics,
+    };
+
+    var buf: [512]u8 = undefined;
+    var pos = buildTestRequest(&buf, 2, 6, 26, header_mod.requestHeaderVersion(2, 6));
+    req.serialize(&buf, &pos, 6);
+
+    const response = broker.handleRequest(buf[0..pos]);
+    try testing.expect(response != null);
+    defer testing.allocator.free(response.?);
+
+    var rpos: usize = 0;
+    var response_header = try ResponseHeader.deserialize(testing.allocator, response.?, &rpos, header_mod.responseHeaderVersion(2, 6));
+    defer response_header.deinit(testing.allocator);
+    try testing.expectEqual(@as(i32, 26), response_header.correlation_id);
+
+    const resp = try Resp.deserialize(testing.allocator, response.?, &rpos, 6);
+    defer freeDeserializedListOffsetsResponse(&resp);
+
+    try testing.expectEqual(response.?.len, rpos);
+    try testing.expectEqual(@as(i32, 0), resp.throttle_time_ms);
+    try testing.expectEqual(@as(usize, 1), resp.topics.len);
+    try testing.expectEqual(@as(i64, 0), resp.topics[0].partitions[0].offset);
+    try testing.expectEqual(@as(i32, broker.cached_leader_epoch), resp.topics[0].partitions[0].leader_epoch);
+}
+
+test "Broker.handleRequest ListOffsets rejects truncated request" {
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+
+    var buf: [128]u8 = undefined;
+    const req_len = buildTestRequest(&buf, 2, 6, 27, header_mod.requestHeaderVersion(2, 6));
+    try testing.expect(broker.handleRequest(buf[0..req_len]) == null);
 }
 
 test "Broker.handleRequest JoinGroup (key=11) returns member_id" {

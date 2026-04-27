@@ -26,20 +26,18 @@ pub const ListOffsetsResponse = struct {
             /// The returned offset.
             /// Versions: 1+
             offset: i64 = -1,
-            /// 
+            ///
             /// Versions: 4+
             leader_epoch: i32 = -1,
 
             pub fn serialize(self: *const ListOffsetsPartitionResponse, buf: []u8, pos: *usize, version: i16) void {
                 ser.writeI32(buf, pos, self.partition_index);
                 ser.writeI16(buf, pos, self.error_code);
-                if (version >= 6) {
-                    ser.writeCompactArrayLen(buf, pos, self.old_style_offsets.len);
-                } else {
+                if (version == 0) {
                     ser.writeArrayLen(buf, pos, self.old_style_offsets.len);
-                }
-                for (self.old_style_offsets) |item| {
-                    ser.writeI64(buf, pos, item);
+                    for (self.old_style_offsets) |item| {
+                        ser.writeI64(buf, pos, item);
+                    }
                 }
                 if (version >= 1) {
                     ser.writeI64(buf, pos, self.timestamp);
@@ -57,16 +55,15 @@ pub const ListOffsetsResponse = struct {
                 var result = ListOffsetsPartitionResponse{};
                 result.partition_index = ser.readI32(buf, pos);
                 result.error_code = ser.readI16(buf, pos);
-                const old_style_offsets_len: usize = if (version >= 6)
-                    (try ser.readCompactArrayLen(buf, pos)) orelse 0
-                else
-                    (try ser.readArrayLen(buf, pos)) orelse 0;
-                if (old_style_offsets_len > 0) {
-                    const old_style_offsets_items = try alloc.alloc(i64, old_style_offsets_len);
-                    for (old_style_offsets_items) |*item| {
-                        item.* = ser.readI64(buf, pos);
+                if (version == 0) {
+                    const old_style_offsets_len: usize = (try ser.readArrayLen(buf, pos)) orelse 0;
+                    if (old_style_offsets_len > 0) {
+                        const old_style_offsets_items = try alloc.alloc(i64, old_style_offsets_len);
+                        for (old_style_offsets_items) |*item| {
+                            item.* = ser.readI64(buf, pos);
+                        }
+                        result.old_style_offsets = old_style_offsets_items;
                     }
-                    result.old_style_offsets = old_style_offsets_items;
                 }
                 if (version >= 1) {
                     result.timestamp = ser.readI64(buf, pos);
@@ -85,12 +82,10 @@ pub const ListOffsetsResponse = struct {
                 var size: usize = 0;
                 size += 4;
                 size += 2;
-                if (version >= 6) {
-                    size += ser.unsignedVarintSize(self.old_style_offsets.len + 1);
-                } else {
+                if (version == 0) {
                     size += 4;
+                    size += self.old_style_offsets.len * 8;
                 }
-                size += self.old_style_offsets.len * 8;
                 if (version >= 1) {
                     size += 8;
                 }
