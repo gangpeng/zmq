@@ -13594,6 +13594,66 @@ test "Broker.handleRequest BeginQuorumEpoch applies internal AutoMQ AppendEntrie
     try testing.expectEqualStrings("beta", broker.auto_mq_kvs.get("alpha").?);
 }
 
+test "Broker replays replicated AutoMQ object metadata AppendEntries payload" {
+    const Resp = generated.begin_quorum_epoch_response.BeginQuorumEpochResponse;
+
+    var raft = RaftState.init(testing.allocator, 2, "automq-object-appendentries");
+    defer raft.deinit();
+    try raft.addVoter(1);
+    try raft.addVoter(2);
+    raft.becomeFollower(1, 1);
+
+    var source = Broker.init(testing.allocator, 1, 19094);
+    defer source.deinit();
+    const stream = try source.object_manager.createStream(1);
+    const stream_id = stream.stream_id;
+    const committed_object_id = source.object_manager.prepareObject();
+    try source.object_manager.commitStreamObject(committed_object_id, stream_id, 0, 10, "so/1/0-10", 128);
+    const prepared_only_object_id = source.object_manager.prepareObject();
+    const record = try source.buildAutoMqObjectMetadataRecord();
+    defer source.allocator.free(record);
+
+    var follower = Broker.init(testing.allocator, 2, 19095);
+    defer follower.deinit();
+    follower.setRaftState(&raft);
+
+    var buf: [4096]u8 = undefined;
+    var pos = buildTestRequest(&buf, 53, 0, 5306, header_mod.requestHeaderVersion(53, 0));
+    ser.writeString(&buf, &pos, "");
+    ser.writeI32(&buf, &pos, 0);
+    ser.writeI32(&buf, &pos, 1); // leader_id
+    ser.writeI32(&buf, &pos, 1); // leader_epoch
+    ser.writeI64(&buf, &pos, 0); // prev_log_offset
+    ser.writeI32(&buf, &pos, 0); // prev_log_epoch
+    ser.writeI64(&buf, &pos, 0); // leader_commit
+    ser.writeI64(&buf, &pos, 0); // entries_start_index
+    ser.writeI32(&buf, &pos, 1); // entry_count
+    ser.writeI32(&buf, &pos, @intCast(record.len));
+    @memcpy(buf[pos .. pos + record.len], record);
+    pos += record.len;
+
+    const response = follower.handleRequest(buf[0..pos]);
+    try testing.expect(response != null);
+    defer testing.allocator.free(response.?);
+
+    var rpos: usize = 0;
+    var response_header = try ResponseHeader.deserialize(testing.allocator, response.?, &rpos, header_mod.responseHeaderVersion(53, 0));
+    defer response_header.deinit(testing.allocator);
+    const resp = try Resp.deserialize(testing.allocator, response.?, &rpos, 0);
+    defer if (resp.topics.len > 0) testing.allocator.free(resp.topics);
+
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.none)), resp.error_code);
+    try testing.expectEqual(@as(usize, 1), raft.log.length());
+    try testing.expectEqual(@as(usize, 1), try follower.replayCommittedAutoMqObjectMetadataRecords());
+
+    const restored_stream = follower.object_manager.getStream(stream_id).?;
+    try testing.expectEqual(@as(u64, 10), restored_stream.end_offset);
+    const restored_object = follower.object_manager.stream_objects.get(committed_object_id).?;
+    try testing.expectEqual(stream_id, restored_object.stream_id);
+    try testing.expectEqual(@as(u64, 10), restored_object.end_offset);
+    try testing.expect(follower.object_manager.prepared_registry.contains(prepared_only_object_id));
+}
+
 test "Broker.handleRequest EndQuorumEpoch returns generated not-controller responses" {
     const Req = generated.end_quorum_epoch_request.EndQuorumEpochRequest;
     const Resp = generated.end_quorum_epoch_response.EndQuorumEpochResponse;
