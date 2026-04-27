@@ -20,10 +20,12 @@ pub const FindCoordinatorRequest = struct {
     coordinator_keys: []const ?[]const u8 = &.{},
 
     pub fn serialize(self: *const FindCoordinatorRequest, buf: []u8, pos: *usize, version: i16) void {
-        if (version >= 3) {
-            ser.writeCompactString(buf, pos, self.key);
-        } else {
-            ser.writeString(buf, pos, self.key);
+        if (version <= 3) {
+            if (version >= 3) {
+                ser.writeCompactString(buf, pos, self.key);
+            } else {
+                ser.writeString(buf, pos, self.key);
+            }
         }
         if (version >= 1) {
             ser.writeI8(buf, pos, self.key_type);
@@ -47,10 +49,12 @@ pub const FindCoordinatorRequest = struct {
 
     pub fn deserialize(alloc: Allocator, buf: []const u8, pos: *usize, version: i16) !FindCoordinatorRequest {
         var result = FindCoordinatorRequest{};
-        result.key = if (version >= 3)
-            try ser.readCompactString(buf, pos)
-        else
-            try ser.readString(buf, pos);
+        if (version <= 3) {
+            result.key = if (version >= 3)
+                try ser.readCompactString(buf, pos)
+            else
+                try ser.readString(buf, pos);
+        }
         if (version >= 1) {
             result.key_type = ser.readI8(buf, pos);
         }
@@ -76,10 +80,12 @@ pub const FindCoordinatorRequest = struct {
 
     pub fn calcSize(self: *const FindCoordinatorRequest, version: i16) usize {
         var size: usize = 0;
-        if (version >= 3) {
-            size += ser.compactStringSize(self.key);
-        } else {
-            size += ser.stringSize(self.key);
+        if (version <= 3) {
+            if (version >= 3) {
+                size += ser.compactStringSize(self.key);
+            } else {
+                size += ser.stringSize(self.key);
+            }
         }
         if (version >= 1) {
             size += 1;

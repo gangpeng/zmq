@@ -466,11 +466,15 @@ class CodeGen:
         lines = []
         needs_close = False
 
-        if v_min is not None and v_min > 0:
-            if v_max is not None:
+        has_min_guard = v_min is not None and v_min > 0
+        has_max_guard = v_max is not None
+        if has_min_guard or has_max_guard:
+            if has_min_guard and has_max_guard:
                 lines.append(f'{pad}if (version >= {v_min} and version <= {v_max}) {{')
-            else:
+            elif has_min_guard:
                 lines.append(f'{pad}if (version >= {v_min}) {{')
+            else:
+                lines.append(f'{pad}if (version <= {v_max}) {{')
             needs_close = True
             extra_pad = pad + '    '
         else:
@@ -487,7 +491,7 @@ class CodeGen:
         uses_version = self._flex_check() is not None  # conditional flex check uses version
         for field in non_tagged:
             v_min, v_max = parse_version_range(field.get('versions', '0+'))
-            if v_min is not None and v_min > 0:
+            if (v_min is not None and v_min > 0) or v_max is not None:
                 uses_version = True
             kafka_type = field['type']
             # String/bytes with conditional flex versions use version
@@ -608,7 +612,7 @@ class CodeGen:
         uses_version = self._flex_check() is not None  # conditional flex check uses version
         for field in non_tagged:
             v_min, v_max = parse_version_range(field.get('versions', '0+'))
-            if v_min is not None and v_min > 0:
+            if (v_min is not None and v_min > 0) or v_max is not None:
                 uses_version = True
             kafka_type = field['type']
             if kafka_type in ('string', 'bytes', 'records') and self._flex_check() is not None:
@@ -753,7 +757,7 @@ class CodeGen:
         uses_self = False
         for field in non_tagged:
             v_min, v_max = parse_version_range(field.get('versions', '0+'))
-            if v_min is not None and v_min > 0:
+            if (v_min is not None and v_min > 0) or v_max is not None:
                 uses_version = True
             kafka_type = field['type']
             if kafka_type in ('string', 'bytes', 'records'):

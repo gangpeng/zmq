@@ -159,7 +159,9 @@ pub const FindCoordinatorResponse = struct {
         if (version >= 1) {
             ser.writeI32(buf, pos, self.throttle_time_ms);
         }
-        ser.writeI16(buf, pos, self.error_code);
+        if (version <= 3) {
+            ser.writeI16(buf, pos, self.error_code);
+        }
         if (version >= 1 and version <= 3) {
             if (version >= 3) {
                 ser.writeCompactString(buf, pos, self.error_message);
@@ -167,13 +169,19 @@ pub const FindCoordinatorResponse = struct {
                 ser.writeString(buf, pos, self.error_message);
             }
         }
-        ser.writeI32(buf, pos, self.node_id);
-        if (version >= 3) {
-            ser.writeCompactString(buf, pos, self.host);
-        } else {
-            ser.writeString(buf, pos, self.host);
+        if (version <= 3) {
+            ser.writeI32(buf, pos, self.node_id);
         }
-        ser.writeI32(buf, pos, self.port);
+        if (version <= 3) {
+            if (version >= 3) {
+                ser.writeCompactString(buf, pos, self.host);
+            } else {
+                ser.writeString(buf, pos, self.host);
+            }
+        }
+        if (version <= 3) {
+            ser.writeI32(buf, pos, self.port);
+        }
         if (version >= 4) {
             if (version >= 3) {
                 ser.writeCompactArrayLen(buf, pos, self.coordinators.len);
@@ -192,19 +200,27 @@ pub const FindCoordinatorResponse = struct {
         if (version >= 1) {
             result.throttle_time_ms = ser.readI32(buf, pos);
         }
-        result.error_code = ser.readI16(buf, pos);
+        if (version <= 3) {
+            result.error_code = ser.readI16(buf, pos);
+        }
         if (version >= 1 and version <= 3) {
             result.error_message = if (version >= 3)
                 try ser.readCompactString(buf, pos)
             else
                 try ser.readString(buf, pos);
         }
-        result.node_id = ser.readI32(buf, pos);
-        result.host = if (version >= 3)
-            try ser.readCompactString(buf, pos)
-        else
-            try ser.readString(buf, pos);
-        result.port = ser.readI32(buf, pos);
+        if (version <= 3) {
+            result.node_id = ser.readI32(buf, pos);
+        }
+        if (version <= 3) {
+            result.host = if (version >= 3)
+                try ser.readCompactString(buf, pos)
+            else
+                try ser.readString(buf, pos);
+        }
+        if (version <= 3) {
+            result.port = ser.readI32(buf, pos);
+        }
         if (version >= 4) {
             const coordinators_len: usize = if (version >= 3)
                 (try ser.readCompactArrayLen(buf, pos)) orelse 0
@@ -227,7 +243,9 @@ pub const FindCoordinatorResponse = struct {
         if (version >= 1) {
             size += 4;
         }
-        size += 2;
+        if (version <= 3) {
+            size += 2;
+        }
         if (version >= 1 and version <= 3) {
             if (version >= 3) {
                 size += ser.compactStringSize(self.error_message);
@@ -235,13 +253,19 @@ pub const FindCoordinatorResponse = struct {
                 size += ser.stringSize(self.error_message);
             }
         }
-        size += 4;
-        if (version >= 3) {
-            size += ser.compactStringSize(self.host);
-        } else {
-            size += ser.stringSize(self.host);
+        if (version <= 3) {
+            size += 4;
         }
-        size += 4;
+        if (version <= 3) {
+            if (version >= 3) {
+                size += ser.compactStringSize(self.host);
+            } else {
+                size += ser.stringSize(self.host);
+            }
+        }
+        if (version <= 3) {
+            size += 4;
+        }
         if (version >= 4) {
             if (version >= 3) {
                 size += ser.unsignedVarintSize(self.coordinators.len + 1);
