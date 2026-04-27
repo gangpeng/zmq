@@ -724,7 +724,7 @@ pub const S3Client = struct {
             @memcpy(&payload_hash, AwsSigV4.EMPTY_PAYLOAD_HASH);
         }
 
-        const host_header = try std.fmt.allocPrint(self.allocator, "{s}:{d}", .{ self.host, self.port });
+        const host_header = try self.hostHeader();
         defer self.allocator.free(host_header);
 
         // Sign the request
@@ -795,6 +795,15 @@ pub const S3Client = struct {
     fn requestTarget(alloc: Allocator, path: []const u8, query: []const u8) ![]u8 {
         if (query.len == 0) return try alloc.dupe(u8, path);
         return try std.fmt.allocPrint(alloc, "{s}?{s}", .{ path, query });
+    }
+
+    fn hostHeader(self: *const S3Client) ![]u8 {
+        if ((self.scheme == .https and self.port == 443) or
+            (self.scheme == .http and self.port == 80))
+        {
+            return try self.allocator.dupe(u8, self.host);
+        }
+        return try std.fmt.allocPrint(self.allocator, "{s}:{d}", .{ self.host, self.port });
     }
 
     fn uriEncode(self: *S3Client, value: []const u8) ![]u8 {
@@ -1123,6 +1132,27 @@ test "S3Client normalizes endpoint scheme and port" {
     try testing.expectEqualStrings("minio", minio_client.host);
     try testing.expectEqual(S3Client.Scheme.http, minio_client.scheme);
     try testing.expectEqual(@as(u16, 9000), minio_client.port);
+}
+
+test "S3Client host header omits default provider ports" {
+    const aws_client = S3Client.init(testing.allocator, .{ .host = "https://s3.us-east-1.amazonaws.com" });
+    const aws_host = try aws_client.hostHeader();
+    defer testing.allocator.free(aws_host);
+    try testing.expectEqualStrings("s3.us-east-1.amazonaws.com", aws_host);
+
+    const http_client = S3Client.init(testing.allocator, .{
+        .host = "s3-compatible.local",
+        .port = 80,
+        .scheme = .http,
+    });
+    const http_host = try http_client.hostHeader();
+    defer testing.allocator.free(http_host);
+    try testing.expectEqualStrings("s3-compatible.local", http_host);
+
+    const custom_port_client = S3Client.init(testing.allocator, .{ .host = "https://r2.example.com:8443" });
+    const custom_host = try custom_port_client.hostHeader();
+    defer testing.allocator.free(custom_host);
+    try testing.expectEqualStrings("r2.example.com:8443", custom_host);
 }
 
 test "S3Client request target includes canonical query" {
