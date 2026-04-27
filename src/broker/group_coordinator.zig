@@ -128,7 +128,7 @@ pub const GroupCoordinator = struct {
 
     /// Handle JoinGroup request. Returns the member ID and whether this member is the leader.
     /// Supports group_instance_id for static membership.
-    /// 
+    ///
     /// After all members have joined, state transitions to
     /// COMPLETING_REBALANCE (not directly to STABLE). STABLE is reached only
     /// after the leader sends SyncGroup with assignments.
@@ -749,6 +749,48 @@ pub const GroupCoordinator = struct {
         defer self.allocator.free(key);
 
         return self.committed_offsets.get(key);
+    }
+
+    pub const CommittedOffset = struct {
+        topic: []const u8,
+        partition: i32,
+        offset: i64,
+    };
+
+    /// Return all committed offsets for a group, sorted by topic and partition.
+    /// Topic slices are borrowed from the coordinator's committed-offset keys.
+    pub fn listCommittedOffsets(self: *const GroupCoordinator, allocator: Allocator, group_id: []const u8) ![]CommittedOffset {
+        var offsets = std.array_list.Managed(CommittedOffset).init(allocator);
+        errdefer offsets.deinit();
+
+        var it = self.committed_offsets.iterator();
+        while (it.next()) |entry| {
+            const key = entry.key_ptr.*;
+            if (key.len <= group_id.len or key[group_id.len] != ':' or !std.mem.startsWith(u8, key, group_id)) {
+                continue;
+            }
+
+            const rest = key[group_id.len + 1 ..];
+            const partition_sep = std.mem.lastIndexOfScalar(u8, rest, ':') orelse continue;
+            if (partition_sep == 0 or partition_sep + 1 >= rest.len) continue;
+
+            const partition = std.fmt.parseInt(i32, rest[partition_sep + 1 ..], 10) catch continue;
+            try offsets.append(.{
+                .topic = rest[0..partition_sep],
+                .partition = partition,
+                .offset = entry.value_ptr.*,
+            });
+        }
+
+        std.mem.sort(CommittedOffset, offsets.items, {}, struct {
+            fn lessThan(_: void, a: CommittedOffset, b: CommittedOffset) bool {
+                const topic_order = std.mem.order(u8, a.topic, b.topic);
+                if (topic_order != .eq) return topic_order == .lt;
+                return a.partition < b.partition;
+            }
+        }.lessThan);
+
+        return try offsets.toOwnedSlice();
     }
 
     pub fn groupCount(self: *const GroupCoordinator) usize {

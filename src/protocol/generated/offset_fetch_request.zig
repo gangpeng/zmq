@@ -18,38 +18,46 @@ pub const OffsetFetchRequest = struct {
         partition_indexes: []const i32 = &.{},
 
         pub fn serialize(self: *const OffsetFetchRequestTopic, buf: []u8, pos: *usize, version: i16) void {
-            if (version >= 6) {
-                ser.writeCompactString(buf, pos, self.name);
-            } else {
-                ser.writeString(buf, pos, self.name);
+            if (version <= 7) {
+                if (version >= 6) {
+                    ser.writeCompactString(buf, pos, self.name);
+                } else {
+                    ser.writeString(buf, pos, self.name);
+                }
             }
-            if (version >= 6) {
-                ser.writeCompactArrayLen(buf, pos, self.partition_indexes.len);
-            } else {
-                ser.writeArrayLen(buf, pos, self.partition_indexes.len);
-            }
-            for (self.partition_indexes) |item| {
-                ser.writeI32(buf, pos, item);
+            if (version <= 7) {
+                if (version >= 6) {
+                    ser.writeCompactArrayLen(buf, pos, self.partition_indexes.len);
+                } else {
+                    ser.writeArrayLen(buf, pos, self.partition_indexes.len);
+                }
+                for (self.partition_indexes) |item| {
+                    ser.writeI32(buf, pos, item);
+                }
             }
             if (version >= 6) ser.writeEmptyTaggedFields(buf, pos);
         }
 
         pub fn deserialize(alloc: Allocator, buf: []const u8, pos: *usize, version: i16) !OffsetFetchRequestTopic {
             var result = OffsetFetchRequestTopic{};
-            result.name = if (version >= 6)
-                try ser.readCompactString(buf, pos)
-            else
-                try ser.readString(buf, pos);
-            const partition_indexes_len: usize = if (version >= 6)
-                (try ser.readCompactArrayLen(buf, pos)) orelse 0
-            else
-                (try ser.readArrayLen(buf, pos)) orelse 0;
-            if (partition_indexes_len > 0) {
-                const partition_indexes_items = try alloc.alloc(i32, partition_indexes_len);
-                for (partition_indexes_items) |*item| {
-                    item.* = ser.readI32(buf, pos);
+            if (version <= 7) {
+                result.name = if (version >= 6)
+                    try ser.readCompactString(buf, pos)
+                else
+                    try ser.readString(buf, pos);
+            }
+            if (version <= 7) {
+                const partition_indexes_len: usize = if (version >= 6)
+                    (try ser.readCompactArrayLen(buf, pos)) orelse 0
+                else
+                    (try ser.readArrayLen(buf, pos)) orelse 0;
+                if (partition_indexes_len > 0) {
+                    const partition_indexes_items = try alloc.alloc(i32, partition_indexes_len);
+                    for (partition_indexes_items) |*item| {
+                        item.* = ser.readI32(buf, pos);
+                    }
+                    result.partition_indexes = partition_indexes_items;
                 }
-                result.partition_indexes = partition_indexes_items;
             }
             if (version >= 6) try ser.skipTaggedFields(buf, pos);
             return result;
@@ -57,17 +65,21 @@ pub const OffsetFetchRequest = struct {
 
         pub fn calcSize(self: *const OffsetFetchRequestTopic, version: i16) usize {
             var size: usize = 0;
-            if (version >= 6) {
-                size += ser.compactStringSize(self.name);
-            } else {
-                size += ser.stringSize(self.name);
+            if (version <= 7) {
+                if (version >= 6) {
+                    size += ser.compactStringSize(self.name);
+                } else {
+                    size += ser.stringSize(self.name);
+                }
             }
-            if (version >= 6) {
-                size += ser.unsignedVarintSize(self.partition_indexes.len + 1);
-            } else {
-                size += 4;
+            if (version <= 7) {
+                if (version >= 6) {
+                    size += ser.unsignedVarintSize(self.partition_indexes.len + 1);
+                } else {
+                    size += 4;
+                }
+                size += self.partition_indexes.len * 4;
             }
-            size += self.partition_indexes.len * 4;
             if (version >= 6) size += 1;
             return size;
         }
@@ -276,18 +288,22 @@ pub const OffsetFetchRequest = struct {
     require_stable: bool = false,
 
     pub fn serialize(self: *const OffsetFetchRequest, buf: []u8, pos: *usize, version: i16) void {
-        if (version >= 6) {
-            ser.writeCompactString(buf, pos, self.group_id);
-        } else {
-            ser.writeString(buf, pos, self.group_id);
+        if (version <= 7) {
+            if (version >= 6) {
+                ser.writeCompactString(buf, pos, self.group_id);
+            } else {
+                ser.writeString(buf, pos, self.group_id);
+            }
         }
-        if (version >= 6) {
-            ser.writeCompactArrayLen(buf, pos, self.topics.len);
-        } else {
-            ser.writeArrayLen(buf, pos, self.topics.len);
-        }
-        for (self.topics) |item| {
-            item.serialize(buf, pos, version);
+        if (version <= 7) {
+            if (version >= 6) {
+                ser.writeCompactArrayLen(buf, pos, self.topics.len);
+            } else {
+                ser.writeArrayLen(buf, pos, self.topics.len);
+            }
+            for (self.topics) |item| {
+                item.serialize(buf, pos, version);
+            }
         }
         if (version >= 8) {
             if (version >= 6) {
@@ -307,20 +323,24 @@ pub const OffsetFetchRequest = struct {
 
     pub fn deserialize(alloc: Allocator, buf: []const u8, pos: *usize, version: i16) !OffsetFetchRequest {
         var result = OffsetFetchRequest{};
-        result.group_id = if (version >= 6)
-            try ser.readCompactString(buf, pos)
-        else
-            try ser.readString(buf, pos);
-        const topics_len: usize = if (version >= 6)
-            (try ser.readCompactArrayLen(buf, pos)) orelse 0
-        else
-            (try ser.readArrayLen(buf, pos)) orelse 0;
-        if (topics_len > 0) {
-            const topics_items = try alloc.alloc(OffsetFetchRequestTopic, topics_len);
-            for (topics_items) |*item| {
-                item.* = try OffsetFetchRequestTopic.deserialize(alloc, buf, pos, version);
+        if (version <= 7) {
+            result.group_id = if (version >= 6)
+                try ser.readCompactString(buf, pos)
+            else
+                try ser.readString(buf, pos);
+        }
+        if (version <= 7) {
+            const topics_len: usize = if (version >= 6)
+                (try ser.readCompactArrayLen(buf, pos)) orelse 0
+            else
+                (try ser.readArrayLen(buf, pos)) orelse 0;
+            if (topics_len > 0) {
+                const topics_items = try alloc.alloc(OffsetFetchRequestTopic, topics_len);
+                for (topics_items) |*item| {
+                    item.* = try OffsetFetchRequestTopic.deserialize(alloc, buf, pos, version);
+                }
+                result.topics = topics_items;
             }
-            result.topics = topics_items;
         }
         if (version >= 8) {
             const groups_len: usize = if (version >= 6)
@@ -344,18 +364,22 @@ pub const OffsetFetchRequest = struct {
 
     pub fn calcSize(self: *const OffsetFetchRequest, version: i16) usize {
         var size: usize = 0;
-        if (version >= 6) {
-            size += ser.compactStringSize(self.group_id);
-        } else {
-            size += ser.stringSize(self.group_id);
+        if (version <= 7) {
+            if (version >= 6) {
+                size += ser.compactStringSize(self.group_id);
+            } else {
+                size += ser.stringSize(self.group_id);
+            }
         }
-        if (version >= 6) {
-            size += ser.unsignedVarintSize(self.topics.len + 1);
-        } else {
-            size += 4;
-        }
-        for (self.topics) |item| {
-            size += item.calcSize(version);
+        if (version <= 7) {
+            if (version >= 6) {
+                size += ser.unsignedVarintSize(self.topics.len + 1);
+            } else {
+                size += 4;
+            }
+            for (self.topics) |item| {
+                size += item.calcSize(version);
+            }
         }
         if (version >= 8) {
             if (version >= 6) {

@@ -1581,12 +1581,13 @@ pub const Broker = struct {
             return @bitCast(std.mem.readInt(u16, resp[p..][0..2], .big));
         }
 
+        if (api_key == 9) return 0; // OffsetFetch errors are topic/group scoped, not at a fixed top-level offset.
         if (api_key == 10 and api_version >= 4) return 0; // FindCoordinator v4+ has coordinator-scoped errors.
 
         // APIs with throttle_time_ms before error_code
         const has_throttle = switch (api_key) {
             // Most APIs v1+ have throttle_time_ms; for simplicity track the common ones
-            8, 9, 10, 11, 12, 13, 14, 22, 25, 26 => api_version >= 1,
+            8, 10, 11, 12, 13, 14, 22, 25, 26 => api_version >= 1,
             18 => false, // ApiVersions: error_code is right after header
             else => false,
         };
@@ -2757,52 +2758,363 @@ pub const Broker = struct {
     // OffsetFetch (key 9)
     // ---------------------------------------------------------------
     fn handleOffsetFetch(self: *Broker, request_bytes: []const u8, body_start: usize, req_header: *const RequestHeader, api_version: i16, resp_header_version: i16) ?[]u8 {
-        var pos = body_start;
-        const flexible = api_version >= 6;
-        const group_id = if (flexible)
-            ((ser.readCompactString(request_bytes, &pos) catch return null) orelse "")
-        else
-            ((ser.readString(request_bytes, &pos) catch return null) orelse "");
+        const Req = generated.offset_fetch_request.OffsetFetchRequest;
+        const Resp = generated.offset_fetch_response.OffsetFetchResponse;
+        const GroupResponse = Resp.OffsetFetchResponseGroup;
 
-        const num_topics = if (flexible)
-            (ser.readCompactArrayLen(request_bytes, &pos) catch return null) orelse 0
-        else
-            @as(usize, @intCast(@max(ser.readI32(request_bytes, &pos), 0)));
-
-        var resp_buf = self.allocator.alloc(u8, 4096) catch return null;
-        var wpos: usize = 0;
-        const resp_header = ResponseHeader{ .correlation_id = req_header.correlation_id };
-        resp_header.serialize(resp_buf, &wpos, resp_header_version);
-        if (api_version >= 3) ser.writeI32(resp_buf, &wpos, 0); // throttle_time_ms
-        if (flexible) ser.writeCompactArrayLen(resp_buf, &wpos, num_topics) else ser.writeArrayLen(resp_buf, &wpos, num_topics);
-
-        for (0..num_topics) |_| {
-            const topic_name = if (flexible)
-                ((ser.readCompactString(request_bytes, &pos) catch return null) orelse "")
-            else
-                ((ser.readString(request_bytes, &pos) catch return null) orelse "");
-            if (flexible) ser.writeCompactString(resp_buf, &wpos, topic_name) else ser.writeString(resp_buf, &wpos, topic_name);
-
-            const num_partitions = if (flexible)
-                (ser.readCompactArrayLen(request_bytes, &pos) catch return null) orelse 0
-            else
-                @as(usize, @intCast(@max(ser.readI32(request_bytes, &pos), 0)));
-            if (flexible) ser.writeCompactArrayLen(resp_buf, &wpos, num_partitions) else ser.writeArrayLen(resp_buf, &wpos, num_partitions);
-
-            for (0..num_partitions) |_| {
-                const partition_id = ser.readI32(request_bytes, &pos);
-                const committed = self.groups.fetchOffset(group_id, topic_name, partition_id) catch null;
-                ser.writeI32(resp_buf, &wpos, partition_id);
-                ser.writeI64(resp_buf, &wpos, committed orelse -1);
-                if (flexible) ser.writeCompactString(resp_buf, &wpos, null) else ser.writeString(resp_buf, &wpos, null); // metadata
-                ser.writeI16(resp_buf, &wpos, 0);
-                if (flexible) ser.writeEmptyTaggedFields(resp_buf, &wpos);
-            }
-            if (flexible) ser.writeEmptyTaggedFields(resp_buf, &wpos);
+        if (!validateOffsetFetchRequestFrame(request_bytes, body_start, api_version)) {
+            log.warn("Malformed OffsetFetch request", .{});
+            return null;
         }
-        if (api_version >= 2) ser.writeI16(resp_buf, &wpos, 0); // error_code (v2+)
-        if (resp_header_version >= 1) ser.writeEmptyTaggedFields(resp_buf, &wpos);
-        return (self.allocator.realloc(resp_buf, wpos) catch resp_buf)[0..wpos];
+
+        const legacy_fetch_all = if (api_version <= 7)
+            offsetFetchLegacyTopicsAreNull(request_bytes, body_start, api_version) orelse return null
+        else
+            false;
+
+        var group_fetch_all_flags: []const bool = &.{};
+        if (api_version >= 8) {
+            group_fetch_all_flags = self.readOffsetFetchGroupFetchAllFlags(request_bytes, body_start, api_version) orelse return null;
+        }
+        defer {
+            if (group_fetch_all_flags.len > 0) self.allocator.free(group_fetch_all_flags);
+        }
+
+        var pos = body_start;
+        var req = Req.deserialize(self.allocator, request_bytes, &pos, api_version) catch |err| {
+            log.warn("Malformed OffsetFetch request: {}", .{err});
+            return null;
+        };
+        defer self.freeOffsetFetchRequest(&req);
+
+        if (api_version >= 8) {
+            if (group_fetch_all_flags.len != req.groups.len) return null;
+
+            var groups: []GroupResponse = &.{};
+            if (req.groups.len > 0) {
+                groups = self.allocator.alloc(GroupResponse, req.groups.len) catch return null;
+            }
+            var groups_init: usize = 0;
+            defer {
+                self.freeOffsetFetchGroups(groups[0..groups_init]);
+                if (groups.len > 0) self.allocator.free(groups);
+            }
+
+            for (req.groups, 0..) |group_req, group_idx| {
+                const group_id = group_req.group_id orelse "";
+                const topics = if (group_fetch_all_flags[group_idx])
+                    self.buildOffsetFetchGroupAllTopics(group_id) orelse return null
+                else
+                    self.buildOffsetFetchGroupRequestedTopics(group_id, group_req.topics) orelse return null;
+
+                groups[groups_init] = .{
+                    .group_id = group_req.group_id,
+                    .topics = topics,
+                    .error_code = @intFromEnum(ErrorCode.none),
+                };
+                groups_init += 1;
+            }
+
+            const resp = Resp{
+                .throttle_time_ms = 0,
+                .groups = groups[0..groups_init],
+            };
+            return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+        }
+
+        const group_id = req.group_id orelse "";
+        const topics = if (legacy_fetch_all)
+            self.buildOffsetFetchLegacyAllTopics(group_id) orelse return null
+        else
+            self.buildOffsetFetchLegacyRequestedTopics(group_id, req.topics) orelse return null;
+        defer self.freeOffsetFetchLegacyTopics(topics);
+
+        const resp = Resp{
+            .throttle_time_ms = 0,
+            .topics = topics,
+            .error_code = @intFromEnum(ErrorCode.none),
+        };
+        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+    }
+
+    fn freeOffsetFetchRequest(self: *Broker, req: *const generated.offset_fetch_request.OffsetFetchRequest) void {
+        for (req.topics) |topic| {
+            if (topic.partition_indexes.len > 0) self.allocator.free(topic.partition_indexes);
+        }
+        if (req.topics.len > 0) self.allocator.free(req.topics);
+
+        for (req.groups) |group| {
+            for (group.topics) |topic| {
+                if (topic.partition_indexes.len > 0) self.allocator.free(topic.partition_indexes);
+            }
+            if (group.topics.len > 0) self.allocator.free(group.topics);
+        }
+        if (req.groups.len > 0) self.allocator.free(req.groups);
+    }
+
+    fn buildOffsetFetchLegacyRequestedTopics(
+        self: *Broker,
+        group_id: []const u8,
+        requested_topics: []const generated.offset_fetch_request.OffsetFetchRequest.OffsetFetchRequestTopic,
+    ) ?[]const generated.offset_fetch_response.OffsetFetchResponse.OffsetFetchResponseTopic {
+        const TopicResponse = generated.offset_fetch_response.OffsetFetchResponse.OffsetFetchResponseTopic;
+        const PartitionResponse = TopicResponse.OffsetFetchResponsePartition;
+
+        if (requested_topics.len == 0) return &.{};
+
+        const topics = self.allocator.alloc(TopicResponse, requested_topics.len) catch return null;
+        var topics_init: usize = 0;
+        var success = false;
+        defer {
+            if (!success) {
+                self.freeOffsetFetchLegacyTopicPartitions(topics[0..topics_init]);
+                if (topics.len > 0) self.allocator.free(topics);
+            }
+        }
+
+        for (requested_topics) |topic_req| {
+            var partitions: []const PartitionResponse = &.{};
+            if (topic_req.partition_indexes.len > 0) {
+                const writable = self.allocator.alloc(PartitionResponse, topic_req.partition_indexes.len) catch return null;
+                var transferred = false;
+                defer {
+                    if (!transferred and writable.len > 0) self.allocator.free(writable);
+                }
+
+                const topic_name = topic_req.name orelse "";
+                for (topic_req.partition_indexes, 0..) |partition_id, partition_idx| {
+                    const committed = self.groups.fetchOffset(group_id, topic_name, partition_id) catch null;
+                    writable[partition_idx] = .{
+                        .partition_index = partition_id,
+                        .committed_offset = committed orelse -1,
+                        .committed_leader_epoch = -1,
+                        .metadata = null,
+                        .error_code = @intFromEnum(ErrorCode.none),
+                    };
+                }
+                partitions = writable;
+                transferred = true;
+            }
+
+            topics[topics_init] = .{
+                .name = topic_req.name,
+                .partitions = partitions,
+            };
+            topics_init += 1;
+        }
+
+        success = true;
+        return topics[0..topics_init];
+    }
+
+    fn buildOffsetFetchLegacyAllTopics(self: *Broker, group_id: []const u8) ?[]const generated.offset_fetch_response.OffsetFetchResponse.OffsetFetchResponseTopic {
+        const TopicResponse = generated.offset_fetch_response.OffsetFetchResponse.OffsetFetchResponseTopic;
+        const PartitionResponse = TopicResponse.OffsetFetchResponsePartition;
+
+        const offsets = self.groups.listCommittedOffsets(self.allocator, group_id) catch return null;
+        defer {
+            if (offsets.len > 0) self.allocator.free(offsets);
+        }
+        if (offsets.len == 0) return &.{};
+
+        const topic_count = countCommittedOffsetTopics(offsets);
+        const topics = self.allocator.alloc(TopicResponse, topic_count) catch return null;
+        var topics_init: usize = 0;
+        var success = false;
+        defer {
+            if (!success) {
+                self.freeOffsetFetchLegacyTopicPartitions(topics[0..topics_init]);
+                if (topics.len > 0) self.allocator.free(topics);
+            }
+        }
+
+        var offset_idx: usize = 0;
+        while (offset_idx < offsets.len) {
+            const topic_name = offsets[offset_idx].topic;
+            const start = offset_idx;
+            while (offset_idx < offsets.len and std.mem.eql(u8, offsets[offset_idx].topic, topic_name)) {
+                offset_idx += 1;
+            }
+
+            const partitions = self.allocator.alloc(PartitionResponse, offset_idx - start) catch return null;
+            var transferred = false;
+            defer {
+                if (!transferred and partitions.len > 0) self.allocator.free(partitions);
+            }
+
+            for (offsets[start..offset_idx], 0..) |offset, partition_idx| {
+                partitions[partition_idx] = .{
+                    .partition_index = offset.partition,
+                    .committed_offset = offset.offset,
+                    .committed_leader_epoch = -1,
+                    .metadata = null,
+                    .error_code = @intFromEnum(ErrorCode.none),
+                };
+            }
+
+            topics[topics_init] = .{
+                .name = topic_name,
+                .partitions = partitions,
+            };
+            topics_init += 1;
+            transferred = true;
+        }
+
+        success = true;
+        return topics[0..topics_init];
+    }
+
+    fn freeOffsetFetchLegacyTopics(self: *Broker, topics: []const generated.offset_fetch_response.OffsetFetchResponse.OffsetFetchResponseTopic) void {
+        self.freeOffsetFetchLegacyTopicPartitions(topics);
+        if (topics.len > 0) self.allocator.free(topics);
+    }
+
+    fn freeOffsetFetchLegacyTopicPartitions(self: *Broker, topics: []const generated.offset_fetch_response.OffsetFetchResponse.OffsetFetchResponseTopic) void {
+        for (topics) |topic| {
+            if (topic.partitions.len > 0) self.allocator.free(topic.partitions);
+        }
+    }
+
+    fn buildOffsetFetchGroupRequestedTopics(
+        self: *Broker,
+        group_id: []const u8,
+        requested_topics: []const generated.offset_fetch_request.OffsetFetchRequest.OffsetFetchRequestGroup.OffsetFetchRequestTopics,
+    ) ?[]const generated.offset_fetch_response.OffsetFetchResponse.OffsetFetchResponseGroup.OffsetFetchResponseTopics {
+        const TopicResponse = generated.offset_fetch_response.OffsetFetchResponse.OffsetFetchResponseGroup.OffsetFetchResponseTopics;
+        const PartitionResponse = TopicResponse.OffsetFetchResponsePartitions;
+
+        if (requested_topics.len == 0) return &.{};
+
+        const topics = self.allocator.alloc(TopicResponse, requested_topics.len) catch return null;
+        var topics_init: usize = 0;
+        var success = false;
+        defer {
+            if (!success) {
+                self.freeOffsetFetchGroupTopicPartitions(topics[0..topics_init]);
+                if (topics.len > 0) self.allocator.free(topics);
+            }
+        }
+
+        for (requested_topics) |topic_req| {
+            var partitions: []const PartitionResponse = &.{};
+            if (topic_req.partition_indexes.len > 0) {
+                const writable = self.allocator.alloc(PartitionResponse, topic_req.partition_indexes.len) catch return null;
+                var transferred = false;
+                defer {
+                    if (!transferred and writable.len > 0) self.allocator.free(writable);
+                }
+
+                const topic_name = topic_req.name orelse "";
+                for (topic_req.partition_indexes, 0..) |partition_id, partition_idx| {
+                    const committed = self.groups.fetchOffset(group_id, topic_name, partition_id) catch null;
+                    writable[partition_idx] = .{
+                        .partition_index = partition_id,
+                        .committed_offset = committed orelse -1,
+                        .committed_leader_epoch = -1,
+                        .metadata = null,
+                        .error_code = @intFromEnum(ErrorCode.none),
+                    };
+                }
+                partitions = writable;
+                transferred = true;
+            }
+
+            topics[topics_init] = .{
+                .name = topic_req.name,
+                .partitions = partitions,
+            };
+            topics_init += 1;
+        }
+
+        success = true;
+        return topics[0..topics_init];
+    }
+
+    fn buildOffsetFetchGroupAllTopics(self: *Broker, group_id: []const u8) ?[]const generated.offset_fetch_response.OffsetFetchResponse.OffsetFetchResponseGroup.OffsetFetchResponseTopics {
+        const TopicResponse = generated.offset_fetch_response.OffsetFetchResponse.OffsetFetchResponseGroup.OffsetFetchResponseTopics;
+        const PartitionResponse = TopicResponse.OffsetFetchResponsePartitions;
+
+        const offsets = self.groups.listCommittedOffsets(self.allocator, group_id) catch return null;
+        defer {
+            if (offsets.len > 0) self.allocator.free(offsets);
+        }
+        if (offsets.len == 0) return &.{};
+
+        const topic_count = countCommittedOffsetTopics(offsets);
+        const topics = self.allocator.alloc(TopicResponse, topic_count) catch return null;
+        var topics_init: usize = 0;
+        var success = false;
+        defer {
+            if (!success) {
+                self.freeOffsetFetchGroupTopicPartitions(topics[0..topics_init]);
+                if (topics.len > 0) self.allocator.free(topics);
+            }
+        }
+
+        var offset_idx: usize = 0;
+        while (offset_idx < offsets.len) {
+            const topic_name = offsets[offset_idx].topic;
+            const start = offset_idx;
+            while (offset_idx < offsets.len and std.mem.eql(u8, offsets[offset_idx].topic, topic_name)) {
+                offset_idx += 1;
+            }
+
+            const partitions = self.allocator.alloc(PartitionResponse, offset_idx - start) catch return null;
+            var transferred = false;
+            defer {
+                if (!transferred and partitions.len > 0) self.allocator.free(partitions);
+            }
+
+            for (offsets[start..offset_idx], 0..) |offset, partition_idx| {
+                partitions[partition_idx] = .{
+                    .partition_index = offset.partition,
+                    .committed_offset = offset.offset,
+                    .committed_leader_epoch = -1,
+                    .metadata = null,
+                    .error_code = @intFromEnum(ErrorCode.none),
+                };
+            }
+
+            topics[topics_init] = .{
+                .name = topic_name,
+                .partitions = partitions,
+            };
+            topics_init += 1;
+            transferred = true;
+        }
+
+        success = true;
+        return topics[0..topics_init];
+    }
+
+    fn freeOffsetFetchGroups(self: *Broker, groups: []const generated.offset_fetch_response.OffsetFetchResponse.OffsetFetchResponseGroup) void {
+        for (groups) |group| {
+            self.freeOffsetFetchGroupTopics(group.topics);
+        }
+    }
+
+    fn freeOffsetFetchGroupTopics(self: *Broker, topics: []const generated.offset_fetch_response.OffsetFetchResponse.OffsetFetchResponseGroup.OffsetFetchResponseTopics) void {
+        self.freeOffsetFetchGroupTopicPartitions(topics);
+        if (topics.len > 0) self.allocator.free(topics);
+    }
+
+    fn freeOffsetFetchGroupTopicPartitions(self: *Broker, topics: []const generated.offset_fetch_response.OffsetFetchResponse.OffsetFetchResponseGroup.OffsetFetchResponseTopics) void {
+        for (topics) |topic| {
+            if (topic.partitions.len > 0) self.allocator.free(topic.partitions);
+        }
+    }
+
+    fn countCommittedOffsetTopics(offsets: []const GroupCoordinator.CommittedOffset) usize {
+        if (offsets.len == 0) return 0;
+        var count: usize = 1;
+        var previous = offsets[0].topic;
+        for (offsets[1..]) |offset| {
+            if (!std.mem.eql(u8, previous, offset.topic)) {
+                count += 1;
+                previous = offset.topic;
+            }
+        }
+        return count;
     }
 
     // ---------------------------------------------------------------
@@ -7183,6 +7495,86 @@ pub const Broker = struct {
         return true;
     }
 
+    fn validateOffsetFetchRequestFrame(buf: []const u8, start_pos: usize, api_version: i16) bool {
+        const flexible = api_version >= 6;
+        var pos = start_pos;
+
+        if (api_version <= 7) {
+            if (!skipKafkaString(buf, &pos, flexible)) return false; // group_id
+            const topics = readKafkaArrayHeader(buf, &pos, flexible) orelse return false;
+            if (topics.is_null and api_version < 2) return false;
+            if (!topics.is_null and !skipOffsetFetchTopics(buf, &pos, flexible, topics.count)) return false;
+        } else {
+            const groups = readKafkaArrayHeader(buf, &pos, true) orelse return false;
+            if (groups.is_null) return false;
+            for (0..groups.count) |_| {
+                if (!skipKafkaString(buf, &pos, true)) return false; // group_id
+                if (api_version >= 9) {
+                    if (!skipKafkaString(buf, &pos, true)) return false; // member_id
+                    if (!skipFixedBytes(buf, &pos, 4)) return false; // member_epoch
+                }
+                const topics = readKafkaArrayHeader(buf, &pos, true) orelse return false;
+                if (!topics.is_null and !skipOffsetFetchTopics(buf, &pos, true, topics.count)) return false;
+                ser.skipTaggedFields(buf, &pos) catch return false;
+            }
+        }
+
+        if (api_version >= 7 and !skipFixedBytes(buf, &pos, 1)) return false; // require_stable
+        if (flexible) ser.skipTaggedFields(buf, &pos) catch return false;
+        return true;
+    }
+
+    fn offsetFetchLegacyTopicsAreNull(buf: []const u8, start_pos: usize, api_version: i16) ?bool {
+        if (api_version < 2 or api_version > 7) return false;
+        const flexible = api_version >= 6;
+        var pos = start_pos;
+
+        if (!skipKafkaString(buf, &pos, flexible)) return null; // group_id
+        const topics = readKafkaArrayHeader(buf, &pos, flexible) orelse return null;
+        return topics.is_null;
+    }
+
+    fn readOffsetFetchGroupFetchAllFlags(self: *Broker, buf: []const u8, start_pos: usize, api_version: i16) ?[]const bool {
+        var pos = start_pos;
+        const groups = readKafkaArrayHeader(buf, &pos, true) orelse return null;
+        if (groups.is_null) return null;
+        if (groups.count == 0) return &.{};
+
+        const flags = self.allocator.alloc(bool, groups.count) catch return null;
+        var success = false;
+        defer {
+            if (!success) self.allocator.free(flags);
+        }
+
+        for (0..groups.count) |group_idx| {
+            if (!skipKafkaString(buf, &pos, true)) return null; // group_id
+            if (api_version >= 9) {
+                if (!skipKafkaString(buf, &pos, true)) return null; // member_id
+                if (!skipFixedBytes(buf, &pos, 4)) return null; // member_epoch
+            }
+
+            const topics = readKafkaArrayHeader(buf, &pos, true) orelse return null;
+            flags[group_idx] = topics.is_null;
+            if (!topics.is_null and !skipOffsetFetchTopics(buf, &pos, true, topics.count)) return null;
+            ser.skipTaggedFields(buf, &pos) catch return null;
+        }
+
+        if (api_version >= 7 and !skipFixedBytes(buf, &pos, 1)) return null; // require_stable
+        ser.skipTaggedFields(buf, &pos) catch return null;
+
+        success = true;
+        return flags;
+    }
+
+    fn skipOffsetFetchTopics(buf: []const u8, pos: *usize, flexible: bool, topic_count: usize) bool {
+        for (0..topic_count) |_| {
+            if (!skipKafkaString(buf, pos, flexible)) return false; // topic name
+            if (!skipKafkaI32Array(buf, pos, flexible)) return false; // partition_indexes
+            if (flexible) ser.skipTaggedFields(buf, pos) catch return false;
+        }
+        return true;
+    }
+
     fn validateInitProducerIdRequestFrame(buf: []const u8, start_pos: usize, api_version: i16) bool {
         const flexible = api_version >= 2;
         var pos = start_pos;
@@ -7447,6 +7839,31 @@ pub const Broker = struct {
         if (item_count > (buf.len - pos.*) / 4) return false;
         pos.* += item_count * 4;
         return true;
+    }
+
+    const KafkaArrayHeader = struct {
+        is_null: bool,
+        count: usize,
+    };
+
+    fn readKafkaArrayHeader(buf: []const u8, pos: *usize, flexible: bool) ?KafkaArrayHeader {
+        const header = if (flexible) blk: {
+            const raw_len = ser.readUnsignedVarint(buf, pos) catch return null;
+            if (raw_len == 0) return .{ .is_null = true, .count = 0 };
+            break :blk KafkaArrayHeader{ .is_null = false, .count = raw_len - 1 };
+        } else blk: {
+            if (pos.* > buf.len or 4 > buf.len - pos.*) return null;
+            const len = std.mem.readInt(i32, buf[pos.*..][0..4], .big);
+            pos.* += 4;
+            if (len < 0) return .{ .is_null = true, .count = 0 };
+            break :blk KafkaArrayHeader{ .is_null = false, .count = @intCast(len) };
+        };
+
+        if (!header.is_null) {
+            if (pos.* > buf.len) return null;
+            if (header.count > buf.len - pos.* + 1) return null;
+        }
+        return header;
     }
 
     fn readKafkaArrayCount(buf: []const u8, pos: *usize, flexible: bool) ?usize {
@@ -11653,6 +12070,158 @@ test "Broker.handleRequest OffsetCommit rejects truncated request" {
 
     var buf: [128]u8 = undefined;
     const req_len = buildTestRequest(&buf, 8, 8, 809, header_mod.requestHeaderVersion(8, 8));
+    try testing.expect(broker.handleRequest(buf[0..req_len]) == null);
+}
+
+test "Broker.handleRequest OffsetFetch v7 returns generated response" {
+    const Req = generated.offset_fetch_request.OffsetFetchRequest;
+    const Resp = generated.offset_fetch_response.OffsetFetchResponse;
+    const Topic = Req.OffsetFetchRequestTopic;
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+
+    try broker.groups.commitOffset("of-generated-group", "of-topic", 0, 123);
+
+    const partitions = [_]i32{ 0, 1 };
+    const topics = [_]Topic{.{
+        .name = "of-topic",
+        .partition_indexes = &partitions,
+    }};
+    const req = Req{
+        .group_id = "of-generated-group",
+        .topics = &topics,
+        .require_stable = false,
+    };
+
+    var buf: [512]u8 = undefined;
+    var pos = buildTestRequest(&buf, 9, 7, 907, header_mod.requestHeaderVersion(9, 7));
+    req.serialize(&buf, &pos, 7);
+
+    const response = broker.handleRequest(buf[0..pos]);
+    try testing.expect(response != null);
+    defer testing.allocator.free(response.?);
+
+    var rpos: usize = 0;
+    var response_header = try ResponseHeader.deserialize(testing.allocator, response.?, &rpos, header_mod.responseHeaderVersion(9, 7));
+    defer response_header.deinit(testing.allocator);
+    try testing.expectEqual(@as(i32, 907), response_header.correlation_id);
+
+    const resp = try Resp.deserialize(testing.allocator, response.?, &rpos, 7);
+    defer broker.freeOffsetFetchLegacyTopics(resp.topics);
+    try testing.expectEqual(response.?.len, rpos);
+    try testing.expectEqual(@as(i32, 0), resp.throttle_time_ms);
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.none)), resp.error_code);
+    try testing.expectEqual(@as(usize, 1), resp.topics.len);
+    try testing.expectEqualStrings("of-topic", resp.topics[0].name.?);
+    try testing.expectEqual(@as(usize, 2), resp.topics[0].partitions.len);
+    try testing.expectEqual(@as(i64, 123), resp.topics[0].partitions[0].committed_offset);
+    try testing.expectEqual(@as(i64, -1), resp.topics[0].partitions[1].committed_offset);
+}
+
+test "Broker.handleRequest OffsetFetch v8 returns grouped generated response" {
+    const Req = generated.offset_fetch_request.OffsetFetchRequest;
+    const Resp = generated.offset_fetch_response.OffsetFetchResponse;
+    const Group = Req.OffsetFetchRequestGroup;
+    const Topic = Group.OffsetFetchRequestTopics;
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+
+    try broker.groups.commitOffset("of-v8-group", "of-v8-topic", 0, 321);
+
+    const partitions = [_]i32{0};
+    const topics = [_]Topic{.{
+        .name = "of-v8-topic",
+        .partition_indexes = &partitions,
+    }};
+    const groups = [_]Group{.{
+        .group_id = "of-v8-group",
+        .topics = &topics,
+    }};
+    const req = Req{
+        .groups = &groups,
+        .require_stable = false,
+    };
+
+    var buf: [512]u8 = undefined;
+    var pos = buildTestRequest(&buf, 9, 8, 908, header_mod.requestHeaderVersion(9, 8));
+    req.serialize(&buf, &pos, 8);
+
+    const response = broker.handleRequest(buf[0..pos]);
+    try testing.expect(response != null);
+    defer testing.allocator.free(response.?);
+
+    var rpos: usize = 0;
+    var response_header = try ResponseHeader.deserialize(testing.allocator, response.?, &rpos, header_mod.responseHeaderVersion(9, 8));
+    defer response_header.deinit(testing.allocator);
+    try testing.expectEqual(@as(i32, 908), response_header.correlation_id);
+
+    const resp = try Resp.deserialize(testing.allocator, response.?, &rpos, 8);
+    defer {
+        broker.freeOffsetFetchGroups(resp.groups);
+        if (resp.groups.len > 0) testing.allocator.free(resp.groups);
+    }
+    try testing.expectEqual(response.?.len, rpos);
+    try testing.expectEqual(@as(i32, 0), resp.throttle_time_ms);
+    try testing.expectEqual(@as(usize, 0), resp.topics.len);
+    try testing.expectEqual(@as(usize, 1), resp.groups.len);
+    try testing.expectEqualStrings("of-v8-group", resp.groups[0].group_id.?);
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.none)), resp.groups[0].error_code);
+    try testing.expectEqual(@as(usize, 1), resp.groups[0].topics.len);
+    try testing.expectEqualStrings("of-v8-topic", resp.groups[0].topics[0].name.?);
+    try testing.expectEqual(@as(i64, 321), resp.groups[0].topics[0].partitions[0].committed_offset);
+}
+
+test "Broker.handleRequest OffsetFetch v8 null topics fetches all committed offsets" {
+    const Resp = generated.offset_fetch_response.OffsetFetchResponse;
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+
+    try broker.groups.commitOffset("of-null-group", "topic-b", 1, 88);
+    try broker.groups.commitOffset("of-null-group", "topic-a", 0, 77);
+
+    var buf: [512]u8 = undefined;
+    var pos = buildTestRequest(&buf, 9, 8, 918, header_mod.requestHeaderVersion(9, 8));
+    ser.writeCompactArrayLen(&buf, &pos, 1); // groups
+    ser.writeCompactString(&buf, &pos, "of-null-group");
+    ser.writeCompactArrayLen(&buf, &pos, null); // null topics => fetch all committed offsets
+    ser.writeEmptyTaggedFields(&buf, &pos); // group tags
+    ser.writeBool(&buf, &pos, false); // require_stable
+    ser.writeEmptyTaggedFields(&buf, &pos); // request tags
+
+    const response = broker.handleRequest(buf[0..pos]);
+    try testing.expect(response != null);
+    defer testing.allocator.free(response.?);
+
+    var rpos: usize = 0;
+    var response_header = try ResponseHeader.deserialize(testing.allocator, response.?, &rpos, header_mod.responseHeaderVersion(9, 8));
+    defer response_header.deinit(testing.allocator);
+    try testing.expectEqual(@as(i32, 918), response_header.correlation_id);
+
+    const resp = try Resp.deserialize(testing.allocator, response.?, &rpos, 8);
+    defer {
+        broker.freeOffsetFetchGroups(resp.groups);
+        if (resp.groups.len > 0) testing.allocator.free(resp.groups);
+    }
+    try testing.expectEqual(response.?.len, rpos);
+    try testing.expectEqual(@as(usize, 1), resp.groups.len);
+    try testing.expectEqual(@as(usize, 2), resp.groups[0].topics.len);
+    try testing.expectEqualStrings("topic-a", resp.groups[0].topics[0].name.?);
+    try testing.expectEqual(@as(i32, 0), resp.groups[0].topics[0].partitions[0].partition_index);
+    try testing.expectEqual(@as(i64, 77), resp.groups[0].topics[0].partitions[0].committed_offset);
+    try testing.expectEqualStrings("topic-b", resp.groups[0].topics[1].name.?);
+    try testing.expectEqual(@as(i32, 1), resp.groups[0].topics[1].partitions[0].partition_index);
+    try testing.expectEqual(@as(i64, 88), resp.groups[0].topics[1].partitions[0].committed_offset);
+}
+
+test "Broker.handleRequest OffsetFetch rejects truncated request" {
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+
+    var buf: [128]u8 = undefined;
+    const req_len = buildTestRequest(&buf, 9, 8, 919, header_mod.requestHeaderVersion(9, 8));
     try testing.expect(broker.handleRequest(buf[0..req_len]) == null);
 }
 
