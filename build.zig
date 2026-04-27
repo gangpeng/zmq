@@ -357,6 +357,41 @@ pub fn build(b: *std.Build) void {
         test_step.dependOn(&run_integration.step);
     }
 
+    // MinIO/S3 integration tests are intentionally not part of the default
+    // unit suite. Run with:
+    //   ZMQ_RUN_MINIO_TESTS=1 zig build test-minio
+    const minio_test_step = b.step("test-minio", "Run MinIO/S3-backed integration tests");
+    {
+        const minio_mod = b.createModule(.{
+            .root_source_file = b.path("tests/minio_s3_test.zig"),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+            .imports = &.{
+                .{ .name = "storage", .module = storage_mod },
+                .{ .name = "broker", .module = broker_mod },
+                .{ .name = "time_compat", .module = time_compat_mod },
+                .{ .name = "posix_compat", .module = posix_compat_mod },
+                .{ .name = "mutex_compat", .module = mutex_compat_mod },
+                .{ .name = "list_compat", .module = list_compat_mod },
+                .{ .name = "fs_compat", .module = fs_compat_mod },
+                .{ .name = "net_compat", .module = net_compat_mod },
+                .{ .name = "random_compat", .module = random_compat_mod },
+                .{ .name = "core", .module = core_mod },
+                .{ .name = "security", .module = security_mod },
+                .{ .name = "protocol", .module = protocol_mod },
+                .{ .name = "network", .module = network_mod },
+                .{ .name = "raft", .module = raft_mod },
+            },
+        });
+        const minio_test = b.addTest(.{
+            .root_module = minio_mod,
+        });
+
+        const run_minio = b.addRunArtifact(minio_test);
+        minio_test_step.dependOn(&run_minio.step);
+    }
+
     // ---------------------------------------------------------------
     // Benchmark step
     // ---------------------------------------------------------------
