@@ -40,6 +40,17 @@ pub const S3Client = struct {
     // Connection pool for keep-alive reuse. Currently unused because requests
     // use Connection: close to keep response framing simple and correct.
     pooled_socket: ?std.posix.socket_t = null,
+    /// Optional HTTP hook used by deterministic storage tests.
+    test_http_ctx: ?*anyopaque = null,
+    test_http_request: ?*const fn (
+        ctx: *anyopaque,
+        method: []const u8,
+        path: []const u8,
+        query: []const u8,
+        body: ?[]const u8,
+        range_header: ?[]const u8,
+        resp_buf: []u8,
+    ) anyerror!u16 = null,
 
     pub const Scheme = enum {
         http,
@@ -466,7 +477,7 @@ pub const S3Client = struct {
             }
 
             if (!part_succeeded) {
-                log.err("Part {d}/{d} failed after {d} retries, aborting multipart upload for {s}", .{
+                log.warn("Part {d}/{d} failed after {d} retries, aborting multipart upload for {s}", .{
                     part_number, num_parts, MAX_PART_RETRIES, key,
                 });
                 return error.S3PartUploadFailed;
@@ -498,7 +509,7 @@ pub const S3Client = struct {
 
         const complete_status = try self.httpRequest("POST", path, complete_query, complete_body.items, null, complete_resp);
         if (complete_status < 200 or complete_status >= 300) {
-            log.err("CompleteMultipartUpload failed with status {d} for {s}", .{ complete_status, key });
+            log.warn("CompleteMultipartUpload failed with status {d} for {s}", .{ complete_status, key });
             return error.S3MultipartCompleteFailed;
         }
 
@@ -645,6 +656,11 @@ pub const S3Client = struct {
     };
 
     fn httpRequest(self: *S3Client, method: []const u8, path: []const u8, query: []const u8, body: ?[]const u8, range_header: ?[]const u8, resp_buf: []u8) !u16 {
+        if (self.test_http_request) |hook| {
+            const ctx = self.test_http_ctx orelse return error.MissingTestHttpContext;
+            return hook(ctx, method, path, query, body, range_header, resp_buf);
+        }
+
         // Retry with exponential backoff
         const MAX_RETRIES: u32 = 3;
         var attempt: u32 = 0;
@@ -1149,6 +1165,183 @@ test "S3Client responseHeaderValueOwned trims ETag" {
     const etag = (try client.responseHeaderValueOwned(response, "ETag")).?;
     defer testing.allocator.free(etag);
     try testing.expectEqualStrings("\"abc123\"", etag);
+}
+
+const MultipartTestServer = struct {
+    allocator: Allocator,
+    mode: Mode,
+    init_count: u32 = 0,
+    part_put_count: u32 = 0,
+    part1_attempts: u32 = 0,
+    part2_attempts: u32 = 0,
+    complete_count: u32 = 0,
+    abort_count: u32 = 0,
+    complete_body: []u8 = &.{},
+
+    const Mode = enum {
+        bad_etag_then_success,
+        persistent_bad_etag,
+        complete_failure,
+    };
+
+    fn deinit(self: *MultipartTestServer) void {
+        if (self.complete_body.len > 0) self.allocator.free(self.complete_body);
+    }
+
+    fn request(ctx: *anyopaque, method: []const u8, _: []const u8, query: []const u8, body: ?[]const u8, _: ?[]const u8, resp_buf: []u8) anyerror!u16 {
+        const self: *MultipartTestServer = @ptrCast(@alignCast(ctx));
+        @memset(resp_buf, 0);
+
+        if (std.mem.eql(u8, method, "POST") and std.mem.eql(u8, query, "uploads")) {
+            self.init_count += 1;
+            writeResponse(resp_buf, "<InitiateMultipartUploadResult><UploadId>upload-1</UploadId></InitiateMultipartUploadResult>");
+            return 200;
+        }
+
+        if (std.mem.eql(u8, method, "PUT")) {
+            self.part_put_count += 1;
+            if (std.mem.indexOf(u8, query, "partNumber=1") != null) {
+                self.part1_attempts += 1;
+                return self.partResponse(1, resp_buf);
+            }
+            if (std.mem.indexOf(u8, query, "partNumber=2") != null) {
+                self.part2_attempts += 1;
+                return self.partResponse(2, resp_buf);
+            }
+            return error.UnexpectedMultipartPart;
+        }
+
+        if (std.mem.eql(u8, method, "POST") and std.mem.startsWith(u8, query, "uploadId=")) {
+            self.complete_count += 1;
+            if (self.complete_body.len > 0) self.allocator.free(self.complete_body);
+            self.complete_body = try self.allocator.dupe(u8, body orelse "");
+            writeResponse(resp_buf, "<CompleteMultipartUploadResult/>");
+            return if (self.mode == .complete_failure) 500 else 200;
+        }
+
+        if (std.mem.eql(u8, method, "DELETE") and std.mem.startsWith(u8, query, "uploadId=")) {
+            self.abort_count += 1;
+            writeResponse(resp_buf, "");
+            return 204;
+        }
+
+        return error.UnexpectedMultipartRequest;
+    }
+
+    fn partResponse(self: *MultipartTestServer, part_number: u32, resp_buf: []u8) u16 {
+        switch (self.mode) {
+            .bad_etag_then_success => {
+                if (part_number == 1 and self.part1_attempts == 1) {
+                    writeResponse(resp_buf, "HTTP/1.1 200 OK\r\n\r\n");
+                } else if (part_number == 1 and self.part1_attempts == 2) {
+                    writeResponse(resp_buf, "HTTP/1.1 200 OK\r\nETag: <bad>\r\n\r\n");
+                } else {
+                    writeValidPartEtag(resp_buf, part_number);
+                }
+                return 200;
+            },
+            .persistent_bad_etag => {
+                writeResponse(resp_buf, "HTTP/1.1 200 OK\r\nETag: <bad>\r\n\r\n");
+                return 200;
+            },
+            .complete_failure => {
+                writeValidPartEtag(resp_buf, part_number);
+                return 200;
+            },
+        }
+    }
+
+    fn writeResponse(resp_buf: []u8, data: []const u8) void {
+        const copy_len = @min(resp_buf.len, data.len);
+        @memcpy(resp_buf[0..copy_len], data[0..copy_len]);
+    }
+
+    fn writeValidPartEtag(resp_buf: []u8, part_number: u32) void {
+        if (part_number == 1) {
+            writeResponse(resp_buf, "HTTP/1.1 200 OK\r\nETag: \"part-1\"\r\n\r\n");
+        } else {
+            writeResponse(resp_buf, "HTTP/1.1 200 OK\r\nETag: \"part-2\"\r\n\r\n");
+        }
+    }
+};
+
+fn allocMultipartTestData(alloc: Allocator) ![]u8 {
+    const len = 5 * 1024 * 1024 + 17;
+    const data = try alloc.alloc(u8, len);
+    @memset(data, 'x');
+    return data;
+}
+
+test "S3Client multipart retries missing and invalid part ETags before success" {
+    var server = MultipartTestServer{ .allocator = testing.allocator, .mode = .bad_etag_then_success };
+    defer server.deinit();
+
+    var client = S3Client.init(testing.allocator, .{});
+    client.test_http_ctx = &server;
+    client.test_http_request = MultipartTestServer.request;
+
+    const data = try allocMultipartTestData(testing.allocator);
+    defer testing.allocator.free(data);
+
+    try client.putObjectMultipart("large-object", data);
+
+    try testing.expectEqual(@as(u32, 1), server.init_count);
+    try testing.expectEqual(@as(u32, 4), server.part_put_count);
+    try testing.expectEqual(@as(u32, 3), server.part1_attempts);
+    try testing.expectEqual(@as(u32, 1), server.part2_attempts);
+    try testing.expectEqual(@as(u32, 1), server.complete_count);
+    try testing.expectEqual(@as(u32, 0), server.abort_count);
+    try testing.expect(std.mem.indexOf(u8, server.complete_body, "<ETag>\"part-1\"</ETag>") != null);
+    try testing.expect(std.mem.indexOf(u8, server.complete_body, "<ETag>\"part-2\"</ETag>") != null);
+    try testing.expectEqual(@as(u64, 1), client.put_count);
+    try testing.expectEqual(@as(u64, @intCast(data.len)), client.bytes_uploaded);
+}
+
+test "S3Client multipart aborts after persistent bad part ETag" {
+    var server = MultipartTestServer{ .allocator = testing.allocator, .mode = .persistent_bad_etag };
+    defer server.deinit();
+
+    var client = S3Client.init(testing.allocator, .{});
+    client.test_http_ctx = &server;
+    client.test_http_request = MultipartTestServer.request;
+
+    const data = try allocMultipartTestData(testing.allocator);
+    defer testing.allocator.free(data);
+
+    try testing.expectError(error.S3PartUploadFailed, client.putObjectMultipart("large-object", data));
+
+    try testing.expectEqual(@as(u32, 1), server.init_count);
+    try testing.expectEqual(@as(u32, 3), server.part_put_count);
+    try testing.expectEqual(@as(u32, 3), server.part1_attempts);
+    try testing.expectEqual(@as(u32, 0), server.part2_attempts);
+    try testing.expectEqual(@as(u32, 0), server.complete_count);
+    try testing.expectEqual(@as(u32, 1), server.abort_count);
+    try testing.expectEqual(@as(u64, 0), client.put_count);
+    try testing.expectEqual(@as(u64, 0), client.bytes_uploaded);
+}
+
+test "S3Client multipart aborts after complete failure" {
+    var server = MultipartTestServer{ .allocator = testing.allocator, .mode = .complete_failure };
+    defer server.deinit();
+
+    var client = S3Client.init(testing.allocator, .{});
+    client.test_http_ctx = &server;
+    client.test_http_request = MultipartTestServer.request;
+
+    const data = try allocMultipartTestData(testing.allocator);
+    defer testing.allocator.free(data);
+
+    try testing.expectError(error.S3MultipartCompleteFailed, client.putObjectMultipart("large-object", data));
+
+    try testing.expectEqual(@as(u32, 1), server.init_count);
+    try testing.expectEqual(@as(u32, 2), server.part_put_count);
+    try testing.expectEqual(@as(u32, 1), server.part1_attempts);
+    try testing.expectEqual(@as(u32, 1), server.part2_attempts);
+    try testing.expectEqual(@as(u32, 1), server.complete_count);
+    try testing.expectEqual(@as(u32, 1), server.abort_count);
+    try testing.expect(std.mem.indexOf(u8, server.complete_body, "<ETag>\"part-1\"</ETag>") != null);
+    try testing.expectEqual(@as(u64, 0), client.put_count);
+    try testing.expectEqual(@as(u64, 0), client.bytes_uploaded);
 }
 
 test "S3Storage mock mode" {
