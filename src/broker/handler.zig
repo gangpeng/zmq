@@ -2506,68 +2506,82 @@ pub const Broker = struct {
     // JoinGroup (key 11)
     // ---------------------------------------------------------------
     fn handleJoinGroup(self: *Broker, request_bytes: []const u8, body_start: usize, req_header: *const RequestHeader, api_version: i16, resp_header_version: i16) ?[]u8 {
+        const Req = generated.join_group_request.JoinGroupRequest;
+        const Resp = generated.join_group_response.JoinGroupResponse;
+
+        if (!validateJoinGroupRequestFrame(request_bytes, body_start, api_version)) {
+            log.warn("Malformed JoinGroup request", .{});
+            return null;
+        }
+
         var pos = body_start;
-        const flexible = api_version >= 6;
-        const readStr = if (flexible) &ser.readCompactString else &ser.readString;
-        const group_id = (readStr(request_bytes, &pos) catch return null) orelse "";
-        _ = ser.readI32(request_bytes, &pos); // session_timeout
-        if (api_version >= 1) _ = ser.readI32(request_bytes, &pos); // rebalance_timeout
-        const req_member_id = readStr(request_bytes, &pos) catch null;
-        // Parse group_instance_id for static membership
-        var group_instance_id: ?[]const u8 = null;
-        if (api_version >= 5) group_instance_id = readStr(request_bytes, &pos) catch null;
-        const protocol_type = (readStr(request_bytes, &pos) catch null) orelse "consumer";
-        // Skip protocols array
-        const num_protocols = if (flexible)
-            (ser.readCompactArrayLen(request_bytes, &pos) catch 0) orelse 0
-        else
-            @as(usize, @intCast(@max(ser.readI32(request_bytes, &pos), 0)));
-        _ = num_protocols;
+        var req = Req.deserialize(self.allocator, request_bytes, &pos, api_version) catch |err| {
+            log.warn("Failed to decode JoinGroup request: {}", .{err});
+            return null;
+        };
+        defer self.freeJoinGroupRequest(&req);
 
-        const result = self.groups.joinGroupWithInstanceId(group_id, req_member_id, group_instance_id, protocol_type, null) catch return null;
+        const member_id = nonEmptyStringOrNull(req.member_id);
+        const protocol_type = req.protocol_type orelse "consumer";
+        const protocol_name = selectedJoinGroupProtocolName(req);
+        const result = self.groups.joinGroupWithInstanceId(req.group_id orelse "", member_id, req.group_instance_id, protocol_type, null) catch return null;
 
-        var resp_buf = self.allocator.alloc(u8, 4096) catch return null;
-        var wpos: usize = 0;
-        const resp_header = ResponseHeader{ .correlation_id = req_header.correlation_id };
-        resp_header.serialize(resp_buf, &wpos, resp_header_version);
-        if (api_version >= 2) ser.writeI32(resp_buf, &wpos, 0); // throttle_time_ms
-        ser.writeI16(resp_buf, &wpos, result.error_code);
-        ser.writeI32(resp_buf, &wpos, result.generation_id);
-        if (api_version >= 7) {
-            if (flexible) ser.writeCompactString(resp_buf, &wpos, "consumer") else ser.writeString(resp_buf, &wpos, "consumer");
-        } else {
-            ser.writeString(resp_buf, &wpos, "consumer");
-        }
-        if (flexible) {
-            ser.writeCompactString(resp_buf, &wpos, if (result.leader_id) |lid| lid else "");
-            ser.writeCompactString(resp_buf, &wpos, result.member_id);
-        } else {
-            ser.writeString(resp_buf, &wpos, if (result.leader_id) |lid| lid else "");
-            ser.writeString(resp_buf, &wpos, result.member_id);
-        }
-
-        // Members list
+        var members: []Resp.JoinGroupResponseMember = &.{};
         if (result.is_leader) {
-            const group = self.groups.groups.getPtr(group_id);
-            if (group) |g| {
-                if (flexible) ser.writeCompactArrayLen(resp_buf, &wpos, g.members.count()) else ser.writeArrayLen(resp_buf, &wpos, g.members.count());
-                var it = g.members.iterator();
-                while (it.next()) |entry| {
-                    if (flexible) ser.writeCompactString(resp_buf, &wpos, entry.key_ptr.*) else ser.writeString(resp_buf, &wpos, entry.key_ptr.*);
-                    if (api_version >= 5) {
-                        if (flexible) ser.writeCompactString(resp_buf, &wpos, null) else ser.writeString(resp_buf, &wpos, null); // group_instance_id
-                    }
-                    if (flexible) ser.writeCompactBytes(resp_buf, &wpos, null) else ser.writeBytesBuf(resp_buf, &wpos, null); // metadata
-                    if (flexible) ser.writeEmptyTaggedFields(resp_buf, &wpos);
-                }
-            } else {
-                if (flexible) ser.writeCompactArrayLen(resp_buf, &wpos, 0) else ser.writeArrayLen(resp_buf, &wpos, 0);
-            }
-        } else {
-            if (flexible) ser.writeCompactArrayLen(resp_buf, &wpos, 0) else ser.writeArrayLen(resp_buf, &wpos, 0);
+            members = self.collectJoinGroupResponseMembers(req.group_id orelse "") catch return null;
         }
-        if (resp_header_version >= 1) ser.writeEmptyTaggedFields(resp_buf, &wpos);
-        return (self.allocator.realloc(resp_buf, wpos) catch resp_buf)[0..wpos];
+        defer if (members.len > 0) self.allocator.free(members);
+
+        const resp = Resp{
+            .throttle_time_ms = 0,
+            .error_code = result.error_code,
+            .generation_id = result.generation_id,
+            .protocol_type = protocol_type,
+            .protocol_name = protocol_name,
+            .leader = result.leader_id orelse "",
+            .skip_assignment = false,
+            .member_id = result.member_id,
+            .members = members,
+        };
+        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+    }
+
+    fn freeJoinGroupRequest(self: *Broker, req: *generated.join_group_request.JoinGroupRequest) void {
+        if (req.protocols.len > 0) self.allocator.free(req.protocols);
+    }
+
+    fn collectJoinGroupResponseMembers(self: *Broker, group_id: []const u8) ![]generated.join_group_response.JoinGroupResponse.JoinGroupResponseMember {
+        const Member = generated.join_group_response.JoinGroupResponse.JoinGroupResponseMember;
+        const group = self.groups.groups.getPtr(group_id) orelse return &.{};
+        if (group.memberCount() == 0) return &.{};
+
+        const members = try self.allocator.alloc(Member, group.memberCount());
+        var member_idx: usize = 0;
+        var it = group.members.iterator();
+        while (it.next()) |entry| {
+            const member = entry.value_ptr;
+            members[member_idx] = .{
+                .member_id = member.member_id,
+                .group_instance_id = member.group_instance_id,
+                .metadata = null,
+            };
+            member_idx += 1;
+        }
+        return members;
+    }
+
+    fn selectedJoinGroupProtocolName(req: generated.join_group_request.JoinGroupRequest) []const u8 {
+        if (req.protocols.len > 0) {
+            return req.protocols[0].name orelse "range";
+        }
+        return "range";
+    }
+
+    fn nonEmptyStringOrNull(value: ?[]const u8) ?[]const u8 {
+        if (value) |inner| {
+            if (inner.len > 0) return inner;
+        }
+        return null;
     }
 
     // ---------------------------------------------------------------
@@ -7016,6 +7030,32 @@ pub const Broker = struct {
         return skipKafkaString(buf, &pos, false);
     }
 
+    fn validateJoinGroupRequestFrame(buf: []const u8, start_pos: usize, api_version: i16) bool {
+        const flexible = api_version >= 6;
+        var pos = start_pos;
+
+        if (!skipKafkaString(buf, &pos, flexible)) return false; // group_id
+        if (!skipFixedBytes(buf, &pos, 4)) return false; // session_timeout_ms
+        if (api_version >= 1 and !skipFixedBytes(buf, &pos, 4)) return false; // rebalance_timeout_ms
+        if (!skipKafkaString(buf, &pos, flexible)) return false; // member_id
+        if (api_version >= 5) {
+            if (!skipKafkaString(buf, &pos, flexible)) return false; // group_instance_id
+        }
+        if (!skipKafkaString(buf, &pos, flexible)) return false; // protocol_type
+
+        const protocol_count = readKafkaArrayCount(buf, &pos, flexible) orelse return false;
+        for (0..protocol_count) |_| {
+            if (!skipKafkaString(buf, &pos, flexible)) return false; // protocol name
+            if (!skipKafkaBytes(buf, &pos, flexible)) return false; // protocol metadata
+            if (flexible) ser.skipTaggedFields(buf, &pos) catch return false;
+        }
+        if (api_version >= 8) {
+            if (!skipKafkaString(buf, &pos, true)) return false; // reason
+        }
+        if (flexible) ser.skipTaggedFields(buf, &pos) catch return false;
+        return true;
+    }
+
     fn validateSyncGroupRequestFrame(buf: []const u8, start_pos: usize, api_version: i16) bool {
         const flexible = api_version >= 4;
         var pos = start_pos;
@@ -11230,6 +11270,66 @@ test "Broker.handleRequest JoinGroup (key=11) returns member_id" {
     try testing.expectEqual(@as(i16, 0), error_code);
     const generation_id = ser.readI32(resp.?, &rpos);
     try testing.expect(generation_id >= 1);
+}
+
+test "Broker.handleRequest JoinGroup v9 returns generated response" {
+    const Req = generated.join_group_request.JoinGroupRequest;
+    const Protocol = Req.JoinGroupRequestProtocol;
+    const Resp = generated.join_group_response.JoinGroupResponse;
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+
+    const protocols = [_]Protocol{.{
+        .name = "range",
+        .metadata = "",
+    }};
+    const req = Req{
+        .group_id = "jg-generated-group",
+        .session_timeout_ms = 30000,
+        .rebalance_timeout_ms = 300000,
+        .member_id = "",
+        .group_instance_id = null,
+        .protocol_type = "consumer",
+        .protocols = &protocols,
+        .reason = "generated-test",
+    };
+
+    var buf: [512]u8 = undefined;
+    var pos = buildTestRequest(&buf, 11, 9, 1109, header_mod.requestHeaderVersion(11, 9));
+    req.serialize(&buf, &pos, 9);
+
+    const response = broker.handleRequest(buf[0..pos]);
+    try testing.expect(response != null);
+    defer testing.allocator.free(response.?);
+
+    var rpos: usize = 0;
+    var response_header = try ResponseHeader.deserialize(testing.allocator, response.?, &rpos, header_mod.responseHeaderVersion(11, 9));
+    defer response_header.deinit(testing.allocator);
+    try testing.expectEqual(@as(i32, 1109), response_header.correlation_id);
+
+    const resp = try Resp.deserialize(testing.allocator, response.?, &rpos, 9);
+    defer if (resp.members.len > 0) testing.allocator.free(resp.members);
+    try testing.expectEqual(response.?.len, rpos);
+    try testing.expectEqual(@as(i32, 0), resp.throttle_time_ms);
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.none)), resp.error_code);
+    try testing.expect(resp.generation_id >= 1);
+    try testing.expectEqualStrings("consumer", resp.protocol_type.?);
+    try testing.expectEqualStrings("range", resp.protocol_name.?);
+    try testing.expect(resp.member_id.?.len > 0);
+    try testing.expectEqualStrings(resp.member_id.?, resp.leader.?);
+    try testing.expect(!resp.skip_assignment);
+    try testing.expectEqual(@as(usize, 1), resp.members.len);
+    try testing.expectEqualStrings(resp.member_id.?, resp.members[0].member_id.?);
+}
+
+test "Broker.handleRequest JoinGroup rejects truncated request" {
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+
+    var buf: [128]u8 = undefined;
+    const req_len = buildTestRequest(&buf, 11, 9, 1110, header_mod.requestHeaderVersion(11, 9));
+    try testing.expect(broker.handleRequest(buf[0..req_len]) == null);
 }
 
 test "Broker.handleRequest SyncGroup (key=14) after JoinGroup" {
