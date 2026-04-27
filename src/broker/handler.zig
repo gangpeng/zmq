@@ -5921,24 +5921,23 @@ pub const Broker = struct {
     // SaslAuthenticate (key 36)
     // ---------------------------------------------------------------
     fn handleSaslAuthenticate(self: *Broker, request_bytes: []const u8, body_start: usize, req_header: *const RequestHeader, api_version: i16, resp_header_version: i16) ?[]u8 {
-        _ = api_version;
-        var pos = body_start;
-        // auth_bytes contains the SASL credentials (format depends on mechanism)
-        const auth_bytes = ser.readBytes(request_bytes, &pos) catch null;
+        const Req = generated.sasl_authenticate_request.SaslAuthenticateRequest;
 
-        var buf = self.allocator.alloc(u8, 512) catch return null;
-        var wpos: usize = 0;
-        const rh = ResponseHeader{ .correlation_id = req_header.correlation_id };
-        rh.serialize(buf, &wpos, resp_header_version);
+        if (!validateSaslAuthenticateRequestFrame(request_bytes, body_start, api_version)) {
+            log.warn("Malformed SaslAuthenticate request", .{});
+            return null;
+        }
+
+        var pos = body_start;
+        const req = Req.deserialize(self.allocator, request_bytes, &pos, api_version) catch |err| {
+            log.warn("Malformed SaslAuthenticate request: {}", .{err});
+            return null;
+        };
+        const auth_bytes = req.auth_bytes;
 
         // If SASL is not enabled, accept all connections (backward compatible)
         if (!self.sasl_enabled) {
-            ser.writeI16(buf, &wpos, 0); // error_code = NONE
-            ser.writeString(buf, &wpos, ""); // error_message
-            ser.writeBytesBuf(buf, &wpos, &.{}); // auth_bytes (empty response)
-            ser.writeI64(buf, &wpos, 0); // session_lifetime_ms
-            if (resp_header_version >= 1) ser.writeEmptyTaggedFields(buf, &wpos);
-            return (self.allocator.realloc(buf, wpos) catch buf)[0..wpos];
+            return self.serializeSaslAuthenticateResponse(req_header, resp_header_version, api_version, @intFromEnum(ErrorCode.none), "", &.{});
         }
 
         // Determine which mechanism this client negotiated during SaslHandshake
@@ -5953,41 +5952,21 @@ pub const Broker = struct {
                     if (result.principal) |principal| {
                         // Format as "User:<sub-claim>" to match Kafka principal format
                         const full_principal = std.fmt.allocPrint(self.allocator, "User:{s}", .{principal}) catch {
-                            ser.writeI16(buf, &wpos, 58); // SASL_AUTHENTICATION_FAILED
-                            ser.writeString(buf, &wpos, "Internal error");
-                            ser.writeBytesBuf(buf, &wpos, &.{});
-                            ser.writeI64(buf, &wpos, 0);
-                            if (resp_header_version >= 1) ser.writeEmptyTaggedFields(buf, &wpos);
-                            return (self.allocator.realloc(buf, wpos) catch buf)[0..wpos];
+                            return self.serializeSaslAuthenticateResponse(req_header, resp_header_version, api_version, @intFromEnum(ErrorCode.sasl_authentication_failed), "Internal error", &.{});
                         };
                         self.storeAuthenticatedPrincipal(client_id, full_principal);
                     }
-                    ser.writeI16(buf, &wpos, 0); // error_code = NONE
-                    ser.writeString(buf, &wpos, ""); // error_message
-                    ser.writeBytesBuf(buf, &wpos, &.{}); // auth_bytes
-                    ser.writeI64(buf, &wpos, 0); // session_lifetime_ms
-                    if (resp_header_version >= 1) ser.writeEmptyTaggedFields(buf, &wpos);
-                    return (self.allocator.realloc(buf, wpos) catch buf)[0..wpos];
+                    return self.serializeSaslAuthenticateResponse(req_header, resp_header_version, api_version, @intFromEnum(ErrorCode.none), "", &.{});
                 }
             }
             // OAUTHBEARER authentication failed
-            ser.writeI16(buf, &wpos, 58); // error_code = SASL_AUTHENTICATION_FAILED
-            ser.writeString(buf, &wpos, "OAUTHBEARER authentication failed");
-            ser.writeBytesBuf(buf, &wpos, &.{});
-            ser.writeI64(buf, &wpos, 0);
-            if (resp_header_version >= 1) ser.writeEmptyTaggedFields(buf, &wpos);
-            return (self.allocator.realloc(buf, wpos) catch buf)[0..wpos];
+            return self.serializeSaslAuthenticateResponse(req_header, resp_header_version, api_version, @intFromEnum(ErrorCode.sasl_authentication_failed), "OAUTHBEARER authentication failed", &.{});
         } else if (std.mem.eql(u8, mechanism, "SCRAM-SHA-256")) {
             // SCRAM-SHA-256: RFC 5802 / RFC 7677
             // Multi-round exchange: client-first → server-first → client-final → server-final.
             // Each SaslAuthenticate call progresses the per-connection ScramStateMachine.
             const token = auth_bytes orelse {
-                ser.writeI16(buf, &wpos, 58); // SASL_AUTHENTICATION_FAILED
-                ser.writeString(buf, &wpos, "Missing SCRAM auth bytes");
-                ser.writeBytesBuf(buf, &wpos, &.{});
-                ser.writeI64(buf, &wpos, 0);
-                if (resp_header_version >= 1) ser.writeEmptyTaggedFields(buf, &wpos);
-                return (self.allocator.realloc(buf, wpos) catch buf)[0..wpos];
+                return self.serializeSaslAuthenticateResponse(req_header, resp_header_version, api_version, @intFromEnum(ErrorCode.sasl_authentication_failed), "Missing SCRAM auth bytes", &.{});
             };
 
             // Look up or create SCRAM session for this client
@@ -6000,55 +5979,38 @@ pub const Broker = struct {
                         // Authentication succeeded — store principal and return server-final
                         if (sm.username) |username| {
                             const full_principal = std.fmt.allocPrint(self.allocator, "User:{s}", .{username}) catch {
-                                ser.writeI16(buf, &wpos, 58);
-                                ser.writeString(buf, &wpos, "Internal error");
-                                ser.writeBytesBuf(buf, &wpos, &.{});
-                                ser.writeI64(buf, &wpos, 0);
-                                if (resp_header_version >= 1) ser.writeEmptyTaggedFields(buf, &wpos);
-                                return (self.allocator.realloc(buf, wpos) catch buf)[0..wpos];
+                                return self.serializeSaslAuthenticateResponse(req_header, resp_header_version, api_version, @intFromEnum(ErrorCode.sasl_authentication_failed), "Internal error", &.{});
                             };
                             self.storeAuthenticatedPrincipal(client_id, full_principal);
                         }
-                        ser.writeI16(buf, &wpos, 0); // error_code = NONE
-                        ser.writeString(buf, &wpos, ""); // error_message
-                        ser.writeBytesBuf(buf, &wpos, server_final); // server-final-message
-                        ser.writeI64(buf, &wpos, 0); // session_lifetime_ms
-                        if (resp_header_version >= 1) ser.writeEmptyTaggedFields(buf, &wpos);
+                        const response = self.serializeSaslAuthenticateResponse(req_header, resp_header_version, api_version, @intFromEnum(ErrorCode.none), "", server_final);
                         // Clean up the completed SCRAM session
                         if (self.scram_sessions.fetchRemove(client_id)) |old| {
                             self.allocator.free(old.key);
                             var old_sm = old.value;
                             old_sm.deinit();
                         }
-                        return (self.allocator.realloc(buf, wpos) catch buf)[0..wpos];
+                        return response;
                     } else {
                         // Client proof verification failed
-                        ser.writeI16(buf, &wpos, 58); // SASL_AUTHENTICATION_FAILED
-                        ser.writeString(buf, &wpos, "SCRAM-SHA-256 authentication failed");
-                        ser.writeBytesBuf(buf, &wpos, &.{});
-                        ser.writeI64(buf, &wpos, 0);
-                        if (resp_header_version >= 1) ser.writeEmptyTaggedFields(buf, &wpos);
+                        const response = self.serializeSaslAuthenticateResponse(req_header, resp_header_version, api_version, @intFromEnum(ErrorCode.sasl_authentication_failed), "SCRAM-SHA-256 authentication failed", &.{});
                         // Clean up the failed session
                         if (self.scram_sessions.fetchRemove(client_id)) |old| {
                             self.allocator.free(old.key);
                             var old_sm = old.value;
                             old_sm.deinit();
                         }
-                        return (self.allocator.realloc(buf, wpos) catch buf)[0..wpos];
+                        return response;
                     }
                 } else {
                     // Unexpected state — session exists but not in server_first_sent
-                    ser.writeI16(buf, &wpos, 58);
-                    ser.writeString(buf, &wpos, "SCRAM-SHA-256 unexpected state");
-                    ser.writeBytesBuf(buf, &wpos, &.{});
-                    ser.writeI64(buf, &wpos, 0);
-                    if (resp_header_version >= 1) ser.writeEmptyTaggedFields(buf, &wpos);
+                    const response = self.serializeSaslAuthenticateResponse(req_header, resp_header_version, api_version, @intFromEnum(ErrorCode.sasl_authentication_failed), "SCRAM-SHA-256 unexpected state", &.{});
                     if (self.scram_sessions.fetchRemove(client_id)) |old| {
                         self.allocator.free(old.key);
                         var old_sm = old.value;
                         old_sm.deinit();
                     }
-                    return (self.allocator.realloc(buf, wpos) catch buf)[0..wpos];
+                    return response;
                 }
             } else {
                 // No existing session — this is the client-first-message (round 1)
@@ -6058,41 +6020,21 @@ pub const Broker = struct {
                     // Store the state machine for this client's next round
                     const key = self.allocator.dupe(u8, client_id) catch {
                         sm.deinit();
-                        ser.writeI16(buf, &wpos, 58);
-                        ser.writeString(buf, &wpos, "Internal error");
-                        ser.writeBytesBuf(buf, &wpos, &.{});
-                        ser.writeI64(buf, &wpos, 0);
-                        if (resp_header_version >= 1) ser.writeEmptyTaggedFields(buf, &wpos);
-                        return (self.allocator.realloc(buf, wpos) catch buf)[0..wpos];
+                        return self.serializeSaslAuthenticateResponse(req_header, resp_header_version, api_version, @intFromEnum(ErrorCode.sasl_authentication_failed), "Internal error", &.{});
                     };
                     self.scram_sessions.put(key, sm) catch {
                         self.allocator.free(key);
                         sm.deinit();
-                        ser.writeI16(buf, &wpos, 58);
-                        ser.writeString(buf, &wpos, "Internal error");
-                        ser.writeBytesBuf(buf, &wpos, &.{});
-                        ser.writeI64(buf, &wpos, 0);
-                        if (resp_header_version >= 1) ser.writeEmptyTaggedFields(buf, &wpos);
-                        return (self.allocator.realloc(buf, wpos) catch buf)[0..wpos];
+                        return self.serializeSaslAuthenticateResponse(req_header, resp_header_version, api_version, @intFromEnum(ErrorCode.sasl_authentication_failed), "Internal error", &.{});
                     };
                     // Return server-first-message to client (intermediate challenge)
                     // Kafka sends error_code=0 for SCRAM challenge responses; the client
                     // knows the exchange is not yet complete from the SCRAM state machine.
-                    ser.writeI16(buf, &wpos, 0); // error_code = NONE (continue exchange)
-                    ser.writeString(buf, &wpos, ""); // error_message
-                    ser.writeBytesBuf(buf, &wpos, server_first); // server-first-message
-                    ser.writeI64(buf, &wpos, 0);
-                    if (resp_header_version >= 1) ser.writeEmptyTaggedFields(buf, &wpos);
-                    return (self.allocator.realloc(buf, wpos) catch buf)[0..wpos];
+                    return self.serializeSaslAuthenticateResponse(req_header, resp_header_version, api_version, @intFromEnum(ErrorCode.none), "", server_first);
                 } else {
                     // Failed to parse client-first (unknown user, bad format, etc.)
                     sm.deinit();
-                    ser.writeI16(buf, &wpos, 58); // SASL_AUTHENTICATION_FAILED
-                    ser.writeString(buf, &wpos, "SCRAM-SHA-256 authentication failed");
-                    ser.writeBytesBuf(buf, &wpos, &.{});
-                    ser.writeI64(buf, &wpos, 0);
-                    if (resp_header_version >= 1) ser.writeEmptyTaggedFields(buf, &wpos);
-                    return (self.allocator.realloc(buf, wpos) catch buf)[0..wpos];
+                    return self.serializeSaslAuthenticateResponse(req_header, resp_header_version, api_version, @intFromEnum(ErrorCode.sasl_authentication_failed), "SCRAM-SHA-256 authentication failed", &.{});
                 }
             }
         } else {
@@ -6103,32 +6045,28 @@ pub const Broker = struct {
                     if (result.principal) |principal| {
                         // Format as "User:<username>" to match Kafka principal format
                         const full_principal = std.fmt.allocPrint(self.allocator, "User:{s}", .{principal}) catch {
-                            ser.writeI16(buf, &wpos, 58); // SASL_AUTHENTICATION_FAILED
-                            ser.writeString(buf, &wpos, "Internal error");
-                            ser.writeBytesBuf(buf, &wpos, &.{});
-                            ser.writeI64(buf, &wpos, 0);
-                            if (resp_header_version >= 1) ser.writeEmptyTaggedFields(buf, &wpos);
-                            return (self.allocator.realloc(buf, wpos) catch buf)[0..wpos];
+                            return self.serializeSaslAuthenticateResponse(req_header, resp_header_version, api_version, @intFromEnum(ErrorCode.sasl_authentication_failed), "Internal error", &.{});
                         };
                         self.storeAuthenticatedPrincipal(client_id, full_principal);
                     }
-                    ser.writeI16(buf, &wpos, 0); // error_code = NONE
-                    ser.writeString(buf, &wpos, ""); // error_message
-                    ser.writeBytesBuf(buf, &wpos, &.{}); // auth_bytes
-                    ser.writeI64(buf, &wpos, 0); // session_lifetime_ms
-                    if (resp_header_version >= 1) ser.writeEmptyTaggedFields(buf, &wpos);
-                    return (self.allocator.realloc(buf, wpos) catch buf)[0..wpos];
+                    return self.serializeSaslAuthenticateResponse(req_header, resp_header_version, api_version, @intFromEnum(ErrorCode.none), "", &.{});
                 }
             }
 
             // PLAIN authentication failed
-            ser.writeI16(buf, &wpos, 58); // error_code = SASL_AUTHENTICATION_FAILED
-            ser.writeString(buf, &wpos, "Authentication failed");
-            ser.writeBytesBuf(buf, &wpos, &.{}); // auth_bytes
-            ser.writeI64(buf, &wpos, 0); // session_lifetime_ms
-            if (resp_header_version >= 1) ser.writeEmptyTaggedFields(buf, &wpos);
-            return (self.allocator.realloc(buf, wpos) catch buf)[0..wpos];
+            return self.serializeSaslAuthenticateResponse(req_header, resp_header_version, api_version, @intFromEnum(ErrorCode.sasl_authentication_failed), "Authentication failed", &.{});
         }
+    }
+
+    fn serializeSaslAuthenticateResponse(self: *Broker, req_header: *const RequestHeader, resp_header_version: i16, api_version: i16, error_code: i16, error_message: ?[]const u8, auth_bytes: ?[]const u8) ?[]u8 {
+        const Resp = generated.sasl_authenticate_response.SaslAuthenticateResponse;
+        const resp = Resp{
+            .error_code = error_code,
+            .error_message = error_message,
+            .auth_bytes = auth_bytes,
+            .session_lifetime_ms = 0,
+        };
+        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
     }
 
     /// Store an authenticated principal in the session map.
@@ -7724,6 +7662,15 @@ pub const Broker = struct {
         return skipKafkaString(buf, &pos, false);
     }
 
+    fn validateSaslAuthenticateRequestFrame(buf: []const u8, start_pos: usize, api_version: i16) bool {
+        const flexible = api_version >= 2;
+        var pos = start_pos;
+
+        if (!skipKafkaBytes(buf, &pos, flexible)) return false; // auth_bytes
+        if (flexible) ser.skipTaggedFields(buf, &pos) catch return false;
+        return true;
+    }
+
     fn validateJoinGroupRequestFrame(buf: []const u8, start_pos: usize, api_version: i16) bool {
         const flexible = api_version >= 6;
         var pos = start_pos;
@@ -8362,7 +8309,13 @@ pub const Broker = struct {
         if (flexible) {
             _ = ser.readCompactBytes(buf, pos) catch return false;
         } else {
-            _ = ser.readBytes(buf, pos) catch return false;
+            if (pos.* > buf.len or 4 > buf.len - pos.*) return false;
+            const len = std.mem.readInt(i32, buf[pos.*..][0..4], .big);
+            pos.* += 4;
+            if (len < 0) return true;
+            const byte_len: usize = @intCast(len);
+            if (byte_len > buf.len - pos.*) return false;
+            pos.* += byte_len;
         }
         return true;
     }
@@ -9113,6 +9066,45 @@ test "Broker.handleRequest SaslHandshake rejects truncated request" {
 
     var buf: [128]u8 = undefined;
     const req_len = buildTestRequest(&buf, 17, 1, 1703, header_mod.requestHeaderVersion(17, 1));
+    try testing.expect(broker.handleRequest(buf[0..req_len]) == null);
+}
+
+test "Broker.handleRequest SaslAuthenticate v2 returns generated flexible response" {
+    const Req = generated.sasl_authenticate_request.SaslAuthenticateRequest;
+    const Resp = generated.sasl_authenticate_response.SaslAuthenticateResponse;
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+
+    const req = Req{ .auth_bytes = "ignored-when-sasl-disabled" };
+
+    var buf: [256]u8 = undefined;
+    var pos = buildTestRequest(&buf, 36, 2, 3602, header_mod.requestHeaderVersion(36, 2));
+    req.serialize(&buf, &pos, 2);
+
+    const response = broker.handleRequest(buf[0..pos]);
+    try testing.expect(response != null);
+    defer testing.allocator.free(response.?);
+
+    var rpos: usize = 0;
+    var response_header = try ResponseHeader.deserialize(testing.allocator, response.?, &rpos, header_mod.responseHeaderVersion(36, 2));
+    defer response_header.deinit(testing.allocator);
+    try testing.expectEqual(@as(i32, 3602), response_header.correlation_id);
+
+    const resp = try Resp.deserialize(testing.allocator, response.?, &rpos, 2);
+    try testing.expectEqual(response.?.len, rpos);
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.none)), resp.error_code);
+    try testing.expectEqualStrings("", resp.error_message.?);
+    try testing.expectEqual(@as(usize, 0), resp.auth_bytes.?.len);
+    try testing.expectEqual(@as(i64, 0), resp.session_lifetime_ms);
+}
+
+test "Broker.handleRequest SaslAuthenticate rejects truncated request" {
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+
+    var buf: [128]u8 = undefined;
+    const req_len = buildTestRequest(&buf, 36, 2, 3603, header_mod.requestHeaderVersion(36, 2));
     try testing.expect(broker.handleRequest(buf[0..req_len]) == null);
 }
 
