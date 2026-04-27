@@ -355,6 +355,41 @@ pub fn isGeneratedAutoMqExtension(api_key: i16) bool {
     return findGeneratedRequest(api_key) != null and api_key >= 501;
 }
 
+fn countOccurrences(haystack: []const u8, needle: []const u8) usize {
+    var count: usize = 0;
+    var search_start: usize = 0;
+    while (std.mem.indexOf(u8, haystack[search_start..], needle)) |rel_index| {
+        count += 1;
+        search_start += rel_index + needle.len;
+    }
+    return count;
+}
+
+fn handleRequestSwitchBody(source: []const u8) ?[]const u8 {
+    const start_marker = "const result = switch (api_key) {";
+    const end_marker = "            else => self.handleUnsupported";
+    const start = std.mem.indexOf(u8, source, start_marker) orelse return null;
+    const body_start = start + start_marker.len;
+    const end_rel = std.mem.indexOf(u8, source[body_start..], end_marker) orelse return null;
+    return source[body_start .. body_start + end_rel];
+}
+
+fn switchCaseKey(line: []const u8) ?i16 {
+    if (std.mem.indexOf(u8, line, "=> self.handle") == null) return null;
+    const arrow = std.mem.indexOf(u8, line, "=>") orelse return null;
+    const lhs = std.mem.trim(u8, line[0..arrow], " \t");
+    if (lhs.len == 0 or lhs[0] < '0' or lhs[0] > '9') return null;
+    return std.fmt.parseInt(i16, lhs, 10) catch return null;
+}
+
+fn handleRequestSwitchHasCase(body: []const u8, key: i16) bool {
+    var lines = std.mem.splitScalar(u8, body, '\n');
+    while (lines.next()) |line| {
+        if ((switchCaseKey(line) orelse continue) == key) return true;
+    }
+    return false;
+}
+
 test "broker API support table is sorted and unique" {
     var previous: ?i16 = null;
     for (broker_supported_apis) |api| {
@@ -374,11 +409,35 @@ test "generated request API catalog is sorted and unique" {
     }
 }
 
+test "generated request API catalog matches generated index exports" {
+    const generated_index_source = @embedFile("generated_index.zig");
+    const request_exports = countOccurrences(generated_index_source, "_request = @import(\"generated/");
+    const response_exports = countOccurrences(generated_index_source, "_response = @import(\"generated/");
+
+    try testing.expectEqual(generated_request_apis.len, request_exports);
+    try testing.expectEqual(generated_request_apis.len, response_exports);
+}
+
 test "broker handler API table is sorted and unique" {
     var previous: ?i16 = null;
     for (broker_handler_api_keys) |key| {
         if (previous) |prev| try testing.expect(key > prev);
         previous = key;
+    }
+}
+
+test "broker handler switch matches audited handler API table" {
+    const handler_source = @embedFile("../broker/handler.zig");
+    const switch_body = handleRequestSwitchBody(handler_source) orelse return error.MissingBrokerHandlerSwitch;
+
+    for (broker_handler_api_keys) |key| {
+        try testing.expect(handleRequestSwitchHasCase(switch_body, key));
+    }
+
+    var lines = std.mem.splitScalar(u8, switch_body, '\n');
+    while (lines.next()) |line| {
+        const key = switchCaseKey(line) orelse continue;
+        try testing.expect(hasBrokerHandler(key));
     }
 }
 
