@@ -113,10 +113,12 @@ pub const LeaveGroupRequest = struct {
         } else {
             ser.writeString(buf, pos, self.group_id);
         }
-        if (version >= 4) {
-            ser.writeCompactString(buf, pos, self.member_id);
-        } else {
-            ser.writeString(buf, pos, self.member_id);
+        if (version <= 2) {
+            if (version >= 4) {
+                ser.writeCompactString(buf, pos, self.member_id);
+            } else {
+                ser.writeString(buf, pos, self.member_id);
+            }
         }
         if (version >= 3) {
             if (version >= 4) {
@@ -137,10 +139,12 @@ pub const LeaveGroupRequest = struct {
             try ser.readCompactString(buf, pos)
         else
             try ser.readString(buf, pos);
-        result.member_id = if (version >= 4)
-            try ser.readCompactString(buf, pos)
-        else
-            try ser.readString(buf, pos);
+        if (version <= 2) {
+            result.member_id = if (version >= 4)
+                try ser.readCompactString(buf, pos)
+            else
+                try ser.readString(buf, pos);
+        }
         if (version >= 3) {
             const members_len: usize = if (version >= 4)
                 (try ser.readCompactArrayLen(buf, pos)) orelse 0
@@ -165,10 +169,12 @@ pub const LeaveGroupRequest = struct {
         } else {
             size += ser.stringSize(self.group_id);
         }
-        if (version >= 4) {
-            size += ser.compactStringSize(self.member_id);
-        } else {
-            size += ser.stringSize(self.member_id);
+        if (version <= 2) {
+            if (version >= 4) {
+                size += ser.compactStringSize(self.member_id);
+            } else {
+                size += ser.stringSize(self.member_id);
+            }
         }
         if (version >= 3) {
             if (version >= 4) {

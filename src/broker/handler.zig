@@ -2601,31 +2601,49 @@ pub const Broker = struct {
     // LeaveGroup (key 13)
     // ---------------------------------------------------------------
     fn handleLeaveGroup(self: *Broker, request_bytes: []const u8, body_start: usize, req_header: *const RequestHeader, api_version: i16, resp_header_version: i16) ?[]u8 {
-        var pos = body_start;
-        const flexible = api_version >= 4;
-        const group_id = if (flexible)
-            ((ser.readCompactString(request_bytes, &pos) catch return null) orelse "")
-        else
-            ((ser.readString(request_bytes, &pos) catch return null) orelse "");
-        const member_id = if (flexible)
-            ((ser.readCompactString(request_bytes, &pos) catch return null) orelse "")
-        else
-            ((ser.readString(request_bytes, &pos) catch return null) orelse "");
+        const Req = generated.leave_group_request.LeaveGroupRequest;
+        const Resp = generated.leave_group_response.LeaveGroupResponse;
+        const MemberResponse = Resp.MemberResponse;
 
-        const error_code = self.groups.leaveGroup(group_id, member_id);
-
-        var resp_buf = self.allocator.alloc(u8, 128) catch return null;
-        var wpos: usize = 0;
-        const resp_header = ResponseHeader{ .correlation_id = req_header.correlation_id };
-        resp_header.serialize(resp_buf, &wpos, resp_header_version);
-        if (api_version >= 1) ser.writeI32(resp_buf, &wpos, 0); // throttle_time_ms
-        ser.writeI16(resp_buf, &wpos, error_code);
-        if (api_version >= 3) {
-            // v3+: members array in response
-            if (flexible) ser.writeCompactArrayLen(resp_buf, &wpos, 0) else ser.writeArrayLen(resp_buf, &wpos, 0);
+        if (!validateLeaveGroupRequestFrame(request_bytes, body_start, api_version)) {
+            log.warn("Malformed LeaveGroup request", .{});
+            return null;
         }
-        if (resp_header_version >= 1) ser.writeEmptyTaggedFields(resp_buf, &wpos);
-        return (self.allocator.realloc(resp_buf, wpos) catch resp_buf)[0..wpos];
+
+        var pos = body_start;
+        var req = Req.deserialize(self.allocator, request_bytes, &pos, api_version) catch |err| {
+            log.warn("Failed to decode LeaveGroup request: {}", .{err});
+            return null;
+        };
+        defer self.freeLeaveGroupRequest(&req);
+
+        var top_error: i16 = @intFromEnum(ErrorCode.none);
+        var member_responses: []MemberResponse = &.{};
+        if (api_version >= 3) {
+            member_responses = self.allocator.alloc(MemberResponse, req.members.len) catch return null;
+            for (req.members, 0..) |member, i| {
+                const member_id = member.member_id orelse "";
+                member_responses[i] = .{
+                    .member_id = member.member_id,
+                    .group_instance_id = member.group_instance_id,
+                    .error_code = self.groups.leaveGroup(req.group_id orelse "", member_id),
+                };
+            }
+        } else {
+            top_error = self.groups.leaveGroup(req.group_id orelse "", req.member_id orelse "");
+        }
+        defer if (member_responses.len > 0) self.allocator.free(member_responses);
+
+        const resp = Resp{
+            .throttle_time_ms = 0,
+            .error_code = top_error,
+            .members = member_responses,
+        };
+        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+    }
+
+    fn freeLeaveGroupRequest(self: *Broker, req: *generated.leave_group_request.LeaveGroupRequest) void {
+        if (req.members.len > 0) self.allocator.free(req.members);
     }
 
     // ---------------------------------------------------------------
@@ -6844,6 +6862,29 @@ pub const Broker = struct {
         if (!skipKafkaString(buf, &pos, flexible)) return false; // member_id
         if (api_version >= 3) {
             if (!skipKafkaString(buf, &pos, flexible)) return false; // group_instance_id
+        }
+        if (flexible) ser.skipTaggedFields(buf, &pos) catch return false;
+        return true;
+    }
+
+    fn validateLeaveGroupRequestFrame(buf: []const u8, start_pos: usize, api_version: i16) bool {
+        const flexible = api_version >= 4;
+        var pos = start_pos;
+
+        if (!skipKafkaString(buf, &pos, flexible)) return false; // group_id
+        if (api_version <= 2) {
+            if (!skipKafkaString(buf, &pos, false)) return false; // member_id
+        }
+        if (api_version >= 3) {
+            const member_count = readKafkaArrayCount(buf, &pos, flexible) orelse return false;
+            for (0..member_count) |_| {
+                if (!skipKafkaString(buf, &pos, flexible)) return false; // member_id
+                if (!skipKafkaString(buf, &pos, flexible)) return false; // group_instance_id
+                if (api_version >= 5) {
+                    if (!skipKafkaString(buf, &pos, true)) return false; // reason
+                }
+                if (flexible) ser.skipTaggedFields(buf, &pos) catch return false;
+            }
         }
         if (flexible) ser.skipTaggedFields(buf, &pos) catch return false;
         return true;
@@ -11098,6 +11139,104 @@ test "Broker.handleRequest Heartbeat rejects truncated request" {
 
     var buf: [128]u8 = undefined;
     const req_len = buildTestRequest(&buf, 12, 4, 1206, header_mod.requestHeaderVersion(12, 4));
+    try testing.expect(broker.handleRequest(buf[0..req_len]) == null);
+}
+
+test "Broker.handleRequest LeaveGroup v4 returns generated member results" {
+    const Req = generated.leave_group_request.LeaveGroupRequest;
+    const Resp = generated.leave_group_response.LeaveGroupResponse;
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+
+    const first = try broker.groups.joinGroup("leave-generated-group", null, "consumer", null);
+    const second = try broker.groups.joinGroup("leave-generated-group", null, "consumer", null);
+    const first_member_id = try testing.allocator.dupe(u8, first.member_id);
+    defer testing.allocator.free(first_member_id);
+    const second_member_id = try testing.allocator.dupe(u8, second.member_id);
+    defer testing.allocator.free(second_member_id);
+
+    const members = [_]Req.MemberIdentity{
+        .{ .member_id = first.member_id, .group_instance_id = null },
+        .{ .member_id = second.member_id, .group_instance_id = "instance-2" },
+    };
+    const req = Req{
+        .group_id = "leave-generated-group",
+        .members = &members,
+    };
+
+    var buf: [512]u8 = undefined;
+    var pos = buildTestRequest(&buf, 13, 4, 1304, header_mod.requestHeaderVersion(13, 4));
+    req.serialize(&buf, &pos, 4);
+
+    const response = broker.handleRequest(buf[0..pos]);
+    try testing.expect(response != null);
+    defer testing.allocator.free(response.?);
+
+    var rpos: usize = 0;
+    var response_header = try ResponseHeader.deserialize(testing.allocator, response.?, &rpos, header_mod.responseHeaderVersion(13, 4));
+    defer response_header.deinit(testing.allocator);
+    try testing.expectEqual(@as(i32, 1304), response_header.correlation_id);
+
+    const resp = try Resp.deserialize(testing.allocator, response.?, &rpos, 4);
+    defer if (resp.members.len > 0) testing.allocator.free(resp.members);
+
+    try testing.expectEqual(response.?.len, rpos);
+    try testing.expectEqual(@as(i32, 0), resp.throttle_time_ms);
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.none)), resp.error_code);
+    try testing.expectEqual(@as(usize, 2), resp.members.len);
+    try testing.expectEqualStrings(first_member_id, resp.members[0].member_id.?);
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.none)), resp.members[0].error_code);
+    try testing.expectEqualStrings(second_member_id, resp.members[1].member_id.?);
+    try testing.expectEqualStrings("instance-2", resp.members[1].group_instance_id.?);
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.none)), resp.members[1].error_code);
+    try testing.expectEqual(@as(usize, 0), broker.groups.groups.getPtr("leave-generated-group").?.memberCount());
+}
+
+test "Broker.handleRequest LeaveGroup v4 returns generated per-member error" {
+    const Req = generated.leave_group_request.LeaveGroupRequest;
+    const Resp = generated.leave_group_response.LeaveGroupResponse;
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+
+    const members = [_]Req.MemberIdentity{.{
+        .member_id = "missing-member",
+        .group_instance_id = null,
+    }};
+    const req = Req{
+        .group_id = "missing-group",
+        .members = &members,
+    };
+
+    var buf: [512]u8 = undefined;
+    var pos = buildTestRequest(&buf, 13, 4, 1305, header_mod.requestHeaderVersion(13, 4));
+    req.serialize(&buf, &pos, 4);
+
+    const response = broker.handleRequest(buf[0..pos]);
+    try testing.expect(response != null);
+    defer testing.allocator.free(response.?);
+
+    var rpos: usize = 0;
+    var response_header = try ResponseHeader.deserialize(testing.allocator, response.?, &rpos, header_mod.responseHeaderVersion(13, 4));
+    defer response_header.deinit(testing.allocator);
+    try testing.expectEqual(@as(i32, 1305), response_header.correlation_id);
+
+    const resp = try Resp.deserialize(testing.allocator, response.?, &rpos, 4);
+    defer if (resp.members.len > 0) testing.allocator.free(resp.members);
+
+    try testing.expectEqual(response.?.len, rpos);
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.none)), resp.error_code);
+    try testing.expectEqual(@as(usize, 1), resp.members.len);
+    try testing.expectEqual(@as(i16, 16), resp.members[0].error_code);
+}
+
+test "Broker.handleRequest LeaveGroup rejects truncated request" {
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+
+    var buf: [128]u8 = undefined;
+    const req_len = buildTestRequest(&buf, 13, 4, 1306, header_mod.requestHeaderVersion(13, 4));
     try testing.expect(broker.handleRequest(buf[0..req_len]) == null);
 }
 
