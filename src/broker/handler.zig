@@ -1459,7 +1459,7 @@ pub const Broker = struct {
             13 => self.handleLeaveGroup(request_bytes, pos, &req_header, api_version, resp_header_version),
             14 => self.handleSyncGroup(request_bytes, pos, &req_header, api_version, resp_header_version),
             15 => self.handleDescribeGroups(request_bytes, pos, &req_header, resp_header_version),
-            16 => self.handleListGroups(&req_header, resp_header_version),
+            16 => self.handleListGroups(request_bytes, pos, &req_header, api_version, resp_header_version),
             17 => self.handleSaslHandshake(request_bytes, pos, &req_header, resp_header_version),
             18 => self.handleApiVersions(request_bytes, pos, &req_header, api_version, resp_header_version),
             19 => self.handleCreateTopics(request_bytes, pos, &req_header, api_version, resp_header_version),
@@ -2951,24 +2951,84 @@ pub const Broker = struct {
     // ---------------------------------------------------------------
     // ListGroups (key 16)
     // ---------------------------------------------------------------
-    fn handleListGroups(self: *Broker, req_header: *const RequestHeader, resp_header_version: i16) ?[]u8 {
-        var resp_buf = self.allocator.alloc(u8, 4096) catch return null;
-        var wpos: usize = 0;
-        const resp_header = ResponseHeader{ .correlation_id = req_header.correlation_id };
-        resp_header.serialize(resp_buf, &wpos, resp_header_version);
-        ser.writeI16(resp_buf, &wpos, 0); // error_code
+    fn handleListGroups(self: *Broker, request_bytes: []const u8, body_start: usize, req_header: *const RequestHeader, api_version: i16, resp_header_version: i16) ?[]u8 {
+        const Req = generated.list_groups_request.ListGroupsRequest;
+        const Resp = generated.list_groups_response.ListGroupsResponse;
 
-        const group_count = self.groups.groupCount();
-        ser.writeArrayLen(resp_buf, &wpos, group_count);
+        if (!validateListGroupsRequestFrame(request_bytes, body_start, api_version)) {
+            log.warn("Malformed ListGroups request", .{});
+            return null;
+        }
+
+        var pos = body_start;
+        var req = Req.deserialize(self.allocator, request_bytes, &pos, api_version) catch |err| {
+            log.warn("Failed to decode ListGroups request: {}", .{err});
+            return null;
+        };
+        defer self.freeListGroupsRequest(&req);
+
+        const listed_groups = self.collectListedGroups(req) catch return null;
+        defer if (listed_groups.len > 0) self.allocator.free(listed_groups);
+
+        const resp = Resp{
+            .throttle_time_ms = 0,
+            .error_code = @intFromEnum(ErrorCode.none),
+            .groups = listed_groups,
+        };
+        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+    }
+
+    fn freeListGroupsRequest(self: *Broker, req: *generated.list_groups_request.ListGroupsRequest) void {
+        if (req.states_filter.len > 0) self.allocator.free(req.states_filter);
+        if (req.types_filter.len > 0) self.allocator.free(req.types_filter);
+    }
+
+    fn collectListedGroups(self: *Broker, req: generated.list_groups_request.ListGroupsRequest) ![]generated.list_groups_response.ListGroupsResponse.ListedGroup {
+        const ListedGroup = generated.list_groups_response.ListGroupsResponse.ListedGroup;
+
+        var listed = std.array_list.Managed(ListedGroup).init(self.allocator);
+        errdefer listed.deinit();
 
         var git = self.groups.groups.iterator();
         while (git.next()) |entry| {
-            ser.writeString(resp_buf, &wpos, entry.value_ptr.group_id);
-            ser.writeString(resp_buf, &wpos, "consumer"); // protocol_type
+            const group = entry.value_ptr;
+            const state_name = consumerGroupStateName(group.state);
+            if (!stringFilterAllows(req.states_filter, state_name)) continue;
+            if (!stringFilterAllows(req.types_filter, "classic")) continue;
+
+            try listed.append(.{
+                .group_id = group.group_id,
+                .protocol_type = "consumer",
+                .group_state = state_name,
+                .group_type = "classic",
+            });
         }
 
-        if (resp_header_version >= 1) ser.writeEmptyTaggedFields(resp_buf, &wpos);
-        return (self.allocator.realloc(resp_buf, wpos) catch resp_buf)[0..wpos];
+        if (listed.items.len == 0) {
+            listed.deinit();
+            return &.{};
+        }
+        return try listed.toOwnedSlice();
+    }
+
+    fn consumerGroupStateName(state: @import("group_coordinator.zig").ConsumerGroup.GroupState) []const u8 {
+        return switch (state) {
+            .empty => "Empty",
+            .preparing_rebalance => "PreparingRebalance",
+            .completing_rebalance => "CompletingRebalance",
+            .stable => "Stable",
+            .dead => "Dead",
+        };
+    }
+
+    fn stringFilterAllows(filter: []const ?[]const u8, value: []const u8) bool {
+        if (filter.len == 0) return true;
+        for (filter) |item| {
+            if (item) |needle| {
+                if (std.mem.eql(u8, needle, value)) return true;
+            }
+        }
+        return false;
     }
 
     // ---------------------------------------------------------------
@@ -6710,6 +6770,26 @@ pub const Broker = struct {
         return true;
     }
 
+    fn validateListGroupsRequestFrame(buf: []const u8, start_pos: usize, api_version: i16) bool {
+        const flexible = api_version >= 3;
+        var pos = start_pos;
+
+        if (api_version >= 4) {
+            const state_count = readKafkaArrayCount(buf, &pos, flexible) orelse return false;
+            for (0..state_count) |_| {
+                if (!skipKafkaString(buf, &pos, flexible)) return false; // state
+            }
+        }
+        if (api_version >= 5) {
+            const type_count = readKafkaArrayCount(buf, &pos, flexible) orelse return false;
+            for (0..type_count) |_| {
+                if (!skipKafkaString(buf, &pos, flexible)) return false; // type
+            }
+        }
+        if (flexible) ser.skipTaggedFields(buf, &pos) catch return false;
+        return true;
+    }
+
     fn validateDescribeAclsRequestFrame(buf: []const u8, start_pos: usize, api_version: i16) bool {
         const flexible = api_version >= 2;
         var pos = start_pos;
@@ -7552,20 +7632,81 @@ test "Broker.handleRequest Produce v0 minimal" {
     try testing.expectEqual(@as(i32, 300), corr_id);
 }
 
-test "Broker.handleRequest ListGroups (key=16)" {
+test "Broker.handleRequest ListGroups v4 returns generated filtered groups" {
+    const Req = generated.list_groups_request.ListGroupsRequest;
+    const Resp = generated.list_groups_response.ListGroupsResponse;
+
     var broker = Broker.init(testing.allocator, 1, 9092);
     defer broker.deinit();
+    _ = try broker.groups.joinGroup("listed-group", null, "consumer", null);
 
-    var buf: [256]u8 = undefined;
-    const req_len = buildTestRequest(&buf, 16, 0, 400, 1);
+    const states = [_]?[]const u8{"PreparingRebalance"};
+    const req = Req{ .states_filter = &states };
 
-    const response = broker.handleRequest(buf[0..req_len]);
+    var buf: [512]u8 = undefined;
+    var pos = buildTestRequest(&buf, 16, 4, 1604, header_mod.requestHeaderVersion(16, 4));
+    req.serialize(&buf, &pos, 4);
+
+    const response = broker.handleRequest(buf[0..pos]);
     try testing.expect(response != null);
     defer testing.allocator.free(response.?);
 
     var rpos: usize = 0;
-    const corr_id = ser.readI32(response.?, &rpos);
-    try testing.expectEqual(@as(i32, 400), corr_id);
+    var response_header = try ResponseHeader.deserialize(testing.allocator, response.?, &rpos, header_mod.responseHeaderVersion(16, 4));
+    defer response_header.deinit(testing.allocator);
+    try testing.expectEqual(@as(i32, 1604), response_header.correlation_id);
+
+    const resp = try Resp.deserialize(testing.allocator, response.?, &rpos, 4);
+    defer if (resp.groups.len > 0) testing.allocator.free(resp.groups);
+
+    try testing.expectEqual(response.?.len, rpos);
+    try testing.expectEqual(@as(i32, 0), resp.throttle_time_ms);
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.none)), resp.error_code);
+    try testing.expectEqual(@as(usize, 1), resp.groups.len);
+    try testing.expectEqualStrings("listed-group", resp.groups[0].group_id.?);
+    try testing.expectEqualStrings("consumer", resp.groups[0].protocol_type.?);
+    try testing.expectEqualStrings("PreparingRebalance", resp.groups[0].group_state.?);
+}
+
+test "Broker.handleRequest ListGroups v4 state filter can return no groups" {
+    const Req = generated.list_groups_request.ListGroupsRequest;
+    const Resp = generated.list_groups_response.ListGroupsResponse;
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+    _ = try broker.groups.joinGroup("listed-group", null, "consumer", null);
+
+    const states = [_]?[]const u8{"Stable"};
+    const req = Req{ .states_filter = &states };
+
+    var buf: [512]u8 = undefined;
+    var pos = buildTestRequest(&buf, 16, 4, 1605, header_mod.requestHeaderVersion(16, 4));
+    req.serialize(&buf, &pos, 4);
+
+    const response = broker.handleRequest(buf[0..pos]);
+    try testing.expect(response != null);
+    defer testing.allocator.free(response.?);
+
+    var rpos: usize = 0;
+    var response_header = try ResponseHeader.deserialize(testing.allocator, response.?, &rpos, header_mod.responseHeaderVersion(16, 4));
+    defer response_header.deinit(testing.allocator);
+    try testing.expectEqual(@as(i32, 1605), response_header.correlation_id);
+
+    const resp = try Resp.deserialize(testing.allocator, response.?, &rpos, 4);
+    defer if (resp.groups.len > 0) testing.allocator.free(resp.groups);
+
+    try testing.expectEqual(response.?.len, rpos);
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.none)), resp.error_code);
+    try testing.expectEqual(@as(usize, 0), resp.groups.len);
+}
+
+test "Broker.handleRequest ListGroups rejects truncated request" {
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+
+    var buf: [128]u8 = undefined;
+    const req_len = buildTestRequest(&buf, 16, 4, 1606, header_mod.requestHeaderVersion(16, 4));
+    try testing.expect(broker.handleRequest(buf[0..req_len]) == null);
 }
 
 test "Broker.handleRequest DeleteGroups v2 deletes empty group" {
