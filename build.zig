@@ -291,6 +291,8 @@ pub fn build(b: *std.Build) void {
         .{ "src/raft.zig", "raft" },
         .{ "src/broker.zig", "broker" },
         .{ "src/controller/controller.zig", "controller" },
+        .{ "src/controller/broker_registry.zig", "broker_registry" },
+        .{ "src/controller/metadata_client.zig", "metadata_client" },
         .{ "src/security.zig", "security" },
         .{ "src/streams.zig", "streams" },
         .{ "src/connect.zig", "connect" },

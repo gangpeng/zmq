@@ -87,7 +87,7 @@ gaps. Each item should land as a small, verified tranche with tests and a commit
 | Consumer groups/transactions | Partial. Core flows exist with simplified persistence. | Kafka-compatible rebalances, offset lifecycle, transactions, fencing, and coordinator failover. |
 | Security | Partial. TLS, SASL, OAuth, SCRAM, and ACL pieces exist. | Interop suites, negative tests, cert rotation, authz coverage for all APIs. |
 | Observability | Partial. Metrics and JSON logging exist. | Complete metric compatibility, readiness contracts, dashboards, and alertable SLOs. |
-| Tests | Improving. Unit/integration tests run under Zig 0.16. | Add protocol golden, S3 fault injection, multi-node e2e, chaos, perf, and client matrix gates. |
+| Tests | Improving. Unit/integration tests run under Zig 0.16. Controller, broker registry, and metadata client tests are included in the default suite. | Add protocol golden, broader multi-node e2e, chaos, perf, and client matrix gates. |
 
 ## Execution Plan
 
