@@ -3443,16 +3443,17 @@ pub const Broker = struct {
         };
         defer self.freeFindCoordinatorRequest(&req);
 
+        const coordinator = self.findCoordinatorOutcome(req.key, req.key_type, api_version);
         const coordinators = self.findCoordinatorResults(req, api_version) catch return null;
         defer if (coordinators.len > 0) self.allocator.free(coordinators);
 
         const resp = Resp{
             .throttle_time_ms = 0,
-            .error_code = @intFromEnum(ErrorCode.none),
+            .error_code = @intFromEnum(coordinator.error_code),
             .error_message = null,
-            .node_id = self.node_id,
-            .host = self.advertised_host,
-            .port = @intCast(self.port),
+            .node_id = coordinator.node_id,
+            .host = coordinator.host,
+            .port = coordinator.port,
             .coordinators = coordinators,
         };
         return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
@@ -3462,18 +3463,53 @@ pub const Broker = struct {
         if (req.coordinator_keys.len > 0) self.allocator.free(req.coordinator_keys);
     }
 
+    const FindCoordinatorOutcome = struct {
+        error_code: ErrorCode,
+        node_id: i32,
+        host: []const u8,
+        port: i32,
+    };
+
+    fn findCoordinatorOutcome(self: *Broker, key: ?[]const u8, key_type: i8, api_version: i16) FindCoordinatorOutcome {
+        if (key == null) return findCoordinatorError(ErrorCode.invalid_request);
+
+        return switch (key_type) {
+            0, 1 => .{
+                .error_code = ErrorCode.none,
+                .node_id = self.node_id,
+                .host = self.advertised_host,
+                .port = @intCast(self.port),
+            },
+            2 => if (api_version >= 6)
+                findCoordinatorError(ErrorCode.coordinator_not_available)
+            else
+                findCoordinatorError(ErrorCode.invalid_request),
+            else => findCoordinatorError(ErrorCode.invalid_request),
+        };
+    }
+
+    fn findCoordinatorError(error_code: ErrorCode) FindCoordinatorOutcome {
+        return .{
+            .error_code = error_code,
+            .node_id = -1,
+            .host = "",
+            .port = -1,
+        };
+    }
+
     fn findCoordinatorResults(self: *Broker, req: generated.find_coordinator_request.FindCoordinatorRequest, api_version: i16) ![]generated.find_coordinator_response.FindCoordinatorResponse.Coordinator {
         const Coordinator = generated.find_coordinator_response.FindCoordinatorResponse.Coordinator;
         if (api_version < 4) return &.{};
 
         const coordinators = try self.allocator.alloc(Coordinator, req.coordinator_keys.len);
         for (req.coordinator_keys, 0..) |key, i| {
+            const coordinator = self.findCoordinatorOutcome(key, req.key_type, api_version);
             coordinators[i] = .{
                 .key = key,
-                .node_id = self.node_id,
-                .host = self.advertised_host,
-                .port = @intCast(self.port),
-                .error_code = @intFromEnum(ErrorCode.none),
+                .node_id = coordinator.node_id,
+                .host = coordinator.host,
+                .port = coordinator.port,
+                .error_code = @intFromEnum(coordinator.error_code),
                 .error_message = null,
             };
         }
@@ -11167,6 +11203,39 @@ test "Broker.handleRequest FindCoordinator v1 returns generated coordinator" {
     try testing.expectEqual(@as(i32, 9092), resp.port);
 }
 
+test "Broker.handleRequest FindCoordinator rejects invalid legacy coordinator type" {
+    const Req = generated.find_coordinator_request.FindCoordinatorRequest;
+    const Resp = generated.find_coordinator_response.FindCoordinatorResponse;
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+
+    const req = Req{
+        .key = "my-group",
+        .key_type = 9,
+    };
+
+    var buf: [256]u8 = undefined;
+    var pos = buildTestRequest(&buf, 10, 2, 1002, header_mod.requestHeaderVersion(10, 2));
+    req.serialize(&buf, &pos, 2);
+
+    const response = broker.handleRequest(buf[0..pos]);
+    try testing.expect(response != null);
+    defer testing.allocator.free(response.?);
+
+    var rpos: usize = 0;
+    var response_header = try ResponseHeader.deserialize(testing.allocator, response.?, &rpos, header_mod.responseHeaderVersion(10, 2));
+    defer response_header.deinit(testing.allocator);
+    try testing.expectEqual(@as(i32, 1002), response_header.correlation_id);
+
+    const resp = try Resp.deserialize(testing.allocator, response.?, &rpos, 2);
+    try testing.expectEqual(response.?.len, rpos);
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.invalid_request)), resp.error_code);
+    try testing.expectEqual(@as(i32, -1), resp.node_id);
+    try testing.expectEqualStrings("", resp.host.?);
+    try testing.expectEqual(@as(i32, -1), resp.port);
+}
+
 test "Broker.handleRequest FindCoordinator v4 returns generated batch coordinators" {
     const Req = generated.find_coordinator_request.FindCoordinatorRequest;
     const Resp = generated.find_coordinator_response.FindCoordinatorResponse;
@@ -11204,6 +11273,83 @@ test "Broker.handleRequest FindCoordinator v4 returns generated batch coordinato
     try testing.expectEqualStrings("localhost", resp.coordinators[0].host.?);
     try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.none)), resp.coordinators[0].error_code);
     try testing.expectEqualStrings("group-b", resp.coordinators[1].key.?);
+}
+
+test "Broker.handleRequest FindCoordinator rejects invalid batch coordinator type" {
+    const Req = generated.find_coordinator_request.FindCoordinatorRequest;
+    const Resp = generated.find_coordinator_response.FindCoordinatorResponse;
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+
+    const keys = [_]?[]const u8{ "group-a", "group-b" };
+    const req = Req{
+        .key_type = 9,
+        .coordinator_keys = &keys,
+    };
+
+    var buf: [512]u8 = undefined;
+    var pos = buildTestRequest(&buf, 10, 4, 1006, header_mod.requestHeaderVersion(10, 4));
+    req.serialize(&buf, &pos, 4);
+
+    const response = broker.handleRequest(buf[0..pos]);
+    try testing.expect(response != null);
+    defer testing.allocator.free(response.?);
+
+    var rpos: usize = 0;
+    var response_header = try ResponseHeader.deserialize(testing.allocator, response.?, &rpos, header_mod.responseHeaderVersion(10, 4));
+    defer response_header.deinit(testing.allocator);
+    try testing.expectEqual(@as(i32, 1006), response_header.correlation_id);
+
+    const resp = try Resp.deserialize(testing.allocator, response.?, &rpos, 4);
+    defer if (resp.coordinators.len > 0) testing.allocator.free(resp.coordinators);
+
+    try testing.expectEqual(response.?.len, rpos);
+    try testing.expectEqual(@as(usize, 2), resp.coordinators.len);
+    for (resp.coordinators) |coordinator| {
+        try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.invalid_request)), coordinator.error_code);
+        try testing.expectEqual(@as(i32, -1), coordinator.node_id);
+        try testing.expectEqualStrings("", coordinator.host.?);
+        try testing.expectEqual(@as(i32, -1), coordinator.port);
+    }
+}
+
+test "Broker.handleRequest FindCoordinator reports share coordinator unavailable" {
+    const Req = generated.find_coordinator_request.FindCoordinatorRequest;
+    const Resp = generated.find_coordinator_response.FindCoordinatorResponse;
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+
+    const keys = [_]?[]const u8{"share-group-a"};
+    const req = Req{
+        .key_type = 2,
+        .coordinator_keys = &keys,
+    };
+
+    var buf: [512]u8 = undefined;
+    var pos = buildTestRequest(&buf, 10, 6, 1007, header_mod.requestHeaderVersion(10, 6));
+    req.serialize(&buf, &pos, 6);
+
+    const response = broker.handleRequest(buf[0..pos]);
+    try testing.expect(response != null);
+    defer testing.allocator.free(response.?);
+
+    var rpos: usize = 0;
+    var response_header = try ResponseHeader.deserialize(testing.allocator, response.?, &rpos, header_mod.responseHeaderVersion(10, 6));
+    defer response_header.deinit(testing.allocator);
+    try testing.expectEqual(@as(i32, 1007), response_header.correlation_id);
+
+    const resp = try Resp.deserialize(testing.allocator, response.?, &rpos, 6);
+    defer if (resp.coordinators.len > 0) testing.allocator.free(resp.coordinators);
+
+    try testing.expectEqual(response.?.len, rpos);
+    try testing.expectEqual(@as(usize, 1), resp.coordinators.len);
+    try testing.expectEqualStrings("share-group-a", resp.coordinators[0].key.?);
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.coordinator_not_available)), resp.coordinators[0].error_code);
+    try testing.expectEqual(@as(i32, -1), resp.coordinators[0].node_id);
+    try testing.expectEqualStrings("", resp.coordinators[0].host.?);
+    try testing.expectEqual(@as(i32, -1), resp.coordinators[0].port);
 }
 
 test "Broker.handleRequest FindCoordinator rejects truncated request" {
