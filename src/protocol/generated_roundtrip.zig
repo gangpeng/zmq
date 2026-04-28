@@ -2,6 +2,29 @@ const std = @import("std");
 const generated = @import("generated_index.zig");
 
 const testing = std.testing;
+const default_round_trip_versions = [_]i16{
+    0,
+    1,
+    2,
+    3,
+    4,
+    5,
+    6,
+    7,
+    8,
+    9,
+    10,
+    11,
+    12,
+    13,
+    14,
+    15,
+    16,
+    17,
+    18,
+    19,
+    20,
+};
 
 fn roundTripDefault(comptime Message: type, comptime version: i16) !void {
     var value = Message{};
@@ -21,12 +44,12 @@ fn roundTripDefault(comptime Message: type, comptime version: i16) !void {
 }
 
 fn roundTripDefaultVersions(comptime Message: type) !void {
-    inline for (.{ 0, 1, 2 }) |version| {
+    inline for (default_round_trip_versions) |version| {
         try roundTripDefault(Message, version);
     }
 }
 
-test "generated default messages round-trip through serialize deserialize and calcSize" {
+test "generated default messages round-trip across common protocol versions" {
     const messages = .{
         generated.add_offsets_to_txn_request.AddOffsetsToTxnRequest,
         generated.add_offsets_to_txn_response.AddOffsetsToTxnResponse,
