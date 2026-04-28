@@ -577,10 +577,7 @@ pub const Broker = struct {
 
         // Load persisted offsets into group coordinator
         const saved_offsets = try self.persistence.loadOffsets();
-        defer {
-            for (saved_offsets) |entry| self.allocator.free(entry.key);
-            self.allocator.free(saved_offsets);
-        }
+        defer self.persistence.freeOffsetEntries(saved_offsets);
 
         for (saved_offsets) |entry| {
             // Key format: "group:topic:partition" (as stored by GroupCoordinator.commitOffset)
@@ -590,7 +587,7 @@ pub const Broker = struct {
             const partition_str = parts.next() orelse continue;
             const partition = std.fmt.parseInt(i32, partition_str, 10) catch continue;
 
-            self.groups.commitOffset(group_id, topic, partition, entry.offset) catch |err| {
+            self.groups.commitOffsetWithMetadata(group_id, topic, partition, entry.offset, entry.leader_epoch, entry.metadata) catch |err| {
                 log.warn("Failed to restore offset for {s}/{s}-{d}: {}", .{ group_id, topic, partition, err });
             };
         }
@@ -1320,24 +1317,7 @@ pub const Broker = struct {
 
     /// Persist committed offsets from group coordinator (best-effort).
     fn persistOffsets(self: *Broker) void {
-        // The committed_offsets map has keys in format "group:topic:partition"
-        // We save as-is using a wrapper that matches the persistence API
-        var offsets_copy = std.StringHashMap(i64).init(self.allocator);
-        defer {
-            var kit = offsets_copy.keyIterator();
-            while (kit.next()) |k| self.allocator.free(k.*);
-            offsets_copy.deinit();
-        }
-
-        var it = self.groups.committed_offsets.iterator();
-        while (it.next()) |entry| {
-            const key = self.allocator.dupe(u8, entry.key_ptr.*) catch continue;
-            offsets_copy.put(key, entry.value_ptr.*) catch {
-                self.allocator.free(key);
-            };
-        }
-
-        self.persistence.saveOffsets(&offsets_copy) catch |err| {
+        self.persistence.saveOffsets(&self.groups.committed_offsets) catch |err| {
             log.warn("Failed to persist offsets: {}", .{err});
         };
     }
@@ -3798,7 +3778,7 @@ pub const Broker = struct {
                 };
 
                 const error_code: i16 = blk: {
-                    self.groups.commitOffsetWithLag(group_id, topic_name, partition_id, offset, leo) catch |err| {
+                    self.groups.commitOffsetWithMetadataAndLag(group_id, topic_name, partition_id, offset, partition_req.committed_leader_epoch, partition_req.committed_metadata, leo) catch |err| {
                         log.warn("OffsetCommit failed for {s}:{s}:{d}: {}", .{ group_id, topic_name, partition_id, err });
                         break :blk @intFromEnum(ErrorCode.kafka_storage_error);
                     };
@@ -3975,12 +3955,12 @@ pub const Broker = struct {
 
                 const topic_name = topic_req.name orelse "";
                 for (topic_req.partition_indexes, 0..) |partition_id, partition_idx| {
-                    const committed = self.groups.fetchOffset(group_id, topic_name, partition_id) catch null;
+                    const committed = self.groups.fetchOffsetRecord(group_id, topic_name, partition_id) catch null;
                     writable[partition_idx] = .{
                         .partition_index = partition_id,
-                        .committed_offset = committed orelse -1,
-                        .committed_leader_epoch = -1,
-                        .metadata = null,
+                        .committed_offset = if (committed) |record| record.offset else -1,
+                        .committed_leader_epoch = if (committed) |record| record.leader_epoch else -1,
+                        .metadata = if (committed) |record| record.metadata else null,
                         .error_code = @intFromEnum(ErrorCode.none),
                     };
                 }
@@ -4038,8 +4018,8 @@ pub const Broker = struct {
                 partitions[partition_idx] = .{
                     .partition_index = offset.partition,
                     .committed_offset = offset.offset,
-                    .committed_leader_epoch = -1,
-                    .metadata = null,
+                    .committed_leader_epoch = offset.leader_epoch,
+                    .metadata = offset.metadata,
                     .error_code = @intFromEnum(ErrorCode.none),
                 };
             }
@@ -4098,12 +4078,12 @@ pub const Broker = struct {
 
                 const topic_name = topic_req.name orelse "";
                 for (topic_req.partition_indexes, 0..) |partition_id, partition_idx| {
-                    const committed = self.groups.fetchOffset(group_id, topic_name, partition_id) catch null;
+                    const committed = self.groups.fetchOffsetRecord(group_id, topic_name, partition_id) catch null;
                     writable[partition_idx] = .{
                         .partition_index = partition_id,
-                        .committed_offset = committed orelse -1,
-                        .committed_leader_epoch = -1,
-                        .metadata = null,
+                        .committed_offset = if (committed) |record| record.offset else -1,
+                        .committed_leader_epoch = if (committed) |record| record.leader_epoch else -1,
+                        .metadata = if (committed) |record| record.metadata else null,
                         .error_code = @intFromEnum(ErrorCode.none),
                     };
                 }
@@ -4161,8 +4141,8 @@ pub const Broker = struct {
                 partitions[partition_idx] = .{
                     .partition_index = offset.partition,
                     .committed_offset = offset.offset,
-                    .committed_leader_epoch = -1,
-                    .metadata = null,
+                    .committed_leader_epoch = offset.leader_epoch,
+                    .metadata = offset.metadata,
                     .error_code = @intFromEnum(ErrorCode.none),
                 };
             }
@@ -7284,6 +7264,8 @@ pub const Broker = struct {
             for (topic.partitions, 0..) |partition, partition_index| {
                 const key = std.fmt.allocPrint(self.allocator, "{s}:{s}:{d}", .{ group_id, topic_name, partition.partition_index }) catch return null;
                 if (self.groups.committed_offsets.fetchRemove(key)) |old| {
+                    var value = old.value;
+                    value.deinit(self.allocator);
                     self.allocator.free(old.key);
                     mutated = true;
                 }
@@ -7963,7 +7945,7 @@ pub const Broker = struct {
                 const error_code: i16 = blk: {
                     if (txn_error != @intFromEnum(ErrorCode.none)) break :blk txn_error;
 
-                    self.groups.commitOffset(group_id, topic, partition_req.partition_index, partition_req.committed_offset) catch |err| {
+                    self.groups.commitOffsetWithMetadata(group_id, topic, partition_req.partition_index, partition_req.committed_offset, partition_req.committed_leader_epoch, partition_req.committed_metadata) catch |err| {
                         log.warn("TxnOffsetCommit failed for {s}:{s}:{d}: {}", .{ group_id, topic, partition_req.partition_index, err });
                         break :blk @intFromEnum(ErrorCode.kafka_storage_error);
                     };
@@ -11584,10 +11566,7 @@ test "Broker.handleRequest DeleteGroups persists removed offsets" {
     try testing.expectEqual(@as(i32, 4201), resp_header.correlation_id);
 
     const loaded = try broker.persistence.loadOffsets();
-    defer {
-        for (loaded) |entry| testing.allocator.free(entry.key);
-        testing.allocator.free(loaded);
-    }
+    defer broker.persistence.freeOffsetEntries(loaded);
     try testing.expectEqual(@as(usize, 0), loaded.len);
 
     const loaded_groups = try broker.persistence.loadConsumerGroups();
@@ -12119,7 +12098,7 @@ test "Broker.handleRequest TxnOffsetCommit persists committed offsets" {
     const partitions = [_]Req.TxnOffsetCommitRequestTopic.TxnOffsetCommitRequestPartition{.{
         .partition_index = 0,
         .committed_offset = 321,
-        .committed_leader_epoch = -1,
+        .committed_leader_epoch = 12,
         .committed_metadata = "persisted",
     }};
     const topics = [_]Req.TxnOffsetCommitRequestTopic{.{
@@ -12160,13 +12139,21 @@ test "Broker.handleRequest TxnOffsetCommit persists committed offsets" {
     try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.none)), resp.topics[0].partitions[0].error_code);
 
     const loaded = try broker.persistence.loadOffsets();
-    defer {
-        for (loaded) |entry| testing.allocator.free(entry.key);
-        testing.allocator.free(loaded);
-    }
+    defer broker.persistence.freeOffsetEntries(loaded);
     try testing.expectEqual(@as(usize, 1), loaded.len);
     try testing.expectEqualStrings("txn-offset-persist-group:txn-offset-persist-topic:0", loaded[0].key);
     try testing.expectEqual(@as(i64, 321), loaded[0].offset);
+    try testing.expectEqual(@as(i32, 12), loaded[0].leader_epoch);
+    try testing.expectEqualStrings("persisted", loaded[0].metadata.?);
+
+    var restarted = Broker.initWithConfig(testing.allocator, 1, 9092, .{ .data_dir = tmp_dir });
+    defer restarted.deinit();
+    try restarted.open();
+    const restored = try restarted.groups.fetchOffsetRecord("txn-offset-persist-group", "txn-offset-persist-topic", 0);
+    try testing.expect(restored != null);
+    try testing.expectEqual(@as(i64, 321), restored.?.offset);
+    try testing.expectEqual(@as(i32, 12), restored.?.leader_epoch);
+    try testing.expectEqualStrings("persisted", restored.?.metadata.?);
 }
 
 test "Broker.handleRequest TxnOffsetCommit requires AddOffsetsToTxn registration" {
@@ -12925,8 +12912,7 @@ test "Broker.handleRequest OffsetDelete returns generated response and deletes o
     var broker = Broker.init(testing.allocator, 1, 9092);
     defer broker.deinit();
 
-    const committed_key = try testing.allocator.dupe(u8, "delete-offset-group:delete-offset-topic:0");
-    try broker.groups.committed_offsets.put(committed_key, 42);
+    try broker.groups.commitOffset("delete-offset-group", "delete-offset-topic", 0, 42);
 
     const partitions = [_]Req.OffsetDeleteRequestTopic.OffsetDeleteRequestPartition{
         .{ .partition_index = 0 },
@@ -12988,8 +12974,7 @@ test "Broker.handleRequest OffsetDelete persists deleted offsets" {
     defer broker.deinit();
     try broker.open();
 
-    const committed_key = try testing.allocator.dupe(u8, "persist-delete-group:persist-delete-topic:0");
-    try broker.groups.committed_offsets.put(committed_key, 42);
+    try broker.groups.commitOffset("persist-delete-group", "persist-delete-topic", 0, 42);
     broker.persistOffsets();
 
     const partitions = [_]Req.OffsetDeleteRequestTopic.OffsetDeleteRequestPartition{.{
@@ -13027,10 +13012,7 @@ test "Broker.handleRequest OffsetDelete persists deleted offsets" {
     try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.none)), resp.error_code);
 
     const loaded = try broker.persistence.loadOffsets();
-    defer {
-        for (loaded) |entry| testing.allocator.free(entry.key);
-        testing.allocator.free(loaded);
-    }
+    defer broker.persistence.freeOffsetEntries(loaded);
     try testing.expectEqual(@as(usize, 0), loaded.len);
 }
 
@@ -17210,6 +17192,10 @@ test "Broker.handleRequest OffsetCommit v8 returns generated response and commit
 
     const committed = try broker.groups.fetchOffset("oc-generated-group", "oc-generated-topic", 0);
     try testing.expectEqual(@as(i64, 77), committed.?);
+    const committed_record = try broker.groups.fetchOffsetRecord("oc-generated-group", "oc-generated-topic", 0);
+    try testing.expect(committed_record != null);
+    try testing.expectEqual(@as(i32, -1), committed_record.?.leader_epoch);
+    try testing.expectEqualStrings("generated-meta", committed_record.?.metadata.?);
 }
 
 test "Broker.handleRequest OffsetCommit reports coordinator commit failure per partition" {
@@ -17291,7 +17277,7 @@ test "Broker.handleRequest OffsetFetch v7 returns generated response" {
     var broker = Broker.init(testing.allocator, 1, 9092);
     defer broker.deinit();
 
-    try broker.groups.commitOffset("of-generated-group", "of-topic", 0, 123);
+    try broker.groups.commitOffsetWithMetadata("of-generated-group", "of-topic", 0, 123, 7, "fetch-meta");
 
     const partitions = [_]i32{ 0, 1 };
     const topics = [_]Topic{.{
@@ -17326,6 +17312,8 @@ test "Broker.handleRequest OffsetFetch v7 returns generated response" {
     try testing.expectEqualStrings("of-topic", resp.topics[0].name.?);
     try testing.expectEqual(@as(usize, 2), resp.topics[0].partitions.len);
     try testing.expectEqual(@as(i64, 123), resp.topics[0].partitions[0].committed_offset);
+    try testing.expectEqual(@as(i32, 7), resp.topics[0].partitions[0].committed_leader_epoch);
+    try testing.expectEqualStrings("fetch-meta", resp.topics[0].partitions[0].metadata.?);
     try testing.expectEqual(@as(i64, -1), resp.topics[0].partitions[1].committed_offset);
 }
 
@@ -17338,7 +17326,7 @@ test "Broker.handleRequest OffsetFetch v8 returns grouped generated response" {
     var broker = Broker.init(testing.allocator, 1, 9092);
     defer broker.deinit();
 
-    try broker.groups.commitOffset("of-v8-group", "of-v8-topic", 0, 321);
+    try broker.groups.commitOffsetWithMetadata("of-v8-group", "of-v8-topic", 0, 321, 9, "grouped-meta");
 
     const partitions = [_]i32{0};
     const topics = [_]Topic{.{
@@ -17381,6 +17369,8 @@ test "Broker.handleRequest OffsetFetch v8 returns grouped generated response" {
     try testing.expectEqual(@as(usize, 1), resp.groups[0].topics.len);
     try testing.expectEqualStrings("of-v8-topic", resp.groups[0].topics[0].name.?);
     try testing.expectEqual(@as(i64, 321), resp.groups[0].topics[0].partitions[0].committed_offset);
+    try testing.expectEqual(@as(i32, 9), resp.groups[0].topics[0].partitions[0].committed_leader_epoch);
+    try testing.expectEqualStrings("grouped-meta", resp.groups[0].topics[0].partitions[0].metadata.?);
 }
 
 test "Broker.handleRequest OffsetFetch v8 null topics fetches all committed offsets" {

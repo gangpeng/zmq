@@ -5,6 +5,17 @@ const log = std.log.scoped(.group_coordinator);
 const MetricRegistry = @import("core").MetricRegistry;
 const ErrorCode = @import("protocol").ErrorCode;
 
+pub const CommittedOffsetValue = struct {
+    offset: i64,
+    leader_epoch: i32 = -1,
+    metadata: ?[]u8 = null,
+
+    pub fn deinit(self: *CommittedOffsetValue, allocator: Allocator) void {
+        if (self.metadata) |metadata| allocator.free(metadata);
+        self.metadata = null;
+    }
+};
+
 /// Consumer group coordinator.
 ///
 /// Manages consumer group lifecycle:
@@ -14,7 +25,7 @@ const ErrorCode = @import("protocol").ErrorCode;
 ///          OffsetCommit, OffsetFetch
 pub const GroupCoordinator = struct {
     groups: std.StringHashMap(ConsumerGroup),
-    committed_offsets: std.StringHashMap(i64),
+    committed_offsets: std.StringHashMap(CommittedOffsetValue),
     allocator: Allocator,
     /// Optional metric registry for emitting consumer lag.
     /// Wired by the Broker after initialization.
@@ -23,7 +34,7 @@ pub const GroupCoordinator = struct {
     pub fn init(alloc: Allocator) GroupCoordinator {
         return .{
             .groups = std.StringHashMap(ConsumerGroup).init(alloc),
-            .committed_offsets = std.StringHashMap(i64).init(alloc),
+            .committed_offsets = std.StringHashMap(CommittedOffsetValue).init(alloc),
             .allocator = alloc,
         };
     }
@@ -38,6 +49,7 @@ pub const GroupCoordinator = struct {
 
         var offset_it = self.committed_offsets.iterator();
         while (offset_it.next()) |entry| {
+            entry.value_ptr.deinit(self.allocator);
             self.allocator.free(entry.key_ptr.*);
         }
         self.committed_offsets.deinit();
@@ -488,6 +500,8 @@ pub const GroupCoordinator = struct {
 
             const key = key_to_remove orelse break;
             if (self.committed_offsets.fetchRemove(key)) |old| {
+                var value = old.value;
+                value.deinit(self.allocator);
                 self.allocator.free(old.key);
             }
         }
@@ -907,13 +921,34 @@ pub const GroupCoordinator = struct {
     /// Commit an offset and optionally emit consumer lag metric.
     /// When log_end_offset is provided, lag = log_end_offset - committed_offset.
     pub fn commitOffsetWithLag(self: *GroupCoordinator, group_id: []const u8, topic: []const u8, partition: i32, offset: i64, log_end_offset: ?i64) !void {
+        return self.commitOffsetWithMetadataAndLag(group_id, topic, partition, offset, -1, null, log_end_offset);
+    }
+
+    /// Commit an offset with optional client metadata and committed leader epoch.
+    pub fn commitOffsetWithMetadata(self: *GroupCoordinator, group_id: []const u8, topic: []const u8, partition: i32, offset: i64, leader_epoch: i32, metadata: ?[]const u8) !void {
+        return self.commitOffsetWithMetadataAndLag(group_id, topic, partition, offset, leader_epoch, metadata, null);
+    }
+
+    /// Commit an offset with optional metadata and lag emission.
+    pub fn commitOffsetWithMetadataAndLag(self: *GroupCoordinator, group_id: []const u8, topic: []const u8, partition: i32, offset: i64, leader_epoch: i32, metadata: ?[]const u8, log_end_offset: ?i64) !void {
         const key = try std.fmt.allocPrint(self.allocator, "{s}:{s}:{d}", .{ group_id, topic, partition });
         errdefer self.allocator.free(key);
+        var value = CommittedOffsetValue{
+            .offset = offset,
+            .leader_epoch = leader_epoch,
+            .metadata = if (metadata) |m| try self.allocator.dupe(u8, m) else null,
+        };
+        var value_inserted = false;
+        errdefer if (!value_inserted) value.deinit(self.allocator);
+
         // Remove old entry if exists (free old key since we have a new one)
         if (self.committed_offsets.fetchRemove(key)) |old| {
+            var old_value = old.value;
+            old_value.deinit(self.allocator);
             self.allocator.free(old.key);
         }
-        try self.committed_offsets.put(key, offset);
+        try self.committed_offsets.put(key, value);
+        value_inserted = true;
 
         // Emit consumer lag metric when both metrics registry and LEO are available
         if (self.metrics) |m| {
@@ -934,6 +969,17 @@ pub const GroupCoordinator = struct {
         const key = try std.fmt.allocPrint(self.allocator, "{s}:{s}:{d}", .{ group_id, topic, partition });
         defer self.allocator.free(key);
 
+        const record = self.committed_offsets.get(key) orelse return null;
+        return record.offset;
+    }
+
+    /// Fetch the complete committed offset record for a topic-partition.
+    /// Returned metadata is borrowed from the coordinator and valid until the
+    /// offset is overwritten or removed.
+    pub fn fetchOffsetRecord(self: *const GroupCoordinator, group_id: []const u8, topic: []const u8, partition: i32) !?CommittedOffsetValue {
+        const key = try std.fmt.allocPrint(self.allocator, "{s}:{s}:{d}", .{ group_id, topic, partition });
+        defer self.allocator.free(key);
+
         return self.committed_offsets.get(key);
     }
 
@@ -941,6 +987,8 @@ pub const GroupCoordinator = struct {
         topic: []const u8,
         partition: i32,
         offset: i64,
+        leader_epoch: i32 = -1,
+        metadata: ?[]const u8 = null,
     };
 
     /// Return all committed offsets for a group, sorted by topic and partition.
@@ -964,7 +1012,9 @@ pub const GroupCoordinator = struct {
             try offsets.append(.{
                 .topic = rest[0..partition_sep],
                 .partition = partition,
-                .offset = entry.value_ptr.*,
+                .offset = entry.value_ptr.offset,
+                .leader_epoch = entry.value_ptr.leader_epoch,
+                .metadata = entry.value_ptr.metadata,
             });
         }
 

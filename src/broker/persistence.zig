@@ -347,7 +347,14 @@ pub const MetadataPersistence = struct {
         const writer = file.writer();
         var it = offsets.iterator();
         while (it.next()) |entry| {
-            try writer.print("{s}\t{d}\n", .{ entry.key_ptr.*, entry.value_ptr.* });
+            try writer.print("{s}\t{d}\t{d}\t", .{ entry.key_ptr.*, entry.value_ptr.offset, entry.value_ptr.leader_epoch });
+            if (entry.value_ptr.metadata) |metadata| {
+                try file.writeAll("1\t");
+                try writeHex(file, metadata);
+            } else {
+                try file.writeAll("0\t");
+            }
+            try file.writeAll("\n");
         }
         try file.sync();
     }
@@ -380,9 +387,19 @@ pub const MetadataPersistence = struct {
             const key = fields.next() orelse continue;
             const val_str = fields.next() orelse continue;
             const offset = std.fmt.parseInt(i64, val_str, 10) catch continue;
+            const leader_epoch_str = fields.next() orelse "";
+            const leader_epoch = if (leader_epoch_str.len > 0)
+                std.fmt.parseInt(i32, leader_epoch_str, 10) catch -1
+            else
+                -1;
+            const has_metadata_str = fields.next() orelse "0";
+            const metadata_hex = fields.next() orelse "";
+            const metadata = decodeOptionalHexAlloc(self.allocator, has_metadata_str, metadata_hex) catch continue;
             try entries.append(.{
                 .key = try self.allocator.dupe(u8, key),
                 .offset = offset,
+                .leader_epoch = leader_epoch,
+                .metadata = metadata,
             });
         }
 
@@ -770,7 +787,17 @@ pub const MetadataPersistence = struct {
     pub const OffsetEntry = struct {
         key: []u8,
         offset: i64,
+        leader_epoch: i32 = -1,
+        metadata: ?[]u8 = null,
     };
+
+    pub fn freeOffsetEntries(self: *MetadataPersistence, entries: []OffsetEntry) void {
+        for (entries) |entry| {
+            self.allocator.free(entry.key);
+            if (entry.metadata) |metadata| self.allocator.free(metadata);
+        }
+        if (entries.len > 0) self.allocator.free(entries);
+    }
 
     pub const ConsumerGroupMemberEntry = struct {
         member_id: []u8,
