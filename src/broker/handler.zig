@@ -3509,8 +3509,23 @@ pub const Broker = struct {
 
         const member_id = nonEmptyStringOrNull(req.member_id);
         const protocol_type = req.protocol_type orelse "consumer";
-        const protocol_name = selectedJoinGroupProtocolName(req);
-        const result = self.groups.joinGroupWithInstanceId(req.group_id orelse "", member_id, req.group_instance_id, protocol_type, null) catch return null;
+        const protocol_selection = self.selectJoinGroupProtocol(req.group_id orelse "", protocol_type, req);
+        if (protocol_selection.error_code != @intFromEnum(ErrorCode.none)) {
+            const resp = Resp{
+                .throttle_time_ms = 0,
+                .error_code = protocol_selection.error_code,
+                .generation_id = -1,
+                .protocol_type = protocol_type,
+                .protocol_name = "",
+                .leader = "",
+                .skip_assignment = false,
+                .member_id = req.member_id orelse "",
+                .members = &.{},
+            };
+            return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+        }
+
+        const result = self.groups.joinGroupWithProtocol(req.group_id orelse "", member_id, req.group_instance_id, protocol_type, protocol_selection.name, protocol_selection.metadata, null) catch return null;
         if (result.error_code == @intFromEnum(ErrorCode.none)) self.persistConsumerGroups();
 
         var members: []Resp.JoinGroupResponseMember = &.{};
@@ -3524,7 +3539,7 @@ pub const Broker = struct {
             .error_code = result.error_code,
             .generation_id = result.generation_id,
             .protocol_type = protocol_type,
-            .protocol_name = protocol_name,
+            .protocol_name = protocol_selection.name,
             .leader = result.leader_id orelse "",
             .skip_assignment = false,
             .member_id = result.member_id,
@@ -3550,18 +3565,57 @@ pub const Broker = struct {
             members[member_idx] = .{
                 .member_id = member.member_id,
                 .group_instance_id = member.group_instance_id,
-                .metadata = null,
+                .metadata = member.protocol_metadata,
             };
             member_idx += 1;
         }
         return members;
     }
 
-    fn selectedJoinGroupProtocolName(req: generated.join_group_request.JoinGroupRequest) []const u8 {
-        if (req.protocols.len > 0) {
-            return req.protocols[0].name orelse "range";
+    const JoinGroupProtocolSelection = struct {
+        error_code: i16,
+        name: []const u8 = "",
+        metadata: ?[]const u8 = null,
+    };
+
+    fn selectJoinGroupProtocol(self: *Broker, group_id: []const u8, protocol_type: []const u8, req: generated.join_group_request.JoinGroupRequest) JoinGroupProtocolSelection {
+        if (group_id.len == 0) return .{ .error_code = @intFromEnum(ErrorCode.invalid_group_id) };
+        if (protocol_type.len == 0 or req.protocols.len == 0) {
+            return .{ .error_code = @intFromEnum(ErrorCode.inconsistent_group_protocol) };
         }
-        return "range";
+
+        if (self.groups.groups.getPtr(group_id)) |group| {
+            if (group.protocol_type) |existing_type| {
+                if (!std.mem.eql(u8, existing_type, protocol_type)) {
+                    return .{ .error_code = @intFromEnum(ErrorCode.inconsistent_group_protocol) };
+                }
+            }
+            if (group.protocol_name) |existing_name| {
+                for (req.protocols) |protocol_req| {
+                    const candidate = protocol_req.name orelse continue;
+                    if (std.mem.eql(u8, candidate, existing_name)) {
+                        return .{
+                            .error_code = @intFromEnum(ErrorCode.none),
+                            .name = existing_name,
+                            .metadata = protocol_req.metadata,
+                        };
+                    }
+                }
+                return .{ .error_code = @intFromEnum(ErrorCode.inconsistent_group_protocol) };
+            }
+        }
+
+        for (req.protocols) |protocol_req| {
+            const candidate = protocol_req.name orelse continue;
+            if (candidate.len == 0) continue;
+            return .{
+                .error_code = @intFromEnum(ErrorCode.none),
+                .name = candidate,
+                .metadata = protocol_req.metadata,
+            };
+        }
+
+        return .{ .error_code = @intFromEnum(ErrorCode.inconsistent_group_protocol) };
     }
 
     fn nonEmptyStringOrNull(value: ?[]const u8) ?[]const u8 {
@@ -16469,6 +16523,48 @@ test "Broker.handleRequest JoinGroup v9 returns generated response" {
     try testing.expect(!resp.skip_assignment);
     try testing.expectEqual(@as(usize, 1), resp.members.len);
     try testing.expectEqualStrings(resp.member_id.?, resp.members[0].member_id.?);
+    try testing.expect(resp.members[0].metadata != null);
+    try testing.expectEqualStrings("", resp.members[0].metadata.?);
+
+    const group = broker.groups.groups.getPtr("jg-generated-group").?;
+    try testing.expectEqualStrings("consumer", group.protocol_type.?);
+    try testing.expectEqualStrings("range", group.protocol_name.?);
+
+    const bad_protocols = [_]Protocol{.{
+        .name = "roundrobin",
+        .metadata = "roundrobin-metadata",
+    }};
+    const bad_req = Req{
+        .group_id = "jg-generated-group",
+        .session_timeout_ms = 30000,
+        .rebalance_timeout_ms = 300000,
+        .member_id = "",
+        .group_instance_id = null,
+        .protocol_type = "consumer",
+        .protocols = &bad_protocols,
+        .reason = "incompatible-protocol",
+    };
+
+    var bad_buf: [512]u8 = undefined;
+    var bad_pos = buildTestRequest(&bad_buf, 11, 9, 1111, header_mod.requestHeaderVersion(11, 9));
+    bad_req.serialize(&bad_buf, &bad_pos, 9);
+
+    const bad_response = broker.handleRequest(bad_buf[0..bad_pos]);
+    try testing.expect(bad_response != null);
+    defer testing.allocator.free(bad_response.?);
+
+    var bad_rpos: usize = 0;
+    var bad_response_header = try ResponseHeader.deserialize(testing.allocator, bad_response.?, &bad_rpos, header_mod.responseHeaderVersion(11, 9));
+    defer bad_response_header.deinit(testing.allocator);
+    try testing.expectEqual(@as(i32, 1111), bad_response_header.correlation_id);
+
+    const bad_resp = try Resp.deserialize(testing.allocator, bad_response.?, &bad_rpos, 9);
+    defer if (bad_resp.members.len > 0) testing.allocator.free(bad_resp.members);
+    try testing.expectEqual(bad_response.?.len, bad_rpos);
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.inconsistent_group_protocol)), bad_resp.error_code);
+    try testing.expectEqual(@as(i32, -1), bad_resp.generation_id);
+    try testing.expectEqual(@as(usize, 0), bad_resp.members.len);
+    try testing.expectEqual(@as(usize, 1), group.memberCount());
 }
 
 test "Broker.handleRequest JoinGroup rejects truncated request" {

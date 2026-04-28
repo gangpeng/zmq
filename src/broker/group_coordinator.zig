@@ -3,6 +3,7 @@ const testing = std.testing;
 const Allocator = std.mem.Allocator;
 const log = std.log.scoped(.group_coordinator);
 const MetricRegistry = @import("core").MetricRegistry;
+const ErrorCode = @import("protocol").ErrorCode;
 
 /// Consumer group coordinator.
 ///
@@ -142,7 +143,25 @@ pub const GroupCoordinator = struct {
     ///   without triggering a full rebalance
     /// - The member_id is stable across restarts
     pub fn joinGroupWithInstanceId(self: *GroupCoordinator, group_id: []const u8, member_id: ?[]const u8, group_instance_id: ?[]const u8, protocol_type: []const u8, subscriptions: ?[]const []const u8) !JoinGroupResult {
-        _ = protocol_type;
+        return self.joinGroupWithProtocol(group_id, member_id, group_instance_id, protocol_type, null, null, subscriptions);
+    }
+
+    pub fn joinGroupWithProtocol(
+        self: *GroupCoordinator,
+        group_id: []const u8,
+        member_id: ?[]const u8,
+        group_instance_id: ?[]const u8,
+        protocol_type: []const u8,
+        selected_protocol_name: ?[]const u8,
+        selected_protocol_metadata: ?[]const u8,
+        subscriptions: ?[]const []const u8,
+    ) !JoinGroupResult {
+        if (group_id.len == 0) return joinGroupError(@intFromEnum(ErrorCode.invalid_group_id));
+        if (selected_protocol_name) |protocol_name| {
+            if (protocol_type.len == 0 or protocol_name.len == 0) {
+                return joinGroupError(@intFromEnum(ErrorCode.inconsistent_group_protocol));
+            }
+        }
 
         if (!self.groups.contains(group_id)) {
             const key = try self.allocator.dupe(u8, group_id);
@@ -151,6 +170,10 @@ pub const GroupCoordinator = struct {
         }
 
         const group = self.groups.getPtr(group_id).?;
+        if (selected_protocol_name) |protocol_name| {
+            const group_protocol_error = try self.ensureGroupProtocol(group, protocol_type, protocol_name);
+            if (group_protocol_error != @intFromEnum(ErrorCode.none)) return joinGroupError(group_protocol_error);
+        }
 
         // Static membership — check if a member with this instance_id already exists
         if (group_instance_id) |gid| {
@@ -170,6 +193,15 @@ pub const GroupCoordinator = struct {
                 // Static member rejoin — update heartbeat, don't trigger rebalance
                 if (group.members.getPtr(emid)) |existing_member| {
                     existing_member.last_heartbeat_ms = @import("time_compat").milliTimestamp();
+                    if (selected_protocol_name) |protocol_name| {
+                        if (existing_member.protocol_name) |old| self.allocator.free(old);
+                        existing_member.protocol_name = try self.allocator.dupe(u8, protocol_name);
+                        if (existing_member.protocol_metadata) |old| self.allocator.free(old);
+                        existing_member.protocol_metadata = if (selected_protocol_metadata) |metadata|
+                            try self.allocator.dupe(u8, metadata)
+                        else
+                            null;
+                    }
                     const is_leader = if (group.leader_id) |lid| std.mem.eql(u8, lid, emid) else false;
                     return .{
                         .error_code = 0,
@@ -192,10 +224,19 @@ pub const GroupCoordinator = struct {
         // Add member to group
         const mid_copy = try self.allocator.dupe(u8, actual_member_id);
         var member = ConsumerGroup.GroupMember.initMember(self.allocator, mid_copy);
+        var member_inserted = false;
+        errdefer if (!member_inserted) member.deinitMember(self.allocator);
 
         // Set group_instance_id for static membership
         if (group_instance_id) |gid| {
             member.group_instance_id = try self.allocator.dupe(u8, gid);
+        }
+
+        if (selected_protocol_name) |protocol_name| {
+            member.protocol_name = try self.allocator.dupe(u8, protocol_name);
+        }
+        if (selected_protocol_metadata) |metadata| {
+            member.protocol_metadata = try self.allocator.dupe(u8, metadata);
         }
 
         // Track topic subscriptions
@@ -206,6 +247,7 @@ pub const GroupCoordinator = struct {
         }
 
         try group.members.put(mid_copy, member);
+        member_inserted = true;
         log.info("Member joined group {s}: member_count={d}", .{ group_id, group.members.count() });
 
         // Transition to PREPARING_REBALANCE when new members join.
@@ -239,6 +281,36 @@ pub const GroupCoordinator = struct {
             .member_id = mid_copy,
             .is_leader = is_leader,
             .leader_id = group.leader_id,
+        };
+    }
+
+    fn ensureGroupProtocol(self: *GroupCoordinator, group: *ConsumerGroup, protocol_type: []const u8, protocol_name: []const u8) !i16 {
+        if (group.protocol_type) |existing_type| {
+            if (!std.mem.eql(u8, existing_type, protocol_type)) {
+                return @intFromEnum(ErrorCode.inconsistent_group_protocol);
+            }
+        } else {
+            group.protocol_type = try self.allocator.dupe(u8, protocol_type);
+        }
+
+        if (group.protocol_name) |existing_name| {
+            if (!std.mem.eql(u8, existing_name, protocol_name)) {
+                return @intFromEnum(ErrorCode.inconsistent_group_protocol);
+            }
+        } else {
+            group.protocol_name = try self.allocator.dupe(u8, protocol_name);
+        }
+
+        return @intFromEnum(ErrorCode.none);
+    }
+
+    fn joinGroupError(error_code: i16) JoinGroupResult {
+        return .{
+            .error_code = error_code,
+            .generation_id = -1,
+            .member_id = "",
+            .is_leader = false,
+            .leader_id = null,
         };
     }
 
@@ -866,6 +938,8 @@ pub const ConsumerGroup = struct {
     members: std.StringHashMap(GroupMember),
     next_member_id: u64 = 1,
     leader_id: ?[]u8 = null,
+    protocol_type: ?[]u8 = null,
+    protocol_name: ?[]u8 = null,
     rebalance_timeout_ms: i64 = 300000, // 5 minutes default
     rebalance_start_ms: i64 = 0,
     session_timeout_ms: i64 = 30000, // 30 seconds default
@@ -889,6 +963,7 @@ pub const ConsumerGroup = struct {
         assignment: ?[]u8 = null,
         subscribed_topics: std.array_list.Managed([]u8),
         protocol_name: ?[]u8 = null,
+        protocol_metadata: ?[]u8 = null,
 
         pub fn initMember(alloc: Allocator, mid: []u8) GroupMember {
             return .{
@@ -902,6 +977,7 @@ pub const ConsumerGroup = struct {
             for (self.subscribed_topics.items) |t| alloc.free(t);
             self.subscribed_topics.deinit();
             if (self.protocol_name) |p| alloc.free(p);
+            if (self.protocol_metadata) |m| alloc.free(m);
             if (self.assignment) |a| alloc.free(a);
             if (self.group_instance_id) |gid| alloc.free(gid);
             alloc.free(self.member_id);
@@ -923,6 +999,8 @@ pub const ConsumerGroup = struct {
         }
         self.members.deinit();
         if (self.leader_id) |lid| self.allocator.free(lid);
+        if (self.protocol_type) |protocol_type| self.allocator.free(protocol_type);
+        if (self.protocol_name) |protocol_name| self.allocator.free(protocol_name);
     }
 
     pub fn memberCount(self: *const ConsumerGroup) usize {
@@ -943,6 +1021,38 @@ test "GroupCoordinator join group" {
     try testing.expect(result.is_leader);
     try testing.expectEqual(@as(i32, 1), result.generation_id);
     try testing.expectEqual(@as(usize, 1), coord.groupCount());
+}
+
+test "GroupCoordinator joinGroupWithProtocol stores protocol metadata" {
+    var coord = GroupCoordinator.init(testing.allocator);
+    defer coord.deinit();
+
+    const result = try coord.joinGroupWithProtocol("protocol-group", null, null, "consumer", "range", "metadata-a", null);
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.none)), result.error_code);
+
+    const group = coord.groups.getPtr("protocol-group").?;
+    try testing.expectEqualStrings("consumer", group.protocol_type.?);
+    try testing.expectEqualStrings("range", group.protocol_name.?);
+
+    const member = group.members.getPtr(result.member_id).?;
+    try testing.expectEqualStrings("range", member.protocol_name.?);
+    try testing.expectEqualStrings("metadata-a", member.protocol_metadata.?);
+}
+
+test "GroupCoordinator joinGroupWithProtocol rejects incompatible protocol" {
+    var coord = GroupCoordinator.init(testing.allocator);
+    defer coord.deinit();
+
+    const result = try coord.joinGroupWithProtocol("protocol-mismatch-group", null, null, "consumer", "range", "metadata-a", null);
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.none)), result.error_code);
+
+    const mismatch = try coord.joinGroupWithProtocol("protocol-mismatch-group", null, null, "consumer", "roundrobin", "metadata-b", null);
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.inconsistent_group_protocol)), mismatch.error_code);
+    try testing.expectEqual(@as(usize, 1), coord.groups.getPtr("protocol-mismatch-group").?.memberCount());
+
+    const type_mismatch = try coord.joinGroupWithProtocol("protocol-mismatch-group", null, null, "connect", "range", "metadata-c", null);
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.inconsistent_group_protocol)), type_mismatch.error_code);
+    try testing.expectEqual(@as(usize, 1), coord.groups.getPtr("protocol-mismatch-group").?.memberCount());
 }
 
 test "GroupCoordinator heartbeat" {
