@@ -3718,7 +3718,7 @@ pub const Broker = struct {
             member_responses = self.allocator.alloc(MemberResponse, req.members.len) catch return null;
             for (req.members, 0..) |member, i| {
                 const member_id = member.member_id orelse "";
-                const error_code = self.groups.leaveGroupWithInstanceId(req.group_id orelse "", member_id, member.group_instance_id);
+                const error_code = self.groups.leaveGroupWithInstanceId(req.group_id orelse "", member_id, nonEmptyStringOrNull(member.group_instance_id));
                 if (error_code == @intFromEnum(ErrorCode.none)) mutated = true;
                 member_responses[i] = .{
                     .member_id = member.member_id,
@@ -18303,7 +18303,7 @@ test "Broker.handleRequest LeaveGroup v4 returns generated member results" {
     defer broker.deinit();
 
     const first = try broker.groups.joinGroup("leave-generated-group", null, "consumer", null);
-    const second = try broker.groups.joinGroup("leave-generated-group", null, "consumer", null);
+    const second = try broker.groups.joinGroupWithInstanceId("leave-generated-group", null, "instance-2", "consumer", null);
     const first_member_id = try testing.allocator.dupe(u8, first.member_id);
     defer testing.allocator.free(first_member_id);
     const second_member_id = try testing.allocator.dupe(u8, second.member_id);
@@ -18388,6 +18388,47 @@ test "Broker.handleRequest LeaveGroup v4 removes static member by instance id" {
     try testing.expectEqual(@as(usize, 0), broker.groups.groups.getPtr("leave-static-group").?.memberCount());
 }
 
+test "Broker.handleRequest LeaveGroup v4 fences mismatched static instance id" {
+    const Req = generated.leave_group_request.LeaveGroupRequest;
+    const Resp = generated.leave_group_response.LeaveGroupResponse;
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+
+    const joined = try broker.groups.joinGroupWithInstanceId("leave-static-fence-generated-group", null, "instance-a", "consumer", null);
+
+    const members = [_]Req.MemberIdentity{.{
+        .member_id = joined.member_id,
+        .group_instance_id = "instance-b",
+    }};
+    const req = Req{
+        .group_id = "leave-static-fence-generated-group",
+        .members = &members,
+    };
+
+    var buf: [512]u8 = undefined;
+    var pos = buildTestRequest(&buf, 13, 4, 1308, header_mod.requestHeaderVersion(13, 4));
+    req.serialize(&buf, &pos, 4);
+
+    const response = broker.handleRequest(buf[0..pos]);
+    try testing.expect(response != null);
+    defer testing.allocator.free(response.?);
+
+    var rpos: usize = 0;
+    var response_header = try ResponseHeader.deserialize(testing.allocator, response.?, &rpos, header_mod.responseHeaderVersion(13, 4));
+    defer response_header.deinit(testing.allocator);
+    try testing.expectEqual(@as(i32, 1308), response_header.correlation_id);
+
+    const resp = try Resp.deserialize(testing.allocator, response.?, &rpos, 4);
+    defer if (resp.members.len > 0) testing.allocator.free(resp.members);
+
+    try testing.expectEqual(response.?.len, rpos);
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.none)), resp.error_code);
+    try testing.expectEqual(@as(usize, 1), resp.members.len);
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.fenced_instance_id)), resp.members[0].error_code);
+    try testing.expectEqual(@as(usize, 1), broker.groups.groups.getPtr("leave-static-fence-generated-group").?.memberCount());
+}
+
 test "Broker.handleRequest LeaveGroup v4 returns generated per-member error" {
     const Req = generated.leave_group_request.LeaveGroupRequest;
     const Resp = generated.leave_group_response.LeaveGroupResponse;
@@ -18423,7 +18464,7 @@ test "Broker.handleRequest LeaveGroup v4 returns generated per-member error" {
     try testing.expectEqual(response.?.len, rpos);
     try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.none)), resp.error_code);
     try testing.expectEqual(@as(usize, 1), resp.members.len);
-    try testing.expectEqual(@as(i16, 16), resp.members[0].error_code);
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.unknown_member_id)), resp.members[0].error_code);
 }
 
 test "Broker.handleRequest LeaveGroup rejects truncated request" {

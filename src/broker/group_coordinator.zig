@@ -389,24 +389,26 @@ pub const GroupCoordinator = struct {
 
     /// Handle LeaveGroup request.
     pub fn leaveGroup(self: *GroupCoordinator, group_id: []const u8, member_id: []const u8) i16 {
-        const group = self.groups.getPtr(group_id) orelse return 16;
+        if (group_id.len == 0) return @intFromEnum(ErrorCode.invalid_group_id);
 
-        if (group.members.fetchRemove(member_id)) |entry| {
-            var member_copy = entry.value;
-            member_copy.deinitMember(self.allocator);
+        const group = self.groups.getPtr(group_id) orelse return @intFromEnum(ErrorCode.unknown_member_id);
+        return self.removeGroupMember(group, group_id, member_id);
+    }
 
-            if (group.members.count() == 0) {
-                group.state = .empty;
-                log.info("Group {s} is now empty after member departure", .{group_id});
-            } else {
-                group.state = .preparing_rebalance;
-                group.generation_id += 1;
-                log.info("Member left group {s}: triggering rebalance, generation={d}", .{ group_id, group.generation_id });
-            }
-            return 0;
+    fn removeGroupMember(self: *GroupCoordinator, group: *ConsumerGroup, group_id: []const u8, member_id: []const u8) i16 {
+        const removed = group.members.fetchRemove(member_id) orelse return @intFromEnum(ErrorCode.unknown_member_id);
+        var member_copy = removed.value;
+        member_copy.deinitMember(self.allocator);
+
+        if (group.members.count() == 0) {
+            group.state = .empty;
+            log.info("Group {s} is now empty after member departure", .{group_id});
+        } else {
+            group.state = .preparing_rebalance;
+            group.generation_id += 1;
+            log.info("Member left group {s}: triggering rebalance, generation={d}", .{ group_id, group.generation_id });
         }
-
-        return 25; // UNKNOWN_MEMBER_ID
+        return @intFromEnum(ErrorCode.none);
     }
 
     /// Handle LeaveGroup with optional static membership identity.
@@ -414,10 +416,24 @@ pub const GroupCoordinator = struct {
     /// Kafka v3+ allows a member identity to carry group_instance_id. If
     /// member_id is empty, resolve the static instance to its current member_id.
     pub fn leaveGroupWithInstanceId(self: *GroupCoordinator, group_id: []const u8, member_id: []const u8, group_instance_id: ?[]const u8) i16 {
-        if (member_id.len > 0) return self.leaveGroup(group_id, member_id);
+        if (group_id.len == 0) return @intFromEnum(ErrorCode.invalid_group_id);
 
-        const instance_id = group_instance_id orelse return self.leaveGroup(group_id, member_id);
-        const group = self.groups.getPtr(group_id) orelse return 16;
+        const group = self.groups.getPtr(group_id) orelse return @intFromEnum(ErrorCode.unknown_member_id);
+        if (member_id.len > 0) {
+            const member = group.members.getPtr(member_id) orelse return @intFromEnum(ErrorCode.unknown_member_id);
+            if (group_instance_id) |requested_instance_id| {
+                if (member.group_instance_id) |existing_instance_id| {
+                    if (!std.mem.eql(u8, existing_instance_id, requested_instance_id)) {
+                        return @intFromEnum(ErrorCode.fenced_instance_id);
+                    }
+                } else {
+                    return @intFromEnum(ErrorCode.fenced_instance_id);
+                }
+            }
+            return self.removeGroupMember(group, group_id, member_id);
+        }
+
+        const instance_id = group_instance_id orelse return @intFromEnum(ErrorCode.unknown_member_id);
 
         var found_member_id: ?[]const u8 = null;
         var it = group.members.iterator();
@@ -431,7 +447,7 @@ pub const GroupCoordinator = struct {
             }
         }
 
-        return self.leaveGroup(group_id, found_member_id orelse return 25);
+        return self.removeGroupMember(group, group_id, found_member_id orelse return @intFromEnum(ErrorCode.unknown_member_id));
     }
 
     /// Delete an empty consumer group and its committed offsets.
@@ -1155,6 +1171,17 @@ test "GroupCoordinator leaveGroupWithInstanceId resolves static member" {
     try testing.expectEqual(@as(usize, 0), coord.groups.getPtr("g1").?.memberCount());
 }
 
+test "GroupCoordinator leaveGroupWithInstanceId fences mismatched static member" {
+    var coord = GroupCoordinator.init(testing.allocator);
+    defer coord.deinit();
+
+    const result = try coord.joinGroupWithInstanceId("leave-static-fence-group", null, "instance-a", "consumer", null);
+
+    const err = coord.leaveGroupWithInstanceId("leave-static-fence-group", result.member_id, "instance-b");
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.fenced_instance_id)), err);
+    try testing.expectEqual(@as(usize, 1), coord.groups.getPtr("leave-static-fence-group").?.memberCount());
+}
+
 test "GroupCoordinator offset commit and fetch" {
     var coord = GroupCoordinator.init(testing.allocator);
     defer coord.deinit();
@@ -1249,7 +1276,7 @@ test "GroupCoordinator leave nonexistent group" {
     defer coord.deinit();
 
     const err = coord.leaveGroup("nonexistent", "member-1");
-    try testing.expectEqual(@as(i16, 16), err); // COORDINATOR_NOT_AVAILABLE
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.unknown_member_id)), err);
 }
 
 test "GroupCoordinator leave unknown member" {
