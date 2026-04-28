@@ -551,7 +551,7 @@ pub const Broker = struct {
                 .name = name_copy,
                 .num_partitions = entry.num_partitions,
                 .replication_factor = entry.replication_factor,
-                .topic_id = TopicInfo.generateTopicId(),
+                .topic_id = if (!isZeroUuid(entry.topic_id)) entry.topic_id else TopicInfo.generateTopicId(),
                 .config = .{
                     .retention_ms = entry.retention_ms,
                     .retention_bytes = entry.retention_bytes,
@@ -13022,6 +13022,7 @@ test "Broker restores topic configs after restart" {
     try fs.makeDirAbsolute(tmp_dir);
     defer fs.deleteTreeAbsolute(tmp_dir) catch {};
 
+    var original_topic_id: [16]u8 = undefined;
     {
         var broker = Broker.initWithConfig(testing.allocator, 1, 9092, .{ .data_dir = tmp_dir });
         defer broker.deinit();
@@ -13029,6 +13030,7 @@ test "Broker restores topic configs after restart" {
 
         try testing.expect(broker.ensureTopic("topic-config-restart"));
         const topic = broker.topics.getPtr("topic-config-restart").?;
+        original_topic_id = topic.topic_id;
         topic.config.retention_ms = 1234;
         topic.config.retention_bytes = 5678;
         topic.config.max_message_bytes = 9000;
@@ -13042,6 +13044,7 @@ test "Broker restores topic configs after restart" {
         try broker.open();
 
         const topic = broker.topics.get("topic-config-restart").?;
+        try testing.expectEqualSlices(u8, &original_topic_id, &topic.topic_id);
         try testing.expectEqual(@as(i64, 1234), topic.config.retention_ms);
         try testing.expectEqual(@as(i64, 5678), topic.config.retention_bytes);
         try testing.expectEqual(@as(i32, 9000), topic.config.max_message_bytes);

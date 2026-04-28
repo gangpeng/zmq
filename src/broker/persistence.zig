@@ -99,6 +99,18 @@ pub const MetadataPersistence = struct {
         return out;
     }
 
+    fn decodeUuidHex(text: []const u8) ![16]u8 {
+        if (text.len != 32) return error.InvalidHex;
+
+        var out: [16]u8 = undefined;
+        for (&out, 0..) |*byte, i| {
+            const high = decodeHexNibble(text[i * 2]) orelse return error.InvalidHex;
+            const low = decodeHexNibble(text[i * 2 + 1]) orelse return error.InvalidHex;
+            byte.* = (high << 4) | low;
+        }
+        return out;
+    }
+
     fn writeI32Csv(file: fs.File, values: []const i32) !void {
         const writer = file.writer();
         for (values, 0..) |value, i| {
@@ -154,9 +166,9 @@ pub const MetadataPersistence = struct {
     }
 
     /// Save topic metadata to disk.
-    /// Format: topic_v2 TSV with hex-encoded names and supported numeric configs.
+    /// Format: topic_v3 TSV with hex-encoded names, topic IDs, and supported numeric configs.
     /// Legacy readers only understood raw `name\tpartitions\trf`; loadTopics
-    /// keeps accepting that format for rolling upgrades.
+    /// keeps accepting that and topic_v2 for rolling upgrades.
     pub fn saveTopics(self: *MetadataPersistence, topics: anytype) !void {
         const dir = self.data_dir orelse return;
 
@@ -175,9 +187,13 @@ pub const MetadataPersistence = struct {
             const retention_bytes = if (has_config) info.config.retention_bytes else default_topic_retention_bytes;
             const max_message_bytes = if (has_config) info.config.max_message_bytes else default_topic_max_message_bytes;
             const min_insync_replicas = if (has_config) info.config.min_insync_replicas else default_topic_min_insync_replicas;
+            const has_topic_id = comptime hasComptimeField(@TypeOf(info.*), "topic_id");
+            const topic_id: [16]u8 = if (has_topic_id) info.topic_id else [_]u8{0} ** 16;
 
-            try file.writeAll("topic_v2\t");
+            try file.writeAll("topic_v3\t");
             try writeHex(file, info.name);
+            try file.writeAll("\t");
+            try writeHex(file, topic_id[0..]);
             try writer.print("\t{d}\t{d}\t{d}\t{d}\t{d}\t{d}\n", .{
                 info.num_partitions,
                 info.replication_factor,
@@ -218,7 +234,45 @@ pub const MetadataPersistence = struct {
             var fields = std.mem.splitSequence(u8, line, "\t");
             const first = fields.next() orelse continue;
 
-            if (std.mem.eql(u8, first, "topic_v2")) {
+            if (std.mem.eql(u8, first, "topic_v3")) {
+                const name_hex = fields.next() orelse continue;
+                const topic_id_hex = fields.next() orelse continue;
+                const parts_str = fields.next() orelse continue;
+                const rf_str = fields.next() orelse continue;
+                const retention_ms_str = fields.next() orelse continue;
+                const retention_bytes_str = fields.next() orelse continue;
+                const max_message_bytes_str = fields.next() orelse continue;
+                const min_insync_replicas_str = fields.next() orelse continue;
+
+                const name = decodeHexAlloc(self.allocator, name_hex) catch continue;
+                const topic_id = decodeUuidHex(topic_id_hex) catch {
+                    self.allocator.free(name);
+                    continue;
+                };
+                const num_parts = std.fmt.parseInt(i32, parts_str, 10) catch {
+                    self.allocator.free(name);
+                    continue;
+                };
+                const rf = std.fmt.parseInt(i16, rf_str, 10) catch {
+                    self.allocator.free(name);
+                    continue;
+                };
+                const retention_ms = std.fmt.parseInt(i64, retention_ms_str, 10) catch default_topic_retention_ms;
+                const retention_bytes = std.fmt.parseInt(i64, retention_bytes_str, 10) catch default_topic_retention_bytes;
+                const max_message_bytes = std.fmt.parseInt(i32, max_message_bytes_str, 10) catch default_topic_max_message_bytes;
+                const min_insync_replicas = std.fmt.parseInt(i32, min_insync_replicas_str, 10) catch default_topic_min_insync_replicas;
+
+                try entries.append(.{
+                    .name = name,
+                    .num_partitions = num_parts,
+                    .replication_factor = rf,
+                    .topic_id = topic_id,
+                    .retention_ms = retention_ms,
+                    .retention_bytes = retention_bytes,
+                    .max_message_bytes = max_message_bytes,
+                    .min_insync_replicas = min_insync_replicas,
+                });
+            } else if (std.mem.eql(u8, first, "topic_v2")) {
                 const name_hex = fields.next() orelse continue;
                 const parts_str = fields.next() orelse continue;
                 const rf_str = fields.next() orelse continue;
@@ -329,6 +383,7 @@ pub const MetadataPersistence = struct {
         name: []u8,
         num_partitions: i32,
         replication_factor: i16,
+        topic_id: [16]u8 = [_]u8{0} ** 16,
         retention_ms: i64 = default_topic_retention_ms,
         retention_bytes: i64 = default_topic_retention_bytes,
         max_message_bytes: i32 = default_topic_max_message_bytes,
@@ -1194,15 +1249,18 @@ test "MetadataPersistence save and load topic configs round-trip" {
         name: []const u8,
         num_partitions: i32,
         replication_factor: i16,
+        topic_id: [16]u8,
         config: TopicConfig,
     };
     var topics = std.StringHashMap(Topic).init(testing.allocator);
     defer topics.deinit();
 
+    const topic_id = [_]u8{ 0x12, 0x34, 0x56, 0x78, 0x9a, 0xbc, 0x4d, 0xef, 0x80, 0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd };
     try topics.put("topic\tconfigured", .{
         .name = "topic\tconfigured",
         .num_partitions = 6,
         .replication_factor = 3,
+        .topic_id = topic_id,
         .config = .{
             .retention_ms = 1234,
             .retention_bytes = 5678,
@@ -1223,6 +1281,7 @@ test "MetadataPersistence save and load topic configs round-trip" {
     try testing.expectEqualStrings("topic\tconfigured", loaded[0].name);
     try testing.expectEqual(@as(i32, 6), loaded[0].num_partitions);
     try testing.expectEqual(@as(i16, 3), loaded[0].replication_factor);
+    try testing.expectEqualSlices(u8, &topic_id, &loaded[0].topic_id);
     try testing.expectEqual(@as(i64, 1234), loaded[0].retention_ms);
     try testing.expectEqual(@as(i64, 5678), loaded[0].retention_bytes);
     try testing.expectEqual(@as(i32, 9000), loaded[0].max_message_bytes);
