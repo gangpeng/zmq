@@ -17,6 +17,11 @@ pub const AutoBalancer = struct {
     check_interval_ms: i64,
     last_check_ms: i64,
 
+    pub const NodeInfo = struct {
+        node_id: i32,
+        rack: ?[]const u8 = null,
+    };
+
     pub const PartitionLoad = struct {
         topic: []const u8,
         partition_id: i32,
@@ -81,15 +86,39 @@ pub const AutoBalancer = struct {
         nodes: []const i32,
         loads: []const PartitionLoad,
     ) ?RebalancePlan {
+        if (nodes.len == 0) return null;
+
+        const node_infos = self.allocator.alloc(NodeInfo, nodes.len) catch return null;
+        defer self.allocator.free(node_infos);
+        for (nodes, 0..) |node_id, i| {
+            node_infos[i] = .{ .node_id = node_id };
+        }
+
+        return self.computeRackAwareRebalancePlan(node_infos, loads);
+    }
+
+    /// Compute partition assignments with optional rack/topology hints.
+    /// When the source node has a rack and a less-loaded node exists in a
+    /// different rack, the planner prefers that cross-rack target before
+    /// falling back to load-only placement.
+    pub fn computeRackAwareRebalancePlan(
+        self: *AutoBalancer,
+        nodes: []const NodeInfo,
+        loads: []const PartitionLoad,
+    ) ?RebalancePlan {
         if (nodes.len <= 1 or loads.len == 0) return null;
+
+        const sorted_loads = self.allocator.dupe(PartitionLoad, loads) catch return null;
+        defer self.allocator.free(sorted_loads);
+        std.mem.sort(PartitionLoad, sorted_loads, {}, partitionLoadGreaterThan);
 
         // Compute current load per node
         var node_loads = std.AutoHashMap(i32, f64).init(self.allocator);
         defer node_loads.deinit();
-        for (nodes) |nid| {
-            node_loads.put(nid, 0.0) catch continue;
+        for (nodes) |node| {
+            node_loads.put(node.node_id, 0.0) catch continue;
         }
-        for (loads) |pl| {
+        for (sorted_loads) |pl| {
             if (node_loads.getPtr(pl.leader_node)) |nl| {
                 nl.* += pl.totalLoad();
             }
@@ -97,39 +126,30 @@ pub const AutoBalancer = struct {
 
         // Compute average load
         var total_load: f64 = 0.0;
-        for (loads) |pl| total_load += pl.totalLoad();
+        for (sorted_loads) |pl| total_load += pl.totalLoad();
         const avg_load = total_load / @as(f64, @floatFromInt(nodes.len));
 
         // Find overloaded nodes and generate moves
         var plan = RebalancePlan.init(self.allocator);
-        for (loads) |pl| {
+        for (sorted_loads) |pl| {
             const current_node_load = node_loads.get(pl.leader_node) orelse continue;
             if (current_node_load <= avg_load * 1.2) continue; // Within 20% tolerance
 
-            // Find least loaded node
-            var min_node: i32 = nodes[0];
-            var min_load: f64 = std.math.inf(f64);
-            for (nodes) |nid| {
-                const nl = node_loads.get(nid) orelse continue;
-                if (nl < min_load) {
-                    min_load = nl;
-                    min_node = nid;
-                }
-            }
+            const target = self.chooseRebalanceTarget(nodes, &node_loads, pl.leader_node, current_node_load) orelse continue;
 
-            if (min_node != pl.leader_node and min_load < current_node_load * 0.8) {
+            if (target.node_id != pl.leader_node and target.load < current_node_load * 0.8) {
                 plan.moves.append(.{
                     .topic = pl.topic,
                     .partition_id = pl.partition_id,
                     .from_node = pl.leader_node,
-                    .to_node = min_node,
+                    .to_node = target.node_id,
                 }) catch continue;
 
                 // Update load tracking
                 if (node_loads.getPtr(pl.leader_node)) |from| {
                     from.* -= pl.totalLoad();
                 }
-                if (node_loads.getPtr(min_node)) |to| {
+                if (node_loads.getPtr(target.node_id)) |to| {
                     to.* += pl.totalLoad();
                 }
             }
@@ -149,6 +169,61 @@ pub const AutoBalancer = struct {
 
         plan.deinit();
         return null;
+    }
+
+    const TargetNode = struct {
+        node_id: i32,
+        load: f64,
+    };
+
+    fn chooseRebalanceTarget(
+        self: *AutoBalancer,
+        nodes: []const NodeInfo,
+        node_loads: *std.AutoHashMap(i32, f64),
+        source_node: i32,
+        source_load: f64,
+    ) ?TargetNode {
+        _ = self;
+
+        const source_rack = rackForNode(nodes, source_node);
+        var best_cross_rack: ?TargetNode = null;
+        var best_any: ?TargetNode = null;
+
+        for (nodes) |node| {
+            if (node.node_id == source_node) continue;
+
+            const load = node_loads.get(node.node_id) orelse continue;
+            if (load >= source_load) continue;
+
+            const candidate = TargetNode{ .node_id = node.node_id, .load = load };
+            if (best_any == null or load < best_any.?.load) {
+                best_any = candidate;
+            }
+
+            if (isDifferentKnownRack(source_rack, node.rack)) {
+                if (best_cross_rack == null or load < best_cross_rack.?.load) {
+                    best_cross_rack = candidate;
+                }
+            }
+        }
+
+        return best_cross_rack orelse best_any;
+    }
+
+    fn rackForNode(nodes: []const NodeInfo, node_id: i32) ?[]const u8 {
+        for (nodes) |node| {
+            if (node.node_id == node_id) return node.rack;
+        }
+        return null;
+    }
+
+    fn isDifferentKnownRack(a: ?[]const u8, b: ?[]const u8) bool {
+        if (a == null or b == null) return false;
+        return !std.mem.eql(u8, a.?, b.?);
+    }
+
+    fn partitionLoadGreaterThan(_: void, a: PartitionLoad, b: PartitionLoad) bool {
+        return a.totalLoad() > b.totalLoad();
     }
 };
 
@@ -214,6 +289,54 @@ test "AutoBalancer imbalanced cluster generates moves" {
         var mp = @constCast(p);
         defer mp.deinit();
         try testing.expect(mp.moveCount() > 0);
+    }
+}
+
+test "AutoBalancer rack-aware plan prefers different rack target" {
+    var ab = AutoBalancer.init(testing.allocator);
+    defer ab.deinit();
+
+    const nodes = [_]AutoBalancer.NodeInfo{
+        .{ .node_id = 0, .rack = "rack-a" },
+        .{ .node_id = 1, .rack = "rack-a" },
+        .{ .node_id = 2, .rack = "rack-b" },
+    };
+    const loads = [_]AutoBalancer.PartitionLoad{
+        .{ .topic = "t", .partition_id = 0, .bytes_in_rate = 6000, .bytes_out_rate = 6000, .leader_node = 0 },
+        .{ .topic = "t", .partition_id = 1, .bytes_in_rate = 6000, .bytes_out_rate = 6000, .leader_node = 0 },
+    };
+
+    const plan = ab.computeRackAwareRebalancePlan(&nodes, &loads);
+    try testing.expect(plan != null);
+    if (plan) |*p| {
+        var mp = @constCast(p);
+        defer mp.deinit();
+        try testing.expect(mp.moveCount() > 0);
+        try testing.expectEqual(@as(i32, 0), mp.moves.items[0].from_node);
+        try testing.expectEqual(@as(i32, 2), mp.moves.items[0].to_node);
+    }
+}
+
+test "AutoBalancer rack-aware plan falls back when racks are equivalent" {
+    var ab = AutoBalancer.init(testing.allocator);
+    defer ab.deinit();
+
+    const nodes = [_]AutoBalancer.NodeInfo{
+        .{ .node_id = 0, .rack = "rack-a" },
+        .{ .node_id = 1, .rack = "rack-a" },
+    };
+    const loads = [_]AutoBalancer.PartitionLoad{
+        .{ .topic = "t", .partition_id = 0, .bytes_in_rate = 6000, .bytes_out_rate = 6000, .leader_node = 0 },
+        .{ .topic = "t", .partition_id = 1, .bytes_in_rate = 100, .bytes_out_rate = 100, .leader_node = 1 },
+    };
+
+    const plan = ab.computeRackAwareRebalancePlan(&nodes, &loads);
+    try testing.expect(plan != null);
+    if (plan) |*p| {
+        var mp = @constCast(p);
+        defer mp.deinit();
+        try testing.expect(mp.moveCount() > 0);
+        try testing.expectEqual(@as(i32, 1), mp.moves.items[0].to_node);
     }
 }
 
