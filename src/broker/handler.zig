@@ -1725,6 +1725,8 @@ pub const Broker = struct {
             57 => self.handleUpdateFeatures(request_bytes, pos, &req_header, api_version, resp_header_version),
             65 => self.handleDescribeTransactions(request_bytes, pos, &req_header, api_version, resp_header_version),
             66 => self.handleListTransactions(request_bytes, pos, &req_header, api_version, resp_header_version),
+            71 => self.handleGetTelemetrySubscriptions(request_bytes, pos, &req_header, api_version, resp_header_version),
+            72 => self.handlePushTelemetry(request_bytes, pos, &req_header, api_version, resp_header_version),
             74 => self.handleListClientMetricsResources(request_bytes, pos, &req_header, api_version, resp_header_version),
             75 => self.handleDescribeTopicPartitions(request_bytes, pos, &req_header, api_version, resp_header_version),
             501 => self.handleCreateStreams(request_bytes, pos, &req_header, api_version, resp_header_version),
@@ -1821,7 +1823,7 @@ pub const Broker = struct {
         const has_throttle = switch (api_key) {
             // Most APIs v1+ have throttle_time_ms; for simplicity track the common ones
             8, 10, 11, 12, 13, 14, 22, 25, 26 => api_version >= 1,
-            57, 66 => true,
+            57, 66, 71, 72 => true,
             18 => false, // ApiVersions: error_code is right after header
             else => false,
         };
@@ -1868,7 +1870,7 @@ pub const Broker = struct {
             0, 1, 2 => .topic, // Produce, Fetch, ListOffsets
             8, 9, 10, 11, 12, 13, 14, 15, 16, 42, 47 => .group, // group-related
             22, 24, 26, 27, 28, 65, 66 => .transactional_id, // txn-related
-            3, 18, 19, 20, 32, 33, 35, 37, 43, 44, 45, 46, 48, 49, 50, 51, 57, 74, 75 => .cluster, // metadata/admin
+            3, 18, 19, 20, 32, 33, 35, 37, 43, 44, 45, 46, 48, 49, 50, 51, 57, 71, 72, 74, 75 => .cluster, // metadata/admin
             501...519, 600...602 => .cluster, // AutoMQ stream/object/controller extensions
             else => .unknown,
         };
@@ -1879,7 +1881,7 @@ pub const Broker = struct {
         return switch (api_key) {
             0 => .write, // Produce
             1 => .read, // Fetch
-            2, 9, 15, 16, 23, 29, 32, 35, 46, 48, 50, 55, 60, 61, 65, 66, 74, 75 => .describe, // ListOffsets, OffsetFetch, Describe*
+            2, 9, 15, 16, 23, 29, 32, 35, 46, 48, 50, 55, 60, 61, 65, 66, 71, 74, 75 => .describe, // ListOffsets, OffsetFetch, Describe*
             3, 18 => .describe, // Metadata, ApiVersions
             8 => .read, // OffsetCommit
             10, 11, 12, 13, 14 => .read, // Group ops
@@ -1888,7 +1890,7 @@ pub const Broker = struct {
             22, 24, 26, 27, 28 => .write, // Txn ops
             30 => .alter, // CreateAcls
             31 => .alter, // DeleteAcls
-            33, 43, 44, 45, 49, 51, 57 => .alter, // Alter/admin APIs
+            33, 43, 44, 45, 49, 51, 57, 72 => .alter, // Alter/admin APIs
             501, 502, 503, 508, 514, 516, 518, 601 => .describe, // AutoMQ reads/lifecycle probes
             504, 511 => .delete, // AutoMQ deletes
             505, 506, 507, 510, 512, 513, 515, 517, 519, 600, 602 => .alter, // AutoMQ mutations
@@ -7949,6 +7951,75 @@ pub const Broker = struct {
     }
 
     // ---------------------------------------------------------------
+    // GetTelemetrySubscriptions (key 71) / PushTelemetry (key 72)
+    // ---------------------------------------------------------------
+    fn handleGetTelemetrySubscriptions(self: *Broker, request_bytes: []const u8, body_start: usize, req_header: *const RequestHeader, api_version: i16, resp_header_version: i16) ?[]u8 {
+        const Req = generated.get_telemetry_subscriptions_request.GetTelemetrySubscriptionsRequest;
+        const Resp = generated.get_telemetry_subscriptions_response.GetTelemetrySubscriptionsResponse;
+
+        if (!validateGetTelemetrySubscriptionsRequestFrame(request_bytes, body_start)) {
+            log.warn("Malformed GetTelemetrySubscriptions request", .{});
+            return null;
+        }
+
+        var pos = body_start;
+        const req = Req.deserialize(self.allocator, request_bytes, &pos, api_version) catch |err| {
+            log.warn("Failed to decode GetTelemetrySubscriptions request: {}", .{err});
+            return null;
+        };
+
+        const resp = Resp{
+            .throttle_time_ms = 0,
+            .error_code = @intFromEnum(ErrorCode.none),
+            .client_instance_id = self.telemetryClientInstanceId(req.client_instance_id, req_header.correlation_id),
+            .subscription_id = 0,
+            .accepted_compression_types = &.{},
+            .push_interval_ms = 0,
+            .telemetry_max_bytes = 0,
+            .delta_temporality = false,
+            .requested_metrics = &.{},
+        };
+        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+    }
+
+    fn handlePushTelemetry(self: *Broker, request_bytes: []const u8, body_start: usize, req_header: *const RequestHeader, api_version: i16, resp_header_version: i16) ?[]u8 {
+        const Req = generated.push_telemetry_request.PushTelemetryRequest;
+        const Resp = generated.push_telemetry_response.PushTelemetryResponse;
+
+        if (!validatePushTelemetryRequestFrame(request_bytes, body_start)) {
+            log.warn("Malformed PushTelemetry request", .{});
+            return null;
+        }
+
+        var pos = body_start;
+        _ = Req.deserialize(self.allocator, request_bytes, &pos, api_version) catch |err| {
+            log.warn("Failed to decode PushTelemetry request: {}", .{err});
+            return null;
+        };
+
+        const resp = Resp{
+            .throttle_time_ms = 0,
+            .error_code = @intFromEnum(ErrorCode.unknown_subscription_id),
+        };
+        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+    }
+
+    fn telemetryClientInstanceId(self: *Broker, request_id: [16]u8, correlation_id: i32) [16]u8 {
+        const zero_uuid = [_]u8{0} ** 16;
+        if (!std.mem.eql(u8, &request_id, &zero_uuid)) return zero_uuid;
+
+        var assigned = [_]u8{0} ** 16;
+        assigned[0] = 'Z';
+        assigned[1] = 'M';
+        assigned[2] = 'Q';
+        assigned[3] = 'T';
+        std.mem.writeInt(i32, assigned[4..8], self.node_id, .big);
+        std.mem.writeInt(i32, assigned[8..12], correlation_id, .big);
+        assigned[15] = 1;
+        return assigned;
+    }
+
+    // ---------------------------------------------------------------
     // ListClientMetricsResources (key 74)
     // ---------------------------------------------------------------
     fn handleListClientMetricsResources(self: *Broker, request_bytes: []const u8, body_start: usize, req_header: *const RequestHeader, api_version: i16, resp_header_version: i16) ?[]u8 {
@@ -10733,6 +10804,23 @@ pub const Broker = struct {
         return true;
     }
 
+    fn validateGetTelemetrySubscriptionsRequestFrame(buf: []const u8, start_pos: usize) bool {
+        var pos = start_pos;
+        if (!skipFixedBytes(buf, &pos, 16)) return false; // client_instance_id
+        ser.skipTaggedFields(buf, &pos) catch return false;
+        return true;
+    }
+
+    fn validatePushTelemetryRequestFrame(buf: []const u8, start_pos: usize) bool {
+        var pos = start_pos;
+        if (!skipFixedBytes(buf, &pos, 16)) return false; // client_instance_id
+        if (!skipFixedBytes(buf, &pos, 6)) return false; // subscription_id + terminating + compression_type
+        const metrics = ser.readCompactBytes(buf, &pos) catch return false;
+        if (metrics == null) return false;
+        ser.skipTaggedFields(buf, &pos) catch return false;
+        return true;
+    }
+
     fn validateListClientMetricsResourcesRequestFrame(buf: []const u8, start_pos: usize) bool {
         var pos = start_pos;
         ser.skipTaggedFields(buf, &pos) catch return false;
@@ -12262,6 +12350,11 @@ fn freeDeserializedAlterUserScramCredentialsResponse(resp: *const generated.alte
 
 fn freeDeserializedUpdateFeaturesResponse(resp: *const generated.update_features_response.UpdateFeaturesResponse) void {
     if (resp.results.len > 0) testing.allocator.free(resp.results);
+}
+
+fn freeDeserializedGetTelemetrySubscriptionsResponse(resp: *const generated.get_telemetry_subscriptions_response.GetTelemetrySubscriptionsResponse) void {
+    if (resp.accepted_compression_types.len > 0) testing.allocator.free(resp.accepted_compression_types);
+    if (resp.requested_metrics.len > 0) testing.allocator.free(resp.requested_metrics);
 }
 
 fn appendInternalRaftAppendEntriesPayload(
@@ -16184,6 +16277,96 @@ test "Broker.handleRequest UpdateFeatures rejects truncated request" {
 
     var buf: [128]u8 = undefined;
     const req_len = buildTestRequest(&buf, 57, 1, 5703, header_mod.requestHeaderVersion(57, 1));
+    try testing.expect(broker.handleRequest(buf[0..req_len]) == null);
+}
+
+test "Broker.handleRequest GetTelemetrySubscriptions returns empty subscription set" {
+    const Req = generated.get_telemetry_subscriptions_request.GetTelemetrySubscriptionsRequest;
+    const Resp = generated.get_telemetry_subscriptions_response.GetTelemetrySubscriptionsResponse;
+
+    var broker = Broker.init(testing.allocator, 7, 9092);
+    defer broker.deinit();
+
+    const zero_uuid = [_]u8{0} ** 16;
+    const req = Req{ .client_instance_id = zero_uuid };
+
+    var buf: [256]u8 = undefined;
+    var pos = buildTestRequest(&buf, 71, 0, 7100, header_mod.requestHeaderVersion(71, 0));
+    req.serialize(&buf, &pos, 0);
+
+    const response = broker.handleRequest(buf[0..pos]);
+    try testing.expect(response != null);
+    defer testing.allocator.free(response.?);
+
+    var rpos: usize = 0;
+    var response_header = try ResponseHeader.deserialize(testing.allocator, response.?, &rpos, header_mod.responseHeaderVersion(71, 0));
+    defer response_header.deinit(testing.allocator);
+    try testing.expectEqual(@as(i32, 7100), response_header.correlation_id);
+
+    const resp = try Resp.deserialize(testing.allocator, response.?, &rpos, 0);
+    defer freeDeserializedGetTelemetrySubscriptionsResponse(&resp);
+
+    try testing.expectEqual(response.?.len, rpos);
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.none)), resp.error_code);
+    try testing.expect(!std.mem.eql(u8, &zero_uuid, &resp.client_instance_id));
+    try testing.expectEqual(@as(i32, 0), resp.subscription_id);
+    try testing.expectEqual(@as(usize, 0), resp.accepted_compression_types.len);
+    try testing.expectEqual(@as(i32, 0), resp.push_interval_ms);
+    try testing.expectEqual(@as(i32, 0), resp.telemetry_max_bytes);
+    try testing.expectEqual(false, resp.delta_temporality);
+    try testing.expectEqual(@as(usize, 0), resp.requested_metrics.len);
+}
+
+test "Broker.handleRequest GetTelemetrySubscriptions rejects truncated request" {
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+
+    var buf: [128]u8 = undefined;
+    const req_len = buildTestRequest(&buf, 71, 0, 7101, header_mod.requestHeaderVersion(71, 0));
+    try testing.expect(broker.handleRequest(buf[0..req_len]) == null);
+}
+
+test "Broker.handleRequest PushTelemetry rejects unsolicited metrics" {
+    const Req = generated.push_telemetry_request.PushTelemetryRequest;
+    const Resp = generated.push_telemetry_response.PushTelemetryResponse;
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+
+    const client_id = [_]u8{1} ** 16;
+    const metrics = [_]u8{ 0x08, 0x01 };
+    const req = Req{
+        .client_instance_id = client_id,
+        .subscription_id = 1,
+        .terminating = false,
+        .compression_type = 0,
+        .metrics = &metrics,
+    };
+
+    var buf: [256]u8 = undefined;
+    var pos = buildTestRequest(&buf, 72, 0, 7200, header_mod.requestHeaderVersion(72, 0));
+    req.serialize(&buf, &pos, 0);
+
+    const response = broker.handleRequest(buf[0..pos]);
+    try testing.expect(response != null);
+    defer testing.allocator.free(response.?);
+
+    var rpos: usize = 0;
+    var response_header = try ResponseHeader.deserialize(testing.allocator, response.?, &rpos, header_mod.responseHeaderVersion(72, 0));
+    defer response_header.deinit(testing.allocator);
+    try testing.expectEqual(@as(i32, 7200), response_header.correlation_id);
+
+    const resp = try Resp.deserialize(testing.allocator, response.?, &rpos, 0);
+    try testing.expectEqual(response.?.len, rpos);
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.unknown_subscription_id)), resp.error_code);
+}
+
+test "Broker.handleRequest PushTelemetry rejects truncated request" {
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+
+    var buf: [128]u8 = undefined;
+    const req_len = buildTestRequest(&buf, 72, 0, 7201, header_mod.requestHeaderVersion(72, 0));
     try testing.expect(broker.handleRequest(buf[0..req_len]) == null);
 }
 
