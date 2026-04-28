@@ -1714,6 +1714,7 @@ pub const Broker = struct {
             47 => self.handleOffsetDelete(request_bytes, pos, &req_header, api_version, resp_header_version),
             48 => self.handleDescribeClientQuotas(request_bytes, pos, &req_header, api_version, resp_header_version),
             49 => self.handleAlterClientQuotas(request_bytes, pos, &req_header, api_version, resp_header_version),
+            50 => self.handleDescribeUserScramCredentials(request_bytes, pos, &req_header, api_version, resp_header_version),
             60 => self.handleDescribeCluster(request_bytes, pos, &req_header, api_version, resp_header_version),
             61 => self.handleDescribeProducers(request_bytes, pos, &req_header, api_version, resp_header_version),
             52 => self.handleVote(request_bytes, pos, &req_header, api_version, resp_header_version),
@@ -1864,7 +1865,7 @@ pub const Broker = struct {
             0, 1, 2 => .topic, // Produce, Fetch, ListOffsets
             8, 9, 10, 11, 12, 13, 14, 15, 16, 42, 47 => .group, // group-related
             22, 24, 26, 27, 28, 65, 66 => .transactional_id, // txn-related
-            3, 18, 19, 20, 32, 33, 35, 37, 43, 44, 45, 46, 48, 49, 75 => .cluster, // metadata/admin
+            3, 18, 19, 20, 32, 33, 35, 37, 43, 44, 45, 46, 48, 49, 50, 75 => .cluster, // metadata/admin
             501...519, 600...602 => .cluster, // AutoMQ stream/object/controller extensions
             else => .unknown,
         };
@@ -1875,7 +1876,7 @@ pub const Broker = struct {
         return switch (api_key) {
             0 => .write, // Produce
             1 => .read, // Fetch
-            2, 9, 15, 16, 23, 29, 32, 35, 46, 48, 55, 60, 61, 65, 66, 75 => .describe, // ListOffsets, OffsetFetch, Describe*
+            2, 9, 15, 16, 23, 29, 32, 35, 46, 48, 50, 55, 60, 61, 65, 66, 75 => .describe, // ListOffsets, OffsetFetch, Describe*
             3, 18 => .describe, // Metadata, ApiVersions
             8 => .read, // OffsetCommit
             10, 11, 12, 13, 14 => .read, // Group ops
@@ -7781,6 +7782,103 @@ pub const Broker = struct {
     }
 
     // ---------------------------------------------------------------
+    // DescribeUserScramCredentials (key 50)
+    // ---------------------------------------------------------------
+    fn handleDescribeUserScramCredentials(self: *Broker, request_bytes: []const u8, body_start: usize, req_header: *const RequestHeader, api_version: i16, resp_header_version: i16) ?[]u8 {
+        const Req = generated.describe_user_scram_credentials_request.DescribeUserScramCredentialsRequest;
+        const Resp = generated.describe_user_scram_credentials_response.DescribeUserScramCredentialsResponse;
+        const Result = Resp.DescribeUserScramCredentialsResult;
+
+        if (!validateDescribeUserScramCredentialsRequestFrame(request_bytes, body_start)) {
+            log.warn("Malformed DescribeUserScramCredentials request", .{});
+            return null;
+        }
+
+        var pos = body_start;
+        var req = Req.deserialize(self.allocator, request_bytes, &pos, api_version) catch |err| {
+            log.warn("Failed to decode DescribeUserScramCredentials request: {}", .{err});
+            return null;
+        };
+        defer self.freeDescribeUserScramCredentialsRequest(&req);
+
+        const result_count = if (req.users.len > 0) req.users.len else self.scram_authenticator.users.count();
+        var results: []Result = &.{};
+        if (result_count > 0) {
+            results = self.allocator.alloc(Result, result_count) catch return null;
+        }
+        var results_init: usize = 0;
+        defer {
+            self.freeDescribeUserScramCredentialResults(results[0..results_init]);
+            if (results.len > 0) self.allocator.free(results);
+        }
+
+        if (req.users.len > 0) {
+            for (req.users) |user| {
+                results[results_init] = self.buildDescribeUserScramCredentialResult(user.name) catch return null;
+                results_init += 1;
+            }
+        } else {
+            var it = self.scram_authenticator.users.iterator();
+            while (it.next()) |entry| {
+                results[results_init] = self.buildDescribeUserScramCredentialResult(entry.key_ptr.*) catch return null;
+                results_init += 1;
+            }
+        }
+
+        const resp = Resp{
+            .throttle_time_ms = 0,
+            .error_code = @intFromEnum(ErrorCode.none),
+            .error_message = null,
+            .results = results[0..results_init],
+        };
+        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+    }
+
+    fn freeDescribeUserScramCredentialsRequest(self: *Broker, req: *generated.describe_user_scram_credentials_request.DescribeUserScramCredentialsRequest) void {
+        if (req.users.len > 0) self.allocator.free(req.users);
+    }
+
+    fn buildDescribeUserScramCredentialResult(self: *Broker, user: ?[]const u8) !generated.describe_user_scram_credentials_response.DescribeUserScramCredentialsResponse.DescribeUserScramCredentialsResult {
+        const Resp = generated.describe_user_scram_credentials_response.DescribeUserScramCredentialsResponse;
+        const Result = Resp.DescribeUserScramCredentialsResult;
+        const CredentialInfo = Result.CredentialInfo;
+        const username = user orelse "";
+        if (username.len == 0) {
+            return .{
+                .user = user,
+                .error_code = @intFromEnum(ErrorCode.invalid_request),
+                .error_message = "Invalid SCRAM user name",
+                .credential_infos = &.{},
+            };
+        }
+
+        const credential = self.scram_authenticator.getCredential(username) orelse return .{
+            .user = user,
+            .error_code = @intFromEnum(ErrorCode.resource_not_found),
+            .error_message = "SCRAM user not found",
+            .credential_infos = &.{},
+        };
+
+        const infos = try self.allocator.alloc(CredentialInfo, 1);
+        infos[0] = .{
+            .mechanism = 1, // SCRAM-SHA-256
+            .iterations = @intCast(credential.iterations),
+        };
+        return .{
+            .user = user,
+            .error_code = @intFromEnum(ErrorCode.none),
+            .error_message = null,
+            .credential_infos = infos,
+        };
+    }
+
+    fn freeDescribeUserScramCredentialResults(self: *Broker, results: []const generated.describe_user_scram_credentials_response.DescribeUserScramCredentialsResponse.DescribeUserScramCredentialsResult) void {
+        for (results) |result| {
+            if (result.credential_infos.len > 0) self.allocator.free(result.credential_infos);
+        }
+    }
+
+    // ---------------------------------------------------------------
     // Unsupported
     // ---------------------------------------------------------------
     fn handleUnsupported(self: *Broker, req_header: *const RequestHeader, api_key: i16, resp_header_version: i16) ?[]u8 {
@@ -10387,6 +10485,21 @@ pub const Broker = struct {
         return true;
     }
 
+    fn validateDescribeUserScramCredentialsRequestFrame(buf: []const u8, start_pos: usize) bool {
+        var pos = start_pos;
+
+        const users = readKafkaArrayHeader(buf, &pos, true) orelse return false;
+        if (!users.is_null) {
+            for (0..users.count) |_| {
+                if (!skipKafkaString(buf, &pos, true)) return false; // user name
+                ser.skipTaggedFields(buf, &pos) catch return false;
+            }
+        }
+
+        ser.skipTaggedFields(buf, &pos) catch return false;
+        return true;
+    }
+
     fn validateOffsetForLeaderEpochRequestFrame(buf: []const u8, start_pos: usize, api_version: i16) bool {
         const flexible = api_version >= 4;
         var pos = start_pos;
@@ -11895,6 +12008,13 @@ fn freeDeserializedAlterClientQuotasResponse(resp: *const generated.alter_client
         if (entry.entity.len > 0) testing.allocator.free(entry.entity);
     }
     if (resp.entries.len > 0) testing.allocator.free(resp.entries);
+}
+
+fn freeDeserializedDescribeUserScramCredentialsResponse(resp: *const generated.describe_user_scram_credentials_response.DescribeUserScramCredentialsResponse) void {
+    for (resp.results) |result| {
+        if (result.credential_infos.len > 0) testing.allocator.free(result.credential_infos);
+    }
+    if (resp.results.len > 0) testing.allocator.free(resp.results);
 }
 
 fn appendInternalRaftAppendEntriesPayload(
@@ -15467,6 +15587,91 @@ test "Broker.handleRequest AlterClientQuotas rejects truncated request" {
 
     var buf: [128]u8 = undefined;
     const req_len = buildTestRequest(&buf, 49, 1, 4903, header_mod.requestHeaderVersion(49, 1));
+    try testing.expect(broker.handleRequest(buf[0..req_len]) == null);
+}
+
+test "Broker.handleRequest DescribeUserScramCredentials returns requested SCRAM users" {
+    const Req = generated.describe_user_scram_credentials_request.DescribeUserScramCredentialsRequest;
+    const Resp = generated.describe_user_scram_credentials_response.DescribeUserScramCredentialsResponse;
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+    try broker.scram_authenticator.addUser("scram-user", "secret");
+
+    const users = [_]Req.UserName{
+        .{ .name = "scram-user" },
+        .{ .name = "missing-scram-user" },
+    };
+    const req = Req{ .users = &users };
+
+    var buf: [512]u8 = undefined;
+    var pos = buildTestRequest(&buf, 50, 0, 5000, header_mod.requestHeaderVersion(50, 0));
+    req.serialize(&buf, &pos, 0);
+
+    const response = broker.handleRequest(buf[0..pos]);
+    try testing.expect(response != null);
+    defer testing.allocator.free(response.?);
+
+    var rpos: usize = 0;
+    var response_header = try ResponseHeader.deserialize(testing.allocator, response.?, &rpos, header_mod.responseHeaderVersion(50, 0));
+    defer response_header.deinit(testing.allocator);
+    try testing.expectEqual(@as(i32, 5000), response_header.correlation_id);
+
+    const resp = try Resp.deserialize(testing.allocator, response.?, &rpos, 0);
+    defer freeDeserializedDescribeUserScramCredentialsResponse(&resp);
+
+    try testing.expectEqual(response.?.len, rpos);
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.none)), resp.error_code);
+    try testing.expectEqual(@as(usize, 2), resp.results.len);
+    try testing.expectEqualStrings("scram-user", resp.results[0].user.?);
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.none)), resp.results[0].error_code);
+    try testing.expectEqual(@as(usize, 1), resp.results[0].credential_infos.len);
+    try testing.expectEqual(@as(i8, 1), resp.results[0].credential_infos[0].mechanism);
+    try testing.expectEqual(@as(i32, 4096), resp.results[0].credential_infos[0].iterations);
+    try testing.expectEqualStrings("missing-scram-user", resp.results[1].user.?);
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.resource_not_found)), resp.results[1].error_code);
+    try testing.expectEqual(@as(usize, 0), resp.results[1].credential_infos.len);
+}
+
+test "Broker.handleRequest DescribeUserScramCredentials empty users describes all" {
+    const Req = generated.describe_user_scram_credentials_request.DescribeUserScramCredentialsRequest;
+    const Resp = generated.describe_user_scram_credentials_response.DescribeUserScramCredentialsResponse;
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+    try broker.scram_authenticator.addUser("scram-all-user", "secret");
+
+    const req = Req{};
+
+    var buf: [512]u8 = undefined;
+    var pos = buildTestRequest(&buf, 50, 0, 5001, header_mod.requestHeaderVersion(50, 0));
+    req.serialize(&buf, &pos, 0);
+
+    const response = broker.handleRequest(buf[0..pos]);
+    try testing.expect(response != null);
+    defer testing.allocator.free(response.?);
+
+    var rpos: usize = 0;
+    var response_header = try ResponseHeader.deserialize(testing.allocator, response.?, &rpos, header_mod.responseHeaderVersion(50, 0));
+    defer response_header.deinit(testing.allocator);
+    try testing.expectEqual(@as(i32, 5001), response_header.correlation_id);
+
+    const resp = try Resp.deserialize(testing.allocator, response.?, &rpos, 0);
+    defer freeDeserializedDescribeUserScramCredentialsResponse(&resp);
+
+    try testing.expectEqual(response.?.len, rpos);
+    try testing.expectEqual(@as(usize, 1), resp.results.len);
+    try testing.expectEqualStrings("scram-all-user", resp.results[0].user.?);
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.none)), resp.results[0].error_code);
+    try testing.expectEqual(@as(usize, 1), resp.results[0].credential_infos.len);
+}
+
+test "Broker.handleRequest DescribeUserScramCredentials rejects truncated request" {
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+
+    var buf: [128]u8 = undefined;
+    const req_len = buildTestRequest(&buf, 50, 0, 5002, header_mod.requestHeaderVersion(50, 0));
     try testing.expect(broker.handleRequest(buf[0..req_len]) == null);
 }
 
