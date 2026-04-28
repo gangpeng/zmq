@@ -42,6 +42,8 @@ const JsonLogger = @import("core").JsonLogger;
 
 const max_offset_commit_metadata_bytes: usize = 4096;
 const offset_commit_record_value_magic = "ZMQOC1";
+const consumer_group_snapshot_record_value_magic = "ZMQCG1";
+const consumer_group_snapshot_record_key = "__zmq_consumer_group_snapshot";
 const auto_mq_quorum_commit_timeout_ms: i64 = 5000;
 
 /// Stateful Kafka broker.
@@ -675,8 +677,9 @@ pub const Broker = struct {
         }
         const recovered_offset_records = try self.restoreOffsetsFromConsumerOffsetsLog();
         if (recovered_offset_records > 0) {
-            log.info("Restored {d} committed offset record(s) from __consumer_offsets", .{recovered_offset_records});
+            log.info("Restored {d} state record(s) from __consumer_offsets", .{recovered_offset_records});
             self.persistOffsets();
+            if (self.groups.groups.count() > 0) self.persistConsumerGroups();
         }
 
         // Load ongoing partition reassignments after topics are available so
@@ -1336,6 +1339,9 @@ pub const Broker = struct {
         self.persistence.saveConsumerGroups(&self.groups.groups) catch |err| {
             log.warn("Failed to persist consumer group state: {}", .{err});
         };
+        self.writeConsumerGroupSnapshotRecord() catch |err| {
+            log.warn("Failed to append consumer group snapshot to __consumer_offsets: {}", .{err});
+        };
     }
 
     /// Persist transaction coordinator state if it has changed since the last flush.
@@ -1614,6 +1620,208 @@ pub const Broker = struct {
         };
     }
 
+    fn writeSnapshotBytes(writer: anytype, value: []const u8) !void {
+        if (value.len > std.math.maxInt(u32)) return error.ConsumerGroupSnapshotTooLarge;
+        try writer.writeInt(u32, @intCast(value.len), .big);
+        try writer.writeAll(value);
+    }
+
+    fn writeSnapshotOptionalBytes(writer: anytype, value: ?[]const u8) !void {
+        if (value) |bytes| {
+            try writer.writeByte(1);
+            try writeSnapshotBytes(writer, bytes);
+        } else {
+            try writer.writeByte(0);
+        }
+    }
+
+    fn encodeConsumerGroupSnapshotRecordValue(self: *Broker) ![]u8 {
+        var buf = std.array_list.Managed(u8).init(self.allocator);
+        errdefer buf.deinit();
+        const writer = @import("list_compat").writer(&buf);
+
+        try writer.writeAll(consumer_group_snapshot_record_value_magic);
+        try writer.writeInt(u32, @intCast(self.groups.groups.count()), .big);
+
+        var group_it = self.groups.groups.iterator();
+        while (group_it.next()) |group_entry| {
+            const group = group_entry.value_ptr;
+            try writeSnapshotBytes(writer, group.group_id);
+            try writer.writeByte(@intFromEnum(group.state));
+            try writer.writeInt(i32, group.generation_id, .big);
+            try writer.writeInt(u64, group.next_member_id, .big);
+            try writeSnapshotOptionalBytes(writer, group.leader_id);
+            try writeSnapshotOptionalBytes(writer, group.protocol_type);
+            try writeSnapshotOptionalBytes(writer, group.protocol_name);
+            try writer.writeInt(i64, group.rebalance_timeout_ms, .big);
+            try writer.writeInt(i64, group.session_timeout_ms, .big);
+            try writer.writeInt(u32, @intCast(group.members.count()), .big);
+
+            var member_it = group.members.iterator();
+            while (member_it.next()) |member_entry| {
+                const member = member_entry.value_ptr;
+                try writeSnapshotBytes(writer, member.member_id);
+                try writeSnapshotOptionalBytes(writer, member.group_instance_id);
+                try writer.writeInt(i64, member.last_heartbeat_ms, .big);
+                try writeSnapshotOptionalBytes(writer, member.assignment);
+                try writeSnapshotOptionalBytes(writer, member.protocol_name);
+                try writeSnapshotOptionalBytes(writer, member.protocol_metadata);
+                try writer.writeInt(u32, @intCast(member.subscribed_topics.items.len), .big);
+                for (member.subscribed_topics.items) |subscription| {
+                    try writeSnapshotBytes(writer, subscription);
+                }
+            }
+        }
+
+        return buf.toOwnedSlice();
+    }
+
+    fn readSnapshotByte(value: []const u8, pos: *usize) !u8 {
+        if (pos.* >= value.len) return error.InvalidConsumerGroupSnapshot;
+        const byte = value[pos.*];
+        pos.* += 1;
+        return byte;
+    }
+
+    fn readSnapshotU32(value: []const u8, pos: *usize) !u32 {
+        if (pos.* + 4 > value.len) return error.InvalidConsumerGroupSnapshot;
+        const out = std.mem.readInt(u32, value[pos.*..][0..4], .big);
+        pos.* += 4;
+        return out;
+    }
+
+    fn readSnapshotI32(value: []const u8, pos: *usize) !i32 {
+        if (pos.* + 4 > value.len) return error.InvalidConsumerGroupSnapshot;
+        const out = std.mem.readInt(i32, value[pos.*..][0..4], .big);
+        pos.* += 4;
+        return out;
+    }
+
+    fn readSnapshotU64(value: []const u8, pos: *usize) !u64 {
+        if (pos.* + 8 > value.len) return error.InvalidConsumerGroupSnapshot;
+        const out = std.mem.readInt(u64, value[pos.*..][0..8], .big);
+        pos.* += 8;
+        return out;
+    }
+
+    fn readSnapshotI64(value: []const u8, pos: *usize) !i64 {
+        if (pos.* + 8 > value.len) return error.InvalidConsumerGroupSnapshot;
+        const out = std.mem.readInt(i64, value[pos.*..][0..8], .big);
+        pos.* += 8;
+        return out;
+    }
+
+    fn readSnapshotBytes(value: []const u8, pos: *usize) ![]const u8 {
+        const len: usize = @intCast(try readSnapshotU32(value, pos));
+        if (pos.* + len > value.len) return error.InvalidConsumerGroupSnapshot;
+        const out = value[pos.* .. pos.* + len];
+        pos.* += len;
+        return out;
+    }
+
+    fn readSnapshotOwnedBytes(self: *Broker, value: []const u8, pos: *usize) ![]u8 {
+        return try self.allocator.dupe(u8, try readSnapshotBytes(value, pos));
+    }
+
+    fn readSnapshotOptionalOwnedBytes(self: *Broker, value: []const u8, pos: *usize) !?[]u8 {
+        const present = try readSnapshotByte(value, pos);
+        if (present == 0) return null;
+        if (present != 1) return error.InvalidConsumerGroupSnapshot;
+        return try self.readSnapshotOwnedBytes(value, pos);
+    }
+
+    fn freeConsumerGroupMap(self: *Broker, groups: *std.StringHashMap(ConsumerGroup)) void {
+        var it = groups.iterator();
+        while (it.next()) |entry| {
+            entry.value_ptr.deinit();
+            self.allocator.free(entry.key_ptr.*);
+        }
+        groups.deinit();
+    }
+
+    fn decodeConsumerGroupSnapshotRecordValue(self: *Broker, value: []const u8) !std.StringHashMap(ConsumerGroup) {
+        if (value.len < consumer_group_snapshot_record_value_magic.len + 4) return error.InvalidConsumerGroupSnapshot;
+        if (!std.mem.eql(u8, value[0..consumer_group_snapshot_record_value_magic.len], consumer_group_snapshot_record_value_magic)) {
+            return error.InvalidConsumerGroupSnapshot;
+        }
+
+        var pos: usize = consumer_group_snapshot_record_value_magic.len;
+        const group_count = try readSnapshotU32(value, &pos);
+        var groups = std.StringHashMap(ConsumerGroup).init(self.allocator);
+        errdefer self.freeConsumerGroupMap(&groups);
+
+        for (0..group_count) |_| {
+            const group_key = try self.readSnapshotOwnedBytes(value, &pos);
+            var group = ConsumerGroup.init(self.allocator, group_key);
+            var group_inserted = false;
+            errdefer if (!group_inserted) {
+                group.deinit();
+                self.allocator.free(group_key);
+            };
+
+            if (group_key.len == 0 or groups.contains(group_key)) return error.InvalidConsumerGroupSnapshot;
+            group.state = consumerGroupStateFromInt(try readSnapshotByte(value, &pos)) orelse return error.InvalidConsumerGroupSnapshot;
+            group.generation_id = @max(try readSnapshotI32(value, &pos), 0);
+            group.next_member_id = @max(try readSnapshotU64(value, &pos), 1);
+            group.leader_id = try self.readSnapshotOptionalOwnedBytes(value, &pos);
+            group.protocol_type = try self.readSnapshotOptionalOwnedBytes(value, &pos);
+            group.protocol_name = try self.readSnapshotOptionalOwnedBytes(value, &pos);
+            group.rebalance_timeout_ms = @max(try readSnapshotI64(value, &pos), 1);
+            group.session_timeout_ms = @max(try readSnapshotI64(value, &pos), 1);
+
+            const member_count = try readSnapshotU32(value, &pos);
+            for (0..member_count) |_| {
+                const member_id = try self.readSnapshotOwnedBytes(value, &pos);
+                var member = ConsumerGroup.GroupMember.initMember(self.allocator, member_id);
+                var member_inserted = false;
+                errdefer if (!member_inserted) member.deinitMember(self.allocator);
+
+                if (member_id.len == 0 or group.members.contains(member_id)) return error.InvalidConsumerGroupSnapshot;
+                member.group_instance_id = try self.readSnapshotOptionalOwnedBytes(value, &pos);
+                member.last_heartbeat_ms = try readSnapshotI64(value, &pos);
+                member.assignment = try self.readSnapshotOptionalOwnedBytes(value, &pos);
+                member.protocol_name = try self.readSnapshotOptionalOwnedBytes(value, &pos);
+                member.protocol_metadata = try self.readSnapshotOptionalOwnedBytes(value, &pos);
+
+                const subscription_count = try readSnapshotU32(value, &pos);
+                for (0..subscription_count) |_| {
+                    const subscription = try self.readSnapshotOwnedBytes(value, &pos);
+                    member.subscribed_topics.append(subscription) catch |err| {
+                        self.allocator.free(subscription);
+                        return err;
+                    };
+                }
+
+                try group.members.put(member_id, member);
+                member_inserted = true;
+            }
+
+            if (group.leader_id) |leader_id| {
+                if (!group.members.contains(leader_id)) {
+                    self.allocator.free(leader_id);
+                    group.leader_id = null;
+                }
+            }
+            if (group.members.count() == 0 and group.state != .dead) {
+                group.state = .empty;
+            }
+
+            try groups.put(group_key, group);
+            group_inserted = true;
+        }
+
+        if (pos != value.len) return error.InvalidConsumerGroupSnapshot;
+        return groups;
+    }
+
+    fn applyConsumerGroupSnapshotRecord(self: *Broker, value: []const u8) !void {
+        var groups = try self.decodeConsumerGroupSnapshotRecordValue(value);
+        errdefer self.freeConsumerGroupMap(&groups);
+
+        self.freeConsumerGroupMap(&self.groups.groups);
+        self.groups.groups = groups;
+    }
+
     fn offsetCommitKeyParts(key: []const u8) ?struct { group_id: []const u8, topic: []const u8, partition: i32 } {
         var fields = std.mem.splitSequence(u8, key, ":");
         const group_id = fields.next() orelse return null;
@@ -1669,6 +1877,43 @@ pub const Broker = struct {
         self.persistPartitionStates();
     }
 
+    /// Write a full consumer-group lifecycle snapshot to __consumer_offsets.
+    /// Replay uses the latest snapshot record to rebuild active membership,
+    /// protocol metadata, timeouts, leader, generation, and assignments without
+    /// relying on local consumer_groups.meta.
+    fn writeConsumerGroupSnapshotRecord(self: *Broker) !void {
+        const info = self.topics.get("__consumer_offsets") orelse return;
+        if (info.num_partitions <= 0) return;
+
+        const value = try self.encodeConsumerGroupSnapshotRecordValue();
+        defer self.allocator.free(value);
+
+        const rec_batch = protocol.record_batch;
+        const records = [_]rec_batch.Record{
+            .{
+                .offset_delta = 0,
+                .key = consumer_group_snapshot_record_key,
+                .value = value,
+            },
+        };
+
+        const batch = try rec_batch.buildRecordBatch(
+            self.allocator,
+            0,
+            &records,
+            -1,
+            -1,
+            -1,
+            @import("time_compat").milliTimestamp(),
+            @import("time_compat").milliTimestamp(),
+            0,
+        );
+        defer self.allocator.free(batch);
+
+        _ = try self.store.produce("__consumer_offsets", 0, batch);
+        self.persistPartitionStates();
+    }
+
     fn restoreOffsetsFromConsumerOffsetsLog(self: *Broker) !usize {
         const info = self.topics.get("__consumer_offsets") orelse return 0;
         if (info.num_partitions <= 0) return 0;
@@ -1712,6 +1957,11 @@ pub const Broker = struct {
     }
 
     fn applyConsumerOffsetRecord(self: *Broker, key: []const u8, value: []const u8) !bool {
+        if (std.mem.eql(u8, key, consumer_group_snapshot_record_key)) {
+            try self.applyConsumerGroupSnapshotRecord(value);
+            return true;
+        }
+
         const parts = offsetCommitKeyParts(key) orelse return false;
         const decoded = decodeOffsetCommitRecordValue(value) orelse return false;
 
@@ -19365,6 +19615,75 @@ test "Broker restores committed offsets from S3 consumer offsets log" {
         try testing.expectEqual(@as(i64, 42), restored.?.offset);
         try testing.expectEqual(@as(i32, 7), restored.?.leader_epoch);
         try testing.expectEqualStrings("offset-meta", restored.?.metadata.?);
+    }
+}
+
+test "Broker restores consumer group lifecycle from S3 consumer offsets log" {
+    var mock_s3 = storage.MockS3.init(testing.allocator);
+    defer mock_s3.deinit();
+    const s3_storage = storage.S3Storage.initMock(testing.allocator, &mock_s3);
+
+    var member_id: ?[]u8 = null;
+    defer if (member_id) |owned| testing.allocator.free(owned);
+    const assignment = "restored-assignment-" ** 24;
+    {
+        var broker = Broker.init(testing.allocator, 1, 9092);
+        defer broker.deinit();
+        broker.store.s3_wal_mode = true;
+        broker.store.s3_storage = s3_storage;
+        broker.store.s3_wal_batcher = storage.wal.S3WalBatcher.init(testing.allocator);
+
+        try broker.open();
+        const subscriptions = [_][]const u8{"stateless-group-topic"};
+        const join = try broker.groups.joinGroupWithProtocol(
+            "stateless-group",
+            null,
+            "instance-a",
+            "consumer",
+            "range",
+            "stateless-metadata",
+            &subscriptions,
+        );
+        member_id = try testing.allocator.dupe(u8, join.member_id);
+        try testing.expect(broker.groups.configureGroupTimeouts("stateless-group", 12345, 67890));
+
+        const assignments = [_]GroupCoordinator.MemberAssignment{.{
+            .member_id = join.member_id,
+            .assignment = assignment,
+        }};
+        const sync = try broker.groups.syncGroup("stateless-group", join.member_id, join.generation_id, &assignments);
+        try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.none)), sync.error_code);
+
+        broker.persistConsumerGroups();
+    }
+
+    {
+        var broker = Broker.init(testing.allocator, 1, 9092);
+        defer broker.deinit();
+        broker.store.s3_wal_mode = true;
+        broker.store.s3_storage = s3_storage;
+        broker.store.s3_wal_batcher = storage.wal.S3WalBatcher.init(testing.allocator);
+
+        try broker.open();
+
+        const group = broker.groups.groups.getPtr("stateless-group").?;
+        try testing.expectEqual(ConsumerGroup.GroupState.stable, group.state);
+        try testing.expectEqual(@as(i32, 1), group.generation_id);
+        try testing.expectEqual(@as(u64, 2), group.next_member_id);
+        try testing.expectEqual(@as(i64, 67890), group.rebalance_timeout_ms);
+        try testing.expectEqual(@as(i64, 12345), group.session_timeout_ms);
+        try testing.expectEqualStrings("consumer", group.protocol_type.?);
+        try testing.expectEqualStrings("range", group.protocol_name.?);
+        try testing.expect(group.leader_id != null);
+        try testing.expectEqualStrings(member_id.?, group.leader_id.?);
+
+        const member = group.members.getPtr(member_id.?).?;
+        try testing.expectEqualStrings("instance-a", member.group_instance_id.?);
+        try testing.expectEqualStrings("range", member.protocol_name.?);
+        try testing.expectEqualStrings("stateless-metadata", member.protocol_metadata.?);
+        try testing.expectEqualStrings(assignment, member.assignment.?);
+        try testing.expectEqual(@as(usize, 1), member.subscribed_topics.items.len);
+        try testing.expectEqualStrings("stateless-group-topic", member.subscribed_topics.items[0]);
     }
 }
 

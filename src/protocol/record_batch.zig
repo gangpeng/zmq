@@ -408,8 +408,17 @@ pub fn buildRecordBatch(
     max_timestamp: i64,
     attributes: i16,
 ) ![]u8 {
-    // First, serialize all records to compute their total size
-    var records_buf = try alloc.alloc(u8, records.len * 256); // generous estimate
+    // First, serialize all records into an exactly-sized temporary buffer.
+    // Internal metadata records can exceed a small fixed estimate.
+    var records_size: usize = 0;
+    for (records) |*record| {
+        const body_size = recordBodySize(record);
+        if (body_size > std.math.maxInt(i32)) return error.RecordTooLarge;
+        records_size += signedVarintSize(@intCast(body_size));
+        records_size += body_size;
+    }
+
+    var records_buf = try alloc.alloc(u8, records_size);
     defer alloc.free(records_buf);
 
     var records_pos: usize = 0;
@@ -418,7 +427,9 @@ pub fn buildRecordBatch(
     }
 
     // Compute batch_length: everything after baseOffset(8) + batchLength(4)
-    const batch_length: i32 = @intCast(BATCH_HEADER_SIZE - 12 + records_pos);
+    const batch_length_usize = BATCH_HEADER_SIZE - 12 + records_pos;
+    if (batch_length_usize > std.math.maxInt(i32)) return error.RecordBatchTooLarge;
+    const batch_length: i32 = @intCast(batch_length_usize);
 
     // Allocate final buffer
     const total_size: usize = @intCast(@as(i64, batch_length) + 12);
@@ -719,6 +730,33 @@ test "buildRecordBatch creates valid batch with correct CRC" {
         const rec = try parseRecord(batch, &pos);
         try testing.expectEqual(@as(i32, @intCast(i)), rec.offset_delta);
     }
+}
+
+test "buildRecordBatch supports metadata records larger than fixed estimates" {
+    const large_value = "x" ** 1024;
+    const records = [_]Record{.{
+        .offset_delta = 0,
+        .key = "large-key",
+        .value = large_value,
+    }};
+
+    const batch = try buildRecordBatch(
+        testing.allocator,
+        0,
+        &records,
+        -1,
+        -1,
+        -1,
+        1000,
+        1000,
+        0,
+    );
+    defer testing.allocator.free(batch);
+
+    var pos: usize = BATCH_HEADER_SIZE;
+    const parsed = try parseRecord(batch, &pos);
+    try testing.expectEqualStrings("large-key", parsed.key.?);
+    try testing.expectEqualStrings(large_value, parsed.value.?);
 }
 
 test "RecordBatchHeader attribute helpers" {
