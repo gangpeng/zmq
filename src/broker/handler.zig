@@ -721,13 +721,7 @@ pub const Broker = struct {
             log.info("Auto-aborted {d} timed-out transaction(s)", .{txn_expired});
         }
 
-        // Persist transaction state if dirty
-        if (self.txn_coordinator.dirty) {
-            self.persistence.saveTransactions(&self.txn_coordinator) catch |err| {
-                log.warn("Failed to persist transaction state: {}", .{err});
-            };
-            self.txn_coordinator.dirty = false;
-        }
+        self.persistTransactionsIfDirty();
 
         // Persist producer sequences if dirty
         if (self.producer_sequences_dirty) {
@@ -933,6 +927,7 @@ pub const Broker = struct {
         self.persistTopics();
         self.persistOffsets();
         self.persistPartitionStates();
+        self.persistTransactionsIfDirty();
         self.persistAutoMqMetadata();
         self.persistPartitionReassignments();
         self.persistObjectManagerSnapshot();
@@ -1293,6 +1288,16 @@ pub const Broker = struct {
         self.persistence.saveOffsets(&offsets_copy) catch |err| {
             log.warn("Failed to persist offsets: {}", .{err});
         };
+    }
+
+    /// Persist transaction coordinator state if it has changed since the last flush.
+    fn persistTransactionsIfDirty(self: *Broker) void {
+        if (!self.txn_coordinator.dirty) return;
+        self.persistence.saveTransactions(&self.txn_coordinator) catch |err| {
+            log.warn("Failed to persist transaction state: {}", .{err});
+            return;
+        };
+        self.txn_coordinator.dirty = false;
     }
 
     /// Persist per-partition offsets/HW/LSO to disk (best-effort).
@@ -4644,6 +4649,7 @@ pub const Broker = struct {
         };
 
         const result = self.txn_coordinator.initProducerId(req.transactional_id) catch return null;
+        self.persistTransactionsIfDirty();
         const resp = Resp{
             .throttle_time_ms = 0,
             .error_code = result.error_code,
@@ -13497,6 +13503,58 @@ test "Broker.handleRequest InitProducerId v4 returns generated response" {
     try testing.expect(resp.producer_id >= 1);
     try testing.expectEqual(@as(i16, 0), resp.producer_epoch);
     try testing.expect(broker.txn_coordinator.getStatus(resp.producer_id) != null);
+}
+
+test "Broker.handleRequest InitProducerId persists producer allocation" {
+    const fs = @import("fs_compat");
+    const Req = generated.init_producer_id_request.InitProducerIdRequest;
+    const Resp = generated.init_producer_id_response.InitProducerIdResponse;
+
+    const tmp_dir = "/tmp/zmq-init-producer-id-persist-test";
+    fs.deleteTreeAbsolute(tmp_dir) catch {};
+    try fs.makeDirAbsolute(tmp_dir);
+    defer fs.deleteTreeAbsolute(tmp_dir) catch {};
+
+    var broker = Broker.initWithConfig(testing.allocator, 1, 9092, .{ .data_dir = tmp_dir });
+    defer broker.deinit();
+    try broker.open();
+
+    const req = Req{
+        .transactional_id = "init-persist-txn",
+        .transaction_timeout_ms = 60000,
+        .producer_id = -1,
+        .producer_epoch = -1,
+    };
+
+    var buf: [512]u8 = undefined;
+    var pos = buildTestRequest(&buf, 22, 4, 2206, header_mod.requestHeaderVersion(22, 4));
+    req.serialize(&buf, &pos, 4);
+
+    const response = broker.handleRequest(buf[0..pos]);
+    try testing.expect(response != null);
+    defer testing.allocator.free(response.?);
+
+    var rpos: usize = 0;
+    var response_header = try ResponseHeader.deserialize(testing.allocator, response.?, &rpos, header_mod.responseHeaderVersion(22, 4));
+    defer response_header.deinit(testing.allocator);
+    try testing.expectEqual(@as(i32, 2206), response_header.correlation_id);
+
+    const resp = try Resp.deserialize(testing.allocator, response.?, &rpos, 4);
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.none)), resp.error_code);
+
+    const snapshot = try broker.persistence.loadTransactions();
+    defer {
+        for (snapshot.entries) |entry| {
+            if (entry.transactional_id) |tid| testing.allocator.free(tid);
+        }
+        testing.allocator.free(snapshot.entries);
+    }
+
+    try testing.expectEqual(resp.producer_id + 1, snapshot.next_producer_id);
+    try testing.expectEqual(@as(usize, 1), snapshot.entries.len);
+    try testing.expectEqual(resp.producer_id, snapshot.entries[0].producer_id);
+    try testing.expectEqual(@as(i16, 0), snapshot.entries[0].producer_epoch);
+    try testing.expectEqualStrings("init-persist-txn", snapshot.entries[0].transactional_id.?);
 }
 
 test "Broker.handleRequest InitProducerId rejects truncated request" {
