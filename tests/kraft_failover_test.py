@@ -234,6 +234,43 @@ def produce(port, topic, payload, correlation_id):
     return base_offset
 
 
+def fetch_records(port, topic, offset, correlation_id):
+    body = struct.pack(">i", -1)  # replica_id
+    body += struct.pack(">i", 5000)
+    body += struct.pack(">i", 1)
+    body += struct.pack(">i", 1)
+    body += write_string(topic)
+    body += struct.pack(">i", 1)
+    body += struct.pack(">i", 0)
+    body += struct.pack(">q", offset)
+    body += struct.pack(">i", 1024 * 1024)
+
+    response = controller_request(port, 1, 0, correlation_id, body)
+    payload_body = response[4:]
+    if len(payload_body) < 30:
+        raise TestError("Fetch response too short")
+    pos = 4
+    name_len = struct.unpack_from(">h", payload_body, pos)[0]
+    pos += 2 + max(name_len, 0)
+    partitions = struct.unpack_from(">i", payload_body, pos)[0]
+    if partitions != 1:
+        raise TestError(f"Fetch partition response count={partitions}")
+    pos += 4
+    partition = struct.unpack_from(">i", payload_body, pos)[0]
+    pos += 4
+    error_code = struct.unpack_from(">h", payload_body, pos)[0]
+    pos += 2
+    high_watermark = struct.unpack_from(">q", payload_body, pos)[0]
+    pos += 8
+    record_len = struct.unpack_from(">i", payload_body, pos)[0]
+    pos += 4
+    if partition != 0 or error_code != 0:
+        raise TestError(f"Fetch partition={partition} error_code={error_code}")
+    if record_len < 0 or pos + record_len > len(payload_body):
+        raise TestError(f"Fetch invalid record_len={record_len}")
+    return high_watermark, payload_body[pos : pos + record_len]
+
+
 def wait_for_produce(port, topic, payload, timeout=45):
     deadline = time.time() + timeout
     correlation_id = 4000
@@ -246,6 +283,35 @@ def wait_for_produce(port, topic, payload, timeout=45):
             correlation_id += 1
             time.sleep(0.5)
     raise TestError(f"produce did not succeed within {timeout}s: {last_error}")
+
+
+def wait_for_payloads(port, topic, payloads, timeout=30):
+    deadline = time.time() + timeout
+    correlation_id = 6000
+    last_error = None
+    last_high_watermark = None
+    last_records = b""
+    while time.time() < deadline:
+        try:
+            high_watermark, records = fetch_records(port, topic, 0, correlation_id)
+            last_high_watermark = high_watermark
+            last_records = records
+            if all(payload in records for payload in payloads):
+                return records
+        except Exception as exc:
+            last_error = exc
+        correlation_id += 1
+        time.sleep(0.25)
+    missing = [payload for payload in payloads if payload not in last_records]
+    if last_error is not None:
+        raise TestError(
+            f"missing payloads after fetch retry: {missing!r}; "
+            f"last_high_watermark={last_high_watermark}; last_error={last_error}"
+        )
+    raise TestError(
+        f"missing payloads after fetch retry: {missing!r}; "
+        f"last_high_watermark={last_high_watermark}"
+    )
 
 
 def describe_quorum_body():
@@ -502,8 +568,11 @@ def main():
         broker = start_broker(tmp, voters)
         wait_for_broker_ready(broker["proc"], broker["port"], broker["log_path"])
         topic = f"kraft-failover-{os.getpid()}-{int(time.time())}"
+        expected_payloads = []
         wait_for_topic(broker["port"], topic)
-        first_offset = wait_for_produce(broker["port"], topic, b"before-controller-failover")
+        expected_payloads.append(b"r0")
+        first_offset = wait_for_produce(broker["port"], topic, expected_payloads[-1])
+        wait_for_payloads(broker["port"], topic, expected_payloads)
 
         stop_process(processes[leader_id]["proc"], crash=True)
         replacement_leader, after = wait_for_leader(processes, forbidden_leaders={leader_id})
@@ -514,9 +583,12 @@ def main():
             raise TestError(f"leader epoch did not advance: before={initial} after={after}")
 
         wait_for_all_alive_to_report(processes, replacement_leader)
-        second_offset = wait_for_produce(broker["port"], topic, b"after-controller-failover")
+        wait_for_payloads(broker["port"], topic, expected_payloads)
+        expected_payloads.append(b"r1")
+        second_offset = wait_for_produce(broker["port"], topic, expected_payloads[-1])
         if second_offset <= first_offset:
             raise TestError(f"broker did not continue after failover: {second_offset} <= {first_offset}")
+        wait_for_payloads(broker["port"], topic, expected_payloads)
 
         restart_controller_id = next(
             node_id for node_id in sorted(alive) if node_id != replacement_leader
@@ -540,24 +612,30 @@ def main():
                 f"{replacement_leader}: {restarted_quorum}"
             )
 
+        wait_for_payloads(broker["port"], topic, expected_payloads)
+        expected_payloads.append(b"r2")
         third_offset = wait_for_produce(
-            broker["port"], topic, b"after-controller-rolling-restart"
+            broker["port"], topic, expected_payloads[-1]
         )
         if third_offset <= second_offset:
             raise TestError(
                 f"broker did not continue after controller restart: {third_offset} <= {second_offset}"
             )
+        wait_for_payloads(broker["port"], topic, expected_payloads)
 
         stop_process(broker["proc"])
         broker = start_broker(tmp, voters)
         wait_for_broker_ready(broker["proc"], broker["port"], broker["log_path"])
+        wait_for_payloads(broker["port"], topic, expected_payloads)
+        expected_payloads.append(b"r3")
         fourth_offset = wait_for_produce(
-            broker["port"], topic, b"after-broker-rolling-restart"
+            broker["port"], topic, expected_payloads[-1]
         )
         if fourth_offset <= third_offset:
             raise TestError(
                 f"broker did not continue after broker restart: {fourth_offset} <= {third_offset}"
             )
+        wait_for_payloads(broker["port"], topic, expected_payloads)
 
         print(
             "ok: KRaft controller failover harness passed "

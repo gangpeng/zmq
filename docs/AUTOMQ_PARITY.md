@@ -224,13 +224,14 @@ Status: completed for the initial catalog and DeleteGroups slice.
   `test-kraft-failover` step covers three controller-only processes, a
   broker-only process, controller leader discovery, broker produce before
   failover, leader kill, replacement leader convergence, controller rolling
-  restart, broker rolling restart, and broker produce after each transition.
+  restart, broker rolling restart, broker produce after each transition, and
+  broker fetch/read-after-transition checks for all acknowledged records.
   Broker registration state and producer-id allocation cursors now have
   Raft-backed controller metadata records; followers persist replicated
   AppendEntries and promoted or restarted controllers replay registered brokers
   and PID cursors before serving lifecycle APIs. Controller metadata full
   snapshot records now preserve broker/PID state across Raft log compaction.
-  Remaining gap: broader failover gates.
+  Remaining gap: broader failover gates and client compatibility fixtures.
 - Validate rack-aware routing and auto-balancer decisions under load.
 
 ### Phase 5: Production Gates
