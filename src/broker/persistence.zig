@@ -18,6 +18,11 @@ pub const MetadataPersistence = struct {
     data_dir: ?[]const u8,
     allocator: Allocator,
 
+    const default_topic_retention_ms: i64 = 604800000;
+    const default_topic_retention_bytes: i64 = -1;
+    const default_topic_max_message_bytes: i32 = 1048576;
+    const default_topic_min_insync_replicas: i32 = 1;
+
     pub fn init(alloc: Allocator, data_dir: ?[]const u8) MetadataPersistence {
         return .{ .data_dir = data_dir, .allocator = alloc };
     }
@@ -149,6 +154,9 @@ pub const MetadataPersistence = struct {
     }
 
     /// Save topic metadata to disk.
+    /// Format: topic_v2 TSV with hex-encoded names and supported numeric configs.
+    /// Legacy readers only understood raw `name\tpartitions\trf`; loadTopics
+    /// keeps accepting that format for rolling upgrades.
     pub fn saveTopics(self: *MetadataPersistence, topics: anytype) !void {
         const dir = self.data_dir orelse return;
 
@@ -162,12 +170,27 @@ pub const MetadataPersistence = struct {
         var it = topics.iterator();
         while (it.next()) |entry| {
             const info = entry.value_ptr;
-            try writer.print("{s}\t{d}\t{d}\n", .{ info.name, info.num_partitions, info.replication_factor });
+            const has_config = comptime hasComptimeField(@TypeOf(info.*), "config");
+            const retention_ms = if (has_config) info.config.retention_ms else default_topic_retention_ms;
+            const retention_bytes = if (has_config) info.config.retention_bytes else default_topic_retention_bytes;
+            const max_message_bytes = if (has_config) info.config.max_message_bytes else default_topic_max_message_bytes;
+            const min_insync_replicas = if (has_config) info.config.min_insync_replicas else default_topic_min_insync_replicas;
+
+            try file.writeAll("topic_v2\t");
+            try writeHex(file, info.name);
+            try writer.print("\t{d}\t{d}\t{d}\t{d}\t{d}\t{d}\n", .{
+                info.num_partitions,
+                info.replication_factor,
+                retention_ms,
+                retention_bytes,
+                max_message_bytes,
+                min_insync_replicas,
+            });
         }
         try file.sync();
     }
 
-    /// Load topic metadata from disk. Returns list of (name, partitions, rf) tuples.
+    /// Load topic metadata from disk.
     pub fn loadTopics(self: *MetadataPersistence) ![]TopicEntry {
         const dir = self.data_dir orelse return &.{};
 
@@ -193,18 +216,53 @@ pub const MetadataPersistence = struct {
             if (line.len == 0) continue;
 
             var fields = std.mem.splitSequence(u8, line, "\t");
-            const name = fields.next() orelse continue;
-            const parts_str = fields.next() orelse continue;
-            const rf_str = fields.next() orelse continue;
+            const first = fields.next() orelse continue;
 
-            const num_parts = std.fmt.parseInt(i32, parts_str, 10) catch continue;
-            const rf = std.fmt.parseInt(i16, rf_str, 10) catch continue;
+            if (std.mem.eql(u8, first, "topic_v2")) {
+                const name_hex = fields.next() orelse continue;
+                const parts_str = fields.next() orelse continue;
+                const rf_str = fields.next() orelse continue;
+                const retention_ms_str = fields.next() orelse continue;
+                const retention_bytes_str = fields.next() orelse continue;
+                const max_message_bytes_str = fields.next() orelse continue;
+                const min_insync_replicas_str = fields.next() orelse continue;
 
-            try entries.append(.{
-                .name = try self.allocator.dupe(u8, name),
-                .num_partitions = num_parts,
-                .replication_factor = rf,
-            });
+                const name = decodeHexAlloc(self.allocator, name_hex) catch continue;
+                const num_parts = std.fmt.parseInt(i32, parts_str, 10) catch {
+                    self.allocator.free(name);
+                    continue;
+                };
+                const rf = std.fmt.parseInt(i16, rf_str, 10) catch {
+                    self.allocator.free(name);
+                    continue;
+                };
+                const retention_ms = std.fmt.parseInt(i64, retention_ms_str, 10) catch default_topic_retention_ms;
+                const retention_bytes = std.fmt.parseInt(i64, retention_bytes_str, 10) catch default_topic_retention_bytes;
+                const max_message_bytes = std.fmt.parseInt(i32, max_message_bytes_str, 10) catch default_topic_max_message_bytes;
+                const min_insync_replicas = std.fmt.parseInt(i32, min_insync_replicas_str, 10) catch default_topic_min_insync_replicas;
+
+                try entries.append(.{
+                    .name = name,
+                    .num_partitions = num_parts,
+                    .replication_factor = rf,
+                    .retention_ms = retention_ms,
+                    .retention_bytes = retention_bytes,
+                    .max_message_bytes = max_message_bytes,
+                    .min_insync_replicas = min_insync_replicas,
+                });
+            } else {
+                const parts_str = fields.next() orelse continue;
+                const rf_str = fields.next() orelse continue;
+
+                const num_parts = std.fmt.parseInt(i32, parts_str, 10) catch continue;
+                const rf = std.fmt.parseInt(i16, rf_str, 10) catch continue;
+
+                try entries.append(.{
+                    .name = try self.allocator.dupe(u8, first),
+                    .num_partitions = num_parts,
+                    .replication_factor = rf,
+                });
+            }
         }
 
         log.info("Loaded {d} topics from topics.meta", .{entries.items.len});
@@ -271,6 +329,10 @@ pub const MetadataPersistence = struct {
         name: []u8,
         num_partitions: i32,
         replication_factor: i16,
+        retention_ms: i64 = default_topic_retention_ms,
+        retention_bytes: i64 = default_topic_retention_bytes,
+        max_message_bytes: i32 = default_topic_max_message_bytes,
+        min_insync_replicas: i32 = default_topic_min_insync_replicas,
     };
 
     pub const OffsetEntry = struct {
@@ -1112,6 +1174,59 @@ test "MetadataPersistence save and load topics" {
     try testing.expectEqual(@as(usize, 2), loaded.len);
 
     fs.deleteTreeAbsolute(tmp_dir) catch {};
+}
+
+test "MetadataPersistence save and load topic configs round-trip" {
+    const tmp_dir = "/tmp/automq-topic-config-meta-test";
+    fs.deleteTreeAbsolute(tmp_dir) catch {};
+    fs.makeDirAbsolute(tmp_dir) catch {};
+    defer fs.deleteTreeAbsolute(tmp_dir) catch {};
+
+    var persistence = MetadataPersistence.init(testing.allocator, tmp_dir);
+
+    const TopicConfig = struct {
+        retention_ms: i64,
+        retention_bytes: i64,
+        max_message_bytes: i32,
+        min_insync_replicas: i32,
+    };
+    const Topic = struct {
+        name: []const u8,
+        num_partitions: i32,
+        replication_factor: i16,
+        config: TopicConfig,
+    };
+    var topics = std.StringHashMap(Topic).init(testing.allocator);
+    defer topics.deinit();
+
+    try topics.put("topic\tconfigured", .{
+        .name = "topic\tconfigured",
+        .num_partitions = 6,
+        .replication_factor = 3,
+        .config = .{
+            .retention_ms = 1234,
+            .retention_bytes = 5678,
+            .max_message_bytes = 9000,
+            .min_insync_replicas = 2,
+        },
+    });
+
+    try persistence.saveTopics(&topics);
+
+    const loaded = try persistence.loadTopics();
+    defer {
+        for (loaded) |e| testing.allocator.free(e.name);
+        testing.allocator.free(loaded);
+    }
+
+    try testing.expectEqual(@as(usize, 1), loaded.len);
+    try testing.expectEqualStrings("topic\tconfigured", loaded[0].name);
+    try testing.expectEqual(@as(i32, 6), loaded[0].num_partitions);
+    try testing.expectEqual(@as(i16, 3), loaded[0].replication_factor);
+    try testing.expectEqual(@as(i64, 1234), loaded[0].retention_ms);
+    try testing.expectEqual(@as(i64, 5678), loaded[0].retention_bytes);
+    try testing.expectEqual(@as(i32, 9000), loaded[0].max_message_bytes);
+    try testing.expectEqual(@as(i32, 2), loaded[0].min_insync_replicas);
 }
 
 test "MetadataPersistence no data dir" {

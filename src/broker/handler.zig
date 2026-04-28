@@ -552,6 +552,12 @@ pub const Broker = struct {
                 .num_partitions = entry.num_partitions,
                 .replication_factor = entry.replication_factor,
                 .topic_id = TopicInfo.generateTopicId(),
+                .config = .{
+                    .retention_ms = entry.retention_ms,
+                    .retention_bytes = entry.retention_bytes,
+                    .max_message_bytes = entry.max_message_bytes,
+                    .min_insync_replicas = entry.min_insync_replicas,
+                },
             });
 
             // Ensure partitions exist in storage
@@ -1236,7 +1242,11 @@ pub const Broker = struct {
 
     /// Ensure an internal topic exists with the specified partition count.
     fn ensureInternalTopic(self: *Broker, name: []const u8, partitions: i32) !void {
-        if (self.topics.contains(name)) return;
+        if (self.topics.getPtr(name)) |topic| {
+            topic.config.cleanup_policy = "compact";
+            topic.config.retention_ms = -1;
+            return;
+        }
 
         const name_copy = try self.allocator.dupe(u8, name);
         errdefer self.allocator.free(name_copy);
@@ -12908,6 +12918,44 @@ test "Broker restores partition state after restart" {
         const stream = broker.object_manager.getStream(stream_id).?;
         try testing.expectEqual(@as(u64, 1), stream.start_offset);
         try testing.expectEqual(@as(u64, 2), stream.end_offset);
+    }
+}
+
+test "Broker restores topic configs after restart" {
+    const fs = @import("fs_compat");
+    const tmp_dir = "/tmp/zmq-topic-config-restart-test";
+    fs.deleteTreeAbsolute(tmp_dir) catch {};
+    try fs.makeDirAbsolute(tmp_dir);
+    defer fs.deleteTreeAbsolute(tmp_dir) catch {};
+
+    {
+        var broker = Broker.initWithConfig(testing.allocator, 1, 9092, .{ .data_dir = tmp_dir });
+        defer broker.deinit();
+        try broker.open();
+
+        try testing.expect(broker.ensureTopic("topic-config-restart"));
+        const topic = broker.topics.getPtr("topic-config-restart").?;
+        topic.config.retention_ms = 1234;
+        topic.config.retention_bytes = 5678;
+        topic.config.max_message_bytes = 9000;
+        topic.config.min_insync_replicas = 2;
+        broker.persistTopics();
+    }
+
+    {
+        var broker = Broker.initWithConfig(testing.allocator, 1, 9092, .{ .data_dir = tmp_dir });
+        defer broker.deinit();
+        try broker.open();
+
+        const topic = broker.topics.get("topic-config-restart").?;
+        try testing.expectEqual(@as(i64, 1234), topic.config.retention_ms);
+        try testing.expectEqual(@as(i64, 5678), topic.config.retention_bytes);
+        try testing.expectEqual(@as(i32, 9000), topic.config.max_message_bytes);
+        try testing.expectEqual(@as(i32, 2), topic.config.min_insync_replicas);
+
+        const offsets = broker.topics.get("__consumer_offsets").?;
+        try testing.expectEqualStrings("compact", offsets.config.cleanup_policy);
+        try testing.expectEqual(@as(i64, -1), offsets.config.retention_ms);
     }
 }
 

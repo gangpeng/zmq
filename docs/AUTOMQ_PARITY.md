@@ -26,8 +26,9 @@ operator-facing behavior.
 - S3 WAL/object storage paths exist, but full AutoMQ S3Stream lifecycle
   compatibility, crash recovery, fencing, and cross-provider validation are
   incomplete. Stream/object metadata now has local file snapshot/restart
-  coverage, partition offset/HW/LSO state is snapshotted for local restart, and
-  filesystem WAL segments replay into the fetch cache after broker restart.
+  coverage, topic-level numeric configs and partition offset/HW/LSO state are
+  snapshotted for local restart, and filesystem WAL segments replay into the
+  fetch cache after broker restart.
   If the local object snapshot is absent, flushed S3 WAL objects can rebuild
   ObjectManager stream-set metadata from their object indexes.
 
@@ -185,8 +186,9 @@ Status: completed for the initial catalog and DeleteGroups slice.
   ranges now fail with parser errors instead of traps or bogus reads; S3 block
   cache keys include start/end/max-bytes/isolation so cached S3 data is not
   reused for the wrong visible fetch window; multipart upload rejects missing or
-  malformed part ETags before completion; local metadata snapshots now fsync
-  before save calls return; MockS3 fault injection now covers bounded put retry,
+  malformed part ETags before completion; topic configs are now included in
+  local topic metadata snapshots; local metadata snapshots now fsync before save
+  calls return; MockS3 fault injection now covers bounded put retry,
   propagated get/list/range/delete failures, temporary list omission, recovery
   retry, fetch storage errors, and compaction orphan retry; restarted S3 WAL
   writers now seed their object counters from existing WAL keys before accepting
