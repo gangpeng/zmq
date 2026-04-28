@@ -3734,6 +3734,31 @@ pub const Broker = struct {
         return ErrorCode.none;
     }
 
+    fn validateOffsetCommitGroup(self: *Broker, api_version: i16, group_id: []const u8, generation_id: i32, member_id: ?[]const u8, group_instance_id: ?[]const u8) ErrorCode {
+        if (api_version == 0) return ErrorCode.none;
+
+        const resolved_member_id = member_id orelse "";
+        const resolved_instance_id = nonEmptyStringOrNull(group_instance_id);
+        if (generation_id < 0 and resolved_member_id.len == 0 and resolved_instance_id == null) {
+            return ErrorCode.none;
+        }
+
+        const group = self.groups.groups.getPtr(group_id) orelse {
+            if (api_version >= 9) return ErrorCode.group_id_not_found;
+            return ErrorCode.unknown_member_id;
+        };
+        const member = group.members.getPtr(resolved_member_id) orelse return ErrorCode.unknown_member_id;
+        if (resolved_instance_id) |instance_id| {
+            if (member.group_instance_id) |existing_instance_id| {
+                if (!std.mem.eql(u8, existing_instance_id, instance_id)) return ErrorCode.fenced_instance_id;
+            } else {
+                return ErrorCode.fenced_instance_id;
+            }
+        }
+        if (group.generation_id != generation_id) return ErrorCode.illegal_generation;
+        return ErrorCode.none;
+    }
+
     // ---------------------------------------------------------------
     // OffsetCommit (key 8)
     // ---------------------------------------------------------------
@@ -3763,6 +3788,7 @@ pub const Broker = struct {
         }
 
         const group_id = req.group_id orelse "";
+        const group_error = self.validateOffsetCommitGroup(api_version, group_id, req.generation_id_or_member_epoch, req.member_id, req.group_instance_id);
         var mutated = false;
         for (req.topics) |topic_req| {
             const partitions = self.allocator.alloc(PartitionResponse, topic_req.partitions.len) catch return null;
@@ -3787,6 +3813,7 @@ pub const Broker = struct {
                 };
 
                 const error_code: i16 = blk: {
+                    if (group_error != ErrorCode.none) break :blk @intFromEnum(group_error);
                     const metadata_error = validateOffsetCommitMetadata(partition_req.committed_metadata);
                     if (metadata_error != ErrorCode.none) break :blk @intFromEnum(metadata_error);
 
@@ -17218,8 +17245,8 @@ test "Broker.handleRequest OffsetCommit and OffsetFetch round-trip" {
         var buf: [512]u8 = undefined;
         var pos = buildTestRequest(&buf, 8, 5, 40, header_mod.requestHeaderVersion(8, 5));
         ser.writeString(&buf, &pos, "oc-group"); // group_id
-        ser.writeI32(&buf, &pos, 1); // generation_id
-        ser.writeString(&buf, &pos, "member-1"); // member_id
+        ser.writeI32(&buf, &pos, -1); // generation_id: simple commit
+        ser.writeString(&buf, &pos, ""); // member_id
         // topics array: 1 topic
         ser.writeI32(&buf, &pos, 1);
         ser.writeString(&buf, &pos, "oc-topic");
@@ -17268,6 +17295,7 @@ test "Broker.handleRequest OffsetCommit v8 returns generated response and commit
 
     var broker = Broker.init(testing.allocator, 1, 9092);
     defer broker.deinit();
+    const joined = try broker.groups.joinGroup("oc-generated-group", null, "consumer", null);
 
     const partitions = [_]Partition{.{
         .partition_index = 0,
@@ -17281,8 +17309,8 @@ test "Broker.handleRequest OffsetCommit v8 returns generated response and commit
     }};
     const req = Req{
         .group_id = "oc-generated-group",
-        .generation_id_or_member_epoch = 1,
-        .member_id = "member-1",
+        .generation_id_or_member_epoch = joined.generation_id,
+        .member_id = joined.member_id,
         .group_instance_id = null,
         .topics = &topics,
     };
@@ -17323,6 +17351,111 @@ test "Broker.handleRequest OffsetCommit v8 returns generated response and commit
     try testing.expectEqualStrings("generated-meta", committed_record.?.metadata.?);
 }
 
+test "Broker.handleRequest OffsetCommit rejects unknown managed member" {
+    const Req = generated.offset_commit_request.OffsetCommitRequest;
+    const Resp = generated.offset_commit_response.OffsetCommitResponse;
+    const Topic = Req.OffsetCommitRequestTopic;
+    const Partition = Topic.OffsetCommitRequestPartition;
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+
+    const partitions = [_]Partition{.{
+        .partition_index = 0,
+        .committed_offset = 99,
+        .committed_leader_epoch = -1,
+        .committed_metadata = "bad-member",
+    }};
+    const topics = [_]Topic{.{
+        .name = "oc-unknown-member-topic",
+        .partitions = &partitions,
+    }};
+    const req = Req{
+        .group_id = "oc-unknown-member-group",
+        .generation_id_or_member_epoch = 1,
+        .member_id = "ghost",
+        .group_instance_id = null,
+        .topics = &topics,
+    };
+
+    var buf: [512]u8 = undefined;
+    var pos = buildTestRequest(&buf, 8, 8, 819, header_mod.requestHeaderVersion(8, 8));
+    req.serialize(&buf, &pos, 8);
+
+    const response = broker.handleRequest(buf[0..pos]);
+    try testing.expect(response != null);
+    defer testing.allocator.free(response.?);
+
+    var rpos: usize = 0;
+    var response_header = try ResponseHeader.deserialize(testing.allocator, response.?, &rpos, header_mod.responseHeaderVersion(8, 8));
+    defer response_header.deinit(testing.allocator);
+    try testing.expectEqual(@as(i32, 819), response_header.correlation_id);
+
+    const resp = try Resp.deserialize(testing.allocator, response.?, &rpos, 8);
+    defer {
+        for (resp.topics) |topic| {
+            if (topic.partitions.len > 0) testing.allocator.free(topic.partitions);
+        }
+        if (resp.topics.len > 0) testing.allocator.free(resp.topics);
+    }
+    try testing.expectEqual(response.?.len, rpos);
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.unknown_member_id)), resp.topics[0].partitions[0].error_code);
+    try testing.expect((try broker.groups.fetchOffset("oc-unknown-member-group", "oc-unknown-member-topic", 0)) == null);
+}
+
+test "Broker.handleRequest OffsetCommit rejects illegal generation" {
+    const Req = generated.offset_commit_request.OffsetCommitRequest;
+    const Resp = generated.offset_commit_response.OffsetCommitResponse;
+    const Topic = Req.OffsetCommitRequestTopic;
+    const Partition = Topic.OffsetCommitRequestPartition;
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+    const joined = try broker.groups.joinGroup("oc-illegal-generation-group", null, "consumer", null);
+
+    const partitions = [_]Partition{.{
+        .partition_index = 0,
+        .committed_offset = 100,
+        .committed_leader_epoch = -1,
+        .committed_metadata = "bad-generation",
+    }};
+    const topics = [_]Topic{.{
+        .name = "oc-illegal-generation-topic",
+        .partitions = &partitions,
+    }};
+    const req = Req{
+        .group_id = "oc-illegal-generation-group",
+        .generation_id_or_member_epoch = joined.generation_id + 1,
+        .member_id = joined.member_id,
+        .group_instance_id = null,
+        .topics = &topics,
+    };
+
+    var buf: [512]u8 = undefined;
+    var pos = buildTestRequest(&buf, 8, 8, 829, header_mod.requestHeaderVersion(8, 8));
+    req.serialize(&buf, &pos, 8);
+
+    const response = broker.handleRequest(buf[0..pos]);
+    try testing.expect(response != null);
+    defer testing.allocator.free(response.?);
+
+    var rpos: usize = 0;
+    var response_header = try ResponseHeader.deserialize(testing.allocator, response.?, &rpos, header_mod.responseHeaderVersion(8, 8));
+    defer response_header.deinit(testing.allocator);
+    try testing.expectEqual(@as(i32, 829), response_header.correlation_id);
+
+    const resp = try Resp.deserialize(testing.allocator, response.?, &rpos, 8);
+    defer {
+        for (resp.topics) |topic| {
+            if (topic.partitions.len > 0) testing.allocator.free(topic.partitions);
+        }
+        if (resp.topics.len > 0) testing.allocator.free(resp.topics);
+    }
+    try testing.expectEqual(response.?.len, rpos);
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.illegal_generation)), resp.topics[0].partitions[0].error_code);
+    try testing.expect((try broker.groups.fetchOffset("oc-illegal-generation-group", "oc-illegal-generation-topic", 0)) == null);
+}
+
 test "Broker.handleRequest OffsetCommit rejects oversized metadata" {
     const Req = generated.offset_commit_request.OffsetCommitRequest;
     const Resp = generated.offset_commit_response.OffsetCommitResponse;
@@ -17345,8 +17478,8 @@ test "Broker.handleRequest OffsetCommit rejects oversized metadata" {
     }};
     const req = Req{
         .group_id = "oc-large-meta-group",
-        .generation_id_or_member_epoch = 1,
-        .member_id = "member-1",
+        .generation_id_or_member_epoch = -1,
+        .member_id = "",
         .group_instance_id = null,
         .topics = &topics,
     };
@@ -17398,8 +17531,8 @@ test "Broker.handleRequest OffsetCommit reports coordinator commit failure per p
     }};
     const req = Req{
         .group_id = "oc-fail-group",
-        .generation_id_or_member_epoch = 1,
-        .member_id = "member-1",
+        .generation_id_or_member_epoch = -1,
+        .member_id = "",
         .group_instance_id = null,
         .topics = &topics,
     };
