@@ -1,6 +1,7 @@
 const std = @import("std");
 const testing = std.testing;
 const Allocator = std.mem.Allocator;
+const ErrorCode = @import("protocol").ErrorCode;
 
 /// Transaction coordinator.
 ///
@@ -158,18 +159,18 @@ pub const TransactionCoordinator = struct {
     /// Validates producer_epoch to reject fenced (zombie) producers.
     /// Idempotent: adding the same topic-partition twice is a no-op.
     pub fn addPartitionsToTxn(self: *TransactionCoordinator, producer_id: i64, producer_epoch: i16, topic: []const u8, partition: i32) !i16 {
-        const txn = self.transactions.getPtr(producer_id) orelse return 48; // INVALID_PRODUCER_ID_MAPPING
+        const txn = self.transactions.getPtr(producer_id) orelse return @intFromEnum(ErrorCode.invalid_producer_id_mapping);
 
         // Epoch validation — reject fenced producers (zombie fencing).
-        // NOTE: AutoMQ/Kafka returns PRODUCER_FENCED (error 22) when epoch mismatches.
-        if (txn.producer_epoch != producer_epoch) return 22; // PRODUCER_FENCED
+        if (txn.producer_epoch != producer_epoch) return @intFromEnum(ErrorCode.invalid_producer_epoch);
 
         // Enforce transaction timeout
         if (txn.status == .ongoing) {
             const elapsed = @import("time_compat").milliTimestamp() - txn.start_time_ms;
             if (elapsed > txn.timeout_ms) {
                 txn.status = .prepare_abort;
-                return 55; // INVALID_TXN_STATE (timed out)
+                self.dirty = true;
+                return @intFromEnum(ErrorCode.invalid_txn_state);
             }
         }
 
@@ -178,7 +179,7 @@ pub const TransactionCoordinator = struct {
             txn.start_time_ms = @import("time_compat").milliTimestamp();
         }
 
-        if (txn.status != .ongoing) return 55; // INVALID_TXN_STATE
+        if (txn.status != .ongoing) return @intFromEnum(ErrorCode.invalid_txn_state);
 
         // Idempotent: skip if this topic-partition is already registered.
         // NOTE: AutoMQ/Kafka silently accepts duplicate partition adds.
@@ -196,26 +197,26 @@ pub const TransactionCoordinator = struct {
     }
 
     pub fn verifyPartitionInTxn(self: *const TransactionCoordinator, producer_id: i64, producer_epoch: i16, topic: []const u8, partition: i32) i16 {
-        const txn = self.transactions.get(producer_id) orelse return 48; // INVALID_PRODUCER_ID_MAPPING
-        if (txn.producer_epoch != producer_epoch) return 22; // PRODUCER_FENCED
-        if (txn.status != .ongoing) return 55; // INVALID_TXN_STATE
+        const txn = self.transactions.get(producer_id) orelse return @intFromEnum(ErrorCode.invalid_producer_id_mapping);
+        if (txn.producer_epoch != producer_epoch) return @intFromEnum(ErrorCode.invalid_producer_epoch);
+        if (txn.status != .ongoing) return @intFromEnum(ErrorCode.invalid_txn_state);
         for (txn.partitions.items) |existing| {
             if (existing.partition == partition and std.mem.eql(u8, existing.topic, topic)) {
                 return 0;
             }
         }
-        return 55; // INVALID_TXN_STATE
+        return @intFromEnum(ErrorCode.invalid_txn_state);
     }
 
     /// EndTxn: commit or abort the transaction.
     /// Validates producer_epoch to reject fenced (zombie) producers.
     pub fn endTxn(self: *TransactionCoordinator, producer_id: i64, producer_epoch: i16, commit: bool) i16 {
-        const txn = self.transactions.getPtr(producer_id) orelse return 48;
+        const txn = self.transactions.getPtr(producer_id) orelse return @intFromEnum(ErrorCode.invalid_producer_id_mapping);
 
         // Epoch validation — reject fenced producers.
-        if (txn.producer_epoch != producer_epoch) return 22; // PRODUCER_FENCED
+        if (txn.producer_epoch != producer_epoch) return @intFromEnum(ErrorCode.invalid_producer_epoch);
 
-        if (txn.status != .ongoing) return 55;
+        if (txn.status != .ongoing) return @intFromEnum(ErrorCode.invalid_txn_state);
 
         if (commit) {
             txn.status = .prepare_commit;
@@ -230,7 +231,7 @@ pub const TransactionCoordinator = struct {
     /// WriteTxnMarkers: finalize the transaction by writing markers to all partitions.
     /// Called after endTxn when all partitions have been prepared.
     pub fn writeTxnMarkers(self: *TransactionCoordinator, producer_id: i64) i16 {
-        const txn = self.transactions.getPtr(producer_id) orelse return 48;
+        const txn = self.transactions.getPtr(producer_id) orelse return @intFromEnum(ErrorCode.invalid_producer_id_mapping);
 
         switch (txn.status) {
             .prepare_commit => {
@@ -257,7 +258,7 @@ pub const TransactionCoordinator = struct {
                 self.dirty = true;
                 return 0;
             },
-            else => return 55, // INVALID_TXN_STATE
+            else => return @intFromEnum(ErrorCode.invalid_txn_state),
         }
     }
 
@@ -484,7 +485,7 @@ test "TransactionCoordinator invalid producer id" {
     defer coord.deinit();
 
     const err = try coord.addPartitionsToTxn(9999, 0, "topic", 0);
-    try testing.expectEqual(@as(i16, 48), err); // INVALID_PRODUCER_ID_MAPPING
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.invalid_producer_id_mapping)), err);
 }
 
 test "TransactionCoordinator endTxn invalid state" {
@@ -497,7 +498,7 @@ test "TransactionCoordinator endTxn invalid state" {
     // endTxn on EMPTY state (never added partitions, so state is "empty")
     // addPartitions transitions from empty→ongoing, endTxn requires ongoing
     const err = coord.endTxn(pid, result.producer_epoch, true);
-    try testing.expectEqual(@as(i16, 55), err); // INVALID_TXN_STATE
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.invalid_txn_state)), err);
 }
 
 test "TransactionCoordinator double commit fails" {
@@ -514,7 +515,7 @@ test "TransactionCoordinator double commit fails" {
     try testing.expectEqual(TransactionCoordinator.TxnStatus.prepare_commit, coord.getStatus(pid).?);
 
     // Second endTxn on prepare_commit state should fail
-    try testing.expectEqual(@as(i16, 55), coord.endTxn(pid, result.producer_epoch, true)); // INVALID_TXN_STATE
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.invalid_txn_state)), coord.endTxn(pid, result.producer_epoch, true));
 }
 
 test "TransactionCoordinator writeTxnMarkers invalid state" {
@@ -525,21 +526,21 @@ test "TransactionCoordinator writeTxnMarkers invalid state" {
     const pid = result.producer_id;
 
     // writeTxnMarkers without endTxn first
-    try testing.expectEqual(@as(i16, 55), coord.writeTxnMarkers(pid)); // INVALID_TXN_STATE
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.invalid_txn_state)), coord.writeTxnMarkers(pid));
 }
 
 test "TransactionCoordinator writeTxnMarkers on nonexistent producer" {
     var coord = TransactionCoordinator.init(testing.allocator);
     defer coord.deinit();
 
-    try testing.expectEqual(@as(i16, 48), coord.writeTxnMarkers(9999)); // INVALID_PRODUCER_ID_MAPPING
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.invalid_producer_id_mapping)), coord.writeTxnMarkers(9999));
 }
 
 test "TransactionCoordinator endTxn on nonexistent producer" {
     var coord = TransactionCoordinator.init(testing.allocator);
     defer coord.deinit();
 
-    try testing.expectEqual(@as(i16, 48), coord.endTxn(9999, 0, true));
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.invalid_producer_id_mapping)), coord.endTxn(9999, 0, true));
 }
 
 test "TransactionCoordinator getPartitions" {
@@ -692,9 +693,9 @@ test "TransactionCoordinator addPartitionsToTxn validates epoch" {
     const ok = try coord.addPartitionsToTxn(pid, 0, "topic", 0);
     try testing.expectEqual(@as(i16, 0), ok);
 
-    // Wrong epoch returns PRODUCER_FENCED (22)
+    // Wrong epoch returns INVALID_PRODUCER_EPOCH.
     const fenced = try coord.addPartitionsToTxn(pid, 99, "topic", 1);
-    try testing.expectEqual(@as(i16, 22), fenced);
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.invalid_producer_epoch)), fenced);
 }
 
 test "TransactionCoordinator endTxn validates epoch" {
@@ -706,9 +707,9 @@ test "TransactionCoordinator endTxn validates epoch" {
 
     _ = try coord.addPartitionsToTxn(pid, result.producer_epoch, "topic", 0);
 
-    // Wrong epoch returns PRODUCER_FENCED (22)
+    // Wrong epoch returns INVALID_PRODUCER_EPOCH.
     const fenced = coord.endTxn(pid, 99, true);
-    try testing.expectEqual(@as(i16, 22), fenced);
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.invalid_producer_epoch)), fenced);
 
     // Correct epoch works
     const ok = coord.endTxn(pid, result.producer_epoch, true);
@@ -735,6 +736,26 @@ test "TransactionCoordinator addPartitionsToTxn idempotent" {
     try testing.expectEqual(@as(usize, 2), coord.getPartitions(pid).?.len);
 }
 
+test "TransactionCoordinator addPartitionsToTxn timeout returns protocol error and marks dirty" {
+    var coord = TransactionCoordinator.init(testing.allocator);
+    defer coord.deinit();
+
+    const result = try coord.initProducerId("timeout-add");
+    const pid = result.producer_id;
+
+    _ = try coord.addPartitionsToTxn(pid, result.producer_epoch, "topic-a", 0);
+    coord.dirty = false;
+    if (coord.transactions.getPtr(pid)) |txn| {
+        txn.timeout_ms = 1;
+        txn.start_time_ms = @import("time_compat").milliTimestamp() - 10_000;
+    }
+
+    const err = try coord.addPartitionsToTxn(pid, result.producer_epoch, "topic-a", 1);
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.invalid_txn_state)), err);
+    try testing.expectEqual(TransactionCoordinator.TxnStatus.prepare_abort, coord.getStatus(pid).?);
+    try testing.expect(coord.dirty);
+}
+
 test "TransactionCoordinator verifyPartitionInTxn validates existing partitions without mutation" {
     var coord = TransactionCoordinator.init(testing.allocator);
     defer coord.deinit();
@@ -744,8 +765,8 @@ test "TransactionCoordinator verifyPartitionInTxn validates existing partitions 
 
     _ = try coord.addPartitionsToTxn(pid, result.producer_epoch, "topic-a", 0);
     try testing.expectEqual(@as(i16, 0), coord.verifyPartitionInTxn(pid, result.producer_epoch, "topic-a", 0));
-    try testing.expectEqual(@as(i16, 55), coord.verifyPartitionInTxn(pid, result.producer_epoch, "topic-a", 1));
-    try testing.expectEqual(@as(i16, 22), coord.verifyPartitionInTxn(pid, result.producer_epoch + 1, "topic-a", 0));
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.invalid_txn_state)), coord.verifyPartitionInTxn(pid, result.producer_epoch, "topic-a", 1));
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.invalid_producer_epoch)), coord.verifyPartitionInTxn(pid, result.producer_epoch + 1, "topic-a", 0));
     try testing.expectEqual(@as(usize, 1), coord.getPartitions(pid).?.len);
 }
 
