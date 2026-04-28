@@ -1725,6 +1725,7 @@ pub const Broker = struct {
             57 => self.handleUpdateFeatures(request_bytes, pos, &req_header, api_version, resp_header_version),
             65 => self.handleDescribeTransactions(request_bytes, pos, &req_header, api_version, resp_header_version),
             66 => self.handleListTransactions(request_bytes, pos, &req_header, api_version, resp_header_version),
+            69 => self.handleConsumerGroupDescribe(request_bytes, pos, &req_header, api_version, resp_header_version),
             71 => self.handleGetTelemetrySubscriptions(request_bytes, pos, &req_header, api_version, resp_header_version),
             72 => self.handlePushTelemetry(request_bytes, pos, &req_header, api_version, resp_header_version),
             74 => self.handleListClientMetricsResources(request_bytes, pos, &req_header, api_version, resp_header_version),
@@ -1818,6 +1819,7 @@ pub const Broker = struct {
 
         if (api_key == 9) return 0; // OffsetFetch errors are topic/group scoped, not at a fixed top-level offset.
         if (api_key == 10 and api_version >= 4) return 0; // FindCoordinator v4+ has coordinator-scoped errors.
+        if (api_key == 69) return 0; // ConsumerGroupDescribe errors are per described group.
 
         // APIs with throttle_time_ms before error_code
         const has_throttle = switch (api_key) {
@@ -1868,7 +1870,7 @@ pub const Broker = struct {
     fn resourceTypeForApiKey(api_key: i16) Authorizer.ResourceType {
         return switch (api_key) {
             0, 1, 2 => .topic, // Produce, Fetch, ListOffsets
-            8, 9, 10, 11, 12, 13, 14, 15, 16, 42, 47 => .group, // group-related
+            8, 9, 10, 11, 12, 13, 14, 15, 16, 42, 47, 69 => .group, // group-related
             22, 24, 26, 27, 28, 65, 66 => .transactional_id, // txn-related
             3, 18, 19, 20, 32, 33, 35, 37, 43, 44, 45, 46, 48, 49, 50, 51, 57, 71, 72, 74, 75 => .cluster, // metadata/admin
             501...519, 600...602 => .cluster, // AutoMQ stream/object/controller extensions
@@ -1881,7 +1883,7 @@ pub const Broker = struct {
         return switch (api_key) {
             0 => .write, // Produce
             1 => .read, // Fetch
-            2, 9, 15, 16, 23, 29, 32, 35, 46, 48, 50, 55, 60, 61, 65, 66, 71, 74, 75 => .describe, // ListOffsets, OffsetFetch, Describe*
+            2, 9, 15, 16, 23, 29, 32, 35, 46, 48, 50, 55, 60, 61, 65, 66, 69, 71, 74, 75 => .describe, // ListOffsets, OffsetFetch, Describe*
             3, 18 => .describe, // Metadata, ApiVersions
             8 => .read, // OffsetCommit
             10, 11, 12, 13, 14 => .read, // Group ops
@@ -4773,6 +4775,160 @@ pub const Broker = struct {
 
     fn describeGroupsAuthorizedOps(include_authorized_operations: bool) i32 {
         return if (include_authorized_operations) 0 else std.math.minInt(i32);
+    }
+
+    // ---------------------------------------------------------------
+    // ConsumerGroupDescribe (key 69) — read-only group introspection
+    // ---------------------------------------------------------------
+    fn handleConsumerGroupDescribe(self: *Broker, request_bytes: []const u8, body_start: usize, req_header: *const RequestHeader, api_version: i16, resp_header_version: i16) ?[]u8 {
+        const Req = generated.consumer_group_describe_request.ConsumerGroupDescribeRequest;
+        const Resp = generated.consumer_group_describe_response.ConsumerGroupDescribeResponse;
+
+        if (!validateConsumerGroupDescribeRequestFrame(request_bytes, body_start)) {
+            log.warn("Malformed ConsumerGroupDescribe request", .{});
+            return null;
+        }
+
+        var pos = body_start;
+        var req = Req.deserialize(self.allocator, request_bytes, &pos, api_version) catch |err| {
+            log.warn("Failed to decode ConsumerGroupDescribe request: {}", .{err});
+            return null;
+        };
+        defer self.freeConsumerGroupDescribeRequest(&req);
+
+        const described_groups = self.collectConsumerGroupDescriptions(req) catch return null;
+        defer {
+            self.freeConsumerGroupDescriptions(described_groups);
+            if (described_groups.len > 0) self.allocator.free(described_groups);
+        }
+
+        const resp = Resp{
+            .throttle_time_ms = 0,
+            .groups = described_groups,
+        };
+        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+    }
+
+    fn freeConsumerGroupDescribeRequest(self: *Broker, req: *generated.consumer_group_describe_request.ConsumerGroupDescribeRequest) void {
+        if (req.group_ids.len > 0) self.allocator.free(req.group_ids);
+    }
+
+    fn collectConsumerGroupDescriptions(self: *Broker, req: generated.consumer_group_describe_request.ConsumerGroupDescribeRequest) ![]generated.consumer_group_describe_response.ConsumerGroupDescribeResponse.DescribedGroup {
+        const DescribedGroup = generated.consumer_group_describe_response.ConsumerGroupDescribeResponse.DescribedGroup;
+
+        if (req.group_ids.len == 0) return &.{};
+
+        const groups = try self.allocator.alloc(DescribedGroup, req.group_ids.len);
+        var groups_init: usize = 0;
+        errdefer {
+            self.freeConsumerGroupDescriptions(groups[0..groups_init]);
+            self.allocator.free(groups);
+        }
+
+        for (req.group_ids) |requested_group| {
+            const group_id = requested_group orelse "";
+            groups[groups_init] = try self.describeConsumerGroup(group_id, req.include_authorized_operations);
+            groups_init += 1;
+        }
+        return groups;
+    }
+
+    fn describeConsumerGroup(self: *Broker, group_id: []const u8, include_authorized_operations: bool) !generated.consumer_group_describe_response.ConsumerGroupDescribeResponse.DescribedGroup {
+        if (group_id.len == 0) {
+            return .{
+                .error_code = @intFromEnum(ErrorCode.invalid_group_id),
+                .error_message = "invalid group id",
+                .group_id = group_id,
+                .group_state = "",
+                .group_epoch = 0,
+                .assignment_epoch = 0,
+                .assignor_name = "",
+                .members = &.{},
+                .authorized_operations = describeGroupsAuthorizedOps(include_authorized_operations),
+            };
+        }
+
+        if (self.groups.groups.getPtr(group_id)) |group| {
+            return self.describeExistingConsumerGroup(group, include_authorized_operations);
+        }
+        return .{
+            .error_code = @intFromEnum(ErrorCode.group_id_not_found),
+            .error_message = null,
+            .group_id = group_id,
+            .group_state = "",
+            .group_epoch = 0,
+            .assignment_epoch = 0,
+            .assignor_name = "",
+            .members = &.{},
+            .authorized_operations = describeGroupsAuthorizedOps(include_authorized_operations),
+        };
+    }
+
+    fn describeExistingConsumerGroup(self: *Broker, group: *const @import("group_coordinator.zig").ConsumerGroup, include_authorized_operations: bool) !generated.consumer_group_describe_response.ConsumerGroupDescribeResponse.DescribedGroup {
+        const Member = generated.consumer_group_describe_response.ConsumerGroupDescribeResponse.DescribedGroup.Member;
+
+        var members: []Member = &.{};
+        if (group.memberCount() > 0) {
+            members = try self.allocator.alloc(Member, group.memberCount());
+            var members_init: usize = 0;
+            errdefer {
+                self.freeConsumerGroupDescribeMembers(members[0..members_init]);
+                self.allocator.free(members);
+            }
+
+            var mit = group.members.iterator();
+            while (mit.next()) |mentry| {
+                const member = mentry.value_ptr;
+                const subscribed_topics = try self.copySubscribedTopicNames(member.subscribed_topics.items);
+                members[members_init] = .{
+                    .member_id = member.member_id,
+                    .instance_id = member.group_instance_id,
+                    .rack_id = null,
+                    .member_epoch = group.generation_id,
+                    .client_id = "zmq-client",
+                    .client_host = "/127.0.0.1",
+                    .subscribed_topic_names = subscribed_topics,
+                    .subscribed_topic_regex = null,
+                    .assignment = .{},
+                    .target_assignment = .{},
+                };
+                members_init += 1;
+            }
+        }
+
+        return .{
+            .error_code = @intFromEnum(ErrorCode.none),
+            .error_message = null,
+            .group_id = group.group_id,
+            .group_state = consumerGroupStateName(group.state),
+            .group_epoch = group.generation_id,
+            .assignment_epoch = group.generation_id,
+            .assignor_name = group.protocol_name orelse "",
+            .members = members,
+            .authorized_operations = describeGroupsAuthorizedOps(include_authorized_operations),
+        };
+    }
+
+    fn copySubscribedTopicNames(self: *Broker, subscribed_topics: []const []u8) ![]const ?[]const u8 {
+        if (subscribed_topics.len == 0) return &.{};
+        const result = try self.allocator.alloc(?[]const u8, subscribed_topics.len);
+        for (subscribed_topics, 0..) |topic, i| {
+            result[i] = topic;
+        }
+        return result;
+    }
+
+    fn freeConsumerGroupDescriptions(self: *Broker, groups: []const generated.consumer_group_describe_response.ConsumerGroupDescribeResponse.DescribedGroup) void {
+        for (groups) |group| {
+            self.freeConsumerGroupDescribeMembers(group.members);
+            if (group.members.len > 0) self.allocator.free(group.members);
+        }
+    }
+
+    fn freeConsumerGroupDescribeMembers(self: *Broker, members: []const generated.consumer_group_describe_response.ConsumerGroupDescribeResponse.DescribedGroup.Member) void {
+        for (members) |member| {
+            if (member.subscribed_topic_names.len > 0) self.allocator.free(member.subscribed_topic_names);
+        }
     }
 
     // ---------------------------------------------------------------
@@ -11124,6 +11280,18 @@ pub const Broker = struct {
         return true;
     }
 
+    fn validateConsumerGroupDescribeRequestFrame(buf: []const u8, start_pos: usize) bool {
+        var pos = start_pos;
+
+        const group_count = readKafkaArrayCount(buf, &pos, true) orelse return false;
+        for (0..group_count) |_| {
+            if (!skipKafkaString(buf, &pos, true)) return false; // group_id
+        }
+        if (!skipFixedBytes(buf, &pos, 1)) return false; // include_authorized_operations
+        ser.skipTaggedFields(buf, &pos) catch return false;
+        return pos == buf.len;
+    }
+
     fn validateHeartbeatRequestFrame(buf: []const u8, start_pos: usize, api_version: i16) bool {
         const flexible = api_version >= 4;
         var pos = start_pos;
@@ -12306,6 +12474,24 @@ fn freeDeserializedDescribeTransactionsResponse(resp: *const generated.describe_
         if (state.topics.len > 0) testing.allocator.free(state.topics);
     }
     if (resp.transaction_states.len > 0) testing.allocator.free(resp.transaction_states);
+}
+
+fn freeDeserializedConsumerGroupDescribeResponse(resp: *const generated.consumer_group_describe_response.ConsumerGroupDescribeResponse) void {
+    for (resp.groups) |group| {
+        for (group.members) |member| {
+            if (member.subscribed_topic_names.len > 0) testing.allocator.free(member.subscribed_topic_names);
+            for (member.assignment.topic_partitions) |topic| {
+                if (topic.partitions.len > 0) testing.allocator.free(topic.partitions);
+            }
+            if (member.assignment.topic_partitions.len > 0) testing.allocator.free(member.assignment.topic_partitions);
+            for (member.target_assignment.topic_partitions) |topic| {
+                if (topic.partitions.len > 0) testing.allocator.free(topic.partitions);
+            }
+            if (member.target_assignment.topic_partitions.len > 0) testing.allocator.free(member.target_assignment.topic_partitions);
+        }
+        if (group.members.len > 0) testing.allocator.free(group.members);
+    }
+    if (resp.groups.len > 0) testing.allocator.free(resp.groups);
 }
 
 fn freeDeserializedDescribeTopicPartitionsResponse(resp: *const generated.describe_topic_partitions_response.DescribeTopicPartitionsResponse) void {
@@ -20580,6 +20766,75 @@ test "Broker.handleRequest DescribeGroups rejects truncated request" {
     var buf: [128]u8 = undefined;
     const req_len = buildTestRequest(&buf, 15, 5, 1506, header_mod.requestHeaderVersion(15, 5));
     try testing.expect(broker.handleRequest(buf[0..req_len]) == null);
+}
+
+test "Broker.handleRequest ConsumerGroupDescribe v0 returns generated group state" {
+    const Req = generated.consumer_group_describe_request.ConsumerGroupDescribeRequest;
+    const Resp = generated.consumer_group_describe_response.ConsumerGroupDescribeResponse;
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+
+    const subscriptions = [_][]const u8{"cgd-topic"};
+    const join_result = try broker.groups.joinGroupWithProtocol("cgd-group", null, null, "consumer", "range", null, &subscriptions);
+    const group = broker.groups.groups.getPtr("cgd-group").?;
+    group.state = .stable;
+
+    const group_ids = [_]?[]const u8{ "cgd-group", "missing-cgd-group" };
+    const req = Req{
+        .group_ids = &group_ids,
+        .include_authorized_operations = true,
+    };
+
+    var buf: [768]u8 = undefined;
+    var pos = buildTestRequest(&buf, 69, 0, 6900, header_mod.requestHeaderVersion(69, 0));
+    req.serialize(&buf, &pos, 0);
+
+    const response = broker.handleRequest(buf[0..pos]);
+    try testing.expect(response != null);
+    defer testing.allocator.free(response.?);
+
+    var rpos: usize = 0;
+    var response_header = try ResponseHeader.deserialize(testing.allocator, response.?, &rpos, header_mod.responseHeaderVersion(69, 0));
+    defer response_header.deinit(testing.allocator);
+    try testing.expectEqual(@as(i32, 6900), response_header.correlation_id);
+
+    const resp = try Resp.deserialize(testing.allocator, response.?, &rpos, 0);
+    defer freeDeserializedConsumerGroupDescribeResponse(&resp);
+    try testing.expectEqual(response.?.len, rpos);
+    try testing.expectEqual(@as(i32, 0), resp.throttle_time_ms);
+    try testing.expectEqual(@as(usize, 2), resp.groups.len);
+
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.none)), resp.groups[0].error_code);
+    try testing.expectEqualStrings("cgd-group", resp.groups[0].group_id.?);
+    try testing.expectEqualStrings("Stable", resp.groups[0].group_state.?);
+    try testing.expectEqual(@as(i32, 1), resp.groups[0].group_epoch);
+    try testing.expectEqual(@as(i32, 1), resp.groups[0].assignment_epoch);
+    try testing.expectEqualStrings("range", resp.groups[0].assignor_name.?);
+    try testing.expectEqual(@as(i32, 0), resp.groups[0].authorized_operations);
+    try testing.expectEqual(@as(usize, 1), resp.groups[0].members.len);
+    try testing.expectEqualStrings(join_result.member_id, resp.groups[0].members[0].member_id.?);
+    try testing.expectEqual(@as(i32, 1), resp.groups[0].members[0].member_epoch);
+    try testing.expectEqualStrings("zmq-client", resp.groups[0].members[0].client_id.?);
+    try testing.expectEqualStrings("/127.0.0.1", resp.groups[0].members[0].client_host.?);
+    try testing.expectEqual(@as(usize, 1), resp.groups[0].members[0].subscribed_topic_names.len);
+    try testing.expectEqualStrings("cgd-topic", resp.groups[0].members[0].subscribed_topic_names[0].?);
+    try testing.expectEqual(@as(usize, 0), resp.groups[0].members[0].assignment.topic_partitions.len);
+
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.group_id_not_found)), resp.groups[1].error_code);
+    try testing.expectEqualStrings("missing-cgd-group", resp.groups[1].group_id.?);
+    try testing.expectEqualStrings("", resp.groups[1].group_state.?);
+    try testing.expectEqual(@as(usize, 0), resp.groups[1].members.len);
+}
+
+test "Broker.handleRequest ConsumerGroupDescribe rejects truncated request" {
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+
+    var buf: [128]u8 = undefined;
+    var pos = buildTestRequest(&buf, 69, 0, 6901, header_mod.requestHeaderVersion(69, 0));
+    ser.writeCompactArrayLen(&buf, &pos, 1); // one group declared, body truncated
+    try testing.expect(broker.handleRequest(buf[0..pos]) == null);
 }
 
 test "Broker.handleRequest OffsetCommit and OffsetFetch round-trip" {
