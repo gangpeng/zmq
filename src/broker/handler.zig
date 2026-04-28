@@ -1718,6 +1718,8 @@ pub const Broker = struct {
             53 => self.handleBeginQuorumEpoch(request_bytes, pos, &req_header, api_version, resp_header_version),
             54 => self.handleEndQuorumEpoch(request_bytes, pos, &req_header, api_version, resp_header_version),
             55 => self.handleDescribeQuorum(request_bytes, pos, &req_header, api_version, resp_header_version),
+            65 => self.handleDescribeTransactions(request_bytes, pos, &req_header, api_version, resp_header_version),
+            66 => self.handleListTransactions(request_bytes, pos, &req_header, api_version, resp_header_version),
             501 => self.handleCreateStreams(request_bytes, pos, &req_header, api_version, resp_header_version),
             502 => self.handleOpenStreams(request_bytes, pos, &req_header, api_version, resp_header_version),
             503 => self.handleCloseStreams(request_bytes, pos, &req_header, api_version, resp_header_version),
@@ -1812,6 +1814,7 @@ pub const Broker = struct {
         const has_throttle = switch (api_key) {
             // Most APIs v1+ have throttle_time_ms; for simplicity track the common ones
             8, 10, 11, 12, 13, 14, 22, 25, 26 => api_version >= 1,
+            66 => true,
             18 => false, // ApiVersions: error_code is right after header
             else => false,
         };
@@ -1829,7 +1832,7 @@ pub const Broker = struct {
             // WriteTxnMarkers (27) — marker/partition-scoped errors only
             27 => return 0,
             // These APIs have a top-level error_code at this position
-            10, 11, 12, 13, 14, 18, 22, 25, 26 => {},
+            10, 11, 12, 13, 14, 18, 22, 25, 26, 66 => {},
             // Other APIs — attempt extraction but don't fail
             else => {},
         }
@@ -1857,7 +1860,7 @@ pub const Broker = struct {
         return switch (api_key) {
             0, 1, 2 => .topic, // Produce, Fetch, ListOffsets
             8, 9, 10, 11, 12, 13, 14, 15, 16, 42, 47 => .group, // group-related
-            22, 24, 26, 27, 28 => .transactional_id, // txn-related
+            22, 24, 26, 27, 28, 65, 66 => .transactional_id, // txn-related
             3, 18, 19, 20, 32, 33, 35, 37, 43, 44, 45, 46 => .cluster, // metadata/admin
             501...519, 600...602 => .cluster, // AutoMQ stream/object/controller extensions
             else => .unknown,
@@ -1869,7 +1872,7 @@ pub const Broker = struct {
         return switch (api_key) {
             0 => .write, // Produce
             1 => .read, // Fetch
-            2, 9, 15, 16, 23, 29, 32, 35, 46, 55, 60, 61 => .describe, // ListOffsets, OffsetFetch, Describe*
+            2, 9, 15, 16, 23, 29, 32, 35, 46, 55, 60, 61, 65, 66 => .describe, // ListOffsets, OffsetFetch, Describe*
             3, 18 => .describe, // Metadata, ApiVersions
             8 => .read, // OffsetCommit
             10, 11, 12, 13, 14 => .read, // Group ops
@@ -8122,6 +8125,307 @@ pub const Broker = struct {
     }
 
     // ---------------------------------------------------------------
+    // DescribeTransactions (key 65)
+    // ---------------------------------------------------------------
+    fn handleDescribeTransactions(self: *Broker, request_bytes: []const u8, body_start: usize, req_header: *const RequestHeader, api_version: i16, resp_header_version: i16) ?[]u8 {
+        const Req = generated.describe_transactions_request.DescribeTransactionsRequest;
+        const Resp = generated.describe_transactions_response.DescribeTransactionsResponse;
+
+        if (!validateDescribeTransactionsRequestFrame(request_bytes, body_start)) {
+            log.warn("Malformed DescribeTransactions request", .{});
+            return null;
+        }
+
+        var pos = body_start;
+        var req = Req.deserialize(self.allocator, request_bytes, &pos, api_version) catch |err| {
+            log.warn("Failed to decode DescribeTransactions request: {}", .{err});
+            return null;
+        };
+        defer self.freeDescribeTransactionsRequest(&req);
+
+        const transaction_states = self.collectDescribedTransactions(req) catch return null;
+        defer {
+            self.freeDescribedTransactionStates(transaction_states);
+            if (transaction_states.len > 0) self.allocator.free(transaction_states);
+        }
+
+        const resp = Resp{
+            .throttle_time_ms = 0,
+            .transaction_states = transaction_states,
+        };
+        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+    }
+
+    fn freeDescribeTransactionsRequest(self: *Broker, req: *generated.describe_transactions_request.DescribeTransactionsRequest) void {
+        if (req.transactional_ids.len > 0) self.allocator.free(req.transactional_ids);
+    }
+
+    fn collectDescribedTransactions(self: *Broker, req: generated.describe_transactions_request.DescribeTransactionsRequest) ![]generated.describe_transactions_response.DescribeTransactionsResponse.TransactionState {
+        const TransactionState = generated.describe_transactions_response.DescribeTransactionsResponse.TransactionState;
+
+        if (req.transactional_ids.len == 0) return &.{};
+
+        const states = try self.allocator.alloc(TransactionState, req.transactional_ids.len);
+        var states_init: usize = 0;
+        errdefer {
+            self.freeDescribedTransactionStates(states[0..states_init]);
+            self.allocator.free(states);
+        }
+
+        for (req.transactional_ids) |requested_id| {
+            const transactional_id = requested_id orelse "";
+            states[states_init] = if (requested_id == null)
+                missingTransactionDescription(null)
+            else if (self.findTransactionByTransactionalId(transactional_id)) |txn|
+                try self.describeExistingTransaction(txn)
+            else
+                missingTransactionDescription(transactional_id);
+            states_init += 1;
+        }
+
+        return states;
+    }
+
+    fn describeExistingTransaction(self: *Broker, txn: *const TxnCoordinator.TransactionState) !generated.describe_transactions_response.DescribeTransactionsResponse.TransactionState {
+        const topics = try self.collectTransactionTopicData(txn);
+        errdefer {
+            self.freeDescribedTransactionTopics(topics);
+            if (topics.len > 0) self.allocator.free(topics);
+        }
+
+        return .{
+            .error_code = @intFromEnum(ErrorCode.none),
+            .transactional_id = txn.transactional_id,
+            .transaction_state = transactionStatusName(txn.status),
+            .transaction_timeout_ms = txn.timeout_ms,
+            .transaction_start_time_ms = txn.start_time_ms,
+            .producer_id = txn.producer_id,
+            .producer_epoch = txn.producer_epoch,
+            .topics = topics,
+        };
+    }
+
+    fn missingTransactionDescription(transactional_id: ?[]const u8) generated.describe_transactions_response.DescribeTransactionsResponse.TransactionState {
+        return .{
+            .error_code = @intFromEnum(ErrorCode.transactional_id_not_found),
+            .transactional_id = transactional_id,
+            .transaction_state = "Dead",
+            .transaction_timeout_ms = 0,
+            .transaction_start_time_ms = -1,
+            .producer_id = -1,
+            .producer_epoch = -1,
+            .topics = &.{},
+        };
+    }
+
+    fn collectTransactionTopicData(self: *Broker, txn: *const TxnCoordinator.TransactionState) ![]generated.describe_transactions_response.DescribeTransactionsResponse.TransactionState.TopicData {
+        const TopicData = generated.describe_transactions_response.DescribeTransactionsResponse.TransactionState.TopicData;
+        const partitions = txn.partitions.items;
+        if (partitions.len == 0) return &.{};
+
+        var topic_count: usize = 0;
+        for (partitions, 0..) |partition, idx| {
+            if (isFirstTransactionTopicOccurrence(partitions, idx, partition.topic)) topic_count += 1;
+        }
+
+        const topics = try self.allocator.alloc(TopicData, topic_count);
+        var topics_init: usize = 0;
+        errdefer {
+            self.freeDescribedTransactionTopics(topics[0..topics_init]);
+            self.allocator.free(topics);
+        }
+
+        for (partitions, 0..) |partition, idx| {
+            if (!isFirstTransactionTopicOccurrence(partitions, idx, partition.topic)) continue;
+
+            var partition_count: usize = 0;
+            for (partitions) |candidate| {
+                if (std.mem.eql(u8, candidate.topic, partition.topic)) partition_count += 1;
+            }
+
+            const partition_indexes = try self.allocator.alloc(i32, partition_count);
+            var partition_idx: usize = 0;
+            for (partitions) |candidate| {
+                if (std.mem.eql(u8, candidate.topic, partition.topic)) {
+                    partition_indexes[partition_idx] = candidate.partition;
+                    partition_idx += 1;
+                }
+            }
+
+            topics[topics_init] = .{
+                .topic = partition.topic,
+                .partitions = partition_indexes,
+            };
+            topics_init += 1;
+        }
+
+        return topics;
+    }
+
+    fn isFirstTransactionTopicOccurrence(partitions: []const TxnCoordinator.TransactionState.TopicPartition, index: usize, topic: []const u8) bool {
+        for (partitions[0..index]) |candidate| {
+            if (std.mem.eql(u8, candidate.topic, topic)) return false;
+        }
+        return true;
+    }
+
+    fn freeDescribedTransactionStates(self: *Broker, states: []const generated.describe_transactions_response.DescribeTransactionsResponse.TransactionState) void {
+        for (states) |state| {
+            self.freeDescribedTransactionTopics(state.topics);
+            if (state.topics.len > 0) self.allocator.free(state.topics);
+        }
+    }
+
+    fn freeDescribedTransactionTopics(self: *Broker, topics: []const generated.describe_transactions_response.DescribeTransactionsResponse.TransactionState.TopicData) void {
+        for (topics) |topic| {
+            if (topic.partitions.len > 0) self.allocator.free(topic.partitions);
+        }
+    }
+
+    fn findTransactionByTransactionalId(self: *Broker, transactional_id: []const u8) ?*const TxnCoordinator.TransactionState {
+        var it = self.txn_coordinator.transactions.iterator();
+        while (it.next()) |entry| {
+            const txn = entry.value_ptr;
+            if (txn.transactional_id) |stored_id| {
+                if (std.mem.eql(u8, stored_id, transactional_id)) return txn;
+            }
+        }
+        return null;
+    }
+
+    // ---------------------------------------------------------------
+    // ListTransactions (key 66)
+    // ---------------------------------------------------------------
+    fn handleListTransactions(self: *Broker, request_bytes: []const u8, body_start: usize, req_header: *const RequestHeader, api_version: i16, resp_header_version: i16) ?[]u8 {
+        const Req = generated.list_transactions_request.ListTransactionsRequest;
+        const Resp = generated.list_transactions_response.ListTransactionsResponse;
+
+        if (!validateListTransactionsRequestFrame(request_bytes, body_start, api_version)) {
+            log.warn("Malformed ListTransactions request", .{});
+            return null;
+        }
+
+        var pos = body_start;
+        var req = Req.deserialize(self.allocator, request_bytes, &pos, api_version) catch |err| {
+            log.warn("Failed to decode ListTransactions request: {}", .{err});
+            return null;
+        };
+        defer self.freeListTransactionsRequest(&req);
+
+        const unknown_state_filters = self.collectUnknownTransactionStateFilters(req.state_filters) catch return null;
+        defer if (unknown_state_filters.len > 0) self.allocator.free(unknown_state_filters);
+
+        const transaction_states = self.collectListedTransactions(req) catch return null;
+        defer if (transaction_states.len > 0) self.allocator.free(transaction_states);
+
+        const resp = Resp{
+            .throttle_time_ms = 0,
+            .error_code = @intFromEnum(ErrorCode.none),
+            .unknown_state_filters = unknown_state_filters,
+            .transaction_states = transaction_states,
+        };
+        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+    }
+
+    fn freeListTransactionsRequest(self: *Broker, req: *generated.list_transactions_request.ListTransactionsRequest) void {
+        if (req.state_filters.len > 0) self.allocator.free(req.state_filters);
+        if (req.producer_id_filters.len > 0) self.allocator.free(req.producer_id_filters);
+    }
+
+    fn collectListedTransactions(self: *Broker, req: generated.list_transactions_request.ListTransactionsRequest) ![]generated.list_transactions_response.ListTransactionsResponse.TransactionState {
+        const TransactionState = generated.list_transactions_response.ListTransactionsResponse.TransactionState;
+
+        var listed = std.array_list.Managed(TransactionState).init(self.allocator);
+        errdefer listed.deinit();
+
+        const now_ms = @import("time_compat").milliTimestamp();
+        var it = self.txn_coordinator.transactions.iterator();
+        while (it.next()) |entry| {
+            const txn = entry.value_ptr;
+            const transactional_id = txn.transactional_id orelse continue;
+            const status_name = transactionStatusName(txn.status);
+
+            if (!transactionStateFilterAllows(req.state_filters, status_name)) continue;
+            if (!producerIdFilterAllows(req.producer_id_filters, txn.producer_id)) continue;
+            if (!transactionDurationFilterAllows(req.duration_filter, now_ms, txn.start_time_ms)) continue;
+
+            try listed.append(.{
+                .transactional_id = transactional_id,
+                .producer_id = txn.producer_id,
+                .transaction_state = status_name,
+            });
+        }
+
+        if (listed.items.len == 0) {
+            listed.deinit();
+            return &.{};
+        }
+        return try listed.toOwnedSlice();
+    }
+
+    fn collectUnknownTransactionStateFilters(self: *Broker, state_filters: []const ?[]const u8) ![]?[]const u8 {
+        var unknown = std.array_list.Managed(?[]const u8).init(self.allocator);
+        errdefer unknown.deinit();
+
+        for (state_filters) |filter| {
+            const name = filter orelse {
+                try unknown.append(null);
+                continue;
+            };
+            if (!isKnownTransactionStatusName(name)) try unknown.append(filter);
+        }
+
+        if (unknown.items.len == 0) {
+            unknown.deinit();
+            return &.{};
+        }
+        return try unknown.toOwnedSlice();
+    }
+
+    fn transactionStatusName(status: TxnCoordinator.TxnStatus) []const u8 {
+        return switch (status) {
+            .empty => "Empty",
+            .ongoing => "Ongoing",
+            .prepare_commit => "PrepareCommit",
+            .complete_commit => "CompleteCommit",
+            .prepare_abort => "PrepareAbort",
+            .complete_abort => "CompleteAbort",
+            .dead => "Dead",
+        };
+    }
+
+    fn isKnownTransactionStatusName(name: []const u8) bool {
+        inline for (std.meta.fields(TxnCoordinator.TxnStatus)) |field| {
+            const status: TxnCoordinator.TxnStatus = @enumFromInt(field.value);
+            if (std.mem.eql(u8, name, transactionStatusName(status))) return true;
+        }
+        return false;
+    }
+
+    fn transactionStateFilterAllows(filter: []const ?[]const u8, state_name: []const u8) bool {
+        if (filter.len == 0) return true;
+        for (filter) |item| {
+            if (item) |needle| {
+                if (std.mem.eql(u8, needle, state_name)) return true;
+            }
+        }
+        return false;
+    }
+
+    fn producerIdFilterAllows(filter: []const i64, producer_id: i64) bool {
+        if (filter.len == 0) return true;
+        for (filter) |candidate| {
+            if (candidate == producer_id) return true;
+        }
+        return false;
+    }
+
+    fn transactionDurationFilterAllows(duration_filter: i64, now_ms: i64, start_time_ms: i64) bool {
+        if (duration_filter < 0) return true;
+        return now_ms - start_time_ms >= duration_filter;
+    }
+
+    // ---------------------------------------------------------------
     // DescribeAcls (key 29)
     // ---------------------------------------------------------------
     fn handleDescribeAcls(self: *Broker, request_bytes: []const u8, body_start: usize, req_header: *const RequestHeader, api_version: i16, resp_header_version: i16) ?[]u8 {
@@ -9985,6 +10289,35 @@ pub const Broker = struct {
         return true;
     }
 
+    fn validateDescribeTransactionsRequestFrame(buf: []const u8, start_pos: usize) bool {
+        var pos = start_pos;
+
+        const transactional_id_count = readKafkaArrayCount(buf, &pos, true) orelse return false;
+        for (0..transactional_id_count) |_| {
+            if (!skipKafkaString(buf, &pos, true)) return false; // transactional_id
+        }
+        ser.skipTaggedFields(buf, &pos) catch return false;
+        return true;
+    }
+
+    fn validateListTransactionsRequestFrame(buf: []const u8, start_pos: usize, api_version: i16) bool {
+        var pos = start_pos;
+
+        const state_count = readKafkaArrayCount(buf, &pos, true) orelse return false;
+        for (0..state_count) |_| {
+            if (!skipKafkaString(buf, &pos, true)) return false; // state_filter
+        }
+
+        const producer_count = readKafkaArrayCount(buf, &pos, true) orelse return false;
+        for (0..producer_count) |_| {
+            if (!skipFixedBytes(buf, &pos, @sizeOf(i64))) return false; // producer_id_filter
+        }
+        if (api_version >= 1 and !skipFixedBytes(buf, &pos, @sizeOf(i64))) return false; // duration_filter
+
+        ser.skipTaggedFields(buf, &pos) catch return false;
+        return true;
+    }
+
     fn skipAddPartitionsToTxnTopics(buf: []const u8, pos: *usize, flexible: bool) bool {
         const topic_count = readKafkaArrayCount(buf, pos, flexible) orelse return false;
         for (0..topic_count) |_| {
@@ -10893,6 +11226,21 @@ fn buildTestRequest(buf: []u8, api_key: i16, api_version: i16, correlation_id: i
         ser.writeString(buf, &pos, "test-client");
     }
     return pos;
+}
+
+fn freeDeserializedListTransactionsResponse(resp: *const generated.list_transactions_response.ListTransactionsResponse) void {
+    if (resp.unknown_state_filters.len > 0) testing.allocator.free(resp.unknown_state_filters);
+    if (resp.transaction_states.len > 0) testing.allocator.free(resp.transaction_states);
+}
+
+fn freeDeserializedDescribeTransactionsResponse(resp: *const generated.describe_transactions_response.DescribeTransactionsResponse) void {
+    for (resp.transaction_states) |state| {
+        for (state.topics) |topic| {
+            if (topic.partitions.len > 0) testing.allocator.free(topic.partitions);
+        }
+        if (state.topics.len > 0) testing.allocator.free(state.topics);
+    }
+    if (resp.transaction_states.len > 0) testing.allocator.free(resp.transaction_states);
 }
 
 fn appendInternalRaftAppendEntriesPayload(
@@ -12393,6 +12741,127 @@ test "Broker.handleRequest WriteTxnMarkers rejects truncated request" {
 
     var buf: [128]u8 = undefined;
     const req_len = buildTestRequest(&buf, 27, 1, 2702, header_mod.requestHeaderVersion(27, 1));
+    try testing.expect(broker.handleRequest(buf[0..req_len]) == null);
+}
+
+test "Broker.handleRequest ListTransactions v1 filters transaction state and producer id" {
+    const Req = generated.list_transactions_request.ListTransactionsRequest;
+    const Resp = generated.list_transactions_response.ListTransactionsResponse;
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+
+    const listed = try broker.txn_coordinator.initProducerId("list-txn");
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.none)), try broker.txn_coordinator.addPartitionsToTxn(listed.producer_id, listed.producer_epoch, "list-txn-topic", 0));
+    const filtered = try broker.txn_coordinator.initProducerId("filtered-list-txn");
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.none)), try broker.txn_coordinator.addPartitionsToTxn(filtered.producer_id, filtered.producer_epoch, "list-txn-topic", 1));
+
+    const state_filters = [_]?[]const u8{ "Ongoing", "BogusTxnState" };
+    const producer_id_filters = [_]i64{listed.producer_id};
+    const req = Req{
+        .state_filters = &state_filters,
+        .producer_id_filters = &producer_id_filters,
+        .duration_filter = -1,
+    };
+
+    var buf: [512]u8 = undefined;
+    var pos = buildTestRequest(&buf, 66, 1, 6601, header_mod.requestHeaderVersion(66, 1));
+    req.serialize(&buf, &pos, 1);
+
+    const response = broker.handleRequest(buf[0..pos]);
+    try testing.expect(response != null);
+    defer testing.allocator.free(response.?);
+
+    var rpos: usize = 0;
+    var response_header = try ResponseHeader.deserialize(testing.allocator, response.?, &rpos, header_mod.responseHeaderVersion(66, 1));
+    defer response_header.deinit(testing.allocator);
+    try testing.expectEqual(@as(i32, 6601), response_header.correlation_id);
+
+    const resp = try Resp.deserialize(testing.allocator, response.?, &rpos, 1);
+    defer freeDeserializedListTransactionsResponse(&resp);
+
+    try testing.expectEqual(response.?.len, rpos);
+    try testing.expectEqual(@as(i32, 0), resp.throttle_time_ms);
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.none)), resp.error_code);
+    try testing.expectEqual(@as(usize, 1), resp.unknown_state_filters.len);
+    try testing.expectEqualStrings("BogusTxnState", resp.unknown_state_filters[0].?);
+    try testing.expectEqual(@as(usize, 1), resp.transaction_states.len);
+    try testing.expectEqualStrings("list-txn", resp.transaction_states[0].transactional_id.?);
+    try testing.expectEqual(listed.producer_id, resp.transaction_states[0].producer_id);
+    try testing.expectEqualStrings("Ongoing", resp.transaction_states[0].transaction_state.?);
+}
+
+test "Broker.handleRequest ListTransactions rejects truncated request" {
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+
+    var buf: [128]u8 = undefined;
+    const req_len = buildTestRequest(&buf, 66, 1, 6602, header_mod.requestHeaderVersion(66, 1));
+    try testing.expect(broker.handleRequest(buf[0..req_len]) == null);
+}
+
+test "Broker.handleRequest DescribeTransactions v0 returns partition details and missing ids" {
+    const Req = generated.describe_transactions_request.DescribeTransactionsRequest;
+    const Resp = generated.describe_transactions_response.DescribeTransactionsResponse;
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+
+    const init_result = try broker.txn_coordinator.initProducerId("describe-txn");
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.none)), try broker.txn_coordinator.addPartitionsToTxn(init_result.producer_id, init_result.producer_epoch, "describe-txn-topic", 0));
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.none)), try broker.txn_coordinator.addPartitionsToTxn(init_result.producer_id, init_result.producer_epoch, "describe-txn-topic", 1));
+
+    const transactional_ids = [_]?[]const u8{ "describe-txn", "missing-txn" };
+    const req = Req{ .transactional_ids = &transactional_ids };
+
+    var buf: [512]u8 = undefined;
+    var pos = buildTestRequest(&buf, 65, 0, 6501, header_mod.requestHeaderVersion(65, 0));
+    req.serialize(&buf, &pos, 0);
+
+    const response = broker.handleRequest(buf[0..pos]);
+    try testing.expect(response != null);
+    defer testing.allocator.free(response.?);
+
+    var rpos: usize = 0;
+    var response_header = try ResponseHeader.deserialize(testing.allocator, response.?, &rpos, header_mod.responseHeaderVersion(65, 0));
+    defer response_header.deinit(testing.allocator);
+    try testing.expectEqual(@as(i32, 6501), response_header.correlation_id);
+
+    const resp = try Resp.deserialize(testing.allocator, response.?, &rpos, 0);
+    defer freeDeserializedDescribeTransactionsResponse(&resp);
+
+    try testing.expectEqual(response.?.len, rpos);
+    try testing.expectEqual(@as(i32, 0), resp.throttle_time_ms);
+    try testing.expectEqual(@as(usize, 2), resp.transaction_states.len);
+
+    const described = resp.transaction_states[0];
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.none)), described.error_code);
+    try testing.expectEqualStrings("describe-txn", described.transactional_id.?);
+    try testing.expectEqualStrings("Ongoing", described.transaction_state.?);
+    try testing.expectEqual(TxnCoordinator.default_transaction_timeout_ms, described.transaction_timeout_ms);
+    try testing.expectEqual(init_result.producer_id, described.producer_id);
+    try testing.expectEqual(init_result.producer_epoch, described.producer_epoch);
+    try testing.expectEqual(@as(usize, 1), described.topics.len);
+    try testing.expectEqualStrings("describe-txn-topic", described.topics[0].topic.?);
+    try testing.expectEqual(@as(usize, 2), described.topics[0].partitions.len);
+    try testing.expectEqual(@as(i32, 0), described.topics[0].partitions[0]);
+    try testing.expectEqual(@as(i32, 1), described.topics[0].partitions[1]);
+
+    const missing = resp.transaction_states[1];
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.transactional_id_not_found)), missing.error_code);
+    try testing.expectEqualStrings("missing-txn", missing.transactional_id.?);
+    try testing.expectEqualStrings("Dead", missing.transaction_state.?);
+    try testing.expectEqual(@as(i64, -1), missing.producer_id);
+    try testing.expectEqual(@as(i16, -1), missing.producer_epoch);
+    try testing.expectEqual(@as(usize, 0), missing.topics.len);
+}
+
+test "Broker.handleRequest DescribeTransactions rejects truncated request" {
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+
+    var buf: [128]u8 = undefined;
+    const req_len = buildTestRequest(&buf, 65, 0, 6502, header_mod.requestHeaderVersion(65, 0));
     try testing.expect(broker.handleRequest(buf[0..req_len]) == null);
 }
 
