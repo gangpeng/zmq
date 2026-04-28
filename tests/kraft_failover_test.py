@@ -461,6 +461,167 @@ def automq_create_stream(port, node_id, correlation_id):
     return stream_id
 
 
+def automq_open_stream(port, node_id, stream_id, stream_epoch, correlation_id):
+    body = struct.pack(">iq", node_id, 1)
+    body += write_compact_array_len(1)
+    body += struct.pack(">qq", stream_id, stream_epoch)
+    body += b"\x00"  # item tagged fields
+    body += b"\x00"  # request tagged fields
+
+    response = automq_request(port, 502, correlation_id, body, timeout=15)
+    pos = parse_flexible_response_header(response, correlation_id)
+    top_error, pos = read_i16(response, pos)
+    _, pos = read_i32(response, pos)  # throttle_time_ms
+    response_count, pos = read_compact_array_len(response, pos)
+    if top_error != 0 or response_count != 1:
+        raise TestError(f"OpenStreams top_error={top_error} response_count={response_count}")
+    item_error, pos = read_i16(response, pos)
+    start_offset, pos = read_i64(response, pos)
+    next_offset, pos = read_i64(response, pos)
+    pos = skip_tags(response, pos)
+    pos = skip_tags(response, pos)
+    if item_error != 0:
+        raise TestError(f"OpenStreams item_error={item_error}")
+    return {"start_offset": start_offset, "next_offset": next_offset}
+
+
+def automq_close_stream(port, node_id, stream_id, stream_epoch, correlation_id):
+    return automq_single_stream_error_response(
+        port,
+        503,
+        correlation_id,
+        struct.pack(">iq", node_id, 1)
+        + write_compact_array_len(1)
+        + struct.pack(">qq", stream_id, stream_epoch)
+        + b"\x00"
+        + b"\x00",
+        "CloseStreams",
+    )
+
+
+def automq_delete_stream(port, node_id, stream_id, stream_epoch, correlation_id):
+    return automq_single_stream_error_response(
+        port,
+        504,
+        correlation_id,
+        struct.pack(">iq", node_id, 1)
+        + write_compact_array_len(1)
+        + struct.pack(">qq", stream_id, stream_epoch)
+        + b"\x00"
+        + b"\x00",
+        "DeleteStreams",
+    )
+
+
+def automq_prepare_s3_object(port, node_id, correlation_id):
+    body = struct.pack(">iiq", node_id, 1, 60_000)
+    body += b"\x00"  # request tagged fields
+
+    response = automq_request(port, 505, correlation_id, body, timeout=15)
+    pos = parse_flexible_response_header(response, correlation_id)
+    error_code, pos = read_i16(response, pos)
+    _, pos = read_i32(response, pos)  # throttle_time_ms
+    object_id, pos = read_i64(response, pos)
+    pos = skip_tags(response, pos)
+    if error_code != 0:
+        raise TestError(f"PrepareS3Object error_code={error_code}")
+    if object_id < 0:
+        raise TestError(f"PrepareS3Object invalid object_id={object_id}")
+    return object_id
+
+
+def automq_commit_stream_object(
+    port,
+    node_id,
+    stream_id,
+    object_id,
+    start_offset,
+    end_offset,
+    stream_epoch,
+    correlation_id,
+):
+    body = struct.pack(">i", node_id)
+    body += struct.pack(">q", 1)  # node_epoch
+    body += struct.pack(">q", object_id)
+    body += struct.pack(">q", 128)  # object_size
+    body += struct.pack(">q", stream_id)
+    body += struct.pack(">q", start_offset)
+    body += struct.pack(">q", end_offset)
+    body += write_compact_array_len(0)  # source_object_ids
+    body += struct.pack(">q", stream_epoch)
+    body += struct.pack(">i", 0)  # attributes
+    body += write_compact_array_len(0)  # operations
+    body += b"\x00"  # request tagged fields
+
+    response = automq_request(port, 507, correlation_id, body, timeout=15, api_version=1)
+    pos = parse_flexible_response_header(response, correlation_id)
+    error_code, pos = read_i16(response, pos)
+    _, pos = read_i32(response, pos)  # throttle_time_ms
+    pos = skip_tags(response, pos)
+    if error_code != 0:
+        raise TestError(f"CommitStreamObject error_code={error_code}")
+
+
+def automq_get_opening_streams(port, node_id, correlation_id, failover_mode=False):
+    body = struct.pack(">iq", node_id, 1)
+    body += b"\x01" if failover_mode else b"\x00"
+    body += b"\x00"  # request tagged fields
+
+    response = automq_request(port, 508, correlation_id, body)
+    pos = parse_flexible_response_header(response, correlation_id)
+    error_code, pos = read_i16(response, pos)
+    _, pos = read_i32(response, pos)  # throttle_time_ms
+    if error_code != 0:
+        raise TestError(f"GetOpeningStreams error_code={error_code}")
+    stream_count, pos = read_compact_array_len(response, pos)
+    streams = []
+    for _ in range(stream_count):
+        stream_id, pos = read_i64(response, pos)
+        epoch, pos = read_i64(response, pos)
+        start_offset, pos = read_i64(response, pos)
+        end_offset, pos = read_i64(response, pos)
+        pos = skip_tags(response, pos)
+        streams.append(
+            {
+                "stream_id": stream_id,
+                "epoch": epoch,
+                "start_offset": start_offset,
+                "end_offset": end_offset,
+            }
+        )
+    pos = skip_tags(response, pos)
+    return streams
+
+
+def automq_trim_stream(port, node_id, stream_id, stream_epoch, new_start_offset, correlation_id):
+    return automq_single_stream_error_response(
+        port,
+        512,
+        correlation_id,
+        struct.pack(">iq", node_id, 1)
+        + write_compact_array_len(1)
+        + struct.pack(">qqq", stream_id, stream_epoch, new_start_offset)
+        + b"\x00"
+        + b"\x00",
+        "TrimStreams",
+    )
+
+
+def automq_single_stream_error_response(port, api_key, correlation_id, body, api_name):
+    response = automq_request(port, api_key, correlation_id, body, timeout=15)
+    pos = parse_flexible_response_header(response, correlation_id)
+    top_error, pos = read_i16(response, pos)
+    _, pos = read_i32(response, pos)  # throttle_time_ms
+    response_count, pos = read_compact_array_len(response, pos)
+    if top_error != 0 or response_count != 1:
+        raise TestError(f"{api_name} top_error={top_error} response_count={response_count}")
+    item_error, pos = read_i16(response, pos)
+    pos = skip_tags(response, pos)
+    pos = skip_tags(response, pos)
+    if item_error != 0:
+        raise TestError(f"{api_name} item_error={item_error}")
+
+
 def automq_describe_stream(port, stream_id, correlation_id):
     body = write_compact_array_len(0)  # topic_partitions
     body += struct.pack(">i", -1)  # node_id
@@ -728,20 +889,237 @@ def wait_for_automq_create_stream(port, node_id, timeout=45):
     raise TestError(f"AutoMQ CreateStreams did not succeed within {timeout}s: {last_error}")
 
 
-def wait_for_automq_stream(port, stream_id, timeout=45):
+def wait_for_automq_open_stream(port, node_id, stream_id, stream_epoch, timeout=45):
     deadline = time.time() + timeout
-    correlation_id = 10000
+    correlation_id = 9300
     last_error = None
     while time.time() < deadline:
         try:
+            return automq_open_stream(port, node_id, stream_id, stream_epoch, correlation_id)
+        except Exception as exc:
+            last_error = exc
+            correlation_id += 1
+            time.sleep(0.5)
+    raise TestError(f"AutoMQ OpenStreams did not succeed within {timeout}s: {last_error}")
+
+
+def wait_for_automq_prepare_s3_object(port, node_id, timeout=45):
+    deadline = time.time() + timeout
+    correlation_id = 9500
+    last_error = None
+    while time.time() < deadline:
+        try:
+            return automq_prepare_s3_object(port, node_id, correlation_id)
+        except Exception as exc:
+            last_error = exc
+            correlation_id += 1
+            time.sleep(0.5)
+    raise TestError(f"AutoMQ PrepareS3Object did not succeed within {timeout}s: {last_error}")
+
+
+def wait_for_automq_commit_stream_object(
+    port,
+    node_id,
+    stream_id,
+    object_id,
+    start_offset,
+    end_offset,
+    stream_epoch,
+    timeout=45,
+):
+    deadline = time.time() + timeout
+    correlation_id = 9700
+    last_error = None
+    while time.time() < deadline:
+        try:
+            automq_commit_stream_object(
+                port,
+                node_id,
+                stream_id,
+                object_id,
+                start_offset,
+                end_offset,
+                stream_epoch,
+                correlation_id,
+            )
+            return
+        except Exception as exc:
+            last_error = exc
+            correlation_id += 1
+            time.sleep(0.5)
+    raise TestError(f"AutoMQ CommitStreamObject did not succeed within {timeout}s: {last_error}")
+
+
+def wait_for_automq_stream(
+    port,
+    stream_id,
+    expected_state=None,
+    expected_epoch=None,
+    expected_start_offset=None,
+    expected_end_offset=None,
+    timeout=45,
+):
+    deadline = time.time() + timeout
+    correlation_id = 10000
+    last_error = None
+    last_stream = None
+    while time.time() < deadline:
+        try:
             stream = automq_describe_stream(port, stream_id, correlation_id)
-            if stream["stream_id"] == stream_id:
+            last_stream = stream
+            if (
+                stream["stream_id"] == stream_id
+                and (expected_state is None or stream["state"] == expected_state)
+                and (expected_epoch is None or stream["epoch"] == expected_epoch)
+                and (
+                    expected_start_offset is None
+                    or stream["start_offset"] == expected_start_offset
+                )
+                and (expected_end_offset is None or stream["end_offset"] == expected_end_offset)
+            ):
                 return stream
         except Exception as exc:
             last_error = exc
         correlation_id += 1
         time.sleep(0.5)
-    raise TestError(f"AutoMQ DescribeStreams did not find stream {stream_id}: {last_error}")
+    raise TestError(
+        f"AutoMQ DescribeStreams did not return expected stream {stream_id}: "
+        f"last_stream={last_stream!r} last_error={last_error}"
+    )
+
+
+def wait_for_automq_stream_missing(port, stream_id, timeout=45):
+    deadline = time.time() + timeout
+    correlation_id = 10500
+    last_error = None
+    while time.time() < deadline:
+        try:
+            automq_describe_stream(port, stream_id, correlation_id)
+        except Exception as exc:
+            last_error = exc
+            return
+        correlation_id += 1
+        time.sleep(0.5)
+    raise TestError(
+        f"AutoMQ DescribeStreams still returned deleted stream {stream_id}: "
+        f"last_error={last_error}"
+    )
+
+
+def wait_for_automq_close_stream(port, node_id, stream_id, stream_epoch, timeout=45):
+    deadline = time.time() + timeout
+    correlation_id = 10600
+    last_error = None
+    while time.time() < deadline:
+        try:
+            automq_close_stream(port, node_id, stream_id, stream_epoch, correlation_id)
+            return
+        except Exception as exc:
+            last_error = exc
+            correlation_id += 1
+            time.sleep(0.5)
+    raise TestError(f"AutoMQ CloseStreams did not succeed within {timeout}s: {last_error}")
+
+
+def wait_for_automq_delete_stream(port, node_id, stream_id, stream_epoch, timeout=45):
+    deadline = time.time() + timeout
+    correlation_id = 10700
+    last_error = None
+    while time.time() < deadline:
+        try:
+            automq_delete_stream(port, node_id, stream_id, stream_epoch, correlation_id)
+            return
+        except Exception as exc:
+            last_error = exc
+            correlation_id += 1
+            time.sleep(0.5)
+    raise TestError(f"AutoMQ DeleteStreams did not succeed within {timeout}s: {last_error}")
+
+
+def wait_for_automq_trim_stream(
+    port,
+    node_id,
+    stream_id,
+    stream_epoch,
+    new_start_offset,
+    timeout=45,
+):
+    deadline = time.time() + timeout
+    correlation_id = 10800
+    last_error = None
+    while time.time() < deadline:
+        try:
+            automq_trim_stream(
+                port,
+                node_id,
+                stream_id,
+                stream_epoch,
+                new_start_offset,
+                correlation_id,
+            )
+            return
+        except Exception as exc:
+            last_error = exc
+            correlation_id += 1
+            time.sleep(0.5)
+    raise TestError(f"AutoMQ TrimStreams did not succeed within {timeout}s: {last_error}")
+
+
+def wait_for_automq_opening_stream(
+    port,
+    node_id,
+    stream_id,
+    expected_epoch=None,
+    expected_start_offset=None,
+    expected_end_offset=None,
+    timeout=45,
+):
+    deadline = time.time() + timeout
+    correlation_id = 10900
+    last_error = None
+    last_streams = []
+    while time.time() < deadline:
+        try:
+            last_streams = automq_get_opening_streams(port, node_id, correlation_id)
+            for stream in last_streams:
+                if (
+                    stream["stream_id"] == stream_id
+                    and (expected_epoch is None or stream["epoch"] == expected_epoch)
+                    and (
+                        expected_start_offset is None
+                        or stream["start_offset"] == expected_start_offset
+                    )
+                    and (expected_end_offset is None or stream["end_offset"] == expected_end_offset)
+                ):
+                    return stream
+        except Exception as exc:
+            last_error = exc
+        correlation_id += 1
+        time.sleep(0.5)
+    raise TestError(
+        f"AutoMQ GetOpeningStreams did not return stream {stream_id}: "
+        f"last_streams={last_streams!r} last_error={last_error}"
+    )
+
+
+def wait_for_automq_opening_stream_missing(port, node_id, stream_id, timeout=45):
+    deadline = time.time() + timeout
+    correlation_id = 10950
+    last_error = None
+    last_streams = []
+    while time.time() < deadline:
+        try:
+            last_streams = automq_get_opening_streams(port, node_id, correlation_id)
+            if all(stream["stream_id"] != stream_id for stream in last_streams):
+                return
+        except Exception as exc:
+            last_error = exc
+        correlation_id += 1
+        time.sleep(0.5)
+    raise TestError(
+        f"AutoMQ GetOpeningStreams still returned stream {stream_id}: "
+        f"last_streams={last_streams!r} last_error={last_error}"
+    )
 
 
 def wait_for_automq_register_node(port, node_id, node_epoch, wal_config, timeout=45):
@@ -1190,8 +1568,36 @@ def run_automq_metadata_failover_scenario(tmp):
         )
         wait_for_automq_zone_router(leader_broker_port, zone_router_before)
 
+        stream_owner_node_id = leader_id
         stream_id = wait_for_automq_create_stream(leader_broker_port, leader_id)
-        wait_for_automq_stream(leader_broker_port, stream_id)
+        stream_object_id = wait_for_automq_prepare_s3_object(
+            leader_broker_port,
+            stream_owner_node_id,
+        )
+        wait_for_automq_commit_stream_object(
+            leader_broker_port,
+            stream_owner_node_id,
+            stream_id,
+            stream_object_id,
+            0,
+            10,
+            1,
+        )
+        wait_for_automq_stream(leader_broker_port, stream_id, "OPENED", 1, 0, 10)
+        wait_for_automq_opening_stream(
+            leader_broker_port,
+            stream_owner_node_id,
+            stream_id,
+            expected_epoch=1,
+            expected_start_offset=0,
+            expected_end_offset=10,
+        )
+
+        deleted_stream_id = wait_for_automq_create_stream(
+            leader_broker_port,
+            stream_owner_node_id,
+        )
+        wait_for_automq_stream(leader_broker_port, deleted_stream_id, "OPENED", 1, 0, 0)
 
         registered_node_id = 700 + leader_id
         registered_node_epoch = 42
@@ -1227,7 +1633,16 @@ def run_automq_metadata_failover_scenario(tmp):
             wait_for_automq_kv(info["broker_port"], key, value_before)
             wait_for_automq_kv(info["broker_port"], delete_key, delete_value)
             wait_for_automq_zone_router(info["broker_port"], zone_router_before)
-            wait_for_automq_stream(info["broker_port"], stream_id)
+            wait_for_automq_stream(info["broker_port"], stream_id, "OPENED", 1, 0, 10)
+            wait_for_automq_opening_stream(
+                info["broker_port"],
+                stream_owner_node_id,
+                stream_id,
+                expected_epoch=1,
+                expected_start_offset=0,
+                expected_end_offset=10,
+            )
+            wait_for_automq_stream(info["broker_port"], deleted_stream_id, "OPENED", 1, 0, 0)
             wait_for_automq_node(
                 info["broker_port"],
                 registered_node_id,
@@ -1246,7 +1661,16 @@ def run_automq_metadata_failover_scenario(tmp):
         wait_for_automq_kv(replacement_broker_port, key, value_before)
         wait_for_automq_kv(replacement_broker_port, delete_key, delete_value)
         wait_for_automq_zone_router(replacement_broker_port, zone_router_before)
-        wait_for_automq_stream(replacement_broker_port, stream_id)
+        wait_for_automq_stream(replacement_broker_port, stream_id, "OPENED", 1, 0, 10)
+        wait_for_automq_opening_stream(
+            replacement_broker_port,
+            stream_owner_node_id,
+            stream_id,
+            expected_epoch=1,
+            expected_start_offset=0,
+            expected_end_offset=10,
+        )
+        wait_for_automq_stream(replacement_broker_port, deleted_stream_id, "OPENED", 1, 0, 0)
         wait_for_automq_node(
             replacement_broker_port,
             registered_node_id,
@@ -1278,6 +1702,54 @@ def run_automq_metadata_failover_scenario(tmp):
         )
         wait_for_automq_zone_router(replacement_broker_port, zone_router_after)
 
+        wait_for_automq_close_stream(
+            replacement_broker_port,
+            stream_owner_node_id,
+            stream_id,
+            1,
+        )
+        wait_for_automq_stream(replacement_broker_port, stream_id, "CLOSED", 1, 0, 10)
+        wait_for_automq_opening_stream_missing(
+            replacement_broker_port,
+            stream_owner_node_id,
+            stream_id,
+        )
+        wait_for_automq_open_stream(
+            replacement_broker_port,
+            stream_owner_node_id,
+            stream_id,
+            2,
+        )
+        wait_for_automq_stream(replacement_broker_port, stream_id, "OPENED", 2, 0, 10)
+        wait_for_automq_trim_stream(
+            replacement_broker_port,
+            stream_owner_node_id,
+            stream_id,
+            2,
+            5,
+        )
+        wait_for_automq_stream(replacement_broker_port, stream_id, "OPENED", 2, 5, 10)
+        wait_for_automq_opening_stream(
+            replacement_broker_port,
+            stream_owner_node_id,
+            stream_id,
+            expected_epoch=2,
+            expected_start_offset=5,
+            expected_end_offset=10,
+        )
+        wait_for_automq_delete_stream(
+            replacement_broker_port,
+            stream_owner_node_id,
+            deleted_stream_id,
+            1,
+        )
+        wait_for_automq_stream_missing(replacement_broker_port, deleted_stream_id)
+        wait_for_automq_opening_stream_missing(
+            replacement_broker_port,
+            stream_owner_node_id,
+            deleted_stream_id,
+        )
+
         processes[leader_id] = start_combined_node(
             tmp,
             leader_id,
@@ -1299,7 +1771,28 @@ def run_automq_metadata_failover_scenario(tmp):
         wait_for_automq_kv(processes[leader_id]["broker_port"], key, value_after)
         wait_for_automq_kv_missing(processes[leader_id]["broker_port"], delete_key)
         wait_for_automq_zone_router(processes[leader_id]["broker_port"], zone_router_after)
-        wait_for_automq_stream(processes[leader_id]["broker_port"], stream_id)
+        wait_for_automq_stream(
+            processes[leader_id]["broker_port"],
+            stream_id,
+            "OPENED",
+            2,
+            5,
+            10,
+        )
+        wait_for_automq_opening_stream(
+            processes[leader_id]["broker_port"],
+            stream_owner_node_id,
+            stream_id,
+            expected_epoch=2,
+            expected_start_offset=5,
+            expected_end_offset=10,
+        )
+        wait_for_automq_stream_missing(processes[leader_id]["broker_port"], deleted_stream_id)
+        wait_for_automq_opening_stream_missing(
+            processes[leader_id]["broker_port"],
+            stream_owner_node_id,
+            deleted_stream_id,
+        )
         wait_for_automq_node(
             processes[leader_id]["broker_port"],
             registered_node_id,
@@ -1312,6 +1805,7 @@ def run_automq_metadata_failover_scenario(tmp):
             "old_leader": leader_id,
             "new_leader": replacement_leader,
             "stream_id": stream_id,
+            "deleted_stream_id": deleted_stream_id,
             "registered_node_id": registered_node_id,
             "zone_router_epoch": zone_router_epoch_after,
             "epoch": after["leader_epoch"],
@@ -1453,6 +1947,7 @@ def main():
             f"automq_old_leader={automq_result['old_leader']}, "
             f"automq_new_leader={automq_result['new_leader']}, "
             f"automq_stream_id={automq_result['stream_id']}, "
+            f"automq_deleted_stream_id={automq_result['deleted_stream_id']}, "
             f"automq_node_id={automq_result['registered_node_id']}, "
             f"automq_zone_router_epoch={automq_result['zone_router_epoch']})"
         )
