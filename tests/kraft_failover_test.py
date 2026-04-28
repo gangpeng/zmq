@@ -178,8 +178,8 @@ def controller_request(port, api_key, api_version, correlation_id, body=b"", tim
         return read_exact(sock, response_size)
 
 
-def automq_request(port, api_key, correlation_id, body=b"", timeout=10):
-    header = struct.pack(">hhi", api_key, 0, correlation_id)
+def automq_request(port, api_key, correlation_id, body=b"", timeout=10, api_version=0):
+    header = struct.pack(">hhi", api_key, api_version, correlation_id)
     header += write_compact_string("automq-failover-test")
     header += b"\x00"
     frame_body = header + body
@@ -386,7 +386,7 @@ def automq_put_kv(port, key, value, correlation_id, overwrite=True):
     return item_value
 
 
-def automq_get_kv(port, key, correlation_id):
+def automq_get_kv_response(port, key, correlation_id):
     body = write_compact_array_len(1)
     body += write_compact_string(key)
     body += b"\x00"  # item tagged fields
@@ -403,8 +403,36 @@ def automq_get_kv(port, key, correlation_id):
     value, pos = read_compact_bytes(response, pos)
     pos = skip_tags(response, pos)
     pos = skip_tags(response, pos)
+    return {"error_code": item_error, "value": value}
+
+
+def automq_get_kv(port, key, correlation_id):
+    item = automq_get_kv_response(port, key, correlation_id)
+    item_error = item["error_code"]
     if item_error != 0:
         raise TestError(f"GetKVs item_error={item_error}")
+    return item["value"]
+
+
+def automq_delete_kv(port, key, correlation_id):
+    body = write_compact_array_len(1)
+    body += write_compact_string(key)
+    body += b"\x00"  # item tagged fields
+    body += b"\x00"  # request tagged fields
+
+    response = automq_request(port, 511, correlation_id, body, timeout=15)
+    pos = parse_flexible_response_header(response, correlation_id)
+    top_error, pos = read_i16(response, pos)
+    _, pos = read_i32(response, pos)  # throttle_time_ms
+    response_count, pos = read_compact_array_len(response, pos)
+    if top_error != 0 or response_count != 1:
+        raise TestError(f"DeleteKVs top_error={top_error} response_count={response_count}")
+    item_error, pos = read_i16(response, pos)
+    value, pos = read_compact_bytes(response, pos)
+    pos = skip_tags(response, pos)
+    pos = skip_tags(response, pos)
+    if item_error != 0:
+        raise TestError(f"DeleteKVs item_error={item_error}")
     return value
 
 
@@ -582,6 +610,35 @@ def automq_get_next_node_id(port, cluster_id, correlation_id):
     return node_id
 
 
+def automq_zone_router(port, metadata, route_epoch, correlation_id, api_version=1):
+    body = write_compact_bytes(metadata)
+    if api_version >= 1:
+        body += struct.pack(">q", route_epoch)
+        body += struct.pack(">h", api_version)
+    body += b"\x00"  # request tagged fields
+
+    response = automq_request(
+        port,
+        515,
+        correlation_id,
+        body,
+        timeout=15,
+        api_version=api_version,
+    )
+    pos = parse_flexible_response_header(response, correlation_id)
+    top_error, pos = read_i16(response, pos)
+    _, pos = read_i32(response, pos)  # throttle_time_ms
+    response_count, pos = read_compact_array_len(response, pos)
+    if top_error != 0 or response_count != 1:
+        raise TestError(
+            f"AutomqZoneRouter top_error={top_error} response_count={response_count}"
+        )
+    data, pos = read_compact_bytes(response, pos)
+    pos = skip_tags(response, pos)
+    pos = skip_tags(response, pos)
+    return data
+
+
 def wait_for_automq_put_kv(port, key, value, timeout=45):
     deadline = time.time() + timeout
     correlation_id = 7000
@@ -612,6 +669,47 @@ def wait_for_automq_kv(port, key, expected_value, timeout=45):
         time.sleep(0.5)
     raise TestError(
         f"AutoMQ GetKVs did not return expected value for {key!r}: "
+        f"last_value={last_value!r} last_error={last_error}"
+    )
+
+
+def wait_for_automq_kv_missing(port, key, timeout=45):
+    deadline = time.time() + timeout
+    correlation_id = 8500
+    last_error = None
+    last_item = None
+    while time.time() < deadline:
+        try:
+            last_item = automq_get_kv_response(port, key, correlation_id)
+            if last_item["error_code"] != 0:
+                return last_item["error_code"]
+        except Exception as exc:
+            last_error = exc
+        correlation_id += 1
+        time.sleep(0.5)
+    raise TestError(
+        f"AutoMQ GetKVs did not report missing key {key!r}: "
+        f"last_item={last_item!r} last_error={last_error}"
+    )
+
+
+def wait_for_automq_delete_kv(port, key, expected_value, timeout=45):
+    deadline = time.time() + timeout
+    correlation_id = 8700
+    last_error = None
+    last_value = None
+    while time.time() < deadline:
+        try:
+            last_value = automq_delete_kv(port, key, correlation_id)
+            if last_value == expected_value:
+                return last_value
+            raise TestError(f"expected deleted value {expected_value!r}, got {last_value!r}")
+        except Exception as exc:
+            last_error = exc
+            correlation_id += 1
+            time.sleep(0.5)
+    raise TestError(
+        f"AutoMQ DeleteKVs did not delete {key!r}: "
         f"last_value={last_value!r} last_error={last_error}"
     )
 
@@ -739,6 +837,47 @@ def wait_for_automq_next_node_id(port, cluster_id, expected_node_id=None, timeou
     raise TestError(
         f"AutoMQ GetNextNodeId did not return expected id {expected_node_id}: "
         f"last_node_id={last_node_id} last_error={last_error}"
+    )
+
+
+def wait_for_automq_zone_router_update(port, metadata, route_epoch, timeout=45):
+    deadline = time.time() + timeout
+    correlation_id = 16000
+    last_error = None
+    last_data = None
+    while time.time() < deadline:
+        try:
+            last_data = automq_zone_router(port, metadata, route_epoch, correlation_id)
+            if last_data == metadata:
+                return last_data
+            raise TestError(f"expected router data {metadata!r}, got {last_data!r}")
+        except Exception as exc:
+            last_error = exc
+            correlation_id += 1
+            time.sleep(0.5)
+    raise TestError(
+        f"AutoMQ ZoneRouter did not update metadata: "
+        f"last_data={last_data!r} last_error={last_error}"
+    )
+
+
+def wait_for_automq_zone_router(port, expected_metadata, timeout=45):
+    deadline = time.time() + timeout
+    correlation_id = 17000
+    last_error = None
+    last_data = None
+    while time.time() < deadline:
+        try:
+            last_data = automq_zone_router(port, None, 0, correlation_id)
+            if last_data == expected_metadata:
+                return last_data
+        except Exception as exc:
+            last_error = exc
+        correlation_id += 1
+        time.sleep(0.5)
+    raise TestError(
+        f"AutoMQ ZoneRouter did not return expected metadata: "
+        f"last_data={last_data!r} last_error={last_error}"
     )
 
 
@@ -1035,6 +1174,22 @@ def run_automq_metadata_failover_scenario(tmp):
         wait_for_automq_put_kv(leader_broker_port, key, value_before)
         wait_for_automq_kv(leader_broker_port, key, value_before)
 
+        delete_key = f"{key}.delete"
+        delete_value = b"delete-after-controller-failover"
+        wait_for_automq_put_kv(leader_broker_port, delete_key, delete_value)
+        wait_for_automq_kv(leader_broker_port, delete_key, delete_value)
+
+        zone_router_before = (
+            f'{{"route":"before-controller-failover","leader":{leader_id}}}'.encode("utf-8")
+        )
+        zone_router_epoch_before = 100 + leader_id
+        wait_for_automq_zone_router_update(
+            leader_broker_port,
+            zone_router_before,
+            zone_router_epoch_before,
+        )
+        wait_for_automq_zone_router(leader_broker_port, zone_router_before)
+
         stream_id = wait_for_automq_create_stream(leader_broker_port, leader_id)
         wait_for_automq_stream(leader_broker_port, stream_id)
 
@@ -1070,6 +1225,8 @@ def run_automq_metadata_failover_scenario(tmp):
             if node_id == leader_id:
                 continue
             wait_for_automq_kv(info["broker_port"], key, value_before)
+            wait_for_automq_kv(info["broker_port"], delete_key, delete_value)
+            wait_for_automq_zone_router(info["broker_port"], zone_router_before)
             wait_for_automq_stream(info["broker_port"], stream_id)
             wait_for_automq_node(
                 info["broker_port"],
@@ -1087,6 +1244,8 @@ def run_automq_metadata_failover_scenario(tmp):
 
         replacement_broker_port = processes[replacement_leader]["broker_port"]
         wait_for_automq_kv(replacement_broker_port, key, value_before)
+        wait_for_automq_kv(replacement_broker_port, delete_key, delete_value)
+        wait_for_automq_zone_router(replacement_broker_port, zone_router_before)
         wait_for_automq_stream(replacement_broker_port, stream_id)
         wait_for_automq_node(
             replacement_broker_port,
@@ -1104,6 +1263,20 @@ def run_automq_metadata_failover_scenario(tmp):
         value_after = b"after-controller-failover"
         wait_for_automq_put_kv(replacement_broker_port, key, value_after)
         wait_for_automq_kv(replacement_broker_port, key, value_after)
+
+        wait_for_automq_delete_kv(replacement_broker_port, delete_key, delete_value)
+        wait_for_automq_kv_missing(replacement_broker_port, delete_key)
+
+        zone_router_after = (
+            f'{{"route":"after-controller-failover","leader":{replacement_leader}}}'.encode("utf-8")
+        )
+        zone_router_epoch_after = zone_router_epoch_before + 100
+        wait_for_automq_zone_router_update(
+            replacement_broker_port,
+            zone_router_after,
+            zone_router_epoch_after,
+        )
+        wait_for_automq_zone_router(replacement_broker_port, zone_router_after)
 
         processes[leader_id] = start_combined_node(
             tmp,
@@ -1124,6 +1297,8 @@ def run_automq_metadata_failover_scenario(tmp):
         )
         wait_for_all_alive_to_report(processes, replacement_leader)
         wait_for_automq_kv(processes[leader_id]["broker_port"], key, value_after)
+        wait_for_automq_kv_missing(processes[leader_id]["broker_port"], delete_key)
+        wait_for_automq_zone_router(processes[leader_id]["broker_port"], zone_router_after)
         wait_for_automq_stream(processes[leader_id]["broker_port"], stream_id)
         wait_for_automq_node(
             processes[leader_id]["broker_port"],
@@ -1138,6 +1313,7 @@ def run_automq_metadata_failover_scenario(tmp):
             "new_leader": replacement_leader,
             "stream_id": stream_id,
             "registered_node_id": registered_node_id,
+            "zone_router_epoch": zone_router_epoch_after,
             "epoch": after["leader_epoch"],
         }
     finally:
@@ -1277,7 +1453,8 @@ def main():
             f"automq_old_leader={automq_result['old_leader']}, "
             f"automq_new_leader={automq_result['new_leader']}, "
             f"automq_stream_id={automq_result['stream_id']}, "
-            f"automq_node_id={automq_result['registered_node_id']})"
+            f"automq_node_id={automq_result['registered_node_id']}, "
+            f"automq_zone_router_epoch={automq_result['zone_router_epoch']})"
         )
         return 0
     finally:
