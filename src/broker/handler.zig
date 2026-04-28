@@ -5293,49 +5293,74 @@ pub const Broker = struct {
         // Before completing the txn, get the partition list so we can write control batches
         const control_type: @import("txn_coordinator.zig").TransactionCoordinator.ControlRecordType = if (req.committed) .commit else .abort;
         var partition_state_dirty = false;
+        var marker_error: i16 = @intFromEnum(ErrorCode.none);
         if (self.txn_coordinator.getPartitions(req.producer_id)) |partitions| {
-            // Write control batch to each partition in the transaction
             for (partitions) |tp| {
-                const pkey = std.fmt.allocPrint(self.allocator, "{s}-{d}", .{ tp.topic, tp.partition }) catch continue;
-                defer self.allocator.free(pkey);
-                const base_off: i64 = if (self.store.partitions.get(pkey)) |state|
-                    @intCast(state.next_offset)
-                else
-                    0;
+                if (!self.topicPartitionExists(tp.topic, tp.partition)) {
+                    marker_error = @intFromEnum(ErrorCode.unknown_topic_or_partition);
+                    break;
+                }
+            }
 
-                const control_batch = self.txn_coordinator.buildControlBatch(
-                    req.producer_id,
-                    req.producer_epoch,
-                    control_type,
-                    base_off,
-                ) catch continue;
-                defer self.allocator.free(control_batch);
+            // Write control batch to each partition in the transaction
+            if (marker_error == @intFromEnum(ErrorCode.none)) {
+                for (partitions) |tp| {
+                    const base_off: i64 = if (self.partitionState(tp.topic, tp.partition)) |state|
+                        @intCast(state.next_offset)
+                    else
+                        0;
 
-                // Write the control batch to the partition store
-                _ = self.store.produce(tp.topic, tp.partition, control_batch) catch |err| {
-                    log.warn("Failed to write control batch for {s}-{d}: {}", .{ tp.topic, tp.partition, err });
-                    continue;
-                };
-                partition_state_dirty = true;
+                    const control_batch = self.txn_coordinator.buildControlBatch(
+                        req.producer_id,
+                        req.producer_epoch,
+                        control_type,
+                        base_off,
+                    ) catch |err| {
+                        log.warn("Failed to build EndTxn control batch for {s}-{d}: {}", .{ tp.topic, tp.partition, err });
+                        marker_error = @intFromEnum(ErrorCode.kafka_storage_error);
+                        break;
+                    };
+                    defer self.allocator.free(control_batch);
+
+                    // Write the control batch to the partition store
+                    _ = self.store.produce(tp.topic, tp.partition, control_batch) catch |err| {
+                        log.warn("Failed to write control batch for {s}-{d}: {}", .{ tp.topic, tp.partition, err });
+                        marker_error = @intFromEnum(ErrorCode.kafka_storage_error);
+                        break;
+                    };
+                    partition_state_dirty = true;
+                }
             }
 
             // Clear first_unstable_txn_offset on each partition so LSO advances.
             // NOTE: AutoMQ/Kafka advances LSO after control batch markers are written.
             // Without this, READ_COMMITTED consumers would never see committed data.
-            for (partitions) |tp| {
-                const pkey2 = std.fmt.allocPrint(self.allocator, "{s}-{d}", .{ tp.topic, tp.partition }) catch continue;
-                defer self.allocator.free(pkey2);
-                if (self.store.partitions.getPtr(pkey2)) |state| {
-                    state.first_unstable_txn_offset = null;
-                    // Recompute LSO = HW (no unstable transactions on this partition now)
-                    state.last_stable_offset = state.high_watermark;
-                    partition_state_dirty = true;
+            if (marker_error == @intFromEnum(ErrorCode.none)) {
+                for (partitions) |tp| {
+                    var key_buf: [512]u8 = undefined;
+                    const pkey = std.fmt.bufPrint(&key_buf, "{s}-{d}", .{ tp.topic, tp.partition }) catch {
+                        marker_error = @intFromEnum(ErrorCode.kafka_storage_error);
+                        break;
+                    };
+                    if (self.store.partitions.getPtr(pkey)) |state| {
+                        state.first_unstable_txn_offset = null;
+                        // Recompute LSO = HW (no unstable transactions on this partition now)
+                        state.last_stable_offset = state.high_watermark;
+                        partition_state_dirty = true;
+                    }
                 }
             }
         }
         if (partition_state_dirty) {
             self.persistPartitionStates();
             self.persistObjectManagerSnapshot();
+        }
+        if (marker_error != @intFromEnum(ErrorCode.none)) {
+            const resp = Resp{
+                .throttle_time_ms = 0,
+                .error_code = marker_error,
+            };
+            return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
         }
 
         const error_code = self.txn_coordinator.endTxnComplete(req.producer_id, req.producer_epoch, req.committed);
@@ -14109,6 +14134,7 @@ test "Broker.handleRequest EndTxn v3 returns generated response and completes tr
 
     var broker = Broker.init(testing.allocator, 1, 9092);
     defer broker.deinit();
+    try testing.expect(broker.ensureTopic("txn-end-topic"));
 
     const init_result = try broker.txn_coordinator.initProducerId("txn-end-generated");
     _ = try broker.txn_coordinator.addPartitionsToTxn(init_result.producer_id, init_result.producer_epoch, "txn-end-topic", 0);
@@ -14138,6 +14164,43 @@ test "Broker.handleRequest EndTxn v3 returns generated response and completes tr
     try testing.expectEqual(@as(i32, 0), resp.throttle_time_ms);
     try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.none)), resp.error_code);
     try testing.expectEqual(TxnCoordinator.TxnStatus.complete_commit, broker.txn_coordinator.getStatus(init_result.producer_id).?);
+}
+
+test "Broker.handleRequest EndTxn rejects transaction with unknown partition" {
+    const Req = generated.end_txn_request.EndTxnRequest;
+    const Resp = generated.end_txn_response.EndTxnResponse;
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+
+    const init_result = try broker.txn_coordinator.initProducerId("txn-end-missing");
+    _ = try broker.txn_coordinator.addPartitionsToTxn(init_result.producer_id, init_result.producer_epoch, "missing-end-topic", 0);
+
+    const req = Req{
+        .transactional_id = "txn-end-missing",
+        .producer_id = init_result.producer_id,
+        .producer_epoch = init_result.producer_epoch,
+        .committed = true,
+    };
+
+    var buf: [512]u8 = undefined;
+    var pos = buildTestRequest(&buf, 26, 3, 2605, header_mod.requestHeaderVersion(26, 3));
+    req.serialize(&buf, &pos, 3);
+
+    const response = broker.handleRequest(buf[0..pos]);
+    try testing.expect(response != null);
+    defer testing.allocator.free(response.?);
+
+    var rpos: usize = 0;
+    var response_header = try ResponseHeader.deserialize(testing.allocator, response.?, &rpos, header_mod.responseHeaderVersion(26, 3));
+    defer response_header.deinit(testing.allocator);
+    try testing.expectEqual(@as(i32, 2605), response_header.correlation_id);
+
+    const resp = try Resp.deserialize(testing.allocator, response.?, &rpos, 3);
+    try testing.expectEqual(response.?.len, rpos);
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.unknown_topic_or_partition)), resp.error_code);
+    try testing.expectEqual(TxnCoordinator.TxnStatus.ongoing, broker.txn_coordinator.getStatus(init_result.producer_id).?);
+    try testing.expect(!broker.store.partitions.contains("missing-end-topic-0"));
 }
 
 test "Broker.handleRequest EndTxn rejects truncated request" {
@@ -16543,6 +16606,7 @@ test "Broker.handleRequest AddPartitionsToTxn (key=24) after InitProducerId" {
 test "Broker.handleRequest EndTxn (key=26) full transaction lifecycle" {
     var broker = Broker.init(testing.allocator, 1, 9092);
     defer broker.deinit();
+    try testing.expect(broker.ensureTopic("txn-topic"));
 
     // InitProducerId
     const init_result = try broker.txn_coordinator.initProducerId("txn-end");
