@@ -1476,6 +1476,12 @@ pub const Broker = struct {
             if (entry.leader_id) |leader_id| {
                 group.leader_id = try self.allocator.dupe(u8, leader_id);
             }
+            if (entry.protocol_type) |protocol_type| {
+                group.protocol_type = try self.allocator.dupe(u8, protocol_type);
+            }
+            if (entry.protocol_name) |protocol_name| {
+                group.protocol_name = try self.allocator.dupe(u8, protocol_name);
+            }
 
             for (entry.members) |member_entry| {
                 if (member_entry.member_id.len == 0) continue;
@@ -1494,6 +1500,9 @@ pub const Broker = struct {
                 }
                 if (member_entry.protocol_name) |protocol_name| {
                     member.protocol_name = try self.allocator.dupe(u8, protocol_name);
+                }
+                if (member_entry.protocol_metadata) |protocol_metadata| {
+                    member.protocol_metadata = try self.allocator.dupe(u8, protocol_metadata);
                 }
                 for (member_entry.subscriptions) |subscription| {
                     const subscription_copy = try self.allocator.dupe(u8, subscription);
@@ -16802,7 +16811,7 @@ test "Broker.handleRequest JoinGroup and SyncGroup persist group state across re
 
         const protocols = [_]JoinProtocol{.{
             .name = "range",
-            .metadata = "",
+            .metadata = "persisted-metadata",
         }};
         const join_req = JoinReq{
             .group_id = "persisted-group",
@@ -16864,8 +16873,12 @@ test "Broker.handleRequest JoinGroup and SyncGroup persist group state across re
         defer broker.persistence.freeConsumerGroupEntries(loaded);
         try testing.expectEqual(@as(usize, 1), loaded.len);
         try testing.expectEqual(@as(u8, 3), loaded[0].state);
+        try testing.expectEqualStrings("consumer", loaded[0].protocol_type.?);
+        try testing.expectEqualStrings("range", loaded[0].protocol_name.?);
         try testing.expectEqual(@as(usize, 1), loaded[0].members.len);
         try testing.expectEqualStrings(assignment_data, loaded[0].members[0].assignment.?);
+        try testing.expectEqualStrings("range", loaded[0].members[0].protocol_name.?);
+        try testing.expectEqualStrings("persisted-metadata", loaded[0].members[0].protocol_metadata.?);
     }
 
     {
@@ -16876,8 +16889,12 @@ test "Broker.handleRequest JoinGroup and SyncGroup persist group state across re
         const group = restarted.groups.groups.getPtr("persisted-group").?;
         try testing.expectEqual(ConsumerGroup.GroupState.stable, group.state);
         try testing.expectEqual(generation_id, group.generation_id);
+        try testing.expectEqualStrings("consumer", group.protocol_type.?);
+        try testing.expectEqualStrings("range", group.protocol_name.?);
         const member = group.members.getPtr(member_id.?).?;
         try testing.expectEqualStrings(assignment_data, member.assignment.?);
+        try testing.expectEqualStrings("range", member.protocol_name.?);
+        try testing.expectEqualStrings("persisted-metadata", member.protocol_metadata.?);
         try testing.expect(group.leader_id != null);
         try testing.expectEqualStrings(member_id.?, group.leader_id.?);
     }

@@ -418,11 +418,24 @@ pub const MetadataPersistence = struct {
             } else {
                 try file.writeAll("0\t");
             }
-            try writer.print("\t{d}\t{d}\t{d}\n", .{
+            try writer.print("\t{d}\t{d}\t{d}", .{
                 group.rebalance_timeout_ms,
                 group.session_timeout_ms,
                 group.members.count(),
             });
+            if (group.protocol_type) |protocol_type| {
+                try file.writeAll("\t1\t");
+                try writeHex(file, protocol_type);
+            } else {
+                try file.writeAll("\t0\t");
+            }
+            if (group.protocol_name) |protocol_name| {
+                try file.writeAll("\t1\t");
+                try writeHex(file, protocol_name);
+            } else {
+                try file.writeAll("\t0\t");
+            }
+            try file.writeAll("\n");
 
             var member_it = group.members.iterator();
             while (member_it.next()) |member_entry| {
@@ -457,6 +470,12 @@ pub const MetadataPersistence = struct {
                 for (member.subscribed_topics.items) |subscription| {
                     try file.writeAll("\t");
                     try writeHex(file, subscription);
+                }
+                if (member.protocol_metadata) |protocol_metadata| {
+                    try file.writeAll("\t1\t");
+                    try writeHex(file, protocol_metadata);
+                } else {
+                    try file.writeAll("\t0\t");
                 }
                 try file.writeAll("\n");
             }
@@ -543,6 +562,25 @@ pub const MetadataPersistence = struct {
                 if (leader_id) |owned_leader| self.allocator.free(owned_leader);
                 continue;
             };
+            var group_protocol_type: ?[]u8 = null;
+            if (fields.next()) |has_protocol_type_str| {
+                const protocol_type_hex = fields.next() orelse "";
+                group_protocol_type = decodeOptionalHexAlloc(self.allocator, has_protocol_type_str, protocol_type_hex) catch {
+                    self.allocator.free(group_id);
+                    if (leader_id) |owned_leader| self.allocator.free(owned_leader);
+                    continue;
+                };
+            }
+            var group_protocol_name: ?[]u8 = null;
+            if (fields.next()) |has_protocol_name_str| {
+                const protocol_name_hex = fields.next() orelse "";
+                group_protocol_name = decodeOptionalHexAlloc(self.allocator, has_protocol_name_str, protocol_name_hex) catch {
+                    self.allocator.free(group_id);
+                    if (leader_id) |owned_leader| self.allocator.free(owned_leader);
+                    if (group_protocol_type) |owned_protocol_type| self.allocator.free(owned_protocol_type);
+                    continue;
+                };
+            }
 
             var members = std.array_list.Managed(ConsumerGroupMemberEntry).init(self.allocator);
             defer members.deinit();
@@ -643,11 +681,20 @@ pub const MetadataPersistence = struct {
                         return err;
                     };
                 }
+                var protocol_metadata: ?[]u8 = null;
+                if (member_fields.next()) |has_metadata_str| {
+                    const metadata_hex = member_fields.next() orelse "";
+                    protocol_metadata = decodeOptionalHexAlloc(self.allocator, has_metadata_str, metadata_hex) catch blk: {
+                        valid_group = false;
+                        break :blk null;
+                    };
+                }
                 if (!valid_group) {
                     self.allocator.free(member_id);
                     if (group_instance_id) |owned_instance| self.allocator.free(owned_instance);
                     if (assignment) |owned_assignment| self.allocator.free(owned_assignment);
                     if (protocol_name) |owned_protocol| self.allocator.free(owned_protocol);
+                    if (protocol_metadata) |owned_metadata| self.allocator.free(owned_metadata);
                     for (subscriptions.items) |subscription| self.allocator.free(subscription);
                     break;
                 }
@@ -659,12 +706,14 @@ pub const MetadataPersistence = struct {
                     .last_heartbeat_ms = last_heartbeat_ms,
                     .assignment = assignment,
                     .protocol_name = protocol_name,
+                    .protocol_metadata = protocol_metadata,
                     .subscriptions = owned_subscriptions,
                 }) catch |err| {
                     self.allocator.free(member_id);
                     if (group_instance_id) |owned_instance| self.allocator.free(owned_instance);
                     if (assignment) |owned_assignment| self.allocator.free(owned_assignment);
                     if (protocol_name) |owned_protocol| self.allocator.free(owned_protocol);
+                    if (protocol_metadata) |owned_metadata| self.allocator.free(owned_metadata);
                     for (owned_subscriptions) |subscription| self.allocator.free(subscription);
                     if (owned_subscriptions.len > 0) self.allocator.free(owned_subscriptions);
                     return err;
@@ -674,6 +723,8 @@ pub const MetadataPersistence = struct {
             if (!valid_group) {
                 self.allocator.free(group_id);
                 if (leader_id) |owned_leader| self.allocator.free(owned_leader);
+                if (group_protocol_type) |owned_protocol_type| self.allocator.free(owned_protocol_type);
+                if (group_protocol_name) |owned_protocol_name| self.allocator.free(owned_protocol_name);
                 self.freeConsumerGroupMemberEntries(members.items);
                 continue;
             }
@@ -685,12 +736,16 @@ pub const MetadataPersistence = struct {
                 .generation_id = generation_id,
                 .next_member_id = next_member_id,
                 .leader_id = leader_id,
+                .protocol_type = group_protocol_type,
+                .protocol_name = group_protocol_name,
                 .rebalance_timeout_ms = rebalance_timeout_ms,
                 .session_timeout_ms = session_timeout_ms,
                 .members = owned_members,
             }) catch |err| {
                 self.allocator.free(group_id);
                 if (leader_id) |owned_leader| self.allocator.free(owned_leader);
+                if (group_protocol_type) |owned_protocol_type| self.allocator.free(owned_protocol_type);
+                if (group_protocol_name) |owned_protocol_name| self.allocator.free(owned_protocol_name);
                 self.freeConsumerGroupMemberEntries(owned_members);
                 if (owned_members.len > 0) self.allocator.free(owned_members);
                 return err;
@@ -723,6 +778,7 @@ pub const MetadataPersistence = struct {
         last_heartbeat_ms: i64,
         assignment: ?[]u8,
         protocol_name: ?[]u8,
+        protocol_metadata: ?[]u8,
         subscriptions: [][]u8,
     };
 
@@ -732,6 +788,8 @@ pub const MetadataPersistence = struct {
         generation_id: i32,
         next_member_id: u64,
         leader_id: ?[]u8,
+        protocol_type: ?[]u8,
+        protocol_name: ?[]u8,
         rebalance_timeout_ms: i64,
         session_timeout_ms: i64,
         members: []ConsumerGroupMemberEntry,
@@ -743,6 +801,7 @@ pub const MetadataPersistence = struct {
             if (member.group_instance_id) |group_instance_id| self.allocator.free(group_instance_id);
             if (member.assignment) |assignment| self.allocator.free(assignment);
             if (member.protocol_name) |protocol_name| self.allocator.free(protocol_name);
+            if (member.protocol_metadata) |protocol_metadata| self.allocator.free(protocol_metadata);
             for (member.subscriptions) |subscription| self.allocator.free(subscription);
             if (member.subscriptions.len > 0) self.allocator.free(member.subscriptions);
         }
@@ -752,6 +811,8 @@ pub const MetadataPersistence = struct {
         for (entries) |entry| {
             self.allocator.free(entry.group_id);
             if (entry.leader_id) |leader_id| self.allocator.free(leader_id);
+            if (entry.protocol_type) |protocol_type| self.allocator.free(protocol_type);
+            if (entry.protocol_name) |protocol_name| self.allocator.free(protocol_name);
             self.freeConsumerGroupMemberEntries(entry.members);
             if (entry.members.len > 0) self.allocator.free(entry.members);
         }
