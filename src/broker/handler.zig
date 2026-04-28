@@ -5215,7 +5215,9 @@ pub const Broker = struct {
 
             const topic = topic_req.name orelse "";
             for (topic_req.partitions, 0..) |partition, partition_idx| {
-                const error_code = if (verify_only)
+                const error_code = if (!self.topicPartitionExists(topic, partition))
+                    @intFromEnum(ErrorCode.unknown_topic_or_partition)
+                else if (verify_only)
                     self.txn_coordinator.verifyPartitionInTxn(producer_id, producer_epoch, topic, partition)
                 else
                     self.txn_coordinator.addPartitionsToTxn(producer_id, producer_epoch, topic, partition) catch 48;
@@ -5234,6 +5236,12 @@ pub const Broker = struct {
         }
 
         return topic_results;
+    }
+
+    fn topicPartitionExists(self: *Broker, topic: []const u8, partition_index: i32) bool {
+        if (topic.len == 0 or partition_index < 0) return false;
+        const topic_info = self.topics.get(topic) orelse return false;
+        return partition_index < topic_info.num_partitions;
     }
 
     fn freeAddPartitionsToTxnRequest(self: *Broker, req: *generated.add_partitions_to_txn_request.AddPartitionsToTxnRequest) void {
@@ -7503,8 +7511,7 @@ pub const Broker = struct {
         if (topic.len == 0 or partition_index < 0) {
             return .{ .error_code = @intFromEnum(ErrorCode.invalid_request) };
         }
-        const topic_info = self.topics.get(topic) orelse return .{ .error_code = @intFromEnum(ErrorCode.unknown_topic_or_partition) };
-        if (partition_index >= topic_info.num_partitions) {
+        if (!self.topicPartitionExists(topic, partition_index)) {
             return .{ .error_code = @intFromEnum(ErrorCode.unknown_topic_or_partition) };
         }
 
@@ -13856,6 +13863,9 @@ test "Broker.handleRequest AddPartitionsToTxn v4 returns generated response and 
 
     var broker = Broker.init(testing.allocator, 1, 9092);
     defer broker.deinit();
+    try testing.expect(broker.ensureTopic("txn-add-parts-topic"));
+    broker.topics.getPtr("txn-add-parts-topic").?.num_partitions = 2;
+    try broker.store.ensurePartition("txn-add-parts-topic", 1);
 
     const init_result = try broker.txn_coordinator.initProducerId("txn-add-parts-generated");
     const partitions = [_]i32{ 0, 1 };
@@ -13903,6 +13913,54 @@ test "Broker.handleRequest AddPartitionsToTxn v4 returns generated response and 
     try testing.expectEqual(@as(usize, 2), broker.txn_coordinator.getPartitions(init_result.producer_id).?.len);
 }
 
+test "Broker.handleRequest AddPartitionsToTxn rejects unknown topic partition" {
+    const Req = generated.add_partitions_to_txn_request.AddPartitionsToTxnRequest;
+    const Topic = generated.add_partitions_to_txn_request.AddPartitionsToTxnTopic;
+    const Txn = Req.AddPartitionsToTxnTransaction;
+    const Resp = generated.add_partitions_to_txn_response.AddPartitionsToTxnResponse;
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+
+    const init_result = try broker.txn_coordinator.initProducerId("txn-add-parts-missing");
+    const partitions = [_]i32{0};
+    const topics = [_]Topic{.{
+        .name = "missing-add-parts-topic",
+        .partitions = &partitions,
+    }};
+    const txns = [_]Txn{.{
+        .transactional_id = "txn-add-parts-missing",
+        .producer_id = init_result.producer_id,
+        .producer_epoch = init_result.producer_epoch,
+        .verify_only = false,
+        .topics = &topics,
+    }};
+    const req = Req{ .transactions = &txns };
+
+    var buf: [512]u8 = undefined;
+    var pos = buildTestRequest(&buf, 24, 4, 2405, header_mod.requestHeaderVersion(24, 4));
+    req.serialize(&buf, &pos, 4);
+
+    const response = broker.handleRequest(buf[0..pos]);
+    try testing.expect(response != null);
+    defer testing.allocator.free(response.?);
+
+    var rpos: usize = 0;
+    var response_header = try ResponseHeader.deserialize(testing.allocator, response.?, &rpos, header_mod.responseHeaderVersion(24, 4));
+    defer response_header.deinit(testing.allocator);
+    try testing.expectEqual(@as(i32, 2405), response_header.correlation_id);
+
+    const resp = try Resp.deserialize(testing.allocator, response.?, &rpos, 4);
+    defer {
+        broker.freeAddPartitionsToTxnResults(resp.results_by_transaction);
+        if (resp.results_by_transaction.len > 0) testing.allocator.free(resp.results_by_transaction);
+    }
+    try testing.expectEqual(response.?.len, rpos);
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.none)), resp.error_code);
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.unknown_topic_or_partition)), resp.results_by_transaction[0].topic_results[0].results_by_partition[0].partition_error_code);
+    try testing.expectEqual(@as(usize, 0), broker.txn_coordinator.getPartitions(init_result.producer_id).?.len);
+}
+
 test "Broker.handleRequest AddPartitionsToTxn persists registered partitions" {
     const fs = @import("fs_compat");
     const Req = generated.add_partitions_to_txn_request.AddPartitionsToTxnRequest;
@@ -13918,6 +13976,9 @@ test "Broker.handleRequest AddPartitionsToTxn persists registered partitions" {
     var broker = Broker.initWithConfig(testing.allocator, 1, 9092, .{ .data_dir = tmp_dir });
     defer broker.deinit();
     try broker.open();
+    try testing.expect(broker.ensureTopic("txn-add-parts-persist-topic"));
+    broker.topics.getPtr("txn-add-parts-persist-topic").?.num_partitions = 2;
+    try broker.store.ensurePartition("txn-add-parts-persist-topic", 1);
 
     const init_result = try broker.txn_coordinator.initProducerId("txn-add-parts-persist");
     const partitions = [_]i32{ 0, 1 };
@@ -16451,6 +16512,7 @@ test "Broker.handleRequest CreateTopics rejects truncated request" {
 test "Broker.handleRequest AddPartitionsToTxn (key=24) after InitProducerId" {
     var broker = Broker.init(testing.allocator, 1, 9092);
     defer broker.deinit();
+    try testing.expect(broker.ensureTopic("txn-topic"));
 
     // InitProducerId first
     const init_result = try broker.txn_coordinator.initProducerId("txn-test");
