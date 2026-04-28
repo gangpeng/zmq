@@ -3634,6 +3634,7 @@ pub const Broker = struct {
         }
 
         const group_id = req.group_id orelse "";
+        var mutated = false;
         for (req.topics) |topic_req| {
             const partitions = self.allocator.alloc(PartitionResponse, topic_req.partitions.len) catch return null;
             var transferred = false;
@@ -3656,15 +3657,22 @@ pub const Broker = struct {
                     break :blk null;
                 };
 
-                self.groups.commitOffsetWithLag(group_id, topic_name, partition_id, offset, leo) catch {};
+                const error_code: i16 = blk: {
+                    self.groups.commitOffsetWithLag(group_id, topic_name, partition_id, offset, leo) catch |err| {
+                        log.warn("OffsetCommit failed for {s}:{s}:{d}: {}", .{ group_id, topic_name, partition_id, err });
+                        break :blk @intFromEnum(ErrorCode.kafka_storage_error);
+                    };
 
-                // Write offset commit as a RecordBatch to __consumer_offsets
-                // The partition in __consumer_offsets is determined by hash(group_id) % 50
-                self.writeOffsetCommitRecord(group_id, topic_name, partition_id, offset);
+                    // Write offset commit as a RecordBatch to __consumer_offsets
+                    // The partition in __consumer_offsets is determined by hash(group_id) % 50
+                    self.writeOffsetCommitRecord(group_id, topic_name, partition_id, offset);
+                    mutated = true;
+                    break :blk @intFromEnum(ErrorCode.none);
+                };
 
                 partitions[partition_idx] = .{
                     .partition_index = partition_id,
-                    .error_code = @intFromEnum(ErrorCode.none),
+                    .error_code = error_code,
                 };
             }
 
@@ -3676,7 +3684,7 @@ pub const Broker = struct {
             transferred = true;
         }
 
-        self.persistOffsets();
+        if (mutated) self.persistOffsets();
 
         const resp = Resp{
             .throttle_time_ms = 0,
@@ -16218,6 +16226,68 @@ test "Broker.handleRequest OffsetCommit v8 returns generated response and commit
 
     const committed = try broker.groups.fetchOffset("oc-generated-group", "oc-generated-topic", 0);
     try testing.expectEqual(@as(i64, 77), committed.?);
+}
+
+test "Broker.handleRequest OffsetCommit reports coordinator commit failure per partition" {
+    const Req = generated.offset_commit_request.OffsetCommitRequest;
+    const Resp = generated.offset_commit_response.OffsetCommitResponse;
+    const Topic = Req.OffsetCommitRequestTopic;
+    const Partition = Topic.OffsetCommitRequestPartition;
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+
+    const partitions = [_]Partition{.{
+        .partition_index = 0,
+        .committed_offset = 88,
+        .committed_leader_epoch = -1,
+        .committed_metadata = "generated-meta",
+    }};
+    const topics = [_]Topic{.{
+        .name = "oc-fail-topic",
+        .partitions = &partitions,
+    }};
+    const req = Req{
+        .group_id = "oc-fail-group",
+        .generation_id_or_member_epoch = 1,
+        .member_id = "member-1",
+        .group_instance_id = null,
+        .topics = &topics,
+    };
+
+    var buf: [512]u8 = undefined;
+    var pos = buildTestRequest(&buf, 8, 8, 810, header_mod.requestHeaderVersion(8, 8));
+    req.serialize(&buf, &pos, 8);
+
+    const original_group_allocator = broker.groups.allocator;
+    var failing_allocator = std.testing.FailingAllocator.init(testing.allocator, .{ .fail_index = 0 });
+    broker.groups.allocator = failing_allocator.allocator();
+    defer broker.groups.allocator = original_group_allocator;
+
+    const response = broker.handleRequest(buf[0..pos]);
+    broker.groups.allocator = original_group_allocator;
+    try testing.expect(response != null);
+    defer testing.allocator.free(response.?);
+
+    var rpos: usize = 0;
+    var response_header = try ResponseHeader.deserialize(testing.allocator, response.?, &rpos, header_mod.responseHeaderVersion(8, 8));
+    defer response_header.deinit(testing.allocator);
+    try testing.expectEqual(@as(i32, 810), response_header.correlation_id);
+
+    const resp = try Resp.deserialize(testing.allocator, response.?, &rpos, 8);
+    defer {
+        for (resp.topics) |topic| {
+            if (topic.partitions.len > 0) testing.allocator.free(topic.partitions);
+        }
+        if (resp.topics.len > 0) testing.allocator.free(resp.topics);
+    }
+    try testing.expectEqual(response.?.len, rpos);
+    try testing.expectEqual(@as(usize, 1), resp.topics.len);
+    try testing.expectEqual(@as(usize, 1), resp.topics[0].partitions.len);
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.kafka_storage_error)), resp.topics[0].partitions[0].error_code);
+
+    const committed = try broker.groups.fetchOffset("oc-fail-group", "oc-fail-topic", 0);
+    try testing.expect(committed == null);
 }
 
 test "Broker.handleRequest OffsetCommit rejects truncated request" {
