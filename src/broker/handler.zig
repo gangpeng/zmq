@@ -7327,7 +7327,14 @@ pub const Broker = struct {
             errdefer self.allocator.free(partitions);
 
             for (topic.partitions, 0..) |partition, partition_index| {
-                if (topic_error == ErrorCode.none) {
+                const partition_error: ErrorCode = if (topic_error != ErrorCode.none)
+                    topic_error
+                else if (!self.topicPartitionExists(topic_name, partition.partition_index))
+                    ErrorCode.unknown_topic_or_partition
+                else
+                    ErrorCode.none;
+
+                if (partition_error == ErrorCode.none) {
                     const key = std.fmt.allocPrint(self.allocator, "{s}:{s}:{d}", .{ group_id, topic_name, partition.partition_index }) catch return null;
                     if (self.groups.committed_offsets.fetchRemove(key)) |old| {
                         var value = old.value;
@@ -7340,7 +7347,7 @@ pub const Broker = struct {
 
                 partitions[partition_index] = .{
                     .partition_index = partition.partition_index,
-                    .error_code = @intFromEnum(topic_error),
+                    .error_code = @intFromEnum(partition_error),
                 };
             }
 
@@ -13189,6 +13196,8 @@ test "Broker.handleRequest OffsetDelete returns generated response and deletes o
     var broker = Broker.init(testing.allocator, 1, 9092);
     defer broker.deinit();
 
+    broker.default_num_partitions = 2;
+    try testing.expect(broker.ensureTopic("delete-offset-topic"));
     try broker.groups.commitOffset("delete-offset-group", "delete-offset-topic", 0, 42);
 
     const partitions = [_]Req.OffsetDeleteRequestTopic.OffsetDeleteRequestPartition{
@@ -13244,6 +13253,7 @@ test "Broker.handleRequest OffsetDelete rejects subscribed group topic" {
     var broker = Broker.init(testing.allocator, 1, 9092);
     defer broker.deinit();
 
+    try testing.expect(broker.ensureTopic("delete-active-topic"));
     const subscriptions = [_][]const u8{"delete-active-topic"};
     _ = try broker.groups.joinGroup("delete-active-group", null, "consumer", &subscriptions);
     try broker.groups.commitOffset("delete-active-group", "delete-active-topic", 0, 42);
@@ -13285,6 +13295,74 @@ test "Broker.handleRequest OffsetDelete rejects subscribed group topic" {
     try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.none)), resp.error_code);
     try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.group_subscribed_to_topic)), resp.topics[0].partitions[0].error_code);
     try testing.expectEqual(@as(?i64, 42), try broker.groups.fetchOffset("delete-active-group", "delete-active-topic", 0));
+}
+
+test "Broker.handleRequest OffsetDelete rejects unknown topic partitions without deleting offsets" {
+    const Req = generated.offset_delete_request.OffsetDeleteRequest;
+    const Resp = generated.offset_delete_response.OffsetDeleteResponse;
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+
+    try testing.expect(broker.ensureTopic("delete-known-topic"));
+    try broker.groups.commitOffset("delete-validation-group", "delete-known-topic", 0, 11);
+    try broker.groups.commitOffset("delete-validation-group", "delete-known-topic", 1, 22);
+    try broker.groups.commitOffset("delete-validation-group", "delete-missing-topic", 0, 33);
+
+    const known_partitions = [_]Req.OffsetDeleteRequestTopic.OffsetDeleteRequestPartition{
+        .{ .partition_index = 0 },
+        .{ .partition_index = 1 },
+    };
+    const missing_partitions = [_]Req.OffsetDeleteRequestTopic.OffsetDeleteRequestPartition{.{
+        .partition_index = 0,
+    }};
+    const topics = [_]Req.OffsetDeleteRequestTopic{
+        .{
+            .name = "delete-known-topic",
+            .partitions = &known_partitions,
+        },
+        .{
+            .name = "delete-missing-topic",
+            .partitions = &missing_partitions,
+        },
+    };
+    const req = Req{
+        .group_id = "delete-validation-group",
+        .topics = &topics,
+    };
+
+    var buf: [768]u8 = undefined;
+    var pos = buildTestRequest(&buf, 47, 0, 4705, header_mod.requestHeaderVersion(47, 0));
+    req.serialize(&buf, &pos, 0);
+
+    const response = broker.handleRequest(buf[0..pos]);
+    try testing.expect(response != null);
+    defer testing.allocator.free(response.?);
+
+    var rpos: usize = 0;
+    var response_header = try ResponseHeader.deserialize(testing.allocator, response.?, &rpos, header_mod.responseHeaderVersion(47, 0));
+    defer response_header.deinit(testing.allocator);
+    try testing.expectEqual(@as(i32, 4705), response_header.correlation_id);
+
+    const resp = try Resp.deserialize(testing.allocator, response.?, &rpos, 0);
+    defer {
+        for (resp.topics) |topic| {
+            if (topic.partitions.len > 0) testing.allocator.free(topic.partitions);
+        }
+        if (resp.topics.len > 0) testing.allocator.free(resp.topics);
+    }
+
+    try testing.expectEqual(response.?.len, rpos);
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.none)), resp.error_code);
+    try testing.expectEqual(@as(usize, 2), resp.topics.len);
+    try testing.expectEqualStrings("delete-known-topic", resp.topics[0].name.?);
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.none)), resp.topics[0].partitions[0].error_code);
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.unknown_topic_or_partition)), resp.topics[0].partitions[1].error_code);
+    try testing.expectEqualStrings("delete-missing-topic", resp.topics[1].name.?);
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.unknown_topic_or_partition)), resp.topics[1].partitions[0].error_code);
+    try testing.expectEqual(@as(?i64, null), try broker.groups.fetchOffset("delete-validation-group", "delete-known-topic", 0));
+    try testing.expectEqual(@as(?i64, 22), try broker.groups.fetchOffset("delete-validation-group", "delete-known-topic", 1));
+    try testing.expectEqual(@as(?i64, 33), try broker.groups.fetchOffset("delete-validation-group", "delete-missing-topic", 0));
 }
 
 test "Broker.handleRequest OffsetDelete reports missing group" {
@@ -13346,6 +13424,7 @@ test "Broker.handleRequest OffsetDelete persists deleted offsets" {
     defer broker.deinit();
     try broker.open();
 
+    try testing.expect(broker.ensureTopic("persist-delete-topic"));
     try broker.groups.commitOffset("persist-delete-group", "persist-delete-topic", 0, 42);
     broker.persistOffsets();
 
