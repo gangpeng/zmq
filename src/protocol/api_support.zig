@@ -335,6 +335,7 @@ pub const broker_handler_api_keys = [_]i16{
     84,
     85,
     86,
+    87,
     501,
     502,
     503,
@@ -383,6 +384,7 @@ pub const fail_closed_generated_handler_api_keys = [_]i16{
     84, // ReadShareGroupState (KIP-932)
     85, // WriteShareGroupState (KIP-932)
     86, // DeleteShareGroupState (KIP-932)
+    87, // ReadShareGroupStateSummary (KIP-932)
 };
 
 /// Controller handler switch cases. Version support comes from
