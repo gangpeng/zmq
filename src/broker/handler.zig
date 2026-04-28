@@ -1738,6 +1738,7 @@ pub const Broker = struct {
             79 => self.handleShareAcknowledge(request_bytes, pos, &req_header, api_version, resp_header_version),
             83 => self.handleInitializeShareGroupState(request_bytes, pos, &req_header, api_version, resp_header_version),
             84 => self.handleReadShareGroupState(request_bytes, pos, &req_header, api_version, resp_header_version),
+            85 => self.handleWriteShareGroupState(request_bytes, pos, &req_header, api_version, resp_header_version),
             501 => self.handleCreateStreams(request_bytes, pos, &req_header, api_version, resp_header_version),
             502 => self.handleOpenStreams(request_bytes, pos, &req_header, api_version, resp_header_version),
             503 => self.handleCloseStreams(request_bytes, pos, &req_header, api_version, resp_header_version),
@@ -5292,6 +5293,111 @@ pub const Broker = struct {
     }
 
     fn freeReadShareGroupStateResultPartitions(self: *Broker, results: []const generated.read_share_group_state_response.ReadShareGroupStateResponse.ReadStateResult) void {
+        for (results) |result| {
+            if (result.partitions.len > 0) self.allocator.free(result.partitions);
+        }
+    }
+
+    // ---------------------------------------------------------------
+    // WriteShareGroupState (key 85) — non-advertised until share state exists
+    // ---------------------------------------------------------------
+    fn handleWriteShareGroupState(self: *Broker, request_bytes: []const u8, body_start: usize, req_header: *const RequestHeader, api_version: i16, resp_header_version: i16) ?[]u8 {
+        const Req = generated.write_share_group_state_request.WriteShareGroupStateRequest;
+        const Resp = generated.write_share_group_state_response.WriteShareGroupStateResponse;
+
+        if (!validateWriteShareGroupStateRequestFrame(request_bytes, body_start)) {
+            log.warn("Malformed WriteShareGroupState request", .{});
+            const partitions = [_]Resp.WriteStateResult.PartitionResult{.{
+                .partition = -1,
+                .error_code = ErrorCode.invalid_request.toInt(),
+                .error_message = "malformed WriteShareGroupState request",
+            }};
+            const results = [_]Resp.WriteStateResult{.{
+                .topic_id = [_]u8{0} ** 16,
+                .partitions = &partitions,
+            }};
+            const resp = Resp{ .results = &results };
+            return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+        }
+
+        var pos = body_start;
+        var req = Req.deserialize(self.allocator, request_bytes, &pos, api_version) catch |err| {
+            log.warn("Failed to decode WriteShareGroupState request: {}", .{err});
+            const partitions = [_]Resp.WriteStateResult.PartitionResult{.{
+                .partition = -1,
+                .error_code = ErrorCode.invalid_request.toInt(),
+                .error_message = "malformed WriteShareGroupState request",
+            }};
+            const results = [_]Resp.WriteStateResult{.{
+                .topic_id = [_]u8{0} ** 16,
+                .partitions = &partitions,
+            }};
+            const resp = Resp{ .results = &results };
+            return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+        };
+        defer self.freeWriteShareGroupStateRequest(&req);
+
+        const results = self.buildWriteShareGroupStateFailClosedResults(req) catch return null;
+        defer self.freeWriteShareGroupStateResults(results);
+
+        const resp = Resp{ .results = results };
+        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+    }
+
+    fn buildWriteShareGroupStateFailClosedResults(
+        self: *Broker,
+        req: generated.write_share_group_state_request.WriteShareGroupStateRequest,
+    ) ![]generated.write_share_group_state_response.WriteShareGroupStateResponse.WriteStateResult {
+        const Result = generated.write_share_group_state_response.WriteShareGroupStateResponse.WriteStateResult;
+        const PartitionResult = Result.PartitionResult;
+
+        if (req.topics.len == 0) return &.{};
+
+        const results = try self.allocator.alloc(Result, req.topics.len);
+        var results_init: usize = 0;
+        errdefer {
+            self.freeWriteShareGroupStateResultPartitions(results[0..results_init]);
+            self.allocator.free(results);
+        }
+
+        for (req.topics) |topic| {
+            const partitions = try self.allocator.alloc(PartitionResult, topic.partitions.len);
+            errdefer self.allocator.free(partitions);
+
+            for (topic.partitions, 0..) |partition, idx| {
+                partitions[idx] = .{
+                    .partition = partition.partition,
+                    .error_code = ErrorCode.unsupported_version.toInt(),
+                    .error_message = "WriteShareGroupState is not implemented",
+                };
+            }
+
+            results[results_init] = .{
+                .topic_id = topic.topic_id,
+                .partitions = partitions,
+            };
+            results_init += 1;
+        }
+
+        return results;
+    }
+
+    fn freeWriteShareGroupStateRequest(self: *Broker, req: *generated.write_share_group_state_request.WriteShareGroupStateRequest) void {
+        for (req.topics) |topic| {
+            for (topic.partitions) |partition| {
+                if (partition.state_batches.len > 0) self.allocator.free(partition.state_batches);
+            }
+            if (topic.partitions.len > 0) self.allocator.free(topic.partitions);
+        }
+        if (req.topics.len > 0) self.allocator.free(req.topics);
+    }
+
+    fn freeWriteShareGroupStateResults(self: *Broker, results: []const generated.write_share_group_state_response.WriteShareGroupStateResponse.WriteStateResult) void {
+        self.freeWriteShareGroupStateResultPartitions(results);
+        if (results.len > 0) self.allocator.free(results);
+    }
+
+    fn freeWriteShareGroupStateResultPartitions(self: *Broker, results: []const generated.write_share_group_state_response.WriteShareGroupStateResponse.WriteStateResult) void {
         for (results) |result| {
             if (result.partitions.len > 0) self.allocator.free(result.partitions);
         }
@@ -12012,6 +12118,33 @@ pub const Broker = struct {
             const partition_count = readKafkaArrayCount(buf, &pos, true) orelse return false;
             for (0..partition_count) |_| {
                 if (!skipFixedBytes(buf, &pos, 8)) return false; // partition + leader_epoch
+                ser.skipTaggedFields(buf, &pos) catch return false;
+            }
+            ser.skipTaggedFields(buf, &pos) catch return false;
+        }
+
+        ser.skipTaggedFields(buf, &pos) catch return false;
+        return pos == buf.len;
+    }
+
+    fn validateWriteShareGroupStateRequestFrame(buf: []const u8, start_pos: usize) bool {
+        var pos = start_pos;
+
+        if (!skipKafkaString(buf, &pos, true)) return false; // group_id
+
+        const topic_count = readKafkaArrayCount(buf, &pos, true) orelse return false;
+        for (0..topic_count) |_| {
+            if (!skipFixedBytes(buf, &pos, 16)) return false; // topic_id
+
+            const partition_count = readKafkaArrayCount(buf, &pos, true) orelse return false;
+            for (0..partition_count) |_| {
+                if (!skipFixedBytes(buf, &pos, 20)) return false; // partition + state_epoch + leader_epoch + start_offset
+
+                const state_batch_count = readKafkaArrayCount(buf, &pos, true) orelse return false;
+                for (0..state_batch_count) |_| {
+                    if (!skipFixedBytes(buf, &pos, 19)) return false; // first_offset + last_offset + delivery_state + delivery_count
+                    ser.skipTaggedFields(buf, &pos) catch return false;
+                }
                 ser.skipTaggedFields(buf, &pos) catch return false;
             }
             ser.skipTaggedFields(buf, &pos) catch return false;
@@ -22158,6 +22291,103 @@ test "Broker.handleRequest ReadShareGroupState rejects malformed request" {
             for (result.partitions) |partition| {
                 if (partition.state_batches.len > 0) testing.allocator.free(partition.state_batches);
             }
+            if (result.partitions.len > 0) testing.allocator.free(result.partitions);
+        }
+        if (resp.results.len > 0) testing.allocator.free(resp.results);
+    }
+
+    try testing.expectEqual(response.?.len, rpos);
+    try testing.expectEqual(@as(usize, 1), resp.results.len);
+    try testing.expectEqual(@as(usize, 1), resp.results[0].partitions.len);
+    try testing.expectEqual(@as(i32, -1), resp.results[0].partitions[0].partition);
+    try testing.expectEqual(ErrorCode.invalid_request.toInt(), resp.results[0].partitions[0].error_code);
+}
+
+test "Broker.handleRequest WriteShareGroupState returns generated fail-closed response" {
+    const Req = generated.write_share_group_state_request.WriteShareGroupStateRequest;
+    const Resp = generated.write_share_group_state_response.WriteShareGroupStateResponse;
+    const WriteStateData = Req.WriteStateData;
+    const PartitionData = WriteStateData.PartitionData;
+    const StateBatch = PartitionData.StateBatch;
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+
+    const topic_id = [_]u8{5} ** 16;
+    const state_batches = [_]StateBatch{.{
+        .first_offset = 10,
+        .last_offset = 11,
+        .delivery_state = 0,
+        .delivery_count = 1,
+    }};
+    const partitions = [_]PartitionData{.{
+        .partition = 0,
+        .state_epoch = 2,
+        .leader_epoch = 3,
+        .start_offset = 10,
+        .state_batches = &state_batches,
+    }};
+    const topics = [_]WriteStateData{.{
+        .topic_id = topic_id,
+        .partitions = &partitions,
+    }};
+    const req = Req{
+        .group_id = "share-group",
+        .topics = &topics,
+    };
+
+    var buf: [512]u8 = undefined;
+    var pos = buildTestRequest(&buf, 85, 0, 8500, header_mod.requestHeaderVersion(85, 0));
+    req.serialize(&buf, &pos, 0);
+
+    const response = broker.handleRequest(buf[0..pos]);
+    try testing.expect(response != null);
+    defer testing.allocator.free(response.?);
+
+    var rpos: usize = 0;
+    var response_header = try ResponseHeader.deserialize(testing.allocator, response.?, &rpos, header_mod.responseHeaderVersion(85, 0));
+    defer response_header.deinit(testing.allocator);
+    try testing.expectEqual(@as(i32, 8500), response_header.correlation_id);
+
+    const resp = try Resp.deserialize(testing.allocator, response.?, &rpos, 0);
+    defer {
+        for (resp.results) |result| {
+            if (result.partitions.len > 0) testing.allocator.free(result.partitions);
+        }
+        if (resp.results.len > 0) testing.allocator.free(resp.results);
+    }
+
+    try testing.expectEqual(response.?.len, rpos);
+    try testing.expectEqual(@as(usize, 1), resp.results.len);
+    try testing.expectEqualSlices(u8, topic_id[0..], resp.results[0].topic_id[0..]);
+    try testing.expectEqual(@as(usize, 1), resp.results[0].partitions.len);
+    try testing.expectEqual(@as(i32, 0), resp.results[0].partitions[0].partition);
+    try testing.expectEqual(ErrorCode.unsupported_version.toInt(), resp.results[0].partitions[0].error_code);
+    try testing.expectEqualStrings("WriteShareGroupState is not implemented", resp.results[0].partitions[0].error_message.?);
+}
+
+test "Broker.handleRequest WriteShareGroupState rejects malformed request" {
+    const Resp = generated.write_share_group_state_response.WriteShareGroupStateResponse;
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+
+    var buf: [128]u8 = undefined;
+    var pos = buildTestRequest(&buf, 85, 0, 8501, header_mod.requestHeaderVersion(85, 0));
+    ser.writeCompactString(&buf, &pos, "share-group"); // missing topics and tagged fields
+
+    const response = broker.handleRequest(buf[0..pos]);
+    try testing.expect(response != null);
+    defer testing.allocator.free(response.?);
+
+    var rpos: usize = 0;
+    var response_header = try ResponseHeader.deserialize(testing.allocator, response.?, &rpos, header_mod.responseHeaderVersion(85, 0));
+    defer response_header.deinit(testing.allocator);
+    try testing.expectEqual(@as(i32, 8501), response_header.correlation_id);
+
+    const resp = try Resp.deserialize(testing.allocator, response.?, &rpos, 0);
+    defer {
+        for (resp.results) |result| {
             if (result.partitions.len > 0) testing.allocator.free(result.partitions);
         }
         if (resp.results.len > 0) testing.allocator.free(resp.results);
