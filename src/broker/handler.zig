@@ -3990,6 +3990,9 @@ pub const Broker = struct {
             const actual_partitions = self.createTopicsPartitionCount(&topic_req);
             const actual_rf = self.createTopicsReplicationFactor(&topic_req);
             var error_code: i16 = @intFromEnum(ErrorCode.none);
+            var error_message: ?[]const u8 = null;
+            var topic_config = TopicConfig{};
+            const config_result = applyCreateTopicConfigs(&topic_config, topic_req.configs);
 
             if (topic_name.len == 0) {
                 error_code = @intFromEnum(ErrorCode.invalid_topic_exception);
@@ -4001,6 +4004,9 @@ pub const Broker = struct {
                 error_code = @intFromEnum(ErrorCode.invalid_partitions);
             } else if (actual_rf <= 0) {
                 error_code = @intFromEnum(ErrorCode.invalid_replication_factor);
+            } else if (config_result.error_code != @intFromEnum(ErrorCode.none)) {
+                error_code = config_result.error_code;
+                error_message = config_result.error_message;
             } else if (!req.validate_only) {
                 const name_copy = self.allocator.dupe(u8, topic_name) catch return null;
                 const key_copy = self.allocator.dupe(u8, topic_name) catch {
@@ -4012,6 +4018,7 @@ pub const Broker = struct {
                     .num_partitions = actual_partitions,
                     .replication_factor = actual_rf,
                     .topic_id = TopicInfo.generateTopicId(),
+                    .config = topic_config,
                 }) catch {
                     self.allocator.free(key_copy);
                     self.allocator.free(name_copy);
@@ -4029,7 +4036,7 @@ pub const Broker = struct {
                 .name = topic_req.name,
                 .topic_id = if (self.topics.get(topic_name)) |info| info.topic_id else .{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 },
                 .error_code = error_code,
-                .error_message = null,
+                .error_message = error_message,
                 .num_partitions = actual_partitions,
                 .replication_factor = actual_rf,
                 .configs = &.{},
@@ -4087,6 +4094,55 @@ pub const Broker = struct {
             }
         }
         return false;
+    }
+
+    fn applyCreateTopicConfigs(
+        topic_config: *TopicConfig,
+        configs: []const generated.create_topics_request.CreateTopicsRequest.CreatableTopic.CreatableTopicConfig,
+    ) IncrementalAlterConfigResult {
+        for (configs) |config| {
+            const result = applyCreateTopicConfig(topic_config, config);
+            if (result.error_code != @intFromEnum(ErrorCode.none)) return result;
+        }
+        return .{
+            .error_code = @intFromEnum(ErrorCode.none),
+            .error_message = null,
+            .mutated = configs.len > 0,
+        };
+    }
+
+    fn applyCreateTopicConfig(
+        topic_config: *TopicConfig,
+        config: generated.create_topics_request.CreateTopicsRequest.CreatableTopic.CreatableTopicConfig,
+    ) IncrementalAlterConfigResult {
+        const name = config.name orelse return .{
+            .error_code = @intFromEnum(ErrorCode.invalid_config),
+            .error_message = "Missing config name",
+        };
+
+        const defaults = TopicConfig{};
+        const value = config.value;
+
+        if (std.mem.eql(u8, name, "retention.ms")) {
+            topic_config.retention_ms = if (value) |v| std.fmt.parseInt(i64, v, 10) catch return invalidTopicConfigValue() else defaults.retention_ms;
+        } else if (std.mem.eql(u8, name, "retention.bytes")) {
+            topic_config.retention_bytes = if (value) |v| std.fmt.parseInt(i64, v, 10) catch return invalidTopicConfigValue() else defaults.retention_bytes;
+        } else if (std.mem.eql(u8, name, "max.message.bytes")) {
+            topic_config.max_message_bytes = if (value) |v| std.fmt.parseInt(i32, v, 10) catch return invalidTopicConfigValue() else defaults.max_message_bytes;
+        } else if (std.mem.eql(u8, name, "min.insync.replicas")) {
+            topic_config.min_insync_replicas = if (value) |v| std.fmt.parseInt(i32, v, 10) catch return invalidTopicConfigValue() else defaults.min_insync_replicas;
+        } else {
+            return .{
+                .error_code = @intFromEnum(ErrorCode.invalid_config),
+                .error_message = "Unsupported topic config",
+            };
+        }
+
+        return .{
+            .error_code = @intFromEnum(ErrorCode.none),
+            .error_message = null,
+            .mutated = true,
+        };
     }
 
     // ---------------------------------------------------------------
@@ -15450,6 +15506,109 @@ test "Broker.handleRequest CreateTopics v7 returns generated response" {
     try testing.expectEqual(@as(i16, 1), resp.topics[0].replication_factor);
     try testing.expect(!std.mem.eql(u8, &resp.topics[0].topic_id, &[_]u8{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 }));
     try testing.expect(broker.topics.contains("ct-generated-topic"));
+}
+
+test "Broker.handleRequest CreateTopics applies supported topic configs" {
+    const Req = generated.create_topics_request.CreateTopicsRequest;
+    const Resp = generated.create_topics_response.CreateTopicsResponse;
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+
+    const configs = [_]Req.CreatableTopic.CreatableTopicConfig{
+        .{ .name = "retention.ms", .value = "1234" },
+        .{ .name = "retention.bytes", .value = "5678" },
+        .{ .name = "max.message.bytes", .value = "9000" },
+        .{ .name = "min.insync.replicas", .value = "2" },
+    };
+    const topics = [_]Req.CreatableTopic{.{
+        .name = "ct-config-topic",
+        .num_partitions = 1,
+        .replication_factor = 1,
+        .configs = &configs,
+    }};
+    const req = Req{
+        .topics = &topics,
+        .timeout_ms = 30000,
+        .validate_only = false,
+    };
+
+    var buf: [1024]u8 = undefined;
+    var pos = buildTestRequest(&buf, 19, 7, 1917, header_mod.requestHeaderVersion(19, 7));
+    req.serialize(&buf, &pos, 7);
+
+    const response = broker.handleRequest(buf[0..pos]);
+    try testing.expect(response != null);
+    defer testing.allocator.free(response.?);
+
+    var rpos: usize = 0;
+    var response_header = try ResponseHeader.deserialize(testing.allocator, response.?, &rpos, header_mod.responseHeaderVersion(19, 7));
+    defer response_header.deinit(testing.allocator);
+    try testing.expectEqual(@as(i32, 1917), response_header.correlation_id);
+
+    const resp = try Resp.deserialize(testing.allocator, response.?, &rpos, 7);
+    defer {
+        for (resp.topics) |topic| {
+            if (topic.configs.len > 0) testing.allocator.free(topic.configs);
+        }
+        if (resp.topics.len > 0) testing.allocator.free(resp.topics);
+    }
+    try testing.expectEqual(response.?.len, rpos);
+    try testing.expectEqual(@as(usize, 1), resp.topics.len);
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.none)), resp.topics[0].error_code);
+
+    const topic = broker.topics.get("ct-config-topic").?;
+    try testing.expectEqual(@as(i64, 1234), topic.config.retention_ms);
+    try testing.expectEqual(@as(i64, 5678), topic.config.retention_bytes);
+    try testing.expectEqual(@as(i32, 9000), topic.config.max_message_bytes);
+    try testing.expectEqual(@as(i32, 2), topic.config.min_insync_replicas);
+}
+
+test "Broker.handleRequest CreateTopics rejects unsupported topic config" {
+    const Req = generated.create_topics_request.CreateTopicsRequest;
+    const Resp = generated.create_topics_response.CreateTopicsResponse;
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+
+    const configs = [_]Req.CreatableTopic.CreatableTopicConfig{.{
+        .name = "cleanup.policy",
+        .value = "compact",
+    }};
+    const topics = [_]Req.CreatableTopic{.{
+        .name = "ct-invalid-config-topic",
+        .num_partitions = 1,
+        .replication_factor = 1,
+        .configs = &configs,
+    }};
+    const req = Req{
+        .topics = &topics,
+        .timeout_ms = 30000,
+        .validate_only = false,
+    };
+
+    var buf: [512]u8 = undefined;
+    var pos = buildTestRequest(&buf, 19, 7, 1918, header_mod.requestHeaderVersion(19, 7));
+    req.serialize(&buf, &pos, 7);
+
+    const response = broker.handleRequest(buf[0..pos]);
+    try testing.expect(response != null);
+    defer testing.allocator.free(response.?);
+
+    var rpos: usize = 0;
+    var response_header = try ResponseHeader.deserialize(testing.allocator, response.?, &rpos, header_mod.responseHeaderVersion(19, 7));
+    defer response_header.deinit(testing.allocator);
+    const resp = try Resp.deserialize(testing.allocator, response.?, &rpos, 7);
+    defer {
+        for (resp.topics) |topic| {
+            if (topic.configs.len > 0) testing.allocator.free(topic.configs);
+        }
+        if (resp.topics.len > 0) testing.allocator.free(resp.topics);
+    }
+
+    try testing.expectEqual(@as(usize, 1), resp.topics.len);
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.invalid_config)), resp.topics[0].error_code);
+    try testing.expect(!broker.topics.contains("ct-invalid-config-topic"));
 }
 
 test "Broker.handleRequest CreateTopics validate_only does not create topic" {
