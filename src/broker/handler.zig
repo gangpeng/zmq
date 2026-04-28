@@ -8088,11 +8088,12 @@ pub const Broker = struct {
             return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
         };
 
-        const manifest = std.fmt.allocPrint(arena_alloc, "{{\"cluster_id\":\"zmq-cluster\",\"node_id\":{d},\"topics\":{d},\"streams\":{d},\"nodes\":{d}}}", .{
+        const manifest = std.fmt.allocPrint(arena_alloc, "{{\"cluster_id\":\"zmq-cluster\",\"node_id\":{d},\"topics\":{d},\"streams\":{d},\"nodes\":{d},\"groups\":{d}}}", .{
             self.node_id,
             self.topics.count(),
             self.object_manager.streamCount(),
             self.auto_mq_nodes.count() + @intFromBool(self.auto_mq_nodes.get(self.node_id) == null),
+            self.auto_mq_group_promotions.count(),
         }) catch return null;
 
         const resp = Resp{ .error_code = 0, .throttle_time_ms = 0, .manifest = manifest };
@@ -18290,6 +18291,7 @@ test "Broker AutoMQ node license and manifest APIs" {
     defer manifest_header.deinit(testing.allocator);
     const manifest_resp = try ManifestResp.deserialize(testing.allocator, response.?, &rpos, 0);
     try testing.expect(std.mem.indexOf(u8, manifest_resp.manifest.?, "\"cluster_id\":\"zmq-cluster\"") != null);
+    try testing.expect(std.mem.indexOf(u8, manifest_resp.manifest.?, "\"groups\":0") != null);
 }
 
 test "Broker AutoMQ router snapshot describe and group APIs" {

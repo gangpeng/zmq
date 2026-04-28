@@ -888,6 +888,25 @@ def automq_export_cluster_manifest(port, correlation_id):
         raise TestError(f"ExportClusterManifest returned invalid JSON: {manifest!r}") from exc
 
 
+def automq_update_group(port, link_id, group_id, promoted, correlation_id):
+    body = write_compact_string(link_id)
+    body += write_compact_string(group_id)
+    body += b"\x01" if promoted else b"\x00"
+    body += b"\x00"  # request tagged fields
+
+    response = automq_request(port, 602, correlation_id, body, timeout=15)
+    pos = parse_flexible_response_header(response, correlation_id)
+    response_group_id, pos = read_compact_string(response, pos)
+    error_code, pos = read_i16(response, pos)
+    _, pos = read_compact_string(response, pos)  # error_message
+    _, pos = read_i32(response, pos)  # throttle_time_ms
+    pos = skip_tags(response, pos)
+    if response_group_id != group_id:
+        raise TestError(f"AutomqUpdateGroup group_id mismatch: {response_group_id!r}")
+    if error_code != 0:
+        raise TestError(f"AutomqUpdateGroup error_code={error_code}")
+
+
 def automq_zone_router(port, metadata, route_epoch, correlation_id, api_version=1):
     body = write_compact_bytes(metadata)
     if api_version >= 1:
@@ -1421,6 +1440,44 @@ def wait_for_automq_manifest_streams(port, minimum_streams, timeout=45):
     )
 
 
+def wait_for_automq_manifest_groups(port, expected_groups, timeout=45):
+    deadline = time.time() + timeout
+    correlation_id = 15900
+    last_error = None
+    last_manifest = None
+    while time.time() < deadline:
+        try:
+            last_manifest = automq_export_cluster_manifest(port, correlation_id)
+            if last_manifest.get("groups") == expected_groups:
+                return last_manifest
+            raise TestError(
+                f"expected groups={expected_groups}, got {last_manifest.get('groups')}"
+            )
+        except Exception as exc:
+            last_error = exc
+        correlation_id += 1
+        time.sleep(0.5)
+    raise TestError(
+        f"AutoMQ ExportClusterManifest did not report groups={expected_groups}: "
+        f"last_manifest={last_manifest!r} last_error={last_error}"
+    )
+
+
+def wait_for_automq_update_group(port, link_id, group_id, promoted, timeout=45):
+    deadline = time.time() + timeout
+    correlation_id = 15950
+    last_error = None
+    while time.time() < deadline:
+        try:
+            automq_update_group(port, link_id, group_id, promoted, correlation_id)
+            return
+        except Exception as exc:
+            last_error = exc
+            correlation_id += 1
+            time.sleep(0.5)
+    raise TestError(f"AutoMQ UpdateGroup did not succeed within {timeout}s: {last_error}")
+
+
 def wait_for_automq_zone_router_update(port, metadata, route_epoch, timeout=45):
     deadline = time.time() + timeout
     correlation_id = 16000
@@ -1771,6 +1828,11 @@ def run_automq_metadata_failover_scenario(tmp):
         )
         wait_for_automq_zone_router(leader_broker_port, zone_router_before)
 
+        group_id = f"automq-group-{os.getpid()}-{leader_id}"
+        link_id = f"automq-link-{leader_id}"
+        wait_for_automq_update_group(leader_broker_port, link_id, group_id, True)
+        wait_for_automq_manifest_groups(leader_broker_port, 1)
+
         stream_owner_node_id = leader_id
         stream_id = wait_for_automq_create_stream(leader_broker_port, leader_id)
         stream_object_id = wait_for_automq_prepare_s3_object(
@@ -1838,6 +1900,7 @@ def run_automq_metadata_failover_scenario(tmp):
             wait_for_automq_kv(info["broker_port"], key, value_before)
             wait_for_automq_kv(info["broker_port"], delete_key, delete_value)
             wait_for_automq_zone_router(info["broker_port"], zone_router_before)
+            wait_for_automq_manifest_groups(info["broker_port"], 1)
             wait_for_automq_stream(info["broker_port"], stream_id, "OPENED", 1, 0, 10)
             wait_for_automq_opening_stream(
                 info["broker_port"],
@@ -1868,6 +1931,7 @@ def run_automq_metadata_failover_scenario(tmp):
         wait_for_automq_kv(replacement_broker_port, key, value_before)
         wait_for_automq_kv(replacement_broker_port, delete_key, delete_value)
         wait_for_automq_zone_router(replacement_broker_port, zone_router_before)
+        wait_for_automq_manifest_groups(replacement_broker_port, 1)
         wait_for_automq_stream(replacement_broker_port, stream_id, "OPENED", 1, 0, 10)
         wait_for_automq_opening_stream(
             replacement_broker_port,
@@ -1910,6 +1974,9 @@ def run_automq_metadata_failover_scenario(tmp):
             zone_router_epoch_after,
         )
         wait_for_automq_zone_router(replacement_broker_port, zone_router_after)
+
+        wait_for_automq_update_group(replacement_broker_port, link_id, group_id, False)
+        wait_for_automq_manifest_groups(replacement_broker_port, 0)
 
         stream_set_object_id = wait_for_automq_prepare_s3_object(
             replacement_broker_port,
@@ -2006,6 +2073,7 @@ def run_automq_metadata_failover_scenario(tmp):
         wait_for_automq_kv(processes[leader_id]["broker_port"], key, value_after)
         wait_for_automq_kv_missing(processes[leader_id]["broker_port"], delete_key)
         wait_for_automq_zone_router(processes[leader_id]["broker_port"], zone_router_after)
+        wait_for_automq_manifest_groups(processes[leader_id]["broker_port"], 0)
         wait_for_automq_stream(
             processes[leader_id]["broker_port"],
             stream_id,
