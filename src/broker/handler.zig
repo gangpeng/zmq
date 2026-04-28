@@ -3852,6 +3852,7 @@ pub const Broker = struct {
                     if (group_error != ErrorCode.none) break :blk @intFromEnum(group_error);
                     const metadata_error = validateOffsetCommitMetadata(partition_req.committed_metadata);
                     if (metadata_error != ErrorCode.none) break :blk @intFromEnum(metadata_error);
+                    if (!self.topicPartitionExists(topic_name, partition_id)) break :blk @intFromEnum(ErrorCode.unknown_topic_or_partition);
 
                     self.groups.commitOffsetWithMetadataAndLag(group_id, topic_name, partition_id, offset, partition_req.committed_leader_epoch, partition_req.committed_metadata, leo) catch |err| {
                         log.warn("OffsetCommit failed for {s}:{s}:{d}: {}", .{ group_id, topic_name, partition_id, err });
@@ -8058,6 +8059,7 @@ pub const Broker = struct {
                     if (group_error != ErrorCode.none) break :blk @intFromEnum(group_error);
                     const metadata_error = validateOffsetCommitMetadata(partition_req.committed_metadata);
                     if (metadata_error != ErrorCode.none) break :blk @intFromEnum(metadata_error);
+                    if (!self.topicPartitionExists(topic, partition_req.partition_index)) break :blk @intFromEnum(ErrorCode.unknown_topic_or_partition);
 
                     self.groups.commitOffsetWithMetadata(group_id, topic, partition_req.partition_index, partition_req.committed_offset, partition_req.committed_leader_epoch, partition_req.committed_metadata) catch |err| {
                         log.warn("TxnOffsetCommit failed for {s}:{s}:{d}: {}", .{ group_id, topic, partition_req.partition_index, err });
@@ -12289,6 +12291,7 @@ test "Broker.handleRequest TxnOffsetCommit v3 returns generated response and com
 
     var broker = Broker.init(testing.allocator, 1, 9092);
     defer broker.deinit();
+    try testing.expect(broker.ensureTopic("txn-offset-topic"));
     const init_result = try initTxnOffsetCommitForTest(&broker, "txn-id", "txn-offset-group");
 
     const partitions = [_]Req.TxnOffsetCommitRequestTopic.TxnOffsetCommitRequestPartition{.{
@@ -12341,6 +12344,87 @@ test "Broker.handleRequest TxnOffsetCommit v3 returns generated response and com
     try testing.expectEqual(@as(i32, 0), resp.topics[0].partitions[0].partition_index);
     try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.none)), resp.topics[0].partitions[0].error_code);
     try testing.expectEqual(@as(?i64, 123), try broker.groups.fetchOffset("txn-offset-group", "txn-offset-topic", 0));
+}
+
+test "Broker.handleRequest TxnOffsetCommit rejects unknown topic partitions without committing offsets" {
+    const Req = generated.txn_offset_commit_request.TxnOffsetCommitRequest;
+    const Resp = generated.txn_offset_commit_response.TxnOffsetCommitResponse;
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+    try testing.expect(broker.ensureTopic("txn-offset-known-topic"));
+    const init_result = try initTxnOffsetCommitForTest(&broker, "txn-offset-validation-id", "txn-offset-validation-group");
+
+    const known_partitions = [_]Req.TxnOffsetCommitRequestTopic.TxnOffsetCommitRequestPartition{
+        .{
+            .partition_index = 0,
+            .committed_offset = 123,
+            .committed_leader_epoch = -1,
+            .committed_metadata = "valid",
+        },
+        .{
+            .partition_index = 1,
+            .committed_offset = 456,
+            .committed_leader_epoch = -1,
+            .committed_metadata = "stale",
+        },
+    };
+    const missing_partitions = [_]Req.TxnOffsetCommitRequestTopic.TxnOffsetCommitRequestPartition{.{
+        .partition_index = 0,
+        .committed_offset = 789,
+        .committed_leader_epoch = -1,
+        .committed_metadata = "missing",
+    }};
+    const topics = [_]Req.TxnOffsetCommitRequestTopic{
+        .{
+            .name = "txn-offset-known-topic",
+            .partitions = &known_partitions,
+        },
+        .{
+            .name = "txn-offset-missing-topic",
+            .partitions = &missing_partitions,
+        },
+    };
+    const req = Req{
+        .transactional_id = "txn-offset-validation-id",
+        .group_id = "txn-offset-validation-group",
+        .producer_id = init_result.producer_id,
+        .producer_epoch = init_result.producer_epoch,
+        .generation_id = -1,
+        .member_id = "",
+        .group_instance_id = null,
+        .topics = &topics,
+    };
+
+    var buf: [1024]u8 = undefined;
+    var pos = buildTestRequest(&buf, 28, 3, 2816, header_mod.requestHeaderVersion(28, 3));
+    req.serialize(&buf, &pos, 3);
+
+    const response = broker.handleRequest(buf[0..pos]);
+    try testing.expect(response != null);
+    defer testing.allocator.free(response.?);
+
+    var rpos: usize = 0;
+    var response_header = try ResponseHeader.deserialize(testing.allocator, response.?, &rpos, header_mod.responseHeaderVersion(28, 3));
+    defer response_header.deinit(testing.allocator);
+    try testing.expectEqual(@as(i32, 2816), response_header.correlation_id);
+
+    const resp = try Resp.deserialize(testing.allocator, response.?, &rpos, 3);
+    defer {
+        for (resp.topics) |topic| {
+            if (topic.partitions.len > 0) testing.allocator.free(topic.partitions);
+        }
+        if (resp.topics.len > 0) testing.allocator.free(resp.topics);
+    }
+
+    try testing.expectEqual(response.?.len, rpos);
+    try testing.expectEqual(@as(usize, 2), resp.topics.len);
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.none)), resp.topics[0].partitions[0].error_code);
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.unknown_topic_or_partition)), resp.topics[0].partitions[1].error_code);
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.unknown_topic_or_partition)), resp.topics[1].partitions[0].error_code);
+    try testing.expectEqual(@as(?i64, 123), try broker.groups.fetchOffset("txn-offset-validation-group", "txn-offset-known-topic", 0));
+    try testing.expectEqual(@as(?i64, null), try broker.groups.fetchOffset("txn-offset-validation-group", "txn-offset-known-topic", 1));
+    try testing.expectEqual(@as(?i64, null), try broker.groups.fetchOffset("txn-offset-validation-group", "txn-offset-missing-topic", 0));
 }
 
 test "Broker.handleRequest TxnOffsetCommit rejects unknown managed member" {
@@ -12523,6 +12607,7 @@ test "Broker.handleRequest TxnOffsetCommit persists committed offsets" {
     var broker = Broker.initWithConfig(testing.allocator, 1, 9092, .{ .data_dir = tmp_dir });
     defer broker.deinit();
     try broker.open();
+    try testing.expect(broker.ensureTopic("txn-offset-persist-topic"));
     const init_result = try initTxnOffsetCommitForTest(&broker, "txn-persist-id", "txn-offset-persist-group");
 
     const partitions = [_]Req.TxnOffsetCommitRequestTopic.TxnOffsetCommitRequestPartition{.{
@@ -17684,6 +17769,7 @@ test "Broker.handleRequest DescribeGroups rejects truncated request" {
 test "Broker.handleRequest OffsetCommit and OffsetFetch round-trip" {
     var broker = Broker.init(testing.allocator, 1, 9092);
     defer broker.deinit();
+    try testing.expect(broker.ensureTopic("oc-topic"));
 
     // OffsetCommit (key=8, v5)
     {
@@ -17740,6 +17826,7 @@ test "Broker.handleRequest OffsetCommit v8 returns generated response and commit
 
     var broker = Broker.init(testing.allocator, 1, 9092);
     defer broker.deinit();
+    try testing.expect(broker.ensureTopic("oc-generated-topic"));
     const joined = try broker.groups.joinGroup("oc-generated-group", null, "consumer", null);
 
     const partitions = [_]Partition{.{
@@ -17794,6 +17881,85 @@ test "Broker.handleRequest OffsetCommit v8 returns generated response and commit
     try testing.expect(committed_record != null);
     try testing.expectEqual(@as(i32, -1), committed_record.?.leader_epoch);
     try testing.expectEqualStrings("generated-meta", committed_record.?.metadata.?);
+}
+
+test "Broker.handleRequest OffsetCommit rejects unknown topic partitions without committing offsets" {
+    const Req = generated.offset_commit_request.OffsetCommitRequest;
+    const Resp = generated.offset_commit_response.OffsetCommitResponse;
+    const Topic = Req.OffsetCommitRequestTopic;
+    const Partition = Topic.OffsetCommitRequestPartition;
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+    try testing.expect(broker.ensureTopic("oc-known-topic"));
+
+    const known_partitions = [_]Partition{
+        .{
+            .partition_index = 0,
+            .committed_offset = 11,
+            .committed_leader_epoch = -1,
+            .committed_metadata = "valid",
+        },
+        .{
+            .partition_index = 1,
+            .committed_offset = 22,
+            .committed_leader_epoch = -1,
+            .committed_metadata = "stale",
+        },
+    };
+    const missing_partitions = [_]Partition{.{
+        .partition_index = 0,
+        .committed_offset = 33,
+        .committed_leader_epoch = -1,
+        .committed_metadata = "missing",
+    }};
+    const topics = [_]Topic{
+        .{
+            .name = "oc-known-topic",
+            .partitions = &known_partitions,
+        },
+        .{
+            .name = "oc-missing-topic",
+            .partitions = &missing_partitions,
+        },
+    };
+    const req = Req{
+        .group_id = "oc-validation-group",
+        .generation_id_or_member_epoch = -1,
+        .member_id = "",
+        .group_instance_id = null,
+        .topics = &topics,
+    };
+
+    var buf: [1024]u8 = undefined;
+    var pos = buildTestRequest(&buf, 8, 8, 811, header_mod.requestHeaderVersion(8, 8));
+    req.serialize(&buf, &pos, 8);
+
+    const response = broker.handleRequest(buf[0..pos]);
+    try testing.expect(response != null);
+    defer testing.allocator.free(response.?);
+
+    var rpos: usize = 0;
+    var response_header = try ResponseHeader.deserialize(testing.allocator, response.?, &rpos, header_mod.responseHeaderVersion(8, 8));
+    defer response_header.deinit(testing.allocator);
+    try testing.expectEqual(@as(i32, 811), response_header.correlation_id);
+
+    const resp = try Resp.deserialize(testing.allocator, response.?, &rpos, 8);
+    defer {
+        for (resp.topics) |topic| {
+            if (topic.partitions.len > 0) testing.allocator.free(topic.partitions);
+        }
+        if (resp.topics.len > 0) testing.allocator.free(resp.topics);
+    }
+
+    try testing.expectEqual(response.?.len, rpos);
+    try testing.expectEqual(@as(usize, 2), resp.topics.len);
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.none)), resp.topics[0].partitions[0].error_code);
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.unknown_topic_or_partition)), resp.topics[0].partitions[1].error_code);
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.unknown_topic_or_partition)), resp.topics[1].partitions[0].error_code);
+    try testing.expectEqual(@as(?i64, 11), try broker.groups.fetchOffset("oc-validation-group", "oc-known-topic", 0));
+    try testing.expectEqual(@as(?i64, null), try broker.groups.fetchOffset("oc-validation-group", "oc-known-topic", 1));
+    try testing.expectEqual(@as(?i64, null), try broker.groups.fetchOffset("oc-validation-group", "oc-missing-topic", 0));
 }
 
 test "Broker.handleRequest OffsetCommit rejects unknown managed member" {
@@ -17963,6 +18129,7 @@ test "Broker.handleRequest OffsetCommit reports coordinator commit failure per p
 
     var broker = Broker.init(testing.allocator, 1, 9092);
     defer broker.deinit();
+    try testing.expect(broker.ensureTopic("oc-fail-topic"));
 
     const partitions = [_]Partition{.{
         .partition_index = 0,
