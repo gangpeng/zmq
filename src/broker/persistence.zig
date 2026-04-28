@@ -133,6 +133,17 @@ pub const MetadataPersistence = struct {
         return values.toOwnedSlice();
     }
 
+    fn parseBoolFlag(text: []const u8) !bool {
+        if (std.mem.eql(u8, text, "0")) return false;
+        if (std.mem.eql(u8, text, "1")) return true;
+        return error.InvalidFlag;
+    }
+
+    fn decodeOptionalHexAlloc(allocator: Allocator, has_value_text: []const u8, hex_text: []const u8) !?[]u8 {
+        if (!try parseBoolFlag(has_value_text)) return null;
+        return try decodeHexAlloc(allocator, hex_text);
+    }
+
     fn freeAutoMqKvEntries(allocator: Allocator, entries: []AutoMqKvEntry) void {
         for (entries) |entry| {
             allocator.free(entry.key);
@@ -379,6 +390,317 @@ pub const MetadataPersistence = struct {
         return entries.toOwnedSlice();
     }
 
+    /// Save consumer-group lifecycle metadata to disk.
+    /// Format: nested TSV with hex-encoded IDs and binary assignments.
+    pub fn saveConsumerGroups(self: *MetadataPersistence, groups: anytype) !void {
+        const dir = self.data_dir orelse return;
+
+        const path = try std.fmt.allocPrint(self.allocator, "{s}/consumer_groups.meta", .{dir});
+        defer self.allocator.free(path);
+
+        const file = try fs.createFileAbsolute(path, .{ .truncate = true });
+        defer file.close();
+        const writer = file.writer();
+
+        var it = groups.iterator();
+        while (it.next()) |entry| {
+            const group = entry.value_ptr;
+            try file.writeAll("group_v1\t");
+            try writeHex(file, group.group_id);
+            try writer.print("\t{d}\t{d}\t{d}\t", .{
+                @intFromEnum(group.state),
+                group.generation_id,
+                group.next_member_id,
+            });
+            if (group.leader_id) |leader_id| {
+                try file.writeAll("1\t");
+                try writeHex(file, leader_id);
+            } else {
+                try file.writeAll("0\t");
+            }
+            try writer.print("\t{d}\t{d}\t{d}\n", .{
+                group.rebalance_timeout_ms,
+                group.session_timeout_ms,
+                group.members.count(),
+            });
+
+            var member_it = group.members.iterator();
+            while (member_it.next()) |member_entry| {
+                const member = member_entry.value_ptr;
+                try file.writeAll("member_v1\t");
+                try writeHex(file, member.member_id);
+
+                if (member.group_instance_id) |group_instance_id| {
+                    try file.writeAll("\t1\t");
+                    try writeHex(file, group_instance_id);
+                } else {
+                    try file.writeAll("\t0\t");
+                }
+
+                try writer.print("\t{d}\t", .{member.last_heartbeat_ms});
+
+                if (member.assignment) |assignment| {
+                    try file.writeAll("1\t");
+                    try writeHex(file, assignment);
+                } else {
+                    try file.writeAll("0\t");
+                }
+
+                if (member.protocol_name) |protocol_name| {
+                    try file.writeAll("\t1\t");
+                    try writeHex(file, protocol_name);
+                } else {
+                    try file.writeAll("\t0\t");
+                }
+
+                try writer.print("\t{d}", .{member.subscribed_topics.items.len});
+                for (member.subscribed_topics.items) |subscription| {
+                    try file.writeAll("\t");
+                    try writeHex(file, subscription);
+                }
+                try file.writeAll("\n");
+            }
+        }
+        try file.sync();
+    }
+
+    /// Load consumer-group lifecycle metadata from disk.
+    pub fn loadConsumerGroups(self: *MetadataPersistence) ![]ConsumerGroupEntry {
+        const dir = self.data_dir orelse return &.{};
+
+        const path = try std.fmt.allocPrint(self.allocator, "{s}/consumer_groups.meta", .{dir});
+        defer self.allocator.free(path);
+
+        const file = fs.openFileAbsolute(path, .{}) catch |err| {
+            log.debug("No consumer_groups.meta found: {}", .{err});
+            return &.{};
+        };
+        defer file.close();
+
+        const content = file.readToEndAlloc(self.allocator, 4 * 1024 * 1024) catch |err| {
+            log.warn("Failed to read consumer_groups.meta: {}", .{err});
+            return &.{};
+        };
+        defer self.allocator.free(content);
+
+        var entries = std.array_list.Managed(ConsumerGroupEntry).init(self.allocator);
+        errdefer {
+            self.freeConsumerGroupMemberEntriesFromGroups(entries.items);
+            entries.deinit();
+        }
+
+        var lines = std.mem.splitSequence(u8, content, "\n");
+        while (lines.next()) |line| {
+            if (line.len == 0) continue;
+
+            var fields = std.mem.splitSequence(u8, line, "\t");
+            const tag = fields.next() orelse continue;
+            if (!std.mem.eql(u8, tag, "group_v1")) continue;
+
+            const group_id_hex = fields.next() orelse continue;
+            const state_str = fields.next() orelse continue;
+            const generation_str = fields.next() orelse continue;
+            const next_member_id_str = fields.next() orelse continue;
+            const has_leader_str = fields.next() orelse continue;
+            const leader_hex = fields.next() orelse "";
+            const rebalance_timeout_str = fields.next() orelse continue;
+            const session_timeout_str = fields.next() orelse continue;
+            const member_count_str = fields.next() orelse continue;
+
+            const group_id = decodeHexAlloc(self.allocator, group_id_hex) catch continue;
+            const leader_id = decodeOptionalHexAlloc(self.allocator, has_leader_str, leader_hex) catch {
+                self.allocator.free(group_id);
+                continue;
+            };
+
+            const state = std.fmt.parseInt(u8, state_str, 10) catch {
+                self.allocator.free(group_id);
+                if (leader_id) |owned_leader| self.allocator.free(owned_leader);
+                continue;
+            };
+            const generation_id = std.fmt.parseInt(i32, generation_str, 10) catch {
+                self.allocator.free(group_id);
+                if (leader_id) |owned_leader| self.allocator.free(owned_leader);
+                continue;
+            };
+            const next_member_id = std.fmt.parseInt(u64, next_member_id_str, 10) catch {
+                self.allocator.free(group_id);
+                if (leader_id) |owned_leader| self.allocator.free(owned_leader);
+                continue;
+            };
+            const rebalance_timeout_ms = std.fmt.parseInt(i64, rebalance_timeout_str, 10) catch {
+                self.allocator.free(group_id);
+                if (leader_id) |owned_leader| self.allocator.free(owned_leader);
+                continue;
+            };
+            const session_timeout_ms = std.fmt.parseInt(i64, session_timeout_str, 10) catch {
+                self.allocator.free(group_id);
+                if (leader_id) |owned_leader| self.allocator.free(owned_leader);
+                continue;
+            };
+            const member_count = std.fmt.parseInt(usize, member_count_str, 10) catch {
+                self.allocator.free(group_id);
+                if (leader_id) |owned_leader| self.allocator.free(owned_leader);
+                continue;
+            };
+
+            var members = std.array_list.Managed(ConsumerGroupMemberEntry).init(self.allocator);
+            defer members.deinit();
+            var valid_group = true;
+            for (0..member_count) |_| {
+                const member_line = lines.next() orelse {
+                    valid_group = false;
+                    break;
+                };
+                var member_fields = std.mem.splitSequence(u8, member_line, "\t");
+                const member_tag = member_fields.next() orelse {
+                    valid_group = false;
+                    break;
+                };
+                if (!std.mem.eql(u8, member_tag, "member_v1")) {
+                    valid_group = false;
+                    break;
+                }
+
+                const member_id_hex = member_fields.next() orelse {
+                    valid_group = false;
+                    break;
+                };
+                const has_instance_str = member_fields.next() orelse {
+                    valid_group = false;
+                    break;
+                };
+                const instance_hex = member_fields.next() orelse "";
+                const heartbeat_str = member_fields.next() orelse {
+                    valid_group = false;
+                    break;
+                };
+                const has_assignment_str = member_fields.next() orelse {
+                    valid_group = false;
+                    break;
+                };
+                const assignment_hex = member_fields.next() orelse "";
+                const has_protocol_str = member_fields.next() orelse {
+                    valid_group = false;
+                    break;
+                };
+                const protocol_hex = member_fields.next() orelse "";
+                const subscription_count_str = member_fields.next() orelse {
+                    valid_group = false;
+                    break;
+                };
+
+                const member_id = decodeHexAlloc(self.allocator, member_id_hex) catch {
+                    valid_group = false;
+                    break;
+                };
+                const group_instance_id = decodeOptionalHexAlloc(self.allocator, has_instance_str, instance_hex) catch {
+                    self.allocator.free(member_id);
+                    valid_group = false;
+                    break;
+                };
+                const last_heartbeat_ms = std.fmt.parseInt(i64, heartbeat_str, 10) catch {
+                    self.allocator.free(member_id);
+                    if (group_instance_id) |owned_instance| self.allocator.free(owned_instance);
+                    valid_group = false;
+                    break;
+                };
+                const assignment = decodeOptionalHexAlloc(self.allocator, has_assignment_str, assignment_hex) catch {
+                    self.allocator.free(member_id);
+                    if (group_instance_id) |owned_instance| self.allocator.free(owned_instance);
+                    valid_group = false;
+                    break;
+                };
+                const protocol_name = decodeOptionalHexAlloc(self.allocator, has_protocol_str, protocol_hex) catch {
+                    self.allocator.free(member_id);
+                    if (group_instance_id) |owned_instance| self.allocator.free(owned_instance);
+                    if (assignment) |owned_assignment| self.allocator.free(owned_assignment);
+                    valid_group = false;
+                    break;
+                };
+                const subscription_count = std.fmt.parseInt(usize, subscription_count_str, 10) catch {
+                    self.allocator.free(member_id);
+                    if (group_instance_id) |owned_instance| self.allocator.free(owned_instance);
+                    if (assignment) |owned_assignment| self.allocator.free(owned_assignment);
+                    if (protocol_name) |owned_protocol| self.allocator.free(owned_protocol);
+                    valid_group = false;
+                    break;
+                };
+
+                var subscriptions = std.array_list.Managed([]u8).init(self.allocator);
+                defer subscriptions.deinit();
+                for (0..subscription_count) |_| {
+                    const subscription_hex = member_fields.next() orelse {
+                        valid_group = false;
+                        break;
+                    };
+                    const subscription = decodeHexAlloc(self.allocator, subscription_hex) catch {
+                        valid_group = false;
+                        break;
+                    };
+                    subscriptions.append(subscription) catch |err| {
+                        self.allocator.free(subscription);
+                        return err;
+                    };
+                }
+                if (!valid_group) {
+                    self.allocator.free(member_id);
+                    if (group_instance_id) |owned_instance| self.allocator.free(owned_instance);
+                    if (assignment) |owned_assignment| self.allocator.free(owned_assignment);
+                    if (protocol_name) |owned_protocol| self.allocator.free(owned_protocol);
+                    for (subscriptions.items) |subscription| self.allocator.free(subscription);
+                    break;
+                }
+
+                const owned_subscriptions = try subscriptions.toOwnedSlice();
+                members.append(.{
+                    .member_id = member_id,
+                    .group_instance_id = group_instance_id,
+                    .last_heartbeat_ms = last_heartbeat_ms,
+                    .assignment = assignment,
+                    .protocol_name = protocol_name,
+                    .subscriptions = owned_subscriptions,
+                }) catch |err| {
+                    self.allocator.free(member_id);
+                    if (group_instance_id) |owned_instance| self.allocator.free(owned_instance);
+                    if (assignment) |owned_assignment| self.allocator.free(owned_assignment);
+                    if (protocol_name) |owned_protocol| self.allocator.free(owned_protocol);
+                    for (owned_subscriptions) |subscription| self.allocator.free(subscription);
+                    if (owned_subscriptions.len > 0) self.allocator.free(owned_subscriptions);
+                    return err;
+                };
+            }
+
+            if (!valid_group) {
+                self.allocator.free(group_id);
+                if (leader_id) |owned_leader| self.allocator.free(owned_leader);
+                self.freeConsumerGroupMemberEntries(members.items);
+                continue;
+            }
+
+            const owned_members = try members.toOwnedSlice();
+            entries.append(.{
+                .group_id = group_id,
+                .state = state,
+                .generation_id = generation_id,
+                .next_member_id = next_member_id,
+                .leader_id = leader_id,
+                .rebalance_timeout_ms = rebalance_timeout_ms,
+                .session_timeout_ms = session_timeout_ms,
+                .members = owned_members,
+            }) catch |err| {
+                self.allocator.free(group_id);
+                if (leader_id) |owned_leader| self.allocator.free(owned_leader);
+                self.freeConsumerGroupMemberEntries(owned_members);
+                if (owned_members.len > 0) self.allocator.free(owned_members);
+                return err;
+            };
+        }
+
+        log.info("Loaded {d} consumer group(s) from consumer_groups.meta", .{entries.items.len});
+        return entries.toOwnedSlice();
+    }
+
     pub const TopicEntry = struct {
         name: []u8,
         num_partitions: i32,
@@ -394,6 +716,51 @@ pub const MetadataPersistence = struct {
         key: []u8,
         offset: i64,
     };
+
+    pub const ConsumerGroupMemberEntry = struct {
+        member_id: []u8,
+        group_instance_id: ?[]u8,
+        last_heartbeat_ms: i64,
+        assignment: ?[]u8,
+        protocol_name: ?[]u8,
+        subscriptions: [][]u8,
+    };
+
+    pub const ConsumerGroupEntry = struct {
+        group_id: []u8,
+        state: u8,
+        generation_id: i32,
+        next_member_id: u64,
+        leader_id: ?[]u8,
+        rebalance_timeout_ms: i64,
+        session_timeout_ms: i64,
+        members: []ConsumerGroupMemberEntry,
+    };
+
+    fn freeConsumerGroupMemberEntries(self: *MetadataPersistence, members: []ConsumerGroupMemberEntry) void {
+        for (members) |member| {
+            self.allocator.free(member.member_id);
+            if (member.group_instance_id) |group_instance_id| self.allocator.free(group_instance_id);
+            if (member.assignment) |assignment| self.allocator.free(assignment);
+            if (member.protocol_name) |protocol_name| self.allocator.free(protocol_name);
+            for (member.subscriptions) |subscription| self.allocator.free(subscription);
+            if (member.subscriptions.len > 0) self.allocator.free(member.subscriptions);
+        }
+    }
+
+    fn freeConsumerGroupMemberEntriesFromGroups(self: *MetadataPersistence, entries: []ConsumerGroupEntry) void {
+        for (entries) |entry| {
+            self.allocator.free(entry.group_id);
+            if (entry.leader_id) |leader_id| self.allocator.free(leader_id);
+            self.freeConsumerGroupMemberEntries(entry.members);
+            if (entry.members.len > 0) self.allocator.free(entry.members);
+        }
+    }
+
+    pub fn freeConsumerGroupEntries(self: *MetadataPersistence, entries: []ConsumerGroupEntry) void {
+        self.freeConsumerGroupMemberEntriesFromGroups(entries);
+        if (entries.len > 0) self.allocator.free(entries);
+    }
 
     pub const TransactionPartitionEntry = struct {
         topic: []const u8,

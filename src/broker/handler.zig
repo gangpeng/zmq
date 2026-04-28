@@ -16,6 +16,7 @@ const ApiVersionsResponse = api_versions_mod.ApiVersionsResponse;
 const DeleteGroupsResponse = delete_groups_mod.DeleteGroupsResponse;
 const PartitionStore = @import("partition_store.zig").PartitionStore;
 const GroupCoordinator = @import("group_coordinator.zig").GroupCoordinator;
+const ConsumerGroup = @import("group_coordinator.zig").ConsumerGroup;
 const TxnCoordinator = @import("txn_coordinator.zig").TransactionCoordinator;
 const QuotaManager = @import("quota_manager.zig").QuotaManager;
 const MetricRegistry = @import("metrics.zig").MetricRegistry;
@@ -594,6 +595,15 @@ pub const Broker = struct {
             };
         }
 
+        // Load persisted consumer-group lifecycle state after offsets so active
+        // group metadata can survive local broker restart.
+        const saved_consumer_groups = try self.persistence.loadConsumerGroups();
+        defer self.persistence.freeConsumerGroupEntries(saved_consumer_groups);
+        try self.restoreConsumerGroups(saved_consumer_groups);
+        if (saved_consumer_groups.len > 0) {
+            log.info("Restored {d} consumer group(s) from consumer_groups.meta", .{saved_consumer_groups.len});
+        }
+
         // Load persisted transaction state
         const txn_snapshot = try self.persistence.loadTransactions();
         defer self.persistence.freeTransactionSnapshot(txn_snapshot);
@@ -698,15 +708,19 @@ pub const Broker = struct {
     pub fn tick(self: *Broker) void {
         // Evict expired consumer group members (30 second timeout)
         const evicted = self.groups.evictExpiredMembers(30000);
+        var consumer_groups_dirty = false;
         if (evicted > 0) {
             log.info("Evicted {d} expired group members", .{evicted});
+            consumer_groups_dirty = true;
         }
 
         // Check for rebalance timeouts
         const forced = self.groups.checkRebalanceTimeouts();
         if (forced > 0) {
             log.info("Force-completed {d} timed-out rebalances", .{forced});
+            consumer_groups_dirty = true;
         }
+        if (consumer_groups_dirty) self.persistConsumerGroups();
 
         // Expire timed-out transactions (auto-abort after timeout_ms).
         // NOTE: AutoMQ/Kafka runs this check periodically to prevent resource leaks
@@ -1280,6 +1294,13 @@ pub const Broker = struct {
         };
     }
 
+    /// Persist consumer-group lifecycle state from the group coordinator.
+    fn persistConsumerGroups(self: *Broker) void {
+        self.persistence.saveConsumerGroups(&self.groups.groups) catch |err| {
+            log.warn("Failed to persist consumer group state: {}", .{err});
+        };
+    }
+
     /// Persist transaction coordinator state if it has changed since the last flush.
     fn persistTransactionsIfDirty(self: *Broker) void {
         if (!self.txn_coordinator.dirty) return;
@@ -1374,6 +1395,79 @@ pub const Broker = struct {
             errdefer restored.deinit(self.allocator);
 
             try self.partition_reassignments.put(owned_key, restored);
+        }
+    }
+
+    fn consumerGroupStateFromInt(value: u8) ?ConsumerGroup.GroupState {
+        return switch (value) {
+            0 => .empty,
+            1 => .preparing_rebalance,
+            2 => .completing_rebalance,
+            3 => .stable,
+            4 => .dead,
+            else => null,
+        };
+    }
+
+    fn restoreConsumerGroups(self: *Broker, entries: []const MetadataPersistence.ConsumerGroupEntry) !void {
+        for (entries) |entry| {
+            if (entry.group_id.len == 0) continue;
+            if (self.groups.groups.contains(entry.group_id)) continue;
+
+            const group_key = try self.allocator.dupe(u8, entry.group_id);
+            var group = ConsumerGroup.init(self.allocator, group_key);
+            errdefer {
+                group.deinit();
+                self.allocator.free(group_key);
+            }
+
+            group.state = consumerGroupStateFromInt(entry.state) orelse .empty;
+            group.generation_id = @max(entry.generation_id, 0);
+            group.next_member_id = @max(entry.next_member_id, 1);
+            group.rebalance_timeout_ms = @max(entry.rebalance_timeout_ms, 1);
+            group.session_timeout_ms = @max(entry.session_timeout_ms, 1);
+            if (entry.leader_id) |leader_id| {
+                group.leader_id = try self.allocator.dupe(u8, leader_id);
+            }
+
+            for (entry.members) |member_entry| {
+                if (member_entry.member_id.len == 0) continue;
+                if (group.members.contains(member_entry.member_id)) continue;
+
+                const member_id = try self.allocator.dupe(u8, member_entry.member_id);
+                var member = ConsumerGroup.GroupMember.initMember(self.allocator, member_id);
+                errdefer member.deinitMember(self.allocator);
+
+                member.last_heartbeat_ms = member_entry.last_heartbeat_ms;
+                if (member_entry.group_instance_id) |group_instance_id| {
+                    member.group_instance_id = try self.allocator.dupe(u8, group_instance_id);
+                }
+                if (member_entry.assignment) |assignment| {
+                    member.assignment = try self.allocator.dupe(u8, assignment);
+                }
+                if (member_entry.protocol_name) |protocol_name| {
+                    member.protocol_name = try self.allocator.dupe(u8, protocol_name);
+                }
+                for (member_entry.subscriptions) |subscription| {
+                    const subscription_copy = try self.allocator.dupe(u8, subscription);
+                    errdefer self.allocator.free(subscription_copy);
+                    try member.subscribed_topics.append(subscription_copy);
+                }
+
+                try group.members.put(member_id, member);
+            }
+
+            if (group.leader_id) |leader_id| {
+                if (!group.members.contains(leader_id)) {
+                    self.allocator.free(leader_id);
+                    group.leader_id = null;
+                }
+            }
+            if (group.members.count() == 0 and group.state != .dead) {
+                group.state = .empty;
+            }
+
+            try self.groups.groups.put(group_key, group);
         }
     }
 
@@ -3370,6 +3464,7 @@ pub const Broker = struct {
         const protocol_type = req.protocol_type orelse "consumer";
         const protocol_name = selectedJoinGroupProtocolName(req);
         const result = self.groups.joinGroupWithInstanceId(req.group_id orelse "", member_id, req.group_instance_id, protocol_type, null) catch return null;
+        if (result.error_code == @intFromEnum(ErrorCode.none)) self.persistConsumerGroups();
 
         var members: []Resp.JoinGroupResponseMember = &.{};
         if (result.is_leader) {
@@ -3478,19 +3573,24 @@ pub const Broker = struct {
 
         var top_error: i16 = @intFromEnum(ErrorCode.none);
         var member_responses: []MemberResponse = &.{};
+        var mutated = false;
         if (api_version >= 3) {
             member_responses = self.allocator.alloc(MemberResponse, req.members.len) catch return null;
             for (req.members, 0..) |member, i| {
                 const member_id = member.member_id orelse "";
+                const error_code = self.groups.leaveGroup(req.group_id orelse "", member_id);
+                if (error_code == @intFromEnum(ErrorCode.none)) mutated = true;
                 member_responses[i] = .{
                     .member_id = member.member_id,
                     .group_instance_id = member.group_instance_id,
-                    .error_code = self.groups.leaveGroup(req.group_id orelse "", member_id),
+                    .error_code = error_code,
                 };
             }
         } else {
             top_error = self.groups.leaveGroup(req.group_id orelse "", req.member_id orelse "");
+            if (top_error == @intFromEnum(ErrorCode.none)) mutated = true;
         }
+        if (mutated) self.persistConsumerGroups();
         defer if (member_responses.len > 0) self.allocator.free(member_responses);
 
         const resp = Resp{
@@ -4192,6 +4292,7 @@ pub const Broker = struct {
         const result = self.groups.syncGroup(req.group_id orelse "", req.member_id orelse "", req.generation_id, assignments) catch blk: {
             break :blk GroupCoord.SyncGroupResult{ .error_code = @intFromEnum(ErrorCode.not_coordinator), .assignment = null };
         };
+        if (assignments != null and result.error_code == @intFromEnum(ErrorCode.none)) self.persistConsumerGroups();
 
         const resp = Resp{
             .throttle_time_ms = 0,
@@ -5595,6 +5696,7 @@ pub const Broker = struct {
         defer results.deinit();
 
         const offsets_before = self.groups.committed_offsets.count();
+        var groups_mutated = false;
         for (0..num_groups) |_| {
             const group_id = if (flexible)
                 (ser.readCompactString(request_bytes, &pos) catch return null) orelse ""
@@ -5602,11 +5704,13 @@ pub const Broker = struct {
                 (ser.readString(request_bytes, &pos) catch return null) orelse "";
 
             const error_code = self.groups.deleteGroup(group_id);
+            if (error_code == @intFromEnum(ErrorCode.none)) groups_mutated = true;
             results.append(.{ .group_id = group_id, .error_code = error_code }) catch return null;
         }
 
         if (flexible) ser.skipTaggedFields(request_bytes, &pos) catch return null;
         if (self.groups.committed_offsets.count() != offsets_before) self.persistOffsets();
+        if (groups_mutated) self.persistConsumerGroups();
 
         const resp_body = DeleteGroupsResponse{
             .throttle_time_ms = 0,
@@ -11091,6 +11195,7 @@ test "Broker.handleRequest DeleteGroups persists removed offsets" {
     const join = try broker.groups.joinGroup("delete-offsets-group", null, "consumer", null);
     try testing.expectEqual(@as(i16, 0), broker.groups.leaveGroup("delete-offsets-group", join.member_id));
     try broker.groups.commitOffset("delete-offsets-group", "delete-offsets-topic", 0, 42);
+    broker.persistConsumerGroups();
     broker.persistOffsets();
 
     var buf: [256]u8 = undefined;
@@ -11114,6 +11219,10 @@ test "Broker.handleRequest DeleteGroups persists removed offsets" {
         testing.allocator.free(loaded);
     }
     try testing.expectEqual(@as(usize, 0), loaded.len);
+
+    const loaded_groups = try broker.persistence.loadConsumerGroups();
+    defer broker.persistence.freeConsumerGroupEntries(loaded_groups);
+    try testing.expectEqual(@as(usize, 0), loaded_groups.len);
 }
 
 test "Broker.handleRequest OffsetForLeaderEpoch v0 returns generated legacy response" {
@@ -15550,6 +15659,112 @@ test "Broker.handleRequest SyncGroup v5 returns generated response" {
 
     const group = broker.groups.groups.getPtr("sg-generated-group").?;
     try testing.expectEqual(@import("group_coordinator.zig").ConsumerGroup.GroupState.stable, group.state);
+}
+
+test "Broker.handleRequest JoinGroup and SyncGroup persist group state across restart" {
+    const fs = @import("fs_compat");
+    const JoinReq = generated.join_group_request.JoinGroupRequest;
+    const JoinProtocol = JoinReq.JoinGroupRequestProtocol;
+    const JoinResp = generated.join_group_response.JoinGroupResponse;
+    const SyncReq = generated.sync_group_request.SyncGroupRequest;
+    const SyncAssignment = SyncReq.SyncGroupRequestAssignment;
+    const SyncResp = generated.sync_group_response.SyncGroupResponse;
+
+    const tmp_dir = "/tmp/zmq-consumer-group-state-persist-test";
+    fs.deleteTreeAbsolute(tmp_dir) catch {};
+    try fs.makeDirAbsolute(tmp_dir);
+    defer fs.deleteTreeAbsolute(tmp_dir) catch {};
+
+    var member_id: ?[]u8 = null;
+    defer if (member_id) |owned_member_id| testing.allocator.free(owned_member_id);
+    var generation_id: i32 = 0;
+    const assignment_data = "restored-assignment";
+    {
+        var broker = Broker.initWithConfig(testing.allocator, 1, 9092, .{ .data_dir = tmp_dir });
+        defer broker.deinit();
+        try broker.open();
+
+        const protocols = [_]JoinProtocol{.{
+            .name = "range",
+            .metadata = "",
+        }};
+        const join_req = JoinReq{
+            .group_id = "persisted-group",
+            .session_timeout_ms = 30000,
+            .rebalance_timeout_ms = 300000,
+            .member_id = "",
+            .group_instance_id = null,
+            .protocol_type = "consumer",
+            .protocols = &protocols,
+            .reason = "persist-test",
+        };
+
+        var join_buf: [512]u8 = undefined;
+        var join_pos = buildTestRequest(&join_buf, 11, 9, 1111, header_mod.requestHeaderVersion(11, 9));
+        join_req.serialize(&join_buf, &join_pos, 9);
+
+        const join_response = broker.handleRequest(join_buf[0..join_pos]);
+        try testing.expect(join_response != null);
+        defer testing.allocator.free(join_response.?);
+
+        var join_rpos: usize = 0;
+        var join_header = try ResponseHeader.deserialize(testing.allocator, join_response.?, &join_rpos, header_mod.responseHeaderVersion(11, 9));
+        defer join_header.deinit(testing.allocator);
+        const join_resp = try JoinResp.deserialize(testing.allocator, join_response.?, &join_rpos, 9);
+        defer if (join_resp.members.len > 0) testing.allocator.free(join_resp.members);
+        try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.none)), join_resp.error_code);
+        member_id = try testing.allocator.dupe(u8, join_resp.member_id.?);
+        generation_id = join_resp.generation_id;
+
+        const sync_assignments = [_]SyncAssignment{.{
+            .member_id = member_id.?,
+            .assignment = assignment_data,
+        }};
+        const sync_req = SyncReq{
+            .group_id = "persisted-group",
+            .generation_id = generation_id,
+            .member_id = member_id.?,
+            .group_instance_id = null,
+            .protocol_type = "consumer",
+            .protocol_name = "range",
+            .assignments = &sync_assignments,
+        };
+
+        var sync_buf: [512]u8 = undefined;
+        var sync_pos = buildTestRequest(&sync_buf, 14, 5, 1415, header_mod.requestHeaderVersion(14, 5));
+        sync_req.serialize(&sync_buf, &sync_pos, 5);
+
+        const sync_response = broker.handleRequest(sync_buf[0..sync_pos]);
+        try testing.expect(sync_response != null);
+        defer testing.allocator.free(sync_response.?);
+
+        var sync_rpos: usize = 0;
+        var sync_header = try ResponseHeader.deserialize(testing.allocator, sync_response.?, &sync_rpos, header_mod.responseHeaderVersion(14, 5));
+        defer sync_header.deinit(testing.allocator);
+        const sync_resp = try SyncResp.deserialize(testing.allocator, sync_response.?, &sync_rpos, 5);
+        try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.none)), sync_resp.error_code);
+
+        const loaded = try broker.persistence.loadConsumerGroups();
+        defer broker.persistence.freeConsumerGroupEntries(loaded);
+        try testing.expectEqual(@as(usize, 1), loaded.len);
+        try testing.expectEqual(@as(u8, 3), loaded[0].state);
+        try testing.expectEqual(@as(usize, 1), loaded[0].members.len);
+        try testing.expectEqualStrings(assignment_data, loaded[0].members[0].assignment.?);
+    }
+
+    {
+        var restarted = Broker.initWithConfig(testing.allocator, 1, 9092, .{ .data_dir = tmp_dir });
+        defer restarted.deinit();
+        try restarted.open();
+
+        const group = restarted.groups.groups.getPtr("persisted-group").?;
+        try testing.expectEqual(ConsumerGroup.GroupState.stable, group.state);
+        try testing.expectEqual(generation_id, group.generation_id);
+        const member = group.members.getPtr(member_id.?).?;
+        try testing.expectEqualStrings(assignment_data, member.assignment.?);
+        try testing.expect(group.leader_id != null);
+        try testing.expectEqualStrings(member_id.?, group.leader_id.?);
+    }
 }
 
 test "Broker.handleRequest SyncGroup rejects truncated request" {
