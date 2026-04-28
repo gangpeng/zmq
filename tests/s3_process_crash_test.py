@@ -216,6 +216,93 @@ def wait_for_payload(topic, payloads):
     raise TestError(f"missing payloads after fetch retry: {missing!r}")
 
 
+def commit_offset(group, topic, offset, correlation_id):
+    body = write_string(group)
+    body += struct.pack(">i", -1)  # generation_id: simple commit
+    body += write_string("")  # member_id
+    body += struct.pack(">i", 1)  # topics
+    body += write_string(topic)
+    body += struct.pack(">i", 1)  # partitions
+    body += struct.pack(">i", 0)  # partition_index
+    body += struct.pack(">q", offset)
+    body += write_string("s3-process-crash")
+
+    response = kafka_request(8, 5, correlation_id, body)
+    payload = response[4:]
+    if len(payload) < 18:
+        raise TestError("OffsetCommit response too short")
+    pos = 4  # throttle_time_ms
+    topics = struct.unpack_from(">i", payload, pos)[0]
+    pos += 4
+    if topics != 1:
+        raise TestError(f"OffsetCommit topic response count={topics}")
+    name_len = struct.unpack_from(">h", payload, pos)[0]
+    pos += 2 + max(name_len, 0)
+    partitions = struct.unpack_from(">i", payload, pos)[0]
+    pos += 4
+    if partitions != 1:
+        raise TestError(f"OffsetCommit partition response count={partitions}")
+    partition = struct.unpack_from(">i", payload, pos)[0]
+    pos += 4
+    error_code = struct.unpack_from(">h", payload, pos)[0]
+    if partition != 0 or error_code != 0:
+        raise TestError(f"OffsetCommit partition={partition} error_code={error_code}")
+
+
+def fetch_committed_offset(group, topic, correlation_id):
+    body = write_string(group)
+    body += struct.pack(">i", 1)  # topics
+    body += write_string(topic)
+    body += struct.pack(">i", 1)  # partitions
+    body += struct.pack(">i", 0)
+
+    response = kafka_request(9, 1, correlation_id, body)
+    payload = response[4:]
+    if len(payload) < 26:
+        raise TestError("OffsetFetch response too short")
+    pos = 0
+    topics = struct.unpack_from(">i", payload, pos)[0]
+    pos += 4
+    if topics != 1:
+        raise TestError(f"OffsetFetch topic response count={topics}")
+    name_len = struct.unpack_from(">h", payload, pos)[0]
+    pos += 2 + max(name_len, 0)
+    partitions = struct.unpack_from(">i", payload, pos)[0]
+    pos += 4
+    if partitions != 1:
+        raise TestError(f"OffsetFetch partition response count={partitions}")
+    partition = struct.unpack_from(">i", payload, pos)[0]
+    pos += 4
+    committed = struct.unpack_from(">q", payload, pos)[0]
+    pos += 8
+    metadata_len = struct.unpack_from(">h", payload, pos)[0]
+    pos += 2 + max(metadata_len, 0)
+    error_code = struct.unpack_from(">h", payload, pos)[0]
+    if partition != 0 or error_code != 0:
+        raise TestError(f"OffsetFetch partition={partition} error_code={error_code}")
+    return committed
+
+
+def wait_for_committed_offset(group, topic, expected_offset):
+    deadline = time.time() + 20
+    correlation_id = 200
+    last_offset = None
+    last_error = None
+    while time.time() < deadline:
+        try:
+            last_offset = fetch_committed_offset(group, topic, correlation_id)
+            if last_offset == expected_offset:
+                return
+        except Exception as exc:
+            last_error = exc
+        correlation_id += 1
+        time.sleep(0.25)
+    raise TestError(
+        f"committed offset did not recover: expected={expected_offset} "
+        f"last_offset={last_offset} last_error={last_error}"
+    )
+
+
 def minio_health_url():
     endpoint = S3_ENDPOINT.rstrip("/")
     if endpoint.startswith("http://") or endpoint.startswith("https://"):
@@ -321,6 +408,7 @@ def main():
     tmp = tempfile.mkdtemp(prefix="zmq-s3-crash-")
     proc = None
     topic = f"s3-crash-{os.getpid()}-{int(time.time())}"
+    group = f"s3-crash-group-{os.getpid()}-{int(time.time())}"
     first = b"before-kill"
     second = b"after-replacement"
     try:
@@ -335,6 +423,8 @@ def main():
         if first_offset != 0:
             raise TestError(f"expected first offset 0, got {first_offset}")
         wait_for_payload(topic, [first])
+        commit_offset(group, topic, 1, 30)
+        wait_for_committed_offset(group, topic, 1)
 
         stop_broker(proc, crash=True)
         proc = None
@@ -342,6 +432,7 @@ def main():
 
         proc = start_broker(data_b, log_b)
         wait_for_payload(topic, [first])
+        wait_for_committed_offset(group, topic, 1)
         second_offset = produce(topic, second, 20)
         if second_offset <= first_offset:
             raise TestError(f"replacement did not advance offsets: {second_offset} <= {first_offset}")

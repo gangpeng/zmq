@@ -41,6 +41,7 @@ const CompactionManager = storage.CompactionManager;
 const JsonLogger = @import("core").JsonLogger;
 
 const max_offset_commit_metadata_bytes: usize = 4096;
+const offset_commit_record_value_magic = "ZMQOC1";
 const auto_mq_quorum_commit_timeout_ms: i64 = 5000;
 
 /// Stateful Kafka broker.
@@ -671,6 +672,11 @@ pub const Broker = struct {
         if (self.store.repairPartitionStatesFromObjectManager()) {
             log.info("Repaired partition state from recovered ObjectManager streams", .{});
             self.persistPartitionStates();
+        }
+        const recovered_offset_records = try self.restoreOffsetsFromConsumerOffsetsLog();
+        if (recovered_offset_records > 0) {
+            log.info("Restored {d} committed offset record(s) from __consumer_offsets", .{recovered_offset_records});
+            self.persistOffsets();
         }
 
         // Load ongoing partition reassignments after topics are available so
@@ -1547,17 +1553,88 @@ pub const Broker = struct {
         }
     }
 
+    const DecodedOffsetCommitRecord = struct {
+        offset: i64,
+        leader_epoch: i32,
+        metadata: ?[]const u8 = null,
+    };
+
+    fn encodeOffsetCommitRecordValue(self: *Broker, offset: i64, leader_epoch: i32, metadata: ?[]const u8) ![]u8 {
+        const metadata_len = if (metadata) |m| m.len else 0;
+        if (metadata_len > std.math.maxInt(u32)) return error.MetadataTooLarge;
+
+        const total_len = offset_commit_record_value_magic.len + 8 + 4 + 1 + 4 + metadata_len;
+        const value = try self.allocator.alloc(u8, total_len);
+        errdefer self.allocator.free(value);
+
+        var pos: usize = 0;
+        @memcpy(value[pos .. pos + offset_commit_record_value_magic.len], offset_commit_record_value_magic);
+        pos += offset_commit_record_value_magic.len;
+        std.mem.writeInt(i64, value[pos..][0..8], offset, .big);
+        pos += 8;
+        std.mem.writeInt(i32, value[pos..][0..4], leader_epoch, .big);
+        pos += 4;
+        value[pos] = if (metadata != null) 1 else 0;
+        pos += 1;
+        std.mem.writeInt(u32, value[pos..][0..4], @intCast(metadata_len), .big);
+        pos += 4;
+        if (metadata) |m| {
+            @memcpy(value[pos .. pos + m.len], m);
+        }
+
+        return value;
+    }
+
+    fn decodeOffsetCommitRecordValue(value: []const u8) ?DecodedOffsetCommitRecord {
+        if (value.len == 8) {
+            return .{
+                .offset = std.mem.readInt(i64, value[0..8], .big),
+                .leader_epoch = -1,
+                .metadata = null,
+            };
+        }
+        if (value.len < offset_commit_record_value_magic.len + 8 + 4 + 1 + 4) return null;
+        if (!std.mem.eql(u8, value[0..offset_commit_record_value_magic.len], offset_commit_record_value_magic)) return null;
+
+        var pos: usize = offset_commit_record_value_magic.len;
+        const offset = std.mem.readInt(i64, value[pos..][0..8], .big);
+        pos += 8;
+        const leader_epoch = std.mem.readInt(i32, value[pos..][0..4], .big);
+        pos += 4;
+        const has_metadata = value[pos] != 0;
+        pos += 1;
+        const metadata_len = std.mem.readInt(u32, value[pos..][0..4], .big);
+        pos += 4;
+        if (pos + metadata_len != value.len) return null;
+        const metadata: ?[]const u8 = if (has_metadata) value[pos .. pos + metadata_len] else null;
+        return .{
+            .offset = offset,
+            .leader_epoch = leader_epoch,
+            .metadata = metadata,
+        };
+    }
+
+    fn offsetCommitKeyParts(key: []const u8) ?struct { group_id: []const u8, topic: []const u8, partition: i32 } {
+        var fields = std.mem.splitSequence(u8, key, ":");
+        const group_id = fields.next() orelse return null;
+        const topic = fields.next() orelse return null;
+        const partition_text = fields.next() orelse return null;
+        if (fields.next() != null) return null;
+        if (group_id.len == 0 or topic.len == 0) return null;
+        const partition = std.fmt.parseInt(i32, partition_text, 10) catch return null;
+        return .{ .group_id = group_id, .topic = topic, .partition = partition };
+    }
+
     /// Write an offset commit as a RecordBatch record to __consumer_offsets.
-    /// This makes offset commits durable in the same format as Java Kafka.
+    /// This makes offset commits recoverable from shared WAL/object storage.
     /// The partition is hash(group_id) % 50.
-    fn writeOffsetCommitRecord(self: *Broker, group_id: []const u8, topic: []const u8, partition_id: i32, offset: i64) void {
+    fn writeOffsetCommitRecord(self: *Broker, group_id: []const u8, topic: []const u8, partition_id: i32, offset: i64, leader_epoch: i32, metadata: ?[]const u8) !void {
         // Build key: group_id + topic + partition (simple concatenation)
-        const key = std.fmt.allocPrint(self.allocator, "{s}:{s}:{d}", .{ group_id, topic, partition_id }) catch return;
+        const key = try std.fmt.allocPrint(self.allocator, "{s}:{s}:{d}", .{ group_id, topic, partition_id });
         defer self.allocator.free(key);
 
-        // Build value: offset as big-endian i64
-        var value_buf: [8]u8 = undefined;
-        std.mem.writeInt(i64, &value_buf, offset, .big);
+        const value = try self.encodeOffsetCommitRecordValue(offset, leader_epoch, metadata);
+        defer self.allocator.free(value);
 
         // Determine target partition in __consumer_offsets: hash(group_id) % 50
         var hasher = std.hash.Wyhash.init(0);
@@ -1570,11 +1647,11 @@ pub const Broker = struct {
             .{
                 .offset_delta = 0,
                 .key = key,
-                .value = &value_buf,
+                .value = value,
             },
         };
 
-        const batch = rec_batch.buildRecordBatch(
+        const batch = try rec_batch.buildRecordBatch(
             self.allocator,
             0, // base_offset (will be rewritten by produce())
             &records,
@@ -1584,15 +1661,69 @@ pub const Broker = struct {
             @import("time_compat").milliTimestamp(),
             @import("time_compat").milliTimestamp(),
             0, // attributes (no compression)
-        ) catch return;
+        );
         defer self.allocator.free(batch);
 
         // Write to __consumer_offsets partition store
-        _ = self.store.produce("__consumer_offsets", target_partition, batch) catch |err| {
-            log.debug("Failed to write offset commit record: {}", .{err});
-            return;
-        };
+        _ = try self.store.produce("__consumer_offsets", target_partition, batch);
         self.persistPartitionStates();
+    }
+
+    fn restoreOffsetsFromConsumerOffsetsLog(self: *Broker) !usize {
+        const info = self.topics.get("__consumer_offsets") orelse return 0;
+        if (info.num_partitions <= 0) return 0;
+
+        var restored: usize = 0;
+        for (0..@as(usize, @intCast(info.num_partitions))) |partition_index| {
+            const result = try self.store.fetch("__consumer_offsets", @intCast(partition_index), 0, 64 * 1024 * 1024);
+            defer if (result.records.len > 0) self.allocator.free(@constCast(result.records));
+            if (result.error_code != @intFromEnum(ErrorCode.none)) return error.ConsumerOffsetsLogUnavailable;
+            restored += try self.applyConsumerOffsetRecordBatches(result.records);
+        }
+        return restored;
+    }
+
+    fn applyConsumerOffsetRecordBatches(self: *Broker, batches: []const u8) !usize {
+        const rec_batch = protocol.record_batch;
+        var pos: usize = 0;
+        var restored: usize = 0;
+
+        while (pos + rec_batch.BATCH_HEADER_SIZE <= batches.len) {
+            const header = rec_batch.RecordBatchHeader.parse(batches[pos..]) catch break;
+            const batch_size = header.totalBatchSize();
+            if (batch_size == 0 or pos + batch_size > batches.len) break;
+
+            if (header.magic == 2 and !header.isControlBatch() and header.record_count > 0) {
+                var record_pos = pos + rec_batch.BATCH_HEADER_SIZE;
+                const batch_end = pos + batch_size;
+                for (0..@as(usize, @intCast(header.record_count))) |_| {
+                    if (record_pos >= batch_end) break;
+                    const record = rec_batch.parseRecord(batches, &record_pos) catch break;
+                    const key = record.key orelse continue;
+                    const value = record.value orelse continue;
+                    if (try self.applyConsumerOffsetRecord(key, value)) restored += 1;
+                }
+            }
+
+            pos += batch_size;
+        }
+
+        return restored;
+    }
+
+    fn applyConsumerOffsetRecord(self: *Broker, key: []const u8, value: []const u8) !bool {
+        const parts = offsetCommitKeyParts(key) orelse return false;
+        const decoded = decodeOffsetCommitRecordValue(value) orelse return false;
+
+        try self.groups.commitOffsetWithMetadata(
+            parts.group_id,
+            parts.topic,
+            parts.partition,
+            decoded.offset,
+            decoded.leader_epoch,
+            decoded.metadata,
+        );
+        return true;
     }
 
     /// Process a raw Kafka protocol request frame and return the response.
@@ -3947,14 +4078,16 @@ pub const Broker = struct {
                     if (metadata_error != ErrorCode.none) break :blk @intFromEnum(metadata_error);
                     if (!self.topicPartitionExists(topic_name, partition_id)) break :blk @intFromEnum(ErrorCode.unknown_topic_or_partition);
 
+                    self.writeOffsetCommitRecord(group_id, topic_name, partition_id, offset, partition_req.committed_leader_epoch, partition_req.committed_metadata) catch |err| {
+                        log.warn("OffsetCommit internal-log write failed for {s}:{s}:{d}: {}", .{ group_id, topic_name, partition_id, err });
+                        break :blk @intFromEnum(ErrorCode.kafka_storage_error);
+                    };
+
                     self.groups.commitOffsetWithMetadataAndLag(group_id, topic_name, partition_id, offset, partition_req.committed_leader_epoch, partition_req.committed_metadata, leo) catch |err| {
                         log.warn("OffsetCommit failed for {s}:{s}:{d}: {}", .{ group_id, topic_name, partition_id, err });
                         break :blk @intFromEnum(ErrorCode.kafka_storage_error);
                     };
 
-                    // Write offset commit as a RecordBatch to __consumer_offsets
-                    // The partition in __consumer_offsets is determined by hash(group_id) % 50
-                    self.writeOffsetCommitRecord(group_id, topic_name, partition_id, offset);
                     mutated = true;
                     break :blk @intFromEnum(ErrorCode.none);
                 };
@@ -9867,6 +10000,11 @@ pub const Broker = struct {
                     const metadata_error = validateOffsetCommitMetadata(partition_req.committed_metadata);
                     if (metadata_error != ErrorCode.none) break :blk @intFromEnum(metadata_error);
                     if (!self.topicPartitionExists(topic, partition_req.partition_index)) break :blk @intFromEnum(ErrorCode.unknown_topic_or_partition);
+
+                    self.writeOffsetCommitRecord(group_id, topic, partition_req.partition_index, partition_req.committed_offset, partition_req.committed_leader_epoch, partition_req.committed_metadata) catch |err| {
+                        log.warn("TxnOffsetCommit internal-log write failed for {s}:{s}:{d}: {}", .{ group_id, topic, partition_req.partition_index, err });
+                        break :blk @intFromEnum(ErrorCode.kafka_storage_error);
+                    };
 
                     self.groups.commitOffsetWithMetadata(group_id, topic, partition_req.partition_index, partition_req.committed_offset, partition_req.committed_leader_epoch, partition_req.committed_metadata) catch |err| {
                         log.warn("TxnOffsetCommit failed for {s}:{s}:{d}: {}", .{ group_id, topic, partition_req.partition_index, err });
@@ -19183,6 +19321,50 @@ test "Broker resumes S3 WAL writes after stateless replacement" {
         defer if (merged.records.len > 0) testing.allocator.free(@constCast(merged.records));
         try testing.expectEqual(@as(i16, 0), merged.error_code);
         try testing.expectEqualStrings("first-second", merged.records);
+    }
+}
+
+test "Broker restores committed offsets from S3 consumer offsets log" {
+    var mock_s3 = storage.MockS3.init(testing.allocator);
+    defer mock_s3.deinit();
+    const s3_storage = storage.S3Storage.initMock(testing.allocator, &mock_s3);
+
+    {
+        var broker = Broker.init(testing.allocator, 1, 9092);
+        defer broker.deinit();
+        broker.store.s3_wal_mode = true;
+        broker.store.s3_storage = s3_storage;
+        broker.store.s3_wal_batcher = storage.wal.S3WalBatcher.init(testing.allocator);
+
+        try broker.open();
+        try broker.writeOffsetCommitRecord(
+            "stateless-offset-group",
+            "stateless-offset-topic",
+            0,
+            42,
+            7,
+            "offset-meta",
+        );
+    }
+
+    {
+        var broker = Broker.init(testing.allocator, 1, 9092);
+        defer broker.deinit();
+        broker.store.s3_wal_mode = true;
+        broker.store.s3_storage = s3_storage;
+        broker.store.s3_wal_batcher = storage.wal.S3WalBatcher.init(testing.allocator);
+
+        try broker.open();
+
+        const restored = try broker.groups.fetchOffsetRecord(
+            "stateless-offset-group",
+            "stateless-offset-topic",
+            0,
+        );
+        try testing.expect(restored != null);
+        try testing.expectEqual(@as(i64, 42), restored.?.offset);
+        try testing.expectEqual(@as(i32, 7), restored.?.leader_epoch);
+        try testing.expectEqualStrings("offset-meta", restored.?.metadata.?);
     }
 }
 
