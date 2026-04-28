@@ -7583,6 +7583,8 @@ pub const Broker = struct {
             const topics = self.allocator.alloc(TopicResult, marker.topics.len) catch return null;
             var topics_init: usize = 0;
             var topics_transferred = false;
+            const marker_validation_error = self.validateLocalWriteTxnMarkerState(marker);
+            var marker_has_partition_error = marker_validation_error != @intFromEnum(ErrorCode.none);
             defer {
                 if (!topics_transferred) {
                     self.freeWriteTxnMarkerTopicResults(topics[0..topics_init]);
@@ -7597,12 +7599,16 @@ pub const Broker = struct {
 
                 const topic = topic_req.name orelse "";
                 for (topic_req.partition_indexes, 0..) |partition_index, partition_idx| {
-                    const write_result = self.writeTxnMarkerPartition(marker, topic, partition_index);
+                    const write_result: TxnMarkerPartitionWriteResult = if (marker_validation_error == @intFromEnum(ErrorCode.none))
+                        self.writeTxnMarkerPartition(marker, topic, partition_index)
+                    else
+                        .{ .error_code = marker_validation_error };
                     partitions[partition_idx] = .{
                         .partition_index = partition_index,
                         .error_code = write_result.error_code,
                     };
                     if (write_result.mutated) partition_state_dirty = true;
+                    if (write_result.error_code != @intFromEnum(ErrorCode.none)) marker_has_partition_error = true;
                 }
 
                 topics[topics_init] = .{
@@ -7613,9 +7619,11 @@ pub const Broker = struct {
                 partitions_transferred = true;
             }
 
-            const coordinator_error = self.completeLocalWriteTxnMarkerState(marker.producer_id);
-            if (coordinator_error != @intFromEnum(ErrorCode.none)) {
-                applyWriteTxnMarkerError(topics[0..topics_init], coordinator_error);
+            if (!marker_has_partition_error) {
+                const coordinator_error = self.completeLocalWriteTxnMarkerState(marker.producer_id);
+                if (coordinator_error != @intFromEnum(ErrorCode.none)) {
+                    applyWriteTxnMarkerError(topics[0..topics_init], coordinator_error);
+                }
             }
 
             markers[markers_init] = .{
@@ -7663,6 +7671,16 @@ pub const Broker = struct {
         error_code: i16,
         mutated: bool = false,
     };
+
+    fn validateLocalWriteTxnMarkerState(self: *Broker, marker: generated.write_txn_markers_request.WriteTxnMarkersRequest.WritableTxnMarker) i16 {
+        const txn = self.txn_coordinator.transactions.get(marker.producer_id) orelse return @intFromEnum(ErrorCode.none);
+        if (txn.producer_epoch != marker.producer_epoch) return @intFromEnum(ErrorCode.invalid_producer_epoch);
+
+        const expected_status: TxnCoordinator.TxnStatus = if (marker.transaction_result) .prepare_commit else .prepare_abort;
+        if (txn.status != expected_status) return @intFromEnum(ErrorCode.invalid_txn_state);
+
+        return @intFromEnum(ErrorCode.none);
+    }
 
     fn writeTxnMarkerPartition(self: *Broker, marker: generated.write_txn_markers_request.WriteTxnMarkersRequest.WritableTxnMarker, topic: []const u8, partition_index: i32) TxnMarkerPartitionWriteResult {
         if (topic.len == 0 or partition_index < 0) {
@@ -11584,6 +11602,187 @@ test "Broker.handleRequest WriteTxnMarkers v1 returns generated response and wri
     try testing.expectEqual(@as(u64, 1), state.high_watermark);
     try testing.expectEqual(@as(u64, 1), state.last_stable_offset);
     try testing.expect(state.first_unstable_txn_offset == null);
+}
+
+test "Broker.handleRequest WriteTxnMarkers rejects mismatched local producer epoch" {
+    const Req = generated.write_txn_markers_request.WriteTxnMarkersRequest;
+    const Resp = generated.write_txn_markers_response.WriteTxnMarkersResponse;
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+    try testing.expect(broker.ensureTopic("txn-marker-epoch-topic"));
+
+    const init_result = try broker.txn_coordinator.initProducerId("txn-marker-epoch");
+    const pid = init_result.producer_id;
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.none)), try broker.txn_coordinator.addPartitionsToTxn(pid, init_result.producer_epoch, "txn-marker-epoch-topic", 0));
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.none)), broker.txn_coordinator.endTxn(pid, init_result.producer_epoch, true));
+
+    const partition_indexes = [_]i32{0};
+    const topics = [_]Req.WritableTxnMarker.WritableTxnMarkerTopic{.{
+        .name = "txn-marker-epoch-topic",
+        .partition_indexes = &partition_indexes,
+    }};
+    const markers = [_]Req.WritableTxnMarker{.{
+        .producer_id = pid,
+        .producer_epoch = init_result.producer_epoch + 1,
+        .transaction_result = true,
+        .topics = &topics,
+        .coordinator_epoch = 0,
+    }};
+    const req = Req{ .markers = &markers };
+
+    var buf: [512]u8 = undefined;
+    var pos = buildTestRequest(&buf, 27, 1, 2704, header_mod.requestHeaderVersion(27, 1));
+    req.serialize(&buf, &pos, 1);
+
+    const response = broker.handleRequest(buf[0..pos]);
+    try testing.expect(response != null);
+    defer testing.allocator.free(response.?);
+
+    var rpos: usize = 0;
+    var response_header = try ResponseHeader.deserialize(testing.allocator, response.?, &rpos, header_mod.responseHeaderVersion(27, 1));
+    defer response_header.deinit(testing.allocator);
+    try testing.expectEqual(@as(i32, 2704), response_header.correlation_id);
+
+    const resp = try Resp.deserialize(testing.allocator, response.?, &rpos, 1);
+    defer {
+        for (resp.markers) |marker| {
+            for (marker.topics) |topic| {
+                if (topic.partitions.len > 0) testing.allocator.free(topic.partitions);
+            }
+            if (marker.topics.len > 0) testing.allocator.free(marker.topics);
+        }
+        if (resp.markers.len > 0) testing.allocator.free(resp.markers);
+    }
+
+    try testing.expectEqual(response.?.len, rpos);
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.invalid_producer_epoch)), resp.markers[0].topics[0].partitions[0].error_code);
+    try testing.expectEqual(TxnCoordinator.TxnStatus.prepare_commit, broker.txn_coordinator.getStatus(pid).?);
+
+    const state = broker.store.partitions.get("txn-marker-epoch-topic-0").?;
+    try testing.expectEqual(@as(u64, 0), state.next_offset);
+    try testing.expectEqual(@as(u64, 0), state.high_watermark);
+}
+
+test "Broker.handleRequest WriteTxnMarkers rejects local marker result for wrong transaction state" {
+    const Req = generated.write_txn_markers_request.WriteTxnMarkersRequest;
+    const Resp = generated.write_txn_markers_response.WriteTxnMarkersResponse;
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+    try testing.expect(broker.ensureTopic("txn-marker-state-topic"));
+
+    const init_result = try broker.txn_coordinator.initProducerId("txn-marker-state");
+    const pid = init_result.producer_id;
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.none)), try broker.txn_coordinator.addPartitionsToTxn(pid, init_result.producer_epoch, "txn-marker-state-topic", 0));
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.none)), broker.txn_coordinator.endTxn(pid, init_result.producer_epoch, false));
+
+    const partition_indexes = [_]i32{0};
+    const topics = [_]Req.WritableTxnMarker.WritableTxnMarkerTopic{.{
+        .name = "txn-marker-state-topic",
+        .partition_indexes = &partition_indexes,
+    }};
+    const markers = [_]Req.WritableTxnMarker{.{
+        .producer_id = pid,
+        .producer_epoch = init_result.producer_epoch,
+        .transaction_result = true,
+        .topics = &topics,
+        .coordinator_epoch = 0,
+    }};
+    const req = Req{ .markers = &markers };
+
+    var buf: [512]u8 = undefined;
+    var pos = buildTestRequest(&buf, 27, 1, 2705, header_mod.requestHeaderVersion(27, 1));
+    req.serialize(&buf, &pos, 1);
+
+    const response = broker.handleRequest(buf[0..pos]);
+    try testing.expect(response != null);
+    defer testing.allocator.free(response.?);
+
+    var rpos: usize = 0;
+    var response_header = try ResponseHeader.deserialize(testing.allocator, response.?, &rpos, header_mod.responseHeaderVersion(27, 1));
+    defer response_header.deinit(testing.allocator);
+    try testing.expectEqual(@as(i32, 2705), response_header.correlation_id);
+
+    const resp = try Resp.deserialize(testing.allocator, response.?, &rpos, 1);
+    defer {
+        for (resp.markers) |marker| {
+            for (marker.topics) |topic| {
+                if (topic.partitions.len > 0) testing.allocator.free(topic.partitions);
+            }
+            if (marker.topics.len > 0) testing.allocator.free(marker.topics);
+        }
+        if (resp.markers.len > 0) testing.allocator.free(resp.markers);
+    }
+
+    try testing.expectEqual(response.?.len, rpos);
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.invalid_txn_state)), resp.markers[0].topics[0].partitions[0].error_code);
+    try testing.expectEqual(TxnCoordinator.TxnStatus.prepare_abort, broker.txn_coordinator.getStatus(pid).?);
+
+    const state = broker.store.partitions.get("txn-marker-state-topic-0").?;
+    try testing.expectEqual(@as(u64, 0), state.next_offset);
+    try testing.expectEqual(@as(u64, 0), state.high_watermark);
+}
+
+test "Broker.handleRequest WriteTxnMarkers preserves local transaction when partition write fails" {
+    const Req = generated.write_txn_markers_request.WriteTxnMarkersRequest;
+    const Resp = generated.write_txn_markers_response.WriteTxnMarkersResponse;
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+    try testing.expect(broker.ensureTopic("txn-marker-partition-error-topic"));
+
+    const init_result = try broker.txn_coordinator.initProducerId("txn-marker-partition-error");
+    const pid = init_result.producer_id;
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.none)), try broker.txn_coordinator.addPartitionsToTxn(pid, init_result.producer_epoch, "txn-marker-partition-error-topic", 0));
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.none)), broker.txn_coordinator.endTxn(pid, init_result.producer_epoch, true));
+
+    const partition_indexes = [_]i32{0};
+    const topics = [_]Req.WritableTxnMarker.WritableTxnMarkerTopic{.{
+        .name = "missing-local-marker-topic",
+        .partition_indexes = &partition_indexes,
+    }};
+    const markers = [_]Req.WritableTxnMarker{.{
+        .producer_id = pid,
+        .producer_epoch = init_result.producer_epoch,
+        .transaction_result = true,
+        .topics = &topics,
+        .coordinator_epoch = 0,
+    }};
+    const req = Req{ .markers = &markers };
+
+    var buf: [512]u8 = undefined;
+    var pos = buildTestRequest(&buf, 27, 1, 2706, header_mod.requestHeaderVersion(27, 1));
+    req.serialize(&buf, &pos, 1);
+
+    const response = broker.handleRequest(buf[0..pos]);
+    try testing.expect(response != null);
+    defer testing.allocator.free(response.?);
+
+    var rpos: usize = 0;
+    var response_header = try ResponseHeader.deserialize(testing.allocator, response.?, &rpos, header_mod.responseHeaderVersion(27, 1));
+    defer response_header.deinit(testing.allocator);
+    try testing.expectEqual(@as(i32, 2706), response_header.correlation_id);
+
+    const resp = try Resp.deserialize(testing.allocator, response.?, &rpos, 1);
+    defer {
+        for (resp.markers) |marker| {
+            for (marker.topics) |topic| {
+                if (topic.partitions.len > 0) testing.allocator.free(topic.partitions);
+            }
+            if (marker.topics.len > 0) testing.allocator.free(marker.topics);
+        }
+        if (resp.markers.len > 0) testing.allocator.free(resp.markers);
+    }
+
+    try testing.expectEqual(response.?.len, rpos);
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.unknown_topic_or_partition)), resp.markers[0].topics[0].partitions[0].error_code);
+    try testing.expectEqual(TxnCoordinator.TxnStatus.prepare_commit, broker.txn_coordinator.getStatus(pid).?);
+
+    const txn = broker.txn_coordinator.transactions.get(pid).?;
+    try testing.expectEqual(@as(usize, 1), txn.partitions.items.len);
+    try testing.expectEqualStrings("txn-marker-partition-error-topic", txn.partitions.items[0].topic);
+    try testing.expectEqual(@as(i32, 0), txn.partitions.items[0].partition);
 }
 
 test "Broker.handleRequest WriteTxnMarkers rejects unknown topic partition" {
