@@ -3998,7 +3998,7 @@ pub const Broker = struct {
                 error_code = @intFromEnum(ErrorCode.invalid_topic_exception);
             } else if (self.topics.contains(topic_name)) {
                 error_code = @intFromEnum(ErrorCode.topic_already_exists);
-            } else if (hasInvalidCreateTopicAssignments(topic_req.assignments)) {
+            } else if (hasInvalidCreateTopicAssignments(topic_req.assignments, self.node_id)) {
                 error_code = @intFromEnum(ErrorCode.invalid_replica_assignment);
             } else if (actual_partitions <= 0) {
                 error_code = @intFromEnum(ErrorCode.invalid_partitions);
@@ -4086,14 +4086,19 @@ pub const Broker = struct {
         return if (topic_req.replication_factor <= 0) self.default_replication_factor else topic_req.replication_factor;
     }
 
-    fn hasInvalidCreateTopicAssignments(assignments: []const generated.create_topics_request.CreateTopicsRequest.CreatableTopic.CreatableReplicaAssignment) bool {
+    fn hasInvalidCreateTopicAssignments(assignments: []const generated.create_topics_request.CreateTopicsRequest.CreatableTopic.CreatableReplicaAssignment, node_id: i32) bool {
+        if (assignments.len == 0) return false;
+
+        var max_partition: i32 = -1;
         for (assignments, 0..) |assignment, assignment_idx| {
             if (assignment.partition_index < 0) return true;
+            if (assignment.broker_ids.len != 1 or assignment.broker_ids[0] != node_id) return true;
+            if (assignment.partition_index > max_partition) max_partition = assignment.partition_index;
             for (assignments[assignment_idx + 1 ..]) |other| {
                 if (assignment.partition_index == other.partition_index) return true;
             }
         }
-        return false;
+        return max_partition + 1 != @as(i32, @intCast(assignments.len));
     }
 
     fn applyCreateTopicConfigs(
@@ -15636,6 +15641,54 @@ test "Broker.handleRequest CreateTopics rejects unsupported topic config" {
     try testing.expectEqual(@as(usize, 1), resp.topics.len);
     try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.invalid_config)), resp.topics[0].error_code);
     try testing.expect(!broker.topics.contains("ct-invalid-config-topic"));
+}
+
+test "Broker.handleRequest CreateTopics rejects unsupported manual assignments" {
+    const Req = generated.create_topics_request.CreateTopicsRequest;
+    const Resp = generated.create_topics_response.CreateTopicsResponse;
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+
+    const remote_brokers = [_]i32{2};
+    const assignments = [_]Req.CreatableTopic.CreatableReplicaAssignment{.{
+        .partition_index = 0,
+        .broker_ids = &remote_brokers,
+    }};
+    const topics = [_]Req.CreatableTopic{.{
+        .name = "ct-remote-assignment-topic",
+        .num_partitions = -1,
+        .replication_factor = -1,
+        .assignments = &assignments,
+    }};
+    const req = Req{
+        .topics = &topics,
+        .timeout_ms = 30000,
+        .validate_only = false,
+    };
+
+    var buf: [512]u8 = undefined;
+    var pos = buildTestRequest(&buf, 19, 7, 1919, header_mod.requestHeaderVersion(19, 7));
+    req.serialize(&buf, &pos, 7);
+
+    const response = broker.handleRequest(buf[0..pos]);
+    try testing.expect(response != null);
+    defer testing.allocator.free(response.?);
+
+    var rpos: usize = 0;
+    var response_header = try ResponseHeader.deserialize(testing.allocator, response.?, &rpos, header_mod.responseHeaderVersion(19, 7));
+    defer response_header.deinit(testing.allocator);
+    const resp = try Resp.deserialize(testing.allocator, response.?, &rpos, 7);
+    defer {
+        for (resp.topics) |topic| {
+            if (topic.configs.len > 0) testing.allocator.free(topic.configs);
+        }
+        if (resp.topics.len > 0) testing.allocator.free(resp.topics);
+    }
+
+    try testing.expectEqual(@as(usize, 1), resp.topics.len);
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.invalid_replica_assignment)), resp.topics[0].error_code);
+    try testing.expect(!broker.topics.contains("ct-remote-assignment-topic"));
 }
 
 test "Broker.handleRequest CreateTopics validate_only does not create topic" {
