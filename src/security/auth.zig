@@ -494,6 +494,40 @@ pub const ScramSha256Authenticator = struct {
         });
     }
 
+    /// Upsert a user with Kafka AlterUserScramCredentials pre-computed material.
+    pub fn putCredential(self: *ScramSha256Authenticator, username: []const u8, salt: [32]u8, iterations: u32, salted_password: [32]u8) !void {
+        if (self.users.fetchRemove(username)) |old| {
+            self.allocator.free(old.key);
+        }
+
+        const user_copy = try self.allocator.dupe(u8, username);
+        errdefer self.allocator.free(user_copy);
+
+        var client_key: [32]u8 = undefined;
+        hmacSha256(&salted_password, "Client Key", &client_key);
+
+        var stored_key: [32]u8 = undefined;
+        std.crypto.hash.sha2.Sha256.hash(&client_key, &stored_key, .{});
+
+        var server_key: [32]u8 = undefined;
+        hmacSha256(&salted_password, "Server Key", &server_key);
+
+        try self.users.put(user_copy, .{
+            .salt = salt,
+            .iterations = iterations,
+            .stored_key = stored_key,
+            .server_key = server_key,
+        });
+    }
+
+    pub fn removeUser(self: *ScramSha256Authenticator, username: []const u8) bool {
+        if (self.users.fetchRemove(username)) |old| {
+            self.allocator.free(old.key);
+            return true;
+        }
+        return false;
+    }
+
     /// Look up a user's SCRAM credential.
     pub fn getCredential(self: *const ScramSha256Authenticator, username: []const u8) ?ScramCredential {
         return self.users.get(username);
