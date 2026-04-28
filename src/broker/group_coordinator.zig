@@ -997,6 +997,17 @@ pub const GroupCoordinator = struct {
         return false;
     }
 
+    pub fn groupHasSubscription(self: *const GroupCoordinator, group_id: []const u8, topic: []const u8) bool {
+        const group = self.groups.getPtr(group_id) orelse return false;
+        var member_it = group.members.iterator();
+        while (member_it.next()) |entry| {
+            for (entry.value_ptr.subscribed_topics.items) |subscribed_topic| {
+                if (std.mem.eql(u8, subscribed_topic, topic)) return true;
+            }
+        }
+        return false;
+    }
+
     pub const CommittedOffset = struct {
         topic: []const u8,
         partition: i32,
