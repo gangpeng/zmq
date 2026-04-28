@@ -5698,20 +5698,38 @@ pub const Broker = struct {
         hasher.update(group_id);
         const target_partition: i32 = @intCast(hasher.final() % 50);
 
-        // Add __consumer_offsets partition to the transaction
-        const error_code = self.txn_coordinator.addPartitionsToTxn(
-            req.producer_id,
-            req.producer_epoch,
-            "__consumer_offsets",
-            target_partition,
-        ) catch 48; // INVALID_PRODUCER_ID_MAPPING on error
-        self.persistTransactionsIfDirty();
+        var error_code = self.validateAddOffsetsToTxnState(req.transactional_id, req.producer_id, req.producer_epoch, group_id, target_partition);
+        if (error_code == @intFromEnum(ErrorCode.none)) {
+            // Add __consumer_offsets partition to the transaction only after all
+            // request and internal-topic preconditions pass.
+            error_code = self.txn_coordinator.addPartitionsToTxn(
+                req.producer_id,
+                req.producer_epoch,
+                "__consumer_offsets",
+                target_partition,
+            ) catch @intFromEnum(ErrorCode.kafka_storage_error);
+            self.persistTransactionsIfDirty();
+        }
 
         const resp = Resp{
             .throttle_time_ms = 0,
             .error_code = error_code,
         };
         return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+    }
+
+    fn validateAddOffsetsToTxnState(self: *Broker, transactional_id: ?[]const u8, producer_id: i64, producer_epoch: i16, group_id: []const u8, offsets_partition: i32) i16 {
+        const tid = transactional_id orelse return @intFromEnum(ErrorCode.invalid_request);
+        if (tid.len == 0) return @intFromEnum(ErrorCode.invalid_request);
+        if (group_id.len == 0) return @intFromEnum(ErrorCode.invalid_group_id);
+
+        const txn = self.txn_coordinator.transactions.get(producer_id) orelse return @intFromEnum(ErrorCode.invalid_producer_id_mapping);
+        const registered_tid = txn.transactional_id orelse return @intFromEnum(ErrorCode.invalid_producer_id_mapping);
+        if (!std.mem.eql(u8, registered_tid, tid)) return @intFromEnum(ErrorCode.invalid_producer_id_mapping);
+        if (txn.producer_epoch != producer_epoch) return @intFromEnum(ErrorCode.invalid_producer_epoch);
+        if (!self.topicPartitionExists("__consumer_offsets", offsets_partition)) return @intFromEnum(ErrorCode.coordinator_not_available);
+
+        return @intFromEnum(ErrorCode.none);
     }
 
     // ---------------------------------------------------------------
@@ -14070,24 +14088,26 @@ test "Broker.handleRequest AddPartitionsToTxn rejects truncated request" {
     try testing.expect(broker.handleRequest(buf[0..req_len]) == null);
 }
 
-test "Broker.handleRequest AddOffsetsToTxn v3 returns generated response and registers offsets partition" {
+fn handleAddOffsetsToTxnForTest(
+    broker: *Broker,
+    transactional_id: ?[]const u8,
+    producer_id: i64,
+    producer_epoch: i16,
+    group_id: ?[]const u8,
+    correlation_id: i32,
+) !generated.add_offsets_to_txn_response.AddOffsetsToTxnResponse {
     const Req = generated.add_offsets_to_txn_request.AddOffsetsToTxnRequest;
     const Resp = generated.add_offsets_to_txn_response.AddOffsetsToTxnResponse;
 
-    var broker = Broker.init(testing.allocator, 1, 9092);
-    defer broker.deinit();
-
-    const init_result = try broker.txn_coordinator.initProducerId("txn-add-offsets");
-    const group_id = "group-add-offsets";
     const req = Req{
-        .transactional_id = "txn-add-offsets",
-        .producer_id = init_result.producer_id,
-        .producer_epoch = init_result.producer_epoch,
+        .transactional_id = transactional_id,
+        .producer_id = producer_id,
+        .producer_epoch = producer_epoch,
         .group_id = group_id,
     };
 
     var buf: [512]u8 = undefined;
-    var pos = buildTestRequest(&buf, 25, 3, 2503, header_mod.requestHeaderVersion(25, 3));
+    var pos = buildTestRequest(&buf, 25, 3, correlation_id, header_mod.requestHeaderVersion(25, 3));
     req.serialize(&buf, &pos, 3);
 
     const response = broker.handleRequest(buf[0..pos]);
@@ -14097,10 +14117,29 @@ test "Broker.handleRequest AddOffsetsToTxn v3 returns generated response and reg
     var rpos: usize = 0;
     var response_header = try ResponseHeader.deserialize(testing.allocator, response.?, &rpos, header_mod.responseHeaderVersion(25, 3));
     defer response_header.deinit(testing.allocator);
-    try testing.expectEqual(@as(i32, 2503), response_header.correlation_id);
+    try testing.expectEqual(correlation_id, response_header.correlation_id);
 
     const resp = try Resp.deserialize(testing.allocator, response.?, &rpos, 3);
     try testing.expectEqual(response.?.len, rpos);
+    return resp;
+}
+
+test "Broker.handleRequest AddOffsetsToTxn v3 returns generated response and registers offsets partition" {
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+    try broker.ensureInternalTopic("__consumer_offsets", 50);
+
+    const init_result = try broker.txn_coordinator.initProducerId("txn-add-offsets");
+    const group_id = "group-add-offsets";
+    const resp = try handleAddOffsetsToTxnForTest(
+        &broker,
+        "txn-add-offsets",
+        init_result.producer_id,
+        init_result.producer_epoch,
+        group_id,
+        2503,
+    );
+
     try testing.expectEqual(@as(i32, 0), resp.throttle_time_ms);
     try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.none)), resp.error_code);
 
@@ -14117,6 +14156,62 @@ test "Broker.handleRequest AddOffsetsToTxn v3 returns generated response and reg
         }
     }
     try testing.expect(found_offsets_partition);
+}
+
+test "Broker.handleRequest AddOffsetsToTxn rejects missing offsets topic" {
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+
+    const init_result = try broker.txn_coordinator.initProducerId("txn-add-offsets-missing-internal");
+    const resp = try handleAddOffsetsToTxnForTest(
+        &broker,
+        "txn-add-offsets-missing-internal",
+        init_result.producer_id,
+        init_result.producer_epoch,
+        "group-add-offsets-missing-internal",
+        2505,
+    );
+
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.coordinator_not_available)), resp.error_code);
+    try testing.expectEqual(@as(usize, 0), broker.txn_coordinator.getPartitions(init_result.producer_id).?.len);
+}
+
+test "Broker.handleRequest AddOffsetsToTxn rejects transactional id mismatch" {
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+    try broker.ensureInternalTopic("__consumer_offsets", 50);
+
+    const init_result = try broker.txn_coordinator.initProducerId("txn-add-offsets-owner");
+    const resp = try handleAddOffsetsToTxnForTest(
+        &broker,
+        "txn-add-offsets-other",
+        init_result.producer_id,
+        init_result.producer_epoch,
+        "group-add-offsets-mismatch",
+        2506,
+    );
+
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.invalid_producer_id_mapping)), resp.error_code);
+    try testing.expectEqual(@as(usize, 0), broker.txn_coordinator.getPartitions(init_result.producer_id).?.len);
+}
+
+test "Broker.handleRequest AddOffsetsToTxn rejects fenced producer epoch" {
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+    try broker.ensureInternalTopic("__consumer_offsets", 50);
+
+    const init_result = try broker.txn_coordinator.initProducerId("txn-add-offsets-fenced");
+    const resp = try handleAddOffsetsToTxnForTest(
+        &broker,
+        "txn-add-offsets-fenced",
+        init_result.producer_id,
+        init_result.producer_epoch + 1,
+        "group-add-offsets-fenced",
+        2507,
+    );
+
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.invalid_producer_epoch)), resp.error_code);
+    try testing.expectEqual(@as(usize, 0), broker.txn_coordinator.getPartitions(init_result.producer_id).?.len);
 }
 
 test "Broker.handleRequest AddOffsetsToTxn rejects truncated request" {
