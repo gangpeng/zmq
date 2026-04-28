@@ -488,6 +488,16 @@ pub const ObjectManager = struct {
         return object_id;
     }
 
+    pub fn prepareObjectWithTtl(self: *ObjectManager, ttl_ms: i64) u64 {
+        return self.prepareObjectWithTtlAt(ttl_ms, @import("time_compat").milliTimestamp());
+    }
+
+    pub fn prepareObjectWithTtlAt(self: *ObjectManager, ttl_ms: i64, now_ms: i64) u64 {
+        const object_id = self.allocateObjectId();
+        self.prepared_registry.trackPreparedWithTtlAt(object_id, now_ms, ttl_ms);
+        return object_id;
+    }
+
     /// Mark a committed object for destruction. It will be physically deleted
     /// after mark_destroyed_retention_ms (default 10 min) to give consumers
     /// time to finish reading in-flight data.
@@ -592,9 +602,7 @@ pub const ObjectManager = struct {
             var it = self.stream_objects.iterator();
             while (it.next()) |entry| {
                 const so = entry.value_ptr;
-                if (so.state == .prepared and so.state_changed_ms > 0 and
-                    now_ms - so.state_changed_ms >= prepared_ttl_ms)
-                {
+                if (so.state == .prepared and self.isPreparedObjectExpired(so.object_id, so.state_changed_ms, prepared_ttl_ms, now_ms)) {
                     expired_so_ids.append(so.object_id) catch continue;
                 }
             }
@@ -613,9 +621,7 @@ pub const ObjectManager = struct {
             var it = self.stream_set_objects.iterator();
             while (it.next()) |entry| {
                 const sso = entry.value_ptr;
-                if (sso.state == .prepared and sso.state_changed_ms > 0 and
-                    now_ms - sso.state_changed_ms >= prepared_ttl_ms)
-                {
+                if (sso.state == .prepared and self.isPreparedObjectExpired(sso.object_id, sso.state_changed_ms, prepared_ttl_ms, now_ms)) {
                     expired_sso_ids.append(sso.object_id) catch continue;
                 }
             }
@@ -627,7 +633,23 @@ pub const ObjectManager = struct {
             expired_count += 1;
         }
 
+        const expired_registry_ids = self.prepared_registry.collectExpiredPreparedIds(prepared_ttl_ms, now_ms, self.allocator) catch return expired_count;
+        defer self.allocator.free(expired_registry_ids);
+        for (expired_registry_ids) |obj_id| {
+            if (self.stream_objects.contains(obj_id) or self.stream_set_objects.contains(obj_id)) continue;
+            log.info("Expiring prepared object id {d} (exceeded TTL of {d}ms)", .{ obj_id, prepared_ttl_ms });
+            self.prepared_registry.untrackPrepared(obj_id);
+            expired_count += 1;
+        }
+
         return expired_count;
+    }
+
+    fn isPreparedObjectExpired(self: *const ObjectManager, object_id: u64, state_changed_ms: i64, prepared_ttl_ms: i64, now_ms: i64) bool {
+        if (self.prepared_registry.getEntry(object_id)) |entry| {
+            if (entry.expires_at_ms > 0) return now_ms >= entry.expires_at_ms;
+        }
+        return state_changed_ms > 0 and now_ms - state_changed_ms >= prepared_ttl_ms;
     }
 
     /// Find mark_destroyed objects ready for physical deletion (retention period elapsed).
@@ -1472,12 +1494,15 @@ pub const PreparedObjectRegistry = struct {
     pub const PreparedEntry = struct {
         object_id: u64,
         prepared_at_ms: i64,
+        /// Absolute expiry time in milliseconds. Zero means use the caller's
+        /// default prepared-object TTL for backward-compatible snapshots.
+        expires_at_ms: i64 = 0,
     };
 
     /// Binary format version for PreparedObjectRegistry snapshots.
     /// Separate from ObjectManager's SNAPSHOT_VERSION since this is an
     /// independent file (prepared.snapshot).
-    const REGISTRY_VERSION: u8 = 1;
+    const REGISTRY_VERSION: u8 = 2;
 
     pub fn init(alloc: Allocator) PreparedObjectRegistry {
         return .{
@@ -1510,11 +1535,20 @@ pub const PreparedObjectRegistry = struct {
         self.trackPreparedAt(object_id, @import("time_compat").milliTimestamp());
     }
 
+    pub fn trackPreparedWithTtl(self: *PreparedObjectRegistry, object_id: u64, ttl_ms: i64) void {
+        self.trackPreparedWithTtlAt(object_id, @import("time_compat").milliTimestamp(), ttl_ms);
+    }
+
     /// Register a newly prepared object with an explicit timestamp for testability.
     pub fn trackPreparedAt(self: *PreparedObjectRegistry, object_id: u64, now_ms: i64) void {
+        self.trackPreparedWithTtlAt(object_id, now_ms, 0);
+    }
+
+    pub fn trackPreparedWithTtlAt(self: *PreparedObjectRegistry, object_id: u64, now_ms: i64, ttl_ms: i64) void {
         self.current.put(object_id, .{
             .object_id = object_id,
             .prepared_at_ms = now_ms,
+            .expires_at_ms = expiryFromTtl(now_ms, ttl_ms),
         }) catch |err| {
             log.warn("Failed to track prepared object {d}: {}", .{ object_id, err });
         };
@@ -1590,6 +1624,40 @@ pub const PreparedObjectRegistry = struct {
         return self.current.contains(object_id) or self.previous.contains(object_id);
     }
 
+    pub fn getEntry(self: *const PreparedObjectRegistry, object_id: u64) ?PreparedEntry {
+        if (self.current.get(object_id)) |entry| return entry;
+        if (self.previous.get(object_id)) |entry| return entry;
+        return null;
+    }
+
+    pub fn collectExpiredPreparedIds(self: *const PreparedObjectRegistry, default_ttl_ms: i64, now_ms: i64, alloc: Allocator) ![]u64 {
+        var id_set = std.AutoHashMap(u64, void).init(alloc);
+        defer id_set.deinit();
+
+        var cur_it = self.current.iterator();
+        while (cur_it.next()) |entry| {
+            if (preparedEntryExpired(entry.value_ptr.*, default_ttl_ms, now_ms)) {
+                try id_set.put(entry.key_ptr.*, {});
+            }
+        }
+        var prev_it = self.previous.iterator();
+        while (prev_it.next()) |entry| {
+            if (self.current.contains(entry.key_ptr.*)) continue;
+            if (preparedEntryExpired(entry.value_ptr.*, default_ttl_ms, now_ms)) {
+                try id_set.put(entry.key_ptr.*, {});
+            }
+        }
+
+        var result = try alloc.alloc(u64, id_set.count());
+        var i: usize = 0;
+        var set_it = id_set.keyIterator();
+        while (set_it.next()) |key| {
+            result[i] = key.*;
+            i += 1;
+        }
+        return result;
+    }
+
     /// Serialize to binary for persistence alongside Raft snapshot.
     ///
     /// Format:
@@ -1600,12 +1668,14 @@ pub const PreparedObjectRegistry = struct {
     ///   For each current entry:
     ///     [8 bytes] object_id (u64)
     ///     [8 bytes] prepared_at_ms (i64)
+    ///     [8 bytes] expires_at_ms (i64) [v2+]
     ///   [4 bytes] previous_count (u32)
     ///   For each previous entry:
     ///     [8 bytes] object_id (u64)
     ///     [8 bytes] prepared_at_ms (i64)
+    ///     [8 bytes] expires_at_ms (i64) [v2+]
     pub fn serialize(self: *const PreparedObjectRegistry, alloc: Allocator) ![]u8 {
-        const entry_size = 16; // 8 (object_id) + 8 (prepared_at_ms)
+        const entry_size = 24; // object_id + prepared_at_ms + expires_at_ms
         const size: usize = 1 + 8 + 8 + 4 + (self.current.count() * entry_size) + 4 + (self.previous.count() * entry_size);
 
         var buf = try alloc.alloc(u8, size);
@@ -1626,6 +1696,7 @@ pub const PreparedObjectRegistry = struct {
         while (cur_it.next()) |entry| {
             writeU64(buf, &pos, entry.value_ptr.object_id);
             writeI64(buf, &pos, entry.value_ptr.prepared_at_ms);
+            writeI64(buf, &pos, entry.value_ptr.expires_at_ms);
         }
 
         // Previous buffer
@@ -1634,6 +1705,7 @@ pub const PreparedObjectRegistry = struct {
         while (prev_it.next()) |entry| {
             writeU64(buf, &pos, entry.value_ptr.object_id);
             writeI64(buf, &pos, entry.value_ptr.prepared_at_ms);
+            writeI64(buf, &pos, entry.value_ptr.expires_at_ms);
         }
 
         std.debug.assert(pos == size);
@@ -1648,7 +1720,7 @@ pub const PreparedObjectRegistry = struct {
 
         const version = data[pos];
         pos += 1;
-        if (version != REGISTRY_VERSION) return error.UnsupportedSnapshotVersion;
+        if (version != 1 and version != REGISTRY_VERSION) return error.UnsupportedSnapshotVersion;
 
         const last_rotation = readI64(data, &pos) orelse return error.CorruptSnapshot;
         const rotation_interval = readI64(data, &pos) orelse return error.CorruptSnapshot;
@@ -1661,7 +1733,8 @@ pub const PreparedObjectRegistry = struct {
         while (ci < cur_count) : (ci += 1) {
             const oid = readU64(data, &pos) orelse return error.CorruptSnapshot;
             const ts = readI64(data, &pos) orelse return error.CorruptSnapshot;
-            try new_current.put(oid, .{ .object_id = oid, .prepared_at_ms = ts });
+            const expires_at = if (version >= 2) readI64(data, &pos) orelse return error.CorruptSnapshot else 0;
+            try new_current.put(oid, .{ .object_id = oid, .prepared_at_ms = ts, .expires_at_ms = expires_at });
         }
 
         // Previous buffer
@@ -1672,7 +1745,8 @@ pub const PreparedObjectRegistry = struct {
         while (pi < prev_count) : (pi += 1) {
             const oid = readU64(data, &pos) orelse return error.CorruptSnapshot;
             const ts = readI64(data, &pos) orelse return error.CorruptSnapshot;
-            try new_previous.put(oid, .{ .object_id = oid, .prepared_at_ms = ts });
+            const expires_at = if (version >= 2) readI64(data, &pos) orelse return error.CorruptSnapshot else 0;
+            try new_previous.put(oid, .{ .object_id = oid, .prepared_at_ms = ts, .expires_at_ms = expires_at });
         }
 
         if (pos != data.len) return error.CorruptSnapshot;
@@ -1690,6 +1764,16 @@ pub const PreparedObjectRegistry = struct {
 
     // Re-use ObjectManager's binary helpers (they are private to ObjectManager,
     // so we define local wrappers that delegate to the same encoding).
+
+    fn expiryFromTtl(now_ms: i64, ttl_ms: i64) i64 {
+        if (ttl_ms <= 0) return 0;
+        return std.math.add(i64, now_ms, ttl_ms) catch std.math.maxInt(i64);
+    }
+
+    fn preparedEntryExpired(entry: PreparedEntry, default_ttl_ms: i64, now_ms: i64) bool {
+        if (entry.expires_at_ms > 0) return now_ms >= entry.expires_at_ms;
+        return entry.prepared_at_ms > 0 and now_ms - entry.prepared_at_ms >= default_ttl_ms;
+    }
 
     fn writeU64(buf: []u8, pos: *usize, value: u64) void {
         @as(*align(1) u64, @ptrCast(buf.ptr + pos.*)).* = std.mem.nativeToLittle(u64, value);
@@ -2855,6 +2939,23 @@ test "ObjectManager prepareObject allocates unique IDs" {
     try testing.expect(id2 < id3);
 }
 
+test "ObjectManager expires registry-only prepared IDs by object TTL" {
+    var om = ObjectManager.init(testing.allocator, 0);
+    defer om.deinit();
+
+    const object_id = om.prepareObjectWithTtlAt(500, 1000);
+    try testing.expect(om.prepared_registry.contains(object_id));
+    try testing.expectEqual(@as(usize, 0), om.getStreamObjectCount());
+
+    const expired_early = om.expirePreparedObjectsAt(3600000, 1499);
+    try testing.expectEqual(@as(u64, 0), expired_early);
+    try testing.expect(om.prepared_registry.contains(object_id));
+
+    const expired = om.expirePreparedObjectsAt(3600000, 1500);
+    try testing.expectEqual(@as(u64, 1), expired);
+    try testing.expect(!om.prepared_registry.contains(object_id));
+}
+
 test "ObjectManager lifecycle snapshot roundtrip preserves state" {
     var om = ObjectManager.init(testing.allocator, 0);
     defer om.deinit();
@@ -3074,7 +3175,7 @@ test "PreparedObjectRegistry serialize and deserialize roundtrip" {
     reg.maybeRotateAt(5200);
 
     // Add more to current
-    reg.trackPreparedAt(400, 5200);
+    reg.trackPreparedWithTtlAt(400, 5200, 1000);
     reg.trackPreparedAt(500, 5201);
 
     // Serialize
@@ -3093,6 +3194,7 @@ test "PreparedObjectRegistry serialize and deserialize roundtrip" {
     try testing.expect(reg2.contains(400));
     try testing.expect(reg2.contains(500));
     try testing.expectEqual(@as(usize, 5), reg2.count());
+    try testing.expectEqual(@as(i64, 6200), reg2.getEntry(400).?.expires_at_ms);
 
     // Verify timestamps preserved
     try testing.expectEqual(@as(i64, 5200), reg2.last_rotation_ms);
@@ -3151,6 +3253,23 @@ test "PreparedObjectRegistry getAllPreparedIds deduplicates across buffers" {
     defer testing.allocator.free(ids);
     try testing.expectEqual(@as(usize, 1), ids.len);
     try testing.expectEqual(@as(u64, 10), ids[0]);
+}
+
+test "PreparedObjectRegistry collects expired IDs using per-entry TTL" {
+    var reg = PreparedObjectRegistry.initWithTime(testing.allocator, 1000);
+    defer reg.deinit();
+
+    reg.trackPreparedWithTtlAt(10, 1000, 500);
+    reg.trackPreparedAt(20, 1000);
+
+    const expired_early = try reg.collectExpiredPreparedIds(3600000, 1499, testing.allocator);
+    defer testing.allocator.free(expired_early);
+    try testing.expectEqual(@as(usize, 0), expired_early.len);
+
+    const expired = try reg.collectExpiredPreparedIds(3600000, 1500, testing.allocator);
+    defer testing.allocator.free(expired);
+    try testing.expectEqual(@as(usize, 1), expired.len);
+    try testing.expectEqual(@as(u64, 10), expired[0]);
 }
 
 test "ObjectManager registerPreparedStreamObject tracks in prepared_registry" {

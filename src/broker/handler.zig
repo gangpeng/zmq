@@ -5745,6 +5745,10 @@ pub const Broker = struct {
             const resp = Resp{ .error_code = errorCode(.invalid_request), .throttle_time_ms = 0, .first_s3_object_id = -1 };
             return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
         }
+        if (req.time_to_live_in_ms <= 0) {
+            const resp = Resp{ .error_code = errorCode(.invalid_request), .throttle_time_ms = 0, .first_s3_object_id = -1 };
+            return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+        }
         if (self.autoMqObjectMutationErrorCode()) |err_code| {
             const resp = Resp{ .error_code = err_code, .throttle_time_ms = 0, .first_s3_object_id = -1 };
             return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
@@ -5753,7 +5757,7 @@ pub const Broker = struct {
         var first_id: u64 = 0;
         var i: i32 = 0;
         while (i < req.prepared_count) : (i += 1) {
-            const object_id = self.object_manager.prepareObject();
+            const object_id = self.object_manager.prepareObjectWithTtl(req.time_to_live_in_ms);
             if (i == 0) first_id = object_id;
         }
         self.persistObjectManagerMutation() catch |err| {
@@ -11911,6 +11915,8 @@ test "Broker AutoMQ stream object lifecycle APIs" {
     const prepare_resp = try PrepareResp.deserialize(testing.allocator, response.?, &rpos, 0);
     try testing.expectEqual(@as(i16, 0), prepare_resp.error_code);
     try testing.expect(prepare_resp.first_s3_object_id > 0);
+    const prepared_entry = broker.object_manager.prepared_registry.getEntry(@intCast(prepare_resp.first_s3_object_id)).?;
+    try testing.expectEqual(@as(i64, 60_000), prepared_entry.expires_at_ms - prepared_entry.prepared_at_ms);
 
     pos = buildTestRequest(&buf, 507, 1, 5070, 2);
     const source_ids = [_]i64{};
