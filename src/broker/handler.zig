@@ -5759,10 +5759,7 @@ pub const Broker = struct {
         };
         const group_id = req.group_id orelse "";
 
-        // Compute partition = hash(group_id) % 50 for __consumer_offsets
-        var hasher = std.hash.Wyhash.init(0);
-        hasher.update(group_id);
-        const target_partition: i32 = @intCast(hasher.final() % 50);
+        const target_partition = self.consumerOffsetsPartition(group_id);
 
         var error_code = self.validateAddOffsetsToTxnState(req.transactional_id, req.producer_id, req.producer_epoch, group_id, target_partition);
         if (error_code == @intFromEnum(ErrorCode.none)) {
@@ -5796,6 +5793,25 @@ pub const Broker = struct {
         if (!self.topicPartitionExists("__consumer_offsets", offsets_partition)) return @intFromEnum(ErrorCode.coordinator_not_available);
 
         return @intFromEnum(ErrorCode.none);
+    }
+
+    fn validateTxnOffsetCommitState(self: *Broker, transactional_id: ?[]const u8, producer_id: i64, producer_epoch: i16, group_id: []const u8) i16 {
+        const offsets_partition = self.consumerOffsetsPartition(group_id);
+        const identity_error = self.validateAddOffsetsToTxnState(transactional_id, producer_id, producer_epoch, group_id, offsets_partition);
+        if (identity_error != @intFromEnum(ErrorCode.none)) return identity_error;
+
+        return self.txn_coordinator.verifyPartitionInTxn(
+            producer_id,
+            producer_epoch,
+            "__consumer_offsets",
+            offsets_partition,
+        );
+    }
+
+    fn consumerOffsetsPartition(_: *Broker, group_id: []const u8) i32 {
+        var hasher = std.hash.Wyhash.init(0);
+        hasher.update(group_id);
+        return @intCast(hasher.final() % 50);
     }
 
     // ---------------------------------------------------------------
@@ -7695,6 +7711,7 @@ pub const Broker = struct {
         defer self.freeTxnOffsetCommitRequest(&req);
 
         const group_id = req.group_id orelse "";
+        const txn_error = self.validateTxnOffsetCommitState(req.transactional_id, req.producer_id, req.producer_epoch, group_id);
         const topics = self.allocator.alloc(TopicResponse, req.topics.len) catch return null;
         var topics_init: usize = 0;
         defer {
@@ -7713,6 +7730,8 @@ pub const Broker = struct {
             const topic = topic_req.name orelse "";
             for (topic_req.partitions, 0..) |partition_req, partition_idx| {
                 const error_code: i16 = blk: {
+                    if (txn_error != @intFromEnum(ErrorCode.none)) break :blk txn_error;
+
                     self.groups.commitOffset(group_id, topic, partition_req.partition_index, partition_req.committed_offset) catch |err| {
                         log.warn("TxnOffsetCommit failed for {s}:{s}:{d}: {}", .{ group_id, topic, partition_req.partition_index, err });
                         break :blk @intFromEnum(ErrorCode.kafka_storage_error);
@@ -11594,12 +11613,29 @@ test "Broker.handleRequest WriteTxnMarkers rejects truncated request" {
     try testing.expect(broker.handleRequest(buf[0..req_len]) == null);
 }
 
+fn initTxnOffsetCommitForTest(broker: *Broker, transactional_id: []const u8, group_id: []const u8) !TxnCoordinator.InitProducerIdResult {
+    try broker.ensureInternalTopic("__consumer_offsets", 50);
+    const init_result = try broker.txn_coordinator.initProducerId(transactional_id);
+    const offsets_partition = broker.consumerOffsetsPartition(group_id);
+    try testing.expectEqual(
+        @as(i16, @intFromEnum(ErrorCode.none)),
+        try broker.txn_coordinator.addPartitionsToTxn(
+            init_result.producer_id,
+            init_result.producer_epoch,
+            "__consumer_offsets",
+            offsets_partition,
+        ),
+    );
+    return init_result;
+}
+
 test "Broker.handleRequest TxnOffsetCommit v3 returns generated response and commits offsets" {
     const Req = generated.txn_offset_commit_request.TxnOffsetCommitRequest;
     const Resp = generated.txn_offset_commit_response.TxnOffsetCommitResponse;
 
     var broker = Broker.init(testing.allocator, 1, 9092);
     defer broker.deinit();
+    const init_result = try initTxnOffsetCommitForTest(&broker, "txn-id", "txn-offset-group");
 
     const partitions = [_]Req.TxnOffsetCommitRequestTopic.TxnOffsetCommitRequestPartition{.{
         .partition_index = 0,
@@ -11614,8 +11650,8 @@ test "Broker.handleRequest TxnOffsetCommit v3 returns generated response and com
     const req = Req{
         .transactional_id = "txn-id",
         .group_id = "txn-offset-group",
-        .producer_id = 99,
-        .producer_epoch = 3,
+        .producer_id = init_result.producer_id,
+        .producer_epoch = init_result.producer_epoch,
         .generation_id = -1,
         .member_id = "",
         .group_instance_id = null,
@@ -11666,6 +11702,7 @@ test "Broker.handleRequest TxnOffsetCommit persists committed offsets" {
     var broker = Broker.initWithConfig(testing.allocator, 1, 9092, .{ .data_dir = tmp_dir });
     defer broker.deinit();
     try broker.open();
+    const init_result = try initTxnOffsetCommitForTest(&broker, "txn-persist-id", "txn-offset-persist-group");
 
     const partitions = [_]Req.TxnOffsetCommitRequestTopic.TxnOffsetCommitRequestPartition{.{
         .partition_index = 0,
@@ -11680,8 +11717,8 @@ test "Broker.handleRequest TxnOffsetCommit persists committed offsets" {
     const req = Req{
         .transactional_id = "txn-persist-id",
         .group_id = "txn-offset-persist-group",
-        .producer_id = 1234,
-        .producer_epoch = 0,
+        .producer_id = init_result.producer_id,
+        .producer_epoch = init_result.producer_epoch,
         .generation_id = -1,
         .member_id = "",
         .group_instance_id = null,
@@ -11718,6 +11755,62 @@ test "Broker.handleRequest TxnOffsetCommit persists committed offsets" {
     try testing.expectEqual(@as(usize, 1), loaded.len);
     try testing.expectEqualStrings("txn-offset-persist-group:txn-offset-persist-topic:0", loaded[0].key);
     try testing.expectEqual(@as(i64, 321), loaded[0].offset);
+}
+
+test "Broker.handleRequest TxnOffsetCommit requires AddOffsetsToTxn registration" {
+    const Req = generated.txn_offset_commit_request.TxnOffsetCommitRequest;
+    const Resp = generated.txn_offset_commit_response.TxnOffsetCommitResponse;
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+    try broker.ensureInternalTopic("__consumer_offsets", 50);
+    const init_result = try broker.txn_coordinator.initProducerId("txn-offset-unregistered");
+
+    const partitions = [_]Req.TxnOffsetCommitRequestTopic.TxnOffsetCommitRequestPartition{.{
+        .partition_index = 0,
+        .committed_offset = 444,
+        .committed_leader_epoch = -1,
+        .committed_metadata = "unregistered",
+    }};
+    const topics = [_]Req.TxnOffsetCommitRequestTopic{.{
+        .name = "txn-offset-unregistered-topic",
+        .partitions = &partitions,
+    }};
+    const req = Req{
+        .transactional_id = "txn-offset-unregistered",
+        .group_id = "txn-offset-unregistered-group",
+        .producer_id = init_result.producer_id,
+        .producer_epoch = init_result.producer_epoch,
+        .generation_id = -1,
+        .member_id = "",
+        .group_instance_id = null,
+        .topics = &topics,
+    };
+
+    var buf: [512]u8 = undefined;
+    var pos = buildTestRequest(&buf, 28, 3, 2806, header_mod.requestHeaderVersion(28, 3));
+    req.serialize(&buf, &pos, 3);
+
+    const response = broker.handleRequest(buf[0..pos]);
+    try testing.expect(response != null);
+    defer testing.allocator.free(response.?);
+
+    var rpos: usize = 0;
+    var response_header = try ResponseHeader.deserialize(testing.allocator, response.?, &rpos, header_mod.responseHeaderVersion(28, 3));
+    defer response_header.deinit(testing.allocator);
+    try testing.expectEqual(@as(i32, 2806), response_header.correlation_id);
+
+    const resp = try Resp.deserialize(testing.allocator, response.?, &rpos, 3);
+    defer {
+        for (resp.topics) |topic| {
+            if (topic.partitions.len > 0) testing.allocator.free(topic.partitions);
+        }
+        if (resp.topics.len > 0) testing.allocator.free(resp.topics);
+    }
+
+    try testing.expectEqual(response.?.len, rpos);
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.invalid_txn_state)), resp.topics[0].partitions[0].error_code);
+    try testing.expectEqual(@as(?i64, null), try broker.groups.fetchOffset("txn-offset-unregistered-group", "txn-offset-unregistered-topic", 0));
 }
 
 test "Broker.handleRequest TxnOffsetCommit rejects truncated request" {
