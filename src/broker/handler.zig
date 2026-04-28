@@ -3771,6 +3771,7 @@ pub const Broker = struct {
     }
 
     fn validateOffsetCommitGroup(self: *Broker, api_version: i16, group_id: []const u8, generation_id: i32, member_id: ?[]const u8, group_instance_id: ?[]const u8) ErrorCode {
+        if (group_id.len == 0) return ErrorCode.invalid_group_id;
         if (api_version == 0) return ErrorCode.none;
 
         const resolved_member_id = member_id orelse "";
@@ -7341,7 +7342,9 @@ pub const Broker = struct {
         defer self.freeOffsetDeleteRequest(&req);
 
         const group_id = req.group_id orelse "";
-        const group_error: ErrorCode = if (self.groups.groups.contains(group_id) or self.groups.hasCommittedOffsetsForGroup(group_id))
+        const group_error: ErrorCode = if (group_id.len == 0)
+            ErrorCode.invalid_group_id
+        else if (self.groups.groups.contains(group_id) or self.groups.hasCommittedOffsetsForGroup(group_id))
             ErrorCode.none
         else
             ErrorCode.group_id_not_found;
@@ -13641,6 +13644,55 @@ test "Broker.handleRequest OffsetDelete reports missing group" {
     try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.group_id_not_found)), resp.topics[0].partitions[0].error_code);
 }
 
+test "Broker.handleRequest OffsetDelete rejects empty group id without deleting offsets" {
+    const Req = generated.offset_delete_request.OffsetDeleteRequest;
+    const Resp = generated.offset_delete_response.OffsetDeleteResponse;
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+
+    try testing.expect(broker.ensureTopic("delete-empty-group-topic"));
+    try broker.groups.commitOffset("", "delete-empty-group-topic", 0, 42);
+
+    const partitions = [_]Req.OffsetDeleteRequestTopic.OffsetDeleteRequestPartition{.{
+        .partition_index = 0,
+    }};
+    const topics = [_]Req.OffsetDeleteRequestTopic{.{
+        .name = "delete-empty-group-topic",
+        .partitions = &partitions,
+    }};
+    const req = Req{
+        .group_id = "",
+        .topics = &topics,
+    };
+
+    var buf: [512]u8 = undefined;
+    var pos = buildTestRequest(&buf, 47, 0, 4706, header_mod.requestHeaderVersion(47, 0));
+    req.serialize(&buf, &pos, 0);
+
+    const response = broker.handleRequest(buf[0..pos]);
+    try testing.expect(response != null);
+    defer testing.allocator.free(response.?);
+
+    var rpos: usize = 0;
+    var response_header = try ResponseHeader.deserialize(testing.allocator, response.?, &rpos, header_mod.responseHeaderVersion(47, 0));
+    defer response_header.deinit(testing.allocator);
+    try testing.expectEqual(@as(i32, 4706), response_header.correlation_id);
+
+    const resp = try Resp.deserialize(testing.allocator, response.?, &rpos, 0);
+    defer {
+        for (resp.topics) |topic| {
+            if (topic.partitions.len > 0) testing.allocator.free(topic.partitions);
+        }
+        if (resp.topics.len > 0) testing.allocator.free(resp.topics);
+    }
+
+    try testing.expectEqual(response.?.len, rpos);
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.invalid_group_id)), resp.error_code);
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.invalid_group_id)), resp.topics[0].partitions[0].error_code);
+    try testing.expectEqual(@as(?i64, 42), try broker.groups.fetchOffset("", "delete-empty-group-topic", 0));
+}
+
 test "Broker.handleRequest OffsetDelete persists deleted offsets" {
     const fs = @import("fs_compat");
     const Req = generated.offset_delete_request.OffsetDeleteRequest;
@@ -17960,6 +18012,61 @@ test "Broker.handleRequest OffsetCommit rejects unknown topic partitions without
     try testing.expectEqual(@as(?i64, 11), try broker.groups.fetchOffset("oc-validation-group", "oc-known-topic", 0));
     try testing.expectEqual(@as(?i64, null), try broker.groups.fetchOffset("oc-validation-group", "oc-known-topic", 1));
     try testing.expectEqual(@as(?i64, null), try broker.groups.fetchOffset("oc-validation-group", "oc-missing-topic", 0));
+}
+
+test "Broker.handleRequest OffsetCommit rejects empty group id" {
+    const Req = generated.offset_commit_request.OffsetCommitRequest;
+    const Resp = generated.offset_commit_response.OffsetCommitResponse;
+    const Topic = Req.OffsetCommitRequestTopic;
+    const Partition = Topic.OffsetCommitRequestPartition;
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+    try testing.expect(broker.ensureTopic("oc-empty-group-topic"));
+
+    const partitions = [_]Partition{.{
+        .partition_index = 0,
+        .committed_offset = 44,
+        .committed_leader_epoch = -1,
+        .committed_metadata = "empty-group",
+    }};
+    const topics = [_]Topic{.{
+        .name = "oc-empty-group-topic",
+        .partitions = &partitions,
+    }};
+    const req = Req{
+        .group_id = "",
+        .generation_id_or_member_epoch = -1,
+        .member_id = "",
+        .group_instance_id = null,
+        .topics = &topics,
+    };
+
+    var buf: [512]u8 = undefined;
+    var pos = buildTestRequest(&buf, 8, 8, 812, header_mod.requestHeaderVersion(8, 8));
+    req.serialize(&buf, &pos, 8);
+
+    const response = broker.handleRequest(buf[0..pos]);
+    try testing.expect(response != null);
+    defer testing.allocator.free(response.?);
+
+    var rpos: usize = 0;
+    var response_header = try ResponseHeader.deserialize(testing.allocator, response.?, &rpos, header_mod.responseHeaderVersion(8, 8));
+    defer response_header.deinit(testing.allocator);
+    try testing.expectEqual(@as(i32, 812), response_header.correlation_id);
+
+    const resp = try Resp.deserialize(testing.allocator, response.?, &rpos, 8);
+    defer {
+        for (resp.topics) |topic| {
+            if (topic.partitions.len > 0) testing.allocator.free(topic.partitions);
+        }
+        if (resp.topics.len > 0) testing.allocator.free(resp.topics);
+    }
+
+    try testing.expectEqual(response.?.len, rpos);
+    try testing.expectEqual(@as(usize, 1), resp.topics.len);
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.invalid_group_id)), resp.topics[0].partitions[0].error_code);
+    try testing.expectEqual(@as(?i64, null), try broker.groups.fetchOffset("", "oc-empty-group-topic", 0));
 }
 
 test "Broker.handleRequest OffsetCommit rejects unknown managed member" {
