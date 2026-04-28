@@ -291,6 +291,31 @@ pub const GroupCoordinator = struct {
         return 25; // UNKNOWN_MEMBER_ID
     }
 
+    /// Handle LeaveGroup with optional static membership identity.
+    ///
+    /// Kafka v3+ allows a member identity to carry group_instance_id. If
+    /// member_id is empty, resolve the static instance to its current member_id.
+    pub fn leaveGroupWithInstanceId(self: *GroupCoordinator, group_id: []const u8, member_id: []const u8, group_instance_id: ?[]const u8) i16 {
+        if (member_id.len > 0) return self.leaveGroup(group_id, member_id);
+
+        const instance_id = group_instance_id orelse return self.leaveGroup(group_id, member_id);
+        const group = self.groups.getPtr(group_id) orelse return 16;
+
+        var found_member_id: ?[]const u8 = null;
+        var it = group.members.iterator();
+        while (it.next()) |entry| {
+            const member = entry.value_ptr;
+            if (member.group_instance_id) |existing_instance_id| {
+                if (std.mem.eql(u8, existing_instance_id, instance_id)) {
+                    found_member_id = entry.key_ptr.*;
+                    break;
+                }
+            }
+        }
+
+        return self.leaveGroup(group_id, found_member_id orelse return 25);
+    }
+
     /// Delete an empty consumer group and its committed offsets.
     ///
     /// Kafka DeleteGroups must not remove groups with active members. Returning
@@ -957,6 +982,18 @@ test "GroupCoordinator leave group" {
     // Group should be empty now
     const group = coord.groups.getPtr("g1").?;
     try testing.expectEqual(ConsumerGroup.GroupState.empty, group.state);
+}
+
+test "GroupCoordinator leaveGroupWithInstanceId resolves static member" {
+    var coord = GroupCoordinator.init(testing.allocator);
+    defer coord.deinit();
+
+    const result = try coord.joinGroupWithInstanceId("g1", null, "instance-1", "consumer", null);
+    try testing.expect(coord.groups.getPtr("g1").?.members.contains(result.member_id));
+
+    const err = coord.leaveGroupWithInstanceId("g1", "", "instance-1");
+    try testing.expectEqual(@as(i16, 0), err);
+    try testing.expectEqual(@as(usize, 0), coord.groups.getPtr("g1").?.memberCount());
 }
 
 test "GroupCoordinator offset commit and fetch" {

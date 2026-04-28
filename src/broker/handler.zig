@@ -3578,7 +3578,7 @@ pub const Broker = struct {
             member_responses = self.allocator.alloc(MemberResponse, req.members.len) catch return null;
             for (req.members, 0..) |member, i| {
                 const member_id = member.member_id orelse "";
-                const error_code = self.groups.leaveGroup(req.group_id orelse "", member_id);
+                const error_code = self.groups.leaveGroupWithInstanceId(req.group_id orelse "", member_id, member.group_instance_id);
                 if (error_code == @intFromEnum(ErrorCode.none)) mutated = true;
                 member_responses[i] = .{
                     .member_id = member.member_id,
@@ -16984,6 +16984,48 @@ test "Broker.handleRequest LeaveGroup v4 returns generated member results" {
     try testing.expectEqualStrings("instance-2", resp.members[1].group_instance_id.?);
     try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.none)), resp.members[1].error_code);
     try testing.expectEqual(@as(usize, 0), broker.groups.groups.getPtr("leave-generated-group").?.memberCount());
+}
+
+test "Broker.handleRequest LeaveGroup v4 removes static member by instance id" {
+    const Req = generated.leave_group_request.LeaveGroupRequest;
+    const Resp = generated.leave_group_response.LeaveGroupResponse;
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+
+    _ = try broker.groups.joinGroupWithInstanceId("leave-static-group", null, "static-instance-1", "consumer", null);
+
+    const members = [_]Req.MemberIdentity{.{
+        .member_id = "",
+        .group_instance_id = "static-instance-1",
+    }};
+    const req = Req{
+        .group_id = "leave-static-group",
+        .members = &members,
+    };
+
+    var buf: [512]u8 = undefined;
+    var pos = buildTestRequest(&buf, 13, 4, 1307, header_mod.requestHeaderVersion(13, 4));
+    req.serialize(&buf, &pos, 4);
+
+    const response = broker.handleRequest(buf[0..pos]);
+    try testing.expect(response != null);
+    defer testing.allocator.free(response.?);
+
+    var rpos: usize = 0;
+    var response_header = try ResponseHeader.deserialize(testing.allocator, response.?, &rpos, header_mod.responseHeaderVersion(13, 4));
+    defer response_header.deinit(testing.allocator);
+    try testing.expectEqual(@as(i32, 1307), response_header.correlation_id);
+
+    const resp = try Resp.deserialize(testing.allocator, response.?, &rpos, 4);
+    defer if (resp.members.len > 0) testing.allocator.free(resp.members);
+
+    try testing.expectEqual(response.?.len, rpos);
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.none)), resp.error_code);
+    try testing.expectEqual(@as(usize, 1), resp.members.len);
+    try testing.expectEqualStrings("static-instance-1", resp.members[0].group_instance_id.?);
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.none)), resp.members[0].error_code);
+    try testing.expectEqual(@as(usize, 0), broker.groups.groups.getPtr("leave-static-group").?.memberCount());
 }
 
 test "Broker.handleRequest LeaveGroup v4 returns generated per-member error" {
