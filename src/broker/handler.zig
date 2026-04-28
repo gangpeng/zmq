@@ -7980,6 +7980,7 @@ pub const Broker = struct {
 
         const group_id = req.group_id orelse "";
         const txn_error = self.validateTxnOffsetCommitState(req.transactional_id, req.producer_id, req.producer_epoch, group_id);
+        const group_error = self.validateOffsetCommitGroup(api_version, group_id, req.generation_id, req.member_id, req.group_instance_id);
         const topics = self.allocator.alloc(TopicResponse, req.topics.len) catch return null;
         var topics_init: usize = 0;
         defer {
@@ -7999,6 +8000,7 @@ pub const Broker = struct {
             for (topic_req.partitions, 0..) |partition_req, partition_idx| {
                 const error_code: i16 = blk: {
                     if (txn_error != @intFromEnum(ErrorCode.none)) break :blk txn_error;
+                    if (group_error != ErrorCode.none) break :blk @intFromEnum(group_error);
                     const metadata_error = validateOffsetCommitMetadata(partition_req.committed_metadata);
                     if (metadata_error != ErrorCode.none) break :blk @intFromEnum(metadata_error);
 
@@ -12174,6 +12176,117 @@ test "Broker.handleRequest TxnOffsetCommit v3 returns generated response and com
     try testing.expectEqual(@as(i32, 0), resp.topics[0].partitions[0].partition_index);
     try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.none)), resp.topics[0].partitions[0].error_code);
     try testing.expectEqual(@as(?i64, 123), try broker.groups.fetchOffset("txn-offset-group", "txn-offset-topic", 0));
+}
+
+test "Broker.handleRequest TxnOffsetCommit rejects unknown managed member" {
+    const Req = generated.txn_offset_commit_request.TxnOffsetCommitRequest;
+    const Resp = generated.txn_offset_commit_response.TxnOffsetCommitResponse;
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+    const init_result = try initTxnOffsetCommitForTest(&broker, "txn-unknown-member-id", "txn-unknown-member-group");
+
+    const partitions = [_]Req.TxnOffsetCommitRequestTopic.TxnOffsetCommitRequestPartition{.{
+        .partition_index = 0,
+        .committed_offset = 555,
+        .committed_leader_epoch = -1,
+        .committed_metadata = "bad-member",
+    }};
+    const topics = [_]Req.TxnOffsetCommitRequestTopic{.{
+        .name = "txn-unknown-member-topic",
+        .partitions = &partitions,
+    }};
+    const req = Req{
+        .transactional_id = "txn-unknown-member-id",
+        .group_id = "txn-unknown-member-group",
+        .producer_id = init_result.producer_id,
+        .producer_epoch = init_result.producer_epoch,
+        .generation_id = 1,
+        .member_id = "ghost",
+        .group_instance_id = null,
+        .topics = &topics,
+    };
+
+    var buf: [512]u8 = undefined;
+    var pos = buildTestRequest(&buf, 28, 3, 2814, header_mod.requestHeaderVersion(28, 3));
+    req.serialize(&buf, &pos, 3);
+
+    const response = broker.handleRequest(buf[0..pos]);
+    try testing.expect(response != null);
+    defer testing.allocator.free(response.?);
+
+    var rpos: usize = 0;
+    var response_header = try ResponseHeader.deserialize(testing.allocator, response.?, &rpos, header_mod.responseHeaderVersion(28, 3));
+    defer response_header.deinit(testing.allocator);
+    try testing.expectEqual(@as(i32, 2814), response_header.correlation_id);
+
+    const resp = try Resp.deserialize(testing.allocator, response.?, &rpos, 3);
+    defer {
+        for (resp.topics) |topic| {
+            if (topic.partitions.len > 0) testing.allocator.free(topic.partitions);
+        }
+        if (resp.topics.len > 0) testing.allocator.free(resp.topics);
+    }
+
+    try testing.expectEqual(response.?.len, rpos);
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.unknown_member_id)), resp.topics[0].partitions[0].error_code);
+    try testing.expectEqual(@as(?i64, null), try broker.groups.fetchOffset("txn-unknown-member-group", "txn-unknown-member-topic", 0));
+}
+
+test "Broker.handleRequest TxnOffsetCommit rejects illegal generation" {
+    const Req = generated.txn_offset_commit_request.TxnOffsetCommitRequest;
+    const Resp = generated.txn_offset_commit_response.TxnOffsetCommitResponse;
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+    const joined = try broker.groups.joinGroup("txn-illegal-generation-group", null, "consumer", null);
+    const init_result = try initTxnOffsetCommitForTest(&broker, "txn-illegal-generation-id", "txn-illegal-generation-group");
+
+    const partitions = [_]Req.TxnOffsetCommitRequestTopic.TxnOffsetCommitRequestPartition{.{
+        .partition_index = 0,
+        .committed_offset = 556,
+        .committed_leader_epoch = -1,
+        .committed_metadata = "bad-generation",
+    }};
+    const topics = [_]Req.TxnOffsetCommitRequestTopic{.{
+        .name = "txn-illegal-generation-topic",
+        .partitions = &partitions,
+    }};
+    const req = Req{
+        .transactional_id = "txn-illegal-generation-id",
+        .group_id = "txn-illegal-generation-group",
+        .producer_id = init_result.producer_id,
+        .producer_epoch = init_result.producer_epoch,
+        .generation_id = joined.generation_id + 1,
+        .member_id = joined.member_id,
+        .group_instance_id = null,
+        .topics = &topics,
+    };
+
+    var buf: [512]u8 = undefined;
+    var pos = buildTestRequest(&buf, 28, 3, 2815, header_mod.requestHeaderVersion(28, 3));
+    req.serialize(&buf, &pos, 3);
+
+    const response = broker.handleRequest(buf[0..pos]);
+    try testing.expect(response != null);
+    defer testing.allocator.free(response.?);
+
+    var rpos: usize = 0;
+    var response_header = try ResponseHeader.deserialize(testing.allocator, response.?, &rpos, header_mod.responseHeaderVersion(28, 3));
+    defer response_header.deinit(testing.allocator);
+    try testing.expectEqual(@as(i32, 2815), response_header.correlation_id);
+
+    const resp = try Resp.deserialize(testing.allocator, response.?, &rpos, 3);
+    defer {
+        for (resp.topics) |topic| {
+            if (topic.partitions.len > 0) testing.allocator.free(topic.partitions);
+        }
+        if (resp.topics.len > 0) testing.allocator.free(resp.topics);
+    }
+
+    try testing.expectEqual(response.?.len, rpos);
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.illegal_generation)), resp.topics[0].partitions[0].error_code);
+    try testing.expectEqual(@as(?i64, null), try broker.groups.fetchOffset("txn-illegal-generation-group", "txn-illegal-generation-topic", 0));
 }
 
 test "Broker.handleRequest TxnOffsetCommit rejects oversized metadata" {
