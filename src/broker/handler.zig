@@ -1720,6 +1720,7 @@ pub const Broker = struct {
             55 => self.handleDescribeQuorum(request_bytes, pos, &req_header, api_version, resp_header_version),
             65 => self.handleDescribeTransactions(request_bytes, pos, &req_header, api_version, resp_header_version),
             66 => self.handleListTransactions(request_bytes, pos, &req_header, api_version, resp_header_version),
+            75 => self.handleDescribeTopicPartitions(request_bytes, pos, &req_header, api_version, resp_header_version),
             501 => self.handleCreateStreams(request_bytes, pos, &req_header, api_version, resp_header_version),
             502 => self.handleOpenStreams(request_bytes, pos, &req_header, api_version, resp_header_version),
             503 => self.handleCloseStreams(request_bytes, pos, &req_header, api_version, resp_header_version),
@@ -1861,7 +1862,7 @@ pub const Broker = struct {
             0, 1, 2 => .topic, // Produce, Fetch, ListOffsets
             8, 9, 10, 11, 12, 13, 14, 15, 16, 42, 47 => .group, // group-related
             22, 24, 26, 27, 28, 65, 66 => .transactional_id, // txn-related
-            3, 18, 19, 20, 32, 33, 35, 37, 43, 44, 45, 46 => .cluster, // metadata/admin
+            3, 18, 19, 20, 32, 33, 35, 37, 43, 44, 45, 46, 75 => .cluster, // metadata/admin
             501...519, 600...602 => .cluster, // AutoMQ stream/object/controller extensions
             else => .unknown,
         };
@@ -1872,7 +1873,7 @@ pub const Broker = struct {
         return switch (api_key) {
             0 => .write, // Produce
             1 => .read, // Fetch
-            2, 9, 15, 16, 23, 29, 32, 35, 46, 55, 60, 61, 65, 66 => .describe, // ListOffsets, OffsetFetch, Describe*
+            2, 9, 15, 16, 23, 29, 32, 35, 46, 55, 60, 61, 65, 66, 75 => .describe, // ListOffsets, OffsetFetch, Describe*
             3, 18 => .describe, // Metadata, ApiVersions
             8 => .read, // OffsetCommit
             10, 11, 12, 13, 14 => .read, // Group ops
@@ -9334,6 +9335,215 @@ pub const Broker = struct {
     }
 
     // ---------------------------------------------------------------
+    // DescribeTopicPartitions (key 75) — paginated topic metadata
+    // ---------------------------------------------------------------
+    fn handleDescribeTopicPartitions(self: *Broker, request_bytes: []const u8, body_start: usize, req_header: *const RequestHeader, api_version: i16, resp_header_version: i16) ?[]u8 {
+        const Req = generated.describe_topic_partitions_request.DescribeTopicPartitionsRequest;
+        const Resp = generated.describe_topic_partitions_response.DescribeTopicPartitionsResponse;
+        const TopicResponse = Resp.DescribeTopicPartitionsResponseTopic;
+
+        if (!validateDescribeTopicPartitionsRequestFrame(request_bytes, body_start)) {
+            log.warn("Malformed DescribeTopicPartitions request", .{});
+            return null;
+        }
+
+        var pos = body_start;
+        var req = Req.deserialize(self.allocator, request_bytes, &pos, api_version) catch |err| {
+            log.warn("Failed to decode DescribeTopicPartitions request: {}", .{err});
+            return null;
+        };
+        defer self.freeDescribeTopicPartitionsRequest(&req);
+
+        var topic_responses: []TopicResponse = &.{};
+        if (req.topics.len > 0) {
+            topic_responses = self.allocator.alloc(TopicResponse, req.topics.len) catch return null;
+        }
+        var topic_init: usize = 0;
+        defer {
+            self.freeDescribeTopicPartitionsTopicResponses(topic_responses[0..topic_init]);
+            if (topic_responses.len > 0) self.allocator.free(topic_responses);
+        }
+
+        const partition_limit: usize = if (req.response_partition_limit > 0)
+            @intCast(req.response_partition_limit)
+        else
+            0;
+        var emitted_partitions: usize = 0;
+        var next_cursor: ?Resp.Cursor = null;
+
+        var cursor_active = true;
+        var cursor_topic: ?[]const u8 = null;
+        var cursor_partition_index: i32 = 0;
+        if (req.cursor) |cursor| {
+            cursor_partition_index = @max(cursor.partition_index, 0);
+            if (cursor.topic_name) |name| {
+                cursor_topic = name;
+                cursor_active = false;
+            }
+        }
+
+        if (partition_limit > 0) {
+            for (req.topics) |topic_req| {
+                const topic_name = topic_req.name orelse "";
+                var start_partition: i32 = 0;
+
+                if (!cursor_active) {
+                    if (!std.mem.eql(u8, topic_name, cursor_topic.?)) continue;
+                    cursor_active = true;
+                    start_partition = cursor_partition_index;
+                }
+
+                if (emitted_partitions >= partition_limit) {
+                    next_cursor = .{ .topic_name = topic_req.name, .partition_index = 0 };
+                    break;
+                }
+
+                const remaining_limit = partition_limit - emitted_partitions;
+                const build = self.buildDescribeTopicPartitionsTopicResponse(topic_name, topic_req.name, start_partition, remaining_limit) catch return null;
+                topic_responses[topic_init] = build.topic;
+                topic_init += 1;
+                emitted_partitions += build.emitted_partitions;
+
+                if (build.next_partition_index) |partition_index| {
+                    next_cursor = .{ .topic_name = topic_responses[topic_init - 1].name, .partition_index = partition_index };
+                    break;
+                }
+            }
+        }
+
+        const resp = Resp{
+            .throttle_time_ms = 0,
+            .topics = topic_responses[0..topic_init],
+            .next_cursor = next_cursor,
+        };
+        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+    }
+
+    const DescribeTopicPartitionsBuildResult = struct {
+        topic: generated.describe_topic_partitions_response.DescribeTopicPartitionsResponse.DescribeTopicPartitionsResponseTopic,
+        emitted_partitions: usize,
+        next_partition_index: ?i32 = null,
+    };
+
+    fn freeDescribeTopicPartitionsRequest(self: *Broker, req: *generated.describe_topic_partitions_request.DescribeTopicPartitionsRequest) void {
+        if (req.topics.len > 0) self.allocator.free(req.topics);
+    }
+
+    fn freeDescribeTopicPartitionsTopicResponses(self: *Broker, topics: []const generated.describe_topic_partitions_response.DescribeTopicPartitionsResponse.DescribeTopicPartitionsResponseTopic) void {
+        for (topics) |topic| {
+            self.freeDescribeTopicPartitionsPartitionResponses(topic.partitions);
+            if (topic.partitions.len > 0) self.allocator.free(topic.partitions);
+        }
+    }
+
+    fn freeDescribeTopicPartitionsPartitionResponses(self: *Broker, partitions: []const generated.describe_topic_partitions_response.DescribeTopicPartitionsResponse.DescribeTopicPartitionsResponseTopic.DescribeTopicPartitionsResponsePartition) void {
+        for (partitions) |partition| {
+            if (partition.replica_nodes.len > 0) self.allocator.free(partition.replica_nodes);
+            if (partition.isr_nodes.len > 0) self.allocator.free(partition.isr_nodes);
+            if (partition.eligible_leader_replicas.len > 0) self.allocator.free(partition.eligible_leader_replicas);
+            if (partition.last_known_elr.len > 0) self.allocator.free(partition.last_known_elr);
+            if (partition.offline_replicas.len > 0) self.allocator.free(partition.offline_replicas);
+        }
+    }
+
+    fn buildDescribeTopicPartitionsTopicResponse(self: *Broker, topic_name: []const u8, response_name: ?[]const u8, start_partition_index: i32, max_partitions: usize) !DescribeTopicPartitionsBuildResult {
+        const Resp = generated.describe_topic_partitions_response.DescribeTopicPartitionsResponse;
+        const TopicResponse = Resp.DescribeTopicPartitionsResponseTopic;
+        const PartitionResponse = TopicResponse.DescribeTopicPartitionsResponsePartition;
+
+        if (topic_name.len == 0) {
+            return .{ .topic = .{
+                .error_code = @intFromEnum(ErrorCode.invalid_topic_exception),
+                .name = response_name,
+                .topic_id = zeroUuid(),
+                .is_internal = false,
+                .partitions = &.{},
+                .topic_authorized_operations = std.math.minInt(i32),
+            }, .emitted_partitions = 0 };
+        }
+
+        const topic_info = self.topics.getPtr(topic_name) orelse return .{ .topic = .{
+            .error_code = @intFromEnum(ErrorCode.unknown_topic_or_partition),
+            .name = response_name,
+            .topic_id = zeroUuid(),
+            .is_internal = false,
+            .partitions = &.{},
+            .topic_authorized_operations = std.math.minInt(i32),
+        }, .emitted_partitions = 0 };
+
+        const partition_total_i32: i32 = @max(topic_info.num_partitions, 0);
+        if (start_partition_index >= partition_total_i32 or max_partitions == 0) {
+            return .{ .topic = .{
+                .error_code = @intFromEnum(ErrorCode.none),
+                .name = topic_info.name,
+                .topic_id = topic_info.topic_id,
+                .is_internal = std.mem.startsWith(u8, topic_info.name, "__"),
+                .partitions = &.{},
+                .topic_authorized_operations = std.math.minInt(i32),
+            }, .emitted_partitions = 0 };
+        }
+
+        const start_partition: usize = @intCast(@max(start_partition_index, 0));
+        const available_partitions: usize = @intCast(partition_total_i32 - @as(i32, @intCast(start_partition)));
+        const partition_count = @min(available_partitions, max_partitions);
+        var partitions: []PartitionResponse = &.{};
+        if (partition_count > 0) {
+            partitions = try self.allocator.alloc(PartitionResponse, partition_count);
+        }
+        var partitions_init: usize = 0;
+        errdefer {
+            self.freeDescribeTopicPartitionsPartitionResponses(partitions[0..partitions_init]);
+            if (partitions.len > 0) self.allocator.free(partitions);
+        }
+
+        for (0..partition_count) |offset| {
+            const partition_index: i32 = @intCast(start_partition + offset);
+            partitions[partitions_init] = try self.buildDescribeTopicPartitionsPartitionResponse(partition_index);
+            partitions_init += 1;
+        }
+
+        const next_partition: ?i32 = if (start_partition + partition_count < @as(usize, @intCast(partition_total_i32)))
+            @intCast(start_partition + partition_count)
+        else
+            null;
+
+        return .{
+            .topic = .{
+                .error_code = @intFromEnum(ErrorCode.none),
+                .name = topic_info.name,
+                .topic_id = topic_info.topic_id,
+                .is_internal = std.mem.startsWith(u8, topic_info.name, "__"),
+                .partitions = partitions[0..partitions_init],
+                .topic_authorized_operations = std.math.minInt(i32),
+            },
+            .emitted_partitions = partitions_init,
+            .next_partition_index = next_partition,
+        };
+    }
+
+    fn buildDescribeTopicPartitionsPartitionResponse(self: *Broker, partition_index: i32) !generated.describe_topic_partitions_response.DescribeTopicPartitionsResponse.DescribeTopicPartitionsResponseTopic.DescribeTopicPartitionsResponsePartition {
+        const replicas = try self.allocator.alloc(i32, 1);
+        errdefer self.allocator.free(replicas);
+        replicas[0] = self.node_id;
+
+        const isr = try self.allocator.alloc(i32, 1);
+        errdefer self.allocator.free(isr);
+        isr[0] = self.node_id;
+
+        return .{
+            .error_code = @intFromEnum(ErrorCode.none),
+            .partition_index = partition_index,
+            .leader_id = self.node_id,
+            .leader_epoch = if (self.raft_state) |rs| rs.current_epoch else self.cached_leader_epoch,
+            .replica_nodes = replicas,
+            .isr_nodes = isr,
+            .eligible_leader_replicas = &.{},
+            .last_known_elr = &.{},
+            .offline_replicas = &.{},
+        };
+    }
+
+    // ---------------------------------------------------------------
     // AlterPartitionReassignments (key 45) — flexible versions only
     // ---------------------------------------------------------------
     fn handleAlterPartitionReassignments(self: *Broker, request_bytes: []const u8, body_start: usize, req_header: *const RequestHeader, api_version: i16, resp_header_version: i16) ?[]u8 {
@@ -10318,6 +10528,30 @@ pub const Broker = struct {
         return true;
     }
 
+    fn validateDescribeTopicPartitionsRequestFrame(buf: []const u8, start_pos: usize) bool {
+        var pos = start_pos;
+
+        const topics = readKafkaArrayHeader(buf, &pos, true) orelse return false;
+        if (topics.is_null) return false;
+        for (0..topics.count) |_| {
+            if (!skipKafkaString(buf, &pos, true)) return false; // topic name
+            ser.skipTaggedFields(buf, &pos) catch return false;
+        }
+
+        if (!skipFixedBytes(buf, &pos, 4)) return false; // response_partition_limit
+
+        const cursor_present = ser.readUnsignedVarint(buf, &pos) catch return false;
+        if (cursor_present > 1) return false;
+        if (cursor_present == 1) {
+            if (!skipKafkaString(buf, &pos, true)) return false; // cursor topic_name
+            if (!skipFixedBytes(buf, &pos, 4)) return false; // cursor partition_index
+            ser.skipTaggedFields(buf, &pos) catch return false;
+        }
+
+        ser.skipTaggedFields(buf, &pos) catch return false;
+        return true;
+    }
+
     fn skipAddPartitionsToTxnTopics(buf: []const u8, pos: *usize, flexible: bool) bool {
         const topic_count = readKafkaArrayCount(buf, pos, flexible) orelse return false;
         for (0..topic_count) |_| {
@@ -11241,6 +11475,20 @@ fn freeDeserializedDescribeTransactionsResponse(resp: *const generated.describe_
         if (state.topics.len > 0) testing.allocator.free(state.topics);
     }
     if (resp.transaction_states.len > 0) testing.allocator.free(resp.transaction_states);
+}
+
+fn freeDeserializedDescribeTopicPartitionsResponse(resp: *const generated.describe_topic_partitions_response.DescribeTopicPartitionsResponse) void {
+    for (resp.topics) |topic| {
+        for (topic.partitions) |partition| {
+            if (partition.replica_nodes.len > 0) testing.allocator.free(partition.replica_nodes);
+            if (partition.isr_nodes.len > 0) testing.allocator.free(partition.isr_nodes);
+            if (partition.eligible_leader_replicas.len > 0) testing.allocator.free(partition.eligible_leader_replicas);
+            if (partition.last_known_elr.len > 0) testing.allocator.free(partition.last_known_elr);
+            if (partition.offline_replicas.len > 0) testing.allocator.free(partition.offline_replicas);
+        }
+        if (topic.partitions.len > 0) testing.allocator.free(topic.partitions);
+    }
+    if (resp.topics.len > 0) testing.allocator.free(resp.topics);
 }
 
 fn appendInternalRaftAppendEntriesPayload(
@@ -17741,6 +17989,120 @@ test "Broker.handleRequest DescribeProducers rejects truncated request" {
 
     var buf: [128]u8 = undefined;
     const req_len = buildTestRequest(&buf, 61, 0, 6101, header_mod.requestHeaderVersion(61, 0));
+    try testing.expect(broker.handleRequest(buf[0..req_len]) == null);
+}
+
+test "Broker.handleRequest DescribeTopicPartitions returns generated metadata and unknown topics" {
+    const Req = generated.describe_topic_partitions_request.DescribeTopicPartitionsRequest;
+    const Resp = generated.describe_topic_partitions_response.DescribeTopicPartitionsResponse;
+
+    var broker = Broker.init(testing.allocator, 7, 19092);
+    defer broker.deinit();
+    broker.cached_leader_epoch = 4;
+    try testing.expect(broker.ensureTopic("dtp-topic"));
+    if (broker.topics.getPtr("dtp-topic")) |topic| {
+        topic.num_partitions = 3;
+    }
+    try broker.store.ensurePartition("dtp-topic", 1);
+    try broker.store.ensurePartition("dtp-topic", 2);
+
+    const topics = [_]Req.TopicRequest{
+        .{ .name = "dtp-topic" },
+        .{ .name = "missing-dtp-topic" },
+    };
+    const req = Req{
+        .topics = &topics,
+        .response_partition_limit = 10,
+    };
+
+    var buf: [1024]u8 = undefined;
+    var pos = buildTestRequest(&buf, 75, 0, 7500, header_mod.requestHeaderVersion(75, 0));
+    req.serialize(&buf, &pos, 0);
+
+    const response = broker.handleRequest(buf[0..pos]);
+    try testing.expect(response != null);
+    defer testing.allocator.free(response.?);
+
+    var rpos: usize = 0;
+    var response_header = try ResponseHeader.deserialize(testing.allocator, response.?, &rpos, header_mod.responseHeaderVersion(75, 0));
+    defer response_header.deinit(testing.allocator);
+    try testing.expectEqual(@as(i32, 7500), response_header.correlation_id);
+
+    const resp = try Resp.deserialize(testing.allocator, response.?, &rpos, 0);
+    defer freeDeserializedDescribeTopicPartitionsResponse(&resp);
+
+    try testing.expectEqual(response.?.len, rpos);
+    try testing.expectEqual(@as(i32, 0), resp.throttle_time_ms);
+    try testing.expectEqual(@as(usize, 2), resp.topics.len);
+    try testing.expect(resp.next_cursor == null);
+
+    try testing.expectEqualStrings("dtp-topic", resp.topics[0].name.?);
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.none)), resp.topics[0].error_code);
+    try testing.expectEqual(@as(usize, 3), resp.topics[0].partitions.len);
+    try testing.expectEqual(@as(i32, 0), resp.topics[0].partitions[0].partition_index);
+    try testing.expectEqual(@as(i32, 7), resp.topics[0].partitions[0].leader_id);
+    try testing.expectEqual(@as(i32, 4), resp.topics[0].partitions[0].leader_epoch);
+    try testing.expectEqual(@as(usize, 1), resp.topics[0].partitions[0].replica_nodes.len);
+    try testing.expectEqual(@as(i32, 7), resp.topics[0].partitions[0].replica_nodes[0]);
+    try testing.expectEqual(@as(usize, 1), resp.topics[0].partitions[0].isr_nodes.len);
+    try testing.expectEqual(@as(i32, 7), resp.topics[0].partitions[0].isr_nodes[0]);
+
+    try testing.expectEqualStrings("missing-dtp-topic", resp.topics[1].name.?);
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.unknown_topic_or_partition)), resp.topics[1].error_code);
+    try testing.expectEqual(@as(usize, 0), resp.topics[1].partitions.len);
+}
+
+test "Broker.handleRequest DescribeTopicPartitions applies response partition cursor" {
+    const Req = generated.describe_topic_partitions_request.DescribeTopicPartitionsRequest;
+    const Resp = generated.describe_topic_partitions_response.DescribeTopicPartitionsResponse;
+
+    var broker = Broker.init(testing.allocator, 3, 19093);
+    defer broker.deinit();
+    try testing.expect(broker.ensureTopic("dtp-cursor-topic"));
+    if (broker.topics.getPtr("dtp-cursor-topic")) |topic| {
+        topic.num_partitions = 3;
+    }
+    try broker.store.ensurePartition("dtp-cursor-topic", 1);
+    try broker.store.ensurePartition("dtp-cursor-topic", 2);
+
+    const topics = [_]Req.TopicRequest{.{ .name = "dtp-cursor-topic" }};
+    const req = Req{
+        .topics = &topics,
+        .response_partition_limit = 1,
+        .cursor = .{ .topic_name = "dtp-cursor-topic", .partition_index = 1 },
+    };
+
+    var buf: [1024]u8 = undefined;
+    var pos = buildTestRequest(&buf, 75, 0, 7501, header_mod.requestHeaderVersion(75, 0));
+    req.serialize(&buf, &pos, 0);
+
+    const response = broker.handleRequest(buf[0..pos]);
+    try testing.expect(response != null);
+    defer testing.allocator.free(response.?);
+
+    var rpos: usize = 0;
+    var response_header = try ResponseHeader.deserialize(testing.allocator, response.?, &rpos, header_mod.responseHeaderVersion(75, 0));
+    defer response_header.deinit(testing.allocator);
+    try testing.expectEqual(@as(i32, 7501), response_header.correlation_id);
+
+    const resp = try Resp.deserialize(testing.allocator, response.?, &rpos, 0);
+    defer freeDeserializedDescribeTopicPartitionsResponse(&resp);
+
+    try testing.expectEqual(response.?.len, rpos);
+    try testing.expectEqual(@as(usize, 1), resp.topics.len);
+    try testing.expectEqual(@as(usize, 1), resp.topics[0].partitions.len);
+    try testing.expectEqual(@as(i32, 1), resp.topics[0].partitions[0].partition_index);
+    try testing.expect(resp.next_cursor != null);
+    try testing.expectEqualStrings("dtp-cursor-topic", resp.next_cursor.?.topic_name.?);
+    try testing.expectEqual(@as(i32, 2), resp.next_cursor.?.partition_index);
+}
+
+test "Broker.handleRequest DescribeTopicPartitions rejects truncated request" {
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+
+    var buf: [128]u8 = undefined;
+    const req_len = buildTestRequest(&buf, 75, 0, 7502, header_mod.requestHeaderVersion(75, 0));
     try testing.expect(broker.handleRequest(buf[0..req_len]) == null);
 }
 
