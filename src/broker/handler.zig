@@ -18319,6 +18319,7 @@ test "Broker AutoMQ router snapshot describe and group APIs" {
     const UpdateGroupResp = generated.automq_update_group_response.AutomqUpdateGroupResponse;
 
     try testing.expect(broker.ensureTopic("snap-topic"));
+    _ = try broker.store.produce("snap-topic", 0, "snapshot-record-batch");
     const stream = try broker.object_manager.createStream(1);
     const stream_id: i64 = @intCast(stream.stream_id);
 
@@ -18431,6 +18432,26 @@ test "Broker AutoMQ router snapshot describe and group APIs" {
     }
     try testing.expectEqual(@as(i16, 0), snapshot_resp.error_code);
     try testing.expect(snapshot_resp.topics.len >= 1);
+    const snap_topic = broker.topics.get("snap-topic").?;
+    const expected_partition_stream_id: i64 = @intCast(PartitionStore.hashPartitionKey("snap-topic", 0));
+    var found_snap_topic = false;
+    for (snapshot_resp.topics) |topic| {
+        if (!std.mem.eql(u8, &topic.topic_id, &snap_topic.topic_id)) continue;
+        found_snap_topic = true;
+        try testing.expect(topic.partitions.len >= 1);
+        var found_partition = false;
+        for (topic.partitions) |partition| {
+            if (partition.partition_index != 0) continue;
+            found_partition = true;
+            try testing.expect(partition.log_end_offset != null);
+            try testing.expectEqual(@as(i64, 1), partition.log_end_offset.?.message_offset);
+            try testing.expect(partition.stream_metadata.len >= 1);
+            try testing.expectEqual(expected_partition_stream_id, partition.stream_metadata[0].stream_id);
+            try testing.expectEqual(@as(i64, 1), partition.stream_metadata[0].end_offset);
+        }
+        try testing.expect(found_partition);
+    }
+    try testing.expect(found_snap_topic);
 
     pos = buildTestRequest(&buf, 602, 0, 6020, 2);
     const update_group_req = UpdateGroupReq{ .link_id = "link-a", .group_id = "group-a", .promoted = true };
