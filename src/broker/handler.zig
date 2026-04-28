@@ -3471,20 +3471,33 @@ pub const Broker = struct {
     };
 
     fn findCoordinatorOutcome(self: *Broker, key: ?[]const u8, key_type: i8, api_version: i16) FindCoordinatorOutcome {
-        if (key == null) return findCoordinatorError(ErrorCode.invalid_request);
+        const resolved_key = key orelse return findCoordinatorError(ErrorCode.invalid_request);
 
         return switch (key_type) {
-            0, 1 => .{
-                .error_code = ErrorCode.none,
-                .node_id = self.node_id,
-                .host = self.advertised_host,
-                .port = @intCast(self.port),
-            },
-            2 => if (api_version >= 6)
-                findCoordinatorError(ErrorCode.coordinator_not_available)
+            0 => if (resolved_key.len == 0)
+                findCoordinatorError(ErrorCode.invalid_group_id)
             else
-                findCoordinatorError(ErrorCode.invalid_request),
+                self.findCoordinatorSuccess(),
+            1 => if (resolved_key.len == 0)
+                findCoordinatorError(ErrorCode.invalid_request)
+            else
+                self.findCoordinatorSuccess(),
+            2 => if (api_version < 6)
+                findCoordinatorError(ErrorCode.invalid_request)
+            else if (resolved_key.len == 0)
+                findCoordinatorError(ErrorCode.invalid_group_id)
+            else
+                findCoordinatorError(ErrorCode.coordinator_not_available),
             else => findCoordinatorError(ErrorCode.invalid_request),
+        };
+    }
+
+    fn findCoordinatorSuccess(self: *Broker) FindCoordinatorOutcome {
+        return .{
+            .error_code = ErrorCode.none,
+            .node_id = self.node_id,
+            .host = self.advertised_host,
+            .port = @intCast(self.port),
         };
     }
 
@@ -11241,6 +11254,39 @@ test "Broker.handleRequest FindCoordinator rejects invalid legacy coordinator ty
     try testing.expectEqual(@as(i32, -1), resp.port);
 }
 
+test "Broker.handleRequest FindCoordinator rejects empty group key" {
+    const Req = generated.find_coordinator_request.FindCoordinatorRequest;
+    const Resp = generated.find_coordinator_response.FindCoordinatorResponse;
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+
+    const req = Req{
+        .key = "",
+        .key_type = 0,
+    };
+
+    var buf: [256]u8 = undefined;
+    var pos = buildTestRequest(&buf, 10, 3, 1003, header_mod.requestHeaderVersion(10, 3));
+    req.serialize(&buf, &pos, 3);
+
+    const response = broker.handleRequest(buf[0..pos]);
+    try testing.expect(response != null);
+    defer testing.allocator.free(response.?);
+
+    var rpos: usize = 0;
+    var response_header = try ResponseHeader.deserialize(testing.allocator, response.?, &rpos, header_mod.responseHeaderVersion(10, 3));
+    defer response_header.deinit(testing.allocator);
+    try testing.expectEqual(@as(i32, 1003), response_header.correlation_id);
+
+    const resp = try Resp.deserialize(testing.allocator, response.?, &rpos, 3);
+    try testing.expectEqual(response.?.len, rpos);
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.invalid_group_id)), resp.error_code);
+    try testing.expectEqual(@as(i32, -1), resp.node_id);
+    try testing.expectEqualStrings("", resp.host.?);
+    try testing.expectEqual(@as(i32, -1), resp.port);
+}
+
 test "Broker.handleRequest FindCoordinator v4 returns generated batch coordinators" {
     const Req = generated.find_coordinator_request.FindCoordinatorRequest;
     const Resp = generated.find_coordinator_response.FindCoordinatorResponse;
@@ -11278,6 +11324,47 @@ test "Broker.handleRequest FindCoordinator v4 returns generated batch coordinato
     try testing.expectEqualStrings("localhost", resp.coordinators[0].host.?);
     try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.none)), resp.coordinators[0].error_code);
     try testing.expectEqualStrings("group-b", resp.coordinators[1].key.?);
+}
+
+test "Broker.handleRequest FindCoordinator reports empty batch group key per coordinator" {
+    const Req = generated.find_coordinator_request.FindCoordinatorRequest;
+    const Resp = generated.find_coordinator_response.FindCoordinatorResponse;
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+
+    const keys = [_]?[]const u8{ "", "group-b" };
+    const req = Req{
+        .key_type = 0,
+        .coordinator_keys = &keys,
+    };
+
+    var buf: [512]u8 = undefined;
+    var pos = buildTestRequest(&buf, 10, 4, 1008, header_mod.requestHeaderVersion(10, 4));
+    req.serialize(&buf, &pos, 4);
+
+    const response = broker.handleRequest(buf[0..pos]);
+    try testing.expect(response != null);
+    defer testing.allocator.free(response.?);
+
+    var rpos: usize = 0;
+    var response_header = try ResponseHeader.deserialize(testing.allocator, response.?, &rpos, header_mod.responseHeaderVersion(10, 4));
+    defer response_header.deinit(testing.allocator);
+    try testing.expectEqual(@as(i32, 1008), response_header.correlation_id);
+
+    const resp = try Resp.deserialize(testing.allocator, response.?, &rpos, 4);
+    defer if (resp.coordinators.len > 0) testing.allocator.free(resp.coordinators);
+
+    try testing.expectEqual(response.?.len, rpos);
+    try testing.expectEqual(@as(usize, 2), resp.coordinators.len);
+    try testing.expectEqualStrings("", resp.coordinators[0].key.?);
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.invalid_group_id)), resp.coordinators[0].error_code);
+    try testing.expectEqual(@as(i32, -1), resp.coordinators[0].node_id);
+    try testing.expectEqualStrings("", resp.coordinators[0].host.?);
+    try testing.expectEqual(@as(i32, -1), resp.coordinators[0].port);
+    try testing.expectEqualStrings("group-b", resp.coordinators[1].key.?);
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.none)), resp.coordinators[1].error_code);
+    try testing.expectEqual(@as(i32, 1), resp.coordinators[1].node_id);
 }
 
 test "Broker.handleRequest FindCoordinator rejects invalid batch coordinator type" {
