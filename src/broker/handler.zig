@@ -1734,6 +1734,7 @@ pub const Broker = struct {
             75 => self.handleDescribeTopicPartitions(request_bytes, pos, &req_header, api_version, resp_header_version),
             76 => self.handleShareGroupHeartbeat(request_bytes, pos, &req_header, api_version, resp_header_version),
             77 => self.handleShareGroupDescribe(request_bytes, pos, &req_header, api_version, resp_header_version),
+            78 => self.handleShareFetch(request_bytes, pos, &req_header, api_version, resp_header_version),
             501 => self.handleCreateStreams(request_bytes, pos, &req_header, api_version, resp_header_version),
             502 => self.handleOpenStreams(request_bytes, pos, &req_header, api_version, resp_header_version),
             503 => self.handleCloseStreams(request_bytes, pos, &req_header, api_version, resp_header_version),
@@ -4961,6 +4962,67 @@ pub const Broker = struct {
             .members = &.{},
             .authorized_operations = describeGroupsAuthorizedOps(include_authorized_operations),
         };
+    }
+
+    // ---------------------------------------------------------------
+    // ShareFetch (key 78) — non-advertised until share sessions exist
+    // ---------------------------------------------------------------
+    fn handleShareFetch(self: *Broker, request_bytes: []const u8, body_start: usize, req_header: *const RequestHeader, api_version: i16, resp_header_version: i16) ?[]u8 {
+        const Req = generated.share_fetch_request.ShareFetchRequest;
+        const Resp = generated.share_fetch_response.ShareFetchResponse;
+
+        if (!validateShareFetchRequestFrame(request_bytes, body_start)) {
+            log.warn("Malformed ShareFetch request", .{});
+            const resp = Resp{
+                .throttle_time_ms = 0,
+                .error_code = ErrorCode.invalid_request.toInt(),
+                .error_message = "malformed ShareFetch request",
+                .responses = &.{},
+                .node_endpoints = &.{},
+            };
+            return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+        }
+
+        var pos = body_start;
+        var req = Req.deserialize(self.allocator, request_bytes, &pos, api_version) catch |err| {
+            log.warn("Failed to decode ShareFetch request: {}", .{err});
+            const resp = Resp{
+                .throttle_time_ms = 0,
+                .error_code = ErrorCode.invalid_request.toInt(),
+                .error_message = "malformed ShareFetch request",
+                .responses = &.{},
+                .node_endpoints = &.{},
+            };
+            return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+        };
+        defer self.freeShareFetchRequest(&req);
+
+        const resp = Resp{
+            .throttle_time_ms = 0,
+            .error_code = ErrorCode.unsupported_version.toInt(),
+            .error_message = "ShareFetch is not implemented",
+            .responses = &.{},
+            .node_endpoints = &.{},
+        };
+        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+    }
+
+    fn freeShareFetchRequest(self: *Broker, req: *generated.share_fetch_request.ShareFetchRequest) void {
+        for (req.topics) |topic| {
+            for (topic.partitions) |partition| {
+                for (partition.acknowledgement_batches) |batch| {
+                    if (batch.acknowledge_types.len > 0) self.allocator.free(batch.acknowledge_types);
+                }
+                if (partition.acknowledgement_batches.len > 0) self.allocator.free(partition.acknowledgement_batches);
+            }
+            if (topic.partitions.len > 0) self.allocator.free(topic.partitions);
+        }
+        if (req.topics.len > 0) self.allocator.free(req.topics);
+
+        for (req.forgotten_topics_data) |topic| {
+            if (topic.partitions.len > 0) self.allocator.free(topic.partitions);
+        }
+        if (req.forgotten_topics_data.len > 0) self.allocator.free(req.forgotten_topics_data);
     }
 
     // ---------------------------------------------------------------
@@ -11572,6 +11634,44 @@ pub const Broker = struct {
             if (!skipKafkaString(buf, &pos, true)) return false; // group_id
         }
         if (!skipFixedBytes(buf, &pos, 1)) return false; // include_authorized_operations
+        ser.skipTaggedFields(buf, &pos) catch return false;
+        return pos == buf.len;
+    }
+
+    fn validateShareFetchRequestFrame(buf: []const u8, start_pos: usize) bool {
+        var pos = start_pos;
+
+        if (!skipKafkaString(buf, &pos, true)) return false; // group_id
+        if (!skipKafkaString(buf, &pos, true)) return false; // member_id
+        if (!skipFixedBytes(buf, &pos, 16)) return false; // share_session_epoch + max_wait_ms + min_bytes + max_bytes
+
+        const topic_count = readKafkaArrayCount(buf, &pos, true) orelse return false;
+        for (0..topic_count) |_| {
+            if (!skipFixedBytes(buf, &pos, 16)) return false; // topic_id
+
+            const partition_count = readKafkaArrayCount(buf, &pos, true) orelse return false;
+            for (0..partition_count) |_| {
+                if (!skipFixedBytes(buf, &pos, 8)) return false; // partition_index + partition_max_bytes
+
+                const ack_batch_count = readKafkaArrayCount(buf, &pos, true) orelse return false;
+                for (0..ack_batch_count) |_| {
+                    if (!skipFixedBytes(buf, &pos, 16)) return false; // first_offset + last_offset
+                    const ack_type_count = readKafkaArrayCount(buf, &pos, true) orelse return false;
+                    if (!skipFixedBytes(buf, &pos, ack_type_count)) return false; // acknowledge_types
+                    ser.skipTaggedFields(buf, &pos) catch return false;
+                }
+                ser.skipTaggedFields(buf, &pos) catch return false;
+            }
+            ser.skipTaggedFields(buf, &pos) catch return false;
+        }
+
+        const forgotten_topic_count = readKafkaArrayCount(buf, &pos, true) orelse return false;
+        for (0..forgotten_topic_count) |_| {
+            if (!skipFixedBytes(buf, &pos, 16)) return false; // topic_id
+            if (!skipCompactI32Array(buf, &pos)) return false; // partitions
+            ser.skipTaggedFields(buf, &pos) catch return false;
+        }
+
         ser.skipTaggedFields(buf, &pos) catch return false;
         return pos == buf.len;
     }
@@ -21331,6 +21431,119 @@ test "Broker.handleRequest ShareGroupDescribe rejects malformed request" {
     try testing.expectEqual(response.?.len, rpos);
     try testing.expectEqual(@as(usize, 1), resp.groups.len);
     try testing.expectEqual(ErrorCode.invalid_request.toInt(), resp.groups[0].error_code);
+}
+
+test "Broker.handleRequest ShareFetch returns generated fail-closed response" {
+    const Req = generated.share_fetch_request.ShareFetchRequest;
+    const Resp = generated.share_fetch_response.ShareFetchResponse;
+    const FetchTopic = Req.FetchTopic;
+    const FetchPartition = FetchTopic.FetchPartition;
+    const AcknowledgementBatch = FetchPartition.AcknowledgementBatch;
+    const ForgottenTopic = Req.ForgottenTopic;
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+
+    const topic_id = [_]u8{1} ** 16;
+    const acknowledge_types = [_]i8{ 1, 2 };
+    const acknowledgement_batches = [_]AcknowledgementBatch{.{
+        .first_offset = 0,
+        .last_offset = 1,
+        .acknowledge_types = &acknowledge_types,
+    }};
+    const partitions = [_]FetchPartition{.{
+        .partition_index = 0,
+        .partition_max_bytes = 1024,
+        .acknowledgement_batches = &acknowledgement_batches,
+    }};
+    const topics = [_]FetchTopic{.{
+        .topic_id = topic_id,
+        .partitions = &partitions,
+    }};
+    const forgotten_partitions = [_]i32{0};
+    const forgotten_topics = [_]ForgottenTopic{.{
+        .topic_id = topic_id,
+        .partitions = &forgotten_partitions,
+    }};
+    const req = Req{
+        .group_id = "share-group",
+        .member_id = "share-member",
+        .share_session_epoch = 0,
+        .max_wait_ms = 1,
+        .min_bytes = 1,
+        .max_bytes = 1024,
+        .topics = &topics,
+        .forgotten_topics_data = &forgotten_topics,
+    };
+
+    var buf: [512]u8 = undefined;
+    var pos = buildTestRequest(&buf, 78, 0, 7800, header_mod.requestHeaderVersion(78, 0));
+    req.serialize(&buf, &pos, 0);
+
+    const response = broker.handleRequest(buf[0..pos]);
+    try testing.expect(response != null);
+    defer testing.allocator.free(response.?);
+
+    var rpos: usize = 0;
+    var response_header = try ResponseHeader.deserialize(testing.allocator, response.?, &rpos, header_mod.responseHeaderVersion(78, 0));
+    defer response_header.deinit(testing.allocator);
+    try testing.expectEqual(@as(i32, 7800), response_header.correlation_id);
+
+    const resp = try Resp.deserialize(testing.allocator, response.?, &rpos, 0);
+    defer {
+        for (resp.responses) |topic| {
+            for (topic.partitions) |partition| {
+                if (partition.acquired_records.len > 0) testing.allocator.free(partition.acquired_records);
+            }
+            if (topic.partitions.len > 0) testing.allocator.free(topic.partitions);
+        }
+        if (resp.responses.len > 0) testing.allocator.free(resp.responses);
+        if (resp.node_endpoints.len > 0) testing.allocator.free(resp.node_endpoints);
+    }
+
+    try testing.expectEqual(response.?.len, rpos);
+    try testing.expectEqual(@as(i32, 0), resp.throttle_time_ms);
+    try testing.expectEqual(ErrorCode.unsupported_version.toInt(), resp.error_code);
+    try testing.expectEqualStrings("ShareFetch is not implemented", resp.error_message.?);
+    try testing.expectEqual(@as(usize, 0), resp.responses.len);
+    try testing.expectEqual(@as(usize, 0), resp.node_endpoints.len);
+}
+
+test "Broker.handleRequest ShareFetch rejects malformed request" {
+    const Resp = generated.share_fetch_response.ShareFetchResponse;
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+
+    var buf: [128]u8 = undefined;
+    var pos = buildTestRequest(&buf, 78, 0, 7801, header_mod.requestHeaderVersion(78, 0));
+    ser.writeCompactString(&buf, &pos, "share-group");
+    ser.writeCompactString(&buf, &pos, "share-member"); // missing session fields and arrays
+
+    const response = broker.handleRequest(buf[0..pos]);
+    try testing.expect(response != null);
+    defer testing.allocator.free(response.?);
+
+    var rpos: usize = 0;
+    var response_header = try ResponseHeader.deserialize(testing.allocator, response.?, &rpos, header_mod.responseHeaderVersion(78, 0));
+    defer response_header.deinit(testing.allocator);
+    try testing.expectEqual(@as(i32, 7801), response_header.correlation_id);
+
+    const resp = try Resp.deserialize(testing.allocator, response.?, &rpos, 0);
+    defer {
+        for (resp.responses) |topic| {
+            for (topic.partitions) |partition| {
+                if (partition.acquired_records.len > 0) testing.allocator.free(partition.acquired_records);
+            }
+            if (topic.partitions.len > 0) testing.allocator.free(topic.partitions);
+        }
+        if (resp.responses.len > 0) testing.allocator.free(resp.responses);
+        if (resp.node_endpoints.len > 0) testing.allocator.free(resp.node_endpoints);
+    }
+
+    try testing.expectEqual(response.?.len, rpos);
+    try testing.expectEqual(ErrorCode.invalid_request.toInt(), resp.error_code);
+    try testing.expectEqualStrings("malformed ShareFetch request", resp.error_message.?);
 }
 
 test "Broker.handleRequest ConsumerGroupDescribe v0 returns generated group state" {
