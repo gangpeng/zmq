@@ -53,7 +53,7 @@ pub const broker_supported_apis = [_]BrokerApiSupport{
     .{ .key = 13, .name = "LeaveGroup", .metric = "leave_group", .min = 0, .max = 5 },
     .{ .key = 14, .name = "SyncGroup", .metric = "sync_group", .min = 0, .max = 5 },
     .{ .key = 15, .name = "DescribeGroups", .metric = "describe_groups", .min = 0, .max = 5 },
-    .{ .key = 16, .name = "ListGroups", .metric = "list_groups", .min = 0, .max = 4 },
+    .{ .key = 16, .name = "ListGroups", .metric = "list_groups", .min = 0, .max = 5 },
     .{ .key = 17, .name = "SaslHandshake", .metric = "sasl_handshake", .min = 0, .max = 1 },
     .{ .key = 18, .name = "ApiVersions", .metric = "api_versions", .min = 0, .max = 4 },
     .{ .key = 19, .name = "CreateTopics", .metric = "create_topics", .min = 0, .max = 7 },

@@ -12192,6 +12192,70 @@ test "Broker.handleRequest ListGroups v4 state filter can return no groups" {
     try testing.expectEqual(@as(usize, 0), resp.groups.len);
 }
 
+test "Broker.handleRequest ListGroups v5 applies group type filters" {
+    const Req = generated.list_groups_request.ListGroupsRequest;
+    const Resp = generated.list_groups_response.ListGroupsResponse;
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+    _ = try broker.groups.joinGroup("typed-listed-group", null, "consumer", null);
+
+    const states = [_]?[]const u8{"PreparingRebalance"};
+    const classic_types = [_]?[]const u8{"classic"};
+    const classic_req = Req{
+        .states_filter = &states,
+        .types_filter = &classic_types,
+    };
+
+    var buf: [512]u8 = undefined;
+    var pos = buildTestRequest(&buf, 16, 5, 1607, header_mod.requestHeaderVersion(16, 5));
+    classic_req.serialize(&buf, &pos, 5);
+
+    const response = broker.handleRequest(buf[0..pos]);
+    try testing.expect(response != null);
+    defer testing.allocator.free(response.?);
+
+    var rpos: usize = 0;
+    var response_header = try ResponseHeader.deserialize(testing.allocator, response.?, &rpos, header_mod.responseHeaderVersion(16, 5));
+    defer response_header.deinit(testing.allocator);
+    try testing.expectEqual(@as(i32, 1607), response_header.correlation_id);
+
+    const resp = try Resp.deserialize(testing.allocator, response.?, &rpos, 5);
+    defer if (resp.groups.len > 0) testing.allocator.free(resp.groups);
+
+    try testing.expectEqual(response.?.len, rpos);
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.none)), resp.error_code);
+    try testing.expectEqual(@as(usize, 1), resp.groups.len);
+    try testing.expectEqualStrings("typed-listed-group", resp.groups[0].group_id.?);
+    try testing.expectEqualStrings("PreparingRebalance", resp.groups[0].group_state.?);
+    try testing.expectEqualStrings("classic", resp.groups[0].group_type.?);
+
+    const consumer_types = [_]?[]const u8{"consumer"};
+    const consumer_req = Req{
+        .states_filter = &states,
+        .types_filter = &consumer_types,
+    };
+
+    pos = buildTestRequest(&buf, 16, 5, 1608, header_mod.requestHeaderVersion(16, 5));
+    consumer_req.serialize(&buf, &pos, 5);
+
+    const filtered_response = broker.handleRequest(buf[0..pos]);
+    try testing.expect(filtered_response != null);
+    defer testing.allocator.free(filtered_response.?);
+
+    rpos = 0;
+    var filtered_header = try ResponseHeader.deserialize(testing.allocator, filtered_response.?, &rpos, header_mod.responseHeaderVersion(16, 5));
+    defer filtered_header.deinit(testing.allocator);
+    try testing.expectEqual(@as(i32, 1608), filtered_header.correlation_id);
+
+    const filtered_resp = try Resp.deserialize(testing.allocator, filtered_response.?, &rpos, 5);
+    defer if (filtered_resp.groups.len > 0) testing.allocator.free(filtered_resp.groups);
+
+    try testing.expectEqual(filtered_response.?.len, rpos);
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.none)), filtered_resp.error_code);
+    try testing.expectEqual(@as(usize, 0), filtered_resp.groups.len);
+}
+
 test "Broker.handleRequest ListGroups rejects truncated request" {
     var broker = Broker.init(testing.allocator, 1, 9092);
     defer broker.deinit();
