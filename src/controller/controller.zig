@@ -102,6 +102,11 @@ pub const Controller = struct {
 
         log.debug("Controller api_key={d} corr={d}", .{ api_key, req_header.correlation_id });
 
+        if (api_key != 18 and api_support.findControllerSupport(api_key) != null and !api_support.isControllerVersionSupported(api_key, api_version)) {
+            log.warn("Unsupported controller API version: api_key={d} v={d}", .{ api_key, api_version });
+            return self.handleUnsupported(&req_header, api_key, resp_header_version);
+        }
+
         return switch (api_key) {
             18 => self.handleApiVersions(&req_header, api_version, resp_header_version),
             52 => self.handleVote(request_bytes, pos, &req_header, api_version, resp_header_version),
@@ -1741,6 +1746,43 @@ test "Controller handleRequest unsupported API returns error" {
     // error_code: 35 (UNSUPPORTED_VERSION)
     const error_code = ser.readI16(response.?, &rpos);
     try testing.expectEqual(@as(i16, 35), error_code);
+}
+
+test "Controller handleRequest advertised APIs reject versions above catalog max before body decode" {
+    var ctrl = Controller.init(testing.allocator, 1, "test-cluster");
+    defer ctrl.deinit();
+
+    for (api_support.controller_supported_apis) |api| {
+        if (api.key == 18) continue; // ApiVersions remains probeable for version negotiation.
+
+        const unsupported_version = api.max + 1;
+        const correlation_id: i32 = 910_000 + @as(i32, @intCast(api.key));
+        var buf: [128]u8 = undefined;
+        const req_len = buildTestRequest(
+            &buf,
+            api.key,
+            unsupported_version,
+            correlation_id,
+            header_mod.requestHeaderVersion(api.key, unsupported_version),
+        );
+
+        const response = ctrl.handleRequest(buf[0..req_len]);
+        try testing.expect(response != null);
+        defer testing.allocator.free(response.?);
+
+        var rpos: usize = 0;
+        var resp_header = try ResponseHeader.deserialize(
+            testing.allocator,
+            response.?,
+            &rpos,
+            header_mod.responseHeaderVersion(api.key, unsupported_version),
+        );
+        defer resp_header.deinit(testing.allocator);
+
+        try testing.expectEqual(correlation_id, resp_header.correlation_id);
+        try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.unsupported_version)), ser.readI16(response.?, &rpos));
+        try testing.expectEqual(response.?.len, rpos);
+    }
 }
 
 test "Controller handleRequest Vote grants to valid candidate" {
