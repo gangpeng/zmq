@@ -395,18 +395,33 @@ pub const MetadataPersistence = struct {
         offset: i64,
     };
 
+    pub const TransactionPartitionEntry = struct {
+        topic: []const u8,
+        partition: i32,
+    };
+
     pub const TransactionEntry = struct {
         producer_id: i64,
         producer_epoch: i16,
         status: u8,
         timeout_ms: i32,
         transactional_id: ?[]u8,
+        partitions: []const TransactionPartitionEntry = &.{},
     };
 
     pub const TransactionSnapshot = struct {
         next_producer_id: i64,
         entries: []TransactionEntry,
     };
+
+    pub fn freeTransactionSnapshot(self: *MetadataPersistence, snapshot: TransactionSnapshot) void {
+        for (snapshot.entries) |entry| {
+            if (entry.transactional_id) |tid| self.allocator.free(tid);
+            for (entry.partitions) |partition| self.allocator.free(partition.topic);
+            if (entry.partitions.len > 0) self.allocator.free(entry.partitions);
+        }
+        if (snapshot.entries.len > 0) self.allocator.free(snapshot.entries);
+    }
 
     pub const ProducerSequenceEntry = struct {
         producer_id: i64,
@@ -451,14 +466,20 @@ pub const MetadataPersistence = struct {
         var it = coordinator.transactions.iterator();
         while (it.next()) |entry| {
             const txn = entry.value_ptr;
-            const tid_str: []const u8 = if (txn.transactional_id) |tid| tid else "";
-            try writer.print("{d}\t{d}\t{d}\t{d}\t{s}\n", .{
+            try writer.print("txn_v2\t{d}\t{d}\t{d}\t{d}\t", .{
                 txn.producer_id,
                 txn.producer_epoch,
                 @intFromEnum(txn.status),
                 txn.timeout_ms,
-                tid_str,
             });
+            if (txn.transactional_id) |tid| try writeHex(file, tid);
+            try writer.print("\t{d}", .{txn.partitions.items.len});
+            for (txn.partitions.items) |partition| {
+                try file.writeAll("\t");
+                try writeHex(file, partition.topic);
+                try writer.print("\t{d}", .{partition.partition});
+            }
+            try file.writeAll("\n");
         }
         try file.sync();
     }
@@ -484,6 +505,14 @@ pub const MetadataPersistence = struct {
         defer self.allocator.free(content);
 
         var entries = std.array_list.Managed(TransactionEntry).init(self.allocator);
+        errdefer {
+            for (entries.items) |entry| {
+                if (entry.transactional_id) |tid| self.allocator.free(tid);
+                for (entry.partitions) |partition| self.allocator.free(partition.topic);
+                if (entry.partitions.len > 0) self.allocator.free(entry.partitions);
+            }
+            entries.deinit();
+        }
         var next_pid: i64 = 1000;
 
         var lines = std.mem.splitSequence(u8, content, "\n");
@@ -498,12 +527,81 @@ pub const MetadataPersistence = struct {
             }
         }
 
-        // Remaining lines: producer_id\tepoch\tstatus\ttimeout_ms\ttransactional_id
+        // Remaining lines: txn_v2 rows, or legacy producer_id rows from older snapshots.
         while (lines.next()) |line| {
             if (line.len == 0) continue;
 
             var fields = std.mem.splitSequence(u8, line, "\t");
-            const pid_str = fields.next() orelse continue;
+            const first = fields.next() orelse continue;
+
+            if (std.mem.eql(u8, first, "txn_v2")) {
+                const pid_str = fields.next() orelse continue;
+                const epoch_str = fields.next() orelse continue;
+                const status_str = fields.next() orelse continue;
+                const timeout_str = fields.next() orelse continue;
+                const tid_hex = fields.next() orelse continue;
+                const partition_count_str = fields.next() orelse continue;
+
+                const pid = std.fmt.parseInt(i64, pid_str, 10) catch continue;
+                const epoch = std.fmt.parseInt(i16, epoch_str, 10) catch continue;
+                const status = std.fmt.parseInt(u8, status_str, 10) catch continue;
+                const timeout = std.fmt.parseInt(i32, timeout_str, 10) catch continue;
+                const partition_count = std.fmt.parseInt(usize, partition_count_str, 10) catch continue;
+
+                const tid: ?[]u8 = if (tid_hex.len > 0)
+                    decodeHexAlloc(self.allocator, tid_hex) catch continue
+                else
+                    null;
+                errdefer if (tid) |owned_tid| self.allocator.free(owned_tid);
+
+                var partitions = std.array_list.Managed(TransactionPartitionEntry).init(self.allocator);
+                defer partitions.deinit();
+                errdefer for (partitions.items) |partition| self.allocator.free(partition.topic);
+                var valid_partitions = true;
+                for (0..partition_count) |_| {
+                    const topic_hex = fields.next() orelse {
+                        valid_partitions = false;
+                        break;
+                    };
+                    const partition_str = fields.next() orelse {
+                        valid_partitions = false;
+                        break;
+                    };
+                    const topic = decodeHexAlloc(self.allocator, topic_hex) catch {
+                        valid_partitions = false;
+                        break;
+                    };
+                    errdefer self.allocator.free(topic);
+                    const partition = std.fmt.parseInt(i32, partition_str, 10) catch {
+                        self.allocator.free(topic);
+                        valid_partitions = false;
+                        break;
+                    };
+                    try partitions.append(.{ .topic = topic, .partition = partition });
+                }
+                if (!valid_partitions) {
+                    for (partitions.items) |partition| self.allocator.free(partition.topic);
+                    if (tid) |owned_tid| self.allocator.free(owned_tid);
+                    continue;
+                }
+
+                const owned_partitions = try partitions.toOwnedSlice();
+                errdefer {
+                    for (owned_partitions) |partition| self.allocator.free(partition.topic);
+                    if (owned_partitions.len > 0) self.allocator.free(owned_partitions);
+                }
+                try entries.append(.{
+                    .producer_id = pid,
+                    .producer_epoch = epoch,
+                    .status = status,
+                    .timeout_ms = timeout,
+                    .transactional_id = tid,
+                    .partitions = owned_partitions,
+                });
+                continue;
+            }
+
+            const pid_str = first;
             const epoch_str = fields.next() orelse continue;
             const status_str = fields.next() orelse continue;
             const timeout_str = fields.next() orelse continue;
@@ -518,6 +616,7 @@ pub const MetadataPersistence = struct {
                 try self.allocator.dupe(u8, tid_str)
             else
                 null;
+            errdefer if (tid) |owned_tid| self.allocator.free(owned_tid);
 
             try entries.append(.{
                 .producer_id = pid,
@@ -1315,12 +1414,7 @@ test "MetadataPersistence save and load transactions round-trip" {
     try persistence.saveTransactions(&coord);
 
     const snapshot = try persistence.loadTransactions();
-    defer {
-        for (snapshot.entries) |e| {
-            if (e.transactional_id) |tid| testing.allocator.free(tid);
-        }
-        testing.allocator.free(snapshot.entries);
-    }
+    defer persistence.freeTransactionSnapshot(snapshot);
 
     try testing.expectEqual(coord.next_producer_id, snapshot.next_producer_id);
     try testing.expectEqual(@as(usize, 2), snapshot.entries.len);
@@ -1332,6 +1426,9 @@ test "MetadataPersistence save and load transactions round-trip" {
             if (std.mem.eql(u8, tid, "persist-txn")) {
                 found_tid = true;
                 try testing.expectEqual(@as(i16, 0), e.producer_epoch);
+                try testing.expectEqual(@as(usize, 1), e.partitions.len);
+                try testing.expectEqualStrings("topic-a", e.partitions[0].topic);
+                try testing.expectEqual(@as(i32, 0), e.partitions[0].partition);
             }
         }
     }
@@ -1347,6 +1444,7 @@ test "MetadataPersistence load transactions missing file" {
     var persistence = MetadataPersistence.init(testing.allocator, tmp_dir);
 
     const snapshot = try persistence.loadTransactions();
+    defer persistence.freeTransactionSnapshot(snapshot);
     try testing.expectEqual(@as(i64, 1000), snapshot.next_producer_id);
     try testing.expectEqual(@as(usize, 0), snapshot.entries.len);
 }

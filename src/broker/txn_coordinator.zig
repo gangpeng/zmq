@@ -401,13 +401,25 @@ pub const TransactionCoordinator = struct {
                 try self.allocator.dupe(u8, tid)
             else
                 null;
+            errdefer if (tid_copy) |tid| self.allocator.free(tid);
+
+            var partitions = std.array_list.Managed(TransactionState.TopicPartition).init(self.allocator);
+            errdefer {
+                for (partitions.items) |partition| self.allocator.free(partition.topic);
+                partitions.deinit();
+            }
+            for (entry.partitions) |partition| {
+                const topic_copy = try self.allocator.dupe(u8, partition.topic);
+                errdefer self.allocator.free(topic_copy);
+                try partitions.append(.{ .topic = topic_copy, .partition = partition.partition });
+            }
 
             try self.transactions.put(entry.producer_id, .{
                 .producer_id = entry.producer_id,
                 .producer_epoch = entry.producer_epoch,
                 .transactional_id = tid_copy,
                 .status = @enumFromInt(entry.status),
-                .partitions = std.array_list.Managed(TransactionState.TopicPartition).init(self.allocator),
+                .partitions = partitions,
                 .start_time_ms = @import("time_compat").milliTimestamp(),
                 .timeout_ms = entry.timeout_ms,
             });
@@ -818,8 +830,11 @@ test "TransactionCoordinator restoreState rebuilds from entries" {
     defer coord.deinit();
 
     const Persistence = @import("persistence.zig").MetadataPersistence;
+    const restored_partitions = [_]Persistence.TransactionPartitionEntry{
+        .{ .topic = "restored-topic", .partition = 2 },
+    };
     var entries = [_]Persistence.TransactionEntry{
-        .{ .producer_id = 2000, .producer_epoch = 3, .status = 1, .timeout_ms = 60000, .transactional_id = null },
+        .{ .producer_id = 2000, .producer_epoch = 3, .status = 1, .timeout_ms = 60000, .transactional_id = null, .partitions = &restored_partitions },
         .{ .producer_id = 2001, .producer_epoch = 0, .status = 0, .timeout_ms = 30000, .transactional_id = null },
     };
 
@@ -829,6 +844,10 @@ test "TransactionCoordinator restoreState rebuilds from entries" {
     try testing.expectEqual(@as(usize, 2), coord.transactionCount());
     try testing.expectEqual(TransactionCoordinator.TxnStatus.ongoing, coord.getStatus(2000).?);
     try testing.expectEqual(TransactionCoordinator.TxnStatus.empty, coord.getStatus(2001).?);
+    const restored = coord.getPartitions(2000).?;
+    try testing.expectEqual(@as(usize, 1), restored.len);
+    try testing.expectEqualStrings("restored-topic", restored[0].topic);
+    try testing.expectEqual(@as(i32, 2), restored[0].partition);
     try testing.expect(!coord.dirty);
 }
 

@@ -596,12 +596,7 @@ pub const Broker = struct {
 
         // Load persisted transaction state
         const txn_snapshot = try self.persistence.loadTransactions();
-        defer {
-            for (txn_snapshot.entries) |e| {
-                if (e.transactional_id) |tid| self.allocator.free(tid);
-            }
-            self.allocator.free(txn_snapshot.entries);
-        }
+        defer self.persistence.freeTransactionSnapshot(txn_snapshot);
         if (txn_snapshot.entries.len > 0 or txn_snapshot.next_producer_id > 1000) {
             try self.txn_coordinator.restoreState(txn_snapshot);
             log.info("Restored {d} transaction(s), next_producer_id={d}", .{ txn_snapshot.entries.len, txn_snapshot.next_producer_id });
@@ -5063,6 +5058,7 @@ pub const Broker = struct {
                 .error_code = @intFromEnum(ErrorCode.none),
                 .results_by_transaction = txn_results[0..txn_results_init],
             };
+            self.persistTransactionsIfDirty();
             return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
         }
 
@@ -5081,6 +5077,7 @@ pub const Broker = struct {
             .throttle_time_ms = 0,
             .results_by_topic_v3_and_below = topic_results,
         };
+        self.persistTransactionsIfDirty();
         return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
     }
 
@@ -5226,6 +5223,7 @@ pub const Broker = struct {
         }
 
         const error_code = self.txn_coordinator.endTxnComplete(req.producer_id, req.producer_epoch, req.committed);
+        self.persistTransactionsIfDirty();
 
         const resp = Resp{
             .throttle_time_ms = 0,
@@ -5566,6 +5564,7 @@ pub const Broker = struct {
             "__consumer_offsets",
             target_partition,
         ) catch 48; // INVALID_PRODUCER_ID_MAPPING on error
+        self.persistTransactionsIfDirty();
 
         const resp = Resp{
             .throttle_time_ms = 0,
@@ -7353,6 +7352,7 @@ pub const Broker = struct {
             self.persistPartitionStates();
             self.persistObjectManagerSnapshot();
         }
+        self.persistTransactionsIfDirty();
 
         const resp = Resp{ .markers = markers[0..markers_init] };
         return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
@@ -13543,12 +13543,7 @@ test "Broker.handleRequest InitProducerId persists producer allocation" {
     try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.none)), resp.error_code);
 
     const snapshot = try broker.persistence.loadTransactions();
-    defer {
-        for (snapshot.entries) |entry| {
-            if (entry.transactional_id) |tid| testing.allocator.free(tid);
-        }
-        testing.allocator.free(snapshot.entries);
-    }
+    defer broker.persistence.freeTransactionSnapshot(snapshot);
 
     try testing.expectEqual(resp.producer_id + 1, snapshot.next_producer_id);
     try testing.expectEqual(@as(usize, 1), snapshot.entries.len);
@@ -13619,6 +13614,78 @@ test "Broker.handleRequest AddPartitionsToTxn v4 returns generated response and 
     try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.none)), resp.results_by_transaction[0].topic_results[0].results_by_partition[0].partition_error_code);
     try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.none)), resp.results_by_transaction[0].topic_results[0].results_by_partition[1].partition_error_code);
     try testing.expectEqual(@as(usize, 2), broker.txn_coordinator.getPartitions(init_result.producer_id).?.len);
+}
+
+test "Broker.handleRequest AddPartitionsToTxn persists registered partitions" {
+    const fs = @import("fs_compat");
+    const Req = generated.add_partitions_to_txn_request.AddPartitionsToTxnRequest;
+    const Topic = generated.add_partitions_to_txn_request.AddPartitionsToTxnTopic;
+    const Txn = Req.AddPartitionsToTxnTransaction;
+    const Resp = generated.add_partitions_to_txn_response.AddPartitionsToTxnResponse;
+
+    const tmp_dir = "/tmp/zmq-add-partitions-to-txn-persist-test";
+    fs.deleteTreeAbsolute(tmp_dir) catch {};
+    try fs.makeDirAbsolute(tmp_dir);
+    defer fs.deleteTreeAbsolute(tmp_dir) catch {};
+
+    var broker = Broker.initWithConfig(testing.allocator, 1, 9092, .{ .data_dir = tmp_dir });
+    defer broker.deinit();
+    try broker.open();
+
+    const init_result = try broker.txn_coordinator.initProducerId("txn-add-parts-persist");
+    const partitions = [_]i32{ 0, 1 };
+    const topics = [_]Topic{.{
+        .name = "txn-add-parts-persist-topic",
+        .partitions = &partitions,
+    }};
+    const txns = [_]Txn{.{
+        .transactional_id = "txn-add-parts-persist",
+        .producer_id = init_result.producer_id,
+        .producer_epoch = init_result.producer_epoch,
+        .verify_only = false,
+        .topics = &topics,
+    }};
+    const req = Req{ .transactions = &txns };
+
+    var buf: [512]u8 = undefined;
+    var pos = buildTestRequest(&buf, 24, 4, 2406, header_mod.requestHeaderVersion(24, 4));
+    req.serialize(&buf, &pos, 4);
+
+    const response = broker.handleRequest(buf[0..pos]);
+    try testing.expect(response != null);
+    defer testing.allocator.free(response.?);
+
+    var rpos: usize = 0;
+    var response_header = try ResponseHeader.deserialize(testing.allocator, response.?, &rpos, header_mod.responseHeaderVersion(24, 4));
+    defer response_header.deinit(testing.allocator);
+    try testing.expectEqual(@as(i32, 2406), response_header.correlation_id);
+
+    const resp = try Resp.deserialize(testing.allocator, response.?, &rpos, 4);
+    defer {
+        broker.freeAddPartitionsToTxnResults(resp.results_by_transaction);
+        if (resp.results_by_transaction.len > 0) testing.allocator.free(resp.results_by_transaction);
+    }
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.none)), resp.error_code);
+
+    const snapshot = try broker.persistence.loadTransactions();
+    defer broker.persistence.freeTransactionSnapshot(snapshot);
+    try testing.expectEqual(@as(usize, 1), snapshot.entries.len);
+    try testing.expectEqual(init_result.producer_id, snapshot.entries[0].producer_id);
+    try testing.expectEqual(@as(usize, 2), snapshot.entries[0].partitions.len);
+    try testing.expectEqualStrings("txn-add-parts-persist-topic", snapshot.entries[0].partitions[0].topic);
+    try testing.expectEqual(@as(i32, 0), snapshot.entries[0].partitions[0].partition);
+    try testing.expectEqualStrings("txn-add-parts-persist-topic", snapshot.entries[0].partitions[1].topic);
+    try testing.expectEqual(@as(i32, 1), snapshot.entries[0].partitions[1].partition);
+
+    var restored = TxnCoordinator.init(testing.allocator);
+    defer restored.deinit();
+    try restored.restoreState(snapshot);
+    const restored_partitions = restored.getPartitions(init_result.producer_id).?;
+    try testing.expectEqual(@as(usize, 2), restored_partitions.len);
+    try testing.expectEqualStrings("txn-add-parts-persist-topic", restored_partitions[0].topic);
+    try testing.expectEqual(@as(i32, 0), restored_partitions[0].partition);
+    try testing.expectEqualStrings("txn-add-parts-persist-topic", restored_partitions[1].topic);
+    try testing.expectEqual(@as(i32, 1), restored_partitions[1].partition);
 }
 
 test "Broker.handleRequest AddPartitionsToTxn rejects truncated request" {
