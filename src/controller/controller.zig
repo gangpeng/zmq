@@ -1038,6 +1038,13 @@ pub const Controller = struct {
     fn handleAddRaftVoter(self: *Controller, request_bytes: []const u8, start_pos: usize, req_header: *const RequestHeader, api_version: i16, resp_header_version: i16) ?[]u8 {
         const Req = generated.add_raft_voter_request.AddRaftVoterRequest;
         const Resp = generated.add_raft_voter_response.AddRaftVoterResponse;
+
+        if (!validateAddRaftVoterRequestFrame(request_bytes, start_pos)) {
+            log.warn("Malformed AddRaftVoter request", .{});
+            const resp = Resp{ .error_code = ErrorCode.invalid_request.toInt(), .error_message = "malformed AddRaftVoter request" };
+            return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+        }
+
         var pos = start_pos;
 
         const req = Req.deserialize(self.allocator, request_bytes, &pos, api_version) catch |err| {
@@ -1070,6 +1077,13 @@ pub const Controller = struct {
     fn handleRemoveRaftVoter(self: *Controller, request_bytes: []const u8, start_pos: usize, req_header: *const RequestHeader, api_version: i16, resp_header_version: i16) ?[]u8 {
         const Req = generated.remove_raft_voter_request.RemoveRaftVoterRequest;
         const Resp = generated.remove_raft_voter_response.RemoveRaftVoterResponse;
+
+        if (!validateRemoveRaftVoterRequestFrame(request_bytes, start_pos)) {
+            log.warn("Malformed RemoveRaftVoter request", .{});
+            const resp = Resp{ .error_code = ErrorCode.invalid_request.toInt(), .error_message = "malformed RemoveRaftVoter request" };
+            return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+        }
+
         var pos = start_pos;
 
         const req = Req.deserialize(self.allocator, request_bytes, &pos, api_version) catch |err| {
@@ -1238,6 +1252,30 @@ fn validateFetchSnapshotRequestFrame(buf: []const u8, start_pos: usize) bool {
 fn validateUnregisterBrokerRequestFrame(buf: []const u8, start_pos: usize) bool {
     var pos = start_pos;
     if (!skipFixedBytes(buf, &pos, 4)) return false; // broker_id
+    ser.skipTaggedFields(buf, &pos) catch return false;
+    return pos == buf.len;
+}
+
+fn validateAddRaftVoterRequestFrame(buf: []const u8, start_pos: usize) bool {
+    var pos = start_pos;
+
+    if (!skipKafkaString(buf, &pos, true)) return false; // cluster_id
+    if (!skipFixedBytes(buf, &pos, 24)) return false; // timeout_ms + voter_id + voter_directory_id
+    const listener_count = readKafkaArrayCount(buf, &pos, true) orelse return false;
+    for (0..listener_count) |_| {
+        if (!skipKafkaString(buf, &pos, true)) return false; // listener name
+        if (!skipKafkaString(buf, &pos, true)) return false; // listener host
+        if (!skipFixedBytes(buf, &pos, 2)) return false; // listener port
+        ser.skipTaggedFields(buf, &pos) catch return false;
+    }
+    ser.skipTaggedFields(buf, &pos) catch return false;
+    return pos == buf.len;
+}
+
+fn validateRemoveRaftVoterRequestFrame(buf: []const u8, start_pos: usize) bool {
+    var pos = start_pos;
+    if (!skipKafkaString(buf, &pos, true)) return false; // cluster_id
+    if (!skipFixedBytes(buf, &pos, 20)) return false; // voter_id + voter_directory_id
     ser.skipTaggedFields(buf, &pos) catch return false;
     return pos == buf.len;
 }
@@ -2412,6 +2450,54 @@ test "Controller handleRequest RemoveRaftVoter uses generated key 81" {
     const resp = try Resp.deserialize(testing.allocator, response.?, &rpos, 0);
     try testing.expectEqual(ErrorCode.none.toInt(), resp.error_code);
     try testing.expect(ctrl.raft_state.pending_config_change);
+}
+
+test "Controller handleRequest AddRaftVoter rejects malformed request" {
+    const Resp = generated.add_raft_voter_response.AddRaftVoterResponse;
+
+    var ctrl = Controller.init(testing.allocator, 1, "test-cluster");
+    defer ctrl.deinit();
+
+    var buf: [128]u8 = undefined;
+    var pos = buildTestRequest(&buf, 80, 0, 8001, header_mod.requestHeaderVersion(80, 0));
+    ser.writeCompactString(&buf, &pos, "test-cluster");
+    ser.writeI32(&buf, &pos, 1000); // timeout_ms, missing voter_id and the rest
+
+    const response = ctrl.handleRequest(buf[0..pos]);
+    try testing.expect(response != null);
+    defer testing.allocator.free(response.?);
+
+    var rpos: usize = 0;
+    var resp_header = try ResponseHeader.deserialize(testing.allocator, response.?, &rpos, header_mod.responseHeaderVersion(80, 0));
+    defer resp_header.deinit(testing.allocator);
+    try testing.expectEqual(@as(i32, 8001), resp_header.correlation_id);
+
+    const resp = try Resp.deserialize(testing.allocator, response.?, &rpos, 0);
+    try testing.expectEqual(ErrorCode.invalid_request.toInt(), resp.error_code);
+}
+
+test "Controller handleRequest RemoveRaftVoter rejects malformed request" {
+    const Resp = generated.remove_raft_voter_response.RemoveRaftVoterResponse;
+
+    var ctrl = Controller.init(testing.allocator, 1, "test-cluster");
+    defer ctrl.deinit();
+
+    var buf: [128]u8 = undefined;
+    var pos = buildTestRequest(&buf, 81, 0, 8101, header_mod.requestHeaderVersion(81, 0));
+    ser.writeCompactString(&buf, &pos, "test-cluster");
+    ser.writeI32(&buf, &pos, 2); // voter_id, missing voter_directory_id and tags
+
+    const response = ctrl.handleRequest(buf[0..pos]);
+    try testing.expect(response != null);
+    defer testing.allocator.free(response.?);
+
+    var rpos: usize = 0;
+    var resp_header = try ResponseHeader.deserialize(testing.allocator, response.?, &rpos, header_mod.responseHeaderVersion(81, 0));
+    defer resp_header.deinit(testing.allocator);
+    try testing.expectEqual(@as(i32, 8101), resp_header.correlation_id);
+
+    const resp = try Resp.deserialize(testing.allocator, response.?, &rpos, 0);
+    try testing.expectEqual(ErrorCode.invalid_request.toInt(), resp.error_code);
 }
 
 test "Controller rejects telemetry keys 71 and 72 instead of treating them as Raft voter APIs" {
