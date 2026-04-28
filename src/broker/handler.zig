@@ -4649,7 +4649,7 @@ pub const Broker = struct {
                     .group_instance_id = member.group_instance_id,
                     .client_id = "zmq-client",
                     .client_host = "/127.0.0.1",
-                    .member_metadata = null,
+                    .member_metadata = member.protocol_metadata,
                     .member_assignment = member.assignment,
                 };
                 member_idx += 1;
@@ -4660,8 +4660,8 @@ pub const Broker = struct {
             .error_code = @intFromEnum(ErrorCode.none),
             .group_id = group.group_id,
             .group_state = consumerGroupStateName(group.state),
-            .protocol_type = "consumer",
-            .protocol_data = "range",
+            .protocol_type = group.protocol_type orelse "",
+            .protocol_data = group.protocol_name orelse "",
             .members = members,
             .authorized_operations = describeGroupsAuthorizedOps(include_authorized_operations),
         };
@@ -16982,7 +16982,7 @@ test "Broker.handleRequest DescribeGroups v5 returns generated response" {
     var broker = Broker.init(testing.allocator, 1, 9092);
     defer broker.deinit();
 
-    _ = try broker.groups.joinGroup("dg-generated-group", null, "consumer", null);
+    _ = try broker.groups.joinGroupWithProtocol("dg-generated-group", null, null, "consumer", "range", "dg-member-metadata", null);
 
     const groups = [_]?[]const u8{ "dg-generated-group", "missing-group" };
     const req = Req{
@@ -17019,6 +17019,7 @@ test "Broker.handleRequest DescribeGroups v5 returns generated response" {
     try testing.expectEqualStrings("range", resp.groups[0].protocol_data.?);
     try testing.expectEqual(@as(usize, 1), resp.groups[0].members.len);
     try testing.expectEqualStrings("zmq-client", resp.groups[0].members[0].client_id.?);
+    try testing.expectEqualStrings("dg-member-metadata", resp.groups[0].members[0].member_metadata.?);
     try testing.expectEqual(@as(i32, 0), resp.groups[0].authorized_operations);
 
     try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.group_id_not_found)), resp.groups[1].error_code);
