@@ -327,6 +327,7 @@ pub const broker_handler_api_keys = [_]i16{
     73,
     74,
     75,
+    76,
     77,
     501,
     502,
@@ -368,6 +369,7 @@ pub const non_advertised_handler_api_keys = [_]i16{
 pub const fail_closed_generated_handler_api_keys = [_]i16{
     68, // ConsumerGroupHeartbeat (KIP-848)
     73, // AssignReplicasToDirs (KIP-858)
+    76, // ShareGroupHeartbeat (KIP-932)
     77, // ShareGroupDescribe (KIP-932)
 };
 

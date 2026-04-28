@@ -1732,6 +1732,7 @@ pub const Broker = struct {
             73 => self.handleAssignReplicasToDirs(request_bytes, pos, &req_header, api_version, resp_header_version),
             74 => self.handleListClientMetricsResources(request_bytes, pos, &req_header, api_version, resp_header_version),
             75 => self.handleDescribeTopicPartitions(request_bytes, pos, &req_header, api_version, resp_header_version),
+            76 => self.handleShareGroupHeartbeat(request_bytes, pos, &req_header, api_version, resp_header_version),
             77 => self.handleShareGroupDescribe(request_bytes, pos, &req_header, api_version, resp_header_version),
             501 => self.handleCreateStreams(request_bytes, pos, &req_header, api_version, resp_header_version),
             502 => self.handleOpenStreams(request_bytes, pos, &req_header, api_version, resp_header_version),
@@ -4841,6 +4842,59 @@ pub const Broker = struct {
             if (topic_partitions.partitions.len > 0) self.allocator.free(topic_partitions.partitions);
         }
         if (req.topic_partitions.len > 0) self.allocator.free(req.topic_partitions);
+    }
+
+    // ---------------------------------------------------------------
+    // ShareGroupHeartbeat (key 76) — non-advertised until share groups exist
+    // ---------------------------------------------------------------
+    fn handleShareGroupHeartbeat(self: *Broker, request_bytes: []const u8, body_start: usize, req_header: *const RequestHeader, api_version: i16, resp_header_version: i16) ?[]u8 {
+        const Req = generated.share_group_heartbeat_request.ShareGroupHeartbeatRequest;
+        const Resp = generated.share_group_heartbeat_response.ShareGroupHeartbeatResponse;
+
+        if (!validateShareGroupHeartbeatRequestFrame(request_bytes, body_start)) {
+            log.warn("Malformed ShareGroupHeartbeat request", .{});
+            const resp = Resp{
+                .throttle_time_ms = 0,
+                .error_code = ErrorCode.invalid_request.toInt(),
+                .error_message = "malformed ShareGroupHeartbeat request",
+                .member_id = null,
+                .member_epoch = 0,
+                .heartbeat_interval_ms = 0,
+                .assignment = null,
+            };
+            return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+        }
+
+        var pos = body_start;
+        var req = Req.deserialize(self.allocator, request_bytes, &pos, api_version) catch |err| {
+            log.warn("Failed to decode ShareGroupHeartbeat request: {}", .{err});
+            const resp = Resp{
+                .throttle_time_ms = 0,
+                .error_code = ErrorCode.invalid_request.toInt(),
+                .error_message = "malformed ShareGroupHeartbeat request",
+                .member_id = null,
+                .member_epoch = 0,
+                .heartbeat_interval_ms = 0,
+                .assignment = null,
+            };
+            return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+        };
+        defer self.freeShareGroupHeartbeatRequest(&req);
+
+        const resp = Resp{
+            .throttle_time_ms = 0,
+            .error_code = ErrorCode.unsupported_version.toInt(),
+            .error_message = "ShareGroupHeartbeat is not implemented",
+            .member_id = req.member_id,
+            .member_epoch = req.member_epoch,
+            .heartbeat_interval_ms = 0,
+            .assignment = null,
+        };
+        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+    }
+
+    fn freeShareGroupHeartbeatRequest(self: *Broker, req: *generated.share_group_heartbeat_request.ShareGroupHeartbeatRequest) void {
+        if (req.subscribed_topic_names.len > 0) self.allocator.free(req.subscribed_topic_names);
     }
 
     // ---------------------------------------------------------------
@@ -11489,6 +11543,23 @@ pub const Broker = struct {
             if (!skipKafkaString(buf, &pos, true)) return false; // group_id
         }
         if (!skipFixedBytes(buf, &pos, 1)) return false; // include_authorized_operations
+        ser.skipTaggedFields(buf, &pos) catch return false;
+        return pos == buf.len;
+    }
+
+    fn validateShareGroupHeartbeatRequestFrame(buf: []const u8, start_pos: usize) bool {
+        var pos = start_pos;
+
+        if (!skipKafkaString(buf, &pos, true)) return false; // group_id
+        if (!skipKafkaString(buf, &pos, true)) return false; // member_id
+        if (!skipFixedBytes(buf, &pos, 4)) return false; // member_epoch
+        if (!skipKafkaString(buf, &pos, true)) return false; // rack_id
+
+        const subscribed_topic_count = readKafkaArrayCount(buf, &pos, true) orelse return false;
+        for (0..subscribed_topic_count) |_| {
+            if (!skipKafkaString(buf, &pos, true)) return false; // topic name
+        }
+
         ser.skipTaggedFields(buf, &pos) catch return false;
         return pos == buf.len;
     }
@@ -21128,6 +21199,71 @@ test "Broker.handleRequest ConsumerGroupHeartbeat rejects malformed request" {
     const resp = try Resp.deserialize(testing.allocator, response.?, &rpos, 0);
     try testing.expectEqual(response.?.len, rpos);
     try testing.expectEqual(ErrorCode.invalid_request.toInt(), resp.error_code);
+}
+
+test "Broker.handleRequest ShareGroupHeartbeat returns generated fail-closed response" {
+    const Req = generated.share_group_heartbeat_request.ShareGroupHeartbeatRequest;
+    const Resp = generated.share_group_heartbeat_response.ShareGroupHeartbeatResponse;
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+
+    const topic_names = [_]?[]const u8{"share-topic"};
+    const req = Req{
+        .group_id = "share-group",
+        .member_id = "share-member",
+        .member_epoch = 0,
+        .rack_id = "rack-a",
+        .subscribed_topic_names = &topic_names,
+    };
+
+    var buf: [256]u8 = undefined;
+    var pos = buildTestRequest(&buf, 76, 0, 7600, header_mod.requestHeaderVersion(76, 0));
+    req.serialize(&buf, &pos, 0);
+
+    const response = broker.handleRequest(buf[0..pos]);
+    try testing.expect(response != null);
+    defer testing.allocator.free(response.?);
+
+    var rpos: usize = 0;
+    var response_header = try ResponseHeader.deserialize(testing.allocator, response.?, &rpos, header_mod.responseHeaderVersion(76, 0));
+    defer response_header.deinit(testing.allocator);
+    try testing.expectEqual(@as(i32, 7600), response_header.correlation_id);
+
+    const resp = try Resp.deserialize(testing.allocator, response.?, &rpos, 0);
+    try testing.expectEqual(response.?.len, rpos);
+    try testing.expectEqual(@as(i32, 0), resp.throttle_time_ms);
+    try testing.expectEqual(ErrorCode.unsupported_version.toInt(), resp.error_code);
+    try testing.expectEqualStrings("ShareGroupHeartbeat is not implemented", resp.error_message.?);
+    try testing.expectEqualStrings("share-member", resp.member_id.?);
+    try testing.expectEqual(@as(i32, 0), resp.member_epoch);
+    try testing.expect(resp.assignment == null);
+}
+
+test "Broker.handleRequest ShareGroupHeartbeat rejects malformed request" {
+    const Resp = generated.share_group_heartbeat_response.ShareGroupHeartbeatResponse;
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+
+    var buf: [128]u8 = undefined;
+    var pos = buildTestRequest(&buf, 76, 0, 7601, header_mod.requestHeaderVersion(76, 0));
+    ser.writeCompactString(&buf, &pos, "share-group"); // missing member_id and remaining body
+
+    const response = broker.handleRequest(buf[0..pos]);
+    try testing.expect(response != null);
+    defer testing.allocator.free(response.?);
+
+    var rpos: usize = 0;
+    var response_header = try ResponseHeader.deserialize(testing.allocator, response.?, &rpos, header_mod.responseHeaderVersion(76, 0));
+    defer response_header.deinit(testing.allocator);
+    try testing.expectEqual(@as(i32, 7601), response_header.correlation_id);
+
+    const resp = try Resp.deserialize(testing.allocator, response.?, &rpos, 0);
+    try testing.expectEqual(response.?.len, rpos);
+    try testing.expectEqual(ErrorCode.invalid_request.toInt(), resp.error_code);
+    try testing.expectEqualStrings("malformed ShareGroupHeartbeat request", resp.error_message.?);
+    try testing.expect(resp.assignment == null);
 }
 
 test "Broker.handleRequest ShareGroupDescribe returns generated fail-closed response" {
