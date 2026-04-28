@@ -111,6 +111,7 @@ pub const Controller = struct {
             59 => self.handleFetchSnapshot(request_bytes, pos, &req_header, api_version, resp_header_version),
             62 => self.handleBrokerRegistration(request_bytes, pos, &req_header, api_version, resp_header_version),
             63 => self.handleBrokerHeartbeat(request_bytes, pos, &req_header, api_version, resp_header_version),
+            64 => self.handleUnregisterBroker(request_bytes, pos, &req_header, api_version, resp_header_version),
             67 => self.handleAllocateProducerIds(request_bytes, pos, &req_header, api_version, resp_header_version),
             80 => self.handleAddRaftVoter(request_bytes, pos, &req_header, api_version, resp_header_version),
             81 => self.handleRemoveRaftVoter(request_bytes, pos, &req_header, api_version, resp_header_version),
@@ -590,6 +591,7 @@ pub const Controller = struct {
         broker_registration = 1,
         producer_id_allocation = 2,
         full_snapshot = 3,
+        broker_unregistration = 4,
     };
 
     fn controllerBytesFieldSize(bytes: []const u8) !usize {
@@ -611,6 +613,7 @@ pub const Controller = struct {
             1 => .broker_registration,
             2 => .producer_id_allocation,
             3 => .full_snapshot,
+            4 => .broker_unregistration,
             else => error.InvalidAutoMqMetadataRecord,
         };
     }
@@ -632,6 +635,21 @@ pub const Controller = struct {
         writeRecordI32(buf, &pos, @intCast(port));
         writeRecordBool(buf, &pos, true);
         try writeRecordBytes(buf, &pos, host);
+        std.debug.assert(pos == buf.len);
+        return buf;
+    }
+
+    fn buildBrokerUnregistrationRecord(self: *Controller, broker_id: i32) ![]u8 {
+        var total_len = try checkedAddSize(controller_metadata_record_magic.len, 1);
+        total_len = try checkedAddSize(total_len, 4);
+
+        const buf = try self.allocator.alloc(u8, total_len);
+        var pos: usize = 0;
+        @memcpy(buf[pos .. pos + controller_metadata_record_magic.len], controller_metadata_record_magic);
+        pos += controller_metadata_record_magic.len;
+        buf[pos] = @intFromEnum(ControllerMetadataRecordKind.broker_unregistration);
+        pos += 1;
+        writeRecordI32(buf, &pos, broker_id);
         std.debug.assert(pos == buf.len);
         return buf;
     }
@@ -714,6 +732,12 @@ pub const Controller = struct {
         );
     }
 
+    fn applyBrokerUnregistrationRecord(self: *Controller, data: []const u8, pos: *usize) !void {
+        const broker_id = try readRecordI32(data, pos);
+        if (pos.* != data.len) return error.InvalidAutoMqMetadataRecord;
+        _ = self.broker_registry.unregister(broker_id);
+    }
+
     fn applyProducerIdAllocationRecord(self: *Controller, data: []const u8, pos: *usize) !void {
         const next_producer_id = try readRecordI64(data, pos);
         if (pos.* != data.len) return error.InvalidAutoMqMetadataRecord;
@@ -775,6 +799,7 @@ pub const Controller = struct {
             .broker_registration => try self.applyBrokerRegistrationRecord(data, &pos),
             .producer_id_allocation => try self.applyProducerIdAllocationRecord(data, &pos),
             .full_snapshot => try self.applyControllerFullSnapshotRecord(data, &pos),
+            .broker_unregistration => try self.applyBrokerUnregistrationRecord(data, &pos),
         }
     }
 
@@ -945,6 +970,65 @@ pub const Controller = struct {
             .is_fenced = false,
             .should_shut_down = false,
         };
+        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+    }
+
+    // ---------------------------------------------------------------
+    // UnregisterBroker (key 64) — broker lifecycle
+    // ---------------------------------------------------------------
+    fn handleUnregisterBroker(self: *Controller, request_bytes: []const u8, start_pos: usize, req_header: *const RequestHeader, api_version: i16, resp_header_version: i16) ?[]u8 {
+        const Req = generated.unregister_broker_request.UnregisterBrokerRequest;
+        const Resp = generated.unregister_broker_response.UnregisterBrokerResponse;
+
+        if (!validateUnregisterBrokerRequestFrame(request_bytes, start_pos)) {
+            log.warn("Malformed UnregisterBroker request", .{});
+            const resp = Resp{ .error_code = ErrorCode.invalid_request.toInt(), .error_message = "malformed UnregisterBroker request" };
+            return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+        }
+
+        var pos = start_pos;
+        const req = Req.deserialize(self.allocator, request_bytes, &pos, api_version) catch |err| {
+            log.warn("Failed to decode UnregisterBroker request: {}", .{err});
+            const resp = Resp{ .error_code = ErrorCode.invalid_request.toInt(), .error_message = "malformed UnregisterBroker request" };
+            return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+        };
+
+        if (self.raft_state.role != .leader) {
+            const resp = Resp{ .throttle_time_ms = 0, .error_code = ErrorCode.not_controller.toInt(), .error_message = null };
+            return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+        }
+
+        _ = self.applyCommittedControllerMetadataRecords() catch |err| {
+            log.warn("Failed to apply controller metadata before unregistering broker {d}: {}", .{ req.broker_id, err });
+            const resp = Resp{ .throttle_time_ms = 0, .error_code = ErrorCode.kafka_storage_error.toInt(), .error_message = null };
+            return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+        };
+
+        if (!self.broker_registry.brokers.contains(req.broker_id)) {
+            const resp = Resp{ .throttle_time_ms = 0, .error_code = ErrorCode.broker_id_not_registered.toInt(), .error_message = null };
+            return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+        }
+
+        const record = self.buildBrokerUnregistrationRecord(req.broker_id) catch {
+            const resp = Resp{ .throttle_time_ms = 0, .error_code = ErrorCode.kafka_storage_error.toInt(), .error_message = null };
+            return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+        };
+        defer self.allocator.free(record);
+
+        const offset = self.appendControllerMetadataRecord(record) catch |err| {
+            const error_code: i16 = switch (err) {
+                error.NotController => ErrorCode.not_controller.toInt(),
+                else => ErrorCode.kafka_storage_error.toInt(),
+            };
+            log.warn("UnregisterBroker metadata append failed for broker {d}: {}", .{ req.broker_id, err });
+            const resp = Resp{ .throttle_time_ms = 0, .error_code = error_code, .error_message = null };
+            return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+        };
+
+        _ = self.broker_registry.unregister(req.broker_id);
+        self.last_applied_controller_metadata_offset = offset;
+
+        const resp = Resp{ .throttle_time_ms = 0, .error_code = ErrorCode.none.toInt(), .error_message = null };
         return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
     }
 
@@ -1147,6 +1231,13 @@ fn validateFetchSnapshotRequestFrame(buf: []const u8, start_pos: usize) bool {
         }
         ser.skipTaggedFields(buf, &pos) catch return false;
     }
+    ser.skipTaggedFields(buf, &pos) catch return false;
+    return pos == buf.len;
+}
+
+fn validateUnregisterBrokerRequestFrame(buf: []const u8, start_pos: usize) bool {
+    var pos = start_pos;
+    if (!skipFixedBytes(buf, &pos, 4)) return false; // broker_id
     ser.skipTaggedFields(buf, &pos) catch return false;
     return pos == buf.len;
 }
@@ -1446,9 +1537,9 @@ test "Controller handleRequest ApiVersions returns supported APIs" {
     const error_code = ser.readI16(response.?, &rpos);
     try testing.expectEqual(@as(i16, 0), error_code);
 
-    // Array of supported APIs — controller supports 11 APIs
+    // Array of supported APIs — controller supports 12 APIs
     const array_len = try ser.readArrayLen(response.?, &rpos);
-    try testing.expectEqual(@as(usize, 11), array_len.?);
+    try testing.expectEqual(@as(usize, 12), array_len.?);
 }
 
 test "Controller handleRequest unsupported API returns error" {
@@ -1931,6 +2022,96 @@ test "Controller handleRequest BrokerHeartbeat reports stale broker epoch" {
     const hb_resp = try HbResp.deserialize(testing.allocator, hb_response.?, &hb_rpos, 0);
     try testing.expectEqual(ErrorCode.stale_broker_epoch.toInt(), hb_resp.error_code);
     try testing.expect(hb_resp.is_fenced);
+}
+
+test "Controller handleRequest UnregisterBroker removes broker" {
+    const Req = generated.unregister_broker_request.UnregisterBrokerRequest;
+    const Resp = generated.unregister_broker_response.UnregisterBrokerResponse;
+
+    var ctrl = Controller.init(testing.allocator, 1, "test-cluster");
+    defer ctrl.deinit();
+    try makeTestControllerLeader(&ctrl);
+    try ctrl.broker_registry.registerWithEpoch(100, "host1", 9092, 7, false);
+
+    var buf: [128]u8 = undefined;
+    var pos = buildTestRequest(&buf, 64, 0, 6400, header_mod.requestHeaderVersion(64, 0));
+    const req = Req{ .broker_id = 100 };
+    req.serialize(&buf, &pos, 0);
+
+    const response = ctrl.handleRequest(buf[0..pos]);
+    try testing.expect(response != null);
+    defer testing.allocator.free(response.?);
+
+    var rpos: usize = 0;
+    var resp_header = try ResponseHeader.deserialize(testing.allocator, response.?, &rpos, header_mod.responseHeaderVersion(64, 0));
+    defer resp_header.deinit(testing.allocator);
+    try testing.expectEqual(@as(i32, 6400), resp_header.correlation_id);
+
+    const resp = try Resp.deserialize(testing.allocator, response.?, &rpos, 0);
+    try testing.expectEqual(response.?.len, rpos);
+    try testing.expectEqual(ErrorCode.none.toInt(), resp.error_code);
+    try testing.expectEqual(@as(usize, 0), ctrl.broker_registry.count());
+}
+
+test "Controller handleRequest UnregisterBroker reports missing broker" {
+    const Req = generated.unregister_broker_request.UnregisterBrokerRequest;
+    const Resp = generated.unregister_broker_response.UnregisterBrokerResponse;
+
+    var ctrl = Controller.init(testing.allocator, 1, "test-cluster");
+    defer ctrl.deinit();
+    try makeTestControllerLeader(&ctrl);
+
+    var buf: [128]u8 = undefined;
+    var pos = buildTestRequest(&buf, 64, 0, 6401, header_mod.requestHeaderVersion(64, 0));
+    const req = Req{ .broker_id = 404 };
+    req.serialize(&buf, &pos, 0);
+
+    const response = ctrl.handleRequest(buf[0..pos]);
+    try testing.expect(response != null);
+    defer testing.allocator.free(response.?);
+
+    var rpos: usize = 0;
+    var resp_header = try ResponseHeader.deserialize(testing.allocator, response.?, &rpos, header_mod.responseHeaderVersion(64, 0));
+    defer resp_header.deinit(testing.allocator);
+    try testing.expectEqual(@as(i32, 6401), resp_header.correlation_id);
+
+    const resp = try Resp.deserialize(testing.allocator, response.?, &rpos, 0);
+    try testing.expectEqual(ErrorCode.broker_id_not_registered.toInt(), resp.error_code);
+}
+
+test "Controller handleRequest UnregisterBroker rejects malformed request" {
+    const Resp = generated.unregister_broker_response.UnregisterBrokerResponse;
+
+    var ctrl = Controller.init(testing.allocator, 1, "test-cluster");
+    defer ctrl.deinit();
+    try makeTestControllerLeader(&ctrl);
+
+    var buf: [128]u8 = undefined;
+    const pos = buildTestRequest(&buf, 64, 0, 6402, header_mod.requestHeaderVersion(64, 0));
+
+    const response = ctrl.handleRequest(buf[0..pos]);
+    try testing.expect(response != null);
+    defer testing.allocator.free(response.?);
+
+    var rpos: usize = 0;
+    var resp_header = try ResponseHeader.deserialize(testing.allocator, response.?, &rpos, header_mod.responseHeaderVersion(64, 0));
+    defer resp_header.deinit(testing.allocator);
+    try testing.expectEqual(@as(i32, 6402), resp_header.correlation_id);
+
+    const resp = try Resp.deserialize(testing.allocator, response.?, &rpos, 0);
+    try testing.expectEqual(ErrorCode.invalid_request.toInt(), resp.error_code);
+}
+
+test "Controller applies broker unregistration metadata record" {
+    var ctrl = Controller.init(testing.allocator, 1, "test-cluster");
+    defer ctrl.deinit();
+
+    try ctrl.broker_registry.registerWithEpoch(100, "host1", 9092, 7, false);
+    const record = try ctrl.buildBrokerUnregistrationRecord(100);
+    defer ctrl.allocator.free(record);
+
+    try ctrl.applyControllerMetadataRecord(record);
+    try testing.expectEqual(@as(usize, 0), ctrl.broker_registry.count());
 }
 
 test "Controller replays replicated broker registration after follower promotion" {

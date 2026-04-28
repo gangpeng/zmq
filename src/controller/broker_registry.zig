@@ -104,6 +104,15 @@ pub const BrokerRegistry = struct {
         return true;
     }
 
+    /// Remove a broker registration. Returns false when the broker is unknown.
+    pub fn unregister(self: *BrokerRegistry, broker_id: i32) bool {
+        const removed = self.brokers.fetchRemove(broker_id) orelse return false;
+        self.allocator.free(removed.value.host);
+        if (removed.value.rack) |r| self.allocator.free(r);
+        log.info("Broker {d} unregistered", .{broker_id});
+        return true;
+    }
+
     /// Evict brokers that haven't sent a heartbeat within timeout_ms.
     /// Returns the number of evicted brokers.
     pub fn evictExpired(self: *BrokerRegistry, timeout_ms: i64) usize {
@@ -123,11 +132,7 @@ pub const BrokerRegistry = struct {
         }
 
         for (to_evict[0..evict_count]) |bid| {
-            if (self.brokers.fetchRemove(bid)) |removed| {
-                self.allocator.free(removed.value.host);
-                if (removed.value.rack) |r| self.allocator.free(r);
-                log.info("Broker {d} evicted (heartbeat timeout)", .{bid});
-            }
+            if (self.unregister(bid)) log.info("Broker {d} evicted (heartbeat timeout)", .{bid});
         }
 
         return evict_count;
@@ -219,6 +224,16 @@ test "BrokerRegistry re-register replaces old entry" {
         try testing.expectEqualStrings("host2", info.host);
         try testing.expectEqual(@as(u16, 9093), info.port);
     }
+}
+
+test "BrokerRegistry unregister removes broker" {
+    var registry = BrokerRegistry.init(testing.allocator);
+    defer registry.deinit();
+
+    _ = try registry.register(100, "host1", 9092);
+    try testing.expect(registry.unregister(100));
+    try testing.expectEqual(@as(usize, 0), registry.count());
+    try testing.expect(!registry.unregister(100));
 }
 
 test "BrokerRegistry registerWithEpoch replays durable registration" {
