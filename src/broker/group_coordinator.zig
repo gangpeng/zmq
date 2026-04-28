@@ -43,10 +43,10 @@ pub const GroupCoordinator = struct {
         self.committed_offsets.deinit();
     }
 
-    /// Evict members that have exceeded their session timeout.
+    /// Evict members that have exceeded their group's configured session timeout.
     /// Should be called periodically (e.g., every 1 second).
     /// Returns the number of members evicted.
-    pub fn evictExpiredMembers(self: *GroupCoordinator, session_timeout_ms: i64) u32 {
+    pub fn evictExpiredMembers(self: *GroupCoordinator) u32 {
         const now = @import("time_compat").milliTimestamp();
         var evicted: u32 = 0;
 
@@ -54,6 +54,7 @@ pub const GroupCoordinator = struct {
         while (git.next()) |gentry| {
             const group = gentry.value_ptr;
             if (group.state == .dead or group.state == .empty) continue;
+            const session_timeout_ms = if (group.session_timeout_ms > 0) group.session_timeout_ms else ConsumerGroup.default_session_timeout_ms;
 
             // Collect expired members
             var expired = std.array_list.Managed([]const u8).init(self.allocator);
@@ -970,10 +971,13 @@ pub const ConsumerGroup = struct {
     leader_id: ?[]u8 = null,
     protocol_type: ?[]u8 = null,
     protocol_name: ?[]u8 = null,
-    rebalance_timeout_ms: i64 = 300000, // 5 minutes default
+    rebalance_timeout_ms: i64 = default_rebalance_timeout_ms,
     rebalance_start_ms: i64 = 0,
-    session_timeout_ms: i64 = 30000, // 30 seconds default
+    session_timeout_ms: i64 = default_session_timeout_ms,
     allocator: Allocator,
+
+    pub const default_rebalance_timeout_ms: i64 = 300000;
+    pub const default_session_timeout_ms: i64 = 30000;
 
     pub const GroupState = enum {
         empty,
@@ -1362,7 +1366,7 @@ test "GroupCoordinator session timeout eviction" {
     member.last_heartbeat_ms = @import("time_compat").milliTimestamp() - 60000; // 60 seconds ago
 
     // Evict with a 30-second timeout — member should be evicted
-    const evicted = coord.evictExpiredMembers(30000);
+    const evicted = coord.evictExpiredMembers();
     try testing.expectEqual(@as(u32, 1), evicted);
 
     // Group should be empty now
@@ -1386,11 +1390,35 @@ test "GroupCoordinator session timeout triggers rebalance when members remain" {
     const m1 = group.members.getPtr(r1.member_id).?;
     m1.last_heartbeat_ms = @import("time_compat").milliTimestamp() - 60000;
 
-    const evicted = coord.evictExpiredMembers(30000);
+    const evicted = coord.evictExpiredMembers();
     try testing.expectEqual(@as(u32, 1), evicted);
     try testing.expectEqual(@as(usize, 1), group.memberCount());
     // Should trigger rebalance since members remain
     try testing.expectEqual(ConsumerGroup.GroupState.preparing_rebalance, group.state);
+}
+
+test "GroupCoordinator session timeout eviction uses each group's configured timeout" {
+    var coord = GroupCoordinator.init(testing.allocator);
+    defer coord.deinit();
+
+    const short_member = try coord.joinGroup("short-timeout-group", null, "consumer", null);
+    const long_member = try coord.joinGroup("long-timeout-group", null, "consumer", null);
+
+    const short_group = coord.groups.getPtr("short-timeout-group").?;
+    const long_group = coord.groups.getPtr("long-timeout-group").?;
+    short_group.session_timeout_ms = 10_000;
+    long_group.session_timeout_ms = 300_000;
+
+    const now = @import("time_compat").milliTimestamp();
+    short_group.members.getPtr(short_member.member_id).?.last_heartbeat_ms = now - 60_000;
+    long_group.members.getPtr(long_member.member_id).?.last_heartbeat_ms = now - 60_000;
+
+    const evicted = coord.evictExpiredMembers();
+    try testing.expectEqual(@as(u32, 1), evicted);
+    try testing.expectEqual(@as(usize, 0), short_group.memberCount());
+    try testing.expectEqual(@as(usize, 1), long_group.memberCount());
+    try testing.expectEqual(ConsumerGroup.GroupState.empty, short_group.state);
+    try testing.expectEqual(ConsumerGroup.GroupState.preparing_rebalance, long_group.state);
 }
 
 test "GroupCoordinator leaveGroup properly cleans member resources" {
@@ -1577,7 +1605,7 @@ test "GroupCoordinator eviction triggers rebalance for remaining members" {
     }
 
     // Evict expired members
-    const evicted = coord.evictExpiredMembers(30_000);
+    const evicted = coord.evictExpiredMembers();
     try testing.expectEqual(@as(u32, 1), evicted);
 
     // Group should be in rebalance (one member remains)
@@ -1599,7 +1627,7 @@ test "GroupCoordinator eviction empties group when all members expire" {
         entry.value_ptr.last_heartbeat_ms = 0;
     }
 
-    const evicted = coord.evictExpiredMembers(30_000);
+    const evicted = coord.evictExpiredMembers();
     try testing.expectEqual(@as(u32, 1), evicted);
     try testing.expectEqual(ConsumerGroup.GroupState.empty, group.state);
     try testing.expectEqual(@as(usize, 0), group.memberCount());
@@ -1723,8 +1751,9 @@ test "GroupCoordinator evictExpiredMembers removes timed-out members" {
     }
     // r3 keeps a recent heartbeat (already set by joinGroup)
 
-    // Evict with a 10-second timeout — r1 and r2 should be evicted, r3 survives
-    const evicted = coord.evictExpiredMembers(10_000);
+    // Evict with this group's 10-second timeout — r1 and r2 should be evicted, r3 survives
+    group.session_timeout_ms = 10_000;
+    const evicted = coord.evictExpiredMembers();
     try testing.expectEqual(@as(u32, 2), evicted);
     try testing.expectEqual(@as(usize, 1), group.memberCount());
 
@@ -1748,8 +1777,9 @@ test "GroupCoordinator evictExpiredMembers skips active members" {
     const group = coord.groups.getPtr("active-group").?;
     try testing.expectEqual(@as(usize, 2), group.memberCount());
 
-    // Evict with a very large timeout (300 seconds) — nobody should be evicted
-    const evicted = coord.evictExpiredMembers(300_000);
+    // Evict with a very large group timeout (300 seconds) — nobody should be evicted
+    group.session_timeout_ms = 300_000;
+    const evicted = coord.evictExpiredMembers();
     try testing.expectEqual(@as(u32, 0), evicted);
     try testing.expectEqual(@as(usize, 2), group.memberCount());
 

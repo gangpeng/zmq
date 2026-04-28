@@ -706,8 +706,9 @@ pub const Broker = struct {
     /// Periodic maintenance — should be called every ~1 second.
     /// Handles: session timeout eviction, rebalance timeouts, S3 flush, metrics.
     pub fn tick(self: *Broker) void {
-        // Evict expired consumer group members (30 second timeout)
-        const evicted = self.groups.evictExpiredMembers(30000);
+        // Evict expired consumer group members using each group's JoinGroup
+        // session timeout.
+        const evicted = self.groups.evictExpiredMembers();
         var consumer_groups_dirty = false;
         if (evicted > 0) {
             log.info("Evicted {d} expired group members", .{evicted});
@@ -17748,6 +17749,28 @@ test "Broker tick runs without crash in memory mode" {
     broker.tick();
     broker.tick();
     broker.tick();
+}
+
+test "Broker tick uses per-group session timeouts for member eviction" {
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+
+    const short_member = try broker.groups.joinGroup("broker-short-timeout", null, "consumer", null);
+    const long_member = try broker.groups.joinGroup("broker-long-timeout", null, "consumer", null);
+
+    const short_group = broker.groups.groups.getPtr("broker-short-timeout").?;
+    const long_group = broker.groups.groups.getPtr("broker-long-timeout").?;
+    short_group.session_timeout_ms = 10_000;
+    long_group.session_timeout_ms = 300_000;
+
+    const now = @import("time_compat").milliTimestamp();
+    short_group.members.getPtr(short_member.member_id).?.last_heartbeat_ms = now - 60_000;
+    long_group.members.getPtr(long_member.member_id).?.last_heartbeat_ms = now - 60_000;
+
+    broker.tick();
+
+    try testing.expectEqual(@as(usize, 0), short_group.memberCount());
+    try testing.expectEqual(@as(usize, 1), long_group.memberCount());
 }
 
 test "Broker tick writes abort marker for timed-out transaction" {
