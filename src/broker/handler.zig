@@ -1724,6 +1724,7 @@ pub const Broker = struct {
             55 => self.handleDescribeQuorum(request_bytes, pos, &req_header, api_version, resp_header_version),
             65 => self.handleDescribeTransactions(request_bytes, pos, &req_header, api_version, resp_header_version),
             66 => self.handleListTransactions(request_bytes, pos, &req_header, api_version, resp_header_version),
+            74 => self.handleListClientMetricsResources(request_bytes, pos, &req_header, api_version, resp_header_version),
             75 => self.handleDescribeTopicPartitions(request_bytes, pos, &req_header, api_version, resp_header_version),
             501 => self.handleCreateStreams(request_bytes, pos, &req_header, api_version, resp_header_version),
             502 => self.handleOpenStreams(request_bytes, pos, &req_header, api_version, resp_header_version),
@@ -1866,7 +1867,7 @@ pub const Broker = struct {
             0, 1, 2 => .topic, // Produce, Fetch, ListOffsets
             8, 9, 10, 11, 12, 13, 14, 15, 16, 42, 47 => .group, // group-related
             22, 24, 26, 27, 28, 65, 66 => .transactional_id, // txn-related
-            3, 18, 19, 20, 32, 33, 35, 37, 43, 44, 45, 46, 48, 49, 50, 51, 75 => .cluster, // metadata/admin
+            3, 18, 19, 20, 32, 33, 35, 37, 43, 44, 45, 46, 48, 49, 50, 51, 74, 75 => .cluster, // metadata/admin
             501...519, 600...602 => .cluster, // AutoMQ stream/object/controller extensions
             else => .unknown,
         };
@@ -1877,7 +1878,7 @@ pub const Broker = struct {
         return switch (api_key) {
             0 => .write, // Produce
             1 => .read, // Fetch
-            2, 9, 15, 16, 23, 29, 32, 35, 46, 48, 50, 55, 60, 61, 65, 66, 75 => .describe, // ListOffsets, OffsetFetch, Describe*
+            2, 9, 15, 16, 23, 29, 32, 35, 46, 48, 50, 55, 60, 61, 65, 66, 74, 75 => .describe, // ListOffsets, OffsetFetch, Describe*
             3, 18 => .describe, // Metadata, ApiVersions
             8 => .read, // OffsetCommit
             10, 11, 12, 13, 14 => .read, // Group ops
@@ -7880,6 +7881,32 @@ pub const Broker = struct {
     }
 
     // ---------------------------------------------------------------
+    // ListClientMetricsResources (key 74)
+    // ---------------------------------------------------------------
+    fn handleListClientMetricsResources(self: *Broker, request_bytes: []const u8, body_start: usize, req_header: *const RequestHeader, api_version: i16, resp_header_version: i16) ?[]u8 {
+        const Req = generated.list_client_metrics_resources_request.ListClientMetricsResourcesRequest;
+        const Resp = generated.list_client_metrics_resources_response.ListClientMetricsResourcesResponse;
+
+        if (!validateListClientMetricsResourcesRequestFrame(request_bytes, body_start)) {
+            log.warn("Malformed ListClientMetricsResources request", .{});
+            return null;
+        }
+
+        var pos = body_start;
+        _ = Req.deserialize(self.allocator, request_bytes, &pos, api_version) catch |err| {
+            log.warn("Failed to decode ListClientMetricsResources request: {}", .{err});
+            return null;
+        };
+
+        const resp = Resp{
+            .throttle_time_ms = 0,
+            .error_code = @intFromEnum(ErrorCode.none),
+            .client_metrics_resources = &.{},
+        };
+        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+    }
+
+    // ---------------------------------------------------------------
     // AlterUserScramCredentials (key 51)
     // ---------------------------------------------------------------
     fn handleAlterUserScramCredentials(self: *Broker, request_bytes: []const u8, body_start: usize, req_header: *const RequestHeader, api_version: i16, resp_header_version: i16) ?[]u8 {
@@ -10611,6 +10638,12 @@ pub const Broker = struct {
             ser.skipTaggedFields(buf, &pos) catch return false;
         }
 
+        ser.skipTaggedFields(buf, &pos) catch return false;
+        return true;
+    }
+
+    fn validateListClientMetricsResourcesRequestFrame(buf: []const u8, start_pos: usize) bool {
+        var pos = start_pos;
         ser.skipTaggedFields(buf, &pos) catch return false;
         return true;
     }
@@ -15938,6 +15971,45 @@ test "Broker.handleRequest AlterUserScramCredentials rejects truncated request" 
 
     var buf: [128]u8 = undefined;
     const req_len = buildTestRequest(&buf, 51, 0, 5103, header_mod.requestHeaderVersion(51, 0));
+    try testing.expect(broker.handleRequest(buf[0..req_len]) == null);
+}
+
+test "Broker.handleRequest ListClientMetricsResources returns empty generated response" {
+    const Req = generated.list_client_metrics_resources_request.ListClientMetricsResourcesRequest;
+    const Resp = generated.list_client_metrics_resources_response.ListClientMetricsResourcesResponse;
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+
+    const req = Req{};
+
+    var buf: [128]u8 = undefined;
+    var pos = buildTestRequest(&buf, 74, 0, 7400, header_mod.requestHeaderVersion(74, 0));
+    req.serialize(&buf, &pos, 0);
+
+    const response = broker.handleRequest(buf[0..pos]);
+    try testing.expect(response != null);
+    defer testing.allocator.free(response.?);
+
+    var rpos: usize = 0;
+    var response_header = try ResponseHeader.deserialize(testing.allocator, response.?, &rpos, header_mod.responseHeaderVersion(74, 0));
+    defer response_header.deinit(testing.allocator);
+    try testing.expectEqual(@as(i32, 7400), response_header.correlation_id);
+
+    const resp = try Resp.deserialize(testing.allocator, response.?, &rpos, 0);
+    defer if (resp.client_metrics_resources.len > 0) testing.allocator.free(resp.client_metrics_resources);
+
+    try testing.expectEqual(response.?.len, rpos);
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.none)), resp.error_code);
+    try testing.expectEqual(@as(usize, 0), resp.client_metrics_resources.len);
+}
+
+test "Broker.handleRequest ListClientMetricsResources rejects truncated request" {
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+
+    var buf: [128]u8 = undefined;
+    const req_len = buildTestRequest(&buf, 74, 0, 7401, header_mod.requestHeaderVersion(74, 0));
     try testing.expect(broker.handleRequest(buf[0..req_len]) == null);
 }
 
