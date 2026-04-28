@@ -1647,7 +1647,7 @@ pub const Broker = struct {
         }
 
         // Validate API version is within supported range
-        if (api_key != 18 and !isVersionSupported(api_key, api_version)) {
+        if (api_key != 18 and !isVersionSupported(api_key, api_version) and !isFailClosedGeneratedVersionSupported(api_key, api_version)) {
             log.warn("Unsupported version: api_key={d} v={d}", .{ api_key, api_version });
             return self.handleUnsupported(&req_header, api_key, resp_header_version);
         }
@@ -1725,6 +1725,7 @@ pub const Broker = struct {
             57 => self.handleUpdateFeatures(request_bytes, pos, &req_header, api_version, resp_header_version),
             65 => self.handleDescribeTransactions(request_bytes, pos, &req_header, api_version, resp_header_version),
             66 => self.handleListTransactions(request_bytes, pos, &req_header, api_version, resp_header_version),
+            68 => self.handleConsumerGroupHeartbeat(request_bytes, pos, &req_header, api_version, resp_header_version),
             69 => self.handleConsumerGroupDescribe(request_bytes, pos, &req_header, api_version, resp_header_version),
             71 => self.handleGetTelemetrySubscriptions(request_bytes, pos, &req_header, api_version, resp_header_version),
             72 => self.handlePushTelemetry(request_bytes, pos, &req_header, api_version, resp_header_version),
@@ -1825,7 +1826,7 @@ pub const Broker = struct {
         const has_throttle = switch (api_key) {
             // Most APIs v1+ have throttle_time_ms; for simplicity track the common ones
             8, 10, 11, 12, 13, 14, 22, 25, 26 => api_version >= 1,
-            57, 66, 71, 72 => true,
+            57, 66, 68, 71, 72 => true,
             18 => false, // ApiVersions: error_code is right after header
             else => false,
         };
@@ -1855,6 +1856,12 @@ pub const Broker = struct {
     /// Check if an API key + version combination is supported.
     fn isVersionSupported(api_key: i16, api_version: i16) bool {
         return api_support.isBrokerVersionSupported(api_key, api_version);
+    }
+
+    fn isFailClosedGeneratedVersionSupported(api_key: i16, api_version: i16) bool {
+        if (!api_support.isFailClosedGeneratedHandlerApi(api_key)) return false;
+        const schema = api_support.findGeneratedRequest(api_key) orelse return false;
+        return api_version >= schema.min and api_version <= schema.max;
     }
 
     fn getVersionRange(api_key: i16) api_support.VersionRange {
@@ -4775,6 +4782,63 @@ pub const Broker = struct {
 
     fn describeGroupsAuthorizedOps(include_authorized_operations: bool) i32 {
         return if (include_authorized_operations) 0 else std.math.minInt(i32);
+    }
+
+    // ---------------------------------------------------------------
+    // ConsumerGroupHeartbeat (key 68) — non-advertised until KIP-848 support
+    // ---------------------------------------------------------------
+    fn handleConsumerGroupHeartbeat(self: *Broker, request_bytes: []const u8, body_start: usize, req_header: *const RequestHeader, api_version: i16, resp_header_version: i16) ?[]u8 {
+        const Req = generated.consumer_group_heartbeat_request.ConsumerGroupHeartbeatRequest;
+        const Resp = generated.consumer_group_heartbeat_response.ConsumerGroupHeartbeatResponse;
+
+        if (!validateConsumerGroupHeartbeatRequestFrame(request_bytes, body_start)) {
+            log.warn("Malformed ConsumerGroupHeartbeat request", .{});
+            const resp = Resp{
+                .throttle_time_ms = 0,
+                .error_code = ErrorCode.invalid_request.toInt(),
+                .error_message = "malformed ConsumerGroupHeartbeat request",
+                .member_id = null,
+                .member_epoch = 0,
+                .heartbeat_interval_ms = 0,
+                .assignment = null,
+            };
+            return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+        }
+
+        var pos = body_start;
+        var req = Req.deserialize(self.allocator, request_bytes, &pos, api_version) catch |err| {
+            log.warn("Failed to decode ConsumerGroupHeartbeat request: {}", .{err});
+            const resp = Resp{
+                .throttle_time_ms = 0,
+                .error_code = ErrorCode.invalid_request.toInt(),
+                .error_message = "malformed ConsumerGroupHeartbeat request",
+                .member_id = null,
+                .member_epoch = 0,
+                .heartbeat_interval_ms = 0,
+                .assignment = null,
+            };
+            return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+        };
+        defer self.freeConsumerGroupHeartbeatRequest(&req);
+
+        const resp = Resp{
+            .throttle_time_ms = 0,
+            .error_code = ErrorCode.unsupported_version.toInt(),
+            .error_message = "ConsumerGroupHeartbeat is not implemented",
+            .member_id = req.member_id,
+            .member_epoch = req.member_epoch,
+            .heartbeat_interval_ms = 0,
+            .assignment = null,
+        };
+        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+    }
+
+    fn freeConsumerGroupHeartbeatRequest(self: *Broker, req: *generated.consumer_group_heartbeat_request.ConsumerGroupHeartbeatRequest) void {
+        if (req.subscribed_topic_names.len > 0) self.allocator.free(req.subscribed_topic_names);
+        for (req.topic_partitions) |topic_partitions| {
+            if (topic_partitions.partitions.len > 0) self.allocator.free(topic_partitions.partitions);
+        }
+        if (req.topic_partitions.len > 0) self.allocator.free(req.topic_partitions);
     }
 
     // ---------------------------------------------------------------
@@ -11288,6 +11352,34 @@ pub const Broker = struct {
             if (!skipKafkaString(buf, &pos, true)) return false; // group_id
         }
         if (!skipFixedBytes(buf, &pos, 1)) return false; // include_authorized_operations
+        ser.skipTaggedFields(buf, &pos) catch return false;
+        return pos == buf.len;
+    }
+
+    fn validateConsumerGroupHeartbeatRequestFrame(buf: []const u8, start_pos: usize) bool {
+        var pos = start_pos;
+
+        if (!skipKafkaString(buf, &pos, true)) return false; // group_id
+        if (!skipKafkaString(buf, &pos, true)) return false; // member_id
+        if (!skipFixedBytes(buf, &pos, 4)) return false; // member_epoch
+        if (!skipKafkaString(buf, &pos, true)) return false; // instance_id
+        if (!skipKafkaString(buf, &pos, true)) return false; // rack_id
+        if (!skipFixedBytes(buf, &pos, 4)) return false; // rebalance_timeout_ms
+
+        const subscribed_topic_count = readKafkaArrayCount(buf, &pos, true) orelse return false;
+        for (0..subscribed_topic_count) |_| {
+            if (!skipKafkaString(buf, &pos, true)) return false; // topic name
+        }
+
+        if (!skipKafkaString(buf, &pos, true)) return false; // server_assignor
+
+        const topic_partitions_count = readKafkaArrayCount(buf, &pos, true) orelse return false;
+        for (0..topic_partitions_count) |_| {
+            if (!skipFixedBytes(buf, &pos, 16)) return false; // topic_id
+            if (!skipCompactI32Array(buf, &pos)) return false; // partitions
+            ser.skipTaggedFields(buf, &pos) catch return false;
+        }
+
         ser.skipTaggedFields(buf, &pos) catch return false;
         return pos == buf.len;
     }
@@ -20766,6 +20858,66 @@ test "Broker.handleRequest DescribeGroups rejects truncated request" {
     var buf: [128]u8 = undefined;
     const req_len = buildTestRequest(&buf, 15, 5, 1506, header_mod.requestHeaderVersion(15, 5));
     try testing.expect(broker.handleRequest(buf[0..req_len]) == null);
+}
+
+test "Broker.handleRequest ConsumerGroupHeartbeat returns generated fail-closed response" {
+    const Req = generated.consumer_group_heartbeat_request.ConsumerGroupHeartbeatRequest;
+    const Resp = generated.consumer_group_heartbeat_response.ConsumerGroupHeartbeatResponse;
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+
+    const req = Req{
+        .group_id = "kip848-group",
+        .member_id = "kip848-member",
+        .member_epoch = 0,
+        .rebalance_timeout_ms = 30_000,
+    };
+
+    var buf: [256]u8 = undefined;
+    var pos = buildTestRequest(&buf, 68, 0, 6800, header_mod.requestHeaderVersion(68, 0));
+    req.serialize(&buf, &pos, 0);
+
+    const response = broker.handleRequest(buf[0..pos]);
+    try testing.expect(response != null);
+    defer testing.allocator.free(response.?);
+
+    var rpos: usize = 0;
+    var response_header = try ResponseHeader.deserialize(testing.allocator, response.?, &rpos, header_mod.responseHeaderVersion(68, 0));
+    defer response_header.deinit(testing.allocator);
+    try testing.expectEqual(@as(i32, 6800), response_header.correlation_id);
+
+    const resp = try Resp.deserialize(testing.allocator, response.?, &rpos, 0);
+    try testing.expectEqual(response.?.len, rpos);
+    try testing.expectEqual(@as(i32, 0), resp.throttle_time_ms);
+    try testing.expectEqual(ErrorCode.unsupported_version.toInt(), resp.error_code);
+    try testing.expectEqualStrings("kip848-member", resp.member_id.?);
+    try testing.expectEqual(@as(i32, 0), resp.member_epoch);
+    try testing.expect(resp.assignment == null);
+}
+
+test "Broker.handleRequest ConsumerGroupHeartbeat rejects malformed request" {
+    const Resp = generated.consumer_group_heartbeat_response.ConsumerGroupHeartbeatResponse;
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+
+    var buf: [128]u8 = undefined;
+    var pos = buildTestRequest(&buf, 68, 0, 6801, header_mod.requestHeaderVersion(68, 0));
+    ser.writeCompactString(&buf, &pos, "kip848-group"); // group_id, body truncated
+
+    const response = broker.handleRequest(buf[0..pos]);
+    try testing.expect(response != null);
+    defer testing.allocator.free(response.?);
+
+    var rpos: usize = 0;
+    var response_header = try ResponseHeader.deserialize(testing.allocator, response.?, &rpos, header_mod.responseHeaderVersion(68, 0));
+    defer response_header.deinit(testing.allocator);
+    try testing.expectEqual(@as(i32, 6801), response_header.correlation_id);
+
+    const resp = try Resp.deserialize(testing.allocator, response.?, &rpos, 0);
+    try testing.expectEqual(response.?.len, rpos);
+    try testing.expectEqual(ErrorCode.invalid_request.toInt(), resp.error_code);
 }
 
 test "Broker.handleRequest ConsumerGroupDescribe v0 returns generated group state" {

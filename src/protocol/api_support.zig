@@ -320,6 +320,7 @@ pub const broker_handler_api_keys = [_]i16{
     61,
     65,
     66,
+    68,
     69,
     71,
     72,
@@ -356,6 +357,14 @@ pub const non_advertised_handler_api_keys = [_]i16{
     5, // StopReplica
     6, // UpdateMetadata
     7, // ControlledShutdown
+};
+
+/// Generated APIs with broker switch cases that intentionally remain
+/// non-advertised until real coordinator semantics are implemented. They are
+/// allowed through version validation only to return schema-valid fail-closed
+/// responses for direct probes.
+pub const fail_closed_generated_handler_api_keys = [_]i16{
+    68, // ConsumerGroupHeartbeat (KIP-848)
 };
 
 /// Controller handler switch cases. Version support comes from
@@ -444,6 +453,13 @@ pub fn hasControllerHandler(api_key: i16) bool {
 
 pub fn isNonAdvertisedHandlerApi(api_key: i16) bool {
     for (non_advertised_handler_api_keys) |key| {
+        if (key == api_key) return true;
+    }
+    return false;
+}
+
+pub fn isFailClosedGeneratedHandlerApi(api_key: i16) bool {
+    for (fail_closed_generated_handler_api_keys) |key| {
         if (key == api_key) return true;
     }
     return false;
@@ -616,7 +632,7 @@ test "non-advertised handler cases are explicit legacy inter-broker RPCs" {
     for (broker_handler_api_keys) |key| {
         if (findBrokerSupport(key) != null) continue;
 
-        try testing.expect(isNonAdvertisedHandlerApi(key));
+        try testing.expect(isNonAdvertisedHandlerApi(key) or isFailClosedGeneratedHandlerApi(key));
         try testing.expect(findGeneratedRequest(key) != null);
         try testing.expect(!isBrokerVersionSupported(key, findGeneratedRequest(key).?.min));
     }
@@ -624,6 +640,14 @@ test "non-advertised handler cases are explicit legacy inter-broker RPCs" {
     for (non_advertised_handler_api_keys) |key| {
         try testing.expect(hasBrokerHandler(key));
         try testing.expect(findBrokerSupport(key) == null);
+    }
+}
+
+test "fail-closed generated handler APIs are not advertised" {
+    for (fail_closed_generated_handler_api_keys) |key| {
+        try testing.expect(hasBrokerHandler(key));
+        try testing.expect(findBrokerSupport(key) == null);
+        try testing.expect(findGeneratedRequest(key) != null);
     }
 }
 
