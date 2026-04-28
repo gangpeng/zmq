@@ -11689,6 +11689,52 @@ test "Broker.handleRequest CreatePartitions v2 returns generated response and ex
     try testing.expect(broker.store.partitions.contains("create-partitions-topic-2"));
 }
 
+test "Broker.handleRequest CreatePartitions rejects unsupported manual assignments" {
+    const Req = generated.create_partitions_request.CreatePartitionsRequest;
+    const Resp = generated.create_partitions_response.CreatePartitionsResponse;
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+    try testing.expect(broker.ensureTopic("create-partitions-remote-assignment-topic"));
+    const before = broker.topics.get("create-partitions-remote-assignment-topic").?.num_partitions;
+
+    const remote_brokers = [_]i32{2};
+    const assignments = [_]Req.CreatePartitionsTopic.CreatePartitionsAssignment{.{
+        .broker_ids = &remote_brokers,
+    }};
+    const topics = [_]Req.CreatePartitionsTopic{.{
+        .name = "create-partitions-remote-assignment-topic",
+        .count = before + 1,
+        .assignments = &assignments,
+    }};
+    const req = Req{
+        .topics = &topics,
+        .timeout_ms = 30000,
+        .validate_only = false,
+    };
+
+    var buf: [512]u8 = undefined;
+    var pos = buildTestRequest(&buf, 37, 2, 3705, header_mod.requestHeaderVersion(37, 2));
+    req.serialize(&buf, &pos, 2);
+
+    const response = broker.handleRequest(buf[0..pos]);
+    try testing.expect(response != null);
+    defer testing.allocator.free(response.?);
+
+    var rpos: usize = 0;
+    var response_header = try ResponseHeader.deserialize(testing.allocator, response.?, &rpos, header_mod.responseHeaderVersion(37, 2));
+    defer response_header.deinit(testing.allocator);
+    try testing.expectEqual(@as(i32, 3705), response_header.correlation_id);
+
+    const resp = try Resp.deserialize(testing.allocator, response.?, &rpos, 2);
+    defer if (resp.results.len > 0) testing.allocator.free(resp.results);
+
+    try testing.expectEqual(response.?.len, rpos);
+    try testing.expectEqual(@as(usize, 1), resp.results.len);
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.invalid_replica_assignment)), resp.results[0].error_code);
+    try testing.expectEqual(before, broker.topics.get("create-partitions-remote-assignment-topic").?.num_partitions);
+}
+
 test "Broker.handleRequest CreatePartitions validate_only does not expand topic" {
     const Req = generated.create_partitions_request.CreatePartitionsRequest;
     const Resp = generated.create_partitions_response.CreatePartitionsResponse;
