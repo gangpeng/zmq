@@ -320,6 +320,20 @@ pub const GroupCoordinator = struct {
         };
     }
 
+    pub fn configureGroupTimeouts(self: *GroupCoordinator, group_id: []const u8, session_timeout_ms: i64, rebalance_timeout_ms: i64) bool {
+        const group = self.groups.getPtr(group_id) orelse return false;
+        var mutated = false;
+        if (group.session_timeout_ms != session_timeout_ms) {
+            group.session_timeout_ms = session_timeout_ms;
+            mutated = true;
+        }
+        if (group.rebalance_timeout_ms != rebalance_timeout_ms) {
+            group.rebalance_timeout_ms = rebalance_timeout_ms;
+            mutated = true;
+        }
+        return mutated;
+    }
+
     fn joinGroupError(error_code: i16) JoinGroupResult {
         return .{
             .error_code = error_code,

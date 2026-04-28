@@ -3518,6 +3518,21 @@ pub const Broker = struct {
 
         const member_id = nonEmptyStringOrNull(req.member_id);
         const protocol_type = req.protocol_type orelse "consumer";
+        const timeout_error = validateJoinGroupTimeouts(api_version, req.session_timeout_ms, req.rebalance_timeout_ms);
+        if (timeout_error != @intFromEnum(ErrorCode.none)) {
+            const resp = Resp{
+                .throttle_time_ms = 0,
+                .error_code = timeout_error,
+                .generation_id = -1,
+                .protocol_type = protocol_type,
+                .protocol_name = "",
+                .leader = "",
+                .skip_assignment = false,
+                .member_id = req.member_id orelse "",
+                .members = &.{},
+            };
+            return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+        }
         const protocol_selection = self.selectJoinGroupProtocol(req.group_id orelse "", protocol_type, req);
         if (protocol_selection.error_code != @intFromEnum(ErrorCode.none)) {
             const resp = Resp{
@@ -3535,7 +3550,10 @@ pub const Broker = struct {
         }
 
         const result = self.groups.joinGroupWithProtocol(req.group_id orelse "", member_id, req.group_instance_id, protocol_type, protocol_selection.name, protocol_selection.metadata, null) catch return null;
-        if (result.error_code == @intFromEnum(ErrorCode.none)) self.persistConsumerGroups();
+        if (result.error_code == @intFromEnum(ErrorCode.none)) {
+            _ = self.groups.configureGroupTimeouts(req.group_id orelse "", @intCast(req.session_timeout_ms), effectiveJoinGroupRebalanceTimeout(api_version, req.session_timeout_ms, req.rebalance_timeout_ms));
+            self.persistConsumerGroups();
+        }
 
         var members: []Resp.JoinGroupResponseMember = &.{};
         if (result.is_leader) {
@@ -3555,6 +3573,17 @@ pub const Broker = struct {
             .members = members,
         };
         return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+    }
+
+    fn validateJoinGroupTimeouts(api_version: i16, session_timeout_ms: i32, rebalance_timeout_ms: i32) i16 {
+        if (session_timeout_ms <= 0) return @intFromEnum(ErrorCode.invalid_session_timeout);
+        if (api_version >= 1 and rebalance_timeout_ms <= 0) return @intFromEnum(ErrorCode.invalid_session_timeout);
+        return @intFromEnum(ErrorCode.none);
+    }
+
+    fn effectiveJoinGroupRebalanceTimeout(api_version: i16, session_timeout_ms: i32, rebalance_timeout_ms: i32) i64 {
+        if (api_version >= 1) return @intCast(rebalance_timeout_ms);
+        return @intCast(session_timeout_ms);
     }
 
     fn freeJoinGroupRequest(self: *Broker, req: *generated.join_group_request.JoinGroupRequest) void {
@@ -16626,6 +16655,8 @@ test "Broker.handleRequest JoinGroup v9 returns generated response" {
     const group = broker.groups.groups.getPtr("jg-generated-group").?;
     try testing.expectEqualStrings("consumer", group.protocol_type.?);
     try testing.expectEqualStrings("range", group.protocol_name.?);
+    try testing.expectEqual(@as(i64, 30000), group.session_timeout_ms);
+    try testing.expectEqual(@as(i64, 300000), group.rebalance_timeout_ms);
 
     const bad_protocols = [_]Protocol{.{
         .name = "roundrobin",
@@ -16662,6 +16693,36 @@ test "Broker.handleRequest JoinGroup v9 returns generated response" {
     try testing.expectEqual(@as(i32, -1), bad_resp.generation_id);
     try testing.expectEqual(@as(usize, 0), bad_resp.members.len);
     try testing.expectEqual(@as(usize, 1), group.memberCount());
+
+    const bad_timeout_req = Req{
+        .group_id = "invalid-timeout-group",
+        .session_timeout_ms = 0,
+        .rebalance_timeout_ms = 300000,
+        .member_id = "",
+        .group_instance_id = null,
+        .protocol_type = "consumer",
+        .protocols = &protocols,
+        .reason = "invalid-timeout",
+    };
+
+    var bad_timeout_buf: [512]u8 = undefined;
+    var bad_timeout_pos = buildTestRequest(&bad_timeout_buf, 11, 9, 1112, header_mod.requestHeaderVersion(11, 9));
+    bad_timeout_req.serialize(&bad_timeout_buf, &bad_timeout_pos, 9);
+
+    const bad_timeout_response = broker.handleRequest(bad_timeout_buf[0..bad_timeout_pos]);
+    try testing.expect(bad_timeout_response != null);
+    defer testing.allocator.free(bad_timeout_response.?);
+
+    var bad_timeout_rpos: usize = 0;
+    var bad_timeout_response_header = try ResponseHeader.deserialize(testing.allocator, bad_timeout_response.?, &bad_timeout_rpos, header_mod.responseHeaderVersion(11, 9));
+    defer bad_timeout_response_header.deinit(testing.allocator);
+    try testing.expectEqual(@as(i32, 1112), bad_timeout_response_header.correlation_id);
+
+    const bad_timeout_resp = try Resp.deserialize(testing.allocator, bad_timeout_response.?, &bad_timeout_rpos, 9);
+    defer if (bad_timeout_resp.members.len > 0) testing.allocator.free(bad_timeout_resp.members);
+    try testing.expectEqual(bad_timeout_response.?.len, bad_timeout_rpos);
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.invalid_session_timeout)), bad_timeout_resp.error_code);
+    try testing.expect(!broker.groups.groups.contains("invalid-timeout-group"));
 }
 
 test "Broker.handleRequest JoinGroup rejects truncated request" {
@@ -16873,6 +16934,8 @@ test "Broker.handleRequest JoinGroup and SyncGroup persist group state across re
         defer broker.persistence.freeConsumerGroupEntries(loaded);
         try testing.expectEqual(@as(usize, 1), loaded.len);
         try testing.expectEqual(@as(u8, 3), loaded[0].state);
+        try testing.expectEqual(@as(i64, 300000), loaded[0].rebalance_timeout_ms);
+        try testing.expectEqual(@as(i64, 30000), loaded[0].session_timeout_ms);
         try testing.expectEqualStrings("consumer", loaded[0].protocol_type.?);
         try testing.expectEqualStrings("range", loaded[0].protocol_name.?);
         try testing.expectEqual(@as(usize, 1), loaded[0].members.len);
@@ -16889,6 +16952,8 @@ test "Broker.handleRequest JoinGroup and SyncGroup persist group state across re
         const group = restarted.groups.groups.getPtr("persisted-group").?;
         try testing.expectEqual(ConsumerGroup.GroupState.stable, group.state);
         try testing.expectEqual(generation_id, group.generation_id);
+        try testing.expectEqual(@as(i64, 300000), group.rebalance_timeout_ms);
+        try testing.expectEqual(@as(i64, 30000), group.session_timeout_ms);
         try testing.expectEqualStrings("consumer", group.protocol_type.?);
         try testing.expectEqualStrings("range", group.protocol_name.?);
         const member = group.members.getPtr(member_id.?).?;
