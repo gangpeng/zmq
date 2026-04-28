@@ -12856,6 +12856,94 @@ test "Broker.handleRequest DescribeTransactions v0 returns partition details and
     try testing.expectEqual(@as(usize, 0), missing.topics.len);
 }
 
+test "Broker.handleRequest transaction introspection survives local broker restart" {
+    const fs = @import("fs_compat");
+    const ListReq = generated.list_transactions_request.ListTransactionsRequest;
+    const ListResp = generated.list_transactions_response.ListTransactionsResponse;
+    const DescribeReq = generated.describe_transactions_request.DescribeTransactionsRequest;
+    const DescribeResp = generated.describe_transactions_response.DescribeTransactionsResponse;
+
+    const tmp_dir = "/tmp/zmq-transaction-introspection-restart-test";
+    fs.deleteTreeAbsolute(tmp_dir) catch {};
+    try fs.makeDirAbsolute(tmp_dir);
+    defer fs.deleteTreeAbsolute(tmp_dir) catch {};
+
+    var producer_id: i64 = 0;
+    var producer_epoch: i16 = 0;
+    {
+        var broker = Broker.initWithConfig(testing.allocator, 1, 9092, .{ .data_dir = tmp_dir });
+        defer broker.deinit();
+        try broker.open();
+
+        const init_result = try broker.txn_coordinator.initProducerId("restart-introspection-txn");
+        producer_id = init_result.producer_id;
+        producer_epoch = init_result.producer_epoch;
+        try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.none)), try broker.txn_coordinator.addPartitionsToTxn(producer_id, producer_epoch, "restart-introspection-topic", 0));
+        broker.persistTransactionsIfDirty();
+    }
+
+    var restarted = Broker.initWithConfig(testing.allocator, 1, 9092, .{ .data_dir = tmp_dir });
+    defer restarted.deinit();
+    try restarted.open();
+
+    const state_filters = [_]?[]const u8{"Ongoing"};
+    const producer_id_filters = [_]i64{producer_id};
+    const list_req = ListReq{
+        .state_filters = &state_filters,
+        .producer_id_filters = &producer_id_filters,
+        .duration_filter = -1,
+    };
+
+    var list_buf: [512]u8 = undefined;
+    var list_pos = buildTestRequest(&list_buf, 66, 1, 6603, header_mod.requestHeaderVersion(66, 1));
+    list_req.serialize(&list_buf, &list_pos, 1);
+
+    const list_response = restarted.handleRequest(list_buf[0..list_pos]);
+    try testing.expect(list_response != null);
+    defer testing.allocator.free(list_response.?);
+
+    var list_rpos: usize = 0;
+    var list_header = try ResponseHeader.deserialize(testing.allocator, list_response.?, &list_rpos, header_mod.responseHeaderVersion(66, 1));
+    defer list_header.deinit(testing.allocator);
+    try testing.expectEqual(@as(i32, 6603), list_header.correlation_id);
+
+    const list_resp = try ListResp.deserialize(testing.allocator, list_response.?, &list_rpos, 1);
+    defer freeDeserializedListTransactionsResponse(&list_resp);
+    try testing.expectEqual(list_response.?.len, list_rpos);
+    try testing.expectEqual(@as(usize, 1), list_resp.transaction_states.len);
+    try testing.expectEqualStrings("restart-introspection-txn", list_resp.transaction_states[0].transactional_id.?);
+    try testing.expectEqual(producer_id, list_resp.transaction_states[0].producer_id);
+    try testing.expectEqualStrings("Ongoing", list_resp.transaction_states[0].transaction_state.?);
+
+    const transactional_ids = [_]?[]const u8{"restart-introspection-txn"};
+    const describe_req = DescribeReq{ .transactional_ids = &transactional_ids };
+
+    var describe_buf: [512]u8 = undefined;
+    var describe_pos = buildTestRequest(&describe_buf, 65, 0, 6503, header_mod.requestHeaderVersion(65, 0));
+    describe_req.serialize(&describe_buf, &describe_pos, 0);
+
+    const describe_response = restarted.handleRequest(describe_buf[0..describe_pos]);
+    try testing.expect(describe_response != null);
+    defer testing.allocator.free(describe_response.?);
+
+    var describe_rpos: usize = 0;
+    var describe_header = try ResponseHeader.deserialize(testing.allocator, describe_response.?, &describe_rpos, header_mod.responseHeaderVersion(65, 0));
+    defer describe_header.deinit(testing.allocator);
+    try testing.expectEqual(@as(i32, 6503), describe_header.correlation_id);
+
+    const describe_resp = try DescribeResp.deserialize(testing.allocator, describe_response.?, &describe_rpos, 0);
+    defer freeDeserializedDescribeTransactionsResponse(&describe_resp);
+    try testing.expectEqual(describe_response.?.len, describe_rpos);
+    try testing.expectEqual(@as(usize, 1), describe_resp.transaction_states.len);
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.none)), describe_resp.transaction_states[0].error_code);
+    try testing.expectEqual(producer_id, describe_resp.transaction_states[0].producer_id);
+    try testing.expectEqual(producer_epoch, describe_resp.transaction_states[0].producer_epoch);
+    try testing.expectEqual(@as(usize, 1), describe_resp.transaction_states[0].topics.len);
+    try testing.expectEqualStrings("restart-introspection-topic", describe_resp.transaction_states[0].topics[0].topic.?);
+    try testing.expectEqual(@as(usize, 1), describe_resp.transaction_states[0].topics[0].partitions.len);
+    try testing.expectEqual(@as(i32, 0), describe_resp.transaction_states[0].topics[0].partitions[0]);
+}
+
 test "Broker.handleRequest DescribeTransactions rejects truncated request" {
     var broker = Broker.init(testing.allocator, 1, 9092);
     defer broker.deinit();
