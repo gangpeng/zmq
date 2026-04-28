@@ -5199,7 +5199,14 @@ pub const Broker = struct {
             }
 
             for (req.transactions) |txn_req| {
-                const topic_results = self.buildAddPartitionsToTxnTopicResults(txn_req.producer_id, txn_req.producer_epoch, txn_req.verify_only, txn_req.topics) catch return null;
+                const transaction_error = self.validateAddPartitionsToTxnIdentity(txn_req.transactional_id, txn_req.producer_id, txn_req.producer_epoch);
+                const topic_results = self.buildAddPartitionsToTxnTopicResults(
+                    txn_req.producer_id,
+                    txn_req.producer_epoch,
+                    txn_req.verify_only,
+                    transaction_error,
+                    txn_req.topics,
+                ) catch return null;
                 var transferred = false;
                 defer {
                     if (!transferred) {
@@ -5229,6 +5236,7 @@ pub const Broker = struct {
             req.v3_and_below_producer_id,
             req.v3_and_below_producer_epoch,
             false,
+            @intFromEnum(ErrorCode.none),
             req.v3_and_below_topics,
         ) catch return null;
         defer {
@@ -5249,6 +5257,7 @@ pub const Broker = struct {
         producer_id: i64,
         producer_epoch: i16,
         verify_only: bool,
+        transaction_error: i16,
         topic_reqs: []const generated.add_partitions_to_txn_request.AddPartitionsToTxnTopic,
     ) ![]generated.add_partitions_to_txn_response.AddPartitionsToTxnTopicResult {
         const TopicResult = generated.add_partitions_to_txn_response.AddPartitionsToTxnTopicResult;
@@ -5270,7 +5279,9 @@ pub const Broker = struct {
 
             const topic = topic_req.name orelse "";
             for (topic_req.partitions, 0..) |partition, partition_idx| {
-                const error_code = if (!self.topicPartitionExists(topic, partition))
+                const error_code = if (transaction_error != @intFromEnum(ErrorCode.none))
+                    transaction_error
+                else if (!self.topicPartitionExists(topic, partition))
                     @intFromEnum(ErrorCode.unknown_topic_or_partition)
                 else if (verify_only)
                     self.txn_coordinator.verifyPartitionInTxn(producer_id, producer_epoch, topic, partition)
@@ -5291,6 +5302,18 @@ pub const Broker = struct {
         }
 
         return topic_results;
+    }
+
+    fn validateAddPartitionsToTxnIdentity(self: *Broker, transactional_id: ?[]const u8, producer_id: i64, producer_epoch: i16) i16 {
+        const tid = transactional_id orelse return @intFromEnum(ErrorCode.invalid_request);
+        if (tid.len == 0) return @intFromEnum(ErrorCode.invalid_request);
+
+        const txn = self.txn_coordinator.transactions.get(producer_id) orelse return @intFromEnum(ErrorCode.invalid_producer_id_mapping);
+        const registered_tid = txn.transactional_id orelse return @intFromEnum(ErrorCode.invalid_producer_id_mapping);
+        if (!std.mem.eql(u8, registered_tid, tid)) return @intFromEnum(ErrorCode.invalid_producer_id_mapping);
+        if (txn.producer_epoch != producer_epoch) return @intFromEnum(ErrorCode.invalid_producer_epoch);
+
+        return @intFromEnum(ErrorCode.none);
     }
 
     fn topicPartitionExists(self: *Broker, topic: []const u8, partition_index: i32) bool {
@@ -14160,6 +14183,55 @@ test "Broker.handleRequest AddPartitionsToTxn rejects unknown topic partition" {
     try testing.expectEqual(response.?.len, rpos);
     try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.none)), resp.error_code);
     try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.unknown_topic_or_partition)), resp.results_by_transaction[0].topic_results[0].results_by_partition[0].partition_error_code);
+    try testing.expectEqual(@as(usize, 0), broker.txn_coordinator.getPartitions(init_result.producer_id).?.len);
+}
+
+test "Broker.handleRequest AddPartitionsToTxn rejects transactional id mismatch" {
+    const Req = generated.add_partitions_to_txn_request.AddPartitionsToTxnRequest;
+    const Topic = generated.add_partitions_to_txn_request.AddPartitionsToTxnTopic;
+    const Txn = Req.AddPartitionsToTxnTransaction;
+    const Resp = generated.add_partitions_to_txn_response.AddPartitionsToTxnResponse;
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+    try testing.expect(broker.ensureTopic("txn-add-parts-mismatch-topic"));
+
+    const init_result = try broker.txn_coordinator.initProducerId("txn-add-parts-owner");
+    const partitions = [_]i32{0};
+    const topics = [_]Topic{.{
+        .name = "txn-add-parts-mismatch-topic",
+        .partitions = &partitions,
+    }};
+    const txns = [_]Txn{.{
+        .transactional_id = "txn-add-parts-other",
+        .producer_id = init_result.producer_id,
+        .producer_epoch = init_result.producer_epoch,
+        .verify_only = false,
+        .topics = &topics,
+    }};
+    const req = Req{ .transactions = &txns };
+
+    var buf: [512]u8 = undefined;
+    var pos = buildTestRequest(&buf, 24, 4, 2406, header_mod.requestHeaderVersion(24, 4));
+    req.serialize(&buf, &pos, 4);
+
+    const response = broker.handleRequest(buf[0..pos]);
+    try testing.expect(response != null);
+    defer testing.allocator.free(response.?);
+
+    var rpos: usize = 0;
+    var response_header = try ResponseHeader.deserialize(testing.allocator, response.?, &rpos, header_mod.responseHeaderVersion(24, 4));
+    defer response_header.deinit(testing.allocator);
+    try testing.expectEqual(@as(i32, 2406), response_header.correlation_id);
+
+    const resp = try Resp.deserialize(testing.allocator, response.?, &rpos, 4);
+    defer {
+        broker.freeAddPartitionsToTxnResults(resp.results_by_transaction);
+        if (resp.results_by_transaction.len > 0) testing.allocator.free(resp.results_by_transaction);
+    }
+    try testing.expectEqual(response.?.len, rpos);
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.none)), resp.error_code);
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.invalid_producer_id_mapping)), resp.results_by_transaction[0].topic_results[0].results_by_partition[0].partition_error_code);
     try testing.expectEqual(@as(usize, 0), broker.txn_coordinator.getPartitions(init_result.producer_id).?.len);
 }
 
