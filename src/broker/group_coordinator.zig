@@ -304,6 +304,22 @@ pub const GroupCoordinator = struct {
         return @intFromEnum(ErrorCode.none);
     }
 
+    pub const EnsureProtocolResult = struct {
+        error_code: i16,
+        mutated: bool = false,
+    };
+
+    pub fn ensureProtocolForGroup(self: *GroupCoordinator, group_id: []const u8, protocol_type: []const u8, protocol_name: []const u8) !EnsureProtocolResult {
+        const group = self.groups.getPtr(group_id) orelse return .{ .error_code = @intFromEnum(ErrorCode.none) };
+        const had_protocol_type = group.protocol_type != null;
+        const had_protocol_name = group.protocol_name != null;
+        const error_code = try self.ensureGroupProtocol(group, protocol_type, protocol_name);
+        return .{
+            .error_code = error_code,
+            .mutated = error_code == @intFromEnum(ErrorCode.none) and (!had_protocol_type or !had_protocol_name),
+        };
+    }
+
     fn joinGroupError(error_code: i16) JoinGroupResult {
         return .{
             .error_code = error_code,

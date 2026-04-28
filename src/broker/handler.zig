@@ -4385,6 +4385,18 @@ pub const Broker = struct {
         };
         defer self.freeSyncGroupRequest(&req);
 
+        const sync_protocol = self.selectSyncGroupProtocol(api_version, req.group_id orelse "", req.protocol_type, req.protocol_name);
+        if (sync_protocol.error_code != @intFromEnum(ErrorCode.none)) {
+            const resp = Resp{
+                .throttle_time_ms = 0,
+                .error_code = sync_protocol.error_code,
+                .protocol_type = sync_protocol.protocol_type,
+                .protocol_name = sync_protocol.protocol_name,
+                .assignment = null,
+            };
+            return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+        }
+
         var assignment_buf: []GroupCoord.MemberAssignment = &.{};
         if (req.assignments.len > 0) {
             assignment_buf = self.allocator.alloc(GroupCoord.MemberAssignment, req.assignments.len) catch return null;
@@ -4401,16 +4413,92 @@ pub const Broker = struct {
         const result = self.groups.syncGroup(req.group_id orelse "", req.member_id orelse "", req.generation_id, assignments) catch blk: {
             break :blk GroupCoord.SyncGroupResult{ .error_code = @intFromEnum(ErrorCode.not_coordinator), .assignment = null };
         };
-        if (assignments != null and result.error_code == @intFromEnum(ErrorCode.none)) self.persistConsumerGroups();
+        var protocol_mutated = false;
+        if (sync_protocol.from_request and result.error_code == @intFromEnum(ErrorCode.none)) {
+            const ensure_result = self.groups.ensureProtocolForGroup(req.group_id orelse "", sync_protocol.protocol_type, sync_protocol.protocol_name) catch return null;
+            protocol_mutated = ensure_result.mutated;
+        }
+        if ((assignments != null or protocol_mutated) and result.error_code == @intFromEnum(ErrorCode.none)) self.persistConsumerGroups();
 
         const resp = Resp{
             .throttle_time_ms = 0,
             .error_code = result.error_code,
-            .protocol_type = "consumer",
-            .protocol_name = "range",
+            .protocol_type = sync_protocol.protocol_type,
+            .protocol_name = sync_protocol.protocol_name,
             .assignment = result.assignment,
         };
         return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+    }
+
+    const SyncGroupProtocolSelection = struct {
+        error_code: i16,
+        protocol_type: []const u8,
+        protocol_name: []const u8,
+        from_request: bool = false,
+    };
+
+    fn selectSyncGroupProtocol(self: *Broker, api_version: i16, group_id: []const u8, request_protocol_type: ?[]const u8, request_protocol_name: ?[]const u8) SyncGroupProtocolSelection {
+        if (api_version >= 5) {
+            const protocol_type = request_protocol_type orelse return .{
+                .error_code = @intFromEnum(ErrorCode.inconsistent_group_protocol),
+                .protocol_type = "",
+                .protocol_name = "",
+            };
+            const protocol_name = request_protocol_name orelse return .{
+                .error_code = @intFromEnum(ErrorCode.inconsistent_group_protocol),
+                .protocol_type = protocol_type,
+                .protocol_name = "",
+            };
+            if (protocol_type.len == 0 or protocol_name.len == 0) {
+                return .{
+                    .error_code = @intFromEnum(ErrorCode.inconsistent_group_protocol),
+                    .protocol_type = protocol_type,
+                    .protocol_name = protocol_name,
+                };
+            }
+
+            if (self.groups.groups.getPtr(group_id)) |group| {
+                if (group.protocol_type) |existing_type| {
+                    if (!std.mem.eql(u8, existing_type, protocol_type)) {
+                        return .{
+                            .error_code = @intFromEnum(ErrorCode.inconsistent_group_protocol),
+                            .protocol_type = protocol_type,
+                            .protocol_name = protocol_name,
+                        };
+                    }
+                }
+                if (group.protocol_name) |existing_name| {
+                    if (!std.mem.eql(u8, existing_name, protocol_name)) {
+                        return .{
+                            .error_code = @intFromEnum(ErrorCode.inconsistent_group_protocol),
+                            .protocol_type = protocol_type,
+                            .protocol_name = protocol_name,
+                        };
+                    }
+                }
+            }
+
+            return .{
+                .error_code = @intFromEnum(ErrorCode.none),
+                .protocol_type = protocol_type,
+                .protocol_name = protocol_name,
+                .from_request = true,
+            };
+        }
+
+        if (self.groups.groups.getPtr(group_id)) |group| {
+            return .{
+                .error_code = @intFromEnum(ErrorCode.none),
+                .protocol_type = if (group.protocol_type) |protocol_type| protocol_type else "consumer",
+                .protocol_name = if (group.protocol_name) |protocol_name| protocol_name else "range",
+            };
+        }
+
+        return .{
+            .error_code = @intFromEnum(ErrorCode.none),
+            .protocol_type = "consumer",
+            .protocol_name = "range",
+        };
     }
 
     fn freeSyncGroupRequest(self: *Broker, req: *generated.sync_group_request.SyncGroupRequest) void {
@@ -16657,6 +16745,36 @@ test "Broker.handleRequest SyncGroup v5 returns generated response" {
 
     const group = broker.groups.groups.getPtr("sg-generated-group").?;
     try testing.expectEqual(@import("group_coordinator.zig").ConsumerGroup.GroupState.stable, group.state);
+    try testing.expectEqualStrings("consumer", group.protocol_type.?);
+    try testing.expectEqualStrings("range", group.protocol_name.?);
+
+    const bad_req = Req{
+        .group_id = "sg-generated-group",
+        .generation_id = join_result.generation_id,
+        .member_id = join_result.member_id,
+        .group_instance_id = null,
+        .protocol_type = "consumer",
+        .protocol_name = "roundrobin",
+        .assignments = &assignments,
+    };
+
+    var bad_buf: [512]u8 = undefined;
+    var bad_pos = buildTestRequest(&bad_buf, 14, 5, 1406, header_mod.requestHeaderVersion(14, 5));
+    bad_req.serialize(&bad_buf, &bad_pos, 5);
+
+    const bad_response = broker.handleRequest(bad_buf[0..bad_pos]);
+    try testing.expect(bad_response != null);
+    defer testing.allocator.free(bad_response.?);
+
+    var bad_rpos: usize = 0;
+    var bad_response_header = try ResponseHeader.deserialize(testing.allocator, bad_response.?, &bad_rpos, header_mod.responseHeaderVersion(14, 5));
+    defer bad_response_header.deinit(testing.allocator);
+    try testing.expectEqual(@as(i32, 1406), bad_response_header.correlation_id);
+
+    const bad_resp = try Resp.deserialize(testing.allocator, bad_response.?, &bad_rpos, 5);
+    try testing.expectEqual(bad_response.?.len, bad_rpos);
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.inconsistent_group_protocol)), bad_resp.error_code);
+    try testing.expect(bad_resp.assignment == null);
 }
 
 test "Broker.handleRequest JoinGroup and SyncGroup persist group state across restart" {
