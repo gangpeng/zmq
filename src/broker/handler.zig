@@ -1732,6 +1732,7 @@ pub const Broker = struct {
             73 => self.handleAssignReplicasToDirs(request_bytes, pos, &req_header, api_version, resp_header_version),
             74 => self.handleListClientMetricsResources(request_bytes, pos, &req_header, api_version, resp_header_version),
             75 => self.handleDescribeTopicPartitions(request_bytes, pos, &req_header, api_version, resp_header_version),
+            77 => self.handleShareGroupDescribe(request_bytes, pos, &req_header, api_version, resp_header_version),
             501 => self.handleCreateStreams(request_bytes, pos, &req_header, api_version, resp_header_version),
             502 => self.handleOpenStreams(request_bytes, pos, &req_header, api_version, resp_header_version),
             503 => self.handleCloseStreams(request_bytes, pos, &req_header, api_version, resp_header_version),
@@ -4840,6 +4841,72 @@ pub const Broker = struct {
             if (topic_partitions.partitions.len > 0) self.allocator.free(topic_partitions.partitions);
         }
         if (req.topic_partitions.len > 0) self.allocator.free(req.topic_partitions);
+    }
+
+    // ---------------------------------------------------------------
+    // ShareGroupDescribe (key 77) — non-advertised until share groups exist
+    // ---------------------------------------------------------------
+    fn handleShareGroupDescribe(self: *Broker, request_bytes: []const u8, body_start: usize, req_header: *const RequestHeader, api_version: i16, resp_header_version: i16) ?[]u8 {
+        const Req = generated.share_group_describe_request.ShareGroupDescribeRequest;
+        const Resp = generated.share_group_describe_response.ShareGroupDescribeResponse;
+
+        if (!validateShareGroupDescribeRequestFrame(request_bytes, body_start)) {
+            log.warn("Malformed ShareGroupDescribe request", .{});
+            const groups = [_]Resp.DescribedGroup{shareGroupDescribeError(null, ErrorCode.invalid_request, "malformed ShareGroupDescribe request", false)};
+            const resp = Resp{
+                .throttle_time_ms = 0,
+                .groups = &groups,
+            };
+            return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+        }
+
+        var pos = body_start;
+        var req = Req.deserialize(self.allocator, request_bytes, &pos, api_version) catch |err| {
+            log.warn("Failed to decode ShareGroupDescribe request: {}", .{err});
+            const groups = [_]Resp.DescribedGroup{shareGroupDescribeError(null, ErrorCode.invalid_request, "malformed ShareGroupDescribe request", false)};
+            const resp = Resp{
+                .throttle_time_ms = 0,
+                .groups = &groups,
+            };
+            return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+        };
+        defer self.freeShareGroupDescribeRequest(&req);
+
+        const groups = self.allocator.alloc(Resp.DescribedGroup, req.group_ids.len) catch return null;
+        defer self.allocator.free(groups);
+
+        for (req.group_ids, 0..) |group_id, idx| {
+            groups[idx] = shareGroupDescribeError(
+                group_id,
+                ErrorCode.unsupported_version,
+                "ShareGroupDescribe is not implemented",
+                req.include_authorized_operations,
+            );
+        }
+
+        const resp = Resp{
+            .throttle_time_ms = 0,
+            .groups = groups,
+        };
+        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+    }
+
+    fn freeShareGroupDescribeRequest(self: *Broker, req: *generated.share_group_describe_request.ShareGroupDescribeRequest) void {
+        if (req.group_ids.len > 0) self.allocator.free(req.group_ids);
+    }
+
+    fn shareGroupDescribeError(group_id: ?[]const u8, error_code: ErrorCode, error_message: []const u8, include_authorized_operations: bool) generated.share_group_describe_response.ShareGroupDescribeResponse.DescribedGroup {
+        return .{
+            .error_code = error_code.toInt(),
+            .error_message = error_message,
+            .group_id = group_id,
+            .group_state = "",
+            .group_epoch = 0,
+            .assignment_epoch = 0,
+            .assignor_name = "",
+            .members = &.{},
+            .authorized_operations = describeGroupsAuthorizedOps(include_authorized_operations),
+        };
     }
 
     // ---------------------------------------------------------------
@@ -11415,6 +11482,18 @@ pub const Broker = struct {
     }
 
     fn validateConsumerGroupDescribeRequestFrame(buf: []const u8, start_pos: usize) bool {
+        var pos = start_pos;
+
+        const group_count = readKafkaArrayCount(buf, &pos, true) orelse return false;
+        for (0..group_count) |_| {
+            if (!skipKafkaString(buf, &pos, true)) return false; // group_id
+        }
+        if (!skipFixedBytes(buf, &pos, 1)) return false; // include_authorized_operations
+        ser.skipTaggedFields(buf, &pos) catch return false;
+        return pos == buf.len;
+    }
+
+    fn validateShareGroupDescribeRequestFrame(buf: []const u8, start_pos: usize) bool {
         var pos = start_pos;
 
         const group_count = readKafkaArrayCount(buf, &pos, true) orelse return false;
@@ -21049,6 +21128,73 @@ test "Broker.handleRequest ConsumerGroupHeartbeat rejects malformed request" {
     const resp = try Resp.deserialize(testing.allocator, response.?, &rpos, 0);
     try testing.expectEqual(response.?.len, rpos);
     try testing.expectEqual(ErrorCode.invalid_request.toInt(), resp.error_code);
+}
+
+test "Broker.handleRequest ShareGroupDescribe returns generated fail-closed response" {
+    const Req = generated.share_group_describe_request.ShareGroupDescribeRequest;
+    const Resp = generated.share_group_describe_response.ShareGroupDescribeResponse;
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+
+    const group_ids = [_]?[]const u8{"share-group"};
+    const req = Req{
+        .group_ids = &group_ids,
+        .include_authorized_operations = true,
+    };
+
+    var buf: [256]u8 = undefined;
+    var pos = buildTestRequest(&buf, 77, 0, 7700, header_mod.requestHeaderVersion(77, 0));
+    req.serialize(&buf, &pos, 0);
+
+    const response = broker.handleRequest(buf[0..pos]);
+    try testing.expect(response != null);
+    defer testing.allocator.free(response.?);
+
+    var rpos: usize = 0;
+    var response_header = try ResponseHeader.deserialize(testing.allocator, response.?, &rpos, header_mod.responseHeaderVersion(77, 0));
+    defer response_header.deinit(testing.allocator);
+    try testing.expectEqual(@as(i32, 7700), response_header.correlation_id);
+
+    const resp = try Resp.deserialize(testing.allocator, response.?, &rpos, 0);
+    defer if (resp.groups.len > 0) testing.allocator.free(resp.groups);
+
+    try testing.expectEqual(response.?.len, rpos);
+    try testing.expectEqual(@as(i32, 0), resp.throttle_time_ms);
+    try testing.expectEqual(@as(usize, 1), resp.groups.len);
+    try testing.expectEqual(ErrorCode.unsupported_version.toInt(), resp.groups[0].error_code);
+    try testing.expectEqualStrings("ShareGroupDescribe is not implemented", resp.groups[0].error_message.?);
+    try testing.expectEqualStrings("share-group", resp.groups[0].group_id.?);
+    try testing.expectEqualStrings("", resp.groups[0].group_state.?);
+    try testing.expectEqual(@as(i32, 0), resp.groups[0].authorized_operations);
+}
+
+test "Broker.handleRequest ShareGroupDescribe rejects malformed request" {
+    const Resp = generated.share_group_describe_response.ShareGroupDescribeResponse;
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+
+    var buf: [128]u8 = undefined;
+    var pos = buildTestRequest(&buf, 77, 0, 7701, header_mod.requestHeaderVersion(77, 0));
+    ser.writeCompactArrayLen(&buf, &pos, 1);
+    ser.writeCompactString(&buf, &pos, "share-group"); // missing include_authorized_operations and tagged fields
+
+    const response = broker.handleRequest(buf[0..pos]);
+    try testing.expect(response != null);
+    defer testing.allocator.free(response.?);
+
+    var rpos: usize = 0;
+    var response_header = try ResponseHeader.deserialize(testing.allocator, response.?, &rpos, header_mod.responseHeaderVersion(77, 0));
+    defer response_header.deinit(testing.allocator);
+    try testing.expectEqual(@as(i32, 7701), response_header.correlation_id);
+
+    const resp = try Resp.deserialize(testing.allocator, response.?, &rpos, 0);
+    defer if (resp.groups.len > 0) testing.allocator.free(resp.groups);
+
+    try testing.expectEqual(response.?.len, rpos);
+    try testing.expectEqual(@as(usize, 1), resp.groups.len);
+    try testing.expectEqual(ErrorCode.invalid_request.toInt(), resp.groups[0].error_code);
 }
 
 test "Broker.handleRequest ConsumerGroupDescribe v0 returns generated group state" {
