@@ -1729,6 +1729,7 @@ pub const Broker = struct {
             69 => self.handleConsumerGroupDescribe(request_bytes, pos, &req_header, api_version, resp_header_version),
             71 => self.handleGetTelemetrySubscriptions(request_bytes, pos, &req_header, api_version, resp_header_version),
             72 => self.handlePushTelemetry(request_bytes, pos, &req_header, api_version, resp_header_version),
+            73 => self.handleAssignReplicasToDirs(request_bytes, pos, &req_header, api_version, resp_header_version),
             74 => self.handleListClientMetricsResources(request_bytes, pos, &req_header, api_version, resp_header_version),
             75 => self.handleDescribeTopicPartitions(request_bytes, pos, &req_header, api_version, resp_header_version),
             501 => self.handleCreateStreams(request_bytes, pos, &req_header, api_version, resp_header_version),
@@ -1826,7 +1827,7 @@ pub const Broker = struct {
         const has_throttle = switch (api_key) {
             // Most APIs v1+ have throttle_time_ms; for simplicity track the common ones
             8, 10, 11, 12, 13, 14, 22, 25, 26 => api_version >= 1,
-            57, 66, 68, 71, 72 => true,
+            57, 66, 68, 71, 72, 73 => true,
             18 => false, // ApiVersions: error_code is right after header
             else => false,
         };
@@ -8224,6 +8225,53 @@ pub const Broker = struct {
         return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
     }
 
+    // ---------------------------------------------------------------
+    // AssignReplicasToDirs (key 73) — non-advertised until JBOD dirs exist
+    // ---------------------------------------------------------------
+    fn handleAssignReplicasToDirs(self: *Broker, request_bytes: []const u8, body_start: usize, req_header: *const RequestHeader, api_version: i16, resp_header_version: i16) ?[]u8 {
+        const Req = generated.assign_replicas_to_dirs_request.AssignReplicasToDirsRequest;
+        const Resp = generated.assign_replicas_to_dirs_response.AssignReplicasToDirsResponse;
+
+        if (!validateAssignReplicasToDirsRequestFrame(request_bytes, body_start)) {
+            log.warn("Malformed AssignReplicasToDirs request", .{});
+            const resp = Resp{
+                .throttle_time_ms = 0,
+                .error_code = ErrorCode.invalid_request.toInt(),
+                .directories = &.{},
+            };
+            return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+        }
+
+        var pos = body_start;
+        var req = Req.deserialize(self.allocator, request_bytes, &pos, api_version) catch |err| {
+            log.warn("Failed to decode AssignReplicasToDirs request: {}", .{err});
+            const resp = Resp{
+                .throttle_time_ms = 0,
+                .error_code = ErrorCode.invalid_request.toInt(),
+                .directories = &.{},
+            };
+            return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+        };
+        defer self.freeAssignReplicasToDirsRequest(&req);
+
+        const resp = Resp{
+            .throttle_time_ms = 0,
+            .error_code = ErrorCode.unsupported_version.toInt(),
+            .directories = &.{},
+        };
+        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+    }
+
+    fn freeAssignReplicasToDirsRequest(self: *Broker, req: *generated.assign_replicas_to_dirs_request.AssignReplicasToDirsRequest) void {
+        for (req.directories) |directory| {
+            for (directory.topics) |topic| {
+                if (topic.partitions.len > 0) self.allocator.free(topic.partitions);
+            }
+            if (directory.topics.len > 0) self.allocator.free(directory.topics);
+        }
+        if (req.directories.len > 0) self.allocator.free(req.directories);
+    }
+
     fn telemetryClientInstanceId(self: *Broker, request_id: [16]u8, correlation_id: i32) [16]u8 {
         const zero_uuid = [_]u8{0} ** 16;
         if (!std.mem.eql(u8, &request_id, &zero_uuid)) return zero_uuid;
@@ -11039,6 +11087,28 @@ pub const Broker = struct {
         if (metrics == null) return false;
         ser.skipTaggedFields(buf, &pos) catch return false;
         return true;
+    }
+
+    fn validateAssignReplicasToDirsRequestFrame(buf: []const u8, start_pos: usize) bool {
+        var pos = start_pos;
+        if (!skipFixedBytes(buf, &pos, 12)) return false; // broker_id + broker_epoch
+        const directory_count = readKafkaArrayCount(buf, &pos, true) orelse return false;
+        for (0..directory_count) |_| {
+            if (!skipFixedBytes(buf, &pos, 16)) return false; // directory_id
+            const topic_count = readKafkaArrayCount(buf, &pos, true) orelse return false;
+            for (0..topic_count) |_| {
+                if (!skipFixedBytes(buf, &pos, 16)) return false; // topic_id
+                const partition_count = readKafkaArrayCount(buf, &pos, true) orelse return false;
+                for (0..partition_count) |_| {
+                    if (!skipFixedBytes(buf, &pos, 4)) return false; // partition_index
+                    ser.skipTaggedFields(buf, &pos) catch return false;
+                }
+                ser.skipTaggedFields(buf, &pos) catch return false;
+            }
+            ser.skipTaggedFields(buf, &pos) catch return false;
+        }
+        ser.skipTaggedFields(buf, &pos) catch return false;
+        return pos == buf.len;
     }
 
     fn validateListClientMetricsResourcesRequestFrame(buf: []const u8, start_pos: usize) bool {
@@ -16646,6 +16716,67 @@ test "Broker.handleRequest PushTelemetry rejects truncated request" {
     var buf: [128]u8 = undefined;
     const req_len = buildTestRequest(&buf, 72, 0, 7201, header_mod.requestHeaderVersion(72, 0));
     try testing.expect(broker.handleRequest(buf[0..req_len]) == null);
+}
+
+test "Broker.handleRequest AssignReplicasToDirs returns generated fail-closed response" {
+    const Req = generated.assign_replicas_to_dirs_request.AssignReplicasToDirsRequest;
+    const Resp = generated.assign_replicas_to_dirs_response.AssignReplicasToDirsResponse;
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+
+    const req = Req{
+        .broker_id = 1,
+        .broker_epoch = 1,
+        .directories = &.{},
+    };
+
+    var buf: [256]u8 = undefined;
+    var pos = buildTestRequest(&buf, 73, 0, 7300, header_mod.requestHeaderVersion(73, 0));
+    req.serialize(&buf, &pos, 0);
+
+    const response = broker.handleRequest(buf[0..pos]);
+    try testing.expect(response != null);
+    defer testing.allocator.free(response.?);
+
+    var rpos: usize = 0;
+    var response_header = try ResponseHeader.deserialize(testing.allocator, response.?, &rpos, header_mod.responseHeaderVersion(73, 0));
+    defer response_header.deinit(testing.allocator);
+    try testing.expectEqual(@as(i32, 7300), response_header.correlation_id);
+
+    const resp = try Resp.deserialize(testing.allocator, response.?, &rpos, 0);
+    defer if (resp.directories.len > 0) testing.allocator.free(resp.directories);
+
+    try testing.expectEqual(response.?.len, rpos);
+    try testing.expectEqual(@as(i32, 0), resp.throttle_time_ms);
+    try testing.expectEqual(ErrorCode.unsupported_version.toInt(), resp.error_code);
+    try testing.expectEqual(@as(usize, 0), resp.directories.len);
+}
+
+test "Broker.handleRequest AssignReplicasToDirs rejects malformed request" {
+    const Resp = generated.assign_replicas_to_dirs_response.AssignReplicasToDirsResponse;
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+
+    var buf: [128]u8 = undefined;
+    var pos = buildTestRequest(&buf, 73, 0, 7301, header_mod.requestHeaderVersion(73, 0));
+    ser.writeI32(&buf, &pos, 1); // broker_id, missing broker_epoch and directories
+
+    const response = broker.handleRequest(buf[0..pos]);
+    try testing.expect(response != null);
+    defer testing.allocator.free(response.?);
+
+    var rpos: usize = 0;
+    var response_header = try ResponseHeader.deserialize(testing.allocator, response.?, &rpos, header_mod.responseHeaderVersion(73, 0));
+    defer response_header.deinit(testing.allocator);
+    try testing.expectEqual(@as(i32, 7301), response_header.correlation_id);
+
+    const resp = try Resp.deserialize(testing.allocator, response.?, &rpos, 0);
+    defer if (resp.directories.len > 0) testing.allocator.free(resp.directories);
+
+    try testing.expectEqual(response.?.len, rpos);
+    try testing.expectEqual(ErrorCode.invalid_request.toInt(), resp.error_code);
 }
 
 test "Broker.handleRequest ListClientMetricsResources returns empty generated response" {

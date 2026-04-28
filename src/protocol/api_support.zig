@@ -324,6 +324,7 @@ pub const broker_handler_api_keys = [_]i16{
     69,
     71,
     72,
+    73,
     74,
     75,
     501,
@@ -365,6 +366,7 @@ pub const non_advertised_handler_api_keys = [_]i16{
 /// responses for direct probes.
 pub const fail_closed_generated_handler_api_keys = [_]i16{
     68, // ConsumerGroupHeartbeat (KIP-848)
+    73, // AssignReplicasToDirs (KIP-858)
 };
 
 /// Controller handler switch cases. Version support comes from
