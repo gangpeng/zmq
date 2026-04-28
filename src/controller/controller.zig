@@ -113,6 +113,7 @@ pub const Controller = struct {
             63 => self.handleBrokerHeartbeat(request_bytes, pos, &req_header, api_version, resp_header_version),
             64 => self.handleUnregisterBroker(request_bytes, pos, &req_header, api_version, resp_header_version),
             67 => self.handleAllocateProducerIds(request_bytes, pos, &req_header, api_version, resp_header_version),
+            70 => self.handleControllerRegistration(request_bytes, pos, &req_header, api_version, resp_header_version),
             80 => self.handleAddRaftVoter(request_bytes, pos, &req_header, api_version, resp_header_version),
             81 => self.handleRemoveRaftVoter(request_bytes, pos, &req_header, api_version, resp_header_version),
             else => self.handleUnsupported(&req_header, api_key, resp_header_version),
@@ -1164,6 +1165,53 @@ pub const Controller = struct {
     }
 
     // ---------------------------------------------------------------
+    // ControllerRegistration (key 70) — KRaft controller lifecycle
+    // ---------------------------------------------------------------
+    fn handleControllerRegistration(self: *Controller, request_bytes: []const u8, start_pos: usize, req_header: *const RequestHeader, api_version: i16, resp_header_version: i16) ?[]u8 {
+        const Req = generated.controller_registration_request.ControllerRegistrationRequest;
+        const Resp = generated.controller_registration_response.ControllerRegistrationResponse;
+
+        if (!validateControllerRegistrationRequestFrame(request_bytes, start_pos)) {
+            log.warn("Malformed ControllerRegistration request", .{});
+            const resp = Resp{ .error_code = ErrorCode.invalid_request.toInt(), .error_message = "malformed ControllerRegistration request" };
+            return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+        }
+
+        var pos = start_pos;
+        var req = Req.deserialize(self.allocator, request_bytes, &pos, api_version) catch |err| {
+            log.warn("Failed to decode ControllerRegistration request: {}", .{err});
+            const resp = Resp{ .error_code = ErrorCode.invalid_request.toInt(), .error_message = "malformed ControllerRegistration request" };
+            return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+        };
+        defer self.freeControllerRegistrationRequest(&req);
+
+        if (req.controller_id < 0 or req.listeners.len == 0) {
+            const resp = Resp{ .throttle_time_ms = 0, .error_code = ErrorCode.invalid_registration.toInt(), .error_message = "invalid controller registration" };
+            return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+        }
+
+        if (self.raft_state.role != .leader) {
+            const resp = Resp{ .throttle_time_ms = 0, .error_code = ErrorCode.not_controller.toInt(), .error_message = null };
+            return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+        }
+
+        if (!self.raft_state.voters.contains(req.controller_id)) {
+            const resp = Resp{ .throttle_time_ms = 0, .error_code = ErrorCode.unknown_controller_id.toInt(), .error_message = null };
+            return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+        }
+
+        log.info("ControllerRegistration accepted controller {d} with {d} listener(s)", .{ req.controller_id, req.listeners.len });
+
+        const resp = Resp{ .throttle_time_ms = 0, .error_code = ErrorCode.none.toInt(), .error_message = null };
+        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+    }
+
+    fn freeControllerRegistrationRequest(self: *Controller, req: *generated.controller_registration_request.ControllerRegistrationRequest) void {
+        if (req.listeners.len > 0) self.allocator.free(req.listeners);
+        if (req.features.len > 0) self.allocator.free(req.features);
+    }
+
+    // ---------------------------------------------------------------
     // Unsupported API
     // ---------------------------------------------------------------
     fn handleUnsupported(self: *Controller, req_header: *const RequestHeader, api_key: i16, resp_header_version: i16) ?[]u8 {
@@ -1252,6 +1300,27 @@ fn validateFetchSnapshotRequestFrame(buf: []const u8, start_pos: usize) bool {
 fn validateUnregisterBrokerRequestFrame(buf: []const u8, start_pos: usize) bool {
     var pos = start_pos;
     if (!skipFixedBytes(buf, &pos, 4)) return false; // broker_id
+    ser.skipTaggedFields(buf, &pos) catch return false;
+    return pos == buf.len;
+}
+
+fn validateControllerRegistrationRequestFrame(buf: []const u8, start_pos: usize) bool {
+    var pos = start_pos;
+
+    if (!skipFixedBytes(buf, &pos, 21)) return false; // controller_id + incarnation_id + zk_migration_ready
+    const listener_count = readKafkaArrayCount(buf, &pos, true) orelse return false;
+    for (0..listener_count) |_| {
+        if (!skipKafkaString(buf, &pos, true)) return false; // listener name
+        if (!skipKafkaString(buf, &pos, true)) return false; // listener host
+        if (!skipFixedBytes(buf, &pos, 4)) return false; // listener port + security_protocol
+        ser.skipTaggedFields(buf, &pos) catch return false;
+    }
+    const feature_count = readKafkaArrayCount(buf, &pos, true) orelse return false;
+    for (0..feature_count) |_| {
+        if (!skipKafkaString(buf, &pos, true)) return false; // feature name
+        if (!skipFixedBytes(buf, &pos, 4)) return false; // min/max supported versions
+        ser.skipTaggedFields(buf, &pos) catch return false;
+    }
     ser.skipTaggedFields(buf, &pos) catch return false;
     return pos == buf.len;
 }
@@ -1575,9 +1644,9 @@ test "Controller handleRequest ApiVersions returns supported APIs" {
     const error_code = ser.readI16(response.?, &rpos);
     try testing.expectEqual(@as(i16, 0), error_code);
 
-    // Array of supported APIs — controller supports 12 APIs
+    // Array of supported APIs — controller supports 13 APIs
     const array_len = try ser.readArrayLen(response.?, &rpos);
-    try testing.expectEqual(@as(usize, 12), array_len.?);
+    try testing.expectEqual(@as(usize, 13), array_len.?);
 }
 
 test "Controller handleRequest unsupported API returns error" {
@@ -2391,6 +2460,137 @@ test "Controller full snapshot survives Raft log compaction" {
     try testing.expectEqual(@as(i64, 1), broker.broker_epoch);
     try testing.expectEqualStrings("host1", broker.host);
     try testing.expect(!broker.fenced);
+}
+
+test "Controller handleRequest ControllerRegistration accepts known voter" {
+    const Req = generated.controller_registration_request.ControllerRegistrationRequest;
+    const Resp = generated.controller_registration_response.ControllerRegistrationResponse;
+
+    var ctrl = Controller.init(testing.allocator, 1, "test-cluster");
+    defer ctrl.deinit();
+    try makeTestControllerLeader(&ctrl);
+
+    const listeners = [_]Req.Listener{.{
+        .name = "CONTROLLER",
+        .host = "127.0.0.1",
+        .port = 9093,
+        .security_protocol = 0,
+    }};
+    const features = [_]Req.Feature{.{
+        .name = "metadata.version",
+        .min_supported_version = 1,
+        .max_supported_version = 1,
+    }};
+
+    var buf: [512]u8 = undefined;
+    var pos = buildTestRequest(&buf, 70, 0, 7000, header_mod.requestHeaderVersion(70, 0));
+    const req = Req{
+        .controller_id = 1,
+        .listeners = &listeners,
+        .features = &features,
+    };
+    req.serialize(&buf, &pos, 0);
+
+    const response = ctrl.handleRequest(buf[0..pos]);
+    try testing.expect(response != null);
+    defer testing.allocator.free(response.?);
+
+    var rpos: usize = 0;
+    var resp_header = try ResponseHeader.deserialize(testing.allocator, response.?, &rpos, header_mod.responseHeaderVersion(70, 0));
+    defer resp_header.deinit(testing.allocator);
+    try testing.expectEqual(@as(i32, 7000), resp_header.correlation_id);
+
+    const resp = try Resp.deserialize(testing.allocator, response.?, &rpos, 0);
+    try testing.expectEqual(ErrorCode.none.toInt(), resp.error_code);
+}
+
+test "Controller handleRequest ControllerRegistration rejects non-leader" {
+    const Req = generated.controller_registration_request.ControllerRegistrationRequest;
+    const Resp = generated.controller_registration_response.ControllerRegistrationResponse;
+
+    var ctrl = Controller.init(testing.allocator, 1, "test-cluster");
+    defer ctrl.deinit();
+    try ctrl.raft_state.addVoter(1);
+
+    const listeners = [_]Req.Listener{.{
+        .name = "CONTROLLER",
+        .host = "127.0.0.1",
+        .port = 9093,
+        .security_protocol = 0,
+    }};
+
+    var buf: [256]u8 = undefined;
+    var pos = buildTestRequest(&buf, 70, 0, 7001, header_mod.requestHeaderVersion(70, 0));
+    const req = Req{ .controller_id = 1, .listeners = &listeners };
+    req.serialize(&buf, &pos, 0);
+
+    const response = ctrl.handleRequest(buf[0..pos]);
+    try testing.expect(response != null);
+    defer testing.allocator.free(response.?);
+
+    var rpos: usize = 0;
+    var resp_header = try ResponseHeader.deserialize(testing.allocator, response.?, &rpos, header_mod.responseHeaderVersion(70, 0));
+    defer resp_header.deinit(testing.allocator);
+    try testing.expectEqual(@as(i32, 7001), resp_header.correlation_id);
+
+    const resp = try Resp.deserialize(testing.allocator, response.?, &rpos, 0);
+    try testing.expectEqual(ErrorCode.not_controller.toInt(), resp.error_code);
+}
+
+test "Controller handleRequest ControllerRegistration rejects unknown controller" {
+    const Req = generated.controller_registration_request.ControllerRegistrationRequest;
+    const Resp = generated.controller_registration_response.ControllerRegistrationResponse;
+
+    var ctrl = Controller.init(testing.allocator, 1, "test-cluster");
+    defer ctrl.deinit();
+    try makeTestControllerLeader(&ctrl);
+
+    const listeners = [_]Req.Listener{.{
+        .name = "CONTROLLER",
+        .host = "127.0.0.1",
+        .port = 9093,
+        .security_protocol = 0,
+    }};
+
+    var buf: [256]u8 = undefined;
+    var pos = buildTestRequest(&buf, 70, 0, 7002, header_mod.requestHeaderVersion(70, 0));
+    const req = Req{ .controller_id = 2, .listeners = &listeners };
+    req.serialize(&buf, &pos, 0);
+
+    const response = ctrl.handleRequest(buf[0..pos]);
+    try testing.expect(response != null);
+    defer testing.allocator.free(response.?);
+
+    var rpos: usize = 0;
+    var resp_header = try ResponseHeader.deserialize(testing.allocator, response.?, &rpos, header_mod.responseHeaderVersion(70, 0));
+    defer resp_header.deinit(testing.allocator);
+    try testing.expectEqual(@as(i32, 7002), resp_header.correlation_id);
+
+    const resp = try Resp.deserialize(testing.allocator, response.?, &rpos, 0);
+    try testing.expectEqual(ErrorCode.unknown_controller_id.toInt(), resp.error_code);
+}
+
+test "Controller handleRequest ControllerRegistration rejects malformed request" {
+    const Resp = generated.controller_registration_response.ControllerRegistrationResponse;
+
+    var ctrl = Controller.init(testing.allocator, 1, "test-cluster");
+    defer ctrl.deinit();
+
+    var buf: [128]u8 = undefined;
+    var pos = buildTestRequest(&buf, 70, 0, 7003, header_mod.requestHeaderVersion(70, 0));
+    ser.writeI32(&buf, &pos, 1); // controller_id, missing incarnation_id and the rest
+
+    const response = ctrl.handleRequest(buf[0..pos]);
+    try testing.expect(response != null);
+    defer testing.allocator.free(response.?);
+
+    var rpos: usize = 0;
+    var resp_header = try ResponseHeader.deserialize(testing.allocator, response.?, &rpos, header_mod.responseHeaderVersion(70, 0));
+    defer resp_header.deinit(testing.allocator);
+    try testing.expectEqual(@as(i32, 7003), resp_header.correlation_id);
+
+    const resp = try Resp.deserialize(testing.allocator, response.?, &rpos, 0);
+    try testing.expectEqual(ErrorCode.invalid_request.toInt(), resp.error_code);
 }
 
 test "Controller handleRequest AddRaftVoter uses generated key 80" {

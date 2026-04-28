@@ -137,6 +137,7 @@ pub const controller_supported_apis = [_]ControllerApiSupport{
     .{ .key = 63, .name = "BrokerHeartbeat", .min = 0, .max = 0 },
     .{ .key = 64, .name = "UnregisterBroker", .min = 0, .max = 0 },
     .{ .key = 67, .name = "AllocateProducerIds", .min = 0, .max = 0 },
+    .{ .key = 70, .name = "ControllerRegistration", .min = 0, .max = 0 },
     .{ .key = 80, .name = "AddRaftVoter", .min = 0, .max = 0 },
     .{ .key = 81, .name = "RemoveRaftVoter", .min = 0, .max = 0 },
 };
@@ -370,6 +371,7 @@ pub const controller_handler_api_keys = [_]i16{
     63,
     64,
     67,
+    70,
     80,
     81,
 };
@@ -591,6 +593,7 @@ test "controller supported APIs do not advertise versions beyond generated schem
 
     try testing.expect(findControllerSupport(71) == null);
     try testing.expect(findControllerSupport(72) == null);
+    try testing.expectEqualStrings("ControllerRegistration", findControllerSupport(70).?.name);
     try testing.expectEqualStrings("AddRaftVoter", findControllerSupport(80).?.name);
     try testing.expectEqualStrings("RemoveRaftVoter", findControllerSupport(81).?.name);
 }
