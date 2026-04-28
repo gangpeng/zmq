@@ -77,6 +77,12 @@ def write_compact_string(value):
     return write_varint(len(raw) + 1) + raw
 
 
+def write_compact_bytes(value):
+    if value is None:
+        return b"\x00"
+    return write_varint(len(value) + 1) + value
+
+
 def write_compact_array_len(count):
     return write_varint(count + 1)
 
@@ -119,11 +125,27 @@ def read_compact_string(buf, pos):
     return buf[pos : pos + length].decode("utf-8", errors="replace"), pos + length
 
 
+def read_compact_bytes(buf, pos):
+    raw_len, pos = read_varint(buf, pos)
+    if raw_len == 0:
+        return None, pos
+    length = raw_len - 1
+    if pos + length > len(buf):
+        raise TestError("buffer underflow while reading compact bytes")
+    return buf[pos : pos + length], pos + length
+
+
 def read_compact_array_len(buf, pos):
     raw_len, pos = read_varint(buf, pos)
     if raw_len == 0:
         return 0, pos
     return raw_len - 1, pos
+
+
+def read_bool(buf, pos):
+    if pos >= len(buf):
+        raise TestError("buffer underflow while reading bool")
+    return buf[pos] != 0, pos + 1
 
 
 def skip_tags(buf, pos):
@@ -154,6 +176,32 @@ def controller_request(port, api_key, api_version, correlation_id, body=b"", tim
         if response_size <= 0 or response_size > 1024 * 1024:
             raise TestError(f"invalid response frame size {response_size}")
         return read_exact(sock, response_size)
+
+
+def automq_request(port, api_key, correlation_id, body=b"", timeout=10):
+    header = struct.pack(">hhi", api_key, 0, correlation_id)
+    header += write_compact_string("automq-failover-test")
+    header += b"\x00"
+    frame_body = header + body
+
+    with socket.create_connection(("127.0.0.1", port), timeout=timeout) as sock:
+        sock.settimeout(timeout)
+        sock.sendall(struct.pack(">I", len(frame_body)) + frame_body)
+        response_size = struct.unpack(">I", read_exact(sock, 4))[0]
+        if response_size <= 0 or response_size > 1024 * 1024:
+            raise TestError(f"invalid AutoMQ response frame size {response_size}")
+        return read_exact(sock, response_size)
+
+
+def parse_flexible_response_header(response, expected_correlation_id):
+    pos = 0
+    correlation_id, pos = read_i32(response, pos)
+    if correlation_id != expected_correlation_id:
+        raise TestError(
+            f"AutoMQ correlation mismatch: expected={expected_correlation_id} got={correlation_id}"
+        )
+    pos = skip_tags(response, pos)
+    return pos
 
 
 def api_versions_count(port):
@@ -312,6 +360,192 @@ def wait_for_payloads(port, topic, payloads, timeout=30):
         f"missing payloads after fetch retry: {missing!r}; "
         f"last_high_watermark={last_high_watermark}"
     )
+
+
+def automq_put_kv(port, key, value, correlation_id, overwrite=True):
+    body = write_compact_array_len(1)
+    body += write_compact_string(key)
+    body += write_compact_bytes(value)
+    body += b"\x01" if overwrite else b"\x00"
+    body += b"\x00"  # item tagged fields
+    body += b"\x00"  # request tagged fields
+
+    response = automq_request(port, 510, correlation_id, body)
+    pos = parse_flexible_response_header(response, correlation_id)
+    top_error, pos = read_i16(response, pos)
+    _, pos = read_i32(response, pos)  # throttle_time_ms
+    response_count, pos = read_compact_array_len(response, pos)
+    if top_error != 0 or response_count != 1:
+        raise TestError(f"PutKVs top_error={top_error} response_count={response_count}")
+    item_error, pos = read_i16(response, pos)
+    item_value, pos = read_compact_bytes(response, pos)
+    pos = skip_tags(response, pos)
+    pos = skip_tags(response, pos)
+    if item_error != 0:
+        raise TestError(f"PutKVs item_error={item_error}")
+    return item_value
+
+
+def automq_get_kv(port, key, correlation_id):
+    body = write_compact_array_len(1)
+    body += write_compact_string(key)
+    body += b"\x00"  # item tagged fields
+    body += b"\x00"  # request tagged fields
+
+    response = automq_request(port, 509, correlation_id, body)
+    pos = parse_flexible_response_header(response, correlation_id)
+    top_error, pos = read_i16(response, pos)
+    _, pos = read_i32(response, pos)  # throttle_time_ms
+    response_count, pos = read_compact_array_len(response, pos)
+    if top_error != 0 or response_count != 1:
+        raise TestError(f"GetKVs top_error={top_error} response_count={response_count}")
+    item_error, pos = read_i16(response, pos)
+    value, pos = read_compact_bytes(response, pos)
+    pos = skip_tags(response, pos)
+    pos = skip_tags(response, pos)
+    if item_error != 0:
+        raise TestError(f"GetKVs item_error={item_error}")
+    return value
+
+
+def automq_create_stream(port, node_id, correlation_id):
+    body = struct.pack(">iq", node_id, 1)
+    body += write_compact_array_len(1)
+    body += struct.pack(">i", node_id)
+    body += b"\x00"  # item tagged fields
+    body += b"\x00"  # request tagged fields
+
+    response = automq_request(port, 501, correlation_id, body, timeout=15)
+    pos = parse_flexible_response_header(response, correlation_id)
+    top_error, pos = read_i16(response, pos)
+    _, pos = read_i32(response, pos)  # throttle_time_ms
+    response_count, pos = read_compact_array_len(response, pos)
+    if top_error != 0 or response_count != 1:
+        raise TestError(f"CreateStreams top_error={top_error} response_count={response_count}")
+    item_error, pos = read_i16(response, pos)
+    stream_id, pos = read_i64(response, pos)
+    pos = skip_tags(response, pos)
+    pos = skip_tags(response, pos)
+    if item_error != 0:
+        raise TestError(f"CreateStreams item_error={item_error}")
+    if stream_id < 0:
+        raise TestError(f"CreateStreams invalid stream_id={stream_id}")
+    return stream_id
+
+
+def automq_describe_stream(port, stream_id, correlation_id):
+    body = write_compact_array_len(0)  # topic_partitions
+    body += struct.pack(">i", -1)  # node_id
+    body += struct.pack(">q", stream_id)
+    body += b"\x00"  # request tagged fields
+
+    response = automq_request(port, 601, correlation_id, body)
+    pos = parse_flexible_response_header(response, correlation_id)
+    top_error, pos = read_i16(response, pos)
+    _, pos = read_i32(response, pos)  # throttle_time_ms
+    stream_count, pos = read_compact_array_len(response, pos)
+    if top_error != 0:
+        raise TestError(f"DescribeStreams top_error={top_error}")
+
+    streams = []
+    for _ in range(stream_count):
+        described_stream_id, pos = read_i64(response, pos)
+        described_node_id, pos = read_i32(response, pos)
+        state, pos = read_compact_string(response, pos)
+        if pos + 16 > len(response):
+            raise TestError("DescribeStreams response truncated in topic_id")
+        pos += 16
+        _, pos = read_compact_string(response, pos)  # topic_name
+        partition_index, pos = read_i32(response, pos)
+        epoch, pos = read_i64(response, pos)
+        start_offset, pos = read_i64(response, pos)
+        end_offset, pos = read_i64(response, pos)
+        tag_count, pos = read_compact_array_len(response, pos)
+        for _ in range(tag_count):
+            _, pos = read_compact_string(response, pos)
+            _, pos = read_compact_string(response, pos)
+            pos = skip_tags(response, pos)
+        pos = skip_tags(response, pos)
+        streams.append(
+            {
+                "stream_id": described_stream_id,
+                "node_id": described_node_id,
+                "state": state,
+                "partition_index": partition_index,
+                "epoch": epoch,
+                "start_offset": start_offset,
+                "end_offset": end_offset,
+            }
+        )
+    pos = skip_tags(response, pos)
+    for stream in streams:
+        if stream["stream_id"] == stream_id:
+            return stream
+    raise TestError(f"DescribeStreams did not include stream_id={stream_id}; streams={streams}")
+
+
+def wait_for_automq_put_kv(port, key, value, timeout=45):
+    deadline = time.time() + timeout
+    correlation_id = 7000
+    last_error = None
+    while time.time() < deadline:
+        try:
+            return automq_put_kv(port, key, value, correlation_id)
+        except Exception as exc:
+            last_error = exc
+            correlation_id += 1
+            time.sleep(0.5)
+    raise TestError(f"AutoMQ PutKVs did not succeed within {timeout}s: {last_error}")
+
+
+def wait_for_automq_kv(port, key, expected_value, timeout=45):
+    deadline = time.time() + timeout
+    correlation_id = 8000
+    last_error = None
+    last_value = None
+    while time.time() < deadline:
+        try:
+            last_value = automq_get_kv(port, key, correlation_id)
+            if last_value == expected_value:
+                return last_value
+        except Exception as exc:
+            last_error = exc
+        correlation_id += 1
+        time.sleep(0.5)
+    raise TestError(
+        f"AutoMQ GetKVs did not return expected value for {key!r}: "
+        f"last_value={last_value!r} last_error={last_error}"
+    )
+
+
+def wait_for_automq_create_stream(port, node_id, timeout=45):
+    deadline = time.time() + timeout
+    correlation_id = 9000
+    last_error = None
+    while time.time() < deadline:
+        try:
+            return automq_create_stream(port, node_id, correlation_id)
+        except Exception as exc:
+            last_error = exc
+            correlation_id += 1
+            time.sleep(0.5)
+    raise TestError(f"AutoMQ CreateStreams did not succeed within {timeout}s: {last_error}")
+
+
+def wait_for_automq_stream(port, stream_id, timeout=45):
+    deadline = time.time() + timeout
+    correlation_id = 10000
+    last_error = None
+    while time.time() < deadline:
+        try:
+            stream = automq_describe_stream(port, stream_id, correlation_id)
+            if stream["stream_id"] == stream_id:
+                return stream
+        except Exception as exc:
+            last_error = exc
+        correlation_id += 1
+        time.sleep(0.5)
+    raise TestError(f"AutoMQ DescribeStreams did not find stream {stream_id}: {last_error}")
 
 
 def describe_quorum_body():
@@ -520,6 +754,44 @@ def start_broker(tmp, voters):
     return {"proc": proc, "port": BROKER_PORT, "log_path": log_path}
 
 
+def start_combined_node(tmp, node_id, controller_port, broker_port, voters):
+    data_dir = os.path.join(tmp, f"automq-combined-{node_id}")
+    log_path = os.path.join(tmp, f"automq-combined-{node_id}.log")
+    os.makedirs(data_dir, exist_ok=True)
+    log_file = open(log_path, "ab", buffering=0)
+    args = [
+        ZMQ_BIN,
+        "--node-id",
+        str(node_id),
+        "--process-roles",
+        "broker,controller",
+        "--controller-port",
+        str(controller_port),
+        "--port",
+        str(broker_port),
+        "--metrics-port",
+        str(broker_port + 2000),
+        "--data-dir",
+        data_dir,
+        "--cluster-id",
+        f"{CLUSTER_ID}-automq",
+        "--voters",
+        voters,
+        "--advertised-host",
+        "localhost",
+        "--workers",
+        "1",
+    ]
+    proc = subprocess.Popen(args, stdout=log_file, stderr=subprocess.STDOUT)
+    proc._zmq_log_file = log_file
+    return {
+        "proc": proc,
+        "port": controller_port,
+        "broker_port": broker_port,
+        "log_path": log_path,
+    }
+
+
 def stop_process(proc, crash=False):
     if proc is None:
         return
@@ -538,6 +810,90 @@ def stop_process(proc, crash=False):
         log_file = getattr(proc, "_zmq_log_file", None)
         if log_file is not None:
             log_file.close()
+
+
+def run_automq_metadata_failover_scenario(tmp):
+    controller_base = PORT_BASE + 200
+    broker_base = BROKER_PORT + 1200
+    processes = {}
+    try:
+        controller_ports = {node_id: controller_base + node_id for node_id in range(3)}
+        broker_ports = {node_id: broker_base + node_id for node_id in range(3)}
+        voters = ",".join(
+            f"{node_id}@127.0.0.1:{port}" for node_id, port in controller_ports.items()
+        )
+
+        for node_id in sorted(controller_ports):
+            processes[node_id] = start_combined_node(
+                tmp, node_id, controller_ports[node_id], broker_ports[node_id], voters
+            )
+        for info in processes.values():
+            wait_for_ready(info["proc"], info["port"], info["log_path"])
+            wait_for_broker_ready(info["proc"], info["broker_port"], info["log_path"])
+
+        leader_id, initial = wait_for_leader(processes)
+        if leader_id not in processes:
+            raise TestError(f"AutoMQ scenario discovered unexpected leader {leader_id}")
+
+        leader_broker_port = processes[leader_id]["broker_port"]
+        key = f"automq.failover.{os.getpid()}.{int(time.time())}"
+        value_before = b"before-controller-failover"
+        wait_for_automq_put_kv(leader_broker_port, key, value_before)
+        wait_for_automq_kv(leader_broker_port, key, value_before)
+
+        stream_id = wait_for_automq_create_stream(leader_broker_port, leader_id)
+        wait_for_automq_stream(leader_broker_port, stream_id)
+
+        for node_id, info in processes.items():
+            if node_id == leader_id:
+                continue
+            wait_for_automq_kv(info["broker_port"], key, value_before)
+            wait_for_automq_stream(info["broker_port"], stream_id)
+
+        stop_process(processes[leader_id]["proc"], crash=True)
+        replacement_leader, after = wait_for_leader(processes, forbidden_leaders={leader_id})
+        if after["leader_epoch"] <= initial["leader_epoch"]:
+            raise TestError(f"AutoMQ failover leader epoch did not advance: before={initial} after={after}")
+        wait_for_all_alive_to_report(processes, replacement_leader)
+
+        replacement_broker_port = processes[replacement_leader]["broker_port"]
+        wait_for_automq_kv(replacement_broker_port, key, value_before)
+        wait_for_automq_stream(replacement_broker_port, stream_id)
+
+        value_after = b"after-controller-failover"
+        wait_for_automq_put_kv(replacement_broker_port, key, value_after)
+        wait_for_automq_kv(replacement_broker_port, key, value_after)
+
+        processes[leader_id] = start_combined_node(
+            tmp,
+            leader_id,
+            controller_ports[leader_id],
+            broker_ports[leader_id],
+            voters,
+        )
+        wait_for_ready(
+            processes[leader_id]["proc"],
+            processes[leader_id]["port"],
+            processes[leader_id]["log_path"],
+        )
+        wait_for_broker_ready(
+            processes[leader_id]["proc"],
+            processes[leader_id]["broker_port"],
+            processes[leader_id]["log_path"],
+        )
+        wait_for_all_alive_to_report(processes, replacement_leader)
+        wait_for_automq_kv(processes[leader_id]["broker_port"], key, value_after)
+        wait_for_automq_stream(processes[leader_id]["broker_port"], stream_id)
+
+        return {
+            "old_leader": leader_id,
+            "new_leader": replacement_leader,
+            "stream_id": stream_id,
+            "epoch": after["leader_epoch"],
+        }
+    finally:
+        for info in processes.values():
+            stop_process(info.get("proc"))
 
 
 def main():
@@ -662,11 +1018,16 @@ def main():
             )
         wait_for_payloads(broker["port"], topic, expected_payloads)
 
+        automq_result = run_automq_metadata_failover_scenario(tmp)
+
         print(
             "ok: KRaft controller failover harness passed "
             f"(old_leader={leader_id}, new_leader={replacement_leader}, "
             f"restarted_controller={restart_controller_id}, "
-            f"old_leader_rejoined=true, epoch={after['leader_epoch']})"
+            f"old_leader_rejoined=true, epoch={after['leader_epoch']}, "
+            f"automq_old_leader={automq_result['old_leader']}, "
+            f"automq_new_leader={automq_result['new_leader']}, "
+            f"automq_stream_id={automq_result['stream_id']})"
         )
         return 0
     finally:

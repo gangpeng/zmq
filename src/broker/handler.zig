@@ -41,6 +41,7 @@ const CompactionManager = storage.CompactionManager;
 const JsonLogger = @import("core").JsonLogger;
 
 const max_offset_commit_metadata_bytes: usize = 4096;
+const auto_mq_quorum_commit_timeout_ms: i64 = 5000;
 
 /// Stateful Kafka broker.
 ///
@@ -1664,6 +1665,10 @@ pub const Broker = struct {
         // Record per-API latency
         const t_start = @import("time_compat").nanoTimestamp();
 
+        if ((api_key >= 501 and api_key <= 519) or (api_key >= 600 and api_key <= 602)) {
+            self.refreshAutoMqQuorumStateForRequest();
+        }
+
         const result = switch (api_key) {
             0 => self.handleProduce(request_bytes, pos, &req_header, api_version, resp_header_version),
             1 => self.handleFetch(request_bytes, pos, &req_header, api_version, resp_header_version),
@@ -2326,17 +2331,48 @@ pub const Broker = struct {
         return record.buf;
     }
 
-    fn commitAutoMqMetadataRecord(self: *Broker, record: []const u8) !void {
-        const raft = self.raft_state orelse return;
+    fn autoMqRecordHasFreshMajorityAck(self: *Broker, offset: u64, append_started_ms: i64) bool {
+        const raft = self.raft_state orelse return true;
+        if (raft.quorumSize() <= 1) return true;
+
+        var acknowledged: usize = 0;
+        var it = raft.voters.iterator();
+        while (it.next()) |entry| {
+            if (entry.key_ptr.* == raft.node_id) {
+                acknowledged += 1;
+                continue;
+            }
+            const voter = entry.value_ptr;
+            if (voter.match_index >= offset and voter.last_heartbeat_ms >= append_started_ms) {
+                acknowledged += 1;
+            }
+        }
+        return acknowledged >= raft.majorityThreshold();
+    }
+
+    fn appendCommittedAutoMqRecord(self: *Broker, record: []const u8) !u64 {
+        const raft = self.raft_state orelse return 0;
         if (raft.role != .leader) return error.NotController;
 
+        const append_started_ms = @import("time_compat").milliTimestamp();
         const offset = try raft.appendEntry(record);
         if (raft.quorumSize() <= 1) {
             raft.commit_index = offset;
-        } else {
-            raft.updateCommitIndex();
+            return offset;
         }
-        if (raft.commit_index < offset) return error.QuorumCommitPending;
+
+        const deadline_ms = append_started_ms + auto_mq_quorum_commit_timeout_ms;
+        while (@import("time_compat").milliTimestamp() < deadline_ms) {
+            if (raft.commit_index >= offset and self.autoMqRecordHasFreshMajorityAck(offset, append_started_ms)) {
+                return offset;
+            }
+            @import("time_compat").sleep(10 * std.time.ns_per_ms);
+        }
+        return error.QuorumCommitPending;
+    }
+
+    fn commitAutoMqMetadataRecord(self: *Broker, record: []const u8) !void {
+        _ = try self.appendCommittedAutoMqRecord(record);
     }
 
     fn commitAutoMqPutKvRecord(self: *Broker, key: []const u8, value: []const u8) !void {
@@ -2659,7 +2695,6 @@ pub const Broker = struct {
     fn ensureAutoMqObjectMutationAllowed(self: *Broker) !void {
         const raft = self.raft_state orelse return;
         if (raft.role != .leader) return error.NotController;
-        if (raft.quorumSize() > 1) return error.QuorumCommitPending;
     }
 
     fn autoMqObjectMutationErrorCode(self: *Broker) ?i16 {
@@ -2696,12 +2731,10 @@ pub const Broker = struct {
     fn commitAutoMqObjectMetadataRecord(self: *Broker) !void {
         const raft = self.raft_state orelse return;
         if (raft.role != .leader) return error.NotController;
-        if (raft.quorumSize() > 1) return error.QuorumCommitPending;
 
         const record = try self.buildAutoMqObjectMetadataRecord();
         defer self.allocator.free(record);
-        const offset = try raft.appendEntry(record);
-        raft.commit_index = offset;
+        _ = try self.appendCommittedAutoMqRecord(record);
     }
 
     fn persistObjectManagerMutation(self: *Broker) !void {
@@ -2740,6 +2773,21 @@ pub const Broker = struct {
             applied += 1;
         }
         return applied;
+    }
+
+    pub fn applyCommittedAutoMqQuorumRecords(self: *Broker) !usize {
+        const metadata_applied = try self.replayCommittedAutoMqMetadataRecords();
+        const object_applied = try self.replayCommittedAutoMqObjectMetadataRecords();
+        if (metadata_applied > 0) self.persistAutoMqMetadata();
+        if (object_applied > 0) self.persistObjectManagerSnapshot();
+        return metadata_applied + object_applied;
+    }
+
+    fn refreshAutoMqQuorumStateForRequest(self: *Broker) void {
+        if (self.raft_state == null) return;
+        _ = self.applyCommittedAutoMqQuorumRecords() catch |err| {
+            log.warn("Failed to refresh AutoMQ quorum metadata before request: {}", .{err});
+        };
     }
 
     fn makeStreamObjectKey(self: *Broker, object_id: u64, stream_id: u64, start_offset: u64, end_offset: u64) ![]u8 {

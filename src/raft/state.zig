@@ -25,7 +25,7 @@ pub const RaftState = struct {
     log: RaftLog,
     election_timer: ElectionTimer,
     allocator: Allocator,
-    
+
     /// Commit index — entries up to this offset are considered committed.
     /// Only committed entries should be applied to the state machine.
     commit_index: u64 = 0,
@@ -247,7 +247,7 @@ pub const RaftState = struct {
         // Initialize next_index for all voters
         var it = self.voters.iterator();
         while (it.next()) |entry| {
-            entry.value_ptr.next_index = self.log.lastOffset() + 1;
+            entry.value_ptr.next_index = self.log.nextOffset();
             entry.value_ptr.match_index = 0;
         }
     }
@@ -603,7 +603,7 @@ pub const RaftState = struct {
         const voter = self.voters.getPtr(follower_id) orelse return;
         if (response.success) {
             voter.match_index = response.match_index;
-            voter.next_index = response.match_index + 1;
+            voter.next_index = if (self.log.length() == 0) 0 else response.match_index + 1;
             voter.last_heartbeat_ms = @import("time_compat").milliTimestamp();
 
             // Recompute commit index after match_index update
@@ -1511,6 +1511,10 @@ test "handleAppendEntriesResponse decrements next_index on failure" {
     _ = try state.appendEntry("e1");
     _ = try state.appendEntry("e2");
 
+    if (state.voters.getPtr(1)) |v| {
+        v.next_index = state.log.nextOffset();
+    }
+
     // Get initial next_index for follower
     const initial_next = if (state.voters.getPtr(1)) |v| v.next_index else 0;
     try testing.expect(initial_next > 0);
@@ -2298,6 +2302,34 @@ test "RaftState getAppendEntriesForFollower returns entries for lagging follower
     try testing.expectEqual(@as(u64, 1), req.prev_log_offset);
     try testing.expectEqual(state.current_epoch, req.prev_log_epoch);
     try testing.expectEqual(state.commit_index, req.leader_commit);
+}
+
+test "RaftState first entry remains replicable after empty heartbeat" {
+    var state = RaftState.init(testing.allocator, 1, "cluster");
+    defer state.deinit();
+
+    try state.addVoter(1);
+    try state.addVoter(2);
+
+    _ = state.startElection();
+    state.becomeLeader();
+
+    const empty = state.getAppendEntriesForFollower(2) orelse return error.UnexpectedNull;
+    try testing.expectEqual(@as(u64, 0), empty.entries_start_index);
+    try testing.expectEqual(@as(usize, 0), empty.entries_count);
+
+    state.handleAppendEntriesResponse(2, .{
+        .success = true,
+        .epoch = state.current_epoch,
+        .match_index = 0,
+    });
+    try testing.expectEqual(@as(u64, 0), state.voters.get(2).?.next_index);
+
+    _ = try state.appendEntry("first-entry");
+
+    const first = state.getAppendEntriesForFollower(2) orelse return error.UnexpectedNull;
+    try testing.expectEqual(@as(u64, 0), first.entries_start_index);
+    try testing.expectEqual(@as(usize, 1), first.entries_count);
 }
 
 test "RaftState getAppendEntriesForFollower returns null for unknown voter" {

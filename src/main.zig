@@ -104,6 +104,14 @@ fn prepareAutoMqMetadataSnapshotForShutdown(brk: *Broker) bool {
     return true;
 }
 
+fn applyCommittedAutoMqQuorumRecords() void {
+    if (global_broker_ptr) |brk| {
+        _ = brk.applyCommittedAutoMqQuorumRecords() catch |err| {
+            log.warn("Failed to apply committed AutoMQ quorum records: {}", .{err});
+        };
+    }
+}
+
 fn handleSignal(sig: posix.SIG) callconv(.c) void {
     _ = sig;
     if (global_shutdown) {
@@ -407,6 +415,7 @@ pub fn main(init: std.process.Init) !void {
 
         if (controller) |ctrl| {
             brk.setRaftState(&ctrl.raft_state);
+            ctrl.raft_commit_hook = &applyCommittedAutoMqQuorumRecords;
         }
         if (!process_roles.is_controller) {
             // Broker-only nodes must prove controller registration/heartbeat

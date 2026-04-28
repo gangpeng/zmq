@@ -39,6 +39,8 @@ pub const Controller = struct {
 
     /// Last controller metadata log offset applied to broker_registry.
     last_applied_controller_metadata_offset: ?u64 = null,
+    /// Optional hook for co-located broker state machines that share this Raft log.
+    raft_commit_hook: ?*const fn () void = null,
 
     pub fn init(alloc: Allocator, node_id: i32, cluster_id: []const u8) Controller {
         return .{
@@ -381,6 +383,7 @@ pub const Controller = struct {
             } else {
                 _ = try self.applyCommittedControllerMetadataRecords();
             }
+            if (self.raft_commit_hook) |hook| hook();
         }
         return append_response;
     }
