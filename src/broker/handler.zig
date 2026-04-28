@@ -7503,6 +7503,10 @@ pub const Broker = struct {
         if (topic.len == 0 or partition_index < 0) {
             return .{ .error_code = @intFromEnum(ErrorCode.invalid_request) };
         }
+        const topic_info = self.topics.get(topic) orelse return .{ .error_code = @intFromEnum(ErrorCode.unknown_topic_or_partition) };
+        if (partition_index >= topic_info.num_partitions) {
+            return .{ .error_code = @intFromEnum(ErrorCode.unknown_topic_or_partition) };
+        }
 
         const control_type: TxnCoordinator.ControlRecordType = if (marker.transaction_result) .commit else .abort;
         const base_offset = if (self.partitionState(topic, partition_index)) |state| clampU64ToI64(state.next_offset) else 0;
@@ -11413,6 +11417,56 @@ test "Broker.handleRequest WriteTxnMarkers v1 returns generated response and wri
     try testing.expectEqual(@as(u64, 1), state.high_watermark);
     try testing.expectEqual(@as(u64, 1), state.last_stable_offset);
     try testing.expect(state.first_unstable_txn_offset == null);
+}
+
+test "Broker.handleRequest WriteTxnMarkers rejects unknown topic partition" {
+    const Req = generated.write_txn_markers_request.WriteTxnMarkersRequest;
+    const Resp = generated.write_txn_markers_response.WriteTxnMarkersResponse;
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+
+    const partition_indexes = [_]i32{0};
+    const topics = [_]Req.WritableTxnMarker.WritableTxnMarkerTopic{.{
+        .name = "missing-marker-topic",
+        .partition_indexes = &partition_indexes,
+    }};
+    const markers = [_]Req.WritableTxnMarker{.{
+        .producer_id = 123456,
+        .producer_epoch = 0,
+        .transaction_result = true,
+        .topics = &topics,
+        .coordinator_epoch = 0,
+    }};
+    const req = Req{ .markers = &markers };
+
+    var buf: [512]u8 = undefined;
+    var pos = buildTestRequest(&buf, 27, 1, 2703, header_mod.requestHeaderVersion(27, 1));
+    req.serialize(&buf, &pos, 1);
+
+    const response = broker.handleRequest(buf[0..pos]);
+    try testing.expect(response != null);
+    defer testing.allocator.free(response.?);
+
+    var rpos: usize = 0;
+    var response_header = try ResponseHeader.deserialize(testing.allocator, response.?, &rpos, header_mod.responseHeaderVersion(27, 1));
+    defer response_header.deinit(testing.allocator);
+    try testing.expectEqual(@as(i32, 2703), response_header.correlation_id);
+
+    const resp = try Resp.deserialize(testing.allocator, response.?, &rpos, 1);
+    defer {
+        for (resp.markers) |marker| {
+            for (marker.topics) |topic| {
+                if (topic.partitions.len > 0) testing.allocator.free(topic.partitions);
+            }
+            if (marker.topics.len > 0) testing.allocator.free(marker.topics);
+        }
+        if (resp.markers.len > 0) testing.allocator.free(resp.markers);
+    }
+
+    try testing.expectEqual(response.?.len, rpos);
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.unknown_topic_or_partition)), resp.markers[0].topics[0].partitions[0].error_code);
+    try testing.expect(!broker.store.partitions.contains("missing-marker-topic-0"));
 }
 
 test "Broker.handleRequest WriteTxnMarkers rejects truncated request" {
