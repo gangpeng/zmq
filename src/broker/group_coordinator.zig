@@ -498,25 +498,55 @@ pub const GroupCoordinator = struct {
     /// SyncGroup transitions from COMPLETING_REBALANCE to STABLE.
     /// Also accepts from PREPARING_REBALANCE for backward compatibility.
     pub fn syncGroup(self: *GroupCoordinator, group_id: []const u8, member_id: []const u8, generation_id: i32, assignments: ?[]const MemberAssignment) !SyncGroupResult {
-        const group = self.groups.getPtr(group_id) orelse return .{
-            .error_code = 16, // COORDINATOR_NOT_AVAILABLE
+        return self.syncGroupWithInstanceId(group_id, member_id, null, generation_id, assignments);
+    }
+
+    /// Handle SyncGroup request with optional static membership instance id.
+    pub fn syncGroupWithInstanceId(self: *GroupCoordinator, group_id: []const u8, member_id: []const u8, group_instance_id: ?[]const u8, generation_id: i32, assignments: ?[]const MemberAssignment) !SyncGroupResult {
+        if (group_id.len == 0) return .{
+            .error_code = @intFromEnum(ErrorCode.invalid_group_id),
             .assignment = null,
         };
+
+        const group = self.groups.getPtr(group_id) orelse return .{
+            .error_code = @intFromEnum(ErrorCode.unknown_member_id),
+            .assignment = null,
+        };
+
+        if (group.state == .dead) return .{
+            .error_code = @intFromEnum(ErrorCode.coordinator_not_available),
+            .assignment = null,
+        };
+
+        const requesting_member = group.members.getPtr(member_id) orelse return .{
+            .error_code = @intFromEnum(ErrorCode.unknown_member_id),
+            .assignment = null,
+        };
+        if (group_instance_id) |requested_instance_id| {
+            if (requesting_member.group_instance_id) |existing_instance_id| {
+                if (!std.mem.eql(u8, existing_instance_id, requested_instance_id)) {
+                    return .{
+                        .error_code = @intFromEnum(ErrorCode.fenced_instance_id),
+                        .assignment = null,
+                    };
+                }
+            } else {
+                return .{
+                    .error_code = @intFromEnum(ErrorCode.fenced_instance_id),
+                    .assignment = null,
+                };
+            }
+        }
 
         if (group.generation_id != generation_id) return .{
-            .error_code = 22, // ILLEGAL_GENERATION
-            .assignment = null,
-        };
-
-        if (!group.members.contains(member_id)) return .{
-            .error_code = 25, // UNKNOWN_MEMBER_ID
+            .error_code = @intFromEnum(ErrorCode.illegal_generation),
             .assignment = null,
         };
 
         // SyncGroup is only valid during rebalance states
         if (group.state != .completing_rebalance and group.state != .preparing_rebalance) {
             return .{
-                .error_code = 27, // REBALANCE_IN_PROGRESS (tells client to rejoin)
+                .error_code = @intFromEnum(ErrorCode.rebalance_in_progress),
                 .assignment = null,
             };
         }
@@ -526,10 +556,9 @@ pub const GroupCoordinator = struct {
             const is_leader = if (group.leader_id) |lid| std.mem.eql(u8, lid, member_id) else false;
             if (!is_leader) {
                 // Non-leader sent assignments — ignore them (follower waits for leader)
-                const member = group.members.getPtr(member_id).?;
                 return .{
-                    .error_code = 0,
-                    .assignment = member.assignment,
+                    .error_code = @intFromEnum(ErrorCode.none),
+                    .assignment = requesting_member.assignment,
                 };
             }
             for (assigns) |a| {
@@ -544,11 +573,9 @@ pub const GroupCoordinator = struct {
             log.info("Group {s} transitioned to stable: leader synced {d} assignments", .{ group_id, assigns.len });
         }
 
-        // Return this member's assignment
-        const member = group.members.getPtr(member_id).?;
         return .{
-            .error_code = 0,
-            .assignment = member.assignment,
+            .error_code = @intFromEnum(ErrorCode.none),
+            .assignment = requesting_member.assignment,
         };
     }
 
@@ -1298,6 +1325,16 @@ test "GroupCoordinator syncGroup wrong generation" {
     try testing.expectEqual(@as(i16, 22), sync.error_code); // ILLEGAL_GENERATION
 }
 
+test "GroupCoordinator syncGroup validates member before generation" {
+    var coord = GroupCoordinator.init(testing.allocator);
+    defer coord.deinit();
+
+    _ = try coord.joinGroup("sync-validation-group", null, "consumer", null);
+
+    const sync = try coord.syncGroup("sync-validation-group", "unknown", 999, null);
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.unknown_member_id)), sync.error_code);
+}
+
 test "GroupCoordinator syncGroup unknown member" {
     var coord = GroupCoordinator.init(testing.allocator);
     defer coord.deinit();
@@ -1313,7 +1350,17 @@ test "GroupCoordinator syncGroup nonexistent group" {
     defer coord.deinit();
 
     const sync = try coord.syncGroup("nonexistent", "m1", 1, null);
-    try testing.expectEqual(@as(i16, 16), sync.error_code); // COORDINATOR_NOT_AVAILABLE
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.unknown_member_id)), sync.error_code);
+}
+
+test "GroupCoordinator syncGroup fences mismatched static instance id" {
+    var coord = GroupCoordinator.init(testing.allocator);
+    defer coord.deinit();
+
+    const join = try coord.joinGroupWithInstanceId("sync-static-group", null, "instance-a", "consumer", null);
+
+    const sync = try coord.syncGroupWithInstanceId("sync-static-group", join.member_id, "instance-b", join.generation_id, null);
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.fenced_instance_id)), sync.error_code);
 }
 
 test "GroupCoordinator offset overwrite" {

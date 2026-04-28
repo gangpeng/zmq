@@ -4449,7 +4449,7 @@ pub const Broker = struct {
         defer if (assignment_buf.len > 0) self.allocator.free(assignment_buf);
 
         const assignments: ?[]const GroupCoord.MemberAssignment = if (assignment_buf.len > 0) assignment_buf else null;
-        const result = self.groups.syncGroup(req.group_id orelse "", req.member_id orelse "", req.generation_id, assignments) catch blk: {
+        const result = self.groups.syncGroupWithInstanceId(req.group_id orelse "", req.member_id orelse "", nonEmptyStringOrNull(req.group_instance_id), req.generation_id, assignments) catch blk: {
             break :blk GroupCoord.SyncGroupResult{ .error_code = @intFromEnum(ErrorCode.not_coordinator), .assignment = null };
         };
         var protocol_mutated = false;
@@ -16846,6 +16846,71 @@ test "Broker.handleRequest SyncGroup v5 returns generated response" {
     try testing.expectEqual(bad_response.?.len, bad_rpos);
     try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.inconsistent_group_protocol)), bad_resp.error_code);
     try testing.expect(bad_resp.assignment == null);
+
+    const missing_req = Req{
+        .group_id = "missing-sync-group",
+        .generation_id = 1,
+        .member_id = "missing-member",
+        .group_instance_id = null,
+        .protocol_type = "consumer",
+        .protocol_name = "range",
+        .assignments = &.{},
+    };
+
+    var missing_buf: [512]u8 = undefined;
+    var missing_pos = buildTestRequest(&missing_buf, 14, 5, 1407, header_mod.requestHeaderVersion(14, 5));
+    missing_req.serialize(&missing_buf, &missing_pos, 5);
+
+    const missing_response = broker.handleRequest(missing_buf[0..missing_pos]);
+    try testing.expect(missing_response != null);
+    defer testing.allocator.free(missing_response.?);
+
+    var missing_rpos: usize = 0;
+    var missing_response_header = try ResponseHeader.deserialize(testing.allocator, missing_response.?, &missing_rpos, header_mod.responseHeaderVersion(14, 5));
+    defer missing_response_header.deinit(testing.allocator);
+    try testing.expectEqual(@as(i32, 1407), missing_response_header.correlation_id);
+
+    const missing_resp = try Resp.deserialize(testing.allocator, missing_response.?, &missing_rpos, 5);
+    try testing.expectEqual(missing_response.?.len, missing_rpos);
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.unknown_member_id)), missing_resp.error_code);
+    try testing.expect(missing_resp.assignment == null);
+}
+
+test "Broker.handleRequest SyncGroup v5 fences mismatched static instance id" {
+    const Req = generated.sync_group_request.SyncGroupRequest;
+    const Resp = generated.sync_group_response.SyncGroupResponse;
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+
+    const join = try broker.groups.joinGroupWithInstanceId("sg-static-generated-group", null, "instance-a", "consumer", null);
+    const req = Req{
+        .group_id = "sg-static-generated-group",
+        .generation_id = join.generation_id,
+        .member_id = join.member_id,
+        .group_instance_id = "instance-b",
+        .protocol_type = "consumer",
+        .protocol_name = "range",
+        .assignments = &.{},
+    };
+
+    var buf: [512]u8 = undefined;
+    var pos = buildTestRequest(&buf, 14, 5, 1408, header_mod.requestHeaderVersion(14, 5));
+    req.serialize(&buf, &pos, 5);
+
+    const response = broker.handleRequest(buf[0..pos]);
+    try testing.expect(response != null);
+    defer testing.allocator.free(response.?);
+
+    var rpos: usize = 0;
+    var response_header = try ResponseHeader.deserialize(testing.allocator, response.?, &rpos, header_mod.responseHeaderVersion(14, 5));
+    defer response_header.deinit(testing.allocator);
+    try testing.expectEqual(@as(i32, 1408), response_header.correlation_id);
+
+    const resp = try Resp.deserialize(testing.allocator, response.?, &rpos, 5);
+    try testing.expectEqual(response.?.len, rpos);
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.fenced_instance_id)), resp.error_code);
+    try testing.expect(resp.assignment == null);
 }
 
 test "Broker.handleRequest JoinGroup and SyncGroup persist group state across restart" {
