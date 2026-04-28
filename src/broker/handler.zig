@@ -1713,6 +1713,7 @@ pub const Broker = struct {
             // OffsetDelete (key 47) — delete committed offsets
             47 => self.handleOffsetDelete(request_bytes, pos, &req_header, api_version, resp_header_version),
             48 => self.handleDescribeClientQuotas(request_bytes, pos, &req_header, api_version, resp_header_version),
+            49 => self.handleAlterClientQuotas(request_bytes, pos, &req_header, api_version, resp_header_version),
             60 => self.handleDescribeCluster(request_bytes, pos, &req_header, api_version, resp_header_version),
             61 => self.handleDescribeProducers(request_bytes, pos, &req_header, api_version, resp_header_version),
             52 => self.handleVote(request_bytes, pos, &req_header, api_version, resp_header_version),
@@ -1863,7 +1864,7 @@ pub const Broker = struct {
             0, 1, 2 => .topic, // Produce, Fetch, ListOffsets
             8, 9, 10, 11, 12, 13, 14, 15, 16, 42, 47 => .group, // group-related
             22, 24, 26, 27, 28, 65, 66 => .transactional_id, // txn-related
-            3, 18, 19, 20, 32, 33, 35, 37, 43, 44, 45, 46, 48, 75 => .cluster, // metadata/admin
+            3, 18, 19, 20, 32, 33, 35, 37, 43, 44, 45, 46, 48, 49, 75 => .cluster, // metadata/admin
             501...519, 600...602 => .cluster, // AutoMQ stream/object/controller extensions
             else => .unknown,
         };
@@ -1883,7 +1884,7 @@ pub const Broker = struct {
             22, 24, 26, 27, 28 => .write, // Txn ops
             30 => .alter, // CreateAcls
             31 => .alter, // DeleteAcls
-            33, 43, 44, 45 => .alter, // Alter/admin APIs
+            33, 43, 44, 45, 49 => .alter, // Alter/admin APIs
             501, 502, 503, 508, 514, 516, 518, 601 => .describe, // AutoMQ reads/lifecycle probes
             504, 511 => .delete, // AutoMQ deletes
             505, 506, 507, 510, 512, 513, 515, 517, 519, 600, 602 => .alter, // AutoMQ mutations
@@ -7598,6 +7599,188 @@ pub const Broker = struct {
     }
 
     // ---------------------------------------------------------------
+    // AlterClientQuotas (key 49)
+    // ---------------------------------------------------------------
+    fn handleAlterClientQuotas(self: *Broker, request_bytes: []const u8, body_start: usize, req_header: *const RequestHeader, api_version: i16, resp_header_version: i16) ?[]u8 {
+        const Req = generated.alter_client_quotas_request.AlterClientQuotasRequest;
+        const Resp = generated.alter_client_quotas_response.AlterClientQuotasResponse;
+        const EntryResponse = Resp.EntryData;
+
+        if (!validateAlterClientQuotasRequestFrame(request_bytes, body_start, api_version)) {
+            log.warn("Malformed AlterClientQuotas request", .{});
+            return null;
+        }
+
+        var pos = body_start;
+        var req = Req.deserialize(self.allocator, request_bytes, &pos, api_version) catch |err| {
+            log.warn("Failed to decode AlterClientQuotas request: {}", .{err});
+            return null;
+        };
+        defer self.freeAlterClientQuotasRequest(&req);
+
+        var responses: []EntryResponse = &.{};
+        if (req.entries.len > 0) {
+            responses = self.allocator.alloc(EntryResponse, req.entries.len) catch return null;
+        }
+        var response_init: usize = 0;
+        defer {
+            self.freeAlterClientQuotaEntries(responses[0..response_init]);
+            if (responses.len > 0) self.allocator.free(responses);
+        }
+
+        for (req.entries) |entry| {
+            const outcome = self.applyAlterClientQuotaEntry(entry, req.validate_only) catch return null;
+            responses[response_init] = self.buildAlterClientQuotaResponseEntry(entry, outcome.error_code, outcome.error_message) catch return null;
+            response_init += 1;
+        }
+
+        const resp = Resp{
+            .throttle_time_ms = 0,
+            .entries = responses[0..response_init],
+        };
+        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+    }
+
+    const AlterClientQuotaOutcome = struct {
+        error_code: i16,
+        error_message: ?[]const u8 = null,
+    };
+
+    const ClientQuotaTarget = union(enum) {
+        default,
+        client: []const u8,
+        invalid: []const u8,
+    };
+
+    fn freeAlterClientQuotasRequest(self: *Broker, req: *generated.alter_client_quotas_request.AlterClientQuotasRequest) void {
+        for (req.entries) |entry| {
+            if (entry.entity.len > 0) self.allocator.free(entry.entity);
+            if (entry.ops.len > 0) self.allocator.free(entry.ops);
+        }
+        if (req.entries.len > 0) self.allocator.free(req.entries);
+    }
+
+    fn applyAlterClientQuotaEntry(self: *Broker, entry: generated.alter_client_quotas_request.AlterClientQuotasRequest.EntryData, validate_only: bool) !AlterClientQuotaOutcome {
+        const target = resolveClientQuotaTarget(entry);
+        switch (target) {
+            .invalid => |message| return .{ .error_code = @intFromEnum(ErrorCode.invalid_request), .error_message = message },
+            else => {},
+        }
+
+        var producer_rate: f64 = 0;
+        var consumer_rate: f64 = 0;
+        var request_rate: f64 = 0;
+
+        switch (target) {
+            .default => {
+                producer_rate = self.quota_manager.default_produce_rate;
+                consumer_rate = self.quota_manager.default_fetch_rate;
+                request_rate = self.quota_manager.default_request_rate;
+            },
+            .client => |client_id| {
+                if (self.quota_manager.client_quotas.get(client_id)) |quota| {
+                    producer_rate = quota.produce_rate_limit;
+                    consumer_rate = quota.fetch_rate_limit;
+                    request_rate = quota.request_rate_limit;
+                }
+            },
+            .invalid => unreachable,
+        }
+
+        for (entry.ops) |op| {
+            const key = op.key orelse return .{
+                .error_code = @intFromEnum(ErrorCode.invalid_config),
+                .error_message = "Missing quota key",
+            };
+
+            const value = if (op.remove) 0 else blk: {
+                if (!(op.value >= 0 and op.value < std.math.inf(f64))) {
+                    return .{
+                        .error_code = @intFromEnum(ErrorCode.invalid_config),
+                        .error_message = "Invalid quota value",
+                    };
+                }
+                break :blk op.value;
+            };
+
+            if (std.mem.eql(u8, key, "producer_byte_rate")) {
+                producer_rate = value;
+            } else if (std.mem.eql(u8, key, "consumer_byte_rate")) {
+                consumer_rate = value;
+            } else if (std.mem.eql(u8, key, "request_percentage")) {
+                request_rate = value;
+            } else {
+                return .{
+                    .error_code = @intFromEnum(ErrorCode.invalid_config),
+                    .error_message = "Unsupported quota key",
+                };
+            }
+        }
+
+        if (!validate_only) {
+            switch (target) {
+                .default => self.quota_manager.setDefaults(producer_rate, consumer_rate, request_rate),
+                .client => |client_id| {
+                    if (producer_rate <= 0 and consumer_rate <= 0 and request_rate <= 0) {
+                        self.removeClientQuota(client_id);
+                    } else {
+                        try self.quota_manager.setClientQuota(client_id, producer_rate, consumer_rate, request_rate);
+                    }
+                },
+                .invalid => unreachable,
+            }
+        }
+
+        return .{ .error_code = @intFromEnum(ErrorCode.none) };
+    }
+
+    fn resolveClientQuotaTarget(entry: generated.alter_client_quotas_request.AlterClientQuotasRequest.EntryData) ClientQuotaTarget {
+        if (entry.entity.len != 1) return .{ .invalid = "Only single client-id quota entities are supported" };
+        const entity = entry.entity[0];
+        const entity_type = entity.entity_type orelse return .{ .invalid = "Missing quota entity type" };
+        if (!std.mem.eql(u8, entity_type, "client-id")) return .{ .invalid = "Unsupported quota entity type" };
+        if (entity.entity_name) |name| return .{ .client = name };
+        return .default;
+    }
+
+    fn removeClientQuota(self: *Broker, client_id: []const u8) void {
+        if (self.quota_manager.client_quotas.fetchRemove(client_id)) |removed| {
+            self.allocator.free(removed.value.client_id);
+            self.allocator.free(removed.key);
+        }
+    }
+
+    fn buildAlterClientQuotaResponseEntry(self: *Broker, entry: generated.alter_client_quotas_request.AlterClientQuotasRequest.EntryData, error_code: i16, error_message: ?[]const u8) !generated.alter_client_quotas_response.AlterClientQuotasResponse.EntryData {
+        const RespEntry = generated.alter_client_quotas_response.AlterClientQuotasResponse.EntryData;
+        const RespEntity = RespEntry.EntityData;
+
+        var entities: []RespEntity = &.{};
+        if (entry.entity.len > 0) {
+            entities = try self.allocator.alloc(RespEntity, entry.entity.len);
+        }
+        errdefer if (entities.len > 0) self.allocator.free(entities);
+
+        for (entry.entity, 0..) |entity, i| {
+            entities[i] = .{
+                .entity_type = entity.entity_type,
+                .entity_name = entity.entity_name,
+            };
+        }
+
+        return .{
+            .error_code = error_code,
+            .error_message = error_message,
+            .entity = entities,
+        };
+    }
+
+    fn freeAlterClientQuotaEntries(self: *Broker, entries: []const generated.alter_client_quotas_response.AlterClientQuotasResponse.EntryData) void {
+        for (entries) |entry| {
+            if (entry.entity.len > 0) self.allocator.free(entry.entity);
+        }
+    }
+
+    // ---------------------------------------------------------------
     // Unsupported
     // ---------------------------------------------------------------
     fn handleUnsupported(self: *Broker, req_header: *const RequestHeader, api_key: i16, resp_header_version: i16) ?[]u8 {
@@ -10174,6 +10357,36 @@ pub const Broker = struct {
         return true;
     }
 
+    fn validateAlterClientQuotasRequestFrame(buf: []const u8, start_pos: usize, api_version: i16) bool {
+        const flexible = api_version >= 1;
+        var pos = start_pos;
+
+        const entries = readKafkaArrayHeader(buf, &pos, flexible) orelse return false;
+        if (entries.is_null) return false;
+        for (0..entries.count) |_| {
+            const entities = readKafkaArrayHeader(buf, &pos, flexible) orelse return false;
+            if (entities.is_null) return false;
+            for (0..entities.count) |_| {
+                if (!skipKafkaString(buf, &pos, flexible)) return false; // entity_type
+                if (!skipKafkaString(buf, &pos, flexible)) return false; // entity_name
+                if (flexible) ser.skipTaggedFields(buf, &pos) catch return false;
+            }
+
+            const ops = readKafkaArrayHeader(buf, &pos, flexible) orelse return false;
+            if (ops.is_null) return false;
+            for (0..ops.count) |_| {
+                if (!skipKafkaString(buf, &pos, flexible)) return false; // key
+                if (!skipFixedBytes(buf, &pos, 9)) return false; // value + remove
+                if (flexible) ser.skipTaggedFields(buf, &pos) catch return false;
+            }
+            if (flexible) ser.skipTaggedFields(buf, &pos) catch return false;
+        }
+
+        if (!skipFixedBytes(buf, &pos, 1)) return false; // validate_only
+        if (flexible) ser.skipTaggedFields(buf, &pos) catch return false;
+        return true;
+    }
+
     fn validateOffsetForLeaderEpochRequestFrame(buf: []const u8, start_pos: usize, api_version: i16) bool {
         const flexible = api_version >= 4;
         var pos = start_pos;
@@ -11673,6 +11886,13 @@ fn freeDeserializedDescribeClientQuotasResponse(resp: *const generated.describe_
     for (resp.entries) |entry| {
         if (entry.entity.len > 0) testing.allocator.free(entry.entity);
         if (entry.values.len > 0) testing.allocator.free(entry.values);
+    }
+    if (resp.entries.len > 0) testing.allocator.free(resp.entries);
+}
+
+fn freeDeserializedAlterClientQuotasResponse(resp: *const generated.alter_client_quotas_response.AlterClientQuotasResponse) void {
+    for (resp.entries) |entry| {
+        if (entry.entity.len > 0) testing.allocator.free(entry.entity);
     }
     if (resp.entries.len > 0) testing.allocator.free(resp.entries);
 }
@@ -15069,6 +15289,184 @@ test "Broker.handleRequest DescribeClientQuotas rejects truncated request" {
 
     var buf: [128]u8 = undefined;
     const req_len = buildTestRequest(&buf, 48, 1, 4803, header_mod.requestHeaderVersion(48, 1));
+    try testing.expect(broker.handleRequest(buf[0..req_len]) == null);
+}
+
+test "Broker.handleRequest AlterClientQuotas v1 mutates quotas and DescribeClientQuotas reads them" {
+    const AlterReq = generated.alter_client_quotas_request.AlterClientQuotasRequest;
+    const AlterResp = generated.alter_client_quotas_response.AlterClientQuotasResponse;
+    const DescribeReq = generated.describe_client_quotas_request.DescribeClientQuotasRequest;
+    const DescribeResp = generated.describe_client_quotas_response.DescribeClientQuotasResponse;
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+
+    const entity = [_]AlterReq.EntryData.EntityData{.{
+        .entity_type = "client-id",
+        .entity_name = "alter-quota-client",
+    }};
+    const ops = [_]AlterReq.EntryData.OpData{
+        .{ .key = "producer_byte_rate", .value = 1234.0, .remove = false },
+        .{ .key = "consumer_byte_rate", .value = 4321.0, .remove = false },
+    };
+    const entries = [_]AlterReq.EntryData{.{
+        .entity = &entity,
+        .ops = &ops,
+    }};
+    const alter_req = AlterReq{ .entries = &entries };
+
+    var buf: [1024]u8 = undefined;
+    var pos = buildTestRequest(&buf, 49, 1, 4900, header_mod.requestHeaderVersion(49, 1));
+    alter_req.serialize(&buf, &pos, 1);
+
+    const alter_response = broker.handleRequest(buf[0..pos]);
+    try testing.expect(alter_response != null);
+    defer testing.allocator.free(alter_response.?);
+
+    var rpos: usize = 0;
+    var alter_header = try ResponseHeader.deserialize(testing.allocator, alter_response.?, &rpos, header_mod.responseHeaderVersion(49, 1));
+    defer alter_header.deinit(testing.allocator);
+    try testing.expectEqual(@as(i32, 4900), alter_header.correlation_id);
+
+    const alter_resp = try AlterResp.deserialize(testing.allocator, alter_response.?, &rpos, 1);
+    defer freeDeserializedAlterClientQuotasResponse(&alter_resp);
+
+    try testing.expectEqual(alter_response.?.len, rpos);
+    try testing.expectEqual(@as(usize, 1), alter_resp.entries.len);
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.none)), alter_resp.entries[0].error_code);
+    try testing.expectEqualStrings("client-id", alter_resp.entries[0].entity[0].entity_type.?);
+    try testing.expectEqualStrings("alter-quota-client", alter_resp.entries[0].entity[0].entity_name.?);
+
+    const components = [_]DescribeReq.ComponentData{.{
+        .entity_type = "client-id",
+        .match_type = 0,
+        .match = "alter-quota-client",
+    }};
+    const describe_req = DescribeReq{
+        .components = &components,
+        .strict = true,
+    };
+
+    pos = buildTestRequest(&buf, 48, 1, 4804, header_mod.requestHeaderVersion(48, 1));
+    describe_req.serialize(&buf, &pos, 1);
+
+    const describe_response = broker.handleRequest(buf[0..pos]);
+    try testing.expect(describe_response != null);
+    defer testing.allocator.free(describe_response.?);
+
+    rpos = 0;
+    var describe_header = try ResponseHeader.deserialize(testing.allocator, describe_response.?, &rpos, header_mod.responseHeaderVersion(48, 1));
+    defer describe_header.deinit(testing.allocator);
+    try testing.expectEqual(@as(i32, 4804), describe_header.correlation_id);
+
+    const describe_resp = try DescribeResp.deserialize(testing.allocator, describe_response.?, &rpos, 1);
+    defer freeDeserializedDescribeClientQuotasResponse(&describe_resp);
+
+    try testing.expectEqual(describe_response.?.len, rpos);
+    try testing.expectEqual(@as(usize, 1), describe_resp.entries.len);
+    try testing.expectEqual(@as(usize, 2), describe_resp.entries[0].values.len);
+    try testing.expectEqualStrings("producer_byte_rate", describe_resp.entries[0].values[0].key.?);
+    try testing.expectEqual(@as(f64, 1234.0), describe_resp.entries[0].values[0].value);
+    try testing.expectEqualStrings("consumer_byte_rate", describe_resp.entries[0].values[1].key.?);
+    try testing.expectEqual(@as(f64, 4321.0), describe_resp.entries[0].values[1].value);
+}
+
+test "Broker.handleRequest AlterClientQuotas honors validate_only" {
+    const Req = generated.alter_client_quotas_request.AlterClientQuotasRequest;
+    const Resp = generated.alter_client_quotas_response.AlterClientQuotasResponse;
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+
+    const entity = [_]Req.EntryData.EntityData{.{
+        .entity_type = "client-id",
+        .entity_name = "validate-only-quota-client",
+    }};
+    const ops = [_]Req.EntryData.OpData{.{
+        .key = "producer_byte_rate",
+        .value = 999.0,
+        .remove = false,
+    }};
+    const entries = [_]Req.EntryData{.{
+        .entity = &entity,
+        .ops = &ops,
+    }};
+    const req = Req{
+        .entries = &entries,
+        .validate_only = true,
+    };
+
+    var buf: [512]u8 = undefined;
+    var pos = buildTestRequest(&buf, 49, 0, 4901, header_mod.requestHeaderVersion(49, 0));
+    req.serialize(&buf, &pos, 0);
+
+    const response = broker.handleRequest(buf[0..pos]);
+    try testing.expect(response != null);
+    defer testing.allocator.free(response.?);
+
+    var rpos: usize = 0;
+    var response_header = try ResponseHeader.deserialize(testing.allocator, response.?, &rpos, header_mod.responseHeaderVersion(49, 0));
+    defer response_header.deinit(testing.allocator);
+    try testing.expectEqual(@as(i32, 4901), response_header.correlation_id);
+
+    const resp = try Resp.deserialize(testing.allocator, response.?, &rpos, 0);
+    defer freeDeserializedAlterClientQuotasResponse(&resp);
+
+    try testing.expectEqual(response.?.len, rpos);
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.none)), resp.entries[0].error_code);
+    try testing.expect(broker.quota_manager.client_quotas.get("validate-only-quota-client") == null);
+}
+
+test "Broker.handleRequest AlterClientQuotas rejects unsupported quota key without mutation" {
+    const Req = generated.alter_client_quotas_request.AlterClientQuotasRequest;
+    const Resp = generated.alter_client_quotas_response.AlterClientQuotasResponse;
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+
+    const entity = [_]Req.EntryData.EntityData{.{
+        .entity_type = "client-id",
+        .entity_name = "bad-quota-client",
+    }};
+    const ops = [_]Req.EntryData.OpData{.{
+        .key = "not_a_quota",
+        .value = 1.0,
+        .remove = false,
+    }};
+    const entries = [_]Req.EntryData{.{
+        .entity = &entity,
+        .ops = &ops,
+    }};
+    const req = Req{ .entries = &entries };
+
+    var buf: [512]u8 = undefined;
+    var pos = buildTestRequest(&buf, 49, 1, 4902, header_mod.requestHeaderVersion(49, 1));
+    req.serialize(&buf, &pos, 1);
+
+    const response = broker.handleRequest(buf[0..pos]);
+    try testing.expect(response != null);
+    defer testing.allocator.free(response.?);
+
+    var rpos: usize = 0;
+    var response_header = try ResponseHeader.deserialize(testing.allocator, response.?, &rpos, header_mod.responseHeaderVersion(49, 1));
+    defer response_header.deinit(testing.allocator);
+    try testing.expectEqual(@as(i32, 4902), response_header.correlation_id);
+
+    const resp = try Resp.deserialize(testing.allocator, response.?, &rpos, 1);
+    defer freeDeserializedAlterClientQuotasResponse(&resp);
+
+    try testing.expectEqual(response.?.len, rpos);
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.invalid_config)), resp.entries[0].error_code);
+    try testing.expect(resp.entries[0].error_message != null);
+    try testing.expect(broker.quota_manager.client_quotas.get("bad-quota-client") == null);
+}
+
+test "Broker.handleRequest AlterClientQuotas rejects truncated request" {
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+
+    var buf: [128]u8 = undefined;
+    const req_len = buildTestRequest(&buf, 49, 1, 4903, header_mod.requestHeaderVersion(49, 1));
     try testing.expect(broker.handleRequest(buf[0..req_len]) == null);
 }
 
