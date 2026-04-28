@@ -7463,6 +7463,7 @@ pub const Broker = struct {
             if (topics.len > 0) self.allocator.free(topics);
         }
 
+        var mutated = false;
         for (req.topics) |topic_req| {
             const partitions = self.allocator.alloc(PartitionResponse, topic_req.partitions.len) catch return null;
             var transferred = false;
@@ -7477,6 +7478,7 @@ pub const Broker = struct {
                         log.warn("TxnOffsetCommit failed for {s}:{s}:{d}: {}", .{ group_id, topic, partition_req.partition_index, err });
                         break :blk @intFromEnum(ErrorCode.kafka_storage_error);
                     };
+                    mutated = true;
                     break :blk @intFromEnum(ErrorCode.none);
                 };
 
@@ -7493,6 +7495,8 @@ pub const Broker = struct {
             topics_init += 1;
             transferred = true;
         }
+
+        if (mutated) self.persistOffsets();
 
         const resp = Resp{
             .throttle_time_ms = 0,
@@ -11238,6 +11242,73 @@ test "Broker.handleRequest TxnOffsetCommit v3 returns generated response and com
     try testing.expectEqual(@as(i32, 0), resp.topics[0].partitions[0].partition_index);
     try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.none)), resp.topics[0].partitions[0].error_code);
     try testing.expectEqual(@as(?i64, 123), try broker.groups.fetchOffset("txn-offset-group", "txn-offset-topic", 0));
+}
+
+test "Broker.handleRequest TxnOffsetCommit persists committed offsets" {
+    const fs = @import("fs_compat");
+    const Req = generated.txn_offset_commit_request.TxnOffsetCommitRequest;
+    const Resp = generated.txn_offset_commit_response.TxnOffsetCommitResponse;
+
+    const tmp_dir = "/tmp/zmq-txn-offset-commit-persist-test";
+    fs.deleteTreeAbsolute(tmp_dir) catch {};
+    try fs.makeDirAbsolute(tmp_dir);
+    defer fs.deleteTreeAbsolute(tmp_dir) catch {};
+
+    var broker = Broker.initWithConfig(testing.allocator, 1, 9092, .{ .data_dir = tmp_dir });
+    defer broker.deinit();
+    try broker.open();
+
+    const partitions = [_]Req.TxnOffsetCommitRequestTopic.TxnOffsetCommitRequestPartition{.{
+        .partition_index = 0,
+        .committed_offset = 321,
+        .committed_leader_epoch = -1,
+        .committed_metadata = "persisted",
+    }};
+    const topics = [_]Req.TxnOffsetCommitRequestTopic{.{
+        .name = "txn-offset-persist-topic",
+        .partitions = &partitions,
+    }};
+    const req = Req{
+        .transactional_id = "txn-persist-id",
+        .group_id = "txn-offset-persist-group",
+        .producer_id = 1234,
+        .producer_epoch = 0,
+        .generation_id = -1,
+        .member_id = "",
+        .group_instance_id = null,
+        .topics = &topics,
+    };
+
+    var buf: [512]u8 = undefined;
+    var pos = buildTestRequest(&buf, 28, 3, 2805, header_mod.requestHeaderVersion(28, 3));
+    req.serialize(&buf, &pos, 3);
+
+    const response = broker.handleRequest(buf[0..pos]);
+    try testing.expect(response != null);
+    defer testing.allocator.free(response.?);
+
+    var rpos: usize = 0;
+    var response_header = try ResponseHeader.deserialize(testing.allocator, response.?, &rpos, header_mod.responseHeaderVersion(28, 3));
+    defer response_header.deinit(testing.allocator);
+    try testing.expectEqual(@as(i32, 2805), response_header.correlation_id);
+
+    const resp = try Resp.deserialize(testing.allocator, response.?, &rpos, 3);
+    defer {
+        for (resp.topics) |topic| {
+            if (topic.partitions.len > 0) testing.allocator.free(topic.partitions);
+        }
+        if (resp.topics.len > 0) testing.allocator.free(resp.topics);
+    }
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.none)), resp.topics[0].partitions[0].error_code);
+
+    const loaded = try broker.persistence.loadOffsets();
+    defer {
+        for (loaded) |entry| testing.allocator.free(entry.key);
+        testing.allocator.free(loaded);
+    }
+    try testing.expectEqual(@as(usize, 1), loaded.len);
+    try testing.expectEqualStrings("txn-offset-persist-group:txn-offset-persist-topic:0", loaded[0].key);
+    try testing.expectEqual(@as(i64, 321), loaded[0].offset);
 }
 
 test "Broker.handleRequest TxnOffsetCommit rejects truncated request" {
