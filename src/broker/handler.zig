@@ -135,6 +135,8 @@ pub const Broker = struct {
     failover_controller: FailoverController,
     /// Auto-balancer for partition reassignment.
     auto_balancer: AutoBalancer,
+    /// Ongoing partition reassignments keyed by "topic-partition".
+    partition_reassignments: std.StringHashMap(PartitionReassignment),
     /// Stream/StreamSetObject/StreamObject metadata registry + S3 object resolution.
     object_manager: ObjectManager,
     /// Compaction manager: splits multi-stream SSOs into per-stream SOs, merges small SOs.
@@ -210,6 +212,21 @@ pub const Broker = struct {
 
         pub fn deinit(self: *AutoMqGroupPromotion, alloc: Allocator) void {
             alloc.free(self.link_id);
+        }
+    };
+
+    pub const PartitionReassignment = struct {
+        topic: []u8,
+        partition_index: i32,
+        replicas: []i32,
+        adding_replicas: []i32,
+        removing_replicas: []i32,
+
+        pub fn deinit(self: *PartitionReassignment, alloc: Allocator) void {
+            alloc.free(self.topic);
+            if (self.replicas.len > 0) alloc.free(self.replicas);
+            if (self.adding_replicas.len > 0) alloc.free(self.adding_replicas);
+            if (self.removing_replicas.len > 0) alloc.free(self.removing_replicas);
         }
     };
 
@@ -384,6 +401,7 @@ pub const Broker = struct {
             .failover_controller = FailoverController.init(alloc, node_id),
             // Initialize auto-balancer
             .auto_balancer = AutoBalancer.init(alloc),
+            .partition_reassignments = std.StringHashMap(PartitionReassignment).init(alloc),
             // Initialize ObjectManager for Stream/StreamSetObject/StreamObject tracking
             .object_manager = ObjectManager.init(alloc, node_id),
         };
@@ -948,6 +966,8 @@ pub const Broker = struct {
         self.failover_controller.deinit();
         // Clean up auto-balancer
         self.auto_balancer.deinit();
+        self.clearPartitionReassignments();
+        self.partition_reassignments.deinit();
         // Clean up ObjectManager (streams, SSOs, SOs)
         self.object_manager.deinit();
         // Clean up delayed fetches
@@ -8291,7 +8311,7 @@ pub const Broker = struct {
             for (topic_req.partitions, 0..) |partition_req, i| {
                 partitions[i] = .{
                     .partition_index = partition_req.partition_index,
-                    .error_code = self.alterPartitionReassignmentError(topic_info, partition_req),
+                    .error_code = self.applyPartitionReassignment(topic_name, topic_info, partition_req) catch @intFromEnum(ErrorCode.kafka_storage_error),
                     .error_message = null,
                 };
             }
@@ -8335,18 +8355,51 @@ pub const Broker = struct {
         }
     }
 
-    fn alterPartitionReassignmentError(self: *Broker, topic_info: ?TopicInfo, partition_req: generated.alter_partition_reassignments_request.AlterPartitionReassignmentsRequest.ReassignableTopic.ReassignablePartition) i16 {
+    fn applyPartitionReassignment(self: *Broker, topic_name: []const u8, topic_info: ?TopicInfo, partition_req: generated.alter_partition_reassignments_request.AlterPartitionReassignmentsRequest.ReassignableTopic.ReassignablePartition) !i16 {
         const info = topic_info orelse return @intFromEnum(ErrorCode.unknown_topic_or_partition);
         if (partition_req.partition_index < 0 or partition_req.partition_index >= info.num_partitions) {
             return @intFromEnum(ErrorCode.unknown_topic_or_partition);
         }
+
+        var key_buf: [256]u8 = undefined;
+        const lookup_key = reassignmentKeyBuf(&key_buf, topic_name, partition_req.partition_index);
+
         if (partition_req.replicas.len == 0) {
+            if (self.partition_reassignments.fetchRemove(lookup_key)) |removed| {
+                self.allocator.free(removed.key);
+                var value = removed.value;
+                value.deinit(self.allocator);
+                return @intFromEnum(ErrorCode.none);
+            }
             return @intFromEnum(ErrorCode.no_reassignment_in_progress);
         }
-        if (partition_req.replicas.len == 1 and partition_req.replicas[0] == self.node_id) {
+
+        if (!validReplicaAssignment(partition_req.replicas)) {
+            return @intFromEnum(ErrorCode.invalid_replica_assignment);
+        }
+
+        if (isLocalReplicaAssignment(partition_req.replicas, self.node_id)) {
+            if (self.partition_reassignments.fetchRemove(lookup_key)) |removed| {
+                self.allocator.free(removed.key);
+                var value = removed.value;
+                value.deinit(self.allocator);
+            }
             return @intFromEnum(ErrorCode.none);
         }
-        return @intFromEnum(ErrorCode.invalid_replica_assignment);
+
+        const owned_key = try reassignmentKey(self.allocator, topic_name, partition_req.partition_index);
+        errdefer self.allocator.free(owned_key);
+        var next = try self.buildPartitionReassignment(topic_name, partition_req.partition_index, partition_req.replicas);
+        errdefer next.deinit(self.allocator);
+
+        if (self.partition_reassignments.fetchRemove(lookup_key)) |removed| {
+            self.allocator.free(removed.key);
+            var value = removed.value;
+            value.deinit(self.allocator);
+        }
+
+        try self.partition_reassignments.put(owned_key, next);
+        return @intFromEnum(ErrorCode.none);
     }
 
     // ---------------------------------------------------------------
@@ -8367,12 +8420,17 @@ pub const Broker = struct {
         };
         defer self.freeListPartitionReassignmentsRequest(&req);
 
-        // Single-node broker: no reassignments in progress
+        const topics = self.buildListPartitionReassignmentsTopics(&req) catch return null;
+        defer if (topics.len > 0) {
+            self.freeListPartitionReassignmentsTopics(topics);
+            self.allocator.free(topics);
+        };
+
         const resp_body = Resp{
             .throttle_time_ms = 0,
             .error_code = @intFromEnum(ErrorCode.none),
             .error_message = null,
-            .topics = &.{},
+            .topics = topics,
         };
         const rh = ResponseHeader{ .correlation_id = req_header.correlation_id };
         const needed = rh.calcSize(resp_header_version) + resp_body.calcSize(api_version);
@@ -8388,6 +8446,191 @@ pub const Broker = struct {
             if (topic.partition_indexes.len > 0) self.allocator.free(topic.partition_indexes);
         }
         if (req.topics.len > 0) self.allocator.free(req.topics);
+    }
+
+    fn buildListPartitionReassignmentsTopics(self: *Broker, req: *const generated.list_partition_reassignments_request.ListPartitionReassignmentsRequest) ![]generated.list_partition_reassignments_response.ListPartitionReassignmentsResponse.OngoingTopicReassignment {
+        const TopicResponse = generated.list_partition_reassignments_response.ListPartitionReassignmentsResponse.OngoingTopicReassignment;
+
+        var topics = std.array_list.Managed(TopicResponse).init(self.allocator);
+        errdefer {
+            self.freeListPartitionReassignmentsTopics(topics.items);
+            topics.deinit();
+        }
+
+        if (req.topics.len == 0) {
+            var seen = std.array_list.Managed([]const u8).init(self.allocator);
+            defer seen.deinit();
+
+            var it = self.partition_reassignments.iterator();
+            while (it.next()) |entry| {
+                if (containsTopicName(seen.items, entry.value_ptr.topic)) continue;
+                try seen.append(entry.value_ptr.topic);
+                try self.appendListPartitionReassignmentTopic(&topics, entry.value_ptr.topic, &.{});
+            }
+        } else {
+            for (req.topics) |topic_req| {
+                const topic_name = topic_req.name orelse "";
+                try self.appendListPartitionReassignmentTopic(&topics, topic_name, topic_req.partition_indexes);
+            }
+        }
+
+        if (topics.items.len == 0) return &.{};
+        return try topics.toOwnedSlice();
+    }
+
+    fn appendListPartitionReassignmentTopic(
+        self: *Broker,
+        topics: *std.array_list.Managed(generated.list_partition_reassignments_response.ListPartitionReassignmentsResponse.OngoingTopicReassignment),
+        topic_name: []const u8,
+        partition_indexes: []const i32,
+    ) !void {
+        const TopicResponse = generated.list_partition_reassignments_response.ListPartitionReassignmentsResponse.OngoingTopicReassignment;
+        const PartitionResponse = TopicResponse.OngoingPartitionReassignment;
+
+        var partitions = std.array_list.Managed(PartitionResponse).init(self.allocator);
+        errdefer {
+            self.freeListPartitionReassignmentPartitions(partitions.items);
+            partitions.deinit();
+        }
+
+        if (partition_indexes.len > 0) {
+            for (partition_indexes) |partition_index| {
+                var key_buf: [256]u8 = undefined;
+                const lookup_key = reassignmentKeyBuf(&key_buf, topic_name, partition_index);
+                if (self.partition_reassignments.get(lookup_key)) |state| {
+                    try partitions.append(try self.listPartitionReassignmentFromState(state));
+                }
+            }
+        } else {
+            var it = self.partition_reassignments.iterator();
+            while (it.next()) |entry| {
+                if (!std.mem.eql(u8, entry.value_ptr.topic, topic_name)) continue;
+                try partitions.append(try self.listPartitionReassignmentFromState(entry.value_ptr.*));
+            }
+        }
+
+        if (partitions.items.len == 0) return;
+        const owned_partitions = try partitions.toOwnedSlice();
+        errdefer {
+            self.freeListPartitionReassignmentPartitions(owned_partitions);
+            self.allocator.free(owned_partitions);
+        }
+        try topics.append(.{
+            .name = topic_name,
+            .partitions = owned_partitions,
+        });
+    }
+
+    fn listPartitionReassignmentFromState(self: *Broker, state: PartitionReassignment) !generated.list_partition_reassignments_response.ListPartitionReassignmentsResponse.OngoingTopicReassignment.OngoingPartitionReassignment {
+        const replicas = try self.allocator.dupe(i32, state.replicas);
+        errdefer if (replicas.len > 0) self.allocator.free(replicas);
+        const adding = try self.allocator.dupe(i32, state.adding_replicas);
+        errdefer if (adding.len > 0) self.allocator.free(adding);
+        const removing = try self.allocator.dupe(i32, state.removing_replicas);
+        errdefer if (removing.len > 0) self.allocator.free(removing);
+
+        return .{
+            .partition_index = state.partition_index,
+            .replicas = replicas,
+            .adding_replicas = adding,
+            .removing_replicas = removing,
+        };
+    }
+
+    fn freeListPartitionReassignmentsTopics(self: *Broker, topics: []const generated.list_partition_reassignments_response.ListPartitionReassignmentsResponse.OngoingTopicReassignment) void {
+        for (topics) |topic| {
+            self.freeListPartitionReassignmentPartitions(topic.partitions);
+            if (topic.partitions.len > 0) self.allocator.free(topic.partitions);
+        }
+    }
+
+    fn freeListPartitionReassignmentPartitions(self: *Broker, partitions: []const generated.list_partition_reassignments_response.ListPartitionReassignmentsResponse.OngoingTopicReassignment.OngoingPartitionReassignment) void {
+        for (partitions) |partition| {
+            if (partition.replicas.len > 0) self.allocator.free(partition.replicas);
+            if (partition.adding_replicas.len > 0) self.allocator.free(partition.adding_replicas);
+            if (partition.removing_replicas.len > 0) self.allocator.free(partition.removing_replicas);
+        }
+    }
+
+    fn buildPartitionReassignment(self: *Broker, topic_name: []const u8, partition_index: i32, replicas: []const i32) !PartitionReassignment {
+        const topic_copy = try self.allocator.dupe(u8, topic_name);
+        errdefer self.allocator.free(topic_copy);
+        const replicas_copy = try self.allocator.dupe(i32, replicas);
+        errdefer self.allocator.free(replicas_copy);
+        const adding = try filterAddingReplicas(self.allocator, replicas, self.node_id);
+        errdefer if (adding.len > 0) self.allocator.free(adding);
+        const removing = try filterRemovingReplicas(self.allocator, replicas, self.node_id);
+        errdefer if (removing.len > 0) self.allocator.free(removing);
+
+        return .{
+            .topic = topic_copy,
+            .partition_index = partition_index,
+            .replicas = replicas_copy,
+            .adding_replicas = adding,
+            .removing_replicas = removing,
+        };
+    }
+
+    fn clearPartitionReassignments(self: *Broker) void {
+        var it = self.partition_reassignments.iterator();
+        while (it.next()) |entry| {
+            self.allocator.free(entry.key_ptr.*);
+            entry.value_ptr.deinit(self.allocator);
+        }
+        self.partition_reassignments.clearRetainingCapacity();
+    }
+
+    fn reassignmentKey(allocator: Allocator, topic_name: []const u8, partition_index: i32) ![]u8 {
+        return try std.fmt.allocPrint(allocator, "{s}-{d}", .{ topic_name, partition_index });
+    }
+
+    fn reassignmentKeyBuf(buf: []u8, topic_name: []const u8, partition_index: i32) []const u8 {
+        return std.fmt.bufPrint(buf, "{s}-{d}", .{ topic_name, partition_index }) catch topic_name;
+    }
+
+    fn validReplicaAssignment(replicas: []const i32) bool {
+        for (replicas, 0..) |replica, i| {
+            if (replica < 0) return false;
+            for (replicas[0..i]) |previous| {
+                if (previous == replica) return false;
+            }
+        }
+        return true;
+    }
+
+    fn isLocalReplicaAssignment(replicas: []const i32, node_id: i32) bool {
+        return replicas.len == 1 and replicas[0] == node_id;
+    }
+
+    fn filterAddingReplicas(allocator: Allocator, replicas: []const i32, node_id: i32) ![]i32 {
+        var list = std.array_list.Managed(i32).init(allocator);
+        defer list.deinit();
+        for (replicas) |replica| {
+            if (replica != node_id) try list.append(replica);
+        }
+        if (list.items.len == 0) return &.{};
+        return try list.toOwnedSlice();
+    }
+
+    fn filterRemovingReplicas(allocator: Allocator, replicas: []const i32, node_id: i32) ![]i32 {
+        if (containsReplica(replicas, node_id)) return &.{};
+        const removing = try allocator.alloc(i32, 1);
+        removing[0] = node_id;
+        return removing;
+    }
+
+    fn containsReplica(replicas: []const i32, node_id: i32) bool {
+        for (replicas) |replica| {
+            if (replica == node_id) return true;
+        }
+        return false;
+    }
+
+    fn containsTopicName(topics: []const []const u8, topic_name: []const u8) bool {
+        for (topics) |topic| {
+            if (std.mem.eql(u8, topic, topic_name)) return true;
+        }
+        return false;
     }
 
     fn validateAlterPartitionReassignmentsRequestFrame(buf: []const u8, start_pos: usize) bool {
@@ -13233,9 +13476,10 @@ test "Broker.handleRequest AlterPartitionReassignments returns request-scoped si
     try testing.expectEqualStrings("reassign-topic", resp.responses[0].name.?);
     try testing.expectEqual(@as(usize, 4), resp.responses[0].partitions.len);
     try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.none)), resp.responses[0].partitions[0].error_code);
-    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.invalid_replica_assignment)), resp.responses[0].partitions[1].error_code);
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.none)), resp.responses[0].partitions[1].error_code);
     try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.unknown_topic_or_partition)), resp.responses[0].partitions[2].error_code);
     try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.no_reassignment_in_progress)), resp.responses[0].partitions[3].error_code);
+    try testing.expectEqual(@as(u32, 1), broker.partition_reassignments.count());
 }
 
 test "Broker.handleRequest ListPartitionReassignments decodes request and returns no ongoing reassignments" {
@@ -13283,6 +13527,110 @@ test "Broker.handleRequest ListPartitionReassignments decodes request and return
 
     try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.none)), resp.error_code);
     try testing.expectEqual(@as(usize, 0), resp.topics.len);
+}
+
+test "Broker.handleRequest partition reassignment alter list and cancel round-trip" {
+    const AlterReq = generated.alter_partition_reassignments_request.AlterPartitionReassignmentsRequest;
+    const AlterResp = generated.alter_partition_reassignments_response.AlterPartitionReassignmentsResponse;
+    const ListReq = generated.list_partition_reassignments_request.ListPartitionReassignmentsRequest;
+    const ListResp = generated.list_partition_reassignments_response.ListPartitionReassignmentsResponse;
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+    try testing.expect(broker.ensureTopic("reassign-roundtrip"));
+
+    const remote_replicas = [_]i32{2};
+    const alter_partitions = [_]AlterReq.ReassignableTopic.ReassignablePartition{.{
+        .partition_index = 0,
+        .replicas = &remote_replicas,
+    }};
+    const alter_topics = [_]AlterReq.ReassignableTopic{.{
+        .name = "reassign-roundtrip",
+        .partitions = &alter_partitions,
+    }};
+    const alter_req = AlterReq{
+        .timeout_ms = 1000,
+        .topics = &alter_topics,
+    };
+
+    var buf: [1024]u8 = undefined;
+    var pos = buildTestRequest(&buf, 45, 0, 4510, header_mod.requestHeaderVersion(45, 0));
+    alter_req.serialize(&buf, &pos, 0);
+
+    const alter_response = broker.handleRequest(buf[0..pos]);
+    try testing.expect(alter_response != null);
+    defer testing.allocator.free(alter_response.?);
+
+    var rpos: usize = 0;
+    var response_header = try ResponseHeader.deserialize(testing.allocator, alter_response.?, &rpos, header_mod.responseHeaderVersion(45, 0));
+    defer response_header.deinit(testing.allocator);
+    const alter_resp = try AlterResp.deserialize(testing.allocator, alter_response.?, &rpos, 0);
+    defer {
+        for (alter_resp.responses) |topic| {
+            if (topic.partitions.len > 0) testing.allocator.free(topic.partitions);
+        }
+        if (alter_resp.responses.len > 0) testing.allocator.free(alter_resp.responses);
+    }
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.none)), alter_resp.responses[0].partitions[0].error_code);
+
+    const list_partitions = [_]i32{0};
+    const list_topics = [_]ListReq.ListPartitionReassignmentsTopics{.{
+        .name = "reassign-roundtrip",
+        .partition_indexes = &list_partitions,
+    }};
+    const list_req = ListReq{
+        .timeout_ms = 1000,
+        .topics = &list_topics,
+    };
+
+    pos = buildTestRequest(&buf, 46, 0, 4610, header_mod.requestHeaderVersion(46, 0));
+    list_req.serialize(&buf, &pos, 0);
+    const list_response = broker.handleRequest(buf[0..pos]);
+    try testing.expect(list_response != null);
+    defer testing.allocator.free(list_response.?);
+
+    rpos = 0;
+    var list_header = try ResponseHeader.deserialize(testing.allocator, list_response.?, &rpos, header_mod.responseHeaderVersion(46, 0));
+    defer list_header.deinit(testing.allocator);
+    const list_resp = try ListResp.deserialize(testing.allocator, list_response.?, &rpos, 0);
+    defer {
+        for (list_resp.topics) |topic| {
+            for (topic.partitions) |partition| {
+                if (partition.replicas.len > 0) testing.allocator.free(partition.replicas);
+                if (partition.adding_replicas.len > 0) testing.allocator.free(partition.adding_replicas);
+                if (partition.removing_replicas.len > 0) testing.allocator.free(partition.removing_replicas);
+            }
+            if (topic.partitions.len > 0) testing.allocator.free(topic.partitions);
+        }
+        if (list_resp.topics.len > 0) testing.allocator.free(list_resp.topics);
+    }
+    try testing.expectEqual(@as(usize, 1), list_resp.topics.len);
+    try testing.expectEqualStrings("reassign-roundtrip", list_resp.topics[0].name.?);
+    try testing.expectEqual(@as(usize, 1), list_resp.topics[0].partitions.len);
+    try testing.expectEqual(@as(i32, 0), list_resp.topics[0].partitions[0].partition_index);
+    try testing.expectEqualSlices(i32, &remote_replicas, list_resp.topics[0].partitions[0].replicas);
+    try testing.expectEqualSlices(i32, &remote_replicas, list_resp.topics[0].partitions[0].adding_replicas);
+    try testing.expectEqualSlices(i32, &[_]i32{1}, list_resp.topics[0].partitions[0].removing_replicas);
+
+    const cancel_partitions = [_]AlterReq.ReassignableTopic.ReassignablePartition{.{
+        .partition_index = 0,
+        .replicas = &.{},
+    }};
+    const cancel_topics = [_]AlterReq.ReassignableTopic{.{
+        .name = "reassign-roundtrip",
+        .partitions = &cancel_partitions,
+    }};
+    const cancel_req = AlterReq{
+        .timeout_ms = 1000,
+        .topics = &cancel_topics,
+    };
+
+    pos = buildTestRequest(&buf, 45, 0, 4511, header_mod.requestHeaderVersion(45, 0));
+    cancel_req.serialize(&buf, &pos, 0);
+    const cancel_response = broker.handleRequest(buf[0..pos]);
+    try testing.expect(cancel_response != null);
+    defer testing.allocator.free(cancel_response.?);
+    try testing.expectEqual(@as(u32, 0), broker.partition_reassignments.count());
 }
 
 test "Broker.handleRequest partition reassignment APIs reject truncated requests" {
