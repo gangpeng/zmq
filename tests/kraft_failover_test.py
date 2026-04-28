@@ -2052,6 +2052,7 @@ def run_automq_metadata_failover_scenario(tmp):
         wait_for_automq_manifest_streams(replacement_broker_port, 1)
         wait_for_automq_partition_snapshot(replacement_broker_port, 2, 0)
 
+        shutil.rmtree(os.path.join(tmp, f"automq-combined-{leader_id}"), ignore_errors=True)
         processes[leader_id] = start_combined_node(
             tmp,
             leader_id,
@@ -2114,6 +2115,7 @@ def run_automq_metadata_failover_scenario(tmp):
             "stream_set_object_id": stream_set_object_id,
             "registered_node_id": registered_node_id,
             "zone_router_epoch": zone_router_epoch_after,
+            "old_leader_fresh_rejoin": True,
             "epoch": after["leader_epoch"],
         }
     finally:
@@ -2256,7 +2258,8 @@ def main():
             f"automq_deleted_stream_id={automq_result['deleted_stream_id']}, "
             f"automq_stream_set_object_id={automq_result['stream_set_object_id']}, "
             f"automq_node_id={automq_result['registered_node_id']}, "
-            f"automq_zone_router_epoch={automq_result['zone_router_epoch']})"
+            f"automq_zone_router_epoch={automq_result['zone_router_epoch']}, "
+            f"automq_old_leader_fresh_rejoin={automq_result['old_leader_fresh_rejoin']})"
         )
         return 0
     finally:
