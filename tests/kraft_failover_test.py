@@ -2173,6 +2173,7 @@ def main():
             raise TestError(f"broker did not continue after failover: {second_offset} <= {first_offset}")
         wait_for_payloads(broker["port"], topic, expected_payloads)
 
+        shutil.rmtree(os.path.join(tmp, f"controller-{leader_id}"), ignore_errors=True)
         processes[leader_id] = start_controller(tmp, leader_id, ports[leader_id], voters)
         wait_for_ready(
             processes[leader_id]["proc"],
@@ -2251,7 +2252,8 @@ def main():
             "ok: KRaft controller failover harness passed "
             f"(old_leader={leader_id}, new_leader={replacement_leader}, "
             f"restarted_controller={restart_controller_id}, "
-            f"old_leader_rejoined=true, epoch={after['leader_epoch']}, "
+            f"old_leader_rejoined=true, old_leader_fresh_rejoin=true, "
+            f"epoch={after['leader_epoch']}, "
             f"automq_old_leader={automq_result['old_leader']}, "
             f"automq_new_leader={automq_result['new_leader']}, "
             f"automq_stream_id={automq_result['stream_id']}, "
