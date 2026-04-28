@@ -1736,6 +1736,7 @@ pub const Broker = struct {
             77 => self.handleShareGroupDescribe(request_bytes, pos, &req_header, api_version, resp_header_version),
             78 => self.handleShareFetch(request_bytes, pos, &req_header, api_version, resp_header_version),
             79 => self.handleShareAcknowledge(request_bytes, pos, &req_header, api_version, resp_header_version),
+            83 => self.handleInitializeShareGroupState(request_bytes, pos, &req_header, api_version, resp_header_version),
             501 => self.handleCreateStreams(request_bytes, pos, &req_header, api_version, resp_header_version),
             502 => self.handleOpenStreams(request_bytes, pos, &req_header, api_version, resp_header_version),
             503 => self.handleCloseStreams(request_bytes, pos, &req_header, api_version, resp_header_version),
@@ -5080,6 +5081,108 @@ pub const Broker = struct {
             if (topic.partitions.len > 0) self.allocator.free(topic.partitions);
         }
         if (req.topics.len > 0) self.allocator.free(req.topics);
+    }
+
+    // ---------------------------------------------------------------
+    // InitializeShareGroupState (key 83) — non-advertised until share state exists
+    // ---------------------------------------------------------------
+    fn handleInitializeShareGroupState(self: *Broker, request_bytes: []const u8, body_start: usize, req_header: *const RequestHeader, api_version: i16, resp_header_version: i16) ?[]u8 {
+        const Req = generated.initialize_share_group_state_request.InitializeShareGroupStateRequest;
+        const Resp = generated.initialize_share_group_state_response.InitializeShareGroupStateResponse;
+
+        if (!validateInitializeShareGroupStateRequestFrame(request_bytes, body_start)) {
+            log.warn("Malformed InitializeShareGroupState request", .{});
+            const partitions = [_]Resp.InitializeStateResult.PartitionResult{.{
+                .partition = -1,
+                .error_code = ErrorCode.invalid_request.toInt(),
+                .error_message = "malformed InitializeShareGroupState request",
+            }};
+            const results = [_]Resp.InitializeStateResult{.{
+                .topic_id = [_]u8{0} ** 16,
+                .partitions = &partitions,
+            }};
+            const resp = Resp{ .results = &results };
+            return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+        }
+
+        var pos = body_start;
+        var req = Req.deserialize(self.allocator, request_bytes, &pos, api_version) catch |err| {
+            log.warn("Failed to decode InitializeShareGroupState request: {}", .{err});
+            const partitions = [_]Resp.InitializeStateResult.PartitionResult{.{
+                .partition = -1,
+                .error_code = ErrorCode.invalid_request.toInt(),
+                .error_message = "malformed InitializeShareGroupState request",
+            }};
+            const results = [_]Resp.InitializeStateResult{.{
+                .topic_id = [_]u8{0} ** 16,
+                .partitions = &partitions,
+            }};
+            const resp = Resp{ .results = &results };
+            return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+        };
+        defer self.freeInitializeShareGroupStateRequest(&req);
+
+        const results = self.buildInitializeShareGroupStateFailClosedResults(req) catch return null;
+        defer self.freeInitializeShareGroupStateResults(results);
+
+        const resp = Resp{ .results = results };
+        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+    }
+
+    fn buildInitializeShareGroupStateFailClosedResults(
+        self: *Broker,
+        req: generated.initialize_share_group_state_request.InitializeShareGroupStateRequest,
+    ) ![]generated.initialize_share_group_state_response.InitializeShareGroupStateResponse.InitializeStateResult {
+        const Result = generated.initialize_share_group_state_response.InitializeShareGroupStateResponse.InitializeStateResult;
+        const PartitionResult = Result.PartitionResult;
+
+        if (req.topics.len == 0) return &.{};
+
+        const results = try self.allocator.alloc(Result, req.topics.len);
+        var results_init: usize = 0;
+        errdefer {
+            self.freeInitializeShareGroupStateResultPartitions(results[0..results_init]);
+            self.allocator.free(results);
+        }
+
+        for (req.topics) |topic| {
+            const partitions = try self.allocator.alloc(PartitionResult, topic.partitions.len);
+            errdefer self.allocator.free(partitions);
+
+            for (topic.partitions, 0..) |partition, idx| {
+                partitions[idx] = .{
+                    .partition = partition.partition,
+                    .error_code = ErrorCode.unsupported_version.toInt(),
+                    .error_message = "InitializeShareGroupState is not implemented",
+                };
+            }
+
+            results[results_init] = .{
+                .topic_id = topic.topic_id,
+                .partitions = partitions,
+            };
+            results_init += 1;
+        }
+
+        return results;
+    }
+
+    fn freeInitializeShareGroupStateRequest(self: *Broker, req: *generated.initialize_share_group_state_request.InitializeShareGroupStateRequest) void {
+        for (req.topics) |topic| {
+            if (topic.partitions.len > 0) self.allocator.free(topic.partitions);
+        }
+        if (req.topics.len > 0) self.allocator.free(req.topics);
+    }
+
+    fn freeInitializeShareGroupStateResults(self: *Broker, results: []const generated.initialize_share_group_state_response.InitializeShareGroupStateResponse.InitializeStateResult) void {
+        self.freeInitializeShareGroupStateResultPartitions(results);
+        if (results.len > 0) self.allocator.free(results);
+    }
+
+    fn freeInitializeShareGroupStateResultPartitions(self: *Broker, results: []const generated.initialize_share_group_state_response.InitializeShareGroupStateResponse.InitializeStateResult) void {
+        for (results) |result| {
+            if (result.partitions.len > 0) self.allocator.free(result.partitions);
+        }
     }
 
     // ---------------------------------------------------------------
@@ -11755,6 +11858,27 @@ pub const Broker = struct {
                     if (!skipFixedBytes(buf, &pos, ack_type_count)) return false; // acknowledge_types
                     ser.skipTaggedFields(buf, &pos) catch return false;
                 }
+                ser.skipTaggedFields(buf, &pos) catch return false;
+            }
+            ser.skipTaggedFields(buf, &pos) catch return false;
+        }
+
+        ser.skipTaggedFields(buf, &pos) catch return false;
+        return pos == buf.len;
+    }
+
+    fn validateInitializeShareGroupStateRequestFrame(buf: []const u8, start_pos: usize) bool {
+        var pos = start_pos;
+
+        if (!skipKafkaString(buf, &pos, true)) return false; // group_id
+
+        const topic_count = readKafkaArrayCount(buf, &pos, true) orelse return false;
+        for (0..topic_count) |_| {
+            if (!skipFixedBytes(buf, &pos, 16)) return false; // topic_id
+
+            const partition_count = readKafkaArrayCount(buf, &pos, true) orelse return false;
+            for (0..partition_count) |_| {
+                if (!skipFixedBytes(buf, &pos, 16)) return false; // partition + state_epoch + start_offset
                 ser.skipTaggedFields(buf, &pos) catch return false;
             }
             ser.skipTaggedFields(buf, &pos) catch return false;
@@ -21728,6 +21852,94 @@ test "Broker.handleRequest ShareAcknowledge rejects malformed request" {
     try testing.expectEqual(response.?.len, rpos);
     try testing.expectEqual(ErrorCode.invalid_request.toInt(), resp.error_code);
     try testing.expectEqualStrings("malformed ShareAcknowledge request", resp.error_message.?);
+}
+
+test "Broker.handleRequest InitializeShareGroupState returns generated fail-closed response" {
+    const Req = generated.initialize_share_group_state_request.InitializeShareGroupStateRequest;
+    const Resp = generated.initialize_share_group_state_response.InitializeShareGroupStateResponse;
+    const InitializeStateData = Req.InitializeStateData;
+    const PartitionData = InitializeStateData.PartitionData;
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+
+    const topic_id = [_]u8{3} ** 16;
+    const partitions = [_]PartitionData{.{
+        .partition = 0,
+        .state_epoch = 1,
+        .start_offset = 10,
+    }};
+    const topics = [_]InitializeStateData{.{
+        .topic_id = topic_id,
+        .partitions = &partitions,
+    }};
+    const req = Req{
+        .group_id = "share-group",
+        .topics = &topics,
+    };
+
+    var buf: [256]u8 = undefined;
+    var pos = buildTestRequest(&buf, 83, 0, 8300, header_mod.requestHeaderVersion(83, 0));
+    req.serialize(&buf, &pos, 0);
+
+    const response = broker.handleRequest(buf[0..pos]);
+    try testing.expect(response != null);
+    defer testing.allocator.free(response.?);
+
+    var rpos: usize = 0;
+    var response_header = try ResponseHeader.deserialize(testing.allocator, response.?, &rpos, header_mod.responseHeaderVersion(83, 0));
+    defer response_header.deinit(testing.allocator);
+    try testing.expectEqual(@as(i32, 8300), response_header.correlation_id);
+
+    const resp = try Resp.deserialize(testing.allocator, response.?, &rpos, 0);
+    defer {
+        for (resp.results) |result| {
+            if (result.partitions.len > 0) testing.allocator.free(result.partitions);
+        }
+        if (resp.results.len > 0) testing.allocator.free(resp.results);
+    }
+
+    try testing.expectEqual(response.?.len, rpos);
+    try testing.expectEqual(@as(usize, 1), resp.results.len);
+    try testing.expectEqualSlices(u8, topic_id[0..], resp.results[0].topic_id[0..]);
+    try testing.expectEqual(@as(usize, 1), resp.results[0].partitions.len);
+    try testing.expectEqual(@as(i32, 0), resp.results[0].partitions[0].partition);
+    try testing.expectEqual(ErrorCode.unsupported_version.toInt(), resp.results[0].partitions[0].error_code);
+    try testing.expectEqualStrings("InitializeShareGroupState is not implemented", resp.results[0].partitions[0].error_message.?);
+}
+
+test "Broker.handleRequest InitializeShareGroupState rejects malformed request" {
+    const Resp = generated.initialize_share_group_state_response.InitializeShareGroupStateResponse;
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+
+    var buf: [128]u8 = undefined;
+    var pos = buildTestRequest(&buf, 83, 0, 8301, header_mod.requestHeaderVersion(83, 0));
+    ser.writeCompactString(&buf, &pos, "share-group"); // missing topics and tagged fields
+
+    const response = broker.handleRequest(buf[0..pos]);
+    try testing.expect(response != null);
+    defer testing.allocator.free(response.?);
+
+    var rpos: usize = 0;
+    var response_header = try ResponseHeader.deserialize(testing.allocator, response.?, &rpos, header_mod.responseHeaderVersion(83, 0));
+    defer response_header.deinit(testing.allocator);
+    try testing.expectEqual(@as(i32, 8301), response_header.correlation_id);
+
+    const resp = try Resp.deserialize(testing.allocator, response.?, &rpos, 0);
+    defer {
+        for (resp.results) |result| {
+            if (result.partitions.len > 0) testing.allocator.free(result.partitions);
+        }
+        if (resp.results.len > 0) testing.allocator.free(resp.results);
+    }
+
+    try testing.expectEqual(response.?.len, rpos);
+    try testing.expectEqual(@as(usize, 1), resp.results.len);
+    try testing.expectEqual(@as(usize, 1), resp.results[0].partitions.len);
+    try testing.expectEqual(@as(i32, -1), resp.results[0].partitions[0].partition);
+    try testing.expectEqual(ErrorCode.invalid_request.toInt(), resp.results[0].partitions[0].error_code);
 }
 
 test "Broker.handleRequest ConsumerGroupDescribe v0 returns generated group state" {
