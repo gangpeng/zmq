@@ -983,6 +983,20 @@ pub const GroupCoordinator = struct {
         return self.committed_offsets.get(key);
     }
 
+    pub fn hasCommittedOffsetsForGroup(self: *const GroupCoordinator, group_id: []const u8) bool {
+        var it = self.committed_offsets.keyIterator();
+        while (it.next()) |key_ptr| {
+            const key = key_ptr.*;
+            if (key.len > group_id.len and
+                key[group_id.len] == ':' and
+                std.mem.startsWith(u8, key, group_id))
+            {
+                return true;
+            }
+        }
+        return false;
+    }
+
     pub const CommittedOffset = struct {
         topic: []const u8,
         partition: i32,

@@ -3874,7 +3874,10 @@ pub const Broker = struct {
 
             for (req.groups, 0..) |group_req, group_idx| {
                 const group_id = group_req.group_id orelse "";
-                const topics = if (group_fetch_all_flags[group_idx])
+                const group_error = self.offsetFetchGroupError(group_id);
+                const topics = if (group_error != ErrorCode.none)
+                    &.{}
+                else if (group_fetch_all_flags[group_idx])
                     self.buildOffsetFetchGroupAllTopics(group_id) orelse return null
                 else
                     self.buildOffsetFetchGroupRequestedTopics(group_id, group_req.topics) orelse return null;
@@ -3882,7 +3885,7 @@ pub const Broker = struct {
                 groups[groups_init] = .{
                     .group_id = group_req.group_id,
                     .topics = topics,
-                    .error_code = @intFromEnum(ErrorCode.none),
+                    .error_code = @intFromEnum(group_error),
                 };
                 groups_init += 1;
             }
@@ -3895,18 +3898,27 @@ pub const Broker = struct {
         }
 
         const group_id = req.group_id orelse "";
-        const topics = if (legacy_fetch_all)
+        const group_error = self.offsetFetchGroupError(group_id);
+        const topics = if (group_error != ErrorCode.none and api_version >= 2)
+            &.{}
+        else if (legacy_fetch_all)
             self.buildOffsetFetchLegacyAllTopics(group_id) orelse return null
         else
-            self.buildOffsetFetchLegacyRequestedTopics(group_id, req.topics) orelse return null;
+            self.buildOffsetFetchLegacyRequestedTopics(group_id, req.topics, if (api_version < 2) group_error else ErrorCode.none) orelse return null;
         defer self.freeOffsetFetchLegacyTopics(topics);
 
         const resp = Resp{
             .throttle_time_ms = 0,
             .topics = topics,
-            .error_code = @intFromEnum(ErrorCode.none),
+            .error_code = @intFromEnum(if (api_version >= 2) group_error else ErrorCode.none),
         };
         return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+    }
+
+    fn offsetFetchGroupError(self: *Broker, group_id: []const u8) ErrorCode {
+        if (self.groups.groups.contains(group_id)) return ErrorCode.none;
+        if (self.groups.hasCommittedOffsetsForGroup(group_id)) return ErrorCode.none;
+        return ErrorCode.group_id_not_found;
     }
 
     fn freeOffsetFetchRequest(self: *Broker, req: *const generated.offset_fetch_request.OffsetFetchRequest) void {
@@ -3928,6 +3940,7 @@ pub const Broker = struct {
         self: *Broker,
         group_id: []const u8,
         requested_topics: []const generated.offset_fetch_request.OffsetFetchRequest.OffsetFetchRequestTopic,
+        partition_error: ErrorCode,
     ) ?[]const generated.offset_fetch_response.OffsetFetchResponse.OffsetFetchResponseTopic {
         const TopicResponse = generated.offset_fetch_response.OffsetFetchResponse.OffsetFetchResponseTopic;
         const PartitionResponse = TopicResponse.OffsetFetchResponsePartition;
@@ -3955,13 +3968,16 @@ pub const Broker = struct {
 
                 const topic_name = topic_req.name orelse "";
                 for (topic_req.partition_indexes, 0..) |partition_id, partition_idx| {
-                    const committed = self.groups.fetchOffsetRecord(group_id, topic_name, partition_id) catch null;
+                    const committed = if (partition_error == ErrorCode.none)
+                        self.groups.fetchOffsetRecord(group_id, topic_name, partition_id) catch null
+                    else
+                        null;
                     writable[partition_idx] = .{
                         .partition_index = partition_id,
                         .committed_offset = if (committed) |record| record.offset else -1,
                         .committed_leader_epoch = if (committed) |record| record.leader_epoch else -1,
                         .metadata = if (committed) |record| record.metadata else null,
-                        .error_code = @intFromEnum(ErrorCode.none),
+                        .error_code = @intFromEnum(partition_error),
                     };
                 }
                 partitions = writable;
@@ -17356,6 +17372,87 @@ test "Broker.handleRequest OffsetFetch v7 returns generated response" {
     try testing.expectEqual(@as(i64, -1), resp.topics[0].partitions[1].committed_offset);
 }
 
+test "Broker.handleRequest OffsetFetch v1 reports missing group per partition" {
+    const Req = generated.offset_fetch_request.OffsetFetchRequest;
+    const Resp = generated.offset_fetch_response.OffsetFetchResponse;
+    const Topic = Req.OffsetFetchRequestTopic;
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+
+    const partitions = [_]i32{0};
+    const topics = [_]Topic{.{
+        .name = "missing-offset-topic",
+        .partition_indexes = &partitions,
+    }};
+    const req = Req{
+        .group_id = "missing-offset-group",
+        .topics = &topics,
+    };
+
+    var buf: [512]u8 = undefined;
+    var pos = buildTestRequest(&buf, 9, 1, 901, header_mod.requestHeaderVersion(9, 1));
+    req.serialize(&buf, &pos, 1);
+
+    const response = broker.handleRequest(buf[0..pos]);
+    try testing.expect(response != null);
+    defer testing.allocator.free(response.?);
+
+    var rpos: usize = 0;
+    var response_header = try ResponseHeader.deserialize(testing.allocator, response.?, &rpos, header_mod.responseHeaderVersion(9, 1));
+    defer response_header.deinit(testing.allocator);
+    try testing.expectEqual(@as(i32, 901), response_header.correlation_id);
+
+    const resp = try Resp.deserialize(testing.allocator, response.?, &rpos, 1);
+    defer broker.freeOffsetFetchLegacyTopics(resp.topics);
+    try testing.expectEqual(response.?.len, rpos);
+    try testing.expectEqual(@as(usize, 1), resp.topics.len);
+    try testing.expectEqualStrings("missing-offset-topic", resp.topics[0].name.?);
+    try testing.expectEqual(@as(usize, 1), resp.topics[0].partitions.len);
+    try testing.expectEqual(@as(i64, -1), resp.topics[0].partitions[0].committed_offset);
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.group_id_not_found)), resp.topics[0].partitions[0].error_code);
+}
+
+test "Broker.handleRequest OffsetFetch v7 reports missing group at top level" {
+    const Req = generated.offset_fetch_request.OffsetFetchRequest;
+    const Resp = generated.offset_fetch_response.OffsetFetchResponse;
+    const Topic = Req.OffsetFetchRequestTopic;
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+
+    const partitions = [_]i32{0};
+    const topics = [_]Topic{.{
+        .name = "missing-offset-topic",
+        .partition_indexes = &partitions,
+    }};
+    const req = Req{
+        .group_id = "missing-offset-group",
+        .topics = &topics,
+        .require_stable = false,
+    };
+
+    var buf: [512]u8 = undefined;
+    var pos = buildTestRequest(&buf, 9, 7, 917, header_mod.requestHeaderVersion(9, 7));
+    req.serialize(&buf, &pos, 7);
+
+    const response = broker.handleRequest(buf[0..pos]);
+    try testing.expect(response != null);
+    defer testing.allocator.free(response.?);
+
+    var rpos: usize = 0;
+    var response_header = try ResponseHeader.deserialize(testing.allocator, response.?, &rpos, header_mod.responseHeaderVersion(9, 7));
+    defer response_header.deinit(testing.allocator);
+    try testing.expectEqual(@as(i32, 917), response_header.correlation_id);
+
+    const resp = try Resp.deserialize(testing.allocator, response.?, &rpos, 7);
+    defer broker.freeOffsetFetchLegacyTopics(resp.topics);
+    try testing.expectEqual(response.?.len, rpos);
+    try testing.expectEqual(@as(i32, 0), resp.throttle_time_ms);
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.group_id_not_found)), resp.error_code);
+    try testing.expectEqual(@as(usize, 0), resp.topics.len);
+}
+
 test "Broker.handleRequest OffsetFetch v8 returns grouped generated response" {
     const Req = generated.offset_fetch_request.OffsetFetchRequest;
     const Resp = generated.offset_fetch_response.OffsetFetchResponse;
@@ -17410,6 +17507,65 @@ test "Broker.handleRequest OffsetFetch v8 returns grouped generated response" {
     try testing.expectEqual(@as(i64, 321), resp.groups[0].topics[0].partitions[0].committed_offset);
     try testing.expectEqual(@as(i32, 9), resp.groups[0].topics[0].partitions[0].committed_leader_epoch);
     try testing.expectEqualStrings("grouped-meta", resp.groups[0].topics[0].partitions[0].metadata.?);
+}
+
+test "Broker.handleRequest OffsetFetch v8 reports missing group at group level" {
+    const Req = generated.offset_fetch_request.OffsetFetchRequest;
+    const Resp = generated.offset_fetch_response.OffsetFetchResponse;
+    const Group = Req.OffsetFetchRequestGroup;
+    const Topic = Group.OffsetFetchRequestTopics;
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+
+    try broker.groups.commitOffset("of-v8-present", "of-v8-topic", 0, 55);
+
+    const partitions = [_]i32{0};
+    const topics = [_]Topic{.{
+        .name = "of-v8-topic",
+        .partition_indexes = &partitions,
+    }};
+    const groups = [_]Group{
+        .{
+            .group_id = "of-v8-present",
+            .topics = &topics,
+        },
+        .{
+            .group_id = "of-v8-missing",
+            .topics = &topics,
+        },
+    };
+    const req = Req{
+        .groups = &groups,
+        .require_stable = false,
+    };
+
+    var buf: [512]u8 = undefined;
+    var pos = buildTestRequest(&buf, 9, 8, 928, header_mod.requestHeaderVersion(9, 8));
+    req.serialize(&buf, &pos, 8);
+
+    const response = broker.handleRequest(buf[0..pos]);
+    try testing.expect(response != null);
+    defer testing.allocator.free(response.?);
+
+    var rpos: usize = 0;
+    var response_header = try ResponseHeader.deserialize(testing.allocator, response.?, &rpos, header_mod.responseHeaderVersion(9, 8));
+    defer response_header.deinit(testing.allocator);
+    try testing.expectEqual(@as(i32, 928), response_header.correlation_id);
+
+    const resp = try Resp.deserialize(testing.allocator, response.?, &rpos, 8);
+    defer {
+        broker.freeOffsetFetchGroups(resp.groups);
+        if (resp.groups.len > 0) testing.allocator.free(resp.groups);
+    }
+    try testing.expectEqual(response.?.len, rpos);
+    try testing.expectEqual(@as(usize, 2), resp.groups.len);
+    try testing.expectEqualStrings("of-v8-present", resp.groups[0].group_id.?);
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.none)), resp.groups[0].error_code);
+    try testing.expectEqual(@as(i64, 55), resp.groups[0].topics[0].partitions[0].committed_offset);
+    try testing.expectEqualStrings("of-v8-missing", resp.groups[1].group_id.?);
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.group_id_not_found)), resp.groups[1].error_code);
+    try testing.expectEqual(@as(usize, 0), resp.groups[1].topics.len);
 }
 
 test "Broker.handleRequest OffsetFetch v8 null topics fetches all committed offsets" {
