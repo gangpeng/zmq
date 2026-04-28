@@ -26,7 +26,9 @@ pub const UpdateFeaturesRequest = struct {
         pub fn serialize(self: *const FeatureUpdateKey, buf: []u8, pos: *usize, version: i16) void {
             ser.writeCompactString(buf, pos, self.feature);
             ser.writeI16(buf, pos, self.max_version_level);
-            ser.writeBool(buf, pos, self.allow_downgrade);
+            if (version <= 0) {
+                ser.writeBool(buf, pos, self.allow_downgrade);
+            }
             if (version >= 1) {
                 ser.writeI8(buf, pos, self.upgrade_type);
             }
@@ -37,7 +39,9 @@ pub const UpdateFeaturesRequest = struct {
             var result = FeatureUpdateKey{};
             result.feature = try ser.readCompactString(buf, pos);
             result.max_version_level = ser.readI16(buf, pos);
-            result.allow_downgrade = try ser.readBool(buf, pos);
+            if (version <= 0) {
+                result.allow_downgrade = try ser.readBool(buf, pos);
+            }
             if (version >= 1) {
                 result.upgrade_type = ser.readI8(buf, pos);
             }
@@ -49,7 +53,9 @@ pub const UpdateFeaturesRequest = struct {
             var size: usize = 0;
             size += ser.compactStringSize(self.feature);
             size += 2;
-            size += 1;
+            if (version <= 0) {
+                size += 1;
+            }
             if (version >= 1) {
                 size += 1;
             }

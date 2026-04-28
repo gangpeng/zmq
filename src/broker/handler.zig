@@ -1722,6 +1722,7 @@ pub const Broker = struct {
             53 => self.handleBeginQuorumEpoch(request_bytes, pos, &req_header, api_version, resp_header_version),
             54 => self.handleEndQuorumEpoch(request_bytes, pos, &req_header, api_version, resp_header_version),
             55 => self.handleDescribeQuorum(request_bytes, pos, &req_header, api_version, resp_header_version),
+            57 => self.handleUpdateFeatures(request_bytes, pos, &req_header, api_version, resp_header_version),
             65 => self.handleDescribeTransactions(request_bytes, pos, &req_header, api_version, resp_header_version),
             66 => self.handleListTransactions(request_bytes, pos, &req_header, api_version, resp_header_version),
             74 => self.handleListClientMetricsResources(request_bytes, pos, &req_header, api_version, resp_header_version),
@@ -1820,7 +1821,7 @@ pub const Broker = struct {
         const has_throttle = switch (api_key) {
             // Most APIs v1+ have throttle_time_ms; for simplicity track the common ones
             8, 10, 11, 12, 13, 14, 22, 25, 26 => api_version >= 1,
-            66 => true,
+            57, 66 => true,
             18 => false, // ApiVersions: error_code is right after header
             else => false,
         };
@@ -1867,7 +1868,7 @@ pub const Broker = struct {
             0, 1, 2 => .topic, // Produce, Fetch, ListOffsets
             8, 9, 10, 11, 12, 13, 14, 15, 16, 42, 47 => .group, // group-related
             22, 24, 26, 27, 28, 65, 66 => .transactional_id, // txn-related
-            3, 18, 19, 20, 32, 33, 35, 37, 43, 44, 45, 46, 48, 49, 50, 51, 74, 75 => .cluster, // metadata/admin
+            3, 18, 19, 20, 32, 33, 35, 37, 43, 44, 45, 46, 48, 49, 50, 51, 57, 74, 75 => .cluster, // metadata/admin
             501...519, 600...602 => .cluster, // AutoMQ stream/object/controller extensions
             else => .unknown,
         };
@@ -1887,7 +1888,7 @@ pub const Broker = struct {
             22, 24, 26, 27, 28 => .write, // Txn ops
             30 => .alter, // CreateAcls
             31 => .alter, // DeleteAcls
-            33, 43, 44, 45, 49, 51 => .alter, // Alter/admin APIs
+            33, 43, 44, 45, 49, 51, 57 => .alter, // Alter/admin APIs
             501, 502, 503, 508, 514, 516, 518, 601 => .describe, // AutoMQ reads/lifecycle probes
             504, 511 => .delete, // AutoMQ deletes
             505, 506, 507, 510, 512, 513, 515, 517, 519, 600, 602 => .alter, // AutoMQ mutations
@@ -7881,6 +7882,73 @@ pub const Broker = struct {
     }
 
     // ---------------------------------------------------------------
+    // UpdateFeatures (key 57)
+    // ---------------------------------------------------------------
+    fn handleUpdateFeatures(self: *Broker, request_bytes: []const u8, body_start: usize, req_header: *const RequestHeader, api_version: i16, resp_header_version: i16) ?[]u8 {
+        const Req = generated.update_features_request.UpdateFeaturesRequest;
+        const Resp = generated.update_features_response.UpdateFeaturesResponse;
+        const Result = Resp.UpdatableFeatureResult;
+
+        if (!validateUpdateFeaturesRequestFrame(request_bytes, body_start, api_version)) {
+            log.warn("Malformed UpdateFeatures request", .{});
+            return null;
+        }
+
+        var pos = body_start;
+        var req = Req.deserialize(self.allocator, request_bytes, &pos, api_version) catch |err| {
+            log.warn("Failed to decode UpdateFeatures request: {}", .{err});
+            return null;
+        };
+        defer self.freeUpdateFeaturesRequest(&req);
+
+        var results: []Result = &.{};
+        if (req.feature_updates.len > 0) {
+            results = self.allocator.alloc(Result, req.feature_updates.len) catch return null;
+        }
+        defer if (results.len > 0) self.allocator.free(results);
+
+        for (req.feature_updates, 0..) |feature_update, i| {
+            results[i] = self.updateFeaturesResult(feature_update, api_version);
+        }
+
+        const resp = Resp{
+            .throttle_time_ms = 0,
+            .error_code = @intFromEnum(ErrorCode.none),
+            .error_message = null,
+            .results = results,
+        };
+        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+    }
+
+    fn freeUpdateFeaturesRequest(self: *Broker, req: *generated.update_features_request.UpdateFeaturesRequest) void {
+        if (req.feature_updates.len > 0) self.allocator.free(req.feature_updates);
+    }
+
+    fn updateFeaturesResult(_: *Broker, feature_update: generated.update_features_request.UpdateFeaturesRequest.FeatureUpdateKey, api_version: i16) generated.update_features_response.UpdateFeaturesResponse.UpdatableFeatureResult {
+        const feature = feature_update.feature orelse "";
+        if (feature.len == 0) {
+            return .{
+                .feature = feature_update.feature,
+                .error_code = @intFromEnum(ErrorCode.invalid_request),
+                .error_message = "Invalid feature name",
+            };
+        }
+        if (api_version >= 1 and (feature_update.upgrade_type < 1 or feature_update.upgrade_type > 3)) {
+            return .{
+                .feature = feature_update.feature,
+                .error_code = @intFromEnum(ErrorCode.invalid_request),
+                .error_message = "Invalid feature upgrade type",
+            };
+        }
+
+        return .{
+            .feature = feature_update.feature,
+            .error_code = @intFromEnum(ErrorCode.feature_update_failed),
+            .error_message = "Feature finalization is not supported by this broker",
+        };
+    }
+
+    // ---------------------------------------------------------------
     // ListClientMetricsResources (key 74)
     // ---------------------------------------------------------------
     fn handleListClientMetricsResources(self: *Broker, request_bytes: []const u8, body_start: usize, req_header: *const RequestHeader, api_version: i16, resp_header_version: i16) ?[]u8 {
@@ -10642,6 +10710,29 @@ pub const Broker = struct {
         return true;
     }
 
+    fn validateUpdateFeaturesRequestFrame(buf: []const u8, start_pos: usize, api_version: i16) bool {
+        var pos = start_pos;
+
+        if (!skipFixedBytes(buf, &pos, 4)) return false; // timeout_ms
+        const updates = readKafkaArrayHeader(buf, &pos, true) orelse return false;
+        if (updates.is_null) return false;
+        for (0..updates.count) |_| {
+            const feature = ser.readCompactString(buf, &pos) catch return false;
+            if (feature == null) return false;
+            if (!skipFixedBytes(buf, &pos, 2)) return false; // max_version_level
+            if (api_version == 0) {
+                if (!skipFixedBytes(buf, &pos, 1)) return false; // allow_downgrade
+            } else {
+                if (!skipFixedBytes(buf, &pos, 1)) return false; // upgrade_type
+            }
+            ser.skipTaggedFields(buf, &pos) catch return false;
+        }
+
+        if (api_version >= 1 and !skipFixedBytes(buf, &pos, 1)) return false; // validate_only
+        ser.skipTaggedFields(buf, &pos) catch return false;
+        return true;
+    }
+
     fn validateListClientMetricsResourcesRequestFrame(buf: []const u8, start_pos: usize) bool {
         var pos = start_pos;
         ser.skipTaggedFields(buf, &pos) catch return false;
@@ -12166,6 +12257,10 @@ fn freeDeserializedDescribeUserScramCredentialsResponse(resp: *const generated.d
 }
 
 fn freeDeserializedAlterUserScramCredentialsResponse(resp: *const generated.alter_user_scram_credentials_response.AlterUserScramCredentialsResponse) void {
+    if (resp.results.len > 0) testing.allocator.free(resp.results);
+}
+
+fn freeDeserializedUpdateFeaturesResponse(resp: *const generated.update_features_response.UpdateFeaturesResponse) void {
     if (resp.results.len > 0) testing.allocator.free(resp.results);
 }
 
@@ -15971,6 +16066,124 @@ test "Broker.handleRequest AlterUserScramCredentials rejects truncated request" 
 
     var buf: [128]u8 = undefined;
     const req_len = buildTestRequest(&buf, 51, 0, 5103, header_mod.requestHeaderVersion(51, 0));
+    try testing.expect(broker.handleRequest(buf[0..req_len]) == null);
+}
+
+test "Broker.handleRequest UpdateFeatures v0 rejects unsupported feature mutation" {
+    const Req = generated.update_features_request.UpdateFeaturesRequest;
+    const Resp = generated.update_features_response.UpdateFeaturesResponse;
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+
+    const updates = [_]Req.FeatureUpdateKey{.{
+        .feature = "metadata.version",
+        .max_version_level = 1,
+        .allow_downgrade = false,
+    }};
+    const req = Req{ .feature_updates = &updates };
+
+    var buf: [512]u8 = undefined;
+    var pos = buildTestRequest(&buf, 57, 0, 5700, header_mod.requestHeaderVersion(57, 0));
+    req.serialize(&buf, &pos, 0);
+
+    const response = broker.handleRequest(buf[0..pos]);
+    try testing.expect(response != null);
+    defer testing.allocator.free(response.?);
+
+    var rpos: usize = 0;
+    var response_header = try ResponseHeader.deserialize(testing.allocator, response.?, &rpos, header_mod.responseHeaderVersion(57, 0));
+    defer response_header.deinit(testing.allocator);
+    try testing.expectEqual(@as(i32, 5700), response_header.correlation_id);
+
+    const resp = try Resp.deserialize(testing.allocator, response.?, &rpos, 0);
+    defer freeDeserializedUpdateFeaturesResponse(&resp);
+
+    try testing.expectEqual(response.?.len, rpos);
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.none)), resp.error_code);
+    try testing.expectEqual(@as(usize, 1), resp.results.len);
+    try testing.expectEqualStrings("metadata.version", resp.results[0].feature.?);
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.feature_update_failed)), resp.results[0].error_code);
+    try testing.expect(resp.results[0].error_message != null);
+}
+
+test "Broker.handleRequest UpdateFeatures v1 accepts frame without v0 allow_downgrade byte" {
+    const Resp = generated.update_features_response.UpdateFeaturesResponse;
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+
+    var buf: [512]u8 = undefined;
+    var pos = buildTestRequest(&buf, 57, 1, 5701, header_mod.requestHeaderVersion(57, 1));
+    ser.writeI32(&buf, &pos, 60000); // timeout_ms
+    ser.writeCompactArrayLen(&buf, &pos, 1);
+    ser.writeCompactString(&buf, &pos, "metadata.version");
+    ser.writeI16(&buf, &pos, 1); // max_version_level
+    ser.writeI8(&buf, &pos, 1); // upgrade_type
+    ser.writeEmptyTaggedFields(&buf, &pos);
+    ser.writeBool(&buf, &pos, false); // validate_only
+    ser.writeEmptyTaggedFields(&buf, &pos);
+
+    const response = broker.handleRequest(buf[0..pos]);
+    try testing.expect(response != null);
+    defer testing.allocator.free(response.?);
+
+    var rpos: usize = 0;
+    var response_header = try ResponseHeader.deserialize(testing.allocator, response.?, &rpos, header_mod.responseHeaderVersion(57, 1));
+    defer response_header.deinit(testing.allocator);
+    try testing.expectEqual(@as(i32, 5701), response_header.correlation_id);
+
+    const resp = try Resp.deserialize(testing.allocator, response.?, &rpos, 1);
+    defer freeDeserializedUpdateFeaturesResponse(&resp);
+
+    try testing.expectEqual(response.?.len, rpos);
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.none)), resp.error_code);
+    try testing.expectEqual(@as(usize, 1), resp.results.len);
+    try testing.expectEqualStrings("metadata.version", resp.results[0].feature.?);
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.feature_update_failed)), resp.results[0].error_code);
+}
+
+test "Broker.handleRequest UpdateFeatures v1 rejects invalid upgrade type" {
+    const Req = generated.update_features_request.UpdateFeaturesRequest;
+    const Resp = generated.update_features_response.UpdateFeaturesResponse;
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+
+    const updates = [_]Req.FeatureUpdateKey{.{
+        .feature = "metadata.version",
+        .max_version_level = 1,
+        .upgrade_type = 9,
+    }};
+    const req = Req{ .feature_updates = &updates };
+
+    var buf: [512]u8 = undefined;
+    var pos = buildTestRequest(&buf, 57, 1, 5702, header_mod.requestHeaderVersion(57, 1));
+    req.serialize(&buf, &pos, 1);
+
+    const response = broker.handleRequest(buf[0..pos]);
+    try testing.expect(response != null);
+    defer testing.allocator.free(response.?);
+
+    var rpos: usize = 0;
+    var response_header = try ResponseHeader.deserialize(testing.allocator, response.?, &rpos, header_mod.responseHeaderVersion(57, 1));
+    defer response_header.deinit(testing.allocator);
+    try testing.expectEqual(@as(i32, 5702), response_header.correlation_id);
+
+    const resp = try Resp.deserialize(testing.allocator, response.?, &rpos, 1);
+    defer freeDeserializedUpdateFeaturesResponse(&resp);
+
+    try testing.expectEqual(response.?.len, rpos);
+    try testing.expectEqual(@as(usize, 1), resp.results.len);
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.invalid_request)), resp.results[0].error_code);
+}
+
+test "Broker.handleRequest UpdateFeatures rejects truncated request" {
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+
+    var buf: [128]u8 = undefined;
+    const req_len = buildTestRequest(&buf, 57, 1, 5703, header_mod.requestHeaderVersion(57, 1));
     try testing.expect(broker.handleRequest(buf[0..req_len]) == null);
 }
 
