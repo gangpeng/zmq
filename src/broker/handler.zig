@@ -7304,6 +7304,10 @@ pub const Broker = struct {
         defer self.freeOffsetDeleteRequest(&req);
 
         const group_id = req.group_id orelse "";
+        const group_error: ErrorCode = if (self.groups.groups.contains(group_id) or self.groups.hasCommittedOffsetsForGroup(group_id))
+            ErrorCode.none
+        else
+            ErrorCode.group_id_not_found;
         var topics = self.allocator.alloc(TopicResult, req.topics.len) catch return null;
         defer {
             self.freeOffsetDeleteResponseTopics(topics);
@@ -7313,7 +7317,9 @@ pub const Broker = struct {
         var mutated = false;
         for (req.topics, 0..) |topic, topic_index| {
             const topic_name = topic.name orelse "";
-            const topic_error: ErrorCode = if (self.groups.groupHasSubscription(group_id, topic_name))
+            const topic_error: ErrorCode = if (group_error != ErrorCode.none)
+                group_error
+            else if (self.groups.groupHasSubscription(group_id, topic_name))
                 ErrorCode.group_subscribed_to_topic
             else
                 ErrorCode.none;
@@ -7347,7 +7353,7 @@ pub const Broker = struct {
         if (mutated) self.persistOffsets();
 
         const resp = Resp{
-            .error_code = @intFromEnum(ErrorCode.none),
+            .error_code = @intFromEnum(group_error),
             .throttle_time_ms = 0,
             .topics = topics,
         };
@@ -13279,6 +13285,51 @@ test "Broker.handleRequest OffsetDelete rejects subscribed group topic" {
     try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.none)), resp.error_code);
     try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.group_subscribed_to_topic)), resp.topics[0].partitions[0].error_code);
     try testing.expectEqual(@as(?i64, 42), try broker.groups.fetchOffset("delete-active-group", "delete-active-topic", 0));
+}
+
+test "Broker.handleRequest OffsetDelete reports missing group" {
+    const Req = generated.offset_delete_request.OffsetDeleteRequest;
+    const Resp = generated.offset_delete_response.OffsetDeleteResponse;
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+
+    const partitions = [_]Req.OffsetDeleteRequestTopic.OffsetDeleteRequestPartition{.{
+        .partition_index = 0,
+    }};
+    const topics = [_]Req.OffsetDeleteRequestTopic{.{
+        .name = "delete-missing-topic",
+        .partitions = &partitions,
+    }};
+    const req = Req{
+        .group_id = "delete-missing-group",
+        .topics = &topics,
+    };
+
+    var buf: [512]u8 = undefined;
+    var pos = buildTestRequest(&buf, 47, 0, 4704, header_mod.requestHeaderVersion(47, 0));
+    req.serialize(&buf, &pos, 0);
+
+    const response = broker.handleRequest(buf[0..pos]);
+    try testing.expect(response != null);
+    defer testing.allocator.free(response.?);
+
+    var rpos: usize = 0;
+    var response_header = try ResponseHeader.deserialize(testing.allocator, response.?, &rpos, header_mod.responseHeaderVersion(47, 0));
+    defer response_header.deinit(testing.allocator);
+    try testing.expectEqual(@as(i32, 4704), response_header.correlation_id);
+
+    const resp = try Resp.deserialize(testing.allocator, response.?, &rpos, 0);
+    defer {
+        for (resp.topics) |topic| {
+            if (topic.partitions.len > 0) testing.allocator.free(topic.partitions);
+        }
+        if (resp.topics.len > 0) testing.allocator.free(resp.topics);
+    }
+
+    try testing.expectEqual(response.?.len, rpos);
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.group_id_not_found)), resp.error_code);
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.group_id_not_found)), resp.topics[0].partitions[0].error_code);
 }
 
 test "Broker.handleRequest OffsetDelete persists deleted offsets" {
