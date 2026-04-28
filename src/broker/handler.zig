@@ -722,10 +722,10 @@ pub const Broker = struct {
         }
         if (consumer_groups_dirty) self.persistConsumerGroups();
 
-        // Expire timed-out transactions (auto-abort after timeout_ms).
-        // NOTE: AutoMQ/Kafka runs this check periodically to prevent resource leaks
-        // from abandoned producers that never call EndTxn.
-        const txn_expired = self.txn_coordinator.expireTransactions();
+        // Expire timed-out transactions (auto-abort after timeout_ms). The
+        // broker writes ABORT control batches before completing coordinator
+        // state so READ_COMMITTED visibility advances consistently.
+        const txn_expired = self.expireTransactionsWithControlMarkers();
         if (txn_expired > 0) {
             log.info("Auto-aborted {d} timed-out transaction(s)", .{txn_expired});
         }
@@ -817,6 +817,53 @@ pub const Broker = struct {
         // has elapsed. This discards the oldest buffer and moves current → previous,
         // matching AutoMQ's ScheduledExecutorService-based rotation.
         self.object_manager.prepared_registry.maybeRotate();
+    }
+
+    const ExpiredTransaction = struct {
+        producer_id: i64,
+        producer_epoch: i16,
+    };
+
+    fn expireTransactionsWithControlMarkers(self: *Broker) u32 {
+        const now = @import("time_compat").milliTimestamp();
+        var expired: [64]ExpiredTransaction = undefined;
+        var expired_count: usize = 0;
+
+        var it = self.txn_coordinator.transactions.iterator();
+        while (it.next()) |entry| {
+            const txn = entry.value_ptr;
+            if (txn.status == .ongoing and now - txn.start_time_ms > txn.timeout_ms and expired_count < expired.len) {
+                expired[expired_count] = .{
+                    .producer_id = txn.producer_id,
+                    .producer_epoch = txn.producer_epoch,
+                };
+                expired_count += 1;
+            }
+        }
+
+        var aborted: u32 = 0;
+        for (expired[0..expired_count]) |txn| {
+            const partitions = self.txn_coordinator.getPartitions(txn.producer_id) orelse continue;
+            const marker_error = self.writeTxnControlBatches(
+                txn.producer_id,
+                txn.producer_epoch,
+                .abort,
+                partitions,
+            );
+            if (marker_error != @intFromEnum(ErrorCode.none)) {
+                log.warn("Timed-out transaction {d} auto-abort marker write failed: error_code={d}", .{ txn.producer_id, marker_error });
+                continue;
+            }
+
+            const complete_error = self.txn_coordinator.endTxnComplete(txn.producer_id, txn.producer_epoch, false);
+            if (complete_error != @intFromEnum(ErrorCode.none)) {
+                log.warn("Timed-out transaction {d} coordinator completion failed: error_code={d}", .{ txn.producer_id, complete_error });
+                continue;
+            }
+            aborted += 1;
+        }
+
+        return aborted;
     }
 
     /// Enforce retention policies for all topics.
@@ -5283,6 +5330,76 @@ pub const Broker = struct {
     // ---------------------------------------------------------------
     // EndTxn (key 26) — Write control batches to partition store
     // ---------------------------------------------------------------
+    fn writeTxnControlBatches(
+        self: *Broker,
+        producer_id: i64,
+        producer_epoch: i16,
+        control_type: TxnCoordinator.ControlRecordType,
+        partitions: []const TxnCoordinator.TransactionState.TopicPartition,
+    ) i16 {
+        var partition_state_dirty = false;
+        var marker_error: i16 = @intFromEnum(ErrorCode.none);
+
+        for (partitions) |tp| {
+            if (!self.topicPartitionExists(tp.topic, tp.partition)) {
+                marker_error = @intFromEnum(ErrorCode.unknown_topic_or_partition);
+                break;
+            }
+        }
+
+        if (marker_error == @intFromEnum(ErrorCode.none)) {
+            for (partitions) |tp| {
+                const base_off: i64 = if (self.partitionState(tp.topic, tp.partition)) |state|
+                    @intCast(state.next_offset)
+                else
+                    0;
+
+                const control_batch = self.txn_coordinator.buildControlBatch(
+                    producer_id,
+                    producer_epoch,
+                    control_type,
+                    base_off,
+                ) catch |err| {
+                    log.warn("Failed to build transaction control batch for {s}-{d}: {}", .{ tp.topic, tp.partition, err });
+                    marker_error = @intFromEnum(ErrorCode.kafka_storage_error);
+                    break;
+                };
+                defer self.allocator.free(control_batch);
+
+                _ = self.store.produce(tp.topic, tp.partition, control_batch) catch |err| {
+                    log.warn("Failed to write transaction control batch for {s}-{d}: {}", .{ tp.topic, tp.partition, err });
+                    marker_error = @intFromEnum(ErrorCode.kafka_storage_error);
+                    break;
+                };
+                partition_state_dirty = true;
+            }
+        }
+
+        // Clear first_unstable_txn_offset on each partition so LSO advances.
+        // NOTE: AutoMQ/Kafka advances LSO after control batch markers are written.
+        // Without this, READ_COMMITTED consumers would never see committed data.
+        if (marker_error == @intFromEnum(ErrorCode.none)) {
+            for (partitions) |tp| {
+                var key_buf: [512]u8 = undefined;
+                const pkey = std.fmt.bufPrint(&key_buf, "{s}-{d}", .{ tp.topic, tp.partition }) catch {
+                    marker_error = @intFromEnum(ErrorCode.kafka_storage_error);
+                    break;
+                };
+                if (self.store.partitions.getPtr(pkey)) |state| {
+                    state.first_unstable_txn_offset = null;
+                    state.last_stable_offset = state.high_watermark;
+                    partition_state_dirty = true;
+                }
+            }
+        }
+
+        if (partition_state_dirty) {
+            self.persistPartitionStates();
+            self.persistObjectManagerSnapshot();
+        }
+        return marker_error;
+    }
+
     fn handleEndTxn(self: *Broker, request_bytes: []const u8, body_start: usize, req_header: *const RequestHeader, api_version: i16, resp_header_version: i16) ?[]u8 {
         const Req = generated.end_txn_request.EndTxnRequest;
         const Resp = generated.end_txn_response.EndTxnResponse;
@@ -5300,68 +5417,9 @@ pub const Broker = struct {
 
         // Before completing the txn, get the partition list so we can write control batches
         const control_type: @import("txn_coordinator.zig").TransactionCoordinator.ControlRecordType = if (req.committed) .commit else .abort;
-        var partition_state_dirty = false;
         var marker_error: i16 = @intFromEnum(ErrorCode.none);
         if (self.txn_coordinator.getPartitions(req.producer_id)) |partitions| {
-            for (partitions) |tp| {
-                if (!self.topicPartitionExists(tp.topic, tp.partition)) {
-                    marker_error = @intFromEnum(ErrorCode.unknown_topic_or_partition);
-                    break;
-                }
-            }
-
-            // Write control batch to each partition in the transaction
-            if (marker_error == @intFromEnum(ErrorCode.none)) {
-                for (partitions) |tp| {
-                    const base_off: i64 = if (self.partitionState(tp.topic, tp.partition)) |state|
-                        @intCast(state.next_offset)
-                    else
-                        0;
-
-                    const control_batch = self.txn_coordinator.buildControlBatch(
-                        req.producer_id,
-                        req.producer_epoch,
-                        control_type,
-                        base_off,
-                    ) catch |err| {
-                        log.warn("Failed to build EndTxn control batch for {s}-{d}: {}", .{ tp.topic, tp.partition, err });
-                        marker_error = @intFromEnum(ErrorCode.kafka_storage_error);
-                        break;
-                    };
-                    defer self.allocator.free(control_batch);
-
-                    // Write the control batch to the partition store
-                    _ = self.store.produce(tp.topic, tp.partition, control_batch) catch |err| {
-                        log.warn("Failed to write control batch for {s}-{d}: {}", .{ tp.topic, tp.partition, err });
-                        marker_error = @intFromEnum(ErrorCode.kafka_storage_error);
-                        break;
-                    };
-                    partition_state_dirty = true;
-                }
-            }
-
-            // Clear first_unstable_txn_offset on each partition so LSO advances.
-            // NOTE: AutoMQ/Kafka advances LSO after control batch markers are written.
-            // Without this, READ_COMMITTED consumers would never see committed data.
-            if (marker_error == @intFromEnum(ErrorCode.none)) {
-                for (partitions) |tp| {
-                    var key_buf: [512]u8 = undefined;
-                    const pkey = std.fmt.bufPrint(&key_buf, "{s}-{d}", .{ tp.topic, tp.partition }) catch {
-                        marker_error = @intFromEnum(ErrorCode.kafka_storage_error);
-                        break;
-                    };
-                    if (self.store.partitions.getPtr(pkey)) |state| {
-                        state.first_unstable_txn_offset = null;
-                        // Recompute LSO = HW (no unstable transactions on this partition now)
-                        state.last_stable_offset = state.high_watermark;
-                        partition_state_dirty = true;
-                    }
-                }
-            }
-        }
-        if (partition_state_dirty) {
-            self.persistPartitionStates();
-            self.persistObjectManagerSnapshot();
+            marker_error = self.writeTxnControlBatches(req.producer_id, req.producer_epoch, control_type, partitions);
         }
         if (marker_error != @intFromEnum(ErrorCode.none)) {
             const resp = Resp{
@@ -16831,6 +16889,45 @@ test "Broker tick runs without crash in memory mode" {
     broker.tick();
     broker.tick();
     broker.tick();
+}
+
+test "Broker tick writes abort marker for timed-out transaction" {
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+    try testing.expect(broker.ensureTopic("txn-timeout-topic"));
+
+    const init_result = try broker.txn_coordinator.initProducerId("txn-timeout-marker");
+    _ = try broker.txn_coordinator.addPartitionsToTxn(
+        init_result.producer_id,
+        init_result.producer_epoch,
+        "txn-timeout-topic",
+        0,
+    );
+
+    const before = broker.partitionState("txn-timeout-topic", 0).?;
+    if (broker.txn_coordinator.transactions.getPtr(init_result.producer_id)) |txn| {
+        txn.timeout_ms = 1;
+        txn.start_time_ms = @import("time_compat").milliTimestamp() - 10_000;
+    }
+
+    broker.tick();
+
+    try testing.expectEqual(TxnCoordinator.TxnStatus.complete_abort, broker.txn_coordinator.getStatus(init_result.producer_id).?);
+    try testing.expectEqual(@as(usize, 0), broker.txn_coordinator.getPartitions(init_result.producer_id).?.len);
+
+    const after = broker.partitionState("txn-timeout-topic", 0).?;
+    try testing.expectEqual(before.next_offset + 1, after.next_offset);
+    try testing.expectEqual(after.high_watermark, after.last_stable_offset);
+    try testing.expect(after.first_unstable_txn_offset == null);
+
+    const fetch_result = try broker.store.fetch("txn-timeout-topic", 0, before.next_offset, 1024);
+    defer if (fetch_result.records.len > 0) testing.allocator.free(@constCast(fetch_result.records));
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.none)), fetch_result.error_code);
+    try testing.expect(fetch_result.records.len >= protocol.record_batch.BATCH_HEADER_SIZE);
+
+    const header = try protocol.record_batch.RecordBatchHeader.parse(fetch_result.records);
+    try testing.expect(header.isTransactional());
+    try testing.expect(header.isControlBatch());
 }
 
 test "Broker fenced by controller rejects produce" {
