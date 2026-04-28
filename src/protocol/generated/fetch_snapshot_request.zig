@@ -12,10 +12,10 @@ pub const FetchSnapshotRequest = struct {
     pub const TopicSnapshot = struct {
         pub const PartitionSnapshot = struct {
             pub const SnapshotId = struct {
-                /// 
+                ///
                 /// Versions: 0+
                 end_offset: i64 = 0,
-                /// 
+                ///
                 /// Versions: 0+
                 epoch: i32 = 0,
 
@@ -132,7 +132,7 @@ pub const FetchSnapshotRequest = struct {
     replica_id: i32 = -1,
     /// The maximum bytes to fetch from all of the snapshots
     /// Versions: 0+
-    max_bytes: i32 = "0x7fffffff",
+    max_bytes: i32 = 0x7fffffff,
     /// The topics to fetch
     /// Versions: 0+
     topics: []const TopicSnapshot = &.{},

@@ -210,7 +210,7 @@ pub const ShareFetchRequest = struct {
     min_bytes: i32 = 0,
     /// The maximum bytes to fetch.  See KIP-74 for cases where this limit may not be honored.
     /// Versions: 0+
-    max_bytes: i32 = "0x7fffffff",
+    max_bytes: i32 = 0x7fffffff,
     /// The topics to fetch.
     /// Versions: 0+
     topics: []const FetchTopic = &.{},

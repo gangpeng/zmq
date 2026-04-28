@@ -108,6 +108,7 @@ pub const Controller = struct {
             53 => self.handleBeginQuorumEpoch(request_bytes, pos, &req_header, api_version, resp_header_version),
             54 => self.handleEndQuorumEpoch(request_bytes, pos, &req_header, api_version, resp_header_version),
             55 => self.handleDescribeQuorum(request_bytes, pos, &req_header, api_version, resp_header_version),
+            59 => self.handleFetchSnapshot(request_bytes, pos, &req_header, api_version, resp_header_version),
             62 => self.handleBrokerRegistration(request_bytes, pos, &req_header, api_version, resp_header_version),
             63 => self.handleBrokerHeartbeat(request_bytes, pos, &req_header, api_version, resp_header_version),
             67 => self.handleAllocateProducerIds(request_bytes, pos, &req_header, api_version, resp_header_version),
@@ -492,6 +493,95 @@ pub const Controller = struct {
             if (topic.partitions.len > 0) self.allocator.free(topic.partitions);
         }
         if (req.topics.len > 0) self.allocator.free(req.topics);
+    }
+
+    // ---------------------------------------------------------------
+    // FetchSnapshot (key 59) — KRaft snapshot transfer
+    // ---------------------------------------------------------------
+    fn handleFetchSnapshot(self: *Controller, request_bytes: []const u8, start_pos: usize, req_header: *const RequestHeader, api_version: i16, resp_header_version: i16) ?[]u8 {
+        const Req = generated.fetch_snapshot_request.FetchSnapshotRequest;
+        const Resp = generated.fetch_snapshot_response.FetchSnapshotResponse;
+
+        if (!validateFetchSnapshotRequestFrame(request_bytes, start_pos)) {
+            log.warn("Malformed FetchSnapshot request", .{});
+            const resp = Resp{ .error_code = ErrorCode.invalid_request.toInt(), .topics = &.{} };
+            return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+        }
+
+        var pos = start_pos;
+        var req = Req.deserialize(self.allocator, request_bytes, &pos, api_version) catch |err| {
+            log.warn("Failed to decode FetchSnapshot request: {}", .{err});
+            const resp = Resp{ .error_code = ErrorCode.invalid_request.toInt(), .topics = &.{} };
+            return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+        };
+        defer self.freeFetchSnapshotRequest(&req);
+
+        const topics = self.buildFetchSnapshotTopics(&req) catch return null;
+        defer {
+            self.freeFetchSnapshotTopics(topics);
+            if (topics.len > 0) self.allocator.free(topics);
+        }
+
+        const resp = Resp{
+            .throttle_time_ms = 0,
+            .error_code = ErrorCode.none.toInt(),
+            .topics = topics,
+        };
+        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+    }
+
+    fn buildFetchSnapshotTopics(self: *Controller, req: *const generated.fetch_snapshot_request.FetchSnapshotRequest) ![]generated.fetch_snapshot_response.FetchSnapshotResponse.TopicSnapshot {
+        const TopicResp = generated.fetch_snapshot_response.FetchSnapshotResponse.TopicSnapshot;
+        const PartitionResp = TopicResp.PartitionSnapshot;
+
+        if (req.topics.len == 0) return &.{};
+        const topics = try self.allocator.alloc(TopicResp, req.topics.len);
+        var topics_init: usize = 0;
+        errdefer {
+            self.freeFetchSnapshotTopics(topics[0..topics_init]);
+            self.allocator.free(topics);
+        }
+
+        for (req.topics, 0..) |topic_req, topic_index| {
+            var partitions: []PartitionResp = &.{};
+            if (topic_req.partitions.len > 0) {
+                partitions = try self.allocator.alloc(PartitionResp, topic_req.partitions.len);
+                for (topic_req.partitions, 0..) |partition_req, partition_index| {
+                    partitions[partition_index] = .{
+                        .index = partition_req.partition,
+                        .error_code = ErrorCode.snapshot_not_found.toInt(),
+                        .snapshot_id = .{
+                            .end_offset = partition_req.snapshot_id.end_offset,
+                            .epoch = partition_req.snapshot_id.epoch,
+                        },
+                        .size = 0,
+                        .position = partition_req.position,
+                        .unaligned_records = null,
+                    };
+                }
+            }
+
+            topics[topic_index] = .{
+                .name = topic_req.name,
+                .partitions = partitions,
+            };
+            topics_init += 1;
+        }
+
+        return topics;
+    }
+
+    fn freeFetchSnapshotRequest(self: *Controller, req: *generated.fetch_snapshot_request.FetchSnapshotRequest) void {
+        for (req.topics) |topic| {
+            if (topic.partitions.len > 0) self.allocator.free(topic.partitions);
+        }
+        if (req.topics.len > 0) self.allocator.free(req.topics);
+    }
+
+    fn freeFetchSnapshotTopics(self: *Controller, topics: []const generated.fetch_snapshot_response.FetchSnapshotResponse.TopicSnapshot) void {
+        for (topics) |topic| {
+            if (topic.partitions.len > 0) self.allocator.free(topic.partitions);
+        }
     }
 
     const controller_metadata_record_magic = "ZMQCTRL2";
@@ -1040,6 +1130,27 @@ fn validateEndQuorumEpochRequestFrame(buf: []const u8, start_pos: usize, api_ver
     return pos == buf.len;
 }
 
+fn validateFetchSnapshotRequestFrame(buf: []const u8, start_pos: usize) bool {
+    var pos = start_pos;
+
+    if (!skipFixedBytes(buf, &pos, 8)) return false; // replica_id + max_bytes
+    const topic_count = readKafkaArrayCount(buf, &pos, true) orelse return false;
+    for (0..topic_count) |_| {
+        if (!skipKafkaString(buf, &pos, true)) return false; // topic name
+        const partition_count = readKafkaArrayCount(buf, &pos, true) orelse return false;
+        for (0..partition_count) |_| {
+            if (!skipFixedBytes(buf, &pos, 8)) return false; // partition + current_leader_epoch
+            if (!skipFixedBytes(buf, &pos, 12)) return false; // snapshot_id
+            ser.skipTaggedFields(buf, &pos) catch return false;
+            if (!skipFixedBytes(buf, &pos, 8)) return false; // position
+            ser.skipTaggedFields(buf, &pos) catch return false;
+        }
+        ser.skipTaggedFields(buf, &pos) catch return false;
+    }
+    ser.skipTaggedFields(buf, &pos) catch return false;
+    return pos == buf.len;
+}
+
 fn skipVoteTopics(buf: []const u8, pos: *usize, api_version: i16) bool {
     const topic_count = readKafkaArrayCount(buf, pos, true) orelse return false;
     for (0..topic_count) |_| {
@@ -1286,6 +1397,13 @@ fn freeDeserializedVoteResponse(resp: *const generated.vote_response.VoteRespons
     if (resp.topics.len > 0) testing.allocator.free(resp.topics);
 }
 
+fn freeDeserializedFetchSnapshotResponse(resp: *const generated.fetch_snapshot_response.FetchSnapshotResponse) void {
+    for (resp.topics) |topic| {
+        if (topic.partitions.len > 0) testing.allocator.free(topic.partitions);
+    }
+    if (resp.topics.len > 0) testing.allocator.free(resp.topics);
+}
+
 test "Controller init and deinit" {
     var ctrl = Controller.init(testing.allocator, 1, "test-cluster");
     defer ctrl.deinit();
@@ -1328,9 +1446,9 @@ test "Controller handleRequest ApiVersions returns supported APIs" {
     const error_code = ser.readI16(response.?, &rpos);
     try testing.expectEqual(@as(i16, 0), error_code);
 
-    // Array of supported APIs — controller supports 10 APIs
+    // Array of supported APIs — controller supports 11 APIs
     const array_len = try ser.readArrayLen(response.?, &rpos);
-    try testing.expectEqual(@as(usize, 10), array_len.?);
+    try testing.expectEqual(@as(usize, 11), array_len.?);
 }
 
 test "Controller handleRequest unsupported API returns error" {
@@ -1608,6 +1726,77 @@ test "Controller handleRequest DescribeQuorum returns quorum info" {
     }
     try testing.expectEqual(@as(i16, 0), resp.error_code);
     try testing.expectEqual(@as(i32, 1), resp.topics[0].partitions[0].leader_id);
+}
+
+test "Controller handleRequest FetchSnapshot returns snapshot not found" {
+    const Req = generated.fetch_snapshot_request.FetchSnapshotRequest;
+    const Resp = generated.fetch_snapshot_response.FetchSnapshotResponse;
+
+    var ctrl = Controller.init(testing.allocator, 1, "test-cluster");
+    defer ctrl.deinit();
+
+    const snapshot_id = Req.TopicSnapshot.PartitionSnapshot.SnapshotId{ .end_offset = 3, .epoch = 1 };
+    const partitions = [_]Req.TopicSnapshot.PartitionSnapshot{.{
+        .partition = 0,
+        .current_leader_epoch = -1,
+        .snapshot_id = snapshot_id,
+        .position = 0,
+    }};
+    const topics = [_]Req.TopicSnapshot{.{ .name = "__cluster_metadata", .partitions = &partitions }};
+    const req = Req{ .replica_id = 2, .max_bytes = 1024, .topics = &topics };
+
+    var buf: [512]u8 = undefined;
+    var pos = buildTestRequest(&buf, 59, 0, 5900, header_mod.requestHeaderVersion(59, 0));
+    req.serialize(&buf, &pos, 0);
+
+    const response = ctrl.handleRequest(buf[0..pos]);
+    try testing.expect(response != null);
+    defer testing.allocator.free(response.?);
+
+    var rpos: usize = 0;
+    var resp_header = try ResponseHeader.deserialize(testing.allocator, response.?, &rpos, header_mod.responseHeaderVersion(59, 0));
+    defer resp_header.deinit(testing.allocator);
+    try testing.expectEqual(@as(i32, 5900), resp_header.correlation_id);
+
+    const resp = try Resp.deserialize(testing.allocator, response.?, &rpos, 0);
+    defer freeDeserializedFetchSnapshotResponse(&resp);
+
+    try testing.expectEqual(response.?.len, rpos);
+    try testing.expectEqual(ErrorCode.none.toInt(), resp.error_code);
+    try testing.expectEqual(@as(usize, 1), resp.topics.len);
+    try testing.expectEqualStrings("__cluster_metadata", resp.topics[0].name.?);
+    try testing.expectEqual(@as(usize, 1), resp.topics[0].partitions.len);
+    try testing.expectEqual(@as(i32, 0), resp.topics[0].partitions[0].index);
+    try testing.expectEqual(ErrorCode.snapshot_not_found.toInt(), resp.topics[0].partitions[0].error_code);
+    try testing.expectEqual(@as(i64, 3), resp.topics[0].partitions[0].snapshot_id.end_offset);
+    try testing.expectEqual(@as(i32, 1), resp.topics[0].partitions[0].snapshot_id.epoch);
+}
+
+test "Controller handleRequest FetchSnapshot rejects malformed generated request" {
+    const Resp = generated.fetch_snapshot_response.FetchSnapshotResponse;
+
+    var ctrl = Controller.init(testing.allocator, 1, "test-cluster");
+    defer ctrl.deinit();
+
+    var buf: [128]u8 = undefined;
+    var pos = buildTestRequest(&buf, 59, 0, 5901, header_mod.requestHeaderVersion(59, 0));
+    ser.writeI32(&buf, &pos, 2); // replica_id
+    ser.writeI32(&buf, &pos, 1024); // max_bytes
+    ser.writeCompactArrayLen(&buf, &pos, 1); // one topic declared, body truncated
+
+    const response = ctrl.handleRequest(buf[0..pos]);
+    try testing.expect(response != null);
+    defer testing.allocator.free(response.?);
+
+    var rpos: usize = 0;
+    var resp_header = try ResponseHeader.deserialize(testing.allocator, response.?, &rpos, header_mod.responseHeaderVersion(59, 0));
+    defer resp_header.deinit(testing.allocator);
+    try testing.expectEqual(@as(i32, 5901), resp_header.correlation_id);
+
+    const resp = try Resp.deserialize(testing.allocator, response.?, &rpos, 0);
+    defer freeDeserializedFetchSnapshotResponse(&resp);
+    try testing.expectEqual(ErrorCode.invalid_request.toInt(), resp.error_code);
+    try testing.expectEqual(@as(usize, 0), resp.topics.len);
 }
 
 test "Controller handleRequest BrokerRegistration registers broker" {

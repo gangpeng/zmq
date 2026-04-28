@@ -118,6 +118,8 @@ def default_value_zig(kafka_type, default, nullable=False):
         return 'null'
     if default in ('true', 'false'):
         return default
+    if default.startswith('0x'):
+        return default
     try:
         int(default)
         return default
