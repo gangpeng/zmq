@@ -5593,6 +5593,7 @@ pub const Broker = struct {
         var results = std.array_list.Managed(DeleteGroupsResponse.DeletableGroupResult).init(self.allocator);
         defer results.deinit();
 
+        const offsets_before = self.groups.committed_offsets.count();
         for (0..num_groups) |_| {
             const group_id = if (flexible)
                 (ser.readCompactString(request_bytes, &pos) catch return null) orelse ""
@@ -5604,6 +5605,7 @@ pub const Broker = struct {
         }
 
         if (flexible) ser.skipTaggedFields(request_bytes, &pos) catch return null;
+        if (self.groups.committed_offsets.count() != offsets_before) self.persistOffsets();
 
         const resp_body = DeleteGroupsResponse{
             .throttle_time_ms = 0,
@@ -11071,6 +11073,46 @@ test "Broker.handleRequest DeleteGroups v2 deletes empty group" {
     try testing.expectEqualStrings("delete-me", group_id);
     try testing.expectEqual(@as(i16, 0), ser.readI16(response.?, &rpos));
     try testing.expectEqual(@as(usize, 0), broker.groups.groupCount());
+}
+
+test "Broker.handleRequest DeleteGroups persists removed offsets" {
+    const fs = @import("fs_compat");
+
+    const tmp_dir = "/tmp/zmq-delete-groups-offset-persist-test";
+    fs.deleteTreeAbsolute(tmp_dir) catch {};
+    try fs.makeDirAbsolute(tmp_dir);
+    defer fs.deleteTreeAbsolute(tmp_dir) catch {};
+
+    var broker = Broker.initWithConfig(testing.allocator, 1, 9092, .{ .data_dir = tmp_dir });
+    defer broker.deinit();
+    try broker.open();
+
+    const join = try broker.groups.joinGroup("delete-offsets-group", null, "consumer", null);
+    try testing.expectEqual(@as(i16, 0), broker.groups.leaveGroup("delete-offsets-group", join.member_id));
+    try broker.groups.commitOffset("delete-offsets-group", "delete-offsets-topic", 0, 42);
+    broker.persistOffsets();
+
+    var buf: [256]u8 = undefined;
+    var pos = buildTestRequest(&buf, 42, 2, 4201, 2);
+    ser.writeCompactArrayLen(&buf, &pos, 1);
+    ser.writeCompactString(&buf, &pos, "delete-offsets-group");
+    ser.writeEmptyTaggedFields(&buf, &pos);
+
+    const response = broker.handleRequest(buf[0..pos]);
+    try testing.expect(response != null);
+    defer testing.allocator.free(response.?);
+
+    var rpos: usize = 0;
+    var resp_header = try ResponseHeader.deserialize(testing.allocator, response.?, &rpos, 1);
+    defer resp_header.deinit(testing.allocator);
+    try testing.expectEqual(@as(i32, 4201), resp_header.correlation_id);
+
+    const loaded = try broker.persistence.loadOffsets();
+    defer {
+        for (loaded) |entry| testing.allocator.free(entry.key);
+        testing.allocator.free(loaded);
+    }
+    try testing.expectEqual(@as(usize, 0), loaded.len);
 }
 
 test "Broker.handleRequest OffsetForLeaderEpoch v0 returns generated legacy response" {
