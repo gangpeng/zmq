@@ -116,6 +116,7 @@ pub const Controller = struct {
             70 => self.handleControllerRegistration(request_bytes, pos, &req_header, api_version, resp_header_version),
             80 => self.handleAddRaftVoter(request_bytes, pos, &req_header, api_version, resp_header_version),
             81 => self.handleRemoveRaftVoter(request_bytes, pos, &req_header, api_version, resp_header_version),
+            82 => self.handleUpdateRaftVoter(request_bytes, pos, &req_header, api_version, resp_header_version),
             else => self.handleUnsupported(&req_header, api_key, resp_header_version),
         };
     }
@@ -1112,6 +1113,59 @@ pub const Controller = struct {
     }
 
     // ---------------------------------------------------------------
+    // UpdateRaftVoter (key 82) — non-advertised until endpoint updates apply
+    // ---------------------------------------------------------------
+    fn handleUpdateRaftVoter(self: *Controller, request_bytes: []const u8, start_pos: usize, req_header: *const RequestHeader, api_version: i16, resp_header_version: i16) ?[]u8 {
+        const Req = generated.update_raft_voter_request.UpdateRaftVoterRequest;
+        const Resp = generated.update_raft_voter_response.UpdateRaftVoterResponse;
+
+        if (!validateUpdateRaftVoterRequestFrame(request_bytes, start_pos)) {
+            log.warn("Malformed UpdateRaftVoter request", .{});
+            const resp = Resp{ .error_code = ErrorCode.invalid_request.toInt() };
+            return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+        }
+
+        var pos = start_pos;
+
+        const req = Req.deserialize(self.allocator, request_bytes, &pos, api_version) catch |err| {
+            log.warn("Failed to decode UpdateRaftVoter request: {}", .{err});
+            const resp = Resp{ .error_code = ErrorCode.invalid_request.toInt() };
+            return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+        };
+        defer if (req.listeners.len > 0) self.allocator.free(req.listeners);
+
+        if (req.cluster_id) |cluster_id| {
+            if (!std.mem.eql(u8, cluster_id, self.cluster_id)) {
+                const resp = Resp{ .throttle_time_ms = 0, .error_code = ErrorCode.inconsistent_cluster_id.toInt() };
+                return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+            }
+        }
+
+        if (req.voter_id < 0 or req.listeners.len == 0) {
+            const resp = Resp{ .throttle_time_ms = 0, .error_code = ErrorCode.invalid_request.toInt() };
+            return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+        }
+
+        if (self.raft_state.role != .leader) {
+            const resp = Resp{ .throttle_time_ms = 0, .error_code = ErrorCode.not_controller.toInt() };
+            return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+        }
+
+        if (!self.raft_state.voters.contains(req.voter_id)) {
+            const resp = Resp{ .throttle_time_ms = 0, .error_code = ErrorCode.resource_not_found.toInt() };
+            return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+        }
+
+        if (req.k_raft_version_feature.min_supported_version > req.k_raft_version_feature.max_supported_version) {
+            const resp = Resp{ .throttle_time_ms = 0, .error_code = ErrorCode.invalid_update_version.toInt() };
+            return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+        }
+
+        const resp = Resp{ .throttle_time_ms = 0, .error_code = ErrorCode.unsupported_version.toInt() };
+        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+    }
+
+    // ---------------------------------------------------------------
     // AllocateProducerIds (key 67) — PID block allocation
     // ---------------------------------------------------------------
     fn handleAllocateProducerIds(self: *Controller, request_bytes: []const u8, start_pos: usize, req_header: *const RequestHeader, api_version: i16, resp_header_version: i16) ?[]u8 {
@@ -1345,6 +1399,23 @@ fn validateRemoveRaftVoterRequestFrame(buf: []const u8, start_pos: usize) bool {
     var pos = start_pos;
     if (!skipKafkaString(buf, &pos, true)) return false; // cluster_id
     if (!skipFixedBytes(buf, &pos, 20)) return false; // voter_id + voter_directory_id
+    ser.skipTaggedFields(buf, &pos) catch return false;
+    return pos == buf.len;
+}
+
+fn validateUpdateRaftVoterRequestFrame(buf: []const u8, start_pos: usize) bool {
+    var pos = start_pos;
+    if (!skipKafkaString(buf, &pos, true)) return false; // cluster_id
+    if (!skipFixedBytes(buf, &pos, 20)) return false; // voter_id + voter_directory_id
+    const listener_count = readKafkaArrayCount(buf, &pos, true) orelse return false;
+    for (0..listener_count) |_| {
+        if (!skipKafkaString(buf, &pos, true)) return false; // listener name
+        if (!skipKafkaString(buf, &pos, true)) return false; // listener host
+        if (!skipFixedBytes(buf, &pos, 2)) return false; // listener port
+        ser.skipTaggedFields(buf, &pos) catch return false;
+    }
+    if (!skipFixedBytes(buf, &pos, 4)) return false; // KRaftVersionFeature min/max
+    ser.skipTaggedFields(buf, &pos) catch return false; // KRaftVersionFeature tags
     ser.skipTaggedFields(buf, &pos) catch return false;
     return pos == buf.len;
 }
@@ -2695,6 +2766,67 @@ test "Controller handleRequest RemoveRaftVoter rejects malformed request" {
     var resp_header = try ResponseHeader.deserialize(testing.allocator, response.?, &rpos, header_mod.responseHeaderVersion(81, 0));
     defer resp_header.deinit(testing.allocator);
     try testing.expectEqual(@as(i32, 8101), resp_header.correlation_id);
+
+    const resp = try Resp.deserialize(testing.allocator, response.?, &rpos, 0);
+    try testing.expectEqual(ErrorCode.invalid_request.toInt(), resp.error_code);
+}
+
+test "Controller handleRequest UpdateRaftVoter returns generated fail-closed response" {
+    const Req = generated.update_raft_voter_request.UpdateRaftVoterRequest;
+    const Resp = generated.update_raft_voter_response.UpdateRaftVoterResponse;
+
+    var ctrl = Controller.init(testing.allocator, 1, "test-cluster");
+    defer ctrl.deinit();
+    try makeTestControllerLeader(&ctrl);
+
+    const listeners = [_]Req.Listener{.{
+        .name = "CONTROLLER",
+        .host = "127.0.0.1",
+        .port = 9093,
+    }};
+
+    var buf: [256]u8 = undefined;
+    var pos = buildTestRequest(&buf, 82, 0, 8200, header_mod.requestHeaderVersion(82, 0));
+    const req = Req{
+        .cluster_id = "test-cluster",
+        .voter_id = 1,
+        .listeners = &listeners,
+        .k_raft_version_feature = .{ .min_supported_version = 0, .max_supported_version = 0 },
+    };
+    req.serialize(&buf, &pos, 0);
+
+    const response = ctrl.handleRequest(buf[0..pos]);
+    try testing.expect(response != null);
+    defer testing.allocator.free(response.?);
+
+    var rpos: usize = 0;
+    var resp_header = try ResponseHeader.deserialize(testing.allocator, response.?, &rpos, header_mod.responseHeaderVersion(82, 0));
+    defer resp_header.deinit(testing.allocator);
+    try testing.expectEqual(@as(i32, 8200), resp_header.correlation_id);
+
+    const resp = try Resp.deserialize(testing.allocator, response.?, &rpos, 0);
+    try testing.expectEqual(ErrorCode.unsupported_version.toInt(), resp.error_code);
+}
+
+test "Controller handleRequest UpdateRaftVoter rejects malformed request" {
+    const Resp = generated.update_raft_voter_response.UpdateRaftVoterResponse;
+
+    var ctrl = Controller.init(testing.allocator, 1, "test-cluster");
+    defer ctrl.deinit();
+
+    var buf: [128]u8 = undefined;
+    var pos = buildTestRequest(&buf, 82, 0, 8201, header_mod.requestHeaderVersion(82, 0));
+    ser.writeCompactString(&buf, &pos, "test-cluster");
+    ser.writeI32(&buf, &pos, 1); // voter_id, missing voter_directory_id and the rest
+
+    const response = ctrl.handleRequest(buf[0..pos]);
+    try testing.expect(response != null);
+    defer testing.allocator.free(response.?);
+
+    var rpos: usize = 0;
+    var resp_header = try ResponseHeader.deserialize(testing.allocator, response.?, &rpos, header_mod.responseHeaderVersion(82, 0));
+    defer resp_header.deinit(testing.allocator);
+    try testing.expectEqual(@as(i32, 8201), resp_header.correlation_id);
 
     const resp = try Resp.deserialize(testing.allocator, response.?, &rpos, 0);
     try testing.expectEqual(ErrorCode.invalid_request.toInt(), resp.error_code);

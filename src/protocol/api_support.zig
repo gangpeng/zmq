@@ -374,6 +374,7 @@ pub const controller_handler_api_keys = [_]i16{
     70,
     80,
     81,
+    82,
 };
 
 pub fn findBrokerSupport(api_key: i16) ?BrokerApiSupport {
@@ -593,6 +594,7 @@ test "controller supported APIs do not advertise versions beyond generated schem
 
     try testing.expect(findControllerSupport(71) == null);
     try testing.expect(findControllerSupport(72) == null);
+    try testing.expect(findControllerSupport(82) == null);
     try testing.expectEqualStrings("ControllerRegistration", findControllerSupport(70).?.name);
     try testing.expectEqualStrings("AddRaftVoter", findControllerSupport(80).?.name);
     try testing.expectEqualStrings("RemoveRaftVoter", findControllerSupport(81).?.name);
