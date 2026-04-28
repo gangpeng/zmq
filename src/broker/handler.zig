@@ -40,6 +40,8 @@ const ObjectManager = storage.ObjectManager;
 const CompactionManager = storage.CompactionManager;
 const JsonLogger = @import("core").JsonLogger;
 
+const max_offset_commit_metadata_bytes: usize = 4096;
+
 /// Stateful Kafka broker.
 ///
 /// Owns all broker-level state: partition storage, consumer group
@@ -3725,6 +3727,13 @@ pub const Broker = struct {
         if (req.members.len > 0) self.allocator.free(req.members);
     }
 
+    fn validateOffsetCommitMetadata(metadata: ?[]const u8) ErrorCode {
+        if (metadata) |value| {
+            if (value.len > max_offset_commit_metadata_bytes) return ErrorCode.invalid_commit_offset_size;
+        }
+        return ErrorCode.none;
+    }
+
     // ---------------------------------------------------------------
     // OffsetCommit (key 8)
     // ---------------------------------------------------------------
@@ -3778,6 +3787,9 @@ pub const Broker = struct {
                 };
 
                 const error_code: i16 = blk: {
+                    const metadata_error = validateOffsetCommitMetadata(partition_req.committed_metadata);
+                    if (metadata_error != ErrorCode.none) break :blk @intFromEnum(metadata_error);
+
                     self.groups.commitOffsetWithMetadataAndLag(group_id, topic_name, partition_id, offset, partition_req.committed_leader_epoch, partition_req.committed_metadata, leo) catch |err| {
                         log.warn("OffsetCommit failed for {s}:{s}:{d}: {}", .{ group_id, topic_name, partition_id, err });
                         break :blk @intFromEnum(ErrorCode.kafka_storage_error);
@@ -7960,6 +7972,8 @@ pub const Broker = struct {
             for (topic_req.partitions, 0..) |partition_req, partition_idx| {
                 const error_code: i16 = blk: {
                     if (txn_error != @intFromEnum(ErrorCode.none)) break :blk txn_error;
+                    const metadata_error = validateOffsetCommitMetadata(partition_req.committed_metadata);
+                    if (metadata_error != ErrorCode.none) break :blk @intFromEnum(metadata_error);
 
                     self.groups.commitOffsetWithMetadata(group_id, topic, partition_req.partition_index, partition_req.committed_offset, partition_req.committed_leader_epoch, partition_req.committed_metadata) catch |err| {
                         log.warn("TxnOffsetCommit failed for {s}:{s}:{d}: {}", .{ group_id, topic, partition_req.partition_index, err });
@@ -12133,6 +12147,62 @@ test "Broker.handleRequest TxnOffsetCommit v3 returns generated response and com
     try testing.expectEqual(@as(i32, 0), resp.topics[0].partitions[0].partition_index);
     try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.none)), resp.topics[0].partitions[0].error_code);
     try testing.expectEqual(@as(?i64, 123), try broker.groups.fetchOffset("txn-offset-group", "txn-offset-topic", 0));
+}
+
+test "Broker.handleRequest TxnOffsetCommit rejects oversized metadata" {
+    const Req = generated.txn_offset_commit_request.TxnOffsetCommitRequest;
+    const Resp = generated.txn_offset_commit_response.TxnOffsetCommitResponse;
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+    const init_result = try initTxnOffsetCommitForTest(&broker, "txn-large-meta-id", "txn-large-meta-group");
+
+    const too_large_metadata = "t" ** (max_offset_commit_metadata_bytes + 1);
+    const partitions = [_]Req.TxnOffsetCommitRequestTopic.TxnOffsetCommitRequestPartition{.{
+        .partition_index = 0,
+        .committed_offset = 444,
+        .committed_leader_epoch = -1,
+        .committed_metadata = too_large_metadata,
+    }};
+    const topics = [_]Req.TxnOffsetCommitRequestTopic{.{
+        .name = "txn-large-meta-topic",
+        .partitions = &partitions,
+    }};
+    const req = Req{
+        .transactional_id = "txn-large-meta-id",
+        .group_id = "txn-large-meta-group",
+        .producer_id = init_result.producer_id,
+        .producer_epoch = init_result.producer_epoch,
+        .generation_id = -1,
+        .member_id = "",
+        .group_instance_id = null,
+        .topics = &topics,
+    };
+
+    var buf: [8192]u8 = undefined;
+    var pos = buildTestRequest(&buf, 28, 3, 2813, header_mod.requestHeaderVersion(28, 3));
+    req.serialize(&buf, &pos, 3);
+
+    const response = broker.handleRequest(buf[0..pos]);
+    try testing.expect(response != null);
+    defer testing.allocator.free(response.?);
+
+    var rpos: usize = 0;
+    var response_header = try ResponseHeader.deserialize(testing.allocator, response.?, &rpos, header_mod.responseHeaderVersion(28, 3));
+    defer response_header.deinit(testing.allocator);
+    try testing.expectEqual(@as(i32, 2813), response_header.correlation_id);
+
+    const resp = try Resp.deserialize(testing.allocator, response.?, &rpos, 3);
+    defer {
+        for (resp.topics) |topic| {
+            if (topic.partitions.len > 0) testing.allocator.free(topic.partitions);
+        }
+        if (resp.topics.len > 0) testing.allocator.free(resp.topics);
+    }
+
+    try testing.expectEqual(response.?.len, rpos);
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.invalid_commit_offset_size)), resp.topics[0].partitions[0].error_code);
+    try testing.expectEqual(@as(?i64, null), try broker.groups.fetchOffset("txn-large-meta-group", "txn-large-meta-topic", 0));
 }
 
 test "Broker.handleRequest TxnOffsetCommit persists committed offsets" {
@@ -17251,6 +17321,60 @@ test "Broker.handleRequest OffsetCommit v8 returns generated response and commit
     try testing.expect(committed_record != null);
     try testing.expectEqual(@as(i32, -1), committed_record.?.leader_epoch);
     try testing.expectEqualStrings("generated-meta", committed_record.?.metadata.?);
+}
+
+test "Broker.handleRequest OffsetCommit rejects oversized metadata" {
+    const Req = generated.offset_commit_request.OffsetCommitRequest;
+    const Resp = generated.offset_commit_response.OffsetCommitResponse;
+    const Topic = Req.OffsetCommitRequestTopic;
+    const Partition = Topic.OffsetCommitRequestPartition;
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+
+    const too_large_metadata = "m" ** (max_offset_commit_metadata_bytes + 1);
+    const partitions = [_]Partition{.{
+        .partition_index = 0,
+        .committed_offset = 88,
+        .committed_leader_epoch = -1,
+        .committed_metadata = too_large_metadata,
+    }};
+    const topics = [_]Topic{.{
+        .name = "oc-large-meta-topic",
+        .partitions = &partitions,
+    }};
+    const req = Req{
+        .group_id = "oc-large-meta-group",
+        .generation_id_or_member_epoch = 1,
+        .member_id = "member-1",
+        .group_instance_id = null,
+        .topics = &topics,
+    };
+
+    var buf: [8192]u8 = undefined;
+    var pos = buildTestRequest(&buf, 8, 8, 818, header_mod.requestHeaderVersion(8, 8));
+    req.serialize(&buf, &pos, 8);
+
+    const response = broker.handleRequest(buf[0..pos]);
+    try testing.expect(response != null);
+    defer testing.allocator.free(response.?);
+
+    var rpos: usize = 0;
+    var response_header = try ResponseHeader.deserialize(testing.allocator, response.?, &rpos, header_mod.responseHeaderVersion(8, 8));
+    defer response_header.deinit(testing.allocator);
+    try testing.expectEqual(@as(i32, 818), response_header.correlation_id);
+
+    const resp = try Resp.deserialize(testing.allocator, response.?, &rpos, 8);
+    defer {
+        for (resp.topics) |topic| {
+            if (topic.partitions.len > 0) testing.allocator.free(topic.partitions);
+        }
+        if (resp.topics.len > 0) testing.allocator.free(resp.topics);
+    }
+    try testing.expectEqual(response.?.len, rpos);
+    try testing.expectEqual(@as(usize, 1), resp.topics.len);
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.invalid_commit_offset_size)), resp.topics[0].partitions[0].error_code);
+    try testing.expect((try broker.groups.fetchOffset("oc-large-meta-group", "oc-large-meta-topic", 0)) == null);
 }
 
 test "Broker.handleRequest OffsetCommit reports coordinator commit failure per partition" {
