@@ -6811,6 +6811,7 @@ pub const Broker = struct {
             if (topics.len > 0) self.allocator.free(topics);
         }
 
+        var mutated = false;
         for (req.topics, 0..) |topic, topic_index| {
             const topic_name = topic.name orelse "";
             const partitions = self.allocator.alloc(PartitionResult, topic.partitions.len) catch return null;
@@ -6820,6 +6821,7 @@ pub const Broker = struct {
                 const key = std.fmt.allocPrint(self.allocator, "{s}:{s}:{d}", .{ group_id, topic_name, partition.partition_index }) catch return null;
                 if (self.groups.committed_offsets.fetchRemove(key)) |old| {
                     self.allocator.free(old.key);
+                    mutated = true;
                 }
                 self.allocator.free(key);
 
@@ -6834,6 +6836,8 @@ pub const Broker = struct {
                 .partitions = partitions,
             };
         }
+
+        if (mutated) self.persistOffsets();
 
         const resp = Resp{
             .error_code = @intFromEnum(ErrorCode.none),
@@ -11983,6 +11987,66 @@ test "Broker.handleRequest OffsetDelete returns generated response and deletes o
     try testing.expectEqual(@as(i32, 1), resp.topics[0].partitions[1].partition_index);
     try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.none)), resp.topics[0].partitions[1].error_code);
     try testing.expect(!broker.groups.committed_offsets.contains("delete-offset-group:delete-offset-topic:0"));
+}
+
+test "Broker.handleRequest OffsetDelete persists deleted offsets" {
+    const fs = @import("fs_compat");
+    const Req = generated.offset_delete_request.OffsetDeleteRequest;
+    const Resp = generated.offset_delete_response.OffsetDeleteResponse;
+
+    const tmp_dir = "/tmp/zmq-offset-delete-persist-test";
+    fs.deleteTreeAbsolute(tmp_dir) catch {};
+    try fs.makeDirAbsolute(tmp_dir);
+    defer fs.deleteTreeAbsolute(tmp_dir) catch {};
+
+    var broker = Broker.initWithConfig(testing.allocator, 1, 9092, .{ .data_dir = tmp_dir });
+    defer broker.deinit();
+    try broker.open();
+
+    const committed_key = try testing.allocator.dupe(u8, "persist-delete-group:persist-delete-topic:0");
+    try broker.groups.committed_offsets.put(committed_key, 42);
+    broker.persistOffsets();
+
+    const partitions = [_]Req.OffsetDeleteRequestTopic.OffsetDeleteRequestPartition{.{
+        .partition_index = 0,
+    }};
+    const topics = [_]Req.OffsetDeleteRequestTopic{.{
+        .name = "persist-delete-topic",
+        .partitions = &partitions,
+    }};
+    const req = Req{
+        .group_id = "persist-delete-group",
+        .topics = &topics,
+    };
+
+    var buf: [512]u8 = undefined;
+    var pos = buildTestRequest(&buf, 47, 0, 4702, header_mod.requestHeaderVersion(47, 0));
+    req.serialize(&buf, &pos, 0);
+
+    const response = broker.handleRequest(buf[0..pos]);
+    try testing.expect(response != null);
+    defer testing.allocator.free(response.?);
+
+    var rpos: usize = 0;
+    var response_header = try ResponseHeader.deserialize(testing.allocator, response.?, &rpos, header_mod.responseHeaderVersion(47, 0));
+    defer response_header.deinit(testing.allocator);
+    try testing.expectEqual(@as(i32, 4702), response_header.correlation_id);
+
+    const resp = try Resp.deserialize(testing.allocator, response.?, &rpos, 0);
+    defer {
+        for (resp.topics) |topic| {
+            if (topic.partitions.len > 0) testing.allocator.free(topic.partitions);
+        }
+        if (resp.topics.len > 0) testing.allocator.free(resp.topics);
+    }
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.none)), resp.error_code);
+
+    const loaded = try broker.persistence.loadOffsets();
+    defer {
+        for (loaded) |entry| testing.allocator.free(entry.key);
+        testing.allocator.free(loaded);
+    }
+    try testing.expectEqual(@as(usize, 0), loaded.len);
 }
 
 test "Broker.handleRequest OffsetDelete rejects truncated request" {
