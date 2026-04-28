@@ -4515,6 +4515,7 @@ pub const Broker = struct {
 
         if (deleted_any) {
             self.persistTopics();
+            self.persistPartitionStates();
             self.persistPartitionReassignments();
             self.persistObjectManagerSnapshot();
         }
@@ -16411,6 +16412,42 @@ test "Broker.handleRequest DeleteTopics clears ongoing reassignments for deleted
 
     try testing.expect(!broker.topics.contains("dt-reassign-topic"));
     try testing.expectEqual(@as(u32, 0), broker.partition_reassignments.count());
+}
+
+test "Broker.handleRequest DeleteTopics persists partition state cleanup" {
+    const fs = @import("fs_compat");
+
+    const tmp_dir = "/tmp/zmq-delete-topics-partition-state-test";
+    fs.deleteTreeAbsolute(tmp_dir) catch {};
+    try fs.makeDirAbsolute(tmp_dir);
+    defer fs.deleteTreeAbsolute(tmp_dir) catch {};
+
+    var broker = Broker.initWithConfig(testing.allocator, 1, 9092, .{ .data_dir = tmp_dir });
+    defer broker.deinit();
+    try broker.open();
+
+    try testing.expect(broker.ensureTopic("dt-partition-state-topic"));
+    _ = try broker.store.produce("dt-partition-state-topic", 0, "before-delete");
+    broker.persistPartitionStates();
+
+    var buf: [512]u8 = undefined;
+    var pos = buildTestRequest(&buf, 20, 0, 202, 1);
+    ser.writeI32(&buf, &pos, 1);
+    ser.writeString(&buf, &pos, "dt-partition-state-topic");
+    ser.writeI32(&buf, &pos, 30000);
+
+    const resp = broker.handleRequest(buf[0..pos]);
+    try testing.expect(resp != null);
+    defer testing.allocator.free(resp.?);
+
+    const loaded = try broker.persistence.loadPartitionStates();
+    defer {
+        for (loaded) |entry| testing.allocator.free(entry.topic);
+        testing.allocator.free(loaded);
+    }
+    for (loaded) |entry| {
+        try testing.expect(!std.mem.eql(u8, entry.topic, "dt-partition-state-topic"));
+    }
 }
 
 test "Broker.handleRequest DeleteTopics rejects truncated request" {
