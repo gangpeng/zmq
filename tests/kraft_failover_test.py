@@ -590,8 +590,33 @@ def main():
             raise TestError(f"broker did not continue after failover: {second_offset} <= {first_offset}")
         wait_for_payloads(broker["port"], topic, expected_payloads)
 
+        processes[leader_id] = start_controller(tmp, leader_id, ports[leader_id], voters)
+        wait_for_ready(
+            processes[leader_id]["proc"],
+            processes[leader_id]["port"],
+            processes[leader_id]["log_path"],
+        )
+        wait_for_all_alive_to_report(processes, replacement_leader)
+        rejoined_quorum = describe_quorum(processes[leader_id]["port"], 5100 + leader_id)
+        if rejoined_quorum["leader_id"] != replacement_leader:
+            raise TestError(
+                f"restarted old leader {leader_id} did not rejoin leader "
+                f"{replacement_leader}: {rejoined_quorum}"
+            )
+
+        wait_for_payloads(broker["port"], topic, expected_payloads)
+        expected_payloads.append(b"r2")
+        third_offset = wait_for_produce(broker["port"], topic, expected_payloads[-1])
+        if third_offset <= second_offset:
+            raise TestError(
+                f"broker did not continue after old leader rejoin: {third_offset} <= {second_offset}"
+            )
+        wait_for_payloads(broker["port"], topic, expected_payloads)
+
+        alive = {node_id for node_id, info in processes.items() if info["proc"].poll() is None}
         restart_controller_id = next(
-            node_id for node_id in sorted(alive) if node_id != replacement_leader
+            node_id for node_id in sorted(alive)
+            if node_id != replacement_leader and node_id != leader_id
         )
         stop_process(processes[restart_controller_id]["proc"])
         processes[restart_controller_id] = start_controller(
@@ -613,13 +638,13 @@ def main():
             )
 
         wait_for_payloads(broker["port"], topic, expected_payloads)
-        expected_payloads.append(b"r2")
-        third_offset = wait_for_produce(
+        expected_payloads.append(b"r3")
+        fourth_offset = wait_for_produce(
             broker["port"], topic, expected_payloads[-1]
         )
-        if third_offset <= second_offset:
+        if fourth_offset <= third_offset:
             raise TestError(
-                f"broker did not continue after controller restart: {third_offset} <= {second_offset}"
+                f"broker did not continue after controller restart: {fourth_offset} <= {third_offset}"
             )
         wait_for_payloads(broker["port"], topic, expected_payloads)
 
@@ -627,20 +652,21 @@ def main():
         broker = start_broker(tmp, voters)
         wait_for_broker_ready(broker["proc"], broker["port"], broker["log_path"])
         wait_for_payloads(broker["port"], topic, expected_payloads)
-        expected_payloads.append(b"r3")
-        fourth_offset = wait_for_produce(
+        expected_payloads.append(b"r4")
+        fifth_offset = wait_for_produce(
             broker["port"], topic, expected_payloads[-1]
         )
-        if fourth_offset <= third_offset:
+        if fifth_offset <= fourth_offset:
             raise TestError(
-                f"broker did not continue after broker restart: {fourth_offset} <= {third_offset}"
+                f"broker did not continue after broker restart: {fifth_offset} <= {fourth_offset}"
             )
         wait_for_payloads(broker["port"], topic, expected_payloads)
 
         print(
             "ok: KRaft controller failover harness passed "
             f"(old_leader={leader_id}, new_leader={replacement_leader}, "
-            f"restarted_controller={restart_controller_id}, epoch={after['leader_epoch']})"
+            f"restarted_controller={restart_controller_id}, "
+            f"old_leader_rejoined=true, epoch={after['leader_epoch']})"
         )
         return 0
     finally:
