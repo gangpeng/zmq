@@ -466,11 +466,11 @@ pub const GroupCoordinator = struct {
     ///
     /// Kafka DeleteGroups must not remove groups with active members. Returning
     /// Kafka error codes here keeps the broker handler thin and testable.
-    pub fn deleteGroup(self: *GroupCoordinator, group_id: []const u8) i16 {
-        if (group_id.len == 0) return 24; // INVALID_GROUP_ID
+    pub fn deleteGroup(self: *GroupCoordinator, group_id: []const u8) ErrorCode {
+        if (group_id.len == 0) return ErrorCode.invalid_group_id;
 
-        const group = self.groups.getPtr(group_id) orelse return 69; // GROUP_ID_NOT_FOUND
-        if (group.members.count() > 0) return 68; // NON_EMPTY_GROUP
+        const group = self.groups.getPtr(group_id) orelse return ErrorCode.group_id_not_found;
+        if (group.members.count() > 0) return ErrorCode.non_empty_group;
 
         self.deleteCommittedOffsetsForGroup(group_id);
 
@@ -478,9 +478,9 @@ pub const GroupCoordinator = struct {
             var group_copy = entry.value;
             group_copy.deinit();
             self.allocator.free(entry.key);
-            return 0;
+            return ErrorCode.none;
         }
-        return 69; // GROUP_ID_NOT_FOUND
+        return ErrorCode.group_id_not_found;
     }
 
     fn deleteCommittedOffsetsForGroup(self: *GroupCoordinator, group_id: []const u8) void {
@@ -1441,14 +1441,14 @@ test "GroupCoordinator deleteGroup enforces emptiness and removes offsets" {
     var coord = GroupCoordinator.init(testing.allocator);
     defer coord.deinit();
 
-    try testing.expectEqual(@as(i16, 69), coord.deleteGroup("missing"));
+    try testing.expectEqual(ErrorCode.group_id_not_found, coord.deleteGroup("missing"));
 
     const join = try coord.joinGroup("delete-me", null, "consumer", null);
     try coord.commitOffset("delete-me", "topic-a", 0, 42);
-    try testing.expectEqual(@as(i16, 68), coord.deleteGroup("delete-me"));
+    try testing.expectEqual(ErrorCode.non_empty_group, coord.deleteGroup("delete-me"));
 
     try testing.expectEqual(@as(i16, 0), coord.leaveGroup("delete-me", join.member_id));
-    try testing.expectEqual(@as(i16, 0), coord.deleteGroup("delete-me"));
+    try testing.expectEqual(ErrorCode.none, coord.deleteGroup("delete-me"));
     try testing.expectEqual(@as(usize, 0), coord.groupCount());
     try testing.expect((try coord.fetchOffset("delete-me", "topic-a", 0)) == null);
 }

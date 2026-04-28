@@ -6029,9 +6029,9 @@ pub const Broker = struct {
             else
                 (ser.readString(request_bytes, &pos) catch return null) orelse "";
 
-            const error_code = self.groups.deleteGroup(group_id);
-            if (error_code == @intFromEnum(ErrorCode.none)) groups_mutated = true;
-            results.append(.{ .group_id = group_id, .error_code = error_code }) catch return null;
+            const delete_error = self.groups.deleteGroup(group_id);
+            if (delete_error == ErrorCode.none) groups_mutated = true;
+            results.append(.{ .group_id = group_id, .error_code = @intFromEnum(delete_error) }) catch return null;
         }
 
         if (flexible) ser.skipTaggedFields(request_bytes, &pos) catch return null;
@@ -11530,6 +11530,45 @@ test "Broker.handleRequest DeleteGroups v2 deletes empty group" {
     try testing.expectEqualStrings("delete-me", group_id);
     try testing.expectEqual(@as(i16, 0), ser.readI16(response.?, &rpos));
     try testing.expectEqual(@as(usize, 0), broker.groups.groupCount());
+}
+
+test "Broker.handleRequest DeleteGroups v2 reports group lifecycle errors" {
+    const Req = generated.delete_groups_request.DeleteGroupsRequest;
+    const Resp = generated.delete_groups_response.DeleteGroupsResponse;
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+
+    _ = try broker.groups.joinGroup("active-delete-group", null, "consumer", null);
+    const group_names = [_]?[]const u8{ "", "active-delete-group", "missing-delete-group" };
+    const req = Req{ .groups_names = &group_names };
+
+    var buf: [512]u8 = undefined;
+    var pos = buildTestRequest(&buf, 42, 2, 4202, header_mod.requestHeaderVersion(42, 2));
+    req.serialize(&buf, &pos, 2);
+
+    const response = broker.handleRequest(buf[0..pos]);
+    try testing.expect(response != null);
+    defer testing.allocator.free(response.?);
+
+    var rpos: usize = 0;
+    var response_header = try ResponseHeader.deserialize(testing.allocator, response.?, &rpos, header_mod.responseHeaderVersion(42, 2));
+    defer response_header.deinit(testing.allocator);
+    try testing.expectEqual(@as(i32, 4202), response_header.correlation_id);
+
+    const resp = try Resp.deserialize(testing.allocator, response.?, &rpos, 2);
+    defer if (resp.results.len > 0) testing.allocator.free(resp.results);
+    try testing.expectEqual(response.?.len, rpos);
+    try testing.expectEqual(@as(i32, 0), resp.throttle_time_ms);
+    try testing.expectEqual(@as(usize, 3), resp.results.len);
+
+    try testing.expectEqualStrings("", resp.results[0].group_id.?);
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.invalid_group_id)), resp.results[0].error_code);
+    try testing.expectEqualStrings("active-delete-group", resp.results[1].group_id.?);
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.non_empty_group)), resp.results[1].error_code);
+    try testing.expectEqualStrings("missing-delete-group", resp.results[2].group_id.?);
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.group_id_not_found)), resp.results[2].error_code);
+    try testing.expectEqual(@as(usize, 1), broker.groups.groupCount());
 }
 
 test "Broker.handleRequest DeleteGroups persists removed offsets" {
