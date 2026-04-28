@@ -484,6 +484,104 @@ def automq_describe_stream(port, stream_id, correlation_id):
     raise TestError(f"DescribeStreams did not include stream_id={stream_id}; streams={streams}")
 
 
+def automq_register_node(port, node_id, node_epoch, wal_config, correlation_id):
+    body = struct.pack(">iq", node_id, node_epoch)
+    body += write_compact_string(wal_config)
+    body += write_compact_array_len(0)  # tags
+    body += b"\x00"  # request tagged fields
+
+    response = automq_request(port, 513, correlation_id, body, timeout=15)
+    pos = parse_flexible_response_header(response, correlation_id)
+    error_code, pos = read_i16(response, pos)
+    _, pos = read_i32(response, pos)  # throttle_time_ms
+    pos = skip_tags(response, pos)
+    if error_code != 0:
+        raise TestError(f"AutomqRegisterNode error_code={error_code}")
+
+
+def automq_get_node(port, node_id, correlation_id):
+    body = write_compact_array_len(1)
+    body += struct.pack(">i", node_id)
+    body += b"\x00"  # request tagged fields
+
+    response = automq_request(port, 514, correlation_id, body)
+    pos = parse_flexible_response_header(response, correlation_id)
+    error_code, pos = read_i16(response, pos)
+    _, pos = read_i32(response, pos)  # throttle_time_ms
+    if error_code != 0:
+        raise TestError(f"AutomqGetNodes error_code={error_code}")
+    node_count, pos = read_compact_array_len(response, pos)
+    nodes = []
+    for _ in range(node_count):
+        described_node_id, pos = read_i32(response, pos)
+        node_epoch, pos = read_i64(response, pos)
+        wal_config, pos = read_compact_string(response, pos)
+        state, pos = read_compact_string(response, pos)
+        has_opening_streams, pos = read_bool(response, pos)
+        tag_count, pos = read_compact_array_len(response, pos)
+        for _ in range(tag_count):
+            _, pos = read_compact_string(response, pos)
+            _, pos = read_compact_string(response, pos)
+            pos = skip_tags(response, pos)
+        pos = skip_tags(response, pos)
+        nodes.append(
+            {
+                "node_id": described_node_id,
+                "node_epoch": node_epoch,
+                "wal_config": wal_config,
+                "state": state,
+                "has_opening_streams": has_opening_streams,
+            }
+        )
+    pos = skip_tags(response, pos)
+    for node in nodes:
+        if node["node_id"] == node_id:
+            return node
+    raise TestError(f"AutomqGetNodes did not include node_id={node_id}; nodes={nodes}")
+
+
+def automq_update_license(port, license_value, correlation_id):
+    body = write_compact_string(license_value)
+    body += b"\x00"  # request tagged fields
+
+    response = automq_request(port, 517, correlation_id, body, timeout=15)
+    pos = parse_flexible_response_header(response, correlation_id)
+    error_code, pos = read_i16(response, pos)
+    _, pos = read_i32(response, pos)  # throttle_time_ms
+    _, pos = read_compact_string(response, pos)  # error_message
+    pos = skip_tags(response, pos)
+    if error_code != 0:
+        raise TestError(f"UpdateLicense error_code={error_code}")
+
+
+def automq_describe_license(port, correlation_id):
+    response = automq_request(port, 518, correlation_id, b"\x00")
+    pos = parse_flexible_response_header(response, correlation_id)
+    error_code, pos = read_i16(response, pos)
+    _, pos = read_i32(response, pos)  # throttle_time_ms
+    _, pos = read_compact_string(response, pos)  # error_message
+    license_value, pos = read_compact_string(response, pos)
+    pos = skip_tags(response, pos)
+    if error_code != 0:
+        raise TestError(f"DescribeLicense error_code={error_code}")
+    return license_value
+
+
+def automq_get_next_node_id(port, cluster_id, correlation_id):
+    body = write_compact_string(cluster_id)
+    body += b"\x00"  # request tagged fields
+
+    response = automq_request(port, 600, correlation_id, body, timeout=15)
+    pos = parse_flexible_response_header(response, correlation_id)
+    error_code, pos = read_i16(response, pos)
+    _, pos = read_i32(response, pos)  # throttle_time_ms
+    node_id, pos = read_i32(response, pos)
+    pos = skip_tags(response, pos)
+    if error_code != 0:
+        raise TestError(f"GetNextNodeId error_code={error_code}")
+    return node_id
+
+
 def wait_for_automq_put_kv(port, key, value, timeout=45):
     deadline = time.time() + timeout
     correlation_id = 7000
@@ -546,6 +644,102 @@ def wait_for_automq_stream(port, stream_id, timeout=45):
         correlation_id += 1
         time.sleep(0.5)
     raise TestError(f"AutoMQ DescribeStreams did not find stream {stream_id}: {last_error}")
+
+
+def wait_for_automq_register_node(port, node_id, node_epoch, wal_config, timeout=45):
+    deadline = time.time() + timeout
+    correlation_id = 11000
+    last_error = None
+    while time.time() < deadline:
+        try:
+            automq_register_node(port, node_id, node_epoch, wal_config, correlation_id)
+            return
+        except Exception as exc:
+            last_error = exc
+            correlation_id += 1
+            time.sleep(0.5)
+    raise TestError(f"AutoMQ RegisterNode did not succeed within {timeout}s: {last_error}")
+
+
+def wait_for_automq_node(port, node_id, expected_epoch, expected_wal_config, timeout=45):
+    deadline = time.time() + timeout
+    correlation_id = 12000
+    last_error = None
+    last_node = None
+    while time.time() < deadline:
+        try:
+            last_node = automq_get_node(port, node_id, correlation_id)
+            if (
+                last_node["node_epoch"] == expected_epoch
+                and last_node["wal_config"] == expected_wal_config
+            ):
+                return last_node
+        except Exception as exc:
+            last_error = exc
+        correlation_id += 1
+        time.sleep(0.5)
+    raise TestError(
+        f"AutoMQ GetNodes did not return expected node {node_id}: "
+        f"last_node={last_node!r} last_error={last_error}"
+    )
+
+
+def wait_for_automq_update_license(port, license_value, timeout=45):
+    deadline = time.time() + timeout
+    correlation_id = 13000
+    last_error = None
+    while time.time() < deadline:
+        try:
+            automq_update_license(port, license_value, correlation_id)
+            return
+        except Exception as exc:
+            last_error = exc
+            correlation_id += 1
+            time.sleep(0.5)
+    raise TestError(f"AutoMQ UpdateLicense did not succeed within {timeout}s: {last_error}")
+
+
+def wait_for_automq_license(port, expected_license, timeout=45):
+    deadline = time.time() + timeout
+    correlation_id = 14000
+    last_error = None
+    last_license = None
+    while time.time() < deadline:
+        try:
+            last_license = automq_describe_license(port, correlation_id)
+            if last_license == expected_license:
+                return last_license
+        except Exception as exc:
+            last_error = exc
+        correlation_id += 1
+        time.sleep(0.5)
+    raise TestError(
+        f"AutoMQ DescribeLicense did not return expected license: "
+        f"last_license={last_license!r} last_error={last_error}"
+    )
+
+
+def wait_for_automq_next_node_id(port, cluster_id, expected_node_id=None, timeout=45):
+    deadline = time.time() + timeout
+    correlation_id = 15000
+    last_error = None
+    last_node_id = None
+    while time.time() < deadline:
+        try:
+            last_node_id = automq_get_next_node_id(port, cluster_id, correlation_id)
+            if expected_node_id is None or last_node_id == expected_node_id:
+                return last_node_id
+            raise TestError(f"expected node_id={expected_node_id}, got {last_node_id}")
+        except Exception as exc:
+            last_error = exc
+            if last_node_id is not None:
+                break
+        correlation_id += 1
+        time.sleep(0.5)
+    raise TestError(
+        f"AutoMQ GetNextNodeId did not return expected id {expected_node_id}: "
+        f"last_node_id={last_node_id} last_error={last_error}"
+    )
 
 
 def describe_quorum_body():
@@ -844,11 +1038,46 @@ def run_automq_metadata_failover_scenario(tmp):
         stream_id = wait_for_automq_create_stream(leader_broker_port, leader_id)
         wait_for_automq_stream(leader_broker_port, stream_id)
 
+        registered_node_id = 700 + leader_id
+        registered_node_epoch = 42
+        registered_wal_config = f"wal://automq-node-{registered_node_id}"
+        wait_for_automq_register_node(
+            leader_broker_port,
+            registered_node_id,
+            registered_node_epoch,
+            registered_wal_config,
+        )
+        wait_for_automq_node(
+            leader_broker_port,
+            registered_node_id,
+            registered_node_epoch,
+            registered_wal_config,
+        )
+
+        license_value = f"license-{os.getpid()}-{int(time.time())}"
+        wait_for_automq_update_license(leader_broker_port, license_value)
+        wait_for_automq_license(leader_broker_port, license_value)
+
+        cluster_id = f"{CLUSTER_ID}-automq"
+        first_allocated_node_id = wait_for_automq_next_node_id(leader_broker_port, cluster_id)
+        if first_allocated_node_id < registered_node_id + 1:
+            raise TestError(
+                f"GetNextNodeId did not advance beyond registered node: "
+                f"allocated={first_allocated_node_id} registered={registered_node_id}"
+            )
+
         for node_id, info in processes.items():
             if node_id == leader_id:
                 continue
             wait_for_automq_kv(info["broker_port"], key, value_before)
             wait_for_automq_stream(info["broker_port"], stream_id)
+            wait_for_automq_node(
+                info["broker_port"],
+                registered_node_id,
+                registered_node_epoch,
+                registered_wal_config,
+            )
+            wait_for_automq_license(info["broker_port"], license_value)
 
         stop_process(processes[leader_id]["proc"], crash=True)
         replacement_leader, after = wait_for_leader(processes, forbidden_leaders={leader_id})
@@ -859,6 +1088,18 @@ def run_automq_metadata_failover_scenario(tmp):
         replacement_broker_port = processes[replacement_leader]["broker_port"]
         wait_for_automq_kv(replacement_broker_port, key, value_before)
         wait_for_automq_stream(replacement_broker_port, stream_id)
+        wait_for_automq_node(
+            replacement_broker_port,
+            registered_node_id,
+            registered_node_epoch,
+            registered_wal_config,
+        )
+        wait_for_automq_license(replacement_broker_port, license_value)
+        wait_for_automq_next_node_id(
+            replacement_broker_port,
+            cluster_id,
+            expected_node_id=first_allocated_node_id + 1,
+        )
 
         value_after = b"after-controller-failover"
         wait_for_automq_put_kv(replacement_broker_port, key, value_after)
@@ -884,11 +1125,19 @@ def run_automq_metadata_failover_scenario(tmp):
         wait_for_all_alive_to_report(processes, replacement_leader)
         wait_for_automq_kv(processes[leader_id]["broker_port"], key, value_after)
         wait_for_automq_stream(processes[leader_id]["broker_port"], stream_id)
+        wait_for_automq_node(
+            processes[leader_id]["broker_port"],
+            registered_node_id,
+            registered_node_epoch,
+            registered_wal_config,
+        )
+        wait_for_automq_license(processes[leader_id]["broker_port"], license_value)
 
         return {
             "old_leader": leader_id,
             "new_leader": replacement_leader,
             "stream_id": stream_id,
+            "registered_node_id": registered_node_id,
             "epoch": after["leader_epoch"],
         }
     finally:
@@ -1027,7 +1276,8 @@ def main():
             f"old_leader_rejoined=true, epoch={after['leader_epoch']}, "
             f"automq_old_leader={automq_result['old_leader']}, "
             f"automq_new_leader={automq_result['new_leader']}, "
-            f"automq_stream_id={automq_result['stream_id']})"
+            f"automq_stream_id={automq_result['stream_id']}, "
+            f"automq_node_id={automq_result['registered_node_id']})"
         )
         return 0
     finally:
