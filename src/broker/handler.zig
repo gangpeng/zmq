@@ -718,13 +718,7 @@ pub const Broker = struct {
 
         self.persistTransactionsIfDirty();
 
-        // Persist producer sequences if dirty
-        if (self.producer_sequences_dirty) {
-            self.persistence.saveProducerSequences(&self.producer_sequences) catch |err| {
-                log.warn("Failed to persist producer sequences: {}", .{err});
-            };
-            self.producer_sequences_dirty = false;
-        }
+        self.persistProducerSequencesIfDirty();
 
         // Periodic S3 flush (if configured)
         if (self.store.s3_storage != null) {
@@ -923,6 +917,7 @@ pub const Broker = struct {
         self.persistOffsets();
         self.persistPartitionStates();
         self.persistTransactionsIfDirty();
+        self.persistProducerSequencesIfDirty();
         self.persistAutoMqMetadata();
         self.persistPartitionReassignments();
         self.persistObjectManagerSnapshot();
@@ -1293,6 +1288,16 @@ pub const Broker = struct {
             return;
         };
         self.txn_coordinator.dirty = false;
+    }
+
+    /// Persist idempotent producer sequence state if it has changed since the last flush.
+    fn persistProducerSequencesIfDirty(self: *Broker) void {
+        if (!self.producer_sequences_dirty) return;
+        self.persistence.saveProducerSequences(&self.producer_sequences) catch |err| {
+            log.warn("Failed to persist producer sequences: {}", .{err});
+            return;
+        };
+        self.producer_sequences_dirty = false;
     }
 
     /// Persist per-partition offsets/HW/LSO to disk (best-effort).
@@ -2842,6 +2847,7 @@ pub const Broker = struct {
         log.debug("Produce: {d} topics, acks={d}", .{ req.topic_data.len, req.acks });
         if (partition_state_dirty) self.persistPartitionStates();
         if (object_metadata_dirty) self.persistObjectManagerSnapshot();
+        self.persistProducerSequencesIfDirty();
 
         // acks=0: fire-and-forget — don't send a response
         if (req.acks == 0) {
@@ -10872,6 +10878,81 @@ test "Broker.handleRequest Produce v9 returns generated flexible response" {
     try testing.expectEqualStrings("produce-v9-topic", resp.responses[0].name.?);
     try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.none)), resp.responses[0].partition_responses[0].error_code);
     try testing.expectEqual(@as(i32, 0), resp.throttle_time_ms);
+}
+
+test "Broker.handleRequest Produce persists idempotent producer sequence" {
+    const fs = @import("fs_compat");
+    const Req = generated.produce_request.ProduceRequest;
+    const Topic = Req.TopicProduceData;
+    const Partition = Topic.PartitionProduceData;
+    const Resp = generated.produce_response.ProduceResponse;
+    const rec_batch = protocol.record_batch;
+
+    const tmp_dir = "/tmp/zmq-producer-sequence-persist-test";
+    fs.deleteTreeAbsolute(tmp_dir) catch {};
+    try fs.makeDirAbsolute(tmp_dir);
+    defer fs.deleteTreeAbsolute(tmp_dir) catch {};
+
+    var broker = Broker.initWithConfig(testing.allocator, 1, 9092, .{ .data_dir = tmp_dir });
+    defer broker.deinit();
+    try broker.open();
+
+    const records = [_]rec_batch.Record{.{
+        .offset_delta = 0,
+        .value = "seq-value",
+    }};
+    const batch = try rec_batch.buildRecordBatch(
+        testing.allocator,
+        0,
+        &records,
+        61010,
+        2,
+        7,
+        12345,
+        12345,
+        0,
+    );
+    defer testing.allocator.free(batch);
+
+    const partitions = [_]Partition{.{
+        .index = 0,
+        .records = batch,
+    }};
+    const topics = [_]Topic{.{
+        .name = "produce-sequence-persist-topic",
+        .partition_data = &partitions,
+    }};
+    const req = Req{
+        .transactional_id = null,
+        .acks = 1,
+        .timeout_ms = 30000,
+        .topic_data = &topics,
+    };
+
+    var buf: [2048]u8 = undefined;
+    var pos = buildTestRequest(&buf, 0, 9, 311, header_mod.requestHeaderVersion(0, 9));
+    req.serialize(&buf, &pos, 9);
+
+    const response = broker.handleRequest(buf[0..pos]);
+    try testing.expect(response != null);
+    defer testing.allocator.free(response.?);
+
+    var rpos: usize = 0;
+    var response_header = try ResponseHeader.deserialize(testing.allocator, response.?, &rpos, header_mod.responseHeaderVersion(0, 9));
+    defer response_header.deinit(testing.allocator);
+    try testing.expectEqual(@as(i32, 311), response_header.correlation_id);
+
+    const resp = try Resp.deserialize(testing.allocator, response.?, &rpos, 9);
+    defer freeDeserializedProduceResponse(&resp);
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.none)), resp.responses[0].partition_responses[0].error_code);
+
+    const loaded = try broker.persistence.loadProducerSequences();
+    defer testing.allocator.free(loaded);
+    try testing.expectEqual(@as(usize, 1), loaded.len);
+    try testing.expectEqual(@as(i64, 61010), loaded[0].producer_id);
+    try testing.expectEqual(@as(i16, 2), loaded[0].producer_epoch);
+    try testing.expectEqual(@as(i32, 7), loaded[0].last_sequence);
+    try testing.expectEqual(PartitionStore.hashPartitionKey("produce-sequence-persist-topic", 0), loaded[0].partition_key);
 }
 
 test "Broker.handleRequest Produce rejects truncated request" {
