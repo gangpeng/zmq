@@ -17,6 +17,7 @@ Optional environment:
     ZMQ_KRAFT_BROKER_PORT           39092
 """
 
+import json
 import os
 import shutil
 import socket
@@ -562,6 +563,40 @@ def automq_commit_stream_object(
         raise TestError(f"CommitStreamObject error_code={error_code}")
 
 
+def automq_commit_stream_set_object(
+    port,
+    node_id,
+    stream_id,
+    object_id,
+    start_offset,
+    end_offset,
+    stream_epoch,
+    correlation_id,
+):
+    body = struct.pack(">i", node_id)
+    body += struct.pack(">q", 1)  # node_epoch
+    body += struct.pack(">q", object_id)
+    body += struct.pack(">q", object_id)  # order_id
+    body += struct.pack(">q", 256)  # object_size
+    body += write_compact_array_len(1)
+    body += struct.pack(">qqqq", stream_id, stream_epoch, start_offset, end_offset)
+    body += b"\x00"  # object_stream_range tagged fields
+    body += write_compact_array_len(0)  # stream_objects
+    body += write_compact_array_len(0)  # compacted_object_ids
+    body += b"\x00"  # failover_mode
+    body += struct.pack(">i", 0)  # attributes
+    body += b"\x00"  # request tagged fields
+
+    response = automq_request(port, 506, correlation_id, body, timeout=15, api_version=1)
+    pos = parse_flexible_response_header(response, correlation_id)
+    error_code, pos = read_i16(response, pos)
+    _, pos = read_i32(response, pos)  # throttle_time_ms
+    _, pos = read_i32(response, pos)  # attributes
+    pos = skip_tags(response, pos)
+    if error_code != 0:
+        raise TestError(f"CommitStreamSetObject error_code={error_code}")
+
+
 def automq_get_opening_streams(port, node_id, correlation_id, failover_mode=False):
     body = struct.pack(">iq", node_id, 1)
     body += b"\x01" if failover_mode else b"\x00"
@@ -771,6 +806,88 @@ def automq_get_next_node_id(port, cluster_id, correlation_id):
     return node_id
 
 
+def automq_get_partition_snapshot(port, session_id, session_epoch, correlation_id):
+    body = struct.pack(">ii", session_id, session_epoch)
+    body += b"\x00"  # request tagged fields
+
+    response = automq_request(port, 516, correlation_id, body)
+    pos = parse_flexible_response_header(response, correlation_id)
+    error_code, pos = read_i16(response, pos)
+    _, pos = read_i32(response, pos)  # throttle_time_ms
+    response_session_id, pos = read_i32(response, pos)
+    response_session_epoch, pos = read_i32(response, pos)
+    if error_code != 0:
+        raise TestError(f"AutomqGetPartitionSnapshot error_code={error_code}")
+    topic_count, pos = read_compact_array_len(response, pos)
+    topics = []
+    for _ in range(topic_count):
+        if pos + 16 > len(response):
+            raise TestError("AutomqGetPartitionSnapshot truncated topic_id")
+        topic_id = response[pos : pos + 16]
+        pos += 16
+        partition_count, pos = read_compact_array_len(response, pos)
+        partitions = []
+        for _ in range(partition_count):
+            partition_index, pos = read_i32(response, pos)
+            leader_epoch, pos = read_i32(response, pos)
+            operation, pos = read_i16(response, pos)
+            has_log_metadata, pos = read_varint(response, pos)
+            if has_log_metadata != 0:
+                raise TestError("unexpected non-empty log_metadata in partition snapshot")
+            has_first_unstable, pos = read_varint(response, pos)
+            if has_first_unstable != 0:
+                raise TestError("unexpected non-empty first_unstable_offset in partition snapshot")
+            has_log_end, pos = read_varint(response, pos)
+            log_end_offset = None
+            if has_log_end != 0:
+                message_offset, pos = read_i64(response, pos)
+                _, pos = read_i32(response, pos)  # relative_position_in_segment
+                pos = skip_tags(response, pos)
+                log_end_offset = message_offset
+            stream_count, pos = read_compact_array_len(response, pos)
+            streams = []
+            for _ in range(stream_count):
+                stream_id, pos = read_i64(response, pos)
+                end_offset, pos = read_i64(response, pos)
+                pos = skip_tags(response, pos)
+                streams.append({"stream_id": stream_id, "end_offset": end_offset})
+            pos = skip_tags(response, pos)
+            partitions.append(
+                {
+                    "partition_index": partition_index,
+                    "leader_epoch": leader_epoch,
+                    "operation": operation,
+                    "log_end_offset": log_end_offset,
+                    "streams": streams,
+                }
+            )
+        pos = skip_tags(response, pos)
+        topics.append({"topic_id": topic_id, "partitions": partitions})
+    pos = skip_tags(response, pos)
+    return {
+        "session_id": response_session_id,
+        "session_epoch": response_session_epoch,
+        "topics": topics,
+    }
+
+
+def automq_export_cluster_manifest(port, correlation_id):
+    response = automq_request(port, 519, correlation_id, b"\x00")
+    pos = parse_flexible_response_header(response, correlation_id)
+    error_code, pos = read_i16(response, pos)
+    _, pos = read_i32(response, pos)  # throttle_time_ms
+    manifest, pos = read_compact_string(response, pos)
+    pos = skip_tags(response, pos)
+    if error_code != 0:
+        raise TestError(f"ExportClusterManifest error_code={error_code}")
+    if manifest is None:
+        raise TestError("ExportClusterManifest returned null manifest")
+    try:
+        return json.loads(manifest)
+    except json.JSONDecodeError as exc:
+        raise TestError(f"ExportClusterManifest returned invalid JSON: {manifest!r}") from exc
+
+
 def automq_zone_router(port, metadata, route_epoch, correlation_id, api_version=1):
     body = write_compact_bytes(metadata)
     if api_version >= 1:
@@ -948,6 +1065,41 @@ def wait_for_automq_commit_stream_object(
             correlation_id += 1
             time.sleep(0.5)
     raise TestError(f"AutoMQ CommitStreamObject did not succeed within {timeout}s: {last_error}")
+
+
+def wait_for_automq_commit_stream_set_object(
+    port,
+    node_id,
+    stream_id,
+    object_id,
+    start_offset,
+    end_offset,
+    stream_epoch,
+    timeout=45,
+):
+    deadline = time.time() + timeout
+    correlation_id = 9800
+    last_error = None
+    while time.time() < deadline:
+        try:
+            automq_commit_stream_set_object(
+                port,
+                node_id,
+                stream_id,
+                object_id,
+                start_offset,
+                end_offset,
+                stream_epoch,
+                correlation_id,
+            )
+            return
+        except Exception as exc:
+            last_error = exc
+            correlation_id += 1
+            time.sleep(0.5)
+    raise TestError(
+        f"AutoMQ CommitStreamSetObject did not succeed within {timeout}s: {last_error}"
+    )
 
 
 def wait_for_automq_stream(
@@ -1215,6 +1367,57 @@ def wait_for_automq_next_node_id(port, cluster_id, expected_node_id=None, timeou
     raise TestError(
         f"AutoMQ GetNextNodeId did not return expected id {expected_node_id}: "
         f"last_node_id={last_node_id} last_error={last_error}"
+    )
+
+
+def wait_for_automq_partition_snapshot(port, session_id, session_epoch, timeout=45):
+    deadline = time.time() + timeout
+    correlation_id = 15500
+    last_error = None
+    last_snapshot = None
+    while time.time() < deadline:
+        try:
+            last_snapshot = automq_get_partition_snapshot(
+                port,
+                session_id,
+                session_epoch,
+                correlation_id,
+            )
+            if (
+                last_snapshot["session_id"] == session_id
+                and last_snapshot["session_epoch"] == session_epoch + 1
+            ):
+                return last_snapshot
+        except Exception as exc:
+            last_error = exc
+        correlation_id += 1
+        time.sleep(0.5)
+    raise TestError(
+        f"AutoMQ GetPartitionSnapshot did not return expected session: "
+        f"last_snapshot={last_snapshot!r} last_error={last_error}"
+    )
+
+
+def wait_for_automq_manifest_streams(port, minimum_streams, timeout=45):
+    deadline = time.time() + timeout
+    correlation_id = 15800
+    last_error = None
+    last_manifest = None
+    while time.time() < deadline:
+        try:
+            last_manifest = automq_export_cluster_manifest(port, correlation_id)
+            if last_manifest.get("streams", -1) >= minimum_streams:
+                return last_manifest
+            raise TestError(
+                f"expected at least {minimum_streams} streams, got {last_manifest.get('streams')}"
+            )
+        except Exception as exc:
+            last_error = exc
+        correlation_id += 1
+        time.sleep(0.5)
+    raise TestError(
+        f"AutoMQ ExportClusterManifest did not report at least {minimum_streams} streams: "
+        f"last_manifest={last_manifest!r} last_error={last_error}"
     )
 
 
@@ -1598,6 +1801,8 @@ def run_automq_metadata_failover_scenario(tmp):
             stream_owner_node_id,
         )
         wait_for_automq_stream(leader_broker_port, deleted_stream_id, "OPENED", 1, 0, 0)
+        wait_for_automq_manifest_streams(leader_broker_port, 2)
+        wait_for_automq_partition_snapshot(leader_broker_port, 1, 0)
 
         registered_node_id = 700 + leader_id
         registered_node_epoch = 42
@@ -1643,6 +1848,8 @@ def run_automq_metadata_failover_scenario(tmp):
                 expected_end_offset=10,
             )
             wait_for_automq_stream(info["broker_port"], deleted_stream_id, "OPENED", 1, 0, 0)
+            wait_for_automq_manifest_streams(info["broker_port"], 2)
+            wait_for_automq_partition_snapshot(info["broker_port"], 1, 0)
             wait_for_automq_node(
                 info["broker_port"],
                 registered_node_id,
@@ -1671,6 +1878,8 @@ def run_automq_metadata_failover_scenario(tmp):
             expected_end_offset=10,
         )
         wait_for_automq_stream(replacement_broker_port, deleted_stream_id, "OPENED", 1, 0, 0)
+        wait_for_automq_manifest_streams(replacement_broker_port, 2)
+        wait_for_automq_partition_snapshot(replacement_broker_port, 1, 0)
         wait_for_automq_node(
             replacement_broker_port,
             registered_node_id,
@@ -1702,13 +1911,37 @@ def run_automq_metadata_failover_scenario(tmp):
         )
         wait_for_automq_zone_router(replacement_broker_port, zone_router_after)
 
+        stream_set_object_id = wait_for_automq_prepare_s3_object(
+            replacement_broker_port,
+            stream_owner_node_id,
+        )
+        wait_for_automq_commit_stream_set_object(
+            replacement_broker_port,
+            stream_owner_node_id,
+            stream_id,
+            stream_set_object_id,
+            10,
+            20,
+            1,
+        )
+        wait_for_automq_stream(replacement_broker_port, stream_id, "OPENED", 1, 0, 20)
+        wait_for_automq_opening_stream(
+            replacement_broker_port,
+            stream_owner_node_id,
+            stream_id,
+            expected_epoch=1,
+            expected_start_offset=0,
+            expected_end_offset=20,
+        )
+        wait_for_automq_manifest_streams(replacement_broker_port, 2)
+
         wait_for_automq_close_stream(
             replacement_broker_port,
             stream_owner_node_id,
             stream_id,
             1,
         )
-        wait_for_automq_stream(replacement_broker_port, stream_id, "CLOSED", 1, 0, 10)
+        wait_for_automq_stream(replacement_broker_port, stream_id, "CLOSED", 1, 0, 20)
         wait_for_automq_opening_stream_missing(
             replacement_broker_port,
             stream_owner_node_id,
@@ -1720,7 +1953,7 @@ def run_automq_metadata_failover_scenario(tmp):
             stream_id,
             2,
         )
-        wait_for_automq_stream(replacement_broker_port, stream_id, "OPENED", 2, 0, 10)
+        wait_for_automq_stream(replacement_broker_port, stream_id, "OPENED", 2, 0, 20)
         wait_for_automq_trim_stream(
             replacement_broker_port,
             stream_owner_node_id,
@@ -1728,14 +1961,14 @@ def run_automq_metadata_failover_scenario(tmp):
             2,
             5,
         )
-        wait_for_automq_stream(replacement_broker_port, stream_id, "OPENED", 2, 5, 10)
+        wait_for_automq_stream(replacement_broker_port, stream_id, "OPENED", 2, 5, 20)
         wait_for_automq_opening_stream(
             replacement_broker_port,
             stream_owner_node_id,
             stream_id,
             expected_epoch=2,
             expected_start_offset=5,
-            expected_end_offset=10,
+            expected_end_offset=20,
         )
         wait_for_automq_delete_stream(
             replacement_broker_port,
@@ -1749,6 +1982,8 @@ def run_automq_metadata_failover_scenario(tmp):
             stream_owner_node_id,
             deleted_stream_id,
         )
+        wait_for_automq_manifest_streams(replacement_broker_port, 1)
+        wait_for_automq_partition_snapshot(replacement_broker_port, 2, 0)
 
         processes[leader_id] = start_combined_node(
             tmp,
@@ -1777,7 +2012,7 @@ def run_automq_metadata_failover_scenario(tmp):
             "OPENED",
             2,
             5,
-            10,
+            20,
         )
         wait_for_automq_opening_stream(
             processes[leader_id]["broker_port"],
@@ -1785,7 +2020,7 @@ def run_automq_metadata_failover_scenario(tmp):
             stream_id,
             expected_epoch=2,
             expected_start_offset=5,
-            expected_end_offset=10,
+            expected_end_offset=20,
         )
         wait_for_automq_stream_missing(processes[leader_id]["broker_port"], deleted_stream_id)
         wait_for_automq_opening_stream_missing(
@@ -1793,6 +2028,8 @@ def run_automq_metadata_failover_scenario(tmp):
             stream_owner_node_id,
             deleted_stream_id,
         )
+        wait_for_automq_manifest_streams(processes[leader_id]["broker_port"], 1)
+        wait_for_automq_partition_snapshot(processes[leader_id]["broker_port"], 2, 0)
         wait_for_automq_node(
             processes[leader_id]["broker_port"],
             registered_node_id,
@@ -1806,6 +2043,7 @@ def run_automq_metadata_failover_scenario(tmp):
             "new_leader": replacement_leader,
             "stream_id": stream_id,
             "deleted_stream_id": deleted_stream_id,
+            "stream_set_object_id": stream_set_object_id,
             "registered_node_id": registered_node_id,
             "zone_router_epoch": zone_router_epoch_after,
             "epoch": after["leader_epoch"],
@@ -1948,6 +2186,7 @@ def main():
             f"automq_new_leader={automq_result['new_leader']}, "
             f"automq_stream_id={automq_result['stream_id']}, "
             f"automq_deleted_stream_id={automq_result['deleted_stream_id']}, "
+            f"automq_stream_set_object_id={automq_result['stream_set_object_id']}, "
             f"automq_node_id={automq_result['registered_node_id']}, "
             f"automq_zone_router_epoch={automq_result['zone_router_epoch']})"
         )
