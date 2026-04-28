@@ -4504,6 +4504,7 @@ pub const Broker = struct {
 
         if (deleted_any) {
             self.persistTopics();
+            self.persistPartitionReassignments();
             self.persistObjectManagerSnapshot();
         }
 
@@ -4557,6 +4558,7 @@ pub const Broker = struct {
         if (self.topics.fetchRemove(topic_name)) |removed| {
             const info = removed.value;
             const topic_id = info.topic_id;
+            _ = self.clearPartitionReassignmentsForTopic(topic_name);
             for (0..@as(usize, @intCast(info.num_partitions))) |pi| {
                 const stream_id = PartitionStore.hashPartitionKey(topic_name, @intCast(pi));
                 self.object_manager.deleteStream(stream_id) catch {};
@@ -4582,6 +4584,31 @@ pub const Broker = struct {
             .topic_id = zeroUuid(),
             .deleted = false,
         };
+    }
+
+    fn clearPartitionReassignmentsForTopic(self: *Broker, topic_name: []const u8) bool {
+        var removed_any = false;
+        while (true) {
+            var key_to_remove: ?[]const u8 = null;
+            var it = self.partition_reassignments.iterator();
+            while (it.next()) |entry| {
+                if (std.mem.eql(u8, entry.value_ptr.topic, topic_name)) {
+                    key_to_remove = entry.key_ptr.*;
+                    break;
+                }
+            }
+
+            const key = key_to_remove orelse break;
+            if (self.partition_reassignments.fetchRemove(key)) |removed| {
+                self.allocator.free(removed.key);
+                var value = removed.value;
+                value.deinit(self.allocator);
+                removed_any = true;
+            } else {
+                break;
+            }
+        }
+        return removed_any;
     }
 
     fn zeroUuid() [16]u8 {
@@ -15867,6 +15894,38 @@ test "Broker.handleRequest DeleteTopics v6 deletes by topic id and returns gener
     try testing.expectEqualSlices(u8, &topic_id, &resp.responses[0].topic_id);
     try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.none)), resp.responses[0].error_code);
     try testing.expect(!broker.topics.contains("dt-v6-topic"));
+}
+
+test "Broker.handleRequest DeleteTopics clears ongoing reassignments for deleted topic" {
+    const AlterReq = generated.alter_partition_reassignments_request.AlterPartitionReassignmentsRequest;
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+
+    try testing.expect(broker.ensureTopic("dt-reassign-topic"));
+    const remote_replicas = [_]i32{2};
+    const reassignment = AlterReq.ReassignableTopic.ReassignablePartition{
+        .partition_index = 0,
+        .replicas = &remote_replicas,
+    };
+    try testing.expectEqual(
+        @as(i16, @intFromEnum(ErrorCode.none)),
+        try broker.applyPartitionReassignment("dt-reassign-topic", broker.topics.get("dt-reassign-topic"), reassignment),
+    );
+    try testing.expectEqual(@as(u32, 1), broker.partition_reassignments.count());
+
+    var buf: [512]u8 = undefined;
+    var pos = buildTestRequest(&buf, 20, 0, 201, 1);
+    ser.writeI32(&buf, &pos, 1);
+    ser.writeString(&buf, &pos, "dt-reassign-topic");
+    ser.writeI32(&buf, &pos, 30000);
+
+    const resp = broker.handleRequest(buf[0..pos]);
+    try testing.expect(resp != null);
+    defer testing.allocator.free(resp.?);
+
+    try testing.expect(!broker.topics.contains("dt-reassign-topic"));
+    try testing.expectEqual(@as(u32, 0), broker.partition_reassignments.count());
 }
 
 test "Broker.handleRequest DeleteTopics rejects truncated request" {
