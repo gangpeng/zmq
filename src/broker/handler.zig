@@ -1712,6 +1712,7 @@ pub const Broker = struct {
             46 => self.handleListPartitionReassignments(request_bytes, pos, &req_header, api_version, resp_header_version),
             // OffsetDelete (key 47) — delete committed offsets
             47 => self.handleOffsetDelete(request_bytes, pos, &req_header, api_version, resp_header_version),
+            48 => self.handleDescribeClientQuotas(request_bytes, pos, &req_header, api_version, resp_header_version),
             60 => self.handleDescribeCluster(request_bytes, pos, &req_header, api_version, resp_header_version),
             61 => self.handleDescribeProducers(request_bytes, pos, &req_header, api_version, resp_header_version),
             52 => self.handleVote(request_bytes, pos, &req_header, api_version, resp_header_version),
@@ -1862,7 +1863,7 @@ pub const Broker = struct {
             0, 1, 2 => .topic, // Produce, Fetch, ListOffsets
             8, 9, 10, 11, 12, 13, 14, 15, 16, 42, 47 => .group, // group-related
             22, 24, 26, 27, 28, 65, 66 => .transactional_id, // txn-related
-            3, 18, 19, 20, 32, 33, 35, 37, 43, 44, 45, 46, 75 => .cluster, // metadata/admin
+            3, 18, 19, 20, 32, 33, 35, 37, 43, 44, 45, 46, 48, 75 => .cluster, // metadata/admin
             501...519, 600...602 => .cluster, // AutoMQ stream/object/controller extensions
             else => .unknown,
         };
@@ -1873,7 +1874,7 @@ pub const Broker = struct {
         return switch (api_key) {
             0 => .write, // Produce
             1 => .read, // Fetch
-            2, 9, 15, 16, 23, 29, 32, 35, 46, 55, 60, 61, 65, 66, 75 => .describe, // ListOffsets, OffsetFetch, Describe*
+            2, 9, 15, 16, 23, 29, 32, 35, 46, 48, 55, 60, 61, 65, 66, 75 => .describe, // ListOffsets, OffsetFetch, Describe*
             3, 18 => .describe, // Metadata, ApiVersions
             8 => .read, // OffsetCommit
             10, 11, 12, 13, 14 => .read, // Group ops
@@ -7438,6 +7439,165 @@ pub const Broker = struct {
     }
 
     // ---------------------------------------------------------------
+    // DescribeClientQuotas (key 48)
+    // ---------------------------------------------------------------
+    fn handleDescribeClientQuotas(self: *Broker, request_bytes: []const u8, body_start: usize, req_header: *const RequestHeader, api_version: i16, resp_header_version: i16) ?[]u8 {
+        const Req = generated.describe_client_quotas_request.DescribeClientQuotasRequest;
+        const Resp = generated.describe_client_quotas_response.DescribeClientQuotasResponse;
+
+        if (!validateDescribeClientQuotasRequestFrame(request_bytes, body_start, api_version)) {
+            log.warn("Malformed DescribeClientQuotas request", .{});
+            return null;
+        }
+
+        var pos = body_start;
+        var req = Req.deserialize(self.allocator, request_bytes, &pos, api_version) catch |err| {
+            log.warn("Failed to decode DescribeClientQuotas request: {}", .{err});
+            return null;
+        };
+        defer self.freeDescribeClientQuotasRequest(&req);
+
+        const request_error = describeClientQuotasRequestError(req);
+        const entries = if (request_error == @intFromEnum(ErrorCode.none))
+            (self.collectDescribeClientQuotaEntries(req) catch return null)
+        else
+            &[_]Resp.EntryData{};
+        defer if (entries.len > 0) self.freeDescribeClientQuotaEntries(entries);
+
+        const resp = Resp{
+            .throttle_time_ms = 0,
+            .error_code = request_error,
+            .error_message = if (request_error == @intFromEnum(ErrorCode.none)) null else "Invalid client quota filter",
+            .entries = entries,
+        };
+        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+    }
+
+    fn freeDescribeClientQuotasRequest(self: *Broker, req: *generated.describe_client_quotas_request.DescribeClientQuotasRequest) void {
+        if (req.components.len > 0) self.allocator.free(req.components);
+    }
+
+    fn describeClientQuotasRequestError(req: generated.describe_client_quotas_request.DescribeClientQuotasRequest) i16 {
+        for (req.components) |component| {
+            if (component.entity_type == null) return @intFromEnum(ErrorCode.invalid_request);
+            if (component.match_type < 0 or component.match_type > 2) return @intFromEnum(ErrorCode.invalid_request);
+        }
+        return @intFromEnum(ErrorCode.none);
+    }
+
+    fn collectDescribeClientQuotaEntries(self: *Broker, req: generated.describe_client_quotas_request.DescribeClientQuotasRequest) ![]generated.describe_client_quotas_response.DescribeClientQuotasResponse.EntryData {
+        const EntryData = generated.describe_client_quotas_response.DescribeClientQuotasResponse.EntryData;
+
+        var entries = std.array_list.Managed(EntryData).init(self.allocator);
+        errdefer {
+            self.freeDescribeClientQuotaEntryContents(entries.items);
+            entries.deinit();
+        }
+
+        if (self.quota_manager.default_produce_rate > 0 or self.quota_manager.default_fetch_rate > 0 or self.quota_manager.default_request_rate > 0) {
+            if (describeClientQuotaMatches(req, null)) {
+                if (try self.buildDescribeClientQuotaEntry(null, self.quota_manager.default_produce_rate, self.quota_manager.default_fetch_rate, self.quota_manager.default_request_rate)) |entry| {
+                    try entries.append(entry);
+                }
+            }
+        }
+
+        var it = self.quota_manager.client_quotas.iterator();
+        while (it.next()) |entry| {
+            const quota = entry.value_ptr;
+            if (!describeClientQuotaMatches(req, quota.client_id)) continue;
+            if (try self.buildDescribeClientQuotaEntry(quota.client_id, quota.produce_rate_limit, quota.fetch_rate_limit, quota.request_rate_limit)) |response_entry| {
+                try entries.append(response_entry);
+            }
+        }
+
+        if (entries.items.len == 0) return &.{};
+        return entries.toOwnedSlice();
+    }
+
+    fn describeClientQuotaMatches(req: generated.describe_client_quotas_request.DescribeClientQuotasRequest, entity_name: ?[]const u8) bool {
+        if (req.components.len == 0) return true;
+
+        const is_default = entity_name == null;
+        var saw_client_id_component = false;
+        for (req.components) |component| {
+            const entity_type = component.entity_type orelse return false;
+            if (!std.mem.eql(u8, entity_type, "client-id")) {
+                if (req.strict) return false;
+                continue;
+            }
+
+            saw_client_id_component = true;
+            switch (component.match_type) {
+                0 => {
+                    if (component.match) |matched_name| {
+                        if (is_default) return false;
+                        if (!std.mem.eql(u8, matched_name, entity_name.?)) return false;
+                    } else if (!is_default) {
+                        return false;
+                    }
+                },
+                1 => {
+                    if (!is_default) return false;
+                },
+                2 => {
+                    if (is_default) return false;
+                },
+                else => return false,
+            }
+        }
+
+        return saw_client_id_component or !req.strict;
+    }
+
+    fn buildDescribeClientQuotaEntry(self: *Broker, entity_name: ?[]const u8, producer_rate: f64, consumer_rate: f64, request_rate: f64) !?generated.describe_client_quotas_response.DescribeClientQuotasResponse.EntryData {
+        const EntryData = generated.describe_client_quotas_response.DescribeClientQuotasResponse.EntryData;
+        const EntityData = EntryData.EntityData;
+        const ValueData = EntryData.ValueData;
+
+        const value_count = @as(usize, @intFromBool(producer_rate > 0)) +
+            @as(usize, @intFromBool(consumer_rate > 0)) +
+            @as(usize, @intFromBool(request_rate > 0));
+        if (value_count == 0) return null;
+
+        const entity = try self.allocator.alloc(EntityData, 1);
+        errdefer self.allocator.free(entity);
+        entity[0] = .{
+            .entity_type = "client-id",
+            .entity_name = entity_name,
+        };
+
+        const values = try self.allocator.alloc(ValueData, value_count);
+        errdefer self.allocator.free(values);
+        var idx: usize = 0;
+        if (producer_rate > 0) {
+            values[idx] = .{ .key = "producer_byte_rate", .value = producer_rate };
+            idx += 1;
+        }
+        if (consumer_rate > 0) {
+            values[idx] = .{ .key = "consumer_byte_rate", .value = consumer_rate };
+            idx += 1;
+        }
+        if (request_rate > 0) {
+            values[idx] = .{ .key = "request_percentage", .value = request_rate };
+        }
+
+        return .{ .entity = entity, .values = values };
+    }
+
+    fn freeDescribeClientQuotaEntries(self: *Broker, entries: []const generated.describe_client_quotas_response.DescribeClientQuotasResponse.EntryData) void {
+        self.freeDescribeClientQuotaEntryContents(entries);
+        self.allocator.free(entries);
+    }
+
+    fn freeDescribeClientQuotaEntryContents(self: *Broker, entries: []const generated.describe_client_quotas_response.DescribeClientQuotasResponse.EntryData) void {
+        for (entries) |entry| {
+            if (entry.entity.len > 0) self.allocator.free(entry.entity);
+            if (entry.values.len > 0) self.allocator.free(entry.values);
+        }
+    }
+
+    // ---------------------------------------------------------------
     // Unsupported
     // ---------------------------------------------------------------
     fn handleUnsupported(self: *Broker, req_header: *const RequestHeader, api_key: i16, resp_header_version: i16) ?[]u8 {
@@ -9996,6 +10156,24 @@ pub const Broker = struct {
         return true;
     }
 
+    fn validateDescribeClientQuotasRequestFrame(buf: []const u8, start_pos: usize, api_version: i16) bool {
+        const flexible = api_version >= 1;
+        var pos = start_pos;
+
+        const components = readKafkaArrayHeader(buf, &pos, flexible) orelse return false;
+        if (components.is_null) return false;
+        for (0..components.count) |_| {
+            if (!skipKafkaString(buf, &pos, flexible)) return false; // entity_type
+            if (!skipFixedBytes(buf, &pos, 1)) return false; // match_type
+            if (!skipKafkaString(buf, &pos, flexible)) return false; // match
+            if (flexible) ser.skipTaggedFields(buf, &pos) catch return false;
+        }
+
+        if (!skipFixedBytes(buf, &pos, 1)) return false; // strict
+        if (flexible) ser.skipTaggedFields(buf, &pos) catch return false;
+        return true;
+    }
+
     fn validateOffsetForLeaderEpochRequestFrame(buf: []const u8, start_pos: usize, api_version: i16) bool {
         const flexible = api_version >= 4;
         var pos = start_pos;
@@ -11489,6 +11667,14 @@ fn freeDeserializedDescribeTopicPartitionsResponse(resp: *const generated.descri
         if (topic.partitions.len > 0) testing.allocator.free(topic.partitions);
     }
     if (resp.topics.len > 0) testing.allocator.free(resp.topics);
+}
+
+fn freeDeserializedDescribeClientQuotasResponse(resp: *const generated.describe_client_quotas_response.DescribeClientQuotasResponse) void {
+    for (resp.entries) |entry| {
+        if (entry.entity.len > 0) testing.allocator.free(entry.entity);
+        if (entry.values.len > 0) testing.allocator.free(entry.values);
+    }
+    if (resp.entries.len > 0) testing.allocator.free(resp.entries);
 }
 
 fn appendInternalRaftAppendEntriesPayload(
@@ -14749,6 +14935,140 @@ test "Broker.handleRequest OffsetDelete rejects truncated request" {
 
     var buf: [128]u8 = undefined;
     const req_len = buildTestRequest(&buf, 47, 0, 4701, header_mod.requestHeaderVersion(47, 0));
+    try testing.expect(broker.handleRequest(buf[0..req_len]) == null);
+}
+
+test "Broker.handleRequest DescribeClientQuotas v0 returns configured client quotas" {
+    const Req = generated.describe_client_quotas_request.DescribeClientQuotasRequest;
+    const Resp = generated.describe_client_quotas_response.DescribeClientQuotasResponse;
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+    try broker.quota_manager.setClientQuota("quota-client", 1000.0, 2000.0, 0.0);
+
+    const components = [_]Req.ComponentData{.{
+        .entity_type = "client-id",
+        .match_type = 0,
+        .match = "quota-client",
+    }};
+    const req = Req{
+        .components = &components,
+        .strict = true,
+    };
+
+    var buf: [512]u8 = undefined;
+    var pos = buildTestRequest(&buf, 48, 0, 4800, header_mod.requestHeaderVersion(48, 0));
+    req.serialize(&buf, &pos, 0);
+
+    const response = broker.handleRequest(buf[0..pos]);
+    try testing.expect(response != null);
+    defer testing.allocator.free(response.?);
+
+    var rpos: usize = 0;
+    var response_header = try ResponseHeader.deserialize(testing.allocator, response.?, &rpos, header_mod.responseHeaderVersion(48, 0));
+    defer response_header.deinit(testing.allocator);
+    try testing.expectEqual(@as(i32, 4800), response_header.correlation_id);
+
+    const resp = try Resp.deserialize(testing.allocator, response.?, &rpos, 0);
+    defer freeDeserializedDescribeClientQuotasResponse(&resp);
+
+    try testing.expectEqual(response.?.len, rpos);
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.none)), resp.error_code);
+    try testing.expect(resp.error_message == null);
+    try testing.expectEqual(@as(usize, 1), resp.entries.len);
+    try testing.expectEqual(@as(usize, 1), resp.entries[0].entity.len);
+    try testing.expectEqualStrings("client-id", resp.entries[0].entity[0].entity_type.?);
+    try testing.expectEqualStrings("quota-client", resp.entries[0].entity[0].entity_name.?);
+    try testing.expectEqual(@as(usize, 2), resp.entries[0].values.len);
+    try testing.expectEqualStrings("producer_byte_rate", resp.entries[0].values[0].key.?);
+    try testing.expectEqual(@as(f64, 1000.0), resp.entries[0].values[0].value);
+    try testing.expectEqualStrings("consumer_byte_rate", resp.entries[0].values[1].key.?);
+    try testing.expectEqual(@as(f64, 2000.0), resp.entries[0].values[1].value);
+}
+
+test "Broker.handleRequest DescribeClientQuotas v1 returns empty generated response when unmatched" {
+    const Req = generated.describe_client_quotas_request.DescribeClientQuotasRequest;
+    const Resp = generated.describe_client_quotas_response.DescribeClientQuotasResponse;
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+
+    const components = [_]Req.ComponentData{.{
+        .entity_type = "client-id",
+        .match_type = 2,
+        .match = null,
+    }};
+    const req = Req{
+        .components = &components,
+        .strict = false,
+    };
+
+    var buf: [512]u8 = undefined;
+    var pos = buildTestRequest(&buf, 48, 1, 4801, header_mod.requestHeaderVersion(48, 1));
+    req.serialize(&buf, &pos, 1);
+
+    const response = broker.handleRequest(buf[0..pos]);
+    try testing.expect(response != null);
+    defer testing.allocator.free(response.?);
+
+    var rpos: usize = 0;
+    var response_header = try ResponseHeader.deserialize(testing.allocator, response.?, &rpos, header_mod.responseHeaderVersion(48, 1));
+    defer response_header.deinit(testing.allocator);
+    try testing.expectEqual(@as(i32, 4801), response_header.correlation_id);
+
+    const resp = try Resp.deserialize(testing.allocator, response.?, &rpos, 1);
+    defer freeDeserializedDescribeClientQuotasResponse(&resp);
+
+    try testing.expectEqual(response.?.len, rpos);
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.none)), resp.error_code);
+    try testing.expectEqual(@as(usize, 0), resp.entries.len);
+}
+
+test "Broker.handleRequest DescribeClientQuotas rejects invalid match type" {
+    const Req = generated.describe_client_quotas_request.DescribeClientQuotasRequest;
+    const Resp = generated.describe_client_quotas_response.DescribeClientQuotasResponse;
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+
+    const components = [_]Req.ComponentData{.{
+        .entity_type = "client-id",
+        .match_type = 9,
+        .match = null,
+    }};
+    const req = Req{
+        .components = &components,
+        .strict = false,
+    };
+
+    var buf: [512]u8 = undefined;
+    var pos = buildTestRequest(&buf, 48, 1, 4802, header_mod.requestHeaderVersion(48, 1));
+    req.serialize(&buf, &pos, 1);
+
+    const response = broker.handleRequest(buf[0..pos]);
+    try testing.expect(response != null);
+    defer testing.allocator.free(response.?);
+
+    var rpos: usize = 0;
+    var response_header = try ResponseHeader.deserialize(testing.allocator, response.?, &rpos, header_mod.responseHeaderVersion(48, 1));
+    defer response_header.deinit(testing.allocator);
+    try testing.expectEqual(@as(i32, 4802), response_header.correlation_id);
+
+    const resp = try Resp.deserialize(testing.allocator, response.?, &rpos, 1);
+    defer freeDeserializedDescribeClientQuotasResponse(&resp);
+
+    try testing.expectEqual(response.?.len, rpos);
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.invalid_request)), resp.error_code);
+    try testing.expect(resp.error_message != null);
+    try testing.expectEqual(@as(usize, 0), resp.entries.len);
+}
+
+test "Broker.handleRequest DescribeClientQuotas rejects truncated request" {
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+
+    var buf: [128]u8 = undefined;
+    const req_len = buildTestRequest(&buf, 48, 1, 4803, header_mod.requestHeaderVersion(48, 1));
     try testing.expect(broker.handleRequest(buf[0..req_len]) == null);
 }
 
