@@ -16,6 +16,7 @@ pub const TransactionCoordinator = struct {
     allocator: Allocator,
     /// Set to true when state changes; cleared after persistence save.
     dirty: bool = false,
+    pub const default_transaction_timeout_ms: i32 = 60000;
 
     pub const TxnStatus = enum {
         empty,
@@ -79,6 +80,14 @@ pub const TransactionCoordinator = struct {
     /// InitProducerId: allocate or recover a producer ID + epoch.
     /// Producer epoch fencing — increment epoch per call for existing transactional_id.
     pub fn initProducerId(self: *TransactionCoordinator, transactional_id: ?[]const u8) !InitProducerIdResult {
+        return self.initProducerIdWithTimeout(transactional_id, default_transaction_timeout_ms);
+    }
+
+    pub fn initProducerIdWithTimeout(self: *TransactionCoordinator, transactional_id: ?[]const u8, transaction_timeout_ms: i32) !InitProducerIdResult {
+        if (validateTransactionTimeout(transactional_id, transaction_timeout_ms)) |error_code| {
+            return initProducerIdError(error_code);
+        }
+
         // Check if transactional_id already has a producer_id assigned (epoch fencing)
         if (transactional_id) |tid| {
             var existing_producer_id: ?i64 = null;
@@ -92,7 +101,7 @@ pub const TransactionCoordinator = struct {
                     }
                 }
             }
-            if (existing_producer_id) |pid| return self.bumpProducerEpoch(pid);
+            if (existing_producer_id) |pid| return self.bumpProducerEpoch(pid, transaction_timeout_ms);
         }
 
         const pid = self.next_producer_id;
@@ -108,6 +117,7 @@ pub const TransactionCoordinator = struct {
             .status = .empty,
             .partitions = std.array_list.Managed(TransactionState.TopicPartition).init(self.allocator),
             .start_time_ms = @import("time_compat").milliTimestamp(),
+            .timeout_ms = if (transactional_id != null) transaction_timeout_ms else default_transaction_timeout_ms,
         });
 
         self.dirty = true;
@@ -119,8 +129,16 @@ pub const TransactionCoordinator = struct {
     }
 
     pub fn initProducerIdForRequest(self: *TransactionCoordinator, transactional_id: ?[]const u8, producer_id: i64, producer_epoch: i16) !InitProducerIdResult {
+        return self.initProducerIdForRequestWithTimeout(transactional_id, default_transaction_timeout_ms, producer_id, producer_epoch);
+    }
+
+    pub fn initProducerIdForRequestWithTimeout(self: *TransactionCoordinator, transactional_id: ?[]const u8, transaction_timeout_ms: i32, producer_id: i64, producer_epoch: i16) !InitProducerIdResult {
+        if (validateTransactionTimeout(transactional_id, transaction_timeout_ms)) |error_code| {
+            return initProducerIdError(error_code);
+        }
+
         if (producer_id == -1 and producer_epoch == -1) {
-            return self.initProducerId(transactional_id);
+            return self.initProducerIdWithTimeout(transactional_id, transaction_timeout_ms);
         }
 
         if (producer_id < 0 or producer_epoch < 0) {
@@ -139,7 +157,7 @@ pub const TransactionCoordinator = struct {
             return initProducerIdError(@intFromEnum(ErrorCode.invalid_producer_epoch));
         }
 
-        return self.bumpProducerEpoch(producer_id);
+        return self.bumpProducerEpoch(producer_id, transaction_timeout_ms);
     }
 
     pub const InitProducerIdResult = struct {
@@ -164,7 +182,14 @@ pub const TransactionCoordinator = struct {
         return stored == null;
     }
 
-    fn bumpProducerEpoch(self: *TransactionCoordinator, producer_id: i64) !InitProducerIdResult {
+    fn validateTransactionTimeout(transactional_id: ?[]const u8, transaction_timeout_ms: i32) ?i16 {
+        if (transactional_id != null and transaction_timeout_ms <= 0) {
+            return @intFromEnum(ErrorCode.invalid_transaction_timeout);
+        }
+        return null;
+    }
+
+    fn bumpProducerEpoch(self: *TransactionCoordinator, producer_id: i64, transaction_timeout_ms: i32) !InitProducerIdResult {
         const txn = self.transactions.getPtr(producer_id) orelse {
             return initProducerIdError(@intFromEnum(ErrorCode.invalid_producer_id_mapping));
         };
@@ -181,6 +206,7 @@ pub const TransactionCoordinator = struct {
             txn.status = .empty;
             txn.clearPartitions(self.allocator);
             txn.start_time_ms = @import("time_compat").milliTimestamp();
+            if (txn.transactional_id != null) txn.timeout_ms = transaction_timeout_ms;
             const txn_copy = txn.*;
             _ = self.transactions.fetchRemove(old_pid);
             try self.transactions.put(new_pid, txn_copy);
@@ -196,6 +222,7 @@ pub const TransactionCoordinator = struct {
         txn.status = .empty;
         txn.clearPartitions(self.allocator);
         txn.start_time_ms = @import("time_compat").milliTimestamp();
+        if (txn.transactional_id != null) txn.timeout_ms = transaction_timeout_ms;
         self.dirty = true;
         return .{
             .error_code = 0,
@@ -778,6 +805,35 @@ test "TransactionCoordinator initProducerIdForRequest recovers non-transactional
     try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.none)), r2.error_code);
     try testing.expectEqual(r1.producer_id, r2.producer_id);
     try testing.expectEqual(@as(i16, 1), r2.producer_epoch);
+}
+
+test "TransactionCoordinator InitProducerId applies transactional timeout" {
+    var coord = TransactionCoordinator.init(testing.allocator);
+    defer coord.deinit();
+
+    const r1 = try coord.initProducerIdWithTimeout("timeout-txn", 1234);
+    try testing.expectEqual(@as(i32, 1234), coord.transactions.get(r1.producer_id).?.timeout_ms);
+
+    const r2 = try coord.initProducerIdForRequestWithTimeout("timeout-txn", 2345, r1.producer_id, r1.producer_epoch);
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.none)), r2.error_code);
+    try testing.expectEqual(r1.producer_id, r2.producer_id);
+    try testing.expectEqual(@as(i16, 1), r2.producer_epoch);
+    try testing.expectEqual(@as(i32, 2345), coord.transactions.get(r1.producer_id).?.timeout_ms);
+}
+
+test "TransactionCoordinator InitProducerId validates transactional timeout" {
+    var coord = TransactionCoordinator.init(testing.allocator);
+    defer coord.deinit();
+
+    const invalid = try coord.initProducerIdWithTimeout("bad-timeout-txn", 0);
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.invalid_transaction_timeout)), invalid.error_code);
+    try testing.expectEqual(@as(i64, -1), invalid.producer_id);
+    try testing.expectEqual(@as(i16, -1), invalid.producer_epoch);
+    try testing.expectEqual(@as(usize, 0), coord.transactionCount());
+
+    const non_txn = try coord.initProducerIdWithTimeout(null, 0);
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.none)), non_txn.error_code);
+    try testing.expectEqual(@as(i32, TransactionCoordinator.default_transaction_timeout_ms), coord.transactions.get(non_txn.producer_id).?.timeout_ms);
 }
 
 // ---------------------------------------------------------------

@@ -4806,7 +4806,7 @@ pub const Broker = struct {
             return null;
         };
 
-        const result = self.txn_coordinator.initProducerIdForRequest(req.transactional_id, req.producer_id, req.producer_epoch) catch return null;
+        const result = self.txn_coordinator.initProducerIdForRequestWithTimeout(req.transactional_id, req.transaction_timeout_ms, req.producer_id, req.producer_epoch) catch return null;
         self.persistTransactionsIfDirty();
         const resp = Resp{
             .throttle_time_ms = 0,
@@ -14320,6 +14320,66 @@ test "Broker.handleRequest InitProducerId v4 validates requested producer epoch"
     try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.invalid_producer_epoch)), resp3.error_code);
     try testing.expectEqual(@as(i64, -1), resp3.producer_id);
     try testing.expectEqual(@as(i16, -1), resp3.producer_epoch);
+}
+
+test "Broker.handleRequest InitProducerId v4 applies and validates transaction timeout" {
+    const Req = generated.init_producer_id_request.InitProducerIdRequest;
+    const Resp = generated.init_producer_id_response.InitProducerIdResponse;
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+
+    const valid_req = Req{
+        .transactional_id = "init-timeout-txn",
+        .transaction_timeout_ms = 1234,
+        .producer_id = -1,
+        .producer_epoch = -1,
+    };
+
+    var valid_buf: [512]u8 = undefined;
+    var valid_pos = buildTestRequest(&valid_buf, 22, 4, 2213, header_mod.requestHeaderVersion(22, 4));
+    valid_req.serialize(&valid_buf, &valid_pos, 4);
+
+    const valid_response = broker.handleRequest(valid_buf[0..valid_pos]);
+    try testing.expect(valid_response != null);
+    defer testing.allocator.free(valid_response.?);
+
+    var valid_rpos: usize = 0;
+    var valid_header = try ResponseHeader.deserialize(testing.allocator, valid_response.?, &valid_rpos, header_mod.responseHeaderVersion(22, 4));
+    defer valid_header.deinit(testing.allocator);
+    try testing.expectEqual(@as(i32, 2213), valid_header.correlation_id);
+
+    const valid_resp = try Resp.deserialize(testing.allocator, valid_response.?, &valid_rpos, 4);
+    try testing.expectEqual(valid_response.?.len, valid_rpos);
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.none)), valid_resp.error_code);
+    try testing.expectEqual(@as(i32, 1234), broker.txn_coordinator.transactions.get(valid_resp.producer_id).?.timeout_ms);
+
+    const invalid_req = Req{
+        .transactional_id = "init-invalid-timeout-txn",
+        .transaction_timeout_ms = 0,
+        .producer_id = -1,
+        .producer_epoch = -1,
+    };
+
+    var invalid_buf: [512]u8 = undefined;
+    var invalid_pos = buildTestRequest(&invalid_buf, 22, 4, 2214, header_mod.requestHeaderVersion(22, 4));
+    invalid_req.serialize(&invalid_buf, &invalid_pos, 4);
+
+    const invalid_response = broker.handleRequest(invalid_buf[0..invalid_pos]);
+    try testing.expect(invalid_response != null);
+    defer testing.allocator.free(invalid_response.?);
+
+    var invalid_rpos: usize = 0;
+    var invalid_header = try ResponseHeader.deserialize(testing.allocator, invalid_response.?, &invalid_rpos, header_mod.responseHeaderVersion(22, 4));
+    defer invalid_header.deinit(testing.allocator);
+    try testing.expectEqual(@as(i32, 2214), invalid_header.correlation_id);
+
+    const invalid_resp = try Resp.deserialize(testing.allocator, invalid_response.?, &invalid_rpos, 4);
+    try testing.expectEqual(invalid_response.?.len, invalid_rpos);
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.invalid_transaction_timeout)), invalid_resp.error_code);
+    try testing.expectEqual(@as(i64, -1), invalid_resp.producer_id);
+    try testing.expectEqual(@as(i16, -1), invalid_resp.producer_epoch);
+    try testing.expectEqual(@as(usize, 1), broker.txn_coordinator.transactionCount());
 }
 
 test "Broker.handleRequest InitProducerId persists producer allocation" {
