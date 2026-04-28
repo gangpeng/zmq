@@ -355,21 +355,36 @@ pub const GroupCoordinator = struct {
 
     /// Handle Heartbeat request.
     pub fn heartbeat(self: *GroupCoordinator, group_id: []const u8, member_id: []const u8, generation_id: i32) i16 {
-        const group = self.groups.getPtr(group_id) orelse return 16; // COORDINATOR_NOT_AVAILABLE
+        return self.heartbeatWithInstanceId(group_id, member_id, null, generation_id);
+    }
 
-        if (group.generation_id != generation_id) return 22; // ILLEGAL_GENERATION
+    /// Handle Heartbeat request with optional static membership instance id.
+    pub fn heartbeatWithInstanceId(self: *GroupCoordinator, group_id: []const u8, member_id: []const u8, group_instance_id: ?[]const u8, generation_id: i32) i16 {
+        if (group_id.len == 0) return @intFromEnum(ErrorCode.invalid_group_id);
 
-        if (group.members.getPtr(member_id)) |member| {
-            member.last_heartbeat_ms = @import("time_compat").milliTimestamp();
-            // Tell client to rejoin if group is rebalancing
-            if (group.state == .preparing_rebalance or group.state == .completing_rebalance) {
-                log.debug("Heartbeat: signaling REBALANCE_IN_PROGRESS to member {s} in group {s}", .{ member_id, group_id });
-                return 27; // REBALANCE_IN_PROGRESS
+        const group = self.groups.getPtr(group_id) orelse return @intFromEnum(ErrorCode.unknown_member_id);
+        if (group.state == .dead) return @intFromEnum(ErrorCode.coordinator_not_available);
+
+        const member = group.members.getPtr(member_id) orelse return @intFromEnum(ErrorCode.unknown_member_id);
+        if (group_instance_id) |requested_instance_id| {
+            if (member.group_instance_id) |existing_instance_id| {
+                if (!std.mem.eql(u8, existing_instance_id, requested_instance_id)) {
+                    return @intFromEnum(ErrorCode.fenced_instance_id);
+                }
+            } else {
+                return @intFromEnum(ErrorCode.fenced_instance_id);
             }
-            return 0; // OK
         }
 
-        return 25; // UNKNOWN_MEMBER_ID
+        if (group.generation_id != generation_id) return @intFromEnum(ErrorCode.illegal_generation);
+
+        member.last_heartbeat_ms = @import("time_compat").milliTimestamp();
+        // Tell client to rejoin if group is rebalancing
+        if (group.state == .preparing_rebalance or group.state == .completing_rebalance) {
+            log.debug("Heartbeat: signaling REBALANCE_IN_PROGRESS to member {s} in group {s}", .{ member_id, group_id });
+            return @intFromEnum(ErrorCode.rebalance_in_progress);
+        }
+        return @intFromEnum(ErrorCode.none);
     }
 
     /// Handle LeaveGroup request.
@@ -1205,7 +1220,28 @@ test "GroupCoordinator heartbeat nonexistent group" {
     defer coord.deinit();
 
     const err = coord.heartbeat("nonexistent", "member-1", 1);
-    try testing.expectEqual(@as(i16, 16), err); // COORDINATOR_NOT_AVAILABLE
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.unknown_member_id)), err);
+}
+
+test "GroupCoordinator heartbeat validates member before generation" {
+    var coord = GroupCoordinator.init(testing.allocator);
+    defer coord.deinit();
+
+    _ = try coord.joinGroup("heartbeat-validation-group", null, "consumer", null);
+
+    const err = coord.heartbeat("heartbeat-validation-group", "missing-member", 999);
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.unknown_member_id)), err);
+}
+
+test "GroupCoordinator heartbeat fences mismatched static instance id" {
+    var coord = GroupCoordinator.init(testing.allocator);
+    defer coord.deinit();
+
+    const join = try coord.joinGroupWithInstanceId("heartbeat-static-group", null, "instance-a", "consumer", null);
+    coord.groups.getPtr("heartbeat-static-group").?.state = .stable;
+
+    const err = coord.heartbeatWithInstanceId("heartbeat-static-group", join.member_id, "instance-b", join.generation_id);
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.fenced_instance_id)), err);
 }
 
 test "GroupCoordinator leave nonexistent group" {

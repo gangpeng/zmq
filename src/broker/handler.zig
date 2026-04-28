@@ -3682,7 +3682,7 @@ pub const Broker = struct {
             return null;
         };
 
-        const error_code = self.groups.heartbeat(req.group_id orelse "", req.member_id orelse "", req.generation_id);
+        const error_code = self.groups.heartbeatWithInstanceId(req.group_id orelse "", req.member_id orelse "", nonEmptyStringOrNull(req.group_instance_id), req.generation_id);
 
         const resp = Resp{
             .throttle_time_ms = 0,
@@ -18190,7 +18190,7 @@ test "Broker.handleRequest Heartbeat v4 returns generated success response" {
     var broker = Broker.init(testing.allocator, 1, 9092);
     defer broker.deinit();
 
-    const join = try broker.groups.joinGroup("hb-generated-group", null, "consumer", null);
+    const join = try broker.groups.joinGroupWithInstanceId("hb-generated-group", null, "instance-1", "consumer", null);
     broker.groups.groups.getPtr("hb-generated-group").?.state = .stable;
 
     const req = Req{
@@ -18248,7 +18248,42 @@ test "Broker.handleRequest Heartbeat v4 returns generated unknown-group error" {
 
     const resp = try Resp.deserialize(testing.allocator, response.?, &rpos, 4);
     try testing.expectEqual(response.?.len, rpos);
-    try testing.expectEqual(@as(i16, 16), resp.error_code);
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.unknown_member_id)), resp.error_code);
+}
+
+test "Broker.handleRequest Heartbeat v4 fences mismatched static instance id" {
+    const Req = generated.heartbeat_request.HeartbeatRequest;
+    const Resp = generated.heartbeat_response.HeartbeatResponse;
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+
+    const join = try broker.groups.joinGroupWithInstanceId("hb-static-generated-group", null, "instance-a", "consumer", null);
+    broker.groups.groups.getPtr("hb-static-generated-group").?.state = .stable;
+
+    const req = Req{
+        .group_id = "hb-static-generated-group",
+        .generation_id = join.generation_id,
+        .member_id = join.member_id,
+        .group_instance_id = "instance-b",
+    };
+
+    var buf: [512]u8 = undefined;
+    var pos = buildTestRequest(&buf, 12, 4, 1207, header_mod.requestHeaderVersion(12, 4));
+    req.serialize(&buf, &pos, 4);
+
+    const response = broker.handleRequest(buf[0..pos]);
+    try testing.expect(response != null);
+    defer testing.allocator.free(response.?);
+
+    var rpos: usize = 0;
+    var response_header = try ResponseHeader.deserialize(testing.allocator, response.?, &rpos, header_mod.responseHeaderVersion(12, 4));
+    defer response_header.deinit(testing.allocator);
+    try testing.expectEqual(@as(i32, 1207), response_header.correlation_id);
+
+    const resp = try Resp.deserialize(testing.allocator, response.?, &rpos, 4);
+    try testing.expectEqual(response.?.len, rpos);
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.fenced_instance_id)), resp.error_code);
 }
 
 test "Broker.handleRequest Heartbeat rejects truncated request" {
@@ -18425,7 +18460,7 @@ test "Broker error counter increments on API error" {
     var broker = Broker.init(testing.allocator, 1, 9092);
     defer broker.deinit();
 
-    // Send a Heartbeat for an unknown group — this will return error code 16
+    // Send a Heartbeat for an unknown group — this will return UNKNOWN_MEMBER_ID.
     var buf: [512]u8 = undefined;
     var pos = buildTestRequest(&buf, 12, 0, 300, 1);
     ser.writeString(&buf, &pos, "nonexistent-group");
@@ -18437,8 +18472,7 @@ test "Broker error counter increments on API error" {
     defer testing.allocator.free(resp.?);
 
     // Verify the error counter was incremented
-    // Heartbeat for unknown group returns error 16 (COORDINATOR_NOT_AVAILABLE)
-    const key = "kafka_server_api_errors_total{heartbeat,16}";
+    const key = "kafka_server_api_errors_total{heartbeat,25}";
     const entry = broker.metrics.labeled_counters.get(key);
     try testing.expect(entry != null);
     try testing.expect(entry.?.value >= 1);
