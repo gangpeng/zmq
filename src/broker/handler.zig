@@ -11187,6 +11187,43 @@ test "Broker.handleRequest unsupported API returns error response" {
     try testing.expectEqual(@as(i32, 77), corr_id);
 }
 
+test "Broker.handleRequest advertised APIs reject versions above catalog max before body decode" {
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+
+    for (api_support.broker_supported_apis) |api| {
+        if (api.key == 18) continue; // ApiVersions remains probeable for version negotiation.
+
+        const unsupported_version = api.max + 1;
+        const correlation_id: i32 = 900_000 + @as(i32, @intCast(api.key));
+        var buf: [128]u8 = undefined;
+        const req_len = buildTestRequest(
+            &buf,
+            api.key,
+            unsupported_version,
+            correlation_id,
+            header_mod.requestHeaderVersion(api.key, unsupported_version),
+        );
+
+        const response = broker.handleRequest(buf[0..req_len]);
+        try testing.expect(response != null);
+        defer testing.allocator.free(response.?);
+
+        var rpos: usize = 0;
+        var response_header = try ResponseHeader.deserialize(
+            testing.allocator,
+            response.?,
+            &rpos,
+            header_mod.responseHeaderVersion(api.key, unsupported_version),
+        );
+        defer response_header.deinit(testing.allocator);
+
+        try testing.expectEqual(correlation_id, response_header.correlation_id);
+        try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.unsupported_version)), ser.readI16(response.?, &rpos));
+        try testing.expectEqual(response.?.len, rpos);
+    }
+}
+
 test "Broker.handleRequest FindCoordinator v1 returns generated coordinator" {
     const Req = generated.find_coordinator_request.FindCoordinatorRequest;
     const Resp = generated.find_coordinator_response.FindCoordinatorResponse;
