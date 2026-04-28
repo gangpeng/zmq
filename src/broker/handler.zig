@@ -4806,7 +4806,7 @@ pub const Broker = struct {
             return null;
         };
 
-        const result = self.txn_coordinator.initProducerId(req.transactional_id) catch return null;
+        const result = self.txn_coordinator.initProducerIdForRequest(req.transactional_id, req.producer_id, req.producer_epoch) catch return null;
         self.persistTransactionsIfDirty();
         const resp = Resp{
             .throttle_time_ms = 0,
@@ -14230,6 +14230,96 @@ test "Broker.handleRequest InitProducerId v4 returns generated response" {
     try testing.expect(resp.producer_id >= 1);
     try testing.expectEqual(@as(i16, 0), resp.producer_epoch);
     try testing.expect(broker.txn_coordinator.getStatus(resp.producer_id) != null);
+}
+
+test "Broker.handleRequest InitProducerId v4 validates requested producer epoch" {
+    const Req = generated.init_producer_id_request.InitProducerIdRequest;
+    const Resp = generated.init_producer_id_response.InitProducerIdResponse;
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+    try testing.expect(broker.ensureTopic("init-recover-topic"));
+
+    const req1 = Req{
+        .transactional_id = "init-recover-txn",
+        .transaction_timeout_ms = 60000,
+        .producer_id = -1,
+        .producer_epoch = -1,
+    };
+
+    var buf1: [512]u8 = undefined;
+    var pos1 = buildTestRequest(&buf1, 22, 4, 2210, header_mod.requestHeaderVersion(22, 4));
+    req1.serialize(&buf1, &pos1, 4);
+
+    const response1 = broker.handleRequest(buf1[0..pos1]);
+    try testing.expect(response1 != null);
+    defer testing.allocator.free(response1.?);
+
+    var rpos1: usize = 0;
+    var response_header1 = try ResponseHeader.deserialize(testing.allocator, response1.?, &rpos1, header_mod.responseHeaderVersion(22, 4));
+    defer response_header1.deinit(testing.allocator);
+    try testing.expectEqual(@as(i32, 2210), response_header1.correlation_id);
+
+    const resp1 = try Resp.deserialize(testing.allocator, response1.?, &rpos1, 4);
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.none)), resp1.error_code);
+    try testing.expectEqual(@as(i16, 0), resp1.producer_epoch);
+
+    _ = try broker.txn_coordinator.addPartitionsToTxn(resp1.producer_id, resp1.producer_epoch, "init-recover-topic", 0);
+    try testing.expectEqual(TxnCoordinator.TxnStatus.ongoing, broker.txn_coordinator.getStatus(resp1.producer_id).?);
+
+    const req2 = Req{
+        .transactional_id = "init-recover-txn",
+        .transaction_timeout_ms = 60000,
+        .producer_id = resp1.producer_id,
+        .producer_epoch = resp1.producer_epoch,
+    };
+
+    var buf2: [512]u8 = undefined;
+    var pos2 = buildTestRequest(&buf2, 22, 4, 2211, header_mod.requestHeaderVersion(22, 4));
+    req2.serialize(&buf2, &pos2, 4);
+
+    const response2 = broker.handleRequest(buf2[0..pos2]);
+    try testing.expect(response2 != null);
+    defer testing.allocator.free(response2.?);
+
+    var rpos2: usize = 0;
+    var response_header2 = try ResponseHeader.deserialize(testing.allocator, response2.?, &rpos2, header_mod.responseHeaderVersion(22, 4));
+    defer response_header2.deinit(testing.allocator);
+    try testing.expectEqual(@as(i32, 2211), response_header2.correlation_id);
+
+    const resp2 = try Resp.deserialize(testing.allocator, response2.?, &rpos2, 4);
+    try testing.expectEqual(response2.?.len, rpos2);
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.none)), resp2.error_code);
+    try testing.expectEqual(resp1.producer_id, resp2.producer_id);
+    try testing.expectEqual(@as(i16, 1), resp2.producer_epoch);
+    try testing.expectEqual(TxnCoordinator.TxnStatus.empty, broker.txn_coordinator.getStatus(resp1.producer_id).?);
+    try testing.expectEqual(@as(usize, 0), broker.txn_coordinator.getPartitions(resp1.producer_id).?.len);
+
+    const req3 = Req{
+        .transactional_id = "init-recover-txn",
+        .transaction_timeout_ms = 60000,
+        .producer_id = resp1.producer_id,
+        .producer_epoch = resp1.producer_epoch,
+    };
+
+    var buf3: [512]u8 = undefined;
+    var pos3 = buildTestRequest(&buf3, 22, 4, 2212, header_mod.requestHeaderVersion(22, 4));
+    req3.serialize(&buf3, &pos3, 4);
+
+    const response3 = broker.handleRequest(buf3[0..pos3]);
+    try testing.expect(response3 != null);
+    defer testing.allocator.free(response3.?);
+
+    var rpos3: usize = 0;
+    var response_header3 = try ResponseHeader.deserialize(testing.allocator, response3.?, &rpos3, header_mod.responseHeaderVersion(22, 4));
+    defer response_header3.deinit(testing.allocator);
+    try testing.expectEqual(@as(i32, 2212), response_header3.correlation_id);
+
+    const resp3 = try Resp.deserialize(testing.allocator, response3.?, &rpos3, 4);
+    try testing.expectEqual(response3.?.len, rpos3);
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.invalid_producer_epoch)), resp3.error_code);
+    try testing.expectEqual(@as(i64, -1), resp3.producer_id);
+    try testing.expectEqual(@as(i16, -1), resp3.producer_epoch);
 }
 
 test "Broker.handleRequest InitProducerId persists producer allocation" {

@@ -81,49 +81,18 @@ pub const TransactionCoordinator = struct {
     pub fn initProducerId(self: *TransactionCoordinator, transactional_id: ?[]const u8) !InitProducerIdResult {
         // Check if transactional_id already has a producer_id assigned (epoch fencing)
         if (transactional_id) |tid| {
+            var existing_producer_id: ?i64 = null;
             var it = self.transactions.iterator();
             while (it.next()) |entry| {
                 const txn = entry.value_ptr;
                 if (txn.transactional_id) |existing_tid| {
                     if (std.mem.eql(u8, existing_tid, tid)) {
-                        // Found existing — bump epoch (fence old producers)
-                        // Epoch overflow protection: if epoch would exceed i16 max,
-                        // allocate a new producer_id and reset epoch to 0.
-                        // NOTE: AutoMQ/Kafka resets when epoch approaches Short.MAX_VALUE.
-                        if (txn.producer_epoch >= std.math.maxInt(i16) - 1) {
-                            // Epoch exhausted — allocate fresh PID
-                            const new_pid = self.next_producer_id;
-                            self.next_producer_id += 1;
-                            const old_pid = txn.producer_id;
-                            txn.producer_id = new_pid;
-                            txn.producer_epoch = 0;
-                            txn.status = .empty;
-                            txn.clearPartitions(self.allocator);
-                            txn.start_time_ms = @import("time_compat").milliTimestamp();
-                            // Re-index under new PID
-                            const txn_copy = txn.*;
-                            _ = self.transactions.fetchRemove(old_pid);
-                            try self.transactions.put(new_pid, txn_copy);
-                            self.dirty = true;
-                            return .{
-                                .error_code = 0,
-                                .producer_id = new_pid,
-                                .producer_epoch = 0,
-                            };
-                        }
-                        txn.producer_epoch += 1;
-                        txn.status = .empty;
-                        txn.clearPartitions(self.allocator);
-                        txn.start_time_ms = @import("time_compat").milliTimestamp();
-                        self.dirty = true;
-                        return .{
-                            .error_code = 0,
-                            .producer_id = txn.producer_id,
-                            .producer_epoch = txn.producer_epoch,
-                        };
+                        existing_producer_id = txn.producer_id;
+                        break;
                     }
                 }
             }
+            if (existing_producer_id) |pid| return self.bumpProducerEpoch(pid);
         }
 
         const pid = self.next_producer_id;
@@ -149,11 +118,91 @@ pub const TransactionCoordinator = struct {
         };
     }
 
+    pub fn initProducerIdForRequest(self: *TransactionCoordinator, transactional_id: ?[]const u8, producer_id: i64, producer_epoch: i16) !InitProducerIdResult {
+        if (producer_id == -1 and producer_epoch == -1) {
+            return self.initProducerId(transactional_id);
+        }
+
+        if (producer_id < 0 or producer_epoch < 0) {
+            return initProducerIdError(@intFromEnum(ErrorCode.invalid_request));
+        }
+
+        const txn = self.transactions.get(producer_id) orelse {
+            return initProducerIdError(@intFromEnum(ErrorCode.invalid_producer_id_mapping));
+        };
+
+        if (!transactionalIdsMatch(transactional_id, txn.transactional_id)) {
+            return initProducerIdError(@intFromEnum(ErrorCode.invalid_producer_id_mapping));
+        }
+
+        if (txn.producer_epoch != producer_epoch) {
+            return initProducerIdError(@intFromEnum(ErrorCode.invalid_producer_epoch));
+        }
+
+        return self.bumpProducerEpoch(producer_id);
+    }
+
     pub const InitProducerIdResult = struct {
         error_code: i16,
         producer_id: i64,
         producer_epoch: i16,
     };
+
+    fn initProducerIdError(error_code: i16) InitProducerIdResult {
+        return .{
+            .error_code = error_code,
+            .producer_id = -1,
+            .producer_epoch = -1,
+        };
+    }
+
+    fn transactionalIdsMatch(requested: ?[]const u8, stored: ?[]const u8) bool {
+        if (requested) |requested_id| {
+            const stored_id = stored orelse return false;
+            return std.mem.eql(u8, requested_id, stored_id);
+        }
+        return stored == null;
+    }
+
+    fn bumpProducerEpoch(self: *TransactionCoordinator, producer_id: i64) !InitProducerIdResult {
+        const txn = self.transactions.getPtr(producer_id) orelse {
+            return initProducerIdError(@intFromEnum(ErrorCode.invalid_producer_id_mapping));
+        };
+
+        // Epoch overflow protection: if epoch would exceed i16 max,
+        // allocate a new producer_id and reset epoch to 0.
+        // NOTE: AutoMQ/Kafka resets when epoch approaches Short.MAX_VALUE.
+        if (txn.producer_epoch >= std.math.maxInt(i16) - 1) {
+            const new_pid = self.next_producer_id;
+            self.next_producer_id += 1;
+            const old_pid = txn.producer_id;
+            txn.producer_id = new_pid;
+            txn.producer_epoch = 0;
+            txn.status = .empty;
+            txn.clearPartitions(self.allocator);
+            txn.start_time_ms = @import("time_compat").milliTimestamp();
+            const txn_copy = txn.*;
+            _ = self.transactions.fetchRemove(old_pid);
+            try self.transactions.put(new_pid, txn_copy);
+            self.dirty = true;
+            return .{
+                .error_code = 0,
+                .producer_id = new_pid,
+                .producer_epoch = 0,
+            };
+        }
+
+        txn.producer_epoch += 1;
+        txn.status = .empty;
+        txn.clearPartitions(self.allocator);
+        txn.start_time_ms = @import("time_compat").milliTimestamp();
+        self.dirty = true;
+        return .{
+            .error_code = 0,
+            .producer_id = txn.producer_id,
+            .producer_epoch = txn.producer_epoch,
+        };
+    }
 
     /// AddPartitionsToTxn: register partitions in an active transaction.
     /// Validates producer_epoch to reject fenced (zombie) producers.
@@ -676,6 +725,59 @@ test "TransactionCoordinator epoch fencing" {
 
     // Still only 1 transaction entry (reused)
     try testing.expectEqual(@as(usize, 1), coord.transactionCount());
+}
+
+test "TransactionCoordinator initProducerIdForRequest bumps validated producer epoch" {
+    var coord = TransactionCoordinator.init(testing.allocator);
+    defer coord.deinit();
+
+    const r1 = try coord.initProducerId("recover-txn");
+    _ = try coord.addPartitionsToTxn(r1.producer_id, r1.producer_epoch, "topic-a", 0);
+    try testing.expectEqual(TransactionCoordinator.TxnStatus.ongoing, coord.getStatus(r1.producer_id).?);
+
+    const r2 = try coord.initProducerIdForRequest("recover-txn", r1.producer_id, r1.producer_epoch);
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.none)), r2.error_code);
+    try testing.expectEqual(r1.producer_id, r2.producer_id);
+    try testing.expectEqual(@as(i16, 1), r2.producer_epoch);
+    try testing.expectEqual(TransactionCoordinator.TxnStatus.empty, coord.getStatus(r1.producer_id).?);
+    try testing.expectEqual(@as(usize, 0), coord.getPartitions(r1.producer_id).?.len);
+
+    const stale = try coord.initProducerIdForRequest("recover-txn", r1.producer_id, r1.producer_epoch);
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.invalid_producer_epoch)), stale.error_code);
+    try testing.expectEqual(@as(i64, -1), stale.producer_id);
+    try testing.expectEqual(@as(i16, -1), stale.producer_epoch);
+    try testing.expectEqual(@as(i16, 1), coord.transactions.get(r1.producer_id).?.producer_epoch);
+}
+
+test "TransactionCoordinator initProducerIdForRequest validates producer ownership" {
+    var coord = TransactionCoordinator.init(testing.allocator);
+    defer coord.deinit();
+
+    const owner = try coord.initProducerId("owner-txn");
+
+    const wrong_tid = try coord.initProducerIdForRequest("other-txn", owner.producer_id, owner.producer_epoch);
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.invalid_producer_id_mapping)), wrong_tid.error_code);
+    try testing.expectEqual(@as(i64, -1), wrong_tid.producer_id);
+    try testing.expectEqual(@as(i16, -1), wrong_tid.producer_epoch);
+
+    const missing_tid = try coord.initProducerIdForRequest(null, owner.producer_id, owner.producer_epoch);
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.invalid_producer_id_mapping)), missing_tid.error_code);
+    try testing.expectEqual(@as(i16, 0), coord.transactions.get(owner.producer_id).?.producer_epoch);
+
+    const malformed = try coord.initProducerIdForRequest("owner-txn", owner.producer_id, -1);
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.invalid_request)), malformed.error_code);
+}
+
+test "TransactionCoordinator initProducerIdForRequest recovers non-transactional producer" {
+    var coord = TransactionCoordinator.init(testing.allocator);
+    defer coord.deinit();
+
+    const r1 = try coord.initProducerId(null);
+    const r2 = try coord.initProducerIdForRequest(null, r1.producer_id, r1.producer_epoch);
+
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.none)), r2.error_code);
+    try testing.expectEqual(r1.producer_id, r2.producer_id);
+    try testing.expectEqual(@as(i16, 1), r2.producer_epoch);
 }
 
 // ---------------------------------------------------------------
