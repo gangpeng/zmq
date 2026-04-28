@@ -662,6 +662,15 @@ pub const Broker = struct {
             self.persistPartitionStates();
         }
 
+        // Load ongoing partition reassignments after topics are available so
+        // stale entries for deleted or out-of-range partitions can be ignored.
+        const saved_reassignments = try self.persistence.loadPartitionReassignments();
+        defer self.persistence.freePartitionReassignmentEntries(saved_reassignments);
+        try self.restorePartitionReassignments(saved_reassignments);
+        if (saved_reassignments.len > 0) {
+            log.info("Restored {d} partition reassignment(s) from partition_reassignments.meta", .{self.partition_reassignments.count()});
+        }
+
         // Load local AutoMQ controller-style metadata (KV namespace, node registry,
         // license, zone router state, and group promotions).
         var auto_mq_snapshot = try self.persistence.loadAutoMqMetadata();
@@ -919,6 +928,7 @@ pub const Broker = struct {
         self.persistOffsets();
         self.persistPartitionStates();
         self.persistAutoMqMetadata();
+        self.persistPartitionReassignments();
         self.persistObjectManagerSnapshot();
 
         var it = self.topics.iterator();
@@ -1282,6 +1292,13 @@ pub const Broker = struct {
         };
     }
 
+    /// Persist ongoing partition reassignment state to disk (best-effort).
+    fn persistPartitionReassignments(self: *Broker) void {
+        self.persistence.savePartitionReassignments(&self.partition_reassignments) catch |err| {
+            log.warn("Failed to persist partition reassignments: {}", .{err});
+        };
+    }
+
     fn restorePartitionStates(self: *Broker, entries: []const MetadataPersistence.PartitionStateEntry) !void {
         for (entries) |entry| {
             if (entry.partition_id < 0) continue;
@@ -1315,6 +1332,33 @@ pub const Broker = struct {
                     stream.trim(state.log_start_offset);
                 }
             }
+        }
+    }
+
+    fn restorePartitionReassignments(self: *Broker, entries: []const MetadataPersistence.PartitionReassignmentEntry) !void {
+        self.clearPartitionReassignments();
+
+        for (entries) |entry| {
+            if (entry.partition_index < 0) continue;
+            const info = self.topics.get(entry.topic) orelse continue;
+            if (entry.partition_index >= info.num_partitions) continue;
+            if (!validReplicaAssignment(entry.replicas)) continue;
+            if (isLocalReplicaAssignment(entry.replicas, self.node_id)) continue;
+
+            var key_buf: [256]u8 = undefined;
+            const lookup_key = reassignmentKeyBuf(&key_buf, entry.topic, entry.partition_index);
+            if (self.partition_reassignments.fetchRemove(lookup_key)) |removed| {
+                self.allocator.free(removed.key);
+                var value = removed.value;
+                value.deinit(self.allocator);
+            }
+
+            const owned_key = try reassignmentKey(self.allocator, entry.topic, entry.partition_index);
+            errdefer self.allocator.free(owned_key);
+            var restored = try self.partitionReassignmentFromEntry(entry);
+            errdefer restored.deinit(self.allocator);
+
+            try self.partition_reassignments.put(owned_key, restored);
         }
     }
 
@@ -8369,6 +8413,7 @@ pub const Broker = struct {
                 self.allocator.free(removed.key);
                 var value = removed.value;
                 value.deinit(self.allocator);
+                self.persistPartitionReassignments();
                 return @intFromEnum(ErrorCode.none);
             }
             return @intFromEnum(ErrorCode.no_reassignment_in_progress);
@@ -8379,11 +8424,14 @@ pub const Broker = struct {
         }
 
         if (isLocalReplicaAssignment(partition_req.replicas, self.node_id)) {
+            var changed = false;
             if (self.partition_reassignments.fetchRemove(lookup_key)) |removed| {
                 self.allocator.free(removed.key);
                 var value = removed.value;
                 value.deinit(self.allocator);
+                changed = true;
             }
+            if (changed) self.persistPartitionReassignments();
             return @intFromEnum(ErrorCode.none);
         }
 
@@ -8399,6 +8447,7 @@ pub const Broker = struct {
         }
 
         try self.partition_reassignments.put(owned_key, next);
+        self.persistPartitionReassignments();
         return @intFromEnum(ErrorCode.none);
     }
 
@@ -8568,6 +8617,25 @@ pub const Broker = struct {
             .replicas = replicas_copy,
             .adding_replicas = adding,
             .removing_replicas = removing,
+        };
+    }
+
+    fn partitionReassignmentFromEntry(self: *Broker, entry: MetadataPersistence.PartitionReassignmentEntry) !PartitionReassignment {
+        const topic_copy = try self.allocator.dupe(u8, entry.topic);
+        errdefer self.allocator.free(topic_copy);
+        const replicas_copy = try self.allocator.dupe(i32, entry.replicas);
+        errdefer if (replicas_copy.len > 0) self.allocator.free(replicas_copy);
+        const adding_copy = try self.allocator.dupe(i32, entry.adding_replicas);
+        errdefer if (adding_copy.len > 0) self.allocator.free(adding_copy);
+        const removing_copy = try self.allocator.dupe(i32, entry.removing_replicas);
+        errdefer if (removing_copy.len > 0) self.allocator.free(removing_copy);
+
+        return .{
+            .topic = topic_copy,
+            .partition_index = entry.partition_index,
+            .replicas = replicas_copy,
+            .adding_replicas = adding_copy,
+            .removing_replicas = removing_copy,
         };
     }
 
@@ -13631,6 +13699,98 @@ test "Broker.handleRequest partition reassignment alter list and cancel round-tr
     try testing.expect(cancel_response != null);
     defer testing.allocator.free(cancel_response.?);
     try testing.expectEqual(@as(u32, 0), broker.partition_reassignments.count());
+}
+
+test "Broker restores partition reassignment state after restart" {
+    const fs = @import("fs_compat");
+    const tmp_dir = "/tmp/zmq-partition-reassignment-restart-test";
+    fs.deleteTreeAbsolute(tmp_dir) catch {};
+    try fs.makeDirAbsolute(tmp_dir);
+    defer fs.deleteTreeAbsolute(tmp_dir) catch {};
+
+    const AlterReq = generated.alter_partition_reassignments_request.AlterPartitionReassignmentsRequest;
+    const ListReq = generated.list_partition_reassignments_request.ListPartitionReassignmentsRequest;
+    const ListResp = generated.list_partition_reassignments_response.ListPartitionReassignmentsResponse;
+
+    const remote_replicas = [_]i32{2};
+
+    {
+        var broker = Broker.initWithConfig(testing.allocator, 1, 9092, .{ .data_dir = tmp_dir });
+        defer broker.deinit();
+        try broker.open();
+        try testing.expect(broker.ensureTopic("reassign-persist"));
+
+        const alter_partitions = [_]AlterReq.ReassignableTopic.ReassignablePartition{.{
+            .partition_index = 0,
+            .replicas = &remote_replicas,
+        }};
+        const alter_topics = [_]AlterReq.ReassignableTopic{.{
+            .name = "reassign-persist",
+            .partitions = &alter_partitions,
+        }};
+        const alter_req = AlterReq{
+            .timeout_ms = 1000,
+            .topics = &alter_topics,
+        };
+
+        var buf: [1024]u8 = undefined;
+        var pos = buildTestRequest(&buf, 45, 0, 4520, header_mod.requestHeaderVersion(45, 0));
+        alter_req.serialize(&buf, &pos, 0);
+
+        const alter_response = broker.handleRequest(buf[0..pos]);
+        try testing.expect(alter_response != null);
+        defer testing.allocator.free(alter_response.?);
+        try testing.expectEqual(@as(u32, 1), broker.partition_reassignments.count());
+    }
+
+    {
+        var broker = Broker.initWithConfig(testing.allocator, 1, 9092, .{ .data_dir = tmp_dir });
+        defer broker.deinit();
+        try broker.open();
+
+        try testing.expectEqual(@as(u32, 1), broker.partition_reassignments.count());
+
+        const list_partitions = [_]i32{0};
+        const list_topics = [_]ListReq.ListPartitionReassignmentsTopics{.{
+            .name = "reassign-persist",
+            .partition_indexes = &list_partitions,
+        }};
+        const list_req = ListReq{
+            .timeout_ms = 1000,
+            .topics = &list_topics,
+        };
+
+        var buf: [1024]u8 = undefined;
+        var pos = buildTestRequest(&buf, 46, 0, 4620, header_mod.requestHeaderVersion(46, 0));
+        list_req.serialize(&buf, &pos, 0);
+        const list_response = broker.handleRequest(buf[0..pos]);
+        try testing.expect(list_response != null);
+        defer testing.allocator.free(list_response.?);
+
+        var rpos: usize = 0;
+        var list_header = try ResponseHeader.deserialize(testing.allocator, list_response.?, &rpos, header_mod.responseHeaderVersion(46, 0));
+        defer list_header.deinit(testing.allocator);
+        const list_resp = try ListResp.deserialize(testing.allocator, list_response.?, &rpos, 0);
+        defer {
+            for (list_resp.topics) |topic| {
+                for (topic.partitions) |partition| {
+                    if (partition.replicas.len > 0) testing.allocator.free(partition.replicas);
+                    if (partition.adding_replicas.len > 0) testing.allocator.free(partition.adding_replicas);
+                    if (partition.removing_replicas.len > 0) testing.allocator.free(partition.removing_replicas);
+                }
+                if (topic.partitions.len > 0) testing.allocator.free(topic.partitions);
+            }
+            if (list_resp.topics.len > 0) testing.allocator.free(list_resp.topics);
+        }
+
+        try testing.expectEqual(@as(usize, 1), list_resp.topics.len);
+        try testing.expectEqualStrings("reassign-persist", list_resp.topics[0].name.?);
+        try testing.expectEqual(@as(usize, 1), list_resp.topics[0].partitions.len);
+        try testing.expectEqual(@as(i32, 0), list_resp.topics[0].partitions[0].partition_index);
+        try testing.expectEqualSlices(i32, &remote_replicas, list_resp.topics[0].partitions[0].replicas);
+        try testing.expectEqualSlices(i32, &remote_replicas, list_resp.topics[0].partitions[0].adding_replicas);
+        try testing.expectEqualSlices(i32, &[_]i32{1}, list_resp.topics[0].partitions[0].removing_replicas);
+    }
 }
 
 test "Broker.handleRequest partition reassignment APIs reject truncated requests" {

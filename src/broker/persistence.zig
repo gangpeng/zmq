@@ -94,6 +94,28 @@ pub const MetadataPersistence = struct {
         return out;
     }
 
+    fn writeI32Csv(file: fs.File, values: []const i32) !void {
+        const writer = file.writer();
+        for (values, 0..) |value, i| {
+            if (i > 0) try file.writeAll(",");
+            try writer.print("{d}", .{value});
+        }
+    }
+
+    fn parseI32CsvAlloc(allocator: Allocator, text: []const u8) ![]i32 {
+        if (text.len == 0) return &.{};
+
+        var values = std.array_list.Managed(i32).init(allocator);
+        defer values.deinit();
+
+        var fields = std.mem.splitSequence(u8, text, ",");
+        while (fields.next()) |field| {
+            if (field.len == 0) return error.InvalidCsv;
+            try values.append(try std.fmt.parseInt(i32, field, 10));
+        }
+        return values.toOwnedSlice();
+    }
+
     fn freeAutoMqKvEntries(allocator: Allocator, entries: []AutoMqKvEntry) void {
         for (entries) |entry| {
             allocator.free(entry.key);
@@ -284,6 +306,14 @@ pub const MetadataPersistence = struct {
         high_watermark: u64,
         last_stable_offset: u64,
         first_unstable_txn_offset: ?u64,
+    };
+
+    pub const PartitionReassignmentEntry = struct {
+        topic: []u8,
+        partition_index: i32,
+        replicas: []i32,
+        adding_replicas: []i32,
+        removing_replicas: []i32,
     };
 
     /// Save transaction state to disk.
@@ -586,6 +616,128 @@ pub const MetadataPersistence = struct {
 
         log.info("Loaded {d} partition states from partition_state.meta", .{entries.items.len});
         return entries.toOwnedSlice();
+    }
+
+    /// Save ongoing partition reassignment metadata to disk.
+    /// Format: partition_reassignments.meta TSV with hex-encoded topic names and CSV replica sets.
+    pub fn savePartitionReassignments(self: *MetadataPersistence, reassignments: anytype) !void {
+        const dir = self.data_dir orelse return;
+
+        const path = try std.fmt.allocPrint(self.allocator, "{s}/partition_reassignments.meta", .{dir});
+        defer self.allocator.free(path);
+
+        const file = try fs.createFileAbsolute(path, .{ .truncate = true });
+        defer file.close();
+        const writer = file.writer();
+
+        var it = reassignments.iterator();
+        while (it.next()) |entry| {
+            const state = entry.value_ptr;
+            try file.writeAll("reassignment\t");
+            try writeHex(file, state.topic);
+            try writer.print("\t{d}\t", .{state.partition_index});
+            try writeI32Csv(file, state.replicas);
+            try file.writeAll("\t");
+            try writeI32Csv(file, state.adding_replicas);
+            try file.writeAll("\t");
+            try writeI32Csv(file, state.removing_replicas);
+            try file.writeAll("\n");
+        }
+        try file.sync();
+    }
+
+    /// Load ongoing partition reassignment metadata from disk.
+    pub fn loadPartitionReassignments(self: *MetadataPersistence) ![]PartitionReassignmentEntry {
+        const dir = self.data_dir orelse return &.{};
+
+        const path = try std.fmt.allocPrint(self.allocator, "{s}/partition_reassignments.meta", .{dir});
+        defer self.allocator.free(path);
+
+        const file = fs.openFileAbsolute(path, .{}) catch |err| {
+            log.debug("No partition_reassignments.meta found: {}", .{err});
+            return &.{};
+        };
+        defer file.close();
+
+        const content = file.readToEndAlloc(self.allocator, 4 * 1024 * 1024) catch |err| {
+            log.warn("Failed to read partition_reassignments.meta: {}", .{err});
+            return &.{};
+        };
+        defer self.allocator.free(content);
+
+        var entries = std.array_list.Managed(PartitionReassignmentEntry).init(self.allocator);
+        errdefer {
+            for (entries.items) |entry| {
+                self.allocator.free(entry.topic);
+                if (entry.replicas.len > 0) self.allocator.free(entry.replicas);
+                if (entry.adding_replicas.len > 0) self.allocator.free(entry.adding_replicas);
+                if (entry.removing_replicas.len > 0) self.allocator.free(entry.removing_replicas);
+            }
+            entries.deinit();
+        }
+
+        var lines = std.mem.splitSequence(u8, content, "\n");
+        while (lines.next()) |line| {
+            if (line.len == 0) continue;
+
+            var fields = std.mem.splitSequence(u8, line, "\t");
+            const tag = fields.next() orelse continue;
+            if (!std.mem.eql(u8, tag, "reassignment")) continue;
+
+            const topic_hex = fields.next() orelse continue;
+            const partition_str = fields.next() orelse continue;
+            const replicas_str = fields.next() orelse continue;
+            const adding_str = fields.next() orelse continue;
+            const removing_str = fields.next() orelse continue;
+
+            const topic = decodeHexAlloc(self.allocator, topic_hex) catch continue;
+            const partition_index = std.fmt.parseInt(i32, partition_str, 10) catch {
+                self.allocator.free(topic);
+                continue;
+            };
+            const replicas = parseI32CsvAlloc(self.allocator, replicas_str) catch {
+                self.allocator.free(topic);
+                continue;
+            };
+            const adding_replicas = parseI32CsvAlloc(self.allocator, adding_str) catch {
+                self.allocator.free(topic);
+                if (replicas.len > 0) self.allocator.free(replicas);
+                continue;
+            };
+            const removing_replicas = parseI32CsvAlloc(self.allocator, removing_str) catch {
+                self.allocator.free(topic);
+                if (replicas.len > 0) self.allocator.free(replicas);
+                if (adding_replicas.len > 0) self.allocator.free(adding_replicas);
+                continue;
+            };
+
+            entries.append(.{
+                .topic = topic,
+                .partition_index = partition_index,
+                .replicas = replicas,
+                .adding_replicas = adding_replicas,
+                .removing_replicas = removing_replicas,
+            }) catch |err| {
+                self.allocator.free(topic);
+                if (replicas.len > 0) self.allocator.free(replicas);
+                if (adding_replicas.len > 0) self.allocator.free(adding_replicas);
+                if (removing_replicas.len > 0) self.allocator.free(removing_replicas);
+                return err;
+            };
+        }
+
+        log.info("Loaded {d} partition reassignments from partition_reassignments.meta", .{entries.items.len});
+        return entries.toOwnedSlice();
+    }
+
+    pub fn freePartitionReassignmentEntries(self: *MetadataPersistence, entries: []PartitionReassignmentEntry) void {
+        for (entries) |entry| {
+            self.allocator.free(entry.topic);
+            if (entry.replicas.len > 0) self.allocator.free(entry.replicas);
+            if (entry.adding_replicas.len > 0) self.allocator.free(entry.adding_replicas);
+            if (entry.removing_replicas.len > 0) self.allocator.free(entry.removing_replicas);
+        }
+        if (entries.len > 0) self.allocator.free(entries);
     }
 
     /// Save ACL entries to disk.
@@ -1163,6 +1315,83 @@ test "MetadataPersistence load partition states missing file" {
     var persistence = MetadataPersistence.init(testing.allocator, tmp_dir);
 
     const loaded = try persistence.loadPartitionStates();
+    try testing.expectEqual(@as(usize, 0), loaded.len);
+}
+
+test "MetadataPersistence save and load partition reassignments round-trip" {
+    const tmp_dir = "/tmp/automq-partition-reassignment-test";
+    fs.deleteTreeAbsolute(tmp_dir) catch {};
+    fs.makeDirAbsolute(tmp_dir) catch {};
+    defer fs.deleteTreeAbsolute(tmp_dir) catch {};
+
+    var persistence = MetadataPersistence.init(testing.allocator, tmp_dir);
+
+    const PartitionReassignment = struct {
+        topic: []const u8,
+        partition_index: i32,
+        replicas: []const i32,
+        adding_replicas: []const i32,
+        removing_replicas: []const i32,
+    };
+    var reassignments = std.StringHashMap(PartitionReassignment).init(testing.allocator);
+    defer reassignments.deinit();
+
+    const replicas_a = [_]i32{ 2, 3 };
+    const adding_a = [_]i32{ 2, 3 };
+    const removing_a = [_]i32{1};
+    const replicas_b = [_]i32{4};
+    const adding_b = [_]i32{4};
+    try reassignments.put("topic\tA-0", .{
+        .topic = "topic\tA",
+        .partition_index = 0,
+        .replicas = &replicas_a,
+        .adding_replicas = &adding_a,
+        .removing_replicas = &removing_a,
+    });
+    try reassignments.put("topic-B-1", .{
+        .topic = "topic-B",
+        .partition_index = 1,
+        .replicas = &replicas_b,
+        .adding_replicas = &adding_b,
+        .removing_replicas = &.{},
+    });
+
+    try persistence.savePartitionReassignments(&reassignments);
+
+    const loaded = try persistence.loadPartitionReassignments();
+    defer persistence.freePartitionReassignmentEntries(loaded);
+
+    try testing.expectEqual(@as(usize, 2), loaded.len);
+    var found_a = false;
+    var found_b = false;
+    for (loaded) |entry| {
+        if (std.mem.eql(u8, entry.topic, "topic\tA")) {
+            found_a = true;
+            try testing.expectEqual(@as(i32, 0), entry.partition_index);
+            try testing.expectEqualSlices(i32, &replicas_a, entry.replicas);
+            try testing.expectEqualSlices(i32, &adding_a, entry.adding_replicas);
+            try testing.expectEqualSlices(i32, &removing_a, entry.removing_replicas);
+        } else if (std.mem.eql(u8, entry.topic, "topic-B")) {
+            found_b = true;
+            try testing.expectEqual(@as(i32, 1), entry.partition_index);
+            try testing.expectEqualSlices(i32, &replicas_b, entry.replicas);
+            try testing.expectEqualSlices(i32, &adding_b, entry.adding_replicas);
+            try testing.expectEqual(@as(usize, 0), entry.removing_replicas.len);
+        }
+    }
+    try testing.expect(found_a);
+    try testing.expect(found_b);
+}
+
+test "MetadataPersistence load partition reassignments missing file" {
+    const tmp_dir = "/tmp/automq-partition-reassignment-missing-test";
+    fs.deleteTreeAbsolute(tmp_dir) catch {};
+    fs.makeDirAbsolute(tmp_dir) catch {};
+    defer fs.deleteTreeAbsolute(tmp_dir) catch {};
+
+    var persistence = MetadataPersistence.init(testing.allocator, tmp_dir);
+
+    const loaded = try persistence.loadPartitionReassignments();
     try testing.expectEqual(@as(usize, 0), loaded.len);
 }
 
