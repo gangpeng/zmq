@@ -1321,6 +1321,9 @@ pub const Broker = struct {
         if (self.topics.contains(topic_name)) return true;
         if (!self.auto_create_topics) return false;
 
+        const previous_snapshot = self.encodeTopicSnapshotRecordValue() catch return false;
+        defer self.allocator.free(previous_snapshot);
+
         const name_copy = self.allocator.dupe(u8, topic_name) catch return false;
         const key_copy = self.allocator.dupe(u8, topic_name) catch {
             self.allocator.free(name_copy);
@@ -1345,7 +1348,13 @@ pub const Broker = struct {
         }
 
         log.info("Auto-created topic '{s}' with {d} partitions", .{ topic_name, self.default_num_partitions });
-        self.persistTopics();
+        self.writeTopicSnapshotRecord() catch |err| {
+            log.warn("Failed to append auto-created topic snapshot to __cluster_metadata: {}", .{err});
+            self.restoreTopicsAfterFailedMutation(previous_snapshot);
+            self.removeTopicPartitionRange(topic_name, 0, self.default_num_partitions);
+            return false;
+        };
+        self.persistTopicsLocal();
         self.persistObjectManagerSnapshot();
         return true;
     }
@@ -23465,6 +23474,27 @@ test "Broker.ensureTopic auto-create" {
     // Should not create if auto_create_topics is false
     broker.auto_create_topics = false;
     try testing.expect(!broker.ensureTopic("another-topic"));
+}
+
+test "Broker.ensureTopic rolls back when topic snapshot S3 WAL write fails" {
+    var mock_s3 = storage.MockS3.init(testing.allocator);
+    defer mock_s3.deinit();
+    const s3_storage = storage.S3Storage.initMock(testing.allocator, &mock_s3);
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+    broker.store.s3_wal_mode = true;
+    broker.store.s3_storage = s3_storage;
+    broker.store.s3_wal_batcher = storage.wal.S3WalBatcher.init(testing.allocator);
+
+    try broker.open();
+    const object_count_before = mock_s3.objectCount();
+    mock_s3.failNextPutObjects(3);
+
+    try testing.expect(!broker.ensureTopic("ensure-topic-s3-fail"));
+    try testing.expect(!broker.topics.contains("ensure-topic-s3-fail"));
+    try testing.expect(!broker.store.partitions.contains("ensure-topic-s3-fail-0"));
+    try testing.expectEqual(object_count_before, mock_s3.objectCount());
 }
 
 test "Broker.ensureTopic returns true for existing topic" {
