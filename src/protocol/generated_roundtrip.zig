@@ -435,6 +435,65 @@ test "generated non-default golden fixtures cover legacy and flexible wire encod
     }
 
     {
+        const FetchRequest = generated.fetch_request.FetchRequest;
+        const topic_id = [_]u8{
+            0x10, 0x11, 0x12, 0x13,
+            0x14, 0x15, 0x16, 0x17,
+            0x18, 0x19, 0x1a, 0x1b,
+            0x1c, 0x1d, 0x1e, 0x1f,
+        };
+        const replica_directory_id = [_]u8{
+            0x00, 0x01, 0x02, 0x03,
+            0x04, 0x05, 0x06, 0x07,
+            0x08, 0x09, 0x0a, 0x0b,
+            0x0c, 0x0d, 0x0e, 0x0f,
+        };
+        const partitions = [_]FetchRequest.FetchTopic.FetchPartition{.{
+            .partition = 0,
+            .current_leader_epoch = 3,
+            .fetch_offset = 42,
+            .last_fetched_epoch = 2,
+            .log_start_offset = 5,
+            .partition_max_bytes = 4096,
+            .replica_directory_id = replica_directory_id,
+        }};
+        const topics = [_]FetchRequest.FetchTopic{.{
+            .topic_id = topic_id,
+            .partitions = &partitions,
+        }};
+        const value = FetchRequest{
+            .cluster_id = "cluster-a",
+            .replica_state = .{ .replica_id = 7, .replica_epoch = 4 },
+            .max_wait_ms = 500,
+            .min_bytes = 1,
+            .max_bytes = 1048576,
+            .isolation_level = 1,
+            .session_id = 123,
+            .session_epoch = 1,
+            .topics = &topics,
+            .rack_id = "rack-a",
+        };
+        try expectGoldenRoundTrip(FetchRequest, value, 17, &[_]u8{
+            0x00, 0x00, 0x01, 0xf4, 0x00, 0x00, 0x00, 0x01,
+            0x00, 0x10, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00,
+            0x7b, 0x00, 0x00, 0x00, 0x01, 0x02, 0x10, 0x11,
+            0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18, 0x19,
+            0x1a, 0x1b, 0x1c, 0x1d, 0x1e, 0x1f, 0x02, 0x00,
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x03, 0x00,
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x2a, 0x00,
+            0x00, 0x00, 0x02, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x05, 0x00, 0x00, 0x10, 0x00, 0x01,
+            0x00, 0x10, 0x00, 0x01, 0x02, 0x03, 0x04, 0x05,
+            0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d,
+            0x0e, 0x0f, 0x00, 0x01, 0x07, 'r',  'a',  'c',
+            'k',  '-',  'a',  0x02, 0x00, 0x0a, 0x0a, 'c',
+            'l',  'u',  's',  't',  'e',  'r',  '-',  'a',
+            0x01, 0x0d, 0x00, 0x00, 0x00, 0x07, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x04, 0x00,
+        });
+    }
+
+    {
         const BrokerHeartbeatRequest = generated.broker_heartbeat_request.BrokerHeartbeatRequest;
         const offline_log_dirs = [_][16]u8{.{
             0x00, 0x01, 0x02, 0x03,
@@ -768,6 +827,108 @@ test "generated FetchSnapshotRequest rejects duplicate known tags" {
         try testing.expectError(
             error.DuplicateTaggedField,
             generated.fetch_snapshot_request.FetchSnapshotRequest.deserialize(testing.allocator, duplicate_replica_directory[0..pos], &read_pos, 1),
+        );
+    }
+}
+
+test "generated FetchRequest rejects duplicate known tags" {
+    {
+        var duplicate_cluster_id: [128]u8 = undefined;
+        var pos: usize = 0;
+        ser.writeI32(&duplicate_cluster_id, &pos, 0); // max_wait_ms
+        ser.writeI32(&duplicate_cluster_id, &pos, 0); // min_bytes
+        ser.writeI32(&duplicate_cluster_id, &pos, 0); // max_bytes
+        ser.writeI8(&duplicate_cluster_id, &pos, 0); // isolation_level
+        ser.writeI32(&duplicate_cluster_id, &pos, 0); // session_id
+        ser.writeI32(&duplicate_cluster_id, &pos, -1); // session_epoch
+        ser.writeCompactArrayLen(&duplicate_cluster_id, &pos, 0); // topics
+        ser.writeCompactArrayLen(&duplicate_cluster_id, &pos, 0); // forgotten_topics_data
+        ser.writeCompactString(&duplicate_cluster_id, &pos, ""); // rack_id
+        ser.writeUnsignedVarint(&duplicate_cluster_id, &pos, 2);
+        inline for (0..2) |_| {
+            ser.writeUnsignedVarint(&duplicate_cluster_id, &pos, 0);
+            ser.writeUnsignedVarint(&duplicate_cluster_id, &pos, 2);
+            ser.writeCompactString(&duplicate_cluster_id, &pos, "c");
+        }
+
+        var read_pos: usize = 0;
+        try testing.expectError(
+            error.DuplicateTaggedField,
+            generated.fetch_request.FetchRequest.deserialize(testing.allocator, duplicate_cluster_id[0..pos], &read_pos, 17),
+        );
+    }
+
+    {
+        var duplicate_replica_state: [128]u8 = undefined;
+        var pos: usize = 0;
+        ser.writeI32(&duplicate_replica_state, &pos, 0); // max_wait_ms
+        ser.writeI32(&duplicate_replica_state, &pos, 0); // min_bytes
+        ser.writeI32(&duplicate_replica_state, &pos, 0); // max_bytes
+        ser.writeI8(&duplicate_replica_state, &pos, 0); // isolation_level
+        ser.writeI32(&duplicate_replica_state, &pos, 0); // session_id
+        ser.writeI32(&duplicate_replica_state, &pos, -1); // session_epoch
+        ser.writeCompactArrayLen(&duplicate_replica_state, &pos, 0); // topics
+        ser.writeCompactArrayLen(&duplicate_replica_state, &pos, 0); // forgotten_topics_data
+        ser.writeCompactString(&duplicate_replica_state, &pos, ""); // rack_id
+        ser.writeUnsignedVarint(&duplicate_replica_state, &pos, 2);
+        inline for (0..2) |_| {
+            ser.writeUnsignedVarint(&duplicate_replica_state, &pos, 1);
+            ser.writeUnsignedVarint(&duplicate_replica_state, &pos, 13);
+            ser.writeI32(&duplicate_replica_state, &pos, 7);
+            ser.writeI64(&duplicate_replica_state, &pos, 4);
+            ser.writeEmptyTaggedFields(&duplicate_replica_state, &pos);
+        }
+
+        var read_pos: usize = 0;
+        try testing.expectError(
+            error.DuplicateTaggedField,
+            generated.fetch_request.FetchRequest.deserialize(testing.allocator, duplicate_replica_state[0..pos], &read_pos, 17),
+        );
+    }
+
+    {
+        var duplicate_replica_directory: [256]u8 = undefined;
+        var pos: usize = 0;
+        ser.writeI32(&duplicate_replica_directory, &pos, 0); // max_wait_ms
+        ser.writeI32(&duplicate_replica_directory, &pos, 0); // min_bytes
+        ser.writeI32(&duplicate_replica_directory, &pos, 0); // max_bytes
+        ser.writeI8(&duplicate_replica_directory, &pos, 0); // isolation_level
+        ser.writeI32(&duplicate_replica_directory, &pos, 0); // session_id
+        ser.writeI32(&duplicate_replica_directory, &pos, -1); // session_epoch
+        ser.writeCompactArrayLen(&duplicate_replica_directory, &pos, 1); // topics
+        ser.writeUuid(&duplicate_replica_directory, &pos, .{
+            0x10, 0x11, 0x12, 0x13,
+            0x14, 0x15, 0x16, 0x17,
+            0x18, 0x19, 0x1a, 0x1b,
+            0x1c, 0x1d, 0x1e, 0x1f,
+        });
+        ser.writeCompactArrayLen(&duplicate_replica_directory, &pos, 1); // partitions
+        ser.writeI32(&duplicate_replica_directory, &pos, 0); // partition
+        ser.writeI32(&duplicate_replica_directory, &pos, 0); // current_leader_epoch
+        ser.writeI64(&duplicate_replica_directory, &pos, 0); // fetch_offset
+        ser.writeI32(&duplicate_replica_directory, &pos, -1); // last_fetched_epoch
+        ser.writeI64(&duplicate_replica_directory, &pos, -1); // log_start_offset
+        ser.writeI32(&duplicate_replica_directory, &pos, 0); // partition_max_bytes
+        ser.writeUnsignedVarint(&duplicate_replica_directory, &pos, 2);
+        inline for (0..2) |_| {
+            ser.writeUnsignedVarint(&duplicate_replica_directory, &pos, 0);
+            ser.writeUnsignedVarint(&duplicate_replica_directory, &pos, 16);
+            ser.writeUuid(&duplicate_replica_directory, &pos, .{
+                0x00, 0x01, 0x02, 0x03,
+                0x04, 0x05, 0x06, 0x07,
+                0x08, 0x09, 0x0a, 0x0b,
+                0x0c, 0x0d, 0x0e, 0x0f,
+            });
+        }
+        ser.writeEmptyTaggedFields(&duplicate_replica_directory, &pos); // topic tags
+        ser.writeCompactArrayLen(&duplicate_replica_directory, &pos, 0); // forgotten_topics_data
+        ser.writeCompactString(&duplicate_replica_directory, &pos, ""); // rack_id
+        ser.writeEmptyTaggedFields(&duplicate_replica_directory, &pos); // request tags
+
+        var read_pos: usize = 0;
+        try testing.expectError(
+            error.DuplicateTaggedField,
+            generated.fetch_request.FetchRequest.deserialize(testing.allocator, duplicate_replica_directory[0..pos], &read_pos, 17),
         );
     }
 }

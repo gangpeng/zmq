@@ -50,6 +50,10 @@ pub const FetchRequest = struct {
             if (version >= 12) size += 1;
             return size;
         }
+
+        fn isDefault(self: *const ReplicaState) bool {
+            return self.replica_id == -1 and self.replica_epoch == -1;
+        }
     };
 
     pub const FetchTopic = struct {
@@ -72,6 +76,9 @@ pub const FetchRequest = struct {
             /// The maximum bytes to fetch from this partition.  See KIP-74 for cases where this limit may not be honored.
             /// Versions: 0+
             partition_max_bytes: i32 = 0,
+            /// The directory id of the follower fetching
+            /// Versions: 17+
+            replica_directory_id: [16]u8 = .{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 },
 
             pub fn serialize(self: *const FetchPartition, buf: []u8, pos: *usize, version: i16) void {
                 ser.writeI32(buf, pos, self.partition);
@@ -86,10 +93,18 @@ pub const FetchRequest = struct {
                     ser.writeI64(buf, pos, self.log_start_offset);
                 }
                 ser.writeI32(buf, pos, self.partition_max_bytes);
-                if (version >= 12) ser.writeEmptyTaggedFields(buf, pos);
+                const has_replica_directory_id = version >= 17 and !isZeroUuid(self.replica_directory_id);
+                if (version >= 12) {
+                    ser.writeUnsignedVarint(buf, pos, if (has_replica_directory_id) 1 else 0);
+                    if (has_replica_directory_id) {
+                        ser.writeUnsignedVarint(buf, pos, 0);
+                        ser.writeUnsignedVarint(buf, pos, 16);
+                        ser.writeUuid(buf, pos, self.replica_directory_id);
+                    }
+                }
             }
 
-            pub fn deserialize(_: Allocator, buf: []const u8, pos: *usize, version: i16) !FetchPartition {
+            pub fn deserialize(alloc: Allocator, buf: []const u8, pos: *usize, version: i16) !FetchPartition {
                 var result = FetchPartition{};
                 result.partition = ser.readI32(buf, pos);
                 if (version >= 9) {
@@ -103,11 +118,27 @@ pub const FetchRequest = struct {
                     result.log_start_offset = ser.readI64(buf, pos);
                 }
                 result.partition_max_bytes = ser.readI32(buf, pos);
-                if (version >= 12) try ser.skipTaggedFields(buf, pos);
+                if (version >= 12) {
+                    const tagged_fields = try ser.readTaggedFields(alloc, buf, pos);
+                    defer if (tagged_fields.len > 0) alloc.free(tagged_fields);
+
+                    var seen_replica_directory_id = false;
+                    for (tagged_fields) |field| {
+                        if (field.tag == 0 and version >= 17) {
+                            if (seen_replica_directory_id) return error.DuplicateTaggedField;
+                            seen_replica_directory_id = true;
+                            if (field.data.len != 16) return error.InvalidTaggedField;
+
+                            var tag_pos: usize = 0;
+                            result.replica_directory_id = try ser.readUuid(field.data, &tag_pos);
+                            if (tag_pos != field.data.len) return error.InvalidTaggedField;
+                        }
+                    }
+                }
                 return result;
             }
 
-            pub fn calcSize(_: *const FetchPartition, version: i16) usize {
+            pub fn calcSize(self: *const FetchPartition, version: i16) usize {
                 var size: usize = 0;
                 size += 4;
                 if (version >= 9) {
@@ -121,7 +152,15 @@ pub const FetchRequest = struct {
                     size += 8;
                 }
                 size += 4;
-                if (version >= 12) size += 1;
+                const has_replica_directory_id = version >= 17 and !isZeroUuid(self.replica_directory_id);
+                if (version >= 12) {
+                    size += ser.unsignedVarintSize(if (has_replica_directory_id) 1 else 0);
+                    if (has_replica_directory_id) {
+                        size += ser.unsignedVarintSize(0);
+                        size += ser.unsignedVarintSize(16);
+                        size += 16;
+                    }
+                }
                 return size;
             }
         };
@@ -160,6 +199,8 @@ pub const FetchRequest = struct {
 
         pub fn deserialize(alloc: Allocator, buf: []const u8, pos: *usize, version: i16) !FetchTopic {
             var result = FetchTopic{};
+            errdefer if (result.partitions.len > 0) alloc.free(result.partitions);
+
             if (version <= 12) {
                 result.topic = if (version >= 12)
                     try ser.readCompactString(buf, pos)
@@ -175,6 +216,7 @@ pub const FetchRequest = struct {
                 (try ser.readArrayLen(buf, pos)) orelse 0;
             if (partitions_len > 0) {
                 const partitions_items = try alloc.alloc(FetchPartition, partitions_len);
+                errdefer alloc.free(partitions_items);
                 for (partitions_items) |*item| {
                     item.* = try FetchPartition.deserialize(alloc, buf, pos, version);
                 }
@@ -246,6 +288,8 @@ pub const FetchRequest = struct {
 
         pub fn deserialize(alloc: Allocator, buf: []const u8, pos: *usize, version: i16) !ForgottenTopic {
             var result = ForgottenTopic{};
+            errdefer if (result.partitions.len > 0) alloc.free(result.partitions);
+
             if (version >= 7 and version <= 12) {
                 result.topic = if (version >= 12)
                     try ser.readCompactString(buf, pos)
@@ -262,6 +306,7 @@ pub const FetchRequest = struct {
                     (try ser.readArrayLen(buf, pos)) orelse 0;
                 if (partitions_len > 0) {
                     const partitions_items = try alloc.alloc(i32, partitions_len);
+                    errdefer alloc.free(partitions_items);
                     for (partitions_items) |*item| {
                         item.* = ser.readI32(buf, pos);
                     }
@@ -297,9 +342,15 @@ pub const FetchRequest = struct {
         }
     };
 
+    /// The clusterId if known. This is used to validate metadata fetches prior to broker registration.
+    /// Versions: 12+
+    cluster_id: ?[]const u8 = null,
     /// The broker ID of the follower, of -1 if this request is from a consumer.
     /// Versions: 0-14
     replica_id: i32 = -1,
+    /// The replica state of the follower, or default if this request is from a consumer.
+    /// Versions: 15+
+    replica_state: ReplicaState = .{},
     /// The maximum time in milliseconds to wait for the response.
     /// Versions: 0+
     max_wait_ms: i32 = 0,
@@ -371,11 +422,40 @@ pub const FetchRequest = struct {
                 ser.writeString(buf, pos, self.rack_id);
             }
         }
-        if (version >= 12) ser.writeEmptyTaggedFields(buf, pos);
+        const has_cluster_id = version >= 12 and self.cluster_id != null;
+        const has_replica_state = version >= 15 and !self.replica_state.isDefault();
+        if (version >= 12) {
+            const tag_count: usize = @as(usize, @intFromBool(has_cluster_id)) + @as(usize, @intFromBool(has_replica_state));
+            ser.writeUnsignedVarint(buf, pos, tag_count);
+            if (has_cluster_id) {
+                const tag_size = ser.compactStringSize(self.cluster_id);
+                ser.writeUnsignedVarint(buf, pos, 0);
+                ser.writeUnsignedVarint(buf, pos, tag_size);
+                ser.writeCompactString(buf, pos, self.cluster_id);
+            }
+            if (has_replica_state) {
+                const tag_size = self.replica_state.calcSize(version);
+                ser.writeUnsignedVarint(buf, pos, 1);
+                ser.writeUnsignedVarint(buf, pos, tag_size);
+                self.replica_state.serialize(buf, pos, version);
+            }
+        }
     }
 
     pub fn deserialize(alloc: Allocator, buf: []const u8, pos: *usize, version: i16) !FetchRequest {
         var result = FetchRequest{};
+        errdefer {
+            for (result.topics) |topic| {
+                if (topic.partitions.len > 0) alloc.free(topic.partitions);
+            }
+            if (result.topics.len > 0) alloc.free(result.topics);
+
+            for (result.forgotten_topics_data) |topic| {
+                if (topic.partitions.len > 0) alloc.free(topic.partitions);
+            }
+            if (result.forgotten_topics_data.len > 0) alloc.free(result.forgotten_topics_data);
+        }
+
         if (version <= 14) {
             result.replica_id = ser.readI32(buf, pos);
         }
@@ -399,8 +479,17 @@ pub const FetchRequest = struct {
             (try ser.readArrayLen(buf, pos)) orelse 0;
         if (topics_len > 0) {
             const topics_items = try alloc.alloc(FetchTopic, topics_len);
+            var topics_init: usize = 0;
+            errdefer {
+                for (topics_items[0..topics_init]) |topic| {
+                    if (topic.partitions.len > 0) alloc.free(topic.partitions);
+                }
+                alloc.free(topics_items);
+            }
+
             for (topics_items) |*item| {
                 item.* = try FetchTopic.deserialize(alloc, buf, pos, version);
+                topics_init += 1;
             }
             result.topics = topics_items;
         }
@@ -411,8 +500,17 @@ pub const FetchRequest = struct {
                 (try ser.readArrayLen(buf, pos)) orelse 0;
             if (forgotten_topics_data_len > 0) {
                 const forgotten_topics_data_items = try alloc.alloc(ForgottenTopic, forgotten_topics_data_len);
+                var forgotten_topics_data_init: usize = 0;
+                errdefer {
+                    for (forgotten_topics_data_items[0..forgotten_topics_data_init]) |topic| {
+                        if (topic.partitions.len > 0) alloc.free(topic.partitions);
+                    }
+                    alloc.free(forgotten_topics_data_items);
+                }
+
                 for (forgotten_topics_data_items) |*item| {
                     item.* = try ForgottenTopic.deserialize(alloc, buf, pos, version);
+                    forgotten_topics_data_init += 1;
                 }
                 result.forgotten_topics_data = forgotten_topics_data_items;
             }
@@ -423,7 +521,30 @@ pub const FetchRequest = struct {
             else
                 try ser.readString(buf, pos);
         }
-        if (version >= 12) try ser.skipTaggedFields(buf, pos);
+        if (version >= 12) {
+            const tagged_fields = try ser.readTaggedFields(alloc, buf, pos);
+            defer if (tagged_fields.len > 0) alloc.free(tagged_fields);
+
+            var seen_cluster_id = false;
+            var seen_replica_state = false;
+            for (tagged_fields) |field| {
+                if (field.tag == 0) {
+                    if (seen_cluster_id) return error.DuplicateTaggedField;
+                    seen_cluster_id = true;
+
+                    var tag_pos: usize = 0;
+                    result.cluster_id = try ser.readCompactString(field.data, &tag_pos);
+                    if (tag_pos != field.data.len) return error.InvalidTaggedField;
+                } else if (field.tag == 1 and version >= 15) {
+                    if (seen_replica_state) return error.DuplicateTaggedField;
+                    seen_replica_state = true;
+
+                    var tag_pos: usize = 0;
+                    result.replica_state = try ReplicaState.deserialize(alloc, field.data, &tag_pos, version);
+                    if (tag_pos != field.data.len) return error.InvalidTaggedField;
+                }
+            }
+        }
         return result;
     }
 
@@ -471,7 +592,31 @@ pub const FetchRequest = struct {
                 size += ser.stringSize(self.rack_id);
             }
         }
-        if (version >= 12) size += 1;
+        const has_cluster_id = version >= 12 and self.cluster_id != null;
+        const has_replica_state = version >= 15 and !self.replica_state.isDefault();
+        if (version >= 12) {
+            const tag_count: usize = @as(usize, @intFromBool(has_cluster_id)) + @as(usize, @intFromBool(has_replica_state));
+            size += ser.unsignedVarintSize(tag_count);
+            if (has_cluster_id) {
+                const tag_size = ser.compactStringSize(self.cluster_id);
+                size += ser.unsignedVarintSize(0);
+                size += ser.unsignedVarintSize(tag_size);
+                size += tag_size;
+            }
+            if (has_replica_state) {
+                const tag_size = self.replica_state.calcSize(version);
+                size += ser.unsignedVarintSize(1);
+                size += ser.unsignedVarintSize(tag_size);
+                size += tag_size;
+            }
+        }
         return size;
     }
 };
+
+fn isZeroUuid(value: [16]u8) bool {
+    for (value) |byte| {
+        if (byte != 0) return false;
+    }
+    return true;
+}
