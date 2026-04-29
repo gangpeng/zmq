@@ -1933,6 +1933,12 @@ pub const Broker = struct {
         self.groups.groups = groups;
     }
 
+    fn restoreConsumerGroupsAfterFailedMutation(self: *Broker, snapshot_value: []const u8) void {
+        self.applyConsumerGroupSnapshotRecord(snapshot_value) catch |restore_err| {
+            log.err("Failed to restore consumer group snapshot after failed mutation: {}", .{restore_err});
+        };
+    }
+
     fn encodeTransactionSnapshotRecordValue(self: *Broker) ![]u8 {
         var buf = std.array_list.Managed(u8).init(self.allocator);
         errdefer buf.deinit();
@@ -5417,11 +5423,15 @@ pub const Broker = struct {
             return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
         }
 
+        const previous_snapshot = self.encodeConsumerGroupSnapshotRecordValue() catch return null;
+        defer self.allocator.free(previous_snapshot);
+
         const result = self.groups.joinGroupWithProtocol(req.group_id orelse "", member_id, req.group_instance_id, protocol_type, protocol_selection.name, protocol_selection.metadata, null) catch return null;
         if (result.error_code == @intFromEnum(ErrorCode.none)) {
             _ = self.groups.configureGroupTimeouts(req.group_id orelse "", @intCast(req.session_timeout_ms), effectiveJoinGroupRebalanceTimeout(api_version, req.session_timeout_ms, req.rebalance_timeout_ms));
             self.persistConsumerGroupsDurably() catch |err| {
                 log.warn("JoinGroup consumer-group snapshot write failed for {s}: {}", .{ req.group_id orelse "", err });
+                self.restoreConsumerGroupsAfterFailedMutation(previous_snapshot);
                 const resp = Resp{
                     .throttle_time_ms = 0,
                     .error_code = @intFromEnum(ErrorCode.kafka_storage_error),
@@ -5592,6 +5602,9 @@ pub const Broker = struct {
         };
         defer self.freeLeaveGroupRequest(&req);
 
+        const previous_snapshot = self.encodeConsumerGroupSnapshotRecordValue() catch return null;
+        defer self.allocator.free(previous_snapshot);
+
         var top_error: i16 = @intFromEnum(ErrorCode.none);
         var member_responses: []MemberResponse = &.{};
         var mutated = false;
@@ -5614,6 +5627,7 @@ pub const Broker = struct {
         if (mutated) {
             self.persistConsumerGroupsDurably() catch |err| {
                 log.warn("LeaveGroup consumer-group snapshot write failed for {s}: {}", .{ req.group_id orelse "", err });
+                self.restoreConsumerGroupsAfterFailedMutation(previous_snapshot);
                 if (api_version >= 3) {
                     for (member_responses) |*member_response| {
                         if (member_response.error_code == @intFromEnum(ErrorCode.none)) {
@@ -6410,6 +6424,9 @@ pub const Broker = struct {
         };
         defer self.freeSyncGroupRequest(&req);
 
+        const previous_snapshot = self.encodeConsumerGroupSnapshotRecordValue() catch return null;
+        defer self.allocator.free(previous_snapshot);
+
         const sync_protocol = self.selectSyncGroupProtocol(api_version, req.group_id orelse "", req.protocol_type, req.protocol_name);
         if (sync_protocol.error_code != @intFromEnum(ErrorCode.none)) {
             const resp = Resp{
@@ -6446,6 +6463,7 @@ pub const Broker = struct {
         if ((assignments != null or protocol_mutated) and result.error_code == @intFromEnum(ErrorCode.none)) {
             self.persistConsumerGroupsDurably() catch |err| {
                 log.warn("SyncGroup consumer-group snapshot write failed for {s}: {}", .{ req.group_id orelse "", err });
+                self.restoreConsumerGroupsAfterFailedMutation(previous_snapshot);
                 const resp = Resp{
                     .throttle_time_ms = 0,
                     .error_code = @intFromEnum(ErrorCode.kafka_storage_error),
@@ -22866,7 +22884,105 @@ test "Broker JoinGroup fails closed when consumer group snapshot S3 WAL write fa
     try testing.expectEqual(response.?.len, rpos);
     try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.kafka_storage_error)), resp.error_code);
     try testing.expectEqual(@as(i32, -1), resp.generation_id);
+    try testing.expect(!broker.groups.groups.contains("snapshot-fail-group"));
     try testing.expectEqual(@as(usize, 0), mock_s3.objectCount());
+}
+
+test "Broker LeaveGroup rolls back when consumer group snapshot S3 WAL write fails" {
+    const Req = generated.leave_group_request.LeaveGroupRequest;
+    const Resp = generated.leave_group_response.LeaveGroupResponse;
+
+    var mock_s3 = storage.MockS3.init(testing.allocator);
+    defer mock_s3.deinit();
+    const s3_storage = storage.S3Storage.initMock(testing.allocator, &mock_s3);
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+    broker.store.s3_wal_mode = true;
+    broker.store.s3_storage = s3_storage;
+    broker.store.s3_wal_batcher = storage.wal.S3WalBatcher.init(testing.allocator);
+    try broker.open();
+
+    const join = try broker.groups.joinGroup("leave-snapshot-fail", null, "consumer", null);
+    const member_id = try testing.allocator.dupe(u8, join.member_id);
+    defer testing.allocator.free(member_id);
+    mock_s3.failNextPutObjects(3);
+
+    const req = Req{
+        .group_id = "leave-snapshot-fail",
+        .member_id = member_id,
+    };
+
+    var buf: [256]u8 = undefined;
+    var pos = buildTestRequest(&buf, 13, 2, 1320, header_mod.requestHeaderVersion(13, 2));
+    req.serialize(&buf, &pos, 2);
+
+    const response = broker.handleRequest(buf[0..pos]);
+    try testing.expect(response != null);
+    defer testing.allocator.free(response.?);
+
+    var rpos: usize = 0;
+    var response_header = try ResponseHeader.deserialize(testing.allocator, response.?, &rpos, header_mod.responseHeaderVersion(13, 2));
+    defer response_header.deinit(testing.allocator);
+    try testing.expectEqual(@as(i32, 1320), response_header.correlation_id);
+
+    const resp = try Resp.deserialize(testing.allocator, response.?, &rpos, 2);
+    defer if (resp.members.len > 0) testing.allocator.free(resp.members);
+    try testing.expectEqual(response.?.len, rpos);
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.kafka_storage_error)), resp.error_code);
+    try testing.expect(broker.groups.groups.getPtr("leave-snapshot-fail").?.members.contains(member_id));
+}
+
+test "Broker SyncGroup rolls back when consumer group snapshot S3 WAL write fails" {
+    const Req = generated.sync_group_request.SyncGroupRequest;
+    const Resp = generated.sync_group_response.SyncGroupResponse;
+
+    var mock_s3 = storage.MockS3.init(testing.allocator);
+    defer mock_s3.deinit();
+    const s3_storage = storage.S3Storage.initMock(testing.allocator, &mock_s3);
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+    broker.store.s3_wal_mode = true;
+    broker.store.s3_storage = s3_storage;
+    broker.store.s3_wal_batcher = storage.wal.S3WalBatcher.init(testing.allocator);
+    try broker.open();
+
+    const join = try broker.groups.joinGroup("sync-snapshot-fail", null, "consumer", null);
+    const member_id = try testing.allocator.dupe(u8, join.member_id);
+    defer testing.allocator.free(member_id);
+    mock_s3.failNextPutObjects(3);
+
+    const assignments = [_]Req.SyncGroupRequestAssignment{.{
+        .member_id = member_id,
+        .assignment = "failed-assignment",
+    }};
+    const req = Req{
+        .group_id = "sync-snapshot-fail",
+        .generation_id = join.generation_id,
+        .member_id = member_id,
+        .assignments = &assignments,
+    };
+
+    var buf: [512]u8 = undefined;
+    var pos = buildTestRequest(&buf, 14, 0, 1409, header_mod.requestHeaderVersion(14, 0));
+    req.serialize(&buf, &pos, 0);
+
+    const response = broker.handleRequest(buf[0..pos]);
+    try testing.expect(response != null);
+    defer testing.allocator.free(response.?);
+
+    var rpos: usize = 0;
+    var response_header = try ResponseHeader.deserialize(testing.allocator, response.?, &rpos, header_mod.responseHeaderVersion(14, 0));
+    defer response_header.deinit(testing.allocator);
+    try testing.expectEqual(@as(i32, 1409), response_header.correlation_id);
+
+    const resp = try Resp.deserialize(testing.allocator, response.?, &rpos, 0);
+    try testing.expectEqual(response.?.len, rpos);
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.kafka_storage_error)), resp.error_code);
+    const group = broker.groups.groups.getPtr("sync-snapshot-fail").?;
+    try testing.expectEqual(ConsumerGroup.GroupState.preparing_rebalance, group.state);
+    try testing.expect(group.members.getPtr(member_id).?.assignment == null);
 }
 
 test "Broker InitProducerId fails closed when transaction snapshot S3 WAL write fails" {
