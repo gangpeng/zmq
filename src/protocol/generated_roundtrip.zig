@@ -435,6 +435,36 @@ test "generated non-default golden fixtures cover legacy and flexible wire encod
     }
 
     {
+        const BrokerHeartbeatRequest = generated.broker_heartbeat_request.BrokerHeartbeatRequest;
+        const offline_log_dirs = [_][16]u8{.{
+            0x00, 0x01, 0x02, 0x03,
+            0x04, 0x05, 0x06, 0x07,
+            0x08, 0x09, 0x0a, 0x0b,
+            0x0c, 0x0d, 0x0e, 0x0f,
+        }};
+        const value = BrokerHeartbeatRequest{
+            .broker_id = 100,
+            .broker_epoch = 7,
+            .current_metadata_offset = 9,
+            .want_fence = false,
+            .want_shut_down = true,
+            .offline_log_dirs = &offline_log_dirs,
+        };
+        try expectGoldenRoundTrip(BrokerHeartbeatRequest, value, 1, &[_]u8{
+            0x00, 0x00, 0x00, 0x64,
+            0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x07,
+            0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x09,
+            0x00, 0x01, 0x01, 0x00, 0x11, 0x02,
+            0x00, 0x01, 0x02, 0x03,
+            0x04, 0x05, 0x06, 0x07,
+            0x08, 0x09, 0x0a, 0x0b,
+            0x0c, 0x0d, 0x0e, 0x0f,
+        });
+    }
+
+    {
         const ApiVersionsResponse = generated.api_versions_response.ApiVersionsResponse;
         const api_keys = [_]ApiVersionsResponse.ApiVersion{
             .{ .api_key = 0, .min_version = 0, .max_version = 11 },
@@ -688,6 +718,34 @@ test "generated FetchSnapshotRequest rejects duplicate known tags" {
             generated.fetch_snapshot_request.FetchSnapshotRequest.deserialize(testing.allocator, duplicate_replica_directory[0..pos], &read_pos, 1),
         );
     }
+}
+
+test "generated BrokerHeartbeatRequest rejects duplicate offline log dir tags" {
+    var duplicate_offline_log_dirs: [128]u8 = undefined;
+    var pos: usize = 0;
+    ser.writeI32(&duplicate_offline_log_dirs, &pos, 0); // broker_id
+    ser.writeI64(&duplicate_offline_log_dirs, &pos, 0); // broker_epoch
+    ser.writeI64(&duplicate_offline_log_dirs, &pos, 0); // current_metadata_offset
+    ser.writeBool(&duplicate_offline_log_dirs, &pos, false);
+    ser.writeBool(&duplicate_offline_log_dirs, &pos, false);
+    ser.writeUnsignedVarint(&duplicate_offline_log_dirs, &pos, 2);
+    inline for (0..2) |_| {
+        ser.writeUnsignedVarint(&duplicate_offline_log_dirs, &pos, 0);
+        ser.writeUnsignedVarint(&duplicate_offline_log_dirs, &pos, 17);
+        ser.writeCompactArrayLen(&duplicate_offline_log_dirs, &pos, 1);
+        ser.writeUuid(&duplicate_offline_log_dirs, &pos, .{
+            0x00, 0x01, 0x02, 0x03,
+            0x04, 0x05, 0x06, 0x07,
+            0x08, 0x09, 0x0a, 0x0b,
+            0x0c, 0x0d, 0x0e, 0x0f,
+        });
+    }
+
+    var read_pos: usize = 0;
+    try testing.expectError(
+        error.DuplicateTaggedField,
+        generated.broker_heartbeat_request.BrokerHeartbeatRequest.deserialize(testing.allocator, duplicate_offline_log_dirs[0..pos], &read_pos, 1),
+    );
 }
 
 test "generated default messages round-trip across common protocol versions" {

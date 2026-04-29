@@ -924,6 +924,7 @@ pub const Controller = struct {
             const resp = Resp{ .error_code = ErrorCode.invalid_request.toInt(), .is_caught_up = false, .is_fenced = true, .should_shut_down = false };
             return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
         };
+        defer if (req.offline_log_dirs.len > 0) self.allocator.free(req.offline_log_dirs);
 
         if (self.raft_state.role != .leader) {
             const resp = Resp{

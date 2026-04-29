@@ -24,35 +24,88 @@ pub const BrokerHeartbeatRequest = struct {
     /// True if the broker wants to be shut down, false otherwise.
     /// Versions: 0+
     want_shut_down: bool = false,
+    /// Log directories that failed and went offline.
+    /// Versions: 1+
+    offline_log_dirs: []const [16]u8 = &.{},
 
-    pub fn serialize(self: *const BrokerHeartbeatRequest, buf: []u8, pos: *usize, _: i16) void {
+    pub fn serialize(self: *const BrokerHeartbeatRequest, buf: []u8, pos: *usize, version: i16) void {
         ser.writeI32(buf, pos, self.broker_id);
         ser.writeI64(buf, pos, self.broker_epoch);
         ser.writeI64(buf, pos, self.current_metadata_offset);
         ser.writeBool(buf, pos, self.want_fence);
         ser.writeBool(buf, pos, self.want_shut_down);
-        ser.writeEmptyTaggedFields(buf, pos);
+        const has_offline_log_dirs = version >= 1 and self.offline_log_dirs.len > 0;
+        ser.writeUnsignedVarint(buf, pos, if (has_offline_log_dirs) 1 else 0);
+        if (has_offline_log_dirs) {
+            const tag_size = offlineLogDirsTagSize(self.offline_log_dirs);
+            ser.writeUnsignedVarint(buf, pos, 0);
+            ser.writeUnsignedVarint(buf, pos, tag_size);
+            ser.writeCompactArrayLen(buf, pos, self.offline_log_dirs.len);
+            for (self.offline_log_dirs) |item| {
+                ser.writeUuid(buf, pos, item);
+            }
+        }
     }
 
-    pub fn deserialize(_: Allocator, buf: []const u8, pos: *usize, _: i16) !BrokerHeartbeatRequest {
+    pub fn deserialize(alloc: Allocator, buf: []const u8, pos: *usize, version: i16) !BrokerHeartbeatRequest {
         var result = BrokerHeartbeatRequest{};
+        errdefer if (result.offline_log_dirs.len > 0) alloc.free(result.offline_log_dirs);
+
         result.broker_id = ser.readI32(buf, pos);
         result.broker_epoch = ser.readI64(buf, pos);
         result.current_metadata_offset = ser.readI64(buf, pos);
         result.want_fence = try ser.readBool(buf, pos);
         result.want_shut_down = try ser.readBool(buf, pos);
-        try ser.skipTaggedFields(buf, pos);
+        const tagged_fields = try ser.readTaggedFields(alloc, buf, pos);
+        defer if (tagged_fields.len > 0) alloc.free(tagged_fields);
+
+        var seen_offline_log_dirs = false;
+        for (tagged_fields) |field| {
+            if (field.tag == 0 and version >= 1) {
+                if (seen_offline_log_dirs) return error.DuplicateTaggedField;
+                seen_offline_log_dirs = true;
+                result.offline_log_dirs = try readOfflineLogDirsTag(alloc, field.data);
+            }
+        }
         return result;
     }
 
-    pub fn calcSize(_: *const BrokerHeartbeatRequest, _: i16) usize {
+    pub fn calcSize(self: *const BrokerHeartbeatRequest, version: i16) usize {
         var size: usize = 0;
         size += 4;
         size += 8;
         size += 8;
         size += 1;
         size += 1;
-        size += 1;
+        const has_offline_log_dirs = version >= 1 and self.offline_log_dirs.len > 0;
+        size += ser.unsignedVarintSize(if (has_offline_log_dirs) 1 else 0);
+        if (has_offline_log_dirs) {
+            const tag_size = offlineLogDirsTagSize(self.offline_log_dirs);
+            size += ser.unsignedVarintSize(0);
+            size += ser.unsignedVarintSize(tag_size);
+            size += tag_size;
+        }
         return size;
     }
 };
+
+fn offlineLogDirsTagSize(offline_log_dirs: []const [16]u8) usize {
+    return ser.unsignedVarintSize(offline_log_dirs.len + 1) + offline_log_dirs.len * 16;
+}
+
+fn readOfflineLogDirsTag(alloc: Allocator, data: []const u8) ![]const [16]u8 {
+    var tag_pos: usize = 0;
+    const offline_log_dirs_len: usize = (try ser.readCompactArrayLen(data, &tag_pos)) orelse return error.InvalidTaggedField;
+    if (offline_log_dirs_len == 0) {
+        if (tag_pos != data.len) return error.InvalidTaggedField;
+        return &.{};
+    }
+
+    const offline_log_dirs = try alloc.alloc([16]u8, offline_log_dirs_len);
+    errdefer alloc.free(offline_log_dirs);
+    for (offline_log_dirs) |*item| {
+        item.* = try ser.readUuid(data, &tag_pos);
+    }
+    if (tag_pos != data.len) return error.InvalidTaggedField;
+    return offline_log_dirs;
+}
