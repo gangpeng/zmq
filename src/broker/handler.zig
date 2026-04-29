@@ -44,6 +44,8 @@ const max_offset_commit_metadata_bytes: usize = 4096;
 const offset_commit_record_value_magic = "ZMQOC1";
 const consumer_group_snapshot_record_value_magic = "ZMQCG1";
 const consumer_group_snapshot_record_key = "__zmq_consumer_group_snapshot";
+const transaction_snapshot_record_value_magic = "ZMQTX1";
+const transaction_snapshot_record_key = "__zmq_transaction_snapshot";
 const auto_mq_quorum_commit_timeout_ms: i64 = 5000;
 
 /// Stateful Kafka broker.
@@ -680,6 +682,13 @@ pub const Broker = struct {
             log.info("Restored {d} state record(s) from __consumer_offsets", .{recovered_offset_records});
             self.persistOffsets();
             if (self.groups.groups.count() > 0) self.persistConsumerGroups();
+        }
+        const recovered_txn_records = try self.restoreTransactionsFromTransactionStateLog();
+        if (recovered_txn_records > 0) {
+            log.info("Restored {d} transaction state record(s) from __transaction_state", .{recovered_txn_records});
+            self.persistence.saveTransactions(&self.txn_coordinator) catch |err| {
+                log.warn("Failed to persist replayed transaction state: {}", .{err});
+            };
         }
 
         // Load ongoing partition reassignments after topics are available so
@@ -1351,6 +1360,10 @@ pub const Broker = struct {
             log.warn("Failed to persist transaction state: {}", .{err});
             return;
         };
+        self.writeTransactionSnapshotRecord() catch |err| {
+            log.warn("Failed to append transaction snapshot to __transaction_state: {}", .{err});
+            return;
+        };
         self.txn_coordinator.dirty = false;
     }
 
@@ -1690,6 +1703,13 @@ pub const Broker = struct {
         return out;
     }
 
+    fn readSnapshotI16(value: []const u8, pos: *usize) !i16 {
+        if (pos.* + 2 > value.len) return error.InvalidConsumerGroupSnapshot;
+        const out = std.mem.readInt(i16, value[pos.*..][0..2], .big);
+        pos.* += 2;
+        return out;
+    }
+
     fn readSnapshotI32(value: []const u8, pos: *usize) !i32 {
         if (pos.* + 4 > value.len) return error.InvalidConsumerGroupSnapshot;
         const out = std.mem.readInt(i32, value[pos.*..][0..4], .big);
@@ -1822,6 +1842,149 @@ pub const Broker = struct {
         self.groups.groups = groups;
     }
 
+    fn encodeTransactionSnapshotRecordValue(self: *Broker) ![]u8 {
+        var buf = std.array_list.Managed(u8).init(self.allocator);
+        errdefer buf.deinit();
+        const writer = @import("list_compat").writer(&buf);
+
+        try writer.writeAll(transaction_snapshot_record_value_magic);
+        try writer.writeInt(i64, self.txn_coordinator.next_producer_id, .big);
+        try writer.writeInt(u32, @intCast(self.txn_coordinator.transactions.count()), .big);
+
+        var txn_it = self.txn_coordinator.transactions.iterator();
+        while (txn_it.next()) |txn_entry| {
+            const txn = txn_entry.value_ptr;
+            try writer.writeInt(i64, txn.producer_id, .big);
+            try writer.writeInt(i16, txn.producer_epoch, .big);
+            try writer.writeByte(@intFromEnum(txn.status));
+            try writer.writeInt(i32, txn.timeout_ms, .big);
+            try writeSnapshotOptionalBytes(writer, txn.transactional_id);
+            try writer.writeInt(u32, @intCast(txn.partitions.items.len), .big);
+            for (txn.partitions.items) |partition| {
+                try writeSnapshotBytes(writer, partition.topic);
+                try writer.writeInt(i32, partition.partition, .big);
+            }
+        }
+
+        return buf.toOwnedSlice();
+    }
+
+    fn transactionStatusFromInt(value: u8) ?TxnCoordinator.TxnStatus {
+        return switch (value) {
+            0 => .empty,
+            1 => .ongoing,
+            2 => .prepare_commit,
+            3 => .complete_commit,
+            4 => .prepare_abort,
+            5 => .complete_abort,
+            6 => .dead,
+            else => null,
+        };
+    }
+
+    fn freeDecodedTransactionEntry(self: *Broker, entry: MetadataPersistence.TransactionEntry) void {
+        if (entry.transactional_id) |tid| self.allocator.free(tid);
+        for (entry.partitions) |partition| self.allocator.free(partition.topic);
+        if (entry.partitions.len > 0) self.allocator.free(entry.partitions);
+    }
+
+    fn decodeTransactionSnapshotRecordValue(self: *Broker, value: []const u8) !MetadataPersistence.TransactionSnapshot {
+        if (value.len < transaction_snapshot_record_value_magic.len + 8 + 4) return error.InvalidTransactionSnapshot;
+        if (!std.mem.eql(u8, value[0..transaction_snapshot_record_value_magic.len], transaction_snapshot_record_value_magic)) {
+            return error.InvalidTransactionSnapshot;
+        }
+
+        var pos: usize = transaction_snapshot_record_value_magic.len;
+        const next_producer_id = try readSnapshotI64(value, &pos);
+        const txn_count = try readSnapshotU32(value, &pos);
+        var entries = std.array_list.Managed(MetadataPersistence.TransactionEntry).init(self.allocator);
+        errdefer {
+            for (entries.items) |entry| self.freeDecodedTransactionEntry(entry);
+            entries.deinit();
+        }
+
+        for (0..txn_count) |_| {
+            const producer_id = try readSnapshotI64(value, &pos);
+            const producer_epoch = try readSnapshotI16(value, &pos);
+            const status = try readSnapshotByte(value, &pos);
+            if (producer_id < 0 or producer_epoch < 0 or transactionStatusFromInt(status) == null) {
+                return error.InvalidTransactionSnapshot;
+            }
+            const timeout_ms = try readSnapshotI32(value, &pos);
+            if (timeout_ms <= 0) return error.InvalidTransactionSnapshot;
+            const transactional_id = try self.readSnapshotOptionalOwnedBytes(value, &pos);
+            var transactional_id_owned = transactional_id != null;
+            errdefer if (transactional_id_owned) {
+                if (transactional_id) |tid| self.allocator.free(tid);
+            };
+
+            var partitions = std.array_list.Managed(MetadataPersistence.TransactionPartitionEntry).init(self.allocator);
+            defer partitions.deinit();
+            errdefer {
+                for (partitions.items) |partition| self.allocator.free(partition.topic);
+            }
+            const partition_count = try readSnapshotU32(value, &pos);
+            for (0..partition_count) |_| {
+                const topic = try self.readSnapshotOwnedBytes(value, &pos);
+                if (topic.len == 0) {
+                    self.allocator.free(topic);
+                    return error.InvalidTransactionSnapshot;
+                }
+                const partition = try readSnapshotI32(value, &pos);
+                if (partition < 0) {
+                    self.allocator.free(topic);
+                    return error.InvalidTransactionSnapshot;
+                }
+                partitions.append(.{ .topic = topic, .partition = partition }) catch |err| {
+                    self.allocator.free(topic);
+                    return err;
+                };
+            }
+
+            const owned_partitions = try partitions.toOwnedSlice();
+            var owned_partitions_owned = true;
+            errdefer if (owned_partitions_owned) {
+                for (owned_partitions) |partition| self.allocator.free(partition.topic);
+                if (owned_partitions.len > 0) self.allocator.free(owned_partitions);
+            };
+            const entry = MetadataPersistence.TransactionEntry{
+                .producer_id = producer_id,
+                .producer_epoch = producer_epoch,
+                .status = status,
+                .timeout_ms = timeout_ms,
+                .transactional_id = transactional_id,
+                .partitions = owned_partitions,
+            };
+            try entries.append(entry);
+            transactional_id_owned = false;
+            owned_partitions_owned = false;
+        }
+
+        if (pos != value.len) return error.InvalidTransactionSnapshot;
+        return .{
+            .next_producer_id = @max(next_producer_id, 1000),
+            .entries = try entries.toOwnedSlice(),
+        };
+    }
+
+    fn clearTransactionCoordinatorState(self: *Broker) void {
+        var it = self.txn_coordinator.transactions.iterator();
+        while (it.next()) |entry| {
+            entry.value_ptr.deinit(self.allocator);
+        }
+        self.txn_coordinator.transactions.clearRetainingCapacity();
+        self.txn_coordinator.next_producer_id = 1000;
+        self.txn_coordinator.dirty = false;
+    }
+
+    fn applyTransactionSnapshotRecord(self: *Broker, value: []const u8) !void {
+        const snapshot = try self.decodeTransactionSnapshotRecordValue(value);
+        defer self.persistence.freeTransactionSnapshot(snapshot);
+
+        self.clearTransactionCoordinatorState();
+        try self.txn_coordinator.restoreState(snapshot);
+    }
+
     fn offsetCommitKeyParts(key: []const u8) ?struct { group_id: []const u8, topic: []const u8, partition: i32 } {
         var fields = std.mem.splitSequence(u8, key, ":");
         const group_id = fields.next() orelse return null;
@@ -1914,6 +2077,43 @@ pub const Broker = struct {
         self.persistPartitionStates();
     }
 
+    /// Write a full transaction coordinator snapshot to __transaction_state.
+    /// This mirrors Kafka's coordinator durability path enough for stateless
+    /// broker replacement to recover producer IDs, epochs, states, and
+    /// registered transaction partitions from shared WAL/object storage.
+    fn writeTransactionSnapshotRecord(self: *Broker) !void {
+        const info = self.topics.get("__transaction_state") orelse return;
+        if (info.num_partitions <= 0) return;
+
+        const value = try self.encodeTransactionSnapshotRecordValue();
+        defer self.allocator.free(value);
+
+        const rec_batch = protocol.record_batch;
+        const records = [_]rec_batch.Record{
+            .{
+                .offset_delta = 0,
+                .key = transaction_snapshot_record_key,
+                .value = value,
+            },
+        };
+
+        const batch = try rec_batch.buildRecordBatch(
+            self.allocator,
+            0,
+            &records,
+            -1,
+            -1,
+            -1,
+            @import("time_compat").milliTimestamp(),
+            @import("time_compat").milliTimestamp(),
+            0,
+        );
+        defer self.allocator.free(batch);
+
+        _ = try self.store.produce("__transaction_state", 0, batch);
+        self.persistPartitionStates();
+    }
+
     fn restoreOffsetsFromConsumerOffsetsLog(self: *Broker) !usize {
         const info = self.topics.get("__consumer_offsets") orelse return 0;
         if (info.num_partitions <= 0) return 0;
@@ -1973,6 +2173,54 @@ pub const Broker = struct {
             decoded.leader_epoch,
             decoded.metadata,
         );
+        return true;
+    }
+
+    fn restoreTransactionsFromTransactionStateLog(self: *Broker) !usize {
+        const info = self.topics.get("__transaction_state") orelse return 0;
+        if (info.num_partitions <= 0) return 0;
+
+        var restored: usize = 0;
+        for (0..@as(usize, @intCast(info.num_partitions))) |partition_index| {
+            const result = try self.store.fetch("__transaction_state", @intCast(partition_index), 0, 64 * 1024 * 1024);
+            defer if (result.records.len > 0) self.allocator.free(@constCast(result.records));
+            if (result.error_code != @intFromEnum(ErrorCode.none)) return error.TransactionStateLogUnavailable;
+            restored += try self.applyTransactionStateRecordBatches(result.records);
+        }
+        return restored;
+    }
+
+    fn applyTransactionStateRecordBatches(self: *Broker, batches: []const u8) !usize {
+        const rec_batch = protocol.record_batch;
+        var pos: usize = 0;
+        var restored: usize = 0;
+
+        while (pos + rec_batch.BATCH_HEADER_SIZE <= batches.len) {
+            const header = rec_batch.RecordBatchHeader.parse(batches[pos..]) catch break;
+            const batch_size = header.totalBatchSize();
+            if (batch_size == 0 or pos + batch_size > batches.len) break;
+
+            if (header.magic == 2 and !header.isControlBatch() and header.record_count > 0) {
+                var record_pos = pos + rec_batch.BATCH_HEADER_SIZE;
+                const batch_end = pos + batch_size;
+                for (0..@as(usize, @intCast(header.record_count))) |_| {
+                    if (record_pos >= batch_end) break;
+                    const record = rec_batch.parseRecord(batches, &record_pos) catch break;
+                    const key = record.key orelse continue;
+                    const value = record.value orelse continue;
+                    if (try self.applyTransactionStateRecord(key, value)) restored += 1;
+                }
+            }
+
+            pos += batch_size;
+        }
+
+        return restored;
+    }
+
+    fn applyTransactionStateRecord(self: *Broker, key: []const u8, value: []const u8) !bool {
+        if (!std.mem.eql(u8, key, transaction_snapshot_record_key)) return false;
+        try self.applyTransactionSnapshotRecord(value);
         return true;
     }
 
@@ -19684,6 +19932,64 @@ test "Broker restores consumer group lifecycle from S3 consumer offsets log" {
         try testing.expectEqualStrings(assignment, member.assignment.?);
         try testing.expectEqual(@as(usize, 1), member.subscribed_topics.items.len);
         try testing.expectEqualStrings("stateless-group-topic", member.subscribed_topics.items[0]);
+    }
+}
+
+test "Broker restores transaction metadata from S3 transaction state log" {
+    var mock_s3 = storage.MockS3.init(testing.allocator);
+    defer mock_s3.deinit();
+    const s3_storage = storage.S3Storage.initMock(testing.allocator, &mock_s3);
+
+    var producer_id: i64 = -1;
+    var producer_epoch: i16 = -1;
+    {
+        var broker = Broker.init(testing.allocator, 1, 9092);
+        defer broker.deinit();
+        broker.store.s3_wal_mode = true;
+        broker.store.s3_storage = s3_storage;
+        broker.store.s3_wal_batcher = storage.wal.S3WalBatcher.init(testing.allocator);
+
+        try broker.open();
+        try testing.expect(broker.ensureTopic("stateless-txn-topic"));
+        const init = try broker.txn_coordinator.initProducerIdWithTimeout("stateless-txn", 45000);
+        try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.none)), init.error_code);
+        producer_id = init.producer_id;
+        producer_epoch = init.producer_epoch;
+
+        const add_error = try broker.txn_coordinator.addPartitionsToTxn(
+            producer_id,
+            producer_epoch,
+            "stateless-txn-topic",
+            0,
+        );
+        try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.none)), add_error);
+        broker.persistTransactionsIfDirty();
+    }
+
+    {
+        var broker = Broker.init(testing.allocator, 1, 9092);
+        defer broker.deinit();
+        broker.store.s3_wal_mode = true;
+        broker.store.s3_storage = s3_storage;
+        broker.store.s3_wal_batcher = storage.wal.S3WalBatcher.init(testing.allocator);
+
+        try broker.open();
+
+        try testing.expectEqual(producer_id + 1, broker.txn_coordinator.next_producer_id);
+        const txn = broker.txn_coordinator.transactions.getPtr(producer_id).?;
+        try testing.expectEqual(producer_id, txn.producer_id);
+        try testing.expectEqual(producer_epoch, txn.producer_epoch);
+        try testing.expectEqual(TxnCoordinator.TxnStatus.ongoing, txn.status);
+        try testing.expectEqualStrings("stateless-txn", txn.transactional_id.?);
+        try testing.expectEqual(@as(i32, 45000), txn.timeout_ms);
+        try testing.expectEqual(@as(usize, 1), txn.partitions.items.len);
+        try testing.expectEqualStrings("stateless-txn-topic", txn.partitions.items[0].topic);
+        try testing.expectEqual(@as(i32, 0), txn.partitions.items[0].partition);
+
+        const bumped = try broker.txn_coordinator.initProducerIdForRequest("stateless-txn", producer_id, producer_epoch);
+        try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.none)), bumped.error_code);
+        try testing.expectEqual(producer_id, bumped.producer_id);
+        try testing.expectEqual(producer_epoch + 1, bumped.producer_epoch);
     }
 }
 
