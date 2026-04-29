@@ -2082,6 +2082,12 @@ pub const Broker = struct {
         try self.txn_coordinator.restoreState(snapshot);
     }
 
+    fn restoreTransactionsAfterFailedMutation(self: *Broker, snapshot_value: []const u8) void {
+        self.applyTransactionSnapshotRecord(snapshot_value) catch |restore_err| {
+            log.err("Failed to restore transaction snapshot after failed mutation: {}", .{restore_err});
+        };
+    }
+
     fn encodeTopicSnapshotRecordValue(self: *Broker) ![]u8 {
         var buf = std.array_list.Managed(u8).init(self.allocator);
         errdefer buf.deinit();
@@ -8020,10 +8026,14 @@ pub const Broker = struct {
             return null;
         };
 
+        const previous_snapshot = self.encodeTransactionSnapshotRecordValue() catch return null;
+        defer self.allocator.free(previous_snapshot);
+
         const result = self.txn_coordinator.initProducerIdForRequestWithTimeout(req.transactional_id, req.transaction_timeout_ms, req.producer_id, req.producer_epoch) catch return null;
         if (result.error_code == @intFromEnum(ErrorCode.none)) {
             self.persistTransactionsIfDirtyDurably() catch |err| {
                 log.warn("InitProducerId transaction snapshot write failed for {s}: {}", .{ req.transactional_id orelse "", err });
+                self.restoreTransactionsAfterFailedMutation(previous_snapshot);
                 const resp = Resp{
                     .throttle_time_ms = 0,
                     .error_code = @intFromEnum(ErrorCode.kafka_storage_error),
@@ -23077,7 +23087,9 @@ test "Broker InitProducerId fails closed when transaction snapshot S3 WAL write 
     try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.kafka_storage_error)), resp.error_code);
     try testing.expectEqual(@as(i64, -1), resp.producer_id);
     try testing.expectEqual(@as(i16, -1), resp.producer_epoch);
-    try testing.expect(broker.txn_coordinator.dirty);
+    try testing.expect(!broker.txn_coordinator.dirty);
+    try testing.expectEqual(@as(usize, 0), broker.txn_coordinator.transactionCount());
+    try testing.expectEqual(@as(i64, 1000), broker.txn_coordinator.next_producer_id);
     try testing.expectEqual(@as(usize, 0), mock_s3.objectCount());
 }
 
