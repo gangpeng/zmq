@@ -8728,6 +8728,10 @@ pub const Broker = struct {
         const previous_snapshot = self.encodeTransactionSnapshotRecordValue() catch return null;
         defer self.allocator.free(previous_snapshot);
 
+        if (self.store.s3_wal_mode) {
+            return self.handleEndTxnS3Wal(req, req_header, api_version, resp_header_version, previous_snapshot);
+        }
+
         // Before completing the txn, get the partition list so we can write control batches
         const control_type: @import("txn_coordinator.zig").TransactionCoordinator.ControlRecordType = if (req.committed) .commit else .abort;
         var marker_error: i16 = @intFromEnum(ErrorCode.none);
@@ -8753,6 +8757,90 @@ pub const Broker = struct {
                 };
                 return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
             };
+        } else {
+            self.persistTransactionsIfDirty();
+        }
+
+        const resp = Resp{
+            .throttle_time_ms = 0,
+            .error_code = error_code,
+        };
+        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+    }
+
+    fn handleEndTxnS3Wal(
+        self: *Broker,
+        req: generated.end_txn_request.EndTxnRequest,
+        req_header: *const RequestHeader,
+        api_version: i16,
+        resp_header_version: i16,
+        previous_snapshot: []const u8,
+    ) ?[]u8 {
+        const Resp = generated.end_txn_response.EndTxnResponse;
+
+        var pending_writes = std.array_list.Managed(PendingTxnMarkerS3WalWrite).init(self.allocator);
+        defer {
+            for (pending_writes.items) |write| {
+                self.allocator.free(write.topic);
+                self.allocator.free(write.data);
+            }
+            pending_writes.deinit();
+        }
+
+        var provisional_offsets = std.AutoHashMap(u64, u64).init(self.allocator);
+        defer provisional_offsets.deinit();
+
+        const control_type: TxnCoordinator.ControlRecordType = if (req.committed) .commit else .abort;
+        if (self.txn_coordinator.getPartitions(req.producer_id)) |partitions| {
+            for (partitions) |tp| {
+                const write_result = self.planTxnControlBatchS3WalPartition(
+                    req.producer_id,
+                    req.producer_epoch,
+                    control_type,
+                    tp.topic,
+                    tp.partition,
+                    &provisional_offsets,
+                    &pending_writes,
+                );
+                if (write_result.error_code != @intFromEnum(ErrorCode.none)) {
+                    const resp = Resp{
+                        .throttle_time_ms = 0,
+                        .error_code = write_result.error_code,
+                    };
+                    return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+                }
+            }
+        }
+
+        const error_code = self.txn_coordinator.endTxnComplete(req.producer_id, req.producer_epoch, req.committed);
+        if (error_code == @intFromEnum(ErrorCode.none)) {
+            self.planTransactionSnapshotS3WalWrite(&provisional_offsets, &pending_writes) catch |err| {
+                log.warn("EndTxn transaction snapshot build failed for {s}: {}", .{ req.transactional_id orelse "", err });
+                self.restoreTransactionsAfterFailedMutation(previous_snapshot);
+                const resp = Resp{
+                    .throttle_time_ms = 0,
+                    .error_code = @intFromEnum(ErrorCode.kafka_storage_error),
+                };
+                return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+            };
+
+            self.flushPendingTxnMarkerS3WalWrites(pending_writes.items) catch |err| {
+                log.warn("EndTxn atomic S3 WAL flush failed for {s}: {}", .{ req.transactional_id orelse "", err });
+                self.restoreTransactionsAfterFailedMutation(previous_snapshot);
+                const resp = Resp{
+                    .throttle_time_ms = 0,
+                    .error_code = @intFromEnum(ErrorCode.kafka_storage_error),
+                };
+                return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+            };
+
+            self.applyCommittedTxnMarkerS3WalWrites(pending_writes.items);
+            self.persistPartitionStates();
+            self.persistObjectManagerSnapshot();
+            self.persistence.saveTransactions(&self.txn_coordinator) catch |err| {
+                log.warn("Failed to persist transaction state after atomic EndTxn S3 WAL flush: {}", .{err});
+            };
+            self.txn_coordinator.dirty = false;
         } else {
             self.persistTransactionsIfDirty();
         }
@@ -11921,7 +12009,7 @@ pub const Broker = struct {
     }
 
     const PendingTxnMarkerS3WalWrite = struct {
-        topic: []const u8,
+        topic: []u8,
         partition_index: i32,
         stream_id: u64,
         base_offset: u64,
@@ -11946,7 +12034,10 @@ pub const Broker = struct {
 
         var pending_writes = std.array_list.Managed(PendingTxnMarkerS3WalWrite).init(self.allocator);
         defer {
-            for (pending_writes.items) |write| self.allocator.free(write.data);
+            for (pending_writes.items) |write| {
+                self.allocator.free(write.topic);
+                self.allocator.free(write.data);
+            }
             pending_writes.deinit();
         }
 
@@ -12058,6 +12149,28 @@ pub const Broker = struct {
         provisional_offsets: *std.AutoHashMap(u64, u64),
         pending_writes: *std.array_list.Managed(PendingTxnMarkerS3WalWrite),
     ) TxnMarkerPartitionWriteResult {
+        const control_type: TxnCoordinator.ControlRecordType = if (marker.transaction_result) .commit else .abort;
+        return self.planTxnControlBatchS3WalPartition(
+            marker.producer_id,
+            marker.producer_epoch,
+            control_type,
+            topic,
+            partition_index,
+            provisional_offsets,
+            pending_writes,
+        );
+    }
+
+    fn planTxnControlBatchS3WalPartition(
+        self: *Broker,
+        producer_id: i64,
+        producer_epoch: i16,
+        control_type: TxnCoordinator.ControlRecordType,
+        topic: []const u8,
+        partition_index: i32,
+        provisional_offsets: *std.AutoHashMap(u64, u64),
+        pending_writes: *std.array_list.Managed(PendingTxnMarkerS3WalWrite),
+    ) TxnMarkerPartitionWriteResult {
         if (topic.len == 0 or partition_index < 0) {
             return .{ .error_code = @intFromEnum(ErrorCode.invalid_request) };
         }
@@ -12071,19 +12184,23 @@ pub const Broker = struct {
             return .{ .error_code = @intFromEnum(ErrorCode.kafka_storage_error) };
         };
 
-        const control_type: TxnCoordinator.ControlRecordType = if (marker.transaction_result) .commit else .abort;
         const control_batch = self.txn_coordinator.buildControlBatch(
-            marker.producer_id,
-            marker.producer_epoch,
+            producer_id,
+            producer_epoch,
             control_type,
             @intCast(base_offset),
         ) catch |err| {
             log.warn("Failed to build transaction marker batch for {s}-{d}: {}", .{ topic, partition_index, err });
             return .{ .error_code = @intFromEnum(ErrorCode.kafka_storage_error) };
         };
+        const topic_copy = self.allocator.dupe(u8, topic) catch |err| {
+            self.allocator.free(control_batch);
+            log.warn("Failed to stage transaction marker topic for {s}-{d}: {}", .{ topic, partition_index, err });
+            return .{ .error_code = @intFromEnum(ErrorCode.kafka_storage_error) };
+        };
 
         pending_writes.append(.{
-            .topic = topic,
+            .topic = topic_copy,
             .partition_index = partition_index,
             .stream_id = stream_id,
             .base_offset = base_offset,
@@ -12091,6 +12208,7 @@ pub const Broker = struct {
             .data = control_batch,
             .clear_unstable = true,
         }) catch |err| {
+            self.allocator.free(topic_copy);
             self.allocator.free(control_batch);
             log.warn("Failed to stage transaction marker batch for {s}-{d}: {}", .{ topic, partition_index, err });
             return .{ .error_code = @intFromEnum(ErrorCode.kafka_storage_error) };
@@ -12118,11 +12236,13 @@ pub const Broker = struct {
         errdefer self.allocator.free(snapshot_batch);
 
         const topic = "__transaction_state";
+        const topic_copy = try self.allocator.dupe(u8, topic);
+        errdefer self.allocator.free(topic_copy);
         const partition_index: i32 = 0;
         const stream_id = PartitionStore.hashPartitionKey(topic, partition_index);
         const base_offset = try self.pendingS3WalBaseOffset(topic, partition_index, stream_id, provisional_offsets);
         try pending_writes.append(.{
-            .topic = topic,
+            .topic = topic_copy,
             .partition_index = partition_index,
             .stream_id = stream_id,
             .base_offset = base_offset,
@@ -24475,10 +24595,10 @@ test "Broker.handleRequest EndTxn rolls back when transaction snapshot S3 WAL wr
     broker.store.s3_storage = s3_storage;
     broker.store.s3_wal_batcher = storage.wal.S3WalBatcher.init(testing.allocator);
     try broker.open();
+    try testing.expect(broker.ensureTopic("txn-end-snapshot-fail-topic"));
 
     const init_result = try broker.txn_coordinator.initProducerId("txn-end-snapshot-fail");
-    broker.txn_coordinator.transactions.getPtr(init_result.producer_id).?.status = .ongoing;
-    broker.txn_coordinator.dirty = true;
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.none)), try broker.txn_coordinator.addPartitionsToTxn(init_result.producer_id, init_result.producer_epoch, "txn-end-snapshot-fail-topic", 0));
     try broker.persistTransactionsIfDirtyDurably();
 
     const object_count_before = mock_s3.objectCount();
@@ -24508,9 +24628,69 @@ test "Broker.handleRequest EndTxn rolls back when transaction snapshot S3 WAL wr
     try testing.expectEqual(response.?.len, rpos);
     try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.kafka_storage_error)), resp.error_code);
     try testing.expectEqual(TxnCoordinator.TxnStatus.ongoing, broker.txn_coordinator.getStatus(init_result.producer_id).?);
-    try testing.expectEqual(@as(usize, 0), broker.txn_coordinator.getPartitions(init_result.producer_id).?.len);
+    try testing.expectEqual(@as(usize, 1), broker.txn_coordinator.getPartitions(init_result.producer_id).?.len);
     try testing.expect(!broker.txn_coordinator.dirty);
     try testing.expectEqual(object_count_before, mock_s3.objectCount());
+    const state = broker.store.partitions.get("txn-end-snapshot-fail-topic-0").?;
+    try testing.expectEqual(@as(u64, 0), state.next_offset);
+    try testing.expectEqual(@as(u64, 0), state.high_watermark);
+}
+
+test "Broker.handleRequest EndTxn S3 WAL commits markers and transaction snapshot atomically" {
+    const Req = generated.end_txn_request.EndTxnRequest;
+    const Resp = generated.end_txn_response.EndTxnResponse;
+
+    var mock_s3 = storage.MockS3.init(testing.allocator);
+    defer mock_s3.deinit();
+    const s3_storage = storage.S3Storage.initMock(testing.allocator, &mock_s3);
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+    broker.store.s3_wal_mode = true;
+    broker.store.s3_storage = s3_storage;
+    broker.store.s3_wal_batcher = storage.wal.S3WalBatcher.init(testing.allocator);
+    try broker.open();
+    try testing.expect(broker.ensureTopic("txn-end-atomic-topic"));
+
+    const init_result = try broker.txn_coordinator.initProducerId("txn-end-atomic");
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.none)), try broker.txn_coordinator.addPartitionsToTxn(init_result.producer_id, init_result.producer_epoch, "txn-end-atomic-topic", 0));
+    try broker.persistTransactionsIfDirtyDurably();
+
+    const object_count_before = mock_s3.objectCount();
+
+    const req = Req{
+        .transactional_id = "txn-end-atomic",
+        .producer_id = init_result.producer_id,
+        .producer_epoch = init_result.producer_epoch,
+        .committed = true,
+    };
+
+    var buf: [512]u8 = undefined;
+    var pos = buildTestRequest(&buf, 26, 3, 2609, header_mod.requestHeaderVersion(26, 3));
+    req.serialize(&buf, &pos, 3);
+
+    const response = broker.handleRequest(buf[0..pos]);
+    try testing.expect(response != null);
+    defer testing.allocator.free(response.?);
+
+    var rpos: usize = 0;
+    var response_header = try ResponseHeader.deserialize(testing.allocator, response.?, &rpos, header_mod.responseHeaderVersion(26, 3));
+    defer response_header.deinit(testing.allocator);
+    try testing.expectEqual(@as(i32, 2609), response_header.correlation_id);
+
+    const resp = try Resp.deserialize(testing.allocator, response.?, &rpos, 3);
+    try testing.expectEqual(response.?.len, rpos);
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.none)), resp.error_code);
+    try testing.expectEqual(TxnCoordinator.TxnStatus.complete_commit, broker.txn_coordinator.getStatus(init_result.producer_id).?);
+    try testing.expectEqual(@as(usize, 0), broker.txn_coordinator.getPartitions(init_result.producer_id).?.len);
+    try testing.expect(!broker.txn_coordinator.dirty);
+    try testing.expectEqual(object_count_before + 1, mock_s3.objectCount());
+
+    const state = broker.store.partitions.get("txn-end-atomic-topic-0").?;
+    try testing.expectEqual(@as(u64, 1), state.next_offset);
+    try testing.expectEqual(@as(u64, 1), state.high_watermark);
+    try testing.expectEqual(@as(u64, 1), state.last_stable_offset);
+    try testing.expect(state.first_unstable_txn_offset == null);
 }
 
 test "Broker.handleRequest EndTxn rejects transactional id mismatch before marker write" {
