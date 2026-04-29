@@ -712,6 +712,11 @@ pub const Broker = struct {
                 log.warn("Failed to persist replayed transaction state: {}", .{err});
             };
         }
+        const rebuilt_producer_sequences = try self.rebuildProducerSequencesFromLogs();
+        if (rebuilt_producer_sequences > 0) {
+            log.info("Rebuilt {d} producer sequence state update(s) from durable logs", .{rebuilt_producer_sequences});
+            self.persistProducerSequencesIfDirty();
+        }
 
         // Load ongoing partition reassignments after topics are available so
         // stale entries for deleted or out-of-range partitions can be ignored.
@@ -4217,6 +4222,11 @@ pub const Broker = struct {
         // Idempotent producer dedup + CRC validation
         var is_duplicate = false;
         var crc_valid = true;
+        const PendingProducerSequenceUpdate = struct {
+            key: ProducerKey,
+            state: ProducerSequenceState,
+        };
+        var pending_producer_sequence: ?PendingProducerSequenceUpdate = null;
         if (partition_req.records) |rec| {
             if (rec.len >= 53) { // Minimum V2 record batch header
                 const rec_batch = protocol.record_batch;
@@ -4253,12 +4263,14 @@ pub const Broker = struct {
                                 }
                             }
                         }
-                        if (!is_duplicate) {
-                            self.producer_sequences.put(pk, .{
-                                .last_sequence = hdr.base_sequence,
-                                .producer_epoch = hdr.producer_epoch,
-                            }) catch {};
-                            self.producer_sequences_dirty = true;
+                        if (!is_duplicate and crc_valid) {
+                            pending_producer_sequence = .{
+                                .key = pk,
+                                .state = .{
+                                    .last_sequence = producerSequenceLastForBatch(hdr),
+                                    .producer_epoch = hdr.producer_epoch,
+                                },
+                            };
                         }
                     }
                 }
@@ -4290,6 +4302,13 @@ pub const Broker = struct {
             }
         else
             null;
+
+        if (produce_result != null) {
+            if (pending_producer_sequence) |update| {
+                self.producer_sequences.put(update.key, update.state) catch {};
+                self.producer_sequences_dirty = true;
+            }
+        }
 
         // Detect MessageTooLarge specifically for proper error code
         const produce_error_code: i16 = if (is_duplicate)
@@ -4347,6 +4366,93 @@ pub const Broker = struct {
             .record_errors = &.{},
             .error_message = null,
         };
+    }
+
+    fn producerSequenceLastForBatch(hdr: protocol.record_batch.RecordBatchHeader) i32 {
+        const record_count = @max(hdr.record_count, 1);
+        const last_sequence = @as(i64, hdr.base_sequence) + @as(i64, record_count) - 1;
+        if (last_sequence > std.math.maxInt(i32)) return std.math.maxInt(i32);
+        if (last_sequence < std.math.minInt(i32)) return std.math.minInt(i32);
+        return @intCast(last_sequence);
+    }
+
+    fn applyRecoveredProducerSequence(
+        self: *Broker,
+        producer_id: i64,
+        partition_key: u64,
+        producer_epoch: i16,
+        last_sequence: i32,
+    ) !bool {
+        const key = Broker.ProducerKey{
+            .producer_id = producer_id,
+            .partition_key = partition_key,
+        };
+        if (self.producer_sequences.get(key)) |stored| {
+            if (producer_epoch < stored.producer_epoch) return false;
+            if (producer_epoch == stored.producer_epoch and last_sequence <= stored.last_sequence) return false;
+        }
+        try self.producer_sequences.put(key, .{
+            .last_sequence = last_sequence,
+            .producer_epoch = producer_epoch,
+        });
+        return true;
+    }
+
+    const ProducerSequenceReplayCounts = struct {
+        updates: usize = 0,
+        records: u64 = 0,
+    };
+
+    fn rebuildProducerSequencesFromRecordBatches(self: *Broker, topic_name: []const u8, partition_index: i32, batches: []const u8) !ProducerSequenceReplayCounts {
+        const rec_batch = protocol.record_batch;
+        const partition_key = PartitionStore.hashPartitionKey(topic_name, partition_index);
+        var pos: usize = 0;
+        var rebuilt = ProducerSequenceReplayCounts{};
+
+        while (pos + rec_batch.BATCH_HEADER_SIZE <= batches.len) {
+            const hdr = rec_batch.RecordBatchHeader.parse(batches[pos..]) catch break;
+            const batch_size = hdr.totalBatchSize();
+            if (batch_size == 0 or pos + batch_size > batches.len) break;
+            rebuilt.records += @intCast(@max(hdr.record_count, 1));
+
+            if (hdr.magic == 2 and !hdr.isControlBatch() and hdr.producer_id >= 0) {
+                if (try self.applyRecoveredProducerSequence(
+                    hdr.producer_id,
+                    partition_key,
+                    hdr.producer_epoch,
+                    producerSequenceLastForBatch(hdr),
+                )) rebuilt.updates += 1;
+            }
+
+            pos += batch_size;
+        }
+
+        return rebuilt;
+    }
+
+    fn rebuildProducerSequencesFromLogs(self: *Broker) !usize {
+        var rebuilt: usize = 0;
+        var it = self.store.partitions.iterator();
+        while (it.next()) |entry| {
+            const state = entry.value_ptr.*;
+            if (state.next_offset <= state.log_start_offset) continue;
+
+            var offset = state.log_start_offset;
+            while (offset < state.next_offset) {
+                const result = try self.store.fetch(state.topic, state.partition_id, offset, 64 * 1024 * 1024);
+                defer if (result.records.len > 0) self.allocator.free(@constCast(result.records));
+                if (result.error_code != @intFromEnum(ErrorCode.none)) return error.ProducerSequenceLogUnavailable;
+                if (result.records.len == 0) break;
+
+                const counts = try self.rebuildProducerSequencesFromRecordBatches(state.topic, state.partition_id, result.records);
+                rebuilt += counts.updates;
+                if (counts.records == 0) break;
+                offset += counts.records;
+            }
+        }
+
+        if (rebuilt > 0) self.producer_sequences_dirty = true;
+        return rebuilt;
     }
 
     // ---------------------------------------------------------------
@@ -15899,6 +16005,182 @@ test "Broker.handleRequest Produce persists idempotent producer sequence" {
     try testing.expectEqual(@as(i16, 2), loaded[0].producer_epoch);
     try testing.expectEqual(@as(i32, 7), loaded[0].last_sequence);
     try testing.expectEqual(PartitionStore.hashPartitionKey("produce-sequence-persist-topic", 0), loaded[0].partition_key);
+}
+
+test "Broker.handleRequest Produce does not advance idempotent sequence on S3 WAL failure" {
+    const Req = generated.produce_request.ProduceRequest;
+    const Topic = Req.TopicProduceData;
+    const Partition = Topic.PartitionProduceData;
+    const Resp = generated.produce_response.ProduceResponse;
+    const rec_batch = protocol.record_batch;
+
+    var mock_s3 = storage.MockS3.init(testing.allocator);
+    defer mock_s3.deinit();
+    const s3_storage = storage.S3Storage.initMock(testing.allocator, &mock_s3);
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+    broker.store.s3_wal_mode = true;
+    broker.store.s3_storage = s3_storage;
+    broker.store.s3_wal_batcher = storage.wal.S3WalBatcher.init(testing.allocator);
+
+    try broker.open();
+    try testing.expect(broker.ensureTopic("produce-sequence-fail-topic"));
+    mock_s3.failNextPutObjects(3);
+
+    const records = [_]rec_batch.Record{.{
+        .offset_delta = 0,
+        .value = "seq-fail-value",
+    }};
+    const batch = try rec_batch.buildRecordBatch(
+        testing.allocator,
+        0,
+        &records,
+        62010,
+        3,
+        11,
+        12345,
+        12345,
+        0,
+    );
+    defer testing.allocator.free(batch);
+
+    const partitions = [_]Partition{.{
+        .index = 0,
+        .records = batch,
+    }};
+    const topics = [_]Topic{.{
+        .name = "produce-sequence-fail-topic",
+        .partition_data = &partitions,
+    }};
+    const req = Req{
+        .transactional_id = null,
+        .acks = 1,
+        .timeout_ms = 30000,
+        .topic_data = &topics,
+    };
+
+    var buf: [2048]u8 = undefined;
+    var pos = buildTestRequest(&buf, 0, 9, 312, header_mod.requestHeaderVersion(0, 9));
+    req.serialize(&buf, &pos, 9);
+
+    const response = broker.handleRequest(buf[0..pos]);
+    try testing.expect(response != null);
+    defer testing.allocator.free(response.?);
+
+    var rpos: usize = 0;
+    var response_header = try ResponseHeader.deserialize(testing.allocator, response.?, &rpos, header_mod.responseHeaderVersion(0, 9));
+    defer response_header.deinit(testing.allocator);
+    try testing.expectEqual(@as(i32, 312), response_header.correlation_id);
+
+    const resp = try Resp.deserialize(testing.allocator, response.?, &rpos, 9);
+    defer freeDeserializedProduceResponse(&resp);
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.kafka_storage_error)), resp.responses[0].partition_responses[0].error_code);
+    try testing.expectEqual(@as(u32, 0), broker.producer_sequences.count());
+    try testing.expect(!broker.producer_sequences_dirty);
+}
+
+test "Broker rebuilds idempotent producer sequence state from S3 WAL" {
+    const Req = generated.produce_request.ProduceRequest;
+    const Topic = Req.TopicProduceData;
+    const Partition = Topic.PartitionProduceData;
+    const Resp = generated.produce_response.ProduceResponse;
+    const rec_batch = protocol.record_batch;
+
+    var mock_s3 = storage.MockS3.init(testing.allocator);
+    defer mock_s3.deinit();
+    const s3_storage = storage.S3Storage.initMock(testing.allocator, &mock_s3);
+
+    const topic_name = "produce-sequence-s3-recovery";
+    const producer_id: i64 = 62011;
+    const producer_epoch: i16 = 4;
+    const base_sequence: i32 = 3;
+
+    const records = [_]rec_batch.Record{
+        .{ .offset_delta = 0, .value = "seq-a" },
+        .{ .offset_delta = 1, .value = "seq-b" },
+    };
+    const batch = try rec_batch.buildRecordBatch(
+        testing.allocator,
+        0,
+        &records,
+        producer_id,
+        producer_epoch,
+        base_sequence,
+        12345,
+        12345,
+        0,
+    );
+    defer testing.allocator.free(batch);
+
+    {
+        var broker = Broker.init(testing.allocator, 1, 9092);
+        defer broker.deinit();
+        broker.store.s3_wal_mode = true;
+        broker.store.s3_storage = s3_storage;
+        broker.store.s3_wal_batcher = storage.wal.S3WalBatcher.init(testing.allocator);
+
+        try broker.open();
+        try testing.expect(broker.ensureTopic(topic_name));
+
+        const partitions = [_]Partition{.{
+            .index = 0,
+            .records = batch,
+        }};
+        const topics = [_]Topic{.{
+            .name = topic_name,
+            .partition_data = &partitions,
+        }};
+        const req = Req{
+            .transactional_id = null,
+            .acks = 1,
+            .timeout_ms = 30000,
+            .topic_data = &topics,
+        };
+
+        var buf: [2048]u8 = undefined;
+        var pos = buildTestRequest(&buf, 0, 9, 313, header_mod.requestHeaderVersion(0, 9));
+        req.serialize(&buf, &pos, 9);
+
+        const response = broker.handleRequest(buf[0..pos]);
+        try testing.expect(response != null);
+        defer testing.allocator.free(response.?);
+
+        var rpos: usize = 0;
+        var response_header = try ResponseHeader.deserialize(testing.allocator, response.?, &rpos, header_mod.responseHeaderVersion(0, 9));
+        defer response_header.deinit(testing.allocator);
+        try testing.expectEqual(@as(i32, 313), response_header.correlation_id);
+
+        const resp = try Resp.deserialize(testing.allocator, response.?, &rpos, 9);
+        defer freeDeserializedProduceResponse(&resp);
+        try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.none)), resp.responses[0].partition_responses[0].error_code);
+
+        const key = Broker.ProducerKey{
+            .producer_id = producer_id,
+            .partition_key = PartitionStore.hashPartitionKey(topic_name, 0),
+        };
+        const local_state = broker.producer_sequences.get(key).?;
+        try testing.expectEqual(@as(i16, producer_epoch), local_state.producer_epoch);
+        try testing.expectEqual(@as(i32, base_sequence + 1), local_state.last_sequence);
+    }
+
+    {
+        var broker = Broker.init(testing.allocator, 1, 9092);
+        defer broker.deinit();
+        broker.store.s3_wal_mode = true;
+        broker.store.s3_storage = s3_storage;
+        broker.store.s3_wal_batcher = storage.wal.S3WalBatcher.init(testing.allocator);
+
+        try broker.open();
+
+        const key = Broker.ProducerKey{
+            .producer_id = producer_id,
+            .partition_key = PartitionStore.hashPartitionKey(topic_name, 0),
+        };
+        const rebuilt_state = broker.producer_sequences.get(key).?;
+        try testing.expectEqual(@as(i16, producer_epoch), rebuilt_state.producer_epoch);
+        try testing.expectEqual(@as(i32, base_sequence + 1), rebuilt_state.last_sequence);
+    }
 }
 
 test "Broker.handleRequest Produce rejects truncated request" {
