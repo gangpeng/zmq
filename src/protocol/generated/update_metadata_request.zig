@@ -38,9 +38,7 @@ pub const UpdateMetadataPartitionState = struct {
     offline_replicas: []const i32 = &.{},
 
     pub fn serialize(self: *const UpdateMetadataPartitionState, buf: []u8, pos: *usize, version: i16) void {
-        if (version >= 6) {
-            ser.writeCompactString(buf, pos, self.topic_name);
-        } else {
+        if (version <= 4) {
             ser.writeString(buf, pos, self.topic_name);
         }
         ser.writeI32(buf, pos, self.partition_index);
@@ -79,10 +77,9 @@ pub const UpdateMetadataPartitionState = struct {
 
     pub fn deserialize(alloc: Allocator, buf: []const u8, pos: *usize, version: i16) !UpdateMetadataPartitionState {
         var result = UpdateMetadataPartitionState{};
-        result.topic_name = if (version >= 6)
-            try ser.readCompactString(buf, pos)
-        else
-            try ser.readString(buf, pos);
+        if (version <= 4) {
+            result.topic_name = try ser.readString(buf, pos);
+        }
         result.partition_index = ser.readI32(buf, pos);
         result.controller_epoch = ser.readI32(buf, pos);
         result.leader = ser.readI32(buf, pos);
@@ -129,9 +126,7 @@ pub const UpdateMetadataPartitionState = struct {
 
     pub fn calcSize(self: *const UpdateMetadataPartitionState, version: i16) usize {
         var size: usize = 0;
-        if (version >= 6) {
-            size += ser.compactStringSize(self.topic_name);
-        } else {
+        if (version <= 4) {
             size += ser.stringSize(self.topic_name);
         }
         size += 4;
@@ -363,12 +358,10 @@ pub const UpdateMetadataRequest = struct {
 
         pub fn serialize(self: *const UpdateMetadataBroker, buf: []u8, pos: *usize, version: i16) void {
             ser.writeI32(buf, pos, self.id);
-            if (version >= 6) {
-                ser.writeCompactString(buf, pos, self.v0_host);
-            } else {
+            if (version == 0) {
                 ser.writeString(buf, pos, self.v0_host);
+                ser.writeI32(buf, pos, self.v0_port);
             }
-            ser.writeI32(buf, pos, self.v0_port);
             if (version >= 1) {
                 if (version >= 6) {
                     ser.writeCompactArrayLen(buf, pos, self.endpoints.len);
@@ -392,11 +385,10 @@ pub const UpdateMetadataRequest = struct {
         pub fn deserialize(alloc: Allocator, buf: []const u8, pos: *usize, version: i16) !UpdateMetadataBroker {
             var result = UpdateMetadataBroker{};
             result.id = ser.readI32(buf, pos);
-            result.v0_host = if (version >= 6)
-                try ser.readCompactString(buf, pos)
-            else
-                try ser.readString(buf, pos);
-            result.v0_port = ser.readI32(buf, pos);
+            if (version == 0) {
+                result.v0_host = try ser.readString(buf, pos);
+                result.v0_port = ser.readI32(buf, pos);
+            }
             if (version >= 1) {
                 const endpoints_len: usize = if (version >= 6)
                     (try ser.readCompactArrayLen(buf, pos)) orelse 0
@@ -423,12 +415,10 @@ pub const UpdateMetadataRequest = struct {
         pub fn calcSize(self: *const UpdateMetadataBroker, version: i16) usize {
             var size: usize = 0;
             size += 4;
-            if (version >= 6) {
-                size += ser.compactStringSize(self.v0_host);
-            } else {
+            if (version == 0) {
                 size += ser.stringSize(self.v0_host);
+                size += 4;
             }
-            size += 4;
             if (version >= 1) {
                 if (version >= 6) {
                     size += ser.unsignedVarintSize(self.endpoints.len + 1);
@@ -485,13 +475,11 @@ pub const UpdateMetadataRequest = struct {
         if (version >= 5) {
             ser.writeI64(buf, pos, self.broker_epoch);
         }
-        if (version >= 6) {
-            ser.writeCompactArrayLen(buf, pos, self.ungrouped_partition_states.len);
-        } else {
+        if (version <= 4) {
             ser.writeArrayLen(buf, pos, self.ungrouped_partition_states.len);
-        }
-        for (self.ungrouped_partition_states) |item| {
-            item.serialize(buf, pos, version);
+            for (self.ungrouped_partition_states) |item| {
+                item.serialize(buf, pos, version);
+            }
         }
         if (version >= 5) {
             if (version >= 6) {
@@ -532,16 +520,15 @@ pub const UpdateMetadataRequest = struct {
         if (version >= 5) {
             result.broker_epoch = ser.readI64(buf, pos);
         }
-        const ungrouped_partition_states_len: usize = if (version >= 6)
-            (try ser.readCompactArrayLen(buf, pos)) orelse 0
-        else
-            (try ser.readArrayLen(buf, pos)) orelse 0;
-        if (ungrouped_partition_states_len > 0) {
-            const ungrouped_partition_states_items = try alloc.alloc(UpdateMetadataPartitionState, ungrouped_partition_states_len);
-            for (ungrouped_partition_states_items) |*item| {
-                item.* = try UpdateMetadataPartitionState.deserialize(alloc, buf, pos, version);
+        if (version <= 4) {
+            const ungrouped_partition_states_len: usize = (try ser.readArrayLen(buf, pos)) orelse 0;
+            if (ungrouped_partition_states_len > 0) {
+                const ungrouped_partition_states_items = try alloc.alloc(UpdateMetadataPartitionState, ungrouped_partition_states_len);
+                for (ungrouped_partition_states_items) |*item| {
+                    item.* = try UpdateMetadataPartitionState.deserialize(alloc, buf, pos, version);
+                }
+                result.ungrouped_partition_states = ungrouped_partition_states_items;
             }
-            result.ungrouped_partition_states = ungrouped_partition_states_items;
         }
         if (version >= 5) {
             const topic_states_len: usize = if (version >= 6)
@@ -597,13 +584,11 @@ pub const UpdateMetadataRequest = struct {
         if (version >= 5) {
             size += 8;
         }
-        if (version >= 6) {
-            size += ser.unsignedVarintSize(self.ungrouped_partition_states.len + 1);
-        } else {
+        if (version <= 4) {
             size += 4;
-        }
-        for (self.ungrouped_partition_states) |item| {
-            size += item.calcSize(version);
+            for (self.ungrouped_partition_states) |item| {
+                size += item.calcSize(version);
+            }
         }
         if (version >= 5) {
             if (version >= 6) {

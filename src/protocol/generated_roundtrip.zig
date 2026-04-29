@@ -691,20 +691,78 @@ test "generated non-default golden fixtures cover legacy and flexible wire encod
 
     {
         const UpdateMetadataRequest = generated.update_metadata_request.UpdateMetadataRequest;
+        const topic_id = [_]u8{
+            0x00, 0x01, 0x02, 0x03,
+            0x04, 0x05, 0x06, 0x07,
+            0x08, 0x09, 0x0a, 0x0b,
+            0x0c, 0x0d, 0x0e, 0x0f,
+        };
+        const partition_states = [_]generated.update_metadata_request.UpdateMetadataPartitionState{.{
+            .partition_index = 1,
+            .controller_epoch = 7,
+            .leader = 2,
+            .leader_epoch = 3,
+            .isr = &[_]i32{2},
+            .zk_version = 4,
+            .replicas = &[_]i32{ 2, 3 },
+            .offline_replicas = &[_]i32{3},
+        }};
+        const topic_states = [_]UpdateMetadataRequest.UpdateMetadataTopicState{.{
+            .topic_name = "t",
+            .topic_id = topic_id,
+            .partition_states = &partition_states,
+        }};
+        const endpoints = [_]UpdateMetadataRequest.UpdateMetadataBroker.UpdateMetadataEndpoint{.{
+            .port = 9092,
+            .host = "host",
+            .listener = "PLAINTEXT",
+            .security_protocol = 0,
+        }};
+        const live_brokers = [_]UpdateMetadataRequest.UpdateMetadataBroker{.{
+            .id = 2,
+            .endpoints = &endpoints,
+            .rack = "rack-a",
+        }};
         const value = UpdateMetadataRequest{
             .controller_id = 2,
             .is_k_raft_controller = true,
             .metadata_type = 2,
             .controller_epoch = 7,
             .broker_epoch = 9,
+            .topic_states = &topic_states,
+            .live_brokers = &live_brokers,
         };
         try expectGoldenRoundTrip(UpdateMetadataRequest, value, 8, &[_]u8{
             0x00, 0x00, 0x00, 0x02,
             0x01, 0x00, 0x00, 0x00,
             0x07, 0x00, 0x00, 0x00,
             0x00, 0x00, 0x00, 0x00,
-            0x09, 0x01, 0x01, 0x01,
-            0x01, 0x00, 0x01, 0x02,
+            0x09, 0x02, 0x02, 't',
+            0x00, 0x01, 0x02, 0x03,
+            0x04, 0x05, 0x06, 0x07,
+            0x08, 0x09, 0x0a, 0x0b,
+            0x0c, 0x0d, 0x0e, 0x0f,
+            0x02, 0x00, 0x00, 0x00,
+            0x01, 0x00, 0x00, 0x00,
+            0x07, 0x00, 0x00, 0x00,
+            0x02, 0x00, 0x00, 0x00,
+            0x03, 0x02, 0x00, 0x00,
+            0x00, 0x02, 0x00, 0x00,
+            0x00, 0x04, 0x03, 0x00,
+            0x00, 0x00, 0x02, 0x00,
+            0x00, 0x00, 0x03, 0x02,
+            0x00, 0x00, 0x00, 0x03,
+            0x00, 0x00, 0x02, 0x00,
+            0x00, 0x00, 0x02, 0x02,
+            0x00, 0x00, 0x23, 0x84,
+            0x05, 'h',  'o',  's',
+            't',  0x0a, 'P',  'L',
+            'A',  'I',  'N',  'T',
+            'E',  'X',  'T',  0x00,
+            0x00, 0x00, 0x07, 'r',
+            'a',  'c',  'k',  '-',
+            'a',  0x00, 0x01, 0x00,
+            0x01, 0x02,
         });
     }
 }
@@ -994,7 +1052,6 @@ test "generated UpdateMetadataRequest rejects duplicate metadata type tags" {
     ser.writeBool(&duplicate_metadata_type, &pos, true); // is_k_raft_controller
     ser.writeI32(&duplicate_metadata_type, &pos, 7); // controller_epoch
     ser.writeI64(&duplicate_metadata_type, &pos, 9); // broker_epoch
-    ser.writeCompactArrayLen(&duplicate_metadata_type, &pos, 0); // ungrouped_partition_states
     ser.writeCompactArrayLen(&duplicate_metadata_type, &pos, 0); // topic_states
     ser.writeCompactArrayLen(&duplicate_metadata_type, &pos, 0); // live_brokers
     ser.writeUnsignedVarint(&duplicate_metadata_type, &pos, 2);
