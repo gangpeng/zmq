@@ -49,6 +49,293 @@ fn roundTripDefaultVersions(comptime Message: type) !void {
     }
 }
 
+fn expectGoldenRoundTrip(comptime Message: type, value: Message, comptime version: i16, expected: []const u8) !void {
+    const size = value.calcSize(version);
+    try testing.expectEqual(expected.len, size);
+
+    const buf = try testing.allocator.alloc(u8, size);
+    defer testing.allocator.free(buf);
+
+    var pos: usize = 0;
+    value.serialize(buf, &pos, version);
+    try testing.expectEqual(expected.len, pos);
+    try testing.expectEqualSlices(u8, expected, buf);
+
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+
+    var read_pos: usize = 0;
+    const decoded = try Message.deserialize(arena.allocator(), expected, &read_pos, version);
+    try testing.expectEqual(expected.len, read_pos);
+    try testing.expectEqual(expected.len, decoded.calcSize(version));
+
+    const decoded_buf = try testing.allocator.alloc(u8, expected.len);
+    defer testing.allocator.free(decoded_buf);
+
+    var decoded_pos: usize = 0;
+    decoded.serialize(decoded_buf, &decoded_pos, version);
+    try testing.expectEqual(expected.len, decoded_pos);
+    try testing.expectEqualSlices(u8, expected, decoded_buf);
+}
+
+test "generated non-default golden fixtures cover legacy and flexible wire encodings" {
+    {
+        const RequestHeader = generated.request_header.RequestHeader;
+        const value = RequestHeader{
+            .request_api_key = 3,
+            .request_api_version = 12,
+            .correlation_id = 0x01020304,
+            .client_id = "zig-client",
+        };
+        try expectGoldenRoundTrip(RequestHeader, value, 1, &[_]u8{
+            0x00, 0x03, 0x00, 0x0c, 0x01, 0x02, 0x03, 0x04,
+            0x00, 0x0a, 'z',  'i',  'g',  '-',  'c',  'l',
+            'i',  'e',  'n',  't',
+        });
+        try expectGoldenRoundTrip(RequestHeader, value, 2, &[_]u8{
+            0x00, 0x03, 0x00, 0x0c, 0x01, 0x02, 0x03, 0x04,
+            0x0b, 'z',  'i',  'g',  '-',  'c',  'l',  'i',
+            'e',  'n',  't',  0x00,
+        });
+    }
+
+    {
+        const MetadataRequest = generated.metadata_request.MetadataRequest;
+        const topics = [_]MetadataRequest.MetadataRequestTopic{
+            .{ .name = "alpha" },
+            .{ .name = "beta" },
+        };
+        const value = MetadataRequest{
+            .topics = &topics,
+            .allow_auto_topic_creation = false,
+            .include_cluster_authorized_operations = true,
+            .include_topic_authorized_operations = false,
+        };
+        try expectGoldenRoundTrip(MetadataRequest, value, 8, &[_]u8{
+            0x00, 0x00, 0x00, 0x02,
+            0x00, 0x05, 'a',  'l',
+            'p',  'h',  'a',  0x00,
+            0x04, 'b',  'e',  't',
+            'a',  0x00, 0x01, 0x00,
+        });
+    }
+
+    {
+        const MetadataRequest = generated.metadata_request.MetadataRequest;
+        const topics = [_]MetadataRequest.MetadataRequestTopic{
+            .{
+                .topic_id = .{
+                    0x00, 0x01, 0x02, 0x03,
+                    0x04, 0x05, 0x06, 0x07,
+                    0x08, 0x09, 0x0a, 0x0b,
+                    0x0c, 0x0d, 0x0e, 0x0f,
+                },
+                .name = "alpha",
+            },
+        };
+        const value = MetadataRequest{
+            .topics = &topics,
+            .allow_auto_topic_creation = false,
+            .include_cluster_authorized_operations = true,
+            .include_topic_authorized_operations = true,
+        };
+        try expectGoldenRoundTrip(MetadataRequest, value, 10, &[_]u8{
+            0x02,
+            0x00,
+            0x01,
+            0x02,
+            0x03,
+            0x04,
+            0x05,
+            0x06,
+            0x07,
+            0x08,
+            0x09,
+            0x0a,
+            0x0b,
+            0x0c,
+            0x0d,
+            0x0e,
+            0x0f,
+            0x06,
+            'a',
+            'l',
+            'p',
+            'h',
+            'a',
+            0x00,
+            0x00,
+            0x01,
+            0x01,
+            0x00,
+        });
+    }
+
+    {
+        const ProduceRequest = generated.produce_request.ProduceRequest;
+        const partitions = [_]ProduceRequest.TopicProduceData.PartitionProduceData{
+            .{ .index = 2, .records = &[_]u8{ 0x01, 0x02, 0x03 } },
+        };
+        const topics = [_]ProduceRequest.TopicProduceData{
+            .{ .name = "topic-a", .partition_data = &partitions },
+        };
+        const value = ProduceRequest{
+            .transactional_id = "txn-1",
+            .acks = -1,
+            .timeout_ms = 1500,
+            .topic_data = &topics,
+        };
+        try expectGoldenRoundTrip(ProduceRequest, value, 9, &[_]u8{
+            0x06, 't',  'x',  'n',  '-',  '1',
+            0xff, 0xff, 0x00, 0x00, 0x05, 0xdc,
+            0x02, 0x08, 't',  'o',  'p',  'i',
+            'c',  '-',  'a',  0x02, 0x00, 0x00,
+            0x00, 0x02, 0x04, 0x01, 0x02, 0x03,
+            0x00, 0x00, 0x00,
+        });
+    }
+
+    {
+        const ApiVersionsResponse = generated.api_versions_response.ApiVersionsResponse;
+        const api_keys = [_]ApiVersionsResponse.ApiVersion{
+            .{ .api_key = 0, .min_version = 0, .max_version = 11 },
+            .{ .api_key = 3, .min_version = 0, .max_version = 12 },
+        };
+        const value = ApiVersionsResponse{
+            .error_code = 0,
+            .api_keys = &api_keys,
+            .throttle_time_ms = 42,
+        };
+        try expectGoldenRoundTrip(ApiVersionsResponse, value, 3, &[_]u8{
+            0x00, 0x00,
+            0x03, 0x00,
+            0x00, 0x00,
+            0x00, 0x00,
+            0x0b, 0x00,
+            0x00, 0x03,
+            0x00, 0x00,
+            0x00, 0x0c,
+            0x00, 0x00,
+            0x00, 0x00,
+            0x2a, 0x00,
+        });
+    }
+
+    {
+        const CreateTopicsRequest = generated.create_topics_request.CreateTopicsRequest;
+        const assignments = [_]CreateTopicsRequest.CreatableTopic.CreatableReplicaAssignment{
+            .{ .partition_index = 0, .broker_ids = &[_]i32{ 1, 2 } },
+        };
+        const configs = [_]CreateTopicsRequest.CreatableTopic.CreatableTopicConfig{
+            .{ .name = "cleanup.policy", .value = "compact" },
+            .{ .name = "retention.ms", .value = "60000" },
+        };
+        const topics = [_]CreateTopicsRequest.CreatableTopic{
+            .{
+                .name = "golden-topic",
+                .num_partitions = 3,
+                .replication_factor = 1,
+                .assignments = &assignments,
+                .configs = &configs,
+            },
+        };
+        const value = CreateTopicsRequest{
+            .topics = &topics,
+            .timeout_ms = 30000,
+            .validate_only = true,
+        };
+        try expectGoldenRoundTrip(CreateTopicsRequest, value, 5, &[_]u8{
+            0x02,
+            0x0d,
+            'g',
+            'o',
+            'l',
+            'd',
+            'e',
+            'n',
+            '-',
+            't',
+            'o',
+            'p',
+            'i',
+            'c',
+            0x00,
+            0x00,
+            0x00,
+            0x03,
+            0x00,
+            0x01,
+            0x02,
+            0x00,
+            0x00,
+            0x00,
+            0x00,
+            0x03,
+            0x00,
+            0x00,
+            0x00,
+            0x01,
+            0x00,
+            0x00,
+            0x00,
+            0x02,
+            0x00,
+            0x03,
+            0x0f,
+            'c',
+            'l',
+            'e',
+            'a',
+            'n',
+            'u',
+            'p',
+            '.',
+            'p',
+            'o',
+            'l',
+            'i',
+            'c',
+            'y',
+            0x08,
+            'c',
+            'o',
+            'm',
+            'p',
+            'a',
+            'c',
+            't',
+            0x00,
+            0x0d,
+            'r',
+            'e',
+            't',
+            'e',
+            'n',
+            't',
+            'i',
+            'o',
+            'n',
+            '.',
+            'm',
+            's',
+            0x06,
+            '6',
+            '0',
+            '0',
+            '0',
+            '0',
+            0x00,
+            0x00,
+            0x00,
+            0x00,
+            0x75,
+            0x30,
+            0x01,
+            0x00,
+        });
+    }
+}
+
 test "generated default messages round-trip across common protocol versions" {
     const messages = .{
         generated.add_offsets_to_txn_request.AddOffsetsToTxnRequest,
