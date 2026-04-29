@@ -210,6 +210,8 @@ Status: completed for the initial catalog and DeleteGroups slice.
   v2+ topic IDs, and the v3 switch from `NewIsr` to `NewIsrWithEpochs`.
   LeaderAndIsrRequest generated encoding now honors v0-v1 ungrouped partition
   states and omits per-partition topic names from v2+ grouped-topic frames.
+  LeaderAndIsrResponse generated encoding now switches from v0-v4 top-level
+  topic-name partition errors to v5+ topic-id grouped partition errors.
 
 ### Phase 2: AutoMQ S3Stream APIs
 

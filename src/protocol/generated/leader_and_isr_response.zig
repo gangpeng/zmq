@@ -20,10 +20,12 @@ pub const LeaderAndIsrPartitionError = struct {
     error_code: i16 = 0,
 
     pub fn serialize(self: *const LeaderAndIsrPartitionError, buf: []u8, pos: *usize, version: i16) void {
-        if (version >= 4) {
-            ser.writeCompactString(buf, pos, self.topic_name);
-        } else {
-            ser.writeString(buf, pos, self.topic_name);
+        if (version <= 4) {
+            if (version >= 4) {
+                ser.writeCompactString(buf, pos, self.topic_name);
+            } else {
+                ser.writeString(buf, pos, self.topic_name);
+            }
         }
         ser.writeI32(buf, pos, self.partition_index);
         ser.writeI16(buf, pos, self.error_code);
@@ -32,10 +34,12 @@ pub const LeaderAndIsrPartitionError = struct {
 
     pub fn deserialize(_: Allocator, buf: []const u8, pos: *usize, version: i16) !LeaderAndIsrPartitionError {
         var result = LeaderAndIsrPartitionError{};
-        result.topic_name = if (version >= 4)
-            try ser.readCompactString(buf, pos)
-        else
-            try ser.readString(buf, pos);
+        if (version <= 4) {
+            result.topic_name = if (version >= 4)
+                try ser.readCompactString(buf, pos)
+            else
+                try ser.readString(buf, pos);
+        }
         result.partition_index = ser.readI32(buf, pos);
         result.error_code = ser.readI16(buf, pos);
         if (version >= 4) try ser.skipTaggedFields(buf, pos);
@@ -44,10 +48,12 @@ pub const LeaderAndIsrPartitionError = struct {
 
     pub fn calcSize(self: *const LeaderAndIsrPartitionError, version: i16) usize {
         var size: usize = 0;
-        if (version >= 4) {
-            size += ser.compactStringSize(self.topic_name);
-        } else {
-            size += ser.stringSize(self.topic_name);
+        if (version <= 4) {
+            if (version >= 4) {
+                size += ser.compactStringSize(self.topic_name);
+            } else {
+                size += ser.stringSize(self.topic_name);
+            }
         }
         size += 4;
         size += 2;
@@ -136,13 +142,15 @@ pub const LeaderAndIsrResponse = struct {
 
     pub fn serialize(self: *const LeaderAndIsrResponse, buf: []u8, pos: *usize, version: i16) void {
         ser.writeI16(buf, pos, self.error_code);
-        if (version >= 4) {
-            ser.writeCompactArrayLen(buf, pos, self.partition_errors.len);
-        } else {
-            ser.writeArrayLen(buf, pos, self.partition_errors.len);
-        }
-        for (self.partition_errors) |item| {
-            item.serialize(buf, pos, version);
+        if (version <= 4) {
+            if (version >= 4) {
+                ser.writeCompactArrayLen(buf, pos, self.partition_errors.len);
+            } else {
+                ser.writeArrayLen(buf, pos, self.partition_errors.len);
+            }
+            for (self.partition_errors) |item| {
+                item.serialize(buf, pos, version);
+            }
         }
         if (version >= 5) {
             if (version >= 4) {
@@ -160,16 +168,18 @@ pub const LeaderAndIsrResponse = struct {
     pub fn deserialize(alloc: Allocator, buf: []const u8, pos: *usize, version: i16) !LeaderAndIsrResponse {
         var result = LeaderAndIsrResponse{};
         result.error_code = ser.readI16(buf, pos);
-        const partition_errors_len: usize = if (version >= 4)
-            (try ser.readCompactArrayLen(buf, pos)) orelse 0
-        else
-            (try ser.readArrayLen(buf, pos)) orelse 0;
-        if (partition_errors_len > 0) {
-            const partition_errors_items = try alloc.alloc(LeaderAndIsrPartitionError, partition_errors_len);
-            for (partition_errors_items) |*item| {
-                item.* = try LeaderAndIsrPartitionError.deserialize(alloc, buf, pos, version);
+        if (version <= 4) {
+            const partition_errors_len: usize = if (version >= 4)
+                (try ser.readCompactArrayLen(buf, pos)) orelse 0
+            else
+                (try ser.readArrayLen(buf, pos)) orelse 0;
+            if (partition_errors_len > 0) {
+                const partition_errors_items = try alloc.alloc(LeaderAndIsrPartitionError, partition_errors_len);
+                for (partition_errors_items) |*item| {
+                    item.* = try LeaderAndIsrPartitionError.deserialize(alloc, buf, pos, version);
+                }
+                result.partition_errors = partition_errors_items;
             }
-            result.partition_errors = partition_errors_items;
         }
         if (version >= 5) {
             const topics_len: usize = if (version >= 4)
@@ -191,13 +201,15 @@ pub const LeaderAndIsrResponse = struct {
     pub fn calcSize(self: *const LeaderAndIsrResponse, version: i16) usize {
         var size: usize = 0;
         size += 2;
-        if (version >= 4) {
-            size += ser.unsignedVarintSize(self.partition_errors.len + 1);
-        } else {
-            size += 4;
-        }
-        for (self.partition_errors) |item| {
-            size += item.calcSize(version);
+        if (version <= 4) {
+            if (version >= 4) {
+                size += ser.unsignedVarintSize(self.partition_errors.len + 1);
+            } else {
+                size += 4;
+            }
+            for (self.partition_errors) |item| {
+                size += item.calcSize(version);
+            }
         }
         if (version >= 5) {
             if (version >= 4) {

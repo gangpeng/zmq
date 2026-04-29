@@ -463,6 +463,65 @@ test "generated non-default golden fixtures cover legacy and flexible wire encod
     }
 
     {
+        const LeaderAndIsrResponse = generated.leader_and_isr_response.LeaderAndIsrResponse;
+        const partition_errors = [_]generated.leader_and_isr_response.LeaderAndIsrPartitionError{.{
+            .topic_name = "topic-a",
+            .partition_index = 2,
+            .error_code = 6,
+        }};
+        const value = LeaderAndIsrResponse{
+            .error_code = 0,
+            .partition_errors = &partition_errors,
+        };
+        try expectGoldenRoundTrip(LeaderAndIsrResponse, value, 4, &[_]u8{
+            0x00, 0x00, 0x02, 0x08,
+            't',  'o',  'p',  'i',
+            'c',  '-',  'a',  0x00,
+            0x00, 0x00, 0x02, 0x00,
+            0x06, 0x00, 0x00,
+        });
+    }
+
+    {
+        const LeaderAndIsrResponse = generated.leader_and_isr_response.LeaderAndIsrResponse;
+        const topic_id = [_]u8{
+            0x00, 0x01, 0x02, 0x03,
+            0x04, 0x05, 0x06, 0x07,
+            0x08, 0x09, 0x0a, 0x0b,
+            0x0c, 0x0d, 0x0e, 0x0f,
+        };
+        const ignored_partition_errors = [_]generated.leader_and_isr_response.LeaderAndIsrPartitionError{.{
+            .topic_name = "ignored",
+            .partition_index = 99,
+            .error_code = 6,
+        }};
+        const topic_partition_errors = [_]generated.leader_and_isr_response.LeaderAndIsrPartitionError{.{
+            .topic_name = "legacy-name",
+            .partition_index = 2,
+            .error_code = 6,
+        }};
+        const topics = [_]LeaderAndIsrResponse.LeaderAndIsrTopicError{.{
+            .topic_id = topic_id,
+            .partition_errors = &topic_partition_errors,
+        }};
+        const value = LeaderAndIsrResponse{
+            .error_code = 0,
+            .partition_errors = &ignored_partition_errors,
+            .topics = &topics,
+        };
+        try expectGoldenRoundTrip(LeaderAndIsrResponse, value, 5, &[_]u8{
+            0x00, 0x00, 0x02, 0x00,
+            0x01, 0x02, 0x03, 0x04,
+            0x05, 0x06, 0x07, 0x08,
+            0x09, 0x0a, 0x0b, 0x0c,
+            0x0d, 0x0e, 0x0f, 0x02,
+            0x00, 0x00, 0x00, 0x02,
+            0x00, 0x06, 0x00, 0x00,
+            0x00,
+        });
+    }
+
+    {
         const ProduceRequest = generated.produce_request.ProduceRequest;
         const partitions = [_]ProduceRequest.TopicProduceData.PartitionProduceData{
             .{ .index = 2, .records = &[_]u8{ 0x01, 0x02, 0x03 } },
