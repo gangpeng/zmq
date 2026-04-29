@@ -10,7 +10,7 @@ operator-facing behavior.
 
 - Zig toolchain target: Zig 0.16.0.
 - Generated protocol request schemas: 110 entries in `src/protocol/api_support.zig`.
-- Broker-advertised APIs: 78 entries in `api_support.broker_supported_apis`.
+- Broker-advertised APIs: 79 entries in `api_support.broker_supported_apis`.
 - AutoMQ extension API keys 501-519 and 600-602 are broker-dispatched and
   advertised. Stream/object APIs have `ObjectManager` side effects; KV,
   node, router, license, node-id allocation, and group-link mutations append
