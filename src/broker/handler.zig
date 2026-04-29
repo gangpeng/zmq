@@ -8428,6 +8428,9 @@ pub const Broker = struct {
         defer self.freeAddPartitionsToTxnRequest(&req);
 
         if (api_version >= 4) {
+            const previous_snapshot = self.encodeTransactionSnapshotRecordValue() catch return null;
+            defer self.allocator.free(previous_snapshot);
+
             const txn_results = self.allocator.alloc(TxnResult, req.transactions.len) catch return null;
             var txn_results_init: usize = 0;
             defer {
@@ -8467,6 +8470,7 @@ pub const Broker = struct {
             };
             self.persistTransactionsIfDirtyDurably() catch |err| {
                 log.warn("AddPartitionsToTxn transaction snapshot write failed: {}", .{err});
+                self.restoreTransactionsAfterFailedMutation(previous_snapshot);
                 markAddPartitionsToTxnResultsStorageError(txn_results[0..txn_results_init]);
                 const storage_resp = Resp{
                     .throttle_time_ms = 0,
@@ -8477,6 +8481,9 @@ pub const Broker = struct {
             };
             return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
         }
+
+        const previous_snapshot = self.encodeTransactionSnapshotRecordValue() catch return null;
+        defer self.allocator.free(previous_snapshot);
 
         const topic_results = self.buildAddPartitionsToTxnTopicResults(
             req.v3_and_below_producer_id,
@@ -8496,6 +8503,7 @@ pub const Broker = struct {
         };
         self.persistTransactionsIfDirtyDurably() catch |err| {
             log.warn("AddPartitionsToTxn transaction snapshot write failed: {}", .{err});
+            self.restoreTransactionsAfterFailedMutation(previous_snapshot);
             markAddPartitionsToTxnTopicResultsStorageError(topic_results);
         };
         return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
@@ -23468,6 +23476,69 @@ test "Broker.handleRequest AddPartitionsToTxn v4 returns generated response and 
     try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.none)), resp.results_by_transaction[0].topic_results[0].results_by_partition[0].partition_error_code);
     try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.none)), resp.results_by_transaction[0].topic_results[0].results_by_partition[1].partition_error_code);
     try testing.expectEqual(@as(usize, 2), broker.txn_coordinator.getPartitions(init_result.producer_id).?.len);
+}
+
+test "Broker.handleRequest AddPartitionsToTxn rolls back when transaction snapshot S3 WAL write fails" {
+    const Req = generated.add_partitions_to_txn_request.AddPartitionsToTxnRequest;
+    const Topic = generated.add_partitions_to_txn_request.AddPartitionsToTxnTopic;
+    const Txn = Req.AddPartitionsToTxnTransaction;
+    const Resp = generated.add_partitions_to_txn_response.AddPartitionsToTxnResponse;
+
+    var mock_s3 = storage.MockS3.init(testing.allocator);
+    defer mock_s3.deinit();
+    const s3_storage = storage.S3Storage.initMock(testing.allocator, &mock_s3);
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+    broker.store.s3_wal_mode = true;
+    broker.store.s3_storage = s3_storage;
+    broker.store.s3_wal_batcher = storage.wal.S3WalBatcher.init(testing.allocator);
+    try broker.open();
+    try testing.expect(broker.ensureTopic("txn-add-parts-snapshot-fail-topic"));
+
+    const init_result = try broker.txn_coordinator.initProducerId("txn-add-parts-snapshot-fail");
+    try broker.persistTransactionsIfDirtyDurably();
+    const object_count_before = mock_s3.objectCount();
+    mock_s3.failNextPutObjects(3);
+
+    const partitions = [_]i32{0};
+    const topics = [_]Topic{.{
+        .name = "txn-add-parts-snapshot-fail-topic",
+        .partitions = &partitions,
+    }};
+    const txns = [_]Txn{.{
+        .transactional_id = "txn-add-parts-snapshot-fail",
+        .producer_id = init_result.producer_id,
+        .producer_epoch = init_result.producer_epoch,
+        .verify_only = false,
+        .topics = &topics,
+    }};
+    const req = Req{ .transactions = &txns };
+
+    var buf: [512]u8 = undefined;
+    var pos = buildTestRequest(&buf, 24, 4, 2408, header_mod.requestHeaderVersion(24, 4));
+    req.serialize(&buf, &pos, 4);
+
+    const response = broker.handleRequest(buf[0..pos]);
+    try testing.expect(response != null);
+    defer testing.allocator.free(response.?);
+
+    var rpos: usize = 0;
+    var response_header = try ResponseHeader.deserialize(testing.allocator, response.?, &rpos, header_mod.responseHeaderVersion(24, 4));
+    defer response_header.deinit(testing.allocator);
+    try testing.expectEqual(@as(i32, 2408), response_header.correlation_id);
+
+    const resp = try Resp.deserialize(testing.allocator, response.?, &rpos, 4);
+    defer {
+        broker.freeAddPartitionsToTxnResults(resp.results_by_transaction);
+        if (resp.results_by_transaction.len > 0) testing.allocator.free(resp.results_by_transaction);
+    }
+    try testing.expectEqual(response.?.len, rpos);
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.kafka_storage_error)), resp.error_code);
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.kafka_storage_error)), resp.results_by_transaction[0].topic_results[0].results_by_partition[0].partition_error_code);
+    try testing.expectEqual(@as(usize, 0), broker.txn_coordinator.getPartitions(init_result.producer_id).?.len);
+    try testing.expect(!broker.txn_coordinator.dirty);
+    try testing.expectEqual(object_count_before, mock_s3.objectCount());
 }
 
 test "Broker.handleRequest AddPartitionsToTxn rejects unknown topic partition" {
