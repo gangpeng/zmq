@@ -9128,6 +9128,9 @@ pub const Broker = struct {
 
         var error_code = self.validateAddOffsetsToTxnState(req.transactional_id, req.producer_id, req.producer_epoch, group_id, target_partition);
         if (error_code == @intFromEnum(ErrorCode.none)) {
+            const previous_snapshot = self.encodeTransactionSnapshotRecordValue() catch return null;
+            defer self.allocator.free(previous_snapshot);
+
             // Add __consumer_offsets partition to the transaction only after all
             // request and internal-topic preconditions pass.
             error_code = self.txn_coordinator.addPartitionsToTxn(
@@ -9139,6 +9142,7 @@ pub const Broker = struct {
             if (error_code == @intFromEnum(ErrorCode.none)) {
                 self.persistTransactionsIfDirtyDurably() catch |err| {
                     log.warn("AddOffsetsToTxn transaction snapshot write failed for {s}: {}", .{ req.transactional_id orelse "", err });
+                    self.restoreTransactionsAfterFailedMutation(previous_snapshot);
                     error_code = @intFromEnum(ErrorCode.kafka_storage_error);
                 };
             } else {
@@ -23715,6 +23719,38 @@ test "Broker.handleRequest AddOffsetsToTxn v3 returns generated response and reg
         }
     }
     try testing.expect(found_offsets_partition);
+}
+
+test "Broker.handleRequest AddOffsetsToTxn rolls back when transaction snapshot S3 WAL write fails" {
+    var mock_s3 = storage.MockS3.init(testing.allocator);
+    defer mock_s3.deinit();
+    const s3_storage = storage.S3Storage.initMock(testing.allocator, &mock_s3);
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+    broker.store.s3_wal_mode = true;
+    broker.store.s3_storage = s3_storage;
+    broker.store.s3_wal_batcher = storage.wal.S3WalBatcher.init(testing.allocator);
+    try broker.open();
+
+    const init_result = try broker.txn_coordinator.initProducerId("txn-add-offsets-snapshot-fail");
+    try broker.persistTransactionsIfDirtyDurably();
+    const object_count_before = mock_s3.objectCount();
+    mock_s3.failNextPutObjects(3);
+
+    const resp = try handleAddOffsetsToTxnForTest(
+        &broker,
+        "txn-add-offsets-snapshot-fail",
+        init_result.producer_id,
+        init_result.producer_epoch,
+        "group-add-offsets-snapshot-fail",
+        2508,
+    );
+
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.kafka_storage_error)), resp.error_code);
+    try testing.expectEqual(@as(usize, 0), broker.txn_coordinator.getPartitions(init_result.producer_id).?.len);
+    try testing.expect(!broker.txn_coordinator.dirty);
+    try testing.expectEqual(object_count_before, mock_s3.objectCount());
 }
 
 test "Broker.handleRequest AddOffsetsToTxn rejects missing offsets topic" {
