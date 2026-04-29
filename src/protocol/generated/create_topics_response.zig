@@ -123,6 +123,9 @@ pub const CreateTopicsResponse = struct {
         /// The error message, or null if there was no error.
         /// Versions: 1+
         error_message: ?[]const u8 = null,
+        /// Optional topic config error returned if configs are not returned in the response.
+        /// Versions: 5+
+        topic_config_error_code: i16 = 0,
         /// Number of partitions of the topic.
         /// Versions: 5+
         num_partitions: i32 = -1,
@@ -166,11 +169,21 @@ pub const CreateTopicsResponse = struct {
                     item.serialize(buf, pos, version);
                 }
             }
-            if (version >= 5) ser.writeEmptyTaggedFields(buf, pos);
+            const has_topic_config_error_code = version >= 5 and self.topic_config_error_code != 0;
+            if (version >= 5) {
+                ser.writeUnsignedVarint(buf, pos, if (has_topic_config_error_code) 1 else 0);
+                if (has_topic_config_error_code) {
+                    ser.writeUnsignedVarint(buf, pos, 0);
+                    ser.writeUnsignedVarint(buf, pos, 2);
+                    ser.writeI16(buf, pos, self.topic_config_error_code);
+                }
+            }
         }
 
         pub fn deserialize(alloc: Allocator, buf: []const u8, pos: *usize, version: i16) !CreatableTopicResult {
             var result = CreatableTopicResult{};
+            errdefer if (result.configs.len > 0) alloc.free(result.configs);
+
             result.name = if (version >= 5)
                 try ser.readCompactString(buf, pos)
             else
@@ -198,13 +211,30 @@ pub const CreateTopicsResponse = struct {
                     (try ser.readArrayLen(buf, pos)) orelse 0;
                 if (configs_len > 0) {
                     const configs_items = try alloc.alloc(CreatableTopicConfigs, configs_len);
+                    errdefer alloc.free(configs_items);
                     for (configs_items) |*item| {
                         item.* = try CreatableTopicConfigs.deserialize(alloc, buf, pos, version);
                     }
                     result.configs = configs_items;
                 }
             }
-            if (version >= 5) try ser.skipTaggedFields(buf, pos);
+            if (version >= 5) {
+                const tagged_fields = try ser.readTaggedFields(alloc, buf, pos);
+                defer if (tagged_fields.len > 0) alloc.free(tagged_fields);
+
+                var seen_topic_config_error_code = false;
+                for (tagged_fields) |field| {
+                    if (field.tag == 0) {
+                        if (seen_topic_config_error_code) return error.DuplicateTaggedField;
+                        seen_topic_config_error_code = true;
+                        if (field.data.len != 2) return error.InvalidTaggedField;
+
+                        var tag_pos: usize = 0;
+                        result.topic_config_error_code = ser.readI16(field.data, &tag_pos);
+                        if (tag_pos != field.data.len) return error.InvalidTaggedField;
+                    }
+                }
+            }
             return result;
         }
 
@@ -242,7 +272,15 @@ pub const CreateTopicsResponse = struct {
                     size += item.calcSize(version);
                 }
             }
-            if (version >= 5) size += 1;
+            const has_topic_config_error_code = version >= 5 and self.topic_config_error_code != 0;
+            if (version >= 5) {
+                size += ser.unsignedVarintSize(if (has_topic_config_error_code) 1 else 0);
+                if (has_topic_config_error_code) {
+                    size += ser.unsignedVarintSize(0);
+                    size += ser.unsignedVarintSize(2);
+                    size += 2;
+                }
+            }
             return size;
         }
     };
@@ -271,6 +309,13 @@ pub const CreateTopicsResponse = struct {
 
     pub fn deserialize(alloc: Allocator, buf: []const u8, pos: *usize, version: i16) !CreateTopicsResponse {
         var result = CreateTopicsResponse{};
+        errdefer {
+            for (result.topics) |topic| {
+                if (topic.configs.len > 0) alloc.free(topic.configs);
+            }
+            if (result.topics.len > 0) alloc.free(result.topics);
+        }
+
         if (version >= 2) {
             result.throttle_time_ms = ser.readI32(buf, pos);
         }
@@ -280,8 +325,17 @@ pub const CreateTopicsResponse = struct {
             (try ser.readArrayLen(buf, pos)) orelse 0;
         if (topics_len > 0) {
             const topics_items = try alloc.alloc(CreatableTopicResult, topics_len);
+            var topics_init: usize = 0;
+            errdefer {
+                for (topics_items[0..topics_init]) |topic| {
+                    if (topic.configs.len > 0) alloc.free(topic.configs);
+                }
+                alloc.free(topics_items);
+            }
+
             for (topics_items) |*item| {
                 item.* = try CreatableTopicResult.deserialize(alloc, buf, pos, version);
+                topics_init += 1;
             }
             result.topics = topics_items;
         }
