@@ -18,35 +18,27 @@ pub const StopReplicaRequest = struct {
         partition_index: i32 = 0,
 
         pub fn serialize(self: *const StopReplicaPartitionV0, buf: []u8, pos: *usize, version: i16) void {
-            if (version >= 2) {
-                ser.writeCompactString(buf, pos, self.topic_name);
-            } else {
+            if (version == 0) {
                 ser.writeString(buf, pos, self.topic_name);
+                ser.writeI32(buf, pos, self.partition_index);
             }
-            ser.writeI32(buf, pos, self.partition_index);
-            if (version >= 2) ser.writeEmptyTaggedFields(buf, pos);
         }
 
         pub fn deserialize(_: Allocator, buf: []const u8, pos: *usize, version: i16) !StopReplicaPartitionV0 {
             var result = StopReplicaPartitionV0{};
-            result.topic_name = if (version >= 2)
-                try ser.readCompactString(buf, pos)
-            else
-                try ser.readString(buf, pos);
-            result.partition_index = ser.readI32(buf, pos);
-            if (version >= 2) try ser.skipTaggedFields(buf, pos);
+            if (version == 0) {
+                result.topic_name = try ser.readString(buf, pos);
+                result.partition_index = ser.readI32(buf, pos);
+            }
             return result;
         }
 
         pub fn calcSize(self: *const StopReplicaPartitionV0, version: i16) usize {
             var size: usize = 0;
-            if (version >= 2) {
-                size += ser.compactStringSize(self.topic_name);
-            } else {
+            if (version == 0) {
                 size += ser.stringSize(self.topic_name);
+                size += 4;
             }
-            size += 4;
-            if (version >= 2) size += 1;
             return size;
         }
     };
@@ -294,14 +286,14 @@ pub const StopReplicaRequest = struct {
         if (version >= 1) {
             ser.writeI64(buf, pos, self.broker_epoch);
         }
-        ser.writeBool(buf, pos, self.delete_partitions);
-        if (version >= 2) {
-            ser.writeCompactArrayLen(buf, pos, self.ungrouped_partitions.len);
-        } else {
-            ser.writeArrayLen(buf, pos, self.ungrouped_partitions.len);
+        if (version <= 2) {
+            ser.writeBool(buf, pos, self.delete_partitions);
         }
-        for (self.ungrouped_partitions) |item| {
-            item.serialize(buf, pos, version);
+        if (version == 0) {
+            ser.writeArrayLen(buf, pos, self.ungrouped_partitions.len);
+            for (self.ungrouped_partitions) |item| {
+                item.serialize(buf, pos, version);
+            }
         }
         if (version >= 1 and version <= 2) {
             if (version >= 2) {
@@ -336,17 +328,18 @@ pub const StopReplicaRequest = struct {
         if (version >= 1) {
             result.broker_epoch = ser.readI64(buf, pos);
         }
-        result.delete_partitions = try ser.readBool(buf, pos);
-        const ungrouped_partitions_len: usize = if (version >= 2)
-            (try ser.readCompactArrayLen(buf, pos)) orelse 0
-        else
-            (try ser.readArrayLen(buf, pos)) orelse 0;
-        if (ungrouped_partitions_len > 0) {
-            const ungrouped_partitions_items = try alloc.alloc(StopReplicaPartitionV0, ungrouped_partitions_len);
-            for (ungrouped_partitions_items) |*item| {
-                item.* = try StopReplicaPartitionV0.deserialize(alloc, buf, pos, version);
+        if (version <= 2) {
+            result.delete_partitions = try ser.readBool(buf, pos);
+        }
+        if (version == 0) {
+            const ungrouped_partitions_len: usize = (try ser.readArrayLen(buf, pos)) orelse 0;
+            if (ungrouped_partitions_len > 0) {
+                const ungrouped_partitions_items = try alloc.alloc(StopReplicaPartitionV0, ungrouped_partitions_len);
+                for (ungrouped_partitions_items) |*item| {
+                    item.* = try StopReplicaPartitionV0.deserialize(alloc, buf, pos, version);
+                }
+                result.ungrouped_partitions = ungrouped_partitions_items;
             }
-            result.ungrouped_partitions = ungrouped_partitions_items;
         }
         if (version >= 1 and version <= 2) {
             const topics_len: usize = if (version >= 2)
@@ -388,14 +381,14 @@ pub const StopReplicaRequest = struct {
         if (version >= 1) {
             size += 8;
         }
-        size += 1;
-        if (version >= 2) {
-            size += ser.unsignedVarintSize(self.ungrouped_partitions.len + 1);
-        } else {
-            size += 4;
+        if (version <= 2) {
+            size += 1;
         }
-        for (self.ungrouped_partitions) |item| {
-            size += item.calcSize(version);
+        if (version == 0) {
+            size += 4;
+            for (self.ungrouped_partitions) |item| {
+                size += item.calcSize(version);
+            }
         }
         if (version >= 1 and version <= 2) {
             if (version >= 2) {

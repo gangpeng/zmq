@@ -203,6 +203,9 @@ Status: completed for the initial catalog and DeleteGroups slice.
   decode generated flexible requests, reject malformed frames, return an empty
   telemetry subscription set, and reject unsolicited pushes with
   `unknown_subscription_id` until client telemetry collection is implemented.
+  StopReplicaRequest generated encoding now honors its legacy field version
+  bounds exactly: v0 `UngroupedPartitions`, v0-v2 `DeletePartitions`, v1-v2
+  grouped `Topics`, and v3+ `TopicStates` have non-default golden fixtures.
 
 ### Phase 2: AutoMQ S3Stream APIs
 

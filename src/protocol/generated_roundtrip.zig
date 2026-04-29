@@ -173,6 +173,89 @@ test "generated non-default golden fixtures cover legacy and flexible wire encod
     }
 
     {
+        const StopReplicaRequest = generated.stop_replica_request.StopReplicaRequest;
+        const ungrouped_partitions = [_]StopReplicaRequest.StopReplicaPartitionV0{.{
+            .topic_name = "topic-a",
+            .partition_index = 2,
+        }};
+        const value = StopReplicaRequest{
+            .controller_id = 7,
+            .controller_epoch = 3,
+            .delete_partitions = true,
+            .ungrouped_partitions = &ungrouped_partitions,
+        };
+        try expectGoldenRoundTrip(StopReplicaRequest, value, 0, &[_]u8{
+            0x00, 0x00, 0x00, 0x07,
+            0x00, 0x00, 0x00, 0x03,
+            0x01, 0x00, 0x00, 0x00,
+            0x01, 0x00, 0x07, 't',
+            'o',  'p',  'i',  'c',
+            '-',  'a',  0x00, 0x00,
+            0x00, 0x02,
+        });
+    }
+
+    {
+        const StopReplicaRequest = generated.stop_replica_request.StopReplicaRequest;
+        const topics = [_]StopReplicaRequest.StopReplicaTopicV1{.{
+            .name = "topic-b",
+            .partition_indexes = &[_]i32{ 1, 3 },
+        }};
+        const value = StopReplicaRequest{
+            .controller_id = 7,
+            .controller_epoch = 3,
+            .broker_epoch = 9,
+            .delete_partitions = true,
+            .topics = &topics,
+        };
+        try expectGoldenRoundTrip(StopReplicaRequest, value, 1, &[_]u8{
+            0x00, 0x00, 0x00, 0x07,
+            0x00, 0x00, 0x00, 0x03,
+            0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x09,
+            0x01, 0x00, 0x00, 0x00,
+            0x01, 0x00, 0x07, 't',
+            'o',  'p',  'i',  'c',
+            '-',  'b',  0x00, 0x00,
+            0x00, 0x02, 0x00, 0x00,
+            0x00, 0x01, 0x00, 0x00,
+            0x00, 0x03,
+        });
+    }
+
+    {
+        const StopReplicaRequest = generated.stop_replica_request.StopReplicaRequest;
+        const partition_states = [_]StopReplicaRequest.StopReplicaTopicState.StopReplicaPartitionState{.{
+            .partition_index = 4,
+            .leader_epoch = 11,
+            .delete_partition = true,
+        }};
+        const topic_states = [_]StopReplicaRequest.StopReplicaTopicState{.{
+            .topic_name = "topic-c",
+            .partition_states = &partition_states,
+        }};
+        const value = StopReplicaRequest{
+            .controller_id = 7,
+            .controller_epoch = 3,
+            .broker_epoch = 9,
+            .delete_partitions = true,
+            .topic_states = &topic_states,
+        };
+        try expectGoldenRoundTrip(StopReplicaRequest, value, 3, &[_]u8{
+            0x00, 0x00, 0x00, 0x07,
+            0x00, 0x00, 0x00, 0x03,
+            0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x09,
+            0x02, 0x08, 't',  'o',
+            'p',  'i',  'c',  '-',
+            'c',  0x02, 0x00, 0x00,
+            0x00, 0x04, 0x00, 0x00,
+            0x00, 0x0b, 0x01, 0x00,
+            0x00, 0x00,
+        });
+    }
+
+    {
         const ProduceRequest = generated.produce_request.ProduceRequest;
         const partitions = [_]ProduceRequest.TopicProduceData.PartitionProduceData{
             .{ .index = 2, .records = &[_]u8{ 0x01, 0x02, 0x03 } },
