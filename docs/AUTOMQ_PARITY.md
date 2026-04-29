@@ -212,6 +212,8 @@ Status: completed for the initial catalog and DeleteGroups slice.
   states and omits per-partition topic names from v2+ grouped-topic frames.
   LeaderAndIsrResponse generated encoding now switches from v0-v4 top-level
   topic-name partition errors to v5+ topic-id grouped partition errors.
+  DescribeConfigsResponse generated encoding now keeps `IsDefault` v0-only so
+  v1+ config entries align `ConfigSource`, sensitivity, and synonym fields.
 
 ### Phase 2: AutoMQ S3Stream APIs
 

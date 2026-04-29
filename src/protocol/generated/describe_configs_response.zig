@@ -128,7 +128,9 @@ pub const DescribeConfigsResponse = struct {
                     ser.writeString(buf, pos, self.value);
                 }
                 ser.writeBool(buf, pos, self.read_only);
-                ser.writeBool(buf, pos, self.is_default);
+                if (version == 0) {
+                    ser.writeBool(buf, pos, self.is_default);
+                }
                 if (version >= 1) {
                     ser.writeI8(buf, pos, self.config_source);
                 }
@@ -167,7 +169,9 @@ pub const DescribeConfigsResponse = struct {
                 else
                     try ser.readString(buf, pos);
                 result.read_only = try ser.readBool(buf, pos);
-                result.is_default = try ser.readBool(buf, pos);
+                if (version == 0) {
+                    result.is_default = try ser.readBool(buf, pos);
+                }
                 if (version >= 1) {
                     result.config_source = ser.readI8(buf, pos);
                 }
@@ -211,7 +215,9 @@ pub const DescribeConfigsResponse = struct {
                     size += ser.stringSize(self.value);
                 }
                 size += 1;
-                size += 1;
+                if (version == 0) {
+                    size += 1;
+                }
                 if (version >= 1) {
                     size += 1;
                 }

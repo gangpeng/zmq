@@ -522,6 +522,58 @@ test "generated non-default golden fixtures cover legacy and flexible wire encod
     }
 
     {
+        const DescribeConfigsResponse = generated.describe_configs_response.DescribeConfigsResponse;
+        const synonyms = [_]DescribeConfigsResponse.DescribeConfigsResult.DescribeConfigsResourceResult.DescribeConfigsSynonym{.{
+            .name = "cleanup.policy",
+            .value = "delete",
+            .source = 1,
+        }};
+        const configs = [_]DescribeConfigsResponse.DescribeConfigsResult.DescribeConfigsResourceResult{.{
+            .name = "cleanup.policy",
+            .value = "compact",
+            .read_only = true,
+            .is_default = true,
+            .config_source = 5,
+            .is_sensitive = false,
+            .synonyms = &synonyms,
+        }};
+        const results = [_]DescribeConfigsResponse.DescribeConfigsResult{.{
+            .error_code = 0,
+            .error_message = null,
+            .resource_type = 2,
+            .resource_name = "topic-a",
+            .configs = &configs,
+        }};
+        const value = DescribeConfigsResponse{
+            .throttle_time_ms = 5,
+            .results = &results,
+        };
+        try expectGoldenRoundTrip(DescribeConfigsResponse, value, 1, &[_]u8{
+            0x00, 0x00, 0x00, 0x05,
+            0x00, 0x00, 0x00, 0x01,
+            0x00, 0x00, 0xff, 0xff,
+            0x02, 0x00, 0x07, 't',
+            'o',  'p',  'i',  'c',
+            '-',  'a',  0x00, 0x00,
+            0x00, 0x01, 0x00, 0x0e,
+            'c',  'l',  'e',  'a',
+            'n',  'u',  'p',  '.',
+            'p',  'o',  'l',  'i',
+            'c',  'y',  0x00, 0x07,
+            'c',  'o',  'm',  'p',
+            'a',  'c',  't',  0x01,
+            0x05, 0x00, 0x00, 0x00,
+            0x00, 0x01, 0x00, 0x0e,
+            'c',  'l',  'e',  'a',
+            'n',  'u',  'p',  '.',
+            'p',  'o',  'l',  'i',
+            'c',  'y',  0x00, 0x06,
+            'd',  'e',  'l',  'e',
+            't',  'e',  0x01,
+        });
+    }
+
+    {
         const ProduceRequest = generated.produce_request.ProduceRequest;
         const partitions = [_]ProduceRequest.TopicProduceData.PartitionProduceData{
             .{ .index = 2, .records = &[_]u8{ 0x01, 0x02, 0x03 } },
