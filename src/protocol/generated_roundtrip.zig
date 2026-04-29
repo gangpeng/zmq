@@ -395,6 +395,46 @@ test "generated non-default golden fixtures cover legacy and flexible wire encod
     }
 
     {
+        const FetchSnapshotRequest = generated.fetch_snapshot_request.FetchSnapshotRequest;
+        const replica_directory_id = [_]u8{
+            0x00, 0x01, 0x02, 0x03,
+            0x04, 0x05, 0x06, 0x07,
+            0x08, 0x09, 0x0a, 0x0b,
+            0x0c, 0x0d, 0x0e, 0x0f,
+        };
+        const partitions = [_]FetchSnapshotRequest.TopicSnapshot.PartitionSnapshot{.{
+            .partition = 1,
+            .current_leader_epoch = 3,
+            .snapshot_id = .{ .end_offset = 42, .epoch = 4 },
+            .position = 16,
+            .replica_directory_id = replica_directory_id,
+        }};
+        const topics = [_]FetchSnapshotRequest.TopicSnapshot{.{
+            .name = "snap-topic",
+            .partitions = &partitions,
+        }};
+        const value = FetchSnapshotRequest{
+            .cluster_id = "cluster-a",
+            .replica_id = 2,
+            .max_bytes = 1024,
+            .topics = &topics,
+        };
+        try expectGoldenRoundTrip(FetchSnapshotRequest, value, 1, &[_]u8{
+            0x00, 0x00, 0x00, 0x02, 0x00, 0x00, 0x04, 0x00,
+            0x02, 0x0b, 's',  'n',  'a',  'p',  '-',  't',
+            'o',  'p',  'i',  'c',  0x02, 0x00, 0x00, 0x00,
+            0x01, 0x00, 0x00, 0x00, 0x03, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00, 0x2a, 0x00, 0x00, 0x00,
+            0x04, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x10, 0x01, 0x00, 0x10, 0x00, 0x01, 0x02, 0x03,
+            0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b,
+            0x0c, 0x0d, 0x0e, 0x0f, 0x00, 0x01, 0x00, 0x0a,
+            0x0a, 'c',  'l',  'u',  's',  't',  'e',  'r',
+            '-',  'a',
+        });
+    }
+
+    {
         const ApiVersionsResponse = generated.api_versions_response.ApiVersionsResponse;
         const api_keys = [_]ApiVersionsResponse.ApiVersion{
             .{ .api_key = 0, .min_version = 0, .max_version = 11 },
@@ -596,6 +636,56 @@ test "generated FetchSnapshotResponse rejects duplicate known tags" {
         try testing.expectError(
             error.DuplicateTaggedField,
             generated.fetch_snapshot_response.FetchSnapshotResponse.deserialize(testing.allocator, duplicate_current_leader[0..pos], &read_pos, 1),
+        );
+    }
+}
+
+test "generated FetchSnapshotRequest rejects duplicate known tags" {
+    {
+        const duplicate_cluster_id = [_]u8{
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x01, 0x02, 0x00, 0x02, 0x02, 'c',
+            0x00, 0x02, 0x02, 'c',
+        };
+        var pos: usize = 0;
+        try testing.expectError(
+            error.DuplicateTaggedField,
+            generated.fetch_snapshot_request.FetchSnapshotRequest.deserialize(testing.allocator, &duplicate_cluster_id, &pos, 1),
+        );
+    }
+
+    {
+        var duplicate_replica_directory: [160]u8 = undefined;
+        var pos: usize = 0;
+        ser.writeI32(&duplicate_replica_directory, &pos, 0); // replica_id
+        ser.writeI32(&duplicate_replica_directory, &pos, 0); // max_bytes
+        ser.writeCompactArrayLen(&duplicate_replica_directory, &pos, 1); // topics
+        ser.writeCompactString(&duplicate_replica_directory, &pos, "t");
+        ser.writeCompactArrayLen(&duplicate_replica_directory, &pos, 1); // partitions
+        ser.writeI32(&duplicate_replica_directory, &pos, 0); // partition
+        ser.writeI32(&duplicate_replica_directory, &pos, 0); // current_leader_epoch
+        ser.writeI64(&duplicate_replica_directory, &pos, 0); // snapshot end_offset
+        ser.writeI32(&duplicate_replica_directory, &pos, 0); // snapshot epoch
+        ser.writeEmptyTaggedFields(&duplicate_replica_directory, &pos); // SnapshotId tags
+        ser.writeI64(&duplicate_replica_directory, &pos, 0); // position
+        ser.writeUnsignedVarint(&duplicate_replica_directory, &pos, 2); // duplicate partition tags
+        inline for (0..2) |_| {
+            ser.writeUnsignedVarint(&duplicate_replica_directory, &pos, 0);
+            ser.writeUnsignedVarint(&duplicate_replica_directory, &pos, 16);
+            ser.writeUuid(&duplicate_replica_directory, &pos, .{
+                0x00, 0x01, 0x02, 0x03,
+                0x04, 0x05, 0x06, 0x07,
+                0x08, 0x09, 0x0a, 0x0b,
+                0x0c, 0x0d, 0x0e, 0x0f,
+            });
+        }
+        ser.writeEmptyTaggedFields(&duplicate_replica_directory, &pos); // topic tags
+        ser.writeEmptyTaggedFields(&duplicate_replica_directory, &pos); // request tags
+
+        var read_pos: usize = 0;
+        try testing.expectError(
+            error.DuplicateTaggedField,
+            generated.fetch_snapshot_request.FetchSnapshotRequest.deserialize(testing.allocator, duplicate_replica_directory[0..pos], &read_pos, 1),
         );
     }
 }

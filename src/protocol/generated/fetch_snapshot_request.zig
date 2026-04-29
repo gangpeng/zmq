@@ -54,13 +54,22 @@ pub const FetchSnapshotRequest = struct {
             /// The byte position within the snapshot to start fetching from
             /// Versions: 0+
             position: i64 = 0,
+            /// The directory ID of the follower fetching.
+            /// Versions: 1+
+            replica_directory_id: [16]u8 = .{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 },
 
             pub fn serialize(self: *const PartitionSnapshot, buf: []u8, pos: *usize, version: i16) void {
                 ser.writeI32(buf, pos, self.partition);
                 ser.writeI32(buf, pos, self.current_leader_epoch);
                 self.snapshot_id.serialize(buf, pos, version);
                 ser.writeI64(buf, pos, self.position);
-                ser.writeEmptyTaggedFields(buf, pos);
+                const has_replica_directory_id = version >= 1 and !isZeroUuid(self.replica_directory_id);
+                ser.writeUnsignedVarint(buf, pos, if (has_replica_directory_id) 1 else 0);
+                if (has_replica_directory_id) {
+                    ser.writeUnsignedVarint(buf, pos, 0);
+                    ser.writeUnsignedVarint(buf, pos, 16);
+                    ser.writeUuid(buf, pos, self.replica_directory_id);
+                }
             }
 
             pub fn deserialize(alloc: Allocator, buf: []const u8, pos: *usize, version: i16) !PartitionSnapshot {
@@ -69,7 +78,21 @@ pub const FetchSnapshotRequest = struct {
                 result.current_leader_epoch = ser.readI32(buf, pos);
                 result.snapshot_id = try SnapshotId.deserialize(alloc, buf, pos, version);
                 result.position = ser.readI64(buf, pos);
-                try ser.skipTaggedFields(buf, pos);
+                const tagged_fields = try ser.readTaggedFields(alloc, buf, pos);
+                defer if (tagged_fields.len > 0) alloc.free(tagged_fields);
+
+                var seen_replica_directory_id = false;
+                for (tagged_fields) |field| {
+                    if (field.tag == 0 and version >= 1) {
+                        if (seen_replica_directory_id) return error.DuplicateTaggedField;
+                        seen_replica_directory_id = true;
+                        if (field.data.len != 16) return error.InvalidTaggedField;
+
+                        var tag_pos: usize = 0;
+                        result.replica_directory_id = try ser.readUuid(field.data, &tag_pos);
+                        if (tag_pos != field.data.len) return error.InvalidTaggedField;
+                    }
+                }
                 return result;
             }
 
@@ -79,7 +102,13 @@ pub const FetchSnapshotRequest = struct {
                 size += 4;
                 size += self.snapshot_id.calcSize(version);
                 size += 8;
-                size += 1;
+                const has_replica_directory_id = version >= 1 and !isZeroUuid(self.replica_directory_id);
+                size += ser.unsignedVarintSize(if (has_replica_directory_id) 1 else 0);
+                if (has_replica_directory_id) {
+                    size += ser.unsignedVarintSize(0);
+                    size += ser.unsignedVarintSize(16);
+                    size += 16;
+                }
                 return size;
             }
         };
@@ -102,10 +131,14 @@ pub const FetchSnapshotRequest = struct {
 
         pub fn deserialize(alloc: Allocator, buf: []const u8, pos: *usize, version: i16) !TopicSnapshot {
             var result = TopicSnapshot{};
+            errdefer if (result.partitions.len > 0) alloc.free(result.partitions);
+
             result.name = try ser.readCompactString(buf, pos);
             const partitions_len: usize = (try ser.readCompactArrayLen(buf, pos)) orelse 0;
             if (partitions_len > 0) {
                 const partitions_items = try alloc.alloc(PartitionSnapshot, partitions_len);
+                errdefer alloc.free(partitions_items);
+
                 for (partitions_items) |*item| {
                     item.* = try PartitionSnapshot.deserialize(alloc, buf, pos, version);
                 }
@@ -127,6 +160,9 @@ pub const FetchSnapshotRequest = struct {
         }
     };
 
+    /// The cluster ID if known.
+    /// Versions: 0+
+    cluster_id: ?[]const u8 = null,
     /// The broker ID of the follower
     /// Versions: 0+
     replica_id: i32 = -1,
@@ -144,22 +180,58 @@ pub const FetchSnapshotRequest = struct {
         for (self.topics) |item| {
             item.serialize(buf, pos, version);
         }
-        ser.writeEmptyTaggedFields(buf, pos);
+        const has_cluster_id = self.cluster_id != null;
+        ser.writeUnsignedVarint(buf, pos, if (has_cluster_id) 1 else 0);
+        if (has_cluster_id) {
+            const tag_size = ser.compactStringSize(self.cluster_id);
+            ser.writeUnsignedVarint(buf, pos, 0);
+            ser.writeUnsignedVarint(buf, pos, tag_size);
+            ser.writeCompactString(buf, pos, self.cluster_id);
+        }
     }
 
     pub fn deserialize(alloc: Allocator, buf: []const u8, pos: *usize, version: i16) !FetchSnapshotRequest {
         var result = FetchSnapshotRequest{};
+        errdefer {
+            for (result.topics) |topic| {
+                if (topic.partitions.len > 0) alloc.free(topic.partitions);
+            }
+            if (result.topics.len > 0) alloc.free(result.topics);
+        }
+
         result.replica_id = ser.readI32(buf, pos);
         result.max_bytes = ser.readI32(buf, pos);
         const topics_len: usize = (try ser.readCompactArrayLen(buf, pos)) orelse 0;
         if (topics_len > 0) {
             const topics_items = try alloc.alloc(TopicSnapshot, topics_len);
+            var topics_init: usize = 0;
+            errdefer {
+                for (topics_items[0..topics_init]) |topic| {
+                    if (topic.partitions.len > 0) alloc.free(topic.partitions);
+                }
+                alloc.free(topics_items);
+            }
+
             for (topics_items) |*item| {
                 item.* = try TopicSnapshot.deserialize(alloc, buf, pos, version);
+                topics_init += 1;
             }
             result.topics = topics_items;
         }
-        try ser.skipTaggedFields(buf, pos);
+        const tagged_fields = try ser.readTaggedFields(alloc, buf, pos);
+        defer if (tagged_fields.len > 0) alloc.free(tagged_fields);
+
+        var seen_cluster_id = false;
+        for (tagged_fields) |field| {
+            if (field.tag == 0) {
+                if (seen_cluster_id) return error.DuplicateTaggedField;
+                seen_cluster_id = true;
+
+                var tag_pos: usize = 0;
+                result.cluster_id = try ser.readCompactString(field.data, &tag_pos);
+                if (tag_pos != field.data.len) return error.InvalidTaggedField;
+            }
+        }
         return result;
     }
 
@@ -171,7 +243,21 @@ pub const FetchSnapshotRequest = struct {
         for (self.topics) |item| {
             size += item.calcSize(version);
         }
-        size += 1;
+        const has_cluster_id = self.cluster_id != null;
+        size += ser.unsignedVarintSize(if (has_cluster_id) 1 else 0);
+        if (has_cluster_id) {
+            const tag_size = ser.compactStringSize(self.cluster_id);
+            size += ser.unsignedVarintSize(0);
+            size += ser.unsignedVarintSize(tag_size);
+            size += tag_size;
+        }
         return size;
     }
 };
+
+fn isZeroUuid(value: [16]u8) bool {
+    for (value) |byte| {
+        if (byte != 0) return false;
+    }
+    return true;
+}
