@@ -900,6 +900,11 @@ pub const Broker = struct {
 
         var aborted: u32 = 0;
         for (expired[0..expired_count]) |txn| {
+            if (self.store.s3_wal_mode) {
+                if (self.expireTransactionWithS3WalControlMarker(txn)) aborted += 1;
+                continue;
+            }
+
             const partitions = self.txn_coordinator.getPartitions(txn.producer_id) orelse continue;
             const marker_error = self.writeTxnControlBatches(
                 txn.producer_id,
@@ -921,6 +926,70 @@ pub const Broker = struct {
         }
 
         return aborted;
+    }
+
+    fn expireTransactionWithS3WalControlMarker(self: *Broker, txn: ExpiredTransaction) bool {
+        const previous_snapshot = self.encodeTransactionSnapshotRecordValue() catch |err| {
+            log.warn("Timed-out transaction {d} snapshot capture failed: {}", .{ txn.producer_id, err });
+            return false;
+        };
+        defer self.allocator.free(previous_snapshot);
+
+        var pending_writes = std.array_list.Managed(PendingTxnMarkerS3WalWrite).init(self.allocator);
+        defer {
+            for (pending_writes.items) |write| {
+                self.allocator.free(write.topic);
+                self.allocator.free(write.data);
+            }
+            pending_writes.deinit();
+        }
+
+        var provisional_offsets = std.AutoHashMap(u64, u64).init(self.allocator);
+        defer provisional_offsets.deinit();
+
+        const partitions = self.txn_coordinator.getPartitions(txn.producer_id) orelse return false;
+        for (partitions) |tp| {
+            const write_result = self.planTxnControlBatchS3WalPartition(
+                txn.producer_id,
+                txn.producer_epoch,
+                .abort,
+                tp.topic,
+                tp.partition,
+                &provisional_offsets,
+                &pending_writes,
+            );
+            if (write_result.error_code != @intFromEnum(ErrorCode.none)) {
+                log.warn("Timed-out transaction {d} abort marker staging failed for {s}-{d}: error_code={d}", .{ txn.producer_id, tp.topic, tp.partition, write_result.error_code });
+                return false;
+            }
+        }
+
+        const complete_error = self.txn_coordinator.endTxnComplete(txn.producer_id, txn.producer_epoch, false);
+        if (complete_error != @intFromEnum(ErrorCode.none)) {
+            log.warn("Timed-out transaction {d} coordinator completion failed: error_code={d}", .{ txn.producer_id, complete_error });
+            return false;
+        }
+
+        self.planTransactionSnapshotS3WalWrite(&provisional_offsets, &pending_writes) catch |err| {
+            log.warn("Timed-out transaction {d} snapshot staging failed: {}", .{ txn.producer_id, err });
+            self.restoreTransactionsAfterFailedMutation(previous_snapshot);
+            return false;
+        };
+
+        self.flushPendingTxnMarkerS3WalWrites(pending_writes.items) catch |err| {
+            log.warn("Timed-out transaction {d} atomic S3 WAL flush failed: {}", .{ txn.producer_id, err });
+            self.restoreTransactionsAfterFailedMutation(previous_snapshot);
+            return false;
+        };
+
+        self.applyCommittedTxnMarkerS3WalWrites(pending_writes.items);
+        self.persistPartitionStates();
+        self.persistObjectManagerSnapshot();
+        self.persistence.saveTransactions(&self.txn_coordinator) catch |err| {
+            log.warn("Failed to persist transaction state after timed-out transaction S3 WAL flush: {}", .{err});
+        };
+        self.txn_coordinator.dirty = false;
+        return true;
     }
 
     /// Enforce retention policies for all topics.
@@ -29505,6 +29574,110 @@ test "Broker tick writes abort marker for timed-out transaction" {
     const header = try protocol.record_batch.RecordBatchHeader.parse(fetch_result.records);
     try testing.expect(header.isTransactional());
     try testing.expect(header.isControlBatch());
+}
+
+test "Broker tick rolls back timed-out transaction when atomic S3 WAL abort flush fails" {
+    var mock_s3 = storage.MockS3.init(testing.allocator);
+    defer mock_s3.deinit();
+    const s3_storage = storage.S3Storage.initMock(testing.allocator, &mock_s3);
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+    broker.store.s3_wal_mode = true;
+    broker.store.s3_storage = s3_storage;
+    broker.store.s3_wal_batcher = storage.wal.S3WalBatcher.init(testing.allocator);
+    try broker.open();
+    try testing.expect(broker.ensureTopic("txn-timeout-s3-fail-topic"));
+
+    const init_result = try broker.txn_coordinator.initProducerId("txn-timeout-s3-fail");
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.none)), try broker.txn_coordinator.addPartitionsToTxn(
+        init_result.producer_id,
+        init_result.producer_epoch,
+        "txn-timeout-s3-fail-topic",
+        0,
+    ));
+    try broker.persistTransactionsIfDirtyDurably();
+
+    if (broker.txn_coordinator.transactions.getPtr(init_result.producer_id)) |txn| {
+        txn.timeout_ms = 1;
+        txn.start_time_ms = @import("time_compat").milliTimestamp() - 10_000;
+    }
+
+    mock_s3.failNextPutObjects(3);
+
+    broker.tick();
+
+    try testing.expectEqual(TxnCoordinator.TxnStatus.ongoing, broker.txn_coordinator.getStatus(init_result.producer_id).?);
+    try testing.expectEqual(@as(usize, 1), broker.txn_coordinator.getPartitions(init_result.producer_id).?.len);
+    try testing.expect(!broker.txn_coordinator.dirty);
+
+    const state = broker.store.partitions.get("txn-timeout-s3-fail-topic-0").?;
+    try testing.expectEqual(@as(u64, 0), state.next_offset);
+    try testing.expectEqual(@as(u64, 0), state.high_watermark);
+    try testing.expectEqual(@as(u64, 0), state.last_stable_offset);
+}
+
+test "Broker restores timed-out transaction S3 WAL abort after stateless replacement" {
+    var mock_s3 = storage.MockS3.init(testing.allocator);
+    defer mock_s3.deinit();
+    const s3_storage = storage.S3Storage.initMock(testing.allocator, &mock_s3);
+    const topic_name = "stateless-timeout-abort-topic";
+
+    var producer_id: i64 = -1;
+    var producer_epoch: i16 = -1;
+
+    {
+        var broker = Broker.init(testing.allocator, 1, 9092);
+        defer broker.deinit();
+        broker.store.s3_wal_mode = true;
+        broker.store.s3_storage = s3_storage;
+        broker.store.s3_wal_batcher = storage.wal.S3WalBatcher.init(testing.allocator);
+        try broker.open();
+        try testing.expect(broker.ensureTopic(topic_name));
+
+        const init_result = try broker.txn_coordinator.initProducerId("stateless-timeout-abort");
+        producer_id = init_result.producer_id;
+        producer_epoch = init_result.producer_epoch;
+        try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.none)), try broker.txn_coordinator.addPartitionsToTxn(producer_id, producer_epoch, topic_name, 0));
+        try broker.persistTransactionsIfDirtyDurably();
+
+        if (broker.txn_coordinator.transactions.getPtr(producer_id)) |txn| {
+            txn.timeout_ms = 1;
+            txn.start_time_ms = @import("time_compat").milliTimestamp() - 10_000;
+        }
+
+        const object_count_before = mock_s3.objectCount();
+        broker.tick();
+        try testing.expect(mock_s3.objectCount() > object_count_before);
+    }
+
+    {
+        var broker = Broker.init(testing.allocator, 1, 9092);
+        defer broker.deinit();
+        broker.store.s3_wal_mode = true;
+        broker.store.s3_storage = s3_storage;
+        broker.store.s3_wal_batcher = storage.wal.S3WalBatcher.init(testing.allocator);
+        try broker.open();
+
+        try testing.expect(broker.topics.contains(topic_name));
+        const txn = broker.txn_coordinator.transactions.getPtr(producer_id).?;
+        try testing.expectEqual(producer_id, txn.producer_id);
+        try testing.expectEqual(producer_epoch, txn.producer_epoch);
+        try testing.expectEqual(TxnCoordinator.TxnStatus.complete_abort, txn.status);
+        try testing.expectEqualStrings("stateless-timeout-abort", txn.transactional_id.?);
+        try testing.expectEqual(@as(usize, 0), txn.partitions.items.len);
+
+        const state = broker.store.partitions.get("stateless-timeout-abort-topic-0").?;
+        try testing.expectEqual(@as(u64, 1), state.next_offset);
+        try testing.expectEqual(@as(u64, 1), state.high_watermark);
+        try testing.expectEqual(@as(u64, 1), state.last_stable_offset);
+        try testing.expect(state.first_unstable_txn_offset == null);
+
+        const fetched = try broker.store.fetch(topic_name, 0, 0, 1024);
+        defer if (fetched.records.len > 0) testing.allocator.free(@constCast(fetched.records));
+        try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.none)), fetched.error_code);
+        try expectTxnControlRecordType(fetched.records, .abort);
+    }
 }
 
 test "Broker fenced by controller rejects produce" {
