@@ -179,7 +179,10 @@ Status: completed for the initial catalog and DeleteGroups slice.
   SCRAM-SHA-256 users, and reports missing users per result.
   AlterUserScramCredentials now advertises key 51 v0, decodes generated
   flexible requests, upserts/removes precomputed SCRAM-SHA-256 credentials,
-  rejects unsupported mechanisms, and exposes mutations through Describe.
+  rejects unsupported mechanisms, exposes mutations through Describe, writes
+  full credential snapshots to `__cluster_metadata` for broker replacement
+  replay, and rolls back local credential visibility when the shared snapshot
+  write fails.
   ListClientMetricsResources now advertises key 74 v0, decodes generated
   flexible requests, rejects malformed frames, and returns an empty generated
   resource list until client telemetry resources are implemented.
@@ -289,7 +292,10 @@ Status: completed for the initial catalog and DeleteGroups slice.
   open replays committed offsets from recovered S3 WAL objects; client quota
   configuration snapshots are now appended to `__cluster_metadata`, replayed
   from recovered S3 WAL on fresh-dir broker replacement, and rolled back on
-  failed snapshot writes before AlterClientQuotas is acknowledged;
+  failed snapshot writes before AlterClientQuotas is acknowledged; SCRAM
+  credential snapshots are likewise appended to `__cluster_metadata`, replayed
+  during broker replacement, and rolled back before AlterUserScramCredentials is
+  acknowledged when the snapshot write fails;
   `test-s3-process-crash`
   adds a gated real broker-process kill/replacement harness against MinIO/S3 and
   now verifies both data and committed offsets after a fresh local data dir

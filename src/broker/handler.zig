@@ -52,6 +52,8 @@ const partition_reassignment_snapshot_record_value_magic = "ZMQPR1";
 const partition_reassignment_snapshot_record_key = "__zmq_partition_reassignment_snapshot";
 const client_quota_snapshot_record_value_magic = "ZMQCQ1";
 const client_quota_snapshot_record_key = "__zmq_client_quota_snapshot";
+const scram_credential_snapshot_record_value_magic = "ZMQSC1";
+const scram_credential_snapshot_record_key = "__zmq_scram_credential_snapshot";
 const auto_mq_quorum_commit_timeout_ms: i64 = 5000;
 
 /// Stateful Kafka broker.
@@ -686,10 +688,11 @@ pub const Broker = struct {
         }
         const recovered_cluster_records = try self.restoreClusterMetadataFromLog();
         if (recovered_cluster_records.total() > 0) {
-            log.info("Restored cluster metadata from __cluster_metadata (topics={d}, reassignments={d}, client_quotas={d})", .{
+            log.info("Restored cluster metadata from __cluster_metadata (topics={d}, reassignments={d}, client_quotas={d}, scram_credentials={d})", .{
                 recovered_cluster_records.topic_snapshots,
                 recovered_cluster_records.partition_reassignment_snapshots,
                 recovered_cluster_records.client_quota_snapshots,
+                recovered_cluster_records.scram_credential_snapshots,
             });
             self.persistence.saveTopics(&self.topics) catch |err| {
                 log.warn("Failed to persist replayed topic metadata: {}", .{err});
@@ -2427,6 +2430,97 @@ pub const Broker = struct {
         };
     }
 
+    const ScramCredentialSnapshot = struct {
+        users: std.StringHashMap(ScramSha256Authenticator.ScramCredential),
+    };
+
+    fn encodeScramCredentialSnapshotRecordValue(self: *Broker) ![]u8 {
+        var buf = std.array_list.Managed(u8).init(self.allocator);
+        errdefer buf.deinit();
+        const writer = @import("list_compat").writer(&buf);
+
+        try writer.writeAll(scram_credential_snapshot_record_value_magic);
+        try writer.writeInt(u32, @intCast(self.scram_authenticator.users.count()), .big);
+
+        var it = self.scram_authenticator.users.iterator();
+        while (it.next()) |entry| {
+            const credential = entry.value_ptr;
+            try writeSnapshotBytes(writer, entry.key_ptr.*);
+            try writer.writeInt(u32, credential.iterations, .big);
+            try writer.writeAll(credential.salt[0..]);
+            try writer.writeAll(credential.stored_key[0..]);
+            try writer.writeAll(credential.server_key[0..]);
+        }
+
+        return buf.toOwnedSlice();
+    }
+
+    fn freeScramCredentialSnapshot(self: *Broker, snapshot: *ScramCredentialSnapshot) void {
+        var it = snapshot.users.iterator();
+        while (it.next()) |entry| {
+            self.allocator.free(entry.key_ptr.*);
+        }
+        snapshot.users.deinit();
+        snapshot.users = std.StringHashMap(ScramSha256Authenticator.ScramCredential).init(self.allocator);
+    }
+
+    fn readSnapshotBytes32(value: []const u8, pos: *usize) ![32]u8 {
+        if (pos.* + 32 > value.len) return error.InvalidScramCredentialSnapshot;
+        const out = value[pos.*..][0..32].*;
+        pos.* += 32;
+        return out;
+    }
+
+    fn decodeScramCredentialSnapshotRecordValue(self: *Broker, value: []const u8) !ScramCredentialSnapshot {
+        if (value.len < scram_credential_snapshot_record_value_magic.len + 4) return error.InvalidScramCredentialSnapshot;
+        if (!std.mem.eql(u8, value[0..scram_credential_snapshot_record_value_magic.len], scram_credential_snapshot_record_value_magic)) {
+            return error.InvalidScramCredentialSnapshot;
+        }
+
+        var pos: usize = scram_credential_snapshot_record_value_magic.len;
+        const credential_count = try readSnapshotU32(value, &pos);
+        if (credential_count > 100_000) return error.InvalidScramCredentialSnapshot;
+
+        var snapshot = ScramCredentialSnapshot{
+            .users = std.StringHashMap(ScramSha256Authenticator.ScramCredential).init(self.allocator),
+        };
+        errdefer self.freeScramCredentialSnapshot(&snapshot);
+
+        for (0..credential_count) |_| {
+            const username = try self.readSnapshotOwnedBytes(value, &pos);
+            var username_owned = true;
+            errdefer if (username_owned) self.allocator.free(username);
+
+            if (username.len == 0 or snapshot.users.contains(username)) {
+                return error.InvalidScramCredentialSnapshot;
+            }
+
+            const iterations = try readSnapshotU32(value, &pos);
+            if (iterations == 0) return error.InvalidScramCredentialSnapshot;
+
+            try snapshot.users.put(username, .{
+                .salt = try readSnapshotBytes32(value, &pos),
+                .iterations = iterations,
+                .stored_key = try readSnapshotBytes32(value, &pos),
+                .server_key = try readSnapshotBytes32(value, &pos),
+            });
+            username_owned = false;
+        }
+
+        if (pos != value.len) return error.InvalidScramCredentialSnapshot;
+        return snapshot;
+    }
+
+    fn applyScramCredentialSnapshotRecord(self: *Broker, value: []const u8) !void {
+        const snapshot = try self.decodeScramCredentialSnapshotRecordValue(value);
+
+        self.scram_authenticator.deinit();
+        self.scram_authenticator = .{
+            .users = snapshot.users,
+            .allocator = self.allocator,
+        };
+    }
+
     fn offsetCommitKeyParts(key: []const u8) ?struct { group_id: []const u8, topic: []const u8, partition: i32 } {
         var fields = std.mem.splitSequence(u8, key, ":");
         const group_id = fields.next() orelse return null;
@@ -2662,13 +2756,49 @@ pub const Broker = struct {
         self.persistPartitionStates();
     }
 
+    /// Write a full SCRAM credential snapshot to __cluster_metadata so
+    /// AlterUserScramCredentials survives stateless broker replacement.
+    fn writeScramCredentialSnapshotRecord(self: *Broker) !void {
+        const info = self.topics.get("__cluster_metadata") orelse return;
+        if (info.num_partitions <= 0) return;
+
+        const value = try self.encodeScramCredentialSnapshotRecordValue();
+        defer self.allocator.free(value);
+
+        const rec_batch = protocol.record_batch;
+        const records = [_]rec_batch.Record{
+            .{
+                .offset_delta = 0,
+                .key = scram_credential_snapshot_record_key,
+                .value = value,
+            },
+        };
+
+        const batch = try rec_batch.buildRecordBatch(
+            self.allocator,
+            0,
+            &records,
+            -1,
+            -1,
+            -1,
+            @import("time_compat").milliTimestamp(),
+            @import("time_compat").milliTimestamp(),
+            0,
+        );
+        defer self.allocator.free(batch);
+
+        _ = try self.store.produce("__cluster_metadata", 0, batch);
+        self.persistPartitionStates();
+    }
+
     const ClusterMetadataReplayCounts = struct {
         topic_snapshots: usize = 0,
         partition_reassignment_snapshots: usize = 0,
         client_quota_snapshots: usize = 0,
+        scram_credential_snapshots: usize = 0,
 
         fn total(self: @This()) usize {
-            return self.topic_snapshots + self.partition_reassignment_snapshots + self.client_quota_snapshots;
+            return self.topic_snapshots + self.partition_reassignment_snapshots + self.client_quota_snapshots + self.scram_credential_snapshots;
         }
     };
 
@@ -2677,6 +2807,7 @@ pub const Broker = struct {
         topic_snapshot,
         partition_reassignment_snapshot,
         client_quota_snapshot,
+        scram_credential_snapshot,
     };
 
     fn restoreClusterMetadataFromLog(self: *Broker) !ClusterMetadataReplayCounts {
@@ -2692,6 +2823,7 @@ pub const Broker = struct {
             restored.topic_snapshots += partition_counts.topic_snapshots;
             restored.partition_reassignment_snapshots += partition_counts.partition_reassignment_snapshots;
             restored.client_quota_snapshots += partition_counts.client_quota_snapshots;
+            restored.scram_credential_snapshots += partition_counts.scram_credential_snapshots;
         }
         return restored;
     }
@@ -2719,6 +2851,7 @@ pub const Broker = struct {
                         .topic_snapshot => restored.topic_snapshots += 1,
                         .partition_reassignment_snapshot => restored.partition_reassignment_snapshots += 1,
                         .client_quota_snapshot => restored.client_quota_snapshots += 1,
+                        .scram_credential_snapshot => restored.scram_credential_snapshots += 1,
                     }
                 }
             }
@@ -2741,6 +2874,10 @@ pub const Broker = struct {
         if (std.mem.eql(u8, key, client_quota_snapshot_record_key)) {
             try self.applyClientQuotaSnapshotRecord(value);
             return .client_quota_snapshot;
+        }
+        if (std.mem.eql(u8, key, scram_credential_snapshot_record_key)) {
+            try self.applyScramCredentialSnapshotRecord(value);
+            return .scram_credential_snapshot;
         }
         return .none;
     }
@@ -10684,7 +10821,7 @@ pub const Broker = struct {
         defer if (results.len > 0) self.allocator.free(results);
 
         for (req.deletions) |deletion| {
-            results[results_init] = self.applyScramCredentialDeletion(deletion);
+            results[results_init] = self.applyScramCredentialDeletion(deletion) catch return null;
             results_init += 1;
         }
         for (req.upsertions) |upsertion| {
@@ -10704,7 +10841,7 @@ pub const Broker = struct {
         if (req.upsertions.len > 0) self.allocator.free(req.upsertions);
     }
 
-    fn applyScramCredentialDeletion(self: *Broker, deletion: generated.alter_user_scram_credentials_request.AlterUserScramCredentialsRequest.ScramCredentialDeletion) generated.alter_user_scram_credentials_response.AlterUserScramCredentialsResponse.AlterUserScramCredentialsResult {
+    fn applyScramCredentialDeletion(self: *Broker, deletion: generated.alter_user_scram_credentials_request.AlterUserScramCredentialsRequest.ScramCredentialDeletion) !generated.alter_user_scram_credentials_response.AlterUserScramCredentialsResponse.AlterUserScramCredentialsResult {
         const username = deletion.name orelse "";
         if (username.len == 0) {
             return .{ .user = deletion.name, .error_code = @intFromEnum(ErrorCode.invalid_request), .error_message = "Invalid SCRAM user name" };
@@ -10712,9 +10849,19 @@ pub const Broker = struct {
         if (deletion.mechanism != 1) {
             return .{ .user = deletion.name, .error_code = @intFromEnum(ErrorCode.unsupported_sasl_mechanism), .error_message = "Unsupported SCRAM mechanism" };
         }
-        if (!self.scram_authenticator.removeUser(username)) {
+        if (self.scram_authenticator.getCredential(username) == null) {
             return .{ .user = deletion.name, .error_code = @intFromEnum(ErrorCode.resource_not_found), .error_message = "SCRAM user not found" };
         }
+        const previous_snapshot = try self.encodeScramCredentialSnapshotRecordValue();
+        defer self.allocator.free(previous_snapshot);
+
+        _ = self.scram_authenticator.removeUser(username);
+
+        self.writeScramCredentialSnapshotRecord() catch |err| {
+            log.warn("Failed to append SCRAM credential snapshot to __cluster_metadata: {}", .{err});
+            self.restoreScramCredentialsAfterFailedMutation(previous_snapshot);
+            return .{ .user = deletion.name, .error_code = @intFromEnum(ErrorCode.kafka_storage_error), .error_message = "Failed to persist SCRAM credentials" };
+        };
         return .{ .user = deletion.name, .error_code = @intFromEnum(ErrorCode.none), .error_message = null };
     }
 
@@ -10740,8 +10887,25 @@ pub const Broker = struct {
         var salted_password: [32]u8 = undefined;
         @memcpy(&salted_password, salted_password_bytes[0..32]);
 
-        try self.scram_authenticator.putCredential(username, salt, @intCast(upsertion.iterations), salted_password);
+        const previous_snapshot = try self.encodeScramCredentialSnapshotRecordValue();
+        defer self.allocator.free(previous_snapshot);
+
+        self.scram_authenticator.putCredential(username, salt, @intCast(upsertion.iterations), salted_password) catch |err| {
+            self.restoreScramCredentialsAfterFailedMutation(previous_snapshot);
+            return err;
+        };
+        self.writeScramCredentialSnapshotRecord() catch |err| {
+            log.warn("Failed to append SCRAM credential snapshot to __cluster_metadata: {}", .{err});
+            self.restoreScramCredentialsAfterFailedMutation(previous_snapshot);
+            return .{ .user = upsertion.name, .error_code = @intFromEnum(ErrorCode.kafka_storage_error), .error_message = "Failed to persist SCRAM credentials" };
+        };
         return .{ .user = upsertion.name, .error_code = @intFromEnum(ErrorCode.none), .error_message = null };
+    }
+
+    fn restoreScramCredentialsAfterFailedMutation(self: *Broker, snapshot_value: []const u8) void {
+        self.applyScramCredentialSnapshotRecord(snapshot_value) catch |restore_err| {
+            log.err("Failed to restore SCRAM credential snapshot after failed mutation: {}", .{restore_err});
+        };
     }
 
     // ---------------------------------------------------------------
@@ -19461,6 +19625,200 @@ test "Broker.handleRequest AlterUserScramCredentials deletes SCRAM user" {
     try testing.expectEqual(response.?.len, rpos);
     try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.none)), resp.results[0].error_code);
     try testing.expect(broker.scram_authenticator.getCredential("scram-delete-user") == null);
+}
+
+test "Broker restores SCRAM credentials from S3 cluster metadata log" {
+    const AlterReq = generated.alter_user_scram_credentials_request.AlterUserScramCredentialsRequest;
+    const AlterResp = generated.alter_user_scram_credentials_response.AlterUserScramCredentialsResponse;
+    const DescribeReq = generated.describe_user_scram_credentials_request.DescribeUserScramCredentialsRequest;
+    const DescribeResp = generated.describe_user_scram_credentials_response.DescribeUserScramCredentialsResponse;
+
+    var mock_s3 = storage.MockS3.init(testing.allocator);
+    defer mock_s3.deinit();
+    const s3_storage = storage.S3Storage.initMock(testing.allocator, &mock_s3);
+
+    const salt = [_]u8{3} ** 32;
+    const salted_password = [_]u8{4} ** 32;
+    {
+        var broker = Broker.init(testing.allocator, 1, 9092);
+        defer broker.deinit();
+        broker.store.s3_wal_mode = true;
+        broker.store.s3_storage = s3_storage;
+        broker.store.s3_wal_batcher = storage.wal.S3WalBatcher.init(testing.allocator);
+
+        try broker.open();
+
+        const upsertions = [_]AlterReq.ScramCredentialUpsertion{.{
+            .name = "scram-s3-user",
+            .mechanism = 1,
+            .iterations = 8192,
+            .salt = &salt,
+            .salted_password = &salted_password,
+        }};
+        const alter_req = AlterReq{ .upsertions = &upsertions };
+
+        var buf: [1024]u8 = undefined;
+        var pos = buildTestRequest(&buf, 51, 0, 5104, header_mod.requestHeaderVersion(51, 0));
+        alter_req.serialize(&buf, &pos, 0);
+
+        const alter_response = broker.handleRequest(buf[0..pos]);
+        try testing.expect(alter_response != null);
+        defer testing.allocator.free(alter_response.?);
+
+        var rpos: usize = 0;
+        var alter_header = try ResponseHeader.deserialize(testing.allocator, alter_response.?, &rpos, header_mod.responseHeaderVersion(51, 0));
+        defer alter_header.deinit(testing.allocator);
+        try testing.expectEqual(@as(i32, 5104), alter_header.correlation_id);
+
+        const alter_resp = try AlterResp.deserialize(testing.allocator, alter_response.?, &rpos, 0);
+        defer freeDeserializedAlterUserScramCredentialsResponse(&alter_resp);
+
+        try testing.expectEqual(alter_response.?.len, rpos);
+        try testing.expectEqual(@as(usize, 1), alter_resp.results.len);
+        try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.none)), alter_resp.results[0].error_code);
+        try testing.expect(mock_s3.objectCount() > 0);
+    }
+
+    {
+        var broker = Broker.init(testing.allocator, 1, 9092);
+        defer broker.deinit();
+        broker.store.s3_wal_mode = true;
+        broker.store.s3_storage = s3_storage;
+        broker.store.s3_wal_batcher = storage.wal.S3WalBatcher.init(testing.allocator);
+
+        try broker.open();
+
+        const credential = broker.scram_authenticator.getCredential("scram-s3-user").?;
+        try testing.expectEqual(@as(u32, 8192), credential.iterations);
+        try testing.expectEqualSlices(u8, salt[0..], credential.salt[0..]);
+
+        const users = [_]DescribeReq.UserName{.{ .name = "scram-s3-user" }};
+        const describe_req = DescribeReq{ .users = &users };
+
+        var buf: [512]u8 = undefined;
+        var pos = buildTestRequest(&buf, 50, 0, 5004, header_mod.requestHeaderVersion(50, 0));
+        describe_req.serialize(&buf, &pos, 0);
+
+        const describe_response = broker.handleRequest(buf[0..pos]);
+        try testing.expect(describe_response != null);
+        defer testing.allocator.free(describe_response.?);
+
+        var rpos: usize = 0;
+        var describe_header = try ResponseHeader.deserialize(testing.allocator, describe_response.?, &rpos, header_mod.responseHeaderVersion(50, 0));
+        defer describe_header.deinit(testing.allocator);
+        try testing.expectEqual(@as(i32, 5004), describe_header.correlation_id);
+
+        const describe_resp = try DescribeResp.deserialize(testing.allocator, describe_response.?, &rpos, 0);
+        defer freeDeserializedDescribeUserScramCredentialsResponse(&describe_resp);
+
+        try testing.expectEqual(describe_response.?.len, rpos);
+        try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.none)), describe_resp.results[0].error_code);
+        try testing.expectEqual(@as(i32, 8192), describe_resp.results[0].credential_infos[0].iterations);
+    }
+}
+
+test "Broker AlterUserScramCredentials fails closed when SCRAM snapshot S3 WAL upsert fails" {
+    const Req = generated.alter_user_scram_credentials_request.AlterUserScramCredentialsRequest;
+    const Resp = generated.alter_user_scram_credentials_response.AlterUserScramCredentialsResponse;
+
+    var mock_s3 = storage.MockS3.init(testing.allocator);
+    defer mock_s3.deinit();
+    const s3_storage = storage.S3Storage.initMock(testing.allocator, &mock_s3);
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+    broker.store.s3_wal_mode = true;
+    broker.store.s3_storage = s3_storage;
+    broker.store.s3_wal_batcher = storage.wal.S3WalBatcher.init(testing.allocator);
+
+    try broker.open();
+    const object_count_before = mock_s3.objectCount();
+    mock_s3.failNextPutObjects(3);
+
+    const salt = [_]u8{5} ** 32;
+    const salted_password = [_]u8{6} ** 32;
+    const upsertions = [_]Req.ScramCredentialUpsertion{.{
+        .name = "scram-s3-fail-user",
+        .mechanism = 1,
+        .iterations = 4096,
+        .salt = &salt,
+        .salted_password = &salted_password,
+    }};
+    const req = Req{ .upsertions = &upsertions };
+
+    var buf: [1024]u8 = undefined;
+    var pos = buildTestRequest(&buf, 51, 0, 5105, header_mod.requestHeaderVersion(51, 0));
+    req.serialize(&buf, &pos, 0);
+
+    const response = broker.handleRequest(buf[0..pos]);
+    try testing.expect(response != null);
+    defer testing.allocator.free(response.?);
+
+    var rpos: usize = 0;
+    var response_header = try ResponseHeader.deserialize(testing.allocator, response.?, &rpos, header_mod.responseHeaderVersion(51, 0));
+    defer response_header.deinit(testing.allocator);
+    try testing.expectEqual(@as(i32, 5105), response_header.correlation_id);
+
+    const resp = try Resp.deserialize(testing.allocator, response.?, &rpos, 0);
+    defer freeDeserializedAlterUserScramCredentialsResponse(&resp);
+
+    try testing.expectEqual(response.?.len, rpos);
+    try testing.expectEqual(@as(usize, 1), resp.results.len);
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.kafka_storage_error)), resp.results[0].error_code);
+    try testing.expect(resp.results[0].error_message != null);
+    try testing.expect(broker.scram_authenticator.getCredential("scram-s3-fail-user") == null);
+    try testing.expectEqual(object_count_before, mock_s3.objectCount());
+}
+
+test "Broker AlterUserScramCredentials rolls back deletion when SCRAM snapshot S3 WAL write fails" {
+    const Req = generated.alter_user_scram_credentials_request.AlterUserScramCredentialsRequest;
+    const Resp = generated.alter_user_scram_credentials_response.AlterUserScramCredentialsResponse;
+
+    var mock_s3 = storage.MockS3.init(testing.allocator);
+    defer mock_s3.deinit();
+    const s3_storage = storage.S3Storage.initMock(testing.allocator, &mock_s3);
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+    broker.store.s3_wal_mode = true;
+    broker.store.s3_storage = s3_storage;
+    broker.store.s3_wal_batcher = storage.wal.S3WalBatcher.init(testing.allocator);
+
+    try broker.open();
+
+    const salt = [_]u8{7} ** 32;
+    const salted_password = [_]u8{8} ** 32;
+    try broker.scram_authenticator.putCredential("scram-delete-s3-fail", salt, 4096, salted_password);
+    try broker.writeScramCredentialSnapshotRecord();
+    const object_count_before = mock_s3.objectCount();
+    mock_s3.failNextPutObjects(3);
+
+    const deletions = [_]Req.ScramCredentialDeletion{.{
+        .name = "scram-delete-s3-fail",
+        .mechanism = 1,
+    }};
+    const req = Req{ .deletions = &deletions };
+
+    var buf: [512]u8 = undefined;
+    var pos = buildTestRequest(&buf, 51, 0, 5106, header_mod.requestHeaderVersion(51, 0));
+    req.serialize(&buf, &pos, 0);
+
+    const response = broker.handleRequest(buf[0..pos]);
+    try testing.expect(response != null);
+    defer testing.allocator.free(response.?);
+
+    var rpos: usize = 0;
+    var response_header = try ResponseHeader.deserialize(testing.allocator, response.?, &rpos, header_mod.responseHeaderVersion(51, 0));
+    defer response_header.deinit(testing.allocator);
+    try testing.expectEqual(@as(i32, 5106), response_header.correlation_id);
+
+    const resp = try Resp.deserialize(testing.allocator, response.?, &rpos, 0);
+    defer freeDeserializedAlterUserScramCredentialsResponse(&resp);
+
+    try testing.expectEqual(response.?.len, rpos);
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.kafka_storage_error)), resp.results[0].error_code);
+    try testing.expect(broker.scram_authenticator.getCredential("scram-delete-s3-fail") != null);
+    try testing.expectEqual(object_count_before, mock_s3.objectCount());
 }
 
 test "Broker.handleRequest AlterUserScramCredentials rejects unsupported mechanism" {
