@@ -1098,11 +1098,15 @@ pub const Broker = struct {
 
     /// Persist current topic metadata to disk (best-effort).
     fn persistTopics(self: *Broker) void {
-        self.persistence.saveTopics(&self.topics) catch |err| {
-            log.warn("Failed to persist topics: {}", .{err});
-        };
+        self.persistTopicsLocal();
         self.writeTopicSnapshotRecord() catch |err| {
             log.warn("Failed to append topic snapshot to __cluster_metadata: {}", .{err});
+        };
+    }
+
+    fn persistTopicsLocal(self: *Broker) void {
+        self.persistence.saveTopics(&self.topics) catch |err| {
+            log.warn("Failed to persist topics: {}", .{err});
         };
     }
 
@@ -2216,6 +2220,12 @@ pub const Broker = struct {
             try self.upsertTopicFromEntry(entry);
         }
         _ = self.pruneInvalidPartitionReassignments();
+    }
+
+    fn restoreTopicsAfterFailedMutation(self: *Broker, snapshot_value: []const u8) void {
+        self.restoreTopicSnapshotRecord(snapshot_value) catch |restore_err| {
+            log.err("Failed to restore topic snapshot after failed mutation: {}", .{restore_err});
+        };
     }
 
     fn encodePartitionReassignmentSnapshotRecordValue(self: *Broker) ![]u8 {
@@ -8585,6 +8595,13 @@ pub const Broker = struct {
         const responses = self.allocator.alloc(ResourceResponse, req.resources.len) catch return null;
         defer if (responses.len > 0) self.allocator.free(responses);
 
+        const mutated_resources = self.allocator.alloc(bool, req.resources.len) catch return null;
+        defer if (mutated_resources.len > 0) self.allocator.free(mutated_resources);
+        @memset(mutated_resources, false);
+
+        const previous_snapshot = if (!req.validate_only) self.encodeTopicSnapshotRecordValue() catch return null else null;
+        defer if (previous_snapshot) |snapshot| self.allocator.free(snapshot);
+
         var mutated = false;
         for (req.resources, 0..) |resource, i| {
             const result = self.applyAlterConfigsResource(resource, req.validate_only);
@@ -8594,11 +8611,29 @@ pub const Broker = struct {
                 .resource_type = resource.resource_type,
                 .resource_name = resource.resource_name,
             };
-            if (result.mutated) mutated = true;
+            if (result.mutated) {
+                mutated = true;
+                mutated_resources[i] = true;
+            }
         }
 
         if (mutated) {
-            self.persistTopics();
+            self.writeTopicSnapshotRecord() catch |err| {
+                log.warn("Failed to append topic config snapshot to __cluster_metadata: {}", .{err});
+                self.restoreTopicsAfterFailedMutation(previous_snapshot.?);
+                for (responses, mutated_resources) |*response, was_mutated| {
+                    if (was_mutated and response.error_code == @intFromEnum(ErrorCode.none)) {
+                        response.error_code = @intFromEnum(ErrorCode.kafka_storage_error);
+                        response.error_message = "Failed to persist topic metadata";
+                    }
+                }
+                const resp = Resp{
+                    .throttle_time_ms = 0,
+                    .responses = responses,
+                };
+                return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+            };
+            self.persistTopicsLocal();
             self.persistObjectManagerSnapshot();
         }
 
@@ -8630,21 +8665,23 @@ pub const Broker = struct {
             .error_message = "Unknown topic",
         };
 
+        var next_config = topic_info.config;
         var updated = false;
         for (resource.configs) |config| {
-            const result = applyAlterTopicConfig(topic_info, config, validate_only);
+            const result = applyAlterTopicConfig(&next_config, config);
             if (result.error_code != @intFromEnum(ErrorCode.none)) return result;
             if (result.mutated) updated = true;
         }
 
+        if (!validate_only and updated) topic_info.config = next_config;
         return .{
             .error_code = @intFromEnum(ErrorCode.none),
             .error_message = null,
-            .mutated = updated,
+            .mutated = updated and !validate_only,
         };
     }
 
-    fn applyAlterTopicConfig(topic_info: *TopicInfo, config: generated.alter_configs_request.AlterConfigsRequest.AlterConfigsResource.AlterableConfig, validate_only: bool) IncrementalAlterConfigResult {
+    fn applyAlterTopicConfig(topic_config: *TopicConfig, config: generated.alter_configs_request.AlterConfigsRequest.AlterConfigsResource.AlterableConfig) IncrementalAlterConfigResult {
         const name = config.name orelse return .{
             .error_code = @intFromEnum(ErrorCode.invalid_config),
             .error_message = "Missing config name",
@@ -8655,16 +8692,16 @@ pub const Broker = struct {
 
         if (std.mem.eql(u8, name, "retention.ms")) {
             const parsed = if (value) |v| std.fmt.parseInt(i64, v, 10) catch return invalidTopicConfigValue() else defaults.retention_ms;
-            if (!validate_only) topic_info.config.retention_ms = parsed;
+            topic_config.retention_ms = parsed;
         } else if (std.mem.eql(u8, name, "retention.bytes")) {
             const parsed = if (value) |v| std.fmt.parseInt(i64, v, 10) catch return invalidTopicConfigValue() else defaults.retention_bytes;
-            if (!validate_only) topic_info.config.retention_bytes = parsed;
+            topic_config.retention_bytes = parsed;
         } else if (std.mem.eql(u8, name, "max.message.bytes")) {
             const parsed = if (value) |v| std.fmt.parseInt(i32, v, 10) catch return invalidTopicConfigValue() else defaults.max_message_bytes;
-            if (!validate_only) topic_info.config.max_message_bytes = parsed;
+            topic_config.max_message_bytes = parsed;
         } else if (std.mem.eql(u8, name, "min.insync.replicas")) {
             const parsed = if (value) |v| std.fmt.parseInt(i32, v, 10) catch return invalidTopicConfigValue() else defaults.min_insync_replicas;
-            if (!validate_only) topic_info.config.min_insync_replicas = parsed;
+            topic_config.min_insync_replicas = parsed;
         } else {
             return .{
                 .error_code = @intFromEnum(ErrorCode.invalid_config),
@@ -8675,7 +8712,7 @@ pub const Broker = struct {
         return .{
             .error_code = @intFromEnum(ErrorCode.none),
             .error_message = null,
-            .mutated = !validate_only,
+            .mutated = true,
         };
     }
 
@@ -10050,6 +10087,13 @@ pub const Broker = struct {
         const responses = self.allocator.alloc(ResourceResponse, req.resources.len) catch return null;
         defer if (responses.len > 0) self.allocator.free(responses);
 
+        const mutated_resources = self.allocator.alloc(bool, req.resources.len) catch return null;
+        defer if (mutated_resources.len > 0) self.allocator.free(mutated_resources);
+        @memset(mutated_resources, false);
+
+        const previous_snapshot = if (!req.validate_only) self.encodeTopicSnapshotRecordValue() catch return null else null;
+        defer if (previous_snapshot) |snapshot| self.allocator.free(snapshot);
+
         var mutated = false;
         for (req.resources, 0..) |resource, i| {
             const result = self.applyIncrementalAlterConfigsResource(resource, req.validate_only);
@@ -10059,11 +10103,29 @@ pub const Broker = struct {
                 .resource_type = resource.resource_type,
                 .resource_name = resource.resource_name,
             };
-            if (result.mutated) mutated = true;
+            if (result.mutated) {
+                mutated = true;
+                mutated_resources[i] = true;
+            }
         }
 
         if (mutated) {
-            self.persistTopics();
+            self.writeTopicSnapshotRecord() catch |err| {
+                log.warn("Failed to append topic config snapshot to __cluster_metadata: {}", .{err});
+                self.restoreTopicsAfterFailedMutation(previous_snapshot.?);
+                for (responses, mutated_resources) |*response, was_mutated| {
+                    if (was_mutated and response.error_code == @intFromEnum(ErrorCode.none)) {
+                        response.error_code = @intFromEnum(ErrorCode.kafka_storage_error);
+                        response.error_message = "Failed to persist topic metadata";
+                    }
+                }
+                const resp = Resp{
+                    .throttle_time_ms = 0,
+                    .responses = responses,
+                };
+                return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+            };
+            self.persistTopicsLocal();
             self.persistObjectManagerSnapshot();
         }
 
@@ -10101,21 +10163,23 @@ pub const Broker = struct {
             .error_message = "Unknown topic",
         };
 
+        var next_config = topic_info.config;
         var updated = false;
         for (resource.configs) |config| {
-            const result = applyIncrementalTopicConfig(topic_info, config, validate_only);
+            const result = applyIncrementalTopicConfig(&next_config, config);
             if (result.error_code != @intFromEnum(ErrorCode.none)) return result;
             if (result.mutated) updated = true;
         }
 
+        if (!validate_only and updated) topic_info.config = next_config;
         return .{
             .error_code = @intFromEnum(ErrorCode.none),
             .error_message = null,
-            .mutated = updated,
+            .mutated = updated and !validate_only,
         };
     }
 
-    fn applyIncrementalTopicConfig(topic_info: *TopicInfo, config: generated.incremental_alter_configs_request.IncrementalAlterConfigsRequest.AlterConfigsResource.AlterableConfig, validate_only: bool) IncrementalAlterConfigResult {
+    fn applyIncrementalTopicConfig(topic_config: *TopicConfig, config: generated.incremental_alter_configs_request.IncrementalAlterConfigsRequest.AlterConfigsResource.AlterableConfig) IncrementalAlterConfigResult {
         const name = config.name orelse return .{
             .error_code = @intFromEnum(ErrorCode.invalid_config),
             .error_message = "Missing config name",
@@ -10141,16 +10205,16 @@ pub const Broker = struct {
 
         if (std.mem.eql(u8, name, "retention.ms")) {
             const parsed = if (is_delete) defaults.retention_ms else std.fmt.parseInt(i64, value, 10) catch return invalidTopicConfigValue();
-            if (!validate_only) topic_info.config.retention_ms = parsed;
+            topic_config.retention_ms = parsed;
         } else if (std.mem.eql(u8, name, "retention.bytes")) {
             const parsed = if (is_delete) defaults.retention_bytes else std.fmt.parseInt(i64, value, 10) catch return invalidTopicConfigValue();
-            if (!validate_only) topic_info.config.retention_bytes = parsed;
+            topic_config.retention_bytes = parsed;
         } else if (std.mem.eql(u8, name, "max.message.bytes")) {
             const parsed = if (is_delete) defaults.max_message_bytes else std.fmt.parseInt(i32, value, 10) catch return invalidTopicConfigValue();
-            if (!validate_only) topic_info.config.max_message_bytes = parsed;
+            topic_config.max_message_bytes = parsed;
         } else if (std.mem.eql(u8, name, "min.insync.replicas")) {
             const parsed = if (is_delete) defaults.min_insync_replicas else std.fmt.parseInt(i32, value, 10) catch return invalidTopicConfigValue();
-            if (!validate_only) topic_info.config.min_insync_replicas = parsed;
+            topic_config.min_insync_replicas = parsed;
         } else {
             return .{
                 .error_code = @intFromEnum(ErrorCode.invalid_config),
@@ -10161,7 +10225,7 @@ pub const Broker = struct {
         return .{
             .error_code = @intFromEnum(ErrorCode.none),
             .error_message = null,
-            .mutated = !validate_only,
+            .mutated = true,
         };
     }
 
@@ -18665,11 +18729,21 @@ test "Broker.handleRequest AlterConfigs validate_only does not mutate" {
     const Req = generated.alter_configs_request.AlterConfigsRequest;
     const Resp = generated.alter_configs_response.AlterConfigsResponse;
 
+    var mock_s3 = storage.MockS3.init(testing.allocator);
+    defer mock_s3.deinit();
+    const s3_storage = storage.S3Storage.initMock(testing.allocator, &mock_s3);
+
     var broker = Broker.init(testing.allocator, 1, 9092);
     defer broker.deinit();
+    broker.store.s3_wal_mode = true;
+    broker.store.s3_storage = s3_storage;
+    broker.store.s3_wal_batcher = storage.wal.S3WalBatcher.init(testing.allocator);
+
+    try broker.open();
     try testing.expect(broker.ensureTopic("alter-cfg-validate-topic"));
 
     const before = broker.topics.get("alter-cfg-validate-topic").?.config.retention_bytes;
+    const object_count_before = mock_s3.objectCount();
     const configs = [_]Req.AlterConfigsResource.AlterableConfig{.{
         .name = "retention.bytes",
         .value = "4096",
@@ -18703,6 +18777,118 @@ test "Broker.handleRequest AlterConfigs validate_only does not mutate" {
     try testing.expectEqual(response.?.len, rpos);
     try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.none)), resp.responses[0].error_code);
     try testing.expectEqual(before, broker.topics.get("alter-cfg-validate-topic").?.config.retention_bytes);
+    try testing.expectEqual(object_count_before, mock_s3.objectCount());
+}
+
+test "Broker.handleRequest AlterConfigs persists topic config through S3 replacement" {
+    const Req = generated.alter_configs_request.AlterConfigsRequest;
+    const Resp = generated.alter_configs_response.AlterConfigsResponse;
+
+    var mock_s3 = storage.MockS3.init(testing.allocator);
+    defer mock_s3.deinit();
+    const s3_storage = storage.S3Storage.initMock(testing.allocator, &mock_s3);
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+    broker.store.s3_wal_mode = true;
+    broker.store.s3_storage = s3_storage;
+    broker.store.s3_wal_batcher = storage.wal.S3WalBatcher.init(testing.allocator);
+
+    try broker.open();
+    try testing.expect(broker.ensureTopic("alter-cfg-s3-topic"));
+
+    const configs = [_]Req.AlterConfigsResource.AlterableConfig{.{
+        .name = "retention.ms",
+        .value = "4321",
+    }};
+    const resources = [_]Req.AlterConfigsResource{.{
+        .resource_type = 2,
+        .resource_name = "alter-cfg-s3-topic",
+        .configs = &configs,
+    }};
+    const req = Req{ .resources = &resources };
+
+    var buf: [512]u8 = undefined;
+    var pos = buildTestRequest(&buf, 33, 2, 3305, header_mod.requestHeaderVersion(33, 2));
+    req.serialize(&buf, &pos, 2);
+
+    const response = broker.handleRequest(buf[0..pos]);
+    try testing.expect(response != null);
+    defer testing.allocator.free(response.?);
+
+    var rpos: usize = 0;
+    var response_header = try ResponseHeader.deserialize(testing.allocator, response.?, &rpos, header_mod.responseHeaderVersion(33, 2));
+    defer response_header.deinit(testing.allocator);
+    try testing.expectEqual(@as(i32, 3305), response_header.correlation_id);
+
+    const resp = try Resp.deserialize(testing.allocator, response.?, &rpos, 2);
+    defer if (resp.responses.len > 0) testing.allocator.free(resp.responses);
+
+    try testing.expectEqual(response.?.len, rpos);
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.none)), resp.responses[0].error_code);
+
+    var replacement = Broker.init(testing.allocator, 1, 9092);
+    defer replacement.deinit();
+    replacement.store.s3_wal_mode = true;
+    replacement.store.s3_storage = s3_storage;
+    replacement.store.s3_wal_batcher = storage.wal.S3WalBatcher.init(testing.allocator);
+
+    try replacement.open();
+    try testing.expect(replacement.topics.contains("alter-cfg-s3-topic"));
+    try testing.expectEqual(@as(i64, 4321), replacement.topics.get("alter-cfg-s3-topic").?.config.retention_ms);
+}
+
+test "Broker.handleRequest AlterConfigs rolls back when topic snapshot S3 WAL write fails" {
+    const Req = generated.alter_configs_request.AlterConfigsRequest;
+    const Resp = generated.alter_configs_response.AlterConfigsResponse;
+
+    var mock_s3 = storage.MockS3.init(testing.allocator);
+    defer mock_s3.deinit();
+    const s3_storage = storage.S3Storage.initMock(testing.allocator, &mock_s3);
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+    broker.store.s3_wal_mode = true;
+    broker.store.s3_storage = s3_storage;
+    broker.store.s3_wal_batcher = storage.wal.S3WalBatcher.init(testing.allocator);
+
+    try broker.open();
+    try testing.expect(broker.ensureTopic("alter-cfg-s3-fail-topic"));
+    const before = broker.topics.get("alter-cfg-s3-fail-topic").?.config.retention_bytes;
+    const object_count_before = mock_s3.objectCount();
+    mock_s3.failNextPutObjects(3);
+
+    const configs = [_]Req.AlterConfigsResource.AlterableConfig{.{
+        .name = "retention.bytes",
+        .value = "8192",
+    }};
+    const resources = [_]Req.AlterConfigsResource{.{
+        .resource_type = 2,
+        .resource_name = "alter-cfg-s3-fail-topic",
+        .configs = &configs,
+    }};
+    const req = Req{ .resources = &resources };
+
+    var buf: [512]u8 = undefined;
+    var pos = buildTestRequest(&buf, 33, 2, 3306, header_mod.requestHeaderVersion(33, 2));
+    req.serialize(&buf, &pos, 2);
+
+    const response = broker.handleRequest(buf[0..pos]);
+    try testing.expect(response != null);
+    defer testing.allocator.free(response.?);
+
+    var rpos: usize = 0;
+    var response_header = try ResponseHeader.deserialize(testing.allocator, response.?, &rpos, header_mod.responseHeaderVersion(33, 2));
+    defer response_header.deinit(testing.allocator);
+    try testing.expectEqual(@as(i32, 3306), response_header.correlation_id);
+
+    const resp = try Resp.deserialize(testing.allocator, response.?, &rpos, 2);
+    defer if (resp.responses.len > 0) testing.allocator.free(resp.responses);
+
+    try testing.expectEqual(response.?.len, rpos);
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.kafka_storage_error)), resp.responses[0].error_code);
+    try testing.expectEqual(before, broker.topics.get("alter-cfg-s3-fail-topic").?.config.retention_bytes);
+    try testing.expectEqual(object_count_before, mock_s3.objectCount());
 }
 
 test "Broker.handleRequest AlterConfigs rejects truncated request" {
@@ -18906,11 +19092,21 @@ test "Broker.handleRequest IncrementalAlterConfigs validate_only does not mutate
     const Req = generated.incremental_alter_configs_request.IncrementalAlterConfigsRequest;
     const Resp = generated.incremental_alter_configs_response.IncrementalAlterConfigsResponse;
 
+    var mock_s3 = storage.MockS3.init(testing.allocator);
+    defer mock_s3.deinit();
+    const s3_storage = storage.S3Storage.initMock(testing.allocator, &mock_s3);
+
     var broker = Broker.init(testing.allocator, 1, 9092);
     defer broker.deinit();
+    broker.store.s3_wal_mode = true;
+    broker.store.s3_storage = s3_storage;
+    broker.store.s3_wal_batcher = storage.wal.S3WalBatcher.init(testing.allocator);
+
+    try broker.open();
     try testing.expect(broker.ensureTopic("inc-cfg-validate-topic"));
 
     const before = broker.topics.get("inc-cfg-validate-topic").?.config.max_message_bytes;
+    const object_count_before = mock_s3.objectCount();
     const configs = [_]Req.AlterConfigsResource.AlterableConfig{.{
         .name = "max.message.bytes",
         .config_operation = 0,
@@ -18945,6 +19141,64 @@ test "Broker.handleRequest IncrementalAlterConfigs validate_only does not mutate
     try testing.expectEqual(response.?.len, rpos);
     try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.none)), resp.responses[0].error_code);
     try testing.expectEqual(before, broker.topics.get("inc-cfg-validate-topic").?.config.max_message_bytes);
+    try testing.expectEqual(object_count_before, mock_s3.objectCount());
+}
+
+test "Broker.handleRequest IncrementalAlterConfigs rolls back when topic snapshot S3 WAL write fails" {
+    const Req = generated.incremental_alter_configs_request.IncrementalAlterConfigsRequest;
+    const Resp = generated.incremental_alter_configs_response.IncrementalAlterConfigsResponse;
+
+    var mock_s3 = storage.MockS3.init(testing.allocator);
+    defer mock_s3.deinit();
+    const s3_storage = storage.S3Storage.initMock(testing.allocator, &mock_s3);
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+    broker.store.s3_wal_mode = true;
+    broker.store.s3_storage = s3_storage;
+    broker.store.s3_wal_batcher = storage.wal.S3WalBatcher.init(testing.allocator);
+
+    try broker.open();
+    try testing.expect(broker.ensureTopic("inc-cfg-s3-fail-topic"));
+    const before = broker.topics.get("inc-cfg-s3-fail-topic").?.config.max_message_bytes;
+    const object_count_before = mock_s3.objectCount();
+    mock_s3.failNextPutObjects(3);
+
+    const configs = [_]Req.AlterConfigsResource.AlterableConfig{.{
+        .name = "max.message.bytes",
+        .config_operation = 0,
+        .value = "4096",
+    }};
+    const resources = [_]Req.AlterConfigsResource{.{
+        .resource_type = 2,
+        .resource_name = "inc-cfg-s3-fail-topic",
+        .configs = &configs,
+    }};
+    const req = Req{
+        .resources = &resources,
+        .validate_only = false,
+    };
+
+    var buf: [512]u8 = undefined;
+    var pos = buildTestRequest(&buf, 44, 1, 4405, header_mod.requestHeaderVersion(44, 1));
+    req.serialize(&buf, &pos, 1);
+
+    const response = broker.handleRequest(buf[0..pos]);
+    try testing.expect(response != null);
+    defer testing.allocator.free(response.?);
+
+    var rpos: usize = 0;
+    var response_header = try ResponseHeader.deserialize(testing.allocator, response.?, &rpos, header_mod.responseHeaderVersion(44, 1));
+    defer response_header.deinit(testing.allocator);
+    try testing.expectEqual(@as(i32, 4405), response_header.correlation_id);
+
+    const resp = try Resp.deserialize(testing.allocator, response.?, &rpos, 1);
+    defer if (resp.responses.len > 0) testing.allocator.free(resp.responses);
+
+    try testing.expectEqual(response.?.len, rpos);
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.kafka_storage_error)), resp.responses[0].error_code);
+    try testing.expectEqual(before, broker.topics.get("inc-cfg-s3-fail-topic").?.config.max_message_bytes);
+    try testing.expectEqual(object_count_before, mock_s3.objectCount());
 }
 
 test "Broker.handleRequest IncrementalAlterConfigs rejects invalid config value" {

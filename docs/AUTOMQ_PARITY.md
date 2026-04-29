@@ -167,6 +167,11 @@ Status: completed for the initial catalog and DeleteGroups slice.
   frames, validate enum fields, write full ACL snapshots to `__cluster_metadata`
   for broker replacement replay, fail closed and roll back local ACL visibility
   when shared snapshot writes fail, and return generated ACL resources/results.
+  AlterConfigs/IncrementalAlterConfigs now validate generated topic config
+  resources against temporary configs before mutating local topic state, write
+  full topic snapshots to `__cluster_metadata` before acknowledging successful
+  mutations, preserve validate-only as a no-write path, and fail closed with
+  rollback when the shared snapshot write fails.
   DescribeClientQuotas now advertises key 48 v0-v1, decodes generated
   legacy/flexible requests, rejects malformed and semantically invalid filters,
   and returns generated QuotaManager-backed per-client quota entries.
@@ -268,7 +273,9 @@ Status: completed for the initial catalog and DeleteGroups slice.
   malformed part ETags before completion; topic configs are now included in
   local topic metadata snapshots, and topic IDs, partition counts, and supported
   configs are now written to `__cluster_metadata` and replayed from recovered S3
-  WAL during fresh-dir replacement; local metadata snapshots now fsync before
+  WAL during fresh-dir replacement; AlterConfigs/IncrementalAlterConfigs now
+  roll back topic config visibility and return storage errors when that shared
+  snapshot cannot be written; local metadata snapshots now fsync before
   save calls return; MockS3 fault injection now covers bounded put retry,
   propagated get/list/range/delete failures, temporary list omission, recovery
   retry, fetch storage errors, and compaction orphan retry; restarted S3 WAL
