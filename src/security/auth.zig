@@ -93,14 +93,21 @@ pub const Authorizer = struct {
 
     /// Add an ACL entry.
     pub fn addAcl(self: *Authorizer, principal: []const u8, resource_type: ResourceType, resource_name: []const u8, pattern_type: PatternType, operation: Operation, permission: Permission, host: []const u8) !void {
+        const principal_copy = try self.allocator.dupe(u8, principal);
+        errdefer self.allocator.free(principal_copy);
+        const resource_name_copy = try self.allocator.dupe(u8, resource_name);
+        errdefer self.allocator.free(resource_name_copy);
+        const host_copy = try self.allocator.dupe(u8, host);
+        errdefer self.allocator.free(host_copy);
+
         try self.acls.append(.{
-            .principal = try self.allocator.dupe(u8, principal),
+            .principal = principal_copy,
             .resource_type = resource_type,
-            .resource_name = try self.allocator.dupe(u8, resource_name),
+            .resource_name = resource_name_copy,
             .pattern_type = pattern_type,
             .operation = operation,
             .permission = permission,
-            .host = try self.allocator.dupe(u8, host),
+            .host = host_copy,
         });
         log.info("ACL added: principal={s} resource={s} op={d} permission={d}", .{ principal, resource_name, @intFromEnum(operation), @intFromEnum(permission) });
     }

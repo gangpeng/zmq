@@ -163,6 +163,10 @@ Status: completed for the initial catalog and DeleteGroups slice.
   AssignReplicasToDirs key 73 remains non-advertised until JBOD directory
   semantics exist, but direct requests now validate/decode generated flexible
   frames and return generated fail-closed responses.
+  DescribeAcls/CreateAcls/DeleteAcls now use generated schemas, reject malformed
+  frames, validate enum fields, write full ACL snapshots to `__cluster_metadata`
+  for broker replacement replay, fail closed and roll back local ACL visibility
+  when shared snapshot writes fail, and return generated ACL resources/results.
   DescribeClientQuotas now advertises key 48 v0-v1, decodes generated
   legacy/flexible requests, rejects malformed and semantically invalid filters,
   and returns generated QuotaManager-backed per-client quota entries.
@@ -295,7 +299,9 @@ Status: completed for the initial catalog and DeleteGroups slice.
   failed snapshot writes before AlterClientQuotas is acknowledged; SCRAM
   credential snapshots are likewise appended to `__cluster_metadata`, replayed
   during broker replacement, and rolled back before AlterUserScramCredentials is
-  acknowledged when the snapshot write fails;
+  acknowledged when the snapshot write fails; ACL snapshots are appended to
+  `__cluster_metadata`, replayed during broker replacement, and rolled back
+  before CreateAcls/DeleteAcls are acknowledged when the snapshot write fails;
   `test-s3-process-crash`
   adds a gated real broker-process kill/replacement harness against MinIO/S3 and
   now verifies both data and committed offsets after a fresh local data dir

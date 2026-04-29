@@ -54,6 +54,8 @@ const client_quota_snapshot_record_value_magic = "ZMQCQ1";
 const client_quota_snapshot_record_key = "__zmq_client_quota_snapshot";
 const scram_credential_snapshot_record_value_magic = "ZMQSC1";
 const scram_credential_snapshot_record_key = "__zmq_scram_credential_snapshot";
+const acl_snapshot_record_value_magic = "ZMQAC1";
+const acl_snapshot_record_key = "__zmq_acl_snapshot";
 const auto_mq_quorum_commit_timeout_ms: i64 = 5000;
 
 /// Stateful Kafka broker.
@@ -688,11 +690,12 @@ pub const Broker = struct {
         }
         const recovered_cluster_records = try self.restoreClusterMetadataFromLog();
         if (recovered_cluster_records.total() > 0) {
-            log.info("Restored cluster metadata from __cluster_metadata (topics={d}, reassignments={d}, client_quotas={d}, scram_credentials={d})", .{
+            log.info("Restored cluster metadata from __cluster_metadata (topics={d}, reassignments={d}, client_quotas={d}, scram_credentials={d}, acls={d})", .{
                 recovered_cluster_records.topic_snapshots,
                 recovered_cluster_records.partition_reassignment_snapshots,
                 recovered_cluster_records.client_quota_snapshots,
                 recovered_cluster_records.scram_credential_snapshots,
+                recovered_cluster_records.acl_snapshots,
             });
             self.persistence.saveTopics(&self.topics) catch |err| {
                 log.warn("Failed to persist replayed topic metadata: {}", .{err});
@@ -2521,6 +2524,110 @@ pub const Broker = struct {
         };
     }
 
+    const AclSnapshot = struct {
+        acls: std.array_list.Managed(Authorizer.AclEntry),
+    };
+
+    fn encodeAclSnapshotRecordValue(self: *Broker) ![]u8 {
+        var buf = std.array_list.Managed(u8).init(self.allocator);
+        errdefer buf.deinit();
+        const writer = @import("list_compat").writer(&buf);
+
+        try writer.writeAll(acl_snapshot_record_value_magic);
+        try writer.writeInt(u32, @intCast(self.authorizer.acls.items.len), .big);
+
+        for (self.authorizer.acls.items) |acl| {
+            try writeSnapshotBytes(writer, acl.principal);
+            try writer.writeByte(@as(u8, @bitCast(@intFromEnum(acl.resource_type))));
+            try writeSnapshotBytes(writer, acl.resource_name);
+            try writer.writeByte(@as(u8, @bitCast(@intFromEnum(acl.pattern_type))));
+            try writer.writeByte(@as(u8, @bitCast(@intFromEnum(acl.operation))));
+            try writer.writeByte(@as(u8, @bitCast(@intFromEnum(acl.permission))));
+            try writeSnapshotBytes(writer, acl.host);
+        }
+
+        return buf.toOwnedSlice();
+    }
+
+    fn freeAclSnapshot(self: *Broker, snapshot: *AclSnapshot) void {
+        for (snapshot.acls.items) |entry| {
+            self.allocator.free(entry.principal);
+            self.allocator.free(entry.resource_name);
+            self.allocator.free(entry.host);
+        }
+        snapshot.acls.deinit();
+        snapshot.acls = std.array_list.Managed(Authorizer.AclEntry).init(self.allocator);
+    }
+
+    fn decodeAclSnapshotRecordValue(self: *Broker, value: []const u8) !AclSnapshot {
+        if (value.len < acl_snapshot_record_value_magic.len + 4) return error.InvalidAclSnapshot;
+        if (!std.mem.eql(u8, value[0..acl_snapshot_record_value_magic.len], acl_snapshot_record_value_magic)) {
+            return error.InvalidAclSnapshot;
+        }
+
+        var pos: usize = acl_snapshot_record_value_magic.len;
+        const acl_count = try readSnapshotU32(value, &pos);
+        if (acl_count > 100_000) return error.InvalidAclSnapshot;
+
+        var snapshot = AclSnapshot{
+            .acls = std.array_list.Managed(Authorizer.AclEntry).init(self.allocator),
+        };
+        errdefer self.freeAclSnapshot(&snapshot);
+
+        for (0..acl_count) |_| {
+            const principal = try self.readSnapshotOwnedBytes(value, &pos);
+            var principal_owned = true;
+            errdefer if (principal_owned) self.allocator.free(principal);
+
+            const resource_type = aclResourceType(@bitCast(try readSnapshotByte(value, &pos))) orelse return error.InvalidAclSnapshot;
+
+            const resource_name = try self.readSnapshotOwnedBytes(value, &pos);
+            var resource_name_owned = true;
+            errdefer if (resource_name_owned) self.allocator.free(resource_name);
+
+            const pattern_type = aclPatternType(@bitCast(try readSnapshotByte(value, &pos))) orelse return error.InvalidAclSnapshot;
+            const operation = aclOperation(@bitCast(try readSnapshotByte(value, &pos))) orelse return error.InvalidAclSnapshot;
+            const permission = aclPermission(@bitCast(try readSnapshotByte(value, &pos))) orelse return error.InvalidAclSnapshot;
+
+            const host = try self.readSnapshotOwnedBytes(value, &pos);
+            var host_owned = true;
+            errdefer if (host_owned) self.allocator.free(host);
+
+            try snapshot.acls.append(.{
+                .principal = principal,
+                .resource_type = resource_type,
+                .resource_name = resource_name,
+                .pattern_type = pattern_type,
+                .operation = operation,
+                .permission = permission,
+                .host = host,
+            });
+            principal_owned = false;
+            resource_name_owned = false;
+            host_owned = false;
+        }
+
+        if (pos != value.len) return error.InvalidAclSnapshot;
+        return snapshot;
+    }
+
+    fn clearAuthorizerAcls(self: *Broker) void {
+        for (self.authorizer.acls.items) |entry| {
+            self.allocator.free(entry.principal);
+            self.allocator.free(entry.resource_name);
+            self.allocator.free(entry.host);
+        }
+        self.authorizer.acls.clearRetainingCapacity();
+    }
+
+    fn applyAclSnapshotRecord(self: *Broker, value: []const u8) !void {
+        const snapshot = try self.decodeAclSnapshotRecordValue(value);
+
+        self.clearAuthorizerAcls();
+        self.authorizer.acls.deinit();
+        self.authorizer.acls = snapshot.acls;
+    }
+
     fn offsetCommitKeyParts(key: []const u8) ?struct { group_id: []const u8, topic: []const u8, partition: i32 } {
         var fields = std.mem.splitSequence(u8, key, ":");
         const group_id = fields.next() orelse return null;
@@ -2791,14 +2898,50 @@ pub const Broker = struct {
         self.persistPartitionStates();
     }
 
+    /// Write a full ACL snapshot to __cluster_metadata so CreateAcls/DeleteAcls
+    /// survive stateless broker replacement.
+    fn writeAclSnapshotRecord(self: *Broker) !void {
+        const info = self.topics.get("__cluster_metadata") orelse return;
+        if (info.num_partitions <= 0) return;
+
+        const value = try self.encodeAclSnapshotRecordValue();
+        defer self.allocator.free(value);
+
+        const rec_batch = protocol.record_batch;
+        const records = [_]rec_batch.Record{
+            .{
+                .offset_delta = 0,
+                .key = acl_snapshot_record_key,
+                .value = value,
+            },
+        };
+
+        const batch = try rec_batch.buildRecordBatch(
+            self.allocator,
+            0,
+            &records,
+            -1,
+            -1,
+            -1,
+            @import("time_compat").milliTimestamp(),
+            @import("time_compat").milliTimestamp(),
+            0,
+        );
+        defer self.allocator.free(batch);
+
+        _ = try self.store.produce("__cluster_metadata", 0, batch);
+        self.persistPartitionStates();
+    }
+
     const ClusterMetadataReplayCounts = struct {
         topic_snapshots: usize = 0,
         partition_reassignment_snapshots: usize = 0,
         client_quota_snapshots: usize = 0,
         scram_credential_snapshots: usize = 0,
+        acl_snapshots: usize = 0,
 
         fn total(self: @This()) usize {
-            return self.topic_snapshots + self.partition_reassignment_snapshots + self.client_quota_snapshots + self.scram_credential_snapshots;
+            return self.topic_snapshots + self.partition_reassignment_snapshots + self.client_quota_snapshots + self.scram_credential_snapshots + self.acl_snapshots;
         }
     };
 
@@ -2808,6 +2951,7 @@ pub const Broker = struct {
         partition_reassignment_snapshot,
         client_quota_snapshot,
         scram_credential_snapshot,
+        acl_snapshot,
     };
 
     fn restoreClusterMetadataFromLog(self: *Broker) !ClusterMetadataReplayCounts {
@@ -2824,6 +2968,7 @@ pub const Broker = struct {
             restored.partition_reassignment_snapshots += partition_counts.partition_reassignment_snapshots;
             restored.client_quota_snapshots += partition_counts.client_quota_snapshots;
             restored.scram_credential_snapshots += partition_counts.scram_credential_snapshots;
+            restored.acl_snapshots += partition_counts.acl_snapshots;
         }
         return restored;
     }
@@ -2852,6 +2997,7 @@ pub const Broker = struct {
                         .partition_reassignment_snapshot => restored.partition_reassignment_snapshots += 1,
                         .client_quota_snapshot => restored.client_quota_snapshots += 1,
                         .scram_credential_snapshot => restored.scram_credential_snapshots += 1,
+                        .acl_snapshot => restored.acl_snapshots += 1,
                     }
                 }
             }
@@ -2878,6 +3024,10 @@ pub const Broker = struct {
         if (std.mem.eql(u8, key, scram_credential_snapshot_record_key)) {
             try self.applyScramCredentialSnapshotRecord(value);
             return .scram_credential_snapshot;
+        }
+        if (std.mem.eql(u8, key, acl_snapshot_record_key)) {
+            try self.applyAclSnapshotRecord(value);
+            return .acl_snapshot;
         }
         return .none;
     }
@@ -12039,13 +12189,9 @@ pub const Broker = struct {
         const results = self.allocator.alloc(Result, req.creations.len) catch return null;
         defer if (results.len > 0) self.allocator.free(results);
 
-        var mutated = false;
         for (req.creations, 0..) |creation, i| {
-            results[i] = self.createAclResult(creation, api_version);
-            if (results[i].error_code == @intFromEnum(ErrorCode.none)) mutated = true;
+            results[i] = self.createAclResult(creation, api_version) catch return null;
         }
-
-        if (mutated) self.persistAcls();
 
         const resp = Resp{
             .throttle_time_ms = 0,
@@ -12058,11 +12204,14 @@ pub const Broker = struct {
         if (req.creations.len > 0) self.allocator.free(req.creations);
     }
 
-    fn createAclResult(self: *Broker, creation: generated.create_acls_request.CreateAclsRequest.AclCreation, api_version: i16) generated.create_acls_response.CreateAclsResponse.AclCreationResult {
+    fn createAclResult(self: *Broker, creation: generated.create_acls_request.CreateAclsRequest.AclCreation, api_version: i16) !generated.create_acls_response.CreateAclsResponse.AclCreationResult {
         const resource_type = aclResourceType(creation.resource_type) orelse return invalidAclCreationResult("Invalid ACL resource type");
         const pattern_type = aclPatternType(if (api_version >= 1) creation.resource_pattern_type else @intFromEnum(Authorizer.PatternType.literal)) orelse return invalidAclCreationResult("Invalid ACL pattern type");
         const operation = aclOperation(creation.operation) orelse return invalidAclCreationResult("Invalid ACL operation");
         const permission = aclPermission(creation.permission_type) orelse return invalidAclCreationResult("Invalid ACL permission type");
+
+        const previous_snapshot = try self.encodeAclSnapshotRecordValue();
+        defer self.allocator.free(previous_snapshot);
 
         self.authorizer.addAcl(
             creation.principal orelse "",
@@ -12074,15 +12223,32 @@ pub const Broker = struct {
             creation.host orelse "",
         ) catch |err| {
             log.warn("CreateAcls failed: {}", .{err});
+            self.restoreAclsAfterFailedMutation(previous_snapshot);
             return .{
                 .error_code = @intFromEnum(ErrorCode.kafka_storage_error),
                 .error_message = "Failed to store ACL",
             };
         };
 
+        self.writeAclSnapshotRecord() catch |err| {
+            log.warn("Failed to append ACL snapshot to __cluster_metadata: {}", .{err});
+            self.restoreAclsAfterFailedMutation(previous_snapshot);
+            return .{
+                .error_code = @intFromEnum(ErrorCode.kafka_storage_error),
+                .error_message = "Failed to persist ACL metadata",
+            };
+        };
+        self.persistAcls();
+
         return .{
             .error_code = @intFromEnum(ErrorCode.none),
             .error_message = null,
+        };
+    }
+
+    fn restoreAclsAfterFailedMutation(self: *Broker, snapshot_value: []const u8) void {
+        self.applyAclSnapshotRecord(snapshot_value) catch |restore_err| {
+            log.err("Failed to restore ACL snapshot after failed mutation: {}", .{restore_err});
         };
     }
 
@@ -12173,14 +12339,10 @@ pub const Broker = struct {
             if (filter_results.len > 0) self.allocator.free(filter_results);
         }
 
-        var mutated = false;
         for (req.filters) |filter| {
             filter_results[filter_results_init] = self.deleteAclsFilterResult(filter, api_version) catch return null;
-            if (filter_results[filter_results_init].error_code == @intFromEnum(ErrorCode.none) and filter_results[filter_results_init].matching_acls.len > 0) mutated = true;
             filter_results_init += 1;
         }
-
-        if (mutated) self.persistAcls();
 
         const resp = Resp{
             .throttle_time_ms = 0,
@@ -12208,6 +12370,19 @@ pub const Broker = struct {
             operation,
             permission,
         );
+        var matching_acls_owned = matching_acls.len > 0;
+        errdefer if (matching_acls_owned) self.freeDeleteAclsMatchingAcls(matching_acls);
+        if (matching_acls.len == 0) {
+            return .{
+                .error_code = @intFromEnum(ErrorCode.none),
+                .error_message = null,
+                .matching_acls = matching_acls,
+            };
+        }
+
+        const previous_snapshot = try self.encodeAclSnapshotRecordValue();
+        errdefer self.allocator.free(previous_snapshot);
+
         _ = self.authorizer.removeMatchingAcls(
             resource_type,
             filter.resource_name_filter,
@@ -12218,6 +12393,21 @@ pub const Broker = struct {
             permission,
         );
 
+        self.writeAclSnapshotRecord() catch |err| {
+            log.warn("Failed to append ACL snapshot to __cluster_metadata: {}", .{err});
+            self.restoreAclsAfterFailedMutation(previous_snapshot);
+            self.allocator.free(previous_snapshot);
+            matching_acls_owned = false;
+            return .{
+                .error_code = @intFromEnum(ErrorCode.kafka_storage_error),
+                .error_message = "Failed to persist ACL metadata",
+                .matching_acls = matching_acls,
+            };
+        };
+        self.allocator.free(previous_snapshot);
+        self.persistAcls();
+
+        matching_acls_owned = false;
         return .{
             .error_code = @intFromEnum(ErrorCode.none),
             .error_message = null,
@@ -18212,6 +18402,216 @@ test "Broker.handleRequest DeleteAcls rejects truncated request" {
     var buf: [128]u8 = undefined;
     const req_len = buildTestRequest(&buf, 31, 2, 3104, header_mod.requestHeaderVersion(31, 2));
     try testing.expect(broker.handleRequest(buf[0..req_len]) == null);
+}
+
+test "Broker restores ACLs from S3 cluster metadata log" {
+    const CreateReq = generated.create_acls_request.CreateAclsRequest;
+    const CreateResp = generated.create_acls_response.CreateAclsResponse;
+    const DescribeReq = generated.describe_acls_request.DescribeAclsRequest;
+    const DescribeResp = generated.describe_acls_response.DescribeAclsResponse;
+
+    var mock_s3 = storage.MockS3.init(testing.allocator);
+    defer mock_s3.deinit();
+    const s3_storage = storage.S3Storage.initMock(testing.allocator, &mock_s3);
+
+    {
+        var broker = Broker.init(testing.allocator, 1, 9092);
+        defer broker.deinit();
+        broker.store.s3_wal_mode = true;
+        broker.store.s3_storage = s3_storage;
+        broker.store.s3_wal_batcher = storage.wal.S3WalBatcher.init(testing.allocator);
+
+        try broker.open();
+
+        const creations = [_]CreateReq.AclCreation{.{
+            .resource_type = @intFromEnum(Authorizer.ResourceType.topic),
+            .resource_name = "acl-s3-topic",
+            .resource_pattern_type = @intFromEnum(Authorizer.PatternType.literal),
+            .principal = "User:s3",
+            .host = "*",
+            .operation = @intFromEnum(Authorizer.Operation.read),
+            .permission_type = @intFromEnum(Authorizer.Permission.allow),
+        }};
+        const req = CreateReq{ .creations = &creations };
+
+        var buf: [512]u8 = undefined;
+        var pos = buildTestRequest(&buf, 30, 2, 3005, header_mod.requestHeaderVersion(30, 2));
+        req.serialize(&buf, &pos, 2);
+
+        const response = broker.handleRequest(buf[0..pos]);
+        try testing.expect(response != null);
+        defer testing.allocator.free(response.?);
+
+        var rpos: usize = 0;
+        var response_header = try ResponseHeader.deserialize(testing.allocator, response.?, &rpos, header_mod.responseHeaderVersion(30, 2));
+        defer response_header.deinit(testing.allocator);
+        try testing.expectEqual(@as(i32, 3005), response_header.correlation_id);
+
+        const resp = try CreateResp.deserialize(testing.allocator, response.?, &rpos, 2);
+        defer if (resp.results.len > 0) testing.allocator.free(resp.results);
+
+        try testing.expectEqual(response.?.len, rpos);
+        try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.none)), resp.results[0].error_code);
+        try testing.expect(mock_s3.objectCount() > 0);
+    }
+
+    {
+        var broker = Broker.init(testing.allocator, 1, 9092);
+        defer broker.deinit();
+        broker.store.s3_wal_mode = true;
+        broker.store.s3_storage = s3_storage;
+        broker.store.s3_wal_batcher = storage.wal.S3WalBatcher.init(testing.allocator);
+
+        try broker.open();
+        try testing.expectEqual(@as(usize, 1), broker.authorizer.aclCount());
+
+        const req = DescribeReq{
+            .resource_type_filter = @intFromEnum(Authorizer.ResourceType.topic),
+            .resource_name_filter = "acl-s3-topic",
+            .pattern_type_filter = @intFromEnum(Authorizer.PatternType.literal),
+            .principal_filter = "User:s3",
+            .host_filter = "*",
+            .operation = @intFromEnum(Authorizer.Operation.read),
+            .permission_type = @intFromEnum(Authorizer.Permission.allow),
+        };
+
+        var buf: [512]u8 = undefined;
+        var pos = buildTestRequest(&buf, 29, 2, 2905, header_mod.requestHeaderVersion(29, 2));
+        req.serialize(&buf, &pos, 2);
+
+        const response = broker.handleRequest(buf[0..pos]);
+        try testing.expect(response != null);
+        defer testing.allocator.free(response.?);
+
+        var rpos: usize = 0;
+        var response_header = try ResponseHeader.deserialize(testing.allocator, response.?, &rpos, header_mod.responseHeaderVersion(29, 2));
+        defer response_header.deinit(testing.allocator);
+        try testing.expectEqual(@as(i32, 2905), response_header.correlation_id);
+
+        const resp = try DescribeResp.deserialize(testing.allocator, response.?, &rpos, 2);
+        defer {
+            for (resp.resources) |resource| {
+                if (resource.acls.len > 0) testing.allocator.free(resource.acls);
+            }
+            if (resp.resources.len > 0) testing.allocator.free(resp.resources);
+        }
+
+        try testing.expectEqual(response.?.len, rpos);
+        try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.none)), resp.error_code);
+        try testing.expectEqual(@as(usize, 1), resp.resources.len);
+        try testing.expectEqualStrings("acl-s3-topic", resp.resources[0].resource_name.?);
+        try testing.expectEqualStrings("User:s3", resp.resources[0].acls[0].principal.?);
+    }
+}
+
+test "Broker CreateAcls fails closed when ACL snapshot S3 WAL write fails" {
+    const Req = generated.create_acls_request.CreateAclsRequest;
+    const Resp = generated.create_acls_response.CreateAclsResponse;
+
+    var mock_s3 = storage.MockS3.init(testing.allocator);
+    defer mock_s3.deinit();
+    const s3_storage = storage.S3Storage.initMock(testing.allocator, &mock_s3);
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+    broker.store.s3_wal_mode = true;
+    broker.store.s3_storage = s3_storage;
+    broker.store.s3_wal_batcher = storage.wal.S3WalBatcher.init(testing.allocator);
+
+    try broker.open();
+    const object_count_before = mock_s3.objectCount();
+    mock_s3.failNextPutObjects(3);
+
+    const creations = [_]Req.AclCreation{.{
+        .resource_type = @intFromEnum(Authorizer.ResourceType.topic),
+        .resource_name = "acl-s3-fail-topic",
+        .resource_pattern_type = @intFromEnum(Authorizer.PatternType.literal),
+        .principal = "User:fail",
+        .host = "*",
+        .operation = @intFromEnum(Authorizer.Operation.read),
+        .permission_type = @intFromEnum(Authorizer.Permission.allow),
+    }};
+    const req = Req{ .creations = &creations };
+
+    var buf: [512]u8 = undefined;
+    var pos = buildTestRequest(&buf, 30, 2, 3006, header_mod.requestHeaderVersion(30, 2));
+    req.serialize(&buf, &pos, 2);
+
+    const response = broker.handleRequest(buf[0..pos]);
+    try testing.expect(response != null);
+    defer testing.allocator.free(response.?);
+
+    var rpos: usize = 0;
+    var response_header = try ResponseHeader.deserialize(testing.allocator, response.?, &rpos, header_mod.responseHeaderVersion(30, 2));
+    defer response_header.deinit(testing.allocator);
+    try testing.expectEqual(@as(i32, 3006), response_header.correlation_id);
+
+    const resp = try Resp.deserialize(testing.allocator, response.?, &rpos, 2);
+    defer if (resp.results.len > 0) testing.allocator.free(resp.results);
+
+    try testing.expectEqual(response.?.len, rpos);
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.kafka_storage_error)), resp.results[0].error_code);
+    try testing.expectEqual(@as(usize, 0), broker.authorizer.aclCount());
+    try testing.expectEqual(object_count_before, mock_s3.objectCount());
+}
+
+test "Broker DeleteAcls rolls back when ACL snapshot S3 WAL write fails" {
+    const Req = generated.delete_acls_request.DeleteAclsRequest;
+    const Resp = generated.delete_acls_response.DeleteAclsResponse;
+
+    var mock_s3 = storage.MockS3.init(testing.allocator);
+    defer mock_s3.deinit();
+    const s3_storage = storage.S3Storage.initMock(testing.allocator, &mock_s3);
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+    broker.store.s3_wal_mode = true;
+    broker.store.s3_storage = s3_storage;
+    broker.store.s3_wal_batcher = storage.wal.S3WalBatcher.init(testing.allocator);
+
+    try broker.open();
+    try broker.authorizer.addAcl("User:delete-fail", .topic, "acl-delete-s3-fail", .literal, .read, .allow, "*");
+    try broker.writeAclSnapshotRecord();
+    const object_count_before = mock_s3.objectCount();
+    mock_s3.failNextPutObjects(3);
+
+    const filters = [_]Req.DeleteAclsFilter{.{
+        .resource_type_filter = @intFromEnum(Authorizer.ResourceType.topic),
+        .resource_name_filter = "acl-delete-s3-fail",
+        .pattern_type_filter = @intFromEnum(Authorizer.PatternType.literal),
+        .principal_filter = "User:delete-fail",
+        .host_filter = "*",
+        .operation = @intFromEnum(Authorizer.Operation.read),
+        .permission_type = @intFromEnum(Authorizer.Permission.allow),
+    }};
+    const req = Req{ .filters = &filters };
+
+    var buf: [512]u8 = undefined;
+    var pos = buildTestRequest(&buf, 31, 2, 3105, header_mod.requestHeaderVersion(31, 2));
+    req.serialize(&buf, &pos, 2);
+
+    const response = broker.handleRequest(buf[0..pos]);
+    try testing.expect(response != null);
+    defer testing.allocator.free(response.?);
+
+    var rpos: usize = 0;
+    var response_header = try ResponseHeader.deserialize(testing.allocator, response.?, &rpos, header_mod.responseHeaderVersion(31, 2));
+    defer response_header.deinit(testing.allocator);
+    try testing.expectEqual(@as(i32, 3105), response_header.correlation_id);
+
+    const resp = try Resp.deserialize(testing.allocator, response.?, &rpos, 2);
+    defer {
+        for (resp.filter_results) |result| {
+            if (result.matching_acls.len > 0) testing.allocator.free(result.matching_acls);
+        }
+        if (resp.filter_results.len > 0) testing.allocator.free(resp.filter_results);
+    }
+
+    try testing.expectEqual(response.?.len, rpos);
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.kafka_storage_error)), resp.filter_results[0].error_code);
+    try testing.expectEqual(@as(usize, 1), resp.filter_results[0].matching_acls.len);
+    try testing.expectEqual(@as(usize, 1), broker.authorizer.aclCount());
+    try testing.expectEqual(object_count_before, mock_s3.objectCount());
 }
 
 test "Broker.handleRequest AlterConfigs v2 returns generated response and updates topic config" {
