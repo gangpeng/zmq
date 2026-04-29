@@ -171,7 +171,9 @@ Status: completed for the initial catalog and DeleteGroups slice.
   validate-only, mutates/removes QuotaManager-backed client/default quotas,
   writes full quota snapshots to `__cluster_metadata` for broker replacement
   replay, and fails closed without leaving local quota state visible when the
-  shared snapshot write fails.
+  shared snapshot write fails. Default produce/fetch quotas are now enforced per
+  client for clients without explicit overrides, and partial client quota
+  overrides fall back to default limits for unset keys.
   DescribeUserScramCredentials now advertises key 50 v0, decodes generated
   flexible requests, rejects malformed frames, describes requested or all
   SCRAM-SHA-256 users, and reports missing users per result.

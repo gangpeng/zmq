@@ -2419,6 +2419,7 @@ pub const Broker = struct {
         self.quota_manager.deinit();
         self.quota_manager = .{
             .client_quotas = snapshot.client_quotas,
+            .default_windows = std.StringHashMap(QuotaManager.DefaultQuotaWindows).init(self.allocator),
             .default_produce_rate = snapshot.default_produce_rate,
             .default_fetch_rate = snapshot.default_fetch_rate,
             .default_request_rate = snapshot.default_request_rate,

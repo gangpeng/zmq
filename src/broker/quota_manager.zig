@@ -10,6 +10,7 @@ const log = std.log.scoped(.quota);
 /// field to slow the client down.
 pub const QuotaManager = struct {
     client_quotas: std.StringHashMap(ClientQuota),
+    default_windows: std.StringHashMap(DefaultQuotaWindows),
     default_produce_rate: f64, // bytes/sec, 0 = unlimited
     default_fetch_rate: f64,
     default_request_rate: f64, // requests/sec
@@ -25,6 +26,12 @@ pub const QuotaManager = struct {
         request_window: RateWindow = .{},
     };
 
+    pub const DefaultQuotaWindows = struct {
+        produce_window: RateWindow = .{},
+        fetch_window: RateWindow = .{},
+        request_window: RateWindow = .{},
+    };
+
     pub const RateWindow = struct {
         bytes_in_window: u64 = 0,
         window_start_ms: i64 = 0,
@@ -34,6 +41,7 @@ pub const QuotaManager = struct {
     pub fn init(alloc: Allocator) QuotaManager {
         return .{
             .client_quotas = std.StringHashMap(ClientQuota).init(alloc),
+            .default_windows = std.StringHashMap(DefaultQuotaWindows).init(alloc),
             .default_produce_rate = 0, // unlimited
             .default_fetch_rate = 0,
             .default_request_rate = 0,
@@ -48,6 +56,8 @@ pub const QuotaManager = struct {
             self.allocator.free(entry.key_ptr.*);
         }
         self.client_quotas.deinit();
+        self.clearDefaultWindows();
+        self.default_windows.deinit();
     }
 
     /// Set quota for a specific client.
@@ -83,22 +93,12 @@ pub const QuotaManager = struct {
     const QuotaType = enum { produce, fetch, request };
 
     fn recordAndThrottle(self: *QuotaManager, client_id: []const u8, bytes: u64, qtype: QuotaType) i32 {
-        const quota = self.client_quotas.getPtr(client_id) orelse return 0;
-        const now = @import("time_compat").milliTimestamp();
-
-        const window = switch (qtype) {
-            .produce => &quota.produce_window,
-            .fetch => &quota.fetch_window,
-            .request => &quota.request_window,
-        };
-
-        const limit = switch (qtype) {
-            .produce => quota.produce_rate_limit,
-            .fetch => quota.fetch_rate_limit,
-            .request => quota.request_rate_limit,
-        };
-
+        const selected = self.selectQuotaWindow(client_id, qtype) orelse return 0;
+        const window = selected.window;
+        const limit = selected.limit;
         if (limit <= 0) return 0; // unlimited
+
+        const now = @import("time_compat").milliTimestamp();
 
         // Reset window if expired
         if (now - window.window_start_ms >= window.window_size_ms) {
@@ -123,11 +123,77 @@ pub const QuotaManager = struct {
         return 0;
     }
 
+    const SelectedQuotaWindow = struct {
+        window: *RateWindow,
+        limit: f64,
+    };
+
+    fn selectQuotaWindow(self: *QuotaManager, client_id: []const u8, qtype: QuotaType) ?SelectedQuotaWindow {
+        if (self.client_quotas.getPtr(client_id)) |quota| {
+            const explicit_limit = switch (qtype) {
+                .produce => quota.produce_rate_limit,
+                .fetch => quota.fetch_rate_limit,
+                .request => quota.request_rate_limit,
+            };
+            if (explicit_limit > 0) {
+                return .{
+                    .window = switch (qtype) {
+                        .produce => &quota.produce_window,
+                        .fetch => &quota.fetch_window,
+                        .request => &quota.request_window,
+                    },
+                    .limit = explicit_limit,
+                };
+            }
+        }
+
+        const default_limit = switch (qtype) {
+            .produce => self.default_produce_rate,
+            .fetch => self.default_fetch_rate,
+            .request => self.default_request_rate,
+        };
+        if (default_limit <= 0) return null;
+
+        const windows = self.defaultWindowsForClient(client_id) orelse return null;
+        return .{
+            .window = switch (qtype) {
+                .produce => &windows.produce_window,
+                .fetch => &windows.fetch_window,
+                .request => &windows.request_window,
+            },
+            .limit = default_limit,
+        };
+    }
+
+    fn defaultWindowsForClient(self: *QuotaManager, client_id: []const u8) ?*DefaultQuotaWindows {
+        if (self.default_windows.getPtr(client_id)) |windows| return windows;
+
+        const key = self.allocator.dupe(u8, client_id) catch |err| {
+            log.warn("Failed to allocate default quota window for client {s}: {}", .{ client_id, err });
+            return null;
+        };
+        self.default_windows.put(key, .{}) catch |err| {
+            self.allocator.free(key);
+            log.warn("Failed to store default quota window for client {s}: {}", .{ client_id, err });
+            return null;
+        };
+        return self.default_windows.getPtr(client_id);
+    }
+
+    fn clearDefaultWindows(self: *QuotaManager) void {
+        var it = self.default_windows.iterator();
+        while (it.next()) |entry| {
+            self.allocator.free(entry.key_ptr.*);
+        }
+        self.default_windows.clearRetainingCapacity();
+    }
+
     /// Set default quotas for all clients.
     pub fn setDefaults(self: *QuotaManager, produce_rate: f64, fetch_rate: f64, request_rate: f64) void {
         self.default_produce_rate = produce_rate;
         self.default_fetch_rate = fetch_rate;
         self.default_request_rate = request_rate;
+        self.clearDefaultWindows();
     }
 };
 
@@ -168,4 +234,41 @@ test "QuotaManager different clients independent" {
     _ = qm.recordProduce("client-a", 5000); // over quota
     const t = qm.recordProduce("client-b", 100); // should be fine
     try testing.expectEqual(@as(i32, 0), t);
+}
+
+test "QuotaManager default quotas throttle clients independently" {
+    var qm = QuotaManager.init(testing.allocator);
+    defer qm.deinit();
+
+    qm.setDefaults(1000, 0, 0);
+
+    try testing.expectEqual(@as(i32, 0), qm.recordProduce("default-a", 900));
+    try testing.expectEqual(@as(i32, 0), qm.recordProduce("default-b", 900));
+    try testing.expect(qm.recordProduce("default-a", 200) > 0);
+    try testing.expectEqual(@as(i32, 0), qm.recordProduce("default-b", 50));
+}
+
+test "QuotaManager explicit quotas fall back to defaults per key" {
+    var qm = QuotaManager.init(testing.allocator);
+    defer qm.deinit();
+
+    qm.setDefaults(1000, 2000, 0);
+    try qm.setClientQuota("partial-client", 0, 5000, 0);
+
+    try testing.expect(qm.recordProduce("partial-client", 1500) > 0);
+    try testing.expectEqual(@as(i32, 0), qm.recordFetch("partial-client", 4000));
+    try testing.expect(qm.recordFetch("partial-client", 2000) > 0);
+}
+
+test "QuotaManager changing defaults resets transient default windows" {
+    var qm = QuotaManager.init(testing.allocator);
+    defer qm.deinit();
+
+    qm.setDefaults(1000, 0, 0);
+    try testing.expect(qm.recordProduce("reset-client", 1500) > 0);
+    try testing.expect(qm.default_windows.count() > 0);
+
+    qm.setDefaults(0, 0, 0);
+    try testing.expectEqual(@as(u32, 0), qm.default_windows.count());
+    try testing.expectEqual(@as(i32, 0), qm.recordProduce("reset-client", 10_000));
 }
