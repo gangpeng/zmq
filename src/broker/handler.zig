@@ -48,6 +48,8 @@ const transaction_snapshot_record_value_magic = "ZMQTX1";
 const transaction_snapshot_record_key = "__zmq_transaction_snapshot";
 const topic_snapshot_record_value_magic = "ZMQTP1";
 const topic_snapshot_record_key = "__zmq_topic_snapshot";
+const partition_reassignment_snapshot_record_value_magic = "ZMQPR1";
+const partition_reassignment_snapshot_record_key = "__zmq_partition_reassignment_snapshot";
 const auto_mq_quorum_commit_timeout_ms: i64 = 5000;
 
 /// Stateful Kafka broker.
@@ -680,11 +682,17 @@ pub const Broker = struct {
             log.info("Repaired partition state from recovered ObjectManager streams", .{});
             self.persistPartitionStates();
         }
-        const recovered_topic_records = try self.restoreTopicsFromClusterMetadataLog();
-        if (recovered_topic_records > 0) {
-            log.info("Restored {d} topic metadata record(s) from __cluster_metadata", .{recovered_topic_records});
+        const recovered_cluster_records = try self.restoreClusterMetadataFromLog();
+        if (recovered_cluster_records.total() > 0) {
+            log.info("Restored cluster metadata from __cluster_metadata (topics={d}, reassignments={d})", .{
+                recovered_cluster_records.topic_snapshots,
+                recovered_cluster_records.partition_reassignment_snapshots,
+            });
             self.persistence.saveTopics(&self.topics) catch |err| {
                 log.warn("Failed to persist replayed topic metadata: {}", .{err});
+            };
+            self.persistence.savePartitionReassignments(&self.partition_reassignments) catch |err| {
+                log.warn("Failed to persist replayed partition reassignments: {}", .{err});
             };
             if (self.store.repairPartitionStatesFromObjectManager()) {
                 log.info("Repaired partition state after topic metadata replay", .{});
@@ -707,11 +715,13 @@ pub const Broker = struct {
 
         // Load ongoing partition reassignments after topics are available so
         // stale entries for deleted or out-of-range partitions can be ignored.
-        const saved_reassignments = try self.persistence.loadPartitionReassignments();
-        defer self.persistence.freePartitionReassignmentEntries(saved_reassignments);
-        try self.restorePartitionReassignments(saved_reassignments);
-        if (saved_reassignments.len > 0) {
-            log.info("Restored {d} partition reassignment(s) from partition_reassignments.meta", .{self.partition_reassignments.count()});
+        if (recovered_cluster_records.partition_reassignment_snapshots == 0) {
+            const saved_reassignments = try self.persistence.loadPartitionReassignments();
+            defer self.persistence.freePartitionReassignmentEntries(saved_reassignments);
+            try self.restorePartitionReassignments(saved_reassignments);
+            if (saved_reassignments.len > 0) {
+                log.info("Restored {d} partition reassignment(s) from partition_reassignments.meta", .{self.partition_reassignments.count()});
+            }
         }
 
         // Load local AutoMQ controller-style metadata (KV namespace, node registry,
@@ -1405,6 +1415,13 @@ pub const Broker = struct {
 
     /// Persist ongoing partition reassignment state to disk (best-effort).
     fn persistPartitionReassignments(self: *Broker) void {
+        self.persistPartitionReassignmentsDurably() catch |err| {
+            log.warn("Failed to persist partition reassignments: {}", .{err});
+        };
+    }
+
+    fn persistPartitionReassignmentsDurably(self: *Broker) !void {
+        try self.writePartitionReassignmentSnapshotRecord();
         self.persistence.savePartitionReassignments(&self.partition_reassignments) catch |err| {
             log.warn("Failed to persist partition reassignments: {}", .{err});
         };
@@ -1667,6 +1684,14 @@ pub const Broker = struct {
         }
     }
 
+    fn writeSnapshotI32Array(writer: anytype, values: []const i32) !void {
+        if (values.len > std.math.maxInt(u32)) return error.SnapshotTooLarge;
+        try writer.writeInt(u32, @intCast(values.len), .big);
+        for (values) |value| {
+            try writer.writeInt(i32, value, .big);
+        }
+    }
+
     fn encodeConsumerGroupSnapshotRecordValue(self: *Broker) ![]u8 {
         var buf = std.array_list.Managed(u8).init(self.allocator);
         errdefer buf.deinit();
@@ -1760,6 +1785,18 @@ pub const Broker = struct {
 
     fn readSnapshotOwnedBytes(self: *Broker, value: []const u8, pos: *usize) ![]u8 {
         return try self.allocator.dupe(u8, try readSnapshotBytes(value, pos));
+    }
+
+    fn readSnapshotOwnedI32Array(self: *Broker, value: []const u8, pos: *usize) ![]i32 {
+        const count: usize = @intCast(try readSnapshotU32(value, pos));
+        if (count > 4096) return error.InvalidPartitionReassignmentSnapshot;
+        if (count == 0) return &.{};
+        const out = try self.allocator.alloc(i32, count);
+        errdefer self.allocator.free(out);
+        for (out) |*item| {
+            item.* = try readSnapshotI32(value, pos);
+        }
+        return out;
     }
 
     fn readSnapshotOptionalOwnedBytes(self: *Broker, value: []const u8, pos: *usize) !?[]u8 {
@@ -2156,6 +2193,99 @@ pub const Broker = struct {
         for (entries) |entry| {
             try self.upsertTopicFromEntry(entry);
         }
+        _ = self.pruneInvalidPartitionReassignments();
+    }
+
+    fn encodePartitionReassignmentSnapshotRecordValue(self: *Broker) ![]u8 {
+        var buf = std.array_list.Managed(u8).init(self.allocator);
+        errdefer buf.deinit();
+        const writer = @import("list_compat").writer(&buf);
+
+        try writer.writeAll(partition_reassignment_snapshot_record_value_magic);
+        try writer.writeInt(u32, @intCast(self.partition_reassignments.count()), .big);
+
+        var it = self.partition_reassignments.iterator();
+        while (it.next()) |entry| {
+            const state = entry.value_ptr;
+            try writeSnapshotBytes(writer, state.topic);
+            try writer.writeInt(i32, state.partition_index, .big);
+            try writeSnapshotI32Array(writer, state.replicas);
+            try writeSnapshotI32Array(writer, state.adding_replicas);
+            try writeSnapshotI32Array(writer, state.removing_replicas);
+        }
+
+        return buf.toOwnedSlice();
+    }
+
+    fn freePartitionReassignmentEntry(self: *Broker, entry: MetadataPersistence.PartitionReassignmentEntry) void {
+        self.allocator.free(entry.topic);
+        if (entry.replicas.len > 0) self.allocator.free(entry.replicas);
+        if (entry.adding_replicas.len > 0) self.allocator.free(entry.adding_replicas);
+        if (entry.removing_replicas.len > 0) self.allocator.free(entry.removing_replicas);
+    }
+
+    fn decodePartitionReassignmentSnapshotRecordValue(self: *Broker, value: []const u8) ![]MetadataPersistence.PartitionReassignmentEntry {
+        if (value.len < partition_reassignment_snapshot_record_value_magic.len + 4) return error.InvalidPartitionReassignmentSnapshot;
+        if (!std.mem.eql(u8, value[0..partition_reassignment_snapshot_record_value_magic.len], partition_reassignment_snapshot_record_value_magic)) {
+            return error.InvalidPartitionReassignmentSnapshot;
+        }
+
+        var pos: usize = partition_reassignment_snapshot_record_value_magic.len;
+        const reassignment_count = try readSnapshotU32(value, &pos);
+        var entries = std.array_list.Managed(MetadataPersistence.PartitionReassignmentEntry).init(self.allocator);
+        errdefer {
+            for (entries.items) |entry| self.freePartitionReassignmentEntry(entry);
+            entries.deinit();
+        }
+
+        for (0..reassignment_count) |_| {
+            const topic = try self.readSnapshotOwnedBytes(value, &pos);
+            var topic_owned = true;
+            errdefer if (topic_owned) self.allocator.free(topic);
+
+            const partition_index = try readSnapshotI32(value, &pos);
+
+            const replicas = try self.readSnapshotOwnedI32Array(value, &pos);
+            var replicas_owned = replicas.len > 0;
+            errdefer if (replicas_owned) self.allocator.free(replicas);
+
+            const adding_replicas = try self.readSnapshotOwnedI32Array(value, &pos);
+            var adding_owned = adding_replicas.len > 0;
+            errdefer if (adding_owned) self.allocator.free(adding_replicas);
+
+            const removing_replicas = try self.readSnapshotOwnedI32Array(value, &pos);
+            var removing_owned = removing_replicas.len > 0;
+            errdefer if (removing_owned) self.allocator.free(removing_replicas);
+
+            if (topic.len == 0 or partition_index < 0 or replicas.len == 0 or
+                !validReplicaAssignment(replicas) or
+                !validReplicaAssignment(adding_replicas) or
+                !validReplicaAssignment(removing_replicas))
+            {
+                return error.InvalidPartitionReassignmentSnapshot;
+            }
+
+            try entries.append(.{
+                .topic = topic,
+                .partition_index = partition_index,
+                .replicas = replicas,
+                .adding_replicas = adding_replicas,
+                .removing_replicas = removing_replicas,
+            });
+            topic_owned = false;
+            replicas_owned = false;
+            adding_owned = false;
+            removing_owned = false;
+        }
+
+        if (pos != value.len) return error.InvalidPartitionReassignmentSnapshot;
+        return try entries.toOwnedSlice();
+    }
+
+    fn restorePartitionReassignmentSnapshotRecord(self: *Broker, value: []const u8) !void {
+        const entries = try self.decodePartitionReassignmentSnapshotRecordValue(value);
+        defer self.persistence.freePartitionReassignmentEntries(entries);
+        try self.restorePartitionReassignments(entries);
     }
 
     fn offsetCommitKeyParts(key: []const u8) ?struct { group_id: []const u8, topic: []const u8, partition: i32 } {
@@ -2323,24 +2453,76 @@ pub const Broker = struct {
         self.persistPartitionStates();
     }
 
-    fn restoreTopicsFromClusterMetadataLog(self: *Broker) !usize {
-        const info = self.topics.get("__cluster_metadata") orelse return 0;
-        if (info.num_partitions <= 0) return 0;
+    /// Write a full reassignment snapshot to __cluster_metadata so fresh-dir
+    /// broker replacement does not lose in-flight AlterPartitionReassignments state.
+    fn writePartitionReassignmentSnapshotRecord(self: *Broker) !void {
+        const info = self.topics.get("__cluster_metadata") orelse return;
+        if (info.num_partitions <= 0) return;
 
-        var restored: usize = 0;
+        const value = try self.encodePartitionReassignmentSnapshotRecordValue();
+        defer self.allocator.free(value);
+
+        const rec_batch = protocol.record_batch;
+        const records = [_]rec_batch.Record{
+            .{
+                .offset_delta = 0,
+                .key = partition_reassignment_snapshot_record_key,
+                .value = value,
+            },
+        };
+
+        const batch = try rec_batch.buildRecordBatch(
+            self.allocator,
+            0,
+            &records,
+            -1,
+            -1,
+            -1,
+            @import("time_compat").milliTimestamp(),
+            @import("time_compat").milliTimestamp(),
+            0,
+        );
+        defer self.allocator.free(batch);
+
+        _ = try self.store.produce("__cluster_metadata", 0, batch);
+        self.persistPartitionStates();
+    }
+
+    const ClusterMetadataReplayCounts = struct {
+        topic_snapshots: usize = 0,
+        partition_reassignment_snapshots: usize = 0,
+
+        fn total(self: @This()) usize {
+            return self.topic_snapshots + self.partition_reassignment_snapshots;
+        }
+    };
+
+    const ClusterMetadataReplayKind = enum {
+        none,
+        topic_snapshot,
+        partition_reassignment_snapshot,
+    };
+
+    fn restoreClusterMetadataFromLog(self: *Broker) !ClusterMetadataReplayCounts {
+        const info = self.topics.get("__cluster_metadata") orelse return .{};
+        if (info.num_partitions <= 0) return .{};
+
+        var restored = ClusterMetadataReplayCounts{};
         for (0..@as(usize, @intCast(info.num_partitions))) |partition_index| {
             const result = try self.store.fetch("__cluster_metadata", @intCast(partition_index), 0, 64 * 1024 * 1024);
             defer if (result.records.len > 0) self.allocator.free(@constCast(result.records));
             if (result.error_code != @intFromEnum(ErrorCode.none)) return error.ClusterMetadataLogUnavailable;
-            restored += try self.applyClusterMetadataRecordBatches(result.records);
+            const partition_counts = try self.applyClusterMetadataRecordBatches(result.records);
+            restored.topic_snapshots += partition_counts.topic_snapshots;
+            restored.partition_reassignment_snapshots += partition_counts.partition_reassignment_snapshots;
         }
         return restored;
     }
 
-    fn applyClusterMetadataRecordBatches(self: *Broker, batches: []const u8) !usize {
+    fn applyClusterMetadataRecordBatches(self: *Broker, batches: []const u8) !ClusterMetadataReplayCounts {
         const rec_batch = protocol.record_batch;
         var pos: usize = 0;
-        var restored: usize = 0;
+        var restored = ClusterMetadataReplayCounts{};
 
         while (pos + rec_batch.BATCH_HEADER_SIZE <= batches.len) {
             const header = rec_batch.RecordBatchHeader.parse(batches[pos..]) catch break;
@@ -2355,7 +2537,11 @@ pub const Broker = struct {
                     const record = rec_batch.parseRecord(batches, &record_pos) catch break;
                     const key = record.key orelse continue;
                     const value = record.value orelse continue;
-                    if (try self.applyClusterMetadataRecord(key, value)) restored += 1;
+                    switch (try self.applyClusterMetadataRecord(key, value)) {
+                        .none => {},
+                        .topic_snapshot => restored.topic_snapshots += 1,
+                        .partition_reassignment_snapshot => restored.partition_reassignment_snapshots += 1,
+                    }
                 }
             }
 
@@ -2365,10 +2551,16 @@ pub const Broker = struct {
         return restored;
     }
 
-    fn applyClusterMetadataRecord(self: *Broker, key: []const u8, value: []const u8) !bool {
-        if (!std.mem.eql(u8, key, topic_snapshot_record_key)) return false;
-        try self.restoreTopicSnapshotRecord(value);
-        return true;
+    fn applyClusterMetadataRecord(self: *Broker, key: []const u8, value: []const u8) !ClusterMetadataReplayKind {
+        if (std.mem.eql(u8, key, topic_snapshot_record_key)) {
+            try self.restoreTopicSnapshotRecord(value);
+            return .topic_snapshot;
+        }
+        if (std.mem.eql(u8, key, partition_reassignment_snapshot_record_key)) {
+            try self.restorePartitionReassignmentSnapshotRecord(value);
+            return .partition_reassignment_snapshot;
+        }
+        return .none;
     }
 
     fn restoreOffsetsFromConsumerOffsetsLog(self: *Broker) !usize {
@@ -12457,11 +12649,13 @@ pub const Broker = struct {
         const lookup_key = reassignmentKeyBuf(&key_buf, topic_name, partition_req.partition_index);
 
         if (partition_req.replicas.len == 0) {
-            if (self.partition_reassignments.fetchRemove(lookup_key)) |removed| {
-                self.allocator.free(removed.key);
-                var value = removed.value;
-                value.deinit(self.allocator);
-                self.persistPartitionReassignments();
+            const removed_existing = self.partition_reassignments.fetchRemove(lookup_key);
+            if (removed_existing) |removed| {
+                self.persistPartitionReassignmentsDurably() catch |err| {
+                    self.restorePartitionReassignmentMapEntry(removed);
+                    return err;
+                };
+                self.freePartitionReassignmentMapEntry(removed);
                 return @intFromEnum(ErrorCode.none);
             }
             return @intFromEnum(ErrorCode.no_reassignment_in_progress);
@@ -12472,30 +12666,49 @@ pub const Broker = struct {
         }
 
         if (isLocalReplicaAssignment(partition_req.replicas, self.node_id)) {
-            var changed = false;
-            if (self.partition_reassignments.fetchRemove(lookup_key)) |removed| {
-                self.allocator.free(removed.key);
-                var value = removed.value;
-                value.deinit(self.allocator);
-                changed = true;
+            const removed_existing = self.partition_reassignments.fetchRemove(lookup_key);
+            if (removed_existing) |removed| {
+                self.persistPartitionReassignmentsDurably() catch |err| {
+                    self.restorePartitionReassignmentMapEntry(removed);
+                    return err;
+                };
+                self.freePartitionReassignmentMapEntry(removed);
             }
-            if (changed) self.persistPartitionReassignments();
             return @intFromEnum(ErrorCode.none);
         }
 
         const owned_key = try reassignmentKey(self.allocator, topic_name, partition_req.partition_index);
-        errdefer self.allocator.free(owned_key);
+        var owned_key_owned = true;
+        errdefer if (owned_key_owned) self.allocator.free(owned_key);
         var next = try self.buildPartitionReassignment(topic_name, partition_req.partition_index, partition_req.replicas);
-        errdefer next.deinit(self.allocator);
+        var next_owned = true;
+        errdefer if (next_owned) next.deinit(self.allocator);
 
-        if (self.partition_reassignments.fetchRemove(lookup_key)) |removed| {
-            self.allocator.free(removed.key);
-            var value = removed.value;
-            value.deinit(self.allocator);
+        const removed_existing = self.partition_reassignments.fetchRemove(lookup_key);
+
+        self.partition_reassignments.put(owned_key, next) catch |err| {
+            if (removed_existing) |removed| {
+                self.restorePartitionReassignmentMapEntry(removed);
+            }
+            return err;
+        };
+        owned_key_owned = false;
+        next_owned = false;
+
+        self.persistPartitionReassignmentsDurably() catch |err| {
+            if (self.partition_reassignments.fetchRemove(lookup_key)) |inserted| {
+                self.freePartitionReassignmentMapEntry(inserted);
+            }
+            if (removed_existing) |removed| {
+                self.restorePartitionReassignmentMapEntry(removed);
+            }
+            return err;
+        };
+
+        if (removed_existing) |removed| {
+            self.freePartitionReassignmentMapEntry(removed);
         }
 
-        try self.partition_reassignments.put(owned_key, next);
-        self.persistPartitionReassignments();
         return @intFromEnum(ErrorCode.none);
     }
 
@@ -12694,6 +12907,48 @@ pub const Broker = struct {
             entry.value_ptr.deinit(self.allocator);
         }
         self.partition_reassignments.clearRetainingCapacity();
+    }
+
+    fn freePartitionReassignmentMapEntry(self: *Broker, removed: anytype) void {
+        self.allocator.free(removed.key);
+        var value = removed.value;
+        value.deinit(self.allocator);
+    }
+
+    fn restorePartitionReassignmentMapEntry(self: *Broker, removed: anytype) void {
+        self.partition_reassignments.put(removed.key, removed.value) catch |restore_err| {
+            log.err("Failed to restore partition reassignment after snapshot write failure: {}", .{restore_err});
+            self.freePartitionReassignmentMapEntry(removed);
+        };
+    }
+
+    fn pruneInvalidPartitionReassignments(self: *Broker) bool {
+        var removed_any = false;
+        while (true) {
+            var key_to_remove: ?[]const u8 = null;
+            var it = self.partition_reassignments.iterator();
+            while (it.next()) |entry| {
+                const info = self.topics.get(entry.value_ptr.topic);
+                if (info == null or entry.value_ptr.partition_index < 0 or
+                    entry.value_ptr.partition_index >= info.?.num_partitions or
+                    entry.value_ptr.replicas.len == 0 or
+                    !validReplicaAssignment(entry.value_ptr.replicas) or
+                    isLocalReplicaAssignment(entry.value_ptr.replicas, self.node_id))
+                {
+                    key_to_remove = entry.key_ptr.*;
+                    break;
+                }
+            }
+
+            const key = key_to_remove orelse break;
+            if (self.partition_reassignments.fetchRemove(key)) |removed| {
+                self.freePartitionReassignmentMapEntry(removed);
+                removed_any = true;
+            } else {
+                break;
+            }
+        }
+        return removed_any;
     }
 
     fn reassignmentKey(allocator: Allocator, topic_name: []const u8, partition_index: i32) ![]u8 {
@@ -21751,6 +22006,120 @@ test "Broker restores partition reassignment state after restart" {
         try testing.expectEqualSlices(i32, &remote_replicas, list_resp.topics[0].partitions[0].adding_replicas);
         try testing.expectEqualSlices(i32, &[_]i32{1}, list_resp.topics[0].partitions[0].removing_replicas);
     }
+}
+
+test "Broker restores partition reassignment state from S3 cluster metadata log" {
+    const AlterReq = generated.alter_partition_reassignments_request.AlterPartitionReassignmentsRequest;
+
+    var mock_s3 = storage.MockS3.init(testing.allocator);
+    defer mock_s3.deinit();
+    const s3_storage = storage.S3Storage.initMock(testing.allocator, &mock_s3);
+
+    const topic_name = "reassign-s3-recovery";
+    const remote_replicas = [_]i32{2};
+
+    {
+        var broker = Broker.init(testing.allocator, 1, 9092);
+        defer broker.deinit();
+        broker.store.s3_wal_mode = true;
+        broker.store.s3_storage = s3_storage;
+        broker.store.s3_wal_batcher = storage.wal.S3WalBatcher.init(testing.allocator);
+
+        try broker.open();
+        try testing.expect(broker.ensureTopic(topic_name));
+
+        const reassignment = AlterReq.ReassignableTopic.ReassignablePartition{
+            .partition_index = 0,
+            .replicas = &remote_replicas,
+        };
+        try testing.expectEqual(
+            @as(i16, @intFromEnum(ErrorCode.none)),
+            try broker.applyPartitionReassignment(topic_name, broker.topics.get(topic_name), reassignment),
+        );
+        try testing.expectEqual(@as(u32, 1), broker.partition_reassignments.count());
+        try testing.expect(mock_s3.objectCount() > 0);
+    }
+
+    {
+        var broker = Broker.init(testing.allocator, 1, 9092);
+        defer broker.deinit();
+        broker.store.s3_wal_mode = true;
+        broker.store.s3_storage = s3_storage;
+        broker.store.s3_wal_batcher = storage.wal.S3WalBatcher.init(testing.allocator);
+
+        try broker.open();
+        try testing.expect(broker.topics.contains(topic_name));
+        try testing.expectEqual(@as(u32, 1), broker.partition_reassignments.count());
+
+        var it = broker.partition_reassignments.iterator();
+        const entry = it.next().?;
+        const state = entry.value_ptr.*;
+        try testing.expectEqualStrings(topic_name, state.topic);
+        try testing.expectEqual(@as(i32, 0), state.partition_index);
+        try testing.expectEqualSlices(i32, &remote_replicas, state.replicas);
+        try testing.expectEqualSlices(i32, &remote_replicas, state.adding_replicas);
+        try testing.expectEqualSlices(i32, &[_]i32{1}, state.removing_replicas);
+    }
+}
+
+test "Broker AlterPartitionReassignments fails closed when reassignment snapshot S3 WAL write fails" {
+    const AlterReq = generated.alter_partition_reassignments_request.AlterPartitionReassignmentsRequest;
+    const AlterResp = generated.alter_partition_reassignments_response.AlterPartitionReassignmentsResponse;
+
+    var mock_s3 = storage.MockS3.init(testing.allocator);
+    defer mock_s3.deinit();
+    const s3_storage = storage.S3Storage.initMock(testing.allocator, &mock_s3);
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+    broker.store.s3_wal_mode = true;
+    broker.store.s3_storage = s3_storage;
+    broker.store.s3_wal_batcher = storage.wal.S3WalBatcher.init(testing.allocator);
+
+    try broker.open();
+    try testing.expect(broker.ensureTopic("reassign-s3-fail"));
+    const object_count_before = mock_s3.objectCount();
+    mock_s3.failNextPutObjects(3);
+
+    const remote_replicas = [_]i32{2};
+    const alter_partitions = [_]AlterReq.ReassignableTopic.ReassignablePartition{.{
+        .partition_index = 0,
+        .replicas = &remote_replicas,
+    }};
+    const alter_topics = [_]AlterReq.ReassignableTopic{.{
+        .name = "reassign-s3-fail",
+        .partitions = &alter_partitions,
+    }};
+    const alter_req = AlterReq{
+        .timeout_ms = 1000,
+        .topics = &alter_topics,
+    };
+
+    var buf: [1024]u8 = undefined;
+    var pos = buildTestRequest(&buf, 45, 0, 4521, header_mod.requestHeaderVersion(45, 0));
+    alter_req.serialize(&buf, &pos, 0);
+
+    const alter_response = broker.handleRequest(buf[0..pos]);
+    try testing.expect(alter_response != null);
+    defer testing.allocator.free(alter_response.?);
+
+    var rpos: usize = 0;
+    var response_header = try ResponseHeader.deserialize(testing.allocator, alter_response.?, &rpos, header_mod.responseHeaderVersion(45, 0));
+    defer response_header.deinit(testing.allocator);
+    try testing.expectEqual(@as(i32, 4521), response_header.correlation_id);
+
+    const alter_resp = try AlterResp.deserialize(testing.allocator, alter_response.?, &rpos, 0);
+    defer {
+        for (alter_resp.responses) |topic| {
+            if (topic.partitions.len > 0) testing.allocator.free(topic.partitions);
+        }
+        if (alter_resp.responses.len > 0) testing.allocator.free(alter_resp.responses);
+    }
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.none)), alter_resp.error_code);
+    try testing.expectEqual(@as(usize, 1), alter_resp.responses.len);
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.kafka_storage_error)), alter_resp.responses[0].partitions[0].error_code);
+    try testing.expectEqual(@as(u32, 0), broker.partition_reassignments.count());
+    try testing.expectEqual(object_count_before, mock_s3.objectCount());
 }
 
 test "Broker.handleRequest partition reassignment APIs reject truncated requests" {
