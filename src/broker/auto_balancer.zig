@@ -31,7 +31,7 @@ pub const AutoBalancer = struct {
 
         /// Total load for sorting purposes.
         pub fn totalLoad(self: *const PartitionLoad) f64 {
-            return self.bytes_in_rate + self.bytes_out_rate;
+            return normalizedRate(self.bytes_in_rate) + normalizedRate(self.bytes_out_rate);
         }
     };
 
@@ -124,9 +124,13 @@ pub const AutoBalancer = struct {
             }
         }
 
-        // Compute average load
+        // Compute average load only for partitions led by known nodes. Metrics
+        // for stale or unknown brokers should not suppress valid local moves.
         var total_load: f64 = 0.0;
-        for (sorted_loads) |pl| total_load += pl.totalLoad();
+        for (sorted_loads) |pl| {
+            if (node_loads.get(pl.leader_node) != null) total_load += pl.totalLoad();
+        }
+        if (total_load <= 0.0) return null;
         const avg_load = total_load / @as(f64, @floatFromInt(nodes.len));
 
         // Find overloaded nodes and generate moves
@@ -220,6 +224,11 @@ pub const AutoBalancer = struct {
     fn isDifferentKnownRack(a: ?[]const u8, b: ?[]const u8) bool {
         if (a == null or b == null) return false;
         return !std.mem.eql(u8, a.?, b.?);
+    }
+
+    fn normalizedRate(rate: f64) f64 {
+        if (rate > 0.0) return rate;
+        return 0.0;
     }
 
     fn partitionLoadGreaterThan(_: void, a: PartitionLoad, b: PartitionLoad) bool {
@@ -337,6 +346,75 @@ test "AutoBalancer rack-aware plan falls back when racks are equivalent" {
         defer mp.deinit();
         try testing.expect(mp.moveCount() > 0);
         try testing.expectEqual(@as(i32, 1), mp.moves.items[0].to_node);
+    }
+}
+
+test "AutoBalancer ignores stale unknown-node load when computing average" {
+    var ab = AutoBalancer.init(testing.allocator);
+    defer ab.deinit();
+
+    const nodes = [_]i32{ 0, 1 };
+    const loads = [_]AutoBalancer.PartitionLoad{
+        .{ .topic = "t", .partition_id = 0, .bytes_in_rate = 1000, .bytes_out_rate = 1000, .leader_node = 0 },
+        .{ .topic = "stale", .partition_id = 0, .bytes_in_rate = 100000, .bytes_out_rate = 100000, .leader_node = 99 },
+    };
+
+    const plan = ab.computeRebalancePlan(&nodes, &loads);
+    try testing.expect(plan != null);
+    if (plan) |*p| {
+        var mp = @constCast(p);
+        defer mp.deinit();
+        try testing.expectEqual(@as(usize, 1), mp.moveCount());
+        try testing.expectEqual(@as(i32, 0), mp.moves.items[0].from_node);
+        try testing.expectEqual(@as(i32, 1), mp.moves.items[0].to_node);
+    }
+}
+
+test "AutoBalancer plan converges simulated node load within tolerance" {
+    var ab = AutoBalancer.init(testing.allocator);
+    defer ab.deinit();
+
+    const nodes = [_]i32{ 0, 1, 2 };
+    const loads = [_]AutoBalancer.PartitionLoad{
+        .{ .topic = "t", .partition_id = 0, .bytes_in_rate = 10000, .bytes_out_rate = 0, .leader_node = 0 },
+        .{ .topic = "t", .partition_id = 1, .bytes_in_rate = 8000, .bytes_out_rate = 0, .leader_node = 0 },
+        .{ .topic = "t", .partition_id = 2, .bytes_in_rate = 6000, .bytes_out_rate = 0, .leader_node = 0 },
+        .{ .topic = "t", .partition_id = 3, .bytes_in_rate = 4000, .bytes_out_rate = 0, .leader_node = 0 },
+        .{ .topic = "t", .partition_id = 4, .bytes_in_rate = 1000, .bytes_out_rate = 0, .leader_node = 1 },
+        .{ .topic = "t", .partition_id = 5, .bytes_in_rate = 1000, .bytes_out_rate = 0, .leader_node = 2 },
+    };
+
+    const plan = ab.computeRebalancePlan(&nodes, &loads);
+    try testing.expect(plan != null);
+    if (plan) |*p| {
+        var mp = @constCast(p);
+        defer mp.deinit();
+        try testing.expectEqual(@as(usize, 2), mp.moveCount());
+
+        var node0: f64 = 28000;
+        var node1: f64 = 1000;
+        var node2: f64 = 1000;
+        for (mp.moves.items) |move| {
+            const moved_load = loads[@as(usize, @intCast(move.partition_id))].totalLoad();
+            switch (move.from_node) {
+                0 => node0 -= moved_load,
+                1 => node1 -= moved_load,
+                2 => node2 -= moved_load,
+                else => {},
+            }
+            switch (move.to_node) {
+                0 => node0 += moved_load,
+                1 => node1 += moved_load,
+                2 => node2 += moved_load,
+                else => {},
+            }
+        }
+
+        const avg_load = 30000.0 / 3.0;
+        const max_allowed = avg_load * 1.2;
+        try testing.expect(node0 <= max_allowed);
+        try testing.expect(node1 <= max_allowed);
+        try testing.expect(node2 <= max_allowed);
     }
 }
 
