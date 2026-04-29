@@ -2751,6 +2751,16 @@ pub const Broker = struct {
         self.persistPartitionStates();
     }
 
+    fn writeOffsetDeleteRecordsForGroup(self: *Broker, group_id: []const u8) !usize {
+        const offsets = try self.groups.listCommittedOffsets(self.allocator, group_id);
+        defer if (offsets.len > 0) self.allocator.free(offsets);
+
+        for (offsets) |offset| {
+            try self.writeOffsetDeleteRecord(group_id, offset.topic, offset.partition);
+        }
+        return offsets.len;
+    }
+
     /// Write a full consumer-group lifecycle snapshot to __consumer_offsets.
     /// Replay uses the latest snapshot record to rebuild active membership,
     /// protocol metadata, timeouts, leader, generation, and assignments without
@@ -9162,7 +9172,7 @@ pub const Broker = struct {
         var results = std.array_list.Managed(DeleteGroupsResponse.DeletableGroupResult).init(self.allocator);
         defer results.deinit();
 
-        const offsets_before = self.groups.committed_offsets.count();
+        var offsets_mutated = false;
         var groups_mutated = false;
         for (0..num_groups) |_| {
             const group_id = if (flexible)
@@ -9170,13 +9180,26 @@ pub const Broker = struct {
             else
                 (ser.readString(request_bytes, &pos) catch return null) orelse "";
 
-            const delete_error = self.groups.deleteGroup(group_id);
-            if (delete_error == ErrorCode.none) groups_mutated = true;
+            var delete_error = self.groups.deleteGroupError(group_id);
+            if (delete_error == ErrorCode.none) {
+                const deleted_offsets = self.writeOffsetDeleteRecordsForGroup(group_id) catch |err| blk: {
+                    log.warn("DeleteGroups offset tombstone write failed for {s}: {}", .{ group_id, err });
+                    delete_error = ErrorCode.kafka_storage_error;
+                    break :blk 0;
+                };
+                if (delete_error == ErrorCode.none) {
+                    delete_error = self.groups.deleteGroup(group_id);
+                    if (delete_error == ErrorCode.none) {
+                        groups_mutated = true;
+                        offsets_mutated = offsets_mutated or deleted_offsets > 0;
+                    }
+                }
+            }
             results.append(.{ .group_id = group_id, .error_code = @intFromEnum(delete_error) }) catch return null;
         }
 
         if (flexible) ser.skipTaggedFields(request_bytes, &pos) catch return null;
-        if (self.groups.committed_offsets.count() != offsets_before) self.persistOffsets();
+        if (offsets_mutated) self.persistOffsets();
         if (groups_mutated) {
             self.persistConsumerGroupsDurably() catch |err| {
                 log.warn("DeleteGroups consumer-group snapshot write failed: {}", .{err});
@@ -17246,6 +17269,109 @@ test "Broker.handleRequest DeleteGroups persists removed offsets" {
     const loaded_groups = try broker.persistence.loadConsumerGroups();
     defer broker.persistence.freeConsumerGroupEntries(loaded_groups);
     try testing.expectEqual(@as(usize, 0), loaded_groups.len);
+}
+
+test "Broker.handleRequest DeleteGroups preserves group when offset tombstone write fails" {
+    const Req = generated.delete_groups_request.DeleteGroupsRequest;
+    const Resp = generated.delete_groups_response.DeleteGroupsResponse;
+
+    var mock_s3 = storage.MockS3.init(testing.allocator);
+    defer mock_s3.deinit();
+    const s3_storage = storage.S3Storage.initMock(testing.allocator, &mock_s3);
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+    broker.store.s3_wal_mode = true;
+    broker.store.s3_storage = s3_storage;
+    broker.store.s3_wal_batcher = storage.wal.S3WalBatcher.init(testing.allocator);
+
+    try broker.open();
+    const join = try broker.groups.joinGroup("delete-groups-s3-fail", null, "consumer", null);
+    try testing.expectEqual(@as(i16, 0), broker.groups.leaveGroup("delete-groups-s3-fail", join.member_id));
+    try broker.groups.commitOffset("delete-groups-s3-fail", "delete-groups-s3-fail-topic", 0, 42);
+
+    const object_count_before = mock_s3.objectCount();
+    mock_s3.failNextPutObjects(3);
+
+    const group_names = [_]?[]const u8{"delete-groups-s3-fail"};
+    const req = Req{ .groups_names = &group_names };
+
+    var buf: [256]u8 = undefined;
+    var pos = buildTestRequest(&buf, 42, 2, 4203, header_mod.requestHeaderVersion(42, 2));
+    req.serialize(&buf, &pos, 2);
+
+    const response = broker.handleRequest(buf[0..pos]);
+    try testing.expect(response != null);
+    defer testing.allocator.free(response.?);
+
+    var rpos: usize = 0;
+    var response_header = try ResponseHeader.deserialize(testing.allocator, response.?, &rpos, header_mod.responseHeaderVersion(42, 2));
+    defer response_header.deinit(testing.allocator);
+    try testing.expectEqual(@as(i32, 4203), response_header.correlation_id);
+
+    const resp = try Resp.deserialize(testing.allocator, response.?, &rpos, 2);
+    defer if (resp.results.len > 0) testing.allocator.free(resp.results);
+    try testing.expectEqual(response.?.len, rpos);
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.kafka_storage_error)), resp.results[0].error_code);
+    try testing.expect(broker.groups.groups.contains("delete-groups-s3-fail"));
+    try testing.expectEqual(@as(?i64, 42), try broker.groups.fetchOffset("delete-groups-s3-fail", "delete-groups-s3-fail-topic", 0));
+    try testing.expectEqual(object_count_before, mock_s3.objectCount());
+}
+
+test "Broker.handleRequest DeleteGroups tombstones offsets for S3 replacement replay" {
+    const Req = generated.delete_groups_request.DeleteGroupsRequest;
+    const Resp = generated.delete_groups_response.DeleteGroupsResponse;
+
+    var mock_s3 = storage.MockS3.init(testing.allocator);
+    defer mock_s3.deinit();
+    const s3_storage = storage.S3Storage.initMock(testing.allocator, &mock_s3);
+
+    {
+        var broker = Broker.init(testing.allocator, 1, 9092);
+        defer broker.deinit();
+        broker.store.s3_wal_mode = true;
+        broker.store.s3_storage = s3_storage;
+        broker.store.s3_wal_batcher = storage.wal.S3WalBatcher.init(testing.allocator);
+
+        try broker.open();
+        const join = try broker.groups.joinGroup("delete-groups-replay", null, "consumer", null);
+        try testing.expectEqual(@as(i16, 0), broker.groups.leaveGroup("delete-groups-replay", join.member_id));
+        try broker.groups.commitOffset("delete-groups-replay", "delete-groups-replay-topic", 0, 77);
+        try broker.writeOffsetCommitRecord("delete-groups-replay", "delete-groups-replay-topic", 0, 77, -1, null);
+
+        const group_names = [_]?[]const u8{"delete-groups-replay"};
+        const req = Req{ .groups_names = &group_names };
+
+        var buf: [256]u8 = undefined;
+        var pos = buildTestRequest(&buf, 42, 2, 4204, header_mod.requestHeaderVersion(42, 2));
+        req.serialize(&buf, &pos, 2);
+
+        const response = broker.handleRequest(buf[0..pos]);
+        try testing.expect(response != null);
+        defer testing.allocator.free(response.?);
+
+        var rpos: usize = 0;
+        var response_header = try ResponseHeader.deserialize(testing.allocator, response.?, &rpos, header_mod.responseHeaderVersion(42, 2));
+        defer response_header.deinit(testing.allocator);
+        try testing.expectEqual(@as(i32, 4204), response_header.correlation_id);
+
+        const resp = try Resp.deserialize(testing.allocator, response.?, &rpos, 2);
+        defer if (resp.results.len > 0) testing.allocator.free(resp.results);
+        try testing.expectEqual(response.?.len, rpos);
+        try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.none)), resp.results[0].error_code);
+    }
+
+    {
+        var broker = Broker.init(testing.allocator, 1, 9092);
+        defer broker.deinit();
+        broker.store.s3_wal_mode = true;
+        broker.store.s3_storage = s3_storage;
+        broker.store.s3_wal_batcher = storage.wal.S3WalBatcher.init(testing.allocator);
+
+        try broker.open();
+        try testing.expect(!broker.groups.groups.contains("delete-groups-replay"));
+        try testing.expectEqual(@as(?i64, null), try broker.groups.fetchOffset("delete-groups-replay", "delete-groups-replay-topic", 0));
+    }
 }
 
 test "Broker.handleRequest OffsetForLeaderEpoch v0 returns generated legacy response" {

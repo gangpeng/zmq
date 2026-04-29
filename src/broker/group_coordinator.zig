@@ -466,12 +466,17 @@ pub const GroupCoordinator = struct {
     ///
     /// Kafka DeleteGroups must not remove groups with active members. Returning
     /// Kafka error codes here keeps the broker handler thin and testable.
-    pub fn deleteGroup(self: *GroupCoordinator, group_id: []const u8) ErrorCode {
+    pub fn deleteGroupError(self: *const GroupCoordinator, group_id: []const u8) ErrorCode {
         if (group_id.len == 0) return ErrorCode.invalid_group_id;
 
-        const group = self.groups.getPtr(group_id) orelse return ErrorCode.group_id_not_found;
+        const group = self.groups.get(group_id) orelse return ErrorCode.group_id_not_found;
         if (group.members.count() > 0) return ErrorCode.non_empty_group;
+        return ErrorCode.none;
+    }
 
+    pub fn deleteGroup(self: *GroupCoordinator, group_id: []const u8) ErrorCode {
+        const validation_error = self.deleteGroupError(group_id);
+        if (validation_error != ErrorCode.none) return validation_error;
         self.deleteCommittedOffsetsForGroup(group_id);
 
         if (self.groups.fetchRemove(group_id)) |entry| {
