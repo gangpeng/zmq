@@ -2228,6 +2228,22 @@ pub const Broker = struct {
         };
     }
 
+    fn removeTopicPartitionRange(self: *Broker, topic_name: []const u8, start_partition: i32, end_partition: i32) void {
+        if (end_partition <= start_partition) return;
+        for (@as(usize, @intCast(start_partition))..@as(usize, @intCast(end_partition))) |pi| {
+            const partition_index: i32 = @intCast(pi);
+            const stream_id = PartitionStore.hashPartitionKey(topic_name, partition_index);
+            self.object_manager.deleteStream(stream_id) catch {};
+
+            const pkey = std.fmt.allocPrint(self.allocator, "{s}-{d}", .{ topic_name, partition_index }) catch continue;
+            defer self.allocator.free(pkey);
+            if (self.store.partitions.fetchRemove(pkey)) |removed| {
+                self.allocator.free(removed.value.topic);
+                self.allocator.free(removed.key);
+            }
+        }
+    }
+
     fn encodePartitionReassignmentSnapshotRecordValue(self: *Broker) ![]u8 {
         var buf = std.array_list.Managed(u8).init(self.allocator);
         errdefer buf.deinit();
@@ -8739,9 +8755,16 @@ pub const Broker = struct {
         const results = self.allocator.alloc(TopicResult, req.topics.len) catch return null;
         defer if (results.len > 0) self.allocator.free(results);
 
+        const mutation_results = self.allocator.alloc(CreatePartitionsTopicResult, req.topics.len) catch return null;
+        defer if (mutation_results.len > 0) self.allocator.free(mutation_results);
+
+        const previous_snapshot = if (!req.validate_only) self.encodeTopicSnapshotRecordValue() catch return null else null;
+        defer if (previous_snapshot) |snapshot| self.allocator.free(snapshot);
+
         var mutated = false;
         for (req.topics, 0..) |topic_req, i| {
             const result = self.applyCreatePartitionsTopic(topic_req, req.validate_only);
+            mutation_results[i] = result;
             results[i] = .{
                 .name = topic_req.name,
                 .error_code = result.error_code,
@@ -8751,7 +8774,24 @@ pub const Broker = struct {
         }
 
         if (mutated) {
-            self.persistTopics();
+            self.writeTopicSnapshotRecord() catch |err| {
+                log.warn("Failed to append CreatePartitions topic snapshot to __cluster_metadata: {}", .{err});
+                self.restoreTopicsAfterFailedMutation(previous_snapshot.?);
+                for (req.topics, mutation_results, results) |topic_req, mutation, *response| {
+                    if (mutation.mutated and response.error_code == @intFromEnum(ErrorCode.none)) {
+                        const topic_name = topic_req.name orelse "";
+                        self.removeTopicPartitionRange(topic_name, mutation.old_count, mutation.new_count);
+                        response.error_code = @intFromEnum(ErrorCode.kafka_storage_error);
+                        response.error_message = "Failed to persist topic metadata";
+                    }
+                }
+                const resp = Resp{
+                    .throttle_time_ms = 0,
+                    .results = results,
+                };
+                return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+            };
+            self.persistTopicsLocal();
             self.persistObjectManagerSnapshot();
         }
 
@@ -8776,6 +8816,8 @@ pub const Broker = struct {
         error_code: i16,
         error_message: ?[]const u8 = null,
         mutated: bool = false,
+        old_count: i32 = 0,
+        new_count: i32 = 0,
     };
 
     fn applyCreatePartitionsTopic(self: *Broker, topic_req: generated.create_partitions_request.CreatePartitionsRequest.CreatePartitionsTopic, validate_only: bool) CreatePartitionsTopicResult {
@@ -8819,20 +8861,23 @@ pub const Broker = struct {
         }
 
         const old_total_count = info.num_partitions;
-        info.num_partitions = topic_req.count;
         for (@as(usize, @intCast(old_total_count))..@as(usize, @intCast(topic_req.count))) |pi| {
             self.store.ensurePartition(topic_name, @intCast(pi)) catch |err| {
                 log.warn("Failed to create partition {s}-{d}: {}", .{ topic_name, pi, err });
+                self.removeTopicPartitionRange(topic_name, old_total_count, @intCast(pi + 1));
                 return .{
                     .error_code = @intFromEnum(ErrorCode.kafka_storage_error),
                     .error_message = "Failed to create partition storage",
                 };
             };
         }
+        info.num_partitions = topic_req.count;
 
         return .{
             .error_code = @intFromEnum(ErrorCode.none),
             .mutated = true,
+            .old_count = old_total_count,
+            .new_count = topic_req.count,
         };
     }
 
@@ -19029,6 +19074,61 @@ test "Broker.handleRequest CreatePartitions validate_only does not expand topic"
     try testing.expectEqual(response.?.len, rpos);
     try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.none)), resp.results[0].error_code);
     try testing.expectEqual(before, broker.topics.get("create-partitions-validate-topic").?.num_partitions);
+}
+
+test "Broker.handleRequest CreatePartitions rolls back when topic snapshot S3 WAL write fails" {
+    const Req = generated.create_partitions_request.CreatePartitionsRequest;
+    const Resp = generated.create_partitions_response.CreatePartitionsResponse;
+
+    var mock_s3 = storage.MockS3.init(testing.allocator);
+    defer mock_s3.deinit();
+    const s3_storage = storage.S3Storage.initMock(testing.allocator, &mock_s3);
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+    broker.store.s3_wal_mode = true;
+    broker.store.s3_storage = s3_storage;
+    broker.store.s3_wal_batcher = storage.wal.S3WalBatcher.init(testing.allocator);
+
+    try broker.open();
+    try testing.expect(broker.ensureTopic("create-partitions-s3-fail-topic"));
+    const before = broker.topics.get("create-partitions-s3-fail-topic").?.num_partitions;
+    const object_count_before = mock_s3.objectCount();
+    mock_s3.failNextPutObjects(3);
+
+    const topics = [_]Req.CreatePartitionsTopic{.{
+        .name = "create-partitions-s3-fail-topic",
+        .count = before + 2,
+        .assignments = &.{},
+    }};
+    const req = Req{
+        .topics = &topics,
+        .timeout_ms = 30000,
+        .validate_only = false,
+    };
+
+    var buf: [512]u8 = undefined;
+    var pos = buildTestRequest(&buf, 37, 2, 3706, header_mod.requestHeaderVersion(37, 2));
+    req.serialize(&buf, &pos, 2);
+
+    const response = broker.handleRequest(buf[0..pos]);
+    try testing.expect(response != null);
+    defer testing.allocator.free(response.?);
+
+    var rpos: usize = 0;
+    var response_header = try ResponseHeader.deserialize(testing.allocator, response.?, &rpos, header_mod.responseHeaderVersion(37, 2));
+    defer response_header.deinit(testing.allocator);
+    try testing.expectEqual(@as(i32, 3706), response_header.correlation_id);
+
+    const resp = try Resp.deserialize(testing.allocator, response.?, &rpos, 2);
+    defer if (resp.results.len > 0) testing.allocator.free(resp.results);
+
+    try testing.expectEqual(response.?.len, rpos);
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.kafka_storage_error)), resp.results[0].error_code);
+    try testing.expectEqual(before, broker.topics.get("create-partitions-s3-fail-topic").?.num_partitions);
+    try testing.expect(!broker.store.partitions.contains("create-partitions-s3-fail-topic-1"));
+    try testing.expect(!broker.store.partitions.contains("create-partitions-s3-fail-topic-2"));
+    try testing.expectEqual(object_count_before, mock_s3.objectCount());
 }
 
 test "Broker.handleRequest CreatePartitions rejects truncated request" {
