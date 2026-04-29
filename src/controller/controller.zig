@@ -1671,6 +1671,7 @@ fn freeDeserializedVoteResponse(resp: *const generated.vote_response.VoteRespons
     for (resp.topics) |topic| {
         if (topic.partitions.len > 0) testing.allocator.free(topic.partitions);
     }
+    if (resp.node_endpoints.len > 0) testing.allocator.free(resp.node_endpoints);
     if (resp.topics.len > 0) testing.allocator.free(resp.topics);
 }
 
@@ -1678,6 +1679,7 @@ fn freeDeserializedFetchSnapshotResponse(resp: *const generated.fetch_snapshot_r
     for (resp.topics) |topic| {
         if (topic.partitions.len > 0) testing.allocator.free(topic.partitions);
     }
+    if (resp.node_endpoints.len > 0) testing.allocator.free(resp.node_endpoints);
     if (resp.topics.len > 0) testing.allocator.free(resp.topics);
 }
 

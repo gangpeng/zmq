@@ -1,5 +1,6 @@
 const std = @import("std");
 const generated = @import("generated_index.zig");
+const ser = @import("serialization.zig");
 
 const testing = std.testing;
 const default_round_trip_versions = [_]i16{
@@ -352,6 +353,48 @@ test "generated non-default golden fixtures cover legacy and flexible wire encod
     }
 
     {
+        const FetchSnapshotResponse = generated.fetch_snapshot_response.FetchSnapshotResponse;
+        const PartitionSnapshot = FetchSnapshotResponse.TopicSnapshot.PartitionSnapshot;
+        const partitions = [_]PartitionSnapshot{.{
+            .index = 1,
+            .error_code = 0,
+            .snapshot_id = .{ .end_offset = 42, .epoch = 3 },
+            .current_leader = .{ .leader_id = 7, .leader_epoch = 4 },
+            .size = 128,
+            .position = 16,
+            .unaligned_records = &[_]u8{ 0xaa, 0xbb },
+        }};
+        const topics = [_]FetchSnapshotResponse.TopicSnapshot{.{
+            .name = "snap-topic",
+            .partitions = &partitions,
+        }};
+        const node_endpoints = [_]FetchSnapshotResponse.NodeEndpoint{.{
+            .node_id = 7,
+            .host = "n1",
+            .port = 9092,
+        }};
+        const value = FetchSnapshotResponse{
+            .throttle_time_ms = 7,
+            .error_code = 0,
+            .topics = &topics,
+            .node_endpoints = &node_endpoints,
+        };
+        try expectGoldenRoundTrip(FetchSnapshotResponse, value, 1, &[_]u8{
+            0x00, 0x00, 0x00, 0x07, 0x00, 0x00, 0x02, 0x0b,
+            's',  'n',  'a',  'p',  '-',  't',  'o',  'p',
+            'i',  'c',  0x02, 0x00, 0x00, 0x00, 0x01, 0x00,
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x2a, 0x00, 0x00, 0x00, 0x03, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x80, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00, 0x10, 0x03, 0xaa, 0xbb,
+            0x01, 0x00, 0x09, 0x00, 0x00, 0x00, 0x07, 0x00,
+            0x00, 0x00, 0x04, 0x00, 0x00, 0x01, 0x00, 0x0b,
+            0x02, 0x00, 0x00, 0x00, 0x07, 0x03, 'n',  '1',
+            0x23, 0x84, 0x00,
+        });
+    }
+
+    {
         const ApiVersionsResponse = generated.api_versions_response.ApiVersionsResponse;
         const api_keys = [_]ApiVersionsResponse.ApiVersion{
             .{ .api_key = 0, .min_version = 0, .max_version = 11 },
@@ -506,6 +549,55 @@ test "generated KRaft quorum responses reject duplicate node endpoint tags" {
     try expectDuplicateNodeEndpointsTagRejected(generated.vote_response.VoteResponse);
     try expectDuplicateNodeEndpointsTagRejected(generated.begin_quorum_epoch_response.BeginQuorumEpochResponse);
     try expectDuplicateNodeEndpointsTagRejected(generated.end_quorum_epoch_response.EndQuorumEpochResponse);
+}
+
+test "generated FetchSnapshotResponse rejects duplicate known tags" {
+    {
+        const duplicate_node_endpoints = [_]u8{
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x02,
+            0x00, 0x0b, 0x02, 0x00, 0x00, 0x00, 0x07, 0x03, 'n', '1', 0x23, 0x84, 0x00,
+            0x00, 0x0b, 0x02, 0x00, 0x00, 0x00, 0x07, 0x03, 'n', '1', 0x23, 0x84, 0x00,
+        };
+        var pos: usize = 0;
+        try testing.expectError(
+            error.DuplicateTaggedField,
+            generated.fetch_snapshot_response.FetchSnapshotResponse.deserialize(testing.allocator, &duplicate_node_endpoints, &pos, 1),
+        );
+    }
+
+    {
+        var duplicate_current_leader: [128]u8 = undefined;
+        var pos: usize = 0;
+        ser.writeI32(&duplicate_current_leader, &pos, 0); // throttle_time_ms
+        ser.writeI16(&duplicate_current_leader, &pos, 0); // error_code
+        ser.writeCompactArrayLen(&duplicate_current_leader, &pos, 1); // topics
+        ser.writeCompactString(&duplicate_current_leader, &pos, "t");
+        ser.writeCompactArrayLen(&duplicate_current_leader, &pos, 1); // partitions
+        ser.writeI32(&duplicate_current_leader, &pos, 0); // index
+        ser.writeI16(&duplicate_current_leader, &pos, 0); // error_code
+        ser.writeI64(&duplicate_current_leader, &pos, 0); // snapshot end_offset
+        ser.writeI32(&duplicate_current_leader, &pos, 0); // snapshot epoch
+        ser.writeEmptyTaggedFields(&duplicate_current_leader, &pos); // SnapshotId tags
+        ser.writeI64(&duplicate_current_leader, &pos, 0); // size
+        ser.writeI64(&duplicate_current_leader, &pos, 0); // position
+        ser.writeCompactBytes(&duplicate_current_leader, &pos, null);
+        ser.writeUnsignedVarint(&duplicate_current_leader, &pos, 2); // duplicate partition tags
+        inline for (0..2) |_| {
+            ser.writeUnsignedVarint(&duplicate_current_leader, &pos, 0);
+            ser.writeUnsignedVarint(&duplicate_current_leader, &pos, 9);
+            ser.writeI32(&duplicate_current_leader, &pos, 7);
+            ser.writeI32(&duplicate_current_leader, &pos, 4);
+            ser.writeEmptyTaggedFields(&duplicate_current_leader, &pos);
+        }
+        ser.writeEmptyTaggedFields(&duplicate_current_leader, &pos); // topic tags
+        ser.writeEmptyTaggedFields(&duplicate_current_leader, &pos); // response tags
+
+        var read_pos: usize = 0;
+        try testing.expectError(
+            error.DuplicateTaggedField,
+            generated.fetch_snapshot_response.FetchSnapshotResponse.deserialize(testing.allocator, duplicate_current_leader[0..pos], &read_pos, 1),
+        );
+    }
 }
 
 test "generated default messages round-trip across common protocol versions" {
