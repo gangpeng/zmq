@@ -23338,6 +23338,107 @@ test "Broker restores transaction metadata from S3 transaction state log" {
     }
 }
 
+test "Broker restores atomic WriteTxnMarkers S3 WAL state after stateless replacement" {
+    const Req = generated.write_txn_markers_request.WriteTxnMarkersRequest;
+    const Resp = generated.write_txn_markers_response.WriteTxnMarkersResponse;
+
+    var mock_s3 = storage.MockS3.init(testing.allocator);
+    defer mock_s3.deinit();
+    const s3_storage = storage.S3Storage.initMock(testing.allocator, &mock_s3);
+    const topic_name = "stateless-txn-marker-atomic-topic";
+
+    var producer_id: i64 = -1;
+    var producer_epoch: i16 = -1;
+
+    {
+        var broker = Broker.init(testing.allocator, 1, 9092);
+        defer broker.deinit();
+        broker.store.s3_wal_mode = true;
+        broker.store.s3_storage = s3_storage;
+        broker.store.s3_wal_batcher = storage.wal.S3WalBatcher.init(testing.allocator);
+
+        try broker.open();
+        try testing.expect(broker.ensureTopic(topic_name));
+
+        const init_result = try broker.txn_coordinator.initProducerId("stateless-txn-marker-atomic");
+        producer_id = init_result.producer_id;
+        producer_epoch = init_result.producer_epoch;
+        try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.none)), try broker.txn_coordinator.addPartitionsToTxn(producer_id, producer_epoch, topic_name, 0));
+        try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.none)), broker.txn_coordinator.endTxn(producer_id, producer_epoch, true));
+        try broker.persistTransactionsIfDirtyDurably();
+
+        const partition_indexes = [_]i32{0};
+        const topics = [_]Req.WritableTxnMarker.WritableTxnMarkerTopic{.{
+            .name = topic_name,
+            .partition_indexes = &partition_indexes,
+        }};
+        const markers = [_]Req.WritableTxnMarker{.{
+            .producer_id = producer_id,
+            .producer_epoch = producer_epoch,
+            .transaction_result = true,
+            .topics = &topics,
+            .coordinator_epoch = 0,
+        }};
+        const req = Req{ .markers = &markers };
+
+        var buf: [512]u8 = undefined;
+        var pos = buildTestRequest(&buf, 27, 1, 2709, header_mod.requestHeaderVersion(27, 1));
+        req.serialize(&buf, &pos, 1);
+
+        const response = broker.handleRequest(buf[0..pos]);
+        try testing.expect(response != null);
+        defer testing.allocator.free(response.?);
+
+        var rpos: usize = 0;
+        var response_header = try ResponseHeader.deserialize(testing.allocator, response.?, &rpos, header_mod.responseHeaderVersion(27, 1));
+        defer response_header.deinit(testing.allocator);
+        try testing.expectEqual(@as(i32, 2709), response_header.correlation_id);
+
+        const resp = try Resp.deserialize(testing.allocator, response.?, &rpos, 1);
+        defer {
+            for (resp.markers) |marker| {
+                for (marker.topics) |topic| {
+                    if (topic.partitions.len > 0) testing.allocator.free(topic.partitions);
+                }
+                if (marker.topics.len > 0) testing.allocator.free(marker.topics);
+            }
+            if (resp.markers.len > 0) testing.allocator.free(resp.markers);
+        }
+        try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.none)), resp.markers[0].topics[0].partitions[0].error_code);
+    }
+
+    try testing.expect(mock_s3.objectCount() > 0);
+
+    {
+        var broker = Broker.init(testing.allocator, 1, 9092);
+        defer broker.deinit();
+        broker.store.s3_wal_mode = true;
+        broker.store.s3_storage = s3_storage;
+        broker.store.s3_wal_batcher = storage.wal.S3WalBatcher.init(testing.allocator);
+
+        try broker.open();
+
+        try testing.expect(broker.topics.contains(topic_name));
+        const txn = broker.txn_coordinator.transactions.getPtr(producer_id).?;
+        try testing.expectEqual(producer_id, txn.producer_id);
+        try testing.expectEqual(producer_epoch, txn.producer_epoch);
+        try testing.expectEqual(TxnCoordinator.TxnStatus.complete_commit, txn.status);
+        try testing.expectEqualStrings("stateless-txn-marker-atomic", txn.transactional_id.?);
+        try testing.expectEqual(@as(usize, 0), txn.partitions.items.len);
+
+        const state = broker.store.partitions.get("stateless-txn-marker-atomic-topic-0").?;
+        try testing.expectEqual(@as(u64, 1), state.next_offset);
+        try testing.expectEqual(@as(u64, 1), state.high_watermark);
+        try testing.expectEqual(@as(u64, 1), state.last_stable_offset);
+        try testing.expect(state.first_unstable_txn_offset == null);
+
+        const fetched = try broker.store.fetch(topic_name, 0, 0, 1024);
+        defer if (fetched.records.len > 0) testing.allocator.free(@constCast(fetched.records));
+        try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.none)), fetched.error_code);
+        try testing.expect(fetched.records.len > 0);
+    }
+}
+
 test "Broker JoinGroup fails closed when consumer group snapshot S3 WAL write fails" {
     const Req = generated.join_group_request.JoinGroupRequest;
     const Protocol = Req.JoinGroupRequestProtocol;
