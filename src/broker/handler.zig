@@ -8721,6 +8721,9 @@ pub const Broker = struct {
             return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
         }
 
+        const previous_snapshot = self.encodeTransactionSnapshotRecordValue() catch return null;
+        defer self.allocator.free(previous_snapshot);
+
         // Before completing the txn, get the partition list so we can write control batches
         const control_type: @import("txn_coordinator.zig").TransactionCoordinator.ControlRecordType = if (req.committed) .commit else .abort;
         var marker_error: i16 = @intFromEnum(ErrorCode.none);
@@ -8739,6 +8742,7 @@ pub const Broker = struct {
         if (error_code == @intFromEnum(ErrorCode.none)) {
             self.persistTransactionsIfDirtyDurably() catch |err| {
                 log.warn("EndTxn transaction snapshot write failed for {s}: {}", .{ req.transactional_id orelse "", err });
+                self.restoreTransactionsAfterFailedMutation(previous_snapshot);
                 const resp = Resp{
                     .throttle_time_ms = 0,
                     .error_code = @intFromEnum(ErrorCode.kafka_storage_error),
@@ -23925,6 +23929,58 @@ test "Broker.handleRequest EndTxn v3 returns generated response and completes tr
     try testing.expectEqual(@as(i32, 0), resp.throttle_time_ms);
     try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.none)), resp.error_code);
     try testing.expectEqual(TxnCoordinator.TxnStatus.complete_commit, broker.txn_coordinator.getStatus(init_result.producer_id).?);
+}
+
+test "Broker.handleRequest EndTxn rolls back when transaction snapshot S3 WAL write fails" {
+    const Req = generated.end_txn_request.EndTxnRequest;
+    const Resp = generated.end_txn_response.EndTxnResponse;
+
+    var mock_s3 = storage.MockS3.init(testing.allocator);
+    defer mock_s3.deinit();
+    const s3_storage = storage.S3Storage.initMock(testing.allocator, &mock_s3);
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+    broker.store.s3_wal_mode = true;
+    broker.store.s3_storage = s3_storage;
+    broker.store.s3_wal_batcher = storage.wal.S3WalBatcher.init(testing.allocator);
+    try broker.open();
+
+    const init_result = try broker.txn_coordinator.initProducerId("txn-end-snapshot-fail");
+    broker.txn_coordinator.transactions.getPtr(init_result.producer_id).?.status = .ongoing;
+    broker.txn_coordinator.dirty = true;
+    try broker.persistTransactionsIfDirtyDurably();
+
+    const object_count_before = mock_s3.objectCount();
+    mock_s3.failNextPutObjects(3);
+
+    const req = Req{
+        .transactional_id = "txn-end-snapshot-fail",
+        .producer_id = init_result.producer_id,
+        .producer_epoch = init_result.producer_epoch,
+        .committed = true,
+    };
+
+    var buf: [512]u8 = undefined;
+    var pos = buildTestRequest(&buf, 26, 3, 2608, header_mod.requestHeaderVersion(26, 3));
+    req.serialize(&buf, &pos, 3);
+
+    const response = broker.handleRequest(buf[0..pos]);
+    try testing.expect(response != null);
+    defer testing.allocator.free(response.?);
+
+    var rpos: usize = 0;
+    var response_header = try ResponseHeader.deserialize(testing.allocator, response.?, &rpos, header_mod.responseHeaderVersion(26, 3));
+    defer response_header.deinit(testing.allocator);
+    try testing.expectEqual(@as(i32, 2608), response_header.correlation_id);
+
+    const resp = try Resp.deserialize(testing.allocator, response.?, &rpos, 3);
+    try testing.expectEqual(response.?.len, rpos);
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.kafka_storage_error)), resp.error_code);
+    try testing.expectEqual(TxnCoordinator.TxnStatus.ongoing, broker.txn_coordinator.getStatus(init_result.producer_id).?);
+    try testing.expectEqual(@as(usize, 0), broker.txn_coordinator.getPartitions(init_result.producer_id).?.len);
+    try testing.expect(!broker.txn_coordinator.dirty);
+    try testing.expectEqual(object_count_before, mock_s3.objectCount());
 }
 
 test "Broker.handleRequest EndTxn rejects transactional id mismatch before marker write" {
