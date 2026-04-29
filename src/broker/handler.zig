@@ -1362,25 +1362,27 @@ pub const Broker = struct {
 
     /// Persist consumer-group lifecycle state from the group coordinator.
     fn persistConsumerGroups(self: *Broker) void {
-        self.persistence.saveConsumerGroups(&self.groups.groups) catch |err| {
+        self.persistConsumerGroupsDurably() catch |err| {
             log.warn("Failed to persist consumer group state: {}", .{err});
         };
-        self.writeConsumerGroupSnapshotRecord() catch |err| {
-            log.warn("Failed to append consumer group snapshot to __consumer_offsets: {}", .{err});
-        };
+    }
+
+    fn persistConsumerGroupsDurably(self: *Broker) !void {
+        try self.persistence.saveConsumerGroups(&self.groups.groups);
+        try self.writeConsumerGroupSnapshotRecord();
     }
 
     /// Persist transaction coordinator state if it has changed since the last flush.
     fn persistTransactionsIfDirty(self: *Broker) void {
-        if (!self.txn_coordinator.dirty) return;
-        self.persistence.saveTransactions(&self.txn_coordinator) catch |err| {
+        self.persistTransactionsIfDirtyDurably() catch |err| {
             log.warn("Failed to persist transaction state: {}", .{err});
-            return;
         };
-        self.writeTransactionSnapshotRecord() catch |err| {
-            log.warn("Failed to append transaction snapshot to __transaction_state: {}", .{err});
-            return;
-        };
+    }
+
+    fn persistTransactionsIfDirtyDurably(self: *Broker) !void {
+        if (!self.txn_coordinator.dirty) return;
+        try self.persistence.saveTransactions(&self.txn_coordinator);
+        try self.writeTransactionSnapshotRecord();
         self.txn_coordinator.dirty = false;
     }
 
@@ -3234,6 +3236,33 @@ pub const Broker = struct {
         return acknowledged >= raft.majorityThreshold();
     }
 
+    fn autoMqRecordHasFreshAllFollowerAck(self: *Broker, offset: u64, since_ms: i64) bool {
+        const raft = self.raft_state orelse return true;
+        if (raft.quorumSize() <= 1) return true;
+
+        var it = raft.voters.iterator();
+        while (it.next()) |entry| {
+            if (entry.key_ptr.* == raft.node_id) continue;
+            const voter = entry.value_ptr;
+            if (voter.match_index < offset or voter.last_heartbeat_ms < since_ms) return false;
+        }
+        return true;
+    }
+
+    fn waitForAutoMqCommitPropagation(self: *Broker, offset: u64, committed_ms: i64) void {
+        const raft = self.raft_state orelse return;
+        if (raft.quorumSize() <= 1) return;
+
+        // The election loop sends AppendEntries every ~500ms. Waiting briefly
+        // after local commit lets followers observe leader_commit before a
+        // failover, without weakening quorum availability if a follower is down.
+        const deadline_ms = committed_ms + 750;
+        while (@import("time_compat").milliTimestamp() < deadline_ms) {
+            if (self.autoMqRecordHasFreshAllFollowerAck(offset, committed_ms)) return;
+            @import("time_compat").sleep(10 * std.time.ns_per_ms);
+        }
+    }
+
     fn appendCommittedAutoMqRecord(self: *Broker, record: []const u8) !u64 {
         const raft = self.raft_state orelse return 0;
         if (raft.role != .leader) return error.NotController;
@@ -3248,6 +3277,7 @@ pub const Broker = struct {
         const deadline_ms = append_started_ms + auto_mq_quorum_commit_timeout_ms;
         while (@import("time_compat").milliTimestamp() < deadline_ms) {
             if (raft.commit_index >= offset and self.autoMqRecordHasFreshMajorityAck(offset, append_started_ms)) {
+                self.waitForAutoMqCommitPropagation(offset, @import("time_compat").milliTimestamp());
                 return offset;
             }
             @import("time_compat").sleep(10 * std.time.ns_per_ms);
@@ -4547,7 +4577,21 @@ pub const Broker = struct {
         const result = self.groups.joinGroupWithProtocol(req.group_id orelse "", member_id, req.group_instance_id, protocol_type, protocol_selection.name, protocol_selection.metadata, null) catch return null;
         if (result.error_code == @intFromEnum(ErrorCode.none)) {
             _ = self.groups.configureGroupTimeouts(req.group_id orelse "", @intCast(req.session_timeout_ms), effectiveJoinGroupRebalanceTimeout(api_version, req.session_timeout_ms, req.rebalance_timeout_ms));
-            self.persistConsumerGroups();
+            self.persistConsumerGroupsDurably() catch |err| {
+                log.warn("JoinGroup consumer-group snapshot write failed for {s}: {}", .{ req.group_id orelse "", err });
+                const resp = Resp{
+                    .throttle_time_ms = 0,
+                    .error_code = @intFromEnum(ErrorCode.kafka_storage_error),
+                    .generation_id = -1,
+                    .protocol_type = protocol_type,
+                    .protocol_name = "",
+                    .leader = "",
+                    .skip_assignment = false,
+                    .member_id = req.member_id orelse "",
+                    .members = &.{},
+                };
+                return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+            };
         }
 
         var members: []Resp.JoinGroupResponseMember = &.{};
@@ -4724,7 +4768,20 @@ pub const Broker = struct {
             top_error = self.groups.leaveGroup(req.group_id orelse "", req.member_id orelse "");
             if (top_error == @intFromEnum(ErrorCode.none)) mutated = true;
         }
-        if (mutated) self.persistConsumerGroups();
+        if (mutated) {
+            self.persistConsumerGroupsDurably() catch |err| {
+                log.warn("LeaveGroup consumer-group snapshot write failed for {s}: {}", .{ req.group_id orelse "", err });
+                if (api_version >= 3) {
+                    for (member_responses) |*member_response| {
+                        if (member_response.error_code == @intFromEnum(ErrorCode.none)) {
+                            member_response.error_code = @intFromEnum(ErrorCode.kafka_storage_error);
+                        }
+                    }
+                } else {
+                    top_error = @intFromEnum(ErrorCode.kafka_storage_error);
+                }
+            };
+        }
         defer if (member_responses.len > 0) self.allocator.free(member_responses);
 
         const resp = Resp{
@@ -5508,7 +5565,19 @@ pub const Broker = struct {
             const ensure_result = self.groups.ensureProtocolForGroup(req.group_id orelse "", sync_protocol.protocol_type, sync_protocol.protocol_name) catch return null;
             protocol_mutated = ensure_result.mutated;
         }
-        if ((assignments != null or protocol_mutated) and result.error_code == @intFromEnum(ErrorCode.none)) self.persistConsumerGroups();
+        if ((assignments != null or protocol_mutated) and result.error_code == @intFromEnum(ErrorCode.none)) {
+            self.persistConsumerGroupsDurably() catch |err| {
+                log.warn("SyncGroup consumer-group snapshot write failed for {s}: {}", .{ req.group_id orelse "", err });
+                const resp = Resp{
+                    .throttle_time_ms = 0,
+                    .error_code = @intFromEnum(ErrorCode.kafka_storage_error),
+                    .protocol_type = sync_protocol.protocol_type,
+                    .protocol_name = sync_protocol.protocol_name,
+                    .assignment = null,
+                };
+                return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+            };
+        }
 
         const resp = Resp{
             .throttle_time_ms = 0,
@@ -7014,7 +7083,20 @@ pub const Broker = struct {
         };
 
         const result = self.txn_coordinator.initProducerIdForRequestWithTimeout(req.transactional_id, req.transaction_timeout_ms, req.producer_id, req.producer_epoch) catch return null;
-        self.persistTransactionsIfDirty();
+        if (result.error_code == @intFromEnum(ErrorCode.none)) {
+            self.persistTransactionsIfDirtyDurably() catch |err| {
+                log.warn("InitProducerId transaction snapshot write failed for {s}: {}", .{ req.transactional_id orelse "", err });
+                const resp = Resp{
+                    .throttle_time_ms = 0,
+                    .error_code = @intFromEnum(ErrorCode.kafka_storage_error),
+                    .producer_id = -1,
+                    .producer_epoch = -1,
+                };
+                return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+            };
+        } else {
+            self.persistTransactionsIfDirty();
+        }
         const resp = Resp{
             .throttle_time_ms = 0,
             .error_code = result.error_code,
@@ -7435,7 +7517,16 @@ pub const Broker = struct {
                 .error_code = @intFromEnum(ErrorCode.none),
                 .results_by_transaction = txn_results[0..txn_results_init],
             };
-            self.persistTransactionsIfDirty();
+            self.persistTransactionsIfDirtyDurably() catch |err| {
+                log.warn("AddPartitionsToTxn transaction snapshot write failed: {}", .{err});
+                markAddPartitionsToTxnResultsStorageError(txn_results[0..txn_results_init]);
+                const storage_resp = Resp{
+                    .throttle_time_ms = 0,
+                    .error_code = @intFromEnum(ErrorCode.kafka_storage_error),
+                    .results_by_transaction = txn_results[0..txn_results_init],
+                };
+                return self.serializeGeneratedResponse(req_header, resp_header_version, &storage_resp, api_version);
+            };
             return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
         }
 
@@ -7455,7 +7546,10 @@ pub const Broker = struct {
             .throttle_time_ms = 0,
             .results_by_topic_v3_and_below = topic_results,
         };
-        self.persistTransactionsIfDirty();
+        self.persistTransactionsIfDirtyDurably() catch |err| {
+            log.warn("AddPartitionsToTxn transaction snapshot write failed: {}", .{err});
+            markAddPartitionsToTxnTopicResultsStorageError(topic_results);
+        };
         return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
     }
 
@@ -7509,6 +7603,23 @@ pub const Broker = struct {
         }
 
         return topic_results;
+    }
+
+    fn markAddPartitionsToTxnResultsStorageError(results: []const generated.add_partitions_to_txn_response.AddPartitionsToTxnResponse.AddPartitionsToTxnResult) void {
+        for (results) |result| {
+            markAddPartitionsToTxnTopicResultsStorageError(result.topic_results);
+        }
+    }
+
+    fn markAddPartitionsToTxnTopicResultsStorageError(topics: []const generated.add_partitions_to_txn_response.AddPartitionsToTxnTopicResult) void {
+        for (topics) |topic| {
+            const partitions: []generated.add_partitions_to_txn_response.AddPartitionsToTxnPartitionResult = @constCast(topic.results_by_partition);
+            for (partitions) |*partition| {
+                if (partition.partition_error_code == @intFromEnum(ErrorCode.none)) {
+                    partition.partition_error_code = @intFromEnum(ErrorCode.kafka_storage_error);
+                }
+            }
+        }
     }
 
     fn validateTransactionalProducerIdentity(self: *Broker, transactional_id: ?[]const u8, producer_id: i64, producer_epoch: i16) i16 {
@@ -7669,7 +7780,18 @@ pub const Broker = struct {
         }
 
         const error_code = self.txn_coordinator.endTxnComplete(req.producer_id, req.producer_epoch, req.committed);
-        self.persistTransactionsIfDirty();
+        if (error_code == @intFromEnum(ErrorCode.none)) {
+            self.persistTransactionsIfDirtyDurably() catch |err| {
+                log.warn("EndTxn transaction snapshot write failed for {s}: {}", .{ req.transactional_id orelse "", err });
+                const resp = Resp{
+                    .throttle_time_ms = 0,
+                    .error_code = @intFromEnum(ErrorCode.kafka_storage_error),
+                };
+                return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+            };
+        } else {
+            self.persistTransactionsIfDirty();
+        }
 
         const resp = Resp{
             .throttle_time_ms = 0,
@@ -8010,7 +8132,14 @@ pub const Broker = struct {
                 "__consumer_offsets",
                 target_partition,
             ) catch @intFromEnum(ErrorCode.kafka_storage_error);
-            self.persistTransactionsIfDirty();
+            if (error_code == @intFromEnum(ErrorCode.none)) {
+                self.persistTransactionsIfDirtyDurably() catch |err| {
+                    log.warn("AddOffsetsToTxn transaction snapshot write failed for {s}: {}", .{ req.transactional_id orelse "", err });
+                    error_code = @intFromEnum(ErrorCode.kafka_storage_error);
+                };
+            } else {
+                self.persistTransactionsIfDirty();
+            }
         }
 
         const resp = Resp{
@@ -8082,7 +8211,16 @@ pub const Broker = struct {
 
         if (flexible) ser.skipTaggedFields(request_bytes, &pos) catch return null;
         if (self.groups.committed_offsets.count() != offsets_before) self.persistOffsets();
-        if (groups_mutated) self.persistConsumerGroups();
+        if (groups_mutated) {
+            self.persistConsumerGroupsDurably() catch |err| {
+                log.warn("DeleteGroups consumer-group snapshot write failed: {}", .{err});
+                for (results.items) |*result| {
+                    if (result.error_code == @intFromEnum(ErrorCode.none)) {
+                        result.error_code = @intFromEnum(ErrorCode.kafka_storage_error);
+                    }
+                }
+            };
+        }
 
         const resp_body = DeleteGroupsResponse{
             .throttle_time_ms = 0,
@@ -10605,7 +10743,12 @@ pub const Broker = struct {
             self.persistPartitionStates();
             self.persistObjectManagerSnapshot();
         }
-        self.persistTransactionsIfDirty();
+        self.persistTransactionsIfDirtyDurably() catch |err| {
+            log.warn("WriteTxnMarkers transaction snapshot write failed: {}", .{err});
+            for (markers[0..markers_init]) |*marker| {
+                applyWriteTxnMarkerError(marker.topics, @intFromEnum(ErrorCode.kafka_storage_error));
+            }
+        };
 
         const resp = Resp{ .markers = markers[0..markers_init] };
         return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
@@ -10695,7 +10838,7 @@ pub const Broker = struct {
         return self.txn_coordinator.writeTxnMarkers(producer_id);
     }
 
-    fn applyWriteTxnMarkerError(topics: []generated.write_txn_markers_response.WriteTxnMarkersResponse.WritableTxnMarkerResult.WritableTxnMarkerTopicResult, error_code: i16) void {
+    fn applyWriteTxnMarkerError(topics: []const generated.write_txn_markers_response.WriteTxnMarkersResponse.WritableTxnMarkerResult.WritableTxnMarkerTopicResult, error_code: i16) void {
         for (topics) |*topic| {
             const partitions: []generated.write_txn_markers_response.WriteTxnMarkersResponse.WritableTxnMarkerResult.WritableTxnMarkerTopicResult.WritableTxnMarkerPartitionResult = @constCast(topic.partitions);
             for (partitions) |*partition| {
@@ -14176,7 +14319,7 @@ pub const Broker = struct {
             }
         }
 
-        return raft.handleAppendEntries(
+        const append_response = raft.handleAppendEntries(
             leader_epoch,
             leader_id,
             @intCast(prev_log_offset_raw),
@@ -14184,6 +14327,10 @@ pub const Broker = struct {
             entries,
             @intCast(leader_commit_raw),
         );
+        if (append_response.success) {
+            _ = try self.applyCommittedAutoMqQuorumRecords();
+        }
+        return append_response;
     }
 
     fn handleBeginQuorumEpoch(self: *Broker, request_bytes: []const u8, start_pos: usize, req_header: *const RequestHeader, api_version: i16, resp_header_version: i16) ?[]u8 {
@@ -20248,6 +20395,106 @@ test "Broker restores transaction metadata from S3 transaction state log" {
         try testing.expectEqual(producer_id, bumped.producer_id);
         try testing.expectEqual(producer_epoch + 1, bumped.producer_epoch);
     }
+}
+
+test "Broker JoinGroup fails closed when consumer group snapshot S3 WAL write fails" {
+    const Req = generated.join_group_request.JoinGroupRequest;
+    const Protocol = Req.JoinGroupRequestProtocol;
+    const Resp = generated.join_group_response.JoinGroupResponse;
+
+    var mock_s3 = storage.MockS3.init(testing.allocator);
+    defer mock_s3.deinit();
+    const s3_storage = storage.S3Storage.initMock(testing.allocator, &mock_s3);
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+    broker.store.s3_wal_mode = true;
+    broker.store.s3_storage = s3_storage;
+    broker.store.s3_wal_batcher = storage.wal.S3WalBatcher.init(testing.allocator);
+    try broker.open();
+
+    mock_s3.failNextPutObjects(3);
+
+    const protocols = [_]Protocol{.{
+        .name = "range",
+        .metadata = "snapshot-fail-metadata",
+    }};
+    const req = Req{
+        .group_id = "snapshot-fail-group",
+        .session_timeout_ms = 30000,
+        .rebalance_timeout_ms = 300000,
+        .member_id = "",
+        .group_instance_id = null,
+        .protocol_type = "consumer",
+        .protocols = &protocols,
+        .reason = "snapshot-fail-test",
+    };
+
+    var buf: [512]u8 = undefined;
+    var pos = buildTestRequest(&buf, 11, 9, 1119, header_mod.requestHeaderVersion(11, 9));
+    req.serialize(&buf, &pos, 9);
+
+    const response = broker.handleRequest(buf[0..pos]);
+    try testing.expect(response != null);
+    defer testing.allocator.free(response.?);
+
+    var rpos: usize = 0;
+    var response_header = try ResponseHeader.deserialize(testing.allocator, response.?, &rpos, header_mod.responseHeaderVersion(11, 9));
+    defer response_header.deinit(testing.allocator);
+    try testing.expectEqual(@as(i32, 1119), response_header.correlation_id);
+
+    const resp = try Resp.deserialize(testing.allocator, response.?, &rpos, 9);
+    defer if (resp.members.len > 0) testing.allocator.free(resp.members);
+    try testing.expectEqual(response.?.len, rpos);
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.kafka_storage_error)), resp.error_code);
+    try testing.expectEqual(@as(i32, -1), resp.generation_id);
+    try testing.expectEqual(@as(usize, 0), mock_s3.objectCount());
+}
+
+test "Broker InitProducerId fails closed when transaction snapshot S3 WAL write fails" {
+    const Req = generated.init_producer_id_request.InitProducerIdRequest;
+    const Resp = generated.init_producer_id_response.InitProducerIdResponse;
+
+    var mock_s3 = storage.MockS3.init(testing.allocator);
+    defer mock_s3.deinit();
+    const s3_storage = storage.S3Storage.initMock(testing.allocator, &mock_s3);
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+    broker.store.s3_wal_mode = true;
+    broker.store.s3_storage = s3_storage;
+    broker.store.s3_wal_batcher = storage.wal.S3WalBatcher.init(testing.allocator);
+    try broker.open();
+
+    mock_s3.failNextPutObjects(3);
+
+    const req = Req{
+        .transactional_id = "snapshot-fail-txn",
+        .transaction_timeout_ms = 60000,
+        .producer_id = -1,
+        .producer_epoch = -1,
+    };
+
+    var buf: [512]u8 = undefined;
+    var pos = buildTestRequest(&buf, 22, 4, 2224, header_mod.requestHeaderVersion(22, 4));
+    req.serialize(&buf, &pos, 4);
+
+    const response = broker.handleRequest(buf[0..pos]);
+    try testing.expect(response != null);
+    defer testing.allocator.free(response.?);
+
+    var rpos: usize = 0;
+    var response_header = try ResponseHeader.deserialize(testing.allocator, response.?, &rpos, header_mod.responseHeaderVersion(22, 4));
+    defer response_header.deinit(testing.allocator);
+    try testing.expectEqual(@as(i32, 2224), response_header.correlation_id);
+
+    const resp = try Resp.deserialize(testing.allocator, response.?, &rpos, 4);
+    try testing.expectEqual(response.?.len, rpos);
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.kafka_storage_error)), resp.error_code);
+    try testing.expectEqual(@as(i64, -1), resp.producer_id);
+    try testing.expectEqual(@as(i16, -1), resp.producer_epoch);
+    try testing.expect(broker.txn_coordinator.dirty);
+    try testing.expectEqual(@as(usize, 0), mock_s3.objectCount());
 }
 
 test "Broker restores topic configs from S3 cluster metadata log" {
