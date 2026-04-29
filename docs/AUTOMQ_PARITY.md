@@ -168,7 +168,10 @@ Status: completed for the initial catalog and DeleteGroups slice.
   and returns generated QuotaManager-backed per-client quota entries.
   AlterClientQuotas now advertises key 49 v0-v1, decodes generated
   legacy/flexible requests, validates quota entities and keys, supports
-  validate-only, and mutates/removes QuotaManager-backed client/default quotas.
+  validate-only, mutates/removes QuotaManager-backed client/default quotas,
+  writes full quota snapshots to `__cluster_metadata` for broker replacement
+  replay, and fails closed without leaving local quota state visible when the
+  shared snapshot write fails.
   DescribeUserScramCredentials now advertises key 50 v0, decodes generated
   flexible requests, rejects malformed frames, describes requested or all
   SCRAM-SHA-256 users, and reports missing users per result.
@@ -281,7 +284,11 @@ Status: completed for the initial catalog and DeleteGroups slice.
   round-trip, S3 WAL metadata rebuild plus fetch, and PartitionStore S3 WAL
   produce/rebuild/resume against MinIO/S3; OffsetCommit and TxnOffsetCommit now
   write versioned `__consumer_offsets` records before acknowledging and broker
-  open replays committed offsets from recovered S3 WAL objects; `test-s3-process-crash`
+  open replays committed offsets from recovered S3 WAL objects; client quota
+  configuration snapshots are now appended to `__cluster_metadata`, replayed
+  from recovered S3 WAL on fresh-dir broker replacement, and rolled back on
+  failed snapshot writes before AlterClientQuotas is acknowledged;
+  `test-s3-process-crash`
   adds a gated real broker-process kill/replacement harness against MinIO/S3 and
   now verifies both data and committed offsets after a fresh local data dir
   replacement. S3 request signing now omits default HTTP/HTTPS ports from the

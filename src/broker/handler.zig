@@ -50,6 +50,8 @@ const topic_snapshot_record_value_magic = "ZMQTP1";
 const topic_snapshot_record_key = "__zmq_topic_snapshot";
 const partition_reassignment_snapshot_record_value_magic = "ZMQPR1";
 const partition_reassignment_snapshot_record_key = "__zmq_partition_reassignment_snapshot";
+const client_quota_snapshot_record_value_magic = "ZMQCQ1";
+const client_quota_snapshot_record_key = "__zmq_client_quota_snapshot";
 const auto_mq_quorum_commit_timeout_ms: i64 = 5000;
 
 /// Stateful Kafka broker.
@@ -684,9 +686,10 @@ pub const Broker = struct {
         }
         const recovered_cluster_records = try self.restoreClusterMetadataFromLog();
         if (recovered_cluster_records.total() > 0) {
-            log.info("Restored cluster metadata from __cluster_metadata (topics={d}, reassignments={d})", .{
+            log.info("Restored cluster metadata from __cluster_metadata (topics={d}, reassignments={d}, client_quotas={d})", .{
                 recovered_cluster_records.topic_snapshots,
                 recovered_cluster_records.partition_reassignment_snapshots,
+                recovered_cluster_records.client_quota_snapshots,
             });
             self.persistence.saveTopics(&self.topics) catch |err| {
                 log.warn("Failed to persist replayed topic metadata: {}", .{err});
@@ -1697,6 +1700,10 @@ pub const Broker = struct {
         }
     }
 
+    fn writeSnapshotF64(writer: anytype, value: f64) !void {
+        try writer.writeInt(u64, @bitCast(value), .big);
+    }
+
     fn encodeConsumerGroupSnapshotRecordValue(self: *Broker) ![]u8 {
         var buf = std.array_list.Managed(u8).init(self.allocator);
         errdefer buf.deinit();
@@ -1778,6 +1785,10 @@ pub const Broker = struct {
         const out = std.mem.readInt(i64, value[pos.*..][0..8], .big);
         pos.* += 8;
         return out;
+    }
+
+    fn readSnapshotF64(value: []const u8, pos: *usize) !f64 {
+        return @bitCast(try readSnapshotU64(value, pos));
     }
 
     fn readSnapshotBytes(value: []const u8, pos: *usize) ![]const u8 {
@@ -2293,6 +2304,128 @@ pub const Broker = struct {
         try self.restorePartitionReassignments(entries);
     }
 
+    const ClientQuotaSnapshot = struct {
+        default_produce_rate: f64,
+        default_fetch_rate: f64,
+        default_request_rate: f64,
+        client_quotas: std.StringHashMap(QuotaManager.ClientQuota),
+    };
+
+    fn validClientQuotaRate(value: f64) bool {
+        return value >= 0 and value < std.math.inf(f64);
+    }
+
+    fn encodeClientQuotaSnapshotRecordValue(self: *Broker) ![]u8 {
+        var buf = std.array_list.Managed(u8).init(self.allocator);
+        errdefer buf.deinit();
+        const writer = @import("list_compat").writer(&buf);
+
+        try writer.writeAll(client_quota_snapshot_record_value_magic);
+        try writeSnapshotF64(writer, self.quota_manager.default_produce_rate);
+        try writeSnapshotF64(writer, self.quota_manager.default_fetch_rate);
+        try writeSnapshotF64(writer, self.quota_manager.default_request_rate);
+        try writer.writeInt(u32, @intCast(self.quota_manager.client_quotas.count()), .big);
+
+        var it = self.quota_manager.client_quotas.iterator();
+        while (it.next()) |entry| {
+            const quota = entry.value_ptr;
+            try writeSnapshotBytes(writer, quota.client_id);
+            try writeSnapshotF64(writer, quota.produce_rate_limit);
+            try writeSnapshotF64(writer, quota.fetch_rate_limit);
+            try writeSnapshotF64(writer, quota.request_rate_limit);
+        }
+
+        return buf.toOwnedSlice();
+    }
+
+    fn freeClientQuotaSnapshot(self: *Broker, snapshot: *ClientQuotaSnapshot) void {
+        var it = snapshot.client_quotas.iterator();
+        while (it.next()) |entry| {
+            self.allocator.free(entry.value_ptr.client_id);
+            self.allocator.free(entry.key_ptr.*);
+        }
+        snapshot.client_quotas.deinit();
+        snapshot.client_quotas = std.StringHashMap(QuotaManager.ClientQuota).init(self.allocator);
+    }
+
+    fn decodeClientQuotaSnapshotRecordValue(self: *Broker, value: []const u8) !ClientQuotaSnapshot {
+        if (value.len < client_quota_snapshot_record_value_magic.len + 28) return error.InvalidClientQuotaSnapshot;
+        if (!std.mem.eql(u8, value[0..client_quota_snapshot_record_value_magic.len], client_quota_snapshot_record_value_magic)) {
+            return error.InvalidClientQuotaSnapshot;
+        }
+
+        var pos: usize = client_quota_snapshot_record_value_magic.len;
+        const default_produce_rate = try readSnapshotF64(value, &pos);
+        const default_fetch_rate = try readSnapshotF64(value, &pos);
+        const default_request_rate = try readSnapshotF64(value, &pos);
+        if (!validClientQuotaRate(default_produce_rate) or
+            !validClientQuotaRate(default_fetch_rate) or
+            !validClientQuotaRate(default_request_rate))
+        {
+            return error.InvalidClientQuotaSnapshot;
+        }
+
+        const quota_count = try readSnapshotU32(value, &pos);
+        if (quota_count > 100_000) return error.InvalidClientQuotaSnapshot;
+
+        var snapshot = ClientQuotaSnapshot{
+            .default_produce_rate = default_produce_rate,
+            .default_fetch_rate = default_fetch_rate,
+            .default_request_rate = default_request_rate,
+            .client_quotas = std.StringHashMap(QuotaManager.ClientQuota).init(self.allocator),
+        };
+        errdefer self.freeClientQuotaSnapshot(&snapshot);
+
+        for (0..quota_count) |_| {
+            const client_key = try self.readSnapshotOwnedBytes(value, &pos);
+            var key_owned = true;
+            errdefer if (key_owned) self.allocator.free(client_key);
+
+            if (client_key.len == 0 or snapshot.client_quotas.contains(client_key)) {
+                return error.InvalidClientQuotaSnapshot;
+            }
+
+            const client_id = try self.allocator.dupe(u8, client_key);
+            var client_id_owned = true;
+            errdefer if (client_id_owned) self.allocator.free(client_id);
+
+            const produce_rate = try readSnapshotF64(value, &pos);
+            const fetch_rate = try readSnapshotF64(value, &pos);
+            const request_rate = try readSnapshotF64(value, &pos);
+            if (!validClientQuotaRate(produce_rate) or
+                !validClientQuotaRate(fetch_rate) or
+                !validClientQuotaRate(request_rate))
+            {
+                return error.InvalidClientQuotaSnapshot;
+            }
+
+            try snapshot.client_quotas.put(client_key, .{
+                .client_id = client_id,
+                .produce_rate_limit = produce_rate,
+                .fetch_rate_limit = fetch_rate,
+                .request_rate_limit = request_rate,
+            });
+            key_owned = false;
+            client_id_owned = false;
+        }
+
+        if (pos != value.len) return error.InvalidClientQuotaSnapshot;
+        return snapshot;
+    }
+
+    fn applyClientQuotaSnapshotRecord(self: *Broker, value: []const u8) !void {
+        const snapshot = try self.decodeClientQuotaSnapshotRecordValue(value);
+
+        self.quota_manager.deinit();
+        self.quota_manager = .{
+            .client_quotas = snapshot.client_quotas,
+            .default_produce_rate = snapshot.default_produce_rate,
+            .default_fetch_rate = snapshot.default_fetch_rate,
+            .default_request_rate = snapshot.default_request_rate,
+            .allocator = self.allocator,
+        };
+    }
+
     fn offsetCommitKeyParts(key: []const u8) ?struct { group_id: []const u8, topic: []const u8, partition: i32 } {
         var fields = std.mem.splitSequence(u8, key, ":");
         const group_id = fields.next() orelse return null;
@@ -2493,12 +2626,48 @@ pub const Broker = struct {
         self.persistPartitionStates();
     }
 
+    /// Write a full client quota snapshot to __cluster_metadata so broker
+    /// replacement does not acknowledge quota changes that only live in memory.
+    fn writeClientQuotaSnapshotRecord(self: *Broker) !void {
+        const info = self.topics.get("__cluster_metadata") orelse return;
+        if (info.num_partitions <= 0) return;
+
+        const value = try self.encodeClientQuotaSnapshotRecordValue();
+        defer self.allocator.free(value);
+
+        const rec_batch = protocol.record_batch;
+        const records = [_]rec_batch.Record{
+            .{
+                .offset_delta = 0,
+                .key = client_quota_snapshot_record_key,
+                .value = value,
+            },
+        };
+
+        const batch = try rec_batch.buildRecordBatch(
+            self.allocator,
+            0,
+            &records,
+            -1,
+            -1,
+            -1,
+            @import("time_compat").milliTimestamp(),
+            @import("time_compat").milliTimestamp(),
+            0,
+        );
+        defer self.allocator.free(batch);
+
+        _ = try self.store.produce("__cluster_metadata", 0, batch);
+        self.persistPartitionStates();
+    }
+
     const ClusterMetadataReplayCounts = struct {
         topic_snapshots: usize = 0,
         partition_reassignment_snapshots: usize = 0,
+        client_quota_snapshots: usize = 0,
 
         fn total(self: @This()) usize {
-            return self.topic_snapshots + self.partition_reassignment_snapshots;
+            return self.topic_snapshots + self.partition_reassignment_snapshots + self.client_quota_snapshots;
         }
     };
 
@@ -2506,6 +2675,7 @@ pub const Broker = struct {
         none,
         topic_snapshot,
         partition_reassignment_snapshot,
+        client_quota_snapshot,
     };
 
     fn restoreClusterMetadataFromLog(self: *Broker) !ClusterMetadataReplayCounts {
@@ -2520,6 +2690,7 @@ pub const Broker = struct {
             const partition_counts = try self.applyClusterMetadataRecordBatches(result.records);
             restored.topic_snapshots += partition_counts.topic_snapshots;
             restored.partition_reassignment_snapshots += partition_counts.partition_reassignment_snapshots;
+            restored.client_quota_snapshots += partition_counts.client_quota_snapshots;
         }
         return restored;
     }
@@ -2546,6 +2717,7 @@ pub const Broker = struct {
                         .none => {},
                         .topic_snapshot => restored.topic_snapshots += 1,
                         .partition_reassignment_snapshot => restored.partition_reassignment_snapshots += 1,
+                        .client_quota_snapshot => restored.client_quota_snapshots += 1,
                     }
                 }
             }
@@ -2564,6 +2736,10 @@ pub const Broker = struct {
         if (std.mem.eql(u8, key, partition_reassignment_snapshot_record_key)) {
             try self.restorePartitionReassignmentSnapshotRecord(value);
             return .partition_reassignment_snapshot;
+        }
+        if (std.mem.eql(u8, key, client_quota_snapshot_record_key)) {
+            try self.applyClientQuotaSnapshotRecord(value);
+            return .client_quota_snapshot;
         }
         return .none;
     }
@@ -10065,7 +10241,7 @@ pub const Broker = struct {
             };
 
             const value = if (op.remove) 0 else blk: {
-                if (!(op.value >= 0 and op.value < std.math.inf(f64))) {
+                if (!validClientQuotaRate(op.value)) {
                     return .{
                         .error_code = @intFromEnum(ErrorCode.invalid_config),
                         .error_message = "Invalid quota value",
@@ -10089,20 +10265,41 @@ pub const Broker = struct {
         }
 
         if (!validate_only) {
+            const previous_snapshot = try self.encodeClientQuotaSnapshotRecordValue();
+            defer self.allocator.free(previous_snapshot);
+
             switch (target) {
                 .default => self.quota_manager.setDefaults(producer_rate, consumer_rate, request_rate),
                 .client => |client_id| {
                     if (producer_rate <= 0 and consumer_rate <= 0 and request_rate <= 0) {
                         self.removeClientQuota(client_id);
                     } else {
-                        try self.quota_manager.setClientQuota(client_id, producer_rate, consumer_rate, request_rate);
+                        self.quota_manager.setClientQuota(client_id, producer_rate, consumer_rate, request_rate) catch |err| {
+                            self.restoreClientQuotasAfterFailedMutation(previous_snapshot);
+                            return err;
+                        };
                     }
                 },
                 .invalid => unreachable,
             }
+
+            self.writeClientQuotaSnapshotRecord() catch |err| {
+                log.warn("Failed to append client quota snapshot to __cluster_metadata: {}", .{err});
+                self.restoreClientQuotasAfterFailedMutation(previous_snapshot);
+                return .{
+                    .error_code = @intFromEnum(ErrorCode.kafka_storage_error),
+                    .error_message = "Failed to persist quota metadata",
+                };
+            };
         }
 
         return .{ .error_code = @intFromEnum(ErrorCode.none) };
+    }
+
+    fn restoreClientQuotasAfterFailedMutation(self: *Broker, snapshot_value: []const u8) void {
+        self.applyClientQuotaSnapshotRecord(snapshot_value) catch |restore_err| {
+            log.err("Failed to restore client quota snapshot after failed mutation: {}", .{restore_err});
+        };
     }
 
     fn resolveClientQuotaTarget(entry: generated.alter_client_quotas_request.AlterClientQuotasRequest.EntryData) ClientQuotaTarget {
@@ -18829,6 +19026,203 @@ test "Broker.handleRequest AlterClientQuotas honors validate_only" {
     try testing.expectEqual(response.?.len, rpos);
     try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.none)), resp.entries[0].error_code);
     try testing.expect(broker.quota_manager.client_quotas.get("validate-only-quota-client") == null);
+}
+
+test "Broker restores client quotas from S3 cluster metadata log" {
+    const AlterReq = generated.alter_client_quotas_request.AlterClientQuotasRequest;
+    const AlterResp = generated.alter_client_quotas_response.AlterClientQuotasResponse;
+
+    var mock_s3 = storage.MockS3.init(testing.allocator);
+    defer mock_s3.deinit();
+    const s3_storage = storage.S3Storage.initMock(testing.allocator, &mock_s3);
+
+    {
+        var broker = Broker.init(testing.allocator, 1, 9092);
+        defer broker.deinit();
+        broker.store.s3_wal_mode = true;
+        broker.store.s3_storage = s3_storage;
+        broker.store.s3_wal_batcher = storage.wal.S3WalBatcher.init(testing.allocator);
+
+        try broker.open();
+
+        const default_entity = [_]AlterReq.EntryData.EntityData{.{
+            .entity_type = "client-id",
+            .entity_name = null,
+        }};
+        const default_ops = [_]AlterReq.EntryData.OpData{
+            .{ .key = "producer_byte_rate", .value = 5000.0, .remove = false },
+            .{ .key = "request_percentage", .value = 25.0, .remove = false },
+        };
+        const client_entity = [_]AlterReq.EntryData.EntityData{.{
+            .entity_type = "client-id",
+            .entity_name = "quota-s3-client",
+        }};
+        const client_ops = [_]AlterReq.EntryData.OpData{
+            .{ .key = "producer_byte_rate", .value = 1234.0, .remove = false },
+            .{ .key = "consumer_byte_rate", .value = 4321.0, .remove = false },
+        };
+        const entries = [_]AlterReq.EntryData{
+            .{ .entity = &default_entity, .ops = &default_ops },
+            .{ .entity = &client_entity, .ops = &client_ops },
+        };
+        const alter_req = AlterReq{ .entries = &entries };
+
+        var buf: [1024]u8 = undefined;
+        var pos = buildTestRequest(&buf, 49, 1, 4904, header_mod.requestHeaderVersion(49, 1));
+        alter_req.serialize(&buf, &pos, 1);
+
+        const alter_response = broker.handleRequest(buf[0..pos]);
+        try testing.expect(alter_response != null);
+        defer testing.allocator.free(alter_response.?);
+
+        var rpos: usize = 0;
+        var alter_header = try ResponseHeader.deserialize(testing.allocator, alter_response.?, &rpos, header_mod.responseHeaderVersion(49, 1));
+        defer alter_header.deinit(testing.allocator);
+        try testing.expectEqual(@as(i32, 4904), alter_header.correlation_id);
+
+        const alter_resp = try AlterResp.deserialize(testing.allocator, alter_response.?, &rpos, 1);
+        defer freeDeserializedAlterClientQuotasResponse(&alter_resp);
+
+        try testing.expectEqual(alter_response.?.len, rpos);
+        try testing.expectEqual(@as(usize, 2), alter_resp.entries.len);
+        try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.none)), alter_resp.entries[0].error_code);
+        try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.none)), alter_resp.entries[1].error_code);
+        try testing.expect(mock_s3.objectCount() > 0);
+    }
+
+    {
+        var broker = Broker.init(testing.allocator, 1, 9092);
+        defer broker.deinit();
+        broker.store.s3_wal_mode = true;
+        broker.store.s3_storage = s3_storage;
+        broker.store.s3_wal_batcher = storage.wal.S3WalBatcher.init(testing.allocator);
+
+        try broker.open();
+
+        try testing.expectEqual(@as(f64, 5000.0), broker.quota_manager.default_produce_rate);
+        try testing.expectEqual(@as(f64, 0.0), broker.quota_manager.default_fetch_rate);
+        try testing.expectEqual(@as(f64, 25.0), broker.quota_manager.default_request_rate);
+        const quota = broker.quota_manager.client_quotas.get("quota-s3-client").?;
+        try testing.expectEqualStrings("quota-s3-client", quota.client_id);
+        try testing.expectEqual(@as(f64, 1234.0), quota.produce_rate_limit);
+        try testing.expectEqual(@as(f64, 4321.0), quota.fetch_rate_limit);
+        try testing.expectEqual(@as(f64, 0.0), quota.request_rate_limit);
+    }
+}
+
+test "Broker AlterClientQuotas fails closed when quota snapshot S3 WAL write fails" {
+    const Req = generated.alter_client_quotas_request.AlterClientQuotasRequest;
+    const Resp = generated.alter_client_quotas_response.AlterClientQuotasResponse;
+
+    var mock_s3 = storage.MockS3.init(testing.allocator);
+    defer mock_s3.deinit();
+    const s3_storage = storage.S3Storage.initMock(testing.allocator, &mock_s3);
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+    broker.store.s3_wal_mode = true;
+    broker.store.s3_storage = s3_storage;
+    broker.store.s3_wal_batcher = storage.wal.S3WalBatcher.init(testing.allocator);
+
+    try broker.open();
+    const object_count_before = mock_s3.objectCount();
+    mock_s3.failNextPutObjects(3);
+
+    const entity = [_]Req.EntryData.EntityData{.{
+        .entity_type = "client-id",
+        .entity_name = "quota-s3-fail-client",
+    }};
+    const ops = [_]Req.EntryData.OpData{.{
+        .key = "producer_byte_rate",
+        .value = 9999.0,
+        .remove = false,
+    }};
+    const entries = [_]Req.EntryData{.{
+        .entity = &entity,
+        .ops = &ops,
+    }};
+    const req = Req{ .entries = &entries };
+
+    var buf: [512]u8 = undefined;
+    var pos = buildTestRequest(&buf, 49, 1, 4905, header_mod.requestHeaderVersion(49, 1));
+    req.serialize(&buf, &pos, 1);
+
+    const response = broker.handleRequest(buf[0..pos]);
+    try testing.expect(response != null);
+    defer testing.allocator.free(response.?);
+
+    var rpos: usize = 0;
+    var response_header = try ResponseHeader.deserialize(testing.allocator, response.?, &rpos, header_mod.responseHeaderVersion(49, 1));
+    defer response_header.deinit(testing.allocator);
+    try testing.expectEqual(@as(i32, 4905), response_header.correlation_id);
+
+    const resp = try Resp.deserialize(testing.allocator, response.?, &rpos, 1);
+    defer freeDeserializedAlterClientQuotasResponse(&resp);
+
+    try testing.expectEqual(response.?.len, rpos);
+    try testing.expectEqual(@as(usize, 1), resp.entries.len);
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.kafka_storage_error)), resp.entries[0].error_code);
+    try testing.expect(resp.entries[0].error_message != null);
+    try testing.expect(broker.quota_manager.client_quotas.get("quota-s3-fail-client") == null);
+    try testing.expectEqual(@as(f64, 0.0), broker.quota_manager.default_produce_rate);
+    try testing.expectEqual(object_count_before, mock_s3.objectCount());
+}
+
+test "Broker AlterClientQuotas validate_only does not write quota snapshot" {
+    const Req = generated.alter_client_quotas_request.AlterClientQuotasRequest;
+    const Resp = generated.alter_client_quotas_response.AlterClientQuotasResponse;
+
+    var mock_s3 = storage.MockS3.init(testing.allocator);
+    defer mock_s3.deinit();
+    const s3_storage = storage.S3Storage.initMock(testing.allocator, &mock_s3);
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+    broker.store.s3_wal_mode = true;
+    broker.store.s3_storage = s3_storage;
+    broker.store.s3_wal_batcher = storage.wal.S3WalBatcher.init(testing.allocator);
+
+    try broker.open();
+    const object_count_before = mock_s3.objectCount();
+
+    const entity = [_]Req.EntryData.EntityData{.{
+        .entity_type = "client-id",
+        .entity_name = "quota-validate-only-s3",
+    }};
+    const ops = [_]Req.EntryData.OpData{.{
+        .key = "producer_byte_rate",
+        .value = 100.0,
+        .remove = false,
+    }};
+    const entries = [_]Req.EntryData{.{
+        .entity = &entity,
+        .ops = &ops,
+    }};
+    const req = Req{
+        .entries = &entries,
+        .validate_only = true,
+    };
+
+    var buf: [512]u8 = undefined;
+    var pos = buildTestRequest(&buf, 49, 1, 4906, header_mod.requestHeaderVersion(49, 1));
+    req.serialize(&buf, &pos, 1);
+
+    const response = broker.handleRequest(buf[0..pos]);
+    try testing.expect(response != null);
+    defer testing.allocator.free(response.?);
+
+    var rpos: usize = 0;
+    var response_header = try ResponseHeader.deserialize(testing.allocator, response.?, &rpos, header_mod.responseHeaderVersion(49, 1));
+    defer response_header.deinit(testing.allocator);
+    try testing.expectEqual(@as(i32, 4906), response_header.correlation_id);
+
+    const resp = try Resp.deserialize(testing.allocator, response.?, &rpos, 1);
+    defer freeDeserializedAlterClientQuotasResponse(&resp);
+
+    try testing.expectEqual(response.?.len, rpos);
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.none)), resp.entries[0].error_code);
+    try testing.expect(broker.quota_manager.client_quotas.get("quota-validate-only-s3") == null);
+    try testing.expectEqual(object_count_before, mock_s3.objectCount());
 }
 
 test "Broker.handleRequest AlterClientQuotas rejects unsupported quota key without mutation" {
