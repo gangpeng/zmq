@@ -9190,6 +9190,9 @@ pub const Broker = struct {
         var results = std.array_list.Managed(DeleteGroupsResponse.DeletableGroupResult).init(self.allocator);
         defer results.deinit();
 
+        const previous_snapshot = self.encodeConsumerGroupSnapshotRecordValue() catch return null;
+        defer self.allocator.free(previous_snapshot);
+
         var offsets_mutated = false;
         var groups_mutated = false;
         for (0..num_groups) |_| {
@@ -9221,6 +9224,7 @@ pub const Broker = struct {
         if (groups_mutated) {
             self.persistConsumerGroupsDurably() catch |err| {
                 log.warn("DeleteGroups consumer-group snapshot write failed: {}", .{err});
+                self.restoreConsumerGroupsAfterFailedMutation(previous_snapshot);
                 for (results.items) |*result| {
                     if (result.error_code == @intFromEnum(ErrorCode.none)) {
                         result.error_code = @intFromEnum(ErrorCode.kafka_storage_error);
@@ -17333,6 +17337,52 @@ test "Broker.handleRequest DeleteGroups preserves group when offset tombstone wr
     try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.kafka_storage_error)), resp.results[0].error_code);
     try testing.expect(broker.groups.groups.contains("delete-groups-s3-fail"));
     try testing.expectEqual(@as(?i64, 42), try broker.groups.fetchOffset("delete-groups-s3-fail", "delete-groups-s3-fail-topic", 0));
+    try testing.expectEqual(object_count_before, mock_s3.objectCount());
+}
+
+test "Broker.handleRequest DeleteGroups restores group when lifecycle snapshot S3 WAL write fails" {
+    const Req = generated.delete_groups_request.DeleteGroupsRequest;
+    const Resp = generated.delete_groups_response.DeleteGroupsResponse;
+
+    var mock_s3 = storage.MockS3.init(testing.allocator);
+    defer mock_s3.deinit();
+    const s3_storage = storage.S3Storage.initMock(testing.allocator, &mock_s3);
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+    broker.store.s3_wal_mode = true;
+    broker.store.s3_storage = s3_storage;
+    broker.store.s3_wal_batcher = storage.wal.S3WalBatcher.init(testing.allocator);
+
+    try broker.open();
+    const join = try broker.groups.joinGroup("delete-groups-snapshot-fail", null, "consumer", null);
+    try testing.expectEqual(@as(i16, 0), broker.groups.leaveGroup("delete-groups-snapshot-fail", join.member_id));
+
+    const object_count_before = mock_s3.objectCount();
+    mock_s3.failNextPutObjects(3);
+
+    const group_names = [_]?[]const u8{"delete-groups-snapshot-fail"};
+    const req = Req{ .groups_names = &group_names };
+
+    var buf: [256]u8 = undefined;
+    var pos = buildTestRequest(&buf, 42, 2, 4205, header_mod.requestHeaderVersion(42, 2));
+    req.serialize(&buf, &pos, 2);
+
+    const response = broker.handleRequest(buf[0..pos]);
+    try testing.expect(response != null);
+    defer testing.allocator.free(response.?);
+
+    var rpos: usize = 0;
+    var response_header = try ResponseHeader.deserialize(testing.allocator, response.?, &rpos, header_mod.responseHeaderVersion(42, 2));
+    defer response_header.deinit(testing.allocator);
+    try testing.expectEqual(@as(i32, 4205), response_header.correlation_id);
+
+    const resp = try Resp.deserialize(testing.allocator, response.?, &rpos, 2);
+    defer if (resp.results.len > 0) testing.allocator.free(resp.results);
+    try testing.expectEqual(response.?.len, rpos);
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.kafka_storage_error)), resp.results[0].error_code);
+    const group = broker.groups.groups.getPtr("delete-groups-snapshot-fail").?;
+    try testing.expectEqual(ConsumerGroup.GroupState.empty, group.state);
     try testing.expectEqual(object_count_before, mock_s3.objectCount());
 }
 
