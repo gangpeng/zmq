@@ -295,6 +295,63 @@ test "generated non-default golden fixtures cover legacy and flexible wire encod
     }
 
     {
+        const VoteResponse = generated.vote_response.VoteResponse;
+        const node_endpoints = [_]VoteResponse.NodeEndpoint{.{
+            .node_id = 7,
+            .host = "n1",
+            .port = 9092,
+        }};
+        const value = VoteResponse{
+            .error_code = 0,
+            .topics = &.{},
+            .node_endpoints = &node_endpoints,
+        };
+        try expectGoldenRoundTrip(VoteResponse, value, 1, &[_]u8{
+            0x00, 0x00, 0x01, 0x01, 0x00, 0x0b, 0x02, 0x00,
+            0x00, 0x00, 0x07, 0x03, 'n',  '1',  0x23, 0x84,
+            0x00,
+        });
+    }
+
+    {
+        const BeginQuorumEpochResponse = generated.begin_quorum_epoch_response.BeginQuorumEpochResponse;
+        const node_endpoints = [_]BeginQuorumEpochResponse.NodeEndpoint{.{
+            .node_id = 3,
+            .host = "bq",
+            .port = 9093,
+        }};
+        const value = BeginQuorumEpochResponse{
+            .error_code = 0,
+            .topics = &.{},
+            .node_endpoints = &node_endpoints,
+        };
+        try expectGoldenRoundTrip(BeginQuorumEpochResponse, value, 1, &[_]u8{
+            0x00, 0x00, 0x01, 0x01, 0x00, 0x0b, 0x02, 0x00,
+            0x00, 0x00, 0x03, 0x03, 'b',  'q',  0x23, 0x85,
+            0x00,
+        });
+    }
+
+    {
+        const EndQuorumEpochResponse = generated.end_quorum_epoch_response.EndQuorumEpochResponse;
+        const node_endpoints = [_]EndQuorumEpochResponse.NodeEndpoint{.{
+            .node_id = 4,
+            .host = "eq",
+            .port = 9094,
+        }};
+        const value = EndQuorumEpochResponse{
+            .error_code = 0,
+            .topics = &.{},
+            .node_endpoints = &node_endpoints,
+        };
+        try expectGoldenRoundTrip(EndQuorumEpochResponse, value, 1, &[_]u8{
+            0x00, 0x00, 0x01, 0x01, 0x00, 0x0b, 0x02, 0x00,
+            0x00, 0x00, 0x04, 0x03, 'e',  'q',  0x23, 0x86,
+            0x00,
+        });
+    }
+
+    {
         const ApiVersionsResponse = generated.api_versions_response.ApiVersionsResponse;
         const api_keys = [_]ApiVersionsResponse.ApiVersion{
             .{ .api_key = 0, .min_version = 0, .max_version = 11 },
@@ -433,6 +490,22 @@ test "generated non-default golden fixtures cover legacy and flexible wire encod
             0x00,
         });
     }
+}
+
+fn expectDuplicateNodeEndpointsTagRejected(comptime Message: type) !void {
+    const bytes = [_]u8{
+        0x00, 0x00, 0x01, 0x02,
+        0x00, 0x0b, 0x02, 0x00, 0x00, 0x00, 0x07, 0x03, 'n', '1', 0x23, 0x84, 0x00,
+        0x00, 0x0b, 0x02, 0x00, 0x00, 0x00, 0x07, 0x03, 'n', '1', 0x23, 0x84, 0x00,
+    };
+    var pos: usize = 0;
+    try testing.expectError(error.DuplicateTaggedField, Message.deserialize(testing.allocator, &bytes, &pos, 1));
+}
+
+test "generated KRaft quorum responses reject duplicate node endpoint tags" {
+    try expectDuplicateNodeEndpointsTagRejected(generated.vote_response.VoteResponse);
+    try expectDuplicateNodeEndpointsTagRejected(generated.begin_quorum_epoch_response.BeginQuorumEpochResponse);
+    try expectDuplicateNodeEndpointsTagRejected(generated.end_quorum_epoch_response.EndQuorumEpochResponse);
 }
 
 test "generated default messages round-trip across common protocol versions" {

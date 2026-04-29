@@ -79,6 +79,8 @@ pub const BeginQuorumEpochResponse = struct {
 
         pub fn deserialize(alloc: Allocator, buf: []const u8, pos: *usize, version: i16) !TopicData {
             var result = TopicData{};
+            errdefer if (result.partitions.len > 0) alloc.free(result.partitions);
+
             result.topic_name = if (version >= 1)
                 try ser.readCompactString(buf, pos)
             else
@@ -190,6 +192,9 @@ pub const BeginQuorumEpochResponse = struct {
     /// 
     /// Versions: 0+
     topics: []const TopicData = &.{},
+    /// Endpoints for all leaders enumerated in PartitionData.
+    /// Versions: 1+
+    node_endpoints: []const NodeEndpoint = &.{},
 
     pub fn serialize(self: *const BeginQuorumEpochResponse, buf: []u8, pos: *usize, version: i16) void {
         ser.writeI16(buf, pos, self.error_code);
@@ -201,11 +206,31 @@ pub const BeginQuorumEpochResponse = struct {
         for (self.topics) |item| {
             item.serialize(buf, pos, version);
         }
-        if (version >= 1) ser.writeEmptyTaggedFields(buf, pos);
+        if (version >= 1) {
+            const has_node_endpoints = self.node_endpoints.len > 0;
+            ser.writeUnsignedVarint(buf, pos, if (has_node_endpoints) 1 else 0);
+            if (has_node_endpoints) {
+                const tag_size = nodeEndpointsTagSize(self.node_endpoints, version);
+                ser.writeUnsignedVarint(buf, pos, 0);
+                ser.writeUnsignedVarint(buf, pos, tag_size);
+                ser.writeCompactArrayLen(buf, pos, self.node_endpoints.len);
+                for (self.node_endpoints) |item| {
+                    item.serialize(buf, pos, version);
+                }
+            }
+        }
     }
 
     pub fn deserialize(alloc: Allocator, buf: []const u8, pos: *usize, version: i16) !BeginQuorumEpochResponse {
         var result = BeginQuorumEpochResponse{};
+        errdefer {
+            for (result.topics) |topic| {
+                if (topic.partitions.len > 0) alloc.free(topic.partitions);
+            }
+            if (result.topics.len > 0) alloc.free(result.topics);
+            if (result.node_endpoints.len > 0) alloc.free(result.node_endpoints);
+        }
+
         result.error_code = ser.readI16(buf, pos);
         const topics_len: usize = if (version >= 1)
             (try ser.readCompactArrayLen(buf, pos)) orelse 0
@@ -218,7 +243,19 @@ pub const BeginQuorumEpochResponse = struct {
             }
             result.topics = topics_items;
         }
-        if (version >= 1) try ser.skipTaggedFields(buf, pos);
+        if (version >= 1) {
+            const tagged_fields = try ser.readTaggedFields(alloc, buf, pos);
+            defer if (tagged_fields.len > 0) alloc.free(tagged_fields);
+
+            var seen_node_endpoints = false;
+            for (tagged_fields) |field| {
+                if (field.tag == 0) {
+                    if (seen_node_endpoints) return error.DuplicateTaggedField;
+                    seen_node_endpoints = true;
+                    result.node_endpoints = try readNodeEndpointsTag(alloc, field.data, version);
+                }
+            }
+        }
         return result;
     }
 
@@ -233,7 +270,41 @@ pub const BeginQuorumEpochResponse = struct {
         for (self.topics) |item| {
             size += item.calcSize(version);
         }
-        if (version >= 1) size += 1;
+        if (version >= 1) {
+            const has_node_endpoints = self.node_endpoints.len > 0;
+            size += ser.unsignedVarintSize(if (has_node_endpoints) 1 else 0);
+            if (has_node_endpoints) {
+                const tag_size = nodeEndpointsTagSize(self.node_endpoints, version);
+                size += ser.unsignedVarintSize(0);
+                size += ser.unsignedVarintSize(tag_size);
+                size += tag_size;
+            }
+        }
         return size;
     }
 };
+
+fn nodeEndpointsTagSize(node_endpoints: []const BeginQuorumEpochResponse.NodeEndpoint, version: i16) usize {
+    var size = ser.unsignedVarintSize(node_endpoints.len + 1);
+    for (node_endpoints) |item| {
+        size += item.calcSize(version);
+    }
+    return size;
+}
+
+fn readNodeEndpointsTag(alloc: Allocator, data: []const u8, version: i16) ![]const BeginQuorumEpochResponse.NodeEndpoint {
+    var tag_pos: usize = 0;
+    const node_endpoints_len: usize = (try ser.readCompactArrayLen(data, &tag_pos)) orelse return error.InvalidTaggedField;
+    if (node_endpoints_len == 0) {
+        if (tag_pos != data.len) return error.InvalidTaggedField;
+        return &.{};
+    }
+
+    const node_endpoints = try alloc.alloc(BeginQuorumEpochResponse.NodeEndpoint, node_endpoints_len);
+    errdefer alloc.free(node_endpoints);
+    for (node_endpoints) |*item| {
+        item.* = try BeginQuorumEpochResponse.NodeEndpoint.deserialize(alloc, data, &tag_pos, version);
+    }
+    if (tag_pos != data.len) return error.InvalidTaggedField;
+    return node_endpoints;
+}
