@@ -16319,6 +16319,24 @@ fn buildTestRequest(buf: []u8, api_key: i16, api_version: i16, correlation_id: i
     return pos;
 }
 
+fn expectTxnControlRecordType(records: []const u8, expected: TxnCoordinator.ControlRecordType) !void {
+    const rec_batch = protocol.record_batch;
+    try testing.expect(records.len >= rec_batch.BATCH_HEADER_SIZE);
+
+    const header = try rec_batch.RecordBatchHeader.parse(records);
+    try testing.expect(header.isTransactional());
+    try testing.expect(header.isControlBatch());
+    try testing.expectEqual(@as(i32, 1), header.record_count);
+    try testing.expect(header.totalBatchSize() <= records.len);
+
+    var pos: usize = rec_batch.BATCH_HEADER_SIZE;
+    const record = try rec_batch.parseRecord(records[0..header.totalBatchSize()], &pos);
+    const key = record.key orelse return error.MissingControlRecordKey;
+    try testing.expectEqual(@as(usize, 4), key.len);
+    try testing.expectEqual(@as(i16, 0), std.mem.readInt(i16, key[0..2], .big));
+    try testing.expectEqual(@as(i16, @intFromEnum(expected)), std.mem.readInt(i16, key[2..4], .big));
+}
+
 fn freeDeserializedListTransactionsResponse(resp: *const generated.list_transactions_response.ListTransactionsResponse) void {
     if (resp.unknown_state_filters.len > 0) testing.allocator.free(resp.unknown_state_filters);
     if (resp.transaction_states.len > 0) testing.allocator.free(resp.transaction_states);
@@ -23555,7 +23573,7 @@ test "Broker restores atomic WriteTxnMarkers S3 WAL state after stateless replac
         const fetched = try broker.store.fetch(topic_name, 0, 0, 1024);
         defer if (fetched.records.len > 0) testing.allocator.free(@constCast(fetched.records));
         try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.none)), fetched.error_code);
-        try testing.expect(fetched.records.len > 0);
+        try expectTxnControlRecordType(fetched.records, .commit);
     }
 }
 
@@ -23656,7 +23674,7 @@ test "Broker restores atomic WriteTxnMarkers abort S3 WAL state after stateless 
         const fetched = try broker.store.fetch(topic_name, 0, 0, 1024);
         defer if (fetched.records.len > 0) testing.allocator.free(@constCast(fetched.records));
         try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.none)), fetched.error_code);
-        try testing.expect(fetched.records.len > 0);
+        try expectTxnControlRecordType(fetched.records, .abort);
     }
 }
 
@@ -23741,7 +23759,7 @@ test "Broker restores atomic EndTxn S3 WAL state after stateless replacement" {
         const fetched = try broker.store.fetch(topic_name, 0, 0, 1024);
         defer if (fetched.records.len > 0) testing.allocator.free(@constCast(fetched.records));
         try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.none)), fetched.error_code);
-        try testing.expect(fetched.records.len > 0);
+        try expectTxnControlRecordType(fetched.records, .commit);
     }
 }
 
@@ -23826,7 +23844,7 @@ test "Broker restores atomic EndTxn abort S3 WAL state after stateless replaceme
         const fetched = try broker.store.fetch(topic_name, 0, 0, 1024);
         defer if (fetched.records.len > 0) testing.allocator.free(@constCast(fetched.records));
         try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.none)), fetched.error_code);
-        try testing.expect(fetched.records.len > 0);
+        try expectTxnControlRecordType(fetched.records, .abort);
     }
 }
 
