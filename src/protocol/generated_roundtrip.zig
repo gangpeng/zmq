@@ -339,6 +339,130 @@ test "generated non-default golden fixtures cover legacy and flexible wire encod
     }
 
     {
+        const LeaderAndIsrRequest = generated.leader_and_isr_request.LeaderAndIsrRequest;
+        const partitions = [_]generated.leader_and_isr_request.LeaderAndIsrPartitionState{.{
+            .topic_name = "topic-a",
+            .partition_index = 2,
+            .controller_epoch = 3,
+            .leader = 1,
+            .leader_epoch = 5,
+            .isr = &[_]i32{ 1, 2 },
+            .partition_epoch = 6,
+            .replicas = &[_]i32{ 1, 2, 3 },
+            .is_new = true,
+        }};
+        const live_leaders = [_]LeaderAndIsrRequest.LeaderAndIsrLiveLeader{.{
+            .broker_id = 1,
+            .host_name = "b1",
+            .port = 9092,
+        }};
+        const value = LeaderAndIsrRequest{
+            .controller_id = 7,
+            .controller_epoch = 3,
+            .ungrouped_partition_states = &partitions,
+            .live_leaders = &live_leaders,
+        };
+        try expectGoldenRoundTrip(LeaderAndIsrRequest, value, 1, &[_]u8{
+            0x00, 0x00, 0x00, 0x07,
+            0x00, 0x00, 0x00, 0x03,
+            0x00, 0x00, 0x00, 0x01,
+            0x00, 0x07, 't',  'o',
+            'p',  'i',  'c',  '-',
+            'a',  0x00, 0x00, 0x00,
+            0x02, 0x00, 0x00, 0x00,
+            0x03, 0x00, 0x00, 0x00,
+            0x01, 0x00, 0x00, 0x00,
+            0x05, 0x00, 0x00, 0x00,
+            0x02, 0x00, 0x00, 0x00,
+            0x01, 0x00, 0x00, 0x00,
+            0x02, 0x00, 0x00, 0x00,
+            0x06, 0x00, 0x00, 0x00,
+            0x03, 0x00, 0x00, 0x00,
+            0x01, 0x00, 0x00, 0x00,
+            0x02, 0x00, 0x00, 0x00,
+            0x03, 0x01, 0x00, 0x00,
+            0x00, 0x01, 0x00, 0x00,
+            0x00, 0x01, 0x00, 0x02,
+            'b',  '1',  0x00, 0x00,
+            0x23, 0x84,
+        });
+    }
+
+    {
+        const LeaderAndIsrRequest = generated.leader_and_isr_request.LeaderAndIsrRequest;
+        const topic_id = [_]u8{
+            0x00, 0x01, 0x02, 0x03,
+            0x04, 0x05, 0x06, 0x07,
+            0x08, 0x09, 0x0a, 0x0b,
+            0x0c, 0x0d, 0x0e, 0x0f,
+        };
+        const partitions = [_]generated.leader_and_isr_request.LeaderAndIsrPartitionState{.{
+            .topic_name = "legacy-name",
+            .partition_index = 2,
+            .controller_epoch = 3,
+            .leader = 1,
+            .leader_epoch = 5,
+            .isr = &[_]i32{ 1, 2 },
+            .partition_epoch = 6,
+            .replicas = &[_]i32{ 1, 2, 3 },
+            .adding_replicas = &[_]i32{4},
+            .removing_replicas = &[_]i32{5},
+            .is_new = true,
+            .leader_recovery_state = 1,
+        }};
+        const topics = [_]LeaderAndIsrRequest.LeaderAndIsrTopicState{.{
+            .topic_name = "topic-b",
+            .topic_id = topic_id,
+            .partition_states = &partitions,
+        }};
+        const live_leaders = [_]LeaderAndIsrRequest.LeaderAndIsrLiveLeader{.{
+            .broker_id = 1,
+            .host_name = "b1",
+            .port = 9092,
+        }};
+        const value = LeaderAndIsrRequest{
+            .controller_id = 7,
+            .controller_epoch = 3,
+            .broker_epoch = 9,
+            .type = 1,
+            .ungrouped_partition_states = &partitions,
+            .topic_states = &topics,
+            .live_leaders = &live_leaders,
+        };
+        try expectGoldenRoundTrip(LeaderAndIsrRequest, value, 6, &[_]u8{
+            0x00, 0x00, 0x00, 0x07,
+            0x00, 0x00, 0x00, 0x03,
+            0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x09,
+            0x01, 0x02, 0x08, 't',
+            'o',  'p',  'i',  'c',
+            '-',  'b',  0x00, 0x01,
+            0x02, 0x03, 0x04, 0x05,
+            0x06, 0x07, 0x08, 0x09,
+            0x0a, 0x0b, 0x0c, 0x0d,
+            0x0e, 0x0f, 0x02, 0x00,
+            0x00, 0x00, 0x02, 0x00,
+            0x00, 0x00, 0x03, 0x00,
+            0x00, 0x00, 0x01, 0x00,
+            0x00, 0x00, 0x05, 0x03,
+            0x00, 0x00, 0x00, 0x01,
+            0x00, 0x00, 0x00, 0x02,
+            0x00, 0x00, 0x00, 0x06,
+            0x04, 0x00, 0x00, 0x00,
+            0x01, 0x00, 0x00, 0x00,
+            0x02, 0x00, 0x00, 0x00,
+            0x03, 0x02, 0x00, 0x00,
+            0x00, 0x04, 0x02, 0x00,
+            0x00, 0x00, 0x05, 0x01,
+            0x01, 0x00, 0x00, 0x02,
+            0x00, 0x00, 0x00, 0x01,
+            0x03, 'b',  '1',  0x00,
+            0x00, 0x23, 0x84, 0x00,
+            0x00,
+        });
+    }
+
+    {
         const ProduceRequest = generated.produce_request.ProduceRequest;
         const partitions = [_]ProduceRequest.TopicProduceData.PartitionProduceData{
             .{ .index = 2, .records = &[_]u8{ 0x01, 0x02, 0x03 } },

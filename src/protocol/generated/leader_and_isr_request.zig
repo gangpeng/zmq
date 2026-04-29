@@ -47,9 +47,7 @@ pub const LeaderAndIsrPartitionState = struct {
     leader_recovery_state: i8 = 0,
 
     pub fn serialize(self: *const LeaderAndIsrPartitionState, buf: []u8, pos: *usize, version: i16) void {
-        if (version >= 4) {
-            ser.writeCompactString(buf, pos, self.topic_name);
-        } else {
+        if (version <= 1) {
             ser.writeString(buf, pos, self.topic_name);
         }
         ser.writeI32(buf, pos, self.partition_index);
@@ -104,10 +102,9 @@ pub const LeaderAndIsrPartitionState = struct {
 
     pub fn deserialize(alloc: Allocator, buf: []const u8, pos: *usize, version: i16) !LeaderAndIsrPartitionState {
         var result = LeaderAndIsrPartitionState{};
-        result.topic_name = if (version >= 4)
-            try ser.readCompactString(buf, pos)
-        else
-            try ser.readString(buf, pos);
+        if (version <= 1) {
+            result.topic_name = try ser.readString(buf, pos);
+        }
         result.partition_index = ser.readI32(buf, pos);
         result.controller_epoch = ser.readI32(buf, pos);
         result.leader = ser.readI32(buf, pos);
@@ -173,9 +170,7 @@ pub const LeaderAndIsrPartitionState = struct {
 
     pub fn calcSize(self: *const LeaderAndIsrPartitionState, version: i16) usize {
         var size: usize = 0;
-        if (version >= 4) {
-            size += ser.compactStringSize(self.topic_name);
-        } else {
+        if (version <= 1) {
             size += ser.stringSize(self.topic_name);
         }
         size += 4;
@@ -398,13 +393,11 @@ pub const LeaderAndIsrRequest = struct {
         if (version >= 5) {
             ser.writeI8(buf, pos, self.type);
         }
-        if (version >= 4) {
-            ser.writeCompactArrayLen(buf, pos, self.ungrouped_partition_states.len);
-        } else {
+        if (version <= 1) {
             ser.writeArrayLen(buf, pos, self.ungrouped_partition_states.len);
-        }
-        for (self.ungrouped_partition_states) |item| {
-            item.serialize(buf, pos, version);
+            for (self.ungrouped_partition_states) |item| {
+                item.serialize(buf, pos, version);
+            }
         }
         if (version >= 2) {
             if (version >= 4) {
@@ -440,16 +433,15 @@ pub const LeaderAndIsrRequest = struct {
         if (version >= 5) {
             result.type = ser.readI8(buf, pos);
         }
-        const ungrouped_partition_states_len: usize = if (version >= 4)
-            (try ser.readCompactArrayLen(buf, pos)) orelse 0
-        else
-            (try ser.readArrayLen(buf, pos)) orelse 0;
-        if (ungrouped_partition_states_len > 0) {
-            const ungrouped_partition_states_items = try alloc.alloc(LeaderAndIsrPartitionState, ungrouped_partition_states_len);
-            for (ungrouped_partition_states_items) |*item| {
-                item.* = try LeaderAndIsrPartitionState.deserialize(alloc, buf, pos, version);
+        if (version <= 1) {
+            const ungrouped_partition_states_len: usize = (try ser.readArrayLen(buf, pos)) orelse 0;
+            if (ungrouped_partition_states_len > 0) {
+                const ungrouped_partition_states_items = try alloc.alloc(LeaderAndIsrPartitionState, ungrouped_partition_states_len);
+                for (ungrouped_partition_states_items) |*item| {
+                    item.* = try LeaderAndIsrPartitionState.deserialize(alloc, buf, pos, version);
+                }
+                result.ungrouped_partition_states = ungrouped_partition_states_items;
             }
-            result.ungrouped_partition_states = ungrouped_partition_states_items;
         }
         if (version >= 2) {
             const topic_states_len: usize = if (version >= 4)
@@ -492,13 +484,11 @@ pub const LeaderAndIsrRequest = struct {
         if (version >= 5) {
             size += 1;
         }
-        if (version >= 4) {
-            size += ser.unsignedVarintSize(self.ungrouped_partition_states.len + 1);
-        } else {
+        if (version <= 1) {
             size += 4;
-        }
-        for (self.ungrouped_partition_states) |item| {
-            size += item.calcSize(version);
+            for (self.ungrouped_partition_states) |item| {
+                size += item.calcSize(version);
+            }
         }
         if (version >= 2) {
             if (version >= 4) {

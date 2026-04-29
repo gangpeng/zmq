@@ -208,6 +208,8 @@ Status: completed for the initial catalog and DeleteGroups slice.
   grouped `Topics`, and v3+ `TopicStates` have non-default golden fixtures.
   AlterPartitionRequest generated encoding now honors v0-v1 topic-name fields,
   v2+ topic IDs, and the v3 switch from `NewIsr` to `NewIsrWithEpochs`.
+  LeaderAndIsrRequest generated encoding now honors v0-v1 ungrouped partition
+  states and omits per-partition topic names from v2+ grouped-topic frames.
 
 ### Phase 2: AutoMQ S3Stream APIs
 
