@@ -629,6 +629,25 @@ test "generated non-default golden fixtures cover legacy and flexible wire encod
             0x28, 0x00,
         });
     }
+
+    {
+        const UpdateMetadataRequest = generated.update_metadata_request.UpdateMetadataRequest;
+        const value = UpdateMetadataRequest{
+            .controller_id = 2,
+            .is_k_raft_controller = true,
+            .metadata_type = 2,
+            .controller_epoch = 7,
+            .broker_epoch = 9,
+        };
+        try expectGoldenRoundTrip(UpdateMetadataRequest, value, 8, &[_]u8{
+            0x00, 0x00, 0x00, 0x02,
+            0x01, 0x00, 0x00, 0x00,
+            0x07, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00,
+            0x09, 0x01, 0x01, 0x01,
+            0x01, 0x00, 0x01, 0x02,
+        });
+    }
 }
 
 fn expectDuplicateNodeEndpointsTagRejected(comptime Message: type) !void {
@@ -804,6 +823,30 @@ test "generated CreateTopicsResponse rejects duplicate topic config error tags" 
     try testing.expectError(
         error.DuplicateTaggedField,
         generated.create_topics_response.CreateTopicsResponse.deserialize(testing.allocator, duplicate_topic_config_error[0..pos], &read_pos, 5),
+    );
+}
+
+test "generated UpdateMetadataRequest rejects duplicate metadata type tags" {
+    var duplicate_metadata_type: [128]u8 = undefined;
+    var pos: usize = 0;
+    ser.writeI32(&duplicate_metadata_type, &pos, 2); // controller_id
+    ser.writeBool(&duplicate_metadata_type, &pos, true); // is_k_raft_controller
+    ser.writeI32(&duplicate_metadata_type, &pos, 7); // controller_epoch
+    ser.writeI64(&duplicate_metadata_type, &pos, 9); // broker_epoch
+    ser.writeCompactArrayLen(&duplicate_metadata_type, &pos, 0); // ungrouped_partition_states
+    ser.writeCompactArrayLen(&duplicate_metadata_type, &pos, 0); // topic_states
+    ser.writeCompactArrayLen(&duplicate_metadata_type, &pos, 0); // live_brokers
+    ser.writeUnsignedVarint(&duplicate_metadata_type, &pos, 2);
+    inline for (0..2) |_| {
+        ser.writeUnsignedVarint(&duplicate_metadata_type, &pos, 0);
+        ser.writeUnsignedVarint(&duplicate_metadata_type, &pos, 1);
+        ser.writeI8(&duplicate_metadata_type, &pos, 2);
+    }
+
+    var read_pos: usize = 0;
+    try testing.expectError(
+        error.DuplicateTaggedField,
+        generated.update_metadata_request.UpdateMetadataRequest.deserialize(testing.allocator, duplicate_metadata_type[0..pos], &read_pos, 8),
     );
 }
 

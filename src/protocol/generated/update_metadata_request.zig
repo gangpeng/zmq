@@ -457,6 +457,9 @@ pub const UpdateMetadataRequest = struct {
     /// If KRaft controller id is used during migration. See KIP-866
     /// Versions: 8+
     is_k_raft_controller: bool = false,
+    /// Indicates if this request is a Full metadata snapshot (2), Incremental (1), or Unknown (0).
+    /// Versions: 8+
+    metadata_type: i8 = 0,
     /// The controller epoch.
     /// Versions: 0+
     controller_epoch: i32 = 0,
@@ -469,7 +472,7 @@ pub const UpdateMetadataRequest = struct {
     /// In newer versions of this RPC, each topic that we would like to update.
     /// Versions: 5+
     topic_states: []const UpdateMetadataTopicState = &.{},
-    /// 
+    ///
     /// Versions: 0+
     live_brokers: []const UpdateMetadataBroker = &.{},
 
@@ -508,7 +511,15 @@ pub const UpdateMetadataRequest = struct {
         for (self.live_brokers) |item| {
             item.serialize(buf, pos, version);
         }
-        if (version >= 6) ser.writeEmptyTaggedFields(buf, pos);
+        const has_metadata_type = version >= 8 and self.metadata_type != 0;
+        if (version >= 6) {
+            ser.writeUnsignedVarint(buf, pos, if (has_metadata_type) 1 else 0);
+            if (has_metadata_type) {
+                ser.writeUnsignedVarint(buf, pos, 0);
+                ser.writeUnsignedVarint(buf, pos, 1);
+                ser.writeI8(buf, pos, self.metadata_type);
+            }
+        }
     }
 
     pub fn deserialize(alloc: Allocator, buf: []const u8, pos: *usize, version: i16) !UpdateMetadataRequest {
@@ -556,7 +567,23 @@ pub const UpdateMetadataRequest = struct {
             }
             result.live_brokers = live_brokers_items;
         }
-        if (version >= 6) try ser.skipTaggedFields(buf, pos);
+        if (version >= 6) {
+            const tagged_fields = try ser.readTaggedFields(alloc, buf, pos);
+            defer if (tagged_fields.len > 0) alloc.free(tagged_fields);
+
+            var seen_metadata_type = false;
+            for (tagged_fields) |field| {
+                if (field.tag == 0 and version >= 8) {
+                    if (seen_metadata_type) return error.DuplicateTaggedField;
+                    seen_metadata_type = true;
+                    if (field.data.len != 1) return error.InvalidTaggedField;
+
+                    var tag_pos: usize = 0;
+                    result.metadata_type = ser.readI8(field.data, &tag_pos);
+                    if (tag_pos != field.data.len) return error.InvalidTaggedField;
+                }
+            }
+        }
         return result;
     }
 
@@ -596,7 +623,15 @@ pub const UpdateMetadataRequest = struct {
         for (self.live_brokers) |item| {
             size += item.calcSize(version);
         }
-        if (version >= 6) size += 1;
+        const has_metadata_type = version >= 8 and self.metadata_type != 0;
+        if (version >= 6) {
+            size += ser.unsignedVarintSize(if (has_metadata_type) 1 else 0);
+            if (has_metadata_type) {
+                size += ser.unsignedVarintSize(0);
+                size += ser.unsignedVarintSize(1);
+                size += 1;
+            }
+        }
         return size;
     }
 };
