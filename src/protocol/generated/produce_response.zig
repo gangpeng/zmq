@@ -106,6 +106,10 @@ pub const ProduceResponse = struct {
                     if (version >= 9) size += 1;
                     return size;
                 }
+
+                pub fn isDefault(self: *const LeaderIdAndEpoch) bool {
+                    return self.leader_id == -1 and self.leader_epoch == -1;
+                }
             };
 
             /// The partition index.
@@ -129,6 +133,9 @@ pub const ProduceResponse = struct {
             /// The global error message summarizing the common root cause of the records that caused the batch to be dropped
             /// Versions: 8+
             error_message: ?[]const u8 = null,
+            /// The leader ID and epoch to use after NOT_LEADER_OR_FOLLOWER errors.
+            /// Versions: 10+
+            current_leader: LeaderIdAndEpoch = .{},
 
             pub fn serialize(self: *const PartitionProduceResponse, buf: []u8, pos: *usize, version: i16) void {
                 ser.writeI32(buf, pos, self.index);
@@ -157,11 +164,22 @@ pub const ProduceResponse = struct {
                         ser.writeString(buf, pos, self.error_message);
                     }
                 }
-                if (version >= 9) ser.writeEmptyTaggedFields(buf, pos);
+                if (version >= 9) {
+                    const has_current_leader = version >= 10 and !self.current_leader.isDefault();
+                    ser.writeUnsignedVarint(buf, pos, if (has_current_leader) 1 else 0);
+                    if (has_current_leader) {
+                        const tag_size = self.current_leader.calcSize(version);
+                        ser.writeUnsignedVarint(buf, pos, 0);
+                        ser.writeUnsignedVarint(buf, pos, tag_size);
+                        self.current_leader.serialize(buf, pos, version);
+                    }
+                }
             }
 
             pub fn deserialize(alloc: Allocator, buf: []const u8, pos: *usize, version: i16) !PartitionProduceResponse {
                 var result = PartitionProduceResponse{};
+                errdefer if (result.record_errors.len > 0) alloc.free(result.record_errors);
+
                 result.index = ser.readI32(buf, pos);
                 result.error_code = ser.readI16(buf, pos);
                 result.base_offset = ser.readI64(buf, pos);
@@ -190,7 +208,22 @@ pub const ProduceResponse = struct {
                     else
                         try ser.readString(buf, pos);
                 }
-                if (version >= 9) try ser.skipTaggedFields(buf, pos);
+                if (version >= 9) {
+                    const tagged_fields = try ser.readTaggedFields(alloc, buf, pos);
+                    defer if (tagged_fields.len > 0) alloc.free(tagged_fields);
+
+                    var seen_current_leader = false;
+                    for (tagged_fields) |field| {
+                        if (field.tag == 0 and version >= 10) {
+                            if (seen_current_leader) return error.DuplicateTaggedField;
+                            seen_current_leader = true;
+
+                            var tag_pos: usize = 0;
+                            result.current_leader = try LeaderIdAndEpoch.deserialize(alloc, field.data, &tag_pos, version);
+                            if (tag_pos != field.data.len) return error.InvalidTaggedField;
+                        }
+                    }
+                }
                 return result;
             }
 
@@ -222,7 +255,16 @@ pub const ProduceResponse = struct {
                         size += ser.stringSize(self.error_message);
                     }
                 }
-                if (version >= 9) size += 1;
+                if (version >= 9) {
+                    const has_current_leader = version >= 10 and !self.current_leader.isDefault();
+                    size += ser.unsignedVarintSize(if (has_current_leader) 1 else 0);
+                    if (has_current_leader) {
+                        const tag_size = self.current_leader.calcSize(version);
+                        size += ser.unsignedVarintSize(0);
+                        size += ser.unsignedVarintSize(tag_size);
+                        size += tag_size;
+                    }
+                }
                 return size;
             }
         };
@@ -387,6 +429,9 @@ pub const ProduceResponse = struct {
     /// The duration in milliseconds for which the request was throttled due to a quota violation, or zero if the request did not violate any quota.
     /// Versions: 1+
     throttle_time_ms: i32 = 0,
+    /// Endpoints for current leaders enumerated in partition responses.
+    /// Versions: 10+
+    node_endpoints: []const NodeEndpoint = &.{},
 
     pub fn serialize(self: *const ProduceResponse, buf: []u8, pos: *usize, version: i16) void {
         if (version >= 9) {
@@ -400,11 +445,34 @@ pub const ProduceResponse = struct {
         if (version >= 1) {
             ser.writeI32(buf, pos, self.throttle_time_ms);
         }
-        if (version >= 9) ser.writeEmptyTaggedFields(buf, pos);
+        if (version >= 9) {
+            const has_node_endpoints = version >= 10 and self.node_endpoints.len > 0;
+            ser.writeUnsignedVarint(buf, pos, if (has_node_endpoints) 1 else 0);
+            if (has_node_endpoints) {
+                const tag_size = nodeEndpointsTagSize(self.node_endpoints, version);
+                ser.writeUnsignedVarint(buf, pos, 0);
+                ser.writeUnsignedVarint(buf, pos, tag_size);
+                ser.writeCompactArrayLen(buf, pos, self.node_endpoints.len);
+                for (self.node_endpoints) |item| {
+                    item.serialize(buf, pos, version);
+                }
+            }
+        }
     }
 
     pub fn deserialize(alloc: Allocator, buf: []const u8, pos: *usize, version: i16) !ProduceResponse {
         var result = ProduceResponse{};
+        errdefer {
+            for (result.responses) |topic| {
+                for (topic.partition_responses) |partition| {
+                    if (partition.record_errors.len > 0) alloc.free(partition.record_errors);
+                }
+                if (topic.partition_responses.len > 0) alloc.free(topic.partition_responses);
+            }
+            if (result.responses.len > 0) alloc.free(result.responses);
+            if (result.node_endpoints.len > 0) alloc.free(result.node_endpoints);
+        }
+
         const responses_len: usize = if (version >= 9)
             (try ser.readCompactArrayLen(buf, pos)) orelse 0
         else
@@ -419,7 +487,19 @@ pub const ProduceResponse = struct {
         if (version >= 1) {
             result.throttle_time_ms = ser.readI32(buf, pos);
         }
-        if (version >= 9) try ser.skipTaggedFields(buf, pos);
+        if (version >= 9) {
+            const tagged_fields = try ser.readTaggedFields(alloc, buf, pos);
+            defer if (tagged_fields.len > 0) alloc.free(tagged_fields);
+
+            var seen_node_endpoints = false;
+            for (tagged_fields) |field| {
+                if (field.tag == 0 and version >= 10) {
+                    if (seen_node_endpoints) return error.DuplicateTaggedField;
+                    seen_node_endpoints = true;
+                    result.node_endpoints = try readNodeEndpointsTag(alloc, field.data, version);
+                }
+            }
+        }
         return result;
     }
 
@@ -436,7 +516,41 @@ pub const ProduceResponse = struct {
         if (version >= 1) {
             size += 4;
         }
-        if (version >= 9) size += 1;
+        if (version >= 9) {
+            const has_node_endpoints = version >= 10 and self.node_endpoints.len > 0;
+            size += ser.unsignedVarintSize(if (has_node_endpoints) 1 else 0);
+            if (has_node_endpoints) {
+                const tag_size = nodeEndpointsTagSize(self.node_endpoints, version);
+                size += ser.unsignedVarintSize(0);
+                size += ser.unsignedVarintSize(tag_size);
+                size += tag_size;
+            }
+        }
         return size;
     }
 };
+
+fn nodeEndpointsTagSize(node_endpoints: []const ProduceResponse.NodeEndpoint, version: i16) usize {
+    var size = ser.unsignedVarintSize(node_endpoints.len + 1);
+    for (node_endpoints) |item| {
+        size += item.calcSize(version);
+    }
+    return size;
+}
+
+fn readNodeEndpointsTag(alloc: Allocator, data: []const u8, version: i16) ![]const ProduceResponse.NodeEndpoint {
+    var tag_pos: usize = 0;
+    const node_endpoints_len: usize = (try ser.readCompactArrayLen(data, &tag_pos)) orelse return error.InvalidTaggedField;
+    if (node_endpoints_len == 0) {
+        if (tag_pos != data.len) return error.InvalidTaggedField;
+        return &.{};
+    }
+
+    const node_endpoints = try alloc.alloc(ProduceResponse.NodeEndpoint, node_endpoints_len);
+    errdefer alloc.free(node_endpoints);
+    for (node_endpoints) |*item| {
+        item.* = try ProduceResponse.NodeEndpoint.deserialize(alloc, data, &tag_pos, version);
+    }
+    if (tag_pos != data.len) return error.InvalidTaggedField;
+    return node_endpoints;
+}

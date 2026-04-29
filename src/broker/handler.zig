@@ -16555,6 +16555,7 @@ fn freeDeserializedProduceResponse(resp: *const generated.produce_response.Produ
         }
         if (topic.partition_responses.len > 0) testing.allocator.free(topic.partition_responses);
     }
+    if (resp.node_endpoints.len > 0) testing.allocator.free(resp.node_endpoints);
     if (resp.responses.len > 0) testing.allocator.free(resp.responses);
 }
 

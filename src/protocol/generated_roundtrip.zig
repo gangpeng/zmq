@@ -196,6 +196,47 @@ test "generated non-default golden fixtures cover legacy and flexible wire encod
     }
 
     {
+        const ProduceResponse = generated.produce_response.ProduceResponse;
+        const PartitionResponse = ProduceResponse.TopicProduceResponse.PartitionProduceResponse;
+        const topic_partitions = [_]PartitionResponse{.{
+            .index = 1,
+            .error_code = 6,
+            .base_offset = -1,
+            .log_append_time_ms = -1,
+            .log_start_offset = -1,
+            .current_leader = .{ .leader_id = 7, .leader_epoch = 3 },
+        }};
+        const topics = [_]ProduceResponse.TopicProduceResponse{.{
+            .name = "topic-a",
+            .partition_responses = &topic_partitions,
+        }};
+        const node_endpoints = [_]ProduceResponse.NodeEndpoint{.{
+            .node_id = 7,
+            .host = "broker-7",
+            .port = 9092,
+            .rack = "az-a",
+        }};
+        const value = ProduceResponse{
+            .responses = &topics,
+            .throttle_time_ms = 5,
+            .node_endpoints = &node_endpoints,
+        };
+        try expectGoldenRoundTrip(ProduceResponse, value, 10, &[_]u8{
+            0x02, 0x08, 't',  'o',  'p',  'i',  'c',  '-',
+            'a',  0x02, 0x00, 0x00, 0x00, 0x01, 0x00, 0x06,
+            0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+            0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+            0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+            0x01, 0x00, 0x01, 0x00, 0x09, 0x00, 0x00, 0x00,
+            0x07, 0x00, 0x00, 0x00, 0x03, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x05, 0x01, 0x00, 0x18, 0x02, 0x00,
+            0x00, 0x00, 0x07, 0x09, 'b',  'r',  'o',  'k',
+            'e',  'r',  '-',  '7',  0x00, 0x00, 0x23, 0x84,
+            0x05, 'a',  'z',  '-',  'a',  0x00,
+        });
+    }
+
+    {
         const ApiVersionsResponse = generated.api_versions_response.ApiVersionsResponse;
         const api_keys = [_]ApiVersionsResponse.ApiVersion{
             .{ .api_key = 0, .min_version = 0, .max_version = 11 },
