@@ -7703,9 +7703,17 @@ pub const Broker = struct {
         if (response_count > 0) {
             responses = self.allocator.alloc(TopicResult, response_count) catch return null;
         }
+        var delete_outcomes: []DeleteTopicOutcome = &.{};
+        if (response_count > 0) {
+            delete_outcomes = self.allocator.alloc(DeleteTopicOutcome, response_count) catch {
+                if (responses.len > 0) self.allocator.free(responses);
+                return null;
+            };
+        }
         var owned_response_names: []?[]u8 = &.{};
         if (response_count > 0) {
             owned_response_names = self.allocator.alloc(?[]u8, response_count) catch {
+                if (delete_outcomes.len > 0) self.allocator.free(delete_outcomes);
                 self.allocator.free(responses);
                 return null;
             };
@@ -7714,11 +7722,19 @@ pub const Broker = struct {
 
         var responses_init: usize = 0;
         var deleted_any = false;
+        const previous_snapshot = self.encodeTopicSnapshotRecordValue() catch {
+            if (owned_response_names.len > 0) self.allocator.free(owned_response_names);
+            if (delete_outcomes.len > 0) self.allocator.free(delete_outcomes);
+            if (responses.len > 0) self.allocator.free(responses);
+            return null;
+        };
         defer {
+            self.allocator.free(previous_snapshot);
             for (owned_response_names) |maybe_name| {
                 if (maybe_name) |name| self.allocator.free(name);
             }
             if (owned_response_names.len > 0) self.allocator.free(owned_response_names);
+            if (delete_outcomes.len > 0) self.allocator.free(delete_outcomes);
             if (responses.len > 0) self.allocator.free(responses);
         }
 
@@ -7735,7 +7751,7 @@ pub const Broker = struct {
 
                 const topic_name = response_name orelse "";
                 const outcome = if (topic_name.len > 0)
-                    self.deleteTopicByName(topic_name)
+                    self.deleteTopicMetadataByName(topic_name)
                 else
                     DeleteTopicOutcome{
                         .error_code = @intFromEnum(ErrorCode.unknown_topic_or_partition),
@@ -7750,12 +7766,13 @@ pub const Broker = struct {
                     .error_code = outcome.error_code,
                     .error_message = null,
                 };
+                delete_outcomes[responses_init] = outcome;
                 responses_init += 1;
             }
         } else {
             for (req.topic_names) |topic_name_opt| {
                 const topic_name = topic_name_opt orelse "";
-                const outcome = self.deleteTopicByName(topic_name);
+                const outcome = self.deleteTopicMetadataByName(topic_name);
                 if (outcome.deleted) deleted_any = true;
 
                 responses[responses_init] = .{
@@ -7764,12 +7781,34 @@ pub const Broker = struct {
                     .error_code = outcome.error_code,
                     .error_message = null,
                 };
+                delete_outcomes[responses_init] = outcome;
                 responses_init += 1;
             }
         }
 
         if (deleted_any) {
-            self.persistTopics();
+            self.writeTopicSnapshotRecord() catch |err| {
+                log.warn("Failed to append DeleteTopics topic snapshot to __cluster_metadata: {}", .{err});
+                self.restoreTopicsAfterFailedMutation(previous_snapshot);
+                for (responses[0..responses_init], delete_outcomes[0..responses_init]) |*response, outcome| {
+                    if (outcome.deleted and response.error_code == @intFromEnum(ErrorCode.none)) {
+                        response.error_code = @intFromEnum(ErrorCode.kafka_storage_error);
+                        response.error_message = "Failed to persist topic metadata";
+                    }
+                }
+                const resp = Resp{
+                    .throttle_time_ms = 0,
+                    .responses = responses[0..responses_init],
+                };
+                return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+            };
+            for (responses[0..responses_init], delete_outcomes[0..responses_init]) |response, outcome| {
+                if (outcome.deleted) {
+                    const topic_name = response.name orelse continue;
+                    self.cleanupDeletedTopicData(topic_name, outcome.partition_count);
+                }
+            }
+            self.persistTopicsLocal();
             self.persistPartitionStates();
             self.persistPartitionReassignments();
             self.persistObjectManagerSnapshot();
@@ -7786,6 +7825,7 @@ pub const Broker = struct {
         error_code: i16,
         topic_id: [16]u8,
         deleted: bool,
+        partition_count: i32 = 0,
     };
 
     fn freeDeleteTopicsRequest(self: *Broker, req: *const generated.delete_topics_request.DeleteTopicsRequest) void {
@@ -7804,7 +7844,18 @@ pub const Broker = struct {
         return null;
     }
 
+    fn cleanupDeletedTopicData(self: *Broker, topic_name: []const u8, partition_count: i32) void {
+        _ = self.clearPartitionReassignmentsForTopic(topic_name);
+        self.removeTopicPartitionRange(topic_name, 0, partition_count);
+    }
+
     fn deleteTopicByName(self: *Broker, topic_name: []const u8) DeleteTopicOutcome {
+        const outcome = self.deleteTopicMetadataByName(topic_name);
+        if (outcome.deleted) self.cleanupDeletedTopicData(topic_name, outcome.partition_count);
+        return outcome;
+    }
+
+    fn deleteTopicMetadataByName(self: *Broker, topic_name: []const u8) DeleteTopicOutcome {
         if (topic_name.len == 0) {
             return .{
                 .error_code = @intFromEnum(ErrorCode.invalid_topic_exception),
@@ -7825,17 +7876,7 @@ pub const Broker = struct {
         if (self.topics.fetchRemove(topic_name)) |removed| {
             const info = removed.value;
             const topic_id = info.topic_id;
-            _ = self.clearPartitionReassignmentsForTopic(topic_name);
-            for (0..@as(usize, @intCast(info.num_partitions))) |pi| {
-                const stream_id = PartitionStore.hashPartitionKey(topic_name, @intCast(pi));
-                self.object_manager.deleteStream(stream_id) catch {};
-                const pkey = std.fmt.allocPrint(self.allocator, "{s}-{d}", .{ topic_name, pi }) catch continue;
-                defer self.allocator.free(pkey);
-                if (self.store.partitions.fetchRemove(pkey)) |se| {
-                    self.allocator.free(se.value.topic);
-                    self.allocator.free(se.key);
-                }
-            }
+            const partition_count = info.num_partitions;
             self.allocator.free(info.name);
             self.allocator.free(removed.key);
             log.info("Deleted topic '{s}' ({d} partitions)", .{ topic_name, info.num_partitions });
@@ -7843,6 +7884,7 @@ pub const Broker = struct {
                 .error_code = @intFromEnum(ErrorCode.none),
                 .topic_id = topic_id,
                 .deleted = true,
+                .partition_count = partition_count,
             };
         }
 
@@ -27982,6 +28024,60 @@ test "Broker.handleRequest DeleteTopics persists partition state cleanup" {
     for (loaded) |entry| {
         try testing.expect(!std.mem.eql(u8, entry.topic, "dt-partition-state-topic"));
     }
+}
+
+test "Broker.handleRequest DeleteTopics rolls back when topic snapshot S3 WAL write fails" {
+    const Req = generated.delete_topics_request.DeleteTopicsRequest;
+    const Resp = generated.delete_topics_response.DeleteTopicsResponse;
+    const Topic = Req.DeleteTopicState;
+
+    var mock_s3 = storage.MockS3.init(testing.allocator);
+    defer mock_s3.deinit();
+    const s3_storage = storage.S3Storage.initMock(testing.allocator, &mock_s3);
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+    broker.store.s3_wal_mode = true;
+    broker.store.s3_storage = s3_storage;
+    broker.store.s3_wal_batcher = storage.wal.S3WalBatcher.init(testing.allocator);
+
+    try broker.open();
+    try testing.expect(broker.ensureTopic("dt-s3-fail-topic"));
+    const topic_id = broker.topics.get("dt-s3-fail-topic").?.topic_id;
+    const object_count_before = mock_s3.objectCount();
+    mock_s3.failNextPutObjects(3);
+
+    const topics = [_]Topic{.{
+        .name = "dt-s3-fail-topic",
+        .topic_id = topic_id,
+    }};
+    const req = Req{
+        .topics = &topics,
+        .timeout_ms = 30000,
+    };
+
+    var buf: [512]u8 = undefined;
+    var pos = buildTestRequest(&buf, 20, 6, 2008, header_mod.requestHeaderVersion(20, 6));
+    req.serialize(&buf, &pos, 6);
+
+    const response = broker.handleRequest(buf[0..pos]);
+    try testing.expect(response != null);
+    defer testing.allocator.free(response.?);
+
+    var rpos: usize = 0;
+    var response_header = try ResponseHeader.deserialize(testing.allocator, response.?, &rpos, header_mod.responseHeaderVersion(20, 6));
+    defer response_header.deinit(testing.allocator);
+    try testing.expectEqual(@as(i32, 2008), response_header.correlation_id);
+
+    const resp = try Resp.deserialize(testing.allocator, response.?, &rpos, 6);
+    defer if (resp.responses.len > 0) testing.allocator.free(resp.responses);
+
+    try testing.expectEqual(response.?.len, rpos);
+    try testing.expectEqual(@as(usize, 1), resp.responses.len);
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.kafka_storage_error)), resp.responses[0].error_code);
+    try testing.expect(broker.topics.contains("dt-s3-fail-topic"));
+    try testing.expect(broker.store.partitions.contains("dt-s3-fail-topic-0"));
+    try testing.expectEqual(object_count_before, mock_s3.objectCount());
 }
 
 test "Broker.handleRequest DeleteTopics rejects truncated request" {
