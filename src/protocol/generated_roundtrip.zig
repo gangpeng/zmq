@@ -237,6 +237,64 @@ test "generated non-default golden fixtures cover legacy and flexible wire encod
     }
 
     {
+        const FetchResponse = generated.fetch_response.FetchResponse;
+        const PartitionData = FetchResponse.FetchableTopicResponse.PartitionData;
+        const partitions = [_]PartitionData{.{
+            .partition_index = 2,
+            .error_code = 6,
+            .high_watermark = 123,
+            .last_stable_offset = 100,
+            .log_start_offset = 5,
+            .preferred_read_replica = -1,
+            .records = null,
+            .diverging_epoch = .{ .epoch = 4, .end_offset = 44 },
+            .current_leader = .{ .leader_id = 7, .leader_epoch = 3 },
+            .snapshot_id = .{ .end_offset = 50, .epoch = 6 },
+        }};
+        const topics = [_]FetchResponse.FetchableTopicResponse{.{
+            .topic_id = .{
+                0x00, 0x01, 0x02, 0x03,
+                0x04, 0x05, 0x06, 0x07,
+                0x08, 0x09, 0x0a, 0x0b,
+                0x0c, 0x0d, 0x0e, 0x0f,
+            },
+            .partitions = &partitions,
+        }};
+        const node_endpoints = [_]FetchResponse.NodeEndpoint{.{
+            .node_id = 7,
+            .host = "broker-7",
+            .port = 9092,
+            .rack = "az-a",
+        }};
+        const value = FetchResponse{
+            .throttle_time_ms = 7,
+            .error_code = 0,
+            .session_id = 99,
+            .responses = &topics,
+            .node_endpoints = &node_endpoints,
+        };
+        try expectGoldenRoundTrip(FetchResponse, value, 16, &[_]u8{
+            0x00, 0x00, 0x00, 0x07, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x63, 0x02, 0x00, 0x01, 0x02, 0x03, 0x04,
+            0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c,
+            0x0d, 0x0e, 0x0f, 0x02, 0x00, 0x00, 0x00, 0x02,
+            0x00, 0x06, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x7b, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x64, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x05, 0x01, 0xff, 0xff, 0xff, 0xff, 0x00,
+            0x03, 0x00, 0x0d, 0x00, 0x00, 0x00, 0x04, 0x00,
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x2c, 0x00,
+            0x01, 0x09, 0x00, 0x00, 0x00, 0x07, 0x00, 0x00,
+            0x00, 0x03, 0x00, 0x02, 0x0d, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00, 0x32, 0x00, 0x00, 0x00,
+            0x06, 0x00, 0x00, 0x01, 0x00, 0x18, 0x02, 0x00,
+            0x00, 0x00, 0x07, 0x09, 'b',  'r',  'o',  'k',
+            'e',  'r',  '-',  '7',  0x00, 0x00, 0x23, 0x84,
+            0x05, 'a',  'z',  '-',  'a',  0x00,
+        });
+    }
+
+    {
         const ApiVersionsResponse = generated.api_versions_response.ApiVersionsResponse;
         const api_keys = [_]ApiVersionsResponse.ApiVersion{
             .{ .api_key = 0, .min_version = 0, .max_version = 11 },

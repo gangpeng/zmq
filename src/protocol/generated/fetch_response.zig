@@ -52,6 +52,10 @@ pub const FetchResponse = struct {
                     if (version >= 12) size += 1;
                     return size;
                 }
+
+                pub fn isDefault(self: *const EpochEndOffset) bool {
+                    return self.epoch == -1 and self.end_offset == -1;
+                }
             };
 
             pub const LeaderIdAndEpoch = struct {
@@ -95,6 +99,10 @@ pub const FetchResponse = struct {
                     if (version >= 12) size += 1;
                     return size;
                 }
+
+                pub fn isDefault(self: *const LeaderIdAndEpoch) bool {
+                    return self.leader_id == -1 and self.leader_epoch == -1;
+                }
             };
 
             pub const SnapshotId = struct {
@@ -125,6 +133,10 @@ pub const FetchResponse = struct {
                     size += 4;
                     if (version >= 12) size += 1;
                     return size;
+                }
+
+                pub fn isDefault(self: *const SnapshotId) bool {
+                    return self.end_offset == -1 and self.epoch == -1;
                 }
             };
 
@@ -186,6 +198,15 @@ pub const FetchResponse = struct {
             /// The current log start offset.
             /// Versions: 5+
             log_start_offset: i64 = -1,
+            /// Largest epoch/end offset known to diverge from the fetch request.
+            /// Versions: 12+
+            diverging_epoch: EpochEndOffset = .{},
+            /// The leader ID and epoch to use after NOT_LEADER_OR_FOLLOWER errors.
+            /// Versions: 12+
+            current_leader: LeaderIdAndEpoch = .{},
+            /// Snapshot end offset and epoch for OFFSET_MOVED_TO_TIERED_STORAGE paths.
+            /// Versions: 12+
+            snapshot_id: SnapshotId = .{},
             /// The aborted transactions.
             /// Versions: 4+
             aborted_transactions: []const AbortedTransaction = &.{},
@@ -224,11 +245,40 @@ pub const FetchResponse = struct {
                 } else {
                     ser.writeBytesBuf(buf, pos, self.records);
                 }
-                if (version >= 12) ser.writeEmptyTaggedFields(buf, pos);
+                if (version >= 12) {
+                    const has_diverging_epoch = !self.diverging_epoch.isDefault();
+                    const has_current_leader = !self.current_leader.isDefault();
+                    const has_snapshot_id = !self.snapshot_id.isDefault();
+                    const tagged_count: usize =
+                        (if (has_diverging_epoch) @as(usize, 1) else 0) +
+                        (if (has_current_leader) @as(usize, 1) else 0) +
+                        (if (has_snapshot_id) @as(usize, 1) else 0);
+                    ser.writeUnsignedVarint(buf, pos, tagged_count);
+                    if (has_diverging_epoch) {
+                        const tag_size = self.diverging_epoch.calcSize(version);
+                        ser.writeUnsignedVarint(buf, pos, 0);
+                        ser.writeUnsignedVarint(buf, pos, tag_size);
+                        self.diverging_epoch.serialize(buf, pos, version);
+                    }
+                    if (has_current_leader) {
+                        const tag_size = self.current_leader.calcSize(version);
+                        ser.writeUnsignedVarint(buf, pos, 1);
+                        ser.writeUnsignedVarint(buf, pos, tag_size);
+                        self.current_leader.serialize(buf, pos, version);
+                    }
+                    if (has_snapshot_id) {
+                        const tag_size = self.snapshot_id.calcSize(version);
+                        ser.writeUnsignedVarint(buf, pos, 2);
+                        ser.writeUnsignedVarint(buf, pos, tag_size);
+                        self.snapshot_id.serialize(buf, pos, version);
+                    }
+                }
             }
 
             pub fn deserialize(alloc: Allocator, buf: []const u8, pos: *usize, version: i16) !PartitionData {
                 var result = PartitionData{};
+                errdefer if (result.aborted_transactions.len > 0) alloc.free(result.aborted_transactions);
+
                 result.partition_index = ser.readI32(buf, pos);
                 result.error_code = ser.readI16(buf, pos);
                 result.high_watermark = ser.readI64(buf, pos);
@@ -258,7 +308,43 @@ pub const FetchResponse = struct {
                     try ser.readCompactBytes(buf, pos)
                 else
                     try ser.readBytes(buf, pos);
-                if (version >= 12) try ser.skipTaggedFields(buf, pos);
+                if (version >= 12) {
+                    const tagged_fields = try ser.readTaggedFields(alloc, buf, pos);
+                    defer if (tagged_fields.len > 0) alloc.free(tagged_fields);
+
+                    var seen_diverging_epoch = false;
+                    var seen_current_leader = false;
+                    var seen_snapshot_id = false;
+                    for (tagged_fields) |field| {
+                        switch (field.tag) {
+                            0 => {
+                                if (seen_diverging_epoch) return error.DuplicateTaggedField;
+                                seen_diverging_epoch = true;
+
+                                var tag_pos: usize = 0;
+                                result.diverging_epoch = try EpochEndOffset.deserialize(alloc, field.data, &tag_pos, version);
+                                if (tag_pos != field.data.len) return error.InvalidTaggedField;
+                            },
+                            1 => {
+                                if (seen_current_leader) return error.DuplicateTaggedField;
+                                seen_current_leader = true;
+
+                                var tag_pos: usize = 0;
+                                result.current_leader = try LeaderIdAndEpoch.deserialize(alloc, field.data, &tag_pos, version);
+                                if (tag_pos != field.data.len) return error.InvalidTaggedField;
+                            },
+                            2 => {
+                                if (seen_snapshot_id) return error.DuplicateTaggedField;
+                                seen_snapshot_id = true;
+
+                                var tag_pos: usize = 0;
+                                result.snapshot_id = try SnapshotId.deserialize(alloc, field.data, &tag_pos, version);
+                                if (tag_pos != field.data.len) return error.InvalidTaggedField;
+                            },
+                            else => {},
+                        }
+                    }
+                }
                 return result;
             }
 
@@ -291,7 +377,34 @@ pub const FetchResponse = struct {
                 } else {
                     size += ser.bytesSize(self.records);
                 }
-                if (version >= 12) size += 1;
+                if (version >= 12) {
+                    const has_diverging_epoch = !self.diverging_epoch.isDefault();
+                    const has_current_leader = !self.current_leader.isDefault();
+                    const has_snapshot_id = !self.snapshot_id.isDefault();
+                    const tagged_count: usize =
+                        (if (has_diverging_epoch) @as(usize, 1) else 0) +
+                        (if (has_current_leader) @as(usize, 1) else 0) +
+                        (if (has_snapshot_id) @as(usize, 1) else 0);
+                    size += ser.unsignedVarintSize(tagged_count);
+                    if (has_diverging_epoch) {
+                        const tag_size = self.diverging_epoch.calcSize(version);
+                        size += ser.unsignedVarintSize(0);
+                        size += ser.unsignedVarintSize(tag_size);
+                        size += tag_size;
+                    }
+                    if (has_current_leader) {
+                        const tag_size = self.current_leader.calcSize(version);
+                        size += ser.unsignedVarintSize(1);
+                        size += ser.unsignedVarintSize(tag_size);
+                        size += tag_size;
+                    }
+                    if (has_snapshot_id) {
+                        const tag_size = self.snapshot_id.calcSize(version);
+                        size += ser.unsignedVarintSize(2);
+                        size += ser.unsignedVarintSize(tag_size);
+                        size += tag_size;
+                    }
+                }
                 return size;
             }
         };
@@ -480,6 +593,9 @@ pub const FetchResponse = struct {
     /// The response topics.
     /// Versions: 0+
     responses: []const FetchableTopicResponse = &.{},
+    /// Endpoints for current leaders enumerated in partition responses.
+    /// Versions: 16+
+    node_endpoints: []const NodeEndpoint = &.{},
 
     pub fn serialize(self: *const FetchResponse, buf: []u8, pos: *usize, version: i16) void {
         if (version >= 1) {
@@ -499,11 +615,34 @@ pub const FetchResponse = struct {
         for (self.responses) |item| {
             item.serialize(buf, pos, version);
         }
-        if (version >= 12) ser.writeEmptyTaggedFields(buf, pos);
+        if (version >= 12) {
+            const has_node_endpoints = version >= 16 and self.node_endpoints.len > 0;
+            ser.writeUnsignedVarint(buf, pos, if (has_node_endpoints) 1 else 0);
+            if (has_node_endpoints) {
+                const tag_size = nodeEndpointsTagSize(self.node_endpoints, version);
+                ser.writeUnsignedVarint(buf, pos, 0);
+                ser.writeUnsignedVarint(buf, pos, tag_size);
+                ser.writeCompactArrayLen(buf, pos, self.node_endpoints.len);
+                for (self.node_endpoints) |item| {
+                    item.serialize(buf, pos, version);
+                }
+            }
+        }
     }
 
     pub fn deserialize(alloc: Allocator, buf: []const u8, pos: *usize, version: i16) !FetchResponse {
         var result = FetchResponse{};
+        errdefer {
+            for (result.responses) |topic| {
+                for (topic.partitions) |partition| {
+                    if (partition.aborted_transactions.len > 0) alloc.free(partition.aborted_transactions);
+                }
+                if (topic.partitions.len > 0) alloc.free(topic.partitions);
+            }
+            if (result.responses.len > 0) alloc.free(result.responses);
+            if (result.node_endpoints.len > 0) alloc.free(result.node_endpoints);
+        }
+
         if (version >= 1) {
             result.throttle_time_ms = ser.readI32(buf, pos);
         }
@@ -524,7 +663,19 @@ pub const FetchResponse = struct {
             }
             result.responses = responses_items;
         }
-        if (version >= 12) try ser.skipTaggedFields(buf, pos);
+        if (version >= 12) {
+            const tagged_fields = try ser.readTaggedFields(alloc, buf, pos);
+            defer if (tagged_fields.len > 0) alloc.free(tagged_fields);
+
+            var seen_node_endpoints = false;
+            for (tagged_fields) |field| {
+                if (field.tag == 0 and version >= 16) {
+                    if (seen_node_endpoints) return error.DuplicateTaggedField;
+                    seen_node_endpoints = true;
+                    result.node_endpoints = try readNodeEndpointsTag(alloc, field.data, version);
+                }
+            }
+        }
         return result;
     }
 
@@ -547,7 +698,41 @@ pub const FetchResponse = struct {
         for (self.responses) |item| {
             size += item.calcSize(version);
         }
-        if (version >= 12) size += 1;
+        if (version >= 12) {
+            const has_node_endpoints = version >= 16 and self.node_endpoints.len > 0;
+            size += ser.unsignedVarintSize(if (has_node_endpoints) 1 else 0);
+            if (has_node_endpoints) {
+                const tag_size = nodeEndpointsTagSize(self.node_endpoints, version);
+                size += ser.unsignedVarintSize(0);
+                size += ser.unsignedVarintSize(tag_size);
+                size += tag_size;
+            }
+        }
         return size;
     }
 };
+
+fn nodeEndpointsTagSize(node_endpoints: []const FetchResponse.NodeEndpoint, version: i16) usize {
+    var size = ser.unsignedVarintSize(node_endpoints.len + 1);
+    for (node_endpoints) |item| {
+        size += item.calcSize(version);
+    }
+    return size;
+}
+
+fn readNodeEndpointsTag(alloc: Allocator, data: []const u8, version: i16) ![]const FetchResponse.NodeEndpoint {
+    var tag_pos: usize = 0;
+    const node_endpoints_len: usize = (try ser.readCompactArrayLen(data, &tag_pos)) orelse return error.InvalidTaggedField;
+    if (node_endpoints_len == 0) {
+        if (tag_pos != data.len) return error.InvalidTaggedField;
+        return &.{};
+    }
+
+    const node_endpoints = try alloc.alloc(FetchResponse.NodeEndpoint, node_endpoints_len);
+    errdefer alloc.free(node_endpoints);
+    for (node_endpoints) |*item| {
+        item.* = try FetchResponse.NodeEndpoint.deserialize(alloc, data, &tag_pos, version);
+    }
+    if (tag_pos != data.len) return error.InvalidTaggedField;
+    return node_endpoints;
+}

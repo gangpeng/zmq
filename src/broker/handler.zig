@@ -16566,6 +16566,7 @@ fn freeDeserializedFetchResponse(resp: *const generated.fetch_response.FetchResp
         }
         if (topic.partitions.len > 0) testing.allocator.free(topic.partitions);
     }
+    if (resp.node_endpoints.len > 0) testing.allocator.free(resp.node_endpoints);
     if (resp.responses.len > 0) testing.allocator.free(resp.responses);
 }
 
