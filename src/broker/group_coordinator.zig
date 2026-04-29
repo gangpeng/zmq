@@ -983,6 +983,20 @@ pub const GroupCoordinator = struct {
         return self.committed_offsets.get(key);
     }
 
+    /// Delete the committed offset for a topic-partition in a consumer group.
+    pub fn deleteCommittedOffset(self: *GroupCoordinator, group_id: []const u8, topic: []const u8, partition: i32) !bool {
+        const key = try std.fmt.allocPrint(self.allocator, "{s}:{s}:{d}", .{ group_id, topic, partition });
+        defer self.allocator.free(key);
+
+        if (self.committed_offsets.fetchRemove(key)) |old| {
+            var value = old.value;
+            value.deinit(self.allocator);
+            self.allocator.free(old.key);
+            return true;
+        }
+        return false;
+    }
+
     pub fn hasCommittedOffsetsForGroup(self: *const GroupCoordinator, group_id: []const u8) bool {
         var it = self.committed_offsets.keyIterator();
         while (it.next()) |key_ptr| {

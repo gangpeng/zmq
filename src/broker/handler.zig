@@ -2685,10 +2685,7 @@ pub const Broker = struct {
         const value = try self.encodeOffsetCommitRecordValue(offset, leader_epoch, metadata);
         defer self.allocator.free(value);
 
-        // Determine target partition in __consumer_offsets: hash(group_id) % 50
-        var hasher = std.hash.Wyhash.init(0);
-        hasher.update(group_id);
-        const target_partition: i32 = @intCast(hasher.final() % 50);
+        const target_partition = self.consumerOffsetsPartition(group_id);
 
         // Build a RecordBatch
         const rec_batch = protocol.record_batch;
@@ -2714,6 +2711,42 @@ pub const Broker = struct {
         defer self.allocator.free(batch);
 
         // Write to __consumer_offsets partition store
+        _ = try self.store.produce("__consumer_offsets", target_partition, batch);
+        self.persistPartitionStates();
+    }
+
+    /// Write an offset-delete tombstone to __consumer_offsets before removing
+    /// the local committed offset. Replay applies this after earlier commits.
+    fn writeOffsetDeleteRecord(self: *Broker, group_id: []const u8, topic: []const u8, partition_id: i32) !void {
+        const target_partition = self.consumerOffsetsPartition(group_id);
+        if (!self.topicPartitionExists("__consumer_offsets", target_partition)) return;
+
+        const key = try std.fmt.allocPrint(self.allocator, "{s}:{s}:{d}", .{ group_id, topic, partition_id });
+        defer self.allocator.free(key);
+
+        const rec_batch = protocol.record_batch;
+        const records = [_]rec_batch.Record{
+            .{
+                .offset_delta = 0,
+                .key = key,
+                .value = null,
+            },
+        };
+
+        const now = @import("time_compat").milliTimestamp();
+        const batch = try rec_batch.buildRecordBatch(
+            self.allocator,
+            0,
+            &records,
+            -1,
+            -1,
+            -1,
+            now,
+            now,
+            0,
+        );
+        defer self.allocator.free(batch);
+
         _ = try self.store.produce("__consumer_offsets", target_partition, batch);
         self.persistPartitionStates();
     }
@@ -3098,8 +3131,7 @@ pub const Broker = struct {
                     if (record_pos >= batch_end) break;
                     const record = rec_batch.parseRecord(batches, &record_pos) catch break;
                     const key = record.key orelse continue;
-                    const value = record.value orelse continue;
-                    if (try self.applyConsumerOffsetRecord(key, value)) restored += 1;
+                    if (try self.applyConsumerOffsetRecord(key, record.value)) restored += 1;
                 }
             }
 
@@ -3109,14 +3141,18 @@ pub const Broker = struct {
         return restored;
     }
 
-    fn applyConsumerOffsetRecord(self: *Broker, key: []const u8, value: []const u8) !bool {
+    fn applyConsumerOffsetRecord(self: *Broker, key: []const u8, value: ?[]const u8) !bool {
         if (std.mem.eql(u8, key, consumer_group_snapshot_record_key)) {
-            try self.applyConsumerGroupSnapshotRecord(value);
+            try self.applyConsumerGroupSnapshotRecord(value orelse return false);
             return true;
         }
 
         const parts = offsetCommitKeyParts(key) orelse return false;
-        const decoded = decodeOffsetCommitRecordValue(value) orelse return false;
+        const commit_value = value orelse {
+            _ = try self.groups.deleteCommittedOffset(parts.group_id, parts.topic, parts.partition);
+            return true;
+        };
+        const decoded = decodeOffsetCommitRecordValue(commit_value) orelse return false;
 
         try self.groups.commitOffsetWithMetadata(
             parts.group_id,
@@ -10424,14 +10460,33 @@ pub const Broker = struct {
                     ErrorCode.none;
 
                 if (partition_error == ErrorCode.none) {
-                    const key = std.fmt.allocPrint(self.allocator, "{s}:{s}:{d}", .{ group_id, topic_name, partition.partition_index }) catch return null;
-                    if (self.groups.committed_offsets.fetchRemove(key)) |old| {
-                        var value = old.value;
-                        value.deinit(self.allocator);
-                        self.allocator.free(old.key);
+                    const existing = self.groups.fetchOffsetRecord(group_id, topic_name, partition.partition_index) catch |err| {
+                        log.warn("OffsetDelete lookup failed for {s}:{s}:{d}: {}", .{ group_id, topic_name, partition.partition_index, err });
+                        partitions[partition_index] = .{
+                            .partition_index = partition.partition_index,
+                            .error_code = @intFromEnum(ErrorCode.kafka_storage_error),
+                        };
+                        continue;
+                    };
+                    if (existing != null) {
+                        self.writeOffsetDeleteRecord(group_id, topic_name, partition.partition_index) catch |err| {
+                            log.warn("OffsetDelete internal-log tombstone write failed for {s}:{s}:{d}: {}", .{ group_id, topic_name, partition.partition_index, err });
+                            partitions[partition_index] = .{
+                                .partition_index = partition.partition_index,
+                                .error_code = @intFromEnum(ErrorCode.kafka_storage_error),
+                            };
+                            continue;
+                        };
+                        _ = self.groups.deleteCommittedOffset(group_id, topic_name, partition.partition_index) catch |err| {
+                            log.warn("OffsetDelete local removal failed for {s}:{s}:{d}: {}", .{ group_id, topic_name, partition.partition_index, err });
+                            partitions[partition_index] = .{
+                                .partition_index = partition.partition_index,
+                                .error_code = @intFromEnum(ErrorCode.kafka_storage_error),
+                            };
+                            continue;
+                        };
                         mutated = true;
                     }
-                    self.allocator.free(key);
                 }
 
                 partitions[partition_index] = .{
@@ -19765,6 +19820,67 @@ test "Broker.handleRequest OffsetDelete persists deleted offsets" {
     try testing.expectEqual(@as(usize, 0), loaded.len);
 }
 
+test "Broker.handleRequest OffsetDelete preserves offsets when S3 tombstone write fails" {
+    const Req = generated.offset_delete_request.OffsetDeleteRequest;
+    const Resp = generated.offset_delete_response.OffsetDeleteResponse;
+
+    var mock_s3 = storage.MockS3.init(testing.allocator);
+    defer mock_s3.deinit();
+    const s3_storage = storage.S3Storage.initMock(testing.allocator, &mock_s3);
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+    broker.store.s3_wal_mode = true;
+    broker.store.s3_storage = s3_storage;
+    broker.store.s3_wal_batcher = storage.wal.S3WalBatcher.init(testing.allocator);
+
+    try broker.open();
+    try testing.expect(broker.ensureTopic("delete-offset-s3-fail-topic"));
+    try broker.groups.commitOffset("delete-offset-s3-fail-group", "delete-offset-s3-fail-topic", 0, 42);
+
+    const object_count_before = mock_s3.objectCount();
+    mock_s3.failNextPutObjects(3);
+
+    const partitions = [_]Req.OffsetDeleteRequestTopic.OffsetDeleteRequestPartition{.{
+        .partition_index = 0,
+    }};
+    const topics = [_]Req.OffsetDeleteRequestTopic{.{
+        .name = "delete-offset-s3-fail-topic",
+        .partitions = &partitions,
+    }};
+    const req = Req{
+        .group_id = "delete-offset-s3-fail-group",
+        .topics = &topics,
+    };
+
+    var buf: [512]u8 = undefined;
+    var pos = buildTestRequest(&buf, 47, 0, 4707, header_mod.requestHeaderVersion(47, 0));
+    req.serialize(&buf, &pos, 0);
+
+    const response = broker.handleRequest(buf[0..pos]);
+    try testing.expect(response != null);
+    defer testing.allocator.free(response.?);
+
+    var rpos: usize = 0;
+    var response_header = try ResponseHeader.deserialize(testing.allocator, response.?, &rpos, header_mod.responseHeaderVersion(47, 0));
+    defer response_header.deinit(testing.allocator);
+    try testing.expectEqual(@as(i32, 4707), response_header.correlation_id);
+
+    const resp = try Resp.deserialize(testing.allocator, response.?, &rpos, 0);
+    defer {
+        for (resp.topics) |topic| {
+            if (topic.partitions.len > 0) testing.allocator.free(topic.partitions);
+        }
+        if (resp.topics.len > 0) testing.allocator.free(resp.topics);
+    }
+
+    try testing.expectEqual(response.?.len, rpos);
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.none)), resp.error_code);
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.kafka_storage_error)), resp.topics[0].partitions[0].error_code);
+    try testing.expectEqual(@as(?i64, 42), try broker.groups.fetchOffset("delete-offset-s3-fail-group", "delete-offset-s3-fail-topic", 0));
+    try testing.expectEqual(object_count_before, mock_s3.objectCount());
+}
+
 test "Broker.handleRequest OffsetDelete rejects truncated request" {
     var broker = Broker.init(testing.allocator, 1, 9092);
     defer broker.deinit();
@@ -22397,6 +22513,52 @@ test "Broker restores committed offsets from S3 consumer offsets log" {
         try testing.expectEqual(@as(i64, 42), restored.?.offset);
         try testing.expectEqual(@as(i32, 7), restored.?.leader_epoch);
         try testing.expectEqualStrings("offset-meta", restored.?.metadata.?);
+    }
+}
+
+test "Broker replays offset tombstones from S3 consumer offsets log" {
+    var mock_s3 = storage.MockS3.init(testing.allocator);
+    defer mock_s3.deinit();
+    const s3_storage = storage.S3Storage.initMock(testing.allocator, &mock_s3);
+
+    {
+        var broker = Broker.init(testing.allocator, 1, 9092);
+        defer broker.deinit();
+        broker.store.s3_wal_mode = true;
+        broker.store.s3_storage = s3_storage;
+        broker.store.s3_wal_batcher = storage.wal.S3WalBatcher.init(testing.allocator);
+
+        try broker.open();
+        try broker.writeOffsetCommitRecord(
+            "stateless-offset-delete-group",
+            "stateless-offset-delete-topic",
+            0,
+            42,
+            7,
+            "deleted-offset-meta",
+        );
+        try broker.writeOffsetDeleteRecord(
+            "stateless-offset-delete-group",
+            "stateless-offset-delete-topic",
+            0,
+        );
+    }
+
+    {
+        var broker = Broker.init(testing.allocator, 1, 9092);
+        defer broker.deinit();
+        broker.store.s3_wal_mode = true;
+        broker.store.s3_storage = s3_storage;
+        broker.store.s3_wal_batcher = storage.wal.S3WalBatcher.init(testing.allocator);
+
+        try broker.open();
+
+        const restored = try broker.groups.fetchOffsetRecord(
+            "stateless-offset-delete-group",
+            "stateless-offset-delete-topic",
+            0,
+        );
+        try testing.expect(restored == null);
     }
 }
 
