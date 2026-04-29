@@ -108,12 +108,7 @@ pub const ApiVersionsResponse = struct {
         }
 
         if (version >= 3) {
-            // Tagged fields in the response body.
-            // Empty tagged fields (count=0) is valid — indicates no optional features
-            // (supported_features, finalized_features, zk_migration_ready).
-            // Real Kafka brokers include these for KRaft feature negotiation,
-            // but they are optional and clients handle their absence correctly.
-            ser.writeEmptyTaggedFields(buf, pos);
+            self.writeTopLevelTaggedFields(buf, pos);
         }
     }
 
@@ -139,7 +134,7 @@ pub const ApiVersionsResponse = struct {
         }
 
         if (version >= 3) {
-            size += 1; // empty tagged fields
+            size += self.topLevelTaggedFieldsSize();
         }
 
         return size;
@@ -147,6 +142,7 @@ pub const ApiVersionsResponse = struct {
 
     pub fn deserialize(alloc: Allocator, buf: []const u8, pos: *usize, version: i16) !ApiVersionsResponse {
         var result = ApiVersionsResponse{};
+        errdefer result.deinit(alloc);
 
         result.error_code = ser.readI16(buf, pos);
 
@@ -175,7 +171,39 @@ pub const ApiVersionsResponse = struct {
         }
 
         if (version >= 3) {
-            try ser.skipTaggedFields(buf, pos);
+            const tagged_fields = try ser.readTaggedFields(alloc, buf, pos);
+            result.tagged_fields = tagged_fields;
+
+            var seen_supported_features = false;
+            var seen_finalized_features_epoch = false;
+            var seen_finalized_features = false;
+            var seen_zk_migration_ready = false;
+
+            for (tagged_fields) |field| {
+                switch (field.tag) {
+                    0 => {
+                        if (seen_supported_features) return error.DuplicateTaggedField;
+                        seen_supported_features = true;
+                        result.supported_features = try parseSupportedFeaturesTag(alloc, field.data);
+                    },
+                    1 => {
+                        if (seen_finalized_features_epoch) return error.DuplicateTaggedField;
+                        seen_finalized_features_epoch = true;
+                        result.finalized_features_epoch = try parseFinalizedFeaturesEpochTag(field.data);
+                    },
+                    2 => {
+                        if (seen_finalized_features) return error.DuplicateTaggedField;
+                        seen_finalized_features = true;
+                        result.finalized_features = try parseFinalizedFeaturesTag(alloc, field.data);
+                    },
+                    3 => {
+                        if (seen_zk_migration_ready) return error.DuplicateTaggedField;
+                        seen_zk_migration_ready = true;
+                        result.zk_migration_ready = try parseZkMigrationReadyTag(field.data);
+                    },
+                    else => {},
+                }
+            }
         }
 
         return result;
@@ -185,9 +213,206 @@ pub const ApiVersionsResponse = struct {
         if (self.api_keys.len > 0) {
             alloc.free(self.api_keys);
         }
+        if (self.supported_features.len > 0) {
+            alloc.free(self.supported_features);
+        }
+        if (self.finalized_features.len > 0) {
+            alloc.free(self.finalized_features);
+        }
+        if (self.tagged_fields.len > 0) {
+            alloc.free(self.tagged_fields);
+        }
         self.* = undefined;
     }
+
+    fn writeTopLevelTaggedFields(self: *const ApiVersionsResponse, buf: []u8, pos: *usize) void {
+        ser.writeUnsignedVarint(buf, pos, self.topLevelTaggedFieldCount());
+
+        if (self.supported_features.len > 0) {
+            writeTaggedFieldHeader(buf, pos, 0, supportedFeaturesTagSize(self.supported_features));
+            ser.writeCompactArrayLen(buf, pos, self.supported_features.len);
+            for (self.supported_features) |feature| {
+                ser.writeCompactString(buf, pos, feature.name);
+                ser.writeI16(buf, pos, feature.min_version);
+                ser.writeI16(buf, pos, feature.max_version);
+                ser.writeEmptyTaggedFields(buf, pos);
+            }
+        }
+
+        if (self.finalized_features_epoch != -1) {
+            writeTaggedFieldHeader(buf, pos, 1, 8);
+            ser.writeI64(buf, pos, self.finalized_features_epoch);
+        }
+
+        if (self.finalized_features.len > 0) {
+            writeTaggedFieldHeader(buf, pos, 2, finalizedFeaturesTagSize(self.finalized_features));
+            ser.writeCompactArrayLen(buf, pos, self.finalized_features.len);
+            for (self.finalized_features) |feature| {
+                ser.writeCompactString(buf, pos, feature.name);
+                ser.writeI16(buf, pos, feature.max_version_level);
+                ser.writeI16(buf, pos, feature.min_version_level);
+                ser.writeEmptyTaggedFields(buf, pos);
+            }
+        }
+
+        if (self.zk_migration_ready) {
+            writeTaggedFieldHeader(buf, pos, 3, 1);
+            ser.writeBool(buf, pos, true);
+        }
+
+        for (self.tagged_fields) |field| {
+            if (isKnownApiVersionsResponseTag(field.tag)) continue;
+            writeTaggedFieldHeader(buf, pos, field.tag, field.data.len);
+            @memcpy(buf[pos.* .. pos.* + field.data.len], field.data);
+            pos.* += field.data.len;
+        }
+    }
+
+    fn topLevelTaggedFieldsSize(self: *const ApiVersionsResponse) usize {
+        var size = ser.unsignedVarintSize(self.topLevelTaggedFieldCount());
+
+        if (self.supported_features.len > 0) {
+            const field_size = supportedFeaturesTagSize(self.supported_features);
+            size += taggedFieldHeaderSize(0, field_size) + field_size;
+        }
+        if (self.finalized_features_epoch != -1) {
+            size += taggedFieldHeaderSize(1, 8) + 8;
+        }
+        if (self.finalized_features.len > 0) {
+            const field_size = finalizedFeaturesTagSize(self.finalized_features);
+            size += taggedFieldHeaderSize(2, field_size) + field_size;
+        }
+        if (self.zk_migration_ready) {
+            size += taggedFieldHeaderSize(3, 1) + 1;
+        }
+        for (self.tagged_fields) |field| {
+            if (isKnownApiVersionsResponseTag(field.tag)) continue;
+            size += taggedFieldHeaderSize(field.tag, field.data.len) + field.data.len;
+        }
+
+        return size;
+    }
+
+    fn topLevelTaggedFieldCount(self: *const ApiVersionsResponse) usize {
+        var count: usize = 0;
+        if (self.supported_features.len > 0) count += 1;
+        if (self.finalized_features_epoch != -1) count += 1;
+        if (self.finalized_features.len > 0) count += 1;
+        if (self.zk_migration_ready) count += 1;
+        for (self.tagged_fields) |field| {
+            if (!isKnownApiVersionsResponseTag(field.tag)) count += 1;
+        }
+        return count;
+    }
 };
+
+fn parseSupportedFeaturesTag(alloc: Allocator, data: []const u8) ![]ApiVersionsResponse.SupportedFeatureKey {
+    var pos: usize = 0;
+    const len = (try ser.readCompactArrayLen(data, &pos)) orelse return error.InvalidTaggedField;
+    if (len == 0) {
+        if (pos != data.len) return error.InvalidTaggedField;
+        return &.{};
+    }
+
+    const features = try alloc.alloc(ApiVersionsResponse.SupportedFeatureKey, len);
+    errdefer alloc.free(features);
+    for (features) |*feature| {
+        feature.* = .{
+            .name = (try ser.readCompactString(data, &pos)) orelse return error.InvalidTaggedField,
+            .min_version = try readI16Checked(data, &pos),
+            .max_version = try readI16Checked(data, &pos),
+        };
+        try ser.skipTaggedFields(data, &pos);
+    }
+    if (pos != data.len) return error.InvalidTaggedField;
+    return features;
+}
+
+fn parseFinalizedFeaturesEpochTag(data: []const u8) !i64 {
+    var pos: usize = 0;
+    const epoch = try readI64Checked(data, &pos);
+    if (pos != data.len) return error.InvalidTaggedField;
+    return epoch;
+}
+
+fn parseFinalizedFeaturesTag(alloc: Allocator, data: []const u8) ![]ApiVersionsResponse.FinalizedFeatureKey {
+    var pos: usize = 0;
+    const len = (try ser.readCompactArrayLen(data, &pos)) orelse return error.InvalidTaggedField;
+    if (len == 0) {
+        if (pos != data.len) return error.InvalidTaggedField;
+        return &.{};
+    }
+
+    const features = try alloc.alloc(ApiVersionsResponse.FinalizedFeatureKey, len);
+    errdefer alloc.free(features);
+    for (features) |*feature| {
+        feature.* = .{
+            .name = (try ser.readCompactString(data, &pos)) orelse return error.InvalidTaggedField,
+            .max_version_level = try readI16Checked(data, &pos),
+            .min_version_level = try readI16Checked(data, &pos),
+        };
+        try ser.skipTaggedFields(data, &pos);
+    }
+    if (pos != data.len) return error.InvalidTaggedField;
+    return features;
+}
+
+fn parseZkMigrationReadyTag(data: []const u8) !bool {
+    var pos: usize = 0;
+    const value = try readBoolChecked(data, &pos);
+    if (pos != data.len) return error.InvalidTaggedField;
+    return value;
+}
+
+fn supportedFeaturesTagSize(features: []const ApiVersionsResponse.SupportedFeatureKey) usize {
+    var size = ser.unsignedVarintSize(features.len + 1);
+    for (features) |feature| {
+        size += ser.compactStringSize(feature.name);
+        size += 2; // min_version
+        size += 2; // max_version
+        size += 1; // element tagged fields
+    }
+    return size;
+}
+
+fn finalizedFeaturesTagSize(features: []const ApiVersionsResponse.FinalizedFeatureKey) usize {
+    var size = ser.unsignedVarintSize(features.len + 1);
+    for (features) |feature| {
+        size += ser.compactStringSize(feature.name);
+        size += 2; // max_version_level
+        size += 2; // min_version_level
+        size += 1; // element tagged fields
+    }
+    return size;
+}
+
+fn writeTaggedFieldHeader(buf: []u8, pos: *usize, tag: usize, size: usize) void {
+    ser.writeUnsignedVarint(buf, pos, tag);
+    ser.writeUnsignedVarint(buf, pos, size);
+}
+
+fn taggedFieldHeaderSize(tag: usize, size: usize) usize {
+    return ser.unsignedVarintSize(tag) + ser.unsignedVarintSize(size);
+}
+
+fn isKnownApiVersionsResponseTag(tag: usize) bool {
+    return tag <= 3;
+}
+
+fn readI16Checked(buf: []const u8, pos: *usize) !i16 {
+    if (pos.* + 2 > buf.len) return error.BufferUnderflow;
+    return ser.readI16(buf, pos);
+}
+
+fn readI64Checked(buf: []const u8, pos: *usize) !i64 {
+    if (pos.* + 8 > buf.len) return error.BufferUnderflow;
+    return ser.readI64(buf, pos);
+}
+
+fn readBoolChecked(buf: []const u8, pos: *usize) !bool {
+    if (pos.* + 1 > buf.len) return error.BufferUnderflow;
+    return try ser.readBool(buf, pos);
+}
 
 fn taggedFieldsSize(fields: []const ser.TaggedField) usize {
     var size = ser.unsignedVarintSize(fields.len);
@@ -289,16 +514,113 @@ test "ApiVersionsResponse v3 round-trip" {
     try testing.expectEqual(wpos, rpos);
 }
 
+test "ApiVersionsResponse v4 feature tagged fields round-trip" {
+    var buf: [512]u8 = undefined;
+    var wpos: usize = 0;
+
+    var api_keys = [_]ApiVersionsResponse.ApiVersion{
+        .{ .api_key = 18, .min_version = 0, .max_version = 4 },
+        .{ .api_key = 57, .min_version = 0, .max_version = 1 },
+    };
+    var supported_features = [_]ApiVersionsResponse.SupportedFeatureKey{
+        .{ .name = "metadata.version", .min_version = 0, .max_version = 3 },
+        .{ .name = "kraft.version", .min_version = 0, .max_version = 1 },
+    };
+    var finalized_features = [_]ApiVersionsResponse.FinalizedFeatureKey{
+        .{ .name = "metadata.version", .max_version_level = 3, .min_version_level = 1 },
+    };
+    const unknown_tag_data = [_]u8{ 0xaa, 0xbb, 0xcc };
+    const unknown_tags = [_]ser.TaggedField{.{
+        .tag = 8,
+        .data = &unknown_tag_data,
+    }};
+
+    const resp = ApiVersionsResponse{
+        .error_code = 0,
+        .api_keys = &api_keys,
+        .throttle_time_ms = 25,
+        .supported_features = &supported_features,
+        .finalized_features_epoch = 42,
+        .finalized_features = &finalized_features,
+        .zk_migration_ready = true,
+        .tagged_fields = &unknown_tags,
+    };
+    resp.serialize(&buf, &wpos, 4);
+    try testing.expectEqual(resp.calcSize(4), wpos);
+
+    var rpos: usize = 0;
+    var read_resp = try ApiVersionsResponse.deserialize(testing.allocator, &buf, &rpos, 4);
+    defer read_resp.deinit(testing.allocator);
+
+    try testing.expectEqual(@as(i16, 0), read_resp.error_code);
+    try testing.expectEqual(@as(usize, 2), read_resp.api_keys.len);
+    try testing.expectEqual(@as(i32, 25), read_resp.throttle_time_ms);
+    try testing.expectEqual(@as(usize, 2), read_resp.supported_features.len);
+    try testing.expectEqualStrings("metadata.version", read_resp.supported_features[0].name);
+    try testing.expectEqual(@as(i16, 0), read_resp.supported_features[0].min_version);
+    try testing.expectEqual(@as(i16, 3), read_resp.supported_features[0].max_version);
+    try testing.expectEqualStrings("kraft.version", read_resp.supported_features[1].name);
+    try testing.expectEqual(@as(i64, 42), read_resp.finalized_features_epoch);
+    try testing.expectEqual(@as(usize, 1), read_resp.finalized_features.len);
+    try testing.expectEqualStrings("metadata.version", read_resp.finalized_features[0].name);
+    try testing.expectEqual(@as(i16, 3), read_resp.finalized_features[0].max_version_level);
+    try testing.expectEqual(@as(i16, 1), read_resp.finalized_features[0].min_version_level);
+    try testing.expect(read_resp.zk_migration_ready);
+    try testing.expectEqual(@as(usize, 5), read_resp.tagged_fields.len);
+    try testing.expectEqual(@as(usize, 8), read_resp.tagged_fields[4].tag);
+    try testing.expectEqualSlices(u8, &unknown_tag_data, read_resp.tagged_fields[4].data);
+    try testing.expectEqual(wpos, rpos);
+
+    var roundtrip_buf: [512]u8 = undefined;
+    var roundtrip_wpos: usize = 0;
+    read_resp.serialize(&roundtrip_buf, &roundtrip_wpos, 4);
+    try testing.expectEqual(wpos, roundtrip_wpos);
+    try testing.expectEqualSlices(u8, buf[0..wpos], roundtrip_buf[0..roundtrip_wpos]);
+}
+
+test "ApiVersionsResponse v3 rejects duplicate feature tags" {
+    var buf: [64]u8 = undefined;
+    var wpos: usize = 0;
+
+    ser.writeI16(&buf, &wpos, 0); // error_code
+    ser.writeCompactArrayLen(&buf, &wpos, 0); // api_keys
+    ser.writeI32(&buf, &wpos, 0); // throttle_time_ms
+    ser.writeUnsignedVarint(&buf, &wpos, 2); // tagged fields
+    ser.writeUnsignedVarint(&buf, &wpos, 3); // zk_migration_ready
+    ser.writeUnsignedVarint(&buf, &wpos, 1);
+    ser.writeBool(&buf, &wpos, true);
+    ser.writeUnsignedVarint(&buf, &wpos, 3); // duplicate zk_migration_ready
+    ser.writeUnsignedVarint(&buf, &wpos, 1);
+    ser.writeBool(&buf, &wpos, false);
+
+    var rpos: usize = 0;
+    try testing.expectError(error.DuplicateTaggedField, ApiVersionsResponse.deserialize(testing.allocator, buf[0..wpos], &rpos, 3));
+}
+
 test "ApiVersionsResponse calcSize matches actual" {
     var api_keys = [_]ApiVersionsResponse.ApiVersion{
         .{ .api_key = 0, .min_version = 0, .max_version = 11 },
         .{ .api_key = 1, .min_version = 0, .max_version = 17 },
     };
+    var supported_features = [_]ApiVersionsResponse.SupportedFeatureKey{.{
+        .name = "metadata.version",
+        .min_version = 0,
+        .max_version = 1,
+    }};
+    var finalized_features = [_]ApiVersionsResponse.FinalizedFeatureKey{.{
+        .name = "metadata.version",
+        .max_version_level = 1,
+        .min_version_level = 1,
+    }};
 
     const resp = ApiVersionsResponse{
         .error_code = 0,
         .api_keys = &api_keys,
         .throttle_time_ms = 0,
+        .supported_features = &supported_features,
+        .finalized_features_epoch = 9,
+        .finalized_features = &finalized_features,
+        .zk_migration_ready = true,
     };
 
     // Test v0
