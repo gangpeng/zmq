@@ -206,6 +206,8 @@ Status: completed for the initial catalog and DeleteGroups slice.
   StopReplicaRequest generated encoding now honors its legacy field version
   bounds exactly: v0 `UngroupedPartitions`, v0-v2 `DeletePartitions`, v1-v2
   grouped `Topics`, and v3+ `TopicStates` have non-default golden fixtures.
+  AlterPartitionRequest generated encoding now honors v0-v1 topic-name fields,
+  v2+ topic IDs, and the v3 switch from `NewIsr` to `NewIsrWithEpochs`.
 
 ### Phase 2: AutoMQ S3Stream APIs
 

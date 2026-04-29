@@ -63,7 +63,7 @@ pub const AlterPartitionRequest = struct {
             /// The ISR for this partition. Deprecated since version 3.
             /// Versions: 0-2
             new_isr: []const i32 = &.{},
-            /// 
+            ///
             /// Versions: 3+
             new_isr_with_epochs: []const BrokerState = &.{},
             /// 1 if the partition is recovering from an unclean leader election; 0 otherwise.
@@ -76,9 +76,11 @@ pub const AlterPartitionRequest = struct {
             pub fn serialize(self: *const PartitionData, buf: []u8, pos: *usize, version: i16) void {
                 ser.writeI32(buf, pos, self.partition_index);
                 ser.writeI32(buf, pos, self.leader_epoch);
-                ser.writeCompactArrayLen(buf, pos, self.new_isr.len);
-                for (self.new_isr) |item| {
-                    ser.writeI32(buf, pos, item);
+                if (version <= 2) {
+                    ser.writeCompactArrayLen(buf, pos, self.new_isr.len);
+                    for (self.new_isr) |item| {
+                        ser.writeI32(buf, pos, item);
+                    }
                 }
                 if (version >= 3) {
                     ser.writeCompactArrayLen(buf, pos, self.new_isr_with_epochs.len);
@@ -97,13 +99,15 @@ pub const AlterPartitionRequest = struct {
                 var result = PartitionData{};
                 result.partition_index = ser.readI32(buf, pos);
                 result.leader_epoch = ser.readI32(buf, pos);
-                const new_isr_len: usize = (try ser.readCompactArrayLen(buf, pos)) orelse 0;
-                if (new_isr_len > 0) {
-                    const new_isr_items = try alloc.alloc(i32, new_isr_len);
-                    for (new_isr_items) |*item| {
-                        item.* = ser.readI32(buf, pos);
+                if (version <= 2) {
+                    const new_isr_len: usize = (try ser.readCompactArrayLen(buf, pos)) orelse 0;
+                    if (new_isr_len > 0) {
+                        const new_isr_items = try alloc.alloc(i32, new_isr_len);
+                        for (new_isr_items) |*item| {
+                            item.* = ser.readI32(buf, pos);
+                        }
+                        result.new_isr = new_isr_items;
                     }
-                    result.new_isr = new_isr_items;
                 }
                 if (version >= 3) {
                     const new_isr_with_epochs_len: usize = (try ser.readCompactArrayLen(buf, pos)) orelse 0;
@@ -127,8 +131,10 @@ pub const AlterPartitionRequest = struct {
                 var size: usize = 0;
                 size += 4;
                 size += 4;
-                size += ser.unsignedVarintSize(self.new_isr.len + 1);
-                size += self.new_isr.len * 4;
+                if (version <= 2) {
+                    size += ser.unsignedVarintSize(self.new_isr.len + 1);
+                    size += self.new_isr.len * 4;
+                }
                 if (version >= 3) {
                     size += ser.unsignedVarintSize(self.new_isr_with_epochs.len + 1);
                     for (self.new_isr_with_epochs) |item| {
@@ -150,12 +156,14 @@ pub const AlterPartitionRequest = struct {
         /// The ID of the topic to alter ISRs for
         /// Versions: 2+
         topic_id: [16]u8 = .{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 },
-        /// 
+        ///
         /// Versions: 0+
         partitions: []const PartitionData = &.{},
 
         pub fn serialize(self: *const TopicData, buf: []u8, pos: *usize, version: i16) void {
-            ser.writeCompactString(buf, pos, self.topic_name);
+            if (version <= 1) {
+                ser.writeCompactString(buf, pos, self.topic_name);
+            }
             if (version >= 2) {
                 ser.writeUuid(buf, pos, self.topic_id);
             }
@@ -168,7 +176,9 @@ pub const AlterPartitionRequest = struct {
 
         pub fn deserialize(alloc: Allocator, buf: []const u8, pos: *usize, version: i16) !TopicData {
             var result = TopicData{};
-            result.topic_name = try ser.readCompactString(buf, pos);
+            if (version <= 1) {
+                result.topic_name = try ser.readCompactString(buf, pos);
+            }
             if (version >= 2) {
                 result.topic_id = try ser.readUuid(buf, pos);
             }
@@ -186,7 +196,9 @@ pub const AlterPartitionRequest = struct {
 
         pub fn calcSize(self: *const TopicData, version: i16) usize {
             var size: usize = 0;
-            size += ser.compactStringSize(self.topic_name);
+            if (version <= 1) {
+                size += ser.compactStringSize(self.topic_name);
+            }
             if (version >= 2) {
                 size += 16;
             }
@@ -205,7 +217,7 @@ pub const AlterPartitionRequest = struct {
     /// The epoch of the requesting broker
     /// Versions: 0+
     broker_epoch: i64 = -1,
-    /// 
+    ///
     /// Versions: 0+
     topics: []const TopicData = &.{},
 

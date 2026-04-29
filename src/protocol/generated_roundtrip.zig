@@ -256,6 +256,89 @@ test "generated non-default golden fixtures cover legacy and flexible wire encod
     }
 
     {
+        const AlterPartitionRequest = generated.alter_partition_request.AlterPartitionRequest;
+        const partitions = [_]AlterPartitionRequest.TopicData.PartitionData{.{
+            .partition_index = 2,
+            .leader_epoch = 5,
+            .new_isr = &[_]i32{ 1, 3 },
+            .leader_recovery_state = 1,
+            .partition_epoch = 12,
+        }};
+        const topics = [_]AlterPartitionRequest.TopicData{.{
+            .topic_name = "topic-a",
+            .partitions = &partitions,
+        }};
+        const value = AlterPartitionRequest{
+            .broker_id = 7,
+            .broker_epoch = 9,
+            .topics = &topics,
+        };
+        try expectGoldenRoundTrip(AlterPartitionRequest, value, 1, &[_]u8{
+            0x00, 0x00, 0x00, 0x07,
+            0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x09,
+            0x02, 0x08, 't',  'o',
+            'p',  'i',  'c',  '-',
+            'a',  0x02, 0x00, 0x00,
+            0x00, 0x02, 0x00, 0x00,
+            0x00, 0x05, 0x03, 0x00,
+            0x00, 0x00, 0x01, 0x00,
+            0x00, 0x00, 0x03, 0x01,
+            0x00, 0x00, 0x00, 0x0c,
+            0x00, 0x00, 0x00,
+        });
+    }
+
+    {
+        const AlterPartitionRequest = generated.alter_partition_request.AlterPartitionRequest;
+        const topic_id = [_]u8{
+            0x00, 0x01, 0x02, 0x03,
+            0x04, 0x05, 0x06, 0x07,
+            0x08, 0x09, 0x0a, 0x0b,
+            0x0c, 0x0d, 0x0e, 0x0f,
+        };
+        const broker_states = [_]AlterPartitionRequest.TopicData.PartitionData.BrokerState{.{
+            .broker_id = 1,
+            .broker_epoch = 8,
+        }};
+        const partitions = [_]AlterPartitionRequest.TopicData.PartitionData{.{
+            .partition_index = 2,
+            .leader_epoch = 5,
+            .new_isr = &[_]i32{99},
+            .new_isr_with_epochs = &broker_states,
+            .leader_recovery_state = 1,
+            .partition_epoch = 12,
+        }};
+        const topics = [_]AlterPartitionRequest.TopicData{.{
+            .topic_name = "legacy-name",
+            .topic_id = topic_id,
+            .partitions = &partitions,
+        }};
+        const value = AlterPartitionRequest{
+            .broker_id = 7,
+            .broker_epoch = 9,
+            .topics = &topics,
+        };
+        try expectGoldenRoundTrip(AlterPartitionRequest, value, 3, &[_]u8{
+            0x00, 0x00, 0x00, 0x07,
+            0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x09,
+            0x02, 0x00, 0x01, 0x02,
+            0x03, 0x04, 0x05, 0x06,
+            0x07, 0x08, 0x09, 0x0a,
+            0x0b, 0x0c, 0x0d, 0x0e,
+            0x0f, 0x02, 0x00, 0x00,
+            0x00, 0x02, 0x00, 0x00,
+            0x00, 0x05, 0x02, 0x00,
+            0x00, 0x00, 0x01, 0x00,
+            0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x08, 0x00,
+            0x01, 0x00, 0x00, 0x00,
+            0x0c, 0x00, 0x00, 0x00,
+        });
+    }
+
+    {
         const ProduceRequest = generated.produce_request.ProduceRequest;
         const partitions = [_]ProduceRequest.TopicProduceData.PartitionProduceData{
             .{ .index = 2, .records = &[_]u8{ 0x01, 0x02, 0x03 } },
