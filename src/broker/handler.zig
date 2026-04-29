@@ -6131,11 +6131,26 @@ pub const Broker = struct {
         }
         var topics_init: usize = 0;
         var created_any = false;
+        var created_topics: []bool = &.{};
+        if (req.topics.len > 0) {
+            created_topics = self.allocator.alloc(bool, req.topics.len) catch {
+                if (topics.len > 0) self.allocator.free(topics);
+                return null;
+            };
+            @memset(created_topics, false);
+        }
+        const previous_snapshot = if (!req.validate_only) self.encodeTopicSnapshotRecordValue() catch {
+            if (created_topics.len > 0) self.allocator.free(created_topics);
+            if (topics.len > 0) self.allocator.free(topics);
+            return null;
+        } else null;
         defer {
+            if (previous_snapshot) |snapshot| self.allocator.free(snapshot);
+            if (created_topics.len > 0) self.allocator.free(created_topics);
             if (topics.len > 0) self.allocator.free(topics);
         }
 
-        for (req.topics) |topic_req| {
+        for (req.topics, 0..) |topic_req, topic_index| {
             const topic_name = topic_req.name orelse "";
             const actual_partitions = self.createTopicsPartitionCount(&topic_req);
             const actual_rf = self.createTopicsReplicationFactor(&topic_req);
@@ -6180,6 +6195,7 @@ pub const Broker = struct {
                 }
                 log.info("Created topic '{s}' ({d} partitions)", .{ topic_name, actual_partitions });
                 created_any = true;
+                created_topics[topic_index] = true;
             }
 
             topics[topics_init] = .{
@@ -6195,7 +6211,26 @@ pub const Broker = struct {
         }
 
         if (created_any) {
-            self.persistTopics();
+            self.writeTopicSnapshotRecord() catch |err| {
+                log.warn("Failed to append CreateTopics topic snapshot to __cluster_metadata: {}", .{err});
+                self.restoreTopicsAfterFailedMutation(previous_snapshot.?);
+                for (req.topics, topics[0..topics_init], created_topics) |topic_req, *response, was_created| {
+                    if (was_created and response.error_code == @intFromEnum(ErrorCode.none)) {
+                        const topic_name = topic_req.name orelse "";
+                        const actual_partitions = self.createTopicsPartitionCount(&topic_req);
+                        self.removeTopicPartitionRange(topic_name, 0, actual_partitions);
+                        response.error_code = @intFromEnum(ErrorCode.kafka_storage_error);
+                        response.error_message = "Failed to persist topic metadata";
+                        response.topic_id = zeroUuid();
+                    }
+                }
+                const resp = Resp{
+                    .throttle_time_ms = 0,
+                    .topics = topics[0..topics_init],
+                };
+                return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+            };
+            self.persistTopicsLocal();
             self.persistObjectManagerSnapshot();
         }
 
@@ -27545,6 +27580,65 @@ test "Broker.handleRequest CreateTopics validate_only does not create topic" {
     try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.none)), resp.topics[0].error_code);
     try testing.expectEqual(@as(i32, 1), resp.topics[0].num_partitions);
     try testing.expect(!broker.topics.contains("ct-validate-only-topic"));
+}
+
+test "Broker.handleRequest CreateTopics rolls back when topic snapshot S3 WAL write fails" {
+    const Req = generated.create_topics_request.CreateTopicsRequest;
+    const Resp = generated.create_topics_response.CreateTopicsResponse;
+
+    var mock_s3 = storage.MockS3.init(testing.allocator);
+    defer mock_s3.deinit();
+    const s3_storage = storage.S3Storage.initMock(testing.allocator, &mock_s3);
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+    broker.store.s3_wal_mode = true;
+    broker.store.s3_storage = s3_storage;
+    broker.store.s3_wal_batcher = storage.wal.S3WalBatcher.init(testing.allocator);
+
+    try broker.open();
+    const object_count_before = mock_s3.objectCount();
+    mock_s3.failNextPutObjects(3);
+
+    const topics = [_]Req.CreatableTopic{.{
+        .name = "ct-s3-fail-topic",
+        .num_partitions = 2,
+        .replication_factor = 1,
+    }};
+    const req = Req{
+        .topics = &topics,
+        .timeout_ms = 30000,
+        .validate_only = false,
+    };
+
+    var buf: [512]u8 = undefined;
+    var pos = buildTestRequest(&buf, 19, 7, 1920, header_mod.requestHeaderVersion(19, 7));
+    req.serialize(&buf, &pos, 7);
+
+    const response = broker.handleRequest(buf[0..pos]);
+    try testing.expect(response != null);
+    defer testing.allocator.free(response.?);
+
+    var rpos: usize = 0;
+    var response_header = try ResponseHeader.deserialize(testing.allocator, response.?, &rpos, header_mod.responseHeaderVersion(19, 7));
+    defer response_header.deinit(testing.allocator);
+    try testing.expectEqual(@as(i32, 1920), response_header.correlation_id);
+
+    const resp = try Resp.deserialize(testing.allocator, response.?, &rpos, 7);
+    defer {
+        for (resp.topics) |topic| {
+            if (topic.configs.len > 0) testing.allocator.free(topic.configs);
+        }
+        if (resp.topics.len > 0) testing.allocator.free(resp.topics);
+    }
+
+    try testing.expectEqual(response.?.len, rpos);
+    try testing.expectEqual(@as(usize, 1), resp.topics.len);
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.kafka_storage_error)), resp.topics[0].error_code);
+    try testing.expect(!broker.topics.contains("ct-s3-fail-topic"));
+    try testing.expect(!broker.store.partitions.contains("ct-s3-fail-topic-0"));
+    try testing.expect(!broker.store.partitions.contains("ct-s3-fail-topic-1"));
+    try testing.expectEqual(object_count_before, mock_s3.objectCount());
 }
 
 test "Broker.handleRequest CreateTopics rejects truncated request" {
