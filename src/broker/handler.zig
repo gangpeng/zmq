@@ -11815,6 +11815,9 @@ pub const Broker = struct {
         }
 
         var partition_state_dirty = false;
+        const previous_snapshot = self.encodeTransactionSnapshotRecordValue() catch return null;
+        defer self.allocator.free(previous_snapshot);
+
         for (req.markers) |marker| {
             const topics = self.allocator.alloc(TopicResult, marker.topics.len) catch return null;
             var topics_init: usize = 0;
@@ -11876,6 +11879,7 @@ pub const Broker = struct {
         }
         self.persistTransactionsIfDirtyDurably() catch |err| {
             log.warn("WriteTxnMarkers transaction snapshot write failed: {}", .{err});
+            self.restoreTransactionsAfterFailedMutation(previous_snapshot);
             for (markers[0..markers_init]) |*marker| {
                 applyWriteTxnMarkerError(marker.topics, @intFromEnum(ErrorCode.kafka_storage_error));
             }
@@ -17837,6 +17841,74 @@ test "Broker.handleRequest WriteTxnMarkers preserves local transaction when part
     try testing.expectEqual(@as(usize, 1), txn.partitions.items.len);
     try testing.expectEqualStrings("txn-marker-partition-error-topic", txn.partitions.items[0].topic);
     try testing.expectEqual(@as(i32, 0), txn.partitions.items[0].partition);
+}
+
+test "Broker.handleRequest WriteTxnMarkers rolls back when transaction snapshot S3 WAL write fails" {
+    const Req = generated.write_txn_markers_request.WriteTxnMarkersRequest;
+    const Resp = generated.write_txn_markers_response.WriteTxnMarkersResponse;
+
+    var mock_s3 = storage.MockS3.init(testing.allocator);
+    defer mock_s3.deinit();
+    const s3_storage = storage.S3Storage.initMock(testing.allocator, &mock_s3);
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+    broker.store.s3_wal_mode = true;
+    broker.store.s3_storage = s3_storage;
+    broker.store.s3_wal_batcher = storage.wal.S3WalBatcher.init(testing.allocator);
+    try broker.open();
+
+    const init_result = try broker.txn_coordinator.initProducerId("txn-marker-snapshot-fail");
+    const pid = init_result.producer_id;
+    broker.txn_coordinator.transactions.getPtr(pid).?.status = .prepare_commit;
+    broker.txn_coordinator.dirty = true;
+    try broker.persistTransactionsIfDirtyDurably();
+
+    const object_count_before = mock_s3.objectCount();
+    mock_s3.failNextPutObjects(3);
+
+    const topics = [_]Req.WritableTxnMarker.WritableTxnMarkerTopic{};
+    const markers = [_]Req.WritableTxnMarker{.{
+        .producer_id = pid,
+        .producer_epoch = init_result.producer_epoch,
+        .transaction_result = true,
+        .topics = &topics,
+        .coordinator_epoch = 0,
+    }};
+    const req = Req{ .markers = &markers };
+
+    var buf: [512]u8 = undefined;
+    var pos = buildTestRequest(&buf, 27, 1, 2707, header_mod.requestHeaderVersion(27, 1));
+    req.serialize(&buf, &pos, 1);
+
+    const response = broker.handleRequest(buf[0..pos]);
+    try testing.expect(response != null);
+    defer testing.allocator.free(response.?);
+
+    var rpos: usize = 0;
+    var response_header = try ResponseHeader.deserialize(testing.allocator, response.?, &rpos, header_mod.responseHeaderVersion(27, 1));
+    defer response_header.deinit(testing.allocator);
+    try testing.expectEqual(@as(i32, 2707), response_header.correlation_id);
+
+    const resp = try Resp.deserialize(testing.allocator, response.?, &rpos, 1);
+    defer {
+        for (resp.markers) |marker| {
+            for (marker.topics) |topic| {
+                if (topic.partitions.len > 0) testing.allocator.free(topic.partitions);
+            }
+            if (marker.topics.len > 0) testing.allocator.free(marker.topics);
+        }
+        if (resp.markers.len > 0) testing.allocator.free(resp.markers);
+    }
+
+    try testing.expectEqual(response.?.len, rpos);
+    try testing.expectEqual(@as(usize, 1), resp.markers.len);
+    try testing.expectEqual(pid, resp.markers[0].producer_id);
+    try testing.expectEqual(@as(usize, 0), resp.markers[0].topics.len);
+    try testing.expectEqual(TxnCoordinator.TxnStatus.prepare_commit, broker.txn_coordinator.getStatus(pid).?);
+    try testing.expectEqual(@as(usize, 0), broker.txn_coordinator.getPartitions(pid).?.len);
+    try testing.expect(!broker.txn_coordinator.dirty);
+    try testing.expectEqual(object_count_before, mock_s3.objectCount());
 }
 
 test "Broker.handleRequest WriteTxnMarkers rejects unknown topic partition" {
