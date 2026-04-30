@@ -13925,8 +13925,12 @@ pub const Broker = struct {
         for (partitions) |partition| {
             if (partition.replica_nodes.len > 0) self.allocator.free(partition.replica_nodes);
             if (partition.isr_nodes.len > 0) self.allocator.free(partition.isr_nodes);
-            if (partition.eligible_leader_replicas.len > 0) self.allocator.free(partition.eligible_leader_replicas);
-            if (partition.last_known_elr.len > 0) self.allocator.free(partition.last_known_elr);
+            if (partition.eligible_leader_replicas) |eligible_leader_replicas| {
+                if (eligible_leader_replicas.len > 0) self.allocator.free(eligible_leader_replicas);
+            }
+            if (partition.last_known_elr) |last_known_elr| {
+                if (last_known_elr.len > 0) self.allocator.free(last_known_elr);
+            }
             if (partition.offline_replicas.len > 0) self.allocator.free(partition.offline_replicas);
         }
     }
@@ -14022,8 +14026,8 @@ pub const Broker = struct {
             .leader_epoch = if (self.raft_state) |rs| rs.current_epoch else self.cached_leader_epoch,
             .replica_nodes = replicas,
             .isr_nodes = isr,
-            .eligible_leader_replicas = &.{},
-            .last_known_elr = &.{},
+            .eligible_leader_replicas = null,
+            .last_known_elr = null,
             .offline_replicas = &.{},
         };
     }
@@ -16481,8 +16485,12 @@ fn freeDeserializedDescribeTopicPartitionsResponse(resp: *const generated.descri
         for (topic.partitions) |partition| {
             if (partition.replica_nodes.len > 0) testing.allocator.free(partition.replica_nodes);
             if (partition.isr_nodes.len > 0) testing.allocator.free(partition.isr_nodes);
-            if (partition.eligible_leader_replicas.len > 0) testing.allocator.free(partition.eligible_leader_replicas);
-            if (partition.last_known_elr.len > 0) testing.allocator.free(partition.last_known_elr);
+            if (partition.eligible_leader_replicas) |eligible_leader_replicas| {
+                if (eligible_leader_replicas.len > 0) testing.allocator.free(eligible_leader_replicas);
+            }
+            if (partition.last_known_elr) |last_known_elr| {
+                if (last_known_elr.len > 0) testing.allocator.free(last_known_elr);
+            }
             if (partition.offline_replicas.len > 0) testing.allocator.free(partition.offline_replicas);
         }
         if (topic.partitions.len > 0) testing.allocator.free(topic.partitions);
@@ -26906,6 +26914,8 @@ test "Broker.handleRequest DescribeTopicPartitions returns generated metadata an
     try testing.expectEqual(@as(i32, 7), resp.topics[0].partitions[0].replica_nodes[0]);
     try testing.expectEqual(@as(usize, 1), resp.topics[0].partitions[0].isr_nodes.len);
     try testing.expectEqual(@as(i32, 7), resp.topics[0].partitions[0].isr_nodes[0]);
+    try testing.expect(resp.topics[0].partitions[0].eligible_leader_replicas == null);
+    try testing.expect(resp.topics[0].partitions[0].last_known_elr == null);
 
     try testing.expectEqualStrings("missing-dtp-topic", resp.topics[1].name.?);
     try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.unknown_topic_or_partition)), resp.topics[1].error_code);

@@ -238,6 +238,9 @@ Status: completed for the initial catalog and DeleteGroups slice.
   AutomqGetPartitionSnapshotResponse now preserves nullable partition
   `StreamMetadata` so absent stream deltas stay distinct from explicit empty
   stream metadata lists.
+  DescribeTopicPartitionsResponse now preserves nullable
+  `EligibleLeaderReplicas` and `LastKnownElr` so unknown ELR state remains
+  distinct from explicit empty ELR state.
   StopReplicaRequest generated encoding now honors its legacy field version
   bounds exactly: v0 `UngroupedPartitions`, v0-v2 `DeletePartitions`, v1-v2
   grouped `Topics`, and v3+ `TopicStates` have non-default golden fixtures.

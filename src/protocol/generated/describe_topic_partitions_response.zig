@@ -31,10 +31,10 @@ pub const DescribeTopicPartitionsResponse = struct {
             isr_nodes: []const i32 = &.{},
             /// The new eligible leader replicas otherwise.
             /// Versions: 0+
-            eligible_leader_replicas: []const i32 = &.{},
+            eligible_leader_replicas: ?[]const i32 = null,
             /// The last known ELR.
             /// Versions: 0+
-            last_known_elr: []const i32 = &.{},
+            last_known_elr: ?[]const i32 = null,
             /// The set of offline replicas of this partition.
             /// Versions: 0+
             offline_replicas: []const i32 = &.{},
@@ -52,13 +52,21 @@ pub const DescribeTopicPartitionsResponse = struct {
                 for (self.isr_nodes) |item| {
                     ser.writeI32(buf, pos, item);
                 }
-                ser.writeCompactArrayLen(buf, pos, self.eligible_leader_replicas.len);
-                for (self.eligible_leader_replicas) |item| {
-                    ser.writeI32(buf, pos, item);
+                if (self.eligible_leader_replicas) |eligible_leader_replicas| {
+                    ser.writeCompactArrayLen(buf, pos, eligible_leader_replicas.len);
+                    for (eligible_leader_replicas) |item| {
+                        ser.writeI32(buf, pos, item);
+                    }
+                } else {
+                    ser.writeCompactArrayLen(buf, pos, null);
                 }
-                ser.writeCompactArrayLen(buf, pos, self.last_known_elr.len);
-                for (self.last_known_elr) |item| {
-                    ser.writeI32(buf, pos, item);
+                if (self.last_known_elr) |last_known_elr| {
+                    ser.writeCompactArrayLen(buf, pos, last_known_elr.len);
+                    for (last_known_elr) |item| {
+                        ser.writeI32(buf, pos, item);
+                    }
+                } else {
+                    ser.writeCompactArrayLen(buf, pos, null);
                 }
                 ser.writeCompactArrayLen(buf, pos, self.offline_replicas.len);
                 for (self.offline_replicas) |item| {
@@ -69,6 +77,18 @@ pub const DescribeTopicPartitionsResponse = struct {
 
             pub fn deserialize(alloc: Allocator, buf: []const u8, pos: *usize, _: i16) !DescribeTopicPartitionsResponsePartition {
                 var result = DescribeTopicPartitionsResponsePartition{};
+                errdefer {
+                    if (result.replica_nodes.len > 0) alloc.free(result.replica_nodes);
+                    if (result.isr_nodes.len > 0) alloc.free(result.isr_nodes);
+                    if (result.eligible_leader_replicas) |eligible_leader_replicas| {
+                        if (eligible_leader_replicas.len > 0) alloc.free(eligible_leader_replicas);
+                    }
+                    if (result.last_known_elr) |last_known_elr| {
+                        if (last_known_elr.len > 0) alloc.free(last_known_elr);
+                    }
+                    if (result.offline_replicas.len > 0) alloc.free(result.offline_replicas);
+                }
+
                 result.error_code = ser.readI16(buf, pos);
                 result.partition_index = ser.readI32(buf, pos);
                 result.leader_id = ser.readI32(buf, pos);
@@ -89,21 +109,35 @@ pub const DescribeTopicPartitionsResponse = struct {
                     }
                     result.isr_nodes = isr_nodes_items;
                 }
-                const eligible_leader_replicas_len: usize = (try ser.readCompactArrayLen(buf, pos)) orelse 0;
-                if (eligible_leader_replicas_len > 0) {
-                    const eligible_leader_replicas_items = try alloc.alloc(i32, eligible_leader_replicas_len);
-                    for (eligible_leader_replicas_items) |*item| {
-                        item.* = ser.readI32(buf, pos);
+                const eligible_leader_replicas_len: ?usize = try ser.readCompactArrayLen(buf, pos);
+                if (eligible_leader_replicas_len) |len| {
+                    if (len == 0) {
+                        result.eligible_leader_replicas = &.{};
+                    } else {
+                        const eligible_leader_replicas_items = try alloc.alloc(i32, len);
+                        errdefer alloc.free(eligible_leader_replicas_items);
+                        for (eligible_leader_replicas_items) |*item| {
+                            item.* = ser.readI32(buf, pos);
+                        }
+                        result.eligible_leader_replicas = eligible_leader_replicas_items;
                     }
-                    result.eligible_leader_replicas = eligible_leader_replicas_items;
+                } else {
+                    result.eligible_leader_replicas = null;
                 }
-                const last_known_elr_len: usize = (try ser.readCompactArrayLen(buf, pos)) orelse 0;
-                if (last_known_elr_len > 0) {
-                    const last_known_elr_items = try alloc.alloc(i32, last_known_elr_len);
-                    for (last_known_elr_items) |*item| {
-                        item.* = ser.readI32(buf, pos);
+                const last_known_elr_len: ?usize = try ser.readCompactArrayLen(buf, pos);
+                if (last_known_elr_len) |len| {
+                    if (len == 0) {
+                        result.last_known_elr = &.{};
+                    } else {
+                        const last_known_elr_items = try alloc.alloc(i32, len);
+                        errdefer alloc.free(last_known_elr_items);
+                        for (last_known_elr_items) |*item| {
+                            item.* = ser.readI32(buf, pos);
+                        }
+                        result.last_known_elr = last_known_elr_items;
                     }
-                    result.last_known_elr = last_known_elr_items;
+                } else {
+                    result.last_known_elr = null;
                 }
                 const offline_replicas_len: usize = (try ser.readCompactArrayLen(buf, pos)) orelse 0;
                 if (offline_replicas_len > 0) {
@@ -127,10 +161,18 @@ pub const DescribeTopicPartitionsResponse = struct {
                 size += self.replica_nodes.len * 4;
                 size += ser.unsignedVarintSize(self.isr_nodes.len + 1);
                 size += self.isr_nodes.len * 4;
-                size += ser.unsignedVarintSize(self.eligible_leader_replicas.len + 1);
-                size += self.eligible_leader_replicas.len * 4;
-                size += ser.unsignedVarintSize(self.last_known_elr.len + 1);
-                size += self.last_known_elr.len * 4;
+                if (self.eligible_leader_replicas) |eligible_leader_replicas| {
+                    size += ser.unsignedVarintSize(eligible_leader_replicas.len + 1);
+                    size += eligible_leader_replicas.len * 4;
+                } else {
+                    size += 1;
+                }
+                if (self.last_known_elr) |last_known_elr| {
+                    size += ser.unsignedVarintSize(last_known_elr.len + 1);
+                    size += last_known_elr.len * 4;
+                } else {
+                    size += 1;
+                }
                 size += ser.unsignedVarintSize(self.offline_replicas.len + 1);
                 size += self.offline_replicas.len * 4;
                 size += 1;

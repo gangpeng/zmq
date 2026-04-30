@@ -1668,6 +1668,84 @@ test "generated non-default golden fixtures cover legacy and flexible wire encod
     }
 
     {
+        const DescribeTopicPartitionsResponse = generated.describe_topic_partitions_response.DescribeTopicPartitionsResponse;
+        const Topic = DescribeTopicPartitionsResponse.DescribeTopicPartitionsResponseTopic;
+        const Partition = Topic.DescribeTopicPartitionsResponsePartition;
+        const replicas = [_]i32{7};
+
+        const null_elr_partitions = [_]Partition{.{
+            .partition_index = 0,
+            .leader_id = 7,
+            .leader_epoch = 4,
+            .replica_nodes = &replicas,
+            .isr_nodes = &replicas,
+            .eligible_leader_replicas = null,
+            .last_known_elr = null,
+        }};
+        const null_elr_topics = [_]Topic{.{
+            .name = "t",
+            .partitions = &null_elr_partitions,
+        }};
+        const null_elr_value = DescribeTopicPartitionsResponse{
+            .topics = &null_elr_topics,
+        };
+        try expectGoldenRoundTrip(DescribeTopicPartitionsResponse, null_elr_value, 0, &[_]u8{
+            0x00, 0x00, 0x00, 0x00,
+            0x02, 0x00, 0x00, 0x02,
+            't',  0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x02, 0x00,
+            0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00,
+            0x07, 0x00, 0x00, 0x00,
+            0x04, 0x02, 0x00, 0x00,
+            0x00, 0x07, 0x02, 0x00,
+            0x00, 0x00, 0x07, 0x00,
+            0x00, 0x01, 0x00, 0x80,
+            0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00,
+        });
+
+        const empty_elr = [_]i32{};
+        const empty_elr_partitions = [_]Partition{.{
+            .partition_index = 0,
+            .leader_id = 7,
+            .leader_epoch = 4,
+            .replica_nodes = &replicas,
+            .isr_nodes = &replicas,
+            .eligible_leader_replicas = &empty_elr,
+            .last_known_elr = &empty_elr,
+        }};
+        const empty_elr_topics = [_]Topic{.{
+            .name = "t",
+            .partitions = &empty_elr_partitions,
+        }};
+        const empty_elr_value = DescribeTopicPartitionsResponse{
+            .topics = &empty_elr_topics,
+        };
+        try expectGoldenRoundTrip(DescribeTopicPartitionsResponse, empty_elr_value, 0, &[_]u8{
+            0x00, 0x00, 0x00, 0x00,
+            0x02, 0x00, 0x00, 0x02,
+            't',  0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x02, 0x00,
+            0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00,
+            0x07, 0x00, 0x00, 0x00,
+            0x04, 0x02, 0x00, 0x00,
+            0x00, 0x07, 0x02, 0x00,
+            0x00, 0x00, 0x07, 0x01,
+            0x01, 0x01, 0x00, 0x80,
+            0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00,
+        });
+    }
+
+    {
         const SnapshotResponse = generated.automq_get_partition_snapshot_response.AutomqGetPartitionSnapshotResponse;
         const PartitionSnapshot = SnapshotResponse.Topic.PartitionSnapshot;
 
