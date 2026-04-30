@@ -13349,10 +13349,12 @@ pub const Broker = struct {
     }
 
     fn freeDescribeLogDirsRequest(self: *Broker, req: *generated.describe_log_dirs_request.DescribeLogDirsRequest) void {
-        for (req.topics) |topic| {
-            if (topic.partitions.len > 0) self.allocator.free(topic.partitions);
+        if (req.topics) |topics| {
+            for (topics) |topic| {
+                if (topic.partitions.len > 0) self.allocator.free(topic.partitions);
+            }
+            if (topics.len > 0) self.allocator.free(topics);
         }
-        if (req.topics.len > 0) self.allocator.free(req.topics);
     }
 
     fn collectDescribeLogDirsTopics(self: *Broker, req: *const generated.describe_log_dirs_request.DescribeLogDirsRequest) ![]generated.describe_log_dirs_response.DescribeLogDirsResponse.DescribeLogDirsResult.DescribeLogDirsTopic {
@@ -13364,7 +13366,7 @@ pub const Broker = struct {
             topics.deinit();
         }
 
-        if (req.topics.len == 0) {
+        if (req.topics == null) {
             var topic_iter = self.topics.iterator();
             while (topic_iter.next()) |entry| {
                 const info = entry.value_ptr;
@@ -13378,7 +13380,7 @@ pub const Broker = struct {
                 };
             }
         } else {
-            for (req.topics) |topic_req| {
+            for (req.topics.?) |topic_req| {
                 const topic_name = topic_req.topic orelse "";
                 const info = self.topics.get(topic_name);
                 const partitions = try self.collectDescribeLogDirsPartitions(topic_name, info, topic_req.partitions);
@@ -25345,6 +25347,78 @@ test "Broker.handleRequest DescribeLogDirs scopes flexible response to requested
     try testing.expectEqual(@as(i64, 3), resp.results[0].topics[0].partitions[0].partition_size);
     try testing.expectEqualStrings("missing-topic", resp.results[0].topics[1].name.?);
     try testing.expectEqual(@as(usize, 0), resp.results[0].topics[1].partitions.len);
+}
+
+test "Broker.handleRequest DescribeLogDirs distinguishes null and empty topics" {
+    const Req = generated.describe_log_dirs_request.DescribeLogDirsRequest;
+    const Resp = generated.describe_log_dirs_response.DescribeLogDirsResponse;
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+    try testing.expect(broker.ensureTopic("log-null-empty-a"));
+    try testing.expect(broker.ensureTopic("log-null-empty-b"));
+
+    var buf: [1024]u8 = undefined;
+
+    {
+        const req = Req{ .topics = null };
+        var pos = buildTestRequest(&buf, 35, 2, 3504, header_mod.requestHeaderVersion(35, 2));
+        req.serialize(&buf, &pos, 2);
+
+        const response = broker.handleRequest(buf[0..pos]);
+        try testing.expect(response != null);
+        defer testing.allocator.free(response.?);
+
+        var rpos: usize = 0;
+        var response_header = try ResponseHeader.deserialize(testing.allocator, response.?, &rpos, header_mod.responseHeaderVersion(35, 2));
+        defer response_header.deinit(testing.allocator);
+        try testing.expectEqual(@as(i32, 3504), response_header.correlation_id);
+
+        const resp = try Resp.deserialize(testing.allocator, response.?, &rpos, 2);
+        defer {
+            for (resp.results) |result| {
+                for (result.topics) |topic| {
+                    if (topic.partitions.len > 0) testing.allocator.free(topic.partitions);
+                }
+                if (result.topics.len > 0) testing.allocator.free(result.topics);
+            }
+            if (resp.results.len > 0) testing.allocator.free(resp.results);
+        }
+
+        try testing.expectEqual(response.?.len, rpos);
+        try testing.expectEqual(@as(usize, 1), resp.results.len);
+        try testing.expectEqual(@as(usize, 2), resp.results[0].topics.len);
+    }
+
+    {
+        const req = Req{ .topics = &.{} };
+        var pos = buildTestRequest(&buf, 35, 2, 3505, header_mod.requestHeaderVersion(35, 2));
+        req.serialize(&buf, &pos, 2);
+
+        const response = broker.handleRequest(buf[0..pos]);
+        try testing.expect(response != null);
+        defer testing.allocator.free(response.?);
+
+        var rpos: usize = 0;
+        var response_header = try ResponseHeader.deserialize(testing.allocator, response.?, &rpos, header_mod.responseHeaderVersion(35, 2));
+        defer response_header.deinit(testing.allocator);
+        try testing.expectEqual(@as(i32, 3505), response_header.correlation_id);
+
+        const resp = try Resp.deserialize(testing.allocator, response.?, &rpos, 2);
+        defer {
+            for (resp.results) |result| {
+                for (result.topics) |topic| {
+                    if (topic.partitions.len > 0) testing.allocator.free(topic.partitions);
+                }
+                if (result.topics.len > 0) testing.allocator.free(result.topics);
+            }
+            if (resp.results.len > 0) testing.allocator.free(resp.results);
+        }
+
+        try testing.expectEqual(response.?.len, rpos);
+        try testing.expectEqual(@as(usize, 1), resp.results.len);
+        try testing.expectEqual(@as(usize, 0), resp.results[0].topics.len);
+    }
 }
 
 test "Broker.handleRequest DescribeLogDirs rejects truncated request" {

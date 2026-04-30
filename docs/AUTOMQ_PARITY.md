@@ -211,6 +211,8 @@ Status: completed for the initial catalog and DeleteGroups slice.
   topic lists.
   DescribeConfigsRequest now preserves nullable `ConfigurationKeys` so null
   requests all configs while explicit empty arrays request no config entries.
+  DescribeLogDirsRequest now preserves nullable `Topics` so null lists all
+  topic log dirs while explicit empty arrays return no topic entries.
   AlterPartitionReassignmentsRequest now preserves nullable `Replicas` so null
   cancels pending reassignments while explicit empty assignments fail closed.
   ListPartitionReassignmentsRequest now preserves nullable `Topics` so null

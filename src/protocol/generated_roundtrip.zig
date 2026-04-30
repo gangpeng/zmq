@@ -568,6 +568,26 @@ test "generated non-default golden fixtures cover legacy and flexible wire encod
     }
 
     {
+        const DescribeLogDirsRequest = generated.describe_log_dirs_request.DescribeLogDirsRequest;
+        const null_value = DescribeLogDirsRequest{
+            .topics = null,
+        };
+        try expectGoldenRoundTrip(DescribeLogDirsRequest, null_value, 0, &[_]u8{
+            0xff, 0xff, 0xff, 0xff,
+        });
+        try expectGoldenRoundTrip(DescribeLogDirsRequest, null_value, 2, &[_]u8{
+            0x00, 0x00,
+        });
+
+        const empty_value = DescribeLogDirsRequest{
+            .topics = &.{},
+        };
+        try expectGoldenRoundTrip(DescribeLogDirsRequest, empty_value, 2, &[_]u8{
+            0x01, 0x00,
+        });
+    }
+
+    {
         const DescribeConfigsResponse = generated.describe_configs_response.DescribeConfigsResponse;
         const synonyms = [_]DescribeConfigsResponse.DescribeConfigsResult.DescribeConfigsResourceResult.DescribeConfigsSynonym{.{
             .name = "cleanup.policy",

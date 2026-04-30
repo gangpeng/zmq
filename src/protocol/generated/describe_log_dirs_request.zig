@@ -75,32 +75,46 @@ pub const DescribeLogDirsRequest = struct {
 
     /// Each topic that we want to describe log directories for, or null for all topics.
     /// Versions: 0+
-    topics: []const DescribableLogDirTopic = &.{},
+    topics: ?[]const DescribableLogDirTopic = null,
 
     pub fn serialize(self: *const DescribeLogDirsRequest, buf: []u8, pos: *usize, version: i16) void {
-        if (version >= 2) {
-            ser.writeCompactArrayLen(buf, pos, self.topics.len);
+        if (self.topics) |topics| {
+            if (version >= 2) {
+                ser.writeCompactArrayLen(buf, pos, topics.len);
+            } else {
+                ser.writeArrayLen(buf, pos, topics.len);
+            }
+            for (topics) |item| {
+                item.serialize(buf, pos, version);
+            }
         } else {
-            ser.writeArrayLen(buf, pos, self.topics.len);
-        }
-        for (self.topics) |item| {
-            item.serialize(buf, pos, version);
+            if (version >= 2) {
+                ser.writeCompactArrayLen(buf, pos, null);
+            } else {
+                ser.writeArrayLen(buf, pos, null);
+            }
         }
         if (version >= 2) ser.writeEmptyTaggedFields(buf, pos);
     }
 
     pub fn deserialize(alloc: Allocator, buf: []const u8, pos: *usize, version: i16) !DescribeLogDirsRequest {
         var result = DescribeLogDirsRequest{};
-        const topics_len: usize = if (version >= 2)
-            (try ser.readCompactArrayLen(buf, pos)) orelse 0
+        const topics_len: ?usize = if (version >= 2)
+            try ser.readCompactArrayLen(buf, pos)
         else
-            (try ser.readArrayLen(buf, pos)) orelse 0;
-        if (topics_len > 0) {
-            const topics_items = try alloc.alloc(DescribableLogDirTopic, topics_len);
-            for (topics_items) |*item| {
-                item.* = try DescribableLogDirTopic.deserialize(alloc, buf, pos, version);
+            try ser.readArrayLen(buf, pos);
+        if (topics_len) |len| {
+            if (len == 0) {
+                result.topics = &.{};
+            } else {
+                const topics_items = try alloc.alloc(DescribableLogDirTopic, len);
+                for (topics_items) |*item| {
+                    item.* = try DescribableLogDirTopic.deserialize(alloc, buf, pos, version);
+                }
+                result.topics = topics_items;
             }
-            result.topics = topics_items;
+        } else {
+            result.topics = null;
         }
         if (version >= 2) try ser.skipTaggedFields(buf, pos);
         return result;
@@ -108,13 +122,19 @@ pub const DescribeLogDirsRequest = struct {
 
     pub fn calcSize(self: *const DescribeLogDirsRequest, version: i16) usize {
         var size: usize = 0;
-        if (version >= 2) {
-            size += ser.unsignedVarintSize(self.topics.len + 1);
+        if (self.topics) |topics| {
+            if (version >= 2) {
+                size += ser.unsignedVarintSize(topics.len + 1);
+            } else {
+                size += 4;
+            }
+            for (topics) |item| {
+                size += item.calcSize(version);
+            }
+        } else if (version >= 2) {
+            size += 1;
         } else {
             size += 4;
-        }
-        for (self.topics) |item| {
-            size += item.calcSize(version);
         }
         if (version >= 2) size += 1;
         return size;
