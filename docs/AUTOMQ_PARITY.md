@@ -185,7 +185,8 @@ Status: completed for the initial catalog and DeleteGroups slice.
   overrides fall back to default limits for unset keys.
   DescribeUserScramCredentials now advertises key 50 v0, decodes generated
   flexible requests, rejects malformed frames, describes requested or all
-  SCRAM-SHA-256 users, and reports missing users per result.
+  SCRAM-SHA-256 users, reports missing users per result, and preserves the
+  nullable `Users` wire encoding while keeping null and empty as describe-all.
   AlterUserScramCredentials now advertises key 51 v0, decodes generated
   flexible requests, upserts/removes precomputed SCRAM-SHA-256 credentials,
   rejects unsupported mechanisms, exposes mutations through Describe, writes

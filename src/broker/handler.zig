@@ -11155,7 +11155,8 @@ pub const Broker = struct {
         };
         defer self.freeDescribeUserScramCredentialsRequest(&req);
 
-        const result_count = if (req.users.len > 0) req.users.len else self.scram_authenticator.users.count();
+        const requested_users = req.users orelse &.{};
+        const result_count = if (requested_users.len > 0) requested_users.len else self.scram_authenticator.users.count();
         var results: []Result = &.{};
         if (result_count > 0) {
             results = self.allocator.alloc(Result, result_count) catch return null;
@@ -11166,8 +11167,8 @@ pub const Broker = struct {
             if (results.len > 0) self.allocator.free(results);
         }
 
-        if (req.users.len > 0) {
-            for (req.users) |user| {
+        if (requested_users.len > 0) {
+            for (requested_users) |user| {
                 results[results_init] = self.buildDescribeUserScramCredentialResult(user.name) catch return null;
                 results_init += 1;
             }
@@ -11189,7 +11190,9 @@ pub const Broker = struct {
     }
 
     fn freeDescribeUserScramCredentialsRequest(self: *Broker, req: *generated.describe_user_scram_credentials_request.DescribeUserScramCredentialsRequest) void {
-        if (req.users.len > 0) self.allocator.free(req.users);
+        if (req.users) |users| {
+            if (users.len > 0) self.allocator.free(users);
+        }
     }
 
     fn buildDescribeUserScramCredentialResult(self: *Broker, user: ?[]const u8) !generated.describe_user_scram_credentials_response.DescribeUserScramCredentialsResponse.DescribeUserScramCredentialsResult {
@@ -21409,7 +21412,7 @@ test "Broker.handleRequest DescribeUserScramCredentials returns requested SCRAM 
     try testing.expectEqual(@as(usize, 0), resp.results[1].credential_infos.len);
 }
 
-test "Broker.handleRequest DescribeUserScramCredentials empty users describes all" {
+test "Broker.handleRequest DescribeUserScramCredentials null and empty users describe all" {
     const Req = generated.describe_user_scram_credentials_request.DescribeUserScramCredentialsRequest;
     const Resp = generated.describe_user_scram_credentials_response.DescribeUserScramCredentialsResponse;
 
@@ -21440,6 +21443,31 @@ test "Broker.handleRequest DescribeUserScramCredentials empty users describes al
     try testing.expectEqualStrings("scram-all-user", resp.results[0].user.?);
     try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.none)), resp.results[0].error_code);
     try testing.expectEqual(@as(usize, 1), resp.results[0].credential_infos.len);
+
+    const empty_users = [_]Req.UserName{};
+    const empty_req = Req{ .users = &empty_users };
+
+    var empty_buf: [512]u8 = undefined;
+    var empty_pos = buildTestRequest(&empty_buf, 50, 0, 5005, header_mod.requestHeaderVersion(50, 0));
+    empty_req.serialize(&empty_buf, &empty_pos, 0);
+
+    const empty_response = broker.handleRequest(empty_buf[0..empty_pos]);
+    try testing.expect(empty_response != null);
+    defer testing.allocator.free(empty_response.?);
+
+    var empty_rpos: usize = 0;
+    var empty_response_header = try ResponseHeader.deserialize(testing.allocator, empty_response.?, &empty_rpos, header_mod.responseHeaderVersion(50, 0));
+    defer empty_response_header.deinit(testing.allocator);
+    try testing.expectEqual(@as(i32, 5005), empty_response_header.correlation_id);
+
+    const empty_resp = try Resp.deserialize(testing.allocator, empty_response.?, &empty_rpos, 0);
+    defer freeDeserializedDescribeUserScramCredentialsResponse(&empty_resp);
+
+    try testing.expectEqual(empty_response.?.len, empty_rpos);
+    try testing.expectEqual(@as(usize, 1), empty_resp.results.len);
+    try testing.expectEqualStrings("scram-all-user", empty_resp.results[0].user.?);
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.none)), empty_resp.results[0].error_code);
+    try testing.expectEqual(@as(usize, 1), empty_resp.results[0].credential_infos.len);
 }
 
 test "Broker.handleRequest DescribeUserScramCredentials rejects truncated request" {

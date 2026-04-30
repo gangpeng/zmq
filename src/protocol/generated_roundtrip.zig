@@ -588,6 +588,24 @@ test "generated non-default golden fixtures cover legacy and flexible wire encod
     }
 
     {
+        const DescribeUserScramCredentialsRequest = generated.describe_user_scram_credentials_request.DescribeUserScramCredentialsRequest;
+        const null_value = DescribeUserScramCredentialsRequest{
+            .users = null,
+        };
+        try expectGoldenRoundTrip(DescribeUserScramCredentialsRequest, null_value, 0, &[_]u8{
+            0x00, 0x00,
+        });
+
+        const empty_users = [_]DescribeUserScramCredentialsRequest.UserName{};
+        const empty_value = DescribeUserScramCredentialsRequest{
+            .users = &empty_users,
+        };
+        try expectGoldenRoundTrip(DescribeUserScramCredentialsRequest, empty_value, 0, &[_]u8{
+            0x01, 0x00,
+        });
+    }
+
+    {
         const ElectLeadersRequest = generated.elect_leaders_request.ElectLeadersRequest;
         const null_value = ElectLeadersRequest{
             .election_type = 0,

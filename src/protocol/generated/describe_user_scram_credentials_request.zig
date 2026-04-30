@@ -36,25 +36,35 @@ pub const DescribeUserScramCredentialsRequest = struct {
 
     /// The users to describe, or null/empty to describe all users.
     /// Versions: 0+
-    users: []const UserName = &.{},
+    users: ?[]const UserName = null,
 
     pub fn serialize(self: *const DescribeUserScramCredentialsRequest, buf: []u8, pos: *usize, version: i16) void {
-        ser.writeCompactArrayLen(buf, pos, self.users.len);
-        for (self.users) |item| {
-            item.serialize(buf, pos, version);
+        if (self.users) |users| {
+            ser.writeCompactArrayLen(buf, pos, users.len);
+            for (users) |item| {
+                item.serialize(buf, pos, version);
+            }
+        } else {
+            ser.writeCompactArrayLen(buf, pos, null);
         }
         ser.writeEmptyTaggedFields(buf, pos);
     }
 
     pub fn deserialize(alloc: Allocator, buf: []const u8, pos: *usize, version: i16) !DescribeUserScramCredentialsRequest {
         var result = DescribeUserScramCredentialsRequest{};
-        const users_len: usize = (try ser.readCompactArrayLen(buf, pos)) orelse 0;
-        if (users_len > 0) {
-            const users_items = try alloc.alloc(UserName, users_len);
-            for (users_items) |*item| {
-                item.* = try UserName.deserialize(alloc, buf, pos, version);
+        const users_len: ?usize = try ser.readCompactArrayLen(buf, pos);
+        if (users_len) |len| {
+            if (len == 0) {
+                result.users = &.{};
+            } else {
+                const users_items = try alloc.alloc(UserName, len);
+                for (users_items) |*item| {
+                    item.* = try UserName.deserialize(alloc, buf, pos, version);
+                }
+                result.users = users_items;
             }
-            result.users = users_items;
+        } else {
+            result.users = null;
         }
         try ser.skipTaggedFields(buf, pos);
         return result;
@@ -62,9 +72,13 @@ pub const DescribeUserScramCredentialsRequest = struct {
 
     pub fn calcSize(self: *const DescribeUserScramCredentialsRequest, version: i16) usize {
         var size: usize = 0;
-        size += ser.unsignedVarintSize(self.users.len + 1);
-        for (self.users) |item| {
-            size += item.calcSize(version);
+        if (self.users) |users| {
+            size += ser.unsignedVarintSize(users.len + 1);
+            for (users) |item| {
+                size += item.calcSize(version);
+            }
+        } else {
+            size += 1;
         }
         size += 1;
         return size;
