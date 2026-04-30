@@ -5931,7 +5931,7 @@ pub const Broker = struct {
                 else if (group_fetch_all_flags[group_idx])
                     self.buildOffsetFetchGroupAllTopics(group_id) orelse return null
                 else
-                    self.buildOffsetFetchGroupRequestedTopics(group_id, group_req.topics) orelse return null;
+                    self.buildOffsetFetchGroupRequestedTopics(group_id, group_req.topics orelse &.{}) orelse return null;
 
                 groups[groups_init] = .{
                     .group_id = group_req.group_id,
@@ -5955,7 +5955,7 @@ pub const Broker = struct {
         else if (legacy_fetch_all)
             self.buildOffsetFetchLegacyAllTopics(group_id) orelse return null
         else
-            self.buildOffsetFetchLegacyRequestedTopics(group_id, req.topics, if (api_version < 2) group_error else ErrorCode.none) orelse return null;
+            self.buildOffsetFetchLegacyRequestedTopics(group_id, req.topics orelse &.{}, if (api_version < 2) group_error else ErrorCode.none) orelse return null;
         defer self.freeOffsetFetchLegacyTopics(topics);
 
         const resp = Resp{
@@ -5973,16 +5973,20 @@ pub const Broker = struct {
     }
 
     fn freeOffsetFetchRequest(self: *Broker, req: *const generated.offset_fetch_request.OffsetFetchRequest) void {
-        for (req.topics) |topic| {
-            if (topic.partition_indexes.len > 0) self.allocator.free(topic.partition_indexes);
-        }
-        if (req.topics.len > 0) self.allocator.free(req.topics);
-
-        for (req.groups) |group| {
-            for (group.topics) |topic| {
+        if (req.topics) |topics| {
+            for (topics) |topic| {
                 if (topic.partition_indexes.len > 0) self.allocator.free(topic.partition_indexes);
             }
-            if (group.topics.len > 0) self.allocator.free(group.topics);
+            if (topics.len > 0) self.allocator.free(topics);
+        }
+
+        for (req.groups) |group| {
+            if (group.topics) |topics| {
+                for (topics) |topic| {
+                    if (topic.partition_indexes.len > 0) self.allocator.free(topic.partition_indexes);
+                }
+                if (topics.len > 0) self.allocator.free(topics);
+            }
         }
         if (req.groups.len > 0) self.allocator.free(req.groups);
     }

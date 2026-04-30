@@ -1053,6 +1053,34 @@ test "generated non-default golden fixtures cover legacy and flexible wire encod
     }
 
     {
+        const OffsetFetchRequest = generated.offset_fetch_request.OffsetFetchRequest;
+        const value = OffsetFetchRequest{
+            .group_id = "group-a",
+            .topics = null,
+        };
+        try expectGoldenRoundTrip(OffsetFetchRequest, value, 2, &[_]u8{
+            0x00, 0x07, 'g',  'r',  'o',  'u', 'p', '-',
+            'a',  0xff, 0xff, 0xff, 0xff,
+        });
+    }
+
+    {
+        const OffsetFetchRequest = generated.offset_fetch_request.OffsetFetchRequest;
+        const groups = [_]OffsetFetchRequest.OffsetFetchRequestGroup{.{
+            .group_id = "group-a",
+            .topics = null,
+        }};
+        const value = OffsetFetchRequest{
+            .groups = &groups,
+            .require_stable = true,
+        };
+        try expectGoldenRoundTrip(OffsetFetchRequest, value, 8, &[_]u8{
+            0x02, 0x08, 'g',  'r',  'o',  'u', 'p', '-',
+            'a',  0x00, 0x00, 0x01, 0x00,
+        });
+    }
+
+    {
         const CreateTopicsRequest = generated.create_topics_request.CreateTopicsRequest;
         const assignments = [_]CreateTopicsRequest.CreatableTopic.CreatableReplicaAssignment{
             .{ .partition_index = 0, .broker_ids = &[_]i32{ 1, 2 } },

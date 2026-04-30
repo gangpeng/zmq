@@ -173,7 +173,7 @@ pub const OffsetFetchRequest = struct {
         member_epoch: i32 = -1,
         /// Each topic we would like to fetch offsets for, or null to fetch offsets for all topics.
         /// Versions: 8+
-        topics: []const OffsetFetchRequestTopics = &.{},
+        topics: ?[]const OffsetFetchRequestTopics = &.{},
 
         pub fn serialize(self: *const OffsetFetchRequestGroup, buf: []u8, pos: *usize, version: i16) void {
             if (version >= 8) {
@@ -194,13 +194,21 @@ pub const OffsetFetchRequest = struct {
                 ser.writeI32(buf, pos, self.member_epoch);
             }
             if (version >= 8) {
-                if (version >= 6) {
-                    ser.writeCompactArrayLen(buf, pos, self.topics.len);
+                if (self.topics) |topics| {
+                    if (version >= 6) {
+                        ser.writeCompactArrayLen(buf, pos, topics.len);
+                    } else {
+                        ser.writeArrayLen(buf, pos, topics.len);
+                    }
+                    for (topics) |item| {
+                        item.serialize(buf, pos, version);
+                    }
                 } else {
-                    ser.writeArrayLen(buf, pos, self.topics.len);
-                }
-                for (self.topics) |item| {
-                    item.serialize(buf, pos, version);
+                    if (version >= 6) {
+                        ser.writeCompactArrayLen(buf, pos, null);
+                    } else {
+                        ser.writeArrayLen(buf, pos, null);
+                    }
                 }
             }
             if (version >= 6) ser.writeEmptyTaggedFields(buf, pos);
@@ -224,16 +232,22 @@ pub const OffsetFetchRequest = struct {
                 result.member_epoch = ser.readI32(buf, pos);
             }
             if (version >= 8) {
-                const topics_len: usize = if (version >= 6)
-                    (try ser.readCompactArrayLen(buf, pos)) orelse 0
+                const topics_len: ?usize = if (version >= 6)
+                    try ser.readCompactArrayLen(buf, pos)
                 else
-                    (try ser.readArrayLen(buf, pos)) orelse 0;
-                if (topics_len > 0) {
-                    const topics_items = try alloc.alloc(OffsetFetchRequestTopics, topics_len);
-                    for (topics_items) |*item| {
-                        item.* = try OffsetFetchRequestTopics.deserialize(alloc, buf, pos, version);
+                    try ser.readArrayLen(buf, pos);
+                if (topics_len) |len| {
+                    if (len == 0) {
+                        result.topics = &.{};
+                    } else {
+                        const topics_items = try alloc.alloc(OffsetFetchRequestTopics, len);
+                        for (topics_items) |*item| {
+                            item.* = try OffsetFetchRequestTopics.deserialize(alloc, buf, pos, version);
+                        }
+                        result.topics = topics_items;
                     }
-                    result.topics = topics_items;
+                } else {
+                    result.topics = null;
                 }
             }
             if (version >= 6) try ser.skipTaggedFields(buf, pos);
@@ -260,13 +274,21 @@ pub const OffsetFetchRequest = struct {
                 size += 4;
             }
             if (version >= 8) {
-                if (version >= 6) {
-                    size += ser.unsignedVarintSize(self.topics.len + 1);
+                if (self.topics) |topics| {
+                    if (version >= 6) {
+                        size += ser.unsignedVarintSize(topics.len + 1);
+                    } else {
+                        size += 4;
+                    }
+                    for (topics) |item| {
+                        size += item.calcSize(version);
+                    }
                 } else {
-                    size += 4;
-                }
-                for (self.topics) |item| {
-                    size += item.calcSize(version);
+                    if (version >= 6) {
+                        size += 1;
+                    } else {
+                        size += 4;
+                    }
                 }
             }
             if (version >= 6) size += 1;
@@ -279,7 +301,7 @@ pub const OffsetFetchRequest = struct {
     group_id: ?[]const u8 = null,
     /// Each topic we would like to fetch offsets for, or null to fetch offsets for all topics.
     /// Versions: 0-7
-    topics: []const OffsetFetchRequestTopic = &.{},
+    topics: ?[]const OffsetFetchRequestTopic = &.{},
     /// Each group we would like to fetch offsets for
     /// Versions: 8+
     groups: []const OffsetFetchRequestGroup = &.{},
@@ -296,13 +318,21 @@ pub const OffsetFetchRequest = struct {
             }
         }
         if (version <= 7) {
-            if (version >= 6) {
-                ser.writeCompactArrayLen(buf, pos, self.topics.len);
+            if (self.topics) |topics| {
+                if (version >= 6) {
+                    ser.writeCompactArrayLen(buf, pos, topics.len);
+                } else {
+                    ser.writeArrayLen(buf, pos, topics.len);
+                }
+                for (topics) |item| {
+                    item.serialize(buf, pos, version);
+                }
             } else {
-                ser.writeArrayLen(buf, pos, self.topics.len);
-            }
-            for (self.topics) |item| {
-                item.serialize(buf, pos, version);
+                if (version >= 6) {
+                    ser.writeCompactArrayLen(buf, pos, null);
+                } else {
+                    ser.writeArrayLen(buf, pos, null);
+                }
             }
         }
         if (version >= 8) {
@@ -330,16 +360,22 @@ pub const OffsetFetchRequest = struct {
                 try ser.readString(buf, pos);
         }
         if (version <= 7) {
-            const topics_len: usize = if (version >= 6)
-                (try ser.readCompactArrayLen(buf, pos)) orelse 0
+            const topics_len: ?usize = if (version >= 6)
+                try ser.readCompactArrayLen(buf, pos)
             else
-                (try ser.readArrayLen(buf, pos)) orelse 0;
-            if (topics_len > 0) {
-                const topics_items = try alloc.alloc(OffsetFetchRequestTopic, topics_len);
-                for (topics_items) |*item| {
-                    item.* = try OffsetFetchRequestTopic.deserialize(alloc, buf, pos, version);
+                try ser.readArrayLen(buf, pos);
+            if (topics_len) |len| {
+                if (len == 0) {
+                    result.topics = &.{};
+                } else {
+                    const topics_items = try alloc.alloc(OffsetFetchRequestTopic, len);
+                    for (topics_items) |*item| {
+                        item.* = try OffsetFetchRequestTopic.deserialize(alloc, buf, pos, version);
+                    }
+                    result.topics = topics_items;
                 }
-                result.topics = topics_items;
+            } else {
+                result.topics = null;
             }
         }
         if (version >= 8) {
@@ -372,13 +408,21 @@ pub const OffsetFetchRequest = struct {
             }
         }
         if (version <= 7) {
-            if (version >= 6) {
-                size += ser.unsignedVarintSize(self.topics.len + 1);
+            if (self.topics) |topics| {
+                if (version >= 6) {
+                    size += ser.unsignedVarintSize(topics.len + 1);
+                } else {
+                    size += 4;
+                }
+                for (topics) |item| {
+                    size += item.calcSize(version);
+                }
             } else {
-                size += 4;
-            }
-            for (self.topics) |item| {
-                size += item.calcSize(version);
+                if (version >= 6) {
+                    size += 1;
+                } else {
+                    size += 4;
+                }
             }
         }
         if (version >= 8) {
