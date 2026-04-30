@@ -235,6 +235,9 @@ Status: completed for the initial catalog and DeleteGroups slice.
   DescribeClientQuotasResponse now preserves nullable `Entries` so top-level
   errors can encode null while successful empty matches encode an explicit
   empty result list.
+  AutomqGetPartitionSnapshotResponse now preserves nullable partition
+  `StreamMetadata` so absent stream deltas stay distinct from explicit empty
+  stream metadata lists.
   StopReplicaRequest generated encoding now honors its legacy field version
   bounds exactly: v0 `UngroupedPartitions`, v0-v2 `DeletePartitions`, v1-v2
   grouped `Topics`, and v3+ `TopicStates` have non-default golden fixtures.

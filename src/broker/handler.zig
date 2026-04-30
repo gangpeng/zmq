@@ -22716,7 +22716,9 @@ test "Broker AutoMQ router snapshot describe and group APIs" {
     defer {
         for (snapshot_resp.topics) |topic| {
             for (topic.partitions) |partition| {
-                if (partition.stream_metadata.len > 0) testing.allocator.free(partition.stream_metadata);
+                if (partition.stream_metadata) |stream_metadata| {
+                    if (stream_metadata.len > 0) testing.allocator.free(stream_metadata);
+                }
             }
             if (topic.partitions.len > 0) testing.allocator.free(topic.partitions);
         }
@@ -22737,9 +22739,10 @@ test "Broker AutoMQ router snapshot describe and group APIs" {
             found_partition = true;
             try testing.expect(partition.log_end_offset != null);
             try testing.expectEqual(@as(i64, 1), partition.log_end_offset.?.message_offset);
-            try testing.expect(partition.stream_metadata.len >= 1);
-            try testing.expectEqual(expected_partition_stream_id, partition.stream_metadata[0].stream_id);
-            try testing.expectEqual(@as(i64, 1), partition.stream_metadata[0].end_offset);
+            const stream_metadata = partition.stream_metadata.?;
+            try testing.expect(stream_metadata.len >= 1);
+            try testing.expectEqual(expected_partition_stream_id, stream_metadata[0].stream_id);
+            try testing.expectEqual(@as(i64, 1), stream_metadata[0].end_offset);
         }
         try testing.expect(found_partition);
     }

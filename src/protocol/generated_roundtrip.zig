@@ -1668,6 +1668,64 @@ test "generated non-default golden fixtures cover legacy and flexible wire encod
     }
 
     {
+        const SnapshotResponse = generated.automq_get_partition_snapshot_response.AutomqGetPartitionSnapshotResponse;
+        const PartitionSnapshot = SnapshotResponse.Topic.PartitionSnapshot;
+
+        const null_partitions = [_]PartitionSnapshot{.{
+            .partition_index = 2,
+            .stream_metadata = null,
+        }};
+        const null_topics = [_]SnapshotResponse.Topic{.{ .partitions = &null_partitions }};
+        const null_value = SnapshotResponse{
+            .session_id = 1,
+            .session_epoch = 2,
+            .topics = &null_topics,
+        };
+        try expectGoldenRoundTrip(SnapshotResponse, null_value, 0, &[_]u8{
+            0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00,
+            0x00, 0x01, 0x00, 0x00,
+            0x00, 0x02, 0x02, 0x00,
+            0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x02,
+            0x00, 0x00, 0x00, 0x02,
+            0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00,
+            0x00,
+        });
+
+        const empty_stream_metadata = [_]PartitionSnapshot.StreamMetadata{};
+        const empty_partitions = [_]PartitionSnapshot{.{
+            .partition_index = 2,
+            .stream_metadata = &empty_stream_metadata,
+        }};
+        const empty_topics = [_]SnapshotResponse.Topic{.{ .partitions = &empty_partitions }};
+        const empty_value = SnapshotResponse{
+            .session_id = 1,
+            .session_epoch = 2,
+            .topics = &empty_topics,
+        };
+        try expectGoldenRoundTrip(SnapshotResponse, empty_value, 0, &[_]u8{
+            0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00,
+            0x00, 0x01, 0x00, 0x00,
+            0x00, 0x02, 0x02, 0x00,
+            0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x02,
+            0x00, 0x00, 0x00, 0x02,
+            0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00,
+            0x00, 0x01, 0x00, 0x00,
+            0x00,
+        });
+    }
+
+    {
         const UpdateMetadataRequest = generated.update_metadata_request.UpdateMetadataRequest;
         const topic_id = [_]u8{
             0x00, 0x01, 0x02, 0x03,

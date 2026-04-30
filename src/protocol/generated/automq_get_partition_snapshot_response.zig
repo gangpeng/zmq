@@ -320,9 +320,9 @@ pub const AutomqGetPartitionSnapshotResponse = struct {
             /// The partition log end offset
             /// Versions: 0+
             log_end_offset: ?LogOffsetMetadata = null,
-            /// 
+            ///
             /// Versions: 0+
-            stream_metadata: []const StreamMetadata = &.{},
+            stream_metadata: ?[]const StreamMetadata = null,
             /// The last segment's last time index
             /// Versions: 1+
             last_timestamp_offset: ?TimestampOffsetData = null,
@@ -349,9 +349,13 @@ pub const AutomqGetPartitionSnapshotResponse = struct {
                 } else {
                     ser.writeUnsignedVarint(buf, pos, 0);
                 }
-                ser.writeCompactArrayLen(buf, pos, self.stream_metadata.len);
-                for (self.stream_metadata) |item| {
-                    item.serialize(buf, pos, version);
+                if (self.stream_metadata) |stream_metadata| {
+                    ser.writeCompactArrayLen(buf, pos, stream_metadata.len);
+                    for (stream_metadata) |item| {
+                        item.serialize(buf, pos, version);
+                    }
+                } else {
+                    ser.writeCompactArrayLen(buf, pos, null);
                 }
                 if (version >= 1) {
                     if (self.last_timestamp_offset) |value| {
@@ -366,6 +370,10 @@ pub const AutomqGetPartitionSnapshotResponse = struct {
 
             pub fn deserialize(alloc: Allocator, buf: []const u8, pos: *usize, version: i16) !PartitionSnapshot {
                 var result = PartitionSnapshot{};
+                errdefer if (result.stream_metadata) |stream_metadata| {
+                    if (stream_metadata.len > 0) alloc.free(stream_metadata);
+                };
+
                 result.partition_index = ser.readI32(buf, pos);
                 result.leader_epoch = ser.readI32(buf, pos);
                 result.operation = ser.readI16(buf, pos);
@@ -378,13 +386,20 @@ pub const AutomqGetPartitionSnapshotResponse = struct {
                 if ((try ser.readUnsignedVarint(buf, pos)) != 0) {
                     result.log_end_offset = try LogOffsetMetadata.deserialize(alloc, buf, pos, version);
                 }
-                const stream_metadata_len: usize = (try ser.readCompactArrayLen(buf, pos)) orelse 0;
-                if (stream_metadata_len > 0) {
-                    const stream_metadata_items = try alloc.alloc(StreamMetadata, stream_metadata_len);
-                    for (stream_metadata_items) |*item| {
-                        item.* = try StreamMetadata.deserialize(alloc, buf, pos, version);
+                const stream_metadata_len: ?usize = try ser.readCompactArrayLen(buf, pos);
+                if (stream_metadata_len) |len| {
+                    if (len == 0) {
+                        result.stream_metadata = &.{};
+                    } else {
+                        const stream_metadata_items = try alloc.alloc(StreamMetadata, len);
+                        errdefer alloc.free(stream_metadata_items);
+                        for (stream_metadata_items) |*item| {
+                            item.* = try StreamMetadata.deserialize(alloc, buf, pos, version);
+                        }
+                        result.stream_metadata = stream_metadata_items;
                     }
-                    result.stream_metadata = stream_metadata_items;
+                } else {
+                    result.stream_metadata = null;
                 }
                 if (version >= 1) {
                     if ((try ser.readUnsignedVarint(buf, pos)) != 0) {
@@ -415,9 +430,13 @@ pub const AutomqGetPartitionSnapshotResponse = struct {
                 } else {
                     size += 1;
                 }
-                size += ser.unsignedVarintSize(self.stream_metadata.len + 1);
-                for (self.stream_metadata) |item| {
-                    size += item.calcSize(version);
+                if (self.stream_metadata) |stream_metadata| {
+                    size += ser.unsignedVarintSize(stream_metadata.len + 1);
+                    for (stream_metadata) |item| {
+                        size += item.calcSize(version);
+                    }
+                } else {
+                    size += 1;
                 }
                 if (version >= 1) {
                     if (self.last_timestamp_offset) |value| {
