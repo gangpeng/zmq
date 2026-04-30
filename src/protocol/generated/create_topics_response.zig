@@ -134,7 +134,7 @@ pub const CreateTopicsResponse = struct {
         replication_factor: i16 = -1,
         /// Configuration of the topic.
         /// Versions: 5+
-        configs: []const CreatableTopicConfigs = &.{},
+        configs: ?[]const CreatableTopicConfigs = null,
 
         pub fn serialize(self: *const CreatableTopicResult, buf: []u8, pos: *usize, version: i16) void {
             if (version >= 5) {
@@ -160,13 +160,21 @@ pub const CreateTopicsResponse = struct {
                 ser.writeI16(buf, pos, self.replication_factor);
             }
             if (version >= 5) {
-                if (version >= 5) {
-                    ser.writeCompactArrayLen(buf, pos, self.configs.len);
+                if (self.configs) |configs| {
+                    if (version >= 5) {
+                        ser.writeCompactArrayLen(buf, pos, configs.len);
+                    } else {
+                        ser.writeArrayLen(buf, pos, configs.len);
+                    }
+                    for (configs) |item| {
+                        item.serialize(buf, pos, version);
+                    }
                 } else {
-                    ser.writeArrayLen(buf, pos, self.configs.len);
-                }
-                for (self.configs) |item| {
-                    item.serialize(buf, pos, version);
+                    if (version >= 5) {
+                        ser.writeCompactArrayLen(buf, pos, null);
+                    } else {
+                        ser.writeArrayLen(buf, pos, null);
+                    }
                 }
             }
             const has_topic_config_error_code = version >= 5 and self.topic_config_error_code != 0;
@@ -182,7 +190,9 @@ pub const CreateTopicsResponse = struct {
 
         pub fn deserialize(alloc: Allocator, buf: []const u8, pos: *usize, version: i16) !CreatableTopicResult {
             var result = CreatableTopicResult{};
-            errdefer if (result.configs.len > 0) alloc.free(result.configs);
+            errdefer if (result.configs) |configs| {
+                if (configs.len > 0) alloc.free(configs);
+            };
 
             result.name = if (version >= 5)
                 try ser.readCompactString(buf, pos)
@@ -205,17 +215,23 @@ pub const CreateTopicsResponse = struct {
                 result.replication_factor = ser.readI16(buf, pos);
             }
             if (version >= 5) {
-                const configs_len: usize = if (version >= 5)
-                    (try ser.readCompactArrayLen(buf, pos)) orelse 0
+                const configs_len: ?usize = if (version >= 5)
+                    try ser.readCompactArrayLen(buf, pos)
                 else
-                    (try ser.readArrayLen(buf, pos)) orelse 0;
-                if (configs_len > 0) {
-                    const configs_items = try alloc.alloc(CreatableTopicConfigs, configs_len);
-                    errdefer alloc.free(configs_items);
-                    for (configs_items) |*item| {
-                        item.* = try CreatableTopicConfigs.deserialize(alloc, buf, pos, version);
+                    try ser.readArrayLen(buf, pos);
+                if (configs_len) |len| {
+                    if (len == 0) {
+                        result.configs = &.{};
+                    } else {
+                        const configs_items = try alloc.alloc(CreatableTopicConfigs, len);
+                        errdefer alloc.free(configs_items);
+                        for (configs_items) |*item| {
+                            item.* = try CreatableTopicConfigs.deserialize(alloc, buf, pos, version);
+                        }
+                        result.configs = configs_items;
                     }
-                    result.configs = configs_items;
+                } else {
+                    result.configs = null;
                 }
             }
             if (version >= 5) {
@@ -263,13 +279,17 @@ pub const CreateTopicsResponse = struct {
                 size += 2;
             }
             if (version >= 5) {
-                if (version >= 5) {
-                    size += ser.unsignedVarintSize(self.configs.len + 1);
+                if (self.configs) |configs| {
+                    if (version >= 5) {
+                        size += ser.unsignedVarintSize(configs.len + 1);
+                    } else {
+                        size += 4;
+                    }
+                    for (configs) |item| {
+                        size += item.calcSize(version);
+                    }
                 } else {
-                    size += 4;
-                }
-                for (self.configs) |item| {
-                    size += item.calcSize(version);
+                    size += if (version >= 5) 1 else 4;
                 }
             }
             const has_topic_config_error_code = version >= 5 and self.topic_config_error_code != 0;
@@ -311,7 +331,9 @@ pub const CreateTopicsResponse = struct {
         var result = CreateTopicsResponse{};
         errdefer {
             for (result.topics) |topic| {
-                if (topic.configs.len > 0) alloc.free(topic.configs);
+                if (topic.configs) |configs| {
+                    if (configs.len > 0) alloc.free(configs);
+                }
             }
             if (result.topics.len > 0) alloc.free(result.topics);
         }
@@ -328,7 +350,9 @@ pub const CreateTopicsResponse = struct {
             var topics_init: usize = 0;
             errdefer {
                 for (topics_items[0..topics_init]) |topic| {
-                    if (topic.configs.len > 0) alloc.free(topic.configs);
+                    if (topic.configs) |configs| {
+                        if (configs.len > 0) alloc.free(configs);
+                    }
                 }
                 alloc.free(topics_items);
             }

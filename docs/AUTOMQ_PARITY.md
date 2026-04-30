@@ -230,6 +230,8 @@ Status: completed for the initial catalog and DeleteGroups slice.
   FetchResponse now preserves nullable `AbortedTransactions` so
   read-uncommitted responses can encode null while read-committed responses can
   encode an explicit empty transaction list.
+  CreateTopicsResponse now preserves nullable `Configs` so responses that do
+  not return topic configs encode null instead of an explicit empty config list.
   StopReplicaRequest generated encoding now honors its legacy field version
   bounds exactly: v0 `UngroupedPartitions`, v0-v2 `DeletePartitions`, v1-v2
   grouped `Topics`, and v3+ `TopicStates` have non-default golden fixtures.

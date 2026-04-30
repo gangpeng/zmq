@@ -1615,9 +1615,25 @@ test "generated non-default golden fixtures cover legacy and flexible wire encod
             '-',  't',  'o',  'p',
             'i',  'c',  0x00, 0x00,
             0x00, 0xff, 0xff, 0xff,
-            0xff, 0xff, 0xff, 0x01,
+            0xff, 0xff, 0xff, 0x00,
             0x01, 0x00, 0x02, 0x00,
             0x28, 0x00,
+        });
+
+        const empty_configs = [_]CreateTopicsResponse.CreatableTopicResult.CreatableTopicConfigs{};
+        const empty_topics = [_]CreateTopicsResponse.CreatableTopicResult{.{
+            .name = "t",
+            .configs = &empty_configs,
+        }};
+        const empty_value = CreateTopicsResponse{
+            .topics = &empty_topics,
+        };
+        try expectGoldenRoundTrip(CreateTopicsResponse, empty_value, 5, &[_]u8{
+            0x00, 0x00, 0x00, 0x00,
+            0x02, 0x02, 't',  0x00,
+            0x00, 0x00, 0xff, 0xff,
+            0xff, 0xff, 0xff, 0xff,
+            0x01, 0x00, 0x00,
         });
     }
 
@@ -1961,7 +1977,7 @@ test "generated CreateTopicsResponse rejects duplicate topic config error tags" 
     ser.writeCompactString(&duplicate_topic_config_error, &pos, null); // error_message
     ser.writeI32(&duplicate_topic_config_error, &pos, -1); // num_partitions
     ser.writeI16(&duplicate_topic_config_error, &pos, -1); // replication_factor
-    ser.writeCompactArrayLen(&duplicate_topic_config_error, &pos, 0); // configs
+    ser.writeCompactArrayLen(&duplicate_topic_config_error, &pos, null); // configs
     ser.writeUnsignedVarint(&duplicate_topic_config_error, &pos, 2);
     inline for (0..2) |_| {
         ser.writeUnsignedVarint(&duplicate_topic_config_error, &pos, 0);

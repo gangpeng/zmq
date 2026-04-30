@@ -6365,7 +6365,7 @@ pub const Broker = struct {
                 .error_message = error_message,
                 .num_partitions = actual_partitions,
                 .replication_factor = actual_rf,
-                .configs = &.{},
+                .configs = null,
             };
             topics_init += 1;
         }
@@ -29665,7 +29665,9 @@ test "Broker.handleRequest CreateTopics v7 returns generated response" {
     const resp = try Resp.deserialize(testing.allocator, response.?, &rpos, 7);
     defer {
         for (resp.topics) |topic| {
-            if (topic.configs.len > 0) testing.allocator.free(topic.configs);
+            if (topic.configs) |response_configs| {
+                if (response_configs.len > 0) testing.allocator.free(response_configs);
+            }
         }
         if (resp.topics.len > 0) testing.allocator.free(resp.topics);
     }
@@ -29676,6 +29678,7 @@ test "Broker.handleRequest CreateTopics v7 returns generated response" {
     try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.none)), resp.topics[0].error_code);
     try testing.expectEqual(@as(i32, 2), resp.topics[0].num_partitions);
     try testing.expectEqual(@as(i16, 1), resp.topics[0].replication_factor);
+    try testing.expect(resp.topics[0].configs == null);
     try testing.expect(!std.mem.eql(u8, &resp.topics[0].topic_id, &[_]u8{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 }));
     try testing.expect(broker.topics.contains("ct-generated-topic"));
 }
@@ -29721,13 +29724,16 @@ test "Broker.handleRequest CreateTopics applies supported topic configs" {
     const resp = try Resp.deserialize(testing.allocator, response.?, &rpos, 7);
     defer {
         for (resp.topics) |topic| {
-            if (topic.configs.len > 0) testing.allocator.free(topic.configs);
+            if (topic.configs) |response_configs| {
+                if (response_configs.len > 0) testing.allocator.free(response_configs);
+            }
         }
         if (resp.topics.len > 0) testing.allocator.free(resp.topics);
     }
     try testing.expectEqual(response.?.len, rpos);
     try testing.expectEqual(@as(usize, 1), resp.topics.len);
     try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.none)), resp.topics[0].error_code);
+    try testing.expect(resp.topics[0].configs == null);
 
     const topic = broker.topics.get("ct-config-topic").?;
     try testing.expectEqual(@as(i64, 1234), topic.config.retention_ms);
@@ -29773,7 +29779,9 @@ test "Broker.handleRequest CreateTopics rejects unsupported topic config" {
     const resp = try Resp.deserialize(testing.allocator, response.?, &rpos, 7);
     defer {
         for (resp.topics) |topic| {
-            if (topic.configs.len > 0) testing.allocator.free(topic.configs);
+            if (topic.configs) |response_configs| {
+                if (response_configs.len > 0) testing.allocator.free(response_configs);
+            }
         }
         if (resp.topics.len > 0) testing.allocator.free(resp.topics);
     }
@@ -29821,7 +29829,9 @@ test "Broker.handleRequest CreateTopics rejects unsupported manual assignments" 
     const resp = try Resp.deserialize(testing.allocator, response.?, &rpos, 7);
     defer {
         for (resp.topics) |topic| {
-            if (topic.configs.len > 0) testing.allocator.free(topic.configs);
+            if (topic.configs) |response_configs| {
+                if (response_configs.len > 0) testing.allocator.free(response_configs);
+            }
         }
         if (resp.topics.len > 0) testing.allocator.free(resp.topics);
     }
@@ -29866,7 +29876,9 @@ test "Broker.handleRequest CreateTopics validate_only does not create topic" {
     const resp = try Resp.deserialize(testing.allocator, response.?, &rpos, 5);
     defer {
         for (resp.topics) |topic| {
-            if (topic.configs.len > 0) testing.allocator.free(topic.configs);
+            if (topic.configs) |response_configs| {
+                if (response_configs.len > 0) testing.allocator.free(response_configs);
+            }
         }
         if (resp.topics.len > 0) testing.allocator.free(resp.topics);
     }
@@ -29922,7 +29934,9 @@ test "Broker.handleRequest CreateTopics rolls back when topic snapshot S3 WAL wr
     const resp = try Resp.deserialize(testing.allocator, response.?, &rpos, 7);
     defer {
         for (resp.topics) |topic| {
-            if (topic.configs.len > 0) testing.allocator.free(topic.configs);
+            if (topic.configs) |response_configs| {
+                if (response_configs.len > 0) testing.allocator.free(response_configs);
+            }
         }
         if (resp.topics.len > 0) testing.allocator.free(resp.topics);
     }
