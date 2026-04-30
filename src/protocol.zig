@@ -15,6 +15,7 @@ pub const messages = @import("protocol/messages.zig");
 pub const record_batch = @import("protocol/record_batch.zig");
 pub const generated = @import("protocol/generated_index.zig");
 pub const generated_roundtrip = @import("protocol/generated_roundtrip.zig");
+pub const generated_schema_audit = @import("protocol/generated_schema_audit.zig");
 pub const error_codes = @import("protocol/error_codes.zig");
 
 pub const ApiKey = api_key.ApiKey;
