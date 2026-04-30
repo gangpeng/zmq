@@ -63,7 +63,8 @@ def type_to_zig(kafka_type, nullable=False):
     if base.startswith('[]'):
         inner = base[2:]
         inner_zig = type_to_zig(inner)
-        # Arrays are always non-nullable in Zig — null arrays become empty slices
+        if nullable:
+            return f'?[]const {inner_zig}'
         return f'[]const {inner_zig}'
 
     type_map = {
@@ -367,14 +368,13 @@ class CodeGen:
             inner = kafka_type[2:] if kafka_type.startswith('[]') else kafka_type
             if not is_primitive(inner) and 'fields' in field:
                 if kafka_type.startswith('[]'):
-                    zig_type = f'[]const {inner}'  # always non-nullable arrays
+                    zig_type = f'?[]const {inner}' if nullable else f'[]const {inner}'
                 else:
                     zig_type = f'?{inner}' if nullable else inner
 
             default = default_value_zig(kafka_type, field.get('default'), nullable)
-            # All arrays default to empty slice
             if kafka_type.startswith('[]'):
-                default = '&.{}'
+                default = self._default_array_value(field)
 
             lines.append(f'{pad}    /// {about}' if about else f'{pad}    ///')
             lines.append(f'{pad}    /// Versions: {versions}')
@@ -412,6 +412,27 @@ class CodeGen:
     def _has_flex_versions(self):
         """Check if this message has flexible versions at all."""
         return self.flex_min is not None
+
+    def _default_array_value(self, field):
+        """Return the Zig default for an array field.
+
+        Nullable request arrays that are not nullable in their earliest version
+        keep the legacy empty-slice default so default messages remain valid at
+        the minimum version. Nullable response arrays default to null because an
+        omitted result list usually means "not present" rather than "present but
+        empty".
+        """
+        if 'nullableVersions' not in field:
+            return '&.{}'
+        if str(field.get('default')) == 'null':
+            return 'null'
+
+        nullable_min, _ = parse_version_range(field.get('nullableVersions'))
+        if nullable_min == 0:
+            return 'null'
+        if self.msg_type == 'response':
+            return 'null'
+        return '&.{}'
 
     def _gen_flex_branch(self, lines, pad, flex_code, nonflex_code):
         """Generate flex/nonflex branching code.
@@ -530,11 +551,11 @@ class CodeGen:
 
             if kafka_type.startswith('[]') and not is_primitive(inner):
                 # Array of structs
-                self._gen_write_array_of_structs(lines, extra_pad, field_expr)
+                self._gen_write_array_of_structs(lines, extra_pad, field_expr, 'nullableVersions' in field)
             elif kafka_type.startswith('[]'):
                 # Array of primitives
                 prim_type = kafka_type[2:]
-                self._gen_write_array_of_primitives(lines, extra_pad, field_expr, prim_type)
+                self._gen_write_array_of_primitives(lines, extra_pad, field_expr, prim_type, 'nullableVersions' in field)
             elif not is_primitive(kafka_type):
                 # Nested/common struct (non-array)
                 nullable = 'nullableVersions' in field
@@ -560,7 +581,22 @@ class CodeGen:
         lines.append(f'{pad}}}')
         return lines
 
-    def _gen_write_array_of_structs(self, lines, pad, field_expr):
+    def _gen_write_array_of_structs(self, lines, pad, field_expr, nullable=False):
+        if nullable:
+            lines.append(f'{pad}if ({field_expr}) |items| {{')
+            self._gen_flex_branch(lines, pad + '    ',
+                ['ser.writeCompactArrayLen(buf, pos, items.len);'],
+                ['ser.writeArrayLen(buf, pos, items.len);'])
+            lines.append(f'{pad}    for (items) |item| {{')
+            lines.append(f'{pad}        item.serialize(buf, pos, version);')
+            lines.append(f'{pad}    }}')
+            lines.append(f'{pad}}} else {{')
+            self._gen_flex_branch(lines, pad + '    ',
+                ['ser.writeCompactArrayLen(buf, pos, null);'],
+                ['ser.writeArrayLen(buf, pos, null);'])
+            lines.append(f'{pad}}}')
+            return
+
         self._gen_flex_branch(lines, pad,
             [f'ser.writeCompactArrayLen(buf, pos, {field_expr}.len);'],
             [f'ser.writeArrayLen(buf, pos, {field_expr}.len);'])
@@ -568,10 +604,26 @@ class CodeGen:
         lines.append(f'{pad}    item.serialize(buf, pos, version);')
         lines.append(f'{pad}}}')
 
-    def _gen_write_array_of_primitives(self, lines, pad, field_expr, prim_type):
+    def _gen_write_array_of_primitives(self, lines, pad, field_expr, prim_type, nullable=False):
+        if nullable:
+            lines.append(f'{pad}if ({field_expr}) |items| {{')
+            self._gen_flex_branch(lines, pad + '    ',
+                ['ser.writeCompactArrayLen(buf, pos, items.len);'],
+                ['ser.writeArrayLen(buf, pos, items.len);'])
+            self._gen_write_array_primitive_items(lines, pad + '    ', 'items', prim_type)
+            lines.append(f'{pad}}} else {{')
+            self._gen_flex_branch(lines, pad + '    ',
+                ['ser.writeCompactArrayLen(buf, pos, null);'],
+                ['ser.writeArrayLen(buf, pos, null);'])
+            lines.append(f'{pad}}}')
+            return
+
         self._gen_flex_branch(lines, pad,
             [f'ser.writeCompactArrayLen(buf, pos, {field_expr}.len);'],
             [f'ser.writeArrayLen(buf, pos, {field_expr}.len);'])
+        self._gen_write_array_primitive_items(lines, pad, field_expr, prim_type)
+
+    def _gen_write_array_primitive_items(self, lines, pad, field_expr, prim_type):
         # For variable-length element types (string/bytes), use flex check per element
         if prim_type in ('string', 'bytes', 'records') and self._has_flex_versions():
             write_flex = get_write_fn(prim_type, True, 'item')
@@ -694,58 +746,93 @@ class CodeGen:
 
     def _gen_read_array(self, lines, pad, zig_name, inner, field, nullable):
         """Generate array deserialization with proper allocation."""
-        kafka_type = field['type']
         is_struct = not is_primitive(inner)
         fc = self._flex_check()
         item_type = type_to_zig(inner)
 
         # Read array length
+        len_type = '?usize' if nullable else 'usize'
+        compact_len_expr = 'try ser.readCompactArrayLen(buf, pos)' if nullable else '(try ser.readCompactArrayLen(buf, pos)) orelse 0'
+        array_len_expr = 'try ser.readArrayLen(buf, pos)' if nullable else '(try ser.readArrayLen(buf, pos)) orelse 0'
         if fc:
-            lines.append(f'{pad}const {zig_name}_len: usize = if ({fc})')
-            lines.append(f'{pad}    (try ser.readCompactArrayLen(buf, pos)) orelse 0')
+            lines.append(f'{pad}const {zig_name}_len: {len_type} = if ({fc})')
+            lines.append(f'{pad}    {compact_len_expr}')
             lines.append(f'{pad}else')
-            lines.append(f'{pad}    (try ser.readArrayLen(buf, pos)) orelse 0;')
+            lines.append(f'{pad}    {array_len_expr};')
         elif self._is_always_flexible():
-            lines.append(f'{pad}const {zig_name}_len: usize = (try ser.readCompactArrayLen(buf, pos)) orelse 0;')
+            lines.append(f'{pad}const {zig_name}_len: {len_type} = {compact_len_expr};')
         else:
-            lines.append(f'{pad}const {zig_name}_len: usize = (try ser.readArrayLen(buf, pos)) orelse 0;')
+            lines.append(f'{pad}const {zig_name}_len: {len_type} = {array_len_expr};')
 
         if is_struct:
             # Allocate and read array of structs
-            lines.append(f'{pad}if ({zig_name}_len > 0) {{')
-            lines.append(f'{pad}    const {zig_name}_items = try alloc.alloc({inner}, {zig_name}_len);')
-            lines.append(f'{pad}    for ({zig_name}_items) |*item| {{')
-            lines.append(f'{pad}        item.* = try {inner}.deserialize(alloc, buf, pos, version);')
-            lines.append(f'{pad}    }}')
-            lines.append(f'{pad}    result.{zig_name} = {zig_name}_items;')
-            lines.append(f'{pad}}}')
+            if nullable:
+                lines.append(f'{pad}if ({zig_name}_len) |len| {{')
+                lines.append(f'{pad}    if (len == 0) {{')
+                lines.append(f'{pad}        result.{zig_name} = &.{{}};')
+                lines.append(f'{pad}    }} else {{')
+                lines.append(f'{pad}        const {zig_name}_items = try alloc.alloc({inner}, len);')
+                lines.append(f'{pad}        for ({zig_name}_items) |*item| {{')
+                lines.append(f'{pad}            item.* = try {inner}.deserialize(alloc, buf, pos, version);')
+                lines.append(f'{pad}        }}')
+                lines.append(f'{pad}        result.{zig_name} = {zig_name}_items;')
+                lines.append(f'{pad}    }}')
+                lines.append(f'{pad}}} else {{')
+                lines.append(f'{pad}    result.{zig_name} = null;')
+                lines.append(f'{pad}}}')
+            else:
+                lines.append(f'{pad}if ({zig_name}_len > 0) {{')
+                lines.append(f'{pad}    const {zig_name}_items = try alloc.alloc({inner}, {zig_name}_len);')
+                lines.append(f'{pad}    for ({zig_name}_items) |*item| {{')
+                lines.append(f'{pad}        item.* = try {inner}.deserialize(alloc, buf, pos, version);')
+                lines.append(f'{pad}    }}')
+                lines.append(f'{pad}    result.{zig_name} = {zig_name}_items;')
+                lines.append(f'{pad}}}')
         else:
             # Array of primitives — allocate and read elements.
             read_flex, flex_needs_try = get_read_expr(inner, True)
             read_nonflex, nonflex_needs_try = get_read_expr(inner, False)
-            lines.append(f'{pad}if ({zig_name}_len > 0) {{')
-            lines.append(f'{pad}    const {zig_name}_items = try alloc.alloc({item_type}, {zig_name}_len);')
-            lines.append(f'{pad}    for ({zig_name}_items) |*item| {{')
+            if nullable:
+                lines.append(f'{pad}if ({zig_name}_len) |len| {{')
+                lines.append(f'{pad}    if (len == 0) {{')
+                lines.append(f'{pad}        result.{zig_name} = &.{{}};')
+                lines.append(f'{pad}    }} else {{')
+                lines.append(f'{pad}        const {zig_name}_items = try alloc.alloc({item_type}, len);')
+                lines.append(f'{pad}        for ({zig_name}_items) |*item| {{')
+                item_pad = pad + '            '
+                close_pad = pad + '        '
+            else:
+                lines.append(f'{pad}if ({zig_name}_len > 0) {{')
+                lines.append(f'{pad}    const {zig_name}_items = try alloc.alloc({item_type}, {zig_name}_len);')
+                lines.append(f'{pad}    for ({zig_name}_items) |*item| {{')
+                item_pad = pad + '        '
+                close_pad = pad + '    '
             if inner in ('string', 'bytes', 'records'):
                 if fc:
-                    lines.append(f'{pad}        item.* = if ({fc})')
-                    lines.append(f'{pad}            try {read_flex}')
-                    lines.append(f'{pad}        else')
-                    lines.append(f'{pad}            try {read_nonflex};')
+                    lines.append(f'{item_pad}item.* = if ({fc})')
+                    lines.append(f'{item_pad}    try {read_flex}')
+                    lines.append(f'{item_pad}else')
+                    lines.append(f'{item_pad}    try {read_nonflex};')
                 elif self._is_always_flexible():
-                    lines.append(f'{pad}        item.* = try {read_flex};')
+                    lines.append(f'{item_pad}item.* = try {read_flex};')
                 else:
-                    lines.append(f'{pad}        item.* = try {read_nonflex};')
+                    lines.append(f'{item_pad}item.* = try {read_nonflex};')
             else:
                 if read_nonflex:
                     prefix = 'try ' if nonflex_needs_try else ''
-                    lines.append(f'{pad}        item.* = {prefix}{read_nonflex};')
+                    lines.append(f'{item_pad}item.* = {prefix}{read_nonflex};')
                 elif read_flex:
                     prefix = 'try ' if flex_needs_try else ''
-                    lines.append(f'{pad}        item.* = {prefix}{read_flex};')
-            lines.append(f'{pad}    }}')
-            lines.append(f'{pad}    result.{zig_name} = {zig_name}_items;')
-            lines.append(f'{pad}}}')
+                    lines.append(f'{item_pad}item.* = {prefix}{read_flex};')
+            lines.append(f'{close_pad}}}')
+            lines.append(f'{close_pad}result.{zig_name} = {zig_name}_items;')
+            if nullable:
+                lines.append(f'{pad}    }}')
+                lines.append(f'{pad}}} else {{')
+                lines.append(f'{pad}    result.{zig_name} = null;')
+                lines.append(f'{pad}}}')
+            else:
+                lines.append(f'{pad}}}')
 
     def _gen_calc_size(self, struct_name, fields, indent):
         """Generate calcSize method."""
@@ -793,7 +880,7 @@ class CodeGen:
             inner = kafka_type[2:] if kafka_type.startswith('[]') else kafka_type
 
             if kafka_type.startswith('[]'):
-                self._gen_size_array(lines, extra_pad, field_expr, inner, field)
+                self._gen_size_array(lines, extra_pad, field_expr, inner, field, 'nullableVersions' in field)
             elif not is_primitive(kafka_type):
                 # Nested/common struct
                 nullable = 'nullableVersions' in field
@@ -826,10 +913,23 @@ class CodeGen:
         lines.append(f'{pad}}}')
         return lines
 
-    def _gen_size_array(self, lines, pad, field_expr, inner, field):
+    def _gen_size_array(self, lines, pad, field_expr, inner, field, nullable=False):
         """Generate size computation for an array field."""
         is_struct = not is_primitive(inner)
 
+        if nullable:
+            lines.append(f'{pad}if ({field_expr}) |items| {{')
+            self._gen_size_array_present(lines, pad + '    ', 'items', inner, is_struct)
+            lines.append(f'{pad}}} else {{')
+            self._gen_flex_branch(lines, pad + '    ',
+                ['size += 1;'],
+                ['size += 4;'])
+            lines.append(f'{pad}}}')
+            return
+
+        self._gen_size_array_present(lines, pad, field_expr, inner, is_struct)
+
+    def _gen_size_array_present(self, lines, pad, field_expr, inner, is_struct):
         # Array length encoding size
         self._gen_flex_branch(lines, pad,
             [f'size += ser.unsignedVarintSize({field_expr}.len + 1);'],
