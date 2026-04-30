@@ -244,6 +244,9 @@ Status: completed for the initial catalog and DeleteGroups slice.
   `codegen_v2.py` now emits nullable arrays as optional slices with null-length
   encode/decode and size calculation so future regeneration preserves this
   wire distinction.
+  Generated ApiVersionsResponse now also models v3+ feature metadata tagged
+  fields and preserves unknown top-level response tags in non-default golden
+  round-trips.
   StopReplicaRequest generated encoding now honors its legacy field version
   bounds exactly: v0 `UngroupedPartitions`, v0-v2 `DeletePartitions`, v1-v2
   grouped `Topics`, and v3+ `TopicStates` have non-default golden fixtures.

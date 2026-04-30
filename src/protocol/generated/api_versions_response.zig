@@ -187,6 +187,21 @@ pub const ApiVersionsResponse = struct {
     /// The duration in milliseconds for which the request was throttled due to a quota violation, or zero if the request did not violate any quota.
     /// Versions: 1+
     throttle_time_ms: i32 = 0,
+    /// Features supported by the broker. Note: in v0-v3, features with MinSupportedVersion = 0 show up with MinSupportedVersion = 1.
+    /// Versions: 3+
+    supported_features: []const SupportedFeatureKey = &.{},
+    /// The monotonically increasing epoch for the finalized features information. Valid values are >= 0. A value of -1 is special and represents unknown epoch.
+    /// Versions: 3+
+    finalized_features_epoch: i64 = -1,
+    /// List of cluster-wide finalized features. The information is valid only if FinalizedFeaturesEpoch >= 0.
+    /// Versions: 3+
+    finalized_features: []const FinalizedFeatureKey = &.{},
+    /// Set by a KRaft controller if the required configurations for ZK migration are present
+    /// Versions: 3+
+    zk_migration_ready: bool = false,
+    /// Unknown top-level tagged fields preserved during generated response round-trips.
+    /// Versions: 3+
+    tagged_fields: []const ser.TaggedField = &.{},
 
     pub fn serialize(self: *const ApiVersionsResponse, buf: []u8, pos: *usize, version: i16) void {
         ser.writeI16(buf, pos, self.error_code);
@@ -201,11 +216,18 @@ pub const ApiVersionsResponse = struct {
         if (version >= 1) {
             ser.writeI32(buf, pos, self.throttle_time_ms);
         }
-        if (version >= 3) ser.writeEmptyTaggedFields(buf, pos);
+        if (version >= 3) self.writeTopLevelTaggedFields(buf, pos);
     }
 
     pub fn deserialize(alloc: Allocator, buf: []const u8, pos: *usize, version: i16) !ApiVersionsResponse {
         var result = ApiVersionsResponse{};
+        errdefer {
+            if (result.api_keys.len > 0) alloc.free(result.api_keys);
+            if (result.supported_features.len > 0) alloc.free(result.supported_features);
+            if (result.finalized_features.len > 0) alloc.free(result.finalized_features);
+            if (result.tagged_fields.len > 0) alloc.free(result.tagged_fields);
+        }
+
         result.error_code = ser.readI16(buf, pos);
         const api_keys_len: usize = if (version >= 3)
             (try ser.readCompactArrayLen(buf, pos)) orelse 0
@@ -221,7 +243,9 @@ pub const ApiVersionsResponse = struct {
         if (version >= 1) {
             result.throttle_time_ms = ser.readI32(buf, pos);
         }
-        if (version >= 3) try ser.skipTaggedFields(buf, pos);
+        if (version >= 3) {
+            try result.readTopLevelTaggedFields(alloc, buf, pos, version);
+        }
         return result;
     }
 
@@ -239,7 +263,205 @@ pub const ApiVersionsResponse = struct {
         if (version >= 1) {
             size += 4;
         }
-        if (version >= 3) size += 1;
+        if (version >= 3) size += self.topLevelTaggedFieldsSize();
         return size;
     }
+
+    fn writeTopLevelTaggedFields(self: *const ApiVersionsResponse, buf: []u8, pos: *usize) void {
+        ser.writeUnsignedVarint(buf, pos, self.topLevelTaggedFieldCount());
+
+        if (self.supported_features.len > 0) {
+            writeTaggedFieldHeader(buf, pos, 0, supportedFeaturesTagSize(self.supported_features));
+            ser.writeCompactArrayLen(buf, pos, self.supported_features.len);
+            for (self.supported_features) |feature| {
+                feature.serialize(buf, pos, 3);
+            }
+        }
+
+        if (self.finalized_features_epoch != -1) {
+            writeTaggedFieldHeader(buf, pos, 1, 8);
+            ser.writeI64(buf, pos, self.finalized_features_epoch);
+        }
+
+        if (self.finalized_features.len > 0) {
+            writeTaggedFieldHeader(buf, pos, 2, finalizedFeaturesTagSize(self.finalized_features));
+            ser.writeCompactArrayLen(buf, pos, self.finalized_features.len);
+            for (self.finalized_features) |feature| {
+                feature.serialize(buf, pos, 3);
+            }
+        }
+
+        if (self.zk_migration_ready) {
+            writeTaggedFieldHeader(buf, pos, 3, 1);
+            ser.writeBool(buf, pos, true);
+        }
+
+        for (self.tagged_fields) |field| {
+            if (isKnownApiVersionsResponseTag(field.tag)) continue;
+            writeTaggedFieldHeader(buf, pos, field.tag, field.data.len);
+            @memcpy(buf[pos.* .. pos.* + field.data.len], field.data);
+            pos.* += field.data.len;
+        }
+    }
+
+    fn readTopLevelTaggedFields(self: *ApiVersionsResponse, alloc: Allocator, buf: []const u8, pos: *usize, version: i16) !void {
+        const tagged_fields = try ser.readTaggedFields(alloc, buf, pos);
+        self.tagged_fields = tagged_fields;
+
+        var seen_supported_features = false;
+        var seen_finalized_features_epoch = false;
+        var seen_finalized_features = false;
+        var seen_zk_migration_ready = false;
+
+        for (tagged_fields) |field| {
+            switch (field.tag) {
+                0 => {
+                    if (seen_supported_features) return error.DuplicateTaggedField;
+                    seen_supported_features = true;
+                    self.supported_features = try parseSupportedFeaturesTag(alloc, field.data, version);
+                },
+                1 => {
+                    if (seen_finalized_features_epoch) return error.DuplicateTaggedField;
+                    seen_finalized_features_epoch = true;
+                    self.finalized_features_epoch = try parseFinalizedFeaturesEpochTag(field.data);
+                },
+                2 => {
+                    if (seen_finalized_features) return error.DuplicateTaggedField;
+                    seen_finalized_features = true;
+                    self.finalized_features = try parseFinalizedFeaturesTag(alloc, field.data, version);
+                },
+                3 => {
+                    if (seen_zk_migration_ready) return error.DuplicateTaggedField;
+                    seen_zk_migration_ready = true;
+                    self.zk_migration_ready = try parseZkMigrationReadyTag(field.data);
+                },
+                else => {},
+            }
+        }
+    }
+
+    fn topLevelTaggedFieldsSize(self: *const ApiVersionsResponse) usize {
+        var size = ser.unsignedVarintSize(self.topLevelTaggedFieldCount());
+
+        if (self.supported_features.len > 0) {
+            const field_size = supportedFeaturesTagSize(self.supported_features);
+            size += taggedFieldHeaderSize(0, field_size) + field_size;
+        }
+        if (self.finalized_features_epoch != -1) {
+            size += taggedFieldHeaderSize(1, 8) + 8;
+        }
+        if (self.finalized_features.len > 0) {
+            const field_size = finalizedFeaturesTagSize(self.finalized_features);
+            size += taggedFieldHeaderSize(2, field_size) + field_size;
+        }
+        if (self.zk_migration_ready) {
+            size += taggedFieldHeaderSize(3, 1) + 1;
+        }
+        for (self.tagged_fields) |field| {
+            if (!isKnownApiVersionsResponseTag(field.tag)) {
+                size += taggedFieldHeaderSize(field.tag, field.data.len) + field.data.len;
+            }
+        }
+
+        return size;
+    }
+
+    fn topLevelTaggedFieldCount(self: *const ApiVersionsResponse) usize {
+        var count: usize = 0;
+        if (self.supported_features.len > 0) count += 1;
+        if (self.finalized_features_epoch != -1) count += 1;
+        if (self.finalized_features.len > 0) count += 1;
+        if (self.zk_migration_ready) count += 1;
+        for (self.tagged_fields) |field| {
+            if (!isKnownApiVersionsResponseTag(field.tag)) count += 1;
+        }
+        return count;
+    }
 };
+
+fn parseSupportedFeaturesTag(alloc: Allocator, data: []const u8, version: i16) ![]ApiVersionsResponse.SupportedFeatureKey {
+    var pos: usize = 0;
+    const len = (try ser.readCompactArrayLen(data, &pos)) orelse return error.InvalidTaggedField;
+    if (len == 0) {
+        if (pos != data.len) return error.InvalidTaggedField;
+        return &.{};
+    }
+
+    const features = try alloc.alloc(ApiVersionsResponse.SupportedFeatureKey, len);
+    errdefer alloc.free(features);
+    for (features) |*feature| {
+        feature.* = try ApiVersionsResponse.SupportedFeatureKey.deserialize(alloc, data, &pos, version);
+    }
+    if (pos != data.len) return error.InvalidTaggedField;
+    return features;
+}
+
+fn parseFinalizedFeaturesEpochTag(data: []const u8) !i64 {
+    var pos: usize = 0;
+    const epoch = try readI64Checked(data, &pos);
+    if (pos != data.len) return error.InvalidTaggedField;
+    return epoch;
+}
+
+fn parseFinalizedFeaturesTag(alloc: Allocator, data: []const u8, version: i16) ![]ApiVersionsResponse.FinalizedFeatureKey {
+    var pos: usize = 0;
+    const len = (try ser.readCompactArrayLen(data, &pos)) orelse return error.InvalidTaggedField;
+    if (len == 0) {
+        if (pos != data.len) return error.InvalidTaggedField;
+        return &.{};
+    }
+
+    const features = try alloc.alloc(ApiVersionsResponse.FinalizedFeatureKey, len);
+    errdefer alloc.free(features);
+    for (features) |*feature| {
+        feature.* = try ApiVersionsResponse.FinalizedFeatureKey.deserialize(alloc, data, &pos, version);
+    }
+    if (pos != data.len) return error.InvalidTaggedField;
+    return features;
+}
+
+fn parseZkMigrationReadyTag(data: []const u8) !bool {
+    var pos: usize = 0;
+    const value = try readBoolChecked(data, &pos);
+    if (pos != data.len) return error.InvalidTaggedField;
+    return value;
+}
+
+fn supportedFeaturesTagSize(features: []const ApiVersionsResponse.SupportedFeatureKey) usize {
+    var size = ser.unsignedVarintSize(features.len + 1);
+    for (features) |feature| {
+        size += feature.calcSize(3);
+    }
+    return size;
+}
+
+fn finalizedFeaturesTagSize(features: []const ApiVersionsResponse.FinalizedFeatureKey) usize {
+    var size = ser.unsignedVarintSize(features.len + 1);
+    for (features) |feature| {
+        size += feature.calcSize(3);
+    }
+    return size;
+}
+
+fn writeTaggedFieldHeader(buf: []u8, pos: *usize, tag: usize, size: usize) void {
+    ser.writeUnsignedVarint(buf, pos, tag);
+    ser.writeUnsignedVarint(buf, pos, size);
+}
+
+fn taggedFieldHeaderSize(tag: usize, size: usize) usize {
+    return ser.unsignedVarintSize(tag) + ser.unsignedVarintSize(size);
+}
+
+fn isKnownApiVersionsResponseTag(tag: usize) bool {
+    return tag <= 3;
+}
+
+fn readI64Checked(buf: []const u8, pos: *usize) !i64 {
+    if (pos.* + 8 > buf.len) return error.BufferUnderflow;
+    return ser.readI64(buf, pos);
+}
+
+fn readBoolChecked(buf: []const u8, pos: *usize) !bool {
+    if (pos.* + 1 > buf.len) return error.BufferUnderflow;
+    return try ser.readBool(buf, pos);
+}

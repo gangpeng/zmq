@@ -1305,10 +1305,30 @@ test "generated non-default golden fixtures cover legacy and flexible wire encod
             .{ .api_key = 0, .min_version = 0, .max_version = 11 },
             .{ .api_key = 3, .min_version = 0, .max_version = 12 },
         };
+        const supported_features = [_]ApiVersionsResponse.SupportedFeatureKey{.{
+            .name = "metadata.version",
+            .min_version = 0,
+            .max_version = 4,
+        }};
+        const finalized_features = [_]ApiVersionsResponse.FinalizedFeatureKey{.{
+            .name = "metadata.version",
+            .max_version_level = 4,
+            .min_version_level = 1,
+        }};
+        const unknown_tag_data = [_]u8{ 0xaa, 0xbb };
+        const unknown_tags = [_]ser.TaggedField{.{
+            .tag = 9,
+            .data = &unknown_tag_data,
+        }};
         const value = ApiVersionsResponse{
             .error_code = 0,
             .api_keys = &api_keys,
             .throttle_time_ms = 42,
+            .supported_features = &supported_features,
+            .finalized_features_epoch = 42,
+            .finalized_features = &finalized_features,
+            .zk_migration_ready = true,
+            .tagged_fields = &unknown_tags,
         };
         try expectGoldenRoundTrip(ApiVersionsResponse, value, 3, &[_]u8{
             0x00, 0x00,
@@ -1321,7 +1341,24 @@ test "generated non-default golden fixtures cover legacy and flexible wire encod
             0x00, 0x0c,
             0x00, 0x00,
             0x00, 0x00,
-            0x2a, 0x00,
+            0x2a, 0x05,
+            0x00, 0x17, 0x02, 0x11,
+            'm',  'e',  't',  'a',
+            'd',  'a',  't',  'a',
+            '.',  'v',  'e',  'r',
+            's',  'i',  'o',  'n',
+            0x00, 0x00, 0x00, 0x04,
+            0x00, 0x01, 0x08, 0x00,
+            0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x2a, 0x02,
+            0x17, 0x02, 0x11, 'm',
+            'e',  't',  'a',  'd',
+            'a',  't',  'a',  '.',
+            'v',  'e',  'r',  's',
+            'i',  'o',  'n',  0x00,
+            0x04, 0x00, 0x01, 0x00,
+            0x03, 0x01, 0x01, 0x09,
+            0x02, 0xaa, 0xbb,
         });
     }
 
