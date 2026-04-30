@@ -361,6 +361,13 @@ pub const S3Client = struct {
 
         // 206 = Partial Content, 200 = Full content
         if (response.status != 206 and response.status != 200) return error.S3GetFailed;
+        if (response.status == 206) {
+            const content_range = headerValue(response.headers(), "Content-Range") orelse
+                return error.S3RangeContentRangeMismatch;
+            if (!contentRangeMatches(content_range, offset, length)) {
+                return error.S3RangeContentRangeMismatch;
+            }
+        }
 
         const result = try self.exactRangeBody(response.status, offset, length, try self.responseBodyOwned(&response));
         self.get_count += 1;
@@ -862,6 +869,25 @@ pub const S3Client = struct {
             std.mem.indexOf(u8, response_data, "<Error ") != null;
     }
 
+    fn contentRangeMatches(value: []const u8, requested_offset: u64, requested_length: u64) bool {
+        if (requested_length == 0) return false;
+        const trimmed = std.mem.trim(u8, value, " \t");
+        if (!std.mem.startsWith(u8, trimmed, "bytes ")) return false;
+
+        const spec = trimmed["bytes ".len..];
+        const dash = std.mem.indexOfScalar(u8, spec, '-') orelse return false;
+        const slash = std.mem.indexOfScalar(u8, spec, '/') orelse return false;
+        if (dash == 0 or slash <= dash + 1) return false;
+
+        const start_text = std.mem.trim(u8, spec[0..dash], " \t");
+        const end_text = std.mem.trim(u8, spec[dash + 1 .. slash], " \t");
+        const start = std.fmt.parseInt(u64, start_text, 10) catch return false;
+        const end = std.fmt.parseInt(u64, end_text, 10) catch return false;
+        const expected_end = std.math.add(u64, requested_offset, requested_length - 1) catch return false;
+
+        return start == requested_offset and end == expected_end;
+    }
+
     fn isChunked(headers: []const u8) bool {
         const value = headerValue(headers, "Transfer-Encoding") orelse return false;
         var tokens = std.mem.splitScalar(u8, value, ',');
@@ -1223,6 +1249,15 @@ test "S3Client range body returns exact requested window" {
 
     const ignored_range_body = try testing.allocator.dupe(u8, "abcd");
     try testing.expectError(error.S3RangeLengthMismatch, client.exactRangeBody(200, 2, 4, ignored_range_body));
+}
+
+test "S3Client validates partial content range window" {
+    try testing.expect(S3Client.contentRangeMatches("bytes 10-14/100", 10, 5));
+    try testing.expect(S3Client.contentRangeMatches(" bytes 10 - 14 / * ", 10, 5));
+    try testing.expect(!S3Client.contentRangeMatches("bytes 10-13/100", 10, 5));
+    try testing.expect(!S3Client.contentRangeMatches("bytes 11-15/100", 10, 5));
+    try testing.expect(!S3Client.contentRangeMatches("items 10-14/100", 10, 5));
+    try testing.expect(!S3Client.contentRangeMatches("bytes */100", 10, 5));
 }
 
 test "S3Client multipart ETag validation" {
