@@ -215,6 +215,8 @@ Status: completed for the initial catalog and DeleteGroups slice.
   topic log dirs while explicit empty arrays return no topic entries.
   ElectLeadersRequest now preserves nullable `TopicPartitions` so null elects
   across all known topics while explicit empty arrays return no topic results.
+  CreatePartitionsRequest now preserves nullable `Assignments` so null uses
+  automatic partition assignment while explicit empty assignment lists fail.
   AlterPartitionReassignmentsRequest now preserves nullable `Replicas` so null
   cancels pending reassignments while explicit empty assignments fail closed.
   ListPartitionReassignmentsRequest now preserves nullable `Topics` so null

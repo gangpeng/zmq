@@ -9146,10 +9146,12 @@ pub const Broker = struct {
 
     fn freeCreatePartitionsRequest(self: *Broker, req: *generated.create_partitions_request.CreatePartitionsRequest) void {
         for (req.topics) |topic| {
-            for (topic.assignments) |assignment| {
-                if (assignment.broker_ids.len > 0) self.allocator.free(assignment.broker_ids);
+            if (topic.assignments) |assignments| {
+                for (assignments) |assignment| {
+                    if (assignment.broker_ids.len > 0) self.allocator.free(assignment.broker_ids);
+                }
+                if (assignments.len > 0) self.allocator.free(assignments);
             }
-            if (topic.assignments.len > 0) self.allocator.free(topic.assignments);
         }
         if (req.topics.len > 0) self.allocator.free(req.topics);
     }
@@ -9181,14 +9183,14 @@ pub const Broker = struct {
         }
 
         const added_count: usize = @intCast(topic_req.count - info.num_partitions);
-        if (topic_req.assignments.len > 0) {
-            if (topic_req.assignments.len != added_count) {
+        if (topic_req.assignments) |assignments| {
+            if (assignments.len != added_count) {
                 return .{
                     .error_code = @intFromEnum(ErrorCode.invalid_replica_assignment),
                     .error_message = "Assignment count must match new partitions",
                 };
             }
-            for (topic_req.assignments) |assignment| {
+            for (assignments) |assignment| {
                 if (assignment.broker_ids.len != 1 or assignment.broker_ids[0] != self.node_id) {
                     return .{
                         .error_code = @intFromEnum(ErrorCode.invalid_replica_assignment),
@@ -20014,7 +20016,7 @@ test "Broker.handleRequest CreatePartitions v2 returns generated response and ex
     const topics = [_]Req.CreatePartitionsTopic{.{
         .name = "create-partitions-topic",
         .count = 3,
-        .assignments = &.{},
+        .assignments = null,
     }};
     const req = Req{
         .topics = &topics,
@@ -20045,6 +20047,48 @@ test "Broker.handleRequest CreatePartitions v2 returns generated response and ex
     try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.none)), resp.results[0].error_code);
     try testing.expectEqual(@as(i32, 3), broker.topics.get("create-partitions-topic").?.num_partitions);
     try testing.expect(broker.store.partitions.contains("create-partitions-topic-2"));
+}
+
+test "Broker.handleRequest CreatePartitions rejects explicit empty assignments" {
+    const Req = generated.create_partitions_request.CreatePartitionsRequest;
+    const Resp = generated.create_partitions_response.CreatePartitionsResponse;
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+    try testing.expect(broker.ensureTopic("create-partitions-empty-assignments-topic"));
+    const before = broker.topics.get("create-partitions-empty-assignments-topic").?.num_partitions;
+
+    const topics = [_]Req.CreatePartitionsTopic{.{
+        .name = "create-partitions-empty-assignments-topic",
+        .count = before + 2,
+        .assignments = &.{},
+    }};
+    const req = Req{
+        .topics = &topics,
+        .timeout_ms = 30000,
+        .validate_only = false,
+    };
+
+    var buf: [512]u8 = undefined;
+    var pos = buildTestRequest(&buf, 37, 2, 3707, header_mod.requestHeaderVersion(37, 2));
+    req.serialize(&buf, &pos, 2);
+
+    const response = broker.handleRequest(buf[0..pos]);
+    try testing.expect(response != null);
+    defer testing.allocator.free(response.?);
+
+    var rpos: usize = 0;
+    var response_header = try ResponseHeader.deserialize(testing.allocator, response.?, &rpos, header_mod.responseHeaderVersion(37, 2));
+    defer response_header.deinit(testing.allocator);
+    try testing.expectEqual(@as(i32, 3707), response_header.correlation_id);
+
+    const resp = try Resp.deserialize(testing.allocator, response.?, &rpos, 2);
+    defer if (resp.results.len > 0) testing.allocator.free(resp.results);
+
+    try testing.expectEqual(response.?.len, rpos);
+    try testing.expectEqual(@as(usize, 1), resp.results.len);
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.invalid_replica_assignment)), resp.results[0].error_code);
+    try testing.expectEqual(before, broker.topics.get("create-partitions-empty-assignments-topic").?.num_partitions);
 }
 
 test "Broker.handleRequest CreatePartitions rejects unsupported manual assignments" {
@@ -20105,7 +20149,7 @@ test "Broker.handleRequest CreatePartitions validate_only does not expand topic"
     const topics = [_]Req.CreatePartitionsTopic{.{
         .name = "create-partitions-validate-topic",
         .count = before + 2,
-        .assignments = &.{},
+        .assignments = null,
     }};
     const req = Req{
         .topics = &topics,
@@ -20157,7 +20201,7 @@ test "Broker.handleRequest CreatePartitions rolls back when topic snapshot S3 WA
     const topics = [_]Req.CreatePartitionsTopic{.{
         .name = "create-partitions-s3-fail-topic",
         .count = before + 2,
-        .assignments = &.{},
+        .assignments = null,
     }};
     const req = Req{
         .topics = &topics,

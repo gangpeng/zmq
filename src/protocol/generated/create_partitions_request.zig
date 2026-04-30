@@ -65,7 +65,7 @@ pub const CreatePartitionsRequest = struct {
         count: i32 = 0,
         /// The new partition assignments.
         /// Versions: 0+
-        assignments: []const CreatePartitionsAssignment = &.{},
+        assignments: ?[]const CreatePartitionsAssignment = null,
 
         pub fn serialize(self: *const CreatePartitionsTopic, buf: []u8, pos: *usize, version: i16) void {
             if (version >= 2) {
@@ -74,13 +74,21 @@ pub const CreatePartitionsRequest = struct {
                 ser.writeString(buf, pos, self.name);
             }
             ser.writeI32(buf, pos, self.count);
-            if (version >= 2) {
-                ser.writeCompactArrayLen(buf, pos, self.assignments.len);
+            if (self.assignments) |assignments| {
+                if (version >= 2) {
+                    ser.writeCompactArrayLen(buf, pos, assignments.len);
+                } else {
+                    ser.writeArrayLen(buf, pos, assignments.len);
+                }
+                for (assignments) |item| {
+                    item.serialize(buf, pos, version);
+                }
             } else {
-                ser.writeArrayLen(buf, pos, self.assignments.len);
-            }
-            for (self.assignments) |item| {
-                item.serialize(buf, pos, version);
+                if (version >= 2) {
+                    ser.writeCompactArrayLen(buf, pos, null);
+                } else {
+                    ser.writeArrayLen(buf, pos, null);
+                }
             }
             if (version >= 2) ser.writeEmptyTaggedFields(buf, pos);
         }
@@ -92,16 +100,22 @@ pub const CreatePartitionsRequest = struct {
             else
                 try ser.readString(buf, pos);
             result.count = ser.readI32(buf, pos);
-            const assignments_len: usize = if (version >= 2)
-                (try ser.readCompactArrayLen(buf, pos)) orelse 0
+            const assignments_len: ?usize = if (version >= 2)
+                try ser.readCompactArrayLen(buf, pos)
             else
-                (try ser.readArrayLen(buf, pos)) orelse 0;
-            if (assignments_len > 0) {
-                const assignments_items = try alloc.alloc(CreatePartitionsAssignment, assignments_len);
-                for (assignments_items) |*item| {
-                    item.* = try CreatePartitionsAssignment.deserialize(alloc, buf, pos, version);
+                try ser.readArrayLen(buf, pos);
+            if (assignments_len) |len| {
+                if (len == 0) {
+                    result.assignments = &.{};
+                } else {
+                    const assignments_items = try alloc.alloc(CreatePartitionsAssignment, len);
+                    for (assignments_items) |*item| {
+                        item.* = try CreatePartitionsAssignment.deserialize(alloc, buf, pos, version);
+                    }
+                    result.assignments = assignments_items;
                 }
-                result.assignments = assignments_items;
+            } else {
+                result.assignments = null;
             }
             if (version >= 2) try ser.skipTaggedFields(buf, pos);
             return result;
@@ -115,13 +129,19 @@ pub const CreatePartitionsRequest = struct {
                 size += ser.stringSize(self.name);
             }
             size += 4;
-            if (version >= 2) {
-                size += ser.unsignedVarintSize(self.assignments.len + 1);
+            if (self.assignments) |assignments| {
+                if (version >= 2) {
+                    size += ser.unsignedVarintSize(assignments.len + 1);
+                } else {
+                    size += 4;
+                }
+                for (assignments) |item| {
+                    size += item.calcSize(version);
+                }
+            } else if (version >= 2) {
+                size += 1;
             } else {
                 size += 4;
-            }
-            for (self.assignments) |item| {
-                size += item.calcSize(version);
             }
             if (version >= 2) size += 1;
             return size;

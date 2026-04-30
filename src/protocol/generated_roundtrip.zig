@@ -612,6 +612,52 @@ test "generated non-default golden fixtures cover legacy and flexible wire encod
     }
 
     {
+        const CreatePartitionsRequest = generated.create_partitions_request.CreatePartitionsRequest;
+        const null_topics = [_]CreatePartitionsRequest.CreatePartitionsTopic{.{
+            .name = "p",
+            .count = 2,
+            .assignments = null,
+        }};
+        const null_value = CreatePartitionsRequest{
+            .topics = &null_topics,
+            .timeout_ms = 1000,
+            .validate_only = false,
+        };
+        try expectGoldenRoundTrip(CreatePartitionsRequest, null_value, 0, &[_]u8{
+            0x00, 0x00, 0x00, 0x01,
+            0x00, 0x01, 'p',  0x00,
+            0x00, 0x00, 0x02, 0xff,
+            0xff, 0xff, 0xff, 0x00,
+            0x00, 0x03, 0xe8, 0x00,
+        });
+        try expectGoldenRoundTrip(CreatePartitionsRequest, null_value, 2, &[_]u8{
+            0x02, 0x02, 'p',
+            0x00, 0x00, 0x00,
+            0x02, 0x00, 0x00,
+            0x00, 0x00, 0x03,
+            0xe8, 0x00, 0x00,
+        });
+
+        const empty_topics = [_]CreatePartitionsRequest.CreatePartitionsTopic{.{
+            .name = "p",
+            .count = 2,
+            .assignments = &.{},
+        }};
+        const empty_value = CreatePartitionsRequest{
+            .topics = &empty_topics,
+            .timeout_ms = 1000,
+            .validate_only = false,
+        };
+        try expectGoldenRoundTrip(CreatePartitionsRequest, empty_value, 2, &[_]u8{
+            0x02, 0x02, 'p',
+            0x00, 0x00, 0x00,
+            0x02, 0x01, 0x00,
+            0x00, 0x00, 0x03,
+            0xe8, 0x00, 0x00,
+        });
+    }
+
+    {
         const DescribeConfigsResponse = generated.describe_configs_response.DescribeConfigsResponse;
         const synonyms = [_]DescribeConfigsResponse.DescribeConfigsResult.DescribeConfigsResourceResult.DescribeConfigsSynonym{.{
             .name = "cleanup.policy",
