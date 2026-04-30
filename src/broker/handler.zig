@@ -14074,7 +14074,9 @@ pub const Broker = struct {
     fn freeAlterPartitionReassignmentsRequest(self: *Broker, req: *generated.alter_partition_reassignments_request.AlterPartitionReassignmentsRequest) void {
         for (req.topics) |topic| {
             for (topic.partitions) |partition| {
-                if (partition.replicas.len > 0) self.allocator.free(partition.replicas);
+                if (partition.replicas) |replicas| {
+                    if (replicas.len > 0) self.allocator.free(replicas);
+                }
             }
             if (topic.partitions.len > 0) self.allocator.free(topic.partitions);
         }
@@ -14096,7 +14098,7 @@ pub const Broker = struct {
         var key_buf: [256]u8 = undefined;
         const lookup_key = reassignmentKeyBuf(&key_buf, topic_name, partition_req.partition_index);
 
-        if (partition_req.replicas.len == 0) {
+        const replicas = partition_req.replicas orelse {
             const removed_existing = self.partition_reassignments.fetchRemove(lookup_key);
             if (removed_existing) |removed| {
                 self.persistPartitionReassignmentsDurably() catch |err| {
@@ -14107,13 +14109,13 @@ pub const Broker = struct {
                 return @intFromEnum(ErrorCode.none);
             }
             return @intFromEnum(ErrorCode.no_reassignment_in_progress);
-        }
+        };
 
-        if (!validReplicaAssignment(partition_req.replicas)) {
+        if (replicas.len == 0 or !validReplicaAssignment(replicas)) {
             return @intFromEnum(ErrorCode.invalid_replica_assignment);
         }
 
-        if (isLocalReplicaAssignment(partition_req.replicas, self.node_id)) {
+        if (isLocalReplicaAssignment(replicas, self.node_id)) {
             const removed_existing = self.partition_reassignments.fetchRemove(lookup_key);
             if (removed_existing) |removed| {
                 self.persistPartitionReassignmentsDurably() catch |err| {
@@ -14128,7 +14130,7 @@ pub const Broker = struct {
         const owned_key = try reassignmentKey(self.allocator, topic_name, partition_req.partition_index);
         var owned_key_owned = true;
         errdefer if (owned_key_owned) self.allocator.free(owned_key);
-        var next = try self.buildPartitionReassignment(topic_name, partition_req.partition_index, partition_req.replicas);
+        var next = try self.buildPartitionReassignment(topic_name, partition_req.partition_index, replicas);
         var next_owned = true;
         errdefer if (next_owned) next.deinit(self.allocator);
 
@@ -25367,7 +25369,7 @@ test "Broker.handleRequest AlterPartitionReassignments returns request-scoped si
         .{ .partition_index = 0, .replicas = &local_replicas },
         .{ .partition_index = 1, .replicas = &remote_replicas },
         .{ .partition_index = 2, .replicas = &local_replicas },
-        .{ .partition_index = 0, .replicas = &.{} },
+        .{ .partition_index = 0, .replicas = null },
     };
     const topics = [_]Req.ReassignableTopic{.{
         .name = "reassign-topic",
@@ -25618,9 +25620,44 @@ test "Broker.handleRequest partition reassignment alter list and cancel round-tr
     try testing.expectEqualSlices(i32, &remote_replicas, list_resp.topics[0].partitions[0].adding_replicas);
     try testing.expectEqualSlices(i32, &[_]i32{1}, list_resp.topics[0].partitions[0].removing_replicas);
 
+    {
+        const empty_partitions = [_]AlterReq.ReassignableTopic.ReassignablePartition{.{
+            .partition_index = 0,
+            .replicas = &.{},
+        }};
+        const empty_topics = [_]AlterReq.ReassignableTopic{.{
+            .name = "reassign-roundtrip",
+            .partitions = &empty_partitions,
+        }};
+        const empty_req = AlterReq{
+            .timeout_ms = 1000,
+            .topics = &empty_topics,
+        };
+
+        pos = buildTestRequest(&buf, 45, 0, 4511, header_mod.requestHeaderVersion(45, 0));
+        empty_req.serialize(&buf, &pos, 0);
+        const empty_response = broker.handleRequest(buf[0..pos]);
+        try testing.expect(empty_response != null);
+        defer testing.allocator.free(empty_response.?);
+
+        rpos = 0;
+        var empty_header = try ResponseHeader.deserialize(testing.allocator, empty_response.?, &rpos, header_mod.responseHeaderVersion(45, 0));
+        defer empty_header.deinit(testing.allocator);
+        const empty_resp = try AlterResp.deserialize(testing.allocator, empty_response.?, &rpos, 0);
+        defer {
+            for (empty_resp.responses) |topic| {
+                if (topic.partitions.len > 0) testing.allocator.free(topic.partitions);
+            }
+            if (empty_resp.responses.len > 0) testing.allocator.free(empty_resp.responses);
+        }
+
+        try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.invalid_replica_assignment)), empty_resp.responses[0].partitions[0].error_code);
+        try testing.expectEqual(@as(u32, 1), broker.partition_reassignments.count());
+    }
+
     const cancel_partitions = [_]AlterReq.ReassignableTopic.ReassignablePartition{.{
         .partition_index = 0,
-        .replicas = &.{},
+        .replicas = null,
     }};
     const cancel_topics = [_]AlterReq.ReassignableTopic{.{
         .name = "reassign-roundtrip",
@@ -25631,7 +25668,7 @@ test "Broker.handleRequest partition reassignment alter list and cancel round-tr
         .topics = &cancel_topics,
     };
 
-    pos = buildTestRequest(&buf, 45, 0, 4511, header_mod.requestHeaderVersion(45, 0));
+    pos = buildTestRequest(&buf, 45, 0, 4512, header_mod.requestHeaderVersion(45, 0));
     cancel_req.serialize(&buf, &pos, 0);
     const cancel_response = broker.handleRequest(buf[0..pos]);
     try testing.expect(cancel_response != null);

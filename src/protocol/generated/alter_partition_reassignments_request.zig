@@ -16,13 +16,17 @@ pub const AlterPartitionReassignmentsRequest = struct {
             partition_index: i32 = 0,
             /// The replicas to place the partitions on, or null to cancel a pending reassignment for this partition.
             /// Versions: 0+
-            replicas: []const i32 = &.{},
+            replicas: ?[]const i32 = null,
 
             pub fn serialize(self: *const ReassignablePartition, buf: []u8, pos: *usize, _: i16) void {
                 ser.writeI32(buf, pos, self.partition_index);
-                ser.writeCompactArrayLen(buf, pos, self.replicas.len);
-                for (self.replicas) |item| {
-                    ser.writeI32(buf, pos, item);
+                if (self.replicas) |replicas| {
+                    ser.writeCompactArrayLen(buf, pos, replicas.len);
+                    for (replicas) |item| {
+                        ser.writeI32(buf, pos, item);
+                    }
+                } else {
+                    ser.writeCompactArrayLen(buf, pos, null);
                 }
                 ser.writeEmptyTaggedFields(buf, pos);
             }
@@ -30,13 +34,19 @@ pub const AlterPartitionReassignmentsRequest = struct {
             pub fn deserialize(alloc: Allocator, buf: []const u8, pos: *usize, _: i16) !ReassignablePartition {
                 var result = ReassignablePartition{};
                 result.partition_index = ser.readI32(buf, pos);
-                const replicas_len: usize = (try ser.readCompactArrayLen(buf, pos)) orelse 0;
-                if (replicas_len > 0) {
-                    const replicas_items = try alloc.alloc(i32, replicas_len);
-                    for (replicas_items) |*item| {
-                        item.* = ser.readI32(buf, pos);
+                const replicas_len: ?usize = try ser.readCompactArrayLen(buf, pos);
+                if (replicas_len) |len| {
+                    if (len == 0) {
+                        result.replicas = &.{};
+                    } else {
+                        const replicas_items = try alloc.alloc(i32, len);
+                        for (replicas_items) |*item| {
+                            item.* = ser.readI32(buf, pos);
+                        }
+                        result.replicas = replicas_items;
                     }
-                    result.replicas = replicas_items;
+                } else {
+                    result.replicas = null;
                 }
                 try ser.skipTaggedFields(buf, pos);
                 return result;
@@ -45,8 +55,12 @@ pub const AlterPartitionReassignmentsRequest = struct {
             pub fn calcSize(self: *const ReassignablePartition, _: i16) usize {
                 var size: usize = 0;
                 size += 4;
-                size += ser.unsignedVarintSize(self.replicas.len + 1);
-                size += self.replicas.len * 4;
+                if (self.replicas) |replicas| {
+                    size += ser.unsignedVarintSize(replicas.len + 1);
+                    size += replicas.len * 4;
+                } else {
+                    size += 1;
+                }
                 size += 1;
                 return size;
             }

@@ -1081,6 +1081,43 @@ test "generated non-default golden fixtures cover legacy and flexible wire encod
     }
 
     {
+        const AlterPartitionReassignmentsRequest = generated.alter_partition_reassignments_request.AlterPartitionReassignmentsRequest;
+        const null_partitions = [_]AlterPartitionReassignmentsRequest.ReassignableTopic.ReassignablePartition{.{
+            .partition_index = 0,
+            .replicas = null,
+        }};
+        const null_topics = [_]AlterPartitionReassignmentsRequest.ReassignableTopic{.{
+            .name = "r",
+            .partitions = &null_partitions,
+        }};
+        const null_value = AlterPartitionReassignmentsRequest{
+            .timeout_ms = 1000,
+            .topics = &null_topics,
+        };
+        try expectGoldenRoundTrip(AlterPartitionReassignmentsRequest, null_value, 0, &[_]u8{
+            0x00, 0x00, 0x03, 0xe8, 0x02, 0x02, 'r',  0x02,
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        });
+
+        const empty_partitions = [_]AlterPartitionReassignmentsRequest.ReassignableTopic.ReassignablePartition{.{
+            .partition_index = 0,
+            .replicas = &.{},
+        }};
+        const empty_topics = [_]AlterPartitionReassignmentsRequest.ReassignableTopic{.{
+            .name = "r",
+            .partitions = &empty_partitions,
+        }};
+        const empty_value = AlterPartitionReassignmentsRequest{
+            .timeout_ms = 1000,
+            .topics = &empty_topics,
+        };
+        try expectGoldenRoundTrip(AlterPartitionReassignmentsRequest, empty_value, 0, &[_]u8{
+            0x00, 0x00, 0x03, 0xe8, 0x02, 0x02, 'r',  0x02,
+            0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00,
+        });
+    }
+
+    {
         const ListPartitionReassignmentsRequest = generated.list_partition_reassignments_request.ListPartitionReassignmentsRequest;
         const null_value = ListPartitionReassignmentsRequest{
             .timeout_ms = 1000,
