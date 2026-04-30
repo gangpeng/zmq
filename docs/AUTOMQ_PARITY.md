@@ -214,6 +214,9 @@ Status: completed for the initial catalog and DeleteGroups slice.
   topic-name partition errors to v5+ topic-id grouped partition errors.
   DescribeConfigsResponse generated encoding now keeps `IsDefault` v0-only so
   v1+ config entries align `ConfigSource`, sensitivity, and synonym fields.
+  EndQuorumEpochRequest generated encoding now keeps v0-only
+  `PreferredSuccessors` out of v1 flexible frames and uses v1+
+  `PreferredCandidates` instead.
 
 ### Phase 2: AutoMQ S3Stream APIs
 

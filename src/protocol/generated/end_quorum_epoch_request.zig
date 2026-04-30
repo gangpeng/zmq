@@ -12,10 +12,10 @@ pub const EndQuorumEpochRequest = struct {
     pub const TopicData = struct {
         pub const PartitionData = struct {
             pub const ReplicaInfo = struct {
-                /// 
+                ///
                 /// Versions: 1+
                 candidate_id: i32 = 0,
-                /// 
+                ///
                 /// Versions: 1+
                 candidate_directory_id: [16]u8 = .{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 },
 
@@ -74,20 +74,14 @@ pub const EndQuorumEpochRequest = struct {
                 ser.writeI32(buf, pos, self.partition_index);
                 ser.writeI32(buf, pos, self.leader_id);
                 ser.writeI32(buf, pos, self.leader_epoch);
-                if (version >= 1) {
-                    ser.writeCompactArrayLen(buf, pos, self.preferred_successors.len);
-                } else {
+                if (version == 0) {
                     ser.writeArrayLen(buf, pos, self.preferred_successors.len);
-                }
-                for (self.preferred_successors) |item| {
-                    ser.writeI32(buf, pos, item);
+                    for (self.preferred_successors) |item| {
+                        ser.writeI32(buf, pos, item);
+                    }
                 }
                 if (version >= 1) {
-                    if (version >= 1) {
-                        ser.writeCompactArrayLen(buf, pos, self.preferred_candidates.len);
-                    } else {
-                        ser.writeArrayLen(buf, pos, self.preferred_candidates.len);
-                    }
+                    ser.writeCompactArrayLen(buf, pos, self.preferred_candidates.len);
                     for (self.preferred_candidates) |item| {
                         item.serialize(buf, pos, version);
                     }
@@ -100,22 +94,18 @@ pub const EndQuorumEpochRequest = struct {
                 result.partition_index = ser.readI32(buf, pos);
                 result.leader_id = ser.readI32(buf, pos);
                 result.leader_epoch = ser.readI32(buf, pos);
-                const preferred_successors_len: usize = if (version >= 1)
-                    (try ser.readCompactArrayLen(buf, pos)) orelse 0
-                else
-                    (try ser.readArrayLen(buf, pos)) orelse 0;
-                if (preferred_successors_len > 0) {
-                    const preferred_successors_items = try alloc.alloc(i32, preferred_successors_len);
-                    for (preferred_successors_items) |*item| {
-                        item.* = ser.readI32(buf, pos);
+                if (version == 0) {
+                    const preferred_successors_len: usize = (try ser.readArrayLen(buf, pos)) orelse 0;
+                    if (preferred_successors_len > 0) {
+                        const preferred_successors_items = try alloc.alloc(i32, preferred_successors_len);
+                        for (preferred_successors_items) |*item| {
+                            item.* = ser.readI32(buf, pos);
+                        }
+                        result.preferred_successors = preferred_successors_items;
                     }
-                    result.preferred_successors = preferred_successors_items;
                 }
                 if (version >= 1) {
-                    const preferred_candidates_len: usize = if (version >= 1)
-                        (try ser.readCompactArrayLen(buf, pos)) orelse 0
-                    else
-                        (try ser.readArrayLen(buf, pos)) orelse 0;
+                    const preferred_candidates_len: usize = (try ser.readCompactArrayLen(buf, pos)) orelse 0;
                     if (preferred_candidates_len > 0) {
                         const preferred_candidates_items = try alloc.alloc(ReplicaInfo, preferred_candidates_len);
                         for (preferred_candidates_items) |*item| {
@@ -133,18 +123,12 @@ pub const EndQuorumEpochRequest = struct {
                 size += 4;
                 size += 4;
                 size += 4;
-                if (version >= 1) {
-                    size += ser.unsignedVarintSize(self.preferred_successors.len + 1);
-                } else {
+                if (version == 0) {
                     size += 4;
+                    size += self.preferred_successors.len * 4;
                 }
-                size += self.preferred_successors.len * 4;
                 if (version >= 1) {
-                    if (version >= 1) {
-                        size += ser.unsignedVarintSize(self.preferred_candidates.len + 1);
-                    } else {
-                        size += 4;
-                    }
+                    size += ser.unsignedVarintSize(self.preferred_candidates.len + 1);
                     for (self.preferred_candidates) |item| {
                         size += item.calcSize(version);
                     }
@@ -157,7 +141,7 @@ pub const EndQuorumEpochRequest = struct {
         /// The topic name.
         /// Versions: 0+
         topic_name: ?[]const u8 = null,
-        /// 
+        ///
         /// Versions: 0+
         partitions: []const PartitionData = &.{},
 
@@ -296,10 +280,10 @@ pub const EndQuorumEpochRequest = struct {
         }
     };
 
-    /// 
+    ///
     /// Versions: 0+
     cluster_id: ?[]const u8 = null,
-    /// 
+    ///
     /// Versions: 0+
     topics: []const TopicData = &.{},
     /// Endpoints for the leader

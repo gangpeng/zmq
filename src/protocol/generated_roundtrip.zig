@@ -754,6 +754,97 @@ test "generated non-default golden fixtures cover legacy and flexible wire encod
     }
 
     {
+        const EndQuorumEpochRequest = generated.end_quorum_epoch_request.EndQuorumEpochRequest;
+        const ignored_candidate_directory_id = [_]u8{
+            0x10, 0x11, 0x12, 0x13,
+            0x14, 0x15, 0x16, 0x17,
+            0x18, 0x19, 0x1a, 0x1b,
+            0x1c, 0x1d, 0x1e, 0x1f,
+        };
+        const ignored_candidates = [_]EndQuorumEpochRequest.TopicData.PartitionData.ReplicaInfo{.{
+            .candidate_id = 99,
+            .candidate_directory_id = ignored_candidate_directory_id,
+        }};
+        const partitions = [_]EndQuorumEpochRequest.TopicData.PartitionData{.{
+            .partition_index = 2,
+            .leader_id = 7,
+            .leader_epoch = 3,
+            .preferred_successors = &[_]i32{ 4, 5 },
+            .preferred_candidates = &ignored_candidates,
+        }};
+        const topics = [_]EndQuorumEpochRequest.TopicData{.{
+            .topic_name = "topic-a",
+            .partitions = &partitions,
+        }};
+        const ignored_leader_endpoints = [_]EndQuorumEpochRequest.LeaderEndpoint{.{
+            .name = "listener",
+            .host = "broker-7",
+            .port = 9092,
+        }};
+        const value = EndQuorumEpochRequest{
+            .cluster_id = "cluster-a",
+            .topics = &topics,
+            .leader_endpoints = &ignored_leader_endpoints,
+        };
+        try expectGoldenRoundTrip(EndQuorumEpochRequest, value, 0, &[_]u8{
+            0x00, 0x09, 'c',  'l',  'u',  's',  't',  'e',
+            'r',  '-',  'a',  0x00, 0x00, 0x00, 0x01, 0x00,
+            0x07, 't',  'o',  'p',  'i',  'c',  '-',  'a',
+            0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x02,
+            0x00, 0x00, 0x00, 0x07, 0x00, 0x00, 0x00, 0x03,
+            0x00, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00, 0x04,
+            0x00, 0x00, 0x00, 0x05,
+        });
+    }
+
+    {
+        const EndQuorumEpochRequest = generated.end_quorum_epoch_request.EndQuorumEpochRequest;
+        const candidate_directory_id = [_]u8{
+            0x10, 0x11, 0x12, 0x13,
+            0x14, 0x15, 0x16, 0x17,
+            0x18, 0x19, 0x1a, 0x1b,
+            0x1c, 0x1d, 0x1e, 0x1f,
+        };
+        const preferred_candidates = [_]EndQuorumEpochRequest.TopicData.PartitionData.ReplicaInfo{.{
+            .candidate_id = 4,
+            .candidate_directory_id = candidate_directory_id,
+        }};
+        const partitions = [_]EndQuorumEpochRequest.TopicData.PartitionData{.{
+            .partition_index = 2,
+            .leader_id = 7,
+            .leader_epoch = 3,
+            .preferred_successors = &[_]i32{ 44, 55 },
+            .preferred_candidates = &preferred_candidates,
+        }};
+        const topics = [_]EndQuorumEpochRequest.TopicData{.{
+            .topic_name = "topic-a",
+            .partitions = &partitions,
+        }};
+        const leader_endpoints = [_]EndQuorumEpochRequest.LeaderEndpoint{.{
+            .name = "listener",
+            .host = "broker-7",
+            .port = 9092,
+        }};
+        const value = EndQuorumEpochRequest{
+            .cluster_id = "cluster-a",
+            .topics = &topics,
+            .leader_endpoints = &leader_endpoints,
+        };
+        try expectGoldenRoundTrip(EndQuorumEpochRequest, value, 1, &[_]u8{
+            0x0a, 'c',  'l',  'u',  's',  't',  'e',  'r',
+            '-',  'a',  0x02, 0x08, 't',  'o',  'p',  'i',
+            'c',  '-',  'a',  0x02, 0x00, 0x00, 0x00, 0x02,
+            0x00, 0x00, 0x00, 0x07, 0x00, 0x00, 0x00, 0x03,
+            0x02, 0x00, 0x00, 0x00, 0x04, 0x10, 0x11, 0x12,
+            0x13, 0x14, 0x15, 0x16, 0x17, 0x18, 0x19, 0x1a,
+            0x1b, 0x1c, 0x1d, 0x1e, 0x1f, 0x00, 0x00, 0x00,
+            0x02, 0x09, 'l',  'i',  's',  't',  'e',  'n',
+            'e',  'r',  0x09, 'b',  'r',  'o',  'k',  'e',
+            'r',  '-',  '7',  0x23, 0x84, 0x00, 0x00,
+        });
+    }
+
+    {
         const FetchSnapshotResponse = generated.fetch_snapshot_response.FetchSnapshotResponse;
         const PartitionSnapshot = FetchSnapshotResponse.TopicSnapshot.PartitionSnapshot;
         const partitions = [_]PartitionSnapshot{.{
