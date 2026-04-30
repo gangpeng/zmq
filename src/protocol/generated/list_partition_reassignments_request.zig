@@ -56,13 +56,17 @@ pub const ListPartitionReassignmentsRequest = struct {
     timeout_ms: i32 = 60000,
     /// The topics to list partition reassignments for, or null to list everything.
     /// Versions: 0+
-    topics: []const ListPartitionReassignmentsTopics = &.{},
+    topics: ?[]const ListPartitionReassignmentsTopics = null,
 
     pub fn serialize(self: *const ListPartitionReassignmentsRequest, buf: []u8, pos: *usize, version: i16) void {
         ser.writeI32(buf, pos, self.timeout_ms);
-        ser.writeCompactArrayLen(buf, pos, self.topics.len);
-        for (self.topics) |item| {
-            item.serialize(buf, pos, version);
+        if (self.topics) |topics| {
+            ser.writeCompactArrayLen(buf, pos, topics.len);
+            for (topics) |item| {
+                item.serialize(buf, pos, version);
+            }
+        } else {
+            ser.writeCompactArrayLen(buf, pos, null);
         }
         ser.writeEmptyTaggedFields(buf, pos);
     }
@@ -70,13 +74,19 @@ pub const ListPartitionReassignmentsRequest = struct {
     pub fn deserialize(alloc: Allocator, buf: []const u8, pos: *usize, version: i16) !ListPartitionReassignmentsRequest {
         var result = ListPartitionReassignmentsRequest{};
         result.timeout_ms = ser.readI32(buf, pos);
-        const topics_len: usize = (try ser.readCompactArrayLen(buf, pos)) orelse 0;
-        if (topics_len > 0) {
-            const topics_items = try alloc.alloc(ListPartitionReassignmentsTopics, topics_len);
-            for (topics_items) |*item| {
-                item.* = try ListPartitionReassignmentsTopics.deserialize(alloc, buf, pos, version);
+        const topics_len: ?usize = try ser.readCompactArrayLen(buf, pos);
+        if (topics_len) |len| {
+            if (len == 0) {
+                result.topics = &.{};
+            } else {
+                const topics_items = try alloc.alloc(ListPartitionReassignmentsTopics, len);
+                for (topics_items) |*item| {
+                    item.* = try ListPartitionReassignmentsTopics.deserialize(alloc, buf, pos, version);
+                }
+                result.topics = topics_items;
             }
-            result.topics = topics_items;
+        } else {
+            result.topics = null;
         }
         try ser.skipTaggedFields(buf, pos);
         return result;
@@ -85,9 +95,13 @@ pub const ListPartitionReassignmentsRequest = struct {
     pub fn calcSize(self: *const ListPartitionReassignmentsRequest, version: i16) usize {
         var size: usize = 0;
         size += 4;
-        size += ser.unsignedVarintSize(self.topics.len + 1);
-        for (self.topics) |item| {
-            size += item.calcSize(version);
+        if (self.topics) |topics| {
+            size += ser.unsignedVarintSize(topics.len + 1);
+            for (topics) |item| {
+                size += item.calcSize(version);
+            }
+        } else {
+            size += 1;
         }
         size += 1;
         return size;

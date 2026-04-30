@@ -1081,6 +1081,25 @@ test "generated non-default golden fixtures cover legacy and flexible wire encod
     }
 
     {
+        const ListPartitionReassignmentsRequest = generated.list_partition_reassignments_request.ListPartitionReassignmentsRequest;
+        const null_value = ListPartitionReassignmentsRequest{
+            .timeout_ms = 1000,
+            .topics = null,
+        };
+        try expectGoldenRoundTrip(ListPartitionReassignmentsRequest, null_value, 0, &[_]u8{
+            0x00, 0x00, 0x03, 0xe8, 0x00, 0x00,
+        });
+
+        const empty_value = ListPartitionReassignmentsRequest{
+            .timeout_ms = 1000,
+            .topics = &.{},
+        };
+        try expectGoldenRoundTrip(ListPartitionReassignmentsRequest, empty_value, 0, &[_]u8{
+            0x00, 0x00, 0x03, 0xe8, 0x01, 0x00,
+        });
+    }
+
+    {
         const CreateTopicsRequest = generated.create_topics_request.CreateTopicsRequest;
         const assignments = [_]CreateTopicsRequest.CreatableTopic.CreatableReplicaAssignment{
             .{ .partition_index = 0, .broker_ids = &[_]i32{ 1, 2 } },

@@ -14200,10 +14200,12 @@ pub const Broker = struct {
     }
 
     fn freeListPartitionReassignmentsRequest(self: *Broker, req: *generated.list_partition_reassignments_request.ListPartitionReassignmentsRequest) void {
-        for (req.topics) |topic| {
-            if (topic.partition_indexes.len > 0) self.allocator.free(topic.partition_indexes);
+        if (req.topics) |topics| {
+            for (topics) |topic| {
+                if (topic.partition_indexes.len > 0) self.allocator.free(topic.partition_indexes);
+            }
+            if (topics.len > 0) self.allocator.free(topics);
         }
-        if (req.topics.len > 0) self.allocator.free(req.topics);
     }
 
     fn buildListPartitionReassignmentsTopics(self: *Broker, req: *const generated.list_partition_reassignments_request.ListPartitionReassignmentsRequest) ![]generated.list_partition_reassignments_response.ListPartitionReassignmentsResponse.OngoingTopicReassignment {
@@ -14215,7 +14217,7 @@ pub const Broker = struct {
             topics.deinit();
         }
 
-        if (req.topics.len == 0) {
+        if (req.topics == null) {
             var seen = std.array_list.Managed([]const u8).init(self.allocator);
             defer seen.deinit();
 
@@ -14226,7 +14228,7 @@ pub const Broker = struct {
                 try self.appendListPartitionReassignmentTopic(&topics, entry.value_ptr.topic, &.{});
             }
         } else {
-            for (req.topics) |topic_req| {
+            for (req.topics.?) |topic_req| {
                 const topic_name = topic_req.name orelse "";
                 try self.appendListPartitionReassignmentTopic(&topics, topic_name, topic_req.partition_indexes);
             }
@@ -25453,6 +25455,84 @@ test "Broker.handleRequest ListPartitionReassignments decodes request and return
 
     try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.none)), resp.error_code);
     try testing.expectEqual(@as(usize, 0), resp.topics.len);
+}
+
+test "Broker.handleRequest ListPartitionReassignments distinguishes null and empty topics" {
+    const AlterReq = generated.alter_partition_reassignments_request.AlterPartitionReassignmentsRequest;
+    const ListReq = generated.list_partition_reassignments_request.ListPartitionReassignmentsRequest;
+    const ListResp = generated.list_partition_reassignments_response.ListPartitionReassignmentsResponse;
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+    try testing.expect(broker.ensureTopic("reassign-null-empty"));
+
+    const remote_replicas = [_]i32{2};
+    const alter_partitions = [_]AlterReq.ReassignableTopic.ReassignablePartition{.{
+        .partition_index = 0,
+        .replicas = &remote_replicas,
+    }};
+    const alter_topics = [_]AlterReq.ReassignableTopic{.{
+        .name = "reassign-null-empty",
+        .partitions = &alter_partitions,
+    }};
+    const alter_req = AlterReq{
+        .timeout_ms = 1000,
+        .topics = &alter_topics,
+    };
+
+    var buf: [1024]u8 = undefined;
+    var pos = buildTestRequest(&buf, 45, 0, 4512, header_mod.requestHeaderVersion(45, 0));
+    alter_req.serialize(&buf, &pos, 0);
+    const alter_response = broker.handleRequest(buf[0..pos]);
+    try testing.expect(alter_response != null);
+    defer testing.allocator.free(alter_response.?);
+
+    try testing.expectEqual(@as(u32, 1), broker.partition_reassignments.count());
+
+    {
+        const list_req = ListReq{
+            .timeout_ms = 1000,
+            .topics = null,
+        };
+        pos = buildTestRequest(&buf, 46, 0, 4612, header_mod.requestHeaderVersion(46, 0));
+        list_req.serialize(&buf, &pos, 0);
+        const list_response = broker.handleRequest(buf[0..pos]);
+        try testing.expect(list_response != null);
+        defer testing.allocator.free(list_response.?);
+
+        var rpos: usize = 0;
+        var list_header = try ResponseHeader.deserialize(testing.allocator, list_response.?, &rpos, header_mod.responseHeaderVersion(46, 0));
+        defer list_header.deinit(testing.allocator);
+        const list_resp = try ListResp.deserialize(testing.allocator, list_response.?, &rpos, 0);
+        defer {
+            broker.freeListPartitionReassignmentsTopics(list_resp.topics);
+            if (list_resp.topics.len > 0) testing.allocator.free(list_resp.topics);
+        }
+        try testing.expectEqual(@as(usize, 1), list_resp.topics.len);
+        try testing.expectEqualStrings("reassign-null-empty", list_resp.topics[0].name.?);
+    }
+
+    {
+        const list_req = ListReq{
+            .timeout_ms = 1000,
+            .topics = &.{},
+        };
+        pos = buildTestRequest(&buf, 46, 0, 4613, header_mod.requestHeaderVersion(46, 0));
+        list_req.serialize(&buf, &pos, 0);
+        const list_response = broker.handleRequest(buf[0..pos]);
+        try testing.expect(list_response != null);
+        defer testing.allocator.free(list_response.?);
+
+        var rpos: usize = 0;
+        var list_header = try ResponseHeader.deserialize(testing.allocator, list_response.?, &rpos, header_mod.responseHeaderVersion(46, 0));
+        defer list_header.deinit(testing.allocator);
+        const list_resp = try ListResp.deserialize(testing.allocator, list_response.?, &rpos, 0);
+        defer {
+            broker.freeListPartitionReassignmentsTopics(list_resp.topics);
+            if (list_resp.topics.len > 0) testing.allocator.free(list_resp.topics);
+        }
+        try testing.expectEqual(@as(usize, 0), list_resp.topics.len);
+    }
 }
 
 test "Broker.handleRequest partition reassignment alter list and cancel round-trip" {

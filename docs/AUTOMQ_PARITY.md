@@ -209,6 +209,8 @@ Status: completed for the initial catalog and DeleteGroups slice.
   OffsetFetchRequest generated round-trips now preserve nullable legacy and
   grouped `Topics` arrays instead of collapsing fetch-all requests to empty
   topic lists.
+  ListPartitionReassignmentsRequest now preserves nullable `Topics` so null
+  lists all ongoing reassignments while explicit empty filters return none.
   StopReplicaRequest generated encoding now honors its legacy field version
   bounds exactly: v0 `UngroupedPartitions`, v0-v2 `DeletePartitions`, v1-v2
   grouped `Topics`, and v3+ `TopicStates` have non-default golden fixtures.
