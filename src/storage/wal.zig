@@ -41,6 +41,10 @@ pub const Wal = struct {
     fsync_policy: FsyncPolicy = .every_n_records,
     /// Number of records between fsync calls (only used with every_n_records policy).
     fsync_interval: u64 = 100,
+    /// Milliseconds between periodic fsync calls (only used with periodic policy).
+    fsync_interval_ms: i64 = 1000,
+    /// Last time a successful fsync completed, in milliseconds since epoch.
+    last_fsync_ms: i64 = 0,
     /// Next segment id to allocate. Initialized from existing WAL files on open.
     next_segment_id: u64 = 0,
 
@@ -51,7 +55,7 @@ pub const Wal = struct {
         every_n_records,
         /// Fsync only when explicitly called (fastest, risk of data loss)
         manual,
-        /// Fsync periodically based on time (not implemented yet)
+        /// Fsync periodically based on elapsed wall-clock time
         periodic,
     };
 
@@ -102,6 +106,7 @@ pub const Wal = struct {
         // acknowledged records before recover() can replay them.
         try self.loadExistingSegments();
         try self.openSegment(self.next_segment_id);
+        self.last_fsync_ms = @import("time_compat").milliTimestamp();
         self.next_segment_id += 1;
     }
 
@@ -146,10 +151,15 @@ pub const Wal = struct {
 
         // Auto-fsync based on policy
         if (self.fsync_policy == .every_record) {
-            try seg.file.sync();
+            try self.syncSegment(seg);
         } else if (self.fsync_policy == .every_n_records) {
             if (self.total_records_written % self.fsync_interval == 0) {
-                try seg.file.sync();
+                try self.syncSegment(seg);
+            }
+        } else if (self.fsync_policy == .periodic) {
+            const now = @import("time_compat").milliTimestamp();
+            if (self.fsync_interval_ms <= 0 or now - self.last_fsync_ms >= self.fsync_interval_ms) {
+                try self.syncSegmentAt(seg, now);
             }
         }
 
@@ -165,9 +175,18 @@ pub const Wal = struct {
 
     /// Fsync the current segment.
     pub fn sync(self: *Wal) !void {
-        if (self.current_segment) |seg| {
-            try seg.file.sync();
+        if (self.current_segment) |*seg| {
+            try self.syncSegment(seg);
         }
+    }
+
+    fn syncSegment(self: *Wal, seg: *Segment) !void {
+        try self.syncSegmentAt(seg, @import("time_compat").milliTimestamp());
+    }
+
+    fn syncSegmentAt(self: *Wal, seg: *Segment, now_ms: i64) !void {
+        try seg.file.sync();
+        self.last_fsync_ms = now_ms;
     }
 
     fn rollSegment(self: *Wal) !void {
@@ -1769,6 +1788,32 @@ test "Wal sync explicit call succeeds" {
         try wal.sync();
 
         try testing.expectEqual(@as(u64, 3), wal.total_records_written);
+    }
+
+    fs.deleteTreeAbsolute(tmp_dir) catch {};
+}
+
+test "Wal periodic fsync policy syncs after elapsed interval" {
+    const tmp_dir = "/tmp/automq-wal-periodic-sync-test";
+    fs.deleteTreeAbsolute(tmp_dir) catch {};
+
+    {
+        var wal = Wal.init(testing.allocator, tmp_dir, 1024 * 1024);
+        defer wal.deinit();
+        wal.fsync_policy = .periodic;
+        wal.fsync_interval_ms = 60_000;
+        try wal.open();
+
+        const opened_fsync_ms = wal.last_fsync_ms;
+        _ = try wal.append("data-before-interval");
+        try testing.expectEqual(opened_fsync_ms, wal.last_fsync_ms);
+
+        const stale_fsync_ms = @import("time_compat").milliTimestamp() - wal.fsync_interval_ms - 1;
+        wal.last_fsync_ms = stale_fsync_ms;
+        _ = try wal.append("data-after-interval");
+
+        try testing.expect(wal.last_fsync_ms > stale_fsync_ms);
+        try testing.expectEqual(@as(u64, 2), wal.total_records_written);
     }
 
     fs.deleteTreeAbsolute(tmp_dir) catch {};

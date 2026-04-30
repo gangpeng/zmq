@@ -337,7 +337,9 @@ Status: completed for the initial catalog and DeleteGroups slice.
   local visibility when their shared topic snapshot cannot be written, and
   CreateTopics/CreatePartitions/DeleteTopics return storage errors for the same
   shared-snapshot failure; local metadata snapshots now fsync before save calls
-  return; MockS3 fault injection now covers bounded put retry,
+  return; filesystem WAL now implements its periodic fsync policy in addition
+  to explicit/every-record/every-N-record barriers; MockS3 fault injection now
+  covers bounded put retry,
   propagated get/list/range/delete failures, temporary list omission, recovery
   retry, fetch storage errors, and compaction orphan retry; restarted S3 WAL
   writers now seed their object counters from existing WAL keys before accepting
