@@ -13501,7 +13501,7 @@ pub const Broker = struct {
         }
 
         if (top_error == 0) {
-            if (req.topic_partitions.len == 0) {
+            if (req.topic_partitions == null) {
                 var tit = self.topics.iterator();
                 while (tit.next()) |entry| {
                     const info = entry.value_ptr;
@@ -13520,7 +13520,7 @@ pub const Broker = struct {
                     };
                 }
             } else {
-                for (req.topic_partitions) |topic_partitions| {
+                for (req.topic_partitions.?) |topic_partitions| {
                     const topic_name = topic_partitions.topic orelse "";
                     const info = self.topics.get(topic_name);
                     const requested_count = topic_partitions.partitions.len;
@@ -13574,10 +13574,12 @@ pub const Broker = struct {
     }
 
     fn freeElectLeadersRequest(self: *Broker, req: *generated.elect_leaders_request.ElectLeadersRequest) void {
-        for (req.topic_partitions) |topic_partitions| {
-            if (topic_partitions.partitions.len > 0) self.allocator.free(topic_partitions.partitions);
+        if (req.topic_partitions) |topic_partitions| {
+            for (topic_partitions) |topic_partition| {
+                if (topic_partition.partitions.len > 0) self.allocator.free(topic_partition.partitions);
+            }
+            if (topic_partitions.len > 0) self.allocator.free(topic_partitions);
         }
-        if (req.topic_partitions.len > 0) self.allocator.free(req.topic_partitions);
     }
 
     // ---------------------------------------------------------------
@@ -26599,6 +26601,80 @@ test "Broker.handleRequest ElectLeaders returns requested partition results" {
     try testing.expectEqual(@as(i16, 0), resp.replica_election_results[0].partition_result[0].error_code);
     try testing.expectEqual(@as(i32, 5), resp.replica_election_results[0].partition_result[1].partition_id);
     try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.unknown_topic_or_partition)), resp.replica_election_results[0].partition_result[1].error_code);
+}
+
+test "Broker.handleRequest ElectLeaders distinguishes null and empty topic partitions" {
+    const Req = generated.elect_leaders_request.ElectLeadersRequest;
+    const Resp = generated.elect_leaders_response.ElectLeadersResponse;
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+    try testing.expect(broker.ensureTopic("elect-null-empty-a"));
+    try testing.expect(broker.ensureTopic("elect-null-empty-b"));
+
+    var buf: [1024]u8 = undefined;
+
+    {
+        const req = Req{
+            .election_type = 0,
+            .topic_partitions = null,
+            .timeout_ms = 1000,
+        };
+        var pos = buildTestRequest(&buf, 43, 2, 4301, header_mod.requestHeaderVersion(43, 2));
+        req.serialize(&buf, &pos, 2);
+
+        const response = broker.handleRequest(buf[0..pos]);
+        try testing.expect(response != null);
+        defer testing.allocator.free(response.?);
+
+        var rpos: usize = 0;
+        var response_header = try ResponseHeader.deserialize(testing.allocator, response.?, &rpos, header_mod.responseHeaderVersion(43, 2));
+        defer response_header.deinit(testing.allocator);
+        try testing.expectEqual(@as(i32, 4301), response_header.correlation_id);
+
+        const resp = try Resp.deserialize(testing.allocator, response.?, &rpos, 2);
+        defer {
+            for (resp.replica_election_results) |result| {
+                if (result.partition_result.len > 0) testing.allocator.free(result.partition_result);
+            }
+            if (resp.replica_election_results.len > 0) testing.allocator.free(resp.replica_election_results);
+        }
+
+        try testing.expectEqual(response.?.len, rpos);
+        try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.none)), resp.error_code);
+        try testing.expectEqual(@as(usize, 2), resp.replica_election_results.len);
+    }
+
+    {
+        const req = Req{
+            .election_type = 0,
+            .topic_partitions = &.{},
+            .timeout_ms = 1000,
+        };
+        var pos = buildTestRequest(&buf, 43, 2, 4302, header_mod.requestHeaderVersion(43, 2));
+        req.serialize(&buf, &pos, 2);
+
+        const response = broker.handleRequest(buf[0..pos]);
+        try testing.expect(response != null);
+        defer testing.allocator.free(response.?);
+
+        var rpos: usize = 0;
+        var response_header = try ResponseHeader.deserialize(testing.allocator, response.?, &rpos, header_mod.responseHeaderVersion(43, 2));
+        defer response_header.deinit(testing.allocator);
+        try testing.expectEqual(@as(i32, 4302), response_header.correlation_id);
+
+        const resp = try Resp.deserialize(testing.allocator, response.?, &rpos, 2);
+        defer {
+            for (resp.replica_election_results) |result| {
+                if (result.partition_result.len > 0) testing.allocator.free(result.partition_result);
+            }
+            if (resp.replica_election_results.len > 0) testing.allocator.free(resp.replica_election_results);
+        }
+
+        try testing.expectEqual(response.?.len, rpos);
+        try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.none)), resp.error_code);
+        try testing.expectEqual(@as(usize, 0), resp.replica_election_results.len);
+    }
 }
 
 test "Broker.handleRequest DescribeProducers returns only requested topic partitions" {

@@ -588,6 +588,30 @@ test "generated non-default golden fixtures cover legacy and flexible wire encod
     }
 
     {
+        const ElectLeadersRequest = generated.elect_leaders_request.ElectLeadersRequest;
+        const null_value = ElectLeadersRequest{
+            .election_type = 0,
+            .topic_partitions = null,
+            .timeout_ms = 1000,
+        };
+        try expectGoldenRoundTrip(ElectLeadersRequest, null_value, 0, &[_]u8{
+            0xff, 0xff, 0xff, 0xff, 0x00, 0x00, 0x03, 0xe8,
+        });
+        try expectGoldenRoundTrip(ElectLeadersRequest, null_value, 2, &[_]u8{
+            0x00, 0x00, 0x00, 0x00, 0x03, 0xe8, 0x00,
+        });
+
+        const empty_value = ElectLeadersRequest{
+            .election_type = 0,
+            .topic_partitions = &.{},
+            .timeout_ms = 1000,
+        };
+        try expectGoldenRoundTrip(ElectLeadersRequest, empty_value, 2, &[_]u8{
+            0x00, 0x01, 0x00, 0x00, 0x03, 0xe8, 0x00,
+        });
+    }
+
+    {
         const DescribeConfigsResponse = generated.describe_configs_response.DescribeConfigsResponse;
         const synonyms = [_]DescribeConfigsResponse.DescribeConfigsResult.DescribeConfigsResourceResult.DescribeConfigsSynonym{.{
             .name = "cleanup.policy",

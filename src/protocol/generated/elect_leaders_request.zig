@@ -78,7 +78,7 @@ pub const ElectLeadersRequest = struct {
     election_type: i8 = 0,
     /// The topic partitions to elect leaders.
     /// Versions: 0+
-    topic_partitions: []const TopicPartitions = &.{},
+    topic_partitions: ?[]const TopicPartitions = null,
     /// The time in ms to wait for the election to complete.
     /// Versions: 0+
     timeout_ms: i32 = 60000,
@@ -87,13 +87,21 @@ pub const ElectLeadersRequest = struct {
         if (version >= 1) {
             ser.writeI8(buf, pos, self.election_type);
         }
-        if (version >= 2) {
-            ser.writeCompactArrayLen(buf, pos, self.topic_partitions.len);
+        if (self.topic_partitions) |topic_partitions| {
+            if (version >= 2) {
+                ser.writeCompactArrayLen(buf, pos, topic_partitions.len);
+            } else {
+                ser.writeArrayLen(buf, pos, topic_partitions.len);
+            }
+            for (topic_partitions) |item| {
+                item.serialize(buf, pos, version);
+            }
         } else {
-            ser.writeArrayLen(buf, pos, self.topic_partitions.len);
-        }
-        for (self.topic_partitions) |item| {
-            item.serialize(buf, pos, version);
+            if (version >= 2) {
+                ser.writeCompactArrayLen(buf, pos, null);
+            } else {
+                ser.writeArrayLen(buf, pos, null);
+            }
         }
         ser.writeI32(buf, pos, self.timeout_ms);
         if (version >= 2) ser.writeEmptyTaggedFields(buf, pos);
@@ -104,16 +112,22 @@ pub const ElectLeadersRequest = struct {
         if (version >= 1) {
             result.election_type = ser.readI8(buf, pos);
         }
-        const topic_partitions_len: usize = if (version >= 2)
-            (try ser.readCompactArrayLen(buf, pos)) orelse 0
+        const topic_partitions_len: ?usize = if (version >= 2)
+            try ser.readCompactArrayLen(buf, pos)
         else
-            (try ser.readArrayLen(buf, pos)) orelse 0;
-        if (topic_partitions_len > 0) {
-            const topic_partitions_items = try alloc.alloc(TopicPartitions, topic_partitions_len);
-            for (topic_partitions_items) |*item| {
-                item.* = try TopicPartitions.deserialize(alloc, buf, pos, version);
+            try ser.readArrayLen(buf, pos);
+        if (topic_partitions_len) |len| {
+            if (len == 0) {
+                result.topic_partitions = &.{};
+            } else {
+                const topic_partitions_items = try alloc.alloc(TopicPartitions, len);
+                for (topic_partitions_items) |*item| {
+                    item.* = try TopicPartitions.deserialize(alloc, buf, pos, version);
+                }
+                result.topic_partitions = topic_partitions_items;
             }
-            result.topic_partitions = topic_partitions_items;
+        } else {
+            result.topic_partitions = null;
         }
         result.timeout_ms = ser.readI32(buf, pos);
         if (version >= 2) try ser.skipTaggedFields(buf, pos);
@@ -125,13 +139,19 @@ pub const ElectLeadersRequest = struct {
         if (version >= 1) {
             size += 1;
         }
-        if (version >= 2) {
-            size += ser.unsignedVarintSize(self.topic_partitions.len + 1);
+        if (self.topic_partitions) |topic_partitions| {
+            if (version >= 2) {
+                size += ser.unsignedVarintSize(topic_partitions.len + 1);
+            } else {
+                size += 4;
+            }
+            for (topic_partitions) |item| {
+                size += item.calcSize(version);
+            }
+        } else if (version >= 2) {
+            size += 1;
         } else {
             size += 4;
-        }
-        for (self.topic_partitions) |item| {
-            size += item.calcSize(version);
         }
         size += 4;
         if (version >= 2) size += 1;
