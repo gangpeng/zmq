@@ -6829,11 +6829,15 @@ pub const Broker = struct {
     }
 
     fn freeConsumerGroupHeartbeatRequest(self: *Broker, req: *generated.consumer_group_heartbeat_request.ConsumerGroupHeartbeatRequest) void {
-        if (req.subscribed_topic_names.len > 0) self.allocator.free(req.subscribed_topic_names);
-        for (req.topic_partitions) |topic_partitions| {
-            if (topic_partitions.partitions.len > 0) self.allocator.free(topic_partitions.partitions);
+        if (req.subscribed_topic_names) |subscribed_topic_names| {
+            if (subscribed_topic_names.len > 0) self.allocator.free(subscribed_topic_names);
         }
-        if (req.topic_partitions.len > 0) self.allocator.free(req.topic_partitions);
+        if (req.topic_partitions) |topic_partitions| {
+            for (topic_partitions) |topic_partition| {
+                if (topic_partition.partitions.len > 0) self.allocator.free(topic_partition.partitions);
+            }
+            if (topic_partitions.len > 0) self.allocator.free(topic_partitions);
+        }
     }
 
     // ---------------------------------------------------------------
@@ -6886,7 +6890,9 @@ pub const Broker = struct {
     }
 
     fn freeShareGroupHeartbeatRequest(self: *Broker, req: *generated.share_group_heartbeat_request.ShareGroupHeartbeatRequest) void {
-        if (req.subscribed_topic_names.len > 0) self.allocator.free(req.subscribed_topic_names);
+        if (req.subscribed_topic_names) |subscribed_topic_names| {
+            if (subscribed_topic_names.len > 0) self.allocator.free(subscribed_topic_names);
+        }
     }
 
     // ---------------------------------------------------------------
@@ -27769,6 +27775,37 @@ test "Broker.handleRequest ConsumerGroupHeartbeat returns generated fail-closed 
     try testing.expectEqualStrings("kip848-member", resp.member_id.?);
     try testing.expectEqual(@as(i32, 0), resp.member_epoch);
     try testing.expect(resp.assignment == null);
+
+    const empty_topic_names = [_]?[]const u8{};
+    const empty_topic_partitions = [_]Req.TopicPartitions{};
+    const empty_req = Req{
+        .group_id = "kip848-group",
+        .member_id = "kip848-empty-member",
+        .member_epoch = 1,
+        .rebalance_timeout_ms = 30_000,
+        .subscribed_topic_names = &empty_topic_names,
+        .topic_partitions = &empty_topic_partitions,
+    };
+
+    var empty_buf: [256]u8 = undefined;
+    var empty_pos = buildTestRequest(&empty_buf, 68, 0, 6802, header_mod.requestHeaderVersion(68, 0));
+    empty_req.serialize(&empty_buf, &empty_pos, 0);
+
+    const empty_response = broker.handleRequest(empty_buf[0..empty_pos]);
+    try testing.expect(empty_response != null);
+    defer testing.allocator.free(empty_response.?);
+
+    var empty_rpos: usize = 0;
+    var empty_response_header = try ResponseHeader.deserialize(testing.allocator, empty_response.?, &empty_rpos, header_mod.responseHeaderVersion(68, 0));
+    defer empty_response_header.deinit(testing.allocator);
+    try testing.expectEqual(@as(i32, 6802), empty_response_header.correlation_id);
+
+    const empty_resp = try Resp.deserialize(testing.allocator, empty_response.?, &empty_rpos, 0);
+    try testing.expectEqual(empty_response.?.len, empty_rpos);
+    try testing.expectEqual(ErrorCode.unsupported_version.toInt(), empty_resp.error_code);
+    try testing.expectEqualStrings("kip848-empty-member", empty_resp.member_id.?);
+    try testing.expectEqual(@as(i32, 1), empty_resp.member_epoch);
+    try testing.expect(empty_resp.assignment == null);
 }
 
 test "Broker.handleRequest ConsumerGroupHeartbeat rejects malformed request" {
@@ -27832,6 +27869,63 @@ test "Broker.handleRequest ShareGroupHeartbeat returns generated fail-closed res
     try testing.expectEqualStrings("share-member", resp.member_id.?);
     try testing.expectEqual(@as(i32, 0), resp.member_epoch);
     try testing.expect(resp.assignment == null);
+
+    const null_req = Req{
+        .group_id = "share-group",
+        .member_id = "share-null-member",
+        .member_epoch = 1,
+        .rack_id = "rack-a",
+        .subscribed_topic_names = null,
+    };
+
+    var null_buf: [256]u8 = undefined;
+    var null_pos = buildTestRequest(&null_buf, 76, 0, 7602, header_mod.requestHeaderVersion(76, 0));
+    null_req.serialize(&null_buf, &null_pos, 0);
+
+    const null_response = broker.handleRequest(null_buf[0..null_pos]);
+    try testing.expect(null_response != null);
+    defer testing.allocator.free(null_response.?);
+
+    var null_rpos: usize = 0;
+    var null_response_header = try ResponseHeader.deserialize(testing.allocator, null_response.?, &null_rpos, header_mod.responseHeaderVersion(76, 0));
+    defer null_response_header.deinit(testing.allocator);
+    try testing.expectEqual(@as(i32, 7602), null_response_header.correlation_id);
+
+    const null_resp = try Resp.deserialize(testing.allocator, null_response.?, &null_rpos, 0);
+    try testing.expectEqual(null_response.?.len, null_rpos);
+    try testing.expectEqual(ErrorCode.unsupported_version.toInt(), null_resp.error_code);
+    try testing.expectEqualStrings("share-null-member", null_resp.member_id.?);
+    try testing.expectEqual(@as(i32, 1), null_resp.member_epoch);
+    try testing.expect(null_resp.assignment == null);
+
+    const empty_topic_names = [_]?[]const u8{};
+    const empty_req = Req{
+        .group_id = "share-group",
+        .member_id = "share-empty-member",
+        .member_epoch = 2,
+        .rack_id = "rack-a",
+        .subscribed_topic_names = &empty_topic_names,
+    };
+
+    var empty_buf: [256]u8 = undefined;
+    var empty_pos = buildTestRequest(&empty_buf, 76, 0, 7603, header_mod.requestHeaderVersion(76, 0));
+    empty_req.serialize(&empty_buf, &empty_pos, 0);
+
+    const empty_response = broker.handleRequest(empty_buf[0..empty_pos]);
+    try testing.expect(empty_response != null);
+    defer testing.allocator.free(empty_response.?);
+
+    var empty_rpos: usize = 0;
+    var empty_response_header = try ResponseHeader.deserialize(testing.allocator, empty_response.?, &empty_rpos, header_mod.responseHeaderVersion(76, 0));
+    defer empty_response_header.deinit(testing.allocator);
+    try testing.expectEqual(@as(i32, 7603), empty_response_header.correlation_id);
+
+    const empty_resp = try Resp.deserialize(testing.allocator, empty_response.?, &empty_rpos, 0);
+    try testing.expectEqual(empty_response.?.len, empty_rpos);
+    try testing.expectEqual(ErrorCode.unsupported_version.toInt(), empty_resp.error_code);
+    try testing.expectEqualStrings("share-empty-member", empty_resp.member_id.?);
+    try testing.expectEqual(@as(i32, 2), empty_resp.member_epoch);
+    try testing.expect(empty_resp.assignment == null);
 }
 
 test "Broker.handleRequest ShareGroupHeartbeat rejects malformed request" {

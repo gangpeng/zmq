@@ -221,6 +221,9 @@ Status: completed for the initial catalog and DeleteGroups slice.
   cancels pending reassignments while explicit empty assignments fail closed.
   ListPartitionReassignmentsRequest now preserves nullable `Topics` so null
   lists all ongoing reassignments while explicit empty filters return none.
+  ConsumerGroupHeartbeatRequest and ShareGroupHeartbeatRequest now preserve
+  nullable subscription arrays so null heartbeats mean unchanged subscriptions
+  while explicit empty arrays mean an empty subscription set.
   StopReplicaRequest generated encoding now honors its legacy field version
   bounds exactly: v0 `UngroupedPartitions`, v0-v2 `DeletePartitions`, v1-v2
   grouped `Topics`, and v3+ `TopicStates` have non-default golden fixtures.

@@ -23,16 +23,20 @@ pub const ShareGroupHeartbeatRequest = struct {
     rack_id: ?[]const u8 = null,
     /// null if it didn't change since the last heartbeat; the subscribed topic names otherwise.
     /// Versions: 0+
-    subscribed_topic_names: []const ?[]const u8 = &.{},
+    subscribed_topic_names: ?[]const ?[]const u8 = null,
 
     pub fn serialize(self: *const ShareGroupHeartbeatRequest, buf: []u8, pos: *usize, _: i16) void {
         ser.writeCompactString(buf, pos, self.group_id);
         ser.writeCompactString(buf, pos, self.member_id);
         ser.writeI32(buf, pos, self.member_epoch);
         ser.writeCompactString(buf, pos, self.rack_id);
-        ser.writeCompactArrayLen(buf, pos, self.subscribed_topic_names.len);
-        for (self.subscribed_topic_names) |item| {
-            ser.writeCompactString(buf, pos, item);
+        if (self.subscribed_topic_names) |subscribed_topic_names| {
+            ser.writeCompactArrayLen(buf, pos, subscribed_topic_names.len);
+            for (subscribed_topic_names) |item| {
+                ser.writeCompactString(buf, pos, item);
+            }
+        } else {
+            ser.writeCompactArrayLen(buf, pos, null);
         }
         ser.writeEmptyTaggedFields(buf, pos);
     }
@@ -43,13 +47,19 @@ pub const ShareGroupHeartbeatRequest = struct {
         result.member_id = try ser.readCompactString(buf, pos);
         result.member_epoch = ser.readI32(buf, pos);
         result.rack_id = try ser.readCompactString(buf, pos);
-        const subscribed_topic_names_len: usize = (try ser.readCompactArrayLen(buf, pos)) orelse 0;
-        if (subscribed_topic_names_len > 0) {
-            const subscribed_topic_names_items = try alloc.alloc(?[]const u8, subscribed_topic_names_len);
-            for (subscribed_topic_names_items) |*item| {
-                item.* = try ser.readCompactString(buf, pos);
+        const subscribed_topic_names_len: ?usize = try ser.readCompactArrayLen(buf, pos);
+        if (subscribed_topic_names_len) |len| {
+            if (len == 0) {
+                result.subscribed_topic_names = &.{};
+            } else {
+                const subscribed_topic_names_items = try alloc.alloc(?[]const u8, len);
+                for (subscribed_topic_names_items) |*item| {
+                    item.* = try ser.readCompactString(buf, pos);
+                }
+                result.subscribed_topic_names = subscribed_topic_names_items;
             }
-            result.subscribed_topic_names = subscribed_topic_names_items;
+        } else {
+            result.subscribed_topic_names = null;
         }
         try ser.skipTaggedFields(buf, pos);
         return result;
@@ -61,9 +71,13 @@ pub const ShareGroupHeartbeatRequest = struct {
         size += ser.compactStringSize(self.member_id);
         size += 4;
         size += ser.compactStringSize(self.rack_id);
-        size += ser.unsignedVarintSize(self.subscribed_topic_names.len + 1);
-        for (self.subscribed_topic_names) |item| {
-            size += ser.compactStringSize(item);
+        if (self.subscribed_topic_names) |subscribed_topic_names| {
+            size += ser.unsignedVarintSize(subscribed_topic_names.len + 1);
+            for (subscribed_topic_names) |item| {
+                size += ser.compactStringSize(item);
+            }
+        } else {
+            size += 1;
         }
         size += 1;
         return size;

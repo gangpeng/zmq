@@ -71,13 +71,13 @@ pub const ConsumerGroupHeartbeatRequest = struct {
     rebalance_timeout_ms: i32 = -1,
     /// null if it didn't change since the last heartbeat; the subscribed topic names otherwise.
     /// Versions: 0+
-    subscribed_topic_names: []const ?[]const u8 = &.{},
+    subscribed_topic_names: ?[]const ?[]const u8 = null,
     /// null if not used or if it didn't change since the last heartbeat; the server side assignor to use otherwise.
     /// Versions: 0+
     server_assignor: ?[]const u8 = null,
     /// null if it didn't change since the last heartbeat; the partitions owned by the member.
     /// Versions: 0+
-    topic_partitions: []const TopicPartitions = &.{},
+    topic_partitions: ?[]const TopicPartitions = null,
 
     pub fn serialize(self: *const ConsumerGroupHeartbeatRequest, buf: []u8, pos: *usize, version: i16) void {
         ser.writeCompactString(buf, pos, self.group_id);
@@ -86,14 +86,22 @@ pub const ConsumerGroupHeartbeatRequest = struct {
         ser.writeCompactString(buf, pos, self.instance_id);
         ser.writeCompactString(buf, pos, self.rack_id);
         ser.writeI32(buf, pos, self.rebalance_timeout_ms);
-        ser.writeCompactArrayLen(buf, pos, self.subscribed_topic_names.len);
-        for (self.subscribed_topic_names) |item| {
-            ser.writeCompactString(buf, pos, item);
+        if (self.subscribed_topic_names) |subscribed_topic_names| {
+            ser.writeCompactArrayLen(buf, pos, subscribed_topic_names.len);
+            for (subscribed_topic_names) |item| {
+                ser.writeCompactString(buf, pos, item);
+            }
+        } else {
+            ser.writeCompactArrayLen(buf, pos, null);
         }
         ser.writeCompactString(buf, pos, self.server_assignor);
-        ser.writeCompactArrayLen(buf, pos, self.topic_partitions.len);
-        for (self.topic_partitions) |item| {
-            item.serialize(buf, pos, version);
+        if (self.topic_partitions) |topic_partitions| {
+            ser.writeCompactArrayLen(buf, pos, topic_partitions.len);
+            for (topic_partitions) |item| {
+                item.serialize(buf, pos, version);
+            }
+        } else {
+            ser.writeCompactArrayLen(buf, pos, null);
         }
         ser.writeEmptyTaggedFields(buf, pos);
     }
@@ -106,22 +114,34 @@ pub const ConsumerGroupHeartbeatRequest = struct {
         result.instance_id = try ser.readCompactString(buf, pos);
         result.rack_id = try ser.readCompactString(buf, pos);
         result.rebalance_timeout_ms = ser.readI32(buf, pos);
-        const subscribed_topic_names_len: usize = (try ser.readCompactArrayLen(buf, pos)) orelse 0;
-        if (subscribed_topic_names_len > 0) {
-            const subscribed_topic_names_items = try alloc.alloc(?[]const u8, subscribed_topic_names_len);
-            for (subscribed_topic_names_items) |*item| {
-                item.* = try ser.readCompactString(buf, pos);
+        const subscribed_topic_names_len: ?usize = try ser.readCompactArrayLen(buf, pos);
+        if (subscribed_topic_names_len) |len| {
+            if (len == 0) {
+                result.subscribed_topic_names = &.{};
+            } else {
+                const subscribed_topic_names_items = try alloc.alloc(?[]const u8, len);
+                for (subscribed_topic_names_items) |*item| {
+                    item.* = try ser.readCompactString(buf, pos);
+                }
+                result.subscribed_topic_names = subscribed_topic_names_items;
             }
-            result.subscribed_topic_names = subscribed_topic_names_items;
+        } else {
+            result.subscribed_topic_names = null;
         }
         result.server_assignor = try ser.readCompactString(buf, pos);
-        const topic_partitions_len: usize = (try ser.readCompactArrayLen(buf, pos)) orelse 0;
-        if (topic_partitions_len > 0) {
-            const topic_partitions_items = try alloc.alloc(TopicPartitions, topic_partitions_len);
-            for (topic_partitions_items) |*item| {
-                item.* = try TopicPartitions.deserialize(alloc, buf, pos, version);
+        const topic_partitions_len: ?usize = try ser.readCompactArrayLen(buf, pos);
+        if (topic_partitions_len) |len| {
+            if (len == 0) {
+                result.topic_partitions = &.{};
+            } else {
+                const topic_partitions_items = try alloc.alloc(TopicPartitions, len);
+                for (topic_partitions_items) |*item| {
+                    item.* = try TopicPartitions.deserialize(alloc, buf, pos, version);
+                }
+                result.topic_partitions = topic_partitions_items;
             }
-            result.topic_partitions = topic_partitions_items;
+        } else {
+            result.topic_partitions = null;
         }
         try ser.skipTaggedFields(buf, pos);
         return result;
@@ -135,14 +155,22 @@ pub const ConsumerGroupHeartbeatRequest = struct {
         size += ser.compactStringSize(self.instance_id);
         size += ser.compactStringSize(self.rack_id);
         size += 4;
-        size += ser.unsignedVarintSize(self.subscribed_topic_names.len + 1);
-        for (self.subscribed_topic_names) |item| {
-            size += ser.compactStringSize(item);
+        if (self.subscribed_topic_names) |subscribed_topic_names| {
+            size += ser.unsignedVarintSize(subscribed_topic_names.len + 1);
+            for (subscribed_topic_names) |item| {
+                size += ser.compactStringSize(item);
+            }
+        } else {
+            size += 1;
         }
         size += ser.compactStringSize(self.server_assignor);
-        size += ser.unsignedVarintSize(self.topic_partitions.len + 1);
-        for (self.topic_partitions) |item| {
-            size += item.calcSize(version);
+        if (self.topic_partitions) |topic_partitions| {
+            size += ser.unsignedVarintSize(topic_partitions.len + 1);
+            for (topic_partitions) |item| {
+                size += item.calcSize(version);
+            }
+        } else {
+            size += 1;
         }
         size += 1;
         return size;

@@ -1207,6 +1207,79 @@ test "generated non-default golden fixtures cover legacy and flexible wire encod
     }
 
     {
+        const ConsumerGroupHeartbeatRequest = generated.consumer_group_heartbeat_request.ConsumerGroupHeartbeatRequest;
+        const null_value = ConsumerGroupHeartbeatRequest{
+            .group_id = "g",
+            .member_id = "m",
+            .member_epoch = 0,
+            .instance_id = null,
+            .rack_id = null,
+            .rebalance_timeout_ms = 30_000,
+            .subscribed_topic_names = null,
+            .server_assignor = null,
+            .topic_partitions = null,
+        };
+        try expectGoldenRoundTrip(ConsumerGroupHeartbeatRequest, null_value, 0, &[_]u8{
+            0x02, 'g',  0x02, 'm',
+            0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00,
+            0x75, 0x30, 0x00, 0x00,
+            0x00, 0x00,
+        });
+
+        const empty_topic_names = [_]?[]const u8{};
+        const empty_topic_partitions = [_]ConsumerGroupHeartbeatRequest.TopicPartitions{};
+        const empty_value = ConsumerGroupHeartbeatRequest{
+            .group_id = "g",
+            .member_id = "m",
+            .member_epoch = 0,
+            .instance_id = null,
+            .rack_id = null,
+            .rebalance_timeout_ms = 30_000,
+            .subscribed_topic_names = &empty_topic_names,
+            .server_assignor = null,
+            .topic_partitions = &empty_topic_partitions,
+        };
+        try expectGoldenRoundTrip(ConsumerGroupHeartbeatRequest, empty_value, 0, &[_]u8{
+            0x02, 'g',  0x02, 'm',
+            0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00,
+            0x75, 0x30, 0x01, 0x00,
+            0x01, 0x00,
+        });
+    }
+
+    {
+        const ShareGroupHeartbeatRequest = generated.share_group_heartbeat_request.ShareGroupHeartbeatRequest;
+        const null_value = ShareGroupHeartbeatRequest{
+            .group_id = "g",
+            .member_id = "m",
+            .member_epoch = 0,
+            .rack_id = null,
+            .subscribed_topic_names = null,
+        };
+        try expectGoldenRoundTrip(ShareGroupHeartbeatRequest, null_value, 0, &[_]u8{
+            0x02, 'g',  0x02, 'm',
+            0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00,
+        });
+
+        const empty_topic_names = [_]?[]const u8{};
+        const empty_value = ShareGroupHeartbeatRequest{
+            .group_id = "g",
+            .member_id = "m",
+            .member_epoch = 0,
+            .rack_id = null,
+            .subscribed_topic_names = &empty_topic_names,
+        };
+        try expectGoldenRoundTrip(ShareGroupHeartbeatRequest, empty_value, 0, &[_]u8{
+            0x02, 'g',  0x02, 'm',
+            0x00, 0x00, 0x00, 0x00,
+            0x00, 0x01, 0x00,
+        });
+    }
+
+    {
         const AlterPartitionReassignmentsRequest = generated.alter_partition_reassignments_request.AlterPartitionReassignmentsRequest;
         const null_partitions = [_]AlterPartitionReassignmentsRequest.ReassignableTopic.ReassignablePartition{.{
             .partition_index = 0,
