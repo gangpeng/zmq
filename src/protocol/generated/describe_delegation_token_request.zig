@@ -64,32 +64,46 @@ pub const DescribeDelegationTokenRequest = struct {
 
     /// Each owner that we want to describe delegation tokens for, or null to describe all tokens.
     /// Versions: 0+
-    owners: []const DescribeDelegationTokenOwner = &.{},
+    owners: ?[]const DescribeDelegationTokenOwner = null,
 
     pub fn serialize(self: *const DescribeDelegationTokenRequest, buf: []u8, pos: *usize, version: i16) void {
-        if (version >= 2) {
-            ser.writeCompactArrayLen(buf, pos, self.owners.len);
+        if (self.owners) |owners| {
+            if (version >= 2) {
+                ser.writeCompactArrayLen(buf, pos, owners.len);
+            } else {
+                ser.writeArrayLen(buf, pos, owners.len);
+            }
+            for (owners) |item| {
+                item.serialize(buf, pos, version);
+            }
         } else {
-            ser.writeArrayLen(buf, pos, self.owners.len);
-        }
-        for (self.owners) |item| {
-            item.serialize(buf, pos, version);
+            if (version >= 2) {
+                ser.writeCompactArrayLen(buf, pos, null);
+            } else {
+                ser.writeArrayLen(buf, pos, null);
+            }
         }
         if (version >= 2) ser.writeEmptyTaggedFields(buf, pos);
     }
 
     pub fn deserialize(alloc: Allocator, buf: []const u8, pos: *usize, version: i16) !DescribeDelegationTokenRequest {
         var result = DescribeDelegationTokenRequest{};
-        const owners_len: usize = if (version >= 2)
-            (try ser.readCompactArrayLen(buf, pos)) orelse 0
+        const owners_len: ?usize = if (version >= 2)
+            try ser.readCompactArrayLen(buf, pos)
         else
-            (try ser.readArrayLen(buf, pos)) orelse 0;
-        if (owners_len > 0) {
-            const owners_items = try alloc.alloc(DescribeDelegationTokenOwner, owners_len);
-            for (owners_items) |*item| {
-                item.* = try DescribeDelegationTokenOwner.deserialize(alloc, buf, pos, version);
+            try ser.readArrayLen(buf, pos);
+        if (owners_len) |len| {
+            if (len == 0) {
+                result.owners = &.{};
+            } else {
+                const owners_items = try alloc.alloc(DescribeDelegationTokenOwner, len);
+                for (owners_items) |*item| {
+                    item.* = try DescribeDelegationTokenOwner.deserialize(alloc, buf, pos, version);
+                }
+                result.owners = owners_items;
             }
-            result.owners = owners_items;
+        } else {
+            result.owners = null;
         }
         if (version >= 2) try ser.skipTaggedFields(buf, pos);
         return result;
@@ -97,13 +111,17 @@ pub const DescribeDelegationTokenRequest = struct {
 
     pub fn calcSize(self: *const DescribeDelegationTokenRequest, version: i16) usize {
         var size: usize = 0;
-        if (version >= 2) {
-            size += ser.unsignedVarintSize(self.owners.len + 1);
+        if (self.owners) |owners| {
+            if (version >= 2) {
+                size += ser.unsignedVarintSize(owners.len + 1);
+            } else {
+                size += 4;
+            }
+            for (owners) |item| {
+                size += item.calcSize(version);
+            }
         } else {
-            size += 4;
-        }
-        for (self.owners) |item| {
-            size += item.calcSize(version);
+            size += if (version >= 2) 1 else 4;
         }
         if (version >= 2) size += 1;
         return size;

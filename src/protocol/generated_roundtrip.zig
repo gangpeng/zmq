@@ -568,6 +568,30 @@ test "generated non-default golden fixtures cover legacy and flexible wire encod
     }
 
     {
+        const DescribeDelegationTokenRequest = generated.describe_delegation_token_request.DescribeDelegationTokenRequest;
+        const null_value = DescribeDelegationTokenRequest{
+            .owners = null,
+        };
+        try expectGoldenRoundTrip(DescribeDelegationTokenRequest, null_value, 0, &[_]u8{
+            0xff, 0xff, 0xff, 0xff,
+        });
+        try expectGoldenRoundTrip(DescribeDelegationTokenRequest, null_value, 2, &[_]u8{
+            0x00, 0x00,
+        });
+
+        const empty_owners = [_]DescribeDelegationTokenRequest.DescribeDelegationTokenOwner{};
+        const empty_value = DescribeDelegationTokenRequest{
+            .owners = &empty_owners,
+        };
+        try expectGoldenRoundTrip(DescribeDelegationTokenRequest, empty_value, 0, &[_]u8{
+            0x00, 0x00, 0x00, 0x00,
+        });
+        try expectGoldenRoundTrip(DescribeDelegationTokenRequest, empty_value, 2, &[_]u8{
+            0x01, 0x00,
+        });
+    }
+
+    {
         const DescribeLogDirsRequest = generated.describe_log_dirs_request.DescribeLogDirsRequest;
         const null_value = DescribeLogDirsRequest{
             .topics = null,
