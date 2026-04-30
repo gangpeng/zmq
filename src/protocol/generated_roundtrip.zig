@@ -1638,6 +1638,36 @@ test "generated non-default golden fixtures cover legacy and flexible wire encod
     }
 
     {
+        const DescribeClientQuotasResponse = generated.describe_client_quotas_response.DescribeClientQuotasResponse;
+        const null_entries = DescribeClientQuotasResponse{
+            .error_code = 42,
+            .error_message = "bad",
+            .entries = null,
+        };
+        try expectGoldenRoundTrip(DescribeClientQuotasResponse, null_entries, 0, &[_]u8{
+            0x00, 0x00, 0x00, 0x00,
+            0x00, 0x2a, 0x00, 0x03,
+            'b',  'a',  'd',  0xff,
+            0xff, 0xff, 0xff,
+        });
+        try expectGoldenRoundTrip(DescribeClientQuotasResponse, null_entries, 1, &[_]u8{
+            0x00, 0x00, 0x00, 0x00,
+            0x00, 0x2a, 0x04, 'b',
+            'a',  'd',  0x00, 0x00,
+        });
+
+        const empty_entries = [_]DescribeClientQuotasResponse.EntryData{};
+        const empty_value = DescribeClientQuotasResponse{
+            .entries = &empty_entries,
+        };
+        try expectGoldenRoundTrip(DescribeClientQuotasResponse, empty_value, 1, &[_]u8{
+            0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x01,
+            0x00,
+        });
+    }
+
+    {
         const UpdateMetadataRequest = generated.update_metadata_request.UpdateMetadataRequest;
         const topic_id = [_]u8{
             0x00, 0x01, 0x02, 0x03,

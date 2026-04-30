@@ -134,12 +134,17 @@ pub const DescribeClientQuotasResponse = struct {
 
         pub fn deserialize(alloc: Allocator, buf: []const u8, pos: *usize, version: i16) !EntryData {
             var result = EntryData{};
+            errdefer {
+                if (result.entity.len > 0) alloc.free(result.entity);
+                if (result.values.len > 0) alloc.free(result.values);
+            }
             const entity_len: usize = if (version >= 1)
                 (try ser.readCompactArrayLen(buf, pos)) orelse 0
             else
                 (try ser.readArrayLen(buf, pos)) orelse 0;
             if (entity_len > 0) {
                 const entity_items = try alloc.alloc(EntityData, entity_len);
+                errdefer alloc.free(entity_items);
                 for (entity_items) |*item| {
                     item.* = try EntityData.deserialize(alloc, buf, pos, version);
                 }
@@ -151,6 +156,7 @@ pub const DescribeClientQuotasResponse = struct {
                 (try ser.readArrayLen(buf, pos)) orelse 0;
             if (values_len > 0) {
                 const values_items = try alloc.alloc(ValueData, values_len);
+                errdefer alloc.free(values_items);
                 for (values_items) |*item| {
                     item.* = try ValueData.deserialize(alloc, buf, pos, version);
                 }
@@ -194,7 +200,7 @@ pub const DescribeClientQuotasResponse = struct {
     error_message: ?[]const u8 = null,
     /// A result entry.
     /// Versions: 0+
-    entries: []const EntryData = &.{},
+    entries: ?[]const EntryData = null,
 
     pub fn serialize(self: *const DescribeClientQuotasResponse, buf: []u8, pos: *usize, version: i16) void {
         ser.writeI32(buf, pos, self.throttle_time_ms);
@@ -204,35 +210,66 @@ pub const DescribeClientQuotasResponse = struct {
         } else {
             ser.writeString(buf, pos, self.error_message);
         }
-        if (version >= 1) {
-            ser.writeCompactArrayLen(buf, pos, self.entries.len);
+        if (self.entries) |entries| {
+            if (version >= 1) {
+                ser.writeCompactArrayLen(buf, pos, entries.len);
+            } else {
+                ser.writeArrayLen(buf, pos, entries.len);
+            }
+            for (entries) |item| {
+                item.serialize(buf, pos, version);
+            }
         } else {
-            ser.writeArrayLen(buf, pos, self.entries.len);
-        }
-        for (self.entries) |item| {
-            item.serialize(buf, pos, version);
+            if (version >= 1) {
+                ser.writeCompactArrayLen(buf, pos, null);
+            } else {
+                ser.writeArrayLen(buf, pos, null);
+            }
         }
         if (version >= 1) ser.writeEmptyTaggedFields(buf, pos);
     }
 
     pub fn deserialize(alloc: Allocator, buf: []const u8, pos: *usize, version: i16) !DescribeClientQuotasResponse {
         var result = DescribeClientQuotasResponse{};
+        errdefer if (result.entries) |entries| {
+            for (entries) |entry| {
+                if (entry.entity.len > 0) alloc.free(entry.entity);
+                if (entry.values.len > 0) alloc.free(entry.values);
+            }
+            if (entries.len > 0) alloc.free(entries);
+        };
+
         result.throttle_time_ms = ser.readI32(buf, pos);
         result.error_code = ser.readI16(buf, pos);
         result.error_message = if (version >= 1)
             try ser.readCompactString(buf, pos)
         else
             try ser.readString(buf, pos);
-        const entries_len: usize = if (version >= 1)
-            (try ser.readCompactArrayLen(buf, pos)) orelse 0
+        const entries_len: ?usize = if (version >= 1)
+            try ser.readCompactArrayLen(buf, pos)
         else
-            (try ser.readArrayLen(buf, pos)) orelse 0;
-        if (entries_len > 0) {
-            const entries_items = try alloc.alloc(EntryData, entries_len);
-            for (entries_items) |*item| {
-                item.* = try EntryData.deserialize(alloc, buf, pos, version);
+            try ser.readArrayLen(buf, pos);
+        if (entries_len) |len| {
+            if (len == 0) {
+                result.entries = &.{};
+            } else {
+                const entries_items = try alloc.alloc(EntryData, len);
+                var entries_init: usize = 0;
+                errdefer {
+                    for (entries_items[0..entries_init]) |entry| {
+                        if (entry.entity.len > 0) alloc.free(entry.entity);
+                        if (entry.values.len > 0) alloc.free(entry.values);
+                    }
+                    alloc.free(entries_items);
+                }
+                for (entries_items) |*item| {
+                    item.* = try EntryData.deserialize(alloc, buf, pos, version);
+                    entries_init += 1;
+                }
+                result.entries = entries_items;
             }
-            result.entries = entries_items;
+        } else {
+            result.entries = null;
         }
         if (version >= 1) try ser.skipTaggedFields(buf, pos);
         return result;
@@ -247,13 +284,17 @@ pub const DescribeClientQuotasResponse = struct {
         } else {
             size += ser.stringSize(self.error_message);
         }
-        if (version >= 1) {
-            size += ser.unsignedVarintSize(self.entries.len + 1);
+        if (self.entries) |entries| {
+            if (version >= 1) {
+                size += ser.unsignedVarintSize(entries.len + 1);
+            } else {
+                size += 4;
+            }
+            for (entries) |item| {
+                size += item.calcSize(version);
+            }
         } else {
-            size += 4;
-        }
-        for (self.entries) |item| {
-            size += item.calcSize(version);
+            size += if (version >= 1) 1 else 4;
         }
         if (version >= 1) size += 1;
         return size;

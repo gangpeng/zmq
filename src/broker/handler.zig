@@ -10798,11 +10798,13 @@ pub const Broker = struct {
         defer self.freeDescribeClientQuotasRequest(&req);
 
         const request_error = describeClientQuotasRequestError(req);
-        const entries = if (request_error == @intFromEnum(ErrorCode.none))
+        const entries: ?[]const Resp.EntryData = if (request_error == @intFromEnum(ErrorCode.none))
             (self.collectDescribeClientQuotaEntries(req) catch return null)
         else
-            &[_]Resp.EntryData{};
-        defer if (entries.len > 0) self.freeDescribeClientQuotaEntries(entries);
+            null;
+        defer if (entries) |response_entries| {
+            if (response_entries.len > 0) self.freeDescribeClientQuotaEntries(response_entries);
+        };
 
         const resp = Resp{
             .throttle_time_ms = 0,
@@ -16489,11 +16491,12 @@ fn freeDeserializedDescribeTopicPartitionsResponse(resp: *const generated.descri
 }
 
 fn freeDeserializedDescribeClientQuotasResponse(resp: *const generated.describe_client_quotas_response.DescribeClientQuotasResponse) void {
-    for (resp.entries) |entry| {
+    const entries = resp.entries orelse return;
+    for (entries) |entry| {
         if (entry.entity.len > 0) testing.allocator.free(entry.entity);
         if (entry.values.len > 0) testing.allocator.free(entry.values);
     }
-    if (resp.entries.len > 0) testing.allocator.free(resp.entries);
+    if (entries.len > 0) testing.allocator.free(entries);
 }
 
 fn freeDeserializedAlterClientQuotasResponse(resp: *const generated.alter_client_quotas_response.AlterClientQuotasResponse) void {
@@ -20904,15 +20907,16 @@ test "Broker.handleRequest DescribeClientQuotas v0 returns configured client quo
     try testing.expectEqual(response.?.len, rpos);
     try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.none)), resp.error_code);
     try testing.expect(resp.error_message == null);
-    try testing.expectEqual(@as(usize, 1), resp.entries.len);
-    try testing.expectEqual(@as(usize, 1), resp.entries[0].entity.len);
-    try testing.expectEqualStrings("client-id", resp.entries[0].entity[0].entity_type.?);
-    try testing.expectEqualStrings("quota-client", resp.entries[0].entity[0].entity_name.?);
-    try testing.expectEqual(@as(usize, 2), resp.entries[0].values.len);
-    try testing.expectEqualStrings("producer_byte_rate", resp.entries[0].values[0].key.?);
-    try testing.expectEqual(@as(f64, 1000.0), resp.entries[0].values[0].value);
-    try testing.expectEqualStrings("consumer_byte_rate", resp.entries[0].values[1].key.?);
-    try testing.expectEqual(@as(f64, 2000.0), resp.entries[0].values[1].value);
+    const response_entries = resp.entries.?;
+    try testing.expectEqual(@as(usize, 1), response_entries.len);
+    try testing.expectEqual(@as(usize, 1), response_entries[0].entity.len);
+    try testing.expectEqualStrings("client-id", response_entries[0].entity[0].entity_type.?);
+    try testing.expectEqualStrings("quota-client", response_entries[0].entity[0].entity_name.?);
+    try testing.expectEqual(@as(usize, 2), response_entries[0].values.len);
+    try testing.expectEqualStrings("producer_byte_rate", response_entries[0].values[0].key.?);
+    try testing.expectEqual(@as(f64, 1000.0), response_entries[0].values[0].value);
+    try testing.expectEqualStrings("consumer_byte_rate", response_entries[0].values[1].key.?);
+    try testing.expectEqual(@as(f64, 2000.0), response_entries[0].values[1].value);
 }
 
 test "Broker.handleRequest DescribeClientQuotas v1 returns empty generated response when unmatched" {
@@ -20950,7 +20954,8 @@ test "Broker.handleRequest DescribeClientQuotas v1 returns empty generated respo
 
     try testing.expectEqual(response.?.len, rpos);
     try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.none)), resp.error_code);
-    try testing.expectEqual(@as(usize, 0), resp.entries.len);
+    try testing.expect(resp.entries != null);
+    try testing.expectEqual(@as(usize, 0), resp.entries.?.len);
 }
 
 test "Broker.handleRequest DescribeClientQuotas rejects invalid match type" {
@@ -20989,7 +20994,7 @@ test "Broker.handleRequest DescribeClientQuotas rejects invalid match type" {
     try testing.expectEqual(response.?.len, rpos);
     try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.invalid_request)), resp.error_code);
     try testing.expect(resp.error_message != null);
-    try testing.expectEqual(@as(usize, 0), resp.entries.len);
+    try testing.expect(resp.entries == null);
 }
 
 test "Broker.handleRequest DescribeClientQuotas rejects truncated request" {
@@ -21072,12 +21077,13 @@ test "Broker.handleRequest AlterClientQuotas v1 mutates quotas and DescribeClien
     defer freeDeserializedDescribeClientQuotasResponse(&describe_resp);
 
     try testing.expectEqual(describe_response.?.len, rpos);
-    try testing.expectEqual(@as(usize, 1), describe_resp.entries.len);
-    try testing.expectEqual(@as(usize, 2), describe_resp.entries[0].values.len);
-    try testing.expectEqualStrings("producer_byte_rate", describe_resp.entries[0].values[0].key.?);
-    try testing.expectEqual(@as(f64, 1234.0), describe_resp.entries[0].values[0].value);
-    try testing.expectEqualStrings("consumer_byte_rate", describe_resp.entries[0].values[1].key.?);
-    try testing.expectEqual(@as(f64, 4321.0), describe_resp.entries[0].values[1].value);
+    const describe_entries = describe_resp.entries.?;
+    try testing.expectEqual(@as(usize, 1), describe_entries.len);
+    try testing.expectEqual(@as(usize, 2), describe_entries[0].values.len);
+    try testing.expectEqualStrings("producer_byte_rate", describe_entries[0].values[0].key.?);
+    try testing.expectEqual(@as(f64, 1234.0), describe_entries[0].values[0].value);
+    try testing.expectEqualStrings("consumer_byte_rate", describe_entries[0].values[1].key.?);
+    try testing.expectEqual(@as(f64, 4321.0), describe_entries[0].values[1].value);
 }
 
 test "Broker.handleRequest AlterClientQuotas honors validate_only" {

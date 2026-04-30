@@ -232,6 +232,9 @@ Status: completed for the initial catalog and DeleteGroups slice.
   encode an explicit empty transaction list.
   CreateTopicsResponse now preserves nullable `Configs` so responses that do
   not return topic configs encode null instead of an explicit empty config list.
+  DescribeClientQuotasResponse now preserves nullable `Entries` so top-level
+  errors can encode null while successful empty matches encode an explicit
+  empty result list.
   StopReplicaRequest generated encoding now honors its legacy field version
   bounds exactly: v0 `UngroupedPartitions`, v0-v2 `DeletePartitions`, v1-v2
   grouped `Topics`, and v3+ `TopicStates` have non-default golden fixtures.
