@@ -532,6 +532,42 @@ test "generated non-default golden fixtures cover legacy and flexible wire encod
     }
 
     {
+        const DescribeConfigsRequest = generated.describe_configs_request.DescribeConfigsRequest;
+
+        const legacy_null_resources = [_]DescribeConfigsRequest.DescribeConfigsResource{.{
+            .resource_type = 2,
+            .resource_name = "r",
+            .configuration_keys = null,
+        }};
+        const legacy_null_value = DescribeConfigsRequest{
+            .resources = &legacy_null_resources,
+        };
+        try expectGoldenRoundTrip(DescribeConfigsRequest, legacy_null_value, 0, &[_]u8{
+            0x00, 0x00, 0x00, 0x01, 0x02, 0x00, 0x01, 'r',
+            0xff, 0xff, 0xff, 0xff,
+        });
+        try expectGoldenRoundTrip(DescribeConfigsRequest, legacy_null_value, 4, &[_]u8{
+            0x02, 0x02, 0x02, 'r', 0x00, 0x00, 0x00, 0x00,
+            0x00,
+        });
+
+        const flexible_empty_resources = [_]DescribeConfigsRequest.DescribeConfigsResource{.{
+            .resource_type = 2,
+            .resource_name = "r",
+            .configuration_keys = &.{},
+        }};
+        const flexible_empty_value = DescribeConfigsRequest{
+            .resources = &flexible_empty_resources,
+            .include_synonyms = false,
+            .include_documentation = false,
+        };
+        try expectGoldenRoundTrip(DescribeConfigsRequest, flexible_empty_value, 4, &[_]u8{
+            0x02, 0x02, 0x02, 'r', 0x01, 0x00, 0x00, 0x00,
+            0x00,
+        });
+    }
+
+    {
         const DescribeConfigsResponse = generated.describe_configs_response.DescribeConfigsResponse;
         const synonyms = [_]DescribeConfigsResponse.DescribeConfigsResult.DescribeConfigsResourceResult.DescribeConfigsSynonym{.{
             .name = "cleanup.policy",

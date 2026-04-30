@@ -8192,7 +8192,9 @@ pub const Broker = struct {
 
     fn freeDescribeConfigsRequest(self: *Broker, req: *const DescribeConfigsRequest) void {
         for (req.resources) |resource| {
-            if (resource.configuration_keys.len > 0) self.allocator.free(resource.configuration_keys);
+            if (resource.configuration_keys) |configuration_keys| {
+                if (configuration_keys.len > 0) self.allocator.free(configuration_keys);
+            }
         }
         if (req.resources.len > 0) self.allocator.free(req.resources);
     }
@@ -8236,7 +8238,7 @@ pub const Broker = struct {
         };
     }
 
-    fn buildTopicDescribeConfigs(self: *Broker, config: *const TopicConfig, keys: []const ?[]const u8, include_documentation: bool) ![]DescribeConfigEntry {
+    fn buildTopicDescribeConfigs(self: *Broker, config: *const TopicConfig, keys: ?[]const ?[]const u8, include_documentation: bool) ![]DescribeConfigEntry {
         const defaults = TopicConfig{};
         var count: usize = 0;
         if (configKeyRequested(keys, "retention.ms")) count += 1;
@@ -8268,7 +8270,7 @@ pub const Broker = struct {
         return configs;
     }
 
-    fn buildBrokerDescribeConfigs(self: *Broker, keys: []const ?[]const u8, include_documentation: bool) ![]DescribeConfigEntry {
+    fn buildBrokerDescribeConfigs(self: *Broker, keys: ?[]const ?[]const u8, include_documentation: bool) ![]DescribeConfigEntry {
         var count: usize = 0;
         if (configKeyRequested(keys, "broker.id")) count += 1;
         if (configKeyRequested(keys, "log.retention.hours")) count += 1;
@@ -8338,9 +8340,9 @@ pub const Broker = struct {
         index.* += 1;
     }
 
-    fn configKeyRequested(keys: []const ?[]const u8, name: []const u8) bool {
-        if (keys.len == 0) return true;
-        for (keys) |maybe_key| {
+    fn configKeyRequested(keys: ?[]const ?[]const u8, name: []const u8) bool {
+        const requested_keys = keys orelse return true;
+        for (requested_keys) |maybe_key| {
             if (maybe_key) |key| {
                 if (std.mem.eql(u8, key, name)) return true;
             }
@@ -15552,13 +15554,14 @@ pub const Broker = struct {
         const flexible = api_version >= 4;
         var pos = start_pos;
 
-        const resource_count = readKafkaArrayCount(buf, &pos, flexible) orelse return false;
-        for (0..resource_count) |_| {
+        const resources = readKafkaArrayHeader(buf, &pos, flexible) orelse return false;
+        if (resources.is_null) return false;
+        for (0..resources.count) |_| {
             if (!skipFixedBytes(buf, &pos, 1)) return false; // resource_type
             if (!skipKafkaString(buf, &pos, flexible)) return false; // resource_name
 
-            const config_key_count = readKafkaArrayCount(buf, &pos, flexible) orelse return false;
-            for (0..config_key_count) |_| {
+            const config_keys = readKafkaArrayHeader(buf, &pos, flexible) orelse return false;
+            for (0..config_keys.count) |_| {
                 if (!skipKafkaString(buf, &pos, flexible)) return false; // configuration key
             }
             if (flexible) ser.skipTaggedFields(buf, &pos) catch return false;
@@ -30165,7 +30168,7 @@ test "Broker.handleRequest DescribeConfigs v0 returns generated topic configs" {
     ser.writeI32(&buf, &pos, 1);
     ser.writeI8(&buf, &pos, 2); // resource_type = TOPIC
     ser.writeString(&buf, &pos, "cfg-topic");
-    ser.writeI32(&buf, &pos, 0);
+    ser.writeI32(&buf, &pos, -1); // null configuration_keys requests all configs
 
     const response = broker.handleRequest(buf[0..pos]);
     try testing.expect(response != null);
@@ -30234,6 +30237,55 @@ test "Broker.handleRequest DescribeConfigs v4 filters keys and preserves flexibl
     try testing.expectEqualStrings("cleanup.policy", resp.results[0].configs[0].name.?);
     try testing.expectEqualStrings("delete", resp.results[0].configs[0].value.?);
     try testing.expect(resp.results[0].configs[0].documentation != null);
+}
+
+test "Broker.handleRequest DescribeConfigs distinguishes null and empty configuration keys" {
+    const Req = generated.describe_configs_request.DescribeConfigsRequest;
+    const Resource = Req.DescribeConfigsResource;
+    const Resp = generated.describe_configs_response.DescribeConfigsResponse;
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+
+    _ = broker.ensureTopic("cfg-topic-null-empty");
+    const resources = [_]Resource{
+        .{
+            .resource_type = 2,
+            .resource_name = "cfg-topic-null-empty",
+            .configuration_keys = null,
+        },
+        .{
+            .resource_type = 2,
+            .resource_name = "cfg-topic-null-empty",
+            .configuration_keys = &.{},
+        },
+    };
+    const req = Req{
+        .resources = &resources,
+    };
+
+    var buf: [512]u8 = undefined;
+    var pos = buildTestRequest(&buf, 32, 4, 3206, header_mod.requestHeaderVersion(32, 4));
+    req.serialize(&buf, &pos, 4);
+
+    const response = broker.handleRequest(buf[0..pos]);
+    try testing.expect(response != null);
+    defer testing.allocator.free(response.?);
+
+    var rpos: usize = 0;
+    var response_header = try ResponseHeader.deserialize(testing.allocator, response.?, &rpos, header_mod.responseHeaderVersion(32, 4));
+    defer response_header.deinit(testing.allocator);
+    try testing.expectEqual(@as(i32, 3206), response_header.correlation_id);
+
+    const resp = try Resp.deserialize(testing.allocator, response.?, &rpos, 4);
+    defer freeDeserializedDescribeConfigsResponse(&resp);
+
+    try testing.expectEqual(response.?.len, rpos);
+    try testing.expectEqual(@as(usize, 2), resp.results.len);
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.none)), resp.results[0].error_code);
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.none)), resp.results[1].error_code);
+    try testing.expectEqual(@as(usize, 7), resp.results[0].configs.len);
+    try testing.expectEqual(@as(usize, 0), resp.results[1].configs.len);
 }
 
 test "Broker.handleRequest DescribeConfigs rejects truncated request" {

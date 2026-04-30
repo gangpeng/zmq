@@ -209,6 +209,8 @@ Status: completed for the initial catalog and DeleteGroups slice.
   OffsetFetchRequest generated round-trips now preserve nullable legacy and
   grouped `Topics` arrays instead of collapsing fetch-all requests to empty
   topic lists.
+  DescribeConfigsRequest now preserves nullable `ConfigurationKeys` so null
+  requests all configs while explicit empty arrays request no config entries.
   AlterPartitionReassignmentsRequest now preserves nullable `Replicas` so null
   cancels pending reassignments while explicit empty assignments fail closed.
   ListPartitionReassignmentsRequest now preserves nullable `Topics` so null

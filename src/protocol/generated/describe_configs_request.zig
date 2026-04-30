@@ -18,7 +18,7 @@ pub const DescribeConfigsRequest = struct {
         resource_name: ?[]const u8 = null,
         /// The configuration keys to list, or null to list all configuration keys.
         /// Versions: 0+
-        configuration_keys: []const ?[]const u8 = &.{},
+        configuration_keys: ?[]const ?[]const u8 = null,
 
         pub fn serialize(self: *const DescribeConfigsResource, buf: []u8, pos: *usize, version: i16) void {
             ser.writeI8(buf, pos, self.resource_type);
@@ -27,16 +27,24 @@ pub const DescribeConfigsRequest = struct {
             } else {
                 ser.writeString(buf, pos, self.resource_name);
             }
-            if (version >= 4) {
-                ser.writeCompactArrayLen(buf, pos, self.configuration_keys.len);
-            } else {
-                ser.writeArrayLen(buf, pos, self.configuration_keys.len);
-            }
-            for (self.configuration_keys) |item| {
+            if (self.configuration_keys) |configuration_keys| {
                 if (version >= 4) {
-                    ser.writeCompactString(buf, pos, item);
+                    ser.writeCompactArrayLen(buf, pos, configuration_keys.len);
                 } else {
-                    ser.writeString(buf, pos, item);
+                    ser.writeArrayLen(buf, pos, configuration_keys.len);
+                }
+                for (configuration_keys) |item| {
+                    if (version >= 4) {
+                        ser.writeCompactString(buf, pos, item);
+                    } else {
+                        ser.writeString(buf, pos, item);
+                    }
+                }
+            } else {
+                if (version >= 4) {
+                    ser.writeCompactArrayLen(buf, pos, null);
+                } else {
+                    ser.writeArrayLen(buf, pos, null);
                 }
             }
             if (version >= 4) ser.writeEmptyTaggedFields(buf, pos);
@@ -49,19 +57,25 @@ pub const DescribeConfigsRequest = struct {
                 try ser.readCompactString(buf, pos)
             else
                 try ser.readString(buf, pos);
-            const configuration_keys_len: usize = if (version >= 4)
-                (try ser.readCompactArrayLen(buf, pos)) orelse 0
+            const configuration_keys_len: ?usize = if (version >= 4)
+                try ser.readCompactArrayLen(buf, pos)
             else
-                (try ser.readArrayLen(buf, pos)) orelse 0;
-            if (configuration_keys_len > 0) {
-                const configuration_keys_items = try alloc.alloc(?[]const u8, configuration_keys_len);
-                for (configuration_keys_items) |*item| {
-                    item.* = if (version >= 4)
-                        try ser.readCompactString(buf, pos)
-                    else
-                        try ser.readString(buf, pos);
+                try ser.readArrayLen(buf, pos);
+            if (configuration_keys_len) |len| {
+                if (len == 0) {
+                    result.configuration_keys = &.{};
+                } else {
+                    const configuration_keys_items = try alloc.alloc(?[]const u8, len);
+                    for (configuration_keys_items) |*item| {
+                        item.* = if (version >= 4)
+                            try ser.readCompactString(buf, pos)
+                        else
+                            try ser.readString(buf, pos);
+                    }
+                    result.configuration_keys = configuration_keys_items;
                 }
-                result.configuration_keys = configuration_keys_items;
+            } else {
+                result.configuration_keys = null;
             }
             if (version >= 4) try ser.skipTaggedFields(buf, pos);
             return result;
@@ -75,17 +89,23 @@ pub const DescribeConfigsRequest = struct {
             } else {
                 size += ser.stringSize(self.resource_name);
             }
-            if (version >= 4) {
-                size += ser.unsignedVarintSize(self.configuration_keys.len + 1);
+            if (self.configuration_keys) |configuration_keys| {
+                if (version >= 4) {
+                    size += ser.unsignedVarintSize(configuration_keys.len + 1);
+                } else {
+                    size += 4;
+                }
+                for (configuration_keys) |item| {
+                    if (version >= 4) {
+                        size += ser.compactStringSize(item);
+                    } else {
+                        size += ser.stringSize(item);
+                    }
+                }
+            } else if (version >= 4) {
+                size += 1;
             } else {
                 size += 4;
-            }
-            for (self.configuration_keys) |item| {
-                if (version >= 4) {
-                    size += ser.compactStringSize(item);
-                } else {
-                    size += ser.stringSize(item);
-                }
             }
             if (version >= 4) size += 1;
             return size;
