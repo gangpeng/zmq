@@ -819,12 +819,117 @@ test "generated non-default golden fixtures cover legacy and flexible wire encod
     {
         const FetchResponse = generated.fetch_response.FetchResponse;
         const PartitionData = FetchResponse.FetchableTopicResponse.PartitionData;
+        const null_partitions = [_]PartitionData{.{
+            .partition_index = 0,
+            .error_code = 0,
+            .high_watermark = 0,
+            .last_stable_offset = -1,
+            .aborted_transactions = null,
+            .records = null,
+        }};
+        const null_topics = [_]FetchResponse.FetchableTopicResponse{.{
+            .topic = "t",
+            .partitions = &null_partitions,
+        }};
+        const null_value = FetchResponse{
+            .throttle_time_ms = 0,
+            .error_code = 0,
+            .session_id = 0,
+            .responses = &null_topics,
+        };
+        try expectGoldenRoundTrip(FetchResponse, null_value, 4, &[_]u8{
+            0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x01,
+            0x00, 0x01, 't',  0x00,
+            0x00, 0x00, 0x01, 0x00,
+            0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00,
+            0x00, 0xff, 0xff, 0xff,
+            0xff, 0xff, 0xff, 0xff,
+            0xff, 0xff, 0xff, 0xff,
+            0xff, 0xff, 0xff, 0xff,
+            0xff,
+        });
+        try expectGoldenRoundTrip(FetchResponse, null_value, 12, &[_]u8{
+            0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x02, 0x02,
+            't',  0x02, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00,
+            0xff, 0xff, 0xff, 0xff,
+            0xff, 0xff, 0xff, 0xff,
+            0xff, 0xff, 0xff, 0xff,
+            0xff, 0xff, 0xff, 0xff,
+            0x00, 0xff, 0xff, 0xff,
+            0xff, 0x00, 0x00, 0x00,
+            0x00,
+        });
+
+        const empty_aborted = [_]PartitionData.AbortedTransaction{};
+        const empty_partitions = [_]PartitionData{.{
+            .partition_index = 0,
+            .error_code = 0,
+            .high_watermark = 0,
+            .last_stable_offset = -1,
+            .aborted_transactions = &empty_aborted,
+            .records = null,
+        }};
+        const empty_topics = [_]FetchResponse.FetchableTopicResponse{.{
+            .topic = "t",
+            .partitions = &empty_partitions,
+        }};
+        const empty_value = FetchResponse{
+            .throttle_time_ms = 0,
+            .error_code = 0,
+            .session_id = 0,
+            .responses = &empty_topics,
+        };
+        try expectGoldenRoundTrip(FetchResponse, empty_value, 4, &[_]u8{
+            0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x01,
+            0x00, 0x01, 't',  0x00,
+            0x00, 0x00, 0x01, 0x00,
+            0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00,
+            0x00, 0xff, 0xff, 0xff,
+            0xff, 0xff, 0xff, 0xff,
+            0xff, 0x00, 0x00, 0x00,
+            0x00, 0xff, 0xff, 0xff,
+            0xff,
+        });
+        try expectGoldenRoundTrip(FetchResponse, empty_value, 12, &[_]u8{
+            0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x02, 0x02,
+            't',  0x02, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00,
+            0xff, 0xff, 0xff, 0xff,
+            0xff, 0xff, 0xff, 0xff,
+            0xff, 0xff, 0xff, 0xff,
+            0xff, 0xff, 0xff, 0xff,
+            0x01, 0xff, 0xff, 0xff,
+            0xff, 0x00, 0x00, 0x00,
+            0x00,
+        });
+    }
+
+    {
+        const FetchResponse = generated.fetch_response.FetchResponse;
+        const PartitionData = FetchResponse.FetchableTopicResponse.PartitionData;
+        const empty_aborted = [_]PartitionData.AbortedTransaction{};
         const partitions = [_]PartitionData{.{
             .partition_index = 2,
             .error_code = 6,
             .high_watermark = 123,
             .last_stable_offset = 100,
             .log_start_offset = 5,
+            .aborted_transactions = &empty_aborted,
             .preferred_read_replica = -1,
             .records = null,
             .diverging_epoch = .{ .epoch = 4, .end_offset = 44 },

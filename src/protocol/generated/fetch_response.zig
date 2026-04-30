@@ -209,7 +209,7 @@ pub const FetchResponse = struct {
             snapshot_id: SnapshotId = .{},
             /// The aborted transactions.
             /// Versions: 4+
-            aborted_transactions: []const AbortedTransaction = &.{},
+            aborted_transactions: ?[]const AbortedTransaction = null,
             /// The preferred read replica for the consumer to use on its next fetch request
             /// Versions: 11+
             preferred_read_replica: i32 = -1,
@@ -228,13 +228,21 @@ pub const FetchResponse = struct {
                     ser.writeI64(buf, pos, self.log_start_offset);
                 }
                 if (version >= 4) {
-                    if (version >= 12) {
-                        ser.writeCompactArrayLen(buf, pos, self.aborted_transactions.len);
+                    if (self.aborted_transactions) |aborted_transactions| {
+                        if (version >= 12) {
+                            ser.writeCompactArrayLen(buf, pos, aborted_transactions.len);
+                        } else {
+                            ser.writeArrayLen(buf, pos, aborted_transactions.len);
+                        }
+                        for (aborted_transactions) |item| {
+                            item.serialize(buf, pos, version);
+                        }
                     } else {
-                        ser.writeArrayLen(buf, pos, self.aborted_transactions.len);
-                    }
-                    for (self.aborted_transactions) |item| {
-                        item.serialize(buf, pos, version);
+                        if (version >= 12) {
+                            ser.writeCompactArrayLen(buf, pos, null);
+                        } else {
+                            ser.writeArrayLen(buf, pos, null);
+                        }
                     }
                 }
                 if (version >= 11) {
@@ -277,7 +285,9 @@ pub const FetchResponse = struct {
 
             pub fn deserialize(alloc: Allocator, buf: []const u8, pos: *usize, version: i16) !PartitionData {
                 var result = PartitionData{};
-                errdefer if (result.aborted_transactions.len > 0) alloc.free(result.aborted_transactions);
+                errdefer if (result.aborted_transactions) |aborted_transactions| {
+                    if (aborted_transactions.len > 0) alloc.free(aborted_transactions);
+                };
 
                 result.partition_index = ser.readI32(buf, pos);
                 result.error_code = ser.readI16(buf, pos);
@@ -289,16 +299,22 @@ pub const FetchResponse = struct {
                     result.log_start_offset = ser.readI64(buf, pos);
                 }
                 if (version >= 4) {
-                    const aborted_transactions_len: usize = if (version >= 12)
-                        (try ser.readCompactArrayLen(buf, pos)) orelse 0
+                    const aborted_transactions_len: ?usize = if (version >= 12)
+                        try ser.readCompactArrayLen(buf, pos)
                     else
-                        (try ser.readArrayLen(buf, pos)) orelse 0;
-                    if (aborted_transactions_len > 0) {
-                        const aborted_transactions_items = try alloc.alloc(AbortedTransaction, aborted_transactions_len);
-                        for (aborted_transactions_items) |*item| {
-                            item.* = try AbortedTransaction.deserialize(alloc, buf, pos, version);
+                        try ser.readArrayLen(buf, pos);
+                    if (aborted_transactions_len) |len| {
+                        if (len == 0) {
+                            result.aborted_transactions = &.{};
+                        } else {
+                            const aborted_transactions_items = try alloc.alloc(AbortedTransaction, len);
+                            for (aborted_transactions_items) |*item| {
+                                item.* = try AbortedTransaction.deserialize(alloc, buf, pos, version);
+                            }
+                            result.aborted_transactions = aborted_transactions_items;
                         }
-                        result.aborted_transactions = aborted_transactions_items;
+                    } else {
+                        result.aborted_transactions = null;
                     }
                 }
                 if (version >= 11) {
@@ -360,13 +376,17 @@ pub const FetchResponse = struct {
                     size += 8;
                 }
                 if (version >= 4) {
-                    if (version >= 12) {
-                        size += ser.unsignedVarintSize(self.aborted_transactions.len + 1);
+                    if (self.aborted_transactions) |aborted_transactions| {
+                        if (version >= 12) {
+                            size += ser.unsignedVarintSize(aborted_transactions.len + 1);
+                        } else {
+                            size += 4;
+                        }
+                        for (aborted_transactions) |item| {
+                            size += item.calcSize(version);
+                        }
                     } else {
-                        size += 4;
-                    }
-                    for (self.aborted_transactions) |item| {
-                        size += item.calcSize(version);
+                        size += if (version >= 12) 1 else 4;
                     }
                 }
                 if (version >= 11) {
@@ -635,7 +655,9 @@ pub const FetchResponse = struct {
         errdefer {
             for (result.responses) |topic| {
                 for (topic.partitions) |partition| {
-                    if (partition.aborted_transactions.len > 0) alloc.free(partition.aborted_transactions);
+                    if (partition.aborted_transactions) |aborted_transactions| {
+                        if (aborted_transactions.len > 0) alloc.free(aborted_transactions);
+                    }
                 }
                 if (topic.partitions.len > 0) alloc.free(topic.partitions);
             }

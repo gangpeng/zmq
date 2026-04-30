@@ -5163,7 +5163,9 @@ pub const Broker = struct {
     fn freeFetchResponseTopics(self: *Broker, topics: []const generated.fetch_response.FetchResponse.FetchableTopicResponse) void {
         for (topics) |topic| {
             for (topic.partitions) |partition| {
-                if (partition.aborted_transactions.len > 0) self.allocator.free(partition.aborted_transactions);
+                if (partition.aborted_transactions) |aborted_transactions| {
+                    if (aborted_transactions.len > 0) self.allocator.free(aborted_transactions);
+                }
                 if (partition.records) |records| {
                     if (records.len > 0) self.allocator.free(@constCast(records));
                 }
@@ -5183,6 +5185,9 @@ pub const Broker = struct {
         var partitions_init: usize = 0;
         errdefer {
             for (partitions[0..partitions_init]) |partition| {
+                if (partition.aborted_transactions) |aborted_transactions| {
+                    if (aborted_transactions.len > 0) self.allocator.free(aborted_transactions);
+                }
                 if (partition.records) |records| {
                     if (records.len > 0) self.allocator.free(@constCast(records));
                 }
@@ -5227,7 +5232,7 @@ pub const Broker = struct {
             .high_watermark = fetch_result.high_watermark,
             .last_stable_offset = fetch_result.last_stable_offset,
             .log_start_offset = 0,
-            .aborted_transactions = &.{},
+            .aborted_transactions = if (isolation_level == 1) &.{} else null,
             .preferred_read_replica = -1,
             .records = if (fetch_result.records.len > 0) fetch_result.records else null,
         };
@@ -16592,7 +16597,9 @@ fn freeDeserializedProduceResponse(resp: *const generated.produce_response.Produ
 fn freeDeserializedFetchResponse(resp: *const generated.fetch_response.FetchResponse) void {
     for (resp.responses) |topic| {
         for (topic.partitions) |partition| {
-            if (partition.aborted_transactions.len > 0) testing.allocator.free(partition.aborted_transactions);
+            if (partition.aborted_transactions) |aborted_transactions| {
+                if (aborted_transactions.len > 0) testing.allocator.free(aborted_transactions);
+            }
         }
         if (topic.partitions.len > 0) testing.allocator.free(topic.partitions);
     }
@@ -27072,8 +27079,41 @@ test "Broker.handleRequest Fetch v12 returns generated flexible response" {
     try testing.expect(resp.session_id != 0);
     try testing.expectEqual(@as(usize, 1), resp.responses.len);
     try testing.expectEqualStrings("fetch-v12-topic", resp.responses[0].topic.?);
+    try testing.expect(resp.responses[0].partitions[0].aborted_transactions == null);
     try testing.expect(resp.responses[0].partitions[0].records != null);
     try testing.expect(resp.responses[0].partitions[0].records.?.len > 0);
+
+    const read_committed_req = Req{
+        .replica_id = -1,
+        .max_wait_ms = 500,
+        .min_bytes = 1,
+        .max_bytes = 1048576,
+        .isolation_level = 1,
+        .session_id = 0,
+        .session_epoch = 0,
+        .topics = &topics,
+        .rack_id = "",
+    };
+
+    var committed_buf: [512]u8 = undefined;
+    var committed_pos = buildTestRequest(&committed_buf, 1, 12, 114, header_mod.requestHeaderVersion(1, 12));
+    read_committed_req.serialize(&committed_buf, &committed_pos, 12);
+
+    const committed_response = broker.handleRequest(committed_buf[0..committed_pos]);
+    try testing.expect(committed_response != null);
+    defer testing.allocator.free(committed_response.?);
+
+    var committed_rpos: usize = 0;
+    var committed_response_header = try ResponseHeader.deserialize(testing.allocator, committed_response.?, &committed_rpos, header_mod.responseHeaderVersion(1, 12));
+    defer committed_response_header.deinit(testing.allocator);
+    try testing.expectEqual(@as(i32, 114), committed_response_header.correlation_id);
+
+    const committed_resp = try Resp.deserialize(testing.allocator, committed_response.?, &committed_rpos, 12);
+    defer freeDeserializedFetchResponse(&committed_resp);
+
+    try testing.expectEqual(committed_response.?.len, committed_rpos);
+    try testing.expect(committed_resp.responses[0].partitions[0].aborted_transactions != null);
+    try testing.expectEqual(@as(usize, 0), committed_resp.responses[0].partitions[0].aborted_transactions.?.len);
 }
 
 test "Broker.handleRequest Fetch rejects truncated request" {
