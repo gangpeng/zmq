@@ -860,7 +860,7 @@ pub const S3Client = struct {
 
     fn isValidMultipartEtag(etag: []const u8) bool {
         if (etag.len == 0) return false;
-        if (std.mem.indexOfAny(u8, etag, "\r\n<>") != null) return false;
+        if (std.mem.indexOfAny(u8, etag, "\r\n<>&") != null) return false;
         return true;
     }
 
@@ -1266,6 +1266,7 @@ test "S3Client multipart ETag validation" {
     try testing.expect(!S3Client.isValidMultipartEtag(""));
     try testing.expect(!S3Client.isValidMultipartEtag("abc\r\nx-bad: 1"));
     try testing.expect(!S3Client.isValidMultipartEtag("<bad>"));
+    try testing.expect(!S3Client.isValidMultipartEtag("abc&bad"));
 }
 
 test "S3Client responseHeaderValueOwned trims ETag" {
