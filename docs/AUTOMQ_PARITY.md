@@ -203,6 +203,9 @@ Status: completed for the initial catalog and DeleteGroups slice.
   decode generated flexible requests, reject malformed frames, return an empty
   telemetry subscription set, and reject unsolicited pushes with
   `unknown_subscription_id` until client telemetry collection is implemented.
+  MetadataRequest generated decoding now preserves nullable `Topics` semantics:
+  v1+ null requests all topics, explicit empty arrays request no topic results,
+  and v0 null topics are rejected as malformed.
   StopReplicaRequest generated encoding now honors its legacy field version
   bounds exactly: v0 `UngroupedPartitions`, v0-v2 `DeletePartitions`, v1-v2
   grouped `Topics`, and v3+ `TopicStates` have non-default golden fixtures.

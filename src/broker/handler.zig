@@ -4596,12 +4596,13 @@ pub const Broker = struct {
             .{ .node_id = self.node_id, .host = self.advertised_host, .port = @intCast(self.port) },
         };
 
-        const requested_all = req.topics.len == 0;
+        const requested_all = req.topics == null;
+        const requested_topics = req.topics orelse &.{};
         var topics: []TopicResult = &.{};
         if (requested_all) {
             topics = self.allocator.alloc(TopicResult, self.topics.count()) catch return null;
         } else {
-            topics = self.allocator.alloc(TopicResult, req.topics.len) catch return null;
+            topics = self.allocator.alloc(TopicResult, requested_topics.len) catch return null;
         }
         var topics_init: usize = 0;
         defer {
@@ -4616,7 +4617,7 @@ pub const Broker = struct {
                 topics_init += 1;
             }
         } else {
-            for (req.topics) |topic_req| {
+            for (requested_topics) |topic_req| {
                 topics[topics_init] = self.buildRequestedMetadataTopicResponse(topic_req, req.allow_auto_topic_creation, api_version) catch return null;
                 topics_init += 1;
             }
@@ -4633,7 +4634,9 @@ pub const Broker = struct {
     }
 
     fn freeMetadataRequest(self: *Broker, req: *const generated.metadata_request.MetadataRequest) void {
-        if (req.topics.len > 0) self.allocator.free(req.topics);
+        if (req.topics) |topics| {
+            if (topics.len > 0) self.allocator.free(topics);
+        }
     }
 
     fn freeMetadataResponseTopics(self: *Broker, topics: []const generated.metadata_response.MetadataResponse.MetadataResponseTopic) void {
@@ -14807,6 +14810,7 @@ pub const Broker = struct {
         var pos = start_pos;
 
         const topics = readKafkaArrayHeader(buf, &pos, flexible) orelse return false;
+        if (api_version == 0 and topics.is_null) return false;
         if (!topics.is_null) {
             for (0..topics.count) |_| {
                 if (api_version >= 10 and !skipFixedBytes(buf, &pos, 16)) return false; // topic_id
@@ -16707,6 +16711,46 @@ test "Broker.handleRequest Metadata v1 returns generated all-topic response" {
     try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.none)), resp.topics[0].error_code);
     try testing.expectEqual(@as(usize, 1), resp.topics[0].partitions.len);
     try testing.expectEqual(@as(i32, 1), resp.topics[0].partitions[0].leader_id);
+}
+
+test "Broker.handleRequest Metadata v1 empty topics returns no topics" {
+    const Resp = generated.metadata_response.MetadataResponse;
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+
+    _ = broker.ensureTopic("meta-v1-empty-topic");
+
+    var buf: [256]u8 = undefined;
+    var pos = buildTestRequest(&buf, 3, 1, 56, header_mod.requestHeaderVersion(3, 1));
+    ser.writeArrayLen(&buf, &pos, 0);
+
+    const response = broker.handleRequest(buf[0..pos]);
+    try testing.expect(response != null);
+    defer testing.allocator.free(response.?);
+
+    var rpos: usize = 0;
+    var response_header = try ResponseHeader.deserialize(testing.allocator, response.?, &rpos, header_mod.responseHeaderVersion(3, 1));
+    defer response_header.deinit(testing.allocator);
+    try testing.expectEqual(@as(i32, 56), response_header.correlation_id);
+
+    const resp = try Resp.deserialize(testing.allocator, response.?, &rpos, 1);
+    defer freeDeserializedMetadataResponse(&resp);
+
+    try testing.expectEqual(response.?.len, rpos);
+    try testing.expectEqual(@as(usize, 1), resp.brokers.len);
+    try testing.expectEqual(@as(usize, 0), resp.topics.len);
+}
+
+test "Broker.handleRequest Metadata v0 rejects null topics" {
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+
+    var buf: [256]u8 = undefined;
+    var pos = buildTestRequest(&buf, 3, 0, 57, header_mod.requestHeaderVersion(3, 0));
+    ser.writeArrayLen(&buf, &pos, null);
+
+    try testing.expect(broker.handleRequest(buf[0..pos]) == null);
 }
 
 test "Broker.handleRequest Metadata v12 returns generated flexible topic metadata" {

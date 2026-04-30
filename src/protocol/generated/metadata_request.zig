@@ -59,7 +59,7 @@ pub const MetadataRequest = struct {
 
     /// The topics to fetch metadata for.
     /// Versions: 0+
-    topics: []const MetadataRequestTopic = &.{},
+    topics: ?[]const MetadataRequestTopic = &.{},
     /// If this is true, the broker may auto-create topics that we requested which do not already exist, if it is configured to do so.
     /// Versions: 4+
     allow_auto_topic_creation: bool = true,
@@ -71,13 +71,21 @@ pub const MetadataRequest = struct {
     include_topic_authorized_operations: bool = false,
 
     pub fn serialize(self: *const MetadataRequest, buf: []u8, pos: *usize, version: i16) void {
-        if (version >= 9) {
-            ser.writeCompactArrayLen(buf, pos, self.topics.len);
+        if (self.topics) |topics| {
+            if (version >= 9) {
+                ser.writeCompactArrayLen(buf, pos, topics.len);
+            } else {
+                ser.writeArrayLen(buf, pos, topics.len);
+            }
+            for (topics) |item| {
+                item.serialize(buf, pos, version);
+            }
         } else {
-            ser.writeArrayLen(buf, pos, self.topics.len);
-        }
-        for (self.topics) |item| {
-            item.serialize(buf, pos, version);
+            if (version >= 9) {
+                ser.writeCompactArrayLen(buf, pos, null);
+            } else {
+                ser.writeArrayLen(buf, pos, null);
+            }
         }
         if (version >= 4) {
             ser.writeBool(buf, pos, self.allow_auto_topic_creation);
@@ -93,16 +101,22 @@ pub const MetadataRequest = struct {
 
     pub fn deserialize(alloc: Allocator, buf: []const u8, pos: *usize, version: i16) !MetadataRequest {
         var result = MetadataRequest{};
-        const topics_len: usize = if (version >= 9)
-            (try ser.readCompactArrayLen(buf, pos)) orelse 0
+        const topics_len: ?usize = if (version >= 9)
+            try ser.readCompactArrayLen(buf, pos)
         else
-            (try ser.readArrayLen(buf, pos)) orelse 0;
-        if (topics_len > 0) {
-            const topics_items = try alloc.alloc(MetadataRequestTopic, topics_len);
-            for (topics_items) |*item| {
-                item.* = try MetadataRequestTopic.deserialize(alloc, buf, pos, version);
+            try ser.readArrayLen(buf, pos);
+        if (topics_len) |len| {
+            if (len == 0) {
+                result.topics = &.{};
+            } else {
+                const topics_items = try alloc.alloc(MetadataRequestTopic, len);
+                for (topics_items) |*item| {
+                    item.* = try MetadataRequestTopic.deserialize(alloc, buf, pos, version);
+                }
+                result.topics = topics_items;
             }
-            result.topics = topics_items;
+        } else {
+            result.topics = null;
         }
         if (version >= 4) {
             result.allow_auto_topic_creation = try ser.readBool(buf, pos);
@@ -119,13 +133,21 @@ pub const MetadataRequest = struct {
 
     pub fn calcSize(self: *const MetadataRequest, version: i16) usize {
         var size: usize = 0;
-        if (version >= 9) {
-            size += ser.unsignedVarintSize(self.topics.len + 1);
+        if (self.topics) |topics| {
+            if (version >= 9) {
+                size += ser.unsignedVarintSize(topics.len + 1);
+            } else {
+                size += 4;
+            }
+            for (topics) |item| {
+                size += item.calcSize(version);
+            }
         } else {
-            size += 4;
-        }
-        for (self.topics) |item| {
-            size += item.calcSize(version);
+            if (version >= 9) {
+                size += 1;
+            } else {
+                size += 4;
+            }
         }
         if (version >= 4) {
             size += 1;

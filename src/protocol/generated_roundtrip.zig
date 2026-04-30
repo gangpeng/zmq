@@ -123,6 +123,16 @@ test "generated non-default golden fixtures cover legacy and flexible wire encod
 
     {
         const MetadataRequest = generated.metadata_request.MetadataRequest;
+        const value = MetadataRequest{
+            .topics = null,
+        };
+        try expectGoldenRoundTrip(MetadataRequest, value, 1, &[_]u8{
+            0xff, 0xff, 0xff, 0xff,
+        });
+    }
+
+    {
+        const MetadataRequest = generated.metadata_request.MetadataRequest;
         const topics = [_]MetadataRequest.MetadataRequestTopic{
             .{
                 .topic_id = .{
