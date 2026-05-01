@@ -1,9 +1,16 @@
 const std = @import("std");
 const testing = std.testing;
+const api_support = @import("protocol").api_support;
 
 /// MetricRegistry is defined in core to avoid circular dependencies between
 /// broker, storage, and raft modules. Re-exported here for backward compatibility.
 pub const MetricRegistry = @import("core").MetricRegistry;
+
+fn registerCounterIfMissing(registry: *MetricRegistry, name: []const u8, help: []const u8) !void {
+    if (!registry.counters.contains(name)) {
+        try registry.registerCounter(name, help);
+    }
+}
 
 /// Register standard broker metrics.
 pub fn registerBrokerMetrics(registry: *MetricRegistry) !void {
@@ -15,6 +22,11 @@ pub fn registerBrokerMetrics(registry: *MetricRegistry) !void {
     try registry.registerHistogram("kafka_server_request_latency_seconds", "Request processing latency");
     try registry.registerCounter("kafka_server_produce_requests_total", "Total produce requests");
     try registry.registerCounter("kafka_server_fetch_requests_total", "Total fetch requests");
+    try registry.registerCounter("kafka_server_produce_throttle_total", "Total throttled produce requests");
+    try registry.registerCounter("kafka_server_fetch_throttle_total", "Total throttled fetch requests");
+    for (api_support.broker_supported_apis) |api| {
+        try registerCounterIfMissing(registry, api.metric, "Total requests for a broker API");
+    }
     // Per-API latency histograms
     try registry.registerHistogram("kafka_server_produce_latency_seconds", "Produce request latency");
     try registry.registerHistogram("kafka_server_fetch_latency_seconds", "Fetch request latency");
@@ -99,6 +111,18 @@ test "registerBrokerMetrics" {
     try testing.expect(registry.labeled_counter_meta.contains("kafka_server_api_errors_total"));
     try testing.expect(registry.labeled_gauge_meta.contains("kafka_consumer_lag"));
     try testing.expect(registry.gauges.contains("kafka_network_connections_active"));
+}
+
+test "registerBrokerMetrics covers broker API metric catalog" {
+    var registry = MetricRegistry.init(testing.allocator);
+    defer registry.deinit();
+
+    try registerBrokerMetrics(&registry);
+    for (api_support.broker_supported_apis) |api| {
+        try testing.expect(registry.counters.contains(api.metric));
+    }
+    try testing.expect(registry.counters.contains("kafka_server_produce_throttle_total"));
+    try testing.expect(registry.counters.contains("kafka_server_fetch_throttle_total"));
 }
 
 test "registerS3Metrics" {
