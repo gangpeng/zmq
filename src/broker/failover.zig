@@ -94,6 +94,10 @@ pub const FailoverController = struct {
         try self.reassignPartition(.{ .topic = topic, .partition = partition }, owner);
     }
 
+    pub fn removePartitionOwner(self: *FailoverController, topic: []const u8, partition: i32) void {
+        self.removePartitionOwnership(topic, partition);
+    }
+
     /// Return the node currently recorded as owner for a partition.
     pub fn findPartitionOwner(self: *const FailoverController, topic: []const u8, partition: i32) ?i32 {
         var it = self.known_nodes.iterator();

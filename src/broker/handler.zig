@@ -585,6 +585,7 @@ pub const Broker = struct {
                     log.warn("Failed to ensure partition {s}-{d}: {}", .{ entry.name, pi, err });
                 };
             }
+            self.trackLocalTopicPartitionRange(entry.name, 0, entry.num_partitions);
 
             log.info("Loaded persisted topic '{s}' ({d} partitions)", .{ entry.name, entry.num_partitions });
         }
@@ -1415,6 +1416,7 @@ pub const Broker = struct {
         for (0..np) |pi| {
             self.store.ensurePartition(topic_name, @intCast(pi)) catch {};
         }
+        self.trackLocalTopicPartitionRange(topic_name, 0, self.default_num_partitions);
 
         log.info("Auto-created topic '{s}' with {d} partitions", .{ topic_name, self.default_num_partitions });
         self.writeTopicSnapshotRecord() catch |err| {
@@ -1455,6 +1457,7 @@ pub const Broker = struct {
         for (0..@as(usize, @intCast(partitions))) |pi| {
             self.store.ensurePartition(name, @intCast(pi)) catch {};
         }
+        self.trackLocalTopicPartitionRange(name, 0, partitions);
 
         log.info("Created internal topic '{s}' ({d} partitions, compact)", .{ name, partitions });
     }
@@ -2243,6 +2246,7 @@ pub const Broker = struct {
     }
 
     fn freeTopicMapEntry(self: *Broker, removed: anytype) void {
+        self.untrackTopicPartitionRange(removed.value.name, 0, removed.value.num_partitions);
         self.allocator.free(removed.value.name);
         self.allocator.free(removed.key);
     }
@@ -2299,6 +2303,7 @@ pub const Broker = struct {
                 log.warn("Failed to ensure restored topic partition {s}-{d}: {}", .{ entry.name, pi, err });
             };
         }
+        self.trackLocalTopicPartitionRange(entry.name, 0, entry.num_partitions);
     }
 
     fn restoreTopicSnapshotRecord(self: *Broker, value: []const u8) !void {
@@ -2318,8 +2323,30 @@ pub const Broker = struct {
         };
     }
 
+    fn trackLocalTopicPartitionRange(self: *Broker, topic_name: []const u8, start_partition: i32, end_partition: i32) void {
+        if (end_partition <= start_partition) return;
+        self.failover_controller.registerNode(self.node_id) catch |err| {
+            log.warn("Failed to register local failover node {d}: {}", .{ self.node_id, err });
+            return;
+        };
+        for (@as(usize, @intCast(start_partition))..@as(usize, @intCast(end_partition))) |pi| {
+            const partition_index: i32 = @intCast(pi);
+            self.failover_controller.registerPartitionOwner(topic_name, partition_index, self.node_id) catch |err| {
+                log.warn("Failed to track failover owner for {s}-{d}: {}", .{ topic_name, partition_index, err });
+            };
+        }
+    }
+
+    fn untrackTopicPartitionRange(self: *Broker, topic_name: []const u8, start_partition: i32, end_partition: i32) void {
+        if (end_partition <= start_partition) return;
+        for (@as(usize, @intCast(start_partition))..@as(usize, @intCast(end_partition))) |pi| {
+            self.failover_controller.removePartitionOwner(topic_name, @intCast(pi));
+        }
+    }
+
     fn removeTopicPartitionRange(self: *Broker, topic_name: []const u8, start_partition: i32, end_partition: i32) void {
         if (end_partition <= start_partition) return;
+        self.untrackTopicPartitionRange(topic_name, start_partition, end_partition);
         for (@as(usize, @intCast(start_partition))..@as(usize, @intCast(end_partition))) |pi| {
             const partition_index: i32 = @intCast(pi);
             const stream_id = PartitionStore.hashPartitionKey(topic_name, partition_index);
@@ -6353,6 +6380,7 @@ pub const Broker = struct {
                 for (0..@intCast(actual_partitions)) |pi| {
                     self.store.ensurePartition(topic_name, @intCast(pi)) catch {};
                 }
+                self.trackLocalTopicPartitionRange(topic_name, 0, actual_partitions);
                 log.info("Created topic '{s}' ({d} partitions)", .{ topic_name, actual_partitions });
                 created_any = true;
                 created_topics[topic_index] = true;
@@ -9226,6 +9254,7 @@ pub const Broker = struct {
                 };
             };
         }
+        self.trackLocalTopicPartitionRange(topic_name, old_total_count, topic_req.count);
         info.num_partitions = topic_req.count;
 
         return .{
@@ -20074,6 +20103,7 @@ test "Broker.handleRequest CreatePartitions v2 returns generated response and ex
     try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.none)), resp.results[0].error_code);
     try testing.expectEqual(@as(i32, 3), broker.topics.get("create-partitions-topic").?.num_partitions);
     try testing.expect(broker.store.partitions.contains("create-partitions-topic-2"));
+    try testing.expectEqual(@as(?i32, 1), broker.failover_controller.findPartitionOwner("create-partitions-topic", 2));
 }
 
 test "Broker.handleRequest CreatePartitions rejects explicit empty assignments" {
@@ -25330,6 +25360,8 @@ test "Broker.ensureTopic auto-create" {
     try testing.expect(!broker.topics.contains("new-topic"));
     try testing.expect(broker.ensureTopic("new-topic"));
     try testing.expect(broker.topics.contains("new-topic"));
+    try testing.expectEqual(@as(?i32, 1), broker.failover_controller.findPartitionOwner("new-topic", 0));
+    try testing.expectEqual(@as(usize, @intCast(broker.default_num_partitions)), broker.failover_controller.nodePartitionCount(1));
 
     // Should not create if auto_create_topics is false
     broker.auto_create_topics = false;
@@ -30300,6 +30332,7 @@ test "Broker handleRequest DeleteTopics (key=20)" {
 
     // Topic should be removed after delete
     try testing.expect(!broker.topics.contains("del-topic"));
+    try testing.expectEqual(@as(?i32, null), broker.failover_controller.findPartitionOwner("del-topic", 0));
 }
 
 test "Broker.handleRequest DeleteTopics v6 deletes by topic id and returns generated response" {
