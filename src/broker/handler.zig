@@ -3689,6 +3689,9 @@ pub const Broker = struct {
             29 => self.handleDescribeAclsAuthorizationError(req_header, api_version, resp_header_version, err_code),
             30 => self.handleCreateAclsAuthorizationError(request_bytes, body_start, req_header, api_version, resp_header_version, err_code),
             31 => self.handleDeleteAclsAuthorizationError(request_bytes, body_start, req_header, api_version, resp_header_version, err_code),
+            55 => self.handleDescribeQuorumAuthorizationError(req_header, api_version, resp_header_version, err_code),
+            60 => self.handleDescribeClusterAuthorizationError(req_header, api_version, resp_header_version, err_code),
+            66 => self.handleListTransactionsAuthorizationError(req_header, api_version, resp_header_version, err_code),
             else => self.handleGenericAuthorizationError(req_header, resp_header_version, err_code),
         };
     }
@@ -3773,6 +3776,43 @@ pub const Broker = struct {
         const resp = Resp{
             .throttle_time_ms = 0,
             .filter_results = filter_results,
+        };
+        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+    }
+
+    fn handleDescribeQuorumAuthorizationError(self: *Broker, req_header: *const RequestHeader, api_version: i16, resp_header_version: i16, err_code: ErrorCode) ?[]u8 {
+        const Resp = generated.describe_quorum_response.DescribeQuorumResponse;
+        const resp = Resp{
+            .error_code = @intFromEnum(err_code),
+            .error_message = if (api_version >= 2) "Not authorized" else null,
+            .topics = &.{},
+            .nodes = &.{},
+        };
+        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+    }
+
+    fn handleDescribeClusterAuthorizationError(self: *Broker, req_header: *const RequestHeader, api_version: i16, resp_header_version: i16, err_code: ErrorCode) ?[]u8 {
+        const Resp = generated.describe_cluster_response.DescribeClusterResponse;
+        const resp = Resp{
+            .throttle_time_ms = 0,
+            .error_code = @intFromEnum(err_code),
+            .error_message = "Not authorized",
+            .endpoint_type = 1,
+            .cluster_id = if (self.raft_state) |rs| rs.cluster_id else "zmq-cluster",
+            .controller_id = self.node_id,
+            .brokers = &.{},
+            .cluster_authorized_operations = std.math.minInt(i32),
+        };
+        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+    }
+
+    fn handleListTransactionsAuthorizationError(self: *Broker, req_header: *const RequestHeader, api_version: i16, resp_header_version: i16, err_code: ErrorCode) ?[]u8 {
+        const Resp = generated.list_transactions_response.ListTransactionsResponse;
+        const resp = Resp{
+            .throttle_time_ms = 0,
+            .error_code = @intFromEnum(err_code),
+            .unknown_state_filters = &.{},
+            .transaction_states = &.{},
         };
         return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
     }
@@ -18822,6 +18862,37 @@ test "Broker.handleRequest ListTransactions rejects truncated request" {
     try testing.expect(broker.handleRequest(buf[0..req_len]) == null);
 }
 
+test "Broker.handleRequest ListTransactions authorization denial uses generated response" {
+    const Req = generated.list_transactions_request.ListTransactionsRequest;
+    const Resp = generated.list_transactions_response.ListTransactionsResponse;
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+    try broker.authorizer.addAcl("other-client", .transactional_id, "*", .literal, .describe, .allow, "*");
+
+    const req = Req{};
+    var buf: [256]u8 = undefined;
+    var pos = buildTestRequest(&buf, 66, 1, 6603, header_mod.requestHeaderVersion(66, 1));
+    req.serialize(&buf, &pos, 1);
+
+    const response = broker.handleRequest(buf[0..pos]);
+    try testing.expect(response != null);
+    defer testing.allocator.free(response.?);
+
+    var rpos: usize = 0;
+    var response_header = try ResponseHeader.deserialize(testing.allocator, response.?, &rpos, header_mod.responseHeaderVersion(66, 1));
+    defer response_header.deinit(testing.allocator);
+    try testing.expectEqual(@as(i32, 6603), response_header.correlation_id);
+
+    const resp = try Resp.deserialize(testing.allocator, response.?, &rpos, 1);
+    defer freeDeserializedListTransactionsResponse(&resp);
+
+    try testing.expectEqual(response.?.len, rpos);
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.transactional_id_authorization_failed)), resp.error_code);
+    try testing.expectEqual(@as(usize, 0), resp.unknown_state_filters.len);
+    try testing.expectEqual(@as(usize, 0), resp.transaction_states.len);
+}
+
 test "Broker.handleRequest DescribeTransactions v0 returns partition details and missing ids" {
     const Req = generated.describe_transactions_request.DescribeTransactionsRequest;
     const Resp = generated.describe_transactions_response.DescribeTransactionsResponse;
@@ -26435,6 +26506,44 @@ test "Broker.handleRequest DescribeCluster rejects truncated request" {
     try testing.expect(broker.handleRequest(buf[0..req_len]) == null);
 }
 
+test "Broker.handleRequest DescribeCluster authorization denial uses generated response" {
+    const Req = generated.describe_cluster_request.DescribeClusterRequest;
+    const Resp = generated.describe_cluster_response.DescribeClusterResponse;
+
+    var broker = Broker.init(testing.allocator, 7, 19092);
+    defer broker.deinit();
+    try broker.authorizer.addAcl("other-client", .cluster, "*", .literal, .describe, .allow, "*");
+
+    const req = Req{
+        .include_cluster_authorized_operations = true,
+        .endpoint_type = 2,
+    };
+
+    var buf: [256]u8 = undefined;
+    var pos = buildTestRequest(&buf, 60, 1, 6004, header_mod.requestHeaderVersion(60, 1));
+    req.serialize(&buf, &pos, 1);
+
+    const response = broker.handleRequest(buf[0..pos]);
+    try testing.expect(response != null);
+    defer testing.allocator.free(response.?);
+
+    var rpos: usize = 0;
+    var response_header = try ResponseHeader.deserialize(testing.allocator, response.?, &rpos, header_mod.responseHeaderVersion(60, 1));
+    defer response_header.deinit(testing.allocator);
+    try testing.expectEqual(@as(i32, 6004), response_header.correlation_id);
+
+    const resp = try Resp.deserialize(testing.allocator, response.?, &rpos, 1);
+    defer if (resp.brokers.len > 0) testing.allocator.free(resp.brokers);
+
+    try testing.expectEqual(response.?.len, rpos);
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.cluster_authorization_failed)), resp.error_code);
+    try testing.expect(resp.error_message != null);
+    try testing.expectEqual(@as(i8, 1), resp.endpoint_type);
+    try testing.expectEqualStrings("zmq-cluster", resp.cluster_id.?);
+    try testing.expectEqual(@as(usize, 0), resp.brokers.len);
+    try testing.expectEqual(@as(i32, std.math.minInt(i32)), resp.cluster_authorized_operations);
+}
+
 test "Broker.handleRequest DescribeQuorum returns request-scoped generated quorum state" {
     const Req = generated.describe_quorum_request.DescribeQuorumRequest;
     const Resp = generated.describe_quorum_response.DescribeQuorumResponse;
@@ -26548,6 +26657,41 @@ test "Broker.handleRequest DescribeQuorum rejects truncated request" {
     var buf: [128]u8 = undefined;
     const req_len = buildTestRequest(&buf, 55, 2, 5504, header_mod.requestHeaderVersion(55, 2));
     try testing.expect(broker.handleRequest(buf[0..req_len]) == null);
+}
+
+test "Broker.handleRequest DescribeQuorum authorization denial uses generated response" {
+    const Req = generated.describe_quorum_request.DescribeQuorumRequest;
+    const Resp = generated.describe_quorum_response.DescribeQuorumResponse;
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+    try broker.authorizer.addAcl("other-client", .cluster, "*", .literal, .describe, .allow, "*");
+
+    const req = Req{};
+    var buf: [256]u8 = undefined;
+    var pos = buildTestRequest(&buf, 55, 2, 5505, header_mod.requestHeaderVersion(55, 2));
+    req.serialize(&buf, &pos, 2);
+
+    const response = broker.handleRequest(buf[0..pos]);
+    try testing.expect(response != null);
+    defer testing.allocator.free(response.?);
+
+    var rpos: usize = 0;
+    var response_header = try ResponseHeader.deserialize(testing.allocator, response.?, &rpos, header_mod.responseHeaderVersion(55, 2));
+    defer response_header.deinit(testing.allocator);
+    try testing.expectEqual(@as(i32, 5505), response_header.correlation_id);
+
+    const resp = try Resp.deserialize(testing.allocator, response.?, &rpos, 2);
+    defer {
+        if (resp.topics.len > 0) testing.allocator.free(resp.topics);
+        if (resp.nodes.len > 0) testing.allocator.free(resp.nodes);
+    }
+
+    try testing.expectEqual(response.?.len, rpos);
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.cluster_authorization_failed)), resp.error_code);
+    try testing.expect(resp.error_message != null);
+    try testing.expectEqual(@as(usize, 0), resp.topics.len);
+    try testing.expectEqual(@as(usize, 0), resp.nodes.len);
 }
 
 test "Broker.handleRequest Vote returns request-scoped generated response" {
