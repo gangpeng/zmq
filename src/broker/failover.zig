@@ -21,9 +21,11 @@ pub const FailoverController = struct {
     pub const PartitionId = struct {
         topic: []const u8,
         partition: i32,
+        owns_topic: bool = false,
     };
 
     pub const NodeState = struct {
+        allocator: Allocator,
         node_id: i32,
         last_heartbeat_ms: i64,
         is_fenced: bool,
@@ -31,6 +33,7 @@ pub const FailoverController = struct {
 
         pub fn init(alloc: Allocator, nid: i32) NodeState {
             return .{
+                .allocator = alloc,
                 .node_id = nid,
                 .last_heartbeat_ms = @import("time_compat").milliTimestamp(),
                 .is_fenced = false,
@@ -39,6 +42,9 @@ pub const FailoverController = struct {
         }
 
         pub fn deinit(self: *NodeState) void {
+            for (self.owned_partitions.items) |partition| {
+                if (partition.owns_topic) self.allocator.free(partition.topic);
+            }
             self.owned_partitions.deinit();
         }
     };
@@ -82,6 +88,28 @@ pub const FailoverController = struct {
         }
     }
 
+    /// Record the node that currently owns a partition. Topic names are copied
+    /// so failover state does not depend on request-buffer lifetimes.
+    pub fn registerPartitionOwner(self: *FailoverController, topic: []const u8, partition: i32, owner: i32) !void {
+        try self.reassignPartition(.{ .topic = topic, .partition = partition }, owner);
+    }
+
+    /// Return the node currently recorded as owner for a partition.
+    pub fn findPartitionOwner(self: *const FailoverController, topic: []const u8, partition: i32) ?i32 {
+        var it = self.known_nodes.iterator();
+        while (it.next()) |entry| {
+            for (entry.value_ptr.owned_partitions.items) |owned| {
+                if (partitionMatches(owned, topic, partition)) return entry.key_ptr.*;
+            }
+        }
+        return null;
+    }
+
+    pub fn nodePartitionCount(self: *const FailoverController, nid: i32) usize {
+        if (self.known_nodes.get(nid)) |state| return state.owned_partitions.items.len;
+        return 0;
+    }
+
     /// Check for failed nodes and trigger failover.
     /// Called from the broker's periodic tick().
     pub fn tick(self: *FailoverController, now_ms: i64) u32 {
@@ -116,9 +144,18 @@ pub const FailoverController = struct {
             self.node_id,
         });
 
-        // 2. Take ownership of failed node's partitions
+        // 2. Take ownership of failed node's partitions.
+        if (failed.owned_partitions.items.len == 0) return;
+        const target = self.known_nodes.getPtr(self.node_id) orelse {
+            log.warn("Failover: local node {d} is not registered; leaving partitions on fenced node {d}", .{ self.node_id, failed.node_id });
+            return;
+        };
+        target.owned_partitions.appendSlice(failed.owned_partitions.items) catch |err| {
+            log.err("Failover: failed to transfer partitions from node {d} to node {d}: {}", .{ failed.node_id, self.node_id, err });
+            return;
+        };
         for (failed.owned_partitions.items) |partition| {
-            self.reassignPartition(partition, self.node_id);
+            log.info("Reassigning {s}-{d} to node {d}", .{ partition.topic, partition.partition, self.node_id });
         }
 
         // 3. Clear the failed node's partition list (they now belong to us)
@@ -127,14 +164,19 @@ pub const FailoverController = struct {
 
     /// Reassign a partition to a target node.
     /// Updates metadata so partition.leader = target, partition.isr = [target].
-    pub fn reassignPartition(self: *FailoverController, partition: PartitionId, target: i32) void {
-        _ = self;
+    pub fn reassignPartition(self: *FailoverController, partition: PartitionId, target: i32) !void {
+        try self.registerNode(target);
+        self.removePartitionOwnership(partition.topic, partition.partition);
+
+        const topic_copy = try self.allocator.dupe(u8, partition.topic);
+        errdefer self.allocator.free(topic_copy);
+        const target_state = self.known_nodes.getPtr(target) orelse return error.UnknownFailoverTarget;
+        try target_state.owned_partitions.append(.{
+            .topic = topic_copy,
+            .partition = partition.partition,
+            .owns_topic = true,
+        });
         log.info("Reassigning {s}-{d} to node {d}", .{ partition.topic, partition.partition, target });
-        // In production: update the metadata store so that
-        //   partition.leader = target
-        //   partition.isr = [target]
-        // Since we're single-node with RF=1 in ZMQ, this is effectively a no-op
-        // but the infrastructure is in place for multi-node support.
     }
 
     /// WAL epoch fencing — check if our epoch is still valid.
@@ -161,6 +203,30 @@ pub const FailoverController = struct {
     /// Get count of known nodes.
     pub fn nodeCount(self: *const FailoverController) usize {
         return self.known_nodes.count();
+    }
+
+    fn removePartitionOwnership(self: *FailoverController, topic: []const u8, partition: i32) void {
+        var it = self.known_nodes.iterator();
+        while (it.next()) |entry| {
+            var i: usize = 0;
+            while (i < entry.value_ptr.owned_partitions.items.len) {
+                const owned = entry.value_ptr.owned_partitions.items[i];
+                if (!partitionMatches(owned, topic, partition)) {
+                    i += 1;
+                    continue;
+                }
+                const removed = entry.value_ptr.owned_partitions.swapRemove(i);
+                self.freePartitionId(removed);
+            }
+        }
+    }
+
+    fn freePartitionId(self: *FailoverController, partition: PartitionId) void {
+        if (partition.owns_topic) self.allocator.free(partition.topic);
+    }
+
+    fn partitionMatches(partition: PartitionId, topic: []const u8, partition_id: i32) bool {
+        return partition.partition == partition_id and std.mem.eql(u8, partition.topic, topic);
     }
 };
 
@@ -218,6 +284,51 @@ test "FailoverController detects timeout and fences node" {
 
     // Epoch should have been bumped
     try testing.expectEqual(@as(u64, 2), fc.currentEpoch());
+}
+
+test "FailoverController transfers partition ownership on timeout" {
+    var fc = FailoverController.init(testing.allocator, 0);
+    defer fc.deinit();
+
+    try fc.registerNode(0);
+    try fc.registerNode(1);
+    try fc.registerPartitionOwner("topic-a", 0, 1);
+    try fc.registerPartitionOwner("topic-a", 1, 1);
+    try testing.expectEqual(@as(?i32, 1), fc.findPartitionOwner("topic-a", 0));
+    try testing.expectEqual(@as(usize, 2), fc.nodePartitionCount(1));
+    try testing.expectEqual(@as(usize, 0), fc.nodePartitionCount(0));
+
+    if (fc.known_nodes.getPtr(1)) |state| {
+        state.last_heartbeat_ms = 0;
+    }
+
+    const now = @import("time_compat").milliTimestamp();
+    const count = fc.tick(now);
+    try testing.expectEqual(@as(u32, 1), count);
+    try testing.expectEqual(@as(?i32, 0), fc.findPartitionOwner("topic-a", 0));
+    try testing.expectEqual(@as(?i32, 0), fc.findPartitionOwner("topic-a", 1));
+    try testing.expectEqual(@as(usize, 0), fc.nodePartitionCount(1));
+    try testing.expectEqual(@as(usize, 2), fc.nodePartitionCount(0));
+    try testing.expectEqual(@as(u64, 2), fc.currentEpoch());
+}
+
+test "FailoverController explicit reassignment replaces stale ownership" {
+    var fc = FailoverController.init(testing.allocator, 0);
+    defer fc.deinit();
+
+    try fc.registerNode(0);
+    try fc.registerNode(1);
+    try fc.registerPartitionOwner("topic-b", 0, 1);
+    try testing.expectEqual(@as(?i32, 1), fc.findPartitionOwner("topic-b", 0));
+
+    try fc.reassignPartition(.{ .topic = "topic-b", .partition = 0 }, 0);
+    try testing.expectEqual(@as(?i32, 0), fc.findPartitionOwner("topic-b", 0));
+    try testing.expectEqual(@as(usize, 0), fc.nodePartitionCount(1));
+    try testing.expectEqual(@as(usize, 1), fc.nodePartitionCount(0));
+
+    try fc.reassignPartition(.{ .topic = "topic-b", .partition = 0 }, 0);
+    try testing.expectEqual(@as(?i32, 0), fc.findPartitionOwner("topic-b", 0));
+    try testing.expectEqual(@as(usize, 1), fc.nodePartitionCount(0));
 }
 
 test "FailoverController does not failover self" {
