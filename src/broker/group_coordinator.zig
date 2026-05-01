@@ -2133,7 +2133,7 @@ test "GroupCoordinator commitOffsetWithLag emits lag metric" {
     // Commit offset 5 with LEO 10 → lag = 5
     try coord.commitOffsetWithLag("test-grp", "test-topic", 0, 5, 10);
 
-    const key = "kafka_consumer_lag{test-grp,test-topic,0}";
+    const key = "kafka_consumer_lag{group=\"test-grp\",topic=\"test-topic\",partition=\"0\"}";
     const entry = registry.labeled_gauges.get(key);
     try testing.expect(entry != null);
     try testing.expectEqual(@as(f64, 5.0), entry.?.value);
@@ -2152,7 +2152,7 @@ test "GroupCoordinator commitOffsetWithLag updates lag on subsequent commits" {
     // Initial commit: lag = 10 - 3 = 7
     try coord.commitOffsetWithLag("grp1", "topic1", 0, 3, 10);
 
-    const key = "kafka_consumer_lag{grp1,topic1,0}";
+    const key = "kafka_consumer_lag{group=\"grp1\",topic=\"topic1\",partition=\"0\"}";
     try testing.expectEqual(@as(f64, 7.0), registry.labeled_gauges.get(key).?.value);
 
     // Consumer catches up: lag = 10 - 10 = 0
@@ -2173,7 +2173,7 @@ test "GroupCoordinator commitOffsetWithLag handles null LEO" {
     // Commit without LEO → lag defaults to 0
     try coord.commitOffsetWithLag("grp2", "topic2", 1, 5, null);
 
-    const key = "kafka_consumer_lag{grp2,topic2,1}";
+    const key = "kafka_consumer_lag{group=\"grp2\",topic=\"topic2\",partition=\"1\"}";
     const entry = registry.labeled_gauges.get(key);
     try testing.expect(entry != null);
     try testing.expectEqual(@as(f64, 0.0), entry.?.value);

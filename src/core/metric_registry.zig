@@ -12,15 +12,16 @@ pub const MetricRegistry = struct {
     counters: std.StringHashMap(Counter),
     gauges: std.StringHashMap(Gauge),
     histograms: std.StringHashMap(Histogram),
-    /// Labeled counters keyed by "name{label1=\"val1\",label2=\"val2\"}"
+    /// Labeled counters keyed by canonical Prometheus labels:
+    /// name{label1="val1",label2="val2"}
     labeled_counters: std.StringHashMap(LabeledCounterEntry),
     /// Metadata for labeled counter families (keyed by base name)
     labeled_counter_meta: std.StringHashMap(LabeledMeta),
-    /// Labeled histograms keyed by "name{label1=\"val1\",label2=\"val2\"}"
+    /// Labeled histograms keyed by canonical Prometheus labels.
     labeled_histograms: std.StringHashMap(LabeledHistogramEntry),
     /// Metadata for labeled histogram families (keyed by base name)
     labeled_histogram_meta: std.StringHashMap(LabeledMeta),
-    /// Labeled gauges keyed by "name{label1=\"val1\",label2=\"val2\"}"
+    /// Labeled gauges keyed by canonical Prometheus labels.
     labeled_gauges: std.StringHashMap(LabeledGaugeEntry),
     /// Metadata for labeled gauge families (keyed by base name)
     labeled_gauge_meta: std.StringHashMap(LabeledMeta),
@@ -298,11 +299,11 @@ pub const MetricRegistry = struct {
 
     /// Increment a labeled counter. Creates the label combination on first use.
     /// label_values must match the label_names order from registration.
-    /// Builds key as: "name{label1=\"val1\",label2=\"val2\"}"
     pub fn incrementLabeledCounter(self: *MetricRegistry, name: []const u8, label_values: []const []const u8) void {
         self.mutex.lock();
         defer self.mutex.unlock();
-        const key = buildLabelKey(self.allocator, name, label_values) catch return;
+        const meta = self.labeled_counter_meta.get(name) orelse return;
+        const key = buildLabelKey(self.allocator, name, meta.label_names, label_values) catch return;
         if (self.labeled_counters.getPtr(key)) |entry| {
             self.allocator.free(key);
             entry.value += 1;
@@ -317,7 +318,8 @@ pub const MetricRegistry = struct {
     pub fn addLabeledCounter(self: *MetricRegistry, name: []const u8, label_values: []const []const u8, delta: u64) void {
         self.mutex.lock();
         defer self.mutex.unlock();
-        const key = buildLabelKey(self.allocator, name, label_values) catch return;
+        const meta = self.labeled_counter_meta.get(name) orelse return;
+        const key = buildLabelKey(self.allocator, name, meta.label_names, label_values) catch return;
         if (self.labeled_counters.getPtr(key)) |entry| {
             self.allocator.free(key);
             entry.value += delta;
@@ -332,7 +334,8 @@ pub const MetricRegistry = struct {
     pub fn observeLabeledHistogram(self: *MetricRegistry, name: []const u8, label_values: []const []const u8, value: f64) void {
         self.mutex.lock();
         defer self.mutex.unlock();
-        const key = buildLabelKey(self.allocator, name, label_values) catch return;
+        const meta = self.labeled_histogram_meta.get(name) orelse return;
+        const key = buildLabelKey(self.allocator, name, meta.label_names, label_values) catch return;
         if (self.labeled_histograms.getPtr(key)) |entry| {
             self.allocator.free(key);
             entry.observe(value);
@@ -350,7 +353,8 @@ pub const MetricRegistry = struct {
     pub fn setLabeledGauge(self: *MetricRegistry, name: []const u8, label_values: []const []const u8, value: f64) void {
         self.mutex.lock();
         defer self.mutex.unlock();
-        const key = buildLabelKey(self.allocator, name, label_values) catch return;
+        const meta = self.labeled_gauge_meta.get(name) orelse return;
+        const key = buildLabelKey(self.allocator, name, meta.label_names, label_values) catch return;
         if (self.labeled_gauges.getPtr(key)) |entry| {
             self.allocator.free(key);
             entry.value = value;
@@ -361,8 +365,10 @@ pub const MetricRegistry = struct {
         }
     }
 
-    /// Build a label key like: "name{label1=\"val1\",label2=\"val2\"}"
-    fn buildLabelKey(alloc: Allocator, name: []const u8, label_values: []const []const u8) ![]u8 {
+    /// Build a canonical Prometheus label key like: name{label1="val1",label2="val2"}.
+    fn buildLabelKey(alloc: Allocator, name: []const u8, label_names: []const []const u8, label_values: []const []const u8) ![]u8 {
+        if (label_names.len != label_values.len) return error.InvalidLabelCount;
+
         var buf = std.array_list.Managed(u8).init(alloc);
         errdefer buf.deinit();
         const writer = @import("list_compat").writer(&buf);
@@ -370,10 +376,37 @@ pub const MetricRegistry = struct {
         try writer.writeByte('{');
         for (label_values, 0..) |val, i| {
             if (i > 0) try writer.writeByte(',');
-            try writer.writeAll(val);
+            try writer.print("{s}=\"", .{label_names[i]});
+            try writeEscapedPrometheusString(writer, val);
+            try writer.writeByte('"');
         }
         try writer.writeByte('}');
         return buf.toOwnedSlice();
+    }
+
+    fn writeEscapedPrometheusString(writer: anytype, value: []const u8) !void {
+        for (value) |byte| {
+            switch (byte) {
+                '\\' => try writer.writeAll("\\\\"),
+                '"' => try writer.writeAll("\\\""),
+                '\n' => try writer.writeAll("\\n"),
+                else => try writer.writeByte(byte),
+            }
+        }
+    }
+
+    fn writeHelpLine(writer: anytype, name: []const u8, help: []const u8) !void {
+        try writer.print("# HELP {s} ", .{name});
+        try writeEscapedPrometheusString(writer, help);
+        try writer.writeByte('\n');
+    }
+
+    fn labelSetFromFullKey(name: []const u8, full_key: []const u8) ?[]const u8 {
+        if (!std.mem.startsWith(u8, full_key, name)) return null;
+        if (full_key.len <= name.len + 1) return null;
+        if (full_key[name.len] != '{') return null;
+        if (full_key[full_key.len - 1] != '}') return null;
+        return full_key[name.len + 1 .. full_key.len - 1];
     }
 
     /// Export all metrics in Prometheus exposition format.
@@ -388,7 +421,7 @@ pub const MetricRegistry = struct {
         var cit = self.counters.iterator();
         while (cit.next()) |entry| {
             const c = entry.value_ptr;
-            try writer.print("# HELP {s} {s}\n", .{ c.name, c.help });
+            try writeHelpLine(writer, c.name, c.help);
             try writer.print("# TYPE {s} counter\n", .{c.name});
             try writer.print("{s} {d}\n\n", .{ c.name, c.value });
         }
@@ -397,7 +430,7 @@ pub const MetricRegistry = struct {
         var git = self.gauges.iterator();
         while (git.next()) |entry| {
             const g = entry.value_ptr;
-            try writer.print("# HELP {s} {s}\n", .{ g.name, g.help });
+            try writeHelpLine(writer, g.name, g.help);
             try writer.print("# TYPE {s} gauge\n", .{g.name});
             try writer.print("{s} {d:.6}\n\n", .{ g.name, g.value });
         }
@@ -406,7 +439,7 @@ pub const MetricRegistry = struct {
         var hit = self.histograms.iterator();
         while (hit.next()) |entry| {
             const h = entry.value_ptr;
-            try writer.print("# HELP {s} {s}\n", .{ h.name, h.help });
+            try writeHelpLine(writer, h.name, h.help);
             try writer.print("# TYPE {s} histogram\n", .{h.name});
             var cumulative: u64 = 0;
             for (Histogram.bucket_bounds, 0..) |bound, i| {
@@ -435,23 +468,15 @@ pub const MetricRegistry = struct {
         var meta_it = self.labeled_counter_meta.iterator();
         while (meta_it.next()) |meta_entry| {
             const meta = meta_entry.value_ptr;
-            try writer.print("# HELP {s} {s}\n", .{ meta.name, meta.help });
+            try writeHelpLine(writer, meta.name, meta.help);
             try writer.print("# TYPE {s} counter\n", .{meta.name});
 
             // Find all labeled counter entries that start with this base name
             var lc_it = self.labeled_counters.iterator();
             while (lc_it.next()) |lc_entry| {
                 const full_key = lc_entry.key_ptr.*;
-                // Check if key starts with "name{"
-                if (std.mem.startsWith(u8, full_key, meta.name) and
-                    full_key.len > meta.name.len and
-                    full_key[meta.name.len] == '{')
-                {
-                    // Extract the label part: {label1,label2}
-                    const label_part = full_key[meta.name.len..];
-                    // Format: name{label1="val1",label2="val2"} value
-                    try self.writeLabeledLine(writer, meta.name, meta.label_names, label_part, lc_entry.value_ptr.value);
-                }
+                _ = labelSetFromFullKey(meta.name, full_key) orelse continue;
+                try writer.print("{s} {d}\n", .{ full_key, lc_entry.value_ptr.value });
             }
             try writer.writeByte('\n');
         }
@@ -462,32 +487,23 @@ pub const MetricRegistry = struct {
         var meta_it = self.labeled_histogram_meta.iterator();
         while (meta_it.next()) |meta_entry| {
             const meta = meta_entry.value_ptr;
-            try writer.print("# HELP {s} {s}\n", .{ meta.name, meta.help });
+            try writeHelpLine(writer, meta.name, meta.help);
             try writer.print("# TYPE {s} histogram\n", .{meta.name});
 
             var lh_it = self.labeled_histograms.iterator();
             while (lh_it.next()) |lh_entry| {
                 const full_key = lh_entry.key_ptr.*;
-                if (std.mem.startsWith(u8, full_key, meta.name) and
-                    full_key.len > meta.name.len and
-                    full_key[meta.name.len] == '{')
-                {
-                    const label_part = full_key[meta.name.len..];
-                    const h = lh_entry.value_ptr;
+                const labels_str = labelSetFromFullKey(meta.name, full_key) orelse continue;
+                const h = lh_entry.value_ptr;
 
-                    // Build label string: label1="val1",label2="val2"
-                    const labels_str = self.buildLabelsString(meta.label_names, label_part) catch continue;
-                    defer self.allocator.free(labels_str);
-
-                    var cumulative: u64 = 0;
-                    for (Histogram.bucket_bounds, 0..) |bound, i| {
-                        cumulative += h.buckets[i];
-                        try writer.print("{s}_bucket{{{s},le=\"{d:.3}\"}} {d}\n", .{ meta.name, labels_str, bound, cumulative });
-                    }
-                    try writer.print("{s}_bucket{{{s},le=\"+Inf\"}} {d}\n", .{ meta.name, labels_str, h.count });
-                    try writer.print("{s}_sum{{{s}}} {d:.6}\n", .{ meta.name, labels_str, h.sum });
-                    try writer.print("{s}_count{{{s}}} {d}\n", .{ meta.name, labels_str, h.count });
+                var cumulative: u64 = 0;
+                for (Histogram.bucket_bounds, 0..) |bound, i| {
+                    cumulative += h.buckets[i];
+                    try writer.print("{s}_bucket{{{s},le=\"{d:.3}\"}} {d}\n", .{ meta.name, labels_str, bound, cumulative });
                 }
+                try writer.print("{s}_bucket{{{s},le=\"+Inf\"}} {d}\n", .{ meta.name, labels_str, h.count });
+                try writer.print("{s}_sum{{{s}}} {d:.6}\n", .{ meta.name, labels_str, h.sum });
+                try writer.print("{s}_count{{{s}}} {d}\n", .{ meta.name, labels_str, h.count });
             }
             try writer.writeByte('\n');
         }
@@ -498,58 +514,17 @@ pub const MetricRegistry = struct {
         var meta_it = self.labeled_gauge_meta.iterator();
         while (meta_it.next()) |meta_entry| {
             const meta = meta_entry.value_ptr;
-            try writer.print("# HELP {s} {s}\n", .{ meta.name, meta.help });
+            try writeHelpLine(writer, meta.name, meta.help);
             try writer.print("# TYPE {s} gauge\n", .{meta.name});
 
             var lg_it = self.labeled_gauges.iterator();
             while (lg_it.next()) |lg_entry| {
                 const full_key = lg_entry.key_ptr.*;
-                if (std.mem.startsWith(u8, full_key, meta.name) and
-                    full_key.len > meta.name.len and
-                    full_key[meta.name.len] == '{')
-                {
-                    const label_part = full_key[meta.name.len..];
-                    const labels_str = self.buildLabelsString(meta.label_names, label_part) catch continue;
-                    defer self.allocator.free(labels_str);
-                    try writer.print("{s}{{{s}}} {d:.6}\n", .{ meta.name, labels_str, lg_entry.value_ptr.value });
-                }
+                _ = labelSetFromFullKey(meta.name, full_key) orelse continue;
+                try writer.print("{s} {d:.6}\n", .{ full_key, lg_entry.value_ptr.value });
             }
             try writer.writeByte('\n');
         }
-    }
-
-    /// Write a single labeled counter line: name{label1="val1",label2="val2"} value
-    fn writeLabeledLine(self: *const MetricRegistry, writer: anytype, name: []const u8, label_names: []const []const u8, label_part: []const u8, value: u64) !void {
-        const labels_str = try self.buildLabelsString(label_names, label_part);
-        defer self.allocator.free(labels_str);
-        try writer.print("{s}{{{s}}} {d}\n", .{ name, labels_str, value });
-    }
-
-    /// Build "label1=\"val1\",label2=\"val2\"" from label names and raw values.
-    /// label_part is "{val1,val2}" — we strip the braces and split on commas.
-    fn buildLabelsString(self: *const MetricRegistry, label_names: []const []const u8, label_part: []const u8) ![]u8 {
-        // Strip braces
-        if (label_part.len < 2) return try self.allocator.dupe(u8, "");
-        const inner = label_part[1 .. label_part.len - 1]; // strip { and }
-
-        var result = std.array_list.Managed(u8).init(self.allocator);
-        errdefer result.deinit();
-        const writer = @import("list_compat").writer(&result);
-
-        var val_iter = std.mem.splitSequence(u8, inner, ",");
-        var i: usize = 0;
-        while (val_iter.next()) |val| {
-            if (i > 0) try writer.writeByte(',');
-            if (i < label_names.len) {
-                try writer.print("{s}=\"{s}\"", .{ label_names[i], val });
-            } else {
-                // Fallback: unnamed label
-                try writer.print("label{d}=\"{s}\"", .{ i, val });
-            }
-            i += 1;
-        }
-
-        return result.toOwnedSlice();
     }
 };
 
@@ -620,8 +595,8 @@ test "MetricRegistry labeled counter" {
     registry.incrementLabeledCounter("s3_requests_total", &.{"get"});
 
     // Verify internal state
-    const put_key = "s3_requests_total{put}";
-    const get_key = "s3_requests_total{get}";
+    const put_key = "s3_requests_total{operation=\"put\"}";
+    const get_key = "s3_requests_total{operation=\"get\"}";
     try testing.expectEqual(@as(u64, 2), registry.labeled_counters.get(put_key).?.value);
     try testing.expectEqual(@as(u64, 1), registry.labeled_counters.get(get_key).?.value);
 
@@ -683,8 +658,8 @@ test "MetricRegistry addLabeledCounter" {
     registry.addLabeledCounter("s3_bytes_total", &.{"upload"}, 2048);
     registry.addLabeledCounter("s3_bytes_total", &.{"download"}, 4096);
 
-    const upload_key = "s3_bytes_total{upload}";
-    const download_key = "s3_bytes_total{download}";
+    const upload_key = "s3_bytes_total{direction=\"upload\"}";
+    const download_key = "s3_bytes_total{direction=\"download\"}";
     try testing.expectEqual(@as(u64, 3072), registry.labeled_counters.get(upload_key).?.value);
     try testing.expectEqual(@as(u64, 4096), registry.labeled_counters.get(download_key).?.value);
 }
@@ -699,8 +674,8 @@ test "MetricRegistry labeled gauge" {
     registry.setLabeledGauge("kafka_consumer_lag", &.{ "my-group", "my-topic", "1" }, 17.0);
 
     // Verify internal state
-    const key0 = "kafka_consumer_lag{my-group,my-topic,0}";
-    const key1 = "kafka_consumer_lag{my-group,my-topic,1}";
+    const key0 = "kafka_consumer_lag{group=\"my-group\",topic=\"my-topic\",partition=\"0\"}";
+    const key1 = "kafka_consumer_lag{group=\"my-group\",topic=\"my-topic\",partition=\"1\"}";
     try testing.expectEqual(@as(f64, 42.0), registry.labeled_gauges.get(key0).?.value);
     try testing.expectEqual(@as(f64, 17.0), registry.labeled_gauges.get(key1).?.value);
 
@@ -715,4 +690,38 @@ test "MetricRegistry labeled gauge" {
     try testing.expect(std.mem.indexOf(u8, output, "# TYPE kafka_consumer_lag gauge") != null);
     try testing.expect(std.mem.indexOf(u8, output, "group=\"my-group\",topic=\"my-topic\",partition=\"0\"") != null);
     try testing.expect(std.mem.indexOf(u8, output, "group=\"my-group\",topic=\"my-topic\",partition=\"1\"") != null);
+}
+
+test "MetricRegistry escapes Prometheus help and label values" {
+    var registry = MetricRegistry.init(testing.allocator);
+    defer registry.deinit();
+
+    try registry.registerCounter("escaped_help_total", "Backslash \\ quote \" newline\ntext");
+    registry.incrementCounter("escaped_help_total");
+
+    try registry.registerLabeledCounter("escaped_labels_total", "Escaped labels", &.{"operation"});
+    registry.incrementLabeledCounter("escaped_labels_total", &.{"put,get"});
+    registry.incrementLabeledCounter("escaped_labels_total", &.{"quote\"slash\\line\nbreak"});
+
+    const output = try registry.exportPrometheus(testing.allocator);
+    defer testing.allocator.free(output);
+
+    try testing.expect(std.mem.indexOf(u8, output, "# HELP escaped_help_total Backslash \\\\ quote \\\" newline\\ntext") != null);
+    try testing.expect(std.mem.indexOf(u8, output, "escaped_labels_total{operation=\"put,get\"} 1") != null);
+    try testing.expect(std.mem.indexOf(u8, output, "escaped_labels_total{operation=\"quote\\\"slash\\\\line\\nbreak\"} 1") != null);
+}
+
+test "MetricRegistry ignores labeled updates with invalid arity" {
+    var registry = MetricRegistry.init(testing.allocator);
+    defer registry.deinit();
+
+    try registry.registerLabeledCounter("arity_total", "Arity checked labels", &.{ "operation", "status" });
+
+    registry.incrementLabeledCounter("arity_total", &.{"put"});
+    registry.incrementLabeledCounter("arity_total", &.{ "put", "ok", "extra" });
+    try testing.expectEqual(@as(u32, 0), registry.labeled_counters.count());
+
+    registry.incrementLabeledCounter("arity_total", &.{ "put", "ok" });
+    try testing.expectEqual(@as(u32, 1), registry.labeled_counters.count());
+    try testing.expect(registry.labeled_counters.contains("arity_total{operation=\"put\",status=\"ok\"}"));
 }

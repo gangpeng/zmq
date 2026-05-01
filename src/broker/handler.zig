@@ -31075,7 +31075,7 @@ test "Broker error counter increments on API error" {
     defer testing.allocator.free(resp.?);
 
     // Verify the error counter was incremented
-    const key = "kafka_server_api_errors_total{heartbeat,25}";
+    const key = "kafka_server_api_errors_total{api=\"heartbeat\",error_code=\"25\"}";
     const entry = broker.metrics.labeled_counters.get(key);
     try testing.expect(entry != null);
     try testing.expect(entry.?.value >= 1);
@@ -31092,7 +31092,7 @@ test "Broker consumer lag computed on offset commit" {
     try broker.groups.commitOffsetWithLag("test-group", "lag-topic", 0, 5, 10);
 
     // Verify the lag metric was set (10 - 5 = 5)
-    const key = "kafka_consumer_lag{test-group,lag-topic,0}";
+    const key = "kafka_consumer_lag{group=\"test-group\",topic=\"lag-topic\",partition=\"0\"}";
     const entry = broker.metrics.labeled_gauges.get(key);
     try testing.expect(entry != null);
     try testing.expectEqual(@as(f64, 5.0), entry.?.value);
