@@ -281,7 +281,40 @@ pub const S3Client = struct {
         return try self.responseBodyOwned(&response);
     }
 
+    fn chunkedBodyEnd(data: []const u8) !usize {
+        var pos: usize = 0;
+        while (pos < data.len) {
+            const line_end = std.mem.indexOf(u8, data[pos..], "\r\n") orelse return error.InvalidChunkedEncoding;
+            const chunk_size_line = data[pos .. pos + line_end];
+            const chunk_size_token = if (std.mem.indexOfScalar(u8, chunk_size_line, ';')) |semi|
+                chunk_size_line[0..semi]
+            else
+                chunk_size_line;
+            const chunk_size = std.fmt.parseInt(usize, std.mem.trim(u8, chunk_size_token, " \t"), 16) catch return error.InvalidChunkedEncoding;
+
+            pos += line_end + 2;
+            if (chunk_size == 0) {
+                while (true) {
+                    const trailer_end = std.mem.indexOf(u8, data[pos..], "\r\n") orelse return error.InvalidChunkedEncoding;
+                    pos += trailer_end + 2;
+                    if (trailer_end == 0) return pos;
+                }
+            }
+
+            if (chunk_size > data.len - pos) return error.InvalidChunkedEncoding;
+            pos += chunk_size;
+            if (data.len - pos < 2) return error.InvalidChunkedEncoding;
+            if (!std.mem.eql(u8, data[pos .. pos + 2], "\r\n")) return error.InvalidChunkedEncoding;
+            pos += 2;
+        }
+
+        return error.InvalidChunkedEncoding;
+    }
+
     fn decodeChunked(self: *S3Client, data: []const u8) ![]u8 {
+        const body_end = try chunkedBodyEnd(data);
+        if (body_end != data.len) return error.InvalidChunkedEncoding;
+
         var result = std.array_list.Managed(u8).init(self.allocator);
         errdefer result.deinit();
         var pos: usize = 0;
@@ -298,10 +331,11 @@ pub const S3Client = struct {
             pos += line_end + 2;
             if (chunk_size == 0) return result.toOwnedSlice();
 
-            if (pos + chunk_size + 2 > data.len) return error.InvalidChunkedEncoding;
+            if (chunk_size > data.len - pos) return error.InvalidChunkedEncoding;
 
             try result.appendSlice(data[pos .. pos + chunk_size]);
             pos += chunk_size;
+            if (data.len - pos < 2) return error.InvalidChunkedEncoding;
             if (!std.mem.eql(u8, data[pos .. pos + 2], "\r\n")) return error.InvalidChunkedEncoding;
             pos += 2;
         }
@@ -389,15 +423,18 @@ pub const S3Client = struct {
         const init_resp = try self.allocator.alloc(u8, 8192);
         defer self.allocator.free(init_resp);
 
-        const init_status = try self.httpRequest("POST", path, "uploads", null, null, init_resp);
-        if (init_status < 200 or init_status >= 300) return error.S3MultipartInitFailed;
+        const init_result = try self.httpRequestWithLength("POST", path, "uploads", null, null, init_resp);
+        if (init_result.status < 200 or init_result.status >= 300) return error.S3MultipartInitFailed;
+
+        const init_body = try self.responseBodyFromRawHttpDataOwned(init_resp[0..init_result.response_len]);
+        defer self.allocator.free(init_body);
 
         // Parse UploadId from XML response
         const upload_id = blk: {
-            const id_start = std.mem.indexOf(u8, init_resp, "<UploadId>") orelse return error.S3MultipartInitFailed;
+            const id_start = std.mem.indexOf(u8, init_body, "<UploadId>") orelse return error.S3MultipartInitFailed;
             const search_from = id_start + 10;
-            const id_end = std.mem.indexOf(u8, init_resp[search_from..], "</UploadId>") orelse return error.S3MultipartInitFailed;
-            break :blk try self.allocator.dupe(u8, init_resp[search_from .. search_from + id_end]);
+            const id_end = std.mem.indexOf(u8, init_body[search_from..], "</UploadId>") orelse return error.S3MultipartInitFailed;
+            break :blk try self.allocator.dupe(u8, init_body[search_from .. search_from + id_end]);
         };
         defer self.allocator.free(upload_id);
 
@@ -504,12 +541,15 @@ pub const S3Client = struct {
         const complete_resp = try self.allocator.alloc(u8, 8192);
         defer self.allocator.free(complete_resp);
 
-        const complete_status = try self.httpRequest("POST", path, complete_query, complete_body.items, null, complete_resp);
-        if (complete_status < 200 or complete_status >= 300) {
-            log.warn("CompleteMultipartUpload failed with status {d} for {s}", .{ complete_status, key });
+        const complete_result = try self.httpRequestWithLength("POST", path, complete_query, complete_body.items, null, complete_resp);
+        if (complete_result.status < 200 or complete_result.status >= 300) {
+            log.warn("CompleteMultipartUpload failed with status {d} for {s}", .{ complete_result.status, key });
             return error.S3MultipartCompleteFailed;
         }
-        if (isMultipartCompleteEmbeddedError(complete_resp)) {
+
+        const complete_response_body = try self.responseBodyFromRawHttpDataOwned(complete_resp[0..complete_result.response_len]);
+        defer self.allocator.free(complete_response_body);
+        if (isMultipartCompleteEmbeddedError(complete_response_body)) {
             log.warn("CompleteMultipartUpload returned embedded S3 error for {s}", .{key});
             return error.S3MultipartCompleteFailed;
         }
@@ -656,10 +696,21 @@ pub const S3Client = struct {
         }
     };
 
+    const HttpRequestResult = struct {
+        status: u16,
+        response_len: usize,
+    };
+
     fn httpRequest(self: *S3Client, method: []const u8, path: []const u8, query: []const u8, body: ?[]const u8, range_header: ?[]const u8, resp_buf: []u8) !u16 {
+        return (try self.httpRequestWithLength(method, path, query, body, range_header, resp_buf)).status;
+    }
+
+    fn httpRequestWithLength(self: *S3Client, method: []const u8, path: []const u8, query: []const u8, body: ?[]const u8, range_header: ?[]const u8, resp_buf: []u8) !HttpRequestResult {
         if (self.test_http_request) |hook| {
             const ctx = self.test_http_ctx orelse return error.MissingTestHttpContext;
-            return hook(ctx, method, path, query, body, range_header, resp_buf);
+            @memset(resp_buf, 0);
+            const status = try hook(ctx, method, path, query, body, range_header, resp_buf);
+            return .{ .status = status, .response_len = detectHttpResponseLength(resp_buf) };
         }
 
         // Retry with exponential backoff
@@ -673,7 +724,7 @@ pub const S3Client = struct {
                 @memset(resp_buf, 0);
                 const copy_len = @min(resp_buf.len, resp.data.len);
                 @memcpy(resp_buf[0..copy_len], resp.data[0..copy_len]);
-                return resp.status;
+                return .{ .status = resp.status, .response_len = copy_len };
             } else |err| {
                 attempt += 1;
                 if (attempt >= MAX_RETRIES) {
@@ -840,6 +891,39 @@ pub const S3Client = struct {
             }
         }
         return null;
+    }
+
+    fn contentLength(headers: []const u8) ?usize {
+        const value = headerValue(headers, "Content-Length") orelse return null;
+        return std.fmt.parseInt(usize, std.mem.trim(u8, value, " \t"), 10) catch null;
+    }
+
+    fn detectHttpResponseLength(data: []const u8) usize {
+        if (std.mem.indexOf(u8, data, "\r\n\r\n")) |header_end| {
+            const headers = data[0..header_end];
+            const body_start = header_end + 4;
+            const body = data[body_start..];
+            if (isChunked(headers)) {
+                if (chunkedBodyEnd(body)) |body_end| {
+                    return body_start + body_end;
+                } else |_| {}
+            }
+            if (contentLength(headers)) |len| {
+                if (len <= data.len - body_start) return body_start + len;
+            }
+        }
+
+        if (std.mem.indexOfScalar(u8, data, 0)) |zero| return zero;
+        return data.len;
+    }
+
+    fn responseBodyFromRawHttpDataOwned(self: *S3Client, response_data: []const u8) ![]u8 {
+        const header_end = std.mem.indexOf(u8, response_data, "\r\n\r\n") orelse
+            return try self.allocator.dupe(u8, response_data);
+        const headers = response_data[0..header_end];
+        const body = response_data[header_end + 4 ..];
+        if (isChunked(headers)) return try self.decodeChunked(body);
+        return try self.allocator.dupe(u8, body);
     }
 
     fn responseHeaderValueOwned(self: *S3Client, response_data: []const u8, name: []const u8) !?[]u8 {
@@ -1231,7 +1315,13 @@ test "S3Client decodeChunked validates framing" {
     defer testing.allocator.free(decoded);
     try testing.expectEqualStrings("hello world", decoded);
 
+    const with_trailer = try client.decodeChunked("5\r\nhello\r\n0\r\nx-amz-checksum-crc32: abc\r\n\r\n");
+    defer testing.allocator.free(with_trailer);
+    try testing.expectEqualStrings("hello", with_trailer);
+
     try testing.expectError(error.InvalidChunkedEncoding, client.decodeChunked("5\r\nabc\r\n0\r\n\r\n"));
+    try testing.expectError(error.InvalidChunkedEncoding, client.decodeChunked("5\r\nhello\r\n0\r\n"));
+    try testing.expectError(error.InvalidChunkedEncoding, client.decodeChunked("5\r\nhello\r\n0\r\n\r\njunk"));
 }
 
 test "S3Client range body returns exact requested window" {
@@ -1350,6 +1440,8 @@ const MultipartTestServer = struct {
         persistent_bad_etag,
         complete_failure,
         complete_embedded_error,
+        chunked_init_and_complete,
+        chunked_complete_embedded_error,
     };
 
     fn deinit(self: *MultipartTestServer) void {
@@ -1362,7 +1454,15 @@ const MultipartTestServer = struct {
 
         if (std.mem.eql(u8, method, "POST") and std.mem.eql(u8, query, "uploads")) {
             self.init_count += 1;
-            writeResponse(resp_buf, "<InitiateMultipartUploadResult><UploadId>upload-1</UploadId></InitiateMultipartUploadResult>");
+            if (self.mode == .chunked_init_and_complete or self.mode == .chunked_complete_embedded_error) {
+                writeChunkedResponseParts(
+                    resp_buf,
+                    "<InitiateMultipartUploadResult><Upload",
+                    "Id>upload-1</UploadId></InitiateMultipartUploadResult>",
+                );
+            } else {
+                writeResponse(resp_buf, "<InitiateMultipartUploadResult><UploadId>upload-1</UploadId></InitiateMultipartUploadResult>");
+            }
             return 200;
         }
 
@@ -1387,7 +1487,13 @@ const MultipartTestServer = struct {
                 writeResponse(resp_buf, "HTTP/1.1 200 OK\r\n\r\n<Error><Code>EntityTooSmall</Code><Message>part too small</Message></Error>");
                 return 200;
             }
-            writeResponse(resp_buf, "<CompleteMultipartUploadResult/>");
+            if (self.mode == .chunked_complete_embedded_error) {
+                writeChunkedResponseParts(resp_buf, "<Err", "or><Code>EntityTooSmall</Code><Message>part too small</Message></Error>");
+            } else if (self.mode == .chunked_init_and_complete) {
+                writeChunkedResponseParts(resp_buf, "<CompleteMultipart", "UploadResult/>");
+            } else {
+                writeResponse(resp_buf, "<CompleteMultipartUploadResult/>");
+            }
             return if (self.mode == .complete_failure) 500 else 200;
         }
 
@@ -1424,12 +1530,24 @@ const MultipartTestServer = struct {
                 writeValidPartEtag(resp_buf, part_number);
                 return 200;
             },
+            .chunked_init_and_complete, .chunked_complete_embedded_error => {
+                writeValidPartEtag(resp_buf, part_number);
+                return 200;
+            },
         }
     }
 
     fn writeResponse(resp_buf: []u8, data: []const u8) void {
         const copy_len = @min(resp_buf.len, data.len);
         @memcpy(resp_buf[0..copy_len], data[0..copy_len]);
+    }
+
+    fn writeChunkedResponseParts(resp_buf: []u8, first: []const u8, second: []const u8) void {
+        _ = std.fmt.bufPrint(
+            resp_buf,
+            "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n{x}\r\n{s}\r\n{x}\r\n{s}\r\n0\r\n\r\n",
+            .{ first.len, first, second.len, second },
+        ) catch return;
     }
 
     fn writeValidPartEtag(resp_buf: []u8, part_number: u32) void {
@@ -1538,6 +1656,49 @@ test "S3Client multipart aborts after embedded complete error" {
     try testing.expectEqual(@as(u32, 1), server.complete_count);
     try testing.expectEqual(@as(u32, 1), server.abort_count);
     try testing.expect(std.mem.indexOf(u8, server.complete_body, "<ETag>\"part-1\"</ETag>") != null);
+    try testing.expectEqual(@as(u64, 0), client.put_count);
+    try testing.expectEqual(@as(u64, 0), client.bytes_uploaded);
+}
+
+test "S3Client multipart decodes chunked init and complete responses" {
+    var server = MultipartTestServer{ .allocator = testing.allocator, .mode = .chunked_init_and_complete };
+    defer server.deinit();
+
+    var client = S3Client.init(testing.allocator, .{});
+    client.test_http_ctx = &server;
+    client.test_http_request = MultipartTestServer.request;
+
+    const data = try allocMultipartTestData(testing.allocator);
+    defer testing.allocator.free(data);
+
+    try client.putObjectMultipart("large-object", data);
+
+    try testing.expectEqual(@as(u32, 1), server.init_count);
+    try testing.expectEqual(@as(u32, 2), server.part_put_count);
+    try testing.expectEqual(@as(u32, 1), server.complete_count);
+    try testing.expectEqual(@as(u32, 0), server.abort_count);
+    try testing.expect(std.mem.indexOf(u8, server.complete_body, "<ETag>\"part-1\"</ETag>") != null);
+    try testing.expectEqual(@as(u64, 1), client.put_count);
+    try testing.expectEqual(@as(u64, @intCast(data.len)), client.bytes_uploaded);
+}
+
+test "S3Client multipart aborts after chunked embedded complete error" {
+    var server = MultipartTestServer{ .allocator = testing.allocator, .mode = .chunked_complete_embedded_error };
+    defer server.deinit();
+
+    var client = S3Client.init(testing.allocator, .{});
+    client.test_http_ctx = &server;
+    client.test_http_request = MultipartTestServer.request;
+
+    const data = try allocMultipartTestData(testing.allocator);
+    defer testing.allocator.free(data);
+
+    try testing.expectError(error.S3MultipartCompleteFailed, client.putObjectMultipart("large-object", data));
+
+    try testing.expectEqual(@as(u32, 1), server.init_count);
+    try testing.expectEqual(@as(u32, 2), server.part_put_count);
+    try testing.expectEqual(@as(u32, 1), server.complete_count);
+    try testing.expectEqual(@as(u32, 1), server.abort_count);
     try testing.expectEqual(@as(u64, 0), client.put_count);
     try testing.expectEqual(@as(u64, 0), client.bytes_uploaded);
 }
