@@ -3382,7 +3382,7 @@ pub const Broker = struct {
                 const resource_name = extractTopicFromRequest(api_key, request_bytes, pos) orelse "*";
                 const result = self.authorizer.authorize(principal, resource_type, resource_name, operation);
                 if (result == .denied) {
-                    return self.handleAuthorizationError(&req_header, resp_header_version);
+                    return self.handleAuthorizationError(request_bytes, pos, &req_header, api_key, api_version, resp_header_version, resource_type);
                 }
             }
         }
@@ -3663,14 +3663,126 @@ pub const Broker = struct {
         };
     }
 
-    /// Return an authorization error response (fix #7).
-    fn handleAuthorizationError(self: *Broker, req_header: *const RequestHeader, resp_header_version: i16) ?[]u8 {
+    fn authorizationErrorCode(resource_type: Authorizer.ResourceType) ErrorCode {
+        return switch (resource_type) {
+            .topic => .topic_authorization_failed,
+            .group => .group_authorization_failed,
+            .transactional_id => .transactional_id_authorization_failed,
+            .cluster => .cluster_authorization_failed,
+            else => .cluster_authorization_failed,
+        };
+    }
+
+    /// Return an authorization error response.
+    fn handleAuthorizationError(
+        self: *Broker,
+        request_bytes: []const u8,
+        body_start: usize,
+        req_header: *const RequestHeader,
+        api_key: i16,
+        api_version: i16,
+        resp_header_version: i16,
+        resource_type: Authorizer.ResourceType,
+    ) ?[]u8 {
+        const err_code = authorizationErrorCode(resource_type);
+        return switch (api_key) {
+            29 => self.handleDescribeAclsAuthorizationError(req_header, api_version, resp_header_version, err_code),
+            30 => self.handleCreateAclsAuthorizationError(request_bytes, body_start, req_header, api_version, resp_header_version, err_code),
+            31 => self.handleDeleteAclsAuthorizationError(request_bytes, body_start, req_header, api_version, resp_header_version, err_code),
+            else => self.handleGenericAuthorizationError(req_header, resp_header_version, err_code),
+        };
+    }
+
+    fn handleDescribeAclsAuthorizationError(self: *Broker, req_header: *const RequestHeader, api_version: i16, resp_header_version: i16, err_code: ErrorCode) ?[]u8 {
+        const Resp = generated.describe_acls_response.DescribeAclsResponse;
+        const resp = Resp{
+            .throttle_time_ms = 0,
+            .error_code = @intFromEnum(err_code),
+            .error_message = "Not authorized",
+            .resources = &.{},
+        };
+        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+    }
+
+    fn handleCreateAclsAuthorizationError(
+        self: *Broker,
+        request_bytes: []const u8,
+        body_start: usize,
+        req_header: *const RequestHeader,
+        api_version: i16,
+        resp_header_version: i16,
+        err_code: ErrorCode,
+    ) ?[]u8 {
+        const Req = generated.create_acls_request.CreateAclsRequest;
+        const Resp = generated.create_acls_response.CreateAclsResponse;
+        const Result = Resp.AclCreationResult;
+
+        var pos = body_start;
+        var req = Req.deserialize(self.allocator, request_bytes, &pos, api_version) catch |err| {
+            log.warn("Failed to decode denied CreateAcls request: {}", .{err});
+            return null;
+        };
+        defer self.freeCreateAclsRequest(&req);
+
+        const results = self.allocator.alloc(Result, req.creations.len) catch return null;
+        defer if (results.len > 0) self.allocator.free(results);
+        for (results) |*result| {
+            result.* = .{
+                .error_code = @intFromEnum(err_code),
+                .error_message = "Not authorized",
+            };
+        }
+
+        const resp = Resp{
+            .throttle_time_ms = 0,
+            .results = results,
+        };
+        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+    }
+
+    fn handleDeleteAclsAuthorizationError(
+        self: *Broker,
+        request_bytes: []const u8,
+        body_start: usize,
+        req_header: *const RequestHeader,
+        api_version: i16,
+        resp_header_version: i16,
+        err_code: ErrorCode,
+    ) ?[]u8 {
+        const Req = generated.delete_acls_request.DeleteAclsRequest;
+        const Resp = generated.delete_acls_response.DeleteAclsResponse;
+        const FilterResult = Resp.DeleteAclsFilterResult;
+
+        var pos = body_start;
+        var req = Req.deserialize(self.allocator, request_bytes, &pos, api_version) catch |err| {
+            log.warn("Failed to decode denied DeleteAcls request: {}", .{err});
+            return null;
+        };
+        defer self.freeDeleteAclsRequest(&req);
+
+        const filter_results = self.allocator.alloc(FilterResult, req.filters.len) catch return null;
+        defer if (filter_results.len > 0) self.allocator.free(filter_results);
+        for (filter_results) |*result| {
+            result.* = .{
+                .error_code = @intFromEnum(err_code),
+                .error_message = "Not authorized",
+                .matching_acls = &.{},
+            };
+        }
+
+        const resp = Resp{
+            .throttle_time_ms = 0,
+            .filter_results = filter_results,
+        };
+        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+    }
+
+    fn handleGenericAuthorizationError(self: *Broker, req_header: *const RequestHeader, resp_header_version: i16, err_code: ErrorCode) ?[]u8 {
         var buf = self.allocator.alloc(u8, 64) catch return null;
         var wpos: usize = 0;
         const resp_header = ResponseHeader{ .correlation_id = req_header.correlation_id };
         resp_header.serialize(buf, &wpos, resp_header_version);
-        // Error code 29 = TOPIC_AUTHORIZATION_FAILED
-        ser.writeI16(buf, &wpos, 29);
+        ser.writeI16(buf, &wpos, @intFromEnum(err_code));
         if (resp_header_version >= 1) ser.writeEmptyTaggedFields(buf, &wpos);
         return (self.allocator.realloc(buf, wpos) catch buf)[0..wpos];
     }
@@ -19434,6 +19546,46 @@ test "Broker.handleRequest DescribeAcls rejects truncated request" {
     try testing.expect(broker.handleRequest(buf[0..req_len]) == null);
 }
 
+test "Broker.handleRequest DescribeAcls authorization denial uses generated response" {
+    const Req = generated.describe_acls_request.DescribeAclsRequest;
+    const Resp = generated.describe_acls_response.DescribeAclsResponse;
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+    try broker.authorizer.addAcl("other-client", .cluster, "*", .literal, .describe, .allow, "*");
+
+    const req = Req{
+        .resource_type_filter = @intFromEnum(Authorizer.ResourceType.topic),
+        .resource_name_filter = "acl-denied-topic",
+        .pattern_type_filter = @intFromEnum(Authorizer.PatternType.literal),
+        .principal_filter = "User:alice",
+        .host_filter = "*",
+        .operation = @intFromEnum(Authorizer.Operation.read),
+        .permission_type = @intFromEnum(Authorizer.Permission.allow),
+    };
+
+    var buf: [512]u8 = undefined;
+    var pos = buildTestRequest(&buf, 29, 2, 2905, header_mod.requestHeaderVersion(29, 2));
+    req.serialize(&buf, &pos, 2);
+
+    const response = broker.handleRequest(buf[0..pos]);
+    try testing.expect(response != null);
+    defer testing.allocator.free(response.?);
+
+    var rpos: usize = 0;
+    var response_header = try ResponseHeader.deserialize(testing.allocator, response.?, &rpos, header_mod.responseHeaderVersion(29, 2));
+    defer response_header.deinit(testing.allocator);
+    try testing.expectEqual(@as(i32, 2905), response_header.correlation_id);
+
+    const resp = try Resp.deserialize(testing.allocator, response.?, &rpos, 2);
+    defer if (resp.resources.len > 0) testing.allocator.free(resp.resources);
+
+    try testing.expectEqual(response.?.len, rpos);
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.cluster_authorization_failed)), resp.error_code);
+    try testing.expect(resp.error_message != null);
+    try testing.expectEqual(@as(usize, 0), resp.resources.len);
+}
+
 test "Broker.handleRequest CreateAcls v2 returns generated response and stores ACL" {
     const Req = generated.create_acls_request.CreateAclsRequest;
     const Resp = generated.create_acls_response.CreateAclsResponse;
@@ -19523,6 +19675,48 @@ test "Broker.handleRequest CreateAcls rejects truncated request" {
     var buf: [128]u8 = undefined;
     const req_len = buildTestRequest(&buf, 30, 2, 3004, header_mod.requestHeaderVersion(30, 2));
     try testing.expect(broker.handleRequest(buf[0..req_len]) == null);
+}
+
+test "Broker.handleRequest CreateAcls authorization denial uses generated response" {
+    const Req = generated.create_acls_request.CreateAclsRequest;
+    const Resp = generated.create_acls_response.CreateAclsResponse;
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+    try broker.authorizer.addAcl("other-client", .cluster, "*", .literal, .alter, .allow, "*");
+
+    const creations = [_]Req.AclCreation{.{
+        .resource_type = @intFromEnum(Authorizer.ResourceType.topic),
+        .resource_name = "acl-denied-topic",
+        .resource_pattern_type = @intFromEnum(Authorizer.PatternType.literal),
+        .principal = "User:alice",
+        .host = "*",
+        .operation = @intFromEnum(Authorizer.Operation.read),
+        .permission_type = @intFromEnum(Authorizer.Permission.allow),
+    }};
+    const req = Req{ .creations = &creations };
+
+    var buf: [512]u8 = undefined;
+    var pos = buildTestRequest(&buf, 30, 2, 3005, header_mod.requestHeaderVersion(30, 2));
+    req.serialize(&buf, &pos, 2);
+
+    const response = broker.handleRequest(buf[0..pos]);
+    try testing.expect(response != null);
+    defer testing.allocator.free(response.?);
+
+    var rpos: usize = 0;
+    var response_header = try ResponseHeader.deserialize(testing.allocator, response.?, &rpos, header_mod.responseHeaderVersion(30, 2));
+    defer response_header.deinit(testing.allocator);
+    try testing.expectEqual(@as(i32, 3005), response_header.correlation_id);
+
+    const resp = try Resp.deserialize(testing.allocator, response.?, &rpos, 2);
+    defer if (resp.results.len > 0) testing.allocator.free(resp.results);
+
+    try testing.expectEqual(response.?.len, rpos);
+    try testing.expectEqual(@as(usize, 1), resp.results.len);
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.cluster_authorization_failed)), resp.results[0].error_code);
+    try testing.expect(resp.results[0].error_message != null);
+    try testing.expectEqual(@as(usize, 1), broker.authorizer.aclCount());
 }
 
 test "Broker.handleRequest DeleteAcls v2 returns generated matching ACL details" {
@@ -19632,6 +19826,49 @@ test "Broker.handleRequest DeleteAcls rejects truncated request" {
     var buf: [128]u8 = undefined;
     const req_len = buildTestRequest(&buf, 31, 2, 3104, header_mod.requestHeaderVersion(31, 2));
     try testing.expect(broker.handleRequest(buf[0..req_len]) == null);
+}
+
+test "Broker.handleRequest DeleteAcls authorization denial uses generated response" {
+    const Req = generated.delete_acls_request.DeleteAclsRequest;
+    const Resp = generated.delete_acls_response.DeleteAclsResponse;
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+    try broker.authorizer.addAcl("User:bob", .topic, "acl-delete-denied-topic", .literal, .read, .allow, "*");
+
+    const filters = [_]Req.DeleteAclsFilter{.{
+        .resource_type_filter = @intFromEnum(Authorizer.ResourceType.topic),
+        .resource_name_filter = "acl-delete-denied-topic",
+        .pattern_type_filter = @intFromEnum(Authorizer.PatternType.literal),
+        .principal_filter = "User:bob",
+        .host_filter = "*",
+        .operation = @intFromEnum(Authorizer.Operation.read),
+        .permission_type = @intFromEnum(Authorizer.Permission.allow),
+    }};
+    const req = Req{ .filters = &filters };
+
+    var buf: [512]u8 = undefined;
+    var pos = buildTestRequest(&buf, 31, 2, 3105, header_mod.requestHeaderVersion(31, 2));
+    req.serialize(&buf, &pos, 2);
+
+    const response = broker.handleRequest(buf[0..pos]);
+    try testing.expect(response != null);
+    defer testing.allocator.free(response.?);
+
+    var rpos: usize = 0;
+    var response_header = try ResponseHeader.deserialize(testing.allocator, response.?, &rpos, header_mod.responseHeaderVersion(31, 2));
+    defer response_header.deinit(testing.allocator);
+    try testing.expectEqual(@as(i32, 3105), response_header.correlation_id);
+
+    const resp = try Resp.deserialize(testing.allocator, response.?, &rpos, 2);
+    defer if (resp.filter_results.len > 0) testing.allocator.free(resp.filter_results);
+
+    try testing.expectEqual(response.?.len, rpos);
+    try testing.expectEqual(@as(usize, 1), resp.filter_results.len);
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.cluster_authorization_failed)), resp.filter_results[0].error_code);
+    try testing.expect(resp.filter_results[0].error_message != null);
+    try testing.expectEqual(@as(usize, 0), resp.filter_results[0].matching_acls.len);
+    try testing.expectEqual(@as(usize, 1), broker.authorizer.aclCount());
 }
 
 test "Broker restores ACLs from S3 cluster metadata log" {
