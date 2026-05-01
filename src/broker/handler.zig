@@ -3686,6 +3686,9 @@ pub const Broker = struct {
     ) ?[]u8 {
         const err_code = authorizationErrorCode(resource_type);
         return switch (api_key) {
+            22 => self.handleInitProducerIdAuthorizationError(req_header, api_version, resp_header_version, err_code),
+            25 => self.handleAddOffsetsToTxnAuthorizationError(req_header, api_version, resp_header_version, err_code),
+            26 => self.handleEndTxnAuthorizationError(req_header, api_version, resp_header_version, err_code),
             29 => self.handleDescribeAclsAuthorizationError(req_header, api_version, resp_header_version, err_code),
             30 => self.handleCreateAclsAuthorizationError(request_bytes, body_start, req_header, api_version, resp_header_version, err_code),
             31 => self.handleDeleteAclsAuthorizationError(request_bytes, body_start, req_header, api_version, resp_header_version, err_code),
@@ -3776,6 +3779,35 @@ pub const Broker = struct {
         const resp = Resp{
             .throttle_time_ms = 0,
             .filter_results = filter_results,
+        };
+        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+    }
+
+    fn handleInitProducerIdAuthorizationError(self: *Broker, req_header: *const RequestHeader, api_version: i16, resp_header_version: i16, err_code: ErrorCode) ?[]u8 {
+        const Resp = generated.init_producer_id_response.InitProducerIdResponse;
+        const resp = Resp{
+            .throttle_time_ms = 0,
+            .error_code = @intFromEnum(err_code),
+            .producer_id = -1,
+            .producer_epoch = -1,
+        };
+        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+    }
+
+    fn handleAddOffsetsToTxnAuthorizationError(self: *Broker, req_header: *const RequestHeader, api_version: i16, resp_header_version: i16, err_code: ErrorCode) ?[]u8 {
+        const Resp = generated.add_offsets_to_txn_response.AddOffsetsToTxnResponse;
+        const resp = Resp{
+            .throttle_time_ms = 0,
+            .error_code = @intFromEnum(err_code),
+        };
+        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+    }
+
+    fn handleEndTxnAuthorizationError(self: *Broker, req_header: *const RequestHeader, api_version: i16, resp_header_version: i16, err_code: ErrorCode) ?[]u8 {
+        const Resp = generated.end_txn_response.EndTxnResponse;
+        const resp = Resp{
+            .throttle_time_ms = 0,
+            .error_code = @intFromEnum(err_code),
         };
         return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
     }
@@ -24940,6 +24972,42 @@ test "Broker.handleRequest InitProducerId rejects truncated request" {
     try testing.expect(broker.handleRequest(buf[0..req_len]) == null);
 }
 
+test "Broker.handleRequest InitProducerId authorization denial uses generated response" {
+    const Req = generated.init_producer_id_request.InitProducerIdRequest;
+    const Resp = generated.init_producer_id_response.InitProducerIdResponse;
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+    try broker.authorizer.addAcl("other-client", .transactional_id, "*", .literal, .write, .allow, "*");
+
+    const req = Req{
+        .transactional_id = "init-auth-denied",
+        .transaction_timeout_ms = 60000,
+        .producer_id = -1,
+        .producer_epoch = -1,
+    };
+
+    var buf: [512]u8 = undefined;
+    var pos = buildTestRequest(&buf, 22, 4, 2207, header_mod.requestHeaderVersion(22, 4));
+    req.serialize(&buf, &pos, 4);
+
+    const response = broker.handleRequest(buf[0..pos]);
+    try testing.expect(response != null);
+    defer testing.allocator.free(response.?);
+
+    var rpos: usize = 0;
+    var response_header = try ResponseHeader.deserialize(testing.allocator, response.?, &rpos, header_mod.responseHeaderVersion(22, 4));
+    defer response_header.deinit(testing.allocator);
+    try testing.expectEqual(@as(i32, 2207), response_header.correlation_id);
+
+    const resp = try Resp.deserialize(testing.allocator, response.?, &rpos, 4);
+    try testing.expectEqual(response.?.len, rpos);
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.transactional_id_authorization_failed)), resp.error_code);
+    try testing.expectEqual(@as(i64, -1), resp.producer_id);
+    try testing.expectEqual(@as(i16, -1), resp.producer_epoch);
+    try testing.expectEqual(@as(usize, 0), broker.txn_coordinator.transactionCount());
+}
+
 test "Broker.handleRequest AddPartitionsToTxn v4 returns generated response and registers partitions" {
     const Req = generated.add_partitions_to_txn_request.AddPartitionsToTxnRequest;
     const Topic = generated.add_partitions_to_txn_request.AddPartitionsToTxnTopic;
@@ -25409,6 +25477,39 @@ test "Broker.handleRequest AddOffsetsToTxn rejects truncated request" {
     try testing.expect(broker.handleRequest(buf[0..req_len]) == null);
 }
 
+test "Broker.handleRequest AddOffsetsToTxn authorization denial uses generated response" {
+    const Req = generated.add_offsets_to_txn_request.AddOffsetsToTxnRequest;
+    const Resp = generated.add_offsets_to_txn_response.AddOffsetsToTxnResponse;
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+    try broker.authorizer.addAcl("other-client", .transactional_id, "*", .literal, .write, .allow, "*");
+
+    const req = Req{
+        .transactional_id = "add-offsets-auth-denied",
+        .producer_id = 1,
+        .producer_epoch = 0,
+        .group_id = "add-offsets-auth-denied-group",
+    };
+
+    var buf: [512]u8 = undefined;
+    var pos = buildTestRequest(&buf, 25, 3, 2509, header_mod.requestHeaderVersion(25, 3));
+    req.serialize(&buf, &pos, 3);
+
+    const response = broker.handleRequest(buf[0..pos]);
+    try testing.expect(response != null);
+    defer testing.allocator.free(response.?);
+
+    var rpos: usize = 0;
+    var response_header = try ResponseHeader.deserialize(testing.allocator, response.?, &rpos, header_mod.responseHeaderVersion(25, 3));
+    defer response_header.deinit(testing.allocator);
+    try testing.expectEqual(@as(i32, 2509), response_header.correlation_id);
+
+    const resp = try Resp.deserialize(testing.allocator, response.?, &rpos, 3);
+    try testing.expectEqual(response.?.len, rpos);
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.transactional_id_authorization_failed)), resp.error_code);
+}
+
 test "Broker.handleRequest EndTxn v3 returns generated response and completes transaction" {
     const Req = generated.end_txn_request.EndTxnRequest;
     const Resp = generated.end_txn_response.EndTxnResponse;
@@ -25643,6 +25744,39 @@ test "Broker.handleRequest EndTxn rejects truncated request" {
     var buf: [128]u8 = undefined;
     const req_len = buildTestRequest(&buf, 26, 3, 2604, header_mod.requestHeaderVersion(26, 3));
     try testing.expect(broker.handleRequest(buf[0..req_len]) == null);
+}
+
+test "Broker.handleRequest EndTxn authorization denial uses generated response" {
+    const Req = generated.end_txn_request.EndTxnRequest;
+    const Resp = generated.end_txn_response.EndTxnResponse;
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+    try broker.authorizer.addAcl("other-client", .transactional_id, "*", .literal, .write, .allow, "*");
+
+    const req = Req{
+        .transactional_id = "end-txn-auth-denied",
+        .producer_id = 1,
+        .producer_epoch = 0,
+        .committed = true,
+    };
+
+    var buf: [512]u8 = undefined;
+    var pos = buildTestRequest(&buf, 26, 3, 2607, header_mod.requestHeaderVersion(26, 3));
+    req.serialize(&buf, &pos, 3);
+
+    const response = broker.handleRequest(buf[0..pos]);
+    try testing.expect(response != null);
+    defer testing.allocator.free(response.?);
+
+    var rpos: usize = 0;
+    var response_header = try ResponseHeader.deserialize(testing.allocator, response.?, &rpos, header_mod.responseHeaderVersion(26, 3));
+    defer response_header.deinit(testing.allocator);
+    try testing.expectEqual(@as(i32, 2607), response_header.correlation_id);
+
+    const resp = try Resp.deserialize(testing.allocator, response.?, &rpos, 3);
+    try testing.expectEqual(response.?.len, rpos);
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.transactional_id_authorization_failed)), resp.error_code);
 }
 
 test "Broker.isVersionSupported" {
