@@ -359,17 +359,7 @@ pub const S3Client = struct {
         var response = try self.sendRequest("GET", path, "", null, range_header, max_response_size);
         defer response.deinit(self.allocator);
 
-        // 206 = Partial Content, 200 = Full content
-        if (response.status != 206 and response.status != 200) return error.S3GetFailed;
-        if (response.status == 206) {
-            const content_range = headerValue(response.headers(), "Content-Range") orelse
-                return error.S3RangeContentRangeMismatch;
-            if (!contentRangeMatches(content_range, offset, length)) {
-                return error.S3RangeContentRangeMismatch;
-            }
-        }
-
-        const result = try self.exactRangeBody(response.status, offset, length, try self.responseBodyOwned(&response));
+        const result = try self.rangeBodyFromResponse(&response, offset, length);
         self.get_count += 1;
         self.bytes_downloaded += result.len;
         return result;
@@ -904,6 +894,19 @@ pub const S3Client = struct {
         return try self.allocator.dupe(u8, response.body());
     }
 
+    fn rangeBodyFromResponse(self: *S3Client, response: *const HttpResponse, requested_offset: u64, requested_length: u64) ![]u8 {
+        // 206 = Partial Content, 200 = Full content.
+        if (response.status != 206 and response.status != 200) return error.S3GetFailed;
+        if (response.status == 206) {
+            const content_range = headerValue(response.headers(), "Content-Range") orelse
+                return error.S3RangeContentRangeMismatch;
+            if (!contentRangeMatches(content_range, requested_offset, requested_length)) {
+                return error.S3RangeContentRangeMismatch;
+            }
+        }
+        return try self.exactRangeBody(response.status, requested_offset, requested_length, try self.responseBodyOwned(response));
+    }
+
     fn exactRangeBody(self: *S3Client, status: u16, requested_offset: u64, requested_length: u64, body: []u8) ![]u8 {
         errdefer self.allocator.free(body);
 
@@ -1258,6 +1261,56 @@ test "S3Client validates partial content range window" {
     try testing.expect(!S3Client.contentRangeMatches("bytes 11-15/100", 10, 5));
     try testing.expect(!S3Client.contentRangeMatches("items 10-14/100", 10, 5));
     try testing.expect(!S3Client.contentRangeMatches("bytes */100", 10, 5));
+}
+
+fn makeHttpResponse(alloc: Allocator, status: u16, raw: []const u8) !S3Client.HttpResponse {
+    const data = try alloc.dupe(u8, raw);
+    errdefer alloc.free(data);
+    const header_end = std.mem.indexOf(u8, data, "\r\n\r\n") orelse return error.S3RequestFailed;
+    return .{
+        .data = data,
+        .status = status,
+        .header_end = header_end,
+    };
+}
+
+test "S3Client range response fails closed on missing or mismatched Content-Range" {
+    var client = S3Client.init(testing.allocator, .{});
+
+    {
+        var response = try makeHttpResponse(
+            testing.allocator,
+            206,
+            "HTTP/1.1 206 Partial Content\r\nContent-Range: bytes 10-14/100\r\n\r\nrange",
+        );
+        defer response.deinit(testing.allocator);
+
+        const body = try client.rangeBodyFromResponse(&response, 10, 5);
+        defer testing.allocator.free(body);
+        try testing.expectEqualStrings("range", body);
+    }
+
+    {
+        var response = try makeHttpResponse(
+            testing.allocator,
+            206,
+            "HTTP/1.1 206 Partial Content\r\n\r\nrange",
+        );
+        defer response.deinit(testing.allocator);
+
+        try testing.expectError(error.S3RangeContentRangeMismatch, client.rangeBodyFromResponse(&response, 10, 5));
+    }
+
+    {
+        var response = try makeHttpResponse(
+            testing.allocator,
+            206,
+            "HTTP/1.1 206 Partial Content\r\nContent-Range: bytes 11-15/100\r\n\r\nrange",
+        );
+        defer response.deinit(testing.allocator);
+
+        try testing.expectError(error.S3RangeContentRangeMismatch, client.rangeBodyFromResponse(&response, 10, 5));
+    }
 }
 
 test "S3Client multipart ETag validation" {
