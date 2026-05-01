@@ -3370,6 +3370,13 @@ pub const Broker = struct {
             return self.handleShutdownReject(&req_header, resp_header_version);
         }
 
+        // Validate API version before authorization, so ACL denial builders never
+        // serialize responses with unsupported schema versions.
+        if (api_key != 18 and !isVersionSupported(api_key, api_version) and !isFailClosedGeneratedVersionSupported(api_key, api_version)) {
+            log.warn("Unsupported version: api_key={d} v={d}", .{ api_key, api_version });
+            return self.handleUnsupported(&req_header, api_key, resp_header_version);
+        }
+
         // Auth/ACL check before dispatch
         if (self.authorizer.aclCount() > 0 or !self.authorizer.allow_everyone_if_no_acl) {
             const client_id = req_header.client_id orelse "anonymous";
@@ -3385,12 +3392,6 @@ pub const Broker = struct {
                     return self.handleAuthorizationError(request_bytes, pos, &req_header, api_key, api_version, resp_header_version, resource_type);
                 }
             }
-        }
-
-        // Validate API version is within supported range
-        if (api_key != 18 and !isVersionSupported(api_key, api_version) and !isFailClosedGeneratedVersionSupported(api_key, api_version)) {
-            log.warn("Unsupported version: api_key={d} v={d}", .{ api_key, api_version });
-            return self.handleUnsupported(&req_header, api_key, resp_header_version);
         }
 
         // Track metrics — per-API and total
@@ -17119,6 +17120,28 @@ test "Broker.handleRequest advertised APIs reject versions above catalog max bef
         try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.unsupported_version)), ser.readI16(response.?, &rpos));
         try testing.expectEqual(response.?.len, rpos);
     }
+}
+
+test "Broker.handleRequest unsupported versions bypass ACL denial response builders" {
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+    try broker.authorizer.addAcl("other-client", .transactional_id, "*", .literal, .write, .allow, "*");
+
+    const api_key: i16 = 22;
+    const unsupported_version: i16 = 5;
+    var buf: [128]u8 = undefined;
+    const req_len = buildTestRequest(&buf, api_key, unsupported_version, 2208, header_mod.requestHeaderVersion(api_key, unsupported_version));
+
+    const response = broker.handleRequest(buf[0..req_len]);
+    try testing.expect(response != null);
+    defer testing.allocator.free(response.?);
+
+    var rpos: usize = 0;
+    var response_header = try ResponseHeader.deserialize(testing.allocator, response.?, &rpos, header_mod.responseHeaderVersion(api_key, unsupported_version));
+    defer response_header.deinit(testing.allocator);
+    try testing.expectEqual(@as(i32, 2208), response_header.correlation_id);
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.unsupported_version)), ser.readI16(response.?, &rpos));
+    try testing.expectEqual(response.?.len, rpos);
 }
 
 test "Broker.handleRequest FindCoordinator v1 returns generated coordinator" {
