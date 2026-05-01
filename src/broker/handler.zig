@@ -3631,10 +3631,10 @@ pub const Broker = struct {
     /// Map API key to the corresponding ACL resource type (fix #7).
     fn resourceTypeForApiKey(api_key: i16) Authorizer.ResourceType {
         return switch (api_key) {
-            0, 1, 2 => .topic, // Produce, Fetch, ListOffsets
+            0, 1, 2, 21, 23, 61 => .topic, // Produce, Fetch, ListOffsets, DeleteRecords, OffsetForLeaderEpoch, DescribeProducers
             8, 9, 10, 11, 12, 13, 14, 15, 16, 42, 47, 69 => .group, // group-related
-            22, 24, 26, 27, 28, 65, 66 => .transactional_id, // txn-related
-            3, 18, 19, 20, 32, 33, 35, 37, 43, 44, 45, 46, 48, 49, 50, 51, 57, 71, 72, 74, 75 => .cluster, // metadata/admin
+            22, 24, 25, 26, 27, 28, 65, 66 => .transactional_id, // txn-related
+            3, 18, 19, 20, 29, 30, 31, 32, 33, 35, 37, 43, 44, 45, 46, 48, 49, 50, 51, 52, 53, 54, 55, 57, 60, 71, 72, 74, 75 => .cluster, // metadata/admin/quorum
             501...519, 600...602 => .cluster, // AutoMQ stream/object/controller extensions
             else => .unknown,
         };
@@ -3650,12 +3650,13 @@ pub const Broker = struct {
             8 => .read, // OffsetCommit
             10, 11, 12, 13, 14 => .read, // Group ops
             19, 37 => .create, // CreateTopics, CreatePartitions
-            20, 42, 47 => .delete, // DeleteTopics, DeleteGroups, OffsetDelete
-            22, 24, 26, 27, 28 => .write, // Txn ops
+            20, 21, 42, 47 => .delete, // DeleteTopics, DeleteRecords, DeleteGroups, OffsetDelete
+            22, 24, 25, 26, 27, 28 => .write, // Txn ops
             30 => .alter, // CreateAcls
             31 => .alter, // DeleteAcls
             33, 43, 44, 45, 49, 51, 57, 72 => .alter, // Alter/admin APIs
-            501, 502, 503, 508, 514, 516, 518, 601 => .describe, // AutoMQ reads/lifecycle probes
+            52, 53, 54 => .cluster_action, // KRaft quorum mutations
+            501, 502, 503, 508, 509, 514, 516, 518, 601 => .describe, // AutoMQ reads/lifecycle probes
             504, 511 => .delete, // AutoMQ deletes
             505, 506, 507, 510, 512, 513, 515, 517, 519, 600, 602 => .alter, // AutoMQ mutations
             else => .any,
@@ -19335,6 +19336,7 @@ test "Broker.handleRequest DescribeAcls v2 returns generated filtered ACLs" {
 
     var broker = Broker.init(testing.allocator, 1, 9092);
     defer broker.deinit();
+    try broker.authorizer.addSuperUser("test-client");
     try broker.authorizer.addAcl("User:alice", .topic, "acl-desc-topic", .literal, .read, .allow, "*");
     try broker.authorizer.addAcl("User:bob", .topic, "acl-desc-topic", .literal, .write, .allow, "*");
 
@@ -19389,6 +19391,7 @@ test "Broker.handleRequest DescribeAcls returns invalid_request for unknown enum
 
     var broker = Broker.init(testing.allocator, 1, 9092);
     defer broker.deinit();
+    try broker.authorizer.addSuperUser("test-client");
     try broker.authorizer.addAcl("User:alice", .topic, "acl-desc-topic", .literal, .read, .allow, "*");
 
     const req = Req{
@@ -19528,6 +19531,7 @@ test "Broker.handleRequest DeleteAcls v2 returns generated matching ACL details"
 
     var broker = Broker.init(testing.allocator, 1, 9092);
     defer broker.deinit();
+    try broker.authorizer.addSuperUser("test-client");
     try broker.authorizer.addAcl("User:bob", .topic, "acl-delete-topic", .literal, .read, .allow, "*");
 
     const filters = [_]Req.DeleteAclsFilter{.{
@@ -19579,6 +19583,7 @@ test "Broker.handleRequest DeleteAcls returns invalid_request for unknown enum" 
 
     var broker = Broker.init(testing.allocator, 1, 9092);
     defer broker.deinit();
+    try broker.authorizer.addSuperUser("test-client");
     try broker.authorizer.addAcl("User:bob", .topic, "acl-delete-topic", .literal, .read, .allow, "*");
 
     const filters = [_]Req.DeleteAclsFilter{.{
@@ -19688,6 +19693,7 @@ test "Broker restores ACLs from S3 cluster metadata log" {
         broker.store.s3_wal_batcher = storage.wal.S3WalBatcher.init(testing.allocator);
 
         try broker.open();
+        try broker.authorizer.addSuperUser("test-client");
         try testing.expectEqual(@as(usize, 1), broker.authorizer.aclCount());
 
         const req = DescribeReq{
@@ -19795,6 +19801,7 @@ test "Broker DeleteAcls rolls back when ACL snapshot S3 WAL write fails" {
     broker.store.s3_wal_batcher = storage.wal.S3WalBatcher.init(testing.allocator);
 
     try broker.open();
+    try broker.authorizer.addSuperUser("test-client");
     try broker.authorizer.addAcl("User:delete-fail", .topic, "acl-delete-s3-fail", .literal, .read, .allow, "*");
     try broker.writeAclSnapshotRecord();
     const object_count_before = mock_s3.objectCount();
@@ -31114,6 +31121,35 @@ test "Broker extractResponseErrorCode returns 0 for Produce" {
     @memset(&resp, 0);
     const ec = Broker.extractResponseErrorCode(&resp, 0, 0, 0);
     try testing.expectEqual(@as(i16, 0), ec);
+}
+
+test "Broker advertised APIs have ACL resource and operation mappings" {
+    for (api_support.broker_supported_apis) |api| {
+        // SASL protocol messages run before an authenticated Kafka principal
+        // exists, so they are intentionally not routed through ACL resources.
+        if (api.key == 17 or api.key == 36) continue;
+
+        try testing.expect(Broker.resourceTypeForApiKey(api.key) != .unknown);
+        try testing.expect(Broker.operationForApiKey(api.key) != .any);
+        try testing.expect(Broker.operationForApiKey(api.key) != .unknown);
+    }
+}
+
+test "Broker ACL mappings cover previously unmapped advertised APIs" {
+    try testing.expectEqual(Authorizer.ResourceType.topic, Broker.resourceTypeForApiKey(21));
+    try testing.expectEqual(Authorizer.Operation.delete, Broker.operationForApiKey(21));
+
+    try testing.expectEqual(Authorizer.ResourceType.transactional_id, Broker.resourceTypeForApiKey(25));
+    try testing.expectEqual(Authorizer.Operation.write, Broker.operationForApiKey(25));
+
+    try testing.expectEqual(Authorizer.ResourceType.cluster, Broker.resourceTypeForApiKey(30));
+    try testing.expectEqual(Authorizer.Operation.alter, Broker.operationForApiKey(30));
+
+    try testing.expectEqual(Authorizer.ResourceType.cluster, Broker.resourceTypeForApiKey(52));
+    try testing.expectEqual(Authorizer.Operation.cluster_action, Broker.operationForApiKey(52));
+
+    try testing.expectEqual(Authorizer.ResourceType.cluster, Broker.resourceTypeForApiKey(60));
+    try testing.expectEqual(Authorizer.Operation.describe, Broker.operationForApiKey(60));
 }
 
 test "Broker json_logger is initialized" {
