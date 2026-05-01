@@ -638,7 +638,7 @@ pub fn main(init: std.process.Init) !void {
         }
         // Signal readiness after all setup is complete
         if (global_metrics_server) |ms| {
-            ms.startup_complete = true;
+            ms.markStartupComplete();
         }
         server.serve() catch |err| {
             log.info("Broker server stopped: {}", .{err});

@@ -552,12 +552,22 @@ test "MetricsServer /ready probe transitions from 503 to 200" {
 
     var ms = MetricsServer.init(alloc, 9090, &registry);
 
-    // Initially not ready — /ready should return 503
-    try testing.expect(!ms.startup_complete);
+    // Initially not ready — /ready should return 503.
+    const starting = ms.readinessResponse();
+    try testing.expectEqualStrings("503 Service Unavailable", starting.status);
+    try testing.expectEqualStrings("NOT READY\n", starting.body);
 
-    // After startup completes — /ready should return 200
-    ms.startup_complete = true;
-    try testing.expect(ms.startup_complete);
+    // After startup completes — /ready should return 200.
+    ms.markStartupComplete();
+    const ready = ms.readinessResponse();
+    try testing.expectEqualStrings("200 OK", ready.status);
+    try testing.expectEqualStrings("READY\n", ready.body);
+
+    // Graceful shutdown removes readiness before the listener exits.
+    ms.stop();
+    const shutting_down = ms.readinessResponse();
+    try testing.expectEqualStrings("503 Service Unavailable", shutting_down.status);
+    try testing.expectEqualStrings("NOT READY\n", shutting_down.body);
 
     // Verify running flag defaults to false (server not yet started)
     try testing.expect(!ms.running);

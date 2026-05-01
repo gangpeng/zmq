@@ -17,6 +17,23 @@ const log = std.log.scoped(.metrics_server);
 /// is set, connections are wrapped with SSL (blocking handshake since
 /// metrics is simple request/response).
 pub const MetricsServer = struct {
+    pub const ProbeResponse = struct {
+        status: []const u8,
+        content_type: []const u8,
+        body: []const u8,
+    };
+
+    pub const ReadinessState = enum {
+        starting,
+        ready,
+        shutting_down,
+    };
+
+    const Route = union(enum) {
+        static: ProbeResponse,
+        metrics,
+    };
+
     port: u16,
     registry: *MetricRegistry,
     allocator: Allocator,
@@ -25,6 +42,8 @@ pub const MetricsServer = struct {
     /// Set to true once the broker has completed startup (listening, metrics registered).
     /// /ready returns 503 until this is true.
     startup_complete: bool = false,
+    /// Set once graceful shutdown begins. /ready returns 503 while the broker drains.
+    shutting_down: bool = false,
     // NOTE: TLS for the metrics server is available but not wired into main.zig
     // by default. To enable, create a TlsContext and pass it here. Typically
     // metrics endpoints are behind a reverse proxy that terminates TLS, so
@@ -95,21 +114,9 @@ pub const MetricsServer = struct {
         if (req_len == 0) return;
         const request = req_buf[0..req_len];
 
-        // Route request
-        if (std.mem.startsWith(u8, request, "GET /health")) {
-            // Liveness: 200 if the event loop is responsive (reaching here proves it)
-            self.sendPlainResponse(client, "200 OK", "text/plain", "OK\n");
-        } else if (std.mem.startsWith(u8, request, "GET /ready")) {
-            // Readiness: 503 until startup_complete is set
-            if (self.startup_complete) {
-                self.sendPlainResponse(client, "200 OK", "text/plain", "READY\n");
-            } else {
-                self.sendPlainResponse(client, "503 Service Unavailable", "text/plain", "NOT READY\n");
-            }
-        } else if (std.mem.startsWith(u8, request, "GET /metrics")) {
-            self.servePlainMetrics(client);
-        } else {
-            self.sendPlainResponse(client, "404 Not Found", "text/plain", "Not Found\n");
+        switch (self.routeRequest(request)) {
+            .static => |resp| self.sendPlainResponse(client, resp.status, resp.content_type, resp.body),
+            .metrics => self.servePlainMetrics(client),
         }
     }
 
@@ -145,20 +152,73 @@ pub const MetricsServer = struct {
         if (ret <= 0) return;
         const request = req_buf[0..@intCast(ret)];
 
-        // Route request and respond via SSL
-        if (std.mem.startsWith(u8, request, "GET /health")) {
-            self.sendSslResponse(ossl, ssl, "200 OK", "text/plain", "OK\n");
-        } else if (std.mem.startsWith(u8, request, "GET /ready")) {
-            if (self.startup_complete) {
-                self.sendSslResponse(ossl, ssl, "200 OK", "text/plain", "READY\n");
-            } else {
-                self.sendSslResponse(ossl, ssl, "503 Service Unavailable", "text/plain", "NOT READY\n");
-            }
-        } else if (std.mem.startsWith(u8, request, "GET /metrics")) {
-            self.serveSslMetrics(ossl, ssl);
-        } else {
-            self.sendSslResponse(ossl, ssl, "404 Not Found", "text/plain", "Not Found\n");
+        switch (self.routeRequest(request)) {
+            .static => |resp| self.sendSslResponse(ossl, ssl, resp.status, resp.content_type, resp.body),
+            .metrics => self.serveSslMetrics(ossl, ssl),
         }
+    }
+
+    fn routeRequest(self: *const MetricsServer, request: []const u8) Route {
+        const target = requestTarget(request) orelse {
+            return .{ .static = notFoundResponse() };
+        };
+
+        if (std.mem.eql(u8, target, "/health")) {
+            return .{ .static = healthResponse() };
+        }
+        if (std.mem.eql(u8, target, "/ready")) {
+            return .{ .static = self.readinessResponse() };
+        }
+        if (std.mem.eql(u8, target, "/metrics")) {
+            return .metrics;
+        }
+        return .{ .static = notFoundResponse() };
+    }
+
+    fn requestTarget(request: []const u8) ?[]const u8 {
+        if (!std.mem.startsWith(u8, request, "GET ")) return null;
+        const target_start: usize = 4;
+        const target_tail = request[target_start..];
+        const target_len = std.mem.indexOfScalar(u8, target_tail, ' ') orelse return null;
+        if (target_len == 0) return null;
+        return target_tail[0..target_len];
+    }
+
+    fn healthResponse() ProbeResponse {
+        return .{
+            .status = "200 OK",
+            .content_type = "text/plain",
+            .body = "OK\n",
+        };
+    }
+
+    fn notFoundResponse() ProbeResponse {
+        return .{
+            .status = "404 Not Found",
+            .content_type = "text/plain",
+            .body = "Not Found\n",
+        };
+    }
+
+    pub fn readinessState(self: *const MetricsServer) ReadinessState {
+        if (self.shutting_down) return .shutting_down;
+        if (!self.startup_complete) return .starting;
+        return .ready;
+    }
+
+    pub fn readinessResponse(self: *const MetricsServer) ProbeResponse {
+        return switch (self.readinessState()) {
+            .ready => .{
+                .status = "200 OK",
+                .content_type = "text/plain",
+                .body = "READY\n",
+            },
+            .starting, .shutting_down => .{
+                .status = "503 Service Unavailable",
+                .content_type = "text/plain",
+                .body = "NOT READY\n",
+            },
+        };
     }
 
     fn servePlainMetrics(self: *MetricsServer, client: posix.socket_t) void {
@@ -201,7 +261,12 @@ pub const MetricsServer = struct {
     }
 
     pub fn stop(self: *MetricsServer) void {
+        self.shutting_down = true;
         self.running = false;
+    }
+
+    pub fn markStartupComplete(self: *MetricsServer) void {
+        self.startup_complete = true;
     }
 };
 
@@ -217,6 +282,8 @@ test "MetricsServer startup_complete defaults to false" {
 
     const server = MetricsServer.init(testing.allocator, 19090, &registry);
     try testing.expect(!server.startup_complete);
+    try testing.expect(!server.shutting_down);
+    try testing.expectEqual(MetricsServer.ReadinessState.starting, server.readinessState());
 }
 
 test "MetricsServer ready returns 503 when startup not complete" {
@@ -224,12 +291,10 @@ test "MetricsServer ready returns 503 when startup not complete" {
     defer registry.deinit();
 
     var server = MetricsServer.init(testing.allocator, 19090, &registry);
-    // Before startup_complete, readiness should indicate not ready
-    try testing.expect(!server.startup_complete);
-
-    // After setting startup_complete, readiness should indicate ready
-    server.startup_complete = true;
-    try testing.expect(server.startup_complete);
+    const resp = server.readinessResponse();
+    try testing.expectEqualStrings("503 Service Unavailable", resp.status);
+    try testing.expectEqualStrings("text/plain", resp.content_type);
+    try testing.expectEqualStrings("NOT READY\n", resp.body);
 }
 
 test "MetricsServer ready transitions from 503 to 200" {
@@ -238,13 +303,48 @@ test "MetricsServer ready transitions from 503 to 200" {
 
     var server = MetricsServer.init(testing.allocator, 19090, &registry);
 
-    // Phase 1: not ready
-    try testing.expect(!server.startup_complete);
+    try testing.expectEqual(MetricsServer.ReadinessState.starting, server.readinessState());
 
-    // Phase 2: startup completes
-    server.startup_complete = true;
-    try testing.expect(server.startup_complete);
+    server.markStartupComplete();
+    try testing.expectEqual(MetricsServer.ReadinessState.ready, server.readinessState());
+    try testing.expectEqualStrings("200 OK", server.readinessResponse().status);
+    try testing.expectEqualStrings("READY\n", server.readinessResponse().body);
 
-    // Phase 3: remains ready
-    try testing.expect(server.startup_complete);
+    server.stop();
+    try testing.expectEqual(MetricsServer.ReadinessState.shutting_down, server.readinessState());
+    try testing.expectEqualStrings("503 Service Unavailable", server.readinessResponse().status);
+    try testing.expectEqualStrings("NOT READY\n", server.readinessResponse().body);
+}
+
+test "MetricsServer routes fixed probes exactly" {
+    var registry = MetricRegistry.init(testing.allocator);
+    defer registry.deinit();
+
+    var server = MetricsServer.init(testing.allocator, 19090, &registry);
+    server.markStartupComplete();
+
+    const health = server.routeRequest("GET /health HTTP/1.1\r\nHost: localhost\r\n\r\n").static;
+    try testing.expectEqualStrings("200 OK", health.status);
+    try testing.expectEqualStrings("OK\n", health.body);
+
+    const ready = server.routeRequest("GET /ready HTTP/1.1\r\n\r\n").static;
+    try testing.expectEqualStrings("200 OK", ready.status);
+    try testing.expectEqualStrings("READY\n", ready.body);
+
+    const ready_suffix = server.routeRequest("GET /readyz HTTP/1.1\r\n\r\n").static;
+    try testing.expectEqualStrings("404 Not Found", ready_suffix.status);
+
+    const bad_method = server.routeRequest("POST /ready HTTP/1.1\r\n\r\n").static;
+    try testing.expectEqualStrings("404 Not Found", bad_method.status);
+}
+
+test "MetricsServer routes metrics through dynamic exporter" {
+    var registry = MetricRegistry.init(testing.allocator);
+    defer registry.deinit();
+
+    const server = MetricsServer.init(testing.allocator, 19090, &registry);
+    switch (server.routeRequest("GET /metrics HTTP/1.1\r\n\r\n")) {
+        .metrics => {},
+        .static => return error.ExpectedMetricsRoute,
+    }
 }
