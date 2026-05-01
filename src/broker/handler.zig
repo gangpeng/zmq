@@ -3687,7 +3687,10 @@ pub const Broker = struct {
     ) ?[]u8 {
         const err_code = authorizationErrorCode(resource_type);
         return switch (api_key) {
+            2 => self.handleListOffsetsAuthorizationError(request_bytes, body_start, req_header, api_version, resp_header_version, err_code),
+            21 => self.handleDeleteRecordsAuthorizationError(request_bytes, body_start, req_header, api_version, resp_header_version, err_code),
             22 => self.handleInitProducerIdAuthorizationError(req_header, api_version, resp_header_version, err_code),
+            23 => self.handleOffsetForLeaderEpochAuthorizationError(request_bytes, body_start, req_header, api_version, resp_header_version, err_code),
             25 => self.handleAddOffsetsToTxnAuthorizationError(req_header, api_version, resp_header_version, err_code),
             26 => self.handleEndTxnAuthorizationError(req_header, api_version, resp_header_version, err_code),
             29 => self.handleDescribeAclsAuthorizationError(req_header, api_version, resp_header_version, err_code),
@@ -3695,9 +3698,215 @@ pub const Broker = struct {
             31 => self.handleDeleteAclsAuthorizationError(request_bytes, body_start, req_header, api_version, resp_header_version, err_code),
             55 => self.handleDescribeQuorumAuthorizationError(req_header, api_version, resp_header_version, err_code),
             60 => self.handleDescribeClusterAuthorizationError(req_header, api_version, resp_header_version, err_code),
+            61 => self.handleDescribeProducersAuthorizationError(request_bytes, body_start, req_header, api_version, resp_header_version, err_code),
             66 => self.handleListTransactionsAuthorizationError(req_header, api_version, resp_header_version, err_code),
             else => self.handleGenericAuthorizationError(req_header, resp_header_version, err_code),
         };
+    }
+
+    fn handleListOffsetsAuthorizationError(
+        self: *Broker,
+        request_bytes: []const u8,
+        body_start: usize,
+        req_header: *const RequestHeader,
+        api_version: i16,
+        resp_header_version: i16,
+        err_code: ErrorCode,
+    ) ?[]u8 {
+        const Req = generated.list_offsets_request.ListOffsetsRequest;
+        const Resp = generated.list_offsets_response.ListOffsetsResponse;
+        const TopicResult = Resp.ListOffsetsTopicResponse;
+        const PartitionResult = TopicResult.ListOffsetsPartitionResponse;
+
+        if (!validateListOffsetsRequestFrame(request_bytes, body_start, api_version)) {
+            log.warn("Malformed denied ListOffsets request", .{});
+            return null;
+        }
+
+        var pos = body_start;
+        var req = Req.deserialize(self.allocator, request_bytes, &pos, api_version) catch |err| {
+            log.warn("Failed to decode denied ListOffsets request: {}", .{err});
+            return null;
+        };
+        defer self.freeListOffsetsRequest(&req);
+
+        var topics: []TopicResult = &.{};
+        if (req.topics.len > 0) {
+            topics = self.allocator.alloc(TopicResult, req.topics.len) catch return null;
+        }
+        var topics_init: usize = 0;
+        defer {
+            self.freeListOffsetsResponseTopics(topics[0..topics_init], api_version);
+            if (topics.len > 0) self.allocator.free(topics);
+        }
+
+        for (req.topics) |topic_req| {
+            var partitions: []PartitionResult = &.{};
+            if (topic_req.partitions.len > 0) {
+                partitions = self.allocator.alloc(PartitionResult, topic_req.partitions.len) catch return null;
+            }
+            var transferred = false;
+            defer if (!transferred and partitions.len > 0) self.allocator.free(partitions);
+
+            for (topic_req.partitions, 0..) |partition_req, partition_idx| {
+                partitions[partition_idx] = .{
+                    .partition_index = partition_req.partition_index,
+                    .error_code = @intFromEnum(err_code),
+                    .old_style_offsets = &.{},
+                    .timestamp = -1,
+                    .offset = -1,
+                    .leader_epoch = -1,
+                };
+            }
+
+            topics[topics_init] = .{
+                .name = topic_req.name,
+                .partitions = partitions,
+            };
+            topics_init += 1;
+            transferred = true;
+        }
+
+        const resp = Resp{
+            .throttle_time_ms = 0,
+            .topics = topics[0..topics_init],
+        };
+        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+    }
+
+    fn handleDeleteRecordsAuthorizationError(
+        self: *Broker,
+        request_bytes: []const u8,
+        body_start: usize,
+        req_header: *const RequestHeader,
+        api_version: i16,
+        resp_header_version: i16,
+        err_code: ErrorCode,
+    ) ?[]u8 {
+        const Req = generated.delete_records_request.DeleteRecordsRequest;
+        const Resp = generated.delete_records_response.DeleteRecordsResponse;
+        const TopicResult = Resp.DeleteRecordsTopicResult;
+        const PartitionResult = TopicResult.DeleteRecordsPartitionResult;
+
+        if (!validateDeleteRecordsRequestFrame(request_bytes, body_start, api_version)) {
+            log.warn("Malformed denied DeleteRecords request", .{});
+            return null;
+        }
+
+        var pos = body_start;
+        var req = Req.deserialize(self.allocator, request_bytes, &pos, api_version) catch |err| {
+            log.warn("Failed to decode denied DeleteRecords request: {}", .{err});
+            return null;
+        };
+        defer self.freeDeleteRecordsRequest(&req);
+
+        var topics: []TopicResult = &.{};
+        if (req.topics.len > 0) {
+            topics = self.allocator.alloc(TopicResult, req.topics.len) catch return null;
+        }
+        var topics_init: usize = 0;
+        defer {
+            self.freeDeleteRecordsResponseTopics(topics[0..topics_init]);
+            if (topics.len > 0) self.allocator.free(topics);
+        }
+
+        for (req.topics) |topic_req| {
+            var partitions: []PartitionResult = &.{};
+            if (topic_req.partitions.len > 0) {
+                partitions = self.allocator.alloc(PartitionResult, topic_req.partitions.len) catch return null;
+            }
+            var transferred = false;
+            defer if (!transferred and partitions.len > 0) self.allocator.free(partitions);
+
+            for (topic_req.partitions, 0..) |partition_req, partition_idx| {
+                partitions[partition_idx] = .{
+                    .partition_index = partition_req.partition_index,
+                    .low_watermark = -1,
+                    .error_code = @intFromEnum(err_code),
+                };
+            }
+
+            topics[topics_init] = .{
+                .name = topic_req.name,
+                .partitions = partitions,
+            };
+            topics_init += 1;
+            transferred = true;
+        }
+
+        const resp = Resp{
+            .throttle_time_ms = 0,
+            .topics = topics[0..topics_init],
+        };
+        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+    }
+
+    fn handleOffsetForLeaderEpochAuthorizationError(
+        self: *Broker,
+        request_bytes: []const u8,
+        body_start: usize,
+        req_header: *const RequestHeader,
+        api_version: i16,
+        resp_header_version: i16,
+        err_code: ErrorCode,
+    ) ?[]u8 {
+        const Req = generated.offset_for_leader_epoch_request.OffsetForLeaderEpochRequest;
+        const Resp = generated.offset_for_leader_epoch_response.OffsetForLeaderEpochResponse;
+        const TopicResult = Resp.OffsetForLeaderTopicResult;
+        const PartitionResult = TopicResult.EpochEndOffset;
+
+        if (!validateOffsetForLeaderEpochRequestFrame(request_bytes, body_start, api_version)) {
+            log.warn("Malformed denied OffsetForLeaderEpoch request", .{});
+            return null;
+        }
+
+        var pos = body_start;
+        var req = Req.deserialize(self.allocator, request_bytes, &pos, api_version) catch |err| {
+            log.warn("Failed to decode denied OffsetForLeaderEpoch request: {}", .{err});
+            return null;
+        };
+        defer self.freeOffsetForLeaderEpochRequest(&req);
+
+        var topics: []TopicResult = &.{};
+        if (req.topics.len > 0) {
+            topics = self.allocator.alloc(TopicResult, req.topics.len) catch return null;
+        }
+        var topics_init: usize = 0;
+        defer {
+            self.freeOffsetForLeaderEpochTopics(topics[0..topics_init]);
+            if (topics.len > 0) self.allocator.free(topics);
+        }
+
+        for (req.topics) |topic_req| {
+            var partitions: []PartitionResult = &.{};
+            if (topic_req.partitions.len > 0) {
+                partitions = self.allocator.alloc(PartitionResult, topic_req.partitions.len) catch return null;
+            }
+            var transferred = false;
+            defer if (!transferred and partitions.len > 0) self.allocator.free(partitions);
+
+            for (topic_req.partitions, 0..) |partition_req, partition_idx| {
+                partitions[partition_idx] = .{
+                    .error_code = @intFromEnum(err_code),
+                    .partition = partition_req.partition,
+                    .leader_epoch = -1,
+                    .end_offset = -1,
+                };
+            }
+
+            topics[topics_init] = .{
+                .topic = topic_req.topic,
+                .partitions = partitions,
+            };
+            topics_init += 1;
+            transferred = true;
+        }
+
+        const resp = Resp{
+            .throttle_time_ms = 0,
+            .topics = topics[0..topics_init],
+        };
+        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
     }
 
     fn handleDescribeAclsAuthorizationError(self: *Broker, req_header: *const RequestHeader, api_version: i16, resp_header_version: i16, err_code: ErrorCode) ?[]u8 {
@@ -3835,6 +4044,74 @@ pub const Broker = struct {
             .controller_id = self.node_id,
             .brokers = &.{},
             .cluster_authorized_operations = std.math.minInt(i32),
+        };
+        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+    }
+
+    fn handleDescribeProducersAuthorizationError(
+        self: *Broker,
+        request_bytes: []const u8,
+        body_start: usize,
+        req_header: *const RequestHeader,
+        api_version: i16,
+        resp_header_version: i16,
+        err_code: ErrorCode,
+    ) ?[]u8 {
+        const Req = generated.describe_producers_request.DescribeProducersRequest;
+        const Resp = generated.describe_producers_response.DescribeProducersResponse;
+        const TopicResponse = Resp.TopicResponse;
+        const PartitionResponse = TopicResponse.PartitionResponse;
+
+        if (!validateDescribeProducersRequestFrame(request_bytes, body_start)) {
+            log.warn("Malformed denied DescribeProducers request", .{});
+            return null;
+        }
+
+        var pos = body_start;
+        var req = Req.deserialize(self.allocator, request_bytes, &pos, api_version) catch |err| {
+            log.warn("Failed to decode denied DescribeProducers request: {}", .{err});
+            return null;
+        };
+        defer self.freeDescribeProducersRequest(&req);
+
+        var topics: []TopicResponse = &.{};
+        if (req.topics.len > 0) {
+            topics = self.allocator.alloc(TopicResponse, req.topics.len) catch return null;
+        }
+        var topics_init: usize = 0;
+        defer {
+            self.freeDescribeProducersTopicResponses(topics[0..topics_init]);
+            if (topics.len > 0) self.allocator.free(topics);
+        }
+
+        for (req.topics) |topic_req| {
+            var partitions: []PartitionResponse = &.{};
+            if (topic_req.partition_indexes.len > 0) {
+                partitions = self.allocator.alloc(PartitionResponse, topic_req.partition_indexes.len) catch return null;
+            }
+            var transferred = false;
+            defer if (!transferred and partitions.len > 0) self.allocator.free(partitions);
+
+            for (topic_req.partition_indexes, 0..) |partition_index, partition_idx| {
+                partitions[partition_idx] = .{
+                    .partition_index = partition_index,
+                    .error_code = @intFromEnum(err_code),
+                    .error_message = "Not authorized",
+                    .active_producers = &.{},
+                };
+            }
+
+            topics[topics_init] = .{
+                .name = topic_req.name,
+                .partitions = partitions,
+            };
+            topics_init += 1;
+            transferred = true;
+        }
+
+        const resp = Resp{
+            .throttle_time_ms = 0,
+            .topics = topics[0..topics_init],
         };
         return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
     }
@@ -13874,6 +14151,20 @@ pub const Broker = struct {
         return true;
     }
 
+    fn validateDescribeProducersRequestFrame(buf: []const u8, start_pos: usize) bool {
+        var pos = start_pos;
+
+        const topic_count = readKafkaArrayCount(buf, &pos, true) orelse return false;
+        for (0..topic_count) |_| {
+            if (!skipKafkaString(buf, &pos, true)) return false; // topic name
+            if (!skipCompactI32Array(buf, &pos)) return false; // partition_indexes
+            ser.skipTaggedFields(buf, &pos) catch return false;
+        }
+
+        ser.skipTaggedFields(buf, &pos) catch return false;
+        return true;
+    }
+
     // ---------------------------------------------------------------
     // DescribeProducers (key 61) — Return request-scoped producer state
     // ---------------------------------------------------------------
@@ -13882,6 +14173,11 @@ pub const Broker = struct {
         const Resp = generated.describe_producers_response.DescribeProducersResponse;
         const TopicResponse = Resp.TopicResponse;
         const PartitionResponse = TopicResponse.PartitionResponse;
+
+        if (!validateDescribeProducersRequestFrame(request_bytes, body_start)) {
+            log.warn("Malformed DescribeProducers request", .{});
+            return null;
+        }
 
         var pos = body_start;
         var req = Req.deserialize(self.allocator, request_bytes, &pos, api_version) catch |err| {
@@ -18395,6 +18691,60 @@ test "Broker.handleRequest OffsetForLeaderEpoch rejects truncated request" {
     var buf: [128]u8 = undefined;
     const req_len = buildTestRequest(&buf, 23, 4, 2305, header_mod.requestHeaderVersion(23, 4));
     try testing.expect(broker.handleRequest(buf[0..req_len]) == null);
+}
+
+test "Broker.handleRequest OffsetForLeaderEpoch authorization denial uses generated response" {
+    const Req = generated.offset_for_leader_epoch_request.OffsetForLeaderEpochRequest;
+    const Resp = generated.offset_for_leader_epoch_response.OffsetForLeaderEpochResponse;
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+    try broker.authorizer.addAcl("other-client", .topic, "*", .literal, .describe, .allow, "*");
+
+    const partitions = [_]Req.OffsetForLeaderTopic.OffsetForLeaderPartition{.{
+        .partition = 0,
+        .current_leader_epoch = -1,
+        .leader_epoch = 0,
+    }};
+    const topics = [_]Req.OffsetForLeaderTopic{.{
+        .topic = "leader-epoch-denied-topic",
+        .partitions = &partitions,
+    }};
+    const req = Req{
+        .replica_id = -1,
+        .topics = &topics,
+    };
+
+    var buf: [512]u8 = undefined;
+    var pos = buildTestRequest(&buf, 23, 4, 2306, header_mod.requestHeaderVersion(23, 4));
+    req.serialize(&buf, &pos, 4);
+
+    const response = broker.handleRequest(buf[0..pos]);
+    try testing.expect(response != null);
+    defer testing.allocator.free(response.?);
+
+    var rpos: usize = 0;
+    var response_header = try ResponseHeader.deserialize(testing.allocator, response.?, &rpos, header_mod.responseHeaderVersion(23, 4));
+    defer response_header.deinit(testing.allocator);
+    try testing.expectEqual(@as(i32, 2306), response_header.correlation_id);
+
+    const resp = try Resp.deserialize(testing.allocator, response.?, &rpos, 4);
+    defer {
+        for (resp.topics) |topic| {
+            if (topic.partitions.len > 0) testing.allocator.free(topic.partitions);
+        }
+        if (resp.topics.len > 0) testing.allocator.free(resp.topics);
+    }
+
+    try testing.expectEqual(response.?.len, rpos);
+    try testing.expectEqual(@as(i32, 0), resp.throttle_time_ms);
+    try testing.expectEqual(@as(usize, 1), resp.topics.len);
+    try testing.expectEqualStrings("leader-epoch-denied-topic", resp.topics[0].topic.?);
+    try testing.expectEqual(@as(usize, 1), resp.topics[0].partitions.len);
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.topic_authorization_failed)), resp.topics[0].partitions[0].error_code);
+    try testing.expectEqual(@as(i32, 0), resp.topics[0].partitions[0].partition);
+    try testing.expectEqual(@as(i32, -1), resp.topics[0].partitions[0].leader_epoch);
+    try testing.expectEqual(@as(i64, -1), resp.topics[0].partitions[0].end_offset);
 }
 
 test "Broker.handleRequest WriteTxnMarkers v1 returns generated response and writes control batch" {
@@ -27435,6 +27785,65 @@ test "Broker.handleRequest DescribeProducers rejects truncated request" {
     var buf: [128]u8 = undefined;
     const req_len = buildTestRequest(&buf, 61, 0, 6101, header_mod.requestHeaderVersion(61, 0));
     try testing.expect(broker.handleRequest(buf[0..req_len]) == null);
+
+    var partial: [128]u8 = undefined;
+    var partial_pos = buildTestRequest(&partial, 61, 0, 6103, header_mod.requestHeaderVersion(61, 0));
+    ser.writeCompactArrayLen(&partial, &partial_pos, 1);
+    ser.writeCompactString(&partial, &partial_pos, "producer-truncated-topic");
+    ser.writeCompactArrayLen(&partial, &partial_pos, 1);
+    try testing.expect(broker.handleRequest(partial[0..partial_pos]) == null);
+}
+
+test "Broker.handleRequest DescribeProducers authorization denial uses generated response" {
+    const Req = generated.describe_producers_request.DescribeProducersRequest;
+    const Resp = generated.describe_producers_response.DescribeProducersResponse;
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+    try broker.authorizer.addAcl("other-client", .topic, "*", .literal, .describe, .allow, "*");
+
+    const partition_indexes = [_]i32{ 0, 1 };
+    const topics = [_]Req.TopicRequest{.{
+        .name = "producer-denied-topic",
+        .partition_indexes = &partition_indexes,
+    }};
+    const req = Req{ .topics = &topics };
+
+    var buf: [512]u8 = undefined;
+    var pos = buildTestRequest(&buf, 61, 0, 6102, header_mod.requestHeaderVersion(61, 0));
+    req.serialize(&buf, &pos, 0);
+
+    const response = broker.handleRequest(buf[0..pos]);
+    try testing.expect(response != null);
+    defer testing.allocator.free(response.?);
+
+    var rpos: usize = 0;
+    var response_header = try ResponseHeader.deserialize(testing.allocator, response.?, &rpos, header_mod.responseHeaderVersion(61, 0));
+    defer response_header.deinit(testing.allocator);
+    try testing.expectEqual(@as(i32, 6102), response_header.correlation_id);
+
+    const resp = try Resp.deserialize(testing.allocator, response.?, &rpos, 0);
+    defer {
+        for (resp.topics) |topic| {
+            for (topic.partitions) |partition| {
+                if (partition.active_producers.len > 0) testing.allocator.free(partition.active_producers);
+            }
+            if (topic.partitions.len > 0) testing.allocator.free(topic.partitions);
+        }
+        if (resp.topics.len > 0) testing.allocator.free(resp.topics);
+    }
+
+    try testing.expectEqual(response.?.len, rpos);
+    try testing.expectEqual(@as(i32, 0), resp.throttle_time_ms);
+    try testing.expectEqual(@as(usize, 1), resp.topics.len);
+    try testing.expectEqualStrings("producer-denied-topic", resp.topics[0].name.?);
+    try testing.expectEqual(@as(usize, 2), resp.topics[0].partitions.len);
+    try testing.expectEqual(@as(i32, 0), resp.topics[0].partitions[0].partition_index);
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.topic_authorization_failed)), resp.topics[0].partitions[0].error_code);
+    try testing.expect(resp.topics[0].partitions[0].error_message != null);
+    try testing.expectEqual(@as(usize, 0), resp.topics[0].partitions[0].active_producers.len);
+    try testing.expectEqual(@as(i32, 1), resp.topics[0].partitions[1].partition_index);
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.topic_authorization_failed)), resp.topics[0].partitions[1].error_code);
 }
 
 test "Broker.handleRequest DescribeTopicPartitions returns generated metadata and unknown topics" {
@@ -27871,6 +28280,58 @@ test "Broker.handleRequest ListOffsets rejects truncated request" {
     var buf: [128]u8 = undefined;
     const req_len = buildTestRequest(&buf, 2, 6, 27, header_mod.requestHeaderVersion(2, 6));
     try testing.expect(broker.handleRequest(buf[0..req_len]) == null);
+}
+
+test "Broker.handleRequest ListOffsets authorization denial uses generated response" {
+    const Req = generated.list_offsets_request.ListOffsetsRequest;
+    const Topic = Req.ListOffsetsTopic;
+    const Partition = Topic.ListOffsetsPartition;
+    const Resp = generated.list_offsets_response.ListOffsetsResponse;
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+    try broker.authorizer.addAcl("other-client", .topic, "*", .literal, .describe, .allow, "*");
+
+    const partitions = [_]Partition{.{
+        .partition_index = 0,
+        .current_leader_epoch = -1,
+        .timestamp = -1,
+    }};
+    const topics = [_]Topic{.{
+        .name = "lo-denied-topic",
+        .partitions = &partitions,
+    }};
+    const req = Req{
+        .replica_id = -1,
+        .isolation_level = 0,
+        .topics = &topics,
+    };
+
+    var buf: [512]u8 = undefined;
+    var pos = buildTestRequest(&buf, 2, 6, 28, header_mod.requestHeaderVersion(2, 6));
+    req.serialize(&buf, &pos, 6);
+
+    const response = broker.handleRequest(buf[0..pos]);
+    try testing.expect(response != null);
+    defer testing.allocator.free(response.?);
+
+    var rpos: usize = 0;
+    var response_header = try ResponseHeader.deserialize(testing.allocator, response.?, &rpos, header_mod.responseHeaderVersion(2, 6));
+    defer response_header.deinit(testing.allocator);
+    try testing.expectEqual(@as(i32, 28), response_header.correlation_id);
+
+    const resp = try Resp.deserialize(testing.allocator, response.?, &rpos, 6);
+    defer freeDeserializedListOffsetsResponse(&resp);
+
+    try testing.expectEqual(response.?.len, rpos);
+    try testing.expectEqual(@as(i32, 0), resp.throttle_time_ms);
+    try testing.expectEqual(@as(usize, 1), resp.topics.len);
+    try testing.expectEqualStrings("lo-denied-topic", resp.topics[0].name.?);
+    try testing.expectEqual(@as(usize, 1), resp.topics[0].partitions.len);
+    try testing.expectEqual(@as(i32, 0), resp.topics[0].partitions[0].partition_index);
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.topic_authorization_failed)), resp.topics[0].partitions[0].error_code);
+    try testing.expectEqual(@as(i64, -1), resp.topics[0].partitions[0].offset);
+    try testing.expectEqual(@as(i32, -1), resp.topics[0].partitions[0].leader_epoch);
 }
 
 test "Broker.handleRequest JoinGroup (key=11) returns member_id" {
@@ -31119,6 +31580,60 @@ test "Broker.handleRequest DeleteRecords rejects truncated request" {
     var buf: [128]u8 = undefined;
     const req_len = buildTestRequest(&buf, 21, 2, 2103, header_mod.requestHeaderVersion(21, 2));
     try testing.expect(broker.handleRequest(buf[0..req_len]) == null);
+}
+
+test "Broker.handleRequest DeleteRecords authorization denial uses generated response" {
+    const Req = generated.delete_records_request.DeleteRecordsRequest;
+    const Resp = generated.delete_records_response.DeleteRecordsResponse;
+    const Topic = Req.DeleteRecordsTopic;
+    const Partition = Topic.DeleteRecordsPartition;
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+    try testing.expect(broker.ensureTopic("dr-denied-topic"));
+    try broker.authorizer.addAcl("other-client", .topic, "*", .literal, .delete, .allow, "*");
+
+    const partitions = [_]Partition{.{
+        .partition_index = 0,
+        .offset = 5,
+    }};
+    const topics = [_]Topic{.{
+        .name = "dr-denied-topic",
+        .partitions = &partitions,
+    }};
+    const req = Req{
+        .topics = &topics,
+        .timeout_ms = 30000,
+    };
+
+    var buf: [512]u8 = undefined;
+    var pos = buildTestRequest(&buf, 21, 2, 2104, header_mod.requestHeaderVersion(21, 2));
+    req.serialize(&buf, &pos, 2);
+
+    const response = broker.handleRequest(buf[0..pos]);
+    try testing.expect(response != null);
+    defer testing.allocator.free(response.?);
+
+    var rpos: usize = 0;
+    var response_header = try ResponseHeader.deserialize(testing.allocator, response.?, &rpos, header_mod.responseHeaderVersion(21, 2));
+    defer response_header.deinit(testing.allocator);
+    try testing.expectEqual(@as(i32, 2104), response_header.correlation_id);
+
+    const resp = try Resp.deserialize(testing.allocator, response.?, &rpos, 2);
+    defer {
+        broker.freeDeleteRecordsResponseTopics(resp.topics);
+        if (resp.topics.len > 0) testing.allocator.free(resp.topics);
+    }
+
+    try testing.expectEqual(response.?.len, rpos);
+    try testing.expectEqual(@as(i32, 0), resp.throttle_time_ms);
+    try testing.expectEqual(@as(usize, 1), resp.topics.len);
+    try testing.expectEqualStrings("dr-denied-topic", resp.topics[0].name.?);
+    try testing.expectEqual(@as(usize, 1), resp.topics[0].partitions.len);
+    try testing.expectEqual(@as(i32, 0), resp.topics[0].partitions[0].partition_index);
+    try testing.expectEqual(@as(i64, -1), resp.topics[0].partitions[0].low_watermark);
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.topic_authorization_failed)), resp.topics[0].partitions[0].error_code);
+    try testing.expectEqual(@as(u64, 0), broker.store.partitions.getPtr("dr-denied-topic-0").?.log_start_offset);
 }
 
 test "Broker.handleRequest DescribeConfigs v0 returns generated topic configs" {
