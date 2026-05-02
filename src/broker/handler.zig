@@ -18667,7 +18667,7 @@ pub const Broker = struct {
             if (flexible) ser.skipTaggedFields(buf, &pos) catch return false;
         }
         if (flexible) ser.skipTaggedFields(buf, &pos) catch return false;
-        return true;
+        return pos == buf.len;
     }
 
     fn validateDescribeGroupsRequestFrame(buf: []const u8, start_pos: usize, api_version: i16) bool {
@@ -35152,6 +35152,34 @@ test "Broker.handleRequest SyncGroup rejects truncated request" {
     var buf: [128]u8 = undefined;
     const req_len = buildTestRequest(&buf, 14, 5, 1406, header_mod.requestHeaderVersion(14, 5));
     try testing.expect(broker.handleRequest(buf[0..req_len]) == null);
+}
+
+test "Broker.handleRequest SyncGroup rejects trailing bytes" {
+    const Req = generated.sync_group_request.SyncGroupRequest;
+    const Assignment = Req.SyncGroupRequestAssignment;
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+
+    const assignments = [_]Assignment{.{
+        .member_id = "sync-trailing-member",
+        .assignment = "sync-trailing-assignment",
+    }};
+    const req = Req{
+        .group_id = "sg-trailing-group",
+        .generation_id = 1,
+        .member_id = "sync-trailing-member",
+        .group_instance_id = null,
+        .protocol_type = "consumer",
+        .protocol_name = "range",
+        .assignments = &assignments,
+    };
+
+    var buf: [512]u8 = undefined;
+    var pos = buildTestRequest(&buf, 14, 5, 1417, header_mod.requestHeaderVersion(14, 5));
+    req.serialize(&buf, &pos, 5);
+
+    try expectTrailingByteRejected(&broker, &buf, pos);
 }
 
 test "Broker.handleRequest SyncGroup v5 authorization denial uses generated response" {
