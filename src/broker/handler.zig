@@ -18213,7 +18213,7 @@ pub const Broker = struct {
             if (partition_count > (buf.len - pos) / 4) return false;
             pos += partition_count * 4;
         }
-        return true;
+        return pos == buf.len;
     }
 
     fn validateDeleteGroupsRequestFrame(buf: []const u8, start_pos: usize, api_version: i16) bool {
@@ -25618,6 +25618,31 @@ test "Broker.handleRequest OffsetDelete rejects truncated request" {
     var buf: [128]u8 = undefined;
     const req_len = buildTestRequest(&buf, 47, 0, 4701, header_mod.requestHeaderVersion(47, 0));
     try testing.expect(broker.handleRequest(buf[0..req_len]) == null);
+}
+
+test "Broker.handleRequest OffsetDelete rejects trailing bytes" {
+    const Req = generated.offset_delete_request.OffsetDeleteRequest;
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+
+    const partitions = [_]Req.OffsetDeleteRequestTopic.OffsetDeleteRequestPartition{.{
+        .partition_index = 0,
+    }};
+    const topics = [_]Req.OffsetDeleteRequestTopic{.{
+        .name = "offset-delete-trailing-topic",
+        .partitions = &partitions,
+    }};
+    const req = Req{
+        .group_id = "offset-delete-trailing-group",
+        .topics = &topics,
+    };
+
+    var buf: [512]u8 = undefined;
+    var pos = buildTestRequest(&buf, 47, 0, 4709, header_mod.requestHeaderVersion(47, 0));
+    req.serialize(&buf, &pos, 0);
+
+    try expectTrailingByteRejected(&broker, buf[0..], pos);
 }
 
 test "Broker.handleRequest OffsetDelete authorization denial uses generated response" {
