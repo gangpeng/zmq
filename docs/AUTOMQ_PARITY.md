@@ -246,6 +246,8 @@ Status: completed for the initial catalog and DeleteGroups slice.
   topic/partition request section.
   Metadata now rejects trailing bytes after the final legacy or flexible topic
   list and authorization flags.
+  Produce now rejects trailing bytes after the final legacy or flexible topic
+  record-data section.
   MetadataRequest generated decoding now preserves nullable `Topics` semantics:
   v1+ null requests all topics, explicit empty arrays request no topic results,
   and v0 null topics are rejected as malformed.

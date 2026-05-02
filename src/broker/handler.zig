@@ -18558,7 +18558,7 @@ pub const Broker = struct {
         }
 
         if (flexible) ser.skipTaggedFields(buf, &pos) catch return false;
-        return true;
+        return pos == buf.len;
     }
 
     fn validateFetchRequestFrame(buf: []const u8, start_pos: usize, api_version: i16) bool {
@@ -21710,6 +21710,37 @@ test "Broker.handleRequest Produce rejects truncated request" {
     var buf: [128]u8 = undefined;
     const req_len = buildTestRequest(&buf, 0, 9, 310, header_mod.requestHeaderVersion(0, 9));
     try testing.expect(broker.handleRequest(buf[0..req_len]) == null);
+}
+
+test "Broker.handleRequest Produce rejects trailing bytes" {
+    const Req = generated.produce_request.ProduceRequest;
+    const Topic = Req.TopicProduceData;
+    const Partition = Topic.PartitionProduceData;
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+
+    const records = "produce-trailing-records";
+    const partitions = [_]Partition{.{
+        .index = 0,
+        .records = records,
+    }};
+    const topics = [_]Topic{.{
+        .name = "produce-trailing-topic",
+        .partition_data = &partitions,
+    }};
+    const req = Req{
+        .transactional_id = null,
+        .acks = 1,
+        .timeout_ms = 30000,
+        .topic_data = &topics,
+    };
+
+    var buf: [512]u8 = undefined;
+    var pos = buildTestRequest(&buf, 0, 9, 320, header_mod.requestHeaderVersion(0, 9));
+    req.serialize(&buf, &pos, 9);
+
+    try expectTrailingByteRejected(&broker, &buf, pos);
 }
 
 test "Broker.handleRequest ListGroups v4 returns generated filtered groups" {
