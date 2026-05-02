@@ -12955,6 +12955,11 @@ pub const Broker = struct {
     // DeleteGroups (key 42)
     // ---------------------------------------------------------------
     fn handleDeleteGroups(self: *Broker, request_bytes: []const u8, body_start: usize, req_header: *const RequestHeader, api_version: i16, resp_header_version: i16) ?[]u8 {
+        if (!validateDeleteGroupsRequestFrame(request_bytes, body_start, api_version)) {
+            log.warn("Malformed DeleteGroups request", .{});
+            return null;
+        }
+
         var pos = body_start;
         const flexible = api_version >= 2;
         const num_groups = if (flexible)
@@ -17296,7 +17301,7 @@ pub const Broker = struct {
         if (!skipFixedBytes(buf, &pos, 1)) return false; // include_cluster_authorized_operations
         if (api_version >= 1 and !skipFixedBytes(buf, &pos, 1)) return false; // endpoint_type
         ser.skipTaggedFields(buf, &pos) catch return false;
-        return true;
+        return pos == buf.len;
     }
 
     fn validateDescribeProducersRequestFrame(buf: []const u8, start_pos: usize) bool {
@@ -18158,7 +18163,7 @@ pub const Broker = struct {
             ser.skipTaggedFields(buf, &pos) catch return false;
         }
         ser.skipTaggedFields(buf, &pos) catch return false;
-        return true;
+        return pos == buf.len;
     }
 
     fn validateListPartitionReassignmentsRequestFrame(buf: []const u8, start_pos: usize) bool {
@@ -18171,7 +18176,7 @@ pub const Broker = struct {
             ser.skipTaggedFields(buf, &pos) catch return false;
         }
         ser.skipTaggedFields(buf, &pos) catch return false;
-        return true;
+        return pos == buf.len;
     }
 
     fn validateBeginQuorumEpochRequestFrame(buf: []const u8, start_pos: usize, api_version: i16) bool {
@@ -18220,7 +18225,7 @@ pub const Broker = struct {
             if (!skipKafkaString(buf, &pos, flexible)) return false; // group_id
         }
         if (flexible) ser.skipTaggedFields(buf, &pos) catch return false;
-        return true;
+        return pos == buf.len;
     }
 
     fn validateDescribeClientQuotasRequestFrame(buf: []const u8, start_pos: usize, api_version: i16) bool {
@@ -18397,7 +18402,7 @@ pub const Broker = struct {
             if (flexible) ser.skipTaggedFields(buf, &pos) catch return false;
         }
         if (flexible) ser.skipTaggedFields(buf, &pos) catch return false;
-        return true;
+        return pos == buf.len;
     }
 
     fn validateWriteTxnMarkersRequestFrame(buf: []const u8, start_pos: usize, api_version: i16) bool {
@@ -21914,6 +21919,21 @@ test "Broker.handleRequest DeleteGroups v2 reports group lifecycle errors" {
     try testing.expectEqual(@as(usize, 1), broker.groups.groupCount());
 }
 
+test "Broker.handleRequest DeleteGroups rejects trailing bytes" {
+    const Req = generated.delete_groups_request.DeleteGroupsRequest;
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+
+    const group_names = [_]?[]const u8{"delete-trailing"};
+    const req = Req{ .groups_names = &group_names };
+    var buf: [128]u8 = undefined;
+    var pos = buildTestRequest(&buf, 42, 2, 4207, header_mod.requestHeaderVersion(42, 2));
+    req.serialize(&buf, &pos, 2);
+
+    try expectTrailingByteRejected(&broker, buf[0..], pos);
+}
+
 test "Broker.handleRequest DeleteGroups authorization denial uses generated response" {
     const Req = generated.delete_groups_request.DeleteGroupsRequest;
     const Resp = generated.delete_groups_response.DeleteGroupsResponse;
@@ -22266,6 +22286,20 @@ test "Broker.handleRequest OffsetForLeaderEpoch rejects truncated request" {
     var buf: [128]u8 = undefined;
     const req_len = buildTestRequest(&buf, 23, 4, 2305, header_mod.requestHeaderVersion(23, 4));
     try testing.expect(broker.handleRequest(buf[0..req_len]) == null);
+}
+
+test "Broker.handleRequest OffsetForLeaderEpoch rejects trailing bytes" {
+    const Req = generated.offset_for_leader_epoch_request.OffsetForLeaderEpochRequest;
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+
+    const req = Req{ .replica_id = -1 };
+    var buf: [128]u8 = undefined;
+    var pos = buildTestRequest(&buf, 23, 4, 2307, header_mod.requestHeaderVersion(23, 4));
+    req.serialize(&buf, &pos, 4);
+
+    try expectTrailingByteRejected(&broker, buf[0..], pos);
 }
 
 test "Broker.handleRequest OffsetForLeaderEpoch authorization denial uses generated response" {
@@ -32198,6 +32232,26 @@ test "Broker.handleRequest partition reassignment APIs reject truncated requests
     try testing.expect(broker.handleRequest(list_buf[0..list_len]) == null);
 }
 
+test "Broker.handleRequest partition reassignment APIs reject trailing bytes" {
+    const AlterReq = generated.alter_partition_reassignments_request.AlterPartitionReassignmentsRequest;
+    const ListReq = generated.list_partition_reassignments_request.ListPartitionReassignmentsRequest;
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+
+    const alter_req = AlterReq{};
+    var alter_buf: [128]u8 = undefined;
+    var alter_pos = buildTestRequest(&alter_buf, 45, 0, 4502, header_mod.requestHeaderVersion(45, 0));
+    alter_req.serialize(&alter_buf, &alter_pos, 0);
+    try expectTrailingByteRejected(&broker, alter_buf[0..], alter_pos);
+
+    const list_req = ListReq{};
+    var list_buf: [128]u8 = undefined;
+    var list_pos = buildTestRequest(&list_buf, 46, 0, 4602, header_mod.requestHeaderVersion(46, 0));
+    list_req.serialize(&list_buf, &list_pos, 0);
+    try expectTrailingByteRejected(&broker, list_buf[0..], list_pos);
+}
+
 test "Broker.handleRequest DescribeCluster uses generated endpoint-scoped response" {
     const Req = generated.describe_cluster_request.DescribeClusterRequest;
     const Resp = generated.describe_cluster_response.DescribeClusterResponse;
@@ -32279,6 +32333,20 @@ test "Broker.handleRequest DescribeCluster rejects truncated request" {
     var buf: [128]u8 = undefined;
     const req_len = buildTestRequest(&buf, 60, 1, 6003, header_mod.requestHeaderVersion(60, 1));
     try testing.expect(broker.handleRequest(buf[0..req_len]) == null);
+}
+
+test "Broker.handleRequest DescribeCluster rejects trailing bytes" {
+    const Req = generated.describe_cluster_request.DescribeClusterRequest;
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+
+    const req = Req{};
+    var buf: [128]u8 = undefined;
+    var pos = buildTestRequest(&buf, 60, 1, 6005, header_mod.requestHeaderVersion(60, 1));
+    req.serialize(&buf, &pos, 1);
+
+    try expectTrailingByteRejected(&broker, buf[0..], pos);
 }
 
 test "Broker.handleRequest DescribeCluster authorization denial uses generated response" {
