@@ -569,23 +569,31 @@ pub const Controller = struct {
         };
         defer self.freeFetchSnapshotRequest(&req);
 
-        const topics = self.buildFetchSnapshotTopics(&req) catch return null;
+        const topics = self.buildFetchSnapshotTopics(&req, api_version) catch return null;
         defer {
             self.freeFetchSnapshotTopics(topics);
             if (topics.len > 0) self.allocator.free(topics);
         }
+        const node_endpoints = self.collectFetchSnapshotNodeEndpoints(api_version) catch return null;
+        defer if (node_endpoints.len > 0) self.allocator.free(node_endpoints);
 
         const resp = Resp{
             .throttle_time_ms = 0,
             .error_code = ErrorCode.none.toInt(),
             .topics = topics,
+            .node_endpoints = node_endpoints,
         };
         return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
     }
 
-    fn buildFetchSnapshotTopics(self: *Controller, req: *const generated.fetch_snapshot_request.FetchSnapshotRequest) ![]generated.fetch_snapshot_response.FetchSnapshotResponse.TopicSnapshot {
+    fn buildFetchSnapshotTopics(self: *Controller, req: *const generated.fetch_snapshot_request.FetchSnapshotRequest, api_version: i16) ![]generated.fetch_snapshot_response.FetchSnapshotResponse.TopicSnapshot {
         const TopicResp = generated.fetch_snapshot_response.FetchSnapshotResponse.TopicSnapshot;
         const PartitionResp = TopicResp.PartitionSnapshot;
+        const leader_id = self.raft_state.leader_id orelse -1;
+        const current_leader = if (api_version >= 1 and leader_id >= 0)
+            PartitionResp.LeaderIdAndEpoch{ .leader_id = leader_id, .leader_epoch = self.raft_state.current_epoch }
+        else
+            PartitionResp.LeaderIdAndEpoch{};
 
         if (req.topics.len == 0) return &.{};
         const topics = try self.allocator.alloc(TopicResp, req.topics.len);
@@ -610,6 +618,7 @@ pub const Controller = struct {
                         .size = 0,
                         .position = partition_req.position,
                         .unaligned_records = null,
+                        .current_leader = current_leader,
                     };
                 }
             }
@@ -622,6 +631,30 @@ pub const Controller = struct {
         }
 
         return topics;
+    }
+
+    fn collectFetchSnapshotNodeEndpoints(self: *Controller, api_version: i16) ![]const generated.fetch_snapshot_response.FetchSnapshotResponse.NodeEndpoint {
+        const NodeEndpoint = generated.fetch_snapshot_response.FetchSnapshotResponse.NodeEndpoint;
+        if (api_version < 1) return &.{};
+        const leader_id = self.raft_state.leader_id orelse return &.{};
+        const voter = self.raft_state.voters.get(leader_id) orelse return &.{};
+        const endpoint = chooseControllerEndpoint(voter.endpoints) orelse return &.{};
+
+        const endpoints = try self.allocator.alloc(NodeEndpoint, 1);
+        endpoints[0] = .{
+            .node_id = leader_id,
+            .host = endpoint.host,
+            .port = endpoint.port,
+        };
+        return endpoints;
+    }
+
+    fn chooseControllerEndpoint(endpoints: []const RaftState.VoterEndpoint) ?RaftState.VoterEndpoint {
+        if (endpoints.len == 0) return null;
+        for (endpoints) |endpoint| {
+            if (std.ascii.eqlIgnoreCase(endpoint.name, "CONTROLLER")) return endpoint;
+        }
+        return endpoints[0];
     }
 
     fn freeFetchSnapshotRequest(self: *Controller, req: *generated.fetch_snapshot_request.FetchSnapshotRequest) void {
@@ -2334,6 +2367,67 @@ test "Controller handleRequest FetchSnapshot returns snapshot not found" {
     try testing.expectEqual(ErrorCode.snapshot_not_found.toInt(), resp.topics[0].partitions[0].error_code);
     try testing.expectEqual(@as(i64, 3), resp.topics[0].partitions[0].snapshot_id.end_offset);
     try testing.expectEqual(@as(i32, 1), resp.topics[0].partitions[0].snapshot_id.epoch);
+}
+
+test "Controller handleRequest FetchSnapshot v1 returns current leader endpoint metadata" {
+    const Req = generated.fetch_snapshot_request.FetchSnapshotRequest;
+    const Resp = generated.fetch_snapshot_response.FetchSnapshotResponse;
+
+    var ctrl = Controller.init(testing.allocator, 1, "test-cluster");
+    defer ctrl.deinit();
+    try makeTestControllerLeader(&ctrl);
+
+    const directory_id = [_]u8{9} ** 16;
+    const endpoint_views = [_]RaftState.VoterEndpointView{.{
+        .name = "CONTROLLER",
+        .host = "controller-1.example",
+        .port = 19093,
+    }};
+    _ = try ctrl.raft_state.proposeUpdateVoter(1, directory_id, &endpoint_views, 0, 1);
+    ctrl.raft_state.commit_index = ctrl.raft_state.log.lastOffset();
+    ctrl.raft_state.applyCommittedConfigs();
+
+    const snapshot_id = Req.TopicSnapshot.PartitionSnapshot.SnapshotId{ .end_offset = 7, .epoch = 2 };
+    const partitions = [_]Req.TopicSnapshot.PartitionSnapshot{.{
+        .partition = 0,
+        .current_leader_epoch = -1,
+        .snapshot_id = snapshot_id,
+        .position = 12,
+        .replica_directory_id = [_]u8{4} ** 16,
+    }};
+    const topics = [_]Req.TopicSnapshot{.{ .name = "__cluster_metadata", .partitions = &partitions }};
+    const req = Req{ .replica_id = 2, .max_bytes = 1024, .topics = &topics };
+
+    var buf: [512]u8 = undefined;
+    var pos = buildTestRequest(&buf, 59, 1, 5902, header_mod.requestHeaderVersion(59, 1));
+    req.serialize(&buf, &pos, 1);
+
+    const response = ctrl.handleRequest(buf[0..pos]);
+    try testing.expect(response != null);
+    defer testing.allocator.free(response.?);
+
+    var rpos: usize = 0;
+    var resp_header = try ResponseHeader.deserialize(testing.allocator, response.?, &rpos, header_mod.responseHeaderVersion(59, 1));
+    defer resp_header.deinit(testing.allocator);
+    try testing.expectEqual(@as(i32, 5902), resp_header.correlation_id);
+
+    const resp = try Resp.deserialize(testing.allocator, response.?, &rpos, 1);
+    defer freeDeserializedFetchSnapshotResponse(&resp);
+
+    try testing.expectEqual(ErrorCode.none.toInt(), resp.error_code);
+    try testing.expectEqual(@as(usize, 1), resp.topics.len);
+    try testing.expectEqual(@as(usize, 1), resp.topics[0].partitions.len);
+    const partition = resp.topics[0].partitions[0];
+    try testing.expectEqual(ErrorCode.snapshot_not_found.toInt(), partition.error_code);
+    try testing.expectEqual(@as(i64, 7), partition.snapshot_id.end_offset);
+    try testing.expectEqual(@as(i32, 2), partition.snapshot_id.epoch);
+    try testing.expectEqual(@as(i64, 12), partition.position);
+    try testing.expectEqual(@as(i32, 1), partition.current_leader.leader_id);
+    try testing.expectEqual(ctrl.raft_state.current_epoch, partition.current_leader.leader_epoch);
+    try testing.expectEqual(@as(usize, 1), resp.node_endpoints.len);
+    try testing.expectEqual(@as(i32, 1), resp.node_endpoints[0].node_id);
+    try testing.expectEqualStrings("controller-1.example", resp.node_endpoints[0].host.?);
+    try testing.expectEqual(@as(u16, 19093), resp.node_endpoints[0].port);
 }
 
 test "Controller handleRequest FetchSnapshot rejects malformed generated request" {
