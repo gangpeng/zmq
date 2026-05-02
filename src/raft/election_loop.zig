@@ -143,6 +143,7 @@ pub const ElectionLoop = struct {
     /// Broadcast vote requests and count grants. If majority reached, become leader.
     fn broadcastAndCountVotes(self: *ElectionLoop, result: RaftState.ElectionResult) void {
         if (self.raft_client_pool) |pool| {
+            self.syncClientPoolWithVoterMetadata();
             const grants = pool.broadcastVoteRequest(
                 self.raft_state.cluster_id,
                 result.epoch,
@@ -166,6 +167,7 @@ pub const ElectionLoop = struct {
     /// Returns true if majority granted pre-vote (safe to proceed to real election).
     fn broadcastAndCountPreVotes(self: *ElectionLoop, result: RaftState.ElectionResult) bool {
         if (self.raft_client_pool) |pool| {
+            self.syncClientPoolWithVoterMetadata();
             // Reuse broadcastVoteRequest for pre-vote (same wire format, different semantics).
             // In a full implementation, pre-vote would use a separate RPC.
             // For now, we use the same Vote RPC but the candidate does NOT increment its epoch.
@@ -188,6 +190,7 @@ pub const ElectionLoop = struct {
     fn sendHeartbeats(self: *ElectionLoop) void {
         if (self.raft_state.role != .leader) return;
         if (self.raft_client_pool) |pool| {
+            self.syncClientPoolWithVoterMetadata();
             pool.broadcastHeartbeat(self.raft_state.current_epoch, self.raft_state.node_id);
         }
     }
@@ -199,6 +202,7 @@ pub const ElectionLoop = struct {
         const pool = self.raft_client_pool.?;
         const raft = self.raft_state;
         if (raft.role != .leader) return;
+        self.syncClientPoolWithVoterMetadata();
 
         var vit = raft.voters.iterator();
         while (vit.next()) |entry| {
@@ -247,6 +251,44 @@ pub const ElectionLoop = struct {
                 });
             }
         }
+    }
+
+    fn syncClientPoolWithVoterMetadata(self: *ElectionLoop) void {
+        const pool = self.raft_client_pool orelse return;
+        const raft = self.raft_state;
+
+        var stale_ids = std.array_list.Managed(i32).init(pool.allocator);
+        defer stale_ids.deinit();
+
+        var client_it = pool.clients.iterator();
+        while (client_it.next()) |entry| {
+            const peer_id = entry.key_ptr.*;
+            if (peer_id == raft.node_id or !raft.voters.contains(peer_id)) {
+                stale_ids.append(peer_id) catch continue;
+            }
+        }
+        for (stale_ids.items) |peer_id| {
+            pool.removePeer(peer_id);
+        }
+
+        var voter_it = raft.voters.iterator();
+        while (voter_it.next()) |entry| {
+            const peer_id = entry.key_ptr.*;
+            if (peer_id == raft.node_id) continue;
+
+            const endpoint = selectControllerEndpoint(entry.value_ptr.endpoints) orelse continue;
+            pool.addOrUpdatePeer(peer_id, endpoint.host, endpoint.port) catch |err| {
+                log.warn("Failed to sync Raft peer {d} from voter metadata: {}", .{ peer_id, err });
+            };
+        }
+    }
+
+    fn selectControllerEndpoint(endpoints: []const RaftState.VoterEndpoint) ?RaftState.VoterEndpoint {
+        if (endpoints.len == 0) return null;
+        for (endpoints) |endpoint| {
+            if (std.ascii.eqlIgnoreCase(endpoint.name, "CONTROLLER")) return endpoint;
+        }
+        return endpoints[0];
     }
 };
 
@@ -349,4 +391,53 @@ test "ElectionLoop candidate retries election on timeout" {
     const result2 = raft.startElection();
     try std.testing.expectEqual(@as(i32, 2), result2.epoch);
     try std.testing.expectEqual(RaftState.Role.candidate, raft.role);
+}
+
+test "ElectionLoop syncs RaftClientPool from committed voter endpoints" {
+    const alloc = std.testing.allocator;
+    var raft = RaftState.init(alloc, 1, "test-cluster");
+    defer raft.deinit();
+
+    try raft.addVoter(1);
+    try raft.addVoter(2);
+    try raft.addVoter(3);
+
+    const dir2 = [_]u8{2} ** 16;
+    const endpoint2 = [_]RaftState.VoterEndpointView{.{
+        .name = "CONTROLLER",
+        .host = "controller-2.example",
+        .port = 19093,
+    }};
+    try raft.updateVoterMetadata(2, dir2, &endpoint2, 0, 0);
+
+    const dir3 = [_]u8{3} ** 16;
+    const endpoints3 = [_]RaftState.VoterEndpointView{
+        .{ .name = "CLIENT", .host = "broker-3.example", .port = 9092 },
+        .{ .name = "CONTROLLER", .host = "controller-3.example", .port = 29093 },
+    };
+    try raft.updateVoterMetadata(3, dir3, &endpoints3, 0, 0);
+
+    var pool = RaftClientPool.init(alloc);
+    defer pool.deinit();
+    try pool.addPeer(2, "stale-controller-2.example", 9093);
+    try pool.addPeer(4, "removed-controller-4.example", 49093);
+
+    var should_stop = false;
+    var loop = ElectionLoop{
+        .raft_state = &raft,
+        .should_stop = &should_stop,
+        .raft_client_pool = &pool,
+    };
+    loop.syncClientPoolWithVoterMetadata();
+
+    try std.testing.expect(pool.getClient(1) == null);
+    try std.testing.expect(pool.getClient(4) == null);
+
+    const client2 = pool.getClient(2).?;
+    try std.testing.expectEqualStrings("controller-2.example", client2.host);
+    try std.testing.expectEqual(@as(u16, 19093), client2.port);
+
+    const client3 = pool.getClient(3).?;
+    try std.testing.expectEqualStrings("controller-3.example", client3.host);
+    try std.testing.expectEqual(@as(u16, 29093), client3.port);
 }

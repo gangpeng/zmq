@@ -455,10 +455,37 @@ pub const RaftClientPool = struct {
 
     /// Add a peer broker to the pool. Dupes the host string for safety.
     pub fn addPeer(self: *RaftClientPool, peer_id: i32, host: []const u8, port: u16) !void {
+        try self.addOrUpdatePeer(peer_id, host, port);
+    }
+
+    /// Add or replace a peer address. Existing connections are closed before
+    /// replacement so dynamic voter endpoint updates do not leak stale clients.
+    pub fn addOrUpdatePeer(self: *RaftClientPool, peer_id: i32, host: []const u8, port: u16) !void {
+        if (self.clients.getPtr(peer_id)) |existing| {
+            if (existing.port == port and std.mem.eql(u8, existing.host, host)) {
+                existing.tls_ctx = self.tls_client_ctx;
+                return;
+            }
+        }
+
+        self.removePeer(peer_id);
+
         const host_owned = try self.allocator.dupe(u8, host);
         var client = RaftClient.init(self.allocator, peer_id, host_owned, port);
         client.tls_ctx = self.tls_client_ctx;
-        try self.clients.put(peer_id, client);
+        self.clients.put(peer_id, client) catch |err| {
+            self.allocator.free(host_owned);
+            return err;
+        };
+    }
+
+    /// Remove a peer and close any active connection.
+    pub fn removePeer(self: *RaftClientPool, peer_id: i32) void {
+        if (self.clients.fetchRemove(peer_id)) |removed| {
+            var client = removed.value;
+            client.deinit();
+            self.allocator.free(client.host);
+        }
     }
 
     /// Get the client for a specific peer.
@@ -586,6 +613,24 @@ test "RaftClientPool init/deinit" {
 
     const c3 = pool.getClient(3);
     try std.testing.expect(c3 == null);
+}
+
+test "RaftClientPool addOrUpdatePeer replaces and removes clients" {
+    var pool = RaftClientPool.init(std.testing.allocator);
+    defer pool.deinit();
+
+    try pool.addPeer(1, "old-host", 9093);
+    try std.testing.expectEqual(@as(usize, 1), pool.clients.count());
+
+    try pool.addOrUpdatePeer(1, "new-host", 19093);
+    try std.testing.expectEqual(@as(usize, 1), pool.clients.count());
+    const updated = pool.getClient(1).?;
+    try std.testing.expectEqualStrings("new-host", updated.host);
+    try std.testing.expectEqual(@as(u16, 19093), updated.port);
+
+    pool.removePeer(1);
+    try std.testing.expectEqual(@as(usize, 0), pool.clients.count());
+    try std.testing.expect(pool.getClient(1) == null);
 }
 
 test "RaftClient init" {
