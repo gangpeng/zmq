@@ -240,6 +240,8 @@ Status: completed for the initial catalog and DeleteGroups slice.
   tagged-fields section.
   AddPartitionsToTxn now rejects trailing bytes after the final flexible
   transaction batch tagged-fields section.
+  EndTxn now rejects trailing bytes after the final flexible request
+  tagged-fields section.
   MetadataRequest generated decoding now preserves nullable `Topics` semantics:
   v1+ null requests all topics, explicit empty arrays request no topic results,
   and v0 null topics are rejected as malformed.

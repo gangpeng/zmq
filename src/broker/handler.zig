@@ -19134,7 +19134,7 @@ pub const Broker = struct {
         if (!skipKafkaString(buf, &pos, flexible)) return false; // transactional_id
         if (!skipFixedBytes(buf, &pos, 11)) return false; // producer_id + producer_epoch + committed
         if (flexible) ser.skipTaggedFields(buf, &pos) catch return false;
-        return true;
+        return pos == buf.len;
     }
 
     fn validateDescribeTransactionsRequestFrame(buf: []const u8, start_pos: usize) bool {
@@ -31536,6 +31536,26 @@ test "Broker.handleRequest EndTxn rejects truncated request" {
     var buf: [128]u8 = undefined;
     const req_len = buildTestRequest(&buf, 26, 3, 2604, header_mod.requestHeaderVersion(26, 3));
     try testing.expect(broker.handleRequest(buf[0..req_len]) == null);
+}
+
+test "Broker.handleRequest EndTxn rejects trailing bytes" {
+    const Req = generated.end_txn_request.EndTxnRequest;
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+
+    const req = Req{
+        .transactional_id = "end-txn-trailing",
+        .producer_id = 1,
+        .producer_epoch = 0,
+        .committed = true,
+    };
+
+    var buf: [512]u8 = undefined;
+    var pos = buildTestRequest(&buf, 26, 3, 2609, header_mod.requestHeaderVersion(26, 3));
+    req.serialize(&buf, &pos, 3);
+
+    try expectTrailingByteRejected(&broker, buf[0..], pos);
 }
 
 test "Broker.handleRequest EndTxn authorization denial uses generated response" {
