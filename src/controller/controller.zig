@@ -3216,6 +3216,88 @@ test "Controller handleRequest ControllerRegistration rejects unknown controller
     try testing.expectEqual(ErrorCode.unknown_controller_id.toInt(), resp.error_code);
 }
 
+test "Controller handleRequest ControllerRegistration rejects invalid feature ranges" {
+    const Req = generated.controller_registration_request.ControllerRegistrationRequest;
+    const Resp = generated.controller_registration_response.ControllerRegistrationResponse;
+
+    var ctrl = Controller.init(testing.allocator, 1, "test-cluster");
+    defer ctrl.deinit();
+    try makeTestControllerLeader(&ctrl);
+
+    const listeners = [_]Req.Listener{.{
+        .name = "CONTROLLER",
+        .host = "127.0.0.1",
+        .port = 9093,
+        .security_protocol = 0,
+    }};
+    const features = [_]Req.Feature{.{
+        .name = "kraft.version",
+        .min_supported_version = 2,
+        .max_supported_version = 1,
+    }};
+
+    var buf: [512]u8 = undefined;
+    var pos = buildTestRequest(&buf, 70, 0, 7004, header_mod.requestHeaderVersion(70, 0));
+    const req = Req{
+        .controller_id = 1,
+        .listeners = &listeners,
+        .features = &features,
+    };
+    req.serialize(&buf, &pos, 0);
+
+    const response = ctrl.handleRequest(buf[0..pos]);
+    try testing.expect(response != null);
+    defer testing.allocator.free(response.?);
+
+    var rpos: usize = 0;
+    var resp_header = try ResponseHeader.deserialize(testing.allocator, response.?, &rpos, header_mod.responseHeaderVersion(70, 0));
+    defer resp_header.deinit(testing.allocator);
+    try testing.expectEqual(@as(i32, 7004), resp_header.correlation_id);
+
+    const resp = try Resp.deserialize(testing.allocator, response.?, &rpos, 0);
+    try testing.expectEqual(ErrorCode.invalid_registration.toInt(), resp.error_code);
+    try testing.expectEqual(@as(usize, 0), ctrl.raft_state.log.length());
+    try testing.expect(!ctrl.raft_state.pending_config_change);
+}
+
+test "Controller handleRequest ControllerRegistration rejects invalid listeners" {
+    const Req = generated.controller_registration_request.ControllerRegistrationRequest;
+    const Resp = generated.controller_registration_response.ControllerRegistrationResponse;
+
+    var ctrl = Controller.init(testing.allocator, 1, "test-cluster");
+    defer ctrl.deinit();
+    try makeTestControllerLeader(&ctrl);
+
+    const listeners = [_]Req.Listener{.{
+        .name = "CONTROLLER",
+        .host = "",
+        .port = 9093,
+        .security_protocol = 0,
+    }};
+
+    var buf: [512]u8 = undefined;
+    var pos = buildTestRequest(&buf, 70, 0, 7005, header_mod.requestHeaderVersion(70, 0));
+    const req = Req{
+        .controller_id = 1,
+        .listeners = &listeners,
+    };
+    req.serialize(&buf, &pos, 0);
+
+    const response = ctrl.handleRequest(buf[0..pos]);
+    try testing.expect(response != null);
+    defer testing.allocator.free(response.?);
+
+    var rpos: usize = 0;
+    var resp_header = try ResponseHeader.deserialize(testing.allocator, response.?, &rpos, header_mod.responseHeaderVersion(70, 0));
+    defer resp_header.deinit(testing.allocator);
+    try testing.expectEqual(@as(i32, 7005), resp_header.correlation_id);
+
+    const resp = try Resp.deserialize(testing.allocator, response.?, &rpos, 0);
+    try testing.expectEqual(ErrorCode.invalid_registration.toInt(), resp.error_code);
+    try testing.expectEqual(@as(usize, 0), ctrl.raft_state.log.length());
+    try testing.expect(!ctrl.raft_state.pending_config_change);
+}
+
 test "Controller handleRequest ControllerRegistration rejects malformed request" {
     const Resp = generated.controller_registration_response.ControllerRegistrationResponse;
 
