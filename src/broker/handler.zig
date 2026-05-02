@@ -3707,8 +3707,11 @@ pub const Broker = struct {
             21 => self.handleDeleteRecordsAuthorizationError(request_bytes, body_start, req_header, api_version, resp_header_version, err_code),
             22 => self.handleInitProducerIdAuthorizationError(req_header, api_version, resp_header_version, err_code),
             23 => self.handleOffsetForLeaderEpochAuthorizationError(request_bytes, body_start, req_header, api_version, resp_header_version, err_code),
+            24 => self.handleAddPartitionsToTxnAuthorizationError(request_bytes, body_start, req_header, api_version, resp_header_version, err_code),
             25 => self.handleAddOffsetsToTxnAuthorizationError(req_header, api_version, resp_header_version, err_code),
             26 => self.handleEndTxnAuthorizationError(req_header, api_version, resp_header_version, err_code),
+            27 => self.handleWriteTxnMarkersAuthorizationError(request_bytes, body_start, req_header, api_version, resp_header_version, err_code),
+            28 => self.handleTxnOffsetCommitAuthorizationError(request_bytes, body_start, req_header, api_version, resp_header_version, err_code),
             29 => self.handleDescribeAclsAuthorizationError(req_header, api_version, resp_header_version, err_code),
             30 => self.handleCreateAclsAuthorizationError(request_bytes, body_start, req_header, api_version, resp_header_version, err_code),
             31 => self.handleDeleteAclsAuthorizationError(request_bytes, body_start, req_header, api_version, resp_header_version, err_code),
@@ -5741,6 +5744,91 @@ pub const Broker = struct {
         return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
     }
 
+    fn handleAddPartitionsToTxnAuthorizationError(
+        self: *Broker,
+        request_bytes: []const u8,
+        body_start: usize,
+        req_header: *const RequestHeader,
+        api_version: i16,
+        resp_header_version: i16,
+        err_code: ErrorCode,
+    ) ?[]u8 {
+        const Req = generated.add_partitions_to_txn_request.AddPartitionsToTxnRequest;
+        const Resp = generated.add_partitions_to_txn_response.AddPartitionsToTxnResponse;
+        const TxnResult = Resp.AddPartitionsToTxnResult;
+        const err_i16 = @intFromEnum(err_code);
+
+        if (!validateAddPartitionsToTxnRequestFrame(request_bytes, body_start, api_version)) {
+            log.warn("Malformed denied AddPartitionsToTxn request", .{});
+            return null;
+        }
+
+        var pos = body_start;
+        var req = Req.deserialize(self.allocator, request_bytes, &pos, api_version) catch |err| {
+            log.warn("Failed to decode denied AddPartitionsToTxn request: {}", .{err});
+            return null;
+        };
+        defer self.freeAddPartitionsToTxnRequest(&req);
+
+        if (api_version >= 4) {
+            const txn_results = self.allocator.alloc(TxnResult, req.transactions.len) catch return null;
+            var txn_results_init: usize = 0;
+            defer {
+                self.freeAddPartitionsToTxnResults(txn_results[0..txn_results_init]);
+                if (txn_results.len > 0) self.allocator.free(txn_results);
+            }
+
+            for (req.transactions) |txn_req| {
+                const topic_results = self.buildAddPartitionsToTxnTopicResults(
+                    txn_req.producer_id,
+                    txn_req.producer_epoch,
+                    txn_req.verify_only,
+                    err_i16,
+                    txn_req.topics,
+                ) catch return null;
+                var transferred = false;
+                defer {
+                    if (!transferred) {
+                        self.freeAddPartitionsToTxnTopicResults(topic_results);
+                        if (topic_results.len > 0) self.allocator.free(topic_results);
+                    }
+                }
+
+                txn_results[txn_results_init] = .{
+                    .transactional_id = txn_req.transactional_id,
+                    .topic_results = topic_results,
+                };
+                txn_results_init += 1;
+                transferred = true;
+            }
+
+            const resp = Resp{
+                .throttle_time_ms = 0,
+                .error_code = err_i16,
+                .results_by_transaction = txn_results[0..txn_results_init],
+            };
+            return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+        }
+
+        const topic_results = self.buildAddPartitionsToTxnTopicResults(
+            req.v3_and_below_producer_id,
+            req.v3_and_below_producer_epoch,
+            false,
+            err_i16,
+            req.v3_and_below_topics,
+        ) catch return null;
+        defer {
+            self.freeAddPartitionsToTxnTopicResults(topic_results);
+            if (topic_results.len > 0) self.allocator.free(topic_results);
+        }
+
+        const resp = Resp{
+            .throttle_time_ms = 0,
+            .results_by_topic_v3_and_below = topic_results,
+        };
+        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+    }
+
     fn handleAddOffsetsToTxnAuthorizationError(self: *Broker, req_header: *const RequestHeader, api_version: i16, resp_header_version: i16, err_code: ErrorCode) ?[]u8 {
         const Resp = generated.add_offsets_to_txn_response.AddOffsetsToTxnResponse;
         const resp = Resp{
@@ -5755,6 +5843,147 @@ pub const Broker = struct {
         const resp = Resp{
             .throttle_time_ms = 0,
             .error_code = @intFromEnum(err_code),
+        };
+        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+    }
+
+    fn handleWriteTxnMarkersAuthorizationError(
+        self: *Broker,
+        request_bytes: []const u8,
+        body_start: usize,
+        req_header: *const RequestHeader,
+        api_version: i16,
+        resp_header_version: i16,
+        err_code: ErrorCode,
+    ) ?[]u8 {
+        const Req = generated.write_txn_markers_request.WriteTxnMarkersRequest;
+        const Resp = generated.write_txn_markers_response.WriteTxnMarkersResponse;
+        const MarkerResult = Resp.WritableTxnMarkerResult;
+        const TopicResult = MarkerResult.WritableTxnMarkerTopicResult;
+        const PartitionResult = TopicResult.WritableTxnMarkerPartitionResult;
+        const err_i16 = @intFromEnum(err_code);
+
+        if (!validateWriteTxnMarkersRequestFrame(request_bytes, body_start, api_version)) {
+            log.warn("Malformed denied WriteTxnMarkers request", .{});
+            return null;
+        }
+
+        var pos = body_start;
+        var req = Req.deserialize(self.allocator, request_bytes, &pos, api_version) catch |err| {
+            log.warn("Failed to decode denied WriteTxnMarkers request: {}", .{err});
+            return null;
+        };
+        defer self.freeWriteTxnMarkersRequest(&req);
+
+        const markers = self.allocator.alloc(MarkerResult, req.markers.len) catch return null;
+        var markers_init: usize = 0;
+        defer {
+            self.freeWriteTxnMarkersResults(markers[0..markers_init]);
+            if (markers.len > 0) self.allocator.free(markers);
+        }
+
+        for (req.markers) |marker| {
+            const topics = self.allocator.alloc(TopicResult, marker.topics.len) catch return null;
+            var topics_init: usize = 0;
+            var topics_transferred = false;
+            defer {
+                if (!topics_transferred) {
+                    self.freeWriteTxnMarkerTopicResults(topics[0..topics_init]);
+                    if (topics.len > 0) self.allocator.free(topics);
+                }
+            }
+
+            for (marker.topics) |topic_req| {
+                const partitions = self.allocator.alloc(PartitionResult, topic_req.partition_indexes.len) catch return null;
+                var partitions_transferred = false;
+                defer if (!partitions_transferred and partitions.len > 0) self.allocator.free(partitions);
+
+                for (topic_req.partition_indexes, 0..) |partition_index, partition_idx| {
+                    partitions[partition_idx] = .{
+                        .partition_index = partition_index,
+                        .error_code = err_i16,
+                    };
+                }
+
+                topics[topics_init] = .{
+                    .name = topic_req.name,
+                    .partitions = partitions,
+                };
+                topics_init += 1;
+                partitions_transferred = true;
+            }
+
+            markers[markers_init] = .{
+                .producer_id = marker.producer_id,
+                .topics = topics[0..topics_init],
+            };
+            markers_init += 1;
+            topics_transferred = true;
+        }
+
+        const resp = Resp{ .markers = markers[0..markers_init] };
+        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+    }
+
+    fn handleTxnOffsetCommitAuthorizationError(
+        self: *Broker,
+        request_bytes: []const u8,
+        body_start: usize,
+        req_header: *const RequestHeader,
+        api_version: i16,
+        resp_header_version: i16,
+        err_code: ErrorCode,
+    ) ?[]u8 {
+        const Req = generated.txn_offset_commit_request.TxnOffsetCommitRequest;
+        const Resp = generated.txn_offset_commit_response.TxnOffsetCommitResponse;
+        const TopicResponse = Resp.TxnOffsetCommitResponseTopic;
+        const PartitionResponse = TopicResponse.TxnOffsetCommitResponsePartition;
+        const err_i16 = @intFromEnum(err_code);
+
+        if (!validateTxnOffsetCommitRequestFrame(request_bytes, body_start, api_version)) {
+            log.warn("Malformed denied TxnOffsetCommit request", .{});
+            return null;
+        }
+
+        var pos = body_start;
+        var req = Req.deserialize(self.allocator, request_bytes, &pos, api_version) catch |err| {
+            log.warn("Failed to decode denied TxnOffsetCommit request: {}", .{err});
+            return null;
+        };
+        defer self.freeTxnOffsetCommitRequest(&req);
+
+        const topics = self.allocator.alloc(TopicResponse, req.topics.len) catch return null;
+        var topics_init: usize = 0;
+        defer {
+            self.freeTxnOffsetCommitTopics(topics[0..topics_init]);
+            if (topics.len > 0) self.allocator.free(topics);
+        }
+
+        for (req.topics) |topic_req| {
+            const partitions = self.allocator.alloc(PartitionResponse, topic_req.partitions.len) catch return null;
+            var transferred = false;
+            defer {
+                if (!transferred and partitions.len > 0) self.allocator.free(partitions);
+            }
+
+            for (topic_req.partitions, 0..) |partition_req, partition_idx| {
+                partitions[partition_idx] = .{
+                    .partition_index = partition_req.partition_index,
+                    .error_code = err_i16,
+                };
+            }
+
+            topics[topics_init] = .{
+                .name = topic_req.name,
+                .partitions = partitions,
+            };
+            topics_init += 1;
+            transferred = true;
+        }
+
+        const resp = Resp{
+            .throttle_time_ms = 0,
+            .topics = topics[0..topics_init],
         };
         return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
     }
@@ -22140,6 +22369,59 @@ test "Broker.handleRequest WriteTxnMarkers rejects truncated request" {
     try testing.expect(broker.handleRequest(buf[0..req_len]) == null);
 }
 
+test "Broker.handleRequest WriteTxnMarkers authorization denial uses generated response" {
+    const Req = generated.write_txn_markers_request.WriteTxnMarkersRequest;
+    const Resp = generated.write_txn_markers_response.WriteTxnMarkersResponse;
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+    try broker.authorizer.addAcl("other-client", .transactional_id, "*", .literal, .write, .allow, "*");
+
+    const partition_indexes = [_]i32{ 0, 1 };
+    const topics = [_]Req.WritableTxnMarker.WritableTxnMarkerTopic{.{
+        .name = "write-markers-auth-denied-topic",
+        .partition_indexes = &partition_indexes,
+    }};
+    const markers = [_]Req.WritableTxnMarker{.{
+        .producer_id = 789,
+        .producer_epoch = 6,
+        .transaction_result = true,
+        .topics = &topics,
+        .coordinator_epoch = 3,
+    }};
+    const req = Req{ .markers = &markers };
+
+    var buf: [512]u8 = undefined;
+    var pos = buildTestRequest(&buf, 27, 1, 2714, header_mod.requestHeaderVersion(27, 1));
+    req.serialize(&buf, &pos, 1);
+
+    const response = broker.handleRequest(buf[0..pos]);
+    try testing.expect(response != null);
+    defer testing.allocator.free(response.?);
+
+    var rpos: usize = 0;
+    var response_header = try ResponseHeader.deserialize(testing.allocator, response.?, &rpos, header_mod.responseHeaderVersion(27, 1));
+    defer response_header.deinit(testing.allocator);
+    try testing.expectEqual(@as(i32, 2714), response_header.correlation_id);
+
+    const resp = try Resp.deserialize(testing.allocator, response.?, &rpos, 1);
+    defer {
+        broker.freeWriteTxnMarkersResults(resp.markers);
+        if (resp.markers.len > 0) testing.allocator.free(resp.markers);
+    }
+    try testing.expectEqual(response.?.len, rpos);
+    try testing.expectEqual(@as(usize, 1), resp.markers.len);
+    try testing.expectEqual(@as(i64, 789), resp.markers[0].producer_id);
+    try testing.expectEqual(@as(usize, 1), resp.markers[0].topics.len);
+    try testing.expectEqualStrings("write-markers-auth-denied-topic", resp.markers[0].topics[0].name.?);
+    try testing.expectEqual(@as(usize, 2), resp.markers[0].topics[0].partitions.len);
+    try testing.expectEqual(@as(i32, 0), resp.markers[0].topics[0].partitions[0].partition_index);
+    try testing.expectEqual(@as(i32, 1), resp.markers[0].topics[0].partitions[1].partition_index);
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.transactional_id_authorization_failed)), resp.markers[0].topics[0].partitions[0].error_code);
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.transactional_id_authorization_failed)), resp.markers[0].topics[0].partitions[1].error_code);
+    try testing.expectEqual(@as(usize, 0), broker.txn_coordinator.transactionCount());
+}
+
 test "Broker.handleRequest ListTransactions v1 filters transaction state and producer id" {
     const Req = generated.list_transactions_request.ListTransactionsRequest;
     const Resp = generated.list_transactions_response.ListTransactionsResponse;
@@ -22888,6 +23170,74 @@ test "Broker.handleRequest TxnOffsetCommit rejects truncated request" {
     var buf: [128]u8 = undefined;
     const req_len = buildTestRequest(&buf, 28, 3, 2804, header_mod.requestHeaderVersion(28, 3));
     try testing.expect(broker.handleRequest(buf[0..req_len]) == null);
+}
+
+test "Broker.handleRequest TxnOffsetCommit authorization denial uses generated response" {
+    const Req = generated.txn_offset_commit_request.TxnOffsetCommitRequest;
+    const Resp = generated.txn_offset_commit_response.TxnOffsetCommitResponse;
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+    try broker.authorizer.addAcl("other-client", .transactional_id, "*", .literal, .write, .allow, "*");
+
+    const partitions = [_]Req.TxnOffsetCommitRequestTopic.TxnOffsetCommitRequestPartition{
+        .{
+            .partition_index = 0,
+            .committed_offset = 100,
+            .committed_leader_epoch = -1,
+            .committed_metadata = "denied-a",
+        },
+        .{
+            .partition_index = 1,
+            .committed_offset = 101,
+            .committed_leader_epoch = -1,
+            .committed_metadata = "denied-b",
+        },
+    };
+    const topics = [_]Req.TxnOffsetCommitRequestTopic{.{
+        .name = "txn-offset-auth-denied-topic",
+        .partitions = &partitions,
+    }};
+    const req = Req{
+        .transactional_id = "txn-offset-auth-denied",
+        .group_id = "txn-offset-auth-denied-group",
+        .producer_id = 321,
+        .producer_epoch = 2,
+        .generation_id = -1,
+        .member_id = "",
+        .group_instance_id = null,
+        .topics = &topics,
+    };
+
+    var buf: [1024]u8 = undefined;
+    var pos = buildTestRequest(&buf, 28, 3, 2814, header_mod.requestHeaderVersion(28, 3));
+    req.serialize(&buf, &pos, 3);
+
+    const response = broker.handleRequest(buf[0..pos]);
+    try testing.expect(response != null);
+    defer testing.allocator.free(response.?);
+
+    var rpos: usize = 0;
+    var response_header = try ResponseHeader.deserialize(testing.allocator, response.?, &rpos, header_mod.responseHeaderVersion(28, 3));
+    defer response_header.deinit(testing.allocator);
+    try testing.expectEqual(@as(i32, 2814), response_header.correlation_id);
+
+    const resp = try Resp.deserialize(testing.allocator, response.?, &rpos, 3);
+    defer {
+        broker.freeTxnOffsetCommitTopics(resp.topics);
+        if (resp.topics.len > 0) testing.allocator.free(resp.topics);
+    }
+    try testing.expectEqual(response.?.len, rpos);
+    try testing.expectEqual(@as(i32, 0), resp.throttle_time_ms);
+    try testing.expectEqual(@as(usize, 1), resp.topics.len);
+    try testing.expectEqualStrings("txn-offset-auth-denied-topic", resp.topics[0].name.?);
+    try testing.expectEqual(@as(usize, 2), resp.topics[0].partitions.len);
+    try testing.expectEqual(@as(i32, 0), resp.topics[0].partitions[0].partition_index);
+    try testing.expectEqual(@as(i32, 1), resp.topics[0].partitions[1].partition_index);
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.transactional_id_authorization_failed)), resp.topics[0].partitions[0].error_code);
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.transactional_id_authorization_failed)), resp.topics[0].partitions[1].error_code);
+    try testing.expectEqual(@as(?i64, null), try broker.groups.fetchOffset("txn-offset-auth-denied-group", "txn-offset-auth-denied-topic", 0));
+    try testing.expectEqual(@as(?i64, null), try broker.groups.fetchOffset("txn-offset-auth-denied-group", "txn-offset-auth-denied-topic", 1));
 }
 
 test "Broker.handleRequest DescribeAcls v2 returns generated filtered ACLs" {
@@ -29795,6 +30145,114 @@ test "Broker.handleRequest AddPartitionsToTxn rejects truncated request" {
     var buf: [128]u8 = undefined;
     const req_len = buildTestRequest(&buf, 24, 4, 2405, header_mod.requestHeaderVersion(24, 4));
     try testing.expect(broker.handleRequest(buf[0..req_len]) == null);
+}
+
+test "Broker.handleRequest AddPartitionsToTxn v4 authorization denial uses generated response" {
+    const Req = generated.add_partitions_to_txn_request.AddPartitionsToTxnRequest;
+    const Topic = generated.add_partitions_to_txn_request.AddPartitionsToTxnTopic;
+    const Txn = Req.AddPartitionsToTxnTransaction;
+    const Resp = generated.add_partitions_to_txn_response.AddPartitionsToTxnResponse;
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+    try broker.authorizer.addAcl("other-client", .transactional_id, "*", .literal, .write, .allow, "*");
+
+    const partitions = [_]i32{ 0, 1 };
+    const topics = [_]Topic{.{
+        .name = "add-parts-auth-denied-topic",
+        .partitions = &partitions,
+    }};
+    const txns = [_]Txn{.{
+        .transactional_id = "add-parts-auth-denied",
+        .producer_id = 123,
+        .producer_epoch = 4,
+        .verify_only = false,
+        .topics = &topics,
+    }};
+    const req = Req{ .transactions = &txns };
+
+    var buf: [512]u8 = undefined;
+    var pos = buildTestRequest(&buf, 24, 4, 2414, header_mod.requestHeaderVersion(24, 4));
+    req.serialize(&buf, &pos, 4);
+
+    const response = broker.handleRequest(buf[0..pos]);
+    try testing.expect(response != null);
+    defer testing.allocator.free(response.?);
+
+    var rpos: usize = 0;
+    var response_header = try ResponseHeader.deserialize(testing.allocator, response.?, &rpos, header_mod.responseHeaderVersion(24, 4));
+    defer response_header.deinit(testing.allocator);
+    try testing.expectEqual(@as(i32, 2414), response_header.correlation_id);
+
+    const resp = try Resp.deserialize(testing.allocator, response.?, &rpos, 4);
+    defer {
+        broker.freeAddPartitionsToTxnResults(resp.results_by_transaction);
+        if (resp.results_by_transaction.len > 0) testing.allocator.free(resp.results_by_transaction);
+    }
+    try testing.expectEqual(response.?.len, rpos);
+    try testing.expectEqual(@as(i32, 0), resp.throttle_time_ms);
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.transactional_id_authorization_failed)), resp.error_code);
+    try testing.expectEqual(@as(usize, 1), resp.results_by_transaction.len);
+    try testing.expectEqualStrings("add-parts-auth-denied", resp.results_by_transaction[0].transactional_id.?);
+    try testing.expectEqual(@as(usize, 1), resp.results_by_transaction[0].topic_results.len);
+    try testing.expectEqualStrings("add-parts-auth-denied-topic", resp.results_by_transaction[0].topic_results[0].name.?);
+    try testing.expectEqual(@as(usize, 2), resp.results_by_transaction[0].topic_results[0].results_by_partition.len);
+    try testing.expectEqual(@as(i32, 0), resp.results_by_transaction[0].topic_results[0].results_by_partition[0].partition_index);
+    try testing.expectEqual(@as(i32, 1), resp.results_by_transaction[0].topic_results[0].results_by_partition[1].partition_index);
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.transactional_id_authorization_failed)), resp.results_by_transaction[0].topic_results[0].results_by_partition[0].partition_error_code);
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.transactional_id_authorization_failed)), resp.results_by_transaction[0].topic_results[0].results_by_partition[1].partition_error_code);
+    try testing.expectEqual(@as(usize, 0), broker.txn_coordinator.transactionCount());
+}
+
+test "Broker.handleRequest AddPartitionsToTxn v3 authorization denial uses generated response" {
+    const Req = generated.add_partitions_to_txn_request.AddPartitionsToTxnRequest;
+    const Topic = generated.add_partitions_to_txn_request.AddPartitionsToTxnTopic;
+    const Resp = generated.add_partitions_to_txn_response.AddPartitionsToTxnResponse;
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+    try broker.authorizer.addAcl("other-client", .transactional_id, "*", .literal, .write, .allow, "*");
+
+    const partitions = [_]i32{ 2, 3 };
+    const topics = [_]Topic{.{
+        .name = "add-parts-auth-denied-legacy-topic",
+        .partitions = &partitions,
+    }};
+    const req = Req{
+        .v3_and_below_transactional_id = "add-parts-auth-denied-legacy",
+        .v3_and_below_producer_id = 456,
+        .v3_and_below_producer_epoch = 5,
+        .v3_and_below_topics = &topics,
+    };
+
+    var buf: [512]u8 = undefined;
+    var pos = buildTestRequest(&buf, 24, 3, 2413, header_mod.requestHeaderVersion(24, 3));
+    req.serialize(&buf, &pos, 3);
+
+    const response = broker.handleRequest(buf[0..pos]);
+    try testing.expect(response != null);
+    defer testing.allocator.free(response.?);
+
+    var rpos: usize = 0;
+    var response_header = try ResponseHeader.deserialize(testing.allocator, response.?, &rpos, header_mod.responseHeaderVersion(24, 3));
+    defer response_header.deinit(testing.allocator);
+    try testing.expectEqual(@as(i32, 2413), response_header.correlation_id);
+
+    const resp = try Resp.deserialize(testing.allocator, response.?, &rpos, 3);
+    defer {
+        broker.freeAddPartitionsToTxnTopicResults(resp.results_by_topic_v3_and_below);
+        if (resp.results_by_topic_v3_and_below.len > 0) testing.allocator.free(resp.results_by_topic_v3_and_below);
+    }
+    try testing.expectEqual(response.?.len, rpos);
+    try testing.expectEqual(@as(i32, 0), resp.throttle_time_ms);
+    try testing.expectEqual(@as(usize, 1), resp.results_by_topic_v3_and_below.len);
+    try testing.expectEqualStrings("add-parts-auth-denied-legacy-topic", resp.results_by_topic_v3_and_below[0].name.?);
+    try testing.expectEqual(@as(usize, 2), resp.results_by_topic_v3_and_below[0].results_by_partition.len);
+    try testing.expectEqual(@as(i32, 2), resp.results_by_topic_v3_and_below[0].results_by_partition[0].partition_index);
+    try testing.expectEqual(@as(i32, 3), resp.results_by_topic_v3_and_below[0].results_by_partition[1].partition_index);
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.transactional_id_authorization_failed)), resp.results_by_topic_v3_and_below[0].results_by_partition[0].partition_error_code);
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.transactional_id_authorization_failed)), resp.results_by_topic_v3_and_below[0].results_by_partition[1].partition_error_code);
+    try testing.expectEqual(@as(usize, 0), broker.txn_coordinator.transactionCount());
 }
 
 fn handleAddOffsetsToTxnForTest(
