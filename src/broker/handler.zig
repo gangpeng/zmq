@@ -3688,6 +3688,11 @@ pub const Broker = struct {
         const err_code = authorizationErrorCode(resource_type);
         return switch (api_key) {
             2 => self.handleListOffsetsAuthorizationError(request_bytes, body_start, req_header, api_version, resp_header_version, err_code),
+            10 => self.handleFindCoordinatorAuthorizationError(request_bytes, body_start, req_header, api_version, resp_header_version, err_code),
+            11 => self.handleJoinGroupAuthorizationError(request_bytes, body_start, req_header, api_version, resp_header_version, err_code),
+            12 => self.handleHeartbeatAuthorizationError(request_bytes, body_start, req_header, api_version, resp_header_version, err_code),
+            13 => self.handleLeaveGroupAuthorizationError(request_bytes, body_start, req_header, api_version, resp_header_version, err_code),
+            14 => self.handleSyncGroupAuthorizationError(request_bytes, body_start, req_header, api_version, resp_header_version, err_code),
             15 => self.handleDescribeGroupsAuthorizationError(request_bytes, body_start, req_header, api_version, resp_header_version, err_code),
             16 => self.handleListGroupsAuthorizationError(req_header, api_version, resp_header_version, err_code),
             21 => self.handleDeleteRecordsAuthorizationError(request_bytes, body_start, req_header, api_version, resp_header_version, err_code),
@@ -3908,6 +3913,201 @@ pub const Broker = struct {
         const resp = Resp{
             .throttle_time_ms = 0,
             .topics = topics[0..topics_init],
+        };
+        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+    }
+
+    fn handleFindCoordinatorAuthorizationError(
+        self: *Broker,
+        request_bytes: []const u8,
+        body_start: usize,
+        req_header: *const RequestHeader,
+        api_version: i16,
+        resp_header_version: i16,
+        err_code: ErrorCode,
+    ) ?[]u8 {
+        const Req = generated.find_coordinator_request.FindCoordinatorRequest;
+        const Resp = generated.find_coordinator_response.FindCoordinatorResponse;
+        const Coordinator = Resp.Coordinator;
+
+        if (!validateFindCoordinatorRequestFrame(request_bytes, body_start, api_version)) {
+            log.warn("Malformed denied FindCoordinator request", .{});
+            return null;
+        }
+
+        var pos = body_start;
+        var req = Req.deserialize(self.allocator, request_bytes, &pos, api_version) catch |err| {
+            log.warn("Failed to decode denied FindCoordinator request: {}", .{err});
+            return null;
+        };
+        defer self.freeFindCoordinatorRequest(&req);
+
+        var coordinators: []Coordinator = &.{};
+        if (api_version >= 4 and req.coordinator_keys.len > 0) {
+            coordinators = self.allocator.alloc(Coordinator, req.coordinator_keys.len) catch return null;
+            for (req.coordinator_keys, 0..) |key, idx| {
+                coordinators[idx] = .{
+                    .key = key,
+                    .node_id = -1,
+                    .host = "",
+                    .port = -1,
+                    .error_code = @intFromEnum(err_code),
+                    .error_message = "Not authorized",
+                };
+            }
+        }
+        defer if (coordinators.len > 0) self.allocator.free(coordinators);
+
+        const resp = Resp{
+            .throttle_time_ms = 0,
+            .error_code = @intFromEnum(err_code),
+            .error_message = "Not authorized",
+            .node_id = -1,
+            .host = "",
+            .port = -1,
+            .coordinators = coordinators,
+        };
+        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+    }
+
+    fn handleJoinGroupAuthorizationError(
+        self: *Broker,
+        request_bytes: []const u8,
+        body_start: usize,
+        req_header: *const RequestHeader,
+        api_version: i16,
+        resp_header_version: i16,
+        err_code: ErrorCode,
+    ) ?[]u8 {
+        const Req = generated.join_group_request.JoinGroupRequest;
+        const Resp = generated.join_group_response.JoinGroupResponse;
+
+        if (!validateJoinGroupRequestFrame(request_bytes, body_start, api_version)) {
+            log.warn("Malformed denied JoinGroup request", .{});
+            return null;
+        }
+
+        var pos = body_start;
+        var req = Req.deserialize(self.allocator, request_bytes, &pos, api_version) catch |err| {
+            log.warn("Failed to decode denied JoinGroup request: {}", .{err});
+            return null;
+        };
+        defer self.freeJoinGroupRequest(&req);
+
+        const protocol_type = req.protocol_type orelse "";
+        const resp = Resp{
+            .throttle_time_ms = 0,
+            .error_code = @intFromEnum(err_code),
+            .generation_id = -1,
+            .protocol_type = protocol_type,
+            .protocol_name = "",
+            .leader = "",
+            .skip_assignment = false,
+            .member_id = req.member_id orelse "",
+            .members = &.{},
+        };
+        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+    }
+
+    fn handleHeartbeatAuthorizationError(
+        self: *Broker,
+        request_bytes: []const u8,
+        body_start: usize,
+        req_header: *const RequestHeader,
+        api_version: i16,
+        resp_header_version: i16,
+        err_code: ErrorCode,
+    ) ?[]u8 {
+        const Resp = generated.heartbeat_response.HeartbeatResponse;
+
+        if (!validateHeartbeatRequestFrame(request_bytes, body_start, api_version)) {
+            log.warn("Malformed denied Heartbeat request", .{});
+            return null;
+        }
+
+        const resp = Resp{
+            .throttle_time_ms = 0,
+            .error_code = @intFromEnum(err_code),
+        };
+        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+    }
+
+    fn handleLeaveGroupAuthorizationError(
+        self: *Broker,
+        request_bytes: []const u8,
+        body_start: usize,
+        req_header: *const RequestHeader,
+        api_version: i16,
+        resp_header_version: i16,
+        err_code: ErrorCode,
+    ) ?[]u8 {
+        const Req = generated.leave_group_request.LeaveGroupRequest;
+        const Resp = generated.leave_group_response.LeaveGroupResponse;
+        const MemberResponse = Resp.MemberResponse;
+
+        if (!validateLeaveGroupRequestFrame(request_bytes, body_start, api_version)) {
+            log.warn("Malformed denied LeaveGroup request", .{});
+            return null;
+        }
+
+        var pos = body_start;
+        var req = Req.deserialize(self.allocator, request_bytes, &pos, api_version) catch |err| {
+            log.warn("Failed to decode denied LeaveGroup request: {}", .{err});
+            return null;
+        };
+        defer self.freeLeaveGroupRequest(&req);
+
+        var members: []MemberResponse = &.{};
+        if (api_version >= 3 and req.members.len > 0) {
+            members = self.allocator.alloc(MemberResponse, req.members.len) catch return null;
+            for (req.members, 0..) |member, idx| {
+                members[idx] = .{
+                    .member_id = member.member_id,
+                    .group_instance_id = member.group_instance_id,
+                    .error_code = @intFromEnum(err_code),
+                };
+            }
+        }
+        defer if (members.len > 0) self.allocator.free(members);
+
+        const resp = Resp{
+            .throttle_time_ms = 0,
+            .error_code = @intFromEnum(err_code),
+            .members = members,
+        };
+        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+    }
+
+    fn handleSyncGroupAuthorizationError(
+        self: *Broker,
+        request_bytes: []const u8,
+        body_start: usize,
+        req_header: *const RequestHeader,
+        api_version: i16,
+        resp_header_version: i16,
+        err_code: ErrorCode,
+    ) ?[]u8 {
+        const Req = generated.sync_group_request.SyncGroupRequest;
+        const Resp = generated.sync_group_response.SyncGroupResponse;
+
+        if (!validateSyncGroupRequestFrame(request_bytes, body_start, api_version)) {
+            log.warn("Malformed denied SyncGroup request", .{});
+            return null;
+        }
+
+        var pos = body_start;
+        var req = Req.deserialize(self.allocator, request_bytes, &pos, api_version) catch |err| {
+            log.warn("Failed to decode denied SyncGroup request: {}", .{err});
+            return null;
+        };
+        defer self.freeSyncGroupRequest(&req);
+
+        const resp = Resp{
+            .throttle_time_ms = 0,
+            .error_code = @intFromEnum(err_code),
+            .protocol_type = req.protocol_type orelse "",
+            .protocol_name = req.protocol_name orelse "",
+            .assignment = null,
         };
         return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
     }
@@ -17821,6 +18021,53 @@ test "Broker.handleRequest FindCoordinator rejects truncated request" {
     try testing.expect(broker.handleRequest(buf[0..req_len]) == null);
 }
 
+test "Broker.handleRequest FindCoordinator v4 authorization denial uses generated response" {
+    const Req = generated.find_coordinator_request.FindCoordinatorRequest;
+    const Resp = generated.find_coordinator_response.FindCoordinatorResponse;
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+    try broker.authorizer.addAcl("other-client", .group, "*", .literal, .read, .allow, "*");
+
+    const keys = [_]?[]const u8{ "denied-group-a", "denied-group-b" };
+    const req = Req{
+        .key_type = 0,
+        .coordinator_keys = &keys,
+    };
+
+    var buf: [512]u8 = undefined;
+    var pos = buildTestRequest(&buf, 10, 4, 1009, header_mod.requestHeaderVersion(10, 4));
+    req.serialize(&buf, &pos, 4);
+
+    const response = broker.handleRequest(buf[0..pos]);
+    try testing.expect(response != null);
+    defer testing.allocator.free(response.?);
+
+    var rpos: usize = 0;
+    var response_header = try ResponseHeader.deserialize(testing.allocator, response.?, &rpos, header_mod.responseHeaderVersion(10, 4));
+    defer response_header.deinit(testing.allocator);
+    try testing.expectEqual(@as(i32, 1009), response_header.correlation_id);
+
+    const resp = try Resp.deserialize(testing.allocator, response.?, &rpos, 4);
+    defer if (resp.coordinators.len > 0) testing.allocator.free(resp.coordinators);
+
+    try testing.expectEqual(response.?.len, rpos);
+    try testing.expectEqual(@as(i32, 0), resp.throttle_time_ms);
+    try testing.expectEqual(@as(usize, 2), resp.coordinators.len);
+    try testing.expectEqualStrings("denied-group-a", resp.coordinators[0].key.?);
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.group_authorization_failed)), resp.coordinators[0].error_code);
+    try testing.expectEqual(@as(i32, -1), resp.coordinators[0].node_id);
+    try testing.expectEqualStrings("", resp.coordinators[0].host.?);
+    try testing.expectEqual(@as(i32, -1), resp.coordinators[0].port);
+    try testing.expectEqualStrings("Not authorized", resp.coordinators[0].error_message.?);
+    try testing.expectEqualStrings("denied-group-b", resp.coordinators[1].key.?);
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.group_authorization_failed)), resp.coordinators[1].error_code);
+    try testing.expectEqual(@as(i32, -1), resp.coordinators[1].node_id);
+    try testing.expectEqualStrings("", resp.coordinators[1].host.?);
+    try testing.expectEqual(@as(i32, -1), resp.coordinators[1].port);
+    try testing.expectEqualStrings("Not authorized", resp.coordinators[1].error_message.?);
+}
+
 test "Broker.handleRequest SaslHandshake v1 returns generated mechanisms and stores selection" {
     const Req = generated.sasl_handshake_request.SaslHandshakeRequest;
     const Resp = generated.sasl_handshake_response.SaslHandshakeResponse;
@@ -28651,6 +28898,58 @@ test "Broker.handleRequest JoinGroup rejects truncated request" {
     try testing.expect(broker.handleRequest(buf[0..req_len]) == null);
 }
 
+test "Broker.handleRequest JoinGroup v9 authorization denial uses generated response" {
+    const Req = generated.join_group_request.JoinGroupRequest;
+    const Protocol = Req.JoinGroupRequestProtocol;
+    const Resp = generated.join_group_response.JoinGroupResponse;
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+    try broker.authorizer.addAcl("other-client", .group, "*", .literal, .read, .allow, "*");
+
+    const protocols = [_]Protocol{.{
+        .name = "range",
+        .metadata = "denied-metadata",
+    }};
+    const req = Req{
+        .group_id = "jg-denied-group",
+        .session_timeout_ms = 30000,
+        .rebalance_timeout_ms = 300000,
+        .member_id = "member-denied",
+        .group_instance_id = null,
+        .protocol_type = "consumer",
+        .protocols = &protocols,
+        .reason = "auth-denial-test",
+    };
+
+    var buf: [512]u8 = undefined;
+    var pos = buildTestRequest(&buf, 11, 9, 1113, header_mod.requestHeaderVersion(11, 9));
+    req.serialize(&buf, &pos, 9);
+
+    const response = broker.handleRequest(buf[0..pos]);
+    try testing.expect(response != null);
+    defer testing.allocator.free(response.?);
+
+    var rpos: usize = 0;
+    var response_header = try ResponseHeader.deserialize(testing.allocator, response.?, &rpos, header_mod.responseHeaderVersion(11, 9));
+    defer response_header.deinit(testing.allocator);
+    try testing.expectEqual(@as(i32, 1113), response_header.correlation_id);
+
+    const resp = try Resp.deserialize(testing.allocator, response.?, &rpos, 9);
+    defer if (resp.members.len > 0) testing.allocator.free(resp.members);
+
+    try testing.expectEqual(response.?.len, rpos);
+    try testing.expectEqual(@as(i32, 0), resp.throttle_time_ms);
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.group_authorization_failed)), resp.error_code);
+    try testing.expectEqual(@as(i32, -1), resp.generation_id);
+    try testing.expectEqualStrings("consumer", resp.protocol_type.?);
+    try testing.expectEqualStrings("", resp.protocol_name.?);
+    try testing.expectEqualStrings("", resp.leader.?);
+    try testing.expect(!resp.skip_assignment);
+    try testing.expectEqualStrings("member-denied", resp.member_id.?);
+    try testing.expectEqual(@as(usize, 0), resp.members.len);
+}
+
 test "Broker.handleRequest SyncGroup (key=14) after JoinGroup" {
     var broker = Broker.init(testing.allocator, 1, 9092);
     defer broker.deinit();
@@ -28954,6 +29253,52 @@ test "Broker.handleRequest SyncGroup rejects truncated request" {
     var buf: [128]u8 = undefined;
     const req_len = buildTestRequest(&buf, 14, 5, 1406, header_mod.requestHeaderVersion(14, 5));
     try testing.expect(broker.handleRequest(buf[0..req_len]) == null);
+}
+
+test "Broker.handleRequest SyncGroup v5 authorization denial uses generated response" {
+    const Req = generated.sync_group_request.SyncGroupRequest;
+    const Assignment = Req.SyncGroupRequestAssignment;
+    const Resp = generated.sync_group_response.SyncGroupResponse;
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+    try broker.authorizer.addAcl("other-client", .group, "*", .literal, .read, .allow, "*");
+
+    const assignments = [_]Assignment{.{
+        .member_id = "sync-denied-member",
+        .assignment = "sync-denied-assignment",
+    }};
+    const req = Req{
+        .group_id = "sg-denied-group",
+        .generation_id = 7,
+        .member_id = "sync-denied-member",
+        .group_instance_id = null,
+        .protocol_type = "consumer",
+        .protocol_name = "range",
+        .assignments = &assignments,
+    };
+
+    var buf: [512]u8 = undefined;
+    var pos = buildTestRequest(&buf, 14, 5, 1416, header_mod.requestHeaderVersion(14, 5));
+    req.serialize(&buf, &pos, 5);
+
+    const response = broker.handleRequest(buf[0..pos]);
+    try testing.expect(response != null);
+    defer testing.allocator.free(response.?);
+
+    var rpos: usize = 0;
+    var response_header = try ResponseHeader.deserialize(testing.allocator, response.?, &rpos, header_mod.responseHeaderVersion(14, 5));
+    defer response_header.deinit(testing.allocator);
+    try testing.expectEqual(@as(i32, 1416), response_header.correlation_id);
+
+    const resp = try Resp.deserialize(testing.allocator, response.?, &rpos, 5);
+
+    try testing.expectEqual(response.?.len, rpos);
+    try testing.expectEqual(@as(i32, 0), resp.throttle_time_ms);
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.group_authorization_failed)), resp.error_code);
+    try testing.expectEqualStrings("consumer", resp.protocol_type.?);
+    try testing.expectEqualStrings("range", resp.protocol_name.?);
+    try testing.expect(resp.assignment == null);
 }
 
 test "Broker.handleRequest DescribeGroups v5 returns generated response" {
@@ -32162,6 +32507,41 @@ test "Broker.handleRequest Heartbeat rejects truncated request" {
     try testing.expect(broker.handleRequest(buf[0..req_len]) == null);
 }
 
+test "Broker.handleRequest Heartbeat v4 authorization denial uses generated response" {
+    const Req = generated.heartbeat_request.HeartbeatRequest;
+    const Resp = generated.heartbeat_response.HeartbeatResponse;
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+    try broker.authorizer.addAcl("other-client", .group, "*", .literal, .read, .allow, "*");
+
+    const req = Req{
+        .group_id = "hb-denied-group",
+        .generation_id = 3,
+        .member_id = "hb-denied-member",
+        .group_instance_id = null,
+    };
+
+    var buf: [512]u8 = undefined;
+    var pos = buildTestRequest(&buf, 12, 4, 1208, header_mod.requestHeaderVersion(12, 4));
+    req.serialize(&buf, &pos, 4);
+
+    const response = broker.handleRequest(buf[0..pos]);
+    try testing.expect(response != null);
+    defer testing.allocator.free(response.?);
+
+    var rpos: usize = 0;
+    var response_header = try ResponseHeader.deserialize(testing.allocator, response.?, &rpos, header_mod.responseHeaderVersion(12, 4));
+    defer response_header.deinit(testing.allocator);
+    try testing.expectEqual(@as(i32, 1208), response_header.correlation_id);
+
+    const resp = try Resp.deserialize(testing.allocator, response.?, &rpos, 4);
+
+    try testing.expectEqual(response.?.len, rpos);
+    try testing.expectEqual(@as(i32, 0), resp.throttle_time_ms);
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.group_authorization_failed)), resp.error_code);
+}
+
 test "Broker.handleRequest LeaveGroup v4 returns generated member results" {
     const Req = generated.leave_group_request.LeaveGroupRequest;
     const Resp = generated.leave_group_response.LeaveGroupResponse;
@@ -32332,6 +32712,51 @@ test "Broker.handleRequest LeaveGroup v4 returns generated per-member error" {
     try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.none)), resp.error_code);
     try testing.expectEqual(@as(usize, 1), resp.members.len);
     try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.unknown_member_id)), resp.members[0].error_code);
+}
+
+test "Broker.handleRequest LeaveGroup v4 authorization denial uses generated response" {
+    const Req = generated.leave_group_request.LeaveGroupRequest;
+    const Resp = generated.leave_group_response.LeaveGroupResponse;
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+    try broker.authorizer.addAcl("other-client", .group, "*", .literal, .read, .allow, "*");
+
+    const members = [_]Req.MemberIdentity{
+        .{ .member_id = "leave-denied-member-a", .group_instance_id = null },
+        .{ .member_id = "leave-denied-member-b", .group_instance_id = "leave-denied-instance-b" },
+    };
+    const req = Req{
+        .group_id = "leave-denied-group",
+        .members = &members,
+    };
+
+    var buf: [512]u8 = undefined;
+    var pos = buildTestRequest(&buf, 13, 4, 1309, header_mod.requestHeaderVersion(13, 4));
+    req.serialize(&buf, &pos, 4);
+
+    const response = broker.handleRequest(buf[0..pos]);
+    try testing.expect(response != null);
+    defer testing.allocator.free(response.?);
+
+    var rpos: usize = 0;
+    var response_header = try ResponseHeader.deserialize(testing.allocator, response.?, &rpos, header_mod.responseHeaderVersion(13, 4));
+    defer response_header.deinit(testing.allocator);
+    try testing.expectEqual(@as(i32, 1309), response_header.correlation_id);
+
+    const resp = try Resp.deserialize(testing.allocator, response.?, &rpos, 4);
+    defer if (resp.members.len > 0) testing.allocator.free(resp.members);
+
+    try testing.expectEqual(response.?.len, rpos);
+    try testing.expectEqual(@as(i32, 0), resp.throttle_time_ms);
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.group_authorization_failed)), resp.error_code);
+    try testing.expectEqual(@as(usize, 2), resp.members.len);
+    try testing.expectEqualStrings("leave-denied-member-a", resp.members[0].member_id.?);
+    try testing.expect(resp.members[0].group_instance_id == null);
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.group_authorization_failed)), resp.members[0].error_code);
+    try testing.expectEqualStrings("leave-denied-member-b", resp.members[1].member_id.?);
+    try testing.expectEqualStrings("leave-denied-instance-b", resp.members[1].group_instance_id.?);
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.group_authorization_failed)), resp.members[1].error_code);
 }
 
 test "Broker.handleRequest LeaveGroup rejects truncated request" {
