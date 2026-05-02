@@ -18422,7 +18422,7 @@ pub const Broker = struct {
             if (flexible) ser.skipTaggedFields(buf, &pos) catch return false;
         }
         if (flexible) ser.skipTaggedFields(buf, &pos) catch return false;
-        return true;
+        return pos == buf.len;
     }
 
     fn validateTxnOffsetCommitRequestFrame(buf: []const u8, start_pos: usize, api_version: i16) bool {
@@ -22837,6 +22837,33 @@ test "Broker.handleRequest WriteTxnMarkers rejects truncated request" {
     var buf: [128]u8 = undefined;
     const req_len = buildTestRequest(&buf, 27, 1, 2702, header_mod.requestHeaderVersion(27, 1));
     try testing.expect(broker.handleRequest(buf[0..req_len]) == null);
+}
+
+test "Broker.handleRequest WriteTxnMarkers rejects trailing bytes" {
+    const Req = generated.write_txn_markers_request.WriteTxnMarkersRequest;
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+
+    const partition_indexes = [_]i32{0};
+    const topics = [_]Req.WritableTxnMarker.WritableTxnMarkerTopic{.{
+        .name = "write-markers-trailing-topic",
+        .partition_indexes = &partition_indexes,
+    }};
+    const markers = [_]Req.WritableTxnMarker{.{
+        .producer_id = 789,
+        .producer_epoch = 6,
+        .transaction_result = true,
+        .topics = &topics,
+        .coordinator_epoch = 3,
+    }};
+    const req = Req{ .markers = &markers };
+
+    var buf: [512]u8 = undefined;
+    var pos = buildTestRequest(&buf, 27, 1, 2715, header_mod.requestHeaderVersion(27, 1));
+    req.serialize(&buf, &pos, 1);
+
+    try expectTrailingByteRejected(&broker, buf[0..], pos);
 }
 
 test "Broker.handleRequest WriteTxnMarkers authorization denial uses generated response" {
