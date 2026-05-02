@@ -3733,6 +3733,7 @@ pub const Broker = struct {
             57 => self.handleUpdateFeaturesAuthorizationError(request_bytes, body_start, req_header, api_version, resp_header_version, err_code),
             60 => self.handleDescribeClusterAuthorizationError(req_header, api_version, resp_header_version, err_code),
             61 => self.handleDescribeProducersAuthorizationError(request_bytes, body_start, req_header, api_version, resp_header_version, err_code),
+            65 => self.handleDescribeTransactionsAuthorizationError(request_bytes, body_start, req_header, api_version, resp_header_version, err_code),
             66 => self.handleListTransactionsAuthorizationError(req_header, api_version, resp_header_version, err_code),
             69 => self.handleConsumerGroupDescribeAuthorizationError(request_bytes, body_start, req_header, api_version, resp_header_version, err_code),
             else => self.handleGenericAuthorizationError(req_header, resp_header_version, err_code),
@@ -5885,6 +5886,57 @@ pub const Broker = struct {
             .error_code = @intFromEnum(err_code),
             .unknown_state_filters = &.{},
             .transaction_states = &.{},
+        };
+        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+    }
+
+    fn handleDescribeTransactionsAuthorizationError(
+        self: *Broker,
+        request_bytes: []const u8,
+        body_start: usize,
+        req_header: *const RequestHeader,
+        api_version: i16,
+        resp_header_version: i16,
+        err_code: ErrorCode,
+    ) ?[]u8 {
+        const Req = generated.describe_transactions_request.DescribeTransactionsRequest;
+        const Resp = generated.describe_transactions_response.DescribeTransactionsResponse;
+        const TransactionState = Resp.TransactionState;
+
+        if (!validateDescribeTransactionsRequestFrame(request_bytes, body_start)) {
+            log.warn("Malformed denied DescribeTransactions request", .{});
+            return null;
+        }
+
+        var pos = body_start;
+        var req = Req.deserialize(self.allocator, request_bytes, &pos, api_version) catch |err| {
+            log.warn("Failed to decode denied DescribeTransactions request: {}", .{err});
+            return null;
+        };
+        defer self.freeDescribeTransactionsRequest(&req);
+
+        var states: []TransactionState = &.{};
+        if (req.transactional_ids.len > 0) {
+            states = self.allocator.alloc(TransactionState, req.transactional_ids.len) catch return null;
+        }
+        defer if (states.len > 0) self.allocator.free(states);
+
+        for (req.transactional_ids, 0..) |transactional_id, idx| {
+            states[idx] = .{
+                .error_code = @intFromEnum(err_code),
+                .transactional_id = transactional_id,
+                .transaction_state = "Dead",
+                .transaction_timeout_ms = 0,
+                .transaction_start_time_ms = -1,
+                .producer_id = -1,
+                .producer_epoch = -1,
+                .topics = &.{},
+            };
+        }
+
+        const resp = Resp{
+            .throttle_time_ms = 0,
+            .transaction_states = states,
         };
         return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
     }
@@ -21492,6 +21544,49 @@ test "Broker.handleRequest DescribeTransactions v0 returns partition details and
     try testing.expectEqual(@as(i64, -1), missing.producer_id);
     try testing.expectEqual(@as(i16, -1), missing.producer_epoch);
     try testing.expectEqual(@as(usize, 0), missing.topics.len);
+}
+
+test "Broker.handleRequest DescribeTransactions authorization denial uses generated response" {
+    const Req = generated.describe_transactions_request.DescribeTransactionsRequest;
+    const Resp = generated.describe_transactions_response.DescribeTransactionsResponse;
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+    try broker.authorizer.addAcl("other-client", .transactional_id, "*", .literal, .describe, .allow, "*");
+
+    const transactional_ids = [_]?[]const u8{ "denied-txn-a", "denied-txn-b" };
+    const req = Req{ .transactional_ids = &transactional_ids };
+
+    var buf: [512]u8 = undefined;
+    var pos = buildTestRequest(&buf, 65, 0, 6514, header_mod.requestHeaderVersion(65, 0));
+    req.serialize(&buf, &pos, 0);
+
+    const response = broker.handleRequest(buf[0..pos]);
+    try testing.expect(response != null);
+    defer testing.allocator.free(response.?);
+
+    var rpos: usize = 0;
+    var response_header = try ResponseHeader.deserialize(testing.allocator, response.?, &rpos, header_mod.responseHeaderVersion(65, 0));
+    defer response_header.deinit(testing.allocator);
+    try testing.expectEqual(@as(i32, 6514), response_header.correlation_id);
+
+    const resp = try Resp.deserialize(testing.allocator, response.?, &rpos, 0);
+    defer freeDeserializedDescribeTransactionsResponse(&resp);
+
+    try testing.expectEqual(response.?.len, rpos);
+    try testing.expectEqual(@as(i32, 0), resp.throttle_time_ms);
+    try testing.expectEqual(@as(usize, 2), resp.transaction_states.len);
+
+    for (resp.transaction_states, 0..) |state, idx| {
+        try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.transactional_id_authorization_failed)), state.error_code);
+        try testing.expectEqualStrings(transactional_ids[idx].?, state.transactional_id.?);
+        try testing.expectEqualStrings("Dead", state.transaction_state.?);
+        try testing.expectEqual(@as(i32, 0), state.transaction_timeout_ms);
+        try testing.expectEqual(@as(i64, -1), state.transaction_start_time_ms);
+        try testing.expectEqual(@as(i64, -1), state.producer_id);
+        try testing.expectEqual(@as(i16, -1), state.producer_epoch);
+        try testing.expectEqual(@as(usize, 0), state.topics.len);
+    }
 }
 
 test "Broker.handleRequest transaction introspection survives local broker restart" {
