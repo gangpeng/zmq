@@ -1385,7 +1385,66 @@ pub const Controller = struct {
             return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
         }
 
-        log.info("ControllerRegistration accepted controller {d} with {d} listener(s)", .{ req.controller_id, req.listeners.len });
+        const voter = self.raft_state.voters.get(req.controller_id).?;
+        var min_kraft_version = voter.k_raft_min_supported_version;
+        var max_kraft_version = voter.k_raft_max_supported_version;
+
+        for (req.features) |feature| {
+            if (feature.min_supported_version > feature.max_supported_version) {
+                const resp = Resp{ .throttle_time_ms = 0, .error_code = ErrorCode.invalid_registration.toInt(), .error_message = "invalid controller feature range" };
+                return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+            }
+            const name = feature.name orelse {
+                const resp = Resp{ .throttle_time_ms = 0, .error_code = ErrorCode.invalid_registration.toInt(), .error_message = "invalid controller feature" };
+                return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+            };
+            if (std.mem.eql(u8, name, "kraft.version")) {
+                min_kraft_version = feature.min_supported_version;
+                max_kraft_version = feature.max_supported_version;
+            }
+        }
+
+        const endpoint_views = self.allocator.alloc(RaftState.VoterEndpointView, req.listeners.len) catch return null;
+        defer self.allocator.free(endpoint_views);
+        for (req.listeners, 0..) |listener, index| {
+            const name = listener.name orelse {
+                const resp = Resp{ .throttle_time_ms = 0, .error_code = ErrorCode.invalid_registration.toInt(), .error_message = "invalid controller listener" };
+                return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+            };
+            const host = listener.host orelse {
+                const resp = Resp{ .throttle_time_ms = 0, .error_code = ErrorCode.invalid_registration.toInt(), .error_message = "invalid controller listener" };
+                return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+            };
+            if (name.len == 0 or host.len == 0 or listener.port == 0) {
+                const resp = Resp{ .throttle_time_ms = 0, .error_code = ErrorCode.invalid_registration.toInt(), .error_message = "invalid controller listener" };
+                return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+            }
+            endpoint_views[index] = .{
+                .name = name,
+                .host = host,
+                .port = listener.port,
+            };
+        }
+
+        const offset = self.raft_state.proposeUpdateVoter(
+            req.controller_id,
+            voter.voter_directory_id,
+            endpoint_views,
+            min_kraft_version,
+            max_kraft_version,
+        ) catch |err| {
+            const error_code: i16 = switch (err) {
+                error.NotLeader => ErrorCode.not_controller.toInt(),
+                error.ConfigChangePending => ErrorCode.concurrent_transactions.toInt(),
+                error.VoterNotFound => ErrorCode.unknown_controller_id.toInt(),
+                error.InvalidUpdateVersion, error.InvalidEndpoint, error.MessageTooLarge => ErrorCode.invalid_registration.toInt(),
+                else => ErrorCode.invalid_registration.toInt(),
+            };
+            const resp = Resp{ .throttle_time_ms = 0, .error_code = error_code, .error_message = null };
+            return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+        };
+
+        log.info("ControllerRegistration accepted controller {d} with {d} listener(s) at offset {d}", .{ req.controller_id, req.listeners.len, offset });
 
         const resp = Resp{ .throttle_time_ms = 0, .error_code = ErrorCode.none.toInt(), .error_message = null };
         return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
@@ -2783,11 +2842,18 @@ test "Controller handleRequest ControllerRegistration accepts known voter" {
         .port = 9093,
         .security_protocol = 0,
     }};
-    const features = [_]Req.Feature{.{
-        .name = "metadata.version",
-        .min_supported_version = 1,
-        .max_supported_version = 1,
-    }};
+    const features = [_]Req.Feature{
+        .{
+            .name = "metadata.version",
+            .min_supported_version = 1,
+            .max_supported_version = 1,
+        },
+        .{
+            .name = "kraft.version",
+            .min_supported_version = 0,
+            .max_supported_version = 1,
+        },
+    };
 
     var buf: [512]u8 = undefined;
     var pos = buildTestRequest(&buf, 70, 0, 7000, header_mod.requestHeaderVersion(70, 0));
@@ -2809,6 +2875,18 @@ test "Controller handleRequest ControllerRegistration accepts known voter" {
 
     const resp = try Resp.deserialize(testing.allocator, response.?, &rpos, 0);
     try testing.expectEqual(ErrorCode.none.toInt(), resp.error_code);
+
+    try testing.expect(ctrl.raft_state.pending_config_change);
+    ctrl.raft_state.commit_index = ctrl.raft_state.log.lastOffset();
+    ctrl.raft_state.applyCommittedConfigs();
+
+    const voter = ctrl.raft_state.voters.get(1).?;
+    try testing.expectEqual(@as(i16, 0), voter.k_raft_min_supported_version);
+    try testing.expectEqual(@as(i16, 1), voter.k_raft_max_supported_version);
+    try testing.expectEqual(@as(usize, 1), voter.endpoints.len);
+    try testing.expectEqualStrings("CONTROLLER", voter.endpoints[0].name);
+    try testing.expectEqualStrings("127.0.0.1", voter.endpoints[0].host);
+    try testing.expectEqual(@as(u16, 9093), voter.endpoints[0].port);
 }
 
 test "Controller handleRequest ControllerRegistration rejects non-leader" {
