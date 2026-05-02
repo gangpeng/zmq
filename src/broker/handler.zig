@@ -17310,7 +17310,7 @@ pub const Broker = struct {
         }
 
         ser.skipTaggedFields(buf, &pos) catch return false;
-        return true;
+        return pos == buf.len;
     }
 
     // ---------------------------------------------------------------
@@ -18283,7 +18283,7 @@ pub const Broker = struct {
         }
 
         ser.skipTaggedFields(buf, &pos) catch return false;
-        return true;
+        return pos == buf.len;
     }
 
     fn validateAlterUserScramCredentialsRequestFrame(buf: []const u8, start_pos: usize) bool {
@@ -18308,7 +18308,7 @@ pub const Broker = struct {
         }
 
         ser.skipTaggedFields(buf, &pos) catch return false;
-        return true;
+        return pos == buf.len;
     }
 
     fn validateUpdateFeaturesRequestFrame(buf: []const u8, start_pos: usize, api_version: i16) bool {
@@ -18331,14 +18331,14 @@ pub const Broker = struct {
 
         if (api_version >= 1 and !skipFixedBytes(buf, &pos, 1)) return false; // validate_only
         ser.skipTaggedFields(buf, &pos) catch return false;
-        return true;
+        return pos == buf.len;
     }
 
     fn validateGetTelemetrySubscriptionsRequestFrame(buf: []const u8, start_pos: usize) bool {
         var pos = start_pos;
         if (!skipFixedBytes(buf, &pos, 16)) return false; // client_instance_id
         ser.skipTaggedFields(buf, &pos) catch return false;
-        return true;
+        return pos == buf.len;
     }
 
     fn validatePushTelemetryRequestFrame(buf: []const u8, start_pos: usize) bool {
@@ -18348,7 +18348,7 @@ pub const Broker = struct {
         const metrics = ser.readCompactBytes(buf, &pos) catch return false;
         if (metrics == null) return false;
         ser.skipTaggedFields(buf, &pos) catch return false;
-        return true;
+        return pos == buf.len;
     }
 
     fn validateAssignReplicasToDirsRequestFrame(buf: []const u8, start_pos: usize) bool {
@@ -18376,7 +18376,7 @@ pub const Broker = struct {
     fn validateListClientMetricsResourcesRequestFrame(buf: []const u8, start_pos: usize) bool {
         var pos = start_pos;
         ser.skipTaggedFields(buf, &pos) catch return false;
-        return true;
+        return pos == buf.len;
     }
 
     fn validateOffsetForLeaderEpochRequestFrame(buf: []const u8, start_pos: usize, api_version: i16) bool {
@@ -20135,6 +20135,14 @@ fn buildTestRequest(buf: []u8, api_key: i16, api_version: i16, correlation_id: i
         ser.writeString(buf, &pos, "test-client");
     }
     return pos;
+}
+
+fn expectTrailingByteRejected(broker: *Broker, buf: []u8, pos: usize) !void {
+    try testing.expect(pos < buf.len);
+    buf[pos] = 0x7f;
+    const response = broker.handleRequest(buf[0 .. pos + 1]);
+    defer if (response) |bytes| testing.allocator.free(bytes);
+    try testing.expect(response == null);
 }
 
 fn expectTxnControlRecordType(records: []const u8, expected: TxnCoordinator.ControlRecordType) !void {
@@ -26316,6 +26324,20 @@ test "Broker.handleRequest DescribeUserScramCredentials rejects truncated reques
     try testing.expect(broker.handleRequest(buf[0..req_len]) == null);
 }
 
+test "Broker.handleRequest DescribeUserScramCredentials rejects trailing bytes" {
+    const Req = generated.describe_user_scram_credentials_request.DescribeUserScramCredentialsRequest;
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+
+    const req = Req{};
+    var buf: [128]u8 = undefined;
+    var pos = buildTestRequest(&buf, 50, 0, 5006, header_mod.requestHeaderVersion(50, 0));
+    req.serialize(&buf, &pos, 0);
+
+    try expectTrailingByteRejected(&broker, buf[0..], pos);
+}
+
 test "Broker.handleRequest AlterUserScramCredentials upserts SCRAM user and Describe reads it" {
     const AlterReq = generated.alter_user_scram_credentials_request.AlterUserScramCredentialsRequest;
     const AlterResp = generated.alter_user_scram_credentials_response.AlterUserScramCredentialsResponse;
@@ -26701,6 +26723,20 @@ test "Broker.handleRequest AlterUserScramCredentials rejects truncated request" 
     try testing.expect(broker.handleRequest(buf[0..req_len]) == null);
 }
 
+test "Broker.handleRequest AlterUserScramCredentials rejects trailing bytes" {
+    const Req = generated.alter_user_scram_credentials_request.AlterUserScramCredentialsRequest;
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+
+    const req = Req{};
+    var buf: [128]u8 = undefined;
+    var pos = buildTestRequest(&buf, 51, 0, 5107, header_mod.requestHeaderVersion(51, 0));
+    req.serialize(&buf, &pos, 0);
+
+    try expectTrailingByteRejected(&broker, buf[0..], pos);
+}
+
 test "Broker.handleRequest UpdateFeatures v0 rejects unsupported feature mutation" {
     const Req = generated.update_features_request.UpdateFeaturesRequest;
     const Resp = generated.update_features_response.UpdateFeaturesResponse;
@@ -26868,6 +26904,20 @@ test "Broker.handleRequest UpdateFeatures rejects truncated request" {
     try testing.expect(broker.handleRequest(buf[0..req_len]) == null);
 }
 
+test "Broker.handleRequest UpdateFeatures rejects trailing bytes" {
+    const Req = generated.update_features_request.UpdateFeaturesRequest;
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+
+    const req = Req{};
+    var buf: [128]u8 = undefined;
+    var pos = buildTestRequest(&buf, 57, 1, 5704, header_mod.requestHeaderVersion(57, 1));
+    req.serialize(&buf, &pos, 1);
+
+    try expectTrailingByteRejected(&broker, buf[0..], pos);
+}
+
 test "Broker.handleRequest GetTelemetrySubscriptions returns empty subscription set" {
     const Req = generated.get_telemetry_subscriptions_request.GetTelemetrySubscriptionsRequest;
     const Resp = generated.get_telemetry_subscriptions_response.GetTelemetrySubscriptionsResponse;
@@ -26952,6 +27002,21 @@ test "Broker.handleRequest GetTelemetrySubscriptions rejects truncated request" 
     try testing.expect(broker.handleRequest(buf[0..req_len]) == null);
 }
 
+test "Broker.handleRequest GetTelemetrySubscriptions rejects trailing bytes" {
+    const Req = generated.get_telemetry_subscriptions_request.GetTelemetrySubscriptionsRequest;
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+
+    const client_id = [_]u8{5} ** 16;
+    const req = Req{ .client_instance_id = client_id };
+    var buf: [128]u8 = undefined;
+    var pos = buildTestRequest(&buf, 71, 0, 7102, header_mod.requestHeaderVersion(71, 0));
+    req.serialize(&buf, &pos, 0);
+
+    try expectTrailingByteRejected(&broker, buf[0..], pos);
+}
+
 test "Broker.handleRequest PushTelemetry rejects unsolicited metrics" {
     const Req = generated.push_telemetry_request.PushTelemetryRequest;
     const Resp = generated.push_telemetry_response.PushTelemetryResponse;
@@ -27030,6 +27095,28 @@ test "Broker.handleRequest PushTelemetry rejects truncated request" {
     var buf: [128]u8 = undefined;
     const req_len = buildTestRequest(&buf, 72, 0, 7201, header_mod.requestHeaderVersion(72, 0));
     try testing.expect(broker.handleRequest(buf[0..req_len]) == null);
+}
+
+test "Broker.handleRequest PushTelemetry rejects trailing bytes" {
+    const Req = generated.push_telemetry_request.PushTelemetryRequest;
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+
+    const client_id = [_]u8{6} ** 16;
+    const metrics = [_]u8{ 0x08, 0x01 };
+    const req = Req{
+        .client_instance_id = client_id,
+        .subscription_id = 1,
+        .terminating = false,
+        .compression_type = 0,
+        .metrics = &metrics,
+    };
+    var buf: [128]u8 = undefined;
+    var pos = buildTestRequest(&buf, 72, 0, 7202, header_mod.requestHeaderVersion(72, 0));
+    req.serialize(&buf, &pos, 0);
+
+    try expectTrailingByteRejected(&broker, buf[0..], pos);
 }
 
 test "Broker.handleRequest AssignReplicasToDirs returns generated fail-closed response" {
@@ -27191,6 +27278,20 @@ test "Broker.handleRequest ListClientMetricsResources rejects truncated request"
     var buf: [128]u8 = undefined;
     const req_len = buildTestRequest(&buf, 74, 0, 7401, header_mod.requestHeaderVersion(74, 0));
     try testing.expect(broker.handleRequest(buf[0..req_len]) == null);
+}
+
+test "Broker.handleRequest ListClientMetricsResources rejects trailing bytes" {
+    const Req = generated.list_client_metrics_resources_request.ListClientMetricsResourcesRequest;
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+
+    const req = Req{};
+    var buf: [128]u8 = undefined;
+    var pos = buildTestRequest(&buf, 74, 0, 7402, header_mod.requestHeaderVersion(74, 0));
+    req.serialize(&buf, &pos, 0);
+
+    try expectTrailingByteRejected(&broker, buf[0..], pos);
 }
 
 test "Broker.handleRequest AutoMQ stream lifecycle authorization denial uses generated responses" {
@@ -33250,6 +33351,20 @@ test "Broker.handleRequest DescribeProducers rejects truncated request" {
     ser.writeCompactString(&partial, &partial_pos, "producer-truncated-topic");
     ser.writeCompactArrayLen(&partial, &partial_pos, 1);
     try testing.expect(broker.handleRequest(partial[0..partial_pos]) == null);
+}
+
+test "Broker.handleRequest DescribeProducers rejects trailing bytes" {
+    const Req = generated.describe_producers_request.DescribeProducersRequest;
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+
+    const req = Req{};
+    var buf: [128]u8 = undefined;
+    var pos = buildTestRequest(&buf, 61, 0, 6104, header_mod.requestHeaderVersion(61, 0));
+    req.serialize(&buf, &pos, 0);
+
+    try expectTrailingByteRejected(&broker, buf[0..], pos);
 }
 
 test "Broker.handleRequest DescribeProducers authorization denial uses generated response" {
