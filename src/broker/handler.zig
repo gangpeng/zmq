@@ -3712,7 +3712,10 @@ pub const Broker = struct {
             29 => self.handleDescribeAclsAuthorizationError(req_header, api_version, resp_header_version, err_code),
             30 => self.handleCreateAclsAuthorizationError(request_bytes, body_start, req_header, api_version, resp_header_version, err_code),
             31 => self.handleDeleteAclsAuthorizationError(request_bytes, body_start, req_header, api_version, resp_header_version, err_code),
+            32 => self.handleDescribeConfigsAuthorizationError(request_bytes, body_start, req_header, api_version, resp_header_version, err_code),
+            33 => self.handleAlterConfigsAuthorizationError(request_bytes, body_start, req_header, api_version, resp_header_version, err_code),
             42 => self.handleDeleteGroupsAuthorizationError(request_bytes, body_start, req_header, api_version, resp_header_version, err_code),
+            44 => self.handleIncrementalAlterConfigsAuthorizationError(request_bytes, body_start, req_header, api_version, resp_header_version, err_code),
             47 => self.handleOffsetDeleteAuthorizationError(request_bytes, body_start, req_header, api_version, resp_header_version, err_code),
             55 => self.handleDescribeQuorumAuthorizationError(req_header, api_version, resp_header_version, err_code),
             60 => self.handleDescribeClusterAuthorizationError(req_header, api_version, resp_header_version, err_code),
@@ -4827,6 +4830,148 @@ pub const Broker = struct {
         const resp = Resp{
             .throttle_time_ms = 0,
             .filter_results = filter_results,
+        };
+        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+    }
+
+    fn handleDescribeConfigsAuthorizationError(
+        self: *Broker,
+        request_bytes: []const u8,
+        body_start: usize,
+        req_header: *const RequestHeader,
+        api_version: i16,
+        resp_header_version: i16,
+        err_code: ErrorCode,
+    ) ?[]u8 {
+        const Req = generated.describe_configs_request.DescribeConfigsRequest;
+        const Resp = generated.describe_configs_response.DescribeConfigsResponse;
+        const Result = Resp.DescribeConfigsResult;
+
+        if (!validateDescribeConfigsRequestFrame(request_bytes, body_start, api_version)) {
+            log.warn("Malformed denied DescribeConfigs request", .{});
+            return null;
+        }
+
+        var pos = body_start;
+        var req = Req.deserialize(self.allocator, request_bytes, &pos, api_version) catch |err| {
+            log.warn("Failed to decode denied DescribeConfigs request: {}", .{err});
+            return null;
+        };
+        defer self.freeDescribeConfigsRequest(&req);
+
+        var results: []Result = &.{};
+        if (req.resources.len > 0) {
+            results = self.allocator.alloc(Result, req.resources.len) catch return null;
+        }
+        defer if (results.len > 0) self.allocator.free(results);
+
+        for (req.resources, 0..) |resource, idx| {
+            results[idx] = .{
+                .error_code = @intFromEnum(err_code),
+                .error_message = "Not authorized",
+                .resource_type = resource.resource_type,
+                .resource_name = resource.resource_name,
+                .configs = &.{},
+            };
+        }
+
+        const resp = Resp{
+            .throttle_time_ms = 0,
+            .results = results,
+        };
+        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+    }
+
+    fn handleAlterConfigsAuthorizationError(
+        self: *Broker,
+        request_bytes: []const u8,
+        body_start: usize,
+        req_header: *const RequestHeader,
+        api_version: i16,
+        resp_header_version: i16,
+        err_code: ErrorCode,
+    ) ?[]u8 {
+        const Req = generated.alter_configs_request.AlterConfigsRequest;
+        const Resp = generated.alter_configs_response.AlterConfigsResponse;
+        const ResourceResponse = Resp.AlterConfigsResourceResponse;
+
+        if (!validateAlterConfigsRequestFrame(request_bytes, body_start, api_version)) {
+            log.warn("Malformed denied AlterConfigs request", .{});
+            return null;
+        }
+
+        var pos = body_start;
+        var req = Req.deserialize(self.allocator, request_bytes, &pos, api_version) catch |err| {
+            log.warn("Failed to decode denied AlterConfigs request: {}", .{err});
+            return null;
+        };
+        defer self.freeAlterConfigsRequest(&req);
+
+        var responses: []ResourceResponse = &.{};
+        if (req.resources.len > 0) {
+            responses = self.allocator.alloc(ResourceResponse, req.resources.len) catch return null;
+        }
+        defer if (responses.len > 0) self.allocator.free(responses);
+
+        for (req.resources, 0..) |resource, idx| {
+            responses[idx] = .{
+                .error_code = @intFromEnum(err_code),
+                .error_message = "Not authorized",
+                .resource_type = resource.resource_type,
+                .resource_name = resource.resource_name,
+            };
+        }
+
+        const resp = Resp{
+            .throttle_time_ms = 0,
+            .responses = responses,
+        };
+        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+    }
+
+    fn handleIncrementalAlterConfigsAuthorizationError(
+        self: *Broker,
+        request_bytes: []const u8,
+        body_start: usize,
+        req_header: *const RequestHeader,
+        api_version: i16,
+        resp_header_version: i16,
+        err_code: ErrorCode,
+    ) ?[]u8 {
+        const Req = generated.incremental_alter_configs_request.IncrementalAlterConfigsRequest;
+        const Resp = generated.incremental_alter_configs_response.IncrementalAlterConfigsResponse;
+        const ResourceResponse = Resp.AlterConfigsResourceResponse;
+
+        if (!validateIncrementalAlterConfigsRequestFrame(request_bytes, body_start, api_version)) {
+            log.warn("Malformed denied IncrementalAlterConfigs request", .{});
+            return null;
+        }
+
+        var pos = body_start;
+        var req = Req.deserialize(self.allocator, request_bytes, &pos, api_version) catch |err| {
+            log.warn("Failed to decode denied IncrementalAlterConfigs request: {}", .{err});
+            return null;
+        };
+        defer self.freeIncrementalAlterConfigsRequest(&req);
+
+        var responses: []ResourceResponse = &.{};
+        if (req.resources.len > 0) {
+            responses = self.allocator.alloc(ResourceResponse, req.resources.len) catch return null;
+        }
+        defer if (responses.len > 0) self.allocator.free(responses);
+
+        for (req.resources, 0..) |resource, idx| {
+            responses[idx] = .{
+                .error_code = @intFromEnum(err_code),
+                .error_message = "Not authorized",
+                .resource_type = resource.resource_type,
+                .resource_name = resource.resource_name,
+            };
+        }
+
+        const resp = Resp{
+            .throttle_time_ms = 0,
+            .responses = responses,
         };
         return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
     }
@@ -21847,6 +21992,56 @@ test "Broker.handleRequest AlterConfigs v2 returns generated response and update
     try testing.expectEqual(@as(i32, 2), broker.topics.get("alter-cfg-topic").?.config.min_insync_replicas);
 }
 
+test "Broker.handleRequest AlterConfigs authorization denial uses generated response" {
+    const Req = generated.alter_configs_request.AlterConfigsRequest;
+    const Resp = generated.alter_configs_response.AlterConfigsResponse;
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+    try testing.expect(broker.ensureTopic("alter-cfg-denied-topic"));
+    const before = broker.topics.get("alter-cfg-denied-topic").?.config.min_insync_replicas;
+    try broker.authorizer.addAcl("other-client", .cluster, "*", .literal, .alter, .allow, "*");
+
+    const configs = [_]Req.AlterConfigsResource.AlterableConfig{.{
+        .name = "min.insync.replicas",
+        .value = "3",
+    }};
+    const resources = [_]Req.AlterConfigsResource{.{
+        .resource_type = 2,
+        .resource_name = "alter-cfg-denied-topic",
+        .configs = &configs,
+    }};
+    const req = Req{
+        .resources = &resources,
+        .validate_only = false,
+    };
+
+    var buf: [512]u8 = undefined;
+    var pos = buildTestRequest(&buf, 33, 2, 3312, header_mod.requestHeaderVersion(33, 2));
+    req.serialize(&buf, &pos, 2);
+
+    const response = broker.handleRequest(buf[0..pos]);
+    try testing.expect(response != null);
+    defer testing.allocator.free(response.?);
+
+    var rpos: usize = 0;
+    var response_header = try ResponseHeader.deserialize(testing.allocator, response.?, &rpos, header_mod.responseHeaderVersion(33, 2));
+    defer response_header.deinit(testing.allocator);
+    try testing.expectEqual(@as(i32, 3312), response_header.correlation_id);
+
+    const resp = try Resp.deserialize(testing.allocator, response.?, &rpos, 2);
+    defer if (resp.responses.len > 0) testing.allocator.free(resp.responses);
+
+    try testing.expectEqual(response.?.len, rpos);
+    try testing.expectEqual(@as(i32, 0), resp.throttle_time_ms);
+    try testing.expectEqual(@as(usize, 1), resp.responses.len);
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.cluster_authorization_failed)), resp.responses[0].error_code);
+    try testing.expectEqualStrings("Not authorized", resp.responses[0].error_message.?);
+    try testing.expectEqual(@as(i8, 2), resp.responses[0].resource_type);
+    try testing.expectEqualStrings("alter-cfg-denied-topic", resp.responses[0].resource_name.?);
+    try testing.expectEqual(before, broker.topics.get("alter-cfg-denied-topic").?.config.min_insync_replicas);
+}
+
 test "Broker.handleRequest AlterConfigs validate_only does not mutate" {
     const Req = generated.alter_configs_request.AlterConfigsRequest;
     const Resp = generated.alter_configs_response.AlterConfigsResponse;
@@ -22306,6 +22501,57 @@ test "Broker.handleRequest IncrementalAlterConfigs v1 returns generated response
     try testing.expectEqual(@as(i8, 2), resp.responses[0].resource_type);
     try testing.expectEqualStrings("inc-cfg-topic", resp.responses[0].resource_name.?);
     try testing.expectEqual(@as(i64, 1234), broker.topics.get("inc-cfg-topic").?.config.retention_ms);
+}
+
+test "Broker.handleRequest IncrementalAlterConfigs authorization denial uses generated response" {
+    const Req = generated.incremental_alter_configs_request.IncrementalAlterConfigsRequest;
+    const Resp = generated.incremental_alter_configs_response.IncrementalAlterConfigsResponse;
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+    try testing.expect(broker.ensureTopic("inc-cfg-denied-topic"));
+    const before = broker.topics.get("inc-cfg-denied-topic").?.config.retention_ms;
+    try broker.authorizer.addAcl("other-client", .cluster, "*", .literal, .alter, .allow, "*");
+
+    const configs = [_]Req.AlterConfigsResource.AlterableConfig{.{
+        .name = "retention.ms",
+        .config_operation = 0,
+        .value = "5678",
+    }};
+    const resources = [_]Req.AlterConfigsResource{.{
+        .resource_type = 2,
+        .resource_name = "inc-cfg-denied-topic",
+        .configs = &configs,
+    }};
+    const req = Req{
+        .resources = &resources,
+        .validate_only = false,
+    };
+
+    var buf: [512]u8 = undefined;
+    var pos = buildTestRequest(&buf, 44, 1, 4411, header_mod.requestHeaderVersion(44, 1));
+    req.serialize(&buf, &pos, 1);
+
+    const response = broker.handleRequest(buf[0..pos]);
+    try testing.expect(response != null);
+    defer testing.allocator.free(response.?);
+
+    var rpos: usize = 0;
+    var response_header = try ResponseHeader.deserialize(testing.allocator, response.?, &rpos, header_mod.responseHeaderVersion(44, 1));
+    defer response_header.deinit(testing.allocator);
+    try testing.expectEqual(@as(i32, 4411), response_header.correlation_id);
+
+    const resp = try Resp.deserialize(testing.allocator, response.?, &rpos, 1);
+    defer if (resp.responses.len > 0) testing.allocator.free(resp.responses);
+
+    try testing.expectEqual(response.?.len, rpos);
+    try testing.expectEqual(@as(i32, 0), resp.throttle_time_ms);
+    try testing.expectEqual(@as(usize, 1), resp.responses.len);
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.cluster_authorization_failed)), resp.responses[0].error_code);
+    try testing.expectEqualStrings("Not authorized", resp.responses[0].error_message.?);
+    try testing.expectEqual(@as(i8, 2), resp.responses[0].resource_type);
+    try testing.expectEqualStrings("inc-cfg-denied-topic", resp.responses[0].resource_name.?);
+    try testing.expectEqual(before, broker.topics.get("inc-cfg-denied-topic").?.config.retention_ms);
 }
 
 test "Broker.handleRequest IncrementalAlterConfigs validate_only does not mutate" {
@@ -33630,6 +33876,54 @@ test "Broker.handleRequest DescribeConfigs v4 filters keys and preserves flexibl
     try testing.expectEqualStrings("cleanup.policy", resp.results[0].configs[0].name.?);
     try testing.expectEqualStrings("delete", resp.results[0].configs[0].value.?);
     try testing.expect(resp.results[0].configs[0].documentation != null);
+}
+
+test "Broker.handleRequest DescribeConfigs authorization denial uses generated response" {
+    const Req = generated.describe_configs_request.DescribeConfigsRequest;
+    const Resource = Req.DescribeConfigsResource;
+    const Resp = generated.describe_configs_response.DescribeConfigsResponse;
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+    _ = broker.ensureTopic("cfg-denied-topic");
+    try broker.authorizer.addAcl("other-client", .cluster, "*", .literal, .describe, .allow, "*");
+
+    const keys = [_]?[]const u8{"cleanup.policy"};
+    const resources = [_]Resource{.{
+        .resource_type = 2,
+        .resource_name = "cfg-denied-topic",
+        .configuration_keys = &keys,
+    }};
+    const req = Req{
+        .resources = &resources,
+        .include_synonyms = true,
+        .include_documentation = true,
+    };
+
+    var buf: [512]u8 = undefined;
+    var pos = buildTestRequest(&buf, 32, 4, 3207, header_mod.requestHeaderVersion(32, 4));
+    req.serialize(&buf, &pos, 4);
+
+    const response = broker.handleRequest(buf[0..pos]);
+    try testing.expect(response != null);
+    defer testing.allocator.free(response.?);
+
+    var rpos: usize = 0;
+    var response_header = try ResponseHeader.deserialize(testing.allocator, response.?, &rpos, header_mod.responseHeaderVersion(32, 4));
+    defer response_header.deinit(testing.allocator);
+    try testing.expectEqual(@as(i32, 3207), response_header.correlation_id);
+
+    const resp = try Resp.deserialize(testing.allocator, response.?, &rpos, 4);
+    defer freeDeserializedDescribeConfigsResponse(&resp);
+
+    try testing.expectEqual(response.?.len, rpos);
+    try testing.expectEqual(@as(i32, 0), resp.throttle_time_ms);
+    try testing.expectEqual(@as(usize, 1), resp.results.len);
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.cluster_authorization_failed)), resp.results[0].error_code);
+    try testing.expectEqualStrings("Not authorized", resp.results[0].error_message.?);
+    try testing.expectEqual(@as(i8, 2), resp.results[0].resource_type);
+    try testing.expectEqualStrings("cfg-denied-topic", resp.results[0].resource_name.?);
+    try testing.expectEqual(@as(usize, 0), resp.results[0].configs.len);
 }
 
 test "Broker.handleRequest DescribeConfigs distinguishes null and empty configuration keys" {
