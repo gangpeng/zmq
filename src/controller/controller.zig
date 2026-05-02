@@ -594,6 +594,7 @@ pub const Controller = struct {
             PartitionResp.LeaderIdAndEpoch{ .leader_id = leader_id, .leader_epoch = self.raft_state.current_epoch }
         else
             PartitionResp.LeaderIdAndEpoch{};
+        var remaining_bytes: usize = if (req.max_bytes <= 0) 0 else @intCast(req.max_bytes);
 
         if (req.topics.len == 0) return &.{};
         const topics = try self.allocator.alloc(TopicResp, req.topics.len);
@@ -608,18 +609,7 @@ pub const Controller = struct {
             if (topic_req.partitions.len > 0) {
                 partitions = try self.allocator.alloc(PartitionResp, topic_req.partitions.len);
                 for (topic_req.partitions, 0..) |partition_req, partition_index| {
-                    partitions[partition_index] = .{
-                        .index = partition_req.partition,
-                        .error_code = ErrorCode.snapshot_not_found.toInt(),
-                        .snapshot_id = .{
-                            .end_offset = partition_req.snapshot_id.end_offset,
-                            .epoch = partition_req.snapshot_id.epoch,
-                        },
-                        .size = 0,
-                        .position = partition_req.position,
-                        .unaligned_records = null,
-                        .current_leader = current_leader,
-                    };
+                    partitions[partition_index] = self.buildFetchSnapshotPartition(topic_req.name, partition_req, current_leader, &remaining_bytes);
                 }
             }
 
@@ -631,6 +621,54 @@ pub const Controller = struct {
         }
 
         return topics;
+    }
+
+    fn buildFetchSnapshotPartition(
+        self: *Controller,
+        topic_name: ?[]const u8,
+        partition_req: generated.fetch_snapshot_request.FetchSnapshotRequest.TopicSnapshot.PartitionSnapshot,
+        current_leader: generated.fetch_snapshot_response.FetchSnapshotResponse.TopicSnapshot.PartitionSnapshot.LeaderIdAndEpoch,
+        remaining_bytes: *usize,
+    ) generated.fetch_snapshot_response.FetchSnapshotResponse.TopicSnapshot.PartitionSnapshot {
+        const PartitionResp = generated.fetch_snapshot_response.FetchSnapshotResponse.TopicSnapshot.PartitionSnapshot;
+        var resp = PartitionResp{
+            .index = partition_req.partition,
+            .error_code = ErrorCode.snapshot_not_found.toInt(),
+            .snapshot_id = .{
+                .end_offset = partition_req.snapshot_id.end_offset,
+                .epoch = partition_req.snapshot_id.epoch,
+            },
+            .size = 0,
+            .position = partition_req.position,
+            .unaligned_records = null,
+            .current_leader = current_leader,
+        };
+
+        const snapshot = self.findFetchSnapshotBytes(topic_name, partition_req.partition, partition_req.snapshot_id.end_offset, partition_req.snapshot_id.epoch) orelse return resp;
+        resp.size = @intCast(snapshot.len);
+        if (partition_req.position < 0 or partition_req.position > resp.size) {
+            resp.error_code = ErrorCode.position_out_of_range.toInt();
+            return resp;
+        }
+
+        const start: usize = @intCast(partition_req.position);
+        const available = snapshot.len - start;
+        const take = @min(available, remaining_bytes.*);
+        resp.error_code = ErrorCode.none.toInt();
+        resp.unaligned_records = snapshot[start .. start + take];
+        remaining_bytes.* -= take;
+        return resp;
+    }
+
+    fn findFetchSnapshotBytes(self: *Controller, topic_name: ?[]const u8, partition_id: i32, end_offset: i64, epoch: i32) ?[]const u8 {
+        const name = topic_name orelse return null;
+        if (!std.mem.eql(u8, name, "__cluster_metadata") or partition_id != 0) return null;
+        if (end_offset < 0 or self.raft_state.last_snapshot_offset == 0) return null;
+        if (@as(u64, @intCast(end_offset)) != self.raft_state.last_snapshot_offset or epoch != self.raft_state.last_snapshot_epoch) return null;
+
+        const entry = self.raft_state.log.get(self.raft_state.last_snapshot_offset) orelse return null;
+        if (!isControllerFullSnapshotRecord(entry.data)) return null;
+        return entry.data;
     }
 
     fn collectFetchSnapshotNodeEndpoints(self: *Controller, api_version: i16) ![]const generated.fetch_snapshot_response.FetchSnapshotResponse.NodeEndpoint {
@@ -691,6 +729,12 @@ pub const Controller = struct {
     fn isControllerMetadataRecord(data: []const u8) bool {
         return data.len >= controller_metadata_record_magic.len and
             std.mem.eql(u8, data[0..controller_metadata_record_magic.len], controller_metadata_record_magic);
+    }
+
+    fn isControllerFullSnapshotRecord(data: []const u8) bool {
+        return isControllerMetadataRecord(data) and
+            data.len > controller_metadata_record_magic.len and
+            data[controller_metadata_record_magic.len] == @intFromEnum(ControllerMetadataRecordKind.full_snapshot);
     }
 
     fn controllerRecordKindFromByte(byte: u8) !ControllerMetadataRecordKind {
@@ -2428,6 +2472,129 @@ test "Controller handleRequest FetchSnapshot v1 returns current leader endpoint 
     try testing.expectEqual(@as(i32, 1), resp.node_endpoints[0].node_id);
     try testing.expectEqualStrings("controller-1.example", resp.node_endpoints[0].host.?);
     try testing.expectEqual(@as(u16, 19093), resp.node_endpoints[0].port);
+}
+
+test "Controller handleRequest FetchSnapshot returns compacted controller snapshot bytes" {
+    const Req = generated.fetch_snapshot_request.FetchSnapshotRequest;
+    const Resp = generated.fetch_snapshot_response.FetchSnapshotResponse;
+
+    var ctrl = Controller.init(testing.allocator, 1, "test-cluster");
+    defer ctrl.deinit();
+    try makeTestControllerLeader(&ctrl);
+
+    const broker_epoch = ctrl.broker_registry.next_broker_epoch;
+    const broker_record = try ctrl.buildBrokerRegistrationRecord(100, "host1", 9092, broker_epoch);
+    defer ctrl.allocator.free(broker_record);
+    const broker_offset = try ctrl.appendControllerMetadataRecord(broker_record);
+    try ctrl.broker_registry.registerWithEpoch(100, "host1", 9092, broker_epoch, false);
+    ctrl.last_applied_controller_metadata_offset = broker_offset;
+
+    try ctrl.prepareControllerMetadataSnapshotForRaftCompaction();
+    ctrl.raft_state.takeSnapshot();
+
+    const snapshot_offset = ctrl.raft_state.last_snapshot_offset;
+    const snapshot_epoch = ctrl.raft_state.last_snapshot_epoch;
+    const snapshot_data = ctrl.raft_state.log.get(snapshot_offset).?.data;
+    try testing.expect(snapshot_data.len > 10);
+
+    const snapshot_id = Req.TopicSnapshot.PartitionSnapshot.SnapshotId{
+        .end_offset = @intCast(snapshot_offset),
+        .epoch = snapshot_epoch,
+    };
+    const partitions = [_]Req.TopicSnapshot.PartitionSnapshot{.{
+        .partition = 0,
+        .current_leader_epoch = -1,
+        .snapshot_id = snapshot_id,
+        .position = 2,
+    }};
+    const topics = [_]Req.TopicSnapshot{.{ .name = "__cluster_metadata", .partitions = &partitions }};
+    const req = Req{ .replica_id = 2, .max_bytes = 7, .topics = &topics };
+
+    var buf: [512]u8 = undefined;
+    var pos = buildTestRequest(&buf, 59, 0, 5903, header_mod.requestHeaderVersion(59, 0));
+    req.serialize(&buf, &pos, 0);
+
+    const response = ctrl.handleRequest(buf[0..pos]);
+    try testing.expect(response != null);
+    defer testing.allocator.free(response.?);
+
+    var rpos: usize = 0;
+    var resp_header = try ResponseHeader.deserialize(testing.allocator, response.?, &rpos, header_mod.responseHeaderVersion(59, 0));
+    defer resp_header.deinit(testing.allocator);
+    try testing.expectEqual(@as(i32, 5903), resp_header.correlation_id);
+
+    const resp = try Resp.deserialize(testing.allocator, response.?, &rpos, 0);
+    defer freeDeserializedFetchSnapshotResponse(&resp);
+
+    try testing.expectEqual(response.?.len, rpos);
+    try testing.expectEqual(ErrorCode.none.toInt(), resp.error_code);
+    try testing.expectEqual(@as(usize, 1), resp.topics.len);
+    try testing.expectEqual(@as(usize, 1), resp.topics[0].partitions.len);
+    const partition = resp.topics[0].partitions[0];
+    try testing.expectEqual(ErrorCode.none.toInt(), partition.error_code);
+    try testing.expectEqual(@as(i64, @intCast(snapshot_offset)), partition.snapshot_id.end_offset);
+    try testing.expectEqual(snapshot_epoch, partition.snapshot_id.epoch);
+    try testing.expectEqual(@as(i64, @intCast(snapshot_data.len)), partition.size);
+    try testing.expectEqual(@as(i64, 2), partition.position);
+    try testing.expect(partition.unaligned_records != null);
+    try testing.expectEqualSlices(u8, snapshot_data[2..9], partition.unaligned_records.?);
+}
+
+test "Controller handleRequest FetchSnapshot rejects positions beyond compacted snapshot" {
+    const Req = generated.fetch_snapshot_request.FetchSnapshotRequest;
+    const Resp = generated.fetch_snapshot_response.FetchSnapshotResponse;
+
+    var ctrl = Controller.init(testing.allocator, 1, "test-cluster");
+    defer ctrl.deinit();
+    try makeTestControllerLeader(&ctrl);
+
+    const broker_epoch = ctrl.broker_registry.next_broker_epoch;
+    const broker_record = try ctrl.buildBrokerRegistrationRecord(100, "host1", 9092, broker_epoch);
+    defer ctrl.allocator.free(broker_record);
+    const broker_offset = try ctrl.appendControllerMetadataRecord(broker_record);
+    try ctrl.broker_registry.registerWithEpoch(100, "host1", 9092, broker_epoch, false);
+    ctrl.last_applied_controller_metadata_offset = broker_offset;
+
+    try ctrl.prepareControllerMetadataSnapshotForRaftCompaction();
+    ctrl.raft_state.takeSnapshot();
+
+    const snapshot_offset = ctrl.raft_state.last_snapshot_offset;
+    const snapshot_epoch = ctrl.raft_state.last_snapshot_epoch;
+    const snapshot_data = ctrl.raft_state.log.get(snapshot_offset).?.data;
+    const snapshot_id = Req.TopicSnapshot.PartitionSnapshot.SnapshotId{
+        .end_offset = @intCast(snapshot_offset),
+        .epoch = snapshot_epoch,
+    };
+    const partitions = [_]Req.TopicSnapshot.PartitionSnapshot{.{
+        .partition = 0,
+        .current_leader_epoch = -1,
+        .snapshot_id = snapshot_id,
+        .position = @as(i64, @intCast(snapshot_data.len)) + 1,
+    }};
+    const topics = [_]Req.TopicSnapshot{.{ .name = "__cluster_metadata", .partitions = &partitions }};
+    const req = Req{ .replica_id = 2, .max_bytes = 1024, .topics = &topics };
+
+    var buf: [512]u8 = undefined;
+    var pos = buildTestRequest(&buf, 59, 0, 5904, header_mod.requestHeaderVersion(59, 0));
+    req.serialize(&buf, &pos, 0);
+
+    const response = ctrl.handleRequest(buf[0..pos]);
+    try testing.expect(response != null);
+    defer testing.allocator.free(response.?);
+
+    var rpos: usize = 0;
+    var resp_header = try ResponseHeader.deserialize(testing.allocator, response.?, &rpos, header_mod.responseHeaderVersion(59, 0));
+    defer resp_header.deinit(testing.allocator);
+    try testing.expectEqual(@as(i32, 5904), resp_header.correlation_id);
+
+    const resp = try Resp.deserialize(testing.allocator, response.?, &rpos, 0);
+    defer freeDeserializedFetchSnapshotResponse(&resp);
+
+    try testing.expectEqual(response.?.len, rpos);
+    const partition = resp.topics[0].partitions[0];
+    try testing.expectEqual(ErrorCode.position_out_of_range.toInt(), partition.error_code);
+    try testing.expectEqual(@as(i64, @intCast(snapshot_data.len)), partition.size);
+    try testing.expect(partition.unaligned_records == null);
 }
 
 test "Controller handleRequest FetchSnapshot rejects malformed generated request" {
