@@ -3744,6 +3744,10 @@ pub const Broker = struct {
             502 => self.handleOpenStreamsAuthorizationError(request_bytes, body_start, req_header, api_version, resp_header_version, err_code),
             503 => self.handleCloseStreamsAuthorizationError(request_bytes, body_start, req_header, api_version, resp_header_version, err_code),
             504 => self.handleDeleteStreamsAuthorizationError(request_bytes, body_start, req_header, api_version, resp_header_version, err_code),
+            505 => self.handlePrepareS3ObjectAuthorizationError(request_bytes, body_start, req_header, api_version, resp_header_version, err_code),
+            506 => self.handleCommitStreamSetObjectAuthorizationError(request_bytes, body_start, req_header, api_version, resp_header_version, err_code),
+            507 => self.handleCommitStreamObjectAuthorizationError(request_bytes, body_start, req_header, api_version, resp_header_version, err_code),
+            508 => self.handleGetOpeningStreamsAuthorizationError(request_bytes, body_start, req_header, api_version, resp_header_version, err_code),
             512 => self.handleTrimStreamsAuthorizationError(request_bytes, body_start, req_header, api_version, resp_header_version, err_code),
             else => self.handleGenericAuthorizationError(req_header, resp_header_version, err_code),
         };
@@ -6240,6 +6244,98 @@ pub const Broker = struct {
         }
 
         const resp = Resp{ .error_code = 0, .throttle_time_ms = 0, .trim_stream_responses = responses };
+        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+    }
+
+    fn handlePrepareS3ObjectAuthorizationError(
+        self: *Broker,
+        request_bytes: []const u8,
+        body_start: usize,
+        req_header: *const RequestHeader,
+        api_version: i16,
+        resp_header_version: i16,
+        err_code: ErrorCode,
+    ) ?[]u8 {
+        const Req = generated.prepare_s3_object_request.PrepareS3ObjectRequest;
+        const Resp = generated.prepare_s3_object_response.PrepareS3ObjectResponse;
+
+        var arena = std.heap.ArenaAllocator.init(self.allocator);
+        defer arena.deinit();
+        _ = parseGeneratedRequest(Req, arena.allocator(), request_bytes, body_start, api_version) catch |err| {
+            log.warn("Failed to decode denied PrepareS3Object request: {}", .{err});
+            return null;
+        };
+
+        const resp = Resp{ .error_code = @intFromEnum(err_code), .throttle_time_ms = 0, .first_s3_object_id = -1 };
+        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+    }
+
+    fn handleCommitStreamSetObjectAuthorizationError(
+        self: *Broker,
+        request_bytes: []const u8,
+        body_start: usize,
+        req_header: *const RequestHeader,
+        api_version: i16,
+        resp_header_version: i16,
+        err_code: ErrorCode,
+    ) ?[]u8 {
+        const Req = generated.commit_stream_set_object_request.CommitStreamSetObjectRequest;
+        const Resp = generated.commit_stream_set_object_response.CommitStreamSetObjectResponse;
+
+        var arena = std.heap.ArenaAllocator.init(self.allocator);
+        defer arena.deinit();
+        _ = parseGeneratedRequest(Req, arena.allocator(), request_bytes, body_start, api_version) catch |err| {
+            log.warn("Failed to decode denied CommitStreamSetObject request: {}", .{err});
+            return null;
+        };
+
+        const resp = Resp{ .error_code = @intFromEnum(err_code), .throttle_time_ms = 0, .attributes = 0 };
+        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+    }
+
+    fn handleCommitStreamObjectAuthorizationError(
+        self: *Broker,
+        request_bytes: []const u8,
+        body_start: usize,
+        req_header: *const RequestHeader,
+        api_version: i16,
+        resp_header_version: i16,
+        err_code: ErrorCode,
+    ) ?[]u8 {
+        const Req = generated.commit_stream_object_request.CommitStreamObjectRequest;
+        const Resp = generated.commit_stream_object_response.CommitStreamObjectResponse;
+
+        var arena = std.heap.ArenaAllocator.init(self.allocator);
+        defer arena.deinit();
+        _ = parseGeneratedRequest(Req, arena.allocator(), request_bytes, body_start, api_version) catch |err| {
+            log.warn("Failed to decode denied CommitStreamObject request: {}", .{err});
+            return null;
+        };
+
+        const resp = Resp{ .error_code = @intFromEnum(err_code), .throttle_time_ms = 0 };
+        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+    }
+
+    fn handleGetOpeningStreamsAuthorizationError(
+        self: *Broker,
+        request_bytes: []const u8,
+        body_start: usize,
+        req_header: *const RequestHeader,
+        api_version: i16,
+        resp_header_version: i16,
+        err_code: ErrorCode,
+    ) ?[]u8 {
+        const Req = generated.get_opening_streams_request.GetOpeningStreamsRequest;
+        const Resp = generated.get_opening_streams_response.GetOpeningStreamsResponse;
+
+        var arena = std.heap.ArenaAllocator.init(self.allocator);
+        defer arena.deinit();
+        _ = parseGeneratedRequest(Req, arena.allocator(), request_bytes, body_start, api_version) catch |err| {
+            log.warn("Failed to decode denied GetOpeningStreams request: {}", .{err});
+            return null;
+        };
+
+        const resp = Resp{ .error_code = @intFromEnum(err_code), .throttle_time_ms = 0, .stream_metadata_list = &.{} };
         return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
     }
 
@@ -26109,6 +26205,137 @@ test "Broker.handleRequest AutoMQ stream lifecycle authorization denial uses gen
     try testing.expectEqual(@as(usize, 1), trim_resp.trim_stream_responses.len);
     try testing.expectEqual(denied, trim_resp.trim_stream_responses[0].error_code);
     try testing.expectEqual(@as(u64, 0), broker.object_manager.getStream(@intCast(stream_id)).?.start_offset);
+}
+
+test "Broker.handleRequest AutoMQ object metadata authorization denial uses generated responses" {
+    const PrepareReq = generated.prepare_s3_object_request.PrepareS3ObjectRequest;
+    const PrepareResp = generated.prepare_s3_object_response.PrepareS3ObjectResponse;
+    const CommitSsoReq = generated.commit_stream_set_object_request.CommitStreamSetObjectRequest;
+    const CommitSsoResp = generated.commit_stream_set_object_response.CommitStreamSetObjectResponse;
+    const CommitSoReq = generated.commit_stream_object_request.CommitStreamObjectRequest;
+    const CommitSoResp = generated.commit_stream_object_response.CommitStreamObjectResponse;
+    const OpeningReq = generated.get_opening_streams_request.GetOpeningStreamsRequest;
+    const OpeningResp = generated.get_opening_streams_response.GetOpeningStreamsResponse;
+    const denied = @as(i16, @intFromEnum(ErrorCode.cluster_authorization_failed));
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+    try broker.authorizer.addAcl("other-client", .cluster, "*", .literal, .alter, .allow, "*");
+    const stream = try broker.object_manager.createStream(1);
+    const stream_id: i64 = @intCast(stream.stream_id);
+    const prepared_before = broker.object_manager.prepared_registry.count();
+    const stream_objects_before = broker.object_manager.getStreamObjectCount();
+    const stream_set_objects_before = broker.object_manager.getStreamSetObjectCount();
+
+    var buf: [4096]u8 = undefined;
+    var pos = buildTestRequest(&buf, 505, 0, 5054, header_mod.requestHeaderVersion(505, 0));
+    const prepare_req = PrepareReq{ .node_id = 1, .prepared_count = 2, .time_to_live_in_ms = 60_000 };
+    prepare_req.serialize(&buf, &pos, 0);
+
+    const prepare_response = broker.handleRequest(buf[0..pos]);
+    try testing.expect(prepare_response != null);
+    defer testing.allocator.free(prepare_response.?);
+
+    var rpos: usize = 0;
+    var prepare_header = try ResponseHeader.deserialize(testing.allocator, prepare_response.?, &rpos, header_mod.responseHeaderVersion(505, 0));
+    defer prepare_header.deinit(testing.allocator);
+    try testing.expectEqual(@as(i32, 5054), prepare_header.correlation_id);
+    const prepare_resp = try PrepareResp.deserialize(testing.allocator, prepare_response.?, &rpos, 0);
+
+    try testing.expectEqual(prepare_response.?.len, rpos);
+    try testing.expectEqual(denied, prepare_resp.error_code);
+    try testing.expectEqual(@as(i64, -1), prepare_resp.first_s3_object_id);
+    try testing.expectEqual(prepared_before, broker.object_manager.prepared_registry.count());
+
+    pos = buildTestRequest(&buf, 506, 1, 5064, header_mod.requestHeaderVersion(506, 1));
+    const ranges = [_]CommitSsoReq.ObjectStreamRange{.{
+        .stream_id = stream_id,
+        .stream_epoch = 1,
+        .start_offset = 0,
+        .end_offset = 10,
+    }};
+    const stream_objects = [_]CommitSsoReq.StreamObject{};
+    const compacted_ids = [_]i64{};
+    const commit_sso_req = CommitSsoReq{
+        .node_id = 1,
+        .node_epoch = 1,
+        .object_id = 11,
+        .order_id = 11,
+        .object_size = 512,
+        .object_stream_ranges = &ranges,
+        .stream_objects = &stream_objects,
+        .compacted_object_ids = &compacted_ids,
+        .failover_mode = false,
+        .attributes = 77,
+    };
+    commit_sso_req.serialize(&buf, &pos, 1);
+
+    const commit_sso_response = broker.handleRequest(buf[0..pos]);
+    try testing.expect(commit_sso_response != null);
+    defer testing.allocator.free(commit_sso_response.?);
+
+    rpos = 0;
+    var commit_sso_header = try ResponseHeader.deserialize(testing.allocator, commit_sso_response.?, &rpos, header_mod.responseHeaderVersion(506, 1));
+    defer commit_sso_header.deinit(testing.allocator);
+    try testing.expectEqual(@as(i32, 5064), commit_sso_header.correlation_id);
+    const commit_sso_resp = try CommitSsoResp.deserialize(testing.allocator, commit_sso_response.?, &rpos, 1);
+
+    try testing.expectEqual(commit_sso_response.?.len, rpos);
+    try testing.expectEqual(denied, commit_sso_resp.error_code);
+    try testing.expectEqual(@as(i32, 0), commit_sso_resp.attributes);
+    try testing.expectEqual(stream_set_objects_before, broker.object_manager.getStreamSetObjectCount());
+    try testing.expectEqual(stream_objects_before, broker.object_manager.getStreamObjectCount());
+
+    pos = buildTestRequest(&buf, 507, 1, 5074, header_mod.requestHeaderVersion(507, 1));
+    const source_ids = [_]i64{11};
+    const operations = [_]i8{0};
+    const commit_so_req = CommitSoReq{
+        .node_id = 1,
+        .node_epoch = 1,
+        .object_id = 12,
+        .object_size = 128,
+        .stream_id = stream_id,
+        .start_offset = 0,
+        .end_offset = 10,
+        .source_object_ids = &source_ids,
+        .stream_epoch = 1,
+        .attributes = 5,
+        .operations = &operations,
+    };
+    commit_so_req.serialize(&buf, &pos, 1);
+
+    const commit_so_response = broker.handleRequest(buf[0..pos]);
+    try testing.expect(commit_so_response != null);
+    defer testing.allocator.free(commit_so_response.?);
+
+    rpos = 0;
+    var commit_so_header = try ResponseHeader.deserialize(testing.allocator, commit_so_response.?, &rpos, header_mod.responseHeaderVersion(507, 1));
+    defer commit_so_header.deinit(testing.allocator);
+    try testing.expectEqual(@as(i32, 5074), commit_so_header.correlation_id);
+    const commit_so_resp = try CommitSoResp.deserialize(testing.allocator, commit_so_response.?, &rpos, 1);
+
+    try testing.expectEqual(commit_so_response.?.len, rpos);
+    try testing.expectEqual(denied, commit_so_resp.error_code);
+    try testing.expectEqual(stream_objects_before, broker.object_manager.getStreamObjectCount());
+
+    pos = buildTestRequest(&buf, 508, 0, 5084, header_mod.requestHeaderVersion(508, 0));
+    const opening_req = OpeningReq{ .node_id = 1, .node_epoch = 1, .failover_mode = false };
+    opening_req.serialize(&buf, &pos, 0);
+
+    const opening_response = broker.handleRequest(buf[0..pos]);
+    try testing.expect(opening_response != null);
+    defer testing.allocator.free(opening_response.?);
+
+    rpos = 0;
+    var opening_header = try ResponseHeader.deserialize(testing.allocator, opening_response.?, &rpos, header_mod.responseHeaderVersion(508, 0));
+    defer opening_header.deinit(testing.allocator);
+    try testing.expectEqual(@as(i32, 5084), opening_header.correlation_id);
+    const opening_resp = try OpeningResp.deserialize(testing.allocator, opening_response.?, &rpos, 0);
+    defer if (opening_resp.stream_metadata_list.len > 0) testing.allocator.free(opening_resp.stream_metadata_list);
+
+    try testing.expectEqual(opening_response.?.len, rpos);
+    try testing.expectEqual(denied, opening_resp.error_code);
+    try testing.expectEqual(@as(usize, 0), opening_resp.stream_metadata_list.len);
 }
 
 test "Broker AutoMQ stream object lifecycle APIs" {
