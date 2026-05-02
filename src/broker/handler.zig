@@ -3692,6 +3692,7 @@ pub const Broker = struct {
             0 => self.handleProduceAuthorizationError(request_bytes, body_start, req_header, api_version, resp_header_version, err_code),
             1 => self.handleFetchAuthorizationError(request_bytes, body_start, req_header, api_version, resp_header_version, err_code),
             2 => self.handleListOffsetsAuthorizationError(request_bytes, body_start, req_header, api_version, resp_header_version, err_code),
+            3 => self.handleMetadataAuthorizationError(request_bytes, body_start, req_header, api_version, resp_header_version, err_code),
             8 => self.handleOffsetCommitAuthorizationError(request_bytes, body_start, req_header, api_version, resp_header_version, err_code),
             9 => self.handleOffsetFetchAuthorizationError(request_bytes, body_start, req_header, api_version, resp_header_version, err_code),
             10 => self.handleFindCoordinatorAuthorizationError(request_bytes, body_start, req_header, api_version, resp_header_version, err_code),
@@ -3701,6 +3702,8 @@ pub const Broker = struct {
             14 => self.handleSyncGroupAuthorizationError(request_bytes, body_start, req_header, api_version, resp_header_version, err_code),
             15 => self.handleDescribeGroupsAuthorizationError(request_bytes, body_start, req_header, api_version, resp_header_version, err_code),
             16 => self.handleListGroupsAuthorizationError(req_header, api_version, resp_header_version, err_code),
+            19 => self.handleCreateTopicsAuthorizationError(request_bytes, body_start, req_header, api_version, resp_header_version, err_code),
+            20 => self.handleDeleteTopicsAuthorizationError(request_bytes, body_start, req_header, api_version, resp_header_version, err_code),
             21 => self.handleDeleteRecordsAuthorizationError(request_bytes, body_start, req_header, api_version, resp_header_version, err_code),
             22 => self.handleInitProducerIdAuthorizationError(req_header, api_version, resp_header_version, err_code),
             23 => self.handleOffsetForLeaderEpochAuthorizationError(request_bytes, body_start, req_header, api_version, resp_header_version, err_code),
@@ -3718,6 +3721,60 @@ pub const Broker = struct {
             69 => self.handleConsumerGroupDescribeAuthorizationError(request_bytes, body_start, req_header, api_version, resp_header_version, err_code),
             else => self.handleGenericAuthorizationError(req_header, resp_header_version, err_code),
         };
+    }
+
+    fn handleMetadataAuthorizationError(
+        self: *Broker,
+        request_bytes: []const u8,
+        body_start: usize,
+        req_header: *const RequestHeader,
+        api_version: i16,
+        resp_header_version: i16,
+        err_code: ErrorCode,
+    ) ?[]u8 {
+        const Req = generated.metadata_request.MetadataRequest;
+        const Resp = generated.metadata_response.MetadataResponse;
+        const TopicResult = Resp.MetadataResponseTopic;
+
+        if (!validateMetadataRequestFrame(request_bytes, body_start, api_version)) {
+            log.warn("Malformed denied Metadata request", .{});
+            return null;
+        }
+
+        var pos = body_start;
+        var req = Req.deserialize(self.allocator, request_bytes, &pos, api_version) catch |err| {
+            log.warn("Failed to decode denied Metadata request: {}", .{err});
+            return null;
+        };
+        defer self.freeMetadataRequest(&req);
+
+        const requested_topics = req.topics orelse &.{};
+        var topics: []TopicResult = &.{};
+        if (requested_topics.len > 0) {
+            topics = self.allocator.alloc(TopicResult, requested_topics.len) catch return null;
+        }
+        defer if (topics.len > 0) self.allocator.free(topics);
+
+        for (requested_topics, 0..) |topic_req, topic_idx| {
+            topics[topic_idx] = .{
+                .error_code = @intFromEnum(err_code),
+                .name = topic_req.name,
+                .topic_id = if (api_version >= 10) topic_req.topic_id else zeroUuid(),
+                .is_internal = false,
+                .partitions = &.{},
+                .topic_authorized_operations = std.math.minInt(i32),
+            };
+        }
+
+        const resp = Resp{
+            .throttle_time_ms = 0,
+            .brokers = &.{},
+            .cluster_id = "zmq-cluster",
+            .controller_id = -1,
+            .topics = topics,
+            .cluster_authorized_operations = std.math.minInt(i32),
+        };
+        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
     }
 
     fn handleProduceAuthorizationError(
@@ -3867,6 +3924,116 @@ pub const Broker = struct {
             .session_id = 0,
             .responses = responses[0..responses_init],
             .node_endpoints = &.{},
+        };
+        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+    }
+
+    fn handleCreateTopicsAuthorizationError(
+        self: *Broker,
+        request_bytes: []const u8,
+        body_start: usize,
+        req_header: *const RequestHeader,
+        api_version: i16,
+        resp_header_version: i16,
+        err_code: ErrorCode,
+    ) ?[]u8 {
+        const Req = generated.create_topics_request.CreateTopicsRequest;
+        const Resp = generated.create_topics_response.CreateTopicsResponse;
+        const TopicResult = Resp.CreatableTopicResult;
+
+        if (!validateCreateTopicsRequestFrame(request_bytes, body_start, api_version)) {
+            log.warn("Malformed denied CreateTopics request", .{});
+            return null;
+        }
+
+        var pos = body_start;
+        var req = Req.deserialize(self.allocator, request_bytes, &pos, api_version) catch |err| {
+            log.warn("Failed to decode denied CreateTopics request: {}", .{err});
+            return null;
+        };
+        defer self.freeCreateTopicsRequest(&req);
+
+        var topics: []TopicResult = &.{};
+        if (req.topics.len > 0) {
+            topics = self.allocator.alloc(TopicResult, req.topics.len) catch return null;
+        }
+        defer if (topics.len > 0) self.allocator.free(topics);
+
+        for (req.topics, 0..) |topic_req, topic_idx| {
+            topics[topic_idx] = .{
+                .name = topic_req.name,
+                .topic_id = zeroUuid(),
+                .error_code = @intFromEnum(err_code),
+                .error_message = "Not authorized",
+                .topic_config_error_code = 0,
+                .num_partitions = -1,
+                .replication_factor = -1,
+                .configs = null,
+            };
+        }
+
+        const resp = Resp{
+            .throttle_time_ms = 0,
+            .topics = topics,
+        };
+        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+    }
+
+    fn handleDeleteTopicsAuthorizationError(
+        self: *Broker,
+        request_bytes: []const u8,
+        body_start: usize,
+        req_header: *const RequestHeader,
+        api_version: i16,
+        resp_header_version: i16,
+        err_code: ErrorCode,
+    ) ?[]u8 {
+        const Req = generated.delete_topics_request.DeleteTopicsRequest;
+        const Resp = generated.delete_topics_response.DeleteTopicsResponse;
+        const TopicResult = Resp.DeletableTopicResult;
+
+        if (!validateDeleteTopicsRequestFrame(request_bytes, body_start, api_version)) {
+            log.warn("Malformed denied DeleteTopics request", .{});
+            return null;
+        }
+
+        var pos = body_start;
+        var req = Req.deserialize(self.allocator, request_bytes, &pos, api_version) catch |err| {
+            log.warn("Failed to decode denied DeleteTopics request: {}", .{err});
+            return null;
+        };
+        defer self.freeDeleteTopicsRequest(&req);
+
+        const response_count = if (api_version >= 6) req.topics.len else req.topic_names.len;
+        var responses: []TopicResult = &.{};
+        if (response_count > 0) {
+            responses = self.allocator.alloc(TopicResult, response_count) catch return null;
+        }
+        defer if (responses.len > 0) self.allocator.free(responses);
+
+        if (api_version >= 6) {
+            for (req.topics, 0..) |topic_req, topic_idx| {
+                responses[topic_idx] = .{
+                    .name = topic_req.name,
+                    .topic_id = topic_req.topic_id,
+                    .error_code = @intFromEnum(err_code),
+                    .error_message = "Not authorized",
+                };
+            }
+        } else {
+            for (req.topic_names, 0..) |topic_name, topic_idx| {
+                responses[topic_idx] = .{
+                    .name = topic_name,
+                    .topic_id = zeroUuid(),
+                    .error_code = @intFromEnum(err_code),
+                    .error_message = "Not authorized",
+                };
+            }
+        }
+
+        const resp = Resp{
+            .throttle_time_ms = 0,
+            .responses = responses,
         };
         return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
     }
@@ -18149,6 +18316,51 @@ test "Broker.handleRequest Metadata v12 returns generated flexible topic metadat
     try testing.expectEqual(@as(i32, 1), resp.topics[0].partitions[0].replica_nodes[0]);
 }
 
+test "Broker.handleRequest Metadata authorization denial uses generated response" {
+    const Req = generated.metadata_request.MetadataRequest;
+    const Topic = Req.MetadataRequestTopic;
+    const Resp = generated.metadata_response.MetadataResponse;
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+    try broker.authorizer.addAcl("other-client", .cluster, "*", .literal, .describe, .allow, "*");
+
+    const topics = [_]Topic{.{
+        .name = "metadata-denied-topic",
+    }};
+    const req = Req{
+        .topics = &topics,
+        .allow_auto_topic_creation = true,
+        .include_topic_authorized_operations = true,
+    };
+
+    var buf: [512]u8 = undefined;
+    var pos = buildTestRequest(&buf, 3, 12, 314, header_mod.requestHeaderVersion(3, 12));
+    req.serialize(&buf, &pos, 12);
+
+    const response = broker.handleRequest(buf[0..pos]);
+    try testing.expect(response != null);
+    defer testing.allocator.free(response.?);
+
+    var rpos: usize = 0;
+    var response_header = try ResponseHeader.deserialize(testing.allocator, response.?, &rpos, header_mod.responseHeaderVersion(3, 12));
+    defer response_header.deinit(testing.allocator);
+    try testing.expectEqual(@as(i32, 314), response_header.correlation_id);
+
+    const resp = try Resp.deserialize(testing.allocator, response.?, &rpos, 12);
+    defer freeDeserializedMetadataResponse(&resp);
+
+    try testing.expectEqual(response.?.len, rpos);
+    try testing.expectEqual(@as(i32, 0), resp.throttle_time_ms);
+    try testing.expectEqual(@as(usize, 0), resp.brokers.len);
+    try testing.expectEqual(@as(i32, -1), resp.controller_id);
+    try testing.expectEqual(@as(usize, 1), resp.topics.len);
+    try testing.expectEqualStrings("metadata-denied-topic", resp.topics[0].name.?);
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.cluster_authorization_failed)), resp.topics[0].error_code);
+    try testing.expectEqual(@as(usize, 0), resp.topics[0].partitions.len);
+    try testing.expect(!broker.topics.contains("metadata-denied-topic"));
+}
+
 test "Broker.handleRequest Metadata rejects truncated request" {
     var broker = Broker.init(testing.allocator, 1, 9092);
     defer broker.deinit();
@@ -32337,6 +32549,61 @@ test "Broker.handleRequest CreateTopics v7 returns generated response" {
     try testing.expect(broker.topics.contains("ct-generated-topic"));
 }
 
+test "Broker.handleRequest CreateTopics authorization denial uses generated response" {
+    const Req = generated.create_topics_request.CreateTopicsRequest;
+    const Resp = generated.create_topics_response.CreateTopicsResponse;
+    const Topic = Req.CreatableTopic;
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+    try broker.authorizer.addAcl("other-client", .cluster, "*", .literal, .create, .allow, "*");
+
+    const topics = [_]Topic{.{
+        .name = "ct-denied-topic",
+        .num_partitions = 2,
+        .replication_factor = 1,
+    }};
+    const req = Req{
+        .topics = &topics,
+        .timeout_ms = 30000,
+        .validate_only = false,
+    };
+
+    var buf: [512]u8 = undefined;
+    var pos = buildTestRequest(&buf, 19, 7, 1927, header_mod.requestHeaderVersion(19, 7));
+    req.serialize(&buf, &pos, 7);
+
+    const response = broker.handleRequest(buf[0..pos]);
+    try testing.expect(response != null);
+    defer testing.allocator.free(response.?);
+
+    var rpos: usize = 0;
+    var response_header = try ResponseHeader.deserialize(testing.allocator, response.?, &rpos, header_mod.responseHeaderVersion(19, 7));
+    defer response_header.deinit(testing.allocator);
+    try testing.expectEqual(@as(i32, 1927), response_header.correlation_id);
+
+    const resp = try Resp.deserialize(testing.allocator, response.?, &rpos, 7);
+    defer {
+        for (resp.topics) |topic| {
+            if (topic.configs) |response_configs| {
+                if (response_configs.len > 0) testing.allocator.free(response_configs);
+            }
+        }
+        if (resp.topics.len > 0) testing.allocator.free(resp.topics);
+    }
+
+    try testing.expectEqual(response.?.len, rpos);
+    try testing.expectEqual(@as(i32, 0), resp.throttle_time_ms);
+    try testing.expectEqual(@as(usize, 1), resp.topics.len);
+    try testing.expectEqualStrings("ct-denied-topic", resp.topics[0].name.?);
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.cluster_authorization_failed)), resp.topics[0].error_code);
+    try testing.expectEqualStrings("Not authorized", resp.topics[0].error_message.?);
+    try testing.expectEqual(@as(i32, -1), resp.topics[0].num_partitions);
+    try testing.expectEqual(@as(i16, -1), resp.topics[0].replication_factor);
+    try testing.expect(resp.topics[0].configs == null);
+    try testing.expect(!broker.topics.contains("ct-denied-topic"));
+}
+
 test "Broker.handleRequest CreateTopics applies supported topic configs" {
     const Req = generated.create_topics_request.CreateTopicsRequest;
     const Resp = generated.create_topics_response.CreateTopicsResponse;
@@ -32982,6 +33249,53 @@ test "Broker.handleRequest DeleteTopics v6 deletes by topic id and returns gener
     try testing.expectEqualSlices(u8, &topic_id, &resp.responses[0].topic_id);
     try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.none)), resp.responses[0].error_code);
     try testing.expect(!broker.topics.contains("dt-v6-topic"));
+}
+
+test "Broker.handleRequest DeleteTopics authorization denial uses generated response" {
+    const Req = generated.delete_topics_request.DeleteTopicsRequest;
+    const Resp = generated.delete_topics_response.DeleteTopicsResponse;
+    const Topic = Req.DeleteTopicState;
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+
+    try testing.expect(broker.ensureTopic("dt-denied-topic"));
+    const topic_id = broker.topics.get("dt-denied-topic").?.topic_id;
+    try broker.authorizer.addAcl("other-client", .cluster, "*", .literal, .delete, .allow, "*");
+
+    const topics = [_]Topic{.{
+        .name = "dt-denied-topic",
+        .topic_id = topic_id,
+    }};
+    const req = Req{
+        .topics = &topics,
+        .timeout_ms = 30000,
+    };
+
+    var buf: [512]u8 = undefined;
+    var pos = buildTestRequest(&buf, 20, 6, 2016, header_mod.requestHeaderVersion(20, 6));
+    req.serialize(&buf, &pos, 6);
+
+    const response = broker.handleRequest(buf[0..pos]);
+    try testing.expect(response != null);
+    defer testing.allocator.free(response.?);
+
+    var rpos: usize = 0;
+    var response_header = try ResponseHeader.deserialize(testing.allocator, response.?, &rpos, header_mod.responseHeaderVersion(20, 6));
+    defer response_header.deinit(testing.allocator);
+    try testing.expectEqual(@as(i32, 2016), response_header.correlation_id);
+
+    const resp = try Resp.deserialize(testing.allocator, response.?, &rpos, 6);
+    defer if (resp.responses.len > 0) testing.allocator.free(resp.responses);
+
+    try testing.expectEqual(response.?.len, rpos);
+    try testing.expectEqual(@as(i32, 0), resp.throttle_time_ms);
+    try testing.expectEqual(@as(usize, 1), resp.responses.len);
+    try testing.expectEqualStrings("dt-denied-topic", resp.responses[0].name.?);
+    try testing.expectEqualSlices(u8, &topic_id, &resp.responses[0].topic_id);
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.cluster_authorization_failed)), resp.responses[0].error_code);
+    try testing.expectEqualStrings("Not authorized", resp.responses[0].error_message.?);
+    try testing.expect(broker.topics.contains("dt-denied-topic"));
 }
 
 test "Broker.handleRequest DeleteTopics clears ongoing reassignments for deleted topic" {
