@@ -10448,14 +10448,74 @@ pub const Broker = struct {
         };
         defer self.freeShareFetchRequest(&req);
 
+        const responses = self.buildShareFetchFailClosedResponses(req) catch return null;
+        defer self.freeShareFetchResponses(responses);
+
         const resp = Resp{
             .throttle_time_ms = 0,
             .error_code = ErrorCode.unsupported_version.toInt(),
             .error_message = "ShareFetch is not implemented",
-            .responses = &.{},
+            .responses = responses,
             .node_endpoints = &.{},
         };
         return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+    }
+
+    fn buildShareFetchFailClosedResponses(
+        self: *Broker,
+        req: generated.share_fetch_request.ShareFetchRequest,
+    ) ![]generated.share_fetch_response.ShareFetchResponse.ShareFetchableTopicResponse {
+        const TopicResponse = generated.share_fetch_response.ShareFetchResponse.ShareFetchableTopicResponse;
+        const PartitionData = TopicResponse.PartitionData;
+
+        if (req.topics.len == 0) return &.{};
+
+        const responses = try self.allocator.alloc(TopicResponse, req.topics.len);
+        var responses_init: usize = 0;
+        errdefer {
+            self.freeShareFetchResponsePartitions(responses[0..responses_init]);
+            self.allocator.free(responses);
+        }
+
+        for (req.topics) |topic| {
+            const partitions = try self.allocator.alloc(PartitionData, topic.partitions.len);
+            errdefer self.allocator.free(partitions);
+
+            for (topic.partitions, 0..) |partition, idx| {
+                partitions[idx] = .{
+                    .partition_index = partition.partition_index,
+                    .error_code = ErrorCode.unsupported_version.toInt(),
+                    .error_message = "ShareFetch is not implemented",
+                    .acknowledge_error_code = if (partition.acknowledgement_batches.len > 0) ErrorCode.unsupported_version.toInt() else ErrorCode.none.toInt(),
+                    .acknowledge_error_message = if (partition.acknowledgement_batches.len > 0) "ShareFetch acknowledgement is not implemented" else null,
+                    .current_leader = .{
+                        .leader_id = -1,
+                        .leader_epoch = -1,
+                    },
+                    .records = null,
+                    .acquired_records = &.{},
+                };
+            }
+
+            responses[responses_init] = .{
+                .topic_id = topic.topic_id,
+                .partitions = partitions,
+            };
+            responses_init += 1;
+        }
+
+        return responses;
+    }
+
+    fn freeShareFetchResponses(self: *Broker, responses: []const generated.share_fetch_response.ShareFetchResponse.ShareFetchableTopicResponse) void {
+        self.freeShareFetchResponsePartitions(responses);
+        if (responses.len > 0) self.allocator.free(responses);
+    }
+
+    fn freeShareFetchResponsePartitions(self: *Broker, responses: []const generated.share_fetch_response.ShareFetchResponse.ShareFetchableTopicResponse) void {
+        for (responses) |response| {
+            if (response.partitions.len > 0) self.allocator.free(response.partitions);
+        }
     }
 
     fn freeShareFetchRequest(self: *Broker, req: *generated.share_fetch_request.ShareFetchRequest) void {
@@ -10509,14 +10569,70 @@ pub const Broker = struct {
         };
         defer self.freeShareAcknowledgeRequest(&req);
 
+        const responses = self.buildShareAcknowledgeFailClosedResponses(req) catch return null;
+        defer self.freeShareAcknowledgeResponses(responses);
+
         const resp = Resp{
             .throttle_time_ms = 0,
             .error_code = ErrorCode.unsupported_version.toInt(),
             .error_message = "ShareAcknowledge is not implemented",
-            .responses = &.{},
+            .responses = responses,
             .node_endpoints = &.{},
         };
         return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+    }
+
+    fn buildShareAcknowledgeFailClosedResponses(
+        self: *Broker,
+        req: generated.share_acknowledge_request.ShareAcknowledgeRequest,
+    ) ![]generated.share_acknowledge_response.ShareAcknowledgeResponse.ShareAcknowledgeTopicResponse {
+        const TopicResponse = generated.share_acknowledge_response.ShareAcknowledgeResponse.ShareAcknowledgeTopicResponse;
+        const PartitionData = TopicResponse.PartitionData;
+
+        if (req.topics.len == 0) return &.{};
+
+        const responses = try self.allocator.alloc(TopicResponse, req.topics.len);
+        var responses_init: usize = 0;
+        errdefer {
+            self.freeShareAcknowledgeResponsePartitions(responses[0..responses_init]);
+            self.allocator.free(responses);
+        }
+
+        for (req.topics) |topic| {
+            const partitions = try self.allocator.alloc(PartitionData, topic.partitions.len);
+            errdefer self.allocator.free(partitions);
+
+            for (topic.partitions, 0..) |partition, idx| {
+                partitions[idx] = .{
+                    .partition_index = partition.partition_index,
+                    .error_code = ErrorCode.unsupported_version.toInt(),
+                    .error_message = "ShareAcknowledge is not implemented",
+                    .current_leader = .{
+                        .leader_id = -1,
+                        .leader_epoch = -1,
+                    },
+                };
+            }
+
+            responses[responses_init] = .{
+                .topic_id = topic.topic_id,
+                .partitions = partitions,
+            };
+            responses_init += 1;
+        }
+
+        return responses;
+    }
+
+    fn freeShareAcknowledgeResponses(self: *Broker, responses: []const generated.share_acknowledge_response.ShareAcknowledgeResponse.ShareAcknowledgeTopicResponse) void {
+        self.freeShareAcknowledgeResponsePartitions(responses);
+        if (responses.len > 0) self.allocator.free(responses);
+    }
+
+    fn freeShareAcknowledgeResponsePartitions(self: *Broker, responses: []const generated.share_acknowledge_response.ShareAcknowledgeResponse.ShareAcknowledgeTopicResponse) void {
+        for (responses) |response| {
+            if (response.partitions.len > 0) self.allocator.free(response.partitions);
+        }
     }
 
     fn freeShareAcknowledgeRequest(self: *Broker, req: *generated.share_acknowledge_request.ShareAcknowledgeRequest) void {
@@ -34885,7 +35001,17 @@ test "Broker.handleRequest ShareFetch returns generated fail-closed response" {
     try testing.expectEqual(@as(i32, 0), resp.throttle_time_ms);
     try testing.expectEqual(ErrorCode.unsupported_version.toInt(), resp.error_code);
     try testing.expectEqualStrings("ShareFetch is not implemented", resp.error_message.?);
-    try testing.expectEqual(@as(usize, 0), resp.responses.len);
+    try testing.expectEqual(@as(usize, 1), resp.responses.len);
+    try testing.expectEqualSlices(u8, topic_id[0..], resp.responses[0].topic_id[0..]);
+    try testing.expectEqual(@as(usize, 1), resp.responses[0].partitions.len);
+    try testing.expectEqual(@as(i32, 0), resp.responses[0].partitions[0].partition_index);
+    try testing.expectEqual(ErrorCode.unsupported_version.toInt(), resp.responses[0].partitions[0].error_code);
+    try testing.expectEqualStrings("ShareFetch is not implemented", resp.responses[0].partitions[0].error_message.?);
+    try testing.expectEqual(ErrorCode.unsupported_version.toInt(), resp.responses[0].partitions[0].acknowledge_error_code);
+    try testing.expectEqualStrings("ShareFetch acknowledgement is not implemented", resp.responses[0].partitions[0].acknowledge_error_message.?);
+    try testing.expectEqual(@as(i32, -1), resp.responses[0].partitions[0].current_leader.leader_id);
+    try testing.expect(resp.responses[0].partitions[0].records == null);
+    try testing.expectEqual(@as(usize, 0), resp.responses[0].partitions[0].acquired_records.len);
     try testing.expectEqual(@as(usize, 0), resp.node_endpoints.len);
 }
 
@@ -34984,7 +35110,13 @@ test "Broker.handleRequest ShareAcknowledge returns generated fail-closed respon
     try testing.expectEqual(@as(i32, 0), resp.throttle_time_ms);
     try testing.expectEqual(ErrorCode.unsupported_version.toInt(), resp.error_code);
     try testing.expectEqualStrings("ShareAcknowledge is not implemented", resp.error_message.?);
-    try testing.expectEqual(@as(usize, 0), resp.responses.len);
+    try testing.expectEqual(@as(usize, 1), resp.responses.len);
+    try testing.expectEqualSlices(u8, topic_id[0..], resp.responses[0].topic_id[0..]);
+    try testing.expectEqual(@as(usize, 1), resp.responses[0].partitions.len);
+    try testing.expectEqual(@as(i32, 0), resp.responses[0].partitions[0].partition_index);
+    try testing.expectEqual(ErrorCode.unsupported_version.toInt(), resp.responses[0].partitions[0].error_code);
+    try testing.expectEqualStrings("ShareAcknowledge is not implemented", resp.responses[0].partitions[0].error_message.?);
+    try testing.expectEqual(@as(i32, -1), resp.responses[0].partitions[0].current_leader.leader_id);
     try testing.expectEqual(@as(usize, 0), resp.node_endpoints.len);
 }
 

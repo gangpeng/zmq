@@ -171,6 +171,9 @@ Status: completed for the initial catalog and DeleteGroups slice.
   AssignReplicasToDirs key 73 remains non-advertised until JBOD directory
   semantics exist, but direct requests now validate/decode generated flexible
   frames and return generated fail-closed responses.
+  ShareFetch and ShareAcknowledge remain non-advertised until share sessions
+  exist, but direct v0 probes now fail closed with request-scoped topic and
+  partition response entries instead of dropping the requested partition shape.
   DescribeAcls/CreateAcls/DeleteAcls now use generated schemas, reject malformed
   frames, validate enum fields, write full ACL snapshots to `__cluster_metadata`
   for broker replacement replay, fail closed and roll back local ACL visibility
