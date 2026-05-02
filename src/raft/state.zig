@@ -63,10 +63,28 @@ pub const RaftState = struct {
 
     pub const VoterInfo = struct {
         node_id: i32,
+        voter_directory_id: [16]u8 = zero_uuid,
+        endpoints: []const VoterEndpoint = &.{},
+        k_raft_min_supported_version: i16 = 0,
+        k_raft_max_supported_version: i16 = 0,
         match_index: u64 = 0,
         next_index: u64 = 0,
         last_heartbeat_ms: i64 = 0,
     };
+
+    pub const VoterEndpoint = struct {
+        name: []u8,
+        host: []u8,
+        port: u16,
+    };
+
+    pub const VoterEndpointView = struct {
+        name: []const u8,
+        host: []const u8,
+        port: u16,
+    };
+
+    const zero_uuid = [_]u8{0} ** 16;
 
     pub fn init(alloc: Allocator, node_id: i32, cluster_id: []const u8) RaftState {
         var state = RaftState{
@@ -90,13 +108,88 @@ pub const RaftState = struct {
     }
 
     pub fn deinit(self: *RaftState) void {
+        var it = self.voters.iterator();
+        while (it.next()) |entry| {
+            self.freeVoterInfo(entry.value_ptr.*);
+        }
         self.voters.deinit();
         self.log.deinit();
     }
 
     /// Register a voter in the cluster.
     pub fn addVoter(self: *RaftState, voter_id: i32) !void {
+        if (self.voters.getPtr(voter_id)) |existing| {
+            self.freeVoterInfo(existing.*);
+            existing.* = .{ .node_id = voter_id };
+            return;
+        }
         try self.voters.put(voter_id, .{ .node_id = voter_id });
+    }
+
+    fn freeVoterEndpoints(self: *RaftState, endpoints: []const VoterEndpoint) void {
+        for (endpoints) |endpoint| {
+            self.allocator.free(endpoint.name);
+            self.allocator.free(endpoint.host);
+        }
+        if (endpoints.len > 0) self.allocator.free(@constCast(endpoints));
+    }
+
+    fn freeVoterInfo(self: *RaftState, info: VoterInfo) void {
+        self.freeVoterEndpoints(info.endpoints);
+    }
+
+    fn cloneVoterEndpoints(self: *RaftState, endpoints: []const VoterEndpointView) ![]const VoterEndpoint {
+        if (endpoints.len == 0) return error.InvalidEndpoint;
+
+        const owned = try self.allocator.alloc(VoterEndpoint, endpoints.len);
+        var initialized: usize = 0;
+        errdefer {
+            for (owned[0..initialized]) |endpoint| {
+                self.allocator.free(endpoint.name);
+                self.allocator.free(endpoint.host);
+            }
+            self.allocator.free(owned);
+        }
+
+        for (endpoints, 0..) |endpoint, index| {
+            if (endpoint.name.len == 0 or endpoint.host.len == 0 or endpoint.port == 0) return error.InvalidEndpoint;
+            const name_copy = try self.allocator.dupe(u8, endpoint.name);
+            const host_copy = self.allocator.dupe(u8, endpoint.host) catch |err| {
+                self.allocator.free(name_copy);
+                return err;
+            };
+            owned[index] = .{
+                .name = name_copy,
+                .host = host_copy,
+                .port = endpoint.port,
+            };
+            initialized += 1;
+        }
+
+        return owned;
+    }
+
+    /// Replace endpoint metadata for an existing voter after a committed update
+    /// config entry is applied.
+    pub fn updateVoterMetadata(
+        self: *RaftState,
+        voter_id: i32,
+        voter_directory_id: [16]u8,
+        endpoints: []const VoterEndpointView,
+        k_raft_min_supported_version: i16,
+        k_raft_max_supported_version: i16,
+    ) !void {
+        if (k_raft_min_supported_version > k_raft_max_supported_version) return error.InvalidUpdateVersion;
+
+        const voter = self.voters.getPtr(voter_id) orelse return error.VoterNotFound;
+        const new_endpoints = try self.cloneVoterEndpoints(endpoints);
+        errdefer self.freeVoterEndpoints(new_endpoints);
+
+        self.freeVoterEndpoints(voter.endpoints);
+        voter.voter_directory_id = voter_directory_id;
+        voter.endpoints = new_endpoints;
+        voter.k_raft_min_supported_version = k_raft_min_supported_version;
+        voter.k_raft_max_supported_version = k_raft_max_supported_version;
     }
 
     /// Handle a vote request. Returns whether vote is granted.
@@ -491,6 +584,7 @@ pub const RaftState = struct {
     pub const ConfigChangeType = enum(u8) {
         add_voter = 1,
         remove_voter = 2,
+        update_voter = 3,
     };
 
     /// A serialized config change entry stored in the Raft log.
@@ -498,6 +592,8 @@ pub const RaftState = struct {
     pub const ConfigChangeEntry = struct {
         change_type: ConfigChangeType,
         voter_id: i32,
+
+        const update_magic = "ZMQCFGU";
 
         pub fn serialize(self: ConfigChangeEntry) [5]u8 {
             var buf: [5]u8 = undefined;
@@ -518,8 +614,158 @@ pub const RaftState = struct {
 
         /// Check if a log entry is a config change (vs regular data).
         pub fn isConfigChange(data: []const u8) bool {
+            if (isVoterUpdate(data)) return true;
             if (data.len < 5) return false;
             return data[0] == 1 or data[0] == 2;
+        }
+
+        pub const VoterUpdate = struct {
+            voter_id: i32,
+            voter_directory_id: [16]u8,
+            endpoints: []const VoterEndpointView,
+            k_raft_min_supported_version: i16,
+            k_raft_max_supported_version: i16,
+
+            pub fn deinit(self: *VoterUpdate, alloc: Allocator) void {
+                if (self.endpoints.len > 0) alloc.free(@constCast(self.endpoints));
+            }
+        };
+
+        pub fn isVoterUpdate(data: []const u8) bool {
+            return data.len >= update_magic.len + 1 and
+                std.mem.eql(u8, data[0..update_magic.len], update_magic) and
+                data[update_magic.len] == @intFromEnum(ConfigChangeType.update_voter);
+        }
+
+        fn checkedAdd(total: *usize, value: usize) !void {
+            if (std.math.maxInt(usize) - total.* < value) return error.MessageTooLarge;
+            total.* += value;
+        }
+
+        pub fn serializeVoterUpdate(
+            alloc: Allocator,
+            voter_id: i32,
+            voter_directory_id: [16]u8,
+            endpoints: []const VoterEndpointView,
+            k_raft_min_supported_version: i16,
+            k_raft_max_supported_version: i16,
+        ) ![]u8 {
+            if (endpoints.len == 0) return error.InvalidEndpoint;
+            if (endpoints.len > std.math.maxInt(u32)) return error.MessageTooLarge;
+            if (k_raft_min_supported_version > k_raft_max_supported_version) return error.InvalidUpdateVersion;
+
+            var total_len: usize = update_magic.len + 1 + 4 + 16 + 2 + 2 + 4;
+            for (endpoints) |endpoint| {
+                if (endpoint.name.len == 0 or endpoint.host.len == 0 or endpoint.port == 0) return error.InvalidEndpoint;
+                if (endpoint.name.len > std.math.maxInt(u32) or endpoint.host.len > std.math.maxInt(u32)) return error.MessageTooLarge;
+                try checkedAdd(&total_len, 4 + endpoint.name.len + 4 + endpoint.host.len + 2);
+            }
+
+            const data = try alloc.alloc(u8, total_len);
+            var pos: usize = 0;
+            @memcpy(data[pos .. pos + update_magic.len], update_magic);
+            pos += update_magic.len;
+            data[pos] = @intFromEnum(ConfigChangeType.update_voter);
+            pos += 1;
+            std.mem.writeInt(i32, data[pos..][0..4], voter_id, .big);
+            pos += 4;
+            @memcpy(data[pos .. pos + 16], &voter_directory_id);
+            pos += 16;
+            std.mem.writeInt(i16, data[pos..][0..2], k_raft_min_supported_version, .big);
+            pos += 2;
+            std.mem.writeInt(i16, data[pos..][0..2], k_raft_max_supported_version, .big);
+            pos += 2;
+            std.mem.writeInt(u32, data[pos..][0..4], @intCast(endpoints.len), .big);
+            pos += 4;
+            for (endpoints) |endpoint| {
+                std.mem.writeInt(u32, data[pos..][0..4], @intCast(endpoint.name.len), .big);
+                pos += 4;
+                @memcpy(data[pos .. pos + endpoint.name.len], endpoint.name);
+                pos += endpoint.name.len;
+                std.mem.writeInt(u32, data[pos..][0..4], @intCast(endpoint.host.len), .big);
+                pos += 4;
+                @memcpy(data[pos .. pos + endpoint.host.len], endpoint.host);
+                pos += endpoint.host.len;
+                std.mem.writeInt(u16, data[pos..][0..2], endpoint.port, .big);
+                pos += 2;
+            }
+            return data;
+        }
+
+        fn readU32(data: []const u8, pos: *usize) !u32 {
+            if (pos.* + 4 > data.len) return error.InvalidConfigChangeEntry;
+            const value = std.mem.readInt(u32, data[pos.*..][0..4], .big);
+            pos.* += 4;
+            return value;
+        }
+
+        fn readI32(data: []const u8, pos: *usize) !i32 {
+            if (pos.* + 4 > data.len) return error.InvalidConfigChangeEntry;
+            const value = std.mem.readInt(i32, data[pos.*..][0..4], .big);
+            pos.* += 4;
+            return value;
+        }
+
+        fn readI16(data: []const u8, pos: *usize) !i16 {
+            if (pos.* + 2 > data.len) return error.InvalidConfigChangeEntry;
+            const value = std.mem.readInt(i16, data[pos.*..][0..2], .big);
+            pos.* += 2;
+            return value;
+        }
+
+        fn readU16(data: []const u8, pos: *usize) !u16 {
+            if (pos.* + 2 > data.len) return error.InvalidConfigChangeEntry;
+            const value = std.mem.readInt(u16, data[pos.*..][0..2], .big);
+            pos.* += 2;
+            return value;
+        }
+
+        fn readBytes(data: []const u8, pos: *usize, len: usize) ![]const u8 {
+            if (pos.* + len > data.len) return error.InvalidConfigChangeEntry;
+            const bytes = data[pos.* .. pos.* + len];
+            pos.* += len;
+            return bytes;
+        }
+
+        pub fn deserializeVoterUpdate(alloc: Allocator, data: []const u8) !?VoterUpdate {
+            if (!isVoterUpdate(data)) return null;
+
+            var pos: usize = update_magic.len + 1;
+            const voter_id = try readI32(data, &pos);
+            const voter_directory_id = try readBytes(data, &pos, 16);
+            const min_supported_version = try readI16(data, &pos);
+            const max_supported_version = try readI16(data, &pos);
+            const endpoint_count: usize = @intCast(try readU32(data, &pos));
+            if (endpoint_count == 0) return error.InvalidConfigChangeEntry;
+
+            const endpoints = try alloc.alloc(VoterEndpointView, endpoint_count);
+            errdefer alloc.free(endpoints);
+
+            for (endpoints) |*endpoint| {
+                const name_len: usize = @intCast(try readU32(data, &pos));
+                const name = try readBytes(data, &pos, name_len);
+                const host_len: usize = @intCast(try readU32(data, &pos));
+                const host = try readBytes(data, &pos, host_len);
+                const port = try readU16(data, &pos);
+                if (name.len == 0 or host.len == 0 or port == 0) return error.InvalidConfigChangeEntry;
+                endpoint.* = .{
+                    .name = name,
+                    .host = host,
+                    .port = port,
+                };
+            }
+            if (pos != data.len) return error.InvalidConfigChangeEntry;
+            if (min_supported_version > max_supported_version) return error.InvalidConfigChangeEntry;
+
+            var directory_id: [16]u8 = undefined;
+            @memcpy(&directory_id, voter_directory_id);
+            return .{
+                .voter_id = voter_id,
+                .voter_directory_id = directory_id,
+                .endpoints = endpoints,
+                .k_raft_min_supported_version = min_supported_version,
+                .k_raft_max_supported_version = max_supported_version,
+            };
         }
     };
 
@@ -718,10 +964,42 @@ pub const RaftState = struct {
         return offset;
     }
 
+    /// Propose updating endpoint metadata for an existing voter (leader only).
+    pub fn proposeUpdateVoter(
+        self: *RaftState,
+        voter_id: i32,
+        voter_directory_id: [16]u8,
+        endpoints: []const VoterEndpointView,
+        k_raft_min_supported_version: i16,
+        k_raft_max_supported_version: i16,
+    ) !u64 {
+        if (self.role != .leader) return error.NotLeader;
+        if (self.pending_config_change) return error.ConfigChangePending;
+        if (!self.voters.contains(voter_id)) return error.VoterNotFound;
+
+        const data = try ConfigChangeEntry.serializeVoterUpdate(
+            self.allocator,
+            voter_id,
+            voter_directory_id,
+            endpoints,
+            k_raft_min_supported_version,
+            k_raft_max_supported_version,
+        );
+        defer self.allocator.free(data);
+
+        const offset = try self.appendEntry(data);
+        self.pending_config_change = true;
+
+        log.info("Proposed UpdateVoter: node {d} at offset {d}", .{ voter_id, offset });
+        return offset;
+    }
+
     /// Remove a voter from the cluster (direct, not through Raft log).
     /// Used internally by applyCommittedConfigs.
     pub fn removeVoter(self: *RaftState, voter_id: i32) void {
-        _ = self.voters.fetchRemove(voter_id);
+        if (self.voters.fetchRemove(voter_id)) |removed| {
+            self.freeVoterInfo(removed.value);
+        }
     }
 
     /// Apply any committed config change entries.
@@ -735,16 +1013,34 @@ pub const RaftState = struct {
                 if (entry.offset <= last_offset) continue;
             }
 
-            if (ConfigChangeEntry.deserialize(entry.data)) |config| {
+            if (ConfigChangeEntry.deserializeVoterUpdate(self.allocator, entry.data) catch null) |update| {
+                var mutable_update = update;
+                defer mutable_update.deinit(self.allocator);
+                self.updateVoterMetadata(
+                    update.voter_id,
+                    update.voter_directory_id,
+                    update.endpoints,
+                    update.k_raft_min_supported_version,
+                    update.k_raft_max_supported_version,
+                ) catch |err| {
+                    log.warn("Config apply failed: update voter {d}: {}", .{ update.voter_id, err });
+                    self.last_applied_config_offset = entry.offset;
+                    self.pending_config_change = false;
+                    continue;
+                };
+                log.info("Config applied: updated voter {d} endpoint metadata", .{update.voter_id});
+                self.last_applied_config_offset = entry.offset;
+                self.pending_config_change = false;
+            } else if (ConfigChangeEntry.deserialize(entry.data)) |config| {
                 switch (config.change_type) {
                     .add_voter => {
-                        self.voters.put(config.voter_id, .{ .node_id = config.voter_id }) catch {};
+                        self.addVoter(config.voter_id) catch {};
                         log.info("Config applied: added voter {d} (now {d} voters)", .{
                             config.voter_id, self.voters.count(),
                         });
                     },
                     .remove_voter => {
-                        _ = self.voters.fetchRemove(config.voter_id);
+                        self.removeVoter(config.voter_id);
                         log.info("Config applied: removed voter {d} (now {d} voters)", .{
                             config.voter_id, self.voters.count(),
                         });
@@ -754,6 +1050,7 @@ pub const RaftState = struct {
                             self.role = .resigned;
                         }
                     },
+                    .update_voter => {},
                 }
                 self.last_applied_config_offset = entry.offset;
                 self.pending_config_change = false;
@@ -2115,6 +2412,64 @@ test "RaftState removing self causes resignation" {
     state.applyCommittedConfigs();
 
     try testing.expectEqual(RaftState.Role.resigned, state.role);
+}
+
+test "RaftState proposeUpdateVoter applies endpoint metadata after commit" {
+    var state = RaftState.init(testing.allocator, 0, "cluster");
+    defer state.deinit();
+
+    try state.addVoter(0);
+    try state.addVoter(1);
+    _ = state.startElection();
+    state.becomeLeader();
+
+    const directory_id = [_]u8{1} ** 16;
+    const endpoints = [_]RaftState.VoterEndpointView{.{
+        .name = "CONTROLLER",
+        .host = "controller-1.example",
+        .port = 19093,
+    }};
+
+    const offset = try state.proposeUpdateVoter(1, directory_id, &endpoints, 1, 2);
+    try testing.expectEqual(@as(u64, 0), offset);
+    try testing.expect(state.pending_config_change);
+
+    state.commit_index = offset;
+    state.applyCommittedConfigs();
+
+    try testing.expect(!state.pending_config_change);
+    const voter = state.voters.get(1).?;
+    try testing.expectEqualSlices(u8, &directory_id, &voter.voter_directory_id);
+    try testing.expectEqual(@as(i16, 1), voter.k_raft_min_supported_version);
+    try testing.expectEqual(@as(i16, 2), voter.k_raft_max_supported_version);
+    try testing.expectEqual(@as(usize, 1), voter.endpoints.len);
+    try testing.expectEqualStrings("CONTROLLER", voter.endpoints[0].name);
+    try testing.expectEqualStrings("controller-1.example", voter.endpoints[0].host);
+    try testing.expectEqual(@as(u16, 19093), voter.endpoints[0].port);
+}
+
+test "RaftState UpdateVoter config entry serializes and deserializes endpoints" {
+    const directory_id = [_]u8{2} ** 16;
+    const endpoints = [_]RaftState.VoterEndpointView{
+        .{ .name = "CONTROLLER", .host = "controller-a", .port = 9093 },
+        .{ .name = "SSL", .host = "controller-b", .port = 9094 },
+    };
+
+    const data = try RaftState.ConfigChangeEntry.serializeVoterUpdate(testing.allocator, 2, directory_id, &endpoints, 0, 3);
+    defer testing.allocator.free(data);
+
+    try testing.expect(RaftState.ConfigChangeEntry.isConfigChange(data));
+    var update = (try RaftState.ConfigChangeEntry.deserializeVoterUpdate(testing.allocator, data)).?;
+    defer update.deinit(testing.allocator);
+
+    try testing.expectEqual(@as(i32, 2), update.voter_id);
+    try testing.expectEqualSlices(u8, &directory_id, &update.voter_directory_id);
+    try testing.expectEqual(@as(i16, 0), update.k_raft_min_supported_version);
+    try testing.expectEqual(@as(i16, 3), update.k_raft_max_supported_version);
+    try testing.expectEqual(@as(usize, 2), update.endpoints.len);
+    try testing.expectEqualStrings("CONTROLLER", update.endpoints[0].name);
+    try testing.expectEqualStrings("controller-a", update.endpoints[0].host);
+    try testing.expectEqual(@as(u16, 9094), update.endpoints[1].port);
 }
 
 test "ConfigChangeEntry serialize and deserialize round-trip" {

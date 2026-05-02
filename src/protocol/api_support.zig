@@ -140,6 +140,7 @@ pub const controller_supported_apis = [_]ControllerApiSupport{
     .{ .key = 70, .name = "ControllerRegistration", .min = 0, .max = 0 },
     .{ .key = 80, .name = "AddRaftVoter", .min = 0, .max = 0 },
     .{ .key = 81, .name = "RemoveRaftVoter", .min = 0, .max = 0 },
+    .{ .key = 82, .name = "UpdateRaftVoter", .min = 0, .max = 0 },
 };
 
 /// Request schemas present in src/protocol/schemas. This is intentionally
@@ -630,10 +631,10 @@ test "controller supported APIs do not advertise versions beyond generated schem
 
     try testing.expect(findControllerSupport(71) == null);
     try testing.expect(findControllerSupport(72) == null);
-    try testing.expect(findControllerSupport(82) == null);
     try testing.expectEqualStrings("ControllerRegistration", findControllerSupport(70).?.name);
     try testing.expectEqualStrings("AddRaftVoter", findControllerSupport(80).?.name);
     try testing.expectEqualStrings("RemoveRaftVoter", findControllerSupport(81).?.name);
+    try testing.expectEqualStrings("UpdateRaftVoter", findControllerSupport(82).?.name);
 }
 
 test "broker supported APIs have handler switch coverage" {

@@ -1122,7 +1122,7 @@ pub const Controller = struct {
     }
 
     // ---------------------------------------------------------------
-    // UpdateRaftVoter (key 82) — non-advertised until endpoint updates apply
+    // UpdateRaftVoter (key 82) — dynamic voter endpoint metadata
     // ---------------------------------------------------------------
     fn handleUpdateRaftVoter(self: *Controller, request_bytes: []const u8, start_pos: usize, req_header: *const RequestHeader, api_version: i16, resp_header_version: i16) ?[]u8 {
         const Req = generated.update_raft_voter_request.UpdateRaftVoterRequest;
@@ -1170,7 +1170,50 @@ pub const Controller = struct {
             return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
         }
 
-        const resp = Resp{ .throttle_time_ms = 0, .error_code = ErrorCode.unsupported_version.toInt() };
+        const endpoint_views = self.allocator.alloc(RaftState.VoterEndpointView, req.listeners.len) catch return null;
+        defer self.allocator.free(endpoint_views);
+        for (req.listeners, 0..) |listener, index| {
+            const name = listener.name orelse {
+                const resp = Resp{ .throttle_time_ms = 0, .error_code = ErrorCode.invalid_request.toInt() };
+                return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+            };
+            const host = listener.host orelse {
+                const resp = Resp{ .throttle_time_ms = 0, .error_code = ErrorCode.invalid_request.toInt() };
+                return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+            };
+            if (name.len == 0 or host.len == 0 or listener.port == 0) {
+                const resp = Resp{ .throttle_time_ms = 0, .error_code = ErrorCode.invalid_request.toInt() };
+                return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+            }
+            endpoint_views[index] = .{
+                .name = name,
+                .host = host,
+                .port = listener.port,
+            };
+        }
+
+        const offset = self.raft_state.proposeUpdateVoter(
+            req.voter_id,
+            req.voter_directory_id,
+            endpoint_views,
+            req.k_raft_version_feature.min_supported_version,
+            req.k_raft_version_feature.max_supported_version,
+        ) catch |err| {
+            const error_code: i16 = switch (err) {
+                error.NotLeader => ErrorCode.not_controller.toInt(),
+                error.ConfigChangePending => ErrorCode.concurrent_transactions.toInt(),
+                error.VoterNotFound => ErrorCode.resource_not_found.toInt(),
+                error.InvalidUpdateVersion => ErrorCode.invalid_update_version.toInt(),
+                error.InvalidEndpoint, error.MessageTooLarge => ErrorCode.invalid_request.toInt(),
+                else => ErrorCode.invalid_request.toInt(),
+            };
+            const resp = Resp{ .throttle_time_ms = 0, .error_code = error_code };
+            return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+        };
+
+        log.info("UpdateRaftVoter: proposed updating node {d} at offset {d}", .{ req.voter_id, offset });
+
+        const resp = Resp{ .throttle_time_ms = 0, .error_code = ErrorCode.none.toInt() };
         return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
     }
 
@@ -1726,9 +1769,17 @@ test "Controller handleRequest ApiVersions returns supported APIs" {
     const error_code = ser.readI16(response.?, &rpos);
     try testing.expectEqual(@as(i16, 0), error_code);
 
-    // Array of supported APIs — controller supports 13 APIs
+    // Array of supported APIs.
     const array_len = try ser.readArrayLen(response.?, &rpos);
-    try testing.expectEqual(@as(usize, 13), array_len.?);
+    try testing.expectEqual(api_support.controller_supported_apis.len, array_len.?);
+    var saw_update_raft_voter = false;
+    for (0..array_len.?) |_| {
+        const api_key = ser.readI16(response.?, &rpos);
+        _ = ser.readI16(response.?, &rpos);
+        _ = ser.readI16(response.?, &rpos);
+        if (api_key == 82) saw_update_raft_voter = true;
+    }
+    try testing.expect(saw_update_raft_voter);
 }
 
 test "Controller handleRequest unsupported API returns error" {
@@ -2819,7 +2870,7 @@ test "Controller handleRequest RemoveRaftVoter rejects malformed request" {
     try testing.expectEqual(ErrorCode.invalid_request.toInt(), resp.error_code);
 }
 
-test "Controller handleRequest UpdateRaftVoter returns generated fail-closed response" {
+test "Controller handleRequest UpdateRaftVoter proposes endpoint update" {
     const Req = generated.update_raft_voter_request.UpdateRaftVoterRequest;
     const Resp = generated.update_raft_voter_response.UpdateRaftVoterResponse;
 
@@ -2853,7 +2904,108 @@ test "Controller handleRequest UpdateRaftVoter returns generated fail-closed res
     try testing.expectEqual(@as(i32, 8200), resp_header.correlation_id);
 
     const resp = try Resp.deserialize(testing.allocator, response.?, &rpos, 0);
-    try testing.expectEqual(ErrorCode.unsupported_version.toInt(), resp.error_code);
+    try testing.expectEqual(ErrorCode.none.toInt(), resp.error_code);
+    try testing.expect(ctrl.raft_state.pending_config_change);
+
+    ctrl.raft_state.commit_index = ctrl.raft_state.log.lastOffset();
+    ctrl.raft_state.applyCommittedConfigs();
+    const voter = ctrl.raft_state.voters.get(1).?;
+    try testing.expectEqual(@as(usize, 1), voter.endpoints.len);
+    try testing.expectEqualStrings("CONTROLLER", voter.endpoints[0].name);
+    try testing.expectEqualStrings("127.0.0.1", voter.endpoints[0].host);
+    try testing.expectEqual(@as(u16, 9093), voter.endpoints[0].port);
+}
+
+test "Controller handleRequest UpdateRaftVoter rejects non-leader unknown voter and invalid feature" {
+    const Req = generated.update_raft_voter_request.UpdateRaftVoterRequest;
+    const Resp = generated.update_raft_voter_response.UpdateRaftVoterResponse;
+
+    const listeners = [_]Req.Listener{.{
+        .name = "CONTROLLER",
+        .host = "127.0.0.1",
+        .port = 9093,
+    }};
+
+    {
+        var ctrl = Controller.init(testing.allocator, 1, "test-cluster");
+        defer ctrl.deinit();
+        try ctrl.raft_state.addVoter(1);
+
+        var buf: [256]u8 = undefined;
+        var pos = buildTestRequest(&buf, 82, 0, 8202, header_mod.requestHeaderVersion(82, 0));
+        const req = Req{
+            .cluster_id = "test-cluster",
+            .voter_id = 1,
+            .listeners = &listeners,
+            .k_raft_version_feature = .{ .min_supported_version = 0, .max_supported_version = 0 },
+        };
+        req.serialize(&buf, &pos, 0);
+
+        const response = ctrl.handleRequest(buf[0..pos]);
+        try testing.expect(response != null);
+        defer testing.allocator.free(response.?);
+
+        var rpos: usize = 0;
+        var resp_header = try ResponseHeader.deserialize(testing.allocator, response.?, &rpos, header_mod.responseHeaderVersion(82, 0));
+        defer resp_header.deinit(testing.allocator);
+        try testing.expectEqual(@as(i32, 8202), resp_header.correlation_id);
+        const resp = try Resp.deserialize(testing.allocator, response.?, &rpos, 0);
+        try testing.expectEqual(ErrorCode.not_controller.toInt(), resp.error_code);
+    }
+
+    {
+        var ctrl = Controller.init(testing.allocator, 1, "test-cluster");
+        defer ctrl.deinit();
+        try makeTestControllerLeader(&ctrl);
+
+        var buf: [256]u8 = undefined;
+        var pos = buildTestRequest(&buf, 82, 0, 8203, header_mod.requestHeaderVersion(82, 0));
+        const req = Req{
+            .cluster_id = "test-cluster",
+            .voter_id = 2,
+            .listeners = &listeners,
+            .k_raft_version_feature = .{ .min_supported_version = 0, .max_supported_version = 0 },
+        };
+        req.serialize(&buf, &pos, 0);
+
+        const response = ctrl.handleRequest(buf[0..pos]);
+        try testing.expect(response != null);
+        defer testing.allocator.free(response.?);
+
+        var rpos: usize = 0;
+        var resp_header = try ResponseHeader.deserialize(testing.allocator, response.?, &rpos, header_mod.responseHeaderVersion(82, 0));
+        defer resp_header.deinit(testing.allocator);
+        try testing.expectEqual(@as(i32, 8203), resp_header.correlation_id);
+        const resp = try Resp.deserialize(testing.allocator, response.?, &rpos, 0);
+        try testing.expectEqual(ErrorCode.resource_not_found.toInt(), resp.error_code);
+    }
+
+    {
+        var ctrl = Controller.init(testing.allocator, 1, "test-cluster");
+        defer ctrl.deinit();
+        try makeTestControllerLeader(&ctrl);
+
+        var buf: [256]u8 = undefined;
+        var pos = buildTestRequest(&buf, 82, 0, 8204, header_mod.requestHeaderVersion(82, 0));
+        const req = Req{
+            .cluster_id = "test-cluster",
+            .voter_id = 1,
+            .listeners = &listeners,
+            .k_raft_version_feature = .{ .min_supported_version = 2, .max_supported_version = 1 },
+        };
+        req.serialize(&buf, &pos, 0);
+
+        const response = ctrl.handleRequest(buf[0..pos]);
+        try testing.expect(response != null);
+        defer testing.allocator.free(response.?);
+
+        var rpos: usize = 0;
+        var resp_header = try ResponseHeader.deserialize(testing.allocator, response.?, &rpos, header_mod.responseHeaderVersion(82, 0));
+        defer resp_header.deinit(testing.allocator);
+        try testing.expectEqual(@as(i32, 8204), resp_header.correlation_id);
+        const resp = try Resp.deserialize(testing.allocator, response.?, &rpos, 0);
+        try testing.expectEqual(ErrorCode.invalid_update_version.toInt(), resp.error_code);
+    }
 }
 
 test "Controller handleRequest UpdateRaftVoter rejects malformed request" {
