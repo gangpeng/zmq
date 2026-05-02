@@ -3722,6 +3722,10 @@ pub const Broker = struct {
             45 => self.handleAlterPartitionReassignmentsAuthorizationError(request_bytes, body_start, req_header, api_version, resp_header_version, err_code),
             46 => self.handleListPartitionReassignmentsAuthorizationError(request_bytes, body_start, req_header, api_version, resp_header_version, err_code),
             47 => self.handleOffsetDeleteAuthorizationError(request_bytes, body_start, req_header, api_version, resp_header_version, err_code),
+            48 => self.handleDescribeClientQuotasAuthorizationError(request_bytes, body_start, req_header, api_version, resp_header_version, err_code),
+            49 => self.handleAlterClientQuotasAuthorizationError(request_bytes, body_start, req_header, api_version, resp_header_version, err_code),
+            50 => self.handleDescribeUserScramCredentialsAuthorizationError(request_bytes, body_start, req_header, api_version, resp_header_version, err_code),
+            51 => self.handleAlterUserScramCredentialsAuthorizationError(request_bytes, body_start, req_header, api_version, resp_header_version, err_code),
             55 => self.handleDescribeQuorumAuthorizationError(req_header, api_version, resp_header_version, err_code),
             60 => self.handleDescribeClusterAuthorizationError(req_header, api_version, resp_header_version, err_code),
             61 => self.handleDescribeProducersAuthorizationError(request_bytes, body_start, req_header, api_version, resp_header_version, err_code),
@@ -5242,6 +5246,193 @@ pub const Broker = struct {
             .error_code = @intFromEnum(err_code),
             .error_message = "Not authorized",
             .topics = &.{},
+        };
+        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+    }
+
+    fn handleDescribeClientQuotasAuthorizationError(
+        self: *Broker,
+        request_bytes: []const u8,
+        body_start: usize,
+        req_header: *const RequestHeader,
+        api_version: i16,
+        resp_header_version: i16,
+        err_code: ErrorCode,
+    ) ?[]u8 {
+        const Req = generated.describe_client_quotas_request.DescribeClientQuotasRequest;
+        const Resp = generated.describe_client_quotas_response.DescribeClientQuotasResponse;
+
+        if (!validateDescribeClientQuotasRequestFrame(request_bytes, body_start, api_version)) {
+            log.warn("Malformed denied DescribeClientQuotas request", .{});
+            return null;
+        }
+
+        var pos = body_start;
+        var req = Req.deserialize(self.allocator, request_bytes, &pos, api_version) catch |err| {
+            log.warn("Failed to decode denied DescribeClientQuotas request: {}", .{err});
+            return null;
+        };
+        defer self.freeDescribeClientQuotasRequest(&req);
+
+        const resp = Resp{
+            .throttle_time_ms = 0,
+            .error_code = @intFromEnum(err_code),
+            .error_message = "Not authorized",
+            .entries = null,
+        };
+        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+    }
+
+    fn handleAlterClientQuotasAuthorizationError(
+        self: *Broker,
+        request_bytes: []const u8,
+        body_start: usize,
+        req_header: *const RequestHeader,
+        api_version: i16,
+        resp_header_version: i16,
+        err_code: ErrorCode,
+    ) ?[]u8 {
+        const Req = generated.alter_client_quotas_request.AlterClientQuotasRequest;
+        const Resp = generated.alter_client_quotas_response.AlterClientQuotasResponse;
+        const EntryResponse = Resp.EntryData;
+
+        if (!validateAlterClientQuotasRequestFrame(request_bytes, body_start, api_version)) {
+            log.warn("Malformed denied AlterClientQuotas request", .{});
+            return null;
+        }
+
+        var pos = body_start;
+        var req = Req.deserialize(self.allocator, request_bytes, &pos, api_version) catch |err| {
+            log.warn("Failed to decode denied AlterClientQuotas request: {}", .{err});
+            return null;
+        };
+        defer self.freeAlterClientQuotasRequest(&req);
+
+        var entries: []EntryResponse = &.{};
+        if (req.entries.len > 0) {
+            entries = self.allocator.alloc(EntryResponse, req.entries.len) catch return null;
+        }
+        var entries_init: usize = 0;
+        defer {
+            self.freeAlterClientQuotaEntries(entries[0..entries_init]);
+            if (entries.len > 0) self.allocator.free(entries);
+        }
+
+        for (req.entries) |entry| {
+            entries[entries_init] = self.buildAlterClientQuotaResponseEntry(entry, @intFromEnum(err_code), "Not authorized") catch return null;
+            entries_init += 1;
+        }
+
+        const resp = Resp{
+            .throttle_time_ms = 0,
+            .entries = entries[0..entries_init],
+        };
+        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+    }
+
+    fn handleDescribeUserScramCredentialsAuthorizationError(
+        self: *Broker,
+        request_bytes: []const u8,
+        body_start: usize,
+        req_header: *const RequestHeader,
+        api_version: i16,
+        resp_header_version: i16,
+        err_code: ErrorCode,
+    ) ?[]u8 {
+        const Req = generated.describe_user_scram_credentials_request.DescribeUserScramCredentialsRequest;
+        const Resp = generated.describe_user_scram_credentials_response.DescribeUserScramCredentialsResponse;
+        const Result = Resp.DescribeUserScramCredentialsResult;
+
+        if (!validateDescribeUserScramCredentialsRequestFrame(request_bytes, body_start)) {
+            log.warn("Malformed denied DescribeUserScramCredentials request", .{});
+            return null;
+        }
+
+        var pos = body_start;
+        var req = Req.deserialize(self.allocator, request_bytes, &pos, api_version) catch |err| {
+            log.warn("Failed to decode denied DescribeUserScramCredentials request: {}", .{err});
+            return null;
+        };
+        defer self.freeDescribeUserScramCredentialsRequest(&req);
+
+        const requested_users = req.users orelse &.{};
+        var results: []Result = &.{};
+        if (requested_users.len > 0) {
+            results = self.allocator.alloc(Result, requested_users.len) catch return null;
+        }
+        defer if (results.len > 0) self.allocator.free(results);
+
+        for (requested_users, 0..) |user, idx| {
+            results[idx] = .{
+                .user = user.name,
+                .error_code = @intFromEnum(err_code),
+                .error_message = "Not authorized",
+                .credential_infos = &.{},
+            };
+        }
+
+        const resp = Resp{
+            .throttle_time_ms = 0,
+            .error_code = @intFromEnum(err_code),
+            .error_message = "Not authorized",
+            .results = results,
+        };
+        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+    }
+
+    fn handleAlterUserScramCredentialsAuthorizationError(
+        self: *Broker,
+        request_bytes: []const u8,
+        body_start: usize,
+        req_header: *const RequestHeader,
+        api_version: i16,
+        resp_header_version: i16,
+        err_code: ErrorCode,
+    ) ?[]u8 {
+        const Req = generated.alter_user_scram_credentials_request.AlterUserScramCredentialsRequest;
+        const Resp = generated.alter_user_scram_credentials_response.AlterUserScramCredentialsResponse;
+        const Result = Resp.AlterUserScramCredentialsResult;
+
+        if (!validateAlterUserScramCredentialsRequestFrame(request_bytes, body_start)) {
+            log.warn("Malformed denied AlterUserScramCredentials request", .{});
+            return null;
+        }
+
+        var pos = body_start;
+        var req = Req.deserialize(self.allocator, request_bytes, &pos, api_version) catch |err| {
+            log.warn("Failed to decode denied AlterUserScramCredentials request: {}", .{err});
+            return null;
+        };
+        defer self.freeAlterUserScramCredentialsRequest(&req);
+
+        const result_count = req.deletions.len + req.upsertions.len;
+        var results: []Result = &.{};
+        if (result_count > 0) {
+            results = self.allocator.alloc(Result, result_count) catch return null;
+        }
+        defer if (results.len > 0) self.allocator.free(results);
+
+        var idx: usize = 0;
+        for (req.deletions) |deletion| {
+            results[idx] = .{
+                .user = deletion.name,
+                .error_code = @intFromEnum(err_code),
+                .error_message = "Not authorized",
+            };
+            idx += 1;
+        }
+        for (req.upsertions) |upsertion| {
+            results[idx] = .{
+                .user = upsertion.name,
+                .error_code = @intFromEnum(err_code),
+                .error_message = "Not authorized",
+            };
+            idx += 1;
+        }
+
+        const resp = Resp{
+            .throttle_time_ms = 0,
+            .results = results,
         };
         return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
     }
@@ -23578,6 +23769,46 @@ test "Broker.handleRequest DescribeClientQuotas v1 returns empty generated respo
     try testing.expectEqual(@as(usize, 0), resp.entries.?.len);
 }
 
+test "Broker.handleRequest DescribeClientQuotas authorization denial uses generated response" {
+    const Req = generated.describe_client_quotas_request.DescribeClientQuotasRequest;
+    const Resp = generated.describe_client_quotas_response.DescribeClientQuotasResponse;
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+    try broker.authorizer.addAcl("other-client", .cluster, "*", .literal, .describe, .allow, "*");
+
+    const components = [_]Req.ComponentData{.{
+        .entity_type = "client-id",
+        .match_type = 0,
+        .match = "quota-denied-client",
+    }};
+    const req = Req{
+        .components = &components,
+        .strict = true,
+    };
+
+    var buf: [512]u8 = undefined;
+    var pos = buildTestRequest(&buf, 48, 1, 4814, header_mod.requestHeaderVersion(48, 1));
+    req.serialize(&buf, &pos, 1);
+
+    const response = broker.handleRequest(buf[0..pos]);
+    try testing.expect(response != null);
+    defer testing.allocator.free(response.?);
+
+    var rpos: usize = 0;
+    var response_header = try ResponseHeader.deserialize(testing.allocator, response.?, &rpos, header_mod.responseHeaderVersion(48, 1));
+    defer response_header.deinit(testing.allocator);
+    try testing.expectEqual(@as(i32, 4814), response_header.correlation_id);
+
+    const resp = try Resp.deserialize(testing.allocator, response.?, &rpos, 1);
+    defer freeDeserializedDescribeClientQuotasResponse(&resp);
+
+    try testing.expectEqual(response.?.len, rpos);
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.cluster_authorization_failed)), resp.error_code);
+    try testing.expectEqualStrings("Not authorized", resp.error_message.?);
+    try testing.expect(resp.entries == null);
+}
+
 test "Broker.handleRequest DescribeClientQuotas rejects invalid match type" {
     const Req = generated.describe_client_quotas_request.DescribeClientQuotasRequest;
     const Resp = generated.describe_client_quotas_response.DescribeClientQuotasResponse;
@@ -23750,6 +23981,56 @@ test "Broker.handleRequest AlterClientQuotas honors validate_only" {
     try testing.expectEqual(response.?.len, rpos);
     try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.none)), resp.entries[0].error_code);
     try testing.expect(broker.quota_manager.client_quotas.get("validate-only-quota-client") == null);
+}
+
+test "Broker.handleRequest AlterClientQuotas authorization denial uses generated response" {
+    const Req = generated.alter_client_quotas_request.AlterClientQuotasRequest;
+    const Resp = generated.alter_client_quotas_response.AlterClientQuotasResponse;
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+    try broker.authorizer.addAcl("other-client", .cluster, "*", .literal, .alter, .allow, "*");
+
+    const entity = [_]Req.EntryData.EntityData{.{
+        .entity_type = "client-id",
+        .entity_name = "quota-denied-client",
+    }};
+    const ops = [_]Req.EntryData.OpData{.{
+        .key = "producer_byte_rate",
+        .value = 999.0,
+        .remove = false,
+    }};
+    const entries = [_]Req.EntryData{.{
+        .entity = &entity,
+        .ops = &ops,
+    }};
+    const req = Req{ .entries = &entries };
+
+    var buf: [512]u8 = undefined;
+    var pos = buildTestRequest(&buf, 49, 1, 4914, header_mod.requestHeaderVersion(49, 1));
+    req.serialize(&buf, &pos, 1);
+
+    const response = broker.handleRequest(buf[0..pos]);
+    try testing.expect(response != null);
+    defer testing.allocator.free(response.?);
+
+    var rpos: usize = 0;
+    var response_header = try ResponseHeader.deserialize(testing.allocator, response.?, &rpos, header_mod.responseHeaderVersion(49, 1));
+    defer response_header.deinit(testing.allocator);
+    try testing.expectEqual(@as(i32, 4914), response_header.correlation_id);
+
+    const resp = try Resp.deserialize(testing.allocator, response.?, &rpos, 1);
+    defer freeDeserializedAlterClientQuotasResponse(&resp);
+
+    try testing.expectEqual(response.?.len, rpos);
+    try testing.expectEqual(@as(i32, 0), resp.throttle_time_ms);
+    try testing.expectEqual(@as(usize, 1), resp.entries.len);
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.cluster_authorization_failed)), resp.entries[0].error_code);
+    try testing.expectEqualStrings("Not authorized", resp.entries[0].error_message.?);
+    try testing.expectEqual(@as(usize, 1), resp.entries[0].entity.len);
+    try testing.expectEqualStrings("client-id", resp.entries[0].entity[0].entity_type.?);
+    try testing.expectEqualStrings("quota-denied-client", resp.entries[0].entity[0].entity_name.?);
+    try testing.expect(broker.quota_manager.client_quotas.get("quota-denied-client") == null);
 }
 
 test "Broker restores client quotas from S3 cluster metadata log" {
@@ -24045,6 +24326,45 @@ test "Broker.handleRequest DescribeUserScramCredentials returns requested SCRAM 
     try testing.expectEqual(@as(usize, 0), resp.results[1].credential_infos.len);
 }
 
+test "Broker.handleRequest DescribeUserScramCredentials authorization denial uses generated response" {
+    const Req = generated.describe_user_scram_credentials_request.DescribeUserScramCredentialsRequest;
+    const Resp = generated.describe_user_scram_credentials_response.DescribeUserScramCredentialsResponse;
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+    try broker.authorizer.addAcl("other-client", .cluster, "*", .literal, .describe, .allow, "*");
+
+    const users = [_]Req.UserName{.{
+        .name = "scram-denied-user",
+    }};
+    const req = Req{ .users = &users };
+
+    var buf: [512]u8 = undefined;
+    var pos = buildTestRequest(&buf, 50, 0, 5014, header_mod.requestHeaderVersion(50, 0));
+    req.serialize(&buf, &pos, 0);
+
+    const response = broker.handleRequest(buf[0..pos]);
+    try testing.expect(response != null);
+    defer testing.allocator.free(response.?);
+
+    var rpos: usize = 0;
+    var response_header = try ResponseHeader.deserialize(testing.allocator, response.?, &rpos, header_mod.responseHeaderVersion(50, 0));
+    defer response_header.deinit(testing.allocator);
+    try testing.expectEqual(@as(i32, 5014), response_header.correlation_id);
+
+    const resp = try Resp.deserialize(testing.allocator, response.?, &rpos, 0);
+    defer freeDeserializedDescribeUserScramCredentialsResponse(&resp);
+
+    try testing.expectEqual(response.?.len, rpos);
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.cluster_authorization_failed)), resp.error_code);
+    try testing.expectEqualStrings("Not authorized", resp.error_message.?);
+    try testing.expectEqual(@as(usize, 1), resp.results.len);
+    try testing.expectEqualStrings("scram-denied-user", resp.results[0].user.?);
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.cluster_authorization_failed)), resp.results[0].error_code);
+    try testing.expectEqualStrings("Not authorized", resp.results[0].error_message.?);
+    try testing.expectEqual(@as(usize, 0), resp.results[0].credential_infos.len);
+}
+
 test "Broker.handleRequest DescribeUserScramCredentials null and empty users describe all" {
     const Req = generated.describe_user_scram_credentials_request.DescribeUserScramCredentialsRequest;
     const Resp = generated.describe_user_scram_credentials_response.DescribeUserScramCredentialsResponse;
@@ -24174,6 +24494,50 @@ test "Broker.handleRequest AlterUserScramCredentials upserts SCRAM user and Desc
     try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.none)), describe_resp.results[0].error_code);
     try testing.expectEqual(@as(i8, 1), describe_resp.results[0].credential_infos[0].mechanism);
     try testing.expectEqual(@as(i32, 8192), describe_resp.results[0].credential_infos[0].iterations);
+}
+
+test "Broker.handleRequest AlterUserScramCredentials authorization denial uses generated response" {
+    const Req = generated.alter_user_scram_credentials_request.AlterUserScramCredentialsRequest;
+    const Resp = generated.alter_user_scram_credentials_response.AlterUserScramCredentialsResponse;
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+    try broker.authorizer.addAcl("other-client", .cluster, "*", .literal, .alter, .allow, "*");
+
+    const salt = [_]u8{1} ** 32;
+    const salted_password = [_]u8{2} ** 32;
+    const upsertions = [_]Req.ScramCredentialUpsertion{.{
+        .name = "scram-denied-user",
+        .mechanism = 1,
+        .iterations = 4096,
+        .salt = &salt,
+        .salted_password = &salted_password,
+    }};
+    const req = Req{ .upsertions = &upsertions };
+
+    var buf: [512]u8 = undefined;
+    var pos = buildTestRequest(&buf, 51, 0, 5114, header_mod.requestHeaderVersion(51, 0));
+    req.serialize(&buf, &pos, 0);
+
+    const response = broker.handleRequest(buf[0..pos]);
+    try testing.expect(response != null);
+    defer testing.allocator.free(response.?);
+
+    var rpos: usize = 0;
+    var response_header = try ResponseHeader.deserialize(testing.allocator, response.?, &rpos, header_mod.responseHeaderVersion(51, 0));
+    defer response_header.deinit(testing.allocator);
+    try testing.expectEqual(@as(i32, 5114), response_header.correlation_id);
+
+    const resp = try Resp.deserialize(testing.allocator, response.?, &rpos, 0);
+    defer freeDeserializedAlterUserScramCredentialsResponse(&resp);
+
+    try testing.expectEqual(response.?.len, rpos);
+    try testing.expectEqual(@as(i32, 0), resp.throttle_time_ms);
+    try testing.expectEqual(@as(usize, 1), resp.results.len);
+    try testing.expectEqualStrings("scram-denied-user", resp.results[0].user.?);
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.cluster_authorization_failed)), resp.results[0].error_code);
+    try testing.expectEqualStrings("Not authorized", resp.results[0].error_message.?);
+    try testing.expect(broker.scram_authenticator.getCredential("scram-denied-user") == null);
 }
 
 test "Broker.handleRequest AlterUserScramCredentials deletes SCRAM user" {
