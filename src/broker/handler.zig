@@ -18601,7 +18601,7 @@ pub const Broker = struct {
 
         if (api_version >= 11 and !skipKafkaString(buf, &pos, flexible)) return false; // rack_id
         if (flexible) ser.skipTaggedFields(buf, &pos) catch return false;
-        return true;
+        return pos == buf.len;
     }
 
     fn validateSaslHandshakeRequestFrame(buf: []const u8, start_pos: usize) bool {
@@ -34297,6 +34297,45 @@ test "Broker.handleRequest Fetch rejects truncated request" {
     var buf: [128]u8 = undefined;
     const req_len = buildTestRequest(&buf, 1, 12, 113, header_mod.requestHeaderVersion(1, 12));
     try testing.expect(broker.handleRequest(buf[0..req_len]) == null);
+}
+
+test "Broker.handleRequest Fetch rejects trailing bytes" {
+    const Req = generated.fetch_request.FetchRequest;
+    const Topic = Req.FetchTopic;
+    const Partition = Topic.FetchPartition;
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+
+    const partitions = [_]Partition{.{
+        .partition = 0,
+        .current_leader_epoch = -1,
+        .fetch_offset = 0,
+        .last_fetched_epoch = -1,
+        .log_start_offset = 0,
+        .partition_max_bytes = 1048576,
+    }};
+    const topics = [_]Topic{.{
+        .topic = "fetch-trailing-topic",
+        .partitions = &partitions,
+    }};
+    const req = Req{
+        .replica_id = -1,
+        .max_wait_ms = 500,
+        .min_bytes = 1,
+        .max_bytes = 1048576,
+        .isolation_level = 0,
+        .session_id = 0,
+        .session_epoch = 0,
+        .topics = &topics,
+        .rack_id = "",
+    };
+
+    var buf: [512]u8 = undefined;
+    var pos = buildTestRequest(&buf, 1, 12, 118, header_mod.requestHeaderVersion(1, 12));
+    req.serialize(&buf, &pos, 12);
+
+    try expectTrailingByteRejected(&broker, &buf, pos);
 }
 
 test "Broker.handleRequest ListOffsets v1 returns generated latest offset" {
