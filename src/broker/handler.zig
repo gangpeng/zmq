@@ -3702,6 +3702,7 @@ pub const Broker = struct {
             14 => self.handleSyncGroupAuthorizationError(request_bytes, body_start, req_header, api_version, resp_header_version, err_code),
             15 => self.handleDescribeGroupsAuthorizationError(request_bytes, body_start, req_header, api_version, resp_header_version, err_code),
             16 => self.handleListGroupsAuthorizationError(req_header, api_version, resp_header_version, err_code),
+            18 => self.handleApiVersionsAuthorizationError(request_bytes, body_start, req_header, api_version, resp_header_version, err_code),
             19 => self.handleCreateTopicsAuthorizationError(request_bytes, body_start, req_header, api_version, resp_header_version, err_code),
             20 => self.handleDeleteTopicsAuthorizationError(request_bytes, body_start, req_header, api_version, resp_header_version, err_code),
             21 => self.handleDeleteRecordsAuthorizationError(request_bytes, body_start, req_header, api_version, resp_header_version, err_code),
@@ -3972,6 +3973,32 @@ pub const Broker = struct {
             .node_endpoints = &.{},
         };
         return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+    }
+
+    fn handleApiVersionsAuthorizationError(
+        self: *Broker,
+        request_bytes: []const u8,
+        body_start: usize,
+        req_header: *const RequestHeader,
+        api_version: i16,
+        resp_header_version: i16,
+        err_code: ErrorCode,
+    ) ?[]u8 {
+        const Req = generated.api_versions_request.ApiVersionsRequest;
+        const body_version: i16 = @min(api_version, 4);
+
+        var pos = body_start;
+        _ = Req.deserialize(self.allocator, request_bytes, &pos, body_version) catch |err| {
+            log.warn("Malformed denied ApiVersions request: {}", .{err});
+            return null;
+        };
+
+        const resp_body = ApiVersionsResponse{
+            .error_code = @intFromEnum(err_code),
+            .api_keys = &.{},
+            .throttle_time_ms = 0,
+        };
+        return self.serializeResponse(req_header, resp_header_version, &resp_body, body_version);
     }
 
     fn handleCreateTopicsAuthorizationError(
@@ -20079,6 +20106,73 @@ test "Broker.handleRequest ApiVersions v3 (flexible)" {
     defer testing.allocator.free(response.?);
 
     try expectApiVersionsResponseMatchesCatalog(response.?, 3, 100);
+}
+
+test "Broker.handleRequest ApiVersions v0 authorization denial uses generated response" {
+    const Resp = generated.api_versions_response.ApiVersionsResponse;
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+    try broker.authorizer.addAcl("other-client", .cluster, "*", .literal, .describe, .allow, "*");
+
+    var buf: [256]u8 = undefined;
+    const req_len = buildTestRequest(&buf, 18, 0, 114, header_mod.requestHeaderVersion(18, 0));
+
+    const response = broker.handleRequest(buf[0..req_len]);
+    try testing.expect(response != null);
+    defer testing.allocator.free(response.?);
+
+    var rpos: usize = 0;
+    var response_header = try ResponseHeader.deserialize(testing.allocator, response.?, &rpos, header_mod.responseHeaderVersion(18, 0));
+    defer response_header.deinit(testing.allocator);
+    try testing.expectEqual(@as(i32, 114), response_header.correlation_id);
+
+    const resp = try Resp.deserialize(testing.allocator, response.?, &rpos, 0);
+    defer if (resp.api_keys.len > 0) testing.allocator.free(resp.api_keys);
+    try testing.expectEqual(response.?.len, rpos);
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.cluster_authorization_failed)), resp.error_code);
+    try testing.expectEqual(@as(usize, 0), resp.api_keys.len);
+}
+
+test "Broker.handleRequest ApiVersions v3 authorization denial uses generated response" {
+    const Req = generated.api_versions_request.ApiVersionsRequest;
+    const Resp = generated.api_versions_response.ApiVersionsResponse;
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+    try broker.authorizer.addAcl("other-client", .cluster, "*", .literal, .describe, .allow, "*");
+
+    const req = Req{
+        .client_software_name = "zmq-denied",
+        .client_software_version = "0.1.0",
+    };
+    var buf: [512]u8 = undefined;
+    var pos = buildTestRequest(&buf, 18, 3, 115, header_mod.requestHeaderVersion(18, 3));
+    req.serialize(&buf, &pos, 3);
+
+    const response = broker.handleRequest(buf[0..pos]);
+    try testing.expect(response != null);
+    defer testing.allocator.free(response.?);
+
+    var rpos: usize = 0;
+    var response_header = try ResponseHeader.deserialize(testing.allocator, response.?, &rpos, header_mod.responseHeaderVersion(18, 3));
+    defer response_header.deinit(testing.allocator);
+    try testing.expectEqual(@as(i32, 115), response_header.correlation_id);
+
+    const resp = try Resp.deserialize(testing.allocator, response.?, &rpos, 3);
+    defer {
+        if (resp.api_keys.len > 0) testing.allocator.free(resp.api_keys);
+        if (resp.supported_features.len > 0) testing.allocator.free(resp.supported_features);
+        if (resp.finalized_features.len > 0) testing.allocator.free(resp.finalized_features);
+        if (resp.tagged_fields.len > 0) testing.allocator.free(resp.tagged_fields);
+    }
+    try testing.expectEqual(response.?.len, rpos);
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.cluster_authorization_failed)), resp.error_code);
+    try testing.expectEqual(@as(usize, 0), resp.api_keys.len);
+    try testing.expectEqual(@as(i32, 0), resp.throttle_time_ms);
+    try testing.expectEqual(@as(usize, 0), resp.supported_features.len);
+    try testing.expectEqual(@as(usize, 0), resp.finalized_features.len);
+    try testing.expectEqual(@as(usize, 0), resp.tagged_fields.len);
 }
 
 test "Broker.handleRequest ApiVersions v4 generated catalog fixture" {
