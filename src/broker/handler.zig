@@ -18642,7 +18642,7 @@ pub const Broker = struct {
             if (!skipKafkaString(buf, &pos, true)) return false; // reason
         }
         if (flexible) ser.skipTaggedFields(buf, &pos) catch return false;
-        return true;
+        return pos == buf.len;
     }
 
     fn validateSyncGroupRequestFrame(buf: []const u8, start_pos: usize, api_version: i16) bool {
@@ -34766,6 +34766,35 @@ test "Broker.handleRequest JoinGroup rejects truncated request" {
     var buf: [128]u8 = undefined;
     const req_len = buildTestRequest(&buf, 11, 9, 1110, header_mod.requestHeaderVersion(11, 9));
     try testing.expect(broker.handleRequest(buf[0..req_len]) == null);
+}
+
+test "Broker.handleRequest JoinGroup rejects trailing bytes" {
+    const Req = generated.join_group_request.JoinGroupRequest;
+    const Protocol = Req.JoinGroupRequestProtocol;
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+
+    const protocols = [_]Protocol{.{
+        .name = "range",
+        .metadata = "",
+    }};
+    const req = Req{
+        .group_id = "jg-trailing-group",
+        .session_timeout_ms = 30000,
+        .rebalance_timeout_ms = 300000,
+        .member_id = "",
+        .group_instance_id = null,
+        .protocol_type = "consumer",
+        .protocols = &protocols,
+        .reason = "trailing-test",
+    };
+
+    var buf: [512]u8 = undefined;
+    var pos = buildTestRequest(&buf, 11, 9, 1114, header_mod.requestHeaderVersion(11, 9));
+    req.serialize(&buf, &pos, 9);
+
+    try expectTrailingByteRejected(&broker, &buf, pos);
 }
 
 test "Broker.handleRequest JoinGroup v9 authorization denial uses generated response" {

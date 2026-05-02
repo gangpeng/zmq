@@ -252,6 +252,8 @@ Status: completed for the initial catalog and DeleteGroups slice.
   topic/rack/tagged-fields section.
   SaslHandshake and SaslAuthenticate now reject trailing bytes after the final
   mechanism/auth-bytes fields.
+  JoinGroup now rejects trailing bytes after the final protocol metadata,
+  reason, and tagged-fields section.
   MetadataRequest generated decoding now preserves nullable `Topics` semantics:
   v1+ null requests all topics, explicit empty arrays request no topic results,
   and v0 null topics are rejected as malformed.
