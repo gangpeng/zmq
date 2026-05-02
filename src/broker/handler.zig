@@ -19102,7 +19102,7 @@ pub const Broker = struct {
         if (!skipFixedBytes(buf, &pos, 10)) return false; // producer_id + producer_epoch
         if (!skipKafkaString(buf, &pos, flexible)) return false; // group_id
         if (flexible) ser.skipTaggedFields(buf, &pos) catch return false;
-        return true;
+        return pos == buf.len;
     }
 
     fn validateAddPartitionsToTxnRequestFrame(buf: []const u8, start_pos: usize, api_version: i16) bool {
@@ -31218,6 +31218,26 @@ test "Broker.handleRequest AddOffsetsToTxn rejects truncated request" {
     var buf: [128]u8 = undefined;
     const req_len = buildTestRequest(&buf, 25, 3, 2504, header_mod.requestHeaderVersion(25, 3));
     try testing.expect(broker.handleRequest(buf[0..req_len]) == null);
+}
+
+test "Broker.handleRequest AddOffsetsToTxn rejects trailing bytes" {
+    const Req = generated.add_offsets_to_txn_request.AddOffsetsToTxnRequest;
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+
+    const req = Req{
+        .transactional_id = "add-offsets-trailing",
+        .producer_id = 1,
+        .producer_epoch = 0,
+        .group_id = "add-offsets-trailing-group",
+    };
+
+    var buf: [512]u8 = undefined;
+    var pos = buildTestRequest(&buf, 25, 3, 2510, header_mod.requestHeaderVersion(25, 3));
+    req.serialize(&buf, &pos, 3);
+
+    try expectTrailingByteRejected(&broker, buf[0..], pos);
 }
 
 test "Broker.handleRequest AddOffsetsToTxn authorization denial uses generated response" {
