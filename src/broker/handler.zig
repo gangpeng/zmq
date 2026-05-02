@@ -18514,7 +18514,7 @@ pub const Broker = struct {
         }
 
         if (flexible) ser.skipTaggedFields(buf, &pos) catch return false;
-        return true;
+        return pos == buf.len;
     }
 
     fn validateMetadataRequestFrame(buf: []const u8, start_pos: usize, api_version: i16) bool {
@@ -34395,6 +34395,36 @@ test "Broker.handleRequest ListOffsets rejects truncated request" {
     var buf: [128]u8 = undefined;
     const req_len = buildTestRequest(&buf, 2, 6, 27, header_mod.requestHeaderVersion(2, 6));
     try testing.expect(broker.handleRequest(buf[0..req_len]) == null);
+}
+
+test "Broker.handleRequest ListOffsets rejects trailing bytes" {
+    const Req = generated.list_offsets_request.ListOffsetsRequest;
+    const Topic = Req.ListOffsetsTopic;
+    const Partition = Topic.ListOffsetsPartition;
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+
+    const partitions = [_]Partition{.{
+        .partition_index = 0,
+        .current_leader_epoch = -1,
+        .timestamp = -1,
+    }};
+    const topics = [_]Topic{.{
+        .name = "lo-trailing",
+        .partitions = &partitions,
+    }};
+    const req = Req{
+        .replica_id = -1,
+        .isolation_level = 0,
+        .topics = &topics,
+    };
+
+    var buf: [512]u8 = undefined;
+    var pos = buildTestRequest(&buf, 2, 6, 29, header_mod.requestHeaderVersion(2, 6));
+    req.serialize(&buf, &pos, 6);
+
+    try expectTrailingByteRejected(&broker, &buf, pos);
 }
 
 test "Broker.handleRequest ListOffsets authorization denial uses generated response" {
