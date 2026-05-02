@@ -18243,7 +18243,7 @@ pub const Broker = struct {
 
         if (!skipFixedBytes(buf, &pos, 1)) return false; // strict
         if (flexible) ser.skipTaggedFields(buf, &pos) catch return false;
-        return true;
+        return pos == buf.len;
     }
 
     fn validateAlterClientQuotasRequestFrame(buf: []const u8, start_pos: usize, api_version: i16) bool {
@@ -18273,7 +18273,7 @@ pub const Broker = struct {
 
         if (!skipFixedBytes(buf, &pos, 1)) return false; // validate_only
         if (flexible) ser.skipTaggedFields(buf, &pos) catch return false;
-        return true;
+        return pos == buf.len;
     }
 
     fn validateDescribeUserScramCredentialsRequestFrame(buf: []const u8, start_pos: usize) bool {
@@ -25783,6 +25783,20 @@ test "Broker.handleRequest DescribeClientQuotas rejects truncated request" {
     try testing.expect(broker.handleRequest(buf[0..req_len]) == null);
 }
 
+test "Broker.handleRequest DescribeClientQuotas rejects trailing bytes" {
+    const Req = generated.describe_client_quotas_request.DescribeClientQuotasRequest;
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+
+    const req = Req{};
+    var buf: [128]u8 = undefined;
+    var pos = buildTestRequest(&buf, 48, 1, 4805, header_mod.requestHeaderVersion(48, 1));
+    req.serialize(&buf, &pos, 1);
+
+    try expectTrailingByteRejected(&broker, buf[0..], pos);
+}
+
 test "Broker.handleRequest AlterClientQuotas v1 mutates quotas and DescribeClientQuotas reads them" {
     const AlterReq = generated.alter_client_quotas_request.AlterClientQuotasRequest;
     const AlterResp = generated.alter_client_quotas_response.AlterClientQuotasResponse;
@@ -26207,6 +26221,20 @@ test "Broker.handleRequest AlterClientQuotas rejects truncated request" {
     var buf: [128]u8 = undefined;
     const req_len = buildTestRequest(&buf, 49, 1, 4903, header_mod.requestHeaderVersion(49, 1));
     try testing.expect(broker.handleRequest(buf[0..req_len]) == null);
+}
+
+test "Broker.handleRequest AlterClientQuotas rejects trailing bytes" {
+    const Req = generated.alter_client_quotas_request.AlterClientQuotasRequest;
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+
+    const req = Req{};
+    var buf: [128]u8 = undefined;
+    var pos = buildTestRequest(&buf, 49, 1, 4907, header_mod.requestHeaderVersion(49, 1));
+    req.serialize(&buf, &pos, 1);
+
+    try expectTrailingByteRejected(&broker, buf[0..], pos);
 }
 
 test "Broker.handleRequest DescribeUserScramCredentials returns requested SCRAM users" {

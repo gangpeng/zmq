@@ -222,6 +222,8 @@ Status: completed for the initial catalog and DeleteGroups slice.
   DeleteGroups, DescribeCluster, partition reassignment, and
   OffsetForLeaderEpoch validators now apply the same fail-closed trailing-byte
   check.
+  DescribeClientQuotas and AlterClientQuotas now reject trailing bytes after
+  their final tagged-fields section as well.
   MetadataRequest generated decoding now preserves nullable `Topics` semantics:
   v1+ null requests all topics, explicit empty arrays request no topic results,
   and v0 null topics are rejected as malformed.
