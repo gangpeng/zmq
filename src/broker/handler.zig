@@ -3736,6 +3736,10 @@ pub const Broker = struct {
             65 => self.handleDescribeTransactionsAuthorizationError(request_bytes, body_start, req_header, api_version, resp_header_version, err_code),
             66 => self.handleListTransactionsAuthorizationError(req_header, api_version, resp_header_version, err_code),
             69 => self.handleConsumerGroupDescribeAuthorizationError(request_bytes, body_start, req_header, api_version, resp_header_version, err_code),
+            71 => self.handleGetTelemetrySubscriptionsAuthorizationError(request_bytes, body_start, req_header, api_version, resp_header_version, err_code),
+            72 => self.handlePushTelemetryAuthorizationError(request_bytes, body_start, req_header, api_version, resp_header_version, err_code),
+            74 => self.handleListClientMetricsResourcesAuthorizationError(request_bytes, body_start, req_header, api_version, resp_header_version, err_code),
+            75 => self.handleDescribeTopicPartitionsAuthorizationError(request_bytes, body_start, req_header, api_version, resp_header_version, err_code),
             else => self.handleGenericAuthorizationError(req_header, resp_header_version, err_code),
         };
     }
@@ -5937,6 +5941,154 @@ pub const Broker = struct {
         const resp = Resp{
             .throttle_time_ms = 0,
             .transaction_states = states,
+        };
+        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+    }
+
+    fn handleGetTelemetrySubscriptionsAuthorizationError(
+        self: *Broker,
+        request_bytes: []const u8,
+        body_start: usize,
+        req_header: *const RequestHeader,
+        api_version: i16,
+        resp_header_version: i16,
+        err_code: ErrorCode,
+    ) ?[]u8 {
+        const Req = generated.get_telemetry_subscriptions_request.GetTelemetrySubscriptionsRequest;
+        const Resp = generated.get_telemetry_subscriptions_response.GetTelemetrySubscriptionsResponse;
+
+        if (!validateGetTelemetrySubscriptionsRequestFrame(request_bytes, body_start)) {
+            log.warn("Malformed denied GetTelemetrySubscriptions request", .{});
+            return null;
+        }
+
+        var pos = body_start;
+        const req = Req.deserialize(self.allocator, request_bytes, &pos, api_version) catch |err| {
+            log.warn("Failed to decode denied GetTelemetrySubscriptions request: {}", .{err});
+            return null;
+        };
+
+        const resp = Resp{
+            .throttle_time_ms = 0,
+            .error_code = @intFromEnum(err_code),
+            .client_instance_id = req.client_instance_id,
+            .subscription_id = 0,
+            .accepted_compression_types = &.{},
+            .push_interval_ms = 0,
+            .telemetry_max_bytes = 0,
+            .delta_temporality = false,
+            .requested_metrics = &.{},
+        };
+        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+    }
+
+    fn handlePushTelemetryAuthorizationError(
+        self: *Broker,
+        request_bytes: []const u8,
+        body_start: usize,
+        req_header: *const RequestHeader,
+        api_version: i16,
+        resp_header_version: i16,
+        err_code: ErrorCode,
+    ) ?[]u8 {
+        const Req = generated.push_telemetry_request.PushTelemetryRequest;
+        const Resp = generated.push_telemetry_response.PushTelemetryResponse;
+
+        if (!validatePushTelemetryRequestFrame(request_bytes, body_start)) {
+            log.warn("Malformed denied PushTelemetry request", .{});
+            return null;
+        }
+
+        var pos = body_start;
+        _ = Req.deserialize(self.allocator, request_bytes, &pos, api_version) catch |err| {
+            log.warn("Failed to decode denied PushTelemetry request: {}", .{err});
+            return null;
+        };
+
+        const resp = Resp{
+            .throttle_time_ms = 0,
+            .error_code = @intFromEnum(err_code),
+        };
+        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+    }
+
+    fn handleListClientMetricsResourcesAuthorizationError(
+        self: *Broker,
+        request_bytes: []const u8,
+        body_start: usize,
+        req_header: *const RequestHeader,
+        api_version: i16,
+        resp_header_version: i16,
+        err_code: ErrorCode,
+    ) ?[]u8 {
+        const Req = generated.list_client_metrics_resources_request.ListClientMetricsResourcesRequest;
+        const Resp = generated.list_client_metrics_resources_response.ListClientMetricsResourcesResponse;
+
+        if (!validateListClientMetricsResourcesRequestFrame(request_bytes, body_start)) {
+            log.warn("Malformed denied ListClientMetricsResources request", .{});
+            return null;
+        }
+
+        var pos = body_start;
+        _ = Req.deserialize(self.allocator, request_bytes, &pos, api_version) catch |err| {
+            log.warn("Failed to decode denied ListClientMetricsResources request: {}", .{err});
+            return null;
+        };
+
+        const resp = Resp{
+            .throttle_time_ms = 0,
+            .error_code = @intFromEnum(err_code),
+            .client_metrics_resources = &.{},
+        };
+        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+    }
+
+    fn handleDescribeTopicPartitionsAuthorizationError(
+        self: *Broker,
+        request_bytes: []const u8,
+        body_start: usize,
+        req_header: *const RequestHeader,
+        api_version: i16,
+        resp_header_version: i16,
+        err_code: ErrorCode,
+    ) ?[]u8 {
+        const Req = generated.describe_topic_partitions_request.DescribeTopicPartitionsRequest;
+        const Resp = generated.describe_topic_partitions_response.DescribeTopicPartitionsResponse;
+        const TopicResponse = Resp.DescribeTopicPartitionsResponseTopic;
+
+        if (!validateDescribeTopicPartitionsRequestFrame(request_bytes, body_start)) {
+            log.warn("Malformed denied DescribeTopicPartitions request", .{});
+            return null;
+        }
+
+        var pos = body_start;
+        var req = Req.deserialize(self.allocator, request_bytes, &pos, api_version) catch |err| {
+            log.warn("Failed to decode denied DescribeTopicPartitions request: {}", .{err});
+            return null;
+        };
+        defer self.freeDescribeTopicPartitionsRequest(&req);
+
+        var topics: []TopicResponse = &.{};
+        if (req.topics.len > 0) {
+            topics = self.allocator.alloc(TopicResponse, req.topics.len) catch return null;
+        }
+        defer if (topics.len > 0) self.allocator.free(topics);
+
+        for (req.topics, 0..) |topic_req, idx| {
+            topics[idx] = .{
+                .error_code = @intFromEnum(err_code),
+                .name = topic_req.name,
+                .topic_id = zeroUuid(),
+                .is_internal = false,
+                .partitions = &.{},
+                .topic_authorized_operations = std.math.minInt(i32),
+            };
+        }
+
+        const resp = Resp{
+            .throttle_time_ms = 0,
+            .topics = topics,
+            .next_cursor = null,
         };
         return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
     }
@@ -25409,6 +25561,44 @@ test "Broker.handleRequest GetTelemetrySubscriptions returns empty subscription 
     try testing.expectEqual(@as(usize, 0), resp.requested_metrics.len);
 }
 
+test "Broker.handleRequest GetTelemetrySubscriptions authorization denial uses generated response" {
+    const Req = generated.get_telemetry_subscriptions_request.GetTelemetrySubscriptionsRequest;
+    const Resp = generated.get_telemetry_subscriptions_response.GetTelemetrySubscriptionsResponse;
+
+    var broker = Broker.init(testing.allocator, 7, 9092);
+    defer broker.deinit();
+    try broker.authorizer.addAcl("other-client", .cluster, "*", .literal, .describe, .allow, "*");
+
+    const client_id = [_]u8{3} ** 16;
+    const req = Req{ .client_instance_id = client_id };
+
+    var buf: [256]u8 = undefined;
+    var pos = buildTestRequest(&buf, 71, 0, 7114, header_mod.requestHeaderVersion(71, 0));
+    req.serialize(&buf, &pos, 0);
+
+    const response = broker.handleRequest(buf[0..pos]);
+    try testing.expect(response != null);
+    defer testing.allocator.free(response.?);
+
+    var rpos: usize = 0;
+    var response_header = try ResponseHeader.deserialize(testing.allocator, response.?, &rpos, header_mod.responseHeaderVersion(71, 0));
+    defer response_header.deinit(testing.allocator);
+    try testing.expectEqual(@as(i32, 7114), response_header.correlation_id);
+
+    const resp = try Resp.deserialize(testing.allocator, response.?, &rpos, 0);
+    defer freeDeserializedGetTelemetrySubscriptionsResponse(&resp);
+
+    try testing.expectEqual(response.?.len, rpos);
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.cluster_authorization_failed)), resp.error_code);
+    try testing.expect(std.mem.eql(u8, &client_id, &resp.client_instance_id));
+    try testing.expectEqual(@as(i32, 0), resp.subscription_id);
+    try testing.expectEqual(@as(usize, 0), resp.accepted_compression_types.len);
+    try testing.expectEqual(@as(i32, 0), resp.push_interval_ms);
+    try testing.expectEqual(@as(i32, 0), resp.telemetry_max_bytes);
+    try testing.expectEqual(false, resp.delta_temporality);
+    try testing.expectEqual(@as(usize, 0), resp.requested_metrics.len);
+}
+
 test "Broker.handleRequest GetTelemetrySubscriptions rejects truncated request" {
     var broker = Broker.init(testing.allocator, 1, 9092);
     defer broker.deinit();
@@ -25451,6 +25641,42 @@ test "Broker.handleRequest PushTelemetry rejects unsolicited metrics" {
     const resp = try Resp.deserialize(testing.allocator, response.?, &rpos, 0);
     try testing.expectEqual(response.?.len, rpos);
     try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.unknown_subscription_id)), resp.error_code);
+}
+
+test "Broker.handleRequest PushTelemetry authorization denial uses generated response" {
+    const Req = generated.push_telemetry_request.PushTelemetryRequest;
+    const Resp = generated.push_telemetry_response.PushTelemetryResponse;
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+    try broker.authorizer.addAcl("other-client", .cluster, "*", .literal, .alter, .allow, "*");
+
+    const client_id = [_]u8{4} ** 16;
+    const metrics = [_]u8{ 0x08, 0x01 };
+    const req = Req{
+        .client_instance_id = client_id,
+        .subscription_id = 1,
+        .terminating = false,
+        .compression_type = 0,
+        .metrics = &metrics,
+    };
+
+    var buf: [256]u8 = undefined;
+    var pos = buildTestRequest(&buf, 72, 0, 7214, header_mod.requestHeaderVersion(72, 0));
+    req.serialize(&buf, &pos, 0);
+
+    const response = broker.handleRequest(buf[0..pos]);
+    try testing.expect(response != null);
+    defer testing.allocator.free(response.?);
+
+    var rpos: usize = 0;
+    var response_header = try ResponseHeader.deserialize(testing.allocator, response.?, &rpos, header_mod.responseHeaderVersion(72, 0));
+    defer response_header.deinit(testing.allocator);
+    try testing.expectEqual(@as(i32, 7214), response_header.correlation_id);
+
+    const resp = try Resp.deserialize(testing.allocator, response.?, &rpos, 0);
+    try testing.expectEqual(response.?.len, rpos);
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.cluster_authorization_failed)), resp.error_code);
 }
 
 test "Broker.handleRequest PushTelemetry rejects truncated request" {
@@ -25550,6 +25776,37 @@ test "Broker.handleRequest ListClientMetricsResources returns empty generated re
 
     try testing.expectEqual(response.?.len, rpos);
     try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.none)), resp.error_code);
+    try testing.expectEqual(@as(usize, 0), resp.client_metrics_resources.len);
+}
+
+test "Broker.handleRequest ListClientMetricsResources authorization denial uses generated response" {
+    const Req = generated.list_client_metrics_resources_request.ListClientMetricsResourcesRequest;
+    const Resp = generated.list_client_metrics_resources_response.ListClientMetricsResourcesResponse;
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+    try broker.authorizer.addAcl("other-client", .cluster, "*", .literal, .describe, .allow, "*");
+
+    const req = Req{};
+
+    var buf: [128]u8 = undefined;
+    var pos = buildTestRequest(&buf, 74, 0, 7414, header_mod.requestHeaderVersion(74, 0));
+    req.serialize(&buf, &pos, 0);
+
+    const response = broker.handleRequest(buf[0..pos]);
+    try testing.expect(response != null);
+    defer testing.allocator.free(response.?);
+
+    var rpos: usize = 0;
+    var response_header = try ResponseHeader.deserialize(testing.allocator, response.?, &rpos, header_mod.responseHeaderVersion(74, 0));
+    defer response_header.deinit(testing.allocator);
+    try testing.expectEqual(@as(i32, 7414), response_header.correlation_id);
+
+    const resp = try Resp.deserialize(testing.allocator, response.?, &rpos, 0);
+    defer if (resp.client_metrics_resources.len > 0) testing.allocator.free(resp.client_metrics_resources);
+
+    try testing.expectEqual(response.?.len, rpos);
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.cluster_authorization_failed)), resp.error_code);
     try testing.expectEqual(@as(usize, 0), resp.client_metrics_resources.len);
 }
 
@@ -31036,6 +31293,57 @@ test "Broker.handleRequest DescribeTopicPartitions applies response partition cu
     try testing.expect(resp.next_cursor != null);
     try testing.expectEqualStrings("dtp-cursor-topic", resp.next_cursor.?.topic_name.?);
     try testing.expectEqual(@as(i32, 2), resp.next_cursor.?.partition_index);
+}
+
+test "Broker.handleRequest DescribeTopicPartitions authorization denial uses generated response" {
+    const Req = generated.describe_topic_partitions_request.DescribeTopicPartitionsRequest;
+    const Resp = generated.describe_topic_partitions_response.DescribeTopicPartitionsResponse;
+
+    var broker = Broker.init(testing.allocator, 3, 19093);
+    defer broker.deinit();
+    try testing.expect(broker.ensureTopic("dtp-denied-topic"));
+    try broker.authorizer.addAcl("other-client", .cluster, "*", .literal, .describe, .allow, "*");
+
+    const topics = [_]Req.TopicRequest{
+        .{ .name = "dtp-denied-topic" },
+        .{ .name = "missing-dtp-denied-topic" },
+    };
+    const req = Req{
+        .topics = &topics,
+        .response_partition_limit = 10,
+        .cursor = .{ .topic_name = "dtp-denied-topic", .partition_index = 1 },
+    };
+
+    var buf: [1024]u8 = undefined;
+    var pos = buildTestRequest(&buf, 75, 0, 7514, header_mod.requestHeaderVersion(75, 0));
+    req.serialize(&buf, &pos, 0);
+
+    const response = broker.handleRequest(buf[0..pos]);
+    try testing.expect(response != null);
+    defer testing.allocator.free(response.?);
+
+    var rpos: usize = 0;
+    var response_header = try ResponseHeader.deserialize(testing.allocator, response.?, &rpos, header_mod.responseHeaderVersion(75, 0));
+    defer response_header.deinit(testing.allocator);
+    try testing.expectEqual(@as(i32, 7514), response_header.correlation_id);
+
+    const resp = try Resp.deserialize(testing.allocator, response.?, &rpos, 0);
+    defer freeDeserializedDescribeTopicPartitionsResponse(&resp);
+
+    try testing.expectEqual(response.?.len, rpos);
+    try testing.expectEqual(@as(i32, 0), resp.throttle_time_ms);
+    try testing.expectEqual(@as(usize, 2), resp.topics.len);
+    try testing.expect(resp.next_cursor == null);
+
+    try testing.expectEqualStrings("dtp-denied-topic", resp.topics[0].name.?);
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.cluster_authorization_failed)), resp.topics[0].error_code);
+    try testing.expectEqual(@as(usize, 0), resp.topics[0].partitions.len);
+    try testing.expectEqual(@as(i32, std.math.minInt(i32)), resp.topics[0].topic_authorized_operations);
+
+    try testing.expectEqualStrings("missing-dtp-denied-topic", resp.topics[1].name.?);
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.cluster_authorization_failed)), resp.topics[1].error_code);
+    try testing.expectEqual(@as(usize, 0), resp.topics[1].partitions.len);
+    try testing.expectEqual(@as(i32, std.math.minInt(i32)), resp.topics[1].topic_authorized_operations);
 }
 
 test "Broker.handleRequest DescribeTopicPartitions rejects truncated request" {
