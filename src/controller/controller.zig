@@ -417,6 +417,7 @@ pub const Controller = struct {
         const Topic = Resp.TopicData;
         const Partition = Topic.PartitionData;
         const ReplicaState = generated.describe_quorum_response.ReplicaState;
+        const Node = Resp.Node;
 
         var pos = start_pos;
         var req = Req.deserialize(self.allocator, request_bytes, &pos, api_version) catch |err| {
@@ -435,11 +436,15 @@ pub const Controller = struct {
         while (vit.next()) |entry| : (voter_index += 1) {
             voters[voter_index] = .{
                 .replica_id = entry.key_ptr.*,
+                .replica_directory_id = entry.value_ptr.voter_directory_id,
                 .log_end_offset = @intCast(entry.value_ptr.match_index),
                 .last_fetch_timestamp = -1,
                 .last_caught_up_timestamp = -1,
             };
         }
+
+        const nodes: []const Node = if (api_version >= 2) self.collectDescribeQuorumNodes() catch return null else &.{};
+        defer self.freeDescribeQuorumNodes(nodes);
 
         const requested_topics = if (req.topics.len == 0) 1 else req.topics.len;
         const topics = self.allocator.alloc(Topic, requested_topics) catch return null;
@@ -481,9 +486,46 @@ pub const Controller = struct {
         const resp = Resp{
             .error_code = 0,
             .topics = topics,
-            .nodes = &.{},
+            .nodes = nodes,
         };
         return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+    }
+
+    fn collectDescribeQuorumNodes(self: *Controller) ![]const generated.describe_quorum_response.DescribeQuorumResponse.Node {
+        const Node = generated.describe_quorum_response.DescribeQuorumResponse.Node;
+        const Listener = Node.Listener;
+
+        const nodes = try self.allocator.alloc(Node, self.raft_state.voters.count());
+        var initialized: usize = 0;
+        errdefer self.freeDescribeQuorumNodes(nodes[0..initialized]);
+
+        var it = self.raft_state.voters.iterator();
+        while (it.next()) |entry| {
+            const endpoints = entry.value_ptr.endpoints;
+            var listeners: []Listener = &.{};
+            if (endpoints.len > 0) listeners = try self.allocator.alloc(Listener, endpoints.len);
+            for (endpoints, 0..) |endpoint, listener_index| {
+                listeners[listener_index] = .{
+                    .name = endpoint.name,
+                    .host = endpoint.host,
+                    .port = endpoint.port,
+                };
+            }
+            nodes[initialized] = .{
+                .node_id = entry.key_ptr.*,
+                .listeners = listeners,
+            };
+            initialized += 1;
+        }
+
+        return nodes;
+    }
+
+    fn freeDescribeQuorumNodes(self: *Controller, nodes: []const generated.describe_quorum_response.DescribeQuorumResponse.Node) void {
+        for (nodes) |node| {
+            if (node.listeners.len > 0) self.allocator.free(@constCast(node.listeners));
+        }
+        if (nodes.len > 0) self.allocator.free(@constCast(nodes));
     }
 
     fn describeQuorumPartition(self: *Controller, partition_index: i32, voters: []const generated.describe_quorum_response.ReplicaState, api_version: i16) generated.describe_quorum_response.DescribeQuorumResponse.TopicData.PartitionData {
@@ -2094,6 +2136,64 @@ test "Controller handleRequest DescribeQuorum returns quorum info" {
     }
     try testing.expectEqual(@as(i16, 0), resp.error_code);
     try testing.expectEqual(@as(i32, 1), resp.topics[0].partitions[0].leader_id);
+}
+
+test "Controller handleRequest DescribeQuorum v2 returns voter node endpoints" {
+    const DescribeReq = generated.describe_quorum_request.DescribeQuorumRequest;
+    const DescribeResp = generated.describe_quorum_response.DescribeQuorumResponse;
+
+    var ctrl = Controller.init(testing.allocator, 1, "test-cluster");
+    defer ctrl.deinit();
+    try makeTestControllerLeader(&ctrl);
+
+    const directory_id = [_]u8{7} ** 16;
+    const endpoint_views = [_]RaftState.VoterEndpointView{.{
+        .name = "CONTROLLER",
+        .host = "controller-1.example",
+        .port = 19093,
+    }};
+    _ = try ctrl.raft_state.proposeUpdateVoter(1, directory_id, &endpoint_views, 0, 1);
+    ctrl.raft_state.commit_index = ctrl.raft_state.log.lastOffset();
+    ctrl.raft_state.applyCommittedConfigs();
+
+    var buf: [256]u8 = undefined;
+    var pos = buildTestRequest(&buf, 55, 2, 5502, header_mod.requestHeaderVersion(55, 2));
+    const req = DescribeReq{};
+    req.serialize(&buf, &pos, 2);
+
+    const response = ctrl.handleRequest(buf[0..pos]);
+    try testing.expect(response != null);
+    defer testing.allocator.free(response.?);
+
+    var rpos: usize = 0;
+    var resp_header = try ResponseHeader.deserialize(testing.allocator, response.?, &rpos, header_mod.responseHeaderVersion(55, 2));
+    defer resp_header.deinit(testing.allocator);
+    try testing.expectEqual(@as(i32, 5502), resp_header.correlation_id);
+
+    const resp = try DescribeResp.deserialize(testing.allocator, response.?, &rpos, 2);
+    defer {
+        for (resp.topics) |topic| {
+            for (topic.partitions) |partition| {
+                if (partition.current_voters.len > 0) testing.allocator.free(partition.current_voters);
+                if (partition.observers.len > 0) testing.allocator.free(partition.observers);
+            }
+            if (topic.partitions.len > 0) testing.allocator.free(topic.partitions);
+        }
+        if (resp.topics.len > 0) testing.allocator.free(resp.topics);
+        for (resp.nodes) |node| {
+            if (node.listeners.len > 0) testing.allocator.free(node.listeners);
+        }
+        if (resp.nodes.len > 0) testing.allocator.free(resp.nodes);
+    }
+
+    try testing.expectEqual(@as(i16, 0), resp.error_code);
+    try testing.expectEqual(@as(usize, 1), resp.nodes.len);
+    try testing.expectEqual(@as(i32, 1), resp.nodes[0].node_id);
+    try testing.expectEqual(@as(usize, 1), resp.nodes[0].listeners.len);
+    try testing.expectEqualStrings("CONTROLLER", resp.nodes[0].listeners[0].name.?);
+    try testing.expectEqualStrings("controller-1.example", resp.nodes[0].listeners[0].host.?);
+    try testing.expectEqual(@as(u16, 19093), resp.nodes[0].listeners[0].port);
+    try testing.expectEqualSlices(u8, &directory_id, &resp.topics[0].partitions[0].current_voters[0].replica_directory_id);
 }
 
 test "Controller handleRequest FetchSnapshot returns snapshot not found" {

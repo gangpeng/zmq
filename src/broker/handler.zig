@@ -19600,7 +19600,6 @@ pub const Broker = struct {
         const Req = generated.describe_quorum_request.DescribeQuorumRequest;
         const Resp = generated.describe_quorum_response.DescribeQuorumResponse;
         const Node = Resp.Node;
-        const Listener = Node.Listener;
 
         if (!validateDescribeQuorumRequestFrame(request_bytes, body_start)) {
             log.warn("Malformed DescribeQuorum request", .{});
@@ -19622,20 +19621,17 @@ pub const Broker = struct {
             if (topics.len > 0) self.allocator.free(topics);
         }
 
-        const listeners = [_]Listener{.{
-            .name = "PLAINTEXT",
-            .host = self.advertised_host,
-            .port = self.port,
-        }};
-        const nodes = [_]Node{.{
-            .node_id = self.node_id,
-            .listeners = &listeners,
-        }};
+        const nodes: []const Node = if (api_version >= 2) blk: {
+            const rs = raft orelse break :blk &.{};
+            break :blk self.collectDescribeQuorumNodes(rs) catch return null;
+        } else &.{};
+        defer self.freeDescribeQuorumNodes(nodes);
+
         const resp_body = Resp{
             .error_code = if (raft == null) @intFromEnum(ErrorCode.not_controller) else @intFromEnum(ErrorCode.none),
             .error_message = null,
             .topics = topics,
-            .nodes = if (api_version >= 2 and raft != null) &nodes else &.{},
+            .nodes = nodes,
         };
 
         const needed = rh.calcSize(resp_header_version) + resp_body.calcSize(api_version);
@@ -19750,6 +19746,7 @@ pub const Broker = struct {
         while (voter_it.next()) |entry| {
             voters[voter_index] = .{
                 .replica_id = entry.key_ptr.*,
+                .replica_directory_id = entry.value_ptr.voter_directory_id,
                 .log_end_offset = @intCast(entry.value_ptr.match_index),
                 .last_fetch_timestamp = -1,
                 .last_caught_up_timestamp = if (entry.key_ptr.* == raft.node_id) @import("time_compat").milliTimestamp() else -1,
@@ -19767,6 +19764,43 @@ pub const Broker = struct {
             .current_voters = voters,
             .observers = &.{},
         };
+    }
+
+    fn collectDescribeQuorumNodes(self: *Broker, raft: *RaftState) ![]const generated.describe_quorum_response.DescribeQuorumResponse.Node {
+        const Node = generated.describe_quorum_response.DescribeQuorumResponse.Node;
+        const Listener = Node.Listener;
+
+        const nodes = try self.allocator.alloc(Node, raft.voters.count());
+        var initialized: usize = 0;
+        errdefer self.freeDescribeQuorumNodes(nodes[0..initialized]);
+
+        var it = raft.voters.iterator();
+        while (it.next()) |entry| {
+            const endpoints = entry.value_ptr.endpoints;
+            var listeners: []Listener = &.{};
+            if (endpoints.len > 0) listeners = try self.allocator.alloc(Listener, endpoints.len);
+            for (endpoints, 0..) |endpoint, listener_index| {
+                listeners[listener_index] = .{
+                    .name = endpoint.name,
+                    .host = endpoint.host,
+                    .port = endpoint.port,
+                };
+            }
+            nodes[initialized] = .{
+                .node_id = entry.key_ptr.*,
+                .listeners = listeners,
+            };
+            initialized += 1;
+        }
+
+        return nodes;
+    }
+
+    fn freeDescribeQuorumNodes(self: *Broker, nodes: []const generated.describe_quorum_response.DescribeQuorumResponse.Node) void {
+        for (nodes) |node| {
+            if (node.listeners.len > 0) self.allocator.free(@constCast(node.listeners));
+        }
+        if (nodes.len > 0) self.allocator.free(@constCast(nodes));
     }
 
     fn freeDescribeQuorumTopics(self: *Broker, topics: []const generated.describe_quorum_response.DescribeQuorumResponse.TopicData) void {
@@ -31881,6 +31915,13 @@ test "Broker.handleRequest DescribeQuorum returns request-scoped generated quoru
     defer raft.deinit();
     try raft.addVoter(5);
     try raft.addVoter(6);
+    const directory_id = [_]u8{5} ** 16;
+    const endpoints = [_]RaftState.VoterEndpointView{.{
+        .name = "CONTROLLER",
+        .host = "controller.example",
+        .port = 19093,
+    }};
+    try raft.updateVoterMetadata(5, directory_id, &endpoints, 0, 1);
     raft.current_epoch = 3;
     raft.commit_index = 4;
     raft.becomeLeader();
@@ -31941,10 +31982,28 @@ test "Broker.handleRequest DescribeQuorum returns request-scoped generated quoru
     try testing.expectEqual(@as(i64, 4), resp.topics[0].partitions[0].high_watermark);
     try testing.expectEqual(@as(usize, 2), resp.topics[0].partitions[0].current_voters.len);
     try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.unknown_topic_or_partition)), resp.topics[0].partitions[1].error_code);
-    try testing.expectEqual(@as(usize, 1), resp.nodes.len);
-    try testing.expectEqual(@as(i32, 5), resp.nodes[0].node_id);
-    try testing.expectEqual(@as(usize, 1), resp.nodes[0].listeners.len);
-    try testing.expectEqualStrings("controller.example", resp.nodes[0].listeners[0].host.?);
+    try testing.expectEqual(@as(usize, 2), resp.nodes.len);
+
+    var saw_voter_directory = false;
+    for (resp.topics[0].partitions[0].current_voters) |voter| {
+        if (voter.replica_id == 5) {
+            saw_voter_directory = true;
+            try testing.expectEqualSlices(u8, &directory_id, &voter.replica_directory_id);
+        }
+    }
+    try testing.expect(saw_voter_directory);
+
+    var saw_node_endpoint = false;
+    for (resp.nodes) |node| {
+        if (node.node_id == 5) {
+            saw_node_endpoint = true;
+            try testing.expectEqual(@as(usize, 1), node.listeners.len);
+            try testing.expectEqualStrings("CONTROLLER", node.listeners[0].name.?);
+            try testing.expectEqualStrings("controller.example", node.listeners[0].host.?);
+            try testing.expectEqual(@as(u16, 19093), node.listeners[0].port);
+        }
+    }
+    try testing.expect(saw_node_endpoint);
 }
 
 test "Broker.handleRequest DescribeQuorum returns generated not-controller response" {

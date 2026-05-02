@@ -128,7 +128,9 @@ Status: completed for the initial catalog and DeleteGroups slice.
   writes. DescribeCluster now decodes generated requests, rejects malformed
   frames, and returns generated endpoint-scoped single-node metadata.
   DescribeQuorum now decodes generated requests, returns generated quorum or
-  not-controller responses, and scopes metadata-partition errors to the request.
+  not-controller responses, scopes metadata-partition errors to the request,
+  and includes committed voter directory IDs plus v2 node listener endpoints
+  from Raft voter metadata on controller and broker paths.
   FetchSnapshot now advertises controller key 59 v0-v1, decodes generated
   flexible requests, rejects malformed frames, and returns request-scoped
   `snapshot_not_found` until snapshot transfer is implemented.
@@ -416,7 +418,8 @@ Status: completed for the initial catalog and DeleteGroups slice.
   framing is in place for Vote, BeginQuorumEpoch, EndQuorumEpoch,
   DescribeQuorum, FetchSnapshot, BrokerRegistration, BrokerHeartbeat,
   UnregisterBroker, AllocateProducerIds, ControllerRegistration, AddRaftVoter,
-  RemoveRaftVoter, and UpdateRaftVoter endpoint-update handling, and
+  RemoveRaftVoter, UpdateRaftVoter endpoint-update handling, and
+  DescribeQuorum v2 endpoint/directory metadata, and
   keys 71/72 remain telemetry-only/unsupported on the controller port. A gated
   `test-kraft-failover` step covers three controller-only processes, a
   broker-only process, controller leader discovery, broker produce before
