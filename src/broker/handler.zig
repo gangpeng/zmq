@@ -3752,6 +3752,16 @@ pub const Broker = struct {
             510 => self.handlePutKVsAuthorizationError(request_bytes, body_start, req_header, api_version, resp_header_version, err_code),
             511 => self.handleDeleteKVsAuthorizationError(request_bytes, body_start, req_header, api_version, resp_header_version, err_code),
             512 => self.handleTrimStreamsAuthorizationError(request_bytes, body_start, req_header, api_version, resp_header_version, err_code),
+            513 => self.handleAutomqRegisterNodeAuthorizationError(request_bytes, body_start, req_header, api_version, resp_header_version, err_code),
+            514 => self.handleAutomqGetNodesAuthorizationError(request_bytes, body_start, req_header, api_version, resp_header_version, err_code),
+            515 => self.handleAutomqZoneRouterAuthorizationError(request_bytes, body_start, req_header, api_version, resp_header_version, err_code),
+            516 => self.handleAutomqGetPartitionSnapshotAuthorizationError(request_bytes, body_start, req_header, api_version, resp_header_version, err_code),
+            517 => self.handleUpdateLicenseAuthorizationError(request_bytes, body_start, req_header, api_version, resp_header_version, err_code),
+            518 => self.handleDescribeLicenseAuthorizationError(request_bytes, body_start, req_header, api_version, resp_header_version, err_code),
+            519 => self.handleExportClusterManifestAuthorizationError(request_bytes, body_start, req_header, api_version, resp_header_version, err_code),
+            600 => self.handleGetNextNodeIdAuthorizationError(request_bytes, body_start, req_header, api_version, resp_header_version, err_code),
+            601 => self.handleDescribeStreamsAuthorizationError(request_bytes, body_start, req_header, api_version, resp_header_version, err_code),
+            602 => self.handleAutomqUpdateGroupAuthorizationError(request_bytes, body_start, req_header, api_version, resp_header_version, err_code),
             else => self.handleGenericAuthorizationError(req_header, resp_header_version, err_code),
         };
     }
@@ -6426,6 +6436,245 @@ pub const Broker = struct {
         }
 
         const resp = Resp{ .error_code = 0, .throttle_time_ms = 0, .delete_kv_responses = responses };
+        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+    }
+
+    fn handleAutomqRegisterNodeAuthorizationError(
+        self: *Broker,
+        request_bytes: []const u8,
+        body_start: usize,
+        req_header: *const RequestHeader,
+        api_version: i16,
+        resp_header_version: i16,
+        err_code: ErrorCode,
+    ) ?[]u8 {
+        const Req = generated.automq_register_node_request.AutomqRegisterNodeRequest;
+        const Resp = generated.automq_register_node_response.AutomqRegisterNodeResponse;
+
+        var arena = std.heap.ArenaAllocator.init(self.allocator);
+        defer arena.deinit();
+        _ = parseGeneratedRequest(Req, arena.allocator(), request_bytes, body_start, api_version) catch |err| {
+            log.warn("Failed to decode denied AutomqRegisterNode request: {}", .{err});
+            return null;
+        };
+
+        const resp = Resp{ .error_code = @intFromEnum(err_code), .throttle_time_ms = 0 };
+        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+    }
+
+    fn handleAutomqGetNodesAuthorizationError(
+        self: *Broker,
+        request_bytes: []const u8,
+        body_start: usize,
+        req_header: *const RequestHeader,
+        api_version: i16,
+        resp_header_version: i16,
+        err_code: ErrorCode,
+    ) ?[]u8 {
+        const Req = generated.automq_get_nodes_request.AutomqGetNodesRequest;
+        const Resp = generated.automq_get_nodes_response.AutomqGetNodesResponse;
+
+        var arena = std.heap.ArenaAllocator.init(self.allocator);
+        defer arena.deinit();
+        _ = parseGeneratedRequest(Req, arena.allocator(), request_bytes, body_start, api_version) catch |err| {
+            log.warn("Failed to decode denied AutomqGetNodes request: {}", .{err});
+            return null;
+        };
+
+        const resp = Resp{ .error_code = @intFromEnum(err_code), .throttle_time_ms = 0, .nodes = &.{} };
+        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+    }
+
+    fn handleAutomqZoneRouterAuthorizationError(
+        self: *Broker,
+        request_bytes: []const u8,
+        body_start: usize,
+        req_header: *const RequestHeader,
+        api_version: i16,
+        resp_header_version: i16,
+        err_code: ErrorCode,
+    ) ?[]u8 {
+        const Req = generated.automq_zone_router_request.AutomqZoneRouterRequest;
+        const Resp = generated.automq_zone_router_response.AutomqZoneRouterResponse;
+
+        var arena = std.heap.ArenaAllocator.init(self.allocator);
+        defer arena.deinit();
+        _ = parseGeneratedRequest(Req, arena.allocator(), request_bytes, body_start, api_version) catch |err| {
+            log.warn("Failed to decode denied AutomqZoneRouter request: {}", .{err});
+            return null;
+        };
+
+        const resp = Resp{ .error_code = @intFromEnum(err_code), .throttle_time_ms = 0, .responses = &.{} };
+        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+    }
+
+    fn handleAutomqGetPartitionSnapshotAuthorizationError(
+        self: *Broker,
+        request_bytes: []const u8,
+        body_start: usize,
+        req_header: *const RequestHeader,
+        api_version: i16,
+        resp_header_version: i16,
+        err_code: ErrorCode,
+    ) ?[]u8 {
+        const Req = generated.automq_get_partition_snapshot_request.AutomqGetPartitionSnapshotRequest;
+        const Resp = generated.automq_get_partition_snapshot_response.AutomqGetPartitionSnapshotResponse;
+
+        var arena = std.heap.ArenaAllocator.init(self.allocator);
+        defer arena.deinit();
+        const req = parseGeneratedRequest(Req, arena.allocator(), request_bytes, body_start, api_version) catch |err| {
+            log.warn("Failed to decode denied AutomqGetPartitionSnapshot request: {}", .{err});
+            return null;
+        };
+
+        const resp = Resp{
+            .error_code = @intFromEnum(err_code),
+            .throttle_time_ms = 0,
+            .session_id = req.session_id,
+            .session_epoch = req.session_epoch,
+            .topics = &.{},
+            .confirm_wal_end_offset = null,
+            .confirm_wal_config = null,
+            .confirm_wal_delta_data = null,
+        };
+        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+    }
+
+    fn handleUpdateLicenseAuthorizationError(
+        self: *Broker,
+        request_bytes: []const u8,
+        body_start: usize,
+        req_header: *const RequestHeader,
+        api_version: i16,
+        resp_header_version: i16,
+        err_code: ErrorCode,
+    ) ?[]u8 {
+        const Req = generated.update_license_request.UpdateLicenseRequest;
+        const Resp = generated.update_license_response.UpdateLicenseResponse;
+
+        var arena = std.heap.ArenaAllocator.init(self.allocator);
+        defer arena.deinit();
+        _ = parseGeneratedRequest(Req, arena.allocator(), request_bytes, body_start, api_version) catch |err| {
+            log.warn("Failed to decode denied UpdateLicense request: {}", .{err});
+            return null;
+        };
+
+        const resp = Resp{ .error_code = @intFromEnum(err_code), .throttle_time_ms = 0, .error_message = "Not authorized" };
+        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+    }
+
+    fn handleDescribeLicenseAuthorizationError(
+        self: *Broker,
+        request_bytes: []const u8,
+        body_start: usize,
+        req_header: *const RequestHeader,
+        api_version: i16,
+        resp_header_version: i16,
+        err_code: ErrorCode,
+    ) ?[]u8 {
+        const Req = generated.describe_license_request.DescribeLicenseRequest;
+        const Resp = generated.describe_license_response.DescribeLicenseResponse;
+
+        var arena = std.heap.ArenaAllocator.init(self.allocator);
+        defer arena.deinit();
+        _ = parseGeneratedRequest(Req, arena.allocator(), request_bytes, body_start, api_version) catch |err| {
+            log.warn("Failed to decode denied DescribeLicense request: {}", .{err});
+            return null;
+        };
+
+        const resp = Resp{ .error_code = @intFromEnum(err_code), .throttle_time_ms = 0, .error_message = "Not authorized", .license = "" };
+        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+    }
+
+    fn handleExportClusterManifestAuthorizationError(
+        self: *Broker,
+        request_bytes: []const u8,
+        body_start: usize,
+        req_header: *const RequestHeader,
+        api_version: i16,
+        resp_header_version: i16,
+        err_code: ErrorCode,
+    ) ?[]u8 {
+        const Req = generated.export_cluster_manifest_request.ExportClusterManifestRequest;
+        const Resp = generated.export_cluster_manifest_response.ExportClusterManifestResponse;
+
+        var arena = std.heap.ArenaAllocator.init(self.allocator);
+        defer arena.deinit();
+        _ = parseGeneratedRequest(Req, arena.allocator(), request_bytes, body_start, api_version) catch |err| {
+            log.warn("Failed to decode denied ExportClusterManifest request: {}", .{err});
+            return null;
+        };
+
+        const resp = Resp{ .error_code = @intFromEnum(err_code), .throttle_time_ms = 0, .manifest = "" };
+        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+    }
+
+    fn handleGetNextNodeIdAuthorizationError(
+        self: *Broker,
+        request_bytes: []const u8,
+        body_start: usize,
+        req_header: *const RequestHeader,
+        api_version: i16,
+        resp_header_version: i16,
+        err_code: ErrorCode,
+    ) ?[]u8 {
+        const Req = generated.get_next_node_id_request.GetNextNodeIdRequest;
+        const Resp = generated.get_next_node_id_response.GetNextNodeIdResponse;
+
+        var arena = std.heap.ArenaAllocator.init(self.allocator);
+        defer arena.deinit();
+        _ = parseGeneratedRequest(Req, arena.allocator(), request_bytes, body_start, api_version) catch |err| {
+            log.warn("Failed to decode denied GetNextNodeId request: {}", .{err});
+            return null;
+        };
+
+        const resp = Resp{ .error_code = @intFromEnum(err_code), .throttle_time_ms = 0, .node_id = -1 };
+        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+    }
+
+    fn handleDescribeStreamsAuthorizationError(
+        self: *Broker,
+        request_bytes: []const u8,
+        body_start: usize,
+        req_header: *const RequestHeader,
+        api_version: i16,
+        resp_header_version: i16,
+        err_code: ErrorCode,
+    ) ?[]u8 {
+        const Req = generated.describe_streams_request.DescribeStreamsRequest;
+        const Resp = generated.describe_streams_response.DescribeStreamsResponse;
+
+        var arena = std.heap.ArenaAllocator.init(self.allocator);
+        defer arena.deinit();
+        _ = parseGeneratedRequest(Req, arena.allocator(), request_bytes, body_start, api_version) catch |err| {
+            log.warn("Failed to decode denied DescribeStreams request: {}", .{err});
+            return null;
+        };
+
+        const resp = Resp{ .error_code = @intFromEnum(err_code), .throttle_time_ms = 0, .stream_metadata_list = &.{} };
+        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+    }
+
+    fn handleAutomqUpdateGroupAuthorizationError(
+        self: *Broker,
+        request_bytes: []const u8,
+        body_start: usize,
+        req_header: *const RequestHeader,
+        api_version: i16,
+        resp_header_version: i16,
+        err_code: ErrorCode,
+    ) ?[]u8 {
+        const Req = generated.automq_update_group_request.AutomqUpdateGroupRequest;
+        const Resp = generated.automq_update_group_response.AutomqUpdateGroupResponse;
+
+        var arena = std.heap.ArenaAllocator.init(self.allocator);
+        defer arena.deinit();
+        const req = parseGeneratedRequest(Req, arena.allocator(), request_bytes, body_start, api_version) catch |err| {
+            log.warn("Failed to decode denied AutomqUpdateGroup request: {}", .{err});
+            return null;
+        };
+
+        const resp = Resp{ .group_id = req.group_id, .error_code = @intFromEnum(err_code), .error_message = "Not authorized", .throttle_time_ms = 0 };
         return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
     }
 
@@ -26530,6 +26779,238 @@ test "Broker.handleRequest AutoMQ KV authorization denial uses generated respons
     }
     try testing.expectEqual(kv_count_before, broker.auto_mq_kvs.count());
     try testing.expectEqualStrings("old-value", broker.auto_mq_kvs.get("existing").?);
+}
+
+test "Broker.handleRequest remaining AutoMQ extension authorization denial uses generated responses" {
+    const RegisterReq = generated.automq_register_node_request.AutomqRegisterNodeRequest;
+    const RegisterResp = generated.automq_register_node_response.AutomqRegisterNodeResponse;
+    const GetNodesReq = generated.automq_get_nodes_request.AutomqGetNodesRequest;
+    const GetNodesResp = generated.automq_get_nodes_response.AutomqGetNodesResponse;
+    const ZoneReq = generated.automq_zone_router_request.AutomqZoneRouterRequest;
+    const ZoneResp = generated.automq_zone_router_response.AutomqZoneRouterResponse;
+    const SnapshotReq = generated.automq_get_partition_snapshot_request.AutomqGetPartitionSnapshotRequest;
+    const SnapshotResp = generated.automq_get_partition_snapshot_response.AutomqGetPartitionSnapshotResponse;
+    const UpdateLicenseReq = generated.update_license_request.UpdateLicenseRequest;
+    const UpdateLicenseResp = generated.update_license_response.UpdateLicenseResponse;
+    const DescribeLicenseReq = generated.describe_license_request.DescribeLicenseRequest;
+    const DescribeLicenseResp = generated.describe_license_response.DescribeLicenseResponse;
+    const ManifestReq = generated.export_cluster_manifest_request.ExportClusterManifestRequest;
+    const ManifestResp = generated.export_cluster_manifest_response.ExportClusterManifestResponse;
+    const NextNodeReq = generated.get_next_node_id_request.GetNextNodeIdRequest;
+    const NextNodeResp = generated.get_next_node_id_response.GetNextNodeIdResponse;
+    const DescribeStreamsReq = generated.describe_streams_request.DescribeStreamsRequest;
+    const DescribeStreamsResp = generated.describe_streams_response.DescribeStreamsResponse;
+    const UpdateGroupReq = generated.automq_update_group_request.AutomqUpdateGroupRequest;
+    const UpdateGroupResp = generated.automq_update_group_response.AutomqUpdateGroupResponse;
+    const denied = @as(i16, @intFromEnum(ErrorCode.cluster_authorization_failed));
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+    try broker.registerAutoMqNodeFromRecord(7, 3, "wal://node-7");
+    const stream = try broker.object_manager.createStream(1);
+    const stream_id: i64 = @intCast(stream.stream_id);
+    try broker.authorizer.addAcl("other-client", .cluster, "*", .literal, .alter, .allow, "*");
+
+    const node_count_before = broker.auto_mq_nodes.count();
+    const next_node_id_before = broker.auto_mq_next_node_id;
+
+    var buf: [4096]u8 = undefined;
+    var pos = buildTestRequest(&buf, 513, 0, 5134, header_mod.requestHeaderVersion(513, 0));
+    const register_req = RegisterReq{ .node_id = 8, .node_epoch = 1, .wal_config = "wal://node-8", .tags = &.{} };
+    register_req.serialize(&buf, &pos, 0);
+
+    const register_response = broker.handleRequest(buf[0..pos]);
+    try testing.expect(register_response != null);
+    defer testing.allocator.free(register_response.?);
+
+    var rpos: usize = 0;
+    var register_header = try ResponseHeader.deserialize(testing.allocator, register_response.?, &rpos, header_mod.responseHeaderVersion(513, 0));
+    defer register_header.deinit(testing.allocator);
+    try testing.expectEqual(@as(i32, 5134), register_header.correlation_id);
+    const register_resp = try RegisterResp.deserialize(testing.allocator, register_response.?, &rpos, 0);
+
+    try testing.expectEqual(register_response.?.len, rpos);
+    try testing.expectEqual(denied, register_resp.error_code);
+    try testing.expectEqual(node_count_before, broker.auto_mq_nodes.count());
+    try testing.expect(!broker.auto_mq_nodes.contains(8));
+
+    pos = buildTestRequest(&buf, 514, 0, 5144, header_mod.requestHeaderVersion(514, 0));
+    const node_ids = [_]i32{7};
+    const get_nodes_req = GetNodesReq{ .node_ids = &node_ids };
+    get_nodes_req.serialize(&buf, &pos, 0);
+
+    const get_nodes_response = broker.handleRequest(buf[0..pos]);
+    try testing.expect(get_nodes_response != null);
+    defer testing.allocator.free(get_nodes_response.?);
+
+    rpos = 0;
+    var get_nodes_header = try ResponseHeader.deserialize(testing.allocator, get_nodes_response.?, &rpos, header_mod.responseHeaderVersion(514, 0));
+    defer get_nodes_header.deinit(testing.allocator);
+    try testing.expectEqual(@as(i32, 5144), get_nodes_header.correlation_id);
+    const get_nodes_resp = try GetNodesResp.deserialize(testing.allocator, get_nodes_response.?, &rpos, 0);
+    defer if (get_nodes_resp.nodes.len > 0) testing.allocator.free(get_nodes_resp.nodes);
+
+    try testing.expectEqual(get_nodes_response.?.len, rpos);
+    try testing.expectEqual(denied, get_nodes_resp.error_code);
+    try testing.expectEqual(@as(usize, 0), get_nodes_resp.nodes.len);
+
+    pos = buildTestRequest(&buf, 515, 1, 5154, header_mod.requestHeaderVersion(515, 1));
+    const zone_req = ZoneReq{ .metadata = "route-data", .route_epoch = 4, .version = 1 };
+    zone_req.serialize(&buf, &pos, 1);
+
+    const zone_response = broker.handleRequest(buf[0..pos]);
+    try testing.expect(zone_response != null);
+    defer testing.allocator.free(zone_response.?);
+
+    rpos = 0;
+    var zone_header = try ResponseHeader.deserialize(testing.allocator, zone_response.?, &rpos, header_mod.responseHeaderVersion(515, 1));
+    defer zone_header.deinit(testing.allocator);
+    try testing.expectEqual(@as(i32, 5154), zone_header.correlation_id);
+    const zone_resp = try ZoneResp.deserialize(testing.allocator, zone_response.?, &rpos, 1);
+    defer if (zone_resp.responses.len > 0) testing.allocator.free(zone_resp.responses);
+
+    try testing.expectEqual(zone_response.?.len, rpos);
+    try testing.expectEqual(denied, zone_resp.error_code);
+    try testing.expectEqual(@as(usize, 0), zone_resp.responses.len);
+    try testing.expect(broker.auto_mq_zone_router_metadata == null);
+
+    pos = buildTestRequest(&buf, 516, 2, 5164, header_mod.requestHeaderVersion(516, 2));
+    const snapshot_req = SnapshotReq{ .session_id = 99, .session_epoch = 4, .request_commit = false, .version = 2 };
+    snapshot_req.serialize(&buf, &pos, 2);
+
+    const snapshot_response = broker.handleRequest(buf[0..pos]);
+    try testing.expect(snapshot_response != null);
+    defer testing.allocator.free(snapshot_response.?);
+
+    rpos = 0;
+    var snapshot_header = try ResponseHeader.deserialize(testing.allocator, snapshot_response.?, &rpos, header_mod.responseHeaderVersion(516, 2));
+    defer snapshot_header.deinit(testing.allocator);
+    try testing.expectEqual(@as(i32, 5164), snapshot_header.correlation_id);
+    const snapshot_resp = try SnapshotResp.deserialize(testing.allocator, snapshot_response.?, &rpos, 2);
+    defer if (snapshot_resp.topics.len > 0) testing.allocator.free(snapshot_resp.topics);
+
+    try testing.expectEqual(snapshot_response.?.len, rpos);
+    try testing.expectEqual(denied, snapshot_resp.error_code);
+    try testing.expectEqual(@as(i32, 99), snapshot_resp.session_id);
+    try testing.expectEqual(@as(i32, 4), snapshot_resp.session_epoch);
+    try testing.expectEqual(@as(usize, 0), snapshot_resp.topics.len);
+    try testing.expect(snapshot_resp.confirm_wal_end_offset == null);
+    try testing.expect(snapshot_resp.confirm_wal_config == null);
+    try testing.expect(snapshot_resp.confirm_wal_delta_data == null);
+
+    pos = buildTestRequest(&buf, 517, 0, 5174, header_mod.requestHeaderVersion(517, 0));
+    const update_license_req = UpdateLicenseReq{ .license = "secret-license" };
+    update_license_req.serialize(&buf, &pos, 0);
+
+    const update_license_response = broker.handleRequest(buf[0..pos]);
+    try testing.expect(update_license_response != null);
+    defer testing.allocator.free(update_license_response.?);
+
+    rpos = 0;
+    var update_license_header = try ResponseHeader.deserialize(testing.allocator, update_license_response.?, &rpos, header_mod.responseHeaderVersion(517, 0));
+    defer update_license_header.deinit(testing.allocator);
+    try testing.expectEqual(@as(i32, 5174), update_license_header.correlation_id);
+    const update_license_resp = try UpdateLicenseResp.deserialize(testing.allocator, update_license_response.?, &rpos, 0);
+
+    try testing.expectEqual(update_license_response.?.len, rpos);
+    try testing.expectEqual(denied, update_license_resp.error_code);
+    try testing.expectEqualStrings("Not authorized", update_license_resp.error_message.?);
+    try testing.expect(broker.auto_mq_license == null);
+
+    pos = buildTestRequest(&buf, 518, 0, 5184, header_mod.requestHeaderVersion(518, 0));
+    const describe_license_req = DescribeLicenseReq{};
+    describe_license_req.serialize(&buf, &pos, 0);
+
+    const describe_license_response = broker.handleRequest(buf[0..pos]);
+    try testing.expect(describe_license_response != null);
+    defer testing.allocator.free(describe_license_response.?);
+
+    rpos = 0;
+    var describe_license_header = try ResponseHeader.deserialize(testing.allocator, describe_license_response.?, &rpos, header_mod.responseHeaderVersion(518, 0));
+    defer describe_license_header.deinit(testing.allocator);
+    try testing.expectEqual(@as(i32, 5184), describe_license_header.correlation_id);
+    const describe_license_resp = try DescribeLicenseResp.deserialize(testing.allocator, describe_license_response.?, &rpos, 0);
+
+    try testing.expectEqual(describe_license_response.?.len, rpos);
+    try testing.expectEqual(denied, describe_license_resp.error_code);
+    try testing.expectEqualStrings("Not authorized", describe_license_resp.error_message.?);
+    try testing.expectEqualStrings("", describe_license_resp.license.?);
+
+    pos = buildTestRequest(&buf, 519, 0, 5194, header_mod.requestHeaderVersion(519, 0));
+    const manifest_req = ManifestReq{};
+    manifest_req.serialize(&buf, &pos, 0);
+
+    const manifest_response = broker.handleRequest(buf[0..pos]);
+    try testing.expect(manifest_response != null);
+    defer testing.allocator.free(manifest_response.?);
+
+    rpos = 0;
+    var manifest_header = try ResponseHeader.deserialize(testing.allocator, manifest_response.?, &rpos, header_mod.responseHeaderVersion(519, 0));
+    defer manifest_header.deinit(testing.allocator);
+    try testing.expectEqual(@as(i32, 5194), manifest_header.correlation_id);
+    const manifest_resp = try ManifestResp.deserialize(testing.allocator, manifest_response.?, &rpos, 0);
+
+    try testing.expectEqual(manifest_response.?.len, rpos);
+    try testing.expectEqual(denied, manifest_resp.error_code);
+    try testing.expectEqualStrings("", manifest_resp.manifest.?);
+
+    pos = buildTestRequest(&buf, 600, 0, 6004, header_mod.requestHeaderVersion(600, 0));
+    const next_node_req = NextNodeReq{ .cluster_id = "zmq-cluster" };
+    next_node_req.serialize(&buf, &pos, 0);
+
+    const next_node_response = broker.handleRequest(buf[0..pos]);
+    try testing.expect(next_node_response != null);
+    defer testing.allocator.free(next_node_response.?);
+
+    rpos = 0;
+    var next_node_header = try ResponseHeader.deserialize(testing.allocator, next_node_response.?, &rpos, header_mod.responseHeaderVersion(600, 0));
+    defer next_node_header.deinit(testing.allocator);
+    try testing.expectEqual(@as(i32, 6004), next_node_header.correlation_id);
+    const next_node_resp = try NextNodeResp.deserialize(testing.allocator, next_node_response.?, &rpos, 0);
+
+    try testing.expectEqual(next_node_response.?.len, rpos);
+    try testing.expectEqual(denied, next_node_resp.error_code);
+    try testing.expectEqual(@as(i32, -1), next_node_resp.node_id);
+    try testing.expectEqual(next_node_id_before, broker.auto_mq_next_node_id);
+
+    pos = buildTestRequest(&buf, 601, 0, 6014, header_mod.requestHeaderVersion(601, 0));
+    const describe_streams_req = DescribeStreamsReq{ .topic_partitions = &.{}, .node_id = -1, .stream_id = stream_id };
+    describe_streams_req.serialize(&buf, &pos, 0);
+
+    const describe_streams_response = broker.handleRequest(buf[0..pos]);
+    try testing.expect(describe_streams_response != null);
+    defer testing.allocator.free(describe_streams_response.?);
+
+    rpos = 0;
+    var describe_streams_header = try ResponseHeader.deserialize(testing.allocator, describe_streams_response.?, &rpos, header_mod.responseHeaderVersion(601, 0));
+    defer describe_streams_header.deinit(testing.allocator);
+    try testing.expectEqual(@as(i32, 6014), describe_streams_header.correlation_id);
+    const describe_streams_resp = try DescribeStreamsResp.deserialize(testing.allocator, describe_streams_response.?, &rpos, 0);
+    defer if (describe_streams_resp.stream_metadata_list.len > 0) testing.allocator.free(describe_streams_resp.stream_metadata_list);
+
+    try testing.expectEqual(describe_streams_response.?.len, rpos);
+    try testing.expectEqual(denied, describe_streams_resp.error_code);
+    try testing.expectEqual(@as(usize, 0), describe_streams_resp.stream_metadata_list.len);
+
+    pos = buildTestRequest(&buf, 602, 0, 6024, header_mod.requestHeaderVersion(602, 0));
+    const update_group_req = UpdateGroupReq{ .link_id = "link-a", .group_id = "group-a", .promoted = true };
+    update_group_req.serialize(&buf, &pos, 0);
+
+    const update_group_response = broker.handleRequest(buf[0..pos]);
+    try testing.expect(update_group_response != null);
+    defer testing.allocator.free(update_group_response.?);
+
+    rpos = 0;
+    var update_group_header = try ResponseHeader.deserialize(testing.allocator, update_group_response.?, &rpos, header_mod.responseHeaderVersion(602, 0));
+    defer update_group_header.deinit(testing.allocator);
+    try testing.expectEqual(@as(i32, 6024), update_group_header.correlation_id);
+    const update_group_resp = try UpdateGroupResp.deserialize(testing.allocator, update_group_response.?, &rpos, 0);
+
+    try testing.expectEqual(update_group_response.?.len, rpos);
+    try testing.expectEqualStrings("group-a", update_group_resp.group_id.?);
+    try testing.expectEqual(denied, update_group_resp.error_code);
+    try testing.expectEqualStrings("Not authorized", update_group_resp.error_message.?);
+    try testing.expectEqual(@as(u32, 0), broker.auto_mq_group_promotions.count());
 }
 
 test "Broker AutoMQ stream object lifecycle APIs" {
