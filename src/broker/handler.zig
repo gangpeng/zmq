@@ -3714,8 +3714,13 @@ pub const Broker = struct {
             31 => self.handleDeleteAclsAuthorizationError(request_bytes, body_start, req_header, api_version, resp_header_version, err_code),
             32 => self.handleDescribeConfigsAuthorizationError(request_bytes, body_start, req_header, api_version, resp_header_version, err_code),
             33 => self.handleAlterConfigsAuthorizationError(request_bytes, body_start, req_header, api_version, resp_header_version, err_code),
+            35 => self.handleDescribeLogDirsAuthorizationError(request_bytes, body_start, req_header, api_version, resp_header_version, err_code),
+            37 => self.handleCreatePartitionsAuthorizationError(request_bytes, body_start, req_header, api_version, resp_header_version, err_code),
             42 => self.handleDeleteGroupsAuthorizationError(request_bytes, body_start, req_header, api_version, resp_header_version, err_code),
+            43 => self.handleElectLeadersAuthorizationError(request_bytes, body_start, req_header, api_version, resp_header_version, err_code),
             44 => self.handleIncrementalAlterConfigsAuthorizationError(request_bytes, body_start, req_header, api_version, resp_header_version, err_code),
+            45 => self.handleAlterPartitionReassignmentsAuthorizationError(request_bytes, body_start, req_header, api_version, resp_header_version, err_code),
+            46 => self.handleListPartitionReassignmentsAuthorizationError(request_bytes, body_start, req_header, api_version, resp_header_version, err_code),
             47 => self.handleOffsetDeleteAuthorizationError(request_bytes, body_start, req_header, api_version, resp_header_version, err_code),
             55 => self.handleDescribeQuorumAuthorizationError(req_header, api_version, resp_header_version, err_code),
             60 => self.handleDescribeClusterAuthorizationError(req_header, api_version, resp_header_version, err_code),
@@ -4834,6 +4839,172 @@ pub const Broker = struct {
         return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
     }
 
+    fn handleDescribeLogDirsAuthorizationError(
+        self: *Broker,
+        request_bytes: []const u8,
+        body_start: usize,
+        req_header: *const RequestHeader,
+        api_version: i16,
+        resp_header_version: i16,
+        err_code: ErrorCode,
+    ) ?[]u8 {
+        const Req = generated.describe_log_dirs_request.DescribeLogDirsRequest;
+        const Resp = generated.describe_log_dirs_response.DescribeLogDirsResponse;
+        const Result = Resp.DescribeLogDirsResult;
+        const Topic = Result.DescribeLogDirsTopic;
+
+        var pos = body_start;
+        var req = Req.deserialize(self.allocator, request_bytes, &pos, api_version) catch |err| {
+            log.warn("Failed to decode denied DescribeLogDirs request: {}", .{err});
+            return null;
+        };
+        defer self.freeDescribeLogDirsRequest(&req);
+
+        var topics: []Topic = &.{};
+        if (req.topics) |requested_topics| {
+            if (requested_topics.len > 0) {
+                topics = self.allocator.alloc(Topic, requested_topics.len) catch return null;
+            }
+            for (requested_topics, 0..) |topic, idx| {
+                topics[idx] = .{
+                    .name = topic.topic,
+                    .partitions = &.{},
+                };
+            }
+        }
+        defer if (topics.len > 0) self.allocator.free(topics);
+
+        const log_dir = if (self.store.data_dir) |dir| dir else "/data/automq";
+        const results = [_]Result{.{
+            .error_code = @intFromEnum(err_code),
+            .log_dir = log_dir,
+            .topics = topics,
+            .total_bytes = -1,
+            .usable_bytes = -1,
+        }};
+        const resp = Resp{
+            .throttle_time_ms = 0,
+            .error_code = @intFromEnum(err_code),
+            .results = &results,
+        };
+        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+    }
+
+    fn handleCreatePartitionsAuthorizationError(
+        self: *Broker,
+        request_bytes: []const u8,
+        body_start: usize,
+        req_header: *const RequestHeader,
+        api_version: i16,
+        resp_header_version: i16,
+        err_code: ErrorCode,
+    ) ?[]u8 {
+        const Req = generated.create_partitions_request.CreatePartitionsRequest;
+        const Resp = generated.create_partitions_response.CreatePartitionsResponse;
+        const TopicResult = Resp.CreatePartitionsTopicResult;
+
+        if (!validateCreatePartitionsRequestFrame(request_bytes, body_start, api_version)) {
+            log.warn("Malformed denied CreatePartitions request", .{});
+            return null;
+        }
+
+        var pos = body_start;
+        var req = Req.deserialize(self.allocator, request_bytes, &pos, api_version) catch |err| {
+            log.warn("Failed to decode denied CreatePartitions request: {}", .{err});
+            return null;
+        };
+        defer self.freeCreatePartitionsRequest(&req);
+
+        var results: []TopicResult = &.{};
+        if (req.topics.len > 0) {
+            results = self.allocator.alloc(TopicResult, req.topics.len) catch return null;
+        }
+        defer if (results.len > 0) self.allocator.free(results);
+
+        for (req.topics, 0..) |topic, idx| {
+            results[idx] = .{
+                .name = topic.name,
+                .error_code = @intFromEnum(err_code),
+                .error_message = "Not authorized",
+            };
+        }
+
+        const resp = Resp{
+            .throttle_time_ms = 0,
+            .results = results,
+        };
+        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+    }
+
+    fn handleElectLeadersAuthorizationError(
+        self: *Broker,
+        request_bytes: []const u8,
+        body_start: usize,
+        req_header: *const RequestHeader,
+        api_version: i16,
+        resp_header_version: i16,
+        err_code: ErrorCode,
+    ) ?[]u8 {
+        const Req = generated.elect_leaders_request.ElectLeadersRequest;
+        const Resp = generated.elect_leaders_response.ElectLeadersResponse;
+        const Result = Resp.ReplicaElectionResult;
+        const PartitionResult = Result.PartitionResult;
+
+        var pos = body_start;
+        var req = Req.deserialize(self.allocator, request_bytes, &pos, api_version) catch |err| {
+            log.warn("Failed to decode denied ElectLeaders request: {}", .{err});
+            return null;
+        };
+        defer self.freeElectLeadersRequest(&req);
+
+        var results: []Result = &.{};
+        var results_init: usize = 0;
+        if (req.topic_partitions) |topic_partitions| {
+            if (topic_partitions.len > 0) {
+                results = self.allocator.alloc(Result, topic_partitions.len) catch return null;
+            }
+            defer {
+                for (results[0..results_init]) |result| {
+                    if (result.partition_result.len > 0) self.allocator.free(result.partition_result);
+                }
+                if (results.len > 0) self.allocator.free(results);
+            }
+
+            for (topic_partitions, 0..) |topic, idx| {
+                var partitions: []PartitionResult = &.{};
+                if (topic.partitions.len > 0) {
+                    partitions = self.allocator.alloc(PartitionResult, topic.partitions.len) catch return null;
+                }
+                for (topic.partitions, 0..) |partition_id, partition_idx| {
+                    partitions[partition_idx] = .{
+                        .partition_id = partition_id,
+                        .error_code = @intFromEnum(err_code),
+                        .error_message = "Not authorized",
+                    };
+                }
+                results[idx] = .{
+                    .topic = topic.topic,
+                    .partition_result = partitions,
+                };
+                results_init += 1;
+            }
+
+            const resp = Resp{
+                .throttle_time_ms = 0,
+                .error_code = @intFromEnum(err_code),
+                .replica_election_results = results,
+            };
+            return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+        }
+
+        const resp = Resp{
+            .throttle_time_ms = 0,
+            .error_code = @intFromEnum(err_code),
+            .replica_election_results = &.{},
+        };
+        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+    }
+
     fn handleDescribeConfigsAuthorizationError(
         self: *Broker,
         request_bytes: []const u8,
@@ -4972,6 +5143,105 @@ pub const Broker = struct {
         const resp = Resp{
             .throttle_time_ms = 0,
             .responses = responses,
+        };
+        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+    }
+
+    fn handleAlterPartitionReassignmentsAuthorizationError(
+        self: *Broker,
+        request_bytes: []const u8,
+        body_start: usize,
+        req_header: *const RequestHeader,
+        api_version: i16,
+        resp_header_version: i16,
+        err_code: ErrorCode,
+    ) ?[]u8 {
+        const Req = generated.alter_partition_reassignments_request.AlterPartitionReassignmentsRequest;
+        const Resp = generated.alter_partition_reassignments_response.AlterPartitionReassignmentsResponse;
+        const TopicResponse = Resp.ReassignableTopicResponse;
+        const PartitionResponse = TopicResponse.ReassignablePartitionResponse;
+
+        if (!validateAlterPartitionReassignmentsRequestFrame(request_bytes, body_start)) {
+            log.warn("Malformed denied AlterPartitionReassignments request", .{});
+            return null;
+        }
+
+        var pos = body_start;
+        var req = Req.deserialize(self.allocator, request_bytes, &pos, api_version) catch |err| {
+            log.warn("Failed to decode denied AlterPartitionReassignments request: {}", .{err});
+            return null;
+        };
+        defer self.freeAlterPartitionReassignmentsRequest(&req);
+
+        var responses: []TopicResponse = &.{};
+        var responses_init: usize = 0;
+        if (req.topics.len > 0) {
+            responses = self.allocator.alloc(TopicResponse, req.topics.len) catch return null;
+        }
+        defer {
+            for (responses[0..responses_init]) |response| {
+                if (response.partitions.len > 0) self.allocator.free(response.partitions);
+            }
+            if (responses.len > 0) self.allocator.free(responses);
+        }
+
+        for (req.topics, 0..) |topic, idx| {
+            var partitions: []PartitionResponse = &.{};
+            if (topic.partitions.len > 0) {
+                partitions = self.allocator.alloc(PartitionResponse, topic.partitions.len) catch return null;
+            }
+            for (topic.partitions, 0..) |partition, partition_idx| {
+                partitions[partition_idx] = .{
+                    .partition_index = partition.partition_index,
+                    .error_code = @intFromEnum(err_code),
+                    .error_message = "Not authorized",
+                };
+            }
+            responses[idx] = .{
+                .name = topic.name,
+                .partitions = partitions,
+            };
+            responses_init += 1;
+        }
+
+        const resp = Resp{
+            .throttle_time_ms = 0,
+            .error_code = @intFromEnum(err_code),
+            .error_message = "Not authorized",
+            .responses = responses,
+        };
+        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+    }
+
+    fn handleListPartitionReassignmentsAuthorizationError(
+        self: *Broker,
+        request_bytes: []const u8,
+        body_start: usize,
+        req_header: *const RequestHeader,
+        api_version: i16,
+        resp_header_version: i16,
+        err_code: ErrorCode,
+    ) ?[]u8 {
+        const Req = generated.list_partition_reassignments_request.ListPartitionReassignmentsRequest;
+        const Resp = generated.list_partition_reassignments_response.ListPartitionReassignmentsResponse;
+
+        if (!validateListPartitionReassignmentsRequestFrame(request_bytes, body_start)) {
+            log.warn("Malformed denied ListPartitionReassignments request", .{});
+            return null;
+        }
+
+        var pos = body_start;
+        var req = Req.deserialize(self.allocator, request_bytes, &pos, api_version) catch |err| {
+            log.warn("Failed to decode denied ListPartitionReassignments request: {}", .{err});
+            return null;
+        };
+        defer self.freeListPartitionReassignmentsRequest(&req);
+
+        const resp = Resp{
+            .throttle_time_ms = 0,
+            .error_code = @intFromEnum(err_code),
+            .error_message = "Not authorized",
+            .topics = &.{},
         };
         return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
     }
@@ -22262,6 +22532,53 @@ test "Broker.handleRequest CreatePartitions v2 returns generated response and ex
     try testing.expectEqual(@as(?i32, 1), broker.failover_controller.findPartitionOwner("create-partitions-topic", 2));
 }
 
+test "Broker.handleRequest CreatePartitions authorization denial uses generated response" {
+    const Req = generated.create_partitions_request.CreatePartitionsRequest;
+    const Resp = generated.create_partitions_response.CreatePartitionsResponse;
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+    try testing.expect(broker.ensureTopic("create-partitions-denied-topic"));
+    const before = broker.topics.get("create-partitions-denied-topic").?.num_partitions;
+    try broker.authorizer.addAcl("other-client", .cluster, "*", .literal, .create, .allow, "*");
+
+    const topics = [_]Req.CreatePartitionsTopic{.{
+        .name = "create-partitions-denied-topic",
+        .count = before + 2,
+        .assignments = null,
+    }};
+    const req = Req{
+        .topics = &topics,
+        .timeout_ms = 30000,
+        .validate_only = false,
+    };
+
+    var buf: [512]u8 = undefined;
+    var pos = buildTestRequest(&buf, 37, 2, 3712, header_mod.requestHeaderVersion(37, 2));
+    req.serialize(&buf, &pos, 2);
+
+    const response = broker.handleRequest(buf[0..pos]);
+    try testing.expect(response != null);
+    defer testing.allocator.free(response.?);
+
+    var rpos: usize = 0;
+    var response_header = try ResponseHeader.deserialize(testing.allocator, response.?, &rpos, header_mod.responseHeaderVersion(37, 2));
+    defer response_header.deinit(testing.allocator);
+    try testing.expectEqual(@as(i32, 3712), response_header.correlation_id);
+
+    const resp = try Resp.deserialize(testing.allocator, response.?, &rpos, 2);
+    defer if (resp.results.len > 0) testing.allocator.free(resp.results);
+
+    try testing.expectEqual(response.?.len, rpos);
+    try testing.expectEqual(@as(i32, 0), resp.throttle_time_ms);
+    try testing.expectEqual(@as(usize, 1), resp.results.len);
+    try testing.expectEqualStrings("create-partitions-denied-topic", resp.results[0].name.?);
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.cluster_authorization_failed)), resp.results[0].error_code);
+    try testing.expectEqualStrings("Not authorized", resp.results[0].error_message.?);
+    try testing.expectEqual(before, broker.topics.get("create-partitions-denied-topic").?.num_partitions);
+    try testing.expect(!broker.store.partitions.contains("create-partitions-denied-topic-1"));
+}
+
 test "Broker.handleRequest CreatePartitions rejects explicit empty assignments" {
     const Req = generated.create_partitions_request.CreatePartitionsRequest;
     const Resp = generated.create_partitions_response.CreatePartitionsResponse;
@@ -27852,6 +28169,55 @@ test "Broker.handleRequest DescribeLogDirs scopes flexible response to requested
     try testing.expectEqual(@as(usize, 0), resp.results[0].topics[1].partitions.len);
 }
 
+test "Broker.handleRequest DescribeLogDirs authorization denial uses generated response" {
+    const Req = generated.describe_log_dirs_request.DescribeLogDirsRequest;
+    const Resp = generated.describe_log_dirs_response.DescribeLogDirsResponse;
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+    try broker.authorizer.addAcl("other-client", .cluster, "*", .literal, .describe, .allow, "*");
+
+    const partitions = [_]i32{ 0, 1 };
+    const topics = [_]Req.DescribableLogDirTopic{.{
+        .topic = "log-denied-topic",
+        .partitions = &partitions,
+    }};
+    const req = Req{ .topics = &topics };
+
+    var buf: [1024]u8 = undefined;
+    var pos = buildTestRequest(&buf, 35, 4, 3514, header_mod.requestHeaderVersion(35, 4));
+    req.serialize(&buf, &pos, 4);
+
+    const response = broker.handleRequest(buf[0..pos]);
+    try testing.expect(response != null);
+    defer testing.allocator.free(response.?);
+
+    var rpos: usize = 0;
+    var response_header = try ResponseHeader.deserialize(testing.allocator, response.?, &rpos, header_mod.responseHeaderVersion(35, 4));
+    defer response_header.deinit(testing.allocator);
+    try testing.expectEqual(@as(i32, 3514), response_header.correlation_id);
+
+    const resp = try Resp.deserialize(testing.allocator, response.?, &rpos, 4);
+    defer {
+        for (resp.results) |result| {
+            for (result.topics) |topic| {
+                if (topic.partitions.len > 0) testing.allocator.free(topic.partitions);
+            }
+            if (result.topics.len > 0) testing.allocator.free(result.topics);
+        }
+        if (resp.results.len > 0) testing.allocator.free(resp.results);
+    }
+
+    try testing.expectEqual(response.?.len, rpos);
+    try testing.expectEqual(@as(i32, 0), resp.throttle_time_ms);
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.cluster_authorization_failed)), resp.error_code);
+    try testing.expectEqual(@as(usize, 1), resp.results.len);
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.cluster_authorization_failed)), resp.results[0].error_code);
+    try testing.expectEqual(@as(usize, 1), resp.results[0].topics.len);
+    try testing.expectEqualStrings("log-denied-topic", resp.results[0].topics[0].name.?);
+    try testing.expectEqual(@as(usize, 0), resp.results[0].topics[0].partitions.len);
+}
+
 test "Broker.handleRequest DescribeLogDirs distinguishes null and empty topics" {
     const Req = generated.describe_log_dirs_request.DescribeLogDirsRequest;
     const Resp = generated.describe_log_dirs_response.DescribeLogDirsResponse;
@@ -27992,6 +28358,63 @@ test "Broker.handleRequest AlterPartitionReassignments returns request-scoped si
     try testing.expectEqual(@as(u32, 1), broker.partition_reassignments.count());
 }
 
+test "Broker.handleRequest AlterPartitionReassignments authorization denial uses generated response" {
+    const Req = generated.alter_partition_reassignments_request.AlterPartitionReassignmentsRequest;
+    const Resp = generated.alter_partition_reassignments_response.AlterPartitionReassignmentsResponse;
+    const PartitionReq = Req.ReassignableTopic.ReassignablePartition;
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+    try testing.expect(broker.ensureTopic("reassign-denied-topic"));
+    try broker.authorizer.addAcl("other-client", .cluster, "*", .literal, .alter, .allow, "*");
+
+    const remote_replicas = [_]i32{2};
+    const partitions = [_]PartitionReq{.{
+        .partition_index = 0,
+        .replicas = &remote_replicas,
+    }};
+    const topics = [_]Req.ReassignableTopic{.{
+        .name = "reassign-denied-topic",
+        .partitions = &partitions,
+    }};
+    const req = Req{
+        .timeout_ms = 1000,
+        .topics = &topics,
+    };
+
+    var buf: [1024]u8 = undefined;
+    var pos = buildTestRequest(&buf, 45, 0, 4514, header_mod.requestHeaderVersion(45, 0));
+    req.serialize(&buf, &pos, 0);
+
+    const response = broker.handleRequest(buf[0..pos]);
+    try testing.expect(response != null);
+    defer testing.allocator.free(response.?);
+
+    var rpos: usize = 0;
+    var response_header = try ResponseHeader.deserialize(testing.allocator, response.?, &rpos, header_mod.responseHeaderVersion(45, 0));
+    defer response_header.deinit(testing.allocator);
+    try testing.expectEqual(@as(i32, 4514), response_header.correlation_id);
+
+    const resp = try Resp.deserialize(testing.allocator, response.?, &rpos, 0);
+    defer {
+        for (resp.responses) |topic| {
+            if (topic.partitions.len > 0) testing.allocator.free(topic.partitions);
+        }
+        if (resp.responses.len > 0) testing.allocator.free(resp.responses);
+    }
+
+    try testing.expectEqual(response.?.len, rpos);
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.cluster_authorization_failed)), resp.error_code);
+    try testing.expectEqualStrings("Not authorized", resp.error_message.?);
+    try testing.expectEqual(@as(usize, 1), resp.responses.len);
+    try testing.expectEqualStrings("reassign-denied-topic", resp.responses[0].name.?);
+    try testing.expectEqual(@as(usize, 1), resp.responses[0].partitions.len);
+    try testing.expectEqual(@as(i32, 0), resp.responses[0].partitions[0].partition_index);
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.cluster_authorization_failed)), resp.responses[0].partitions[0].error_code);
+    try testing.expectEqualStrings("Not authorized", resp.responses[0].partitions[0].error_message.?);
+    try testing.expectEqual(@as(u32, 0), broker.partition_reassignments.count());
+}
+
 test "Broker.handleRequest ListPartitionReassignments decodes request and returns no ongoing reassignments" {
     const Req = generated.list_partition_reassignments_request.ListPartitionReassignmentsRequest;
     const Resp = generated.list_partition_reassignments_response.ListPartitionReassignmentsResponse;
@@ -28036,6 +28459,56 @@ test "Broker.handleRequest ListPartitionReassignments decodes request and return
     }
 
     try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.none)), resp.error_code);
+    try testing.expectEqual(@as(usize, 0), resp.topics.len);
+}
+
+test "Broker.handleRequest ListPartitionReassignments authorization denial uses generated response" {
+    const Req = generated.list_partition_reassignments_request.ListPartitionReassignmentsRequest;
+    const Resp = generated.list_partition_reassignments_response.ListPartitionReassignmentsResponse;
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+    try broker.authorizer.addAcl("other-client", .cluster, "*", .literal, .describe, .allow, "*");
+
+    const partitions = [_]i32{ 0, 1 };
+    const topics = [_]Req.ListPartitionReassignmentsTopics{.{
+        .name = "reassign-denied-topic",
+        .partition_indexes = &partitions,
+    }};
+    const req = Req{
+        .timeout_ms = 1000,
+        .topics = &topics,
+    };
+
+    var buf: [512]u8 = undefined;
+    var pos = buildTestRequest(&buf, 46, 0, 4614, header_mod.requestHeaderVersion(46, 0));
+    req.serialize(&buf, &pos, 0);
+
+    const response = broker.handleRequest(buf[0..pos]);
+    try testing.expect(response != null);
+    defer testing.allocator.free(response.?);
+
+    var rpos: usize = 0;
+    var response_header = try ResponseHeader.deserialize(testing.allocator, response.?, &rpos, header_mod.responseHeaderVersion(46, 0));
+    defer response_header.deinit(testing.allocator);
+    try testing.expectEqual(@as(i32, 4614), response_header.correlation_id);
+
+    const resp = try Resp.deserialize(testing.allocator, response.?, &rpos, 0);
+    defer {
+        for (resp.topics) |topic| {
+            for (topic.partitions) |partition| {
+                if (partition.replicas.len > 0) testing.allocator.free(partition.replicas);
+                if (partition.adding_replicas.len > 0) testing.allocator.free(partition.adding_replicas);
+                if (partition.removing_replicas.len > 0) testing.allocator.free(partition.removing_replicas);
+            }
+            if (topic.partitions.len > 0) testing.allocator.free(topic.partitions);
+        }
+        if (resp.topics.len > 0) testing.allocator.free(resp.topics);
+    }
+
+    try testing.expectEqual(response.?.len, rpos);
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.cluster_authorization_failed)), resp.error_code);
+    try testing.expectEqualStrings("Not authorized", resp.error_message.?);
     try testing.expectEqual(@as(usize, 0), resp.topics.len);
 }
 
@@ -29175,6 +29648,58 @@ test "Broker.handleRequest ElectLeaders returns requested partition results" {
     try testing.expectEqual(@as(i16, 0), resp.replica_election_results[0].partition_result[0].error_code);
     try testing.expectEqual(@as(i32, 5), resp.replica_election_results[0].partition_result[1].partition_id);
     try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.unknown_topic_or_partition)), resp.replica_election_results[0].partition_result[1].error_code);
+}
+
+test "Broker.handleRequest ElectLeaders authorization denial uses generated response" {
+    const Req = generated.elect_leaders_request.ElectLeadersRequest;
+    const Resp = generated.elect_leaders_response.ElectLeadersResponse;
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+    try broker.authorizer.addAcl("other-client", .cluster, "*", .literal, .alter, .allow, "*");
+
+    const partitions = [_]i32{ 0, 5 };
+    const topics = [_]Req.TopicPartitions{.{
+        .topic = "elect-denied-topic",
+        .partitions = &partitions,
+    }};
+    const req = Req{
+        .election_type = 0,
+        .topic_partitions = &topics,
+        .timeout_ms = 1000,
+    };
+
+    var buf: [1024]u8 = undefined;
+    var pos = buildTestRequest(&buf, 43, 2, 4314, header_mod.requestHeaderVersion(43, 2));
+    req.serialize(&buf, &pos, 2);
+
+    const response = broker.handleRequest(buf[0..pos]);
+    try testing.expect(response != null);
+    defer testing.allocator.free(response.?);
+
+    var rpos: usize = 0;
+    var response_header = try ResponseHeader.deserialize(testing.allocator, response.?, &rpos, header_mod.responseHeaderVersion(43, 2));
+    defer response_header.deinit(testing.allocator);
+    try testing.expectEqual(@as(i32, 4314), response_header.correlation_id);
+
+    const resp = try Resp.deserialize(testing.allocator, response.?, &rpos, 2);
+    defer {
+        for (resp.replica_election_results) |result| {
+            if (result.partition_result.len > 0) testing.allocator.free(result.partition_result);
+        }
+        if (resp.replica_election_results.len > 0) testing.allocator.free(resp.replica_election_results);
+    }
+
+    try testing.expectEqual(response.?.len, rpos);
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.cluster_authorization_failed)), resp.error_code);
+    try testing.expectEqual(@as(usize, 1), resp.replica_election_results.len);
+    try testing.expectEqualStrings("elect-denied-topic", resp.replica_election_results[0].topic.?);
+    try testing.expectEqual(@as(usize, 2), resp.replica_election_results[0].partition_result.len);
+    try testing.expectEqual(@as(i32, 0), resp.replica_election_results[0].partition_result[0].partition_id);
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.cluster_authorization_failed)), resp.replica_election_results[0].partition_result[0].error_code);
+    try testing.expectEqualStrings("Not authorized", resp.replica_election_results[0].partition_result[0].error_message.?);
+    try testing.expectEqual(@as(i32, 5), resp.replica_election_results[0].partition_result[1].partition_id);
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.cluster_authorization_failed)), resp.replica_election_results[0].partition_result[1].error_code);
 }
 
 test "Broker.handleRequest ElectLeaders distinguishes null and empty topic partitions" {
