@@ -3748,6 +3748,9 @@ pub const Broker = struct {
             506 => self.handleCommitStreamSetObjectAuthorizationError(request_bytes, body_start, req_header, api_version, resp_header_version, err_code),
             507 => self.handleCommitStreamObjectAuthorizationError(request_bytes, body_start, req_header, api_version, resp_header_version, err_code),
             508 => self.handleGetOpeningStreamsAuthorizationError(request_bytes, body_start, req_header, api_version, resp_header_version, err_code),
+            509 => self.handleGetKVsAuthorizationError(request_bytes, body_start, req_header, api_version, resp_header_version, err_code),
+            510 => self.handlePutKVsAuthorizationError(request_bytes, body_start, req_header, api_version, resp_header_version, err_code),
+            511 => self.handleDeleteKVsAuthorizationError(request_bytes, body_start, req_header, api_version, resp_header_version, err_code),
             512 => self.handleTrimStreamsAuthorizationError(request_bytes, body_start, req_header, api_version, resp_header_version, err_code),
             else => self.handleGenericAuthorizationError(req_header, resp_header_version, err_code),
         };
@@ -6336,6 +6339,93 @@ pub const Broker = struct {
         };
 
         const resp = Resp{ .error_code = @intFromEnum(err_code), .throttle_time_ms = 0, .stream_metadata_list = &.{} };
+        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+    }
+
+    fn handleGetKVsAuthorizationError(
+        self: *Broker,
+        request_bytes: []const u8,
+        body_start: usize,
+        req_header: *const RequestHeader,
+        api_version: i16,
+        resp_header_version: i16,
+        err_code: ErrorCode,
+    ) ?[]u8 {
+        const Req = generated.get_k_vs_request.GetKVsRequest;
+        const Resp = generated.get_k_vs_response.GetKVsResponse;
+        const ItemResp = Resp.GetKVResponse;
+
+        var arena = std.heap.ArenaAllocator.init(self.allocator);
+        defer arena.deinit();
+        const req = parseGeneratedRequest(Req, arena.allocator(), request_bytes, body_start, api_version) catch |err| {
+            log.warn("Failed to decode denied GetKVs request: {}", .{err});
+            return null;
+        };
+
+        const responses = arena.allocator().alloc(ItemResp, req.get_key_requests.len) catch return null;
+        for (responses) |*response| {
+            response.* = .{ .error_code = @intFromEnum(err_code), .value = null };
+        }
+
+        const resp = Resp{ .error_code = 0, .throttle_time_ms = 0, .get_kv_responses = responses };
+        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+    }
+
+    fn handlePutKVsAuthorizationError(
+        self: *Broker,
+        request_bytes: []const u8,
+        body_start: usize,
+        req_header: *const RequestHeader,
+        api_version: i16,
+        resp_header_version: i16,
+        err_code: ErrorCode,
+    ) ?[]u8 {
+        const Req = generated.put_k_vs_request.PutKVsRequest;
+        const Resp = generated.put_k_vs_response.PutKVsResponse;
+        const ItemResp = Resp.PutKVResponse;
+
+        var arena = std.heap.ArenaAllocator.init(self.allocator);
+        defer arena.deinit();
+        const req = parseGeneratedRequest(Req, arena.allocator(), request_bytes, body_start, api_version) catch |err| {
+            log.warn("Failed to decode denied PutKVs request: {}", .{err});
+            return null;
+        };
+
+        const responses = arena.allocator().alloc(ItemResp, req.put_kv_requests.len) catch return null;
+        for (responses) |*response| {
+            response.* = .{ .error_code = @intFromEnum(err_code), .value = null };
+        }
+
+        const resp = Resp{ .error_code = 0, .throttle_time_ms = 0, .put_kv_responses = responses };
+        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+    }
+
+    fn handleDeleteKVsAuthorizationError(
+        self: *Broker,
+        request_bytes: []const u8,
+        body_start: usize,
+        req_header: *const RequestHeader,
+        api_version: i16,
+        resp_header_version: i16,
+        err_code: ErrorCode,
+    ) ?[]u8 {
+        const Req = generated.delete_k_vs_request.DeleteKVsRequest;
+        const Resp = generated.delete_k_vs_response.DeleteKVsResponse;
+        const ItemResp = Resp.DeleteKVResponse;
+
+        var arena = std.heap.ArenaAllocator.init(self.allocator);
+        defer arena.deinit();
+        const req = parseGeneratedRequest(Req, arena.allocator(), request_bytes, body_start, api_version) catch |err| {
+            log.warn("Failed to decode denied DeleteKVs request: {}", .{err});
+            return null;
+        };
+
+        const responses = arena.allocator().alloc(ItemResp, req.delete_kv_requests.len) catch return null;
+        for (responses) |*response| {
+            response.* = .{ .error_code = @intFromEnum(err_code), .value = null };
+        }
+
+        const resp = Resp{ .error_code = 0, .throttle_time_ms = 0, .delete_kv_responses = responses };
         return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
     }
 
@@ -26336,6 +26426,110 @@ test "Broker.handleRequest AutoMQ object metadata authorization denial uses gene
     try testing.expectEqual(opening_response.?.len, rpos);
     try testing.expectEqual(denied, opening_resp.error_code);
     try testing.expectEqual(@as(usize, 0), opening_resp.stream_metadata_list.len);
+}
+
+test "Broker.handleRequest AutoMQ KV authorization denial uses generated responses" {
+    const GetReq = generated.get_k_vs_request.GetKVsRequest;
+    const GetResp = generated.get_k_vs_response.GetKVsResponse;
+    const PutReq = generated.put_k_vs_request.PutKVsRequest;
+    const PutResp = generated.put_k_vs_response.PutKVsResponse;
+    const DeleteReq = generated.delete_k_vs_request.DeleteKVsRequest;
+    const DeleteResp = generated.delete_k_vs_response.DeleteKVsResponse;
+    const denied = @as(i16, @intFromEnum(ErrorCode.cluster_authorization_failed));
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+    try broker.putAutoMqKvFromRecord("existing", "old-value");
+    try broker.authorizer.addAcl("other-client", .cluster, "*", .literal, .alter, .allow, "*");
+    const kv_count_before = broker.auto_mq_kvs.count();
+
+    var buf: [2048]u8 = undefined;
+    var pos = buildTestRequest(&buf, 509, 0, 5094, header_mod.requestHeaderVersion(509, 0));
+    const get_items = [_]GetReq.GetKVRequest{
+        .{ .key = "existing" },
+        .{ .key = "missing" },
+    };
+    const get_req = GetReq{ .get_key_requests = &get_items };
+    get_req.serialize(&buf, &pos, 0);
+
+    const get_response = broker.handleRequest(buf[0..pos]);
+    try testing.expect(get_response != null);
+    defer testing.allocator.free(get_response.?);
+
+    var rpos: usize = 0;
+    var get_header = try ResponseHeader.deserialize(testing.allocator, get_response.?, &rpos, header_mod.responseHeaderVersion(509, 0));
+    defer get_header.deinit(testing.allocator);
+    try testing.expectEqual(@as(i32, 5094), get_header.correlation_id);
+    const get_resp = try GetResp.deserialize(testing.allocator, get_response.?, &rpos, 0);
+    defer if (get_resp.get_kv_responses.len > 0) testing.allocator.free(get_resp.get_kv_responses);
+
+    try testing.expectEqual(get_response.?.len, rpos);
+    try testing.expectEqual(@as(i16, 0), get_resp.error_code);
+    try testing.expectEqual(@as(usize, 2), get_resp.get_kv_responses.len);
+    for (get_resp.get_kv_responses) |item| {
+        try testing.expectEqual(denied, item.error_code);
+        try testing.expect(item.value == null);
+    }
+    try testing.expectEqual(kv_count_before, broker.auto_mq_kvs.count());
+
+    pos = buildTestRequest(&buf, 510, 0, 5104, header_mod.requestHeaderVersion(510, 0));
+    const put_items = [_]PutReq.PutKVRequest{
+        .{ .key = "existing", .value = "new-value", .overwrite = true },
+        .{ .key = "new-key", .value = "new-value", .overwrite = true },
+    };
+    const put_req = PutReq{ .put_kv_requests = &put_items };
+    put_req.serialize(&buf, &pos, 0);
+
+    const put_response = broker.handleRequest(buf[0..pos]);
+    try testing.expect(put_response != null);
+    defer testing.allocator.free(put_response.?);
+
+    rpos = 0;
+    var put_header = try ResponseHeader.deserialize(testing.allocator, put_response.?, &rpos, header_mod.responseHeaderVersion(510, 0));
+    defer put_header.deinit(testing.allocator);
+    try testing.expectEqual(@as(i32, 5104), put_header.correlation_id);
+    const put_resp = try PutResp.deserialize(testing.allocator, put_response.?, &rpos, 0);
+    defer if (put_resp.put_kv_responses.len > 0) testing.allocator.free(put_resp.put_kv_responses);
+
+    try testing.expectEqual(put_response.?.len, rpos);
+    try testing.expectEqual(@as(i16, 0), put_resp.error_code);
+    try testing.expectEqual(@as(usize, 2), put_resp.put_kv_responses.len);
+    for (put_resp.put_kv_responses) |item| {
+        try testing.expectEqual(denied, item.error_code);
+        try testing.expect(item.value == null);
+    }
+    try testing.expectEqual(kv_count_before, broker.auto_mq_kvs.count());
+    try testing.expectEqualStrings("old-value", broker.auto_mq_kvs.get("existing").?);
+    try testing.expect(!broker.auto_mq_kvs.contains("new-key"));
+
+    pos = buildTestRequest(&buf, 511, 0, 5114, header_mod.requestHeaderVersion(511, 0));
+    const delete_items = [_]DeleteReq.DeleteKVRequest{
+        .{ .key = "existing" },
+        .{ .key = "missing" },
+    };
+    const delete_req = DeleteReq{ .delete_kv_requests = &delete_items };
+    delete_req.serialize(&buf, &pos, 0);
+
+    const delete_response = broker.handleRequest(buf[0..pos]);
+    try testing.expect(delete_response != null);
+    defer testing.allocator.free(delete_response.?);
+
+    rpos = 0;
+    var delete_header = try ResponseHeader.deserialize(testing.allocator, delete_response.?, &rpos, header_mod.responseHeaderVersion(511, 0));
+    defer delete_header.deinit(testing.allocator);
+    try testing.expectEqual(@as(i32, 5114), delete_header.correlation_id);
+    const delete_resp = try DeleteResp.deserialize(testing.allocator, delete_response.?, &rpos, 0);
+    defer if (delete_resp.delete_kv_responses.len > 0) testing.allocator.free(delete_resp.delete_kv_responses);
+
+    try testing.expectEqual(delete_response.?.len, rpos);
+    try testing.expectEqual(@as(i16, 0), delete_resp.error_code);
+    try testing.expectEqual(@as(usize, 2), delete_resp.delete_kv_responses.len);
+    for (delete_resp.delete_kv_responses) |item| {
+        try testing.expectEqual(denied, item.error_code);
+        try testing.expect(item.value == null);
+    }
+    try testing.expectEqual(kv_count_before, broker.auto_mq_kvs.count());
+    try testing.expectEqualStrings("old-value", broker.auto_mq_kvs.get("existing").?);
 }
 
 test "Broker AutoMQ stream object lifecycle APIs" {
