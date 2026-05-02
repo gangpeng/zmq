@@ -232,6 +232,8 @@ Status: completed for the initial catalog and DeleteGroups slice.
   coordinator key-list tagged-fields section.
   WriteTxnMarkers now rejects trailing bytes after the final transaction-marker
   tagged-fields section.
+  TxnOffsetCommit now rejects trailing bytes after the final offset topic
+  tagged-fields section.
   MetadataRequest generated decoding now preserves nullable `Topics` semantics:
   v1+ null requests all topics, explicit empty arrays request no topic results,
   and v0 null topics are rejected as malformed.

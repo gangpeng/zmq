@@ -18451,7 +18451,7 @@ pub const Broker = struct {
             if (flexible) ser.skipTaggedFields(buf, &pos) catch return false;
         }
         if (flexible) ser.skipTaggedFields(buf, &pos) catch return false;
-        return true;
+        return pos == buf.len;
     }
 
     fn validateCreateAclsRequestFrame(buf: []const u8, start_pos: usize, api_version: i16) bool {
@@ -23667,6 +23667,40 @@ test "Broker.handleRequest TxnOffsetCommit rejects truncated request" {
     var buf: [128]u8 = undefined;
     const req_len = buildTestRequest(&buf, 28, 3, 2804, header_mod.requestHeaderVersion(28, 3));
     try testing.expect(broker.handleRequest(buf[0..req_len]) == null);
+}
+
+test "Broker.handleRequest TxnOffsetCommit rejects trailing bytes" {
+    const Req = generated.txn_offset_commit_request.TxnOffsetCommitRequest;
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+
+    const partitions = [_]Req.TxnOffsetCommitRequestTopic.TxnOffsetCommitRequestPartition{.{
+        .partition_index = 0,
+        .committed_offset = 100,
+        .committed_leader_epoch = -1,
+        .committed_metadata = "trailing",
+    }};
+    const topics = [_]Req.TxnOffsetCommitRequestTopic{.{
+        .name = "txn-offset-trailing-topic",
+        .partitions = &partitions,
+    }};
+    const req = Req{
+        .transactional_id = "txn-offset-trailing-id",
+        .group_id = "txn-offset-trailing-group",
+        .producer_id = 321,
+        .producer_epoch = 2,
+        .generation_id = -1,
+        .member_id = "",
+        .group_instance_id = null,
+        .topics = &topics,
+    };
+
+    var buf: [1024]u8 = undefined;
+    var pos = buildTestRequest(&buf, 28, 3, 2815, header_mod.requestHeaderVersion(28, 3));
+    req.serialize(&buf, &pos, 3);
+
+    try expectTrailingByteRejected(&broker, buf[0..], pos);
 }
 
 test "Broker.handleRequest TxnOffsetCommit authorization denial uses generated response" {
