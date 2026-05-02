@@ -224,6 +224,8 @@ Status: completed for the initial catalog and DeleteGroups slice.
   check.
   DescribeClientQuotas and AlterClientQuotas now reject trailing bytes after
   their final tagged-fields section as well.
+  DescribeAcls, CreateAcls, and DeleteAcls now reject trailing bytes after the
+  final filter/creation tagged-fields section before normal handling.
   MetadataRequest generated decoding now preserves nullable `Topics` semantics:
   v1+ null requests all topics, explicit empty arrays request no topic results,
   and v0 null topics are rejected as malformed.

@@ -18469,7 +18469,7 @@ pub const Broker = struct {
             if (flexible) ser.skipTaggedFields(buf, &pos) catch return false;
         }
         if (flexible) ser.skipTaggedFields(buf, &pos) catch return false;
-        return true;
+        return pos == buf.len;
     }
 
     fn validateFindCoordinatorRequestFrame(buf: []const u8, start_pos: usize, api_version: i16) bool {
@@ -19231,7 +19231,7 @@ pub const Broker = struct {
         if (!skipKafkaString(buf, &pos, flexible)) return false; // host_filter
         if (!skipFixedBytes(buf, &pos, 2)) return false; // operation + permission_type
         if (flexible) ser.skipTaggedFields(buf, &pos) catch return false;
-        return true;
+        return pos == buf.len;
     }
 
     fn validateDeleteAclsRequestFrame(buf: []const u8, start_pos: usize, api_version: i16) bool {
@@ -19249,7 +19249,7 @@ pub const Broker = struct {
             if (flexible) ser.skipTaggedFields(buf, &pos) catch return false;
         }
         if (flexible) ser.skipTaggedFields(buf, &pos) catch return false;
-        return true;
+        return pos == buf.len;
     }
 
     fn validateDescribeConfigsRequestFrame(buf: []const u8, start_pos: usize, api_version: i16) bool {
@@ -23795,6 +23795,29 @@ test "Broker.handleRequest DescribeAcls rejects truncated request" {
     try testing.expect(broker.handleRequest(buf[0..req_len]) == null);
 }
 
+test "Broker.handleRequest DescribeAcls rejects trailing bytes" {
+    const Req = generated.describe_acls_request.DescribeAclsRequest;
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+
+    const req = Req{
+        .resource_type_filter = @intFromEnum(Authorizer.ResourceType.topic),
+        .resource_name_filter = "acl-desc-topic",
+        .pattern_type_filter = @intFromEnum(Authorizer.PatternType.literal),
+        .principal_filter = "User:alice",
+        .host_filter = "*",
+        .operation = @intFromEnum(Authorizer.Operation.read),
+        .permission_type = @intFromEnum(Authorizer.Permission.allow),
+    };
+
+    var buf: [512]u8 = undefined;
+    var pos = buildTestRequest(&buf, 29, 2, 2906, header_mod.requestHeaderVersion(29, 2));
+    req.serialize(&buf, &pos, 2);
+
+    try expectTrailingByteRejected(&broker, buf[0..], pos);
+}
+
 test "Broker.handleRequest DescribeAcls authorization denial uses generated response" {
     const Req = generated.describe_acls_request.DescribeAclsRequest;
     const Resp = generated.describe_acls_response.DescribeAclsResponse;
@@ -23924,6 +23947,30 @@ test "Broker.handleRequest CreateAcls rejects truncated request" {
     var buf: [128]u8 = undefined;
     const req_len = buildTestRequest(&buf, 30, 2, 3004, header_mod.requestHeaderVersion(30, 2));
     try testing.expect(broker.handleRequest(buf[0..req_len]) == null);
+}
+
+test "Broker.handleRequest CreateAcls rejects trailing bytes" {
+    const Req = generated.create_acls_request.CreateAclsRequest;
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+
+    const creations = [_]Req.AclCreation{.{
+        .resource_type = @intFromEnum(Authorizer.ResourceType.topic),
+        .resource_name = "acl-topic",
+        .resource_pattern_type = @intFromEnum(Authorizer.PatternType.literal),
+        .principal = "User:alice",
+        .host = "*",
+        .operation = @intFromEnum(Authorizer.Operation.read),
+        .permission_type = @intFromEnum(Authorizer.Permission.allow),
+    }};
+    const req = Req{ .creations = &creations };
+
+    var buf: [512]u8 = undefined;
+    var pos = buildTestRequest(&buf, 30, 2, 3006, header_mod.requestHeaderVersion(30, 2));
+    req.serialize(&buf, &pos, 2);
+
+    try expectTrailingByteRejected(&broker, buf[0..], pos);
 }
 
 test "Broker.handleRequest CreateAcls authorization denial uses generated response" {
@@ -24075,6 +24122,30 @@ test "Broker.handleRequest DeleteAcls rejects truncated request" {
     var buf: [128]u8 = undefined;
     const req_len = buildTestRequest(&buf, 31, 2, 3104, header_mod.requestHeaderVersion(31, 2));
     try testing.expect(broker.handleRequest(buf[0..req_len]) == null);
+}
+
+test "Broker.handleRequest DeleteAcls rejects trailing bytes" {
+    const Req = generated.delete_acls_request.DeleteAclsRequest;
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+
+    const filters = [_]Req.DeleteAclsFilter{.{
+        .resource_type_filter = @intFromEnum(Authorizer.ResourceType.topic),
+        .resource_name_filter = "acl-delete-topic",
+        .pattern_type_filter = @intFromEnum(Authorizer.PatternType.literal),
+        .principal_filter = "User:bob",
+        .host_filter = "*",
+        .operation = @intFromEnum(Authorizer.Operation.read),
+        .permission_type = @intFromEnum(Authorizer.Permission.allow),
+    }};
+    const req = Req{ .filters = &filters };
+
+    var buf: [512]u8 = undefined;
+    var pos = buildTestRequest(&buf, 31, 2, 3106, header_mod.requestHeaderVersion(31, 2));
+    req.serialize(&buf, &pos, 2);
+
+    try expectTrailingByteRejected(&broker, buf[0..], pos);
 }
 
 test "Broker.handleRequest DeleteAcls authorization denial uses generated response" {
