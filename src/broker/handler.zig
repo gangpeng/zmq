@@ -3386,7 +3386,7 @@ pub const Broker = struct {
             if (resource_type != .unknown) {
                 const operation = operationForApiKey(api_key);
                 // Extract topic name for topic-specific ACL checks (Produce/Fetch)
-                const resource_name = extractTopicFromRequest(api_key, request_bytes, pos) orelse "*";
+                const resource_name = self.extractTopicFromRequest(api_key, api_version, request_bytes, pos) orelse "*";
                 const result = self.authorizer.authorize(principal, resource_type, resource_name, operation);
                 if (result == .denied) {
                     return self.handleAuthorizationError(request_bytes, pos, &req_header, api_key, api_version, resp_header_version, resource_type);
@@ -3689,6 +3689,8 @@ pub const Broker = struct {
     ) ?[]u8 {
         const err_code = authorizationErrorCode(resource_type);
         return switch (api_key) {
+            0 => self.handleProduceAuthorizationError(request_bytes, body_start, req_header, api_version, resp_header_version, err_code),
+            1 => self.handleFetchAuthorizationError(request_bytes, body_start, req_header, api_version, resp_header_version, err_code),
             2 => self.handleListOffsetsAuthorizationError(request_bytes, body_start, req_header, api_version, resp_header_version, err_code),
             8 => self.handleOffsetCommitAuthorizationError(request_bytes, body_start, req_header, api_version, resp_header_version, err_code),
             9 => self.handleOffsetFetchAuthorizationError(request_bytes, body_start, req_header, api_version, resp_header_version, err_code),
@@ -3716,6 +3718,157 @@ pub const Broker = struct {
             69 => self.handleConsumerGroupDescribeAuthorizationError(request_bytes, body_start, req_header, api_version, resp_header_version, err_code),
             else => self.handleGenericAuthorizationError(req_header, resp_header_version, err_code),
         };
+    }
+
+    fn handleProduceAuthorizationError(
+        self: *Broker,
+        request_bytes: []const u8,
+        body_start: usize,
+        req_header: *const RequestHeader,
+        api_version: i16,
+        resp_header_version: i16,
+        err_code: ErrorCode,
+    ) ?[]u8 {
+        const Req = generated.produce_request.ProduceRequest;
+        const Resp = generated.produce_response.ProduceResponse;
+        const TopicResult = Resp.TopicProduceResponse;
+        const PartitionResult = TopicResult.PartitionProduceResponse;
+
+        if (!validateProduceRequestFrame(request_bytes, body_start, api_version)) {
+            log.warn("Malformed denied Produce request", .{});
+            return null;
+        }
+
+        var pos = body_start;
+        var req = Req.deserialize(self.allocator, request_bytes, &pos, api_version) catch |err| {
+            log.warn("Failed to decode denied Produce request: {}", .{err});
+            return null;
+        };
+        defer self.freeProduceRequest(&req);
+
+        // Match Produce's acks=0 wire contract: clients do not expect a response.
+        if (req.acks == 0) return null;
+
+        var responses: []TopicResult = &.{};
+        if (req.topic_data.len > 0) {
+            responses = self.allocator.alloc(TopicResult, req.topic_data.len) catch return null;
+        }
+        var responses_init: usize = 0;
+        defer {
+            self.freeProduceResponseTopics(responses[0..responses_init]);
+            if (responses.len > 0) self.allocator.free(responses);
+        }
+
+        for (req.topic_data) |topic_req| {
+            var partitions: []PartitionResult = &.{};
+            if (topic_req.partition_data.len > 0) {
+                partitions = self.allocator.alloc(PartitionResult, topic_req.partition_data.len) catch return null;
+            }
+            var transferred = false;
+            defer if (!transferred and partitions.len > 0) self.allocator.free(partitions);
+
+            for (topic_req.partition_data, 0..) |partition_req, partition_idx| {
+                partitions[partition_idx] = .{
+                    .index = partition_req.index,
+                    .error_code = @intFromEnum(err_code),
+                    .base_offset = -1,
+                    .log_append_time_ms = -1,
+                    .log_start_offset = -1,
+                    .record_errors = &.{},
+                    .error_message = "Not authorized",
+                };
+            }
+
+            responses[responses_init] = .{
+                .name = topic_req.name,
+                .partition_responses = partitions,
+            };
+            responses_init += 1;
+            transferred = true;
+        }
+
+        const resp = Resp{
+            .responses = responses[0..responses_init],
+            .throttle_time_ms = 0,
+            .node_endpoints = &.{},
+        };
+        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+    }
+
+    fn handleFetchAuthorizationError(
+        self: *Broker,
+        request_bytes: []const u8,
+        body_start: usize,
+        req_header: *const RequestHeader,
+        api_version: i16,
+        resp_header_version: i16,
+        err_code: ErrorCode,
+    ) ?[]u8 {
+        const Req = generated.fetch_request.FetchRequest;
+        const Resp = generated.fetch_response.FetchResponse;
+        const TopicResult = Resp.FetchableTopicResponse;
+        const PartitionResult = TopicResult.PartitionData;
+
+        if (!validateFetchRequestFrame(request_bytes, body_start, api_version)) {
+            log.warn("Malformed denied Fetch request", .{});
+            return null;
+        }
+
+        var pos = body_start;
+        var req = Req.deserialize(self.allocator, request_bytes, &pos, api_version) catch |err| {
+            log.warn("Failed to decode denied Fetch request: {}", .{err});
+            return null;
+        };
+        defer self.freeFetchRequest(&req);
+
+        var responses: []TopicResult = &.{};
+        if (req.topics.len > 0) {
+            responses = self.allocator.alloc(TopicResult, req.topics.len) catch return null;
+        }
+        var responses_init: usize = 0;
+        defer {
+            self.freeFetchResponseTopics(responses[0..responses_init]);
+            if (responses.len > 0) self.allocator.free(responses);
+        }
+
+        for (req.topics) |topic_req| {
+            var partitions: []PartitionResult = &.{};
+            if (topic_req.partitions.len > 0) {
+                partitions = self.allocator.alloc(PartitionResult, topic_req.partitions.len) catch return null;
+            }
+            var transferred = false;
+            defer if (!transferred and partitions.len > 0) self.allocator.free(partitions);
+
+            for (topic_req.partitions, 0..) |partition_req, partition_idx| {
+                partitions[partition_idx] = .{
+                    .partition_index = partition_req.partition,
+                    .error_code = @intFromEnum(err_code),
+                    .high_watermark = 0,
+                    .last_stable_offset = -1,
+                    .log_start_offset = -1,
+                    .aborted_transactions = null,
+                    .preferred_read_replica = -1,
+                    .records = null,
+                };
+            }
+
+            responses[responses_init] = .{
+                .topic = topic_req.topic,
+                .topic_id = if (api_version >= 13) topic_req.topic_id else zeroUuid(),
+                .partitions = partitions,
+            };
+            responses_init += 1;
+            transferred = true;
+        }
+
+        const resp = Resp{
+            .throttle_time_ms = 0,
+            .error_code = if (req.topics.len == 0) @intFromEnum(err_code) else @intFromEnum(ErrorCode.none),
+            .session_id = 0,
+            .responses = responses[0..responses_init],
+            .node_endpoints = &.{},
+        };
+        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
     }
 
     fn handleListOffsetsAuthorizationError(
@@ -4709,35 +4862,42 @@ pub const Broker = struct {
 
     /// Extract the first topic name from a Produce or Fetch request for topic-specific ACL checks.
     /// Returns null for non-topic APIs or if parsing fails.
-    fn extractTopicFromRequest(api_key: i16, request_bytes: []const u8, body_start: usize) ?[]const u8 {
+    fn extractTopicFromRequest(self: *Broker, api_key: i16, api_version: i16, request_bytes: []const u8, body_start: usize) ?[]const u8 {
         if (api_key != 0 and api_key != 1) return null; // Only Produce (0) and Fetch (1)
         var pos = body_start;
         if (api_key == 0) {
-            // Produce v0+: transactional_id (nullable string), acks (i16), timeout (i32), then topic array
-            _ = ser.readString(request_bytes, &pos) catch return null; // transactional_id
-            if (pos + 6 > request_bytes.len) return null;
-            pos += 2; // acks (i16)
-            pos += 4; // timeout_ms (i32)
-            const num_topics_opt = ser.readArrayLen(request_bytes, &pos) catch return null;
-            if (num_topics_opt) |num_topics| {
-                if (num_topics > 0) {
-                    return (ser.readString(request_bytes, &pos) catch null) orelse null;
-                }
-            }
+            const flexible = api_version >= 9;
+            if (api_version >= 3 and !skipKafkaString(request_bytes, &pos, flexible)) return null; // transactional_id
+            if (!skipFixedBytes(request_bytes, &pos, 6)) return null; // acks + timeout_ms
+
+            const topic_count = readKafkaArrayCount(request_bytes, &pos, flexible) orelse return null;
+            if (topic_count == 0) return null;
+            return if (flexible)
+                (ser.readCompactString(request_bytes, &pos) catch null) orelse null
+            else
+                (ser.readString(request_bytes, &pos) catch null) orelse null;
         } else {
-            // Fetch v0+: replica_id (i32), max_wait (i32), min_bytes (i32), then topic array
-            if (pos + 12 > request_bytes.len) return null;
-            pos += 4; // replica_id (i32)
-            pos += 4; // max_wait_ms (i32)
-            pos += 4; // min_bytes (i32)
-            const num_topics_opt = ser.readArrayLen(request_bytes, &pos) catch return null;
-            if (num_topics_opt) |num_topics| {
-                if (num_topics > 0) {
-                    return (ser.readString(request_bytes, &pos) catch null) orelse null;
-                }
+            const flexible = api_version >= 12;
+            if (api_version <= 14 and !skipFixedBytes(request_bytes, &pos, 4)) return null; // replica_id
+            if (!skipFixedBytes(request_bytes, &pos, 8)) return null; // max_wait_ms + min_bytes
+            if (api_version >= 3 and !skipFixedBytes(request_bytes, &pos, 4)) return null; // max_bytes
+            if (api_version >= 4 and !skipFixedBytes(request_bytes, &pos, 1)) return null; // isolation_level
+            if (api_version >= 7 and !skipFixedBytes(request_bytes, &pos, 8)) return null; // session_id + session_epoch
+
+            const topic_count = readKafkaArrayCount(request_bytes, &pos, flexible) orelse return null;
+            if (topic_count == 0) return null;
+            if (api_version <= 12) {
+                return if (flexible)
+                    (ser.readCompactString(request_bytes, &pos) catch null) orelse null
+                else
+                    (ser.readString(request_bytes, &pos) catch null) orelse null;
             }
+
+            if (pos > request_bytes.len or 16 > request_bytes.len - pos) return null;
+            var topic_id: [16]u8 = undefined;
+            @memcpy(&topic_id, request_bytes[pos .. pos + 16]);
+            return if (self.findTopicById(topic_id)) |topic_info| topic_info.name else null;
         }
-        return null;
     }
 
     // ---------------------------------------------------------------
@@ -18590,6 +18750,115 @@ test "Broker.handleRequest Produce v9 returns generated flexible response" {
     try testing.expectEqual(@as(i32, 0), resp.throttle_time_ms);
 }
 
+test "Broker.handleRequest Produce v9 uses exact topic ACL extraction" {
+    const Req = generated.produce_request.ProduceRequest;
+    const Topic = Req.TopicProduceData;
+    const Partition = Topic.PartitionProduceData;
+    const Resp = generated.produce_response.ProduceResponse;
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+    try broker.authorizer.addAcl("test-client", .topic, "produce-v9-acl-topic", .literal, .write, .allow, "*");
+
+    const records = "acl-records";
+    const partitions = [_]Partition{.{
+        .index = 0,
+        .records = records,
+    }};
+    const topics = [_]Topic{.{
+        .name = "produce-v9-acl-topic",
+        .partition_data = &partitions,
+    }};
+    const req = Req{
+        .transactional_id = null,
+        .acks = 1,
+        .timeout_ms = 30000,
+        .topic_data = &topics,
+    };
+
+    var buf: [512]u8 = undefined;
+    var pos = buildTestRequest(&buf, 0, 9, 310, header_mod.requestHeaderVersion(0, 9));
+    req.serialize(&buf, &pos, 9);
+
+    const response = broker.handleRequest(buf[0..pos]);
+    try testing.expect(response != null);
+    defer testing.allocator.free(response.?);
+
+    var rpos: usize = 0;
+    var response_header = try ResponseHeader.deserialize(testing.allocator, response.?, &rpos, header_mod.responseHeaderVersion(0, 9));
+    defer response_header.deinit(testing.allocator);
+    try testing.expectEqual(@as(i32, 310), response_header.correlation_id);
+
+    const resp = try Resp.deserialize(testing.allocator, response.?, &rpos, 9);
+    defer freeDeserializedProduceResponse(&resp);
+
+    try testing.expectEqual(response.?.len, rpos);
+    try testing.expectEqualStrings("produce-v9-acl-topic", resp.responses[0].name.?);
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.none)), resp.responses[0].partition_responses[0].error_code);
+}
+
+test "Broker.handleRequest Produce authorization denial uses generated response" {
+    const Req = generated.produce_request.ProduceRequest;
+    const Topic = Req.TopicProduceData;
+    const Partition = Topic.PartitionProduceData;
+    const Resp = generated.produce_response.ProduceResponse;
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+    try broker.authorizer.addAcl("other-client", .topic, "*", .literal, .write, .allow, "*");
+
+    const records = "denied-records";
+    const partitions = [_]Partition{
+        .{
+            .index = 0,
+            .records = records,
+        },
+        .{
+            .index = 1,
+            .records = records,
+        },
+    };
+    const topics = [_]Topic{.{
+        .name = "produce-denied-topic",
+        .partition_data = &partitions,
+    }};
+    const req = Req{
+        .transactional_id = null,
+        .acks = 1,
+        .timeout_ms = 30000,
+        .topic_data = &topics,
+    };
+
+    var buf: [512]u8 = undefined;
+    var pos = buildTestRequest(&buf, 0, 9, 319, header_mod.requestHeaderVersion(0, 9));
+    req.serialize(&buf, &pos, 9);
+
+    const response = broker.handleRequest(buf[0..pos]);
+    try testing.expect(response != null);
+    defer testing.allocator.free(response.?);
+
+    var rpos: usize = 0;
+    var response_header = try ResponseHeader.deserialize(testing.allocator, response.?, &rpos, header_mod.responseHeaderVersion(0, 9));
+    defer response_header.deinit(testing.allocator);
+    try testing.expectEqual(@as(i32, 319), response_header.correlation_id);
+
+    const resp = try Resp.deserialize(testing.allocator, response.?, &rpos, 9);
+    defer freeDeserializedProduceResponse(&resp);
+
+    try testing.expectEqual(response.?.len, rpos);
+    try testing.expectEqual(@as(i32, 0), resp.throttle_time_ms);
+    try testing.expectEqual(@as(usize, 1), resp.responses.len);
+    try testing.expectEqualStrings("produce-denied-topic", resp.responses[0].name.?);
+    try testing.expectEqual(@as(usize, 2), resp.responses[0].partition_responses.len);
+    try testing.expectEqual(@as(i32, 0), resp.responses[0].partition_responses[0].index);
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.topic_authorization_failed)), resp.responses[0].partition_responses[0].error_code);
+    try testing.expectEqual(@as(i64, -1), resp.responses[0].partition_responses[0].base_offset);
+    try testing.expectEqualStrings("Not authorized", resp.responses[0].partition_responses[0].error_message.?);
+    try testing.expectEqual(@as(i32, 1), resp.responses[0].partition_responses[1].index);
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.topic_authorization_failed)), resp.responses[0].partition_responses[1].error_code);
+    try testing.expect(broker.topics.get("produce-denied-topic") == null);
+}
+
 test "Broker.handleRequest Produce persists idempotent producer sequence" {
     const fs = @import("fs_compat");
     const Req = generated.produce_request.ProduceRequest;
@@ -28937,6 +29206,136 @@ test "Broker.handleRequest Fetch v12 returns generated flexible response" {
     try testing.expectEqual(committed_response.?.len, committed_rpos);
     try testing.expect(committed_resp.responses[0].partitions[0].aborted_transactions != null);
     try testing.expectEqual(@as(usize, 0), committed_resp.responses[0].partitions[0].aborted_transactions.?.len);
+}
+
+test "Broker.handleRequest Fetch v12 uses exact topic ACL extraction" {
+    const Req = generated.fetch_request.FetchRequest;
+    const Topic = Req.FetchTopic;
+    const Partition = Topic.FetchPartition;
+    const Resp = generated.fetch_response.FetchResponse;
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+    try broker.authorizer.addAcl("test-client", .topic, "fetch-v12-acl-topic", .literal, .read, .allow, "*");
+    _ = broker.store.produce("fetch-v12-acl-topic", 0, "acl-fetch-record") catch {};
+
+    const partitions = [_]Partition{.{
+        .partition = 0,
+        .current_leader_epoch = -1,
+        .fetch_offset = 0,
+        .last_fetched_epoch = -1,
+        .log_start_offset = 0,
+        .partition_max_bytes = 1048576,
+    }};
+    const topics = [_]Topic{.{
+        .topic = "fetch-v12-acl-topic",
+        .partitions = &partitions,
+    }};
+    const req = Req{
+        .replica_id = -1,
+        .max_wait_ms = 500,
+        .min_bytes = 1,
+        .max_bytes = 1048576,
+        .isolation_level = 0,
+        .session_id = 0,
+        .session_epoch = 0,
+        .topics = &topics,
+        .rack_id = "",
+    };
+
+    var buf: [512]u8 = undefined;
+    var pos = buildTestRequest(&buf, 1, 12, 116, header_mod.requestHeaderVersion(1, 12));
+    req.serialize(&buf, &pos, 12);
+
+    const response = broker.handleRequest(buf[0..pos]);
+    try testing.expect(response != null);
+    defer testing.allocator.free(response.?);
+
+    var rpos: usize = 0;
+    var response_header = try ResponseHeader.deserialize(testing.allocator, response.?, &rpos, header_mod.responseHeaderVersion(1, 12));
+    defer response_header.deinit(testing.allocator);
+    try testing.expectEqual(@as(i32, 116), response_header.correlation_id);
+
+    const resp = try Resp.deserialize(testing.allocator, response.?, &rpos, 12);
+    defer freeDeserializedFetchResponse(&resp);
+
+    try testing.expectEqual(response.?.len, rpos);
+    try testing.expectEqualStrings("fetch-v12-acl-topic", resp.responses[0].topic.?);
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.none)), resp.responses[0].partitions[0].error_code);
+    try testing.expect(resp.responses[0].partitions[0].records != null);
+}
+
+test "Broker.handleRequest Fetch authorization denial uses generated response" {
+    const Req = generated.fetch_request.FetchRequest;
+    const Topic = Req.FetchTopic;
+    const Partition = Topic.FetchPartition;
+    const Resp = generated.fetch_response.FetchResponse;
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+    try broker.authorizer.addAcl("other-client", .topic, "*", .literal, .read, .allow, "*");
+
+    const partitions = [_]Partition{
+        .{
+            .partition = 0,
+            .current_leader_epoch = -1,
+            .fetch_offset = 0,
+            .last_fetched_epoch = -1,
+            .log_start_offset = 0,
+            .partition_max_bytes = 1048576,
+        },
+        .{
+            .partition = 1,
+            .current_leader_epoch = -1,
+            .fetch_offset = 0,
+            .last_fetched_epoch = -1,
+            .log_start_offset = 0,
+            .partition_max_bytes = 1048576,
+        },
+    };
+    const topics = [_]Topic{.{
+        .topic = "fetch-denied-topic",
+        .partitions = &partitions,
+    }};
+    const req = Req{
+        .replica_id = -1,
+        .max_wait_ms = 500,
+        .min_bytes = 1,
+        .max_bytes = 1048576,
+        .isolation_level = 0,
+        .session_id = 0,
+        .session_epoch = 0,
+        .topics = &topics,
+        .rack_id = "",
+    };
+
+    var buf: [512]u8 = undefined;
+    var pos = buildTestRequest(&buf, 1, 12, 117, header_mod.requestHeaderVersion(1, 12));
+    req.serialize(&buf, &pos, 12);
+
+    const response = broker.handleRequest(buf[0..pos]);
+    try testing.expect(response != null);
+    defer testing.allocator.free(response.?);
+
+    var rpos: usize = 0;
+    var response_header = try ResponseHeader.deserialize(testing.allocator, response.?, &rpos, header_mod.responseHeaderVersion(1, 12));
+    defer response_header.deinit(testing.allocator);
+    try testing.expectEqual(@as(i32, 117), response_header.correlation_id);
+
+    const resp = try Resp.deserialize(testing.allocator, response.?, &rpos, 12);
+    defer freeDeserializedFetchResponse(&resp);
+
+    try testing.expectEqual(response.?.len, rpos);
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.none)), resp.error_code);
+    try testing.expectEqual(@as(i32, 0), resp.session_id);
+    try testing.expectEqual(@as(usize, 1), resp.responses.len);
+    try testing.expectEqualStrings("fetch-denied-topic", resp.responses[0].topic.?);
+    try testing.expectEqual(@as(usize, 2), resp.responses[0].partitions.len);
+    try testing.expectEqual(@as(i32, 0), resp.responses[0].partitions[0].partition_index);
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.topic_authorization_failed)), resp.responses[0].partitions[0].error_code);
+    try testing.expect(resp.responses[0].partitions[0].records == null);
+    try testing.expectEqual(@as(i32, 1), resp.responses[0].partitions[1].partition_index);
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.topic_authorization_failed)), resp.responses[0].partitions[1].error_code);
 }
 
 test "Broker.handleRequest Fetch rejects truncated request" {
