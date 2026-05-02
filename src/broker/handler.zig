@@ -3740,6 +3740,11 @@ pub const Broker = struct {
             72 => self.handlePushTelemetryAuthorizationError(request_bytes, body_start, req_header, api_version, resp_header_version, err_code),
             74 => self.handleListClientMetricsResourcesAuthorizationError(request_bytes, body_start, req_header, api_version, resp_header_version, err_code),
             75 => self.handleDescribeTopicPartitionsAuthorizationError(request_bytes, body_start, req_header, api_version, resp_header_version, err_code),
+            501 => self.handleCreateStreamsAuthorizationError(request_bytes, body_start, req_header, api_version, resp_header_version, err_code),
+            502 => self.handleOpenStreamsAuthorizationError(request_bytes, body_start, req_header, api_version, resp_header_version, err_code),
+            503 => self.handleCloseStreamsAuthorizationError(request_bytes, body_start, req_header, api_version, resp_header_version, err_code),
+            504 => self.handleDeleteStreamsAuthorizationError(request_bytes, body_start, req_header, api_version, resp_header_version, err_code),
+            512 => self.handleTrimStreamsAuthorizationError(request_bytes, body_start, req_header, api_version, resp_header_version, err_code),
             else => self.handleGenericAuthorizationError(req_header, resp_header_version, err_code),
         };
     }
@@ -6090,6 +6095,151 @@ pub const Broker = struct {
             .topics = topics,
             .next_cursor = null,
         };
+        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+    }
+
+    fn handleCreateStreamsAuthorizationError(
+        self: *Broker,
+        request_bytes: []const u8,
+        body_start: usize,
+        req_header: *const RequestHeader,
+        api_version: i16,
+        resp_header_version: i16,
+        err_code: ErrorCode,
+    ) ?[]u8 {
+        const Req = generated.create_streams_request.CreateStreamsRequest;
+        const Resp = generated.create_streams_response.CreateStreamsResponse;
+        const ItemResp = Resp.CreateStreamResponse;
+
+        var arena = std.heap.ArenaAllocator.init(self.allocator);
+        defer arena.deinit();
+        const req = parseGeneratedRequest(Req, arena.allocator(), request_bytes, body_start, api_version) catch |err| {
+            log.warn("Failed to decode denied CreateStreams request: {}", .{err});
+            return null;
+        };
+
+        const responses = arena.allocator().alloc(ItemResp, req.create_stream_requests.len) catch return null;
+        for (responses) |*response| {
+            response.* = .{ .error_code = @intFromEnum(err_code), .stream_id = -1 };
+        }
+
+        const resp = Resp{ .error_code = 0, .throttle_time_ms = 0, .create_stream_responses = responses };
+        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+    }
+
+    fn handleOpenStreamsAuthorizationError(
+        self: *Broker,
+        request_bytes: []const u8,
+        body_start: usize,
+        req_header: *const RequestHeader,
+        api_version: i16,
+        resp_header_version: i16,
+        err_code: ErrorCode,
+    ) ?[]u8 {
+        const Req = generated.open_streams_request.OpenStreamsRequest;
+        const Resp = generated.open_streams_response.OpenStreamsResponse;
+        const ItemResp = Resp.OpenStreamResponse;
+
+        var arena = std.heap.ArenaAllocator.init(self.allocator);
+        defer arena.deinit();
+        const req = parseGeneratedRequest(Req, arena.allocator(), request_bytes, body_start, api_version) catch |err| {
+            log.warn("Failed to decode denied OpenStreams request: {}", .{err});
+            return null;
+        };
+
+        const responses = arena.allocator().alloc(ItemResp, req.open_stream_requests.len) catch return null;
+        for (responses) |*response| {
+            response.* = .{ .error_code = @intFromEnum(err_code), .start_offset = -1, .next_offset = -1 };
+        }
+
+        const resp = Resp{ .error_code = 0, .throttle_time_ms = 0, .open_stream_responses = responses };
+        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+    }
+
+    fn handleCloseStreamsAuthorizationError(
+        self: *Broker,
+        request_bytes: []const u8,
+        body_start: usize,
+        req_header: *const RequestHeader,
+        api_version: i16,
+        resp_header_version: i16,
+        err_code: ErrorCode,
+    ) ?[]u8 {
+        const Req = generated.close_streams_request.CloseStreamsRequest;
+        const Resp = generated.close_streams_response.CloseStreamsResponse;
+        const ItemResp = Resp.CloseStreamResponse;
+
+        var arena = std.heap.ArenaAllocator.init(self.allocator);
+        defer arena.deinit();
+        const req = parseGeneratedRequest(Req, arena.allocator(), request_bytes, body_start, api_version) catch |err| {
+            log.warn("Failed to decode denied CloseStreams request: {}", .{err});
+            return null;
+        };
+
+        const responses = arena.allocator().alloc(ItemResp, req.close_stream_requests.len) catch return null;
+        for (responses) |*response| {
+            response.* = .{ .error_code = @intFromEnum(err_code) };
+        }
+
+        const resp = Resp{ .error_code = 0, .throttle_time_ms = 0, .close_stream_responses = responses };
+        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+    }
+
+    fn handleDeleteStreamsAuthorizationError(
+        self: *Broker,
+        request_bytes: []const u8,
+        body_start: usize,
+        req_header: *const RequestHeader,
+        api_version: i16,
+        resp_header_version: i16,
+        err_code: ErrorCode,
+    ) ?[]u8 {
+        const Req = generated.delete_streams_request.DeleteStreamsRequest;
+        const Resp = generated.delete_streams_response.DeleteStreamsResponse;
+        const ItemResp = Resp.DeleteStreamResponse;
+
+        var arena = std.heap.ArenaAllocator.init(self.allocator);
+        defer arena.deinit();
+        const req = parseGeneratedRequest(Req, arena.allocator(), request_bytes, body_start, api_version) catch |err| {
+            log.warn("Failed to decode denied DeleteStreams request: {}", .{err});
+            return null;
+        };
+
+        const responses = arena.allocator().alloc(ItemResp, req.delete_stream_requests.len) catch return null;
+        for (responses) |*response| {
+            response.* = .{ .error_code = @intFromEnum(err_code) };
+        }
+
+        const resp = Resp{ .error_code = 0, .throttle_time_ms = 0, .delete_stream_responses = responses };
+        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+    }
+
+    fn handleTrimStreamsAuthorizationError(
+        self: *Broker,
+        request_bytes: []const u8,
+        body_start: usize,
+        req_header: *const RequestHeader,
+        api_version: i16,
+        resp_header_version: i16,
+        err_code: ErrorCode,
+    ) ?[]u8 {
+        const Req = generated.trim_streams_request.TrimStreamsRequest;
+        const Resp = generated.trim_streams_response.TrimStreamsResponse;
+        const ItemResp = Resp.TrimStreamResponse;
+
+        var arena = std.heap.ArenaAllocator.init(self.allocator);
+        defer arena.deinit();
+        const req = parseGeneratedRequest(Req, arena.allocator(), request_bytes, body_start, api_version) catch |err| {
+            log.warn("Failed to decode denied TrimStreams request: {}", .{err});
+            return null;
+        };
+
+        const responses = arena.allocator().alloc(ItemResp, req.trim_stream_requests.len) catch return null;
+        for (responses) |*response| {
+            response.* = .{ .error_code = @intFromEnum(err_code) };
+        }
+
+        const resp = Resp{ .error_code = 0, .throttle_time_ms = 0, .trim_stream_responses = responses };
         return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
     }
 
@@ -25817,6 +25967,148 @@ test "Broker.handleRequest ListClientMetricsResources rejects truncated request"
     var buf: [128]u8 = undefined;
     const req_len = buildTestRequest(&buf, 74, 0, 7401, header_mod.requestHeaderVersion(74, 0));
     try testing.expect(broker.handleRequest(buf[0..req_len]) == null);
+}
+
+test "Broker.handleRequest AutoMQ stream lifecycle authorization denial uses generated responses" {
+    const CreateReq = generated.create_streams_request.CreateStreamsRequest;
+    const CreateResp = generated.create_streams_response.CreateStreamsResponse;
+    const OpenReq = generated.open_streams_request.OpenStreamsRequest;
+    const OpenResp = generated.open_streams_response.OpenStreamsResponse;
+    const CloseReq = generated.close_streams_request.CloseStreamsRequest;
+    const CloseResp = generated.close_streams_response.CloseStreamsResponse;
+    const DeleteReq = generated.delete_streams_request.DeleteStreamsRequest;
+    const DeleteResp = generated.delete_streams_response.DeleteStreamsResponse;
+    const TrimReq = generated.trim_streams_request.TrimStreamsRequest;
+    const TrimResp = generated.trim_streams_response.TrimStreamsResponse;
+    const denied = @as(i16, @intFromEnum(ErrorCode.cluster_authorization_failed));
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+    try broker.authorizer.addAcl("other-client", .cluster, "*", .literal, .alter, .allow, "*");
+    const stream = try broker.object_manager.createStream(1);
+    const stream_id: i64 = @intCast(stream.stream_id);
+    const initial_stream_count = broker.object_manager.streamCount();
+
+    var buf: [2048]u8 = undefined;
+    var pos = buildTestRequest(&buf, 501, 1, 5014, header_mod.requestHeaderVersion(501, 1));
+    const create_items = [_]CreateReq.CreateStreamRequest{
+        .{ .node_id = 1, .tags = &.{} },
+        .{ .node_id = 2, .tags = &.{} },
+    };
+    const create_req = CreateReq{ .node_id = 1, .node_epoch = 1, .create_stream_requests = &create_items };
+    create_req.serialize(&buf, &pos, 1);
+
+    const response = broker.handleRequest(buf[0..pos]);
+    try testing.expect(response != null);
+    defer testing.allocator.free(response.?);
+
+    var rpos: usize = 0;
+    var create_header = try ResponseHeader.deserialize(testing.allocator, response.?, &rpos, header_mod.responseHeaderVersion(501, 1));
+    defer create_header.deinit(testing.allocator);
+    try testing.expectEqual(@as(i32, 5014), create_header.correlation_id);
+    const create_resp = try CreateResp.deserialize(testing.allocator, response.?, &rpos, 1);
+    defer if (create_resp.create_stream_responses.len > 0) testing.allocator.free(create_resp.create_stream_responses);
+
+    try testing.expectEqual(response.?.len, rpos);
+    try testing.expectEqual(@as(i16, 0), create_resp.error_code);
+    try testing.expectEqual(@as(usize, 2), create_resp.create_stream_responses.len);
+    for (create_resp.create_stream_responses) |item| {
+        try testing.expectEqual(denied, item.error_code);
+        try testing.expectEqual(@as(i64, -1), item.stream_id);
+    }
+    try testing.expectEqual(initial_stream_count, broker.object_manager.streamCount());
+
+    pos = buildTestRequest(&buf, 502, 1, 5024, header_mod.requestHeaderVersion(502, 1));
+    const open_items = [_]OpenReq.OpenStreamRequest{
+        .{ .stream_id = stream_id, .stream_epoch = 2, .tags = &.{} },
+    };
+    const open_req = OpenReq{ .node_id = 1, .node_epoch = 1, .open_stream_requests = &open_items };
+    open_req.serialize(&buf, &pos, 1);
+
+    const open_response = broker.handleRequest(buf[0..pos]);
+    try testing.expect(open_response != null);
+    defer testing.allocator.free(open_response.?);
+
+    rpos = 0;
+    var open_header = try ResponseHeader.deserialize(testing.allocator, open_response.?, &rpos, header_mod.responseHeaderVersion(502, 1));
+    defer open_header.deinit(testing.allocator);
+    try testing.expectEqual(@as(i32, 5024), open_header.correlation_id);
+    const open_resp = try OpenResp.deserialize(testing.allocator, open_response.?, &rpos, 1);
+    defer if (open_resp.open_stream_responses.len > 0) testing.allocator.free(open_resp.open_stream_responses);
+
+    try testing.expectEqual(open_response.?.len, rpos);
+    try testing.expectEqual(@as(i16, 0), open_resp.error_code);
+    try testing.expectEqual(@as(usize, 1), open_resp.open_stream_responses.len);
+    try testing.expectEqual(denied, open_resp.open_stream_responses[0].error_code);
+    try testing.expectEqual(@as(i64, -1), open_resp.open_stream_responses[0].start_offset);
+    try testing.expectEqual(@as(i64, -1), open_resp.open_stream_responses[0].next_offset);
+    try testing.expectEqual(@as(u64, 1), broker.object_manager.getStream(@intCast(stream_id)).?.epoch);
+
+    pos = buildTestRequest(&buf, 503, 0, 5034, header_mod.requestHeaderVersion(503, 0));
+    const close_items = [_]CloseReq.CloseStreamRequest{.{ .stream_id = stream_id, .stream_epoch = 1 }};
+    const close_req = CloseReq{ .node_id = 1, .node_epoch = 1, .close_stream_requests = &close_items };
+    close_req.serialize(&buf, &pos, 0);
+
+    const close_response = broker.handleRequest(buf[0..pos]);
+    try testing.expect(close_response != null);
+    defer testing.allocator.free(close_response.?);
+
+    rpos = 0;
+    var close_header = try ResponseHeader.deserialize(testing.allocator, close_response.?, &rpos, header_mod.responseHeaderVersion(503, 0));
+    defer close_header.deinit(testing.allocator);
+    try testing.expectEqual(@as(i32, 5034), close_header.correlation_id);
+    const close_resp = try CloseResp.deserialize(testing.allocator, close_response.?, &rpos, 0);
+    defer if (close_resp.close_stream_responses.len > 0) testing.allocator.free(close_resp.close_stream_responses);
+
+    try testing.expectEqual(close_response.?.len, rpos);
+    try testing.expectEqual(@as(i16, 0), close_resp.error_code);
+    try testing.expectEqual(@as(usize, 1), close_resp.close_stream_responses.len);
+    try testing.expectEqual(denied, close_resp.close_stream_responses[0].error_code);
+    try testing.expectEqual(storage.stream.StreamState.opened, broker.object_manager.getStream(@intCast(stream_id)).?.state);
+
+    pos = buildTestRequest(&buf, 504, 0, 5044, header_mod.requestHeaderVersion(504, 0));
+    const delete_items = [_]DeleteReq.DeleteStreamRequest{.{ .stream_id = stream_id, .stream_epoch = 1 }};
+    const delete_req = DeleteReq{ .node_id = 1, .node_epoch = 1, .delete_stream_requests = &delete_items };
+    delete_req.serialize(&buf, &pos, 0);
+
+    const delete_response = broker.handleRequest(buf[0..pos]);
+    try testing.expect(delete_response != null);
+    defer testing.allocator.free(delete_response.?);
+
+    rpos = 0;
+    var delete_header = try ResponseHeader.deserialize(testing.allocator, delete_response.?, &rpos, header_mod.responseHeaderVersion(504, 0));
+    defer delete_header.deinit(testing.allocator);
+    try testing.expectEqual(@as(i32, 5044), delete_header.correlation_id);
+    const delete_resp = try DeleteResp.deserialize(testing.allocator, delete_response.?, &rpos, 0);
+    defer if (delete_resp.delete_stream_responses.len > 0) testing.allocator.free(delete_resp.delete_stream_responses);
+
+    try testing.expectEqual(delete_response.?.len, rpos);
+    try testing.expectEqual(@as(i16, 0), delete_resp.error_code);
+    try testing.expectEqual(@as(usize, 1), delete_resp.delete_stream_responses.len);
+    try testing.expectEqual(denied, delete_resp.delete_stream_responses[0].error_code);
+    try testing.expectEqual(initial_stream_count, broker.object_manager.streamCount());
+
+    pos = buildTestRequest(&buf, 512, 0, 5124, header_mod.requestHeaderVersion(512, 0));
+    const trim_items = [_]TrimReq.TrimStreamRequest{.{ .stream_id = stream_id, .stream_epoch = 1, .new_start_offset = 7 }};
+    const trim_req = TrimReq{ .node_id = 1, .node_epoch = 1, .trim_stream_requests = &trim_items };
+    trim_req.serialize(&buf, &pos, 0);
+
+    const trim_response = broker.handleRequest(buf[0..pos]);
+    try testing.expect(trim_response != null);
+    defer testing.allocator.free(trim_response.?);
+
+    rpos = 0;
+    var trim_header = try ResponseHeader.deserialize(testing.allocator, trim_response.?, &rpos, header_mod.responseHeaderVersion(512, 0));
+    defer trim_header.deinit(testing.allocator);
+    try testing.expectEqual(@as(i32, 5124), trim_header.correlation_id);
+    const trim_resp = try TrimResp.deserialize(testing.allocator, trim_response.?, &rpos, 0);
+    defer if (trim_resp.trim_stream_responses.len > 0) testing.allocator.free(trim_resp.trim_stream_responses);
+
+    try testing.expectEqual(trim_response.?.len, rpos);
+    try testing.expectEqual(@as(i16, 0), trim_resp.error_code);
+    try testing.expectEqual(@as(usize, 1), trim_resp.trim_stream_responses.len);
+    try testing.expectEqual(denied, trim_resp.trim_stream_responses[0].error_code);
+    try testing.expectEqual(@as(u64, 0), broker.object_manager.getStream(@intCast(stream_id)).?.start_offset);
 }
 
 test "Broker AutoMQ stream object lifecycle APIs" {
