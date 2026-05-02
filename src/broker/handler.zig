@@ -18535,7 +18535,7 @@ pub const Broker = struct {
         if (api_version >= 8 and api_version <= 10 and !skipFixedBytes(buf, &pos, 1)) return false; // include_cluster_authorized_operations
         if (api_version >= 8 and !skipFixedBytes(buf, &pos, 1)) return false; // include_topic_authorized_operations
         if (flexible) ser.skipTaggedFields(buf, &pos) catch return false;
-        return true;
+        return pos == buf.len;
     }
 
     fn validateProduceRequestFrame(buf: []const u8, start_pos: usize, api_version: i16) bool {
@@ -20707,6 +20707,29 @@ test "Broker.handleRequest Metadata rejects truncated request" {
     var buf: [128]u8 = undefined;
     const req_len = buildTestRequest(&buf, 3, 12, 313, header_mod.requestHeaderVersion(3, 12));
     try testing.expect(broker.handleRequest(buf[0..req_len]) == null);
+}
+
+test "Broker.handleRequest Metadata rejects trailing bytes" {
+    const Req = generated.metadata_request.MetadataRequest;
+    const Topic = Req.MetadataRequestTopic;
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+
+    const topics = [_]Topic{.{
+        .name = "metadata-trailing-topic",
+    }};
+    const req = Req{
+        .topics = &topics,
+        .allow_auto_topic_creation = false,
+        .include_topic_authorized_operations = true,
+    };
+
+    var buf: [512]u8 = undefined;
+    var pos = buildTestRequest(&buf, 3, 12, 315, header_mod.requestHeaderVersion(3, 12));
+    req.serialize(&buf, &pos, 12);
+
+    try expectTrailingByteRejected(&broker, &buf, pos);
 }
 
 test "Broker.handleRequest unsupported API returns error response" {
