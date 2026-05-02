@@ -170,7 +170,8 @@ Status: completed for the initial catalog and DeleteGroups slice.
   conflicts to KIP-848 `FENCED_MEMBER_EPOCH`/`UNRELEASED_INSTANCE_ID` errors.
   AssignReplicasToDirs key 73 remains non-advertised until JBOD directory
   semantics exist, but direct requests now validate/decode generated flexible
-  frames and return generated fail-closed responses.
+  frames and return generated fail-closed responses, including requested
+  directory/topic/partition entries with per-partition errors.
   ShareFetch and ShareAcknowledge remain non-advertised until share sessions
   exist, but direct v0 probes now fail closed with request-scoped topic and
   partition response entries instead of dropping the requested partition shape.

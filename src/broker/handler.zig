@@ -14958,12 +14958,86 @@ pub const Broker = struct {
         };
         defer self.freeAssignReplicasToDirsRequest(&req);
 
+        const directories = self.buildAssignReplicasToDirsFailClosedDirectories(req) catch return null;
+        defer self.freeAssignReplicasToDirsDirectories(directories);
+
         const resp = Resp{
             .throttle_time_ms = 0,
             .error_code = ErrorCode.unsupported_version.toInt(),
-            .directories = &.{},
+            .directories = directories,
         };
         return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+    }
+
+    fn buildAssignReplicasToDirsFailClosedDirectories(
+        self: *Broker,
+        req: generated.assign_replicas_to_dirs_request.AssignReplicasToDirsRequest,
+    ) ![]generated.assign_replicas_to_dirs_response.AssignReplicasToDirsResponse.DirectoryData {
+        const DirectoryData = generated.assign_replicas_to_dirs_response.AssignReplicasToDirsResponse.DirectoryData;
+        const TopicData = DirectoryData.TopicData;
+        const PartitionData = TopicData.PartitionData;
+
+        if (req.directories.len == 0) return &.{};
+
+        const directories = try self.allocator.alloc(DirectoryData, req.directories.len);
+        var directories_init: usize = 0;
+        errdefer {
+            self.freeAssignReplicasToDirsDirectoryChildren(directories[0..directories_init]);
+            self.allocator.free(directories);
+        }
+
+        for (req.directories) |directory| {
+            const topics = try self.allocator.alloc(TopicData, directory.topics.len);
+            var topics_init: usize = 0;
+            errdefer {
+                self.freeAssignReplicasToDirsTopicPartitions(topics[0..topics_init]);
+                self.allocator.free(topics);
+            }
+
+            for (directory.topics) |topic| {
+                const partitions = try self.allocator.alloc(PartitionData, topic.partitions.len);
+                errdefer self.allocator.free(partitions);
+
+                for (topic.partitions, 0..) |partition, idx| {
+                    partitions[idx] = .{
+                        .partition_index = partition.partition_index,
+                        .error_code = ErrorCode.unsupported_version.toInt(),
+                    };
+                }
+
+                topics[topics_init] = .{
+                    .topic_id = topic.topic_id,
+                    .partitions = partitions,
+                };
+                topics_init += 1;
+            }
+
+            directories[directories_init] = .{
+                .id = directory.id,
+                .topics = topics,
+            };
+            directories_init += 1;
+        }
+
+        return directories;
+    }
+
+    fn freeAssignReplicasToDirsDirectories(self: *Broker, directories: []const generated.assign_replicas_to_dirs_response.AssignReplicasToDirsResponse.DirectoryData) void {
+        self.freeAssignReplicasToDirsDirectoryChildren(directories);
+        if (directories.len > 0) self.allocator.free(directories);
+    }
+
+    fn freeAssignReplicasToDirsDirectoryChildren(self: *Broker, directories: []const generated.assign_replicas_to_dirs_response.AssignReplicasToDirsResponse.DirectoryData) void {
+        for (directories) |directory| {
+            self.freeAssignReplicasToDirsTopicPartitions(directory.topics);
+            if (directory.topics.len > 0) self.allocator.free(directory.topics);
+        }
+    }
+
+    fn freeAssignReplicasToDirsTopicPartitions(self: *Broker, topics: []const generated.assign_replicas_to_dirs_response.AssignReplicasToDirsResponse.DirectoryData.TopicData) void {
+        for (topics) |topic| {
+            if (topic.partitions.len > 0) self.allocator.free(topic.partitions);
+        }
     }
 
     fn freeAssignReplicasToDirsRequest(self: *Broker, req: *generated.assign_replicas_to_dirs_request.AssignReplicasToDirsRequest) void {
@@ -26961,14 +27035,30 @@ test "Broker.handleRequest PushTelemetry rejects truncated request" {
 test "Broker.handleRequest AssignReplicasToDirs returns generated fail-closed response" {
     const Req = generated.assign_replicas_to_dirs_request.AssignReplicasToDirsRequest;
     const Resp = generated.assign_replicas_to_dirs_response.AssignReplicasToDirsResponse;
+    const DirectoryData = Req.DirectoryData;
+    const TopicData = DirectoryData.TopicData;
+    const PartitionData = TopicData.PartitionData;
 
     var broker = Broker.init(testing.allocator, 1, 9092);
     defer broker.deinit();
 
+    const directory_id = [_]u8{7} ** 16;
+    const topic_id = [_]u8{8} ** 16;
+    const partitions = [_]PartitionData{.{
+        .partition_index = 3,
+    }};
+    const topics = [_]TopicData{.{
+        .topic_id = topic_id,
+        .partitions = &partitions,
+    }};
+    const directories = [_]DirectoryData{.{
+        .id = directory_id,
+        .topics = &topics,
+    }};
     const req = Req{
         .broker_id = 1,
         .broker_epoch = 1,
-        .directories = &.{},
+        .directories = &directories,
     };
 
     var buf: [256]u8 = undefined;
@@ -26985,12 +27075,26 @@ test "Broker.handleRequest AssignReplicasToDirs returns generated fail-closed re
     try testing.expectEqual(@as(i32, 7300), response_header.correlation_id);
 
     const resp = try Resp.deserialize(testing.allocator, response.?, &rpos, 0);
-    defer if (resp.directories.len > 0) testing.allocator.free(resp.directories);
+    defer {
+        for (resp.directories) |directory| {
+            for (directory.topics) |topic| {
+                if (topic.partitions.len > 0) testing.allocator.free(topic.partitions);
+            }
+            if (directory.topics.len > 0) testing.allocator.free(directory.topics);
+        }
+        if (resp.directories.len > 0) testing.allocator.free(resp.directories);
+    }
 
     try testing.expectEqual(response.?.len, rpos);
     try testing.expectEqual(@as(i32, 0), resp.throttle_time_ms);
     try testing.expectEqual(ErrorCode.unsupported_version.toInt(), resp.error_code);
-    try testing.expectEqual(@as(usize, 0), resp.directories.len);
+    try testing.expectEqual(@as(usize, 1), resp.directories.len);
+    try testing.expectEqualSlices(u8, directory_id[0..], resp.directories[0].id[0..]);
+    try testing.expectEqual(@as(usize, 1), resp.directories[0].topics.len);
+    try testing.expectEqualSlices(u8, topic_id[0..], resp.directories[0].topics[0].topic_id[0..]);
+    try testing.expectEqual(@as(usize, 1), resp.directories[0].topics[0].partitions.len);
+    try testing.expectEqual(@as(i32, 3), resp.directories[0].topics[0].partitions[0].partition_index);
+    try testing.expectEqual(ErrorCode.unsupported_version.toInt(), resp.directories[0].topics[0].partitions[0].error_code);
 }
 
 test "Broker.handleRequest AssignReplicasToDirs rejects malformed request" {
