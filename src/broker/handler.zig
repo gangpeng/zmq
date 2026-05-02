@@ -3577,6 +3577,7 @@ pub const Broker = struct {
         if (api_key == 8) return 0; // OffsetCommit errors are partition scoped, not at a fixed top-level offset.
         if (api_key == 9) return 0; // OffsetFetch errors are topic/group scoped, not at a fixed top-level offset.
         if (api_key == 10 and api_version >= 4) return 0; // FindCoordinator v4+ has coordinator-scoped errors.
+        if (api_key == 42) return 0; // DeleteGroups errors are per requested group.
         if (api_key == 69) return 0; // ConsumerGroupDescribe errors are per described group.
 
         // APIs with throttle_time_ms before error_code
@@ -3706,6 +3707,8 @@ pub const Broker = struct {
             29 => self.handleDescribeAclsAuthorizationError(req_header, api_version, resp_header_version, err_code),
             30 => self.handleCreateAclsAuthorizationError(request_bytes, body_start, req_header, api_version, resp_header_version, err_code),
             31 => self.handleDeleteAclsAuthorizationError(request_bytes, body_start, req_header, api_version, resp_header_version, err_code),
+            42 => self.handleDeleteGroupsAuthorizationError(request_bytes, body_start, req_header, api_version, resp_header_version, err_code),
+            47 => self.handleOffsetDeleteAuthorizationError(request_bytes, body_start, req_header, api_version, resp_header_version, err_code),
             55 => self.handleDescribeQuorumAuthorizationError(req_header, api_version, resp_header_version, err_code),
             60 => self.handleDescribeClusterAuthorizationError(req_header, api_version, resp_header_version, err_code),
             61 => self.handleDescribeProducersAuthorizationError(request_bytes, body_start, req_header, api_version, resp_header_version, err_code),
@@ -4053,6 +4056,118 @@ pub const Broker = struct {
             .throttle_time_ms = 0,
             .topics = topics,
             .error_code = @intFromEnum(err_code),
+        };
+        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+    }
+
+    fn handleDeleteGroupsAuthorizationError(
+        self: *Broker,
+        request_bytes: []const u8,
+        body_start: usize,
+        req_header: *const RequestHeader,
+        api_version: i16,
+        resp_header_version: i16,
+        err_code: ErrorCode,
+    ) ?[]u8 {
+        const Req = generated.delete_groups_request.DeleteGroupsRequest;
+        const Resp = generated.delete_groups_response.DeleteGroupsResponse;
+        const Result = Resp.DeletableGroupResult;
+
+        if (!validateDeleteGroupsRequestFrame(request_bytes, body_start, api_version)) {
+            log.warn("Malformed denied DeleteGroups request", .{});
+            return null;
+        }
+
+        var pos = body_start;
+        const req = Req.deserialize(self.allocator, request_bytes, &pos, api_version) catch |err| {
+            log.warn("Failed to decode denied DeleteGroups request: {}", .{err});
+            return null;
+        };
+        defer if (req.groups_names.len > 0) self.allocator.free(req.groups_names);
+
+        var results: []Result = &.{};
+        if (req.groups_names.len > 0) {
+            results = self.allocator.alloc(Result, req.groups_names.len) catch return null;
+        }
+        defer if (results.len > 0) self.allocator.free(results);
+
+        for (req.groups_names, 0..) |group_id, idx| {
+            results[idx] = .{
+                .group_id = group_id,
+                .error_code = @intFromEnum(err_code),
+            };
+        }
+
+        const resp = Resp{
+            .throttle_time_ms = 0,
+            .results = results,
+        };
+        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+    }
+
+    fn handleOffsetDeleteAuthorizationError(
+        self: *Broker,
+        request_bytes: []const u8,
+        body_start: usize,
+        req_header: *const RequestHeader,
+        api_version: i16,
+        resp_header_version: i16,
+        err_code: ErrorCode,
+    ) ?[]u8 {
+        const Req = generated.offset_delete_request.OffsetDeleteRequest;
+        const Resp = generated.offset_delete_response.OffsetDeleteResponse;
+        const TopicResult = Resp.OffsetDeleteResponseTopic;
+        const PartitionResult = TopicResult.OffsetDeleteResponsePartition;
+
+        if (!validateOffsetDeleteRequestFrame(request_bytes, body_start)) {
+            log.warn("Malformed denied OffsetDelete request", .{});
+            return null;
+        }
+
+        var pos = body_start;
+        var req = Req.deserialize(self.allocator, request_bytes, &pos, api_version) catch |err| {
+            log.warn("Failed to decode denied OffsetDelete request: {}", .{err});
+            return null;
+        };
+        defer self.freeOffsetDeleteRequest(&req);
+
+        var topics: []TopicResult = &.{};
+        if (req.topics.len > 0) {
+            topics = self.allocator.alloc(TopicResult, req.topics.len) catch return null;
+        }
+        var topics_init: usize = 0;
+        defer {
+            self.freeOffsetDeleteResponseTopics(topics[0..topics_init]);
+            if (topics.len > 0) self.allocator.free(topics);
+        }
+
+        for (req.topics) |topic_req| {
+            var partitions: []PartitionResult = &.{};
+            if (topic_req.partitions.len > 0) {
+                partitions = self.allocator.alloc(PartitionResult, topic_req.partitions.len) catch return null;
+            }
+            var transferred = false;
+            defer if (!transferred and partitions.len > 0) self.allocator.free(partitions);
+
+            for (topic_req.partitions, 0..) |partition_req, partition_idx| {
+                partitions[partition_idx] = .{
+                    .partition_index = partition_req.partition_index,
+                    .error_code = @intFromEnum(err_code),
+                };
+            }
+
+            topics[topics_init] = .{
+                .name = topic_req.name,
+                .partitions = partitions,
+            };
+            topics_init += 1;
+            transferred = true;
+        }
+
+        const resp = Resp{
+            .error_code = @intFromEnum(err_code),
+            .throttle_time_ms = 0,
+            .topics = topics[0..topics_init],
         };
         return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
     }
@@ -15571,6 +15686,18 @@ pub const Broker = struct {
         return true;
     }
 
+    fn validateDeleteGroupsRequestFrame(buf: []const u8, start_pos: usize, api_version: i16) bool {
+        const flexible = api_version >= 2;
+        var pos = start_pos;
+
+        const group_count = readKafkaArrayCount(buf, &pos, flexible) orelse return false;
+        for (0..group_count) |_| {
+            if (!skipKafkaString(buf, &pos, flexible)) return false; // group_id
+        }
+        if (flexible) ser.skipTaggedFields(buf, &pos) catch return false;
+        return true;
+    }
+
     fn validateDescribeClientQuotasRequestFrame(buf: []const u8, start_pos: usize, api_version: i16) bool {
         const flexible = api_version >= 1;
         var pos = start_pos;
@@ -18972,6 +19099,47 @@ test "Broker.handleRequest DeleteGroups v2 reports group lifecycle errors" {
     try testing.expectEqual(@as(usize, 1), broker.groups.groupCount());
 }
 
+test "Broker.handleRequest DeleteGroups authorization denial uses generated response" {
+    const Req = generated.delete_groups_request.DeleteGroupsRequest;
+    const Resp = generated.delete_groups_response.DeleteGroupsResponse;
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+    try broker.authorizer.addAcl("other-client", .group, "*", .literal, .delete, .allow, "*");
+
+    const joined = try broker.groups.joinGroup("delete-denied-existing", null, "consumer", null);
+    try testing.expectEqual(@as(i16, 0), broker.groups.leaveGroup("delete-denied-existing", joined.member_id));
+    try testing.expectEqual(@as(usize, 1), broker.groups.groupCount());
+
+    const group_names = [_]?[]const u8{ "delete-denied-existing", "delete-denied-missing" };
+    const req = Req{ .groups_names = &group_names };
+
+    var buf: [512]u8 = undefined;
+    var pos = buildTestRequest(&buf, 42, 2, 4206, header_mod.requestHeaderVersion(42, 2));
+    req.serialize(&buf, &pos, 2);
+
+    const response = broker.handleRequest(buf[0..pos]);
+    try testing.expect(response != null);
+    defer testing.allocator.free(response.?);
+
+    var rpos: usize = 0;
+    var response_header = try ResponseHeader.deserialize(testing.allocator, response.?, &rpos, header_mod.responseHeaderVersion(42, 2));
+    defer response_header.deinit(testing.allocator);
+    try testing.expectEqual(@as(i32, 4206), response_header.correlation_id);
+
+    const resp = try Resp.deserialize(testing.allocator, response.?, &rpos, 2);
+    defer if (resp.results.len > 0) testing.allocator.free(resp.results);
+
+    try testing.expectEqual(response.?.len, rpos);
+    try testing.expectEqual(@as(i32, 0), resp.throttle_time_ms);
+    try testing.expectEqual(@as(usize, 2), resp.results.len);
+    try testing.expectEqualStrings("delete-denied-existing", resp.results[0].group_id.?);
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.group_authorization_failed)), resp.results[0].error_code);
+    try testing.expectEqualStrings("delete-denied-missing", resp.results[1].group_id.?);
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.group_authorization_failed)), resp.results[1].error_code);
+    try testing.expectEqual(@as(usize, 1), broker.groups.groupCount());
+}
+
 test "Broker.handleRequest DeleteGroups persists removed offsets" {
     const fs = @import("fs_compat");
 
@@ -22218,6 +22386,64 @@ test "Broker.handleRequest OffsetDelete rejects truncated request" {
     var buf: [128]u8 = undefined;
     const req_len = buildTestRequest(&buf, 47, 0, 4701, header_mod.requestHeaderVersion(47, 0));
     try testing.expect(broker.handleRequest(buf[0..req_len]) == null);
+}
+
+test "Broker.handleRequest OffsetDelete authorization denial uses generated response" {
+    const Req = generated.offset_delete_request.OffsetDeleteRequest;
+    const Resp = generated.offset_delete_response.OffsetDeleteResponse;
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+    try broker.authorizer.addAcl("other-client", .group, "*", .literal, .delete, .allow, "*");
+
+    try testing.expect(broker.ensureTopic("offset-delete-denied-topic"));
+    try broker.groups.commitOffset("offset-delete-denied-group", "offset-delete-denied-topic", 0, 55);
+
+    const partitions = [_]Req.OffsetDeleteRequestTopic.OffsetDeleteRequestPartition{
+        .{ .partition_index = 0 },
+        .{ .partition_index = 1 },
+    };
+    const topics = [_]Req.OffsetDeleteRequestTopic{.{
+        .name = "offset-delete-denied-topic",
+        .partitions = &partitions,
+    }};
+    const req = Req{
+        .group_id = "offset-delete-denied-group",
+        .topics = &topics,
+    };
+
+    var buf: [512]u8 = undefined;
+    var pos = buildTestRequest(&buf, 47, 0, 4708, header_mod.requestHeaderVersion(47, 0));
+    req.serialize(&buf, &pos, 0);
+
+    const response = broker.handleRequest(buf[0..pos]);
+    try testing.expect(response != null);
+    defer testing.allocator.free(response.?);
+
+    var rpos: usize = 0;
+    var response_header = try ResponseHeader.deserialize(testing.allocator, response.?, &rpos, header_mod.responseHeaderVersion(47, 0));
+    defer response_header.deinit(testing.allocator);
+    try testing.expectEqual(@as(i32, 4708), response_header.correlation_id);
+
+    const resp = try Resp.deserialize(testing.allocator, response.?, &rpos, 0);
+    defer {
+        for (resp.topics) |topic| {
+            if (topic.partitions.len > 0) testing.allocator.free(topic.partitions);
+        }
+        if (resp.topics.len > 0) testing.allocator.free(resp.topics);
+    }
+
+    try testing.expectEqual(response.?.len, rpos);
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.group_authorization_failed)), resp.error_code);
+    try testing.expectEqual(@as(i32, 0), resp.throttle_time_ms);
+    try testing.expectEqual(@as(usize, 1), resp.topics.len);
+    try testing.expectEqualStrings("offset-delete-denied-topic", resp.topics[0].name.?);
+    try testing.expectEqual(@as(usize, 2), resp.topics[0].partitions.len);
+    try testing.expectEqual(@as(i32, 0), resp.topics[0].partitions[0].partition_index);
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.group_authorization_failed)), resp.topics[0].partitions[0].error_code);
+    try testing.expectEqual(@as(i32, 1), resp.topics[0].partitions[1].partition_index);
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.group_authorization_failed)), resp.topics[0].partitions[1].error_code);
+    try testing.expectEqual(@as(?i64, 55), try broker.groups.fetchOffset("offset-delete-denied-group", "offset-delete-denied-topic", 0));
 }
 
 test "Broker.handleRequest DescribeClientQuotas v0 returns configured client quotas" {
