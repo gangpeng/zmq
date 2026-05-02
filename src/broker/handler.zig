@@ -3726,7 +3726,11 @@ pub const Broker = struct {
             49 => self.handleAlterClientQuotasAuthorizationError(request_bytes, body_start, req_header, api_version, resp_header_version, err_code),
             50 => self.handleDescribeUserScramCredentialsAuthorizationError(request_bytes, body_start, req_header, api_version, resp_header_version, err_code),
             51 => self.handleAlterUserScramCredentialsAuthorizationError(request_bytes, body_start, req_header, api_version, resp_header_version, err_code),
+            52 => self.handleVoteAuthorizationError(request_bytes, body_start, req_header, api_version, resp_header_version, err_code),
+            53 => self.handleBeginQuorumEpochAuthorizationError(request_bytes, body_start, req_header, api_version, resp_header_version, err_code),
+            54 => self.handleEndQuorumEpochAuthorizationError(request_bytes, body_start, req_header, api_version, resp_header_version, err_code),
             55 => self.handleDescribeQuorumAuthorizationError(req_header, api_version, resp_header_version, err_code),
+            57 => self.handleUpdateFeaturesAuthorizationError(request_bytes, body_start, req_header, api_version, resp_header_version, err_code),
             60 => self.handleDescribeClusterAuthorizationError(req_header, api_version, resp_header_version, err_code),
             61 => self.handleDescribeProducersAuthorizationError(request_bytes, body_start, req_header, api_version, resp_header_version, err_code),
             66 => self.handleListTransactionsAuthorizationError(req_header, api_version, resp_header_version, err_code),
@@ -5432,6 +5436,268 @@ pub const Broker = struct {
 
         const resp = Resp{
             .throttle_time_ms = 0,
+            .results = results,
+        };
+        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+    }
+
+    fn handleVoteAuthorizationError(
+        self: *Broker,
+        request_bytes: []const u8,
+        body_start: usize,
+        req_header: *const RequestHeader,
+        api_version: i16,
+        resp_header_version: i16,
+        err_code: ErrorCode,
+    ) ?[]u8 {
+        const Req = generated.vote_request.VoteRequest;
+        const Resp = generated.vote_response.VoteResponse;
+        const TopicResult = Resp.TopicData;
+        const PartitionResult = TopicResult.PartitionData;
+
+        if (!validateVoteRequestFrame(request_bytes, body_start, api_version)) {
+            log.warn("Malformed denied Vote request", .{});
+            return null;
+        }
+
+        var pos = body_start;
+        var req = Req.deserialize(self.allocator, request_bytes, &pos, api_version) catch |err| {
+            log.warn("Failed to decode denied Vote request: {}", .{err});
+            return null;
+        };
+        defer self.freeVoteRequest(&req);
+
+        var topics: []TopicResult = &.{};
+        var topics_init: usize = 0;
+        if (req.topics.len > 0) {
+            topics = self.allocator.alloc(TopicResult, req.topics.len) catch return null;
+        }
+        defer {
+            for (topics[0..topics_init]) |topic| {
+                if (topic.partitions.len > 0) self.allocator.free(topic.partitions);
+            }
+            if (topics.len > 0) self.allocator.free(topics);
+        }
+
+        for (req.topics) |topic| {
+            var partitions: []PartitionResult = &.{};
+            if (topic.partitions.len > 0) {
+                partitions = self.allocator.alloc(PartitionResult, topic.partitions.len) catch return null;
+            }
+            var transferred = false;
+            defer if (!transferred and partitions.len > 0) self.allocator.free(partitions);
+
+            for (topic.partitions, 0..) |partition, idx| {
+                partitions[idx] = .{
+                    .partition_index = partition.partition_index,
+                    .error_code = @intFromEnum(err_code),
+                    .leader_id = -1,
+                    .leader_epoch = -1,
+                    .vote_granted = false,
+                };
+            }
+
+            topics[topics_init] = .{
+                .topic_name = topic.topic_name,
+                .partitions = partitions,
+            };
+            topics_init += 1;
+            transferred = true;
+        }
+
+        const resp = Resp{
+            .error_code = @intFromEnum(err_code),
+            .topics = topics[0..topics_init],
+            .node_endpoints = &.{},
+        };
+        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+    }
+
+    fn handleBeginQuorumEpochAuthorizationError(
+        self: *Broker,
+        request_bytes: []const u8,
+        body_start: usize,
+        req_header: *const RequestHeader,
+        api_version: i16,
+        resp_header_version: i16,
+        err_code: ErrorCode,
+    ) ?[]u8 {
+        const Req = generated.begin_quorum_epoch_request.BeginQuorumEpochRequest;
+        const Resp = generated.begin_quorum_epoch_response.BeginQuorumEpochResponse;
+        const TopicResult = Resp.TopicData;
+        const PartitionResult = TopicResult.PartitionData;
+
+        if (!validateBeginQuorumEpochRequestFrame(request_bytes, body_start, api_version)) {
+            log.warn("Malformed denied BeginQuorumEpoch request", .{});
+            return null;
+        }
+
+        var pos = body_start;
+        var req = Req.deserialize(self.allocator, request_bytes, &pos, api_version) catch |err| {
+            log.warn("Failed to decode denied BeginQuorumEpoch request: {}", .{err});
+            return null;
+        };
+        defer self.freeBeginQuorumEpochRequest(&req);
+
+        var topics: []TopicResult = &.{};
+        var topics_init: usize = 0;
+        if (req.topics.len > 0) {
+            topics = self.allocator.alloc(TopicResult, req.topics.len) catch return null;
+        }
+        defer {
+            for (topics[0..topics_init]) |topic| {
+                if (topic.partitions.len > 0) self.allocator.free(topic.partitions);
+            }
+            if (topics.len > 0) self.allocator.free(topics);
+        }
+
+        for (req.topics) |topic| {
+            var partitions: []PartitionResult = &.{};
+            if (topic.partitions.len > 0) {
+                partitions = self.allocator.alloc(PartitionResult, topic.partitions.len) catch return null;
+            }
+            var transferred = false;
+            defer if (!transferred and partitions.len > 0) self.allocator.free(partitions);
+
+            for (topic.partitions, 0..) |partition, idx| {
+                partitions[idx] = .{
+                    .partition_index = partition.partition_index,
+                    .error_code = @intFromEnum(err_code),
+                    .leader_id = -1,
+                    .leader_epoch = -1,
+                };
+            }
+
+            topics[topics_init] = .{
+                .topic_name = topic.topic_name,
+                .partitions = partitions,
+            };
+            topics_init += 1;
+            transferred = true;
+        }
+
+        const resp = Resp{
+            .error_code = @intFromEnum(err_code),
+            .topics = topics[0..topics_init],
+            .node_endpoints = &.{},
+        };
+        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+    }
+
+    fn handleEndQuorumEpochAuthorizationError(
+        self: *Broker,
+        request_bytes: []const u8,
+        body_start: usize,
+        req_header: *const RequestHeader,
+        api_version: i16,
+        resp_header_version: i16,
+        err_code: ErrorCode,
+    ) ?[]u8 {
+        const Req = generated.end_quorum_epoch_request.EndQuorumEpochRequest;
+        const Resp = generated.end_quorum_epoch_response.EndQuorumEpochResponse;
+        const TopicResult = Resp.TopicData;
+        const PartitionResult = TopicResult.PartitionData;
+
+        if (!validateEndQuorumEpochRequestFrame(request_bytes, body_start, api_version)) {
+            log.warn("Malformed denied EndQuorumEpoch request", .{});
+            return null;
+        }
+
+        var pos = body_start;
+        var req = Req.deserialize(self.allocator, request_bytes, &pos, api_version) catch |err| {
+            log.warn("Failed to decode denied EndQuorumEpoch request: {}", .{err});
+            return null;
+        };
+        defer self.freeEndQuorumEpochRequest(&req);
+
+        var topics: []TopicResult = &.{};
+        var topics_init: usize = 0;
+        if (req.topics.len > 0) {
+            topics = self.allocator.alloc(TopicResult, req.topics.len) catch return null;
+        }
+        defer {
+            for (topics[0..topics_init]) |topic| {
+                if (topic.partitions.len > 0) self.allocator.free(topic.partitions);
+            }
+            if (topics.len > 0) self.allocator.free(topics);
+        }
+
+        for (req.topics) |topic| {
+            var partitions: []PartitionResult = &.{};
+            if (topic.partitions.len > 0) {
+                partitions = self.allocator.alloc(PartitionResult, topic.partitions.len) catch return null;
+            }
+            var transferred = false;
+            defer if (!transferred and partitions.len > 0) self.allocator.free(partitions);
+
+            for (topic.partitions, 0..) |partition, idx| {
+                partitions[idx] = .{
+                    .partition_index = partition.partition_index,
+                    .error_code = @intFromEnum(err_code),
+                    .leader_id = -1,
+                    .leader_epoch = -1,
+                };
+            }
+
+            topics[topics_init] = .{
+                .topic_name = topic.topic_name,
+                .partitions = partitions,
+            };
+            topics_init += 1;
+            transferred = true;
+        }
+
+        const resp = Resp{
+            .error_code = @intFromEnum(err_code),
+            .topics = topics[0..topics_init],
+            .node_endpoints = &.{},
+        };
+        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+    }
+
+    fn handleUpdateFeaturesAuthorizationError(
+        self: *Broker,
+        request_bytes: []const u8,
+        body_start: usize,
+        req_header: *const RequestHeader,
+        api_version: i16,
+        resp_header_version: i16,
+        err_code: ErrorCode,
+    ) ?[]u8 {
+        const Req = generated.update_features_request.UpdateFeaturesRequest;
+        const Resp = generated.update_features_response.UpdateFeaturesResponse;
+        const Result = Resp.UpdatableFeatureResult;
+
+        if (!validateUpdateFeaturesRequestFrame(request_bytes, body_start, api_version)) {
+            log.warn("Malformed denied UpdateFeatures request", .{});
+            return null;
+        }
+
+        var pos = body_start;
+        var req = Req.deserialize(self.allocator, request_bytes, &pos, api_version) catch |err| {
+            log.warn("Failed to decode denied UpdateFeatures request: {}", .{err});
+            return null;
+        };
+        defer self.freeUpdateFeaturesRequest(&req);
+
+        var results: []Result = &.{};
+        if (req.feature_updates.len > 0) {
+            results = self.allocator.alloc(Result, req.feature_updates.len) catch return null;
+        }
+        defer if (results.len > 0) self.allocator.free(results);
+
+        for (req.feature_updates, 0..) |feature_update, idx| {
+            results[idx] = .{
+                .feature = feature_update.feature,
+                .error_code = @intFromEnum(err_code),
+                .error_message = "Not authorized",
+            };
+        }
+
+        const resp = Resp{
+            .throttle_time_ms = 0,
+            .error_code = @intFromEnum(err_code),
+            .error_message = "Not authorized",
             .results = results,
         };
         return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
@@ -17864,8 +18130,11 @@ pub const Broker = struct {
             const partition_count = readKafkaArrayCount(buf, pos, flexible) orelse return false;
             for (0..partition_count) |_| {
                 if (!skipFixedBytes(buf, pos, 12)) return false; // partition_index + leader_id + leader_epoch
-                if (!skipKafkaI32Array(buf, pos, flexible)) return false; // preferred_successors
-                if (flexible and !skipEndQuorumPreferredCandidates(buf, pos)) return false;
+                if (flexible) {
+                    if (!skipEndQuorumPreferredCandidates(buf, pos)) return false;
+                } else {
+                    if (!skipKafkaI32Array(buf, pos, false)) return false; // preferred_successors
+                }
                 if (flexible) ser.skipTaggedFields(buf, pos) catch return false;
             }
             if (flexible) ser.skipTaggedFields(buf, pos) catch return false;
@@ -18606,6 +18875,30 @@ fn freeDeserializedAlterUserScramCredentialsResponse(resp: *const generated.alte
 
 fn freeDeserializedUpdateFeaturesResponse(resp: *const generated.update_features_response.UpdateFeaturesResponse) void {
     if (resp.results.len > 0) testing.allocator.free(resp.results);
+}
+
+fn freeDeserializedVoteResponse(resp: *const generated.vote_response.VoteResponse) void {
+    for (resp.topics) |topic| {
+        if (topic.partitions.len > 0) testing.allocator.free(topic.partitions);
+    }
+    if (resp.topics.len > 0) testing.allocator.free(resp.topics);
+    if (resp.node_endpoints.len > 0) testing.allocator.free(resp.node_endpoints);
+}
+
+fn freeDeserializedBeginQuorumEpochResponse(resp: *const generated.begin_quorum_epoch_response.BeginQuorumEpochResponse) void {
+    for (resp.topics) |topic| {
+        if (topic.partitions.len > 0) testing.allocator.free(topic.partitions);
+    }
+    if (resp.topics.len > 0) testing.allocator.free(resp.topics);
+    if (resp.node_endpoints.len > 0) testing.allocator.free(resp.node_endpoints);
+}
+
+fn freeDeserializedEndQuorumEpochResponse(resp: *const generated.end_quorum_epoch_response.EndQuorumEpochResponse) void {
+    for (resp.topics) |topic| {
+        if (topic.partitions.len > 0) testing.allocator.free(topic.partitions);
+    }
+    if (resp.topics.len > 0) testing.allocator.free(resp.topics);
+    if (resp.node_endpoints.len > 0) testing.allocator.free(resp.node_endpoints);
 }
 
 fn freeDeserializedGetTelemetrySubscriptionsResponse(resp: *const generated.get_telemetry_subscriptions_response.GetTelemetrySubscriptionsResponse) void {
@@ -24926,6 +25219,55 @@ test "Broker.handleRequest UpdateFeatures v1 rejects invalid upgrade type" {
     try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.invalid_request)), resp.results[0].error_code);
 }
 
+test "Broker.handleRequest UpdateFeatures authorization denial uses generated response" {
+    const Req = generated.update_features_request.UpdateFeaturesRequest;
+    const Resp = generated.update_features_response.UpdateFeaturesResponse;
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+    try broker.authorizer.addAcl("other-client", .cluster, "*", .literal, .alter, .allow, "*");
+
+    const updates = [_]Req.FeatureUpdateKey{
+        .{
+            .feature = "metadata.version",
+            .max_version_level = 1,
+            .upgrade_type = 1,
+        },
+        .{
+            .feature = "kraft.version",
+            .max_version_level = 1,
+            .upgrade_type = 1,
+        },
+    };
+    const req = Req{ .feature_updates = &updates };
+
+    var buf: [512]u8 = undefined;
+    var pos = buildTestRequest(&buf, 57, 1, 5714, header_mod.requestHeaderVersion(57, 1));
+    req.serialize(&buf, &pos, 1);
+
+    const response = broker.handleRequest(buf[0..pos]);
+    try testing.expect(response != null);
+    defer testing.allocator.free(response.?);
+
+    var rpos: usize = 0;
+    var response_header = try ResponseHeader.deserialize(testing.allocator, response.?, &rpos, header_mod.responseHeaderVersion(57, 1));
+    defer response_header.deinit(testing.allocator);
+    try testing.expectEqual(@as(i32, 5714), response_header.correlation_id);
+
+    const resp = try Resp.deserialize(testing.allocator, response.?, &rpos, 1);
+    defer freeDeserializedUpdateFeaturesResponse(&resp);
+
+    try testing.expectEqual(response.?.len, rpos);
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.cluster_authorization_failed)), resp.error_code);
+    try testing.expectEqualStrings("Not authorized", resp.error_message.?);
+    try testing.expectEqual(@as(usize, 2), resp.results.len);
+    try testing.expectEqualStrings("metadata.version", resp.results[0].feature.?);
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.cluster_authorization_failed)), resp.results[0].error_code);
+    try testing.expectEqualStrings("Not authorized", resp.results[0].error_message.?);
+    try testing.expectEqualStrings("kraft.version", resp.results[1].feature.?);
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.cluster_authorization_failed)), resp.results[1].error_code);
+}
+
 test "Broker.handleRequest UpdateFeatures rejects truncated request" {
     var broker = Broker.init(testing.allocator, 1, 9092);
     defer broker.deinit();
@@ -29668,6 +30010,80 @@ test "Broker.handleRequest Vote returns generated not-controller responses" {
     }
 }
 
+test "Broker.handleRequest Vote authorization denial uses generated response" {
+    const Req = generated.vote_request.VoteRequest;
+    const Resp = generated.vote_response.VoteResponse;
+
+    var raft = RaftState.init(testing.allocator, 5, "vote-denied-cluster");
+    defer raft.deinit();
+
+    var broker = Broker.init(testing.allocator, 5, 19094);
+    defer broker.deinit();
+    broker.raft_state = &raft;
+    try broker.authorizer.addAcl("other-client", .cluster, "*", .literal, .cluster_action, .allow, "*");
+
+    const zero_uuid = [_]u8{0} ** 16;
+    const partitions = [_]Req.TopicData.PartitionData{
+        .{
+            .partition_index = 0,
+            .candidate_epoch = 3,
+            .candidate_id = 7,
+            .candidate_directory_id = zero_uuid,
+            .voter_directory_id = zero_uuid,
+            .last_offset_epoch = 2,
+            .last_offset = 99,
+        },
+        .{
+            .partition_index = 2,
+            .candidate_epoch = 3,
+            .candidate_id = 8,
+            .candidate_directory_id = zero_uuid,
+            .voter_directory_id = zero_uuid,
+            .last_offset_epoch = 2,
+            .last_offset = 100,
+        },
+    };
+    const topics = [_]Req.TopicData{.{
+        .topic_name = "__cluster_metadata",
+        .partitions = &partitions,
+    }};
+    const req = Req{
+        .cluster_id = "vote-denied-cluster",
+        .voter_id = 5,
+        .topics = &topics,
+    };
+
+    var buf: [1024]u8 = undefined;
+    var pos = buildTestRequest(&buf, 52, 1, 5214, header_mod.requestHeaderVersion(52, 1));
+    req.serialize(&buf, &pos, 1);
+
+    const response = broker.handleRequest(buf[0..pos]);
+    try testing.expect(response != null);
+    defer testing.allocator.free(response.?);
+
+    var rpos: usize = 0;
+    var response_header = try ResponseHeader.deserialize(testing.allocator, response.?, &rpos, header_mod.responseHeaderVersion(52, 1));
+    defer response_header.deinit(testing.allocator);
+    try testing.expectEqual(@as(i32, 5214), response_header.correlation_id);
+
+    const resp = try Resp.deserialize(testing.allocator, response.?, &rpos, 1);
+    defer freeDeserializedVoteResponse(&resp);
+
+    try testing.expectEqual(response.?.len, rpos);
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.cluster_authorization_failed)), resp.error_code);
+    try testing.expectEqual(@as(usize, 1), resp.topics.len);
+    try testing.expectEqualStrings("__cluster_metadata", resp.topics[0].topic_name.?);
+    try testing.expectEqual(@as(usize, 2), resp.topics[0].partitions.len);
+    try testing.expectEqual(@as(i32, 0), resp.topics[0].partitions[0].partition_index);
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.cluster_authorization_failed)), resp.topics[0].partitions[0].error_code);
+    try testing.expectEqual(@as(i32, -1), resp.topics[0].partitions[0].leader_id);
+    try testing.expectEqual(@as(i32, -1), resp.topics[0].partitions[0].leader_epoch);
+    try testing.expect(!resp.topics[0].partitions[0].vote_granted);
+    try testing.expectEqual(@as(i32, 2), resp.topics[0].partitions[1].partition_index);
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.cluster_authorization_failed)), resp.topics[0].partitions[1].error_code);
+    try testing.expectEqual(@as(usize, 0), resp.node_endpoints.len);
+}
+
 test "Broker.handleRequest Vote rejects truncated requests" {
     var broker = Broker.init(testing.allocator, 1, 9092);
     defer broker.deinit();
@@ -29708,6 +30124,74 @@ test "Broker.handleRequest BeginQuorumEpoch returns generated not-controller res
         try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.not_controller)), resp.error_code);
         try testing.expectEqual(@as(usize, 0), resp.topics.len);
     }
+}
+
+test "Broker.handleRequest BeginQuorumEpoch authorization denial uses generated response" {
+    const Req = generated.begin_quorum_epoch_request.BeginQuorumEpochRequest;
+    const Resp = generated.begin_quorum_epoch_response.BeginQuorumEpochResponse;
+
+    var raft = RaftState.init(testing.allocator, 5, "begin-denied-cluster");
+    defer raft.deinit();
+
+    var broker = Broker.init(testing.allocator, 5, 19094);
+    defer broker.deinit();
+    broker.raft_state = &raft;
+    try broker.authorizer.addAcl("other-client", .cluster, "*", .literal, .cluster_action, .allow, "*");
+
+    const zero_uuid = [_]u8{0} ** 16;
+    const partitions = [_]Req.TopicData.PartitionData{
+        .{
+            .partition_index = 0,
+            .voter_directory_id = zero_uuid,
+            .leader_id = 7,
+            .leader_epoch = 3,
+        },
+        .{
+            .partition_index = 4,
+            .voter_directory_id = zero_uuid,
+            .leader_id = 7,
+            .leader_epoch = 3,
+        },
+    };
+    const topics = [_]Req.TopicData{.{
+        .topic_name = "__cluster_metadata",
+        .partitions = &partitions,
+    }};
+    const req = Req{
+        .cluster_id = "begin-denied-cluster",
+        .voter_id = 5,
+        .topics = &topics,
+    };
+
+    var buf: [1024]u8 = undefined;
+    var pos = buildTestRequest(&buf, 53, 1, 5314, header_mod.requestHeaderVersion(53, 1));
+    req.serialize(&buf, &pos, 1);
+
+    const response = broker.handleRequest(buf[0..pos]);
+    try testing.expect(response != null);
+    defer testing.allocator.free(response.?);
+
+    var rpos: usize = 0;
+    var response_header = try ResponseHeader.deserialize(testing.allocator, response.?, &rpos, header_mod.responseHeaderVersion(53, 1));
+    defer response_header.deinit(testing.allocator);
+    try testing.expectEqual(@as(i32, 5314), response_header.correlation_id);
+
+    const resp = try Resp.deserialize(testing.allocator, response.?, &rpos, 1);
+    defer freeDeserializedBeginQuorumEpochResponse(&resp);
+
+    try testing.expectEqual(response.?.len, rpos);
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.cluster_authorization_failed)), resp.error_code);
+    try testing.expectEqual(@as(usize, 1), resp.topics.len);
+    try testing.expectEqualStrings("__cluster_metadata", resp.topics[0].topic_name.?);
+    try testing.expectEqual(@as(usize, 2), resp.topics[0].partitions.len);
+    try testing.expectEqual(@as(i32, 0), resp.topics[0].partitions[0].partition_index);
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.cluster_authorization_failed)), resp.topics[0].partitions[0].error_code);
+    try testing.expectEqual(@as(i32, -1), resp.topics[0].partitions[0].leader_id);
+    try testing.expectEqual(@as(i32, -1), resp.topics[0].partitions[0].leader_epoch);
+    try testing.expectEqual(@as(i32, 4), resp.topics[0].partitions[1].partition_index);
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.cluster_authorization_failed)), resp.topics[0].partitions[1].error_code);
+    try testing.expectEqual(@as(usize, 0), resp.node_endpoints.len);
+    try testing.expectEqual(@as(i32, 0), raft.current_epoch);
 }
 
 test "Broker.handleRequest BeginQuorumEpoch applies internal AutoMQ AppendEntries payload" {
@@ -29940,6 +30424,78 @@ test "Broker.handleRequest EndQuorumEpoch returns generated not-controller respo
         try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.not_controller)), resp.error_code);
         try testing.expectEqual(@as(usize, 0), resp.topics.len);
     }
+}
+
+test "Broker.handleRequest EndQuorumEpoch authorization denial uses generated response" {
+    const Req = generated.end_quorum_epoch_request.EndQuorumEpochRequest;
+    const Resp = generated.end_quorum_epoch_response.EndQuorumEpochResponse;
+
+    var raft = RaftState.init(testing.allocator, 5, "end-denied-cluster");
+    defer raft.deinit();
+    raft.becomeFollower(3, 7);
+
+    var broker = Broker.init(testing.allocator, 5, 19094);
+    defer broker.deinit();
+    broker.raft_state = &raft;
+    try broker.authorizer.addAcl("other-client", .cluster, "*", .literal, .cluster_action, .allow, "*");
+
+    const zero_uuid = [_]u8{0} ** 16;
+    const preferred_candidates = [_]Req.TopicData.PartitionData.ReplicaInfo{.{
+        .candidate_id = 8,
+        .candidate_directory_id = zero_uuid,
+    }};
+    const partitions = [_]Req.TopicData.PartitionData{
+        .{
+            .partition_index = 0,
+            .leader_id = 7,
+            .leader_epoch = 3,
+            .preferred_candidates = &preferred_candidates,
+        },
+        .{
+            .partition_index = 6,
+            .leader_id = 7,
+            .leader_epoch = 3,
+            .preferred_candidates = &preferred_candidates,
+        },
+    };
+    const topics = [_]Req.TopicData{.{
+        .topic_name = "__cluster_metadata",
+        .partitions = &partitions,
+    }};
+    const req = Req{
+        .cluster_id = "end-denied-cluster",
+        .topics = &topics,
+    };
+
+    var buf: [1024]u8 = undefined;
+    var pos = buildTestRequest(&buf, 54, 1, 5414, header_mod.requestHeaderVersion(54, 1));
+    req.serialize(&buf, &pos, 1);
+
+    const response = broker.handleRequest(buf[0..pos]);
+    try testing.expect(response != null);
+    defer testing.allocator.free(response.?);
+
+    var rpos: usize = 0;
+    var response_header = try ResponseHeader.deserialize(testing.allocator, response.?, &rpos, header_mod.responseHeaderVersion(54, 1));
+    defer response_header.deinit(testing.allocator);
+    try testing.expectEqual(@as(i32, 5414), response_header.correlation_id);
+
+    const resp = try Resp.deserialize(testing.allocator, response.?, &rpos, 1);
+    defer freeDeserializedEndQuorumEpochResponse(&resp);
+
+    try testing.expectEqual(response.?.len, rpos);
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.cluster_authorization_failed)), resp.error_code);
+    try testing.expectEqual(@as(usize, 1), resp.topics.len);
+    try testing.expectEqualStrings("__cluster_metadata", resp.topics[0].topic_name.?);
+    try testing.expectEqual(@as(usize, 2), resp.topics[0].partitions.len);
+    try testing.expectEqual(@as(i32, 0), resp.topics[0].partitions[0].partition_index);
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.cluster_authorization_failed)), resp.topics[0].partitions[0].error_code);
+    try testing.expectEqual(@as(i32, -1), resp.topics[0].partitions[0].leader_id);
+    try testing.expectEqual(@as(i32, -1), resp.topics[0].partitions[0].leader_epoch);
+    try testing.expectEqual(@as(i32, 6), resp.topics[0].partitions[1].partition_index);
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.cluster_authorization_failed)), resp.topics[0].partitions[1].error_code);
+    try testing.expectEqual(@as(usize, 0), resp.node_endpoints.len);
+    try testing.expectEqual(@as(i32, 3), raft.current_epoch);
 }
 
 test "Broker.handleRequest BeginQuorumEpoch and EndQuorumEpoch reject truncated requests" {
