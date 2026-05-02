@@ -18680,7 +18680,7 @@ pub const Broker = struct {
         }
         if (api_version >= 3 and !skipFixedBytes(buf, &pos, 1)) return false; // include_authorized_operations
         if (flexible) ser.skipTaggedFields(buf, &pos) catch return false;
-        return true;
+        return pos == buf.len;
     }
 
     fn validateConsumerGroupDescribeRequestFrame(buf: []const u8, start_pos: usize) bool {
@@ -35288,6 +35288,25 @@ test "Broker.handleRequest DescribeGroups rejects truncated request" {
     var buf: [128]u8 = undefined;
     const req_len = buildTestRequest(&buf, 15, 5, 1506, header_mod.requestHeaderVersion(15, 5));
     try testing.expect(broker.handleRequest(buf[0..req_len]) == null);
+}
+
+test "Broker.handleRequest DescribeGroups rejects trailing bytes" {
+    const Req = generated.describe_groups_request.DescribeGroupsRequest;
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+
+    const groups = [_]?[]const u8{"dg-trailing-group"};
+    const req = Req{
+        .groups = &groups,
+        .include_authorized_operations = true,
+    };
+
+    var buf: [512]u8 = undefined;
+    var pos = buildTestRequest(&buf, 15, 5, 1508, header_mod.requestHeaderVersion(15, 5));
+    req.serialize(&buf, &pos, 5);
+
+    try expectTrailingByteRejected(&broker, &buf, pos);
 }
 
 test "Broker.handleRequest DescribeGroups authorization denial uses generated response" {
