@@ -614,12 +614,13 @@ pub const RaftState = struct {
 
         /// Check if a log entry is a config change (vs regular data).
         pub fn isConfigChange(data: []const u8) bool {
-            if (isVoterUpdate(data)) return true;
+            if (isVoterMetadataChange(data)) return true;
             if (data.len < 5) return false;
             return data[0] == 1 or data[0] == 2;
         }
 
         pub const VoterUpdate = struct {
+            change_type: ConfigChangeType = .update_voter,
             voter_id: i32,
             voter_directory_id: [16]u8,
             endpoints: []const VoterEndpointView,
@@ -637,19 +638,28 @@ pub const RaftState = struct {
                 data[update_magic.len] == @intFromEnum(ConfigChangeType.update_voter);
         }
 
+        pub fn isVoterMetadataChange(data: []const u8) bool {
+            if (data.len < update_magic.len + 1) return false;
+            if (!std.mem.eql(u8, data[0..update_magic.len], update_magic)) return false;
+            return data[update_magic.len] == @intFromEnum(ConfigChangeType.add_voter) or
+                data[update_magic.len] == @intFromEnum(ConfigChangeType.update_voter);
+        }
+
         fn checkedAdd(total: *usize, value: usize) !void {
             if (std.math.maxInt(usize) - total.* < value) return error.MessageTooLarge;
             total.* += value;
         }
 
-        pub fn serializeVoterUpdate(
+        fn serializeVoterMetadataChange(
             alloc: Allocator,
+            change_type: ConfigChangeType,
             voter_id: i32,
             voter_directory_id: [16]u8,
             endpoints: []const VoterEndpointView,
             k_raft_min_supported_version: i16,
             k_raft_max_supported_version: i16,
         ) ![]u8 {
+            if (change_type != .add_voter and change_type != .update_voter) return error.InvalidConfigChangeEntry;
             if (endpoints.len == 0) return error.InvalidEndpoint;
             if (endpoints.len > std.math.maxInt(u32)) return error.MessageTooLarge;
             if (k_raft_min_supported_version > k_raft_max_supported_version) return error.InvalidUpdateVersion;
@@ -665,7 +675,7 @@ pub const RaftState = struct {
             var pos: usize = 0;
             @memcpy(data[pos .. pos + update_magic.len], update_magic);
             pos += update_magic.len;
-            data[pos] = @intFromEnum(ConfigChangeType.update_voter);
+            data[pos] = @intFromEnum(change_type);
             pos += 1;
             std.mem.writeInt(i32, data[pos..][0..4], voter_id, .big);
             pos += 4;
@@ -690,6 +700,34 @@ pub const RaftState = struct {
                 pos += 2;
             }
             return data;
+        }
+
+        pub fn serializeVoterAdd(
+            alloc: Allocator,
+            voter_id: i32,
+            voter_directory_id: [16]u8,
+            endpoints: []const VoterEndpointView,
+        ) ![]u8 {
+            return serializeVoterMetadataChange(alloc, .add_voter, voter_id, voter_directory_id, endpoints, 0, 0);
+        }
+
+        pub fn serializeVoterUpdate(
+            alloc: Allocator,
+            voter_id: i32,
+            voter_directory_id: [16]u8,
+            endpoints: []const VoterEndpointView,
+            k_raft_min_supported_version: i16,
+            k_raft_max_supported_version: i16,
+        ) ![]u8 {
+            return serializeVoterMetadataChange(
+                alloc,
+                .update_voter,
+                voter_id,
+                voter_directory_id,
+                endpoints,
+                k_raft_min_supported_version,
+                k_raft_max_supported_version,
+            );
         }
 
         fn readU32(data: []const u8, pos: *usize) !u32 {
@@ -727,10 +765,11 @@ pub const RaftState = struct {
             return bytes;
         }
 
-        pub fn deserializeVoterUpdate(alloc: Allocator, data: []const u8) !?VoterUpdate {
-            if (!isVoterUpdate(data)) return null;
+        pub fn deserializeVoterMetadataChange(alloc: Allocator, data: []const u8) !?VoterUpdate {
+            if (!isVoterMetadataChange(data)) return null;
 
             var pos: usize = update_magic.len + 1;
+            const change_type: ConfigChangeType = @enumFromInt(data[update_magic.len]);
             const voter_id = try readI32(data, &pos);
             const voter_directory_id = try readBytes(data, &pos, 16);
             const min_supported_version = try readI16(data, &pos);
@@ -760,12 +799,23 @@ pub const RaftState = struct {
             var directory_id: [16]u8 = undefined;
             @memcpy(&directory_id, voter_directory_id);
             return .{
+                .change_type = change_type,
                 .voter_id = voter_id,
                 .voter_directory_id = directory_id,
                 .endpoints = endpoints,
                 .k_raft_min_supported_version = min_supported_version,
                 .k_raft_max_supported_version = max_supported_version,
             };
+        }
+
+        pub fn deserializeVoterUpdate(alloc: Allocator, data: []const u8) !?VoterUpdate {
+            const change = (try deserializeVoterMetadataChange(alloc, data)) orelse return null;
+            if (change.change_type != .update_voter) {
+                var mutable_change = change;
+                mutable_change.deinit(alloc);
+                return null;
+            }
+            return change;
         }
     };
 
@@ -943,6 +993,32 @@ pub const RaftState = struct {
         return offset;
     }
 
+    /// Propose adding a voter with endpoint metadata (leader only).
+    pub fn proposeAddVoterWithMetadata(
+        self: *RaftState,
+        voter_id: i32,
+        voter_directory_id: [16]u8,
+        endpoints: []const VoterEndpointView,
+    ) !u64 {
+        if (self.role != .leader) return error.NotLeader;
+        if (self.pending_config_change) return error.ConfigChangePending;
+        if (self.voters.contains(voter_id)) return error.VoterAlreadyExists;
+
+        const data = try ConfigChangeEntry.serializeVoterAdd(
+            self.allocator,
+            voter_id,
+            voter_directory_id,
+            endpoints,
+        );
+        defer self.allocator.free(data);
+
+        const offset = try self.appendEntry(data);
+        self.pending_config_change = true;
+
+        log.info("Proposed AddVoter with endpoint metadata: node {d} at offset {d}", .{ voter_id, offset });
+        return offset;
+    }
+
     /// Propose removing a voter from the cluster (leader only).
     /// Returns the log offset of the config change entry, or error if:
     /// - Not the leader
@@ -1013,22 +1089,47 @@ pub const RaftState = struct {
                 if (entry.offset <= last_offset) continue;
             }
 
-            if (ConfigChangeEntry.deserializeVoterUpdate(self.allocator, entry.data) catch null) |update| {
-                var mutable_update = update;
-                defer mutable_update.deinit(self.allocator);
-                self.updateVoterMetadata(
-                    update.voter_id,
-                    update.voter_directory_id,
-                    update.endpoints,
-                    update.k_raft_min_supported_version,
-                    update.k_raft_max_supported_version,
-                ) catch |err| {
-                    log.warn("Config apply failed: update voter {d}: {}", .{ update.voter_id, err });
-                    self.last_applied_config_offset = entry.offset;
-                    self.pending_config_change = false;
-                    continue;
-                };
-                log.info("Config applied: updated voter {d} endpoint metadata", .{update.voter_id});
+            if (ConfigChangeEntry.deserializeVoterMetadataChange(self.allocator, entry.data) catch null) |change| {
+                var mutable_change = change;
+                defer mutable_change.deinit(self.allocator);
+                switch (change.change_type) {
+                    .add_voter => {
+                        self.addVoter(change.voter_id) catch |err| {
+                            log.warn("Config apply failed: add voter {d}: {}", .{ change.voter_id, err });
+                            self.last_applied_config_offset = entry.offset;
+                            self.pending_config_change = false;
+                            continue;
+                        };
+                        self.updateVoterMetadata(
+                            change.voter_id,
+                            change.voter_directory_id,
+                            change.endpoints,
+                            change.k_raft_min_supported_version,
+                            change.k_raft_max_supported_version,
+                        ) catch |err| {
+                            log.warn("Config apply failed: add voter {d} endpoint metadata: {}", .{ change.voter_id, err });
+                        };
+                        log.info("Config applied: added voter {d} with endpoint metadata (now {d} voters)", .{
+                            change.voter_id, self.voters.count(),
+                        });
+                    },
+                    .update_voter => {
+                        self.updateVoterMetadata(
+                            change.voter_id,
+                            change.voter_directory_id,
+                            change.endpoints,
+                            change.k_raft_min_supported_version,
+                            change.k_raft_max_supported_version,
+                        ) catch |err| {
+                            log.warn("Config apply failed: update voter {d}: {}", .{ change.voter_id, err });
+                            self.last_applied_config_offset = entry.offset;
+                            self.pending_config_change = false;
+                            continue;
+                        };
+                        log.info("Config applied: updated voter {d} endpoint metadata", .{change.voter_id});
+                    },
+                    .remove_voter => {},
+                }
                 self.last_applied_config_offset = entry.offset;
                 self.pending_config_change = false;
             } else if (ConfigChangeEntry.deserialize(entry.data)) |config| {
@@ -2332,6 +2433,38 @@ test "RaftState proposeAddVoter rejects when config pending" {
     _ = try state.proposeAddVoter(1); // First one succeeds
     const result = state.proposeAddVoter(2); // Second rejected
     try testing.expectError(error.ConfigChangePending, result);
+}
+
+test "RaftState proposeAddVoterWithMetadata applies endpoint metadata after commit" {
+    var state = RaftState.init(testing.allocator, 0, "cluster");
+    defer state.deinit();
+
+    try state.addVoter(0);
+    _ = state.startElection();
+    state.becomeLeader();
+
+    const directory_id = [_]u8{3} ** 16;
+    const endpoints = [_]RaftState.VoterEndpointView{.{
+        .name = "CONTROLLER",
+        .host = "controller-2.example",
+        .port = 29093,
+    }};
+
+    const offset = try state.proposeAddVoterWithMetadata(2, directory_id, &endpoints);
+    try testing.expectEqual(@as(u64, 0), offset);
+    try testing.expect(state.pending_config_change);
+    try testing.expect(!state.voters.contains(2));
+
+    state.commit_index = offset;
+    state.applyCommittedConfigs();
+
+    try testing.expect(!state.pending_config_change);
+    const voter = state.voters.get(2).?;
+    try testing.expectEqualSlices(u8, &directory_id, &voter.voter_directory_id);
+    try testing.expectEqual(@as(usize, 1), voter.endpoints.len);
+    try testing.expectEqualStrings("CONTROLLER", voter.endpoints[0].name);
+    try testing.expectEqualStrings("controller-2.example", voter.endpoints[0].host);
+    try testing.expectEqual(@as(u16, 29093), voter.endpoints[0].port);
 }
 
 test "RaftState proposeRemoveVoter works" {
