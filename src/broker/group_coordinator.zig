@@ -399,6 +399,31 @@ pub const GroupCoordinator = struct {
         return @intFromEnum(ErrorCode.none);
     }
 
+    /// KIP-848 ConsumerGroupHeartbeat drives rebalance progress through the
+    /// heartbeat itself, so a preparing/completing group should not be rejected
+    /// with REBALANCE_IN_PROGRESS like the classic Heartbeat API.
+    pub fn consumerGroupHeartbeat(self: *GroupCoordinator, group_id: []const u8, member_id: []const u8, group_instance_id: ?[]const u8, member_epoch: i32) i16 {
+        if (group_id.len == 0) return @intFromEnum(ErrorCode.invalid_group_id);
+
+        const group = self.groups.getPtr(group_id) orelse return @intFromEnum(ErrorCode.unknown_member_id);
+        if (group.state == .dead) return @intFromEnum(ErrorCode.coordinator_not_available);
+
+        const member = group.members.getPtr(member_id) orelse return @intFromEnum(ErrorCode.unknown_member_id);
+        if (group_instance_id) |requested_instance_id| {
+            if (member.group_instance_id) |existing_instance_id| {
+                if (!std.mem.eql(u8, existing_instance_id, requested_instance_id)) {
+                    return @intFromEnum(ErrorCode.fenced_instance_id);
+                }
+            } else {
+                return @intFromEnum(ErrorCode.fenced_instance_id);
+            }
+        }
+
+        if (group.generation_id != member_epoch) return @intFromEnum(ErrorCode.illegal_generation);
+        member.last_heartbeat_ms = @import("time_compat").milliTimestamp();
+        return @intFromEnum(ErrorCode.none);
+    }
+
     /// Handle LeaveGroup request.
     pub fn leaveGroup(self: *GroupCoordinator, group_id: []const u8, member_id: []const u8) i16 {
         if (group_id.len == 0) return @intFromEnum(ErrorCode.invalid_group_id);
@@ -1705,6 +1730,21 @@ test "GroupCoordinator heartbeat returns REBALANCE_IN_PROGRESS during rebalance"
     // Now heartbeat should succeed normally
     const err2 = coord.heartbeat("g1", r1.member_id, r1.generation_id);
     try testing.expectEqual(@as(i16, 0), err2);
+}
+
+test "GroupCoordinator consumer group heartbeat accepts preparing rebalance" {
+    var coord = GroupCoordinator.init(testing.allocator);
+    defer coord.deinit();
+
+    const r1 = try coord.joinGroup("kip848-group", null, "consumer", null);
+    const group = coord.groups.getPtr("kip848-group").?;
+    try testing.expectEqual(ConsumerGroup.GroupState.preparing_rebalance, group.state);
+
+    const classic_err = coord.heartbeat("kip848-group", r1.member_id, r1.generation_id);
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.rebalance_in_progress)), classic_err);
+
+    const kip848_err = coord.consumerGroupHeartbeat("kip848-group", r1.member_id, null, r1.generation_id);
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.none)), kip848_err);
 }
 
 test "GroupCoordinator static member rejoin preserves assignment" {

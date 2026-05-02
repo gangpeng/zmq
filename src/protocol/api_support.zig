@@ -371,9 +371,10 @@ pub const non_advertised_handler_api_keys = [_]i16{
 };
 
 /// Generated APIs with broker switch cases that intentionally remain
-/// non-advertised until real coordinator semantics are implemented. They are
-/// allowed through version validation only to return schema-valid fail-closed
-/// responses for direct probes.
+/// non-advertised until their full coordinator/storage semantics are
+/// implemented. Most return schema-valid fail-closed responses for direct
+/// probes; ConsumerGroupHeartbeat currently exposes a compatibility subset but
+/// stays here until full KIP-848 assignment semantics exist.
 pub const fail_closed_generated_handler_api_keys = [_]i16{
     68, // ConsumerGroupHeartbeat (KIP-848)
     73, // AssignReplicasToDirs (KIP-858)

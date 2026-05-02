@@ -10143,7 +10143,7 @@ pub const Broker = struct {
     }
 
     // ---------------------------------------------------------------
-    // ConsumerGroupHeartbeat (key 68) — non-advertised until KIP-848 support
+    // ConsumerGroupHeartbeat (key 68) — non-advertised until full KIP-848 assignment support
     // ---------------------------------------------------------------
     fn handleConsumerGroupHeartbeat(self: *Broker, request_bytes: []const u8, body_start: usize, req_header: *const RequestHeader, api_version: i16, resp_header_version: i16) ?[]u8 {
         const Req = generated.consumer_group_heartbeat_request.ConsumerGroupHeartbeatRequest;
@@ -10179,16 +10179,107 @@ pub const Broker = struct {
         };
         defer self.freeConsumerGroupHeartbeatRequest(&req);
 
+        const subscriptions = self.consumerGroupHeartbeatSubscriptions(req.subscribed_topic_names) catch {
+            const resp = consumerGroupHeartbeatResponse(ErrorCode.invalid_request.toInt(), "invalid ConsumerGroupHeartbeat subscription", req.member_id, req.member_epoch, 0);
+            return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+        };
+        defer if (subscriptions) |topics| {
+            if (topics.len > 0) self.allocator.free(topics);
+        };
+
+        const group_id = req.group_id orelse "";
+        const member_id = req.member_id orelse "";
+        const instance_id = nonEmptyStringOrNull(req.instance_id);
+        const assignor = if (req.server_assignor) |value| if (value.len > 0) value else "range" else "range";
+
+        if (req.member_epoch == 0 or req.member_epoch == -2) {
+            if (req.member_epoch == -2 and instance_id == null) {
+                const resp = consumerGroupHeartbeatResponse(ErrorCode.invalid_request.toInt(), "static rejoin requires instance_id", req.member_id, req.member_epoch, 0);
+                return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+            }
+
+            const previous_snapshot = self.encodeConsumerGroupSnapshotRecordValue() catch return null;
+            defer self.allocator.free(previous_snapshot);
+
+            const result = self.groups.joinGroupWithProtocol(group_id, nonEmptyStringOrNull(req.member_id), instance_id, "consumer", assignor, null, subscriptions) catch return null;
+            if (result.error_code == @intFromEnum(ErrorCode.none)) {
+                if (req.rebalance_timeout_ms > 0) {
+                    _ = self.groups.configureGroupTimeouts(group_id, ConsumerGroup.default_session_timeout_ms, @intCast(req.rebalance_timeout_ms));
+                }
+                self.persistConsumerGroupsDurably() catch |err| {
+                    log.warn("ConsumerGroupHeartbeat join snapshot write failed for {s}: {}", .{ group_id, err });
+                    self.restoreConsumerGroupsAfterFailedMutation(previous_snapshot);
+                    const resp = consumerGroupHeartbeatResponse(ErrorCode.kafka_storage_error.toInt(), null, req.member_id, req.member_epoch, 0);
+                    return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+                };
+            }
+
+            const resp = consumerGroupHeartbeatResponse(result.error_code, null, result.member_id, result.generation_id, consumer_group_heartbeat_interval_ms);
+            return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+        }
+
+        if (req.member_epoch == -1) {
+            const previous_snapshot = self.encodeConsumerGroupSnapshotRecordValue() catch return null;
+            defer self.allocator.free(previous_snapshot);
+
+            const error_code = self.groups.leaveGroupWithInstanceId(group_id, member_id, instance_id);
+            if (error_code == @intFromEnum(ErrorCode.none)) {
+                self.persistConsumerGroupsDurably() catch |err| {
+                    log.warn("ConsumerGroupHeartbeat leave snapshot write failed for {s}: {}", .{ group_id, err });
+                    self.restoreConsumerGroupsAfterFailedMutation(previous_snapshot);
+                    const resp = consumerGroupHeartbeatResponse(ErrorCode.kafka_storage_error.toInt(), null, req.member_id, req.member_epoch, 0);
+                    return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+                };
+            }
+
+            const resp = consumerGroupHeartbeatResponse(error_code, null, req.member_id, -1, consumer_group_heartbeat_interval_ms);
+            return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+        }
+
+        if (req.member_epoch < -2) {
+            const resp = consumerGroupHeartbeatResponse(ErrorCode.invalid_request.toInt(), "invalid member epoch", req.member_id, req.member_epoch, 0);
+            return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+        }
+
+        const error_code = self.groups.consumerGroupHeartbeat(group_id, member_id, instance_id, req.member_epoch);
         const resp = Resp{
             .throttle_time_ms = 0,
-            .error_code = ErrorCode.unsupported_version.toInt(),
-            .error_message = "ConsumerGroupHeartbeat is not implemented",
+            .error_code = error_code,
+            .error_message = null,
             .member_id = req.member_id,
             .member_epoch = req.member_epoch,
-            .heartbeat_interval_ms = 0,
+            .heartbeat_interval_ms = if (error_code == @intFromEnum(ErrorCode.none)) consumer_group_heartbeat_interval_ms else 0,
             .assignment = null,
         };
         return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+    }
+
+    const consumer_group_heartbeat_interval_ms: i32 = 3000;
+
+    fn consumerGroupHeartbeatResponse(error_code: i16, error_message: ?[]const u8, member_id: ?[]const u8, member_epoch: i32, heartbeat_interval_ms: i32) generated.consumer_group_heartbeat_response.ConsumerGroupHeartbeatResponse {
+        return .{
+            .throttle_time_ms = 0,
+            .error_code = error_code,
+            .error_message = error_message,
+            .member_id = member_id,
+            .member_epoch = member_epoch,
+            .heartbeat_interval_ms = heartbeat_interval_ms,
+            .assignment = null,
+        };
+    }
+
+    fn consumerGroupHeartbeatSubscriptions(self: *Broker, subscribed_topic_names: ?[]const ?[]const u8) !?[]const []const u8 {
+        const names = subscribed_topic_names orelse return null;
+        if (names.len == 0) return &.{};
+
+        const topics = try self.allocator.alloc([]const u8, names.len);
+        errdefer self.allocator.free(topics);
+        for (names, 0..) |maybe_name, index| {
+            const name = maybe_name orelse return error.InvalidRequest;
+            if (name.len == 0) return error.InvalidRequest;
+            topics[index] = name;
+        }
+        return topics;
     }
 
     fn freeConsumerGroupHeartbeatRequest(self: *Broker, req: *generated.consumer_group_heartbeat_request.ConsumerGroupHeartbeatRequest) void {
@@ -34339,18 +34430,21 @@ test "Broker.handleRequest DescribeGroups authorization denial uses generated re
     try testing.expectEqualStrings("dg-denied-other", resp.groups[1].group_id.?);
 }
 
-test "Broker.handleRequest ConsumerGroupHeartbeat returns generated fail-closed response" {
+test "Broker.handleRequest ConsumerGroupHeartbeat joins heartbeats and leaves group" {
     const Req = generated.consumer_group_heartbeat_request.ConsumerGroupHeartbeatRequest;
     const Resp = generated.consumer_group_heartbeat_response.ConsumerGroupHeartbeatResponse;
 
     var broker = Broker.init(testing.allocator, 1, 9092);
     defer broker.deinit();
 
+    const topic_names = [_]?[]const u8{ "topic-a", "topic-b" };
     const req = Req{
         .group_id = "kip848-group",
         .member_id = "kip848-member",
         .member_epoch = 0,
         .rebalance_timeout_ms = 30_000,
+        .subscribed_topic_names = &topic_names,
+        .server_assignor = "range",
     };
 
     var buf: [256]u8 = undefined;
@@ -34369,41 +34463,75 @@ test "Broker.handleRequest ConsumerGroupHeartbeat returns generated fail-closed 
     const resp = try Resp.deserialize(testing.allocator, response.?, &rpos, 0);
     try testing.expectEqual(response.?.len, rpos);
     try testing.expectEqual(@as(i32, 0), resp.throttle_time_ms);
-    try testing.expectEqual(ErrorCode.unsupported_version.toInt(), resp.error_code);
+    try testing.expectEqual(ErrorCode.none.toInt(), resp.error_code);
     try testing.expectEqualStrings("kip848-member", resp.member_id.?);
-    try testing.expectEqual(@as(i32, 0), resp.member_epoch);
+    try testing.expectEqual(@as(i32, 1), resp.member_epoch);
+    try testing.expectEqual(@as(i32, 3000), resp.heartbeat_interval_ms);
     try testing.expect(resp.assignment == null);
 
-    const empty_topic_names = [_]?[]const u8{};
-    const empty_topic_partitions = [_]Req.TopicPartitions{};
-    const empty_req = Req{
+    const group = broker.groups.groups.getPtr("kip848-group").?;
+    try testing.expectEqual(ConsumerGroup.GroupState.preparing_rebalance, group.state);
+    const member = group.members.getPtr("kip848-member").?;
+    try testing.expectEqual(@as(usize, 2), member.subscribed_topics.items.len);
+    try testing.expectEqualStrings("topic-a", member.subscribed_topics.items[0]);
+    try testing.expectEqualStrings("topic-b", member.subscribed_topics.items[1]);
+    try testing.expectEqualStrings("range", member.protocol_name.?);
+
+    const heartbeat_req = Req{
         .group_id = "kip848-group",
-        .member_id = "kip848-empty-member",
-        .member_epoch = 1,
-        .rebalance_timeout_ms = 30_000,
-        .subscribed_topic_names = &empty_topic_names,
-        .topic_partitions = &empty_topic_partitions,
+        .member_id = resp.member_id,
+        .member_epoch = resp.member_epoch,
+        .rebalance_timeout_ms = -1,
     };
 
-    var empty_buf: [256]u8 = undefined;
-    var empty_pos = buildTestRequest(&empty_buf, 68, 0, 6802, header_mod.requestHeaderVersion(68, 0));
-    empty_req.serialize(&empty_buf, &empty_pos, 0);
+    var hb_buf: [256]u8 = undefined;
+    var hb_pos = buildTestRequest(&hb_buf, 68, 0, 6802, header_mod.requestHeaderVersion(68, 0));
+    heartbeat_req.serialize(&hb_buf, &hb_pos, 0);
 
-    const empty_response = broker.handleRequest(empty_buf[0..empty_pos]);
-    try testing.expect(empty_response != null);
-    defer testing.allocator.free(empty_response.?);
+    const hb_response = broker.handleRequest(hb_buf[0..hb_pos]);
+    try testing.expect(hb_response != null);
+    defer testing.allocator.free(hb_response.?);
 
-    var empty_rpos: usize = 0;
-    var empty_response_header = try ResponseHeader.deserialize(testing.allocator, empty_response.?, &empty_rpos, header_mod.responseHeaderVersion(68, 0));
-    defer empty_response_header.deinit(testing.allocator);
-    try testing.expectEqual(@as(i32, 6802), empty_response_header.correlation_id);
+    var hb_rpos: usize = 0;
+    var hb_response_header = try ResponseHeader.deserialize(testing.allocator, hb_response.?, &hb_rpos, header_mod.responseHeaderVersion(68, 0));
+    defer hb_response_header.deinit(testing.allocator);
+    try testing.expectEqual(@as(i32, 6802), hb_response_header.correlation_id);
 
-    const empty_resp = try Resp.deserialize(testing.allocator, empty_response.?, &empty_rpos, 0);
-    try testing.expectEqual(empty_response.?.len, empty_rpos);
-    try testing.expectEqual(ErrorCode.unsupported_version.toInt(), empty_resp.error_code);
-    try testing.expectEqualStrings("kip848-empty-member", empty_resp.member_id.?);
-    try testing.expectEqual(@as(i32, 1), empty_resp.member_epoch);
-    try testing.expect(empty_resp.assignment == null);
+    const hb_resp = try Resp.deserialize(testing.allocator, hb_response.?, &hb_rpos, 0);
+    try testing.expectEqual(hb_response.?.len, hb_rpos);
+    try testing.expectEqual(ErrorCode.none.toInt(), hb_resp.error_code);
+    try testing.expectEqualStrings("kip848-member", hb_resp.member_id.?);
+    try testing.expectEqual(@as(i32, 1), hb_resp.member_epoch);
+    try testing.expectEqual(@as(i32, 3000), hb_resp.heartbeat_interval_ms);
+    try testing.expect(hb_resp.assignment == null);
+
+    const leave_req = Req{
+        .group_id = "kip848-group",
+        .member_id = resp.member_id,
+        .member_epoch = -1,
+        .rebalance_timeout_ms = -1,
+    };
+
+    var leave_buf: [256]u8 = undefined;
+    var leave_pos = buildTestRequest(&leave_buf, 68, 0, 6803, header_mod.requestHeaderVersion(68, 0));
+    leave_req.serialize(&leave_buf, &leave_pos, 0);
+
+    const leave_response = broker.handleRequest(leave_buf[0..leave_pos]);
+    try testing.expect(leave_response != null);
+    defer testing.allocator.free(leave_response.?);
+
+    var leave_rpos: usize = 0;
+    var leave_response_header = try ResponseHeader.deserialize(testing.allocator, leave_response.?, &leave_rpos, header_mod.responseHeaderVersion(68, 0));
+    defer leave_response_header.deinit(testing.allocator);
+    try testing.expectEqual(@as(i32, 6803), leave_response_header.correlation_id);
+
+    const leave_resp = try Resp.deserialize(testing.allocator, leave_response.?, &leave_rpos, 0);
+    try testing.expectEqual(leave_response.?.len, leave_rpos);
+    try testing.expectEqual(ErrorCode.none.toInt(), leave_resp.error_code);
+    try testing.expectEqualStrings("kip848-member", leave_resp.member_id.?);
+    try testing.expectEqual(@as(i32, -1), leave_resp.member_epoch);
+    try testing.expectEqual(@as(usize, 0), group.members.count());
+    try testing.expectEqual(ConsumerGroup.GroupState.empty, group.state);
 }
 
 test "Broker.handleRequest ConsumerGroupHeartbeat rejects malformed request" {
