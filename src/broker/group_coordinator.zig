@@ -412,14 +412,14 @@ pub const GroupCoordinator = struct {
         if (group_instance_id) |requested_instance_id| {
             if (member.group_instance_id) |existing_instance_id| {
                 if (!std.mem.eql(u8, existing_instance_id, requested_instance_id)) {
-                    return @intFromEnum(ErrorCode.fenced_instance_id);
+                    return @intFromEnum(ErrorCode.unreleased_instance_id);
                 }
             } else {
-                return @intFromEnum(ErrorCode.fenced_instance_id);
+                return @intFromEnum(ErrorCode.unreleased_instance_id);
             }
         }
 
-        if (group.generation_id != member_epoch) return @intFromEnum(ErrorCode.illegal_generation);
+        if (group.generation_id != member_epoch) return @intFromEnum(ErrorCode.fenced_member_epoch);
         member.last_heartbeat_ms = @import("time_compat").milliTimestamp();
         return @intFromEnum(ErrorCode.none);
     }
@@ -1745,6 +1745,19 @@ test "GroupCoordinator consumer group heartbeat accepts preparing rebalance" {
 
     const kip848_err = coord.consumerGroupHeartbeat("kip848-group", r1.member_id, null, r1.generation_id);
     try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.none)), kip848_err);
+}
+
+test "GroupCoordinator consumer group heartbeat uses KIP-848 fencing errors" {
+    var coord = GroupCoordinator.init(testing.allocator);
+    defer coord.deinit();
+
+    const dynamic = try coord.joinGroup("kip848-fenced-epoch-group", null, "consumer", null);
+    const stale_epoch_err = coord.consumerGroupHeartbeat("kip848-fenced-epoch-group", dynamic.member_id, null, dynamic.generation_id + 1);
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.fenced_member_epoch)), stale_epoch_err);
+
+    const static_member = try coord.joinGroupWithInstanceId("kip848-static-fence-group", null, "instance-a", "consumer", null);
+    const instance_err = coord.consumerGroupHeartbeat("kip848-static-fence-group", static_member.member_id, "instance-b", static_member.generation_id);
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.unreleased_instance_id)), instance_err);
 }
 
 test "GroupCoordinator static member rejoin preserves assignment" {

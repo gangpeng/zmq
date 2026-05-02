@@ -34505,6 +34505,34 @@ test "Broker.handleRequest ConsumerGroupHeartbeat joins heartbeats and leaves gr
     try testing.expectEqual(@as(i32, 3000), hb_resp.heartbeat_interval_ms);
     try testing.expect(hb_resp.assignment == null);
 
+    const stale_epoch_req = Req{
+        .group_id = "kip848-group",
+        .member_id = resp.member_id,
+        .member_epoch = resp.member_epoch + 1,
+        .rebalance_timeout_ms = -1,
+    };
+
+    var stale_buf: [256]u8 = undefined;
+    var stale_pos = buildTestRequest(&stale_buf, 68, 0, 6804, header_mod.requestHeaderVersion(68, 0));
+    stale_epoch_req.serialize(&stale_buf, &stale_pos, 0);
+
+    const stale_response = broker.handleRequest(stale_buf[0..stale_pos]);
+    try testing.expect(stale_response != null);
+    defer testing.allocator.free(stale_response.?);
+
+    var stale_rpos: usize = 0;
+    var stale_response_header = try ResponseHeader.deserialize(testing.allocator, stale_response.?, &stale_rpos, header_mod.responseHeaderVersion(68, 0));
+    defer stale_response_header.deinit(testing.allocator);
+    try testing.expectEqual(@as(i32, 6804), stale_response_header.correlation_id);
+
+    const stale_resp = try Resp.deserialize(testing.allocator, stale_response.?, &stale_rpos, 0);
+    try testing.expectEqual(stale_response.?.len, stale_rpos);
+    try testing.expectEqual(ErrorCode.fenced_member_epoch.toInt(), stale_resp.error_code);
+    try testing.expectEqualStrings("kip848-member", stale_resp.member_id.?);
+    try testing.expectEqual(@as(i32, 2), stale_resp.member_epoch);
+    try testing.expectEqual(@as(i32, 0), stale_resp.heartbeat_interval_ms);
+    try testing.expect(stale_resp.assignment == null);
+
     const leave_req = Req{
         .group_id = "kip848-group",
         .member_id = resp.member_id,
@@ -34532,6 +34560,44 @@ test "Broker.handleRequest ConsumerGroupHeartbeat joins heartbeats and leaves gr
     try testing.expectEqual(@as(i32, -1), leave_resp.member_epoch);
     try testing.expectEqual(@as(usize, 0), group.members.count());
     try testing.expectEqual(ConsumerGroup.GroupState.empty, group.state);
+}
+
+test "Broker.handleRequest ConsumerGroupHeartbeat uses KIP-848 static fencing error" {
+    const Req = generated.consumer_group_heartbeat_request.ConsumerGroupHeartbeatRequest;
+    const Resp = generated.consumer_group_heartbeat_response.ConsumerGroupHeartbeatResponse;
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+
+    const joined = try broker.groups.joinGroupWithProtocol("kip848-static-group", "kip848-static-member", "instance-a", "consumer", "range", null, null);
+    const req = Req{
+        .group_id = "kip848-static-group",
+        .member_id = joined.member_id,
+        .member_epoch = joined.generation_id,
+        .instance_id = "instance-b",
+        .rebalance_timeout_ms = -1,
+    };
+
+    var buf: [256]u8 = undefined;
+    var pos = buildTestRequest(&buf, 68, 0, 6805, header_mod.requestHeaderVersion(68, 0));
+    req.serialize(&buf, &pos, 0);
+
+    const response = broker.handleRequest(buf[0..pos]);
+    try testing.expect(response != null);
+    defer testing.allocator.free(response.?);
+
+    var rpos: usize = 0;
+    var response_header = try ResponseHeader.deserialize(testing.allocator, response.?, &rpos, header_mod.responseHeaderVersion(68, 0));
+    defer response_header.deinit(testing.allocator);
+    try testing.expectEqual(@as(i32, 6805), response_header.correlation_id);
+
+    const resp = try Resp.deserialize(testing.allocator, response.?, &rpos, 0);
+    try testing.expectEqual(response.?.len, rpos);
+    try testing.expectEqual(ErrorCode.unreleased_instance_id.toInt(), resp.error_code);
+    try testing.expectEqualStrings("kip848-static-member", resp.member_id.?);
+    try testing.expectEqual(@as(i32, 1), resp.member_epoch);
+    try testing.expectEqual(@as(i32, 0), resp.heartbeat_interval_ms);
+    try testing.expect(resp.assignment == null);
 }
 
 test "Broker.handleRequest ConsumerGroupHeartbeat rejects malformed request" {

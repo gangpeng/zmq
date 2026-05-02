@@ -165,8 +165,9 @@ Status: completed for the initial catalog and DeleteGroups slice.
   subscriptions, and missing-group errors from the existing group coordinator.
   ConsumerGroupHeartbeat key 68 remains non-advertised until full KIP-848
   assignment semantics exist, but direct v0 requests now validate/decode
-  generated flexible frames and can join, heartbeat, and leave through the
-  existing group coordinator.
+  generated flexible frames, can join, heartbeat, and leave through the
+  existing group coordinator, and now map stale member epochs/static instance
+  conflicts to KIP-848 `FENCED_MEMBER_EPOCH`/`UNRELEASED_INSTANCE_ID` errors.
   AssignReplicasToDirs key 73 remains non-advertised until JBOD directory
   semantics exist, but direct requests now validate/decode generated flexible
   frames and return generated fail-closed responses.
