@@ -18606,7 +18606,8 @@ pub const Broker = struct {
 
     fn validateSaslHandshakeRequestFrame(buf: []const u8, start_pos: usize) bool {
         var pos = start_pos;
-        return skipKafkaString(buf, &pos, false);
+        if (!skipKafkaString(buf, &pos, false)) return false;
+        return pos == buf.len;
     }
 
     fn validateSaslAuthenticateRequestFrame(buf: []const u8, start_pos: usize, api_version: i16) bool {
@@ -18615,7 +18616,7 @@ pub const Broker = struct {
 
         if (!skipKafkaBytes(buf, &pos, flexible)) return false; // auth_bytes
         if (flexible) ser.skipTaggedFields(buf, &pos) catch return false;
-        return true;
+        return pos == buf.len;
     }
 
     fn validateJoinGroupRequestFrame(buf: []const u8, start_pos: usize, api_version: i16) bool {
@@ -21217,6 +21218,21 @@ test "Broker.handleRequest SaslHandshake rejects truncated request" {
     try testing.expect(broker.handleRequest(buf[0..req_len]) == null);
 }
 
+test "Broker.handleRequest SaslHandshake rejects trailing bytes" {
+    const Req = generated.sasl_handshake_request.SaslHandshakeRequest;
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+
+    const req = Req{ .mechanism = "PLAIN" };
+
+    var buf: [256]u8 = undefined;
+    var pos = buildTestRequest(&buf, 17, 1, 1704, header_mod.requestHeaderVersion(17, 1));
+    req.serialize(&buf, &pos, 1);
+
+    try expectTrailingByteRejected(&broker, &buf, pos);
+}
+
 test "Broker.handleRequest SaslAuthenticate v2 returns generated flexible response" {
     const Req = generated.sasl_authenticate_request.SaslAuthenticateRequest;
     const Resp = generated.sasl_authenticate_response.SaslAuthenticateResponse;
@@ -21254,6 +21270,21 @@ test "Broker.handleRequest SaslAuthenticate rejects truncated request" {
     var buf: [128]u8 = undefined;
     const req_len = buildTestRequest(&buf, 36, 2, 3603, header_mod.requestHeaderVersion(36, 2));
     try testing.expect(broker.handleRequest(buf[0..req_len]) == null);
+}
+
+test "Broker.handleRequest SaslAuthenticate rejects trailing bytes" {
+    const Req = generated.sasl_authenticate_request.SaslAuthenticateRequest;
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+
+    const req = Req{ .auth_bytes = "auth-trailing" };
+
+    var buf: [256]u8 = undefined;
+    var pos = buildTestRequest(&buf, 36, 2, 3604, header_mod.requestHeaderVersion(36, 2));
+    req.serialize(&buf, &pos, 2);
+
+    try expectTrailingByteRejected(&broker, &buf, pos);
 }
 
 test "Broker.handleRequest Produce v0 returns generated response" {
