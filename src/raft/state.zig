@@ -119,8 +119,7 @@ pub const RaftState = struct {
     /// Register a voter in the cluster.
     pub fn addVoter(self: *RaftState, voter_id: i32) !void {
         if (self.voters.getPtr(voter_id)) |existing| {
-            self.freeVoterInfo(existing.*);
-            existing.* = .{ .node_id = voter_id };
+            existing.node_id = voter_id;
             return;
         }
         try self.voters.put(voter_id, .{ .node_id = voter_id });
@@ -2579,6 +2578,79 @@ test "RaftState proposeUpdateVoter applies endpoint metadata after commit" {
     try testing.expectEqualStrings("CONTROLLER", voter.endpoints[0].name);
     try testing.expectEqualStrings("controller-1.example", voter.endpoints[0].host);
     try testing.expectEqual(@as(u16, 19093), voter.endpoints[0].port);
+}
+
+test "RaftState addVoter preserves metadata for existing voter" {
+    var state = RaftState.init(testing.allocator, 0, "cluster");
+    defer state.deinit();
+
+    try state.addVoter(1);
+
+    const directory_id = [_]u8{4} ** 16;
+    const endpoints = [_]RaftState.VoterEndpointView{.{
+        .name = "CONTROLLER",
+        .host = "controller-1.example",
+        .port = 19093,
+    }};
+    try state.updateVoterMetadata(1, directory_id, &endpoints, 0, 1);
+
+    try state.addVoter(1);
+
+    const voter = state.voters.get(1).?;
+    try testing.expectEqualSlices(u8, &directory_id, &voter.voter_directory_id);
+    try testing.expectEqual(@as(usize, 1), voter.endpoints.len);
+    try testing.expectEqualStrings("CONTROLLER", voter.endpoints[0].name);
+    try testing.expectEqualStrings("controller-1.example", voter.endpoints[0].host);
+    try testing.expectEqual(@as(u16, 19093), voter.endpoints[0].port);
+}
+
+test "RaftState replays persisted UpdateVoter metadata after static voter registration" {
+    const tmp_dir = "/tmp/zmq-raft-voter-update-replay-test";
+    fs.deleteTreeAbsolute(tmp_dir) catch {};
+    defer fs.deleteTreeAbsolute(tmp_dir) catch {};
+
+    const directory_id = [_]u8{5} ** 16;
+    const endpoints = [_]RaftState.VoterEndpointView{.{
+        .name = "CONTROLLER",
+        .host = "controller-1-replayed.example",
+        .port = 39093,
+    }};
+
+    {
+        var state = RaftState.initWithDataDir(testing.allocator, 0, "cluster", tmp_dir);
+        defer state.deinit();
+
+        try state.addVoter(0);
+        try state.addVoter(1);
+        _ = state.startElection();
+        state.becomeLeader();
+
+        const offset = try state.proposeUpdateVoter(1, directory_id, &endpoints, 1, 3);
+        state.commit_index = offset;
+        state.applyCommittedConfigs();
+    }
+
+    {
+        var state = RaftState.initWithDataDir(testing.allocator, 0, "cluster", tmp_dir);
+        defer state.deinit();
+
+        try state.addVoter(0);
+        try state.addVoter(1);
+        const recovered = try state.loadPersistedLog();
+        try testing.expectEqual(@as(u64, 1), recovered);
+
+        state.commit_index = state.log.lastOffset();
+        state.applyCommittedConfigs();
+
+        const voter = state.voters.get(1).?;
+        try testing.expectEqualSlices(u8, &directory_id, &voter.voter_directory_id);
+        try testing.expectEqual(@as(i16, 1), voter.k_raft_min_supported_version);
+        try testing.expectEqual(@as(i16, 3), voter.k_raft_max_supported_version);
+        try testing.expectEqual(@as(usize, 1), voter.endpoints.len);
+        try testing.expectEqualStrings("CONTROLLER", voter.endpoints[0].name);
+        try testing.expectEqualStrings("controller-1-replayed.example", voter.endpoints[0].host);
+        try testing.expectEqual(@as(u16, 39093), voter.endpoints[0].port);
+    }
 }
 
 test "RaftState UpdateVoter config entry serializes and deserializes endpoints" {

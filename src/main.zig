@@ -342,6 +342,13 @@ pub fn main(init: std.process.Init) !void {
             Controller.init(alloc, node_id, cluster_id);
         controller = ctrl;
 
+        if (voters_str == null) {
+            ctrl.raft_state.addVoter(node_id) catch {};
+        } else {
+            raft_pool = RaftClientPool.init(alloc);
+            parseAndRegisterVoters(&ctrl.raft_state, voters_str.?, &raft_pool.?);
+        }
+
         if (data_dir != null) {
             const recovered = ctrl.raft_state.loadPersistedLog() catch |err| blk: {
                 log.warn("Controller Raft log recovery failed: {}", .{err});
@@ -349,21 +356,14 @@ pub fn main(init: std.process.Init) !void {
             };
             if (recovered > 0) {
                 // This implementation persists only the log image, not a separate
-                // commit-index file. On local restart, replay the durable image so
-                // controller broker metadata is not lost across rolling restarts.
+                // commit-index file. Static voters must already be registered so
+                // UpdateRaftVoter records can reapply endpoint metadata on restart.
                 ctrl.raft_state.commit_index = ctrl.raft_state.log.lastOffset();
                 ctrl.raft_state.applyCommittedConfigs();
                 _ = ctrl.replayCommittedControllerMetadataRecords() catch |err| {
                     log.warn("Controller metadata replay failed: {}", .{err});
                 };
             }
-        }
-
-        if (voters_str == null) {
-            ctrl.raft_state.addVoter(node_id) catch {};
-        } else {
-            raft_pool = RaftClientPool.init(alloc);
-            parseAndRegisterVoters(&ctrl.raft_state, voters_str.?, &raft_pool.?);
         }
 
         handler_routing.setGlobalController(ctrl);
