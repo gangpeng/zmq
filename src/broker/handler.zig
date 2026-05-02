@@ -19124,7 +19124,7 @@ pub const Broker = struct {
         }
 
         if (flexible) ser.skipTaggedFields(buf, &pos) catch return false;
-        return true;
+        return pos == buf.len;
     }
 
     fn validateEndTxnRequestFrame(buf: []const u8, start_pos: usize, api_version: i16) bool {
@@ -30943,6 +30943,35 @@ test "Broker.handleRequest AddPartitionsToTxn rejects truncated request" {
     var buf: [128]u8 = undefined;
     const req_len = buildTestRequest(&buf, 24, 4, 2405, header_mod.requestHeaderVersion(24, 4));
     try testing.expect(broker.handleRequest(buf[0..req_len]) == null);
+}
+
+test "Broker.handleRequest AddPartitionsToTxn rejects trailing bytes" {
+    const Req = generated.add_partitions_to_txn_request.AddPartitionsToTxnRequest;
+    const Topic = generated.add_partitions_to_txn_request.AddPartitionsToTxnTopic;
+    const Txn = Req.AddPartitionsToTxnTransaction;
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+
+    const partitions = [_]i32{ 0, 1 };
+    const topics = [_]Topic{.{
+        .name = "add-parts-trailing-topic",
+        .partitions = &partitions,
+    }};
+    const txns = [_]Txn{.{
+        .transactional_id = "add-parts-trailing",
+        .producer_id = 123,
+        .producer_epoch = 4,
+        .verify_only = false,
+        .topics = &topics,
+    }};
+    const req = Req{ .transactions = &txns };
+
+    var buf: [512]u8 = undefined;
+    var pos = buildTestRequest(&buf, 24, 4, 2412, header_mod.requestHeaderVersion(24, 4));
+    req.serialize(&buf, &pos, 4);
+
+    try expectTrailingByteRejected(&broker, buf[0..], pos);
 }
 
 test "Broker.handleRequest AddPartitionsToTxn v4 authorization denial uses generated response" {
