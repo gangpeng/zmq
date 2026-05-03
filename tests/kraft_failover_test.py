@@ -88,6 +88,13 @@ def write_compact_array_len(count):
     return write_varint(count + 1)
 
 
+def write_compact_i32_array(values):
+    out = bytearray(write_compact_array_len(len(values)))
+    for value in values:
+        out += struct.pack(">i", value)
+    return bytes(out)
+
+
 def read_exact(sock, size):
     data = bytearray()
     while len(data) < size:
@@ -116,6 +123,15 @@ def read_i64(buf, pos):
     return struct.unpack_from(">q", buf, pos)[0], pos + 8
 
 
+def read_string(buf, pos):
+    length, pos = read_i16(buf, pos)
+    if length < 0:
+        return None, pos
+    if pos + length > len(buf):
+        raise TestError("buffer underflow while reading string")
+    return buf[pos : pos + length].decode("utf-8", errors="replace"), pos + length
+
+
 def read_compact_string(buf, pos):
     raw_len, pos = read_varint(buf, pos)
     if raw_len == 0:
@@ -141,6 +157,26 @@ def read_compact_array_len(buf, pos):
     if raw_len == 0:
         return 0, pos
     return raw_len - 1, pos
+
+
+def read_i32_array(buf, pos):
+    count, pos = read_i32(buf, pos)
+    if count < 0:
+        return None, pos
+    values = []
+    for _ in range(count):
+        value, pos = read_i32(buf, pos)
+        values.append(value)
+    return values, pos
+
+
+def read_compact_i32_array(buf, pos):
+    count, pos = read_compact_array_len(buf, pos)
+    values = []
+    for _ in range(count):
+        value, pos = read_i32(buf, pos)
+        values.append(value)
+    return values, pos
 
 
 def read_bool(buf, pos):
@@ -238,6 +274,80 @@ def create_topic(port, name, correlation_id):
         raise TestError(f"CreateTopics error_code={error_code}")
 
 
+def metadata_partition_leader(port, topic, correlation_id):
+    body = struct.pack(">i", 1)
+    body += write_string(topic)
+    body += b"\x00"  # allow_auto_topic_creation=false
+    response = controller_request(port, 3, 4, correlation_id, body)
+
+    pos = 0
+    response_correlation, pos = read_i32(response, pos)
+    if response_correlation != correlation_id:
+        raise TestError(f"Metadata correlation mismatch: {response_correlation}")
+    _, pos = read_i32(response, pos)  # throttle_time_ms
+
+    brokers_len, pos = read_i32(response, pos)
+    if brokers_len < 0:
+        raise TestError(f"Metadata invalid broker count={brokers_len}")
+    for _ in range(brokers_len):
+        _, pos = read_i32(response, pos)  # node_id
+        _, pos = read_string(response, pos)  # host
+        _, pos = read_i32(response, pos)  # port
+        _, pos = read_string(response, pos)  # rack
+
+    _, pos = read_string(response, pos)  # cluster_id
+    _, pos = read_i32(response, pos)  # controller_id
+
+    topics_len, pos = read_i32(response, pos)
+    if topics_len != 1:
+        raise TestError(f"Metadata topic count={topics_len}")
+    topic_error, pos = read_i16(response, pos)
+    topic_name, pos = read_string(response, pos)
+    _, pos = read_bool(response, pos)  # is_internal
+    partitions_len, pos = read_i32(response, pos)
+    if topic_error != 0:
+        raise TestError(f"Metadata topic={topic_name!r} error_code={topic_error}")
+    if partitions_len != 1:
+        raise TestError(f"Metadata partitions count={partitions_len}")
+    partition_error, pos = read_i16(response, pos)
+    partition_index, pos = read_i32(response, pos)
+    leader_id, pos = read_i32(response, pos)
+    replicas, pos = read_i32_array(response, pos)
+    isr, pos = read_i32_array(response, pos)
+    if partition_error != 0 or partition_index != 0:
+        raise TestError(
+            f"Metadata partition={partition_index} error_code={partition_error}"
+        )
+    return {
+        "leader_id": leader_id,
+        "replicas": replicas,
+        "isr": isr,
+    }
+
+
+def wait_for_metadata_leader(port, topic, expected_leader, timeout=30):
+    deadline = time.time() + timeout
+    correlation_id = 3100
+    last_error = None
+    last_metadata = None
+    while time.time() < deadline:
+        try:
+            last_metadata = metadata_partition_leader(port, topic, correlation_id)
+            if last_metadata["leader_id"] == expected_leader:
+                return last_metadata
+            raise TestError(
+                f"leader_id={last_metadata['leader_id']} expected={expected_leader}"
+            )
+        except Exception as exc:
+            last_error = exc
+        correlation_id += 1
+        time.sleep(0.25)
+    raise TestError(
+        f"Metadata leader for {topic!r} did not converge to {expected_leader}: "
+        f"last_metadata={last_metadata} last_error={last_error}"
+    )
+
+
 def wait_for_topic(port, name):
     deadline = time.time() + 20
     correlation_id = 3000
@@ -283,6 +393,54 @@ def produce(port, topic, payload, correlation_id):
     return base_offset
 
 
+def produce_error_code(port, topic, payload, correlation_id):
+    body = struct.pack(">h", 1)  # acks
+    body += struct.pack(">i", 30000)
+    body += struct.pack(">i", 1)
+    body += write_string(topic)
+    body += struct.pack(">i", 1)
+    body += struct.pack(">i", 0)
+    body += struct.pack(">i", len(payload)) + payload
+
+    response = controller_request(port, 0, 0, correlation_id, body)
+    payload_body = response[4:]
+    if len(payload_body) < 24:
+        raise TestError("Produce response too short")
+    pos = 4
+    name_len = struct.unpack_from(">h", payload_body, pos)[0]
+    pos += 2 + max(name_len, 0)
+    partitions = struct.unpack_from(">i", payload_body, pos)[0]
+    if partitions != 1:
+        raise TestError(f"Produce partition response count={partitions}")
+    pos += 4
+    partition = struct.unpack_from(">i", payload_body, pos)[0]
+    pos += 4
+    error_code = struct.unpack_from(">h", payload_body, pos)[0]
+    if partition != 0:
+        raise TestError(f"Produce partition={partition} error_code={error_code}")
+    return error_code
+
+
+def wait_for_produce_error(port, topic, payload, expected_error, timeout=30):
+    deadline = time.time() + timeout
+    correlation_id = 4300
+    last_error = None
+    last_code = None
+    while time.time() < deadline:
+        try:
+            last_code = produce_error_code(port, topic, payload, correlation_id)
+            if last_code == expected_error:
+                return
+        except Exception as exc:
+            last_error = exc
+        correlation_id += 1
+        time.sleep(0.25)
+    raise TestError(
+        f"Produce to {topic!r} did not return {expected_error}: "
+        f"last_code={last_code} last_error={last_error}"
+    )
+
+
 def fetch_records(port, topic, offset, correlation_id):
     body = struct.pack(">i", -1)  # replica_id
     body += struct.pack(">i", 5000)
@@ -318,6 +476,95 @@ def fetch_records(port, topic, offset, correlation_id):
     if record_len < 0 or pos + record_len > len(payload_body):
         raise TestError(f"Fetch invalid record_len={record_len}")
     return high_watermark, payload_body[pos : pos + record_len]
+
+
+def alter_partition_reassignment(port, topic, partition, replicas, correlation_id):
+    body = struct.pack(">i", 30000)
+    body += write_compact_array_len(1)
+    body += write_compact_string(topic)
+    body += write_compact_array_len(1)
+    body += struct.pack(">i", partition)
+    body += write_compact_i32_array(replicas) if replicas is not None else b"\x00"
+    body += b"\x00"  # partition tagged fields
+    body += b"\x00"  # topic tagged fields
+    body += b"\x00"  # request tagged fields
+
+    response = automq_request(port, 45, correlation_id, body, api_version=0)
+    pos = parse_flexible_response_header(response, correlation_id)
+    _, pos = read_i32(response, pos)  # throttle_time_ms
+    top_error, pos = read_i16(response, pos)
+    _, pos = read_compact_string(response, pos)  # error_message
+    topics_len, pos = read_compact_array_len(response, pos)
+    if top_error != 0 or topics_len != 1:
+        raise TestError(f"AlterPartitionReassignments top_error={top_error} topics={topics_len}")
+    topic_name, pos = read_compact_string(response, pos)
+    partitions_len, pos = read_compact_array_len(response, pos)
+    if topic_name != topic or partitions_len != 1:
+        raise TestError(
+            f"AlterPartitionReassignments topic={topic_name!r} partitions={partitions_len}"
+        )
+    response_partition, pos = read_i32(response, pos)
+    partition_error, pos = read_i16(response, pos)
+    _, pos = read_compact_string(response, pos)  # error_message
+    if response_partition != partition:
+        raise TestError(f"AlterPartitionReassignments partition={response_partition}")
+    if partition_error != 0:
+        raise TestError(f"AlterPartitionReassignments partition_error={partition_error}")
+
+
+def list_partition_reassignment(port, topic, partition, correlation_id):
+    body = struct.pack(">i", 30000)
+    body += write_compact_array_len(1)
+    body += write_compact_string(topic)
+    body += write_compact_i32_array([partition])
+    body += b"\x00"  # topic tagged fields
+    body += b"\x00"  # request tagged fields
+
+    response = automq_request(port, 46, correlation_id, body, api_version=0)
+    pos = parse_flexible_response_header(response, correlation_id)
+    _, pos = read_i32(response, pos)  # throttle_time_ms
+    top_error, pos = read_i16(response, pos)
+    _, pos = read_compact_string(response, pos)  # error_message
+    topics_len, pos = read_compact_array_len(response, pos)
+    if top_error != 0:
+        raise TestError(f"ListPartitionReassignments top_error={top_error}")
+    if topics_len == 0:
+        return None
+    topic_name, pos = read_compact_string(response, pos)
+    partitions_len, pos = read_compact_array_len(response, pos)
+    if topic_name != topic or partitions_len == 0:
+        return None
+    response_partition, pos = read_i32(response, pos)
+    replicas, pos = read_compact_i32_array(response, pos)
+    adding, pos = read_compact_i32_array(response, pos)
+    removing, pos = read_compact_i32_array(response, pos)
+    if response_partition != partition:
+        return None
+    return {
+        "replicas": replicas,
+        "adding": adding,
+        "removing": removing,
+    }
+
+
+def wait_for_partition_reassignment(port, topic, partition, expected_replicas, timeout=30):
+    deadline = time.time() + timeout
+    correlation_id = 4600
+    last_error = None
+    last_state = None
+    while time.time() < deadline:
+        try:
+            last_state = list_partition_reassignment(port, topic, partition, correlation_id)
+            if last_state is not None and last_state["replicas"] == expected_replicas:
+                return last_state
+        except Exception as exc:
+            last_error = exc
+        correlation_id += 1
+        time.sleep(0.25)
+    raise TestError(
+        f"partition reassignment for {topic}-{partition} did not converge to "
+        f"{expected_replicas}: last_state={last_state} last_error={last_error}"
+    )
 
 
 def wait_for_produce(port, topic, payload, timeout=45):
@@ -1783,6 +2030,30 @@ def stop_process(proc, crash=False):
             log_file.close()
 
 
+def run_live_reassignment_convergence(processes, source_id):
+    source_port = processes[source_id]["broker_port"]
+    target_id = next(node_id for node_id in sorted(processes) if node_id != source_id)
+    topic = f"kraft-reassign-{os.getpid()}-{source_id}-{target_id}-{int(time.time())}"
+
+    wait_for_topic(source_port, topic)
+    wait_for_metadata_leader(source_port, topic, source_id)
+
+    before_payload = b"ra"
+    wait_for_produce(source_port, topic, before_payload)
+
+    alter_partition_reassignment(source_port, topic, 0, [target_id], 4500)
+    wait_for_partition_reassignment(source_port, topic, 0, [target_id])
+    wait_for_metadata_leader(source_port, topic, target_id)
+
+    wait_for_produce_error(source_port, topic, b"old-owner-rejected", 6)
+
+    return {
+        "topic": topic,
+        "source_id": source_id,
+        "target_id": target_id,
+    }
+
+
 def run_automq_metadata_failover_scenario(tmp):
     controller_base = PORT_BASE + 200
     broker_base = BROKER_PORT + 1200
@@ -1920,6 +2191,8 @@ def run_automq_metadata_failover_scenario(tmp):
                 registered_wal_config,
             )
             wait_for_automq_license(info["broker_port"], license_value)
+
+        reassignment_result = run_live_reassignment_convergence(processes, leader_id)
 
         stop_process(processes[leader_id]["proc"], crash=True)
         replacement_leader, after = wait_for_leader(processes, forbidden_leaders={leader_id})
@@ -2116,6 +2389,8 @@ def run_automq_metadata_failover_scenario(tmp):
             "registered_node_id": registered_node_id,
             "zone_router_epoch": zone_router_epoch_after,
             "old_leader_fresh_rejoin": True,
+            "reassignment_topic": reassignment_result["topic"],
+            "reassignment_target": reassignment_result["target_id"],
             "epoch": after["leader_epoch"],
         }
     finally:
@@ -2261,6 +2536,8 @@ def main():
             f"automq_stream_set_object_id={automq_result['stream_set_object_id']}, "
             f"automq_node_id={automq_result['registered_node_id']}, "
             f"automq_zone_router_epoch={automq_result['zone_router_epoch']}, "
+            f"reassignment_topic={automq_result['reassignment_topic']}, "
+            f"reassignment_target={automq_result['reassignment_target']}, "
             f"automq_old_leader_fresh_rejoin={automq_result['old_leader_fresh_rejoin']})"
         )
         return 0
