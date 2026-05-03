@@ -286,6 +286,8 @@ Status: completed for the initial catalog and DeleteGroups slice.
   and tagged-fields section.
   CreatePartitions now rejects trailing bytes after topic assignments, timeout,
   validate-only flag, and tagged-fields section.
+  IncrementalAlterConfigs now rejects trailing bytes after resources,
+  config operations/values, validate-only flag, and tagged-fields section.
   MetadataRequest generated decoding now preserves nullable `Topics` semantics:
   v1+ null requests all topics, explicit empty arrays request no topic results,
   and v0 null topics are rejected as malformed.

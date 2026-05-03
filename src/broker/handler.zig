@@ -19410,7 +19410,7 @@ pub const Broker = struct {
         }
         if (!skipFixedBytes(buf, &pos, 1)) return false; // validate_only
         if (flexible) ser.skipTaggedFields(buf, &pos) catch return false;
-        return true;
+        return pos == buf.len;
     }
 
     fn validateVoteRequestFrame(buf: []const u8, start_pos: usize, api_version: i16) bool {
@@ -25494,6 +25494,34 @@ test "Broker.handleRequest IncrementalAlterConfigs rejects truncated request" {
     var buf: [128]u8 = undefined;
     const req_len = buildTestRequest(&buf, 44, 1, 4404, header_mod.requestHeaderVersion(44, 1));
     try testing.expect(broker.handleRequest(buf[0..req_len]) == null);
+}
+
+test "Broker.handleRequest IncrementalAlterConfigs rejects trailing bytes" {
+    const Req = generated.incremental_alter_configs_request.IncrementalAlterConfigsRequest;
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+
+    const configs = [_]Req.AlterConfigsResource.AlterableConfig{.{
+        .name = "retention.ms",
+        .config_operation = 0,
+        .value = "1234",
+    }};
+    const resources = [_]Req.AlterConfigsResource{.{
+        .resource_type = 2,
+        .resource_name = "inc-cfg-trailing-topic",
+        .configs = &configs,
+    }};
+    const req = Req{
+        .resources = &resources,
+        .validate_only = false,
+    };
+
+    var buf: [512]u8 = undefined;
+    var pos = buildTestRequest(&buf, 44, 1, 4406, header_mod.requestHeaderVersion(44, 1));
+    req.serialize(&buf, &pos, 1);
+
+    try expectTrailingByteRejected(&broker, &buf, pos);
 }
 
 test "Broker.handleRequest OffsetDelete returns generated response and deletes offsets" {
