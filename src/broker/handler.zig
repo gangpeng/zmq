@@ -19164,7 +19164,7 @@ pub const Broker = struct {
         if (api_version >= 1 and !skipFixedBytes(buf, &pos, @sizeOf(i64))) return false; // duration_filter
 
         ser.skipTaggedFields(buf, &pos) catch return false;
-        return true;
+        return pos == buf.len;
     }
 
     fn validateDescribeTopicPartitionsRequestFrame(buf: []const u8, start_pos: usize) bool {
@@ -23058,6 +23058,27 @@ test "Broker.handleRequest ListTransactions rejects truncated request" {
     var buf: [128]u8 = undefined;
     const req_len = buildTestRequest(&buf, 66, 1, 6602, header_mod.requestHeaderVersion(66, 1));
     try testing.expect(broker.handleRequest(buf[0..req_len]) == null);
+}
+
+test "Broker.handleRequest ListTransactions rejects trailing bytes" {
+    const Req = generated.list_transactions_request.ListTransactionsRequest;
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+
+    const state_filters = [_]?[]const u8{"Ongoing"};
+    const producer_id_filters = [_]i64{12345};
+    const req = Req{
+        .state_filters = &state_filters,
+        .producer_id_filters = &producer_id_filters,
+        .duration_filter = -1,
+    };
+
+    var buf: [256]u8 = undefined;
+    var pos = buildTestRequest(&buf, 66, 1, 6604, header_mod.requestHeaderVersion(66, 1));
+    req.serialize(&buf, &pos, 1);
+
+    try expectTrailingByteRejected(&broker, &buf, pos);
 }
 
 test "Broker.handleRequest ListTransactions authorization denial uses generated response" {
