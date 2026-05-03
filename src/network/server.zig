@@ -325,7 +325,9 @@ pub const Server = struct {
 
             // Update active connections gauge after each io_uring iteration
             if (self.metrics) |m| {
-                m.setGauge("kafka_network_connections_active", @floatFromInt(connections.count()));
+                const active_connections = @as(f64, @floatFromInt(connections.count()));
+                m.setGauge("kafka_network_connections_active", active_connections);
+                m.setGauge("Kafka_server_connection_count", active_connections);
             }
         }
 
@@ -598,7 +600,9 @@ pub const Server = struct {
 
             // Update active connections gauge after each epoll iteration
             if (self.metrics) |m| {
-                m.setGauge("kafka_network_connections_active", @floatFromInt(connections.count()));
+                const active_connections = @as(f64, @floatFromInt(connections.count()));
+                m.setGauge("kafka_network_connections_active", active_connections);
+                m.setGauge("Kafka_server_connection_count", active_connections);
             }
 
             // Check if drain phase is complete (all connections done or timeout elapsed).

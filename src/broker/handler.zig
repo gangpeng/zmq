@@ -995,10 +995,18 @@ pub const Broker = struct {
             }
         }
 
-        // Track active group/member counts in metrics
-        self.metrics.setGauge("kafka_server_group_count", @floatFromInt(self.groups.groupCount()));
-        self.metrics.setGauge("kafka_server_topic_count", @floatFromInt(self.topics.count()));
+        // Track active group/member counts in metrics.
+        const group_count = self.groups.groupCount();
+        const topic_count = self.topics.count();
+        const partition_count = self.brokerPartitionCount();
+        self.metrics.setGauge("kafka_server_group_count", @floatFromInt(group_count));
+        self.metrics.setGauge("kafka_server_topic_count", @floatFromInt(topic_count));
         self.metrics.setGauge("kafka_server_member_count", @floatFromInt(self.groups.totalMemberCount()));
+        self.metrics.setGauge("kafka_server_partition_count", @floatFromInt(partition_count));
+        self.metrics.setGauge("Kafka_group_count", @floatFromInt(group_count));
+        self.metrics.setGauge("Kafka_topic_count", @floatFromInt(topic_count));
+        self.metrics.setGauge("Kafka_partition_count", @floatFromInt(partition_count));
+        self.metrics.setGauge("Kafka_partition_total_count", @floatFromInt(partition_count));
 
         // Periodically persist committed offsets and group state
         self.persistOffsets();
@@ -1030,6 +1038,15 @@ pub const Broker = struct {
         // has elapsed. This discards the oldest buffer and moves current → previous,
         // matching AutoMQ's ScheduledExecutorService-based rotation.
         self.object_manager.prepared_registry.maybeRotate();
+    }
+
+    fn brokerPartitionCount(self: *const Broker) usize {
+        var count: usize = 0;
+        var it = self.topics.valueIterator();
+        while (it.next()) |topic| {
+            if (topic.num_partitions > 0) count += @intCast(topic.num_partitions);
+        }
+        return count;
     }
 
     const ExpiredTransaction = struct {
@@ -4866,6 +4883,11 @@ pub const Broker = struct {
         if (api_name.len > 0) {
             self.metrics.incrementCounter(api_name);
         }
+        const api_type_for_metrics = apiRequestTypeName(api_key);
+        var api_version_buf: [16]u8 = undefined;
+        const api_version_str = std.fmt.bufPrint(&api_version_buf, "{d}", .{api_version}) catch "?";
+        self.metrics.incrementLabeledCounter("Kafka_request_count_total", &.{ api_type_for_metrics, api_version_str });
+        self.metrics.addLabeledCounter("Kafka_request_size_bytes_total", &.{ api_type_for_metrics, api_version_str }, @intCast(request_bytes.len));
 
         // Record per-API latency
         const t_start = @import("time_compat").nanoTimestamp();
@@ -4982,14 +5004,20 @@ pub const Broker = struct {
         const latency_ns = t_done - t_start;
         const latency_secs: f64 = @as(f64, @floatFromInt(@max(latency_ns, 0))) / 1_000_000_000.0;
         self.metrics.observeHistogram("kafka_server_request_latency_seconds", latency_secs);
+        const latency_ms: u64 = @intFromFloat(@max(latency_secs * 1000.0, 0.0));
+        self.metrics.addLabeledCounter("Kafka_request_time_milliseconds_total", &.{ api_type_for_metrics, api_version_str }, latency_ms);
 
         if (result) |resp| {
             self.metrics.addCounter("kafka_server_bytes_out_total", resp.len);
+            self.metrics.addLabeledCounter("Kafka_response_size_bytes_total", &.{ api_type_for_metrics, api_version_str }, @intCast(resp.len));
 
             // Track per-API error counters. Extract top-level error_code from the response.
             // Response format: correlation_id(4) [+ tagged_fields for flexible] + [throttle_time] + error_code(2).
             // We use a helper to find the error_code offset per API.
             const error_code = extractResponseErrorCode(resp, api_key, api_version, resp_header_version);
+            var error_metric_buf: [64]u8 = undefined;
+            const error_metric_name = errorNameForMetrics(error_code, &error_metric_buf);
+            self.metrics.incrementLabeledCounter("Kafka_request_error_count_total", &.{ api_type_for_metrics, api_version_str, error_metric_name });
             if (error_code != 0) {
                 var ec_buf: [8]u8 = undefined;
                 const ec_str = std.fmt.bufPrint(&ec_buf, "{d}", .{error_code}) catch "?";
@@ -5093,6 +5121,31 @@ pub const Broker = struct {
     /// Get a human-readable name for an API key (used for metrics).
     fn apiKeyName(api_key: i16) []const u8 {
         return api_support.brokerMetricName(api_key);
+    }
+
+    fn apiRequestTypeName(api_key: i16) []const u8 {
+        if (api_support.findBrokerSupport(api_key)) |api| return api.name;
+        if (api_support.findGeneratedRequest(api_key)) |api| {
+            if (std.mem.endsWith(u8, api.name, "Request")) {
+                return api.name[0 .. api.name.len - "Request".len];
+            }
+            return api.name;
+        }
+        return "Unknown";
+    }
+
+    fn errorNameForMetrics(error_code: i16, buffer: *[64]u8) []const u8 {
+        if (error_code == 0) return "NONE";
+        if (error_code < 0 or error_code > @intFromEnum(ErrorCode.transaction_abortable)) {
+            return std.fmt.bufPrint(buffer, "CODE_{d}", .{error_code}) catch "UNKNOWN";
+        }
+        const error_enum: ErrorCode = @enumFromInt(error_code);
+        const raw = @tagName(error_enum);
+        const len = @min(raw.len, buffer.len);
+        for (raw[0..len], 0..) |byte, idx| {
+            buffer[idx] = if (byte >= 'a' and byte <= 'z') byte - ('a' - 'A') else byte;
+        }
+        return buffer[0..len];
     }
 
     /// Map API key to the corresponding ACL resource type (fix #7).
@@ -50930,6 +50983,70 @@ test "Broker kafka_network_connections_active is registered" {
     defer broker.deinit();
 
     try testing.expect(broker.metrics.gauges.contains("kafka_network_connections_active"));
+    try testing.expect(broker.metrics.gauges.contains("Kafka_server_connection_count"));
+}
+
+test "Broker exports AutoMQ-compatible request metrics" {
+    const Req = generated.api_versions_request.ApiVersionsRequest;
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+
+    const req = Req{
+        .client_software_name = "zmq",
+        .client_software_version = "0.1.0",
+    };
+    var buf: [512]u8 = undefined;
+    var pos = buildTestRequest(&buf, 18, 3, 1803, header_mod.requestHeaderVersion(18, 3));
+    req.serialize(&buf, &pos, 3);
+
+    const response = broker.handleRequest(buf[0..pos]);
+    try testing.expect(response != null);
+    defer testing.allocator.free(response.?);
+
+    const request_key = "Kafka_request_count_total{type=\"ApiVersions\",version=\"3\"}";
+    const request_entry = broker.metrics.labeled_counters.get(request_key);
+    try testing.expect(request_entry != null);
+    try testing.expectEqual(@as(u64, 1), request_entry.?.value);
+
+    const request_bytes_key = "Kafka_request_size_bytes_total{type=\"ApiVersions\",version=\"3\"}";
+    const request_bytes_entry = broker.metrics.labeled_counters.get(request_bytes_key);
+    try testing.expect(request_bytes_entry != null);
+    try testing.expectEqual(@as(u64, pos), request_bytes_entry.?.value);
+
+    const response_bytes_key = "Kafka_response_size_bytes_total{type=\"ApiVersions\",version=\"3\"}";
+    const response_bytes_entry = broker.metrics.labeled_counters.get(response_bytes_key);
+    try testing.expect(response_bytes_entry != null);
+    try testing.expectEqual(@as(u64, response.?.len), response_bytes_entry.?.value);
+
+    const error_key = "Kafka_request_error_count_total{type=\"ApiVersions\",version=\"3\",error=\"NONE\"}";
+    const error_entry = broker.metrics.labeled_counters.get(error_key);
+    try testing.expect(error_entry != null);
+    try testing.expectEqual(@as(u64, 1), error_entry.?.value);
+
+    const output = try broker.metrics.exportPrometheus(testing.allocator);
+    defer testing.allocator.free(output);
+    try testing.expect(std.mem.indexOf(u8, output, "# TYPE Kafka_request_count_total counter") != null);
+    try testing.expect(std.mem.indexOf(u8, output, request_key) != null);
+    try testing.expect(std.mem.indexOf(u8, output, response_bytes_key) != null);
+}
+
+test "Broker tick exports AutoMQ-compatible broker gauges" {
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+
+    _ = broker.ensureTopic("automq-metric-topic-a");
+    _ = broker.ensureTopic("automq-metric-topic-b");
+    if (broker.topics.getPtr("automq-metric-topic-b")) |topic| topic.num_partitions = 3;
+    const subscriptions = [_][]const u8{"automq-metric-topic-a"};
+    _ = try broker.groups.joinGroup("automq-metric-group", "member-a", "consumer", &subscriptions);
+
+    broker.tick();
+
+    try testing.expectEqual(@as(f64, 2.0), broker.metrics.gauges.get("Kafka_topic_count").?.value);
+    try testing.expectEqual(@as(f64, 1.0), broker.metrics.gauges.get("Kafka_group_count").?.value);
+    try testing.expectEqual(@as(f64, 4.0), broker.metrics.gauges.get("Kafka_partition_count").?.value);
+    try testing.expectEqual(@as(f64, 4.0), broker.metrics.gauges.get("Kafka_partition_total_count").?.value);
 }
 
 test "Broker client telemetry metrics are registered" {
@@ -50965,6 +51082,11 @@ test "Broker error counter increments on API error" {
     const entry = broker.metrics.labeled_counters.get(key);
     try testing.expect(entry != null);
     try testing.expect(entry.?.value >= 1);
+
+    const automq_key = "Kafka_request_error_count_total{type=\"Heartbeat\",version=\"0\",error=\"UNKNOWN_MEMBER_ID\"}";
+    const automq_entry = broker.metrics.labeled_counters.get(automq_key);
+    try testing.expect(automq_entry != null);
+    try testing.expectEqual(@as(u64, 1), automq_entry.?.value);
 }
 
 test "Broker consumer lag computed on offset commit" {

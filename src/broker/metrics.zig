@@ -34,6 +34,36 @@ pub fn registerBrokerMetrics(registry: *MetricRegistry) !void {
     try registry.registerGauge("kafka_server_group_count", "Number of consumer groups");
     try registry.registerGauge("kafka_server_topic_count", "Number of topics");
     try registry.registerGauge("kafka_server_member_count", "Number of consumer group members");
+    try registry.registerGauge("Kafka_server_connection_count", "AutoMQ-compatible active connection count");
+    try registry.registerGauge("Kafka_topic_count", "AutoMQ-compatible topic count");
+    try registry.registerGauge("Kafka_group_count", "AutoMQ-compatible consumer group count");
+    try registry.registerGauge("Kafka_partition_count", "AutoMQ-compatible local partition count");
+    try registry.registerGauge("Kafka_partition_total_count", "AutoMQ-compatible cluster partition count");
+    try registry.registerLabeledCounter(
+        "Kafka_request_count_total",
+        "AutoMQ-compatible Kafka request count by API type and version",
+        &.{ "type", "version" },
+    );
+    try registry.registerLabeledCounter(
+        "Kafka_request_size_bytes_total",
+        "AutoMQ-compatible Kafka request bytes by API type and version",
+        &.{ "type", "version" },
+    );
+    try registry.registerLabeledCounter(
+        "Kafka_response_size_bytes_total",
+        "AutoMQ-compatible Kafka response bytes by API type and version",
+        &.{ "type", "version" },
+    );
+    try registry.registerLabeledCounter(
+        "Kafka_request_time_milliseconds_total",
+        "AutoMQ-compatible Kafka request handling time by API type and version",
+        &.{ "type", "version" },
+    );
+    try registry.registerLabeledCounter(
+        "Kafka_request_error_count_total",
+        "AutoMQ-compatible Kafka request result count by API type, version, and error",
+        &.{ "type", "version", "error" },
+    );
     // Per-API error counter (labeled by api name and error code)
     try registry.registerLabeledCounter(
         "kafka_server_api_errors_total",
@@ -115,6 +145,16 @@ test "registerBrokerMetrics" {
     try testing.expect(registry.gauges.contains("kafka_server_active_connections"));
     try testing.expect(registry.histograms.contains("kafka_server_request_latency_seconds"));
     // Sprint 5: per-API error counter, consumer lag, active connections
+    try testing.expect(registry.labeled_counter_meta.contains("Kafka_request_count_total"));
+    try testing.expect(registry.labeled_counter_meta.contains("Kafka_request_error_count_total"));
+    try testing.expect(registry.labeled_counter_meta.contains("Kafka_request_size_bytes_total"));
+    try testing.expect(registry.labeled_counter_meta.contains("Kafka_response_size_bytes_total"));
+    try testing.expect(registry.labeled_counter_meta.contains("Kafka_request_time_milliseconds_total"));
+    try testing.expect(registry.gauges.contains("Kafka_server_connection_count"));
+    try testing.expect(registry.gauges.contains("Kafka_topic_count"));
+    try testing.expect(registry.gauges.contains("Kafka_group_count"));
+    try testing.expect(registry.gauges.contains("Kafka_partition_count"));
+    try testing.expect(registry.gauges.contains("Kafka_partition_total_count"));
     try testing.expect(registry.labeled_counter_meta.contains("kafka_server_api_errors_total"));
     try testing.expect(registry.labeled_gauge_meta.contains("kafka_consumer_lag"));
     try testing.expect(registry.gauges.contains("kafka_network_connections_active"));
