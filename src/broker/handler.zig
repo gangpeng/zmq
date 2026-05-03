@@ -2229,6 +2229,35 @@ pub const Broker = struct {
         if (first_error) |err| return err;
     }
 
+    fn persistDeleteTopicsCleanupLocalDurably(self: *Broker) !void {
+        var first_error: ?anyerror = null;
+        self.persistTopicsLocalDurably() catch |err| {
+            log.warn("DeleteTopics topics checkpoint failed: {}", .{err});
+            first_error = err;
+        };
+        self.persistReplicaDirectoryAssignmentsDurably() catch |err| {
+            log.warn("DeleteTopics replica-directory checkpoint failed: {}", .{err});
+            if (first_error == null) first_error = err;
+        };
+        self.persistShareGroupStatesDurably() catch |err| {
+            log.warn("DeleteTopics share-group state checkpoint failed: {}", .{err});
+            if (first_error == null) first_error = err;
+        };
+        self.persistPartitionStatesDurably() catch |err| {
+            log.warn("DeleteTopics partition-state checkpoint failed: {}", .{err});
+            if (first_error == null) first_error = err;
+        };
+        self.persistence.savePartitionReassignments(&self.partition_reassignments) catch |err| {
+            log.warn("DeleteTopics partition-reassignment checkpoint failed: {}", .{err});
+            if (first_error == null) first_error = err;
+        };
+        self.persistObjectManagerSnapshotDurably() catch |err| {
+            log.warn("DeleteTopics ObjectManager snapshot failed: {}", .{err});
+            if (first_error == null) first_error = err;
+        };
+        if (first_error) |err| return err;
+    }
+
     /// Persist ongoing partition reassignment state to disk (best-effort).
     fn persistPartitionReassignments(self: *Broker) void {
         self.persistPartitionReassignmentsDurably() catch |err| {
@@ -14262,12 +14291,15 @@ pub const Broker = struct {
                     self.cleanupDeletedTopicData(topic_name, outcome.topic_id, outcome.partition_count);
                 }
             }
-            self.persistTopicsLocal();
-            self.persistReplicaDirectoryAssignmentsLocal();
-            self.persistShareGroupStatesLocal();
-            self.persistPartitionStates();
-            self.persistPartitionReassignments();
-            self.persistObjectManagerSnapshot();
+            self.persistDeleteTopicsCleanupLocalDurably() catch |err| {
+                log.warn("DeleteTopics local cleanup checkpoint failed after topic snapshot commit: {}", .{err});
+                for (responses[0..responses_init], delete_outcomes[0..responses_init]) |*response, outcome| {
+                    if (outcome.deleted and response.error_code == @intFromEnum(ErrorCode.none)) {
+                        response.error_code = @intFromEnum(ErrorCode.kafka_storage_error);
+                        response.error_message = "Failed to persist topic cleanup";
+                    }
+                }
+            };
         }
 
         const resp = Resp{
@@ -48731,6 +48763,117 @@ test "Broker.handleRequest DeleteTopics rolls back when topic snapshot S3 WAL wr
     const restored_directory = (try broker.getReplicaDirectoryAssignment(topic_id, 0)) orelse return error.ExpectedReplicaDirectoryAssignment;
     try testing.expectEqualSlices(u8, replica_directory_id[0..], restored_directory[0..]);
     try testing.expectEqual(object_count_before, mock_s3.objectCount());
+}
+
+test "Broker.handleRequest DeleteTopics reports storage error when local partition cleanup checkpoint fails" {
+    const fs = @import("fs_compat");
+    const Req = generated.delete_topics_request.DeleteTopicsRequest;
+    const Resp = generated.delete_topics_response.DeleteTopicsResponse;
+    const Topic = Req.DeleteTopicState;
+
+    const tmp_dir = "/tmp/zmq-delete-topics-local-partition-cleanup-fail-test";
+    fs.deleteTreeAbsolute(tmp_dir) catch {};
+    try fs.makeDirAbsolute(tmp_dir);
+    defer fs.deleteTreeAbsolute(tmp_dir) catch {};
+
+    var broker = Broker.initWithConfig(testing.allocator, 1, 9092, .{ .data_dir = tmp_dir });
+    defer broker.deinit();
+
+    try testing.expect(broker.ensureTopic("dt-partition-cleanup-fail-topic"));
+    const topic_id = broker.topics.get("dt-partition-cleanup-fail-topic").?.topic_id;
+
+    const partition_state_path = try std.fmt.allocPrint(testing.allocator, "{s}/partition_state.meta", .{tmp_dir});
+    defer testing.allocator.free(partition_state_path);
+    fs.deleteFileAbsolute(partition_state_path) catch {};
+    try fs.makeDirAbsolute(partition_state_path);
+
+    const topics = [_]Topic{.{
+        .name = "dt-partition-cleanup-fail-topic",
+        .topic_id = topic_id,
+    }};
+    const req = Req{
+        .topics = &topics,
+        .timeout_ms = 30000,
+    };
+
+    var buf: [512]u8 = undefined;
+    var pos = buildTestRequest(&buf, 20, 6, 2011, header_mod.requestHeaderVersion(20, 6));
+    req.serialize(&buf, &pos, 6);
+
+    const response = broker.handleRequest(buf[0..pos]);
+    try testing.expect(response != null);
+    defer testing.allocator.free(response.?);
+
+    var rpos: usize = 0;
+    var response_header = try ResponseHeader.deserialize(testing.allocator, response.?, &rpos, header_mod.responseHeaderVersion(20, 6));
+    defer response_header.deinit(testing.allocator);
+    try testing.expectEqual(@as(i32, 2011), response_header.correlation_id);
+
+    const resp = try Resp.deserialize(testing.allocator, response.?, &rpos, 6);
+    defer if (resp.responses.len > 0) testing.allocator.free(resp.responses);
+
+    try testing.expectEqual(response.?.len, rpos);
+    try testing.expectEqual(@as(usize, 1), resp.responses.len);
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.kafka_storage_error)), resp.responses[0].error_code);
+    try testing.expectEqualStrings("Failed to persist topic cleanup", resp.responses[0].error_message.?);
+    try testing.expect(!broker.topics.contains("dt-partition-cleanup-fail-topic"));
+    try testing.expect(!broker.store.partitions.contains("dt-partition-cleanup-fail-topic-0"));
+}
+
+test "Broker.handleRequest DeleteTopics reports storage error when local object cleanup snapshot fails" {
+    const fs = @import("fs_compat");
+    const Req = generated.delete_topics_request.DeleteTopicsRequest;
+    const Resp = generated.delete_topics_response.DeleteTopicsResponse;
+    const Topic = Req.DeleteTopicState;
+
+    const tmp_dir = "/tmp/zmq-delete-topics-local-object-cleanup-fail-test";
+    fs.deleteTreeAbsolute(tmp_dir) catch {};
+    try fs.makeDirAbsolute(tmp_dir);
+    defer fs.deleteTreeAbsolute(tmp_dir) catch {};
+
+    var broker = Broker.initWithConfig(testing.allocator, 1, 9092, .{ .data_dir = tmp_dir });
+    defer broker.deinit();
+    try broker.open();
+
+    try testing.expect(broker.ensureTopic("dt-object-cleanup-fail-topic"));
+    const topic_id = broker.topics.get("dt-object-cleanup-fail-topic").?.topic_id;
+
+    const object_snapshot_path = try std.fmt.allocPrint(testing.allocator, "{s}/objects.snapshot", .{tmp_dir});
+    defer testing.allocator.free(object_snapshot_path);
+    fs.deleteFileAbsolute(object_snapshot_path) catch {};
+    try fs.makeDirAbsolute(object_snapshot_path);
+
+    const topics = [_]Topic{.{
+        .name = "dt-object-cleanup-fail-topic",
+        .topic_id = topic_id,
+    }};
+    const req = Req{
+        .topics = &topics,
+        .timeout_ms = 30000,
+    };
+
+    var buf: [512]u8 = undefined;
+    var pos = buildTestRequest(&buf, 20, 6, 2012, header_mod.requestHeaderVersion(20, 6));
+    req.serialize(&buf, &pos, 6);
+
+    const response = broker.handleRequest(buf[0..pos]);
+    try testing.expect(response != null);
+    defer testing.allocator.free(response.?);
+
+    var rpos: usize = 0;
+    var response_header = try ResponseHeader.deserialize(testing.allocator, response.?, &rpos, header_mod.responseHeaderVersion(20, 6));
+    defer response_header.deinit(testing.allocator);
+    try testing.expectEqual(@as(i32, 2012), response_header.correlation_id);
+
+    const resp = try Resp.deserialize(testing.allocator, response.?, &rpos, 6);
+    defer if (resp.responses.len > 0) testing.allocator.free(resp.responses);
+
+    try testing.expectEqual(response.?.len, rpos);
+    try testing.expectEqual(@as(usize, 1), resp.responses.len);
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.kafka_storage_error)), resp.responses[0].error_code);
+    try testing.expectEqualStrings("Failed to persist topic cleanup", resp.responses[0].error_message.?);
+    try testing.expect(!broker.topics.contains("dt-object-cleanup-fail-topic"));
+    try testing.expect(!broker.store.partitions.contains("dt-object-cleanup-fail-topic-0"));
 }
 
 test "Broker.handleRequest DeleteTopics rejects truncated request" {
