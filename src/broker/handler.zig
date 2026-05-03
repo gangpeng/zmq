@@ -1581,11 +1581,16 @@ pub const Broker = struct {
             }
 
             const owned_key = try reassignmentKey(self.allocator, entry.topic, entry.partition_index);
-            errdefer self.allocator.free(owned_key);
+            var owned_key_owned = true;
+            errdefer if (owned_key_owned) self.allocator.free(owned_key);
             var restored = try self.partitionReassignmentFromEntry(entry);
-            errdefer restored.deinit(self.allocator);
+            var restored_owned = true;
+            errdefer if (restored_owned) restored.deinit(self.allocator);
 
             try self.partition_reassignments.put(owned_key, restored);
+            owned_key_owned = false;
+            restored_owned = false;
+            try self.applyPartitionReassignmentOwnership(entry.topic, entry.partition_index, entry.replicas);
         }
     }
 
@@ -8013,18 +8018,20 @@ pub const Broker = struct {
         }
 
         for (0..partition_count) |partition_index| {
+            const partition_index_i32: i32 = @intCast(partition_index);
+            const owner = self.partitionOwnerOrSelf(topic_info.name, partition_index_i32);
             const replicas = try self.allocator.alloc(i32, 1);
             errdefer self.allocator.free(replicas);
-            replicas[0] = self.node_id;
+            replicas[0] = owner;
 
             const isr = try self.allocator.alloc(i32, 1);
             errdefer self.allocator.free(isr);
-            isr[0] = self.node_id;
+            isr[0] = owner;
 
             partitions[partitions_init] = .{
                 .error_code = @intFromEnum(ErrorCode.none),
-                .partition_index = @intCast(partition_index),
-                .leader_id = self.node_id,
+                .partition_index = partition_index_i32,
+                .leader_id = owner,
                 .leader_epoch = if (self.raft_state) |rs| rs.current_epoch else self.cached_leader_epoch,
                 .replica_nodes = replicas,
                 .isr_nodes = isr,
@@ -8040,6 +8047,31 @@ pub const Broker = struct {
             .is_internal = std.mem.startsWith(u8, topic_info.name, "__"),
             .partitions = partitions[0..partitions_init],
         };
+    }
+
+    fn partitionOwnerOrSelf(self: *const Broker, topic_name: []const u8, partition_index: i32) i32 {
+        return self.failover_controller.findPartitionOwner(topic_name, partition_index) orelse self.node_id;
+    }
+
+    fn partitionRequestError(self: *const Broker, topic_name: []const u8, partition_index: i32) ?i16 {
+        if (self.topics.get(topic_name)) |topic_info| {
+            if (partition_index < 0 or partition_index >= topic_info.num_partitions) {
+                return @intFromEnum(ErrorCode.unknown_topic_or_partition);
+            }
+            if (self.partitionOwnerOrSelf(topic_name, partition_index) != self.node_id) {
+                return @intFromEnum(ErrorCode.not_leader_or_follower);
+            }
+            return null;
+        }
+
+        if (self.storePartitionExists(topic_name, partition_index)) return null;
+        return @intFromEnum(ErrorCode.unknown_topic_or_partition);
+    }
+
+    fn storePartitionExists(self: *const Broker, topic_name: []const u8, partition_index: i32) bool {
+        var key_buf: [256]u8 = undefined;
+        const key = std.fmt.bufPrint(&key_buf, "{s}-{d}", .{ topic_name, partition_index }) catch return false;
+        return self.store.partitions.contains(key);
     }
 
     // ---------------------------------------------------------------
@@ -8217,6 +8249,18 @@ pub const Broker = struct {
         // Auto-create topic if needed
         _ = self.ensureTopic(topic_name);
         object_metadata_dirty.* = true;
+
+        if (self.partitionRequestError(topic_name, partition_req.index)) |error_code| {
+            return .{
+                .index = partition_req.index,
+                .error_code = error_code,
+                .base_offset = -1,
+                .log_append_time_ms = -1,
+                .log_start_offset = -1,
+                .record_errors = &.{},
+                .error_message = null,
+            };
+        }
 
         // Actually produce (skip if duplicate or CRC invalid)
         var was_wal_fenced = false;
@@ -8520,6 +8564,19 @@ pub const Broker = struct {
 
     fn buildFetchPartitionResponse(self: *Broker, topic_name: []const u8, partition_req: generated.fetch_request.FetchRequest.FetchTopic.FetchPartition, isolation_level: i8) generated.fetch_response.FetchResponse.FetchableTopicResponse.PartitionData {
         const fetch_offset: u64 = if (partition_req.fetch_offset < 0) 0 else @intCast(partition_req.fetch_offset);
+        if (self.partitionRequestError(topic_name, partition_req.partition)) |error_code| {
+            return .{
+                .partition_index = partition_req.partition,
+                .error_code = error_code,
+                .high_watermark = 0,
+                .last_stable_offset = -1,
+                .log_start_offset = 0,
+                .aborted_transactions = if (isolation_level == 1) &.{} else null,
+                .preferred_read_replica = -1,
+                .records = null,
+            };
+        }
+
         const fetch_result = self.store.fetchWithIsolation(topic_name, partition_req.partition, fetch_offset, 1024 * 1024, isolation_level) catch |err| blk: {
             log.debug("Fetch failed for {s}-{d} at offset {d}: {}", .{ topic_name, partition_req.partition, fetch_offset, err });
             break :blk PartitionStore.FetchResult{
@@ -17651,7 +17708,7 @@ pub const Broker = struct {
 
         for (0..partition_count) |offset| {
             const partition_index: i32 = @intCast(start_partition + offset);
-            partitions[partitions_init] = try self.buildDescribeTopicPartitionsPartitionResponse(partition_index);
+            partitions[partitions_init] = try self.buildDescribeTopicPartitionsPartitionResponse(topic_info.name, partition_index);
             partitions_init += 1;
         }
 
@@ -17674,19 +17731,20 @@ pub const Broker = struct {
         };
     }
 
-    fn buildDescribeTopicPartitionsPartitionResponse(self: *Broker, partition_index: i32) !generated.describe_topic_partitions_response.DescribeTopicPartitionsResponse.DescribeTopicPartitionsResponseTopic.DescribeTopicPartitionsResponsePartition {
+    fn buildDescribeTopicPartitionsPartitionResponse(self: *Broker, topic_name: []const u8, partition_index: i32) !generated.describe_topic_partitions_response.DescribeTopicPartitionsResponse.DescribeTopicPartitionsResponseTopic.DescribeTopicPartitionsResponsePartition {
+        const owner = self.partitionOwnerOrSelf(topic_name, partition_index);
         const replicas = try self.allocator.alloc(i32, 1);
         errdefer self.allocator.free(replicas);
-        replicas[0] = self.node_id;
+        replicas[0] = owner;
 
         const isr = try self.allocator.alloc(i32, 1);
         errdefer self.allocator.free(isr);
-        isr[0] = self.node_id;
+        isr[0] = owner;
 
         return .{
             .error_code = @intFromEnum(ErrorCode.none),
             .partition_index = partition_index,
-            .leader_id = self.node_id,
+            .leader_id = owner,
             .leader_epoch = if (self.raft_state) |rs| rs.current_epoch else self.cached_leader_epoch,
             .replica_nodes = replicas,
             .isr_nodes = isr,
@@ -17793,8 +17851,14 @@ pub const Broker = struct {
         const replicas = partition_req.replicas orelse {
             const removed_existing = self.partition_reassignments.fetchRemove(lookup_key);
             if (removed_existing) |removed| {
+                const previous_owner = self.partitionOwnerOrSelf(topic_name, partition_req.partition_index);
+                self.applyPartitionReassignmentOwnership(topic_name, partition_req.partition_index, &[_]i32{self.node_id}) catch |err| {
+                    self.restorePartitionReassignmentMapEntry(removed);
+                    return err;
+                };
                 self.persistPartitionReassignmentsDurably() catch |err| {
                     self.restorePartitionReassignmentMapEntry(removed);
+                    self.restorePartitionOwner(topic_name, partition_req.partition_index, previous_owner);
                     return err;
                 };
                 self.freePartitionReassignmentMapEntry(removed);
@@ -17809,9 +17873,17 @@ pub const Broker = struct {
 
         if (isLocalReplicaAssignment(replicas, self.node_id)) {
             const removed_existing = self.partition_reassignments.fetchRemove(lookup_key);
+            const previous_owner = self.partitionOwnerOrSelf(topic_name, partition_req.partition_index);
+            self.applyPartitionReassignmentOwnership(topic_name, partition_req.partition_index, replicas) catch |err| {
+                if (removed_existing) |removed| {
+                    self.restorePartitionReassignmentMapEntry(removed);
+                }
+                return err;
+            };
             if (removed_existing) |removed| {
                 self.persistPartitionReassignmentsDurably() catch |err| {
                     self.restorePartitionReassignmentMapEntry(removed);
+                    self.restorePartitionOwner(topic_name, partition_req.partition_index, previous_owner);
                     return err;
                 };
                 self.freePartitionReassignmentMapEntry(removed);
@@ -17837,6 +17909,17 @@ pub const Broker = struct {
         owned_key_owned = false;
         next_owned = false;
 
+        const previous_owner = self.partitionOwnerOrSelf(topic_name, partition_req.partition_index);
+        self.applyPartitionReassignmentOwnership(topic_name, partition_req.partition_index, replicas) catch |err| {
+            if (self.partition_reassignments.fetchRemove(lookup_key)) |inserted| {
+                self.freePartitionReassignmentMapEntry(inserted);
+            }
+            if (removed_existing) |removed| {
+                self.restorePartitionReassignmentMapEntry(removed);
+            }
+            return err;
+        };
+
         self.persistPartitionReassignmentsDurably() catch |err| {
             if (self.partition_reassignments.fetchRemove(lookup_key)) |inserted| {
                 self.freePartitionReassignmentMapEntry(inserted);
@@ -17844,6 +17927,7 @@ pub const Broker = struct {
             if (removed_existing) |removed| {
                 self.restorePartitionReassignmentMapEntry(removed);
             }
+            self.restorePartitionOwner(topic_name, partition_req.partition_index, previous_owner);
             return err;
         };
 
@@ -18063,6 +18147,17 @@ pub const Broker = struct {
         self.partition_reassignments.put(removed.key, removed.value) catch |restore_err| {
             log.err("Failed to restore partition reassignment after snapshot write failure: {}", .{restore_err});
             self.freePartitionReassignmentMapEntry(removed);
+        };
+    }
+
+    fn applyPartitionReassignmentOwnership(self: *Broker, topic_name: []const u8, partition_index: i32, replicas: []const i32) !void {
+        if (replicas.len == 0) return error.InvalidReplicaAssignment;
+        try self.failover_controller.reassignPartition(.{ .topic = topic_name, .partition = partition_index }, replicas[0]);
+    }
+
+    fn restorePartitionOwner(self: *Broker, topic_name: []const u8, partition_index: i32, owner: i32) void {
+        self.failover_controller.reassignPartition(.{ .topic = topic_name, .partition = partition_index }, owner) catch |restore_err| {
+            log.err("Failed to restore partition owner for {s}-{d} to node {d}: {}", .{ topic_name, partition_index, owner, restore_err });
         };
     }
 
@@ -32527,6 +32622,150 @@ test "Broker.handleRequest partition reassignment alter list and cancel round-tr
     try testing.expectEqual(@as(u32, 0), broker.partition_reassignments.count());
 }
 
+test "Broker partition reassignment updates owner metadata and rejects local IO" {
+    const AlterReq = generated.alter_partition_reassignments_request.AlterPartitionReassignmentsRequest;
+    const MetadataReq = generated.metadata_request.MetadataRequest;
+    const MetadataResp = generated.metadata_response.MetadataResponse;
+    const ProduceReq = generated.produce_request.ProduceRequest;
+    const ProduceResp = generated.produce_response.ProduceResponse;
+    const FetchReq = generated.fetch_request.FetchRequest;
+    const FetchResp = generated.fetch_response.FetchResponse;
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+    try testing.expect(broker.ensureTopic("reassign-owner"));
+
+    const remote_replicas = [_]i32{2};
+    const reassignment = AlterReq.ReassignableTopic.ReassignablePartition{
+        .partition_index = 0,
+        .replicas = &remote_replicas,
+    };
+    try testing.expectEqual(
+        @as(i16, @intFromEnum(ErrorCode.none)),
+        try broker.applyPartitionReassignment("reassign-owner", broker.topics.get("reassign-owner"), reassignment),
+    );
+    try testing.expectEqual(@as(?i32, 2), broker.failover_controller.findPartitionOwner("reassign-owner", 0));
+
+    {
+        const metadata_topics = [_]MetadataReq.MetadataRequestTopic{.{
+            .name = "reassign-owner",
+        }};
+        const metadata_req = MetadataReq{
+            .topics = &metadata_topics,
+            .allow_auto_topic_creation = false,
+        };
+
+        var buf: [512]u8 = undefined;
+        var pos = buildTestRequest(&buf, 3, 12, 4515, header_mod.requestHeaderVersion(3, 12));
+        metadata_req.serialize(&buf, &pos, 12);
+
+        const response = broker.handleRequest(buf[0..pos]);
+        try testing.expect(response != null);
+        defer testing.allocator.free(response.?);
+
+        var rpos: usize = 0;
+        var response_header = try ResponseHeader.deserialize(testing.allocator, response.?, &rpos, header_mod.responseHeaderVersion(3, 12));
+        defer response_header.deinit(testing.allocator);
+        try testing.expectEqual(@as(i32, 4515), response_header.correlation_id);
+
+        const resp = try MetadataResp.deserialize(testing.allocator, response.?, &rpos, 12);
+        defer freeDeserializedMetadataResponse(&resp);
+        try testing.expectEqual(response.?.len, rpos);
+        try testing.expectEqual(@as(i32, 2), resp.topics[0].partitions[0].leader_id);
+        try testing.expectEqual(@as(usize, 1), resp.topics[0].partitions[0].replica_nodes.len);
+        try testing.expectEqual(@as(i32, 2), resp.topics[0].partitions[0].replica_nodes[0]);
+        try testing.expectEqual(@as(i32, 2), resp.topics[0].partitions[0].isr_nodes[0]);
+    }
+
+    {
+        const produce_partitions = [_]ProduceReq.TopicProduceData.PartitionProduceData{.{
+            .index = 0,
+            .records = "remote-owned-records",
+        }};
+        const produce_topics = [_]ProduceReq.TopicProduceData{.{
+            .name = "reassign-owner",
+            .partition_data = &produce_partitions,
+        }};
+        const produce_req = ProduceReq{
+            .transactional_id = null,
+            .acks = 1,
+            .timeout_ms = 30000,
+            .topic_data = &produce_topics,
+        };
+
+        var buf: [512]u8 = undefined;
+        var pos = buildTestRequest(&buf, 0, 9, 4516, header_mod.requestHeaderVersion(0, 9));
+        produce_req.serialize(&buf, &pos, 9);
+
+        const response = broker.handleRequest(buf[0..pos]);
+        try testing.expect(response != null);
+        defer testing.allocator.free(response.?);
+
+        var rpos: usize = 0;
+        var response_header = try ResponseHeader.deserialize(testing.allocator, response.?, &rpos, header_mod.responseHeaderVersion(0, 9));
+        defer response_header.deinit(testing.allocator);
+        try testing.expectEqual(@as(i32, 4516), response_header.correlation_id);
+
+        const resp = try ProduceResp.deserialize(testing.allocator, response.?, &rpos, 9);
+        defer freeDeserializedProduceResponse(&resp);
+        try testing.expectEqual(response.?.len, rpos);
+        try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.not_leader_or_follower)), resp.responses[0].partition_responses[0].error_code);
+        try testing.expectEqual(@as(i64, -1), resp.responses[0].partition_responses[0].base_offset);
+    }
+
+    {
+        const fetch_partitions = [_]FetchReq.FetchTopic.FetchPartition{.{
+            .partition = 0,
+            .current_leader_epoch = -1,
+            .fetch_offset = 0,
+            .log_start_offset = 0,
+            .partition_max_bytes = 1024,
+        }};
+        const fetch_topics = [_]FetchReq.FetchTopic{.{
+            .topic = "reassign-owner",
+            .partitions = &fetch_partitions,
+        }};
+        const fetch_req = FetchReq{
+            .replica_id = -1,
+            .max_wait_ms = 0,
+            .min_bytes = 0,
+            .max_bytes = 1024,
+            .isolation_level = 0,
+            .topics = &fetch_topics,
+            .rack_id = "",
+        };
+
+        var buf: [512]u8 = undefined;
+        var pos = buildTestRequest(&buf, 1, 11, 4517, header_mod.requestHeaderVersion(1, 11));
+        fetch_req.serialize(&buf, &pos, 11);
+
+        const response = broker.handleRequest(buf[0..pos]);
+        try testing.expect(response != null);
+        defer testing.allocator.free(response.?);
+
+        var rpos: usize = 0;
+        var response_header = try ResponseHeader.deserialize(testing.allocator, response.?, &rpos, header_mod.responseHeaderVersion(1, 11));
+        defer response_header.deinit(testing.allocator);
+        try testing.expectEqual(@as(i32, 4517), response_header.correlation_id);
+
+        const resp = try FetchResp.deserialize(testing.allocator, response.?, &rpos, 11);
+        defer freeDeserializedFetchResponse(&resp);
+        try testing.expectEqual(response.?.len, rpos);
+        try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.not_leader_or_follower)), resp.responses[0].partitions[0].error_code);
+        try testing.expect(resp.responses[0].partitions[0].records == null);
+    }
+
+    const cancel = AlterReq.ReassignableTopic.ReassignablePartition{
+        .partition_index = 0,
+        .replicas = null,
+    };
+    try testing.expectEqual(
+        @as(i16, @intFromEnum(ErrorCode.none)),
+        try broker.applyPartitionReassignment("reassign-owner", broker.topics.get("reassign-owner"), cancel),
+    );
+    try testing.expectEqual(@as(?i32, 1), broker.failover_controller.findPartitionOwner("reassign-owner", 0));
+}
+
 test "Broker restores partition reassignment state after restart" {
     const fs = @import("fs_compat");
     const tmp_dir = "/tmp/zmq-partition-reassignment-restart-test";
@@ -32567,6 +32806,7 @@ test "Broker restores partition reassignment state after restart" {
         try testing.expect(alter_response != null);
         defer testing.allocator.free(alter_response.?);
         try testing.expectEqual(@as(u32, 1), broker.partition_reassignments.count());
+        try testing.expectEqual(@as(?i32, 2), broker.failover_controller.findPartitionOwner("reassign-persist", 0));
     }
 
     {
@@ -32575,6 +32815,7 @@ test "Broker restores partition reassignment state after restart" {
         try broker.open();
 
         try testing.expectEqual(@as(u32, 1), broker.partition_reassignments.count());
+        try testing.expectEqual(@as(?i32, 2), broker.failover_controller.findPartitionOwner("reassign-persist", 0));
 
         const list_partitions = [_]i32{0};
         const list_topics = [_]ListReq.ListPartitionReassignmentsTopics{.{
@@ -32670,6 +32911,7 @@ test "Broker restores partition reassignment state from S3 cluster metadata log"
         try testing.expectEqualSlices(i32, &remote_replicas, state.replicas);
         try testing.expectEqualSlices(i32, &remote_replicas, state.adding_replicas);
         try testing.expectEqualSlices(i32, &[_]i32{1}, state.removing_replicas);
+        try testing.expectEqual(@as(?i32, 2), broker.failover_controller.findPartitionOwner(topic_name, 0));
     }
 }
 
