@@ -15661,6 +15661,10 @@ pub const Broker = struct {
     // ---------------------------------------------------------------
     // GetTelemetrySubscriptions (key 71) / PushTelemetry (key 72)
     // ---------------------------------------------------------------
+    const telemetry_subscription_id: i32 = 1;
+    const telemetry_push_interval_ms: i32 = 60000;
+    const telemetry_max_bytes: i32 = 1048576;
+
     fn handleGetTelemetrySubscriptions(self: *Broker, request_bytes: []const u8, body_start: usize, req_header: *const RequestHeader, api_version: i16, resp_header_version: i16) ?[]u8 {
         const Req = generated.get_telemetry_subscriptions_request.GetTelemetrySubscriptionsRequest;
         const Resp = generated.get_telemetry_subscriptions_response.GetTelemetrySubscriptionsResponse;
@@ -15676,16 +15680,18 @@ pub const Broker = struct {
             return null;
         };
 
+        const accepted_compression_types = [_]i8{0};
+        const requested_metrics = [_]?[]const u8{""};
         const resp = Resp{
             .throttle_time_ms = 0,
             .error_code = @intFromEnum(ErrorCode.none),
             .client_instance_id = self.telemetryClientInstanceId(req.client_instance_id, req_header.correlation_id),
-            .subscription_id = 0,
-            .accepted_compression_types = &.{},
-            .push_interval_ms = 0,
-            .telemetry_max_bytes = 0,
+            .subscription_id = telemetry_subscription_id,
+            .accepted_compression_types = &accepted_compression_types,
+            .push_interval_ms = telemetry_push_interval_ms,
+            .telemetry_max_bytes = telemetry_max_bytes,
             .delta_temporality = false,
-            .requested_metrics = &.{},
+            .requested_metrics = &requested_metrics,
         };
         return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
     }
@@ -15700,14 +15706,24 @@ pub const Broker = struct {
         }
 
         var pos = body_start;
-        _ = Req.deserialize(self.allocator, request_bytes, &pos, api_version) catch |err| {
+        const req = Req.deserialize(self.allocator, request_bytes, &pos, api_version) catch |err| {
             log.warn("Failed to decode PushTelemetry request: {}", .{err});
             return null;
         };
 
+        const metrics_len = if (req.metrics) |metrics| metrics.len else 0;
+        const error_code: i16 = if (req.subscription_id != telemetry_subscription_id)
+            @intFromEnum(ErrorCode.unknown_subscription_id)
+        else if (req.compression_type != 0)
+            @intFromEnum(ErrorCode.unsupported_compression_type)
+        else if (metrics_len > telemetry_max_bytes)
+            @intFromEnum(ErrorCode.telemetry_too_large)
+        else
+            @intFromEnum(ErrorCode.none);
+
         const resp = Resp{
             .throttle_time_ms = 0,
-            .error_code = @intFromEnum(ErrorCode.unknown_subscription_id),
+            .error_code = error_code,
         };
         return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
     }
@@ -15835,7 +15851,7 @@ pub const Broker = struct {
 
     fn telemetryClientInstanceId(self: *Broker, request_id: [16]u8, correlation_id: i32) [16]u8 {
         const zero_uuid = [_]u8{0} ** 16;
-        if (!std.mem.eql(u8, &request_id, &zero_uuid)) return zero_uuid;
+        if (!std.mem.eql(u8, &request_id, &zero_uuid)) return request_id;
 
         var assigned = [_]u8{0} ** 16;
         assigned[0] = 'Z';
@@ -15866,10 +15882,13 @@ pub const Broker = struct {
             return null;
         };
 
+        const resources = [_]Resp.ClientMetricsResource{.{
+            .name = "default",
+        }};
         const resp = Resp{
             .throttle_time_ms = 0,
             .error_code = @intFromEnum(ErrorCode.none),
-            .client_metrics_resources = &.{},
+            .client_metrics_resources = &resources,
         };
         return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
     }
@@ -29041,7 +29060,7 @@ test "Broker.handleRequest UpdateFeatures rejects trailing bytes" {
     try expectTrailingByteRejected(&broker, buf[0..], pos);
 }
 
-test "Broker.handleRequest GetTelemetrySubscriptions returns empty subscription set" {
+test "Broker.handleRequest GetTelemetrySubscriptions returns default subscription" {
     const Req = generated.get_telemetry_subscriptions_request.GetTelemetrySubscriptionsRequest;
     const Resp = generated.get_telemetry_subscriptions_response.GetTelemetrySubscriptionsResponse;
 
@@ -29070,12 +29089,46 @@ test "Broker.handleRequest GetTelemetrySubscriptions returns empty subscription 
     try testing.expectEqual(response.?.len, rpos);
     try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.none)), resp.error_code);
     try testing.expect(!std.mem.eql(u8, &zero_uuid, &resp.client_instance_id));
-    try testing.expectEqual(@as(i32, 0), resp.subscription_id);
-    try testing.expectEqual(@as(usize, 0), resp.accepted_compression_types.len);
-    try testing.expectEqual(@as(i32, 0), resp.push_interval_ms);
-    try testing.expectEqual(@as(i32, 0), resp.telemetry_max_bytes);
+    try testing.expectEqual(@as(i32, 1), resp.subscription_id);
+    try testing.expectEqual(@as(usize, 1), resp.accepted_compression_types.len);
+    try testing.expectEqual(@as(i8, 0), resp.accepted_compression_types[0]);
+    try testing.expectEqual(@as(i32, 60000), resp.push_interval_ms);
+    try testing.expectEqual(@as(i32, 1048576), resp.telemetry_max_bytes);
     try testing.expectEqual(false, resp.delta_temporality);
-    try testing.expectEqual(@as(usize, 0), resp.requested_metrics.len);
+    try testing.expectEqual(@as(usize, 1), resp.requested_metrics.len);
+    try testing.expectEqualStrings("", resp.requested_metrics[0].?);
+}
+
+test "Broker.handleRequest GetTelemetrySubscriptions preserves existing client instance id" {
+    const Req = generated.get_telemetry_subscriptions_request.GetTelemetrySubscriptionsRequest;
+    const Resp = generated.get_telemetry_subscriptions_response.GetTelemetrySubscriptionsResponse;
+
+    var broker = Broker.init(testing.allocator, 7, 9092);
+    defer broker.deinit();
+
+    const client_id = [_]u8{9} ** 16;
+    const req = Req{ .client_instance_id = client_id };
+
+    var buf: [256]u8 = undefined;
+    var pos = buildTestRequest(&buf, 71, 0, 7103, header_mod.requestHeaderVersion(71, 0));
+    req.serialize(&buf, &pos, 0);
+
+    const response = broker.handleRequest(buf[0..pos]);
+    try testing.expect(response != null);
+    defer testing.allocator.free(response.?);
+
+    var rpos: usize = 0;
+    var response_header = try ResponseHeader.deserialize(testing.allocator, response.?, &rpos, header_mod.responseHeaderVersion(71, 0));
+    defer response_header.deinit(testing.allocator);
+    try testing.expectEqual(@as(i32, 7103), response_header.correlation_id);
+
+    const resp = try Resp.deserialize(testing.allocator, response.?, &rpos, 0);
+    defer freeDeserializedGetTelemetrySubscriptionsResponse(&resp);
+
+    try testing.expectEqual(response.?.len, rpos);
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.none)), resp.error_code);
+    try testing.expectEqualSlices(u8, client_id[0..], resp.client_instance_id[0..]);
+    try testing.expectEqual(@as(i32, 1), resp.subscription_id);
 }
 
 test "Broker.handleRequest GetTelemetrySubscriptions authorization denial uses generated response" {
@@ -29140,7 +29193,7 @@ test "Broker.handleRequest GetTelemetrySubscriptions rejects trailing bytes" {
     try expectTrailingByteRejected(&broker, buf[0..], pos);
 }
 
-test "Broker.handleRequest PushTelemetry rejects unsolicited metrics" {
+test "Broker.handleRequest PushTelemetry accepts default subscription" {
     const Req = generated.push_telemetry_request.PushTelemetryRequest;
     const Resp = generated.push_telemetry_response.PushTelemetryResponse;
 
@@ -29172,7 +29225,116 @@ test "Broker.handleRequest PushTelemetry rejects unsolicited metrics" {
 
     const resp = try Resp.deserialize(testing.allocator, response.?, &rpos, 0);
     try testing.expectEqual(response.?.len, rpos);
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.none)), resp.error_code);
+}
+
+test "Broker.handleRequest PushTelemetry rejects unknown subscription" {
+    const Req = generated.push_telemetry_request.PushTelemetryRequest;
+    const Resp = generated.push_telemetry_response.PushTelemetryResponse;
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+
+    const client_id = [_]u8{1} ** 16;
+    const metrics = [_]u8{ 0x08, 0x01 };
+    const req = Req{
+        .client_instance_id = client_id,
+        .subscription_id = 99,
+        .terminating = false,
+        .compression_type = 0,
+        .metrics = &metrics,
+    };
+
+    var buf: [256]u8 = undefined;
+    var pos = buildTestRequest(&buf, 72, 0, 7201, header_mod.requestHeaderVersion(72, 0));
+    req.serialize(&buf, &pos, 0);
+
+    const response = broker.handleRequest(buf[0..pos]);
+    try testing.expect(response != null);
+    defer testing.allocator.free(response.?);
+
+    var rpos: usize = 0;
+    var response_header = try ResponseHeader.deserialize(testing.allocator, response.?, &rpos, header_mod.responseHeaderVersion(72, 0));
+    defer response_header.deinit(testing.allocator);
+    try testing.expectEqual(@as(i32, 7201), response_header.correlation_id);
+
+    const resp = try Resp.deserialize(testing.allocator, response.?, &rpos, 0);
+    try testing.expectEqual(response.?.len, rpos);
     try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.unknown_subscription_id)), resp.error_code);
+}
+
+test "Broker.handleRequest PushTelemetry rejects unsupported compression" {
+    const Req = generated.push_telemetry_request.PushTelemetryRequest;
+    const Resp = generated.push_telemetry_response.PushTelemetryResponse;
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+
+    const client_id = [_]u8{2} ** 16;
+    const metrics = [_]u8{ 0x08, 0x01 };
+    const req = Req{
+        .client_instance_id = client_id,
+        .subscription_id = 1,
+        .terminating = false,
+        .compression_type = 1,
+        .metrics = &metrics,
+    };
+
+    var buf: [256]u8 = undefined;
+    var pos = buildTestRequest(&buf, 72, 0, 7202, header_mod.requestHeaderVersion(72, 0));
+    req.serialize(&buf, &pos, 0);
+
+    const response = broker.handleRequest(buf[0..pos]);
+    try testing.expect(response != null);
+    defer testing.allocator.free(response.?);
+
+    var rpos: usize = 0;
+    var response_header = try ResponseHeader.deserialize(testing.allocator, response.?, &rpos, header_mod.responseHeaderVersion(72, 0));
+    defer response_header.deinit(testing.allocator);
+    try testing.expectEqual(@as(i32, 7202), response_header.correlation_id);
+
+    const resp = try Resp.deserialize(testing.allocator, response.?, &rpos, 0);
+    try testing.expectEqual(response.?.len, rpos);
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.unsupported_compression_type)), resp.error_code);
+}
+
+test "Broker.handleRequest PushTelemetry rejects oversized metrics" {
+    const Req = generated.push_telemetry_request.PushTelemetryRequest;
+    const Resp = generated.push_telemetry_response.PushTelemetryResponse;
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+
+    const metrics = try testing.allocator.alloc(u8, 1048577);
+    defer testing.allocator.free(metrics);
+    @memset(metrics, 0x01);
+
+    const client_id = [_]u8{3} ** 16;
+    const req = Req{
+        .client_instance_id = client_id,
+        .subscription_id = 1,
+        .terminating = false,
+        .compression_type = 0,
+        .metrics = metrics,
+    };
+
+    var buf = try testing.allocator.alloc(u8, req.calcSize(0) + 64);
+    defer testing.allocator.free(buf);
+    var pos = buildTestRequest(buf, 72, 0, 7203, header_mod.requestHeaderVersion(72, 0));
+    req.serialize(buf, &pos, 0);
+
+    const response = broker.handleRequest(buf[0..pos]);
+    try testing.expect(response != null);
+    defer testing.allocator.free(response.?);
+
+    var rpos: usize = 0;
+    var response_header = try ResponseHeader.deserialize(testing.allocator, response.?, &rpos, header_mod.responseHeaderVersion(72, 0));
+    defer response_header.deinit(testing.allocator);
+    try testing.expectEqual(@as(i32, 7203), response_header.correlation_id);
+
+    const resp = try Resp.deserialize(testing.allocator, response.?, &rpos, 0);
+    try testing.expectEqual(response.?.len, rpos);
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.telemetry_too_large)), resp.error_code);
 }
 
 test "Broker.handleRequest PushTelemetry authorization denial uses generated response" {
@@ -29333,7 +29495,7 @@ test "Broker.handleRequest AssignReplicasToDirs rejects malformed request" {
     try testing.expectEqual(ErrorCode.invalid_request.toInt(), resp.error_code);
 }
 
-test "Broker.handleRequest ListClientMetricsResources returns empty generated response" {
+test "Broker.handleRequest ListClientMetricsResources returns default generated resource" {
     const Req = generated.list_client_metrics_resources_request.ListClientMetricsResourcesRequest;
     const Resp = generated.list_client_metrics_resources_response.ListClientMetricsResourcesResponse;
 
@@ -29360,7 +29522,8 @@ test "Broker.handleRequest ListClientMetricsResources returns empty generated re
 
     try testing.expectEqual(response.?.len, rpos);
     try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.none)), resp.error_code);
-    try testing.expectEqual(@as(usize, 0), resp.client_metrics_resources.len);
+    try testing.expectEqual(@as(usize, 1), resp.client_metrics_resources.len);
+    try testing.expectEqualStrings("default", resp.client_metrics_resources[0].name.?);
 }
 
 test "Broker.handleRequest ListClientMetricsResources authorization denial uses generated response" {
