@@ -25909,6 +25909,107 @@ test "Broker.handleRequest SASL enabled gates non-auth APIs until authentication
     try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.none)), allowed_resp.topics[0].error_code);
 }
 
+test "Broker.handleRequest SASL pre-auth APIs bypass ACL denial" {
+    const HandshakeReq = generated.sasl_handshake_request.SaslHandshakeRequest;
+    const HandshakeResp = generated.sasl_handshake_response.SaslHandshakeResponse;
+    const AuthReq = generated.sasl_authenticate_request.SaslAuthenticateRequest;
+    const AuthResp = generated.sasl_authenticate_response.SaslAuthenticateResponse;
+    const MetadataReq = generated.metadata_request.MetadataRequest;
+    const MetadataResp = generated.metadata_response.MetadataResponse;
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+    broker.sasl_enabled = true;
+    broker.sasl_enabled_mechanisms = "PLAIN";
+    try broker.sasl_authenticator.addUser("bob", "secret");
+    try broker.authorizer.addAcl("other-client", .cluster, "*", .literal, .describe, .allow, "*");
+
+    const handshake_req = HandshakeReq{ .mechanism = "PLAIN" };
+    var handshake_buf: [256]u8 = undefined;
+    var handshake_pos = buildTestRequest(&handshake_buf, 17, 1, 3620, header_mod.requestHeaderVersion(17, 1));
+    handshake_req.serialize(&handshake_buf, &handshake_pos, 1);
+
+    const handshake_response = broker.handleRequest(handshake_buf[0..handshake_pos]);
+    try testing.expect(handshake_response != null);
+    defer testing.allocator.free(handshake_response.?);
+
+    var handshake_rpos: usize = 0;
+    var handshake_header = try ResponseHeader.deserialize(testing.allocator, handshake_response.?, &handshake_rpos, header_mod.responseHeaderVersion(17, 1));
+    defer handshake_header.deinit(testing.allocator);
+    try testing.expectEqual(@as(i32, 3620), handshake_header.correlation_id);
+
+    const handshake_resp = try HandshakeResp.deserialize(testing.allocator, handshake_response.?, &handshake_rpos, 1);
+    defer if (handshake_resp.mechanisms.len > 0) testing.allocator.free(handshake_resp.mechanisms);
+    try testing.expectEqual(handshake_response.?.len, handshake_rpos);
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.none)), handshake_resp.error_code);
+
+    const auth_req = AuthReq{ .auth_bytes = "\x00bob\x00secret" };
+    var auth_buf: [256]u8 = undefined;
+    var auth_pos = buildTestRequest(&auth_buf, 36, 2, 3621, header_mod.requestHeaderVersion(36, 2));
+    auth_req.serialize(&auth_buf, &auth_pos, 2);
+
+    const auth_response = broker.handleRequest(auth_buf[0..auth_pos]);
+    try testing.expect(auth_response != null);
+    defer testing.allocator.free(auth_response.?);
+
+    var auth_rpos: usize = 0;
+    var auth_header = try ResponseHeader.deserialize(testing.allocator, auth_response.?, &auth_rpos, header_mod.responseHeaderVersion(36, 2));
+    defer auth_header.deinit(testing.allocator);
+    try testing.expectEqual(@as(i32, 3621), auth_header.correlation_id);
+
+    const auth_resp = try AuthResp.deserialize(testing.allocator, auth_response.?, &auth_rpos, 2);
+    try testing.expectEqual(auth_response.?.len, auth_rpos);
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.none)), auth_resp.error_code);
+    try testing.expectEqualStrings("User:bob", broker.authenticated_sessions.get("test-client").?);
+
+    const metadata_req = MetadataReq{
+        .topics = &.{},
+        .allow_auto_topic_creation = false,
+        .include_topic_authorized_operations = true,
+    };
+    var metadata_buf: [256]u8 = undefined;
+    var metadata_pos = buildTestRequest(&metadata_buf, 3, 12, 3622, header_mod.requestHeaderVersion(3, 12));
+    metadata_req.serialize(&metadata_buf, &metadata_pos, 12);
+
+    const metadata_response = broker.handleRequest(metadata_buf[0..metadata_pos]);
+    try testing.expect(metadata_response != null);
+    defer testing.allocator.free(metadata_response.?);
+
+    var metadata_rpos: usize = 0;
+    var metadata_header = try ResponseHeader.deserialize(testing.allocator, metadata_response.?, &metadata_rpos, header_mod.responseHeaderVersion(3, 12));
+    defer metadata_header.deinit(testing.allocator);
+    try testing.expectEqual(@as(i32, 3622), metadata_header.correlation_id);
+
+    const metadata_resp = try MetadataResp.deserialize(testing.allocator, metadata_response.?, &metadata_rpos, 12);
+    defer freeDeserializedMetadataResponse(&metadata_resp);
+    try testing.expectEqual(metadata_response.?.len, metadata_rpos);
+    try testing.expectEqual(@as(usize, 0), metadata_resp.brokers.len);
+    try testing.expectEqual(@as(usize, 0), metadata_resp.topics.len);
+}
+
+test "Broker.handleRequest unsupported versions bypass SASL pre-auth gate" {
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+    broker.sasl_enabled = true;
+    try broker.authorizer.addAcl("other-client", .transactional_id, "*", .literal, .write, .allow, "*");
+
+    const api_key: i16 = 22;
+    const unsupported_version: i16 = 6;
+    var buf: [128]u8 = undefined;
+    const req_len = buildTestRequest(&buf, api_key, unsupported_version, 3623, header_mod.requestHeaderVersion(api_key, unsupported_version));
+
+    const response = broker.handleRequest(buf[0..req_len]);
+    try testing.expect(response != null);
+    defer testing.allocator.free(response.?);
+
+    var rpos: usize = 0;
+    var response_header = try ResponseHeader.deserialize(testing.allocator, response.?, &rpos, header_mod.responseHeaderVersion(api_key, unsupported_version));
+    defer response_header.deinit(testing.allocator);
+    try testing.expectEqual(@as(i32, 3623), response_header.correlation_id);
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.unsupported_version)), ser.readI16(response.?, &rpos));
+    try testing.expectEqual(response.?.len, rpos);
+}
+
 test "Broker.handleRequest SaslAuthenticate rejects truncated request" {
     var broker = Broker.init(testing.allocator, 1, 9092);
     defer broker.deinit();
