@@ -19645,7 +19645,8 @@ pub const Broker = struct {
         if (std.mem.eql(u8, mechanism, "OAUTHBEARER")) {
             // OAUTHBEARER: parse JWT from SASL token (KIP-255)
             if (auth_bytes) |token| {
-                const result = self.oauth_authenticator.authenticate(self.allocator, token);
+                var result = self.oauth_authenticator.authenticate(self.allocator, token);
+                defer result.deinit(self.allocator);
                 if (result.success) {
                     if (result.principal) |principal| {
                         // Format as "User:<sub-claim>" to match Kafka principal format

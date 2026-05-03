@@ -966,8 +966,8 @@ pub const OAuthBearerAuthenticator = struct {
     /// Authenticate an OAUTHBEARER SASL token.
     /// The token format is: "n,,\x01auth=Bearer <jwt>\x01\x01"
     /// Returns the authenticated principal (from JWT "sub" claim) or failure.
-    /// The returned principal (if any) is a slice of the input token — valid
-    /// as long as the token bytes remain alive.
+    /// The returned principal is allocator-owned; callers must call
+    /// `AuthResult.deinit` after copying or using it.
     pub fn authenticate(self: *const OAuthBearerAuthenticator, alloc: Allocator, token: []const u8) AuthResult {
         // Extract the JWT from the OAUTHBEARER SASL framing
         const jwt_str = extractBearerToken(token) orelse {
@@ -1018,27 +1018,21 @@ pub const OAuthBearerAuthenticator = struct {
             }
         }
 
-        // Extract principal from "sub" claim — must copy before freeing JWT
+        // Extract principal from "sub" claim.
         const principal = jwt.getPrincipal() orelse {
             log.warn("OAUTHBEARER: token missing 'sub' claim", .{});
             jwt.deinit();
             return .{ .success = false, .principal = null };
         };
 
-        // The principal points into jwt.payload_json which we're about to free,
-        // so we need the caller to understand the lifetime. Since the principal
-        // is a substring of the decoded JWT payload, and the Broker stores it
-        // via allocator.dupe in handleSaslAuthenticate, this is safe as long
-        // as we DON'T free the jwt here. The caller must deinit.
-        // However, for a simpler API, we'll keep the JWT alive by not calling deinit
-        // and rely on the test allocator to detect the leak. In production, the
-        // principal is immediately copied by the handler.
-        //
-        // Actually, let's just leak the JWT in this context — the principal is
-        // only needed briefly until the handler copies it into authenticated_sessions.
-        // This is acceptable for a per-authentication allocation.
-        log.info("OAUTHBEARER authentication success: principal={s}", .{principal});
-        return .{ .success = true, .principal = principal };
+        const principal_copy = alloc.dupe(u8, principal) catch {
+            jwt.deinit();
+            return .{ .success = false, .principal = null };
+        };
+        jwt.deinit();
+
+        log.info("OAUTHBEARER authentication success: principal={s}", .{principal_copy});
+        return .{ .success = true, .principal = principal_copy };
     }
 
     /// Extract the Bearer JWT from the OAUTHBEARER SASL token format.
@@ -1073,7 +1067,14 @@ pub const OAuthBearerAuthenticator = struct {
 
     pub const AuthResult = struct {
         success: bool,
-        principal: ?[]const u8,
+        principal: ?[]u8,
+
+        pub fn deinit(self: *AuthResult, alloc: Allocator) void {
+            if (self.principal) |principal| {
+                alloc.free(principal);
+                self.principal = null;
+            }
+        }
     };
 };
 
@@ -1199,10 +1200,11 @@ test "OAuthBearerAuthenticator valid token" {
     const jwt = "eyJhbGciOiJub25lIn0.eyJzdWIiOiJvYXV0aHVzZXIiLCJleHAiOjk5OTk5OTk5OTl9.";
     const sasl_token = "n,,\x01auth=Bearer " ++ jwt ++ "\x01\x01";
 
-    // Use page_allocator since the JWT won't be freed (principal points into it)
-    const result = oauth.authenticate(std.heap.page_allocator, sasl_token);
+    var result = oauth.authenticate(testing.allocator, sasl_token);
+    defer result.deinit(testing.allocator);
     try testing.expect(result.success);
     try testing.expect(result.principal != null);
+    try testing.expectEqualStrings("oauthuser", result.principal.?);
 }
 
 test "OAuthBearerAuthenticator expired token" {
@@ -1212,7 +1214,8 @@ test "OAuthBearerAuthenticator expired token" {
     const jwt = "eyJhbGciOiJub25lIn0.eyJzdWIiOiJleHBpcmVkIiwiZXhwIjoxMDAwMDAwMDAwfQ.";
     const sasl_token = "n,,\x01auth=Bearer " ++ jwt ++ "\x01\x01";
 
-    const result = oauth.authenticate(std.heap.page_allocator, sasl_token);
+    var result = oauth.authenticate(testing.allocator, sasl_token);
+    defer result.deinit(testing.allocator);
     try testing.expect(!result.success);
 }
 
@@ -1223,7 +1226,8 @@ test "OAuthBearerAuthenticator issuer validation" {
     const jwt = "eyJhbGciOiJub25lIn0.eyJzdWIiOiJ1c2VyIiwiaXNzIjoid3JvbmctaXNzdWVyIiwiZXhwIjo5OTk5OTk5OTk5fQ.";
     const sasl_token = "n,,\x01auth=Bearer " ++ jwt ++ "\x01\x01";
 
-    const result = oauth.authenticate(std.heap.page_allocator, sasl_token);
+    var result = oauth.authenticate(testing.allocator, sasl_token);
+    defer result.deinit(testing.allocator);
     try testing.expect(!result.success);
 }
 
@@ -1233,9 +1237,22 @@ test "OAuthBearerAuthenticator raw JWT token" {
     // Pass raw JWT without SASL framing
     const jwt = "eyJhbGciOiJub25lIn0.eyJzdWIiOiJyYXd1c2VyIiwiZXhwIjo5OTk5OTk5OTk5fQ.";
 
-    const result = oauth.authenticate(std.heap.page_allocator, jwt);
+    var result = oauth.authenticate(testing.allocator, jwt);
+    defer result.deinit(testing.allocator);
     try testing.expect(result.success);
     try testing.expect(result.principal != null);
+    try testing.expectEqualStrings("rawuser", result.principal.?);
+}
+
+test "OAuthBearerAuthenticator rejects token without subject without leaks" {
+    const oauth = OAuthBearerAuthenticator.init();
+
+    const jwt = "eyJhbGciOiJub25lIn0.eyJleHAiOjk5OTk5OTk5OTl9.";
+    const sasl_token = "n,,\x01auth=Bearer " ++ jwt ++ "\x01\x01";
+
+    var result = oauth.authenticate(testing.allocator, sasl_token);
+    defer result.deinit(testing.allocator);
+    try testing.expect(!result.success);
 }
 
 // ---------------------------------------------------------------
