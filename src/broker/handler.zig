@@ -18199,7 +18199,7 @@ pub const Broker = struct {
         if (!skipEndQuorumTopics(buf, &pos, flexible)) return false;
         if (flexible and !skipQuorumLeaderEndpoints(buf, &pos)) return false;
         if (flexible) ser.skipTaggedFields(buf, &pos) catch return false;
-        return true;
+        return pos == buf.len;
     }
 
     fn validateOffsetDeleteRequestFrame(buf: []const u8, start_pos: usize) bool {
@@ -33702,6 +33702,45 @@ test "Broker.handleRequest BeginQuorumEpoch and EndQuorumEpoch reject truncated 
         const req_len = buildTestRequest(&buf, case.api_key, case.version, case.correlation_id, header_mod.requestHeaderVersion(case.api_key, case.version));
         try testing.expect(broker.handleRequest(buf[0..req_len]) == null);
     }
+}
+
+test "Broker.handleRequest EndQuorumEpoch rejects trailing bytes" {
+    const Req = generated.end_quorum_epoch_request.EndQuorumEpochRequest;
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+
+    const zero_uuid = [_]u8{0} ** 16;
+    const preferred_candidates = [_]Req.TopicData.PartitionData.ReplicaInfo{.{
+        .candidate_id = 2,
+        .candidate_directory_id = zero_uuid,
+    }};
+    const partitions = [_]Req.TopicData.PartitionData{.{
+        .partition_index = 0,
+        .leader_id = 1,
+        .leader_epoch = 3,
+        .preferred_candidates = &preferred_candidates,
+    }};
+    const topics = [_]Req.TopicData{.{
+        .topic_name = "__cluster_metadata",
+        .partitions = &partitions,
+    }};
+    const endpoints = [_]Req.LeaderEndpoint{.{
+        .name = "CONTROLLER",
+        .host = "localhost",
+        .port = 9093,
+    }};
+    const req = Req{
+        .cluster_id = "end-quorum-trailing-cluster",
+        .topics = &topics,
+        .leader_endpoints = &endpoints,
+    };
+
+    var buf: [1024]u8 = undefined;
+    var pos = buildTestRequest(&buf, 54, 1, 5404, header_mod.requestHeaderVersion(54, 1));
+    req.serialize(&buf, &pos, 1);
+
+    try expectTrailingByteRejected(&broker, &buf, pos);
 }
 
 test "Broker.handleRequest ElectLeaders returns requested partition results" {
