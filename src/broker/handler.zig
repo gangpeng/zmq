@@ -17946,6 +17946,46 @@ pub const Broker = struct {
         }
     }
 
+    pub fn executeRebalancePlan(self: *Broker, plan: *const AutoBalancer.RebalancePlan) !usize {
+        for (plan.moves.items, 0..) |move, move_index| {
+            var previous_index: usize = 0;
+            while (previous_index < move_index) : (previous_index += 1) {
+                if (sameRebalancePartition(plan.moves.items[previous_index], move)) return error.DuplicateRebalanceMove;
+            }
+            _ = try self.validateRebalancePlanMove(move);
+        }
+
+        var applied: usize = 0;
+        for (plan.moves.items) |move| {
+            if (!(try self.validateRebalancePlanMove(move))) continue;
+
+            const replicas = [_]i32{move.to_node};
+            const partition_req = generated.alter_partition_reassignments_request.AlterPartitionReassignmentsRequest.ReassignableTopic.ReassignablePartition{
+                .partition_index = move.partition_id,
+                .replicas = &replicas,
+            };
+            const error_code = try self.applyPartitionReassignment(move.topic, self.topics.get(move.topic), partition_req);
+            if (error_code != @intFromEnum(ErrorCode.none)) return error.RebalancePlanApplyFailed;
+            applied += 1;
+        }
+        return applied;
+    }
+
+    fn validateRebalancePlanMove(self: *Broker, move: AutoBalancer.RebalancePlan.PartitionMove) !bool {
+        if (move.to_node == move.from_node) return false;
+        if (move.to_node < 0) return error.InvalidReplicaAssignment;
+        const info = self.topics.get(move.topic) orelse return error.UnknownTopicOrPartition;
+        if (move.partition_id < 0 or move.partition_id >= info.num_partitions) return error.UnknownTopicOrPartition;
+
+        const current_owner = self.partitionOwnerOrSelf(move.topic, move.partition_id);
+        if (current_owner != move.from_node) return error.StaleRebalancePlan;
+        return true;
+    }
+
+    fn sameRebalancePartition(a: AutoBalancer.RebalancePlan.PartitionMove, b: AutoBalancer.RebalancePlan.PartitionMove) bool {
+        return a.partition_id == b.partition_id and std.mem.eql(u8, a.topic, b.topic);
+    }
+
     fn applyPartitionReassignment(self: *Broker, topic_name: []const u8, topic_info: ?TopicInfo, partition_req: generated.alter_partition_reassignments_request.AlterPartitionReassignmentsRequest.ReassignableTopic.ReassignablePartition) !i16 {
         const info = topic_info orelse return @intFromEnum(ErrorCode.unknown_topic_or_partition);
         if (partition_req.partition_index < 0 or partition_req.partition_index >= info.num_partitions) {
@@ -32879,6 +32919,52 @@ test "Broker partition reassignment updates owner metadata and rejects local IO"
         try broker.applyPartitionReassignment("reassign-owner", broker.topics.get("reassign-owner"), cancel),
     );
     try testing.expectEqual(@as(?i32, 1), broker.failover_controller.findPartitionOwner("reassign-owner", 0));
+}
+
+test "Broker executes auto-balancer plan as durable partition reassignment" {
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+    try testing.expect(broker.ensureTopic("rebalance-exec"));
+
+    var plan = AutoBalancer.RebalancePlan.init(testing.allocator);
+    defer plan.deinit();
+    try plan.moves.append(.{
+        .topic = "rebalance-exec",
+        .partition_id = 0,
+        .from_node = 1,
+        .to_node = 2,
+    });
+
+    try testing.expectEqual(@as(usize, 1), try broker.executeRebalancePlan(&plan));
+    try testing.expectEqual(@as(u32, 1), broker.partition_reassignments.count());
+    try testing.expectEqual(@as(?i32, 2), broker.failover_controller.findPartitionOwner("rebalance-exec", 0));
+}
+
+test "Broker rejects stale auto-balancer plan before mutating reassignment state" {
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+    try testing.expect(broker.ensureTopic("rebalance-stale-a"));
+    try testing.expect(broker.ensureTopic("rebalance-stale-b"));
+
+    var plan = AutoBalancer.RebalancePlan.init(testing.allocator);
+    defer plan.deinit();
+    try plan.moves.append(.{
+        .topic = "rebalance-stale-a",
+        .partition_id = 0,
+        .from_node = 1,
+        .to_node = 2,
+    });
+    try plan.moves.append(.{
+        .topic = "rebalance-stale-b",
+        .partition_id = 0,
+        .from_node = 3,
+        .to_node = 2,
+    });
+
+    try testing.expectError(error.StaleRebalancePlan, broker.executeRebalancePlan(&plan));
+    try testing.expectEqual(@as(u32, 0), broker.partition_reassignments.count());
+    try testing.expectEqual(@as(?i32, 1), broker.failover_controller.findPartitionOwner("rebalance-stale-a", 0));
+    try testing.expectEqual(@as(?i32, 1), broker.failover_controller.findPartitionOwner("rebalance-stale-b", 0));
 }
 
 test "Broker partition reassignment quorum records replay assignment and cancellation" {
