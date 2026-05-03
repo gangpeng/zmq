@@ -19079,6 +19079,8 @@ pub const Broker = struct {
                 sample.deinit(self.allocator);
             }
             self.allocator.free(key);
+            self.metrics.incrementCounter("kafka_client_telemetry_terminations_total");
+            self.updateClientTelemetryMetrics();
             return;
         }
 
@@ -19101,6 +19103,19 @@ pub const Broker = struct {
         } else {
             try self.client_telemetry_samples.put(key, sample);
         }
+        self.metrics.incrementCounter("kafka_client_telemetry_pushes_total");
+        self.updateClientTelemetryMetrics();
+    }
+
+    fn updateClientTelemetryMetrics(self: *Broker) void {
+        var retained_bytes: usize = 0;
+        var it = self.client_telemetry_samples.valueIterator();
+        while (it.next()) |sample| {
+            retained_bytes += sample.metrics.len;
+        }
+
+        self.metrics.setGauge("kafka_client_telemetry_samples", @floatFromInt(self.client_telemetry_samples.count()));
+        self.metrics.setGauge("kafka_client_telemetry_bytes", @floatFromInt(retained_bytes));
     }
 
     // ---------------------------------------------------------------
@@ -33901,6 +33916,9 @@ test "Broker.handleRequest PushTelemetry accepts default subscription" {
     defer testing.allocator.free(telemetry_key);
     const sample = broker.client_telemetry_samples.get(telemetry_key) orelse return error.ExpectedClientTelemetrySample;
     try testing.expectEqualSlices(u8, &metrics, sample.metrics);
+    try testing.expectEqual(@as(u64, 1), broker.metrics.counters.get("kafka_client_telemetry_pushes_total").?.value);
+    try testing.expectEqual(@as(f64, 1.0), broker.metrics.gauges.get("kafka_client_telemetry_samples").?.value);
+    try testing.expectEqual(@as(f64, @floatFromInt(metrics.len)), broker.metrics.gauges.get("kafka_client_telemetry_bytes").?.value);
 }
 
 test "Broker.handleRequest PushTelemetry rejects unknown subscription" {
@@ -34049,6 +34067,10 @@ test "Broker.handleRequest PushTelemetry terminating removes collected sample" {
     try testing.expectEqual(response.?.len, rpos);
     try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.none)), resp.error_code);
     try testing.expectEqual(@as(usize, 0), broker.client_telemetry_samples.count());
+    try testing.expectEqual(@as(u64, 1), broker.metrics.counters.get("kafka_client_telemetry_pushes_total").?.value);
+    try testing.expectEqual(@as(u64, 1), broker.metrics.counters.get("kafka_client_telemetry_terminations_total").?.value);
+    try testing.expectEqual(@as(f64, 0.0), broker.metrics.gauges.get("kafka_client_telemetry_samples").?.value);
+    try testing.expectEqual(@as(f64, 0.0), broker.metrics.gauges.get("kafka_client_telemetry_bytes").?.value);
 }
 
 test "Broker.handleRequest PushTelemetry authorization denial uses generated response" {
@@ -50759,6 +50781,16 @@ test "Broker kafka_network_connections_active is registered" {
     defer broker.deinit();
 
     try testing.expect(broker.metrics.gauges.contains("kafka_network_connections_active"));
+}
+
+test "Broker client telemetry metrics are registered" {
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+
+    try testing.expect(broker.metrics.counters.contains("kafka_client_telemetry_pushes_total"));
+    try testing.expect(broker.metrics.counters.contains("kafka_client_telemetry_terminations_total"));
+    try testing.expect(broker.metrics.gauges.contains("kafka_client_telemetry_samples"));
+    try testing.expect(broker.metrics.gauges.contains("kafka_client_telemetry_bytes"));
 }
 
 test "Broker error counter increments on API error" {

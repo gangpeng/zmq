@@ -48,6 +48,10 @@ pub fn registerBrokerMetrics(registry: *MetricRegistry) !void {
     );
     // Active network connections gauge
     try registry.registerGauge("kafka_network_connections_active", "Number of active network connections");
+    try registry.registerCounter("kafka_client_telemetry_pushes_total", "Accepted client telemetry pushes");
+    try registry.registerCounter("kafka_client_telemetry_terminations_total", "Accepted terminating client telemetry pushes");
+    try registry.registerGauge("kafka_client_telemetry_samples", "Retained active client telemetry samples");
+    try registry.registerGauge("kafka_client_telemetry_bytes", "Retained active client telemetry bytes");
 }
 
 /// Register S3 I/O metrics (labeled by operation type).
@@ -111,6 +115,10 @@ test "registerBrokerMetrics" {
     try testing.expect(registry.labeled_counter_meta.contains("kafka_server_api_errors_total"));
     try testing.expect(registry.labeled_gauge_meta.contains("kafka_consumer_lag"));
     try testing.expect(registry.gauges.contains("kafka_network_connections_active"));
+    try testing.expect(registry.counters.contains("kafka_client_telemetry_pushes_total"));
+    try testing.expect(registry.counters.contains("kafka_client_telemetry_terminations_total"));
+    try testing.expect(registry.gauges.contains("kafka_client_telemetry_samples"));
+    try testing.expect(registry.gauges.contains("kafka_client_telemetry_bytes"));
 }
 
 test "registerBrokerMetrics covers broker API metric catalog" {
