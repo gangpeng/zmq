@@ -405,6 +405,16 @@ pub fn build(b: *std.Build) void {
         s3_process_crash_step.dependOn(&run_s3_process_crash.step);
     }
 
+    // Live S3-compatible provider matrix. The Python wrapper skips unless
+    // ZMQ_RUN_S3_PROVIDER_MATRIX=1 is set, then invokes test-minio once per
+    // configured provider profile.
+    const s3_provider_matrix_step = b.step("test-s3-provider-matrix", "Run gated S3 provider compatibility matrix");
+    {
+        const run_s3_provider_matrix = b.addSystemCommand(&.{ "python3", "tests/s3_provider_matrix_test.py" });
+        run_s3_provider_matrix.step.dependOn(b.getInstallStep());
+        s3_provider_matrix_step.dependOn(&run_s3_provider_matrix.step);
+    }
+
     // External Kafka-client compatibility matrix. The Python test skips unless
     // ZMQ_RUN_CLIENT_MATRIX=1 is set and requires a running broker plus client
     // binaries such as kcat or Kafka CLI tools.
