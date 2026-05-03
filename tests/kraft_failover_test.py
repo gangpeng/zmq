@@ -2033,6 +2033,7 @@ def stop_process(proc, crash=False):
 def run_live_reassignment_convergence(processes, source_id):
     source_port = processes[source_id]["broker_port"]
     target_id = next(node_id for node_id in sorted(processes) if node_id != source_id)
+    target_port = processes[target_id]["broker_port"]
     topic = f"kraft-reassign-{os.getpid()}-{source_id}-{target_id}-{int(time.time())}"
 
     wait_for_topic(source_port, topic)
@@ -2044,13 +2045,17 @@ def run_live_reassignment_convergence(processes, source_id):
     alter_partition_reassignment(source_port, topic, 0, [target_id], 4500)
     wait_for_partition_reassignment(source_port, topic, 0, [target_id])
     wait_for_metadata_leader(source_port, topic, target_id)
+    wait_for_metadata_leader(target_port, topic, target_id)
 
     wait_for_produce_error(source_port, topic, b"old-owner-rejected", 6)
+    target_offset = wait_for_produce(target_port, topic, b"rb")
+    wait_for_payloads(target_port, topic, [b"rb"])
 
     return {
         "topic": topic,
         "source_id": source_id,
         "target_id": target_id,
+        "target_offset": target_offset,
     }
 
 
@@ -2391,6 +2396,7 @@ def run_automq_metadata_failover_scenario(tmp):
             "old_leader_fresh_rejoin": True,
             "reassignment_topic": reassignment_result["topic"],
             "reassignment_target": reassignment_result["target_id"],
+            "reassignment_target_offset": reassignment_result["target_offset"],
             "epoch": after["leader_epoch"],
         }
     finally:
@@ -2538,6 +2544,7 @@ def main():
             f"automq_zone_router_epoch={automq_result['zone_router_epoch']}, "
             f"reassignment_topic={automq_result['reassignment_topic']}, "
             f"reassignment_target={automq_result['reassignment_target']}, "
+            f"reassignment_target_offset={automq_result['reassignment_target_offset']}, "
             f"automq_old_leader_fresh_rejoin={automq_result['old_leader_fresh_rejoin']})"
         )
         return 0

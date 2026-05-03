@@ -48,6 +48,7 @@ const transaction_snapshot_record_value_magic = "ZMQTX1";
 const transaction_snapshot_record_key = "__zmq_transaction_snapshot";
 const topic_snapshot_record_value_magic = "ZMQTP1";
 const topic_snapshot_record_key = "__zmq_topic_snapshot";
+const topic_quorum_record_magic = "ZMQTPQ2";
 const partition_reassignment_snapshot_record_value_magic = "ZMQPR1";
 const partition_reassignment_snapshot_record_key = "__zmq_partition_reassignment_snapshot";
 const partition_reassignment_quorum_record_magic = "ZMQPRQ2";
@@ -715,6 +716,12 @@ pub const Broker = struct {
                 self.persistPartitionStates();
             }
         }
+        const recovered_topic_quorum_records = try self.replayCommittedTopicQuorumRecords();
+        if (recovered_topic_quorum_records > 0) {
+            log.info("Replayed {d} committed topic quorum record(s)", .{recovered_topic_quorum_records});
+            self.persistTopicsLocal();
+        }
+
         const recovered_partition_quorum_records = try self.replayCommittedPartitionReassignmentQuorumRecords();
         if (recovered_partition_quorum_records > 0) {
             log.info("Replayed {d} committed partition reassignment quorum record(s)", .{recovered_partition_quorum_records});
@@ -1114,8 +1121,9 @@ pub const Broker = struct {
     }
 
     pub fn deinit(self: *Broker) void {
-        // Save state before shutdown
-        self.persistTopics();
+        // Save local state before shutdown. Quorum-backed topic mutations are
+        // committed at mutation time; shutdown must not append new Raft records.
+        self.persistTopicsForShutdown();
         self.persistOffsets();
         self.persistPartitionStates();
         self.persistTransactionsIfDirty();
@@ -1185,6 +1193,14 @@ pub const Broker = struct {
         self.persistTopicsLocal();
         self.writeTopicSnapshotRecord() catch |err| {
             log.warn("Failed to append topic snapshot to __cluster_metadata: {}", .{err});
+        };
+    }
+
+    fn persistTopicsForShutdown(self: *Broker) void {
+        self.persistTopicsLocal();
+        if (self.raft_state != null) return;
+        self.writeTopicSnapshotRecordLocal() catch |err| {
+            log.warn("Failed to append shutdown topic snapshot to __cluster_metadata: {}", .{err});
         };
     }
 
@@ -3011,6 +3027,17 @@ pub const Broker = struct {
     /// partition counts, and supported creation-time configs survive fresh-dir
     /// broker replacement without relying on local topics.meta.
     fn writeTopicSnapshotRecord(self: *Broker) !void {
+        if (self.raft_state != null) {
+            try self.commitTopicQuorumRecord();
+            self.writeTopicSnapshotRecordLocal() catch |err| {
+                log.warn("Failed to append quorum-backed topic snapshot to __cluster_metadata: {}", .{err});
+            };
+            return;
+        }
+        try self.writeTopicSnapshotRecordLocal();
+    }
+
+    fn writeTopicSnapshotRecordLocal(self: *Broker) !void {
         const info = self.topics.get("__cluster_metadata") orelse return;
         if (info.num_partitions <= 0) return;
 
@@ -7880,6 +7907,57 @@ pub const Broker = struct {
         return applied;
     }
 
+    fn isTopicQuorumRecord(data: []const u8) bool {
+        return data.len >= topic_quorum_record_magic.len and
+            std.mem.eql(u8, data[0..topic_quorum_record_magic.len], topic_quorum_record_magic);
+    }
+
+    fn buildTopicQuorumRecord(self: *Broker) ![]u8 {
+        const snapshot = try self.encodeTopicSnapshotRecordValue();
+        defer self.allocator.free(snapshot);
+
+        const snapshot_size = try autoMqBytesFieldSize(snapshot);
+        const total_len = try checkedAddSize(topic_quorum_record_magic.len, snapshot_size);
+        const buf = try self.allocator.alloc(u8, total_len);
+        var pos: usize = 0;
+        @memcpy(buf[pos .. pos + topic_quorum_record_magic.len], topic_quorum_record_magic);
+        pos += topic_quorum_record_magic.len;
+        try writeRecordBytes(buf, &pos, snapshot);
+        std.debug.assert(pos == buf.len);
+        return buf;
+    }
+
+    fn commitTopicQuorumRecord(self: *Broker) !void {
+        const raft = self.raft_state orelse return;
+        if (raft.role != .leader) return error.NotController;
+
+        const record = try self.buildTopicQuorumRecord();
+        defer self.allocator.free(record);
+        _ = try self.appendCommittedAutoMqRecord(record);
+    }
+
+    fn applyTopicQuorumRecord(self: *Broker, data: []const u8) !void {
+        if (!isTopicQuorumRecord(data)) return;
+
+        var pos = topic_quorum_record_magic.len;
+        const snapshot = try readRecordBytes(data, &pos);
+        if (pos != data.len) return error.InvalidAutoMqMetadataRecord;
+        try self.restoreTopicSnapshotRecord(snapshot);
+    }
+
+    fn replayCommittedTopicQuorumRecords(self: *Broker) !usize {
+        const raft = self.raft_state orelse return 0;
+
+        var applied: usize = 0;
+        for (raft.log.entries.items) |entry| {
+            if (entry.offset > raft.commit_index) break;
+            if (!isTopicQuorumRecord(entry.data)) continue;
+            try self.applyTopicQuorumRecord(entry.data);
+            applied += 1;
+        }
+        return applied;
+    }
+
     fn isPartitionReassignmentQuorumRecord(data: []const u8) bool {
         return data.len >= partition_reassignment_quorum_record_magic.len and
             std.mem.eql(u8, data[0..partition_reassignment_quorum_record_magic.len], partition_reassignment_quorum_record_magic);
@@ -7934,15 +8012,17 @@ pub const Broker = struct {
     pub fn applyCommittedAutoMqQuorumRecords(self: *Broker) !usize {
         const metadata_applied = try self.replayCommittedAutoMqMetadataRecords();
         const object_applied = try self.replayCommittedAutoMqObjectMetadataRecords();
+        const topic_applied = try self.replayCommittedTopicQuorumRecords();
         const reassignment_applied = try self.replayCommittedPartitionReassignmentQuorumRecords();
         if (metadata_applied > 0) self.persistAutoMqMetadata();
         if (object_applied > 0) self.persistObjectManagerSnapshot();
+        if (topic_applied > 0) self.persistTopicsLocal();
         if (reassignment_applied > 0) {
             self.persistence.savePartitionReassignments(&self.partition_reassignments) catch |err| {
                 log.warn("Failed to persist replayed partition reassignment quorum records: {}", .{err});
             };
         }
-        return metadata_applied + object_applied + reassignment_applied;
+        return metadata_applied + object_applied + topic_applied + reassignment_applied;
     }
 
     fn refreshAutoMqQuorumStateForRequest(self: *Broker) void {
@@ -33097,6 +33177,59 @@ test "Broker rejects stale auto-balancer plan before mutating reassignment state
     try testing.expectEqual(@as(?i32, 1), broker.failover_controller.findPartitionOwner("rebalance-stale-b", 0));
 }
 
+test "Broker topic quorum records replay topic metadata before reassignments" {
+    const AlterReq = generated.alter_partition_reassignments_request.AlterPartitionReassignmentsRequest;
+
+    var raft = RaftState.init(testing.allocator, 1, "topic-quorum");
+    defer raft.deinit();
+    try raft.addVoter(1);
+    _ = raft.startElection();
+    raft.becomeLeader();
+
+    const topic_name = "topic-quorum-reassignment";
+    const remote_replicas = [_]i32{2};
+    const remote_reassignment = AlterReq.ReassignableTopic.ReassignablePartition{
+        .partition_index = 0,
+        .replicas = &remote_replicas,
+    };
+
+    {
+        var leader = Broker.init(testing.allocator, 1, 9092);
+        defer leader.deinit();
+        leader.setRaftState(&raft);
+        try testing.expect(leader.ensureTopic(topic_name));
+        try testing.expectEqual(@as(usize, 1), raft.log.length());
+        try testing.expect(Broker.isTopicQuorumRecord(raft.log.entries.items[0].data));
+
+        try testing.expectEqual(
+            @as(i16, @intFromEnum(ErrorCode.none)),
+            try leader.applyPartitionReassignment(topic_name, leader.topics.get(topic_name), remote_reassignment),
+        );
+        try testing.expectEqual(@as(usize, 2), raft.log.length());
+        try testing.expect(Broker.isPartitionReassignmentQuorumRecord(raft.log.entries.items[1].data));
+    }
+
+    {
+        var observer = Broker.init(testing.allocator, 3, 9094);
+        defer observer.deinit();
+        observer.setRaftState(&raft);
+        try testing.expectEqual(@as(usize, 2), try observer.applyCommittedAutoMqQuorumRecords());
+        try testing.expect(observer.topics.contains(topic_name));
+        try testing.expectEqual(@as(?i32, 2), observer.failover_controller.findPartitionOwner(topic_name, 0));
+        try testing.expectEqual(@as(u32, 1), observer.partition_reassignments.count());
+    }
+
+    {
+        var target = Broker.init(testing.allocator, 2, 9093);
+        defer target.deinit();
+        target.setRaftState(&raft);
+        try testing.expectEqual(@as(usize, 2), try target.applyCommittedAutoMqQuorumRecords());
+        try testing.expect(target.topics.contains(topic_name));
+        try testing.expectEqual(@as(?i32, 2), target.failover_controller.findPartitionOwner(topic_name, 0));
+        try testing.expectEqual(@as(u32, 0), target.partition_reassignments.count());
+    }
+}
+
 test "Broker partition reassignment quorum records replay assignment and cancellation" {
     const AlterReq = generated.alter_partition_reassignments_request.AlterPartitionReassignmentsRequest;
 
@@ -33128,8 +33261,9 @@ test "Broker partition reassignment quorum records replay assignment and cancell
             try leader.applyPartitionReassignment(topic_name, leader.topics.get(topic_name), remote_reassignment),
         );
         try testing.expectEqual(@as(?i32, 2), leader.failover_controller.findPartitionOwner(topic_name, 0));
-        try testing.expectEqual(@as(usize, 1), raft.log.length());
-        try testing.expect(Broker.isPartitionReassignmentQuorumRecord(raft.log.entries.items[0].data));
+        try testing.expectEqual(@as(usize, 2), raft.log.length());
+        try testing.expect(Broker.isTopicQuorumRecord(raft.log.entries.items[0].data));
+        try testing.expect(Broker.isPartitionReassignmentQuorumRecord(raft.log.entries.items[1].data));
     }
 
     {
@@ -33156,7 +33290,8 @@ test "Broker partition reassignment quorum records replay assignment and cancell
         );
         try testing.expectEqual(@as(u32, 0), leader.partition_reassignments.count());
         try testing.expectEqual(@as(?i32, 1), leader.failover_controller.findPartitionOwner(topic_name, 0));
-        try testing.expectEqual(@as(usize, 2), raft.log.length());
+        try testing.expectEqual(@as(usize, 3), raft.log.length());
+        try testing.expect(Broker.isPartitionReassignmentQuorumRecord(raft.log.entries.items[2].data));
     }
 
     {
@@ -33182,8 +33317,8 @@ test "Broker partition reassignment quorum mutation fails closed on non-leader" 
 
     var broker = Broker.init(testing.allocator, 1, 9092);
     defer broker.deinit();
-    broker.setRaftState(&raft);
     try testing.expect(broker.ensureTopic("reassign-quorum-follower-topic"));
+    broker.setRaftState(&raft);
 
     const remote_replicas = [_]i32{2};
     const alter_partitions = [_]AlterReq.ReassignableTopic.ReassignablePartition{.{
