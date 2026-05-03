@@ -1530,10 +1530,17 @@ pub const Broker = struct {
         self.share_group_sessions.clearRetainingCapacity();
     }
 
-    fn clearShareGroupSession(self: *Broker, group_id: []const u8, member_id: []const u8) bool {
-        const key = self.shareGroupMemberKey(group_id, member_id) catch return false;
+    fn clearShareGroupSession(self: *Broker, group_id: []const u8, member_id: []const u8) !bool {
+        const key = try self.shareGroupMemberKey(group_id, member_id);
         defer self.allocator.free(key);
         if (self.share_group_sessions.fetchRemove(key)) |removed| {
+            self.persistShareGroupSessionsDurably() catch |err| {
+                self.share_group_sessions.put(removed.key, removed.value) catch |restore_err| {
+                    self.allocator.free(removed.key);
+                    return restore_err;
+                };
+                return err;
+            };
             self.allocator.free(removed.key);
             return true;
         }
@@ -11485,9 +11492,15 @@ pub const Broker = struct {
                     const resp = shareGroupHeartbeatResponse(ErrorCode.kafka_storage_error.toInt(), null, req.member_id, req.member_epoch, 0);
                     return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
                 };
-                if (self.clearShareGroupSession(group_id, member_id)) {
-                    self.persistShareGroupSessionsLocal();
-                }
+                _ = self.clearShareGroupSession(group_id, member_id) catch |err| {
+                    log.warn("ShareGroupHeartbeat session cleanup failed for {s}/{s}: {}", .{ group_id, member_id, err });
+                    self.restoreConsumerGroupsAfterFailedMutation(previous_snapshot);
+                    self.persistConsumerGroupsDurably() catch |restore_err| {
+                        log.err("Failed to persist restored ShareGroupHeartbeat leave rollback for {s}: {}", .{ group_id, restore_err });
+                    };
+                    const resp = shareGroupHeartbeatResponse(ErrorCode.kafka_storage_error.toInt(), null, req.member_id, req.member_epoch, 0);
+                    return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+                };
             }
 
             const resp = shareGroupHeartbeatResponse(error_code, null, req.member_id, -1, 0);
@@ -41540,6 +41553,61 @@ test "Broker.handleRequest ShareGroupHeartbeat rejects malformed request" {
     try testing.expectEqual(ErrorCode.invalid_request.toInt(), resp.error_code);
     try testing.expectEqualStrings("malformed ShareGroupHeartbeat request", resp.error_message.?);
     try testing.expect(resp.assignment == null);
+}
+
+test "Broker.handleRequest ShareGroupHeartbeat leave rolls back when session cleanup persistence fails" {
+    const fs = @import("fs_compat");
+    const Req = generated.share_group_heartbeat_request.ShareGroupHeartbeatRequest;
+    const Resp = generated.share_group_heartbeat_response.ShareGroupHeartbeatResponse;
+
+    const tmp_dir = "/tmp/zmq-share-heartbeat-session-cleanup-fail-test";
+    fs.deleteTreeAbsolute(tmp_dir) catch {};
+    try fs.makeDirAbsolute(tmp_dir);
+    defer fs.deleteTreeAbsolute(tmp_dir) catch {};
+
+    var broker = Broker.initWithConfig(testing.allocator, 1, 9092, .{ .data_dir = tmp_dir });
+    defer broker.deinit();
+
+    const subscriptions = [_][]const u8{};
+    const joined = try broker.groups.joinGroupWithProtocol("share-cleanup-fail-group", "share-member", null, "share", "range", null, &subscriptions);
+    try testing.expectEqual(ErrorCode.none.toInt(), joined.error_code);
+    try testing.expect(broker.markShareGroupStable("share-cleanup-fail-group"));
+    try broker.persistConsumerGroupsDurably();
+    try testing.expectEqual(ErrorCode.none, try broker.updateShareSessionEpoch("share-cleanup-fail-group", "share-member", 0));
+
+    const sessions_path = try std.fmt.allocPrint(testing.allocator, "{s}/share_group_sessions.meta", .{tmp_dir});
+    defer testing.allocator.free(sessions_path);
+    try fs.deleteFileAbsolute(sessions_path);
+    try fs.makeDirAbsolute(sessions_path);
+
+    const req = Req{
+        .group_id = "share-cleanup-fail-group",
+        .member_id = "share-member",
+        .member_epoch = -1,
+    };
+
+    var buf: [256]u8 = undefined;
+    var pos = buildTestRequest(&buf, 76, 0, 7606, header_mod.requestHeaderVersion(76, 0));
+    req.serialize(&buf, &pos, 0);
+
+    const response = broker.handleRequest(buf[0..pos]);
+    try testing.expect(response != null);
+    defer testing.allocator.free(response.?);
+
+    var rpos: usize = 0;
+    var response_header = try ResponseHeader.deserialize(testing.allocator, response.?, &rpos, header_mod.responseHeaderVersion(76, 0));
+    defer response_header.deinit(testing.allocator);
+    try testing.expectEqual(@as(i32, 7606), response_header.correlation_id);
+
+    const resp = try Resp.deserialize(testing.allocator, response.?, &rpos, 0);
+    defer freeDeserializedShareGroupHeartbeatResponse(&resp);
+    try testing.expectEqual(response.?.len, rpos);
+    try testing.expectEqual(ErrorCode.kafka_storage_error.toInt(), resp.error_code);
+
+    const group = broker.groups.groups.getPtr("share-cleanup-fail-group") orelse return error.ExpectedShareGroup;
+    try testing.expect(group.members.contains("share-member"));
+    try testing.expectEqual(ConsumerGroup.GroupState.stable, group.state);
+    try testing.expectEqual(@as(usize, 1), broker.share_group_sessions.count());
 }
 
 test "Broker.handleRequest ShareGroupDescribe returns local share group state" {

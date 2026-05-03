@@ -193,8 +193,9 @@ Status: completed for the initial catalog and DeleteGroups slice.
   ShareGroupHeartbeat and ShareGroupDescribe remain non-advertised until durable
   share-group coordinator semantics exist, but direct v0 probes now join,
   heartbeat, update subscriptions/rack metadata, leave, return deterministic
-  range assignments, and describe local share groups through the existing group
-  coordinator. ShareFetch and ShareAcknowledge remain non-advertised until
+  range assignments, fail closed on leave/session-cleanup persistence errors,
+  and describe local share groups through the existing group coordinator.
+  ShareFetch and ShareAcknowledge remain non-advertised until
   durable share-session data-plane semantics exist, but direct v0 probes now
   validate local share sessions, fetch records from the partition store, return
   acquired-record ranges, validate acknowledgement batches, advance local share
