@@ -18966,7 +18966,7 @@ pub const Broker = struct {
             }
         }
         if (flexible) ser.skipTaggedFields(buf, &pos) catch return false;
-        return true;
+        return pos == buf.len;
     }
 
     fn validateOffsetCommitRequestFrame(buf: []const u8, start_pos: usize, api_version: i16) bool {
@@ -39190,6 +39190,28 @@ test "Broker.handleRequest LeaveGroup rejects truncated request" {
     var buf: [128]u8 = undefined;
     const req_len = buildTestRequest(&buf, 13, 4, 1306, header_mod.requestHeaderVersion(13, 4));
     try testing.expect(broker.handleRequest(buf[0..req_len]) == null);
+}
+
+test "Broker.handleRequest LeaveGroup rejects trailing bytes" {
+    const Req = generated.leave_group_request.LeaveGroupRequest;
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+
+    const members = [_]Req.MemberIdentity{.{
+        .member_id = "leave-trailing-member",
+        .group_instance_id = null,
+    }};
+    const req = Req{
+        .group_id = "leave-trailing-group",
+        .members = &members,
+    };
+
+    var buf: [512]u8 = undefined;
+    var pos = buildTestRequest(&buf, 13, 4, 1310, header_mod.requestHeaderVersion(13, 4));
+    req.serialize(&buf, &pos, 4);
+
+    try expectTrailingByteRejected(&broker, &buf, pos);
 }
 
 test "Broker kafka_server_api_errors_total is registered" {
