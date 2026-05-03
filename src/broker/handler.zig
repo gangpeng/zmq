@@ -815,6 +815,13 @@ pub const Broker = struct {
             log.info("Restored {d} share group state partition(s) from share_group_states.meta", .{self.share_group_states.count()});
         }
 
+        const saved_share_group_sessions = try self.persistence.loadShareGroupSessions();
+        defer self.persistence.freeShareGroupSessionEntries(saved_share_group_sessions);
+        try self.restoreShareGroupSessions(saved_share_group_sessions);
+        if (saved_share_group_sessions.len > 0) {
+            log.info("Restored {d} share group session(s) from share_group_sessions.meta", .{self.share_group_sessions.count()});
+        }
+
         // Load local AutoMQ controller-style metadata (KV namespace, node registry,
         // license, zone router state, and group promotions).
         var auto_mq_snapshot = try self.persistence.loadAutoMqMetadata();
@@ -1189,6 +1196,7 @@ pub const Broker = struct {
         self.persistProducerSequencesIfDirty();
         self.persistAutoMqMetadata();
         self.persistShareGroupStatesLocal();
+        self.persistShareGroupSessionsLocal();
         self.persistPartitionReassignmentsLocal();
         self.persistReplicaDirectoryAssignmentsLocal();
         self.persistObjectManagerSnapshot();
@@ -1474,6 +1482,41 @@ pub const Broker = struct {
         self.share_group_sessions.clearRetainingCapacity();
     }
 
+    fn clearShareGroupSession(self: *Broker, group_id: []const u8, member_id: []const u8) bool {
+        const key = self.shareGroupMemberKey(group_id, member_id) catch return false;
+        defer self.allocator.free(key);
+        if (self.share_group_sessions.fetchRemove(key)) |removed| {
+            self.allocator.free(removed.key);
+            return true;
+        }
+        return false;
+    }
+
+    fn clearShareGroupSessionsForGroup(self: *Broker, group_id: []const u8) bool {
+        var removed_any = false;
+        while (true) {
+            var key_to_remove: ?[]const u8 = null;
+            var it = self.share_group_sessions.iterator();
+            while (it.next()) |entry| {
+                const key = entry.key_ptr.*;
+                const parts = parseShareGroupMemberKey(key) orelse continue;
+                if (std.mem.eql(u8, parts.group_id, group_id)) {
+                    key_to_remove = key;
+                    break;
+                }
+            }
+
+            const key = key_to_remove orelse break;
+            if (self.share_group_sessions.fetchRemove(key)) |removed| {
+                self.allocator.free(removed.key);
+                removed_any = true;
+            } else {
+                break;
+            }
+        }
+        return removed_any;
+    }
+
     fn clearReplicaDirectoryAssignments(self: *Broker) void {
         var it = self.replica_directory_assignments.iterator();
         while (it.next()) |entry| {
@@ -1724,6 +1767,12 @@ pub const Broker = struct {
         };
     }
 
+    fn persistShareGroupSessionsLocal(self: *Broker) void {
+        self.persistence.saveShareGroupSessions(&self.share_group_sessions) catch |err| {
+            log.warn("Failed to persist share group sessions: {}", .{err});
+        };
+    }
+
     fn persistPartitionReassignmentsDurably(self: *Broker) !void {
         if (self.raft_state != null) {
             try self.commitPartitionReassignmentQuorumRecord();
@@ -1836,6 +1885,25 @@ pub const Broker = struct {
                 self.allocator.free(key);
             } else {
                 try self.share_group_states.put(key, restored);
+            }
+        }
+    }
+
+    fn restoreShareGroupSessions(self: *Broker, entries: []const MetadataPersistence.ShareGroupSessionEntry) !void {
+        self.clearShareGroupSessions();
+
+        for (entries) |entry| {
+            if (entry.epoch < 0) continue;
+            const parts = parseShareGroupMemberKey(entry.key) orelse continue;
+            if (self.validateShareGroupMember(parts.group_id, parts.member_id) != ErrorCode.none) continue;
+
+            const key = try self.allocator.dupe(u8, entry.key);
+            errdefer self.allocator.free(key);
+            if (self.share_group_sessions.getPtr(key)) |existing| {
+                existing.* = entry.epoch;
+                self.allocator.free(key);
+            } else {
+                try self.share_group_sessions.put(key, entry.epoch);
             }
         }
     }
@@ -11271,6 +11339,9 @@ pub const Broker = struct {
                     const resp = shareGroupHeartbeatResponse(ErrorCode.kafka_storage_error.toInt(), null, req.member_id, req.member_epoch, 0);
                     return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
                 };
+                if (self.clearShareGroupSession(group_id, member_id)) {
+                    self.persistShareGroupSessionsLocal();
+                }
             }
 
             const resp = shareGroupHeartbeatResponse(error_code, null, req.member_id, -1, 0);
@@ -11619,11 +11690,25 @@ pub const Broker = struct {
     }
 
     fn shareGroupMemberKey(self: *Broker, group_id: []const u8, member_id: []const u8) ![]u8 {
-        const key = try self.allocator.alloc(u8, group_id.len + 1 + member_id.len);
-        @memcpy(key[0..group_id.len], group_id);
-        key[group_id.len] = ':';
-        @memcpy(key[group_id.len + 1 ..], member_id);
-        return key;
+        return std.fmt.allocPrint(self.allocator, "{d}:{s}{s}", .{ group_id.len, group_id, member_id });
+    }
+
+    const ShareGroupMemberKeyParts = struct {
+        group_id: []const u8,
+        member_id: []const u8,
+    };
+
+    fn parseShareGroupMemberKey(key: []const u8) ?ShareGroupMemberKeyParts {
+        const delimiter = std.mem.indexOfScalar(u8, key, ':') orelse return null;
+        if (delimiter == 0) return null;
+        const group_len = std.fmt.parseInt(usize, key[0..delimiter], 10) catch return null;
+        const group_start = delimiter + 1;
+        const member_start = group_start + group_len;
+        if (member_start > key.len) return null;
+        return .{
+            .group_id = key[group_start..member_start],
+            .member_id = key[member_start..],
+        };
     }
 
     fn validateShareGroupMember(self: *const Broker, group_id: ?[]const u8, member_id: ?[]const u8) ErrorCode {
@@ -11648,6 +11733,7 @@ pub const Broker = struct {
             if (self.share_group_sessions.fetchRemove(key)) |removed| {
                 self.allocator.free(removed.key);
                 self.allocator.free(key);
+                self.persistShareGroupSessionsLocal();
                 return ErrorCode.none;
             }
             self.allocator.free(key);
@@ -11658,10 +11744,12 @@ pub const Broker = struct {
             defer self.allocator.free(key);
             if (share_session_epoch == 0) {
                 current_epoch.* = 0;
+                self.persistShareGroupSessionsLocal();
                 return ErrorCode.none;
             }
             if (share_session_epoch != current_epoch.* + 1) return ErrorCode.invalid_fetch_session_epoch;
             current_epoch.* = share_session_epoch;
+            self.persistShareGroupSessionsLocal();
             return ErrorCode.none;
         }
 
@@ -11671,6 +11759,7 @@ pub const Broker = struct {
         }
 
         try self.share_group_sessions.put(key, 0);
+        self.persistShareGroupSessionsLocal();
         return ErrorCode.none;
     }
 
@@ -14831,7 +14920,9 @@ pub const Broker = struct {
         if (flexible) ser.skipTaggedFields(request_bytes, &pos) catch return null;
         if (offsets_mutated) self.persistOffsets();
         if (groups_mutated) {
+            var groups_persisted = true;
             self.persistConsumerGroupsDurably() catch |err| {
+                groups_persisted = false;
                 log.warn("DeleteGroups consumer-group snapshot write failed: {}", .{err});
                 self.restoreConsumerGroupsAfterFailedMutation(previous_snapshot);
                 for (results.items) |*result| {
@@ -14840,6 +14931,17 @@ pub const Broker = struct {
                     }
                 }
             };
+            if (groups_persisted) {
+                var sessions_removed = false;
+                for (results.items) |result| {
+                    if (result.error_code == @intFromEnum(ErrorCode.none)) {
+                        if (result.group_id) |deleted_group_id| {
+                            sessions_removed = self.clearShareGroupSessionsForGroup(deleted_group_id) or sessions_removed;
+                        }
+                    }
+                }
+                if (sessions_removed) self.persistShareGroupSessionsLocal();
+            }
         }
 
         const resp_body = DeleteGroupsResponse{
@@ -40758,6 +40860,9 @@ test "Broker.handleRequest ShareGroupHeartbeat joins heartbeats updates and leav
     try testing.expectEqual(ErrorCode.fenced_member_epoch.toInt(), stale_resp.error_code);
     try testing.expectEqual(@as(i32, 0), stale_resp.heartbeat_interval_ms);
 
+    try testing.expectEqual(ErrorCode.none, try broker.updateShareSessionEpoch("share-group", "share-member", 0));
+    try testing.expectEqual(@as(usize, 1), broker.share_group_sessions.count());
+
     const leave_req = Req{
         .group_id = "share-group",
         .member_id = resp.member_id,
@@ -40783,6 +40888,7 @@ test "Broker.handleRequest ShareGroupHeartbeat joins heartbeats updates and leav
     try testing.expectEqual(ErrorCode.none.toInt(), leave_resp.error_code);
     try testing.expectEqual(@as(i32, -1), leave_resp.member_epoch);
     try testing.expectEqual(ConsumerGroup.GroupState.empty, group.state);
+    try testing.expectEqual(@as(usize, 0), broker.share_group_sessions.count());
 }
 
 test "Broker.handleRequest ShareGroupHeartbeat rejects malformed request" {
@@ -41146,6 +41252,38 @@ test "Broker.handleRequest ShareAcknowledge rejects malformed request" {
     try testing.expectEqual(response.?.len, rpos);
     try testing.expectEqual(ErrorCode.invalid_request.toInt(), resp.error_code);
     try testing.expectEqualStrings("malformed ShareAcknowledge request", resp.error_message.?);
+}
+
+test "Broker share session epoch persists across local restart" {
+    const fs = @import("fs_compat");
+
+    const tmp_dir = "/tmp/zmq-share-group-session-restart-test";
+    fs.deleteTreeAbsolute(tmp_dir) catch {};
+    try fs.makeDirAbsolute(tmp_dir);
+    defer fs.deleteTreeAbsolute(tmp_dir) catch {};
+
+    {
+        var broker = Broker.initWithConfig(testing.allocator, 1, 9092, .{ .data_dir = tmp_dir });
+        defer broker.deinit();
+
+        const subscriptions = [_][]const u8{};
+        const joined = try broker.groups.joinGroupWithProtocol("share:restart-group", "member:one", null, "share", "range", null, &subscriptions);
+        try testing.expectEqual(ErrorCode.none.toInt(), joined.error_code);
+        try testing.expect(broker.markShareGroupStable("share:restart-group"));
+        try broker.persistConsumerGroupsDurably();
+
+        try testing.expectEqual(ErrorCode.none, try broker.updateShareSessionEpoch("share:restart-group", "member:one", 0));
+        try testing.expectEqual(ErrorCode.none, try broker.updateShareSessionEpoch("share:restart-group", "member:one", 1));
+    }
+
+    {
+        var restarted = Broker.initWithConfig(testing.allocator, 1, 9092, .{ .data_dir = tmp_dir });
+        try restarted.open();
+        defer restarted.deinit();
+
+        try testing.expectEqual(ErrorCode.none, try restarted.updateShareSessionEpoch("share:restart-group", "member:one", 2));
+        try testing.expectEqual(ErrorCode.invalid_fetch_session_epoch, try restarted.updateShareSessionEpoch("share:restart-group", "member:one", 2));
+    }
 }
 
 test "Broker.handleRequest InitializeShareGroupState initializes local share state" {

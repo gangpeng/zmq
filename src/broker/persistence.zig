@@ -942,6 +942,11 @@ pub const MetadataPersistence = struct {
         batches: []ShareStateBatchEntry,
     };
 
+    pub const ShareGroupSessionEntry = struct {
+        key: []u8,
+        epoch: i32,
+    };
+
     /// Save transaction state to disk.
     /// NOTE: AutoMQ/Kafka persists to __transaction_state topic on coordinator startup.
     /// ZMQ uses file-based persistence as a simplification.
@@ -1685,6 +1690,83 @@ pub const MetadataPersistence = struct {
             self.allocator.free(entry.key);
             if (entry.batches.len > 0) self.allocator.free(entry.batches);
         }
+        if (entries.len > 0) self.allocator.free(entries);
+    }
+
+    /// Save local share fetch-session epochs to disk.
+    /// Format: share_group_sessions.meta TSV with a hex-encoded internal session key.
+    pub fn saveShareGroupSessions(self: *MetadataPersistence, sessions: anytype) !void {
+        const dir = self.data_dir orelse return;
+
+        const path = try std.fmt.allocPrint(self.allocator, "{s}/share_group_sessions.meta", .{dir});
+        defer self.allocator.free(path);
+
+        const file = try fs.createFileAbsolute(path, .{ .truncate = true });
+        defer file.close();
+        const writer = file.writer();
+
+        var it = sessions.iterator();
+        while (it.next()) |entry| {
+            try file.writeAll("share_session\t");
+            try writeHex(file, entry.key_ptr.*);
+            try writer.print("\t{d}\n", .{entry.value_ptr.*});
+        }
+        try file.sync();
+    }
+
+    pub fn loadShareGroupSessions(self: *MetadataPersistence) ![]ShareGroupSessionEntry {
+        const dir = self.data_dir orelse return &.{};
+
+        const path = try std.fmt.allocPrint(self.allocator, "{s}/share_group_sessions.meta", .{dir});
+        defer self.allocator.free(path);
+
+        const file = fs.openFileAbsolute(path, .{}) catch |err| {
+            log.debug("No share_group_sessions.meta found: {}", .{err});
+            return &.{};
+        };
+        defer file.close();
+
+        const content = file.readToEndAlloc(self.allocator, 1024 * 1024) catch |err| {
+            log.warn("Failed to read share_group_sessions.meta: {}", .{err});
+            return &.{};
+        };
+        defer self.allocator.free(content);
+
+        var entries = std.array_list.Managed(ShareGroupSessionEntry).init(self.allocator);
+        errdefer {
+            for (entries.items) |entry| self.allocator.free(entry.key);
+            entries.deinit();
+        }
+
+        var lines = std.mem.splitSequence(u8, content, "\n");
+        while (lines.next()) |line| {
+            if (line.len == 0) continue;
+
+            var fields = std.mem.splitSequence(u8, line, "\t");
+            const tag = fields.next() orelse continue;
+            if (!std.mem.eql(u8, tag, "share_session")) continue;
+
+            const key_hex = fields.next() orelse continue;
+            const epoch_str = fields.next() orelse continue;
+
+            const key = decodeHexAlloc(self.allocator, key_hex) catch continue;
+            const epoch = std.fmt.parseInt(i32, epoch_str, 10) catch {
+                self.allocator.free(key);
+                continue;
+            };
+
+            try entries.append(.{
+                .key = key,
+                .epoch = epoch,
+            });
+        }
+
+        log.info("Loaded {d} share group session entries from share_group_sessions.meta", .{entries.items.len});
+        return entries.toOwnedSlice();
+    }
+
+    pub fn freeShareGroupSessionEntries(self: *MetadataPersistence, entries: []ShareGroupSessionEntry) void {
+        for (entries) |entry| self.allocator.free(entry.key);
         if (entries.len > 0) self.allocator.free(entries);
     }
 
@@ -2482,6 +2564,34 @@ test "MetadataPersistence save and load share group states round-trip" {
     try testing.expectEqual(@as(i64, 8), loaded[0].batches[0].last_offset);
     try testing.expectEqual(@as(i8, 2), loaded[0].batches[0].delivery_state);
     try testing.expectEqual(@as(i16, 1), loaded[0].batches[0].delivery_count);
+}
+
+test "MetadataPersistence save and load share group sessions round-trip" {
+    const tmp_dir = "/tmp/automq-share-group-session-test";
+    fs.deleteTreeAbsolute(tmp_dir) catch {};
+    fs.makeDirAbsolute(tmp_dir) catch {};
+    defer fs.deleteTreeAbsolute(tmp_dir) catch {};
+
+    var persistence = MetadataPersistence.init(testing.allocator, tmp_dir);
+
+    var sessions = std.StringHashMap(i32).init(testing.allocator);
+    defer {
+        var it = sessions.iterator();
+        while (it.next()) |entry| testing.allocator.free(entry.key_ptr.*);
+        sessions.deinit();
+    }
+
+    const key = try testing.allocator.dupe(u8, "10:group\tname-member\nid");
+    try sessions.put(key, 7);
+
+    try persistence.saveShareGroupSessions(&sessions);
+
+    const loaded = try persistence.loadShareGroupSessions();
+    defer persistence.freeShareGroupSessionEntries(loaded);
+
+    try testing.expectEqual(@as(usize, 1), loaded.len);
+    try testing.expectEqualStrings("10:group\tname-member\nid", loaded[0].key);
+    try testing.expectEqual(@as(i32, 7), loaded[0].epoch);
 }
 
 test "MetadataPersistence save and load AutoMQ metadata round-trip" {
