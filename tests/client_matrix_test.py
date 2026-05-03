@@ -12,10 +12,17 @@ Run against a running ZMQ broker:
 Optional environment:
     ZMQ_CLIENT_MATRIX_BOOTSTRAP   localhost:9092
     ZMQ_CLIENT_MATRIX_TOOLS       auto | kcat,kafka-cli,kafka-python,confluent-kafka,java-kafka,go-kafka
+    ZMQ_CLIENT_MATRIX_PROFILES    Comma-separated profile names for explicit client/library version sets
     ZMQ_CLIENT_MATRIX_JAVA_CLASSPATH
                                   Classpath containing kafka-clients jars for java-kafka
     ZMQ_CLIENT_MATRIX_ENABLE_GO   1 to include go-kafka in auto mode
     ZMQ_CLIENT_MATRIX_GO_MODULE   Go module for go-kafka (default github.com/segmentio/kafka-go@latest)
+    ZMQ_CLIENT_MATRIX_PYTHON      Python executable for kafka-python/confluent-kafka probes
+
+Per-profile overrides:
+    For profile "apache_3_7", set ZMQ_CLIENT_MATRIX_APACHE_3_7_TOOLS,
+    ZMQ_CLIENT_MATRIX_APACHE_3_7_JAVA_CLASSPATH, etc. A profile inherits the
+    corresponding global setting when its override is not present.
 
 Supported probes:
     kcat             metadata plus produce/fetch round trip
@@ -41,13 +48,15 @@ TOOLS = os.environ.get("ZMQ_CLIENT_MATRIX_TOOLS", "auto")
 JAVA_CLASSPATH = os.environ.get("ZMQ_CLIENT_MATRIX_JAVA_CLASSPATH")
 ENABLE_GO_AUTO = os.environ.get("ZMQ_CLIENT_MATRIX_ENABLE_GO") == "1"
 GO_MODULE = os.environ.get("ZMQ_CLIENT_MATRIX_GO_MODULE", "github.com/segmentio/kafka-go@latest")
+PYTHON = os.environ.get("ZMQ_CLIENT_MATRIX_PYTHON", sys.executable)
+ACTIVE_PROFILE = "default"
 
 
 class MatrixError(Exception):
     pass
 
 
-def run(cmd, timeout=30, input_text=None, cwd=None):
+def run(cmd, timeout=30, input_text=None, cwd=None, env=None):
     proc = subprocess.run(
         cmd,
         input=input_text,
@@ -56,6 +65,7 @@ def run(cmd, timeout=30, input_text=None, cwd=None):
         text=True,
         timeout=timeout,
         cwd=cwd,
+        env=env,
     )
     if proc.returncode != 0:
         raise MatrixError(f"{cmd[0]} failed with exit code {proc.returncode}\n{proc.stdout}")
@@ -70,13 +80,83 @@ def have_module(module):
     return importlib.util.find_spec(module) is not None
 
 
+def have_python_module(module):
+    if python_is_current():
+        return have_module(module)
+    try:
+        run(
+            [
+                PYTHON,
+                "-c",
+                f"import importlib.util; raise SystemExit(0 if importlib.util.find_spec({module!r}) else 1)",
+            ],
+            timeout=15,
+        )
+        return True
+    except (MatrixError, FileNotFoundError, subprocess.TimeoutExpired):
+        return False
+
+
+def python_is_current():
+    try:
+        return os.path.realpath(PYTHON) == os.path.realpath(sys.executable)
+    except OSError:
+        return PYTHON == sys.executable
+
+
+def profile_env_name(profile, suffix):
+    sanitized = "".join(ch.upper() if ch.isalnum() else "_" for ch in profile)
+    return f"ZMQ_CLIENT_MATRIX_{sanitized}_{suffix}"
+
+
+def profile_names():
+    raw = os.environ.get("ZMQ_CLIENT_MATRIX_PROFILES", "")
+    names = [name.strip() for name in raw.split(",") if name.strip()]
+    return names if names else ["default"]
+
+
+def profile_setting(profile, suffix, fallback):
+    if profile == "default":
+        return os.environ.get(f"ZMQ_CLIENT_MATRIX_{suffix}", fallback)
+    return os.environ.get(profile_env_name(profile, suffix), os.environ.get(f"ZMQ_CLIENT_MATRIX_{suffix}", fallback))
+
+
+def apply_profile(profile):
+    global ACTIVE_PROFILE, BOOTSTRAP, TOOLS, JAVA_CLASSPATH, ENABLE_GO_AUTO, GO_MODULE, PYTHON
+
+    ACTIVE_PROFILE = profile
+    BOOTSTRAP = profile_setting(profile, "BOOTSTRAP", "localhost:9092")
+    TOOLS = profile_setting(profile, "TOOLS", "auto")
+    JAVA_CLASSPATH = profile_setting(profile, "JAVA_CLASSPATH", None)
+    ENABLE_GO_AUTO = profile_setting(profile, "ENABLE_GO", "0") == "1"
+    GO_MODULE = profile_setting(profile, "GO_MODULE", "github.com/segmentio/kafka-go@latest")
+    PYTHON = profile_setting(profile, "PYTHON", sys.executable)
+
+
 def matrix_topic(tool):
-    sanitized = "".join(ch if ch.isalnum() else "_" for ch in tool)
+    profile_prefix = "" if ACTIVE_PROFILE == "default" else f"{ACTIVE_PROFILE}_"
+    sanitized = "".join(ch if ch.isalnum() else "_" for ch in profile_prefix + tool)
     return f"zmq_client_matrix_{sanitized}_{os.getpid()}"
 
 
 def matrix_payload(tool):
-    return f"zmq-client-matrix-{tool}-{os.getpid()}"
+    return f"zmq-client-matrix-{ACTIVE_PROFILE}-{tool}-{os.getpid()}"
+
+
+def run_python_subtool(tool):
+    if python_is_current():
+        return False
+
+    env = os.environ.copy()
+    env["ZMQ_RUN_CLIENT_MATRIX"] = "1"
+    env["ZMQ_CLIENT_MATRIX_BOOTSTRAP"] = BOOTSTRAP
+    env["ZMQ_CLIENT_MATRIX_TOOLS"] = tool
+    env["ZMQ_CLIENT_MATRIX_ENABLE_GO"] = "0"
+    env["ZMQ_CLIENT_MATRIX_PYTHON"] = PYTHON
+    env.pop("ZMQ_CLIENT_MATRIX_PROFILES", None)
+
+    run([PYTHON, __file__], timeout=120, env=env)
+    return True
 
 
 def require_output_contains(output, payload, tool):
@@ -96,9 +176,9 @@ def selected_tools():
             and have("kafka-console-consumer.sh")
         ):
             tools.append("kafka-cli")
-        if have_module("kafka"):
+        if have_python_module("kafka"):
             tools.append("kafka-python")
-        if have_module("confluent_kafka"):
+        if have_python_module("confluent_kafka"):
             tools.append("confluent-kafka")
         if have("javac") and have("java") and JAVA_CLASSPATH:
             tools.append("java-kafka")
@@ -166,6 +246,9 @@ def test_kafka_cli():
 
 
 def test_kafka_python():
+    if run_python_subtool("kafka-python"):
+        print(f"ok: kafka-python delegated to {PYTHON}")
+        return
     if not have_module("kafka"):
         raise MatrixError("kafka-python selected but import 'kafka' is not available")
 
@@ -220,6 +303,9 @@ def test_kafka_python():
 
 
 def test_confluent_kafka():
+    if run_python_subtool("confluent-kafka"):
+        print(f"ok: confluent-kafka delegated to {PYTHON}")
+        return
     if not have_module("confluent_kafka"):
         raise MatrixError("confluent-kafka selected but import 'confluent_kafka' is not available")
 
@@ -469,6 +555,16 @@ def main():
         print("skip: set ZMQ_RUN_CLIENT_MATRIX=1 to run real-client matrix")
         return 0
 
+    profiles = profile_names()
+    for profile in profiles:
+        apply_profile(profile)
+        run_profile()
+
+    print(f"ok: client matrix passed for {', '.join(profiles)} profile(s)")
+    return 0
+
+
+def run_profile():
     tools = selected_tools()
     if not tools:
         raise MatrixError(
@@ -492,12 +588,41 @@ def main():
         else:
             raise MatrixError(f"unknown client matrix tool: {tool}")
 
-    print(f"ok: client matrix passed for {', '.join(tools)} against {BOOTSTRAP}")
-    return 0
+    print(f"ok: client matrix profile {ACTIVE_PROFILE} passed for {', '.join(tools)} against {BOOTSTRAP}")
+
+
+def self_test():
+    old_env = os.environ.copy()
+    try:
+        os.environ["ZMQ_CLIENT_MATRIX_PROFILES"] = "apache_3_7, go_1_21"
+        os.environ["ZMQ_CLIENT_MATRIX_APACHE_3_7_TOOLS"] = "java-kafka"
+        os.environ["ZMQ_CLIENT_MATRIX_APACHE_3_7_JAVA_CLASSPATH"] = "/opt/kafka-3.7/libs/*"
+        os.environ["ZMQ_CLIENT_MATRIX_GO_1_21_TOOLS"] = "go-kafka"
+        os.environ["ZMQ_CLIENT_MATRIX_GO_1_21_GO_MODULE"] = "github.com/segmentio/kafka-go@v0.4.47"
+
+        names = profile_names()
+        if names != ["apache_3_7", "go_1_21"]:
+            raise MatrixError(f"profile parsing failed: {names}")
+
+        apply_profile("apache_3_7")
+        if TOOLS != "java-kafka" or JAVA_CLASSPATH != "/opt/kafka-3.7/libs/*":
+            raise MatrixError("java profile override failed")
+
+        apply_profile("go_1_21")
+        if TOOLS != "go-kafka" or GO_MODULE != "github.com/segmentio/kafka-go@v0.4.47":
+            raise MatrixError("go profile override failed")
+
+        print("ok: client matrix profile self-test")
+        return 0
+    finally:
+        os.environ.clear()
+        os.environ.update(old_env)
 
 
 if __name__ == "__main__":
     try:
+        if "--self-test" in sys.argv:
+            sys.exit(self_test())
         sys.exit(main())
     except MatrixError as exc:
         print(f"FAIL: {exc}", file=sys.stderr)
