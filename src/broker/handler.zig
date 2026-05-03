@@ -19146,7 +19146,7 @@ pub const Broker = struct {
             if (!skipKafkaString(buf, &pos, true)) return false; // transactional_id
         }
         ser.skipTaggedFields(buf, &pos) catch return false;
-        return true;
+        return pos == buf.len;
     }
 
     fn validateListTransactionsRequestFrame(buf: []const u8, start_pos: usize, api_version: i16) bool {
@@ -23285,6 +23285,22 @@ test "Broker.handleRequest DescribeTransactions rejects truncated request" {
     var buf: [128]u8 = undefined;
     const req_len = buildTestRequest(&buf, 65, 0, 6502, header_mod.requestHeaderVersion(65, 0));
     try testing.expect(broker.handleRequest(buf[0..req_len]) == null);
+}
+
+test "Broker.handleRequest DescribeTransactions rejects trailing bytes" {
+    const Req = generated.describe_transactions_request.DescribeTransactionsRequest;
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+
+    const transactional_ids = [_]?[]const u8{"describe-trailing-txn"};
+    const req = Req{ .transactional_ids = &transactional_ids };
+
+    var buf: [256]u8 = undefined;
+    var pos = buildTestRequest(&buf, 65, 0, 6504, header_mod.requestHeaderVersion(65, 0));
+    req.serialize(&buf, &pos, 0);
+
+    try expectTrailingByteRejected(&broker, &buf, pos);
 }
 
 fn initTxnOffsetCommitForTest(broker: *Broker, transactional_id: []const u8, group_id: []const u8) !TxnCoordinator.InitProducerIdResult {
