@@ -19188,7 +19188,7 @@ pub const Broker = struct {
         }
 
         ser.skipTaggedFields(buf, &pos) catch return false;
-        return true;
+        return pos == buf.len;
     }
 
     fn skipAddPartitionsToTxnTopics(buf: []const u8, pos: *usize, flexible: bool) bool {
@@ -34067,6 +34067,25 @@ test "Broker.handleRequest DescribeTopicPartitions rejects truncated request" {
     var buf: [128]u8 = undefined;
     const req_len = buildTestRequest(&buf, 75, 0, 7502, header_mod.requestHeaderVersion(75, 0));
     try testing.expect(broker.handleRequest(buf[0..req_len]) == null);
+}
+
+test "Broker.handleRequest DescribeTopicPartitions rejects trailing bytes" {
+    const Req = generated.describe_topic_partitions_request.DescribeTopicPartitionsRequest;
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+
+    const topics = [_]Req.TopicRequest{.{ .name = "dtp-trailing-topic" }};
+    const req = Req{
+        .topics = &topics,
+        .response_partition_limit = 10,
+    };
+
+    var buf: [512]u8 = undefined;
+    var pos = buildTestRequest(&buf, 75, 0, 7503, header_mod.requestHeaderVersion(75, 0));
+    req.serialize(&buf, &pos, 0);
+
+    try expectTrailingByteRejected(&broker, &buf, pos);
 }
 
 // ---------------------------------------------------------------

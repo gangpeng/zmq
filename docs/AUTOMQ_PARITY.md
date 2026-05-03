@@ -270,6 +270,8 @@ Status: completed for the initial catalog and DeleteGroups slice.
   ID and tagged-fields section.
   ListTransactions now rejects trailing bytes after state/producer/duration
   filters and tagged-fields section.
+  DescribeTopicPartitions now rejects trailing bytes after topic filters,
+  optional cursor, and tagged-fields section.
   MetadataRequest generated decoding now preserves nullable `Topics` semantics:
   v1+ null requests all topics, explicit empty arrays request no topic results,
   and v0 null topics are rejected as malformed.
