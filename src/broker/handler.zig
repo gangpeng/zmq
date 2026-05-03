@@ -60,6 +60,8 @@ const scram_credential_snapshot_record_value_magic = "ZMQSC1";
 const scram_credential_snapshot_record_key = "__zmq_scram_credential_snapshot";
 const acl_snapshot_record_value_magic = "ZMQAC1";
 const acl_snapshot_record_key = "__zmq_acl_snapshot";
+const finalized_feature_snapshot_record_value_magic = "ZMQFF1";
+const finalized_feature_snapshot_record_key = "__zmq_finalized_feature_snapshot";
 const auto_mq_quorum_commit_timeout_ms: i64 = 5000;
 
 /// Stateful Kafka broker.
@@ -758,18 +760,22 @@ pub const Broker = struct {
         }
         const recovered_cluster_records = try self.restoreClusterMetadataFromLog();
         if (recovered_cluster_records.total() > 0) {
-            log.info("Restored cluster metadata from __cluster_metadata (topics={d}, reassignments={d}, client_quotas={d}, scram_credentials={d}, acls={d})", .{
+            log.info("Restored cluster metadata from __cluster_metadata (topics={d}, reassignments={d}, client_quotas={d}, scram_credentials={d}, acls={d}, finalized_features={d})", .{
                 recovered_cluster_records.topic_snapshots,
                 recovered_cluster_records.partition_reassignment_snapshots,
                 recovered_cluster_records.client_quota_snapshots,
                 recovered_cluster_records.scram_credential_snapshots,
                 recovered_cluster_records.acl_snapshots,
+                recovered_cluster_records.finalized_feature_snapshots,
             });
             self.persistence.saveTopics(&self.topics) catch |err| {
                 log.warn("Failed to persist replayed topic metadata: {}", .{err});
             };
             self.persistence.savePartitionReassignments(&self.partition_reassignments) catch |err| {
                 log.warn("Failed to persist replayed partition reassignments: {}", .{err});
+            };
+            self.persistFinalizedFeaturesDurably() catch |err| {
+                log.warn("Failed to persist replayed finalized feature metadata: {}", .{err});
             };
             if (self.store.repairPartitionStatesFromObjectManager()) {
                 log.info("Repaired partition state after topic metadata replay", .{});
@@ -843,8 +849,10 @@ pub const Broker = struct {
 
         const finalized_feature_snapshot = try self.persistence.loadFinalizedFeatures();
         defer self.persistence.freeFinalizedFeatureSnapshot(finalized_feature_snapshot);
-        try self.restoreFinalizedFeatures(finalized_feature_snapshot);
-        if (finalized_feature_snapshot.features.len > 0) {
+        if (recovered_cluster_records.finalized_feature_snapshots == 0) {
+            try self.restoreFinalizedFeatures(finalized_feature_snapshot);
+        }
+        if (finalized_feature_snapshot.features.len > 0 and recovered_cluster_records.finalized_feature_snapshots == 0) {
             log.info("Restored {d} finalized feature(s) from finalized_features.meta", .{self.finalized_features.count()});
         }
 
@@ -3405,6 +3413,69 @@ pub const Broker = struct {
         try self.restorePartitionReassignments(entries);
     }
 
+    fn encodeFinalizedFeatureSnapshotRecordValue(self: *Broker) ![]u8 {
+        var buf = std.array_list.Managed(u8).init(self.allocator);
+        errdefer buf.deinit();
+        const writer = @import("list_compat").writer(&buf);
+
+        try writer.writeAll(finalized_feature_snapshot_record_value_magic);
+        try writer.writeInt(i64, self.finalized_features_epoch, .big);
+        try writer.writeInt(u32, @intCast(self.finalized_features.count()), .big);
+
+        var it = self.finalized_features.iterator();
+        while (it.next()) |entry| {
+            try writeSnapshotBytes(writer, entry.key_ptr.*);
+            try writer.writeInt(i16, entry.value_ptr.*, .big);
+        }
+
+        return buf.toOwnedSlice();
+    }
+
+    fn decodeFinalizedFeatureSnapshotRecordValue(self: *Broker, value: []const u8) !MetadataPersistence.FinalizedFeatureSnapshot {
+        if (value.len < finalized_feature_snapshot_record_value_magic.len + 12) return error.InvalidFinalizedFeatureSnapshot;
+        if (!std.mem.eql(u8, value[0..finalized_feature_snapshot_record_value_magic.len], finalized_feature_snapshot_record_value_magic)) {
+            return error.InvalidFinalizedFeatureSnapshot;
+        }
+
+        var pos: usize = finalized_feature_snapshot_record_value_magic.len;
+        const epoch = try readSnapshotI64(value, &pos);
+        const feature_count = try readSnapshotU32(value, &pos);
+        if (feature_count > 100_000) return error.InvalidFinalizedFeatureSnapshot;
+
+        var entries = std.array_list.Managed(MetadataPersistence.FinalizedFeatureEntry).init(self.allocator);
+        errdefer {
+            for (entries.items) |entry| self.allocator.free(entry.name);
+            entries.deinit();
+        }
+
+        for (0..feature_count) |_| {
+            const name = try self.readSnapshotOwnedBytes(value, &pos);
+            var name_owned = true;
+            errdefer if (name_owned) self.allocator.free(name);
+
+            const max_version_level = try readSnapshotI16(value, &pos);
+            if (name.len == 0 or max_version_level < 1) return error.InvalidFinalizedFeatureSnapshot;
+
+            try entries.append(.{
+                .name = name,
+                .max_version_level = max_version_level,
+            });
+            name_owned = false;
+        }
+
+        if (pos != value.len) return error.InvalidFinalizedFeatureSnapshot;
+        return .{
+            .epoch = if (entries.items.len > 0 and epoch < 0) 0 else epoch,
+            .features = try entries.toOwnedSlice(),
+        };
+    }
+
+    fn applyFinalizedFeatureSnapshotRecord(self: *Broker, value: []const u8) !void {
+        const snapshot = try self.decodeFinalizedFeatureSnapshotRecordValue(value);
+        defer self.persistence.freeFinalizedFeatureSnapshot(snapshot);
+        try self.restoreFinalizedFeatures(snapshot);
+    }
+
     const ClientQuotaSnapshot = struct {
         default_produce_rate: f64,
         default_fetch_rate: f64,
@@ -4086,15 +4157,51 @@ pub const Broker = struct {
         try self.persistPartitionStatesDurably();
     }
 
+    /// Write finalized feature metadata to __cluster_metadata so UpdateFeatures
+    /// survives stateless broker replacement.
+    fn writeFinalizedFeatureSnapshotRecord(self: *Broker) !void {
+        const info = self.topics.get("__cluster_metadata") orelse return;
+        if (info.num_partitions <= 0) return;
+
+        const value = try self.encodeFinalizedFeatureSnapshotRecordValue();
+        defer self.allocator.free(value);
+
+        const rec_batch = protocol.record_batch;
+        const records = [_]rec_batch.Record{
+            .{
+                .offset_delta = 0,
+                .key = finalized_feature_snapshot_record_key,
+                .value = value,
+            },
+        };
+
+        const batch = try rec_batch.buildRecordBatch(
+            self.allocator,
+            0,
+            &records,
+            -1,
+            -1,
+            -1,
+            @import("time_compat").milliTimestamp(),
+            @import("time_compat").milliTimestamp(),
+            0,
+        );
+        defer self.allocator.free(batch);
+
+        _ = try self.store.produce("__cluster_metadata", 0, batch);
+        try self.persistPartitionStatesDurably();
+    }
+
     const ClusterMetadataReplayCounts = struct {
         topic_snapshots: usize = 0,
         partition_reassignment_snapshots: usize = 0,
         client_quota_snapshots: usize = 0,
         scram_credential_snapshots: usize = 0,
         acl_snapshots: usize = 0,
+        finalized_feature_snapshots: usize = 0,
 
         fn total(self: @This()) usize {
-            return self.topic_snapshots + self.partition_reassignment_snapshots + self.client_quota_snapshots + self.scram_credential_snapshots + self.acl_snapshots;
+            return self.topic_snapshots + self.partition_reassignment_snapshots + self.client_quota_snapshots + self.scram_credential_snapshots + self.acl_snapshots + self.finalized_feature_snapshots;
         }
     };
 
@@ -4105,6 +4212,7 @@ pub const Broker = struct {
         client_quota_snapshot,
         scram_credential_snapshot,
         acl_snapshot,
+        finalized_feature_snapshot,
     };
 
     fn restoreClusterMetadataFromLog(self: *Broker) !ClusterMetadataReplayCounts {
@@ -4122,6 +4230,7 @@ pub const Broker = struct {
             restored.client_quota_snapshots += partition_counts.client_quota_snapshots;
             restored.scram_credential_snapshots += partition_counts.scram_credential_snapshots;
             restored.acl_snapshots += partition_counts.acl_snapshots;
+            restored.finalized_feature_snapshots += partition_counts.finalized_feature_snapshots;
         }
         return restored;
     }
@@ -4151,6 +4260,7 @@ pub const Broker = struct {
                         .client_quota_snapshot => restored.client_quota_snapshots += 1,
                         .scram_credential_snapshot => restored.scram_credential_snapshots += 1,
                         .acl_snapshot => restored.acl_snapshots += 1,
+                        .finalized_feature_snapshot => restored.finalized_feature_snapshots += 1,
                     }
                 }
             }
@@ -4181,6 +4291,10 @@ pub const Broker = struct {
         if (std.mem.eql(u8, key, acl_snapshot_record_key)) {
             try self.applyAclSnapshotRecord(value);
             return .acl_snapshot;
+        }
+        if (std.mem.eql(u8, key, finalized_feature_snapshot_record_key)) {
+            try self.applyFinalizedFeatureSnapshotRecord(value);
+            return .finalized_feature_snapshot;
         }
         return .none;
     }
@@ -18044,12 +18158,27 @@ pub const Broker = struct {
             }
             if (response_error == ErrorCode.none) {
                 self.finalized_features_epoch = if (self.finalized_features_epoch < 0) 0 else self.finalized_features_epoch + 1;
+                self.writeFinalizedFeatureSnapshotRecord() catch |err| {
+                    log.warn("Failed to append finalized feature snapshot to __cluster_metadata: {}", .{err});
+                    self.restoreFinalizedFeatureLocalSnapshot(&previous_snapshot);
+                    self.markUpdateFeaturesStorageError(results);
+                    response_error = ErrorCode.kafka_storage_error;
+                    response_error_message = "Failed to persist finalized feature metadata";
+                };
+            }
+            if (response_error == ErrorCode.none) {
                 self.persistFinalizedFeaturesDurably() catch |err| {
                     log.warn("UpdateFeatures finalized feature snapshot write failed: {}", .{err});
                     self.restoreFinalizedFeatureLocalSnapshot(&previous_snapshot);
                     self.markUpdateFeaturesStorageError(results);
                     response_error = ErrorCode.kafka_storage_error;
                     response_error_message = "Failed to persist finalized feature metadata";
+                    self.writeFinalizedFeatureSnapshotRecord() catch |rollback_err| {
+                        log.warn("Failed to append UpdateFeatures rollback finalized feature snapshot to __cluster_metadata: {}", .{rollback_err});
+                    };
+                    self.persistFinalizedFeaturesDurably() catch |rollback_err| {
+                        log.warn("Failed to persist restored finalized feature metadata: {}", .{rollback_err});
+                    };
                 };
             }
         }
@@ -33013,6 +33142,117 @@ test "Broker finalized features persist across local restart" {
         try testing.expectEqual(@as(i16, 1), restarted.finalized_features.get("metadata.version").?);
         try testing.expectEqual(@as(i64, 3), restarted.finalized_features_epoch);
     }
+}
+
+test "Broker restores finalized features from S3 cluster metadata log" {
+    const Req = generated.update_features_request.UpdateFeaturesRequest;
+    const Resp = generated.update_features_response.UpdateFeaturesResponse;
+
+    var mock_s3 = storage.MockS3.init(testing.allocator);
+    defer mock_s3.deinit();
+    const s3_storage = storage.S3Storage.initMock(testing.allocator, &mock_s3);
+
+    {
+        var broker = Broker.init(testing.allocator, 1, 9092);
+        defer broker.deinit();
+        broker.store.s3_wal_mode = true;
+        broker.store.s3_storage = s3_storage;
+        broker.store.s3_wal_batcher = storage.wal.S3WalBatcher.init(testing.allocator);
+
+        try broker.open();
+
+        const updates = [_]Req.FeatureUpdateKey{.{
+            .feature = "metadata.version",
+            .max_version_level = 1,
+            .upgrade_type = 1,
+        }};
+        const req = Req{ .feature_updates = &updates };
+
+        var buf: [512]u8 = undefined;
+        var pos = buildTestRequest(&buf, 57, 1, 5716, header_mod.requestHeaderVersion(57, 1));
+        req.serialize(&buf, &pos, 1);
+
+        const response = broker.handleRequest(buf[0..pos]);
+        try testing.expect(response != null);
+        defer testing.allocator.free(response.?);
+
+        var rpos: usize = 0;
+        var response_header = try ResponseHeader.deserialize(testing.allocator, response.?, &rpos, header_mod.responseHeaderVersion(57, 1));
+        defer response_header.deinit(testing.allocator);
+        try testing.expectEqual(@as(i32, 5716), response_header.correlation_id);
+
+        const resp = try Resp.deserialize(testing.allocator, response.?, &rpos, 1);
+        defer freeDeserializedUpdateFeaturesResponse(&resp);
+
+        try testing.expectEqual(response.?.len, rpos);
+        try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.none)), resp.error_code);
+        try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.none)), resp.results[0].error_code);
+        try testing.expect(mock_s3.objectCount() > 0);
+    }
+
+    {
+        var broker = Broker.init(testing.allocator, 1, 9092);
+        defer broker.deinit();
+        broker.store.s3_wal_mode = true;
+        broker.store.s3_storage = s3_storage;
+        broker.store.s3_wal_batcher = storage.wal.S3WalBatcher.init(testing.allocator);
+
+        try broker.open();
+
+        try testing.expectEqual(@as(i16, 1), broker.finalized_features.get("metadata.version").?);
+        try testing.expectEqual(@as(i64, 0), broker.finalized_features_epoch);
+    }
+}
+
+test "Broker UpdateFeatures fails closed when finalized feature snapshot S3 WAL write fails" {
+    const Req = generated.update_features_request.UpdateFeaturesRequest;
+    const Resp = generated.update_features_response.UpdateFeaturesResponse;
+
+    var mock_s3 = storage.MockS3.init(testing.allocator);
+    defer mock_s3.deinit();
+    const s3_storage = storage.S3Storage.initMock(testing.allocator, &mock_s3);
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+    broker.store.s3_wal_mode = true;
+    broker.store.s3_storage = s3_storage;
+    broker.store.s3_wal_batcher = storage.wal.S3WalBatcher.init(testing.allocator);
+
+    try broker.open();
+    const object_count_before = mock_s3.objectCount();
+    mock_s3.failNextPutObjects(3);
+
+    const updates = [_]Req.FeatureUpdateKey{.{
+        .feature = "metadata.version",
+        .max_version_level = 1,
+        .upgrade_type = 1,
+    }};
+    const req = Req{ .feature_updates = &updates };
+
+    var buf: [512]u8 = undefined;
+    var pos = buildTestRequest(&buf, 57, 1, 5717, header_mod.requestHeaderVersion(57, 1));
+    req.serialize(&buf, &pos, 1);
+
+    const response = broker.handleRequest(buf[0..pos]);
+    try testing.expect(response != null);
+    defer testing.allocator.free(response.?);
+
+    var rpos: usize = 0;
+    var response_header = try ResponseHeader.deserialize(testing.allocator, response.?, &rpos, header_mod.responseHeaderVersion(57, 1));
+    defer response_header.deinit(testing.allocator);
+    try testing.expectEqual(@as(i32, 5717), response_header.correlation_id);
+
+    const resp = try Resp.deserialize(testing.allocator, response.?, &rpos, 1);
+    defer freeDeserializedUpdateFeaturesResponse(&resp);
+
+    try testing.expectEqual(response.?.len, rpos);
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.kafka_storage_error)), resp.error_code);
+    try testing.expectEqualStrings("Failed to persist finalized feature metadata", resp.error_message.?);
+    try testing.expectEqual(@as(usize, 1), resp.results.len);
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.kafka_storage_error)), resp.results[0].error_code);
+    try testing.expect(broker.finalized_features.get("metadata.version") == null);
+    try testing.expectEqual(@as(i64, -1), broker.finalized_features_epoch);
+    try testing.expectEqual(object_count_before, mock_s3.objectCount());
 }
 
 test "Broker.handleRequest UpdateFeatures authorization denial uses generated response" {
