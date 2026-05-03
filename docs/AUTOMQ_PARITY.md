@@ -72,9 +72,11 @@ gaps. Each item should land as a small, verified tranche with tests and a commit
 | P2 | Observability gates | Metrics, structured logs, readiness/liveness, dashboards, and alertable SLOs match the documented operational contract. | In progress. Metrics and JSON logging exist; `/health` and `/ready` now share a deterministic routing/response contract across plain and TLS metrics transports, including exact-path matching plus startup and shutdown readiness transitions in the default Zig suite. Prometheus export now escapes HELP text and label values, rejects invalid labeled-metric arity, and uses canonical label-set keys in registry tests. Broker metric registration is audited against the advertised broker API metric catalog and includes produce/fetch throttle counters so request metrics are not silently dropped. Client-metrics APIs now expose a default resource, retain accepted uncompressed telemetry samples by client instance, drop samples on terminating pushes, list active client resources, and cover unknown subscription, unsupported compression, and oversized metric rejections. Dashboards, broader metric-name compatibility, telemetry export, and alertable SLO gates remain. |
 | P2 | Performance and client matrix gates | Repeatable benchmarks and Java/librdkafka/Go/Python/Kafka CLI compatibility suites pass across supported versions. | Started. A gated external-client matrix step exists for kcat, Kafka CLI, kafka-python, and confluent-kafka metadata plus produce/fetch probes; broader Java/Go/versioned client suites remain. |
 
-Latest default-suite share data-plane tranche: ShareFetch acquisition failures
-and ShareAcknowledge acknowledgement failures now roll back both local share
-session epochs and share-state visibility when persistence fails.
+Latest default-suite share data-plane tranche: share sessions and share-partition
+state now write combined snapshots to `__consumer_offsets`, replay from S3 WAL
+after fresh-dir replacement, skip stale local share files when shared snapshots
+exist, and roll back failed shared snapshot writes before exposing session
+epochs.
 
 ## Capability Matrix
 
@@ -206,16 +208,18 @@ Status: completed for the initial catalog and DeleteGroups slice.
   validate local share sessions, fetch records from the partition store, return
   acquired-record ranges, validate acknowledgement batches, advance local share
   start offsets, clear sessions on share-member leave/group delete, restore
-  share session epochs across local broker restart, and roll back session plus
-  share-state mutation changes, including DeleteGroups cleanup, when local
-  persistence fails.
+  share session epochs across local broker restart and fresh-dir S3 WAL
+  replacement, write combined share data-plane snapshots to `__consumer_offsets`,
+  and roll back session plus share-state mutation changes, including DeleteGroups
+  cleanup, when local or shared persistence fails.
   InitializeShareGroupState, ReadShareGroupState, WriteShareGroupState,
   DeleteShareGroupState, and ReadShareGroupStateSummary remain non-advertised
   until share coordinator durability exists, but direct v0 probes now validate
   topic IDs, group IDs, partitions, state epochs, start offsets, and state
   batches while maintaining local share-partition state and restoring it across
-  local broker restart. Initialize/write/delete mutations now fail closed with
-  default-suite rollback coverage when local share-state persistence fails.
+  local broker restart and fresh-dir S3 WAL replacement. Initialize/write/delete
+  mutations now fail closed with default-suite rollback coverage when local or
+  shared share-state persistence fails.
   DescribeAcls/CreateAcls/DeleteAcls now use generated schemas, reject malformed
   frames, validate enum fields, write full ACL snapshots to `__cluster_metadata`
   for broker replacement replay, fail closed and roll back local ACL visibility
@@ -520,7 +524,9 @@ Status: completed for the initial catalog and DeleteGroups slice.
   generation, leader, assignments, protocol metadata, and group timeouts across
   local broker restart, the same lifecycle snapshot is written to
   `__consumer_offsets` and replayed from recovered S3 WAL during fresh-dir
-  replacement, transaction coordinator snapshots are written to
+  replacement, share sessions and share-partition state are written as combined
+  `__consumer_offsets` snapshots and replayed from recovered S3 WAL during
+  fresh-dir replacement, transaction coordinator snapshots are written to
   `__transaction_state` and replayed from recovered S3 WAL during fresh-dir
   replacement, client-facing coordinator mutations now fail closed when these
   snapshot writes fail, InitProducerId, AddPartitionsToTxn, AddOffsetsToTxn,
@@ -546,7 +552,9 @@ Status: completed for the initial catalog and DeleteGroups slice.
   replay those tombstones during fresh-dir replacement, and preserve local
   offsets/groups when the shared tombstone write fails; DeleteGroups,
   JoinGroup, LeaveGroup, and SyncGroup now restore the previous local group
-  snapshot when their shared lifecycle snapshot write fails; client quota
+  snapshot when their shared lifecycle snapshot write fails; share data-plane
+  snapshot writes restore prior session/state visibility when shared persistence
+  fails; client quota
   configuration snapshots are now appended to `__cluster_metadata`, replayed
   from recovered S3 WAL on fresh-dir broker replacement, and rolled back on
   failed snapshot writes before AlterClientQuotas is acknowledged; SCRAM

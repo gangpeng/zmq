@@ -46,6 +46,8 @@ const offset_commit_record_value_magic = "ZMQOC1";
 const consumer_group_snapshot_record_value_magic_v1 = "ZMQCG1";
 const consumer_group_snapshot_record_value_magic = "ZMQCG2";
 const consumer_group_snapshot_record_key = "__zmq_consumer_group_snapshot";
+const share_group_data_snapshot_record_value_magic = "ZMQSH1";
+const share_group_data_snapshot_record_key = "__zmq_share_group_data_snapshot";
 const transaction_snapshot_record_value_magic = "ZMQTX1";
 const transaction_snapshot_record_key = "__zmq_transaction_snapshot";
 const topic_snapshot_record_value_magic = "ZMQTP1";
@@ -802,11 +804,27 @@ pub const Broker = struct {
             };
         }
 
-        const recovered_offset_records = try self.restoreOffsetsFromConsumerOffsetsLog();
-        if (recovered_offset_records > 0) {
-            log.info("Restored {d} state record(s) from __consumer_offsets", .{recovered_offset_records});
-            self.persistOffsets();
-            if (self.groups.groups.count() > 0) self.persistConsumerGroups();
+        const recovered_consumer_offsets = try self.restoreOffsetsFromConsumerOffsetsLog();
+        if (recovered_consumer_offsets.total() > 0) {
+            log.info("Restored __consumer_offsets state (offsets={d}, groups={d}, share_data={d})", .{
+                recovered_consumer_offsets.offset_records,
+                recovered_consumer_offsets.consumer_group_snapshots,
+                recovered_consumer_offsets.share_group_data_snapshots,
+            });
+            if (recovered_consumer_offsets.offset_records > 0) self.persistOffsets();
+            if (recovered_consumer_offsets.consumer_group_snapshots > 0 and self.groups.groups.count() > 0) {
+                self.persistence.saveConsumerGroups(&self.groups.groups) catch |err| {
+                    log.warn("Failed to persist replayed consumer group state: {}", .{err});
+                };
+            }
+            if (recovered_consumer_offsets.share_group_data_snapshots > 0) {
+                self.persistShareGroupStatesLocalDurably() catch |err| {
+                    log.warn("Failed to persist replayed share group states: {}", .{err});
+                };
+                self.persistShareGroupSessionsLocalDurably() catch |err| {
+                    log.warn("Failed to persist replayed share group sessions: {}", .{err});
+                };
+            }
         }
         const recovered_txn_records = try self.restoreTransactionsFromTransactionStateLog();
         if (recovered_txn_records > 0) {
@@ -841,18 +859,20 @@ pub const Broker = struct {
             }
         }
 
-        const saved_share_group_states = try self.persistence.loadShareGroupStates();
-        defer self.persistence.freeShareGroupStateEntries(saved_share_group_states);
-        try self.restoreShareGroupStates(saved_share_group_states);
-        if (saved_share_group_states.len > 0) {
-            log.info("Restored {d} share group state partition(s) from share_group_states.meta", .{self.share_group_states.count()});
-        }
+        if (recovered_consumer_offsets.share_group_data_snapshots == 0) {
+            const saved_share_group_states = try self.persistence.loadShareGroupStates();
+            defer self.persistence.freeShareGroupStateEntries(saved_share_group_states);
+            try self.restoreShareGroupStates(saved_share_group_states);
+            if (saved_share_group_states.len > 0) {
+                log.info("Restored {d} share group state partition(s) from share_group_states.meta", .{self.share_group_states.count()});
+            }
 
-        const saved_share_group_sessions = try self.persistence.loadShareGroupSessions();
-        defer self.persistence.freeShareGroupSessionEntries(saved_share_group_sessions);
-        try self.restoreShareGroupSessions(saved_share_group_sessions);
-        if (saved_share_group_sessions.len > 0) {
-            log.info("Restored {d} share group session(s) from share_group_sessions.meta", .{self.share_group_sessions.count()});
+            const saved_share_group_sessions = try self.persistence.loadShareGroupSessions();
+            defer self.persistence.freeShareGroupSessionEntries(saved_share_group_sessions);
+            try self.restoreShareGroupSessions(saved_share_group_sessions);
+            if (saved_share_group_sessions.len > 0) {
+                log.info("Restored {d} share group session(s) from share_group_sessions.meta", .{self.share_group_sessions.count()});
+            }
         }
 
         const finalized_feature_snapshot = try self.persistence.loadFinalizedFeatures();
@@ -2323,23 +2343,39 @@ pub const Broker = struct {
     }
 
     fn persistShareGroupStatesLocal(self: *Broker) void {
-        self.persistShareGroupStatesDurably() catch |err| {
+        self.persistShareGroupStatesLocalDurably() catch |err| {
             log.warn("Failed to persist share group states: {}", .{err});
         };
     }
 
     fn persistShareGroupSessionsLocal(self: *Broker) void {
-        self.persistShareGroupSessionsDurably() catch |err| {
+        self.persistShareGroupSessionsLocalDurably() catch |err| {
             log.warn("Failed to persist share group sessions: {}", .{err});
         };
     }
 
-    fn persistShareGroupStatesDurably(self: *Broker) !void {
+    fn persistShareGroupStatesLocalDurably(self: *Broker) !void {
         try self.persistence.saveShareGroupStates(&self.share_group_states);
     }
 
-    fn persistShareGroupSessionsDurably(self: *Broker) !void {
+    fn persistShareGroupSessionsLocalDurably(self: *Broker) !void {
         try self.persistence.saveShareGroupSessions(&self.share_group_sessions);
+    }
+
+    fn persistShareGroupDataDurably(self: *Broker) !void {
+        try self.writeShareGroupDataSnapshotRecord();
+        try self.persistShareGroupStatesLocalDurably();
+        try self.persistShareGroupSessionsLocalDurably();
+    }
+
+    fn persistShareGroupStatesDurably(self: *Broker) !void {
+        try self.writeShareGroupDataSnapshotRecord();
+        try self.persistShareGroupStatesLocalDurably();
+    }
+
+    fn persistShareGroupSessionsDurably(self: *Broker) !void {
+        try self.writeShareGroupDataSnapshotRecord();
+        try self.persistShareGroupSessionsLocalDurably();
     }
 
     fn persistFinalizedFeaturesLocal(self: *Broker) void {
@@ -3001,6 +3037,151 @@ pub const Broker = struct {
         self.applyConsumerGroupSnapshotRecord(snapshot_value) catch |restore_err| {
             log.err("Failed to restore consumer group snapshot after failed mutation: {}", .{restore_err});
         };
+    }
+
+    const ShareGroupDataSnapshot = struct {
+        sessions: std.StringHashMap(i32),
+        states: std.StringHashMap(SharePartitionState),
+    };
+
+    fn isShareStateHexByte(byte: u8) bool {
+        return (byte >= '0' and byte <= '9') or (byte >= 'a' and byte <= 'f') or (byte >= 'A' and byte <= 'F');
+    }
+
+    fn validShareGroupStateKey(key: []const u8) bool {
+        const last_colon = std.mem.lastIndexOfScalar(u8, key, ':') orelse return false;
+        if (last_colon < 33 or last_colon + 1 >= key.len) return false;
+        const topic_hex_start = last_colon - 32;
+        if (topic_hex_start == 0 or key[topic_hex_start - 1] != ':') return false;
+        for (key[topic_hex_start..last_colon]) |byte| {
+            if (!isShareStateHexByte(byte)) return false;
+        }
+        const partition = std.fmt.parseInt(i32, key[last_colon + 1 ..], 10) catch return false;
+        return partition >= 0;
+    }
+
+    fn freeShareGroupDataSnapshot(self: *Broker, snapshot: *ShareGroupDataSnapshot) void {
+        self.freeShareGroupSessionSnapshot(&snapshot.sessions);
+        self.freeShareGroupStateSnapshot(&snapshot.states);
+    }
+
+    fn encodeShareGroupDataSnapshotRecordValue(self: *Broker) ![]u8 {
+        var buf = std.array_list.Managed(u8).init(self.allocator);
+        errdefer buf.deinit();
+        const writer = @import("list_compat").writer(&buf);
+
+        try writer.writeAll(share_group_data_snapshot_record_value_magic);
+        try writer.writeInt(u32, @intCast(self.share_group_sessions.count()), .big);
+        var session_it = self.share_group_sessions.iterator();
+        while (session_it.next()) |entry| {
+            try writeSnapshotBytes(writer, entry.key_ptr.*);
+            try writer.writeInt(i32, entry.value_ptr.*, .big);
+        }
+
+        try writer.writeInt(u32, @intCast(self.share_group_states.count()), .big);
+        var state_it = self.share_group_states.iterator();
+        while (state_it.next()) |entry| {
+            const state = entry.value_ptr;
+            try writeSnapshotBytes(writer, entry.key_ptr.*);
+            try writer.writeInt(i32, state.state_epoch, .big);
+            try writer.writeInt(i64, state.start_offset, .big);
+            try writer.writeInt(u32, @intCast(state.batches.len), .big);
+            for (state.batches) |batch| {
+                try writer.writeInt(i64, batch.first_offset, .big);
+                try writer.writeInt(i64, batch.last_offset, .big);
+                try writer.writeByte(@as(u8, @bitCast(batch.delivery_state)));
+                try writer.writeInt(i16, batch.delivery_count, .big);
+            }
+        }
+
+        return buf.toOwnedSlice();
+    }
+
+    fn decodeShareGroupDataSnapshotRecordValue(self: *Broker, value: []const u8) !ShareGroupDataSnapshot {
+        if (value.len < share_group_data_snapshot_record_value_magic.len + 8) return error.InvalidShareGroupDataSnapshot;
+        if (!std.mem.eql(u8, value[0..share_group_data_snapshot_record_value_magic.len], share_group_data_snapshot_record_value_magic)) {
+            return error.InvalidShareGroupDataSnapshot;
+        }
+
+        var pos: usize = share_group_data_snapshot_record_value_magic.len;
+        var snapshot = ShareGroupDataSnapshot{
+            .sessions = std.StringHashMap(i32).init(self.allocator),
+            .states = std.StringHashMap(SharePartitionState).init(self.allocator),
+        };
+        errdefer self.freeShareGroupDataSnapshot(&snapshot);
+
+        const session_count = try readSnapshotU32(value, &pos);
+        if (session_count > 1_000_000) return error.InvalidShareGroupDataSnapshot;
+        for (0..session_count) |_| {
+            const key = try self.readSnapshotOwnedBytes(value, &pos);
+            var key_owned = true;
+            errdefer if (key_owned) self.allocator.free(key);
+
+            if (key.len == 0 or parseShareGroupMemberKey(key) == null or snapshot.sessions.contains(key)) {
+                return error.InvalidShareGroupDataSnapshot;
+            }
+            const epoch = try readSnapshotI32(value, &pos);
+            if (epoch < 0) return error.InvalidShareGroupDataSnapshot;
+
+            try snapshot.sessions.put(key, epoch);
+            key_owned = false;
+        }
+
+        const state_count = try readSnapshotU32(value, &pos);
+        if (state_count > 1_000_000) return error.InvalidShareGroupDataSnapshot;
+        for (0..state_count) |_| {
+            const key = try self.readSnapshotOwnedBytes(value, &pos);
+            var key_owned = true;
+            errdefer if (key_owned) self.allocator.free(key);
+
+            if (!validShareGroupStateKey(key) or snapshot.states.contains(key)) {
+                return error.InvalidShareGroupDataSnapshot;
+            }
+
+            const state_epoch = try readSnapshotI32(value, &pos);
+            const start_offset = try readSnapshotI64(value, &pos);
+            if (state_epoch < 0 or start_offset < -1) return error.InvalidShareGroupDataSnapshot;
+
+            const batch_count = try readSnapshotU32(value, &pos);
+            if (batch_count > 1_000_000) return error.InvalidShareGroupDataSnapshot;
+            const batches: []ShareStateBatch = if (batch_count > 0) try self.allocator.alloc(ShareStateBatch, batch_count) else &.{};
+            var batches_owned = batches.len > 0;
+            errdefer if (batches_owned) self.allocator.free(batches);
+
+            for (batches) |*batch| {
+                const first_offset = try readSnapshotI64(value, &pos);
+                const last_offset = try readSnapshotI64(value, &pos);
+                const delivery_state: i8 = @bitCast(try readSnapshotByte(value, &pos));
+                const delivery_count = try readSnapshotI16(value, &pos);
+                if (validateShareStateBatch(first_offset, last_offset, delivery_state, delivery_count) != .none) {
+                    return error.InvalidShareGroupDataSnapshot;
+                }
+                batch.* = .{
+                    .first_offset = first_offset,
+                    .last_offset = last_offset,
+                    .delivery_state = delivery_state,
+                    .delivery_count = delivery_count,
+                };
+            }
+
+            try snapshot.states.put(key, .{
+                .state_epoch = state_epoch,
+                .start_offset = start_offset,
+                .batches = batches,
+            });
+            key_owned = false;
+            batches_owned = false;
+        }
+
+        if (pos != value.len) return error.InvalidShareGroupDataSnapshot;
+        return snapshot;
+    }
+
+    fn applyShareGroupDataSnapshotRecord(self: *Broker, value: []const u8) !void {
+        var snapshot = try self.decodeShareGroupDataSnapshotRecordValue(value);
+        self.restoreShareGroupSessionSnapshot(&snapshot.sessions);
+        self.restoreShareGroupStateSnapshot(&snapshot.states);
+        self.freeShareGroupDataSnapshot(&snapshot);
     }
 
     fn encodeTransactionSnapshotRecordValue(self: *Broker) ![]u8 {
@@ -4021,6 +4202,42 @@ pub const Broker = struct {
         try self.persistPartitionStatesDurably();
     }
 
+    /// Write share-group sessions plus partition acquisition state to
+    /// __consumer_offsets so share data-plane state survives fresh-dir broker
+    /// replacement without relying on local share_group_*.meta files.
+    fn writeShareGroupDataSnapshotRecord(self: *Broker) !void {
+        const info = self.topics.get("__consumer_offsets") orelse return;
+        if (info.num_partitions <= 0) return;
+
+        const value = try self.encodeShareGroupDataSnapshotRecordValue();
+        defer self.allocator.free(value);
+
+        const rec_batch = protocol.record_batch;
+        const records = [_]rec_batch.Record{
+            .{
+                .offset_delta = 0,
+                .key = share_group_data_snapshot_record_key,
+                .value = value,
+            },
+        };
+
+        const batch = try rec_batch.buildRecordBatch(
+            self.allocator,
+            0,
+            &records,
+            -1,
+            -1,
+            -1,
+            @import("time_compat").milliTimestamp(),
+            @import("time_compat").milliTimestamp(),
+            0,
+        );
+        defer self.allocator.free(batch);
+
+        _ = try self.store.produce("__consumer_offsets", 0, batch);
+        try self.persistPartitionStatesDurably();
+    }
+
     /// Write a full transaction coordinator snapshot to __transaction_state.
     /// This mirrors Kafka's coordinator durability path enough for stateless
     /// broker replacement to recover producer IDs, epochs, states, and
@@ -4434,24 +4651,44 @@ pub const Broker = struct {
         return .none;
     }
 
-    fn restoreOffsetsFromConsumerOffsetsLog(self: *Broker) !usize {
-        const info = self.topics.get("__consumer_offsets") orelse return 0;
-        if (info.num_partitions <= 0) return 0;
+    const ConsumerOffsetsReplayCounts = struct {
+        offset_records: usize = 0,
+        consumer_group_snapshots: usize = 0,
+        share_group_data_snapshots: usize = 0,
 
-        var restored: usize = 0;
+        fn total(self: @This()) usize {
+            return self.offset_records + self.consumer_group_snapshots + self.share_group_data_snapshots;
+        }
+    };
+
+    const ConsumerOffsetsReplayKind = enum {
+        none,
+        offset_record,
+        consumer_group_snapshot,
+        share_group_data_snapshot,
+    };
+
+    fn restoreOffsetsFromConsumerOffsetsLog(self: *Broker) !ConsumerOffsetsReplayCounts {
+        const info = self.topics.get("__consumer_offsets") orelse return .{};
+        if (info.num_partitions <= 0) return .{};
+
+        var restored = ConsumerOffsetsReplayCounts{};
         for (0..@as(usize, @intCast(info.num_partitions))) |partition_index| {
             const result = try self.store.fetch("__consumer_offsets", @intCast(partition_index), 0, 64 * 1024 * 1024);
             defer if (result.records.len > 0) self.allocator.free(@constCast(result.records));
             if (result.error_code != @intFromEnum(ErrorCode.none)) return error.ConsumerOffsetsLogUnavailable;
-            restored += try self.applyConsumerOffsetRecordBatches(result.records);
+            const partition_counts = try self.applyConsumerOffsetRecordBatches(result.records);
+            restored.offset_records += partition_counts.offset_records;
+            restored.consumer_group_snapshots += partition_counts.consumer_group_snapshots;
+            restored.share_group_data_snapshots += partition_counts.share_group_data_snapshots;
         }
         return restored;
     }
 
-    fn applyConsumerOffsetRecordBatches(self: *Broker, batches: []const u8) !usize {
+    fn applyConsumerOffsetRecordBatches(self: *Broker, batches: []const u8) !ConsumerOffsetsReplayCounts {
         const rec_batch = protocol.record_batch;
         var pos: usize = 0;
-        var restored: usize = 0;
+        var restored = ConsumerOffsetsReplayCounts{};
 
         while (pos + rec_batch.BATCH_HEADER_SIZE <= batches.len) {
             const header = rec_batch.RecordBatchHeader.parse(batches[pos..]) catch break;
@@ -4465,7 +4702,12 @@ pub const Broker = struct {
                     if (record_pos >= batch_end) break;
                     const record = rec_batch.parseRecord(batches, &record_pos) catch break;
                     const key = record.key orelse continue;
-                    if (try self.applyConsumerOffsetRecord(key, record.value)) restored += 1;
+                    switch (try self.applyConsumerOffsetRecord(key, record.value)) {
+                        .none => {},
+                        .offset_record => restored.offset_records += 1,
+                        .consumer_group_snapshot => restored.consumer_group_snapshots += 1,
+                        .share_group_data_snapshot => restored.share_group_data_snapshots += 1,
+                    }
                 }
             }
 
@@ -4475,18 +4717,22 @@ pub const Broker = struct {
         return restored;
     }
 
-    fn applyConsumerOffsetRecord(self: *Broker, key: []const u8, value: ?[]const u8) !bool {
+    fn applyConsumerOffsetRecord(self: *Broker, key: []const u8, value: ?[]const u8) !ConsumerOffsetsReplayKind {
         if (std.mem.eql(u8, key, consumer_group_snapshot_record_key)) {
-            try self.applyConsumerGroupSnapshotRecord(value orelse return false);
-            return true;
+            try self.applyConsumerGroupSnapshotRecord(value orelse return .none);
+            return .consumer_group_snapshot;
+        }
+        if (std.mem.eql(u8, key, share_group_data_snapshot_record_key)) {
+            try self.applyShareGroupDataSnapshotRecord(value orelse return .none);
+            return .share_group_data_snapshot;
         }
 
-        const parts = offsetCommitKeyParts(key) orelse return false;
+        const parts = offsetCommitKeyParts(key) orelse return .none;
         const commit_value = value orelse {
             _ = try self.groups.deleteCommittedOffset(parts.group_id, parts.topic, parts.partition);
-            return true;
+            return .offset_record;
         };
-        const decoded = decodeOffsetCommitRecordValue(commit_value) orelse return false;
+        const decoded = decodeOffsetCommitRecordValue(commit_value) orelse return .none;
 
         try self.groups.commitOffsetWithMetadata(
             parts.group_id,
@@ -4496,7 +4742,7 @@ pub const Broker = struct {
             decoded.leader_epoch,
             decoded.metadata,
         );
-        return true;
+        return .offset_record;
     }
 
     fn restoreTransactionsFromTransactionStateLog(self: *Broker) !usize {
@@ -12693,6 +12939,7 @@ pub const Broker = struct {
                         self.allocator.free(removed.key);
                         return restore_err;
                     };
+                    self.persistRestoredShareGroupDataSnapshot("Share session close");
                     self.allocator.free(key);
                     log.warn("Share session close persistence failed for {s}/{s}: {}", .{ group_id, member_id, err });
                     return ErrorCode.kafka_storage_error;
@@ -12712,6 +12959,7 @@ pub const Broker = struct {
                 current_epoch.* = 0;
                 self.persistShareGroupSessionsDurably() catch |err| {
                     current_epoch.* = previous_epoch;
+                    self.persistRestoredShareGroupDataSnapshot("Share session reset");
                     log.warn("Share session reset persistence failed for {s}/{s}: {}", .{ group_id, member_id, err });
                     return ErrorCode.kafka_storage_error;
                 };
@@ -12722,6 +12970,7 @@ pub const Broker = struct {
             current_epoch.* = share_session_epoch;
             self.persistShareGroupSessionsDurably() catch |err| {
                 current_epoch.* = previous_epoch;
+                self.persistRestoredShareGroupDataSnapshot("Share session epoch");
                 log.warn("Share session epoch persistence failed for {s}/{s}: {}", .{ group_id, member_id, err });
                 return ErrorCode.kafka_storage_error;
             };
@@ -12741,6 +12990,7 @@ pub const Broker = struct {
             if (self.share_group_sessions.fetchRemove(key)) |removed| {
                 self.allocator.free(removed.key);
             }
+            self.persistRestoredShareGroupDataSnapshot("Share session open");
             log.warn("Share session open persistence failed for {s}/{s}: {}", .{ group_id, member_id, err });
             return ErrorCode.kafka_storage_error;
         };
@@ -12754,11 +13004,14 @@ pub const Broker = struct {
     ) void {
         self.restoreShareGroupSessionSnapshot(sessions);
         self.restoreShareGroupStateSnapshot(states);
-        self.persistShareGroupSessionsDurably() catch |err| {
-            log.warn("Failed to persist rolled-back share session snapshot: {}", .{err});
+        self.persistShareGroupDataDurably() catch |err| {
+            log.warn("Failed to persist rolled-back share data-plane snapshot: {}", .{err});
         };
-        self.persistShareGroupStatesDurably() catch |err| {
-            log.warn("Failed to persist rolled-back share state snapshot: {}", .{err});
+    }
+
+    fn persistRestoredShareGroupDataSnapshot(self: *Broker, context: []const u8) void {
+        self.persistShareGroupDataDurably() catch |err| {
+            log.warn("{s} rollback share data-plane snapshot failed: {}", .{ context, err });
         };
     }
 
@@ -13475,6 +13728,7 @@ pub const Broker = struct {
             self.persistShareGroupStatesDurably() catch |err| {
                 existing.* = previous;
                 if (batches.len > 0) self.allocator.free(batches);
+                self.persistRestoredShareGroupDataSnapshot("Share partition state update");
                 return err;
             };
             var old = previous;
@@ -13497,6 +13751,7 @@ pub const Broker = struct {
                 var state = removed.value;
                 state.deinit(self.allocator);
             }
+            self.persistRestoredShareGroupDataSnapshot("Share partition state insert");
             return err;
         };
     }
@@ -13512,6 +13767,7 @@ pub const Broker = struct {
                     state.deinit(self.allocator);
                     return restore_err;
                 };
+                self.persistRestoredShareGroupDataSnapshot("Share partition state delete");
                 return err;
             };
             self.allocator.free(removed.key);
@@ -45306,6 +45562,102 @@ test "Broker share session epoch persists across local restart" {
         try testing.expectEqual(ErrorCode.none, try restarted.updateShareSessionEpoch("share:restart-group", "member:one", 2));
         try testing.expectEqual(ErrorCode.invalid_fetch_session_epoch, try restarted.updateShareSessionEpoch("share:restart-group", "member:one", 2));
     }
+}
+
+test "Broker restores share data plane from S3 consumer offsets log" {
+    var mock_s3 = storage.MockS3.init(testing.allocator);
+    defer mock_s3.deinit();
+    const s3_storage = storage.S3Storage.initMock(testing.allocator, &mock_s3);
+
+    var topic_id: [16]u8 = undefined;
+    {
+        var broker = Broker.init(testing.allocator, 1, 9092);
+        defer broker.deinit();
+        broker.store.s3_wal_mode = true;
+        broker.store.s3_storage = s3_storage;
+        broker.store.s3_wal_batcher = storage.wal.S3WalBatcher.init(testing.allocator);
+
+        try broker.open();
+        try testing.expect(broker.ensureTopic("stateless-share-topic"));
+        try broker.writeTopicSnapshotRecord();
+        topic_id = broker.topics.get("stateless-share-topic").?.topic_id;
+
+        const subscriptions = [_][]const u8{"stateless-share-topic"};
+        const joined = try broker.groups.joinGroupWithProtocol("stateless-share-group", "share-member", null, "share", "range", null, &subscriptions);
+        try testing.expectEqual(ErrorCode.none.toInt(), joined.error_code);
+        try testing.expect(broker.markShareGroupStable("stateless-share-group"));
+        try broker.persistConsumerGroupsDurably();
+
+        const batches = try testing.allocator.alloc(Broker.ShareStateBatch, 1);
+        batches[0] = .{
+            .first_offset = 11,
+            .last_offset = 13,
+            .delivery_state = 2,
+            .delivery_count = 3,
+        };
+        try broker.setSharePartitionState("stateless-share-group", topic_id, 0, 5, 11, batches);
+        try testing.expectEqual(ErrorCode.none, try broker.updateShareSessionEpoch("stateless-share-group", "share-member", 0));
+        try testing.expectEqual(ErrorCode.none, try broker.updateShareSessionEpoch("stateless-share-group", "share-member", 1));
+    }
+
+    {
+        var broker = Broker.init(testing.allocator, 1, 9092);
+        defer broker.deinit();
+        broker.store.s3_wal_mode = true;
+        broker.store.s3_storage = s3_storage;
+        broker.store.s3_wal_batcher = storage.wal.S3WalBatcher.init(testing.allocator);
+
+        try broker.open();
+        try testing.expect(broker.topics.contains("stateless-share-topic"));
+
+        const group = broker.groups.groups.getPtr("stateless-share-group") orelse return error.ExpectedShareGroup;
+        try testing.expectEqual(ConsumerGroup.GroupState.stable, group.state);
+        try testing.expect(group.members.contains("share-member"));
+
+        const session_key = try broker.shareGroupMemberKey("stateless-share-group", "share-member");
+        defer testing.allocator.free(session_key);
+        try testing.expectEqual(@as(i32, 1), broker.share_group_sessions.get(session_key).?);
+
+        const state = (try broker.getSharePartitionState("stateless-share-group", topic_id, 0)) orelse return error.ExpectedSharePartitionState;
+        try testing.expectEqual(@as(i32, 5), state.state_epoch);
+        try testing.expectEqual(@as(i64, 11), state.start_offset);
+        try testing.expectEqual(@as(usize, 1), state.batches.len);
+        try testing.expectEqual(@as(i64, 11), state.batches[0].first_offset);
+        try testing.expectEqual(@as(i64, 13), state.batches[0].last_offset);
+        try testing.expectEqual(@as(i8, 2), state.batches[0].delivery_state);
+        try testing.expectEqual(@as(i16, 3), state.batches[0].delivery_count);
+    }
+}
+
+test "Broker rolls back share session when shared snapshot write fails" {
+    var mock_s3 = storage.MockS3.init(testing.allocator);
+    defer mock_s3.deinit();
+    const s3_storage = storage.S3Storage.initMock(testing.allocator, &mock_s3);
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+    broker.store.s3_wal_mode = true;
+    broker.store.s3_storage = s3_storage;
+    broker.store.s3_wal_batcher = storage.wal.S3WalBatcher.init(testing.allocator);
+    try broker.open();
+
+    const subscriptions = [_][]const u8{};
+    const joined = try broker.groups.joinGroupWithProtocol("share-session-s3-fail-group", "share-member", null, "share", "range", null, &subscriptions);
+    try testing.expectEqual(ErrorCode.none.toInt(), joined.error_code);
+    try testing.expect(broker.markShareGroupStable("share-session-s3-fail-group"));
+    try broker.persistConsumerGroupsDurably();
+
+    mock_s3.failNextPutObjects(3);
+    try testing.expectEqual(ErrorCode.kafka_storage_error, try broker.updateShareSessionEpoch("share-session-s3-fail-group", "share-member", 0));
+    try testing.expectEqual(@as(usize, 0), broker.share_group_sessions.count());
+
+    var replacement = Broker.init(testing.allocator, 1, 9092);
+    defer replacement.deinit();
+    replacement.store.s3_wal_mode = true;
+    replacement.store.s3_storage = s3_storage;
+    replacement.store.s3_wal_batcher = storage.wal.S3WalBatcher.init(testing.allocator);
+    try replacement.open();
+    try testing.expectEqual(@as(usize, 0), replacement.share_group_sessions.count());
 }
 
 test "Broker.handleRequest ShareFetch rolls back session when local persistence fails" {
