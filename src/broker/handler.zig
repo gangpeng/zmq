@@ -9497,7 +9497,7 @@ pub const Broker = struct {
 
             for (req.groups, 0..) |group_req, group_idx| {
                 const group_id = group_req.group_id orelse "";
-                const group_error = self.offsetFetchGroupError(group_id);
+                const group_error = self.offsetFetchGroupErrorForRequest(group_req, api_version);
                 const topics = if (group_error != ErrorCode.none)
                     &.{}
                 else if (group_fetch_all_flags[group_idx])
@@ -9536,6 +9536,28 @@ pub const Broker = struct {
             .error_code = @intFromEnum(if (api_version >= 2) group_error else ErrorCode.none),
         };
         return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+    }
+
+    fn offsetFetchGroupErrorForRequest(
+        self: *Broker,
+        group_req: generated.offset_fetch_request.OffsetFetchRequest.OffsetFetchRequestGroup,
+        api_version: i16,
+    ) ErrorCode {
+        const group_id = group_req.group_id orelse "";
+        const member_id = group_req.member_id orelse "";
+        const validates_member_epoch = api_version >= 9 and (member_id.len > 0 or group_req.member_epoch >= 0);
+
+        const group = self.groups.groups.getPtr(group_id) orelse {
+            if (validates_member_epoch) return ErrorCode.unknown_member_id;
+            if (self.groups.hasCommittedOffsetsForGroup(group_id)) return ErrorCode.none;
+            return ErrorCode.group_id_not_found;
+        };
+
+        if (validates_member_epoch) {
+            if (member_id.len == 0 or !group.members.contains(member_id)) return ErrorCode.unknown_member_id;
+            if (group.generation_id != group_req.member_epoch) return ErrorCode.fenced_member_epoch;
+        }
+        return ErrorCode.none;
     }
 
     fn offsetFetchGroupError(self: *Broker, group_id: []const u8) ErrorCode {
@@ -38860,6 +38882,88 @@ test "Broker.handleRequest OffsetFetch v8 returns grouped generated response" {
     try testing.expectEqual(@as(i64, 321), resp.groups[0].topics[0].partitions[0].committed_offset);
     try testing.expectEqual(@as(i32, 9), resp.groups[0].topics[0].partitions[0].committed_leader_epoch);
     try testing.expectEqualStrings("grouped-meta", resp.groups[0].topics[0].partitions[0].metadata.?);
+}
+
+test "Broker.handleRequest OffsetFetch v9 validates KIP-848 member identity" {
+    const Req = generated.offset_fetch_request.OffsetFetchRequest;
+    const Resp = generated.offset_fetch_response.OffsetFetchResponse;
+    const Group = Req.OffsetFetchRequestGroup;
+    const Topic = Group.OffsetFetchRequestTopics;
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+
+    const subscriptions = [_][]const u8{"of-v9-topic"};
+    const joined = try broker.groups.joinGroupWithProtocol("of-v9-group", "of-v9-member", null, "consumer", "range", null, &subscriptions);
+    try broker.groups.commitOffsetWithMetadata("of-v9-group", "of-v9-topic", 0, 654, 11, "v9-meta");
+
+    const partitions = [_]i32{0};
+    const topics = [_]Topic{.{
+        .name = "of-v9-topic",
+        .partition_indexes = &partitions,
+    }};
+    const groups = [_]Group{
+        .{
+            .group_id = "of-v9-group",
+            .member_id = joined.member_id,
+            .member_epoch = joined.generation_id,
+            .topics = &topics,
+        },
+        .{
+            .group_id = "of-v9-group",
+            .member_id = "ghost-member",
+            .member_epoch = joined.generation_id,
+            .topics = &topics,
+        },
+        .{
+            .group_id = "of-v9-group",
+            .member_id = joined.member_id,
+            .member_epoch = joined.generation_id + 1,
+            .topics = &topics,
+        },
+    };
+    const req = Req{
+        .groups = &groups,
+        .require_stable = false,
+    };
+
+    var buf: [768]u8 = undefined;
+    var pos = buildTestRequest(&buf, 9, 9, 909, header_mod.requestHeaderVersion(9, 9));
+    req.serialize(&buf, &pos, 9);
+
+    const response = broker.handleRequest(buf[0..pos]);
+    try testing.expect(response != null);
+    defer testing.allocator.free(response.?);
+
+    var rpos: usize = 0;
+    var response_header = try ResponseHeader.deserialize(testing.allocator, response.?, &rpos, header_mod.responseHeaderVersion(9, 9));
+    defer response_header.deinit(testing.allocator);
+    try testing.expectEqual(@as(i32, 909), response_header.correlation_id);
+
+    const resp = try Resp.deserialize(testing.allocator, response.?, &rpos, 9);
+    defer {
+        broker.freeOffsetFetchGroups(resp.groups);
+        if (resp.groups.len > 0) testing.allocator.free(resp.groups);
+    }
+    try testing.expectEqual(response.?.len, rpos);
+    try testing.expectEqual(@as(i32, 0), resp.throttle_time_ms);
+    try testing.expectEqual(@as(usize, 3), resp.groups.len);
+
+    try testing.expectEqualStrings("of-v9-group", resp.groups[0].group_id.?);
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.none)), resp.groups[0].error_code);
+    try testing.expectEqual(@as(usize, 1), resp.groups[0].topics.len);
+    try testing.expectEqualStrings("of-v9-topic", resp.groups[0].topics[0].name.?);
+    try testing.expectEqual(@as(i64, 654), resp.groups[0].topics[0].partitions[0].committed_offset);
+    try testing.expectEqual(@as(i32, 11), resp.groups[0].topics[0].partitions[0].committed_leader_epoch);
+    try testing.expectEqualStrings("v9-meta", resp.groups[0].topics[0].partitions[0].metadata.?);
+
+    try testing.expectEqualStrings("of-v9-group", resp.groups[1].group_id.?);
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.unknown_member_id)), resp.groups[1].error_code);
+    try testing.expectEqual(@as(usize, 0), resp.groups[1].topics.len);
+
+    try testing.expectEqualStrings("of-v9-group", resp.groups[2].group_id.?);
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.fenced_member_epoch)), resp.groups[2].error_code);
+    try testing.expectEqual(@as(usize, 0), resp.groups[2].topics.len);
 }
 
 test "Broker.handleRequest OffsetFetch v8 reports missing group at group level" {
