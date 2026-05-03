@@ -50,6 +50,7 @@ const topic_snapshot_record_value_magic = "ZMQTP1";
 const topic_snapshot_record_key = "__zmq_topic_snapshot";
 const partition_reassignment_snapshot_record_value_magic = "ZMQPR1";
 const partition_reassignment_snapshot_record_key = "__zmq_partition_reassignment_snapshot";
+const partition_reassignment_quorum_record_magic = "ZMQPRQ2";
 const client_quota_snapshot_record_value_magic = "ZMQCQ1";
 const client_quota_snapshot_record_key = "__zmq_client_quota_snapshot";
 const scram_credential_snapshot_record_value_magic = "ZMQSC1";
@@ -709,6 +710,14 @@ pub const Broker = struct {
                 self.persistPartitionStates();
             }
         }
+        const recovered_partition_quorum_records = try self.replayCommittedPartitionReassignmentQuorumRecords();
+        if (recovered_partition_quorum_records > 0) {
+            log.info("Replayed {d} committed partition reassignment quorum record(s)", .{recovered_partition_quorum_records});
+            self.persistence.savePartitionReassignments(&self.partition_reassignments) catch |err| {
+                log.warn("Failed to persist replayed quorum partition reassignments: {}", .{err});
+            };
+        }
+
         const recovered_offset_records = try self.restoreOffsetsFromConsumerOffsetsLog();
         if (recovered_offset_records > 0) {
             log.info("Restored {d} state record(s) from __consumer_offsets", .{recovered_offset_records});
@@ -730,7 +739,7 @@ pub const Broker = struct {
 
         // Load ongoing partition reassignments after topics are available so
         // stale entries for deleted or out-of-range partitions can be ignored.
-        if (recovered_cluster_records.partition_reassignment_snapshots == 0) {
+        if (recovered_cluster_records.partition_reassignment_snapshots == 0 and recovered_partition_quorum_records == 0) {
             const saved_reassignments = try self.persistence.loadPartitionReassignments();
             defer self.persistence.freePartitionReassignmentEntries(saved_reassignments);
             try self.restorePartitionReassignments(saved_reassignments);
@@ -1107,7 +1116,7 @@ pub const Broker = struct {
         self.persistTransactionsIfDirty();
         self.persistProducerSequencesIfDirty();
         self.persistAutoMqMetadata();
-        self.persistPartitionReassignments();
+        self.persistPartitionReassignmentsLocal();
         self.persistObjectManagerSnapshot();
 
         var it = self.topics.iterator();
@@ -1519,11 +1528,21 @@ pub const Broker = struct {
         };
     }
 
-    fn persistPartitionReassignmentsDurably(self: *Broker) !void {
-        try self.writePartitionReassignmentSnapshotRecord();
+    fn persistPartitionReassignmentsLocal(self: *Broker) void {
         self.persistence.savePartitionReassignments(&self.partition_reassignments) catch |err| {
             log.warn("Failed to persist partition reassignments: {}", .{err});
         };
+    }
+
+    fn persistPartitionReassignmentsDurably(self: *Broker) !void {
+        if (self.raft_state != null) {
+            try self.commitPartitionReassignmentQuorumRecord();
+            self.persistPartitionReassignmentsLocal();
+            return;
+        }
+
+        try self.writePartitionReassignmentSnapshotRecord();
+        self.persistPartitionReassignmentsLocal();
     }
 
     fn restorePartitionStates(self: *Broker, entries: []const MetadataPersistence.PartitionStateEntry) !void {
@@ -1563,6 +1582,7 @@ pub const Broker = struct {
     }
 
     fn restorePartitionReassignments(self: *Broker, entries: []const MetadataPersistence.PartitionReassignmentEntry) !void {
+        self.restoreLocalOwnershipForCurrentReassignments();
         self.clearPartitionReassignments();
 
         for (entries) |entry| {
@@ -1591,6 +1611,35 @@ pub const Broker = struct {
             owned_key_owned = false;
             restored_owned = false;
             try self.applyPartitionReassignmentOwnership(entry.topic, entry.partition_index, entry.replicas);
+        }
+    }
+
+    fn restoreLocalOwnershipForCurrentReassignments(self: *Broker) void {
+        var it = self.partition_reassignments.iterator();
+        while (it.next()) |entry| {
+            const state = entry.value_ptr;
+            const info = self.topics.get(state.topic) orelse {
+                self.failover_controller.removePartitionOwner(state.topic, state.partition_index);
+                continue;
+            };
+            if (state.partition_index < 0 or state.partition_index >= info.num_partitions) {
+                self.failover_controller.removePartitionOwner(state.topic, state.partition_index);
+                continue;
+            }
+            self.restorePartitionOwner(state.topic, state.partition_index, self.node_id);
+        }
+    }
+
+    fn reapplyPartitionReassignmentOwnerships(self: *Broker) void {
+        var it = self.partition_reassignments.iterator();
+        while (it.next()) |entry| {
+            const state = entry.value_ptr;
+            const info = self.topics.get(state.topic) orelse continue;
+            if (state.partition_index < 0 or state.partition_index >= info.num_partitions) continue;
+            if (state.replicas.len == 0 or isLocalReplicaAssignment(state.replicas, self.node_id)) continue;
+            self.applyPartitionReassignmentOwnership(state.topic, state.partition_index, state.replicas) catch |err| {
+                log.warn("Failed to reapply partition reassignment owner for {s}-{d}: {}", .{ state.topic, state.partition_index, err });
+            };
         }
     }
 
@@ -2320,6 +2369,7 @@ pub const Broker = struct {
             try self.upsertTopicFromEntry(entry);
         }
         _ = self.pruneInvalidPartitionReassignments();
+        self.reapplyPartitionReassignmentOwnerships();
     }
 
     fn restoreTopicsAfterFailedMutation(self: *Broker, snapshot_value: []const u8) void {
@@ -7825,12 +7875,69 @@ pub const Broker = struct {
         return applied;
     }
 
+    fn isPartitionReassignmentQuorumRecord(data: []const u8) bool {
+        return data.len >= partition_reassignment_quorum_record_magic.len and
+            std.mem.eql(u8, data[0..partition_reassignment_quorum_record_magic.len], partition_reassignment_quorum_record_magic);
+    }
+
+    fn buildPartitionReassignmentQuorumRecord(self: *Broker) ![]u8 {
+        const snapshot = try self.encodePartitionReassignmentSnapshotRecordValue();
+        defer self.allocator.free(snapshot);
+
+        const snapshot_size = try autoMqBytesFieldSize(snapshot);
+        const total_len = try checkedAddSize(partition_reassignment_quorum_record_magic.len, snapshot_size);
+        const buf = try self.allocator.alloc(u8, total_len);
+        var pos: usize = 0;
+        @memcpy(buf[pos .. pos + partition_reassignment_quorum_record_magic.len], partition_reassignment_quorum_record_magic);
+        pos += partition_reassignment_quorum_record_magic.len;
+        try writeRecordBytes(buf, &pos, snapshot);
+        std.debug.assert(pos == buf.len);
+        return buf;
+    }
+
+    fn commitPartitionReassignmentQuorumRecord(self: *Broker) !void {
+        const raft = self.raft_state orelse return;
+        if (raft.role != .leader) return error.NotController;
+
+        const record = try self.buildPartitionReassignmentQuorumRecord();
+        defer self.allocator.free(record);
+        _ = try self.appendCommittedAutoMqRecord(record);
+    }
+
+    fn applyPartitionReassignmentQuorumRecord(self: *Broker, data: []const u8) !void {
+        if (!isPartitionReassignmentQuorumRecord(data)) return;
+
+        var pos = partition_reassignment_quorum_record_magic.len;
+        const snapshot = try readRecordBytes(data, &pos);
+        if (pos != data.len) return error.InvalidAutoMqMetadataRecord;
+        try self.restorePartitionReassignmentSnapshotRecord(snapshot);
+    }
+
+    fn replayCommittedPartitionReassignmentQuorumRecords(self: *Broker) !usize {
+        const raft = self.raft_state orelse return 0;
+
+        var applied: usize = 0;
+        for (raft.log.entries.items) |entry| {
+            if (entry.offset > raft.commit_index) break;
+            if (!isPartitionReassignmentQuorumRecord(entry.data)) continue;
+            try self.applyPartitionReassignmentQuorumRecord(entry.data);
+            applied += 1;
+        }
+        return applied;
+    }
+
     pub fn applyCommittedAutoMqQuorumRecords(self: *Broker) !usize {
         const metadata_applied = try self.replayCommittedAutoMqMetadataRecords();
         const object_applied = try self.replayCommittedAutoMqObjectMetadataRecords();
+        const reassignment_applied = try self.replayCommittedPartitionReassignmentQuorumRecords();
         if (metadata_applied > 0) self.persistAutoMqMetadata();
         if (object_applied > 0) self.persistObjectManagerSnapshot();
-        return metadata_applied + object_applied;
+        if (reassignment_applied > 0) {
+            self.persistence.savePartitionReassignments(&self.partition_reassignments) catch |err| {
+                log.warn("Failed to persist replayed partition reassignment quorum records: {}", .{err});
+            };
+        }
+        return metadata_applied + object_applied + reassignment_applied;
     }
 
     fn refreshAutoMqQuorumStateForRequest(self: *Broker) void {
@@ -17793,7 +17900,7 @@ pub const Broker = struct {
             for (topic_req.partitions, 0..) |partition_req, i| {
                 partitions[i] = .{
                     .partition_index = partition_req.partition_index,
-                    .error_code = self.applyPartitionReassignment(topic_name, topic_info, partition_req) catch @intFromEnum(ErrorCode.kafka_storage_error),
+                    .error_code = self.applyPartitionReassignment(topic_name, topic_info, partition_req) catch |err| partitionReassignmentErrorCode(err),
                     .error_message = null,
                 };
             }
@@ -17936,6 +18043,14 @@ pub const Broker = struct {
         }
 
         return @intFromEnum(ErrorCode.none);
+    }
+
+    fn partitionReassignmentErrorCode(err: anyerror) i16 {
+        return switch (err) {
+            error.NotController => @intFromEnum(ErrorCode.not_controller),
+            error.QuorumCommitPending => @intFromEnum(ErrorCode.request_timed_out),
+            else => @intFromEnum(ErrorCode.kafka_storage_error),
+        };
     }
 
     // ---------------------------------------------------------------
@@ -32764,6 +32879,135 @@ test "Broker partition reassignment updates owner metadata and rejects local IO"
         try broker.applyPartitionReassignment("reassign-owner", broker.topics.get("reassign-owner"), cancel),
     );
     try testing.expectEqual(@as(?i32, 1), broker.failover_controller.findPartitionOwner("reassign-owner", 0));
+}
+
+test "Broker partition reassignment quorum records replay assignment and cancellation" {
+    const AlterReq = generated.alter_partition_reassignments_request.AlterPartitionReassignmentsRequest;
+
+    var raft = RaftState.init(testing.allocator, 1, "reassign-quorum");
+    defer raft.deinit();
+    try raft.addVoter(1);
+    _ = raft.startElection();
+    raft.becomeLeader();
+
+    const topic_name = "reassign-quorum-topic";
+    const remote_replicas = [_]i32{2};
+    const remote_reassignment = AlterReq.ReassignableTopic.ReassignablePartition{
+        .partition_index = 0,
+        .replicas = &remote_replicas,
+    };
+    const cancel_reassignment = AlterReq.ReassignableTopic.ReassignablePartition{
+        .partition_index = 0,
+        .replicas = null,
+    };
+
+    {
+        var leader = Broker.init(testing.allocator, 1, 9092);
+        defer leader.deinit();
+        leader.setRaftState(&raft);
+        try testing.expect(leader.ensureTopic(topic_name));
+
+        try testing.expectEqual(
+            @as(i16, @intFromEnum(ErrorCode.none)),
+            try leader.applyPartitionReassignment(topic_name, leader.topics.get(topic_name), remote_reassignment),
+        );
+        try testing.expectEqual(@as(?i32, 2), leader.failover_controller.findPartitionOwner(topic_name, 0));
+        try testing.expectEqual(@as(usize, 1), raft.log.length());
+        try testing.expect(Broker.isPartitionReassignmentQuorumRecord(raft.log.entries.items[0].data));
+    }
+
+    {
+        var follower = Broker.init(testing.allocator, 1, 9092);
+        defer follower.deinit();
+        try testing.expect(follower.ensureTopic(topic_name));
+        follower.setRaftState(&raft);
+
+        try testing.expectEqual(@as(usize, 1), try follower.replayCommittedPartitionReassignmentQuorumRecords());
+        try testing.expectEqual(@as(u32, 1), follower.partition_reassignments.count());
+        try testing.expectEqual(@as(?i32, 2), follower.failover_controller.findPartitionOwner(topic_name, 0));
+    }
+
+    {
+        var leader = Broker.init(testing.allocator, 1, 9092);
+        defer leader.deinit();
+        try testing.expect(leader.ensureTopic(topic_name));
+        leader.setRaftState(&raft);
+        try testing.expectEqual(@as(usize, 1), try leader.replayCommittedPartitionReassignmentQuorumRecords());
+
+        try testing.expectEqual(
+            @as(i16, @intFromEnum(ErrorCode.none)),
+            try leader.applyPartitionReassignment(topic_name, leader.topics.get(topic_name), cancel_reassignment),
+        );
+        try testing.expectEqual(@as(u32, 0), leader.partition_reassignments.count());
+        try testing.expectEqual(@as(?i32, 1), leader.failover_controller.findPartitionOwner(topic_name, 0));
+        try testing.expectEqual(@as(usize, 2), raft.log.length());
+    }
+
+    {
+        var follower = Broker.init(testing.allocator, 1, 9092);
+        defer follower.deinit();
+        try testing.expect(follower.ensureTopic(topic_name));
+        follower.setRaftState(&raft);
+
+        try testing.expectEqual(@as(usize, 2), try follower.replayCommittedPartitionReassignmentQuorumRecords());
+        try testing.expectEqual(@as(u32, 0), follower.partition_reassignments.count());
+        try testing.expectEqual(@as(?i32, 1), follower.failover_controller.findPartitionOwner(topic_name, 0));
+    }
+}
+
+test "Broker partition reassignment quorum mutation fails closed on non-leader" {
+    const AlterReq = generated.alter_partition_reassignments_request.AlterPartitionReassignmentsRequest;
+    const AlterResp = generated.alter_partition_reassignments_response.AlterPartitionReassignmentsResponse;
+
+    var raft = RaftState.init(testing.allocator, 1, "reassign-quorum-follower");
+    defer raft.deinit();
+    try raft.addVoter(1);
+    raft.becomeFollower(2, 2);
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+    broker.setRaftState(&raft);
+    try testing.expect(broker.ensureTopic("reassign-quorum-follower-topic"));
+
+    const remote_replicas = [_]i32{2};
+    const alter_partitions = [_]AlterReq.ReassignableTopic.ReassignablePartition{.{
+        .partition_index = 0,
+        .replicas = &remote_replicas,
+    }};
+    const alter_topics = [_]AlterReq.ReassignableTopic{.{
+        .name = "reassign-quorum-follower-topic",
+        .partitions = &alter_partitions,
+    }};
+    const alter_req = AlterReq{
+        .timeout_ms = 1000,
+        .topics = &alter_topics,
+    };
+
+    var buf: [512]u8 = undefined;
+    var pos = buildTestRequest(&buf, 45, 0, 4520, header_mod.requestHeaderVersion(45, 0));
+    alter_req.serialize(&buf, &pos, 0);
+
+    const response = broker.handleRequest(buf[0..pos]);
+    try testing.expect(response != null);
+    defer testing.allocator.free(response.?);
+
+    var rpos: usize = 0;
+    var response_header = try ResponseHeader.deserialize(testing.allocator, response.?, &rpos, header_mod.responseHeaderVersion(45, 0));
+    defer response_header.deinit(testing.allocator);
+    try testing.expectEqual(@as(i32, 4520), response_header.correlation_id);
+
+    const resp = try AlterResp.deserialize(testing.allocator, response.?, &rpos, 0);
+    defer {
+        for (resp.responses) |topic| {
+            if (topic.partitions.len > 0) testing.allocator.free(topic.partitions);
+        }
+        if (resp.responses.len > 0) testing.allocator.free(resp.responses);
+    }
+    try testing.expectEqual(response.?.len, rpos);
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.not_controller)), resp.responses[0].partitions[0].error_code);
+    try testing.expectEqual(@as(u32, 0), broker.partition_reassignments.count());
+    try testing.expectEqual(@as(?i32, 1), broker.failover_controller.findPartitionOwner("reassign-quorum-follower-topic", 0));
+    try testing.expectEqual(@as(usize, 0), raft.log.length());
 }
 
 test "Broker restores partition reassignment state after restart" {
