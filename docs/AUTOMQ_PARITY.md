@@ -162,7 +162,8 @@ Status: completed for the initial catalog and DeleteGroups slice.
   reports unknown topics, and honors the response partition cursor.
   ConsumerGroupDescribe now advertises key 69 v0, decodes generated flexible
   requests, rejects malformed frames, and reports read-only group state, members,
-  subscriptions, and missing-group errors from the existing group coordinator.
+  subscriptions, current/target range assignments, and missing-group errors
+  from the existing group coordinator.
   ConsumerGroupHeartbeat key 68 remains non-advertised until full KIP-848
   epoch/revocation semantics exist, but direct v0 requests now validate/decode
   generated flexible frames, can join, heartbeat, and leave through the

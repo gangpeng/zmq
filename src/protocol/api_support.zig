@@ -374,7 +374,7 @@ pub const non_advertised_handler_api_keys = [_]i16{
 /// non-advertised until their full coordinator/storage semantics are
 /// implemented. Most return schema-valid fail-closed responses for direct
 /// probes; ConsumerGroupHeartbeat currently exposes a compatibility subset but
-/// stays here until full KIP-848 assignment semantics exist.
+/// stays here until full KIP-848 epoch/revocation semantics exist.
 pub const fail_closed_generated_handler_api_keys = [_]i16{
     68, // ConsumerGroupHeartbeat (KIP-848)
     73, // AssignReplicasToDirs (KIP-858)

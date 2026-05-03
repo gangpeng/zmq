@@ -10561,6 +10561,63 @@ pub const Broker = struct {
         return std.mem.lessThan(u8, a, b);
     }
 
+    const RangeAssignmentTopic = struct {
+        topic_id: [16]u8,
+        topic_name: []const u8,
+        partitions: []const i32,
+    };
+
+    fn buildRangeAssignedTopic(
+        self: *Broker,
+        group: *const ConsumerGroup,
+        topic_name: []const u8,
+        member_id: []const u8,
+    ) !?RangeAssignmentTopic {
+        const topic = self.topics.get(topic_name) orelse return null;
+        if (topic.num_partitions <= 0) return null;
+
+        var member_ids = std.array_list.Managed([]const u8).init(self.allocator);
+        defer member_ids.deinit();
+        var it = group.members.iterator();
+        while (it.next()) |entry| {
+            if (memberSubscribedToTopic(entry.value_ptr, topic_name)) {
+                try member_ids.append(entry.key_ptr.*);
+            }
+        }
+        if (member_ids.items.len == 0) return null;
+        std.mem.sort([]const u8, member_ids.items, {}, stringSliceLessThan);
+
+        var member_index: ?usize = null;
+        for (member_ids.items, 0..) |candidate, index| {
+            if (std.mem.eql(u8, candidate, member_id)) {
+                member_index = index;
+                break;
+            }
+        }
+        const index = member_index orelse return null;
+
+        const member_count = std.math.cast(i32, member_ids.items.len) orelse return error.TooManyConsumerGroupMembers;
+        const partitions_per_member = @divTrunc(topic.num_partitions, member_count);
+        const extra = @rem(topic.num_partitions, member_count);
+        const index_i32: i32 = @intCast(index);
+        const start = index_i32 * partitions_per_member + @min(index_i32, extra);
+        const count = partitions_per_member + if (index_i32 < extra) @as(i32, 1) else 0;
+        if (count <= 0) return null;
+
+        const partitions = try self.allocator.alloc(i32, @intCast(count));
+        var partition: i32 = start;
+        for (partitions) |*out| {
+            out.* = partition;
+            partition += 1;
+        }
+
+        return .{
+            .topic_id = topic.topic_id,
+            .topic_name = topic.name,
+            .partitions = partitions,
+        };
+    }
+
     fn buildConsumerGroupHeartbeatAssignment(
         self: *Broker,
         group_id: []const u8,
@@ -10580,48 +10637,12 @@ pub const Broker = struct {
         }
 
         for (member.subscribed_topics.items) |topic_name| {
-            const topic = self.topics.get(topic_name) orelse continue;
-            if (topic.num_partitions <= 0) continue;
-
-            var member_ids = std.array_list.Managed([]const u8).init(self.allocator);
-            defer member_ids.deinit();
-            var it = group.members.iterator();
-            while (it.next()) |entry| {
-                if (memberSubscribedToTopic(entry.value_ptr, topic_name)) {
-                    try member_ids.append(entry.key_ptr.*);
-                }
-            }
-            if (member_ids.items.len == 0) continue;
-            std.mem.sort([]const u8, member_ids.items, {}, stringSliceLessThan);
-
-            var member_index: ?usize = null;
-            for (member_ids.items, 0..) |candidate, index| {
-                if (std.mem.eql(u8, candidate, member_id)) {
-                    member_index = index;
-                    break;
-                }
-            }
-            const index = member_index orelse continue;
-
-            const member_count = std.math.cast(i32, member_ids.items.len) orelse return error.TooManyConsumerGroupMembers;
-            const partitions_per_member = @divTrunc(topic.num_partitions, member_count);
-            const extra = @rem(topic.num_partitions, member_count);
-            const index_i32: i32 = @intCast(index);
-            const start = index_i32 * partitions_per_member + @min(index_i32, extra);
-            const count = partitions_per_member + if (index_i32 < extra) @as(i32, 1) else 0;
-            if (count <= 0) continue;
-
-            const partitions = try self.allocator.alloc(i32, @intCast(count));
-            errdefer self.allocator.free(partitions);
-            var partition: i32 = start;
-            for (partitions) |*out| {
-                out.* = partition;
-                partition += 1;
-            }
+            const assigned = (try self.buildRangeAssignedTopic(group, topic_name, member_id)) orelse continue;
+            errdefer self.allocator.free(assigned.partitions);
 
             try topic_partitions.append(.{
-                .topic_id = topic.topic_id,
-                .partitions = partitions,
+                .topic_id = assigned.topic_id,
+                .partitions = assigned.partitions,
             });
         }
 
@@ -11653,6 +11674,11 @@ pub const Broker = struct {
             while (mit.next()) |mentry| {
                 const member = mentry.value_ptr;
                 const subscribed_topics = try self.copySubscribedTopicNames(member.subscribed_topics.items);
+                errdefer if (subscribed_topics.len > 0) self.allocator.free(subscribed_topics);
+                var assignment = try self.buildConsumerGroupDescribeAssignment(group, member.member_id, member.subscribed_topics.items);
+                errdefer self.freeConsumerGroupDescribeAssignment(&assignment);
+                var target_assignment = try self.buildConsumerGroupDescribeAssignment(group, member.member_id, member.subscribed_topics.items);
+                errdefer self.freeConsumerGroupDescribeAssignment(&target_assignment);
                 members[members_init] = .{
                     .member_id = member.member_id,
                     .instance_id = member.group_instance_id,
@@ -11662,8 +11688,8 @@ pub const Broker = struct {
                     .client_host = "/127.0.0.1",
                     .subscribed_topic_names = subscribed_topics,
                     .subscribed_topic_regex = null,
-                    .assignment = .{},
-                    .target_assignment = .{},
+                    .assignment = assignment,
+                    .target_assignment = target_assignment,
                 };
                 members_init += 1;
             }
@@ -11691,6 +11717,44 @@ pub const Broker = struct {
         return result;
     }
 
+    fn buildConsumerGroupDescribeAssignment(
+        self: *Broker,
+        group: *const ConsumerGroup,
+        member_id: []const u8,
+        subscribed_topics: []const []u8,
+    ) !generated.consumer_group_describe_response.Assignment {
+        const Assignment = generated.consumer_group_describe_response.Assignment;
+        const TopicPartitions = generated.consumer_group_describe_response.TopicPartitions;
+
+        var topic_partitions = std.array_list.Managed(TopicPartitions).init(self.allocator);
+        errdefer {
+            for (topic_partitions.items) |entry| {
+                if (entry.partitions.len > 0) self.allocator.free(entry.partitions);
+            }
+            topic_partitions.deinit();
+        }
+
+        for (subscribed_topics) |topic_name| {
+            const assigned = (try self.buildRangeAssignedTopic(group, topic_name, member_id)) orelse continue;
+            errdefer self.allocator.free(assigned.partitions);
+            try topic_partitions.append(.{
+                .topic_id = assigned.topic_id,
+                .topic_name = assigned.topic_name,
+                .partitions = assigned.partitions,
+            });
+        }
+
+        if (topic_partitions.items.len == 0) return Assignment{ .topic_partitions = &.{} };
+        return Assignment{ .topic_partitions = try topic_partitions.toOwnedSlice() };
+    }
+
+    fn freeConsumerGroupDescribeAssignment(self: *Broker, assignment: *const generated.consumer_group_describe_response.Assignment) void {
+        for (assignment.topic_partitions) |topic| {
+            if (topic.partitions.len > 0) self.allocator.free(topic.partitions);
+        }
+        if (assignment.topic_partitions.len > 0) self.allocator.free(assignment.topic_partitions);
+    }
+
     fn freeConsumerGroupDescriptions(self: *Broker, groups: []const generated.consumer_group_describe_response.ConsumerGroupDescribeResponse.DescribedGroup) void {
         for (groups) |group| {
             self.freeConsumerGroupDescribeMembers(group.members);
@@ -11701,6 +11765,8 @@ pub const Broker = struct {
     fn freeConsumerGroupDescribeMembers(self: *Broker, members: []const generated.consumer_group_describe_response.ConsumerGroupDescribeResponse.DescribedGroup.Member) void {
         for (members) |member| {
             if (member.subscribed_topic_names.len > 0) self.allocator.free(member.subscribed_topic_names);
+            self.freeConsumerGroupDescribeAssignment(&member.assignment);
+            self.freeConsumerGroupDescribeAssignment(&member.target_assignment);
         }
     }
 
@@ -37909,6 +37975,8 @@ test "Broker.handleRequest ConsumerGroupDescribe v0 returns generated group stat
 
     var broker = Broker.init(testing.allocator, 1, 9092);
     defer broker.deinit();
+    broker.default_num_partitions = 2;
+    try testing.expect(broker.ensureTopic("cgd-topic"));
 
     const subscriptions = [_][]const u8{"cgd-topic"};
     const join_result = try broker.groups.joinGroupWithProtocol("cgd-group", null, null, "consumer", "range", null, &subscriptions);
@@ -37954,7 +38022,14 @@ test "Broker.handleRequest ConsumerGroupDescribe v0 returns generated group stat
     try testing.expectEqualStrings("/127.0.0.1", resp.groups[0].members[0].client_host.?);
     try testing.expectEqual(@as(usize, 1), resp.groups[0].members[0].subscribed_topic_names.len);
     try testing.expectEqualStrings("cgd-topic", resp.groups[0].members[0].subscribed_topic_names[0].?);
-    try testing.expectEqual(@as(usize, 0), resp.groups[0].members[0].assignment.topic_partitions.len);
+    try testing.expectEqual(@as(usize, 1), resp.groups[0].members[0].assignment.topic_partitions.len);
+    try testing.expectEqualSlices(u8, &broker.topics.get("cgd-topic").?.topic_id, &resp.groups[0].members[0].assignment.topic_partitions[0].topic_id);
+    try testing.expectEqualStrings("cgd-topic", resp.groups[0].members[0].assignment.topic_partitions[0].topic_name.?);
+    try testing.expectEqualSlices(i32, &[_]i32{ 0, 1 }, resp.groups[0].members[0].assignment.topic_partitions[0].partitions);
+    try testing.expectEqual(@as(usize, 1), resp.groups[0].members[0].target_assignment.topic_partitions.len);
+    try testing.expectEqualSlices(u8, &broker.topics.get("cgd-topic").?.topic_id, &resp.groups[0].members[0].target_assignment.topic_partitions[0].topic_id);
+    try testing.expectEqualStrings("cgd-topic", resp.groups[0].members[0].target_assignment.topic_partitions[0].topic_name.?);
+    try testing.expectEqualSlices(i32, &[_]i32{ 0, 1 }, resp.groups[0].members[0].target_assignment.topic_partitions[0].partitions);
 
     try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.group_id_not_found)), resp.groups[1].error_code);
     try testing.expectEqualStrings("missing-cgd-group", resp.groups[1].group_id.?);
