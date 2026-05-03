@@ -13649,10 +13649,12 @@ pub const Broker = struct {
             for (responses[0..responses_init], delete_outcomes[0..responses_init]) |response, outcome| {
                 if (outcome.deleted) {
                     const topic_name = response.name orelse continue;
-                    self.cleanupDeletedTopicData(topic_name, outcome.partition_count);
+                    self.cleanupDeletedTopicData(topic_name, outcome.topic_id, outcome.partition_count);
                 }
             }
             self.persistTopicsLocal();
+            self.persistReplicaDirectoryAssignmentsLocal();
+            self.persistShareGroupStatesLocal();
             self.persistPartitionStates();
             self.persistPartitionReassignments();
             self.persistObjectManagerSnapshot();
@@ -13688,14 +13690,16 @@ pub const Broker = struct {
         return null;
     }
 
-    fn cleanupDeletedTopicData(self: *Broker, topic_name: []const u8, partition_count: i32) void {
+    fn cleanupDeletedTopicData(self: *Broker, topic_name: []const u8, topic_id: [16]u8, partition_count: i32) void {
+        self.clearReplicaDirectoryAssignmentsForTopicId(topic_id);
+        self.clearShareGroupStatesForTopicId(topic_id);
         _ = self.clearPartitionReassignmentsForTopic(topic_name);
         self.removeTopicPartitionRange(topic_name, 0, partition_count);
     }
 
     fn deleteTopicByName(self: *Broker, topic_name: []const u8) DeleteTopicOutcome {
         const outcome = self.deleteTopicMetadataByName(topic_name);
-        if (outcome.deleted) self.cleanupDeletedTopicData(topic_name, outcome.partition_count);
+        if (outcome.deleted) self.cleanupDeletedTopicData(topic_name, outcome.topic_id, outcome.partition_count);
         return outcome;
     }
 
@@ -13721,8 +13725,6 @@ pub const Broker = struct {
             const info = removed.value;
             const topic_id = info.topic_id;
             const partition_count = info.num_partitions;
-            self.clearReplicaDirectoryAssignmentsForTopicId(topic_id);
-            self.clearShareGroupStatesForTopicId(topic_id);
             self.allocator.free(info.name);
             self.allocator.free(removed.key);
             log.info("Deleted topic '{s}' ({d} partitions)", .{ topic_name, info.num_partitions });
@@ -45336,6 +45338,19 @@ test "Broker.handleRequest DeleteTopics rolls back when topic snapshot S3 WAL wr
     try broker.open();
     try testing.expect(broker.ensureTopic("dt-s3-fail-topic"));
     const topic_id = broker.topics.get("dt-s3-fail-topic").?.topic_id;
+    const share_key = try broker.shareGroupStateKey("dt-s3-fail-share-group", topic_id, 0);
+    try broker.share_group_states.put(share_key, .{
+        .state_epoch = 1,
+        .start_offset = 7,
+        .batches = &.{},
+    });
+    const replica_directory_id = [_]u8{0x4d} ** 16;
+    const replica_key = try broker.replicaDirectoryAssignmentKey(topic_id, 0);
+    try broker.replica_directory_assignments.put(replica_key, .{
+        .topic_id = topic_id,
+        .partition_index = 0,
+        .directory_id = replica_directory_id,
+    });
     const object_count_before = mock_s3.objectCount();
     mock_s3.failNextPutObjects(3);
 
@@ -45369,6 +45384,9 @@ test "Broker.handleRequest DeleteTopics rolls back when topic snapshot S3 WAL wr
     try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.kafka_storage_error)), resp.responses[0].error_code);
     try testing.expect(broker.topics.contains("dt-s3-fail-topic"));
     try testing.expect(broker.store.partitions.contains("dt-s3-fail-topic-0"));
+    try testing.expect((try broker.getSharePartitionState("dt-s3-fail-share-group", topic_id, 0)) != null);
+    const restored_directory = (try broker.getReplicaDirectoryAssignment(topic_id, 0)) orelse return error.ExpectedReplicaDirectoryAssignment;
+    try testing.expectEqualSlices(u8, replica_directory_id[0..], restored_directory[0..]);
     try testing.expectEqual(object_count_before, mock_s3.objectCount());
 }
 
