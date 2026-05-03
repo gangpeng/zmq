@@ -18,6 +18,7 @@ pub fn main() !void {
     try benchByteBuffer(stdout);
     try benchPartitionStoreMemory(stdout);
     try benchPartitionStoreS3Wal(stdout);
+    try benchLiveS3Provider(stdout);
     try benchPartitionStoreMemoryGrowth(stdout);
 
     try stdout.print("\n=== Benchmarks complete ===\n", .{});
@@ -142,6 +143,48 @@ fn nowNs() u64 {
     return @intCast(time.nanoTimestamp());
 }
 
+fn getenv(name: [:0]const u8) ?[]const u8 {
+    const value = std.c.getenv(name.ptr) orelse return null;
+    return std.mem.span(value);
+}
+
+fn envOr(name: [:0]const u8, default: []const u8) []const u8 {
+    return getenv(name) orelse default;
+}
+
+fn envBool(name: [:0]const u8, default: bool) bool {
+    const value = getenv(name) orelse return default;
+    if (std.mem.eql(u8, value, "1") or std.ascii.eqlIgnoreCase(value, "true") or std.ascii.eqlIgnoreCase(value, "yes")) {
+        return true;
+    }
+    if (std.mem.eql(u8, value, "0") or std.ascii.eqlIgnoreCase(value, "false") or std.ascii.eqlIgnoreCase(value, "no")) {
+        return false;
+    }
+    return default;
+}
+
+fn envU16(name: [:0]const u8, default: u16) u16 {
+    const value = getenv(name) orelse return default;
+    return std.fmt.parseInt(u16, value, 10) catch default;
+}
+
+fn envUsize(name: [:0]const u8, default: usize) usize {
+    const value = getenv(name) orelse return default;
+    return std.fmt.parseInt(usize, value, 10) catch default;
+}
+
+fn envF64(name: [:0]const u8, default: f64) f64 {
+    const value = getenv(name) orelse return default;
+    return std.fmt.parseFloat(f64, value) catch default;
+}
+
+fn envScheme(name: [:0]const u8, default: storage.S3Client.Scheme) storage.S3Client.Scheme {
+    const value = getenv(name) orelse return default;
+    if (std.ascii.eqlIgnoreCase(value, "https")) return .https;
+    if (std.ascii.eqlIgnoreCase(value, "http")) return .http;
+    return default;
+}
+
 fn lessThanU64(_: void, a: u64, b: u64) bool {
     return a < b;
 }
@@ -179,6 +222,17 @@ fn requirePerformance(name: []const u8, result: TimedResult, min_ops_per_sec: f6
         std.debug.print(
             "benchmark gate failed for {s}: throughput={d:.2}/s min={d:.2}/s p99={d:.2}ms max={d:.2}ms\n",
             .{ name, result.throughput, min_ops_per_sec, p99_ms, max_p99_ms },
+        );
+        return error.BenchmarkGateFailed;
+    }
+}
+
+fn requireThroughput(name: []const u8, mib_per_sec: f64, p99_ns: u64, min_mib_per_sec: f64, max_p99_ms: f64) !void {
+    const p99_ms = @as(f64, @floatFromInt(p99_ns)) / 1e6;
+    if (mib_per_sec < min_mib_per_sec or p99_ms > max_p99_ms) {
+        std.debug.print(
+            "benchmark gate failed for {s}: throughput={d:.2}MiB/s min={d:.2}MiB/s p99={d:.2}ms max={d:.2}ms\n",
+            .{ name, mib_per_sec, min_mib_per_sec, p99_ms, max_p99_ms },
         );
         return error.BenchmarkGateFailed;
     }
@@ -347,6 +401,136 @@ fn benchPartitionStoreS3Wal(writer: anytype) !void {
         recovered_per_sec,
         @as(f64, @floatFromInt(rebuild_ns)) / 1e6,
     });
+}
+
+fn liveS3Config() storage.S3Client.Config {
+    return .{
+        .host = envOr("ZMQ_S3_ENDPOINT", "127.0.0.1"),
+        .port = envU16("ZMQ_S3_PORT", 9000),
+        .bucket = envOr("ZMQ_S3_BUCKET", "zmq-bench-live"),
+        .access_key = envOr("ZMQ_S3_ACCESS_KEY", "minioadmin"),
+        .secret_key = envOr("ZMQ_S3_SECRET_KEY", "minioadmin"),
+        .scheme = envScheme("ZMQ_S3_SCHEME", .http),
+        .region = envOr("ZMQ_S3_REGION", "us-east-1"),
+        .path_style = envBool("ZMQ_S3_PATH_STYLE", true),
+        .tls_ca_file = getenv("ZMQ_S3_TLS_CA_FILE"),
+    };
+}
+
+fn freeS3Keys(alloc: std.mem.Allocator, keys: [][]u8) void {
+    for (keys) |key| alloc.free(key);
+    alloc.free(keys);
+}
+
+fn cleanupS3Prefix(s3: *storage.S3Storage, prefix: []const u8) void {
+    const keys = s3.listObjectKeys(prefix) catch return;
+    defer freeS3Keys(s3.allocator, keys);
+
+    for (keys) |key| {
+        s3.deleteObject(key) catch {};
+    }
+}
+
+fn fillPayload(payload: []u8) void {
+    for (payload, 0..) |*byte, i| {
+        byte.* = @truncate((i * 31) % 251);
+    }
+}
+
+fn benchLiveS3Provider(writer: anytype) !void {
+    if (!envBool("ZMQ_RUN_BENCH_LIVE_S3", false)) {
+        try writer.print("Live S3 provider benchmark skipped (set ZMQ_RUN_BENCH_LIVE_S3=1)\n", .{});
+        return;
+    }
+
+    const alloc = std.heap.page_allocator;
+    var client = storage.S3Client.init(alloc, liveS3Config());
+    if (!envBool("ZMQ_S3_SKIP_ENSURE_BUCKET", false)) {
+        try client.ensureBucket();
+    }
+    var s3 = storage.S3Storage.initReal(alloc, &client);
+
+    const iterations = envUsize("ZMQ_BENCH_LIVE_S3_ITERATIONS", 20);
+    const payload_len = envUsize("ZMQ_BENCH_LIVE_S3_PAYLOAD_BYTES", 64 * 1024);
+    if (iterations == 0 or payload_len == 0) return error.InvalidBenchmarkConfig;
+
+    const prefix = try std.fmt.allocPrint(alloc, "bench/live/{d}", .{nowNs()});
+    defer alloc.free(prefix);
+    defer cleanupS3Prefix(&s3, prefix);
+
+    const payload = try alloc.alloc(u8, payload_len);
+    defer alloc.free(payload);
+    fillPayload(payload);
+
+    var keys = std.array_list.Managed([]u8).init(alloc);
+    defer {
+        for (keys.items) |key| alloc.free(key);
+        keys.deinit();
+    }
+
+    const put_latencies = try alloc.alloc(u64, iterations);
+    defer alloc.free(put_latencies);
+
+    const put_start = nowNs();
+    for (put_latencies, 0..) |*latency, i| {
+        const key = try std.fmt.allocPrint(alloc, "{s}/{d:0>6}", .{ prefix, i });
+
+        const start = nowNs();
+        s3.putObject(key, payload) catch |err| {
+            alloc.free(key);
+            return err;
+        };
+        keys.append(key) catch |err| {
+            alloc.free(key);
+            return err;
+        };
+        latency.* = nowNs() - start;
+    }
+    const put_result = summarize(put_latencies, nowNs() - put_start);
+    const total_mib = (@as(f64, @floatFromInt(iterations)) * @as(f64, @floatFromInt(payload_len))) / (1024.0 * 1024.0);
+    const put_mib_per_sec = total_mib / (@as(f64, @floatFromInt(put_result.elapsed_ns)) / 1e9);
+    try writer.print("Live S3 put             {d:>8.2} MiB/s  p99={d:>8.2} ms  objects={d}\n", .{
+        put_mib_per_sec,
+        @as(f64, @floatFromInt(put_result.p99_ns)) / 1e6,
+        iterations,
+    });
+    try requireThroughput(
+        "Live S3 put",
+        put_mib_per_sec,
+        put_result.p99_ns,
+        envF64("ZMQ_BENCH_LIVE_S3_MIN_PUT_MIB_PER_SEC", 0.05),
+        envF64("ZMQ_BENCH_LIVE_S3_MAX_PUT_P99_MS", 10_000.0),
+    );
+
+    const get_latencies = try alloc.alloc(u64, iterations);
+    defer alloc.free(get_latencies);
+
+    const get_start = nowNs();
+    for (get_latencies, keys.items) |*latency, key| {
+        const start = nowNs();
+        const data = (try s3.getObject(key)) orelse return error.LiveS3ObjectMissing;
+        if (data.len != payload.len) {
+            alloc.free(data);
+            return error.LiveS3ObjectSizeMismatch;
+        }
+        alloc.free(data);
+        latency.* = nowNs() - start;
+    }
+    const get_result = summarize(get_latencies, nowNs() - get_start);
+    const get_mib_per_sec = total_mib / (@as(f64, @floatFromInt(get_result.elapsed_ns)) / 1e9);
+    const requests_per_mib = @as(f64, @floatFromInt(client.put_count + client.get_count)) / total_mib;
+    try writer.print("Live S3 get             {d:>8.2} MiB/s  p99={d:>8.2} ms  requests/MiB={d:.2}\n", .{
+        get_mib_per_sec,
+        @as(f64, @floatFromInt(get_result.p99_ns)) / 1e6,
+        requests_per_mib,
+    });
+    try requireThroughput(
+        "Live S3 get",
+        get_mib_per_sec,
+        get_result.p99_ns,
+        envF64("ZMQ_BENCH_LIVE_S3_MIN_GET_MIB_PER_SEC", 0.05),
+        envF64("ZMQ_BENCH_LIVE_S3_MAX_GET_P99_MS", 10_000.0),
+    );
 }
 
 fn benchPartitionStoreMemoryGrowth(writer: anytype) !void {

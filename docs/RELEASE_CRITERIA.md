@@ -48,6 +48,7 @@ ZMQ_RUN_PROCESS_CRASH_TESTS=1 /tmp/zig-aarch64-linux-0.16.0/zig build test-s3-pr
 ZMQ_RUN_S3_PROVIDER_MATRIX=1 /tmp/zig-aarch64-linux-0.16.0/zig build test-s3-provider-matrix --summary all
 ZMQ_RUN_KRAFT_FAILOVER_TESTS=1 /tmp/zig-aarch64-linux-0.16.0/zig build test-kraft-failover --summary all
 /tmp/zig-aarch64-linux-0.16.0/zig build bench --summary all
+ZMQ_RUN_BENCH_LIVE_S3=1 /tmp/zig-aarch64-linux-0.16.0/zig build bench --summary all
 ZMQ_RUN_BENCH_COMPARE=1 /tmp/zig-aarch64-linux-0.16.0/zig build bench-compare --summary all
 ```
 
