@@ -4884,6 +4884,23 @@ pub const Broker = struct {
             return self.handleUnsupported(&req_header, api_key, resp_header_version);
         }
 
+        if (self.sasl_enabled and !isSaslAuthenticationApi(api_key)) {
+            const client_id = req_header.client_id orelse "anonymous";
+            if (self.authenticated_sessions.get(client_id) == null) {
+                log.warn("Unauthenticated SASL request rejected: api_key={d} client_id={s}", .{ api_key, client_id });
+                const resource_type = resourceTypeForApiKey(api_key);
+                return self.handleAuthorizationError(
+                    request_bytes,
+                    pos,
+                    &req_header,
+                    api_key,
+                    api_version,
+                    resp_header_version,
+                    if (resource_type == .unknown) .cluster else resource_type,
+                );
+            }
+        }
+
         // Auth/ACL check before dispatch
         if (self.authorizer.aclCount() > 0 or !self.authorizer.allow_everyone_if_no_acl) {
             const client_id = req_header.client_id orelse "anonymous";
@@ -5222,6 +5239,13 @@ pub const Broker = struct {
             504, 511 => .delete, // AutoMQ deletes
             505, 506, 507, 510, 512, 513, 515, 517, 519, 600, 602 => .alter, // AutoMQ mutations
             else => .any,
+        };
+    }
+
+    fn isSaslAuthenticationApi(api_key: i16) bool {
+        return switch (api_key) {
+            17, 18, 36 => true, // SaslHandshake, ApiVersions, SaslAuthenticate
+            else => false,
         };
     }
 
@@ -25783,6 +25807,106 @@ test "Broker.handleRequest SaslAuthenticate v2 returns generated flexible respon
     try testing.expectEqualStrings("", resp.error_message.?);
     try testing.expectEqual(@as(usize, 0), resp.auth_bytes.?.len);
     try testing.expectEqual(@as(i64, 0), resp.session_lifetime_ms);
+}
+
+test "Broker.handleRequest SASL enabled gates non-auth APIs until authentication" {
+    const MetadataReq = generated.metadata_request.MetadataRequest;
+    const MetadataTopic = MetadataReq.MetadataRequestTopic;
+    const MetadataResp = generated.metadata_response.MetadataResponse;
+    const HandshakeReq = generated.sasl_handshake_request.SaslHandshakeRequest;
+    const HandshakeResp = generated.sasl_handshake_response.SaslHandshakeResponse;
+    const AuthReq = generated.sasl_authenticate_request.SaslAuthenticateRequest;
+    const AuthResp = generated.sasl_authenticate_response.SaslAuthenticateResponse;
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+    broker.sasl_enabled = true;
+    broker.sasl_enabled_mechanisms = "PLAIN";
+    try broker.sasl_authenticator.addUser("alice", "secret");
+    _ = broker.ensureTopic("sasl-gated-topic");
+
+    const topics = [_]MetadataTopic{.{
+        .name = "sasl-gated-topic",
+    }};
+    const metadata_req = MetadataReq{
+        .topics = &topics,
+        .allow_auto_topic_creation = false,
+        .include_topic_authorized_operations = true,
+    };
+
+    var metadata_buf: [512]u8 = undefined;
+    var metadata_pos = buildTestRequest(&metadata_buf, 3, 12, 3610, header_mod.requestHeaderVersion(3, 12));
+    metadata_req.serialize(&metadata_buf, &metadata_pos, 12);
+
+    const denied_response = broker.handleRequest(metadata_buf[0..metadata_pos]);
+    try testing.expect(denied_response != null);
+    defer testing.allocator.free(denied_response.?);
+
+    var denied_rpos: usize = 0;
+    var denied_header = try ResponseHeader.deserialize(testing.allocator, denied_response.?, &denied_rpos, header_mod.responseHeaderVersion(3, 12));
+    defer denied_header.deinit(testing.allocator);
+    try testing.expectEqual(@as(i32, 3610), denied_header.correlation_id);
+
+    const denied_resp = try MetadataResp.deserialize(testing.allocator, denied_response.?, &denied_rpos, 12);
+    defer freeDeserializedMetadataResponse(&denied_resp);
+    try testing.expectEqual(denied_response.?.len, denied_rpos);
+    try testing.expectEqual(@as(usize, 1), denied_resp.topics.len);
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.cluster_authorization_failed)), denied_resp.topics[0].error_code);
+
+    const handshake_req = HandshakeReq{ .mechanism = "PLAIN" };
+    var handshake_buf: [256]u8 = undefined;
+    var handshake_pos = buildTestRequest(&handshake_buf, 17, 1, 3611, header_mod.requestHeaderVersion(17, 1));
+    handshake_req.serialize(&handshake_buf, &handshake_pos, 1);
+
+    const handshake_response = broker.handleRequest(handshake_buf[0..handshake_pos]);
+    try testing.expect(handshake_response != null);
+    defer testing.allocator.free(handshake_response.?);
+
+    var handshake_rpos: usize = 0;
+    var handshake_header = try ResponseHeader.deserialize(testing.allocator, handshake_response.?, &handshake_rpos, header_mod.responseHeaderVersion(17, 1));
+    defer handshake_header.deinit(testing.allocator);
+    try testing.expectEqual(@as(i32, 3611), handshake_header.correlation_id);
+
+    const handshake_resp = try HandshakeResp.deserialize(testing.allocator, handshake_response.?, &handshake_rpos, 1);
+    defer if (handshake_resp.mechanisms.len > 0) testing.allocator.free(handshake_resp.mechanisms);
+    try testing.expectEqual(handshake_response.?.len, handshake_rpos);
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.none)), handshake_resp.error_code);
+    try testing.expectEqualStrings("PLAIN", broker.sasl_mechanisms.get("test-client").?);
+
+    const auth_req = AuthReq{ .auth_bytes = "\x00alice\x00secret" };
+    var auth_buf: [256]u8 = undefined;
+    var auth_pos = buildTestRequest(&auth_buf, 36, 2, 3612, header_mod.requestHeaderVersion(36, 2));
+    auth_req.serialize(&auth_buf, &auth_pos, 2);
+
+    const auth_response = broker.handleRequest(auth_buf[0..auth_pos]);
+    try testing.expect(auth_response != null);
+    defer testing.allocator.free(auth_response.?);
+
+    var auth_rpos: usize = 0;
+    var auth_header = try ResponseHeader.deserialize(testing.allocator, auth_response.?, &auth_rpos, header_mod.responseHeaderVersion(36, 2));
+    defer auth_header.deinit(testing.allocator);
+    try testing.expectEqual(@as(i32, 3612), auth_header.correlation_id);
+
+    const auth_resp = try AuthResp.deserialize(testing.allocator, auth_response.?, &auth_rpos, 2);
+    try testing.expectEqual(auth_response.?.len, auth_rpos);
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.none)), auth_resp.error_code);
+    try testing.expectEqualStrings("User:alice", broker.authenticated_sessions.get("test-client").?);
+
+    const allowed_response = broker.handleRequest(metadata_buf[0..metadata_pos]);
+    try testing.expect(allowed_response != null);
+    defer testing.allocator.free(allowed_response.?);
+
+    var allowed_rpos: usize = 0;
+    var allowed_header = try ResponseHeader.deserialize(testing.allocator, allowed_response.?, &allowed_rpos, header_mod.responseHeaderVersion(3, 12));
+    defer allowed_header.deinit(testing.allocator);
+    try testing.expectEqual(@as(i32, 3610), allowed_header.correlation_id);
+
+    const allowed_resp = try MetadataResp.deserialize(testing.allocator, allowed_response.?, &allowed_rpos, 12);
+    defer freeDeserializedMetadataResponse(&allowed_resp);
+    try testing.expectEqual(allowed_response.?.len, allowed_rpos);
+    try testing.expectEqual(@as(usize, 1), allowed_resp.brokers.len);
+    try testing.expectEqual(@as(usize, 1), allowed_resp.topics.len);
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.none)), allowed_resp.topics[0].error_code);
 }
 
 test "Broker.handleRequest SaslAuthenticate rejects truncated request" {
