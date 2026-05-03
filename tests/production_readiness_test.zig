@@ -749,6 +749,70 @@ test "Observability dashboard and alerts reference exported metrics" {
     try testing.expect(alert_metric_refs >= alert_metrics.len);
 }
 
+test "AutoMQ parity release criteria document pins required gates" {
+    const alloc = testing.allocator;
+
+    const criteria_file = try fs.cwd().openFile("docs/RELEASE_CRITERIA.md", .{});
+    defer criteria_file.close();
+    const criteria = try criteria_file.readToEndAlloc(alloc, 128 * 1024);
+    defer alloc.free(criteria);
+
+    const required_sections = [_][]const u8{
+        "# AutoMQ Parity Release Criteria",
+        "## Required Gates",
+        "## Required Commands",
+        "## Known Unsupported Or Partial Surfaces",
+        "## Release Decision",
+    };
+    for (required_sections) |section| {
+        try testing.expect(std.mem.indexOf(u8, criteria, section) != null);
+    }
+
+    const required_gates = [_][]const u8{
+        "`Protocol`",
+        "`Durability`",
+        "`Stateless`",
+        "`MultiNode`",
+        "`Security`",
+        "`Observability`",
+        "`Performance`",
+        "`Chaos`",
+    };
+    for (required_gates) |gate| {
+        try testing.expect(std.mem.indexOf(u8, criteria, gate) != null);
+    }
+
+    const required_commands = [_][]const u8{
+        "zig build test --summary all",
+        "zig build test-chaos --summary all",
+        "zig build test-client-matrix --summary all",
+        "zig build test-minio --summary all",
+        "zig build test-s3-process-crash --summary all",
+        "zig build test-s3-provider-matrix --summary all",
+        "zig build test-kraft-failover --summary all",
+        "zig build bench --summary all",
+    };
+    for (required_commands) |command| {
+        try testing.expect(std.mem.indexOf(u8, criteria, command) != null);
+    }
+
+    const unsupported_surfaces = [_][]const u8{
+        "ConsumerGroupHeartbeat",
+        "Share-group APIs",
+        "AssignReplicasToDirs",
+        "Legacy inter-broker APIs",
+        "broker-only stateless replacement",
+        "cross-broker chaos",
+        "comparative Kafka/AutoMQ performance",
+    };
+    for (unsupported_surfaces) |surface| {
+        try testing.expect(std.mem.indexOf(u8, criteria, surface) != null);
+    }
+
+    try testing.expect(std.mem.indexOf(u8, criteria, "TBD") == null);
+    try testing.expect(std.mem.indexOf(u8, criteria, "TODO") == null);
+}
+
 // ---------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------

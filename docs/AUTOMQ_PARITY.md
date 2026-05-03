@@ -699,6 +699,11 @@ Status: completed for the initial catalog and DeleteGroups slice.
   MinIO/provider performance and comparative Kafka/AutoMQ trend gates.
 - Add release criteria: no known data-loss bug, no advertised stub API, passing
   client matrix, passing MinIO/S3 matrix, and documented unsupported features.
+  Status: `docs/RELEASE_CRITERIA.md` now pins required protocol, durability,
+  stateless, multi-node, security, observability, performance, and chaos gates,
+  lists the release commands, and documents currently unsupported/partial
+  surfaces. The default production-readiness suite verifies the document keeps
+  those gates and unsupported surfaces explicit.
 
 ## Rules For Future Changes
 
