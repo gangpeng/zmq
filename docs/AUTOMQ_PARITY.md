@@ -294,6 +294,9 @@ Status: completed for the initial catalog and DeleteGroups slice.
   partitions, leader endpoints, and tagged-fields section.
   DescribeQuorum now rejects trailing bytes after topic partitions and
   tagged-fields section.
+  A source-level audit now fails the default suite if broker request-frame
+  validators accept trailing bytes, with only the documented
+  BeginQuorumEpoch internal AppendEntries bridge exempted.
   MetadataRequest generated decoding now preserves nullable `Topics` semantics:
   v1+ null requests all topics, explicit empty arrays request no topic results,
   and v0 null topics are rejected as malformed.

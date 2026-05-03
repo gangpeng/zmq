@@ -532,6 +532,43 @@ fn handleRequestSwitchHasCase(body: []const u8, key: i16) bool {
     return false;
 }
 
+fn auditBrokerRequestFrameValidators(source: []const u8) !void {
+    var search_start: usize = 0;
+    var validator_count: usize = 0;
+    while (std.mem.indexOf(u8, source[search_start..], "fn validate")) |rel_fn_pos| {
+        const fn_pos = search_start + rel_fn_pos;
+        const paren_rel = std.mem.indexOfScalar(u8, source[fn_pos..], '(') orelse return error.MalformedValidator;
+        const paren = fn_pos + paren_rel;
+        const name = std.mem.trim(u8, source[fn_pos + "fn ".len .. paren], " \t");
+        if (!std.mem.endsWith(u8, name, "RequestFrame")) {
+            search_start = paren + 1;
+            continue;
+        }
+
+        const body_start_rel = std.mem.indexOfScalar(u8, source[paren..], '{') orelse return error.MalformedValidator;
+        const body_start = paren + body_start_rel;
+        const next_fn_rel = std.mem.indexOf(u8, source[body_start + 1 ..], "\n    fn ");
+        const body_end = if (next_fn_rel) |rel| body_start + 1 + rel else source.len;
+        const body = source[body_start..body_end];
+
+        if (std.mem.eql(u8, name, "validateBeginQuorumEpochRequestFrame")) {
+            try testing.expect(std.mem.indexOf(u8, body, "return true;") != null);
+            search_start = body_end;
+            continue;
+        }
+
+        validator_count += 1;
+        if (std.mem.indexOf(u8, body, "return pos == buf.len;") == null) {
+            std.debug.print("non-strict broker request-frame validator: {s}\n", .{name});
+            return error.NonStrictRequestFrameValidator;
+        }
+
+        search_start = body_end;
+    }
+
+    try testing.expect(validator_count > 0);
+}
+
 test "broker API support table is sorted and unique" {
     var previous: ?i16 = null;
     for (broker_supported_apis) |api| {
@@ -598,6 +635,12 @@ test "broker handler switch matches audited handler API table" {
         const key = switchCaseKey(line) orelse continue;
         try testing.expect(hasBrokerHandler(key));
     }
+}
+
+test "broker request-frame validators enforce strict EOF except internal append entries" {
+    const handler_source = @embedFile("../broker/handler.zig");
+    try auditBrokerRequestFrameValidators(handler_source);
+    try testing.expect(std.mem.indexOf(u8, handler_source, "BeginQuorumEpoch applies internal AutoMQ AppendEntries payload") != null);
 }
 
 test "controller handler switch matches audited handler API table" {
