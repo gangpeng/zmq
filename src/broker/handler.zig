@@ -10475,6 +10475,12 @@ pub const Broker = struct {
             if (topics.len > 0) self.allocator.free(topics);
         };
 
+        const owned_partitions_error = self.validateConsumerGroupHeartbeatOwnedPartitions(req.topic_partitions);
+        if (owned_partitions_error != ErrorCode.none) {
+            const resp = consumerGroupHeartbeatResponse(owned_partitions_error.toInt(), null, req.member_id, req.member_epoch, 0);
+            return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+        }
+
         const group_id = req.group_id orelse "";
         const member_id = req.member_id orelse "";
         const instance_id = nonEmptyStringOrNull(req.instance_id);
@@ -10736,6 +10742,27 @@ pub const Broker = struct {
             topics[index] = name;
         }
         return topics;
+    }
+
+    fn validateConsumerGroupHeartbeatOwnedPartitions(
+        self: *const Broker,
+        topic_partitions: ?[]const generated.consumer_group_heartbeat_request.ConsumerGroupHeartbeatRequest.TopicPartitions,
+    ) ErrorCode {
+        const topics = topic_partitions orelse return ErrorCode.none;
+        for (topics, 0..) |topic, topic_index| {
+            if (isZeroUuid(topic.topic_id)) return ErrorCode.unknown_topic_id;
+            const topic_name = self.findTopicNameById(topic.topic_id) orelse return ErrorCode.unknown_topic_id;
+            for (topics[0..topic_index]) |previous_topic| {
+                if (std.mem.eql(u8, &previous_topic.topic_id, &topic.topic_id)) return ErrorCode.invalid_request;
+            }
+            for (topic.partitions, 0..) |partition, partition_index| {
+                if (!self.topicPartitionExists(topic_name, partition)) return ErrorCode.unknown_topic_or_partition;
+                for (topic.partitions[0..partition_index]) |previous_partition| {
+                    if (previous_partition == partition) return ErrorCode.invalid_request;
+                }
+            }
+        }
+        return ErrorCode.none;
     }
 
     fn freeConsumerGroupHeartbeatRequest(self: *Broker, req: *generated.consumer_group_heartbeat_request.ConsumerGroupHeartbeatRequest) void {
@@ -12749,7 +12776,7 @@ pub const Broker = struct {
         return @intFromEnum(ErrorCode.none);
     }
 
-    fn topicPartitionExists(self: *Broker, topic: []const u8, partition_index: i32) bool {
+    fn topicPartitionExists(self: *const Broker, topic: []const u8, partition_index: i32) bool {
         if (topic.len == 0 or partition_index < 0) return false;
         const topic_info = self.topics.get(topic) orelse return false;
         return partition_index < topic_info.num_partitions;
@@ -37099,6 +37126,141 @@ test "Broker.handleRequest ConsumerGroupHeartbeat updates changed subscriptions"
     try testing.expectEqual(ErrorCode.fenced_member_epoch.toInt(), stale_resp.error_code);
     try testing.expectEqual(@as(i32, 1), stale_resp.member_epoch);
     try testing.expect(stale_resp.assignment == null);
+}
+
+test "Broker.handleRequest ConsumerGroupHeartbeat validates owned partitions" {
+    const Req = generated.consumer_group_heartbeat_request.ConsumerGroupHeartbeatRequest;
+    const Resp = generated.consumer_group_heartbeat_response.ConsumerGroupHeartbeatResponse;
+    const TopicPartitions = Req.TopicPartitions;
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+    broker.default_num_partitions = 2;
+    try testing.expect(broker.ensureTopic("owned-topic"));
+    const topic_id = broker.topics.get("owned-topic").?.topic_id;
+
+    const topic_names = [_]?[]const u8{"owned-topic"};
+    const join_req = Req{
+        .group_id = "kip848-owned-group",
+        .member_id = "owned-member",
+        .member_epoch = 0,
+        .rebalance_timeout_ms = 30_000,
+        .subscribed_topic_names = &topic_names,
+        .server_assignor = "range",
+    };
+
+    var join_buf: [256]u8 = undefined;
+    var join_pos = buildTestRequest(&join_buf, 68, 0, 6830, header_mod.requestHeaderVersion(68, 0));
+    join_req.serialize(&join_buf, &join_pos, 0);
+
+    const join_response = broker.handleRequest(join_buf[0..join_pos]);
+    try testing.expect(join_response != null);
+    defer testing.allocator.free(join_response.?);
+
+    var join_rpos: usize = 0;
+    var join_response_header = try ResponseHeader.deserialize(testing.allocator, join_response.?, &join_rpos, header_mod.responseHeaderVersion(68, 0));
+    defer join_response_header.deinit(testing.allocator);
+    try testing.expectEqual(@as(i32, 6830), join_response_header.correlation_id);
+
+    const join_resp = try Resp.deserialize(testing.allocator, join_response.?, &join_rpos, 0);
+    defer freeDeserializedConsumerGroupHeartbeatResponse(&join_resp);
+    try testing.expectEqual(join_response.?.len, join_rpos);
+    try testing.expectEqual(ErrorCode.none.toInt(), join_resp.error_code);
+
+    const valid_owned = [_]TopicPartitions{.{
+        .topic_id = topic_id,
+        .partitions = &[_]i32{ 0, 1 },
+    }};
+    const valid_req = Req{
+        .group_id = "kip848-owned-group",
+        .member_id = join_resp.member_id,
+        .member_epoch = join_resp.member_epoch,
+        .rebalance_timeout_ms = -1,
+        .topic_partitions = &valid_owned,
+    };
+
+    var valid_buf: [256]u8 = undefined;
+    var valid_pos = buildTestRequest(&valid_buf, 68, 0, 6831, header_mod.requestHeaderVersion(68, 0));
+    valid_req.serialize(&valid_buf, &valid_pos, 0);
+
+    const valid_response = broker.handleRequest(valid_buf[0..valid_pos]);
+    try testing.expect(valid_response != null);
+    defer testing.allocator.free(valid_response.?);
+
+    var valid_rpos: usize = 0;
+    var valid_response_header = try ResponseHeader.deserialize(testing.allocator, valid_response.?, &valid_rpos, header_mod.responseHeaderVersion(68, 0));
+    defer valid_response_header.deinit(testing.allocator);
+    try testing.expectEqual(@as(i32, 6831), valid_response_header.correlation_id);
+
+    const valid_resp = try Resp.deserialize(testing.allocator, valid_response.?, &valid_rpos, 0);
+    defer freeDeserializedConsumerGroupHeartbeatResponse(&valid_resp);
+    try testing.expectEqual(valid_response.?.len, valid_rpos);
+    try testing.expectEqual(ErrorCode.none.toInt(), valid_resp.error_code);
+    try testing.expect(valid_resp.assignment != null);
+
+    const unknown_owned = [_]TopicPartitions{.{
+        .topic_id = [_]u8{9} ** 16,
+        .partitions = &[_]i32{0},
+    }};
+    const unknown_req = Req{
+        .group_id = "kip848-owned-group",
+        .member_id = join_resp.member_id,
+        .member_epoch = join_resp.member_epoch,
+        .rebalance_timeout_ms = -1,
+        .topic_partitions = &unknown_owned,
+    };
+
+    var unknown_buf: [256]u8 = undefined;
+    var unknown_pos = buildTestRequest(&unknown_buf, 68, 0, 6832, header_mod.requestHeaderVersion(68, 0));
+    unknown_req.serialize(&unknown_buf, &unknown_pos, 0);
+
+    const unknown_response = broker.handleRequest(unknown_buf[0..unknown_pos]);
+    try testing.expect(unknown_response != null);
+    defer testing.allocator.free(unknown_response.?);
+
+    var unknown_rpos: usize = 0;
+    var unknown_response_header = try ResponseHeader.deserialize(testing.allocator, unknown_response.?, &unknown_rpos, header_mod.responseHeaderVersion(68, 0));
+    defer unknown_response_header.deinit(testing.allocator);
+    try testing.expectEqual(@as(i32, 6832), unknown_response_header.correlation_id);
+
+    const unknown_resp = try Resp.deserialize(testing.allocator, unknown_response.?, &unknown_rpos, 0);
+    defer freeDeserializedConsumerGroupHeartbeatResponse(&unknown_resp);
+    try testing.expectEqual(unknown_response.?.len, unknown_rpos);
+    try testing.expectEqual(ErrorCode.unknown_topic_id.toInt(), unknown_resp.error_code);
+    try testing.expectEqual(@as(i32, 0), unknown_resp.heartbeat_interval_ms);
+    try testing.expect(unknown_resp.assignment == null);
+
+    const bad_partition_owned = [_]TopicPartitions{.{
+        .topic_id = topic_id,
+        .partitions = &[_]i32{2},
+    }};
+    const bad_partition_req = Req{
+        .group_id = "kip848-owned-group",
+        .member_id = join_resp.member_id,
+        .member_epoch = join_resp.member_epoch,
+        .rebalance_timeout_ms = -1,
+        .topic_partitions = &bad_partition_owned,
+    };
+
+    var bad_partition_buf: [256]u8 = undefined;
+    var bad_partition_pos = buildTestRequest(&bad_partition_buf, 68, 0, 6833, header_mod.requestHeaderVersion(68, 0));
+    bad_partition_req.serialize(&bad_partition_buf, &bad_partition_pos, 0);
+
+    const bad_partition_response = broker.handleRequest(bad_partition_buf[0..bad_partition_pos]);
+    try testing.expect(bad_partition_response != null);
+    defer testing.allocator.free(bad_partition_response.?);
+
+    var bad_partition_rpos: usize = 0;
+    var bad_partition_response_header = try ResponseHeader.deserialize(testing.allocator, bad_partition_response.?, &bad_partition_rpos, header_mod.responseHeaderVersion(68, 0));
+    defer bad_partition_response_header.deinit(testing.allocator);
+    try testing.expectEqual(@as(i32, 6833), bad_partition_response_header.correlation_id);
+
+    const bad_partition_resp = try Resp.deserialize(testing.allocator, bad_partition_response.?, &bad_partition_rpos, 0);
+    defer freeDeserializedConsumerGroupHeartbeatResponse(&bad_partition_resp);
+    try testing.expectEqual(bad_partition_response.?.len, bad_partition_rpos);
+    try testing.expectEqual(ErrorCode.unknown_topic_or_partition.toInt(), bad_partition_resp.error_code);
+    try testing.expectEqual(@as(i32, 0), bad_partition_resp.heartbeat_interval_ms);
+    try testing.expect(bad_partition_resp.assignment == null);
 }
 
 test "Broker.handleRequest ConsumerGroupHeartbeat returns range assignments across members" {
