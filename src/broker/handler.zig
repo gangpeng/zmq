@@ -18943,7 +18943,7 @@ pub const Broker = struct {
             if (!skipKafkaString(buf, &pos, flexible)) return false; // group_instance_id
         }
         if (flexible) ser.skipTaggedFields(buf, &pos) catch return false;
-        return true;
+        return pos == buf.len;
     }
 
     fn validateLeaveGroupRequestFrame(buf: []const u8, start_pos: usize, api_version: i16) bool {
@@ -38909,6 +38909,26 @@ test "Broker.handleRequest Heartbeat rejects truncated request" {
     var buf: [128]u8 = undefined;
     const req_len = buildTestRequest(&buf, 12, 4, 1206, header_mod.requestHeaderVersion(12, 4));
     try testing.expect(broker.handleRequest(buf[0..req_len]) == null);
+}
+
+test "Broker.handleRequest Heartbeat rejects trailing bytes" {
+    const Req = generated.heartbeat_request.HeartbeatRequest;
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+
+    const req = Req{
+        .group_id = "hb-trailing-group",
+        .generation_id = 1,
+        .member_id = "hb-trailing-member",
+        .group_instance_id = null,
+    };
+
+    var buf: [512]u8 = undefined;
+    var pos = buildTestRequest(&buf, 12, 4, 1209, header_mod.requestHeaderVersion(12, 4));
+    req.serialize(&buf, &pos, 4);
+
+    try expectTrailingByteRejected(&broker, &buf, pos);
 }
 
 test "Broker.handleRequest Heartbeat v4 authorization denial uses generated response" {

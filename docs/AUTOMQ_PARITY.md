@@ -258,6 +258,8 @@ Status: completed for the initial catalog and DeleteGroups slice.
   tagged-fields section.
   DescribeGroups now rejects trailing bytes after the group list,
   authorization flag, and tagged-fields section.
+  Heartbeat now rejects trailing bytes after the final member/static-instance
+  fields and tagged-fields section.
   MetadataRequest generated decoding now preserves nullable `Topics` semantics:
   v1+ null requests all topics, explicit empty arrays request no topic results,
   and v0 null topics are rejected as malformed.
