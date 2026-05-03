@@ -12,6 +12,7 @@ Run against a running ZMQ broker:
 Optional environment:
     ZMQ_CLIENT_MATRIX_BOOTSTRAP   localhost:9092
     ZMQ_CLIENT_MATRIX_TOOLS       auto | kcat,kafka-cli,kafka-python,confluent-kafka,java-kafka,go-kafka
+    ZMQ_CLIENT_MATRIX_SEMANTICS   basic | admin | groups | transactions | all (comma-separated)
     ZMQ_CLIENT_MATRIX_PROFILES    Comma-separated profile names for explicit client/library version sets
     ZMQ_CLIENT_MATRIX_JAVA_CLASSPATH
                                   Classpath containing kafka-clients jars for java-kafka
@@ -31,6 +32,12 @@ Supported probes:
     confluent-kafka  AdminClient metadata plus producer/consumer and offset commit round trip
     java-kafka       Apache kafka-clients AdminClient plus producer/consumer and offset commit round trip
     go-kafka         segmentio kafka-go metadata plus writer/reader and offset commit round trip
+
+Semantic probes:
+    basic            metadata, produce/fetch, and offset commit where supported
+    admin            explicit topic/config admin through real clients
+    groups           consumer-group join/commit/list/describe where supported
+    transactions     transactional produce through clients that expose Kafka transactions
 """
 
 import importlib.util
@@ -45,15 +52,45 @@ import textwrap
 RUN_ENABLED = os.environ.get("ZMQ_RUN_CLIENT_MATRIX") == "1"
 BOOTSTRAP = os.environ.get("ZMQ_CLIENT_MATRIX_BOOTSTRAP", "localhost:9092")
 TOOLS = os.environ.get("ZMQ_CLIENT_MATRIX_TOOLS", "auto")
+SEMANTIC_ORDER = ["basic", "admin", "groups", "transactions"]
+TRANSACTION_TOOLS = {"confluent-kafka", "java-kafka"}
 JAVA_CLASSPATH = os.environ.get("ZMQ_CLIENT_MATRIX_JAVA_CLASSPATH")
 ENABLE_GO_AUTO = os.environ.get("ZMQ_CLIENT_MATRIX_ENABLE_GO") == "1"
 GO_MODULE = os.environ.get("ZMQ_CLIENT_MATRIX_GO_MODULE", "github.com/segmentio/kafka-go@latest")
 PYTHON = os.environ.get("ZMQ_CLIENT_MATRIX_PYTHON", sys.executable)
 ACTIVE_PROFILE = "default"
+SEMANTICS = None
 
 
 class MatrixError(Exception):
     pass
+
+
+def parse_semantics(raw):
+    raw = (raw or "basic").strip()
+    if raw in ("", "default", "basic"):
+        return {"basic"}
+    selected = set()
+    for item in raw.split(","):
+        name = item.strip().lower()
+        if not name:
+            continue
+        if name == "all":
+            selected.update(SEMANTIC_ORDER)
+            continue
+        if name not in SEMANTIC_ORDER:
+            raise MatrixError(f"unknown client matrix semantic probe: {name}")
+        selected.add(name)
+    selected.add("basic")
+    return selected
+
+
+def semantics_csv():
+    return ",".join(name for name in SEMANTIC_ORDER if name in SEMANTICS)
+
+
+def semantic_enabled(name):
+    return name in SEMANTICS
 
 
 def run(cmd, timeout=30, input_text=None, cwd=None, env=None):
@@ -122,11 +159,12 @@ def profile_setting(profile, suffix, fallback):
 
 
 def apply_profile(profile):
-    global ACTIVE_PROFILE, BOOTSTRAP, TOOLS, JAVA_CLASSPATH, ENABLE_GO_AUTO, GO_MODULE, PYTHON
+    global ACTIVE_PROFILE, BOOTSTRAP, TOOLS, SEMANTICS, JAVA_CLASSPATH, ENABLE_GO_AUTO, GO_MODULE, PYTHON
 
     ACTIVE_PROFILE = profile
     BOOTSTRAP = profile_setting(profile, "BOOTSTRAP", "localhost:9092")
     TOOLS = profile_setting(profile, "TOOLS", "auto")
+    SEMANTICS = parse_semantics(profile_setting(profile, "SEMANTICS", "basic"))
     JAVA_CLASSPATH = profile_setting(profile, "JAVA_CLASSPATH", None)
     ENABLE_GO_AUTO = profile_setting(profile, "ENABLE_GO", "0") == "1"
     GO_MODULE = profile_setting(profile, "GO_MODULE", "github.com/segmentio/kafka-go@latest")
@@ -151,6 +189,7 @@ def run_python_subtool(tool):
     env["ZMQ_RUN_CLIENT_MATRIX"] = "1"
     env["ZMQ_CLIENT_MATRIX_BOOTSTRAP"] = BOOTSTRAP
     env["ZMQ_CLIENT_MATRIX_TOOLS"] = tool
+    env["ZMQ_CLIENT_MATRIX_SEMANTICS"] = semantics_csv()
     env["ZMQ_CLIENT_MATRIX_ENABLE_GO"] = "0"
     env["ZMQ_CLIENT_MATRIX_PYTHON"] = PYTHON
     env.pop("ZMQ_CLIENT_MATRIX_PROFILES", None)
@@ -188,6 +227,14 @@ def selected_tools():
     return [tool.strip() for tool in TOOLS.split(",") if tool.strip()]
 
 
+def ensure_tool_supports_semantics(tool):
+    if semantic_enabled("transactions") and tool not in TRANSACTION_TOOLS:
+        raise MatrixError(
+            f"{tool} selected with transactions semantic, but only "
+            f"{', '.join(sorted(TRANSACTION_TOOLS))} have transaction probes"
+        )
+
+
 def test_kcat():
     if not have("kcat"):
         raise MatrixError("kcat selected but not found in PATH")
@@ -200,7 +247,29 @@ def test_kcat():
     run(["kcat", "-P", "-b", BOOTSTRAP, "-t", topic], input_text=payload + "\n", timeout=45)
     fetched = run(["kcat", "-C", "-b", BOOTSTRAP, "-t", topic, "-o", "beginning", "-c", "1", "-e"], timeout=45)
     require_output_contains(fetched, payload, "kcat")
-    print("ok: kcat metadata and produce/fetch probes")
+
+    if semantic_enabled("groups"):
+        group = f"zmq-client-matrix-kcat-{os.getpid()}"
+        group_fetched = run(
+            [
+                "kcat",
+                "-C",
+                "-b",
+                BOOTSTRAP,
+                "-G",
+                group,
+                topic,
+                "-X",
+                "auto.offset.reset=earliest",
+                "-c",
+                "1",
+                "-e",
+            ],
+            timeout=45,
+        )
+        require_output_contains(group_fetched, payload, "kcat group")
+
+    print(f"ok: kcat probes ({semantics_csv()})")
 
 
 def test_kafka_cli():
@@ -212,6 +281,10 @@ def test_kafka_cli():
         raise MatrixError("kafka-console-producer.sh selected but not found in PATH")
     if not have("kafka-console-consumer.sh"):
         raise MatrixError("kafka-console-consumer.sh selected but not found in PATH")
+    if semantic_enabled("admin") and not have("kafka-configs.sh"):
+        raise MatrixError("kafka-cli admin semantics selected but kafka-configs.sh is not in PATH")
+    if semantic_enabled("groups") and not have("kafka-consumer-groups.sh"):
+        raise MatrixError("kafka-cli group semantics selected but kafka-consumer-groups.sh is not in PATH")
 
     api_out = run(["kafka-broker-api-versions.sh", "--bootstrap-server", BOOTSTRAP], timeout=45)
     if "Produce" not in api_out and "ApiVersions" not in api_out:
@@ -241,28 +314,69 @@ def test_kafka_cli():
     if topic not in describe_out:
         raise MatrixError(f"kafka-topics describe output did not include {topic!r}\n{describe_out}")
 
+    if semantic_enabled("admin"):
+        run(
+            [
+                "kafka-configs.sh",
+                "--bootstrap-server",
+                BOOTSTRAP,
+                "--entity-type",
+                "topics",
+                "--entity-name",
+                topic,
+                "--alter",
+                "--add-config",
+                "max.message.bytes=1048576",
+            ],
+            timeout=45,
+        )
+        config_out = run(
+            [
+                "kafka-configs.sh",
+                "--bootstrap-server",
+                BOOTSTRAP,
+                "--entity-type",
+                "topics",
+                "--entity-name",
+                topic,
+                "--describe",
+            ],
+            timeout=45,
+        )
+        if "max.message.bytes" not in config_out:
+            raise MatrixError(f"kafka-configs describe did not include altered topic config\n{config_out}")
+
     run(
         ["kafka-console-producer.sh", "--bootstrap-server", BOOTSTRAP, "--topic", topic],
         input_text=payload + "\n",
         timeout=45,
     )
+    group = f"zmq-client-matrix-kafka-cli-{os.getpid()}"
+    consumer_cmd = [
+        "kafka-console-consumer.sh",
+        "--bootstrap-server",
+        BOOTSTRAP,
+        "--topic",
+        topic,
+        "--from-beginning",
+        "--max-messages",
+        "1",
+        "--timeout-ms",
+        "10000",
+    ]
+    if semantic_enabled("groups"):
+        consumer_cmd += ["--group", group]
     fetched = run(
-        [
-            "kafka-console-consumer.sh",
-            "--bootstrap-server",
-            BOOTSTRAP,
-            "--topic",
-            topic,
-            "--from-beginning",
-            "--max-messages",
-            "1",
-            "--timeout-ms",
-            "10000",
-        ],
+        consumer_cmd,
         timeout=45,
     )
     require_output_contains(fetched, payload, "kafka-cli")
-    print("ok: kafka CLI API/topic admin and produce/fetch probes")
+    if semantic_enabled("groups"):
+        groups_out = run(["kafka-consumer-groups.sh", "--bootstrap-server", BOOTSTRAP, "--list"], timeout=45)
+        if group not in groups_out:
+            raise MatrixError(f"kafka-consumer-groups --list did not include {group!r}\n{groups_out}")
+        run(["kafka-consumer-groups.sh", "--bootstrap-server", BOOTSTRAP, "--describe", "--group", group], timeout=45)
+    print(f"ok: kafka CLI probes ({semantics_csv()})")
 
 
 def test_kafka_python():
@@ -273,8 +387,12 @@ def test_kafka_python():
         raise MatrixError("kafka-python selected but import 'kafka' is not available")
 
     from kafka import KafkaAdminClient, KafkaConsumer, KafkaProducer, TopicPartition
+    from kafka.admin import NewTopic
+    from kafka.errors import TopicAlreadyExistsError
     from kafka.structs import OffsetAndMetadata
 
+    topic = matrix_topic("kafka-python")
+    payload = matrix_payload("kafka-python").encode()
     admin = KafkaAdminClient(
         bootstrap_servers=BOOTSTRAP,
         client_id="zmq-client-matrix-kafka-python",
@@ -285,11 +403,20 @@ def test_kafka_python():
         topics = admin.list_topics()
         if topics is None:
             raise MatrixError("kafka-python list_topics returned None")
+        if semantic_enabled("admin"):
+            try:
+                admin.create_topics(
+                    [NewTopic(topic, num_partitions=2, replication_factor=1)],
+                    timeout_ms=10000,
+                )
+            except TopicAlreadyExistsError:
+                pass
+            except Exception as exc:
+                if "TOPIC_ALREADY_EXISTS" not in str(exc) and "TopicAlreadyExists" not in str(exc):
+                    raise
     finally:
         admin.close()
 
-    topic = matrix_topic("kafka-python")
-    payload = matrix_payload("kafka-python").encode()
     producer = KafkaProducer(
         bootstrap_servers=BOOTSTRAP,
         client_id="zmq-client-matrix-kafka-python-producer",
@@ -324,7 +451,7 @@ def test_kafka_python():
                     raise MatrixError(
                         f"kafka-python committed offset mismatch: expected={expected_offset} got={committed}"
                     )
-                print("ok: kafka-python metadata, produce/fetch, and offset commit probes")
+                print(f"ok: kafka-python probes ({semantics_csv()})")
                 return
         raise MatrixError("kafka-python consumer did not fetch produced payload")
     finally:
@@ -339,19 +466,28 @@ def test_confluent_kafka():
         raise MatrixError("confluent-kafka selected but import 'confluent_kafka' is not available")
 
     from confluent_kafka import Consumer, Producer, TopicPartition
-    from confluent_kafka.admin import AdminClient
+    from confluent_kafka.admin import AdminClient, NewTopic
+    from confluent_kafka import KafkaException
 
     admin = AdminClient({
         "bootstrap.servers": BOOTSTRAP,
         "client.id": "zmq-client-matrix-confluent-kafka",
         "socket.timeout.ms": 10000,
     })
+    topic = matrix_topic("confluent-kafka")
+    payload = matrix_payload("confluent-kafka").encode()
     metadata = admin.list_topics(timeout=10)
     if not metadata.brokers:
         raise MatrixError("confluent-kafka metadata response did not include brokers")
+    if semantic_enabled("admin"):
+        futures = admin.create_topics([NewTopic(topic, num_partitions=2, replication_factor=1)])
+        for future in futures.values():
+            try:
+                future.result(timeout=10)
+            except KafkaException as exc:
+                if "TOPIC_ALREADY_EXISTS" not in str(exc):
+                    raise
 
-    topic = matrix_topic("confluent-kafka")
-    payload = matrix_payload("confluent-kafka").encode()
     producer = Producer({
         "bootstrap.servers": BOOTSTRAP,
         "client.id": "zmq-client-matrix-confluent-producer",
@@ -388,11 +524,33 @@ def test_confluent_kafka():
                     raise MatrixError(
                         f"confluent-kafka committed offset mismatch: expected>={expected_offset} got={committed}"
                     )
-                print("ok: confluent-kafka metadata, produce/fetch, and offset commit probes")
+                if semantic_enabled("transactions"):
+                    test_confluent_transaction(topic)
+                print(f"ok: confluent-kafka probes ({semantics_csv()})")
                 return
         raise MatrixError("confluent-kafka consumer did not fetch produced payload")
     finally:
         consumer.close()
+
+
+def test_confluent_transaction(topic):
+    from confluent_kafka import Producer
+
+    payload = f"{matrix_payload('confluent-kafka-txn')}-txn".encode()
+    producer = Producer({
+        "bootstrap.servers": BOOTSTRAP,
+        "client.id": "zmq-client-matrix-confluent-transactional-producer",
+        "transactional.id": f"zmq-client-matrix-confluent-txn-{os.getpid()}",
+        "socket.timeout.ms": 10000,
+        "message.timeout.ms": 10000,
+    })
+    producer.init_transactions(15)
+    producer.begin_transaction()
+    producer.produce(topic, payload)
+    if producer.flush(10) != 0:
+        producer.abort_transaction(10)
+        raise MatrixError("confluent-kafka transactional producer did not flush")
+    producer.commit_transaction(15)
 
 
 JAVA_MATRIX_SOURCE = r"""
@@ -402,6 +560,7 @@ import java.util.Properties;
 import java.util.Set;
 import java.util.concurrent.TimeUnit;
 import org.apache.kafka.clients.admin.AdminClient;
+import org.apache.kafka.clients.admin.NewTopic;
 import org.apache.kafka.clients.consumer.ConsumerRecord;
 import org.apache.kafka.clients.consumer.ConsumerRecords;
 import org.apache.kafka.clients.consumer.KafkaConsumer;
@@ -418,6 +577,7 @@ public class ZmqKafkaClientMatrix {
         String topic = args[1];
         String payload = args[2];
         String group = args[3];
+        String semantics = args[4];
 
         Properties adminProps = new Properties();
         adminProps.put("bootstrap.servers", bootstrap);
@@ -427,6 +587,15 @@ public class ZmqKafkaClientMatrix {
             Set<String> topics = admin.listTopics().names().get(10, TimeUnit.SECONDS);
             if (topics == null) {
                 throw new RuntimeException("AdminClient listTopics returned null");
+            }
+            if (semantics.contains("admin")) {
+                try {
+                    admin.createTopics(Collections.singleton(new NewTopic(topic, 2, (short) 1))).all().get(10, TimeUnit.SECONDS);
+                } catch (Exception e) {
+                    if (!e.toString().contains("TopicExistsException") && !e.toString().contains("TOPIC_ALREADY_EXISTS")) {
+                        throw e;
+                    }
+                }
             }
         }
 
@@ -468,11 +637,31 @@ public class ZmqKafkaClientMatrix {
                         if (committed == null || committed.offset() < expectedOffset) {
                             throw new RuntimeException("Java committed offset mismatch");
                         }
+                        if (semantics.contains("transactions")) {
+                            runTransaction(bootstrap, topic, payload + "-txn");
+                        }
                         return;
                     }
                 }
             }
             throw new RuntimeException("Java consumer did not fetch produced payload");
+        }
+    }
+
+    private static void runTransaction(String bootstrap, String topic, String payload) throws Exception {
+        Properties producerProps = new Properties();
+        producerProps.put("bootstrap.servers", bootstrap);
+        producerProps.put("client.id", "zmq-client-matrix-java-transactional-producer");
+        producerProps.put("transactional.id", "zmq-client-matrix-java-txn-" + System.currentTimeMillis());
+        producerProps.put("key.serializer", StringSerializer.class.getName());
+        producerProps.put("value.serializer", StringSerializer.class.getName());
+        producerProps.put("request.timeout.ms", "10000");
+        producerProps.put("delivery.timeout.ms", "15000");
+        try (KafkaProducer<String, String> producer = new KafkaProducer<>(producerProps)) {
+            producer.initTransactions();
+            producer.beginTransaction();
+            producer.send(new ProducerRecord<>(topic, payload)).get(10, TimeUnit.SECONDS);
+            producer.commitTransaction();
         }
     }
 }
@@ -496,10 +685,20 @@ def test_java_kafka():
 
         run(["javac", "-cp", JAVA_CLASSPATH, source_path], timeout=60)
         run(
-            ["java", "-cp", f"{tmp}:{JAVA_CLASSPATH}", "ZmqKafkaClientMatrix", BOOTSTRAP, topic, payload, group],
+            [
+                "java",
+                "-cp",
+                f"{tmp}:{JAVA_CLASSPATH}",
+                "ZmqKafkaClientMatrix",
+                BOOTSTRAP,
+                topic,
+                payload,
+                group,
+                semantics_csv(),
+            ],
             timeout=90,
         )
-    print("ok: java-kafka metadata, produce/fetch, and offset commit probes")
+    print(f"ok: java-kafka probes ({semantics_csv()})")
 
 
 GO_MATRIX_SOURCE = r"""
@@ -509,30 +708,43 @@ import (
     "context"
     "fmt"
     "os"
+    "strings"
     "time"
 
     "github.com/segmentio/kafka-go"
 )
 
 func main() {
-    if len(os.Args) != 5 {
-        panic("usage: go-matrix <bootstrap> <topic> <payload> <group>")
+    if len(os.Args) != 6 {
+        panic("usage: go-matrix <bootstrap> <topic> <payload> <group> <semantics>")
     }
     bootstrap := os.Args[1]
     topic := os.Args[2]
     payload := os.Args[3]
     group := os.Args[4]
+    semantics := os.Args[5]
 
     conn, err := kafka.Dial("tcp", bootstrap)
     if err != nil {
         panic(err)
     }
     partitions, err := conn.ReadPartitions()
-    _ = conn.Close()
     if err != nil {
+        _ = conn.Close()
         panic(err)
     }
     _ = partitions
+    if strings.Contains(semantics, "admin") {
+        if err := conn.CreateTopics(kafka.TopicConfig{
+            Topic:             topic,
+            NumPartitions:     2,
+            ReplicationFactor: 1,
+        }); err != nil && !strings.Contains(strings.ToLower(err.Error()), "exist") {
+            _ = conn.Close()
+            panic(err)
+        }
+    }
+    _ = conn.Close()
 
     writer := &kafka.Writer{
         Addr:         kafka.TCP(bootstrap),
@@ -597,8 +809,8 @@ def test_go_kafka():
 
         run(["go", "mod", "init", "zmq-client-matrix-go"], timeout=30, cwd=tmp)
         run(["go", "get", GO_MODULE], timeout=120, cwd=tmp)
-        run(["go", "run", ".", BOOTSTRAP, topic, payload, group], timeout=120, cwd=tmp)
-    print("ok: go-kafka metadata, produce/fetch, and offset commit probes")
+        run(["go", "run", ".", BOOTSTRAP, topic, payload, group, semantics_csv()], timeout=120, cwd=tmp)
+    print(f"ok: go-kafka probes ({semantics_csv()})")
 
 
 def main():
@@ -624,6 +836,7 @@ def run_profile():
         )
 
     for tool in tools:
+        ensure_tool_supports_semantics(tool)
         if tool == "kcat":
             test_kcat()
         elif tool == "kafka-cli":
@@ -648,8 +861,10 @@ def self_test():
         os.environ["ZMQ_CLIENT_MATRIX_PROFILES"] = "apache_3_7, go_1_21"
         os.environ["ZMQ_CLIENT_MATRIX_APACHE_3_7_TOOLS"] = "java-kafka"
         os.environ["ZMQ_CLIENT_MATRIX_APACHE_3_7_JAVA_CLASSPATH"] = "/opt/kafka-3.7/libs/*"
+        os.environ["ZMQ_CLIENT_MATRIX_APACHE_3_7_SEMANTICS"] = "admin,transactions"
         os.environ["ZMQ_CLIENT_MATRIX_GO_1_21_TOOLS"] = "go-kafka"
         os.environ["ZMQ_CLIENT_MATRIX_GO_1_21_GO_MODULE"] = "github.com/segmentio/kafka-go@v0.4.47"
+        os.environ["ZMQ_CLIENT_MATRIX_GO_1_21_SEMANTICS"] = "admin,groups"
 
         names = profile_names()
         if names != ["apache_3_7", "go_1_21"]:
@@ -658,10 +873,23 @@ def self_test():
         apply_profile("apache_3_7")
         if TOOLS != "java-kafka" or JAVA_CLASSPATH != "/opt/kafka-3.7/libs/*":
             raise MatrixError("java profile override failed")
+        if semantics_csv() != "basic,admin,transactions":
+            raise MatrixError(f"java semantics override failed: {semantics_csv()}")
 
         apply_profile("go_1_21")
         if TOOLS != "go-kafka" or GO_MODULE != "github.com/segmentio/kafka-go@v0.4.47":
             raise MatrixError("go profile override failed")
+        if semantics_csv() != "basic,admin,groups":
+            raise MatrixError(f"go semantics override failed: {semantics_csv()}")
+
+        if parse_semantics("all") != set(SEMANTIC_ORDER):
+            raise MatrixError("semantic all parsing failed")
+        try:
+            parse_semantics("basic,unknown")
+            raise MatrixError("unknown semantic probe was accepted")
+        except MatrixError as exc:
+            if "unknown client matrix semantic probe" not in str(exc):
+                raise
 
         print("ok: client matrix profile self-test")
         return 0
