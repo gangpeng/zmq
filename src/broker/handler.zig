@@ -8411,6 +8411,7 @@ pub const Broker = struct {
         var is_duplicate = false;
         var crc_valid = true;
         var transaction_error_code: i16 = @intFromEnum(ErrorCode.none);
+        var sequence_error_code: i16 = @intFromEnum(ErrorCode.none);
         const PendingProducerSequenceUpdate = struct {
             key: ProducerKey,
             state: ProducerSequenceState,
@@ -8441,18 +8442,22 @@ pub const Broker = struct {
                         };
                         if (self.producer_sequences.get(pk)) |stored| {
                             if (hdr.producer_epoch < stored.producer_epoch) {
-                                // Stale epoch — producer was fenced
-                                is_duplicate = true; // Reject stale-epoch records
+                                sequence_error_code = @intFromEnum(ErrorCode.invalid_producer_epoch);
                             } else if (hdr.producer_epoch > stored.producer_epoch) {
                                 // New epoch — accept (producer restarted)
                             } else {
                                 // Same epoch — check sequence
                                 if (hdr.base_sequence <= stored.last_sequence) {
                                     is_duplicate = true;
+                                } else {
+                                    const expected_next_sequence = @as(i64, stored.last_sequence) + 1;
+                                    if (@as(i64, hdr.base_sequence) != expected_next_sequence) {
+                                        sequence_error_code = @intFromEnum(ErrorCode.out_of_order_sequence_number);
+                                    }
                                 }
                             }
                         }
-                        if (!is_duplicate and crc_valid) {
+                        if (!is_duplicate and crc_valid and sequence_error_code == @intFromEnum(ErrorCode.none)) {
                             pending_producer_sequence = .{
                                 .key = pk,
                                 .state = .{
@@ -8495,7 +8500,7 @@ pub const Broker = struct {
         // Actually produce (skip if duplicate or CRC invalid)
         var was_wal_fenced = false;
         var was_storage_error = false;
-        const produce_result = if (is_duplicate or !crc_valid or transaction_error_code != @intFromEnum(ErrorCode.none))
+        const produce_result = if (is_duplicate or !crc_valid or transaction_error_code != @intFromEnum(ErrorCode.none) or sequence_error_code != @intFromEnum(ErrorCode.none))
             null
         else if (partition_req.records) |rec|
             self.store.produce(topic_name, partition_req.index, rec) catch |err| blk: {
@@ -8528,6 +8533,8 @@ pub const Broker = struct {
             @intFromEnum(ErrorCode.none) // idempotent success
         else if (!crc_valid)
             @intFromEnum(ErrorCode.corrupt_message)
+        else if (sequence_error_code != @intFromEnum(ErrorCode.none))
+            sequence_error_code
         else if (produce_result != null)
             @intFromEnum(ErrorCode.none)
         else if (was_wal_fenced)
@@ -22734,6 +22741,153 @@ test "Broker.handleRequest Produce does not advance idempotent sequence on S3 WA
     try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.kafka_storage_error)), resp.responses[0].partition_responses[0].error_code);
     try testing.expectEqual(@as(u32, 0), broker.producer_sequences.count());
     try testing.expect(!broker.producer_sequences_dirty);
+}
+
+test "Broker.handleRequest Produce rejects idempotent sequence gaps and stale epochs" {
+    const rec_batch = protocol.record_batch;
+    const topic_name = "produce-sequence-validation-topic";
+    const producer_id: i64 = 63010;
+    const producer_epoch: i16 = 3;
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+    try testing.expect(broker.ensureTopic(topic_name));
+
+    const Result = struct {
+        error_code: i16,
+        base_offset: i64,
+    };
+    const Helper = struct {
+        fn sendProduce(broker_ptr: *Broker, topic: []const u8, batch: []const u8, correlation_id: i32) !Result {
+            const Req = generated.produce_request.ProduceRequest;
+            const Topic = Req.TopicProduceData;
+            const Partition = Topic.PartitionProduceData;
+            const Resp = generated.produce_response.ProduceResponse;
+
+            const partitions = [_]Partition{.{
+                .index = 0,
+                .records = batch,
+            }};
+            const topics = [_]Topic{.{
+                .name = topic,
+                .partition_data = &partitions,
+            }};
+            const req = Req{
+                .transactional_id = null,
+                .acks = 1,
+                .timeout_ms = 30000,
+                .topic_data = &topics,
+            };
+
+            var buf: [4096]u8 = undefined;
+            var pos = buildTestRequest(&buf, 0, 9, correlation_id, header_mod.requestHeaderVersion(0, 9));
+            req.serialize(&buf, &pos, 9);
+
+            const response = broker_ptr.handleRequest(buf[0..pos]);
+            try testing.expect(response != null);
+            defer testing.allocator.free(response.?);
+
+            var rpos: usize = 0;
+            var response_header = try ResponseHeader.deserialize(testing.allocator, response.?, &rpos, header_mod.responseHeaderVersion(0, 9));
+            defer response_header.deinit(testing.allocator);
+            try testing.expectEqual(correlation_id, response_header.correlation_id);
+
+            const resp = try Resp.deserialize(testing.allocator, response.?, &rpos, 9);
+            defer freeDeserializedProduceResponse(&resp);
+            try testing.expectEqual(response.?.len, rpos);
+            try testing.expectEqual(@as(usize, 1), resp.responses.len);
+            try testing.expectEqualStrings(topic, resp.responses[0].name.?);
+            try testing.expectEqual(@as(usize, 1), resp.responses[0].partition_responses.len);
+            try testing.expectEqual(@as(i32, 0), resp.responses[0].partition_responses[0].index);
+
+            return .{
+                .error_code = resp.responses[0].partition_responses[0].error_code,
+                .base_offset = resp.responses[0].partition_responses[0].base_offset,
+            };
+        }
+    };
+
+    const key = Broker.ProducerKey{
+        .producer_id = producer_id,
+        .partition_key = PartitionStore.hashPartitionKey(topic_name, 0),
+    };
+
+    const first_records = [_]rec_batch.Record{.{ .offset_delta = 0, .value = "seq-first" }};
+    const first_batch = try rec_batch.buildRecordBatch(
+        testing.allocator,
+        0,
+        &first_records,
+        producer_id,
+        producer_epoch,
+        0,
+        12345,
+        12345,
+        0,
+    );
+    defer testing.allocator.free(first_batch);
+    const first = try Helper.sendProduce(&broker, topic_name, first_batch, 314);
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.none)), first.error_code);
+    try testing.expectEqual(@as(i64, 0), first.base_offset);
+    try testing.expectEqual(@as(u64, 1), broker.partitionState(topic_name, 0).?.next_offset);
+    try testing.expectEqual(@as(i32, 0), broker.producer_sequences.get(key).?.last_sequence);
+
+    const gap_records = [_]rec_batch.Record{.{ .offset_delta = 0, .value = "seq-gap" }};
+    const gap_batch = try rec_batch.buildRecordBatch(
+        testing.allocator,
+        0,
+        &gap_records,
+        producer_id,
+        producer_epoch,
+        2,
+        12346,
+        12346,
+        0,
+    );
+    defer testing.allocator.free(gap_batch);
+    const gap = try Helper.sendProduce(&broker, topic_name, gap_batch, 315);
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.out_of_order_sequence_number)), gap.error_code);
+    try testing.expectEqual(@as(i64, -1), gap.base_offset);
+    try testing.expectEqual(@as(u64, 1), broker.partitionState(topic_name, 0).?.next_offset);
+    try testing.expectEqual(@as(i32, 0), broker.producer_sequences.get(key).?.last_sequence);
+
+    const stale_records = [_]rec_batch.Record{.{ .offset_delta = 0, .value = "seq-stale" }};
+    const stale_batch = try rec_batch.buildRecordBatch(
+        testing.allocator,
+        0,
+        &stale_records,
+        producer_id,
+        producer_epoch - 1,
+        1,
+        12347,
+        12347,
+        0,
+    );
+    defer testing.allocator.free(stale_batch);
+    const stale = try Helper.sendProduce(&broker, topic_name, stale_batch, 316);
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.invalid_producer_epoch)), stale.error_code);
+    try testing.expectEqual(@as(i64, -1), stale.base_offset);
+    try testing.expectEqual(@as(u64, 1), broker.partitionState(topic_name, 0).?.next_offset);
+    try testing.expectEqual(producer_epoch, broker.producer_sequences.get(key).?.producer_epoch);
+    try testing.expectEqual(@as(i32, 0), broker.producer_sequences.get(key).?.last_sequence);
+
+    const next_records = [_]rec_batch.Record{.{ .offset_delta = 0, .value = "seq-next" }};
+    const next_batch = try rec_batch.buildRecordBatch(
+        testing.allocator,
+        0,
+        &next_records,
+        producer_id,
+        producer_epoch,
+        1,
+        12348,
+        12348,
+        0,
+    );
+    defer testing.allocator.free(next_batch);
+    const next = try Helper.sendProduce(&broker, topic_name, next_batch, 317);
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.none)), next.error_code);
+    try testing.expectEqual(@as(i64, 1), next.base_offset);
+    try testing.expectEqual(@as(u64, 2), broker.partitionState(topic_name, 0).?.next_offset);
+    try testing.expectEqual(@as(i32, 1), broker.producer_sequences.get(key).?.last_sequence);
 }
 
 test "Broker rebuilds idempotent producer sequence state from S3 WAL" {
