@@ -10589,7 +10589,7 @@ pub const Broker = struct {
                 };
             }
 
-            const resp = consumerGroupHeartbeatResponse(error_code, null, req.member_id, -1, consumer_group_heartbeat_interval_ms);
+            const resp = consumerGroupHeartbeatResponse(error_code, null, req.member_id, -1, 0);
             return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
         }
 
@@ -37129,8 +37129,39 @@ test "Broker.handleRequest ConsumerGroupHeartbeat joins heartbeats and leaves gr
     try testing.expectEqual(ErrorCode.none.toInt(), leave_resp.error_code);
     try testing.expectEqualStrings("kip848-member", leave_resp.member_id.?);
     try testing.expectEqual(@as(i32, -1), leave_resp.member_epoch);
+    try testing.expectEqual(@as(i32, 0), leave_resp.heartbeat_interval_ms);
+    try testing.expect(leave_resp.assignment == null);
     try testing.expectEqual(@as(usize, 0), group.members.count());
     try testing.expectEqual(ConsumerGroup.GroupState.empty, group.state);
+
+    const missing_leave_req = Req{
+        .group_id = "kip848-group",
+        .member_id = "missing-kip848-member",
+        .member_epoch = -1,
+        .rebalance_timeout_ms = -1,
+    };
+
+    var missing_leave_buf: [256]u8 = undefined;
+    var missing_leave_pos = buildTestRequest(&missing_leave_buf, 68, 0, 6806, header_mod.requestHeaderVersion(68, 0));
+    missing_leave_req.serialize(&missing_leave_buf, &missing_leave_pos, 0);
+
+    const missing_leave_response = broker.handleRequest(missing_leave_buf[0..missing_leave_pos]);
+    try testing.expect(missing_leave_response != null);
+    defer testing.allocator.free(missing_leave_response.?);
+
+    var missing_leave_rpos: usize = 0;
+    var missing_leave_response_header = try ResponseHeader.deserialize(testing.allocator, missing_leave_response.?, &missing_leave_rpos, header_mod.responseHeaderVersion(68, 0));
+    defer missing_leave_response_header.deinit(testing.allocator);
+    try testing.expectEqual(@as(i32, 6806), missing_leave_response_header.correlation_id);
+
+    const missing_leave_resp = try Resp.deserialize(testing.allocator, missing_leave_response.?, &missing_leave_rpos, 0);
+    defer freeDeserializedConsumerGroupHeartbeatResponse(&missing_leave_resp);
+    try testing.expectEqual(missing_leave_response.?.len, missing_leave_rpos);
+    try testing.expectEqual(ErrorCode.unknown_member_id.toInt(), missing_leave_resp.error_code);
+    try testing.expectEqualStrings("missing-kip848-member", missing_leave_resp.member_id.?);
+    try testing.expectEqual(@as(i32, -1), missing_leave_resp.member_epoch);
+    try testing.expectEqual(@as(i32, 0), missing_leave_resp.heartbeat_interval_ms);
+    try testing.expect(missing_leave_resp.assignment == null);
 }
 
 test "Broker.handleRequest ConsumerGroupHeartbeat updates changed subscriptions" {
