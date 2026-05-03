@@ -742,6 +742,24 @@ pub const S3Client = struct {
     }
 
     fn sendRequest(self: *S3Client, method: []const u8, path: []const u8, query: []const u8, body: ?[]const u8, range_header: ?[]const u8, max_response_size: usize) !HttpResponse {
+        if (self.test_http_request) |hook| {
+            const ctx = self.test_http_ctx orelse return error.MissingTestHttpContext;
+            const hook_buf_len = @min(max_response_size, 64 * 1024);
+            const hook_buf = try self.allocator.alloc(u8, hook_buf_len);
+            defer self.allocator.free(hook_buf);
+            @memset(hook_buf, 0);
+            const status = try hook(ctx, method, path, query, body, range_header, hook_buf);
+            const response_len = detectHttpResponseLength(hook_buf);
+            const data = try self.allocator.dupe(u8, hook_buf[0..response_len]);
+            errdefer self.allocator.free(data);
+            const header_end = std.mem.indexOf(u8, data, "\r\n\r\n") orelse return error.S3RequestFailed;
+            return .{
+                .data = data,
+                .status = status,
+                .header_end = header_end,
+            };
+        }
+
         const MAX_RETRIES: u32 = 3;
         var attempt: u32 = 0;
         while (true) {
@@ -1146,7 +1164,10 @@ pub const S3Storage = struct {
                 self.allocator.free(page.keys);
                 page.keys = &.{};
 
-                const next_token = page.next_continuation_token orelse break;
+                const next_token = page.next_continuation_token orelse {
+                    if (page.is_truncated) return error.S3ListMissingContinuationToken;
+                    break;
+                };
                 page.next_continuation_token = null;
                 if (continuation_token) |old| self.allocator.free(old);
                 continuation_token = next_token;
@@ -1177,12 +1198,13 @@ pub const S3Storage = struct {
 const ListObjectPage = struct {
     keys: [][]u8,
     next_continuation_token: ?[]u8,
+    is_truncated: bool = false,
 
     fn deinit(self: *ListObjectPage, alloc: Allocator) void {
         for (self.keys) |key| alloc.free(key);
         if (self.keys.len > 0) alloc.free(self.keys);
         if (self.next_continuation_token) |token| alloc.free(token);
-        self.* = .{ .keys = &.{}, .next_continuation_token = null };
+        self.* = .{ .keys = &.{}, .next_continuation_token = null, .is_truncated = false };
     }
 };
 
@@ -1220,10 +1242,12 @@ fn parseListObjectPage(alloc: Allocator, xml: []const u8) !ListObjectPage {
     }
 
     const next_token = try parseXmlTagValue(alloc, xml, "NextContinuationToken");
+    const is_truncated = parseXmlBoolTag(xml, "IsTruncated") orelse (next_token != null);
 
     return .{
         .keys = try keys.toOwnedSlice(),
         .next_continuation_token = next_token,
+        .is_truncated = is_truncated,
     };
 }
 
@@ -1236,6 +1260,18 @@ fn parseXmlTagValue(alloc: Allocator, xml: []const u8, comptime tag: []const u8)
     const value = xml[value_start .. value_start + end_rel];
     if (value.len == 0) return null;
     return try decodeXmlTextAlloc(alloc, value);
+}
+
+fn parseXmlBoolTag(xml: []const u8, comptime tag: []const u8) ?bool {
+    const open_tag = "<" ++ tag ++ ">";
+    const close_tag = "</" ++ tag ++ ">";
+    const start = std.mem.indexOf(u8, xml, open_tag) orelse return null;
+    const value_start = start + open_tag.len;
+    const end_rel = std.mem.indexOf(u8, xml[value_start..], close_tag) orelse return null;
+    const value = std.mem.trim(u8, xml[value_start .. value_start + end_rel], " \t\r\n");
+    if (std.ascii.eqlIgnoreCase(value, "true")) return true;
+    if (std.ascii.eqlIgnoreCase(value, "false")) return false;
+    return null;
 }
 
 fn decodeXmlTextAlloc(alloc: Allocator, text: []const u8) ![]u8 {
@@ -1825,6 +1861,93 @@ test "S3Storage mock mode propagates injected operation failures" {
     try testing.expect(mock.getObject("key") == null);
 }
 
+const ListObjectsTestServer = struct {
+    mode: Mode,
+    page_count: u32 = 0,
+
+    const Mode = enum {
+        missing_continuation_token,
+        two_pages,
+    };
+
+    fn request(ctx: *anyopaque, method: []const u8, _: []const u8, query: []const u8, _: ?[]const u8, _: ?[]const u8, resp_buf: []u8) anyerror!u16 {
+        const self: *ListObjectsTestServer = @ptrCast(@alignCast(ctx));
+        @memset(resp_buf, 0);
+        if (!std.mem.eql(u8, method, "GET") or std.mem.indexOf(u8, query, "list-type=2") == null) {
+            return error.UnexpectedListObjectsRequest;
+        }
+
+        self.page_count += 1;
+        switch (self.mode) {
+            .missing_continuation_token => {
+                writeHttpResponse(resp_buf,
+                    \\<ListBucketResult>
+                    \\  <IsTruncated>true</IsTruncated>
+                    \\  <Contents><Key>wal/epoch-0/bulk/0000000001</Key></Contents>
+                    \\</ListBucketResult>
+                );
+            },
+            .two_pages => {
+                if (std.mem.indexOf(u8, query, "continuation-token=next-token") == null) {
+                    writeHttpResponse(resp_buf,
+                        \\<ListBucketResult>
+                        \\  <IsTruncated>true</IsTruncated>
+                        \\  <Contents><Key>wal/epoch-0/bulk/0000000002</Key></Contents>
+                        \\  <NextContinuationToken>next-token</NextContinuationToken>
+                        \\</ListBucketResult>
+                    );
+                } else {
+                    writeHttpResponse(resp_buf,
+                        \\<ListBucketResult>
+                        \\  <IsTruncated>false</IsTruncated>
+                        \\  <Contents><Key>wal/epoch-0/bulk/0000000001</Key></Contents>
+                        \\</ListBucketResult>
+                    );
+                }
+            },
+        }
+        return 200;
+    }
+
+    fn writeHttpResponse(resp_buf: []u8, body: []const u8) void {
+        _ = std.fmt.bufPrint(
+            resp_buf,
+            "HTTP/1.1 200 OK\r\nContent-Length: {d}\r\n\r\n{s}",
+            .{ body.len, body },
+        ) catch return;
+    }
+};
+
+test "S3Storage real-client listing fails closed on truncated page without token" {
+    var server = ListObjectsTestServer{ .mode = .missing_continuation_token };
+    var client = S3Client.init(testing.allocator, .{});
+    client.test_http_ctx = &server;
+    client.test_http_request = ListObjectsTestServer.request;
+    var storage = S3Storage.initReal(testing.allocator, &client);
+
+    try testing.expectError(error.S3ListMissingContinuationToken, storage.listObjectKeys("wal/"));
+    try testing.expectEqual(@as(u32, 1), server.page_count);
+}
+
+test "S3Storage real-client listing follows continuation tokens" {
+    var server = ListObjectsTestServer{ .mode = .two_pages };
+    var client = S3Client.init(testing.allocator, .{});
+    client.test_http_ctx = &server;
+    client.test_http_request = ListObjectsTestServer.request;
+    var storage = S3Storage.initReal(testing.allocator, &client);
+
+    const keys = try storage.listObjectKeys("wal/");
+    defer {
+        for (keys) |key| testing.allocator.free(key);
+        testing.allocator.free(keys);
+    }
+
+    try testing.expectEqual(@as(u32, 2), server.page_count);
+    try testing.expectEqual(@as(usize, 2), keys.len);
+    try testing.expectEqualStrings("wal/epoch-0/bulk/0000000001", keys[0]);
+    try testing.expectEqualStrings("wal/epoch-0/bulk/0000000002", keys[1]);
+}
+
 test "S3Storage parses ListObjects keys" {
     const xml =
         \\<ListBucketResult>
@@ -1859,6 +1982,7 @@ test "S3Storage parses ListObjects continuation token" {
     try testing.expectEqual(@as(usize, 1), page.keys.len);
     try testing.expectEqualStrings("wal/epoch-0/bulk/0000000001", page.keys[0]);
     try testing.expectEqualStrings("opaque-token-1", page.next_continuation_token.?);
+    try testing.expect(page.is_truncated);
 }
 
 test "S3Storage decodes ListObjects XML entities" {
@@ -1875,6 +1999,37 @@ test "S3Storage decodes ListObjects XML entities" {
     try testing.expectEqual(@as(usize, 1), page.keys.len);
     try testing.expectEqualStrings("wal/epoch-0/bulk/a&b\"c'd", page.keys[0]);
     try testing.expectEqualStrings("next&token", page.next_continuation_token.?);
+    try testing.expect(page.is_truncated);
+}
+
+test "S3Storage detects truncated ListObjects page without continuation token" {
+    const xml =
+        \\<ListBucketResult>
+        \\  <IsTruncated>true</IsTruncated>
+        \\  <Contents><Key>wal/epoch-0/bulk/0000000001</Key></Contents>
+        \\</ListBucketResult>
+    ;
+
+    var page = try parseListObjectPage(testing.allocator, xml);
+    defer page.deinit(testing.allocator);
+
+    try testing.expect(page.is_truncated);
+    try testing.expect(page.next_continuation_token == null);
+}
+
+test "S3Storage parses non-truncated ListObjects page explicitly" {
+    const xml =
+        \\<ListBucketResult>
+        \\  <IsTruncated>false</IsTruncated>
+        \\  <Contents><Key>wal/epoch-0/bulk/0000000001</Key></Contents>
+        \\</ListBucketResult>
+    ;
+
+    var page = try parseListObjectPage(testing.allocator, xml);
+    defer page.deinit(testing.allocator);
+
+    try testing.expect(!page.is_truncated);
+    try testing.expect(page.next_continuation_token == null);
 }
 
 test "S3Client getObject retry structure" {
