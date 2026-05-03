@@ -424,6 +424,9 @@ pub fn build(b: *std.Build) void {
         const run_client_matrix = b.addSystemCommand(&.{ "python3", "tests/client_matrix_test.py" });
         run_client_matrix.step.dependOn(b.getInstallStep());
         client_matrix_step.dependOn(&run_client_matrix.step);
+
+        const client_matrix_self_test = b.addSystemCommand(&.{ "python3", "tests/client_matrix_test.py", "--self-test" });
+        test_step.dependOn(&client_matrix_self_test.step);
     }
 
     // External multi-process KRaft/controller failover harness. The Python test

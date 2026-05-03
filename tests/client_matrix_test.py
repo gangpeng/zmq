@@ -19,6 +19,18 @@ Optional environment:
                                   PLAIN | SCRAM-SHA-256 | OAUTHBEARER
     ZMQ_CLIENT_MATRIX_SASL_USERNAME
     ZMQ_CLIENT_MATRIX_SASL_PASSWORD
+    ZMQ_CLIENT_MATRIX_OAUTH_TOKEN
+                                  Valid JWT token for kafka-python/confluent-kafka OAUTHBEARER probes
+    ZMQ_CLIENT_MATRIX_BAD_OAUTH_TOKEN
+                                  Invalid/expired JWT token expected to fail OAUTHBEARER authentication
+    ZMQ_CLIENT_MATRIX_OAUTH_JAAS_CONFIG
+                                  Java/Kafka CLI OAUTHBEARER JAAS config
+    ZMQ_CLIENT_MATRIX_BAD_OAUTH_JAAS_CONFIG
+                                  Java/Kafka CLI OAUTHBEARER JAAS config expected to fail
+    ZMQ_CLIENT_MATRIX_OAUTHBEARER_CONFIG
+                                  kcat/librdkafka OAUTHBEARER config string
+    ZMQ_CLIENT_MATRIX_BAD_OAUTHBEARER_CONFIG
+                                  kcat/librdkafka OAUTHBEARER config string expected to fail
     ZMQ_CLIENT_MATRIX_SSL_CA_LOCATION
     ZMQ_CLIENT_MATRIX_BAD_SSL_CA_LOCATION
     ZMQ_CLIENT_MATRIX_ACL_DENIED_TOPIC
@@ -88,6 +100,12 @@ SECURITY_PROTOCOL = "PLAINTEXT"
 SASL_MECHANISM = None
 SASL_USERNAME = None
 SASL_PASSWORD = None
+OAUTH_TOKEN = None
+BAD_OAUTH_TOKEN = None
+OAUTH_JAAS_CONFIG = None
+BAD_OAUTH_JAAS_CONFIG = None
+OAUTHBEARER_CONFIG = None
+BAD_OAUTHBEARER_CONFIG = None
 SSL_CA_LOCATION = None
 BAD_SSL_CA_LOCATION = None
 ACL_DENIED_TOPIC = None
@@ -95,6 +113,14 @@ ACL_DENIED_TOPIC = None
 
 class MatrixError(Exception):
     pass
+
+
+class StaticOAuthTokenProvider:
+    def __init__(self, token):
+        self._token = token
+
+    def token(self):
+        return self._token
 
 
 def parse_semantics(raw):
@@ -132,25 +158,40 @@ def security_enabled():
     )
 
 
-def security_properties(password_override=None, ssl_ca_override=None):
+def oauth_enabled():
+    return (SASL_MECHANISM or "").upper() == "OAUTHBEARER"
+
+
+def oauth_token_expiry():
+    raw = os.environ.get("ZMQ_CLIENT_MATRIX_OAUTH_TOKEN_EXPIRY", "9999999999")
+    try:
+        return int(raw)
+    except ValueError:
+        raise MatrixError(f"invalid ZMQ_CLIENT_MATRIX_OAUTH_TOKEN_EXPIRY: {raw!r}")
+
+
+def security_properties(password_override=None, ssl_ca_override=None, jaas_config_override=None):
     if not security_enabled():
         return {}
     props = {"security.protocol": SECURITY_PROTOCOL}
     if SASL_MECHANISM:
         props["sasl.mechanism"] = SASL_MECHANISM
         props["sasl.mechanisms"] = SASL_MECHANISM
-    if SASL_USERNAME:
+    if not oauth_enabled() and SASL_USERNAME:
         props["sasl.username"] = SASL_USERNAME
     password = SASL_PASSWORD if password_override is None else password_override
-    if password:
+    if not oauth_enabled() and password:
         props["sasl.password"] = password
+    jaas_config = OAUTH_JAAS_CONFIG if jaas_config_override is None else jaas_config_override
+    if oauth_enabled() and jaas_config:
+        props["sasl.jaas.config"] = jaas_config
     ssl_ca = SSL_CA_LOCATION if ssl_ca_override is None else ssl_ca_override
     if ssl_ca:
         props["ssl.ca.location"] = ssl_ca
     return props
 
 
-def kcat_security_args(password_override=None, ssl_ca_override=None):
+def kcat_security_args(password_override=None, ssl_ca_override=None, oauthbearer_config_override=None):
     args = []
     props = security_properties(password_override=password_override, ssl_ca_override=ssl_ca_override)
     if not props:
@@ -159,16 +200,31 @@ def kcat_security_args(password_override=None, ssl_ca_override=None):
         value = props.get(key)
         if value:
             args += ["-X", f"{key}={value}"]
+    oauth_config = OAUTHBEARER_CONFIG if oauthbearer_config_override is None else oauthbearer_config_override
+    if oauth_enabled() and oauth_config:
+        args += ["-X", "enable.sasl.oauthbearer.unsecure.jwt=true"]
+        args += ["-X", f"sasl.oauthbearer.config={oauth_config}"]
     return args
 
 
-def kafka_cli_security_config_path(password_override=None, ssl_ca_override=None):
-    props = security_properties(password_override=password_override, ssl_ca_override=ssl_ca_override)
+def kafka_cli_security_config_path(password_override=None, ssl_ca_override=None, jaas_config_override=None):
+    props = security_properties(
+        password_override=password_override,
+        ssl_ca_override=ssl_ca_override,
+        jaas_config_override=jaas_config_override,
+    )
     if not props:
         return None
     fd, path = tempfile.mkstemp(prefix="zmq-client-matrix-kafka-cli-", suffix=".properties")
     with os.fdopen(fd, "w", encoding="utf-8") as f:
-        for key in ("security.protocol", "sasl.mechanism", "sasl.username", "sasl.password", "ssl.ca.location"):
+        for key in (
+            "security.protocol",
+            "sasl.mechanism",
+            "sasl.username",
+            "sasl.password",
+            "sasl.jaas.config",
+            "ssl.ca.location",
+        ):
             value = props.get(key)
             if value:
                 f.write(f"{key}={value}\n")
@@ -181,12 +237,17 @@ def kafka_cli_command_config(args, config_path):
     return args + ["--command-config", config_path]
 
 
-def kafka_python_security_config(password_override=None, ssl_ca_override=None):
+def kafka_python_security_config(password_override=None, ssl_ca_override=None, oauth_token_override=None):
     if not security_enabled():
         return {}
     config = {"security_protocol": SECURITY_PROTOCOL}
     if SASL_MECHANISM:
         config["sasl_mechanism"] = SASL_MECHANISM
+    if oauth_enabled():
+        token = OAUTH_TOKEN if oauth_token_override is None else oauth_token_override
+        if token:
+            config["sasl_oauth_token_provider"] = StaticOAuthTokenProvider(token)
+        return config
     if SASL_USERNAME:
         config["sasl_plain_username"] = SASL_USERNAME
     password = SASL_PASSWORD if password_override is None else password_override
@@ -198,13 +259,18 @@ def kafka_python_security_config(password_override=None, ssl_ca_override=None):
     return config
 
 
-def confluent_security_config(password_override=None, ssl_ca_override=None):
+def confluent_security_config(password_override=None, ssl_ca_override=None, oauth_token_override=None):
     props = security_properties(password_override=password_override, ssl_ca_override=ssl_ca_override)
     if not props:
         return {}
     config = {"security.protocol": props["security.protocol"]}
     if SASL_MECHANISM:
         config["sasl.mechanisms"] = SASL_MECHANISM
+    if oauth_enabled():
+        token = OAUTH_TOKEN if oauth_token_override is None else oauth_token_override
+        if token:
+            config["oauth_cb"] = lambda *_args: (token, oauth_token_expiry())
+        return config
     if SASL_USERNAME:
         config["sasl.username"] = SASL_USERNAME
     password = SASL_PASSWORD if password_override is None else password_override
@@ -222,7 +288,19 @@ def bad_sasl_password():
 
 
 def sasl_negative_enabled():
-    return bool(SASL_PASSWORD)
+    return bool(SASL_PASSWORD) and not oauth_enabled()
+
+
+def oauth_token_negative_enabled():
+    return oauth_enabled() and bool(BAD_OAUTH_TOKEN)
+
+
+def oauth_jaas_negative_enabled():
+    return oauth_enabled() and bool(BAD_OAUTH_JAAS_CONFIG)
+
+
+def oauthbearer_config_negative_enabled():
+    return oauth_enabled() and bool(BAD_OAUTHBEARER_CONFIG)
 
 
 def tls_negative_enabled():
@@ -234,7 +312,38 @@ def acl_negative_enabled():
 
 
 def security_negative_configured():
-    return sasl_negative_enabled() or tls_negative_enabled() or acl_negative_enabled()
+    return (
+        sasl_negative_enabled()
+        or oauth_token_negative_enabled()
+        or oauth_jaas_negative_enabled()
+        or oauthbearer_config_negative_enabled()
+        or tls_negative_enabled()
+        or acl_negative_enabled()
+    )
+
+
+def oauth_positive_configured_for_tool(tool):
+    if not oauth_enabled():
+        return True
+    if tool in ("kafka-python", "confluent-kafka"):
+        return bool(OAUTH_TOKEN)
+    if tool in ("kafka-cli", "java-kafka"):
+        return bool(OAUTH_JAAS_CONFIG)
+    if tool == "kcat":
+        return bool(OAUTHBEARER_CONFIG)
+    return False
+
+
+def security_negative_configured_for_tool(tool):
+    if sasl_negative_enabled() or tls_negative_enabled() or acl_negative_enabled():
+        return True
+    if tool in ("kafka-python", "confluent-kafka") and oauth_token_negative_enabled():
+        return True
+    if tool in ("kafka-cli", "java-kafka") and oauth_jaas_negative_enabled():
+        return True
+    if tool == "kcat" and oauthbearer_config_negative_enabled():
+        return True
+    return False
 
 
 def run(cmd, timeout=30, input_text=None, cwd=None, env=None):
@@ -321,7 +430,8 @@ def profile_setting(profile, suffix, fallback):
 def apply_profile(profile):
     global ACTIVE_PROFILE, BOOTSTRAP, TOOLS, SEMANTICS, JAVA_CLASSPATH, ENABLE_GO_AUTO, GO_MODULE, PYTHON
     global SECURITY_PROTOCOL, SASL_MECHANISM, SASL_USERNAME, SASL_PASSWORD, SSL_CA_LOCATION
-    global BAD_SSL_CA_LOCATION, ACL_DENIED_TOPIC
+    global OAUTH_TOKEN, BAD_OAUTH_TOKEN, OAUTH_JAAS_CONFIG, BAD_OAUTH_JAAS_CONFIG
+    global OAUTHBEARER_CONFIG, BAD_OAUTHBEARER_CONFIG, BAD_SSL_CA_LOCATION, ACL_DENIED_TOPIC
 
     ACTIVE_PROFILE = profile
     BOOTSTRAP = profile_setting(profile, "BOOTSTRAP", "localhost:9092")
@@ -331,6 +441,12 @@ def apply_profile(profile):
     SASL_MECHANISM = profile_setting(profile, "SASL_MECHANISM", None)
     SASL_USERNAME = profile_setting(profile, "SASL_USERNAME", None)
     SASL_PASSWORD = profile_setting(profile, "SASL_PASSWORD", None)
+    OAUTH_TOKEN = profile_setting(profile, "OAUTH_TOKEN", None)
+    BAD_OAUTH_TOKEN = profile_setting(profile, "BAD_OAUTH_TOKEN", None)
+    OAUTH_JAAS_CONFIG = profile_setting(profile, "OAUTH_JAAS_CONFIG", None)
+    BAD_OAUTH_JAAS_CONFIG = profile_setting(profile, "BAD_OAUTH_JAAS_CONFIG", None)
+    OAUTHBEARER_CONFIG = profile_setting(profile, "OAUTHBEARER_CONFIG", None)
+    BAD_OAUTHBEARER_CONFIG = profile_setting(profile, "BAD_OAUTHBEARER_CONFIG", None)
     SSL_CA_LOCATION = profile_setting(profile, "SSL_CA_LOCATION", None)
     BAD_SSL_CA_LOCATION = profile_setting(profile, "BAD_SSL_CA_LOCATION", None)
     ACL_DENIED_TOPIC = profile_setting(profile, "ACL_DENIED_TOPIC", None)
@@ -366,6 +482,18 @@ def run_python_subtool(tool):
         env["ZMQ_CLIENT_MATRIX_SASL_USERNAME"] = SASL_USERNAME
     if SASL_PASSWORD:
         env["ZMQ_CLIENT_MATRIX_SASL_PASSWORD"] = SASL_PASSWORD
+    if OAUTH_TOKEN:
+        env["ZMQ_CLIENT_MATRIX_OAUTH_TOKEN"] = OAUTH_TOKEN
+    if BAD_OAUTH_TOKEN:
+        env["ZMQ_CLIENT_MATRIX_BAD_OAUTH_TOKEN"] = BAD_OAUTH_TOKEN
+    if OAUTH_JAAS_CONFIG:
+        env["ZMQ_CLIENT_MATRIX_OAUTH_JAAS_CONFIG"] = OAUTH_JAAS_CONFIG
+    if BAD_OAUTH_JAAS_CONFIG:
+        env["ZMQ_CLIENT_MATRIX_BAD_OAUTH_JAAS_CONFIG"] = BAD_OAUTH_JAAS_CONFIG
+    if OAUTHBEARER_CONFIG:
+        env["ZMQ_CLIENT_MATRIX_OAUTHBEARER_CONFIG"] = OAUTHBEARER_CONFIG
+    if BAD_OAUTHBEARER_CONFIG:
+        env["ZMQ_CLIENT_MATRIX_BAD_OAUTHBEARER_CONFIG"] = BAD_OAUTHBEARER_CONFIG
     if SSL_CA_LOCATION:
         env["ZMQ_CLIENT_MATRIX_SSL_CA_LOCATION"] = SSL_CA_LOCATION
     if BAD_SSL_CA_LOCATION:
@@ -395,6 +523,30 @@ def active_security_env():
         env["ZMQ_CLIENT_MATRIX_SASL_PASSWORD"] = SASL_PASSWORD
     else:
         env.pop("ZMQ_CLIENT_MATRIX_SASL_PASSWORD", None)
+    if OAUTH_TOKEN:
+        env["ZMQ_CLIENT_MATRIX_OAUTH_TOKEN"] = OAUTH_TOKEN
+    else:
+        env.pop("ZMQ_CLIENT_MATRIX_OAUTH_TOKEN", None)
+    if BAD_OAUTH_TOKEN:
+        env["ZMQ_CLIENT_MATRIX_BAD_OAUTH_TOKEN"] = BAD_OAUTH_TOKEN
+    else:
+        env.pop("ZMQ_CLIENT_MATRIX_BAD_OAUTH_TOKEN", None)
+    if OAUTH_JAAS_CONFIG:
+        env["ZMQ_CLIENT_MATRIX_OAUTH_JAAS_CONFIG"] = OAUTH_JAAS_CONFIG
+    else:
+        env.pop("ZMQ_CLIENT_MATRIX_OAUTH_JAAS_CONFIG", None)
+    if BAD_OAUTH_JAAS_CONFIG:
+        env["ZMQ_CLIENT_MATRIX_BAD_OAUTH_JAAS_CONFIG"] = BAD_OAUTH_JAAS_CONFIG
+    else:
+        env.pop("ZMQ_CLIENT_MATRIX_BAD_OAUTH_JAAS_CONFIG", None)
+    if OAUTHBEARER_CONFIG:
+        env["ZMQ_CLIENT_MATRIX_OAUTHBEARER_CONFIG"] = OAUTHBEARER_CONFIG
+    else:
+        env.pop("ZMQ_CLIENT_MATRIX_OAUTHBEARER_CONFIG", None)
+    if BAD_OAUTHBEARER_CONFIG:
+        env["ZMQ_CLIENT_MATRIX_BAD_OAUTHBEARER_CONFIG"] = BAD_OAUTHBEARER_CONFIG
+    else:
+        env.pop("ZMQ_CLIENT_MATRIX_BAD_OAUTHBEARER_CONFIG", None)
     if SSL_CA_LOCATION:
         env["ZMQ_CLIENT_MATRIX_SSL_CA_LOCATION"] = SSL_CA_LOCATION
     else:
@@ -455,11 +607,20 @@ def ensure_tool_supports_semantics(tool):
             f"{tool} selected with security configuration, but only "
             f"{', '.join(sorted(SECURITY_TOOLS))} have security interop probes"
         )
+    if security_enabled() and oauth_enabled() and not oauth_positive_configured_for_tool(tool):
+        raise MatrixError(
+            f"{tool} selected with OAUTHBEARER security, but no compatible positive OAuth fixture is configured"
+        )
     if semantic_enabled("security-negative") and not security_negative_configured():
         raise MatrixError(
             "security-negative semantic requires at least one configured negative vector: "
-            "ZMQ_CLIENT_MATRIX_SASL_PASSWORD, ZMQ_CLIENT_MATRIX_BAD_SSL_CA_LOCATION with SSL/SASL_SSL, "
-            "or ZMQ_CLIENT_MATRIX_ACL_DENIED_TOPIC"
+            "ZMQ_CLIENT_MATRIX_SASL_PASSWORD, ZMQ_CLIENT_MATRIX_BAD_OAUTH_TOKEN, "
+            "ZMQ_CLIENT_MATRIX_BAD_OAUTH_JAAS_CONFIG, ZMQ_CLIENT_MATRIX_BAD_OAUTHBEARER_CONFIG, "
+            "ZMQ_CLIENT_MATRIX_BAD_SSL_CA_LOCATION with SSL/SASL_SSL, or ZMQ_CLIENT_MATRIX_ACL_DENIED_TOPIC"
+        )
+    if semantic_enabled("security-negative") and not security_negative_configured_for_tool(tool):
+        raise MatrixError(
+            f"{tool} selected with security-negative semantic, but no compatible negative vector is configured"
         )
 
 
@@ -502,6 +663,11 @@ def test_kcat():
     if semantic_enabled("security-negative") and tls_negative_enabled():
         run_expect_failure(
             ["kcat"] + kcat_security_args(ssl_ca_override=BAD_SSL_CA_LOCATION) + ["-L", "-b", BOOTSTRAP],
+            timeout=45,
+        )
+    if semantic_enabled("security-negative") and oauthbearer_config_negative_enabled():
+        run_expect_failure(
+            ["kcat"] + kcat_security_args(oauthbearer_config_override=BAD_OAUTHBEARER_CONFIG) + ["-L", "-b", BOOTSTRAP],
             timeout=45,
         )
     if semantic_enabled("security-negative") and acl_negative_enabled():
@@ -690,6 +856,22 @@ def test_kafka_cli():
                         os.unlink(bad_config_path)
                     except FileNotFoundError:
                         pass
+        if semantic_enabled("security-negative") and oauth_jaas_negative_enabled():
+            bad_config_path = kafka_cli_security_config_path(jaas_config_override=BAD_OAUTH_JAAS_CONFIG)
+            try:
+                run_expect_failure(
+                    kafka_cli_command_config(
+                        ["kafka-broker-api-versions.sh", "--bootstrap-server", BOOTSTRAP],
+                        bad_config_path,
+                    ),
+                    timeout=45,
+                )
+            finally:
+                if bad_config_path is not None:
+                    try:
+                        os.unlink(bad_config_path)
+                    except FileNotFoundError:
+                        pass
         if semantic_enabled("security-negative") and acl_negative_enabled():
             denied_cmd = ["kafka-console-producer.sh", "--bootstrap-server", BOOTSTRAP, "--topic", ACL_DENIED_TOPIC]
             if config_path is not None:
@@ -784,6 +966,7 @@ def test_kafka_python():
                 if semantic_enabled("security-negative"):
                     test_kafka_python_security_negative()
                     test_kafka_python_tls_negative()
+                    test_kafka_python_oauth_negative()
                     test_kafka_python_acl_negative(payload)
                 print(f"ok: kafka-python probes ({semantics_csv()})")
                 return
@@ -879,6 +1062,31 @@ def test_kafka_python_tls_negative():
         except Exception:
             return
         raise MatrixError("kafka-python bad TLS trust unexpectedly succeeded")
+    finally:
+        admin.close()
+
+
+def test_kafka_python_oauth_negative():
+    if not oauth_token_negative_enabled():
+        return
+    from kafka import KafkaAdminClient
+
+    try:
+        admin = KafkaAdminClient(
+            bootstrap_servers=BOOTSTRAP,
+            client_id="zmq-client-matrix-kafka-python-bad-oauth",
+            request_timeout_ms=10000,
+            api_version_auto_timeout_ms=5000,
+            **kafka_python_security_config(oauth_token_override=BAD_OAUTH_TOKEN),
+        )
+    except Exception:
+        return
+    try:
+        try:
+            admin.list_topics()
+        except Exception:
+            return
+        raise MatrixError("kafka-python bad OAuth token unexpectedly succeeded")
     finally:
         admin.close()
 
@@ -982,6 +1190,7 @@ def test_confluent_kafka():
                 if semantic_enabled("security-negative"):
                     test_confluent_security_negative()
                     test_confluent_tls_negative()
+                    test_confluent_oauth_negative()
                     test_confluent_acl_negative(payload)
                 print(f"ok: confluent-kafka probes ({semantics_csv()})")
                 return
@@ -1062,6 +1271,24 @@ def test_confluent_tls_negative():
     except Exception:
         return
     raise MatrixError("confluent-kafka bad TLS trust unexpectedly succeeded")
+
+
+def test_confluent_oauth_negative():
+    if not oauth_token_negative_enabled():
+        return
+    from confluent_kafka.admin import AdminClient
+
+    admin = AdminClient({
+        "bootstrap.servers": BOOTSTRAP,
+        "client.id": "zmq-client-matrix-confluent-bad-oauth",
+        "socket.timeout.ms": 10000,
+        **confluent_security_config(oauth_token_override=BAD_OAUTH_TOKEN),
+    })
+    try:
+        admin.list_topics(timeout=10)
+    except Exception:
+        return
+    raise MatrixError("confluent-kafka bad OAuth token unexpectedly succeeded")
 
 
 def test_confluent_acl_negative(payload):
@@ -1282,6 +1509,11 @@ public class ZmqKafkaClientMatrix {
     }
 
     private static void runSecurityNegative(String bootstrap) throws Exception {
+        String mechanism = System.getenv("ZMQ_CLIENT_MATRIX_SASL_MECHANISM");
+        if ("OAUTHBEARER".equals(mechanism)) {
+            runOAuthNegative(bootstrap);
+            return;
+        }
         String password = System.getenv("ZMQ_CLIENT_MATRIX_SASL_PASSWORD");
         if (password == null || password.isEmpty()) {
             return;
@@ -1295,6 +1527,27 @@ public class ZmqKafkaClientMatrix {
         try (AdminClient admin = AdminClient.create(adminProps)) {
             admin.listTopics().names().get(10, TimeUnit.SECONDS);
             throw new RuntimeException("Java bad credentials unexpectedly succeeded");
+        } catch (Exception expected) {
+            if (expected.toString().contains("unexpectedly succeeded")) {
+                throw expected;
+            }
+        }
+    }
+
+    private static void runOAuthNegative(String bootstrap) throws Exception {
+        String badJaas = System.getenv("ZMQ_CLIENT_MATRIX_BAD_OAUTH_JAAS_CONFIG");
+        if (badJaas == null || badJaas.isEmpty()) {
+            return;
+        }
+        Properties adminProps = new Properties();
+        adminProps.put("bootstrap.servers", bootstrap);
+        adminProps.put("client.id", "zmq-client-matrix-java-bad-oauth");
+        adminProps.put("request.timeout.ms", "10000");
+        applySecurity(adminProps);
+        adminProps.put("sasl.jaas.config", badJaas);
+        try (AdminClient admin = AdminClient.create(adminProps)) {
+            admin.listTopics().names().get(10, TimeUnit.SECONDS);
+            throw new RuntimeException("Java bad OAuth token unexpectedly succeeded");
         } catch (Exception expected) {
             if (expected.toString().contains("unexpectedly succeeded")) {
                 throw expected;
@@ -1353,6 +1606,7 @@ public class ZmqKafkaClientMatrix {
         putEnv(props, "sasl.mechanism", "ZMQ_CLIENT_MATRIX_SASL_MECHANISM");
         putEnv(props, "sasl.username", "ZMQ_CLIENT_MATRIX_SASL_USERNAME");
         putEnv(props, "sasl.password", "ZMQ_CLIENT_MATRIX_SASL_PASSWORD");
+        putEnv(props, "sasl.jaas.config", "ZMQ_CLIENT_MATRIX_OAUTH_JAAS_CONFIG");
         putEnv(props, "ssl.truststore.location", "ZMQ_CLIENT_MATRIX_SSL_CA_LOCATION");
     }
 
@@ -1603,6 +1857,33 @@ def self_test():
         finally:
             os.unlink(kafka_props_path)
 
+        os.environ["ZMQ_CLIENT_MATRIX_APACHE_3_7_SASL_MECHANISM"] = "OAUTHBEARER"
+        os.environ["ZMQ_CLIENT_MATRIX_APACHE_3_7_OAUTH_JAAS_CONFIG"] = (
+            'org.apache.kafka.common.security.oauthbearer.OAuthBearerLoginModule required '
+            'unsecuredLoginStringClaim_sub="matrix-user";'
+        )
+        os.environ["ZMQ_CLIENT_MATRIX_APACHE_3_7_BAD_OAUTH_JAAS_CONFIG"] = (
+            'org.apache.kafka.common.security.oauthbearer.OAuthBearerLoginModule required '
+            'unsecuredLoginStringClaim_sub="matrix-user" unsecuredLoginNumberClaim_exp="1000";'
+        )
+        apply_profile("apache_3_7")
+        if not oauth_enabled() or not oauth_positive_configured_for_tool("java-kafka"):
+            raise MatrixError("Java OAuth positive fixture self-test failed")
+        if not security_negative_configured_for_tool("java-kafka"):
+            raise MatrixError("Java OAuth negative fixture self-test failed")
+        java_env = active_security_env()
+        if "unsecuredLoginStringClaim_sub" not in java_env.get("ZMQ_CLIENT_MATRIX_OAUTH_JAAS_CONFIG", ""):
+            raise MatrixError("Java OAuth environment self-test failed")
+        oauth_props_path = kafka_cli_security_config_path()
+        try:
+            with open(oauth_props_path, "r", encoding="utf-8") as f:
+                oauth_props = f.read()
+            if "sasl.mechanism=OAUTHBEARER" not in oauth_props or "sasl.jaas.config=" not in oauth_props:
+                raise MatrixError("Kafka CLI OAuth security config self-test failed")
+        finally:
+            os.unlink(oauth_props_path)
+        os.environ["ZMQ_CLIENT_MATRIX_APACHE_3_7_SASL_MECHANISM"] = "PLAIN"
+
         apply_profile("go_1_21")
         if TOOLS != "go-kafka" or GO_MODULE != "github.com/segmentio/kafka-go@v0.4.47":
             raise MatrixError("go profile override failed")
@@ -1641,6 +1922,9 @@ def self_test():
         os.environ["ZMQ_CLIENT_MATRIX_GO_1_21_SEMANTICS"] = "security-negative"
         os.environ.pop("ZMQ_CLIENT_MATRIX_GO_1_21_BAD_SSL_CA_LOCATION", None)
         os.environ.pop("ZMQ_CLIENT_MATRIX_GO_1_21_ACL_DENIED_TOPIC", None)
+        os.environ.pop("ZMQ_CLIENT_MATRIX_GO_1_21_BAD_OAUTH_TOKEN", None)
+        os.environ.pop("ZMQ_CLIENT_MATRIX_GO_1_21_BAD_OAUTH_JAAS_CONFIG", None)
+        os.environ.pop("ZMQ_CLIENT_MATRIX_GO_1_21_BAD_OAUTHBEARER_CONFIG", None)
         os.environ.pop("ZMQ_CLIENT_MATRIX_SASL_PASSWORD", None)
         apply_profile("go_1_21")
         try:
@@ -1649,8 +1933,30 @@ def self_test():
         except MatrixError as exc:
             if "at least one configured negative vector" not in str(exc):
                 raise
+        os.environ["ZMQ_CLIENT_MATRIX_GO_1_21_TOOLS"] = "kafka-python"
+        os.environ["ZMQ_CLIENT_MATRIX_GO_1_21_SEMANTICS"] = "security,security-negative"
+        os.environ["ZMQ_CLIENT_MATRIX_GO_1_21_SECURITY_PROTOCOL"] = "SASL_PLAINTEXT"
+        os.environ["ZMQ_CLIENT_MATRIX_GO_1_21_SASL_MECHANISM"] = "OAUTHBEARER"
+        os.environ["ZMQ_CLIENT_MATRIX_GO_1_21_OAUTH_TOKEN"] = (
+            "eyJhbGciOiJub25lIn0.eyJzdWIiOiJtYXRyaXgtdXNlciIsImV4cCI6OTk5OTk5OTk5OX0."
+        )
+        os.environ["ZMQ_CLIENT_MATRIX_GO_1_21_BAD_OAUTH_TOKEN"] = (
+            "eyJhbGciOiJub25lIn0.eyJzdWIiOiJtYXRyaXgtdXNlciIsImV4cCI6MTAwMH0."
+        )
+        apply_profile("go_1_21")
+        ensure_tool_supports_semantics("kafka-python")
+        oauth_config = kafka_python_security_config()
+        provider = oauth_config.get("sasl_oauth_token_provider")
+        if provider is None or provider.token() != OAUTH_TOKEN:
+            raise MatrixError("kafka-python OAuth token provider self-test failed")
+        if not security_negative_configured_for_tool("kafka-python"):
+            raise MatrixError("kafka-python OAuth negative vector self-test failed")
         os.environ["ZMQ_CLIENT_MATRIX_GO_1_21_TOOLS"] = "go-kafka"
         os.environ["ZMQ_CLIENT_MATRIX_GO_1_21_SEMANTICS"] = "admin,groups"
+        os.environ.pop("ZMQ_CLIENT_MATRIX_GO_1_21_SECURITY_PROTOCOL", None)
+        os.environ.pop("ZMQ_CLIENT_MATRIX_GO_1_21_SASL_MECHANISM", None)
+        os.environ.pop("ZMQ_CLIENT_MATRIX_GO_1_21_OAUTH_TOKEN", None)
+        os.environ.pop("ZMQ_CLIENT_MATRIX_GO_1_21_BAD_OAUTH_TOKEN", None)
         apply_profile("go_1_21")
         try:
             parse_semantics("basic,unknown")
