@@ -156,6 +156,11 @@ pub const Broker = struct {
     failover_controller: FailoverController,
     /// Auto-balancer for partition reassignment.
     auto_balancer: AutoBalancer,
+    /// Cached controller broker snapshot used by scheduled auto-balancing.
+    controller_rebalance_brokers: std.array_list.Managed(AutoBalancer.BrokerNode),
+    /// Cached partition load samples used by scheduled auto-balancing.
+    controller_rebalance_loads: std.array_list.Managed(AutoBalancer.PartitionLoad),
+    last_controller_rebalance_result: ControllerAwareRebalanceResult = .{},
     /// Ongoing partition reassignments keyed by "topic-partition".
     partition_reassignments: std.StringHashMap(PartitionReassignment),
     /// Stream/StreamSetObject/StreamObject metadata registry + S3 object resolution.
@@ -427,6 +432,8 @@ pub const Broker = struct {
             .failover_controller = FailoverController.init(alloc, node_id),
             // Initialize auto-balancer
             .auto_balancer = AutoBalancer.init(alloc),
+            .controller_rebalance_brokers = std.array_list.Managed(AutoBalancer.BrokerNode).init(alloc),
+            .controller_rebalance_loads = std.array_list.Managed(AutoBalancer.PartitionLoad).init(alloc),
             .partition_reassignments = std.StringHashMap(PartitionReassignment).init(alloc),
             // Initialize ObjectManager for Stream/StreamSetObject/StreamObject tracking
             .object_manager = ObjectManager.init(alloc, node_id),
@@ -813,6 +820,10 @@ pub const Broker = struct {
 
         self.persistProducerSequencesIfDirty();
 
+        if (self.runScheduledControllerAwareRebalance()) |_| {} else |err| {
+            log.warn("Scheduled controller-aware rebalance failed: {}", .{err});
+        }
+
         // Periodic S3 flush (if configured)
         if (self.store.s3_storage != null) {
             self.store.flushAllToS3() catch |err| {
@@ -1176,6 +1187,9 @@ pub const Broker = struct {
         // Clean up failover controller
         self.failover_controller.deinit();
         // Clean up auto-balancer
+        self.clearControllerAwareRebalanceInputs();
+        self.controller_rebalance_brokers.deinit();
+        self.controller_rebalance_loads.deinit();
         self.auto_balancer.deinit();
         self.clearPartitionReassignments();
         self.partition_reassignments.deinit();
@@ -18031,6 +18045,93 @@ pub const Broker = struct {
         }
     }
 
+    fn freeControllerAwareRebalanceBrokerItems(self: *Broker, brokers: []AutoBalancer.BrokerNode) void {
+        for (brokers) |broker| {
+            if (broker.rack) |rack| self.allocator.free(rack);
+        }
+    }
+
+    fn freeControllerAwareRebalanceLoadItems(self: *Broker, loads: []AutoBalancer.PartitionLoad) void {
+        for (loads) |load| {
+            self.allocator.free(load.topic);
+        }
+    }
+
+    pub fn clearControllerAwareRebalanceInputs(self: *Broker) void {
+        self.freeControllerAwareRebalanceBrokerItems(self.controller_rebalance_brokers.items);
+        self.freeControllerAwareRebalanceLoadItems(self.controller_rebalance_loads.items);
+        self.controller_rebalance_brokers.clearRetainingCapacity();
+        self.controller_rebalance_loads.clearRetainingCapacity();
+        self.last_controller_rebalance_result = .{};
+    }
+
+    pub fn setControllerAwareRebalanceInputs(
+        self: *Broker,
+        brokers: []const AutoBalancer.BrokerNode,
+        loads: []const AutoBalancer.PartitionLoad,
+    ) !void {
+        var next_brokers = std.array_list.Managed(AutoBalancer.BrokerNode).init(self.allocator);
+        errdefer {
+            self.freeControllerAwareRebalanceBrokerItems(next_brokers.items);
+            next_brokers.deinit();
+        }
+
+        var next_loads = std.array_list.Managed(AutoBalancer.PartitionLoad).init(self.allocator);
+        errdefer {
+            self.freeControllerAwareRebalanceLoadItems(next_loads.items);
+            next_loads.deinit();
+        }
+
+        for (brokers) |broker| {
+            const rack_copy = if (broker.rack) |rack| try self.allocator.dupe(u8, rack) else null;
+            next_brokers.append(.{
+                .node_id = broker.node_id,
+                .rack = rack_copy,
+                .fenced = broker.fenced,
+            }) catch |err| {
+                if (rack_copy) |rack| self.allocator.free(rack);
+                return err;
+            };
+        }
+
+        for (loads) |load| {
+            const topic_copy = try self.allocator.dupe(u8, load.topic);
+            next_loads.append(.{
+                .topic = topic_copy,
+                .partition_id = load.partition_id,
+                .bytes_in_rate = load.bytes_in_rate,
+                .bytes_out_rate = load.bytes_out_rate,
+                .leader_node = load.leader_node,
+            }) catch |err| {
+                self.allocator.free(topic_copy);
+                return err;
+            };
+        }
+
+        self.clearControllerAwareRebalanceInputs();
+        self.controller_rebalance_brokers.deinit();
+        self.controller_rebalance_loads.deinit();
+        self.controller_rebalance_brokers = next_brokers;
+        self.controller_rebalance_loads = next_loads;
+    }
+
+    pub fn runScheduledControllerAwareRebalance(self: *Broker) !ControllerAwareRebalanceResult {
+        if (!self.auto_balancer.shouldCheck()) return .{};
+        defer self.auto_balancer.markChecked();
+
+        if (self.controller_rebalance_brokers.items.len == 0 or self.controller_rebalance_loads.items.len == 0) {
+            self.last_controller_rebalance_result = .{};
+            return .{};
+        }
+
+        const result = try self.executeControllerAwareRebalance(
+            self.controller_rebalance_brokers.items,
+            self.controller_rebalance_loads.items,
+        );
+        self.last_controller_rebalance_result = result;
+        return result;
+    }
+
     pub fn executeControllerAwareRebalance(
         self: *Broker,
         brokers: []const AutoBalancer.BrokerNode,
@@ -33148,6 +33249,62 @@ test "Broker controller-aware rebalance orchestration no-ops without active targ
     try testing.expectEqual(@as(usize, 0), result.applied_moves);
     try testing.expectEqual(@as(u32, 0), broker.partition_reassignments.count());
     try testing.expectEqual(@as(?i32, 3), broker.failover_controller.findPartitionOwner("rebalance-no-target", 0));
+}
+
+test "Broker tick runs scheduled controller-aware rebalance when interval elapses" {
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+    try testing.expect(broker.ensureTopic("rebalance-scheduled"));
+    try broker.failover_controller.reassignPartition(.{ .topic = "rebalance-scheduled", .partition = 0 }, 3);
+
+    const brokers = [_]AutoBalancer.BrokerNode{
+        .{ .node_id = 2, .rack = "rack-a" },
+        .{ .node_id = 3, .rack = "rack-b", .fenced = true },
+    };
+    const loads = [_]AutoBalancer.PartitionLoad{.{
+        .topic = "rebalance-scheduled",
+        .partition_id = 0,
+        .bytes_in_rate = 4_000,
+        .bytes_out_rate = 1_000,
+        .leader_node = 3,
+    }};
+    try broker.setControllerAwareRebalanceInputs(&brokers, &loads);
+    broker.auto_balancer.last_check_ms = @import("time_compat").milliTimestamp() - broker.auto_balancer.check_interval_ms - 1;
+
+    broker.tick();
+
+    try testing.expectEqual(@as(usize, 1), broker.last_controller_rebalance_result.planned_moves);
+    try testing.expectEqual(@as(usize, 1), broker.last_controller_rebalance_result.applied_moves);
+    try testing.expectEqual(@as(u32, 1), broker.partition_reassignments.count());
+    try testing.expectEqual(@as(?i32, 2), broker.failover_controller.findPartitionOwner("rebalance-scheduled", 0));
+}
+
+test "Broker tick skips scheduled controller-aware rebalance before interval elapses" {
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+    try testing.expect(broker.ensureTopic("rebalance-scheduled-skip"));
+    try broker.failover_controller.reassignPartition(.{ .topic = "rebalance-scheduled-skip", .partition = 0 }, 3);
+
+    const brokers = [_]AutoBalancer.BrokerNode{
+        .{ .node_id = 2, .rack = "rack-a" },
+        .{ .node_id = 3, .rack = "rack-b", .fenced = true },
+    };
+    const loads = [_]AutoBalancer.PartitionLoad{.{
+        .topic = "rebalance-scheduled-skip",
+        .partition_id = 0,
+        .bytes_in_rate = 4_000,
+        .bytes_out_rate = 1_000,
+        .leader_node = 3,
+    }};
+    try broker.setControllerAwareRebalanceInputs(&brokers, &loads);
+    broker.auto_balancer.last_check_ms = @import("time_compat").milliTimestamp();
+
+    broker.tick();
+
+    try testing.expectEqual(@as(usize, 0), broker.last_controller_rebalance_result.planned_moves);
+    try testing.expectEqual(@as(usize, 0), broker.last_controller_rebalance_result.applied_moves);
+    try testing.expectEqual(@as(u32, 0), broker.partition_reassignments.count());
+    try testing.expectEqual(@as(?i32, 3), broker.failover_controller.findPartitionOwner("rebalance-scheduled-skip", 0));
 }
 
 test "Broker rejects stale auto-balancer plan before mutating reassignment state" {

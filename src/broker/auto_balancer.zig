@@ -84,6 +84,10 @@ pub const AutoBalancer = struct {
         return (now - self.last_check_ms) >= self.check_interval_ms;
     }
 
+    pub fn markChecked(self: *AutoBalancer) void {
+        self.last_check_ms = @import("time_compat").milliTimestamp();
+    }
+
     /// Compute partition assignments to balance load across nodes.
     /// Uses a simple greedy algorithm: sort partitions by load descending,
     /// assign each to the least-loaded node.
