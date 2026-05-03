@@ -5919,6 +5919,7 @@ pub const Broker = struct {
 
             for (req.transactions) |txn_req| {
                 const topic_results = self.buildAddPartitionsToTxnTopicResults(
+                    api_version,
                     txn_req.producer_id,
                     txn_req.producer_epoch,
                     txn_req.verify_only,
@@ -5950,6 +5951,7 @@ pub const Broker = struct {
         }
 
         const topic_results = self.buildAddPartitionsToTxnTopicResults(
+            api_version,
             req.v3_and_below_producer_id,
             req.v3_and_below_producer_epoch,
             false,
@@ -12736,6 +12738,7 @@ pub const Broker = struct {
             for (req.transactions) |txn_req| {
                 const transaction_error = self.validateTransactionalProducerIdentity(txn_req.transactional_id, txn_req.producer_id, txn_req.producer_epoch);
                 const topic_results = self.buildAddPartitionsToTxnTopicResults(
+                    api_version,
                     txn_req.producer_id,
                     txn_req.producer_epoch,
                     txn_req.verify_only,
@@ -12781,6 +12784,7 @@ pub const Broker = struct {
         defer self.allocator.free(previous_snapshot);
 
         const topic_results = self.buildAddPartitionsToTxnTopicResults(
+            api_version,
             req.v3_and_below_producer_id,
             req.v3_and_below_producer_epoch,
             false,
@@ -12806,6 +12810,7 @@ pub const Broker = struct {
 
     fn buildAddPartitionsToTxnTopicResults(
         self: *Broker,
+        api_version: i16,
         producer_id: i64,
         producer_epoch: i16,
         verify_only: bool,
@@ -12831,7 +12836,7 @@ pub const Broker = struct {
 
             const topic = topic_req.name orelse "";
             for (topic_req.partitions, 0..) |partition, partition_idx| {
-                const error_code = if (transaction_error != @intFromEnum(ErrorCode.none))
+                var error_code = if (transaction_error != @intFromEnum(ErrorCode.none))
                     transaction_error
                 else if (!self.topicPartitionExists(topic, partition))
                     @intFromEnum(ErrorCode.unknown_topic_or_partition)
@@ -12839,6 +12844,7 @@ pub const Broker = struct {
                     self.txn_coordinator.verifyPartitionInTxn(producer_id, producer_epoch, topic, partition)
                 else
                     self.txn_coordinator.addPartitionsToTxn(producer_id, producer_epoch, topic, partition) catch 48;
+                error_code = self.mapTransactionAbortableErrorFromVersion(api_version, 5, producer_id, error_code);
                 partition_results[partition_idx] = .{
                     .partition_index = partition,
                     .partition_error_code = error_code,
@@ -13603,7 +13609,11 @@ pub const Broker = struct {
     }
 
     fn mapTransactionAbortableError(self: *const Broker, api_version: i16, producer_id: i64, error_code: i16) i16 {
-        if (api_version < 4 or error_code != @intFromEnum(ErrorCode.invalid_txn_state)) return error_code;
+        return self.mapTransactionAbortableErrorFromVersion(api_version, 4, producer_id, error_code);
+    }
+
+    fn mapTransactionAbortableErrorFromVersion(self: *const Broker, api_version: i16, min_api_version: i16, producer_id: i64, error_code: i16) i16 {
+        if (api_version < min_api_version or error_code != @intFromEnum(ErrorCode.invalid_txn_state)) return error_code;
 
         const txn = self.txn_coordinator.transactions.get(producer_id) orelse return error_code;
         if (txn.status == .prepare_abort) return @intFromEnum(ErrorCode.transaction_abortable);
@@ -31922,6 +31932,80 @@ test "Broker.handleRequest AddPartitionsToTxn v4 returns generated response and 
     try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.none)), resp.results_by_transaction[0].topic_results[0].results_by_partition[0].partition_error_code);
     try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.none)), resp.results_by_transaction[0].topic_results[0].results_by_partition[1].partition_error_code);
     try testing.expectEqual(@as(usize, 2), broker.txn_coordinator.getPartitions(init_result.producer_id).?.len);
+}
+
+test "Broker.handleRequest AddPartitionsToTxn v5 maps abortable transaction state" {
+    const Req = generated.add_partitions_to_txn_request.AddPartitionsToTxnRequest;
+    const Topic = generated.add_partitions_to_txn_request.AddPartitionsToTxnTopic;
+    const Txn = Req.AddPartitionsToTxnTransaction;
+    const Resp = generated.add_partitions_to_txn_response.AddPartitionsToTxnResponse;
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+    try testing.expect(broker.ensureTopic("txn-add-parts-abortable-topic"));
+
+    const init_result = try broker.txn_coordinator.initProducerId("txn-add-parts-abortable");
+    const txn = broker.txn_coordinator.transactions.getPtr(init_result.producer_id) orelse return error.ExpectedTransactionState;
+    txn.status = .prepare_abort;
+
+    const partitions = [_]i32{0};
+    const topics = [_]Topic{.{
+        .name = "txn-add-parts-abortable-topic",
+        .partitions = &partitions,
+    }};
+    const txns = [_]Txn{.{
+        .transactional_id = "txn-add-parts-abortable",
+        .producer_id = init_result.producer_id,
+        .producer_epoch = init_result.producer_epoch,
+        .verify_only = false,
+        .topics = &topics,
+    }};
+    const req = Req{ .transactions = &txns };
+
+    var legacy_buf: [512]u8 = undefined;
+    var legacy_pos = buildTestRequest(&legacy_buf, 24, 4, 2415, header_mod.requestHeaderVersion(24, 4));
+    req.serialize(&legacy_buf, &legacy_pos, 4);
+
+    const legacy_response = broker.handleRequest(legacy_buf[0..legacy_pos]);
+    try testing.expect(legacy_response != null);
+    defer testing.allocator.free(legacy_response.?);
+
+    var legacy_rpos: usize = 0;
+    var legacy_header = try ResponseHeader.deserialize(testing.allocator, legacy_response.?, &legacy_rpos, header_mod.responseHeaderVersion(24, 4));
+    defer legacy_header.deinit(testing.allocator);
+    try testing.expectEqual(@as(i32, 2415), legacy_header.correlation_id);
+
+    const legacy_resp = try Resp.deserialize(testing.allocator, legacy_response.?, &legacy_rpos, 4);
+    defer {
+        broker.freeAddPartitionsToTxnResults(legacy_resp.results_by_transaction);
+        if (legacy_resp.results_by_transaction.len > 0) testing.allocator.free(legacy_resp.results_by_transaction);
+    }
+    try testing.expectEqual(legacy_response.?.len, legacy_rpos);
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.none)), legacy_resp.error_code);
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.invalid_txn_state)), legacy_resp.results_by_transaction[0].topic_results[0].results_by_partition[0].partition_error_code);
+
+    var v5_buf: [512]u8 = undefined;
+    var v5_pos = buildTestRequest(&v5_buf, 24, 5, 2416, header_mod.requestHeaderVersion(24, 5));
+    req.serialize(&v5_buf, &v5_pos, 5);
+
+    const v5_response = broker.handleRequest(v5_buf[0..v5_pos]);
+    try testing.expect(v5_response != null);
+    defer testing.allocator.free(v5_response.?);
+
+    var v5_rpos: usize = 0;
+    var v5_header = try ResponseHeader.deserialize(testing.allocator, v5_response.?, &v5_rpos, header_mod.responseHeaderVersion(24, 5));
+    defer v5_header.deinit(testing.allocator);
+    try testing.expectEqual(@as(i32, 2416), v5_header.correlation_id);
+
+    const v5_resp = try Resp.deserialize(testing.allocator, v5_response.?, &v5_rpos, 5);
+    defer {
+        broker.freeAddPartitionsToTxnResults(v5_resp.results_by_transaction);
+        if (v5_resp.results_by_transaction.len > 0) testing.allocator.free(v5_resp.results_by_transaction);
+    }
+    try testing.expectEqual(v5_response.?.len, v5_rpos);
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.none)), v5_resp.error_code);
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.transaction_abortable)), v5_resp.results_by_transaction[0].topic_results[0].results_by_partition[0].partition_error_code);
+    try testing.expectEqual(@as(usize, 0), broker.txn_coordinator.getPartitions(init_result.producer_id).?.len);
 }
 
 test "Broker.handleRequest AddPartitionsToTxn rolls back when transaction snapshot S3 WAL write fails" {
