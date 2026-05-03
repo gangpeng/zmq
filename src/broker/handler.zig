@@ -10570,7 +10570,11 @@ pub const Broker = struct {
                 null;
             defer if (assignment) |*owned| self.freeConsumerGroupHeartbeatAssignment(owned);
 
-            var resp = consumerGroupHeartbeatResponse(result.error_code, null, result.member_id, response_member_epoch, consumer_group_heartbeat_interval_ms);
+            const response_heartbeat_interval_ms: i32 = if (result.error_code == @intFromEnum(ErrorCode.none))
+                consumer_group_heartbeat_interval_ms
+            else
+                0;
+            var resp = consumerGroupHeartbeatResponse(result.error_code, null, result.member_id, response_member_epoch, response_heartbeat_interval_ms);
             resp.assignment = assignment;
             return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
         }
@@ -37825,6 +37829,46 @@ test "Broker.handleRequest ConsumerGroupHeartbeat rejects malformed request" {
     defer freeDeserializedConsumerGroupHeartbeatResponse(&resp);
     try testing.expectEqual(response.?.len, rpos);
     try testing.expectEqual(ErrorCode.invalid_request.toInt(), resp.error_code);
+}
+
+test "Broker.handleRequest ConsumerGroupHeartbeat join errors do not schedule heartbeat" {
+    const Req = generated.consumer_group_heartbeat_request.ConsumerGroupHeartbeatRequest;
+    const Resp = generated.consumer_group_heartbeat_response.ConsumerGroupHeartbeatResponse;
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+
+    const topic_names = [_]?[]const u8{};
+    const req = Req{
+        .group_id = "",
+        .member_id = "invalid-join-member",
+        .member_epoch = 0,
+        .rebalance_timeout_ms = 30_000,
+        .subscribed_topic_names = &topic_names,
+        .server_assignor = "range",
+    };
+
+    var buf: [256]u8 = undefined;
+    var pos = buildTestRequest(&buf, 68, 0, 6846, header_mod.requestHeaderVersion(68, 0));
+    req.serialize(&buf, &pos, 0);
+
+    const response = broker.handleRequest(buf[0..pos]);
+    try testing.expect(response != null);
+    defer testing.allocator.free(response.?);
+
+    var rpos: usize = 0;
+    var response_header = try ResponseHeader.deserialize(testing.allocator, response.?, &rpos, header_mod.responseHeaderVersion(68, 0));
+    defer response_header.deinit(testing.allocator);
+    try testing.expectEqual(@as(i32, 6846), response_header.correlation_id);
+
+    const resp = try Resp.deserialize(testing.allocator, response.?, &rpos, 0);
+    defer freeDeserializedConsumerGroupHeartbeatResponse(&resp);
+    try testing.expectEqual(response.?.len, rpos);
+    try testing.expectEqual(ErrorCode.invalid_group_id.toInt(), resp.error_code);
+    try testing.expectEqual(@as(i32, -1), resp.member_epoch);
+    try testing.expectEqual(@as(i32, 0), resp.heartbeat_interval_ms);
+    try testing.expect(resp.assignment == null);
+    try testing.expect(broker.groups.groups.getPtr("") == null);
 }
 
 test "Broker.handleRequest ConsumerGroupHeartbeat rejects duplicate subscriptions" {

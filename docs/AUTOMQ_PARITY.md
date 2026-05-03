@@ -173,8 +173,8 @@ Status: completed for the initial catalog and DeleteGroups slice.
   through local/S3 group snapshots, expose them through ConsumerGroupDescribe,
   validate owned topic-partition echoes against the member assignment, reject
   unsupported/incompatible server assignors and duplicate subscription names,
-  return terminal leave responses without scheduling another heartbeat, and
-  map stale member epochs/static instance
+  return terminal leave responses and join/rejoin error responses without
+  scheduling another heartbeat, and map stale member epochs/static instance
   conflicts to KIP-848
   `FENCED_MEMBER_EPOCH`/`UNRELEASED_INSTANCE_ID` errors.
   OffsetFetch v9 now validates supplied KIP-848 `member_id`/`member_epoch`
