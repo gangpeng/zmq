@@ -1097,10 +1097,13 @@ pub const Broker = struct {
         };
 
         self.applyCommittedTxnMarkerS3WalWrites(pending_writes.items);
-        self.persistPartitionStates();
-        self.persistObjectManagerSnapshot();
+        self.persistPartitionAndObjectLocalMetadataDurably("Timed-out transaction S3 WAL marker") catch |err| {
+            log.warn("Timed-out transaction {d} local marker metadata persistence failed after S3 WAL flush: {}", .{ txn.producer_id, err });
+            return false;
+        };
         self.persistence.saveTransactions(&self.txn_coordinator) catch |err| {
             log.warn("Failed to persist transaction state after timed-out transaction S3 WAL flush: {}", .{err});
+            return false;
         };
         self.txn_coordinator.dirty = false;
         return true;
@@ -2211,6 +2214,19 @@ pub const Broker = struct {
 
     fn persistPartitionStatesDurably(self: *Broker) !void {
         try self.persistence.savePartitionStates(&self.store.partitions);
+    }
+
+    fn persistPartitionAndObjectLocalMetadataDurably(self: *Broker, context: []const u8) !void {
+        var first_error: ?anyerror = null;
+        self.persistPartitionStatesDurably() catch |err| {
+            log.warn("{s} partition state checkpoint failed: {}", .{ context, err });
+            first_error = err;
+        };
+        self.persistObjectManagerSnapshotDurably() catch |err| {
+            log.warn("{s} ObjectManager snapshot failed: {}", .{ context, err });
+            if (first_error == null) first_error = err;
+        };
+        if (first_error) |err| return err;
     }
 
     /// Persist ongoing partition reassignment state to disk (best-effort).
@@ -15148,8 +15164,9 @@ pub const Broker = struct {
         }
 
         if (partition_state_dirty) {
-            self.persistPartitionStates();
-            self.persistObjectManagerSnapshot();
+            self.persistPartitionAndObjectLocalMetadataDurably("Transaction control batch") catch {
+                return @intFromEnum(ErrorCode.kafka_storage_error);
+            };
         }
         return marker_error;
     }
@@ -15297,11 +15314,21 @@ pub const Broker = struct {
             };
 
             self.applyCommittedTxnMarkerS3WalWrites(pending_writes.items);
-            self.persistPartitionStates();
-            self.persistObjectManagerSnapshot();
+            var local_persistence_error: ?anyerror = null;
+            self.persistPartitionAndObjectLocalMetadataDurably("EndTxn S3 WAL marker") catch |err| {
+                local_persistence_error = err;
+            };
             self.persistence.saveTransactions(&self.txn_coordinator) catch |err| {
                 log.warn("Failed to persist transaction state after atomic EndTxn S3 WAL flush: {}", .{err});
+                if (local_persistence_error == null) local_persistence_error = err;
             };
+            if (local_persistence_error) |_| {
+                const resp = Resp{
+                    .throttle_time_ms = 0,
+                    .error_code = @intFromEnum(ErrorCode.kafka_storage_error),
+                };
+                return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+            }
             self.txn_coordinator.dirty = false;
         } else {
             self.persistTransactionsIfDirty();
@@ -19200,17 +19227,25 @@ pub const Broker = struct {
             topics_transferred = true;
         }
 
+        var local_marker_persistence_failed = false;
         if (partition_state_dirty) {
-            self.persistPartitionStates();
-            self.persistObjectManagerSnapshot();
+            self.persistPartitionAndObjectLocalMetadataDurably("WriteTxnMarkers") catch {
+                self.restoreTransactionsAfterFailedMutation(previous_snapshot);
+                for (markers[0..markers_init]) |*marker| {
+                    applyWriteTxnMarkerError(marker.topics, @intFromEnum(ErrorCode.kafka_storage_error));
+                }
+                local_marker_persistence_failed = true;
+            };
         }
-        self.persistTransactionsIfDirtyDurably() catch |err| {
-            log.warn("WriteTxnMarkers transaction snapshot write failed: {}", .{err});
-            self.restoreTransactionsAfterFailedMutation(previous_snapshot);
-            for (markers[0..markers_init]) |*marker| {
-                applyWriteTxnMarkerError(marker.topics, @intFromEnum(ErrorCode.kafka_storage_error));
-            }
-        };
+        if (!local_marker_persistence_failed) {
+            self.persistTransactionsIfDirtyDurably() catch |err| {
+                log.warn("WriteTxnMarkers transaction snapshot write failed: {}", .{err});
+                self.restoreTransactionsAfterFailedMutation(previous_snapshot);
+                for (markers[0..markers_init]) |*marker| {
+                    applyWriteTxnMarkerError(marker.topics, @intFromEnum(ErrorCode.kafka_storage_error));
+                }
+            };
+        }
 
         const resp = Resp{ .markers = markers[0..markers_init] };
         return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
@@ -19357,13 +19392,24 @@ pub const Broker = struct {
             };
 
             self.applyCommittedTxnMarkerS3WalWrites(pending_writes.items);
-            self.persistPartitionStates();
-            self.persistObjectManagerSnapshot();
+            self.persistPartitionAndObjectLocalMetadataDurably("WriteTxnMarkers S3 WAL marker") catch |err| {
+                log.warn("WriteTxnMarkers local marker metadata persistence failed after S3 WAL flush: {}", .{err});
+                for (markers[0..markers_init.*]) |*marker| {
+                    applyWriteTxnMarkerError(marker.topics, @intFromEnum(ErrorCode.kafka_storage_error));
+                }
+                const resp = Resp{ .markers = markers[0..markers_init.*] };
+                return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+            };
         }
 
         if (coordinator_state_dirty) {
             self.persistence.saveTransactions(&self.txn_coordinator) catch |err| {
                 log.warn("Failed to persist transaction state after atomic WriteTxnMarkers S3 WAL flush: {}", .{err});
+                for (markers[0..markers_init.*]) |*marker| {
+                    applyWriteTxnMarkerError(marker.topics, @intFromEnum(ErrorCode.kafka_storage_error));
+                }
+                const resp = Resp{ .markers = markers[0..markers_init.*] };
+                return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
             };
             self.txn_coordinator.dirty = false;
         }
@@ -27140,6 +27186,72 @@ test "Broker.handleRequest WriteTxnMarkers preserves local transaction when part
     try testing.expectEqual(@as(i32, 0), txn.partitions.items[0].partition);
 }
 
+test "Broker.handleRequest WriteTxnMarkers rolls back when local object snapshot fails" {
+    const fs = @import("fs_compat");
+    const Req = generated.write_txn_markers_request.WriteTxnMarkersRequest;
+    const Resp = generated.write_txn_markers_response.WriteTxnMarkersResponse;
+
+    const tmp_dir = "/tmp/zmq-write-txn-markers-local-object-fail-test";
+    fs.deleteTreeAbsolute(tmp_dir) catch {};
+    try fs.makeDirAbsolute(tmp_dir);
+    defer fs.deleteTreeAbsolute(tmp_dir) catch {};
+
+    var broker = Broker.initWithConfig(testing.allocator, 1, 9092, .{ .data_dir = tmp_dir });
+    defer broker.deinit();
+    try broker.open();
+    try testing.expect(broker.ensureTopic("txn-marker-local-object-fail-topic"));
+
+    const init_result = try broker.txn_coordinator.initProducerId("txn-marker-local-object-fail");
+    const pid = init_result.producer_id;
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.none)), try broker.txn_coordinator.addPartitionsToTxn(pid, init_result.producer_epoch, "txn-marker-local-object-fail-topic", 0));
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.none)), broker.txn_coordinator.endTxn(pid, init_result.producer_epoch, true));
+
+    const object_snapshot_path = try std.fmt.allocPrint(testing.allocator, "{s}/objects.snapshot", .{tmp_dir});
+    defer testing.allocator.free(object_snapshot_path);
+    fs.deleteFileAbsolute(object_snapshot_path) catch {};
+    try fs.makeDirAbsolute(object_snapshot_path);
+
+    const partition_indexes = [_]i32{0};
+    const topics = [_]Req.WritableTxnMarker.WritableTxnMarkerTopic{.{
+        .name = "txn-marker-local-object-fail-topic",
+        .partition_indexes = &partition_indexes,
+    }};
+    const markers = [_]Req.WritableTxnMarker{.{
+        .producer_id = pid,
+        .producer_epoch = init_result.producer_epoch,
+        .transaction_result = true,
+        .topics = &topics,
+        .coordinator_epoch = 0,
+    }};
+    const req = Req{ .markers = &markers };
+
+    var buf: [512]u8 = undefined;
+    var pos = buildTestRequest(&buf, 27, 1, 2709, header_mod.requestHeaderVersion(27, 1));
+    req.serialize(&buf, &pos, 1);
+
+    const response = broker.handleRequest(buf[0..pos]);
+    try testing.expect(response != null);
+    defer testing.allocator.free(response.?);
+
+    var rpos: usize = 0;
+    var response_header = try ResponseHeader.deserialize(testing.allocator, response.?, &rpos, header_mod.responseHeaderVersion(27, 1));
+    defer response_header.deinit(testing.allocator);
+    try testing.expectEqual(@as(i32, 2709), response_header.correlation_id);
+
+    const resp = try Resp.deserialize(testing.allocator, response.?, &rpos, 1);
+    defer {
+        broker.freeWriteTxnMarkersResults(resp.markers);
+        if (resp.markers.len > 0) testing.allocator.free(resp.markers);
+    }
+
+    try testing.expectEqual(response.?.len, rpos);
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.kafka_storage_error)), resp.markers[0].topics[0].partitions[0].error_code);
+    try testing.expectEqual(TxnCoordinator.TxnStatus.prepare_commit, broker.txn_coordinator.getStatus(pid).?);
+    const state = broker.store.partitions.get("txn-marker-local-object-fail-topic-0").?;
+    try testing.expectEqual(@as(u64, 1), state.next_offset);
+    try testing.expectEqual(@as(u64, 1), state.high_watermark);
+}
+
 test "Broker.handleRequest WriteTxnMarkers rolls back when transaction snapshot S3 WAL write fails" {
     const Req = generated.write_txn_markers_request.WriteTxnMarkersRequest;
     const Resp = generated.write_txn_markers_response.WriteTxnMarkersResponse;
@@ -27294,6 +27406,79 @@ test "Broker.handleRequest WriteTxnMarkers S3 WAL commits marker and transaction
     try testing.expectEqual(@as(u64, 1), state.high_watermark);
     try testing.expectEqual(@as(u64, 1), state.last_stable_offset);
     try testing.expect(state.first_unstable_txn_offset == null);
+}
+
+test "Broker.handleRequest WriteTxnMarkers reports storage error when S3 local transaction checkpoint fails" {
+    const fs = @import("fs_compat");
+    const Req = generated.write_txn_markers_request.WriteTxnMarkersRequest;
+    const Resp = generated.write_txn_markers_response.WriteTxnMarkersResponse;
+
+    const tmp_dir = "/tmp/zmq-write-txn-markers-s3-local-txn-fail-test";
+    fs.deleteTreeAbsolute(tmp_dir) catch {};
+    try fs.makeDirAbsolute(tmp_dir);
+    defer fs.deleteTreeAbsolute(tmp_dir) catch {};
+
+    var mock_s3 = storage.MockS3.init(testing.allocator);
+    defer mock_s3.deinit();
+    const s3_storage = storage.S3Storage.initMock(testing.allocator, &mock_s3);
+
+    var broker = Broker.initWithConfig(testing.allocator, 1, 9092, .{ .data_dir = tmp_dir });
+    defer broker.deinit();
+    broker.store.s3_wal_mode = true;
+    broker.store.s3_storage = s3_storage;
+    broker.store.s3_wal_batcher = storage.wal.S3WalBatcher.init(testing.allocator);
+    try broker.open();
+    try testing.expect(broker.ensureTopic("txn-marker-s3-local-txn-fail-topic"));
+
+    const init_result = try broker.txn_coordinator.initProducerId("txn-marker-s3-local-txn-fail");
+    const pid = init_result.producer_id;
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.none)), try broker.txn_coordinator.addPartitionsToTxn(pid, init_result.producer_epoch, "txn-marker-s3-local-txn-fail-topic", 0));
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.none)), broker.txn_coordinator.endTxn(pid, init_result.producer_epoch, true));
+
+    const transactions_path = try std.fmt.allocPrint(testing.allocator, "{s}/transactions.meta", .{tmp_dir});
+    defer testing.allocator.free(transactions_path);
+    fs.deleteFileAbsolute(transactions_path) catch {};
+    try fs.makeDirAbsolute(transactions_path);
+
+    const object_count_before = mock_s3.objectCount();
+    const partition_indexes = [_]i32{0};
+    const topics = [_]Req.WritableTxnMarker.WritableTxnMarkerTopic{.{
+        .name = "txn-marker-s3-local-txn-fail-topic",
+        .partition_indexes = &partition_indexes,
+    }};
+    const markers = [_]Req.WritableTxnMarker{.{
+        .producer_id = pid,
+        .producer_epoch = init_result.producer_epoch,
+        .transaction_result = true,
+        .topics = &topics,
+        .coordinator_epoch = 0,
+    }};
+    const req = Req{ .markers = &markers };
+
+    var buf: [512]u8 = undefined;
+    var pos = buildTestRequest(&buf, 27, 1, 2710, header_mod.requestHeaderVersion(27, 1));
+    req.serialize(&buf, &pos, 1);
+
+    const response = broker.handleRequest(buf[0..pos]);
+    try testing.expect(response != null);
+    defer testing.allocator.free(response.?);
+
+    var rpos: usize = 0;
+    var response_header = try ResponseHeader.deserialize(testing.allocator, response.?, &rpos, header_mod.responseHeaderVersion(27, 1));
+    defer response_header.deinit(testing.allocator);
+    try testing.expectEqual(@as(i32, 2710), response_header.correlation_id);
+
+    const resp = try Resp.deserialize(testing.allocator, response.?, &rpos, 1);
+    defer {
+        broker.freeWriteTxnMarkersResults(resp.markers);
+        if (resp.markers.len > 0) testing.allocator.free(resp.markers);
+    }
+
+    try testing.expectEqual(response.?.len, rpos);
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.kafka_storage_error)), resp.markers[0].topics[0].partitions[0].error_code);
+    try testing.expectEqual(TxnCoordinator.TxnStatus.complete_commit, broker.txn_coordinator.getStatus(pid).?);
+    try testing.expect(broker.txn_coordinator.dirty);
+    try testing.expectEqual(object_count_before + 1, mock_s3.objectCount());
 }
 
 test "Broker.handleRequest WriteTxnMarkers rejects unknown topic partition" {
@@ -38213,6 +38398,43 @@ test "Broker.handleRequest EndTxn v4 maps abortable transaction state before mar
     try testing.expectEqual(@as(u64, 0), state.next_offset);
 }
 
+test "Broker.handleRequest EndTxn reports storage error when local partition checkpoint fails" {
+    const fs = @import("fs_compat");
+
+    const tmp_dir = "/tmp/zmq-end-txn-local-partition-fail-test";
+    fs.deleteTreeAbsolute(tmp_dir) catch {};
+    try fs.makeDirAbsolute(tmp_dir);
+    defer fs.deleteTreeAbsolute(tmp_dir) catch {};
+
+    var broker = Broker.initWithConfig(testing.allocator, 1, 9092, .{ .data_dir = tmp_dir });
+    defer broker.deinit();
+    try broker.open();
+    try testing.expect(broker.ensureTopic("txn-end-local-partition-fail-topic"));
+
+    const init_result = try broker.txn_coordinator.initProducerId("txn-end-local-partition-fail");
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.none)), try broker.txn_coordinator.addPartitionsToTxn(init_result.producer_id, init_result.producer_epoch, "txn-end-local-partition-fail-topic", 0));
+
+    const partition_state_path = try std.fmt.allocPrint(testing.allocator, "{s}/partition_state.meta", .{tmp_dir});
+    defer testing.allocator.free(partition_state_path);
+    fs.deleteFileAbsolute(partition_state_path) catch {};
+    try fs.makeDirAbsolute(partition_state_path);
+
+    const resp = try handleEndTxnForTestVersion(
+        &broker,
+        "txn-end-local-partition-fail",
+        init_result.producer_id,
+        init_result.producer_epoch,
+        true,
+        2612,
+        3,
+    );
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.kafka_storage_error)), resp.error_code);
+    try testing.expectEqual(TxnCoordinator.TxnStatus.ongoing, broker.txn_coordinator.getStatus(init_result.producer_id).?);
+    const state = broker.partitionState("txn-end-local-partition-fail-topic", 0).?;
+    try testing.expectEqual(@as(u64, 1), state.next_offset);
+    try testing.expectEqual(@as(u64, 1), state.high_watermark);
+}
+
 test "Broker.handleRequest EndTxn rolls back when transaction snapshot S3 WAL write fails" {
     const Req = generated.end_txn_request.EndTxnRequest;
     const Resp = generated.end_txn_response.EndTxnResponse;
@@ -38323,6 +38545,67 @@ test "Broker.handleRequest EndTxn S3 WAL commits markers and transaction snapsho
     try testing.expectEqual(@as(u64, 1), state.high_watermark);
     try testing.expectEqual(@as(u64, 1), state.last_stable_offset);
     try testing.expect(state.first_unstable_txn_offset == null);
+}
+
+test "Broker.handleRequest EndTxn reports storage error when S3 local partition checkpoint fails" {
+    const fs = @import("fs_compat");
+    const Req = generated.end_txn_request.EndTxnRequest;
+    const Resp = generated.end_txn_response.EndTxnResponse;
+
+    const tmp_dir = "/tmp/zmq-end-txn-s3-local-partition-fail-test";
+    fs.deleteTreeAbsolute(tmp_dir) catch {};
+    try fs.makeDirAbsolute(tmp_dir);
+    defer fs.deleteTreeAbsolute(tmp_dir) catch {};
+
+    var mock_s3 = storage.MockS3.init(testing.allocator);
+    defer mock_s3.deinit();
+    const s3_storage = storage.S3Storage.initMock(testing.allocator, &mock_s3);
+
+    var broker = Broker.initWithConfig(testing.allocator, 1, 9092, .{ .data_dir = tmp_dir });
+    defer broker.deinit();
+    broker.store.s3_wal_mode = true;
+    broker.store.s3_storage = s3_storage;
+    broker.store.s3_wal_batcher = storage.wal.S3WalBatcher.init(testing.allocator);
+    try broker.open();
+    try testing.expect(broker.ensureTopic("txn-end-s3-local-partition-fail-topic"));
+
+    const init_result = try broker.txn_coordinator.initProducerId("txn-end-s3-local-partition-fail");
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.none)), try broker.txn_coordinator.addPartitionsToTxn(init_result.producer_id, init_result.producer_epoch, "txn-end-s3-local-partition-fail-topic", 0));
+
+    const partition_state_path = try std.fmt.allocPrint(testing.allocator, "{s}/partition_state.meta", .{tmp_dir});
+    defer testing.allocator.free(partition_state_path);
+    fs.deleteFileAbsolute(partition_state_path) catch {};
+    try fs.makeDirAbsolute(partition_state_path);
+
+    const object_count_before = mock_s3.objectCount();
+    const req = Req{
+        .transactional_id = "txn-end-s3-local-partition-fail",
+        .producer_id = init_result.producer_id,
+        .producer_epoch = init_result.producer_epoch,
+        .committed = true,
+    };
+
+    var buf: [512]u8 = undefined;
+    var pos = buildTestRequest(&buf, 26, 3, 2613, header_mod.requestHeaderVersion(26, 3));
+    req.serialize(&buf, &pos, 3);
+
+    const response = broker.handleRequest(buf[0..pos]);
+    try testing.expect(response != null);
+    defer testing.allocator.free(response.?);
+
+    var rpos: usize = 0;
+    var response_header = try ResponseHeader.deserialize(testing.allocator, response.?, &rpos, header_mod.responseHeaderVersion(26, 3));
+    defer response_header.deinit(testing.allocator);
+    try testing.expectEqual(@as(i32, 2613), response_header.correlation_id);
+
+    const resp = try Resp.deserialize(testing.allocator, response.?, &rpos, 3);
+    try testing.expectEqual(response.?.len, rpos);
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.kafka_storage_error)), resp.error_code);
+    try testing.expectEqual(TxnCoordinator.TxnStatus.complete_commit, broker.txn_coordinator.getStatus(init_result.producer_id).?);
+    try testing.expectEqual(object_count_before + 1, mock_s3.objectCount());
+    const state = broker.partitionState("txn-end-s3-local-partition-fail-topic", 0).?;
+    try testing.expectEqual(@as(u64, 1), state.next_offset);
+    try testing.expectEqual(@as(u64, 1), state.high_watermark);
 }
 
 test "Broker.handleRequest EndTxn rejects transactional id mismatch before marker write" {
