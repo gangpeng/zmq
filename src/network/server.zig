@@ -484,6 +484,10 @@ pub const Server = struct {
 
                         // Set up TLS for SSL/SASL_SSL connections
                         if (self.tls_context) |tls_ctx| {
+                            _ = tls_ctx.reloadIfCertificatesChanged() catch |err| blk: {
+                                log.warn("TLS certificate reload check failed before accepting fd={d}: {}", .{ client_fd, err });
+                                break :blk false;
+                            };
                             if (connections.getPtr(client_fd)) |conn| {
                                 const ssl = tls_ctx.createSsl(client_fd) catch {
                                     log.warn("Failed to create SSL for fd={d}", .{client_fd});

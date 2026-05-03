@@ -1,9 +1,11 @@
 const std = @import("std");
 const testing = std.testing;
 const posix = std.posix;
+const linux = std.os.linux;
 const log = std.log.scoped(.tls);
 const Allocator = std.mem.Allocator;
 const OpenSslLib = @import("openssl.zig").OpenSslLib;
+const fs = @import("fs_compat");
 
 /// TLS configuration for the broker.
 ///
@@ -103,6 +105,75 @@ pub const TlsConfig = struct {
         }
     }
 };
+
+pub const TlsFileFingerprint = struct {
+    configured: bool = false,
+    exists: bool = false,
+    size: u64 = 0,
+    inode: u64 = 0,
+    mtime_sec: i64 = 0,
+    mtime_nsec: u32 = 0,
+
+    pub fn eql(self: TlsFileFingerprint, other: TlsFileFingerprint) bool {
+        return self.configured == other.configured and
+            self.exists == other.exists and
+            self.size == other.size and
+            self.inode == other.inode and
+            self.mtime_sec == other.mtime_sec and
+            self.mtime_nsec == other.mtime_nsec;
+    }
+};
+
+pub const TlsCertificateWatchState = struct {
+    cert: TlsFileFingerprint = .{},
+    key: TlsFileFingerprint = .{},
+    ca: TlsFileFingerprint = .{},
+
+    pub fn capture(config: *const TlsConfig) !TlsCertificateWatchState {
+        return .{
+            .cert = try captureFileFingerprint(config.cert_file),
+            .key = try captureFileFingerprint(config.key_file),
+            .ca = try captureFileFingerprint(config.ca_file),
+        };
+    }
+
+    pub fn eql(self: TlsCertificateWatchState, other: TlsCertificateWatchState) bool {
+        return self.cert.eql(other.cert) and self.key.eql(other.key) and self.ca.eql(other.ca);
+    }
+
+    pub fn changed(self: TlsCertificateWatchState, config: *const TlsConfig) !bool {
+        const current = try capture(config);
+        return !self.eql(current);
+    }
+};
+
+fn captureFileFingerprint(path_opt: ?[]const u8) !TlsFileFingerprint {
+    const path = path_opt orelse return .{};
+    const file = fs.openFileAbsolute(path, .{}) catch |err| switch (err) {
+        error.FileNotFound => return .{ .configured = true },
+        else => |open_err| return open_err,
+    };
+    defer file.close();
+
+    var statx_buf: linux.Statx = undefined;
+    const rc = linux.statx(file.fd, "", linux.AT.EMPTY_PATH, .{ .SIZE = true, .INO = true, .MTIME = true }, &statx_buf);
+    switch (posix.errno(rc)) {
+        .SUCCESS => return .{
+            .configured = true,
+            .exists = true,
+            .size = statx_buf.size,
+            .inode = statx_buf.ino,
+            .mtime_sec = statx_buf.mtime.sec,
+            .mtime_nsec = statx_buf.mtime.nsec,
+        },
+        .ACCES => return error.AccessDenied,
+        .PERM => return error.PermissionDenied,
+        .BADF => return error.Unexpected,
+        .INVAL => return error.Unexpected,
+        .NOMEM => return error.SystemResources,
+        else => |err| return posix.unexpectedErrno(err),
+    }
+}
 
 /// TLS connection state for a single client connection.
 ///
@@ -333,6 +404,7 @@ pub const TlsContext = struct {
     ssl_ctx: ?*anyopaque = null,
     openssl: ?OpenSslLib = null,
     allocator: Allocator,
+    certificate_watch: TlsCertificateWatchState = .{},
 
     pub fn init(alloc: Allocator, config: TlsConfig) !TlsContext {
         var ctx = TlsContext{
@@ -420,6 +492,7 @@ pub const TlsContext = struct {
             ctx.ssl_ctx = ssl_ctx;
             ctx.openssl = ossl;
             ctx.initialized = true;
+            ctx.certificate_watch = try TlsCertificateWatchState.capture(&config);
 
             log.info("TLS context initialized (min={s}, max={s}, client_auth={s})", .{
                 @tagName(config.min_tls_version),
@@ -429,6 +502,22 @@ pub const TlsContext = struct {
         }
 
         return ctx;
+    }
+
+    pub fn reloadIfCertificatesChanged(self: *TlsContext) !bool {
+        if (!self.config.needsTls()) return false;
+
+        const current = try TlsCertificateWatchState.capture(&self.config);
+        if (self.certificate_watch.eql(current)) return false;
+
+        var replacement = try TlsContext.init(self.allocator, self.config);
+        replacement.certificate_watch = current;
+
+        var old = self.*;
+        self.* = replacement;
+        old.deinit();
+        log.info("TLS certificate context reloaded after PEM file change", .{});
+        return true;
     }
 
     /// Create a new SSL object for an accepted connection.
@@ -710,6 +799,20 @@ pub fn isHandshakeTimedOut(handshake_start_ms: i64, now_ms: i64) bool {
 // Tests
 // ---------------------------------------------------------------
 
+fn writeTlsRotationTestFile(path: []const u8, bytes: []const u8) !void {
+    const file = try fs.createFileAbsolute(path, .{ .truncate = true });
+    defer file.close();
+    try file.writeAll(bytes);
+    try file.sync();
+}
+
+fn tlsRotationTestPath(tmp: *const testing.TmpDir, name: []const u8) ![]u8 {
+    return try std.fmt.allocPrint(testing.allocator, ".zig-cache/tmp/{s}/{s}", .{
+        tmp.sub_path[0..],
+        name,
+    });
+}
+
 test "TlsConfig defaults" {
     const config = TlsConfig{};
     try testing.expect(!config.needsTls());
@@ -808,6 +911,66 @@ test "TlsContext init plaintext" {
     var ctx = try TlsContext.init(testing.allocator, config);
     defer ctx.deinit();
     try testing.expect(!ctx.initialized);
+}
+
+test "TlsCertificateWatchState detects PEM file rotation" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const cert_path = try tlsRotationTestPath(&tmp, "cert.pem");
+    defer testing.allocator.free(cert_path);
+    const key_path = try tlsRotationTestPath(&tmp, "key.pem");
+    defer testing.allocator.free(key_path);
+
+    try writeTlsRotationTestFile(cert_path, "cert-v1");
+    try writeTlsRotationTestFile(key_path, "key-v1");
+
+    const config = TlsConfig{
+        .protocol = .ssl,
+        .cert_file = cert_path,
+        .key_file = key_path,
+    };
+    const initial = try TlsCertificateWatchState.capture(&config);
+    try testing.expect(initial.cert.configured);
+    try testing.expect(initial.cert.exists);
+    try testing.expect(initial.key.exists);
+    try testing.expect(!try initial.changed(&config));
+
+    try writeTlsRotationTestFile(cert_path, "cert-v2-rotated");
+    try testing.expect(try initial.changed(&config));
+}
+
+test "TlsCertificateWatchState treats deleted configured PEM as changed" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const cert_path = try tlsRotationTestPath(&tmp, "cert.pem");
+    defer testing.allocator.free(cert_path);
+    const key_path = try tlsRotationTestPath(&tmp, "key.pem");
+    defer testing.allocator.free(key_path);
+
+    try writeTlsRotationTestFile(cert_path, "cert-v1");
+    try writeTlsRotationTestFile(key_path, "key-v1");
+
+    const config = TlsConfig{
+        .protocol = .ssl,
+        .cert_file = cert_path,
+        .key_file = key_path,
+    };
+    const initial = try TlsCertificateWatchState.capture(&config);
+    try fs.deleteFileAbsolute(cert_path);
+
+    const current = try TlsCertificateWatchState.capture(&config);
+    try testing.expect(current.cert.configured);
+    try testing.expect(!current.cert.exists);
+    try testing.expect(!initial.eql(current));
+}
+
+test "TlsContext reloadIfCertificatesChanged no-ops without TLS" {
+    const config = TlsConfig{};
+    var ctx = try TlsContext.init(testing.allocator, config);
+    defer ctx.deinit();
+    try testing.expect(!try ctx.reloadIfCertificatesChanged());
 }
 
 test "TlsConnection init" {
