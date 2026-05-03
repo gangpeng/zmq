@@ -12,7 +12,7 @@ Run against a running ZMQ broker:
 Optional environment:
     ZMQ_CLIENT_MATRIX_BOOTSTRAP   localhost:9092
     ZMQ_CLIENT_MATRIX_TOOLS       auto | kcat,kafka-cli,kafka-python,confluent-kafka,java-kafka,go-kafka
-    ZMQ_CLIENT_MATRIX_SEMANTICS   basic | admin | groups | transactions | all (comma-separated)
+    ZMQ_CLIENT_MATRIX_SEMANTICS   basic | admin | groups | rebalance | transactions | security | all
     ZMQ_CLIENT_MATRIX_SECURITY_PROTOCOL
                                   PLAINTEXT | SASL_PLAINTEXT | SSL | SASL_SSL
     ZMQ_CLIENT_MATRIX_SASL_MECHANISM
@@ -44,6 +44,7 @@ Semantic probes:
     basic            metadata, produce/fetch, and offset commit where supported
     admin            explicit topic/config admin through real clients
     groups           consumer-group join/commit/list/describe where supported
+    rebalance        multi-consumer assignment convergence where supported
     transactions     transactional produce through clients that expose Kafka transactions
     security         run the selected probes with configured TLS/SASL client properties
 """
@@ -55,12 +56,14 @@ import subprocess
 import sys
 import tempfile
 import textwrap
+import time
 
 
 RUN_ENABLED = os.environ.get("ZMQ_RUN_CLIENT_MATRIX") == "1"
 BOOTSTRAP = os.environ.get("ZMQ_CLIENT_MATRIX_BOOTSTRAP", "localhost:9092")
 TOOLS = os.environ.get("ZMQ_CLIENT_MATRIX_TOOLS", "auto")
-SEMANTIC_ORDER = ["basic", "admin", "groups", "transactions", "security"]
+SEMANTIC_ORDER = ["basic", "admin", "groups", "rebalance", "transactions", "security"]
+REBALANCE_TOOLS = {"kafka-python", "confluent-kafka", "java-kafka"}
 TRANSACTION_TOOLS = {"confluent-kafka", "java-kafka"}
 SECURITY_TOOLS = {"kcat", "kafka-cli", "kafka-python", "confluent-kafka", "java-kafka"}
 JAVA_CLASSPATH = os.environ.get("ZMQ_CLIENT_MATRIX_JAVA_CLASSPATH")
@@ -339,6 +342,11 @@ def selected_tools():
 
 
 def ensure_tool_supports_semantics(tool):
+    if semantic_enabled("rebalance") and tool not in REBALANCE_TOOLS:
+        raise MatrixError(
+            f"{tool} selected with rebalance semantic, but only "
+            f"{', '.join(sorted(REBALANCE_TOOLS))} have rebalance probes"
+        )
     if semantic_enabled("transactions") and tool not in TRANSACTION_TOOLS:
         raise MatrixError(
             f"{tool} selected with transactions semantic, but only "
@@ -566,7 +574,7 @@ def test_kafka_python():
         topics = admin.list_topics()
         if topics is None:
             raise MatrixError("kafka-python list_topics returned None")
-        if semantic_enabled("admin"):
+        if semantic_enabled("admin") or semantic_enabled("rebalance"):
             try:
                 admin.create_topics(
                     [NewTopic(topic, num_partitions=2, replication_factor=1)],
@@ -616,11 +624,54 @@ def test_kafka_python():
                     raise MatrixError(
                         f"kafka-python committed offset mismatch: expected={expected_offset} got={committed}"
                     )
+                if semantic_enabled("rebalance"):
+                    test_kafka_python_rebalance(topic)
                 print(f"ok: kafka-python probes ({semantics_csv()})")
                 return
         raise MatrixError("kafka-python consumer did not fetch produced payload")
     finally:
         consumer.close()
+
+
+def test_kafka_python_rebalance(topic):
+    from kafka import KafkaConsumer
+
+    group = f"zmq-client-matrix-kafka-python-rebalance-{os.getpid()}"
+    consumers = [
+        KafkaConsumer(
+            bootstrap_servers=BOOTSTRAP,
+            client_id=f"zmq-client-matrix-kafka-python-rebalance-{idx}",
+            group_id=group,
+            auto_offset_reset="earliest",
+            enable_auto_commit=False,
+            consumer_timeout_ms=1000,
+            request_timeout_ms=10000,
+            api_version_auto_timeout_ms=5000,
+            **kafka_python_security_config(),
+        )
+        for idx in range(2)
+    ]
+    try:
+        for consumer in consumers:
+            consumer.subscribe([topic])
+        deadline = time.time() + 20
+        while time.time() < deadline:
+            assignments = []
+            for consumer in consumers:
+                consumer.poll(timeout_ms=500)
+                assignments.append(consumer.assignment())
+            partitions = {
+                tp.partition
+                for assignment in assignments
+                for tp in assignment
+                if tp.topic == topic
+            }
+            if all(assignments) and partitions.issuperset({0, 1}):
+                return
+        raise MatrixError(f"kafka-python rebalance did not assign both partitions: {assignments}")
+    finally:
+        for consumer in consumers:
+            consumer.close()
 
 
 def test_confluent_kafka():
@@ -645,7 +696,7 @@ def test_confluent_kafka():
     metadata = admin.list_topics(timeout=10)
     if not metadata.brokers:
         raise MatrixError("confluent-kafka metadata response did not include brokers")
-    if semantic_enabled("admin"):
+    if semantic_enabled("admin") or semantic_enabled("rebalance"):
         futures = admin.create_topics([NewTopic(topic, num_partitions=2, replication_factor=1)])
         for future in futures.values():
             try:
@@ -694,11 +745,51 @@ def test_confluent_kafka():
                     )
                 if semantic_enabled("transactions"):
                     test_confluent_transaction(topic)
+                if semantic_enabled("rebalance"):
+                    test_confluent_rebalance(topic)
                 print(f"ok: confluent-kafka probes ({semantics_csv()})")
                 return
         raise MatrixError("confluent-kafka consumer did not fetch produced payload")
     finally:
         consumer.close()
+
+
+def test_confluent_rebalance(topic):
+    from confluent_kafka import Consumer
+
+    group = f"zmq-client-matrix-confluent-rebalance-{os.getpid()}"
+    consumers = [
+        Consumer({
+            "bootstrap.servers": BOOTSTRAP,
+            "client.id": f"zmq-client-matrix-confluent-rebalance-{idx}",
+            "group.id": group,
+            "auto.offset.reset": "earliest",
+            "enable.auto.commit": False,
+            "socket.timeout.ms": 10000,
+            **confluent_security_config(),
+        })
+        for idx in range(2)
+    ]
+    try:
+        for consumer in consumers:
+            consumer.subscribe([topic])
+        deadline = time.time() + 20
+        while time.time() < deadline:
+            for consumer in consumers:
+                consumer.poll(0.5)
+            assignments = [consumer.assignment() for consumer in consumers]
+            partitions = {
+                tp.partition
+                for assignment in assignments
+                for tp in assignment
+                if tp.topic == topic
+            }
+            if all(assignments) and partitions.issuperset({0, 1}):
+                return
+        raise MatrixError(f"confluent-kafka rebalance did not assign both partitions: {assignments}")
+    finally:
+        for consumer in consumers:
+            consumer.close()
 
 
 def test_confluent_transaction(topic):
@@ -725,6 +816,7 @@ def test_confluent_transaction(topic):
 JAVA_MATRIX_SOURCE = r"""
 import java.time.Duration;
 import java.util.Collections;
+import java.util.HashSet;
 import java.util.Properties;
 import java.util.Set;
 import java.util.concurrent.TimeUnit;
@@ -758,7 +850,7 @@ public class ZmqKafkaClientMatrix {
             if (topics == null) {
                 throw new RuntimeException("AdminClient listTopics returned null");
             }
-            if (semantics.contains("admin")) {
+            if (semantics.contains("admin") || semantics.contains("rebalance")) {
                 try {
                     admin.createTopics(Collections.singleton(new NewTopic(topic, 2, (short) 1))).all().get(10, TimeUnit.SECONDS);
                 } catch (Exception e) {
@@ -812,6 +904,9 @@ public class ZmqKafkaClientMatrix {
                         if (semantics.contains("transactions")) {
                             runTransaction(bootstrap, topic, payload + "-txn");
                         }
+                        if (semantics.contains("rebalance")) {
+                            runRebalance(bootstrap, topic);
+                        }
                         return;
                     }
                 }
@@ -835,6 +930,52 @@ public class ZmqKafkaClientMatrix {
             producer.beginTransaction();
             producer.send(new ProducerRecord<>(topic, payload)).get(10, TimeUnit.SECONDS);
             producer.commitTransaction();
+        }
+    }
+
+    private static void runRebalance(String bootstrap, String topic) throws Exception {
+        Properties consumerProps = new Properties();
+        consumerProps.put("bootstrap.servers", bootstrap);
+        consumerProps.put("group.id", "zmq-client-matrix-java-rebalance-" + System.currentTimeMillis());
+        consumerProps.put("key.deserializer", StringDeserializer.class.getName());
+        consumerProps.put("value.deserializer", StringDeserializer.class.getName());
+        consumerProps.put("auto.offset.reset", "earliest");
+        consumerProps.put("enable.auto.commit", "false");
+        consumerProps.put("request.timeout.ms", "10000");
+        consumerProps.put("session.timeout.ms", "6000");
+        consumerProps.put("heartbeat.interval.ms", "2000");
+        applySecurity(consumerProps);
+
+        Properties firstProps = new Properties();
+        firstProps.putAll(consumerProps);
+        firstProps.put("client.id", "zmq-client-matrix-java-rebalance-0");
+        Properties secondProps = new Properties();
+        secondProps.putAll(consumerProps);
+        secondProps.put("client.id", "zmq-client-matrix-java-rebalance-1");
+
+        try (
+            KafkaConsumer<String, String> first = new KafkaConsumer<>(firstProps);
+            KafkaConsumer<String, String> second = new KafkaConsumer<>(secondProps)
+        ) {
+            first.subscribe(Collections.singletonList(topic));
+            second.subscribe(Collections.singletonList(topic));
+            long deadline = System.currentTimeMillis() + 20000;
+            while (System.currentTimeMillis() < deadline) {
+                first.poll(Duration.ofMillis(500));
+                second.poll(Duration.ofMillis(500));
+                Set<Integer> partitions = new HashSet<>();
+                first.assignment().forEach(tp -> {
+                    if (topic.equals(tp.topic())) partitions.add(tp.partition());
+                });
+                second.assignment().forEach(tp -> {
+                    if (topic.equals(tp.topic())) partitions.add(tp.partition());
+                });
+                if (!first.assignment().isEmpty() && !second.assignment().isEmpty()
+                    && partitions.contains(0) && partitions.contains(1)) {
+                    return;
+                }
+            }
+            throw new RuntimeException("Java rebalance did not assign both partitions");
         }
     }
 
@@ -1049,7 +1190,7 @@ def self_test():
         os.environ["ZMQ_CLIENT_MATRIX_PROFILES"] = "apache_3_7, go_1_21"
         os.environ["ZMQ_CLIENT_MATRIX_APACHE_3_7_TOOLS"] = "java-kafka"
         os.environ["ZMQ_CLIENT_MATRIX_APACHE_3_7_JAVA_CLASSPATH"] = "/opt/kafka-3.7/libs/*"
-        os.environ["ZMQ_CLIENT_MATRIX_APACHE_3_7_SEMANTICS"] = "admin,transactions,security"
+        os.environ["ZMQ_CLIENT_MATRIX_APACHE_3_7_SEMANTICS"] = "admin,rebalance,transactions,security"
         os.environ["ZMQ_CLIENT_MATRIX_APACHE_3_7_SECURITY_PROTOCOL"] = "SASL_PLAINTEXT"
         os.environ["ZMQ_CLIENT_MATRIX_APACHE_3_7_SASL_MECHANISM"] = "PLAIN"
         os.environ["ZMQ_CLIENT_MATRIX_APACHE_3_7_SASL_USERNAME"] = "matrix-user"
@@ -1065,7 +1206,7 @@ def self_test():
         apply_profile("apache_3_7")
         if TOOLS != "java-kafka" or JAVA_CLASSPATH != "/opt/kafka-3.7/libs/*":
             raise MatrixError("java profile override failed")
-        if semantics_csv() != "basic,admin,transactions,security":
+        if semantics_csv() != "basic,admin,rebalance,transactions,security":
             raise MatrixError(f"java semantics override failed: {semantics_csv()}")
         if not security_enabled():
             raise MatrixError("security semantic did not enable security config")
@@ -1089,6 +1230,14 @@ def self_test():
 
         if parse_semantics("all") != set(SEMANTIC_ORDER):
             raise MatrixError("semantic all parsing failed")
+        os.environ["ZMQ_CLIENT_MATRIX_GO_1_21_SEMANTICS"] = "rebalance"
+        apply_profile("go_1_21")
+        try:
+            ensure_tool_supports_semantics("go-kafka")
+            raise MatrixError("unsupported rebalance tool was accepted")
+        except MatrixError as exc:
+            if "rebalance probes" not in str(exc):
+                raise
         os.environ["ZMQ_CLIENT_MATRIX_GO_1_21_SEMANTICS"] = "security"
         apply_profile("go_1_21")
         try:
