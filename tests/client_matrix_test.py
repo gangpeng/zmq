@@ -13,6 +13,13 @@ Optional environment:
     ZMQ_CLIENT_MATRIX_BOOTSTRAP   localhost:9092
     ZMQ_CLIENT_MATRIX_TOOLS       auto | kcat,kafka-cli,kafka-python,confluent-kafka,java-kafka,go-kafka
     ZMQ_CLIENT_MATRIX_SEMANTICS   basic | admin | groups | transactions | all (comma-separated)
+    ZMQ_CLIENT_MATRIX_SECURITY_PROTOCOL
+                                  PLAINTEXT | SASL_PLAINTEXT | SSL | SASL_SSL
+    ZMQ_CLIENT_MATRIX_SASL_MECHANISM
+                                  PLAIN | SCRAM-SHA-256 | OAUTHBEARER
+    ZMQ_CLIENT_MATRIX_SASL_USERNAME
+    ZMQ_CLIENT_MATRIX_SASL_PASSWORD
+    ZMQ_CLIENT_MATRIX_SSL_CA_LOCATION
     ZMQ_CLIENT_MATRIX_PROFILES    Comma-separated profile names for explicit client/library version sets
     ZMQ_CLIENT_MATRIX_JAVA_CLASSPATH
                                   Classpath containing kafka-clients jars for java-kafka
@@ -38,6 +45,7 @@ Semantic probes:
     admin            explicit topic/config admin through real clients
     groups           consumer-group join/commit/list/describe where supported
     transactions     transactional produce through clients that expose Kafka transactions
+    security         run the selected probes with configured TLS/SASL client properties
 """
 
 import importlib.util
@@ -52,14 +60,20 @@ import textwrap
 RUN_ENABLED = os.environ.get("ZMQ_RUN_CLIENT_MATRIX") == "1"
 BOOTSTRAP = os.environ.get("ZMQ_CLIENT_MATRIX_BOOTSTRAP", "localhost:9092")
 TOOLS = os.environ.get("ZMQ_CLIENT_MATRIX_TOOLS", "auto")
-SEMANTIC_ORDER = ["basic", "admin", "groups", "transactions"]
+SEMANTIC_ORDER = ["basic", "admin", "groups", "transactions", "security"]
 TRANSACTION_TOOLS = {"confluent-kafka", "java-kafka"}
+SECURITY_TOOLS = {"kcat", "kafka-cli", "kafka-python", "confluent-kafka", "java-kafka"}
 JAVA_CLASSPATH = os.environ.get("ZMQ_CLIENT_MATRIX_JAVA_CLASSPATH")
 ENABLE_GO_AUTO = os.environ.get("ZMQ_CLIENT_MATRIX_ENABLE_GO") == "1"
 GO_MODULE = os.environ.get("ZMQ_CLIENT_MATRIX_GO_MODULE", "github.com/segmentio/kafka-go@latest")
 PYTHON = os.environ.get("ZMQ_CLIENT_MATRIX_PYTHON", sys.executable)
 ACTIVE_PROFILE = "default"
 SEMANTICS = None
+SECURITY_PROTOCOL = "PLAINTEXT"
+SASL_MECHANISM = None
+SASL_USERNAME = None
+SASL_PASSWORD = None
+SSL_CA_LOCATION = None
 
 
 class MatrixError(Exception):
@@ -91,6 +105,88 @@ def semantics_csv():
 
 def semantic_enabled(name):
     return name in SEMANTICS
+
+
+def security_enabled():
+    return semantic_enabled("security") or SECURITY_PROTOCOL.upper() != "PLAINTEXT"
+
+
+def security_properties():
+    if not security_enabled():
+        return {}
+    props = {"security.protocol": SECURITY_PROTOCOL}
+    if SASL_MECHANISM:
+        props["sasl.mechanism"] = SASL_MECHANISM
+        props["sasl.mechanisms"] = SASL_MECHANISM
+    if SASL_USERNAME:
+        props["sasl.username"] = SASL_USERNAME
+    if SASL_PASSWORD:
+        props["sasl.password"] = SASL_PASSWORD
+    if SSL_CA_LOCATION:
+        props["ssl.ca.location"] = SSL_CA_LOCATION
+    return props
+
+
+def kcat_security_args():
+    args = []
+    props = security_properties()
+    if not props:
+        return args
+    for key in ("security.protocol", "sasl.mechanisms", "sasl.username", "sasl.password", "ssl.ca.location"):
+        value = props.get(key)
+        if value:
+            args += ["-X", f"{key}={value}"]
+    return args
+
+
+def kafka_cli_security_config_path():
+    props = security_properties()
+    if not props:
+        return None
+    fd, path = tempfile.mkstemp(prefix="zmq-client-matrix-kafka-cli-", suffix=".properties")
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
+        for key in ("security.protocol", "sasl.mechanism", "sasl.username", "sasl.password", "ssl.ca.location"):
+            value = props.get(key)
+            if value:
+                f.write(f"{key}={value}\n")
+    return path
+
+
+def kafka_cli_command_config(args, config_path):
+    if config_path is None:
+        return args
+    return args + ["--command-config", config_path]
+
+
+def kafka_python_security_config():
+    if not security_enabled():
+        return {}
+    config = {"security_protocol": SECURITY_PROTOCOL}
+    if SASL_MECHANISM:
+        config["sasl_mechanism"] = SASL_MECHANISM
+    if SASL_USERNAME:
+        config["sasl_plain_username"] = SASL_USERNAME
+    if SASL_PASSWORD:
+        config["sasl_plain_password"] = SASL_PASSWORD
+    if SSL_CA_LOCATION:
+        config["ssl_cafile"] = SSL_CA_LOCATION
+    return config
+
+
+def confluent_security_config():
+    props = security_properties()
+    if not props:
+        return {}
+    config = {"security.protocol": props["security.protocol"]}
+    if SASL_MECHANISM:
+        config["sasl.mechanisms"] = SASL_MECHANISM
+    if SASL_USERNAME:
+        config["sasl.username"] = SASL_USERNAME
+    if SASL_PASSWORD:
+        config["sasl.password"] = SASL_PASSWORD
+    if SSL_CA_LOCATION:
+        config["ssl.ca.location"] = SSL_CA_LOCATION
+    return config
 
 
 def run(cmd, timeout=30, input_text=None, cwd=None, env=None):
@@ -160,11 +256,17 @@ def profile_setting(profile, suffix, fallback):
 
 def apply_profile(profile):
     global ACTIVE_PROFILE, BOOTSTRAP, TOOLS, SEMANTICS, JAVA_CLASSPATH, ENABLE_GO_AUTO, GO_MODULE, PYTHON
+    global SECURITY_PROTOCOL, SASL_MECHANISM, SASL_USERNAME, SASL_PASSWORD, SSL_CA_LOCATION
 
     ACTIVE_PROFILE = profile
     BOOTSTRAP = profile_setting(profile, "BOOTSTRAP", "localhost:9092")
     TOOLS = profile_setting(profile, "TOOLS", "auto")
     SEMANTICS = parse_semantics(profile_setting(profile, "SEMANTICS", "basic"))
+    SECURITY_PROTOCOL = profile_setting(profile, "SECURITY_PROTOCOL", "PLAINTEXT")
+    SASL_MECHANISM = profile_setting(profile, "SASL_MECHANISM", None)
+    SASL_USERNAME = profile_setting(profile, "SASL_USERNAME", None)
+    SASL_PASSWORD = profile_setting(profile, "SASL_PASSWORD", None)
+    SSL_CA_LOCATION = profile_setting(profile, "SSL_CA_LOCATION", None)
     JAVA_CLASSPATH = profile_setting(profile, "JAVA_CLASSPATH", None)
     ENABLE_GO_AUTO = profile_setting(profile, "ENABLE_GO", "0") == "1"
     GO_MODULE = profile_setting(profile, "GO_MODULE", "github.com/segmentio/kafka-go@latest")
@@ -190,6 +292,15 @@ def run_python_subtool(tool):
     env["ZMQ_CLIENT_MATRIX_BOOTSTRAP"] = BOOTSTRAP
     env["ZMQ_CLIENT_MATRIX_TOOLS"] = tool
     env["ZMQ_CLIENT_MATRIX_SEMANTICS"] = semantics_csv()
+    env["ZMQ_CLIENT_MATRIX_SECURITY_PROTOCOL"] = SECURITY_PROTOCOL
+    if SASL_MECHANISM:
+        env["ZMQ_CLIENT_MATRIX_SASL_MECHANISM"] = SASL_MECHANISM
+    if SASL_USERNAME:
+        env["ZMQ_CLIENT_MATRIX_SASL_USERNAME"] = SASL_USERNAME
+    if SASL_PASSWORD:
+        env["ZMQ_CLIENT_MATRIX_SASL_PASSWORD"] = SASL_PASSWORD
+    if SSL_CA_LOCATION:
+        env["ZMQ_CLIENT_MATRIX_SSL_CA_LOCATION"] = SSL_CA_LOCATION
     env["ZMQ_CLIENT_MATRIX_ENABLE_GO"] = "0"
     env["ZMQ_CLIENT_MATRIX_PYTHON"] = PYTHON
     env.pop("ZMQ_CLIENT_MATRIX_PROFILES", None)
@@ -233,26 +344,31 @@ def ensure_tool_supports_semantics(tool):
             f"{tool} selected with transactions semantic, but only "
             f"{', '.join(sorted(TRANSACTION_TOOLS))} have transaction probes"
         )
+    if security_enabled() and tool not in SECURITY_TOOLS:
+        raise MatrixError(
+            f"{tool} selected with security configuration, but only "
+            f"{', '.join(sorted(SECURITY_TOOLS))} have security interop probes"
+        )
 
 
 def test_kcat():
     if not have("kcat"):
         raise MatrixError("kcat selected but not found in PATH")
-    out = run(["kcat", "-L", "-b", BOOTSTRAP])
+    kcat_args = ["kcat"] + kcat_security_args()
+    out = run(kcat_args + ["-L", "-b", BOOTSTRAP])
     if "Metadata for" not in out and "broker" not in out.lower():
         raise MatrixError(f"kcat metadata output did not look valid\n{out}")
 
     topic = matrix_topic("kcat")
     payload = matrix_payload("kcat")
-    run(["kcat", "-P", "-b", BOOTSTRAP, "-t", topic], input_text=payload + "\n", timeout=45)
-    fetched = run(["kcat", "-C", "-b", BOOTSTRAP, "-t", topic, "-o", "beginning", "-c", "1", "-e"], timeout=45)
+    run(kcat_args + ["-P", "-b", BOOTSTRAP, "-t", topic], input_text=payload + "\n", timeout=45)
+    fetched = run(kcat_args + ["-C", "-b", BOOTSTRAP, "-t", topic, "-o", "beginning", "-c", "1", "-e"], timeout=45)
     require_output_contains(fetched, payload, "kcat")
 
     if semantic_enabled("groups"):
         group = f"zmq-client-matrix-kcat-{os.getpid()}"
         group_fetched = run(
-            [
-                "kcat",
+            kcat_args + [
                 "-C",
                 "-b",
                 BOOTSTRAP,
@@ -286,97 +402,143 @@ def test_kafka_cli():
     if semantic_enabled("groups") and not have("kafka-consumer-groups.sh"):
         raise MatrixError("kafka-cli group semantics selected but kafka-consumer-groups.sh is not in PATH")
 
-    api_out = run(["kafka-broker-api-versions.sh", "--bootstrap-server", BOOTSTRAP], timeout=45)
-    if "Produce" not in api_out and "ApiVersions" not in api_out:
-        raise MatrixError(f"kafka-broker-api-versions output did not include expected APIs\n{api_out}")
+    config_path = kafka_cli_security_config_path()
+    try:
+        api_out = run(
+            kafka_cli_command_config(
+                ["kafka-broker-api-versions.sh", "--bootstrap-server", BOOTSTRAP],
+                config_path,
+            ),
+            timeout=45,
+        )
+        if "Produce" not in api_out and "ApiVersions" not in api_out:
+            raise MatrixError(f"kafka-broker-api-versions output did not include expected APIs\n{api_out}")
 
-    run(["kafka-topics.sh", "--bootstrap-server", BOOTSTRAP, "--list"], timeout=45)
+        run(
+            kafka_cli_command_config(
+                ["kafka-topics.sh", "--bootstrap-server", BOOTSTRAP, "--list"],
+                config_path,
+            ),
+            timeout=45,
+        )
 
-    topic = matrix_topic("kafka-cli")
-    payload = matrix_payload("kafka-cli")
-    run(
-        [
-            "kafka-topics.sh",
+        topic = matrix_topic("kafka-cli")
+        payload = matrix_payload("kafka-cli")
+        run(
+            kafka_cli_command_config(
+                [
+                    "kafka-topics.sh",
+                    "--bootstrap-server",
+                    BOOTSTRAP,
+                    "--create",
+                    "--if-not-exists",
+                    "--topic",
+                    topic,
+                    "--partitions",
+                    "1",
+                    "--replication-factor",
+                    "1",
+                ],
+                config_path,
+            ),
+            timeout=45,
+        )
+        describe_out = run(
+            kafka_cli_command_config(
+                ["kafka-topics.sh", "--bootstrap-server", BOOTSTRAP, "--describe", "--topic", topic],
+                config_path,
+            ),
+            timeout=45,
+        )
+        if topic not in describe_out:
+            raise MatrixError(f"kafka-topics describe output did not include {topic!r}\n{describe_out}")
+
+        if semantic_enabled("admin"):
+            run(
+                kafka_cli_command_config(
+                    [
+                        "kafka-configs.sh",
+                        "--bootstrap-server",
+                        BOOTSTRAP,
+                        "--entity-type",
+                        "topics",
+                        "--entity-name",
+                        topic,
+                        "--alter",
+                        "--add-config",
+                        "max.message.bytes=1048576",
+                    ],
+                    config_path,
+                ),
+                timeout=45,
+            )
+            config_out = run(
+                kafka_cli_command_config(
+                    [
+                        "kafka-configs.sh",
+                        "--bootstrap-server",
+                        BOOTSTRAP,
+                        "--entity-type",
+                        "topics",
+                        "--entity-name",
+                        topic,
+                        "--describe",
+                    ],
+                    config_path,
+                ),
+                timeout=45,
+            )
+            if "max.message.bytes" not in config_out:
+                raise MatrixError(f"kafka-configs describe did not include altered topic config\n{config_out}")
+
+        producer_cmd = ["kafka-console-producer.sh", "--bootstrap-server", BOOTSTRAP, "--topic", topic]
+        if config_path is not None:
+            producer_cmd += ["--producer.config", config_path]
+        run(producer_cmd, input_text=payload + "\n", timeout=45)
+
+        group = f"zmq-client-matrix-kafka-cli-{os.getpid()}"
+        consumer_cmd = [
+            "kafka-console-consumer.sh",
             "--bootstrap-server",
             BOOTSTRAP,
-            "--create",
-            "--if-not-exists",
             "--topic",
             topic,
-            "--partitions",
+            "--from-beginning",
+            "--max-messages",
             "1",
-            "--replication-factor",
-            "1",
-        ],
-        timeout=45,
-    )
-    describe_out = run(["kafka-topics.sh", "--bootstrap-server", BOOTSTRAP, "--describe", "--topic", topic], timeout=45)
-    if topic not in describe_out:
-        raise MatrixError(f"kafka-topics describe output did not include {topic!r}\n{describe_out}")
-
-    if semantic_enabled("admin"):
-        run(
-            [
-                "kafka-configs.sh",
-                "--bootstrap-server",
-                BOOTSTRAP,
-                "--entity-type",
-                "topics",
-                "--entity-name",
-                topic,
-                "--alter",
-                "--add-config",
-                "max.message.bytes=1048576",
-            ],
-            timeout=45,
-        )
-        config_out = run(
-            [
-                "kafka-configs.sh",
-                "--bootstrap-server",
-                BOOTSTRAP,
-                "--entity-type",
-                "topics",
-                "--entity-name",
-                topic,
-                "--describe",
-            ],
-            timeout=45,
-        )
-        if "max.message.bytes" not in config_out:
-            raise MatrixError(f"kafka-configs describe did not include altered topic config\n{config_out}")
-
-    run(
-        ["kafka-console-producer.sh", "--bootstrap-server", BOOTSTRAP, "--topic", topic],
-        input_text=payload + "\n",
-        timeout=45,
-    )
-    group = f"zmq-client-matrix-kafka-cli-{os.getpid()}"
-    consumer_cmd = [
-        "kafka-console-consumer.sh",
-        "--bootstrap-server",
-        BOOTSTRAP,
-        "--topic",
-        topic,
-        "--from-beginning",
-        "--max-messages",
-        "1",
-        "--timeout-ms",
-        "10000",
-    ]
-    if semantic_enabled("groups"):
-        consumer_cmd += ["--group", group]
-    fetched = run(
-        consumer_cmd,
-        timeout=45,
-    )
-    require_output_contains(fetched, payload, "kafka-cli")
-    if semantic_enabled("groups"):
-        groups_out = run(["kafka-consumer-groups.sh", "--bootstrap-server", BOOTSTRAP, "--list"], timeout=45)
-        if group not in groups_out:
-            raise MatrixError(f"kafka-consumer-groups --list did not include {group!r}\n{groups_out}")
-        run(["kafka-consumer-groups.sh", "--bootstrap-server", BOOTSTRAP, "--describe", "--group", group], timeout=45)
-    print(f"ok: kafka CLI probes ({semantics_csv()})")
+            "--timeout-ms",
+            "10000",
+        ]
+        if config_path is not None:
+            consumer_cmd += ["--consumer.config", config_path]
+        if semantic_enabled("groups"):
+            consumer_cmd += ["--group", group]
+        fetched = run(consumer_cmd, timeout=45)
+        require_output_contains(fetched, payload, "kafka-cli")
+        if semantic_enabled("groups"):
+            groups_out = run(
+                kafka_cli_command_config(
+                    ["kafka-consumer-groups.sh", "--bootstrap-server", BOOTSTRAP, "--list"],
+                    config_path,
+                ),
+                timeout=45,
+            )
+            if group not in groups_out:
+                raise MatrixError(f"kafka-consumer-groups --list did not include {group!r}\n{groups_out}")
+            run(
+                kafka_cli_command_config(
+                    ["kafka-consumer-groups.sh", "--bootstrap-server", BOOTSTRAP, "--describe", "--group", group],
+                    config_path,
+                ),
+                timeout=45,
+            )
+        print(f"ok: kafka CLI probes ({semantics_csv()})")
+    finally:
+        if config_path is not None:
+            try:
+                os.unlink(config_path)
+            except FileNotFoundError:
+                pass
 
 
 def test_kafka_python():
@@ -398,6 +560,7 @@ def test_kafka_python():
         client_id="zmq-client-matrix-kafka-python",
         request_timeout_ms=10000,
         api_version_auto_timeout_ms=5000,
+        **kafka_python_security_config(),
     )
     try:
         topics = admin.list_topics()
@@ -422,6 +585,7 @@ def test_kafka_python():
         client_id="zmq-client-matrix-kafka-python-producer",
         request_timeout_ms=10000,
         api_version_auto_timeout_ms=5000,
+        **kafka_python_security_config(),
     )
     try:
         producer.send(topic, payload).get(timeout=10)
@@ -439,6 +603,7 @@ def test_kafka_python():
         consumer_timeout_ms=10000,
         request_timeout_ms=10000,
         api_version_auto_timeout_ms=5000,
+        **kafka_python_security_config(),
     )
     try:
         for message in consumer:
@@ -473,6 +638,7 @@ def test_confluent_kafka():
         "bootstrap.servers": BOOTSTRAP,
         "client.id": "zmq-client-matrix-confluent-kafka",
         "socket.timeout.ms": 10000,
+        **confluent_security_config(),
     })
     topic = matrix_topic("confluent-kafka")
     payload = matrix_payload("confluent-kafka").encode()
@@ -493,6 +659,7 @@ def test_confluent_kafka():
         "client.id": "zmq-client-matrix-confluent-producer",
         "socket.timeout.ms": 10000,
         "message.timeout.ms": 10000,
+        **confluent_security_config(),
     })
     producer.produce(topic, payload)
     if producer.flush(10) != 0:
@@ -505,6 +672,7 @@ def test_confluent_kafka():
         "auto.offset.reset": "earliest",
         "enable.auto.commit": False,
         "socket.timeout.ms": 10000,
+        **confluent_security_config(),
     })
     try:
         consumer.subscribe([topic])
@@ -543,6 +711,7 @@ def test_confluent_transaction(topic):
         "transactional.id": f"zmq-client-matrix-confluent-txn-{os.getpid()}",
         "socket.timeout.ms": 10000,
         "message.timeout.ms": 10000,
+        **confluent_security_config(),
     })
     producer.init_transactions(15)
     producer.begin_transaction()
@@ -583,6 +752,7 @@ public class ZmqKafkaClientMatrix {
         adminProps.put("bootstrap.servers", bootstrap);
         adminProps.put("client.id", "zmq-client-matrix-java-admin");
         adminProps.put("request.timeout.ms", "10000");
+        applySecurity(adminProps);
         try (AdminClient admin = AdminClient.create(adminProps)) {
             Set<String> topics = admin.listTopics().names().get(10, TimeUnit.SECONDS);
             if (topics == null) {
@@ -607,6 +777,7 @@ public class ZmqKafkaClientMatrix {
         producerProps.put("acks", "1");
         producerProps.put("request.timeout.ms", "10000");
         producerProps.put("delivery.timeout.ms", "15000");
+        applySecurity(producerProps);
         try (KafkaProducer<String, String> producer = new KafkaProducer<>(producerProps)) {
             producer.send(new ProducerRecord<>(topic, payload)).get(10, TimeUnit.SECONDS);
             producer.flush();
@@ -623,6 +794,7 @@ public class ZmqKafkaClientMatrix {
         consumerProps.put("request.timeout.ms", "10000");
         consumerProps.put("session.timeout.ms", "6000");
         consumerProps.put("heartbeat.interval.ms", "2000");
+        applySecurity(consumerProps);
         try (KafkaConsumer<String, String> consumer = new KafkaConsumer<>(consumerProps)) {
             consumer.subscribe(Collections.singletonList(topic));
             long deadline = System.currentTimeMillis() + 10000;
@@ -657,11 +829,27 @@ public class ZmqKafkaClientMatrix {
         producerProps.put("value.serializer", StringSerializer.class.getName());
         producerProps.put("request.timeout.ms", "10000");
         producerProps.put("delivery.timeout.ms", "15000");
+        applySecurity(producerProps);
         try (KafkaProducer<String, String> producer = new KafkaProducer<>(producerProps)) {
             producer.initTransactions();
             producer.beginTransaction();
             producer.send(new ProducerRecord<>(topic, payload)).get(10, TimeUnit.SECONDS);
             producer.commitTransaction();
+        }
+    }
+
+    private static void applySecurity(Properties props) {
+        putEnv(props, "security.protocol", "ZMQ_CLIENT_MATRIX_SECURITY_PROTOCOL");
+        putEnv(props, "sasl.mechanism", "ZMQ_CLIENT_MATRIX_SASL_MECHANISM");
+        putEnv(props, "sasl.username", "ZMQ_CLIENT_MATRIX_SASL_USERNAME");
+        putEnv(props, "sasl.password", "ZMQ_CLIENT_MATRIX_SASL_PASSWORD");
+        putEnv(props, "ssl.truststore.location", "ZMQ_CLIENT_MATRIX_SSL_CA_LOCATION");
+    }
+
+    private static void putEnv(Properties props, String key, String env) {
+        String value = System.getenv(env);
+        if (value != null && !value.isEmpty()) {
+            props.put(key, value);
         }
     }
 }
@@ -861,7 +1049,11 @@ def self_test():
         os.environ["ZMQ_CLIENT_MATRIX_PROFILES"] = "apache_3_7, go_1_21"
         os.environ["ZMQ_CLIENT_MATRIX_APACHE_3_7_TOOLS"] = "java-kafka"
         os.environ["ZMQ_CLIENT_MATRIX_APACHE_3_7_JAVA_CLASSPATH"] = "/opt/kafka-3.7/libs/*"
-        os.environ["ZMQ_CLIENT_MATRIX_APACHE_3_7_SEMANTICS"] = "admin,transactions"
+        os.environ["ZMQ_CLIENT_MATRIX_APACHE_3_7_SEMANTICS"] = "admin,transactions,security"
+        os.environ["ZMQ_CLIENT_MATRIX_APACHE_3_7_SECURITY_PROTOCOL"] = "SASL_PLAINTEXT"
+        os.environ["ZMQ_CLIENT_MATRIX_APACHE_3_7_SASL_MECHANISM"] = "PLAIN"
+        os.environ["ZMQ_CLIENT_MATRIX_APACHE_3_7_SASL_USERNAME"] = "matrix-user"
+        os.environ["ZMQ_CLIENT_MATRIX_APACHE_3_7_SASL_PASSWORD"] = "matrix-pass"
         os.environ["ZMQ_CLIENT_MATRIX_GO_1_21_TOOLS"] = "go-kafka"
         os.environ["ZMQ_CLIENT_MATRIX_GO_1_21_GO_MODULE"] = "github.com/segmentio/kafka-go@v0.4.47"
         os.environ["ZMQ_CLIENT_MATRIX_GO_1_21_SEMANTICS"] = "admin,groups"
@@ -873,8 +1065,21 @@ def self_test():
         apply_profile("apache_3_7")
         if TOOLS != "java-kafka" or JAVA_CLASSPATH != "/opt/kafka-3.7/libs/*":
             raise MatrixError("java profile override failed")
-        if semantics_csv() != "basic,admin,transactions":
+        if semantics_csv() != "basic,admin,transactions,security":
             raise MatrixError(f"java semantics override failed: {semantics_csv()}")
+        if not security_enabled():
+            raise MatrixError("security semantic did not enable security config")
+        props = security_properties()
+        if props.get("security.protocol") != "SASL_PLAINTEXT" or props.get("sasl.mechanism") != "PLAIN":
+            raise MatrixError(f"security property override failed: {props}")
+        kafka_props_path = kafka_cli_security_config_path()
+        try:
+            with open(kafka_props_path, "r", encoding="utf-8") as f:
+                kafka_props = f.read()
+            if "security.protocol=SASL_PLAINTEXT" not in kafka_props:
+                raise MatrixError("Kafka CLI security config self-test failed")
+        finally:
+            os.unlink(kafka_props_path)
 
         apply_profile("go_1_21")
         if TOOLS != "go-kafka" or GO_MODULE != "github.com/segmentio/kafka-go@v0.4.47":
@@ -884,6 +1089,16 @@ def self_test():
 
         if parse_semantics("all") != set(SEMANTIC_ORDER):
             raise MatrixError("semantic all parsing failed")
+        os.environ["ZMQ_CLIENT_MATRIX_GO_1_21_SEMANTICS"] = "security"
+        apply_profile("go_1_21")
+        try:
+            ensure_tool_supports_semantics("go-kafka")
+            raise MatrixError("unsupported security tool was accepted")
+        except MatrixError as exc:
+            if "security interop probes" not in str(exc):
+                raise
+        os.environ["ZMQ_CLIENT_MATRIX_GO_1_21_SEMANTICS"] = "admin,groups"
+        apply_profile("go_1_21")
         try:
             parse_semantics("basic,unknown")
             raise MatrixError("unknown semantic probe was accepted")
