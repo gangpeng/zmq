@@ -1354,31 +1354,27 @@ pub const Broker = struct {
 
     /// Persist stream/object metadata snapshots to disk (best-effort).
     fn persistObjectManagerSnapshot(self: *Broker) void {
+        self.persistObjectManagerSnapshotDurably() catch |err| {
+            log.warn("Failed to persist ObjectManager snapshot: {}", .{err});
+        };
+    }
+
+    fn persistObjectManagerSnapshotDurably(self: *Broker) !void {
         var empty_orphans = [_][]const u8{};
         const orphaned_keys: []const []const u8 = if (self.compaction_manager) |*cm|
             cm.orphaned_keys.items
         else
             empty_orphans[0..];
 
-        const object_snapshot = self.object_manager.takeSnapshot(orphaned_keys) catch |err| {
-            log.warn("Failed to build ObjectManager snapshot: {}", .{err});
-            return;
-        };
+        const object_snapshot = try self.object_manager.takeSnapshot(orphaned_keys);
         defer self.allocator.free(object_snapshot);
 
-        self.persistence.saveObjectManagerSnapshot(object_snapshot) catch |err| {
-            log.warn("Failed to persist ObjectManager snapshot: {}", .{err});
-        };
+        try self.persistence.saveObjectManagerSnapshot(object_snapshot);
 
-        const prepared_snapshot = self.object_manager.prepared_registry.serialize(self.allocator) catch |err| {
-            log.warn("Failed to build prepared object registry snapshot: {}", .{err});
-            return;
-        };
+        const prepared_snapshot = try self.object_manager.prepared_registry.serialize(self.allocator);
         defer self.allocator.free(prepared_snapshot);
 
-        self.persistence.savePreparedObjectRegistrySnapshot(prepared_snapshot) catch |err| {
-            log.warn("Failed to persist prepared object registry snapshot: {}", .{err});
-        };
+        try self.persistence.savePreparedObjectRegistrySnapshot(prepared_snapshot);
     }
 
     fn freeOrphanedKeys(self: *Broker, keys: [][]u8) void {
@@ -1443,6 +1439,46 @@ pub const Broker = struct {
             self.rebuildPreparedRegistryFromObjectSnapshot();
         }
         return true;
+    }
+
+    const ObjectManagerLocalSnapshot = struct {
+        object_snapshot: []u8,
+        prepared_snapshot: []u8,
+    };
+
+    fn takeObjectManagerLocalSnapshot(self: *Broker) !ObjectManagerLocalSnapshot {
+        var empty_orphans = [_][]const u8{};
+        const orphaned_keys: []const []const u8 = if (self.compaction_manager) |*cm|
+            cm.orphaned_keys.items
+        else
+            empty_orphans[0..];
+
+        const object_snapshot = try self.object_manager.takeSnapshot(orphaned_keys);
+        errdefer self.allocator.free(object_snapshot);
+        const prepared_snapshot = try self.object_manager.prepared_registry.serialize(self.allocator);
+        return .{
+            .object_snapshot = object_snapshot,
+            .prepared_snapshot = prepared_snapshot,
+        };
+    }
+
+    fn freeObjectManagerLocalSnapshot(self: *Broker, snapshot: *ObjectManagerLocalSnapshot) void {
+        self.allocator.free(snapshot.object_snapshot);
+        self.allocator.free(snapshot.prepared_snapshot);
+    }
+
+    fn restoreObjectManagerLocalSnapshot(self: *Broker, snapshot: ObjectManagerLocalSnapshot) void {
+        self.resetObjectManagerForQuorumSnapshot();
+        const orphaned_keys = self.object_manager.loadSnapshot(snapshot.object_snapshot) catch |err| {
+            log.err("Failed to restore ObjectManager snapshot after rollback: {}", .{err});
+            return;
+        };
+        self.attachOrphanedKeysToCompaction(orphaned_keys) catch |err| {
+            log.err("Failed to restore ObjectManager orphaned keys after rollback: {}", .{err});
+        };
+        self.object_manager.prepared_registry.deserialize(snapshot.prepared_snapshot) catch |err| {
+            log.err("Failed to restore prepared object registry after rollback: {}", .{err});
+        };
     }
 
     fn clearAutoMqMetadata(self: *Broker) void {
@@ -8636,6 +8672,15 @@ pub const Broker = struct {
         self.persistObjectManagerSnapshot();
     }
 
+    fn persistObjectManagerMutationDurably(self: *Broker) !void {
+        try self.commitAutoMqObjectMetadataRecord();
+        if (self.raft_state != null) {
+            self.persistObjectManagerSnapshot();
+            return;
+        }
+        try self.persistObjectManagerSnapshotDurably();
+    }
+
     fn resetObjectManagerForQuorumSnapshot(self: *Broker) void {
         self.object_manager.deinit();
         self.object_manager = ObjectManager.init(self.allocator, self.node_id);
@@ -15667,6 +15712,11 @@ pub const Broker = struct {
         }
 
         var mutated = false;
+        var previous_snapshot: ?ObjectManagerLocalSnapshot = null;
+        defer if (previous_snapshot) |*snapshot| self.freeObjectManagerLocalSnapshot(snapshot);
+        if (self.raft_state == null) {
+            previous_snapshot = self.takeObjectManagerLocalSnapshot() catch return null;
+        }
         for (req.create_stream_requests, 0..) |item, i| {
             const owner_node = if (item.node_id != 0) item.node_id else if (req.node_id != 0) req.node_id else self.node_id;
             const stream = self.object_manager.createStream(owner_node) catch |err| {
@@ -15677,10 +15727,14 @@ pub const Broker = struct {
             mutated = true;
         }
         if (mutated) {
-            self.persistObjectManagerMutation() catch |err| {
+            self.persistObjectManagerMutationDurably() catch |err| {
                 const err_code = autoMqQuorumErrorCode(err);
+                if (previous_snapshot) |snapshot| self.restoreObjectManagerLocalSnapshot(snapshot);
                 for (responses) |*response| {
-                    if (response.error_code == 0) response.error_code = err_code;
+                    if (response.error_code == 0) {
+                        response.error_code = err_code;
+                        response.stream_id = -1;
+                    }
                 }
             };
         }
@@ -15874,13 +15928,19 @@ pub const Broker = struct {
             return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
         }
 
+        var previous_snapshot: ?ObjectManagerLocalSnapshot = null;
+        defer if (previous_snapshot) |*snapshot| self.freeObjectManagerLocalSnapshot(snapshot);
+        if (self.raft_state == null) {
+            previous_snapshot = self.takeObjectManagerLocalSnapshot() catch return null;
+        }
         var first_id: u64 = 0;
         var i: i32 = 0;
         while (i < req.prepared_count) : (i += 1) {
             const object_id = self.object_manager.prepareObjectWithTtl(req.time_to_live_in_ms);
             if (i == 0) first_id = object_id;
         }
-        self.persistObjectManagerMutation() catch |err| {
+        self.persistObjectManagerMutationDurably() catch |err| {
+            if (previous_snapshot) |snapshot| self.restoreObjectManagerLocalSnapshot(snapshot);
             const resp = Resp{ .error_code = autoMqQuorumErrorCode(err), .throttle_time_ms = 0, .first_s3_object_id = -1 };
             return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
         };
@@ -33374,6 +33434,72 @@ test "Broker rejects AutoMQ object metadata mutation when not leader" {
     try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.not_controller)), create_resp.create_stream_responses[0].error_code);
     try testing.expectEqual(initial_stream_count, broker.object_manager.streamCount());
     try testing.expectEqual(@as(usize, 0), raft.log.length());
+}
+
+test "Broker AutoMQ object mutations roll back when local snapshot persistence fails" {
+    const fs = @import("fs_compat");
+    const tmp_dir = "/tmp/zmq-automq-object-persist-fail-test";
+    fs.deleteTreeAbsolute(tmp_dir) catch {};
+    try fs.makeDirAbsolute(tmp_dir);
+    defer fs.deleteTreeAbsolute(tmp_dir) catch {};
+
+    const object_snapshot_path = try std.fmt.allocPrint(testing.allocator, "{s}/objects.snapshot", .{tmp_dir});
+    defer testing.allocator.free(object_snapshot_path);
+    try fs.makeDirAbsolute(object_snapshot_path);
+
+    const CreateReq = generated.create_streams_request.CreateStreamsRequest;
+    const CreateResp = generated.create_streams_response.CreateStreamsResponse;
+    const PrepareReq = generated.prepare_s3_object_request.PrepareS3ObjectRequest;
+    const PrepareResp = generated.prepare_s3_object_response.PrepareS3ObjectResponse;
+    const storage_error = @as(i16, @intFromEnum(ErrorCode.kafka_storage_error));
+
+    var broker = Broker.initWithConfig(testing.allocator, 1, 9092, .{ .data_dir = tmp_dir });
+    defer broker.deinit();
+
+    var buf: [512]u8 = undefined;
+    var pos = buildTestRequest(&buf, 501, 0, 5011, header_mod.requestHeaderVersion(501, 0));
+    const create_items = [_]CreateReq.CreateStreamRequest{.{ .node_id = 1 }};
+    const create_req = CreateReq{ .node_id = 1, .node_epoch = 1, .create_stream_requests = &create_items };
+    create_req.serialize(&buf, &pos, 0);
+
+    const create_response = broker.handleRequest(buf[0..pos]);
+    try testing.expect(create_response != null);
+    defer testing.allocator.free(create_response.?);
+
+    var rpos: usize = 0;
+    var create_header = try ResponseHeader.deserialize(testing.allocator, create_response.?, &rpos, header_mod.responseHeaderVersion(501, 0));
+    defer create_header.deinit(testing.allocator);
+    try testing.expectEqual(@as(i32, 5011), create_header.correlation_id);
+    const create_resp = try CreateResp.deserialize(testing.allocator, create_response.?, &rpos, 0);
+    defer testing.allocator.free(create_resp.create_stream_responses);
+
+    try testing.expectEqual(create_response.?.len, rpos);
+    try testing.expectEqual(@as(i16, 0), create_resp.error_code);
+    try testing.expectEqual(@as(usize, 1), create_resp.create_stream_responses.len);
+    try testing.expectEqual(storage_error, create_resp.create_stream_responses[0].error_code);
+    try testing.expectEqual(@as(i64, -1), create_resp.create_stream_responses[0].stream_id);
+    try testing.expectEqual(@as(usize, 0), broker.object_manager.streamCount());
+
+    const next_object_id_before = broker.object_manager.next_object_id;
+    pos = buildTestRequest(&buf, 505, 0, 5051, header_mod.requestHeaderVersion(505, 0));
+    const prepare_req = PrepareReq{ .prepared_count = 2, .time_to_live_in_ms = 1000 };
+    prepare_req.serialize(&buf, &pos, 0);
+
+    const prepare_response = broker.handleRequest(buf[0..pos]);
+    try testing.expect(prepare_response != null);
+    defer testing.allocator.free(prepare_response.?);
+
+    rpos = 0;
+    var prepare_header = try ResponseHeader.deserialize(testing.allocator, prepare_response.?, &rpos, header_mod.responseHeaderVersion(505, 0));
+    defer prepare_header.deinit(testing.allocator);
+    try testing.expectEqual(@as(i32, 5051), prepare_header.correlation_id);
+    const prepare_resp = try PrepareResp.deserialize(testing.allocator, prepare_response.?, &rpos, 0);
+
+    try testing.expectEqual(prepare_response.?.len, rpos);
+    try testing.expectEqual(storage_error, prepare_resp.error_code);
+    try testing.expectEqual(@as(i64, -1), prepare_resp.first_s3_object_id);
+    try testing.expectEqual(next_object_id_before, broker.object_manager.next_object_id);
+    try testing.expectEqual(@as(usize, 0), broker.object_manager.prepared_registry.count());
 }
 
 test "Broker AutoMQ KV APIs round-trip" {
