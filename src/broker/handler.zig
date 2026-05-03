@@ -42101,6 +42101,65 @@ test "Broker.handleRequest BeginQuorumEpoch authorization denial uses generated 
     try testing.expectEqual(@as(i32, 0), raft.current_epoch);
 }
 
+test "Broker.handleRequest BeginQuorumEpoch fences S3 WAL writer on higher leader epoch" {
+    const Req = generated.begin_quorum_epoch_request.BeginQuorumEpochRequest;
+    const Resp = generated.begin_quorum_epoch_response.BeginQuorumEpochResponse;
+
+    var raft = RaftState.init(testing.allocator, 5, "begin-fence-s3-wal");
+    defer raft.deinit();
+    _ = raft.startElection();
+    raft.becomeLeader();
+    try testing.expectEqual(.leader, raft.role);
+    try testing.expectEqual(@as(i32, 1), raft.current_epoch);
+
+    var broker = Broker.init(testing.allocator, 5, 19094);
+    defer broker.deinit();
+    broker.setRaftState(&raft);
+    broker.store.s3_wal_batcher = storage.wal.S3WalBatcher.init(testing.allocator);
+    try testing.expect(!broker.store.s3_wal_batcher.?.is_fenced);
+
+    const zero_uuid = [_]u8{0} ** 16;
+    const partitions = [_]Req.TopicData.PartitionData{.{
+        .partition_index = 0,
+        .voter_directory_id = zero_uuid,
+        .leader_id = 7,
+        .leader_epoch = 2,
+    }};
+    const topics = [_]Req.TopicData{.{
+        .topic_name = "__cluster_metadata",
+        .partitions = &partitions,
+    }};
+    const req = Req{
+        .cluster_id = "begin-fence-s3-wal",
+        .voter_id = 5,
+        .topics = &topics,
+    };
+
+    var buf: [1024]u8 = undefined;
+    var pos = buildTestRequest(&buf, 53, 1, 5315, header_mod.requestHeaderVersion(53, 1));
+    req.serialize(&buf, &pos, 1);
+
+    const response = broker.handleRequest(buf[0..pos]);
+    try testing.expect(response != null);
+    defer testing.allocator.free(response.?);
+
+    var rpos: usize = 0;
+    var response_header = try ResponseHeader.deserialize(testing.allocator, response.?, &rpos, header_mod.responseHeaderVersion(53, 1));
+    defer response_header.deinit(testing.allocator);
+    try testing.expectEqual(@as(i32, 5315), response_header.correlation_id);
+
+    const resp = try Resp.deserialize(testing.allocator, response.?, &rpos, 1);
+    defer freeDeserializedBeginQuorumEpochResponse(&resp);
+    try testing.expectEqual(response.?.len, rpos);
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.none)), resp.error_code);
+
+    try testing.expectEqual(.follower, raft.role);
+    try testing.expectEqual(@as(i32, 2), raft.current_epoch);
+    try testing.expectEqual(@as(i32, 7), raft.leader_id.?);
+    try testing.expect(broker.store.s3_wal_batcher.?.is_fenced);
+    try testing.expectError(error.WalFenced, broker.store.s3_wal_batcher.?.append(123, 0, "records-after-fence"));
+}
+
 test "Broker.handleRequest BeginQuorumEpoch applies internal AutoMQ AppendEntries payload" {
     const Resp = generated.begin_quorum_epoch_response.BeginQuorumEpochResponse;
 
