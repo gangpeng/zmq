@@ -922,6 +922,12 @@ pub const MetadataPersistence = struct {
         removing_replicas: []i32,
     };
 
+    pub const ReplicaDirectoryAssignmentEntry = struct {
+        topic_id: [16]u8,
+        partition_index: i32,
+        directory_id: [16]u8,
+    };
+
     /// Save transaction state to disk.
     /// NOTE: AutoMQ/Kafka persists to __transaction_state topic on coordinator startup.
     /// ZMQ uses file-based persistence as a simplification.
@@ -1427,6 +1433,82 @@ pub const MetadataPersistence = struct {
             if (entry.adding_replicas.len > 0) self.allocator.free(entry.adding_replicas);
             if (entry.removing_replicas.len > 0) self.allocator.free(entry.removing_replicas);
         }
+        if (entries.len > 0) self.allocator.free(entries);
+    }
+
+    /// Save local replica-directory assignments to disk.
+    /// Format: replica_directory_assignments.meta TSV with hex topic/directory UUIDs.
+    pub fn saveReplicaDirectoryAssignments(self: *MetadataPersistence, assignments: anytype) !void {
+        const dir = self.data_dir orelse return;
+
+        const path = try std.fmt.allocPrint(self.allocator, "{s}/replica_directory_assignments.meta", .{dir});
+        defer self.allocator.free(path);
+
+        const file = try fs.createFileAbsolute(path, .{ .truncate = true });
+        defer file.close();
+        const writer = file.writer();
+
+        var it = assignments.iterator();
+        while (it.next()) |entry| {
+            const assignment = entry.value_ptr;
+            try file.writeAll("replica_dir\t");
+            try writeHex(file, assignment.topic_id[0..]);
+            try writer.print("\t{d}\t", .{assignment.partition_index});
+            try writeHex(file, assignment.directory_id[0..]);
+            try file.writeAll("\n");
+        }
+        try file.sync();
+    }
+
+    pub fn loadReplicaDirectoryAssignments(self: *MetadataPersistence) ![]ReplicaDirectoryAssignmentEntry {
+        const dir = self.data_dir orelse return &.{};
+
+        const path = try std.fmt.allocPrint(self.allocator, "{s}/replica_directory_assignments.meta", .{dir});
+        defer self.allocator.free(path);
+
+        const file = fs.openFileAbsolute(path, .{}) catch |err| {
+            log.debug("No replica_directory_assignments.meta found: {}", .{err});
+            return &.{};
+        };
+        defer file.close();
+
+        const content = file.readToEndAlloc(self.allocator, 1024 * 1024) catch |err| {
+            log.warn("Failed to read replica_directory_assignments.meta: {}", .{err});
+            return &.{};
+        };
+        defer self.allocator.free(content);
+
+        var entries = std.array_list.Managed(ReplicaDirectoryAssignmentEntry).init(self.allocator);
+        errdefer entries.deinit();
+
+        var lines = std.mem.splitSequence(u8, content, "\n");
+        while (lines.next()) |line| {
+            if (line.len == 0) continue;
+
+            var fields = std.mem.splitSequence(u8, line, "\t");
+            const tag = fields.next() orelse continue;
+            if (!std.mem.eql(u8, tag, "replica_dir")) continue;
+
+            const topic_id_hex = fields.next() orelse continue;
+            const partition_str = fields.next() orelse continue;
+            const directory_id_hex = fields.next() orelse continue;
+
+            const topic_id = decodeUuidHex(topic_id_hex) catch continue;
+            const partition_index = std.fmt.parseInt(i32, partition_str, 10) catch continue;
+            const directory_id = decodeUuidHex(directory_id_hex) catch continue;
+
+            try entries.append(.{
+                .topic_id = topic_id,
+                .partition_index = partition_index,
+                .directory_id = directory_id,
+            });
+        }
+
+        log.info("Loaded {d} replica directory assignments from replica_directory_assignments.meta", .{entries.items.len});
+        return entries.toOwnedSlice();
+    }
+
+    pub fn freeReplicaDirectoryAssignmentEntries(self: *MetadataPersistence, entries: []ReplicaDirectoryAssignmentEntry) void {
         if (entries.len > 0) self.allocator.free(entries);
     }
 
@@ -2139,6 +2221,41 @@ test "MetadataPersistence load partition reassignments missing file" {
 
     const loaded = try persistence.loadPartitionReassignments();
     try testing.expectEqual(@as(usize, 0), loaded.len);
+}
+
+test "MetadataPersistence save and load replica directory assignments round-trip" {
+    const tmp_dir = "/tmp/automq-replica-directory-assignment-test";
+    fs.deleteTreeAbsolute(tmp_dir) catch {};
+    fs.makeDirAbsolute(tmp_dir) catch {};
+    defer fs.deleteTreeAbsolute(tmp_dir) catch {};
+
+    var persistence = MetadataPersistence.init(testing.allocator, tmp_dir);
+
+    const ReplicaDirectoryAssignment = struct {
+        topic_id: [16]u8,
+        partition_index: i32,
+        directory_id: [16]u8,
+    };
+    var assignments = std.StringHashMap(ReplicaDirectoryAssignment).init(testing.allocator);
+    defer assignments.deinit();
+
+    const topic_id = [_]u8{0x11} ** 16;
+    const directory_id = [_]u8{0x22} ** 16;
+    try assignments.put("topic-0", .{
+        .topic_id = topic_id,
+        .partition_index = 3,
+        .directory_id = directory_id,
+    });
+
+    try persistence.saveReplicaDirectoryAssignments(&assignments);
+
+    const loaded = try persistence.loadReplicaDirectoryAssignments();
+    defer persistence.freeReplicaDirectoryAssignmentEntries(loaded);
+
+    try testing.expectEqual(@as(usize, 1), loaded.len);
+    try testing.expectEqualSlices(u8, topic_id[0..], loaded[0].topic_id[0..]);
+    try testing.expectEqual(@as(i32, 3), loaded[0].partition_index);
+    try testing.expectEqualSlices(u8, directory_id[0..], loaded[0].directory_id[0..]);
 }
 
 test "MetadataPersistence save and load AutoMQ metadata round-trip" {

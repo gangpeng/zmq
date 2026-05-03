@@ -188,8 +188,8 @@ Status: completed for the initial catalog and DeleteGroups slice.
   controller-backed JBOD directory semantics exist, but direct requests now
   validate/decode generated flexible frames, validate broker identity/epoch and
   directory/topic/partition targets, reject duplicate assignments, return
-  generated per-partition errors, and maintain local replica-directory
-  assignment state.
+  generated per-partition errors, maintain local replica-directory assignment
+  state, and restore that state across local broker restart.
   ShareGroupHeartbeat and ShareGroupDescribe remain non-advertised until durable
   share-group coordinator semantics exist, but direct v0 probes now join,
   heartbeat, update subscriptions/rack metadata, leave, return deterministic

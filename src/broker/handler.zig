@@ -97,7 +97,7 @@ pub const Broker = struct {
     /// Local share fetch session epochs keyed by group/member.
     share_group_sessions: std.StringHashMap(i32),
     /// Local replica directory assignments keyed by topic-id/partition.
-    replica_directory_assignments: std.StringHashMap([16]u8),
+    replica_directory_assignments: std.StringHashMap(ReplicaDirectoryAssignment),
     /// Idempotent producer deduplication: tracks last sequence number per producer+partition.
     producer_sequences: std.AutoHashMap(ProducerKey, ProducerSequenceState),
     allocator: Allocator,
@@ -261,6 +261,12 @@ pub const Broker = struct {
             if (self.adding_replicas.len > 0) alloc.free(self.adding_replicas);
             if (self.removing_replicas.len > 0) alloc.free(self.removing_replicas);
         }
+    };
+
+    pub const ReplicaDirectoryAssignment = struct {
+        topic_id: [16]u8,
+        partition_index: i32,
+        directory_id: [16]u8,
     };
 
     pub const ShareStateBatch = struct {
@@ -439,7 +445,7 @@ pub const Broker = struct {
             .auto_mq_group_promotions = std.StringHashMap(AutoMqGroupPromotion).init(alloc),
             .share_group_states = std.StringHashMap(SharePartitionState).init(alloc),
             .share_group_sessions = std.StringHashMap(i32).init(alloc),
-            .replica_directory_assignments = std.StringHashMap([16]u8).init(alloc),
+            .replica_directory_assignments = std.StringHashMap(ReplicaDirectoryAssignment).init(alloc),
             .producer_sequences = std.AutoHashMap(ProducerKey, ProducerSequenceState).init(alloc),
             .allocator = alloc,
             .node_id = node_id,
@@ -793,6 +799,13 @@ pub const Broker = struct {
             if (saved_reassignments.len > 0) {
                 log.info("Restored {d} partition reassignment(s) from partition_reassignments.meta", .{self.partition_reassignments.count()});
             }
+        }
+
+        const saved_replica_dirs = try self.persistence.loadReplicaDirectoryAssignments();
+        defer self.persistence.freeReplicaDirectoryAssignmentEntries(saved_replica_dirs);
+        try self.restoreReplicaDirectoryAssignments(saved_replica_dirs);
+        if (saved_replica_dirs.len > 0) {
+            log.info("Restored {d} replica directory assignment(s) from replica_directory_assignments.meta", .{self.replica_directory_assignments.count()});
         }
 
         // Load local AutoMQ controller-style metadata (KV namespace, node registry,
@@ -1169,6 +1182,7 @@ pub const Broker = struct {
         self.persistProducerSequencesIfDirty();
         self.persistAutoMqMetadata();
         self.persistPartitionReassignmentsLocal();
+        self.persistReplicaDirectoryAssignmentsLocal();
         self.persistObjectManagerSnapshot();
 
         var it = self.topics.iterator();
@@ -1657,6 +1671,12 @@ pub const Broker = struct {
         };
     }
 
+    fn persistReplicaDirectoryAssignmentsLocal(self: *Broker) void {
+        self.persistence.saveReplicaDirectoryAssignments(&self.replica_directory_assignments) catch |err| {
+            log.warn("Failed to persist replica directory assignments: {}", .{err});
+        };
+    }
+
     fn persistPartitionReassignmentsDurably(self: *Broker) !void {
         if (self.raft_state != null) {
             try self.commitPartitionReassignmentQuorumRecord();
@@ -1700,6 +1720,31 @@ pub const Broker = struct {
                     stream.advanceEndOffset(state.next_offset);
                     stream.trim(state.log_start_offset);
                 }
+            }
+        }
+    }
+
+    fn restoreReplicaDirectoryAssignments(self: *Broker, entries: []const MetadataPersistence.ReplicaDirectoryAssignmentEntry) !void {
+        self.clearReplicaDirectoryAssignments();
+
+        for (entries) |entry| {
+            if (entry.partition_index < 0) continue;
+            if (isZeroUuid(entry.topic_id) or isZeroUuid(entry.directory_id)) continue;
+            const topic_name = self.findTopicNameById(entry.topic_id) orelse continue;
+            if (!self.topicPartitionExists(topic_name, entry.partition_index)) continue;
+
+            const key = try self.replicaDirectoryAssignmentKey(entry.topic_id, entry.partition_index);
+            errdefer self.allocator.free(key);
+            const restored: ReplicaDirectoryAssignment = .{
+                .topic_id = entry.topic_id,
+                .partition_index = entry.partition_index,
+                .directory_id = entry.directory_id,
+            };
+            if (self.replica_directory_assignments.getPtr(key)) |existing| {
+                existing.* = restored;
+                self.allocator.free(key);
+            } else {
+                try self.replica_directory_assignments.put(key, restored);
             }
         }
     }
@@ -16702,6 +16747,7 @@ pub const Broker = struct {
                 log.warn("Failed to commit local replica directory assignments: {}", .{err});
                 return null;
             };
+            self.persistReplicaDirectoryAssignmentsLocal();
         }
 
         const resp = Resp{
@@ -16714,6 +16760,8 @@ pub const Broker = struct {
 
     const PendingReplicaDirectoryAssignment = struct {
         key: []u8,
+        topic_id: [16]u8,
+        partition_index: i32,
         directory_id: [16]u8,
     };
 
@@ -16776,6 +16824,8 @@ pub const Broker = struct {
                         } else {
                             try pending_assignments.append(.{
                                 .key = key,
+                                .topic_id = topic.topic_id,
+                                .partition_index = partition.partition_index,
                                 .directory_id = directory.id,
                             });
                         }
@@ -16832,13 +16882,17 @@ pub const Broker = struct {
     fn commitReplicaDirectoryAssignments(self: *Broker, assignments: []PendingReplicaDirectoryAssignment) !void {
         for (assignments) |*assignment| {
             if (self.replica_directory_assignments.getPtr(assignment.key)) |existing| {
-                existing.* = assignment.directory_id;
+                existing.directory_id = assignment.directory_id;
                 self.allocator.free(assignment.key);
                 assignment.key = &.{};
                 continue;
             }
 
-            try self.replica_directory_assignments.put(assignment.key, assignment.directory_id);
+            try self.replica_directory_assignments.put(assignment.key, .{
+                .topic_id = assignment.topic_id,
+                .partition_index = assignment.partition_index,
+                .directory_id = assignment.directory_id,
+            });
             assignment.key = &.{};
         }
     }
@@ -16846,7 +16900,8 @@ pub const Broker = struct {
     fn getReplicaDirectoryAssignment(self: *Broker, topic_id: [16]u8, partition_index: i32) !?[16]u8 {
         const key = try self.replicaDirectoryAssignmentKey(topic_id, partition_index);
         defer self.allocator.free(key);
-        return self.replica_directory_assignments.get(key);
+        const assignment = self.replica_directory_assignments.get(key) orelse return null;
+        return assignment.directory_id;
     }
 
     fn freeAssignReplicasToDirsDirectories(self: *Broker, directories: []const generated.assign_replicas_to_dirs_response.AssignReplicasToDirsResponse.DirectoryData) void {
@@ -30619,6 +30674,80 @@ test "Broker.handleRequest AssignReplicasToDirs validates local targets" {
     const stored = (try broker.getReplicaDirectoryAssignment(topic_id, 0)) orelse return error.ExpectedReplicaDirectoryAssignment;
     try testing.expectEqualSlices(u8, directory_id[0..], stored[0..]);
     try testing.expect((try broker.getReplicaDirectoryAssignment(topic_id, 99)) == null);
+}
+
+test "Broker.handleRequest AssignReplicasToDirs persists local assignments across restart" {
+    const Req = generated.assign_replicas_to_dirs_request.AssignReplicasToDirsRequest;
+    const Resp = generated.assign_replicas_to_dirs_response.AssignReplicasToDirsResponse;
+    const DirectoryData = Req.DirectoryData;
+    const TopicData = DirectoryData.TopicData;
+    const PartitionData = TopicData.PartitionData;
+    const fs = @import("fs_compat");
+
+    const tmp_dir = "/tmp/zmq-assign-replicas-to-dirs-restart-test";
+    fs.deleteTreeAbsolute(tmp_dir) catch {};
+    try fs.makeDirAbsolute(tmp_dir);
+    defer fs.deleteTreeAbsolute(tmp_dir) catch {};
+
+    const directory_id = [_]u8{0x7a} ** 16;
+    var topic_id: [16]u8 = undefined;
+
+    {
+        var broker = Broker.initWithConfig(testing.allocator, 1, 9092, .{ .data_dir = tmp_dir });
+        defer broker.deinit();
+
+        _ = broker.ensureTopic("assign-dir-restart-topic");
+        topic_id = broker.topics.get("assign-dir-restart-topic").?.topic_id;
+
+        const partitions = [_]PartitionData{.{
+            .partition_index = 0,
+        }};
+        const topics = [_]TopicData{.{
+            .topic_id = topic_id,
+            .partitions = &partitions,
+        }};
+        const directories = [_]DirectoryData{.{
+            .id = directory_id,
+            .topics = &topics,
+        }};
+        const req = Req{
+            .broker_id = 1,
+            .broker_epoch = 1,
+            .directories = &directories,
+        };
+
+        var buf: [256]u8 = undefined;
+        var pos = buildTestRequest(&buf, 73, 0, 7303, header_mod.requestHeaderVersion(73, 0));
+        req.serialize(&buf, &pos, 0);
+
+        const response = broker.handleRequest(buf[0..pos]);
+        try testing.expect(response != null);
+        defer testing.allocator.free(response.?);
+
+        var rpos: usize = 0;
+        var response_header = try ResponseHeader.deserialize(testing.allocator, response.?, &rpos, header_mod.responseHeaderVersion(73, 0));
+        defer response_header.deinit(testing.allocator);
+        const resp = try Resp.deserialize(testing.allocator, response.?, &rpos, 0);
+        defer {
+            for (resp.directories) |directory| {
+                for (directory.topics) |topic| {
+                    if (topic.partitions.len > 0) testing.allocator.free(topic.partitions);
+                }
+                if (directory.topics.len > 0) testing.allocator.free(directory.topics);
+            }
+            if (resp.directories.len > 0) testing.allocator.free(resp.directories);
+        }
+        try testing.expectEqual(ErrorCode.none.toInt(), resp.error_code);
+    }
+
+    {
+        var restarted = Broker.initWithConfig(testing.allocator, 1, 9092, .{ .data_dir = tmp_dir });
+        try restarted.open();
+        defer restarted.deinit();
+
+        const stored = (try restarted.getReplicaDirectoryAssignment(topic_id, 0)) orelse return error.ExpectedReplicaDirectoryAssignment;
+        try testing.expectEqualSlices(u8, directory_id[0..], stored[0..]);
+    }
 }
 
 test "Broker.handleRequest AssignReplicasToDirs rejects malformed request" {
