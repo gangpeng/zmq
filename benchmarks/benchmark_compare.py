@@ -73,6 +73,21 @@ WARMUP = {
     "metadata": 100,
 }
 
+BENCHMARKS = [
+    ("api_versions", "ApiVersions"),
+    ("produce_single", "Produce (reuse)"),
+    ("produce_fresh", "Produce (fresh)"),
+    ("fetch", "Fetch"),
+    ("metadata", "Metadata"),
+]
+
+DEFAULT_GATE_THRESHOLDS = {
+    "min_throughput_ratio": 0.05,
+    "max_p50_latency_ratio": 20.0,
+    "max_p99_latency_ratio": 20.0,
+    "max_error_rate": 0.0,
+}
+
 def parse_targets(raw):
     """Parse a benchmark target argument into the display-order target list."""
     if raw == "all" or raw == "both":
@@ -274,7 +289,15 @@ def bench(name, fn, iterations, warmup=100):
 
     if not latencies:
         print(f"    {name}: FAILED ({errors} errors)")
-        return {"throughput": 0, "p50": 0, "p99": 0, "p999": 0, "errors": errors}
+        return {
+            "throughput": 0,
+            "p50": 0,
+            "p99": 0,
+            "p999": 0,
+            "errors": errors,
+            "successes": 0,
+            "requests": iterations,
+        }
 
     throughput = len(latencies) / elapsed
     latencies_ms = sorted([l * 1000 for l in latencies])
@@ -284,7 +307,15 @@ def bench(name, fn, iterations, warmup=100):
 
     suffix = f"  ({errors} errors)" if errors else ""
     print(f"    {name}: {throughput:,.0f} req/s  p50={p50:.2f}ms  p99={p99:.2f}ms{suffix}")
-    return {"throughput": throughput, "p50": p50, "p99": p99, "p999": p999, "errors": errors}
+    return {
+        "throughput": throughput,
+        "p50": p50,
+        "p99": p99,
+        "p999": p999,
+        "errors": errors,
+        "successes": len(latencies),
+        "requests": iterations,
+    }
 
 def wait_for_broker(port, timeout=120):
     """Wait until the broker responds to ApiVersions."""
@@ -417,6 +448,132 @@ def _ratio_str(val_a, val_b, higher_is_better=True):
         marker = "▲" if ratio <= 1.0 else "▼"
     return f"{ratio:>6.2f}x", marker
 
+def env_float(name, default):
+    raw = os.environ.get(name)
+    if raw is None or raw == "":
+        return default
+    try:
+        value = float(raw)
+    except ValueError as exc:
+        raise ValueError(f"{name} must be a float, got {raw!r}") from exc
+    if value < 0:
+        raise ValueError(f"{name} must be non-negative, got {value}")
+    return value
+
+def comparison_gate_thresholds():
+    return {
+        "min_throughput_ratio": env_float(
+            "ZMQ_BENCH_COMPARE_MIN_THROUGHPUT_RATIO",
+            DEFAULT_GATE_THRESHOLDS["min_throughput_ratio"],
+        ),
+        "max_p50_latency_ratio": env_float(
+            "ZMQ_BENCH_COMPARE_MAX_P50_LATENCY_RATIO",
+            DEFAULT_GATE_THRESHOLDS["max_p50_latency_ratio"],
+        ),
+        "max_p99_latency_ratio": env_float(
+            "ZMQ_BENCH_COMPARE_MAX_P99_LATENCY_RATIO",
+            DEFAULT_GATE_THRESHOLDS["max_p99_latency_ratio"],
+        ),
+        "max_error_rate": env_float(
+            "ZMQ_BENCH_COMPARE_MAX_ERROR_RATE",
+            DEFAULT_GATE_THRESHOLDS["max_error_rate"],
+        ),
+    }
+
+def result_error_rate(result):
+    errors = int(result.get("errors", 0) or 0)
+    requests = int(result.get("requests", 0) or 0)
+    successes = int(result.get("successes", 0) or 0)
+    denominator = requests if requests > 0 else errors + successes
+    if denominator <= 0:
+        return 0.0
+    return errors / denominator
+
+def evaluate_comparison_gates(all_results, thresholds=None, require_baseline=False):
+    """Return release-gate failures for ZMQ-vs-baseline comparative results."""
+    thresholds = thresholds or comparison_gate_thresholds()
+    failures = []
+
+    if "zmq" not in all_results:
+        if require_baseline:
+            failures.append("ZMQ result is required for comparative benchmark gates")
+        return failures
+
+    baselines = [target for target in ALL_TARGETS if target != "zmq" and target in all_results]
+    if not baselines:
+        if require_baseline:
+            failures.append("at least one Kafka or AutoMQ baseline result is required")
+        return failures
+
+    max_error_rate = thresholds["max_error_rate"]
+    for target in ["zmq"] + baselines:
+        for key, label in BENCHMARKS:
+            result = all_results[target].get(key)
+            if result is None:
+                failures.append(f"{TARGET_LABELS[target]} missing {label} result")
+                continue
+            error_rate = result_error_rate(result)
+            if error_rate > max_error_rate:
+                failures.append(
+                    f"{TARGET_LABELS[target]} {label} error rate {error_rate:.2%} exceeds "
+                    f"{max_error_rate:.2%}"
+                )
+
+    for baseline in baselines:
+        for key, label in BENCHMARKS:
+            zmq = all_results["zmq"].get(key)
+            other = all_results[baseline].get(key)
+            if not zmq or not other:
+                continue
+
+            other_throughput = other.get("throughput", 0) or 0
+            if other_throughput <= 0:
+                failures.append(f"{TARGET_LABELS[baseline]} {label} throughput is zero; comparison is invalid")
+            else:
+                throughput_ratio = (zmq.get("throughput", 0) or 0) / other_throughput
+                if throughput_ratio < thresholds["min_throughput_ratio"]:
+                    failures.append(
+                        f"{label} ZMQ/{baseline} throughput ratio {throughput_ratio:.2f}x below "
+                        f"{thresholds['min_throughput_ratio']:.2f}x"
+                    )
+
+            for metric, threshold_name in [
+                ("p50", "max_p50_latency_ratio"),
+                ("p99", "max_p99_latency_ratio"),
+            ]:
+                other_latency = other.get(metric, 0) or 0
+                zmq_latency = zmq.get(metric, 0) or 0
+                if other_latency <= 0:
+                    failures.append(f"{TARGET_LABELS[baseline]} {label} {metric} is zero; comparison is invalid")
+                    continue
+                latency_ratio = zmq_latency / other_latency
+                max_ratio = thresholds[threshold_name]
+                if latency_ratio > max_ratio:
+                    failures.append(
+                        f"{label} ZMQ/{baseline} {metric} latency ratio {latency_ratio:.2f}x exceeds "
+                        f"{max_ratio:.2f}x"
+                    )
+
+    return failures
+
+def print_gate_result(failures, thresholds):
+    print("\n" + "=" * 72)
+    print("  COMPARATIVE BENCHMARK GATE")
+    print("=" * 72)
+    print(
+        "  thresholds: "
+        f"throughput_ratio>={thresholds['min_throughput_ratio']:.2f}x, "
+        f"p50_ratio<={thresholds['max_p50_latency_ratio']:.2f}x, "
+        f"p99_ratio<={thresholds['max_p99_latency_ratio']:.2f}x, "
+        f"error_rate<={thresholds['max_error_rate']:.2%}"
+    )
+    if not failures:
+        print("  result: pass")
+        return
+    print("  result: fail")
+    for failure in failures:
+        print(f"  - {failure}")
+
 def print_comparison(all_results):
     """Print side-by-side comparison table for 2 or 3 systems."""
     targets = [t for t in ALL_TARGETS if t in all_results]
@@ -442,14 +599,6 @@ def print_comparison(all_results):
     print(f"  COMPARISON: {title_parts}")
     print("=" * (60 + 14 * len(targets) + 14 * len(ratio_pairs)))
 
-    benchmarks = [
-        ("api_versions", "ApiVersions"),
-        ("produce_single", "Produce (reuse)"),
-        ("produce_fresh", "Produce (fresh)"),
-        ("fetch", "Fetch"),
-        ("metadata", "Metadata"),
-    ]
-
     # Header
     hdr = f"  {'Benchmark':<22} {'Metric':<6}"
     for t in targets:
@@ -465,7 +614,7 @@ def print_comparison(all_results):
         sep += f" {'─'*14}"
     print(sep)
 
-    for key, label in benchmarks:
+    for key, label in BENCHMARKS:
         results_for_key = {t: all_results[t].get(key, {}) for t in targets}
 
         for metric, metric_label, higher_is_better in [
@@ -535,6 +684,12 @@ def main():
         print("skip: set ZMQ_RUN_BENCH_COMPARE=1 to run comparative benchmark gate")
         return 0
 
+    try:
+        gate_thresholds = comparison_gate_thresholds()
+    except ValueError as exc:
+        print(f"  ERROR: {exc}")
+        return 1
+
     # Parse target list
     try:
         targets = parse_targets(args.target)
@@ -584,6 +739,17 @@ def main():
     if len(all_results) >= 2:
         print_comparison(all_results)
 
+    gate_failures = evaluate_comparison_gates(
+        all_results,
+        thresholds=gate_thresholds,
+        require_baseline=args.require_enabled,
+    )
+    exit_code = 0
+    if args.require_enabled or os.environ.get("ZMQ_BENCH_COMPARE_ENFORCE_GATES") == "1":
+        print_gate_result(gate_failures, gate_thresholds)
+        if gate_failures:
+            exit_code = 1
+
     # Save results
     results_file = os.path.join(PROJECT_DIR, "benchmarks", "results.json")
     saved = {"timestamp": time.strftime("%Y-%m-%d %H:%M:%S")}
@@ -594,7 +760,7 @@ def main():
         json.dump(saved, f, indent=2)
     print(f"\n  Results saved to {results_file}")
 
-    return 0
+    return exit_code
 
 def self_test():
     if parse_targets("all") != ALL_TARGETS:
@@ -616,6 +782,61 @@ def self_test():
     lower_latency, latency_marker = _ratio_str(0.5, 1.0, False)
     if "0.50x" not in lower_latency or latency_marker != "▲":
         raise AssertionError("latency ratio formatting failed")
+
+    thresholds = {
+        "min_throughput_ratio": 0.50,
+        "max_p50_latency_ratio": 2.00,
+        "max_p99_latency_ratio": 3.00,
+        "max_error_rate": 0.00,
+    }
+    passing_result = {
+        "api_versions": {"throughput": 80, "p50": 2, "p99": 6, "errors": 0, "requests": 10, "successes": 10},
+        "produce_single": {"throughput": 80, "p50": 2, "p99": 6, "errors": 0, "requests": 10, "successes": 10},
+        "produce_fresh": {"throughput": 80, "p50": 2, "p99": 6, "errors": 0, "requests": 10, "successes": 10},
+        "fetch": {"throughput": 80, "p50": 2, "p99": 6, "errors": 0, "requests": 10, "successes": 10},
+        "metadata": {"throughput": 80, "p50": 2, "p99": 6, "errors": 0, "requests": 10, "successes": 10},
+    }
+    baseline_result = {
+        "api_versions": {"throughput": 100, "p50": 1, "p99": 2, "errors": 0, "requests": 10, "successes": 10},
+        "produce_single": {"throughput": 100, "p50": 1, "p99": 2, "errors": 0, "requests": 10, "successes": 10},
+        "produce_fresh": {"throughput": 100, "p50": 1, "p99": 2, "errors": 0, "requests": 10, "successes": 10},
+        "fetch": {"throughput": 100, "p50": 1, "p99": 2, "errors": 0, "requests": 10, "successes": 10},
+        "metadata": {"throughput": 100, "p50": 1, "p99": 2, "errors": 0, "requests": 10, "successes": 10},
+    }
+    if evaluate_comparison_gates({"zmq": passing_result, "kafka": baseline_result}, thresholds, True):
+        raise AssertionError("passing comparison gate failed")
+
+    failing_result = dict(passing_result)
+    failing_result["fetch"] = {
+        "throughput": 10,
+        "p50": 5,
+        "p99": 20,
+        "errors": 1,
+        "requests": 10,
+        "successes": 9,
+    }
+    failures = evaluate_comparison_gates({"zmq": failing_result, "kafka": baseline_result}, thresholds, True)
+    if not failures:
+        raise AssertionError("failing comparison gate passed")
+    if not any("throughput ratio" in failure for failure in failures):
+        raise AssertionError("throughput regression was not reported")
+    if not any("error rate" in failure for failure in failures):
+        raise AssertionError("error-rate regression was not reported")
+    if not evaluate_comparison_gates({"zmq": passing_result}, thresholds, True):
+        raise AssertionError("missing baseline was not reported")
+
+    old_env = os.environ.copy()
+    try:
+        os.environ["ZMQ_BENCH_COMPARE_MIN_THROUGHPUT_RATIO"] = "0.25"
+        os.environ["ZMQ_BENCH_COMPARE_MAX_P50_LATENCY_RATIO"] = "4"
+        os.environ["ZMQ_BENCH_COMPARE_MAX_P99_LATENCY_RATIO"] = "8"
+        os.environ["ZMQ_BENCH_COMPARE_MAX_ERROR_RATE"] = "0.01"
+        env_thresholds = comparison_gate_thresholds()
+        if env_thresholds["min_throughput_ratio"] != 0.25 or env_thresholds["max_error_rate"] != 0.01:
+            raise AssertionError("environment threshold parsing failed")
+    finally:
+        os.environ.clear()
+        os.environ.update(old_env)
 
     print("ok: comparative benchmark self-test")
     return 0
