@@ -95,6 +95,8 @@ pub const Broker = struct {
     /// Cluster-wide finalized feature levels accepted through UpdateFeatures.
     finalized_features: std.StringHashMap(i16),
     finalized_features_epoch: i64 = -1,
+    /// Last accepted client telemetry payloads keyed by client instance UUID hex.
+    client_telemetry_samples: std.StringHashMap(ClientTelemetrySample),
     /// Local share-group partition state keyed by group/topic-id/partition.
     share_group_states: std.StringHashMap(SharePartitionState),
     /// Local share fetch session epochs keyed by group/member.
@@ -290,6 +292,17 @@ pub const Broker = struct {
         }
     };
 
+    pub const ClientTelemetrySample = struct {
+        metrics: []u8,
+        last_seen_ms: i64,
+
+        pub fn deinit(self: *ClientTelemetrySample, alloc: Allocator) void {
+            if (self.metrics.len > 0) alloc.free(self.metrics);
+            self.metrics = &.{};
+            self.last_seen_ms = 0;
+        }
+    };
+
     pub const ControllerAwareRebalanceResult = struct {
         planned_moves: usize = 0,
         applied_moves: usize = 0,
@@ -447,6 +460,7 @@ pub const Broker = struct {
             .auto_mq_next_node_id = defaultAutoMqNextNodeId(node_id),
             .auto_mq_group_promotions = std.StringHashMap(AutoMqGroupPromotion).init(alloc),
             .finalized_features = std.StringHashMap(i16).init(alloc),
+            .client_telemetry_samples = std.StringHashMap(ClientTelemetrySample).init(alloc),
             .share_group_states = std.StringHashMap(SharePartitionState).init(alloc),
             .share_group_sessions = std.StringHashMap(i32).init(alloc),
             .replica_directory_assignments = std.StringHashMap(ReplicaDirectoryAssignment).init(alloc),
@@ -1225,6 +1239,8 @@ pub const Broker = struct {
         self.auto_mq_group_promotions.deinit();
         self.clearFinalizedFeatures();
         self.finalized_features.deinit();
+        self.clearClientTelemetrySamples();
+        self.client_telemetry_samples.deinit();
         self.clearShareGroupStates();
         self.share_group_states.deinit();
         self.clearShareGroupSessions();
@@ -1453,6 +1469,15 @@ pub const Broker = struct {
         }
         self.finalized_features.clearRetainingCapacity();
         self.finalized_features_epoch = -1;
+    }
+
+    fn clearClientTelemetrySamples(self: *Broker) void {
+        var it = self.client_telemetry_samples.iterator();
+        while (it.next()) |entry| {
+            self.allocator.free(entry.key_ptr.*);
+            entry.value_ptr.deinit(self.allocator);
+        }
+        self.client_telemetry_samples.clearRetainingCapacity();
     }
 
     fn clearShareGroupStates(self: *Broker) void {
@@ -17094,6 +17119,10 @@ pub const Broker = struct {
         else
             @intFromEnum(ErrorCode.none);
 
+        if (error_code == @intFromEnum(ErrorCode.none)) {
+            self.recordClientTelemetry(req.client_instance_id, req.metrics, req.terminating) catch return null;
+        }
+
         const resp = Resp{
             .throttle_time_ms = 0,
             .error_code = error_code,
@@ -17346,6 +17375,52 @@ pub const Broker = struct {
         return assigned;
     }
 
+    fn clientTelemetryKey(self: *Broker, client_instance_id: [16]u8) ![]u8 {
+        const key = try self.allocator.alloc(u8, 32);
+        var pos: usize = 0;
+        for (client_instance_id) |byte| {
+            key[pos] = shareStateHex(byte >> 4);
+            key[pos + 1] = shareStateHex(byte & 0x0f);
+            pos += 2;
+        }
+        return key;
+    }
+
+    fn recordClientTelemetry(self: *Broker, client_instance_id: [16]u8, metrics: ?[]const u8, terminating: bool) !void {
+        const key = try self.clientTelemetryKey(client_instance_id);
+        errdefer self.allocator.free(key);
+
+        if (terminating) {
+            if (self.client_telemetry_samples.fetchRemove(key)) |removed| {
+                self.allocator.free(removed.key);
+                var sample = removed.value;
+                sample.deinit(self.allocator);
+            }
+            self.allocator.free(key);
+            return;
+        }
+
+        const metric_bytes = metrics orelse &.{};
+        const owned_metrics: []u8 = if (metric_bytes.len > 0)
+            try self.allocator.dupe(u8, metric_bytes)
+        else
+            &.{};
+        errdefer if (owned_metrics.len > 0) self.allocator.free(owned_metrics);
+
+        const sample: ClientTelemetrySample = .{
+            .metrics = owned_metrics,
+            .last_seen_ms = @import("time_compat").milliTimestamp(),
+        };
+
+        if (self.client_telemetry_samples.getPtr(key)) |existing| {
+            existing.deinit(self.allocator);
+            existing.* = sample;
+            self.allocator.free(key);
+        } else {
+            try self.client_telemetry_samples.put(key, sample);
+        }
+    }
+
     // ---------------------------------------------------------------
     // ListClientMetricsResources (key 74)
     // ---------------------------------------------------------------
@@ -17364,15 +17439,60 @@ pub const Broker = struct {
             return null;
         };
 
-        const resources = [_]Resp.ClientMetricsResource{.{
-            .name = "default",
-        }};
+        const resources = self.buildClientMetricsResources() catch return null;
+        defer self.freeClientMetricsResources(resources);
         const resp = Resp{
             .throttle_time_ms = 0,
             .error_code = @intFromEnum(ErrorCode.none),
-            .client_metrics_resources = &resources,
+            .client_metrics_resources = resources,
         };
         return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+    }
+
+    fn buildClientMetricsResources(self: *Broker) ![]generated.list_client_metrics_resources_response.ListClientMetricsResourcesResponse.ClientMetricsResource {
+        const Resource = generated.list_client_metrics_resources_response.ListClientMetricsResourcesResponse.ClientMetricsResource;
+        const count = 1 + self.client_telemetry_samples.count();
+        const resources = try self.allocator.alloc(Resource, count);
+
+        resources[0] = .{ .name = "default" };
+        var idx: usize = 1;
+        var initialized: usize = 1;
+        errdefer {
+            for (resources[1..initialized]) |resource| {
+                if (resource.name) |name| self.allocator.free(@constCast(name));
+            }
+            self.allocator.free(resources);
+        }
+
+        var it = self.client_telemetry_samples.iterator();
+        while (it.next()) |entry| {
+            const name = try std.fmt.allocPrint(self.allocator, "client:{s}", .{entry.key_ptr.*});
+            resources[idx] = .{ .name = name };
+            idx += 1;
+            initialized = idx;
+        }
+        if (resources.len > 2) {
+            std.mem.sort(Resource, resources[1..], {}, clientMetricsResourceLessThan);
+        }
+        return resources;
+    }
+
+    fn clientMetricsResourceLessThan(
+        _: void,
+        lhs: generated.list_client_metrics_resources_response.ListClientMetricsResourcesResponse.ClientMetricsResource,
+        rhs: generated.list_client_metrics_resources_response.ListClientMetricsResourcesResponse.ClientMetricsResource,
+    ) bool {
+        return std.mem.lessThan(u8, lhs.name orelse "", rhs.name orelse "");
+    }
+
+    fn freeClientMetricsResources(self: *Broker, resources: anytype) void {
+        for (resources, 0..) |resource, idx| {
+            if (idx == 0) continue;
+            if (resource.name) |name| {
+                if (name.len > 0) self.allocator.free(@constCast(name));
+            }
+        }
+        if (resources.len > 0) self.allocator.free(resources);
     }
 
     // ---------------------------------------------------------------
@@ -30901,6 +31021,11 @@ test "Broker.handleRequest PushTelemetry accepts default subscription" {
     const resp = try Resp.deserialize(testing.allocator, response.?, &rpos, 0);
     try testing.expectEqual(response.?.len, rpos);
     try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.none)), resp.error_code);
+
+    const telemetry_key = try broker.clientTelemetryKey(client_id);
+    defer testing.allocator.free(telemetry_key);
+    const sample = broker.client_telemetry_samples.get(telemetry_key) orelse return error.ExpectedClientTelemetrySample;
+    try testing.expectEqualSlices(u8, &metrics, sample.metrics);
 }
 
 test "Broker.handleRequest PushTelemetry rejects unknown subscription" {
@@ -31010,6 +31135,45 @@ test "Broker.handleRequest PushTelemetry rejects oversized metrics" {
     const resp = try Resp.deserialize(testing.allocator, response.?, &rpos, 0);
     try testing.expectEqual(response.?.len, rpos);
     try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.telemetry_too_large)), resp.error_code);
+}
+
+test "Broker.handleRequest PushTelemetry terminating removes collected sample" {
+    const Req = generated.push_telemetry_request.PushTelemetryRequest;
+    const Resp = generated.push_telemetry_response.PushTelemetryResponse;
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+
+    const client_id = [_]u8{4} ** 16;
+    const metrics = [_]u8{ 0x08, 0x01 };
+    try broker.recordClientTelemetry(client_id, &metrics, false);
+    try testing.expectEqual(@as(usize, 1), broker.client_telemetry_samples.count());
+
+    const req = Req{
+        .client_instance_id = client_id,
+        .subscription_id = 1,
+        .terminating = true,
+        .compression_type = 0,
+        .metrics = &metrics,
+    };
+
+    var buf: [256]u8 = undefined;
+    var pos = buildTestRequest(&buf, 72, 0, 7206, header_mod.requestHeaderVersion(72, 0));
+    req.serialize(&buf, &pos, 0);
+
+    const response = broker.handleRequest(buf[0..pos]);
+    try testing.expect(response != null);
+    defer testing.allocator.free(response.?);
+
+    var rpos: usize = 0;
+    var response_header = try ResponseHeader.deserialize(testing.allocator, response.?, &rpos, header_mod.responseHeaderVersion(72, 0));
+    defer response_header.deinit(testing.allocator);
+    try testing.expectEqual(@as(i32, 7206), response_header.correlation_id);
+
+    const resp = try Resp.deserialize(testing.allocator, response.?, &rpos, 0);
+    try testing.expectEqual(response.?.len, rpos);
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.none)), resp.error_code);
+    try testing.expectEqual(@as(usize, 0), broker.client_telemetry_samples.count());
 }
 
 test "Broker.handleRequest PushTelemetry authorization denial uses generated response" {
@@ -31345,12 +31509,16 @@ test "Broker.handleRequest AssignReplicasToDirs rejects malformed request" {
     try testing.expectEqual(ErrorCode.invalid_request.toInt(), resp.error_code);
 }
 
-test "Broker.handleRequest ListClientMetricsResources returns default generated resource" {
+test "Broker.handleRequest ListClientMetricsResources returns collected client resources" {
     const Req = generated.list_client_metrics_resources_request.ListClientMetricsResourcesRequest;
     const Resp = generated.list_client_metrics_resources_response.ListClientMetricsResourcesResponse;
 
     var broker = Broker.init(testing.allocator, 1, 9092);
     defer broker.deinit();
+
+    const client_id = [_]u8{0xab} ** 16;
+    const metrics = [_]u8{ 0x08, 0x01 };
+    try broker.recordClientTelemetry(client_id, &metrics, false);
 
     const req = Req{};
 
@@ -31372,8 +31540,9 @@ test "Broker.handleRequest ListClientMetricsResources returns default generated 
 
     try testing.expectEqual(response.?.len, rpos);
     try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.none)), resp.error_code);
-    try testing.expectEqual(@as(usize, 1), resp.client_metrics_resources.len);
+    try testing.expectEqual(@as(usize, 2), resp.client_metrics_resources.len);
     try testing.expectEqualStrings("default", resp.client_metrics_resources[0].name.?);
+    try testing.expectEqualStrings("client:abababababababababababababababab", resp.client_metrics_resources[1].name.?);
 }
 
 test "Broker.handleRequest ListClientMetricsResources authorization denial uses generated response" {
