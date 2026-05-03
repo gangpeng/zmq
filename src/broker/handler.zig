@@ -19942,7 +19942,7 @@ pub const Broker = struct {
             ser.skipTaggedFields(buf, &pos) catch return false;
         }
         ser.skipTaggedFields(buf, &pos) catch return false;
-        return true;
+        return pos == buf.len;
     }
 
     fn freeDescribeQuorumRequest(self: *Broker, req: *generated.describe_quorum_request.DescribeQuorumRequest) void {
@@ -33039,6 +33039,28 @@ test "Broker.handleRequest DescribeQuorum rejects truncated request" {
     var buf: [128]u8 = undefined;
     const req_len = buildTestRequest(&buf, 55, 2, 5504, header_mod.requestHeaderVersion(55, 2));
     try testing.expect(broker.handleRequest(buf[0..req_len]) == null);
+}
+
+test "Broker.handleRequest DescribeQuorum rejects trailing bytes" {
+    const Req = generated.describe_quorum_request.DescribeQuorumRequest;
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+
+    const partitions = [_]Req.TopicData.PartitionData{.{
+        .partition_index = 0,
+    }};
+    const topics = [_]Req.TopicData{.{
+        .topic_name = "__cluster_metadata",
+        .partitions = &partitions,
+    }};
+    const req = Req{ .topics = &topics };
+
+    var buf: [512]u8 = undefined;
+    var pos = buildTestRequest(&buf, 55, 2, 5506, header_mod.requestHeaderVersion(55, 2));
+    req.serialize(&buf, &pos, 2);
+
+    try expectTrailingByteRejected(&broker, &buf, pos);
 }
 
 test "Broker.handleRequest DescribeQuorum authorization denial uses generated response" {
