@@ -19028,7 +19028,7 @@ pub const Broker = struct {
 
         if (api_version >= 7 and !skipFixedBytes(buf, &pos, 1)) return false; // require_stable
         if (flexible) ser.skipTaggedFields(buf, &pos) catch return false;
-        return true;
+        return pos == buf.len;
     }
 
     fn offsetFetchLegacyTopicsAreNull(buf: []const u8, start_pos: usize, api_version: i16) ?bool {
@@ -37412,6 +37412,35 @@ test "Broker.handleRequest OffsetFetch rejects truncated request" {
     var buf: [128]u8 = undefined;
     const req_len = buildTestRequest(&buf, 9, 8, 919, header_mod.requestHeaderVersion(9, 8));
     try testing.expect(broker.handleRequest(buf[0..req_len]) == null);
+}
+
+test "Broker.handleRequest OffsetFetch rejects trailing bytes" {
+    const Req = generated.offset_fetch_request.OffsetFetchRequest;
+    const Group = Req.OffsetFetchRequestGroup;
+    const Topic = Group.OffsetFetchRequestTopics;
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+
+    const partitions = [_]i32{0};
+    const topics = [_]Topic{.{
+        .name = "of-trailing-topic",
+        .partition_indexes = &partitions,
+    }};
+    const groups = [_]Group{.{
+        .group_id = "of-trailing-group",
+        .topics = &topics,
+    }};
+    const req = Req{
+        .groups = &groups,
+        .require_stable = false,
+    };
+
+    var buf: [512]u8 = undefined;
+    var pos = buildTestRequest(&buf, 9, 8, 929, header_mod.requestHeaderVersion(9, 8));
+    req.serialize(&buf, &pos, 8);
+
+    try expectTrailingByteRejected(&broker, &buf, pos);
 }
 
 test "Broker.handleRequest OffsetFetch v7 authorization denial uses generated response" {
