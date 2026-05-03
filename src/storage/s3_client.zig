@@ -57,6 +57,8 @@ pub const S3Client = struct {
         https,
     };
 
+    const sha256_checksum_base64_len = std.base64.standard.Encoder.calcSize(32);
+
     pub const Config = struct {
         host: []const u8 = "127.0.0.1",
         port: u16 = 9000,
@@ -972,10 +974,29 @@ pub const S3Client = struct {
     }
 
     fn responseBodyOwned(self: *S3Client, response: *const HttpResponse) ![]u8 {
-        if (isChunked(response.headers())) {
-            return try self.decodeChunked(response.body());
+        const body = if (isChunked(response.headers()))
+            try self.decodeChunked(response.body())
+        else
+            try self.allocator.dupe(u8, response.body());
+        errdefer self.allocator.free(body);
+
+        try validateResponseChecksum(response.headers(), body);
+        return body;
+    }
+
+    fn validateResponseChecksum(headers: []const u8, body: []const u8) !void {
+        const expected = headerValue(headers, "x-amz-checksum-sha256") orelse return;
+        var checksum_buf: [sha256_checksum_base64_len]u8 = undefined;
+        const actual = sha256Base64(body, &checksum_buf);
+        if (!std.mem.eql(u8, std.mem.trim(u8, expected, " \t"), actual)) {
+            return error.S3ChecksumMismatch;
         }
-        return try self.allocator.dupe(u8, response.body());
+    }
+
+    fn sha256Base64(body: []const u8, out: *[sha256_checksum_base64_len]u8) []const u8 {
+        var digest: [32]u8 = undefined;
+        std.crypto.hash.sha2.Sha256.hash(body, &digest, .{});
+        return std.base64.standard.Encoder.encode(out, &digest);
     }
 
     fn rangeBodyFromResponse(self: *S3Client, response: *const HttpResponse, requested_offset: u64, requested_length: u64) ![]u8 {
@@ -1401,6 +1422,35 @@ test "S3Client range response fails closed on missing or mismatched Content-Rang
 
         try testing.expectError(error.S3RangeContentRangeMismatch, client.rangeBodyFromResponse(&response, 10, 5));
     }
+}
+
+test "S3Client validates SHA256 checksum response header" {
+    var client = S3Client.init(testing.allocator, .{});
+    var checksum_buf: [S3Client.sha256_checksum_base64_len]u8 = undefined;
+    const checksum = S3Client.sha256Base64("checksum-body", &checksum_buf);
+
+    const raw_ok = try std.fmt.allocPrint(
+        testing.allocator,
+        "HTTP/1.1 200 OK\r\nx-amz-checksum-sha256: {s}\r\n\r\nchecksum-body",
+        .{checksum},
+    );
+    defer testing.allocator.free(raw_ok);
+
+    var ok_response = try makeHttpResponse(testing.allocator, 200, raw_ok);
+    defer ok_response.deinit(testing.allocator);
+
+    const ok_body = try client.responseBodyOwned(&ok_response);
+    defer testing.allocator.free(ok_body);
+    try testing.expectEqualStrings("checksum-body", ok_body);
+
+    var bad_response = try makeHttpResponse(
+        testing.allocator,
+        200,
+        "HTTP/1.1 200 OK\r\nx-amz-checksum-sha256: AAAA\r\n\r\nchecksum-body",
+    );
+    defer bad_response.deinit(testing.allocator);
+
+    try testing.expectError(error.S3ChecksumMismatch, client.responseBodyOwned(&bad_response));
 }
 
 test "S3Client multipart ETag validation" {
