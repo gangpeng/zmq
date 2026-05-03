@@ -62,7 +62,7 @@ pub const broker_supported_apis = [_]BrokerApiSupport{
     .{ .key = 22, .name = "InitProducerId", .metric = "init_producer_id", .min = 0, .max = 4 },
     .{ .key = 23, .name = "OffsetForLeaderEpoch", .metric = "offset_for_leader_epoch", .min = 0, .max = 4 },
     .{ .key = 24, .name = "AddPartitionsToTxn", .metric = "add_partitions_to_txn", .min = 0, .max = 4 },
-    .{ .key = 25, .name = "AddOffsetsToTxn", .metric = "add_offsets_to_txn", .min = 0, .max = 3 },
+    .{ .key = 25, .name = "AddOffsetsToTxn", .metric = "add_offsets_to_txn", .min = 0, .max = 4 },
     .{ .key = 26, .name = "EndTxn", .metric = "end_txn", .min = 0, .max = 3 },
     .{ .key = 27, .name = "WriteTxnMarkers", .metric = "write_txn_markers", .min = 0, .max = 1 },
     .{ .key = 28, .name = "TxnOffsetCommit", .metric = "txn_offset_commit", .min = 0, .max = 4 },

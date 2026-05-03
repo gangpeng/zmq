@@ -13537,6 +13537,7 @@ pub const Broker = struct {
                 "__consumer_offsets",
                 target_partition,
             ) catch @intFromEnum(ErrorCode.kafka_storage_error);
+            error_code = self.mapTransactionAbortableError(api_version, req.producer_id, error_code);
             if (error_code == @intFromEnum(ErrorCode.none)) {
                 self.persistTransactionsIfDirtyDurably() catch |err| {
                     log.warn("AddOffsetsToTxn transaction snapshot write failed for {s}: {}", .{ req.transactional_id orelse "", err });
@@ -32294,6 +32295,18 @@ fn handleAddOffsetsToTxnForTest(
     group_id: ?[]const u8,
     correlation_id: i32,
 ) !generated.add_offsets_to_txn_response.AddOffsetsToTxnResponse {
+    return handleAddOffsetsToTxnForTestVersion(broker, transactional_id, producer_id, producer_epoch, group_id, correlation_id, 3);
+}
+
+fn handleAddOffsetsToTxnForTestVersion(
+    broker: *Broker,
+    transactional_id: ?[]const u8,
+    producer_id: i64,
+    producer_epoch: i16,
+    group_id: ?[]const u8,
+    correlation_id: i32,
+    api_version: i16,
+) !generated.add_offsets_to_txn_response.AddOffsetsToTxnResponse {
     const Req = generated.add_offsets_to_txn_request.AddOffsetsToTxnRequest;
     const Resp = generated.add_offsets_to_txn_response.AddOffsetsToTxnResponse;
 
@@ -32305,19 +32318,19 @@ fn handleAddOffsetsToTxnForTest(
     };
 
     var buf: [512]u8 = undefined;
-    var pos = buildTestRequest(&buf, 25, 3, correlation_id, header_mod.requestHeaderVersion(25, 3));
-    req.serialize(&buf, &pos, 3);
+    var pos = buildTestRequest(&buf, 25, api_version, correlation_id, header_mod.requestHeaderVersion(25, api_version));
+    req.serialize(&buf, &pos, api_version);
 
     const response = broker.handleRequest(buf[0..pos]);
     try testing.expect(response != null);
     defer testing.allocator.free(response.?);
 
     var rpos: usize = 0;
-    var response_header = try ResponseHeader.deserialize(testing.allocator, response.?, &rpos, header_mod.responseHeaderVersion(25, 3));
+    var response_header = try ResponseHeader.deserialize(testing.allocator, response.?, &rpos, header_mod.responseHeaderVersion(25, api_version));
     defer response_header.deinit(testing.allocator);
     try testing.expectEqual(correlation_id, response_header.correlation_id);
 
-    const resp = try Resp.deserialize(testing.allocator, response.?, &rpos, 3);
+    const resp = try Resp.deserialize(testing.allocator, response.?, &rpos, api_version);
     try testing.expectEqual(response.?.len, rpos);
     return resp;
 }
@@ -32441,6 +32454,39 @@ test "Broker.handleRequest AddOffsetsToTxn rejects fenced producer epoch" {
     );
 
     try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.invalid_producer_epoch)), resp.error_code);
+    try testing.expectEqual(@as(usize, 0), broker.txn_coordinator.getPartitions(init_result.producer_id).?.len);
+}
+
+test "Broker.handleRequest AddOffsetsToTxn v4 maps abortable transaction state" {
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+    try broker.ensureInternalTopic("__consumer_offsets", 50);
+
+    const init_result = try broker.txn_coordinator.initProducerId("txn-add-offsets-abortable");
+    const txn = broker.txn_coordinator.transactions.getPtr(init_result.producer_id) orelse return error.ExpectedTransactionState;
+    txn.status = .prepare_abort;
+
+    const legacy_resp = try handleAddOffsetsToTxnForTestVersion(
+        &broker,
+        "txn-add-offsets-abortable",
+        init_result.producer_id,
+        init_result.producer_epoch,
+        "group-add-offsets-abortable",
+        2511,
+        3,
+    );
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.invalid_txn_state)), legacy_resp.error_code);
+
+    const v4_resp = try handleAddOffsetsToTxnForTestVersion(
+        &broker,
+        "txn-add-offsets-abortable",
+        init_result.producer_id,
+        init_result.producer_epoch,
+        "group-add-offsets-abortable",
+        2512,
+        4,
+    );
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.transaction_abortable)), v4_resp.error_code);
     try testing.expectEqual(@as(usize, 0), broker.txn_coordinator.getPartitions(init_result.producer_id).?.len);
 }
 
