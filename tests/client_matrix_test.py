@@ -26,11 +26,11 @@ Per-profile overrides:
 
 Supported probes:
     kcat             metadata plus produce/fetch round trip
-    kafka-cli        API/topic probes plus console produce/fetch round trip
-    kafka-python     AdminClient metadata plus producer/consumer round trip
-    confluent-kafka  AdminClient metadata plus producer/consumer round trip
-    java-kafka       Apache kafka-clients AdminClient plus producer/consumer round trip
-    go-kafka         segmentio kafka-go metadata plus writer/reader round trip
+    kafka-cli        API/topic admin probes plus console produce/fetch round trip
+    kafka-python     AdminClient metadata plus producer/consumer and offset commit round trip
+    confluent-kafka  AdminClient metadata plus producer/consumer and offset commit round trip
+    java-kafka       Apache kafka-clients AdminClient plus producer/consumer and offset commit round trip
+    go-kafka         segmentio kafka-go metadata plus writer/reader and offset commit round trip
 """
 
 import importlib.util
@@ -222,6 +222,26 @@ def test_kafka_cli():
     topic = matrix_topic("kafka-cli")
     payload = matrix_payload("kafka-cli")
     run(
+        [
+            "kafka-topics.sh",
+            "--bootstrap-server",
+            BOOTSTRAP,
+            "--create",
+            "--if-not-exists",
+            "--topic",
+            topic,
+            "--partitions",
+            "1",
+            "--replication-factor",
+            "1",
+        ],
+        timeout=45,
+    )
+    describe_out = run(["kafka-topics.sh", "--bootstrap-server", BOOTSTRAP, "--describe", "--topic", topic], timeout=45)
+    if topic not in describe_out:
+        raise MatrixError(f"kafka-topics describe output did not include {topic!r}\n{describe_out}")
+
+    run(
         ["kafka-console-producer.sh", "--bootstrap-server", BOOTSTRAP, "--topic", topic],
         input_text=payload + "\n",
         timeout=45,
@@ -242,7 +262,7 @@ def test_kafka_cli():
         timeout=45,
     )
     require_output_contains(fetched, payload, "kafka-cli")
-    print("ok: kafka CLI API/topic and produce/fetch probes")
+    print("ok: kafka CLI API/topic admin and produce/fetch probes")
 
 
 def test_kafka_python():
@@ -252,7 +272,8 @@ def test_kafka_python():
     if not have_module("kafka"):
         raise MatrixError("kafka-python selected but import 'kafka' is not available")
 
-    from kafka import KafkaAdminClient, KafkaConsumer, KafkaProducer
+    from kafka import KafkaAdminClient, KafkaConsumer, KafkaProducer, TopicPartition
+    from kafka.structs import OffsetAndMetadata
 
     admin = KafkaAdminClient(
         bootstrap_servers=BOOTSTRAP,
@@ -295,7 +316,15 @@ def test_kafka_python():
     try:
         for message in consumer:
             if message.value == payload:
-                print("ok: kafka-python metadata and produce/fetch probes")
+                tp = TopicPartition(message.topic, message.partition)
+                expected_offset = message.offset + 1
+                consumer.commit({tp: OffsetAndMetadata(expected_offset, "zmq-client-matrix")})
+                committed = consumer.committed(tp)
+                if committed != expected_offset:
+                    raise MatrixError(
+                        f"kafka-python committed offset mismatch: expected={expected_offset} got={committed}"
+                    )
+                print("ok: kafka-python metadata, produce/fetch, and offset commit probes")
                 return
         raise MatrixError("kafka-python consumer did not fetch produced payload")
     finally:
@@ -309,7 +338,7 @@ def test_confluent_kafka():
     if not have_module("confluent_kafka"):
         raise MatrixError("confluent-kafka selected but import 'confluent_kafka' is not available")
 
-    from confluent_kafka import Consumer, Producer
+    from confluent_kafka import Consumer, Producer, TopicPartition
     from confluent_kafka.admin import AdminClient
 
     admin = AdminClient({
@@ -352,7 +381,14 @@ def test_confluent_kafka():
             if message.error():
                 raise MatrixError(f"confluent-kafka consumer error: {message.error()}")
             if message.value() == payload:
-                print("ok: confluent-kafka metadata and produce/fetch probes")
+                expected_offset = message.offset() + 1
+                consumer.commit(message=message, asynchronous=False)
+                committed = consumer.committed([TopicPartition(topic, message.partition())], timeout=10)
+                if not committed or committed[0].offset < expected_offset:
+                    raise MatrixError(
+                        f"confluent-kafka committed offset mismatch: expected>={expected_offset} got={committed}"
+                    )
+                print("ok: confluent-kafka metadata, produce/fetch, and offset commit probes")
                 return
         raise MatrixError("confluent-kafka consumer did not fetch produced payload")
     finally:
@@ -369,8 +405,10 @@ import org.apache.kafka.clients.admin.AdminClient;
 import org.apache.kafka.clients.consumer.ConsumerRecord;
 import org.apache.kafka.clients.consumer.ConsumerRecords;
 import org.apache.kafka.clients.consumer.KafkaConsumer;
+import org.apache.kafka.clients.consumer.OffsetAndMetadata;
 import org.apache.kafka.clients.producer.KafkaProducer;
 import org.apache.kafka.clients.producer.ProducerRecord;
+import org.apache.kafka.common.TopicPartition;
 import org.apache.kafka.common.serialization.StringDeserializer;
 import org.apache.kafka.common.serialization.StringSerializer;
 
@@ -423,6 +461,13 @@ public class ZmqKafkaClientMatrix {
                 ConsumerRecords<String, String> records = consumer.poll(Duration.ofMillis(500));
                 for (ConsumerRecord<String, String> record : records) {
                     if (payload.equals(record.value())) {
+                        TopicPartition tp = new TopicPartition(record.topic(), record.partition());
+                        long expectedOffset = record.offset() + 1;
+                        consumer.commitSync(Collections.singletonMap(tp, new OffsetAndMetadata(expectedOffset)));
+                        OffsetAndMetadata committed = consumer.committed(tp);
+                        if (committed == null || committed.offset() < expectedOffset) {
+                            throw new RuntimeException("Java committed offset mismatch");
+                        }
                         return;
                     }
                 }
@@ -454,7 +499,7 @@ def test_java_kafka():
             ["java", "-cp", f"{tmp}:{JAVA_CLASSPATH}", "ZmqKafkaClientMatrix", BOOTSTRAP, topic, payload, group],
             timeout=90,
         )
-    print("ok: java-kafka metadata and produce/fetch probes")
+    print("ok: java-kafka metadata, produce/fetch, and offset commit probes")
 
 
 GO_MATRIX_SOURCE = r"""
@@ -518,11 +563,17 @@ func main() {
     deadline, done := context.WithTimeout(context.Background(), 15*time.Second)
     defer done()
     for {
-        message, err := reader.ReadMessage(deadline)
+        message, err := reader.FetchMessage(deadline)
         if err != nil {
             panic(err)
         }
         if string(message.Value) == payload {
+            commitCtx, commitCancel := context.WithTimeout(context.Background(), 10*time.Second)
+            if err := reader.CommitMessages(commitCtx, message); err != nil {
+                commitCancel()
+                panic(err)
+            }
+            commitCancel()
             fmt.Println("ok")
             return
         }
@@ -547,7 +598,7 @@ def test_go_kafka():
         run(["go", "mod", "init", "zmq-client-matrix-go"], timeout=30, cwd=tmp)
         run(["go", "get", GO_MODULE], timeout=120, cwd=tmp)
         run(["go", "run", ".", BOOTSTRAP, topic, payload, group], timeout=120, cwd=tmp)
-    print("ok: go-kafka metadata and produce/fetch probes")
+    print("ok: go-kafka metadata, produce/fetch, and offset commit probes")
 
 
 def main():
