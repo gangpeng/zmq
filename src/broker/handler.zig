@@ -12321,6 +12321,16 @@ pub const Broker = struct {
             return null;
         };
 
+        if (self.validateInitProducerIdAbortableState(api_version, req.transactional_id, req.transaction_timeout_ms, req.producer_id, req.producer_epoch)) {
+            const resp = Resp{
+                .throttle_time_ms = 0,
+                .error_code = @intFromEnum(ErrorCode.transaction_abortable),
+                .producer_id = -1,
+                .producer_epoch = -1,
+            };
+            return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+        }
+
         const previous_snapshot = self.encodeTransactionSnapshotRecordValue() catch return null;
         defer self.allocator.free(previous_snapshot);
 
@@ -12347,6 +12357,30 @@ pub const Broker = struct {
             .producer_epoch = result.producer_epoch,
         };
         return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+    }
+
+    fn validateInitProducerIdAbortableState(self: *const Broker, api_version: i16, transactional_id: ?[]const u8, transaction_timeout_ms: i32, producer_id: i64, producer_epoch: i16) bool {
+        if (api_version < 5) return false;
+        if (transactional_id == null or transaction_timeout_ms <= 0) return false;
+
+        if (producer_id == -1 and producer_epoch == -1) {
+            const tid = transactional_id.?;
+            var it = self.txn_coordinator.transactions.iterator();
+            while (it.next()) |entry| {
+                const txn = entry.value_ptr;
+                if (txn.transactional_id) |stored_tid| {
+                    if (std.mem.eql(u8, stored_tid, tid) and txn.status == .prepare_abort) return true;
+                }
+            }
+            return false;
+        }
+
+        if (producer_id < 0 or producer_epoch < 0) return false;
+        const txn = self.txn_coordinator.transactions.get(producer_id) orelse return false;
+        const stored_tid = txn.transactional_id orelse return false;
+        if (!std.mem.eql(u8, stored_tid, transactional_id.?)) return false;
+        if (txn.producer_epoch != producer_epoch) return false;
+        return txn.status == .prepare_abort;
     }
 
     // ---------------------------------------------------------------
@@ -21667,7 +21701,7 @@ test "Broker.handleRequest unsupported versions bypass ACL denial response build
     try broker.authorizer.addAcl("other-client", .transactional_id, "*", .literal, .write, .allow, "*");
 
     const api_key: i16 = 22;
-    const unsupported_version: i16 = 5;
+    const unsupported_version: i16 = 6;
     var buf: [128]u8 = undefined;
     const req_len = buildTestRequest(&buf, api_key, unsupported_version, 2208, header_mod.requestHeaderVersion(api_key, unsupported_version));
 
@@ -31702,6 +31736,66 @@ test "Broker.handleRequest InitProducerId v4 validates requested producer epoch"
     try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.invalid_producer_epoch)), resp3.error_code);
     try testing.expectEqual(@as(i64, -1), resp3.producer_id);
     try testing.expectEqual(@as(i16, -1), resp3.producer_epoch);
+}
+
+test "Broker.handleRequest InitProducerId v5 maps abortable transaction state" {
+    const Req = generated.init_producer_id_request.InitProducerIdRequest;
+    const Resp = generated.init_producer_id_response.InitProducerIdResponse;
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+
+    const init_result = try broker.txn_coordinator.initProducerId("init-abortable-txn");
+    const txn = broker.txn_coordinator.transactions.getPtr(init_result.producer_id) orelse return error.ExpectedTransactionState;
+    txn.status = .prepare_abort;
+
+    const req = Req{
+        .transactional_id = "init-abortable-txn",
+        .transaction_timeout_ms = 60000,
+        .producer_id = init_result.producer_id,
+        .producer_epoch = init_result.producer_epoch,
+    };
+
+    var v5_buf: [512]u8 = undefined;
+    var v5_pos = buildTestRequest(&v5_buf, 22, 5, 2215, header_mod.requestHeaderVersion(22, 5));
+    req.serialize(&v5_buf, &v5_pos, 5);
+
+    const v5_response = broker.handleRequest(v5_buf[0..v5_pos]);
+    try testing.expect(v5_response != null);
+    defer testing.allocator.free(v5_response.?);
+
+    var v5_rpos: usize = 0;
+    var v5_header = try ResponseHeader.deserialize(testing.allocator, v5_response.?, &v5_rpos, header_mod.responseHeaderVersion(22, 5));
+    defer v5_header.deinit(testing.allocator);
+    try testing.expectEqual(@as(i32, 2215), v5_header.correlation_id);
+
+    const v5_resp = try Resp.deserialize(testing.allocator, v5_response.?, &v5_rpos, 5);
+    try testing.expectEqual(v5_response.?.len, v5_rpos);
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.transaction_abortable)), v5_resp.error_code);
+    try testing.expectEqual(@as(i64, -1), v5_resp.producer_id);
+    try testing.expectEqual(@as(i16, -1), v5_resp.producer_epoch);
+    try testing.expectEqual(TxnCoordinator.TxnStatus.prepare_abort, broker.txn_coordinator.getStatus(init_result.producer_id).?);
+    try testing.expectEqual(init_result.producer_epoch, broker.txn_coordinator.transactions.get(init_result.producer_id).?.producer_epoch);
+
+    var v4_buf: [512]u8 = undefined;
+    var v4_pos = buildTestRequest(&v4_buf, 22, 4, 2216, header_mod.requestHeaderVersion(22, 4));
+    req.serialize(&v4_buf, &v4_pos, 4);
+
+    const v4_response = broker.handleRequest(v4_buf[0..v4_pos]);
+    try testing.expect(v4_response != null);
+    defer testing.allocator.free(v4_response.?);
+
+    var v4_rpos: usize = 0;
+    var v4_header = try ResponseHeader.deserialize(testing.allocator, v4_response.?, &v4_rpos, header_mod.responseHeaderVersion(22, 4));
+    defer v4_header.deinit(testing.allocator);
+    try testing.expectEqual(@as(i32, 2216), v4_header.correlation_id);
+
+    const v4_resp = try Resp.deserialize(testing.allocator, v4_response.?, &v4_rpos, 4);
+    try testing.expectEqual(v4_response.?.len, v4_rpos);
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.none)), v4_resp.error_code);
+    try testing.expectEqual(init_result.producer_id, v4_resp.producer_id);
+    try testing.expectEqual(init_result.producer_epoch + 1, v4_resp.producer_epoch);
+    try testing.expectEqual(TxnCoordinator.TxnStatus.empty, broker.txn_coordinator.getStatus(init_result.producer_id).?);
 }
 
 test "Broker.handleRequest InitProducerId v4 applies and validates transaction timeout" {

@@ -59,7 +59,7 @@ pub const broker_supported_apis = [_]BrokerApiSupport{
     .{ .key = 19, .name = "CreateTopics", .metric = "create_topics", .min = 0, .max = 7 },
     .{ .key = 20, .name = "DeleteTopics", .metric = "delete_topics", .min = 0, .max = 6 },
     .{ .key = 21, .name = "DeleteRecords", .metric = "delete_records", .min = 0, .max = 2 },
-    .{ .key = 22, .name = "InitProducerId", .metric = "init_producer_id", .min = 0, .max = 4 },
+    .{ .key = 22, .name = "InitProducerId", .metric = "init_producer_id", .min = 0, .max = 5 },
     .{ .key = 23, .name = "OffsetForLeaderEpoch", .metric = "offset_for_leader_epoch", .min = 0, .max = 4 },
     .{ .key = 24, .name = "AddPartitionsToTxn", .metric = "add_partitions_to_txn", .min = 0, .max = 5 },
     .{ .key = 25, .name = "AddOffsetsToTxn", .metric = "add_offsets_to_txn", .min = 0, .max = 4 },
