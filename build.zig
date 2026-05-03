@@ -414,6 +414,9 @@ pub fn build(b: *std.Build) void {
         const run_s3_provider_matrix = b.addSystemCommand(&.{ "python3", "tests/s3_provider_matrix_test.py" });
         run_s3_provider_matrix.step.dependOn(b.getInstallStep());
         s3_provider_matrix_step.dependOn(&run_s3_provider_matrix.step);
+
+        const s3_provider_matrix_self_test = b.addSystemCommand(&.{ "python3", "tests/s3_provider_matrix_test.py", "--self-test" });
+        test_step.dependOn(&s3_provider_matrix_self_test.step);
     }
 
     // External Kafka-client compatibility matrix. The Python test skips unless

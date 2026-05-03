@@ -16,6 +16,9 @@ Optional environment:
     ZMQ_CHAOS_NETWORK_DOWN       command run to inject a network partition
     ZMQ_CHAOS_NETWORK_UP         command run to heal a network partition
     ZMQ_CHAOS_NETWORK_EXPECT     "fail" (default) or "survive" for probe during partition
+    ZMQ_CHAOS_S3_DOWN            command run to inject live S3 provider outage
+    ZMQ_CHAOS_S3_UP              command run to heal live S3 provider outage
+    ZMQ_CHAOS_S3_* or ZMQ_S3_*   live S3 settings for live-s3-outage scenario
 
 Safe default scenarios:
     sigkill-restart              kill -9 and restart from the same local WAL
@@ -25,6 +28,10 @@ Safe default scenarios:
 
 The network-partition scenario is available for CI jobs that provide explicit
 traffic-control hooks through ZMQ_CHAOS_NETWORK_DOWN/UP.
+
+The live-s3-outage scenario is available for CI jobs that provide an actual
+S3-compatible endpoint plus explicit outage/heal hooks through
+ZMQ_CHAOS_S3_DOWN/UP.
 """
 
 import os
@@ -52,6 +59,8 @@ ALIASES = {
     "clock-skew": "clock-skewed-records",
     "s3": "s3-outage",
     "network": "network-partition",
+    "live-s3": "live-s3-outage",
+    "s3-live": "live-s3-outage",
 }
 
 
@@ -284,6 +293,65 @@ def current_time_ms():
     return int(time.time() * 1000)
 
 
+def setting_with_fallback(prefix, suffix, fallback_prefix=None, default=None):
+    value = os.environ.get(f"{prefix}{suffix}")
+    if value is not None and value != "":
+        return value
+    if fallback_prefix:
+        value = os.environ.get(f"{fallback_prefix}{suffix}")
+        if value is not None and value != "":
+            return value
+    return default
+
+
+def live_s3_config_from_env():
+    endpoint = setting_with_fallback("ZMQ_CHAOS_S3_", "ENDPOINT", "ZMQ_S3_", None)
+    if not endpoint:
+        raise TestError("live-s3-outage requires ZMQ_CHAOS_S3_ENDPOINT or ZMQ_S3_ENDPOINT")
+    return {
+        "endpoint": endpoint,
+        "port": setting_with_fallback("ZMQ_CHAOS_S3_", "PORT", "ZMQ_S3_", "9000"),
+        "bucket": setting_with_fallback("ZMQ_CHAOS_S3_", "BUCKET", "ZMQ_S3_", f"zmq-chaos-{os.getpid()}"),
+        "access_key": setting_with_fallback("ZMQ_CHAOS_S3_", "ACCESS_KEY", "ZMQ_S3_", "minioadmin"),
+        "secret_key": setting_with_fallback("ZMQ_CHAOS_S3_", "SECRET_KEY", "ZMQ_S3_", "minioadmin"),
+        "scheme": setting_with_fallback("ZMQ_CHAOS_S3_", "SCHEME", "ZMQ_S3_", None),
+        "region": setting_with_fallback("ZMQ_CHAOS_S3_", "REGION", "ZMQ_S3_", None),
+        "path_style": setting_with_fallback("ZMQ_CHAOS_S3_", "PATH_STYLE", "ZMQ_S3_", None),
+        "tls_ca_file": setting_with_fallback("ZMQ_CHAOS_S3_", "TLS_CA_FILE", "ZMQ_S3_", None),
+    }
+
+
+def append_s3_args(args, config):
+    args += [
+        "--s3-endpoint",
+        config["endpoint"],
+        "--s3-port",
+        str(config["port"]),
+        "--s3-bucket",
+        config["bucket"],
+        "--s3-access-key",
+        config["access_key"],
+        "--s3-secret-key",
+        config["secret_key"],
+        "--s3-wal-batch-size",
+        "1",
+        "--s3-wal-flush-interval",
+        "1",
+        "--s3-wal-flush-mode",
+        "sync",
+    ]
+    optional_flags = [
+        ("scheme", "--s3-scheme"),
+        ("region", "--s3-region"),
+        ("path_style", "--s3-path-style"),
+        ("tls_ca_file", "--s3-tls-ca-file"),
+    ]
+    for key, flag in optional_flags:
+        value = config.get(key)
+        if value is not None and value != "":
+            args += [flag, str(value)]
+
+
 def tail(path, limit=12000):
     try:
         with open(path, "rb") as f:
@@ -310,7 +378,7 @@ def wait_for_broker(proc, port, log_path, timeout=40):
     raise TestError(f"broker did not become ready: {last_error}\n{tail(log_path)}")
 
 
-def launch_broker(data_dir, log_path, s3_port=None):
+def launch_broker(data_dir, log_path, s3_port=None, s3_config=None):
     broker_port = choose_port("ZMQ_CHAOS_BROKER_PORT")
     controller_port = choose_port("ZMQ_CHAOS_CONTROLLER_PORT")
     metrics_port = choose_port("ZMQ_CHAOS_METRICS_PORT")
@@ -338,33 +406,24 @@ def launch_broker(data_dir, log_path, s3_port=None):
         "--compaction-interval",
         "3600000",
     ]
-    if s3_port is not None:
-        args += [
-            "--s3-endpoint",
-            "127.0.0.1",
-            "--s3-port",
-            str(s3_port),
-            "--s3-bucket",
-            f"zmq-chaos-{os.getpid()}",
-            "--s3-access-key",
-            "minioadmin",
-            "--s3-secret-key",
-            "minioadmin",
-            "--s3-wal-batch-size",
-            "1",
-            "--s3-wal-flush-interval",
-            "1",
-            "--s3-wal-flush-mode",
-            "sync",
-        ]
+    if s3_config is not None:
+        append_s3_args(args, s3_config)
+    elif s3_port is not None:
+        append_s3_args(args, {
+            "endpoint": "127.0.0.1",
+            "port": s3_port,
+            "bucket": f"zmq-chaos-{os.getpid()}",
+            "access_key": "minioadmin",
+            "secret_key": "minioadmin",
+        })
     proc = subprocess.Popen(args, stdout=log_file, stderr=subprocess.STDOUT)
     proc._zmq_log_file = log_file
     proc._zmq_port = broker_port
     return proc, broker_port
 
 
-def start_broker(data_dir, log_path, s3_port=None):
-    proc, broker_port = launch_broker(data_dir, log_path, s3_port)
+def start_broker(data_dir, log_path, s3_port=None, s3_config=None):
+    proc, broker_port = launch_broker(data_dir, log_path, s3_port=s3_port, s3_config=s3_config)
     wait_for_broker(proc, broker_port, log_path)
     return proc, broker_port
 
@@ -566,12 +625,57 @@ def scenario_network_partition(tmp):
         stop_broker(proc)
 
 
+def scenario_live_s3_outage(tmp):
+    data_dir = os.path.join(tmp, "live-s3-outage-data")
+    log_path = os.path.join(tmp, "live-s3-outage.log")
+    topic = f"chaos-live-s3-{os.getpid()}"
+    before = b"before-live-s3-outage"
+    during = b"during-live-s3-outage"
+    after = b"after-live-s3-outage"
+    proc = None
+    healed = False
+    s3_config = live_s3_config_from_env()
+    try:
+        proc, port = start_broker(data_dir, log_path, s3_config=s3_config)
+        wait_for_topic(port, topic)
+        produce(port, topic, build_record_batch(before, current_time_ms()), 50)
+        wait_for_payload(port, topic, [before])
+
+        run_hook("ZMQ_CHAOS_S3_DOWN")
+        try:
+            try:
+                error_code, base_offset = produce_result(port, topic, build_record_batch(during, current_time_ms()), 51)
+                if error_code == 0 or base_offset >= 0:
+                    raise TestError(
+                        f"live S3 outage produce was acknowledged: error={error_code} offset={base_offset}"
+                    )
+            except (OSError, socket.timeout, TestError) as exc:
+                if "acknowledged" in str(exc):
+                    raise
+        finally:
+            run_hook("ZMQ_CHAOS_S3_UP")
+            healed = True
+
+        wait_for_broker(proc, port, log_path)
+        produce(port, topic, build_record_batch(after, current_time_ms()), 52)
+        wait_for_payload(port, topic, [before, after])
+        print("ok: chaos live-s3-outage")
+    finally:
+        if not healed and os.environ.get("ZMQ_CHAOS_S3_UP"):
+            try:
+                run_hook("ZMQ_CHAOS_S3_UP")
+            except TestError as exc:
+                print(f"WARN: failed to heal S3 outage: {exc}", file=sys.stderr)
+        stop_broker(proc)
+
+
 SCENARIO_FUNCS = {
     "sigkill-restart": scenario_sigkill_restart,
     "slow-partial-client": scenario_slow_partial_client,
     "clock-skewed-records": scenario_clock_skewed_records,
     "s3-outage": scenario_s3_outage,
     "network-partition": scenario_network_partition,
+    "live-s3-outage": scenario_live_s3_outage,
 }
 
 
@@ -582,6 +686,8 @@ def selected_scenarios():
         names = list(DEFAULT_SCENARIOS)
         if os.environ.get("ZMQ_CHAOS_NETWORK_DOWN") or os.environ.get("ZMQ_CHAOS_NETWORK_UP"):
             names.append("network-partition")
+        if os.environ.get("ZMQ_CHAOS_S3_DOWN") or os.environ.get("ZMQ_CHAOS_S3_UP"):
+            names.append("live-s3-outage")
 
     resolved = []
     for name in names:
@@ -626,6 +732,45 @@ def self_test():
         ]
         if selected_scenarios() != expected:
             raise TestError("scenario alias selection failed")
+        os.environ["ZMQ_CHAOS_SCENARIOS"] = "live-s3,network"
+        if selected_scenarios() != ["live-s3-outage", "network-partition"]:
+            raise TestError("live S3/network scenario alias selection failed")
+        os.environ["ZMQ_CHAOS_SCENARIOS"] = "all"
+        os.environ["ZMQ_CHAOS_NETWORK_DOWN"] = "true"
+        os.environ["ZMQ_CHAOS_NETWORK_UP"] = "true"
+        os.environ["ZMQ_CHAOS_S3_DOWN"] = "true"
+        os.environ["ZMQ_CHAOS_S3_UP"] = "true"
+        all_scenarios = selected_scenarios()
+        if "network-partition" not in all_scenarios or "live-s3-outage" not in all_scenarios:
+            raise TestError("all scenario selection did not include hooked chaos scenarios")
+        os.environ["ZMQ_CHAOS_S3_ENDPOINT"] = "s3.example.test"
+        os.environ["ZMQ_CHAOS_S3_PORT"] = "443"
+        os.environ["ZMQ_CHAOS_S3_BUCKET"] = "zmq-chaos"
+        os.environ["ZMQ_CHAOS_S3_ACCESS_KEY"] = "ak"
+        os.environ["ZMQ_CHAOS_S3_SECRET_KEY"] = "sk"
+        os.environ["ZMQ_CHAOS_S3_SCHEME"] = "https"
+        os.environ["ZMQ_CHAOS_S3_REGION"] = "us-west-2"
+        os.environ["ZMQ_CHAOS_S3_PATH_STYLE"] = "false"
+        os.environ["ZMQ_CHAOS_S3_TLS_CA_FILE"] = "/tmp/ca.pem"
+        s3_config = live_s3_config_from_env()
+        if s3_config["endpoint"] != "s3.example.test" or s3_config["scheme"] != "https":
+            raise TestError("live S3 config parsing failed")
+        args = []
+        append_s3_args(args, s3_config)
+        for expected_arg in [
+            "--s3-endpoint",
+            "s3.example.test",
+            "--s3-scheme",
+            "https",
+            "--s3-region",
+            "us-west-2",
+            "--s3-path-style",
+            "false",
+            "--s3-tls-ca-file",
+            "/tmp/ca.pem",
+        ]:
+            if expected_arg not in args:
+                raise TestError(f"live S3 broker args missing {expected_arg}")
         if write_string("abc") != b"\x00\x03abc":
             raise TestError("string encoding self-test failed")
         batch = build_record_batch(b"x", 123456789)

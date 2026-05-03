@@ -29,6 +29,9 @@ Per-profile gates:
     ListObjectsV2 pagination gate for providers in that profile.
     ZMQ_S3_<PROFILE>_RUN_PROCESS_CRASH=1 also runs the broker-process
     crash/replacement harness with that provider's S3 settings.
+    ZMQ_S3_<PROFILE>_RUN_LIVE_OUTAGE=1 also runs the live-S3 chaos outage
+    harness. It requires ZMQ_S3_<PROFILE>_OUTAGE_DOWN and
+    ZMQ_S3_<PROFILE>_OUTAGE_UP commands that inject and heal provider access.
 """
 
 import os
@@ -110,6 +113,37 @@ def provider_env(profile):
     return env
 
 
+def provider_chaos_env(profile, env):
+    chaos_env = env.copy()
+    chaos_env["ZMQ_RUN_CHAOS_TESTS"] = "1"
+    chaos_env["ZMQ_CHAOS_SCENARIOS"] = "live-s3-outage"
+    for suffix in (
+        "ENDPOINT",
+        "PORT",
+        "BUCKET",
+        "ACCESS_KEY",
+        "SECRET_KEY",
+        "SCHEME",
+        "REGION",
+        "PATH_STYLE",
+        "TLS_CA_FILE",
+    ):
+        value = env.get(f"ZMQ_S3_{suffix}")
+        if value:
+            chaos_env[f"ZMQ_CHAOS_S3_{suffix}"] = value
+
+    outage_down = profile_setting(profile, "OUTAGE_DOWN", None)
+    outage_up = profile_setting(profile, "OUTAGE_UP", None)
+    if not outage_down or not outage_up:
+        raise MatrixError(
+            f"profile {profile} RUN_LIVE_OUTAGE requires "
+            f"{profile_key(profile, 'OUTAGE_DOWN')} and {profile_key(profile, 'OUTAGE_UP')}"
+        )
+    chaos_env["ZMQ_CHAOS_S3_DOWN"] = outage_down
+    chaos_env["ZMQ_CHAOS_S3_UP"] = outage_up
+    return chaos_env
+
+
 def profile_enabled(profile, suffix):
     return truthy(profile_setting(profile, suffix, "0"))
 
@@ -121,6 +155,8 @@ def run_profile(profile):
         process_env = env.copy()
         process_env["ZMQ_RUN_PROCESS_CRASH_TESTS"] = "1"
         run([ZIG, "build", "test-s3-process-crash", "--summary", "all"], timeout=900, env=process_env)
+    if profile_enabled(profile, "RUN_LIVE_OUTAGE"):
+        run([ZIG, "build", "test-chaos", "--summary", "all"], timeout=900, env=provider_chaos_env(profile, env))
     print(
         "ok: S3 provider profile "
         f"{profile} endpoint={env['ZMQ_S3_ENDPOINT']}:{env['ZMQ_S3_PORT']} bucket={env['ZMQ_S3_BUCKET']}"
@@ -153,6 +189,9 @@ def self_test():
         os.environ["ZMQ_S3_AWS_US_EAST_1_SKIP_MINIO_HEALTH"] = "1"
         os.environ["ZMQ_S3_AWS_US_EAST_1_REQUIRE_LIST_PAGINATION"] = "1"
         os.environ["ZMQ_S3_AWS_US_EAST_1_RUN_PROCESS_CRASH"] = "true"
+        os.environ["ZMQ_S3_AWS_US_EAST_1_RUN_LIVE_OUTAGE"] = "true"
+        os.environ["ZMQ_S3_AWS_US_EAST_1_OUTAGE_DOWN"] = "tc qdisc add dev lo root netem loss 100%"
+        os.environ["ZMQ_S3_AWS_US_EAST_1_OUTAGE_UP"] = "tc qdisc del dev lo root"
 
         names = profile_names()
         if names != ["minio", "aws_us_east_1"]:
@@ -179,6 +218,15 @@ def self_test():
             raise MatrixError("profile pagination gate override failed")
         if not profile_enabled("aws_us_east_1", "RUN_PROCESS_CRASH"):
             raise MatrixError("profile process-crash gate override failed")
+        if not profile_enabled("aws_us_east_1", "RUN_LIVE_OUTAGE"):
+            raise MatrixError("profile live-outage gate override failed")
+        chaos_env = provider_chaos_env("aws_us_east_1", env)
+        if chaos_env["ZMQ_CHAOS_SCENARIOS"] != "live-s3-outage":
+            raise MatrixError("profile live-outage scenario override failed")
+        if chaos_env["ZMQ_CHAOS_S3_ENDPOINT"] != "s3.amazonaws.com":
+            raise MatrixError("profile live-outage endpoint pass-through failed")
+        if chaos_env["ZMQ_CHAOS_S3_DOWN"] != "tc qdisc add dev lo root netem loss 100%":
+            raise MatrixError("profile live-outage down hook override failed")
 
         print("ok: S3 provider matrix self-test")
         return 0
