@@ -17,6 +17,7 @@ const DeleteGroupsResponse = delete_groups_mod.DeleteGroupsResponse;
 const PartitionStore = @import("partition_store.zig").PartitionStore;
 const GroupCoordinator = @import("group_coordinator.zig").GroupCoordinator;
 const ConsumerGroup = @import("group_coordinator.zig").ConsumerGroup;
+const CommittedOffsetValue = @import("group_coordinator.zig").CommittedOffsetValue;
 const TxnCoordinator = @import("txn_coordinator.zig").TransactionCoordinator;
 const QuotaManager = @import("quota_manager.zig").QuotaManager;
 const MetricRegistry = @import("metrics.zig").MetricRegistry;
@@ -1697,6 +1698,44 @@ pub const Broker = struct {
         snapshot.* = current;
     }
 
+    fn cloneCommittedOffsets(self: *Broker) !std.StringHashMap(CommittedOffsetValue) {
+        var snapshot = std.StringHashMap(CommittedOffsetValue).init(self.allocator);
+        errdefer self.freeCommittedOffsetSnapshot(&snapshot);
+
+        var it = self.groups.committed_offsets.iterator();
+        while (it.next()) |entry| {
+            const key = try self.allocator.dupe(u8, entry.key_ptr.*);
+            errdefer self.allocator.free(key);
+            const value = CommittedOffsetValue{
+                .offset = entry.value_ptr.offset,
+                .leader_epoch = entry.value_ptr.leader_epoch,
+                .metadata = if (entry.value_ptr.metadata) |metadata| try self.allocator.dupe(u8, metadata) else null,
+            };
+            snapshot.put(key, value) catch |err| {
+                var owned_value = value;
+                owned_value.deinit(self.allocator);
+                return err;
+            };
+        }
+
+        return snapshot;
+    }
+
+    fn freeCommittedOffsetSnapshot(self: *Broker, snapshot: *std.StringHashMap(CommittedOffsetValue)) void {
+        var it = snapshot.iterator();
+        while (it.next()) |entry| {
+            entry.value_ptr.deinit(self.allocator);
+            self.allocator.free(entry.key_ptr.*);
+        }
+        snapshot.deinit();
+    }
+
+    fn restoreCommittedOffsetSnapshot(self: *Broker, snapshot: *std.StringHashMap(CommittedOffsetValue)) void {
+        const current = self.groups.committed_offsets;
+        self.groups.committed_offsets = snapshot.*;
+        snapshot.* = current;
+    }
+
     fn clearShareGroupSession(self: *Broker, group_id: []const u8, member_id: []const u8) !bool {
         const key = try self.shareGroupMemberKey(group_id, member_id);
         defer self.allocator.free(key);
@@ -2068,9 +2107,13 @@ pub const Broker = struct {
 
     /// Persist committed offsets from group coordinator (best-effort).
     fn persistOffsets(self: *Broker) void {
-        self.persistence.saveOffsets(&self.groups.committed_offsets) catch |err| {
+        self.persistOffsetsDurably() catch |err| {
             log.warn("Failed to persist offsets: {}", .{err});
         };
+    }
+
+    fn persistOffsetsDurably(self: *Broker) !void {
+        try self.persistence.saveOffsets(&self.groups.committed_offsets);
     }
 
     /// Persist consumer-group lifecycle state from the group coordinator.
@@ -10204,6 +10247,8 @@ pub const Broker = struct {
 
         const group_id = req.group_id orelse "";
         const group_error = self.validateOffsetCommitGroup(api_version, group_id, req.generation_id_or_member_epoch, req.member_id, req.group_instance_id);
+        var previous_offsets = self.cloneCommittedOffsets() catch return null;
+        defer self.freeCommittedOffsetSnapshot(&previous_offsets);
         var mutated = false;
         for (req.topics) |topic_req| {
             const partitions = self.allocator.alloc(PartitionResponse, topic_req.partitions.len) catch return null;
@@ -10261,7 +10306,20 @@ pub const Broker = struct {
             transferred = true;
         }
 
-        if (mutated) self.persistOffsets();
+        if (mutated) {
+            self.persistOffsetsDurably() catch |err| {
+                log.warn("OffsetCommit offset snapshot write failed: {}", .{err});
+                self.restoreCommittedOffsetSnapshot(&previous_offsets);
+                for (topics[0..topics_init]) |*topic| {
+                    const partitions: []PartitionResponse = @constCast(topic.partitions);
+                    for (partitions) |*partition| {
+                        if (partition.error_code == @intFromEnum(ErrorCode.none)) {
+                            partition.error_code = @intFromEnum(ErrorCode.kafka_storage_error);
+                        }
+                    }
+                }
+            };
+        }
 
         const resp = Resp{
             .throttle_time_ms = 0,
@@ -17089,6 +17147,8 @@ pub const Broker = struct {
             ErrorCode.none
         else
             ErrorCode.group_id_not_found;
+        var previous_offsets = self.cloneCommittedOffsets() catch return null;
+        defer self.freeCommittedOffsetSnapshot(&previous_offsets);
         var topics = self.allocator.alloc(TopicResult, req.topics.len) catch return null;
         defer {
             self.freeOffsetDeleteResponseTopics(topics);
@@ -17157,7 +17217,20 @@ pub const Broker = struct {
             };
         }
 
-        if (mutated) self.persistOffsets();
+        if (mutated) {
+            self.persistOffsetsDurably() catch |err| {
+                log.warn("OffsetDelete offset snapshot write failed: {}", .{err});
+                self.restoreCommittedOffsetSnapshot(&previous_offsets);
+                for (topics) |*topic| {
+                    const partitions: []PartitionResult = @constCast(topic.partitions);
+                    for (partitions) |*partition| {
+                        if (partition.error_code == @intFromEnum(ErrorCode.none)) {
+                            partition.error_code = @intFromEnum(ErrorCode.kafka_storage_error);
+                        }
+                    }
+                }
+            };
+        }
 
         const resp = Resp{
             .error_code = @intFromEnum(group_error),
@@ -19341,6 +19414,8 @@ pub const Broker = struct {
         const group_id = req.group_id orelse "";
         const txn_error = self.validateTxnOffsetCommitState(api_version, req.transactional_id, req.producer_id, req.producer_epoch, group_id);
         const group_error = self.validateOffsetCommitGroup(api_version, group_id, req.generation_id, req.member_id, req.group_instance_id);
+        var previous_offsets = self.cloneCommittedOffsets() catch return null;
+        defer self.freeCommittedOffsetSnapshot(&previous_offsets);
         const topics = self.allocator.alloc(TopicResponse, req.topics.len) catch return null;
         var topics_init: usize = 0;
         defer {
@@ -19392,7 +19467,20 @@ pub const Broker = struct {
             transferred = true;
         }
 
-        if (mutated) self.persistOffsets();
+        if (mutated) {
+            self.persistOffsetsDurably() catch |err| {
+                log.warn("TxnOffsetCommit offset snapshot write failed: {}", .{err});
+                self.restoreCommittedOffsetSnapshot(&previous_offsets);
+                for (topics[0..topics_init]) |*topic| {
+                    const partitions: []PartitionResponse = @constCast(topic.partitions);
+                    for (partitions) |*partition| {
+                        if (partition.error_code == @intFromEnum(ErrorCode.none)) {
+                            partition.error_code = @intFromEnum(ErrorCode.kafka_storage_error);
+                        }
+                    }
+                }
+            };
+        }
 
         const resp = Resp{
             .throttle_time_ms = 0,
@@ -27691,6 +27779,80 @@ test "Broker.handleRequest TxnOffsetCommit persists committed offsets" {
     try testing.expectEqualStrings("persisted", restored.?.metadata.?);
 }
 
+test "Broker.handleRequest TxnOffsetCommit rolls back local offset persistence failures" {
+    const fs = @import("fs_compat");
+    const Req = generated.txn_offset_commit_request.TxnOffsetCommitRequest;
+    const Resp = generated.txn_offset_commit_response.TxnOffsetCommitResponse;
+
+    const tmp_dir = "/tmp/zmq-txn-offset-commit-persist-fail-test";
+    fs.deleteTreeAbsolute(tmp_dir) catch {};
+    try fs.makeDirAbsolute(tmp_dir);
+    defer fs.deleteTreeAbsolute(tmp_dir) catch {};
+
+    var broker = Broker.initWithConfig(testing.allocator, 1, 9092, .{ .data_dir = tmp_dir });
+    defer broker.deinit();
+    try broker.open();
+    try testing.expect(broker.ensureTopic("txn-offset-persist-fail-topic"));
+    try broker.groups.commitOffsetWithMetadata("txn-offset-persist-fail-group", "txn-offset-persist-fail-topic", 0, 44, -1, "txn-old");
+    try broker.persistOffsetsDurably();
+    const init_result = try initTxnOffsetCommitForTest(&broker, "txn-persist-fail-id", "txn-offset-persist-fail-group");
+
+    const offsets_path = try std.fmt.allocPrint(testing.allocator, "{s}/offsets.meta", .{tmp_dir});
+    defer testing.allocator.free(offsets_path);
+    try fs.deleteFileAbsolute(offsets_path);
+    try fs.makeDirAbsolute(offsets_path);
+
+    const partitions = [_]Req.TxnOffsetCommitRequestTopic.TxnOffsetCommitRequestPartition{.{
+        .partition_index = 0,
+        .committed_offset = 222,
+        .committed_leader_epoch = 6,
+        .committed_metadata = "txn-new",
+    }};
+    const topics = [_]Req.TxnOffsetCommitRequestTopic{.{
+        .name = "txn-offset-persist-fail-topic",
+        .partitions = &partitions,
+    }};
+    const req = Req{
+        .transactional_id = "txn-persist-fail-id",
+        .group_id = "txn-offset-persist-fail-group",
+        .producer_id = init_result.producer_id,
+        .producer_epoch = init_result.producer_epoch,
+        .generation_id = -1,
+        .member_id = "",
+        .group_instance_id = null,
+        .topics = &topics,
+    };
+
+    var buf: [512]u8 = undefined;
+    var pos = buildTestRequest(&buf, 28, 3, 2807, header_mod.requestHeaderVersion(28, 3));
+    req.serialize(&buf, &pos, 3);
+
+    const response = broker.handleRequest(buf[0..pos]);
+    try testing.expect(response != null);
+    defer testing.allocator.free(response.?);
+
+    var rpos: usize = 0;
+    var response_header = try ResponseHeader.deserialize(testing.allocator, response.?, &rpos, header_mod.responseHeaderVersion(28, 3));
+    defer response_header.deinit(testing.allocator);
+    try testing.expectEqual(@as(i32, 2807), response_header.correlation_id);
+
+    const resp = try Resp.deserialize(testing.allocator, response.?, &rpos, 3);
+    defer {
+        for (resp.topics) |topic| {
+            if (topic.partitions.len > 0) testing.allocator.free(topic.partitions);
+        }
+        if (resp.topics.len > 0) testing.allocator.free(resp.topics);
+    }
+
+    try testing.expectEqual(response.?.len, rpos);
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.kafka_storage_error)), resp.topics[0].partitions[0].error_code);
+    const committed_record = try broker.groups.fetchOffsetRecord("txn-offset-persist-fail-group", "txn-offset-persist-fail-topic", 0);
+    try testing.expect(committed_record != null);
+    try testing.expectEqual(@as(i64, 44), committed_record.?.offset);
+    try testing.expectEqual(@as(i32, -1), committed_record.?.leader_epoch);
+    try testing.expectEqualStrings("txn-old", committed_record.?.metadata.?);
+}
+
 test "Broker.handleRequest TxnOffsetCommit requires AddOffsetsToTxn registration" {
     const Req = generated.txn_offset_commit_request.TxnOffsetCommitRequest;
     const Resp = generated.txn_offset_commit_response.TxnOffsetCommitResponse;
@@ -30019,6 +30181,70 @@ test "Broker.handleRequest OffsetDelete persists deleted offsets" {
     const loaded = try broker.persistence.loadOffsets();
     defer broker.persistence.freeOffsetEntries(loaded);
     try testing.expectEqual(@as(usize, 0), loaded.len);
+}
+
+test "Broker.handleRequest OffsetDelete rolls back local offset persistence failures" {
+    const fs = @import("fs_compat");
+    const Req = generated.offset_delete_request.OffsetDeleteRequest;
+    const Resp = generated.offset_delete_response.OffsetDeleteResponse;
+
+    const tmp_dir = "/tmp/zmq-offset-delete-persist-fail-test";
+    fs.deleteTreeAbsolute(tmp_dir) catch {};
+    try fs.makeDirAbsolute(tmp_dir);
+    defer fs.deleteTreeAbsolute(tmp_dir) catch {};
+
+    var broker = Broker.initWithConfig(testing.allocator, 1, 9092, .{ .data_dir = tmp_dir });
+    defer broker.deinit();
+    try broker.open();
+    try testing.expect(broker.ensureTopic("delete-offset-persist-fail-topic"));
+    try broker.groups.commitOffsetWithMetadata("delete-offset-persist-fail-group", "delete-offset-persist-fail-topic", 0, 55, -1, "delete-old");
+    try broker.persistOffsetsDurably();
+
+    const offsets_path = try std.fmt.allocPrint(testing.allocator, "{s}/offsets.meta", .{tmp_dir});
+    defer testing.allocator.free(offsets_path);
+    try fs.deleteFileAbsolute(offsets_path);
+    try fs.makeDirAbsolute(offsets_path);
+
+    const partitions = [_]Req.OffsetDeleteRequestTopic.OffsetDeleteRequestPartition{.{
+        .partition_index = 0,
+    }};
+    const topics = [_]Req.OffsetDeleteRequestTopic{.{
+        .name = "delete-offset-persist-fail-topic",
+        .partitions = &partitions,
+    }};
+    const req = Req{
+        .group_id = "delete-offset-persist-fail-group",
+        .topics = &topics,
+    };
+
+    var buf: [512]u8 = undefined;
+    var pos = buildTestRequest(&buf, 47, 0, 4708, header_mod.requestHeaderVersion(47, 0));
+    req.serialize(&buf, &pos, 0);
+
+    const response = broker.handleRequest(buf[0..pos]);
+    try testing.expect(response != null);
+    defer testing.allocator.free(response.?);
+
+    var rpos: usize = 0;
+    var response_header = try ResponseHeader.deserialize(testing.allocator, response.?, &rpos, header_mod.responseHeaderVersion(47, 0));
+    defer response_header.deinit(testing.allocator);
+    try testing.expectEqual(@as(i32, 4708), response_header.correlation_id);
+
+    const resp = try Resp.deserialize(testing.allocator, response.?, &rpos, 0);
+    defer {
+        for (resp.topics) |topic| {
+            if (topic.partitions.len > 0) testing.allocator.free(topic.partitions);
+        }
+        if (resp.topics.len > 0) testing.allocator.free(resp.topics);
+    }
+
+    try testing.expectEqual(response.?.len, rpos);
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.none)), resp.error_code);
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.kafka_storage_error)), resp.topics[0].partitions[0].error_code);
+    const committed_record = try broker.groups.fetchOffsetRecord("delete-offset-persist-fail-group", "delete-offset-persist-fail-topic", 0);
+    try testing.expect(committed_record != null);
+    try testing.expectEqual(@as(i64, 55), committed_record.?.offset);
+    try testing.expectEqualStrings("delete-old", committed_record.?.metadata.?);
 }
 
 test "Broker.handleRequest OffsetDelete preserves offsets when S3 tombstone write fails" {
@@ -45142,6 +45368,78 @@ test "Broker.handleRequest OffsetCommit reports coordinator commit failure per p
 
     const committed = try broker.groups.fetchOffset("oc-fail-group", "oc-fail-topic", 0);
     try testing.expect(committed == null);
+}
+
+test "Broker.handleRequest OffsetCommit rolls back local offset persistence failures" {
+    const fs = @import("fs_compat");
+    const Req = generated.offset_commit_request.OffsetCommitRequest;
+    const Resp = generated.offset_commit_response.OffsetCommitResponse;
+    const Topic = Req.OffsetCommitRequestTopic;
+    const Partition = Topic.OffsetCommitRequestPartition;
+
+    const tmp_dir = "/tmp/zmq-offset-commit-persist-fail-test";
+    fs.deleteTreeAbsolute(tmp_dir) catch {};
+    try fs.makeDirAbsolute(tmp_dir);
+    defer fs.deleteTreeAbsolute(tmp_dir) catch {};
+
+    var broker = Broker.initWithConfig(testing.allocator, 1, 9092, .{ .data_dir = tmp_dir });
+    defer broker.deinit();
+    try broker.open();
+    try testing.expect(broker.ensureTopic("oc-persist-fail-topic"));
+    try broker.groups.commitOffsetWithMetadata("oc-persist-fail-group", "oc-persist-fail-topic", 0, 12, -1, "old-meta");
+    try broker.persistOffsetsDurably();
+
+    const offsets_path = try std.fmt.allocPrint(testing.allocator, "{s}/offsets.meta", .{tmp_dir});
+    defer testing.allocator.free(offsets_path);
+    try fs.deleteFileAbsolute(offsets_path);
+    try fs.makeDirAbsolute(offsets_path);
+
+    const partitions = [_]Partition{.{
+        .partition_index = 0,
+        .committed_offset = 99,
+        .committed_leader_epoch = 4,
+        .committed_metadata = "new-meta",
+    }};
+    const topics = [_]Topic{.{
+        .name = "oc-persist-fail-topic",
+        .partitions = &partitions,
+    }};
+    const req = Req{
+        .group_id = "oc-persist-fail-group",
+        .generation_id_or_member_epoch = -1,
+        .member_id = "",
+        .group_instance_id = null,
+        .topics = &topics,
+    };
+
+    var buf: [512]u8 = undefined;
+    var pos = buildTestRequest(&buf, 8, 8, 817, header_mod.requestHeaderVersion(8, 8));
+    req.serialize(&buf, &pos, 8);
+
+    const response = broker.handleRequest(buf[0..pos]);
+    try testing.expect(response != null);
+    defer testing.allocator.free(response.?);
+
+    var rpos: usize = 0;
+    var response_header = try ResponseHeader.deserialize(testing.allocator, response.?, &rpos, header_mod.responseHeaderVersion(8, 8));
+    defer response_header.deinit(testing.allocator);
+    try testing.expectEqual(@as(i32, 817), response_header.correlation_id);
+
+    const resp = try Resp.deserialize(testing.allocator, response.?, &rpos, 8);
+    defer {
+        for (resp.topics) |topic| {
+            if (topic.partitions.len > 0) testing.allocator.free(topic.partitions);
+        }
+        if (resp.topics.len > 0) testing.allocator.free(resp.topics);
+    }
+
+    try testing.expectEqual(response.?.len, rpos);
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.kafka_storage_error)), resp.topics[0].partitions[0].error_code);
+    const committed_record = try broker.groups.fetchOffsetRecord("oc-persist-fail-group", "oc-persist-fail-topic", 0);
+    try testing.expect(committed_record != null);
+    try testing.expectEqual(@as(i64, 12), committed_record.?.offset);
+    try testing.expectEqual(@as(i32, -1), committed_record.?.leader_epoch);
+    try testing.expectEqualStrings("old-meta", committed_record.?.metadata.?);
 }
 
 test "Broker.handleRequest OffsetCommit rejects truncated request" {
