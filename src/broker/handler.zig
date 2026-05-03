@@ -16323,6 +16323,11 @@ pub const Broker = struct {
             const resp = Resp{ .error_code = autoMqQuorumErrorCode(err), .throttle_time_ms = 0 };
             return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
         };
+        var previous_snapshot: ?MetadataPersistence.AutoMqMetadataSnapshot = null;
+        defer if (previous_snapshot) |*snapshot| self.persistence.freeAutoMqMetadataSnapshot(snapshot);
+        if (self.raft_state == null) {
+            previous_snapshot = self.cloneAutoMqMetadataSnapshot() catch return null;
+        }
         const wal_config_copy = self.allocator.dupe(u8, wal_config) catch return null;
 
         if (self.auto_mq_nodes.getPtr(req.node_id)) |node| {
@@ -16335,7 +16340,12 @@ pub const Broker = struct {
             };
         }
         if (req.node_id >= self.auto_mq_next_node_id) self.auto_mq_next_node_id = req.node_id + 1;
-        self.persistAutoMqMetadata();
+        self.persistAutoMqMetadataAfterMutation() catch |err| {
+            log.warn("AutomqRegisterNode metadata snapshot write failed: {}", .{err});
+            if (previous_snapshot) |snapshot| self.restoreAutoMqMetadataAfterFailedMutation(snapshot);
+            const resp = Resp{ .error_code = errorCode(.kafka_storage_error), .throttle_time_ms = 0 };
+            return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+        };
 
         const resp = Resp{ .error_code = 0, .throttle_time_ms = 0 };
         return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
@@ -16427,6 +16437,11 @@ pub const Broker = struct {
                 return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
             };
         }
+        var previous_snapshot: ?MetadataPersistence.AutoMqMetadataSnapshot = null;
+        defer if (previous_snapshot) |*snapshot| self.persistence.freeAutoMqMetadataSnapshot(snapshot);
+        if (self.raft_state == null and (req.metadata != null or new_route_epoch != self.auto_mq_zone_router_epoch)) {
+            previous_snapshot = self.cloneAutoMqMetadataSnapshot() catch return null;
+        }
         if (req.metadata) |metadata| {
             const metadata_copy = self.allocator.dupe(u8, metadata) catch return null;
             if (self.auto_mq_zone_router_metadata) |old| self.allocator.free(old);
@@ -16437,7 +16452,19 @@ pub const Broker = struct {
             self.auto_mq_zone_router_epoch = new_route_epoch;
             mutated = true;
         }
-        if (mutated) self.persistAutoMqMetadata();
+        var response_error: i16 = 0;
+        if (mutated) {
+            self.persistAutoMqMetadataAfterMutation() catch |err| {
+                log.warn("AutomqZoneRouter metadata snapshot write failed: {}", .{err});
+                if (previous_snapshot) |snapshot| self.restoreAutoMqMetadataAfterFailedMutation(snapshot);
+                response_error = errorCode(.kafka_storage_error);
+            };
+        }
+
+        if (response_error != 0) {
+            const resp = Resp{ .error_code = response_error, .throttle_time_ms = 0, .responses = &.{} };
+            return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+        }
 
         const default_route = std.fmt.allocPrint(arena_alloc, "{{\"node_id\":{d},\"epoch\":{d}}}", .{ self.node_id, self.auto_mq_zone_router_epoch }) catch return null;
         const responses = arena_alloc.alloc(ItemResp, 1) catch return null;
@@ -16516,10 +16543,20 @@ pub const Broker = struct {
             const resp = Resp{ .error_code = autoMqQuorumErrorCode(err), .throttle_time_ms = 0, .error_message = "metadata quorum unavailable" };
             return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
         };
+        var previous_snapshot: ?MetadataPersistence.AutoMqMetadataSnapshot = null;
+        defer if (previous_snapshot) |*snapshot| self.persistence.freeAutoMqMetadataSnapshot(snapshot);
+        if (self.raft_state == null) {
+            previous_snapshot = self.cloneAutoMqMetadataSnapshot() catch return null;
+        }
         const license_copy = self.allocator.dupe(u8, license) catch return null;
         if (self.auto_mq_license) |old| self.allocator.free(old);
         self.auto_mq_license = license_copy;
-        self.persistAutoMqMetadata();
+        self.persistAutoMqMetadataAfterMutation() catch |err| {
+            log.warn("UpdateLicense metadata snapshot write failed: {}", .{err});
+            if (previous_snapshot) |snapshot| self.restoreAutoMqMetadataAfterFailedMutation(snapshot);
+            const resp = Resp{ .error_code = errorCode(.kafka_storage_error), .throttle_time_ms = 0, .error_message = "Failed to persist AutoMQ metadata" };
+            return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+        };
 
         const resp = Resp{ .error_code = 0, .throttle_time_ms = 0, .error_message = "" };
         return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
@@ -16586,8 +16623,18 @@ pub const Broker = struct {
             const resp = Resp{ .error_code = autoMqQuorumErrorCode(err), .throttle_time_ms = 0, .node_id = -1 };
             return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
         };
+        var previous_snapshot: ?MetadataPersistence.AutoMqMetadataSnapshot = null;
+        defer if (previous_snapshot) |*snapshot| self.persistence.freeAutoMqMetadataSnapshot(snapshot);
+        if (self.raft_state == null) {
+            previous_snapshot = self.cloneAutoMqMetadataSnapshot() catch return null;
+        }
         self.auto_mq_next_node_id = next_node_id;
-        self.persistAutoMqMetadata();
+        self.persistAutoMqMetadataAfterMutation() catch |err| {
+            log.warn("GetNextNodeId metadata snapshot write failed: {}", .{err});
+            if (previous_snapshot) |snapshot| self.restoreAutoMqMetadataAfterFailedMutation(snapshot);
+            const resp = Resp{ .error_code = errorCode(.kafka_storage_error), .throttle_time_ms = 0, .node_id = -1 };
+            return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+        };
         const resp = Resp{ .error_code = 0, .throttle_time_ms = 0, .node_id = node_id };
         return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
     }
@@ -16665,11 +16712,16 @@ pub const Broker = struct {
         }
 
         var mutated = false;
+        var previous_snapshot: ?MetadataPersistence.AutoMqMetadataSnapshot = null;
+        defer if (previous_snapshot) |*snapshot| self.persistence.freeAutoMqMetadataSnapshot(snapshot);
         if (req.promoted) {
             self.commitAutoMqUpdateGroupRecord(group_id, link_id, true) catch |err| {
                 const resp = Resp{ .group_id = req.group_id, .error_code = autoMqQuorumErrorCode(err), .error_message = "metadata quorum unavailable", .throttle_time_ms = 0 };
                 return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
             };
+            if (self.raft_state == null) {
+                previous_snapshot = self.cloneAutoMqMetadataSnapshot() catch return null;
+            }
             const link_copy = self.allocator.dupe(u8, link_id) catch return null;
             if (self.auto_mq_group_promotions.getPtr(group_id)) |existing| {
                 existing.deinit(self.allocator);
@@ -16691,15 +16743,27 @@ pub const Broker = struct {
                 const resp = Resp{ .group_id = req.group_id, .error_code = autoMqQuorumErrorCode(err), .error_message = "metadata quorum unavailable", .throttle_time_ms = 0 };
                 return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
             };
+            if (self.raft_state == null) {
+                previous_snapshot = self.cloneAutoMqMetadataSnapshot() catch return null;
+            }
             const removed = self.auto_mq_group_promotions.fetchRemove(group_id).?;
             self.allocator.free(removed.key);
             var promotion = removed.value;
             promotion.deinit(self.allocator);
             mutated = true;
         }
-        if (mutated) self.persistAutoMqMetadata();
+        var response_error: i16 = 0;
+        var response_error_message: ?[]const u8 = null;
+        if (mutated) {
+            self.persistAutoMqMetadataAfterMutation() catch |err| {
+                log.warn("AutomqUpdateGroup metadata snapshot write failed: {}", .{err});
+                if (previous_snapshot) |snapshot| self.restoreAutoMqMetadataAfterFailedMutation(snapshot);
+                response_error = errorCode(.kafka_storage_error);
+                response_error_message = "Failed to persist AutoMQ metadata";
+            };
+        }
 
-        const resp = Resp{ .group_id = req.group_id, .error_code = 0, .error_message = null, .throttle_time_ms = 0 };
+        const resp = Resp{ .group_id = req.group_id, .error_code = response_error, .error_message = response_error_message, .throttle_time_ms = 0 };
         return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
     }
 
@@ -33459,6 +33523,150 @@ test "Broker AutoMQ KV APIs roll back when local metadata persistence fails" {
     try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.resource_not_found)), delete_resp.delete_kv_responses[1].error_code);
     try testing.expectEqual(@as(u32, 1), broker.auto_mq_kvs.count());
     try testing.expectEqualStrings("old-value", broker.auto_mq_kvs.get("existing").?);
+}
+
+test "Broker AutoMQ metadata mutation APIs roll back when local persistence fails" {
+    const fs = @import("fs_compat");
+    const tmp_dir = "/tmp/zmq-automq-metadata-persist-fail-test";
+    fs.deleteTreeAbsolute(tmp_dir) catch {};
+    try fs.makeDirAbsolute(tmp_dir);
+    defer fs.deleteTreeAbsolute(tmp_dir) catch {};
+
+    const metadata_path = try std.fmt.allocPrint(testing.allocator, "{s}/automq.meta", .{tmp_dir});
+    defer testing.allocator.free(metadata_path);
+    try fs.makeDirAbsolute(metadata_path);
+
+    const RegisterReq = generated.automq_register_node_request.AutomqRegisterNodeRequest;
+    const RegisterResp = generated.automq_register_node_response.AutomqRegisterNodeResponse;
+    const ZoneReq = generated.automq_zone_router_request.AutomqZoneRouterRequest;
+    const ZoneResp = generated.automq_zone_router_response.AutomqZoneRouterResponse;
+    const UpdateLicenseReq = generated.update_license_request.UpdateLicenseRequest;
+    const UpdateLicenseResp = generated.update_license_response.UpdateLicenseResponse;
+    const NextNodeReq = generated.get_next_node_id_request.GetNextNodeIdRequest;
+    const NextNodeResp = generated.get_next_node_id_response.GetNextNodeIdResponse;
+    const UpdateGroupReq = generated.automq_update_group_request.AutomqUpdateGroupRequest;
+    const UpdateGroupResp = generated.automq_update_group_response.AutomqUpdateGroupResponse;
+    const storage_error = @as(i16, @intFromEnum(ErrorCode.kafka_storage_error));
+
+    var broker = Broker.initWithConfig(testing.allocator, 1, 9092, .{ .data_dir = tmp_dir });
+    defer broker.deinit();
+    var owned_responses = std.array_list.Managed([]u8).init(testing.allocator);
+    defer {
+        for (owned_responses.items) |owned_response| testing.allocator.free(owned_response);
+        owned_responses.deinit();
+    }
+    try broker.registerAutoMqNodeFromRecord(7, 3, "wal://old");
+    broker.setAutoMqNextNodeIdFromRecord(10);
+    try broker.setAutoMqZoneRouterFromRecord("old-route", 3);
+    try broker.setAutoMqLicenseFromRecord("old-license");
+    try broker.updateAutoMqGroupFromRecord("group-a", "old-link", true);
+
+    var buf: [1024]u8 = undefined;
+    var pos = buildTestRequest(&buf, 513, 0, 5131, header_mod.requestHeaderVersion(513, 0));
+    const register_req = RegisterReq{ .node_id = 7, .node_epoch = 4, .wal_config = "wal://new" };
+    register_req.serialize(&buf, &pos, 0);
+    var response = broker.handleRequest(buf[0..pos]);
+    try testing.expect(response != null);
+    try owned_responses.append(response.?);
+
+    var rpos: usize = 0;
+    var register_header = try ResponseHeader.deserialize(testing.allocator, response.?, &rpos, header_mod.responseHeaderVersion(513, 0));
+    defer register_header.deinit(testing.allocator);
+    try testing.expectEqual(@as(i32, 5131), register_header.correlation_id);
+    const register_resp = try RegisterResp.deserialize(testing.allocator, response.?, &rpos, 0);
+    try testing.expectEqual(response.?.len, rpos);
+    try testing.expectEqual(storage_error, register_resp.error_code);
+    const node = broker.auto_mq_nodes.get(7).?;
+    try testing.expectEqual(@as(i64, 3), node.node_epoch);
+    try testing.expectEqualStrings("wal://old", node.wal_config);
+    try testing.expectEqual(@as(i32, 10), broker.auto_mq_next_node_id);
+
+    pos = buildTestRequest(&buf, 600, 0, 6001, header_mod.requestHeaderVersion(600, 0));
+    const next_node_req = NextNodeReq{ .cluster_id = "zmq-cluster" };
+    next_node_req.serialize(&buf, &pos, 0);
+    response = broker.handleRequest(buf[0..pos]);
+    try testing.expect(response != null);
+    try owned_responses.append(response.?);
+
+    rpos = 0;
+    var next_node_header = try ResponseHeader.deserialize(testing.allocator, response.?, &rpos, header_mod.responseHeaderVersion(600, 0));
+    defer next_node_header.deinit(testing.allocator);
+    try testing.expectEqual(@as(i32, 6001), next_node_header.correlation_id);
+    const next_node_resp = try NextNodeResp.deserialize(testing.allocator, response.?, &rpos, 0);
+    try testing.expectEqual(response.?.len, rpos);
+    try testing.expectEqual(storage_error, next_node_resp.error_code);
+    try testing.expectEqual(@as(i32, -1), next_node_resp.node_id);
+    try testing.expectEqual(@as(i32, 10), broker.auto_mq_next_node_id);
+
+    pos = buildTestRequest(&buf, 515, 1, 5151, header_mod.requestHeaderVersion(515, 1));
+    const zone_req = ZoneReq{ .metadata = "new-route", .route_epoch = 4, .version = 1 };
+    zone_req.serialize(&buf, &pos, 1);
+    response = broker.handleRequest(buf[0..pos]);
+    try testing.expect(response != null);
+    try owned_responses.append(response.?);
+
+    rpos = 0;
+    var zone_header = try ResponseHeader.deserialize(testing.allocator, response.?, &rpos, header_mod.responseHeaderVersion(515, 1));
+    defer zone_header.deinit(testing.allocator);
+    try testing.expectEqual(@as(i32, 5151), zone_header.correlation_id);
+    const zone_resp = try ZoneResp.deserialize(testing.allocator, response.?, &rpos, 1);
+    defer if (zone_resp.responses.len > 0) testing.allocator.free(zone_resp.responses);
+    try testing.expectEqual(response.?.len, rpos);
+    try testing.expectEqual(storage_error, zone_resp.error_code);
+    try testing.expectEqual(@as(usize, 0), zone_resp.responses.len);
+    try testing.expectEqualStrings("old-route", broker.auto_mq_zone_router_metadata.?);
+    try testing.expectEqual(@as(i64, 3), broker.auto_mq_zone_router_epoch);
+
+    pos = buildTestRequest(&buf, 517, 0, 5171, header_mod.requestHeaderVersion(517, 0));
+    const update_license_req = UpdateLicenseReq{ .license = "new-license" };
+    update_license_req.serialize(&buf, &pos, 0);
+    response = broker.handleRequest(buf[0..pos]);
+    try testing.expect(response != null);
+    try owned_responses.append(response.?);
+
+    rpos = 0;
+    var update_license_header = try ResponseHeader.deserialize(testing.allocator, response.?, &rpos, header_mod.responseHeaderVersion(517, 0));
+    defer update_license_header.deinit(testing.allocator);
+    try testing.expectEqual(@as(i32, 5171), update_license_header.correlation_id);
+    const update_license_resp = try UpdateLicenseResp.deserialize(testing.allocator, response.?, &rpos, 0);
+    try testing.expectEqual(response.?.len, rpos);
+    try testing.expectEqual(storage_error, update_license_resp.error_code);
+    try testing.expectEqualStrings("Failed to persist AutoMQ metadata", update_license_resp.error_message.?);
+    try testing.expectEqualStrings("old-license", broker.auto_mq_license.?);
+
+    pos = buildTestRequest(&buf, 602, 0, 6021, header_mod.requestHeaderVersion(602, 0));
+    const promote_group_req = UpdateGroupReq{ .link_id = "new-link", .group_id = "group-a", .promoted = true };
+    promote_group_req.serialize(&buf, &pos, 0);
+    response = broker.handleRequest(buf[0..pos]);
+    try testing.expect(response != null);
+    try owned_responses.append(response.?);
+
+    rpos = 0;
+    var promote_group_header = try ResponseHeader.deserialize(testing.allocator, response.?, &rpos, header_mod.responseHeaderVersion(602, 0));
+    defer promote_group_header.deinit(testing.allocator);
+    try testing.expectEqual(@as(i32, 6021), promote_group_header.correlation_id);
+    const promote_group_resp = try UpdateGroupResp.deserialize(testing.allocator, response.?, &rpos, 0);
+    try testing.expectEqual(response.?.len, rpos);
+    try testing.expectEqual(storage_error, promote_group_resp.error_code);
+    try testing.expectEqualStrings("Failed to persist AutoMQ metadata", promote_group_resp.error_message.?);
+    try testing.expectEqualStrings("old-link", broker.auto_mq_group_promotions.get("group-a").?.link_id);
+
+    pos = buildTestRequest(&buf, 602, 0, 6022, header_mod.requestHeaderVersion(602, 0));
+    const demote_group_req = UpdateGroupReq{ .link_id = "", .group_id = "group-a", .promoted = false };
+    demote_group_req.serialize(&buf, &pos, 0);
+    response = broker.handleRequest(buf[0..pos]);
+    try testing.expect(response != null);
+    try owned_responses.append(response.?);
+
+    rpos = 0;
+    var demote_group_header = try ResponseHeader.deserialize(testing.allocator, response.?, &rpos, header_mod.responseHeaderVersion(602, 0));
+    defer demote_group_header.deinit(testing.allocator);
+    try testing.expectEqual(@as(i32, 6022), demote_group_header.correlation_id);
+    const demote_group_resp = try UpdateGroupResp.deserialize(testing.allocator, response.?, &rpos, 0);
+    try testing.expectEqual(response.?.len, rpos);
+    try testing.expectEqual(storage_error, demote_group_resp.error_code);
+    try testing.expectEqualStrings("Failed to persist AutoMQ metadata", demote_group_resp.error_message.?);
+    try testing.expectEqualStrings("old-link", broker.auto_mq_group_promotions.get("group-a").?.link_id);
 }
 
 test "Broker AutoMQ node license and manifest APIs" {
