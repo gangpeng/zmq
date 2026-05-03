@@ -1327,7 +1327,13 @@ pub const Broker = struct {
 
     /// Persist local AutoMQ controller-style metadata to disk (best-effort).
     fn persistAutoMqMetadata(self: *Broker) void {
-        self.persistence.saveAutoMqMetadata(
+        self.persistAutoMqMetadataDurably() catch |err| {
+            log.warn("Failed to persist AutoMQ metadata: {}", .{err});
+        };
+    }
+
+    fn persistAutoMqMetadataDurably(self: *Broker) !void {
+        try self.persistence.saveAutoMqMetadata(
             &self.auto_mq_kvs,
             &self.auto_mq_nodes,
             self.auto_mq_next_node_id,
@@ -1335,9 +1341,15 @@ pub const Broker = struct {
             self.auto_mq_zone_router_metadata,
             self.auto_mq_zone_router_epoch,
             &self.auto_mq_group_promotions,
-        ) catch |err| {
-            log.warn("Failed to persist AutoMQ metadata: {}", .{err});
-        };
+        );
+    }
+
+    fn persistAutoMqMetadataAfterMutation(self: *Broker) !void {
+        if (self.raft_state != null) {
+            self.persistAutoMqMetadata();
+            return;
+        }
+        try self.persistAutoMqMetadataDurably();
     }
 
     /// Persist stream/object metadata snapshots to disk (best-effort).
@@ -1846,6 +1858,97 @@ pub const Broker = struct {
                 return err;
             };
         }
+    }
+
+    fn cloneAutoMqMetadataSnapshot(self: *Broker) !MetadataPersistence.AutoMqMetadataSnapshot {
+        var snapshot = MetadataPersistence.AutoMqMetadataSnapshot{
+            .next_node_id = self.auto_mq_next_node_id,
+            .zone_router_epoch = self.auto_mq_zone_router_epoch,
+            .license = null,
+            .zone_router_metadata = null,
+            .kvs = &.{},
+            .nodes = &.{},
+            .group_promotions = &.{},
+        };
+        errdefer self.persistence.freeAutoMqMetadataSnapshot(&snapshot);
+
+        if (self.auto_mq_license) |license| {
+            snapshot.license = try self.allocator.dupe(u8, license);
+        }
+        if (self.auto_mq_zone_router_metadata) |metadata| {
+            snapshot.zone_router_metadata = try self.allocator.dupe(u8, metadata);
+        }
+
+        var kvs = std.array_list.Managed(MetadataPersistence.AutoMqKvEntry).init(self.allocator);
+        errdefer {
+            for (kvs.items) |entry| {
+                self.allocator.free(entry.key);
+                self.allocator.free(entry.value);
+            }
+            kvs.deinit();
+        }
+        var kv_it = self.auto_mq_kvs.iterator();
+        while (kv_it.next()) |entry| {
+            const key = try self.allocator.dupe(u8, entry.key_ptr.*);
+            errdefer self.allocator.free(key);
+            const value = try self.allocator.dupe(u8, entry.value_ptr.*);
+            kvs.append(.{ .key = key, .value = value }) catch |err| {
+                self.allocator.free(value);
+                return err;
+            };
+        }
+        snapshot.kvs = try kvs.toOwnedSlice();
+
+        var nodes = std.array_list.Managed(MetadataPersistence.AutoMqNodeEntry).init(self.allocator);
+        errdefer {
+            for (nodes.items) |entry| self.allocator.free(entry.wal_config);
+            nodes.deinit();
+        }
+        var node_it = self.auto_mq_nodes.iterator();
+        while (node_it.next()) |entry| {
+            const wal_config = try self.allocator.dupe(u8, entry.value_ptr.wal_config);
+            nodes.append(.{
+                .node_id = entry.key_ptr.*,
+                .node_epoch = entry.value_ptr.node_epoch,
+                .wal_config = wal_config,
+            }) catch |err| {
+                self.allocator.free(wal_config);
+                return err;
+            };
+        }
+        snapshot.nodes = try nodes.toOwnedSlice();
+
+        var group_promotions = std.array_list.Managed(MetadataPersistence.AutoMqGroupPromotionEntry).init(self.allocator);
+        errdefer {
+            for (group_promotions.items) |entry| {
+                self.allocator.free(entry.group_id);
+                self.allocator.free(entry.link_id);
+            }
+            group_promotions.deinit();
+        }
+        var group_it = self.auto_mq_group_promotions.iterator();
+        while (group_it.next()) |entry| {
+            const group_id = try self.allocator.dupe(u8, entry.key_ptr.*);
+            errdefer self.allocator.free(group_id);
+            const link_id = try self.allocator.dupe(u8, entry.value_ptr.link_id);
+            group_promotions.append(.{
+                .group_id = group_id,
+                .link_id = link_id,
+                .promoted = entry.value_ptr.promoted,
+            }) catch |err| {
+                self.allocator.free(link_id);
+                return err;
+            };
+        }
+        snapshot.group_promotions = try group_promotions.toOwnedSlice();
+
+        return snapshot;
+    }
+
+    fn restoreAutoMqMetadataAfterFailedMutation(self: *Broker, snapshot: MetadataPersistence.AutoMqMetadataSnapshot) void {
+        self.restoreAutoMqMetadata(snapshot) catch |err| {
+            log.err("Failed to restore AutoMQ metadata after rollback: {}", .{err});
+        };
     }
 
     /// Auto-create a topic if auto.create.topics.enable is true.
@@ -16022,6 +16125,12 @@ pub const Broker = struct {
         };
 
         const responses = arena_alloc.alloc(ItemResp, req.put_kv_requests.len) catch return null;
+        var response_error: i16 = 0;
+        var previous_snapshot: ?MetadataPersistence.AutoMqMetadataSnapshot = null;
+        defer if (previous_snapshot) |*snapshot| self.persistence.freeAutoMqMetadataSnapshot(snapshot);
+        if (self.raft_state == null) {
+            previous_snapshot = self.cloneAutoMqMetadataSnapshot() catch return null;
+        }
         var mutated = false;
         for (req.put_kv_requests, 0..) |item, i| {
             const key = item.key orelse "";
@@ -16063,9 +16172,21 @@ pub const Broker = struct {
                 mutated = true;
             }
         }
-        if (mutated) self.persistAutoMqMetadata();
+        if (mutated) {
+            self.persistAutoMqMetadataAfterMutation() catch |err| {
+                log.warn("PutKVs AutoMQ metadata snapshot write failed: {}", .{err});
+                if (previous_snapshot) |snapshot| self.restoreAutoMqMetadataAfterFailedMutation(snapshot);
+                response_error = errorCode(.kafka_storage_error);
+                for (responses) |*response| {
+                    if (response.error_code == 0) {
+                        response.error_code = errorCode(.kafka_storage_error);
+                        response.value = null;
+                    }
+                }
+            };
+        }
 
-        const resp = Resp{ .error_code = 0, .throttle_time_ms = 0, .put_kv_responses = responses };
+        const resp = Resp{ .error_code = response_error, .throttle_time_ms = 0, .put_kv_responses = responses };
         return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
     }
 
@@ -16083,6 +16204,12 @@ pub const Broker = struct {
         };
 
         const responses = arena_alloc.alloc(ItemResp, req.delete_kv_requests.len) catch return null;
+        var response_error: i16 = 0;
+        var previous_snapshot: ?MetadataPersistence.AutoMqMetadataSnapshot = null;
+        defer if (previous_snapshot) |*snapshot| self.persistence.freeAutoMqMetadataSnapshot(snapshot);
+        if (self.raft_state == null) {
+            previous_snapshot = self.cloneAutoMqMetadataSnapshot() catch return null;
+        }
         var mutated = false;
         for (req.delete_kv_requests, 0..) |item, i| {
             const key = item.key orelse "";
@@ -16105,9 +16232,21 @@ pub const Broker = struct {
                 responses[i] = .{ .error_code = errorCode(.resource_not_found), .value = null };
             }
         }
-        if (mutated) self.persistAutoMqMetadata();
+        if (mutated) {
+            self.persistAutoMqMetadataAfterMutation() catch |err| {
+                log.warn("DeleteKVs AutoMQ metadata snapshot write failed: {}", .{err});
+                if (previous_snapshot) |snapshot| self.restoreAutoMqMetadataAfterFailedMutation(snapshot);
+                response_error = errorCode(.kafka_storage_error);
+                for (responses) |*response| {
+                    if (response.error_code == 0) {
+                        response.error_code = errorCode(.kafka_storage_error);
+                        response.value = null;
+                    }
+                }
+            };
+        }
 
-        const resp = Resp{ .error_code = 0, .throttle_time_ms = 0, .delete_kv_responses = responses };
+        const resp = Resp{ .error_code = response_error, .throttle_time_ms = 0, .delete_kv_responses = responses };
         return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
     }
 
@@ -33237,6 +33376,89 @@ test "Broker AutoMQ KV APIs round-trip" {
     try testing.expectEqual(@as(i16, 0), delete_resp.delete_kv_responses[0].error_code);
     try testing.expectEqualStrings("beta", delete_resp.delete_kv_responses[0].value.?);
     try testing.expectEqual(@as(u32, 0), broker.auto_mq_kvs.count());
+}
+
+test "Broker AutoMQ KV APIs roll back when local metadata persistence fails" {
+    const fs = @import("fs_compat");
+    const tmp_dir = "/tmp/zmq-automq-kv-persist-fail-test";
+    fs.deleteTreeAbsolute(tmp_dir) catch {};
+    try fs.makeDirAbsolute(tmp_dir);
+    defer fs.deleteTreeAbsolute(tmp_dir) catch {};
+
+    const metadata_path = try std.fmt.allocPrint(testing.allocator, "{s}/automq.meta", .{tmp_dir});
+    defer testing.allocator.free(metadata_path);
+    try fs.makeDirAbsolute(metadata_path);
+
+    const PutReq = generated.put_k_vs_request.PutKVsRequest;
+    const PutResp = generated.put_k_vs_response.PutKVsResponse;
+    const DeleteReq = generated.delete_k_vs_request.DeleteKVsRequest;
+    const DeleteResp = generated.delete_k_vs_response.DeleteKVsResponse;
+    const storage_error = @as(i16, @intFromEnum(ErrorCode.kafka_storage_error));
+
+    var broker = Broker.initWithConfig(testing.allocator, 1, 9092, .{ .data_dir = tmp_dir });
+    defer broker.deinit();
+    try broker.putAutoMqKvFromRecord("existing", "old-value");
+
+    var buf: [1024]u8 = undefined;
+    var pos = buildTestRequest(&buf, 510, 0, 5101, header_mod.requestHeaderVersion(510, 0));
+    const put_items = [_]PutReq.PutKVRequest{
+        .{ .key = "existing", .value = "new-value", .overwrite = true },
+        .{ .key = "new-key", .value = "new-value", .overwrite = true },
+        .{ .key = "", .value = "ignored", .overwrite = true },
+    };
+    const put_req = PutReq{ .put_kv_requests = &put_items };
+    put_req.serialize(&buf, &pos, 0);
+
+    const put_response = broker.handleRequest(buf[0..pos]);
+    try testing.expect(put_response != null);
+    defer testing.allocator.free(put_response.?);
+
+    var rpos: usize = 0;
+    var put_header = try ResponseHeader.deserialize(testing.allocator, put_response.?, &rpos, header_mod.responseHeaderVersion(510, 0));
+    defer put_header.deinit(testing.allocator);
+    try testing.expectEqual(@as(i32, 5101), put_header.correlation_id);
+    const put_resp = try PutResp.deserialize(testing.allocator, put_response.?, &rpos, 0);
+    defer testing.allocator.free(put_resp.put_kv_responses);
+
+    try testing.expectEqual(put_response.?.len, rpos);
+    try testing.expectEqual(storage_error, put_resp.error_code);
+    try testing.expectEqual(@as(usize, 3), put_resp.put_kv_responses.len);
+    try testing.expectEqual(storage_error, put_resp.put_kv_responses[0].error_code);
+    try testing.expect(put_resp.put_kv_responses[0].value == null);
+    try testing.expectEqual(storage_error, put_resp.put_kv_responses[1].error_code);
+    try testing.expect(put_resp.put_kv_responses[1].value == null);
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.invalid_request)), put_resp.put_kv_responses[2].error_code);
+    try testing.expectEqual(@as(u32, 1), broker.auto_mq_kvs.count());
+    try testing.expectEqualStrings("old-value", broker.auto_mq_kvs.get("existing").?);
+    try testing.expect(!broker.auto_mq_kvs.contains("new-key"));
+
+    pos = buildTestRequest(&buf, 511, 0, 5111, header_mod.requestHeaderVersion(511, 0));
+    const delete_items = [_]DeleteReq.DeleteKVRequest{
+        .{ .key = "existing" },
+        .{ .key = "missing" },
+    };
+    const delete_req = DeleteReq{ .delete_kv_requests = &delete_items };
+    delete_req.serialize(&buf, &pos, 0);
+
+    const delete_response = broker.handleRequest(buf[0..pos]);
+    try testing.expect(delete_response != null);
+    defer testing.allocator.free(delete_response.?);
+
+    rpos = 0;
+    var delete_header = try ResponseHeader.deserialize(testing.allocator, delete_response.?, &rpos, header_mod.responseHeaderVersion(511, 0));
+    defer delete_header.deinit(testing.allocator);
+    try testing.expectEqual(@as(i32, 5111), delete_header.correlation_id);
+    const delete_resp = try DeleteResp.deserialize(testing.allocator, delete_response.?, &rpos, 0);
+    defer testing.allocator.free(delete_resp.delete_kv_responses);
+
+    try testing.expectEqual(delete_response.?.len, rpos);
+    try testing.expectEqual(storage_error, delete_resp.error_code);
+    try testing.expectEqual(@as(usize, 2), delete_resp.delete_kv_responses.len);
+    try testing.expectEqual(storage_error, delete_resp.delete_kv_responses[0].error_code);
+    try testing.expect(delete_resp.delete_kv_responses[0].value == null);
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.resource_not_found)), delete_resp.delete_kv_responses[1].error_code);
+    try testing.expectEqual(@as(u32, 1), broker.auto_mq_kvs.count());
+    try testing.expectEqualStrings("old-value", broker.auto_mq_kvs.get("existing").?);
 }
 
 test "Broker AutoMQ node license and manifest APIs" {
