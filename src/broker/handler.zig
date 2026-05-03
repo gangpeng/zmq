@@ -15339,8 +15339,27 @@ pub const Broker = struct {
                 };
                 return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
             };
-            self.persistTopicsLocal();
-            self.persistObjectManagerSnapshot();
+            self.persistTopicAndObjectLocalMetadataDurably() catch |err| {
+                log.warn("Failed to persist AlterConfigs local metadata: {}", .{err});
+                self.restoreTopicsAfterFailedMutation(previous_snapshot.?);
+                for (responses, mutated_resources) |*response, was_mutated| {
+                    if (was_mutated and response.error_code == @intFromEnum(ErrorCode.none)) {
+                        response.error_code = @intFromEnum(ErrorCode.kafka_storage_error);
+                        response.error_message = "Failed to persist topic metadata";
+                    }
+                }
+                self.writeTopicSnapshotRecord() catch |rollback_err| {
+                    log.warn("Failed to append AlterConfigs rollback topic snapshot to __cluster_metadata: {}", .{rollback_err});
+                };
+                self.persistTopicsLocalDurably() catch |rollback_err| {
+                    log.warn("Failed to persist restored AlterConfigs local topic metadata: {}", .{rollback_err});
+                };
+                const resp = Resp{
+                    .throttle_time_ms = 0,
+                    .responses = responses,
+                };
+                return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+            };
         }
 
         const resp = Resp{
@@ -15483,8 +15502,29 @@ pub const Broker = struct {
                 };
                 return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
             };
-            self.persistTopicsLocal();
-            self.persistObjectManagerSnapshot();
+            self.persistTopicAndObjectLocalMetadataDurably() catch |err| {
+                log.warn("Failed to persist CreatePartitions local metadata: {}", .{err});
+                self.restoreTopicsAfterFailedMutation(previous_snapshot.?);
+                for (req.topics, mutation_results, results) |topic_req, mutation, *response| {
+                    if (mutation.mutated and response.error_code == @intFromEnum(ErrorCode.none)) {
+                        const topic_name = topic_req.name orelse "";
+                        self.removeTopicPartitionRange(topic_name, mutation.old_count, mutation.new_count);
+                        response.error_code = @intFromEnum(ErrorCode.kafka_storage_error);
+                        response.error_message = "Failed to persist topic metadata";
+                    }
+                }
+                self.writeTopicSnapshotRecord() catch |rollback_err| {
+                    log.warn("Failed to append CreatePartitions rollback topic snapshot to __cluster_metadata: {}", .{rollback_err});
+                };
+                self.persistTopicsLocalDurably() catch |rollback_err| {
+                    log.warn("Failed to persist restored CreatePartitions local topic metadata: {}", .{rollback_err});
+                };
+                const resp = Resp{
+                    .throttle_time_ms = 0,
+                    .results = results,
+                };
+                return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+            };
         }
 
         const resp = Resp{
@@ -17107,8 +17147,27 @@ pub const Broker = struct {
                 };
                 return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
             };
-            self.persistTopicsLocal();
-            self.persistObjectManagerSnapshot();
+            self.persistTopicAndObjectLocalMetadataDurably() catch |err| {
+                log.warn("Failed to persist IncrementalAlterConfigs local metadata: {}", .{err});
+                self.restoreTopicsAfterFailedMutation(previous_snapshot.?);
+                for (responses, mutated_resources) |*response, was_mutated| {
+                    if (was_mutated and response.error_code == @intFromEnum(ErrorCode.none)) {
+                        response.error_code = @intFromEnum(ErrorCode.kafka_storage_error);
+                        response.error_message = "Failed to persist topic metadata";
+                    }
+                }
+                self.writeTopicSnapshotRecord() catch |rollback_err| {
+                    log.warn("Failed to append IncrementalAlterConfigs rollback topic snapshot to __cluster_metadata: {}", .{rollback_err});
+                };
+                self.persistTopicsLocalDurably() catch |rollback_err| {
+                    log.warn("Failed to persist restored IncrementalAlterConfigs local topic metadata: {}", .{rollback_err});
+                };
+                const resp = Resp{
+                    .throttle_time_ms = 0,
+                    .responses = responses,
+                };
+                return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+            };
         }
 
         const resp = Resp{
@@ -29408,6 +29467,112 @@ test "Broker.handleRequest AlterConfigs rolls back when topic snapshot S3 WAL wr
     try testing.expectEqual(object_count_before, mock_s3.objectCount());
 }
 
+test "Broker.handleRequest AlterConfigs rolls back when local topics persistence fails" {
+    const fs = @import("fs_compat");
+    const Req = generated.alter_configs_request.AlterConfigsRequest;
+    const Resp = generated.alter_configs_response.AlterConfigsResponse;
+
+    const tmp_dir = "/tmp/zmq-alter-configs-local-topics-fail-test";
+    fs.deleteTreeAbsolute(tmp_dir) catch {};
+    try fs.makeDirAbsolute(tmp_dir);
+    defer fs.deleteTreeAbsolute(tmp_dir) catch {};
+
+    var broker = Broker.initWithConfig(testing.allocator, 1, 9092, .{ .data_dir = tmp_dir });
+    defer broker.deinit();
+    try broker.open();
+    try testing.expect(broker.ensureTopic("alter-cfg-local-topics-fail-topic"));
+    const before = broker.topics.get("alter-cfg-local-topics-fail-topic").?.config.retention_bytes;
+
+    const topics_path = try std.fmt.allocPrint(testing.allocator, "{s}/topics.meta", .{tmp_dir});
+    defer testing.allocator.free(topics_path);
+    fs.deleteFileAbsolute(topics_path) catch {};
+    try fs.makeDirAbsolute(topics_path);
+
+    const configs = [_]Req.AlterConfigsResource.AlterableConfig{.{
+        .name = "retention.bytes",
+        .value = "8192",
+    }};
+    const resources = [_]Req.AlterConfigsResource{.{
+        .resource_type = 2,
+        .resource_name = "alter-cfg-local-topics-fail-topic",
+        .configs = &configs,
+    }};
+    const req = Req{ .resources = &resources };
+
+    var buf: [512]u8 = undefined;
+    var pos = buildTestRequest(&buf, 33, 2, 3308, header_mod.requestHeaderVersion(33, 2));
+    req.serialize(&buf, &pos, 2);
+
+    const response = broker.handleRequest(buf[0..pos]);
+    try testing.expect(response != null);
+    defer testing.allocator.free(response.?);
+
+    var rpos: usize = 0;
+    var response_header = try ResponseHeader.deserialize(testing.allocator, response.?, &rpos, header_mod.responseHeaderVersion(33, 2));
+    defer response_header.deinit(testing.allocator);
+    try testing.expectEqual(@as(i32, 3308), response_header.correlation_id);
+
+    const resp = try Resp.deserialize(testing.allocator, response.?, &rpos, 2);
+    defer if (resp.responses.len > 0) testing.allocator.free(resp.responses);
+
+    try testing.expectEqual(response.?.len, rpos);
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.kafka_storage_error)), resp.responses[0].error_code);
+    try testing.expectEqual(before, broker.topics.get("alter-cfg-local-topics-fail-topic").?.config.retention_bytes);
+}
+
+test "Broker.handleRequest AlterConfigs rolls back when local object snapshot fails" {
+    const fs = @import("fs_compat");
+    const Req = generated.alter_configs_request.AlterConfigsRequest;
+    const Resp = generated.alter_configs_response.AlterConfigsResponse;
+
+    const tmp_dir = "/tmp/zmq-alter-configs-local-object-fail-test";
+    fs.deleteTreeAbsolute(tmp_dir) catch {};
+    try fs.makeDirAbsolute(tmp_dir);
+    defer fs.deleteTreeAbsolute(tmp_dir) catch {};
+
+    var broker = Broker.initWithConfig(testing.allocator, 1, 9092, .{ .data_dir = tmp_dir });
+    defer broker.deinit();
+    try broker.open();
+    try testing.expect(broker.ensureTopic("alter-cfg-local-object-fail-topic"));
+    const before = broker.topics.get("alter-cfg-local-object-fail-topic").?.config.retention_bytes;
+
+    const object_snapshot_path = try std.fmt.allocPrint(testing.allocator, "{s}/objects.snapshot", .{tmp_dir});
+    defer testing.allocator.free(object_snapshot_path);
+    fs.deleteFileAbsolute(object_snapshot_path) catch {};
+    try fs.makeDirAbsolute(object_snapshot_path);
+
+    const configs = [_]Req.AlterConfigsResource.AlterableConfig{.{
+        .name = "retention.bytes",
+        .value = "8192",
+    }};
+    const resources = [_]Req.AlterConfigsResource{.{
+        .resource_type = 2,
+        .resource_name = "alter-cfg-local-object-fail-topic",
+        .configs = &configs,
+    }};
+    const req = Req{ .resources = &resources };
+
+    var buf: [512]u8 = undefined;
+    var pos = buildTestRequest(&buf, 33, 2, 3309, header_mod.requestHeaderVersion(33, 2));
+    req.serialize(&buf, &pos, 2);
+
+    const response = broker.handleRequest(buf[0..pos]);
+    try testing.expect(response != null);
+    defer testing.allocator.free(response.?);
+
+    var rpos: usize = 0;
+    var response_header = try ResponseHeader.deserialize(testing.allocator, response.?, &rpos, header_mod.responseHeaderVersion(33, 2));
+    defer response_header.deinit(testing.allocator);
+    try testing.expectEqual(@as(i32, 3309), response_header.correlation_id);
+
+    const resp = try Resp.deserialize(testing.allocator, response.?, &rpos, 2);
+    defer if (resp.responses.len > 0) testing.allocator.free(resp.responses);
+
+    try testing.expectEqual(response.?.len, rpos);
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.kafka_storage_error)), resp.responses[0].error_code);
+    try testing.expectEqual(before, broker.topics.get("alter-cfg-local-object-fail-topic").?.config.retention_bytes);
+}
+
 test "Broker.handleRequest AlterConfigs rejects truncated request" {
     var broker = Broker.init(testing.allocator, 1, 9092);
     defer broker.deinit();
@@ -29718,6 +29883,116 @@ test "Broker.handleRequest CreatePartitions rolls back when topic snapshot S3 WA
     try testing.expect(!broker.store.partitions.contains("create-partitions-s3-fail-topic-1"));
     try testing.expect(!broker.store.partitions.contains("create-partitions-s3-fail-topic-2"));
     try testing.expectEqual(object_count_before, mock_s3.objectCount());
+}
+
+test "Broker.handleRequest CreatePartitions rolls back when local topics persistence fails" {
+    const fs = @import("fs_compat");
+    const Req = generated.create_partitions_request.CreatePartitionsRequest;
+    const Resp = generated.create_partitions_response.CreatePartitionsResponse;
+
+    const tmp_dir = "/tmp/zmq-create-partitions-local-topics-fail-test";
+    fs.deleteTreeAbsolute(tmp_dir) catch {};
+    try fs.makeDirAbsolute(tmp_dir);
+    defer fs.deleteTreeAbsolute(tmp_dir) catch {};
+
+    var broker = Broker.initWithConfig(testing.allocator, 1, 9092, .{ .data_dir = tmp_dir });
+    defer broker.deinit();
+    try broker.open();
+    try testing.expect(broker.ensureTopic("create-partitions-local-topics-fail-topic"));
+    const before = broker.topics.get("create-partitions-local-topics-fail-topic").?.num_partitions;
+
+    const topics_path = try std.fmt.allocPrint(testing.allocator, "{s}/topics.meta", .{tmp_dir});
+    defer testing.allocator.free(topics_path);
+    fs.deleteFileAbsolute(topics_path) catch {};
+    try fs.makeDirAbsolute(topics_path);
+
+    const topics = [_]Req.CreatePartitionsTopic{.{
+        .name = "create-partitions-local-topics-fail-topic",
+        .count = before + 2,
+        .assignments = null,
+    }};
+    const req = Req{
+        .topics = &topics,
+        .timeout_ms = 30000,
+        .validate_only = false,
+    };
+
+    var buf: [512]u8 = undefined;
+    var pos = buildTestRequest(&buf, 37, 2, 3709, header_mod.requestHeaderVersion(37, 2));
+    req.serialize(&buf, &pos, 2);
+
+    const response = broker.handleRequest(buf[0..pos]);
+    try testing.expect(response != null);
+    defer testing.allocator.free(response.?);
+
+    var rpos: usize = 0;
+    var response_header = try ResponseHeader.deserialize(testing.allocator, response.?, &rpos, header_mod.responseHeaderVersion(37, 2));
+    defer response_header.deinit(testing.allocator);
+    try testing.expectEqual(@as(i32, 3709), response_header.correlation_id);
+
+    const resp = try Resp.deserialize(testing.allocator, response.?, &rpos, 2);
+    defer if (resp.results.len > 0) testing.allocator.free(resp.results);
+
+    try testing.expectEqual(response.?.len, rpos);
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.kafka_storage_error)), resp.results[0].error_code);
+    try testing.expectEqual(before, broker.topics.get("create-partitions-local-topics-fail-topic").?.num_partitions);
+    try testing.expect(!broker.store.partitions.contains("create-partitions-local-topics-fail-topic-1"));
+    try testing.expect(!broker.store.partitions.contains("create-partitions-local-topics-fail-topic-2"));
+}
+
+test "Broker.handleRequest CreatePartitions rolls back when local object snapshot fails" {
+    const fs = @import("fs_compat");
+    const Req = generated.create_partitions_request.CreatePartitionsRequest;
+    const Resp = generated.create_partitions_response.CreatePartitionsResponse;
+
+    const tmp_dir = "/tmp/zmq-create-partitions-local-object-fail-test";
+    fs.deleteTreeAbsolute(tmp_dir) catch {};
+    try fs.makeDirAbsolute(tmp_dir);
+    defer fs.deleteTreeAbsolute(tmp_dir) catch {};
+
+    var broker = Broker.initWithConfig(testing.allocator, 1, 9092, .{ .data_dir = tmp_dir });
+    defer broker.deinit();
+    try broker.open();
+    try testing.expect(broker.ensureTopic("create-partitions-local-object-fail-topic"));
+    const before = broker.topics.get("create-partitions-local-object-fail-topic").?.num_partitions;
+
+    const object_snapshot_path = try std.fmt.allocPrint(testing.allocator, "{s}/objects.snapshot", .{tmp_dir});
+    defer testing.allocator.free(object_snapshot_path);
+    fs.deleteFileAbsolute(object_snapshot_path) catch {};
+    try fs.makeDirAbsolute(object_snapshot_path);
+
+    const topics = [_]Req.CreatePartitionsTopic{.{
+        .name = "create-partitions-local-object-fail-topic",
+        .count = before + 2,
+        .assignments = null,
+    }};
+    const req = Req{
+        .topics = &topics,
+        .timeout_ms = 30000,
+        .validate_only = false,
+    };
+
+    var buf: [512]u8 = undefined;
+    var pos = buildTestRequest(&buf, 37, 2, 3710, header_mod.requestHeaderVersion(37, 2));
+    req.serialize(&buf, &pos, 2);
+
+    const response = broker.handleRequest(buf[0..pos]);
+    try testing.expect(response != null);
+    defer testing.allocator.free(response.?);
+
+    var rpos: usize = 0;
+    var response_header = try ResponseHeader.deserialize(testing.allocator, response.?, &rpos, header_mod.responseHeaderVersion(37, 2));
+    defer response_header.deinit(testing.allocator);
+    try testing.expectEqual(@as(i32, 3710), response_header.correlation_id);
+
+    const resp = try Resp.deserialize(testing.allocator, response.?, &rpos, 2);
+    defer if (resp.results.len > 0) testing.allocator.free(resp.results);
+
+    try testing.expectEqual(response.?.len, rpos);
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.kafka_storage_error)), resp.results[0].error_code);
+    try testing.expectEqual(before, broker.topics.get("create-partitions-local-object-fail-topic").?.num_partitions);
+    try testing.expect(!broker.store.partitions.contains("create-partitions-local-object-fail-topic-1"));
+    try testing.expect(!broker.store.partitions.contains("create-partitions-local-object-fail-topic-2"));
 }
 
 test "Broker.handleRequest CreatePartitions rejects truncated request" {
@@ -30036,6 +30311,120 @@ test "Broker.handleRequest IncrementalAlterConfigs rolls back when topic snapsho
     try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.kafka_storage_error)), resp.responses[0].error_code);
     try testing.expectEqual(before, broker.topics.get("inc-cfg-s3-fail-topic").?.config.max_message_bytes);
     try testing.expectEqual(object_count_before, mock_s3.objectCount());
+}
+
+test "Broker.handleRequest IncrementalAlterConfigs rolls back when local topics persistence fails" {
+    const fs = @import("fs_compat");
+    const Req = generated.incremental_alter_configs_request.IncrementalAlterConfigsRequest;
+    const Resp = generated.incremental_alter_configs_response.IncrementalAlterConfigsResponse;
+
+    const tmp_dir = "/tmp/zmq-incremental-alter-configs-local-topics-fail-test";
+    fs.deleteTreeAbsolute(tmp_dir) catch {};
+    try fs.makeDirAbsolute(tmp_dir);
+    defer fs.deleteTreeAbsolute(tmp_dir) catch {};
+
+    var broker = Broker.initWithConfig(testing.allocator, 1, 9092, .{ .data_dir = tmp_dir });
+    defer broker.deinit();
+    try broker.open();
+    try testing.expect(broker.ensureTopic("inc-cfg-local-topics-fail-topic"));
+    const before = broker.topics.get("inc-cfg-local-topics-fail-topic").?.config.max_message_bytes;
+
+    const topics_path = try std.fmt.allocPrint(testing.allocator, "{s}/topics.meta", .{tmp_dir});
+    defer testing.allocator.free(topics_path);
+    fs.deleteFileAbsolute(topics_path) catch {};
+    try fs.makeDirAbsolute(topics_path);
+
+    const configs = [_]Req.AlterConfigsResource.AlterableConfig{.{
+        .name = "max.message.bytes",
+        .config_operation = 0,
+        .value = "4096",
+    }};
+    const resources = [_]Req.AlterConfigsResource{.{
+        .resource_type = 2,
+        .resource_name = "inc-cfg-local-topics-fail-topic",
+        .configs = &configs,
+    }};
+    const req = Req{
+        .resources = &resources,
+        .validate_only = false,
+    };
+
+    var buf: [512]u8 = undefined;
+    var pos = buildTestRequest(&buf, 44, 1, 4406, header_mod.requestHeaderVersion(44, 1));
+    req.serialize(&buf, &pos, 1);
+
+    const response = broker.handleRequest(buf[0..pos]);
+    try testing.expect(response != null);
+    defer testing.allocator.free(response.?);
+
+    var rpos: usize = 0;
+    var response_header = try ResponseHeader.deserialize(testing.allocator, response.?, &rpos, header_mod.responseHeaderVersion(44, 1));
+    defer response_header.deinit(testing.allocator);
+    try testing.expectEqual(@as(i32, 4406), response_header.correlation_id);
+
+    const resp = try Resp.deserialize(testing.allocator, response.?, &rpos, 1);
+    defer if (resp.responses.len > 0) testing.allocator.free(resp.responses);
+
+    try testing.expectEqual(response.?.len, rpos);
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.kafka_storage_error)), resp.responses[0].error_code);
+    try testing.expectEqual(before, broker.topics.get("inc-cfg-local-topics-fail-topic").?.config.max_message_bytes);
+}
+
+test "Broker.handleRequest IncrementalAlterConfigs rolls back when local object snapshot fails" {
+    const fs = @import("fs_compat");
+    const Req = generated.incremental_alter_configs_request.IncrementalAlterConfigsRequest;
+    const Resp = generated.incremental_alter_configs_response.IncrementalAlterConfigsResponse;
+
+    const tmp_dir = "/tmp/zmq-incremental-alter-configs-local-object-fail-test";
+    fs.deleteTreeAbsolute(tmp_dir) catch {};
+    try fs.makeDirAbsolute(tmp_dir);
+    defer fs.deleteTreeAbsolute(tmp_dir) catch {};
+
+    var broker = Broker.initWithConfig(testing.allocator, 1, 9092, .{ .data_dir = tmp_dir });
+    defer broker.deinit();
+    try broker.open();
+    try testing.expect(broker.ensureTopic("inc-cfg-local-object-fail-topic"));
+    const before = broker.topics.get("inc-cfg-local-object-fail-topic").?.config.max_message_bytes;
+
+    const object_snapshot_path = try std.fmt.allocPrint(testing.allocator, "{s}/objects.snapshot", .{tmp_dir});
+    defer testing.allocator.free(object_snapshot_path);
+    fs.deleteFileAbsolute(object_snapshot_path) catch {};
+    try fs.makeDirAbsolute(object_snapshot_path);
+
+    const configs = [_]Req.AlterConfigsResource.AlterableConfig{.{
+        .name = "max.message.bytes",
+        .config_operation = 0,
+        .value = "4096",
+    }};
+    const resources = [_]Req.AlterConfigsResource{.{
+        .resource_type = 2,
+        .resource_name = "inc-cfg-local-object-fail-topic",
+        .configs = &configs,
+    }};
+    const req = Req{
+        .resources = &resources,
+        .validate_only = false,
+    };
+
+    var buf: [512]u8 = undefined;
+    var pos = buildTestRequest(&buf, 44, 1, 4407, header_mod.requestHeaderVersion(44, 1));
+    req.serialize(&buf, &pos, 1);
+
+    const response = broker.handleRequest(buf[0..pos]);
+    try testing.expect(response != null);
+    defer testing.allocator.free(response.?);
+
+    var rpos: usize = 0;
+    var response_header = try ResponseHeader.deserialize(testing.allocator, response.?, &rpos, header_mod.responseHeaderVersion(44, 1));
+    defer response_header.deinit(testing.allocator);
+    try testing.expectEqual(@as(i32, 4407), response_header.correlation_id);
+
+    const resp = try Resp.deserialize(testing.allocator, response.?, &rpos, 1);
+    defer if (resp.responses.len > 0) testing.allocator.free(resp.responses);
+
+    try testing.expectEqual(response.?.len, rpos);
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.kafka_storage_error)), resp.responses[0].error_code);
+    try testing.expectEqual(before, broker.topics.get("inc-cfg-local-object-fail-topic").?.config.max_message_bytes);
 }
 
 test "Broker.handleRequest IncrementalAlterConfigs rejects invalid config value" {
