@@ -92,6 +92,9 @@ pub const Broker = struct {
     auto_mq_zone_router_epoch: i64 = 0,
     /// AutoMQ link/group promotion state keyed by group_id.
     auto_mq_group_promotions: std.StringHashMap(AutoMqGroupPromotion),
+    /// Cluster-wide finalized feature levels accepted through UpdateFeatures.
+    finalized_features: std.StringHashMap(i16),
+    finalized_features_epoch: i64 = -1,
     /// Local share-group partition state keyed by group/topic-id/partition.
     share_group_states: std.StringHashMap(SharePartitionState),
     /// Local share fetch session epochs keyed by group/member.
@@ -443,6 +446,7 @@ pub const Broker = struct {
             .auto_mq_nodes = std.AutoHashMap(i32, AutoMqNodeMetadata).init(alloc),
             .auto_mq_next_node_id = defaultAutoMqNextNodeId(node_id),
             .auto_mq_group_promotions = std.StringHashMap(AutoMqGroupPromotion).init(alloc),
+            .finalized_features = std.StringHashMap(i16).init(alloc),
             .share_group_states = std.StringHashMap(SharePartitionState).init(alloc),
             .share_group_sessions = std.StringHashMap(i32).init(alloc),
             .replica_directory_assignments = std.StringHashMap(ReplicaDirectoryAssignment).init(alloc),
@@ -822,6 +826,13 @@ pub const Broker = struct {
             log.info("Restored {d} share group session(s) from share_group_sessions.meta", .{self.share_group_sessions.count()});
         }
 
+        const finalized_feature_snapshot = try self.persistence.loadFinalizedFeatures();
+        defer self.persistence.freeFinalizedFeatureSnapshot(finalized_feature_snapshot);
+        try self.restoreFinalizedFeatures(finalized_feature_snapshot);
+        if (finalized_feature_snapshot.features.len > 0) {
+            log.info("Restored {d} finalized feature(s) from finalized_features.meta", .{self.finalized_features.count()});
+        }
+
         // Load local AutoMQ controller-style metadata (KV namespace, node registry,
         // license, zone router state, and group promotions).
         var auto_mq_snapshot = try self.persistence.loadAutoMqMetadata();
@@ -1195,6 +1206,7 @@ pub const Broker = struct {
         self.persistTransactionsIfDirty();
         self.persistProducerSequencesIfDirty();
         self.persistAutoMqMetadata();
+        self.persistFinalizedFeaturesLocal();
         self.persistShareGroupStatesLocal();
         self.persistShareGroupSessionsLocal();
         self.persistPartitionReassignmentsLocal();
@@ -1211,6 +1223,8 @@ pub const Broker = struct {
         self.auto_mq_kvs.deinit();
         self.auto_mq_nodes.deinit();
         self.auto_mq_group_promotions.deinit();
+        self.clearFinalizedFeatures();
+        self.finalized_features.deinit();
         self.clearShareGroupStates();
         self.share_group_states.deinit();
         self.clearShareGroupSessions();
@@ -1430,6 +1444,15 @@ pub const Broker = struct {
             entry.value_ptr.deinit(self.allocator);
         }
         self.auto_mq_group_promotions.clearRetainingCapacity();
+    }
+
+    fn clearFinalizedFeatures(self: *Broker) void {
+        var it = self.finalized_features.iterator();
+        while (it.next()) |entry| {
+            self.allocator.free(entry.key_ptr.*);
+        }
+        self.finalized_features.clearRetainingCapacity();
+        self.finalized_features_epoch = -1;
     }
 
     fn clearShareGroupStates(self: *Broker) void {
@@ -1773,6 +1796,12 @@ pub const Broker = struct {
         };
     }
 
+    fn persistFinalizedFeaturesLocal(self: *Broker) void {
+        self.persistence.saveFinalizedFeatures(&self.finalized_features, self.finalized_features_epoch) catch |err| {
+            log.warn("Failed to persist finalized features: {}", .{err});
+        };
+    }
+
     fn persistPartitionReassignmentsDurably(self: *Broker) !void {
         if (self.raft_state != null) {
             try self.commitPartitionReassignmentQuorumRecord();
@@ -1906,6 +1935,28 @@ pub const Broker = struct {
                 try self.share_group_sessions.put(key, entry.epoch);
             }
         }
+    }
+
+    fn restoreFinalizedFeatures(self: *Broker, snapshot: MetadataPersistence.FinalizedFeatureSnapshot) !void {
+        self.clearFinalizedFeatures();
+
+        for (snapshot.features) |entry| {
+            if (!isSupportedFinalizedFeatureVersion(entry.name, entry.max_version_level)) continue;
+            const name = try self.allocator.dupe(u8, entry.name);
+            errdefer self.allocator.free(name);
+            if (self.finalized_features.getPtr(name)) |existing| {
+                existing.* = entry.max_version_level;
+                self.allocator.free(name);
+            } else {
+                try self.finalized_features.put(name, entry.max_version_level);
+            }
+        }
+        self.finalized_features_epoch = if (snapshot.epoch >= 0)
+            snapshot.epoch
+        else if (self.finalized_features.count() > 0)
+            0
+        else
+            -1;
     }
 
     fn restorePartitionReassignments(self: *Broker, entries: []const MetadataPersistence.PartitionReassignmentEntry) !void {
@@ -7392,6 +7443,29 @@ pub const Broker = struct {
     // ---------------------------------------------------------------
     // ApiVersions (key 18)
     // ---------------------------------------------------------------
+    const BrokerFeature = struct {
+        name: []const u8,
+        min_version: i16,
+        max_version: i16,
+    };
+
+    const broker_feature_catalog = [_]BrokerFeature{
+        .{ .name = "metadata.version", .min_version = 1, .max_version = 1 },
+        .{ .name = "kraft.version", .min_version = 1, .max_version = 1 },
+    };
+
+    fn findBrokerFeature(name: []const u8) ?BrokerFeature {
+        for (broker_feature_catalog) |feature| {
+            if (std.mem.eql(u8, feature.name, name)) return feature;
+        }
+        return null;
+    }
+
+    fn isSupportedFinalizedFeatureVersion(name: []const u8, version: i16) bool {
+        const feature = findBrokerFeature(name) orelse return false;
+        return version >= feature.min_version and version <= feature.max_version;
+    }
+
     fn handleApiVersions(self: *Broker, request_bytes: []const u8, body_start: usize, req_header: *const RequestHeader, api_version: i16, resp_header_version: i16) ?[]u8 {
         const Req = generated.api_versions_request.ApiVersionsRequest;
         const body_version: i16 = @min(api_version, 4);
@@ -7408,13 +7482,52 @@ pub const Broker = struct {
             api_keys_list[i] = .{ .api_key = s.key, .min_version = s.min, .max_version = s.max };
         }
 
+        var supported_features: [broker_feature_catalog.len]ApiVersionsResponse.SupportedFeatureKey = undefined;
+        if (body_version >= 3) {
+            for (broker_feature_catalog, 0..) |feature, i| {
+                supported_features[i] = .{
+                    .name = feature.name,
+                    .min_version = feature.min_version,
+                    .max_version = feature.max_version,
+                };
+            }
+        }
+
+        const finalized_features = self.buildFinalizedFeatureResponseEntries(body_version) catch return null;
+        defer if (finalized_features.len > 0) self.allocator.free(finalized_features);
+
         const resp_body = ApiVersionsResponse{
             .error_code = 0,
             .api_keys = &api_keys_list,
             .throttle_time_ms = 0,
+            .supported_features = if (body_version >= 3) &supported_features else &.{},
+            .finalized_features_epoch = if (body_version >= 3) self.finalized_features_epoch else -1,
+            .finalized_features = finalized_features,
         };
 
         return self.serializeResponse(req_header, resp_header_version, &resp_body, body_version);
+    }
+
+    fn buildFinalizedFeatureResponseEntries(self: *Broker, body_version: i16) ![]ApiVersionsResponse.FinalizedFeatureKey {
+        if (body_version < 3 or self.finalized_features.count() == 0) return &.{};
+
+        const features = try self.allocator.alloc(ApiVersionsResponse.FinalizedFeatureKey, self.finalized_features.count());
+        var i: usize = 0;
+        var it = self.finalized_features.iterator();
+        while (it.next()) |entry| {
+            features[i] = .{
+                .name = entry.key_ptr.*,
+                .max_version_level = entry.value_ptr.*,
+                .min_version_level = entry.value_ptr.*,
+            };
+            i += 1;
+        }
+        std.mem.sort(ApiVersionsResponse.FinalizedFeatureKey, features, {}, finalizedFeatureLessThan);
+        return features;
+    }
+
+    fn finalizedFeatureLessThan(_: void, lhs: ApiVersionsResponse.FinalizedFeatureKey, rhs: ApiVersionsResponse.FinalizedFeatureKey) bool {
+        return std.mem.lessThan(u8, lhs.name, rhs.name);
     }
 
     fn serializeResponse(self: *Broker, req_header: *const RequestHeader, resp_header_version: i16, resp_body: *const ApiVersionsResponse, body_version: i16) ?[]u8 {
@@ -16788,8 +16901,22 @@ pub const Broker = struct {
         }
         defer if (results.len > 0) self.allocator.free(results);
 
+        var has_successful_mutation = false;
         for (req.feature_updates, 0..) |feature_update, i| {
             results[i] = self.updateFeaturesResult(feature_update, api_version);
+            if (results[i].error_code == @intFromEnum(ErrorCode.none)) {
+                has_successful_mutation = true;
+            }
+        }
+
+        if (has_successful_mutation and !req.validate_only) {
+            for (req.feature_updates, 0..) |feature_update, i| {
+                if (results[i].error_code == @intFromEnum(ErrorCode.none)) {
+                    self.applyFinalizedFeatureUpdate(feature_update) catch return null;
+                }
+            }
+            self.finalized_features_epoch = if (self.finalized_features_epoch < 0) 0 else self.finalized_features_epoch + 1;
+            self.persistFinalizedFeaturesLocal();
         }
 
         const resp = Resp{
@@ -16805,7 +16932,7 @@ pub const Broker = struct {
         if (req.feature_updates.len > 0) self.allocator.free(req.feature_updates);
     }
 
-    fn updateFeaturesResult(_: *Broker, feature_update: generated.update_features_request.UpdateFeaturesRequest.FeatureUpdateKey, api_version: i16) generated.update_features_response.UpdateFeaturesResponse.UpdatableFeatureResult {
+    fn updateFeaturesResult(self: *Broker, feature_update: generated.update_features_request.UpdateFeaturesRequest.FeatureUpdateKey, api_version: i16) generated.update_features_response.UpdateFeaturesResponse.UpdatableFeatureResult {
         const feature = feature_update.feature orelse "";
         if (feature.len == 0) {
             return .{
@@ -16822,11 +16949,86 @@ pub const Broker = struct {
             };
         }
 
-        return .{
+        const supported_feature = findBrokerFeature(feature) orelse return .{
             .feature = feature_update.feature,
             .error_code = @intFromEnum(ErrorCode.feature_update_failed),
-            .error_message = "Feature finalization is not supported by this broker",
+            .error_message = "Unsupported feature",
         };
+
+        if (feature_update.max_version_level > 0 and
+            (feature_update.max_version_level < supported_feature.min_version or
+                feature_update.max_version_level > supported_feature.max_version))
+        {
+            return .{
+                .feature = feature_update.feature,
+                .error_code = @intFromEnum(ErrorCode.invalid_update_version),
+                .error_message = "Unsupported finalized feature version",
+            };
+        }
+
+        const current_level = self.finalized_features.get(feature) orelse 0;
+        if (feature_update.max_version_level < 1) {
+            if (current_level == 0) return .{
+                .feature = feature_update.feature,
+                .error_code = @intFromEnum(ErrorCode.none),
+                .error_message = null,
+            };
+            if (!isFeatureDowngradeAllowed(feature_update, api_version)) return .{
+                .feature = feature_update.feature,
+                .error_code = @intFromEnum(ErrorCode.invalid_update_version),
+                .error_message = "Feature downgrade/delete is not allowed",
+            };
+            return .{
+                .feature = feature_update.feature,
+                .error_code = @intFromEnum(ErrorCode.none),
+                .error_message = null,
+            };
+        }
+
+        if (current_level > 0 and feature_update.max_version_level < current_level and !isFeatureDowngradeAllowed(feature_update, api_version)) {
+            return .{
+                .feature = feature_update.feature,
+                .error_code = @intFromEnum(ErrorCode.invalid_update_version),
+                .error_message = "Feature downgrade/delete is not allowed",
+            };
+        }
+        if (current_level > 0 and feature_update.max_version_level > current_level and api_version >= 1 and feature_update.upgrade_type != 1) {
+            return .{
+                .feature = feature_update.feature,
+                .error_code = @intFromEnum(ErrorCode.invalid_update_version),
+                .error_message = "Feature upgrade requires upgrade type 1",
+            };
+        }
+
+        return .{
+            .feature = feature_update.feature,
+            .error_code = @intFromEnum(ErrorCode.none),
+            .error_message = null,
+        };
+    }
+
+    fn isFeatureDowngradeAllowed(feature_update: generated.update_features_request.UpdateFeaturesRequest.FeatureUpdateKey, api_version: i16) bool {
+        if (api_version <= 0) return feature_update.allow_downgrade;
+        return feature_update.upgrade_type == 2 or feature_update.upgrade_type == 3;
+    }
+
+    fn applyFinalizedFeatureUpdate(self: *Broker, feature_update: generated.update_features_request.UpdateFeaturesRequest.FeatureUpdateKey) !void {
+        const feature = feature_update.feature orelse return;
+        if (feature_update.max_version_level < 1) {
+            if (self.finalized_features.fetchRemove(feature)) |removed| {
+                self.allocator.free(removed.key);
+            }
+            return;
+        }
+
+        if (self.finalized_features.getPtr(feature)) |level| {
+            level.* = feature_update.max_version_level;
+            return;
+        }
+
+        const key = try self.allocator.dupe(u8, feature);
+        errdefer self.allocator.free(key);
+        try self.finalized_features.put(key, feature_update.max_version_level);
     }
 
     // ---------------------------------------------------------------
@@ -22672,7 +22874,12 @@ fn expectApiVersionsResponseMatchesCatalog(response: []const u8, api_version: i1
     try testing.expectEqual(correlation_id, response_header.correlation_id);
 
     const resp = try Resp.deserialize(testing.allocator, response, &rpos, body_version);
-    defer if (resp.api_keys.len > 0) testing.allocator.free(resp.api_keys);
+    defer {
+        if (resp.api_keys.len > 0) testing.allocator.free(resp.api_keys);
+        if (resp.supported_features.len > 0) testing.allocator.free(resp.supported_features);
+        if (resp.finalized_features.len > 0) testing.allocator.free(resp.finalized_features);
+        if (resp.tagged_fields.len > 0) testing.allocator.free(resp.tagged_fields);
+    }
 
     try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.none)), resp.error_code);
     try testing.expectEqual(api_support.broker_supported_apis.len, resp.api_keys.len);
@@ -30182,7 +30389,7 @@ test "Broker.handleRequest AlterUserScramCredentials rejects trailing bytes" {
     try expectTrailingByteRejected(&broker, buf[0..], pos);
 }
 
-test "Broker.handleRequest UpdateFeatures v0 rejects unsupported feature mutation" {
+test "Broker.handleRequest UpdateFeatures v0 finalizes supported feature" {
     const Req = generated.update_features_request.UpdateFeaturesRequest;
     const Resp = generated.update_features_response.UpdateFeaturesResponse;
 
@@ -30216,8 +30423,10 @@ test "Broker.handleRequest UpdateFeatures v0 rejects unsupported feature mutatio
     try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.none)), resp.error_code);
     try testing.expectEqual(@as(usize, 1), resp.results.len);
     try testing.expectEqualStrings("metadata.version", resp.results[0].feature.?);
-    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.feature_update_failed)), resp.results[0].error_code);
-    try testing.expect(resp.results[0].error_message != null);
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.none)), resp.results[0].error_code);
+    try testing.expect(resp.results[0].error_message == null);
+    try testing.expectEqual(@as(i16, 1), broker.finalized_features.get("metadata.version").?);
+    try testing.expectEqual(@as(i64, 0), broker.finalized_features_epoch);
 }
 
 test "Broker.handleRequest UpdateFeatures v1 accepts frame without v0 allow_downgrade byte" {
@@ -30253,7 +30462,8 @@ test "Broker.handleRequest UpdateFeatures v1 accepts frame without v0 allow_down
     try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.none)), resp.error_code);
     try testing.expectEqual(@as(usize, 1), resp.results.len);
     try testing.expectEqualStrings("metadata.version", resp.results[0].feature.?);
-    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.feature_update_failed)), resp.results[0].error_code);
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.none)), resp.results[0].error_code);
+    try testing.expectEqual(@as(i16, 1), broker.finalized_features.get("metadata.version").?);
 }
 
 test "Broker.handleRequest UpdateFeatures v1 rejects invalid upgrade type" {
@@ -30289,6 +30499,168 @@ test "Broker.handleRequest UpdateFeatures v1 rejects invalid upgrade type" {
     try testing.expectEqual(response.?.len, rpos);
     try testing.expectEqual(@as(usize, 1), resp.results.len);
     try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.invalid_request)), resp.results[0].error_code);
+}
+
+test "Broker.handleRequest UpdateFeatures rejects unsupported feature mutation" {
+    const Req = generated.update_features_request.UpdateFeaturesRequest;
+    const Resp = generated.update_features_response.UpdateFeaturesResponse;
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+
+    const updates = [_]Req.FeatureUpdateKey{.{
+        .feature = "unknown.feature",
+        .max_version_level = 1,
+        .upgrade_type = 1,
+    }};
+    const req = Req{ .feature_updates = &updates };
+
+    var buf: [512]u8 = undefined;
+    var pos = buildTestRequest(&buf, 57, 1, 5705, header_mod.requestHeaderVersion(57, 1));
+    req.serialize(&buf, &pos, 1);
+
+    const response = broker.handleRequest(buf[0..pos]);
+    try testing.expect(response != null);
+    defer testing.allocator.free(response.?);
+
+    var rpos: usize = 0;
+    var response_header = try ResponseHeader.deserialize(testing.allocator, response.?, &rpos, header_mod.responseHeaderVersion(57, 1));
+    defer response_header.deinit(testing.allocator);
+    try testing.expectEqual(@as(i32, 5705), response_header.correlation_id);
+
+    const resp = try Resp.deserialize(testing.allocator, response.?, &rpos, 1);
+    defer freeDeserializedUpdateFeaturesResponse(&resp);
+
+    try testing.expectEqual(response.?.len, rpos);
+    try testing.expectEqual(@as(usize, 1), resp.results.len);
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.feature_update_failed)), resp.results[0].error_code);
+    try testing.expect(broker.finalized_features.get("unknown.feature") == null);
+}
+
+test "Broker.handleRequest UpdateFeatures validate-only does not mutate finalized features" {
+    const Req = generated.update_features_request.UpdateFeaturesRequest;
+    const Resp = generated.update_features_response.UpdateFeaturesResponse;
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+
+    const updates = [_]Req.FeatureUpdateKey{.{
+        .feature = "metadata.version",
+        .max_version_level = 1,
+        .upgrade_type = 1,
+    }};
+    const req = Req{
+        .feature_updates = &updates,
+        .validate_only = true,
+    };
+
+    var buf: [512]u8 = undefined;
+    var pos = buildTestRequest(&buf, 57, 1, 5706, header_mod.requestHeaderVersion(57, 1));
+    req.serialize(&buf, &pos, 1);
+
+    const response = broker.handleRequest(buf[0..pos]);
+    try testing.expect(response != null);
+    defer testing.allocator.free(response.?);
+
+    var rpos: usize = 0;
+    var response_header = try ResponseHeader.deserialize(testing.allocator, response.?, &rpos, header_mod.responseHeaderVersion(57, 1));
+    defer response_header.deinit(testing.allocator);
+    try testing.expectEqual(@as(i32, 5706), response_header.correlation_id);
+
+    const resp = try Resp.deserialize(testing.allocator, response.?, &rpos, 1);
+    defer freeDeserializedUpdateFeaturesResponse(&resp);
+
+    try testing.expectEqual(response.?.len, rpos);
+    try testing.expectEqual(@as(usize, 1), resp.results.len);
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.none)), resp.results[0].error_code);
+    try testing.expect(broker.finalized_features.get("metadata.version") == null);
+    try testing.expectEqual(@as(i64, -1), broker.finalized_features_epoch);
+}
+
+test "Broker.handleRequest ApiVersions reports finalized feature metadata" {
+    const UpdateReq = generated.update_features_request.UpdateFeaturesRequest;
+    const ApiResp = generated.api_versions_response.ApiVersionsResponse;
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+
+    const updates = [_]UpdateReq.FeatureUpdateKey{.{
+        .feature = "metadata.version",
+        .max_version_level = 1,
+        .upgrade_type = 1,
+    }};
+    const update_req = UpdateReq{ .feature_updates = &updates };
+    var update_buf: [512]u8 = undefined;
+    var update_pos = buildTestRequest(&update_buf, 57, 1, 5707, header_mod.requestHeaderVersion(57, 1));
+    update_req.serialize(&update_buf, &update_pos, 1);
+    const update_response = broker.handleRequest(update_buf[0..update_pos]);
+    try testing.expect(update_response != null);
+    testing.allocator.free(update_response.?);
+
+    const api_req = generated.api_versions_request.ApiVersionsRequest{
+        .client_software_name = "feature-test",
+        .client_software_version = "0.1.0",
+    };
+    var api_buf: [512]u8 = undefined;
+    var api_pos = buildTestRequest(&api_buf, 18, 3, 5708, header_mod.requestHeaderVersion(18, 3));
+    api_req.serialize(&api_buf, &api_pos, 3);
+
+    const api_response = broker.handleRequest(api_buf[0..api_pos]);
+    try testing.expect(api_response != null);
+    defer testing.allocator.free(api_response.?);
+
+    var rpos: usize = 0;
+    var response_header = try ResponseHeader.deserialize(testing.allocator, api_response.?, &rpos, header_mod.responseHeaderVersion(18, 3));
+    defer response_header.deinit(testing.allocator);
+    try testing.expectEqual(@as(i32, 5708), response_header.correlation_id);
+
+    const resp = try ApiResp.deserialize(testing.allocator, api_response.?, &rpos, 3);
+    defer {
+        if (resp.api_keys.len > 0) testing.allocator.free(resp.api_keys);
+        if (resp.supported_features.len > 0) testing.allocator.free(resp.supported_features);
+        if (resp.finalized_features.len > 0) testing.allocator.free(resp.finalized_features);
+        if (resp.tagged_fields.len > 0) testing.allocator.free(resp.tagged_fields);
+    }
+
+    try testing.expectEqual(api_response.?.len, rpos);
+    try testing.expectEqual(@as(usize, 2), resp.supported_features.len);
+    try testing.expectEqualStrings("metadata.version", resp.supported_features[0].name.?);
+    try testing.expectEqual(@as(i64, 0), resp.finalized_features_epoch);
+    try testing.expectEqual(@as(usize, 1), resp.finalized_features.len);
+    try testing.expectEqualStrings("metadata.version", resp.finalized_features[0].name.?);
+    try testing.expectEqual(@as(i16, 1), resp.finalized_features[0].max_version_level);
+    try testing.expectEqual(@as(i16, 1), resp.finalized_features[0].min_version_level);
+}
+
+test "Broker finalized features persist across local restart" {
+    const fs = @import("fs_compat");
+
+    const tmp_dir = "/tmp/zmq-finalized-features-restart-test";
+    fs.deleteTreeAbsolute(tmp_dir) catch {};
+    try fs.makeDirAbsolute(tmp_dir);
+    defer fs.deleteTreeAbsolute(tmp_dir) catch {};
+
+    {
+        var broker = Broker.initWithConfig(testing.allocator, 1, 9092, .{ .data_dir = tmp_dir });
+        defer broker.deinit();
+
+        try broker.applyFinalizedFeatureUpdate(.{
+            .feature = "metadata.version",
+            .max_version_level = 1,
+            .upgrade_type = 1,
+        });
+        broker.finalized_features_epoch = 3;
+        broker.persistFinalizedFeaturesLocal();
+    }
+
+    {
+        var restarted = Broker.initWithConfig(testing.allocator, 1, 9092, .{ .data_dir = tmp_dir });
+        try restarted.open();
+        defer restarted.deinit();
+
+        try testing.expectEqual(@as(i16, 1), restarted.finalized_features.get("metadata.version").?);
+        try testing.expectEqual(@as(i64, 3), restarted.finalized_features_epoch);
+    }
 }
 
 test "Broker.handleRequest UpdateFeatures authorization denial uses generated response" {

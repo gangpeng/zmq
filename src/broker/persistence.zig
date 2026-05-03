@@ -947,6 +947,16 @@ pub const MetadataPersistence = struct {
         epoch: i32,
     };
 
+    pub const FinalizedFeatureEntry = struct {
+        name: []u8,
+        max_version_level: i16,
+    };
+
+    pub const FinalizedFeatureSnapshot = struct {
+        epoch: i64,
+        features: []FinalizedFeatureEntry,
+    };
+
     /// Save transaction state to disk.
     /// NOTE: AutoMQ/Kafka persists to __transaction_state topic on coordinator startup.
     /// ZMQ uses file-based persistence as a simplification.
@@ -1768,6 +1778,96 @@ pub const MetadataPersistence = struct {
     pub fn freeShareGroupSessionEntries(self: *MetadataPersistence, entries: []ShareGroupSessionEntry) void {
         for (entries) |entry| self.allocator.free(entry.key);
         if (entries.len > 0) self.allocator.free(entries);
+    }
+
+    /// Save local finalized feature metadata to disk.
+    /// Format: finalized_features.meta TSV with an epoch row and hex feature names.
+    pub fn saveFinalizedFeatures(self: *MetadataPersistence, features: anytype, epoch: i64) !void {
+        const dir = self.data_dir orelse return;
+
+        const path = try std.fmt.allocPrint(self.allocator, "{s}/finalized_features.meta", .{dir});
+        defer self.allocator.free(path);
+
+        const file = try fs.createFileAbsolute(path, .{ .truncate = true });
+        defer file.close();
+        const writer = file.writer();
+
+        try writer.print("epoch\t{d}\n", .{epoch});
+        var it = features.iterator();
+        while (it.next()) |entry| {
+            try file.writeAll("feature\t");
+            try writeHex(file, entry.key_ptr.*);
+            try writer.print("\t{d}\n", .{entry.value_ptr.*});
+        }
+        try file.sync();
+    }
+
+    pub fn loadFinalizedFeatures(self: *MetadataPersistence) !FinalizedFeatureSnapshot {
+        const dir = self.data_dir orelse return .{ .epoch = -1, .features = &.{} };
+
+        const path = try std.fmt.allocPrint(self.allocator, "{s}/finalized_features.meta", .{dir});
+        defer self.allocator.free(path);
+
+        const file = fs.openFileAbsolute(path, .{}) catch |err| {
+            log.debug("No finalized_features.meta found: {}", .{err});
+            return .{ .epoch = -1, .features = &.{} };
+        };
+        defer file.close();
+
+        const content = file.readToEndAlloc(self.allocator, 1024 * 1024) catch |err| {
+            log.warn("Failed to read finalized_features.meta: {}", .{err});
+            return .{ .epoch = -1, .features = &.{} };
+        };
+        defer self.allocator.free(content);
+
+        var epoch: i64 = -1;
+        var entries = std.array_list.Managed(FinalizedFeatureEntry).init(self.allocator);
+        errdefer {
+            for (entries.items) |entry| self.allocator.free(entry.name);
+            entries.deinit();
+        }
+
+        var lines = std.mem.splitSequence(u8, content, "\n");
+        while (lines.next()) |line| {
+            if (line.len == 0) continue;
+
+            var fields = std.mem.splitSequence(u8, line, "\t");
+            const tag = fields.next() orelse continue;
+            if (std.mem.eql(u8, tag, "epoch")) {
+                const epoch_str = fields.next() orelse continue;
+                epoch = std.fmt.parseInt(i64, epoch_str, 10) catch epoch;
+                continue;
+            }
+            if (!std.mem.eql(u8, tag, "feature")) continue;
+
+            const name_hex = fields.next() orelse continue;
+            const max_version_str = fields.next() orelse continue;
+            const name = decodeHexAlloc(self.allocator, name_hex) catch continue;
+            const max_version_level = std.fmt.parseInt(i16, max_version_str, 10) catch {
+                self.allocator.free(name);
+                continue;
+            };
+            if (name.len == 0 or max_version_level < 1) {
+                self.allocator.free(name);
+                continue;
+            }
+
+            try entries.append(.{
+                .name = name,
+                .max_version_level = max_version_level,
+            });
+        }
+
+        log.info("Loaded {d} finalized feature entries from finalized_features.meta", .{entries.items.len});
+        return .{
+            .epoch = if (entries.items.len > 0 and epoch < 0) 0 else epoch,
+            .features = try entries.toOwnedSlice(),
+        };
+    }
+
+    pub fn freeFinalizedFeatureSnapshot(self: *MetadataPersistence, snapshot: FinalizedFeatureSnapshot) void {
+        for (snapshot.features) |entry| self.allocator.free(entry.name);
+        if (snapshot.features.len > 0) self.allocator.free(snapshot.features);
     }
 
     /// Save ACL entries to disk.
@@ -2592,6 +2692,35 @@ test "MetadataPersistence save and load share group sessions round-trip" {
     try testing.expectEqual(@as(usize, 1), loaded.len);
     try testing.expectEqualStrings("10:group\tname-member\nid", loaded[0].key);
     try testing.expectEqual(@as(i32, 7), loaded[0].epoch);
+}
+
+test "MetadataPersistence save and load finalized features round-trip" {
+    const tmp_dir = "/tmp/automq-finalized-features-test";
+    fs.deleteTreeAbsolute(tmp_dir) catch {};
+    fs.makeDirAbsolute(tmp_dir) catch {};
+    defer fs.deleteTreeAbsolute(tmp_dir) catch {};
+
+    var persistence = MetadataPersistence.init(testing.allocator, tmp_dir);
+
+    var features = std.StringHashMap(i16).init(testing.allocator);
+    defer {
+        var it = features.iterator();
+        while (it.next()) |entry| testing.allocator.free(entry.key_ptr.*);
+        features.deinit();
+    }
+
+    const metadata_key = try testing.allocator.dupe(u8, "metadata.version");
+    try features.put(metadata_key, 1);
+
+    try persistence.saveFinalizedFeatures(&features, 4);
+
+    const loaded = try persistence.loadFinalizedFeatures();
+    defer persistence.freeFinalizedFeatureSnapshot(loaded);
+
+    try testing.expectEqual(@as(i64, 4), loaded.epoch);
+    try testing.expectEqual(@as(usize, 1), loaded.features.len);
+    try testing.expectEqualStrings("metadata.version", loaded.features[0].name);
+    try testing.expectEqual(@as(i16, 1), loaded.features[0].max_version_level);
 }
 
 test "MetadataPersistence save and load AutoMQ metadata round-trip" {

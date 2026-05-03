@@ -242,9 +242,11 @@ Status: completed for the initial catalog and DeleteGroups slice.
   flexible requests, rejects malformed frames, and returns a default generated
   resource until configurable client telemetry resources are implemented.
   UpdateFeatures now advertises key 57 v0-v1, decodes generated flexible
-  requests with correct v1 field gating, rejects malformed frames and invalid
-  upgrade types, and fails closed per requested feature until finalized feature
-  metadata is implemented.
+  requests with correct v1 field gating, rejects malformed frames, invalid
+  upgrade types, unsupported features, and unsupported finalized versions,
+  honors validate-only requests, mutates local finalized feature metadata for
+  supported features, persists it across local restart, and exposes supported
+  and finalized features through ApiVersions v3+ tagged fields.
   GetTelemetrySubscriptions and PushTelemetry now advertise keys 71/72 v0,
   decode generated flexible requests, reject malformed frames, return a minimal
   all-metrics telemetry subscription, preserve assigned client instance IDs,
