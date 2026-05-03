@@ -12,7 +12,7 @@ Run against a running ZMQ broker:
 Optional environment:
     ZMQ_CLIENT_MATRIX_BOOTSTRAP   localhost:9092
     ZMQ_CLIENT_MATRIX_TOOLS       auto | kcat,kafka-cli,kafka-python,confluent-kafka,java-kafka,go-kafka
-    ZMQ_CLIENT_MATRIX_SEMANTICS   basic | admin | groups | rebalance | transactions | security | all
+    ZMQ_CLIENT_MATRIX_SEMANTICS   basic | admin | groups | rebalance | transactions | security | security-negative | all
     ZMQ_CLIENT_MATRIX_SECURITY_PROTOCOL
                                   PLAINTEXT | SASL_PLAINTEXT | SSL | SASL_SSL
     ZMQ_CLIENT_MATRIX_SASL_MECHANISM
@@ -47,6 +47,8 @@ Semantic probes:
     rebalance        multi-consumer assignment convergence where supported
     transactions     transactional produce through clients that expose Kafka transactions
     security         run the selected probes with configured TLS/SASL client properties
+    security-negative
+                      verify bad configured credentials fail closed where supported
 """
 
 import importlib.util
@@ -62,7 +64,15 @@ import time
 RUN_ENABLED = os.environ.get("ZMQ_RUN_CLIENT_MATRIX") == "1"
 BOOTSTRAP = os.environ.get("ZMQ_CLIENT_MATRIX_BOOTSTRAP", "localhost:9092")
 TOOLS = os.environ.get("ZMQ_CLIENT_MATRIX_TOOLS", "auto")
-SEMANTIC_ORDER = ["basic", "admin", "groups", "rebalance", "transactions", "security"]
+SEMANTIC_ORDER = [
+    "basic",
+    "admin",
+    "groups",
+    "rebalance",
+    "transactions",
+    "security",
+    "security-negative",
+]
 REBALANCE_TOOLS = {"kafka-python", "confluent-kafka", "java-kafka"}
 TRANSACTION_TOOLS = {"confluent-kafka", "java-kafka"}
 SECURITY_TOOLS = {"kcat", "kafka-cli", "kafka-python", "confluent-kafka", "java-kafka"}
@@ -111,10 +121,14 @@ def semantic_enabled(name):
 
 
 def security_enabled():
-    return semantic_enabled("security") or SECURITY_PROTOCOL.upper() != "PLAINTEXT"
+    return (
+        semantic_enabled("security")
+        or semantic_enabled("security-negative")
+        or SECURITY_PROTOCOL.upper() != "PLAINTEXT"
+    )
 
 
-def security_properties():
+def security_properties(password_override=None):
     if not security_enabled():
         return {}
     props = {"security.protocol": SECURITY_PROTOCOL}
@@ -123,16 +137,17 @@ def security_properties():
         props["sasl.mechanisms"] = SASL_MECHANISM
     if SASL_USERNAME:
         props["sasl.username"] = SASL_USERNAME
-    if SASL_PASSWORD:
-        props["sasl.password"] = SASL_PASSWORD
+    password = SASL_PASSWORD if password_override is None else password_override
+    if password:
+        props["sasl.password"] = password
     if SSL_CA_LOCATION:
         props["ssl.ca.location"] = SSL_CA_LOCATION
     return props
 
 
-def kcat_security_args():
+def kcat_security_args(password_override=None):
     args = []
-    props = security_properties()
+    props = security_properties(password_override=password_override)
     if not props:
         return args
     for key in ("security.protocol", "sasl.mechanisms", "sasl.username", "sasl.password", "ssl.ca.location"):
@@ -142,8 +157,8 @@ def kcat_security_args():
     return args
 
 
-def kafka_cli_security_config_path():
-    props = security_properties()
+def kafka_cli_security_config_path(password_override=None):
+    props = security_properties(password_override=password_override)
     if not props:
         return None
     fd, path = tempfile.mkstemp(prefix="zmq-client-matrix-kafka-cli-", suffix=".properties")
@@ -161,7 +176,7 @@ def kafka_cli_command_config(args, config_path):
     return args + ["--command-config", config_path]
 
 
-def kafka_python_security_config():
+def kafka_python_security_config(password_override=None):
     if not security_enabled():
         return {}
     config = {"security_protocol": SECURITY_PROTOCOL}
@@ -169,15 +184,16 @@ def kafka_python_security_config():
         config["sasl_mechanism"] = SASL_MECHANISM
     if SASL_USERNAME:
         config["sasl_plain_username"] = SASL_USERNAME
-    if SASL_PASSWORD:
-        config["sasl_plain_password"] = SASL_PASSWORD
+    password = SASL_PASSWORD if password_override is None else password_override
+    if password:
+        config["sasl_plain_password"] = password
     if SSL_CA_LOCATION:
         config["ssl_cafile"] = SSL_CA_LOCATION
     return config
 
 
-def confluent_security_config():
-    props = security_properties()
+def confluent_security_config(password_override=None):
+    props = security_properties(password_override=password_override)
     if not props:
         return {}
     config = {"security.protocol": props["security.protocol"]}
@@ -185,11 +201,18 @@ def confluent_security_config():
         config["sasl.mechanisms"] = SASL_MECHANISM
     if SASL_USERNAME:
         config["sasl.username"] = SASL_USERNAME
-    if SASL_PASSWORD:
-        config["sasl.password"] = SASL_PASSWORD
+    password = SASL_PASSWORD if password_override is None else password_override
+    if password:
+        config["sasl.password"] = password
     if SSL_CA_LOCATION:
         config["ssl.ca.location"] = SSL_CA_LOCATION
     return config
+
+
+def bad_sasl_password():
+    if not SASL_PASSWORD:
+        raise MatrixError("security-negative semantic requires ZMQ_CLIENT_MATRIX_SASL_PASSWORD")
+    return SASL_PASSWORD + "-invalid"
 
 
 def run(cmd, timeout=30, input_text=None, cwd=None, env=None):
@@ -205,6 +228,22 @@ def run(cmd, timeout=30, input_text=None, cwd=None, env=None):
     )
     if proc.returncode != 0:
         raise MatrixError(f"{cmd[0]} failed with exit code {proc.returncode}\n{proc.stdout}")
+    return proc.stdout
+
+
+def run_expect_failure(cmd, timeout=30, input_text=None, cwd=None, env=None):
+    proc = subprocess.run(
+        cmd,
+        input=input_text,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        timeout=timeout,
+        cwd=cwd,
+        env=env,
+    )
+    if proc.returncode == 0:
+        raise MatrixError(f"{cmd[0]} unexpectedly succeeded\n{proc.stdout}")
     return proc.stdout
 
 
@@ -357,6 +396,8 @@ def ensure_tool_supports_semantics(tool):
             f"{tool} selected with security configuration, but only "
             f"{', '.join(sorted(SECURITY_TOOLS))} have security interop probes"
         )
+    if semantic_enabled("security-negative") and not SASL_PASSWORD:
+        raise MatrixError("security-negative semantic requires a configured SASL password")
 
 
 def test_kcat():
@@ -392,6 +433,9 @@ def test_kcat():
             timeout=45,
         )
         require_output_contains(group_fetched, payload, "kcat group")
+
+    if semantic_enabled("security-negative"):
+        run_expect_failure(["kcat"] + kcat_security_args(password_override=bad_sasl_password()) + ["-L", "-b", BOOTSTRAP])
 
     print(f"ok: kcat probes ({semantics_csv()})")
 
@@ -540,6 +584,22 @@ def test_kafka_cli():
                 ),
                 timeout=45,
             )
+        if semantic_enabled("security-negative"):
+            bad_config_path = kafka_cli_security_config_path(password_override=bad_sasl_password())
+            try:
+                run_expect_failure(
+                    kafka_cli_command_config(
+                        ["kafka-broker-api-versions.sh", "--bootstrap-server", BOOTSTRAP],
+                        bad_config_path,
+                    ),
+                    timeout=45,
+                )
+            finally:
+                if bad_config_path is not None:
+                    try:
+                        os.unlink(bad_config_path)
+                    except FileNotFoundError:
+                        pass
         print(f"ok: kafka CLI probes ({semantics_csv()})")
     finally:
         if config_path is not None:
@@ -626,6 +686,8 @@ def test_kafka_python():
                     )
                 if semantic_enabled("rebalance"):
                     test_kafka_python_rebalance(topic)
+                if semantic_enabled("security-negative"):
+                    test_kafka_python_security_negative()
                 print(f"ok: kafka-python probes ({semantics_csv()})")
                 return
         raise MatrixError("kafka-python consumer did not fetch produced payload")
@@ -672,6 +734,29 @@ def test_kafka_python_rebalance(topic):
     finally:
         for consumer in consumers:
             consumer.close()
+
+
+def test_kafka_python_security_negative():
+    from kafka import KafkaAdminClient
+
+    try:
+        admin = KafkaAdminClient(
+            bootstrap_servers=BOOTSTRAP,
+            client_id="zmq-client-matrix-kafka-python-negative",
+            request_timeout_ms=10000,
+            api_version_auto_timeout_ms=5000,
+            **kafka_python_security_config(password_override=bad_sasl_password()),
+        )
+    except Exception:
+        return
+    try:
+        try:
+            admin.list_topics()
+        except Exception:
+            return
+        raise MatrixError("kafka-python bad credentials unexpectedly succeeded")
+    finally:
+        admin.close()
 
 
 def test_confluent_kafka():
@@ -747,6 +832,8 @@ def test_confluent_kafka():
                     test_confluent_transaction(topic)
                 if semantic_enabled("rebalance"):
                     test_confluent_rebalance(topic)
+                if semantic_enabled("security-negative"):
+                    test_confluent_security_negative()
                 print(f"ok: confluent-kafka probes ({semantics_csv()})")
                 return
         raise MatrixError("confluent-kafka consumer did not fetch produced payload")
@@ -790,6 +877,22 @@ def test_confluent_rebalance(topic):
     finally:
         for consumer in consumers:
             consumer.close()
+
+
+def test_confluent_security_negative():
+    from confluent_kafka.admin import AdminClient
+
+    admin = AdminClient({
+        "bootstrap.servers": BOOTSTRAP,
+        "client.id": "zmq-client-matrix-confluent-negative",
+        "socket.timeout.ms": 10000,
+        **confluent_security_config(password_override=bad_sasl_password()),
+    })
+    try:
+        admin.list_topics(timeout=10)
+    except Exception:
+        return
+    raise MatrixError("confluent-kafka bad credentials unexpectedly succeeded")
 
 
 def test_confluent_transaction(topic):
@@ -858,6 +961,9 @@ public class ZmqKafkaClientMatrix {
                         throw e;
                     }
                 }
+            }
+            if (semantics.contains("security-negative")) {
+                runSecurityNegative(bootstrap);
             }
         }
 
@@ -976,6 +1082,27 @@ public class ZmqKafkaClientMatrix {
                 }
             }
             throw new RuntimeException("Java rebalance did not assign both partitions");
+        }
+    }
+
+    private static void runSecurityNegative(String bootstrap) throws Exception {
+        String password = System.getenv("ZMQ_CLIENT_MATRIX_SASL_PASSWORD");
+        if (password == null || password.isEmpty()) {
+            throw new RuntimeException("security-negative requires ZMQ_CLIENT_MATRIX_SASL_PASSWORD");
+        }
+        Properties adminProps = new Properties();
+        adminProps.put("bootstrap.servers", bootstrap);
+        adminProps.put("client.id", "zmq-client-matrix-java-negative");
+        adminProps.put("request.timeout.ms", "10000");
+        applySecurity(adminProps);
+        adminProps.put("sasl.password", password + "-invalid");
+        try (AdminClient admin = AdminClient.create(adminProps)) {
+            admin.listTopics().names().get(10, TimeUnit.SECONDS);
+            throw new RuntimeException("Java bad credentials unexpectedly succeeded");
+        } catch (Exception expected) {
+            if (expected.toString().contains("unexpectedly succeeded")) {
+                throw expected;
+            }
         }
     }
 
@@ -1190,7 +1317,9 @@ def self_test():
         os.environ["ZMQ_CLIENT_MATRIX_PROFILES"] = "apache_3_7, go_1_21"
         os.environ["ZMQ_CLIENT_MATRIX_APACHE_3_7_TOOLS"] = "java-kafka"
         os.environ["ZMQ_CLIENT_MATRIX_APACHE_3_7_JAVA_CLASSPATH"] = "/opt/kafka-3.7/libs/*"
-        os.environ["ZMQ_CLIENT_MATRIX_APACHE_3_7_SEMANTICS"] = "admin,rebalance,transactions,security"
+        os.environ["ZMQ_CLIENT_MATRIX_APACHE_3_7_SEMANTICS"] = (
+            "admin,rebalance,transactions,security,security-negative"
+        )
         os.environ["ZMQ_CLIENT_MATRIX_APACHE_3_7_SECURITY_PROTOCOL"] = "SASL_PLAINTEXT"
         os.environ["ZMQ_CLIENT_MATRIX_APACHE_3_7_SASL_MECHANISM"] = "PLAIN"
         os.environ["ZMQ_CLIENT_MATRIX_APACHE_3_7_SASL_USERNAME"] = "matrix-user"
@@ -1206,7 +1335,7 @@ def self_test():
         apply_profile("apache_3_7")
         if TOOLS != "java-kafka" or JAVA_CLASSPATH != "/opt/kafka-3.7/libs/*":
             raise MatrixError("java profile override failed")
-        if semantics_csv() != "basic,admin,rebalance,transactions,security":
+        if semantics_csv() != "basic,admin,rebalance,transactions,security,security-negative":
             raise MatrixError(f"java semantics override failed: {semantics_csv()}")
         if not security_enabled():
             raise MatrixError("security semantic did not enable security config")
@@ -1243,6 +1372,14 @@ def self_test():
         try:
             ensure_tool_supports_semantics("go-kafka")
             raise MatrixError("unsupported security tool was accepted")
+        except MatrixError as exc:
+            if "security interop probes" not in str(exc):
+                raise
+        os.environ["ZMQ_CLIENT_MATRIX_GO_1_21_SEMANTICS"] = "security-negative"
+        apply_profile("go_1_21")
+        try:
+            ensure_tool_supports_semantics("go-kafka")
+            raise MatrixError("unsupported security-negative tool was accepted")
         except MatrixError as exc:
             if "security interop probes" not in str(exc):
                 raise

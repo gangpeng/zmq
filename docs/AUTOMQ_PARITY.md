@@ -463,10 +463,10 @@ Status: completed for the initial catalog and DeleteGroups slice.
   version profiles with per-profile bootstrap, tool list, Java classpath, Go
   module, Python interpreter, semantic-suite, TLS, and SASL overrides so CI can
   run explicit client/library version sets. `ZMQ_CLIENT_MATRIX_SEMANTICS` can
-  now require admin, consumer-group, rebalance, transactional, and
-  secured-client real-client probes in addition to default
-  metadata/produce/fetch/offset checks. Remaining gap: broaden security
-  negative-case semantic client fixtures.
+  now require admin, consumer-group, rebalance, transactional, secured-client,
+  and bad-credential real-client probes in addition to default
+  metadata/produce/fetch/offset checks. Remaining gap: broaden TLS certificate
+  and OAuth negative-case semantic client fixtures.
 - Prepared-object lifecycle coverage includes request-TTL tracking, registry-only
   allocation expiry, prepared/committed/destroyed state transitions, and
   compaction cleanup paths. Local-mode Create/Open/Close/Delete/TrimStreams,
@@ -683,9 +683,11 @@ Status: completed for the initial catalog and DeleteGroups slice.
   admin topic/config operations, consumer-group list/describe or group reads,
   multi-consumer rebalance assignment convergence for kafka-python,
   confluent-kafka, and Java kafka-clients, transactional produce paths for
-  confluent-kafka and Java kafka-clients, and secured-client runs for kcat,
-  Kafka CLI, kafka-python, confluent-kafka, and Java kafka-clients. Remaining
-  work: add ACL/security negative-case semantic client fixtures.
+  confluent-kafka and Java kafka-clients, secured-client runs for kcat, Kafka
+  CLI, kafka-python, confluent-kafka, and Java kafka-clients, and
+  bad-credential fail-closed checks over those secured-client profiles.
+  Remaining work: add TLS certificate, OAuth, and ACL negative-case semantic
+  client fixtures.
 - Add chaos tests for SIGKILL, network partition, S3 outage, clock skew, and
   slow/partial clients.
   Status: gated `test-chaos` starts real broker processes and now verifies
