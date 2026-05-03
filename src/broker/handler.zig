@@ -19368,7 +19368,7 @@ pub const Broker = struct {
 
         if (!skipFixedBytes(buf, &pos, 4)) return false; // timeout_ms
         if (flexible) ser.skipTaggedFields(buf, &pos) catch return false;
-        return true;
+        return pos == buf.len;
     }
 
     fn validateCreatePartitionsRequestFrame(buf: []const u8, start_pos: usize, api_version: i16) bool {
@@ -38741,6 +38741,34 @@ test "Broker.handleRequest DeleteRecords rejects truncated request" {
     var buf: [128]u8 = undefined;
     const req_len = buildTestRequest(&buf, 21, 2, 2103, header_mod.requestHeaderVersion(21, 2));
     try testing.expect(broker.handleRequest(buf[0..req_len]) == null);
+}
+
+test "Broker.handleRequest DeleteRecords rejects trailing bytes" {
+    const Req = generated.delete_records_request.DeleteRecordsRequest;
+    const Topic = Req.DeleteRecordsTopic;
+    const Partition = Topic.DeleteRecordsPartition;
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+
+    const partitions = [_]Partition{.{
+        .partition_index = 0,
+        .offset = 5,
+    }};
+    const topics = [_]Topic{.{
+        .name = "dr-trailing-topic",
+        .partitions = &partitions,
+    }};
+    const req = Req{
+        .topics = &topics,
+        .timeout_ms = 30000,
+    };
+
+    var buf: [512]u8 = undefined;
+    var pos = buildTestRequest(&buf, 21, 2, 2105, header_mod.requestHeaderVersion(21, 2));
+    req.serialize(&buf, &pos, 2);
+
+    try expectTrailingByteRejected(&broker, &buf, pos);
 }
 
 test "Broker.handleRequest DeleteRecords authorization denial uses generated response" {
