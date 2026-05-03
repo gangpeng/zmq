@@ -1471,6 +1471,51 @@ pub const Broker = struct {
         self.finalized_features_epoch = -1;
     }
 
+    const FinalizedFeatureLocalSnapshot = struct {
+        features: std.StringHashMap(i16),
+        epoch: i64,
+    };
+
+    fn cloneFinalizedFeatureLocalSnapshot(self: *Broker) !FinalizedFeatureLocalSnapshot {
+        var features = std.StringHashMap(i16).init(self.allocator);
+        errdefer self.freeFinalizedFeatureMap(&features);
+
+        var it = self.finalized_features.iterator();
+        while (it.next()) |entry| {
+            const key = try self.allocator.dupe(u8, entry.key_ptr.*);
+            features.put(key, entry.value_ptr.*) catch |err| {
+                self.allocator.free(key);
+                return err;
+            };
+        }
+
+        return .{
+            .features = features,
+            .epoch = self.finalized_features_epoch,
+        };
+    }
+
+    fn freeFinalizedFeatureMap(self: *Broker, features: *std.StringHashMap(i16)) void {
+        var it = features.iterator();
+        while (it.next()) |entry| {
+            self.allocator.free(entry.key_ptr.*);
+        }
+        features.deinit();
+    }
+
+    fn freeFinalizedFeatureLocalSnapshot(self: *Broker, snapshot: *FinalizedFeatureLocalSnapshot) void {
+        self.freeFinalizedFeatureMap(&snapshot.features);
+    }
+
+    fn restoreFinalizedFeatureLocalSnapshot(self: *Broker, snapshot: *FinalizedFeatureLocalSnapshot) void {
+        const current_features = self.finalized_features;
+        const current_epoch = self.finalized_features_epoch;
+        self.finalized_features = snapshot.features;
+        self.finalized_features_epoch = snapshot.epoch;
+        snapshot.features = current_features;
+        snapshot.epoch = current_epoch;
+    }
+
     fn clearClientTelemetrySamples(self: *Broker) void {
         var it = self.client_telemetry_samples.iterator();
         while (it.next()) |entry| {
@@ -1976,9 +2021,13 @@ pub const Broker = struct {
     }
 
     fn persistFinalizedFeaturesLocal(self: *Broker) void {
-        self.persistence.saveFinalizedFeatures(&self.finalized_features, self.finalized_features_epoch) catch |err| {
+        self.persistFinalizedFeaturesDurably() catch |err| {
             log.warn("Failed to persist finalized features: {}", .{err});
         };
+    }
+
+    fn persistFinalizedFeaturesDurably(self: *Broker) !void {
+        try self.persistence.saveFinalizedFeatures(&self.finalized_features, self.finalized_features_epoch);
     }
 
     fn persistPartitionReassignmentsDurably(self: *Broker) !void {
@@ -17326,20 +17375,40 @@ pub const Broker = struct {
             }
         }
 
+        var response_error = ErrorCode.none;
+        var response_error_message: ?[]const u8 = null;
         if (has_successful_mutation and !req.validate_only) {
+            var previous_snapshot = self.cloneFinalizedFeatureLocalSnapshot() catch return null;
+            defer self.freeFinalizedFeatureLocalSnapshot(&previous_snapshot);
+
             for (req.feature_updates, 0..) |feature_update, i| {
                 if (results[i].error_code == @intFromEnum(ErrorCode.none)) {
-                    self.applyFinalizedFeatureUpdate(feature_update) catch return null;
+                    self.applyFinalizedFeatureUpdate(feature_update) catch |err| {
+                        log.warn("Failed to apply finalized feature update: {}", .{err});
+                        self.restoreFinalizedFeatureLocalSnapshot(&previous_snapshot);
+                        self.markUpdateFeaturesStorageError(results);
+                        response_error = ErrorCode.kafka_storage_error;
+                        response_error_message = "Failed to persist finalized feature metadata";
+                        break;
+                    };
                 }
             }
-            self.finalized_features_epoch = if (self.finalized_features_epoch < 0) 0 else self.finalized_features_epoch + 1;
-            self.persistFinalizedFeaturesLocal();
+            if (response_error == ErrorCode.none) {
+                self.finalized_features_epoch = if (self.finalized_features_epoch < 0) 0 else self.finalized_features_epoch + 1;
+                self.persistFinalizedFeaturesDurably() catch |err| {
+                    log.warn("UpdateFeatures finalized feature snapshot write failed: {}", .{err});
+                    self.restoreFinalizedFeatureLocalSnapshot(&previous_snapshot);
+                    self.markUpdateFeaturesStorageError(results);
+                    response_error = ErrorCode.kafka_storage_error;
+                    response_error_message = "Failed to persist finalized feature metadata";
+                };
+            }
         }
 
         const resp = Resp{
             .throttle_time_ms = 0,
-            .error_code = @intFromEnum(ErrorCode.none),
-            .error_message = null,
+            .error_code = response_error.toInt(),
+            .error_message = response_error_message,
             .results = results,
         };
         return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
@@ -17347,6 +17416,16 @@ pub const Broker = struct {
 
     fn freeUpdateFeaturesRequest(self: *Broker, req: *generated.update_features_request.UpdateFeaturesRequest) void {
         if (req.feature_updates.len > 0) self.allocator.free(req.feature_updates);
+    }
+
+    fn markUpdateFeaturesStorageError(self: *Broker, results: []generated.update_features_response.UpdateFeaturesResponse.UpdatableFeatureResult) void {
+        _ = self;
+        for (results) |*result| {
+            if (result.error_code == @intFromEnum(ErrorCode.none)) {
+                result.error_code = @intFromEnum(ErrorCode.kafka_storage_error);
+                result.error_message = "Failed to persist finalized feature metadata";
+            }
+        }
     }
 
     fn updateFeaturesResult(self: *Broker, feature_update: generated.update_features_request.UpdateFeaturesRequest.FeatureUpdateKey, api_version: i16) generated.update_features_response.UpdateFeaturesResponse.UpdatableFeatureResult {
@@ -31168,6 +31247,57 @@ test "Broker.handleRequest UpdateFeatures validate-only does not mutate finalize
     try testing.expectEqual(response.?.len, rpos);
     try testing.expectEqual(@as(usize, 1), resp.results.len);
     try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.none)), resp.results[0].error_code);
+    try testing.expect(broker.finalized_features.get("metadata.version") == null);
+    try testing.expectEqual(@as(i64, -1), broker.finalized_features_epoch);
+}
+
+test "Broker.handleRequest UpdateFeatures rolls back when local persistence fails" {
+    const fs = @import("fs_compat");
+    const Req = generated.update_features_request.UpdateFeaturesRequest;
+    const Resp = generated.update_features_response.UpdateFeaturesResponse;
+
+    const tmp_dir = "/tmp/zmq-update-features-persist-fail-test";
+    fs.deleteTreeAbsolute(tmp_dir) catch {};
+    try fs.makeDirAbsolute(tmp_dir);
+    defer fs.deleteTreeAbsolute(tmp_dir) catch {};
+
+    const features_path = try std.fmt.allocPrint(testing.allocator, "{s}/finalized_features.meta", .{tmp_dir});
+    defer testing.allocator.free(features_path);
+    try fs.makeDirAbsolute(features_path);
+
+    var broker = Broker.initWithConfig(testing.allocator, 1, 9092, .{ .data_dir = tmp_dir });
+    defer broker.deinit();
+
+    const updates = [_]Req.FeatureUpdateKey{.{
+        .feature = "metadata.version",
+        .max_version_level = 1,
+        .upgrade_type = 1,
+    }};
+    const req = Req{ .feature_updates = &updates };
+
+    var buf: [512]u8 = undefined;
+    var pos = buildTestRequest(&buf, 57, 1, 5715, header_mod.requestHeaderVersion(57, 1));
+    req.serialize(&buf, &pos, 1);
+
+    const response = broker.handleRequest(buf[0..pos]);
+    try testing.expect(response != null);
+    defer testing.allocator.free(response.?);
+
+    var rpos: usize = 0;
+    var response_header = try ResponseHeader.deserialize(testing.allocator, response.?, &rpos, header_mod.responseHeaderVersion(57, 1));
+    defer response_header.deinit(testing.allocator);
+    try testing.expectEqual(@as(i32, 5715), response_header.correlation_id);
+
+    const resp = try Resp.deserialize(testing.allocator, response.?, &rpos, 1);
+    defer freeDeserializedUpdateFeaturesResponse(&resp);
+
+    try testing.expectEqual(response.?.len, rpos);
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.kafka_storage_error)), resp.error_code);
+    try testing.expectEqualStrings("Failed to persist finalized feature metadata", resp.error_message.?);
+    try testing.expectEqual(@as(usize, 1), resp.results.len);
+    try testing.expectEqualStrings("metadata.version", resp.results[0].feature.?);
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.kafka_storage_error)), resp.results[0].error_code);
+    try testing.expectEqualStrings("Failed to persist finalized feature metadata", resp.results[0].error_message.?);
     try testing.expect(broker.finalized_features.get("metadata.version") == null);
     try testing.expectEqual(@as(i64, -1), broker.finalized_features_epoch);
 }
