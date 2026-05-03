@@ -12885,6 +12885,15 @@ pub const Broker = struct {
         return @intFromEnum(ErrorCode.none);
     }
 
+    fn validateEndTxnState(self: *const Broker, api_version: i16, producer_id: i64, committed: bool) i16 {
+        const txn = self.txn_coordinator.transactions.get(producer_id) orelse return @intFromEnum(ErrorCode.invalid_producer_id_mapping);
+        if (txn.status == .ongoing) return @intFromEnum(ErrorCode.none);
+
+        const invalid_state = @intFromEnum(ErrorCode.invalid_txn_state);
+        if (committed and txn.status == .prepare_abort) return self.mapTransactionAbortableError(api_version, producer_id, invalid_state);
+        return invalid_state;
+    }
+
     fn topicPartitionExists(self: *const Broker, topic: []const u8, partition_index: i32) bool {
         if (topic.len == 0 or partition_index < 0) return false;
         const topic_info = self.topics.get(topic) orelse return false;
@@ -13012,6 +13021,15 @@ pub const Broker = struct {
             const resp = Resp{
                 .throttle_time_ms = 0,
                 .error_code = identity_error,
+            };
+            return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+        }
+
+        const state_error = self.validateEndTxnState(api_version, req.producer_id, req.committed);
+        if (state_error != @intFromEnum(ErrorCode.none)) {
+            const resp = Resp{
+                .throttle_time_ms = 0,
+                .error_code = state_error,
             };
             return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
         }
@@ -32552,10 +32570,44 @@ test "Broker.handleRequest AddOffsetsToTxn authorization denial uses generated r
     try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.transactional_id_authorization_failed)), resp.error_code);
 }
 
-test "Broker.handleRequest EndTxn v3 returns generated response and completes transaction" {
+fn handleEndTxnForTestVersion(
+    broker: *Broker,
+    transactional_id: ?[]const u8,
+    producer_id: i64,
+    producer_epoch: i16,
+    committed: bool,
+    correlation_id: i32,
+    api_version: i16,
+) !generated.end_txn_response.EndTxnResponse {
     const Req = generated.end_txn_request.EndTxnRequest;
     const Resp = generated.end_txn_response.EndTxnResponse;
 
+    const req = Req{
+        .transactional_id = transactional_id,
+        .producer_id = producer_id,
+        .producer_epoch = producer_epoch,
+        .committed = committed,
+    };
+
+    var buf: [512]u8 = undefined;
+    var pos = buildTestRequest(&buf, 26, api_version, correlation_id, header_mod.requestHeaderVersion(26, api_version));
+    req.serialize(&buf, &pos, api_version);
+
+    const response = broker.handleRequest(buf[0..pos]);
+    try testing.expect(response != null);
+    defer testing.allocator.free(response.?);
+
+    var rpos: usize = 0;
+    var response_header = try ResponseHeader.deserialize(testing.allocator, response.?, &rpos, header_mod.responseHeaderVersion(26, api_version));
+    defer response_header.deinit(testing.allocator);
+    try testing.expectEqual(correlation_id, response_header.correlation_id);
+
+    const resp = try Resp.deserialize(testing.allocator, response.?, &rpos, api_version);
+    try testing.expectEqual(response.?.len, rpos);
+    return resp;
+}
+
+test "Broker.handleRequest EndTxn v3 returns generated response and completes transaction" {
     var broker = Broker.init(testing.allocator, 1, 9092);
     defer broker.deinit();
     try testing.expect(broker.ensureTopic("txn-end-topic"));
@@ -32563,31 +32615,57 @@ test "Broker.handleRequest EndTxn v3 returns generated response and completes tr
     const init_result = try broker.txn_coordinator.initProducerId("txn-end-generated");
     _ = try broker.txn_coordinator.addPartitionsToTxn(init_result.producer_id, init_result.producer_epoch, "txn-end-topic", 0);
 
-    const req = Req{
-        .transactional_id = "txn-end-generated",
-        .producer_id = init_result.producer_id,
-        .producer_epoch = init_result.producer_epoch,
-        .committed = true,
-    };
-
-    var buf: [512]u8 = undefined;
-    var pos = buildTestRequest(&buf, 26, 3, 2603, header_mod.requestHeaderVersion(26, 3));
-    req.serialize(&buf, &pos, 3);
-
-    const response = broker.handleRequest(buf[0..pos]);
-    try testing.expect(response != null);
-    defer testing.allocator.free(response.?);
-
-    var rpos: usize = 0;
-    var response_header = try ResponseHeader.deserialize(testing.allocator, response.?, &rpos, header_mod.responseHeaderVersion(26, 3));
-    defer response_header.deinit(testing.allocator);
-    try testing.expectEqual(@as(i32, 2603), response_header.correlation_id);
-
-    const resp = try Resp.deserialize(testing.allocator, response.?, &rpos, 3);
-    try testing.expectEqual(response.?.len, rpos);
+    const resp = try handleEndTxnForTestVersion(
+        &broker,
+        "txn-end-generated",
+        init_result.producer_id,
+        init_result.producer_epoch,
+        true,
+        2603,
+        3,
+    );
     try testing.expectEqual(@as(i32, 0), resp.throttle_time_ms);
     try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.none)), resp.error_code);
     try testing.expectEqual(TxnCoordinator.TxnStatus.complete_commit, broker.txn_coordinator.getStatus(init_result.producer_id).?);
+}
+
+test "Broker.handleRequest EndTxn v4 maps abortable transaction state before marker write" {
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+    try testing.expect(broker.ensureTopic("txn-end-abortable-topic"));
+
+    const init_result = try broker.txn_coordinator.initProducerId("txn-end-abortable");
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.none)), try broker.txn_coordinator.addPartitionsToTxn(init_result.producer_id, init_result.producer_epoch, "txn-end-abortable-topic", 0));
+    const txn = broker.txn_coordinator.transactions.getPtr(init_result.producer_id) orelse return error.ExpectedTransactionState;
+    txn.status = .prepare_abort;
+
+    const legacy_resp = try handleEndTxnForTestVersion(
+        &broker,
+        "txn-end-abortable",
+        init_result.producer_id,
+        init_result.producer_epoch,
+        true,
+        2610,
+        3,
+    );
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.invalid_txn_state)), legacy_resp.error_code);
+    try testing.expectEqual(TxnCoordinator.TxnStatus.prepare_abort, broker.txn_coordinator.getStatus(init_result.producer_id).?);
+    var state = broker.partitionState("txn-end-abortable-topic", 0).?;
+    try testing.expectEqual(@as(u64, 0), state.next_offset);
+
+    const v4_resp = try handleEndTxnForTestVersion(
+        &broker,
+        "txn-end-abortable",
+        init_result.producer_id,
+        init_result.producer_epoch,
+        true,
+        2611,
+        4,
+    );
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.transaction_abortable)), v4_resp.error_code);
+    try testing.expectEqual(TxnCoordinator.TxnStatus.prepare_abort, broker.txn_coordinator.getStatus(init_result.producer_id).?);
+    state = broker.partitionState("txn-end-abortable-topic", 0).?;
+    try testing.expectEqual(@as(u64, 0), state.next_offset);
 }
 
 test "Broker.handleRequest EndTxn rolls back when transaction snapshot S3 WAL write fails" {
