@@ -4,7 +4,9 @@ const Allocator = std.mem.Allocator;
 const fs = @import("fs_compat");
 const crc32c = @import("core").crc32c;
 const log = std.log.scoped(.wal);
-const ObjectWriter = @import("s3.zig").ObjectWriter;
+const s3_mod = @import("s3.zig");
+const ObjectWriter = s3_mod.ObjectWriter;
+const MockS3Type = s3_mod.MockS3;
 const stream_mod = @import("stream.zig");
 const ObjectManager = stream_mod.ObjectManager;
 const StreamOffsetRange = stream_mod.StreamOffsetRange;
@@ -939,6 +941,13 @@ pub const S3WalBatcher = struct {
             return false;
         }
 
+        if (self.buffer.items.len == 0) return true;
+
+        if (self.fenceIfStorageHasNewerEpoch(s3_storage)) {
+            self.batch_upload_failures += 1;
+            return false;
+        }
+
         // Compute stream ranges BEFORE flushBuild clears the buffer
         const ranges = if (self.object_manager != null)
             self.computeStreamRanges() catch null
@@ -1040,6 +1049,11 @@ pub const S3WalBatcher = struct {
 
     /// Update the WAL epoch — called when this node becomes the new owner after failover.
     pub fn setEpoch(self: *S3WalBatcher, new_epoch: u64) void {
+        if (new_epoch < self.wal_epoch) {
+            self.is_fenced = true;
+            log.warn("S3 WAL stale epoch rejected: current={d} requested={d}", .{ self.wal_epoch, new_epoch });
+            return;
+        }
         log.info("S3 WAL epoch updated: {d} -> {d}", .{ self.wal_epoch, new_epoch });
         self.wal_epoch = new_epoch;
         self.is_fenced = false; // Un-fence with new epoch
@@ -1070,6 +1084,45 @@ pub const S3WalBatcher = struct {
             .epoch = std.fmt.parseInt(u64, rest[0..sep], 10) catch return null,
             .counter = std.fmt.parseInt(u64, counter_text, 10) catch return null,
         };
+    }
+
+    fn StorageChild(comptime T: type) type {
+        return switch (@typeInfo(T)) {
+            .pointer => |ptr| ptr.child,
+            else => T,
+        };
+    }
+
+    fn fenceIfStorageHasNewerEpoch(self: *S3WalBatcher, s3_storage: anytype) bool {
+        const StorageT = StorageChild(@TypeOf(s3_storage));
+        if (comptime !@hasDecl(StorageT, "listObjectKeys")) return false;
+
+        const keys = if (comptime StorageT == MockS3Type)
+            s3_storage.listObjectKeys(self.allocator, "wal/") catch |err| {
+                self.is_fenced = true;
+                log.warn("S3 WAL epoch fence check failed: {}", .{err});
+                return true;
+            }
+        else
+            s3_storage.listObjectKeys("wal/") catch |err| {
+                self.is_fenced = true;
+                log.warn("S3 WAL epoch fence check failed: {}", .{err});
+                return true;
+            };
+        defer {
+            for (keys) |key| self.allocator.free(key);
+            self.allocator.free(keys);
+        }
+
+        for (keys) |key| {
+            const parsed = parseObjectKey(key) orelse continue;
+            if (parsed.epoch > self.wal_epoch) {
+                self.is_fenced = true;
+                log.warn("S3 WAL stale writer fenced: current={d} observed={d}", .{ self.wal_epoch, parsed.epoch });
+                return true;
+            }
+        }
+        return false;
     }
 
     /// Advance the local object-key generator from an existing WAL object key.
@@ -1377,6 +1430,32 @@ test "S3WalBatcher flushNow retries injected MockS3 put failures" {
     try testing.expectEqual(@as(usize, 1), mock_s3.objectCount());
 }
 
+test "S3WalBatcher flushNow fences stale epoch observed in storage" {
+    const MockS3 = @import("s3.zig").MockS3;
+
+    var mock_s3 = MockS3.init(testing.allocator);
+    defer mock_s3.deinit();
+
+    var current_owner = S3WalBatcher.init(testing.allocator);
+    defer current_owner.deinit();
+    current_owner.setEpoch(2);
+    try current_owner.append(1, 0, "current-owner-record");
+    try testing.expect(current_owner.flushNow(&mock_s3));
+    try testing.expectEqual(@as(usize, 1), mock_s3.objectCount());
+
+    var stale_owner = S3WalBatcher.init(testing.allocator);
+    defer stale_owner.deinit();
+    stale_owner.setEpoch(1);
+    try stale_owner.append(1, 1, "stale-owner-record");
+
+    try testing.expect(!stale_owner.flushNow(&mock_s3));
+    try testing.expect(stale_owner.is_fenced);
+    try testing.expectEqual(@as(usize, 1), stale_owner.pendingCount());
+    try testing.expectEqual(@as(u64, 0), stale_owner.batch_upload_count);
+    try testing.expectEqual(@as(u64, 1), stale_owner.batch_upload_failures);
+    try testing.expectEqual(@as(usize, 1), mock_s3.objectCount());
+}
+
 test "S3WalBatcher fencing rejects appends" {
     var batcher = S3WalBatcher.init(testing.allocator);
     defer batcher.deinit();
@@ -1478,9 +1557,10 @@ test "S3WalBatcher epoch monotonicity" {
     batcher.setEpoch(5);
     try testing.expectEqual(@as(u64, 5), batcher.wal_epoch);
 
-    // Setting a lower epoch is allowed (controller decides policy)
+    // Stale epochs fence the writer instead of silently downgrading it.
     batcher.setEpoch(3);
-    try testing.expectEqual(@as(u64, 3), batcher.wal_epoch);
+    try testing.expectEqual(@as(u64, 5), batcher.wal_epoch);
+    try testing.expect(batcher.is_fenced);
 }
 
 test "S3WalBatcher epoch in object key" {
