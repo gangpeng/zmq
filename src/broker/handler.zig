@@ -1321,9 +1321,13 @@ pub const Broker = struct {
 
     /// Persist ACLs to disk.
     fn persistAcls(self: *Broker) void {
-        self.persistence.saveAcls(self.authorizer.acls.items) catch |err| {
+        self.persistAclsDurably() catch |err| {
             log.warn("Failed to persist ACLs: {}", .{err});
         };
+    }
+
+    fn persistAclsDurably(self: *Broker) !void {
+        try self.persistence.saveAcls(self.authorizer.acls.items);
     }
 
     /// Persist local AutoMQ controller-style metadata to disk (best-effort).
@@ -19976,15 +19980,26 @@ pub const Broker = struct {
             };
         };
 
-        self.writeAclSnapshotRecord() catch |err| {
-            log.warn("Failed to append ACL snapshot to __cluster_metadata: {}", .{err});
+        self.persistAclsDurably() catch |err| {
+            log.warn("Failed to persist ACLs locally: {}", .{err});
             self.restoreAclsAfterFailedMutation(previous_snapshot);
             return .{
                 .error_code = @intFromEnum(ErrorCode.kafka_storage_error),
                 .error_message = "Failed to persist ACL metadata",
             };
         };
-        self.persistAcls();
+
+        self.writeAclSnapshotRecord() catch |err| {
+            log.warn("Failed to append ACL snapshot to __cluster_metadata: {}", .{err});
+            self.restoreAclsAfterFailedMutation(previous_snapshot);
+            self.persistAclsDurably() catch |restore_err| {
+                log.warn("Failed to persist restored ACL metadata: {}", .{restore_err});
+            };
+            return .{
+                .error_code = @intFromEnum(ErrorCode.kafka_storage_error),
+                .error_message = "Failed to persist ACL metadata",
+            };
+        };
 
         return .{
             .error_code = @intFromEnum(ErrorCode.none),
@@ -20139,8 +20154,8 @@ pub const Broker = struct {
             permission,
         );
 
-        self.writeAclSnapshotRecord() catch |err| {
-            log.warn("Failed to append ACL snapshot to __cluster_metadata: {}", .{err});
+        self.persistAclsDurably() catch |err| {
+            log.warn("Failed to persist ACLs locally: {}", .{err});
             self.restoreAclsAfterFailedMutation(previous_snapshot);
             self.allocator.free(previous_snapshot);
             matching_acls_owned = false;
@@ -20150,8 +20165,22 @@ pub const Broker = struct {
                 .matching_acls = matching_acls,
             };
         };
+
+        self.writeAclSnapshotRecord() catch |err| {
+            log.warn("Failed to append ACL snapshot to __cluster_metadata: {}", .{err});
+            self.restoreAclsAfterFailedMutation(previous_snapshot);
+            self.persistAclsDurably() catch |restore_err| {
+                log.warn("Failed to persist restored ACL metadata: {}", .{restore_err});
+            };
+            self.allocator.free(previous_snapshot);
+            matching_acls_owned = false;
+            return .{
+                .error_code = @intFromEnum(ErrorCode.kafka_storage_error),
+                .error_message = "Failed to persist ACL metadata",
+                .matching_acls = matching_acls,
+            };
+        };
         self.allocator.free(previous_snapshot);
-        self.persistAcls();
 
         matching_acls_owned = false;
         return .{
@@ -28425,6 +28454,62 @@ test "Broker.handleRequest CreateAcls authorization denial uses generated respon
     try testing.expectEqual(@as(usize, 1), broker.authorizer.aclCount());
 }
 
+test "Broker.handleRequest CreateAcls rolls back local ACL persistence failures" {
+    const fs = @import("fs_compat");
+    const Req = generated.create_acls_request.CreateAclsRequest;
+    const Resp = generated.create_acls_response.CreateAclsResponse;
+
+    const tmp_dir = "/tmp/zmq-create-acls-persist-fail-test";
+    fs.deleteTreeAbsolute(tmp_dir) catch {};
+    try fs.makeDirAbsolute(tmp_dir);
+    defer fs.deleteTreeAbsolute(tmp_dir) catch {};
+
+    var broker = Broker.initWithConfig(testing.allocator, 1, 9092, .{ .data_dir = tmp_dir });
+    defer broker.deinit();
+    try broker.authorizer.addSuperUser("test-client");
+    try broker.authorizer.addAcl("User:existing", .topic, "acl-existing-topic", .literal, .read, .allow, "*");
+    try broker.persistAclsDurably();
+
+    const acls_path = try std.fmt.allocPrint(testing.allocator, "{s}/acls.meta", .{tmp_dir});
+    defer testing.allocator.free(acls_path);
+    try fs.deleteFileAbsolute(acls_path);
+    try fs.makeDirAbsolute(acls_path);
+
+    const creations = [_]Req.AclCreation{.{
+        .resource_type = @intFromEnum(Authorizer.ResourceType.topic),
+        .resource_name = "acl-local-fail-topic",
+        .resource_pattern_type = @intFromEnum(Authorizer.PatternType.literal),
+        .principal = "User:local-fail",
+        .host = "*",
+        .operation = @intFromEnum(Authorizer.Operation.write),
+        .permission_type = @intFromEnum(Authorizer.Permission.allow),
+    }};
+    const req = Req{ .creations = &creations };
+
+    var buf: [512]u8 = undefined;
+    var pos = buildTestRequest(&buf, 30, 2, 3007, header_mod.requestHeaderVersion(30, 2));
+    req.serialize(&buf, &pos, 2);
+
+    const response = broker.handleRequest(buf[0..pos]);
+    try testing.expect(response != null);
+    defer testing.allocator.free(response.?);
+
+    var rpos: usize = 0;
+    var response_header = try ResponseHeader.deserialize(testing.allocator, response.?, &rpos, header_mod.responseHeaderVersion(30, 2));
+    defer response_header.deinit(testing.allocator);
+    try testing.expectEqual(@as(i32, 3007), response_header.correlation_id);
+
+    const resp = try Resp.deserialize(testing.allocator, response.?, &rpos, 2);
+    defer if (resp.results.len > 0) testing.allocator.free(resp.results);
+
+    try testing.expectEqual(response.?.len, rpos);
+    try testing.expectEqual(@as(usize, 1), resp.results.len);
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.kafka_storage_error)), resp.results[0].error_code);
+    try testing.expectEqual(@as(usize, 1), broker.authorizer.aclCount());
+    try testing.expectEqual(Authorizer.AuthResult.allowed, broker.authorizer.authorize("User:existing", .topic, "acl-existing-topic", .read));
+    try testing.expectEqual(Authorizer.AuthResult.denied, broker.authorizer.authorize("User:local-fail", .topic, "acl-local-fail-topic", .write));
+}
+
 test "Broker.handleRequest DeleteAcls v2 returns generated matching ACL details" {
     const Req = generated.delete_acls_request.DeleteAclsRequest;
     const Resp = generated.delete_acls_response.DeleteAclsResponse;
@@ -28599,6 +28684,67 @@ test "Broker.handleRequest DeleteAcls authorization denial uses generated respon
     try testing.expect(resp.filter_results[0].error_message != null);
     try testing.expectEqual(@as(usize, 0), resp.filter_results[0].matching_acls.len);
     try testing.expectEqual(@as(usize, 1), broker.authorizer.aclCount());
+}
+
+test "Broker.handleRequest DeleteAcls rolls back local ACL persistence failures" {
+    const fs = @import("fs_compat");
+    const Req = generated.delete_acls_request.DeleteAclsRequest;
+    const Resp = generated.delete_acls_response.DeleteAclsResponse;
+
+    const tmp_dir = "/tmp/zmq-delete-acls-persist-fail-test";
+    fs.deleteTreeAbsolute(tmp_dir) catch {};
+    try fs.makeDirAbsolute(tmp_dir);
+    defer fs.deleteTreeAbsolute(tmp_dir) catch {};
+
+    var broker = Broker.initWithConfig(testing.allocator, 1, 9092, .{ .data_dir = tmp_dir });
+    defer broker.deinit();
+    try broker.authorizer.addSuperUser("test-client");
+    try broker.authorizer.addAcl("User:delete-local", .topic, "acl-delete-local-fail", .literal, .read, .allow, "*");
+    try broker.persistAclsDurably();
+
+    const acls_path = try std.fmt.allocPrint(testing.allocator, "{s}/acls.meta", .{tmp_dir});
+    defer testing.allocator.free(acls_path);
+    try fs.deleteFileAbsolute(acls_path);
+    try fs.makeDirAbsolute(acls_path);
+
+    const filters = [_]Req.DeleteAclsFilter{.{
+        .resource_type_filter = @intFromEnum(Authorizer.ResourceType.topic),
+        .resource_name_filter = "acl-delete-local-fail",
+        .pattern_type_filter = @intFromEnum(Authorizer.PatternType.literal),
+        .principal_filter = "User:delete-local",
+        .host_filter = "*",
+        .operation = @intFromEnum(Authorizer.Operation.read),
+        .permission_type = @intFromEnum(Authorizer.Permission.allow),
+    }};
+    const req = Req{ .filters = &filters };
+
+    var buf: [512]u8 = undefined;
+    var pos = buildTestRequest(&buf, 31, 2, 3107, header_mod.requestHeaderVersion(31, 2));
+    req.serialize(&buf, &pos, 2);
+
+    const response = broker.handleRequest(buf[0..pos]);
+    try testing.expect(response != null);
+    defer testing.allocator.free(response.?);
+
+    var rpos: usize = 0;
+    var response_header = try ResponseHeader.deserialize(testing.allocator, response.?, &rpos, header_mod.responseHeaderVersion(31, 2));
+    defer response_header.deinit(testing.allocator);
+    try testing.expectEqual(@as(i32, 3107), response_header.correlation_id);
+
+    const resp = try Resp.deserialize(testing.allocator, response.?, &rpos, 2);
+    defer {
+        for (resp.filter_results) |result| {
+            if (result.matching_acls.len > 0) testing.allocator.free(result.matching_acls);
+        }
+        if (resp.filter_results.len > 0) testing.allocator.free(resp.filter_results);
+    }
+
+    try testing.expectEqual(response.?.len, rpos);
+    try testing.expectEqual(@as(usize, 1), resp.filter_results.len);
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.kafka_storage_error)), resp.filter_results[0].error_code);
+    try testing.expectEqual(@as(usize, 1), resp.filter_results[0].matching_acls.len);
+    try testing.expectEqual(@as(usize, 1), broker.authorizer.aclCount());
+    try testing.expectEqual(Authorizer.AuthResult.allowed, broker.authorizer.authorize("User:delete-local", .topic, "acl-delete-local-fail", .read));
 }
 
 test "Broker restores ACLs from S3 cluster metadata log" {
