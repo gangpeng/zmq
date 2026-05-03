@@ -1314,9 +1314,18 @@ pub const Broker = struct {
     }
 
     fn persistTopicsLocal(self: *Broker) void {
-        self.persistence.saveTopics(&self.topics) catch |err| {
+        self.persistTopicsLocalDurably() catch |err| {
             log.warn("Failed to persist topics: {}", .{err});
         };
+    }
+
+    fn persistTopicsLocalDurably(self: *Broker) !void {
+        try self.persistence.saveTopics(&self.topics);
+    }
+
+    fn persistTopicAndObjectLocalMetadataDurably(self: *Broker) !void {
+        try self.persistTopicsLocalDurably();
+        try self.persistObjectManagerSnapshotDurably();
     }
 
     /// Persist ACLs to disk.
@@ -10977,8 +10986,31 @@ pub const Broker = struct {
                 };
                 return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
             };
-            self.persistTopicsLocal();
-            self.persistObjectManagerSnapshot();
+            self.persistTopicAndObjectLocalMetadataDurably() catch |err| {
+                log.warn("Failed to persist CreateTopics local metadata: {}", .{err});
+                self.restoreTopicsAfterFailedMutation(previous_snapshot.?);
+                for (req.topics, topics[0..topics_init], created_topics) |topic_req, *response, was_created| {
+                    if (was_created and response.error_code == @intFromEnum(ErrorCode.none)) {
+                        const topic_name = topic_req.name orelse "";
+                        const actual_partitions = self.createTopicsPartitionCount(&topic_req);
+                        self.removeTopicPartitionRange(topic_name, 0, actual_partitions);
+                        response.error_code = @intFromEnum(ErrorCode.kafka_storage_error);
+                        response.error_message = "Failed to persist topic metadata";
+                        response.topic_id = zeroUuid();
+                    }
+                }
+                self.writeTopicSnapshotRecord() catch |rollback_err| {
+                    log.warn("Failed to append CreateTopics rollback topic snapshot to __cluster_metadata: {}", .{rollback_err});
+                };
+                self.persistTopicsLocalDurably() catch |rollback_err| {
+                    log.warn("Failed to persist restored CreateTopics local topic metadata: {}", .{rollback_err});
+                };
+                const resp = Resp{
+                    .throttle_time_ms = 0,
+                    .topics = topics[0..topics_init],
+                };
+                return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+            };
         }
 
         const resp = Resp{
@@ -47012,6 +47044,126 @@ test "Broker.handleRequest CreateTopics rolls back when internal metadata checkp
     try testing.expect(!broker.topics.contains("ct-internal-checkpoint-fail-topic"));
     try testing.expect(!broker.store.partitions.contains("ct-internal-checkpoint-fail-topic-0"));
     try testing.expect(!broker.store.partitions.contains("ct-internal-checkpoint-fail-topic-1"));
+}
+
+test "Broker.handleRequest CreateTopics rolls back when local topics persistence fails" {
+    const fs = @import("fs_compat");
+    const Req = generated.create_topics_request.CreateTopicsRequest;
+    const Resp = generated.create_topics_response.CreateTopicsResponse;
+
+    const tmp_dir = "/tmp/zmq-create-topics-local-topics-fail-test";
+    fs.deleteTreeAbsolute(tmp_dir) catch {};
+    try fs.makeDirAbsolute(tmp_dir);
+    defer fs.deleteTreeAbsolute(tmp_dir) catch {};
+
+    var broker = Broker.initWithConfig(testing.allocator, 1, 9092, .{ .data_dir = tmp_dir });
+    defer broker.deinit();
+    try broker.open();
+
+    const topics_path = try std.fmt.allocPrint(testing.allocator, "{s}/topics.meta", .{tmp_dir});
+    defer testing.allocator.free(topics_path);
+    fs.deleteFileAbsolute(topics_path) catch {};
+    try fs.makeDirAbsolute(topics_path);
+
+    const topics = [_]Req.CreatableTopic{.{
+        .name = "ct-local-topics-fail-topic",
+        .num_partitions = 2,
+        .replication_factor = 1,
+    }};
+    const req = Req{
+        .topics = &topics,
+        .timeout_ms = 30000,
+        .validate_only = false,
+    };
+
+    var buf: [512]u8 = undefined;
+    var pos = buildTestRequest(&buf, 19, 7, 1930, header_mod.requestHeaderVersion(19, 7));
+    req.serialize(&buf, &pos, 7);
+
+    const response = broker.handleRequest(buf[0..pos]);
+    try testing.expect(response != null);
+    defer testing.allocator.free(response.?);
+
+    var rpos: usize = 0;
+    var response_header = try ResponseHeader.deserialize(testing.allocator, response.?, &rpos, header_mod.responseHeaderVersion(19, 7));
+    defer response_header.deinit(testing.allocator);
+    try testing.expectEqual(@as(i32, 1930), response_header.correlation_id);
+
+    const resp = try Resp.deserialize(testing.allocator, response.?, &rpos, 7);
+    defer {
+        for (resp.topics) |topic| {
+            if (topic.configs) |response_configs| {
+                if (response_configs.len > 0) testing.allocator.free(response_configs);
+            }
+        }
+        if (resp.topics.len > 0) testing.allocator.free(resp.topics);
+    }
+
+    try testing.expectEqual(response.?.len, rpos);
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.kafka_storage_error)), resp.topics[0].error_code);
+    try testing.expect(!broker.topics.contains("ct-local-topics-fail-topic"));
+    try testing.expect(!broker.store.partitions.contains("ct-local-topics-fail-topic-0"));
+    try testing.expect(!broker.store.partitions.contains("ct-local-topics-fail-topic-1"));
+}
+
+test "Broker.handleRequest CreateTopics rolls back when local object snapshot fails" {
+    const fs = @import("fs_compat");
+    const Req = generated.create_topics_request.CreateTopicsRequest;
+    const Resp = generated.create_topics_response.CreateTopicsResponse;
+
+    const tmp_dir = "/tmp/zmq-create-topics-local-object-fail-test";
+    fs.deleteTreeAbsolute(tmp_dir) catch {};
+    try fs.makeDirAbsolute(tmp_dir);
+    defer fs.deleteTreeAbsolute(tmp_dir) catch {};
+
+    var broker = Broker.initWithConfig(testing.allocator, 1, 9092, .{ .data_dir = tmp_dir });
+    defer broker.deinit();
+    try broker.open();
+
+    const object_snapshot_path = try std.fmt.allocPrint(testing.allocator, "{s}/objects.snapshot", .{tmp_dir});
+    defer testing.allocator.free(object_snapshot_path);
+    fs.deleteFileAbsolute(object_snapshot_path) catch {};
+    try fs.makeDirAbsolute(object_snapshot_path);
+
+    const topics = [_]Req.CreatableTopic{.{
+        .name = "ct-local-object-fail-topic",
+        .num_partitions = 2,
+        .replication_factor = 1,
+    }};
+    const req = Req{
+        .topics = &topics,
+        .timeout_ms = 30000,
+        .validate_only = false,
+    };
+
+    var buf: [512]u8 = undefined;
+    var pos = buildTestRequest(&buf, 19, 7, 1931, header_mod.requestHeaderVersion(19, 7));
+    req.serialize(&buf, &pos, 7);
+
+    const response = broker.handleRequest(buf[0..pos]);
+    try testing.expect(response != null);
+    defer testing.allocator.free(response.?);
+
+    var rpos: usize = 0;
+    var response_header = try ResponseHeader.deserialize(testing.allocator, response.?, &rpos, header_mod.responseHeaderVersion(19, 7));
+    defer response_header.deinit(testing.allocator);
+    try testing.expectEqual(@as(i32, 1931), response_header.correlation_id);
+
+    const resp = try Resp.deserialize(testing.allocator, response.?, &rpos, 7);
+    defer {
+        for (resp.topics) |topic| {
+            if (topic.configs) |response_configs| {
+                if (response_configs.len > 0) testing.allocator.free(response_configs);
+            }
+        }
+        if (resp.topics.len > 0) testing.allocator.free(resp.topics);
+    }
+
+    try testing.expectEqual(response.?.len, rpos);
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.kafka_storage_error)), resp.topics[0].error_code);
+    try testing.expect(!broker.topics.contains("ct-local-object-fail-topic"));
+    try testing.expect(!broker.store.partitions.contains("ct-local-object-fail-topic-0"));
+    try testing.expect(!broker.store.partitions.contains("ct-local-object-fail-topic-1"));
 }
 
 test "Broker.handleRequest CreateTopics rejects truncated request" {
