@@ -280,6 +280,8 @@ Status: completed for the initial catalog and DeleteGroups slice.
   validate-only flag, and tagged-fields section.
   CreateTopics now rejects trailing bytes after topic assignments/configs,
   timeout, validate-only flag, and tagged-fields section.
+  DeleteTopics now rejects trailing bytes after topic names/IDs, timeout,
+  and tagged-fields section.
   MetadataRequest generated decoding now preserves nullable `Topics` semantics:
   v1+ null requests all topics, explicit empty arrays request no topic results,
   and v0 null topics are rejected as malformed.

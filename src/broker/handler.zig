@@ -19348,7 +19348,7 @@ pub const Broker = struct {
 
         if (!skipFixedBytes(buf, &pos, 4)) return false; // timeout_ms
         if (flexible) ser.skipTaggedFields(buf, &pos) catch return false;
-        return true;
+        return pos == buf.len;
     }
 
     fn validateDeleteRecordsRequestFrame(buf: []const u8, start_pos: usize, api_version: i16) bool {
@@ -38652,6 +38652,31 @@ test "Broker.handleRequest DeleteTopics rejects truncated request" {
     var buf: [128]u8 = undefined;
     const req_len = buildTestRequest(&buf, 20, 6, 2007, header_mod.requestHeaderVersion(20, 6));
     try testing.expect(broker.handleRequest(buf[0..req_len]) == null);
+}
+
+test "Broker.handleRequest DeleteTopics rejects trailing bytes" {
+    const Req = generated.delete_topics_request.DeleteTopicsRequest;
+    const Topic = Req.DeleteTopicState;
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+
+    try testing.expect(broker.ensureTopic("dt-trailing-topic"));
+    const topic_id = broker.topics.get("dt-trailing-topic").?.topic_id;
+    const topics = [_]Topic{.{
+        .name = "dt-trailing-topic",
+        .topic_id = topic_id,
+    }};
+    const req = Req{
+        .topics = &topics,
+        .timeout_ms = 30000,
+    };
+
+    var buf: [512]u8 = undefined;
+    var pos = buildTestRequest(&buf, 20, 6, 2009, header_mod.requestHeaderVersion(20, 6));
+    req.serialize(&buf, &pos, 6);
+
+    try expectTrailingByteRejected(&broker, &buf, pos);
 }
 
 test "Broker.handleRequest DeleteRecords v2 returns generated response and trims partition" {
