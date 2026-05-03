@@ -10970,7 +10970,7 @@ pub const Broker = struct {
     }
 
     // ---------------------------------------------------------------
-    // ShareGroupHeartbeat (key 76) — non-advertised until share groups exist
+    // ShareGroupHeartbeat (key 76) — non-advertised until durable share-group coordinator semantics exist
     // ---------------------------------------------------------------
     fn handleShareGroupHeartbeat(self: *Broker, request_bytes: []const u8, body_start: usize, req_header: *const RequestHeader, api_version: i16, resp_header_version: i16) ?[]u8 {
         const Req = generated.share_group_heartbeat_request.ShareGroupHeartbeatRequest;
@@ -11006,16 +11006,223 @@ pub const Broker = struct {
         };
         defer self.freeShareGroupHeartbeatRequest(&req);
 
-        const resp = Resp{
+        const subscriptions = self.consumerGroupHeartbeatSubscriptions(req.subscribed_topic_names) catch {
+            const resp = shareGroupHeartbeatResponse(ErrorCode.invalid_request.toInt(), "invalid ShareGroupHeartbeat subscription", req.member_id, req.member_epoch, 0);
+            return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+        };
+        defer if (subscriptions) |topics| {
+            if (topics.len > 0) self.allocator.free(topics);
+        };
+
+        const group_id = req.group_id orelse "";
+        const member_id = req.member_id orelse "";
+
+        if (req.member_epoch == 0) {
+            const previous_snapshot = self.encodeConsumerGroupSnapshotRecordValue() catch return null;
+            defer self.allocator.free(previous_snapshot);
+
+            const result = self.groups.joinGroupWithProtocol(group_id, nonEmptyStringOrNull(req.member_id), null, "share", "range", null, subscriptions) catch return null;
+            var response_member_epoch = result.generation_id;
+            if (result.error_code == @intFromEnum(ErrorCode.none)) {
+                if (req.rack_id) |rack| {
+                    _ = self.groups.updateMemberRackIfChanged(group_id, result.member_id, rack) catch |err| {
+                        log.warn("ShareGroupHeartbeat rack update failed for {s}: {}", .{ group_id, err });
+                        self.restoreConsumerGroupsAfterFailedMutation(previous_snapshot);
+                        const resp = shareGroupHeartbeatResponse(ErrorCode.kafka_storage_error.toInt(), null, req.member_id, req.member_epoch, 0);
+                        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+                    };
+                }
+                _ = self.markShareGroupStable(group_id);
+                if (self.groups.groups.getPtr(group_id)) |group| {
+                    response_member_epoch = group.generation_id;
+                }
+                self.persistConsumerGroupsDurably() catch |err| {
+                    log.warn("ShareGroupHeartbeat join snapshot write failed for {s}: {}", .{ group_id, err });
+                    self.restoreConsumerGroupsAfterFailedMutation(previous_snapshot);
+                    const resp = shareGroupHeartbeatResponse(ErrorCode.kafka_storage_error.toInt(), null, req.member_id, req.member_epoch, 0);
+                    return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+                };
+            }
+
+            var assignment = if (result.error_code == @intFromEnum(ErrorCode.none))
+                self.buildShareGroupHeartbeatAssignment(group_id, result.member_id) catch |err| blk: {
+                    log.warn("Failed to build ShareGroupHeartbeat assignment for {s}: {}", .{ group_id, err });
+                    break :blk null;
+                }
+            else
+                null;
+            defer if (assignment) |*owned| self.freeShareGroupHeartbeatAssignment(owned);
+
+            var resp = shareGroupHeartbeatResponse(
+                result.error_code,
+                null,
+                if (result.error_code == @intFromEnum(ErrorCode.none)) result.member_id else req.member_id,
+                response_member_epoch,
+                if (result.error_code == @intFromEnum(ErrorCode.none)) share_group_heartbeat_interval_ms else 0,
+            );
+            resp.assignment = assignment;
+            return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+        }
+
+        if (req.member_epoch == -1) {
+            const previous_snapshot = self.encodeConsumerGroupSnapshotRecordValue() catch return null;
+            defer self.allocator.free(previous_snapshot);
+
+            const protocol_error = self.validateShareGroupProtocol(group_id);
+            const error_code = if (protocol_error == ErrorCode.none)
+                self.groups.leaveGroup(group_id, member_id)
+            else
+                protocol_error.toInt();
+            if (error_code == @intFromEnum(ErrorCode.none)) {
+                self.persistConsumerGroupsDurably() catch |err| {
+                    log.warn("ShareGroupHeartbeat leave snapshot write failed for {s}: {}", .{ group_id, err });
+                    self.restoreConsumerGroupsAfterFailedMutation(previous_snapshot);
+                    const resp = shareGroupHeartbeatResponse(ErrorCode.kafka_storage_error.toInt(), null, req.member_id, req.member_epoch, 0);
+                    return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+                };
+            }
+
+            const resp = shareGroupHeartbeatResponse(error_code, null, req.member_id, -1, 0);
+            return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+        }
+
+        if (req.member_epoch < -1) {
+            const resp = shareGroupHeartbeatResponse(ErrorCode.invalid_request.toInt(), "invalid member epoch", req.member_id, req.member_epoch, 0);
+            return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+        }
+
+        const protocol_error = self.validateShareGroupProtocol(group_id);
+        const error_code = if (protocol_error == ErrorCode.none)
+            self.groups.consumerGroupHeartbeat(group_id, member_id, null, req.member_epoch)
+        else
+            protocol_error.toInt();
+        var response_member_epoch = req.member_epoch;
+        if (error_code == @intFromEnum(ErrorCode.none) and (subscriptions != null or req.rack_id != null)) {
+            const previous_snapshot = self.encodeConsumerGroupSnapshotRecordValue() catch return null;
+            defer self.allocator.free(previous_snapshot);
+
+            var changed = false;
+            if (req.rack_id) |rack| {
+                changed = (self.groups.updateMemberRackIfChanged(group_id, member_id, rack) catch |err| {
+                    log.warn("ShareGroupHeartbeat rack update failed for {s}: {}", .{ group_id, err });
+                    self.restoreConsumerGroupsAfterFailedMutation(previous_snapshot);
+                    const resp = shareGroupHeartbeatResponse(ErrorCode.kafka_storage_error.toInt(), null, req.member_id, req.member_epoch, 0);
+                    return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+                }) or changed;
+            }
+            if (subscriptions) |topics| {
+                changed = (self.groups.replaceMemberSubscriptionsIfChanged(group_id, member_id, topics) catch |err| {
+                    log.warn("ShareGroupHeartbeat subscription update failed for {s}: {}", .{ group_id, err });
+                    self.restoreConsumerGroupsAfterFailedMutation(previous_snapshot);
+                    const resp = shareGroupHeartbeatResponse(ErrorCode.kafka_storage_error.toInt(), null, req.member_id, req.member_epoch, 0);
+                    return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+                }) or changed;
+            }
+            changed = self.markShareGroupStable(group_id) or changed;
+            if (changed) {
+                if (self.groups.groups.getPtr(group_id)) |group| {
+                    response_member_epoch = group.generation_id;
+                }
+                self.persistConsumerGroupsDurably() catch |err| {
+                    log.warn("ShareGroupHeartbeat member metadata snapshot write failed for {s}: {}", .{ group_id, err });
+                    self.restoreConsumerGroupsAfterFailedMutation(previous_snapshot);
+                    const resp = shareGroupHeartbeatResponse(ErrorCode.kafka_storage_error.toInt(), null, req.member_id, req.member_epoch, 0);
+                    return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+                };
+            }
+        }
+
+        var assignment = if (error_code == @intFromEnum(ErrorCode.none))
+            self.buildShareGroupHeartbeatAssignment(group_id, member_id) catch |err| blk: {
+                log.warn("Failed to build ShareGroupHeartbeat assignment for {s}: {}", .{ group_id, err });
+                break :blk null;
+            }
+        else
+            null;
+        defer if (assignment) |*owned| self.freeShareGroupHeartbeatAssignment(owned);
+
+        var resp = shareGroupHeartbeatResponse(
+            error_code,
+            null,
+            req.member_id,
+            response_member_epoch,
+            if (error_code == @intFromEnum(ErrorCode.none)) share_group_heartbeat_interval_ms else 0,
+        );
+        resp.assignment = assignment;
+        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+    }
+
+    const share_group_heartbeat_interval_ms: i32 = 3000;
+
+    fn shareGroupHeartbeatResponse(error_code: i16, error_message: ?[]const u8, member_id: ?[]const u8, member_epoch: i32, heartbeat_interval_ms: i32) generated.share_group_heartbeat_response.ShareGroupHeartbeatResponse {
+        return .{
             .throttle_time_ms = 0,
-            .error_code = ErrorCode.unsupported_version.toInt(),
-            .error_message = "ShareGroupHeartbeat is not implemented",
-            .member_id = req.member_id,
-            .member_epoch = req.member_epoch,
-            .heartbeat_interval_ms = 0,
+            .error_code = error_code,
+            .error_message = error_message,
+            .member_id = member_id,
+            .member_epoch = member_epoch,
+            .heartbeat_interval_ms = heartbeat_interval_ms,
             .assignment = null,
         };
-        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+    }
+
+    fn validateShareGroupProtocol(self: *const Broker, group_id: []const u8) ErrorCode {
+        const group = self.groups.groups.getPtr(group_id) orelse return ErrorCode.none;
+        if (group.protocol_type) |protocol_type| {
+            if (!std.mem.eql(u8, protocol_type, "share")) return ErrorCode.inconsistent_group_protocol;
+        }
+        if (group.protocol_name) |protocol_name| {
+            if (!std.mem.eql(u8, protocol_name, "range")) return ErrorCode.inconsistent_group_protocol;
+        }
+        return ErrorCode.none;
+    }
+
+    fn markShareGroupStable(self: *Broker, group_id: []const u8) bool {
+        const group = self.groups.groups.getPtr(group_id) orelse return false;
+        if (group.state == .stable) return false;
+        group.state = .stable;
+        return true;
+    }
+
+    fn buildShareGroupHeartbeatAssignment(
+        self: *Broker,
+        group_id: []const u8,
+        member_id: []const u8,
+    ) !?generated.share_group_heartbeat_response.ShareGroupHeartbeatResponse.Assignment {
+        const Resp = generated.share_group_heartbeat_response.ShareGroupHeartbeatResponse;
+        const TopicPartitions = generated.share_group_heartbeat_response.TopicPartitions;
+        const group = self.groups.groups.getPtr(group_id) orelse return null;
+        const member = group.members.getPtr(member_id) orelse return null;
+
+        var topic_partitions = std.array_list.Managed(TopicPartitions).init(self.allocator);
+        errdefer {
+            for (topic_partitions.items) |entry| {
+                if (entry.partitions.len > 0) self.allocator.free(entry.partitions);
+            }
+            topic_partitions.deinit();
+        }
+
+        for (member.subscribed_topics.items) |topic_name| {
+            const assigned = (try self.buildRangeAssignedTopic(group, topic_name, member_id)) orelse continue;
+            errdefer self.allocator.free(assigned.partitions);
+            try topic_partitions.append(.{
+                .topic_id = assigned.topic_id,
+                .partitions = assigned.partitions,
+            });
+        }
+
+        if (topic_partitions.items.len == 0) return Resp.Assignment{ .topic_partitions = &.{} };
+        return Resp.Assignment{ .topic_partitions = try topic_partitions.toOwnedSlice() };
+    }
+
+    fn freeShareGroupHeartbeatAssignment(
+        self: *Broker,
+        assignment: *generated.share_group_heartbeat_response.ShareGroupHeartbeatResponse.Assignment,
+    ) void {
+        for (assignment.topic_partitions) |entry| {
+            if (entry.partitions.len > 0) self.allocator.free(entry.partitions);
+        }
+        if (assignment.topic_partitions.len > 0) self.allocator.free(assignment.topic_partitions);
     }
 
     fn freeShareGroupHeartbeatRequest(self: *Broker, req: *generated.share_group_heartbeat_request.ShareGroupHeartbeatRequest) void {
@@ -11025,7 +11232,7 @@ pub const Broker = struct {
     }
 
     // ---------------------------------------------------------------
-    // ShareGroupDescribe (key 77) — non-advertised until share groups exist
+    // ShareGroupDescribe (key 77) — non-advertised until durable share-group coordinator semantics exist
     // ---------------------------------------------------------------
     fn handleShareGroupDescribe(self: *Broker, request_bytes: []const u8, body_start: usize, req_header: *const RequestHeader, api_version: i16, resp_header_version: i16) ?[]u8 {
         const Req = generated.share_group_describe_request.ShareGroupDescribeRequest;
@@ -11053,16 +11260,10 @@ pub const Broker = struct {
         };
         defer self.freeShareGroupDescribeRequest(&req);
 
-        const groups = self.allocator.alloc(Resp.DescribedGroup, req.group_ids.len) catch return null;
-        defer self.allocator.free(groups);
-
-        for (req.group_ids, 0..) |group_id, idx| {
-            groups[idx] = shareGroupDescribeError(
-                group_id,
-                ErrorCode.unsupported_version,
-                "ShareGroupDescribe is not implemented",
-                req.include_authorized_operations,
-            );
+        const groups = self.collectShareGroupDescriptions(req) catch return null;
+        defer {
+            self.freeShareGroupDescriptions(groups);
+            if (groups.len > 0) self.allocator.free(groups);
         }
 
         const resp = Resp{
@@ -11076,7 +11277,143 @@ pub const Broker = struct {
         if (req.group_ids.len > 0) self.allocator.free(req.group_ids);
     }
 
-    fn shareGroupDescribeError(group_id: ?[]const u8, error_code: ErrorCode, error_message: []const u8, include_authorized_operations: bool) generated.share_group_describe_response.ShareGroupDescribeResponse.DescribedGroup {
+    fn collectShareGroupDescriptions(self: *Broker, req: generated.share_group_describe_request.ShareGroupDescribeRequest) ![]generated.share_group_describe_response.ShareGroupDescribeResponse.DescribedGroup {
+        const DescribedGroup = generated.share_group_describe_response.ShareGroupDescribeResponse.DescribedGroup;
+
+        if (req.group_ids.len == 0) return &.{};
+
+        const groups = try self.allocator.alloc(DescribedGroup, req.group_ids.len);
+        var groups_init: usize = 0;
+        errdefer {
+            self.freeShareGroupDescriptions(groups[0..groups_init]);
+            self.allocator.free(groups);
+        }
+
+        for (req.group_ids) |requested_group| {
+            const group_id = requested_group orelse "";
+            groups[groups_init] = try self.describeShareGroup(group_id, req.include_authorized_operations);
+            groups_init += 1;
+        }
+        return groups;
+    }
+
+    fn describeShareGroup(self: *Broker, group_id: []const u8, include_authorized_operations: bool) !generated.share_group_describe_response.ShareGroupDescribeResponse.DescribedGroup {
+        if (group_id.len == 0) {
+            return shareGroupDescribeError(group_id, ErrorCode.invalid_group_id, "invalid share group id", include_authorized_operations);
+        }
+
+        if (self.groups.groups.getPtr(group_id)) |group| {
+            if (self.isShareGroup(group)) {
+                return self.describeExistingShareGroup(group, include_authorized_operations);
+            }
+        }
+
+        return shareGroupDescribeError(group_id, ErrorCode.group_id_not_found, null, include_authorized_operations);
+    }
+
+    fn isShareGroup(_: *const Broker, group: *const ConsumerGroup) bool {
+        const protocol_type = group.protocol_type orelse return false;
+        return std.mem.eql(u8, protocol_type, "share");
+    }
+
+    fn describeExistingShareGroup(self: *Broker, group: *const ConsumerGroup, include_authorized_operations: bool) !generated.share_group_describe_response.ShareGroupDescribeResponse.DescribedGroup {
+        const Member = generated.share_group_describe_response.ShareGroupDescribeResponse.DescribedGroup.Member;
+
+        var members: []Member = &.{};
+        if (group.memberCount() > 0) {
+            members = try self.allocator.alloc(Member, group.memberCount());
+            var members_init: usize = 0;
+            errdefer {
+                self.freeShareGroupDescribeMembers(members[0..members_init]);
+                self.allocator.free(members);
+            }
+
+            var mit = group.members.iterator();
+            while (mit.next()) |mentry| {
+                const member = mentry.value_ptr;
+                const subscribed_topics = try self.copySubscribedTopicNames(member.subscribed_topics.items);
+                errdefer if (subscribed_topics.len > 0) self.allocator.free(subscribed_topics);
+                var assignment = try self.buildShareGroupDescribeAssignment(group, member.member_id, member.subscribed_topics.items);
+                errdefer self.freeShareGroupDescribeAssignment(&assignment);
+                members[members_init] = .{
+                    .member_id = member.member_id,
+                    .rack_id = member.rack_id,
+                    .member_epoch = group.generation_id,
+                    .client_id = "zmq-client",
+                    .client_host = "/127.0.0.1",
+                    .subscribed_topic_names = subscribed_topics,
+                    .assignment = assignment,
+                };
+                members_init += 1;
+            }
+        }
+
+        return .{
+            .error_code = @intFromEnum(ErrorCode.none),
+            .error_message = null,
+            .group_id = group.group_id,
+            .group_state = consumerGroupStateName(group.state),
+            .group_epoch = group.generation_id,
+            .assignment_epoch = group.generation_id,
+            .assignor_name = group.protocol_name orelse "range",
+            .members = members,
+            .authorized_operations = describeGroupsAuthorizedOps(include_authorized_operations),
+        };
+    }
+
+    fn buildShareGroupDescribeAssignment(
+        self: *Broker,
+        group: *const ConsumerGroup,
+        member_id: []const u8,
+        subscribed_topics: []const []u8,
+    ) !generated.share_group_describe_response.Assignment {
+        const Assignment = generated.share_group_describe_response.Assignment;
+        const TopicPartitions = generated.share_group_describe_response.TopicPartitions;
+
+        var topic_partitions = std.array_list.Managed(TopicPartitions).init(self.allocator);
+        errdefer {
+            for (topic_partitions.items) |entry| {
+                if (entry.partitions.len > 0) self.allocator.free(entry.partitions);
+            }
+            topic_partitions.deinit();
+        }
+
+        for (subscribed_topics) |topic_name| {
+            const assigned = (try self.buildRangeAssignedTopic(group, topic_name, member_id)) orelse continue;
+            errdefer self.allocator.free(assigned.partitions);
+            try topic_partitions.append(.{
+                .topic_id = assigned.topic_id,
+                .topic_name = assigned.topic_name,
+                .partitions = assigned.partitions,
+            });
+        }
+
+        if (topic_partitions.items.len == 0) return Assignment{ .topic_partitions = &.{} };
+        return Assignment{ .topic_partitions = try topic_partitions.toOwnedSlice() };
+    }
+
+    fn freeShareGroupDescriptions(self: *Broker, groups: []const generated.share_group_describe_response.ShareGroupDescribeResponse.DescribedGroup) void {
+        for (groups) |group| {
+            self.freeShareGroupDescribeMembers(group.members);
+            if (group.members.len > 0) self.allocator.free(group.members);
+        }
+    }
+
+    fn freeShareGroupDescribeMembers(self: *Broker, members: []const generated.share_group_describe_response.ShareGroupDescribeResponse.DescribedGroup.Member) void {
+        for (members) |member| {
+            if (member.subscribed_topic_names.len > 0) self.allocator.free(member.subscribed_topic_names);
+            self.freeShareGroupDescribeAssignment(&member.assignment);
+        }
+    }
+
+    fn freeShareGroupDescribeAssignment(self: *Broker, assignment: *const generated.share_group_describe_response.Assignment) void {
+        for (assignment.topic_partitions) |topic| {
+            if (topic.partitions.len > 0) self.allocator.free(topic.partitions);
+        }
+        if (assignment.topic_partitions.len > 0) self.allocator.free(assignment.topic_partitions);
+    }
+
+    fn shareGroupDescribeError(group_id: ?[]const u8, error_code: ErrorCode, error_message: ?[]const u8, include_authorized_operations: bool) generated.share_group_describe_response.ShareGroupDescribeResponse.DescribedGroup {
         return .{
             .error_code = error_code.toInt(),
             .error_message = error_message,
@@ -21447,6 +21784,29 @@ fn freeDeserializedConsumerGroupHeartbeatResponse(resp: *const generated.consume
         }
         if (assignment.topic_partitions.len > 0) testing.allocator.free(assignment.topic_partitions);
     }
+}
+
+fn freeDeserializedShareGroupHeartbeatResponse(resp: *const generated.share_group_heartbeat_response.ShareGroupHeartbeatResponse) void {
+    if (resp.assignment) |assignment| {
+        for (assignment.topic_partitions) |topic| {
+            if (topic.partitions.len > 0) testing.allocator.free(topic.partitions);
+        }
+        if (assignment.topic_partitions.len > 0) testing.allocator.free(assignment.topic_partitions);
+    }
+}
+
+fn freeDeserializedShareGroupDescribeResponse(resp: *const generated.share_group_describe_response.ShareGroupDescribeResponse) void {
+    for (resp.groups) |group| {
+        for (group.members) |member| {
+            if (member.subscribed_topic_names.len > 0) testing.allocator.free(member.subscribed_topic_names);
+            for (member.assignment.topic_partitions) |topic| {
+                if (topic.partitions.len > 0) testing.allocator.free(topic.partitions);
+            }
+            if (member.assignment.topic_partitions.len > 0) testing.allocator.free(member.assignment.topic_partitions);
+        }
+        if (group.members.len > 0) testing.allocator.free(group.members);
+    }
+    if (resp.groups.len > 0) testing.allocator.free(resp.groups);
 }
 
 fn freeDeserializedDescribeTopicPartitionsResponse(resp: *const generated.describe_topic_partitions_response.DescribeTopicPartitionsResponse) void {
@@ -39493,12 +39853,14 @@ test "Broker.handleRequest ConsumerGroupHeartbeat stores rack metadata for descr
     try testing.expectEqualStrings("rack-b", describe_resp.groups[0].members[0].rack_id.?);
 }
 
-test "Broker.handleRequest ShareGroupHeartbeat returns generated fail-closed response" {
+test "Broker.handleRequest ShareGroupHeartbeat joins heartbeats updates and leaves local share group" {
     const Req = generated.share_group_heartbeat_request.ShareGroupHeartbeatRequest;
     const Resp = generated.share_group_heartbeat_response.ShareGroupHeartbeatResponse;
 
     var broker = Broker.init(testing.allocator, 1, 9092);
     defer broker.deinit();
+    broker.default_num_partitions = 2;
+    try testing.expect(broker.ensureTopic("share-topic"));
 
     const topic_names = [_]?[]const u8{"share-topic"};
     const req = Req{
@@ -39523,19 +39885,32 @@ test "Broker.handleRequest ShareGroupHeartbeat returns generated fail-closed res
     try testing.expectEqual(@as(i32, 7600), response_header.correlation_id);
 
     const resp = try Resp.deserialize(testing.allocator, response.?, &rpos, 0);
+    defer freeDeserializedShareGroupHeartbeatResponse(&resp);
     try testing.expectEqual(response.?.len, rpos);
     try testing.expectEqual(@as(i32, 0), resp.throttle_time_ms);
-    try testing.expectEqual(ErrorCode.unsupported_version.toInt(), resp.error_code);
-    try testing.expectEqualStrings("ShareGroupHeartbeat is not implemented", resp.error_message.?);
+    try testing.expectEqual(ErrorCode.none.toInt(), resp.error_code);
+    try testing.expect(resp.error_message == null);
     try testing.expectEqualStrings("share-member", resp.member_id.?);
-    try testing.expectEqual(@as(i32, 0), resp.member_epoch);
-    try testing.expect(resp.assignment == null);
+    try testing.expectEqual(@as(i32, 1), resp.member_epoch);
+    try testing.expectEqual(@as(i32, 3000), resp.heartbeat_interval_ms);
+    const assignment = resp.assignment orelse return error.ExpectedShareGroupHeartbeatAssignment;
+    try testing.expectEqual(@as(usize, 1), assignment.topic_partitions.len);
+    try testing.expectEqualSlices(u8, &broker.topics.get("share-topic").?.topic_id, &assignment.topic_partitions[0].topic_id);
+    try testing.expectEqualSlices(i32, &[_]i32{ 0, 1 }, assignment.topic_partitions[0].partitions);
+
+    const group = broker.groups.groups.getPtr("share-group").?;
+    try testing.expectEqual(ConsumerGroup.GroupState.stable, group.state);
+    try testing.expectEqualStrings("share", group.protocol_type.?);
+    try testing.expectEqualStrings("range", group.protocol_name.?);
+    const member = group.members.getPtr("share-member").?;
+    try testing.expectEqualStrings("rack-a", member.rack_id.?);
+    try testing.expectEqual(@as(usize, 1), member.subscribed_topics.items.len);
+    try testing.expectEqualStrings("share-topic", member.subscribed_topics.items[0]);
 
     const null_req = Req{
         .group_id = "share-group",
-        .member_id = "share-null-member",
+        .member_id = resp.member_id,
         .member_epoch = 1,
-        .rack_id = "rack-a",
         .subscribed_topic_names = null,
     };
 
@@ -39553,18 +39928,19 @@ test "Broker.handleRequest ShareGroupHeartbeat returns generated fail-closed res
     try testing.expectEqual(@as(i32, 7602), null_response_header.correlation_id);
 
     const null_resp = try Resp.deserialize(testing.allocator, null_response.?, &null_rpos, 0);
+    defer freeDeserializedShareGroupHeartbeatResponse(&null_resp);
     try testing.expectEqual(null_response.?.len, null_rpos);
-    try testing.expectEqual(ErrorCode.unsupported_version.toInt(), null_resp.error_code);
-    try testing.expectEqualStrings("share-null-member", null_resp.member_id.?);
+    try testing.expectEqual(ErrorCode.none.toInt(), null_resp.error_code);
+    try testing.expectEqualStrings("share-member", null_resp.member_id.?);
     try testing.expectEqual(@as(i32, 1), null_resp.member_epoch);
-    try testing.expect(null_resp.assignment == null);
+    try testing.expect(null_resp.assignment != null);
 
     const empty_topic_names = [_]?[]const u8{};
     const empty_req = Req{
         .group_id = "share-group",
-        .member_id = "share-empty-member",
-        .member_epoch = 2,
-        .rack_id = "rack-a",
+        .member_id = resp.member_id,
+        .member_epoch = 1,
+        .rack_id = "rack-b",
         .subscribed_topic_names = &empty_topic_names,
     };
 
@@ -39582,11 +39958,67 @@ test "Broker.handleRequest ShareGroupHeartbeat returns generated fail-closed res
     try testing.expectEqual(@as(i32, 7603), empty_response_header.correlation_id);
 
     const empty_resp = try Resp.deserialize(testing.allocator, empty_response.?, &empty_rpos, 0);
+    defer freeDeserializedShareGroupHeartbeatResponse(&empty_resp);
     try testing.expectEqual(empty_response.?.len, empty_rpos);
-    try testing.expectEqual(ErrorCode.unsupported_version.toInt(), empty_resp.error_code);
-    try testing.expectEqualStrings("share-empty-member", empty_resp.member_id.?);
+    try testing.expectEqual(ErrorCode.none.toInt(), empty_resp.error_code);
+    try testing.expectEqualStrings("share-member", empty_resp.member_id.?);
     try testing.expectEqual(@as(i32, 2), empty_resp.member_epoch);
-    try testing.expect(empty_resp.assignment == null);
+    const empty_assignment = empty_resp.assignment orelse return error.ExpectedShareGroupHeartbeatAssignment;
+    try testing.expectEqual(@as(usize, 0), empty_assignment.topic_partitions.len);
+    try testing.expectEqualStrings("rack-b", member.rack_id.?);
+    try testing.expectEqual(@as(usize, 0), member.subscribed_topics.items.len);
+
+    const stale_req = Req{
+        .group_id = "share-group",
+        .member_id = resp.member_id,
+        .member_epoch = 1,
+        .subscribed_topic_names = null,
+    };
+
+    var stale_buf: [256]u8 = undefined;
+    var stale_pos = buildTestRequest(&stale_buf, 76, 0, 7604, header_mod.requestHeaderVersion(76, 0));
+    stale_req.serialize(&stale_buf, &stale_pos, 0);
+
+    const stale_response = broker.handleRequest(stale_buf[0..stale_pos]);
+    try testing.expect(stale_response != null);
+    defer testing.allocator.free(stale_response.?);
+
+    var stale_rpos: usize = 0;
+    var stale_response_header = try ResponseHeader.deserialize(testing.allocator, stale_response.?, &stale_rpos, header_mod.responseHeaderVersion(76, 0));
+    defer stale_response_header.deinit(testing.allocator);
+    try testing.expectEqual(@as(i32, 7604), stale_response_header.correlation_id);
+
+    const stale_resp = try Resp.deserialize(testing.allocator, stale_response.?, &stale_rpos, 0);
+    defer freeDeserializedShareGroupHeartbeatResponse(&stale_resp);
+    try testing.expectEqual(stale_response.?.len, stale_rpos);
+    try testing.expectEqual(ErrorCode.fenced_member_epoch.toInt(), stale_resp.error_code);
+    try testing.expectEqual(@as(i32, 0), stale_resp.heartbeat_interval_ms);
+
+    const leave_req = Req{
+        .group_id = "share-group",
+        .member_id = resp.member_id,
+        .member_epoch = -1,
+    };
+
+    var leave_buf: [256]u8 = undefined;
+    var leave_pos = buildTestRequest(&leave_buf, 76, 0, 7605, header_mod.requestHeaderVersion(76, 0));
+    leave_req.serialize(&leave_buf, &leave_pos, 0);
+
+    const leave_response = broker.handleRequest(leave_buf[0..leave_pos]);
+    try testing.expect(leave_response != null);
+    defer testing.allocator.free(leave_response.?);
+
+    var leave_rpos: usize = 0;
+    var leave_response_header = try ResponseHeader.deserialize(testing.allocator, leave_response.?, &leave_rpos, header_mod.responseHeaderVersion(76, 0));
+    defer leave_response_header.deinit(testing.allocator);
+    try testing.expectEqual(@as(i32, 7605), leave_response_header.correlation_id);
+
+    const leave_resp = try Resp.deserialize(testing.allocator, leave_response.?, &leave_rpos, 0);
+    defer freeDeserializedShareGroupHeartbeatResponse(&leave_resp);
+    try testing.expectEqual(leave_response.?.len, leave_rpos);
+    try testing.expectEqual(ErrorCode.none.toInt(), leave_resp.error_code);
+    try testing.expectEqual(@as(i32, -1), leave_resp.member_epoch);
+    try testing.expectEqual(ConsumerGroup.GroupState.empty, group.state);
 }
 
 test "Broker.handleRequest ShareGroupHeartbeat rejects malformed request" {
@@ -39609,26 +40041,35 @@ test "Broker.handleRequest ShareGroupHeartbeat rejects malformed request" {
     try testing.expectEqual(@as(i32, 7601), response_header.correlation_id);
 
     const resp = try Resp.deserialize(testing.allocator, response.?, &rpos, 0);
+    defer freeDeserializedShareGroupHeartbeatResponse(&resp);
     try testing.expectEqual(response.?.len, rpos);
     try testing.expectEqual(ErrorCode.invalid_request.toInt(), resp.error_code);
     try testing.expectEqualStrings("malformed ShareGroupHeartbeat request", resp.error_message.?);
     try testing.expect(resp.assignment == null);
 }
 
-test "Broker.handleRequest ShareGroupDescribe returns generated fail-closed response" {
+test "Broker.handleRequest ShareGroupDescribe returns local share group state" {
     const Req = generated.share_group_describe_request.ShareGroupDescribeRequest;
     const Resp = generated.share_group_describe_response.ShareGroupDescribeResponse;
 
     var broker = Broker.init(testing.allocator, 1, 9092);
     defer broker.deinit();
+    broker.default_num_partitions = 2;
+    try testing.expect(broker.ensureTopic("share-desc-topic"));
 
-    const group_ids = [_]?[]const u8{"share-group"};
+    const subscriptions = [_][]const u8{"share-desc-topic"};
+    const joined = try broker.groups.joinGroupWithProtocol("share-desc-group", "share-member", null, "share", "range", null, &subscriptions);
+    try testing.expectEqual(ErrorCode.none.toInt(), joined.error_code);
+    _ = try broker.groups.updateMemberRackIfChanged("share-desc-group", "share-member", "rack-a");
+    try testing.expect(broker.markShareGroupStable("share-desc-group"));
+
+    const group_ids = [_]?[]const u8{ "share-desc-group", "missing-share-group", "" };
     const req = Req{
         .group_ids = &group_ids,
         .include_authorized_operations = true,
     };
 
-    var buf: [256]u8 = undefined;
+    var buf: [512]u8 = undefined;
     var pos = buildTestRequest(&buf, 77, 0, 7700, header_mod.requestHeaderVersion(77, 0));
     req.serialize(&buf, &pos, 0);
 
@@ -39642,16 +40083,30 @@ test "Broker.handleRequest ShareGroupDescribe returns generated fail-closed resp
     try testing.expectEqual(@as(i32, 7700), response_header.correlation_id);
 
     const resp = try Resp.deserialize(testing.allocator, response.?, &rpos, 0);
-    defer if (resp.groups.len > 0) testing.allocator.free(resp.groups);
+    defer freeDeserializedShareGroupDescribeResponse(&resp);
 
     try testing.expectEqual(response.?.len, rpos);
     try testing.expectEqual(@as(i32, 0), resp.throttle_time_ms);
-    try testing.expectEqual(@as(usize, 1), resp.groups.len);
-    try testing.expectEqual(ErrorCode.unsupported_version.toInt(), resp.groups[0].error_code);
-    try testing.expectEqualStrings("ShareGroupDescribe is not implemented", resp.groups[0].error_message.?);
-    try testing.expectEqualStrings("share-group", resp.groups[0].group_id.?);
-    try testing.expectEqualStrings("", resp.groups[0].group_state.?);
+    try testing.expectEqual(@as(usize, 3), resp.groups.len);
+    try testing.expectEqual(ErrorCode.none.toInt(), resp.groups[0].error_code);
+    try testing.expect(resp.groups[0].error_message == null);
+    try testing.expectEqualStrings("share-desc-group", resp.groups[0].group_id.?);
+    try testing.expectEqualStrings("Stable", resp.groups[0].group_state.?);
+    try testing.expectEqualStrings("range", resp.groups[0].assignor_name.?);
     try testing.expectEqual(@as(i32, 0), resp.groups[0].authorized_operations);
+    try testing.expectEqual(@as(usize, 1), resp.groups[0].members.len);
+    try testing.expectEqualStrings("share-member", resp.groups[0].members[0].member_id.?);
+    try testing.expectEqualStrings("rack-a", resp.groups[0].members[0].rack_id.?);
+    try testing.expectEqual(@as(i32, 1), resp.groups[0].members[0].member_epoch);
+    try testing.expectEqual(@as(usize, 1), resp.groups[0].members[0].subscribed_topic_names.len);
+    try testing.expectEqualStrings("share-desc-topic", resp.groups[0].members[0].subscribed_topic_names[0].?);
+    try testing.expectEqual(@as(usize, 1), resp.groups[0].members[0].assignment.topic_partitions.len);
+    try testing.expectEqualSlices(u8, &broker.topics.get("share-desc-topic").?.topic_id, &resp.groups[0].members[0].assignment.topic_partitions[0].topic_id);
+    try testing.expectEqualStrings("share-desc-topic", resp.groups[0].members[0].assignment.topic_partitions[0].topic_name.?);
+    try testing.expectEqualSlices(i32, &[_]i32{ 0, 1 }, resp.groups[0].members[0].assignment.topic_partitions[0].partitions);
+    try testing.expectEqual(ErrorCode.group_id_not_found.toInt(), resp.groups[1].error_code);
+    try testing.expectEqualStrings("missing-share-group", resp.groups[1].group_id.?);
+    try testing.expectEqual(ErrorCode.invalid_group_id.toInt(), resp.groups[2].error_code);
 }
 
 test "Broker.handleRequest ShareGroupDescribe rejects malformed request" {
@@ -39675,7 +40130,7 @@ test "Broker.handleRequest ShareGroupDescribe rejects malformed request" {
     try testing.expectEqual(@as(i32, 7701), response_header.correlation_id);
 
     const resp = try Resp.deserialize(testing.allocator, response.?, &rpos, 0);
-    defer if (resp.groups.len > 0) testing.allocator.free(resp.groups);
+    defer freeDeserializedShareGroupDescribeResponse(&resp);
 
     try testing.expectEqual(response.?.len, rpos);
     try testing.expectEqual(@as(usize, 1), resp.groups.len);
