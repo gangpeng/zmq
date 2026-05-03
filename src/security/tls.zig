@@ -20,7 +20,9 @@ pub const TlsConfig = struct {
     enabled: bool = false,
     protocol: SecurityProtocol = .plaintext,
 
-    // Certificate paths
+    // Java keystore/truststore paths are kept for config compatibility only.
+    // The current TLS implementation loads PEM files directly, so validate()
+    // fails closed if these fields are set instead of silently ignoring them.
     keystore_path: ?[]const u8 = null,
     keystore_password: ?[]const u8 = null,
     truststore_path: ?[]const u8 = null,
@@ -81,11 +83,23 @@ pub const TlsConfig = struct {
     pub fn validate(self: *const TlsConfig) !void {
         if (!self.needsTls()) return;
 
-        if (self.cert_file == null and self.keystore_path == null) {
+        if (@intFromEnum(self.min_tls_version) > @intFromEnum(self.max_tls_version)) {
+            return error.InvalidTlsVersionRange;
+        }
+        if (self.keystore_path != null or self.keystore_password != null) {
+            return error.UnsupportedKeystoreFormat;
+        }
+        if (self.truststore_path != null or self.truststore_password != null) {
+            return error.UnsupportedTruststoreFormat;
+        }
+        if (self.cert_file == null) {
             return error.NoCertificateConfigured;
         }
-        if (self.key_file == null and self.keystore_path == null) {
+        if (self.key_file == null) {
             return error.NoPrivateKeyConfigured;
+        }
+        if (self.client_auth != .none and self.ca_file == null) {
+            return error.NoTrustAnchorsConfigured;
         }
     }
 };
@@ -733,6 +747,55 @@ test "TlsConfig validate ok with cert" {
         .key_file = "/path/to/key.pem",
     };
     try config.validate();
+}
+
+test "TlsConfig validate rejects unsupported keystore fields" {
+    const config = TlsConfig{
+        .protocol = .ssl,
+        .keystore_path = "/path/to/kafka.keystore.jks",
+        .keystore_password = "secret",
+    };
+    try testing.expectError(error.UnsupportedKeystoreFormat, config.validate());
+}
+
+test "TlsConfig validate rejects unsupported truststore fields" {
+    const config = TlsConfig{
+        .protocol = .ssl,
+        .cert_file = "/path/to/cert.pem",
+        .key_file = "/path/to/key.pem",
+        .truststore_path = "/path/to/kafka.truststore.jks",
+    };
+    try testing.expectError(error.UnsupportedTruststoreFormat, config.validate());
+}
+
+test "TlsConfig validate rejects inverted TLS version range" {
+    const config = TlsConfig{
+        .protocol = .ssl,
+        .cert_file = "/path/to/cert.pem",
+        .key_file = "/path/to/key.pem",
+        .min_tls_version = .tls_1_3,
+        .max_tls_version = .tls_1_2,
+    };
+    try testing.expectError(error.InvalidTlsVersionRange, config.validate());
+}
+
+test "TlsConfig validate requires trust anchors for mTLS" {
+    const missing_ca = TlsConfig{
+        .protocol = .ssl,
+        .cert_file = "/path/to/cert.pem",
+        .key_file = "/path/to/key.pem",
+        .client_auth = .required,
+    };
+    try testing.expectError(error.NoTrustAnchorsConfigured, missing_ca.validate());
+
+    const with_ca = TlsConfig{
+        .protocol = .ssl,
+        .cert_file = "/path/to/cert.pem",
+        .key_file = "/path/to/key.pem",
+        .ca_file = "/path/to/ca.pem",
+        .client_auth = .required,
+    };
+    try with_ca.validate();
 }
 
 test "TlsConfig validate ok for plaintext" {
