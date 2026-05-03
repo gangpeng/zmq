@@ -485,4 +485,15 @@ pub fn build(b: *std.Build) void {
     const bench_run = b.addRunArtifact(bench_exe);
     const bench_step = b.step("bench", "Run performance benchmarks");
     bench_step.dependOn(&bench_run.step);
+
+    // Comparative Kafka/AutoMQ benchmark gate. The Python wrapper skips unless
+    // ZMQ_RUN_BENCH_COMPARE=1 is set so the build step is safe in local tests.
+    const bench_compare_step = b.step("bench-compare", "Run gated ZMQ/Kafka/AutoMQ comparative benchmarks");
+    {
+        const run_bench_compare = b.addSystemCommand(&.{ "python3", "benchmarks/benchmark_compare.py", "--require-enabled" });
+        bench_compare_step.dependOn(&run_bench_compare.step);
+
+        const bench_compare_self_test = b.addSystemCommand(&.{ "python3", "benchmarks/benchmark_compare.py", "--self-test" });
+        test_step.dependOn(&bench_compare_self_test.step);
+    }
 }

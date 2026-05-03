@@ -73,6 +73,17 @@ WARMUP = {
     "metadata": 100,
 }
 
+def parse_targets(raw):
+    """Parse a benchmark target argument into the display-order target list."""
+    if raw == "all" or raw == "both":
+        return list(ALL_TARGETS)
+
+    targets = [t.strip() for t in raw.split(",") if t.strip()]
+    for target in targets:
+        if target not in ALL_TARGETS:
+            raise ValueError(f"Unknown target '{target}'. Valid targets: {', '.join(ALL_TARGETS)}")
+    return targets
+
 # ── Kafka wire protocol helpers ──
 # Uses lowest versions compatible with all three targets:
 #   - Produce v0: supported by ZMQ (0-11), Kafka 4.2 (0-13), AutoMQ (0-11)
@@ -505,17 +516,31 @@ def main():
         default="all",
         help="Comma-separated list of targets: zmq, kafka, automq, or 'all' (default: all)",
     )
+    parser.add_argument(
+        "--require-enabled",
+        action="store_true",
+        help="Skip unless ZMQ_RUN_BENCH_COMPARE=1 is set; used by the build step",
+    )
+    parser.add_argument(
+        "--self-test",
+        action="store_true",
+        help="Run deterministic parser/formatting checks without Docker or brokers",
+    )
     args = parser.parse_args()
 
+    if args.self_test:
+        return self_test()
+
+    if args.require_enabled and os.environ.get("ZMQ_RUN_BENCH_COMPARE") != "1":
+        print("skip: set ZMQ_RUN_BENCH_COMPARE=1 to run comparative benchmark gate")
+        return 0
+
     # Parse target list
-    if args.target == "all" or args.target == "both":
-        targets = list(ALL_TARGETS)
-    else:
-        targets = [t.strip() for t in args.target.split(",")]
-        for t in targets:
-            if t not in ALL_TARGETS:
-                print(f"  ERROR: Unknown target '{t}'. Valid targets: {', '.join(ALL_TARGETS)}")
-                return 1
+    try:
+        targets = parse_targets(args.target)
+    except ValueError as exc:
+        print(f"  ERROR: {exc}")
+        return 1
 
     manage_docker = len(targets) > 1
     all_results = {}
@@ -569,6 +594,30 @@ def main():
         json.dump(saved, f, indent=2)
     print(f"\n  Results saved to {results_file}")
 
+    return 0
+
+def self_test():
+    if parse_targets("all") != ALL_TARGETS:
+        raise AssertionError("all target parsing failed")
+    if parse_targets("both") != ALL_TARGETS:
+        raise AssertionError("both target parsing failed")
+    if parse_targets("zmq,kafka") != ["zmq", "kafka"]:
+        raise AssertionError("subset target parsing failed")
+
+    try:
+        parse_targets("zmq,unknown")
+        raise AssertionError("invalid target parsing did not fail")
+    except ValueError:
+        pass
+
+    faster, faster_marker = _ratio_str(2.0, 1.0, True)
+    if "2.00x" not in faster or faster_marker != "▲":
+        raise AssertionError("throughput ratio formatting failed")
+    lower_latency, latency_marker = _ratio_str(0.5, 1.0, False)
+    if "0.50x" not in lower_latency or latency_marker != "▲":
+        raise AssertionError("latency ratio formatting failed")
+
+    print("ok: comparative benchmark self-test")
     return 0
 
 if __name__ == "__main__":

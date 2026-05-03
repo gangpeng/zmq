@@ -791,6 +791,7 @@ test "AutoMQ parity release criteria document pins required gates" {
         "zig build test-s3-provider-matrix --summary all",
         "zig build test-kraft-failover --summary all",
         "zig build bench --summary all",
+        "zig build bench-compare --summary all",
     };
     for (required_commands) |command| {
         try testing.expect(std.mem.indexOf(u8, criteria, command) != null);
