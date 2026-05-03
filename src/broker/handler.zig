@@ -1810,15 +1810,23 @@ pub const Broker = struct {
     }
 
     fn persistShareGroupStatesLocal(self: *Broker) void {
-        self.persistence.saveShareGroupStates(&self.share_group_states) catch |err| {
+        self.persistShareGroupStatesDurably() catch |err| {
             log.warn("Failed to persist share group states: {}", .{err});
         };
     }
 
     fn persistShareGroupSessionsLocal(self: *Broker) void {
-        self.persistence.saveShareGroupSessions(&self.share_group_sessions) catch |err| {
+        self.persistShareGroupSessionsDurably() catch |err| {
             log.warn("Failed to persist share group sessions: {}", .{err});
         };
+    }
+
+    fn persistShareGroupStatesDurably(self: *Broker) !void {
+        try self.persistence.saveShareGroupStates(&self.share_group_states);
+    }
+
+    fn persistShareGroupSessionsDurably(self: *Broker) !void {
+        try self.persistence.saveShareGroupSessions(&self.share_group_sessions);
     }
 
     fn persistFinalizedFeaturesLocal(self: *Broker) void {
@@ -11865,13 +11873,21 @@ pub const Broker = struct {
         if (share_session_epoch < -1) return ErrorCode.invalid_request;
 
         const key = try self.shareGroupMemberKey(group_id, member_id);
-        errdefer self.allocator.free(key);
 
         if (share_session_epoch == -1) {
             if (self.share_group_sessions.fetchRemove(key)) |removed| {
-                self.allocator.free(removed.key);
+                self.persistShareGroupSessionsDurably() catch |err| {
+                    self.share_group_sessions.put(removed.key, removed.value) catch |restore_err| {
+                        self.allocator.free(key);
+                        self.allocator.free(removed.key);
+                        return restore_err;
+                    };
+                    self.allocator.free(key);
+                    log.warn("Share session close persistence failed for {s}/{s}: {}", .{ group_id, member_id, err });
+                    return ErrorCode.kafka_storage_error;
+                };
                 self.allocator.free(key);
-                self.persistShareGroupSessionsLocal();
+                self.allocator.free(removed.key);
                 return ErrorCode.none;
             }
             self.allocator.free(key);
@@ -11881,13 +11897,23 @@ pub const Broker = struct {
         if (self.share_group_sessions.getPtr(key)) |current_epoch| {
             defer self.allocator.free(key);
             if (share_session_epoch == 0) {
+                const previous_epoch = current_epoch.*;
                 current_epoch.* = 0;
-                self.persistShareGroupSessionsLocal();
+                self.persistShareGroupSessionsDurably() catch |err| {
+                    current_epoch.* = previous_epoch;
+                    log.warn("Share session reset persistence failed for {s}/{s}: {}", .{ group_id, member_id, err });
+                    return ErrorCode.kafka_storage_error;
+                };
                 return ErrorCode.none;
             }
             if (share_session_epoch != current_epoch.* + 1) return ErrorCode.invalid_fetch_session_epoch;
+            const previous_epoch = current_epoch.*;
             current_epoch.* = share_session_epoch;
-            self.persistShareGroupSessionsLocal();
+            self.persistShareGroupSessionsDurably() catch |err| {
+                current_epoch.* = previous_epoch;
+                log.warn("Share session epoch persistence failed for {s}/{s}: {}", .{ group_id, member_id, err });
+                return ErrorCode.kafka_storage_error;
+            };
             return ErrorCode.none;
         }
 
@@ -11896,8 +11922,17 @@ pub const Broker = struct {
             return ErrorCode.invalid_fetch_session_epoch;
         }
 
-        try self.share_group_sessions.put(key, 0);
-        self.persistShareGroupSessionsLocal();
+        self.share_group_sessions.put(key, 0) catch |err| {
+            self.allocator.free(key);
+            return err;
+        };
+        self.persistShareGroupSessionsDurably() catch |err| {
+            if (self.share_group_sessions.fetchRemove(key)) |removed| {
+                self.allocator.free(removed.key);
+            }
+            log.warn("Share session open persistence failed for {s}/{s}: {}", .{ group_id, member_id, err });
+            return ErrorCode.kafka_storage_error;
+        };
         return ErrorCode.none;
     }
 
@@ -12107,7 +12142,10 @@ pub const Broker = struct {
                 if (acknowledge_error == ErrorCode.none and partition.acknowledgement_batches.len > 0) {
                     acknowledge_error = validateShareAcknowledgementBatches(partition.acknowledgement_batches);
                     if (acknowledge_error == ErrorCode.none) {
-                        try self.applyShareAcknowledgementBatches(req.group_id.?, topic.topic_id, partition.partition_index, partition.acknowledgement_batches);
+                        self.applyShareAcknowledgementBatches(req.group_id.?, topic.topic_id, partition.partition_index, partition.acknowledgement_batches) catch |err| {
+                            log.warn("ShareFetch acknowledgement persistence failed for {s}-{d}: {}", .{ topic_name, partition.partition_index, err });
+                            acknowledge_error = ErrorCode.kafka_storage_error;
+                        };
                     }
                 }
 
@@ -12141,17 +12179,26 @@ pub const Broker = struct {
                             if (!acquired_transferred and acquired_records.len > 0) self.allocator.free(acquired_records);
                         }
 
-                        try self.recordShareFetchAcquisition(req.group_id.?, topic.topic_id, partition.partition_index, @intCast(start_offset), last_offset);
-                        const acquired = try self.allocator.alloc(AcquiredRecords, 1);
-                        acquired[0] = .{
-                            .first_offset = @intCast(start_offset),
-                            .last_offset = last_offset,
-                            .delivery_count = 1,
+                        self.recordShareFetchAcquisition(req.group_id.?, topic.topic_id, partition.partition_index, @intCast(start_offset), last_offset) catch |err| {
+                            log.warn("ShareFetch acquisition persistence failed for {s}-{d}: {}", .{ topic_name, partition.partition_index, err });
+                            error_code = ErrorCode.kafka_storage_error;
+                            acknowledge_error = ErrorCode.kafka_storage_error;
                         };
-                        records = fetch_result.records;
-                        acquired_records = acquired;
-                        records_transferred = true;
-                        acquired_transferred = true;
+                        if (error_code == ErrorCode.none) {
+                            const acquired = try self.allocator.alloc(AcquiredRecords, 1);
+                            acquired[0] = .{
+                                .first_offset = @intCast(start_offset),
+                                .last_offset = last_offset,
+                                .delivery_count = 1,
+                            };
+                            records = fetch_result.records;
+                            acquired_records = acquired;
+                            records_transferred = true;
+                            acquired_transferred = true;
+                        } else if (fetch_result.records.len > 0) {
+                            self.allocator.free(@constCast(fetch_result.records));
+                            records_transferred = true;
+                        }
                     }
                 }
 
@@ -12313,7 +12360,10 @@ pub const Broker = struct {
                 if (error_code == ErrorCode.none) {
                     error_code = validateShareAcknowledgementBatches(partition.acknowledgement_batches);
                     if (error_code == ErrorCode.none) {
-                        try self.applyShareAcknowledgementBatches(req.group_id.?, topic.topic_id, partition.partition_index, partition.acknowledgement_batches);
+                        self.applyShareAcknowledgementBatches(req.group_id.?, topic.topic_id, partition.partition_index, partition.acknowledgement_batches) catch |err| {
+                            log.warn("ShareAcknowledge persistence failed for {s}-{d}: {}", .{ topic_name, partition.partition_index, err });
+                            error_code = ErrorCode.kafka_storage_error;
+                        };
                     }
                 }
 
@@ -12477,40 +12527,64 @@ pub const Broker = struct {
         start_offset: i64,
         batches: []ShareStateBatch,
     ) !void {
-        const key = try self.shareGroupStateKey(group_id, topic_id, partition);
-        errdefer {
-            self.allocator.free(key);
+        const key = self.shareGroupStateKey(group_id, topic_id, partition) catch |err| {
             if (batches.len > 0) self.allocator.free(batches);
-        }
+            return err;
+        };
 
         if (self.share_group_states.getPtr(key)) |existing| {
             self.allocator.free(key);
-            existing.deinit(self.allocator);
+            const previous = existing.*;
             existing.* = .{
                 .state_epoch = state_epoch,
                 .start_offset = start_offset,
                 .batches = batches,
             };
-            self.persistShareGroupStatesLocal();
+            self.persistShareGroupStatesDurably() catch |err| {
+                existing.* = previous;
+                if (batches.len > 0) self.allocator.free(batches);
+                return err;
+            };
+            var old = previous;
+            old.deinit(self.allocator);
             return;
         }
 
-        try self.share_group_states.put(key, .{
+        self.share_group_states.put(key, .{
             .state_epoch = state_epoch,
             .start_offset = start_offset,
             .batches = batches,
-        });
-        self.persistShareGroupStatesLocal();
+        }) catch |err| {
+            self.allocator.free(key);
+            if (batches.len > 0) self.allocator.free(batches);
+            return err;
+        };
+        self.persistShareGroupStatesDurably() catch |err| {
+            if (self.share_group_states.fetchRemove(key)) |removed| {
+                self.allocator.free(removed.key);
+                var state = removed.value;
+                state.deinit(self.allocator);
+            }
+            return err;
+        };
     }
 
     fn deleteSharePartitionState(self: *Broker, group_id: []const u8, topic_id: [16]u8, partition: i32) !void {
         const key = try self.shareGroupStateKey(group_id, topic_id, partition);
         defer self.allocator.free(key);
         if (self.share_group_states.fetchRemove(key)) |removed| {
+            self.persistShareGroupStatesDurably() catch |err| {
+                self.share_group_states.put(removed.key, removed.value) catch |restore_err| {
+                    self.allocator.free(removed.key);
+                    var state = removed.value;
+                    state.deinit(self.allocator);
+                    return restore_err;
+                };
+                return err;
+            };
             self.allocator.free(removed.key);
             var state = removed.value;
             state.deinit(self.allocator);
-            self.persistShareGroupStatesLocal();
         }
     }
 
@@ -12588,10 +12662,13 @@ pub const Broker = struct {
                     null;
                 const epoch_error = if (target_error == ErrorCode.none) validateShareStateEpoch(existing, partition.state_epoch) else ErrorCode.none;
                 const offset_error = if (target_error == ErrorCode.none and epoch_error == ErrorCode.none) validateShareStateStartOffset(partition.start_offset) else ErrorCode.none;
-                const error_code = if (target_error != ErrorCode.none) target_error else if (epoch_error != ErrorCode.none) epoch_error else offset_error;
+                var error_code = if (target_error != ErrorCode.none) target_error else if (epoch_error != ErrorCode.none) epoch_error else offset_error;
 
                 if (error_code == ErrorCode.none) {
-                    try self.setSharePartitionState(req.group_id.?, topic.topic_id, partition.partition, partition.state_epoch, partition.start_offset, &.{});
+                    self.setSharePartitionState(req.group_id.?, topic.topic_id, partition.partition, partition.state_epoch, partition.start_offset, &.{}) catch |err| {
+                        log.warn("InitializeShareGroupState persistence failed for partition {d}: {}", .{ partition.partition, err });
+                        error_code = ErrorCode.kafka_storage_error;
+                    };
                 }
 
                 partitions[idx] = .{
@@ -12841,7 +12918,7 @@ pub const Broker = struct {
                         if (batch_error != ErrorCode.none) break;
                     }
                 }
-                const error_code = if (target_error != ErrorCode.none) target_error else if (epoch_error != ErrorCode.none) epoch_error else if (offset_error != ErrorCode.none) offset_error else batch_error;
+                var error_code = if (target_error != ErrorCode.none) target_error else if (epoch_error != ErrorCode.none) epoch_error else if (offset_error != ErrorCode.none) offset_error else batch_error;
 
                 if (error_code == ErrorCode.none) {
                     const batches = try self.cloneShareStateBatchesFromWrite(partition.state_batches);
@@ -12851,7 +12928,10 @@ pub const Broker = struct {
                         state.start_offset
                     else
                         @as(i64, -1);
-                    try self.setSharePartitionState(req.group_id.?, topic.topic_id, partition.partition, partition.state_epoch, start_offset, batches);
+                    self.setSharePartitionState(req.group_id.?, topic.topic_id, partition.partition, partition.state_epoch, start_offset, batches) catch |err| {
+                        log.warn("WriteShareGroupState persistence failed for partition {d}: {}", .{ partition.partition, err });
+                        error_code = ErrorCode.kafka_storage_error;
+                    };
                 }
 
                 partitions[idx] = .{
@@ -12959,9 +13039,12 @@ pub const Broker = struct {
             errdefer self.allocator.free(partitions);
 
             for (topic.partitions, 0..) |partition, idx| {
-                const error_code = self.validateShareStateTarget(req.group_id, topic.topic_id, partition.partition);
+                var error_code = self.validateShareStateTarget(req.group_id, topic.topic_id, partition.partition);
                 if (error_code == ErrorCode.none) {
-                    try self.deleteSharePartitionState(req.group_id.?, topic.topic_id, partition.partition);
+                    self.deleteSharePartitionState(req.group_id.?, topic.topic_id, partition.partition) catch |err| {
+                        log.warn("DeleteShareGroupState persistence failed for partition {d}: {}", .{ partition.partition, err });
+                        error_code = ErrorCode.kafka_storage_error;
+                    };
                 }
 
                 partitions[idx] = .{
@@ -41827,6 +41910,70 @@ test "Broker share session epoch persists across local restart" {
     }
 }
 
+test "Broker.handleRequest ShareFetch rolls back session when local persistence fails" {
+    const fs = @import("fs_compat");
+    const Req = generated.share_fetch_request.ShareFetchRequest;
+    const Resp = generated.share_fetch_response.ShareFetchResponse;
+
+    const tmp_dir = "/tmp/zmq-share-session-persist-fail-test";
+    fs.deleteTreeAbsolute(tmp_dir) catch {};
+    try fs.makeDirAbsolute(tmp_dir);
+    defer fs.deleteTreeAbsolute(tmp_dir) catch {};
+
+    const sessions_path = try std.fmt.allocPrint(testing.allocator, "{s}/share_group_sessions.meta", .{tmp_dir});
+    defer testing.allocator.free(sessions_path);
+    try fs.makeDirAbsolute(sessions_path);
+
+    var broker = Broker.initWithConfig(testing.allocator, 1, 9092, .{ .data_dir = tmp_dir });
+    defer broker.deinit();
+    try testing.expect(broker.ensureTopic("share-session-fail-topic"));
+
+    const subscriptions = [_][]const u8{"share-session-fail-topic"};
+    const joined = try broker.groups.joinGroupWithProtocol("share-session-fail-group", "share-member", null, "share", "range", null, &subscriptions);
+    try testing.expectEqual(ErrorCode.none.toInt(), joined.error_code);
+    try testing.expect(broker.markShareGroupStable("share-session-fail-group"));
+
+    const req = Req{
+        .group_id = "share-session-fail-group",
+        .member_id = "share-member",
+        .share_session_epoch = 0,
+        .max_wait_ms = 1,
+        .min_bytes = 0,
+        .max_bytes = 1024,
+        .topics = &.{},
+        .forgotten_topics_data = &.{},
+    };
+
+    var buf: [256]u8 = undefined;
+    var pos = buildTestRequest(&buf, 78, 0, 7802, header_mod.requestHeaderVersion(78, 0));
+    req.serialize(&buf, &pos, 0);
+
+    const response = broker.handleRequest(buf[0..pos]);
+    try testing.expect(response != null);
+    defer testing.allocator.free(response.?);
+
+    var rpos: usize = 0;
+    var response_header = try ResponseHeader.deserialize(testing.allocator, response.?, &rpos, header_mod.responseHeaderVersion(78, 0));
+    defer response_header.deinit(testing.allocator);
+    try testing.expectEqual(@as(i32, 7802), response_header.correlation_id);
+
+    const resp = try Resp.deserialize(testing.allocator, response.?, &rpos, 0);
+    defer {
+        for (resp.responses) |topic| {
+            for (topic.partitions) |partition| {
+                if (partition.acquired_records.len > 0) testing.allocator.free(partition.acquired_records);
+            }
+            if (topic.partitions.len > 0) testing.allocator.free(topic.partitions);
+        }
+        if (resp.responses.len > 0) testing.allocator.free(resp.responses);
+        if (resp.node_endpoints.len > 0) testing.allocator.free(resp.node_endpoints);
+    }
+
+    try testing.expectEqual(response.?.len, rpos);
+    try testing.expectEqual(ErrorCode.kafka_storage_error.toInt(), resp.error_code);
+    try testing.expectEqual(@as(usize, 0), broker.share_group_sessions.count());
+}
+
 test "Broker.handleRequest InitializeShareGroupState initializes local share state" {
     const Req = generated.initialize_share_group_state_request.InitializeShareGroupStateRequest;
     const Resp = generated.initialize_share_group_state_response.InitializeShareGroupStateResponse;
@@ -42140,6 +42287,78 @@ test "Broker.handleRequest WriteShareGroupState writes local share state" {
     try testing.expectEqual(@as(usize, 1), read_resp.results[0].partitions[0].state_batches.len);
     try testing.expectEqual(@as(i64, 10), read_resp.results[0].partitions[0].state_batches[0].first_offset);
     try testing.expectEqual(@as(i64, 11), read_resp.results[0].partitions[0].state_batches[0].last_offset);
+}
+
+test "Broker.handleRequest WriteShareGroupState rolls back state when local persistence fails" {
+    const fs = @import("fs_compat");
+    const Req = generated.write_share_group_state_request.WriteShareGroupStateRequest;
+    const Resp = generated.write_share_group_state_response.WriteShareGroupStateResponse;
+    const WriteStateData = Req.WriteStateData;
+    const PartitionData = WriteStateData.PartitionData;
+    const StateBatch = PartitionData.StateBatch;
+
+    const tmp_dir = "/tmp/zmq-share-state-persist-fail-test";
+    fs.deleteTreeAbsolute(tmp_dir) catch {};
+    try fs.makeDirAbsolute(tmp_dir);
+    defer fs.deleteTreeAbsolute(tmp_dir) catch {};
+
+    const states_path = try std.fmt.allocPrint(testing.allocator, "{s}/share_group_states.meta", .{tmp_dir});
+    defer testing.allocator.free(states_path);
+    try fs.makeDirAbsolute(states_path);
+
+    var broker = Broker.initWithConfig(testing.allocator, 1, 9092, .{ .data_dir = tmp_dir });
+    defer broker.deinit();
+    try testing.expect(broker.ensureTopic("share-state-persist-fail-topic"));
+
+    const topic_id = broker.topics.get("share-state-persist-fail-topic").?.topic_id;
+    const state_batches = [_]StateBatch{.{
+        .first_offset = 10,
+        .last_offset = 11,
+        .delivery_state = 0,
+        .delivery_count = 1,
+    }};
+    const partitions = [_]PartitionData{.{
+        .partition = 0,
+        .state_epoch = 2,
+        .leader_epoch = 3,
+        .start_offset = 10,
+        .state_batches = &state_batches,
+    }};
+    const topics = [_]WriteStateData{.{
+        .topic_id = topic_id,
+        .partitions = &partitions,
+    }};
+    const req = Req{
+        .group_id = "share-group",
+        .topics = &topics,
+    };
+
+    var buf: [512]u8 = undefined;
+    var pos = buildTestRequest(&buf, 85, 0, 8504, header_mod.requestHeaderVersion(85, 0));
+    req.serialize(&buf, &pos, 0);
+
+    const response = broker.handleRequest(buf[0..pos]);
+    try testing.expect(response != null);
+    defer testing.allocator.free(response.?);
+
+    var rpos: usize = 0;
+    var response_header = try ResponseHeader.deserialize(testing.allocator, response.?, &rpos, header_mod.responseHeaderVersion(85, 0));
+    defer response_header.deinit(testing.allocator);
+    try testing.expectEqual(@as(i32, 8504), response_header.correlation_id);
+
+    const resp = try Resp.deserialize(testing.allocator, response.?, &rpos, 0);
+    defer {
+        for (resp.results) |result| {
+            if (result.partitions.len > 0) testing.allocator.free(result.partitions);
+        }
+        if (resp.results.len > 0) testing.allocator.free(resp.results);
+    }
+
+    try testing.expectEqual(response.?.len, rpos);
+    try testing.expectEqual(@as(usize, 1), resp.results.len);
+    try testing.expectEqual(@as(usize, 1), resp.results[0].partitions.len);
+    try testing.expectEqual(ErrorCode.kafka_storage_error.toInt(), resp.results[0].partitions[0].error_code);
+    try testing.expect((try broker.getSharePartitionState("share-group", topic_id, 0)) == null);
 }
 
 test "Broker share group state persists across local restart" {
