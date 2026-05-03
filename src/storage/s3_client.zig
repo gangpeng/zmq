@@ -25,6 +25,7 @@ pub const S3Client = struct {
     access_key: []const u8,
     secret_key: []const u8,
     scheme: Scheme = .http,
+    path_style: bool = true,
     tls_ca_file: ?[]const u8 = null,
     signer: AwsSigV4,
     allocator: Allocator,
@@ -66,6 +67,8 @@ pub const S3Client = struct {
         access_key: []const u8 = "minioadmin",
         secret_key: []const u8 = "minioadmin",
         scheme: Scheme = .http,
+        region: []const u8 = "us-east-1",
+        path_style: bool = true,
         tls_ca_file: ?[]const u8 = null,
     };
 
@@ -101,8 +104,9 @@ pub const S3Client = struct {
             .access_key = access_key,
             .secret_key = secret_key,
             .scheme = endpoint.scheme,
+            .path_style = config.path_style,
             .tls_ca_file = config.tls_ca_file,
-            .signer = AwsSigV4.init(access_key, secret_key),
+            .signer = AwsSigV4.initWithRegion(access_key, secret_key, config.region),
             .allocator = alloc,
         };
     }
@@ -159,7 +163,7 @@ pub const S3Client = struct {
 
     /// Ensure the bucket exists.
     pub fn ensureBucket(self: *S3Client) !void {
-        const path = try std.fmt.allocPrint(self.allocator, "/{s}", .{self.bucket});
+        const path = try self.bucketPath();
         defer self.allocator.free(path);
 
         var resp_buf: [4096]u8 = undefined;
@@ -172,7 +176,7 @@ pub const S3Client = struct {
     /// Upload an object.
     pub fn putObject(self: *S3Client, key: []const u8, data: []const u8) !void {
         const start_ns = @import("time_compat").nanoTimestamp();
-        const path = try std.fmt.allocPrint(self.allocator, "/{s}/{s}", .{ self.bucket, key });
+        const path = try self.objectPath(key);
         defer self.allocator.free(path);
 
         var resp_buf: [4096]u8 = undefined;
@@ -228,7 +232,7 @@ pub const S3Client = struct {
 
     /// Single attempt to download an object. Called by getObject() retry loop.
     fn getObjectOnce(self: *S3Client, key: []const u8) ![]u8 {
-        const path = try std.fmt.allocPrint(self.allocator, "/{s}/{s}", .{ self.bucket, key });
+        const path = try self.objectPath(key);
         defer self.allocator.free(path);
 
         var response = try self.sendRequest("GET", path, "", null, null, 1024 * 1024 * 1024);
@@ -272,7 +276,7 @@ pub const S3Client = struct {
         };
         defer self.allocator.free(query);
 
-        const path = try std.fmt.allocPrint(self.allocator, "/{s}", .{self.bucket});
+        const path = try self.bucketPath();
         defer self.allocator.free(path);
 
         var response = try self.sendRequest("GET", path, query, null, null, 64 * 1024 * 1024);
@@ -348,7 +352,7 @@ pub const S3Client = struct {
     /// Delete an object.
     pub fn deleteObject(self: *S3Client, key: []const u8) !void {
         const start_ns = @import("time_compat").nanoTimestamp();
-        const path = try std.fmt.allocPrint(self.allocator, "/{s}/{s}", .{ self.bucket, key });
+        const path = try self.objectPath(key);
         defer self.allocator.free(path);
 
         var resp_buf: [4096]u8 = undefined;
@@ -369,7 +373,7 @@ pub const S3Client = struct {
 
     /// Check if an object exists.
     pub fn headObject(self: *S3Client, key: []const u8) !bool {
-        const path = try std.fmt.allocPrint(self.allocator, "/{s}/{s}", .{ self.bucket, key });
+        const path = try self.objectPath(key);
         defer self.allocator.free(path);
 
         var resp_buf: [4096]u8 = undefined;
@@ -384,7 +388,7 @@ pub const S3Client = struct {
         if (length == 0) return try self.allocator.alloc(u8, 0);
         if (offset > std.math.maxInt(u64) - (length - 1)) return error.S3RangeInvalid;
 
-        const path = try std.fmt.allocPrint(self.allocator, "/{s}/{s}", .{ self.bucket, key });
+        const path = try self.objectPath(key);
         defer self.allocator.free(path);
 
         const range_header = try std.fmt.allocPrint(self.allocator, "bytes={d}-{d}", .{ offset, offset + length - 1 });
@@ -418,7 +422,7 @@ pub const S3Client = struct {
             return self.putObject(key, data);
         }
 
-        const path = try std.fmt.allocPrint(self.allocator, "/{s}/{s}", .{ self.bucket, key });
+        const path = try self.objectPath(key);
         defer self.allocator.free(path);
 
         // Step 1: Initiate multipart upload
@@ -640,7 +644,10 @@ pub const S3Client = struct {
     };
 
     fn connect(self: *const S3Client) !S3Connection {
-        const fd = try self.connectTcp();
+        const request_host = try self.requestHostName();
+        defer self.allocator.free(request_host);
+
+        const fd = try self.connectTcp(request_host);
         errdefer @import("posix_compat").close(fd);
 
         if (self.scheme == .https) {
@@ -650,7 +657,7 @@ pub const S3Client = struct {
             });
             errdefer tls_ctx.deinit();
 
-            const host_z = try self.allocator.dupeZ(u8, self.host);
+            const host_z = try self.allocator.dupeZ(u8, request_host);
             defer self.allocator.free(host_z);
 
             const ssl = try tls_ctx.wrapConnectionWithHostname(fd, host_z);
@@ -664,11 +671,11 @@ pub const S3Client = struct {
         return .{ .fd = fd };
     }
 
-    fn connectTcp(self: *const S3Client) !std.posix.socket_t {
+    fn connectTcp(self: *const S3Client, host: []const u8) !std.posix.socket_t {
         // Try numeric IP first, fall back to DNS resolution for hostnames (e.g. "minio" in Docker)
-        const address = net.Address.parseIp4(self.host, self.port) catch blk: {
+        const address = net.Address.parseIp4(host, self.port) catch blk: {
             // Hostname — resolve via system DNS (getaddrinfo)
-            const addr_list = net.getAddressList(self.allocator, self.host, self.port) catch return error.UnknownHostName;
+            const addr_list = net.getAddressList(self.allocator, host, self.port) catch return error.UnknownHostName;
             defer addr_list.deinit();
             if (addr_list.addrs.len == 0) return error.UnknownHostName;
             break :blk addr_list.addrs[0];
@@ -869,13 +876,30 @@ pub const S3Client = struct {
         return try std.fmt.allocPrint(alloc, "{s}?{s}", .{ path, query });
     }
 
+    fn bucketPath(self: *const S3Client) ![]u8 {
+        if (!self.path_style) return try self.allocator.dupe(u8, "/");
+        return try std.fmt.allocPrint(self.allocator, "/{s}", .{self.bucket});
+    }
+
+    fn objectPath(self: *const S3Client, key: []const u8) ![]u8 {
+        if (!self.path_style) return try std.fmt.allocPrint(self.allocator, "/{s}", .{key});
+        return try std.fmt.allocPrint(self.allocator, "/{s}/{s}", .{ self.bucket, key });
+    }
+
+    fn requestHostName(self: *const S3Client) ![]u8 {
+        if (self.path_style) return try self.allocator.dupe(u8, self.host);
+        return try std.fmt.allocPrint(self.allocator, "{s}.{s}", .{ self.bucket, self.host });
+    }
+
     fn hostHeader(self: *const S3Client) ![]u8 {
+        const request_host = try self.requestHostName();
+        defer self.allocator.free(request_host);
         if ((self.scheme == .https and self.port == 443) or
             (self.scheme == .http and self.port == 80))
         {
-            return try self.allocator.dupe(u8, self.host);
+            return try self.allocator.dupe(u8, request_host);
         }
-        return try std.fmt.allocPrint(self.allocator, "{s}:{d}", .{ self.host, self.port });
+        return try std.fmt.allocPrint(self.allocator, "{s}:{d}", .{ request_host, self.port });
     }
 
     fn uriEncode(self: *S3Client, value: []const u8) ![]u8 {
@@ -1317,6 +1341,8 @@ test "S3Client init" {
     const client = S3Client.init(testing.allocator, .{});
     try testing.expectEqualStrings("127.0.0.1", client.host);
     try testing.expectEqual(@as(u16, 9000), client.port);
+    try testing.expectEqualStrings("us-east-1", client.signer.region);
+    try testing.expect(client.path_style);
     try testing.expectEqual(@as(u64, 0), client.put_count);
 }
 
@@ -1351,6 +1377,33 @@ test "S3Client host header omits default provider ports" {
     const custom_host = try custom_port_client.hostHeader();
     defer testing.allocator.free(custom_host);
     try testing.expectEqualStrings("r2.example.com:8443", custom_host);
+}
+
+test "S3Client supports provider region and virtual-hosted addressing" {
+    const client = S3Client.init(testing.allocator, .{
+        .host = "https://s3.us-west-2.amazonaws.com",
+        .bucket = "zmq-parity",
+        .region = "us-west-2",
+        .path_style = false,
+    });
+
+    try testing.expectEqualStrings("us-west-2", client.signer.region);
+
+    const host = try client.hostHeader();
+    defer testing.allocator.free(host);
+    try testing.expectEqualStrings("zmq-parity.s3.us-west-2.amazonaws.com", host);
+
+    const request_host = try client.requestHostName();
+    defer testing.allocator.free(request_host);
+    try testing.expectEqualStrings("zmq-parity.s3.us-west-2.amazonaws.com", request_host);
+
+    const bucket_path = try client.bucketPath();
+    defer testing.allocator.free(bucket_path);
+    try testing.expectEqualStrings("/", bucket_path);
+
+    const object_path = try client.objectPath("wal/0000000001");
+    defer testing.allocator.free(object_path);
+    try testing.expectEqualStrings("/wal/0000000001", object_path);
 }
 
 test "S3Client request target includes canonical query" {

@@ -89,6 +89,9 @@ pub const PartitionStore = struct {
         s3_bucket: []const u8 = "automq",
         s3_access_key: []const u8 = "minioadmin",
         s3_secret_key: []const u8 = "minioadmin",
+        s3_scheme: S3Client.Scheme = .http,
+        s3_region: []const u8 = "us-east-1",
+        s3_path_style: bool = true,
         s3_tls_ca_file: ?[]const u8 = null,
         /// S3 WAL mode: use S3WalBatcher for batched, durable S3 writes.
         s3_wal_mode: bool = false,
@@ -127,6 +130,9 @@ pub const PartitionStore = struct {
                 .bucket = config.s3_bucket,
                 .access_key = config.s3_access_key,
                 .secret_key = config.s3_secret_key,
+                .scheme = config.s3_scheme,
+                .region = config.s3_region,
+                .path_style = config.s3_path_style,
                 .tls_ca_file = config.s3_tls_ca_file,
             });
             store.s3_storage = S3Storage.initReal(alloc, &store.s3_client.?);

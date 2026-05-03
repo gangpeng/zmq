@@ -14,6 +14,24 @@ fn envOr(name: [:0]const u8, default: []const u8) []const u8 {
     return getenv(name) orelse default;
 }
 
+fn envBool(name: [:0]const u8, default: bool) bool {
+    const value = getenv(name) orelse return default;
+    if (std.mem.eql(u8, value, "1") or std.ascii.eqlIgnoreCase(value, "true") or std.ascii.eqlIgnoreCase(value, "yes")) {
+        return true;
+    }
+    if (std.mem.eql(u8, value, "0") or std.ascii.eqlIgnoreCase(value, "false") or std.ascii.eqlIgnoreCase(value, "no")) {
+        return false;
+    }
+    return default;
+}
+
+fn envScheme(name: [:0]const u8, default: storage.S3Client.Scheme) !storage.S3Client.Scheme {
+    const value = getenv(name) orelse return default;
+    if (std.ascii.eqlIgnoreCase(value, "http")) return .http;
+    if (std.ascii.eqlIgnoreCase(value, "https")) return .https;
+    return error.InvalidMinioScheme;
+}
+
 fn requireMinioConfig() !storage.S3Client.Config {
     const enabled = getenv("ZMQ_RUN_MINIO_TESTS") orelse return error.SkipZigTest;
     if (!std.mem.eql(u8, enabled, "1") and !std.ascii.eqlIgnoreCase(enabled, "true")) {
@@ -29,12 +47,18 @@ fn requireMinioConfig() !storage.S3Client.Config {
         .bucket = envOr("ZMQ_S3_BUCKET", "zmq-minio-it"),
         .access_key = envOr("ZMQ_S3_ACCESS_KEY", "minioadmin"),
         .secret_key = envOr("ZMQ_S3_SECRET_KEY", "minioadmin"),
+        .scheme = try envScheme("ZMQ_S3_SCHEME", .http),
+        .region = envOr("ZMQ_S3_REGION", "us-east-1"),
+        .path_style = envBool("ZMQ_S3_PATH_STYLE", true),
+        .tls_ca_file = getenv("ZMQ_S3_TLS_CA_FILE"),
     };
 }
 
 fn initMinioClient() !storage.S3Client {
     var client = storage.S3Client.init(testing.allocator, try requireMinioConfig());
-    try client.ensureBucket();
+    if (!envBool("ZMQ_S3_SKIP_ENSURE_BUCKET", false)) {
+        try client.ensureBucket();
+    }
     return client;
 }
 
@@ -62,6 +86,11 @@ fn allocMultipartData(alloc: std.mem.Allocator) ![]u8 {
         byte.* = @intCast(i % 251);
     }
     return data;
+}
+
+fn requireProviderGate(name: [:0]const u8) !void {
+    if (!envBool(name, false)) return error.SkipZigTest;
+    _ = try requireMinioConfig();
 }
 
 test "MinIO S3Storage object writer get range list delete round-trip" {
@@ -210,4 +239,29 @@ test "MinIO PartitionStore S3 WAL produce rebuilds and resumes" {
     defer if (merged.records.len > 0) testing.allocator.free(@constCast(merged.records));
     try testing.expectEqual(@as(i16, 0), merged.error_code);
     try testing.expectEqualStrings("live-alive-blive-c", merged.records);
+}
+
+test "MinIO/S3 provider ListObjects pagination gate" {
+    try requireProviderGate("ZMQ_S3_REQUIRE_LIST_PAGINATION");
+
+    var client = try initMinioClient();
+    var s3 = storage.S3Storage.initReal(testing.allocator, &client);
+
+    const prefix = try uniqueKey(testing.allocator, "integration/pagination");
+    defer testing.allocator.free(prefix);
+    defer cleanupPrefix(&s3, prefix);
+
+    const object_count = 1005;
+    var i: usize = 0;
+    while (i < object_count) : (i += 1) {
+        const key = try std.fmt.allocPrint(testing.allocator, "{s}/{d:0>4}", .{ prefix, i });
+        defer testing.allocator.free(key);
+        try s3.putObject(key, "x");
+    }
+
+    const keys = try s3.listObjectKeys(prefix);
+    defer freeKeys(testing.allocator, keys);
+    try testing.expectEqual(@as(usize, object_count), keys.len);
+    try testing.expect(std.mem.endsWith(u8, keys[0], "/0000"));
+    try testing.expect(std.mem.endsWith(u8, keys[keys.len - 1], "/1004"));
 }

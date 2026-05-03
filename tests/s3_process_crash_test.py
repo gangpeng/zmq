@@ -18,6 +18,11 @@ Optional environment:
     ZMQ_S3_BUCKET              unique bucket per run
     ZMQ_S3_ACCESS_KEY          minioadmin
     ZMQ_S3_SECRET_KEY          minioadmin
+    ZMQ_S3_SCHEME              http
+    ZMQ_S3_REGION              us-east-1
+    ZMQ_S3_PATH_STYLE          true
+    ZMQ_S3_TLS_CA_FILE         optional CA file for HTTPS providers
+    ZMQ_S3_SKIP_MINIO_HEALTH   0; set to 1 for non-MinIO providers
     ZMQ_TEST_BROKER_PORT       29092
     ZMQ_TEST_CONTROLLER_PORT   29093
     ZMQ_TEST_METRICS_PORT      29090
@@ -49,6 +54,11 @@ S3_PORT = env_int("ZMQ_S3_PORT", 9000)
 S3_BUCKET = os.environ.get("ZMQ_S3_BUCKET", f"zmq-crash-{os.getpid()}-{int(time.time())}")
 S3_ACCESS_KEY = os.environ.get("ZMQ_S3_ACCESS_KEY", "minioadmin")
 S3_SECRET_KEY = os.environ.get("ZMQ_S3_SECRET_KEY", "minioadmin")
+S3_SCHEME = os.environ.get("ZMQ_S3_SCHEME", "http")
+S3_REGION = os.environ.get("ZMQ_S3_REGION", "us-east-1")
+S3_PATH_STYLE = os.environ.get("ZMQ_S3_PATH_STYLE", "true")
+S3_TLS_CA_FILE = os.environ.get("ZMQ_S3_TLS_CA_FILE")
+S3_SKIP_MINIO_HEALTH = os.environ.get("ZMQ_S3_SKIP_MINIO_HEALTH", "0").lower() in ("1", "true", "yes")
 BROKER_PORT = env_int("ZMQ_TEST_BROKER_PORT", 29092)
 CONTROLLER_PORT = env_int("ZMQ_TEST_CONTROLLER_PORT", 29093)
 METRICS_PORT = env_int("ZMQ_TEST_METRICS_PORT", 29090)
@@ -310,10 +320,13 @@ def minio_health_url():
         if parsed.port is not None:
             return f"{endpoint}/minio/health/live"
         return f"{endpoint}:{S3_PORT}/minio/health/live"
-    return f"http://{endpoint}:{S3_PORT}/minio/health/live"
+    scheme = os.environ.get("ZMQ_S3_SCHEME", "http")
+    return f"{scheme}://{endpoint}:{S3_PORT}/minio/health/live"
 
 
 def require_minio():
+    if S3_SKIP_MINIO_HEALTH:
+        return
     try:
         with urllib.request.urlopen(minio_health_url(), timeout=3) as response:
             if response.status != 200:
@@ -358,6 +371,12 @@ def start_broker(data_dir, log_path):
         S3_ACCESS_KEY,
         "--s3-secret-key",
         S3_SECRET_KEY,
+        "--s3-scheme",
+        S3_SCHEME,
+        "--s3-region",
+        S3_REGION,
+        "--s3-path-style",
+        S3_PATH_STYLE,
         "--cluster-id",
         "zmq-s3-process-crash",
         "--advertised-host",
@@ -371,6 +390,8 @@ def start_broker(data_dir, log_path):
         "--compaction-interval",
         "3600000",
     ]
+    if S3_TLS_CA_FILE:
+        args.extend(["--s3-ca-file", S3_TLS_CA_FILE])
     proc = subprocess.Popen(args, stdout=log_file, stderr=subprocess.STDOUT)
     proc._zmq_log_file = log_file
     wait_for_broker(proc, log_path)

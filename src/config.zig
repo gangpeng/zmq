@@ -113,7 +113,7 @@ pub const ConfigFile = struct {
 
 /// Apply config file properties to BrokerConfig.
 /// Supports the following Kafka-standard properties:
-/// - s3.endpoint.host, s3.endpoint.port, s3.bucket, s3.access.key, s3.secret.key, s3.tls.ca.file
+/// - s3.endpoint.host, s3.endpoint.port, s3.bucket, s3.access.key, s3.secret.key, s3.scheme, s3.region, s3.path.style, s3.tls.ca.file
 /// - log.dirs (data directory)
 /// - num.partitions (default partition count for auto-created topics)
 /// - default.replication.factor
@@ -125,6 +125,15 @@ pub fn applyConfig(config: *@import("broker").Broker.BrokerConfig, cfg: *const C
     if (cfg.getString("s3.bucket")) |b| config.s3_bucket = b;
     if (cfg.getString("s3.access.key")) |k| config.s3_access_key = k;
     if (cfg.getString("s3.secret.key")) |k| config.s3_secret_key = k;
+    if (cfg.getString("s3.scheme")) |s| {
+        if (std.ascii.eqlIgnoreCase(s, "https")) {
+            config.s3_scheme = .https;
+        } else if (std.ascii.eqlIgnoreCase(s, "http")) {
+            config.s3_scheme = .http;
+        }
+    }
+    if (cfg.getString("s3.region")) |r| config.s3_region = r;
+    config.s3_path_style = cfg.getBool("s3.path.style", config.s3_path_style);
     if (cfg.getString("s3.tls.ca.file")) |f| config.s3_tls_ca_file = f;
     if (cfg.getString("log.dirs")) |d| config.data_dir = d;
 
@@ -261,4 +270,21 @@ test "ConfigFile applies client telemetry export sink" {
     var broker_config = @import("broker").Broker.BrokerConfig{};
     applyConfig(&broker_config, &cfg);
     try testing.expectEqualStrings("/var/lib/zmq/client-telemetry.jsonl", broker_config.client_telemetry_export_path.?);
+}
+
+test "ConfigFile applies S3 provider region and addressing" {
+    var cfg = ConfigFile.init(testing.allocator);
+    defer cfg.deinit();
+
+    try cfg.parse(
+        \\s3.scheme=https
+        \\s3.region=us-west-2
+        \\s3.path.style=false
+    );
+
+    var broker_config = @import("broker").Broker.BrokerConfig{};
+    applyConfig(&broker_config, &cfg);
+    try testing.expectEqual(@import("storage").S3Client.Scheme.https, broker_config.s3_scheme);
+    try testing.expectEqualStrings("us-west-2", broker_config.s3_region);
+    try testing.expect(!broker_config.s3_path_style);
 }

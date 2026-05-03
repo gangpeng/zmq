@@ -19,10 +19,14 @@ pub const AwsSigV4 = struct {
     service: []const u8,
 
     pub fn init(access_key: []const u8, secret_key: []const u8) AwsSigV4 {
+        return initWithRegion(access_key, secret_key, "us-east-1");
+    }
+
+    pub fn initWithRegion(access_key: []const u8, secret_key: []const u8, region: []const u8) AwsSigV4 {
         return .{
             .access_key = access_key,
             .secret_key = secret_key,
-            .region = "us-east-1",
+            .region = region,
             .service = "s3",
         };
     }
@@ -195,6 +199,24 @@ test "SigV4 signing deterministic" {
 
     // Same inputs should produce same signature
     try testing.expectEqualStrings(auth1, auth2);
+}
+
+test "SigV4 signing honors configured region" {
+    const signer = AwsSigV4.initWithRegion("AKID", "SECRET", "us-west-2");
+
+    const auth = try signer.sign(
+        testing.allocator,
+        "GET",
+        "/bucket/key",
+        "",
+        "bucket.s3.us-west-2.amazonaws.com",
+        AwsSigV4.EMPTY_PAYLOAD_HASH,
+        "20260101",
+        "20260101T000000Z",
+    );
+    defer testing.allocator.free(auth);
+
+    try testing.expect(std.mem.indexOf(u8, auth, "/20260101/us-west-2/s3/aws4_request") != null);
 }
 
 test "SigV4 different methods produce different signatures" {

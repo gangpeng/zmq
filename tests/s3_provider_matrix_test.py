@@ -18,8 +18,17 @@ Per-profile overrides:
     For profile "aws_us_east_1", set ZMQ_S3_AWS_US_EAST_1_ENDPOINT,
     ZMQ_S3_AWS_US_EAST_1_PORT, ZMQ_S3_AWS_US_EAST_1_BUCKET,
     ZMQ_S3_AWS_US_EAST_1_ACCESS_KEY, ZMQ_S3_AWS_US_EAST_1_SECRET_KEY.
-    Optional ZMQ_S3_<PROFILE>_REGION and ZMQ_S3_<PROFILE>_PATH_STYLE are passed
-    through for providers whose client configuration uses them.
+    Optional ZMQ_S3_<PROFILE>_SCHEME, ZMQ_S3_<PROFILE>_REGION,
+    ZMQ_S3_<PROFILE>_PATH_STYLE, ZMQ_S3_<PROFILE>_TLS_CA_FILE,
+    ZMQ_S3_<PROFILE>_SKIP_ENSURE_BUCKET, and
+    ZMQ_S3_<PROFILE>_SKIP_MINIO_HEALTH are passed through for HTTPS and
+    non-path-style providers.
+
+Per-profile gates:
+    ZMQ_S3_<PROFILE>_REQUIRE_LIST_PAGINATION=1 enables a live 1005-object
+    ListObjectsV2 pagination gate for providers in that profile.
+    ZMQ_S3_<PROFILE>_RUN_PROCESS_CRASH=1 also runs the broker-process
+    crash/replacement harness with that provider's S3 settings.
 """
 
 import os
@@ -64,6 +73,10 @@ def profile_setting(profile, suffix, fallback):
     return os.environ.get(profile_key(profile, suffix), os.environ.get(f"ZMQ_S3_{suffix}", fallback))
 
 
+def truthy(value):
+    return str(value).strip().lower() in ("1", "true", "yes", "on")
+
+
 def provider_env(profile):
     env = os.environ.copy()
     env["ZMQ_RUN_MINIO_TESTS"] = "1"
@@ -73,18 +86,41 @@ def provider_env(profile):
     env["ZMQ_S3_ACCESS_KEY"] = profile_setting(profile, "ACCESS_KEY", "minioadmin")
     env["ZMQ_S3_SECRET_KEY"] = profile_setting(profile, "SECRET_KEY", "minioadmin")
 
+    scheme = profile_setting(profile, "SCHEME", None)
+    if scheme:
+        env["ZMQ_S3_SCHEME"] = scheme
     region = profile_setting(profile, "REGION", None)
     if region:
         env["ZMQ_S3_REGION"] = region
     path_style = profile_setting(profile, "PATH_STYLE", None)
     if path_style:
         env["ZMQ_S3_PATH_STYLE"] = path_style
+    tls_ca_file = profile_setting(profile, "TLS_CA_FILE", None)
+    if tls_ca_file:
+        env["ZMQ_S3_TLS_CA_FILE"] = tls_ca_file
+    skip_ensure_bucket = profile_setting(profile, "SKIP_ENSURE_BUCKET", None)
+    if skip_ensure_bucket:
+        env["ZMQ_S3_SKIP_ENSURE_BUCKET"] = skip_ensure_bucket
+    skip_minio_health = profile_setting(profile, "SKIP_MINIO_HEALTH", None)
+    if skip_minio_health:
+        env["ZMQ_S3_SKIP_MINIO_HEALTH"] = skip_minio_health
+    require_list_pagination = profile_setting(profile, "REQUIRE_LIST_PAGINATION", None)
+    if require_list_pagination:
+        env["ZMQ_S3_REQUIRE_LIST_PAGINATION"] = require_list_pagination
     return env
+
+
+def profile_enabled(profile, suffix):
+    return truthy(profile_setting(profile, suffix, "0"))
 
 
 def run_profile(profile):
     env = provider_env(profile)
     run([ZIG, "build", "test-minio", "--summary", "all"], timeout=600, env=env)
+    if profile_enabled(profile, "RUN_PROCESS_CRASH"):
+        process_env = env.copy()
+        process_env["ZMQ_RUN_PROCESS_CRASH_TESTS"] = "1"
+        run([ZIG, "build", "test-s3-process-crash", "--summary", "all"], timeout=900, env=process_env)
     print(
         "ok: S3 provider profile "
         f"{profile} endpoint={env['ZMQ_S3_ENDPOINT']}:{env['ZMQ_S3_PORT']} bucket={env['ZMQ_S3_BUCKET']}"
@@ -111,6 +147,12 @@ def self_test():
         os.environ["ZMQ_S3_AWS_US_EAST_1_PORT"] = "443"
         os.environ["ZMQ_S3_AWS_US_EAST_1_BUCKET"] = "zmq-parity"
         os.environ["ZMQ_S3_AWS_US_EAST_1_REGION"] = "us-east-1"
+        os.environ["ZMQ_S3_AWS_US_EAST_1_SCHEME"] = "https"
+        os.environ["ZMQ_S3_AWS_US_EAST_1_PATH_STYLE"] = "false"
+        os.environ["ZMQ_S3_AWS_US_EAST_1_SKIP_ENSURE_BUCKET"] = "1"
+        os.environ["ZMQ_S3_AWS_US_EAST_1_SKIP_MINIO_HEALTH"] = "1"
+        os.environ["ZMQ_S3_AWS_US_EAST_1_REQUIRE_LIST_PAGINATION"] = "1"
+        os.environ["ZMQ_S3_AWS_US_EAST_1_RUN_PROCESS_CRASH"] = "true"
 
         names = profile_names()
         if names != ["minio", "aws_us_east_1"]:
@@ -125,6 +167,18 @@ def self_test():
             raise MatrixError("profile bucket override failed")
         if env["ZMQ_S3_REGION"] != "us-east-1":
             raise MatrixError("profile region override failed")
+        if env["ZMQ_S3_SCHEME"] != "https":
+            raise MatrixError("profile scheme override failed")
+        if env["ZMQ_S3_PATH_STYLE"] != "false":
+            raise MatrixError("profile path-style override failed")
+        if env["ZMQ_S3_SKIP_ENSURE_BUCKET"] != "1":
+            raise MatrixError("profile skip-ensure-bucket override failed")
+        if env["ZMQ_S3_SKIP_MINIO_HEALTH"] != "1":
+            raise MatrixError("profile skip-minio-health override failed")
+        if env["ZMQ_S3_REQUIRE_LIST_PAGINATION"] != "1":
+            raise MatrixError("profile pagination gate override failed")
+        if not profile_enabled("aws_us_east_1", "RUN_PROCESS_CRASH"):
+            raise MatrixError("profile process-crash gate override failed")
 
         print("ok: S3 provider matrix self-test")
         return 0

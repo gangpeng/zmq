@@ -6,6 +6,7 @@ const network = @import("network");
 const Server = network.Server;
 const MetricsServer = network.MetricsServer;
 const RaftClientPool = network.RaftClientPool;
+const storage = @import("storage");
 const broker_mod = @import("broker");
 const handler = broker_mod.handler;
 const Broker = broker_mod.Broker;
@@ -48,6 +49,22 @@ fn writeAll(fd: posix.fd_t, bytes: []const u8) !void {
             else => return error.WriteFailed,
         }
     }
+}
+
+fn parseBoolFlag(text: []const u8, default: bool) bool {
+    if (std.mem.eql(u8, text, "1") or std.ascii.eqlIgnoreCase(text, "true") or std.ascii.eqlIgnoreCase(text, "yes")) {
+        return true;
+    }
+    if (std.mem.eql(u8, text, "0") or std.ascii.eqlIgnoreCase(text, "false") or std.ascii.eqlIgnoreCase(text, "no")) {
+        return false;
+    }
+    return default;
+}
+
+fn parseS3Scheme(text: []const u8, default: storage.S3Client.Scheme) storage.S3Client.Scheme {
+    if (std.ascii.eqlIgnoreCase(text, "https")) return .https;
+    if (std.ascii.eqlIgnoreCase(text, "http")) return .http;
+    return default;
 }
 
 /// Global pointers for signal handler access.
@@ -158,6 +175,9 @@ pub fn main(init: std.process.Init) !void {
     var s3_bucket: []const u8 = "automq";
     var s3_access_key: []const u8 = "minioadmin";
     var s3_secret_key: []const u8 = "minioadmin";
+    var s3_scheme: storage.S3Client.Scheme = .http;
+    var s3_region: []const u8 = "us-east-1";
+    var s3_path_style: bool = true;
     var s3_tls_ca_file: ?[]const u8 = null;
     var node_id: i32 = 0;
     var config_path: ?[]const u8 = null;
@@ -203,6 +223,12 @@ pub fn main(init: std.process.Init) !void {
             if (args.next()) |k| s3_access_key = k;
         } else if (std.mem.eql(u8, arg, "--s3-secret-key")) {
             if (args.next()) |k| s3_secret_key = k;
+        } else if (std.mem.eql(u8, arg, "--s3-scheme")) {
+            if (args.next()) |v| s3_scheme = parseS3Scheme(v, s3_scheme);
+        } else if (std.mem.eql(u8, arg, "--s3-region")) {
+            if (args.next()) |r| s3_region = r;
+        } else if (std.mem.eql(u8, arg, "--s3-path-style")) {
+            if (args.next()) |v| s3_path_style = parseBoolFlag(v, s3_path_style);
         } else if (std.mem.eql(u8, arg, "--s3-ca-file")) {
             s3_tls_ca_file = args.next();
         } else if (std.mem.eql(u8, arg, "--metrics-port")) {
@@ -267,6 +293,9 @@ pub fn main(init: std.process.Init) !void {
         s3_bucket = cfg.getStringOr("s3.bucket", s3_bucket);
         s3_access_key = cfg.getStringOr("s3.access.key", s3_access_key);
         s3_secret_key = cfg.getStringOr("s3.secret.key", s3_secret_key);
+        if (cfg.getString("s3.scheme")) |s| s3_scheme = parseS3Scheme(s, s3_scheme);
+        s3_region = cfg.getStringOr("s3.region", s3_region);
+        s3_path_style = cfg.getBool("s3.path.style", s3_path_style);
         if (s3_tls_ca_file == null) s3_tls_ca_file = cfg.getString("s3.tls.ca.file");
         port = cfg.getInt(u16, "listeners.port", port);
         metrics_port = cfg.getInt(u16, "metrics.port", metrics_port);
@@ -394,6 +423,9 @@ pub fn main(init: std.process.Init) !void {
             .s3_bucket = s3_bucket,
             .s3_access_key = s3_access_key,
             .s3_secret_key = s3_secret_key,
+            .s3_scheme = s3_scheme,
+            .s3_region = s3_region,
+            .s3_path_style = s3_path_style,
             .s3_tls_ca_file = s3_tls_ca_file,
             .advertised_host = advertised_host,
             .s3_wal_batch_size = s3_wal_batch_size,
