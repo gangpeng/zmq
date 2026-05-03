@@ -12,6 +12,7 @@
 
 const std = @import("std");
 const testing = std.testing;
+const fs = @import("fs_compat");
 
 // --- Module imports (via barrel re-exports registered in build.zig) ---
 const security = @import("security");
@@ -621,6 +622,61 @@ test "Cross-cutting: SASL/PLAIN and SCRAM authenticators coexist" {
     // PLAIN auth rejects SCRAM user (different password store)
     const cross_result = plain_auth.authenticate("\x00modern-client\x00scrampass");
     try testing.expect(!cross_result.success);
+}
+
+test "Observability dashboard and alerts reference exported metrics" {
+    const alloc = testing.allocator;
+
+    const dashboard_file = try fs.cwd().openFile("docs/observability/zmq-grafana-dashboard.json", .{});
+    defer dashboard_file.close();
+    const dashboard = try dashboard_file.readToEndAlloc(alloc, 256 * 1024);
+    defer alloc.free(dashboard);
+
+    var parsed_dashboard = try std.json.parseFromSlice(std.json.Value, alloc, dashboard, .{});
+    defer parsed_dashboard.deinit();
+
+    const dashboard_metrics = [_][]const u8{
+        "kafka_server_requests_total",
+        "kafka_server_api_errors_total",
+        "kafka_server_request_latency_seconds_bucket",
+        "kafka_network_connections_active",
+        "s3_requests_total",
+        "s3_request_errors_total",
+        "s3_request_duration_seconds_bucket",
+        "log_cache_size_bytes",
+        "s3_block_cache_size_bytes",
+        "kafka_client_telemetry_pushes_total",
+        "kafka_client_telemetry_terminations_total",
+        "kafka_client_telemetry_samples",
+        "kafka_client_telemetry_bytes",
+        "raft_role",
+        "raft_current_epoch",
+        "raft_commit_index",
+    };
+    for (dashboard_metrics) |metric| {
+        try testing.expect(std.mem.indexOf(u8, dashboard, metric) != null);
+    }
+    try testing.expect(std.mem.indexOf(u8, dashboard, "ZMQ AutoMQ Parity Overview") != null);
+
+    const alerts_file = try fs.cwd().openFile("docs/observability/zmq-prometheus-alerts.yaml", .{});
+    defer alerts_file.close();
+    const alerts = try alerts_file.readToEndAlloc(alloc, 128 * 1024);
+    defer alloc.free(alerts);
+
+    const alert_metrics = [_][]const u8{
+        "kafka_server_api_errors_total",
+        "kafka_server_requests_total",
+        "kafka_server_request_latency_seconds_bucket",
+        "raft_role",
+        "s3_request_errors_total",
+        "s3_request_duration_seconds_bucket",
+        "compaction_errors_total",
+        "kafka_client_telemetry_bytes",
+    };
+    for (alert_metrics) |metric| {
+        try testing.expect(std.mem.indexOf(u8, alerts, metric) != null);
+    }
+    try testing.expect(std.mem.indexOf(u8, alerts, "severity: critical") != null);
 }
 
 // ---------------------------------------------------------------

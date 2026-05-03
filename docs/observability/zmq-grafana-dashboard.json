@@ -1,0 +1,286 @@
+{
+  "annotations": {
+    "list": []
+  },
+  "editable": true,
+  "fiscalYearStartMonth": 0,
+  "graphTooltip": 0,
+  "panels": [
+    {
+      "datasource": "${DS_PROMETHEUS}",
+      "fieldConfig": {
+        "defaults": {
+          "unit": "reqps"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 0,
+        "y": 0
+      },
+      "id": 1,
+      "targets": [
+        {
+          "expr": "sum(rate(kafka_server_requests_total[5m]))",
+          "legendFormat": "requests"
+        },
+        {
+          "expr": "sum(rate(kafka_server_produce_requests_total[5m]))",
+          "legendFormat": "produce"
+        },
+        {
+          "expr": "sum(rate(kafka_server_fetch_requests_total[5m]))",
+          "legendFormat": "fetch"
+        }
+      ],
+      "title": "Broker Request Rate",
+      "type": "timeseries"
+    },
+    {
+      "datasource": "${DS_PROMETHEUS}",
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 8,
+        "y": 0
+      },
+      "id": 2,
+      "targets": [
+        {
+          "expr": "sum(rate(kafka_server_api_errors_total[5m])) / clamp_min(sum(rate(kafka_server_requests_total[5m])), 1)",
+          "legendFormat": "api errors"
+        }
+      ],
+      "title": "API Error Ratio",
+      "type": "timeseries"
+    },
+    {
+      "datasource": "${DS_PROMETHEUS}",
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 16,
+        "y": 0
+      },
+      "id": 3,
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.99, sum(rate(kafka_server_request_latency_seconds_bucket[5m])) by (le))",
+          "legendFormat": "p99 all requests"
+        },
+        {
+          "expr": "histogram_quantile(0.99, sum(rate(kafka_server_produce_latency_seconds_bucket[5m])) by (le))",
+          "legendFormat": "p99 produce"
+        },
+        {
+          "expr": "histogram_quantile(0.99, sum(rate(kafka_server_fetch_latency_seconds_bucket[5m])) by (le))",
+          "legendFormat": "p99 fetch"
+        }
+      ],
+      "title": "Request Latency",
+      "type": "timeseries"
+    },
+    {
+      "datasource": "${DS_PROMETHEUS}",
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 0,
+        "y": 8
+      },
+      "id": 4,
+      "targets": [
+        {
+          "expr": "kafka_network_connections_active",
+          "legendFormat": "connections"
+        },
+        {
+          "expr": "kafka_server_topic_count",
+          "legendFormat": "topics"
+        },
+        {
+          "expr": "kafka_server_group_count",
+          "legendFormat": "groups"
+        }
+      ],
+      "title": "Broker State",
+      "type": "timeseries"
+    },
+    {
+      "datasource": "${DS_PROMETHEUS}",
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 8,
+        "y": 8
+      },
+      "id": 5,
+      "targets": [
+        {
+          "expr": "sum(rate(s3_requests_total[5m])) by (operation)",
+          "legendFormat": "{{operation}}"
+        },
+        {
+          "expr": "sum(rate(s3_request_errors_total[5m])) by (operation)",
+          "legendFormat": "{{operation}} errors"
+        }
+      ],
+      "title": "S3 Request Volume",
+      "type": "timeseries"
+    },
+    {
+      "datasource": "${DS_PROMETHEUS}",
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 16,
+        "y": 8
+      },
+      "id": 6,
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.99, sum(rate(s3_request_duration_seconds_bucket[5m])) by (le, operation))",
+          "legendFormat": "{{operation}} p99"
+        }
+      ],
+      "title": "S3 Latency",
+      "type": "timeseries"
+    },
+    {
+      "datasource": "${DS_PROMETHEUS}",
+      "fieldConfig": {
+        "defaults": {
+          "unit": "bytes"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 0,
+        "y": 16
+      },
+      "id": 7,
+      "targets": [
+        {
+          "expr": "log_cache_size_bytes",
+          "legendFormat": "log cache"
+        },
+        {
+          "expr": "s3_block_cache_size_bytes",
+          "legendFormat": "s3 block cache"
+        },
+        {
+          "expr": "kafka_client_telemetry_bytes",
+          "legendFormat": "client telemetry"
+        }
+      ],
+      "title": "Memory-Oriented Gauges",
+      "type": "timeseries"
+    },
+    {
+      "datasource": "${DS_PROMETHEUS}",
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 8,
+        "y": 16
+      },
+      "id": 8,
+      "targets": [
+        {
+          "expr": "kafka_client_telemetry_samples",
+          "legendFormat": "retained samples"
+        },
+        {
+          "expr": "sum(rate(kafka_client_telemetry_pushes_total[5m]))",
+          "legendFormat": "pushes"
+        },
+        {
+          "expr": "sum(rate(kafka_client_telemetry_terminations_total[5m]))",
+          "legendFormat": "terminations"
+        }
+      ],
+      "title": "Client Telemetry",
+      "type": "timeseries"
+    },
+    {
+      "datasource": "${DS_PROMETHEUS}",
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 16,
+        "y": 16
+      },
+      "id": 9,
+      "targets": [
+        {
+          "expr": "raft_role",
+          "legendFormat": "role"
+        },
+        {
+          "expr": "raft_current_epoch",
+          "legendFormat": "epoch"
+        },
+        {
+          "expr": "raft_commit_index",
+          "legendFormat": "commit index"
+        }
+      ],
+      "title": "Raft State",
+      "type": "timeseries"
+    }
+  ],
+  "refresh": "10s",
+  "schemaVersion": 39,
+  "tags": [
+    "zmq",
+    "automq",
+    "kafka"
+  ],
+  "templating": {
+    "list": [
+      {
+        "current": {},
+        "label": "Prometheus",
+        "name": "DS_PROMETHEUS",
+        "query": "prometheus",
+        "type": "datasource"
+      }
+    ]
+  },
+  "time": {
+    "from": "now-1h",
+    "to": "now"
+  },
+  "timezone": "browser",
+  "title": "ZMQ AutoMQ Parity Overview",
+  "uid": "zmq-automq-parity",
+  "version": 1
+}
