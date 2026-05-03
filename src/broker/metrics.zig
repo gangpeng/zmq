@@ -133,6 +133,8 @@ pub fn registerCompactionMetrics(registry: *MetricRegistry) !void {
     try registry.registerCounter("compaction_splits_total", "Total SSOs split into SOs");
     try registry.registerCounter("compaction_merges_total", "Total merge operations");
     try registry.registerCounter("compaction_cleanups_total", "Total cleanup deletions");
+    try registry.registerCounter("compaction_destroyed_total", "Total destroyed S3 objects physically deleted");
+    try registry.registerCounter("compaction_expired_prepared_total", "Total expired prepared S3 objects");
     try registry.registerCounter("compaction_errors_total", "Failed compaction operations");
     try registry.registerGauge("compaction_orphaned_keys", "Orphaned S3 keys pending retry");
 }
@@ -244,6 +246,11 @@ test "registerCompactionMetrics" {
     try testing.expect(registry.counters.contains("compaction_cycles_total"));
     try testing.expect(registry.histograms.contains("compaction_cycle_duration_seconds"));
     try testing.expect(registry.counters.contains("compaction_splits_total"));
+    try testing.expect(registry.counters.contains("compaction_merges_total"));
+    try testing.expect(registry.counters.contains("compaction_cleanups_total"));
+    try testing.expect(registry.counters.contains("compaction_destroyed_total"));
+    try testing.expect(registry.counters.contains("compaction_expired_prepared_total"));
+    try testing.expect(registry.counters.contains("compaction_errors_total"));
     try testing.expect(registry.gauges.contains("compaction_orphaned_keys"));
 }
 

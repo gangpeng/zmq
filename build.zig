@@ -343,6 +343,7 @@ pub fn build(b: *std.Build) void {
                 .{ .name = "storage", .module = storage_mod },
                 .{ .name = "security", .module = security_mod },
                 .{ .name = "network", .module = network_mod },
+                .{ .name = "broker", .module = broker_mod },
                 .{ .name = "time_compat", .module = time_compat_mod },
                 .{ .name = "posix_compat", .module = posix_compat_mod },
                 .{ .name = "mutex_compat", .module = mutex_compat_mod },

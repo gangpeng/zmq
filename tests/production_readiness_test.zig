@@ -39,6 +39,9 @@ const JsonLogger = core.JsonLogger;
 const network = @import("network");
 const MetricsServer = network.MetricsServer;
 
+const broker = @import("broker");
+const broker_metrics = broker.metrics;
+
 // ---------------------------------------------------------------
 // Test 1: TLS Configuration and Hostname Verification Setup
 // ---------------------------------------------------------------
@@ -627,6 +630,10 @@ test "Cross-cutting: SASL/PLAIN and SCRAM authenticators coexist" {
 test "Observability dashboard and alerts reference exported metrics" {
     const alloc = testing.allocator;
 
+    var registry = MetricRegistry.init(alloc);
+    defer registry.deinit();
+    try registerOperationalMetricCorpus(&registry);
+
     const dashboard_file = try fs.cwd().openFile("docs/observability/zmq-grafana-dashboard.json", .{});
     defer dashboard_file.close();
     const dashboard = try dashboard_file.readToEndAlloc(alloc, 256 * 1024);
@@ -635,10 +642,19 @@ test "Observability dashboard and alerts reference exported metrics" {
     var parsed_dashboard = try std.json.parseFromSlice(std.json.Value, alloc, dashboard, .{});
     defer parsed_dashboard.deinit();
 
+    var dashboard_expressions = std.array_list.Managed([]const u8).init(alloc);
+    defer dashboard_expressions.deinit();
+    try collectJsonPromqlExpressions(&parsed_dashboard.value, &dashboard_expressions);
+    try testing.expect(dashboard_expressions.items.len >= 9);
+
     const dashboard_metrics = [_][]const u8{
         "kafka_server_requests_total",
+        "kafka_server_produce_requests_total",
+        "kafka_server_fetch_requests_total",
         "kafka_server_api_errors_total",
         "kafka_server_request_latency_seconds_bucket",
+        "kafka_server_produce_latency_seconds_bucket",
+        "kafka_server_fetch_latency_seconds_bucket",
         "kafka_network_connections_active",
         "s3_requests_total",
         "s3_request_errors_total",
@@ -660,10 +676,21 @@ test "Observability dashboard and alerts reference exported metrics" {
     }
     try testing.expect(std.mem.indexOf(u8, dashboard, "ZMQ AutoMQ Parity Overview") != null);
 
+    var dashboard_metric_refs: usize = 0;
+    for (dashboard_expressions.items) |expr| {
+        dashboard_metric_refs += try assertPromqlExpressionMetricsRegistered(&registry, "dashboard", expr);
+    }
+    try testing.expect(dashboard_metric_refs >= dashboard_metrics.len);
+
     const alerts_file = try fs.cwd().openFile("docs/observability/zmq-prometheus-alerts.yaml", .{});
     defer alerts_file.close();
     const alerts = try alerts_file.readToEndAlloc(alloc, 128 * 1024);
     defer alloc.free(alerts);
+
+    var alert_expressions = std.array_list.Managed([]const u8).init(alloc);
+    defer alert_expressions.deinit();
+    try collectYamlPromqlExpressions(alerts, &alert_expressions);
+    try testing.expect(alert_expressions.items.len >= 9);
 
     const alert_metrics = [_][]const u8{
         "kafka_server_api_errors_total",
@@ -691,11 +718,157 @@ test "Observability dashboard and alerts reference exported metrics" {
         try testing.expect(std.mem.indexOf(u8, alerts, name) != null);
     }
     try testing.expect(std.mem.indexOf(u8, alerts, "severity: critical") != null);
+
+    var alert_metric_refs: usize = 0;
+    for (alert_expressions.items) |expr| {
+        alert_metric_refs += try assertPromqlExpressionMetricsRegistered(&registry, "alerts", expr);
+    }
+    try testing.expect(alert_metric_refs >= alert_metrics.len);
 }
 
 // ---------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------
+
+fn registerOperationalMetricCorpus(registry: *MetricRegistry) !void {
+    try broker_metrics.registerBrokerMetrics(registry);
+    try broker_metrics.registerS3Metrics(registry);
+    try broker_metrics.registerCompactionMetrics(registry);
+    try broker_metrics.registerCacheMetrics(registry);
+    try broker_metrics.registerRaftMetrics(registry);
+}
+
+fn collectJsonPromqlExpressions(value: *const std.json.Value, expressions: *std.array_list.Managed([]const u8)) !void {
+    switch (value.*) {
+        .object => |object| {
+            var it = object.iterator();
+            while (it.next()) |entry| {
+                if (std.mem.eql(u8, entry.key_ptr.*, "expr")) {
+                    switch (entry.value_ptr.*) {
+                        .string => |expr| try expressions.append(expr),
+                        else => {},
+                    }
+                }
+                try collectJsonPromqlExpressions(entry.value_ptr, expressions);
+            }
+        },
+        .array => |array| {
+            for (array.items) |*item| {
+                try collectJsonPromqlExpressions(item, expressions);
+            }
+        },
+        else => {},
+    }
+}
+
+fn collectYamlPromqlExpressions(yaml: []const u8, expressions: *std.array_list.Managed([]const u8)) !void {
+    var lines = std.mem.splitScalar(u8, yaml, '\n');
+    while (lines.next()) |line| {
+        const trimmed = std.mem.trim(u8, line, " \t");
+        if (!std.mem.startsWith(u8, trimmed, "expr:")) continue;
+
+        var expr = std.mem.trim(u8, trimmed["expr:".len..], " \t");
+        if (expr.len >= 2) {
+            const first = expr[0];
+            const last = expr[expr.len - 1];
+            if ((first == '"' and last == '"') or (first == '\'' and last == '\'')) {
+                expr = expr[1 .. expr.len - 1];
+            }
+        }
+        try expressions.append(expr);
+    }
+}
+
+fn assertPromqlExpressionMetricsRegistered(registry: *const MetricRegistry, source: []const u8, expr: []const u8) !usize {
+    var metric_refs: usize = 0;
+    var i: usize = 0;
+    while (i < expr.len) {
+        if (!isPromqlIdentStart(expr[i])) {
+            i += 1;
+            continue;
+        }
+
+        const start = i;
+        i += 1;
+        while (i < expr.len and isPromqlIdentChar(expr[i])) : (i += 1) {}
+        const token = expr[start..i];
+        if (!isPromqlMetricIdentifier(token)) continue;
+
+        metric_refs += 1;
+        if (!isRegisteredPrometheusMetric(registry, token)) {
+            std.debug.print("unregistered {s} metric reference: {s} in expression: {s}\n", .{ source, token, expr });
+            return error.UnregisteredMetricReference;
+        }
+    }
+    return metric_refs;
+}
+
+fn isRegisteredPrometheusMetric(registry: *const MetricRegistry, name: []const u8) bool {
+    if (registry.counters.contains(name)) return true;
+    if (registry.gauges.contains(name)) return true;
+    if (registry.histograms.contains(name)) return true;
+    if (registry.labeled_counter_meta.contains(name)) return true;
+    if (registry.labeled_gauge_meta.contains(name)) return true;
+    if (registry.labeled_histogram_meta.contains(name)) return true;
+
+    if (stripHistogramPrometheusSuffix(name)) |base| {
+        if (registry.histograms.contains(base)) return true;
+        if (registry.labeled_histogram_meta.contains(base)) return true;
+    }
+    return false;
+}
+
+fn stripHistogramPrometheusSuffix(name: []const u8) ?[]const u8 {
+    const suffixes = [_][]const u8{ "_bucket", "_sum", "_count" };
+    for (suffixes) |suffix| {
+        if (std.mem.endsWith(u8, name, suffix)) {
+            return name[0 .. name.len - suffix.len];
+        }
+    }
+    return null;
+}
+
+fn isPromqlMetricIdentifier(identifier: []const u8) bool {
+    const skipped = [_][]const u8{
+        "avg",
+        "by",
+        "clamp_min",
+        "histogram_quantile",
+        "le",
+        "max",
+        "min",
+        "operation",
+        "rate",
+        "sum",
+        "without",
+    };
+    for (skipped) |item| {
+        if (std.mem.eql(u8, identifier, item)) return false;
+    }
+
+    const metric_prefixes = [_][]const u8{
+        "Kafka_",
+        "cache_",
+        "compaction_",
+        "kafka_",
+        "log_cache_",
+        "raft_",
+        "s3_",
+        "zmq_",
+    };
+    for (metric_prefixes) |prefix| {
+        if (std.mem.startsWith(u8, identifier, prefix)) return true;
+    }
+    return false;
+}
+
+fn isPromqlIdentStart(byte: u8) bool {
+    return (byte >= 'A' and byte <= 'Z') or (byte >= 'a' and byte <= 'z') or byte == '_' or byte == ':';
+}
+
+fn isPromqlIdentChar(byte: u8) bool {
+    return isPromqlIdentStart(byte) or (byte >= '0' and byte <= '9');
+}
 
 /// PBKDF2-HMAC-SHA256 (Hi function from RFC 5802).
 fn pbkdf2HmacSha256(password: []const u8, salt: []const u8, iterations: u32, out: *[32]u8) void {

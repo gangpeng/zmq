@@ -5055,6 +5055,11 @@ pub const Broker = struct {
         const latency_ns = t_done - t_start;
         const latency_secs: f64 = @as(f64, @floatFromInt(@max(latency_ns, 0))) / 1_000_000_000.0;
         self.metrics.observeHistogram("kafka_server_request_latency_seconds", latency_secs);
+        if (api_key == 0) {
+            self.metrics.observeHistogram("kafka_server_produce_latency_seconds", latency_secs);
+        } else if (api_key == 1) {
+            self.metrics.observeHistogram("kafka_server_fetch_latency_seconds", latency_secs);
+        }
         const latency_ms: u64 = @intFromFloat(@max(latency_secs * 1000.0, 0.0));
         self.metrics.addLabeledCounter("Kafka_request_time_milliseconds_total", &.{ api_type_for_metrics, api_version_str }, latency_ms);
         self.metrics.addLabeledCounter("kafka_network_requestmetrics_totaltimems_total", &.{ api_type_for_metrics, api_version_str }, latency_ms);
@@ -26157,6 +26162,9 @@ test "Broker.handleRequest Produce v0 returns generated response" {
     try testing.expectEqual(@as(usize, 1), resp.responses[0].partition_responses.len);
     try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.none)), resp.responses[0].partition_responses[0].error_code);
     try testing.expectEqual(@as(i64, 0), resp.responses[0].partition_responses[0].base_offset);
+    try testing.expectEqual(@as(u64, 1), broker.metrics.counters.get("kafka_server_produce_requests_total").?.value);
+    try testing.expectEqual(@as(u64, 1), broker.metrics.counters.get("kafka_server_brokertopicmetrics_totalproducerequests_total").?.value);
+    try testing.expectEqual(@as(u64, 1), broker.metrics.histograms.get("kafka_server_produce_latency_seconds").?.count);
 }
 
 test "Broker.handleRequest Produce v9 returns generated flexible response" {
@@ -43340,6 +43348,9 @@ test "Broker.handleRequest Fetch v0 returns generated produced data" {
         try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.none)), fetch_resp.responses[0].partitions[0].error_code);
         try testing.expect(fetch_resp.responses[0].partitions[0].records != null);
         try testing.expect(fetch_resp.responses[0].partitions[0].records.?.len > 0);
+        try testing.expectEqual(@as(u64, 1), broker.metrics.counters.get("kafka_server_fetch_requests_total").?.value);
+        try testing.expectEqual(@as(u64, 1), broker.metrics.counters.get("kafka_server_brokertopicmetrics_totalfetchrequests_total").?.value);
+        try testing.expectEqual(@as(u64, 1), broker.metrics.histograms.get("kafka_server_fetch_latency_seconds").?.count);
     }
 }
 
