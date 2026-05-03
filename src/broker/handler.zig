@@ -10860,6 +10860,7 @@ pub const Broker = struct {
 
     fn validateConsumerGroupHeartbeatAssignor(self: *const Broker, group_id: []const u8, server_assignor: []const u8) ErrorCode {
         if (server_assignor.len == 0) return ErrorCode.invalid_request;
+        if (!std.mem.eql(u8, server_assignor, "range")) return ErrorCode.unsupported_assignor;
         const group = self.groups.groups.getPtr(group_id) orelse return ErrorCode.none;
         if (group.protocol_type) |protocol_type| {
             if (!std.mem.eql(u8, protocol_type, "consumer")) return ErrorCode.inconsistent_group_protocol;
@@ -37505,7 +37506,7 @@ test "Broker.handleRequest ConsumerGroupHeartbeat rejects owned partitions outsi
     try testing.expect(foreign_resp.assignment == null);
 }
 
-test "Broker.handleRequest ConsumerGroupHeartbeat validates server assignor changes" {
+test "Broker.handleRequest ConsumerGroupHeartbeat validates server assignors" {
     const Req = generated.consumer_group_heartbeat_request.ConsumerGroupHeartbeatRequest;
     const Resp = generated.consumer_group_heartbeat_response.ConsumerGroupHeartbeatResponse;
 
@@ -37565,9 +37566,39 @@ test "Broker.handleRequest ConsumerGroupHeartbeat validates server assignor chan
     const mismatch_resp = try Resp.deserialize(testing.allocator, mismatch_response.?, &mismatch_rpos, 0);
     defer freeDeserializedConsumerGroupHeartbeatResponse(&mismatch_resp);
     try testing.expectEqual(mismatch_response.?.len, mismatch_rpos);
-    try testing.expectEqual(ErrorCode.inconsistent_group_protocol.toInt(), mismatch_resp.error_code);
+    try testing.expectEqual(ErrorCode.unsupported_assignor.toInt(), mismatch_resp.error_code);
     try testing.expectEqual(@as(i32, 0), mismatch_resp.heartbeat_interval_ms);
     try testing.expect(mismatch_resp.assignment == null);
+
+    const unsupported_join_req = Req{
+        .group_id = "kip848-unsupported-assignor-group",
+        .member_id = "unsupported-assignor-member",
+        .member_epoch = 0,
+        .rebalance_timeout_ms = 30_000,
+        .subscribed_topic_names = &topic_names,
+        .server_assignor = "roundrobin",
+    };
+
+    var unsupported_join_buf: [256]u8 = undefined;
+    var unsupported_join_pos = buildTestRequest(&unsupported_join_buf, 68, 0, 6844, header_mod.requestHeaderVersion(68, 0));
+    unsupported_join_req.serialize(&unsupported_join_buf, &unsupported_join_pos, 0);
+
+    const unsupported_join_response = broker.handleRequest(unsupported_join_buf[0..unsupported_join_pos]);
+    try testing.expect(unsupported_join_response != null);
+    defer testing.allocator.free(unsupported_join_response.?);
+
+    var unsupported_join_rpos: usize = 0;
+    var unsupported_join_response_header = try ResponseHeader.deserialize(testing.allocator, unsupported_join_response.?, &unsupported_join_rpos, header_mod.responseHeaderVersion(68, 0));
+    defer unsupported_join_response_header.deinit(testing.allocator);
+    try testing.expectEqual(@as(i32, 6844), unsupported_join_response_header.correlation_id);
+
+    const unsupported_join_resp = try Resp.deserialize(testing.allocator, unsupported_join_response.?, &unsupported_join_rpos, 0);
+    defer freeDeserializedConsumerGroupHeartbeatResponse(&unsupported_join_resp);
+    try testing.expectEqual(unsupported_join_response.?.len, unsupported_join_rpos);
+    try testing.expectEqual(ErrorCode.unsupported_assignor.toInt(), unsupported_join_resp.error_code);
+    try testing.expectEqual(@as(i32, 0), unsupported_join_resp.heartbeat_interval_ms);
+    try testing.expect(unsupported_join_resp.assignment == null);
+    try testing.expect(broker.groups.groups.getPtr("kip848-unsupported-assignor-group") == null);
 
     const empty_req = Req{
         .group_id = "kip848-assignor-group",

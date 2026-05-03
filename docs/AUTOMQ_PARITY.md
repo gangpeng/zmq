@@ -172,8 +172,8 @@ Status: completed for the initial catalog and DeleteGroups slice.
   subscription lists with a persisted member-epoch bump, persist member rack IDs
   through local/S3 group snapshots, expose them through ConsumerGroupDescribe,
   validate owned topic-partition echoes against the member assignment, reject
-  incompatible server assignor changes and duplicate subscription names, and
-  map stale member epochs/static instance
+  unsupported/incompatible server assignors and duplicate subscription names,
+  and map stale member epochs/static instance
   conflicts to KIP-848
   `FENCED_MEMBER_EPOCH`/`UNRELEASED_INSTANCE_ID` errors.
   OffsetFetch v9 now validates supplied KIP-848 `member_id`/`member_epoch`
