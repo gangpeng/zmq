@@ -10482,9 +10482,23 @@ pub const Broker = struct {
         }
 
         const group_id = req.group_id orelse "";
+        const requested_assignor = if (req.server_assignor) |value| blk: {
+            if (value.len == 0) {
+                const resp = consumerGroupHeartbeatResponse(ErrorCode.invalid_request.toInt(), "empty ConsumerGroupHeartbeat server_assignor", req.member_id, req.member_epoch, 0);
+                return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+            }
+            break :blk value;
+        } else null;
+        if (requested_assignor) |server_assignor| {
+            const assignor_error = self.validateConsumerGroupHeartbeatAssignor(group_id, server_assignor);
+            if (assignor_error != ErrorCode.none) {
+                const resp = consumerGroupHeartbeatResponse(assignor_error.toInt(), null, req.member_id, req.member_epoch, 0);
+                return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+            }
+        }
         const member_id = req.member_id orelse "";
         const instance_id = nonEmptyStringOrNull(req.instance_id);
-        const assignor = if (req.server_assignor) |value| if (value.len > 0) value else "range" else "range";
+        const assignor = requested_assignor orelse "range";
 
         if (req.member_epoch == 0 or req.member_epoch == -2) {
             if (req.member_epoch == -2 and instance_id == null) {
@@ -10761,6 +10775,18 @@ pub const Broker = struct {
                     if (previous_partition == partition) return ErrorCode.invalid_request;
                 }
             }
+        }
+        return ErrorCode.none;
+    }
+
+    fn validateConsumerGroupHeartbeatAssignor(self: *const Broker, group_id: []const u8, server_assignor: []const u8) ErrorCode {
+        if (server_assignor.len == 0) return ErrorCode.invalid_request;
+        const group = self.groups.groups.getPtr(group_id) orelse return ErrorCode.none;
+        if (group.protocol_type) |protocol_type| {
+            if (!std.mem.eql(u8, protocol_type, "consumer")) return ErrorCode.inconsistent_group_protocol;
+        }
+        if (group.protocol_name) |protocol_name| {
+            if (!std.mem.eql(u8, protocol_name, server_assignor)) return ErrorCode.inconsistent_group_protocol;
         }
         return ErrorCode.none;
     }
@@ -37261,6 +37287,99 @@ test "Broker.handleRequest ConsumerGroupHeartbeat validates owned partitions" {
     try testing.expectEqual(ErrorCode.unknown_topic_or_partition.toInt(), bad_partition_resp.error_code);
     try testing.expectEqual(@as(i32, 0), bad_partition_resp.heartbeat_interval_ms);
     try testing.expect(bad_partition_resp.assignment == null);
+}
+
+test "Broker.handleRequest ConsumerGroupHeartbeat validates server assignor changes" {
+    const Req = generated.consumer_group_heartbeat_request.ConsumerGroupHeartbeatRequest;
+    const Resp = generated.consumer_group_heartbeat_response.ConsumerGroupHeartbeatResponse;
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+    try testing.expect(broker.ensureTopic("assignor-topic"));
+
+    const topic_names = [_]?[]const u8{"assignor-topic"};
+    const join_req = Req{
+        .group_id = "kip848-assignor-group",
+        .member_id = "assignor-member",
+        .member_epoch = 0,
+        .rebalance_timeout_ms = 30_000,
+        .subscribed_topic_names = &topic_names,
+        .server_assignor = "range",
+    };
+
+    var join_buf: [256]u8 = undefined;
+    var join_pos = buildTestRequest(&join_buf, 68, 0, 6840, header_mod.requestHeaderVersion(68, 0));
+    join_req.serialize(&join_buf, &join_pos, 0);
+
+    const join_response = broker.handleRequest(join_buf[0..join_pos]);
+    try testing.expect(join_response != null);
+    defer testing.allocator.free(join_response.?);
+
+    var join_rpos: usize = 0;
+    var join_response_header = try ResponseHeader.deserialize(testing.allocator, join_response.?, &join_rpos, header_mod.responseHeaderVersion(68, 0));
+    defer join_response_header.deinit(testing.allocator);
+    try testing.expectEqual(@as(i32, 6840), join_response_header.correlation_id);
+
+    const join_resp = try Resp.deserialize(testing.allocator, join_response.?, &join_rpos, 0);
+    defer freeDeserializedConsumerGroupHeartbeatResponse(&join_resp);
+    try testing.expectEqual(join_response.?.len, join_rpos);
+    try testing.expectEqual(ErrorCode.none.toInt(), join_resp.error_code);
+
+    const mismatch_req = Req{
+        .group_id = "kip848-assignor-group",
+        .member_id = join_resp.member_id,
+        .member_epoch = join_resp.member_epoch,
+        .rebalance_timeout_ms = -1,
+        .server_assignor = "roundrobin",
+    };
+
+    var mismatch_buf: [256]u8 = undefined;
+    var mismatch_pos = buildTestRequest(&mismatch_buf, 68, 0, 6841, header_mod.requestHeaderVersion(68, 0));
+    mismatch_req.serialize(&mismatch_buf, &mismatch_pos, 0);
+
+    const mismatch_response = broker.handleRequest(mismatch_buf[0..mismatch_pos]);
+    try testing.expect(mismatch_response != null);
+    defer testing.allocator.free(mismatch_response.?);
+
+    var mismatch_rpos: usize = 0;
+    var mismatch_response_header = try ResponseHeader.deserialize(testing.allocator, mismatch_response.?, &mismatch_rpos, header_mod.responseHeaderVersion(68, 0));
+    defer mismatch_response_header.deinit(testing.allocator);
+    try testing.expectEqual(@as(i32, 6841), mismatch_response_header.correlation_id);
+
+    const mismatch_resp = try Resp.deserialize(testing.allocator, mismatch_response.?, &mismatch_rpos, 0);
+    defer freeDeserializedConsumerGroupHeartbeatResponse(&mismatch_resp);
+    try testing.expectEqual(mismatch_response.?.len, mismatch_rpos);
+    try testing.expectEqual(ErrorCode.inconsistent_group_protocol.toInt(), mismatch_resp.error_code);
+    try testing.expectEqual(@as(i32, 0), mismatch_resp.heartbeat_interval_ms);
+    try testing.expect(mismatch_resp.assignment == null);
+
+    const empty_req = Req{
+        .group_id = "kip848-assignor-group",
+        .member_id = join_resp.member_id,
+        .member_epoch = join_resp.member_epoch,
+        .rebalance_timeout_ms = -1,
+        .server_assignor = "",
+    };
+
+    var empty_buf: [256]u8 = undefined;
+    var empty_pos = buildTestRequest(&empty_buf, 68, 0, 6842, header_mod.requestHeaderVersion(68, 0));
+    empty_req.serialize(&empty_buf, &empty_pos, 0);
+
+    const empty_response = broker.handleRequest(empty_buf[0..empty_pos]);
+    try testing.expect(empty_response != null);
+    defer testing.allocator.free(empty_response.?);
+
+    var empty_rpos: usize = 0;
+    var empty_response_header = try ResponseHeader.deserialize(testing.allocator, empty_response.?, &empty_rpos, header_mod.responseHeaderVersion(68, 0));
+    defer empty_response_header.deinit(testing.allocator);
+    try testing.expectEqual(@as(i32, 6842), empty_response_header.correlation_id);
+
+    const empty_resp = try Resp.deserialize(testing.allocator, empty_response.?, &empty_rpos, 0);
+    defer freeDeserializedConsumerGroupHeartbeatResponse(&empty_resp);
+    try testing.expectEqual(empty_response.?.len, empty_rpos);
+    try testing.expectEqual(ErrorCode.invalid_request.toInt(), empty_resp.error_code);
+    try testing.expectEqual(@as(i32, 0), empty_resp.heartbeat_interval_ms);
+    try testing.expect(empty_resp.assignment == null);
 }
 
 test "Broker.handleRequest ConsumerGroupHeartbeat returns range assignments across members" {
