@@ -1547,7 +1547,12 @@ pub const Broker = struct {
         return false;
     }
 
-    fn clearShareGroupSessionsForGroup(self: *Broker, group_id: []const u8) bool {
+    const RemovedShareGroupSession = struct {
+        key: []const u8,
+        epoch: i32,
+    };
+
+    fn removeShareGroupSessionsForGroup(self: *Broker, group_id: []const u8, removed_sessions: *std.array_list.Managed(RemovedShareGroupSession)) !bool {
         var removed_any = false;
         while (true) {
             var key_to_remove: ?[]const u8 = null;
@@ -1562,14 +1567,40 @@ pub const Broker = struct {
             }
 
             const key = key_to_remove orelse break;
-            if (self.share_group_sessions.fetchRemove(key)) |removed| {
-                self.allocator.free(removed.key);
+            if (self.share_group_sessions.fetchRemove(key)) |entry| {
+                removed_sessions.append(.{
+                    .key = entry.key,
+                    .epoch = entry.value,
+                }) catch |err| {
+                    self.share_group_sessions.put(entry.key, entry.value) catch {
+                        self.allocator.free(entry.key);
+                    };
+                    return err;
+                };
                 removed_any = true;
             } else {
                 break;
             }
         }
         return removed_any;
+    }
+
+    fn restoreRemovedShareGroupSessions(self: *Broker, removed: []const RemovedShareGroupSession) void {
+        for (removed) |entry| {
+            if (self.share_group_sessions.getPtr(entry.key)) |existing| {
+                existing.* = entry.epoch;
+                self.allocator.free(entry.key);
+            } else {
+                self.share_group_sessions.put(entry.key, entry.epoch) catch |err| {
+                    log.err("Failed to restore removed share session after rollback: {}", .{err});
+                    self.allocator.free(entry.key);
+                };
+            }
+        }
+    }
+
+    fn freeRemovedShareGroupSessions(self: *Broker, removed: []const RemovedShareGroupSession) void {
+        for (removed) |entry| self.allocator.free(entry.key);
     }
 
     fn clearReplicaDirectoryAssignments(self: *Broker) void {
@@ -15154,27 +15185,61 @@ pub const Broker = struct {
         if (flexible) ser.skipTaggedFields(request_bytes, &pos) catch return null;
         if (offsets_mutated) self.persistOffsets();
         if (groups_mutated) {
-            var groups_persisted = true;
-            self.persistConsumerGroupsDurably() catch |err| {
-                groups_persisted = false;
-                log.warn("DeleteGroups consumer-group snapshot write failed: {}", .{err});
+            var removed_share_sessions = std.array_list.Managed(RemovedShareGroupSession).init(self.allocator);
+            defer {
+                self.freeRemovedShareGroupSessions(removed_share_sessions.items);
+                removed_share_sessions.deinit();
+            }
+
+            var sessions_removed = false;
+            var mutation_failed = false;
+            var groups_snapshot_persisted = false;
+            for (results.items) |result| {
+                if (result.error_code == @intFromEnum(ErrorCode.none)) {
+                    if (result.group_id) |deleted_group_id| {
+                        sessions_removed = (self.removeShareGroupSessionsForGroup(deleted_group_id, &removed_share_sessions) catch |err| blk: {
+                            mutation_failed = true;
+                            log.warn("DeleteGroups share-session cleanup failed for {s}: {}", .{ deleted_group_id, err });
+                            break :blk false;
+                        }) or sessions_removed;
+                    }
+                }
+            }
+
+            if (!mutation_failed) {
+                self.persistConsumerGroupsDurably() catch |err| {
+                    mutation_failed = true;
+                    log.warn("DeleteGroups consumer-group snapshot write failed: {}", .{err});
+                };
+                if (!mutation_failed) {
+                    groups_snapshot_persisted = true;
+                }
+            }
+
+            if (!mutation_failed and sessions_removed) {
+                self.persistShareGroupSessionsDurably() catch |err| {
+                    mutation_failed = true;
+                    log.warn("DeleteGroups share-session snapshot write failed: {}", .{err});
+                };
+            }
+
+            if (mutation_failed) {
+                self.restoreRemovedShareGroupSessions(removed_share_sessions.items);
+                removed_share_sessions.clearRetainingCapacity();
                 self.restoreConsumerGroupsAfterFailedMutation(previous_snapshot);
+                if (groups_snapshot_persisted) {
+                    self.persistConsumerGroupsDurably() catch |restore_err| {
+                        log.warn("Failed to persist restored DeleteGroups rollback snapshot: {}", .{restore_err});
+                    };
+                }
                 for (results.items) |*result| {
                     if (result.error_code == @intFromEnum(ErrorCode.none)) {
                         result.error_code = @intFromEnum(ErrorCode.kafka_storage_error);
                     }
                 }
-            };
-            if (groups_persisted) {
-                var sessions_removed = false;
-                for (results.items) |result| {
-                    if (result.error_code == @intFromEnum(ErrorCode.none)) {
-                        if (result.group_id) |deleted_group_id| {
-                            sessions_removed = self.clearShareGroupSessionsForGroup(deleted_group_id) or sessions_removed;
-                        }
-                    }
-                }
-                if (sessions_removed) self.persistShareGroupSessionsLocal();
+            } else {
+                self.freeRemovedShareGroupSessions(removed_share_sessions.items);
+                removed_share_sessions.clearRetainingCapacity();
             }
         }
 
@@ -25169,6 +25234,59 @@ test "Broker.handleRequest DeleteGroups v2 reports group lifecycle errors" {
     try testing.expectEqualStrings("missing-delete-group", resp.results[2].group_id.?);
     try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.group_id_not_found)), resp.results[2].error_code);
     try testing.expectEqual(@as(usize, 1), broker.groups.groupCount());
+}
+
+test "Broker.handleRequest DeleteGroups rolls back share session cleanup persistence failures" {
+    const fs = @import("fs_compat");
+    const Req = generated.delete_groups_request.DeleteGroupsRequest;
+    const Resp = generated.delete_groups_response.DeleteGroupsResponse;
+
+    const tmp_dir = "/tmp/zmq-delete-groups-share-session-cleanup-fail-test";
+    fs.deleteTreeAbsolute(tmp_dir) catch {};
+    try fs.makeDirAbsolute(tmp_dir);
+    defer fs.deleteTreeAbsolute(tmp_dir) catch {};
+
+    var broker = Broker.initWithConfig(testing.allocator, 1, 9092, .{ .data_dir = tmp_dir });
+    defer broker.deinit();
+
+    const subscriptions = [_][]const u8{};
+    const joined = try broker.groups.joinGroupWithProtocol("delete-share-session-group", "share-member", null, "share", "range", null, &subscriptions);
+    try testing.expectEqual(ErrorCode.none.toInt(), joined.error_code);
+    try testing.expect(broker.markShareGroupStable("delete-share-session-group"));
+    try testing.expectEqual(ErrorCode.none, try broker.updateShareSessionEpoch("delete-share-session-group", "share-member", 0));
+    try testing.expectEqual(ErrorCode.none.toInt(), broker.groups.leaveGroup("delete-share-session-group", "share-member"));
+    try broker.persistConsumerGroupsDurably();
+
+    const sessions_path = try std.fmt.allocPrint(testing.allocator, "{s}/share_group_sessions.meta", .{tmp_dir});
+    defer testing.allocator.free(sessions_path);
+    try fs.deleteFileAbsolute(sessions_path);
+    try fs.makeDirAbsolute(sessions_path);
+
+    const group_names = [_]?[]const u8{"delete-share-session-group"};
+    const req = Req{ .groups_names = &group_names };
+
+    var buf: [256]u8 = undefined;
+    var pos = buildTestRequest(&buf, 42, 2, 4208, header_mod.requestHeaderVersion(42, 2));
+    req.serialize(&buf, &pos, 2);
+
+    const response = broker.handleRequest(buf[0..pos]);
+    try testing.expect(response != null);
+    defer testing.allocator.free(response.?);
+
+    var rpos: usize = 0;
+    var response_header = try ResponseHeader.deserialize(testing.allocator, response.?, &rpos, header_mod.responseHeaderVersion(42, 2));
+    defer response_header.deinit(testing.allocator);
+    try testing.expectEqual(@as(i32, 4208), response_header.correlation_id);
+
+    const resp = try Resp.deserialize(testing.allocator, response.?, &rpos, 2);
+    defer if (resp.results.len > 0) testing.allocator.free(resp.results);
+    try testing.expectEqual(response.?.len, rpos);
+    try testing.expectEqual(@as(usize, 1), resp.results.len);
+    try testing.expectEqualStrings("delete-share-session-group", resp.results[0].group_id.?);
+    try testing.expectEqual(ErrorCode.kafka_storage_error.toInt(), resp.results[0].error_code);
+    const group = broker.groups.groups.getPtr("delete-share-session-group") orelse return error.ExpectedShareGroup;
+    try testing.expectEqual(@as(usize, 0), group.memberCount());
+    try testing.expectEqual(@as(usize, 1), broker.share_group_sessions.count());
 }
 
 test "Broker.handleRequest DeleteGroups rejects trailing bytes" {
