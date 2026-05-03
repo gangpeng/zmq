@@ -42160,6 +42160,56 @@ test "Broker.handleRequest BeginQuorumEpoch fences S3 WAL writer on higher leade
     try testing.expectError(error.WalFenced, broker.store.s3_wal_batcher.?.append(123, 0, "records-after-fence"));
 }
 
+test "Broker.handleRequest internal AppendEntries fences S3 WAL produce path on higher leader epoch" {
+    const Resp = generated.begin_quorum_epoch_response.BeginQuorumEpochResponse;
+
+    var mock_s3 = storage.MockS3.init(testing.allocator);
+    defer mock_s3.deinit();
+    const s3_storage = storage.S3Storage.initMock(testing.allocator, &mock_s3);
+
+    var raft = RaftState.init(testing.allocator, 5, "appendentries-fence-s3-wal");
+    defer raft.deinit();
+    _ = raft.startElection();
+    raft.becomeLeader();
+
+    var broker = Broker.init(testing.allocator, 5, 19094);
+    defer broker.deinit();
+    broker.setRaftState(&raft);
+    broker.store.s3_wal_mode = true;
+    broker.store.s3_storage = s3_storage;
+    broker.store.s3_wal_batcher = storage.wal.S3WalBatcher.init(testing.allocator);
+
+    var buf: [512]u8 = undefined;
+    var pos = buildTestRequest(&buf, 53, 0, 5316, header_mod.requestHeaderVersion(53, 0));
+    const no_records = [_][]const u8{};
+    appendInternalRaftAppendEntriesPayload(&buf, &pos, 7, 2, 0, 0, 0, 0, &no_records);
+
+    const response = broker.handleRequest(buf[0..pos]);
+    try testing.expect(response != null);
+    defer testing.allocator.free(response.?);
+
+    var rpos: usize = 0;
+    var response_header = try ResponseHeader.deserialize(testing.allocator, response.?, &rpos, header_mod.responseHeaderVersion(53, 0));
+    defer response_header.deinit(testing.allocator);
+    try testing.expectEqual(@as(i32, 5316), response_header.correlation_id);
+
+    const resp = try Resp.deserialize(testing.allocator, response.?, &rpos, 0);
+    defer if (resp.topics.len > 0) testing.allocator.free(resp.topics);
+    try testing.expectEqual(response.?.len, rpos);
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.none)), resp.error_code);
+
+    try testing.expectEqual(.follower, raft.role);
+    try testing.expectEqual(@as(i32, 2), raft.current_epoch);
+    try testing.expect(broker.store.s3_wal_batcher.?.is_fenced);
+
+    try testing.expectError(error.WalFenced, broker.store.produce("appendentries-fenced-topic", 0, "records-after-fence"));
+    const state = broker.store.partitions.get("appendentries-fenced-topic-0").?;
+    try testing.expectEqual(@as(u64, 0), state.next_offset);
+    try testing.expectEqual(@as(u64, 0), state.high_watermark);
+    try testing.expectEqual(@as(usize, 0), broker.store.cache.recordCount());
+    try testing.expectEqual(@as(usize, 0), mock_s3.objectCount());
+}
+
 test "Broker.handleRequest BeginQuorumEpoch applies internal AutoMQ AppendEntries payload" {
     const Resp = generated.begin_quorum_epoch_response.BeginQuorumEpochResponse;
 
