@@ -16018,6 +16018,11 @@ pub const Broker = struct {
             return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
         }
 
+        var previous_snapshot: ?ObjectManagerLocalSnapshot = null;
+        defer if (previous_snapshot) |*snapshot| self.freeObjectManagerLocalSnapshot(snapshot);
+        if (self.raft_state == null) {
+            previous_snapshot = self.takeObjectManagerLocalSnapshot() catch return null;
+        }
         const sso_key = self.makeStreamSetObjectKey(object_id, req.node_id) catch return null;
         defer self.allocator.free(sso_key);
         self.object_manager.commitStreamSetObject(object_id, req.node_id, order_id, ranges, sso_key, object_size) catch |err| {
@@ -16046,7 +16051,8 @@ pub const Broker = struct {
             }
         }
         if (mutated) {
-            self.persistObjectManagerMutation() catch |err| {
+            self.persistObjectManagerMutationDurably() catch |err| {
+                if (previous_snapshot) |snapshot| self.restoreObjectManagerLocalSnapshot(snapshot);
                 const resp = Resp{ .error_code = autoMqQuorumErrorCode(err), .throttle_time_ms = 0 };
                 return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
             };
@@ -16096,6 +16102,11 @@ pub const Broker = struct {
             return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
         }
 
+        var previous_snapshot: ?ObjectManagerLocalSnapshot = null;
+        defer if (previous_snapshot) |*snapshot| self.freeObjectManagerLocalSnapshot(snapshot);
+        if (self.raft_state == null) {
+            previous_snapshot = self.takeObjectManagerLocalSnapshot() catch return null;
+        }
         const key = self.makeStreamObjectKey(object_id, stream_id, start_offset, end_offset) catch return null;
         defer self.allocator.free(key);
         self.object_manager.commitStreamObject(object_id, stream_id, start_offset, end_offset, key, object_size) catch |err| {
@@ -16123,7 +16134,8 @@ pub const Broker = struct {
             }
         }
         if (mutated) {
-            self.persistObjectManagerMutation() catch |err| {
+            self.persistObjectManagerMutationDurably() catch |err| {
+                if (previous_snapshot) |snapshot| self.restoreObjectManagerLocalSnapshot(snapshot);
                 const resp = Resp{ .error_code = autoMqQuorumErrorCode(err), .throttle_time_ms = 0 };
                 return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
             };
@@ -33485,6 +33497,10 @@ test "Broker AutoMQ object mutations roll back when local snapshot persistence f
     const DeleteResp = generated.delete_streams_response.DeleteStreamsResponse;
     const PrepareReq = generated.prepare_s3_object_request.PrepareS3ObjectRequest;
     const PrepareResp = generated.prepare_s3_object_response.PrepareS3ObjectResponse;
+    const CommitSsoReq = generated.commit_stream_set_object_request.CommitStreamSetObjectRequest;
+    const CommitSsoResp = generated.commit_stream_set_object_response.CommitStreamSetObjectResponse;
+    const CommitSoReq = generated.commit_stream_object_request.CommitStreamObjectRequest;
+    const CommitSoResp = generated.commit_stream_object_response.CommitStreamObjectResponse;
     const TrimReq = generated.trim_streams_request.TrimStreamsRequest;
     const TrimResp = generated.trim_streams_response.TrimStreamsResponse;
     const storage_error = @as(i16, @intFromEnum(ErrorCode.kafka_storage_error));
@@ -33492,7 +33508,7 @@ test "Broker AutoMQ object mutations roll back when local snapshot persistence f
     var broker = Broker.initWithConfig(testing.allocator, 1, 9092, .{ .data_dir = tmp_dir });
     defer broker.deinit();
 
-    var buf: [512]u8 = undefined;
+    var buf: [4096]u8 = undefined;
     var pos = buildTestRequest(&buf, 501, 0, 5011, header_mod.requestHeaderVersion(501, 0));
     const create_items = [_]CreateReq.CreateStreamRequest{.{ .node_id = 1 }};
     const create_req = CreateReq{ .node_id = 1, .node_epoch = 1, .create_stream_requests = &create_items };
@@ -33624,6 +33640,81 @@ test "Broker AutoMQ object mutations roll back when local snapshot persistence f
     try testing.expectEqual(delete_response.?.len, rpos);
     try testing.expectEqual(storage_error, delete_resp.delete_stream_responses[0].error_code);
     try testing.expect(broker.object_manager.getStream(stream_id) != null);
+
+    const so_object_id = broker.object_manager.prepareObject();
+    const end_offset_before_commit = broker.object_manager.getStream(stream_id).?.end_offset;
+    pos = buildTestRequest(&buf, 507, 1, 5071, header_mod.requestHeaderVersion(507, 1));
+    const source_ids = [_]i64{};
+    const operations = [_]i8{};
+    const commit_so_req = CommitSoReq{
+        .node_id = 1,
+        .node_epoch = 1,
+        .object_id = @intCast(so_object_id),
+        .object_size = 128,
+        .stream_id = @intCast(stream_id),
+        .start_offset = @intCast(end_offset_before_commit),
+        .end_offset = @intCast(end_offset_before_commit + 10),
+        .source_object_ids = &source_ids,
+        .stream_epoch = 1,
+        .attributes = 0,
+        .operations = &operations,
+    };
+    commit_so_req.serialize(&buf, &pos, 1);
+
+    const commit_so_response = broker.handleRequest(buf[0..pos]);
+    try testing.expect(commit_so_response != null);
+    defer testing.allocator.free(commit_so_response.?);
+
+    rpos = 0;
+    var commit_so_header = try ResponseHeader.deserialize(testing.allocator, commit_so_response.?, &rpos, header_mod.responseHeaderVersion(507, 1));
+    defer commit_so_header.deinit(testing.allocator);
+    try testing.expectEqual(@as(i32, 5071), commit_so_header.correlation_id);
+    const commit_so_resp = try CommitSoResp.deserialize(testing.allocator, commit_so_response.?, &rpos, 1);
+
+    try testing.expectEqual(commit_so_response.?.len, rpos);
+    try testing.expectEqual(storage_error, commit_so_resp.error_code);
+    try testing.expectEqual(@as(usize, 0), broker.object_manager.getStreamObjectCount());
+    try testing.expect(broker.object_manager.prepared_registry.contains(so_object_id));
+    try testing.expectEqual(end_offset_before_commit, broker.object_manager.getStream(stream_id).?.end_offset);
+
+    const sso_object_id = broker.object_manager.prepareObject();
+    pos = buildTestRequest(&buf, 506, 1, 5061, header_mod.requestHeaderVersion(506, 1));
+    const ranges = [_]CommitSsoReq.ObjectStreamRange{.{
+        .stream_id = @intCast(stream_id),
+        .stream_epoch = 1,
+        .start_offset = 0,
+        .end_offset = @intCast(end_offset_before_commit),
+    }};
+    const stream_objects = [_]CommitSsoReq.StreamObject{};
+    const compacted_ids = [_]i64{};
+    const commit_sso_req = CommitSsoReq{
+        .node_id = 1,
+        .node_epoch = 1,
+        .object_id = @intCast(sso_object_id),
+        .order_id = @intCast(sso_object_id),
+        .object_size = 256,
+        .object_stream_ranges = &ranges,
+        .stream_objects = &stream_objects,
+        .compacted_object_ids = &compacted_ids,
+        .failover_mode = false,
+        .attributes = 3,
+    };
+    commit_sso_req.serialize(&buf, &pos, 1);
+
+    const commit_sso_response = broker.handleRequest(buf[0..pos]);
+    try testing.expect(commit_sso_response != null);
+    defer testing.allocator.free(commit_sso_response.?);
+
+    rpos = 0;
+    var commit_sso_header = try ResponseHeader.deserialize(testing.allocator, commit_sso_response.?, &rpos, header_mod.responseHeaderVersion(506, 1));
+    defer commit_sso_header.deinit(testing.allocator);
+    try testing.expectEqual(@as(i32, 5061), commit_sso_header.correlation_id);
+    const commit_sso_resp = try CommitSsoResp.deserialize(testing.allocator, commit_sso_response.?, &rpos, 1);
+
+    try testing.expectEqual(commit_sso_response.?.len, rpos);
+    try testing.expectEqual(storage_error, commit_sso_resp.error_code);
+    try testing.expectEqual(@as(usize, 0), broker.object_manager.getStreamSetObjectCount());
+    try testing.expect(broker.object_manager.prepared_registry.contains(sso_object_id));
 }
 
 test "Broker AutoMQ KV APIs round-trip" {
