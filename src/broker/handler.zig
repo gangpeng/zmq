@@ -92,6 +92,8 @@ pub const Broker = struct {
     auto_mq_zone_router_epoch: i64 = 0,
     /// AutoMQ link/group promotion state keyed by group_id.
     auto_mq_group_promotions: std.StringHashMap(AutoMqGroupPromotion),
+    /// Local share-group partition state keyed by group/topic-id/partition.
+    share_group_states: std.StringHashMap(SharePartitionState),
     /// Idempotent producer deduplication: tracks last sequence number per producer+partition.
     producer_sequences: std.AutoHashMap(ProducerKey, ProducerSequenceState),
     allocator: Allocator,
@@ -257,6 +259,24 @@ pub const Broker = struct {
         }
     };
 
+    pub const ShareStateBatch = struct {
+        first_offset: i64,
+        last_offset: i64,
+        delivery_state: i8,
+        delivery_count: i16,
+    };
+
+    pub const SharePartitionState = struct {
+        state_epoch: i32,
+        start_offset: i64,
+        batches: []ShareStateBatch = &.{},
+
+        pub fn deinit(self: *SharePartitionState, alloc: Allocator) void {
+            if (self.batches.len > 0) alloc.free(self.batches);
+            self.batches = &.{};
+        }
+    };
+
     pub const ControllerAwareRebalanceResult = struct {
         planned_moves: usize = 0,
         applied_moves: usize = 0,
@@ -413,6 +433,7 @@ pub const Broker = struct {
             .auto_mq_nodes = std.AutoHashMap(i32, AutoMqNodeMetadata).init(alloc),
             .auto_mq_next_node_id = defaultAutoMqNextNodeId(node_id),
             .auto_mq_group_promotions = std.StringHashMap(AutoMqGroupPromotion).init(alloc),
+            .share_group_states = std.StringHashMap(SharePartitionState).init(alloc),
             .producer_sequences = std.AutoHashMap(ProducerKey, ProducerSequenceState).init(alloc),
             .allocator = alloc,
             .node_id = node_id,
@@ -1154,6 +1175,8 @@ pub const Broker = struct {
         self.auto_mq_kvs.deinit();
         self.auto_mq_nodes.deinit();
         self.auto_mq_group_promotions.deinit();
+        self.clearShareGroupStates();
+        self.share_group_states.deinit();
         self.producer_sequences.deinit();
         self.store.deinit();
         self.groups.deinit();
@@ -1367,6 +1390,15 @@ pub const Broker = struct {
             entry.value_ptr.deinit(self.allocator);
         }
         self.auto_mq_group_promotions.clearRetainingCapacity();
+    }
+
+    fn clearShareGroupStates(self: *Broker) void {
+        var it = self.share_group_states.iterator();
+        while (it.next()) |entry| {
+            self.allocator.free(entry.key_ptr.*);
+            entry.value_ptr.deinit(self.allocator);
+        }
+        self.share_group_states.clearRetainingCapacity();
     }
 
     fn restoreAutoMqMetadata(self: *Broker, snapshot: MetadataPersistence.AutoMqMetadataSnapshot) !void {
@@ -11291,8 +11323,157 @@ pub const Broker = struct {
         if (req.topics.len > 0) self.allocator.free(req.topics);
     }
 
+    fn shareStateErrorMessage(error_code: ErrorCode) ?[]const u8 {
+        return switch (error_code) {
+            .none => null,
+            .invalid_group_id => "Invalid share group id",
+            .unknown_topic_id => "Unknown share topic id",
+            .unknown_topic_or_partition => "Unknown share topic partition",
+            .invalid_request => "Invalid share state request",
+            else => "Share state request failed",
+        };
+    }
+
+    fn validateShareStateTarget(self: *const Broker, group_id: ?[]const u8, topic_id: [16]u8, partition: i32) ErrorCode {
+        const group = group_id orelse return ErrorCode.invalid_group_id;
+        if (group.len == 0) return ErrorCode.invalid_group_id;
+        if (isZeroUuid(topic_id)) return ErrorCode.unknown_topic_id;
+        const topic_name = self.findTopicNameById(topic_id) orelse return ErrorCode.unknown_topic_id;
+        if (!self.topicPartitionExists(topic_name, partition)) return ErrorCode.unknown_topic_or_partition;
+        return ErrorCode.none;
+    }
+
+    fn validateShareStateEpoch(existing: ?*const SharePartitionState, state_epoch: i32) ErrorCode {
+        if (state_epoch < 0) return ErrorCode.invalid_request;
+        if (existing) |state| {
+            if (state_epoch < state.state_epoch) return ErrorCode.invalid_request;
+        }
+        return ErrorCode.none;
+    }
+
+    fn validateShareStateStartOffset(start_offset: i64) ErrorCode {
+        if (start_offset < -1) return ErrorCode.invalid_request;
+        return ErrorCode.none;
+    }
+
+    fn validateShareStateBatch(first_offset: i64, last_offset: i64, delivery_state: i8, delivery_count: i16) ErrorCode {
+        if (first_offset < 0 or last_offset < first_offset) return ErrorCode.invalid_request;
+        if (delivery_state != 0 and delivery_state != 2 and delivery_state != 4) return ErrorCode.invalid_request;
+        if (delivery_count < 0) return ErrorCode.invalid_request;
+        return ErrorCode.none;
+    }
+
+    fn shareStateHex(nibble: u8) u8 {
+        return if (nibble < 10) '0' + nibble else 'a' + (nibble - 10);
+    }
+
+    fn shareGroupStateKey(self: *Broker, group_id: []const u8, topic_id: [16]u8, partition: i32) ![]u8 {
+        var partition_buf: [16]u8 = undefined;
+        const partition_text = try std.fmt.bufPrint(&partition_buf, "{d}", .{partition});
+        const key = try self.allocator.alloc(u8, group_id.len + 1 + 32 + 1 + partition_text.len);
+
+        var pos: usize = 0;
+        @memcpy(key[pos .. pos + group_id.len], group_id);
+        pos += group_id.len;
+        key[pos] = ':';
+        pos += 1;
+        for (topic_id) |byte| {
+            key[pos] = shareStateHex(byte >> 4);
+            key[pos + 1] = shareStateHex(byte & 0x0f);
+            pos += 2;
+        }
+        key[pos] = ':';
+        pos += 1;
+        @memcpy(key[pos .. pos + partition_text.len], partition_text);
+        return key;
+    }
+
+    fn getSharePartitionState(self: *Broker, group_id: []const u8, topic_id: [16]u8, partition: i32) !?*SharePartitionState {
+        const key = try self.shareGroupStateKey(group_id, topic_id, partition);
+        defer self.allocator.free(key);
+        return self.share_group_states.getPtr(key);
+    }
+
+    fn cloneShareStateBatchesFromWrite(
+        self: *Broker,
+        batches: []const generated.write_share_group_state_request.WriteShareGroupStateRequest.WriteStateData.PartitionData.StateBatch,
+    ) ![]ShareStateBatch {
+        if (batches.len == 0) return &.{};
+        const cloned = try self.allocator.alloc(ShareStateBatch, batches.len);
+        for (batches, 0..) |batch, idx| {
+            cloned[idx] = .{
+                .first_offset = batch.first_offset,
+                .last_offset = batch.last_offset,
+                .delivery_state = batch.delivery_state,
+                .delivery_count = batch.delivery_count,
+            };
+        }
+        return cloned;
+    }
+
+    fn cloneShareStateBatchesForRead(
+        self: *Broker,
+        batches: []const ShareStateBatch,
+    ) ![]generated.read_share_group_state_response.ReadShareGroupStateResponse.ReadStateResult.PartitionResult.StateBatch {
+        const ReadBatch = generated.read_share_group_state_response.ReadShareGroupStateResponse.ReadStateResult.PartitionResult.StateBatch;
+        if (batches.len == 0) return &.{};
+        const cloned = try self.allocator.alloc(ReadBatch, batches.len);
+        for (batches, 0..) |batch, idx| {
+            cloned[idx] = .{
+                .first_offset = batch.first_offset,
+                .last_offset = batch.last_offset,
+                .delivery_state = batch.delivery_state,
+                .delivery_count = batch.delivery_count,
+            };
+        }
+        return cloned;
+    }
+
+    fn setSharePartitionState(
+        self: *Broker,
+        group_id: []const u8,
+        topic_id: [16]u8,
+        partition: i32,
+        state_epoch: i32,
+        start_offset: i64,
+        batches: []ShareStateBatch,
+    ) !void {
+        const key = try self.shareGroupStateKey(group_id, topic_id, partition);
+        errdefer {
+            self.allocator.free(key);
+            if (batches.len > 0) self.allocator.free(batches);
+        }
+
+        if (self.share_group_states.getPtr(key)) |existing| {
+            self.allocator.free(key);
+            existing.deinit(self.allocator);
+            existing.* = .{
+                .state_epoch = state_epoch,
+                .start_offset = start_offset,
+                .batches = batches,
+            };
+            return;
+        }
+
+        try self.share_group_states.put(key, .{
+            .state_epoch = state_epoch,
+            .start_offset = start_offset,
+            .batches = batches,
+        });
+    }
+
+    fn deleteSharePartitionState(self: *Broker, group_id: []const u8, topic_id: [16]u8, partition: i32) !void {
+        const key = try self.shareGroupStateKey(group_id, topic_id, partition);
+        defer self.allocator.free(key);
+        if (self.share_group_states.fetchRemove(key)) |removed| {
+            self.allocator.free(removed.key);
+            var state = removed.value;
+            state.deinit(self.allocator);
+        }
+    }
+
     // ---------------------------------------------------------------
-    // InitializeShareGroupState (key 83) — non-advertised until share state exists
+    // InitializeShareGroupState (key 83) — non-advertised until share state is durable/coordinator-backed
     // ---------------------------------------------------------------
     fn handleInitializeShareGroupState(self: *Broker, request_bytes: []const u8, body_start: usize, req_header: *const RequestHeader, api_version: i16, resp_header_version: i16) ?[]u8 {
         const Req = generated.initialize_share_group_state_request.InitializeShareGroupStateRequest;
@@ -11330,14 +11511,14 @@ pub const Broker = struct {
         };
         defer self.freeInitializeShareGroupStateRequest(&req);
 
-        const results = self.buildInitializeShareGroupStateFailClosedResults(req) catch return null;
+        const results = self.buildInitializeShareGroupStateResults(req) catch return null;
         defer self.freeInitializeShareGroupStateResults(results);
 
         const resp = Resp{ .results = results };
         return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
     }
 
-    fn buildInitializeShareGroupStateFailClosedResults(
+    fn buildInitializeShareGroupStateResults(
         self: *Broker,
         req: generated.initialize_share_group_state_request.InitializeShareGroupStateRequest,
     ) ![]generated.initialize_share_group_state_response.InitializeShareGroupStateResponse.InitializeStateResult {
@@ -11358,10 +11539,23 @@ pub const Broker = struct {
             errdefer self.allocator.free(partitions);
 
             for (topic.partitions, 0..) |partition, idx| {
+                const target_error = self.validateShareStateTarget(req.group_id, topic.topic_id, partition.partition);
+                const existing = if (target_error == ErrorCode.none)
+                    try self.getSharePartitionState(req.group_id.?, topic.topic_id, partition.partition)
+                else
+                    null;
+                const epoch_error = if (target_error == ErrorCode.none) validateShareStateEpoch(existing, partition.state_epoch) else ErrorCode.none;
+                const offset_error = if (target_error == ErrorCode.none and epoch_error == ErrorCode.none) validateShareStateStartOffset(partition.start_offset) else ErrorCode.none;
+                const error_code = if (target_error != ErrorCode.none) target_error else if (epoch_error != ErrorCode.none) epoch_error else offset_error;
+
+                if (error_code == ErrorCode.none) {
+                    try self.setSharePartitionState(req.group_id.?, topic.topic_id, partition.partition, partition.state_epoch, partition.start_offset, &.{});
+                }
+
                 partitions[idx] = .{
                     .partition = partition.partition,
-                    .error_code = ErrorCode.unsupported_version.toInt(),
-                    .error_message = "InitializeShareGroupState is not implemented",
+                    .error_code = error_code.toInt(),
+                    .error_message = shareStateErrorMessage(error_code),
                 };
             }
 
@@ -11394,7 +11588,7 @@ pub const Broker = struct {
     }
 
     // ---------------------------------------------------------------
-    // ReadShareGroupState (key 84) — non-advertised until share state exists
+    // ReadShareGroupState (key 84) — non-advertised until share state is durable/coordinator-backed
     // ---------------------------------------------------------------
     fn handleReadShareGroupState(self: *Broker, request_bytes: []const u8, body_start: usize, req_header: *const RequestHeader, api_version: i16, resp_header_version: i16) ?[]u8 {
         const Req = generated.read_share_group_state_request.ReadShareGroupStateRequest;
@@ -11438,14 +11632,14 @@ pub const Broker = struct {
         };
         defer self.freeReadShareGroupStateRequest(&req);
 
-        const results = self.buildReadShareGroupStateFailClosedResults(req) catch return null;
+        const results = self.buildReadShareGroupStateResults(req) catch return null;
         defer self.freeReadShareGroupStateResults(results);
 
         const resp = Resp{ .results = results };
         return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
     }
 
-    fn buildReadShareGroupStateFailClosedResults(
+    fn buildReadShareGroupStateResults(
         self: *Broker,
         req: generated.read_share_group_state_request.ReadShareGroupStateRequest,
     ) ![]generated.read_share_group_state_response.ReadShareGroupStateResponse.ReadStateResult {
@@ -11463,17 +11657,34 @@ pub const Broker = struct {
 
         for (req.topics) |topic| {
             const partitions = try self.allocator.alloc(PartitionResult, topic.partitions.len);
-            errdefer self.allocator.free(partitions);
+            var partitions_init: usize = 0;
+            errdefer {
+                for (partitions[0..partitions_init]) |partition_result| {
+                    if (partition_result.state_batches.len > 0) self.allocator.free(partition_result.state_batches);
+                }
+                self.allocator.free(partitions);
+            }
 
             for (topic.partitions, 0..) |partition, idx| {
+                const target_error = self.validateShareStateTarget(req.group_id, topic.topic_id, partition.partition);
+                const state = if (target_error == ErrorCode.none)
+                    try self.getSharePartitionState(req.group_id.?, topic.topic_id, partition.partition)
+                else
+                    null;
+                const state_batches = if (state) |share_state|
+                    try self.cloneShareStateBatchesForRead(share_state.batches)
+                else
+                    &.{};
+
                 partitions[idx] = .{
                     .partition = partition.partition,
-                    .error_code = ErrorCode.unsupported_version.toInt(),
-                    .error_message = "ReadShareGroupState is not implemented",
-                    .state_epoch = 0,
-                    .start_offset = -1,
-                    .state_batches = &.{},
+                    .error_code = target_error.toInt(),
+                    .error_message = shareStateErrorMessage(target_error),
+                    .state_epoch = if (state) |share_state| share_state.state_epoch else 0,
+                    .start_offset = if (state) |share_state| share_state.start_offset else -1,
+                    .state_batches = state_batches,
                 };
+                partitions_init += 1;
             }
 
             results[results_init] = .{
@@ -11500,12 +11711,15 @@ pub const Broker = struct {
 
     fn freeReadShareGroupStateResultPartitions(self: *Broker, results: []const generated.read_share_group_state_response.ReadShareGroupStateResponse.ReadStateResult) void {
         for (results) |result| {
+            for (result.partitions) |partition| {
+                if (partition.state_batches.len > 0) self.allocator.free(partition.state_batches);
+            }
             if (result.partitions.len > 0) self.allocator.free(result.partitions);
         }
     }
 
     // ---------------------------------------------------------------
-    // WriteShareGroupState (key 85) — non-advertised until share state exists
+    // WriteShareGroupState (key 85) — non-advertised until share state is durable/coordinator-backed
     // ---------------------------------------------------------------
     fn handleWriteShareGroupState(self: *Broker, request_bytes: []const u8, body_start: usize, req_header: *const RequestHeader, api_version: i16, resp_header_version: i16) ?[]u8 {
         const Req = generated.write_share_group_state_request.WriteShareGroupStateRequest;
@@ -11543,14 +11757,14 @@ pub const Broker = struct {
         };
         defer self.freeWriteShareGroupStateRequest(&req);
 
-        const results = self.buildWriteShareGroupStateFailClosedResults(req) catch return null;
+        const results = self.buildWriteShareGroupStateResults(req) catch return null;
         defer self.freeWriteShareGroupStateResults(results);
 
         const resp = Resp{ .results = results };
         return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
     }
 
-    fn buildWriteShareGroupStateFailClosedResults(
+    fn buildWriteShareGroupStateResults(
         self: *Broker,
         req: generated.write_share_group_state_request.WriteShareGroupStateRequest,
     ) ![]generated.write_share_group_state_response.WriteShareGroupStateResponse.WriteStateResult {
@@ -11571,10 +11785,37 @@ pub const Broker = struct {
             errdefer self.allocator.free(partitions);
 
             for (topic.partitions, 0..) |partition, idx| {
+                const target_error = self.validateShareStateTarget(req.group_id, topic.topic_id, partition.partition);
+                const existing = if (target_error == ErrorCode.none)
+                    try self.getSharePartitionState(req.group_id.?, topic.topic_id, partition.partition)
+                else
+                    null;
+                const epoch_error = if (target_error == ErrorCode.none) validateShareStateEpoch(existing, partition.state_epoch) else ErrorCode.none;
+                const offset_error = if (target_error == ErrorCode.none and epoch_error == ErrorCode.none) validateShareStateStartOffset(partition.start_offset) else ErrorCode.none;
+                var batch_error = ErrorCode.none;
+                if (target_error == ErrorCode.none and epoch_error == ErrorCode.none and offset_error == ErrorCode.none) {
+                    for (partition.state_batches) |batch| {
+                        batch_error = validateShareStateBatch(batch.first_offset, batch.last_offset, batch.delivery_state, batch.delivery_count);
+                        if (batch_error != ErrorCode.none) break;
+                    }
+                }
+                const error_code = if (target_error != ErrorCode.none) target_error else if (epoch_error != ErrorCode.none) epoch_error else if (offset_error != ErrorCode.none) offset_error else batch_error;
+
+                if (error_code == ErrorCode.none) {
+                    const batches = try self.cloneShareStateBatchesFromWrite(partition.state_batches);
+                    const start_offset = if (partition.start_offset >= 0)
+                        partition.start_offset
+                    else if (existing) |state|
+                        state.start_offset
+                    else
+                        @as(i64, -1);
+                    try self.setSharePartitionState(req.group_id.?, topic.topic_id, partition.partition, partition.state_epoch, start_offset, batches);
+                }
+
                 partitions[idx] = .{
                     .partition = partition.partition,
-                    .error_code = ErrorCode.unsupported_version.toInt(),
-                    .error_message = "WriteShareGroupState is not implemented",
+                    .error_code = error_code.toInt(),
+                    .error_message = shareStateErrorMessage(error_code),
                 };
             }
 
@@ -11610,7 +11851,7 @@ pub const Broker = struct {
     }
 
     // ---------------------------------------------------------------
-    // DeleteShareGroupState (key 86) — non-advertised until share state exists
+    // DeleteShareGroupState (key 86) — non-advertised until share state is durable/coordinator-backed
     // ---------------------------------------------------------------
     fn handleDeleteShareGroupState(self: *Broker, request_bytes: []const u8, body_start: usize, req_header: *const RequestHeader, api_version: i16, resp_header_version: i16) ?[]u8 {
         const Req = generated.delete_share_group_state_request.DeleteShareGroupStateRequest;
@@ -11648,14 +11889,14 @@ pub const Broker = struct {
         };
         defer self.freeDeleteShareGroupStateRequest(&req);
 
-        const results = self.buildDeleteShareGroupStateFailClosedResults(req) catch return null;
+        const results = self.buildDeleteShareGroupStateResults(req) catch return null;
         defer self.freeDeleteShareGroupStateResults(results);
 
         const resp = Resp{ .results = results };
         return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
     }
 
-    fn buildDeleteShareGroupStateFailClosedResults(
+    fn buildDeleteShareGroupStateResults(
         self: *Broker,
         req: generated.delete_share_group_state_request.DeleteShareGroupStateRequest,
     ) ![]generated.delete_share_group_state_response.DeleteShareGroupStateResponse.DeleteStateResult {
@@ -11676,10 +11917,15 @@ pub const Broker = struct {
             errdefer self.allocator.free(partitions);
 
             for (topic.partitions, 0..) |partition, idx| {
+                const error_code = self.validateShareStateTarget(req.group_id, topic.topic_id, partition.partition);
+                if (error_code == ErrorCode.none) {
+                    try self.deleteSharePartitionState(req.group_id.?, topic.topic_id, partition.partition);
+                }
+
                 partitions[idx] = .{
                     .partition = partition.partition,
-                    .error_code = ErrorCode.unsupported_version.toInt(),
-                    .error_message = "DeleteShareGroupState is not implemented",
+                    .error_code = error_code.toInt(),
+                    .error_message = shareStateErrorMessage(error_code),
                 };
             }
 
@@ -11712,7 +11958,7 @@ pub const Broker = struct {
     }
 
     // ---------------------------------------------------------------
-    // ReadShareGroupStateSummary (key 87) — non-advertised until share state exists
+    // ReadShareGroupStateSummary (key 87) — non-advertised until share state is durable/coordinator-backed
     // ---------------------------------------------------------------
     fn handleReadShareGroupStateSummary(self: *Broker, request_bytes: []const u8, body_start: usize, req_header: *const RequestHeader, api_version: i16, resp_header_version: i16) ?[]u8 {
         const Req = generated.read_share_group_state_summary_request.ReadShareGroupStateSummaryRequest;
@@ -11754,14 +12000,14 @@ pub const Broker = struct {
         };
         defer self.freeReadShareGroupStateSummaryRequest(&req);
 
-        const results = self.buildReadShareGroupStateSummaryFailClosedResults(req) catch return null;
+        const results = self.buildReadShareGroupStateSummaryResults(req) catch return null;
         defer self.freeReadShareGroupStateSummaryResults(results);
 
         const resp = Resp{ .results = results };
         return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
     }
 
-    fn buildReadShareGroupStateSummaryFailClosedResults(
+    fn buildReadShareGroupStateSummaryResults(
         self: *Broker,
         req: generated.read_share_group_state_summary_request.ReadShareGroupStateSummaryRequest,
     ) ![]generated.read_share_group_state_summary_response.ReadShareGroupStateSummaryResponse.ReadStateSummaryResult {
@@ -11782,12 +12028,18 @@ pub const Broker = struct {
             errdefer self.allocator.free(partitions);
 
             for (topic.partitions, 0..) |partition, idx| {
+                const target_error = self.validateShareStateTarget(req.group_id, topic.topic_id, partition.partition);
+                const state = if (target_error == ErrorCode.none)
+                    try self.getSharePartitionState(req.group_id.?, topic.topic_id, partition.partition)
+                else
+                    null;
+
                 partitions[idx] = .{
                     .partition = partition.partition,
-                    .error_code = ErrorCode.unsupported_version.toInt(),
-                    .error_message = "ReadShareGroupStateSummary is not implemented",
-                    .state_epoch = 0,
-                    .start_offset = -1,
+                    .error_code = target_error.toInt(),
+                    .error_message = shareStateErrorMessage(target_error),
+                    .state_epoch = if (state) |share_state| share_state.state_epoch else 0,
+                    .start_offset = if (state) |share_state| share_state.start_offset else -1,
                 };
             }
 
@@ -39655,7 +39907,7 @@ test "Broker.handleRequest ShareAcknowledge rejects malformed request" {
     try testing.expectEqualStrings("malformed ShareAcknowledge request", resp.error_message.?);
 }
 
-test "Broker.handleRequest InitializeShareGroupState returns generated fail-closed response" {
+test "Broker.handleRequest InitializeShareGroupState initializes local share state" {
     const Req = generated.initialize_share_group_state_request.InitializeShareGroupStateRequest;
     const Resp = generated.initialize_share_group_state_response.InitializeShareGroupStateResponse;
     const InitializeStateData = Req.InitializeStateData;
@@ -39663,8 +39915,9 @@ test "Broker.handleRequest InitializeShareGroupState returns generated fail-clos
 
     var broker = Broker.init(testing.allocator, 1, 9092);
     defer broker.deinit();
+    try testing.expect(broker.ensureTopic("share-state-init-topic"));
 
-    const topic_id = [_]u8{3} ** 16;
+    const topic_id = broker.topics.get("share-state-init-topic").?.topic_id;
     const partitions = [_]PartitionData{.{
         .partition = 0,
         .state_epoch = 1,
@@ -39705,8 +39958,13 @@ test "Broker.handleRequest InitializeShareGroupState returns generated fail-clos
     try testing.expectEqualSlices(u8, topic_id[0..], resp.results[0].topic_id[0..]);
     try testing.expectEqual(@as(usize, 1), resp.results[0].partitions.len);
     try testing.expectEqual(@as(i32, 0), resp.results[0].partitions[0].partition);
-    try testing.expectEqual(ErrorCode.unsupported_version.toInt(), resp.results[0].partitions[0].error_code);
-    try testing.expectEqualStrings("InitializeShareGroupState is not implemented", resp.results[0].partitions[0].error_message.?);
+    try testing.expectEqual(ErrorCode.none.toInt(), resp.results[0].partitions[0].error_code);
+    try testing.expect(resp.results[0].partitions[0].error_message == null);
+
+    const state = (try broker.getSharePartitionState("share-group", topic_id, 0)).?;
+    try testing.expectEqual(@as(i32, 1), state.state_epoch);
+    try testing.expectEqual(@as(i64, 10), state.start_offset);
+    try testing.expectEqual(@as(usize, 0), state.batches.len);
 }
 
 test "Broker.handleRequest InitializeShareGroupState rejects malformed request" {
@@ -39743,7 +40001,7 @@ test "Broker.handleRequest InitializeShareGroupState rejects malformed request" 
     try testing.expectEqual(ErrorCode.invalid_request.toInt(), resp.results[0].partitions[0].error_code);
 }
 
-test "Broker.handleRequest ReadShareGroupState returns generated fail-closed response" {
+test "Broker.handleRequest ReadShareGroupState returns uninitialized local state" {
     const Req = generated.read_share_group_state_request.ReadShareGroupStateRequest;
     const Resp = generated.read_share_group_state_response.ReadShareGroupStateResponse;
     const ReadStateData = Req.ReadStateData;
@@ -39751,8 +40009,9 @@ test "Broker.handleRequest ReadShareGroupState returns generated fail-closed res
 
     var broker = Broker.init(testing.allocator, 1, 9092);
     defer broker.deinit();
+    try testing.expect(broker.ensureTopic("share-state-read-topic"));
 
-    const topic_id = [_]u8{4} ** 16;
+    const topic_id = broker.topics.get("share-state-read-topic").?.topic_id;
     const partitions = [_]PartitionData{.{
         .partition = 0,
         .leader_epoch = 3,
@@ -39795,8 +40054,9 @@ test "Broker.handleRequest ReadShareGroupState returns generated fail-closed res
     try testing.expectEqualSlices(u8, topic_id[0..], resp.results[0].topic_id[0..]);
     try testing.expectEqual(@as(usize, 1), resp.results[0].partitions.len);
     try testing.expectEqual(@as(i32, 0), resp.results[0].partitions[0].partition);
-    try testing.expectEqual(ErrorCode.unsupported_version.toInt(), resp.results[0].partitions[0].error_code);
-    try testing.expectEqualStrings("ReadShareGroupState is not implemented", resp.results[0].partitions[0].error_message.?);
+    try testing.expectEqual(ErrorCode.none.toInt(), resp.results[0].partitions[0].error_code);
+    try testing.expect(resp.results[0].partitions[0].error_message == null);
+    try testing.expectEqual(@as(i32, 0), resp.results[0].partitions[0].state_epoch);
     try testing.expectEqual(@as(i64, -1), resp.results[0].partitions[0].start_offset);
     try testing.expectEqual(@as(usize, 0), resp.results[0].partitions[0].state_batches.len);
 }
@@ -39838,7 +40098,7 @@ test "Broker.handleRequest ReadShareGroupState rejects malformed request" {
     try testing.expectEqual(ErrorCode.invalid_request.toInt(), resp.results[0].partitions[0].error_code);
 }
 
-test "Broker.handleRequest WriteShareGroupState returns generated fail-closed response" {
+test "Broker.handleRequest WriteShareGroupState writes local share state" {
     const Req = generated.write_share_group_state_request.WriteShareGroupStateRequest;
     const Resp = generated.write_share_group_state_response.WriteShareGroupStateResponse;
     const WriteStateData = Req.WriteStateData;
@@ -39847,8 +40107,9 @@ test "Broker.handleRequest WriteShareGroupState returns generated fail-closed re
 
     var broker = Broker.init(testing.allocator, 1, 9092);
     defer broker.deinit();
+    try testing.expect(broker.ensureTopic("share-state-write-topic"));
 
-    const topic_id = [_]u8{5} ** 16;
+    const topic_id = broker.topics.get("share-state-write-topic").?.topic_id;
     const state_batches = [_]StateBatch{.{
         .first_offset = 10,
         .last_offset = 11,
@@ -39897,8 +40158,68 @@ test "Broker.handleRequest WriteShareGroupState returns generated fail-closed re
     try testing.expectEqualSlices(u8, topic_id[0..], resp.results[0].topic_id[0..]);
     try testing.expectEqual(@as(usize, 1), resp.results[0].partitions.len);
     try testing.expectEqual(@as(i32, 0), resp.results[0].partitions[0].partition);
-    try testing.expectEqual(ErrorCode.unsupported_version.toInt(), resp.results[0].partitions[0].error_code);
-    try testing.expectEqualStrings("WriteShareGroupState is not implemented", resp.results[0].partitions[0].error_message.?);
+    try testing.expectEqual(ErrorCode.none.toInt(), resp.results[0].partitions[0].error_code);
+    try testing.expect(resp.results[0].partitions[0].error_message == null);
+
+    const state = (try broker.getSharePartitionState("share-group", topic_id, 0)).?;
+    try testing.expectEqual(@as(i32, 2), state.state_epoch);
+    try testing.expectEqual(@as(i64, 10), state.start_offset);
+    try testing.expectEqual(@as(usize, 1), state.batches.len);
+    try testing.expectEqual(@as(i64, 10), state.batches[0].first_offset);
+    try testing.expectEqual(@as(i64, 11), state.batches[0].last_offset);
+    try testing.expectEqual(@as(i8, 0), state.batches[0].delivery_state);
+    try testing.expectEqual(@as(i16, 1), state.batches[0].delivery_count);
+
+    const ReadReq = generated.read_share_group_state_request.ReadShareGroupStateRequest;
+    const ReadResp = generated.read_share_group_state_response.ReadShareGroupStateResponse;
+    const ReadStateData = ReadReq.ReadStateData;
+    const ReadPartitionData = ReadStateData.PartitionData;
+    const read_partitions = [_]ReadPartitionData{.{
+        .partition = 0,
+        .leader_epoch = 3,
+    }};
+    const read_topics = [_]ReadStateData{.{
+        .topic_id = topic_id,
+        .partitions = &read_partitions,
+    }};
+    const read_req = ReadReq{
+        .group_id = "share-group",
+        .topics = &read_topics,
+    };
+
+    var read_buf: [256]u8 = undefined;
+    var read_pos = buildTestRequest(&read_buf, 84, 0, 8502, header_mod.requestHeaderVersion(84, 0));
+    read_req.serialize(&read_buf, &read_pos, 0);
+
+    const read_response = broker.handleRequest(read_buf[0..read_pos]);
+    try testing.expect(read_response != null);
+    defer testing.allocator.free(read_response.?);
+
+    var read_rpos: usize = 0;
+    var read_response_header = try ResponseHeader.deserialize(testing.allocator, read_response.?, &read_rpos, header_mod.responseHeaderVersion(84, 0));
+    defer read_response_header.deinit(testing.allocator);
+    try testing.expectEqual(@as(i32, 8502), read_response_header.correlation_id);
+
+    const read_resp = try ReadResp.deserialize(testing.allocator, read_response.?, &read_rpos, 0);
+    defer {
+        for (read_resp.results) |result| {
+            for (result.partitions) |partition| {
+                if (partition.state_batches.len > 0) testing.allocator.free(partition.state_batches);
+            }
+            if (result.partitions.len > 0) testing.allocator.free(result.partitions);
+        }
+        if (read_resp.results.len > 0) testing.allocator.free(read_resp.results);
+    }
+
+    try testing.expectEqual(read_response.?.len, read_rpos);
+    try testing.expectEqual(@as(usize, 1), read_resp.results.len);
+    try testing.expectEqual(@as(usize, 1), read_resp.results[0].partitions.len);
+    try testing.expectEqual(ErrorCode.none.toInt(), read_resp.results[0].partitions[0].error_code);
+    try testing.expectEqual(@as(i32, 2), read_resp.results[0].partitions[0].state_epoch);
+    try testing.expectEqual(@as(i64, 10), read_resp.results[0].partitions[0].start_offset);
+    try testing.expectEqual(@as(usize, 1), read_resp.results[0].partitions[0].state_batches.len);
+    try testing.expectEqual(@as(i64, 10), read_resp.results[0].partitions[0].state_batches[0].first_offset);
+    try testing.expectEqual(@as(i64, 11), read_resp.results[0].partitions[0].state_batches[0].last_offset);
 }
 
 test "Broker.handleRequest WriteShareGroupState rejects malformed request" {
@@ -39935,7 +40256,85 @@ test "Broker.handleRequest WriteShareGroupState rejects malformed request" {
     try testing.expectEqual(ErrorCode.invalid_request.toInt(), resp.results[0].partitions[0].error_code);
 }
 
-test "Broker.handleRequest DeleteShareGroupState returns generated fail-closed response" {
+test "Broker.handleRequest WriteShareGroupState rejects stale epochs and invalid batches" {
+    const Req = generated.write_share_group_state_request.WriteShareGroupStateRequest;
+    const Resp = generated.write_share_group_state_response.WriteShareGroupStateResponse;
+    const WriteStateData = Req.WriteStateData;
+    const PartitionData = WriteStateData.PartitionData;
+    const StateBatch = PartitionData.StateBatch;
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+    try testing.expect(broker.ensureTopic("share-state-invalid-topic"));
+
+    const topic_id = broker.topics.get("share-state-invalid-topic").?.topic_id;
+    try broker.setSharePartitionState("share-group", topic_id, 0, 5, 40, &.{});
+
+    const bad_batches = [_]StateBatch{.{
+        .first_offset = 12,
+        .last_offset = 11,
+        .delivery_state = 1,
+        .delivery_count = 1,
+    }};
+    const partitions = [_]PartitionData{
+        .{
+            .partition = 0,
+            .state_epoch = 4,
+            .leader_epoch = 3,
+            .start_offset = -1,
+            .state_batches = &.{},
+        },
+        .{
+            .partition = 0,
+            .state_epoch = 5,
+            .leader_epoch = 3,
+            .start_offset = -1,
+            .state_batches = &bad_batches,
+        },
+    };
+    const topics = [_]WriteStateData{.{
+        .topic_id = topic_id,
+        .partitions = &partitions,
+    }};
+    const req = Req{
+        .group_id = "share-group",
+        .topics = &topics,
+    };
+
+    var buf: [512]u8 = undefined;
+    var pos = buildTestRequest(&buf, 85, 0, 8503, header_mod.requestHeaderVersion(85, 0));
+    req.serialize(&buf, &pos, 0);
+
+    const response = broker.handleRequest(buf[0..pos]);
+    try testing.expect(response != null);
+    defer testing.allocator.free(response.?);
+
+    var rpos: usize = 0;
+    var response_header = try ResponseHeader.deserialize(testing.allocator, response.?, &rpos, header_mod.responseHeaderVersion(85, 0));
+    defer response_header.deinit(testing.allocator);
+    try testing.expectEqual(@as(i32, 8503), response_header.correlation_id);
+
+    const resp = try Resp.deserialize(testing.allocator, response.?, &rpos, 0);
+    defer {
+        for (resp.results) |result| {
+            if (result.partitions.len > 0) testing.allocator.free(result.partitions);
+        }
+        if (resp.results.len > 0) testing.allocator.free(resp.results);
+    }
+
+    try testing.expectEqual(response.?.len, rpos);
+    try testing.expectEqual(@as(usize, 1), resp.results.len);
+    try testing.expectEqual(@as(usize, 2), resp.results[0].partitions.len);
+    try testing.expectEqual(ErrorCode.invalid_request.toInt(), resp.results[0].partitions[0].error_code);
+    try testing.expectEqual(ErrorCode.invalid_request.toInt(), resp.results[0].partitions[1].error_code);
+
+    const state = (try broker.getSharePartitionState("share-group", topic_id, 0)).?;
+    try testing.expectEqual(@as(i32, 5), state.state_epoch);
+    try testing.expectEqual(@as(i64, 40), state.start_offset);
+    try testing.expectEqual(@as(usize, 0), state.batches.len);
+}
+
+test "Broker.handleRequest DeleteShareGroupState removes local share state" {
     const Req = generated.delete_share_group_state_request.DeleteShareGroupStateRequest;
     const Resp = generated.delete_share_group_state_response.DeleteShareGroupStateResponse;
     const DeleteStateData = Req.DeleteStateData;
@@ -39943,8 +40342,10 @@ test "Broker.handleRequest DeleteShareGroupState returns generated fail-closed r
 
     var broker = Broker.init(testing.allocator, 1, 9092);
     defer broker.deinit();
+    try testing.expect(broker.ensureTopic("share-state-delete-topic"));
 
-    const topic_id = [_]u8{6} ** 16;
+    const topic_id = broker.topics.get("share-state-delete-topic").?.topic_id;
+    try broker.setSharePartitionState("share-group", topic_id, 0, 3, 20, &.{});
     const partitions = [_]PartitionData{.{
         .partition = 0,
     }};
@@ -39983,8 +40384,9 @@ test "Broker.handleRequest DeleteShareGroupState returns generated fail-closed r
     try testing.expectEqualSlices(u8, topic_id[0..], resp.results[0].topic_id[0..]);
     try testing.expectEqual(@as(usize, 1), resp.results[0].partitions.len);
     try testing.expectEqual(@as(i32, 0), resp.results[0].partitions[0].partition);
-    try testing.expectEqual(ErrorCode.unsupported_version.toInt(), resp.results[0].partitions[0].error_code);
-    try testing.expectEqualStrings("DeleteShareGroupState is not implemented", resp.results[0].partitions[0].error_message.?);
+    try testing.expectEqual(ErrorCode.none.toInt(), resp.results[0].partitions[0].error_code);
+    try testing.expect(resp.results[0].partitions[0].error_message == null);
+    try testing.expect((try broker.getSharePartitionState("share-group", topic_id, 0)) == null);
 }
 
 test "Broker.handleRequest DeleteShareGroupState rejects malformed request" {
@@ -40021,7 +40423,7 @@ test "Broker.handleRequest DeleteShareGroupState rejects malformed request" {
     try testing.expectEqual(ErrorCode.invalid_request.toInt(), resp.results[0].partitions[0].error_code);
 }
 
-test "Broker.handleRequest ReadShareGroupStateSummary returns generated fail-closed response" {
+test "Broker.handleRequest ReadShareGroupStateSummary returns local share state summary" {
     const Req = generated.read_share_group_state_summary_request.ReadShareGroupStateSummaryRequest;
     const Resp = generated.read_share_group_state_summary_response.ReadShareGroupStateSummaryResponse;
     const ReadStateSummaryData = Req.ReadStateSummaryData;
@@ -40029,8 +40431,10 @@ test "Broker.handleRequest ReadShareGroupStateSummary returns generated fail-clo
 
     var broker = Broker.init(testing.allocator, 1, 9092);
     defer broker.deinit();
+    try testing.expect(broker.ensureTopic("share-state-summary-topic"));
 
-    const topic_id = [_]u8{7} ** 16;
+    const topic_id = broker.topics.get("share-state-summary-topic").?.topic_id;
+    try broker.setSharePartitionState("share-group", topic_id, 0, 4, 30, &.{});
     const partitions = [_]PartitionData{.{
         .partition = 0,
         .leader_epoch = 3,
@@ -40070,10 +40474,10 @@ test "Broker.handleRequest ReadShareGroupStateSummary returns generated fail-clo
     try testing.expectEqualSlices(u8, topic_id[0..], resp.results[0].topic_id[0..]);
     try testing.expectEqual(@as(usize, 1), resp.results[0].partitions.len);
     try testing.expectEqual(@as(i32, 0), resp.results[0].partitions[0].partition);
-    try testing.expectEqual(ErrorCode.unsupported_version.toInt(), resp.results[0].partitions[0].error_code);
-    try testing.expectEqualStrings("ReadShareGroupStateSummary is not implemented", resp.results[0].partitions[0].error_message.?);
-    try testing.expectEqual(@as(i32, 0), resp.results[0].partitions[0].state_epoch);
-    try testing.expectEqual(@as(i64, -1), resp.results[0].partitions[0].start_offset);
+    try testing.expectEqual(ErrorCode.none.toInt(), resp.results[0].partitions[0].error_code);
+    try testing.expect(resp.results[0].partitions[0].error_message == null);
+    try testing.expectEqual(@as(i32, 4), resp.results[0].partitions[0].state_epoch);
+    try testing.expectEqual(@as(i64, 30), resp.results[0].partitions[0].start_offset);
 }
 
 test "Broker.handleRequest ReadShareGroupStateSummary rejects malformed request" {
