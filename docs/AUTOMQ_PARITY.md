@@ -203,7 +203,8 @@ Status: completed for the initial catalog and DeleteGroups slice.
   DeleteShareGroupState, and ReadShareGroupStateSummary remain non-advertised
   until share coordinator durability exists, but direct v0 probes now validate
   topic IDs, group IDs, partitions, state epochs, start offsets, and state
-  batches while maintaining local share-partition state.
+  batches while maintaining local share-partition state and restoring it across
+  local broker restart.
   DescribeAcls/CreateAcls/DeleteAcls now use generated schemas, reject malformed
   frames, validate enum fields, write full ACL snapshots to `__cluster_metadata`
   for broker replacement replay, fail closed and roll back local ACL visibility

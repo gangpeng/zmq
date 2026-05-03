@@ -928,6 +928,20 @@ pub const MetadataPersistence = struct {
         directory_id: [16]u8,
     };
 
+    pub const ShareStateBatchEntry = struct {
+        first_offset: i64,
+        last_offset: i64,
+        delivery_state: i8,
+        delivery_count: i16,
+    };
+
+    pub const ShareGroupStateEntry = struct {
+        key: []u8,
+        state_epoch: i32,
+        start_offset: i64,
+        batches: []ShareStateBatchEntry,
+    };
+
     /// Save transaction state to disk.
     /// NOTE: AutoMQ/Kafka persists to __transaction_state topic on coordinator startup.
     /// ZMQ uses file-based persistence as a simplification.
@@ -1509,6 +1523,168 @@ pub const MetadataPersistence = struct {
     }
 
     pub fn freeReplicaDirectoryAssignmentEntries(self: *MetadataPersistence, entries: []ReplicaDirectoryAssignmentEntry) void {
+        if (entries.len > 0) self.allocator.free(entries);
+    }
+
+    /// Save local share-group partition state to disk.
+    /// Format: share_group_states.meta TSV with a hex-encoded internal state key.
+    pub fn saveShareGroupStates(self: *MetadataPersistence, states: anytype) !void {
+        const dir = self.data_dir orelse return;
+
+        const path = try std.fmt.allocPrint(self.allocator, "{s}/share_group_states.meta", .{dir});
+        defer self.allocator.free(path);
+
+        const file = try fs.createFileAbsolute(path, .{ .truncate = true });
+        defer file.close();
+        const writer = file.writer();
+
+        var it = states.iterator();
+        while (it.next()) |entry| {
+            const state = entry.value_ptr;
+            try file.writeAll("share_state\t");
+            try writeHex(file, entry.key_ptr.*);
+            try writer.print("\t{d}\t{d}\t{d}", .{
+                state.state_epoch,
+                state.start_offset,
+                state.batches.len,
+            });
+            for (state.batches) |batch| {
+                try writer.print("\t{d}\t{d}\t{d}\t{d}", .{
+                    batch.first_offset,
+                    batch.last_offset,
+                    batch.delivery_state,
+                    batch.delivery_count,
+                });
+            }
+            try file.writeAll("\n");
+        }
+        try file.sync();
+    }
+
+    pub fn loadShareGroupStates(self: *MetadataPersistence) ![]ShareGroupStateEntry {
+        const dir = self.data_dir orelse return &.{};
+
+        const path = try std.fmt.allocPrint(self.allocator, "{s}/share_group_states.meta", .{dir});
+        defer self.allocator.free(path);
+
+        const file = fs.openFileAbsolute(path, .{}) catch |err| {
+            log.debug("No share_group_states.meta found: {}", .{err});
+            return &.{};
+        };
+        defer file.close();
+
+        const content = file.readToEndAlloc(self.allocator, 4 * 1024 * 1024) catch |err| {
+            log.warn("Failed to read share_group_states.meta: {}", .{err});
+            return &.{};
+        };
+        defer self.allocator.free(content);
+
+        var entries = std.array_list.Managed(ShareGroupStateEntry).init(self.allocator);
+        errdefer {
+            for (entries.items) |entry| {
+                self.allocator.free(entry.key);
+                if (entry.batches.len > 0) self.allocator.free(entry.batches);
+            }
+            entries.deinit();
+        }
+
+        var lines = std.mem.splitSequence(u8, content, "\n");
+        while (lines.next()) |line| {
+            if (line.len == 0) continue;
+
+            var fields = std.mem.splitSequence(u8, line, "\t");
+            const tag = fields.next() orelse continue;
+            if (!std.mem.eql(u8, tag, "share_state")) continue;
+
+            const key_hex = fields.next() orelse continue;
+            const state_epoch_str = fields.next() orelse continue;
+            const start_offset_str = fields.next() orelse continue;
+            const batch_count_str = fields.next() orelse continue;
+
+            const key = decodeHexAlloc(self.allocator, key_hex) catch continue;
+            const state_epoch = std.fmt.parseInt(i32, state_epoch_str, 10) catch {
+                self.allocator.free(key);
+                continue;
+            };
+            const start_offset = std.fmt.parseInt(i64, start_offset_str, 10) catch {
+                self.allocator.free(key);
+                continue;
+            };
+            const batch_count = std.fmt.parseInt(usize, batch_count_str, 10) catch {
+                self.allocator.free(key);
+                continue;
+            };
+
+            const batches: []ShareStateBatchEntry = if (batch_count > 0) self.allocator.alloc(ShareStateBatchEntry, batch_count) catch {
+                self.allocator.free(key);
+                continue;
+            } else &.{};
+            var valid_batches = true;
+            for (batches) |*batch| {
+                const first_offset_str = fields.next() orelse {
+                    valid_batches = false;
+                    break;
+                };
+                const last_offset_str = fields.next() orelse {
+                    valid_batches = false;
+                    break;
+                };
+                const delivery_state_str = fields.next() orelse {
+                    valid_batches = false;
+                    break;
+                };
+                const delivery_count_str = fields.next() orelse {
+                    valid_batches = false;
+                    break;
+                };
+
+                const first_offset = std.fmt.parseInt(i64, first_offset_str, 10) catch {
+                    valid_batches = false;
+                    break;
+                };
+                const last_offset = std.fmt.parseInt(i64, last_offset_str, 10) catch {
+                    valid_batches = false;
+                    break;
+                };
+                const delivery_state = std.fmt.parseInt(i8, delivery_state_str, 10) catch {
+                    valid_batches = false;
+                    break;
+                };
+                const delivery_count = std.fmt.parseInt(i16, delivery_count_str, 10) catch {
+                    valid_batches = false;
+                    break;
+                };
+
+                batch.* = .{
+                    .first_offset = first_offset,
+                    .last_offset = last_offset,
+                    .delivery_state = delivery_state,
+                    .delivery_count = delivery_count,
+                };
+            }
+            if (!valid_batches) {
+                self.allocator.free(key);
+                if (batches.len > 0) self.allocator.free(batches);
+                continue;
+            }
+
+            try entries.append(.{
+                .key = key,
+                .state_epoch = state_epoch,
+                .start_offset = start_offset,
+                .batches = batches,
+            });
+        }
+
+        log.info("Loaded {d} share group state entries from share_group_states.meta", .{entries.items.len});
+        return entries.toOwnedSlice();
+    }
+
+    pub fn freeShareGroupStateEntries(self: *MetadataPersistence, entries: []ShareGroupStateEntry) void {
+        for (entries) |entry| {
+            self.allocator.free(entry.key);
+            if (entry.batches.len > 0) self.allocator.free(entry.batches);
+        }
         if (entries.len > 0) self.allocator.free(entries);
     }
 
@@ -2256,6 +2432,56 @@ test "MetadataPersistence save and load replica directory assignments round-trip
     try testing.expectEqualSlices(u8, topic_id[0..], loaded[0].topic_id[0..]);
     try testing.expectEqual(@as(i32, 3), loaded[0].partition_index);
     try testing.expectEqualSlices(u8, directory_id[0..], loaded[0].directory_id[0..]);
+}
+
+test "MetadataPersistence save and load share group states round-trip" {
+    const tmp_dir = "/tmp/automq-share-group-state-test";
+    fs.deleteTreeAbsolute(tmp_dir) catch {};
+    fs.makeDirAbsolute(tmp_dir) catch {};
+    defer fs.deleteTreeAbsolute(tmp_dir) catch {};
+
+    var persistence = MetadataPersistence.init(testing.allocator, tmp_dir);
+
+    const ShareStateBatch = struct {
+        first_offset: i64,
+        last_offset: i64,
+        delivery_state: i8,
+        delivery_count: i16,
+    };
+    const SharePartitionState = struct {
+        state_epoch: i32,
+        start_offset: i64,
+        batches: []const ShareStateBatch,
+    };
+    var states = std.StringHashMap(SharePartitionState).init(testing.allocator);
+    defer states.deinit();
+
+    const batches = [_]ShareStateBatch{.{
+        .first_offset = 5,
+        .last_offset = 8,
+        .delivery_state = 2,
+        .delivery_count = 1,
+    }};
+    try states.put("group:00112233445566778899aabbccddeeff:0", .{
+        .state_epoch = 4,
+        .start_offset = 5,
+        .batches = &batches,
+    });
+
+    try persistence.saveShareGroupStates(&states);
+
+    const loaded = try persistence.loadShareGroupStates();
+    defer persistence.freeShareGroupStateEntries(loaded);
+
+    try testing.expectEqual(@as(usize, 1), loaded.len);
+    try testing.expectEqualStrings("group:00112233445566778899aabbccddeeff:0", loaded[0].key);
+    try testing.expectEqual(@as(i32, 4), loaded[0].state_epoch);
+    try testing.expectEqual(@as(i64, 5), loaded[0].start_offset);
+    try testing.expectEqual(@as(usize, 1), loaded[0].batches.len);
+    try testing.expectEqual(@as(i64, 5), loaded[0].batches[0].first_offset);
+    try testing.expectEqual(@as(i64, 8), loaded[0].batches[0].last_offset);
+    try testing.expectEqual(@as(i8, 2), loaded[0].batches[0].delivery_state);
+    try testing.expectEqual(@as(i16, 1), loaded[0].batches[0].delivery_count);
 }
 
 test "MetadataPersistence save and load AutoMQ metadata round-trip" {

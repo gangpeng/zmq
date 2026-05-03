@@ -808,6 +808,13 @@ pub const Broker = struct {
             log.info("Restored {d} replica directory assignment(s) from replica_directory_assignments.meta", .{self.replica_directory_assignments.count()});
         }
 
+        const saved_share_group_states = try self.persistence.loadShareGroupStates();
+        defer self.persistence.freeShareGroupStateEntries(saved_share_group_states);
+        try self.restoreShareGroupStates(saved_share_group_states);
+        if (saved_share_group_states.len > 0) {
+            log.info("Restored {d} share group state partition(s) from share_group_states.meta", .{self.share_group_states.count()});
+        }
+
         // Load local AutoMQ controller-style metadata (KV namespace, node registry,
         // license, zone router state, and group promotions).
         var auto_mq_snapshot = try self.persistence.loadAutoMqMetadata();
@@ -1181,6 +1188,7 @@ pub const Broker = struct {
         self.persistTransactionsIfDirty();
         self.persistProducerSequencesIfDirty();
         self.persistAutoMqMetadata();
+        self.persistShareGroupStatesLocal();
         self.persistPartitionReassignmentsLocal();
         self.persistReplicaDirectoryAssignmentsLocal();
         self.persistObjectManagerSnapshot();
@@ -1423,6 +1431,39 @@ pub const Broker = struct {
             entry.value_ptr.deinit(self.allocator);
         }
         self.share_group_states.clearRetainingCapacity();
+    }
+
+    fn clearShareGroupStatesForTopicId(self: *Broker, topic_id: [16]u8) void {
+        var token: [34]u8 = undefined;
+        token[0] = ':';
+        var pos: usize = 1;
+        for (topic_id) |byte| {
+            token[pos] = shareStateHex(byte >> 4);
+            token[pos + 1] = shareStateHex(byte & 0x0f);
+            pos += 2;
+        }
+        token[pos] = ':';
+
+        while (true) {
+            var key_to_remove: ?[]const u8 = null;
+            var it = self.share_group_states.iterator();
+            while (it.next()) |entry| {
+                const key = entry.key_ptr.*;
+                if (std.mem.indexOf(u8, key, &token) != null) {
+                    key_to_remove = key;
+                    break;
+                }
+            }
+
+            const key = key_to_remove orelse break;
+            if (self.share_group_states.fetchRemove(key)) |removed| {
+                self.allocator.free(removed.key);
+                var state = removed.value;
+                state.deinit(self.allocator);
+            } else {
+                break;
+            }
+        }
     }
 
     fn clearShareGroupSessions(self: *Broker) void {
@@ -1677,6 +1718,12 @@ pub const Broker = struct {
         };
     }
 
+    fn persistShareGroupStatesLocal(self: *Broker) void {
+        self.persistence.saveShareGroupStates(&self.share_group_states) catch |err| {
+            log.warn("Failed to persist share group states: {}", .{err});
+        };
+    }
+
     fn persistPartitionReassignmentsDurably(self: *Broker) !void {
         if (self.raft_state != null) {
             try self.commitPartitionReassignmentQuorumRecord();
@@ -1745,6 +1792,50 @@ pub const Broker = struct {
                 self.allocator.free(key);
             } else {
                 try self.replica_directory_assignments.put(key, restored);
+            }
+        }
+    }
+
+    fn restoreShareGroupStates(self: *Broker, entries: []const MetadataPersistence.ShareGroupStateEntry) !void {
+        self.clearShareGroupStates();
+
+        for (entries) |entry| {
+            if (entry.state_epoch < 0) continue;
+            if (entry.start_offset < -1) continue;
+
+            const batches: []ShareStateBatch = if (entry.batches.len > 0) try self.allocator.alloc(ShareStateBatch, entry.batches.len) else &.{};
+            errdefer if (batches.len > 0) self.allocator.free(batches);
+            var valid_batches = true;
+            for (entry.batches, 0..) |batch, index| {
+                if (validateShareStateBatch(batch.first_offset, batch.last_offset, batch.delivery_state, batch.delivery_count) != .none) {
+                    valid_batches = false;
+                    break;
+                }
+                batches[index] = .{
+                    .first_offset = batch.first_offset,
+                    .last_offset = batch.last_offset,
+                    .delivery_state = batch.delivery_state,
+                    .delivery_count = batch.delivery_count,
+                };
+            }
+            if (!valid_batches) {
+                if (batches.len > 0) self.allocator.free(batches);
+                continue;
+            }
+
+            const key = try self.allocator.dupe(u8, entry.key);
+            errdefer self.allocator.free(key);
+            const restored: SharePartitionState = .{
+                .state_epoch = entry.state_epoch,
+                .start_offset = entry.start_offset,
+                .batches = batches,
+            };
+            if (self.share_group_states.getPtr(key)) |existing| {
+                existing.deinit(self.allocator);
+                existing.* = restored;
+                self.allocator.free(key);
+            } else {
+                try self.share_group_states.put(key, restored);
             }
         }
     }
@@ -12173,6 +12264,7 @@ pub const Broker = struct {
                 .start_offset = start_offset,
                 .batches = batches,
             };
+            self.persistShareGroupStatesLocal();
             return;
         }
 
@@ -12181,6 +12273,7 @@ pub const Broker = struct {
             .start_offset = start_offset,
             .batches = batches,
         });
+        self.persistShareGroupStatesLocal();
     }
 
     fn deleteSharePartitionState(self: *Broker, group_id: []const u8, topic_id: [16]u8, partition: i32) !void {
@@ -12190,6 +12283,7 @@ pub const Broker = struct {
             self.allocator.free(removed.key);
             var state = removed.value;
             state.deinit(self.allocator);
+            self.persistShareGroupStatesLocal();
         }
     }
 
@@ -13274,6 +13368,7 @@ pub const Broker = struct {
             const topic_id = info.topic_id;
             const partition_count = info.num_partitions;
             self.clearReplicaDirectoryAssignmentsForTopicId(topic_id);
+            self.clearShareGroupStatesForTopicId(topic_id);
             self.allocator.free(info.name);
             self.allocator.free(removed.key);
             log.info("Deleted topic '{s}' ({d} partitions)", .{ topic_name, info.num_partitions });
@@ -41366,6 +41461,47 @@ test "Broker.handleRequest WriteShareGroupState writes local share state" {
     try testing.expectEqual(@as(usize, 1), read_resp.results[0].partitions[0].state_batches.len);
     try testing.expectEqual(@as(i64, 10), read_resp.results[0].partitions[0].state_batches[0].first_offset);
     try testing.expectEqual(@as(i64, 11), read_resp.results[0].partitions[0].state_batches[0].last_offset);
+}
+
+test "Broker share group state persists across local restart" {
+    const fs = @import("fs_compat");
+
+    const tmp_dir = "/tmp/zmq-share-group-state-restart-test";
+    fs.deleteTreeAbsolute(tmp_dir) catch {};
+    try fs.makeDirAbsolute(tmp_dir);
+    defer fs.deleteTreeAbsolute(tmp_dir) catch {};
+
+    var topic_id: [16]u8 = undefined;
+    {
+        var broker = Broker.initWithConfig(testing.allocator, 1, 9092, .{ .data_dir = tmp_dir });
+        defer broker.deinit();
+        try testing.expect(broker.ensureTopic("share-state-restart-topic"));
+        topic_id = broker.topics.get("share-state-restart-topic").?.topic_id;
+
+        const batches = try testing.allocator.alloc(Broker.ShareStateBatch, 1);
+        batches[0] = .{
+            .first_offset = 7,
+            .last_offset = 9,
+            .delivery_state = 2,
+            .delivery_count = 3,
+        };
+        try broker.setSharePartitionState("share-restart-group", topic_id, 0, 6, 7, batches);
+    }
+
+    {
+        var restarted = Broker.initWithConfig(testing.allocator, 1, 9092, .{ .data_dir = tmp_dir });
+        try restarted.open();
+        defer restarted.deinit();
+
+        const state = (try restarted.getSharePartitionState("share-restart-group", topic_id, 0)) orelse return error.ExpectedSharePartitionState;
+        try testing.expectEqual(@as(i32, 6), state.state_epoch);
+        try testing.expectEqual(@as(i64, 7), state.start_offset);
+        try testing.expectEqual(@as(usize, 1), state.batches.len);
+        try testing.expectEqual(@as(i64, 7), state.batches[0].first_offset);
+        try testing.expectEqual(@as(i64, 9), state.batches[0].last_offset);
+        try testing.expectEqual(@as(i8, 2), state.batches[0].delivery_state);
+        try testing.expectEqual(@as(i16, 3), state.batches[0].delivery_count);
+    }
 }
 
 test "Broker.handleRequest WriteShareGroupState rejects malformed request" {
