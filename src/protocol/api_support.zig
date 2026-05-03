@@ -65,7 +65,7 @@ pub const broker_supported_apis = [_]BrokerApiSupport{
     .{ .key = 25, .name = "AddOffsetsToTxn", .metric = "add_offsets_to_txn", .min = 0, .max = 3 },
     .{ .key = 26, .name = "EndTxn", .metric = "end_txn", .min = 0, .max = 3 },
     .{ .key = 27, .name = "WriteTxnMarkers", .metric = "write_txn_markers", .min = 0, .max = 1 },
-    .{ .key = 28, .name = "TxnOffsetCommit", .metric = "txn_offset_commit", .min = 0, .max = 3 },
+    .{ .key = 28, .name = "TxnOffsetCommit", .metric = "txn_offset_commit", .min = 0, .max = 4 },
     .{ .key = 29, .name = "DescribeAcls", .metric = "describe_acls", .min = 0, .max = 3 },
     .{ .key = 30, .name = "CreateAcls", .metric = "create_acls", .min = 0, .max = 3 },
     .{ .key = 31, .name = "DeleteAcls", .metric = "delete_acls", .min = 0, .max = 3 },

@@ -13569,17 +13569,26 @@ pub const Broker = struct {
         return @intFromEnum(ErrorCode.none);
     }
 
-    fn validateTxnOffsetCommitState(self: *Broker, transactional_id: ?[]const u8, producer_id: i64, producer_epoch: i16, group_id: []const u8) i16 {
+    fn validateTxnOffsetCommitState(self: *Broker, api_version: i16, transactional_id: ?[]const u8, producer_id: i64, producer_epoch: i16, group_id: []const u8) i16 {
         const offsets_partition = self.consumerOffsetsPartition(group_id);
         const identity_error = self.validateAddOffsetsToTxnState(transactional_id, producer_id, producer_epoch, group_id, offsets_partition);
         if (identity_error != @intFromEnum(ErrorCode.none)) return identity_error;
 
-        return self.txn_coordinator.verifyPartitionInTxn(
+        const state_error = self.txn_coordinator.verifyPartitionInTxn(
             producer_id,
             producer_epoch,
             "__consumer_offsets",
             offsets_partition,
         );
+        return self.mapTransactionAbortableError(api_version, producer_id, state_error);
+    }
+
+    fn mapTransactionAbortableError(self: *const Broker, api_version: i16, producer_id: i64, error_code: i16) i16 {
+        if (api_version < 4 or error_code != @intFromEnum(ErrorCode.invalid_txn_state)) return error_code;
+
+        const txn = self.txn_coordinator.transactions.get(producer_id) orelse return error_code;
+        if (txn.status == .prepare_abort) return @intFromEnum(ErrorCode.transaction_abortable);
+        return error_code;
     }
 
     fn consumerOffsetsPartition(_: *Broker, group_id: []const u8) i32 {
@@ -16773,7 +16782,7 @@ pub const Broker = struct {
         defer self.freeTxnOffsetCommitRequest(&req);
 
         const group_id = req.group_id orelse "";
-        const txn_error = self.validateTxnOffsetCommitState(req.transactional_id, req.producer_id, req.producer_epoch, group_id);
+        const txn_error = self.validateTxnOffsetCommitState(api_version, req.transactional_id, req.producer_id, req.producer_epoch, group_id);
         const group_error = self.validateOffsetCommitGroup(api_version, group_id, req.generation_id, req.member_id, req.group_instance_id);
         const topics = self.allocator.alloc(TopicResponse, req.topics.len) catch return null;
         var topics_init: usize = 0;
@@ -24691,6 +24700,87 @@ test "Broker.handleRequest TxnOffsetCommit requires AddOffsetsToTxn registration
     try testing.expectEqual(response.?.len, rpos);
     try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.invalid_txn_state)), resp.topics[0].partitions[0].error_code);
     try testing.expectEqual(@as(?i64, null), try broker.groups.fetchOffset("txn-offset-unregistered-group", "txn-offset-unregistered-topic", 0));
+}
+
+test "Broker.handleRequest TxnOffsetCommit v4 maps abortable transaction state" {
+    const Req = generated.txn_offset_commit_request.TxnOffsetCommitRequest;
+    const Resp = generated.txn_offset_commit_response.TxnOffsetCommitResponse;
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+    try testing.expect(broker.ensureTopic("txn-offset-abortable-topic"));
+    const init_result = try initTxnOffsetCommitForTest(&broker, "txn-offset-abortable-id", "txn-offset-abortable-group");
+
+    const txn = broker.txn_coordinator.transactions.getPtr(init_result.producer_id) orelse return error.ExpectedTransactionState;
+    txn.status = .prepare_abort;
+
+    const partitions = [_]Req.TxnOffsetCommitRequestTopic.TxnOffsetCommitRequestPartition{.{
+        .partition_index = 0,
+        .committed_offset = 445,
+        .committed_leader_epoch = -1,
+        .committed_metadata = "abortable",
+    }};
+    const topics = [_]Req.TxnOffsetCommitRequestTopic{.{
+        .name = "txn-offset-abortable-topic",
+        .partitions = &partitions,
+    }};
+    const req = Req{
+        .transactional_id = "txn-offset-abortable-id",
+        .group_id = "txn-offset-abortable-group",
+        .producer_id = init_result.producer_id,
+        .producer_epoch = init_result.producer_epoch,
+        .generation_id = -1,
+        .member_id = "",
+        .group_instance_id = null,
+        .topics = &topics,
+    };
+
+    var legacy_buf: [512]u8 = undefined;
+    var legacy_pos = buildTestRequest(&legacy_buf, 28, 3, 2817, header_mod.requestHeaderVersion(28, 3));
+    req.serialize(&legacy_buf, &legacy_pos, 3);
+
+    const legacy_response = broker.handleRequest(legacy_buf[0..legacy_pos]);
+    try testing.expect(legacy_response != null);
+    defer testing.allocator.free(legacy_response.?);
+
+    var legacy_rpos: usize = 0;
+    var legacy_header = try ResponseHeader.deserialize(testing.allocator, legacy_response.?, &legacy_rpos, header_mod.responseHeaderVersion(28, 3));
+    defer legacy_header.deinit(testing.allocator);
+    try testing.expectEqual(@as(i32, 2817), legacy_header.correlation_id);
+
+    const legacy_resp = try Resp.deserialize(testing.allocator, legacy_response.?, &legacy_rpos, 3);
+    defer {
+        for (legacy_resp.topics) |topic| {
+            if (topic.partitions.len > 0) testing.allocator.free(topic.partitions);
+        }
+        if (legacy_resp.topics.len > 0) testing.allocator.free(legacy_resp.topics);
+    }
+    try testing.expectEqual(legacy_response.?.len, legacy_rpos);
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.invalid_txn_state)), legacy_resp.topics[0].partitions[0].error_code);
+
+    var v4_buf: [512]u8 = undefined;
+    var v4_pos = buildTestRequest(&v4_buf, 28, 4, 2818, header_mod.requestHeaderVersion(28, 4));
+    req.serialize(&v4_buf, &v4_pos, 4);
+
+    const v4_response = broker.handleRequest(v4_buf[0..v4_pos]);
+    try testing.expect(v4_response != null);
+    defer testing.allocator.free(v4_response.?);
+
+    var v4_rpos: usize = 0;
+    var v4_header = try ResponseHeader.deserialize(testing.allocator, v4_response.?, &v4_rpos, header_mod.responseHeaderVersion(28, 4));
+    defer v4_header.deinit(testing.allocator);
+    try testing.expectEqual(@as(i32, 2818), v4_header.correlation_id);
+
+    const v4_resp = try Resp.deserialize(testing.allocator, v4_response.?, &v4_rpos, 4);
+    defer {
+        for (v4_resp.topics) |topic| {
+            if (topic.partitions.len > 0) testing.allocator.free(topic.partitions);
+        }
+        if (v4_resp.topics.len > 0) testing.allocator.free(v4_resp.topics);
+    }
+    try testing.expectEqual(v4_response.?.len, v4_rpos);
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.transaction_abortable)), v4_resp.topics[0].partitions[0].error_code);
+    try testing.expectEqual(@as(?i64, null), try broker.groups.fetchOffset("txn-offset-abortable-group", "txn-offset-abortable-topic", 0));
 }
 
 test "Broker.handleRequest TxnOffsetCommit rejects truncated request" {
