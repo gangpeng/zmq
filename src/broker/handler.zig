@@ -19273,7 +19273,7 @@ pub const Broker = struct {
         if (api_version >= 1 and !skipFixedBytes(buf, &pos, 1)) return false; // include_synonyms
         if (api_version >= 3 and !skipFixedBytes(buf, &pos, 1)) return false; // include_documentation
         if (flexible) ser.skipTaggedFields(buf, &pos) catch return false;
-        return true;
+        return pos == buf.len;
     }
 
     fn validateAlterConfigsRequestFrame(buf: []const u8, start_pos: usize, api_version: i16) bool {
@@ -38909,6 +38909,32 @@ test "Broker.handleRequest DescribeConfigs rejects truncated request" {
     var buf: [128]u8 = undefined;
     const req_len = buildTestRequest(&buf, 32, 4, 3205, header_mod.requestHeaderVersion(32, 4));
     try testing.expect(broker.handleRequest(buf[0..req_len]) == null);
+}
+
+test "Broker.handleRequest DescribeConfigs rejects trailing bytes" {
+    const Req = generated.describe_configs_request.DescribeConfigsRequest;
+    const Resource = Req.DescribeConfigsResource;
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+
+    const keys = [_]?[]const u8{"cleanup.policy"};
+    const resources = [_]Resource{.{
+        .resource_type = 2,
+        .resource_name = "cfg-trailing-topic",
+        .configuration_keys = &keys,
+    }};
+    const req = Req{
+        .resources = &resources,
+        .include_synonyms = true,
+        .include_documentation = true,
+    };
+
+    var buf: [512]u8 = undefined;
+    var pos = buildTestRequest(&buf, 32, 4, 3208, header_mod.requestHeaderVersion(32, 4));
+    req.serialize(&buf, &pos, 4);
+
+    try expectTrailingByteRejected(&broker, &buf, pos);
 }
 
 test "Broker handleRequest Heartbeat (key=12)" {
