@@ -3715,7 +3715,7 @@ pub const Broker = struct {
 
         // Write to __consumer_offsets partition store
         _ = try self.store.produce("__consumer_offsets", target_partition, batch);
-        self.persistPartitionStates();
+        try self.persistPartitionStatesDurably();
     }
 
     /// Write an offset-delete tombstone to __consumer_offsets before removing
@@ -3751,7 +3751,7 @@ pub const Broker = struct {
         defer self.allocator.free(batch);
 
         _ = try self.store.produce("__consumer_offsets", target_partition, batch);
-        self.persistPartitionStates();
+        try self.persistPartitionStatesDurably();
     }
 
     fn writeOffsetDeleteRecordsForGroup(self: *Broker, group_id: []const u8) !usize {
@@ -3798,7 +3798,7 @@ pub const Broker = struct {
         defer self.allocator.free(batch);
 
         _ = try self.store.produce("__consumer_offsets", 0, batch);
-        self.persistPartitionStates();
+        try self.persistPartitionStatesDurably();
     }
 
     /// Write a full transaction coordinator snapshot to __transaction_state.
@@ -3816,7 +3816,7 @@ pub const Broker = struct {
         defer self.allocator.free(batch);
 
         _ = try self.store.produce("__transaction_state", 0, batch);
-        self.persistPartitionStates();
+        try self.persistPartitionStatesDurably();
     }
 
     fn buildTransactionSnapshotRecordBatch(self: *Broker, value: []const u8) ![]u8 {
@@ -3886,7 +3886,7 @@ pub const Broker = struct {
         defer self.allocator.free(batch);
 
         _ = try self.store.produce("__cluster_metadata", 0, batch);
-        self.persistPartitionStates();
+        try self.persistPartitionStatesDurably();
     }
 
     /// Write a full reassignment snapshot to __cluster_metadata so fresh-dir
@@ -3921,7 +3921,7 @@ pub const Broker = struct {
         defer self.allocator.free(batch);
 
         _ = try self.store.produce("__cluster_metadata", 0, batch);
-        self.persistPartitionStates();
+        try self.persistPartitionStatesDurably();
     }
 
     /// Write a full client quota snapshot to __cluster_metadata so broker
@@ -3956,7 +3956,7 @@ pub const Broker = struct {
         defer self.allocator.free(batch);
 
         _ = try self.store.produce("__cluster_metadata", 0, batch);
-        self.persistPartitionStates();
+        try self.persistPartitionStatesDurably();
     }
 
     /// Write a full SCRAM credential snapshot to __cluster_metadata so
@@ -3991,7 +3991,7 @@ pub const Broker = struct {
         defer self.allocator.free(batch);
 
         _ = try self.store.produce("__cluster_metadata", 0, batch);
-        self.persistPartitionStates();
+        try self.persistPartitionStatesDurably();
     }
 
     /// Write a full ACL snapshot to __cluster_metadata so CreateAcls/DeleteAcls
@@ -4026,7 +4026,7 @@ pub const Broker = struct {
         defer self.allocator.free(batch);
 
         _ = try self.store.produce("__cluster_metadata", 0, batch);
-        self.persistPartitionStates();
+        try self.persistPartitionStatesDurably();
     }
 
     const ClusterMetadataReplayCounts = struct {
@@ -45671,6 +45671,77 @@ test "Broker.handleRequest OffsetCommit rolls back local offset persistence fail
     try testing.expectEqualStrings("old-meta", committed_record.?.metadata.?);
 }
 
+test "Broker.handleRequest OffsetCommit fails closed when internal offset log checkpoint fails" {
+    const fs = @import("fs_compat");
+    const Req = generated.offset_commit_request.OffsetCommitRequest;
+    const Resp = generated.offset_commit_response.OffsetCommitResponse;
+    const Topic = Req.OffsetCommitRequestTopic;
+    const Partition = Topic.OffsetCommitRequestPartition;
+
+    const tmp_dir = "/tmp/zmq-offset-commit-internal-checkpoint-fail-test";
+    fs.deleteTreeAbsolute(tmp_dir) catch {};
+    try fs.makeDirAbsolute(tmp_dir);
+    defer fs.deleteTreeAbsolute(tmp_dir) catch {};
+
+    var broker = Broker.initWithConfig(testing.allocator, 1, 9092, .{ .data_dir = tmp_dir });
+    defer broker.deinit();
+    try broker.open();
+    try testing.expect(broker.ensureTopic("oc-internal-checkpoint-fail-topic"));
+    try broker.groups.commitOffsetWithMetadata("oc-internal-checkpoint-fail-group", "oc-internal-checkpoint-fail-topic", 0, 12, -1, "old-meta");
+    try broker.persistOffsetsDurably();
+
+    const partition_state_path = try std.fmt.allocPrint(testing.allocator, "{s}/partition_state.meta", .{tmp_dir});
+    defer testing.allocator.free(partition_state_path);
+    fs.deleteFileAbsolute(partition_state_path) catch {};
+    try fs.makeDirAbsolute(partition_state_path);
+
+    const partitions = [_]Partition{.{
+        .partition_index = 0,
+        .committed_offset = 99,
+        .committed_leader_epoch = 4,
+        .committed_metadata = "new-meta",
+    }};
+    const topics = [_]Topic{.{
+        .name = "oc-internal-checkpoint-fail-topic",
+        .partitions = &partitions,
+    }};
+    const req = Req{
+        .group_id = "oc-internal-checkpoint-fail-group",
+        .generation_id_or_member_epoch = -1,
+        .member_id = "",
+        .group_instance_id = null,
+        .topics = &topics,
+    };
+
+    var buf: [512]u8 = undefined;
+    var pos = buildTestRequest(&buf, 8, 8, 818, header_mod.requestHeaderVersion(8, 8));
+    req.serialize(&buf, &pos, 8);
+
+    const response = broker.handleRequest(buf[0..pos]);
+    try testing.expect(response != null);
+    defer testing.allocator.free(response.?);
+
+    var rpos: usize = 0;
+    var response_header = try ResponseHeader.deserialize(testing.allocator, response.?, &rpos, header_mod.responseHeaderVersion(8, 8));
+    defer response_header.deinit(testing.allocator);
+    try testing.expectEqual(@as(i32, 818), response_header.correlation_id);
+
+    const resp = try Resp.deserialize(testing.allocator, response.?, &rpos, 8);
+    defer {
+        for (resp.topics) |topic| {
+            if (topic.partitions.len > 0) testing.allocator.free(topic.partitions);
+        }
+        if (resp.topics.len > 0) testing.allocator.free(resp.topics);
+    }
+
+    try testing.expectEqual(response.?.len, rpos);
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.kafka_storage_error)), resp.topics[0].partitions[0].error_code);
+    const committed_record = try broker.groups.fetchOffsetRecord("oc-internal-checkpoint-fail-group", "oc-internal-checkpoint-fail-topic", 0);
+    try testing.expect(committed_record != null);
+    try testing.expectEqual(@as(i64, 12), committed_record.?.offset);
+    try testing.expectEqualStrings("old-meta", committed_record.?.metadata.?);
+}
+
 test "Broker.handleRequest OffsetCommit rejects truncated request" {
     var broker = Broker.init(testing.allocator, 1, 9092);
     defer broker.deinit();
@@ -46880,6 +46951,67 @@ test "Broker.handleRequest CreateTopics rolls back when topic snapshot S3 WAL wr
     try testing.expect(!broker.store.partitions.contains("ct-s3-fail-topic-0"));
     try testing.expect(!broker.store.partitions.contains("ct-s3-fail-topic-1"));
     try testing.expectEqual(object_count_before, mock_s3.objectCount());
+}
+
+test "Broker.handleRequest CreateTopics rolls back when internal metadata checkpoint fails" {
+    const fs = @import("fs_compat");
+    const Req = generated.create_topics_request.CreateTopicsRequest;
+    const Resp = generated.create_topics_response.CreateTopicsResponse;
+
+    const tmp_dir = "/tmp/zmq-create-topics-internal-checkpoint-fail-test";
+    fs.deleteTreeAbsolute(tmp_dir) catch {};
+    try fs.makeDirAbsolute(tmp_dir);
+    defer fs.deleteTreeAbsolute(tmp_dir) catch {};
+
+    var broker = Broker.initWithConfig(testing.allocator, 1, 9092, .{ .data_dir = tmp_dir });
+    defer broker.deinit();
+    try broker.open();
+
+    const partition_state_path = try std.fmt.allocPrint(testing.allocator, "{s}/partition_state.meta", .{tmp_dir});
+    defer testing.allocator.free(partition_state_path);
+    fs.deleteFileAbsolute(partition_state_path) catch {};
+    try fs.makeDirAbsolute(partition_state_path);
+
+    const topics = [_]Req.CreatableTopic{.{
+        .name = "ct-internal-checkpoint-fail-topic",
+        .num_partitions = 2,
+        .replication_factor = 1,
+    }};
+    const req = Req{
+        .topics = &topics,
+        .timeout_ms = 30000,
+        .validate_only = false,
+    };
+
+    var buf: [512]u8 = undefined;
+    var pos = buildTestRequest(&buf, 19, 7, 1929, header_mod.requestHeaderVersion(19, 7));
+    req.serialize(&buf, &pos, 7);
+
+    const response = broker.handleRequest(buf[0..pos]);
+    try testing.expect(response != null);
+    defer testing.allocator.free(response.?);
+
+    var rpos: usize = 0;
+    var response_header = try ResponseHeader.deserialize(testing.allocator, response.?, &rpos, header_mod.responseHeaderVersion(19, 7));
+    defer response_header.deinit(testing.allocator);
+    try testing.expectEqual(@as(i32, 1929), response_header.correlation_id);
+
+    const resp = try Resp.deserialize(testing.allocator, response.?, &rpos, 7);
+    defer {
+        for (resp.topics) |topic| {
+            if (topic.configs) |response_configs| {
+                if (response_configs.len > 0) testing.allocator.free(response_configs);
+            }
+        }
+        if (resp.topics.len > 0) testing.allocator.free(resp.topics);
+    }
+
+    try testing.expectEqual(response.?.len, rpos);
+    try testing.expectEqual(@as(usize, 1), resp.topics.len);
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.kafka_storage_error)), resp.topics[0].error_code);
+    try testing.expect(!broker.topics.contains("ct-internal-checkpoint-fail-topic"));
+    try testing.expect(!broker.store.partitions.contains("ct-internal-checkpoint-fail-topic-0"));
+    try testing.expect(!broker.store.partitions.contains("ct-internal-checkpoint-fail-topic-1"));
 }
 
 test "Broker.handleRequest CreateTopics rejects truncated request" {
