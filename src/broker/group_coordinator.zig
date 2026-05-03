@@ -381,6 +381,19 @@ pub const GroupCoordinator = struct {
         return true;
     }
 
+    pub fn updateMemberRackIfChanged(self: *GroupCoordinator, group_id: []const u8, member_id: []const u8, rack_id: []const u8) !bool {
+        const group = self.groups.getPtr(group_id) orelse return false;
+        const member = group.members.getPtr(member_id) orelse return false;
+        if (member.rack_id) |existing| {
+            if (std.mem.eql(u8, existing, rack_id)) return false;
+        }
+
+        const rack_copy = try self.allocator.dupe(u8, rack_id);
+        if (member.rack_id) |old| self.allocator.free(old);
+        member.rack_id = rack_copy;
+        return true;
+    }
+
     fn joinGroupError(error_code: i16) JoinGroupResult {
         return .{
             .error_code = error_code,
@@ -1204,6 +1217,7 @@ pub const ConsumerGroup = struct {
         /// static membership. When set, members are identified by instance_id rather
         /// than member_id, preventing unnecessary rebalances on pod restarts.
         group_instance_id: ?[]u8 = null,
+        rack_id: ?[]u8 = null,
         last_heartbeat_ms: i64 = 0,
         assignment: ?[]u8 = null,
         subscribed_topics: std.array_list.Managed([]u8),
@@ -1225,6 +1239,7 @@ pub const ConsumerGroup = struct {
             if (self.protocol_metadata) |m| alloc.free(m);
             if (self.assignment) |a| alloc.free(a);
             if (self.group_instance_id) |gid| alloc.free(gid);
+            if (self.rack_id) |rack| alloc.free(rack);
             alloc.free(self.member_id);
         }
     };

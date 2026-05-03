@@ -494,6 +494,12 @@ pub const MetadataPersistence = struct {
                 } else {
                     try file.writeAll("\t0\t");
                 }
+                if (member.rack_id) |rack_id| {
+                    try file.writeAll("\t1\t");
+                    try writeHex(file, rack_id);
+                } else {
+                    try file.writeAll("\t0\t");
+                }
                 try file.writeAll("\n");
             }
         }
@@ -706,12 +712,21 @@ pub const MetadataPersistence = struct {
                         break :blk null;
                     };
                 }
+                var rack_id: ?[]u8 = null;
+                if (member_fields.next()) |has_rack_str| {
+                    const rack_hex = member_fields.next() orelse "";
+                    rack_id = decodeOptionalHexAlloc(self.allocator, has_rack_str, rack_hex) catch blk: {
+                        valid_group = false;
+                        break :blk null;
+                    };
+                }
                 if (!valid_group) {
                     self.allocator.free(member_id);
                     if (group_instance_id) |owned_instance| self.allocator.free(owned_instance);
                     if (assignment) |owned_assignment| self.allocator.free(owned_assignment);
                     if (protocol_name) |owned_protocol| self.allocator.free(owned_protocol);
                     if (protocol_metadata) |owned_metadata| self.allocator.free(owned_metadata);
+                    if (rack_id) |owned_rack| self.allocator.free(owned_rack);
                     for (subscriptions.items) |subscription| self.allocator.free(subscription);
                     break;
                 }
@@ -724,6 +739,7 @@ pub const MetadataPersistence = struct {
                     .assignment = assignment,
                     .protocol_name = protocol_name,
                     .protocol_metadata = protocol_metadata,
+                    .rack_id = rack_id,
                     .subscriptions = owned_subscriptions,
                 }) catch |err| {
                     self.allocator.free(member_id);
@@ -731,6 +747,7 @@ pub const MetadataPersistence = struct {
                     if (assignment) |owned_assignment| self.allocator.free(owned_assignment);
                     if (protocol_name) |owned_protocol| self.allocator.free(owned_protocol);
                     if (protocol_metadata) |owned_metadata| self.allocator.free(owned_metadata);
+                    if (rack_id) |owned_rack| self.allocator.free(owned_rack);
                     for (owned_subscriptions) |subscription| self.allocator.free(subscription);
                     if (owned_subscriptions.len > 0) self.allocator.free(owned_subscriptions);
                     return err;
@@ -806,6 +823,7 @@ pub const MetadataPersistence = struct {
         assignment: ?[]u8,
         protocol_name: ?[]u8,
         protocol_metadata: ?[]u8,
+        rack_id: ?[]u8,
         subscriptions: [][]u8,
     };
 
@@ -829,6 +847,7 @@ pub const MetadataPersistence = struct {
             if (member.assignment) |assignment| self.allocator.free(assignment);
             if (member.protocol_name) |protocol_name| self.allocator.free(protocol_name);
             if (member.protocol_metadata) |protocol_metadata| self.allocator.free(protocol_metadata);
+            if (member.rack_id) |rack_id| self.allocator.free(rack_id);
             for (member.subscriptions) |subscription| self.allocator.free(subscription);
             if (member.subscriptions.len > 0) self.allocator.free(member.subscriptions);
         }

@@ -42,7 +42,8 @@ const JsonLogger = @import("core").JsonLogger;
 
 const max_offset_commit_metadata_bytes: usize = 4096;
 const offset_commit_record_value_magic = "ZMQOC1";
-const consumer_group_snapshot_record_value_magic = "ZMQCG1";
+const consumer_group_snapshot_record_value_magic_v1 = "ZMQCG1";
+const consumer_group_snapshot_record_value_magic = "ZMQCG2";
 const consumer_group_snapshot_record_key = "__zmq_consumer_group_snapshot";
 const transaction_snapshot_record_value_magic = "ZMQTX1";
 const transaction_snapshot_record_key = "__zmq_transaction_snapshot";
@@ -1728,6 +1729,9 @@ pub const Broker = struct {
                 if (member_entry.group_instance_id) |group_instance_id| {
                     member.group_instance_id = try self.allocator.dupe(u8, group_instance_id);
                 }
+                if (member_entry.rack_id) |rack_id| {
+                    member.rack_id = try self.allocator.dupe(u8, rack_id);
+                }
                 if (member_entry.assignment) |assignment| {
                     member.assignment = try self.allocator.dupe(u8, assignment);
                 }
@@ -1911,6 +1915,7 @@ pub const Broker = struct {
                 const member = member_entry.value_ptr;
                 try writeSnapshotBytes(writer, member.member_id);
                 try writeSnapshotOptionalBytes(writer, member.group_instance_id);
+                try writeSnapshotOptionalBytes(writer, member.rack_id);
                 try writer.writeInt(i64, member.last_heartbeat_ms, .big);
                 try writeSnapshotOptionalBytes(writer, member.assignment);
                 try writeSnapshotOptionalBytes(writer, member.protocol_name);
@@ -2013,9 +2018,12 @@ pub const Broker = struct {
 
     fn decodeConsumerGroupSnapshotRecordValue(self: *Broker, value: []const u8) !std.StringHashMap(ConsumerGroup) {
         if (value.len < consumer_group_snapshot_record_value_magic.len + 4) return error.InvalidConsumerGroupSnapshot;
-        if (!std.mem.eql(u8, value[0..consumer_group_snapshot_record_value_magic.len], consumer_group_snapshot_record_value_magic)) {
+        const snapshot_version: u8 = if (std.mem.eql(u8, value[0..consumer_group_snapshot_record_value_magic.len], consumer_group_snapshot_record_value_magic))
+            2
+        else if (std.mem.eql(u8, value[0..consumer_group_snapshot_record_value_magic_v1.len], consumer_group_snapshot_record_value_magic_v1))
+            1
+        else
             return error.InvalidConsumerGroupSnapshot;
-        }
 
         var pos: usize = consumer_group_snapshot_record_value_magic.len;
         const group_count = try readSnapshotU32(value, &pos);
@@ -2050,6 +2058,9 @@ pub const Broker = struct {
 
                 if (member_id.len == 0 or group.members.contains(member_id)) return error.InvalidConsumerGroupSnapshot;
                 member.group_instance_id = try self.readSnapshotOptionalOwnedBytes(value, &pos);
+                if (snapshot_version >= 2) {
+                    member.rack_id = try self.readSnapshotOptionalOwnedBytes(value, &pos);
+                }
                 member.last_heartbeat_ms = try readSnapshotI64(value, &pos);
                 member.assignment = try self.readSnapshotOptionalOwnedBytes(value, &pos);
                 member.protocol_name = try self.readSnapshotOptionalOwnedBytes(value, &pos);
@@ -10475,6 +10486,8 @@ pub const Broker = struct {
             if (topics.len > 0) self.allocator.free(topics);
         };
 
+        const rack_id = req.rack_id;
+
         const owned_partitions_error = self.validateConsumerGroupHeartbeatOwnedPartitions(req.topic_partitions);
         if (owned_partitions_error != ErrorCode.none) {
             const resp = consumerGroupHeartbeatResponse(owned_partitions_error.toInt(), null, req.member_id, req.member_epoch, 0);
@@ -10514,6 +10527,14 @@ pub const Broker = struct {
             if (result.error_code == @intFromEnum(ErrorCode.none)) {
                 if (req.rebalance_timeout_ms > 0) {
                     _ = self.groups.configureGroupTimeouts(group_id, ConsumerGroup.default_session_timeout_ms, @intCast(req.rebalance_timeout_ms));
+                }
+                if (rack_id) |rack| {
+                    _ = self.groups.updateMemberRackIfChanged(group_id, result.member_id, rack) catch |err| {
+                        log.warn("ConsumerGroupHeartbeat rack update failed for {s}: {}", .{ group_id, err });
+                        self.restoreConsumerGroupsAfterFailedMutation(previous_snapshot);
+                        const resp = consumerGroupHeartbeatResponse(ErrorCode.kafka_storage_error.toInt(), null, req.member_id, req.member_epoch, 0);
+                        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+                    };
                 }
                 if (subscriptions) |topics| {
                     _ = self.groups.replaceMemberSubscriptionsIfChanged(group_id, result.member_id, topics) catch |err| {
@@ -10574,18 +10595,30 @@ pub const Broker = struct {
         const error_code = self.groups.consumerGroupHeartbeat(group_id, member_id, instance_id, req.member_epoch);
         var response_member_epoch = req.member_epoch;
         if (error_code == @intFromEnum(ErrorCode.none)) {
-            if (subscriptions) |topics| {
+            if (subscriptions != null or rack_id != null) {
                 const previous_snapshot = self.encodeConsumerGroupSnapshotRecordValue() catch return null;
                 defer self.allocator.free(previous_snapshot);
 
-                const changed = self.groups.replaceMemberSubscriptionsIfChanged(group_id, member_id, topics) catch |err| {
-                    log.warn("ConsumerGroupHeartbeat subscription update failed for {s}: {}", .{ group_id, err });
-                    const resp = consumerGroupHeartbeatResponse(ErrorCode.kafka_storage_error.toInt(), null, req.member_id, req.member_epoch, 0);
-                    return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
-                };
+                var changed = false;
+                if (rack_id) |rack| {
+                    changed = (self.groups.updateMemberRackIfChanged(group_id, member_id, rack) catch |err| {
+                        log.warn("ConsumerGroupHeartbeat rack update failed for {s}: {}", .{ group_id, err });
+                        self.restoreConsumerGroupsAfterFailedMutation(previous_snapshot);
+                        const resp = consumerGroupHeartbeatResponse(ErrorCode.kafka_storage_error.toInt(), null, req.member_id, req.member_epoch, 0);
+                        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+                    }) or changed;
+                }
+                if (subscriptions) |topics| {
+                    changed = (self.groups.replaceMemberSubscriptionsIfChanged(group_id, member_id, topics) catch |err| {
+                        log.warn("ConsumerGroupHeartbeat subscription update failed for {s}: {}", .{ group_id, err });
+                        self.restoreConsumerGroupsAfterFailedMutation(previous_snapshot);
+                        const resp = consumerGroupHeartbeatResponse(ErrorCode.kafka_storage_error.toInt(), null, req.member_id, req.member_epoch, 0);
+                        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+                    }) or changed;
+                }
                 if (changed) {
                     self.persistConsumerGroupsDurably() catch |err| {
-                        log.warn("ConsumerGroupHeartbeat subscription snapshot write failed for {s}: {}", .{ group_id, err });
+                        log.warn("ConsumerGroupHeartbeat member metadata snapshot write failed for {s}: {}", .{ group_id, err });
                         self.restoreConsumerGroupsAfterFailedMutation(previous_snapshot);
                         const resp = consumerGroupHeartbeatResponse(ErrorCode.kafka_storage_error.toInt(), null, req.member_id, req.member_epoch, 0);
                         return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
@@ -11799,7 +11832,7 @@ pub const Broker = struct {
                 members[members_init] = .{
                     .member_id = member.member_id,
                     .instance_id = member.group_instance_id,
-                    .rack_id = null,
+                    .rack_id = member.rack_id,
                     .member_epoch = group.generation_id,
                     .client_id = "zmq-client",
                     .client_host = "/127.0.0.1",
@@ -30584,6 +30617,7 @@ test "Broker restores consumer group lifecycle from S3 consumer offsets log" {
         }};
         const sync = try broker.groups.syncGroup("stateless-group", join.member_id, join.generation_id, &assignments);
         try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.none)), sync.error_code);
+        try testing.expect(try broker.groups.updateMemberRackIfChanged("stateless-group", join.member_id, "rack-stateless"));
 
         broker.persistConsumerGroups();
     }
@@ -30612,6 +30646,7 @@ test "Broker restores consumer group lifecycle from S3 consumer offsets log" {
         try testing.expectEqualStrings("instance-a", member.group_instance_id.?);
         try testing.expectEqualStrings("range", member.protocol_name.?);
         try testing.expectEqualStrings("stateless-metadata", member.protocol_metadata.?);
+        try testing.expectEqualStrings("rack-stateless", member.rack_id.?);
         try testing.expectEqualStrings(assignment, member.assignment.?);
         try testing.expectEqual(@as(usize, 1), member.subscribed_topics.items.len);
         try testing.expectEqualStrings("stateless-group-topic", member.subscribed_topics.items[0]);
@@ -36655,6 +36690,8 @@ test "Broker.handleRequest JoinGroup and SyncGroup persist group state across re
         defer sync_header.deinit(testing.allocator);
         const sync_resp = try SyncResp.deserialize(testing.allocator, sync_response.?, &sync_rpos, 5);
         try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.none)), sync_resp.error_code);
+        try testing.expect(try broker.groups.updateMemberRackIfChanged("persisted-group", member_id.?, "rack-persisted"));
+        try broker.persistConsumerGroupsDurably();
 
         const loaded = try broker.persistence.loadConsumerGroups();
         defer broker.persistence.freeConsumerGroupEntries(loaded);
@@ -36668,6 +36705,7 @@ test "Broker.handleRequest JoinGroup and SyncGroup persist group state across re
         try testing.expectEqualStrings(assignment_data, loaded[0].members[0].assignment.?);
         try testing.expectEqualStrings("range", loaded[0].members[0].protocol_name.?);
         try testing.expectEqualStrings("persisted-metadata", loaded[0].members[0].protocol_metadata.?);
+        try testing.expectEqualStrings("rack-persisted", loaded[0].members[0].rack_id.?);
     }
 
     {
@@ -36686,6 +36724,7 @@ test "Broker.handleRequest JoinGroup and SyncGroup persist group state across re
         try testing.expectEqualStrings(assignment_data, member.assignment.?);
         try testing.expectEqualStrings("range", member.protocol_name.?);
         try testing.expectEqualStrings("persisted-metadata", member.protocol_metadata.?);
+        try testing.expectEqualStrings("rack-persisted", member.rack_id.?);
         try testing.expect(group.leader_id != null);
         try testing.expectEqualStrings(member_id.?, group.leader_id.?);
     }
@@ -37591,6 +37630,105 @@ test "Broker.handleRequest ConsumerGroupHeartbeat rejects duplicate subscription
     try testing.expectEqual(@as(i32, 0), resp.heartbeat_interval_ms);
     try testing.expect(resp.assignment == null);
     try testing.expect(broker.groups.groups.getPtr("kip848-duplicate-sub-group") == null);
+}
+
+test "Broker.handleRequest ConsumerGroupHeartbeat stores rack metadata for describe" {
+    const HeartbeatReq = generated.consumer_group_heartbeat_request.ConsumerGroupHeartbeatRequest;
+    const HeartbeatResp = generated.consumer_group_heartbeat_response.ConsumerGroupHeartbeatResponse;
+    const DescribeReq = generated.consumer_group_describe_request.ConsumerGroupDescribeRequest;
+    const DescribeResp = generated.consumer_group_describe_response.ConsumerGroupDescribeResponse;
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+    try testing.expect(broker.ensureTopic("rack-topic"));
+
+    const topic_names = [_]?[]const u8{"rack-topic"};
+    const join_req = HeartbeatReq{
+        .group_id = "kip848-rack-group",
+        .member_id = "rack-member",
+        .member_epoch = 0,
+        .rack_id = "rack-a",
+        .rebalance_timeout_ms = 30_000,
+        .subscribed_topic_names = &topic_names,
+        .server_assignor = "range",
+    };
+
+    var join_buf: [256]u8 = undefined;
+    var join_pos = buildTestRequest(&join_buf, 68, 0, 6844, header_mod.requestHeaderVersion(68, 0));
+    join_req.serialize(&join_buf, &join_pos, 0);
+
+    const join_response = broker.handleRequest(join_buf[0..join_pos]);
+    try testing.expect(join_response != null);
+    defer testing.allocator.free(join_response.?);
+
+    var join_rpos: usize = 0;
+    var join_response_header = try ResponseHeader.deserialize(testing.allocator, join_response.?, &join_rpos, header_mod.responseHeaderVersion(68, 0));
+    defer join_response_header.deinit(testing.allocator);
+    try testing.expectEqual(@as(i32, 6844), join_response_header.correlation_id);
+
+    const join_resp = try HeartbeatResp.deserialize(testing.allocator, join_response.?, &join_rpos, 0);
+    defer freeDeserializedConsumerGroupHeartbeatResponse(&join_resp);
+    try testing.expectEqual(join_response.?.len, join_rpos);
+    try testing.expectEqual(ErrorCode.none.toInt(), join_resp.error_code);
+    try testing.expectEqual(@as(i32, 1), join_resp.member_epoch);
+    const joined_member = broker.groups.groups.getPtr("kip848-rack-group").?.members.getPtr("rack-member").?;
+    try testing.expectEqualStrings("rack-a", joined_member.rack_id.?);
+
+    const update_req = HeartbeatReq{
+        .group_id = "kip848-rack-group",
+        .member_id = join_resp.member_id,
+        .member_epoch = join_resp.member_epoch,
+        .rack_id = "rack-b",
+        .rebalance_timeout_ms = -1,
+    };
+
+    var update_buf: [256]u8 = undefined;
+    var update_pos = buildTestRequest(&update_buf, 68, 0, 6845, header_mod.requestHeaderVersion(68, 0));
+    update_req.serialize(&update_buf, &update_pos, 0);
+
+    const update_response = broker.handleRequest(update_buf[0..update_pos]);
+    try testing.expect(update_response != null);
+    defer testing.allocator.free(update_response.?);
+
+    var update_rpos: usize = 0;
+    var update_response_header = try ResponseHeader.deserialize(testing.allocator, update_response.?, &update_rpos, header_mod.responseHeaderVersion(68, 0));
+    defer update_response_header.deinit(testing.allocator);
+    try testing.expectEqual(@as(i32, 6845), update_response_header.correlation_id);
+
+    const update_resp = try HeartbeatResp.deserialize(testing.allocator, update_response.?, &update_rpos, 0);
+    defer freeDeserializedConsumerGroupHeartbeatResponse(&update_resp);
+    try testing.expectEqual(update_response.?.len, update_rpos);
+    try testing.expectEqual(ErrorCode.none.toInt(), update_resp.error_code);
+    try testing.expectEqual(@as(i32, 1), update_resp.member_epoch);
+    try testing.expectEqualStrings("rack-b", joined_member.rack_id.?);
+
+    const group_ids = [_]?[]const u8{"kip848-rack-group"};
+    const describe_req = DescribeReq{
+        .group_ids = &group_ids,
+        .include_authorized_operations = true,
+    };
+
+    var describe_buf: [512]u8 = undefined;
+    var describe_pos = buildTestRequest(&describe_buf, 69, 0, 6904, header_mod.requestHeaderVersion(69, 0));
+    describe_req.serialize(&describe_buf, &describe_pos, 0);
+
+    const describe_response = broker.handleRequest(describe_buf[0..describe_pos]);
+    try testing.expect(describe_response != null);
+    defer testing.allocator.free(describe_response.?);
+
+    var describe_rpos: usize = 0;
+    var describe_response_header = try ResponseHeader.deserialize(testing.allocator, describe_response.?, &describe_rpos, header_mod.responseHeaderVersion(69, 0));
+    defer describe_response_header.deinit(testing.allocator);
+    try testing.expectEqual(@as(i32, 6904), describe_response_header.correlation_id);
+
+    const describe_resp = try DescribeResp.deserialize(testing.allocator, describe_response.?, &describe_rpos, 0);
+    defer freeDeserializedConsumerGroupDescribeResponse(&describe_resp);
+    try testing.expectEqual(describe_response.?.len, describe_rpos);
+    try testing.expectEqual(@as(usize, 1), describe_resp.groups.len);
+    try testing.expectEqual(ErrorCode.none.toInt(), describe_resp.groups[0].error_code);
+    try testing.expectEqual(@as(usize, 1), describe_resp.groups[0].members.len);
+    try testing.expectEqualStrings("rack-member", describe_resp.groups[0].members[0].member_id.?);
+    try testing.expectEqualStrings("rack-b", describe_resp.groups[0].members[0].rack_id.?);
 }
 
 test "Broker.handleRequest ShareGroupHeartbeat returns generated fail-closed response" {
