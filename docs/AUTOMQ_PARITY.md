@@ -184,10 +184,12 @@ Status: completed for the initial catalog and DeleteGroups slice.
   member epochs to
   `FENCED_MEMBER_EPOCH` and missing member groups to `UNKNOWN_MEMBER_ID`
   instead of classic-generation/group-id errors.
-  AssignReplicasToDirs key 73 remains non-advertised until JBOD directory
-  semantics exist, but direct requests now validate/decode generated flexible
-  frames and return generated fail-closed responses, including requested
-  directory/topic/partition entries with per-partition errors.
+  AssignReplicasToDirs key 73 remains non-advertised until durable
+  controller-backed JBOD directory semantics exist, but direct requests now
+  validate/decode generated flexible frames, validate broker identity/epoch and
+  directory/topic/partition targets, reject duplicate assignments, return
+  generated per-partition errors, and maintain local replica-directory
+  assignment state.
   ShareGroupHeartbeat and ShareGroupDescribe remain non-advertised until durable
   share-group coordinator semantics exist, but direct v0 probes now join,
   heartbeat, update subscriptions/rack metadata, leave, return deterministic
