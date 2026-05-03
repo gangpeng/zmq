@@ -45320,6 +45320,80 @@ test "Broker.handleRequest DeleteTopics persists partition state cleanup" {
     }
 }
 
+test "Broker.handleRequest DeleteTopics persists share and replica directory cleanup" {
+    const fs = @import("fs_compat");
+    const Req = generated.delete_topics_request.DeleteTopicsRequest;
+    const Resp = generated.delete_topics_response.DeleteTopicsResponse;
+    const Topic = Req.DeleteTopicState;
+
+    const tmp_dir = "/tmp/zmq-delete-topics-side-state-cleanup-test";
+    fs.deleteTreeAbsolute(tmp_dir) catch {};
+    try fs.makeDirAbsolute(tmp_dir);
+    defer fs.deleteTreeAbsolute(tmp_dir) catch {};
+
+    const replica_directory_id = [_]u8{0x3c} ** 16;
+    var topic_id: [16]u8 = undefined;
+    {
+        var broker = Broker.initWithConfig(testing.allocator, 1, 9092, .{ .data_dir = tmp_dir });
+        defer broker.deinit();
+        try broker.open();
+
+        try testing.expect(broker.ensureTopic("dt-side-state-topic"));
+        topic_id = broker.topics.get("dt-side-state-topic").?.topic_id;
+        try broker.setSharePartitionState("dt-side-state-group", topic_id, 0, 2, 11, &.{});
+
+        const replica_key = try broker.replicaDirectoryAssignmentKey(topic_id, 0);
+        try broker.replica_directory_assignments.put(replica_key, .{
+            .topic_id = topic_id,
+            .partition_index = 0,
+            .directory_id = replica_directory_id,
+        });
+        broker.persistReplicaDirectoryAssignmentsLocal();
+
+        const topics = [_]Topic{.{
+            .name = "dt-side-state-topic",
+            .topic_id = topic_id,
+        }};
+        const req = Req{
+            .topics = &topics,
+            .timeout_ms = 30000,
+        };
+
+        var buf: [512]u8 = undefined;
+        var pos = buildTestRequest(&buf, 20, 6, 2010, header_mod.requestHeaderVersion(20, 6));
+        req.serialize(&buf, &pos, 6);
+
+        const response = broker.handleRequest(buf[0..pos]);
+        try testing.expect(response != null);
+        defer testing.allocator.free(response.?);
+
+        var rpos: usize = 0;
+        var response_header = try ResponseHeader.deserialize(testing.allocator, response.?, &rpos, header_mod.responseHeaderVersion(20, 6));
+        defer response_header.deinit(testing.allocator);
+        try testing.expectEqual(@as(i32, 2010), response_header.correlation_id);
+
+        const resp = try Resp.deserialize(testing.allocator, response.?, &rpos, 6);
+        defer if (resp.responses.len > 0) testing.allocator.free(resp.responses);
+
+        try testing.expectEqual(response.?.len, rpos);
+        try testing.expectEqual(@as(usize, 1), resp.responses.len);
+        try testing.expectEqual(ErrorCode.none.toInt(), resp.responses[0].error_code);
+        try testing.expect(!broker.topics.contains("dt-side-state-topic"));
+        try testing.expect((try broker.getSharePartitionState("dt-side-state-group", topic_id, 0)) == null);
+        try testing.expect((try broker.getReplicaDirectoryAssignment(topic_id, 0)) == null);
+    }
+
+    {
+        var restarted = Broker.initWithConfig(testing.allocator, 1, 9092, .{ .data_dir = tmp_dir });
+        defer restarted.deinit();
+        try restarted.open();
+
+        try testing.expect(!restarted.topics.contains("dt-side-state-topic"));
+        try testing.expect((try restarted.getSharePartitionState("dt-side-state-group", topic_id, 0)) == null);
+        try testing.expect((try restarted.getReplicaDirectoryAssignment(topic_id, 0)) == null);
+    }
+}
+
 test "Broker.handleRequest DeleteTopics rolls back when topic snapshot S3 WAL write fails" {
     const Req = generated.delete_topics_request.DeleteTopicsRequest;
     const Resp = generated.delete_topics_response.DeleteTopicsResponse;
