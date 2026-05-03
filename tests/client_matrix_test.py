@@ -11,13 +11,16 @@ Run against a running ZMQ broker:
 
 Optional environment:
     ZMQ_CLIENT_MATRIX_BOOTSTRAP   localhost:9092
-    ZMQ_CLIENT_MATRIX_TOOLS       auto | kcat,kafka-cli
+    ZMQ_CLIENT_MATRIX_TOOLS       auto | kcat,kafka-cli,kafka-python,confluent-kafka
 
 Supported probes:
-    kcat       kcat -L
-    kafka-cli  kafka-broker-api-versions.sh and kafka-topics.sh --list
+    kcat             kcat -L
+    kafka-cli        kafka-broker-api-versions.sh and kafka-topics.sh --list
+    kafka-python     kafka.KafkaAdminClient metadata/list-topics probe
+    confluent-kafka  confluent_kafka.admin.AdminClient metadata probe
 """
 
+import importlib.util
 import os
 import shutil
 import subprocess
@@ -44,6 +47,10 @@ def have(exe):
     return shutil.which(exe) is not None
 
 
+def have_module(module):
+    return importlib.util.find_spec(module) is not None
+
+
 def selected_tools():
     if TOOLS == "auto":
         tools = []
@@ -51,6 +58,10 @@ def selected_tools():
             tools.append("kcat")
         if have("kafka-broker-api-versions.sh") and have("kafka-topics.sh"):
             tools.append("kafka-cli")
+        if have_module("kafka"):
+            tools.append("kafka-python")
+        if have_module("confluent_kafka"):
+            tools.append("confluent-kafka")
         return tools
     return [tool.strip() for tool in TOOLS.split(",") if tool.strip()]
 
@@ -78,6 +89,44 @@ def test_kafka_cli():
     print("ok: kafka CLI API/topic probes")
 
 
+def test_kafka_python():
+    if not have_module("kafka"):
+        raise MatrixError("kafka-python selected but import 'kafka' is not available")
+
+    from kafka import KafkaAdminClient
+
+    admin = KafkaAdminClient(
+        bootstrap_servers=BOOTSTRAP,
+        client_id="zmq-client-matrix-kafka-python",
+        request_timeout_ms=10000,
+        api_version_auto_timeout_ms=5000,
+    )
+    try:
+        topics = admin.list_topics()
+        if topics is None:
+            raise MatrixError("kafka-python list_topics returned None")
+    finally:
+        admin.close()
+    print("ok: kafka-python metadata/list-topics probe")
+
+
+def test_confluent_kafka():
+    if not have_module("confluent_kafka"):
+        raise MatrixError("confluent-kafka selected but import 'confluent_kafka' is not available")
+
+    from confluent_kafka.admin import AdminClient
+
+    admin = AdminClient({
+        "bootstrap.servers": BOOTSTRAP,
+        "client.id": "zmq-client-matrix-confluent-kafka",
+        "socket.timeout.ms": 10000,
+    })
+    metadata = admin.list_topics(timeout=10)
+    if not metadata.brokers:
+        raise MatrixError("confluent-kafka metadata response did not include brokers")
+    print("ok: confluent-kafka metadata probe")
+
+
 def main():
     if not RUN_ENABLED:
         print("skip: set ZMQ_RUN_CLIENT_MATRIX=1 to run real-client matrix")
@@ -95,6 +144,10 @@ def main():
             test_kcat()
         elif tool == "kafka-cli":
             test_kafka_cli()
+        elif tool == "kafka-python":
+            test_kafka_python()
+        elif tool == "confluent-kafka":
+            test_confluent_kafka()
         else:
             raise MatrixError(f"unknown client matrix tool: {tool}")
 
