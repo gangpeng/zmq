@@ -20,6 +20,8 @@ Optional environment:
     ZMQ_CLIENT_MATRIX_SASL_USERNAME
     ZMQ_CLIENT_MATRIX_SASL_PASSWORD
     ZMQ_CLIENT_MATRIX_SSL_CA_LOCATION
+    ZMQ_CLIENT_MATRIX_BAD_SSL_CA_LOCATION
+    ZMQ_CLIENT_MATRIX_ACL_DENIED_TOPIC
     ZMQ_CLIENT_MATRIX_PROFILES    Comma-separated profile names for explicit client/library version sets
     ZMQ_CLIENT_MATRIX_JAVA_CLASSPATH
                                   Classpath containing kafka-clients jars for java-kafka
@@ -48,7 +50,7 @@ Semantic probes:
     transactions     transactional produce through clients that expose Kafka transactions
     security         run the selected probes with configured TLS/SASL client properties
     security-negative
-                      verify bad configured credentials fail closed where supported
+                      verify bad credentials, bad TLS trust, or ACL-denied produce fail closed where configured
 """
 
 import importlib.util
@@ -87,6 +89,8 @@ SASL_MECHANISM = None
 SASL_USERNAME = None
 SASL_PASSWORD = None
 SSL_CA_LOCATION = None
+BAD_SSL_CA_LOCATION = None
+ACL_DENIED_TOPIC = None
 
 
 class MatrixError(Exception):
@@ -128,7 +132,7 @@ def security_enabled():
     )
 
 
-def security_properties(password_override=None):
+def security_properties(password_override=None, ssl_ca_override=None):
     if not security_enabled():
         return {}
     props = {"security.protocol": SECURITY_PROTOCOL}
@@ -140,14 +144,15 @@ def security_properties(password_override=None):
     password = SASL_PASSWORD if password_override is None else password_override
     if password:
         props["sasl.password"] = password
-    if SSL_CA_LOCATION:
-        props["ssl.ca.location"] = SSL_CA_LOCATION
+    ssl_ca = SSL_CA_LOCATION if ssl_ca_override is None else ssl_ca_override
+    if ssl_ca:
+        props["ssl.ca.location"] = ssl_ca
     return props
 
 
-def kcat_security_args(password_override=None):
+def kcat_security_args(password_override=None, ssl_ca_override=None):
     args = []
-    props = security_properties(password_override=password_override)
+    props = security_properties(password_override=password_override, ssl_ca_override=ssl_ca_override)
     if not props:
         return args
     for key in ("security.protocol", "sasl.mechanisms", "sasl.username", "sasl.password", "ssl.ca.location"):
@@ -157,8 +162,8 @@ def kcat_security_args(password_override=None):
     return args
 
 
-def kafka_cli_security_config_path(password_override=None):
-    props = security_properties(password_override=password_override)
+def kafka_cli_security_config_path(password_override=None, ssl_ca_override=None):
+    props = security_properties(password_override=password_override, ssl_ca_override=ssl_ca_override)
     if not props:
         return None
     fd, path = tempfile.mkstemp(prefix="zmq-client-matrix-kafka-cli-", suffix=".properties")
@@ -176,7 +181,7 @@ def kafka_cli_command_config(args, config_path):
     return args + ["--command-config", config_path]
 
 
-def kafka_python_security_config(password_override=None):
+def kafka_python_security_config(password_override=None, ssl_ca_override=None):
     if not security_enabled():
         return {}
     config = {"security_protocol": SECURITY_PROTOCOL}
@@ -187,13 +192,14 @@ def kafka_python_security_config(password_override=None):
     password = SASL_PASSWORD if password_override is None else password_override
     if password:
         config["sasl_plain_password"] = password
-    if SSL_CA_LOCATION:
-        config["ssl_cafile"] = SSL_CA_LOCATION
+    ssl_ca = SSL_CA_LOCATION if ssl_ca_override is None else ssl_ca_override
+    if ssl_ca:
+        config["ssl_cafile"] = ssl_ca
     return config
 
 
-def confluent_security_config(password_override=None):
-    props = security_properties(password_override=password_override)
+def confluent_security_config(password_override=None, ssl_ca_override=None):
+    props = security_properties(password_override=password_override, ssl_ca_override=ssl_ca_override)
     if not props:
         return {}
     config = {"security.protocol": props["security.protocol"]}
@@ -213,6 +219,22 @@ def bad_sasl_password():
     if not SASL_PASSWORD:
         raise MatrixError("security-negative semantic requires ZMQ_CLIENT_MATRIX_SASL_PASSWORD")
     return SASL_PASSWORD + "-invalid"
+
+
+def sasl_negative_enabled():
+    return bool(SASL_PASSWORD)
+
+
+def tls_negative_enabled():
+    return bool(BAD_SSL_CA_LOCATION) and SECURITY_PROTOCOL.upper() in ("SSL", "SASL_SSL")
+
+
+def acl_negative_enabled():
+    return bool(ACL_DENIED_TOPIC)
+
+
+def security_negative_configured():
+    return sasl_negative_enabled() or tls_negative_enabled() or acl_negative_enabled()
 
 
 def run(cmd, timeout=30, input_text=None, cwd=None, env=None):
@@ -299,6 +321,7 @@ def profile_setting(profile, suffix, fallback):
 def apply_profile(profile):
     global ACTIVE_PROFILE, BOOTSTRAP, TOOLS, SEMANTICS, JAVA_CLASSPATH, ENABLE_GO_AUTO, GO_MODULE, PYTHON
     global SECURITY_PROTOCOL, SASL_MECHANISM, SASL_USERNAME, SASL_PASSWORD, SSL_CA_LOCATION
+    global BAD_SSL_CA_LOCATION, ACL_DENIED_TOPIC
 
     ACTIVE_PROFILE = profile
     BOOTSTRAP = profile_setting(profile, "BOOTSTRAP", "localhost:9092")
@@ -309,6 +332,8 @@ def apply_profile(profile):
     SASL_USERNAME = profile_setting(profile, "SASL_USERNAME", None)
     SASL_PASSWORD = profile_setting(profile, "SASL_PASSWORD", None)
     SSL_CA_LOCATION = profile_setting(profile, "SSL_CA_LOCATION", None)
+    BAD_SSL_CA_LOCATION = profile_setting(profile, "BAD_SSL_CA_LOCATION", None)
+    ACL_DENIED_TOPIC = profile_setting(profile, "ACL_DENIED_TOPIC", None)
     JAVA_CLASSPATH = profile_setting(profile, "JAVA_CLASSPATH", None)
     ENABLE_GO_AUTO = profile_setting(profile, "ENABLE_GO", "0") == "1"
     GO_MODULE = profile_setting(profile, "GO_MODULE", "github.com/segmentio/kafka-go@latest")
@@ -343,12 +368,46 @@ def run_python_subtool(tool):
         env["ZMQ_CLIENT_MATRIX_SASL_PASSWORD"] = SASL_PASSWORD
     if SSL_CA_LOCATION:
         env["ZMQ_CLIENT_MATRIX_SSL_CA_LOCATION"] = SSL_CA_LOCATION
+    if BAD_SSL_CA_LOCATION:
+        env["ZMQ_CLIENT_MATRIX_BAD_SSL_CA_LOCATION"] = BAD_SSL_CA_LOCATION
+    if ACL_DENIED_TOPIC:
+        env["ZMQ_CLIENT_MATRIX_ACL_DENIED_TOPIC"] = ACL_DENIED_TOPIC
     env["ZMQ_CLIENT_MATRIX_ENABLE_GO"] = "0"
     env["ZMQ_CLIENT_MATRIX_PYTHON"] = PYTHON
     env.pop("ZMQ_CLIENT_MATRIX_PROFILES", None)
 
     run([PYTHON, __file__], timeout=120, env=env)
     return True
+
+
+def active_security_env():
+    env = os.environ.copy()
+    env["ZMQ_CLIENT_MATRIX_SECURITY_PROTOCOL"] = SECURITY_PROTOCOL
+    if SASL_MECHANISM:
+        env["ZMQ_CLIENT_MATRIX_SASL_MECHANISM"] = SASL_MECHANISM
+    else:
+        env.pop("ZMQ_CLIENT_MATRIX_SASL_MECHANISM", None)
+    if SASL_USERNAME:
+        env["ZMQ_CLIENT_MATRIX_SASL_USERNAME"] = SASL_USERNAME
+    else:
+        env.pop("ZMQ_CLIENT_MATRIX_SASL_USERNAME", None)
+    if SASL_PASSWORD:
+        env["ZMQ_CLIENT_MATRIX_SASL_PASSWORD"] = SASL_PASSWORD
+    else:
+        env.pop("ZMQ_CLIENT_MATRIX_SASL_PASSWORD", None)
+    if SSL_CA_LOCATION:
+        env["ZMQ_CLIENT_MATRIX_SSL_CA_LOCATION"] = SSL_CA_LOCATION
+    else:
+        env.pop("ZMQ_CLIENT_MATRIX_SSL_CA_LOCATION", None)
+    if BAD_SSL_CA_LOCATION:
+        env["ZMQ_CLIENT_MATRIX_BAD_SSL_CA_LOCATION"] = BAD_SSL_CA_LOCATION
+    else:
+        env.pop("ZMQ_CLIENT_MATRIX_BAD_SSL_CA_LOCATION", None)
+    if ACL_DENIED_TOPIC:
+        env["ZMQ_CLIENT_MATRIX_ACL_DENIED_TOPIC"] = ACL_DENIED_TOPIC
+    else:
+        env.pop("ZMQ_CLIENT_MATRIX_ACL_DENIED_TOPIC", None)
+    return env
 
 
 def require_output_contains(output, payload, tool):
@@ -396,8 +455,12 @@ def ensure_tool_supports_semantics(tool):
             f"{tool} selected with security configuration, but only "
             f"{', '.join(sorted(SECURITY_TOOLS))} have security interop probes"
         )
-    if semantic_enabled("security-negative") and not SASL_PASSWORD:
-        raise MatrixError("security-negative semantic requires a configured SASL password")
+    if semantic_enabled("security-negative") and not security_negative_configured():
+        raise MatrixError(
+            "security-negative semantic requires at least one configured negative vector: "
+            "ZMQ_CLIENT_MATRIX_SASL_PASSWORD, ZMQ_CLIENT_MATRIX_BAD_SSL_CA_LOCATION with SSL/SASL_SSL, "
+            "or ZMQ_CLIENT_MATRIX_ACL_DENIED_TOPIC"
+        )
 
 
 def test_kcat():
@@ -434,8 +497,19 @@ def test_kcat():
         )
         require_output_contains(group_fetched, payload, "kcat group")
 
-    if semantic_enabled("security-negative"):
+    if semantic_enabled("security-negative") and sasl_negative_enabled():
         run_expect_failure(["kcat"] + kcat_security_args(password_override=bad_sasl_password()) + ["-L", "-b", BOOTSTRAP])
+    if semantic_enabled("security-negative") and tls_negative_enabled():
+        run_expect_failure(
+            ["kcat"] + kcat_security_args(ssl_ca_override=BAD_SSL_CA_LOCATION) + ["-L", "-b", BOOTSTRAP],
+            timeout=45,
+        )
+    if semantic_enabled("security-negative") and acl_negative_enabled():
+        run_expect_failure(
+            kcat_args + ["-P", "-b", BOOTSTRAP, "-t", ACL_DENIED_TOPIC],
+            input_text=payload + "-denied\n",
+            timeout=45,
+        )
 
     print(f"ok: kcat probes ({semantics_csv()})")
 
@@ -584,7 +658,7 @@ def test_kafka_cli():
                 ),
                 timeout=45,
             )
-        if semantic_enabled("security-negative"):
+        if semantic_enabled("security-negative") and sasl_negative_enabled():
             bad_config_path = kafka_cli_security_config_path(password_override=bad_sasl_password())
             try:
                 run_expect_failure(
@@ -600,6 +674,27 @@ def test_kafka_cli():
                         os.unlink(bad_config_path)
                     except FileNotFoundError:
                         pass
+        if semantic_enabled("security-negative") and tls_negative_enabled():
+            bad_config_path = kafka_cli_security_config_path(ssl_ca_override=BAD_SSL_CA_LOCATION)
+            try:
+                run_expect_failure(
+                    kafka_cli_command_config(
+                        ["kafka-broker-api-versions.sh", "--bootstrap-server", BOOTSTRAP],
+                        bad_config_path,
+                    ),
+                    timeout=45,
+                )
+            finally:
+                if bad_config_path is not None:
+                    try:
+                        os.unlink(bad_config_path)
+                    except FileNotFoundError:
+                        pass
+        if semantic_enabled("security-negative") and acl_negative_enabled():
+            denied_cmd = ["kafka-console-producer.sh", "--bootstrap-server", BOOTSTRAP, "--topic", ACL_DENIED_TOPIC]
+            if config_path is not None:
+                denied_cmd += ["--producer.config", config_path]
+            run_expect_failure(denied_cmd, input_text=payload + "-denied\n", timeout=45)
         print(f"ok: kafka CLI probes ({semantics_csv()})")
     finally:
         if config_path is not None:
@@ -688,6 +783,8 @@ def test_kafka_python():
                     test_kafka_python_rebalance(topic)
                 if semantic_enabled("security-negative"):
                     test_kafka_python_security_negative()
+                    test_kafka_python_tls_negative()
+                    test_kafka_python_acl_negative(payload)
                 print(f"ok: kafka-python probes ({semantics_csv()})")
                 return
         raise MatrixError("kafka-python consumer did not fetch produced payload")
@@ -737,6 +834,8 @@ def test_kafka_python_rebalance(topic):
 
 
 def test_kafka_python_security_negative():
+    if not sasl_negative_enabled():
+        return
     from kafka import KafkaAdminClient
 
     try:
@@ -757,6 +856,54 @@ def test_kafka_python_security_negative():
         raise MatrixError("kafka-python bad credentials unexpectedly succeeded")
     finally:
         admin.close()
+
+
+def test_kafka_python_tls_negative():
+    if not tls_negative_enabled():
+        return
+    from kafka import KafkaAdminClient
+
+    try:
+        admin = KafkaAdminClient(
+            bootstrap_servers=BOOTSTRAP,
+            client_id="zmq-client-matrix-kafka-python-bad-tls",
+            request_timeout_ms=10000,
+            api_version_auto_timeout_ms=5000,
+            **kafka_python_security_config(ssl_ca_override=BAD_SSL_CA_LOCATION),
+        )
+    except Exception:
+        return
+    try:
+        try:
+            admin.list_topics()
+        except Exception:
+            return
+        raise MatrixError("kafka-python bad TLS trust unexpectedly succeeded")
+    finally:
+        admin.close()
+
+
+def test_kafka_python_acl_negative(payload):
+    if not acl_negative_enabled():
+        return
+    from kafka import KafkaProducer
+
+    producer = KafkaProducer(
+        bootstrap_servers=BOOTSTRAP,
+        client_id="zmq-client-matrix-kafka-python-acl-denied",
+        request_timeout_ms=10000,
+        api_version_auto_timeout_ms=5000,
+        **kafka_python_security_config(),
+    )
+    try:
+        try:
+            producer.send(ACL_DENIED_TOPIC, payload + b"-denied").get(timeout=10)
+            producer.flush(timeout=10)
+        except Exception:
+            return
+        raise MatrixError("kafka-python ACL-denied produce unexpectedly succeeded")
+    finally:
+        producer.close()
 
 
 def test_confluent_kafka():
@@ -834,6 +981,8 @@ def test_confluent_kafka():
                     test_confluent_rebalance(topic)
                 if semantic_enabled("security-negative"):
                     test_confluent_security_negative()
+                    test_confluent_tls_negative()
+                    test_confluent_acl_negative(payload)
                 print(f"ok: confluent-kafka probes ({semantics_csv()})")
                 return
         raise MatrixError("confluent-kafka consumer did not fetch produced payload")
@@ -880,6 +1029,8 @@ def test_confluent_rebalance(topic):
 
 
 def test_confluent_security_negative():
+    if not sasl_negative_enabled():
+        return
     from confluent_kafka.admin import AdminClient
 
     admin = AdminClient({
@@ -893,6 +1044,49 @@ def test_confluent_security_negative():
     except Exception:
         return
     raise MatrixError("confluent-kafka bad credentials unexpectedly succeeded")
+
+
+def test_confluent_tls_negative():
+    if not tls_negative_enabled():
+        return
+    from confluent_kafka.admin import AdminClient
+
+    admin = AdminClient({
+        "bootstrap.servers": BOOTSTRAP,
+        "client.id": "zmq-client-matrix-confluent-bad-tls",
+        "socket.timeout.ms": 10000,
+        **confluent_security_config(ssl_ca_override=BAD_SSL_CA_LOCATION),
+    })
+    try:
+        admin.list_topics(timeout=10)
+    except Exception:
+        return
+    raise MatrixError("confluent-kafka bad TLS trust unexpectedly succeeded")
+
+
+def test_confluent_acl_negative(payload):
+    if not acl_negative_enabled():
+        return
+    from confluent_kafka import Producer
+
+    failures = []
+
+    def delivery_report(err, _msg):
+        if err is not None:
+            failures.append(str(err))
+
+    producer = Producer({
+        "bootstrap.servers": BOOTSTRAP,
+        "client.id": "zmq-client-matrix-confluent-acl-denied",
+        "socket.timeout.ms": 10000,
+        "message.timeout.ms": 10000,
+        **confluent_security_config(),
+    })
+    producer.produce(ACL_DENIED_TOPIC, payload + b"-denied", callback=delivery_report)
+    producer.flush(10)
+    if failures:
+        return
+    raise MatrixError("confluent-kafka ACL-denied produce unexpectedly succeeded")
 
 
 def test_confluent_transaction(topic):
@@ -964,6 +1158,8 @@ public class ZmqKafkaClientMatrix {
             }
             if (semantics.contains("security-negative")) {
                 runSecurityNegative(bootstrap);
+                runTlsNegative(bootstrap);
+                runAclNegative(bootstrap, payload + "-denied");
             }
         }
 
@@ -1088,7 +1284,7 @@ public class ZmqKafkaClientMatrix {
     private static void runSecurityNegative(String bootstrap) throws Exception {
         String password = System.getenv("ZMQ_CLIENT_MATRIX_SASL_PASSWORD");
         if (password == null || password.isEmpty()) {
-            throw new RuntimeException("security-negative requires ZMQ_CLIENT_MATRIX_SASL_PASSWORD");
+            return;
         }
         Properties adminProps = new Properties();
         adminProps.put("bootstrap.servers", bootstrap);
@@ -1099,6 +1295,52 @@ public class ZmqKafkaClientMatrix {
         try (AdminClient admin = AdminClient.create(adminProps)) {
             admin.listTopics().names().get(10, TimeUnit.SECONDS);
             throw new RuntimeException("Java bad credentials unexpectedly succeeded");
+        } catch (Exception expected) {
+            if (expected.toString().contains("unexpectedly succeeded")) {
+                throw expected;
+            }
+        }
+    }
+
+    private static void runTlsNegative(String bootstrap) throws Exception {
+        String badCa = System.getenv("ZMQ_CLIENT_MATRIX_BAD_SSL_CA_LOCATION");
+        String protocol = System.getenv("ZMQ_CLIENT_MATRIX_SECURITY_PROTOCOL");
+        if (badCa == null || badCa.isEmpty() || protocol == null || !protocol.contains("SSL")) {
+            return;
+        }
+        Properties adminProps = new Properties();
+        adminProps.put("bootstrap.servers", bootstrap);
+        adminProps.put("client.id", "zmq-client-matrix-java-bad-tls");
+        adminProps.put("request.timeout.ms", "10000");
+        applySecurity(adminProps);
+        adminProps.put("ssl.truststore.location", badCa);
+        try (AdminClient admin = AdminClient.create(adminProps)) {
+            admin.listTopics().names().get(10, TimeUnit.SECONDS);
+            throw new RuntimeException("Java bad TLS trust unexpectedly succeeded");
+        } catch (Exception expected) {
+            if (expected.toString().contains("unexpectedly succeeded")) {
+                throw expected;
+            }
+        }
+    }
+
+    private static void runAclNegative(String bootstrap, String payload) throws Exception {
+        String deniedTopic = System.getenv("ZMQ_CLIENT_MATRIX_ACL_DENIED_TOPIC");
+        if (deniedTopic == null || deniedTopic.isEmpty()) {
+            return;
+        }
+        Properties producerProps = new Properties();
+        producerProps.put("bootstrap.servers", bootstrap);
+        producerProps.put("client.id", "zmq-client-matrix-java-acl-denied");
+        producerProps.put("key.serializer", StringSerializer.class.getName());
+        producerProps.put("value.serializer", StringSerializer.class.getName());
+        producerProps.put("acks", "1");
+        producerProps.put("request.timeout.ms", "10000");
+        producerProps.put("delivery.timeout.ms", "15000");
+        applySecurity(producerProps);
+        try (KafkaProducer<String, String> producer = new KafkaProducer<>(producerProps)) {
+            producer.send(new ProducerRecord<>(deniedTopic, payload)).get(10, TimeUnit.SECONDS);
+            throw new RuntimeException("Java ACL-denied produce unexpectedly succeeded");
         } catch (Exception expected) {
             if (expected.toString().contains("unexpectedly succeeded")) {
                 throw expected;
@@ -1153,6 +1395,7 @@ def test_java_kafka():
                 semantics_csv(),
             ],
             timeout=90,
+            env=active_security_env(),
         )
     print(f"ok: java-kafka probes ({semantics_csv()})")
 
@@ -1324,6 +1567,8 @@ def self_test():
         os.environ["ZMQ_CLIENT_MATRIX_APACHE_3_7_SASL_MECHANISM"] = "PLAIN"
         os.environ["ZMQ_CLIENT_MATRIX_APACHE_3_7_SASL_USERNAME"] = "matrix-user"
         os.environ["ZMQ_CLIENT_MATRIX_APACHE_3_7_SASL_PASSWORD"] = "matrix-pass"
+        os.environ["ZMQ_CLIENT_MATRIX_APACHE_3_7_BAD_SSL_CA_LOCATION"] = "/tmp/matrix-bad-ca.pem"
+        os.environ["ZMQ_CLIENT_MATRIX_APACHE_3_7_ACL_DENIED_TOPIC"] = "matrix-denied-topic"
         os.environ["ZMQ_CLIENT_MATRIX_GO_1_21_TOOLS"] = "go-kafka"
         os.environ["ZMQ_CLIENT_MATRIX_GO_1_21_GO_MODULE"] = "github.com/segmentio/kafka-go@v0.4.47"
         os.environ["ZMQ_CLIENT_MATRIX_GO_1_21_SEMANTICS"] = "admin,groups"
@@ -1342,6 +1587,13 @@ def self_test():
         props = security_properties()
         if props.get("security.protocol") != "SASL_PLAINTEXT" or props.get("sasl.mechanism") != "PLAIN":
             raise MatrixError(f"security property override failed: {props}")
+        if not security_negative_configured() or BAD_SSL_CA_LOCATION != "/tmp/matrix-bad-ca.pem":
+            raise MatrixError("security-negative vector profile override failed")
+        if ACL_DENIED_TOPIC != "matrix-denied-topic":
+            raise MatrixError("ACL negative topic profile override failed")
+        java_env = active_security_env()
+        if java_env.get("ZMQ_CLIENT_MATRIX_ACL_DENIED_TOPIC") != "matrix-denied-topic":
+            raise MatrixError("active Java security environment self-test failed")
         kafka_props_path = kafka_cli_security_config_path()
         try:
             with open(kafka_props_path, "r", encoding="utf-8") as f:
@@ -1383,6 +1635,21 @@ def self_test():
         except MatrixError as exc:
             if "security interop probes" not in str(exc):
                 raise
+        os.environ["ZMQ_CLIENT_MATRIX_GO_1_21_SEMANTICS"] = "admin,groups"
+        apply_profile("go_1_21")
+        os.environ["ZMQ_CLIENT_MATRIX_GO_1_21_TOOLS"] = "kcat"
+        os.environ["ZMQ_CLIENT_MATRIX_GO_1_21_SEMANTICS"] = "security-negative"
+        os.environ.pop("ZMQ_CLIENT_MATRIX_GO_1_21_BAD_SSL_CA_LOCATION", None)
+        os.environ.pop("ZMQ_CLIENT_MATRIX_GO_1_21_ACL_DENIED_TOPIC", None)
+        os.environ.pop("ZMQ_CLIENT_MATRIX_SASL_PASSWORD", None)
+        apply_profile("go_1_21")
+        try:
+            ensure_tool_supports_semantics("kcat")
+            raise MatrixError("security-negative without vectors was accepted")
+        except MatrixError as exc:
+            if "at least one configured negative vector" not in str(exc):
+                raise
+        os.environ["ZMQ_CLIENT_MATRIX_GO_1_21_TOOLS"] = "go-kafka"
         os.environ["ZMQ_CLIENT_MATRIX_GO_1_21_SEMANTICS"] = "admin,groups"
         apply_profile("go_1_21")
         try:
