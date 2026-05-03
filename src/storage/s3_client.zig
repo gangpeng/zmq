@@ -436,7 +436,7 @@ pub const S3Client = struct {
             const id_start = std.mem.indexOf(u8, init_body, "<UploadId>") orelse return error.S3MultipartInitFailed;
             const search_from = id_start + 10;
             const id_end = std.mem.indexOf(u8, init_body[search_from..], "</UploadId>") orelse return error.S3MultipartInitFailed;
-            break :blk try self.allocator.dupe(u8, init_body[search_from .. search_from + id_end]);
+            break :blk try decodeXmlTextAlloc(self.allocator, init_body[search_from .. search_from + id_end]);
         };
         defer self.allocator.free(upload_id);
 
@@ -1528,6 +1528,7 @@ const MultipartTestServer = struct {
         complete_embedded_error,
         chunked_init_and_complete,
         chunked_complete_embedded_error,
+        escaped_upload_id,
     };
 
     fn deinit(self: *MultipartTestServer) void {
@@ -1546,6 +1547,8 @@ const MultipartTestServer = struct {
                     "<InitiateMultipartUploadResult><Upload",
                     "Id>upload-1</UploadId></InitiateMultipartUploadResult>",
                 );
+            } else if (self.mode == .escaped_upload_id) {
+                writeResponse(resp_buf, "<InitiateMultipartUploadResult><UploadId>upload&amp;id/with space</UploadId></InitiateMultipartUploadResult>");
             } else {
                 writeResponse(resp_buf, "<InitiateMultipartUploadResult><UploadId>upload-1</UploadId></InitiateMultipartUploadResult>");
             }
@@ -1553,6 +1556,7 @@ const MultipartTestServer = struct {
         }
 
         if (std.mem.eql(u8, method, "PUT")) {
+            try self.expectEscapedUploadIdQuery(query);
             self.part_put_count += 1;
             if (std.mem.indexOf(u8, query, "partNumber=1") != null) {
                 self.part1_attempts += 1;
@@ -1566,6 +1570,7 @@ const MultipartTestServer = struct {
         }
 
         if (std.mem.eql(u8, method, "POST") and std.mem.startsWith(u8, query, "uploadId=")) {
+            try self.expectEscapedUploadIdQuery(query);
             self.complete_count += 1;
             if (self.complete_body.len > 0) self.allocator.free(self.complete_body);
             self.complete_body = try self.allocator.dupe(u8, body orelse "");
@@ -1584,6 +1589,7 @@ const MultipartTestServer = struct {
         }
 
         if (std.mem.eql(u8, method, "DELETE") and std.mem.startsWith(u8, query, "uploadId=")) {
+            try self.expectEscapedUploadIdQuery(query);
             self.abort_count += 1;
             writeResponse(resp_buf, "");
             return 204;
@@ -1620,6 +1626,17 @@ const MultipartTestServer = struct {
                 writeValidPartEtag(resp_buf, part_number);
                 return 200;
             },
+            .escaped_upload_id => {
+                writeValidPartEtag(resp_buf, part_number);
+                return 200;
+            },
+        }
+    }
+
+    fn expectEscapedUploadIdQuery(self: *const MultipartTestServer, query: []const u8) !void {
+        if (self.mode != .escaped_upload_id) return;
+        if (std.mem.indexOf(u8, query, "uploadId=upload%26id%2Fwith%20space") == null) {
+            return error.MultipartUploadIdNotDecodedAndEncoded;
         }
     }
 
@@ -1748,6 +1765,28 @@ test "S3Client multipart aborts after embedded complete error" {
 
 test "S3Client multipart decodes chunked init and complete responses" {
     var server = MultipartTestServer{ .allocator = testing.allocator, .mode = .chunked_init_and_complete };
+    defer server.deinit();
+
+    var client = S3Client.init(testing.allocator, .{});
+    client.test_http_ctx = &server;
+    client.test_http_request = MultipartTestServer.request;
+
+    const data = try allocMultipartTestData(testing.allocator);
+    defer testing.allocator.free(data);
+
+    try client.putObjectMultipart("large-object", data);
+
+    try testing.expectEqual(@as(u32, 1), server.init_count);
+    try testing.expectEqual(@as(u32, 2), server.part_put_count);
+    try testing.expectEqual(@as(u32, 1), server.complete_count);
+    try testing.expectEqual(@as(u32, 0), server.abort_count);
+    try testing.expect(std.mem.indexOf(u8, server.complete_body, "<ETag>\"part-1\"</ETag>") != null);
+    try testing.expectEqual(@as(u64, 1), client.put_count);
+    try testing.expectEqual(@as(u64, @intCast(data.len)), client.bytes_uploaded);
+}
+
+test "S3Client multipart decodes XML-escaped upload IDs before signing requests" {
+    var server = MultipartTestServer{ .allocator = testing.allocator, .mode = .escaped_upload_id };
     defer server.deinit();
 
     var client = S3Client.init(testing.allocator, .{});
