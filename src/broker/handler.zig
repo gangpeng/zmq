@@ -94,6 +94,8 @@ pub const Broker = struct {
     auto_mq_group_promotions: std.StringHashMap(AutoMqGroupPromotion),
     /// Local share-group partition state keyed by group/topic-id/partition.
     share_group_states: std.StringHashMap(SharePartitionState),
+    /// Local share fetch session epochs keyed by group/member.
+    share_group_sessions: std.StringHashMap(i32),
     /// Idempotent producer deduplication: tracks last sequence number per producer+partition.
     producer_sequences: std.AutoHashMap(ProducerKey, ProducerSequenceState),
     allocator: Allocator,
@@ -434,6 +436,7 @@ pub const Broker = struct {
             .auto_mq_next_node_id = defaultAutoMqNextNodeId(node_id),
             .auto_mq_group_promotions = std.StringHashMap(AutoMqGroupPromotion).init(alloc),
             .share_group_states = std.StringHashMap(SharePartitionState).init(alloc),
+            .share_group_sessions = std.StringHashMap(i32).init(alloc),
             .producer_sequences = std.AutoHashMap(ProducerKey, ProducerSequenceState).init(alloc),
             .allocator = alloc,
             .node_id = node_id,
@@ -1177,6 +1180,8 @@ pub const Broker = struct {
         self.auto_mq_group_promotions.deinit();
         self.clearShareGroupStates();
         self.share_group_states.deinit();
+        self.clearShareGroupSessions();
+        self.share_group_sessions.deinit();
         self.producer_sequences.deinit();
         self.store.deinit();
         self.groups.deinit();
@@ -1399,6 +1404,14 @@ pub const Broker = struct {
             entry.value_ptr.deinit(self.allocator);
         }
         self.share_group_states.clearRetainingCapacity();
+    }
+
+    fn clearShareGroupSessions(self: *Broker) void {
+        var it = self.share_group_sessions.iterator();
+        while (it.next()) |entry| {
+            self.allocator.free(entry.key_ptr.*);
+        }
+        self.share_group_sessions.clearRetainingCapacity();
     }
 
     fn restoreAutoMqMetadata(self: *Broker, snapshot: MetadataPersistence.AutoMqMetadataSnapshot) !void {
@@ -11427,6 +11440,150 @@ pub const Broker = struct {
         };
     }
 
+    fn shareGroupMemberKey(self: *Broker, group_id: []const u8, member_id: []const u8) ![]u8 {
+        const key = try self.allocator.alloc(u8, group_id.len + 1 + member_id.len);
+        @memcpy(key[0..group_id.len], group_id);
+        key[group_id.len] = ':';
+        @memcpy(key[group_id.len + 1 ..], member_id);
+        return key;
+    }
+
+    fn validateShareGroupMember(self: *const Broker, group_id: ?[]const u8, member_id: ?[]const u8) ErrorCode {
+        const group_name = group_id orelse return ErrorCode.invalid_group_id;
+        if (group_name.len == 0) return ErrorCode.invalid_group_id;
+        const member_name = member_id orelse return ErrorCode.unknown_member_id;
+        if (member_name.len == 0) return ErrorCode.unknown_member_id;
+
+        const group = self.groups.groups.get(group_name) orelse return ErrorCode.unknown_member_id;
+        if (!self.isShareGroup(&group)) return ErrorCode.inconsistent_group_protocol;
+        if (!group.members.contains(member_name)) return ErrorCode.unknown_member_id;
+        return ErrorCode.none;
+    }
+
+    fn updateShareSessionEpoch(self: *Broker, group_id: []const u8, member_id: []const u8, share_session_epoch: i32) !ErrorCode {
+        if (share_session_epoch < -1) return ErrorCode.invalid_request;
+
+        const key = try self.shareGroupMemberKey(group_id, member_id);
+        errdefer self.allocator.free(key);
+
+        if (share_session_epoch == -1) {
+            if (self.share_group_sessions.fetchRemove(key)) |removed| {
+                self.allocator.free(removed.key);
+                self.allocator.free(key);
+                return ErrorCode.none;
+            }
+            self.allocator.free(key);
+            return ErrorCode.invalid_fetch_session_epoch;
+        }
+
+        if (self.share_group_sessions.getPtr(key)) |current_epoch| {
+            defer self.allocator.free(key);
+            if (share_session_epoch == 0) {
+                current_epoch.* = 0;
+                return ErrorCode.none;
+            }
+            if (share_session_epoch != current_epoch.* + 1) return ErrorCode.invalid_fetch_session_epoch;
+            current_epoch.* = share_session_epoch;
+            return ErrorCode.none;
+        }
+
+        if (share_session_epoch != 0) {
+            self.allocator.free(key);
+            return ErrorCode.invalid_fetch_session_epoch;
+        }
+
+        try self.share_group_sessions.put(key, 0);
+        return ErrorCode.none;
+    }
+
+    fn shareFetchErrorMessage(error_code: ErrorCode) ?[]const u8 {
+        return switch (error_code) {
+            .none => null,
+            .invalid_group_id => "Invalid share group id",
+            .unknown_member_id => "Unknown share group member",
+            .inconsistent_group_protocol => "Group is not a share group",
+            .invalid_fetch_session_epoch => "Invalid share session epoch",
+            .invalid_request => "Invalid share fetch request",
+            else => "Share fetch failed",
+        };
+    }
+
+    fn validateShareFetchRequestSemantics(req: generated.share_fetch_request.ShareFetchRequest) ErrorCode {
+        if (req.max_wait_ms < 0 or req.min_bytes < 0 or req.max_bytes < 0) return ErrorCode.invalid_request;
+        return ErrorCode.none;
+    }
+
+    fn validateShareAcknowledgementBatches(batches: anytype) ErrorCode {
+        for (batches) |batch| {
+            if (batch.first_offset < 0 or batch.last_offset < batch.first_offset) return ErrorCode.invalid_request;
+            if (batch.last_offset == std.math.maxInt(i64)) return ErrorCode.invalid_request;
+            const raw_count = batch.last_offset - batch.first_offset + 1;
+            const count = std.math.cast(usize, raw_count) orelse return ErrorCode.invalid_request;
+            if (batch.acknowledge_types.len != count) return ErrorCode.invalid_request;
+            for (batch.acknowledge_types) |ack_type| {
+                if (ack_type < 0 or ack_type > 3) return ErrorCode.invalid_request;
+            }
+        }
+        return ErrorCode.none;
+    }
+
+    fn applyShareAcknowledgementBatches(self: *Broker, group_id: []const u8, topic_id: [16]u8, partition: i32, batches: anytype) !void {
+        if (batches.len == 0) return;
+
+        const existing = try self.getSharePartitionState(group_id, topic_id, partition);
+        var start_offset: i64 = if (existing) |state| state.start_offset else 0;
+        const state_epoch: i32 = if (existing) |state| state.state_epoch else 0;
+
+        var release_batches = std.array_list.Managed(ShareStateBatch).init(self.allocator);
+        errdefer release_batches.deinit();
+
+        for (batches) |batch| {
+            var offset = batch.first_offset;
+            for (batch.acknowledge_types) |ack_type| {
+                switch (ack_type) {
+                    0, 1, 3 => {
+                        if (offset + 1 > start_offset) start_offset = offset + 1;
+                    },
+                    2 => try release_batches.append(.{
+                        .first_offset = offset,
+                        .last_offset = offset,
+                        .delivery_state = 0,
+                        .delivery_count = 0,
+                    }),
+                    else => unreachable,
+                }
+                offset += 1;
+            }
+        }
+
+        var owned_batches: []ShareStateBatch = &.{};
+        if (release_batches.items.len > 0) {
+            owned_batches = try release_batches.toOwnedSlice();
+        }
+        try self.setSharePartitionState(group_id, topic_id, partition, state_epoch, start_offset, owned_batches);
+    }
+
+    fn recordShareFetchAcquisition(self: *Broker, group_id: []const u8, topic_id: [16]u8, partition: i32, first_offset: i64, last_offset: i64) !void {
+        if (last_offset < first_offset) return;
+        const existing = try self.getSharePartitionState(group_id, topic_id, partition);
+        const state_epoch: i32 = if (existing) |state| state.state_epoch else 0;
+        const start_offset: i64 = if (existing) |state| state.start_offset else first_offset;
+        const delivery_count: i16 = if (existing) |state| blk: {
+            if (state.batches.len == 0) break :blk 1;
+            const next_count = @as(i32, state.batches[0].delivery_count) + 1;
+            break :blk if (next_count > std.math.maxInt(i16)) std.math.maxInt(i16) else @intCast(next_count);
+        } else 1;
+
+        const batches = try self.allocator.alloc(ShareStateBatch, 1);
+        batches[0] = .{
+            .first_offset = first_offset,
+            .last_offset = last_offset,
+            .delivery_state = 2,
+            .delivery_count = delivery_count,
+        };
+        try self.setSharePartitionState(group_id, topic_id, partition, state_epoch, start_offset, batches);
+    }
+
     // ---------------------------------------------------------------
     // ShareFetch (key 78) — non-advertised until share sessions exist
     // ---------------------------------------------------------------
@@ -11460,25 +11617,35 @@ pub const Broker = struct {
         };
         defer self.freeShareFetchRequest(&req);
 
-        const responses = self.buildShareFetchFailClosedResponses(req) catch return null;
+        const member_error = self.validateShareGroupMember(req.group_id, req.member_id);
+        const semantics_error = if (member_error == ErrorCode.none) validateShareFetchRequestSemantics(req) else ErrorCode.none;
+        const session_error = if (member_error == ErrorCode.none and semantics_error == ErrorCode.none)
+            self.updateShareSessionEpoch(req.group_id.?, req.member_id.?, req.share_session_epoch) catch return null
+        else
+            ErrorCode.none;
+        const request_error = if (member_error != ErrorCode.none) member_error else if (semantics_error != ErrorCode.none) semantics_error else session_error;
+
+        const responses = self.buildShareFetchResponses(req, request_error) catch return null;
         defer self.freeShareFetchResponses(responses);
 
         const resp = Resp{
             .throttle_time_ms = 0,
-            .error_code = ErrorCode.unsupported_version.toInt(),
-            .error_message = "ShareFetch is not implemented",
+            .error_code = request_error.toInt(),
+            .error_message = shareFetchErrorMessage(request_error),
             .responses = responses,
             .node_endpoints = &.{},
         };
         return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
     }
 
-    fn buildShareFetchFailClosedResponses(
+    fn buildShareFetchResponses(
         self: *Broker,
         req: generated.share_fetch_request.ShareFetchRequest,
+        request_error: ErrorCode,
     ) ![]generated.share_fetch_response.ShareFetchResponse.ShareFetchableTopicResponse {
         const TopicResponse = generated.share_fetch_response.ShareFetchResponse.ShareFetchableTopicResponse;
         const PartitionData = TopicResponse.PartitionData;
+        const AcquiredRecords = PartitionData.AcquiredRecords;
 
         if (req.topics.len == 0) return &.{};
 
@@ -11491,22 +11658,112 @@ pub const Broker = struct {
 
         for (req.topics) |topic| {
             const partitions = try self.allocator.alloc(PartitionData, topic.partitions.len);
-            errdefer self.allocator.free(partitions);
+            var partitions_init: usize = 0;
+            errdefer {
+                for (partitions[0..partitions_init]) |partition| {
+                    if (partition.records) |records| {
+                        if (records.len > 0) self.allocator.free(@constCast(records));
+                    }
+                    if (partition.acquired_records.len > 0) self.allocator.free(partition.acquired_records);
+                }
+                self.allocator.free(partitions);
+            }
 
             for (topic.partitions, 0..) |partition, idx| {
+                var error_code = request_error;
+                var acknowledge_error = request_error;
+                var records: ?[]const u8 = null;
+                var acquired_records: []const AcquiredRecords = &.{};
+                var leader_id: i32 = self.node_id;
+                const leader_epoch: i32 = 0;
+
+                if (error_code == ErrorCode.none) {
+                    error_code = self.validateShareStateTarget(req.group_id, topic.topic_id, partition.partition_index);
+                    acknowledge_error = error_code;
+                }
+                const topic_name = if (error_code == ErrorCode.none)
+                    self.findTopicNameById(topic.topic_id).?
+                else
+                    "";
+                if (error_code == ErrorCode.none) {
+                    if (self.partitionRequestError(topic_name, partition.partition_index)) |partition_error| {
+                        error_code = ErrorCode.fromInt(partition_error);
+                        acknowledge_error = error_code;
+                        if (error_code == ErrorCode.not_leader_or_follower) {
+                            leader_id = self.partitionOwnerOrSelf(topic_name, partition.partition_index);
+                        }
+                    }
+                }
+                if (error_code == ErrorCode.none and partition.partition_max_bytes < 0) {
+                    error_code = ErrorCode.invalid_request;
+                    acknowledge_error = ErrorCode.invalid_request;
+                }
+
+                if (acknowledge_error == ErrorCode.none and partition.acknowledgement_batches.len > 0) {
+                    acknowledge_error = validateShareAcknowledgementBatches(partition.acknowledgement_batches);
+                    if (acknowledge_error == ErrorCode.none) {
+                        try self.applyShareAcknowledgementBatches(req.group_id.?, topic.topic_id, partition.partition_index, partition.acknowledgement_batches);
+                    }
+                }
+
+                if (error_code == ErrorCode.none and acknowledge_error == ErrorCode.none and partition.partition_max_bytes > 0 and req.share_session_epoch != -1) {
+                    const existing = try self.getSharePartitionState(req.group_id.?, topic.topic_id, partition.partition_index);
+                    const start_offset_i64: i64 = if (existing) |state|
+                        if (state.start_offset >= 0) state.start_offset else 0
+                    else
+                        0;
+                    const start_offset: u64 = @intCast(start_offset_i64);
+                    const request_max: usize = @intCast(@min(partition.partition_max_bytes, req.max_bytes));
+                    const fetch_result = self.store.fetch(topic_name, partition.partition_index, start_offset, request_max) catch |err| blk: {
+                        log.debug("ShareFetch failed for {s}-{d} at offset {d}: {}", .{ topic_name, partition.partition_index, start_offset, err });
+                        break :blk PartitionStore.FetchResult{
+                            .error_code = @intFromEnum(ErrorCode.unknown_topic_or_partition),
+                            .records = &.{},
+                            .high_watermark = 0,
+                            .last_stable_offset = -1,
+                        };
+                    };
+                    error_code = ErrorCode.fromInt(fetch_result.error_code);
+                    if (error_code == ErrorCode.none and fetch_result.records.len > 0) {
+                        const last_offset = if (fetch_result.high_watermark > @as(i64, @intCast(start_offset)))
+                            fetch_result.high_watermark - 1
+                        else
+                            @as(i64, @intCast(start_offset));
+                        var records_transferred = false;
+                        var acquired_transferred = false;
+                        errdefer {
+                            if (!records_transferred) self.allocator.free(@constCast(fetch_result.records));
+                            if (!acquired_transferred and acquired_records.len > 0) self.allocator.free(acquired_records);
+                        }
+
+                        try self.recordShareFetchAcquisition(req.group_id.?, topic.topic_id, partition.partition_index, @intCast(start_offset), last_offset);
+                        const acquired = try self.allocator.alloc(AcquiredRecords, 1);
+                        acquired[0] = .{
+                            .first_offset = @intCast(start_offset),
+                            .last_offset = last_offset,
+                            .delivery_count = 1,
+                        };
+                        records = fetch_result.records;
+                        acquired_records = acquired;
+                        records_transferred = true;
+                        acquired_transferred = true;
+                    }
+                }
+
                 partitions[idx] = .{
                     .partition_index = partition.partition_index,
-                    .error_code = ErrorCode.unsupported_version.toInt(),
-                    .error_message = "ShareFetch is not implemented",
-                    .acknowledge_error_code = if (partition.acknowledgement_batches.len > 0) ErrorCode.unsupported_version.toInt() else ErrorCode.none.toInt(),
-                    .acknowledge_error_message = if (partition.acknowledgement_batches.len > 0) "ShareFetch acknowledgement is not implemented" else null,
+                    .error_code = error_code.toInt(),
+                    .error_message = shareFetchErrorMessage(error_code),
+                    .acknowledge_error_code = acknowledge_error.toInt(),
+                    .acknowledge_error_message = shareFetchErrorMessage(acknowledge_error),
                     .current_leader = .{
-                        .leader_id = -1,
-                        .leader_epoch = -1,
+                        .leader_id = leader_id,
+                        .leader_epoch = leader_epoch,
                     },
-                    .records = null,
-                    .acquired_records = &.{},
+                    .records = records,
+                    .acquired_records = acquired_records,
                 };
+                partitions_init += 1;
             }
 
             responses[responses_init] = .{
@@ -11526,6 +11783,12 @@ pub const Broker = struct {
 
     fn freeShareFetchResponsePartitions(self: *Broker, responses: []const generated.share_fetch_response.ShareFetchResponse.ShareFetchableTopicResponse) void {
         for (responses) |response| {
+            for (response.partitions) |partition| {
+                if (partition.records) |records| {
+                    if (records.len > 0) self.allocator.free(@constCast(records));
+                }
+                if (partition.acquired_records.len > 0) self.allocator.free(partition.acquired_records);
+            }
             if (response.partitions.len > 0) self.allocator.free(response.partitions);
         }
     }
@@ -11581,22 +11844,30 @@ pub const Broker = struct {
         };
         defer self.freeShareAcknowledgeRequest(&req);
 
-        const responses = self.buildShareAcknowledgeFailClosedResponses(req) catch return null;
+        const member_error = self.validateShareGroupMember(req.group_id, req.member_id);
+        const session_error = if (member_error == ErrorCode.none)
+            self.updateShareSessionEpoch(req.group_id.?, req.member_id.?, req.share_session_epoch) catch return null
+        else
+            ErrorCode.none;
+        const request_error = if (member_error != ErrorCode.none) member_error else session_error;
+
+        const responses = self.buildShareAcknowledgeResponses(req, request_error) catch return null;
         defer self.freeShareAcknowledgeResponses(responses);
 
         const resp = Resp{
             .throttle_time_ms = 0,
-            .error_code = ErrorCode.unsupported_version.toInt(),
-            .error_message = "ShareAcknowledge is not implemented",
+            .error_code = request_error.toInt(),
+            .error_message = shareFetchErrorMessage(request_error),
             .responses = responses,
             .node_endpoints = &.{},
         };
         return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
     }
 
-    fn buildShareAcknowledgeFailClosedResponses(
+    fn buildShareAcknowledgeResponses(
         self: *Broker,
         req: generated.share_acknowledge_request.ShareAcknowledgeRequest,
+        request_error: ErrorCode,
     ) ![]generated.share_acknowledge_response.ShareAcknowledgeResponse.ShareAcknowledgeTopicResponse {
         const TopicResponse = generated.share_acknowledge_response.ShareAcknowledgeResponse.ShareAcknowledgeTopicResponse;
         const PartitionData = TopicResponse.PartitionData;
@@ -11615,13 +11886,39 @@ pub const Broker = struct {
             errdefer self.allocator.free(partitions);
 
             for (topic.partitions, 0..) |partition, idx| {
+                var error_code = request_error;
+                var leader_id: i32 = self.node_id;
+                const leader_epoch: i32 = 0;
+
+                if (error_code == ErrorCode.none) {
+                    error_code = self.validateShareStateTarget(req.group_id, topic.topic_id, partition.partition_index);
+                }
+                const topic_name = if (error_code == ErrorCode.none)
+                    self.findTopicNameById(topic.topic_id).?
+                else
+                    "";
+                if (error_code == ErrorCode.none) {
+                    if (self.partitionRequestError(topic_name, partition.partition_index)) |partition_error| {
+                        error_code = ErrorCode.fromInt(partition_error);
+                        if (error_code == ErrorCode.not_leader_or_follower) {
+                            leader_id = self.partitionOwnerOrSelf(topic_name, partition.partition_index);
+                        }
+                    }
+                }
+                if (error_code == ErrorCode.none) {
+                    error_code = validateShareAcknowledgementBatches(partition.acknowledgement_batches);
+                    if (error_code == ErrorCode.none) {
+                        try self.applyShareAcknowledgementBatches(req.group_id.?, topic.topic_id, partition.partition_index, partition.acknowledgement_batches);
+                    }
+                }
+
                 partitions[idx] = .{
                     .partition_index = partition.partition_index,
-                    .error_code = ErrorCode.unsupported_version.toInt(),
-                    .error_message = "ShareAcknowledge is not implemented",
+                    .error_code = error_code.toInt(),
+                    .error_message = shareFetchErrorMessage(error_code),
                     .current_leader = .{
-                        .leader_id = -1,
-                        .leader_epoch = -1,
+                        .leader_id = leader_id,
+                        .leader_epoch = leader_epoch,
                     },
                 };
             }
@@ -40137,47 +40434,42 @@ test "Broker.handleRequest ShareGroupDescribe rejects malformed request" {
     try testing.expectEqual(ErrorCode.invalid_request.toInt(), resp.groups[0].error_code);
 }
 
-test "Broker.handleRequest ShareFetch returns generated fail-closed response" {
+test "Broker.handleRequest ShareFetch opens local session and fetches records" {
     const Req = generated.share_fetch_request.ShareFetchRequest;
     const Resp = generated.share_fetch_response.ShareFetchResponse;
     const FetchTopic = Req.FetchTopic;
     const FetchPartition = FetchTopic.FetchPartition;
-    const AcknowledgementBatch = FetchPartition.AcknowledgementBatch;
-    const ForgottenTopic = Req.ForgottenTopic;
 
     var broker = Broker.init(testing.allocator, 1, 9092);
     defer broker.deinit();
+    try testing.expect(broker.ensureTopic("share-fetch-topic"));
+    _ = try broker.store.produce("share-fetch-topic", 0, "a");
+    _ = try broker.store.produce("share-fetch-topic", 0, "b");
 
-    const topic_id = [_]u8{1} ** 16;
-    const acknowledge_types = [_]i8{ 1, 2 };
-    const acknowledgement_batches = [_]AcknowledgementBatch{.{
-        .first_offset = 0,
-        .last_offset = 1,
-        .acknowledge_types = &acknowledge_types,
-    }};
+    const subscriptions = [_][]const u8{"share-fetch-topic"};
+    const joined = try broker.groups.joinGroupWithProtocol("share-group", "share-member", null, "share", "range", null, &subscriptions);
+    try testing.expectEqual(ErrorCode.none.toInt(), joined.error_code);
+    _ = broker.markShareGroupStable("share-group");
+
+    const topic_id = broker.topics.get("share-fetch-topic").?.topic_id;
     const partitions = [_]FetchPartition{.{
         .partition_index = 0,
         .partition_max_bytes = 1024,
-        .acknowledgement_batches = &acknowledgement_batches,
+        .acknowledgement_batches = &.{},
     }};
     const topics = [_]FetchTopic{.{
         .topic_id = topic_id,
         .partitions = &partitions,
-    }};
-    const forgotten_partitions = [_]i32{0};
-    const forgotten_topics = [_]ForgottenTopic{.{
-        .topic_id = topic_id,
-        .partitions = &forgotten_partitions,
     }};
     const req = Req{
         .group_id = "share-group",
         .member_id = "share-member",
         .share_session_epoch = 0,
         .max_wait_ms = 1,
-        .min_bytes = 1,
+        .min_bytes = 0,
         .max_bytes = 1024,
         .topics = &topics,
-        .forgotten_topics_data = &forgotten_topics,
+        .forgotten_topics_data = &.{},
     };
 
     var buf: [512]u8 = undefined;
@@ -40207,20 +40499,27 @@ test "Broker.handleRequest ShareFetch returns generated fail-closed response" {
 
     try testing.expectEqual(response.?.len, rpos);
     try testing.expectEqual(@as(i32, 0), resp.throttle_time_ms);
-    try testing.expectEqual(ErrorCode.unsupported_version.toInt(), resp.error_code);
-    try testing.expectEqualStrings("ShareFetch is not implemented", resp.error_message.?);
+    try testing.expectEqual(ErrorCode.none.toInt(), resp.error_code);
+    try testing.expect(resp.error_message == null);
     try testing.expectEqual(@as(usize, 1), resp.responses.len);
     try testing.expectEqualSlices(u8, topic_id[0..], resp.responses[0].topic_id[0..]);
     try testing.expectEqual(@as(usize, 1), resp.responses[0].partitions.len);
     try testing.expectEqual(@as(i32, 0), resp.responses[0].partitions[0].partition_index);
-    try testing.expectEqual(ErrorCode.unsupported_version.toInt(), resp.responses[0].partitions[0].error_code);
-    try testing.expectEqualStrings("ShareFetch is not implemented", resp.responses[0].partitions[0].error_message.?);
-    try testing.expectEqual(ErrorCode.unsupported_version.toInt(), resp.responses[0].partitions[0].acknowledge_error_code);
-    try testing.expectEqualStrings("ShareFetch acknowledgement is not implemented", resp.responses[0].partitions[0].acknowledge_error_message.?);
-    try testing.expectEqual(@as(i32, -1), resp.responses[0].partitions[0].current_leader.leader_id);
-    try testing.expect(resp.responses[0].partitions[0].records == null);
-    try testing.expectEqual(@as(usize, 0), resp.responses[0].partitions[0].acquired_records.len);
+    try testing.expectEqual(ErrorCode.none.toInt(), resp.responses[0].partitions[0].error_code);
+    try testing.expect(resp.responses[0].partitions[0].error_message == null);
+    try testing.expectEqual(ErrorCode.none.toInt(), resp.responses[0].partitions[0].acknowledge_error_code);
+    try testing.expect(resp.responses[0].partitions[0].acknowledge_error_message == null);
+    try testing.expectEqual(@as(i32, 1), resp.responses[0].partitions[0].current_leader.leader_id);
+    try testing.expectEqualStrings("ab", resp.responses[0].partitions[0].records.?);
+    try testing.expectEqual(@as(usize, 1), resp.responses[0].partitions[0].acquired_records.len);
+    try testing.expectEqual(@as(i64, 0), resp.responses[0].partitions[0].acquired_records[0].first_offset);
+    try testing.expectEqual(@as(i64, 1), resp.responses[0].partitions[0].acquired_records[0].last_offset);
     try testing.expectEqual(@as(usize, 0), resp.node_endpoints.len);
+
+    const state = (try broker.getSharePartitionState("share-group", topic_id, 0)).?;
+    try testing.expectEqual(@as(i64, 0), state.start_offset);
+    try testing.expectEqual(@as(usize, 1), state.batches.len);
+    try testing.expectEqual(@as(i8, 2), state.batches[0].delivery_state);
 }
 
 test "Broker.handleRequest ShareFetch rejects malformed request" {
@@ -40260,7 +40559,7 @@ test "Broker.handleRequest ShareFetch rejects malformed request" {
     try testing.expectEqualStrings("malformed ShareFetch request", resp.error_message.?);
 }
 
-test "Broker.handleRequest ShareAcknowledge returns generated fail-closed response" {
+test "Broker.handleRequest ShareAcknowledge advances local share state" {
     const Req = generated.share_acknowledge_request.ShareAcknowledgeRequest;
     const Resp = generated.share_acknowledge_response.ShareAcknowledgeResponse;
     const AcknowledgeTopic = Req.AcknowledgeTopic;
@@ -40269,8 +40568,24 @@ test "Broker.handleRequest ShareAcknowledge returns generated fail-closed respon
 
     var broker = Broker.init(testing.allocator, 1, 9092);
     defer broker.deinit();
+    try testing.expect(broker.ensureTopic("share-ack-topic"));
 
-    const topic_id = [_]u8{2} ** 16;
+    const subscriptions = [_][]const u8{"share-ack-topic"};
+    const joined = try broker.groups.joinGroupWithProtocol("share-group", "share-member", null, "share", "range", null, &subscriptions);
+    try testing.expectEqual(ErrorCode.none.toInt(), joined.error_code);
+    _ = broker.markShareGroupStable("share-group");
+    try testing.expectEqual(ErrorCode.none, try broker.updateShareSessionEpoch("share-group", "share-member", 0));
+
+    const topic_id = broker.topics.get("share-ack-topic").?.topic_id;
+    const acquired_batches = try testing.allocator.alloc(Broker.ShareStateBatch, 1);
+    acquired_batches[0] = .{
+        .first_offset = 0,
+        .last_offset = 0,
+        .delivery_state = 2,
+        .delivery_count = 1,
+    };
+    try broker.setSharePartitionState("share-group", topic_id, 0, 0, 0, acquired_batches);
+
     const acknowledge_types = [_]i8{1};
     const acknowledgement_batches = [_]AcknowledgementBatch{.{
         .first_offset = 0,
@@ -40316,16 +40631,20 @@ test "Broker.handleRequest ShareAcknowledge returns generated fail-closed respon
 
     try testing.expectEqual(response.?.len, rpos);
     try testing.expectEqual(@as(i32, 0), resp.throttle_time_ms);
-    try testing.expectEqual(ErrorCode.unsupported_version.toInt(), resp.error_code);
-    try testing.expectEqualStrings("ShareAcknowledge is not implemented", resp.error_message.?);
+    try testing.expectEqual(ErrorCode.none.toInt(), resp.error_code);
+    try testing.expect(resp.error_message == null);
     try testing.expectEqual(@as(usize, 1), resp.responses.len);
     try testing.expectEqualSlices(u8, topic_id[0..], resp.responses[0].topic_id[0..]);
     try testing.expectEqual(@as(usize, 1), resp.responses[0].partitions.len);
     try testing.expectEqual(@as(i32, 0), resp.responses[0].partitions[0].partition_index);
-    try testing.expectEqual(ErrorCode.unsupported_version.toInt(), resp.responses[0].partitions[0].error_code);
-    try testing.expectEqualStrings("ShareAcknowledge is not implemented", resp.responses[0].partitions[0].error_message.?);
-    try testing.expectEqual(@as(i32, -1), resp.responses[0].partitions[0].current_leader.leader_id);
+    try testing.expectEqual(ErrorCode.none.toInt(), resp.responses[0].partitions[0].error_code);
+    try testing.expect(resp.responses[0].partitions[0].error_message == null);
+    try testing.expectEqual(@as(i32, 1), resp.responses[0].partitions[0].current_leader.leader_id);
     try testing.expectEqual(@as(usize, 0), resp.node_endpoints.len);
+
+    const state = (try broker.getSharePartitionState("share-group", topic_id, 0)).?;
+    try testing.expectEqual(@as(i64, 1), state.start_offset);
+    try testing.expectEqual(@as(usize, 0), state.batches.len);
 }
 
 test "Broker.handleRequest ShareAcknowledge rejects malformed request" {
