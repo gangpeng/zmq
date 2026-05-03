@@ -999,6 +999,11 @@ pub const Broker = struct {
         const group_count = self.groups.groupCount();
         const topic_count = self.topics.count();
         const partition_count = self.brokerPartitionCount();
+        const leader_partition_count = self.brokerLocalLeaderPartitionCount();
+        const active_controller_count: f64 = if (self.raft_state) |raft|
+            if (raft.role == .leader) 1.0 else 0.0
+        else
+            0.0;
         self.metrics.setGauge("kafka_server_group_count", @floatFromInt(group_count));
         self.metrics.setGauge("kafka_server_topic_count", @floatFromInt(topic_count));
         self.metrics.setGauge("kafka_server_member_count", @floatFromInt(self.groups.totalMemberCount()));
@@ -1007,6 +1012,11 @@ pub const Broker = struct {
         self.metrics.setGauge("Kafka_topic_count", @floatFromInt(topic_count));
         self.metrics.setGauge("Kafka_partition_count", @floatFromInt(partition_count));
         self.metrics.setGauge("Kafka_partition_total_count", @floatFromInt(partition_count));
+        self.metrics.setGauge("kafka_controller_kafkacontroller_activecontrollercount", active_controller_count);
+        self.metrics.setGauge("kafka_server_replicamanager_partitioncount", @floatFromInt(partition_count));
+        self.metrics.setGauge("kafka_server_replicamanager_leadercount", @floatFromInt(leader_partition_count));
+        self.metrics.setGauge("kafka_server_replicamanager_underreplicatedpartitions", 0.0);
+        self.metrics.setGauge("kafka_server_replicamanager_offlinepartitionscount", 0.0);
 
         // Periodically persist committed offsets and group state
         self.persistOffsets();
@@ -1045,6 +1055,22 @@ pub const Broker = struct {
         var it = self.topics.valueIterator();
         while (it.next()) |topic| {
             if (topic.num_partitions > 0) count += @intCast(topic.num_partitions);
+        }
+        return count;
+    }
+
+    fn brokerLocalLeaderPartitionCount(self: *const Broker) usize {
+        var count: usize = 0;
+        var it = self.topics.iterator();
+        while (it.next()) |entry| {
+            const topic = entry.value_ptr;
+            if (topic.num_partitions <= 0) continue;
+            var partition_index: i32 = 0;
+            while (partition_index < topic.num_partitions) : (partition_index += 1) {
+                if (self.partitionOwnerOrSelf(entry.key_ptr.*, partition_index) == self.node_id) {
+                    count += 1;
+                }
+            }
         }
         return count;
     }
@@ -4878,6 +4904,12 @@ pub const Broker = struct {
         // Track metrics — per-API and total
         self.metrics.incrementCounter("kafka_server_requests_total");
         self.metrics.addCounter("kafka_server_bytes_in_total", request_bytes.len);
+        self.metrics.addCounter("kafka_server_brokertopicmetrics_bytesin_total", request_bytes.len);
+        if (api_key == 0) {
+            self.metrics.incrementCounter("kafka_server_brokertopicmetrics_totalproducerequests_total");
+        } else if (api_key == 1) {
+            self.metrics.incrementCounter("kafka_server_brokertopicmetrics_totalfetchrequests_total");
+        }
 
         const api_name = apiKeyName(api_key);
         if (api_name.len > 0) {
@@ -4888,6 +4920,8 @@ pub const Broker = struct {
         const api_version_str = std.fmt.bufPrint(&api_version_buf, "{d}", .{api_version}) catch "?";
         self.metrics.incrementLabeledCounter("Kafka_request_count_total", &.{ api_type_for_metrics, api_version_str });
         self.metrics.addLabeledCounter("Kafka_request_size_bytes_total", &.{ api_type_for_metrics, api_version_str }, @intCast(request_bytes.len));
+        self.metrics.incrementLabeledCounter("kafka_network_requestmetrics_requests_total", &.{ api_type_for_metrics, api_version_str });
+        self.metrics.addLabeledCounter("kafka_network_requestmetrics_requestbytes_total", &.{ api_type_for_metrics, api_version_str }, @intCast(request_bytes.len));
 
         // Record per-API latency
         const t_start = @import("time_compat").nanoTimestamp();
@@ -5006,10 +5040,13 @@ pub const Broker = struct {
         self.metrics.observeHistogram("kafka_server_request_latency_seconds", latency_secs);
         const latency_ms: u64 = @intFromFloat(@max(latency_secs * 1000.0, 0.0));
         self.metrics.addLabeledCounter("Kafka_request_time_milliseconds_total", &.{ api_type_for_metrics, api_version_str }, latency_ms);
+        self.metrics.addLabeledCounter("kafka_network_requestmetrics_totaltimems_total", &.{ api_type_for_metrics, api_version_str }, latency_ms);
 
         if (result) |resp| {
             self.metrics.addCounter("kafka_server_bytes_out_total", resp.len);
+            self.metrics.addCounter("kafka_server_brokertopicmetrics_bytesout_total", resp.len);
             self.metrics.addLabeledCounter("Kafka_response_size_bytes_total", &.{ api_type_for_metrics, api_version_str }, @intCast(resp.len));
+            self.metrics.addLabeledCounter("kafka_network_requestmetrics_responsebytes_total", &.{ api_type_for_metrics, api_version_str }, @intCast(resp.len));
 
             // Track per-API error counters. Extract top-level error_code from the response.
             // Response format: correlation_id(4) [+ tagged_fields for flexible] + [throttle_time] + error_code(2).
@@ -5019,6 +5056,11 @@ pub const Broker = struct {
             const error_metric_name = errorNameForMetrics(error_code, &error_metric_buf);
             self.metrics.incrementLabeledCounter("Kafka_request_error_count_total", &.{ api_type_for_metrics, api_version_str, error_metric_name });
             if (error_code != 0) {
+                if (api_key == 0) {
+                    self.metrics.incrementCounter("kafka_server_brokertopicmetrics_failedproducerequests_total");
+                } else if (api_key == 1) {
+                    self.metrics.incrementCounter("kafka_server_brokertopicmetrics_failedfetchrequests_total");
+                }
                 var ec_buf: [8]u8 = undefined;
                 const ec_str = std.fmt.bufPrint(&ec_buf, "{d}", .{error_code}) catch "?";
                 const api_name_for_err = apiKeyName(api_key);
@@ -51014,21 +51056,41 @@ test "Broker exports AutoMQ-compatible request metrics" {
     try testing.expect(request_bytes_entry != null);
     try testing.expectEqual(@as(u64, pos), request_bytes_entry.?.value);
 
+    const jmx_request_key = "kafka_network_requestmetrics_requests_total{request=\"ApiVersions\",version=\"3\"}";
+    const jmx_request_entry = broker.metrics.labeled_counters.get(jmx_request_key);
+    try testing.expect(jmx_request_entry != null);
+    try testing.expectEqual(@as(u64, 1), jmx_request_entry.?.value);
+
+    const jmx_request_bytes_key = "kafka_network_requestmetrics_requestbytes_total{request=\"ApiVersions\",version=\"3\"}";
+    const jmx_request_bytes_entry = broker.metrics.labeled_counters.get(jmx_request_bytes_key);
+    try testing.expect(jmx_request_bytes_entry != null);
+    try testing.expectEqual(@as(u64, pos), jmx_request_bytes_entry.?.value);
+
     const response_bytes_key = "Kafka_response_size_bytes_total{type=\"ApiVersions\",version=\"3\"}";
     const response_bytes_entry = broker.metrics.labeled_counters.get(response_bytes_key);
     try testing.expect(response_bytes_entry != null);
     try testing.expectEqual(@as(u64, response.?.len), response_bytes_entry.?.value);
+
+    const jmx_response_bytes_key = "kafka_network_requestmetrics_responsebytes_total{request=\"ApiVersions\",version=\"3\"}";
+    const jmx_response_bytes_entry = broker.metrics.labeled_counters.get(jmx_response_bytes_key);
+    try testing.expect(jmx_response_bytes_entry != null);
+    try testing.expectEqual(@as(u64, response.?.len), jmx_response_bytes_entry.?.value);
 
     const error_key = "Kafka_request_error_count_total{type=\"ApiVersions\",version=\"3\",error=\"NONE\"}";
     const error_entry = broker.metrics.labeled_counters.get(error_key);
     try testing.expect(error_entry != null);
     try testing.expectEqual(@as(u64, 1), error_entry.?.value);
 
+    try testing.expectEqual(@as(u64, pos), broker.metrics.counters.get("kafka_server_brokertopicmetrics_bytesin_total").?.value);
+    try testing.expectEqual(@as(u64, response.?.len), broker.metrics.counters.get("kafka_server_brokertopicmetrics_bytesout_total").?.value);
+
     const output = try broker.metrics.exportPrometheus(testing.allocator);
     defer testing.allocator.free(output);
     try testing.expect(std.mem.indexOf(u8, output, "# TYPE Kafka_request_count_total counter") != null);
     try testing.expect(std.mem.indexOf(u8, output, request_key) != null);
     try testing.expect(std.mem.indexOf(u8, output, response_bytes_key) != null);
+    try testing.expect(std.mem.indexOf(u8, output, "# TYPE kafka_network_requestmetrics_requests_total counter") != null);
+    try testing.expect(std.mem.indexOf(u8, output, jmx_request_key) != null);
 }
 
 test "Broker tick exports AutoMQ-compatible broker gauges" {
@@ -51047,6 +51109,11 @@ test "Broker tick exports AutoMQ-compatible broker gauges" {
     try testing.expectEqual(@as(f64, 1.0), broker.metrics.gauges.get("Kafka_group_count").?.value);
     try testing.expectEqual(@as(f64, 4.0), broker.metrics.gauges.get("Kafka_partition_count").?.value);
     try testing.expectEqual(@as(f64, 4.0), broker.metrics.gauges.get("Kafka_partition_total_count").?.value);
+    try testing.expectEqual(@as(f64, 4.0), broker.metrics.gauges.get("kafka_server_replicamanager_partitioncount").?.value);
+    try testing.expectEqual(@as(f64, 4.0), broker.metrics.gauges.get("kafka_server_replicamanager_leadercount").?.value);
+    try testing.expectEqual(@as(f64, 0.0), broker.metrics.gauges.get("kafka_server_replicamanager_underreplicatedpartitions").?.value);
+    try testing.expectEqual(@as(f64, 0.0), broker.metrics.gauges.get("kafka_server_replicamanager_offlinepartitionscount").?.value);
+    try testing.expectEqual(@as(f64, 0.0), broker.metrics.gauges.get("kafka_controller_kafkacontroller_activecontrollercount").?.value);
 }
 
 test "Broker client telemetry metrics are registered" {

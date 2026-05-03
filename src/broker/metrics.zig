@@ -39,6 +39,17 @@ pub fn registerBrokerMetrics(registry: *MetricRegistry) !void {
     try registry.registerGauge("Kafka_group_count", "AutoMQ-compatible consumer group count");
     try registry.registerGauge("Kafka_partition_count", "AutoMQ-compatible local partition count");
     try registry.registerGauge("Kafka_partition_total_count", "AutoMQ-compatible cluster partition count");
+    try registry.registerGauge("kafka_controller_kafkacontroller_activecontrollercount", "JMX-compatible active controller count");
+    try registry.registerGauge("kafka_server_replicamanager_partitioncount", "JMX-compatible local partition count");
+    try registry.registerGauge("kafka_server_replicamanager_leadercount", "JMX-compatible local leader partition count");
+    try registry.registerGauge("kafka_server_replicamanager_underreplicatedpartitions", "JMX-compatible under-replicated partition count");
+    try registry.registerGauge("kafka_server_replicamanager_offlinepartitionscount", "JMX-compatible offline partition count");
+    try registry.registerCounter("kafka_server_brokertopicmetrics_totalproducerequests_total", "JMX-compatible total produce requests");
+    try registry.registerCounter("kafka_server_brokertopicmetrics_totalfetchrequests_total", "JMX-compatible total fetch requests");
+    try registry.registerCounter("kafka_server_brokertopicmetrics_bytesin_total", "JMX-compatible broker bytes in");
+    try registry.registerCounter("kafka_server_brokertopicmetrics_bytesout_total", "JMX-compatible broker bytes out");
+    try registry.registerCounter("kafka_server_brokertopicmetrics_failedproducerequests_total", "JMX-compatible failed produce requests");
+    try registry.registerCounter("kafka_server_brokertopicmetrics_failedfetchrequests_total", "JMX-compatible failed fetch requests");
     try registry.registerLabeledCounter(
         "Kafka_request_count_total",
         "AutoMQ-compatible Kafka request count by API type and version",
@@ -63,6 +74,26 @@ pub fn registerBrokerMetrics(registry: *MetricRegistry) !void {
         "Kafka_request_error_count_total",
         "AutoMQ-compatible Kafka request result count by API type, version, and error",
         &.{ "type", "version", "error" },
+    );
+    try registry.registerLabeledCounter(
+        "kafka_network_requestmetrics_requests_total",
+        "JMX-compatible Kafka network request count by request type and version",
+        &.{ "request", "version" },
+    );
+    try registry.registerLabeledCounter(
+        "kafka_network_requestmetrics_requestbytes_total",
+        "JMX-compatible Kafka network request bytes by request type and version",
+        &.{ "request", "version" },
+    );
+    try registry.registerLabeledCounter(
+        "kafka_network_requestmetrics_responsebytes_total",
+        "JMX-compatible Kafka network response bytes by request type and version",
+        &.{ "request", "version" },
+    );
+    try registry.registerLabeledCounter(
+        "kafka_network_requestmetrics_totaltimems_total",
+        "JMX-compatible Kafka network total request time by request type and version",
+        &.{ "request", "version" },
     );
     // Per-API error counter (labeled by api name and error code)
     try registry.registerLabeledCounter(
@@ -155,6 +186,21 @@ test "registerBrokerMetrics" {
     try testing.expect(registry.gauges.contains("Kafka_group_count"));
     try testing.expect(registry.gauges.contains("Kafka_partition_count"));
     try testing.expect(registry.gauges.contains("Kafka_partition_total_count"));
+    try testing.expect(registry.gauges.contains("kafka_controller_kafkacontroller_activecontrollercount"));
+    try testing.expect(registry.gauges.contains("kafka_server_replicamanager_partitioncount"));
+    try testing.expect(registry.gauges.contains("kafka_server_replicamanager_leadercount"));
+    try testing.expect(registry.gauges.contains("kafka_server_replicamanager_underreplicatedpartitions"));
+    try testing.expect(registry.gauges.contains("kafka_server_replicamanager_offlinepartitionscount"));
+    try testing.expect(registry.counters.contains("kafka_server_brokertopicmetrics_totalproducerequests_total"));
+    try testing.expect(registry.counters.contains("kafka_server_brokertopicmetrics_totalfetchrequests_total"));
+    try testing.expect(registry.counters.contains("kafka_server_brokertopicmetrics_bytesin_total"));
+    try testing.expect(registry.counters.contains("kafka_server_brokertopicmetrics_bytesout_total"));
+    try testing.expect(registry.counters.contains("kafka_server_brokertopicmetrics_failedproducerequests_total"));
+    try testing.expect(registry.counters.contains("kafka_server_brokertopicmetrics_failedfetchrequests_total"));
+    try testing.expect(registry.labeled_counter_meta.contains("kafka_network_requestmetrics_requests_total"));
+    try testing.expect(registry.labeled_counter_meta.contains("kafka_network_requestmetrics_requestbytes_total"));
+    try testing.expect(registry.labeled_counter_meta.contains("kafka_network_requestmetrics_responsebytes_total"));
+    try testing.expect(registry.labeled_counter_meta.contains("kafka_network_requestmetrics_totaltimems_total"));
     try testing.expect(registry.labeled_counter_meta.contains("kafka_server_api_errors_total"));
     try testing.expect(registry.labeled_gauge_meta.contains("kafka_consumer_lag"));
     try testing.expect(registry.gauges.contains("kafka_network_connections_active"));
