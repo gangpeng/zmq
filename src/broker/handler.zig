@@ -54,6 +54,8 @@ const topic_quorum_record_magic = "ZMQTPQ2";
 const partition_reassignment_snapshot_record_value_magic = "ZMQPR1";
 const partition_reassignment_snapshot_record_key = "__zmq_partition_reassignment_snapshot";
 const partition_reassignment_quorum_record_magic = "ZMQPRQ2";
+const replica_directory_assignment_snapshot_record_value_magic = "ZMQRD1";
+const replica_directory_assignment_snapshot_record_key = "__zmq_replica_directory_assignment_snapshot";
 const client_quota_snapshot_record_value_magic = "ZMQCQ1";
 const client_quota_snapshot_record_key = "__zmq_client_quota_snapshot";
 const scram_credential_snapshot_record_value_magic = "ZMQSC1";
@@ -760,9 +762,10 @@ pub const Broker = struct {
         }
         const recovered_cluster_records = try self.restoreClusterMetadataFromLog();
         if (recovered_cluster_records.total() > 0) {
-            log.info("Restored cluster metadata from __cluster_metadata (topics={d}, reassignments={d}, client_quotas={d}, scram_credentials={d}, acls={d}, finalized_features={d})", .{
+            log.info("Restored cluster metadata from __cluster_metadata (topics={d}, reassignments={d}, replica_dirs={d}, client_quotas={d}, scram_credentials={d}, acls={d}, finalized_features={d})", .{
                 recovered_cluster_records.topic_snapshots,
                 recovered_cluster_records.partition_reassignment_snapshots,
+                recovered_cluster_records.replica_directory_assignment_snapshots,
                 recovered_cluster_records.client_quota_snapshots,
                 recovered_cluster_records.scram_credential_snapshots,
                 recovered_cluster_records.acl_snapshots,
@@ -773,6 +776,9 @@ pub const Broker = struct {
             };
             self.persistence.savePartitionReassignments(&self.partition_reassignments) catch |err| {
                 log.warn("Failed to persist replayed partition reassignments: {}", .{err});
+            };
+            self.persistence.saveReplicaDirectoryAssignments(&self.replica_directory_assignments) catch |err| {
+                log.warn("Failed to persist replayed replica directory assignments: {}", .{err});
             };
             self.persistFinalizedFeaturesDurably() catch |err| {
                 log.warn("Failed to persist replayed finalized feature metadata: {}", .{err});
@@ -826,11 +832,13 @@ pub const Broker = struct {
             }
         }
 
-        const saved_replica_dirs = try self.persistence.loadReplicaDirectoryAssignments();
-        defer self.persistence.freeReplicaDirectoryAssignmentEntries(saved_replica_dirs);
-        try self.restoreReplicaDirectoryAssignments(saved_replica_dirs);
-        if (saved_replica_dirs.len > 0) {
-            log.info("Restored {d} replica directory assignment(s) from replica_directory_assignments.meta", .{self.replica_directory_assignments.count()});
+        if (recovered_cluster_records.replica_directory_assignment_snapshots == 0) {
+            const saved_replica_dirs = try self.persistence.loadReplicaDirectoryAssignments();
+            defer self.persistence.freeReplicaDirectoryAssignmentEntries(saved_replica_dirs);
+            try self.restoreReplicaDirectoryAssignments(saved_replica_dirs);
+            if (saved_replica_dirs.len > 0) {
+                log.info("Restored {d} replica directory assignment(s) from replica_directory_assignments.meta", .{self.replica_directory_assignments.count()});
+            }
         }
 
         const saved_share_group_states = try self.persistence.loadShareGroupStates();
@@ -1932,6 +1940,31 @@ pub const Broker = struct {
         const current = self.replica_directory_assignments;
         self.replica_directory_assignments = snapshot.*;
         snapshot.* = current;
+    }
+
+    fn pruneInvalidReplicaDirectoryAssignments(self: *Broker) usize {
+        var removed_count: usize = 0;
+        while (true) {
+            var key_to_remove: ?[]const u8 = null;
+            var it = self.replica_directory_assignments.iterator();
+            while (it.next()) |entry| {
+                const assignment = entry.value_ptr.*;
+                const topic_name = self.findTopicNameById(assignment.topic_id);
+                if (topic_name == null or !self.topicPartitionExists(topic_name.?, assignment.partition_index)) {
+                    key_to_remove = entry.key_ptr.*;
+                    break;
+                }
+            }
+
+            const key = key_to_remove orelse break;
+            if (self.replica_directory_assignments.fetchRemove(key)) |removed| {
+                self.allocator.free(removed.key);
+                removed_count += 1;
+            } else {
+                break;
+            }
+        }
+        return removed_count;
     }
 
     fn restoreAutoMqMetadata(self: *Broker, snapshot: MetadataPersistence.AutoMqMetadataSnapshot) !void {
@@ -3274,6 +3307,7 @@ pub const Broker = struct {
             try self.upsertTopicFromEntry(entry);
         }
         _ = self.pruneInvalidPartitionReassignments();
+        _ = self.pruneInvalidReplicaDirectoryAssignments();
         self.reapplyPartitionReassignmentOwnerships();
     }
 
@@ -3411,6 +3445,64 @@ pub const Broker = struct {
         const entries = try self.decodePartitionReassignmentSnapshotRecordValue(value);
         defer self.persistence.freePartitionReassignmentEntries(entries);
         try self.restorePartitionReassignments(entries);
+    }
+
+    fn encodeReplicaDirectoryAssignmentSnapshotRecordValue(self: *Broker) ![]u8 {
+        var buf = std.array_list.Managed(u8).init(self.allocator);
+        errdefer buf.deinit();
+        const writer = @import("list_compat").writer(&buf);
+
+        try writer.writeAll(replica_directory_assignment_snapshot_record_value_magic);
+        try writer.writeInt(u32, @intCast(self.replica_directory_assignments.count()), .big);
+
+        var it = self.replica_directory_assignments.iterator();
+        while (it.next()) |entry| {
+            const assignment = entry.value_ptr.*;
+            try writer.writeAll(assignment.topic_id[0..]);
+            try writer.writeInt(i32, assignment.partition_index, .big);
+            try writer.writeAll(assignment.directory_id[0..]);
+        }
+
+        return buf.toOwnedSlice();
+    }
+
+    fn decodeReplicaDirectoryAssignmentSnapshotRecordValue(self: *Broker, value: []const u8) ![]MetadataPersistence.ReplicaDirectoryAssignmentEntry {
+        if (value.len < replica_directory_assignment_snapshot_record_value_magic.len + 4) return error.InvalidReplicaDirectoryAssignmentSnapshot;
+        if (!std.mem.eql(u8, value[0..replica_directory_assignment_snapshot_record_value_magic.len], replica_directory_assignment_snapshot_record_value_magic)) {
+            return error.InvalidReplicaDirectoryAssignmentSnapshot;
+        }
+
+        var pos: usize = replica_directory_assignment_snapshot_record_value_magic.len;
+        const assignment_count = try readSnapshotU32(value, &pos);
+        if (assignment_count > 1_000_000) return error.InvalidReplicaDirectoryAssignmentSnapshot;
+
+        var entries = std.array_list.Managed(MetadataPersistence.ReplicaDirectoryAssignmentEntry).init(self.allocator);
+        errdefer entries.deinit();
+
+        for (0..assignment_count) |_| {
+            const topic_id = try readSnapshotUuid(value, &pos);
+            const partition_index = try readSnapshotI32(value, &pos);
+            const directory_id = try readSnapshotUuid(value, &pos);
+
+            if (partition_index < 0 or isZeroUuid(topic_id) or isZeroUuid(directory_id)) {
+                return error.InvalidReplicaDirectoryAssignmentSnapshot;
+            }
+
+            try entries.append(.{
+                .topic_id = topic_id,
+                .partition_index = partition_index,
+                .directory_id = directory_id,
+            });
+        }
+
+        if (pos != value.len) return error.InvalidReplicaDirectoryAssignmentSnapshot;
+        return try entries.toOwnedSlice();
+    }
+
+    fn restoreReplicaDirectoryAssignmentSnapshotRecord(self: *Broker, value: []const u8) !void {
+        const entries = try self.decodeReplicaDirectoryAssignmentSnapshotRecordValue(value);
+        defer self.persistence.freeReplicaDirectoryAssignmentEntries(entries);
+        try self.restoreReplicaDirectoryAssignments(entries);
     }
 
     fn encodeFinalizedFeatureSnapshotRecordValue(self: *Broker) ![]u8 {
@@ -4052,6 +4144,41 @@ pub const Broker = struct {
         try self.persistPartitionStatesDurably();
     }
 
+    /// Write replica-directory assignments to __cluster_metadata so
+    /// AssignReplicasToDirs survives stateless broker replacement.
+    fn writeReplicaDirectoryAssignmentSnapshotRecord(self: *Broker) !void {
+        const info = self.topics.get("__cluster_metadata") orelse return;
+        if (info.num_partitions <= 0) return;
+
+        const value = try self.encodeReplicaDirectoryAssignmentSnapshotRecordValue();
+        defer self.allocator.free(value);
+
+        const rec_batch = protocol.record_batch;
+        const records = [_]rec_batch.Record{
+            .{
+                .offset_delta = 0,
+                .key = replica_directory_assignment_snapshot_record_key,
+                .value = value,
+            },
+        };
+
+        const batch = try rec_batch.buildRecordBatch(
+            self.allocator,
+            0,
+            &records,
+            -1,
+            -1,
+            -1,
+            @import("time_compat").milliTimestamp(),
+            @import("time_compat").milliTimestamp(),
+            0,
+        );
+        defer self.allocator.free(batch);
+
+        _ = try self.store.produce("__cluster_metadata", 0, batch);
+        try self.persistPartitionStatesDurably();
+    }
+
     /// Write a full client quota snapshot to __cluster_metadata so broker
     /// replacement does not acknowledge quota changes that only live in memory.
     fn writeClientQuotaSnapshotRecord(self: *Broker) !void {
@@ -4195,13 +4322,14 @@ pub const Broker = struct {
     const ClusterMetadataReplayCounts = struct {
         topic_snapshots: usize = 0,
         partition_reassignment_snapshots: usize = 0,
+        replica_directory_assignment_snapshots: usize = 0,
         client_quota_snapshots: usize = 0,
         scram_credential_snapshots: usize = 0,
         acl_snapshots: usize = 0,
         finalized_feature_snapshots: usize = 0,
 
         fn total(self: @This()) usize {
-            return self.topic_snapshots + self.partition_reassignment_snapshots + self.client_quota_snapshots + self.scram_credential_snapshots + self.acl_snapshots + self.finalized_feature_snapshots;
+            return self.topic_snapshots + self.partition_reassignment_snapshots + self.replica_directory_assignment_snapshots + self.client_quota_snapshots + self.scram_credential_snapshots + self.acl_snapshots + self.finalized_feature_snapshots;
         }
     };
 
@@ -4209,6 +4337,7 @@ pub const Broker = struct {
         none,
         topic_snapshot,
         partition_reassignment_snapshot,
+        replica_directory_assignment_snapshot,
         client_quota_snapshot,
         scram_credential_snapshot,
         acl_snapshot,
@@ -4227,6 +4356,7 @@ pub const Broker = struct {
             const partition_counts = try self.applyClusterMetadataRecordBatches(result.records);
             restored.topic_snapshots += partition_counts.topic_snapshots;
             restored.partition_reassignment_snapshots += partition_counts.partition_reassignment_snapshots;
+            restored.replica_directory_assignment_snapshots += partition_counts.replica_directory_assignment_snapshots;
             restored.client_quota_snapshots += partition_counts.client_quota_snapshots;
             restored.scram_credential_snapshots += partition_counts.scram_credential_snapshots;
             restored.acl_snapshots += partition_counts.acl_snapshots;
@@ -4257,6 +4387,7 @@ pub const Broker = struct {
                         .none => {},
                         .topic_snapshot => restored.topic_snapshots += 1,
                         .partition_reassignment_snapshot => restored.partition_reassignment_snapshots += 1,
+                        .replica_directory_assignment_snapshot => restored.replica_directory_assignment_snapshots += 1,
                         .client_quota_snapshot => restored.client_quota_snapshots += 1,
                         .scram_credential_snapshot => restored.scram_credential_snapshots += 1,
                         .acl_snapshot => restored.acl_snapshots += 1,
@@ -4279,6 +4410,10 @@ pub const Broker = struct {
         if (std.mem.eql(u8, key, partition_reassignment_snapshot_record_key)) {
             try self.restorePartitionReassignmentSnapshotRecord(value);
             return .partition_reassignment_snapshot;
+        }
+        if (std.mem.eql(u8, key, replica_directory_assignment_snapshot_record_key)) {
+            try self.restoreReplicaDirectoryAssignmentSnapshotRecord(value);
+            return .replica_directory_assignment_snapshot;
         }
         if (std.mem.eql(u8, key, client_quota_snapshot_record_key)) {
             try self.applyClientQuotaSnapshotRecord(value);
@@ -18431,6 +18566,12 @@ pub const Broker = struct {
                 mutation_failed = true;
             };
             if (!mutation_failed) {
+                self.writeReplicaDirectoryAssignmentSnapshotRecord() catch |err| {
+                    log.warn("AssignReplicasToDirs shared assignment snapshot write failed: {}", .{err});
+                    mutation_failed = true;
+                };
+            }
+            if (!mutation_failed) {
                 self.persistReplicaDirectoryAssignmentsDurably() catch |err| {
                     log.warn("AssignReplicasToDirs assignment snapshot write failed: {}", .{err});
                     mutation_failed = true;
@@ -18439,6 +18580,12 @@ pub const Broker = struct {
 
             if (mutation_failed) {
                 self.restoreReplicaDirectoryAssignmentSnapshot(&previous_assignments);
+                self.writeReplicaDirectoryAssignmentSnapshotRecord() catch |rollback_err| {
+                    log.warn("Failed to append AssignReplicasToDirs rollback assignment snapshot to __cluster_metadata: {}", .{rollback_err});
+                };
+                self.persistReplicaDirectoryAssignmentsDurably() catch |rollback_err| {
+                    log.warn("Failed to persist restored replica directory assignments: {}", .{rollback_err});
+                };
                 self.markAssignReplicasToDirsStorageError(directories);
                 response_error = .kafka_storage_error;
             }
@@ -33953,6 +34100,165 @@ test "Broker.handleRequest AssignReplicasToDirs persists local assignments acros
         const stored = (try restarted.getReplicaDirectoryAssignment(topic_id, 0)) orelse return error.ExpectedReplicaDirectoryAssignment;
         try testing.expectEqualSlices(u8, directory_id[0..], stored[0..]);
     }
+}
+
+test "Broker restores AssignReplicasToDirs assignments from S3 cluster metadata log" {
+    const Req = generated.assign_replicas_to_dirs_request.AssignReplicasToDirsRequest;
+    const Resp = generated.assign_replicas_to_dirs_response.AssignReplicasToDirsResponse;
+    const DirectoryData = Req.DirectoryData;
+    const TopicData = DirectoryData.TopicData;
+    const PartitionData = TopicData.PartitionData;
+
+    var mock_s3 = storage.MockS3.init(testing.allocator);
+    defer mock_s3.deinit();
+    const s3_storage = storage.S3Storage.initMock(testing.allocator, &mock_s3);
+
+    const directory_id = [_]u8{0x7c} ** 16;
+    var topic_id: [16]u8 = undefined;
+
+    {
+        var broker = Broker.init(testing.allocator, 1, 9092);
+        defer broker.deinit();
+        broker.store.s3_wal_mode = true;
+        broker.store.s3_storage = s3_storage;
+        broker.store.s3_wal_batcher = storage.wal.S3WalBatcher.init(testing.allocator);
+
+        try broker.open();
+        _ = broker.ensureTopic("assign-dir-s3-replay-topic");
+        topic_id = broker.topics.get("assign-dir-s3-replay-topic").?.topic_id;
+
+        const partitions = [_]PartitionData{.{
+            .partition_index = 0,
+        }};
+        const topics = [_]TopicData{.{
+            .topic_id = topic_id,
+            .partitions = &partitions,
+        }};
+        const directories = [_]DirectoryData{.{
+            .id = directory_id,
+            .topics = &topics,
+        }};
+        const req = Req{
+            .broker_id = 1,
+            .broker_epoch = 1,
+            .directories = &directories,
+        };
+
+        var buf: [256]u8 = undefined;
+        var pos = buildTestRequest(&buf, 73, 0, 7305, header_mod.requestHeaderVersion(73, 0));
+        req.serialize(&buf, &pos, 0);
+
+        const response = broker.handleRequest(buf[0..pos]);
+        try testing.expect(response != null);
+        defer testing.allocator.free(response.?);
+
+        var rpos: usize = 0;
+        var response_header = try ResponseHeader.deserialize(testing.allocator, response.?, &rpos, header_mod.responseHeaderVersion(73, 0));
+        defer response_header.deinit(testing.allocator);
+        try testing.expectEqual(@as(i32, 7305), response_header.correlation_id);
+
+        const resp = try Resp.deserialize(testing.allocator, response.?, &rpos, 0);
+        defer {
+            for (resp.directories) |directory| {
+                for (directory.topics) |topic| {
+                    if (topic.partitions.len > 0) testing.allocator.free(topic.partitions);
+                }
+                if (directory.topics.len > 0) testing.allocator.free(directory.topics);
+            }
+            if (resp.directories.len > 0) testing.allocator.free(resp.directories);
+        }
+
+        try testing.expectEqual(response.?.len, rpos);
+        try testing.expectEqual(ErrorCode.none.toInt(), resp.error_code);
+        try testing.expectEqual(ErrorCode.none.toInt(), resp.directories[0].topics[0].partitions[0].error_code);
+        try testing.expect(mock_s3.objectCount() > 0);
+    }
+
+    {
+        var broker = Broker.init(testing.allocator, 1, 9092);
+        defer broker.deinit();
+        broker.store.s3_wal_mode = true;
+        broker.store.s3_storage = s3_storage;
+        broker.store.s3_wal_batcher = storage.wal.S3WalBatcher.init(testing.allocator);
+
+        try broker.open();
+
+        const stored = (try broker.getReplicaDirectoryAssignment(topic_id, 0)) orelse return error.ExpectedReplicaDirectoryAssignment;
+        try testing.expectEqualSlices(u8, directory_id[0..], stored[0..]);
+    }
+}
+
+test "Broker.handleRequest AssignReplicasToDirs fails closed when shared snapshot write fails" {
+    const Req = generated.assign_replicas_to_dirs_request.AssignReplicasToDirsRequest;
+    const Resp = generated.assign_replicas_to_dirs_response.AssignReplicasToDirsResponse;
+    const DirectoryData = Req.DirectoryData;
+    const TopicData = DirectoryData.TopicData;
+    const PartitionData = TopicData.PartitionData;
+
+    var mock_s3 = storage.MockS3.init(testing.allocator);
+    defer mock_s3.deinit();
+    const s3_storage = storage.S3Storage.initMock(testing.allocator, &mock_s3);
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+    broker.store.s3_wal_mode = true;
+    broker.store.s3_storage = s3_storage;
+    broker.store.s3_wal_batcher = storage.wal.S3WalBatcher.init(testing.allocator);
+
+    try broker.open();
+    _ = broker.ensureTopic("assign-dir-shared-fail-topic");
+
+    const topic_id = broker.topics.get("assign-dir-shared-fail-topic").?.topic_id;
+    const directory_id = [_]u8{0x7d} ** 16;
+    const object_count_before = mock_s3.objectCount();
+    mock_s3.failNextPutObjects(3);
+
+    const partitions = [_]PartitionData{.{
+        .partition_index = 0,
+    }};
+    const topics = [_]TopicData{.{
+        .topic_id = topic_id,
+        .partitions = &partitions,
+    }};
+    const directories = [_]DirectoryData{.{
+        .id = directory_id,
+        .topics = &topics,
+    }};
+    const req = Req{
+        .broker_id = 1,
+        .broker_epoch = 1,
+        .directories = &directories,
+    };
+
+    var buf: [256]u8 = undefined;
+    var pos = buildTestRequest(&buf, 73, 0, 7306, header_mod.requestHeaderVersion(73, 0));
+    req.serialize(&buf, &pos, 0);
+
+    const response = broker.handleRequest(buf[0..pos]);
+    try testing.expect(response != null);
+    defer testing.allocator.free(response.?);
+
+    var rpos: usize = 0;
+    var response_header = try ResponseHeader.deserialize(testing.allocator, response.?, &rpos, header_mod.responseHeaderVersion(73, 0));
+    defer response_header.deinit(testing.allocator);
+    try testing.expectEqual(@as(i32, 7306), response_header.correlation_id);
+
+    const resp = try Resp.deserialize(testing.allocator, response.?, &rpos, 0);
+    defer {
+        for (resp.directories) |directory| {
+            for (directory.topics) |topic| {
+                if (topic.partitions.len > 0) testing.allocator.free(topic.partitions);
+            }
+            if (directory.topics.len > 0) testing.allocator.free(directory.topics);
+        }
+        if (resp.directories.len > 0) testing.allocator.free(resp.directories);
+    }
+
+    try testing.expectEqual(response.?.len, rpos);
+    try testing.expectEqual(ErrorCode.kafka_storage_error.toInt(), resp.error_code);
+    try testing.expectEqual(ErrorCode.kafka_storage_error.toInt(), resp.directories[0].topics[0].partitions[0].error_code);
+    try testing.expect((try broker.getReplicaDirectoryAssignment(topic_id, 0)) == null);
+    try testing.expectEqual(object_count_before + 1, mock_s3.objectCount());
 }
 
 test "Broker.handleRequest AssignReplicasToDirs rolls back when local persistence fails" {
