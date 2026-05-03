@@ -10477,7 +10477,17 @@ pub const Broker = struct {
                 };
             }
 
-            const resp = consumerGroupHeartbeatResponse(result.error_code, null, result.member_id, result.generation_id, consumer_group_heartbeat_interval_ms);
+            var assignment = if (result.error_code == @intFromEnum(ErrorCode.none))
+                self.buildConsumerGroupHeartbeatAssignment(group_id, result.member_id) catch |err| blk: {
+                    log.warn("Failed to build ConsumerGroupHeartbeat assignment for {s}: {}", .{ group_id, err });
+                    break :blk null;
+                }
+            else
+                null;
+            defer if (assignment) |*owned| self.freeConsumerGroupHeartbeatAssignment(owned);
+
+            var resp = consumerGroupHeartbeatResponse(result.error_code, null, result.member_id, result.generation_id, consumer_group_heartbeat_interval_ms);
+            resp.assignment = assignment;
             return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
         }
 
@@ -10505,6 +10515,15 @@ pub const Broker = struct {
         }
 
         const error_code = self.groups.consumerGroupHeartbeat(group_id, member_id, instance_id, req.member_epoch);
+        var assignment = if (error_code == @intFromEnum(ErrorCode.none))
+            self.buildConsumerGroupHeartbeatAssignment(group_id, member_id) catch |err| blk: {
+                log.warn("Failed to build ConsumerGroupHeartbeat assignment for {s}: {}", .{ group_id, err });
+                break :blk null;
+            }
+        else
+            null;
+        defer if (assignment) |*owned| self.freeConsumerGroupHeartbeatAssignment(owned);
+
         const resp = Resp{
             .throttle_time_ms = 0,
             .error_code = error_code,
@@ -10512,7 +10531,7 @@ pub const Broker = struct {
             .member_id = req.member_id,
             .member_epoch = req.member_epoch,
             .heartbeat_interval_ms = if (error_code == @intFromEnum(ErrorCode.none)) consumer_group_heartbeat_interval_ms else 0,
-            .assignment = null,
+            .assignment = assignment,
         };
         return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
     }
@@ -10529,6 +10548,98 @@ pub const Broker = struct {
             .heartbeat_interval_ms = heartbeat_interval_ms,
             .assignment = null,
         };
+    }
+
+    fn memberSubscribedToTopic(member: *const ConsumerGroup.GroupMember, topic_name: []const u8) bool {
+        for (member.subscribed_topics.items) |subscribed| {
+            if (std.mem.eql(u8, subscribed, topic_name)) return true;
+        }
+        return false;
+    }
+
+    fn stringSliceLessThan(_: void, a: []const u8, b: []const u8) bool {
+        return std.mem.lessThan(u8, a, b);
+    }
+
+    fn buildConsumerGroupHeartbeatAssignment(
+        self: *Broker,
+        group_id: []const u8,
+        member_id: []const u8,
+    ) !?generated.consumer_group_heartbeat_response.ConsumerGroupHeartbeatResponse.Assignment {
+        const Resp = generated.consumer_group_heartbeat_response.ConsumerGroupHeartbeatResponse;
+        const TopicPartitions = generated.consumer_group_heartbeat_response.TopicPartitions;
+        const group = self.groups.groups.getPtr(group_id) orelse return null;
+        const member = group.members.getPtr(member_id) orelse return null;
+
+        var topic_partitions = std.array_list.Managed(TopicPartitions).init(self.allocator);
+        errdefer {
+            for (topic_partitions.items) |entry| {
+                if (entry.partitions.len > 0) self.allocator.free(entry.partitions);
+            }
+            topic_partitions.deinit();
+        }
+
+        for (member.subscribed_topics.items) |topic_name| {
+            const topic = self.topics.get(topic_name) orelse continue;
+            if (topic.num_partitions <= 0) continue;
+
+            var member_ids = std.array_list.Managed([]const u8).init(self.allocator);
+            defer member_ids.deinit();
+            var it = group.members.iterator();
+            while (it.next()) |entry| {
+                if (memberSubscribedToTopic(entry.value_ptr, topic_name)) {
+                    try member_ids.append(entry.key_ptr.*);
+                }
+            }
+            if (member_ids.items.len == 0) continue;
+            std.mem.sort([]const u8, member_ids.items, {}, stringSliceLessThan);
+
+            var member_index: ?usize = null;
+            for (member_ids.items, 0..) |candidate, index| {
+                if (std.mem.eql(u8, candidate, member_id)) {
+                    member_index = index;
+                    break;
+                }
+            }
+            const index = member_index orelse continue;
+
+            const member_count = std.math.cast(i32, member_ids.items.len) orelse return error.TooManyConsumerGroupMembers;
+            const partitions_per_member = @divTrunc(topic.num_partitions, member_count);
+            const extra = @rem(topic.num_partitions, member_count);
+            const index_i32: i32 = @intCast(index);
+            const start = index_i32 * partitions_per_member + @min(index_i32, extra);
+            const count = partitions_per_member + if (index_i32 < extra) @as(i32, 1) else 0;
+            if (count <= 0) continue;
+
+            const partitions = try self.allocator.alloc(i32, @intCast(count));
+            errdefer self.allocator.free(partitions);
+            var partition: i32 = start;
+            for (partitions) |*out| {
+                out.* = partition;
+                partition += 1;
+            }
+
+            try topic_partitions.append(.{
+                .topic_id = topic.topic_id,
+                .partitions = partitions,
+            });
+        }
+
+        if (topic_partitions.items.len == 0) {
+            return Resp.Assignment{ .topic_partitions = &.{} };
+        }
+
+        return Resp.Assignment{ .topic_partitions = try topic_partitions.toOwnedSlice() };
+    }
+
+    fn freeConsumerGroupHeartbeatAssignment(
+        self: *Broker,
+        assignment: *generated.consumer_group_heartbeat_response.ConsumerGroupHeartbeatResponse.Assignment,
+    ) void {
+        for (assignment.topic_partitions) |entry| {
+            if (entry.partitions.len > 0) self.allocator.free(entry.partitions);
+        }
+        if (assignment.topic_partitions.len > 0) self.allocator.free(assignment.topic_partitions);
     }
 
     fn consumerGroupHeartbeatSubscriptions(self: *Broker, subscribed_topic_names: ?[]const ?[]const u8) !?[]const []const u8 {
@@ -20652,6 +20763,15 @@ fn freeDeserializedConsumerGroupDescribeResponse(resp: *const generated.consumer
         if (group.members.len > 0) testing.allocator.free(group.members);
     }
     if (resp.groups.len > 0) testing.allocator.free(resp.groups);
+}
+
+fn freeDeserializedConsumerGroupHeartbeatResponse(resp: *const generated.consumer_group_heartbeat_response.ConsumerGroupHeartbeatResponse) void {
+    if (resp.assignment) |assignment| {
+        for (assignment.topic_partitions) |topic| {
+            if (topic.partitions.len > 0) testing.allocator.free(topic.partitions);
+        }
+        if (assignment.topic_partitions.len > 0) testing.allocator.free(assignment.topic_partitions);
+    }
 }
 
 fn freeDeserializedDescribeTopicPartitionsResponse(resp: *const generated.describe_topic_partitions_response.DescribeTopicPartitionsResponse) void {
@@ -36605,6 +36725,10 @@ test "Broker.handleRequest ConsumerGroupHeartbeat joins heartbeats and leaves gr
 
     var broker = Broker.init(testing.allocator, 1, 9092);
     defer broker.deinit();
+    broker.default_num_partitions = 3;
+    try testing.expect(broker.ensureTopic("topic-a"));
+    broker.default_num_partitions = 2;
+    try testing.expect(broker.ensureTopic("topic-b"));
 
     const topic_names = [_]?[]const u8{ "topic-a", "topic-b" };
     const req = Req{
@@ -36630,13 +36754,19 @@ test "Broker.handleRequest ConsumerGroupHeartbeat joins heartbeats and leaves gr
     try testing.expectEqual(@as(i32, 6800), response_header.correlation_id);
 
     const resp = try Resp.deserialize(testing.allocator, response.?, &rpos, 0);
+    defer freeDeserializedConsumerGroupHeartbeatResponse(&resp);
     try testing.expectEqual(response.?.len, rpos);
     try testing.expectEqual(@as(i32, 0), resp.throttle_time_ms);
     try testing.expectEqual(ErrorCode.none.toInt(), resp.error_code);
     try testing.expectEqualStrings("kip848-member", resp.member_id.?);
     try testing.expectEqual(@as(i32, 1), resp.member_epoch);
     try testing.expectEqual(@as(i32, 3000), resp.heartbeat_interval_ms);
-    try testing.expect(resp.assignment == null);
+    const assignment = resp.assignment orelse return error.ExpectedConsumerGroupHeartbeatAssignment;
+    try testing.expectEqual(@as(usize, 2), assignment.topic_partitions.len);
+    try testing.expectEqualSlices(u8, &broker.topics.get("topic-a").?.topic_id, &assignment.topic_partitions[0].topic_id);
+    try testing.expectEqualSlices(i32, &[_]i32{ 0, 1, 2 }, assignment.topic_partitions[0].partitions);
+    try testing.expectEqualSlices(u8, &broker.topics.get("topic-b").?.topic_id, &assignment.topic_partitions[1].topic_id);
+    try testing.expectEqualSlices(i32, &[_]i32{ 0, 1 }, assignment.topic_partitions[1].partitions);
 
     const group = broker.groups.groups.getPtr("kip848-group").?;
     try testing.expectEqual(ConsumerGroup.GroupState.preparing_rebalance, group.state);
@@ -36667,12 +36797,16 @@ test "Broker.handleRequest ConsumerGroupHeartbeat joins heartbeats and leaves gr
     try testing.expectEqual(@as(i32, 6802), hb_response_header.correlation_id);
 
     const hb_resp = try Resp.deserialize(testing.allocator, hb_response.?, &hb_rpos, 0);
+    defer freeDeserializedConsumerGroupHeartbeatResponse(&hb_resp);
     try testing.expectEqual(hb_response.?.len, hb_rpos);
     try testing.expectEqual(ErrorCode.none.toInt(), hb_resp.error_code);
     try testing.expectEqualStrings("kip848-member", hb_resp.member_id.?);
     try testing.expectEqual(@as(i32, 1), hb_resp.member_epoch);
     try testing.expectEqual(@as(i32, 3000), hb_resp.heartbeat_interval_ms);
-    try testing.expect(hb_resp.assignment == null);
+    const hb_assignment = hb_resp.assignment orelse return error.ExpectedConsumerGroupHeartbeatAssignment;
+    try testing.expectEqual(@as(usize, 2), hb_assignment.topic_partitions.len);
+    try testing.expectEqualSlices(i32, &[_]i32{ 0, 1, 2 }, hb_assignment.topic_partitions[0].partitions);
+    try testing.expectEqualSlices(i32, &[_]i32{ 0, 1 }, hb_assignment.topic_partitions[1].partitions);
 
     const stale_epoch_req = Req{
         .group_id = "kip848-group",
@@ -36695,6 +36829,7 @@ test "Broker.handleRequest ConsumerGroupHeartbeat joins heartbeats and leaves gr
     try testing.expectEqual(@as(i32, 6804), stale_response_header.correlation_id);
 
     const stale_resp = try Resp.deserialize(testing.allocator, stale_response.?, &stale_rpos, 0);
+    defer freeDeserializedConsumerGroupHeartbeatResponse(&stale_resp);
     try testing.expectEqual(stale_response.?.len, stale_rpos);
     try testing.expectEqual(ErrorCode.fenced_member_epoch.toInt(), stale_resp.error_code);
     try testing.expectEqualStrings("kip848-member", stale_resp.member_id.?);
@@ -36723,12 +36858,116 @@ test "Broker.handleRequest ConsumerGroupHeartbeat joins heartbeats and leaves gr
     try testing.expectEqual(@as(i32, 6803), leave_response_header.correlation_id);
 
     const leave_resp = try Resp.deserialize(testing.allocator, leave_response.?, &leave_rpos, 0);
+    defer freeDeserializedConsumerGroupHeartbeatResponse(&leave_resp);
     try testing.expectEqual(leave_response.?.len, leave_rpos);
     try testing.expectEqual(ErrorCode.none.toInt(), leave_resp.error_code);
     try testing.expectEqualStrings("kip848-member", leave_resp.member_id.?);
     try testing.expectEqual(@as(i32, -1), leave_resp.member_epoch);
     try testing.expectEqual(@as(usize, 0), group.members.count());
     try testing.expectEqual(ConsumerGroup.GroupState.empty, group.state);
+}
+
+test "Broker.handleRequest ConsumerGroupHeartbeat returns range assignments across members" {
+    const Req = generated.consumer_group_heartbeat_request.ConsumerGroupHeartbeatRequest;
+    const Resp = generated.consumer_group_heartbeat_response.ConsumerGroupHeartbeatResponse;
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+    broker.default_num_partitions = 4;
+    try testing.expect(broker.ensureTopic("range-topic"));
+    const topic_id = broker.topics.get("range-topic").?.topic_id;
+
+    const topic_names = [_]?[]const u8{"range-topic"};
+    const member_a_req = Req{
+        .group_id = "range-group",
+        .member_id = "member-a",
+        .member_epoch = 0,
+        .rebalance_timeout_ms = 30_000,
+        .subscribed_topic_names = &topic_names,
+        .server_assignor = "range",
+    };
+
+    var a_buf: [256]u8 = undefined;
+    var a_pos = buildTestRequest(&a_buf, 68, 0, 6810, header_mod.requestHeaderVersion(68, 0));
+    member_a_req.serialize(&a_buf, &a_pos, 0);
+
+    const a_response = broker.handleRequest(a_buf[0..a_pos]);
+    try testing.expect(a_response != null);
+    defer testing.allocator.free(a_response.?);
+
+    var a_rpos: usize = 0;
+    var a_response_header = try ResponseHeader.deserialize(testing.allocator, a_response.?, &a_rpos, header_mod.responseHeaderVersion(68, 0));
+    defer a_response_header.deinit(testing.allocator);
+    try testing.expectEqual(@as(i32, 6810), a_response_header.correlation_id);
+
+    const a_resp = try Resp.deserialize(testing.allocator, a_response.?, &a_rpos, 0);
+    defer freeDeserializedConsumerGroupHeartbeatResponse(&a_resp);
+    try testing.expectEqual(a_response.?.len, a_rpos);
+    try testing.expectEqual(ErrorCode.none.toInt(), a_resp.error_code);
+    const a_initial_assignment = a_resp.assignment orelse return error.ExpectedConsumerGroupHeartbeatAssignment;
+    try testing.expectEqual(@as(usize, 1), a_initial_assignment.topic_partitions.len);
+    try testing.expectEqualSlices(u8, &topic_id, &a_initial_assignment.topic_partitions[0].topic_id);
+    try testing.expectEqualSlices(i32, &[_]i32{ 0, 1, 2, 3 }, a_initial_assignment.topic_partitions[0].partitions);
+
+    const member_b_req = Req{
+        .group_id = "range-group",
+        .member_id = "member-b",
+        .member_epoch = 0,
+        .rebalance_timeout_ms = 30_000,
+        .subscribed_topic_names = &topic_names,
+        .server_assignor = "range",
+    };
+
+    var b_buf: [256]u8 = undefined;
+    var b_pos = buildTestRequest(&b_buf, 68, 0, 6811, header_mod.requestHeaderVersion(68, 0));
+    member_b_req.serialize(&b_buf, &b_pos, 0);
+
+    const b_response = broker.handleRequest(b_buf[0..b_pos]);
+    try testing.expect(b_response != null);
+    defer testing.allocator.free(b_response.?);
+
+    var b_rpos: usize = 0;
+    var b_response_header = try ResponseHeader.deserialize(testing.allocator, b_response.?, &b_rpos, header_mod.responseHeaderVersion(68, 0));
+    defer b_response_header.deinit(testing.allocator);
+    try testing.expectEqual(@as(i32, 6811), b_response_header.correlation_id);
+
+    const b_resp = try Resp.deserialize(testing.allocator, b_response.?, &b_rpos, 0);
+    defer freeDeserializedConsumerGroupHeartbeatResponse(&b_resp);
+    try testing.expectEqual(b_response.?.len, b_rpos);
+    try testing.expectEqual(ErrorCode.none.toInt(), b_resp.error_code);
+    const b_assignment = b_resp.assignment orelse return error.ExpectedConsumerGroupHeartbeatAssignment;
+    try testing.expectEqual(@as(usize, 1), b_assignment.topic_partitions.len);
+    try testing.expectEqualSlices(u8, &topic_id, &b_assignment.topic_partitions[0].topic_id);
+    try testing.expectEqualSlices(i32, &[_]i32{ 2, 3 }, b_assignment.topic_partitions[0].partitions);
+
+    const member_a_heartbeat_req = Req{
+        .group_id = "range-group",
+        .member_id = a_resp.member_id,
+        .member_epoch = a_resp.member_epoch,
+        .rebalance_timeout_ms = -1,
+    };
+
+    var hb_buf: [256]u8 = undefined;
+    var hb_pos = buildTestRequest(&hb_buf, 68, 0, 6812, header_mod.requestHeaderVersion(68, 0));
+    member_a_heartbeat_req.serialize(&hb_buf, &hb_pos, 0);
+
+    const hb_response = broker.handleRequest(hb_buf[0..hb_pos]);
+    try testing.expect(hb_response != null);
+    defer testing.allocator.free(hb_response.?);
+
+    var hb_rpos: usize = 0;
+    var hb_response_header = try ResponseHeader.deserialize(testing.allocator, hb_response.?, &hb_rpos, header_mod.responseHeaderVersion(68, 0));
+    defer hb_response_header.deinit(testing.allocator);
+    try testing.expectEqual(@as(i32, 6812), hb_response_header.correlation_id);
+
+    const hb_resp = try Resp.deserialize(testing.allocator, hb_response.?, &hb_rpos, 0);
+    defer freeDeserializedConsumerGroupHeartbeatResponse(&hb_resp);
+    try testing.expectEqual(hb_response.?.len, hb_rpos);
+    try testing.expectEqual(ErrorCode.none.toInt(), hb_resp.error_code);
+    const hb_assignment = hb_resp.assignment orelse return error.ExpectedConsumerGroupHeartbeatAssignment;
+    try testing.expectEqual(@as(usize, 1), hb_assignment.topic_partitions.len);
+    try testing.expectEqualSlices(u8, &topic_id, &hb_assignment.topic_partitions[0].topic_id);
+    try testing.expectEqualSlices(i32, &[_]i32{ 0, 1 }, hb_assignment.topic_partitions[0].partitions);
 }
 
 test "Broker.handleRequest ConsumerGroupHeartbeat uses KIP-848 static fencing error" {
@@ -36761,6 +37000,7 @@ test "Broker.handleRequest ConsumerGroupHeartbeat uses KIP-848 static fencing er
     try testing.expectEqual(@as(i32, 6805), response_header.correlation_id);
 
     const resp = try Resp.deserialize(testing.allocator, response.?, &rpos, 0);
+    defer freeDeserializedConsumerGroupHeartbeatResponse(&resp);
     try testing.expectEqual(response.?.len, rpos);
     try testing.expectEqual(ErrorCode.unreleased_instance_id.toInt(), resp.error_code);
     try testing.expectEqualStrings("kip848-static-member", resp.member_id.?);
@@ -36789,6 +37029,7 @@ test "Broker.handleRequest ConsumerGroupHeartbeat rejects malformed request" {
     try testing.expectEqual(@as(i32, 6801), response_header.correlation_id);
 
     const resp = try Resp.deserialize(testing.allocator, response.?, &rpos, 0);
+    defer freeDeserializedConsumerGroupHeartbeatResponse(&resp);
     try testing.expectEqual(response.?.len, rpos);
     try testing.expectEqual(ErrorCode.invalid_request.toInt(), resp.error_code);
 }
