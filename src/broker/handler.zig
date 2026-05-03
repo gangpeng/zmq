@@ -22396,6 +22396,89 @@ test "Broker.handleRequest Produce v11 maps abortable transaction state" {
     try testing.expectEqual(TxnCoordinator.TxnStatus.prepare_abort, broker.txn_coordinator.getStatus(init_result.producer_id).?);
 }
 
+test "Broker.handleRequest Produce validates transactional partition registration" {
+    const Req = generated.produce_request.ProduceRequest;
+    const Topic = Req.TopicProduceData;
+    const Partition = Topic.PartitionProduceData;
+    const Resp = generated.produce_response.ProduceResponse;
+    const rec_batch = protocol.record_batch;
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+    try testing.expect(broker.ensureTopic("produce-txn-registration-topic"));
+    broker.topics.getPtr("produce-txn-registration-topic").?.num_partitions = 2;
+    try broker.store.ensurePartition("produce-txn-registration-topic", 1);
+
+    const init_result = try broker.txn_coordinator.initProducerId("produce-txn-registration");
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.none)), try broker.txn_coordinator.addPartitionsToTxn(
+        init_result.producer_id,
+        init_result.producer_epoch,
+        "produce-txn-registration-topic",
+        0,
+    ));
+
+    const records = [_]rec_batch.Record{.{
+        .offset_delta = 0,
+        .value = "registered-produce-value",
+    }};
+    const batch = try rec_batch.buildRecordBatch(
+        testing.allocator,
+        0,
+        &records,
+        init_result.producer_id,
+        init_result.producer_epoch,
+        0,
+        12345,
+        12345,
+        0,
+    );
+    defer testing.allocator.free(batch);
+
+    const partitions = [_]Partition{
+        .{
+            .index = 0,
+            .records = batch,
+        },
+        .{
+            .index = 1,
+            .records = batch,
+        },
+    };
+    const topics = [_]Topic{.{
+        .name = "produce-txn-registration-topic",
+        .partition_data = &partitions,
+    }};
+    const req = Req{
+        .transactional_id = "produce-txn-registration",
+        .acks = 1,
+        .timeout_ms = 30000,
+        .topic_data = &topics,
+    };
+
+    var buf: [4096]u8 = undefined;
+    var pos = buildTestRequest(&buf, 0, 11, 315, header_mod.requestHeaderVersion(0, 11));
+    req.serialize(&buf, &pos, 11);
+
+    const response = broker.handleRequest(buf[0..pos]);
+    try testing.expect(response != null);
+    defer testing.allocator.free(response.?);
+
+    var rpos: usize = 0;
+    var response_header = try ResponseHeader.deserialize(testing.allocator, response.?, &rpos, header_mod.responseHeaderVersion(0, 11));
+    defer response_header.deinit(testing.allocator);
+    try testing.expectEqual(@as(i32, 315), response_header.correlation_id);
+
+    const resp = try Resp.deserialize(testing.allocator, response.?, &rpos, 11);
+    defer freeDeserializedProduceResponse(&resp);
+    try testing.expectEqual(response.?.len, rpos);
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.none)), resp.responses[0].partition_responses[0].error_code);
+    try testing.expectEqual(@as(i64, 0), resp.responses[0].partition_responses[0].base_offset);
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.invalid_txn_state)), resp.responses[0].partition_responses[1].error_code);
+    try testing.expectEqual(@as(i64, -1), resp.responses[0].partition_responses[1].base_offset);
+    try testing.expectEqual(@as(u64, 1), broker.partitionState("produce-txn-registration-topic", 0).?.next_offset);
+    try testing.expectEqual(@as(u64, 0), broker.partitionState("produce-txn-registration-topic", 1).?.next_offset);
+}
+
 test "Broker.handleRequest Produce v9 uses exact topic ACL extraction" {
     const Req = generated.produce_request.ProduceRequest;
     const Topic = Req.TopicProduceData;
