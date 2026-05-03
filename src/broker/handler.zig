@@ -9334,11 +9334,7 @@ pub const Broker = struct {
         if (generation_id < 0 and resolved_member_id.len == 0 and resolved_instance_id == null) {
             return ErrorCode.none;
         }
-
-        const group = self.groups.groups.getPtr(group_id) orelse {
-            if (api_version >= 9) return ErrorCode.group_id_not_found;
-            return ErrorCode.unknown_member_id;
-        };
+        const group = self.groups.groups.getPtr(group_id) orelse return ErrorCode.unknown_member_id;
         const member = group.members.getPtr(resolved_member_id) orelse return ErrorCode.unknown_member_id;
         if (resolved_instance_id) |instance_id| {
             if (member.group_instance_id) |existing_instance_id| {
@@ -39413,6 +39409,61 @@ test "Broker.handleRequest OffsetCommit v9 maps stale KIP-848 member epoch" {
     try testing.expectEqual(response.?.len, rpos);
     try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.fenced_member_epoch)), resp.topics[0].partitions[0].error_code);
     try testing.expect((try broker.groups.fetchOffset("oc-kip848-group", "oc-kip848-topic", 0)) == null);
+}
+
+test "Broker.handleRequest OffsetCommit v9 maps missing KIP-848 member group to unknown member" {
+    const Req = generated.offset_commit_request.OffsetCommitRequest;
+    const Resp = generated.offset_commit_response.OffsetCommitResponse;
+    const Topic = Req.OffsetCommitRequestTopic;
+    const Partition = Topic.OffsetCommitRequestPartition;
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+    try testing.expect(broker.ensureTopic("oc-kip848-missing-topic"));
+
+    const partitions = [_]Partition{.{
+        .partition_index = 0,
+        .committed_offset = 202,
+        .committed_leader_epoch = -1,
+        .committed_metadata = "missing-member-group",
+    }};
+    const topics = [_]Topic{.{
+        .name = "oc-kip848-missing-topic",
+        .partitions = &partitions,
+    }};
+    const req = Req{
+        .group_id = "oc-kip848-missing-group",
+        .generation_id_or_member_epoch = 1,
+        .member_id = "missing-kip848-member",
+        .group_instance_id = null,
+        .topics = &topics,
+    };
+
+    var buf: [512]u8 = undefined;
+    var pos = buildTestRequest(&buf, 8, 9, 849, header_mod.requestHeaderVersion(8, 9));
+    req.serialize(&buf, &pos, 9);
+
+    const response = broker.handleRequest(buf[0..pos]);
+    try testing.expect(response != null);
+    defer testing.allocator.free(response.?);
+
+    var rpos: usize = 0;
+    var response_header = try ResponseHeader.deserialize(testing.allocator, response.?, &rpos, header_mod.responseHeaderVersion(8, 9));
+    defer response_header.deinit(testing.allocator);
+    try testing.expectEqual(@as(i32, 849), response_header.correlation_id);
+
+    const resp = try Resp.deserialize(testing.allocator, response.?, &rpos, 9);
+    defer {
+        for (resp.topics) |topic| {
+            if (topic.partitions.len > 0) testing.allocator.free(topic.partitions);
+        }
+        if (resp.topics.len > 0) testing.allocator.free(resp.topics);
+    }
+    try testing.expectEqual(response.?.len, rpos);
+    try testing.expectEqual(@as(usize, 1), resp.topics.len);
+    try testing.expectEqual(@as(usize, 1), resp.topics[0].partitions.len);
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.unknown_member_id)), resp.topics[0].partitions[0].error_code);
+    try testing.expect((try broker.groups.fetchOffset("oc-kip848-missing-group", "oc-kip848-missing-topic", 0)) == null);
 }
 
 test "Broker.handleRequest OffsetCommit rejects oversized metadata" {
