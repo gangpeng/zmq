@@ -72,6 +72,10 @@ gaps. Each item should land as a small, verified tranche with tests and a commit
 | P2 | Observability gates | Metrics, structured logs, readiness/liveness, dashboards, and alertable SLOs match the documented operational contract. | In progress. Metrics and JSON logging exist; `/health` and `/ready` now share a deterministic routing/response contract across plain and TLS metrics transports, including exact-path matching plus startup and shutdown readiness transitions in the default Zig suite. Prometheus export now escapes HELP text and label values, rejects invalid labeled-metric arity, and uses canonical label-set keys in registry tests. Broker metric registration is audited against the advertised broker API metric catalog and includes produce/fetch throttle counters so request metrics are not silently dropped. Client-metrics APIs now expose a default resource, retain accepted uncompressed telemetry samples by client instance, drop samples on terminating pushes, list active client resources, and cover unknown subscription, unsupported compression, and oversized metric rejections. Dashboards, broader metric-name compatibility, telemetry export, and alertable SLO gates remain. |
 | P2 | Performance and client matrix gates | Repeatable benchmarks and Java/librdkafka/Go/Python/Kafka CLI compatibility suites pass across supported versions. | Started. A gated external-client matrix step exists for kcat, Kafka CLI, kafka-python, and confluent-kafka metadata/API probes; broader Java/Go/versioned client suites remain. |
 
+Latest default-suite share data-plane tranche: ShareFetch acquisition failures
+and ShareAcknowledge acknowledgement failures now roll back both local share
+session epochs and share-state visibility when persistence fails.
+
 ## Capability Matrix
 
 | Area | Current status | Required to call complete |
@@ -201,8 +205,9 @@ Status: completed for the initial catalog and DeleteGroups slice.
   validate local share sessions, fetch records from the partition store, return
   acquired-record ranges, validate acknowledgement batches, advance local share
   start offsets, clear sessions on share-member leave/group delete, restore
-  share session epochs across local broker restart, and roll back session
-  changes, including DeleteGroups cleanup, when local session persistence fails.
+  share session epochs across local broker restart, and roll back session plus
+  share-state mutation changes, including DeleteGroups cleanup, when local
+  persistence fails.
   InitializeShareGroupState, ReadShareGroupState, WriteShareGroupState,
   DeleteShareGroupState, and ReadShareGroupStateSummary remain non-advertised
   until share coordinator durability exists, but direct v0 probes now validate
