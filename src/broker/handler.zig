@@ -8320,12 +8320,6 @@ pub const Broker = struct {
         };
         defer self.freeProduceRequest(&req);
 
-        // acks=-1 semantics — in single-node mode, self is the only ISR member,
-        // so acks=-1 (all replicas) behaves identically to acks=1.
-        if (req.acks == -1 and self.default_replication_factor > 1) {
-            log.warn("acks=-1 with replication_factor={d}: single-node mode treats as acks=1", .{self.default_replication_factor});
-        }
-
         var responses: []TopicResult = &.{};
         if (req.topic_data.len > 0) {
             responses = self.allocator.alloc(TopicResult, req.topic_data.len) catch return null;
@@ -8339,7 +8333,7 @@ pub const Broker = struct {
         var object_metadata_dirty = false;
         var partition_state_dirty = false;
         for (req.topic_data) |topic_req| {
-            responses[responses_init] = self.buildProduceTopicResponse(api_version, req.transactional_id, topic_req, &object_metadata_dirty, &partition_state_dirty) catch return null;
+            responses[responses_init] = self.buildProduceTopicResponse(api_version, req.acks, req.transactional_id, topic_req, &object_metadata_dirty, &partition_state_dirty) catch return null;
             responses_init += 1;
         }
 
@@ -8385,7 +8379,7 @@ pub const Broker = struct {
         }
     }
 
-    fn buildProduceTopicResponse(self: *Broker, api_version: i16, transactional_id: ?[]const u8, topic_req: generated.produce_request.ProduceRequest.TopicProduceData, object_metadata_dirty: *bool, partition_state_dirty: *bool) !generated.produce_response.ProduceResponse.TopicProduceResponse {
+    fn buildProduceTopicResponse(self: *Broker, api_version: i16, required_acks: i16, transactional_id: ?[]const u8, topic_req: generated.produce_request.ProduceRequest.TopicProduceData, object_metadata_dirty: *bool, partition_state_dirty: *bool) !generated.produce_response.ProduceResponse.TopicProduceResponse {
         const Resp = generated.produce_response.ProduceResponse;
         const PartitionResult = Resp.TopicProduceResponse.PartitionProduceResponse;
 
@@ -8397,7 +8391,7 @@ pub const Broker = struct {
 
         const topic_name = topic_req.name orelse "";
         for (topic_req.partition_data, 0..) |partition_req, partition_index| {
-            partitions[partition_index] = self.buildProducePartitionResponse(api_version, transactional_id, topic_name, partition_req, object_metadata_dirty, partition_state_dirty);
+            partitions[partition_index] = self.buildProducePartitionResponse(api_version, required_acks, transactional_id, topic_name, partition_req, object_metadata_dirty, partition_state_dirty);
         }
 
         return .{
@@ -8406,7 +8400,7 @@ pub const Broker = struct {
         };
     }
 
-    fn buildProducePartitionResponse(self: *Broker, api_version: i16, transactional_id: ?[]const u8, topic_name: []const u8, partition_req: generated.produce_request.ProduceRequest.TopicProduceData.PartitionProduceData, object_metadata_dirty: *bool, partition_state_dirty: *bool) generated.produce_response.ProduceResponse.TopicProduceResponse.PartitionProduceResponse {
+    fn buildProducePartitionResponse(self: *Broker, api_version: i16, required_acks: i16, transactional_id: ?[]const u8, topic_name: []const u8, partition_req: generated.produce_request.ProduceRequest.TopicProduceData.PartitionProduceData, object_metadata_dirty: *bool, partition_state_dirty: *bool) generated.produce_response.ProduceResponse.TopicProduceResponse.PartitionProduceResponse {
         // Idempotent producer dedup + CRC validation
         var is_duplicate = false;
         var crc_valid = true;
@@ -8497,10 +8491,12 @@ pub const Broker = struct {
             };
         }
 
+        const required_acks_error_code = self.requiredAcksProduceError(topic_name, required_acks);
+
         // Actually produce (skip if duplicate or CRC invalid)
         var was_wal_fenced = false;
         var was_storage_error = false;
-        const produce_result = if (is_duplicate or !crc_valid or transaction_error_code != @intFromEnum(ErrorCode.none) or sequence_error_code != @intFromEnum(ErrorCode.none))
+        const produce_result = if (is_duplicate or !crc_valid or required_acks_error_code != @intFromEnum(ErrorCode.none) or transaction_error_code != @intFromEnum(ErrorCode.none) or sequence_error_code != @intFromEnum(ErrorCode.none))
             null
         else if (partition_req.records) |rec|
             self.store.produce(topic_name, partition_req.index, rec) catch |err| blk: {
@@ -8527,7 +8523,9 @@ pub const Broker = struct {
         }
 
         // Detect MessageTooLarge specifically for proper error code
-        const produce_error_code: i16 = if (transaction_error_code != @intFromEnum(ErrorCode.none))
+        const produce_error_code: i16 = if (required_acks_error_code != @intFromEnum(ErrorCode.none))
+            required_acks_error_code
+        else if (transaction_error_code != @intFromEnum(ErrorCode.none))
             transaction_error_code
         else if (is_duplicate)
             @intFromEnum(ErrorCode.none) // idempotent success
@@ -8586,6 +8584,22 @@ pub const Broker = struct {
             .record_errors = &.{},
             .error_message = null,
         };
+    }
+
+    fn requiredAcksProduceError(self: *const Broker, topic_name: []const u8, required_acks: i16) i16 {
+        if (required_acks != -1 and required_acks != 0 and required_acks != 1) {
+            return @intFromEnum(ErrorCode.invalid_required_acks);
+        }
+
+        if (required_acks != -1) return @intFromEnum(ErrorCode.none);
+
+        const topic_info = self.topics.get(topic_name) orelse return @intFromEnum(ErrorCode.unknown_topic_or_partition);
+        const local_isr_count: i32 = 1;
+        if (topic_info.config.min_insync_replicas > local_isr_count) {
+            return @intFromEnum(ErrorCode.not_enough_replicas);
+        }
+
+        return @intFromEnum(ErrorCode.none);
     }
 
     fn validateTransactionalProduceState(self: *Broker, api_version: i16, transactional_id: ?[]const u8, producer_id: i64, producer_epoch: i16, topic: []const u8, partition: i32) i16 {
@@ -22307,6 +22321,89 @@ test "Broker.handleRequest Produce v9 returns generated flexible response" {
     try testing.expectEqualStrings("produce-v9-topic", resp.responses[0].name.?);
     try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.none)), resp.responses[0].partition_responses[0].error_code);
     try testing.expectEqual(@as(i32, 0), resp.throttle_time_ms);
+}
+
+test "Broker.handleRequest Produce enforces required acks before append" {
+    const Req = generated.produce_request.ProduceRequest;
+    const Topic = Req.TopicProduceData;
+    const Partition = Topic.PartitionProduceData;
+    const Resp = generated.produce_response.ProduceResponse;
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+
+    try testing.expect(broker.ensureTopic("produce-min-isr-topic"));
+    broker.topics.getPtr("produce-min-isr-topic").?.config.min_insync_replicas = 2;
+
+    const min_isr_partitions = [_]Partition{.{
+        .index = 0,
+        .records = "min-isr-records",
+    }};
+    const min_isr_topics = [_]Topic{.{
+        .name = "produce-min-isr-topic",
+        .partition_data = &min_isr_partitions,
+    }};
+    const min_isr_req = Req{
+        .transactional_id = null,
+        .acks = -1,
+        .timeout_ms = 30000,
+        .topic_data = &min_isr_topics,
+    };
+
+    var min_isr_buf: [512]u8 = undefined;
+    var min_isr_pos = buildTestRequest(&min_isr_buf, 0, 9, 318, header_mod.requestHeaderVersion(0, 9));
+    min_isr_req.serialize(&min_isr_buf, &min_isr_pos, 9);
+
+    const min_isr_response = broker.handleRequest(min_isr_buf[0..min_isr_pos]);
+    try testing.expect(min_isr_response != null);
+    defer testing.allocator.free(min_isr_response.?);
+
+    var min_isr_rpos: usize = 0;
+    var min_isr_header = try ResponseHeader.deserialize(testing.allocator, min_isr_response.?, &min_isr_rpos, header_mod.responseHeaderVersion(0, 9));
+    defer min_isr_header.deinit(testing.allocator);
+    try testing.expectEqual(@as(i32, 318), min_isr_header.correlation_id);
+
+    const min_isr_resp = try Resp.deserialize(testing.allocator, min_isr_response.?, &min_isr_rpos, 9);
+    defer freeDeserializedProduceResponse(&min_isr_resp);
+    try testing.expectEqual(min_isr_response.?.len, min_isr_rpos);
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.not_enough_replicas)), min_isr_resp.responses[0].partition_responses[0].error_code);
+    try testing.expectEqual(@as(i64, -1), min_isr_resp.responses[0].partition_responses[0].base_offset);
+    try testing.expectEqual(@as(u64, 0), broker.partitionState("produce-min-isr-topic", 0).?.next_offset);
+
+    const invalid_acks_partitions = [_]Partition{.{
+        .index = 0,
+        .records = "invalid-acks-records",
+    }};
+    const invalid_acks_topics = [_]Topic{.{
+        .name = "produce-invalid-acks-topic",
+        .partition_data = &invalid_acks_partitions,
+    }};
+    const invalid_acks_req = Req{
+        .transactional_id = null,
+        .acks = 2,
+        .timeout_ms = 30000,
+        .topic_data = &invalid_acks_topics,
+    };
+
+    var invalid_acks_buf: [512]u8 = undefined;
+    var invalid_acks_pos = buildTestRequest(&invalid_acks_buf, 0, 9, 319, header_mod.requestHeaderVersion(0, 9));
+    invalid_acks_req.serialize(&invalid_acks_buf, &invalid_acks_pos, 9);
+
+    const invalid_acks_response = broker.handleRequest(invalid_acks_buf[0..invalid_acks_pos]);
+    try testing.expect(invalid_acks_response != null);
+    defer testing.allocator.free(invalid_acks_response.?);
+
+    var invalid_acks_rpos: usize = 0;
+    var invalid_acks_header = try ResponseHeader.deserialize(testing.allocator, invalid_acks_response.?, &invalid_acks_rpos, header_mod.responseHeaderVersion(0, 9));
+    defer invalid_acks_header.deinit(testing.allocator);
+    try testing.expectEqual(@as(i32, 319), invalid_acks_header.correlation_id);
+
+    const invalid_acks_resp = try Resp.deserialize(testing.allocator, invalid_acks_response.?, &invalid_acks_rpos, 9);
+    defer freeDeserializedProduceResponse(&invalid_acks_resp);
+    try testing.expectEqual(invalid_acks_response.?.len, invalid_acks_rpos);
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.invalid_required_acks)), invalid_acks_resp.responses[0].partition_responses[0].error_code);
+    try testing.expectEqual(@as(i64, -1), invalid_acks_resp.responses[0].partition_responses[0].base_offset);
+    try testing.expectEqual(@as(u64, 0), broker.partitionState("produce-invalid-acks-topic", 0).?.next_offset);
 }
 
 test "Broker.handleRequest Produce v11 maps abortable transaction state" {
