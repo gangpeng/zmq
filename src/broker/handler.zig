@@ -24256,6 +24256,62 @@ test "Broker.handleRequest TxnOffsetCommit v3 returns generated response and com
     try testing.expectEqual(@as(?i64, 123), try broker.groups.fetchOffset("txn-offset-group", "txn-offset-topic", 0));
 }
 
+test "Broker.handleRequest TxnOffsetCommit rejects empty group id" {
+    const Req = generated.txn_offset_commit_request.TxnOffsetCommitRequest;
+    const Resp = generated.txn_offset_commit_response.TxnOffsetCommitResponse;
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+
+    const partitions = [_]Req.TxnOffsetCommitRequestTopic.TxnOffsetCommitRequestPartition{.{
+        .partition_index = 0,
+        .committed_offset = 124,
+        .committed_leader_epoch = -1,
+        .committed_metadata = "empty-group",
+    }};
+    const topics = [_]Req.TxnOffsetCommitRequestTopic{.{
+        .name = "txn-offset-empty-group-topic",
+        .partitions = &partitions,
+    }};
+    const req = Req{
+        .transactional_id = "txn-empty-group-id",
+        .group_id = "",
+        .producer_id = 1,
+        .producer_epoch = 0,
+        .generation_id = -1,
+        .member_id = "",
+        .group_instance_id = null,
+        .topics = &topics,
+    };
+
+    var buf: [512]u8 = undefined;
+    var pos = buildTestRequest(&buf, 28, 3, 2807, header_mod.requestHeaderVersion(28, 3));
+    req.serialize(&buf, &pos, 3);
+
+    const response = broker.handleRequest(buf[0..pos]);
+    try testing.expect(response != null);
+    defer testing.allocator.free(response.?);
+
+    var rpos: usize = 0;
+    var response_header = try ResponseHeader.deserialize(testing.allocator, response.?, &rpos, header_mod.responseHeaderVersion(28, 3));
+    defer response_header.deinit(testing.allocator);
+    try testing.expectEqual(@as(i32, 2807), response_header.correlation_id);
+
+    const resp = try Resp.deserialize(testing.allocator, response.?, &rpos, 3);
+    defer {
+        for (resp.topics) |topic| {
+            if (topic.partitions.len > 0) testing.allocator.free(topic.partitions);
+        }
+        if (resp.topics.len > 0) testing.allocator.free(resp.topics);
+    }
+
+    try testing.expectEqual(response.?.len, rpos);
+    try testing.expectEqual(@as(usize, 1), resp.topics.len);
+    try testing.expectEqual(@as(usize, 1), resp.topics[0].partitions.len);
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.invalid_group_id)), resp.topics[0].partitions[0].error_code);
+    try testing.expectEqual(@as(?i64, null), try broker.groups.fetchOffset("", "txn-offset-empty-group-topic", 0));
+}
+
 test "Broker.handleRequest TxnOffsetCommit rejects unknown topic partitions without committing offsets" {
     const Req = generated.txn_offset_commit_request.TxnOffsetCommitRequest;
     const Resp = generated.txn_offset_commit_response.TxnOffsetCommitResponse;
