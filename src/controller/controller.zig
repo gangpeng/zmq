@@ -715,11 +715,16 @@ pub const Controller = struct {
         producer_id_allocation = 2,
         full_snapshot = 3,
         broker_unregistration = 4,
+        full_snapshot_v2 = 5,
     };
 
     fn controllerBytesFieldSize(bytes: []const u8) !usize {
         if (bytes.len > std.math.maxInt(u32)) return error.RecordTooLarge;
         return 4 + bytes.len;
+    }
+
+    fn controllerOptionalBytesFieldSize(bytes: ?[]const u8) !usize {
+        return try checkedAddSize(1, if (bytes) |value| try controllerBytesFieldSize(value) else 0);
     }
 
     fn checkedAddSize(a: usize, b: usize) !usize {
@@ -734,7 +739,8 @@ pub const Controller = struct {
     fn isControllerFullSnapshotRecord(data: []const u8) bool {
         return isControllerMetadataRecord(data) and
             data.len > controller_metadata_record_magic.len and
-            data[controller_metadata_record_magic.len] == @intFromEnum(ControllerMetadataRecordKind.full_snapshot);
+            (data[controller_metadata_record_magic.len] == @intFromEnum(ControllerMetadataRecordKind.full_snapshot) or
+                data[controller_metadata_record_magic.len] == @intFromEnum(ControllerMetadataRecordKind.full_snapshot_v2));
     }
 
     fn controllerRecordKindFromByte(byte: u8) !ControllerMetadataRecordKind {
@@ -743,15 +749,22 @@ pub const Controller = struct {
             2 => .producer_id_allocation,
             3 => .full_snapshot,
             4 => .broker_unregistration,
+            5 => .full_snapshot_v2,
             else => error.InvalidAutoMqMetadataRecord,
         };
     }
 
     fn buildBrokerRegistrationRecord(self: *Controller, broker_id: i32, host: []const u8, port: u16, broker_epoch: i64) ![]u8 {
+        return self.buildBrokerRegistrationRecordWithRack(broker_id, host, port, null, broker_epoch);
+    }
+
+    fn buildBrokerRegistrationRecordWithRack(self: *Controller, broker_id: i32, host: []const u8, port: u16, rack: ?[]const u8, broker_epoch: i64) ![]u8 {
         const host_size = try controllerBytesFieldSize(host);
+        const rack_size = try controllerOptionalBytesFieldSize(rack);
         var total_len = try checkedAddSize(controller_metadata_record_magic.len, 1);
         total_len = try checkedAddSize(total_len, 4 + 8 + 4 + 1);
         total_len = try checkedAddSize(total_len, host_size);
+        total_len = try checkedAddSize(total_len, rack_size);
 
         const buf = try self.allocator.alloc(u8, total_len);
         var pos: usize = 0;
@@ -764,6 +777,7 @@ pub const Controller = struct {
         writeRecordI32(buf, &pos, @intCast(port));
         writeRecordBool(buf, &pos, true);
         try writeRecordBytes(buf, &pos, host);
+        try writeRecordOptionalBytes(buf, &pos, rack);
         std.debug.assert(pos == buf.len);
         return buf;
     }
@@ -792,13 +806,14 @@ pub const Controller = struct {
         while (it.next()) |entry| {
             total_len = try checkedAddSize(total_len, 4 + 8 + 4 + 1);
             total_len = try checkedAddSize(total_len, try controllerBytesFieldSize(entry.value_ptr.host));
+            total_len = try checkedAddSize(total_len, try controllerOptionalBytesFieldSize(entry.value_ptr.rack));
         }
 
         const buf = try self.allocator.alloc(u8, total_len);
         var pos: usize = 0;
         @memcpy(buf[pos .. pos + controller_metadata_record_magic.len], controller_metadata_record_magic);
         pos += controller_metadata_record_magic.len;
-        buf[pos] = @intFromEnum(ControllerMetadataRecordKind.full_snapshot);
+        buf[pos] = @intFromEnum(ControllerMetadataRecordKind.full_snapshot_v2);
         pos += 1;
         writeRecordI64(buf, &pos, self.next_producer_id);
         writeRecordI64(buf, &pos, self.broker_registry.next_broker_epoch);
@@ -812,6 +827,7 @@ pub const Controller = struct {
             writeRecordI32(buf, &pos, @intCast(broker.port));
             writeRecordBool(buf, &pos, broker.fenced);
             try writeRecordBytes(buf, &pos, broker.host);
+            try writeRecordOptionalBytes(buf, &pos, broker.rack);
         }
         std.debug.assert(pos == buf.len);
         return buf;
@@ -849,13 +865,15 @@ pub const Controller = struct {
         const port_raw = try readRecordI32(data, pos);
         const fenced = try readRecordBool(data, pos);
         const host = try readRecordBytes(data, pos);
+        const rack = if (pos.* < data.len) try readRecordOptionalBytes(data, pos) else null;
         if (pos.* != data.len) return error.InvalidAutoMqMetadataRecord;
         if (port_raw < 0 or port_raw > std.math.maxInt(u16)) return error.InvalidAutoMqMetadataRecord;
 
-        try self.broker_registry.registerWithEpoch(
+        try self.broker_registry.registerWithEpochAndRack(
             broker_id,
             host,
             @intCast(port_raw),
+            rack,
             broker_epoch,
             fenced,
         );
@@ -874,7 +892,7 @@ pub const Controller = struct {
         self.next_producer_id = @max(self.next_producer_id, next_producer_id);
     }
 
-    fn applyControllerFullSnapshotRecord(self: *Controller, data: []const u8, pos: *usize) !void {
+    fn applyControllerFullSnapshotRecord(self: *Controller, data: []const u8, pos: *usize, has_rack_metadata: bool) !void {
         const next_producer_id = try readRecordI64(data, pos);
         const next_broker_epoch = try readRecordI64(data, pos);
         const broker_count = try readRecordU32(data, pos);
@@ -890,6 +908,7 @@ pub const Controller = struct {
             if (port_raw < 0 or port_raw > std.math.maxInt(u16)) return error.InvalidAutoMqMetadataRecord;
             _ = try readRecordBool(data, &scan_pos);
             _ = try readRecordBytes(data, &scan_pos);
+            if (has_rack_metadata) _ = try readRecordOptionalBytes(data, &scan_pos);
         }
         if (scan_pos != data.len) return error.InvalidAutoMqMetadataRecord;
 
@@ -905,10 +924,12 @@ pub const Controller = struct {
             const port_raw = try readRecordI32(data, pos);
             const fenced = try readRecordBool(data, pos);
             const host = try readRecordBytes(data, pos);
-            try self.broker_registry.registerWithEpoch(
+            const rack = if (has_rack_metadata) try readRecordOptionalBytes(data, pos) else null;
+            try self.broker_registry.registerWithEpochAndRack(
                 broker_id,
                 host,
                 @intCast(port_raw),
+                rack,
                 broker_epoch,
                 fenced,
             );
@@ -927,8 +948,9 @@ pub const Controller = struct {
         switch (kind) {
             .broker_registration => try self.applyBrokerRegistrationRecord(data, &pos),
             .producer_id_allocation => try self.applyProducerIdAllocationRecord(data, &pos),
-            .full_snapshot => try self.applyControllerFullSnapshotRecord(data, &pos),
+            .full_snapshot => try self.applyControllerFullSnapshotRecord(data, &pos, false),
             .broker_unregistration => try self.applyBrokerUnregistrationRecord(data, &pos),
+            .full_snapshot_v2 => try self.applyControllerFullSnapshotRecord(data, &pos, true),
         }
     }
 
@@ -990,7 +1012,7 @@ pub const Controller = struct {
         }
 
         const broker_epoch = self.broker_registry.next_broker_epoch;
-        const record = self.buildBrokerRegistrationRecord(req.broker_id, host, broker_port, broker_epoch) catch {
+        const record = self.buildBrokerRegistrationRecordWithRack(req.broker_id, host, broker_port, req.rack, broker_epoch) catch {
             log.warn("BrokerRegistration record build failed for broker {d}", .{req.broker_id});
             const resp = Resp{ .error_code = ErrorCode.kafka_storage_error.toInt(), .broker_epoch = -1 };
             return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
@@ -1007,10 +1029,11 @@ pub const Controller = struct {
             return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
         };
 
-        self.broker_registry.registerWithEpoch(
+        self.broker_registry.registerWithEpochAndRack(
             req.broker_id,
             host,
             broker_port,
+            req.rack,
             broker_epoch,
             true,
         ) catch {
@@ -1843,6 +1866,11 @@ fn writeRecordBytes(buf: []u8, pos: *usize, bytes: []const u8) !void {
     pos.* += bytes.len;
 }
 
+fn writeRecordOptionalBytes(buf: []u8, pos: *usize, bytes: ?[]const u8) !void {
+    writeRecordBool(buf, pos, bytes != null);
+    if (bytes) |value| try writeRecordBytes(buf, pos, value);
+}
+
 fn readRecordBool(data: []const u8, pos: *usize) !bool {
     if (pos.* + 1 > data.len) return error.InvalidAutoMqMetadataRecord;
     const byte = data[pos.*];
@@ -1862,6 +1890,11 @@ fn readRecordBytes(data: []const u8, pos: *usize) ![]const u8 {
     const bytes = data[pos.* .. pos.* + len];
     pos.* += len;
     return bytes;
+}
+
+fn readRecordOptionalBytes(data: []const u8, pos: *usize) !?[]const u8 {
+    const has_bytes = try readRecordBool(data, pos);
+    return if (has_bytes) try readRecordBytes(data, pos) else null;
 }
 
 fn readRecordU32(data: []const u8, pos: *usize) !u32 {
@@ -2922,7 +2955,7 @@ test "Controller initWithDataDir replays durable broker registrations" {
         var buf: [256]u8 = undefined;
         var pos = buildTestRequest(&buf, 62, 0, 5310, header_mod.requestHeaderVersion(62, 0));
         const listeners = [_]Req.Listener{.{ .name = "PLAINTEXT", .host = "host1", .port = 9092, .security_protocol = 0 }};
-        const req = Req{ .broker_id = 100, .cluster_id = "controller-metadata-restart", .listeners = &listeners };
+        const req = Req{ .broker_id = 100, .cluster_id = "controller-metadata-restart", .listeners = &listeners, .rack = "rack-a" };
         req.serialize(&buf, &pos, 0);
 
         const response = ctrl.handleRequest(buf[0..pos]);
@@ -2945,6 +2978,7 @@ test "Controller initWithDataDir replays durable broker registrations" {
         try testing.expectEqual(@as(i64, 1), info.broker_epoch);
         try testing.expectEqualStrings("host1", info.host);
         try testing.expectEqual(@as(u16, 9092), info.port);
+        try testing.expectEqualStrings("rack-a", info.rack orelse return error.TestUnexpectedResult);
     }
 }
 
@@ -3060,10 +3094,10 @@ test "Controller full snapshot survives Raft log compaction" {
     try makeTestControllerLeader(&ctrl);
 
     const broker_epoch = ctrl.broker_registry.next_broker_epoch;
-    const broker_record = try ctrl.buildBrokerRegistrationRecord(100, "host1", 9092, broker_epoch);
+    const broker_record = try ctrl.buildBrokerRegistrationRecordWithRack(100, "host1", 9092, "rack-a", broker_epoch);
     defer ctrl.allocator.free(broker_record);
     var offset = try ctrl.appendControllerMetadataRecord(broker_record);
-    try ctrl.broker_registry.registerWithEpoch(100, "host1", 9092, broker_epoch, false);
+    try ctrl.broker_registry.registerWithEpochAndRack(100, "host1", 9092, "rack-a", broker_epoch, false);
     ctrl.last_applied_controller_metadata_offset = offset;
 
     const pid_record = try ctrl.buildProducerIdAllocationRecord(2000);
@@ -3086,6 +3120,7 @@ test "Controller full snapshot survives Raft log compaction" {
     const broker = ctrl.broker_registry.brokers.get(100).?;
     try testing.expectEqual(@as(i64, 1), broker.broker_epoch);
     try testing.expectEqualStrings("host1", broker.host);
+    try testing.expectEqualStrings("rack-a", broker.rack orelse return error.TestUnexpectedResult);
     try testing.expect(!broker.fenced);
 }
 

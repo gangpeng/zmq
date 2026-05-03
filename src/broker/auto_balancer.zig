@@ -22,6 +22,12 @@ pub const AutoBalancer = struct {
         rack: ?[]const u8 = null,
     };
 
+    pub const BrokerNode = struct {
+        node_id: i32,
+        rack: ?[]const u8 = null,
+        fenced: bool = false,
+    };
+
     pub const PartitionLoad = struct {
         topic: []const u8,
         partition_id: i32,
@@ -106,7 +112,39 @@ pub const AutoBalancer = struct {
         nodes: []const NodeInfo,
         loads: []const PartitionLoad,
     ) ?RebalancePlan {
-        if (nodes.len <= 1 or loads.len == 0) return null;
+        return self.computeRackAwareRebalancePlanWithOptions(nodes, loads, .{});
+    }
+
+    /// Compute a plan directly from controller broker lifecycle state.
+    /// Only unfenced brokers are eligible targets. Loads whose leader is no
+    /// longer an active broker are moved first, which covers scale-in/failover
+    /// convergence before normal rack-aware balancing.
+    pub fn computeControllerAwareRebalancePlan(
+        self: *AutoBalancer,
+        brokers: []const BrokerNode,
+        loads: []const PartitionLoad,
+    ) ?RebalancePlan {
+        if (loads.len == 0) return null;
+
+        const nodes = self.collectActiveBrokerNodes(brokers) catch return null;
+        defer self.allocator.free(nodes);
+        if (nodes.len == 0) return null;
+
+        return self.computeRackAwareRebalancePlanWithOptions(nodes, loads, .{ .move_inactive_leaders = true });
+    }
+
+    const PlannerOptions = struct {
+        move_inactive_leaders: bool = false,
+    };
+
+    fn computeRackAwareRebalancePlanWithOptions(
+        self: *AutoBalancer,
+        nodes: []const NodeInfo,
+        loads: []const PartitionLoad,
+        options: PlannerOptions,
+    ) ?RebalancePlan {
+        if (nodes.len == 0 or loads.len == 0) return null;
+        if (nodes.len <= 1 and !options.move_inactive_leaders) return null;
 
         const sorted_loads = self.allocator.dupe(PartitionLoad, loads) catch return null;
         defer self.allocator.free(sorted_loads);
@@ -127,15 +165,42 @@ pub const AutoBalancer = struct {
         // Compute average load only for partitions led by known nodes. Metrics
         // for stale or unknown brokers should not suppress valid local moves.
         var total_load: f64 = 0.0;
+        var has_inactive_leader = false;
         for (sorted_loads) |pl| {
-            if (node_loads.get(pl.leader_node) != null) total_load += pl.totalLoad();
+            if (node_loads.get(pl.leader_node) != null) {
+                total_load += pl.totalLoad();
+            } else if (options.move_inactive_leaders) {
+                total_load += pl.totalLoad();
+                has_inactive_leader = true;
+            }
         }
-        if (total_load <= 0.0) return null;
-        const avg_load = total_load / @as(f64, @floatFromInt(nodes.len));
+        if (total_load <= 0.0 and !has_inactive_leader) return null;
+        const avg_load = if (total_load > 0.0) total_load / @as(f64, @floatFromInt(nodes.len)) else 0.0;
 
         // Find overloaded nodes and generate moves
         var plan = RebalancePlan.init(self.allocator);
+        if (options.move_inactive_leaders) {
+            for (sorted_loads) |pl| {
+                if (node_loads.get(pl.leader_node) != null) continue;
+                const target = self.chooseLeastLoadedTarget(nodes, &node_loads) orelse continue;
+                if (target.node_id == pl.leader_node) continue;
+
+                plan.moves.append(.{
+                    .topic = pl.topic,
+                    .partition_id = pl.partition_id,
+                    .from_node = pl.leader_node,
+                    .to_node = target.node_id,
+                }) catch continue;
+
+                if (node_loads.getPtr(target.node_id)) |to| {
+                    to.* += pl.totalLoad();
+                }
+            }
+        }
+
         for (sorted_loads) |pl| {
+            if (node_loads.get(pl.leader_node) == null) continue;
+            if (total_load <= 0.0 or nodes.len <= 1) continue;
             const current_node_load = node_loads.get(pl.leader_node) orelse continue;
             if (current_node_load <= avg_load * 1.2) continue; // Within 20% tolerance
 
@@ -200,18 +265,50 @@ pub const AutoBalancer = struct {
             if (load >= source_load) continue;
 
             const candidate = TargetNode{ .node_id = node.node_id, .load = load };
-            if (best_any == null or load < best_any.?.load) {
+            if (best_any == null or isBetterTarget(candidate, best_any.?)) {
                 best_any = candidate;
             }
 
             if (isDifferentKnownRack(source_rack, node.rack)) {
-                if (best_cross_rack == null or load < best_cross_rack.?.load) {
+                if (best_cross_rack == null or isBetterTarget(candidate, best_cross_rack.?)) {
                     best_cross_rack = candidate;
                 }
             }
         }
 
         return best_cross_rack orelse best_any;
+    }
+
+    fn chooseLeastLoadedTarget(
+        self: *AutoBalancer,
+        nodes: []const NodeInfo,
+        node_loads: *std.AutoHashMap(i32, f64),
+    ) ?TargetNode {
+        _ = self;
+
+        var best: ?TargetNode = null;
+        for (nodes) |node| {
+            const load = node_loads.get(node.node_id) orelse continue;
+            const candidate = TargetNode{ .node_id = node.node_id, .load = load };
+            if (best == null or isBetterTarget(candidate, best.?)) best = candidate;
+        }
+        return best;
+    }
+
+    fn collectActiveBrokerNodes(self: *AutoBalancer, brokers: []const BrokerNode) ![]NodeInfo {
+        var nodes = std.array_list.Managed(NodeInfo).init(self.allocator);
+        errdefer nodes.deinit();
+
+        for (brokers) |broker| {
+            if (broker.fenced) continue;
+            try nodes.append(.{
+                .node_id = broker.node_id,
+                .rack = broker.rack,
+            });
+        }
+
+        std.mem.sort(NodeInfo, nodes.items, {}, nodeInfoLessThan);
+        return try nodes.toOwnedSlice();
     }
 
     fn rackForNode(nodes: []const NodeInfo, node_id: i32) ?[]const u8 {
@@ -226,13 +323,30 @@ pub const AutoBalancer = struct {
         return !std.mem.eql(u8, a.?, b.?);
     }
 
+    fn isBetterTarget(candidate: TargetNode, current: TargetNode) bool {
+        if (candidate.load < current.load) return true;
+        if (candidate.load > current.load) return false;
+        return candidate.node_id < current.node_id;
+    }
+
     fn normalizedRate(rate: f64) f64 {
         if (rate > 0.0) return rate;
         return 0.0;
     }
 
     fn partitionLoadGreaterThan(_: void, a: PartitionLoad, b: PartitionLoad) bool {
-        return a.totalLoad() > b.totalLoad();
+        const a_load = a.totalLoad();
+        const b_load = b.totalLoad();
+        if (a_load > b_load) return true;
+        if (a_load < b_load) return false;
+        const topic_order = std.mem.order(u8, a.topic, b.topic);
+        if (topic_order != .eq) return topic_order == .lt;
+        if (a.partition_id != b.partition_id) return a.partition_id < b.partition_id;
+        return a.leader_node < b.leader_node;
+    }
+
+    fn nodeInfoLessThan(_: void, a: NodeInfo, b: NodeInfo) bool {
+        return a.node_id < b.node_id;
     }
 };
 
@@ -415,6 +529,33 @@ test "AutoBalancer plan converges simulated node load within tolerance" {
         try testing.expect(node0 <= max_allowed);
         try testing.expect(node1 <= max_allowed);
         try testing.expect(node2 <= max_allowed);
+    }
+}
+
+test "AutoBalancer controller-aware plan uses active broker racks and moves fenced leaders" {
+    const brokers = [_]AutoBalancer.BrokerNode{
+        .{ .node_id = 0, .rack = "rack-a" },
+        .{ .node_id = 1, .rack = "rack-b" },
+        .{ .node_id = 2, .rack = "rack-a", .fenced = true },
+    };
+
+    var ab = AutoBalancer.init(testing.allocator);
+    defer ab.deinit();
+
+    const loads = [_]AutoBalancer.PartitionLoad{
+        .{ .topic = "active", .partition_id = 0, .bytes_in_rate = 1, .bytes_out_rate = 0, .leader_node = 0 },
+        .{ .topic = "fenced", .partition_id = 0, .bytes_in_rate = 100, .bytes_out_rate = 0, .leader_node = 2 },
+    };
+
+    const plan = ab.computeControllerAwareRebalancePlan(&brokers, &loads);
+    try testing.expect(plan != null);
+    if (plan) |*p| {
+        var mp = @constCast(p);
+        defer mp.deinit();
+        try testing.expectEqual(@as(usize, 1), mp.moveCount());
+        try testing.expectEqualStrings("fenced", mp.moves.items[0].topic);
+        try testing.expectEqual(@as(i32, 2), mp.moves.items[0].from_node);
+        try testing.expectEqual(@as(i32, 1), mp.moves.items[0].to_node);
     }
 }
 

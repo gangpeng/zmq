@@ -58,25 +58,32 @@ pub const BrokerRegistry = struct {
     /// Install a registration that already has a controller-assigned epoch.
     /// Used by Raft metadata replay on follower promotion/restart.
     pub fn registerWithEpoch(self: *BrokerRegistry, broker_id: i32, host: []const u8, port: u16, broker_epoch: i64, fenced: bool) !void {
+        try self.registerWithEpochAndRack(broker_id, host, port, null, broker_epoch, fenced);
+    }
+
+    /// Install a registration with optional topology metadata.
+    pub fn registerWithEpochAndRack(self: *BrokerRegistry, broker_id: i32, host: []const u8, port: u16, rack: ?[]const u8, broker_epoch: i64, fenced: bool) !void {
         if (broker_epoch <= 0) return error.InvalidBrokerEpoch;
         const now = @import("time_compat").milliTimestamp();
 
-        // If re-registering, free old host string
-        if (self.brokers.getPtr(broker_id)) |existing| {
-            self.allocator.free(existing.host);
-            if (existing.rack) |r| self.allocator.free(r);
-        }
-
         const host_copy = try self.allocator.dupe(u8, host);
+        errdefer self.allocator.free(host_copy);
+        const rack_copy = if (rack) |r| try self.allocator.dupe(u8, r) else null;
+        errdefer if (rack_copy) |r| self.allocator.free(r);
 
-        try self.brokers.put(broker_id, .{
+        const old = try self.brokers.fetchPut(broker_id, .{
             .broker_id = broker_id,
             .host = host_copy,
             .port = port,
+            .rack = rack_copy,
             .broker_epoch = broker_epoch,
             .last_heartbeat_ms = now,
             .fenced = fenced,
         });
+        if (old) |entry| {
+            self.allocator.free(entry.value.host);
+            if (entry.value.rack) |r| self.allocator.free(r);
+        }
 
         if (broker_epoch >= self.next_broker_epoch) self.next_broker_epoch = broker_epoch + 1;
         log.info("Broker {d} registered: {s}:{d} epoch={d}", .{ broker_id, host, port, broker_epoch });
@@ -251,6 +258,24 @@ test "BrokerRegistry registerWithEpoch replays durable registration" {
     } else {
         return error.TestUnexpectedResult;
     }
+}
+
+test "BrokerRegistry registerWithEpochAndRack preserves rack metadata" {
+    var registry = BrokerRegistry.init(testing.allocator);
+    defer registry.deinit();
+
+    try registry.registerWithEpochAndRack(100, "host1", 9092, "rack-a", 7, true);
+    try testing.expectEqual(@as(usize, 1), registry.count());
+
+    const info = registry.brokers.get(100) orelse return error.TestUnexpectedResult;
+    try testing.expectEqualStrings("host1", info.host);
+    try testing.expectEqualStrings("rack-a", info.rack orelse return error.TestUnexpectedResult);
+
+    try registry.registerWithEpochAndRack(100, "host2", 9093, "rack-b", 8, false);
+    const updated = registry.brokers.get(100) orelse return error.TestUnexpectedResult;
+    try testing.expectEqualStrings("host2", updated.host);
+    try testing.expectEqualStrings("rack-b", updated.rack orelse return error.TestUnexpectedResult);
+    try testing.expect(!updated.fenced);
 }
 
 test "BrokerRegistry heartbeat on unknown broker returns error" {
