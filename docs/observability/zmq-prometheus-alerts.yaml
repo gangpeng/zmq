@@ -46,6 +46,53 @@ groups:
           summary: No ZMQ Raft node is reporting leader role.
           description: A KRaft quorum without a leader cannot safely commit controller metadata.
 
+  - name: zmq-controller
+    rules:
+      - alert: ZMQNoActiveController
+        expr: kafka_controller_kafkacontroller_activecontrollercount < 1
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: No ZMQ controller is reporting active-controller status.
+          description: Controller failover or registration may be stalled.
+
+      - alert: ZMQOfflinePartitions
+        expr: kafka_server_replicamanager_offlinepartitionscount > 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: ZMQ replica manager reports offline partitions.
+          description: Offline partitions can make Produce or Fetch unavailable.
+
+      - alert: ZMQUnderReplicatedPartitions
+        expr: kafka_server_replicamanager_underreplicatedpartitions > 0
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: ZMQ replica manager reports under-replicated partitions.
+          description: Replication lag can reduce durability during broker failure.
+
+      - alert: ZMQFailedProduceRequests
+        expr: rate(kafka_server_brokertopicmetrics_failedproducerequests_total[5m]) > 0
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: ZMQ broker topic metrics report failed produce requests.
+          description: Failed writes can indicate storage, fencing, authorization, or leader routing issues.
+
+      - alert: ZMQFailedFetchRequests
+        expr: rate(kafka_server_brokertopicmetrics_failedfetchrequests_total[5m]) > 0
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: ZMQ broker topic metrics report failed fetch requests.
+          description: Failed reads can indicate storage, fencing, authorization, or leader routing issues.
+
   - name: zmq-storage
     rules:
       - alert: ZMQS3RequestErrors

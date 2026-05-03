@@ -263,6 +263,112 @@
       ],
       "title": "Raft State",
       "type": "timeseries"
+    },
+    {
+      "datasource": "${DS_PROMETHEUS}",
+      "fieldConfig": {
+        "defaults": {
+          "unit": "reqps"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 0,
+        "y": 24
+      },
+      "id": 10,
+      "targets": [
+        {
+          "expr": "sum(rate(kafka_network_requestmetrics_requests_total[5m])) by (request)",
+          "legendFormat": "{{request}} requests"
+        },
+        {
+          "expr": "sum(rate(kafka_network_requestmetrics_totaltimems_total[5m])) by (request)",
+          "legendFormat": "{{request}} total ms"
+        }
+      ],
+      "title": "JMX Request Metrics",
+      "type": "timeseries"
+    },
+    {
+      "datasource": "${DS_PROMETHEUS}",
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 8,
+        "y": 24
+      },
+      "id": 11,
+      "targets": [
+        {
+          "expr": "rate(kafka_server_brokertopicmetrics_totalproducerequests_total[5m])",
+          "legendFormat": "produce requests"
+        },
+        {
+          "expr": "rate(kafka_server_brokertopicmetrics_totalfetchrequests_total[5m])",
+          "legendFormat": "fetch requests"
+        },
+        {
+          "expr": "rate(kafka_server_brokertopicmetrics_failedproducerequests_total[5m])",
+          "legendFormat": "failed produce"
+        },
+        {
+          "expr": "rate(kafka_server_brokertopicmetrics_failedfetchrequests_total[5m])",
+          "legendFormat": "failed fetch"
+        },
+        {
+          "expr": "rate(kafka_server_brokertopicmetrics_bytesin_total[5m])",
+          "legendFormat": "bytes in"
+        },
+        {
+          "expr": "rate(kafka_server_brokertopicmetrics_bytesout_total[5m])",
+          "legendFormat": "bytes out"
+        }
+      ],
+      "title": "JMX Broker Topic Metrics",
+      "type": "timeseries"
+    },
+    {
+      "datasource": "${DS_PROMETHEUS}",
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 16,
+        "y": 24
+      },
+      "id": 12,
+      "targets": [
+        {
+          "expr": "kafka_controller_kafkacontroller_activecontrollercount",
+          "legendFormat": "active controllers"
+        },
+        {
+          "expr": "kafka_server_replicamanager_partitioncount",
+          "legendFormat": "partitions"
+        },
+        {
+          "expr": "kafka_server_replicamanager_leadercount",
+          "legendFormat": "leaders"
+        },
+        {
+          "expr": "kafka_server_replicamanager_underreplicatedpartitions",
+          "legendFormat": "under-replicated"
+        },
+        {
+          "expr": "kafka_server_replicamanager_offlinepartitionscount",
+          "legendFormat": "offline"
+        }
+      ],
+      "title": "JMX Controller And Replica Manager",
+      "type": "timeseries"
     }
   ],
   "refresh": "10s",
@@ -290,5 +396,5 @@
   "timezone": "browser",
   "title": "ZMQ AutoMQ Parity Overview",
   "uid": "zmq-automq-parity",
-  "version": 1
+  "version": 2
 }

@@ -670,6 +670,19 @@ test "Observability dashboard and alerts reference exported metrics" {
         "raft_role",
         "raft_current_epoch",
         "raft_commit_index",
+        "kafka_network_requestmetrics_requests_total",
+        "kafka_network_requestmetrics_totaltimems_total",
+        "kafka_server_brokertopicmetrics_totalproducerequests_total",
+        "kafka_server_brokertopicmetrics_totalfetchrequests_total",
+        "kafka_server_brokertopicmetrics_failedproducerequests_total",
+        "kafka_server_brokertopicmetrics_failedfetchrequests_total",
+        "kafka_server_brokertopicmetrics_bytesin_total",
+        "kafka_server_brokertopicmetrics_bytesout_total",
+        "kafka_controller_kafkacontroller_activecontrollercount",
+        "kafka_server_replicamanager_partitioncount",
+        "kafka_server_replicamanager_leadercount",
+        "kafka_server_replicamanager_underreplicatedpartitions",
+        "kafka_server_replicamanager_offlinepartitionscount",
     };
     for (dashboard_metrics) |metric| {
         try testing.expect(std.mem.indexOf(u8, dashboard, metric) != null);
@@ -704,6 +717,11 @@ test "Observability dashboard and alerts reference exported metrics" {
         "compaction_errors_total",
         "kafka_client_telemetry_bytes",
         "kafka_client_telemetry_export_errors_total",
+        "kafka_controller_kafkacontroller_activecontrollercount",
+        "kafka_server_replicamanager_offlinepartitionscount",
+        "kafka_server_replicamanager_underreplicatedpartitions",
+        "kafka_server_brokertopicmetrics_failedproducerequests_total",
+        "kafka_server_brokertopicmetrics_failedfetchrequests_total",
     };
     for (alert_metrics) |metric| {
         try testing.expect(std.mem.indexOf(u8, alerts, metric) != null);
@@ -713,6 +731,11 @@ test "Observability dashboard and alerts reference exported metrics" {
         "ZMQHighProduceLatencyP99",
         "ZMQHighFetchLatencyP99",
         "ZMQS3LatencyP99",
+        "ZMQNoActiveController",
+        "ZMQOfflinePartitions",
+        "ZMQUnderReplicatedPartitions",
+        "ZMQFailedProduceRequests",
+        "ZMQFailedFetchRequests",
     };
     for (alert_names) |name| {
         try testing.expect(std.mem.indexOf(u8, alerts, name) != null);
