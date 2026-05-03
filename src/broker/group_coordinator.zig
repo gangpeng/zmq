@@ -347,6 +347,40 @@ pub const GroupCoordinator = struct {
         return mutated;
     }
 
+    fn subscriptionsEqual(member: *const ConsumerGroup.GroupMember, subscriptions: []const []const u8) bool {
+        if (member.subscribed_topics.items.len != subscriptions.len) return false;
+        for (subscriptions, 0..) |topic, index| {
+            if (!std.mem.eql(u8, member.subscribed_topics.items[index], topic)) return false;
+        }
+        return true;
+    }
+
+    pub fn replaceMemberSubscriptionsIfChanged(self: *GroupCoordinator, group_id: []const u8, member_id: []const u8, subscriptions: []const []const u8) !bool {
+        const group = self.groups.getPtr(group_id) orelse return false;
+        const member = group.members.getPtr(member_id) orelse return false;
+        if (subscriptionsEqual(member, subscriptions)) return false;
+
+        var new_subscriptions = std.array_list.Managed([]u8).init(self.allocator);
+        errdefer {
+            for (new_subscriptions.items) |topic| self.allocator.free(topic);
+            new_subscriptions.deinit();
+        }
+        for (subscriptions) |topic| {
+            try new_subscriptions.append(try self.allocator.dupe(u8, topic));
+        }
+
+        for (member.subscribed_topics.items) |topic| self.allocator.free(topic);
+        member.subscribed_topics.deinit();
+        member.subscribed_topics = new_subscriptions;
+
+        group.generation_id += 1;
+        if (group.state == .stable) {
+            group.state = .preparing_rebalance;
+            group.rebalance_start_ms = @import("time_compat").milliTimestamp();
+        }
+        return true;
+    }
+
     fn joinGroupError(error_code: i16) JoinGroupResult {
         return .{
             .error_code = error_code,
