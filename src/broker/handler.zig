@@ -10753,6 +10753,9 @@ pub const Broker = struct {
         for (names, 0..) |maybe_name, index| {
             const name = maybe_name orelse return error.InvalidRequest;
             if (name.len == 0) return error.InvalidRequest;
+            for (topics[0..index]) |previous_name| {
+                if (std.mem.eql(u8, previous_name, name)) return error.InvalidRequest;
+            }
             topics[index] = name;
         }
         return topics;
@@ -37547,6 +37550,47 @@ test "Broker.handleRequest ConsumerGroupHeartbeat rejects malformed request" {
     defer freeDeserializedConsumerGroupHeartbeatResponse(&resp);
     try testing.expectEqual(response.?.len, rpos);
     try testing.expectEqual(ErrorCode.invalid_request.toInt(), resp.error_code);
+}
+
+test "Broker.handleRequest ConsumerGroupHeartbeat rejects duplicate subscriptions" {
+    const Req = generated.consumer_group_heartbeat_request.ConsumerGroupHeartbeatRequest;
+    const Resp = generated.consumer_group_heartbeat_response.ConsumerGroupHeartbeatResponse;
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+    try testing.expect(broker.ensureTopic("duplicate-sub-topic"));
+
+    const topic_names = [_]?[]const u8{ "duplicate-sub-topic", "duplicate-sub-topic" };
+    const req = Req{
+        .group_id = "kip848-duplicate-sub-group",
+        .member_id = "duplicate-sub-member",
+        .member_epoch = 0,
+        .rebalance_timeout_ms = 30_000,
+        .subscribed_topic_names = &topic_names,
+        .server_assignor = "range",
+    };
+
+    var buf: [256]u8 = undefined;
+    var pos = buildTestRequest(&buf, 68, 0, 6843, header_mod.requestHeaderVersion(68, 0));
+    req.serialize(&buf, &pos, 0);
+
+    const response = broker.handleRequest(buf[0..pos]);
+    try testing.expect(response != null);
+    defer testing.allocator.free(response.?);
+
+    var rpos: usize = 0;
+    var response_header = try ResponseHeader.deserialize(testing.allocator, response.?, &rpos, header_mod.responseHeaderVersion(68, 0));
+    defer response_header.deinit(testing.allocator);
+    try testing.expectEqual(@as(i32, 6843), response_header.correlation_id);
+
+    const resp = try Resp.deserialize(testing.allocator, response.?, &rpos, 0);
+    defer freeDeserializedConsumerGroupHeartbeatResponse(&resp);
+    try testing.expectEqual(response.?.len, rpos);
+    try testing.expectEqual(ErrorCode.invalid_request.toInt(), resp.error_code);
+    try testing.expectEqualStrings("invalid ConsumerGroupHeartbeat subscription", resp.error_message.?);
+    try testing.expectEqual(@as(i32, 0), resp.heartbeat_interval_ms);
+    try testing.expect(resp.assignment == null);
+    try testing.expect(broker.groups.groups.getPtr("kip848-duplicate-sub-group") == null);
 }
 
 test "Broker.handleRequest ShareGroupHeartbeat returns generated fail-closed response" {
