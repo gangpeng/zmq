@@ -8339,7 +8339,7 @@ pub const Broker = struct {
         var object_metadata_dirty = false;
         var partition_state_dirty = false;
         for (req.topic_data) |topic_req| {
-            responses[responses_init] = self.buildProduceTopicResponse(topic_req, &object_metadata_dirty, &partition_state_dirty) catch return null;
+            responses[responses_init] = self.buildProduceTopicResponse(api_version, req.transactional_id, topic_req, &object_metadata_dirty, &partition_state_dirty) catch return null;
             responses_init += 1;
         }
 
@@ -8385,7 +8385,7 @@ pub const Broker = struct {
         }
     }
 
-    fn buildProduceTopicResponse(self: *Broker, topic_req: generated.produce_request.ProduceRequest.TopicProduceData, object_metadata_dirty: *bool, partition_state_dirty: *bool) !generated.produce_response.ProduceResponse.TopicProduceResponse {
+    fn buildProduceTopicResponse(self: *Broker, api_version: i16, transactional_id: ?[]const u8, topic_req: generated.produce_request.ProduceRequest.TopicProduceData, object_metadata_dirty: *bool, partition_state_dirty: *bool) !generated.produce_response.ProduceResponse.TopicProduceResponse {
         const Resp = generated.produce_response.ProduceResponse;
         const PartitionResult = Resp.TopicProduceResponse.PartitionProduceResponse;
 
@@ -8397,7 +8397,7 @@ pub const Broker = struct {
 
         const topic_name = topic_req.name orelse "";
         for (topic_req.partition_data, 0..) |partition_req, partition_index| {
-            partitions[partition_index] = self.buildProducePartitionResponse(topic_name, partition_req, object_metadata_dirty, partition_state_dirty);
+            partitions[partition_index] = self.buildProducePartitionResponse(api_version, transactional_id, topic_name, partition_req, object_metadata_dirty, partition_state_dirty);
         }
 
         return .{
@@ -8406,10 +8406,11 @@ pub const Broker = struct {
         };
     }
 
-    fn buildProducePartitionResponse(self: *Broker, topic_name: []const u8, partition_req: generated.produce_request.ProduceRequest.TopicProduceData.PartitionProduceData, object_metadata_dirty: *bool, partition_state_dirty: *bool) generated.produce_response.ProduceResponse.TopicProduceResponse.PartitionProduceResponse {
+    fn buildProducePartitionResponse(self: *Broker, api_version: i16, transactional_id: ?[]const u8, topic_name: []const u8, partition_req: generated.produce_request.ProduceRequest.TopicProduceData.PartitionProduceData, object_metadata_dirty: *bool, partition_state_dirty: *bool) generated.produce_response.ProduceResponse.TopicProduceResponse.PartitionProduceResponse {
         // Idempotent producer dedup + CRC validation
         var is_duplicate = false;
         var crc_valid = true;
+        var transaction_error_code: i16 = @intFromEnum(ErrorCode.none);
         const PendingProducerSequenceUpdate = struct {
             key: ProducerKey,
             state: ProducerSequenceState,
@@ -8461,6 +8462,16 @@ pub const Broker = struct {
                             };
                         }
                     }
+                    if (transactional_id != null and crc_valid) {
+                        transaction_error_code = self.validateTransactionalProduceState(
+                            api_version,
+                            transactional_id,
+                            hdr.producer_id,
+                            hdr.producer_epoch,
+                            topic_name,
+                            partition_req.index,
+                        );
+                    }
                 }
             }
         }
@@ -8484,7 +8495,7 @@ pub const Broker = struct {
         // Actually produce (skip if duplicate or CRC invalid)
         var was_wal_fenced = false;
         var was_storage_error = false;
-        const produce_result = if (is_duplicate or !crc_valid)
+        const produce_result = if (is_duplicate or !crc_valid or transaction_error_code != @intFromEnum(ErrorCode.none))
             null
         else if (partition_req.records) |rec|
             self.store.produce(topic_name, partition_req.index, rec) catch |err| blk: {
@@ -8511,7 +8522,9 @@ pub const Broker = struct {
         }
 
         // Detect MessageTooLarge specifically for proper error code
-        const produce_error_code: i16 = if (is_duplicate)
+        const produce_error_code: i16 = if (transaction_error_code != @intFromEnum(ErrorCode.none))
+            transaction_error_code
+        else if (is_duplicate)
             @intFromEnum(ErrorCode.none) // idempotent success
         else if (!crc_valid)
             @intFromEnum(ErrorCode.corrupt_message)
@@ -8566,6 +8579,14 @@ pub const Broker = struct {
             .record_errors = &.{},
             .error_message = null,
         };
+    }
+
+    fn validateTransactionalProduceState(self: *Broker, api_version: i16, transactional_id: ?[]const u8, producer_id: i64, producer_epoch: i16, topic: []const u8, partition: i32) i16 {
+        const identity_error = self.validateTransactionalProducerIdentity(transactional_id, producer_id, producer_epoch);
+        if (identity_error != @intFromEnum(ErrorCode.none)) return identity_error;
+
+        const state_error = self.txn_coordinator.verifyPartitionInTxn(producer_id, producer_epoch, topic, partition);
+        return self.mapTransactionAbortableErrorFromVersion(api_version, 11, producer_id, state_error);
     }
 
     fn producerSequenceLastForBatch(hdr: protocol.record_batch.RecordBatchHeader) i32 {
@@ -22279,6 +22300,100 @@ test "Broker.handleRequest Produce v9 returns generated flexible response" {
     try testing.expectEqualStrings("produce-v9-topic", resp.responses[0].name.?);
     try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.none)), resp.responses[0].partition_responses[0].error_code);
     try testing.expectEqual(@as(i32, 0), resp.throttle_time_ms);
+}
+
+test "Broker.handleRequest Produce v11 maps abortable transaction state" {
+    const Req = generated.produce_request.ProduceRequest;
+    const Topic = Req.TopicProduceData;
+    const Partition = Topic.PartitionProduceData;
+    const Resp = generated.produce_response.ProduceResponse;
+    const rec_batch = protocol.record_batch;
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+    try testing.expect(broker.ensureTopic("produce-txn-abortable-topic"));
+
+    const init_result = try broker.txn_coordinator.initProducerId("produce-txn-abortable");
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.none)), try broker.txn_coordinator.addPartitionsToTxn(
+        init_result.producer_id,
+        init_result.producer_epoch,
+        "produce-txn-abortable-topic",
+        0,
+    ));
+    const txn = broker.txn_coordinator.transactions.getPtr(init_result.producer_id) orelse return error.ExpectedTransactionState;
+    txn.status = .prepare_abort;
+
+    const records = [_]rec_batch.Record{.{
+        .offset_delta = 0,
+        .value = "abortable-produce-value",
+    }};
+    const batch = try rec_batch.buildRecordBatch(
+        testing.allocator,
+        0,
+        &records,
+        init_result.producer_id,
+        init_result.producer_epoch,
+        0,
+        12345,
+        12345,
+        0,
+    );
+    defer testing.allocator.free(batch);
+
+    const partitions = [_]Partition{.{
+        .index = 0,
+        .records = batch,
+    }};
+    const topics = [_]Topic{.{
+        .name = "produce-txn-abortable-topic",
+        .partition_data = &partitions,
+    }};
+    const req = Req{
+        .transactional_id = "produce-txn-abortable",
+        .acks = 1,
+        .timeout_ms = 30000,
+        .topic_data = &topics,
+    };
+
+    var legacy_buf: [2048]u8 = undefined;
+    var legacy_pos = buildTestRequest(&legacy_buf, 0, 10, 313, header_mod.requestHeaderVersion(0, 10));
+    req.serialize(&legacy_buf, &legacy_pos, 10);
+
+    const legacy_response = broker.handleRequest(legacy_buf[0..legacy_pos]);
+    try testing.expect(legacy_response != null);
+    defer testing.allocator.free(legacy_response.?);
+
+    var legacy_rpos: usize = 0;
+    var legacy_header = try ResponseHeader.deserialize(testing.allocator, legacy_response.?, &legacy_rpos, header_mod.responseHeaderVersion(0, 10));
+    defer legacy_header.deinit(testing.allocator);
+    try testing.expectEqual(@as(i32, 313), legacy_header.correlation_id);
+
+    const legacy_resp = try Resp.deserialize(testing.allocator, legacy_response.?, &legacy_rpos, 10);
+    defer freeDeserializedProduceResponse(&legacy_resp);
+    try testing.expectEqual(legacy_response.?.len, legacy_rpos);
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.invalid_txn_state)), legacy_resp.responses[0].partition_responses[0].error_code);
+    try testing.expectEqual(@as(i64, -1), legacy_resp.responses[0].partition_responses[0].base_offset);
+
+    var v11_buf: [2048]u8 = undefined;
+    var v11_pos = buildTestRequest(&v11_buf, 0, 11, 314, header_mod.requestHeaderVersion(0, 11));
+    req.serialize(&v11_buf, &v11_pos, 11);
+
+    const v11_response = broker.handleRequest(v11_buf[0..v11_pos]);
+    try testing.expect(v11_response != null);
+    defer testing.allocator.free(v11_response.?);
+
+    var v11_rpos: usize = 0;
+    var v11_header = try ResponseHeader.deserialize(testing.allocator, v11_response.?, &v11_rpos, header_mod.responseHeaderVersion(0, 11));
+    defer v11_header.deinit(testing.allocator);
+    try testing.expectEqual(@as(i32, 314), v11_header.correlation_id);
+
+    const v11_resp = try Resp.deserialize(testing.allocator, v11_response.?, &v11_rpos, 11);
+    defer freeDeserializedProduceResponse(&v11_resp);
+    try testing.expectEqual(v11_response.?.len, v11_rpos);
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.transaction_abortable)), v11_resp.responses[0].partition_responses[0].error_code);
+    try testing.expectEqual(@as(i64, -1), v11_resp.responses[0].partition_responses[0].base_offset);
+    try testing.expectEqual(@as(u64, 0), broker.partitionState("produce-txn-abortable-topic", 0).?.next_offset);
+    try testing.expectEqual(TxnCoordinator.TxnStatus.prepare_abort, broker.txn_coordinator.getStatus(init_result.producer_id).?);
 }
 
 test "Broker.handleRequest Produce v9 uses exact topic ACL extraction" {
