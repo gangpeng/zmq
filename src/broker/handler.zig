@@ -19325,7 +19325,7 @@ pub const Broker = struct {
         if (!skipFixedBytes(buf, &pos, 4)) return false; // timeout_ms
         if (api_version >= 1 and !skipFixedBytes(buf, &pos, 1)) return false; // validate_only
         if (flexible) ser.skipTaggedFields(buf, &pos) catch return false;
-        return true;
+        return pos == buf.len;
     }
 
     fn validateDeleteTopicsRequestFrame(buf: []const u8, start_pos: usize, api_version: i16) bool {
@@ -38078,6 +38078,31 @@ test "Broker.handleRequest CreateTopics rejects truncated request" {
     var buf: [128]u8 = undefined;
     const req_len = buildTestRequest(&buf, 19, 7, 1908, header_mod.requestHeaderVersion(19, 7));
     try testing.expect(broker.handleRequest(buf[0..req_len]) == null);
+}
+
+test "Broker.handleRequest CreateTopics rejects trailing bytes" {
+    const Req = generated.create_topics_request.CreateTopicsRequest;
+    const Topic = Req.CreatableTopic;
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+
+    const topics = [_]Topic{.{
+        .name = "ct-trailing-topic",
+        .num_partitions = 1,
+        .replication_factor = 1,
+    }};
+    const req = Req{
+        .topics = &topics,
+        .timeout_ms = 30000,
+        .validate_only = false,
+    };
+
+    var buf: [512]u8 = undefined;
+    var pos = buildTestRequest(&buf, 19, 7, 1928, header_mod.requestHeaderVersion(19, 7));
+    req.serialize(&buf, &pos, 7);
+
+    try expectTrailingByteRejected(&broker, &buf, pos);
 }
 
 test "Broker.handleRequest AddPartitionsToTxn (key=24) after InitProducerId" {

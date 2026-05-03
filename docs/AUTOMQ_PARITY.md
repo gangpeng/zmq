@@ -278,6 +278,8 @@ Status: completed for the initial catalog and DeleteGroups slice.
   filters, option flags, and tagged-fields section.
   AlterConfigs now rejects trailing bytes after resources, config values,
   validate-only flag, and tagged-fields section.
+  CreateTopics now rejects trailing bytes after topic assignments/configs,
+  timeout, validate-only flag, and tagged-fields section.
   MetadataRequest generated decoding now preserves nullable `Topics` semantics:
   v1+ null requests all topics, explicit empty arrays request no topic results,
   and v0 null topics are rejected as malformed.
