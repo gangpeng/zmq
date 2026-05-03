@@ -19388,7 +19388,7 @@ pub const Broker = struct {
         }
         if (!skipFixedBytes(buf, &pos, 5)) return false; // timeout_ms + validate_only
         if (flexible) ser.skipTaggedFields(buf, &pos) catch return false;
-        return true;
+        return pos == buf.len;
     }
 
     fn validateIncrementalAlterConfigsRequestFrame(buf: []const u8, start_pos: usize, api_version: i16) bool {
@@ -25207,6 +25207,30 @@ test "Broker.handleRequest CreatePartitions rejects truncated request" {
     var buf: [128]u8 = undefined;
     const req_len = buildTestRequest(&buf, 37, 2, 3704, header_mod.requestHeaderVersion(37, 2));
     try testing.expect(broker.handleRequest(buf[0..req_len]) == null);
+}
+
+test "Broker.handleRequest CreatePartitions rejects trailing bytes" {
+    const Req = generated.create_partitions_request.CreatePartitionsRequest;
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+
+    const topics = [_]Req.CreatePartitionsTopic{.{
+        .name = "create-partitions-trailing-topic",
+        .count = 3,
+        .assignments = null,
+    }};
+    const req = Req{
+        .topics = &topics,
+        .timeout_ms = 30000,
+        .validate_only = false,
+    };
+
+    var buf: [512]u8 = undefined;
+    var pos = buildTestRequest(&buf, 37, 2, 3708, header_mod.requestHeaderVersion(37, 2));
+    req.serialize(&buf, &pos, 2);
+
+    try expectTrailingByteRejected(&broker, &buf, pos);
 }
 
 test "Broker.handleRequest IncrementalAlterConfigs v1 returns generated response and updates topic config" {
