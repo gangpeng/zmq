@@ -15767,6 +15767,11 @@ pub const Broker = struct {
         }
 
         var mutated = false;
+        var previous_snapshot: ?ObjectManagerLocalSnapshot = null;
+        defer if (previous_snapshot) |*snapshot| self.freeObjectManagerLocalSnapshot(snapshot);
+        if (self.raft_state == null) {
+            previous_snapshot = self.takeObjectManagerLocalSnapshot() catch return null;
+        }
         for (req.open_stream_requests, 0..) |item, i| {
             const stream_id = i64ToU64(item.stream_id) orelse {
                 responses[i] = .{ .error_code = errorCode(.invalid_request), .start_offset = -1, .next_offset = -1 };
@@ -15786,10 +15791,15 @@ pub const Broker = struct {
             mutated = true;
         }
         if (mutated) {
-            self.persistObjectManagerMutation() catch |err| {
+            self.persistObjectManagerMutationDurably() catch |err| {
                 const err_code = autoMqQuorumErrorCode(err);
+                if (previous_snapshot) |snapshot| self.restoreObjectManagerLocalSnapshot(snapshot);
                 for (responses) |*response| {
-                    if (response.error_code == 0) response.error_code = err_code;
+                    if (response.error_code == 0) {
+                        response.error_code = err_code;
+                        response.start_offset = -1;
+                        response.next_offset = -1;
+                    }
                 }
             };
         }
@@ -15822,6 +15832,11 @@ pub const Broker = struct {
         }
 
         var mutated = false;
+        var previous_snapshot: ?ObjectManagerLocalSnapshot = null;
+        defer if (previous_snapshot) |*snapshot| self.freeObjectManagerLocalSnapshot(snapshot);
+        if (self.raft_state == null) {
+            previous_snapshot = self.takeObjectManagerLocalSnapshot() catch return null;
+        }
         for (req.close_stream_requests, 0..) |item, i| {
             const stream_id = i64ToU64(item.stream_id) orelse {
                 responses[i] = .{ .error_code = errorCode(.invalid_request) };
@@ -15843,8 +15858,9 @@ pub const Broker = struct {
             mutated = true;
         }
         if (mutated) {
-            self.persistObjectManagerMutation() catch |err| {
+            self.persistObjectManagerMutationDurably() catch |err| {
                 const err_code = autoMqQuorumErrorCode(err);
+                if (previous_snapshot) |snapshot| self.restoreObjectManagerLocalSnapshot(snapshot);
                 for (responses) |*response| {
                     if (response.error_code == 0) response.error_code = err_code;
                 }
@@ -15879,6 +15895,11 @@ pub const Broker = struct {
         }
 
         var mutated = false;
+        var previous_snapshot: ?ObjectManagerLocalSnapshot = null;
+        defer if (previous_snapshot) |*snapshot| self.freeObjectManagerLocalSnapshot(snapshot);
+        if (self.raft_state == null) {
+            previous_snapshot = self.takeObjectManagerLocalSnapshot() catch return null;
+        }
         for (req.delete_stream_requests, 0..) |item, i| {
             const stream_id = i64ToU64(item.stream_id) orelse {
                 responses[i] = .{ .error_code = errorCode(.invalid_request) };
@@ -15892,8 +15913,9 @@ pub const Broker = struct {
             mutated = true;
         }
         if (mutated) {
-            self.persistObjectManagerMutation() catch |err| {
+            self.persistObjectManagerMutationDurably() catch |err| {
                 const err_code = autoMqQuorumErrorCode(err);
+                if (previous_snapshot) |snapshot| self.restoreObjectManagerLocalSnapshot(snapshot);
                 for (responses) |*response| {
                     if (response.error_code == 0) response.error_code = err_code;
                 }
@@ -16333,6 +16355,11 @@ pub const Broker = struct {
         }
 
         var mutated = false;
+        var previous_snapshot: ?ObjectManagerLocalSnapshot = null;
+        defer if (previous_snapshot) |*snapshot| self.freeObjectManagerLocalSnapshot(snapshot);
+        if (self.raft_state == null) {
+            previous_snapshot = self.takeObjectManagerLocalSnapshot() catch return null;
+        }
         for (req.trim_stream_requests, 0..) |item, i| {
             const stream_id = i64ToU64(item.stream_id) orelse {
                 responses[i] = .{ .error_code = errorCode(.invalid_request) };
@@ -16350,8 +16377,9 @@ pub const Broker = struct {
             mutated = true;
         }
         if (mutated) {
-            self.persistObjectManagerMutation() catch |err| {
+            self.persistObjectManagerMutationDurably() catch |err| {
                 const err_code = autoMqQuorumErrorCode(err);
+                if (previous_snapshot) |snapshot| self.restoreObjectManagerLocalSnapshot(snapshot);
                 for (responses) |*response| {
                     if (response.error_code == 0) response.error_code = err_code;
                 }
@@ -33449,8 +33477,16 @@ test "Broker AutoMQ object mutations roll back when local snapshot persistence f
 
     const CreateReq = generated.create_streams_request.CreateStreamsRequest;
     const CreateResp = generated.create_streams_response.CreateStreamsResponse;
+    const OpenReq = generated.open_streams_request.OpenStreamsRequest;
+    const OpenResp = generated.open_streams_response.OpenStreamsResponse;
+    const CloseReq = generated.close_streams_request.CloseStreamsRequest;
+    const CloseResp = generated.close_streams_response.CloseStreamsResponse;
+    const DeleteReq = generated.delete_streams_request.DeleteStreamsRequest;
+    const DeleteResp = generated.delete_streams_response.DeleteStreamsResponse;
     const PrepareReq = generated.prepare_s3_object_request.PrepareS3ObjectRequest;
     const PrepareResp = generated.prepare_s3_object_response.PrepareS3ObjectResponse;
+    const TrimReq = generated.trim_streams_request.TrimStreamsRequest;
+    const TrimResp = generated.trim_streams_response.TrimStreamsResponse;
     const storage_error = @as(i16, @intFromEnum(ErrorCode.kafka_storage_error));
 
     var broker = Broker.initWithConfig(testing.allocator, 1, 9092, .{ .data_dir = tmp_dir });
@@ -33500,6 +33536,94 @@ test "Broker AutoMQ object mutations roll back when local snapshot persistence f
     try testing.expectEqual(@as(i64, -1), prepare_resp.first_s3_object_id);
     try testing.expectEqual(next_object_id_before, broker.object_manager.next_object_id);
     try testing.expectEqual(@as(usize, 0), broker.object_manager.prepared_registry.count());
+
+    const stream = try broker.object_manager.createStream(1);
+    const stream_id = stream.stream_id;
+
+    pos = buildTestRequest(&buf, 503, 0, 5031, header_mod.requestHeaderVersion(503, 0));
+    const close_items = [_]CloseReq.CloseStreamRequest{.{ .stream_id = @intCast(stream_id), .stream_epoch = 1 }};
+    const close_req = CloseReq{ .node_id = 1, .node_epoch = 1, .close_stream_requests = &close_items };
+    close_req.serialize(&buf, &pos, 0);
+
+    const close_response = broker.handleRequest(buf[0..pos]);
+    try testing.expect(close_response != null);
+    defer testing.allocator.free(close_response.?);
+
+    rpos = 0;
+    var close_header = try ResponseHeader.deserialize(testing.allocator, close_response.?, &rpos, header_mod.responseHeaderVersion(503, 0));
+    defer close_header.deinit(testing.allocator);
+    try testing.expectEqual(@as(i32, 5031), close_header.correlation_id);
+    const close_resp = try CloseResp.deserialize(testing.allocator, close_response.?, &rpos, 0);
+    defer testing.allocator.free(close_resp.close_stream_responses);
+
+    try testing.expectEqual(close_response.?.len, rpos);
+    try testing.expectEqual(storage_error, close_resp.close_stream_responses[0].error_code);
+    try testing.expectEqual(storage.stream.StreamState.opened, broker.object_manager.getStream(stream_id).?.state);
+
+    broker.object_manager.getStream(stream_id).?.advanceEndOffset(10);
+    pos = buildTestRequest(&buf, 512, 0, 5121, header_mod.requestHeaderVersion(512, 0));
+    const trim_items = [_]TrimReq.TrimStreamRequest{.{ .stream_id = @intCast(stream_id), .stream_epoch = 1, .new_start_offset = 5 }};
+    const trim_req = TrimReq{ .node_id = 1, .node_epoch = 1, .trim_stream_requests = &trim_items };
+    trim_req.serialize(&buf, &pos, 0);
+
+    const trim_response = broker.handleRequest(buf[0..pos]);
+    try testing.expect(trim_response != null);
+    defer testing.allocator.free(trim_response.?);
+
+    rpos = 0;
+    var trim_header = try ResponseHeader.deserialize(testing.allocator, trim_response.?, &rpos, header_mod.responseHeaderVersion(512, 0));
+    defer trim_header.deinit(testing.allocator);
+    try testing.expectEqual(@as(i32, 5121), trim_header.correlation_id);
+    const trim_resp = try TrimResp.deserialize(testing.allocator, trim_response.?, &rpos, 0);
+    defer testing.allocator.free(trim_resp.trim_stream_responses);
+
+    try testing.expectEqual(trim_response.?.len, rpos);
+    try testing.expectEqual(storage_error, trim_resp.trim_stream_responses[0].error_code);
+    try testing.expectEqual(@as(u64, 0), broker.object_manager.getStream(stream_id).?.start_offset);
+
+    broker.object_manager.getStream(stream_id).?.close();
+    pos = buildTestRequest(&buf, 502, 0, 5021, header_mod.requestHeaderVersion(502, 0));
+    const open_items = [_]OpenReq.OpenStreamRequest{.{ .stream_id = @intCast(stream_id), .stream_epoch = 2 }};
+    const open_req = OpenReq{ .node_id = 1, .node_epoch = 1, .open_stream_requests = &open_items };
+    open_req.serialize(&buf, &pos, 0);
+
+    const open_response = broker.handleRequest(buf[0..pos]);
+    try testing.expect(open_response != null);
+    defer testing.allocator.free(open_response.?);
+
+    rpos = 0;
+    var open_header = try ResponseHeader.deserialize(testing.allocator, open_response.?, &rpos, header_mod.responseHeaderVersion(502, 0));
+    defer open_header.deinit(testing.allocator);
+    try testing.expectEqual(@as(i32, 5021), open_header.correlation_id);
+    const open_resp = try OpenResp.deserialize(testing.allocator, open_response.?, &rpos, 0);
+    defer testing.allocator.free(open_resp.open_stream_responses);
+
+    try testing.expectEqual(open_response.?.len, rpos);
+    try testing.expectEqual(storage_error, open_resp.open_stream_responses[0].error_code);
+    try testing.expectEqual(@as(i64, -1), open_resp.open_stream_responses[0].start_offset);
+    try testing.expectEqual(@as(i64, -1), open_resp.open_stream_responses[0].next_offset);
+    try testing.expectEqual(storage.stream.StreamState.closed, broker.object_manager.getStream(stream_id).?.state);
+    try testing.expectEqual(@as(u64, 1), broker.object_manager.getStream(stream_id).?.epoch);
+
+    pos = buildTestRequest(&buf, 504, 0, 5041, header_mod.requestHeaderVersion(504, 0));
+    const delete_items = [_]DeleteReq.DeleteStreamRequest{.{ .stream_id = @intCast(stream_id), .stream_epoch = 1 }};
+    const delete_req = DeleteReq{ .node_id = 1, .node_epoch = 1, .delete_stream_requests = &delete_items };
+    delete_req.serialize(&buf, &pos, 0);
+
+    const delete_response = broker.handleRequest(buf[0..pos]);
+    try testing.expect(delete_response != null);
+    defer testing.allocator.free(delete_response.?);
+
+    rpos = 0;
+    var delete_header = try ResponseHeader.deserialize(testing.allocator, delete_response.?, &rpos, header_mod.responseHeaderVersion(504, 0));
+    defer delete_header.deinit(testing.allocator);
+    try testing.expectEqual(@as(i32, 5041), delete_header.correlation_id);
+    const delete_resp = try DeleteResp.deserialize(testing.allocator, delete_response.?, &rpos, 0);
+    defer testing.allocator.free(delete_resp.delete_stream_responses);
+
+    try testing.expectEqual(delete_response.?.len, rpos);
+    try testing.expectEqual(storage_error, delete_resp.delete_stream_responses[0].error_code);
+    try testing.expect(broker.object_manager.getStream(stream_id) != null);
 }
 
 test "Broker AutoMQ KV APIs round-trip" {
