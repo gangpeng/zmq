@@ -42402,6 +42402,69 @@ test "Broker.handleRequest InitializeShareGroupState rejects malformed request" 
     try testing.expectEqual(ErrorCode.invalid_request.toInt(), resp.results[0].partitions[0].error_code);
 }
 
+test "Broker.handleRequest InitializeShareGroupState rolls back state when local persistence fails" {
+    const fs = @import("fs_compat");
+    const Req = generated.initialize_share_group_state_request.InitializeShareGroupStateRequest;
+    const Resp = generated.initialize_share_group_state_response.InitializeShareGroupStateResponse;
+    const InitializeStateData = Req.InitializeStateData;
+    const PartitionData = InitializeStateData.PartitionData;
+
+    const tmp_dir = "/tmp/zmq-share-state-init-persist-fail-test";
+    fs.deleteTreeAbsolute(tmp_dir) catch {};
+    try fs.makeDirAbsolute(tmp_dir);
+    defer fs.deleteTreeAbsolute(tmp_dir) catch {};
+
+    const states_path = try std.fmt.allocPrint(testing.allocator, "{s}/share_group_states.meta", .{tmp_dir});
+    defer testing.allocator.free(states_path);
+    try fs.makeDirAbsolute(states_path);
+
+    var broker = Broker.initWithConfig(testing.allocator, 1, 9092, .{ .data_dir = tmp_dir });
+    defer broker.deinit();
+    try testing.expect(broker.ensureTopic("share-state-init-fail-topic"));
+
+    const topic_id = broker.topics.get("share-state-init-fail-topic").?.topic_id;
+    const partitions = [_]PartitionData{.{
+        .partition = 0,
+        .state_epoch = 1,
+        .start_offset = 10,
+    }};
+    const topics = [_]InitializeStateData{.{
+        .topic_id = topic_id,
+        .partitions = &partitions,
+    }};
+    const req = Req{
+        .group_id = "share-init-fail-group",
+        .topics = &topics,
+    };
+
+    var buf: [256]u8 = undefined;
+    var pos = buildTestRequest(&buf, 83, 0, 8302, header_mod.requestHeaderVersion(83, 0));
+    req.serialize(&buf, &pos, 0);
+
+    const response = broker.handleRequest(buf[0..pos]);
+    try testing.expect(response != null);
+    defer testing.allocator.free(response.?);
+
+    var rpos: usize = 0;
+    var response_header = try ResponseHeader.deserialize(testing.allocator, response.?, &rpos, header_mod.responseHeaderVersion(83, 0));
+    defer response_header.deinit(testing.allocator);
+    try testing.expectEqual(@as(i32, 8302), response_header.correlation_id);
+
+    const resp = try Resp.deserialize(testing.allocator, response.?, &rpos, 0);
+    defer {
+        for (resp.results) |result| {
+            if (result.partitions.len > 0) testing.allocator.free(result.partitions);
+        }
+        if (resp.results.len > 0) testing.allocator.free(resp.results);
+    }
+
+    try testing.expectEqual(response.?.len, rpos);
+    try testing.expectEqual(@as(usize, 1), resp.results.len);
+    try testing.expectEqual(@as(usize, 1), resp.results[0].partitions.len);
+    try testing.expectEqual(ErrorCode.kafka_storage_error.toInt(), resp.results[0].partitions[0].error_code);
+    try testing.expect((try broker.getSharePartitionState("share-init-fail-group", topic_id, 0)) == null);
+}
+
 test "Broker.handleRequest ReadShareGroupState returns uninitialized local state" {
     const Req = generated.read_share_group_state_request.ReadShareGroupStateRequest;
     const Resp = generated.read_share_group_state_response.ReadShareGroupStateResponse;
@@ -42901,6 +42964,72 @@ test "Broker.handleRequest DeleteShareGroupState removes local share state" {
     try testing.expectEqual(ErrorCode.none.toInt(), resp.results[0].partitions[0].error_code);
     try testing.expect(resp.results[0].partitions[0].error_message == null);
     try testing.expect((try broker.getSharePartitionState("share-group", topic_id, 0)) == null);
+}
+
+test "Broker.handleRequest DeleteShareGroupState rolls back state when local persistence fails" {
+    const fs = @import("fs_compat");
+    const Req = generated.delete_share_group_state_request.DeleteShareGroupStateRequest;
+    const Resp = generated.delete_share_group_state_response.DeleteShareGroupStateResponse;
+    const DeleteStateData = Req.DeleteStateData;
+    const PartitionData = DeleteStateData.PartitionData;
+
+    const tmp_dir = "/tmp/zmq-share-state-delete-persist-fail-test";
+    fs.deleteTreeAbsolute(tmp_dir) catch {};
+    try fs.makeDirAbsolute(tmp_dir);
+    defer fs.deleteTreeAbsolute(tmp_dir) catch {};
+
+    var broker = Broker.initWithConfig(testing.allocator, 1, 9092, .{ .data_dir = tmp_dir });
+    defer broker.deinit();
+    try testing.expect(broker.ensureTopic("share-state-delete-fail-topic"));
+
+    const topic_id = broker.topics.get("share-state-delete-fail-topic").?.topic_id;
+    try broker.setSharePartitionState("share-delete-fail-group", topic_id, 0, 3, 20, &.{});
+
+    const states_path = try std.fmt.allocPrint(testing.allocator, "{s}/share_group_states.meta", .{tmp_dir});
+    defer testing.allocator.free(states_path);
+    try fs.deleteFileAbsolute(states_path);
+    try fs.makeDirAbsolute(states_path);
+
+    const partitions = [_]PartitionData{.{
+        .partition = 0,
+    }};
+    const topics = [_]DeleteStateData{.{
+        .topic_id = topic_id,
+        .partitions = &partitions,
+    }};
+    const req = Req{
+        .group_id = "share-delete-fail-group",
+        .topics = &topics,
+    };
+
+    var buf: [256]u8 = undefined;
+    var pos = buildTestRequest(&buf, 86, 0, 8602, header_mod.requestHeaderVersion(86, 0));
+    req.serialize(&buf, &pos, 0);
+
+    const response = broker.handleRequest(buf[0..pos]);
+    try testing.expect(response != null);
+    defer testing.allocator.free(response.?);
+
+    var rpos: usize = 0;
+    var response_header = try ResponseHeader.deserialize(testing.allocator, response.?, &rpos, header_mod.responseHeaderVersion(86, 0));
+    defer response_header.deinit(testing.allocator);
+    try testing.expectEqual(@as(i32, 8602), response_header.correlation_id);
+
+    const resp = try Resp.deserialize(testing.allocator, response.?, &rpos, 0);
+    defer {
+        for (resp.results) |result| {
+            if (result.partitions.len > 0) testing.allocator.free(result.partitions);
+        }
+        if (resp.results.len > 0) testing.allocator.free(resp.results);
+    }
+
+    try testing.expectEqual(response.?.len, rpos);
+    try testing.expectEqual(@as(usize, 1), resp.results.len);
+    try testing.expectEqual(@as(usize, 1), resp.results[0].partitions.len);
+    try testing.expectEqual(ErrorCode.kafka_storage_error.toInt(), resp.results[0].partitions[0].error_code);
+    const state = (try broker.getSharePartitionState("share-delete-fail-group", topic_id, 0)) orelse return error.ExpectedSharePartitionState;
+    try testing.expectEqual(@as(i32, 3), state.state_epoch);
+    try testing.expectEqual(@as(i64, 20), state.start_offset);
 }
 
 test "Broker.handleRequest DeleteShareGroupState rejects malformed request" {

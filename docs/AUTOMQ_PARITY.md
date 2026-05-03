@@ -209,7 +209,7 @@ Status: completed for the initial catalog and DeleteGroups slice.
   topic IDs, group IDs, partitions, state epochs, start offsets, and state
   batches while maintaining local share-partition state and restoring it across
   local broker restart. Initialize/write/delete mutations now fail closed with
-  rollback when local share-state persistence fails.
+  default-suite rollback coverage when local share-state persistence fails.
   DescribeAcls/CreateAcls/DeleteAcls now use generated schemas, reject malformed
   frames, validate enum fields, write full ACL snapshots to `__cluster_metadata`
   for broker replacement replay, fail closed and roll back local ACL visibility
