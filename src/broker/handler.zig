@@ -10544,6 +10544,12 @@ pub const Broker = struct {
                         return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
                     };
                 }
+                const assignment_echo_error = self.validateConsumerGroupHeartbeatOwnedAssignment(group_id, result.member_id, req.topic_partitions) catch return null;
+                if (assignment_echo_error != ErrorCode.none) {
+                    self.restoreConsumerGroupsAfterFailedMutation(previous_snapshot);
+                    const resp = consumerGroupHeartbeatResponse(assignment_echo_error.toInt(), "ConsumerGroupHeartbeat owned partitions do not match assignment", req.member_id, req.member_epoch, 0);
+                    return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+                }
                 if (self.groups.groups.getPtr(group_id)) |group| {
                     response_member_epoch = group.generation_id;
                 }
@@ -10595,6 +10601,11 @@ pub const Broker = struct {
         const error_code = self.groups.consumerGroupHeartbeat(group_id, member_id, instance_id, req.member_epoch);
         var response_member_epoch = req.member_epoch;
         if (error_code == @intFromEnum(ErrorCode.none)) {
+            const assignment_echo_error = self.validateConsumerGroupHeartbeatOwnedAssignment(group_id, member_id, req.topic_partitions) catch return null;
+            if (assignment_echo_error != ErrorCode.none) {
+                const resp = consumerGroupHeartbeatResponse(assignment_echo_error.toInt(), "ConsumerGroupHeartbeat owned partitions do not match assignment", req.member_id, req.member_epoch, 0);
+                return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+            }
             if (subscriptions != null or rack_id != null) {
                 const previous_snapshot = self.encodeConsumerGroupSnapshotRecordValue() catch return null;
                 defer self.allocator.free(previous_snapshot);
@@ -10810,6 +10821,38 @@ pub const Broker = struct {
                 for (topic.partitions[0..partition_index]) |previous_partition| {
                     if (previous_partition == partition) return ErrorCode.invalid_request;
                 }
+            }
+        }
+        return ErrorCode.none;
+    }
+
+    fn validateConsumerGroupHeartbeatOwnedAssignment(
+        self: *Broker,
+        group_id: []const u8,
+        member_id: []const u8,
+        topic_partitions: ?[]const generated.consumer_group_heartbeat_request.ConsumerGroupHeartbeatRequest.TopicPartitions,
+    ) !ErrorCode {
+        const topics = topic_partitions orelse return ErrorCode.none;
+        const group = self.groups.groups.getPtr(group_id) orelse return ErrorCode.unknown_member_id;
+        if (!group.members.contains(member_id)) return ErrorCode.unknown_member_id;
+
+        for (topics) |topic| {
+            const topic_name = self.findTopicNameById(topic.topic_id) orelse return ErrorCode.unknown_topic_id;
+            const assigned = (try self.buildRangeAssignedTopic(group, topic_name, member_id)) orelse {
+                if (topic.partitions.len == 0) continue;
+                return ErrorCode.invalid_request;
+            };
+            defer self.allocator.free(assigned.partitions);
+
+            for (topic.partitions) |owned_partition| {
+                var found = false;
+                for (assigned.partitions) |assigned_partition| {
+                    if (assigned_partition == owned_partition) {
+                        found = true;
+                        break;
+                    }
+                }
+                if (!found) return ErrorCode.invalid_request;
             }
         }
         return ErrorCode.none;
@@ -37329,6 +37372,137 @@ test "Broker.handleRequest ConsumerGroupHeartbeat validates owned partitions" {
     try testing.expectEqual(ErrorCode.unknown_topic_or_partition.toInt(), bad_partition_resp.error_code);
     try testing.expectEqual(@as(i32, 0), bad_partition_resp.heartbeat_interval_ms);
     try testing.expect(bad_partition_resp.assignment == null);
+}
+
+test "Broker.handleRequest ConsumerGroupHeartbeat rejects owned partitions outside member assignment" {
+    const Req = generated.consumer_group_heartbeat_request.ConsumerGroupHeartbeatRequest;
+    const Resp = generated.consumer_group_heartbeat_response.ConsumerGroupHeartbeatResponse;
+    const TopicPartitions = Req.TopicPartitions;
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+    broker.default_num_partitions = 4;
+    try testing.expect(broker.ensureTopic("owned-range-topic"));
+    const topic_id = broker.topics.get("owned-range-topic").?.topic_id;
+
+    const topic_names = [_]?[]const u8{"owned-range-topic"};
+    const member_a_req = Req{
+        .group_id = "kip848-owned-range-group",
+        .member_id = "owned-range-a",
+        .member_epoch = 0,
+        .rebalance_timeout_ms = 30_000,
+        .subscribed_topic_names = &topic_names,
+        .server_assignor = "range",
+    };
+
+    var a_buf: [256]u8 = undefined;
+    var a_pos = buildTestRequest(&a_buf, 68, 0, 6834, header_mod.requestHeaderVersion(68, 0));
+    member_a_req.serialize(&a_buf, &a_pos, 0);
+
+    const a_response = broker.handleRequest(a_buf[0..a_pos]);
+    try testing.expect(a_response != null);
+    defer testing.allocator.free(a_response.?);
+
+    var a_rpos: usize = 0;
+    var a_response_header = try ResponseHeader.deserialize(testing.allocator, a_response.?, &a_rpos, header_mod.responseHeaderVersion(68, 0));
+    defer a_response_header.deinit(testing.allocator);
+    try testing.expectEqual(@as(i32, 6834), a_response_header.correlation_id);
+
+    const a_resp = try Resp.deserialize(testing.allocator, a_response.?, &a_rpos, 0);
+    defer freeDeserializedConsumerGroupHeartbeatResponse(&a_resp);
+    try testing.expectEqual(a_response.?.len, a_rpos);
+    try testing.expectEqual(ErrorCode.none.toInt(), a_resp.error_code);
+
+    const member_b_req = Req{
+        .group_id = "kip848-owned-range-group",
+        .member_id = "owned-range-b",
+        .member_epoch = 0,
+        .rebalance_timeout_ms = 30_000,
+        .subscribed_topic_names = &topic_names,
+        .server_assignor = "range",
+    };
+
+    var b_buf: [256]u8 = undefined;
+    var b_pos = buildTestRequest(&b_buf, 68, 0, 6835, header_mod.requestHeaderVersion(68, 0));
+    member_b_req.serialize(&b_buf, &b_pos, 0);
+
+    const b_response = broker.handleRequest(b_buf[0..b_pos]);
+    try testing.expect(b_response != null);
+    defer testing.allocator.free(b_response.?);
+
+    var b_rpos: usize = 0;
+    var b_response_header = try ResponseHeader.deserialize(testing.allocator, b_response.?, &b_rpos, header_mod.responseHeaderVersion(68, 0));
+    defer b_response_header.deinit(testing.allocator);
+    try testing.expectEqual(@as(i32, 6835), b_response_header.correlation_id);
+
+    const b_resp = try Resp.deserialize(testing.allocator, b_response.?, &b_rpos, 0);
+    defer freeDeserializedConsumerGroupHeartbeatResponse(&b_resp);
+    try testing.expectEqual(b_response.?.len, b_rpos);
+    try testing.expectEqual(ErrorCode.none.toInt(), b_resp.error_code);
+
+    const valid_owned = [_]TopicPartitions{.{
+        .topic_id = topic_id,
+        .partitions = &[_]i32{ 2, 3 },
+    }};
+    const valid_req = Req{
+        .group_id = "kip848-owned-range-group",
+        .member_id = b_resp.member_id,
+        .member_epoch = b_resp.member_epoch,
+        .rebalance_timeout_ms = -1,
+        .topic_partitions = &valid_owned,
+    };
+
+    var valid_buf: [256]u8 = undefined;
+    var valid_pos = buildTestRequest(&valid_buf, 68, 0, 6836, header_mod.requestHeaderVersion(68, 0));
+    valid_req.serialize(&valid_buf, &valid_pos, 0);
+
+    const valid_response = broker.handleRequest(valid_buf[0..valid_pos]);
+    try testing.expect(valid_response != null);
+    defer testing.allocator.free(valid_response.?);
+
+    var valid_rpos: usize = 0;
+    var valid_response_header = try ResponseHeader.deserialize(testing.allocator, valid_response.?, &valid_rpos, header_mod.responseHeaderVersion(68, 0));
+    defer valid_response_header.deinit(testing.allocator);
+    try testing.expectEqual(@as(i32, 6836), valid_response_header.correlation_id);
+
+    const valid_resp = try Resp.deserialize(testing.allocator, valid_response.?, &valid_rpos, 0);
+    defer freeDeserializedConsumerGroupHeartbeatResponse(&valid_resp);
+    try testing.expectEqual(valid_response.?.len, valid_rpos);
+    try testing.expectEqual(ErrorCode.none.toInt(), valid_resp.error_code);
+    try testing.expect(valid_resp.assignment != null);
+
+    const foreign_owned = [_]TopicPartitions{.{
+        .topic_id = topic_id,
+        .partitions = &[_]i32{0},
+    }};
+    const foreign_req = Req{
+        .group_id = "kip848-owned-range-group",
+        .member_id = b_resp.member_id,
+        .member_epoch = b_resp.member_epoch,
+        .rebalance_timeout_ms = -1,
+        .topic_partitions = &foreign_owned,
+    };
+
+    var foreign_buf: [256]u8 = undefined;
+    var foreign_pos = buildTestRequest(&foreign_buf, 68, 0, 6837, header_mod.requestHeaderVersion(68, 0));
+    foreign_req.serialize(&foreign_buf, &foreign_pos, 0);
+
+    const foreign_response = broker.handleRequest(foreign_buf[0..foreign_pos]);
+    try testing.expect(foreign_response != null);
+    defer testing.allocator.free(foreign_response.?);
+
+    var foreign_rpos: usize = 0;
+    var foreign_response_header = try ResponseHeader.deserialize(testing.allocator, foreign_response.?, &foreign_rpos, header_mod.responseHeaderVersion(68, 0));
+    defer foreign_response_header.deinit(testing.allocator);
+    try testing.expectEqual(@as(i32, 6837), foreign_response_header.correlation_id);
+
+    const foreign_resp = try Resp.deserialize(testing.allocator, foreign_response.?, &foreign_rpos, 0);
+    defer freeDeserializedConsumerGroupHeartbeatResponse(&foreign_resp);
+    try testing.expectEqual(foreign_response.?.len, foreign_rpos);
+    try testing.expectEqual(ErrorCode.invalid_request.toInt(), foreign_resp.error_code);
+    try testing.expectEqualStrings("ConsumerGroupHeartbeat owned partitions do not match assignment", foreign_resp.error_message.?);
+    try testing.expectEqual(@as(i32, 0), foreign_resp.heartbeat_interval_ms);
+    try testing.expect(foreign_resp.assignment == null);
 }
 
 test "Broker.handleRequest ConsumerGroupHeartbeat validates server assignor changes" {
