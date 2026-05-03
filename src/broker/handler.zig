@@ -250,6 +250,11 @@ pub const Broker = struct {
         }
     };
 
+    pub const ControllerAwareRebalanceResult = struct {
+        planned_moves: usize = 0,
+        applied_moves: usize = 0,
+    };
+
     /// Per-topic configuration (mirrors Kafka topic configs).
     pub const TopicConfig = struct {
         retention_ms: i64 = 604800000, // 7 days
@@ -17946,6 +17951,22 @@ pub const Broker = struct {
         }
     }
 
+    pub fn executeControllerAwareRebalance(
+        self: *Broker,
+        brokers: []const AutoBalancer.BrokerNode,
+        loads: []const AutoBalancer.PartitionLoad,
+    ) !ControllerAwareRebalanceResult {
+        var plan = self.auto_balancer.computeControllerAwareRebalancePlan(brokers, loads) orelse return .{};
+        defer plan.deinit();
+
+        const planned = plan.moveCount();
+        const applied = try self.executeRebalancePlan(&plan);
+        return .{
+            .planned_moves = planned,
+            .applied_moves = applied,
+        };
+    }
+
     pub fn executeRebalancePlan(self: *Broker, plan: *const AutoBalancer.RebalancePlan) !usize {
         for (plan.moves.items, 0..) |move, move_index| {
             var previous_index: usize = 0;
@@ -32938,6 +32959,115 @@ test "Broker executes auto-balancer plan as durable partition reassignment" {
     try testing.expectEqual(@as(usize, 1), try broker.executeRebalancePlan(&plan));
     try testing.expectEqual(@as(u32, 1), broker.partition_reassignments.count());
     try testing.expectEqual(@as(?i32, 2), broker.failover_controller.findPartitionOwner("rebalance-exec", 0));
+}
+
+test "Broker controller-aware rebalance orchestration moves fenced broker ownership durably" {
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+    try testing.expect(broker.ensureTopic("rebalance-orchestrated"));
+    try broker.failover_controller.reassignPartition(.{ .topic = "rebalance-orchestrated", .partition = 0 }, 3);
+
+    const brokers = [_]AutoBalancer.BrokerNode{
+        .{ .node_id = 2, .rack = "rack-a" },
+        .{ .node_id = 4, .rack = "rack-b" },
+        .{ .node_id = 3, .rack = "rack-a", .fenced = true },
+    };
+    const loads = [_]AutoBalancer.PartitionLoad{.{
+        .topic = "rebalance-orchestrated",
+        .partition_id = 0,
+        .bytes_in_rate = 10_000,
+        .bytes_out_rate = 5_000,
+        .leader_node = 3,
+    }};
+
+    const result = try broker.executeControllerAwareRebalance(&brokers, &loads);
+    try testing.expectEqual(@as(usize, 1), result.planned_moves);
+    try testing.expectEqual(@as(usize, 1), result.applied_moves);
+    try testing.expectEqual(@as(u32, 1), broker.partition_reassignments.count());
+    try testing.expectEqual(@as(?i32, 2), broker.failover_controller.findPartitionOwner("rebalance-orchestrated", 0));
+}
+
+test "Broker controller-aware rebalance orchestration converges after ownership changes" {
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+    try testing.expect(broker.ensureTopic("rebalance-converge-hot"));
+    try testing.expect(broker.ensureTopic("rebalance-converge-peer"));
+    try broker.failover_controller.reassignPartition(.{ .topic = "rebalance-converge-hot", .partition = 0 }, 3);
+    try broker.failover_controller.reassignPartition(.{ .topic = "rebalance-converge-peer", .partition = 0 }, 4);
+
+    const brokers = [_]AutoBalancer.BrokerNode{
+        .{ .node_id = 2, .rack = "rack-a" },
+        .{ .node_id = 4, .rack = "rack-b" },
+        .{ .node_id = 3, .rack = "rack-a", .fenced = true },
+    };
+    const initial_loads = [_]AutoBalancer.PartitionLoad{.{
+        .topic = "rebalance-converge-hot",
+        .partition_id = 0,
+        .bytes_in_rate = 100,
+        .bytes_out_rate = 0,
+        .leader_node = 3,
+    }};
+
+    const first = try broker.executeControllerAwareRebalance(&brokers, &initial_loads);
+    try testing.expectEqual(@as(usize, 1), first.planned_moves);
+    try testing.expectEqual(@as(usize, 1), first.applied_moves);
+    try testing.expectEqual(@as(?i32, 2), broker.failover_controller.findPartitionOwner("rebalance-converge-hot", 0));
+
+    const converged_loads = [_]AutoBalancer.PartitionLoad{
+        .{ .topic = "rebalance-converge-hot", .partition_id = 0, .bytes_in_rate = 100, .bytes_out_rate = 0, .leader_node = 2 },
+        .{ .topic = "rebalance-converge-peer", .partition_id = 0, .bytes_in_rate = 100, .bytes_out_rate = 0, .leader_node = 4 },
+    };
+    const second = try broker.executeControllerAwareRebalance(&brokers, &converged_loads);
+    try testing.expectEqual(@as(usize, 0), second.planned_moves);
+    try testing.expectEqual(@as(usize, 0), second.applied_moves);
+    try testing.expectEqual(@as(?i32, 2), broker.failover_controller.findPartitionOwner("rebalance-converge-hot", 0));
+}
+
+test "Broker controller-aware rebalance orchestration rejects stale plans without partial mutation" {
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+    try testing.expect(broker.ensureTopic("rebalance-orchestrated-valid"));
+    try testing.expect(broker.ensureTopic("rebalance-orchestrated-stale"));
+    try broker.failover_controller.reassignPartition(.{ .topic = "rebalance-orchestrated-valid", .partition = 0 }, 3);
+
+    const brokers = [_]AutoBalancer.BrokerNode{
+        .{ .node_id = 2, .rack = "rack-a" },
+        .{ .node_id = 3, .rack = "rack-a", .fenced = true },
+    };
+    const loads = [_]AutoBalancer.PartitionLoad{
+        .{ .topic = "rebalance-orchestrated-valid", .partition_id = 0, .bytes_in_rate = 100, .bytes_out_rate = 0, .leader_node = 3 },
+        .{ .topic = "rebalance-orchestrated-stale", .partition_id = 0, .bytes_in_rate = 1, .bytes_out_rate = 0, .leader_node = 3 },
+    };
+
+    try testing.expectError(error.StaleRebalancePlan, broker.executeControllerAwareRebalance(&brokers, &loads));
+    try testing.expectEqual(@as(u32, 0), broker.partition_reassignments.count());
+    try testing.expectEqual(@as(?i32, 3), broker.failover_controller.findPartitionOwner("rebalance-orchestrated-valid", 0));
+    try testing.expectEqual(@as(?i32, 1), broker.failover_controller.findPartitionOwner("rebalance-orchestrated-stale", 0));
+}
+
+test "Broker controller-aware rebalance orchestration no-ops without active targets" {
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+    try testing.expect(broker.ensureTopic("rebalance-no-target"));
+    try broker.failover_controller.reassignPartition(.{ .topic = "rebalance-no-target", .partition = 0 }, 3);
+
+    const brokers = [_]AutoBalancer.BrokerNode{
+        .{ .node_id = 2, .rack = "rack-a", .fenced = true },
+        .{ .node_id = 3, .rack = "rack-b", .fenced = true },
+    };
+    const loads = [_]AutoBalancer.PartitionLoad{.{
+        .topic = "rebalance-no-target",
+        .partition_id = 0,
+        .bytes_in_rate = 100,
+        .bytes_out_rate = 0,
+        .leader_node = 3,
+    }};
+
+    const result = try broker.executeControllerAwareRebalance(&brokers, &loads);
+    try testing.expectEqual(@as(usize, 0), result.planned_moves);
+    try testing.expectEqual(@as(usize, 0), result.applied_moves);
+    try testing.expectEqual(@as(u32, 0), broker.partition_reassignments.count());
+    try testing.expectEqual(@as(?i32, 3), broker.failover_controller.findPartitionOwner("rebalance-no-target", 0));
 }
 
 test "Broker rejects stale auto-balancer plan before mutating reassignment state" {
