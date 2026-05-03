@@ -11,13 +11,19 @@ Run against a running ZMQ broker:
 
 Optional environment:
     ZMQ_CLIENT_MATRIX_BOOTSTRAP   localhost:9092
-    ZMQ_CLIENT_MATRIX_TOOLS       auto | kcat,kafka-cli,kafka-python,confluent-kafka
+    ZMQ_CLIENT_MATRIX_TOOLS       auto | kcat,kafka-cli,kafka-python,confluent-kafka,java-kafka,go-kafka
+    ZMQ_CLIENT_MATRIX_JAVA_CLASSPATH
+                                  Classpath containing kafka-clients jars for java-kafka
+    ZMQ_CLIENT_MATRIX_ENABLE_GO   1 to include go-kafka in auto mode
+    ZMQ_CLIENT_MATRIX_GO_MODULE   Go module for go-kafka (default github.com/segmentio/kafka-go@latest)
 
 Supported probes:
     kcat             metadata plus produce/fetch round trip
     kafka-cli        API/topic probes plus console produce/fetch round trip
     kafka-python     AdminClient metadata plus producer/consumer round trip
     confluent-kafka  AdminClient metadata plus producer/consumer round trip
+    java-kafka       Apache kafka-clients AdminClient plus producer/consumer round trip
+    go-kafka         segmentio kafka-go metadata plus writer/reader round trip
 """
 
 import importlib.util
@@ -25,18 +31,23 @@ import os
 import shutil
 import subprocess
 import sys
+import tempfile
+import textwrap
 
 
 RUN_ENABLED = os.environ.get("ZMQ_RUN_CLIENT_MATRIX") == "1"
 BOOTSTRAP = os.environ.get("ZMQ_CLIENT_MATRIX_BOOTSTRAP", "localhost:9092")
 TOOLS = os.environ.get("ZMQ_CLIENT_MATRIX_TOOLS", "auto")
+JAVA_CLASSPATH = os.environ.get("ZMQ_CLIENT_MATRIX_JAVA_CLASSPATH")
+ENABLE_GO_AUTO = os.environ.get("ZMQ_CLIENT_MATRIX_ENABLE_GO") == "1"
+GO_MODULE = os.environ.get("ZMQ_CLIENT_MATRIX_GO_MODULE", "github.com/segmentio/kafka-go@latest")
 
 
 class MatrixError(Exception):
     pass
 
 
-def run(cmd, timeout=30, input_text=None):
+def run(cmd, timeout=30, input_text=None, cwd=None):
     proc = subprocess.run(
         cmd,
         input=input_text,
@@ -44,6 +55,7 @@ def run(cmd, timeout=30, input_text=None):
         stderr=subprocess.STDOUT,
         text=True,
         timeout=timeout,
+        cwd=cwd,
     )
     if proc.returncode != 0:
         raise MatrixError(f"{cmd[0]} failed with exit code {proc.returncode}\n{proc.stdout}")
@@ -88,6 +100,10 @@ def selected_tools():
             tools.append("kafka-python")
         if have_module("confluent_kafka"):
             tools.append("confluent-kafka")
+        if have("javac") and have("java") and JAVA_CLASSPATH:
+            tools.append("java-kafka")
+        if ENABLE_GO_AUTO and have("go"):
+            tools.append("go-kafka")
         return tools
     return [tool.strip() for tool in TOOLS.split(",") if tool.strip()]
 
@@ -257,6 +273,197 @@ def test_confluent_kafka():
         consumer.close()
 
 
+JAVA_MATRIX_SOURCE = r"""
+import java.time.Duration;
+import java.util.Collections;
+import java.util.Properties;
+import java.util.Set;
+import java.util.concurrent.TimeUnit;
+import org.apache.kafka.clients.admin.AdminClient;
+import org.apache.kafka.clients.consumer.ConsumerRecord;
+import org.apache.kafka.clients.consumer.ConsumerRecords;
+import org.apache.kafka.clients.consumer.KafkaConsumer;
+import org.apache.kafka.clients.producer.KafkaProducer;
+import org.apache.kafka.clients.producer.ProducerRecord;
+import org.apache.kafka.common.serialization.StringDeserializer;
+import org.apache.kafka.common.serialization.StringSerializer;
+
+public class ZmqKafkaClientMatrix {
+    public static void main(String[] args) throws Exception {
+        String bootstrap = args[0];
+        String topic = args[1];
+        String payload = args[2];
+        String group = args[3];
+
+        Properties adminProps = new Properties();
+        adminProps.put("bootstrap.servers", bootstrap);
+        adminProps.put("client.id", "zmq-client-matrix-java-admin");
+        adminProps.put("request.timeout.ms", "10000");
+        try (AdminClient admin = AdminClient.create(adminProps)) {
+            Set<String> topics = admin.listTopics().names().get(10, TimeUnit.SECONDS);
+            if (topics == null) {
+                throw new RuntimeException("AdminClient listTopics returned null");
+            }
+        }
+
+        Properties producerProps = new Properties();
+        producerProps.put("bootstrap.servers", bootstrap);
+        producerProps.put("client.id", "zmq-client-matrix-java-producer");
+        producerProps.put("key.serializer", StringSerializer.class.getName());
+        producerProps.put("value.serializer", StringSerializer.class.getName());
+        producerProps.put("acks", "1");
+        producerProps.put("request.timeout.ms", "10000");
+        producerProps.put("delivery.timeout.ms", "15000");
+        try (KafkaProducer<String, String> producer = new KafkaProducer<>(producerProps)) {
+            producer.send(new ProducerRecord<>(topic, payload)).get(10, TimeUnit.SECONDS);
+            producer.flush();
+        }
+
+        Properties consumerProps = new Properties();
+        consumerProps.put("bootstrap.servers", bootstrap);
+        consumerProps.put("client.id", "zmq-client-matrix-java-consumer");
+        consumerProps.put("group.id", group);
+        consumerProps.put("key.deserializer", StringDeserializer.class.getName());
+        consumerProps.put("value.deserializer", StringDeserializer.class.getName());
+        consumerProps.put("auto.offset.reset", "earliest");
+        consumerProps.put("enable.auto.commit", "false");
+        consumerProps.put("request.timeout.ms", "10000");
+        consumerProps.put("session.timeout.ms", "6000");
+        consumerProps.put("heartbeat.interval.ms", "2000");
+        try (KafkaConsumer<String, String> consumer = new KafkaConsumer<>(consumerProps)) {
+            consumer.subscribe(Collections.singletonList(topic));
+            long deadline = System.currentTimeMillis() + 10000;
+            while (System.currentTimeMillis() < deadline) {
+                ConsumerRecords<String, String> records = consumer.poll(Duration.ofMillis(500));
+                for (ConsumerRecord<String, String> record : records) {
+                    if (payload.equals(record.value())) {
+                        return;
+                    }
+                }
+            }
+            throw new RuntimeException("Java consumer did not fetch produced payload");
+        }
+    }
+}
+"""
+
+
+def test_java_kafka():
+    if not have("javac") or not have("java"):
+        raise MatrixError("java-kafka selected but javac/java are not available in PATH")
+    if not JAVA_CLASSPATH:
+        raise MatrixError("java-kafka selected but ZMQ_CLIENT_MATRIX_JAVA_CLASSPATH is not set")
+
+    topic = matrix_topic("java-kafka")
+    payload = matrix_payload("java-kafka")
+    group = f"zmq-client-matrix-java-{os.getpid()}"
+
+    with tempfile.TemporaryDirectory(prefix="zmq-client-matrix-java-") as tmp:
+        source_path = os.path.join(tmp, "ZmqKafkaClientMatrix.java")
+        with open(source_path, "w", encoding="utf-8") as f:
+            f.write(JAVA_MATRIX_SOURCE)
+
+        run(["javac", "-cp", JAVA_CLASSPATH, source_path], timeout=60)
+        run(
+            ["java", "-cp", f"{tmp}:{JAVA_CLASSPATH}", "ZmqKafkaClientMatrix", BOOTSTRAP, topic, payload, group],
+            timeout=90,
+        )
+    print("ok: java-kafka metadata and produce/fetch probes")
+
+
+GO_MATRIX_SOURCE = r"""
+package main
+
+import (
+    "context"
+    "fmt"
+    "os"
+    "time"
+
+    "github.com/segmentio/kafka-go"
+)
+
+func main() {
+    if len(os.Args) != 5 {
+        panic("usage: go-matrix <bootstrap> <topic> <payload> <group>")
+    }
+    bootstrap := os.Args[1]
+    topic := os.Args[2]
+    payload := os.Args[3]
+    group := os.Args[4]
+
+    conn, err := kafka.Dial("tcp", bootstrap)
+    if err != nil {
+        panic(err)
+    }
+    partitions, err := conn.ReadPartitions()
+    _ = conn.Close()
+    if err != nil {
+        panic(err)
+    }
+    _ = partitions
+
+    writer := &kafka.Writer{
+        Addr:         kafka.TCP(bootstrap),
+        Topic:        topic,
+        RequiredAcks: kafka.RequireOne,
+        BatchTimeout: 10 * time.Millisecond,
+    }
+    ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+    defer cancel()
+    if err := writer.WriteMessages(ctx, kafka.Message{Value: []byte(payload)}); err != nil {
+        _ = writer.Close()
+        panic(err)
+    }
+    if err := writer.Close(); err != nil {
+        panic(err)
+    }
+
+    reader := kafka.NewReader(kafka.ReaderConfig{
+        Brokers: []string{bootstrap},
+        Topic:   topic,
+        GroupID: group,
+        MinBytes: 1,
+        MaxBytes: 10000000,
+        MaxWait:  500 * time.Millisecond,
+    })
+    defer reader.Close()
+
+    deadline, done := context.WithTimeout(context.Background(), 15*time.Second)
+    defer done()
+    for {
+        message, err := reader.ReadMessage(deadline)
+        if err != nil {
+            panic(err)
+        }
+        if string(message.Value) == payload {
+            fmt.Println("ok")
+            return
+        }
+    }
+}
+"""
+
+
+def test_go_kafka():
+    if not have("go"):
+        raise MatrixError("go-kafka selected but go is not available in PATH")
+
+    topic = matrix_topic("go-kafka")
+    payload = matrix_payload("go-kafka")
+    group = f"zmq-client-matrix-go-{os.getpid()}"
+
+    with tempfile.TemporaryDirectory(prefix="zmq-client-matrix-go-") as tmp:
+        source_path = os.path.join(tmp, "main.go")
+        with open(source_path, "w", encoding="utf-8") as f:
+            f.write(textwrap.dedent(GO_MATRIX_SOURCE).lstrip())
+
+        run(["go", "mod", "init", "zmq-client-matrix-go"], timeout=30, cwd=tmp)
+        run(["go", "get", GO_MODULE], timeout=120, cwd=tmp)
+        run(["go", "run", ".", BOOTSTRAP, topic, payload, group], timeout=120, cwd=tmp)
+    print("ok: go-kafka metadata and produce/fetch probes")
+
+
 def main():
     if not RUN_ENABLED:
         print("skip: set ZMQ_RUN_CLIENT_MATRIX=1 to run real-client matrix")
@@ -278,6 +485,10 @@ def main():
             test_kafka_python()
         elif tool == "confluent-kafka":
             test_confluent_kafka()
+        elif tool == "java-kafka":
+            test_java_kafka()
+        elif tool == "go-kafka":
+            test_go_kafka()
         else:
             raise MatrixError(f"unknown client matrix tool: {tool}")
 
