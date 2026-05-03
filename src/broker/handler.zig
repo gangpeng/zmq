@@ -19420,7 +19420,7 @@ pub const Broker = struct {
         if (api_version >= 1 and !skipFixedBytes(buf, &pos, 4)) return false; // voter_id
         if (!skipVoteTopics(buf, &pos, api_version)) return false;
         ser.skipTaggedFields(buf, &pos) catch return false;
-        return true;
+        return pos == buf.len;
     }
 
     fn skipVoteTopics(buf: []const u8, pos: *usize, api_version: i16) bool {
@@ -33245,6 +33245,39 @@ test "Broker.handleRequest Vote rejects truncated requests" {
         const req_len = buildTestRequest(&buf, 52, version, 5220 + @as(i32, @intCast(index)), header_mod.requestHeaderVersion(52, version));
         try testing.expect(broker.handleRequest(buf[0..req_len]) == null);
     }
+}
+
+test "Broker.handleRequest Vote rejects trailing bytes" {
+    const Req = generated.vote_request.VoteRequest;
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+
+    const zero_uuid = [_]u8{0} ** 16;
+    const partitions = [_]Req.TopicData.PartitionData{.{
+        .partition_index = 0,
+        .candidate_epoch = 1,
+        .candidate_id = 2,
+        .candidate_directory_id = zero_uuid,
+        .voter_directory_id = zero_uuid,
+        .last_offset_epoch = 0,
+        .last_offset = 0,
+    }};
+    const topics = [_]Req.TopicData{.{
+        .topic_name = "__cluster_metadata",
+        .partitions = &partitions,
+    }};
+    const req = Req{
+        .cluster_id = "vote-trailing-cluster",
+        .voter_id = 1,
+        .topics = &topics,
+    };
+
+    var buf: [1024]u8 = undefined;
+    var pos = buildTestRequest(&buf, 52, 1, 5222, header_mod.requestHeaderVersion(52, 1));
+    req.serialize(&buf, &pos, 1);
+
+    try expectTrailingByteRejected(&broker, &buf, pos);
 }
 
 test "Broker.handleRequest BeginQuorumEpoch returns generated not-controller responses" {

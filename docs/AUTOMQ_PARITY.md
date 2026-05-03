@@ -288,6 +288,8 @@ Status: completed for the initial catalog and DeleteGroups slice.
   validate-only flag, and tagged-fields section.
   IncrementalAlterConfigs now rejects trailing bytes after resources,
   config operations/values, validate-only flag, and tagged-fields section.
+  Vote now rejects trailing bytes after cluster ID, voter ID, topic
+  partitions, and tagged-fields section.
   MetadataRequest generated decoding now preserves nullable `Topics` semantics:
   v1+ null requests all topics, explicit empty arrays request no topic results,
   and v0 null topics are rejected as malformed.
