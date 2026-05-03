@@ -436,6 +436,19 @@ pub fn build(b: *std.Build) void {
         kraft_failover_step.dependOn(&run_kraft_failover.step);
     }
 
+    // External broker chaos harness. The real process scenarios skip unless
+    // ZMQ_RUN_CHAOS_TESTS=1 is set; the deterministic parser/fixture self-test
+    // is included in the default test step.
+    const chaos_step = b.step("test-chaos", "Run gated broker chaos harness");
+    {
+        const run_chaos = b.addSystemCommand(&.{ "python3", "tests/chaos_test.py" });
+        run_chaos.step.dependOn(b.getInstallStep());
+        chaos_step.dependOn(&run_chaos.step);
+
+        const chaos_self_test = b.addSystemCommand(&.{ "python3", "tests/chaos_test.py", "--self-test" });
+        test_step.dependOn(&chaos_self_test.step);
+    }
+
     // ---------------------------------------------------------------
     // Benchmark step
     // ---------------------------------------------------------------

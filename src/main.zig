@@ -296,12 +296,12 @@ pub fn main(init: std.process.Init) !void {
     // Validate: broker-only mode requires --voters to know the controller quorum
     if (process_roles.is_broker and !process_roles.is_controller and voters_str == null) {
         try stdout.print("  ERROR: --voters is required for broker-only mode (process.roles=broker)\n", .{});
-        return;
+        return error.InvalidConfiguration;
     }
     // Validate: port conflict between broker and controller
     if (process_roles.isCombined() and port == controller_port) {
         try stdout.print("  ERROR: --port and --controller-port must differ in combined mode (both are {d})\n", .{port});
-        return;
+        return error.InvalidConfiguration;
     }
 
     // Ignore SIGPIPE — writing to a closed TCP socket must not kill the broker.
@@ -430,7 +430,7 @@ pub fn main(init: std.process.Init) !void {
 
         brk.open() catch |err| {
             try stdout.print("  ERROR: Failed to open storage: {}\n", .{err});
-            return;
+            return error.BrokerOpenFailed;
         };
 
         // Load persisted PreparedObjectRegistry from the Raft data directory.
