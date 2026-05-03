@@ -9336,7 +9336,10 @@ pub const Broker = struct {
                 return ErrorCode.fenced_instance_id;
             }
         }
-        if (group.generation_id != generation_id) return ErrorCode.illegal_generation;
+        if (group.generation_id != generation_id) {
+            if (api_version >= 9) return ErrorCode.fenced_member_epoch;
+            return ErrorCode.illegal_generation;
+        }
         return ErrorCode.none;
     }
 
@@ -38469,6 +38472,61 @@ test "Broker.handleRequest OffsetCommit rejects illegal generation" {
     try testing.expectEqual(response.?.len, rpos);
     try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.illegal_generation)), resp.topics[0].partitions[0].error_code);
     try testing.expect((try broker.groups.fetchOffset("oc-illegal-generation-group", "oc-illegal-generation-topic", 0)) == null);
+}
+
+test "Broker.handleRequest OffsetCommit v9 maps stale KIP-848 member epoch" {
+    const Req = generated.offset_commit_request.OffsetCommitRequest;
+    const Resp = generated.offset_commit_response.OffsetCommitResponse;
+    const Topic = Req.OffsetCommitRequestTopic;
+    const Partition = Topic.OffsetCommitRequestPartition;
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+    try testing.expect(broker.ensureTopic("oc-kip848-topic"));
+    const subscriptions = [_][]const u8{"oc-kip848-topic"};
+    const joined = try broker.groups.joinGroupWithProtocol("oc-kip848-group", "oc-kip848-member", null, "consumer", "range", null, &subscriptions);
+
+    const partitions = [_]Partition{.{
+        .partition_index = 0,
+        .committed_offset = 101,
+        .committed_leader_epoch = -1,
+        .committed_metadata = "stale-member-epoch",
+    }};
+    const topics = [_]Topic{.{
+        .name = "oc-kip848-topic",
+        .partitions = &partitions,
+    }};
+    const req = Req{
+        .group_id = "oc-kip848-group",
+        .generation_id_or_member_epoch = joined.generation_id + 1,
+        .member_id = joined.member_id,
+        .group_instance_id = null,
+        .topics = &topics,
+    };
+
+    var buf: [512]u8 = undefined;
+    var pos = buildTestRequest(&buf, 8, 9, 839, header_mod.requestHeaderVersion(8, 9));
+    req.serialize(&buf, &pos, 9);
+
+    const response = broker.handleRequest(buf[0..pos]);
+    try testing.expect(response != null);
+    defer testing.allocator.free(response.?);
+
+    var rpos: usize = 0;
+    var response_header = try ResponseHeader.deserialize(testing.allocator, response.?, &rpos, header_mod.responseHeaderVersion(8, 9));
+    defer response_header.deinit(testing.allocator);
+    try testing.expectEqual(@as(i32, 839), response_header.correlation_id);
+
+    const resp = try Resp.deserialize(testing.allocator, response.?, &rpos, 9);
+    defer {
+        for (resp.topics) |topic| {
+            if (topic.partitions.len > 0) testing.allocator.free(topic.partitions);
+        }
+        if (resp.topics.len > 0) testing.allocator.free(resp.topics);
+    }
+    try testing.expectEqual(response.?.len, rpos);
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.fenced_member_epoch)), resp.topics[0].partitions[0].error_code);
+    try testing.expect((try broker.groups.fetchOffset("oc-kip848-group", "oc-kip848-topic", 0)) == null);
 }
 
 test "Broker.handleRequest OffsetCommit rejects oversized metadata" {

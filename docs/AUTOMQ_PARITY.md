@@ -173,7 +173,8 @@ Status: completed for the initial catalog and DeleteGroups slice.
   `FENCED_MEMBER_EPOCH`/`UNRELEASED_INSTANCE_ID` errors.
   OffsetFetch v9 now validates supplied KIP-848 `member_id`/`member_epoch`
   fields at the group response level while preserving no-identity admin offset
-  fetches.
+  fetches, and OffsetCommit v9 maps stale member epochs to
+  `FENCED_MEMBER_EPOCH` instead of the classic-generation error.
   AssignReplicasToDirs key 73 remains non-advertised until JBOD directory
   semantics exist, but direct requests now validate/decode generated flexible
   frames and return generated fail-closed responses, including requested
