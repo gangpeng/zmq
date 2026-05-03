@@ -19218,7 +19218,7 @@ pub const Broker = struct {
             }
         }
         if (flexible) ser.skipTaggedFields(buf, &pos) catch return false;
-        return true;
+        return pos == buf.len;
     }
 
     fn validateDescribeAclsRequestFrame(buf: []const u8, start_pos: usize, api_version: i16) bool {
@@ -21913,6 +21913,26 @@ test "Broker.handleRequest ListGroups rejects truncated request" {
     var buf: [128]u8 = undefined;
     const req_len = buildTestRequest(&buf, 16, 4, 1606, header_mod.requestHeaderVersion(16, 4));
     try testing.expect(broker.handleRequest(buf[0..req_len]) == null);
+}
+
+test "Broker.handleRequest ListGroups rejects trailing bytes" {
+    const Req = generated.list_groups_request.ListGroupsRequest;
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+
+    const states = [_]?[]const u8{"Stable"};
+    const types = [_]?[]const u8{"classic"};
+    const req = Req{
+        .states_filter = &states,
+        .types_filter = &types,
+    };
+
+    var buf: [512]u8 = undefined;
+    var pos = buildTestRequest(&buf, 16, 5, 1610, header_mod.requestHeaderVersion(16, 5));
+    req.serialize(&buf, &pos, 5);
+
+    try expectTrailingByteRejected(&broker, &buf, pos);
 }
 
 test "Broker.handleRequest ListGroups authorization denial uses generated response" {
