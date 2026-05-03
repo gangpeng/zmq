@@ -1640,6 +1640,36 @@ pub const Broker = struct {
         }
     }
 
+    fn cloneReplicaDirectoryAssignments(self: *Broker) !std.StringHashMap(ReplicaDirectoryAssignment) {
+        var snapshot = std.StringHashMap(ReplicaDirectoryAssignment).init(self.allocator);
+        errdefer self.freeReplicaDirectoryAssignmentSnapshot(&snapshot);
+
+        var it = self.replica_directory_assignments.iterator();
+        while (it.next()) |entry| {
+            const key = try self.allocator.dupe(u8, entry.key_ptr.*);
+            snapshot.put(key, entry.value_ptr.*) catch |err| {
+                self.allocator.free(key);
+                return err;
+            };
+        }
+
+        return snapshot;
+    }
+
+    fn freeReplicaDirectoryAssignmentSnapshot(self: *Broker, snapshot: *std.StringHashMap(ReplicaDirectoryAssignment)) void {
+        var it = snapshot.iterator();
+        while (it.next()) |entry| {
+            self.allocator.free(entry.key_ptr.*);
+        }
+        snapshot.deinit();
+    }
+
+    fn restoreReplicaDirectoryAssignmentSnapshot(self: *Broker, snapshot: *std.StringHashMap(ReplicaDirectoryAssignment)) void {
+        const current = self.replica_directory_assignments;
+        self.replica_directory_assignments = snapshot.*;
+        snapshot.* = current;
+    }
+
     fn restoreAutoMqMetadata(self: *Broker, snapshot: MetadataPersistence.AutoMqMetadataSnapshot) !void {
         self.clearAutoMqMetadata();
         errdefer self.clearAutoMqMetadata();
@@ -1842,9 +1872,13 @@ pub const Broker = struct {
     }
 
     fn persistReplicaDirectoryAssignmentsLocal(self: *Broker) void {
-        self.persistence.saveReplicaDirectoryAssignments(&self.replica_directory_assignments) catch |err| {
+        self.persistReplicaDirectoryAssignmentsDurably() catch |err| {
             log.warn("Failed to persist replica directory assignments: {}", .{err});
         };
+    }
+
+    fn persistReplicaDirectoryAssignmentsDurably(self: *Broker) !void {
+        try self.persistence.saveReplicaDirectoryAssignments(&self.replica_directory_assignments);
     }
 
     fn persistShareGroupStatesLocal(self: *Broker) void {
@@ -17333,17 +17367,34 @@ pub const Broker = struct {
 
         const directories = self.buildAssignReplicasToDirsDirectories(req, top_error, &pending_assignments) catch return null;
         defer self.freeAssignReplicasToDirsDirectories(directories);
-        if (top_error == .none) {
+
+        var response_error = top_error;
+        if (top_error == .none and pending_assignments.items.len > 0) {
+            var previous_assignments = self.cloneReplicaDirectoryAssignments() catch return null;
+            defer self.freeReplicaDirectoryAssignmentSnapshot(&previous_assignments);
+
+            var mutation_failed = false;
             self.commitReplicaDirectoryAssignments(pending_assignments.items) catch |err| {
                 log.warn("Failed to commit local replica directory assignments: {}", .{err});
-                return null;
+                mutation_failed = true;
             };
-            self.persistReplicaDirectoryAssignmentsLocal();
+            if (!mutation_failed) {
+                self.persistReplicaDirectoryAssignmentsDurably() catch |err| {
+                    log.warn("AssignReplicasToDirs assignment snapshot write failed: {}", .{err});
+                    mutation_failed = true;
+                };
+            }
+
+            if (mutation_failed) {
+                self.restoreReplicaDirectoryAssignmentSnapshot(&previous_assignments);
+                self.markAssignReplicasToDirsStorageError(directories);
+                response_error = .kafka_storage_error;
+            }
         }
 
         const resp = Resp{
             .throttle_time_ms = 0,
-            .error_code = top_error.toInt(),
+            .error_code = response_error.toInt(),
             .directories = directories,
         };
         return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
@@ -17360,6 +17411,19 @@ pub const Broker = struct {
         if (req.broker_id != self.node_id) return ErrorCode.broker_id_not_registered;
         if (req.broker_epoch < 0) return ErrorCode.stale_broker_epoch;
         return ErrorCode.none;
+    }
+
+    fn markAssignReplicasToDirsStorageError(self: *Broker, directories: []generated.assign_replicas_to_dirs_response.AssignReplicasToDirsResponse.DirectoryData) void {
+        _ = self;
+        for (directories) |directory| {
+            for (directory.topics) |topic| {
+                for (@constCast(topic.partitions)) |*partition| {
+                    if (partition.error_code == ErrorCode.none.toInt()) {
+                        partition.error_code = ErrorCode.kafka_storage_error.toInt();
+                    }
+                }
+            }
+        }
     }
 
     fn buildAssignReplicasToDirsDirectories(
@@ -31697,6 +31761,88 @@ test "Broker.handleRequest AssignReplicasToDirs persists local assignments acros
         const stored = (try restarted.getReplicaDirectoryAssignment(topic_id, 0)) orelse return error.ExpectedReplicaDirectoryAssignment;
         try testing.expectEqualSlices(u8, directory_id[0..], stored[0..]);
     }
+}
+
+test "Broker.handleRequest AssignReplicasToDirs rolls back when local persistence fails" {
+    const Req = generated.assign_replicas_to_dirs_request.AssignReplicasToDirsRequest;
+    const Resp = generated.assign_replicas_to_dirs_response.AssignReplicasToDirsResponse;
+    const DirectoryData = Req.DirectoryData;
+    const TopicData = DirectoryData.TopicData;
+    const PartitionData = TopicData.PartitionData;
+    const fs = @import("fs_compat");
+
+    const tmp_dir = "/tmp/zmq-assign-replicas-to-dirs-persist-fail-test";
+    fs.deleteTreeAbsolute(tmp_dir) catch {};
+    try fs.makeDirAbsolute(tmp_dir);
+    defer fs.deleteTreeAbsolute(tmp_dir) catch {};
+
+    var broker = Broker.initWithConfig(testing.allocator, 1, 9092, .{ .data_dir = tmp_dir });
+    defer broker.deinit();
+
+    _ = broker.ensureTopic("assign-dir-persist-fail-topic");
+    const topic_id = broker.topics.get("assign-dir-persist-fail-topic").?.topic_id;
+    const old_directory_id = [_]u8{0x2a} ** 16;
+    const new_directory_id = [_]u8{0x2b} ** 16;
+    const old_key = try broker.replicaDirectoryAssignmentKey(topic_id, 0);
+    try broker.replica_directory_assignments.put(old_key, .{
+        .topic_id = topic_id,
+        .partition_index = 0,
+        .directory_id = old_directory_id,
+    });
+
+    const assignments_path = try std.fmt.allocPrint(testing.allocator, "{s}/replica_directory_assignments.meta", .{tmp_dir});
+    defer testing.allocator.free(assignments_path);
+    try fs.makeDirAbsolute(assignments_path);
+
+    const partitions = [_]PartitionData{.{
+        .partition_index = 0,
+    }};
+    const topics = [_]TopicData{.{
+        .topic_id = topic_id,
+        .partitions = &partitions,
+    }};
+    const directories = [_]DirectoryData{.{
+        .id = new_directory_id,
+        .topics = &topics,
+    }};
+    const req = Req{
+        .broker_id = 1,
+        .broker_epoch = 1,
+        .directories = &directories,
+    };
+
+    var buf: [256]u8 = undefined;
+    var pos = buildTestRequest(&buf, 73, 0, 7304, header_mod.requestHeaderVersion(73, 0));
+    req.serialize(&buf, &pos, 0);
+
+    const response = broker.handleRequest(buf[0..pos]);
+    try testing.expect(response != null);
+    defer testing.allocator.free(response.?);
+
+    var rpos: usize = 0;
+    var response_header = try ResponseHeader.deserialize(testing.allocator, response.?, &rpos, header_mod.responseHeaderVersion(73, 0));
+    defer response_header.deinit(testing.allocator);
+    try testing.expectEqual(@as(i32, 7304), response_header.correlation_id);
+
+    const resp = try Resp.deserialize(testing.allocator, response.?, &rpos, 0);
+    defer {
+        for (resp.directories) |directory| {
+            for (directory.topics) |topic| {
+                if (topic.partitions.len > 0) testing.allocator.free(topic.partitions);
+            }
+            if (directory.topics.len > 0) testing.allocator.free(directory.topics);
+        }
+        if (resp.directories.len > 0) testing.allocator.free(resp.directories);
+    }
+
+    try testing.expectEqual(response.?.len, rpos);
+    try testing.expectEqual(ErrorCode.kafka_storage_error.toInt(), resp.error_code);
+    try testing.expectEqual(@as(usize, 1), resp.directories.len);
+    try testing.expectEqual(@as(usize, 1), resp.directories[0].topics.len);
+    try testing.expectEqual(@as(usize, 1), resp.directories[0].topics[0].partitions.len);
+    try testing.expectEqual(ErrorCode.kafka_storage_error.toInt(), resp.directories[0].topics[0].partitions[0].error_code);
+    const restored = (try broker.getReplicaDirectoryAssignment(topic_id, 0)) orelse return error.ExpectedReplicaDirectoryAssignment;
+    try testing.expectEqualSlices(u8, old_directory_id[0..], restored[0..]);
 }
 
 test "Broker.handleRequest AssignReplicasToDirs rejects malformed request" {
