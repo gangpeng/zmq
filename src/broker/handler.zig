@@ -18999,7 +18999,7 @@ pub const Broker = struct {
             if (flexible) ser.skipTaggedFields(buf, &pos) catch return false;
         }
         if (flexible) ser.skipTaggedFields(buf, &pos) catch return false;
-        return true;
+        return pos == buf.len;
     }
 
     fn validateOffsetFetchRequestFrame(buf: []const u8, start_pos: usize, api_version: i16) bool {
@@ -37014,6 +37014,39 @@ test "Broker.handleRequest OffsetCommit rejects truncated request" {
     var buf: [128]u8 = undefined;
     const req_len = buildTestRequest(&buf, 8, 8, 809, header_mod.requestHeaderVersion(8, 8));
     try testing.expect(broker.handleRequest(buf[0..req_len]) == null);
+}
+
+test "Broker.handleRequest OffsetCommit rejects trailing bytes" {
+    const Req = generated.offset_commit_request.OffsetCommitRequest;
+    const Topic = Req.OffsetCommitRequestTopic;
+    const Partition = Topic.OffsetCommitRequestPartition;
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+
+    const partitions = [_]Partition{.{
+        .partition_index = 0,
+        .committed_offset = 123,
+        .committed_leader_epoch = -1,
+        .committed_metadata = "trailing-meta",
+    }};
+    const topics = [_]Topic{.{
+        .name = "oc-trailing-topic",
+        .partitions = &partitions,
+    }};
+    const req = Req{
+        .group_id = "oc-trailing-group",
+        .generation_id_or_member_epoch = -1,
+        .member_id = "",
+        .group_instance_id = null,
+        .topics = &topics,
+    };
+
+    var buf: [512]u8 = undefined;
+    var pos = buildTestRequest(&buf, 8, 8, 830, header_mod.requestHeaderVersion(8, 8));
+    req.serialize(&buf, &pos, 8);
+
+    try expectTrailingByteRejected(&broker, &buf, pos);
 }
 
 test "Broker.handleRequest OffsetCommit authorization denial uses generated response" {

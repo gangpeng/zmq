@@ -262,6 +262,8 @@ Status: completed for the initial catalog and DeleteGroups slice.
   fields and tagged-fields section.
   LeaveGroup now rejects trailing bytes after the final legacy member or
   flexible member-identity list and tagged-fields section.
+  OffsetCommit now rejects trailing bytes after the final offset topic,
+  partition, and tagged-fields section.
   MetadataRequest generated decoding now preserves nullable `Topics` semantics:
   v1+ null requests all topics, explicit empty arrays request no topic results,
   and v0 null topics are rejected as malformed.
