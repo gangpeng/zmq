@@ -1,5 +1,6 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
+const fs_compat = @import("fs_compat");
 const log = std.log.scoped(.broker);
 
 const protocol = @import("protocol");
@@ -104,6 +105,8 @@ pub const Broker = struct {
     finalized_features_epoch: i64 = -1,
     /// Last accepted client telemetry payloads keyed by client instance UUID hex.
     client_telemetry_samples: std.StringHashMap(ClientTelemetrySample),
+    /// Optional append-only JSONL sink for accepted client telemetry payloads.
+    client_telemetry_export_path: ?[]const u8 = null,
     /// Local share-group partition state keyed by group/topic-id/partition.
     share_group_states: std.StringHashMap(SharePartitionState),
     /// Local share fetch session epochs keyed by group/member.
@@ -422,6 +425,8 @@ pub const Broker = struct {
         tls_ca_file: ?[]const u8 = null,
         /// Client certificate auth mode: "none", "requested", "required"
         tls_client_auth: []const u8 = "none",
+        /// Optional append-only JSONL sink for KIP-714 PushTelemetry payloads.
+        client_telemetry_export_path: ?[]const u8 = null,
     };
 
     pub const WalFlushMode = storage.wal.WalFlushMode;
@@ -468,6 +473,7 @@ pub const Broker = struct {
             .auto_mq_group_promotions = std.StringHashMap(AutoMqGroupPromotion).init(alloc),
             .finalized_features = std.StringHashMap(i16).init(alloc),
             .client_telemetry_samples = std.StringHashMap(ClientTelemetrySample).init(alloc),
+            .client_telemetry_export_path = config.client_telemetry_export_path,
             .share_group_states = std.StringHashMap(SharePartitionState).init(alloc),
             .share_group_sessions = std.StringHashMap(i32).init(alloc),
             .replica_directory_assignments = std.StringHashMap(ReplicaDirectoryAssignment).init(alloc),
@@ -18760,7 +18766,14 @@ pub const Broker = struct {
             @intFromEnum(ErrorCode.none);
 
         if (error_code == @intFromEnum(ErrorCode.none)) {
-            self.recordClientTelemetry(req.client_instance_id, req.metrics, req.terminating) catch return null;
+            self.recordClientTelemetry(req.client_instance_id, req.metrics, req.terminating) catch |err| {
+                log.warn("Failed to record/export client telemetry: {}", .{err});
+                const resp = Resp{
+                    .throttle_time_ms = 0,
+                    .error_code = @intFromEnum(ErrorCode.kafka_storage_error),
+                };
+                return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+            };
         }
 
         const resp = Resp{
@@ -19069,6 +19082,8 @@ pub const Broker = struct {
     }
 
     fn recordClientTelemetry(self: *Broker, client_instance_id: [16]u8, metrics: ?[]const u8, terminating: bool) !void {
+        try self.exportClientTelemetry(client_instance_id, metrics, terminating);
+
         const key = try self.clientTelemetryKey(client_instance_id);
         errdefer self.allocator.free(key);
 
@@ -19105,6 +19120,37 @@ pub const Broker = struct {
         }
         self.metrics.incrementCounter("kafka_client_telemetry_pushes_total");
         self.updateClientTelemetryMetrics();
+    }
+
+    fn exportClientTelemetry(self: *Broker, client_instance_id: [16]u8, metrics: ?[]const u8, terminating: bool) !void {
+        const path = self.client_telemetry_export_path orelse return;
+        errdefer self.metrics.incrementCounter("kafka_client_telemetry_export_errors_total");
+
+        const key = try self.clientTelemetryKey(client_instance_id);
+        defer self.allocator.free(key);
+
+        const metric_bytes = metrics orelse &.{};
+        const encoder = std.base64.standard.Encoder;
+        const encoded_metrics = try self.allocator.alloc(u8, encoder.calcSize(metric_bytes.len));
+        defer self.allocator.free(encoded_metrics);
+        _ = encoder.encode(encoded_metrics, metric_bytes);
+
+        const line = try std.fmt.allocPrint(
+            self.allocator,
+            "{{\"ts_ms\":{d},\"client_instance_id\":\"{s}\",\"terminating\":{},\"metrics_base64\":\"{s}\"}}\n",
+            .{ @import("time_compat").milliTimestamp(), key, terminating, encoded_metrics },
+        );
+        defer self.allocator.free(line);
+
+        const file = try fs_compat.createFileAbsolute(path, .{ .truncate = false });
+        defer file.close();
+        const stat = try file.stat();
+        try file.seekTo(stat.size);
+        try file.writeAll(line);
+        try file.sync();
+
+        self.metrics.incrementCounter("kafka_client_telemetry_exported_total");
+        self.metrics.addCounter("kafka_client_telemetry_export_bytes_total", @intCast(metric_bytes.len));
     }
 
     fn updateClientTelemetryMetrics(self: *Broker) void {
@@ -33919,6 +33965,109 @@ test "Broker.handleRequest PushTelemetry accepts default subscription" {
     try testing.expectEqual(@as(u64, 1), broker.metrics.counters.get("kafka_client_telemetry_pushes_total").?.value);
     try testing.expectEqual(@as(f64, 1.0), broker.metrics.gauges.get("kafka_client_telemetry_samples").?.value);
     try testing.expectEqual(@as(f64, @floatFromInt(metrics.len)), broker.metrics.gauges.get("kafka_client_telemetry_bytes").?.value);
+}
+
+test "Broker.handleRequest PushTelemetry exports accepted telemetry to JSONL sink" {
+    const Req = generated.push_telemetry_request.PushTelemetryRequest;
+    const Resp = generated.push_telemetry_response.PushTelemetryResponse;
+
+    const tmp_dir = "/tmp/zmq-telemetry-export-test";
+    fs_compat.deleteTreeAbsolute(tmp_dir) catch {};
+    try fs_compat.makeDirAbsolute(tmp_dir);
+    defer fs_compat.deleteTreeAbsolute(tmp_dir) catch {};
+    const export_path = "/tmp/zmq-telemetry-export-test/client-telemetry.jsonl";
+
+    var broker = Broker.initWithConfig(testing.allocator, 1, 9092, .{
+        .client_telemetry_export_path = export_path,
+    });
+    defer broker.deinit();
+
+    const client_id = [_]u8{0xab} ** 16;
+    const metrics = [_]u8{ 0x08, 0x01 };
+    const req = Req{
+        .client_instance_id = client_id,
+        .subscription_id = 1,
+        .terminating = false,
+        .compression_type = 0,
+        .metrics = &metrics,
+    };
+
+    var buf: [256]u8 = undefined;
+    var pos = buildTestRequest(&buf, 72, 0, 7207, header_mod.requestHeaderVersion(72, 0));
+    req.serialize(&buf, &pos, 0);
+
+    const response = broker.handleRequest(buf[0..pos]);
+    try testing.expect(response != null);
+    defer testing.allocator.free(response.?);
+
+    var rpos: usize = 0;
+    var response_header = try ResponseHeader.deserialize(testing.allocator, response.?, &rpos, header_mod.responseHeaderVersion(72, 0));
+    defer response_header.deinit(testing.allocator);
+    try testing.expectEqual(@as(i32, 7207), response_header.correlation_id);
+
+    const resp = try Resp.deserialize(testing.allocator, response.?, &rpos, 0);
+    try testing.expectEqual(response.?.len, rpos);
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.none)), resp.error_code);
+
+    const file = try fs_compat.openFileAbsolute(export_path, .{});
+    defer file.close();
+    const exported = try file.readToEndAlloc(testing.allocator, 4096);
+    defer testing.allocator.free(exported);
+
+    try testing.expect(std.mem.indexOf(u8, exported, "\"client_instance_id\":\"abababababababababababababababab\"") != null);
+    try testing.expect(std.mem.indexOf(u8, exported, "\"terminating\":false") != null);
+    try testing.expect(std.mem.indexOf(u8, exported, "\"metrics_base64\":\"CAE=\"") != null);
+    try testing.expectEqual(@as(u64, 1), broker.metrics.counters.get("kafka_client_telemetry_exported_total").?.value);
+    try testing.expectEqual(@as(u64, metrics.len), broker.metrics.counters.get("kafka_client_telemetry_export_bytes_total").?.value);
+    try testing.expectEqual(@as(u64, 0), broker.metrics.counters.get("kafka_client_telemetry_export_errors_total").?.value);
+    try testing.expectEqual(@as(usize, 1), broker.client_telemetry_samples.count());
+}
+
+test "Broker.handleRequest PushTelemetry fails closed when telemetry export fails" {
+    const Req = generated.push_telemetry_request.PushTelemetryRequest;
+    const Resp = generated.push_telemetry_response.PushTelemetryResponse;
+
+    const tmp_dir = "/tmp/zmq-telemetry-export-fail-test";
+    fs_compat.deleteTreeAbsolute(tmp_dir) catch {};
+    try fs_compat.makeDirAbsolute(tmp_dir);
+    defer fs_compat.deleteTreeAbsolute(tmp_dir) catch {};
+    const export_path = "/tmp/zmq-telemetry-export-fail-test/missing/client-telemetry.jsonl";
+
+    var broker = Broker.initWithConfig(testing.allocator, 1, 9092, .{
+        .client_telemetry_export_path = export_path,
+    });
+    defer broker.deinit();
+
+    const client_id = [_]u8{0xcd} ** 16;
+    const metrics = [_]u8{ 0x08, 0x01 };
+    const req = Req{
+        .client_instance_id = client_id,
+        .subscription_id = 1,
+        .terminating = false,
+        .compression_type = 0,
+        .metrics = &metrics,
+    };
+
+    var buf: [256]u8 = undefined;
+    var pos = buildTestRequest(&buf, 72, 0, 7208, header_mod.requestHeaderVersion(72, 0));
+    req.serialize(&buf, &pos, 0);
+
+    const response = broker.handleRequest(buf[0..pos]);
+    try testing.expect(response != null);
+    defer testing.allocator.free(response.?);
+
+    var rpos: usize = 0;
+    var response_header = try ResponseHeader.deserialize(testing.allocator, response.?, &rpos, header_mod.responseHeaderVersion(72, 0));
+    defer response_header.deinit(testing.allocator);
+    try testing.expectEqual(@as(i32, 7208), response_header.correlation_id);
+
+    const resp = try Resp.deserialize(testing.allocator, response.?, &rpos, 0);
+    try testing.expectEqual(response.?.len, rpos);
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.kafka_storage_error)), resp.error_code);
+    try testing.expectEqual(@as(usize, 0), broker.client_telemetry_samples.count());
+    try testing.expectEqual(@as(u64, 0), broker.metrics.counters.get("kafka_client_telemetry_pushes_total").?.value);
+    try testing.expectEqual(@as(u64, 0), broker.metrics.counters.get("kafka_client_telemetry_exported_total").?.value);
+    try testing.expectEqual(@as(u64, 1), broker.metrics.counters.get("kafka_client_telemetry_export_errors_total").?.value);
 }
 
 test "Broker.handleRequest PushTelemetry rejects unknown subscription" {
@@ -50789,6 +50938,9 @@ test "Broker client telemetry metrics are registered" {
 
     try testing.expect(broker.metrics.counters.contains("kafka_client_telemetry_pushes_total"));
     try testing.expect(broker.metrics.counters.contains("kafka_client_telemetry_terminations_total"));
+    try testing.expect(broker.metrics.counters.contains("kafka_client_telemetry_exported_total"));
+    try testing.expect(broker.metrics.counters.contains("kafka_client_telemetry_export_errors_total"));
+    try testing.expect(broker.metrics.counters.contains("kafka_client_telemetry_export_bytes_total"));
     try testing.expect(broker.metrics.gauges.contains("kafka_client_telemetry_samples"));
     try testing.expect(broker.metrics.gauges.contains("kafka_client_telemetry_bytes"));
 }

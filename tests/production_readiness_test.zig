@@ -647,6 +647,8 @@ test "Observability dashboard and alerts reference exported metrics" {
         "s3_block_cache_size_bytes",
         "kafka_client_telemetry_pushes_total",
         "kafka_client_telemetry_terminations_total",
+        "kafka_client_telemetry_exported_total",
+        "kafka_client_telemetry_export_errors_total",
         "kafka_client_telemetry_samples",
         "kafka_client_telemetry_bytes",
         "raft_role",
@@ -672,6 +674,7 @@ test "Observability dashboard and alerts reference exported metrics" {
         "s3_request_duration_seconds_bucket",
         "compaction_errors_total",
         "kafka_client_telemetry_bytes",
+        "kafka_client_telemetry_export_errors_total",
     };
     for (alert_metrics) |metric| {
         try testing.expect(std.mem.indexOf(u8, alerts, metric) != null);

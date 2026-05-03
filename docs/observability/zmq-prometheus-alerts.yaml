@@ -67,3 +67,12 @@ groups:
         annotations:
           summary: ZMQ retained client telemetry exceeds 100 MiB.
           description: Client telemetry retention may be growing without terminating cleanup.
+
+      - alert: ZMQClientTelemetryExportErrors
+        expr: rate(kafka_client_telemetry_export_errors_total[5m]) > 0
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: ZMQ client telemetry export is failing.
+          description: Accepted client telemetry cannot be delivered to the configured external sink.

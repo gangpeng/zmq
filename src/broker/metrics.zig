@@ -50,6 +50,9 @@ pub fn registerBrokerMetrics(registry: *MetricRegistry) !void {
     try registry.registerGauge("kafka_network_connections_active", "Number of active network connections");
     try registry.registerCounter("kafka_client_telemetry_pushes_total", "Accepted client telemetry pushes");
     try registry.registerCounter("kafka_client_telemetry_terminations_total", "Accepted terminating client telemetry pushes");
+    try registry.registerCounter("kafka_client_telemetry_exported_total", "Client telemetry pushes exported to an external sink");
+    try registry.registerCounter("kafka_client_telemetry_export_errors_total", "Client telemetry export failures");
+    try registry.registerCounter("kafka_client_telemetry_export_bytes_total", "Client telemetry bytes exported to an external sink");
     try registry.registerGauge("kafka_client_telemetry_samples", "Retained active client telemetry samples");
     try registry.registerGauge("kafka_client_telemetry_bytes", "Retained active client telemetry bytes");
 }
@@ -117,6 +120,9 @@ test "registerBrokerMetrics" {
     try testing.expect(registry.gauges.contains("kafka_network_connections_active"));
     try testing.expect(registry.counters.contains("kafka_client_telemetry_pushes_total"));
     try testing.expect(registry.counters.contains("kafka_client_telemetry_terminations_total"));
+    try testing.expect(registry.counters.contains("kafka_client_telemetry_exported_total"));
+    try testing.expect(registry.counters.contains("kafka_client_telemetry_export_errors_total"));
+    try testing.expect(registry.counters.contains("kafka_client_telemetry_export_bytes_total"));
     try testing.expect(registry.gauges.contains("kafka_client_telemetry_samples"));
     try testing.expect(registry.gauges.contains("kafka_client_telemetry_bytes"));
 }

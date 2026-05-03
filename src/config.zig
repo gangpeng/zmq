@@ -169,6 +169,10 @@ pub fn applyConfig(config: *@import("broker").Broker.BrokerConfig, cfg: *const C
     if (cfg.getString("ssl.keyfile")) |f| config.tls_key_file = f;
     if (cfg.getString("ssl.cafile")) |f| config.tls_ca_file = f;
     if (cfg.getString("ssl.client.auth")) |a| config.tls_client_auth = a;
+
+    // Client telemetry export configuration. Accepted PushTelemetry payloads are
+    // written as opaque base64 JSONL records to this append-only sink.
+    if (cfg.getString("client.telemetry.export.file")) |f| config.client_telemetry_export_path = f;
 }
 
 // ---------------------------------------------------------------
@@ -246,4 +250,15 @@ test "ConfigFile values with equals sign" {
 
     try cfg.parse("url=http://host:9000/path?a=1&b=2\n");
     try testing.expectEqualStrings("http://host:9000/path?a=1&b=2", cfg.getString("url").?);
+}
+
+test "ConfigFile applies client telemetry export sink" {
+    var cfg = ConfigFile.init(testing.allocator);
+    defer cfg.deinit();
+
+    try cfg.parse("client.telemetry.export.file=/var/lib/zmq/client-telemetry.jsonl\n");
+
+    var broker_config = @import("broker").Broker.BrokerConfig{};
+    applyConfig(&broker_config, &cfg);
+    try testing.expectEqualStrings("/var/lib/zmq/client-telemetry.jsonl", broker_config.client_telemetry_export_path.?);
 }

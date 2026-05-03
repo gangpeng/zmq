@@ -182,6 +182,7 @@ pub fn main(init: std.process.Init) !void {
     var tls_key_file: ?[]const u8 = null;
     var tls_ca_file: ?[]const u8 = null;
     var tls_client_auth_str: []const u8 = "none";
+    var client_telemetry_export_path: ?[]const u8 = null;
 
     var args = try std.process.Args.Iterator.initAllocator(init.minimal.args, alloc);
     defer args.deinit();
@@ -245,6 +246,8 @@ pub fn main(init: std.process.Init) !void {
             tls_ca_file = args.next();
         } else if (std.mem.eql(u8, arg, "--tls-client-auth")) {
             if (args.next()) |v| tls_client_auth_str = v;
+        } else if (std.mem.eql(u8, arg, "--client-telemetry-export-file")) {
+            client_telemetry_export_path = args.next();
         } else {
             port = std.fmt.parseInt(u16, arg, 10) catch port;
         }
@@ -287,6 +290,7 @@ pub fn main(init: std.process.Init) !void {
         if (cfg.getString("ssl.keyfile")) |f| tls_key_file = f;
         if (cfg.getString("ssl.cafile")) |f| tls_ca_file = f;
         if (cfg.getString("ssl.client.auth")) |a| tls_client_auth_str = a;
+        if (client_telemetry_export_path == null) client_telemetry_export_path = cfg.getString("client.telemetry.export.file");
     }
 
     // Validate: broker-only mode requires --voters to know the controller quorum
@@ -398,6 +402,7 @@ pub fn main(init: std.process.Init) !void {
             .cache_max_size = cache_max_size,
             .s3_block_cache_size = s3_block_cache_size,
             .compaction_interval_ms = compaction_interval,
+            .client_telemetry_export_path = client_telemetry_export_path,
         });
         broker = brk;
         // Re-wire internal pointers that became stale after the struct copy
