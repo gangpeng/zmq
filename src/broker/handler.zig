@@ -19294,7 +19294,7 @@ pub const Broker = struct {
         }
         if (!skipFixedBytes(buf, &pos, 1)) return false; // validate_only
         if (flexible) ser.skipTaggedFields(buf, &pos) catch return false;
-        return true;
+        return pos == buf.len;
     }
 
     fn validateCreateTopicsRequestFrame(buf: []const u8, start_pos: usize, api_version: i16) bool {
@@ -24895,6 +24895,33 @@ test "Broker.handleRequest AlterConfigs rejects truncated request" {
     var buf: [128]u8 = undefined;
     const req_len = buildTestRequest(&buf, 33, 2, 3304, header_mod.requestHeaderVersion(33, 2));
     try testing.expect(broker.handleRequest(buf[0..req_len]) == null);
+}
+
+test "Broker.handleRequest AlterConfigs rejects trailing bytes" {
+    const Req = generated.alter_configs_request.AlterConfigsRequest;
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+
+    const configs = [_]Req.AlterConfigsResource.AlterableConfig{.{
+        .name = "retention.ms",
+        .value = "60000",
+    }};
+    const resources = [_]Req.AlterConfigsResource{.{
+        .resource_type = 2,
+        .resource_name = "alter-cfg-trailing-topic",
+        .configs = &configs,
+    }};
+    const req = Req{
+        .resources = &resources,
+        .validate_only = true,
+    };
+
+    var buf: [512]u8 = undefined;
+    var pos = buildTestRequest(&buf, 33, 2, 3307, header_mod.requestHeaderVersion(33, 2));
+    req.serialize(&buf, &pos, 2);
+
+    try expectTrailingByteRejected(&broker, &buf, pos);
 }
 
 test "Broker.handleRequest CreatePartitions v2 returns generated response and expands topic" {
