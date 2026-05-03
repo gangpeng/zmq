@@ -10017,6 +10017,10 @@ pub const Broker = struct {
             var error_message: ?[]const u8 = null;
             var topic_config = TopicConfig{};
             const config_result = applyCreateTopicConfigs(&topic_config, topic_req.configs);
+            const config_validation = if (actual_rf > 0 and config_result.error_code == @intFromEnum(ErrorCode.none))
+                validateTopicConfigForReplication(topic_config, actual_rf)
+            else
+                IncrementalAlterConfigResult{ .error_code = @intFromEnum(ErrorCode.none) };
 
             if (topic_name.len == 0) {
                 error_code = @intFromEnum(ErrorCode.invalid_topic_exception);
@@ -10031,6 +10035,9 @@ pub const Broker = struct {
             } else if (config_result.error_code != @intFromEnum(ErrorCode.none)) {
                 error_code = config_result.error_code;
                 error_message = config_result.error_message;
+            } else if (config_validation.error_code != @intFromEnum(ErrorCode.none)) {
+                error_code = config_validation.error_code;
+                error_message = config_validation.error_message;
             } else if (!req.validate_only) {
                 const name_copy = self.allocator.dupe(u8, topic_name) catch return null;
                 const key_copy = self.allocator.dupe(u8, topic_name) catch {
@@ -13343,6 +13350,8 @@ pub const Broker = struct {
             if (result.error_code != @intFromEnum(ErrorCode.none)) return result;
             if (result.mutated) updated = true;
         }
+        const validation_result = validateTopicConfigForReplication(next_config, topic_info.replication_factor);
+        if (validation_result.error_code != @intFromEnum(ErrorCode.none)) return validation_result;
 
         if (!validate_only and updated) topic_info.config = next_config;
         return .{
@@ -14913,6 +14922,8 @@ pub const Broker = struct {
             if (result.error_code != @intFromEnum(ErrorCode.none)) return result;
             if (result.mutated) updated = true;
         }
+        const validation_result = validateTopicConfigForReplication(next_config, topic_info.replication_factor);
+        if (validation_result.error_code != @intFromEnum(ErrorCode.none)) return validation_result;
 
         if (!validate_only and updated) topic_info.config = next_config;
         return .{
@@ -14969,6 +14980,22 @@ pub const Broker = struct {
             .error_code = @intFromEnum(ErrorCode.none),
             .error_message = null,
             .mutated = true,
+        };
+    }
+
+    fn validateTopicConfigForReplication(topic_config: TopicConfig, replication_factor: i16) IncrementalAlterConfigResult {
+        if (topic_config.max_message_bytes <= 0) return invalidTopicConfigValue();
+        if (topic_config.min_insync_replicas <= 0) return invalidTopicConfigValue();
+        if (replication_factor > 0 and topic_config.min_insync_replicas > @as(i32, replication_factor)) {
+            return .{
+                .error_code = @intFromEnum(ErrorCode.invalid_config),
+                .error_message = "min.insync.replicas cannot exceed replication factor",
+            };
+        }
+        return .{
+            .error_code = @intFromEnum(ErrorCode.none),
+            .error_message = null,
+            .mutated = false,
         };
     }
 
@@ -26125,6 +26152,7 @@ test "Broker.handleRequest AlterConfigs v2 returns generated response and update
     var broker = Broker.init(testing.allocator, 1, 9092);
     defer broker.deinit();
     try testing.expect(broker.ensureTopic("alter-cfg-topic"));
+    broker.topics.getPtr("alter-cfg-topic").?.replication_factor = 2;
 
     const configs = [_]Req.AlterConfigsResource.AlterableConfig{.{
         .name = "min.insync.replicas",
@@ -26163,6 +26191,76 @@ test "Broker.handleRequest AlterConfigs v2 returns generated response and update
     try testing.expectEqual(@as(i8, 2), resp.responses[0].resource_type);
     try testing.expectEqualStrings("alter-cfg-topic", resp.responses[0].resource_name.?);
     try testing.expectEqual(@as(i32, 2), broker.topics.get("alter-cfg-topic").?.config.min_insync_replicas);
+}
+
+test "Broker.handleRequest AlterConfigs rejects invalid topic config values" {
+    const Req = generated.alter_configs_request.AlterConfigsRequest;
+    const Resp = generated.alter_configs_response.AlterConfigsResponse;
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+    try testing.expect(broker.ensureTopic("alter-cfg-zero-min-isr-topic"));
+    try testing.expect(broker.ensureTopic("alter-cfg-high-min-isr-topic"));
+    try testing.expect(broker.ensureTopic("alter-cfg-zero-max-message-topic"));
+
+    const zero_min_isr_config = [_]Req.AlterConfigsResource.AlterableConfig{.{
+        .name = "min.insync.replicas",
+        .value = "0",
+    }};
+    const high_min_isr_config = [_]Req.AlterConfigsResource.AlterableConfig{.{
+        .name = "min.insync.replicas",
+        .value = "2",
+    }};
+    const zero_max_message_config = [_]Req.AlterConfigsResource.AlterableConfig{.{
+        .name = "max.message.bytes",
+        .value = "0",
+    }};
+    const resources = [_]Req.AlterConfigsResource{
+        .{
+            .resource_type = 2,
+            .resource_name = "alter-cfg-zero-min-isr-topic",
+            .configs = &zero_min_isr_config,
+        },
+        .{
+            .resource_type = 2,
+            .resource_name = "alter-cfg-high-min-isr-topic",
+            .configs = &high_min_isr_config,
+        },
+        .{
+            .resource_type = 2,
+            .resource_name = "alter-cfg-zero-max-message-topic",
+            .configs = &zero_max_message_config,
+        },
+    };
+    const req = Req{
+        .resources = &resources,
+        .validate_only = false,
+    };
+
+    var buf: [1024]u8 = undefined;
+    var pos = buildTestRequest(&buf, 33, 2, 3315, header_mod.requestHeaderVersion(33, 2));
+    req.serialize(&buf, &pos, 2);
+
+    const response = broker.handleRequest(buf[0..pos]);
+    try testing.expect(response != null);
+    defer testing.allocator.free(response.?);
+
+    var rpos: usize = 0;
+    var response_header = try ResponseHeader.deserialize(testing.allocator, response.?, &rpos, header_mod.responseHeaderVersion(33, 2));
+    defer response_header.deinit(testing.allocator);
+    try testing.expectEqual(@as(i32, 3315), response_header.correlation_id);
+
+    const resp = try Resp.deserialize(testing.allocator, response.?, &rpos, 2);
+    defer if (resp.responses.len > 0) testing.allocator.free(resp.responses);
+
+    try testing.expectEqual(response.?.len, rpos);
+    try testing.expectEqual(@as(usize, 3), resp.responses.len);
+    for (resp.responses) |resource| {
+        try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.invalid_config)), resource.error_code);
+    }
+    try testing.expectEqual(@as(i32, 1), broker.topics.get("alter-cfg-zero-min-isr-topic").?.config.min_insync_replicas);
+    try testing.expectEqual(@as(i32, 1), broker.topics.get("alter-cfg-high-min-isr-topic").?.config.min_insync_replicas);
+    try testing.expectEqual(@as(i32, 1048576), broker.topics.get("alter-cfg-zero-max-message-topic").?.config.max_message_bytes);
 }
 
 test "Broker.handleRequest AlterConfigs authorization denial uses generated response" {
@@ -26772,6 +26870,79 @@ test "Broker.handleRequest IncrementalAlterConfigs v1 returns generated response
     try testing.expectEqual(@as(i8, 2), resp.responses[0].resource_type);
     try testing.expectEqualStrings("inc-cfg-topic", resp.responses[0].resource_name.?);
     try testing.expectEqual(@as(i64, 1234), broker.topics.get("inc-cfg-topic").?.config.retention_ms);
+}
+
+test "Broker.handleRequest IncrementalAlterConfigs rejects invalid topic config values" {
+    const Req = generated.incremental_alter_configs_request.IncrementalAlterConfigsRequest;
+    const Resp = generated.incremental_alter_configs_response.IncrementalAlterConfigsResponse;
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+    try testing.expect(broker.ensureTopic("inc-cfg-zero-min-isr-topic"));
+    try testing.expect(broker.ensureTopic("inc-cfg-high-min-isr-topic"));
+    try testing.expect(broker.ensureTopic("inc-cfg-zero-max-message-topic"));
+
+    const zero_min_isr_config = [_]Req.AlterConfigsResource.AlterableConfig{.{
+        .name = "min.insync.replicas",
+        .config_operation = 0,
+        .value = "0",
+    }};
+    const high_min_isr_config = [_]Req.AlterConfigsResource.AlterableConfig{.{
+        .name = "min.insync.replicas",
+        .config_operation = 0,
+        .value = "2",
+    }};
+    const zero_max_message_config = [_]Req.AlterConfigsResource.AlterableConfig{.{
+        .name = "max.message.bytes",
+        .config_operation = 0,
+        .value = "0",
+    }};
+    const resources = [_]Req.AlterConfigsResource{
+        .{
+            .resource_type = 2,
+            .resource_name = "inc-cfg-zero-min-isr-topic",
+            .configs = &zero_min_isr_config,
+        },
+        .{
+            .resource_type = 2,
+            .resource_name = "inc-cfg-high-min-isr-topic",
+            .configs = &high_min_isr_config,
+        },
+        .{
+            .resource_type = 2,
+            .resource_name = "inc-cfg-zero-max-message-topic",
+            .configs = &zero_max_message_config,
+        },
+    };
+    const req = Req{
+        .resources = &resources,
+        .validate_only = false,
+    };
+
+    var buf: [1024]u8 = undefined;
+    var pos = buildTestRequest(&buf, 44, 1, 4414, header_mod.requestHeaderVersion(44, 1));
+    req.serialize(&buf, &pos, 1);
+
+    const response = broker.handleRequest(buf[0..pos]);
+    try testing.expect(response != null);
+    defer testing.allocator.free(response.?);
+
+    var rpos: usize = 0;
+    var response_header = try ResponseHeader.deserialize(testing.allocator, response.?, &rpos, header_mod.responseHeaderVersion(44, 1));
+    defer response_header.deinit(testing.allocator);
+    try testing.expectEqual(@as(i32, 4414), response_header.correlation_id);
+
+    const resp = try Resp.deserialize(testing.allocator, response.?, &rpos, 1);
+    defer if (resp.responses.len > 0) testing.allocator.free(resp.responses);
+
+    try testing.expectEqual(response.?.len, rpos);
+    try testing.expectEqual(@as(usize, 3), resp.responses.len);
+    for (resp.responses) |resource| {
+        try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.invalid_config)), resource.error_code);
+    }
+    try testing.expectEqual(@as(i32, 1), broker.topics.get("inc-cfg-zero-min-isr-topic").?.config.min_insync_replicas);
+    try testing.expectEqual(@as(i32, 1), broker.topics.get("inc-cfg-high-min-isr-topic").?.config.min_insync_replicas);
+    try testing.expectEqual(@as(i32, 1048576), broker.topics.get("inc-cfg-zero-max-message-topic").?.config.max_message_bytes);
 }
 
 test "Broker.handleRequest IncrementalAlterConfigs authorization denial uses generated response" {
@@ -41365,7 +41536,7 @@ test "Broker.handleRequest CreateTopics applies supported topic configs" {
     const topics = [_]Req.CreatableTopic{.{
         .name = "ct-config-topic",
         .num_partitions = 1,
-        .replication_factor = 1,
+        .replication_factor = 2,
         .configs = &configs,
     }};
     const req = Req{
@@ -41406,6 +41577,84 @@ test "Broker.handleRequest CreateTopics applies supported topic configs" {
     try testing.expectEqual(@as(i64, 5678), topic.config.retention_bytes);
     try testing.expectEqual(@as(i32, 9000), topic.config.max_message_bytes);
     try testing.expectEqual(@as(i32, 2), topic.config.min_insync_replicas);
+}
+
+test "Broker.handleRequest CreateTopics rejects invalid topic config values" {
+    const Req = generated.create_topics_request.CreateTopicsRequest;
+    const Resp = generated.create_topics_response.CreateTopicsResponse;
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+
+    const zero_min_isr_config = [_]Req.CreatableTopic.CreatableTopicConfig{.{
+        .name = "min.insync.replicas",
+        .value = "0",
+    }};
+    const high_min_isr_config = [_]Req.CreatableTopic.CreatableTopicConfig{.{
+        .name = "min.insync.replicas",
+        .value = "2",
+    }};
+    const zero_max_message_config = [_]Req.CreatableTopic.CreatableTopicConfig{.{
+        .name = "max.message.bytes",
+        .value = "0",
+    }};
+    const topics = [_]Req.CreatableTopic{
+        .{
+            .name = "ct-zero-min-isr-topic",
+            .num_partitions = 1,
+            .replication_factor = 1,
+            .configs = &zero_min_isr_config,
+        },
+        .{
+            .name = "ct-high-min-isr-topic",
+            .num_partitions = 1,
+            .replication_factor = 1,
+            .configs = &high_min_isr_config,
+        },
+        .{
+            .name = "ct-zero-max-message-topic",
+            .num_partitions = 1,
+            .replication_factor = 1,
+            .configs = &zero_max_message_config,
+        },
+    };
+    const req = Req{
+        .topics = &topics,
+        .timeout_ms = 30000,
+        .validate_only = false,
+    };
+
+    var buf: [1024]u8 = undefined;
+    var pos = buildTestRequest(&buf, 19, 7, 1921, header_mod.requestHeaderVersion(19, 7));
+    req.serialize(&buf, &pos, 7);
+
+    const response = broker.handleRequest(buf[0..pos]);
+    try testing.expect(response != null);
+    defer testing.allocator.free(response.?);
+
+    var rpos: usize = 0;
+    var response_header = try ResponseHeader.deserialize(testing.allocator, response.?, &rpos, header_mod.responseHeaderVersion(19, 7));
+    defer response_header.deinit(testing.allocator);
+    try testing.expectEqual(@as(i32, 1921), response_header.correlation_id);
+
+    const resp = try Resp.deserialize(testing.allocator, response.?, &rpos, 7);
+    defer {
+        for (resp.topics) |topic| {
+            if (topic.configs) |response_configs| {
+                if (response_configs.len > 0) testing.allocator.free(response_configs);
+            }
+        }
+        if (resp.topics.len > 0) testing.allocator.free(resp.topics);
+    }
+
+    try testing.expectEqual(response.?.len, rpos);
+    try testing.expectEqual(@as(usize, 3), resp.topics.len);
+    for (resp.topics) |topic| {
+        try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.invalid_config)), topic.error_code);
+    }
+    try testing.expect(!broker.topics.contains("ct-zero-min-isr-topic"));
+    try testing.expect(!broker.topics.contains("ct-high-min-isr-topic"));
+    try testing.expect(!broker.topics.contains("ct-zero-max-message-topic"));
 }
 
 test "Broker.handleRequest CreateTopics rejects unsupported topic config" {
