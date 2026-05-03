@@ -19,6 +19,24 @@ groups:
           summary: ZMQ request p99 latency is above 1 second.
           description: Broker request handling latency is above the operational SLO.
 
+      - alert: ZMQHighProduceLatencyP99
+        expr: histogram_quantile(0.99, sum(rate(kafka_server_produce_latency_seconds_bucket[5m])) by (le)) > 1
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: ZMQ produce p99 latency is above 1 second.
+          description: Produce acknowledgements are above the operational write-latency SLO.
+
+      - alert: ZMQHighFetchLatencyP99
+        expr: histogram_quantile(0.99, sum(rate(kafka_server_fetch_latency_seconds_bucket[5m])) by (le)) > 1
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: ZMQ fetch p99 latency is above 1 second.
+          description: Fetch responses are above the operational read-latency SLO.
+
       - alert: ZMQNoActiveRaftLeader
         expr: max(raft_role) < 3
         for: 1m

@@ -669,6 +669,8 @@ test "Observability dashboard and alerts reference exported metrics" {
         "kafka_server_api_errors_total",
         "kafka_server_requests_total",
         "kafka_server_request_latency_seconds_bucket",
+        "kafka_server_produce_latency_seconds_bucket",
+        "kafka_server_fetch_latency_seconds_bucket",
         "raft_role",
         "s3_request_errors_total",
         "s3_request_duration_seconds_bucket",
@@ -678,6 +680,15 @@ test "Observability dashboard and alerts reference exported metrics" {
     };
     for (alert_metrics) |metric| {
         try testing.expect(std.mem.indexOf(u8, alerts, metric) != null);
+    }
+    const alert_names = [_][]const u8{
+        "ZMQHighRequestLatencyP99",
+        "ZMQHighProduceLatencyP99",
+        "ZMQHighFetchLatencyP99",
+        "ZMQS3LatencyP99",
+    };
+    for (alert_names) |name| {
+        try testing.expect(std.mem.indexOf(u8, alerts, name) != null);
     }
     try testing.expect(std.mem.indexOf(u8, alerts, "severity: critical") != null);
 }
