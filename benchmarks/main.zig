@@ -1,4 +1,5 @@
 const std = @import("std");
+const allocators = @import("allocators");
 const broker = @import("broker");
 const protocol = @import("protocol");
 const storage = @import("storage");
@@ -17,6 +18,7 @@ pub fn main() !void {
     try benchByteBuffer(stdout);
     try benchPartitionStoreMemory(stdout);
     try benchPartitionStoreS3Wal(stdout);
+    try benchPartitionStoreMemoryGrowth(stdout);
 
     try stdout.print("\n=== Benchmarks complete ===\n", .{});
 }
@@ -345,4 +347,65 @@ fn benchPartitionStoreS3Wal(writer: anytype) !void {
         recovered_per_sec,
         @as(f64, @floatFromInt(rebuild_ns)) / 1e6,
     });
+}
+
+fn benchPartitionStoreMemoryGrowth(writer: anytype) !void {
+    var tracker = allocators.TrackingAllocator.init(std.heap.page_allocator);
+    defer tracker.deinit();
+    const alloc = tracker.allocator();
+
+    const topic = "bench-memory-growth";
+    const partition: i32 = 0;
+    const iterations: usize = 5_000;
+    const cache_limit: usize = 512 * 1024;
+    const max_retained_growth: usize = 3 * 1024 * 1024;
+
+    var store = broker.PartitionStore.initWithConfig(alloc, .{
+        .cache_max_blocks = 8,
+        .cache_max_size = cache_limit,
+    });
+    defer store.deinit();
+
+    // This benchmark gates steady-state store/cache growth. Disable the
+    // intentionally unbounded in-memory WAL so retained bytes reflect cache
+    // eviction behavior instead of durable-log accumulation.
+    if (store.memory_wal) |*mwal| {
+        mwal.deinit();
+        store.memory_wal = null;
+    }
+
+    const batch = try buildBenchmarkBatch(alloc, 4 * 1024);
+    defer alloc.free(batch);
+
+    const baseline = tracker.stats().current_usage_bytes;
+    var max_current = baseline;
+    const start = nowNs();
+    for (0..iterations) |i| {
+        _ = try store.produce(topic, partition, batch);
+        if (i % 100 == 0) {
+            max_current = @max(max_current, tracker.stats().current_usage_bytes);
+        }
+    }
+    const elapsed_ns = nowNs() - start;
+    max_current = @max(max_current, tracker.stats().current_usage_bytes);
+
+    const final_usage = tracker.stats().current_usage_bytes;
+    const retained_growth = final_usage -| baseline;
+    const peak_growth = tracker.stats().peak_usage_bytes -| baseline;
+    const throughput = @as(f64, @floatFromInt(iterations)) / (@as(f64, @floatFromInt(elapsed_ns)) / 1e9);
+
+    try writer.print("PartitionStore memory    {d:>10.0}/s  retained={d} KiB  peak={d} KiB  max_current={d} KiB\n", .{
+        throughput,
+        retained_growth / 1024,
+        peak_growth / 1024,
+        (max_current -| baseline) / 1024,
+    });
+
+    if (retained_growth > max_retained_growth or max_current -| baseline > max_retained_growth) {
+        std.debug.print(
+            "memory-growth gate failed: retained={d} max_current={d} limit={d}\n",
+            .{ retained_growth, max_current -| baseline, max_retained_growth },
+        );
+        return error.BenchmarkMemoryGrowthExceeded;
+    }
 }
