@@ -19634,7 +19634,13 @@ pub const Broker = struct {
 
         // Determine which mechanism this client negotiated during SaslHandshake
         const client_id = req_header.client_id orelse "anonymous";
-        const mechanism = self.sasl_mechanisms.get(client_id) orelse "PLAIN";
+        const mechanism = self.resolveSaslMechanism(client_id) orelse {
+            return self.serializeSaslAuthenticateResponse(req_header, resp_header_version, api_version, @intFromEnum(ErrorCode.unsupported_sasl_mechanism), "SASL mechanism not negotiated or enabled", &.{});
+        };
+
+        if (!isMechanismEnabled(self.sasl_enabled_mechanisms, mechanism)) {
+            return self.serializeSaslAuthenticateResponse(req_header, resp_header_version, api_version, @intFromEnum(ErrorCode.unsupported_sasl_mechanism), "SASL mechanism not enabled", &.{});
+        }
 
         if (std.mem.eql(u8, mechanism, "OAUTHBEARER")) {
             // OAUTHBEARER: parse JWT from SASL token (KIP-255)
@@ -19748,6 +19754,12 @@ pub const Broker = struct {
             // PLAIN authentication failed
             return self.serializeSaslAuthenticateResponse(req_header, resp_header_version, api_version, @intFromEnum(ErrorCode.sasl_authentication_failed), "Authentication failed", &.{});
         }
+    }
+
+    fn resolveSaslMechanism(self: *Broker, client_id: []const u8) ?[]const u8 {
+        if (self.sasl_mechanisms.get(client_id)) |mechanism| return mechanism;
+        if (isMechanismEnabled(self.sasl_enabled_mechanisms, "PLAIN")) return "PLAIN";
+        return null;
     }
 
     fn serializeSaslAuthenticateResponse(self: *Broker, req_header: *const RequestHeader, resp_header_version: i16, api_version: i16, error_code: i16, error_message: ?[]const u8, auth_bytes: ?[]const u8) ?[]u8 {
@@ -26008,6 +26020,79 @@ test "Broker.handleRequest unsupported versions bypass SASL pre-auth gate" {
     try testing.expectEqual(@as(i32, 3623), response_header.correlation_id);
     try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.unsupported_version)), ser.readI16(response.?, &rpos));
     try testing.expectEqual(response.?.len, rpos);
+}
+
+test "Broker.handleRequest SaslAuthenticate rejects disabled default PLAIN fallback" {
+    const AuthReq = generated.sasl_authenticate_request.SaslAuthenticateRequest;
+    const AuthResp = generated.sasl_authenticate_response.SaslAuthenticateResponse;
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+    broker.sasl_enabled = true;
+    broker.sasl_enabled_mechanisms = "SCRAM-SHA-256";
+    try broker.sasl_authenticator.addUser("plain-user", "secret");
+
+    const auth_req = AuthReq{ .auth_bytes = "\x00plain-user\x00secret" };
+    var auth_buf: [256]u8 = undefined;
+    var auth_pos = buildTestRequest(&auth_buf, 36, 2, 3630, header_mod.requestHeaderVersion(36, 2));
+    auth_req.serialize(&auth_buf, &auth_pos, 2);
+
+    const auth_response = broker.handleRequest(auth_buf[0..auth_pos]);
+    try testing.expect(auth_response != null);
+    defer testing.allocator.free(auth_response.?);
+
+    var auth_rpos: usize = 0;
+    var auth_header = try ResponseHeader.deserialize(testing.allocator, auth_response.?, &auth_rpos, header_mod.responseHeaderVersion(36, 2));
+    defer auth_header.deinit(testing.allocator);
+    try testing.expectEqual(@as(i32, 3630), auth_header.correlation_id);
+
+    const auth_resp = try AuthResp.deserialize(testing.allocator, auth_response.?, &auth_rpos, 2);
+    try testing.expectEqual(auth_response.?.len, auth_rpos);
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.unsupported_sasl_mechanism)), auth_resp.error_code);
+    try testing.expect(broker.authenticated_sessions.get("test-client") == null);
+}
+
+test "Broker.handleRequest SaslAuthenticate rejects negotiated mechanism after disable" {
+    const HandshakeReq = generated.sasl_handshake_request.SaslHandshakeRequest;
+    const AuthReq = generated.sasl_authenticate_request.SaslAuthenticateRequest;
+    const AuthResp = generated.sasl_authenticate_response.SaslAuthenticateResponse;
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+    broker.sasl_enabled = true;
+    broker.sasl_enabled_mechanisms = "PLAIN,SCRAM-SHA-256";
+    try broker.sasl_authenticator.addUser("plain-user", "secret");
+
+    const handshake_req = HandshakeReq{ .mechanism = "PLAIN" };
+    var handshake_buf: [256]u8 = undefined;
+    var handshake_pos = buildTestRequest(&handshake_buf, 17, 1, 3631, header_mod.requestHeaderVersion(17, 1));
+    handshake_req.serialize(&handshake_buf, &handshake_pos, 1);
+
+    const handshake_response = broker.handleRequest(handshake_buf[0..handshake_pos]);
+    try testing.expect(handshake_response != null);
+    defer testing.allocator.free(handshake_response.?);
+    try testing.expectEqualStrings("PLAIN", broker.sasl_mechanisms.get("test-client").?);
+
+    broker.sasl_enabled_mechanisms = "SCRAM-SHA-256";
+
+    const auth_req = AuthReq{ .auth_bytes = "\x00plain-user\x00secret" };
+    var auth_buf: [256]u8 = undefined;
+    var auth_pos = buildTestRequest(&auth_buf, 36, 2, 3632, header_mod.requestHeaderVersion(36, 2));
+    auth_req.serialize(&auth_buf, &auth_pos, 2);
+
+    const auth_response = broker.handleRequest(auth_buf[0..auth_pos]);
+    try testing.expect(auth_response != null);
+    defer testing.allocator.free(auth_response.?);
+
+    var auth_rpos: usize = 0;
+    var auth_header = try ResponseHeader.deserialize(testing.allocator, auth_response.?, &auth_rpos, header_mod.responseHeaderVersion(36, 2));
+    defer auth_header.deinit(testing.allocator);
+    try testing.expectEqual(@as(i32, 3632), auth_header.correlation_id);
+
+    const auth_resp = try AuthResp.deserialize(testing.allocator, auth_response.?, &auth_rpos, 2);
+    try testing.expectEqual(auth_response.?.len, auth_rpos);
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.unsupported_sasl_mechanism)), auth_resp.error_code);
+    try testing.expect(broker.authenticated_sessions.get("test-client") == null);
 }
 
 test "Broker.handleRequest SaslAuthenticate rejects truncated request" {
