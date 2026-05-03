@@ -2191,11 +2191,14 @@ pub const Broker = struct {
 
     /// Persist idempotent producer sequence state if it has changed since the last flush.
     fn persistProducerSequencesIfDirty(self: *Broker) void {
-        if (!self.producer_sequences_dirty) return;
-        self.persistence.saveProducerSequences(&self.producer_sequences) catch |err| {
+        self.persistProducerSequencesIfDirtyDurably() catch |err| {
             log.warn("Failed to persist producer sequences: {}", .{err});
-            return;
         };
+    }
+
+    fn persistProducerSequencesIfDirtyDurably(self: *Broker) !void {
+        if (!self.producer_sequences_dirty) return;
+        try self.persistence.saveProducerSequences(&self.producer_sequences);
         self.producer_sequences_dirty = false;
     }
 
@@ -9224,9 +9227,26 @@ pub const Broker = struct {
         }
 
         log.debug("Produce: {d} topics, acks={d}", .{ req.topic_data.len, req.acks });
-        if (partition_state_dirty) self.persistPartitionStates();
-        if (object_metadata_dirty) self.persistObjectManagerSnapshot();
-        self.persistProducerSequencesIfDirty();
+        var local_persistence_error: ?anyerror = null;
+        if (partition_state_dirty) {
+            self.persistPartitionStatesDurably() catch |err| {
+                log.warn("Produce partition state checkpoint failed: {}", .{err});
+                local_persistence_error = err;
+            };
+        }
+        if (object_metadata_dirty) {
+            self.persistObjectManagerSnapshotDurably() catch |err| {
+                log.warn("Produce ObjectManager snapshot failed: {}", .{err});
+                if (local_persistence_error == null) local_persistence_error = err;
+            };
+        }
+        self.persistProducerSequencesIfDirtyDurably() catch |err| {
+            log.warn("Produce producer sequence checkpoint failed: {}", .{err});
+            if (local_persistence_error == null) local_persistence_error = err;
+        };
+        if (local_persistence_error != null) {
+            self.markProduceSuccessfulPartitionsStorageError(responses[0..responses_init]);
+        }
 
         // acks=0: fire-and-forget — don't send a response
         if (req.acks == 0) {
@@ -9238,6 +9258,22 @@ pub const Broker = struct {
             .throttle_time_ms = throttle_time_ms,
         };
         return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+    }
+
+    fn markProduceSuccessfulPartitionsStorageError(self: *Broker, topics: []generated.produce_response.ProduceResponse.TopicProduceResponse) void {
+        _ = self;
+        for (topics) |topic| {
+            const partitions: []generated.produce_response.ProduceResponse.TopicProduceResponse.PartitionProduceResponse = @constCast(topic.partition_responses);
+            for (partitions) |*partition| {
+                if (partition.error_code == @intFromEnum(ErrorCode.none)) {
+                    partition.error_code = @intFromEnum(ErrorCode.kafka_storage_error);
+                    partition.base_offset = -1;
+                    partition.log_append_time_ms = -1;
+                    partition.log_start_offset = -1;
+                    partition.error_message = "Failed to persist local produce metadata";
+                }
+            }
+        }
     }
 
     fn freeProduceRequest(self: *Broker, req: *const generated.produce_request.ProduceRequest) void {
@@ -25536,6 +25572,201 @@ test "Broker.handleRequest Produce persists idempotent producer sequence" {
     try testing.expectEqual(@as(i16, 2), loaded[0].producer_epoch);
     try testing.expectEqual(@as(i32, 7), loaded[0].last_sequence);
     try testing.expectEqual(PartitionStore.hashPartitionKey("produce-sequence-persist-topic", 0), loaded[0].partition_key);
+}
+
+test "Broker.handleRequest Produce reports storage error when local partition checkpoint fails" {
+    const fs = @import("fs_compat");
+    const Req = generated.produce_request.ProduceRequest;
+    const Topic = Req.TopicProduceData;
+    const Partition = Topic.PartitionProduceData;
+    const Resp = generated.produce_response.ProduceResponse;
+
+    const tmp_dir = "/tmp/zmq-produce-local-partition-checkpoint-fail-test";
+    fs.deleteTreeAbsolute(tmp_dir) catch {};
+    try fs.makeDirAbsolute(tmp_dir);
+    defer fs.deleteTreeAbsolute(tmp_dir) catch {};
+
+    var broker = Broker.initWithConfig(testing.allocator, 1, 9092, .{ .data_dir = tmp_dir });
+    defer broker.deinit();
+    try broker.open();
+    try testing.expect(broker.ensureTopic("produce-local-partition-fail-topic"));
+
+    const partition_state_path = try std.fmt.allocPrint(testing.allocator, "{s}/partition_state.meta", .{tmp_dir});
+    defer testing.allocator.free(partition_state_path);
+    fs.deleteFileAbsolute(partition_state_path) catch {};
+    try fs.makeDirAbsolute(partition_state_path);
+
+    const partitions = [_]Partition{.{
+        .index = 0,
+        .records = "local-partition-fail-records",
+    }};
+    const topics = [_]Topic{.{
+        .name = "produce-local-partition-fail-topic",
+        .partition_data = &partitions,
+    }};
+    const req = Req{
+        .transactional_id = null,
+        .acks = 1,
+        .timeout_ms = 30000,
+        .topic_data = &topics,
+    };
+
+    var buf: [512]u8 = undefined;
+    var pos = buildTestRequest(&buf, 0, 9, 320, header_mod.requestHeaderVersion(0, 9));
+    req.serialize(&buf, &pos, 9);
+
+    const response = broker.handleRequest(buf[0..pos]);
+    try testing.expect(response != null);
+    defer testing.allocator.free(response.?);
+
+    var rpos: usize = 0;
+    var response_header = try ResponseHeader.deserialize(testing.allocator, response.?, &rpos, header_mod.responseHeaderVersion(0, 9));
+    defer response_header.deinit(testing.allocator);
+    try testing.expectEqual(@as(i32, 320), response_header.correlation_id);
+
+    const resp = try Resp.deserialize(testing.allocator, response.?, &rpos, 9);
+    defer freeDeserializedProduceResponse(&resp);
+
+    try testing.expectEqual(response.?.len, rpos);
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.kafka_storage_error)), resp.responses[0].partition_responses[0].error_code);
+    try testing.expectEqual(@as(i64, -1), resp.responses[0].partition_responses[0].base_offset);
+    try testing.expectEqual(@as(u64, 1), broker.partitionState("produce-local-partition-fail-topic", 0).?.next_offset);
+}
+
+test "Broker.handleRequest Produce reports storage error when local object snapshot fails" {
+    const fs = @import("fs_compat");
+    const Req = generated.produce_request.ProduceRequest;
+    const Topic = Req.TopicProduceData;
+    const Partition = Topic.PartitionProduceData;
+    const Resp = generated.produce_response.ProduceResponse;
+
+    const tmp_dir = "/tmp/zmq-produce-local-object-snapshot-fail-test";
+    fs.deleteTreeAbsolute(tmp_dir) catch {};
+    try fs.makeDirAbsolute(tmp_dir);
+    defer fs.deleteTreeAbsolute(tmp_dir) catch {};
+
+    var broker = Broker.initWithConfig(testing.allocator, 1, 9092, .{ .data_dir = tmp_dir });
+    defer broker.deinit();
+    try broker.open();
+    try testing.expect(broker.ensureTopic("produce-local-object-fail-topic"));
+
+    const object_snapshot_path = try std.fmt.allocPrint(testing.allocator, "{s}/objects.snapshot", .{tmp_dir});
+    defer testing.allocator.free(object_snapshot_path);
+    fs.deleteFileAbsolute(object_snapshot_path) catch {};
+    try fs.makeDirAbsolute(object_snapshot_path);
+
+    const partitions = [_]Partition{.{
+        .index = 0,
+        .records = "local-object-fail-records",
+    }};
+    const topics = [_]Topic{.{
+        .name = "produce-local-object-fail-topic",
+        .partition_data = &partitions,
+    }};
+    const req = Req{
+        .transactional_id = null,
+        .acks = 1,
+        .timeout_ms = 30000,
+        .topic_data = &topics,
+    };
+
+    var buf: [512]u8 = undefined;
+    var pos = buildTestRequest(&buf, 0, 9, 321, header_mod.requestHeaderVersion(0, 9));
+    req.serialize(&buf, &pos, 9);
+
+    const response = broker.handleRequest(buf[0..pos]);
+    try testing.expect(response != null);
+    defer testing.allocator.free(response.?);
+
+    var rpos: usize = 0;
+    var response_header = try ResponseHeader.deserialize(testing.allocator, response.?, &rpos, header_mod.responseHeaderVersion(0, 9));
+    defer response_header.deinit(testing.allocator);
+    try testing.expectEqual(@as(i32, 321), response_header.correlation_id);
+
+    const resp = try Resp.deserialize(testing.allocator, response.?, &rpos, 9);
+    defer freeDeserializedProduceResponse(&resp);
+
+    try testing.expectEqual(response.?.len, rpos);
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.kafka_storage_error)), resp.responses[0].partition_responses[0].error_code);
+    try testing.expectEqual(@as(i64, -1), resp.responses[0].partition_responses[0].base_offset);
+    try testing.expectEqual(@as(u64, 1), broker.partitionState("produce-local-object-fail-topic", 0).?.next_offset);
+}
+
+test "Broker.handleRequest Produce reports storage error when producer sequence checkpoint fails" {
+    const fs = @import("fs_compat");
+    const Req = generated.produce_request.ProduceRequest;
+    const Topic = Req.TopicProduceData;
+    const Partition = Topic.PartitionProduceData;
+    const Resp = generated.produce_response.ProduceResponse;
+    const rec_batch = protocol.record_batch;
+
+    const tmp_dir = "/tmp/zmq-produce-producer-sequence-checkpoint-fail-test";
+    fs.deleteTreeAbsolute(tmp_dir) catch {};
+    try fs.makeDirAbsolute(tmp_dir);
+    defer fs.deleteTreeAbsolute(tmp_dir) catch {};
+
+    var broker = Broker.initWithConfig(testing.allocator, 1, 9092, .{ .data_dir = tmp_dir });
+    defer broker.deinit();
+    try broker.open();
+    try testing.expect(broker.ensureTopic("produce-sequence-local-fail-topic"));
+
+    const producer_state_path = try std.fmt.allocPrint(testing.allocator, "{s}/producer_state.meta", .{tmp_dir});
+    defer testing.allocator.free(producer_state_path);
+    fs.deleteFileAbsolute(producer_state_path) catch {};
+    try fs.makeDirAbsolute(producer_state_path);
+
+    const records = [_]rec_batch.Record{.{
+        .offset_delta = 0,
+        .value = "seq-local-fail-value",
+    }};
+    const batch = try rec_batch.buildRecordBatch(
+        testing.allocator,
+        0,
+        &records,
+        64010,
+        4,
+        0,
+        12345,
+        12345,
+        0,
+    );
+    defer testing.allocator.free(batch);
+
+    const partitions = [_]Partition{.{
+        .index = 0,
+        .records = batch,
+    }};
+    const topics = [_]Topic{.{
+        .name = "produce-sequence-local-fail-topic",
+        .partition_data = &partitions,
+    }};
+    const req = Req{
+        .transactional_id = null,
+        .acks = 1,
+        .timeout_ms = 30000,
+        .topic_data = &topics,
+    };
+
+    var buf: [2048]u8 = undefined;
+    var pos = buildTestRequest(&buf, 0, 9, 322, header_mod.requestHeaderVersion(0, 9));
+    req.serialize(&buf, &pos, 9);
+
+    const response = broker.handleRequest(buf[0..pos]);
+    try testing.expect(response != null);
+    defer testing.allocator.free(response.?);
+
+    var rpos: usize = 0;
+    var response_header = try ResponseHeader.deserialize(testing.allocator, response.?, &rpos, header_mod.responseHeaderVersion(0, 9));
+    defer response_header.deinit(testing.allocator);
+    try testing.expectEqual(@as(i32, 322), response_header.correlation_id);
+
+    const resp = try Resp.deserialize(testing.allocator, response.?, &rpos, 9);
+    defer freeDeserializedProduceResponse(&resp);
+    try testing.expectEqual(response.?.len, rpos);
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.kafka_storage_error)), resp.responses[0].partition_responses[0].error_code);
+    try testing.expectEqual(@as(i64, -1), resp.responses[0].partition_responses[0].base_offset);
+    try testing.expectEqual(@as(u32, 1), broker.producer_sequences.count());
+    try testing.expect(broker.producer_sequences_dirty);
 }
 
 test "Broker.handleRequest Produce does not advance idempotent sequence on S3 WAL failure" {
