@@ -1740,6 +1740,40 @@ pub const Broker = struct {
         snapshot.* = current;
     }
 
+    fn clonePartitionStateSnapshot(self: *Broker) !std.StringHashMap(PartitionStore.PartitionState) {
+        var snapshot = std.StringHashMap(PartitionStore.PartitionState).init(self.allocator);
+        errdefer self.freePartitionStateSnapshot(&snapshot);
+
+        var it = self.store.partitions.iterator();
+        while (it.next()) |entry| {
+            const key = try self.allocator.dupe(u8, entry.key_ptr.*);
+            errdefer self.allocator.free(key);
+            var state = entry.value_ptr.*;
+            state.topic = try self.allocator.dupe(u8, entry.value_ptr.topic);
+            snapshot.put(key, state) catch |err| {
+                self.allocator.free(state.topic);
+                return err;
+            };
+        }
+
+        return snapshot;
+    }
+
+    fn freePartitionStateSnapshot(self: *Broker, snapshot: *std.StringHashMap(PartitionStore.PartitionState)) void {
+        var it = snapshot.iterator();
+        while (it.next()) |entry| {
+            self.allocator.free(entry.value_ptr.topic);
+            self.allocator.free(entry.key_ptr.*);
+        }
+        snapshot.deinit();
+    }
+
+    fn restorePartitionStateSnapshot(self: *Broker, snapshot: *std.StringHashMap(PartitionStore.PartitionState)) void {
+        const current = self.store.partitions;
+        self.store.partitions = snapshot.*;
+        snapshot.* = current;
+    }
+
     fn clearShareGroupSession(self: *Broker, group_id: []const u8, member_id: []const u8) !bool {
         const key = try self.shareGroupMemberKey(group_id, member_id);
         defer self.allocator.free(key);
@@ -2158,9 +2192,13 @@ pub const Broker = struct {
 
     /// Persist per-partition offsets/HW/LSO to disk (best-effort).
     fn persistPartitionStates(self: *Broker) void {
-        self.persistence.savePartitionStates(&self.store.partitions) catch |err| {
+        self.persistPartitionStatesDurably() catch |err| {
             log.warn("Failed to persist partition states: {}", .{err});
         };
+    }
+
+    fn persistPartitionStatesDurably(self: *Broker) !void {
+        try self.persistence.savePartitionStates(&self.store.partitions);
     }
 
     /// Persist ongoing partition reassignment state to disk (best-effort).
@@ -14586,12 +14624,26 @@ pub const Broker = struct {
         };
         defer self.freeDeleteRecordsRequest(&req);
 
+        var total_requested_partitions: usize = 0;
+        for (req.topics) |topic_req| {
+            total_requested_partitions += topic_req.partitions.len;
+        }
+        const mutated_partitions = self.allocator.alloc(bool, total_requested_partitions) catch return null;
+        defer if (mutated_partitions.len > 0) self.allocator.free(mutated_partitions);
+        @memset(mutated_partitions, false);
+
+        var previous_partition_states = self.clonePartitionStateSnapshot() catch return null;
+        defer self.freePartitionStateSnapshot(&previous_partition_states);
+        var previous_object_snapshot: ?ObjectManagerLocalSnapshot = self.takeObjectManagerLocalSnapshot() catch return null;
+        defer if (previous_object_snapshot) |*snapshot| self.freeObjectManagerLocalSnapshot(snapshot);
+
         var topics: []TopicResult = &.{};
         if (req.topics.len > 0) {
             topics = self.allocator.alloc(TopicResult, req.topics.len) catch return null;
         }
         var topics_init: usize = 0;
         var mutated = false;
+        var requested_partition_index: usize = 0;
         defer {
             self.freeDeleteRecordsResponseTopics(topics[0..topics_init]);
             if (topics.len > 0) self.allocator.free(topics);
@@ -14609,12 +14661,16 @@ pub const Broker = struct {
                 const topic_name = topic_req.name orelse "";
                 for (topic_req.partitions, 0..) |partition_req, partition_idx| {
                     const trim_result = self.trimDeleteRecordsPartition(topic_name, partition_req.partition_index, partition_req.offset);
-                    if (trim_result.mutated) mutated = true;
+                    if (trim_result.mutated) {
+                        mutated = true;
+                        mutated_partitions[requested_partition_index] = true;
+                    }
                     writable[partition_idx] = .{
                         .partition_index = partition_req.partition_index,
                         .low_watermark = trim_result.low_watermark,
                         .error_code = trim_result.error_code,
                     };
+                    requested_partition_index += 1;
                 }
                 partitions = writable;
                 transferred = true;
@@ -14628,8 +14684,35 @@ pub const Broker = struct {
         }
 
         if (mutated) {
-            self.persistPartitionStates();
-            self.persistObjectManagerSnapshot();
+            var persistence_error: ?anyerror = null;
+            self.persistPartitionStatesDurably() catch |err| {
+                persistence_error = err;
+            };
+            if (persistence_error == null) {
+                self.persistObjectManagerSnapshotDurably() catch |err| {
+                    persistence_error = err;
+                };
+            }
+            if (persistence_error) |err| {
+                log.warn("DeleteRecords metadata persistence failed: {}", .{err});
+                self.restorePartitionStateSnapshot(&previous_partition_states);
+                if (previous_object_snapshot) |snapshot| self.restoreObjectManagerLocalSnapshot(snapshot);
+                self.persistPartitionStatesDurably() catch |restore_err| {
+                    log.warn("Failed to persist restored partition states after DeleteRecords failure: {}", .{restore_err});
+                };
+
+                var flag_index: usize = 0;
+                for (topics[0..topics_init]) |*topic| {
+                    const partitions: []PartitionResult = @constCast(topic.partitions);
+                    for (partitions) |*partition| {
+                        if (mutated_partitions[flag_index] and partition.error_code == @intFromEnum(ErrorCode.none)) {
+                            partition.low_watermark = -1;
+                            partition.error_code = @intFromEnum(ErrorCode.kafka_storage_error);
+                        }
+                        flag_index += 1;
+                    }
+                }
+            }
         }
 
         const resp = Resp{
@@ -47550,6 +47633,134 @@ test "Broker.handleRequest DeleteRecords v2 returns generated response and trims
     const pkey = try std.fmt.allocPrint(testing.allocator, "{s}-{d}", .{ "dr-generated-topic", 0 });
     defer testing.allocator.free(pkey);
     try testing.expectEqual(@as(u64, 5), broker.store.partitions.getPtr(pkey).?.log_start_offset);
+}
+
+test "Broker.handleRequest DeleteRecords rolls back partition state persistence failures" {
+    const fs = @import("fs_compat");
+    const Req = generated.delete_records_request.DeleteRecordsRequest;
+    const Resp = generated.delete_records_response.DeleteRecordsResponse;
+    const Topic = Req.DeleteRecordsTopic;
+    const Partition = Topic.DeleteRecordsPartition;
+
+    const tmp_dir = "/tmp/zmq-delete-records-partition-persist-fail-test";
+    fs.deleteTreeAbsolute(tmp_dir) catch {};
+    try fs.makeDirAbsolute(tmp_dir);
+    defer fs.deleteTreeAbsolute(tmp_dir) catch {};
+
+    var broker = Broker.initWithConfig(testing.allocator, 1, 9092, .{ .data_dir = tmp_dir });
+    defer broker.deinit();
+    try broker.open();
+    try testing.expect(broker.ensureTopic("dr-partition-persist-fail-topic"));
+    _ = try broker.store.produce("dr-partition-persist-fail-topic", 0, "delete-records-persist-fail-record");
+
+    const partition_state_path = try std.fmt.allocPrint(testing.allocator, "{s}/partition_state.meta", .{tmp_dir});
+    defer testing.allocator.free(partition_state_path);
+    fs.deleteFileAbsolute(partition_state_path) catch {};
+    try fs.makeDirAbsolute(partition_state_path);
+
+    const partitions = [_]Partition{.{
+        .partition_index = 0,
+        .offset = 1,
+    }};
+    const topics = [_]Topic{.{
+        .name = "dr-partition-persist-fail-topic",
+        .partitions = &partitions,
+    }};
+    const req = Req{
+        .topics = &topics,
+        .timeout_ms = 30000,
+    };
+
+    var buf: [512]u8 = undefined;
+    var pos = buildTestRequest(&buf, 21, 2, 2107, header_mod.requestHeaderVersion(21, 2));
+    req.serialize(&buf, &pos, 2);
+
+    const response = broker.handleRequest(buf[0..pos]);
+    try testing.expect(response != null);
+    defer testing.allocator.free(response.?);
+
+    var rpos: usize = 0;
+    var response_header = try ResponseHeader.deserialize(testing.allocator, response.?, &rpos, header_mod.responseHeaderVersion(21, 2));
+    defer response_header.deinit(testing.allocator);
+    try testing.expectEqual(@as(i32, 2107), response_header.correlation_id);
+
+    const resp = try Resp.deserialize(testing.allocator, response.?, &rpos, 2);
+    defer {
+        broker.freeDeleteRecordsResponseTopics(resp.topics);
+        if (resp.topics.len > 0) testing.allocator.free(resp.topics);
+    }
+
+    try testing.expectEqual(response.?.len, rpos);
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.kafka_storage_error)), resp.topics[0].partitions[0].error_code);
+    try testing.expectEqual(@as(i64, -1), resp.topics[0].partitions[0].low_watermark);
+
+    const pkey = try std.fmt.allocPrint(testing.allocator, "{s}-{d}", .{ "dr-partition-persist-fail-topic", 0 });
+    defer testing.allocator.free(pkey);
+    try testing.expectEqual(@as(u64, 0), broker.store.partitions.getPtr(pkey).?.log_start_offset);
+}
+
+test "Broker.handleRequest DeleteRecords rolls back object snapshot persistence failures" {
+    const fs = @import("fs_compat");
+    const Req = generated.delete_records_request.DeleteRecordsRequest;
+    const Resp = generated.delete_records_response.DeleteRecordsResponse;
+    const Topic = Req.DeleteRecordsTopic;
+    const Partition = Topic.DeleteRecordsPartition;
+
+    const tmp_dir = "/tmp/zmq-delete-records-object-persist-fail-test";
+    fs.deleteTreeAbsolute(tmp_dir) catch {};
+    try fs.makeDirAbsolute(tmp_dir);
+    defer fs.deleteTreeAbsolute(tmp_dir) catch {};
+
+    var broker = Broker.initWithConfig(testing.allocator, 1, 9092, .{ .data_dir = tmp_dir });
+    defer broker.deinit();
+    try broker.open();
+    try testing.expect(broker.ensureTopic("dr-object-persist-fail-topic"));
+    _ = try broker.store.produce("dr-object-persist-fail-topic", 0, "delete-records-object-fail-record");
+
+    const object_snapshot_path = try std.fmt.allocPrint(testing.allocator, "{s}/objects.snapshot", .{tmp_dir});
+    defer testing.allocator.free(object_snapshot_path);
+    fs.deleteFileAbsolute(object_snapshot_path) catch {};
+    try fs.makeDirAbsolute(object_snapshot_path);
+
+    const partitions = [_]Partition{.{
+        .partition_index = 0,
+        .offset = 1,
+    }};
+    const topics = [_]Topic{.{
+        .name = "dr-object-persist-fail-topic",
+        .partitions = &partitions,
+    }};
+    const req = Req{
+        .topics = &topics,
+        .timeout_ms = 30000,
+    };
+
+    var buf: [512]u8 = undefined;
+    var pos = buildTestRequest(&buf, 21, 2, 2109, header_mod.requestHeaderVersion(21, 2));
+    req.serialize(&buf, &pos, 2);
+
+    const response = broker.handleRequest(buf[0..pos]);
+    try testing.expect(response != null);
+    defer testing.allocator.free(response.?);
+
+    var rpos: usize = 0;
+    var response_header = try ResponseHeader.deserialize(testing.allocator, response.?, &rpos, header_mod.responseHeaderVersion(21, 2));
+    defer response_header.deinit(testing.allocator);
+    try testing.expectEqual(@as(i32, 2109), response_header.correlation_id);
+
+    const resp = try Resp.deserialize(testing.allocator, response.?, &rpos, 2);
+    defer {
+        broker.freeDeleteRecordsResponseTopics(resp.topics);
+        if (resp.topics.len > 0) testing.allocator.free(resp.topics);
+    }
+
+    try testing.expectEqual(response.?.len, rpos);
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.kafka_storage_error)), resp.topics[0].partitions[0].error_code);
+    try testing.expectEqual(@as(i64, -1), resp.topics[0].partitions[0].low_watermark);
+
+    const pkey = try std.fmt.allocPrint(testing.allocator, "{s}-{d}", .{ "dr-object-persist-fail-topic", 0 });
+    defer testing.allocator.free(pkey);
+    try testing.expectEqual(@as(u64, 0), broker.store.partitions.getPtr(pkey).?.log_start_offset);
 }
 
 test "Broker.handleRequest DeleteRecords rejects truncated request" {
