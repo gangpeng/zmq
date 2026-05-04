@@ -502,6 +502,7 @@ pub fn main(init: std.process.Init) !void {
                 advertised_host,
                 port,
                 &brk.cached_leader_epoch,
+                &brk.cached_broker_epoch,
                 &brk.is_fenced_by_controller,
                 &brk.last_successful_heartbeat_ms,
                 &global_shutdown,

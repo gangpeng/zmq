@@ -133,6 +133,9 @@ pub const Broker = struct {
     raft_state: ?*RaftState = null,
     /// Cached leader epoch received from the controller (used in broker-only mode).
     cached_leader_epoch: i32 = 0,
+    /// Cached broker epoch assigned by the controller during BrokerRegistration.
+    /// A zero value means single-node/unregistered mode and does not enforce epoch checks.
+    cached_broker_epoch: i64 = 0,
     /// Set to true when the controller fences this broker (e.g., heartbeat timeout).
     /// When fenced, the broker rejects all produce requests with NOT_LEADER_OR_FOLLOWER.
     is_fenced_by_controller: bool = false,
@@ -19086,6 +19089,7 @@ pub const Broker = struct {
     fn validateAssignReplicasToDirsBroker(self: *const Broker, req: generated.assign_replicas_to_dirs_request.AssignReplicasToDirsRequest) ErrorCode {
         if (req.broker_id != self.node_id) return ErrorCode.broker_id_not_registered;
         if (req.broker_epoch < 0) return ErrorCode.stale_broker_epoch;
+        if (self.cached_broker_epoch > 0 and req.broker_epoch != self.cached_broker_epoch) return ErrorCode.stale_broker_epoch;
         return ErrorCode.none;
     }
 
@@ -35031,6 +35035,68 @@ test "Broker.handleRequest AssignReplicasToDirs validates local targets" {
     const stored = (try broker.getReplicaDirectoryAssignment(topic_id, 0)) orelse return error.ExpectedReplicaDirectoryAssignment;
     try testing.expectEqualSlices(u8, directory_id[0..], stored[0..]);
     try testing.expect((try broker.getReplicaDirectoryAssignment(topic_id, 99)) == null);
+}
+
+test "Broker.handleRequest AssignReplicasToDirs rejects stale broker epoch" {
+    const Req = generated.assign_replicas_to_dirs_request.AssignReplicasToDirsRequest;
+    const Resp = generated.assign_replicas_to_dirs_response.AssignReplicasToDirsResponse;
+    const DirectoryData = Req.DirectoryData;
+    const TopicData = DirectoryData.TopicData;
+    const PartitionData = TopicData.PartitionData;
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+    broker.cached_broker_epoch = 7;
+
+    _ = broker.ensureTopic("assign-dir-stale-epoch-topic");
+    const topic_id = broker.topics.get("assign-dir-stale-epoch-topic").?.topic_id;
+    const directory_id = [_]u8{0x17} ** 16;
+    const partitions = [_]PartitionData{.{
+        .partition_index = 0,
+    }};
+    const topics = [_]TopicData{.{
+        .topic_id = topic_id,
+        .partitions = &partitions,
+    }};
+    const directories = [_]DirectoryData{.{
+        .id = directory_id,
+        .topics = &topics,
+    }};
+    const req = Req{
+        .broker_id = 1,
+        .broker_epoch = 6,
+        .directories = &directories,
+    };
+
+    var buf: [256]u8 = undefined;
+    var pos = buildTestRequest(&buf, 73, 0, 7308, header_mod.requestHeaderVersion(73, 0));
+    req.serialize(&buf, &pos, 0);
+
+    const response = broker.handleRequest(buf[0..pos]);
+    try testing.expect(response != null);
+    defer testing.allocator.free(response.?);
+
+    var rpos: usize = 0;
+    var response_header = try ResponseHeader.deserialize(testing.allocator, response.?, &rpos, header_mod.responseHeaderVersion(73, 0));
+    defer response_header.deinit(testing.allocator);
+    try testing.expectEqual(@as(i32, 7308), response_header.correlation_id);
+
+    const resp = try Resp.deserialize(testing.allocator, response.?, &rpos, 0);
+    defer {
+        for (resp.directories) |directory| {
+            for (directory.topics) |topic| {
+                if (topic.partitions.len > 0) testing.allocator.free(topic.partitions);
+            }
+            if (directory.topics.len > 0) testing.allocator.free(directory.topics);
+        }
+        if (resp.directories.len > 0) testing.allocator.free(resp.directories);
+    }
+
+    try testing.expectEqual(response.?.len, rpos);
+    try testing.expectEqual(ErrorCode.stale_broker_epoch.toInt(), resp.error_code);
+    try testing.expectEqual(@as(usize, 1), resp.directories.len);
+    try testing.expectEqual(ErrorCode.stale_broker_epoch.toInt(), resp.directories[0].topics[0].partitions[0].error_code);
+    try testing.expect((try broker.getReplicaDirectoryAssignment(topic_id, 0)) == null);
 }
 
 test "Broker.handleRequest AssignReplicasToDirs persists local assignments across restart" {

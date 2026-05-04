@@ -200,7 +200,8 @@ Status: completed for the initial catalog and DeleteGroups slice.
   instead of classic-generation/group-id errors.
   AssignReplicasToDirs key 73 remains non-advertised until durable
   controller-backed JBOD directory semantics exist, but direct requests now
-  validate/decode generated flexible frames, validate broker identity/epoch and
+  validate/decode generated flexible frames, validate broker identity and the
+  cached controller-assigned broker epoch for broker-only nodes, validate
   directory/topic/partition targets, reject duplicate assignments, return
   generated per-partition errors, maintain local replica-directory assignment
   state, restore that state across local broker restart, append assignment

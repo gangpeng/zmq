@@ -35,6 +35,9 @@ pub const MetadataClient = struct {
     /// Pointer to the Broker's cached_leader_epoch field.
     /// Updated when we discover the current epoch from the controller.
     cached_leader_epoch: *i32,
+    /// Pointer to the Broker's cached_broker_epoch field.
+    /// Updated after successful BrokerRegistration so broker handlers can reject stale controller commands.
+    cached_broker_epoch: *i64,
     /// Pointer to the Broker's is_fenced_by_controller field.
     /// Set to true when the controller heartbeat says we are fenced.
     is_fenced: *bool,
@@ -63,6 +66,7 @@ pub const MetadataClient = struct {
         host: []const u8,
         port: u16,
         cached_epoch: *i32,
+        cached_broker_epoch: *i64,
         is_fenced: *bool,
         last_heartbeat_ms: *i64,
         should_stop: *bool,
@@ -74,6 +78,7 @@ pub const MetadataClient = struct {
             .advertised_host = host,
             .advertised_port = port,
             .cached_leader_epoch = cached_epoch,
+            .cached_broker_epoch = cached_broker_epoch,
             .is_fenced = is_fenced,
             .last_heartbeat_ms = last_heartbeat_ms,
             .should_stop = should_stop,
@@ -243,6 +248,7 @@ pub const MetadataClient = struct {
             };
             if (resp.error_code == 0) {
                 self.broker_epoch = resp.broker_epoch;
+                self.cached_broker_epoch.* = resp.broker_epoch;
                 log.info("Registered with controller: broker_epoch={d}", .{self.broker_epoch});
             } else {
                 log.warn("BrokerRegistration failed: error_code={d}", .{resp.error_code});
@@ -362,6 +368,7 @@ const testing = std.testing;
 
 test "MetadataClient staleness detection fences broker" {
     var cached_epoch: i32 = 0;
+    var cached_broker_epoch: i64 = 0;
     var is_fenced: bool = false;
     var last_hb: i64 = @import("time_compat").milliTimestamp() - 60_000; // 60s ago
     var should_stop: bool = false;
@@ -372,6 +379,7 @@ test "MetadataClient staleness detection fences broker" {
         "localhost",
         9092,
         &cached_epoch,
+        &cached_broker_epoch,
         &is_fenced,
         &last_hb,
         &should_stop,
@@ -394,6 +402,7 @@ test "MetadataClient staleness detection fences broker" {
 
 test "MetadataClient fresh heartbeat prevents fencing" {
     var cached_epoch: i32 = 0;
+    var cached_broker_epoch: i64 = 0;
     var is_fenced: bool = false;
     var last_hb: i64 = @import("time_compat").milliTimestamp(); // Just now
     var should_stop: bool = false;
@@ -404,6 +413,7 @@ test "MetadataClient fresh heartbeat prevents fencing" {
         "localhost",
         9092,
         &cached_epoch,
+        &cached_broker_epoch,
         &is_fenced,
         &last_hb,
         &should_stop,
@@ -422,6 +432,7 @@ test "MetadataClient fresh heartbeat prevents fencing" {
 
 test "MetadataClient zero last_heartbeat skips staleness check" {
     var cached_epoch: i32 = 0;
+    var cached_broker_epoch: i64 = 0;
     var is_fenced: bool = false;
     var last_hb: i64 = 0; // Never had a heartbeat (just started)
     var should_stop: bool = false;
@@ -432,6 +443,7 @@ test "MetadataClient zero last_heartbeat skips staleness check" {
         "localhost",
         9092,
         &cached_epoch,
+        &cached_broker_epoch,
         &is_fenced,
         &last_hb,
         &should_stop,
@@ -452,6 +464,7 @@ test "MetadataClient parseDescribeQuorumResponse valid" {
     const Resp = generated.describe_quorum_response.DescribeQuorumResponse;
 
     var cached_epoch: i32 = 0;
+    var cached_broker_epoch: i64 = 0;
     var is_fenced: bool = false;
     var last_hb: i64 = 0;
     var should_stop: bool = false;
@@ -462,6 +475,7 @@ test "MetadataClient parseDescribeQuorumResponse valid" {
         "localhost",
         9092,
         &cached_epoch,
+        &cached_broker_epoch,
         &is_fenced,
         &last_hb,
         &should_stop,
@@ -496,6 +510,7 @@ test "MetadataClient parseDescribeQuorumResponse no leader" {
     const Resp = generated.describe_quorum_response.DescribeQuorumResponse;
 
     var cached_epoch: i32 = 0;
+    var cached_broker_epoch: i64 = 0;
     var is_fenced: bool = false;
     var last_hb: i64 = 0;
     var should_stop: bool = false;
@@ -506,6 +521,7 @@ test "MetadataClient parseDescribeQuorumResponse no leader" {
         "localhost",
         9092,
         &cached_epoch,
+        &cached_broker_epoch,
         &is_fenced,
         &last_hb,
         &should_stop,
@@ -534,6 +550,7 @@ test "MetadataClient parseDescribeQuorumResponse no leader" {
 
 test "MetadataClient setTlsContext propagates to controller pool" {
     var cached_epoch: i32 = 0;
+    var cached_broker_epoch: i64 = 0;
     var is_fenced: bool = false;
     var last_hb: i64 = 0;
     var should_stop: bool = false;
@@ -544,6 +561,7 @@ test "MetadataClient setTlsContext propagates to controller pool" {
         "localhost",
         9092,
         &cached_epoch,
+        &cached_broker_epoch,
         &is_fenced,
         &last_hb,
         &should_stop,
