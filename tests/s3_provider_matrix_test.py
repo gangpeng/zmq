@@ -14,6 +14,9 @@ Global environment:
     ZMQ_S3_PROVIDER_PROFILES    Comma-separated profile names. Defaults to minio.
     ZMQ_S3_PROVIDER_REQUIRED_PROFILES comma-separated profile names that must be present.
     ZMQ_S3_PROVIDER_REQUIRED_OUTAGE_PROFILES comma-separated profile names that must run outage gates.
+    ZMQ_S3_PROVIDER_REQUIRED_PROCESS_CRASH_PROFILES
+                               comma-separated profile names that must run broker
+                               process-crash/replacement gates.
     ZMQ_S3_PROVIDER_REQUIRED_LIST_PAGINATION_PROFILES
                                comma-separated profile names that must run the ListObjectsV2 pagination gate.
     ZMQ_S3_PROVIDER_REQUIRED_MULTIPART_EDGE_PROFILES
@@ -231,6 +234,25 @@ def validate_required_profiles(profiles):
             + ", ".join(missing_hooks)
         )
 
+    required_process_crash = configured_names("ZMQ_S3_PROVIDER_REQUIRED_PROCESS_CRASH_PROFILES")
+    missing_process_crash_profiles = [
+        profile for profile in required_process_crash if profile not in profile_set
+    ]
+    if missing_process_crash_profiles:
+        raise MatrixError(
+            "required S3 process-crash profiles missing from ZMQ_S3_PROVIDER_PROFILES: "
+            + ", ".join(missing_process_crash_profiles)
+        )
+    disabled_process_crash = [
+        profile for profile in required_process_crash
+        if not profile_enabled(profile, "RUN_PROCESS_CRASH")
+    ]
+    if disabled_process_crash:
+        raise MatrixError(
+            "required S3 process-crash profiles must set RUN_PROCESS_CRASH=1: "
+            + ", ".join(disabled_process_crash)
+        )
+
     required_list_pagination = configured_names("ZMQ_S3_PROVIDER_REQUIRED_LIST_PAGINATION_PROFILES")
     missing_list_pagination_profiles = [
         profile for profile in required_list_pagination if profile not in profile_set
@@ -357,6 +379,7 @@ def self_test():
         os.environ["ZMQ_S3_AWS_US_EAST_1_OUTAGE_UP"] = "tc qdisc del dev lo root"
         os.environ["ZMQ_S3_PROVIDER_REQUIRED_PROFILES"] = "minio,aws_us_east_1"
         os.environ["ZMQ_S3_PROVIDER_REQUIRED_OUTAGE_PROFILES"] = "aws_us_east_1"
+        os.environ["ZMQ_S3_PROVIDER_REQUIRED_PROCESS_CRASH_PROFILES"] = "aws_us_east_1"
         os.environ["ZMQ_S3_PROVIDER_REQUIRED_LIST_PAGINATION_PROFILES"] = "aws_us_east_1"
         os.environ["ZMQ_S3_PROVIDER_REQUIRED_MULTIPART_EDGE_PROFILES"] = "aws_us_east_1"
         os.environ["ZMQ_S3_PROVIDER_REQUIRED_MULTIPART_FAULT_PROFILES"] = "aws_us_east_1"
@@ -420,6 +443,15 @@ def self_test():
                 raise
 
         os.environ["ZMQ_S3_PROVIDER_REQUIRED_OUTAGE_PROFILES"] = "aws_us_east_1"
+        os.environ["ZMQ_S3_PROVIDER_REQUIRED_PROCESS_CRASH_PROFILES"] = "minio,aws_us_east_1"
+        try:
+            validate_required_profiles(names)
+            raise MatrixError("missing required process-crash profile did not fail validation")
+        except MatrixError as exc:
+            if "RUN_PROCESS_CRASH" not in str(exc):
+                raise
+
+        os.environ["ZMQ_S3_PROVIDER_REQUIRED_PROCESS_CRASH_PROFILES"] = "aws_us_east_1"
         os.environ["ZMQ_S3_PROVIDER_REQUIRED_LIST_PAGINATION_PROFILES"] = "minio,aws_us_east_1"
         try:
             validate_required_profiles(names)

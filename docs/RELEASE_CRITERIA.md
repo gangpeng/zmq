@@ -61,9 +61,11 @@ broker chaos partitions, `ZMQ_E2E_REQUIRED_CHAOS_PHASES` for Docker
 cross-broker chaos phases, `ZMQ_E2E_REQUIRED_LOAD_SCALE_PHASES` for live Docker
 scale-in/scale-out/load phases, and provider/client/profile requirement
 variables for S3 and external-client matrices. S3 provider coverage must pin
-provider, outage, ListObjectsV2 pagination, multipart-edge, and multipart-fault profiles with
+provider, outage, process-crash/replacement, ListObjectsV2 pagination,
+multipart-edge, and multipart-fault profiles with
 `ZMQ_S3_PROVIDER_REQUIRED_PROFILES`,
 `ZMQ_S3_PROVIDER_REQUIRED_OUTAGE_PROFILES`,
+`ZMQ_S3_PROVIDER_REQUIRED_PROCESS_CRASH_PROFILES`,
 `ZMQ_S3_PROVIDER_REQUIRED_LIST_PAGINATION_PROFILES`,
 `ZMQ_S3_PROVIDER_REQUIRED_MULTIPART_EDGE_PROFILES`, and
 `ZMQ_S3_PROVIDER_REQUIRED_MULTIPART_FAULT_PROFILES`. External-client coverage
