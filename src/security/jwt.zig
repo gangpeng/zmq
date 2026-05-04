@@ -27,6 +27,7 @@ pub const JwtToken = struct {
     scope: ?[]const u8 = null,
     expires_at: ?i64 = null,
     issued_at: ?i64 = null,
+    not_before: ?i64 = null,
     allocator: Allocator,
 
     /// Parse a JWT token string (header.payload.signature).
@@ -62,6 +63,7 @@ pub const JwtToken = struct {
         jwt.scope = extractStringClaim(payload_json, "\"scope\"");
         jwt.expires_at = extractIntClaim(payload_json, "\"exp\"");
         jwt.issued_at = extractIntClaim(payload_json, "\"iat\"");
+        jwt.not_before = extractIntClaim(payload_json, "\"nbf\"");
 
         return jwt;
     }
@@ -71,6 +73,22 @@ pub const JwtToken = struct {
         const exp = self.expires_at orelse return false; // No exp = never expires
         const now = @import("time_compat").timestamp();
         return now > exp;
+    }
+
+    /// Check if the token's not-before claim is still in the future.
+    pub fn isNotYetValid(self: *const JwtToken) bool {
+        const nbf = self.not_before orelse return false;
+        const now = @import("time_compat").timestamp();
+        return now < nbf;
+    }
+
+    /// Check if the token audience matches either a string aud claim or an
+    /// array-valued aud claim, both of which are common across OAuth providers.
+    pub fn hasAudience(self: *const JwtToken, expected: []const u8) bool {
+        if (self.audience) |actual| {
+            if (std.mem.eql(u8, actual, expected)) return true;
+        }
+        return stringArrayClaimContains(self.payload_json, "\"aud\"", expected);
     }
 
     /// Get the principal (subject claim).
@@ -161,6 +179,37 @@ fn extractIntClaim(json: []const u8, key: []const u8) ?i64 {
     return std.fmt.parseInt(i64, after_key[start..i], 10) catch null;
 }
 
+/// Return true when a JSON string-array claim contains `expected`.
+/// This intentionally remains a minimal JWT-claim parser; it handles the
+/// compact provider tokens used by the broker's OAUTHBEARER gate without
+/// pulling a full JSON DOM into the authentication hot path.
+fn stringArrayClaimContains(json: []const u8, key: []const u8, expected: []const u8) bool {
+    const key_pos = std.mem.indexOf(u8, json, key) orelse return false;
+    const after_key = json[key_pos + key.len ..];
+
+    var i: usize = 0;
+    while (i < after_key.len and (after_key[i] == ' ' or after_key[i] == ':' or after_key[i] == '\t')) : (i += 1) {}
+    if (i >= after_key.len or after_key[i] != '[') return false;
+    i += 1;
+
+    while (i < after_key.len) {
+        while (i < after_key.len and (after_key[i] == ' ' or after_key[i] == '\t' or after_key[i] == '\n' or after_key[i] == '\r' or after_key[i] == ',')) : (i += 1) {}
+        if (i >= after_key.len or after_key[i] == ']') return false;
+        if (after_key[i] != '"') return false;
+        i += 1;
+
+        const value_start = i;
+        while (i < after_key.len) : (i += 1) {
+            if (after_key[i] == '"' and (i == 0 or after_key[i - 1] != '\\')) break;
+        }
+        if (i >= after_key.len) return false;
+        if (std.mem.eql(u8, after_key[value_start..i], expected)) return true;
+        i += 1;
+    }
+
+    return false;
+}
+
 // ---------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------
@@ -179,6 +228,7 @@ test "JwtToken parse valid token" {
     try testing.expectEqualStrings("test", jwt.issuer.?);
     try testing.expectEqual(@as(i64, 9999999999), jwt.expires_at.?);
     try testing.expect(!jwt.isExpired());
+    try testing.expect(!jwt.isNotYetValid());
 }
 
 test "JwtToken parse expired token" {
@@ -229,4 +279,19 @@ test "extractIntClaim" {
     try testing.expectEqual(@as(i64, 1234567890), extractIntClaim(json, "\"exp\"").?);
     try testing.expectEqual(@as(i64, 1000000000), extractIntClaim(json, "\"iat\"").?);
     try testing.expect(extractIntClaim(json, "\"missing\"") == null);
+}
+
+test "JwtToken audience array and not-before claims" {
+    const array_audience_token = "eyJhbGciOiJub25lIn0.eyJzdWIiOiJhcnJheWF1ZCIsImF1ZCI6WyJub3Qta2Fma2EiLCJrYWZrYSJdLCJleHAiOjk5OTk5OTk5OTl9.";
+    var array_audience_jwt = try JwtToken.parse(testing.allocator, array_audience_token);
+    defer array_audience_jwt.deinit();
+    try testing.expect(array_audience_jwt.audience == null);
+    try testing.expect(array_audience_jwt.hasAudience("kafka"));
+    try testing.expect(!array_audience_jwt.hasAudience("missing"));
+
+    const not_before_token = "eyJhbGciOiJub25lIn0.eyJzdWIiOiJmdXR1cmUiLCJuYmYiOjk5OTk5OTk5OTksImV4cCI6MTAwMDAwMDAwMDB9.";
+    var not_before_jwt = try JwtToken.parse(testing.allocator, not_before_token);
+    defer not_before_jwt.deinit();
+    try testing.expectEqual(@as(i64, 9999999999), not_before_jwt.not_before.?);
+    try testing.expect(not_before_jwt.isNotYetValid());
 }

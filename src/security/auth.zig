@@ -987,6 +987,11 @@ pub const OAuthBearerAuthenticator = struct {
             jwt.deinit();
             return .{ .success = false, .principal = null };
         }
+        if (jwt.isNotYetValid()) {
+            log.warn("OAUTHBEARER: token not yet valid (nbf={?d})", .{jwt.not_before});
+            jwt.deinit();
+            return .{ .success = false, .principal = null };
+        }
 
         // Validate issuer if configured
         if (self.expected_issuer) |expected| {
@@ -1005,14 +1010,8 @@ pub const OAuthBearerAuthenticator = struct {
 
         // Validate audience if configured
         if (self.expected_audience) |expected| {
-            if (jwt.audience) |actual| {
-                if (!std.mem.eql(u8, actual, expected)) {
-                    log.warn("OAUTHBEARER: audience mismatch (expected={s}, got={s})", .{ expected, actual });
-                    jwt.deinit();
-                    return .{ .success = false, .principal = null };
-                }
-            } else {
-                log.warn("OAUTHBEARER: token missing audience claim", .{});
+            if (!jwt.hasAudience(expected)) {
+                log.warn("OAUTHBEARER: audience mismatch or missing audience (expected={s})", .{expected});
                 jwt.deinit();
                 return .{ .success = false, .principal = null };
             }
@@ -1224,6 +1223,29 @@ test "OAuthBearerAuthenticator issuer validation" {
 
     // JWT with iss="wrong-issuer"
     const jwt = "eyJhbGciOiJub25lIn0.eyJzdWIiOiJ1c2VyIiwiaXNzIjoid3JvbmctaXNzdWVyIiwiZXhwIjo5OTk5OTk5OTk5fQ.";
+    const sasl_token = "n,,\x01auth=Bearer " ++ jwt ++ "\x01\x01";
+
+    var result = oauth.authenticate(testing.allocator, sasl_token);
+    defer result.deinit(testing.allocator);
+    try testing.expect(!result.success);
+}
+
+test "OAuthBearerAuthenticator accepts array-valued audience claims" {
+    const oauth = OAuthBearerAuthenticator.initWithConfig(null, "kafka");
+
+    const jwt = "eyJhbGciOiJub25lIn0.eyJzdWIiOiJhcnJheWF1ZCIsImF1ZCI6WyJub3Qta2Fma2EiLCJrYWZrYSJdLCJleHAiOjk5OTk5OTk5OTl9.";
+    const sasl_token = "n,,\x01auth=Bearer " ++ jwt ++ "\x01\x01";
+
+    var result = oauth.authenticate(testing.allocator, sasl_token);
+    defer result.deinit(testing.allocator);
+    try testing.expect(result.success);
+    try testing.expectEqualStrings("arrayaud", result.principal.?);
+}
+
+test "OAuthBearerAuthenticator rejects future not-before tokens" {
+    const oauth = OAuthBearerAuthenticator.init();
+
+    const jwt = "eyJhbGciOiJub25lIn0.eyJzdWIiOiJmdXR1cmUiLCJuYmYiOjk5OTk5OTk5OTksImV4cCI6MTAwMDAwMDAwMDB9.";
     const sasl_token = "n,,\x01auth=Bearer " ++ jwt ++ "\x01\x01";
 
     var result = oauth.authenticate(testing.allocator, sasl_token);
