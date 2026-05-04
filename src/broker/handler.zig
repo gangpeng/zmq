@@ -5349,7 +5349,7 @@ pub const Broker = struct {
     fn resourceTypeForApiKey(api_key: i16) Authorizer.ResourceType {
         return switch (api_key) {
             0, 1, 2, 21, 23, 61 => .topic, // Produce, Fetch, ListOffsets, DeleteRecords, OffsetForLeaderEpoch, DescribeProducers
-            8, 9, 10, 11, 12, 13, 14, 15, 16, 42, 47, 68, 69 => .group, // group-related
+            8, 9, 10, 11, 12, 13, 14, 15, 16, 42, 47, 68, 69, 76, 77, 78, 79, 83, 84, 85, 86, 87 => .group, // group-related
             22, 24, 25, 26, 27, 28, 65, 66 => .transactional_id, // txn-related
             3, 18, 19, 20, 29, 30, 31, 32, 33, 35, 37, 43, 44, 45, 46, 48, 49, 50, 51, 52, 53, 54, 55, 57, 60, 71, 72, 73, 74, 75 => .cluster, // metadata/admin/quorum
             501...519, 600...602 => .cluster, // AutoMQ stream/object/controller extensions
@@ -5362,16 +5362,16 @@ pub const Broker = struct {
         return switch (api_key) {
             0 => .write, // Produce
             1 => .read, // Fetch
-            2, 9, 15, 16, 23, 29, 32, 35, 46, 48, 50, 55, 60, 61, 65, 66, 69, 71, 74, 75 => .describe, // ListOffsets, OffsetFetch, Describe*
+            2, 9, 15, 16, 23, 29, 32, 35, 46, 48, 50, 55, 60, 61, 65, 66, 69, 71, 74, 75, 77, 84, 87 => .describe, // ListOffsets, OffsetFetch, Describe*
             3, 18 => .describe, // Metadata, ApiVersions
             8 => .read, // OffsetCommit
-            10, 11, 12, 13, 14, 68 => .read, // Group ops
+            10, 11, 12, 13, 14, 68, 76, 78, 79 => .read, // Group ops
             19, 37 => .create, // CreateTopics, CreatePartitions
             20, 21, 42, 47 => .delete, // DeleteTopics, DeleteRecords, DeleteGroups, OffsetDelete
             22, 24, 25, 26, 27, 28 => .write, // Txn ops
             30 => .alter, // CreateAcls
             31 => .alter, // DeleteAcls
-            33, 43, 44, 45, 49, 51, 57, 72, 73 => .alter, // Alter/admin APIs
+            33, 43, 44, 45, 49, 51, 57, 72, 73, 83, 85, 86 => .alter, // Alter/admin APIs
             52, 53, 54 => .cluster_action, // KRaft quorum mutations
             501, 502, 503, 508, 509, 514, 516, 518, 601 => .describe, // AutoMQ reads/lifecycle probes
             504, 511 => .delete, // AutoMQ deletes
@@ -5467,6 +5467,15 @@ pub const Broker = struct {
             73 => self.handleAssignReplicasToDirsAuthorizationError(request_bytes, body_start, req_header, api_version, resp_header_version, err_code),
             74 => self.handleListClientMetricsResourcesAuthorizationError(request_bytes, body_start, req_header, api_version, resp_header_version, err_code),
             75 => self.handleDescribeTopicPartitionsAuthorizationError(request_bytes, body_start, req_header, api_version, resp_header_version, err_code),
+            76 => self.handleShareGroupHeartbeatAuthorizationError(request_bytes, body_start, req_header, api_version, resp_header_version, err_code),
+            77 => self.handleShareGroupDescribeAuthorizationError(request_bytes, body_start, req_header, api_version, resp_header_version, err_code),
+            78 => self.handleShareFetchAuthorizationError(request_bytes, body_start, req_header, api_version, resp_header_version, err_code),
+            79 => self.handleShareAcknowledgeAuthorizationError(request_bytes, body_start, req_header, api_version, resp_header_version, err_code),
+            83 => self.handleInitializeShareGroupStateAuthorizationError(request_bytes, body_start, req_header, api_version, resp_header_version, err_code),
+            84 => self.handleReadShareGroupStateAuthorizationError(request_bytes, body_start, req_header, api_version, resp_header_version, err_code),
+            85 => self.handleWriteShareGroupStateAuthorizationError(request_bytes, body_start, req_header, api_version, resp_header_version, err_code),
+            86 => self.handleDeleteShareGroupStateAuthorizationError(request_bytes, body_start, req_header, api_version, resp_header_version, err_code),
+            87 => self.handleReadShareGroupStateSummaryAuthorizationError(request_bytes, body_start, req_header, api_version, resp_header_version, err_code),
             501 => self.handleCreateStreamsAuthorizationError(request_bytes, body_start, req_header, api_version, resp_header_version, err_code),
             502 => self.handleOpenStreamsAuthorizationError(request_bytes, body_start, req_header, api_version, resp_header_version, err_code),
             503 => self.handleCloseStreamsAuthorizationError(request_bytes, body_start, req_header, api_version, resp_header_version, err_code),
@@ -7870,6 +7879,674 @@ pub const Broker = struct {
             .groups = groups,
         };
         return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+    }
+
+    fn handleShareGroupHeartbeatAuthorizationError(
+        self: *Broker,
+        request_bytes: []const u8,
+        body_start: usize,
+        req_header: *const RequestHeader,
+        api_version: i16,
+        resp_header_version: i16,
+        err_code: ErrorCode,
+    ) ?[]u8 {
+        const Req = generated.share_group_heartbeat_request.ShareGroupHeartbeatRequest;
+        const Resp = generated.share_group_heartbeat_response.ShareGroupHeartbeatResponse;
+
+        if (!validateShareGroupHeartbeatRequestFrame(request_bytes, body_start)) {
+            log.warn("Malformed denied ShareGroupHeartbeat request", .{});
+            const resp = Resp{
+                .throttle_time_ms = 0,
+                .error_code = ErrorCode.invalid_request.toInt(),
+                .error_message = "malformed ShareGroupHeartbeat request",
+                .member_id = null,
+                .member_epoch = 0,
+                .heartbeat_interval_ms = 0,
+                .assignment = null,
+            };
+            return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+        }
+
+        var pos = body_start;
+        var req = Req.deserialize(self.allocator, request_bytes, &pos, api_version) catch |err| {
+            log.warn("Failed to decode denied ShareGroupHeartbeat request: {}", .{err});
+            const resp = Resp{
+                .throttle_time_ms = 0,
+                .error_code = ErrorCode.invalid_request.toInt(),
+                .error_message = "malformed ShareGroupHeartbeat request",
+                .member_id = null,
+                .member_epoch = 0,
+                .heartbeat_interval_ms = 0,
+                .assignment = null,
+            };
+            return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+        };
+        defer self.freeShareGroupHeartbeatRequest(&req);
+
+        const resp = Resp{
+            .throttle_time_ms = 0,
+            .error_code = @intFromEnum(err_code),
+            .error_message = "Not authorized",
+            .member_id = req.member_id,
+            .member_epoch = req.member_epoch,
+            .heartbeat_interval_ms = 0,
+            .assignment = null,
+        };
+        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+    }
+
+    fn handleShareGroupDescribeAuthorizationError(
+        self: *Broker,
+        request_bytes: []const u8,
+        body_start: usize,
+        req_header: *const RequestHeader,
+        api_version: i16,
+        resp_header_version: i16,
+        err_code: ErrorCode,
+    ) ?[]u8 {
+        const Req = generated.share_group_describe_request.ShareGroupDescribeRequest;
+        const Resp = generated.share_group_describe_response.ShareGroupDescribeResponse;
+        const DescribedGroup = Resp.DescribedGroup;
+
+        if (!validateShareGroupDescribeRequestFrame(request_bytes, body_start)) {
+            log.warn("Malformed denied ShareGroupDescribe request", .{});
+            const groups = [_]DescribedGroup{shareGroupDescribeError(null, ErrorCode.invalid_request, "malformed ShareGroupDescribe request", false)};
+            const resp = Resp{ .throttle_time_ms = 0, .groups = &groups };
+            return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+        }
+
+        var pos = body_start;
+        var req = Req.deserialize(self.allocator, request_bytes, &pos, api_version) catch |err| {
+            log.warn("Failed to decode denied ShareGroupDescribe request: {}", .{err});
+            const groups = [_]DescribedGroup{shareGroupDescribeError(null, ErrorCode.invalid_request, "malformed ShareGroupDescribe request", false)};
+            const resp = Resp{ .throttle_time_ms = 0, .groups = &groups };
+            return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+        };
+        defer self.freeShareGroupDescribeRequest(&req);
+
+        var groups: []DescribedGroup = &.{};
+        if (req.group_ids.len > 0) {
+            groups = self.allocator.alloc(DescribedGroup, req.group_ids.len) catch return null;
+        }
+        defer if (groups.len > 0) self.allocator.free(groups);
+
+        for (req.group_ids, 0..) |group_id, idx| {
+            groups[idx] = .{
+                .error_code = @intFromEnum(err_code),
+                .error_message = "Not authorized",
+                .group_id = group_id,
+                .group_state = "",
+                .group_epoch = 0,
+                .assignment_epoch = 0,
+                .assignor_name = "",
+                .members = &.{},
+                .authorized_operations = describeGroupsAuthorizedOps(req.include_authorized_operations),
+            };
+        }
+
+        const resp = Resp{ .throttle_time_ms = 0, .groups = groups };
+        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+    }
+
+    fn handleShareFetchAuthorizationError(
+        self: *Broker,
+        request_bytes: []const u8,
+        body_start: usize,
+        req_header: *const RequestHeader,
+        api_version: i16,
+        resp_header_version: i16,
+        err_code: ErrorCode,
+    ) ?[]u8 {
+        const Req = generated.share_fetch_request.ShareFetchRequest;
+        const Resp = generated.share_fetch_response.ShareFetchResponse;
+
+        if (!validateShareFetchRequestFrame(request_bytes, body_start)) {
+            log.warn("Malformed denied ShareFetch request", .{});
+            const resp = Resp{
+                .throttle_time_ms = 0,
+                .error_code = ErrorCode.invalid_request.toInt(),
+                .error_message = "malformed ShareFetch request",
+                .responses = &.{},
+                .node_endpoints = &.{},
+            };
+            return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+        }
+
+        var pos = body_start;
+        var req = Req.deserialize(self.allocator, request_bytes, &pos, api_version) catch |err| {
+            log.warn("Failed to decode denied ShareFetch request: {}", .{err});
+            const resp = Resp{
+                .throttle_time_ms = 0,
+                .error_code = ErrorCode.invalid_request.toInt(),
+                .error_message = "malformed ShareFetch request",
+                .responses = &.{},
+                .node_endpoints = &.{},
+            };
+            return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+        };
+        defer self.freeShareFetchRequest(&req);
+
+        const resp = Resp{
+            .throttle_time_ms = 0,
+            .error_code = @intFromEnum(err_code),
+            .error_message = "Not authorized",
+            .responses = &.{},
+            .node_endpoints = &.{},
+        };
+        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+    }
+
+    fn handleShareAcknowledgeAuthorizationError(
+        self: *Broker,
+        request_bytes: []const u8,
+        body_start: usize,
+        req_header: *const RequestHeader,
+        api_version: i16,
+        resp_header_version: i16,
+        err_code: ErrorCode,
+    ) ?[]u8 {
+        const Req = generated.share_acknowledge_request.ShareAcknowledgeRequest;
+        const Resp = generated.share_acknowledge_response.ShareAcknowledgeResponse;
+
+        if (!validateShareAcknowledgeRequestFrame(request_bytes, body_start)) {
+            log.warn("Malformed denied ShareAcknowledge request", .{});
+            const resp = Resp{
+                .throttle_time_ms = 0,
+                .error_code = ErrorCode.invalid_request.toInt(),
+                .error_message = "malformed ShareAcknowledge request",
+                .responses = &.{},
+                .node_endpoints = &.{},
+            };
+            return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+        }
+
+        var pos = body_start;
+        var req = Req.deserialize(self.allocator, request_bytes, &pos, api_version) catch |err| {
+            log.warn("Failed to decode denied ShareAcknowledge request: {}", .{err});
+            const resp = Resp{
+                .throttle_time_ms = 0,
+                .error_code = ErrorCode.invalid_request.toInt(),
+                .error_message = "malformed ShareAcknowledge request",
+                .responses = &.{},
+                .node_endpoints = &.{},
+            };
+            return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+        };
+        defer self.freeShareAcknowledgeRequest(&req);
+
+        const resp = Resp{
+            .throttle_time_ms = 0,
+            .error_code = @intFromEnum(err_code),
+            .error_message = "Not authorized",
+            .responses = &.{},
+            .node_endpoints = &.{},
+        };
+        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+    }
+
+    fn handleInitializeShareGroupStateAuthorizationError(
+        self: *Broker,
+        request_bytes: []const u8,
+        body_start: usize,
+        req_header: *const RequestHeader,
+        api_version: i16,
+        resp_header_version: i16,
+        err_code: ErrorCode,
+    ) ?[]u8 {
+        const Req = generated.initialize_share_group_state_request.InitializeShareGroupStateRequest;
+        const Resp = generated.initialize_share_group_state_response.InitializeShareGroupStateResponse;
+
+        if (!validateInitializeShareGroupStateRequestFrame(request_bytes, body_start)) {
+            log.warn("Malformed denied InitializeShareGroupState request", .{});
+            const partitions = [_]Resp.InitializeStateResult.PartitionResult{.{
+                .partition = -1,
+                .error_code = ErrorCode.invalid_request.toInt(),
+                .error_message = "malformed InitializeShareGroupState request",
+            }};
+            const results = [_]Resp.InitializeStateResult{.{
+                .topic_id = [_]u8{0} ** 16,
+                .partitions = &partitions,
+            }};
+            const resp = Resp{ .results = &results };
+            return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+        }
+
+        var pos = body_start;
+        var req = Req.deserialize(self.allocator, request_bytes, &pos, api_version) catch |err| {
+            log.warn("Failed to decode denied InitializeShareGroupState request: {}", .{err});
+            const partitions = [_]Resp.InitializeStateResult.PartitionResult{.{
+                .partition = -1,
+                .error_code = ErrorCode.invalid_request.toInt(),
+                .error_message = "malformed InitializeShareGroupState request",
+            }};
+            const results = [_]Resp.InitializeStateResult{.{
+                .topic_id = [_]u8{0} ** 16,
+                .partitions = &partitions,
+            }};
+            const resp = Resp{ .results = &results };
+            return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+        };
+        defer self.freeInitializeShareGroupStateRequest(&req);
+
+        const results = self.buildInitializeShareGroupStateAuthorizationResults(req, err_code) catch return null;
+        defer self.freeInitializeShareGroupStateResults(results);
+
+        const resp = Resp{ .results = results };
+        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+    }
+
+    fn buildInitializeShareGroupStateAuthorizationResults(
+        self: *Broker,
+        req: generated.initialize_share_group_state_request.InitializeShareGroupStateRequest,
+        err_code: ErrorCode,
+    ) ![]generated.initialize_share_group_state_response.InitializeShareGroupStateResponse.InitializeStateResult {
+        const Result = generated.initialize_share_group_state_response.InitializeShareGroupStateResponse.InitializeStateResult;
+        const PartitionResult = Result.PartitionResult;
+
+        if (req.topics.len == 0) return &.{};
+
+        const results = try self.allocator.alloc(Result, req.topics.len);
+        var results_init: usize = 0;
+        errdefer {
+            self.freeInitializeShareGroupStateResultPartitions(results[0..results_init]);
+            self.allocator.free(results);
+        }
+
+        for (req.topics) |topic| {
+            const partitions = try self.allocator.alloc(PartitionResult, topic.partitions.len);
+            errdefer self.allocator.free(partitions);
+
+            for (topic.partitions, 0..) |partition, idx| {
+                partitions[idx] = .{
+                    .partition = partition.partition,
+                    .error_code = @intFromEnum(err_code),
+                    .error_message = "Not authorized",
+                };
+            }
+
+            results[results_init] = .{
+                .topic_id = topic.topic_id,
+                .partitions = partitions,
+            };
+            results_init += 1;
+        }
+
+        return results;
+    }
+
+    fn handleReadShareGroupStateAuthorizationError(
+        self: *Broker,
+        request_bytes: []const u8,
+        body_start: usize,
+        req_header: *const RequestHeader,
+        api_version: i16,
+        resp_header_version: i16,
+        err_code: ErrorCode,
+    ) ?[]u8 {
+        const Req = generated.read_share_group_state_request.ReadShareGroupStateRequest;
+        const Resp = generated.read_share_group_state_response.ReadShareGroupStateResponse;
+
+        if (!validateReadShareGroupStateRequestFrame(request_bytes, body_start)) {
+            log.warn("Malformed denied ReadShareGroupState request", .{});
+            const partitions = [_]Resp.ReadStateResult.PartitionResult{.{
+                .partition = -1,
+                .error_code = ErrorCode.invalid_request.toInt(),
+                .error_message = "malformed ReadShareGroupState request",
+                .state_epoch = 0,
+                .start_offset = -1,
+                .state_batches = &.{},
+            }};
+            const results = [_]Resp.ReadStateResult{.{
+                .topic_id = [_]u8{0} ** 16,
+                .partitions = &partitions,
+            }};
+            const resp = Resp{ .results = &results };
+            return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+        }
+
+        var pos = body_start;
+        var req = Req.deserialize(self.allocator, request_bytes, &pos, api_version) catch |err| {
+            log.warn("Failed to decode denied ReadShareGroupState request: {}", .{err});
+            const partitions = [_]Resp.ReadStateResult.PartitionResult{.{
+                .partition = -1,
+                .error_code = ErrorCode.invalid_request.toInt(),
+                .error_message = "malformed ReadShareGroupState request",
+                .state_epoch = 0,
+                .start_offset = -1,
+                .state_batches = &.{},
+            }};
+            const results = [_]Resp.ReadStateResult{.{
+                .topic_id = [_]u8{0} ** 16,
+                .partitions = &partitions,
+            }};
+            const resp = Resp{ .results = &results };
+            return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+        };
+        defer self.freeReadShareGroupStateRequest(&req);
+
+        const results = self.buildReadShareGroupStateAuthorizationResults(req, err_code) catch return null;
+        defer self.freeReadShareGroupStateResults(results);
+
+        const resp = Resp{ .results = results };
+        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+    }
+
+    fn buildReadShareGroupStateAuthorizationResults(
+        self: *Broker,
+        req: generated.read_share_group_state_request.ReadShareGroupStateRequest,
+        err_code: ErrorCode,
+    ) ![]generated.read_share_group_state_response.ReadShareGroupStateResponse.ReadStateResult {
+        const Result = generated.read_share_group_state_response.ReadShareGroupStateResponse.ReadStateResult;
+        const PartitionResult = Result.PartitionResult;
+
+        if (req.topics.len == 0) return &.{};
+
+        const results = try self.allocator.alloc(Result, req.topics.len);
+        var results_init: usize = 0;
+        errdefer {
+            self.freeReadShareGroupStateResultPartitions(results[0..results_init]);
+            self.allocator.free(results);
+        }
+
+        for (req.topics) |topic| {
+            const partitions = try self.allocator.alloc(PartitionResult, topic.partitions.len);
+            errdefer self.allocator.free(partitions);
+
+            for (topic.partitions, 0..) |partition, idx| {
+                partitions[idx] = .{
+                    .partition = partition.partition,
+                    .error_code = @intFromEnum(err_code),
+                    .error_message = "Not authorized",
+                    .state_epoch = 0,
+                    .start_offset = -1,
+                    .state_batches = &.{},
+                };
+            }
+
+            results[results_init] = .{
+                .topic_id = topic.topic_id,
+                .partitions = partitions,
+            };
+            results_init += 1;
+        }
+
+        return results;
+    }
+
+    fn handleWriteShareGroupStateAuthorizationError(
+        self: *Broker,
+        request_bytes: []const u8,
+        body_start: usize,
+        req_header: *const RequestHeader,
+        api_version: i16,
+        resp_header_version: i16,
+        err_code: ErrorCode,
+    ) ?[]u8 {
+        const Req = generated.write_share_group_state_request.WriteShareGroupStateRequest;
+        const Resp = generated.write_share_group_state_response.WriteShareGroupStateResponse;
+
+        if (!validateWriteShareGroupStateRequestFrame(request_bytes, body_start)) {
+            log.warn("Malformed denied WriteShareGroupState request", .{});
+            const partitions = [_]Resp.WriteStateResult.PartitionResult{.{
+                .partition = -1,
+                .error_code = ErrorCode.invalid_request.toInt(),
+                .error_message = "malformed WriteShareGroupState request",
+            }};
+            const results = [_]Resp.WriteStateResult{.{
+                .topic_id = [_]u8{0} ** 16,
+                .partitions = &partitions,
+            }};
+            const resp = Resp{ .results = &results };
+            return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+        }
+
+        var pos = body_start;
+        var req = Req.deserialize(self.allocator, request_bytes, &pos, api_version) catch |err| {
+            log.warn("Failed to decode denied WriteShareGroupState request: {}", .{err});
+            const partitions = [_]Resp.WriteStateResult.PartitionResult{.{
+                .partition = -1,
+                .error_code = ErrorCode.invalid_request.toInt(),
+                .error_message = "malformed WriteShareGroupState request",
+            }};
+            const results = [_]Resp.WriteStateResult{.{
+                .topic_id = [_]u8{0} ** 16,
+                .partitions = &partitions,
+            }};
+            const resp = Resp{ .results = &results };
+            return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+        };
+        defer self.freeWriteShareGroupStateRequest(&req);
+
+        const results = self.buildWriteShareGroupStateAuthorizationResults(req, err_code) catch return null;
+        defer self.freeWriteShareGroupStateResults(results);
+
+        const resp = Resp{ .results = results };
+        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+    }
+
+    fn buildWriteShareGroupStateAuthorizationResults(
+        self: *Broker,
+        req: generated.write_share_group_state_request.WriteShareGroupStateRequest,
+        err_code: ErrorCode,
+    ) ![]generated.write_share_group_state_response.WriteShareGroupStateResponse.WriteStateResult {
+        const Result = generated.write_share_group_state_response.WriteShareGroupStateResponse.WriteStateResult;
+        const PartitionResult = Result.PartitionResult;
+
+        if (req.topics.len == 0) return &.{};
+
+        const results = try self.allocator.alloc(Result, req.topics.len);
+        var results_init: usize = 0;
+        errdefer {
+            self.freeWriteShareGroupStateResultPartitions(results[0..results_init]);
+            self.allocator.free(results);
+        }
+
+        for (req.topics) |topic| {
+            const partitions = try self.allocator.alloc(PartitionResult, topic.partitions.len);
+            errdefer self.allocator.free(partitions);
+
+            for (topic.partitions, 0..) |partition, idx| {
+                partitions[idx] = .{
+                    .partition = partition.partition,
+                    .error_code = @intFromEnum(err_code),
+                    .error_message = "Not authorized",
+                };
+            }
+
+            results[results_init] = .{
+                .topic_id = topic.topic_id,
+                .partitions = partitions,
+            };
+            results_init += 1;
+        }
+
+        return results;
+    }
+
+    fn handleDeleteShareGroupStateAuthorizationError(
+        self: *Broker,
+        request_bytes: []const u8,
+        body_start: usize,
+        req_header: *const RequestHeader,
+        api_version: i16,
+        resp_header_version: i16,
+        err_code: ErrorCode,
+    ) ?[]u8 {
+        const Req = generated.delete_share_group_state_request.DeleteShareGroupStateRequest;
+        const Resp = generated.delete_share_group_state_response.DeleteShareGroupStateResponse;
+
+        if (!validateDeleteShareGroupStateRequestFrame(request_bytes, body_start)) {
+            log.warn("Malformed denied DeleteShareGroupState request", .{});
+            const partitions = [_]Resp.DeleteStateResult.PartitionResult{.{
+                .partition = -1,
+                .error_code = ErrorCode.invalid_request.toInt(),
+                .error_message = "malformed DeleteShareGroupState request",
+            }};
+            const results = [_]Resp.DeleteStateResult{.{
+                .topic_id = [_]u8{0} ** 16,
+                .partitions = &partitions,
+            }};
+            const resp = Resp{ .results = &results };
+            return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+        }
+
+        var pos = body_start;
+        var req = Req.deserialize(self.allocator, request_bytes, &pos, api_version) catch |err| {
+            log.warn("Failed to decode denied DeleteShareGroupState request: {}", .{err});
+            const partitions = [_]Resp.DeleteStateResult.PartitionResult{.{
+                .partition = -1,
+                .error_code = ErrorCode.invalid_request.toInt(),
+                .error_message = "malformed DeleteShareGroupState request",
+            }};
+            const results = [_]Resp.DeleteStateResult{.{
+                .topic_id = [_]u8{0} ** 16,
+                .partitions = &partitions,
+            }};
+            const resp = Resp{ .results = &results };
+            return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+        };
+        defer self.freeDeleteShareGroupStateRequest(&req);
+
+        const results = self.buildDeleteShareGroupStateAuthorizationResults(req, err_code) catch return null;
+        defer self.freeDeleteShareGroupStateResults(results);
+
+        const resp = Resp{ .results = results };
+        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+    }
+
+    fn buildDeleteShareGroupStateAuthorizationResults(
+        self: *Broker,
+        req: generated.delete_share_group_state_request.DeleteShareGroupStateRequest,
+        err_code: ErrorCode,
+    ) ![]generated.delete_share_group_state_response.DeleteShareGroupStateResponse.DeleteStateResult {
+        const Result = generated.delete_share_group_state_response.DeleteShareGroupStateResponse.DeleteStateResult;
+        const PartitionResult = Result.PartitionResult;
+
+        if (req.topics.len == 0) return &.{};
+
+        const results = try self.allocator.alloc(Result, req.topics.len);
+        var results_init: usize = 0;
+        errdefer {
+            self.freeDeleteShareGroupStateResultPartitions(results[0..results_init]);
+            self.allocator.free(results);
+        }
+
+        for (req.topics) |topic| {
+            const partitions = try self.allocator.alloc(PartitionResult, topic.partitions.len);
+            errdefer self.allocator.free(partitions);
+
+            for (topic.partitions, 0..) |partition, idx| {
+                partitions[idx] = .{
+                    .partition = partition.partition,
+                    .error_code = @intFromEnum(err_code),
+                    .error_message = "Not authorized",
+                };
+            }
+
+            results[results_init] = .{
+                .topic_id = topic.topic_id,
+                .partitions = partitions,
+            };
+            results_init += 1;
+        }
+
+        return results;
+    }
+
+    fn handleReadShareGroupStateSummaryAuthorizationError(
+        self: *Broker,
+        request_bytes: []const u8,
+        body_start: usize,
+        req_header: *const RequestHeader,
+        api_version: i16,
+        resp_header_version: i16,
+        err_code: ErrorCode,
+    ) ?[]u8 {
+        const Req = generated.read_share_group_state_summary_request.ReadShareGroupStateSummaryRequest;
+        const Resp = generated.read_share_group_state_summary_response.ReadShareGroupStateSummaryResponse;
+
+        if (!validateReadShareGroupStateSummaryRequestFrame(request_bytes, body_start)) {
+            log.warn("Malformed denied ReadShareGroupStateSummary request", .{});
+            const partitions = [_]Resp.ReadStateSummaryResult.PartitionResult{.{
+                .partition = -1,
+                .error_code = ErrorCode.invalid_request.toInt(),
+                .error_message = "malformed ReadShareGroupStateSummary request",
+                .state_epoch = 0,
+                .start_offset = -1,
+            }};
+            const results = [_]Resp.ReadStateSummaryResult{.{
+                .topic_id = [_]u8{0} ** 16,
+                .partitions = &partitions,
+            }};
+            const resp = Resp{ .results = &results };
+            return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+        }
+
+        var pos = body_start;
+        var req = Req.deserialize(self.allocator, request_bytes, &pos, api_version) catch |err| {
+            log.warn("Failed to decode denied ReadShareGroupStateSummary request: {}", .{err});
+            const partitions = [_]Resp.ReadStateSummaryResult.PartitionResult{.{
+                .partition = -1,
+                .error_code = ErrorCode.invalid_request.toInt(),
+                .error_message = "malformed ReadShareGroupStateSummary request",
+                .state_epoch = 0,
+                .start_offset = -1,
+            }};
+            const results = [_]Resp.ReadStateSummaryResult{.{
+                .topic_id = [_]u8{0} ** 16,
+                .partitions = &partitions,
+            }};
+            const resp = Resp{ .results = &results };
+            return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+        };
+        defer self.freeReadShareGroupStateSummaryRequest(&req);
+
+        const results = self.buildReadShareGroupStateSummaryAuthorizationResults(req, err_code) catch return null;
+        defer self.freeReadShareGroupStateSummaryResults(results);
+
+        const resp = Resp{ .results = results };
+        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+    }
+
+    fn buildReadShareGroupStateSummaryAuthorizationResults(
+        self: *Broker,
+        req: generated.read_share_group_state_summary_request.ReadShareGroupStateSummaryRequest,
+        err_code: ErrorCode,
+    ) ![]generated.read_share_group_state_summary_response.ReadShareGroupStateSummaryResponse.ReadStateSummaryResult {
+        const Result = generated.read_share_group_state_summary_response.ReadShareGroupStateSummaryResponse.ReadStateSummaryResult;
+        const PartitionResult = Result.PartitionResult;
+
+        if (req.topics.len == 0) return &.{};
+
+        const results = try self.allocator.alloc(Result, req.topics.len);
+        var results_init: usize = 0;
+        errdefer {
+            self.freeReadShareGroupStateSummaryResultPartitions(results[0..results_init]);
+            self.allocator.free(results);
+        }
+
+        for (req.topics) |topic| {
+            const partitions = try self.allocator.alloc(PartitionResult, topic.partitions.len);
+            errdefer self.allocator.free(partitions);
+
+            for (topic.partitions, 0..) |partition, idx| {
+                partitions[idx] = .{
+                    .partition = partition.partition,
+                    .error_code = @intFromEnum(err_code),
+                    .error_message = "Not authorized",
+                    .state_epoch = 0,
+                    .start_offset = -1,
+                };
+            }
+
+            results[results_init] = .{
+                .topic_id = topic.topic_id,
+                .partitions = partitions,
+            };
+            results_init += 1;
+        }
+
+        return results;
     }
 
     fn handleDescribeProducersAuthorizationError(
@@ -13141,7 +13818,7 @@ pub const Broker = struct {
     }
 
     // ---------------------------------------------------------------
-    // ShareGroupHeartbeat (key 76) — non-advertised until durable share-group coordinator semantics exist
+    // ShareGroupHeartbeat (key 76) — advertised KIP-932 single-broker share-group coordinator
     // ---------------------------------------------------------------
     fn handleShareGroupHeartbeat(self: *Broker, request_bytes: []const u8, body_start: usize, req_header: *const RequestHeader, api_version: i16, resp_header_version: i16) ?[]u8 {
         const Req = generated.share_group_heartbeat_request.ShareGroupHeartbeatRequest;
@@ -13412,7 +14089,7 @@ pub const Broker = struct {
     }
 
     // ---------------------------------------------------------------
-    // ShareGroupDescribe (key 77) — non-advertised until durable share-group coordinator semantics exist
+    // ShareGroupDescribe (key 77) — advertised KIP-932 share-group introspection
     // ---------------------------------------------------------------
     fn handleShareGroupDescribe(self: *Broker, request_bytes: []const u8, body_start: usize, req_header: *const RequestHeader, api_version: i16, resp_header_version: i16) ?[]u8 {
         const Req = generated.share_group_describe_request.ShareGroupDescribeRequest;
@@ -13889,7 +14566,7 @@ pub const Broker = struct {
     }
 
     // ---------------------------------------------------------------
-    // ShareFetch (key 78) — non-advertised until share sessions exist
+    // ShareFetch (key 78) — advertised KIP-932 share-session data plane
     // ---------------------------------------------------------------
     fn handleShareFetch(self: *Broker, request_bytes: []const u8, body_start: usize, req_header: *const RequestHeader, api_version: i16, resp_header_version: i16) ?[]u8 {
         const Req = generated.share_fetch_request.ShareFetchRequest;
@@ -14146,7 +14823,7 @@ pub const Broker = struct {
     }
 
     // ---------------------------------------------------------------
-    // ShareAcknowledge (key 79) — non-advertised until share sessions exist
+    // ShareAcknowledge (key 79) — advertised KIP-932 share-session acknowledgements
     // ---------------------------------------------------------------
     fn handleShareAcknowledge(self: *Broker, request_bytes: []const u8, body_start: usize, req_header: *const RequestHeader, api_version: i16, resp_header_version: i16) ?[]u8 {
         const Req = generated.share_acknowledge_request.ShareAcknowledgeRequest;
@@ -14492,7 +15169,7 @@ pub const Broker = struct {
     }
 
     // ---------------------------------------------------------------
-    // InitializeShareGroupState (key 83) — non-advertised until share state is durable/coordinator-backed
+    // InitializeShareGroupState (key 83) — advertised KIP-932 share state mutation
     // ---------------------------------------------------------------
     fn handleInitializeShareGroupState(self: *Broker, request_bytes: []const u8, body_start: usize, req_header: *const RequestHeader, api_version: i16, resp_header_version: i16) ?[]u8 {
         const Req = generated.initialize_share_group_state_request.InitializeShareGroupStateRequest;
@@ -14610,7 +15287,7 @@ pub const Broker = struct {
     }
 
     // ---------------------------------------------------------------
-    // ReadShareGroupState (key 84) — non-advertised until share state is durable/coordinator-backed
+    // ReadShareGroupState (key 84) — advertised KIP-932 share state read
     // ---------------------------------------------------------------
     fn handleReadShareGroupState(self: *Broker, request_bytes: []const u8, body_start: usize, req_header: *const RequestHeader, api_version: i16, resp_header_version: i16) ?[]u8 {
         const Req = generated.read_share_group_state_request.ReadShareGroupStateRequest;
@@ -14741,7 +15418,7 @@ pub const Broker = struct {
     }
 
     // ---------------------------------------------------------------
-    // WriteShareGroupState (key 85) — non-advertised until share state is durable/coordinator-backed
+    // WriteShareGroupState (key 85) — advertised KIP-932 share state mutation
     // ---------------------------------------------------------------
     fn handleWriteShareGroupState(self: *Broker, request_bytes: []const u8, body_start: usize, req_header: *const RequestHeader, api_version: i16, resp_header_version: i16) ?[]u8 {
         const Req = generated.write_share_group_state_request.WriteShareGroupStateRequest;
@@ -14876,7 +15553,7 @@ pub const Broker = struct {
     }
 
     // ---------------------------------------------------------------
-    // DeleteShareGroupState (key 86) — non-advertised until share state is durable/coordinator-backed
+    // DeleteShareGroupState (key 86) — advertised KIP-932 share state mutation
     // ---------------------------------------------------------------
     fn handleDeleteShareGroupState(self: *Broker, request_bytes: []const u8, body_start: usize, req_header: *const RequestHeader, api_version: i16, resp_header_version: i16) ?[]u8 {
         const Req = generated.delete_share_group_state_request.DeleteShareGroupStateRequest;
@@ -14986,7 +15663,7 @@ pub const Broker = struct {
     }
 
     // ---------------------------------------------------------------
-    // ReadShareGroupStateSummary (key 87) — non-advertised until share state is durable/coordinator-backed
+    // ReadShareGroupStateSummary (key 87) — advertised KIP-932 share state summary
     // ---------------------------------------------------------------
     fn handleReadShareGroupStateSummary(self: *Broker, request_bytes: []const u8, body_start: usize, req_header: *const RequestHeader, api_version: i16, resp_header_version: i16) ?[]u8 {
         const Req = generated.read_share_group_state_summary_request.ReadShareGroupStateSummaryRequest;
@@ -25364,6 +26041,12 @@ fn buildTestRequest(buf: []u8, api_key: i16, api_version: i16, correlation_id: i
         ser.writeString(buf, &pos, "test-client");
     }
     return pos;
+}
+
+fn expectTestResponseHeader(response: []const u8, api_key: i16, api_version: i16, correlation_id: i32, pos: *usize) !void {
+    var response_header = try ResponseHeader.deserialize(testing.allocator, response, pos, header_mod.responseHeaderVersion(api_key, api_version));
+    defer response_header.deinit(testing.allocator);
+    try testing.expectEqual(correlation_id, response_header.correlation_id);
 }
 
 fn expectTrailingByteRejected(broker: *Broker, buf: []u8, pos: usize) !void {
@@ -47129,6 +47812,156 @@ test "Broker.handleRequest ShareGroupDescribe rejects malformed request" {
     try testing.expectEqual(ErrorCode.invalid_request.toInt(), resp.groups[0].error_code);
 }
 
+test "Broker.handleRequest share group APIs authorization denial uses generated responses" {
+    const HeartbeatReq = generated.share_group_heartbeat_request.ShareGroupHeartbeatRequest;
+    const HeartbeatResp = generated.share_group_heartbeat_response.ShareGroupHeartbeatResponse;
+    const DescribeReq = generated.share_group_describe_request.ShareGroupDescribeRequest;
+    const DescribeResp = generated.share_group_describe_response.ShareGroupDescribeResponse;
+    const FetchReq = generated.share_fetch_request.ShareFetchRequest;
+    const FetchResp = generated.share_fetch_response.ShareFetchResponse;
+    const AckReq = generated.share_acknowledge_request.ShareAcknowledgeRequest;
+    const AckResp = generated.share_acknowledge_response.ShareAcknowledgeResponse;
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+    try broker.authorizer.addAcl("other-client", .group, "*", .literal, .read, .allow, "*");
+
+    const heartbeat_req = HeartbeatReq{
+        .group_id = "share-auth-group",
+        .member_id = "share-auth-member",
+        .member_epoch = 7,
+    };
+
+    var heartbeat_buf: [256]u8 = undefined;
+    var heartbeat_pos = buildTestRequest(&heartbeat_buf, 76, 0, 7607, header_mod.requestHeaderVersion(76, 0));
+    heartbeat_req.serialize(&heartbeat_buf, &heartbeat_pos, 0);
+
+    const heartbeat_response = broker.handleRequest(heartbeat_buf[0..heartbeat_pos]);
+    try testing.expect(heartbeat_response != null);
+    defer testing.allocator.free(heartbeat_response.?);
+
+    var heartbeat_rpos: usize = 0;
+    try expectTestResponseHeader(heartbeat_response.?, 76, 0, 7607, &heartbeat_rpos);
+    const heartbeat_resp = try HeartbeatResp.deserialize(testing.allocator, heartbeat_response.?, &heartbeat_rpos, 0);
+    defer freeDeserializedShareGroupHeartbeatResponse(&heartbeat_resp);
+    try testing.expectEqual(heartbeat_response.?.len, heartbeat_rpos);
+    try testing.expectEqual(ErrorCode.group_authorization_failed.toInt(), heartbeat_resp.error_code);
+    try testing.expectEqualStrings("Not authorized", heartbeat_resp.error_message.?);
+    try testing.expectEqualStrings("share-auth-member", heartbeat_resp.member_id.?);
+    try testing.expectEqual(@as(i32, 7), heartbeat_resp.member_epoch);
+    try testing.expectEqual(@as(i32, 0), heartbeat_resp.heartbeat_interval_ms);
+    try testing.expect(heartbeat_resp.assignment == null);
+
+    const group_ids = [_]?[]const u8{ "share-auth-group", "share-auth-other" };
+    const describe_req = DescribeReq{
+        .group_ids = &group_ids,
+        .include_authorized_operations = true,
+    };
+
+    var describe_buf: [256]u8 = undefined;
+    var describe_pos = buildTestRequest(&describe_buf, 77, 0, 7702, header_mod.requestHeaderVersion(77, 0));
+    describe_req.serialize(&describe_buf, &describe_pos, 0);
+
+    const describe_response = broker.handleRequest(describe_buf[0..describe_pos]);
+    try testing.expect(describe_response != null);
+    defer testing.allocator.free(describe_response.?);
+
+    var describe_rpos: usize = 0;
+    try expectTestResponseHeader(describe_response.?, 77, 0, 7702, &describe_rpos);
+    const describe_resp = try DescribeResp.deserialize(testing.allocator, describe_response.?, &describe_rpos, 0);
+    defer freeDeserializedShareGroupDescribeResponse(&describe_resp);
+    try testing.expectEqual(describe_response.?.len, describe_rpos);
+    try testing.expectEqual(@as(i32, 0), describe_resp.throttle_time_ms);
+    try testing.expectEqual(@as(usize, 2), describe_resp.groups.len);
+    try testing.expectEqual(ErrorCode.group_authorization_failed.toInt(), describe_resp.groups[0].error_code);
+    try testing.expectEqualStrings("Not authorized", describe_resp.groups[0].error_message.?);
+    try testing.expectEqualStrings("share-auth-group", describe_resp.groups[0].group_id.?);
+    try testing.expectEqualStrings("", describe_resp.groups[0].group_state.?);
+    try testing.expectEqual(@as(i32, 0), describe_resp.groups[0].authorized_operations);
+    try testing.expectEqual(ErrorCode.group_authorization_failed.toInt(), describe_resp.groups[1].error_code);
+    try testing.expectEqualStrings("share-auth-other", describe_resp.groups[1].group_id.?);
+
+    const topic_id = [_]u8{0x41} ** 16;
+    const fetch_partitions = [_]FetchReq.FetchTopic.FetchPartition{.{
+        .partition_index = 2,
+        .partition_max_bytes = 1024,
+        .acknowledgement_batches = &.{},
+    }};
+    const fetch_topics = [_]FetchReq.FetchTopic{.{
+        .topic_id = topic_id,
+        .partitions = &fetch_partitions,
+    }};
+    const fetch_req = FetchReq{
+        .group_id = "share-auth-group",
+        .member_id = "share-auth-member",
+        .share_session_epoch = 0,
+        .max_wait_ms = 1,
+        .min_bytes = 0,
+        .max_bytes = 1024,
+        .topics = &fetch_topics,
+        .forgotten_topics_data = &.{},
+    };
+
+    var fetch_buf: [512]u8 = undefined;
+    var fetch_pos = buildTestRequest(&fetch_buf, 78, 0, 7804, header_mod.requestHeaderVersion(78, 0));
+    fetch_req.serialize(&fetch_buf, &fetch_pos, 0);
+
+    const fetch_response = broker.handleRequest(fetch_buf[0..fetch_pos]);
+    try testing.expect(fetch_response != null);
+    defer testing.allocator.free(fetch_response.?);
+
+    var fetch_rpos: usize = 0;
+    try expectTestResponseHeader(fetch_response.?, 78, 0, 7804, &fetch_rpos);
+    const fetch_resp = try FetchResp.deserialize(testing.allocator, fetch_response.?, &fetch_rpos, 0);
+    defer {
+        if (fetch_resp.responses.len > 0) testing.allocator.free(fetch_resp.responses);
+        if (fetch_resp.node_endpoints.len > 0) testing.allocator.free(fetch_resp.node_endpoints);
+    }
+    try testing.expectEqual(fetch_response.?.len, fetch_rpos);
+    try testing.expectEqual(@as(i32, 0), fetch_resp.throttle_time_ms);
+    try testing.expectEqual(ErrorCode.group_authorization_failed.toInt(), fetch_resp.error_code);
+    try testing.expectEqualStrings("Not authorized", fetch_resp.error_message.?);
+    try testing.expectEqual(@as(usize, 0), fetch_resp.responses.len);
+    try testing.expectEqual(@as(usize, 0), fetch_resp.node_endpoints.len);
+
+    const ack_partitions = [_]AckReq.AcknowledgeTopic.AcknowledgePartition{.{
+        .partition_index = 2,
+        .acknowledgement_batches = &.{},
+    }};
+    const ack_topics = [_]AckReq.AcknowledgeTopic{.{
+        .topic_id = topic_id,
+        .partitions = &ack_partitions,
+    }};
+    const ack_req = AckReq{
+        .group_id = "share-auth-group",
+        .member_id = "share-auth-member",
+        .share_session_epoch = 1,
+        .topics = &ack_topics,
+    };
+
+    var ack_buf: [512]u8 = undefined;
+    var ack_pos = buildTestRequest(&ack_buf, 79, 0, 7903, header_mod.requestHeaderVersion(79, 0));
+    ack_req.serialize(&ack_buf, &ack_pos, 0);
+
+    const ack_response = broker.handleRequest(ack_buf[0..ack_pos]);
+    try testing.expect(ack_response != null);
+    defer testing.allocator.free(ack_response.?);
+
+    var ack_rpos: usize = 0;
+    try expectTestResponseHeader(ack_response.?, 79, 0, 7903, &ack_rpos);
+    const ack_resp = try AckResp.deserialize(testing.allocator, ack_response.?, &ack_rpos, 0);
+    defer {
+        if (ack_resp.responses.len > 0) testing.allocator.free(ack_resp.responses);
+        if (ack_resp.node_endpoints.len > 0) testing.allocator.free(ack_resp.node_endpoints);
+    }
+    try testing.expectEqual(ack_response.?.len, ack_rpos);
+    try testing.expectEqual(@as(i32, 0), ack_resp.throttle_time_ms);
+    try testing.expectEqual(ErrorCode.group_authorization_failed.toInt(), ack_resp.error_code);
+    try testing.expectEqualStrings("Not authorized", ack_resp.error_message.?);
+    try testing.expectEqual(@as(usize, 0), ack_resp.responses.len);
+    try testing.expectEqual(@as(usize, 0), ack_resp.node_endpoints.len);
+}
+
 test "Broker.handleRequest ShareFetch opens local session and fetches records" {
     const Req = generated.share_fetch_request.ShareFetchRequest;
     const Resp = generated.share_fetch_response.ShareFetchResponse;
@@ -48599,6 +49432,226 @@ test "Broker.handleRequest ReadShareGroupStateSummary rejects malformed request"
     try testing.expectEqual(@as(usize, 1), resp.results[0].partitions.len);
     try testing.expectEqual(@as(i32, -1), resp.results[0].partitions[0].partition);
     try testing.expectEqual(ErrorCode.invalid_request.toInt(), resp.results[0].partitions[0].error_code);
+}
+
+test "Broker.handleRequest share state APIs authorization denial uses generated responses" {
+    const InitReq = generated.initialize_share_group_state_request.InitializeShareGroupStateRequest;
+    const InitResp = generated.initialize_share_group_state_response.InitializeShareGroupStateResponse;
+    const ReadReq = generated.read_share_group_state_request.ReadShareGroupStateRequest;
+    const ReadResp = generated.read_share_group_state_response.ReadShareGroupStateResponse;
+    const WriteReq = generated.write_share_group_state_request.WriteShareGroupStateRequest;
+    const WriteResp = generated.write_share_group_state_response.WriteShareGroupStateResponse;
+    const DeleteReq = generated.delete_share_group_state_request.DeleteShareGroupStateRequest;
+    const DeleteResp = generated.delete_share_group_state_response.DeleteShareGroupStateResponse;
+    const SummaryReq = generated.read_share_group_state_summary_request.ReadShareGroupStateSummaryRequest;
+    const SummaryResp = generated.read_share_group_state_summary_response.ReadShareGroupStateSummaryResponse;
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+    try broker.authorizer.addAcl("other-client", .group, "*", .literal, .alter, .allow, "*");
+
+    const topic_id = [_]u8{0x5a} ** 16;
+
+    const init_partitions = [_]InitReq.InitializeStateData.PartitionData{.{
+        .partition = 3,
+        .state_epoch = 9,
+        .start_offset = 11,
+    }};
+    const init_topics = [_]InitReq.InitializeStateData{.{
+        .topic_id = topic_id,
+        .partitions = &init_partitions,
+    }};
+    const init_req = InitReq{
+        .group_id = "share-state-auth-group",
+        .topics = &init_topics,
+    };
+
+    var init_buf: [256]u8 = undefined;
+    var init_pos = buildTestRequest(&init_buf, 83, 0, 8303, header_mod.requestHeaderVersion(83, 0));
+    init_req.serialize(&init_buf, &init_pos, 0);
+
+    const init_response = broker.handleRequest(init_buf[0..init_pos]);
+    try testing.expect(init_response != null);
+    defer testing.allocator.free(init_response.?);
+
+    var init_rpos: usize = 0;
+    try expectTestResponseHeader(init_response.?, 83, 0, 8303, &init_rpos);
+    const init_resp = try InitResp.deserialize(testing.allocator, init_response.?, &init_rpos, 0);
+    defer {
+        for (init_resp.results) |result| {
+            if (result.partitions.len > 0) testing.allocator.free(result.partitions);
+        }
+        if (init_resp.results.len > 0) testing.allocator.free(init_resp.results);
+    }
+    try testing.expectEqual(init_response.?.len, init_rpos);
+    try testing.expectEqual(@as(usize, 1), init_resp.results.len);
+    try testing.expectEqualSlices(u8, topic_id[0..], init_resp.results[0].topic_id[0..]);
+    try testing.expectEqual(@as(usize, 1), init_resp.results[0].partitions.len);
+    try testing.expectEqual(@as(i32, 3), init_resp.results[0].partitions[0].partition);
+    try testing.expectEqual(ErrorCode.group_authorization_failed.toInt(), init_resp.results[0].partitions[0].error_code);
+    try testing.expectEqualStrings("Not authorized", init_resp.results[0].partitions[0].error_message.?);
+
+    const read_partitions = [_]ReadReq.ReadStateData.PartitionData{.{
+        .partition = 4,
+        .leader_epoch = 2,
+    }};
+    const read_topics = [_]ReadReq.ReadStateData{.{
+        .topic_id = topic_id,
+        .partitions = &read_partitions,
+    }};
+    const read_req = ReadReq{
+        .group_id = "share-state-auth-group",
+        .topics = &read_topics,
+    };
+
+    var read_buf: [256]u8 = undefined;
+    var read_pos = buildTestRequest(&read_buf, 84, 0, 8402, header_mod.requestHeaderVersion(84, 0));
+    read_req.serialize(&read_buf, &read_pos, 0);
+
+    const read_response = broker.handleRequest(read_buf[0..read_pos]);
+    try testing.expect(read_response != null);
+    defer testing.allocator.free(read_response.?);
+
+    var read_rpos: usize = 0;
+    try expectTestResponseHeader(read_response.?, 84, 0, 8402, &read_rpos);
+    const read_resp = try ReadResp.deserialize(testing.allocator, read_response.?, &read_rpos, 0);
+    defer {
+        for (read_resp.results) |result| {
+            for (result.partitions) |partition| {
+                if (partition.state_batches.len > 0) testing.allocator.free(partition.state_batches);
+            }
+            if (result.partitions.len > 0) testing.allocator.free(result.partitions);
+        }
+        if (read_resp.results.len > 0) testing.allocator.free(read_resp.results);
+    }
+    try testing.expectEqual(read_response.?.len, read_rpos);
+    try testing.expectEqual(@as(usize, 1), read_resp.results.len);
+    try testing.expectEqualSlices(u8, topic_id[0..], read_resp.results[0].topic_id[0..]);
+    try testing.expectEqual(@as(usize, 1), read_resp.results[0].partitions.len);
+    try testing.expectEqual(@as(i32, 4), read_resp.results[0].partitions[0].partition);
+    try testing.expectEqual(ErrorCode.group_authorization_failed.toInt(), read_resp.results[0].partitions[0].error_code);
+    try testing.expectEqualStrings("Not authorized", read_resp.results[0].partitions[0].error_message.?);
+    try testing.expectEqual(@as(i32, 0), read_resp.results[0].partitions[0].state_epoch);
+    try testing.expectEqual(@as(i64, -1), read_resp.results[0].partitions[0].start_offset);
+    try testing.expectEqual(@as(usize, 0), read_resp.results[0].partitions[0].state_batches.len);
+
+    const write_partitions = [_]WriteReq.WriteStateData.PartitionData{.{
+        .partition = 5,
+        .state_epoch = 3,
+        .leader_epoch = 2,
+        .start_offset = 22,
+        .state_batches = &.{},
+    }};
+    const write_topics = [_]WriteReq.WriteStateData{.{
+        .topic_id = topic_id,
+        .partitions = &write_partitions,
+    }};
+    const write_req = WriteReq{
+        .group_id = "share-state-auth-group",
+        .topics = &write_topics,
+    };
+
+    var write_buf: [256]u8 = undefined;
+    var write_pos = buildTestRequest(&write_buf, 85, 0, 8504, header_mod.requestHeaderVersion(85, 0));
+    write_req.serialize(&write_buf, &write_pos, 0);
+
+    const write_response = broker.handleRequest(write_buf[0..write_pos]);
+    try testing.expect(write_response != null);
+    defer testing.allocator.free(write_response.?);
+
+    var write_rpos: usize = 0;
+    try expectTestResponseHeader(write_response.?, 85, 0, 8504, &write_rpos);
+    const write_resp = try WriteResp.deserialize(testing.allocator, write_response.?, &write_rpos, 0);
+    defer {
+        for (write_resp.results) |result| {
+            if (result.partitions.len > 0) testing.allocator.free(result.partitions);
+        }
+        if (write_resp.results.len > 0) testing.allocator.free(write_resp.results);
+    }
+    try testing.expectEqual(write_response.?.len, write_rpos);
+    try testing.expectEqual(@as(usize, 1), write_resp.results.len);
+    try testing.expectEqualSlices(u8, topic_id[0..], write_resp.results[0].topic_id[0..]);
+    try testing.expectEqual(@as(usize, 1), write_resp.results[0].partitions.len);
+    try testing.expectEqual(@as(i32, 5), write_resp.results[0].partitions[0].partition);
+    try testing.expectEqual(ErrorCode.group_authorization_failed.toInt(), write_resp.results[0].partitions[0].error_code);
+    try testing.expectEqualStrings("Not authorized", write_resp.results[0].partitions[0].error_message.?);
+
+    const delete_partitions = [_]DeleteReq.DeleteStateData.PartitionData{.{
+        .partition = 6,
+    }};
+    const delete_topics = [_]DeleteReq.DeleteStateData{.{
+        .topic_id = topic_id,
+        .partitions = &delete_partitions,
+    }};
+    const delete_req = DeleteReq{
+        .group_id = "share-state-auth-group",
+        .topics = &delete_topics,
+    };
+
+    var delete_buf: [256]u8 = undefined;
+    var delete_pos = buildTestRequest(&delete_buf, 86, 0, 8603, header_mod.requestHeaderVersion(86, 0));
+    delete_req.serialize(&delete_buf, &delete_pos, 0);
+
+    const delete_response = broker.handleRequest(delete_buf[0..delete_pos]);
+    try testing.expect(delete_response != null);
+    defer testing.allocator.free(delete_response.?);
+
+    var delete_rpos: usize = 0;
+    try expectTestResponseHeader(delete_response.?, 86, 0, 8603, &delete_rpos);
+    const delete_resp = try DeleteResp.deserialize(testing.allocator, delete_response.?, &delete_rpos, 0);
+    defer {
+        for (delete_resp.results) |result| {
+            if (result.partitions.len > 0) testing.allocator.free(result.partitions);
+        }
+        if (delete_resp.results.len > 0) testing.allocator.free(delete_resp.results);
+    }
+    try testing.expectEqual(delete_response.?.len, delete_rpos);
+    try testing.expectEqual(@as(usize, 1), delete_resp.results.len);
+    try testing.expectEqualSlices(u8, topic_id[0..], delete_resp.results[0].topic_id[0..]);
+    try testing.expectEqual(@as(usize, 1), delete_resp.results[0].partitions.len);
+    try testing.expectEqual(@as(i32, 6), delete_resp.results[0].partitions[0].partition);
+    try testing.expectEqual(ErrorCode.group_authorization_failed.toInt(), delete_resp.results[0].partitions[0].error_code);
+    try testing.expectEqualStrings("Not authorized", delete_resp.results[0].partitions[0].error_message.?);
+
+    const summary_partitions = [_]SummaryReq.ReadStateSummaryData.PartitionData{.{
+        .partition = 7,
+        .leader_epoch = 2,
+    }};
+    const summary_topics = [_]SummaryReq.ReadStateSummaryData{.{
+        .topic_id = topic_id,
+        .partitions = &summary_partitions,
+    }};
+    const summary_req = SummaryReq{
+        .group_id = "share-state-auth-group",
+        .topics = &summary_topics,
+    };
+
+    var summary_buf: [256]u8 = undefined;
+    var summary_pos = buildTestRequest(&summary_buf, 87, 0, 8702, header_mod.requestHeaderVersion(87, 0));
+    summary_req.serialize(&summary_buf, &summary_pos, 0);
+
+    const summary_response = broker.handleRequest(summary_buf[0..summary_pos]);
+    try testing.expect(summary_response != null);
+    defer testing.allocator.free(summary_response.?);
+
+    var summary_rpos: usize = 0;
+    try expectTestResponseHeader(summary_response.?, 87, 0, 8702, &summary_rpos);
+    const summary_resp = try SummaryResp.deserialize(testing.allocator, summary_response.?, &summary_rpos, 0);
+    defer {
+        for (summary_resp.results) |result| {
+            if (result.partitions.len > 0) testing.allocator.free(result.partitions);
+        }
+        if (summary_resp.results.len > 0) testing.allocator.free(summary_resp.results);
+    }
+    try testing.expectEqual(summary_response.?.len, summary_rpos);
+    try testing.expectEqual(@as(usize, 1), summary_resp.results.len);
+    try testing.expectEqualSlices(u8, topic_id[0..], summary_resp.results[0].topic_id[0..]);
+    try testing.expectEqual(@as(usize, 1), summary_resp.results[0].partitions.len);
+    try testing.expectEqual(@as(i32, 7), summary_resp.results[0].partitions[0].partition);
+    try testing.expectEqual(ErrorCode.group_authorization_failed.toInt(), summary_resp.results[0].partitions[0].error_code);
+    try testing.expectEqualStrings("Not authorized", summary_resp.results[0].partitions[0].error_message.?);
+    try testing.expectEqual(@as(i32, 0), summary_resp.results[0].partitions[0].state_epoch);
+    try testing.expectEqual(@as(i64, -1), summary_resp.results[0].partitions[0].start_offset);
 }
 
 test "Broker.handleRequest ConsumerGroupDescribe v0 returns generated group state" {

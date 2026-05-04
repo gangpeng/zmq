@@ -84,8 +84,6 @@ The following surfaces must remain documented and non-advertised, or become
 fully implemented and covered by the gates above, before an AutoMQ-complete
 release:
 
-- Share-group APIs remain non-advertised until durable share-group coordinator
-  and share-session data-plane semantics are complete.
 - Legacy inter-broker APIs remain non-advertised until real controller-backed
   inter-broker behavior replaces single-node/no-op compatibility handlers.
 - Broader broker-only stateless replacement still has local cache/state

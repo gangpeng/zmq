@@ -100,6 +100,15 @@ pub const broker_supported_apis = [_]BrokerApiSupport{
     .{ .key = 73, .name = "AssignReplicasToDirs", .metric = "assign_replicas_to_dirs", .min = 0, .max = 0 },
     .{ .key = 74, .name = "ListClientMetricsResources", .metric = "list_client_metrics_resources", .min = 0, .max = 0 },
     .{ .key = 75, .name = "DescribeTopicPartitions", .metric = "describe_topic_partitions", .min = 0, .max = 0 },
+    .{ .key = 76, .name = "ShareGroupHeartbeat", .metric = "share_group_heartbeat", .min = 0, .max = 0 },
+    .{ .key = 77, .name = "ShareGroupDescribe", .metric = "share_group_describe", .min = 0, .max = 0 },
+    .{ .key = 78, .name = "ShareFetch", .metric = "share_fetch", .min = 0, .max = 0 },
+    .{ .key = 79, .name = "ShareAcknowledge", .metric = "share_acknowledge", .min = 0, .max = 0 },
+    .{ .key = 83, .name = "InitializeShareGroupState", .metric = "initialize_share_group_state", .min = 0, .max = 0 },
+    .{ .key = 84, .name = "ReadShareGroupState", .metric = "read_share_group_state", .min = 0, .max = 0 },
+    .{ .key = 85, .name = "WriteShareGroupState", .metric = "write_share_group_state", .min = 0, .max = 0 },
+    .{ .key = 86, .name = "DeleteShareGroupState", .metric = "delete_share_group_state", .min = 0, .max = 0 },
+    .{ .key = 87, .name = "ReadShareGroupStateSummary", .metric = "read_share_group_state_summary", .min = 0, .max = 0 },
     .{ .key = 501, .name = "CreateStreams", .metric = "automq_create_streams", .min = 0, .max = 1 },
     .{ .key = 502, .name = "OpenStreams", .metric = "automq_open_streams", .min = 0, .max = 1 },
     .{ .key = 503, .name = "CloseStreams", .metric = "automq_close_streams", .min = 0, .max = 0 },
@@ -374,19 +383,9 @@ pub const non_advertised_handler_api_keys = [_]i16{
 
 /// Generated APIs with broker switch cases that intentionally remain
 /// non-advertised until their full coordinator/storage semantics are
-/// implemented. Most return schema-valid fail-closed responses for direct
-/// probes.
-pub const fail_closed_generated_handler_api_keys = [_]i16{
-    76, // ShareGroupHeartbeat (KIP-932)
-    77, // ShareGroupDescribe (KIP-932)
-    78, // ShareFetch (KIP-932)
-    79, // ShareAcknowledge (KIP-932)
-    83, // InitializeShareGroupState (KIP-932)
-    84, // ReadShareGroupState (KIP-932)
-    85, // WriteShareGroupState (KIP-932)
-    86, // DeleteShareGroupState (KIP-932)
-    87, // ReadShareGroupStateSummary (KIP-932)
-};
+/// implemented. Keep empty when every generated handler case is either
+/// advertised or listed as a legacy non-advertised inter-broker RPC.
+pub const fail_closed_generated_handler_api_keys = [_]i16{};
 
 /// Controller handler switch cases. Version support comes from
 /// controller_supported_apis; this table only audits dispatch drift.
