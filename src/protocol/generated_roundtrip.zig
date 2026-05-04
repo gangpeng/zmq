@@ -960,6 +960,48 @@ test "generated non-default golden fixtures cover legacy and flexible wire encod
     }
 
     {
+        const ElectLeadersResponse = generated.elect_leaders_response.ElectLeadersResponse;
+        const partition_results = [_]ElectLeadersResponse.ReplicaElectionResult.PartitionResult{
+            .{
+                .partition_id = 0,
+                .error_code = 0,
+                .error_message = null,
+            },
+            .{
+                .partition_id = 2,
+                .error_code = 42,
+                .error_message = "not leader",
+            },
+        };
+        const results = [_]ElectLeadersResponse.ReplicaElectionResult{.{
+            .topic = "topic-a",
+            .partition_result = &partition_results,
+        }};
+        const value = ElectLeadersResponse{
+            .throttle_time_ms = 8,
+            .error_code = 0,
+            .replica_election_results = &results,
+        };
+        try expectGoldenRoundTrip(ElectLeadersResponse, value, 1, &[_]u8{
+            0x00, 0x00, 0x00, 0x08, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x01, 0x00, 0x07, 't',  'o',  'p',  'i',
+            'c',  '-',  'a',  0x00, 0x00, 0x00, 0x02, 0x00,
+            0x00, 0x00, 0x00, 0x00, 0x00, 0xff, 0xff, 0x00,
+            0x00, 0x00, 0x02, 0x00, 0x2a, 0x00, 0x0a, 'n',
+            'o',  't',  ' ',  'l',  'e',  'a',  'd',  'e',
+            'r',
+        });
+        try expectGoldenRoundTrip(ElectLeadersResponse, value, 2, &[_]u8{
+            0x00, 0x00, 0x00, 0x08, 0x00, 0x00, 0x02, 0x08,
+            't',  'o',  'p',  'i',  'c',  '-',  'a',  0x03,
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x02, 0x00, 0x2a, 0x0b, 'n',
+            'o',  't',  ' ',  'l',  'e',  'a',  'd',  'e',
+            'r',  0x00, 0x00, 0x00,
+        });
+    }
+
+    {
         const CreatePartitionsRequest = generated.create_partitions_request.CreatePartitionsRequest;
         const null_topics = [_]CreatePartitionsRequest.CreatePartitionsTopic{.{
             .name = "p",
@@ -5526,6 +5568,41 @@ test "generated non-default golden fixtures cover legacy and flexible wire encod
     }
 
     {
+        const AlterPartitionReassignmentsResponse = generated.alter_partition_reassignments_response.AlterPartitionReassignmentsResponse;
+        const partitions = [_]AlterPartitionReassignmentsResponse.ReassignableTopicResponse.ReassignablePartitionResponse{
+            .{
+                .partition_index = 0,
+                .error_code = 0,
+                .error_message = null,
+            },
+            .{
+                .partition_index = 1,
+                .error_code = 42,
+                .error_message = "bad replica",
+            },
+        };
+        const responses = [_]AlterPartitionReassignmentsResponse.ReassignableTopicResponse{.{
+            .name = "reassign-topic",
+            .partitions = &partitions,
+        }};
+        const value = AlterPartitionReassignmentsResponse{
+            .throttle_time_ms = 4,
+            .error_code = 0,
+            .error_message = null,
+            .responses = &responses,
+        };
+        try expectGoldenRoundTrip(AlterPartitionReassignmentsResponse, value, 0, &[_]u8{
+            0x00, 0x00, 0x00, 0x04, 0x00, 0x00, 0x00, 0x02,
+            0x0f, 'r',  'e',  'a',  's',  's',  'i',  'g',
+            'n',  '-',  't',  'o',  'p',  'i',  'c',  0x03,
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x01, 0x00, 0x2a, 0x0c, 'b',
+            'a',  'd',  ' ',  'r',  'e',  'p',  'l',  'i',
+            'c',  'a',  0x00, 0x00, 0x00,
+        });
+    }
+
+    {
         const ListPartitionReassignmentsRequest = generated.list_partition_reassignments_request.ListPartitionReassignmentsRequest;
         const null_value = ListPartitionReassignmentsRequest{
             .timeout_ms = 1000,
@@ -5541,6 +5618,35 @@ test "generated non-default golden fixtures cover legacy and flexible wire encod
         };
         try expectGoldenRoundTrip(ListPartitionReassignmentsRequest, empty_value, 0, &[_]u8{
             0x00, 0x00, 0x03, 0xe8, 0x01, 0x00,
+        });
+    }
+
+    {
+        const ListPartitionReassignmentsResponse = generated.list_partition_reassignments_response.ListPartitionReassignmentsResponse;
+        const partitions = [_]ListPartitionReassignmentsResponse.OngoingTopicReassignment.OngoingPartitionReassignment{.{
+            .partition_index = 0,
+            .replicas = &[_]i32{ 1, 2 },
+            .adding_replicas = &[_]i32{2},
+            .removing_replicas = &[_]i32{3},
+        }};
+        const topics = [_]ListPartitionReassignmentsResponse.OngoingTopicReassignment{.{
+            .name = "reassign-topic",
+            .partitions = &partitions,
+        }};
+        const value = ListPartitionReassignmentsResponse{
+            .throttle_time_ms = 5,
+            .error_code = 0,
+            .error_message = null,
+            .topics = &topics,
+        };
+        try expectGoldenRoundTrip(ListPartitionReassignmentsResponse, value, 0, &[_]u8{
+            0x00, 0x00, 0x00, 0x05, 0x00, 0x00, 0x00, 0x02,
+            0x0f, 'r',  'e',  'a',  's',  's',  'i',  'g',
+            'n',  '-',  't',  'o',  'p',  'i',  'c',  0x02,
+            0x00, 0x00, 0x00, 0x00, 0x03, 0x00, 0x00, 0x00,
+            0x01, 0x00, 0x00, 0x00, 0x02, 0x02, 0x00, 0x00,
+            0x00, 0x02, 0x02, 0x00, 0x00, 0x00, 0x03, 0x00,
+            0x00, 0x00,
         });
     }
 

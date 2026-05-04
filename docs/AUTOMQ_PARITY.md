@@ -53,6 +53,7 @@ operator-facing behavior.
   AssignReplicasToDirs v0, ShareFetch/ShareAcknowledge v0,
   ConsumerGroupHeartbeatResponse v0, ShareGroupHeartbeatResponse and
   ShareGroupDescribe request/response v0,
+  ElectLeadersResponse v1/v2, Alter/ListPartitionReassignmentsResponse v0,
   Initialize/Read/Write/DeleteShareGroupState and ReadShareGroupStateSummary
   v0, ConsumerGroupDescribe v0, OffsetCommit v1/v8, OffsetFetch v7/v8,
   TxnOffsetCommit v3, DescribeProducers v0, CreatePartitionsResponse v2,
@@ -73,6 +74,8 @@ operator-facing behavior.
   membership metadata/assignments/static identities/state/type filters,
   consumer/share heartbeat assignment responses, share group member/assignment
   describe views,
+  election response legacy/flexible errors, reassignment per-partition errors
+  and replica deltas,
   telemetry UUID/compression/metric-prefix/payload resource fields,
   config admin null values/operation types, topic deletion name-to-UUID
   transitions, group deletion compact arrays,
