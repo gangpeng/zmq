@@ -18,6 +18,10 @@ Optional environment:
     ZMQ_KRAFT_NETWORK_DOWN          command run to inject controller/broker partition
     ZMQ_KRAFT_NETWORK_UP            command run to heal controller/broker partition
     ZMQ_KRAFT_NETWORK_EXPECT        "fail" (default) or "survive" for Produce during partition
+    ZMQ_KRAFT_NETWORK_MATRIX        comma-separated scheduled partition phases
+    ZMQ_KRAFT_NETWORK_<PHASE>_DOWN  optional phase-specific down hook
+    ZMQ_KRAFT_NETWORK_<PHASE>_UP    optional phase-specific heal hook
+    ZMQ_KRAFT_NETWORK_<PHASE>_EXPECT optional phase-specific "fail" or "survive"
 """
 
 import json
@@ -615,7 +619,64 @@ def wait_for_payloads(port, topic, payloads, timeout=30):
 
 
 def network_hooks_configured():
-    return bool(os.environ.get("ZMQ_KRAFT_NETWORK_DOWN") or os.environ.get("ZMQ_KRAFT_NETWORK_UP"))
+    return bool(
+        os.environ.get("ZMQ_KRAFT_NETWORK_MATRIX")
+        or os.environ.get("ZMQ_KRAFT_NETWORK_DOWN")
+        or os.environ.get("ZMQ_KRAFT_NETWORK_UP")
+    )
+
+
+def network_phase_env_name(phase, suffix):
+    normalized = []
+    for ch in phase.upper():
+        if ch.isalnum():
+            normalized.append(ch)
+        else:
+            normalized.append("_")
+    name = "_".join(part for part in "".join(normalized).split("_") if part)
+    if not name:
+        raise TestError(f"invalid empty KRaft network matrix phase {phase!r}")
+    return f"ZMQ_KRAFT_NETWORK_{name}_{suffix}"
+
+
+def network_phase_command(phase, suffix):
+    return os.environ.get(network_phase_env_name(phase, suffix)) or os.environ.get(
+        f"ZMQ_KRAFT_NETWORK_{suffix}"
+    )
+
+
+def network_phase_expect(phase):
+    return os.environ.get(network_phase_env_name(phase, "EXPECT")) or os.environ.get(
+        "ZMQ_KRAFT_NETWORK_EXPECT", "fail"
+    )
+
+
+def selected_network_partition_phases():
+    if not network_hooks_configured():
+        return []
+
+    raw_matrix = os.environ.get("ZMQ_KRAFT_NETWORK_MATRIX")
+    if raw_matrix:
+        names = [name.strip() for name in raw_matrix.split(",") if name.strip()]
+        if not names:
+            raise TestError("ZMQ_KRAFT_NETWORK_MATRIX did not contain any phases")
+    else:
+        names = ["controller-broker"]
+
+    phases = []
+    for name in names:
+        down = network_phase_command(name, "DOWN")
+        up = network_phase_command(name, "UP")
+        if not down or not up:
+            raise TestError(
+                "KRaft network partition gate requires DOWN and UP hooks for "
+                f"phase {name!r}"
+            )
+        expect = network_phase_expect(name)
+        if expect not in ("fail", "survive"):
+            raise TestError(f"invalid KRaft network expectation for {name!r}: {expect!r}")
+        phases.append({"name": name, "down": down, "up": up, "expect": expect})
+    return phases
 
 
 def hook_context_env(processes, broker, leader_id):
@@ -633,12 +694,9 @@ def hook_context_env(processes, broker, leader_id):
     return env
 
 
-def run_network_hook(env_name, env):
-    raw = os.environ.get(env_name)
-    if not raw:
-        raise TestError(f"{env_name} is required for KRaft network partition gate")
+def run_network_hook(label, command, env):
     proc = subprocess.run(
-        shlex.split(raw),
+        shlex.split(command),
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
         text=True,
@@ -646,47 +704,70 @@ def run_network_hook(env_name, env):
         env=env,
     )
     if proc.returncode != 0:
-        raise TestError(f"{env_name} failed with exit code {proc.returncode}\n{proc.stdout}")
+        raise TestError(f"{label} failed with exit code {proc.returncode}\n{proc.stdout}")
 
 
-def run_network_partition_probe(processes, broker, topic, expected_payloads, leader_id):
-    if not network_hooks_configured():
-        return None
-    if not os.environ.get("ZMQ_KRAFT_NETWORK_DOWN") or not os.environ.get("ZMQ_KRAFT_NETWORK_UP"):
-        raise TestError("KRaft network partition gate requires both ZMQ_KRAFT_NETWORK_DOWN and ZMQ_KRAFT_NETWORK_UP")
-    expect = os.environ.get("ZMQ_KRAFT_NETWORK_EXPECT", "fail")
-    if expect not in ("fail", "survive"):
-        raise TestError(f"invalid ZMQ_KRAFT_NETWORK_EXPECT={expect!r}")
-
+def run_network_partition_phase(processes, broker, topic, expected_payloads, leader_id, phase, phase_index):
     hook_env = hook_context_env(processes, broker, leader_id)
-    payload = b"r-network-partition"
+    hook_env["ZMQ_KRAFT_NETWORK_PHASE"] = phase["name"]
+    hook_env["ZMQ_KRAFT_NETWORK_PHASE_INDEX"] = str(phase_index)
+    hook_env["ZMQ_KRAFT_NETWORK_EXPECT"] = phase["expect"]
+    payload = f"r-network-{phase_index}-{phase['name']}".encode("utf-8")
     healed = False
     survived = False
     try:
-        run_network_hook("ZMQ_KRAFT_NETWORK_DOWN", hook_env)
+        run_network_hook(f"{phase['name']}:down", phase["down"], hook_env)
         try:
             wait_for_produce(broker["port"], topic, payload, timeout=8)
             survived = True
         except Exception:
             survived = False
-        if expect == "fail" and survived:
-            raise TestError("network partition produce unexpectedly succeeded")
-        if expect == "survive" and not survived:
-            raise TestError("network partition produce unexpectedly failed")
+        if phase["expect"] == "fail" and survived:
+            raise TestError(f"network partition phase {phase['name']!r} unexpectedly succeeded")
+        if phase["expect"] == "survive" and not survived:
+            raise TestError(f"network partition phase {phase['name']!r} unexpectedly failed")
         if survived:
             expected_payloads.append(payload)
     finally:
-        run_network_hook("ZMQ_KRAFT_NETWORK_UP", hook_env)
+        run_network_hook(f"{phase['name']}:up", phase["up"], hook_env)
         healed = True
 
     healed_leader, _ = wait_for_leader(processes)
     wait_for_all_alive_to_report(processes, healed_leader)
     wait_for_broker_ready(broker["proc"], broker["port"], broker["log_path"])
     wait_for_payloads(broker["port"], topic, expected_payloads)
-    expected_payloads.append(b"r-network-healed")
+    expected_payloads.append(f"r-network-healed-{phase_index}-{phase['name']}".encode("utf-8"))
     wait_for_produce(broker["port"], topic, expected_payloads[-1])
     wait_for_payloads(broker["port"], topic, expected_payloads)
-    return {"leader_id": healed_leader, "expect": expect, "survived": survived, "healed": healed}
+    return {
+        "phase": phase["name"],
+        "leader_id": healed_leader,
+        "expect": phase["expect"],
+        "survived": survived,
+        "healed": healed,
+    }
+
+
+def run_network_partition_matrix(processes, broker, topic, expected_payloads, leader_id):
+    phases = selected_network_partition_phases()
+    if not phases:
+        return None
+
+    results = []
+    current_leader_id = leader_id
+    for phase_index, phase in enumerate(phases):
+        result = run_network_partition_phase(
+            processes,
+            broker,
+            topic,
+            expected_payloads,
+            current_leader_id,
+            phase,
+            phase_index,
+        )
+        current_leader_id = result["leader_id"]
+        results.append(result)
+    return results
 
 
 def automq_put_kv(port, key, value, correlation_id, overwrite=True):
@@ -2517,7 +2598,7 @@ def main():
         first_offset = wait_for_produce(broker["port"], topic, expected_payloads[-1])
         wait_for_payloads(broker["port"], topic, expected_payloads)
 
-        network_partition_result = run_network_partition_probe(
+        network_partition_result = run_network_partition_matrix(
             processes, broker, topic, expected_payloads, leader_id
         )
         if network_partition_result is not None:
@@ -2658,6 +2739,19 @@ def self_test():
         os.environ["ZMQ_KRAFT_NETWORK_UP"] = "true"
         if not network_hooks_configured():
             raise TestError("network hooks were not detected")
+        phases = selected_network_partition_phases()
+        if len(phases) != 1 or phases[0]["name"] != "controller-broker":
+            raise TestError(f"default network phase selection failed: {phases}")
+
+        os.environ["ZMQ_KRAFT_NETWORK_MATRIX"] = "leader-isolation, broker-link"
+        os.environ["ZMQ_KRAFT_NETWORK_BROKER_LINK_EXPECT"] = "survive"
+        os.environ["ZMQ_KRAFT_NETWORK_BROKER_LINK_DOWN"] = "true"
+        os.environ["ZMQ_KRAFT_NETWORK_BROKER_LINK_UP"] = "true"
+        phases = selected_network_partition_phases()
+        if [phase["name"] for phase in phases] != ["leader-isolation", "broker-link"]:
+            raise TestError(f"network matrix phase parsing failed: {phases}")
+        if phases[0]["expect"] != "fail" or phases[1]["expect"] != "survive":
+            raise TestError(f"network matrix expectation parsing failed: {phases}")
 
         processes = {
             0: {"proc": DummyProc(1000), "port": 39093},
@@ -2672,8 +2766,11 @@ def self_test():
             raise TestError("hook controller port context failed")
         if env["ZMQ_KRAFT_BROKER_PID"] != "2000":
             raise TestError("hook broker pid context failed")
-        run_network_hook("ZMQ_KRAFT_NETWORK_DOWN", env)
-        run_network_hook("ZMQ_KRAFT_NETWORK_UP", env)
+        env["ZMQ_KRAFT_NETWORK_PHASE"] = "leader-isolation"
+        env["ZMQ_KRAFT_NETWORK_PHASE_INDEX"] = "0"
+        env["ZMQ_KRAFT_NETWORK_EXPECT"] = "fail"
+        run_network_hook("self-test:down", phases[0]["down"], env)
+        run_network_hook("self-test:up", phases[0]["up"], env)
 
         print("ok: KRaft failover harness self-test")
         return 0
