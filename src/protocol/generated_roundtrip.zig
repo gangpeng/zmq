@@ -3672,6 +3672,153 @@ test "generated non-default golden fixtures cover legacy and flexible wire encod
     }
 
     {
+        const DescribeClientQuotasRequest = generated.describe_client_quotas_request.DescribeClientQuotasRequest;
+        const components = [_]DescribeClientQuotasRequest.ComponentData{
+            .{
+                .entity_type = "client-id",
+                .match_type = 0,
+                .match = "client-a",
+            },
+            .{
+                .entity_type = "user",
+                .match_type = 1,
+                .match = null,
+            },
+        };
+        const value = DescribeClientQuotasRequest{
+            .components = &components,
+            .strict = true,
+        };
+        try expectGoldenRoundTrip(DescribeClientQuotasRequest, value, 1, &[_]u8{
+            0x03, 0x0a, 'c',  'l',
+            'i',  'e',  'n',  't',
+            '-',  'i',  'd',  0x00,
+            0x09, 'c',  'l',  'i',
+            'e',  'n',  't',  '-',
+            'a',  0x00, 0x05, 'u',
+            's',  'e',  'r',  0x01,
+            0x00, 0x00, 0x01, 0x00,
+        });
+    }
+
+    {
+        const DescribeClientQuotasResponse = generated.describe_client_quotas_response.DescribeClientQuotasResponse;
+        const EntityData = DescribeClientQuotasResponse.EntryData.EntityData;
+        const ValueData = DescribeClientQuotasResponse.EntryData.ValueData;
+        const entities = [_]EntityData{
+            .{ .entity_type = "client-id", .entity_name = "client-a" },
+            .{ .entity_type = "user", .entity_name = null },
+        };
+        const values = [_]ValueData{.{
+            .key = "fetch",
+            .value = 1.5,
+        }};
+        const entries = [_]DescribeClientQuotasResponse.EntryData{.{
+            .entity = &entities,
+            .values = &values,
+        }};
+        const value = DescribeClientQuotasResponse{
+            .throttle_time_ms = 7,
+            .entries = &entries,
+        };
+        try expectGoldenRoundTrip(DescribeClientQuotasResponse, value, 1, &[_]u8{
+            0x00, 0x00, 0x00, 0x07,
+            0x00, 0x00, 0x00, 0x02,
+            0x03, 0x0a, 'c',  'l',
+            'i',  'e',  'n',  't',
+            '-',  'i',  'd',  0x09,
+            'c',  'l',  'i',  'e',
+            'n',  't',  '-',  'a',
+            0x00, 0x05, 'u',  's',
+            'e',  'r',  0x00, 0x00,
+            0x02, 0x06, 'f',  'e',
+            't',  'c',  'h',  0x3f,
+            0xf8, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00,
+        });
+    }
+
+    {
+        const AlterClientQuotasRequest = generated.alter_client_quotas_request.AlterClientQuotasRequest;
+        const EntityData = AlterClientQuotasRequest.EntryData.EntityData;
+        const OpData = AlterClientQuotasRequest.EntryData.OpData;
+        const entities = [_]EntityData{
+            .{ .entity_type = "client-id", .entity_name = "client-a" },
+            .{ .entity_type = "user", .entity_name = null },
+        };
+        const ops = [_]OpData{
+            .{
+                .key = "produce",
+                .value = 100.0,
+                .remove = false,
+            },
+            .{
+                .key = "fetch",
+                .value = 1.5,
+                .remove = true,
+            },
+        };
+        const entries = [_]AlterClientQuotasRequest.EntryData{.{
+            .entity = &entities,
+            .ops = &ops,
+        }};
+        const value = AlterClientQuotasRequest{
+            .entries = &entries,
+            .validate_only = true,
+        };
+        try expectGoldenRoundTrip(AlterClientQuotasRequest, value, 1, &[_]u8{
+            0x02, 0x03, 0x0a, 'c',
+            'l',  'i',  'e',  'n',
+            't',  '-',  'i',  'd',
+            0x09, 'c',  'l',  'i',
+            'e',  'n',  't',  '-',
+            'a',  0x00, 0x05, 'u',
+            's',  'e',  'r',  0x00,
+            0x00, 0x03, 0x08, 'p',
+            'r',  'o',  'd',  'u',
+            'c',  'e',  0x40, 0x59,
+            0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00,
+            0x06, 'f',  'e',  't',
+            'c',  'h',  0x3f, 0xf8,
+            0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x01, 0x00,
+            0x00, 0x01, 0x00,
+        });
+    }
+
+    {
+        const AlterClientQuotasResponse = generated.alter_client_quotas_response.AlterClientQuotasResponse;
+        const EntityData = AlterClientQuotasResponse.EntryData.EntityData;
+        const entities = [_]EntityData{.{
+            .entity_type = "client-id",
+            .entity_name = "client-a",
+        }};
+        const entries = [_]AlterClientQuotasResponse.EntryData{.{
+            .error_code = 42,
+            .error_message = "invalid",
+            .entity = &entities,
+        }};
+        const value = AlterClientQuotasResponse{
+            .throttle_time_ms = 8,
+            .entries = &entries,
+        };
+        try expectGoldenRoundTrip(AlterClientQuotasResponse, value, 1, &[_]u8{
+            0x00, 0x00, 0x00, 0x08,
+            0x02, 0x00, 0x2a, 0x08,
+            'i',  'n',  'v',  'a',
+            'l',  'i',  'd',  0x02,
+            0x0a, 'c',  'l',  'i',
+            'e',  'n',  't',  '-',
+            'i',  'd',  0x09, 'c',
+            'l',  'i',  'e',  'n',
+            't',  '-',  'a',  0x00,
+            0x00, 0x00,
+        });
+    }
+
+    {
         const DescribeTopicPartitionsResponse = generated.describe_topic_partitions_response.DescribeTopicPartitionsResponse;
         const Topic = DescribeTopicPartitionsResponse.DescribeTopicPartitionsResponseTopic;
         const Partition = Topic.DescribeTopicPartitionsResponsePartition;
