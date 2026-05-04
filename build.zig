@@ -458,6 +458,18 @@ pub fn build(b: *std.Build) void {
         test_step.dependOn(&chaos_self_test.step);
     }
 
+    // Docker-compose multi-node E2E harness. The real cluster test skips
+    // unless ZMQ_RUN_E2E_TESTS=1 is set; the deterministic configuration
+    // self-test is included in the default test step.
+    const e2e_step = b.step("test-e2e", "Run gated Docker 3-node E2E harness");
+    {
+        const run_e2e = b.addSystemCommand(&.{ "python3", "tests/e2e_test.py" });
+        e2e_step.dependOn(&run_e2e.step);
+
+        const e2e_self_test = b.addSystemCommand(&.{ "python3", "tests/e2e_test.py", "--self-test" });
+        test_step.dependOn(&e2e_self_test.step);
+    }
+
     // ---------------------------------------------------------------
     // Benchmark step
     // ---------------------------------------------------------------

@@ -20,7 +20,8 @@ Tests:
 
 Usage:
   docker compose up -d                 # Start cluster first
-  python3 tests/e2e_test.py            # Run tests
+  ZMQ_RUN_E2E_TESTS=1 python3 tests/e2e_test.py
+  python3 tests/e2e_test.py --self-test
   docker compose down -v               # Cleanup
 """
 
@@ -29,7 +30,10 @@ import struct
 import subprocess
 import sys
 import time
+import os
 import urllib.request
+
+RUN_ENABLED = sys.argv.count("--self-test") > 0 or os.environ.get("ZMQ_RUN_E2E_TESTS") == "1"
 
 # ---------------------------------------------------------------
 # Configuration — matches docker-compose.yml port mapping
@@ -218,11 +222,41 @@ class TestRunner:
             print(f"  \u2717 {name} {detail}")
 
 
+def self_test():
+    required_keys = {"name", "broker_port", "controller_port", "metrics_port", "container"}
+    if len(NODES) != 3:
+        raise AssertionError("E2E harness must define exactly three nodes")
+
+    seen_ports = set()
+    for node in NODES:
+        missing = required_keys - set(node)
+        if missing:
+            raise AssertionError(f"E2E node {node!r} missing keys: {sorted(missing)}")
+        for key in ("broker_port", "controller_port", "metrics_port"):
+            port = node[key]
+            if not isinstance(port, int) or port <= 0:
+                raise AssertionError(f"E2E node {node['name']} has invalid {key}: {port!r}")
+            if port in seen_ports:
+                raise AssertionError(f"E2E port {port} is reused")
+            seen_ports.add(port)
+
+    if MINIO_PORT in seen_ports:
+        raise AssertionError("MinIO port must not collide with broker/controller/metrics ports")
+    print("ok: E2E harness self-test")
+    return 0
+
+
 # ---------------------------------------------------------------
 # Main test suite
 # ---------------------------------------------------------------
 
 def main():
+    if "--self-test" in sys.argv:
+        return self_test()
+    if not RUN_ENABLED:
+        print("skip: set ZMQ_RUN_E2E_TESTS=1 to run Docker 3-node E2E harness")
+        return 0
+
     t = TestRunner()
 
     print("\n\u2554\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2557")
