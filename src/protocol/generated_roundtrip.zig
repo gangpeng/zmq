@@ -1300,6 +1300,319 @@ test "generated non-default golden fixtures cover legacy and flexible wire encod
     }
 
     {
+        const BrokerRegistrationRequest = generated.broker_registration_request.BrokerRegistrationRequest;
+        const incarnation_id = [_]u8{
+            0x10, 0x11, 0x12, 0x13,
+            0x14, 0x15, 0x16, 0x17,
+            0x18, 0x19, 0x1a, 0x1b,
+            0x1c, 0x1d, 0x1e, 0x1f,
+        };
+        const log_dirs = [_][16]u8{.{
+            0x00, 0x01, 0x02, 0x03,
+            0x04, 0x05, 0x06, 0x07,
+            0x08, 0x09, 0x0a, 0x0b,
+            0x0c, 0x0d, 0x0e, 0x0f,
+        }};
+        const listeners = [_]BrokerRegistrationRequest.Listener{.{
+            .name = "PLAINTEXT",
+            .host = "broker-1",
+            .port = 9092,
+            .security_protocol = 0,
+        }};
+        const features = [_]BrokerRegistrationRequest.Feature{.{
+            .name = "metadata.version",
+            .min_supported_version = 0,
+            .max_supported_version = 4,
+        }};
+        const value = BrokerRegistrationRequest{
+            .broker_id = 101,
+            .cluster_id = "cluster-a",
+            .incarnation_id = incarnation_id,
+            .listeners = &listeners,
+            .features = &features,
+            .rack = "rack-a",
+            .is_migrating_zk_broker = false,
+            .log_dirs = &log_dirs,
+        };
+        try expectGoldenRoundTrip(BrokerRegistrationRequest, value, 2, &[_]u8{
+            0x00, 0x00, 0x00, 0x65,
+            0x0a, 'c',  'l',  'u',
+            's',  't',  'e',  'r',
+            '-',  'a',  0x10, 0x11,
+            0x12, 0x13, 0x14, 0x15,
+            0x16, 0x17, 0x18, 0x19,
+            0x1a, 0x1b, 0x1c, 0x1d,
+            0x1e, 0x1f, 0x02, 0x0a,
+            'P',  'L',  'A',  'I',
+            'N',  'T',  'E',  'X',
+            'T',  0x09, 'b',  'r',
+            'o',  'k',  'e',  'r',
+            '-',  '1',  0x23, 0x84,
+            0x00, 0x00, 0x00, 0x02,
+            0x11, 'm',  'e',  't',
+            'a',  'd',  'a',  't',
+            'a',  '.',  'v',  'e',
+            'r',  's',  'i',  'o',
+            'n',  0x00, 0x00, 0x00,
+            0x04, 0x00, 0x07, 'r',
+            'a',  'c',  'k',  '-',
+            'a',  0x00, 0x02, 0x00,
+            0x01, 0x02, 0x03, 0x04,
+            0x05, 0x06, 0x07, 0x08,
+            0x09, 0x0a, 0x0b, 0x0c,
+            0x0d, 0x0e, 0x0f, 0x00,
+        });
+    }
+
+    {
+        const BrokerRegistrationResponse = generated.broker_registration_response.BrokerRegistrationResponse;
+        const value = BrokerRegistrationResponse{
+            .throttle_time_ms = 12,
+            .error_code = 0,
+            .broker_epoch = 5,
+        };
+        try expectGoldenRoundTrip(BrokerRegistrationResponse, value, 2, &[_]u8{
+            0x00, 0x00, 0x00, 0x0c,
+            0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x05,
+            0x00,
+        });
+    }
+
+    {
+        const BrokerHeartbeatResponse = generated.broker_heartbeat_response.BrokerHeartbeatResponse;
+        const value = BrokerHeartbeatResponse{
+            .throttle_time_ms = 5,
+            .error_code = 0,
+            .is_caught_up = true,
+            .is_fenced = false,
+            .should_shut_down = true,
+        };
+        try expectGoldenRoundTrip(BrokerHeartbeatResponse, value, 1, &[_]u8{
+            0x00, 0x00, 0x00, 0x05,
+            0x00, 0x00, 0x01, 0x00,
+            0x01, 0x00,
+        });
+    }
+
+    {
+        const ControllerRegistrationRequest = generated.controller_registration_request.ControllerRegistrationRequest;
+        const incarnation_id = [_]u8{
+            0x20, 0x21, 0x22, 0x23,
+            0x24, 0x25, 0x26, 0x27,
+            0x28, 0x29, 0x2a, 0x2b,
+            0x2c, 0x2d, 0x2e, 0x2f,
+        };
+        const listeners = [_]ControllerRegistrationRequest.Listener{.{
+            .name = "CONTROLLER",
+            .host = "controller-1",
+            .port = 9093,
+            .security_protocol = 0,
+        }};
+        const features = [_]ControllerRegistrationRequest.Feature{.{
+            .name = "kraft.version",
+            .min_supported_version = 0,
+            .max_supported_version = 1,
+        }};
+        const value = ControllerRegistrationRequest{
+            .controller_id = 3,
+            .incarnation_id = incarnation_id,
+            .zk_migration_ready = true,
+            .listeners = &listeners,
+            .features = &features,
+        };
+        try expectGoldenRoundTrip(ControllerRegistrationRequest, value, 0, &[_]u8{
+            0x00, 0x00, 0x00, 0x03,
+            0x20, 0x21, 0x22, 0x23,
+            0x24, 0x25, 0x26, 0x27,
+            0x28, 0x29, 0x2a, 0x2b,
+            0x2c, 0x2d, 0x2e, 0x2f,
+            0x01, 0x02, 0x0b, 'C',
+            'O',  'N',  'T',  'R',
+            'O',  'L',  'L',  'E',
+            'R',  0x0d, 'c',  'o',
+            'n',  't',  'r',  'o',
+            'l',  'l',  'e',  'r',
+            '-',  '1',  0x23, 0x85,
+            0x00, 0x00, 0x00, 0x02,
+            0x0e, 'k',  'r',  'a',
+            'f',  't',  '.',  'v',
+            'e',  'r',  's',  'i',
+            'o',  'n',  0x00, 0x00,
+            0x00, 0x01, 0x00, 0x00,
+        });
+    }
+
+    {
+        const ControllerRegistrationResponse = generated.controller_registration_response.ControllerRegistrationResponse;
+        const value = ControllerRegistrationResponse{
+            .throttle_time_ms = 7,
+            .error_code = 41,
+            .error_message = "not controller",
+        };
+        try expectGoldenRoundTrip(ControllerRegistrationResponse, value, 0, &[_]u8{
+            0x00, 0x00, 0x00, 0x07,
+            0x00, 0x29, 0x0f, 'n',
+            'o',  't',  ' ',  'c',
+            'o',  'n',  't',  'r',
+            'o',  'l',  'l',  'e',
+            'r',  0x00,
+        });
+    }
+
+    {
+        const AddRaftVoterRequest = generated.add_raft_voter_request.AddRaftVoterRequest;
+        const voter_directory_id = [_]u8{
+            0x30, 0x31, 0x32, 0x33,
+            0x34, 0x35, 0x36, 0x37,
+            0x38, 0x39, 0x3a, 0x3b,
+            0x3c, 0x3d, 0x3e, 0x3f,
+        };
+        const listeners = [_]AddRaftVoterRequest.Listener{.{
+            .name = "CONTROLLER",
+            .host = "controller-4",
+            .port = 19093,
+        }};
+        const value = AddRaftVoterRequest{
+            .cluster_id = "cluster-a",
+            .timeout_ms = 3000,
+            .voter_id = 4,
+            .voter_directory_id = voter_directory_id,
+            .listeners = &listeners,
+        };
+        try expectGoldenRoundTrip(AddRaftVoterRequest, value, 0, &[_]u8{
+            0x0a, 'c',  'l',  'u',
+            's',  't',  'e',  'r',
+            '-',  'a',  0x00, 0x00,
+            0x0b, 0xb8, 0x00, 0x00,
+            0x00, 0x04, 0x30, 0x31,
+            0x32, 0x33, 0x34, 0x35,
+            0x36, 0x37, 0x38, 0x39,
+            0x3a, 0x3b, 0x3c, 0x3d,
+            0x3e, 0x3f, 0x02, 0x0b,
+            'C',  'O',  'N',  'T',
+            'R',  'O',  'L',  'L',
+            'E',  'R',  0x0d, 'c',
+            'o',  'n',  't',  'r',
+            'o',  'l',  'l',  'e',
+            'r',  '-',  '4',  0x4a,
+            0x95, 0x00, 0x00,
+        });
+    }
+
+    {
+        const AddRaftVoterResponse = generated.add_raft_voter_response.AddRaftVoterResponse;
+        const value = AddRaftVoterResponse{
+            .throttle_time_ms = 9,
+            .error_code = 42,
+            .error_message = "duplicate",
+        };
+        try expectGoldenRoundTrip(AddRaftVoterResponse, value, 0, &[_]u8{
+            0x00, 0x00, 0x00, 0x09,
+            0x00, 0x2a, 0x0a, 'd',
+            'u',  'p',  'l',  'i',
+            'c',  'a',  't',  'e',
+            0x00,
+        });
+    }
+
+    {
+        const RemoveRaftVoterRequest = generated.remove_raft_voter_request.RemoveRaftVoterRequest;
+        const voter_directory_id = [_]u8{
+            0x30, 0x31, 0x32, 0x33,
+            0x34, 0x35, 0x36, 0x37,
+            0x38, 0x39, 0x3a, 0x3b,
+            0x3c, 0x3d, 0x3e, 0x3f,
+        };
+        const value = RemoveRaftVoterRequest{
+            .cluster_id = "cluster-a",
+            .voter_id = 4,
+            .voter_directory_id = voter_directory_id,
+        };
+        try expectGoldenRoundTrip(RemoveRaftVoterRequest, value, 0, &[_]u8{
+            0x0a, 'c',  'l',  'u',
+            's',  't',  'e',  'r',
+            '-',  'a',  0x00, 0x00,
+            0x00, 0x04, 0x30, 0x31,
+            0x32, 0x33, 0x34, 0x35,
+            0x36, 0x37, 0x38, 0x39,
+            0x3a, 0x3b, 0x3c, 0x3d,
+            0x3e, 0x3f, 0x00,
+        });
+    }
+
+    {
+        const RemoveRaftVoterResponse = generated.remove_raft_voter_response.RemoveRaftVoterResponse;
+        const value = RemoveRaftVoterResponse{
+            .throttle_time_ms = 10,
+            .error_code = 42,
+            .error_message = "missing",
+        };
+        try expectGoldenRoundTrip(RemoveRaftVoterResponse, value, 0, &[_]u8{
+            0x00, 0x00, 0x00, 0x0a,
+            0x00, 0x2a, 0x08, 'm',
+            'i',  's',  's',  'i',
+            'n',  'g',  0x00,
+        });
+    }
+
+    {
+        const UpdateRaftVoterRequest = generated.update_raft_voter_request.UpdateRaftVoterRequest;
+        const voter_directory_id = [_]u8{
+            0x30, 0x31, 0x32, 0x33,
+            0x34, 0x35, 0x36, 0x37,
+            0x38, 0x39, 0x3a, 0x3b,
+            0x3c, 0x3d, 0x3e, 0x3f,
+        };
+        const listeners = [_]UpdateRaftVoterRequest.Listener{.{
+            .name = "CONTROLLER",
+            .host = "controller-4",
+            .port = 19094,
+        }};
+        const value = UpdateRaftVoterRequest{
+            .cluster_id = "cluster-a",
+            .voter_id = 4,
+            .voter_directory_id = voter_directory_id,
+            .listeners = &listeners,
+            .k_raft_version_feature = .{
+                .min_supported_version = 1,
+                .max_supported_version = 3,
+            },
+        };
+        try expectGoldenRoundTrip(UpdateRaftVoterRequest, value, 0, &[_]u8{
+            0x0a, 'c',  'l',  'u',
+            's',  't',  'e',  'r',
+            '-',  'a',  0x00, 0x00,
+            0x00, 0x04, 0x30, 0x31,
+            0x32, 0x33, 0x34, 0x35,
+            0x36, 0x37, 0x38, 0x39,
+            0x3a, 0x3b, 0x3c, 0x3d,
+            0x3e, 0x3f, 0x02, 0x0b,
+            'C',  'O',  'N',  'T',
+            'R',  'O',  'L',  'L',
+            'E',  'R',  0x0d, 'c',
+            'o',  'n',  't',  'r',
+            'o',  'l',  'l',  'e',
+            'r',  '-',  '4',  0x4a,
+            0x96, 0x00, 0x00, 0x01,
+            0x00, 0x03, 0x00, 0x00,
+        });
+    }
+
+    {
+        const UpdateRaftVoterResponse = generated.update_raft_voter_response.UpdateRaftVoterResponse;
+        const value = UpdateRaftVoterResponse{
+            .throttle_time_ms = 11,
+            .error_code = 21,
+        };
+        try expectGoldenRoundTrip(UpdateRaftVoterResponse, value, 0, &[_]u8{
+            0x00, 0x00, 0x00, 0x0b,
+            0x00, 0x15, 0x00,
+        });
+    }
+
+    {
         const ApiVersionsResponse = generated.api_versions_response.ApiVersionsResponse;
         const api_keys = [_]ApiVersionsResponse.ApiVersion{
             .{ .api_key = 0, .min_version = 0, .max_version = 11 },
