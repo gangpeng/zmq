@@ -828,7 +828,6 @@ test "AutoMQ parity release criteria document pins required gates" {
     }
 
     const unsupported_surfaces = [_][]const u8{
-        "ConsumerGroupHeartbeat",
         "Share-group APIs",
         "Legacy inter-broker APIs",
         "broker-only stateless replacement",

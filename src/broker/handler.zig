@@ -47,6 +47,7 @@ const offset_commit_record_value_magic = "ZMQOC1";
 const consumer_group_snapshot_record_value_magic_v1 = "ZMQCG1";
 const consumer_group_snapshot_record_value_magic = "ZMQCG2";
 const consumer_group_snapshot_record_key = "__zmq_consumer_group_snapshot";
+const consumer_group_heartbeat_assignment_magic = "ZMQCGA1";
 const share_group_data_snapshot_record_value_magic = "ZMQSH1";
 const share_group_data_snapshot_record_key = "__zmq_share_group_data_snapshot";
 const transaction_snapshot_record_value_magic = "ZMQTX1";
@@ -5348,7 +5349,7 @@ pub const Broker = struct {
     fn resourceTypeForApiKey(api_key: i16) Authorizer.ResourceType {
         return switch (api_key) {
             0, 1, 2, 21, 23, 61 => .topic, // Produce, Fetch, ListOffsets, DeleteRecords, OffsetForLeaderEpoch, DescribeProducers
-            8, 9, 10, 11, 12, 13, 14, 15, 16, 42, 47, 69 => .group, // group-related
+            8, 9, 10, 11, 12, 13, 14, 15, 16, 42, 47, 68, 69 => .group, // group-related
             22, 24, 25, 26, 27, 28, 65, 66 => .transactional_id, // txn-related
             3, 18, 19, 20, 29, 30, 31, 32, 33, 35, 37, 43, 44, 45, 46, 48, 49, 50, 51, 52, 53, 54, 55, 57, 60, 71, 72, 73, 74, 75 => .cluster, // metadata/admin/quorum
             501...519, 600...602 => .cluster, // AutoMQ stream/object/controller extensions
@@ -5364,7 +5365,7 @@ pub const Broker = struct {
             2, 9, 15, 16, 23, 29, 32, 35, 46, 48, 50, 55, 60, 61, 65, 66, 69, 71, 74, 75 => .describe, // ListOffsets, OffsetFetch, Describe*
             3, 18 => .describe, // Metadata, ApiVersions
             8 => .read, // OffsetCommit
-            10, 11, 12, 13, 14 => .read, // Group ops
+            10, 11, 12, 13, 14, 68 => .read, // Group ops
             19, 37 => .create, // CreateTopics, CreatePartitions
             20, 21, 42, 47 => .delete, // DeleteTopics, DeleteRecords, DeleteGroups, OffsetDelete
             22, 24, 25, 26, 27, 28 => .write, // Txn ops
@@ -5459,6 +5460,7 @@ pub const Broker = struct {
             61 => self.handleDescribeProducersAuthorizationError(request_bytes, body_start, req_header, api_version, resp_header_version, err_code),
             65 => self.handleDescribeTransactionsAuthorizationError(request_bytes, body_start, req_header, api_version, resp_header_version, err_code),
             66 => self.handleListTransactionsAuthorizationError(req_header, api_version, resp_header_version, err_code),
+            68 => self.handleConsumerGroupHeartbeatAuthorizationError(request_bytes, body_start, req_header, api_version, resp_header_version, err_code),
             69 => self.handleConsumerGroupDescribeAuthorizationError(request_bytes, body_start, req_header, api_version, resp_header_version, err_code),
             71 => self.handleGetTelemetrySubscriptionsAuthorizationError(request_bytes, body_start, req_header, api_version, resp_header_version, err_code),
             72 => self.handlePushTelemetryAuthorizationError(request_bytes, body_start, req_header, api_version, resp_header_version, err_code),
@@ -7760,6 +7762,60 @@ pub const Broker = struct {
             .controller_id = self.node_id,
             .brokers = &.{},
             .cluster_authorized_operations = std.math.minInt(i32),
+        };
+        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+    }
+
+    fn handleConsumerGroupHeartbeatAuthorizationError(
+        self: *Broker,
+        request_bytes: []const u8,
+        body_start: usize,
+        req_header: *const RequestHeader,
+        api_version: i16,
+        resp_header_version: i16,
+        err_code: ErrorCode,
+    ) ?[]u8 {
+        const Req = generated.consumer_group_heartbeat_request.ConsumerGroupHeartbeatRequest;
+        const Resp = generated.consumer_group_heartbeat_response.ConsumerGroupHeartbeatResponse;
+
+        if (!validateConsumerGroupHeartbeatRequestFrame(request_bytes, body_start)) {
+            log.warn("Malformed denied ConsumerGroupHeartbeat request", .{});
+            const resp = Resp{
+                .throttle_time_ms = 0,
+                .error_code = ErrorCode.invalid_request.toInt(),
+                .error_message = "malformed ConsumerGroupHeartbeat request",
+                .member_id = null,
+                .member_epoch = 0,
+                .heartbeat_interval_ms = 0,
+                .assignment = null,
+            };
+            return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+        }
+
+        var pos = body_start;
+        var req = Req.deserialize(self.allocator, request_bytes, &pos, api_version) catch |err| {
+            log.warn("Failed to decode denied ConsumerGroupHeartbeat request: {}", .{err});
+            const resp = Resp{
+                .throttle_time_ms = 0,
+                .error_code = ErrorCode.invalid_request.toInt(),
+                .error_message = "malformed ConsumerGroupHeartbeat request",
+                .member_id = null,
+                .member_epoch = 0,
+                .heartbeat_interval_ms = 0,
+                .assignment = null,
+            };
+            return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+        };
+        defer self.freeConsumerGroupHeartbeatRequest(&req);
+
+        const resp = Resp{
+            .throttle_time_ms = 0,
+            .error_code = @intFromEnum(err_code),
+            .error_message = "Not authorized",
+            .member_id = req.member_id,
+            .member_epoch = req.member_epoch,
+            .heartbeat_interval_ms = 0,
+            .assignment = null,
         };
         return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
     }
@@ -12313,7 +12369,7 @@ pub const Broker = struct {
     }
 
     // ---------------------------------------------------------------
-    // ConsumerGroupHeartbeat (key 68) — non-advertised until full KIP-848 assignment support
+    // ConsumerGroupHeartbeat (key 68) — KIP-848 heartbeat-driven membership and cooperative assignment
     // ---------------------------------------------------------------
     fn handleConsumerGroupHeartbeat(self: *Broker, request_bytes: []const u8, body_start: usize, req_header: *const RequestHeader, api_version: i16, resp_header_version: i16) ?[]u8 {
         const Req = generated.consumer_group_heartbeat_request.ConsumerGroupHeartbeatRequest;
@@ -12424,6 +12480,24 @@ pub const Broker = struct {
                 if (self.groups.groups.getPtr(group_id)) |group| {
                     response_member_epoch = group.generation_id;
                 }
+            }
+
+            var assignment = if (result.error_code == @intFromEnum(ErrorCode.none))
+                self.buildConsumerGroupHeartbeatAssignment(group_id, result.member_id) catch |err| {
+                    log.warn("Failed to build ConsumerGroupHeartbeat assignment for {s}: {}", .{ group_id, err });
+                    self.restoreConsumerGroupsAfterFailedMutation(previous_snapshot);
+                    return null;
+                }
+            else
+                null;
+            defer if (assignment) |*owned| self.freeConsumerGroupHeartbeatAssignment(owned);
+            if (result.error_code == @intFromEnum(ErrorCode.none)) {
+                _ = self.storeConsumerGroupHeartbeatGrantedAssignment(group_id, result.member_id, assignment) catch |err| {
+                    log.warn("ConsumerGroupHeartbeat assignment snapshot update failed for {s}: {}", .{ group_id, err });
+                    self.restoreConsumerGroupsAfterFailedMutation(previous_snapshot);
+                    const resp = consumerGroupHeartbeatResponse(ErrorCode.kafka_storage_error.toInt(), null, req.member_id, req.member_epoch, 0);
+                    return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+                };
                 self.persistConsumerGroupsDurably() catch |err| {
                     log.warn("ConsumerGroupHeartbeat join snapshot write failed for {s}: {}", .{ group_id, err });
                     self.restoreConsumerGroupsAfterFailedMutation(previous_snapshot);
@@ -12431,15 +12505,6 @@ pub const Broker = struct {
                     return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
                 };
             }
-
-            var assignment = if (result.error_code == @intFromEnum(ErrorCode.none))
-                self.buildConsumerGroupHeartbeatAssignment(group_id, result.member_id) catch |err| blk: {
-                    log.warn("Failed to build ConsumerGroupHeartbeat assignment for {s}: {}", .{ group_id, err });
-                    break :blk null;
-                }
-            else
-                null;
-            defer if (assignment) |*owned| self.freeConsumerGroupHeartbeatAssignment(owned);
 
             const response_heartbeat_interval_ms: i32 = if (result.error_code == @intFromEnum(ErrorCode.none))
                 consumer_group_heartbeat_interval_ms
@@ -12481,48 +12546,62 @@ pub const Broker = struct {
                 const resp = consumerGroupHeartbeatResponse(assignment_echo_error.toInt(), "ConsumerGroupHeartbeat owned partitions do not match assignment", req.member_id, req.member_epoch, 0);
                 return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
             }
-            if (subscriptions != null or rack_id != null) {
-                const previous_snapshot = self.encodeConsumerGroupSnapshotRecordValue() catch return null;
-                defer self.allocator.free(previous_snapshot);
+        }
 
-                var changed = false;
-                if (rack_id) |rack| {
-                    changed = (self.groups.updateMemberRackIfChanged(group_id, member_id, rack) catch |err| {
-                        log.warn("ConsumerGroupHeartbeat rack update failed for {s}: {}", .{ group_id, err });
-                        self.restoreConsumerGroupsAfterFailedMutation(previous_snapshot);
-                        const resp = consumerGroupHeartbeatResponse(ErrorCode.kafka_storage_error.toInt(), null, req.member_id, req.member_epoch, 0);
-                        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
-                    }) or changed;
-                }
-                if (subscriptions) |topics| {
-                    changed = (self.groups.replaceMemberSubscriptionsIfChanged(group_id, member_id, topics) catch |err| {
-                        log.warn("ConsumerGroupHeartbeat subscription update failed for {s}: {}", .{ group_id, err });
-                        self.restoreConsumerGroupsAfterFailedMutation(previous_snapshot);
-                        const resp = consumerGroupHeartbeatResponse(ErrorCode.kafka_storage_error.toInt(), null, req.member_id, req.member_epoch, 0);
-                        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
-                    }) or changed;
-                }
-                if (changed) {
-                    self.persistConsumerGroupsDurably() catch |err| {
-                        log.warn("ConsumerGroupHeartbeat member metadata snapshot write failed for {s}: {}", .{ group_id, err });
-                        self.restoreConsumerGroupsAfterFailedMutation(previous_snapshot);
-                        const resp = consumerGroupHeartbeatResponse(ErrorCode.kafka_storage_error.toInt(), null, req.member_id, req.member_epoch, 0);
-                        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
-                    };
-                }
-                if (self.groups.groups.getPtr(group_id)) |group| {
-                    response_member_epoch = group.generation_id;
-                }
+        var assignment: ?Resp.Assignment = null;
+        defer if (assignment) |*owned| self.freeConsumerGroupHeartbeatAssignment(owned);
+
+        if (error_code == @intFromEnum(ErrorCode.none)) {
+            const previous_snapshot = self.encodeConsumerGroupSnapshotRecordValue() catch return null;
+            defer self.allocator.free(previous_snapshot);
+
+            var changed = false;
+            if (rack_id) |rack| {
+                changed = (self.groups.updateMemberRackIfChanged(group_id, member_id, rack) catch |err| {
+                    log.warn("ConsumerGroupHeartbeat rack update failed for {s}: {}", .{ group_id, err });
+                    self.restoreConsumerGroupsAfterFailedMutation(previous_snapshot);
+                    const resp = consumerGroupHeartbeatResponse(ErrorCode.kafka_storage_error.toInt(), null, req.member_id, req.member_epoch, 0);
+                    return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+                }) or changed;
+            }
+            if (subscriptions) |topics| {
+                changed = (self.groups.replaceMemberSubscriptionsIfChanged(group_id, member_id, topics) catch |err| {
+                    log.warn("ConsumerGroupHeartbeat subscription update failed for {s}: {}", .{ group_id, err });
+                    self.restoreConsumerGroupsAfterFailedMutation(previous_snapshot);
+                    const resp = consumerGroupHeartbeatResponse(ErrorCode.kafka_storage_error.toInt(), null, req.member_id, req.member_epoch, 0);
+                    return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+                }) or changed;
+            }
+            changed = (self.storeConsumerGroupHeartbeatOwnedAssignmentFromRequest(group_id, member_id, req.topic_partitions) catch |err| {
+                log.warn("ConsumerGroupHeartbeat owned assignment update failed for {s}: {}", .{ group_id, err });
+                self.restoreConsumerGroupsAfterFailedMutation(previous_snapshot);
+                const resp = consumerGroupHeartbeatResponse(ErrorCode.kafka_storage_error.toInt(), null, req.member_id, req.member_epoch, 0);
+                return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+            }) or changed;
+            assignment = self.buildConsumerGroupHeartbeatAssignment(group_id, member_id) catch |err| {
+                log.warn("Failed to build ConsumerGroupHeartbeat assignment for {s}: {}", .{ group_id, err });
+                self.restoreConsumerGroupsAfterFailedMutation(previous_snapshot);
+                return null;
+            };
+            changed = (self.storeConsumerGroupHeartbeatGrantedAssignment(group_id, member_id, assignment) catch |err| {
+                log.warn("ConsumerGroupHeartbeat granted assignment update failed for {s}: {}", .{ group_id, err });
+                self.restoreConsumerGroupsAfterFailedMutation(previous_snapshot);
+                const resp = consumerGroupHeartbeatResponse(ErrorCode.kafka_storage_error.toInt(), null, req.member_id, req.member_epoch, 0);
+                return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+            }) or changed;
+
+            if (self.groups.groups.getPtr(group_id)) |group| {
+                response_member_epoch = group.generation_id;
+            }
+            if (changed) {
+                self.persistConsumerGroupsDurably() catch |err| {
+                    log.warn("ConsumerGroupHeartbeat member metadata snapshot write failed for {s}: {}", .{ group_id, err });
+                    self.restoreConsumerGroupsAfterFailedMutation(previous_snapshot);
+                    const resp = consumerGroupHeartbeatResponse(ErrorCode.kafka_storage_error.toInt(), null, req.member_id, req.member_epoch, 0);
+                    return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+                };
             }
         }
-        var assignment = if (error_code == @intFromEnum(ErrorCode.none))
-            self.buildConsumerGroupHeartbeatAssignment(group_id, member_id) catch |err| blk: {
-                log.warn("Failed to build ConsumerGroupHeartbeat assignment for {s}: {}", .{ group_id, err });
-                break :blk null;
-            }
-        else
-            null;
-        defer if (assignment) |*owned| self.freeConsumerGroupHeartbeatAssignment(owned);
 
         const resp = Resp{
             .throttle_time_ms = 0,
@@ -12566,6 +12645,51 @@ pub const Broker = struct {
         topic_name: []const u8,
         partitions: []const i32,
     };
+
+    fn i32LessThan(_: void, a: i32, b: i32) bool {
+        return a < b;
+    }
+
+    fn consumerGroupHeartbeatAssignmentContains(
+        assignment: ?[]const u8,
+        topic_id: [16]u8,
+        partition: i32,
+    ) bool {
+        const bytes = assignment orelse return false;
+        if (bytes.len < consumer_group_heartbeat_assignment_magic.len + 4) return false;
+        if (!std.mem.eql(u8, bytes[0..consumer_group_heartbeat_assignment_magic.len], consumer_group_heartbeat_assignment_magic)) return false;
+
+        var pos: usize = consumer_group_heartbeat_assignment_magic.len;
+        const topic_count = readSnapshotU32(bytes, &pos) catch return false;
+        for (0..topic_count) |_| {
+            const stored_topic_id = readSnapshotUuid(bytes, &pos) catch return false;
+            const partition_count = readSnapshotU32(bytes, &pos) catch return false;
+            if (partition_count > 1_000_000) return false;
+            for (0..partition_count) |_| {
+                const stored_partition = readSnapshotI32(bytes, &pos) catch return false;
+                if (stored_partition == partition and std.mem.eql(u8, stored_topic_id[0..], topic_id[0..])) {
+                    return true;
+                }
+            }
+        }
+        return false;
+    }
+
+    fn consumerGroupHeartbeatPartitionOwnedByOther(
+        group: *const ConsumerGroup,
+        member_id: []const u8,
+        topic_id: [16]u8,
+        partition: i32,
+    ) bool {
+        var it = group.members.iterator();
+        while (it.next()) |entry| {
+            if (std.mem.eql(u8, entry.key_ptr.*, member_id)) continue;
+            if (consumerGroupHeartbeatAssignmentContains(entry.value_ptr.assignment, topic_id, partition)) {
+                return true;
+            }
+        }
+        return false;
+    }
 
     fn buildRangeAssignedTopic(
         self: *Broker,
@@ -12618,6 +12742,31 @@ pub const Broker = struct {
         };
     }
 
+    fn buildAssignableRangeAssignedTopic(
+        self: *Broker,
+        group: *const ConsumerGroup,
+        topic_name: []const u8,
+        member_id: []const u8,
+    ) !?RangeAssignmentTopic {
+        const ideal = (try self.buildRangeAssignedTopic(group, topic_name, member_id)) orelse return null;
+        defer self.allocator.free(ideal.partitions);
+
+        var partitions = std.array_list.Managed(i32).init(self.allocator);
+        errdefer partitions.deinit();
+        for (ideal.partitions) |partition| {
+            if (!consumerGroupHeartbeatPartitionOwnedByOther(group, member_id, ideal.topic_id, partition)) {
+                try partitions.append(partition);
+            }
+        }
+        if (partitions.items.len == 0) return null;
+
+        return .{
+            .topic_id = ideal.topic_id,
+            .topic_name = ideal.topic_name,
+            .partitions = try partitions.toOwnedSlice(),
+        };
+    }
+
     fn buildConsumerGroupHeartbeatAssignment(
         self: *Broker,
         group_id: []const u8,
@@ -12637,7 +12786,7 @@ pub const Broker = struct {
         }
 
         for (member.subscribed_topics.items) |topic_name| {
-            const assigned = (try self.buildRangeAssignedTopic(group, topic_name, member_id)) orelse continue;
+            const assigned = (try self.buildAssignableRangeAssignedTopic(group, topic_name, member_id)) orelse continue;
             errdefer self.allocator.free(assigned.partitions);
 
             try topic_partitions.append(.{
@@ -12680,6 +12829,239 @@ pub const Broker = struct {
         return topics;
     }
 
+    fn encodeConsumerGroupHeartbeatResponseAssignmentTopics(
+        self: *Broker,
+        topics: []const generated.consumer_group_heartbeat_response.TopicPartitions,
+    ) ![]u8 {
+        var buf = std.array_list.Managed(u8).init(self.allocator);
+        errdefer buf.deinit();
+        const writer = @import("list_compat").writer(&buf);
+
+        try writer.writeAll(consumer_group_heartbeat_assignment_magic);
+        try writer.writeInt(u32, @intCast(topics.len), .big);
+        for (topics) |topic| {
+            try writer.writeAll(topic.topic_id[0..]);
+            try writer.writeInt(u32, @intCast(topic.partitions.len), .big);
+            for (topic.partitions) |partition| {
+                try writer.writeInt(i32, partition, .big);
+            }
+        }
+
+        return buf.toOwnedSlice();
+    }
+
+    fn encodeConsumerGroupHeartbeatRequestAssignmentTopics(
+        self: *Broker,
+        topics: []const generated.consumer_group_heartbeat_request.ConsumerGroupHeartbeatRequest.TopicPartitions,
+    ) ![]u8 {
+        var buf = std.array_list.Managed(u8).init(self.allocator);
+        errdefer buf.deinit();
+        const writer = @import("list_compat").writer(&buf);
+
+        try writer.writeAll(consumer_group_heartbeat_assignment_magic);
+        try writer.writeInt(u32, @intCast(topics.len), .big);
+        for (topics) |topic| {
+            try writer.writeAll(topic.topic_id[0..]);
+            try writer.writeInt(u32, @intCast(topic.partitions.len), .big);
+            for (topic.partitions) |partition| {
+                try writer.writeInt(i32, partition, .big);
+            }
+        }
+
+        return buf.toOwnedSlice();
+    }
+
+    fn decodeConsumerGroupHeartbeatAssignmentTopics(
+        self: *Broker,
+        assignment: ?[]const u8,
+    ) ![]generated.consumer_group_heartbeat_response.TopicPartitions {
+        const RespTopic = generated.consumer_group_heartbeat_response.TopicPartitions;
+        const bytes = assignment orelse return &[_]RespTopic{};
+        if (bytes.len < consumer_group_heartbeat_assignment_magic.len + 4) return &[_]RespTopic{};
+        if (!std.mem.eql(u8, bytes[0..consumer_group_heartbeat_assignment_magic.len], consumer_group_heartbeat_assignment_magic)) {
+            return &[_]RespTopic{};
+        }
+
+        var pos: usize = consumer_group_heartbeat_assignment_magic.len;
+        const topic_count = try readSnapshotU32(bytes, &pos);
+        if (topic_count > 4096) return error.InvalidConsumerGroupHeartbeatAssignment;
+        if (topic_count == 0) return &[_]RespTopic{};
+
+        const topics = try self.allocator.alloc(RespTopic, topic_count);
+        var initialized_topics: usize = 0;
+        errdefer {
+            for (topics[0..initialized_topics]) |topic| {
+                if (topic.partitions.len > 0) self.allocator.free(topic.partitions);
+            }
+            self.allocator.free(topics);
+        }
+
+        for (topics) |*topic| {
+            topic.topic_id = try readSnapshotUuid(bytes, &pos);
+            const partition_count = try readSnapshotU32(bytes, &pos);
+            if (partition_count > 1_000_000) return error.InvalidConsumerGroupHeartbeatAssignment;
+            if (partition_count == 0) {
+                topic.partitions = &.{};
+            } else {
+                const partitions = try self.allocator.alloc(i32, partition_count);
+                errdefer self.allocator.free(partitions);
+                for (partitions) |*partition| {
+                    partition.* = try readSnapshotI32(bytes, &pos);
+                }
+                topic.partitions = partitions;
+            }
+            initialized_topics += 1;
+        }
+        if (pos != bytes.len) return error.InvalidConsumerGroupHeartbeatAssignment;
+        return topics;
+    }
+
+    fn freeConsumerGroupHeartbeatTopicPartitions(
+        self: *Broker,
+        topics: []generated.consumer_group_heartbeat_response.TopicPartitions,
+    ) void {
+        for (topics) |topic| {
+            if (topic.partitions.len > 0) self.allocator.free(topic.partitions);
+        }
+        if (topics.len > 0) self.allocator.free(topics);
+    }
+
+    fn mergeConsumerGroupHeartbeatAssignmentTopic(
+        self: *Broker,
+        topics: *std.array_list.Managed(generated.consumer_group_heartbeat_response.TopicPartitions),
+        target: generated.consumer_group_heartbeat_response.TopicPartitions,
+    ) !bool {
+        for (topics.items) |*existing| {
+            if (!std.mem.eql(u8, existing.topic_id[0..], target.topic_id[0..])) continue;
+
+            var changed = false;
+            var partitions = std.array_list.Managed(i32).init(self.allocator);
+            defer partitions.deinit();
+            try partitions.appendSlice(existing.partitions);
+
+            for (target.partitions) |partition| {
+                var found = false;
+                for (partitions.items) |existing_partition| {
+                    if (existing_partition == partition) {
+                        found = true;
+                        break;
+                    }
+                }
+                if (!found) {
+                    try partitions.append(partition);
+                    changed = true;
+                }
+            }
+
+            if (!changed) return false;
+            std.mem.sort(i32, partitions.items, {}, i32LessThan);
+            const merged = try partitions.toOwnedSlice();
+            if (existing.partitions.len > 0) self.allocator.free(existing.partitions);
+            existing.partitions = merged;
+            return true;
+        }
+
+        const copied = if (target.partitions.len == 0) blk: {
+            break :blk &[_]i32{};
+        } else blk: {
+            const owned = try self.allocator.dupe(i32, target.partitions);
+            std.mem.sort(i32, owned, {}, i32LessThan);
+            break :blk owned;
+        };
+        errdefer if (copied.len > 0) self.allocator.free(copied);
+        try topics.append(.{
+            .topic_id = target.topic_id,
+            .partitions = copied,
+        });
+        return true;
+    }
+
+    fn replaceConsumerGroupHeartbeatMemberAssignment(
+        self: *Broker,
+        group_id: []const u8,
+        member_id: []const u8,
+        encoded: []u8,
+    ) bool {
+        const group = self.groups.groups.getPtr(group_id) orelse {
+            self.allocator.free(encoded);
+            return false;
+        };
+        const member = group.members.getPtr(member_id) orelse {
+            self.allocator.free(encoded);
+            return false;
+        };
+        if (member.assignment) |old| {
+            if (std.mem.eql(u8, old, encoded)) {
+                self.allocator.free(encoded);
+                return false;
+            }
+            self.allocator.free(old);
+        }
+        member.assignment = encoded;
+        return true;
+    }
+
+    fn storeConsumerGroupHeartbeatOwnedAssignmentFromRequest(
+        self: *Broker,
+        group_id: []const u8,
+        member_id: []const u8,
+        topic_partitions: ?[]const generated.consumer_group_heartbeat_request.ConsumerGroupHeartbeatRequest.TopicPartitions,
+    ) !bool {
+        const topics = topic_partitions orelse return false;
+        const encoded = try self.encodeConsumerGroupHeartbeatRequestAssignmentTopics(topics);
+        return self.replaceConsumerGroupHeartbeatMemberAssignment(group_id, member_id, encoded);
+    }
+
+    fn storeConsumerGroupHeartbeatGrantedAssignment(
+        self: *Broker,
+        group_id: []const u8,
+        member_id: []const u8,
+        assignment: ?generated.consumer_group_heartbeat_response.ConsumerGroupHeartbeatResponse.Assignment,
+    ) !bool {
+        const assigned = assignment orelse return false;
+        const group = self.groups.groups.getPtr(group_id) orelse return false;
+        const member = group.members.getPtr(member_id) orelse return false;
+
+        const decoded = try self.decodeConsumerGroupHeartbeatAssignmentTopics(member.assignment);
+        defer self.freeConsumerGroupHeartbeatTopicPartitions(decoded);
+
+        var topics = std.array_list.Managed(generated.consumer_group_heartbeat_response.TopicPartitions).init(self.allocator);
+        defer topics.deinit();
+        for (decoded) |topic| {
+            const copied_partitions = if (topic.partitions.len == 0)
+                &[_]i32{}
+            else
+                try self.allocator.dupe(i32, topic.partitions);
+            errdefer if (copied_partitions.len > 0) self.allocator.free(copied_partitions);
+            try topics.append(.{
+                .topic_id = topic.topic_id,
+                .partitions = copied_partitions,
+            });
+        }
+        errdefer {
+            for (topics.items) |topic| {
+                if (topic.partitions.len > 0) self.allocator.free(topic.partitions);
+            }
+        }
+
+        var changed = false;
+        for (assigned.topic_partitions) |topic| {
+            changed = (try self.mergeConsumerGroupHeartbeatAssignmentTopic(&topics, topic)) or changed;
+        }
+        if (!changed) {
+            for (topics.items) |topic| {
+                if (topic.partitions.len > 0) self.allocator.free(topic.partitions);
+            }
+            return false;
+        }
+
+        const encoded = try self.encodeConsumerGroupHeartbeatResponseAssignmentTopics(topics.items);
+        for (topics.items) |topic| {
+            if (topic.partitions.len > 0) self.allocator.free(topic.partitions);
+        }
+        return self.replaceConsumerGroupHeartbeatMemberAssignment(group_id, member_id, encoded);
+    }
+
     fn validateConsumerGroupHeartbeatOwnedPartitions(
         self: *const Broker,
         topic_partitions: ?[]const generated.consumer_group_heartbeat_request.ConsumerGroupHeartbeatRequest.TopicPartitions,
@@ -12709,25 +13091,25 @@ pub const Broker = struct {
     ) !ErrorCode {
         const topics = topic_partitions orelse return ErrorCode.none;
         const group = self.groups.groups.getPtr(group_id) orelse return ErrorCode.unknown_member_id;
-        if (!group.members.contains(member_id)) return ErrorCode.unknown_member_id;
+        const member = group.members.getPtr(member_id) orelse return ErrorCode.unknown_member_id;
 
         for (topics) |topic| {
             const topic_name = self.findTopicNameById(topic.topic_id) orelse return ErrorCode.unknown_topic_id;
-            const assigned = (try self.buildRangeAssignedTopic(group, topic_name, member_id)) orelse {
-                if (topic.partitions.len == 0) continue;
-                return ErrorCode.invalid_request;
-            };
-            defer self.allocator.free(assigned.partitions);
+            const assigned = try self.buildAssignableRangeAssignedTopic(group, topic_name, member_id);
+            defer if (assigned) |owned| self.allocator.free(owned.partitions);
 
             for (topic.partitions) |owned_partition| {
-                var found = false;
-                for (assigned.partitions) |assigned_partition| {
-                    if (assigned_partition == owned_partition) {
-                        found = true;
-                        break;
+                var in_current_target = false;
+                if (assigned) |current| {
+                    for (current.partitions) |assigned_partition| {
+                        if (assigned_partition == owned_partition) {
+                            in_current_target = true;
+                            break;
+                        }
                     }
                 }
-                if (!found) return ErrorCode.invalid_request;
+                const was_previously_granted = consumerGroupHeartbeatAssignmentContains(member.assignment, topic.topic_id, owned_partition);
+                if (!in_current_target and !was_previously_granted) return ErrorCode.invalid_request;
             }
         }
         return ErrorCode.none;
@@ -45808,7 +46190,7 @@ test "Broker.handleRequest ConsumerGroupHeartbeat rejects owned partitions outsi
 
     const valid_owned = [_]TopicPartitions{.{
         .topic_id = topic_id,
-        .partitions = &[_]i32{ 2, 3 },
+        .partitions = &[_]i32{},
     }};
     const valid_req = Req{
         .group_id = "kip848-owned-range-group",
@@ -45997,6 +46379,7 @@ test "Broker.handleRequest ConsumerGroupHeartbeat validates server assignors" {
 test "Broker.handleRequest ConsumerGroupHeartbeat returns range assignments across members" {
     const Req = generated.consumer_group_heartbeat_request.ConsumerGroupHeartbeatRequest;
     const Resp = generated.consumer_group_heartbeat_response.ConsumerGroupHeartbeatResponse;
+    const TopicPartitions = Req.TopicPartitions;
 
     var broker = Broker.init(testing.allocator, 1, 9092);
     defer broker.deinit();
@@ -46063,15 +46446,18 @@ test "Broker.handleRequest ConsumerGroupHeartbeat returns range assignments acro
     try testing.expectEqual(b_response.?.len, b_rpos);
     try testing.expectEqual(ErrorCode.none.toInt(), b_resp.error_code);
     const b_assignment = b_resp.assignment orelse return error.ExpectedConsumerGroupHeartbeatAssignment;
-    try testing.expectEqual(@as(usize, 1), b_assignment.topic_partitions.len);
-    try testing.expectEqualSlices(u8, &topic_id, &b_assignment.topic_partitions[0].topic_id);
-    try testing.expectEqualSlices(i32, &[_]i32{ 2, 3 }, b_assignment.topic_partitions[0].partitions);
+    try testing.expectEqual(@as(usize, 0), b_assignment.topic_partitions.len);
 
+    const a_owned_all = [_]TopicPartitions{.{
+        .topic_id = topic_id,
+        .partitions = &[_]i32{ 0, 1, 2, 3 },
+    }};
     const member_a_heartbeat_req = Req{
         .group_id = "range-group",
         .member_id = a_resp.member_id,
         .member_epoch = a_resp.member_epoch,
         .rebalance_timeout_ms = -1,
+        .topic_partitions = &a_owned_all,
     };
 
     var hb_buf: [256]u8 = undefined;
@@ -46095,6 +46481,65 @@ test "Broker.handleRequest ConsumerGroupHeartbeat returns range assignments acro
     try testing.expectEqual(@as(usize, 1), hb_assignment.topic_partitions.len);
     try testing.expectEqualSlices(u8, &topic_id, &hb_assignment.topic_partitions[0].topic_id);
     try testing.expectEqualSlices(i32, &[_]i32{ 0, 1 }, hb_assignment.topic_partitions[0].partitions);
+
+    const a_owned_revoked = [_]TopicPartitions{.{
+        .topic_id = topic_id,
+        .partitions = &[_]i32{ 0, 1 },
+    }};
+    const member_a_revoked_req = Req{
+        .group_id = "range-group",
+        .member_id = a_resp.member_id,
+        .member_epoch = a_resp.member_epoch,
+        .rebalance_timeout_ms = -1,
+        .topic_partitions = &a_owned_revoked,
+    };
+
+    var revoke_buf: [256]u8 = undefined;
+    var revoke_pos = buildTestRequest(&revoke_buf, 68, 0, 6813, header_mod.requestHeaderVersion(68, 0));
+    member_a_revoked_req.serialize(&revoke_buf, &revoke_pos, 0);
+
+    const revoke_response = broker.handleRequest(revoke_buf[0..revoke_pos]);
+    try testing.expect(revoke_response != null);
+    defer testing.allocator.free(revoke_response.?);
+
+    var revoke_rpos: usize = 0;
+    var revoke_response_header = try ResponseHeader.deserialize(testing.allocator, revoke_response.?, &revoke_rpos, header_mod.responseHeaderVersion(68, 0));
+    defer revoke_response_header.deinit(testing.allocator);
+    try testing.expectEqual(@as(i32, 6813), revoke_response_header.correlation_id);
+
+    const revoke_resp = try Resp.deserialize(testing.allocator, revoke_response.?, &revoke_rpos, 0);
+    defer freeDeserializedConsumerGroupHeartbeatResponse(&revoke_resp);
+    try testing.expectEqual(revoke_response.?.len, revoke_rpos);
+    try testing.expectEqual(ErrorCode.none.toInt(), revoke_resp.error_code);
+
+    const member_b_heartbeat_req = Req{
+        .group_id = "range-group",
+        .member_id = b_resp.member_id,
+        .member_epoch = b_resp.member_epoch,
+        .rebalance_timeout_ms = -1,
+    };
+
+    var b_hb_buf: [256]u8 = undefined;
+    var b_hb_pos = buildTestRequest(&b_hb_buf, 68, 0, 6814, header_mod.requestHeaderVersion(68, 0));
+    member_b_heartbeat_req.serialize(&b_hb_buf, &b_hb_pos, 0);
+
+    const b_hb_response = broker.handleRequest(b_hb_buf[0..b_hb_pos]);
+    try testing.expect(b_hb_response != null);
+    defer testing.allocator.free(b_hb_response.?);
+
+    var b_hb_rpos: usize = 0;
+    var b_hb_response_header = try ResponseHeader.deserialize(testing.allocator, b_hb_response.?, &b_hb_rpos, header_mod.responseHeaderVersion(68, 0));
+    defer b_hb_response_header.deinit(testing.allocator);
+    try testing.expectEqual(@as(i32, 6814), b_hb_response_header.correlation_id);
+
+    const b_hb_resp = try Resp.deserialize(testing.allocator, b_hb_response.?, &b_hb_rpos, 0);
+    defer freeDeserializedConsumerGroupHeartbeatResponse(&b_hb_resp);
+    try testing.expectEqual(b_hb_response.?.len, b_hb_rpos);
+    try testing.expectEqual(ErrorCode.none.toInt(), b_hb_resp.error_code);
+    const b_hb_assignment = b_hb_resp.assignment orelse return error.ExpectedConsumerGroupHeartbeatAssignment;
+    try testing.expectEqual(@as(usize, 1), b_hb_assignment.topic_partitions.len);
+    try testing.expectEqualSlices(u8, &topic_id, &b_hb_assignment.topic_partitions[0].topic_id);
+    try testing.expectEqualSlices(i32, &[_]i32{ 2, 3 }, b_hb_assignment.topic_partitions[0].partitions);
 }
 
 test "Broker.handleRequest ConsumerGroupHeartbeat uses KIP-848 static fencing error" {

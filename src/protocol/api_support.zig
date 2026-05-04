@@ -93,6 +93,7 @@ pub const broker_supported_apis = [_]BrokerApiSupport{
     .{ .key = 61, .name = "DescribeProducers", .metric = "describe_producers", .min = 0, .max = 0 },
     .{ .key = 65, .name = "DescribeTransactions", .metric = "describe_transactions", .min = 0, .max = 0 },
     .{ .key = 66, .name = "ListTransactions", .metric = "list_transactions", .min = 0, .max = 1 },
+    .{ .key = 68, .name = "ConsumerGroupHeartbeat", .metric = "consumer_group_heartbeat", .min = 0, .max = 0 },
     .{ .key = 69, .name = "ConsumerGroupDescribe", .metric = "consumer_group_describe", .min = 0, .max = 0 },
     .{ .key = 71, .name = "GetTelemetrySubscriptions", .metric = "get_telemetry_subscriptions", .min = 0, .max = 0 },
     .{ .key = 72, .name = "PushTelemetry", .metric = "push_telemetry", .min = 0, .max = 0 },
@@ -374,10 +375,8 @@ pub const non_advertised_handler_api_keys = [_]i16{
 /// Generated APIs with broker switch cases that intentionally remain
 /// non-advertised until their full coordinator/storage semantics are
 /// implemented. Most return schema-valid fail-closed responses for direct
-/// probes; ConsumerGroupHeartbeat currently exposes a compatibility subset but
-/// stays here until full KIP-848 epoch/revocation semantics exist.
+/// probes.
 pub const fail_closed_generated_handler_api_keys = [_]i16{
-    68, // ConsumerGroupHeartbeat (KIP-848)
     76, // ShareGroupHeartbeat (KIP-932)
     77, // ShareGroupDescribe (KIP-932)
     78, // ShareFetch (KIP-932)

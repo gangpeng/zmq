@@ -84,8 +84,6 @@ The following surfaces must remain documented and non-advertised, or become
 fully implemented and covered by the gates above, before an AutoMQ-complete
 release:
 
-- KIP-848 `ConsumerGroupHeartbeat` remains non-advertised until full epoch,
-  assignment revocation, and coordinator migration semantics are implemented.
 - Share-group APIs remain non-advertised until durable share-group coordinator
   and share-session data-plane semantics are complete.
 - Legacy inter-broker APIs remain non-advertised until real controller-backed
