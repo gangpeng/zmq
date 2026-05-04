@@ -22,6 +22,8 @@ Optional environment:
     ZMQ_KRAFT_NETWORK_<PHASE>_DOWN  optional phase-specific down hook
     ZMQ_KRAFT_NETWORK_<PHASE>_UP    optional phase-specific heal hook
     ZMQ_KRAFT_NETWORK_<PHASE>_EXPECT optional phase-specific "fail" or "survive"
+    ZMQ_KRAFT_REQUIRED_NETWORK_PHASES
+                                     fail if scheduled phases omit any required name
 """
 
 import json
@@ -651,13 +653,19 @@ def network_phase_expect(phase):
     )
 
 
+def split_csv(raw):
+    if not raw:
+        return []
+    return [item.strip() for item in raw.split(",") if item.strip()]
+
+
 def selected_network_partition_phases():
     if not network_hooks_configured():
         return []
 
     raw_matrix = os.environ.get("ZMQ_KRAFT_NETWORK_MATRIX")
     if raw_matrix:
-        names = [name.strip() for name in raw_matrix.split(",") if name.strip()]
+        names = split_csv(raw_matrix)
         if not names:
             raise TestError("ZMQ_KRAFT_NETWORK_MATRIX did not contain any phases")
     else:
@@ -677,6 +685,20 @@ def selected_network_partition_phases():
             raise TestError(f"invalid KRaft network expectation for {name!r}: {expect!r}")
         phases.append({"name": name, "down": down, "up": up, "expect": expect})
     return phases
+
+
+def validate_required_network_phase_coverage():
+    required_phases = split_csv(os.environ.get("ZMQ_KRAFT_REQUIRED_NETWORK_PHASES"))
+    if not required_phases:
+        return
+
+    configured_phases = [phase["name"] for phase in selected_network_partition_phases()]
+    missing_phases = [phase for phase in required_phases if phase not in configured_phases]
+    if missing_phases:
+        raise TestError(
+            "required KRaft network phases not configured: "
+            + ", ".join(missing_phases)
+        )
 
 
 def hook_context_env(processes, broker, leader_id):
@@ -2570,6 +2592,7 @@ def main():
         return 0
     if not os.path.exists(ZMQ_BIN):
         raise TestError(f"broker binary not found: {ZMQ_BIN}")
+    validate_required_network_phase_coverage()
 
     tmp = tempfile.mkdtemp(prefix="zmq-kraft-failover-")
     processes = {}
@@ -2752,6 +2775,15 @@ def self_test():
             raise TestError(f"network matrix phase parsing failed: {phases}")
         if phases[0]["expect"] != "fail" or phases[1]["expect"] != "survive":
             raise TestError(f"network matrix expectation parsing failed: {phases}")
+        os.environ["ZMQ_KRAFT_REQUIRED_NETWORK_PHASES"] = "leader-isolation,broker-link"
+        validate_required_network_phase_coverage()
+        os.environ["ZMQ_KRAFT_REQUIRED_NETWORK_PHASES"] = "missing-phase"
+        try:
+            validate_required_network_phase_coverage()
+            raise TestError("missing required KRaft network phase was not rejected")
+        except TestError as exc:
+            if "required KRaft network phases" not in str(exc):
+                raise
 
         processes = {
             0: {"proc": DummyProc(1000), "port": 39093},

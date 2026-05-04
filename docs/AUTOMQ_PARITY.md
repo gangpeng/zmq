@@ -663,8 +663,10 @@ Status: completed for the initial catalog and DeleteGroups slice.
   receives controller/broker PID and port context plus the active controller
   leader, verifies configured produce behavior during the partition, heals the
   cluster, reconverges controllers, and verifies broker data continuity before
-  the leader-kill/restart sequence. Remaining gap: broader failover gates and
-  client compatibility fixtures.
+  the leader-kill/restart sequence. Release jobs can require specific scheduled
+  controller/broker partition phases with `ZMQ_KRAFT_REQUIRED_NETWORK_PHASES`,
+  so missing failover matrix coverage fails before the harness starts.
+  Remaining gap: broader failover gates and client compatibility fixtures.
 - Validate rack-aware routing and auto-balancer decisions under load. Status:
   rack-aware planning has unit coverage for cross-rack target preference,
   same-rack fallback, stale unknown-node metric filtering, non-negative metric
@@ -736,9 +738,11 @@ Status: completed for the initial catalog and DeleteGroups slice.
   `test-kraft-failover` can require controller/broker network-partition hooks
   with `ZMQ_KRAFT_NETWORK_DOWN` and `ZMQ_KRAFT_NETWORK_UP`, or scheduled named
   controller/broker partition phases with `ZMQ_KRAFT_NETWORK_MATRIX` and
-  `ZMQ_KRAFT_NETWORK_<PHASE>_{DOWN,UP,EXPECT}` overrides. Remaining work:
-  broader environment execution coverage for live provider outage profiles,
-  scheduled partition matrices, and cross-broker chaos hooks.
+  `ZMQ_KRAFT_NETWORK_<PHASE>_{DOWN,UP,EXPECT}` overrides, and can fail release
+  jobs when required failover phases are omitted through
+  `ZMQ_KRAFT_REQUIRED_NETWORK_PHASES`. Remaining work: broader environment
+  execution coverage for live provider outage profiles, scheduled partition
+  matrices, and cross-broker chaos hooks.
 - Add performance baselines for produce/fetch throughput, p99 latency, S3
   operations per MiB, recovery time, and memory growth.
   Status: `zig build bench` now compiles against the broker/storage/protocol

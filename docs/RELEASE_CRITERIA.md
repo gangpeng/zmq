@@ -53,6 +53,12 @@ ZMQ_RUN_BENCH_LIVE_S3=1 /tmp/zig-aarch64-linux-0.16.0/zig build bench --summary 
 ZMQ_RUN_BENCH_COMPARE=1 /tmp/zig-aarch64-linux-0.16.0/zig build bench-compare --summary all
 ```
 
+Release CI must set required coverage variables for environment-specific
+matrices, including `ZMQ_KRAFT_REQUIRED_NETWORK_PHASES` for scheduled
+controller/broker partition phases, `ZMQ_CHAOS_REQUIRED_NETWORK_PHASES` for
+broker chaos partitions, and provider/client/profile requirement variables for
+S3 and external-client matrices.
+
 ## Known Unsupported Or Partial Surfaces
 
 The following surfaces must remain documented and non-advertised, or become
@@ -70,8 +76,9 @@ release:
 - Broader broker-only stateless replacement still has local cache/state
   assumptions outside the covered S3/quorum replay paths.
 - Broader live load/scale orchestration, CI execution of required scheduled
-  cross-broker chaos matrices, scheduled live provider outage profiles, and
-  comparative Kafka/AutoMQ performance trend gates are still release blockers.
+  cross-broker chaos and KRaft failover matrices, scheduled live provider
+  outage profiles, and comparative Kafka/AutoMQ performance trend gates are
+  still release blockers.
 
 ## Release Decision
 

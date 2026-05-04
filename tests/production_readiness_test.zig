@@ -802,6 +802,8 @@ test "AutoMQ parity release criteria document pins required gates" {
         "zig build test-s3-process-crash --summary all",
         "zig build test-s3-provider-matrix --summary all",
         "zig build test-kraft-failover --summary all",
+        "ZMQ_KRAFT_REQUIRED_NETWORK_PHASES",
+        "ZMQ_CHAOS_REQUIRED_NETWORK_PHASES",
         "zig build bench --summary all",
         "ZMQ_RUN_BENCH_LIVE_S3=1",
         "zig build bench-compare --summary all",
