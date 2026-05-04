@@ -2159,6 +2159,134 @@ test "generated non-default golden fixtures cover legacy and flexible wire encod
     }
 
     {
+        const DeleteShareGroupStateRequest = generated.delete_share_group_state_request.DeleteShareGroupStateRequest;
+        const partitions = [_]DeleteShareGroupStateRequest.DeleteStateData.PartitionData{
+            .{ .partition = 0 },
+            .{ .partition = 2 },
+        };
+        const topics = [_]DeleteShareGroupStateRequest.DeleteStateData{.{
+            .topic_id = .{
+                0x40, 0x41, 0x42, 0x43,
+                0x44, 0x45, 0x46, 0x47,
+                0x48, 0x49, 0x4a, 0x4b,
+                0x4c, 0x4d, 0x4e, 0x4f,
+            },
+            .partitions = &partitions,
+        }};
+        const value = DeleteShareGroupStateRequest{
+            .group_id = "share-g",
+            .topics = &topics,
+        };
+        try expectGoldenRoundTrip(DeleteShareGroupStateRequest, value, 0, &[_]u8{
+            0x08, 0x73, 0x68, 0x61, 0x72, 0x65, 0x2d, 0x67,
+            0x02, 0x40, 0x41, 0x42, 0x43, 0x44, 0x45, 0x46,
+            0x47, 0x48, 0x49, 0x4a, 0x4b, 0x4c, 0x4d, 0x4e,
+            0x4f, 0x03, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x02, 0x00, 0x00, 0x00,
+        });
+    }
+
+    {
+        const DeleteShareGroupStateResponse = generated.delete_share_group_state_response.DeleteShareGroupStateResponse;
+        const partition_results = [_]DeleteShareGroupStateResponse.DeleteStateResult.PartitionResult{
+            .{ .partition = 0, .error_code = 0, .error_message = null },
+            .{ .partition = 2, .error_code = 42, .error_message = "bad-epoch" },
+        };
+        const results = [_]DeleteShareGroupStateResponse.DeleteStateResult{.{
+            .topic_id = .{
+                0x40, 0x41, 0x42, 0x43,
+                0x44, 0x45, 0x46, 0x47,
+                0x48, 0x49, 0x4a, 0x4b,
+                0x4c, 0x4d, 0x4e, 0x4f,
+            },
+            .partitions = &partition_results,
+        }};
+        const value = DeleteShareGroupStateResponse{
+            .results = &results,
+        };
+        try expectGoldenRoundTrip(DeleteShareGroupStateResponse, value, 0, &[_]u8{
+            0x02, 0x40, 0x41, 0x42, 0x43, 0x44, 0x45, 0x46,
+            0x47, 0x48, 0x49, 0x4a, 0x4b, 0x4c, 0x4d, 0x4e,
+            0x4f, 0x03, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x02, 0x00, 0x2a,
+            0x0a, 0x62, 0x61, 0x64, 0x2d, 0x65, 0x70, 0x6f,
+            0x63, 0x68, 0x00, 0x00, 0x00,
+        });
+    }
+
+    {
+        const ReadShareGroupStateSummaryRequest = generated.read_share_group_state_summary_request.ReadShareGroupStateSummaryRequest;
+        const partitions = [_]ReadShareGroupStateSummaryRequest.ReadStateSummaryData.PartitionData{
+            .{ .partition = 0, .leader_epoch = 9 },
+            .{ .partition = 2, .leader_epoch = 9 },
+        };
+        const topics = [_]ReadShareGroupStateSummaryRequest.ReadStateSummaryData{.{
+            .topic_id = .{
+                0x40, 0x41, 0x42, 0x43,
+                0x44, 0x45, 0x46, 0x47,
+                0x48, 0x49, 0x4a, 0x4b,
+                0x4c, 0x4d, 0x4e, 0x4f,
+            },
+            .partitions = &partitions,
+        }};
+        const value = ReadShareGroupStateSummaryRequest{
+            .group_id = "share-g",
+            .topics = &topics,
+        };
+        try expectGoldenRoundTrip(ReadShareGroupStateSummaryRequest, value, 0, &[_]u8{
+            0x08, 0x73, 0x68, 0x61, 0x72, 0x65, 0x2d, 0x67,
+            0x02, 0x40, 0x41, 0x42, 0x43, 0x44, 0x45, 0x46,
+            0x47, 0x48, 0x49, 0x4a, 0x4b, 0x4c, 0x4d, 0x4e,
+            0x4f, 0x03, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x09, 0x00, 0x00, 0x00, 0x00, 0x02, 0x00,
+            0x00, 0x00, 0x09, 0x00, 0x00, 0x00,
+        });
+    }
+
+    {
+        const ReadShareGroupStateSummaryResponse = generated.read_share_group_state_summary_response.ReadShareGroupStateSummaryResponse;
+        const partition_results = [_]ReadShareGroupStateSummaryResponse.ReadStateSummaryResult.PartitionResult{
+            .{
+                .partition = 0,
+                .error_code = 0,
+                .error_message = null,
+                .state_epoch = 5,
+                .start_offset = 10,
+            },
+            .{
+                .partition = 2,
+                .error_code = 42,
+                .error_message = "bad-epoch",
+                .state_epoch = 0,
+                .start_offset = -1,
+            },
+        };
+        const results = [_]ReadShareGroupStateSummaryResponse.ReadStateSummaryResult{.{
+            .topic_id = .{
+                0x40, 0x41, 0x42, 0x43,
+                0x44, 0x45, 0x46, 0x47,
+                0x48, 0x49, 0x4a, 0x4b,
+                0x4c, 0x4d, 0x4e, 0x4f,
+            },
+            .partitions = &partition_results,
+        }};
+        const value = ReadShareGroupStateSummaryResponse{
+            .results = &results,
+        };
+        try expectGoldenRoundTrip(ReadShareGroupStateSummaryResponse, value, 0, &[_]u8{
+            0x02, 0x40, 0x41, 0x42, 0x43, 0x44, 0x45, 0x46,
+            0x47, 0x48, 0x49, 0x4a, 0x4b, 0x4c, 0x4d, 0x4e,
+            0x4f, 0x03, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00, 0x05, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00, 0x0a, 0x00, 0x00, 0x00,
+            0x00, 0x02, 0x00, 0x2a, 0x0a, 0x62, 0x61, 0x64,
+            0x2d, 0x65, 0x70, 0x6f, 0x63, 0x68, 0x00, 0x00,
+            0x00, 0x00, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+            0xff, 0xff, 0x00, 0x00, 0x00,
+        });
+    }
+
+    {
         const AlterPartitionReassignmentsRequest = generated.alter_partition_reassignments_request.AlterPartitionReassignmentsRequest;
         const null_partitions = [_]AlterPartitionReassignmentsRequest.ReassignableTopic.ReassignablePartition{.{
             .partition_index = 0,
