@@ -761,7 +761,13 @@ Status: completed for the initial catalog and DeleteGroups slice.
   load/scale orchestration can now be required separately with
   `ZMQ_E2E_LOAD_SCALE_MATRIX`, per-phase apply/restore hooks, cross-node
   produce/fetch checks after both apply and restore, and
-  `ZMQ_E2E_REQUIRED_LOAD_SCALE_PHASES` release coverage validation.
+  `ZMQ_E2E_REQUIRED_LOAD_SCALE_PHASES` release coverage validation. The Docker
+  build now selects the Zig 0.16.0 archive from Docker `TARGETARCH` so arm64
+  and amd64 E2E builders do not silently download an incompatible compiler. The
+  E2E Produce helper now emits valid Kafka v0 MessageSet records, so broker
+  offset rewrites preserve payload values, and the local Docker combined-mode
+  S3 WAL gate passes all 35 checks including restart recovery and cross-node
+  produce/fetch visibility.
   Remaining gap: broader failover gates and client compatibility fixtures.
 - Validate rack-aware routing and auto-balancer decisions under load. Status:
   rack-aware planning has unit coverage for cross-rack target preference,

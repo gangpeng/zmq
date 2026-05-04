@@ -25,6 +25,7 @@ const MetricRegistry = @import("metrics.zig").MetricRegistry;
 const metrics_mod = @import("metrics.zig");
 const MetadataPersistence = @import("persistence.zig").MetadataPersistence;
 const RaftState = @import("raft").RaftState;
+const RaftClient = @import("network").RaftClient;
 const auth_mod = @import("security").auth;
 const Authorizer = auth_mod.Authorizer;
 const SaslPlainAuthenticator = auth_mod.SaslPlainAuthenticator;
@@ -120,6 +121,8 @@ pub const Broker = struct {
     replica_directory_assignments: std.StringHashMap(ReplicaDirectoryAssignment),
     /// Idempotent producer deduplication: tracks last sequence number per producer+partition.
     producer_sequences: std.AutoHashMap(ProducerKey, ProducerSequenceState),
+    /// Broker listeners for combined-mode peers, keyed by KRaft node id.
+    broker_peers: std.AutoHashMap(i32, BrokerPeerEndpoint),
     allocator: Allocator,
     /// KRaft node ID for this broker in the cluster.
     node_id: i32,
@@ -364,6 +367,11 @@ pub const Broker = struct {
         producer_epoch: i16,
     };
 
+    pub const BrokerPeerEndpoint = struct {
+        host: []u8,
+        port: u16,
+    };
+
     pub const BrokerConfig = struct {
         data_dir: ?[]const u8 = null,
         s3_endpoint_host: ?[]const u8 = null,
@@ -578,6 +586,7 @@ pub const Broker = struct {
             .share_group_sessions = std.StringHashMap(i32).init(alloc),
             .replica_directory_assignments = std.StringHashMap(ReplicaDirectoryAssignment).init(alloc),
             .producer_sequences = std.AutoHashMap(ProducerKey, ProducerSequenceState).init(alloc),
+            .broker_peers = std.AutoHashMap(i32, BrokerPeerEndpoint).init(alloc),
             .allocator = alloc,
             .node_id = node_id,
             .port = port,
@@ -682,6 +691,42 @@ pub const Broker = struct {
         self.raft_state = raft;
         // Wire metrics into the Raft state for consensus observability
         raft.metrics = &self.metrics;
+    }
+
+    fn clearBrokerPeers(self: *Broker) void {
+        var it = self.broker_peers.iterator();
+        while (it.next()) |entry| {
+            self.allocator.free(entry.value_ptr.host);
+        }
+        self.broker_peers.clearRetainingCapacity();
+    }
+
+    pub fn addBrokerPeer(self: *Broker, node_id: i32, host: []const u8, port: u16) !void {
+        if (node_id == self.node_id) return;
+        const host_copy = try self.allocator.dupe(u8, host);
+        errdefer self.allocator.free(host_copy);
+
+        const previous = try self.broker_peers.fetchPut(node_id, .{
+            .host = host_copy,
+            .port = port,
+        });
+        if (previous) |old| {
+            self.allocator.free(old.value.host);
+        }
+    }
+
+    fn forwardControllerMutationToLeader(self: *Broker, request_bytes: []const u8) !?[]u8 {
+        const raft = self.raft_state orelse return null;
+        if (raft.role == .leader) return null;
+
+        const leader_id = raft.leader_id orelse return error.NoControllerLeader;
+        if (leader_id == self.node_id) return null;
+
+        const peer = self.broker_peers.get(leader_id) orelse return error.UnknownControllerLeaderBroker;
+        var client = RaftClient.init(self.allocator, leader_id, peer.host, peer.port);
+        defer client.deinit();
+
+        return try client.sendRawRequest(request_bytes, self.allocator);
     }
 
     /// Establish internal self-referencing pointers after the Broker struct
@@ -1063,8 +1108,10 @@ pub const Broker = struct {
             log.warn("Scheduled controller-aware rebalance failed: {}", .{err});
         }
 
-        // Periodic S3 flush (if configured)
-        if (self.store.s3_storage != null) {
+        // Periodic legacy data-object flush. S3 WAL mode already writes
+        // durable indexed WAL objects, so duplicating the entire hot cache into
+        // data/ objects on every tick creates object storms and stale overlap.
+        if (self.store.s3_storage != null and !self.store.s3_wal_mode) {
             self.store.flushAllToS3() catch |err| {
                 log.warn("S3 flush failed, will retry: {}", .{err});
                 self.json_logger.log(.warn, "S3 flush failed, will retry", null);
@@ -1467,6 +1514,8 @@ pub const Broker = struct {
         self.clearReplicaDirectoryAssignments();
         self.replica_directory_assignments.deinit();
         self.producer_sequences.deinit();
+        self.clearBrokerPeers();
+        self.broker_peers.deinit();
         self.store.deinit();
         self.groups.deinit();
         self.txn_coordinator.deinit();
@@ -12698,6 +12747,12 @@ pub const Broker = struct {
         const Resp = generated.create_topics_response.CreateTopicsResponse;
         const TopicResult = Resp.CreatableTopicResult;
 
+        if (self.forwardControllerMutationToLeader(request_bytes)) |forwarded| {
+            if (forwarded) |response| return response;
+        } else |err| {
+            log.warn("Failed to forward CreateTopics to controller leader: {}", .{err});
+        }
+
         if (!validateCreateTopicsRequestFrame(request_bytes, body_start, api_version)) {
             log.warn("Malformed CreateTopics request", .{});
             return null;
@@ -16391,6 +16446,12 @@ pub const Broker = struct {
         const Req = generated.delete_topics_request.DeleteTopicsRequest;
         const Resp = generated.delete_topics_response.DeleteTopicsResponse;
         const TopicResult = Resp.DeletableTopicResult;
+
+        if (self.forwardControllerMutationToLeader(request_bytes)) |forwarded| {
+            if (forwarded) |response| return response;
+        } else |err| {
+            log.warn("Failed to forward DeleteTopics to controller leader: {}", .{err});
+        }
 
         if (!validateDeleteTopicsRequestFrame(request_bytes, body_start, api_version)) {
             log.warn("Malformed DeleteTopics request", .{});

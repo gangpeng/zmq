@@ -467,6 +467,9 @@ pub fn main(init: std.process.Init) !void {
             brk.setRaftState(&ctrl.raft_state);
             ctrl.raft_commit_hook = &applyCommittedAutoMqQuorumRecords;
         }
+        if (voters_str) |vs| {
+            parseVotersIntoBrokerPeers(brk, vs, port);
+        }
         if (!process_roles.is_controller) {
             // Broker-only nodes must prove controller registration/heartbeat
             // before accepting produce requests.
@@ -812,6 +815,34 @@ fn parseVotersIntoMetadataClient(mc: *MetadataClient, voters: []const u8) void {
                     const port_str = addr_part[colon + 1 ..];
                     const voter_port = std.fmt.parseInt(u16, port_str, 10) catch continue;
                     mc.addVoter(voter_id, host, voter_port) catch continue;
+                }
+            }
+            start = i + 1;
+        }
+    }
+}
+
+fn parseVotersIntoBrokerPeers(brk: *Broker, voters: []const u8, broker_port: u16) void {
+    // Static controller voter strings do not carry broker listener ports.
+    // Combined-mode Docker/E2E clusters use the same internal broker port on
+    // each node, so use the local broker port with the parsed peer host.
+    var start: usize = 0;
+    for (voters, 0..) |c, i| {
+        if (c == ',' or i == voters.len - 1) {
+            const end = if (c == ',') i else i + 1;
+            const entry = voters[start..end];
+            if (std.mem.indexOf(u8, entry, "@")) |at_pos| {
+                const id_str = entry[0..at_pos];
+                const voter_id = std.fmt.parseInt(i32, id_str, 10) catch {
+                    start = i + 1;
+                    continue;
+                };
+                const addr_part = entry[at_pos + 1 ..];
+                if (std.mem.indexOf(u8, addr_part, ":")) |colon| {
+                    const host = addr_part[0..colon];
+                    brk.addBrokerPeer(voter_id, host, broker_port) catch |err| {
+                        log.warn("Failed to register broker peer {d} at {s}:{d}: {}", .{ voter_id, host, broker_port, err });
+                    };
                 }
             }
             start = i + 1;

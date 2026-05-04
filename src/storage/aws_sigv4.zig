@@ -50,10 +50,13 @@ pub const AwsSigV4 = struct {
 
         const signed_headers = "host;x-amz-content-sha256;x-amz-date";
 
+        const canonical_query = try canonicalQueryString(alloc, query);
+        defer alloc.free(canonical_query);
+
         const canonical_request = try std.fmt.allocPrint(alloc, "{s}\n{s}\n{s}\n{s}\n{s}\n{s}", .{
             method,
             path,
-            query,
+            canonical_query,
             canonical_headers,
             signed_headers,
             payload_hash,
@@ -108,6 +111,47 @@ pub const AwsSigV4 = struct {
 
     /// Hash of empty payload.
     pub const EMPTY_PAYLOAD_HASH = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
+
+    const QueryParam = struct {
+        name: []const u8,
+        value: []const u8,
+    };
+
+    fn canonicalQueryString(alloc: Allocator, query: []const u8) ![]u8 {
+        if (query.len == 0) return try alloc.dupe(u8, "");
+
+        var params = std.array_list.Managed(QueryParam).init(alloc);
+        defer params.deinit();
+
+        var iter = std.mem.splitScalar(u8, query, '&');
+        while (iter.next()) |part| {
+            if (part.len == 0) continue;
+            if (std.mem.indexOfScalar(u8, part, '=')) |eq| {
+                try params.append(.{ .name = part[0..eq], .value = part[eq + 1 ..] });
+            } else {
+                try params.append(.{ .name = part, .value = "" });
+            }
+        }
+
+        std.mem.sort(QueryParam, params.items, {}, struct {
+            fn lessThan(_: void, a: QueryParam, b: QueryParam) bool {
+                const name_order = std.mem.order(u8, a.name, b.name);
+                if (name_order == .lt) return true;
+                if (name_order == .gt) return false;
+                return std.mem.lessThan(u8, a.value, b.value);
+            }
+        }.lessThan);
+
+        var out = std.array_list.Managed(u8).init(alloc);
+        errdefer out.deinit();
+        for (params.items, 0..) |param, i| {
+            if (i > 0) try out.append('&');
+            try out.appendSlice(param.name);
+            try out.append('=');
+            try out.appendSlice(param.value);
+        }
+        return try out.toOwnedSlice();
+    }
 
     /// Get current date/time in ISO 8601 format for AWS.
     pub fn currentDateTime(date_buf: *[8]u8, datetime_buf: *[16]u8) void {
@@ -287,4 +331,60 @@ test "SigV4 with query string" {
     defer testing.allocator.free(auth);
 
     try testing.expect(std.mem.indexOf(u8, auth, "Signature=") != null);
+}
+
+test "SigV4 canonicalizes query parameters before signing" {
+    const signer = AwsSigV4.init("AKID", "SECRET");
+
+    const auth_unsorted = try signer.sign(
+        testing.allocator,
+        "GET",
+        "/bucket",
+        "list-type=2&prefix=wal%2F&continuation-token=next-token",
+        "localhost:9000",
+        AwsSigV4.EMPTY_PAYLOAD_HASH,
+        "20260101",
+        "20260101T000000Z",
+    );
+    defer testing.allocator.free(auth_unsorted);
+
+    const auth_sorted = try signer.sign(
+        testing.allocator,
+        "GET",
+        "/bucket",
+        "continuation-token=next-token&list-type=2&prefix=wal%2F",
+        "localhost:9000",
+        AwsSigV4.EMPTY_PAYLOAD_HASH,
+        "20260101",
+        "20260101T000000Z",
+    );
+    defer testing.allocator.free(auth_sorted);
+
+    try testing.expectEqualStrings(auth_sorted, auth_unsorted);
+
+    const auth_uploads_bare = try signer.sign(
+        testing.allocator,
+        "POST",
+        "/bucket/key",
+        "uploads",
+        "localhost:9000",
+        AwsSigV4.EMPTY_PAYLOAD_HASH,
+        "20260101",
+        "20260101T000000Z",
+    );
+    defer testing.allocator.free(auth_uploads_bare);
+
+    const auth_uploads_empty = try signer.sign(
+        testing.allocator,
+        "POST",
+        "/bucket/key",
+        "uploads=",
+        "localhost:9000",
+        AwsSigV4.EMPTY_PAYLOAD_HASH,
+        "20260101",
+        "20260101T000000Z",
+    );
+    defer testing.allocator.free(auth_uploads_empty);
+
+    try testing.expectEqualStrings(auth_uploads_empty, auth_uploads_bare);
 }

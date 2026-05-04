@@ -773,6 +773,12 @@ pub const S3WalBatcher = struct {
     pending_hw_updates: std.AutoHashMap(u64, u64),
     /// Group commit: number of produce requests waiting on the current batch.
     pending_produce_count: u32 = 0,
+    /// Last wall-clock time the writer scanned S3 for newer WAL epochs.
+    /// Fencing must fail closed, but doing a bucket list before every sync
+    /// produce turns large produce loops into a ListObjects storm.
+    last_epoch_fence_check_ms: i64 = 0,
+    /// Minimum interval between S3 epoch scans on an active writer.
+    epoch_fence_check_interval_ms: i64 = 1000,
 
     pub const BatchEntry = struct {
         stream_id: u64,
@@ -1057,6 +1063,7 @@ pub const S3WalBatcher = struct {
         log.info("S3 WAL epoch updated: {d} -> {d}", .{ self.wal_epoch, new_epoch });
         self.wal_epoch = new_epoch;
         self.is_fenced = false; // Un-fence with new epoch
+        self.last_epoch_fence_check_ms = 0;
     }
 
     /// Get the S3 object key for the current batch (includes epoch for fencing).
@@ -1097,6 +1104,11 @@ pub const S3WalBatcher = struct {
         const StorageT = StorageChild(@TypeOf(s3_storage));
         if (comptime !@hasDecl(StorageT, "listObjectKeys")) return false;
 
+        const now_ms = @import("time_compat").milliTimestamp();
+        if (self.last_epoch_fence_check_ms > 0 and now_ms - self.last_epoch_fence_check_ms < self.epoch_fence_check_interval_ms) {
+            return false;
+        }
+
         const keys = if (comptime StorageT == MockS3Type)
             s3_storage.listObjectKeys(self.allocator, "wal/") catch |err| {
                 self.is_fenced = true;
@@ -1109,6 +1121,7 @@ pub const S3WalBatcher = struct {
                 log.warn("S3 WAL epoch fence check failed: {}", .{err});
                 return true;
             };
+        self.last_epoch_fence_check_ms = now_ms;
         defer {
             for (keys) |key| self.allocator.free(key);
             self.allocator.free(keys);

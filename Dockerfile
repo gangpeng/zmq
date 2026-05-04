@@ -5,9 +5,16 @@
 FROM debian:bookworm-slim AS builder
 
 # Install Zig 0.16.0
+ARG TARGETARCH
+ARG ZIG_VERSION=0.16.0
 RUN apt-get update && apt-get install -y curl xz-utils && \
-    curl -L https://ziglang.org/download/0.16.0/zig-x86_64-linux-0.16.0.tar.xz | tar xJ -C /opt && \
-    ln -s /opt/zig-x86_64-linux-0.16.0/zig /usr/local/bin/zig && \
+    case "$TARGETARCH" in \
+      amd64) zig_arch=x86_64 ;; \
+      arm64) zig_arch=aarch64 ;; \
+      *) echo "unsupported Docker target architecture: $TARGETARCH" >&2; exit 1 ;; \
+    esac && \
+    curl -L "https://ziglang.org/download/${ZIG_VERSION}/zig-${zig_arch}-linux-${ZIG_VERSION}.tar.xz" | tar xJ -C /opt && \
+    ln -s "/opt/zig-${zig_arch}-linux-${ZIG_VERSION}/zig" /usr/local/bin/zig && \
     rm -rf /var/lib/apt/lists/*
 
 WORKDIR /src

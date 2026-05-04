@@ -54,6 +54,7 @@ import time
 import os
 import urllib.request
 import shlex
+import zlib
 
 RUN_ENABLED = sys.argv.count("--self-test") > 0 or os.environ.get("ZMQ_RUN_E2E_TESTS") == "1"
 
@@ -136,13 +137,27 @@ def delete_topic(sock, corr_id, name):
     return struct.unpack_from('>h', data, pos)[0]
 
 
+def build_message_set(payload):
+    """Build a single-message Kafka v0 MessageSet preserving payload as value."""
+    message_body = (
+        struct.pack('>bb', 0, 0)  # magic, attributes
+        + struct.pack('>i', -1)  # null key
+        + struct.pack('>i', len(payload))
+        + payload
+    )
+    crc = zlib.crc32(message_body) & 0xFFFFFFFF
+    message = struct.pack('>I', crc) + message_body
+    return struct.pack('>qi', 0, len(message)) + message
+
+
 def produce(sock, corr_id, topic, partition, record):
-    """Produce v0 — returns (error_code, base_offset)."""
+    """Produce v0 — wraps record as a MessageSet value; returns (error_code, base_offset)."""
     topic_b = topic.encode()
+    message_set = build_message_set(record)
     body = struct.pack('>hi', -1, 30000) + struct.pack('>i', 1)
     body += struct.pack('>h', len(topic_b)) + topic_b
     body += struct.pack('>ii', 1, partition)
-    body += struct.pack('>i', len(record)) + record
+    body += struct.pack('>i', len(message_set)) + message_set
     data = kafka_request(sock, 0, 0, corr_id, body)
     if data is None or len(data) < 20:
         return -1, -1
@@ -569,6 +584,14 @@ def self_test():
     if MINIO_PORT in seen_ports:
         raise AssertionError("MinIO port must not collide with broker/controller/metrics ports")
 
+    payload = b"message-set-payload"
+    message_set = bytearray(build_message_set(payload))
+    if payload not in message_set:
+        raise AssertionError("E2E Produce helper did not preserve payload as MessageSet value")
+    struct.pack_into('>q', message_set, 0, 42)
+    if payload not in message_set:
+        raise AssertionError("broker offset rewrite would corrupt E2E MessageSet payload")
+
     old_env = os.environ.copy()
     try:
         os.environ.pop("ZMQ_E2E_CHAOS_DOWN", None)
@@ -838,11 +861,10 @@ def main():
 
     oc_body = struct.pack('>h', len(b'e2e-group')) + b'e2e-group'
     oc_body += struct.pack('>i', 1)
-    oc_body += struct.pack('>h', len(b'member-1')) + b'member-1'
-    oc_body += struct.pack('>i', 1)
     oc_body += struct.pack('>h', len(b'e2e-topic')) + b'e2e-topic'
     oc_body += struct.pack('>i', 1)
     oc_body += struct.pack('>iq', 0, 500)
+    oc_body += struct.pack('>h', 0)  # committed_metadata
     data = kafka_request(sock_o, 8, 0, t.next(), oc_body)
     t.check("OffsetCommit", data is not None and len(data) >= 4)
 
@@ -902,15 +924,23 @@ def main():
     # =============================================
     print("\n[Test i] Restart recovery")
     subprocess.run(["docker", "start", NODES[0]["container"]], capture_output=True, timeout=30)
-    time.sleep(3)
 
-    try:
-        sock = t.connect(NODES[0]["broker_port"])
-        n = api_versions(sock, t.next())
-        t.check(f"Node 0 restarted and responds ({n} APIs)", n >= 10)
-        sock.close()
-    except Exception as e:
-        t.check("Node 0 restarted", False, str(e))
+    restart_ok = False
+    restart_detail = ""
+    for _ in range(30):
+        try:
+            sock = t.connect(NODES[0]["broker_port"])
+            n = api_versions(sock, t.next())
+            sock.close()
+            if n >= 10:
+                restart_ok = True
+                restart_detail = f"{n} APIs"
+                break
+            restart_detail = f"{n} APIs"
+        except Exception as e:
+            restart_detail = str(e)
+        time.sleep(1)
+    t.check(f"Node 0 restarted and responds ({restart_detail})", restart_ok, restart_detail)
 
     # =============================================
     # Test (j): Metadata consistency across nodes

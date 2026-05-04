@@ -265,11 +265,11 @@ pub const S3Client = struct {
             if (continuation_token) |token| encoded_token = try self.uriEncode(token);
 
             if (encoded_prefix != null and encoded_token != null) {
-                break :blk try std.fmt.allocPrint(self.allocator, "list-type=2&prefix={s}&continuation-token={s}", .{ encoded_prefix.?, encoded_token.? });
+                break :blk try std.fmt.allocPrint(self.allocator, "continuation-token={s}&list-type=2&prefix={s}", .{ encoded_token.?, encoded_prefix.? });
             } else if (encoded_prefix != null) {
                 break :blk try std.fmt.allocPrint(self.allocator, "list-type=2&prefix={s}", .{encoded_prefix.?});
             } else if (encoded_token != null) {
-                break :blk try std.fmt.allocPrint(self.allocator, "list-type=2&continuation-token={s}", .{encoded_token.?});
+                break :blk try std.fmt.allocPrint(self.allocator, "continuation-token={s}&list-type=2", .{encoded_token.?});
             } else {
                 break :blk try self.allocator.dupe(u8, "list-type=2");
             }
@@ -282,7 +282,17 @@ pub const S3Client = struct {
         var response = try self.sendRequest("GET", path, query, null, null, 64 * 1024 * 1024);
         defer response.deinit(self.allocator);
 
-        if (response.status < 200 or response.status >= 300) return error.S3ListFailed;
+        if (response.status < 200 or response.status >= 300) {
+            const body = response.body();
+            const snippet = body[0..@min(body.len, 512)];
+            log.warn("S3 ListObjectsV2 failed status={d} prefix='{s}' continuation_token='{s}' body='{s}'", .{
+                response.status,
+                prefix orelse "",
+                continuation_token orelse "",
+                snippet,
+            });
+            return error.S3ListFailed;
+        }
 
         return try self.responseBodyOwned(&response);
     }
@@ -2009,6 +2019,39 @@ const ListObjectsTestServer = struct {
         ) catch return;
     }
 };
+
+const ListObjectsQueryOrderServer = struct {
+    expected_query: []const u8,
+    page_count: u32 = 0,
+
+    fn request(ctx: *anyopaque, method: []const u8, _: []const u8, query: []const u8, _: ?[]const u8, _: ?[]const u8, resp_buf: []u8) anyerror!u16 {
+        const self: *ListObjectsQueryOrderServer = @ptrCast(@alignCast(ctx));
+        @memset(resp_buf, 0);
+        try testing.expectEqualStrings("GET", method);
+        try testing.expectEqualStrings(self.expected_query, query);
+        self.page_count += 1;
+        ListObjectsTestServer.writeHttpResponse(resp_buf,
+            \\<ListBucketResult>
+            \\  <IsTruncated>false</IsTruncated>
+            \\</ListBucketResult>
+        );
+        return 200;
+    }
+};
+
+test "S3Client ListObjectsV2 pagination query uses canonical order" {
+    var server = ListObjectsQueryOrderServer{
+        .expected_query = "continuation-token=next%20token%2F1&list-type=2&prefix=wal%2F",
+    };
+    var client = S3Client.init(testing.allocator, .{});
+    client.test_http_ctx = &server;
+    client.test_http_request = ListObjectsQueryOrderServer.request;
+
+    const xml = try client.listObjectsPage("wal/", "next token/1");
+    defer testing.allocator.free(xml);
+
+    try testing.expectEqual(@as(u32, 1), server.page_count);
+}
 
 test "S3Storage real-client listing fails closed on truncated page without token" {
     var server = ListObjectsTestServer{ .mode = .missing_continuation_token };

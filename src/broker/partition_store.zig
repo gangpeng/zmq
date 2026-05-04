@@ -56,6 +56,9 @@ pub const PartitionStore = struct {
     use_filesystem: bool,
     /// S3 WAL mode: when true, produce acks only after S3 write completes.
     s3_wal_mode: bool = false,
+    /// Last time this process refreshed ObjectManager state from shared S3 WAL
+    /// objects. This keeps the hot produce path from listing S3 on every batch.
+    last_s3_wal_recovery_ms: i64 = 0,
 
     const FS_WAL_RECORD_MAGIC = [_]u8{ 'Z', 'M', 'Q', 'P', 'W', 'A', 'L', 1 };
     const KAFKA_STORAGE_ERROR: i16 = 56;
@@ -268,6 +271,29 @@ pub const PartitionStore = struct {
         }
 
         return recovered;
+    }
+
+    pub fn refreshS3WalObjects(self: *PartitionStore, force: bool) !bool {
+        if (!self.s3_wal_mode) return false;
+        if (self.object_manager == null or self.s3_storage == null) return false;
+
+        const now_ms = @import("time_compat").milliTimestamp();
+        if (!force and self.last_s3_wal_recovery_ms > 0 and now_ms - self.last_s3_wal_recovery_ms < 250) {
+            return false;
+        }
+
+        const recovered = try self.recoverS3WalObjects();
+        const repaired = self.repairPartitionStatesFromObjectManager();
+        self.last_s3_wal_recovery_ms = now_ms;
+        return recovered > 0 or repaired;
+    }
+
+    fn shouldRefreshS3WalBeforeProduce(self: *PartitionStore, topic: []const u8, partition_id: i32) bool {
+        if (!self.s3_wal_mode) return false;
+        var key_buf: [256]u8 = undefined;
+        const key = partitionKeyBuf(&key_buf, topic, partition_id);
+        const state = self.partitions.get(key) orelse return true;
+        return state.next_offset == 0 and state.high_watermark == 0;
     }
 
     fn rejectOverlappingS3WalRanges(self: *PartitionStore, om: *ObjectManager, key: []const u8, ranges: []const stream_mod.StreamOffsetRange) !void {
@@ -522,6 +548,10 @@ pub const PartitionStore = struct {
 
         try self.ensurePartition(topic, partition_id);
 
+        if (self.s3_wal_mode) {
+            _ = try self.refreshS3WalObjects(self.shouldRefreshS3WalBeforeProduce(topic, partition_id));
+        }
+
         var key_buf: [256]u8 = undefined;
         const key = partitionKeyBuf(&key_buf, topic, partition_id);
 
@@ -768,12 +798,17 @@ pub const PartitionStore = struct {
         var key_buf: [256]u8 = undefined;
         const key = partitionKeyBuf(&key_buf, topic, partition_id);
 
-        const state = self.partitions.get(key) orelse return .{
+        var state = self.partitions.get(key) orelse return .{
             .error_code = 3,
             .records = &.{},
             .high_watermark = 0,
             .last_stable_offset = -1,
         };
+
+        if (self.s3_wal_mode) {
+            _ = try self.refreshS3WalObjects(state.next_offset == 0 or start_offset >= state.next_offset);
+            state = self.partitions.get(key) orelse state;
+        }
 
         // For READ_COMMITTED, cap the visible offset range to last_stable_offset
         // Use LSO (not HW) for READ_COMMITTED isolation.
@@ -782,6 +817,15 @@ pub const PartitionStore = struct {
             state.last_stable_offset // READ_COMMITTED: only up to last stable offset
         else
             state.next_offset; // READ_UNCOMMITTED: all written data
+
+        if (start_offset >= effective_end_offset) {
+            return .{
+                .error_code = 0,
+                .records = &.{},
+                .high_watermark = @intCast(state.high_watermark),
+                .last_stable_offset = @intCast(state.last_stable_offset),
+            };
+        }
 
         const stream_id = hashPartitionKey(topic, partition_id);
 
@@ -833,7 +877,7 @@ pub const PartitionStore = struct {
 
         // Tier 3: Read from S3 via ObjectManager (preferred) or legacy key guessing
         if (self.object_manager) |om| {
-            const s3_metas = om.getObjects(stream_id, start_offset, effective_end_offset, 100) catch &[0]stream_mod.S3ObjectMetadata{};
+            const s3_metas = om.getObjects(stream_id, start_offset, effective_end_offset, 4096) catch &[0]stream_mod.S3ObjectMetadata{};
             defer if (s3_metas.len > 0) self.allocator.free(s3_metas);
 
             if (s3_metas.len > 0) {
@@ -1502,6 +1546,84 @@ test "PartitionStore rebuilds S3 WAL data after local store replacement" {
     try testing.expectEqualStrings("ab", result.records);
 }
 
+test "PartitionStore S3 WAL fetch includes objects beyond first hundred" {
+    var mock_s3 = MockS3.init(testing.allocator);
+    defer mock_s3.deinit();
+    const s3_storage = S3Storage.initMock(testing.allocator, &mock_s3);
+
+    {
+        var producer_store = PartitionStore.init(testing.allocator);
+        defer producer_store.deinit();
+        producer_store.s3_wal_mode = true;
+        producer_store.s3_storage = s3_storage;
+        producer_store.s3_wal_batcher = S3WalBatcher.init(testing.allocator);
+
+        for (0..150) |i| {
+            const payload: []const u8 = if (i == 149) "Z" else "x";
+            const result = try producer_store.produce("s3-many-objects-topic", 0, payload);
+            try testing.expectEqual(@as(i64, @intCast(i)), result.base_offset);
+        }
+    }
+
+    try testing.expectEqual(@as(usize, 150), mock_s3.objectCount());
+
+    var object_manager = ObjectManager.init(testing.allocator, 1);
+    defer object_manager.deinit();
+
+    var replacement_store = PartitionStore.init(testing.allocator);
+    defer replacement_store.deinit();
+    replacement_store.s3_storage = s3_storage;
+    replacement_store.object_manager = &object_manager;
+
+    try testing.expectEqual(@as(u64, 150), try replacement_store.recoverS3WalObjects());
+    try replacement_store.ensurePartition("s3-many-objects-topic", 0);
+    try testing.expect(replacement_store.repairPartitionStatesFromObjectManager());
+
+    const result = try replacement_store.fetch("s3-many-objects-topic", 0, 0, 2048);
+    defer if (result.records.len > 0) testing.allocator.free(@constCast(result.records));
+    try testing.expectEqual(@as(i16, 0), result.error_code);
+    try testing.expectEqual(@as(usize, 150), result.records.len);
+    try testing.expectEqual(@as(u8, 'Z'), result.records[149]);
+}
+
+test "PartitionStore S3 WAL alternating writers refresh offsets and fetch visibility" {
+    var mock_s3 = MockS3.init(testing.allocator);
+    defer mock_s3.deinit();
+    const s3_storage = S3Storage.initMock(testing.allocator, &mock_s3);
+
+    var object_manager_a = ObjectManager.init(testing.allocator, 1);
+    defer object_manager_a.deinit();
+    var object_manager_b = ObjectManager.init(testing.allocator, 2);
+    defer object_manager_b.deinit();
+
+    var store_a = PartitionStore.init(testing.allocator);
+    defer store_a.deinit();
+    store_a.s3_wal_mode = true;
+    store_a.s3_storage = s3_storage;
+    store_a.s3_wal_batcher = S3WalBatcher.init(testing.allocator);
+    store_a.setObjectManager(&object_manager_a);
+
+    var store_b = PartitionStore.init(testing.allocator);
+    defer store_b.deinit();
+    store_b.s3_wal_mode = true;
+    store_b.s3_storage = s3_storage;
+    store_b.s3_wal_batcher = S3WalBatcher.init(testing.allocator);
+    store_b.setObjectManager(&object_manager_b);
+
+    try testing.expectEqual(@as(i64, 0), (try store_a.produce("s3-alternating-topic", 0, "a")).base_offset);
+    try testing.expectEqual(@as(i64, 1), (try store_b.produce("s3-alternating-topic", 0, "b")).base_offset);
+
+    store_a.last_s3_wal_recovery_ms = 0;
+    try testing.expectEqual(@as(i64, 2), (try store_a.produce("s3-alternating-topic", 0, "c")).base_offset);
+
+    store_b.last_s3_wal_recovery_ms = 0;
+    const fetched = try store_b.fetch("s3-alternating-topic", 0, 0, 1024);
+    defer if (fetched.records.len > 0) testing.allocator.free(@constCast(fetched.records));
+    try testing.expectEqual(@as(i16, 0), fetched.error_code);
+    try testing.expectEqual(@as(i64, 3), fetched.high_watermark);
+    try testing.expectEqualStrings("abc", fetched.records);
+}
+
 test "PartitionStore fails S3 WAL recovery on overlapping object ranges" {
     var mock_s3 = MockS3.init(testing.allocator);
     defer mock_s3.deinit();
@@ -1811,6 +1933,57 @@ test "PartitionStore S3 WAL failed sync produce is not visible or retained" {
     try testing.expectEqual(@as(i16, 0), visible.error_code);
     try testing.expectEqual(@as(i64, 1), visible.high_watermark);
     try testing.expectEqualStrings("rec-a", visible.records);
+}
+
+test "PartitionStore S3 WAL hot local produce and fetch do not require repeated S3 listing" {
+    var mock_s3 = MockS3.init(testing.allocator);
+    defer mock_s3.deinit();
+    const s3_storage = S3Storage.initMock(testing.allocator, &mock_s3);
+
+    var object_manager = ObjectManager.init(testing.allocator, 1);
+    defer object_manager.deinit();
+
+    var store = PartitionStore.init(testing.allocator);
+    defer store.deinit();
+    store.s3_wal_mode = true;
+    store.s3_storage = s3_storage;
+    store.s3_wal_batcher = S3WalBatcher.init(testing.allocator);
+    store.setObjectManager(&object_manager);
+
+    const first = try store.produce("hot-local-topic", 0, "a");
+    try testing.expectEqual(@as(i64, 0), first.base_offset);
+
+    mock_s3.failNextListObjects(1);
+
+    const second = try store.produce("hot-local-topic", 0, "b");
+    try testing.expectEqual(@as(i64, 1), second.base_offset);
+
+    const fetched = try store.fetch("hot-local-topic", 0, 0, 1024);
+    defer if (fetched.records.len > 0) testing.allocator.free(@constCast(fetched.records));
+    try testing.expectEqual(@as(i16, 0), fetched.error_code);
+    try testing.expectEqual(@as(i64, 2), fetched.high_watermark);
+    try testing.expectEqualStrings("ab", fetched.records);
+}
+
+test "PartitionStore S3 WAL empty fetch does not probe legacy data objects" {
+    var mock_s3 = MockS3.init(testing.allocator);
+    defer mock_s3.deinit();
+    const s3_storage = S3Storage.initMock(testing.allocator, &mock_s3);
+
+    var object_manager = ObjectManager.init(testing.allocator, 1);
+    defer object_manager.deinit();
+
+    var store = PartitionStore.init(testing.allocator);
+    defer store.deinit();
+    store.s3_wal_mode = true;
+    store.s3_storage = s3_storage;
+    store.setObjectManager(&object_manager);
+
+    try store.ensurePartition("__consumer_offsets", 17);
+    const fetched = try store.fetch("__consumer_offsets", 17, 0, 1024);
+    try testing.expectEqual(@as(i16, 0), fetched.error_code);
+    try testing.expectEqual(@as(usize, 0), fetched.records.len);
+    try testing.expectEqual(@as(u64, 0), mock_s3.get_count);
 }
 
 test "PartitionStore produce offset increments correctly" {
