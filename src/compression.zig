@@ -8,7 +8,6 @@
 /// - Zstd (4): native Zig implementation (simple framing)
 ///
 /// For production, add C FFI to libsnappy/liblz4/libzstd for optimal performance.
-
 const std = @import("std");
 const testing = std.testing;
 const Allocator = std.mem.Allocator;
@@ -124,60 +123,62 @@ fn decompressSnappy(alloc: Allocator, data: []const u8) ![]u8 {
 
         switch (tag_type) {
             0 => { // Literal
-                var lit_len: usize = @as(usize, tag >> 2) + 1;
-                if (lit_len == 61) {
-                    if (pos >= data.len) break;
-                    lit_len = @as(usize, data[pos]) + 1;
-                    pos += 1;
-                } else if (lit_len == 62) {
-                    if (pos + 2 > data.len) break;
-                    lit_len = std.mem.readInt(u16, data[pos..][0..2], .little) + 1;
-                    pos += 2;
+                const len_code: u8 = tag >> 2;
+                var lit_len: usize = 0;
+                if (len_code < 60) {
+                    lit_len = @as(usize, len_code) + 1;
+                } else {
+                    const extra_len: usize = @as(usize, len_code) - 59;
+                    if (pos + extra_len > data.len) return error.InvalidData;
+                    var encoded_len: usize = 0;
+                    for (0..extra_len) |i| {
+                        encoded_len |= @as(usize, data[pos + i]) << @intCast(8 * i);
+                    }
+                    pos += extra_len;
+                    lit_len = encoded_len + 1;
                 }
-                if (pos + lit_len > data.len or out_pos + lit_len > uncompressed_len) break;
+                if (pos + lit_len > data.len or out_pos + lit_len > uncompressed_len) return error.InvalidData;
                 @memcpy(output[out_pos .. out_pos + lit_len], data[pos .. pos + lit_len]);
                 pos += lit_len;
                 out_pos += lit_len;
             },
             1 => { // Copy with 1-byte offset
                 const length: usize = @as(usize, (tag >> 2) & 0x07) + 4;
-                if (pos >= data.len) break;
+                if (pos >= data.len) return error.InvalidData;
                 const offset: usize = (@as(usize, tag & 0xe0) << 3) | @as(usize, data[pos]);
                 pos += 1;
-                if (offset == 0 or offset > out_pos) break;
+                if (offset == 0 or offset > out_pos or out_pos + length > uncompressed_len) return error.InvalidData;
                 for (0..length) |i| {
-                    if (out_pos + i >= uncompressed_len) break;
                     output[out_pos + i] = output[out_pos + i - offset];
                 }
-                out_pos += @min(length, uncompressed_len - out_pos);
+                out_pos += length;
             },
             2 => { // Copy with 2-byte offset
                 const length: usize = @as(usize, tag >> 2) + 1;
-                if (pos + 2 > data.len) break;
+                if (pos + 2 > data.len) return error.InvalidData;
                 const offset: usize = std.mem.readInt(u16, data[pos..][0..2], .little);
                 pos += 2;
-                if (offset == 0 or offset > out_pos) break;
+                if (offset == 0 or offset > out_pos or out_pos + length > uncompressed_len) return error.InvalidData;
                 for (0..length) |i| {
-                    if (out_pos + i >= uncompressed_len) break;
                     output[out_pos + i] = output[out_pos + i - offset];
                 }
-                out_pos += @min(length, uncompressed_len - out_pos);
+                out_pos += length;
             },
             3 => { // Copy with 4-byte offset
                 const length: usize = @as(usize, tag >> 2) + 1;
-                if (pos + 4 > data.len) break;
+                if (pos + 4 > data.len) return error.InvalidData;
                 const offset: usize = std.mem.readInt(u32, data[pos..][0..4], .little);
                 pos += 4;
-                if (offset == 0 or offset > out_pos) break;
+                if (offset == 0 or offset > out_pos or out_pos + length > uncompressed_len) return error.InvalidData;
                 for (0..length) |i| {
-                    if (out_pos + i >= uncompressed_len) break;
                     output[out_pos + i] = output[out_pos + i - offset];
                 }
-                out_pos += @min(length, uncompressed_len - out_pos);
+                out_pos += length;
             },
         }
     }
 
+    if (out_pos != uncompressed_len or pos != data.len) return error.InvalidData;
     return output;
 }
 
@@ -199,7 +200,9 @@ fn decompressLz4(alloc: Allocator, data: []const u8) ![]u8 {
     if (data.len < 4) return error.InvalidData;
 
     // Kafka LZ4: [i32 decompressed_size] [lz4 block data]
-    const decompressed_size: usize = @intCast(std.mem.readInt(i32, data[0..4], .big));
+    const decompressed_size_i32 = std.mem.readInt(i32, data[0..4], .big);
+    if (decompressed_size_i32 < 0) return error.InvalidData;
+    const decompressed_size: usize = @intCast(decompressed_size_i32);
     const compressed = data[4..];
 
     if (decompressed_size == compressed.len) {
@@ -220,16 +223,21 @@ fn decompressLz4(alloc: Allocator, data: []const u8) ![]u8 {
         // Literal length
         var lit_len: usize = @as(usize, token >> 4);
         if (lit_len == 15) {
+            var terminated = false;
             while (in_pos < compressed.len) {
                 const extra = compressed[in_pos];
                 in_pos += 1;
                 lit_len += extra;
-                if (extra != 255) break;
+                if (extra != 255) {
+                    terminated = true;
+                    break;
+                }
             }
+            if (!terminated) return error.InvalidData;
         }
 
         // Copy literals
-        if (in_pos + lit_len > compressed.len or out_pos + lit_len > decompressed_size) break;
+        if (in_pos + lit_len > compressed.len or out_pos + lit_len > decompressed_size) return error.InvalidData;
         @memcpy(output[out_pos .. out_pos + lit_len], compressed[in_pos .. in_pos + lit_len]);
         in_pos += lit_len;
         out_pos += lit_len;
@@ -237,31 +245,36 @@ fn decompressLz4(alloc: Allocator, data: []const u8) ![]u8 {
         if (out_pos >= decompressed_size) break;
 
         // Match offset
-        if (in_pos + 2 > compressed.len) break;
+        if (in_pos + 2 > compressed.len) return error.InvalidData;
         const offset: usize = std.mem.readInt(u16, compressed[in_pos..][0..2], .little);
         in_pos += 2;
-        if (offset == 0) break;
+        if (offset == 0) return error.InvalidData;
 
         // Match length
         var match_len: usize = @as(usize, token & 0x0F) + 4; // minmatch = 4
         if ((token & 0x0F) == 15) {
+            var terminated = false;
             while (in_pos < compressed.len) {
                 const extra = compressed[in_pos];
                 in_pos += 1;
                 match_len += extra;
-                if (extra != 255) break;
+                if (extra != 255) {
+                    terminated = true;
+                    break;
+                }
             }
+            if (!terminated) return error.InvalidData;
         }
 
         // Copy match (may overlap)
-        if (offset > out_pos) break;
-        const copy_len = @min(match_len, decompressed_size - out_pos);
-        for (0..copy_len) |i| {
+        if (offset > out_pos or out_pos + match_len > decompressed_size) return error.InvalidData;
+        for (0..match_len) |i| {
             output[out_pos + i] = output[out_pos + i - offset];
         }
-        out_pos += copy_len;
+        out_pos += match_len;
     }
 
+    if (out_pos != decompressed_size or in_pos != compressed.len) return error.InvalidData;
     return output;
 }
 
@@ -401,4 +414,29 @@ test "snappy larger data" {
     const d = try decompress(testing.allocator, .snappy, c);
     defer testing.allocator.free(d);
     try testing.expectEqualStrings(data, d);
+}
+
+test "snappy malformed streams fail closed" {
+    const truncated_literal = [_]u8{ 0x05, 0x08, 'a', 'b' };
+    try testing.expectError(error.InvalidData, decompress(testing.allocator, .snappy, &truncated_literal));
+
+    const invalid_copy_offset = [_]u8{ 0x04, 0x01, 0x00 };
+    try testing.expectError(error.InvalidData, decompress(testing.allocator, .snappy, &invalid_copy_offset));
+
+    const trailing_bytes = [_]u8{ 0x00, 0x00 };
+    try testing.expectError(error.InvalidData, decompress(testing.allocator, .snappy, &trailing_bytes));
+}
+
+test "lz4 malformed streams fail closed" {
+    const negative_size = [_]u8{ 0xff, 0xff, 0xff, 0xff };
+    try testing.expectError(error.InvalidData, decompress(testing.allocator, .lz4, &negative_size));
+
+    const truncated_literal = [_]u8{ 0x00, 0x00, 0x00, 0x05, 0x50, 'a', 'b' };
+    try testing.expectError(error.InvalidData, decompress(testing.allocator, .lz4, &truncated_literal));
+
+    const invalid_match_offset = [_]u8{ 0x00, 0x00, 0x00, 0x05, 0x01, 0x00, 0x00 };
+    try testing.expectError(error.InvalidData, decompress(testing.allocator, .lz4, &invalid_match_offset));
+
+    const trailing_bytes = [_]u8{ 0x00, 0x00, 0x00, 0x01, 0x10, 'a', 0x00 };
+    try testing.expectError(error.InvalidData, decompress(testing.allocator, .lz4, &trailing_bytes));
 }
