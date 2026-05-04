@@ -319,6 +319,14 @@
         {
           "expr": "sum(rate(kafka_network_requestmetrics_responsesendtimems_total[5m])) by (request)",
           "legendFormat": "{{request}} response send ms"
+        },
+        {
+          "expr": "kafka_network_requestchannel_requestqueuesize",
+          "legendFormat": "request queue size"
+        },
+        {
+          "expr": "kafka_network_requestchannel_responsequeuesize",
+          "legendFormat": "response queue size"
         }
       ],
       "title": "JMX Request Metrics",
@@ -401,6 +409,14 @@
         {
           "expr": "kafka_server_replicamanager_underreplicatedpartitions",
           "legendFormat": "under-replicated"
+        },
+        {
+          "expr": "kafka_server_replicamanager_underminisrpartitioncount",
+          "legendFormat": "under min ISR"
+        },
+        {
+          "expr": "kafka_server_replicamanager_atminisrpartitioncount",
+          "legendFormat": "at min ISR"
         },
         {
           "expr": "kafka_server_replicamanager_offlinepartitionscount",

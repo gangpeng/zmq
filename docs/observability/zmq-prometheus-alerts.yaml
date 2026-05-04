@@ -84,6 +84,15 @@ groups:
           summary: ZMQ network processor idle ratio is low.
           description: Sustained low network-processor idle time indicates network saturation.
 
+      - alert: ZMQRequestChannelBacklog
+        expr: kafka_network_requestchannel_requestqueuesize + kafka_network_requestchannel_responsequeuesize > 1000
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: ZMQ request channel backlog is high.
+          description: Request or response queues are accumulating faster than broker workers can drain them.
+
       - alert: ZMQOfflinePartitions
         expr: kafka_server_replicamanager_offlinepartitionscount > 0
         for: 1m
@@ -101,6 +110,15 @@ groups:
         annotations:
           summary: ZMQ replica manager reports under-replicated partitions.
           description: Replication lag can reduce durability during broker failure.
+
+      - alert: ZMQUnderMinIsrPartitions
+        expr: kafka_server_replicamanager_underminisrpartitioncount > 0
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: ZMQ replica manager reports partitions below min ISR.
+          description: Produce with acks=all can fail and durability is degraded while partitions are below min ISR.
 
       - alert: ZMQPartitionReassignmentStuck
         expr: kafka_server_replicamanager_reassigningpartitions > 0
