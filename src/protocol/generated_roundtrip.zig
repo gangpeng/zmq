@@ -1855,6 +1855,89 @@ test "generated non-default golden fixtures cover legacy and flexible wire encod
     }
 
     {
+        const ShareAcknowledgeRequest = generated.share_acknowledge_request.ShareAcknowledgeRequest;
+        const acknowledgement_batches = [_]ShareAcknowledgeRequest.AcknowledgeTopic.AcknowledgePartition.AcknowledgementBatch{.{
+            .first_offset = 5,
+            .last_offset = 7,
+            .acknowledge_types = &[_]i8{ 1, 3 },
+        }};
+        const partitions = [_]ShareAcknowledgeRequest.AcknowledgeTopic.AcknowledgePartition{.{
+            .partition_index = 0,
+            .acknowledgement_batches = &acknowledgement_batches,
+        }};
+        const topics = [_]ShareAcknowledgeRequest.AcknowledgeTopic{.{
+            .topic_id = .{
+                0x20, 0x21, 0x22, 0x23,
+                0x24, 0x25, 0x26, 0x27,
+                0x28, 0x29, 0x2a, 0x2b,
+                0x2c, 0x2d, 0x2e, 0x2f,
+            },
+            .partitions = &partitions,
+        }};
+        const value = ShareAcknowledgeRequest{
+            .group_id = "share-g",
+            .member_id = "member-1",
+            .share_session_epoch = 2,
+            .topics = &topics,
+        };
+        try expectGoldenRoundTrip(ShareAcknowledgeRequest, value, 0, &[_]u8{
+            0x08, 0x73, 0x68, 0x61, 0x72, 0x65, 0x2d, 0x67,
+            0x09, 0x6d, 0x65, 0x6d, 0x62, 0x65, 0x72, 0x2d,
+            0x31, 0x00, 0x00, 0x00, 0x02, 0x02, 0x20, 0x21,
+            0x22, 0x23, 0x24, 0x25, 0x26, 0x27, 0x28, 0x29,
+            0x2a, 0x2b, 0x2c, 0x2d, 0x2e, 0x2f, 0x02, 0x00,
+            0x00, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x05, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x07, 0x03, 0x01, 0x03, 0x00,
+            0x00, 0x00, 0x00,
+        });
+    }
+
+    {
+        const ShareAcknowledgeResponse = generated.share_acknowledge_response.ShareAcknowledgeResponse;
+        const partition_data = [_]ShareAcknowledgeResponse.ShareAcknowledgeTopicResponse.PartitionData{.{
+            .partition_index = 0,
+            .error_code = 6,
+            .error_message = "fenced",
+            .current_leader = .{ .leader_id = 2, .leader_epoch = 9 },
+        }};
+        const responses = [_]ShareAcknowledgeResponse.ShareAcknowledgeTopicResponse{.{
+            .topic_id = .{
+                0x20, 0x21, 0x22, 0x23,
+                0x24, 0x25, 0x26, 0x27,
+                0x28, 0x29, 0x2a, 0x2b,
+                0x2c, 0x2d, 0x2e, 0x2f,
+            },
+            .partitions = &partition_data,
+        }};
+        const node_endpoints = [_]ShareAcknowledgeResponse.NodeEndpoint{.{
+            .node_id = 2,
+            .host = "broker-2",
+            .port = 19092,
+            .rack = "az-a",
+        }};
+        const value = ShareAcknowledgeResponse{
+            .throttle_time_ms = 4,
+            .error_code = 0,
+            .error_message = "ack-ok",
+            .responses = &responses,
+            .node_endpoints = &node_endpoints,
+        };
+        try expectGoldenRoundTrip(ShareAcknowledgeResponse, value, 0, &[_]u8{
+            0x00, 0x00, 0x00, 0x04, 0x00, 0x00, 0x07, 0x61,
+            0x63, 0x6b, 0x2d, 0x6f, 0x6b, 0x02, 0x20, 0x21,
+            0x22, 0x23, 0x24, 0x25, 0x26, 0x27, 0x28, 0x29,
+            0x2a, 0x2b, 0x2c, 0x2d, 0x2e, 0x2f, 0x02, 0x00,
+            0x00, 0x00, 0x00, 0x00, 0x06, 0x07, 0x66, 0x65,
+            0x6e, 0x63, 0x65, 0x64, 0x00, 0x00, 0x00, 0x02,
+            0x00, 0x00, 0x00, 0x09, 0x00, 0x00, 0x00, 0x02,
+            0x00, 0x00, 0x00, 0x02, 0x09, 0x62, 0x72, 0x6f,
+            0x6b, 0x65, 0x72, 0x2d, 0x32, 0x00, 0x00, 0x4a,
+            0x94, 0x05, 0x61, 0x7a, 0x2d, 0x61, 0x00, 0x00,
+        });
+    }
+
+    {
         const AlterPartitionReassignmentsRequest = generated.alter_partition_reassignments_request.AlterPartitionReassignmentsRequest;
         const null_partitions = [_]AlterPartitionReassignmentsRequest.ReassignableTopic.ReassignablePartition{.{
             .partition_index = 0,
