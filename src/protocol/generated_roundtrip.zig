@@ -4786,6 +4786,164 @@ test "generated non-default golden fixtures cover legacy and flexible wire encod
     }
 
     {
+        const ConsumerGroupHeartbeatResponseModule = generated.consumer_group_heartbeat_response;
+        const ConsumerGroupHeartbeatResponse = ConsumerGroupHeartbeatResponseModule.ConsumerGroupHeartbeatResponse;
+        const topic_partitions = [_]ConsumerGroupHeartbeatResponseModule.TopicPartitions{.{
+            .topic_id = .{
+                0x10, 0x11, 0x12, 0x13,
+                0x14, 0x15, 0x16, 0x17,
+                0x18, 0x19, 0x1a, 0x1b,
+                0x1c, 0x1d, 0x1e, 0x1f,
+            },
+            .partitions = &[_]i32{ 0, 2 },
+        }};
+        const value = ConsumerGroupHeartbeatResponse{
+            .throttle_time_ms = 5,
+            .error_code = 0,
+            .error_message = null,
+            .member_id = "member-1",
+            .member_epoch = 3,
+            .heartbeat_interval_ms = 1500,
+            .assignment = .{ .topic_partitions = &topic_partitions },
+        };
+        try expectGoldenRoundTrip(ConsumerGroupHeartbeatResponse, value, 0, &[_]u8{
+            0x00, 0x00, 0x00, 0x05, 0x00, 0x00, 0x00, 0x09,
+            0x6d, 0x65, 0x6d, 0x62, 0x65, 0x72, 0x2d, 0x31,
+            0x00, 0x00, 0x00, 0x03, 0x00, 0x00, 0x05, 0xdc,
+            0x01, 0x02, 0x10, 0x11, 0x12, 0x13, 0x14, 0x15,
+            0x16, 0x17, 0x18, 0x19, 0x1a, 0x1b, 0x1c, 0x1d,
+            0x1e, 0x1f, 0x03, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x02, 0x00, 0x00, 0x00,
+        });
+    }
+
+    {
+        const ShareGroupHeartbeatResponseModule = generated.share_group_heartbeat_response;
+        const ShareGroupHeartbeatResponse = ShareGroupHeartbeatResponseModule.ShareGroupHeartbeatResponse;
+        const topic_partitions = [_]ShareGroupHeartbeatResponseModule.TopicPartitions{.{
+            .topic_id = .{
+                0x40, 0x41, 0x42, 0x43,
+                0x44, 0x45, 0x46, 0x47,
+                0x48, 0x49, 0x4a, 0x4b,
+                0x4c, 0x4d, 0x4e, 0x4f,
+            },
+            .partitions = &[_]i32{ 1, 3 },
+        }};
+        const value = ShareGroupHeartbeatResponse{
+            .throttle_time_ms = 6,
+            .error_code = 0,
+            .error_message = "ok",
+            .member_id = "share-member",
+            .member_epoch = 4,
+            .heartbeat_interval_ms = 1000,
+            .assignment = .{ .topic_partitions = &topic_partitions },
+        };
+        try expectGoldenRoundTrip(ShareGroupHeartbeatResponse, value, 0, &[_]u8{
+            0x00, 0x00, 0x00, 0x06, 0x00, 0x00, 0x03, 0x6f,
+            0x6b, 0x0d, 0x73, 0x68, 0x61, 0x72, 0x65, 0x2d,
+            0x6d, 0x65, 0x6d, 0x62, 0x65, 0x72, 0x00, 0x00,
+            0x00, 0x04, 0x00, 0x00, 0x03, 0xe8, 0x01, 0x02,
+            0x40, 0x41, 0x42, 0x43, 0x44, 0x45, 0x46, 0x47,
+            0x48, 0x49, 0x4a, 0x4b, 0x4c, 0x4d, 0x4e, 0x4f,
+            0x03, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00,
+            0x03, 0x00, 0x00, 0x00,
+        });
+    }
+
+    {
+        const ShareGroupDescribeRequest = generated.share_group_describe_request.ShareGroupDescribeRequest;
+        const group_ids = [_]?[]const u8{ "share-a", null, "share-b" };
+        const value = ShareGroupDescribeRequest{
+            .group_ids = &group_ids,
+            .include_authorized_operations = true,
+        };
+        try expectGoldenRoundTrip(ShareGroupDescribeRequest, value, 0, &[_]u8{
+            0x04, 0x08, 0x73, 0x68, 0x61, 0x72, 0x65, 0x2d,
+            0x61, 0x00, 0x08, 0x73, 0x68, 0x61, 0x72, 0x65,
+            0x2d, 0x62, 0x01, 0x00,
+        });
+    }
+
+    {
+        const ShareGroupDescribeResponseModule = generated.share_group_describe_response;
+        const ShareGroupDescribeResponse = ShareGroupDescribeResponseModule.ShareGroupDescribeResponse;
+        const topic_partitions = [_]ShareGroupDescribeResponseModule.TopicPartitions{.{
+            .topic_id = .{
+                0x50, 0x51, 0x52, 0x53,
+                0x54, 0x55, 0x56, 0x57,
+                0x58, 0x59, 0x5a, 0x5b,
+                0x5c, 0x5d, 0x5e, 0x5f,
+            },
+            .topic_name = "topic-a",
+            .partitions = &[_]i32{ 0, 1 },
+        }};
+        const subscribed_topic_names = [_]?[]const u8{ "topic-a", "topic-b" };
+        const assignment = ShareGroupDescribeResponseModule.Assignment{
+            .topic_partitions = &topic_partitions,
+        };
+        const members = [_]ShareGroupDescribeResponse.DescribedGroup.Member{.{
+            .member_id = "mem-1",
+            .rack_id = "rack-a",
+            .member_epoch = 5,
+            .client_id = "client-1",
+            .client_host = "/127.0.0.1",
+            .subscribed_topic_names = &subscribed_topic_names,
+            .assignment = assignment,
+        }};
+        const groups = [_]ShareGroupDescribeResponse.DescribedGroup{
+            .{
+                .error_code = 0,
+                .error_message = null,
+                .group_id = "share-a",
+                .group_state = "Stable",
+                .group_epoch = 5,
+                .assignment_epoch = 6,
+                .assignor_name = "range",
+                .members = &members,
+                .authorized_operations = 3,
+            },
+            .{
+                .error_code = 69,
+                .error_message = "missing",
+                .group_id = "missing",
+                .group_state = "",
+                .group_epoch = 0,
+                .assignment_epoch = 0,
+                .assignor_name = null,
+                .members = &.{},
+            },
+        };
+        const value = ShareGroupDescribeResponse{
+            .throttle_time_ms = 9,
+            .groups = &groups,
+        };
+        try expectGoldenRoundTrip(ShareGroupDescribeResponse, value, 0, &[_]u8{
+            0x00, 0x00, 0x00, 0x09, 0x03, 0x00, 0x00, 0x00,
+            0x08, 0x73, 0x68, 0x61, 0x72, 0x65, 0x2d, 0x61,
+            0x07, 0x53, 0x74, 0x61, 0x62, 0x6c, 0x65, 0x00,
+            0x00, 0x00, 0x05, 0x00, 0x00, 0x00, 0x06, 0x06,
+            0x72, 0x61, 0x6e, 0x67, 0x65, 0x02, 0x06, 0x6d,
+            0x65, 0x6d, 0x2d, 0x31, 0x07, 0x72, 0x61, 0x63,
+            0x6b, 0x2d, 0x61, 0x00, 0x00, 0x00, 0x05, 0x09,
+            0x63, 0x6c, 0x69, 0x65, 0x6e, 0x74, 0x2d, 0x31,
+            0x0b, 0x2f, 0x31, 0x32, 0x37, 0x2e, 0x30, 0x2e,
+            0x30, 0x2e, 0x31, 0x03, 0x08, 0x74, 0x6f, 0x70,
+            0x69, 0x63, 0x2d, 0x61, 0x08, 0x74, 0x6f, 0x70,
+            0x69, 0x63, 0x2d, 0x62, 0x02, 0x50, 0x51, 0x52,
+            0x53, 0x54, 0x55, 0x56, 0x57, 0x58, 0x59, 0x5a,
+            0x5b, 0x5c, 0x5d, 0x5e, 0x5f, 0x08, 0x74, 0x6f,
+            0x70, 0x69, 0x63, 0x2d, 0x61, 0x03, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00, 0x03, 0x00, 0x00, 0x45,
+            0x08, 0x6d, 0x69, 0x73, 0x73, 0x69, 0x6e, 0x67,
+            0x08, 0x6d, 0x69, 0x73, 0x73, 0x69, 0x6e, 0x67,
+            0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x01, 0x80, 0x00, 0x00, 0x00, 0x00,
+            0x00,
+        });
+    }
+
+    {
         const ShareFetchRequest = generated.share_fetch_request.ShareFetchRequest;
         const acknowledgement_batches = [_]ShareFetchRequest.FetchTopic.FetchPartition.AcknowledgementBatch{.{
             .first_offset = 5,
