@@ -6647,6 +6647,431 @@ test "generated non-default golden fixtures cover legacy and flexible wire encod
             0x00,
         });
     }
+
+    {
+        const CreateStreamsRequest = generated.create_streams_request.CreateStreamsRequest;
+        const tags = [_]CreateStreamsRequest.CreateStreamRequest.Tag{.{
+            .key = "k",
+            .value = "v",
+        }};
+        const requests = [_]CreateStreamsRequest.CreateStreamRequest{.{
+            .node_id = 8,
+            .tags = &tags,
+        }};
+        const value = CreateStreamsRequest{
+            .node_id = 7,
+            .node_epoch = 9,
+            .create_stream_requests = &requests,
+        };
+        try expectGoldenRoundTrip(CreateStreamsRequest, value, 1, &[_]u8{
+            0x00, 0x00, 0x00, 0x07, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x09, 0x02, 0x00, 0x00, 0x00,
+            0x08, 0x02, 0x02, 0x6b, 0x02, 0x76, 0x00, 0x00,
+            0x00,
+        });
+    }
+
+    {
+        const CreateStreamsResponse = generated.create_streams_response.CreateStreamsResponse;
+        const responses = [_]CreateStreamsResponse.CreateStreamResponse{.{
+            .stream_id = 101,
+        }};
+        const value = CreateStreamsResponse{
+            .throttle_time_ms = 1,
+            .create_stream_responses = &responses,
+        };
+        try expectGoldenRoundTrip(CreateStreamsResponse, value, 1, &[_]u8{
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x02, 0x00,
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x65, 0x00, 0x00,
+        });
+    }
+
+    {
+        const OpenStreamsRequest = generated.open_streams_request.OpenStreamsRequest;
+        const tags = [_]OpenStreamsRequest.OpenStreamRequest.Tag{.{
+            .key = "k",
+            .value = "v",
+        }};
+        const requests = [_]OpenStreamsRequest.OpenStreamRequest{.{
+            .stream_id = 101,
+            .stream_epoch = 2,
+            .tags = &tags,
+        }};
+        const value = OpenStreamsRequest{
+            .node_id = 7,
+            .node_epoch = 9,
+            .open_stream_requests = &requests,
+        };
+        try expectGoldenRoundTrip(OpenStreamsRequest, value, 1, &[_]u8{
+            0x00, 0x00, 0x00, 0x07, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x09, 0x02, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00, 0x65, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00, 0x02, 0x02, 0x02, 0x6b,
+            0x02, 0x76, 0x00, 0x00, 0x00,
+        });
+    }
+
+    {
+        const OpenStreamsResponse = generated.open_streams_response.OpenStreamsResponse;
+        const responses = [_]OpenStreamsResponse.OpenStreamResponse{.{
+            .start_offset = 3,
+            .next_offset = 4,
+        }};
+        const value = OpenStreamsResponse{
+            .throttle_time_ms = 2,
+            .open_stream_responses = &responses,
+        };
+        try expectGoldenRoundTrip(OpenStreamsResponse, value, 1, &[_]u8{
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x02, 0x02, 0x00,
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x03, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x04, 0x00, 0x00,
+        });
+    }
+
+    {
+        const CloseStreamsRequest = generated.close_streams_request.CloseStreamsRequest;
+        const requests = [_]CloseStreamsRequest.CloseStreamRequest{.{
+            .stream_id = 101,
+            .stream_epoch = 2,
+        }};
+        const value = CloseStreamsRequest{
+            .node_id = 7,
+            .node_epoch = 9,
+            .close_stream_requests = &requests,
+        };
+        try expectGoldenRoundTrip(CloseStreamsRequest, value, 0, &[_]u8{
+            0x00, 0x00, 0x00, 0x07, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x09, 0x02, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00, 0x65, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00, 0x02, 0x00, 0x00,
+        });
+    }
+
+    {
+        const CloseStreamsResponse = generated.close_streams_response.CloseStreamsResponse;
+        const responses = [_]CloseStreamsResponse.CloseStreamResponse{.{
+            .error_code = 42,
+        }};
+        const value = CloseStreamsResponse{
+            .throttle_time_ms = 3,
+            .close_stream_responses = &responses,
+        };
+        try expectGoldenRoundTrip(CloseStreamsResponse, value, 0, &[_]u8{
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x03, 0x02, 0x00,
+            0x2a, 0x00, 0x00,
+        });
+    }
+
+    {
+        const DeleteStreamsRequest = generated.delete_streams_request.DeleteStreamsRequest;
+        const requests = [_]DeleteStreamsRequest.DeleteStreamRequest{.{
+            .stream_id = 101,
+            .stream_epoch = 2,
+        }};
+        const value = DeleteStreamsRequest{
+            .node_id = 7,
+            .node_epoch = 9,
+            .delete_stream_requests = &requests,
+        };
+        try expectGoldenRoundTrip(DeleteStreamsRequest, value, 0, &[_]u8{
+            0x00, 0x00, 0x00, 0x07, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x09, 0x02, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00, 0x65, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00, 0x02, 0x00, 0x00,
+        });
+    }
+
+    {
+        const DeleteStreamsResponse = generated.delete_streams_response.DeleteStreamsResponse;
+        const responses = [_]DeleteStreamsResponse.DeleteStreamResponse{.{
+            .error_code = 42,
+        }};
+        const value = DeleteStreamsResponse{
+            .throttle_time_ms = 4,
+            .delete_stream_responses = &responses,
+        };
+        try expectGoldenRoundTrip(DeleteStreamsResponse, value, 0, &[_]u8{
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x04, 0x02, 0x00,
+            0x2a, 0x00, 0x00,
+        });
+    }
+
+    {
+        const PrepareS3ObjectRequest = generated.prepare_s3_object_request.PrepareS3ObjectRequest;
+        const value = PrepareS3ObjectRequest{
+            .node_id = 7,
+            .prepared_count = 2,
+            .time_to_live_in_ms = 1000,
+        };
+        try expectGoldenRoundTrip(PrepareS3ObjectRequest, value, 0, &[_]u8{
+            0x00, 0x00, 0x00, 0x07, 0x00, 0x00, 0x00, 0x02,
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x03, 0xe8,
+            0x00,
+        });
+    }
+
+    {
+        const PrepareS3ObjectResponse = generated.prepare_s3_object_response.PrepareS3ObjectResponse;
+        const value = PrepareS3ObjectResponse{
+            .throttle_time_ms = 5,
+            .first_s3_object_id = 100,
+        };
+        try expectGoldenRoundTrip(PrepareS3ObjectResponse, value, 0, &[_]u8{
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x05, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x64, 0x00,
+        });
+    }
+
+    {
+        const CommitStreamSetObjectRequest = generated.commit_stream_set_object_request.CommitStreamSetObjectRequest;
+        const ranges = [_]CommitStreamSetObjectRequest.ObjectStreamRange{.{
+            .stream_id = 101,
+            .stream_epoch = 2,
+            .start_offset = 3,
+            .end_offset = 4,
+        }};
+        const stream_objects = [_]CommitStreamSetObjectRequest.StreamObject{.{
+            .object_id = 102,
+            .object_size = 13,
+            .stream_id = 101,
+            .start_offset = 3,
+            .end_offset = 4,
+            .attributes = 5,
+        }};
+        const value = CommitStreamSetObjectRequest{
+            .node_id = 7,
+            .node_epoch = 9,
+            .object_id = 100,
+            .order_id = 11,
+            .object_size = 12,
+            .object_stream_ranges = &ranges,
+            .stream_objects = &stream_objects,
+            .compacted_object_ids = &[_]i64{ 90, 91 },
+            .failover_mode = true,
+            .attributes = 6,
+        };
+        try expectGoldenRoundTrip(CommitStreamSetObjectRequest, value, 1, &[_]u8{
+            0x00, 0x00, 0x00, 0x07, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x09, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x64, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x0b, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x0c, 0x02, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00, 0x65, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00, 0x03, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00, 0x04, 0x00, 0x02, 0x00,
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x66, 0x00,
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x0d, 0x00,
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x65, 0x00,
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x03, 0x00,
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x04, 0x00,
+            0x00, 0x00, 0x05, 0x00, 0x03, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00, 0x5a, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00, 0x5b, 0x01, 0x00, 0x00,
+            0x00, 0x06, 0x00,
+        });
+    }
+
+    {
+        const CommitStreamSetObjectResponse = generated.commit_stream_set_object_response.CommitStreamSetObjectResponse;
+        const value = CommitStreamSetObjectResponse{
+            .throttle_time_ms = 6,
+            .attributes = 7,
+        };
+        try expectGoldenRoundTrip(CommitStreamSetObjectResponse, value, 1, &[_]u8{
+            0x00, 0x00, 0x00, 0x00,
+            0x00, 0x06, 0x00, 0x00,
+            0x00, 0x07, 0x00,
+        });
+    }
+
+    {
+        const CommitStreamObjectRequest = generated.commit_stream_object_request.CommitStreamObjectRequest;
+        const value = CommitStreamObjectRequest{
+            .node_id = 7,
+            .node_epoch = 9,
+            .object_id = 102,
+            .object_size = 13,
+            .stream_id = 101,
+            .start_offset = 3,
+            .end_offset = 4,
+            .source_object_ids = &[_]i64{ 90, 91 },
+            .stream_epoch = 2,
+            .attributes = 5,
+            .operations = &[_]i8{ 0, 1 },
+        };
+        try expectGoldenRoundTrip(CommitStreamObjectRequest, value, 1, &[_]u8{
+            0x00, 0x00, 0x00, 0x07, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x09, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x66, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x0d, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x65, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x03, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x04, 0x03, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00, 0x5a, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00, 0x5b, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00,
+            0x05, 0x03, 0x00, 0x01, 0x00,
+        });
+    }
+
+    {
+        const CommitStreamObjectResponse = generated.commit_stream_object_response.CommitStreamObjectResponse;
+        const value = CommitStreamObjectResponse{
+            .throttle_time_ms = 7,
+        };
+        try expectGoldenRoundTrip(CommitStreamObjectResponse, value, 1, &[_]u8{
+            0x00, 0x00, 0x00, 0x00,
+            0x00, 0x07, 0x00,
+        });
+    }
+
+    {
+        const GetOpeningStreamsRequest = generated.get_opening_streams_request.GetOpeningStreamsRequest;
+        const value = GetOpeningStreamsRequest{
+            .node_id = 7,
+            .node_epoch = 9,
+            .failover_mode = true,
+        };
+        try expectGoldenRoundTrip(GetOpeningStreamsRequest, value, 0, &[_]u8{
+            0x00, 0x00, 0x00, 0x07,
+            0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x09,
+            0x01, 0x00,
+        });
+    }
+
+    {
+        const GetOpeningStreamsResponse = generated.get_opening_streams_response.GetOpeningStreamsResponse;
+        const metadata = [_]GetOpeningStreamsResponse.StreamMetadata{.{
+            .stream_id = 101,
+            .epoch = 2,
+            .start_offset = 3,
+            .end_offset = 4,
+        }};
+        const value = GetOpeningStreamsResponse{
+            .throttle_time_ms = 8,
+            .stream_metadata_list = &metadata,
+        };
+        try expectGoldenRoundTrip(GetOpeningStreamsResponse, value, 0, &[_]u8{
+            0x00, 0x00, 0x00, 0x00,
+            0x00, 0x08, 0x02, 0x00,
+            0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x65, 0x00,
+            0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x02, 0x00,
+            0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x03, 0x00,
+            0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x04, 0x00,
+            0x00,
+        });
+    }
+
+    {
+        const TrimStreamsRequest = generated.trim_streams_request.TrimStreamsRequest;
+        const requests = [_]TrimStreamsRequest.TrimStreamRequest{.{
+            .stream_id = 101,
+            .stream_epoch = 2,
+            .new_start_offset = 5,
+        }};
+        const value = TrimStreamsRequest{
+            .node_id = 7,
+            .node_epoch = 9,
+            .trim_stream_requests = &requests,
+        };
+        try expectGoldenRoundTrip(TrimStreamsRequest, value, 0, &[_]u8{
+            0x00, 0x00, 0x00, 0x07, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x09, 0x02, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00, 0x65, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00, 0x05, 0x00, 0x00,
+        });
+    }
+
+    {
+        const TrimStreamsResponse = generated.trim_streams_response.TrimStreamsResponse;
+        const responses = [_]TrimStreamsResponse.TrimStreamResponse{.{
+            .error_code = 42,
+        }};
+        const value = TrimStreamsResponse{
+            .throttle_time_ms = 10,
+            .trim_stream_responses = &responses,
+        };
+        try expectGoldenRoundTrip(TrimStreamsResponse, value, 0, &[_]u8{
+            0x00, 0x00, 0x00, 0x00,
+            0x00, 0x0a, 0x02, 0x00,
+            0x2a, 0x00, 0x00,
+        });
+    }
+
+    {
+        const DescribeStreamsRequest = generated.describe_streams_request.DescribeStreamsRequest;
+        const partitions = [_]DescribeStreamsRequest.TopicPartitionData.PartitionData{
+            .{ .partition_index = 1 },
+            .{ .partition_index = 2 },
+        };
+        const topics = [_]DescribeStreamsRequest.TopicPartitionData{.{
+            .topic_name = "topic-a",
+            .partitions = &partitions,
+        }};
+        const value = DescribeStreamsRequest{
+            .topic_partitions = &topics,
+            .node_id = 7,
+            .stream_id = 101,
+        };
+        try expectGoldenRoundTrip(DescribeStreamsRequest, value, 0, &[_]u8{
+            0x02, 0x08, 0x74, 0x6f, 0x70, 0x69, 0x63, 0x2d,
+            0x61, 0x03, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00,
+            0x00, 0x00, 0x02, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x07, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x65, 0x00,
+        });
+    }
+
+    {
+        const DescribeStreamsResponse = generated.describe_streams_response.DescribeStreamsResponse;
+        const tags = [_]DescribeStreamsResponse.StreamMetadata.Tag{.{
+            .key = "k",
+            .value = "v",
+        }};
+        const metadata = [_]DescribeStreamsResponse.StreamMetadata{.{
+            .stream_id = 101,
+            .node_id = 7,
+            .state = "OPEN",
+            .topic_id = .{
+                0x00, 0x01, 0x02, 0x03,
+                0x04, 0x05, 0x06, 0x07,
+                0x08, 0x09, 0x0a, 0x0b,
+                0x0c, 0x0d, 0x0e, 0x0f,
+            },
+            .topic_name = "topic-a",
+            .partition_index = 1,
+            .epoch = 2,
+            .start_offset = 3,
+            .end_offset = 4,
+            .tags = &tags,
+        }};
+        const value = DescribeStreamsResponse{
+            .throttle_time_ms = 11,
+            .stream_metadata_list = &metadata,
+        };
+        try expectGoldenRoundTrip(DescribeStreamsResponse, value, 0, &[_]u8{
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x0b, 0x02, 0x00,
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x65, 0x00,
+            0x00, 0x00, 0x07, 0x05, 0x4f, 0x50, 0x45, 0x4e,
+            0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07,
+            0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f,
+            0x08, 0x74, 0x6f, 0x70, 0x69, 0x63, 0x2d, 0x61,
+            0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x03, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x04, 0x02, 0x02, 0x6b, 0x02,
+            0x76, 0x00, 0x00, 0x00,
+        });
+    }
 }
 
 fn expectDuplicateNodeEndpointsTagRejected(comptime Message: type) !void {
