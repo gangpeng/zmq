@@ -599,7 +599,9 @@ Status: completed for the initial catalog and DeleteGroups slice.
   replacement. `test-s3-provider-matrix` now runs the live MinIO/S3 suite across
   named S3-compatible provider profiles with per-profile endpoint, port, bucket,
   credential, scheme, region, TLS CA, path-style, existing-bucket,
-  ListObjectsV2 pagination, and optional process-crash/replacement gates. S3
+  ListObjectsV2 pagination, required live multipart-edge coverage through
+  `ZMQ_S3_PROVIDER_REQUIRED_MULTIPART_EDGE_PROFILES`, and optional
+  process-crash/replacement gates. S3
   request signing now honors configured regions, supports virtual-hosted
   addressing, omits default HTTP/HTTPS ports from the canonical Host header for
   AWS-style providers, and preserves explicit custom ports. Real-client

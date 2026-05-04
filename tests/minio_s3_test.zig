@@ -80,12 +80,16 @@ fn cleanupPrefix(s3: *storage.S3Storage, prefix: []const u8) void {
     }
 }
 
-fn allocMultipartData(alloc: std.mem.Allocator) ![]u8 {
-    const data = try alloc.alloc(u8, 5 * 1024 * 1024 + 257);
+fn allocMultipartDataLen(alloc: std.mem.Allocator, len: usize) ![]u8 {
+    const data = try alloc.alloc(u8, len);
     for (data, 0..) |*byte, i| {
         byte.* = @intCast(i % 251);
     }
     return data;
+}
+
+fn allocMultipartData(alloc: std.mem.Allocator) ![]u8 {
+    return allocMultipartDataLen(alloc, 5 * 1024 * 1024 + 257);
 }
 
 fn requireProviderGate(name: [:0]const u8) !void {
@@ -143,6 +147,28 @@ test "MinIO S3Client multipart round-trip" {
     defer client.deleteObject(key) catch {};
 
     const data = try allocMultipartData(testing.allocator);
+    defer testing.allocator.free(data);
+
+    try client.putObjectMultipart(key, data);
+
+    const fetched = try client.getObject(key);
+    defer testing.allocator.free(fetched);
+    try testing.expectEqual(data.len, fetched.len);
+    try testing.expectEqualSlices(u8, data, fetched);
+
+    try client.deleteObject(key);
+}
+
+test "MinIO/S3 provider multipart edge gate" {
+    try requireProviderGate("ZMQ_S3_REQUIRE_MULTIPART_EDGE");
+
+    var client = try initMinioClient();
+
+    const key = try uniqueKey(testing.allocator, "integration/multipart-edge");
+    defer testing.allocator.free(key);
+    defer client.deleteObject(key) catch {};
+
+    const data = try allocMultipartDataLen(testing.allocator, 10 * 1024 * 1024 + 333);
     defer testing.allocator.free(data);
 
     try client.putObjectMultipart(key, data);

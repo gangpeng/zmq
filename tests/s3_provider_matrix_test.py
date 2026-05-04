@@ -14,6 +14,8 @@ Global environment:
     ZMQ_S3_PROVIDER_PROFILES    Comma-separated profile names. Defaults to minio.
     ZMQ_S3_PROVIDER_REQUIRED_PROFILES comma-separated profile names that must be present.
     ZMQ_S3_PROVIDER_REQUIRED_OUTAGE_PROFILES comma-separated profile names that must run outage gates.
+    ZMQ_S3_PROVIDER_REQUIRED_MULTIPART_EDGE_PROFILES
+                               comma-separated profile names that must run the multipart edge gate.
     ZMQ_S3_PROVIDER_ZIG         Zig executable. Defaults to zig.
 
 Per-profile overrides:
@@ -29,6 +31,8 @@ Per-profile overrides:
 Per-profile gates:
     ZMQ_S3_<PROFILE>_REQUIRE_LIST_PAGINATION=1 enables a live 1005-object
     ListObjectsV2 pagination gate for providers in that profile.
+    ZMQ_S3_<PROFILE>_REQUIRE_MULTIPART_EDGE=1 enables a live uneven three-part
+    multipart upload/get verification gate for providers in that profile.
     ZMQ_S3_<PROFILE>_RUN_PROCESS_CRASH=1 also runs the broker-process
     crash/replacement harness with that provider's S3 settings.
     ZMQ_S3_<PROFILE>_RUN_LIVE_OUTAGE=1 also runs the live-S3 chaos outage
@@ -117,6 +121,9 @@ def provider_env(profile):
     require_list_pagination = profile_setting(profile, "REQUIRE_LIST_PAGINATION", None)
     if require_list_pagination:
         env["ZMQ_S3_REQUIRE_LIST_PAGINATION"] = require_list_pagination
+    require_multipart_edge = profile_setting(profile, "REQUIRE_MULTIPART_EDGE", None)
+    if require_multipart_edge:
+        env["ZMQ_S3_REQUIRE_MULTIPART_EDGE"] = require_multipart_edge
     return env
 
 
@@ -192,6 +199,23 @@ def validate_required_profiles(profiles):
             + ", ".join(missing_hooks)
         )
 
+    required_multipart_edge = configured_names("ZMQ_S3_PROVIDER_REQUIRED_MULTIPART_EDGE_PROFILES")
+    missing_multipart_edge_profiles = [profile for profile in required_multipart_edge if profile not in profile_set]
+    if missing_multipart_edge_profiles:
+        raise MatrixError(
+            "required S3 multipart-edge profiles missing from ZMQ_S3_PROVIDER_PROFILES: "
+            + ", ".join(missing_multipart_edge_profiles)
+        )
+    disabled_multipart_edge = [
+        profile for profile in required_multipart_edge
+        if not profile_enabled(profile, "REQUIRE_MULTIPART_EDGE")
+    ]
+    if disabled_multipart_edge:
+        raise MatrixError(
+            "required S3 multipart-edge profiles must set REQUIRE_MULTIPART_EDGE=1: "
+            + ", ".join(disabled_multipart_edge)
+        )
+
 
 def run_profile(profile):
     env = provider_env(profile)
@@ -234,12 +258,14 @@ def self_test():
         os.environ["ZMQ_S3_AWS_US_EAST_1_SKIP_ENSURE_BUCKET"] = "1"
         os.environ["ZMQ_S3_AWS_US_EAST_1_SKIP_MINIO_HEALTH"] = "1"
         os.environ["ZMQ_S3_AWS_US_EAST_1_REQUIRE_LIST_PAGINATION"] = "1"
+        os.environ["ZMQ_S3_AWS_US_EAST_1_REQUIRE_MULTIPART_EDGE"] = "1"
         os.environ["ZMQ_S3_AWS_US_EAST_1_RUN_PROCESS_CRASH"] = "true"
         os.environ["ZMQ_S3_AWS_US_EAST_1_RUN_LIVE_OUTAGE"] = "true"
         os.environ["ZMQ_S3_AWS_US_EAST_1_OUTAGE_DOWN"] = "tc qdisc add dev lo root netem loss 100%"
         os.environ["ZMQ_S3_AWS_US_EAST_1_OUTAGE_UP"] = "tc qdisc del dev lo root"
         os.environ["ZMQ_S3_PROVIDER_REQUIRED_PROFILES"] = "minio,aws_us_east_1"
         os.environ["ZMQ_S3_PROVIDER_REQUIRED_OUTAGE_PROFILES"] = "aws_us_east_1"
+        os.environ["ZMQ_S3_PROVIDER_REQUIRED_MULTIPART_EDGE_PROFILES"] = "aws_us_east_1"
 
         names = profile_names()
         if names != ["minio", "aws_us_east_1"]:
@@ -265,6 +291,8 @@ def self_test():
             raise MatrixError("profile skip-minio-health override failed")
         if env["ZMQ_S3_REQUIRE_LIST_PAGINATION"] != "1":
             raise MatrixError("profile pagination gate override failed")
+        if env["ZMQ_S3_REQUIRE_MULTIPART_EDGE"] != "1":
+            raise MatrixError("profile multipart-edge gate override failed")
         if not profile_enabled("aws_us_east_1", "RUN_PROCESS_CRASH"):
             raise MatrixError("profile process-crash gate override failed")
         if not profile_enabled("aws_us_east_1", "RUN_LIVE_OUTAGE"):
@@ -283,6 +311,15 @@ def self_test():
             raise MatrixError("missing required outage profile did not fail validation")
         except MatrixError as exc:
             if "RUN_LIVE_OUTAGE" not in str(exc):
+                raise
+
+        os.environ["ZMQ_S3_PROVIDER_REQUIRED_OUTAGE_PROFILES"] = "aws_us_east_1"
+        os.environ["ZMQ_S3_PROVIDER_REQUIRED_MULTIPART_EDGE_PROFILES"] = "minio,aws_us_east_1"
+        try:
+            validate_required_profiles(names)
+            raise MatrixError("missing required multipart-edge profile did not fail validation")
+        except MatrixError as exc:
+            if "REQUIRE_MULTIPART_EDGE" not in str(exc):
                 raise
 
         print("ok: S3 provider matrix self-test")
