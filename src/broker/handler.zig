@@ -5069,6 +5069,11 @@ pub const Broker = struct {
         const latency_ms: u64 = @intFromFloat(@max(latency_secs * 1000.0, 0.0));
         self.metrics.addLabeledCounter("Kafka_request_time_milliseconds_total", &.{ api_type_for_metrics, api_version_str }, latency_ms);
         self.metrics.addLabeledCounter("kafka_network_requestmetrics_totaltimems_total", &.{ api_type_for_metrics, api_version_str }, latency_ms);
+        self.metrics.addLabeledCounter("kafka_network_requestmetrics_requestqueuetimems_total", &.{ api_type_for_metrics, api_version_str }, 0);
+        self.metrics.addLabeledCounter("kafka_network_requestmetrics_localtimems_total", &.{ api_type_for_metrics, api_version_str }, latency_ms);
+        self.metrics.addLabeledCounter("kafka_network_requestmetrics_remotetimems_total", &.{ api_type_for_metrics, api_version_str }, 0);
+        self.metrics.addLabeledCounter("kafka_network_requestmetrics_responsequeuetimems_total", &.{ api_type_for_metrics, api_version_str }, 0);
+        self.metrics.addLabeledCounter("kafka_network_requestmetrics_responsesendtimems_total", &.{ api_type_for_metrics, api_version_str }, 0);
 
         if (result) |resp| {
             self.metrics.addCounter("kafka_server_bytes_out_total", resp.len);
@@ -10106,6 +10111,9 @@ pub const Broker = struct {
                 self.producer_sequences.put(update.key, update.state) catch {};
                 self.producer_sequences_dirty = true;
             }
+            if (partition_req.records) |rec| {
+                self.metrics.addCounter("kafka_server_brokertopicmetrics_messagesin_total", producedRecordCountForMetrics(rec));
+            }
         }
 
         // Detect MessageTooLarge specifically for proper error code
@@ -10129,6 +10137,12 @@ pub const Broker = struct {
             if (rec.len > 1048576) break :blk @intFromEnum(ErrorCode.message_too_large);
             break :blk @intFromEnum(ErrorCode.offset_out_of_range);
         } else @intFromEnum(ErrorCode.offset_out_of_range);
+
+        if (produce_error_code != @intFromEnum(ErrorCode.none)) {
+            if (partition_req.records) |rec| {
+                self.metrics.addCounter("kafka_server_brokertopicmetrics_bytesrejected_total", @intCast(rec.len));
+            }
+        }
 
         // Notify delayed fetches when new data arrives
         if (produce_result != null) {
@@ -10202,6 +10216,30 @@ pub const Broker = struct {
         if (last_sequence > std.math.maxInt(i32)) return std.math.maxInt(i32);
         if (last_sequence < std.math.minInt(i32)) return std.math.minInt(i32);
         return @intCast(last_sequence);
+    }
+
+    fn producedRecordCountForMetrics(records: []const u8) u64 {
+        if (records.len == 0) return 0;
+
+        const rec_batch = protocol.record_batch;
+        var pos: usize = 0;
+        var parsed_any = false;
+        var total: u64 = 0;
+
+        while (pos + rec_batch.BATCH_HEADER_SIZE <= records.len) {
+            const hdr = rec_batch.RecordBatchHeader.parse(records[pos..]) catch break;
+            const total_i64 = @as(i64, hdr.batch_length) + 12;
+            if (total_i64 < @as(i64, @intCast(rec_batch.BATCH_HEADER_SIZE))) break;
+            const batch_size: usize = @intCast(total_i64);
+            if (batch_size > records.len - pos) break;
+
+            total += @intCast(@max(hdr.record_count, 1));
+            parsed_any = true;
+            pos += batch_size;
+        }
+
+        if (parsed_any and total > 0) return total;
+        return 1;
     }
 
     fn applyRecoveredProducerSequence(
@@ -26170,7 +26208,45 @@ test "Broker.handleRequest Produce v0 returns generated response" {
     try testing.expectEqual(@as(i64, 0), resp.responses[0].partition_responses[0].base_offset);
     try testing.expectEqual(@as(u64, 1), broker.metrics.counters.get("kafka_server_produce_requests_total").?.value);
     try testing.expectEqual(@as(u64, 1), broker.metrics.counters.get("kafka_server_brokertopicmetrics_totalproducerequests_total").?.value);
+    try testing.expectEqual(@as(u64, 1), broker.metrics.counters.get("kafka_server_brokertopicmetrics_messagesin_total").?.value);
     try testing.expectEqual(@as(u64, 1), broker.metrics.histograms.get("kafka_server_produce_latency_seconds").?.count);
+}
+
+test "Broker.handleRequest Produce records JMX rejected bytes" {
+    const Resp = generated.produce_response.ProduceResponse;
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+
+    var buf: [512]u8 = undefined;
+    var pos = buildTestRequest(&buf, 0, 0, 301, header_mod.requestHeaderVersion(0, 0));
+    ser.writeI16(&buf, &pos, 2); // invalid acks
+    ser.writeI32(&buf, &pos, 30000);
+    ser.writeI32(&buf, &pos, 1);
+    ser.writeString(&buf, &pos, "produce-rejected-metric-topic");
+    ser.writeI32(&buf, &pos, 1);
+    ser.writeI32(&buf, &pos, 0);
+    const rejected_records = "rejected-records";
+    ser.writeI32(&buf, &pos, @intCast(rejected_records.len));
+    @memcpy(buf[pos .. pos + rejected_records.len], rejected_records);
+    pos += rejected_records.len;
+
+    const response = broker.handleRequest(buf[0..pos]);
+    try testing.expect(response != null);
+    defer testing.allocator.free(response.?);
+
+    var rpos: usize = 0;
+    var response_header = try ResponseHeader.deserialize(testing.allocator, response.?, &rpos, header_mod.responseHeaderVersion(0, 0));
+    defer response_header.deinit(testing.allocator);
+    try testing.expectEqual(@as(i32, 301), response_header.correlation_id);
+
+    const resp = try Resp.deserialize(testing.allocator, response.?, &rpos, 0);
+    defer freeDeserializedProduceResponse(&resp);
+
+    try testing.expectEqual(response.?.len, rpos);
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.invalid_required_acks)), resp.responses[0].partition_responses[0].error_code);
+    try testing.expectEqual(@as(u64, rejected_records.len), broker.metrics.counters.get("kafka_server_brokertopicmetrics_bytesrejected_total").?.value);
+    try testing.expectEqual(@as(u64, 0), broker.metrics.counters.get("kafka_server_brokertopicmetrics_messagesin_total").?.value);
 }
 
 test "Broker.handleRequest Produce v9 returns generated flexible response" {
@@ -51513,6 +51589,17 @@ test "Broker exports AutoMQ-compatible request metrics" {
     try testing.expect(jmx_response_bytes_entry != null);
     try testing.expectEqual(@as(u64, response.?.len), jmx_response_bytes_entry.?.value);
 
+    const jmx_request_queue_ms_key = "kafka_network_requestmetrics_requestqueuetimems_total{request=\"ApiVersions\",version=\"3\"}";
+    try testing.expect(broker.metrics.labeled_counters.get(jmx_request_queue_ms_key) != null);
+    const jmx_local_ms_key = "kafka_network_requestmetrics_localtimems_total{request=\"ApiVersions\",version=\"3\"}";
+    try testing.expect(broker.metrics.labeled_counters.get(jmx_local_ms_key) != null);
+    const jmx_remote_ms_key = "kafka_network_requestmetrics_remotetimems_total{request=\"ApiVersions\",version=\"3\"}";
+    try testing.expect(broker.metrics.labeled_counters.get(jmx_remote_ms_key) != null);
+    const jmx_response_queue_ms_key = "kafka_network_requestmetrics_responsequeuetimems_total{request=\"ApiVersions\",version=\"3\"}";
+    try testing.expect(broker.metrics.labeled_counters.get(jmx_response_queue_ms_key) != null);
+    const jmx_response_send_ms_key = "kafka_network_requestmetrics_responsesendtimems_total{request=\"ApiVersions\",version=\"3\"}";
+    try testing.expect(broker.metrics.labeled_counters.get(jmx_response_send_ms_key) != null);
+
     const error_key = "Kafka_request_error_count_total{type=\"ApiVersions\",version=\"3\",error=\"NONE\"}";
     const error_entry = broker.metrics.labeled_counters.get(error_key);
     try testing.expect(error_entry != null);
@@ -51528,6 +51615,7 @@ test "Broker exports AutoMQ-compatible request metrics" {
     try testing.expect(std.mem.indexOf(u8, output, response_bytes_key) != null);
     try testing.expect(std.mem.indexOf(u8, output, "# TYPE kafka_network_requestmetrics_requests_total counter") != null);
     try testing.expect(std.mem.indexOf(u8, output, jmx_request_key) != null);
+    try testing.expect(std.mem.indexOf(u8, output, "# TYPE kafka_network_requestmetrics_localtimems_total counter") != null);
 }
 
 test "Broker tick exports AutoMQ-compatible broker gauges" {

@@ -672,8 +672,15 @@ test "Observability dashboard and alerts reference exported metrics" {
         "raft_commit_index",
         "kafka_network_requestmetrics_requests_total",
         "kafka_network_requestmetrics_totaltimems_total",
+        "kafka_network_requestmetrics_requestqueuetimems_total",
+        "kafka_network_requestmetrics_localtimems_total",
+        "kafka_network_requestmetrics_remotetimems_total",
+        "kafka_network_requestmetrics_responsequeuetimems_total",
+        "kafka_network_requestmetrics_responsesendtimems_total",
         "kafka_server_brokertopicmetrics_totalproducerequests_total",
         "kafka_server_brokertopicmetrics_totalfetchrequests_total",
+        "kafka_server_brokertopicmetrics_messagesin_total",
+        "kafka_server_brokertopicmetrics_bytesrejected_total",
         "kafka_server_brokertopicmetrics_failedproducerequests_total",
         "kafka_server_brokertopicmetrics_failedfetchrequests_total",
         "kafka_server_brokertopicmetrics_bytesin_total",
@@ -722,6 +729,9 @@ test "Observability dashboard and alerts reference exported metrics" {
         "kafka_server_replicamanager_underreplicatedpartitions",
         "kafka_server_brokertopicmetrics_failedproducerequests_total",
         "kafka_server_brokertopicmetrics_failedfetchrequests_total",
+        "kafka_server_brokertopicmetrics_bytesrejected_total",
+        "kafka_network_requestmetrics_localtimems_total",
+        "kafka_network_requestmetrics_requests_total",
     };
     for (alert_metrics) |metric| {
         try testing.expect(std.mem.indexOf(u8, alerts, metric) != null);
@@ -736,6 +746,8 @@ test "Observability dashboard and alerts reference exported metrics" {
         "ZMQUnderReplicatedPartitions",
         "ZMQFailedProduceRequests",
         "ZMQFailedFetchRequests",
+        "ZMQRejectedProduceBytes",
+        "ZMQHighJmxRequestLocalTime",
     };
     for (alert_names) |name| {
         try testing.expect(std.mem.indexOf(u8, alerts, name) != null);

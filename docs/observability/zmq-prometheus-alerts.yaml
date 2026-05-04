@@ -93,6 +93,24 @@ groups:
           summary: ZMQ broker topic metrics report failed fetch requests.
           description: Failed reads can indicate storage, fencing, authorization, or leader routing issues.
 
+      - alert: ZMQRejectedProduceBytes
+        expr: rate(kafka_server_brokertopicmetrics_bytesrejected_total[5m]) > 0
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: ZMQ broker topic metrics report rejected produce bytes.
+          description: Rejected write payloads can indicate oversized batches, invalid acks, fencing, or storage failures.
+
+      - alert: ZMQHighJmxRequestLocalTime
+        expr: sum(rate(kafka_network_requestmetrics_localtimems_total[5m])) / clamp_min(sum(rate(kafka_network_requestmetrics_requests_total[5m])), 1) > 1000
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: ZMQ JMX-compatible local request time is above 1 second.
+          description: Broker-local request handling time is sustained above the operational latency SLO.
+
   - name: zmq-storage
     rules:
       - alert: ZMQS3RequestErrors
