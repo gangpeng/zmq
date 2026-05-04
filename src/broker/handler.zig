@@ -56,6 +56,8 @@ const topic_snapshot_record_value_magic = "ZMQTP1";
 const topic_snapshot_record_value_magic_v2 = "ZMQTP2";
 const topic_snapshot_record_key = "__zmq_topic_snapshot";
 const topic_quorum_record_magic = "ZMQTPQ2";
+const partition_state_snapshot_record_value_magic = "ZMQPS1";
+const partition_state_snapshot_record_key = "__zmq_partition_state_snapshot";
 const partition_reassignment_snapshot_record_value_magic = "ZMQPR1";
 const partition_reassignment_snapshot_record_key = "__zmq_partition_reassignment_snapshot";
 const partition_reassignment_quorum_record_magic = "ZMQPRQ2";
@@ -878,8 +880,9 @@ pub const Broker = struct {
         }
         const recovered_cluster_records = try self.restoreClusterMetadataFromLog();
         if (recovered_cluster_records.total() > 0) {
-            log.info("Restored cluster metadata from __cluster_metadata (topics={d}, reassignments={d}, replica_dirs={d}, client_quotas={d}, scram_credentials={d}, acls={d}, finalized_features={d})", .{
+            log.info("Restored cluster metadata from __cluster_metadata (topics={d}, partition_states={d}, reassignments={d}, replica_dirs={d}, client_quotas={d}, scram_credentials={d}, acls={d}, finalized_features={d})", .{
                 recovered_cluster_records.topic_snapshots,
+                recovered_cluster_records.partition_state_snapshots,
                 recovered_cluster_records.partition_reassignment_snapshots,
                 recovered_cluster_records.replica_directory_assignment_snapshots,
                 recovered_cluster_records.client_quota_snapshots,
@@ -890,6 +893,11 @@ pub const Broker = struct {
             self.persistence.saveTopics(&self.topics) catch |err| {
                 log.warn("Failed to persist replayed topic metadata: {}", .{err});
             };
+            if (recovered_cluster_records.partition_state_snapshots > 0) {
+                self.persistPartitionAndObjectLocalMetadataDurably("Cluster metadata partition-state replay") catch |err| {
+                    log.warn("Failed to persist replayed partition visibility metadata: {}", .{err});
+                };
+            }
             self.persistence.savePartitionReassignments(&self.partition_reassignments) catch |err| {
                 log.warn("Failed to persist replayed partition reassignments: {}", .{err});
             };
@@ -1342,7 +1350,10 @@ pub const Broker = struct {
 
         if (total_trimmed > 0) {
             log.info("Retention enforcement: trimmed {d} partition(s)", .{total_trimmed});
-            self.persistPartitionStates();
+            self.persistSharedPartitionStatesDurably() catch |err| {
+                log.warn("Failed to append retention partition-state snapshot to __cluster_metadata: {}", .{err});
+                self.persistPartitionStates();
+            };
             self.persistObjectManagerSnapshot();
         }
     }
@@ -2456,6 +2467,10 @@ pub const Broker = struct {
 
     fn persistPartitionStatesDurably(self: *Broker) !void {
         try self.persistence.savePartitionStates(&self.store.partitions);
+    }
+
+    fn persistSharedPartitionStatesDurably(self: *Broker) !void {
+        try self.writePartitionStateSnapshotRecord();
     }
 
     fn persistPartitionAndObjectLocalMetadataDurably(self: *Broker, context: []const u8) !void {
@@ -3739,6 +3754,111 @@ pub const Broker = struct {
         }
     }
 
+    fn userPartitionStateSnapshotCount(self: *Broker) usize {
+        var count: usize = 0;
+        var it = self.store.partitions.iterator();
+        while (it.next()) |entry| {
+            if (!isInternalTopicName(entry.value_ptr.topic)) count += 1;
+        }
+        return count;
+    }
+
+    fn encodePartitionStateSnapshotRecordValue(self: *Broker) ![]u8 {
+        var buf = std.array_list.Managed(u8).init(self.allocator);
+        errdefer buf.deinit();
+        const writer = @import("list_compat").writer(&buf);
+
+        try writer.writeAll(partition_state_snapshot_record_value_magic);
+        try writer.writeInt(u32, @intCast(self.userPartitionStateSnapshotCount()), .big);
+
+        var it = self.store.partitions.iterator();
+        while (it.next()) |entry| {
+            const state = entry.value_ptr;
+            if (isInternalTopicName(state.topic)) continue;
+            try writeSnapshotBytes(writer, state.topic);
+            try writer.writeInt(i32, state.partition_id, .big);
+            try writer.writeInt(u64, state.log_start_offset, .big);
+        }
+
+        return buf.toOwnedSlice();
+    }
+
+    fn freePartitionStateEntries(self: *Broker, entries: []MetadataPersistence.PartitionStateEntry) void {
+        for (entries) |entry| self.allocator.free(entry.topic);
+        if (entries.len > 0) self.allocator.free(entries);
+    }
+
+    fn decodePartitionStateSnapshotRecordValue(self: *Broker, value: []const u8) ![]MetadataPersistence.PartitionStateEntry {
+        if (value.len < partition_state_snapshot_record_value_magic.len + 4) return error.InvalidPartitionStateSnapshot;
+        if (!std.mem.eql(u8, value[0..partition_state_snapshot_record_value_magic.len], partition_state_snapshot_record_value_magic)) {
+            return error.InvalidPartitionStateSnapshot;
+        }
+
+        var pos: usize = partition_state_snapshot_record_value_magic.len;
+        const state_count = try readSnapshotU32(value, &pos);
+        if (state_count > 1_000_000) return error.InvalidPartitionStateSnapshot;
+
+        var entries = std.array_list.Managed(MetadataPersistence.PartitionStateEntry).init(self.allocator);
+        errdefer {
+            for (entries.items) |entry| self.allocator.free(entry.topic);
+            entries.deinit();
+        }
+
+        for (0..state_count) |_| {
+            const topic = try self.readSnapshotOwnedBytes(value, &pos);
+            errdefer self.allocator.free(topic);
+            const partition_id = try readSnapshotI32(value, &pos);
+            const log_start_offset = try readSnapshotU64(value, &pos);
+            if (topic.len == 0 or isInternalTopicName(topic) or partition_id < 0) return error.InvalidPartitionStateSnapshot;
+
+            try entries.append(.{
+                .topic = topic,
+                .partition_id = partition_id,
+                .next_offset = 0,
+                .log_start_offset = log_start_offset,
+                .high_watermark = 0,
+                .last_stable_offset = 0,
+                .first_unstable_txn_offset = null,
+            });
+        }
+
+        if (pos != value.len) return error.InvalidPartitionStateSnapshot;
+        return try entries.toOwnedSlice();
+    }
+
+    fn restorePartitionStateSnapshotRecord(self: *Broker, value: []const u8) !void {
+        const entries = try self.decodePartitionStateSnapshotRecordValue(value);
+        defer self.freePartitionStateEntries(entries);
+
+        for (entries) |entry| {
+            if (!self.topicPartitionExists(entry.topic, entry.partition_id)) continue;
+            self.store.ensurePartition(entry.topic, entry.partition_id) catch |err| {
+                log.warn("Failed to ensure partition for restored shared state {s}-{d}: {}", .{ entry.topic, entry.partition_id, err });
+                continue;
+            };
+
+            const pkey = std.fmt.allocPrint(self.allocator, "{s}-{d}", .{ entry.topic, entry.partition_id }) catch continue;
+            defer self.allocator.free(pkey);
+            const state = self.store.partitions.getPtr(pkey) orelse continue;
+            const stream_id = PartitionStore.hashPartitionKey(entry.topic, entry.partition_id);
+            const restored_stream = self.object_manager.getStream(stream_id);
+            if (restored_stream) |stream| {
+                if (stream.end_offset > state.next_offset) state.next_offset = stream.end_offset;
+            }
+            state.log_start_offset = @min(entry.log_start_offset, state.next_offset);
+            state.high_watermark = @min(@max(state.high_watermark, state.log_start_offset), state.next_offset);
+            state.last_stable_offset = @min(@max(state.last_stable_offset, state.log_start_offset), state.high_watermark);
+            if (state.first_unstable_txn_offset) |unstable| {
+                state.first_unstable_txn_offset = @min(@max(unstable, state.log_start_offset), state.next_offset);
+            }
+
+            if (restored_stream) |stream| {
+                stream.trim(state.log_start_offset);
+                stream.advanceEndOffset(state.next_offset);
+            }
+        }
+    }
+
     fn encodePartitionReassignmentSnapshotRecordValue(self: *Broker) ![]u8 {
         var buf = std.array_list.Managed(u8).init(self.allocator);
         errdefer buf.deinit();
@@ -4529,6 +4649,42 @@ pub const Broker = struct {
         try self.persistPartitionStatesDurably();
     }
 
+    /// Write user-partition low-watermark state to __cluster_metadata so
+    /// DeleteRecords/retention trims survive fresh-dir broker replacement
+    /// without relying on local partition_state.meta or objects.snapshot.
+    fn writePartitionStateSnapshotRecord(self: *Broker) !void {
+        const info = self.topics.get("__cluster_metadata") orelse return;
+        if (info.num_partitions <= 0) return;
+
+        const value = try self.encodePartitionStateSnapshotRecordValue();
+        defer self.allocator.free(value);
+
+        const rec_batch = protocol.record_batch;
+        const records = [_]rec_batch.Record{
+            .{
+                .offset_delta = 0,
+                .key = partition_state_snapshot_record_key,
+                .value = value,
+            },
+        };
+
+        const batch = try rec_batch.buildRecordBatch(
+            self.allocator,
+            0,
+            &records,
+            -1,
+            -1,
+            -1,
+            @import("time_compat").milliTimestamp(),
+            @import("time_compat").milliTimestamp(),
+            0,
+        );
+        defer self.allocator.free(batch);
+
+        _ = try self.store.produce("__cluster_metadata", 0, batch);
+        try self.persistence.savePartitionStates(&self.store.partitions);
+    }
+
     /// Write a full reassignment snapshot to __cluster_metadata so fresh-dir
     /// broker replacement does not lose in-flight AlterPartitionReassignments state.
     fn writePartitionReassignmentSnapshotRecord(self: *Broker) !void {
@@ -4741,6 +4897,7 @@ pub const Broker = struct {
 
     const ClusterMetadataReplayCounts = struct {
         topic_snapshots: usize = 0,
+        partition_state_snapshots: usize = 0,
         partition_reassignment_snapshots: usize = 0,
         replica_directory_assignment_snapshots: usize = 0,
         client_quota_snapshots: usize = 0,
@@ -4749,13 +4906,14 @@ pub const Broker = struct {
         finalized_feature_snapshots: usize = 0,
 
         fn total(self: @This()) usize {
-            return self.topic_snapshots + self.partition_reassignment_snapshots + self.replica_directory_assignment_snapshots + self.client_quota_snapshots + self.scram_credential_snapshots + self.acl_snapshots + self.finalized_feature_snapshots;
+            return self.topic_snapshots + self.partition_state_snapshots + self.partition_reassignment_snapshots + self.replica_directory_assignment_snapshots + self.client_quota_snapshots + self.scram_credential_snapshots + self.acl_snapshots + self.finalized_feature_snapshots;
         }
     };
 
     const ClusterMetadataReplayKind = enum {
         none,
         topic_snapshot,
+        partition_state_snapshot,
         partition_reassignment_snapshot,
         replica_directory_assignment_snapshot,
         client_quota_snapshot,
@@ -4775,6 +4933,7 @@ pub const Broker = struct {
             if (result.error_code != @intFromEnum(ErrorCode.none)) return error.ClusterMetadataLogUnavailable;
             const partition_counts = try self.applyClusterMetadataRecordBatches(result.records);
             restored.topic_snapshots += partition_counts.topic_snapshots;
+            restored.partition_state_snapshots += partition_counts.partition_state_snapshots;
             restored.partition_reassignment_snapshots += partition_counts.partition_reassignment_snapshots;
             restored.replica_directory_assignment_snapshots += partition_counts.replica_directory_assignment_snapshots;
             restored.client_quota_snapshots += partition_counts.client_quota_snapshots;
@@ -4806,6 +4965,7 @@ pub const Broker = struct {
                     switch (try self.applyClusterMetadataRecord(key, value)) {
                         .none => {},
                         .topic_snapshot => restored.topic_snapshots += 1,
+                        .partition_state_snapshot => restored.partition_state_snapshots += 1,
                         .partition_reassignment_snapshot => restored.partition_reassignment_snapshots += 1,
                         .replica_directory_assignment_snapshot => restored.replica_directory_assignment_snapshots += 1,
                         .client_quota_snapshot => restored.client_quota_snapshots += 1,
@@ -4826,6 +4986,10 @@ pub const Broker = struct {
         if (std.mem.eql(u8, key, topic_snapshot_record_key)) {
             try self.restoreTopicSnapshotRecord(value);
             return .topic_snapshot;
+        }
+        if (std.mem.eql(u8, key, partition_state_snapshot_record_key)) {
+            try self.restorePartitionStateSnapshotRecord(value);
+            return .partition_state_snapshot;
         }
         if (std.mem.eql(u8, key, partition_reassignment_snapshot_record_key)) {
             try self.restorePartitionReassignmentSnapshotRecord(value);
@@ -16875,7 +17039,7 @@ pub const Broker = struct {
 
         if (mutated) {
             var persistence_error: ?anyerror = null;
-            self.persistPartitionStatesDurably() catch |err| {
+            self.persistSharedPartitionStatesDurably() catch |err| {
                 persistence_error = err;
             };
             if (persistence_error == null) {
@@ -16887,6 +17051,9 @@ pub const Broker = struct {
                 log.warn("DeleteRecords metadata persistence failed: {}", .{err});
                 self.restorePartitionStateSnapshot(&previous_partition_states);
                 if (previous_object_snapshot) |snapshot| self.restoreObjectManagerLocalSnapshot(snapshot);
+                self.persistSharedPartitionStatesDurably() catch |restore_err| {
+                    log.warn("Failed to append DeleteRecords rollback partition-state snapshot: {}", .{restore_err});
+                };
                 self.persistPartitionStatesDurably() catch |restore_err| {
                     log.warn("Failed to persist restored partition states after DeleteRecords failure: {}", .{restore_err});
                 };
@@ -53339,6 +53506,93 @@ test "Broker.handleRequest DeleteRecords v2 returns generated response and trims
     const pkey = try std.fmt.allocPrint(testing.allocator, "{s}-{d}", .{ "dr-generated-topic", 0 });
     defer testing.allocator.free(pkey);
     try testing.expectEqual(@as(u64, 5), broker.store.partitions.getPtr(pkey).?.log_start_offset);
+}
+
+test "Broker restores DeleteRecords trim from S3 cluster metadata log" {
+    const Req = generated.delete_records_request.DeleteRecordsRequest;
+    const Resp = generated.delete_records_response.DeleteRecordsResponse;
+    const Topic = Req.DeleteRecordsTopic;
+    const Partition = Topic.DeleteRecordsPartition;
+
+    var mock_s3 = storage.MockS3.init(testing.allocator);
+    defer mock_s3.deinit();
+    const s3_storage = storage.S3Storage.initMock(testing.allocator, &mock_s3);
+
+    const topic_name = "dr-s3-trim-recovery-topic";
+    const partitions = [_]Partition{.{
+        .partition_index = 0,
+        .offset = 1,
+    }};
+    const topics = [_]Topic{.{
+        .name = topic_name,
+        .partitions = &partitions,
+    }};
+    const req = Req{
+        .topics = &topics,
+        .timeout_ms = 30000,
+    };
+
+    {
+        var broker = Broker.init(testing.allocator, 1, 9092);
+        defer broker.deinit();
+        broker.store.s3_wal_mode = true;
+        broker.store.s3_storage = s3_storage;
+        broker.store.s3_wal_batcher = storage.wal.S3WalBatcher.init(testing.allocator);
+
+        try broker.open();
+        try testing.expect(broker.ensureTopic(topic_name));
+        _ = try broker.store.produce(topic_name, 0, "trim-recovery-a");
+        _ = try broker.store.produce(topic_name, 0, "trim-recovery-b");
+
+        var buf: [512]u8 = undefined;
+        var pos = buildTestRequest(&buf, 21, 2, 2118, header_mod.requestHeaderVersion(21, 2));
+        req.serialize(&buf, &pos, 2);
+
+        const response = broker.handleRequest(buf[0..pos]);
+        try testing.expect(response != null);
+        defer testing.allocator.free(response.?);
+
+        var rpos: usize = 0;
+        var response_header = try ResponseHeader.deserialize(testing.allocator, response.?, &rpos, header_mod.responseHeaderVersion(21, 2));
+        defer response_header.deinit(testing.allocator);
+        try testing.expectEqual(@as(i32, 2118), response_header.correlation_id);
+
+        const resp = try Resp.deserialize(testing.allocator, response.?, &rpos, 2);
+        defer {
+            broker.freeDeleteRecordsResponseTopics(resp.topics);
+            if (resp.topics.len > 0) testing.allocator.free(resp.topics);
+        }
+
+        try testing.expectEqual(response.?.len, rpos);
+        try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.none)), resp.topics[0].partitions[0].error_code);
+        try testing.expectEqual(@as(i64, 1), resp.topics[0].partitions[0].low_watermark);
+        _ = try broker.store.produce(topic_name, 0, "trim-recovery-c");
+        try testing.expect(mock_s3.objectCount() > 0);
+    }
+
+    {
+        var broker = Broker.init(testing.allocator, 1, 9092);
+        defer broker.deinit();
+        broker.store.s3_wal_mode = true;
+        broker.store.s3_storage = s3_storage;
+        broker.store.s3_wal_batcher = storage.wal.S3WalBatcher.init(testing.allocator);
+
+        try broker.open();
+        try testing.expect(broker.topics.contains(topic_name));
+
+        const pkey = try std.fmt.allocPrint(testing.allocator, "{s}-{d}", .{ topic_name, 0 });
+        defer testing.allocator.free(pkey);
+        const state = broker.store.partitions.get(pkey).?;
+        try testing.expectEqual(@as(u64, 3), state.next_offset);
+        try testing.expectEqual(@as(u64, 1), state.log_start_offset);
+        try testing.expectEqual(@as(u64, 3), state.high_watermark);
+        try testing.expectEqual(@as(u64, 3), state.last_stable_offset);
+
+        const stream_id = PartitionStore.hashPartitionKey(topic_name, 0);
+        const stream = broker.object_manager.getStream(stream_id).?;
+        try testing.expectEqual(@as(u64, 1), stream.start_offset);
+        try testing.expectEqual(@as(u64, 3), stream.end_offset);
+    }
 }
 
 test "Broker.handleRequest DeleteRecords rolls back partition state persistence failures" {
