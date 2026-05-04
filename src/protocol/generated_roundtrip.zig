@@ -1391,6 +1391,168 @@ test "generated non-default golden fixtures cover legacy and flexible wire encod
     }
 
     {
+        const ConsumerGroupDescribeRequest = generated.consumer_group_describe_request.ConsumerGroupDescribeRequest;
+        const group_ids = [_]?[]const u8{ "group-a", "group-b" };
+        const value = ConsumerGroupDescribeRequest{
+            .group_ids = &group_ids,
+            .include_authorized_operations = true,
+        };
+        try expectGoldenRoundTrip(ConsumerGroupDescribeRequest, value, 0, &[_]u8{
+            0x03, 0x08, 'g',  'r',  'o',  'u',  'p',  '-',
+            'a',  0x08, 'g',  'r',  'o',  'u',  'p',  '-',
+            'b',  0x01, 0x00,
+        });
+    }
+
+    {
+        const ConsumerGroupDescribeResponse = generated.consumer_group_describe_response.ConsumerGroupDescribeResponse;
+        const Assignment = generated.consumer_group_describe_response.Assignment;
+        const TopicPartitions = generated.consumer_group_describe_response.TopicPartitions;
+        const partitions = [_]i32{ 0, 2 };
+        const assigned_topics = [_]TopicPartitions{.{
+            .topic_id = .{
+                0x10, 0x11, 0x12, 0x13,
+                0x14, 0x15, 0x16, 0x17,
+                0x18, 0x19, 0x1a, 0x1b,
+                0x1c, 0x1d, 0x1e, 0x1f,
+            },
+            .topic_name = "topic-a",
+            .partitions = &partitions,
+        }};
+        const subscribed_topics = [_]?[]const u8{ "topic-a", "topic-b" };
+        const members = [_]ConsumerGroupDescribeResponse.DescribedGroup.Member{.{
+            .member_id = "member-a",
+            .instance_id = "instance-a",
+            .rack_id = "rack-a",
+            .member_epoch = 5,
+            .client_id = "client-a",
+            .client_host = "/127.0.0.1",
+            .subscribed_topic_names = &subscribed_topics,
+            .assignment = Assignment{ .topic_partitions = &assigned_topics },
+            .target_assignment = Assignment{},
+        }};
+        const groups = [_]ConsumerGroupDescribeResponse.DescribedGroup{.{
+            .group_id = "group-a",
+            .group_state = "Stable",
+            .group_epoch = 3,
+            .assignment_epoch = 4,
+            .assignor_name = "range",
+            .members = &members,
+            .authorized_operations = 5,
+        }};
+        const value = ConsumerGroupDescribeResponse{
+            .throttle_time_ms = 5,
+            .groups = &groups,
+        };
+        try expectGoldenRoundTrip(ConsumerGroupDescribeResponse, value, 0, &[_]u8{
+            0x00, 0x00, 0x00, 0x05, 0x02, 0x00, 0x00, 0x00,
+            0x08, 'g',  'r',  'o',  'u',  'p',  '-',  'a',
+            0x07, 'S',  't',  'a',  'b',  'l',  'e',  0x00,
+            0x00, 0x00, 0x03, 0x00, 0x00, 0x00, 0x04, 0x06,
+            'r',  'a',  'n',  'g',  'e',  0x02, 0x09, 'm',
+            'e',  'm',  'b',  'e',  'r',  '-',  'a',  0x0b,
+            'i',  'n',  's',  't',  'a',  'n',  'c',  'e',
+            '-',  'a',  0x07, 'r',  'a',  'c',  'k',  '-',
+            'a',  0x00, 0x00, 0x00, 0x05, 0x09, 'c',  'l',
+            'i',  'e',  'n',  't',  '-',  'a',  0x0b, '/',
+            '1',  '2',  '7',  '.',  '0',  '.',  '0',  '.',
+            '1',  0x03, 0x08, 't',  'o',  'p',  'i',  'c',
+            '-',  'a',  0x08, 't',  'o',  'p',  'i',  'c',
+            '-',  'b',  0x00, 0x02, 0x10, 0x11, 0x12, 0x13,
+            0x14, 0x15, 0x16, 0x17, 0x18, 0x19, 0x1a, 0x1b,
+            0x1c, 0x1d, 0x1e, 0x1f, 0x08, 't',  'o',  'p',
+            'i',  'c',  '-',  'a',  0x03, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00, 0x02, 0x00, 0x00, 0x01,
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x05, 0x00, 0x00,
+        });
+    }
+
+    {
+        const OffsetCommitRequest = generated.offset_commit_request.OffsetCommitRequest;
+        const partitions = [_]OffsetCommitRequest.OffsetCommitRequestTopic.OffsetCommitRequestPartition{.{
+            .partition_index = 2,
+            .committed_offset = 42,
+            .commit_timestamp = 123456789,
+            .committed_metadata = "meta-a",
+        }};
+        const topics = [_]OffsetCommitRequest.OffsetCommitRequestTopic{.{
+            .name = "topic-a",
+            .partitions = &partitions,
+        }};
+        const value = OffsetCommitRequest{
+            .group_id = "group-a",
+            .generation_id_or_member_epoch = 3,
+            .member_id = "member-a",
+            .topics = &topics,
+        };
+        try expectGoldenRoundTrip(OffsetCommitRequest, value, 1, &[_]u8{
+            0x00, 0x07, 'g',  'r',  'o',  'u',  'p',  '-',
+            'a',  0x00, 0x00, 0x00, 0x03, 0x00, 0x08, 'm',
+            'e',  'm',  'b',  'e',  'r',  '-',  'a',  0x00,
+            0x00, 0x00, 0x01, 0x00, 0x07, 't',  'o',  'p',
+            'i',  'c',  '-',  'a',  0x00, 0x00, 0x00, 0x01,
+            0x00, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x2a, 0x00, 0x00, 0x00, 0x00,
+            0x07, 0x5b, 0xcd, 0x15, 0x00, 0x06, 'm',  'e',
+            't',  'a',  '-',  'a',
+        });
+    }
+
+    {
+        const OffsetCommitRequest = generated.offset_commit_request.OffsetCommitRequest;
+        const partitions = [_]OffsetCommitRequest.OffsetCommitRequestTopic.OffsetCommitRequestPartition{.{
+            .partition_index = 2,
+            .committed_offset = 42,
+            .committed_leader_epoch = 9,
+            .committed_metadata = "meta-a",
+        }};
+        const topics = [_]OffsetCommitRequest.OffsetCommitRequestTopic{.{
+            .name = "topic-a",
+            .partitions = &partitions,
+        }};
+        const value = OffsetCommitRequest{
+            .group_id = "group-a",
+            .generation_id_or_member_epoch = 7,
+            .member_id = "member-a",
+            .group_instance_id = "instance-a",
+            .topics = &topics,
+        };
+        try expectGoldenRoundTrip(OffsetCommitRequest, value, 8, &[_]u8{
+            0x08, 'g',  'r',  'o',  'u',  'p',  '-',  'a',
+            0x00, 0x00, 0x00, 0x07, 0x09, 'm',  'e',  'm',
+            'b',  'e',  'r',  '-',  'a',  0x0b, 'i',  'n',
+            's',  't',  'a',  'n',  'c',  'e',  '-',  'a',
+            0x02, 0x08, 't',  'o',  'p',  'i',  'c',  '-',
+            'a',  0x02, 0x00, 0x00, 0x00, 0x02, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x2a, 0x00, 0x00,
+            0x00, 0x09, 0x07, 'm',  'e',  't',  'a',  '-',
+            'a',  0x00, 0x00, 0x00,
+        });
+    }
+
+    {
+        const OffsetCommitResponse = generated.offset_commit_response.OffsetCommitResponse;
+        const partitions = [_]OffsetCommitResponse.OffsetCommitResponseTopic.OffsetCommitResponsePartition{
+            .{ .partition_index = 0, .error_code = 0 },
+            .{ .partition_index = 2, .error_code = 30 },
+        };
+        const topics = [_]OffsetCommitResponse.OffsetCommitResponseTopic{.{
+            .name = "topic-a",
+            .partitions = &partitions,
+        }};
+        const value = OffsetCommitResponse{
+            .throttle_time_ms = 5,
+            .topics = &topics,
+        };
+        try expectGoldenRoundTrip(OffsetCommitResponse, value, 8, &[_]u8{
+            0x00, 0x00, 0x00, 0x05, 0x02, 0x08, 't',  'o',
+            'p',  'i',  'c',  '-',  'a',  0x03, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x02, 0x00, 0x1e, 0x00, 0x00, 0x00,
+        });
+    }
+
+    {
         const ListTransactionsRequest = generated.list_transactions_request.ListTransactionsRequest;
         const state_filters = [_]?[]const u8{ "Ongoing", "PrepareCommit" };
         const producer_id_filters = [_]i64{ 123456789, 987654321 };
