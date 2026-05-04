@@ -36,6 +36,14 @@ Optional cross-broker chaos environment:
   ZMQ_E2E_LOAD_SCALE_<PHASE>_APPLY / RESTORE
                                       phase-specific scale/load hooks
   ZMQ_E2E_REQUIRED_LOAD_SCALE_PHASES   fail if matrix omits required phases
+
+Hook context:
+  ZMQ_E2E_TOPIC                        active test topic for the phase
+  ZMQ_E2E_BROKER_PORTS                 node:port list for broker listeners
+  ZMQ_E2E_CONTROLLER_PORTS             node:port list for controller listeners
+  ZMQ_E2E_METRICS_PORTS                node:port list for metrics listeners
+  ZMQ_E2E_CONTAINERS                   node:container list
+  ZMQ_E2E_MINIO_PORT                   mapped MinIO port
 """
 
 import socket
@@ -294,20 +302,26 @@ def validate_required_e2e_chaos_phase_coverage():
         )
 
 
-def e2e_chaos_hook_env(phase, index):
+def e2e_chaos_hook_env(phase, index, topic=None):
     env = os.environ.copy()
     env["ZMQ_E2E_CHAOS_PHASE"] = phase["name"]
     env["ZMQ_E2E_CHAOS_PHASE_INDEX"] = str(index)
     env["ZMQ_E2E_CHAOS_EXPECT"] = phase["expect"]
+    if topic is not None:
+        env["ZMQ_E2E_TOPIC"] = topic
     env["ZMQ_E2E_BROKER_PORTS"] = ",".join(
         f"{node['name']}:{node['broker_port']}" for node in NODES
     )
     env["ZMQ_E2E_CONTROLLER_PORTS"] = ",".join(
         f"{node['name']}:{node['controller_port']}" for node in NODES
     )
+    env["ZMQ_E2E_METRICS_PORTS"] = ",".join(
+        f"{node['name']}:{node['metrics_port']}" for node in NODES
+    )
     env["ZMQ_E2E_CONTAINERS"] = ",".join(
         f"{node['name']}:{node['container']}" for node in NODES
     )
+    env["ZMQ_E2E_MINIO_PORT"] = str(MINIO_PORT)
     return env
 
 
@@ -361,7 +375,7 @@ def run_cross_broker_chaos(t, topic):
 
     print("\n[Test l] Cross-broker chaos phases")
     for index, phase in enumerate(phases):
-        env = e2e_chaos_hook_env(phase, index)
+        env = e2e_chaos_hook_env(phase, index, topic)
         healed = False
         during_payload = f"e2e-chaos-during-{index}-{phase['name']}".encode()
         healed_payload = f"e2e-chaos-healed-{index}-{phase['name']}".encode()
@@ -443,19 +457,25 @@ def validate_required_e2e_load_scale_phase_coverage():
         )
 
 
-def e2e_load_scale_hook_env(phase, index):
+def e2e_load_scale_hook_env(phase, index, topic=None):
     env = os.environ.copy()
     env["ZMQ_E2E_LOAD_SCALE_PHASE"] = phase["name"]
     env["ZMQ_E2E_LOAD_SCALE_PHASE_INDEX"] = str(index)
+    if topic is not None:
+        env["ZMQ_E2E_TOPIC"] = topic
     env["ZMQ_E2E_BROKER_PORTS"] = ",".join(
         f"{node['name']}:{node['broker_port']}" for node in NODES
     )
     env["ZMQ_E2E_CONTROLLER_PORTS"] = ",".join(
         f"{node['name']}:{node['controller_port']}" for node in NODES
     )
+    env["ZMQ_E2E_METRICS_PORTS"] = ",".join(
+        f"{node['name']}:{node['metrics_port']}" for node in NODES
+    )
     env["ZMQ_E2E_CONTAINERS"] = ",".join(
         f"{node['name']}:{node['container']}" for node in NODES
     )
+    env["ZMQ_E2E_MINIO_PORT"] = str(MINIO_PORT)
     return env
 
 
@@ -479,7 +499,7 @@ def run_e2e_load_scale_phases(t, topic):
 
     print("\n[Test m] Live load/scale phases")
     for index, phase in enumerate(phases):
-        env = e2e_load_scale_hook_env(phase, index)
+        env = e2e_load_scale_hook_env(phase, index, topic)
         restored = False
         applied_payload = f"e2e-load-scale-applied-{index}-{phase['name']}".encode()
         restored_payload = f"e2e-load-scale-restored-{index}-{phase['name']}".encode()
@@ -588,13 +608,19 @@ def self_test():
             if "required E2E chaos phases" not in str(exc):
                 raise
 
-        env = e2e_chaos_hook_env(phases[1], 1)
+        env = e2e_chaos_hook_env(phases[1], 1, "self-test-topic")
         if env["ZMQ_E2E_CHAOS_PHASE"] != "broker-2":
             raise AssertionError("E2E chaos phase context failed")
+        if env["ZMQ_E2E_TOPIC"] != "self-test-topic":
+            raise AssertionError("E2E chaos topic context failed")
         if env["ZMQ_E2E_BROKER_PORTS"] != "node0:19092,node1:19094,node2:19096":
             raise AssertionError("E2E chaos broker port context failed")
+        if env["ZMQ_E2E_METRICS_PORTS"] != "node0:19090,node1:19091,node2:19098":
+            raise AssertionError("E2E chaos metrics port context failed")
         if "node0:zmq-node-0" not in env["ZMQ_E2E_CONTAINERS"]:
             raise AssertionError("E2E chaos container context failed")
+        if env["ZMQ_E2E_MINIO_PORT"] != "9000":
+            raise AssertionError("E2E chaos MinIO context failed")
         run_e2e_chaos_hook("self-test:down", phases[1]["down"], env)
         run_e2e_chaos_hook("self-test:up", phases[1]["up"], env)
 
@@ -621,11 +647,17 @@ def self_test():
             if "required E2E load/scale phases" not in str(exc):
                 raise
 
-        load_env = e2e_load_scale_hook_env(load_scale_phases[1], 1)
+        load_env = e2e_load_scale_hook_env(load_scale_phases[1], 1, "self-test-topic")
         if load_env["ZMQ_E2E_LOAD_SCALE_PHASE"] != "scale-in":
             raise AssertionError("E2E load/scale phase context failed")
+        if load_env["ZMQ_E2E_TOPIC"] != "self-test-topic":
+            raise AssertionError("E2E load/scale topic context failed")
         if load_env["ZMQ_E2E_CONTROLLER_PORTS"] != "node0:19093,node1:19095,node2:19097":
             raise AssertionError("E2E load/scale controller port context failed")
+        if load_env["ZMQ_E2E_METRICS_PORTS"] != "node0:19090,node1:19091,node2:19098":
+            raise AssertionError("E2E load/scale metrics port context failed")
+        if load_env["ZMQ_E2E_MINIO_PORT"] != "9000":
+            raise AssertionError("E2E load/scale MinIO context failed")
         run_e2e_load_scale_hook("self-test:apply", load_scale_phases[1]["apply"], load_env)
         run_e2e_load_scale_hook("self-test:restore", load_scale_phases[1]["restore"], load_env)
     finally:
