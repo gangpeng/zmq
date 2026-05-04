@@ -82,6 +82,8 @@ fn decompressGzip(alloc: Allocator, data: []const u8) ![]u8 {
 // Block types: literal (0), copy-1 (1), copy-2 (2), copy-4 (3)
 // ---------------------------------------------------------------
 fn compressSnappy(alloc: Allocator, data: []const u8) ![]u8 {
+    if (data.len > std.math.maxInt(u32)) return error.InputTooLarge;
+
     // Simple literal-only compression (valid Snappy, just uncompressed)
     var result = std.array_list.Managed(u8).init(alloc);
     errdefer result.deinit();
@@ -190,8 +192,9 @@ fn decompressSnappy(alloc: Allocator, data: []const u8) ![]u8 {
 fn compressLz4(alloc: Allocator, data: []const u8) ![]u8 {
     // Store format: [i32 uncompressed_len] [raw data]
     // This is valid as "uncompressed" LZ4 in Kafka's framing
+    const data_len_i32 = std.math.cast(i32, data.len) orelse return error.InputTooLarge;
     var result = try alloc.alloc(u8, 4 + data.len);
-    std.mem.writeInt(i32, result[0..4], @intCast(data.len), .big);
+    std.mem.writeInt(i32, result[0..4], data_len_i32, .big);
     @memcpy(result[4..], data);
     return result;
 }
@@ -284,8 +287,9 @@ fn decompressLz4(alloc: Allocator, data: []const u8) ![]u8 {
 // ---------------------------------------------------------------
 fn compressZstd(alloc: Allocator, data: []const u8) ![]u8 {
     // Simple store: [i32 len] [data]
+    const data_len_i32 = std.math.cast(i32, data.len) orelse return error.InputTooLarge;
     var result = try alloc.alloc(u8, 4 + data.len);
-    std.mem.writeInt(i32, result[0..4], @intCast(data.len), .big);
+    std.mem.writeInt(i32, result[0..4], data_len_i32, .big);
     @memcpy(result[4..], data);
     return result;
 }
@@ -308,7 +312,9 @@ fn decompressZstd(alloc: Allocator, data: []const u8) ![]u8 {
     }
 
     // Simple store format
-    const decompressed_size: usize = @intCast(std.mem.readInt(i32, data[0..4], .big));
+    const decompressed_size_i32 = std.mem.readInt(i32, data[0..4], .big);
+    if (decompressed_size_i32 < 0) return error.InvalidData;
+    const decompressed_size: usize = @intCast(decompressed_size_i32);
     if (data.len < 4 + decompressed_size) return error.InvalidData;
     return try alloc.dupe(u8, data[4 .. 4 + decompressed_size]);
 }
@@ -439,4 +445,12 @@ test "lz4 malformed streams fail closed" {
 
     const trailing_bytes = [_]u8{ 0x00, 0x00, 0x00, 0x01, 0x10, 'a', 0x00 };
     try testing.expectError(error.InvalidData, decompress(testing.allocator, .lz4, &trailing_bytes));
+}
+
+test "zstd store malformed streams fail closed" {
+    const negative_size = [_]u8{ 0xff, 0xff, 0xff, 0xff };
+    try testing.expectError(error.InvalidData, decompress(testing.allocator, .zstd, &negative_size));
+
+    const truncated_store = [_]u8{ 0x00, 0x00, 0x00, 0x05, 'a', 'b' };
+    try testing.expectError(error.InvalidData, decompress(testing.allocator, .zstd, &truncated_store));
 }
