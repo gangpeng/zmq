@@ -40,13 +40,13 @@ Optional environment:
     ZMQ_CLIENT_MATRIX_REQUIRED_VERSIONED_PROFILES
                                   Profiles that must pin exact client/library versions
     ZMQ_CLIENT_MATRIX_REQUIRED_SECURITY_PROFILES
-                                  Profiles that must run secured-client probes
+                                  Profiles that must run secured-client probes with supported tools
     ZMQ_CLIENT_MATRIX_REQUIRED_SECURITY_NEGATIVE_PROFILES
                                   Profiles that must run configured negative security probes
     ZMQ_CLIENT_MATRIX_REQUIRED_OAUTH_PROFILES
-                                  Profiles that must run OAUTHBEARER secured-client probes
+                                  Profiles that must run OAUTHBEARER secured-client probes for every selected tool
     ZMQ_CLIENT_MATRIX_REQUIRED_OAUTH_NEGATIVE_PROFILES
-                                  Profiles that must run OAuth-specific negative probes
+                                  Profiles that must run OAuth-specific negative probes for every selected tool
     ZMQ_CLIENT_MATRIX_REQUIRED_TOOLS
                                   Client tools that must be covered across all selected profiles
     ZMQ_CLIENT_MATRIX_REQUIRED_SEMANTICS
@@ -574,14 +574,23 @@ def validate_required_profiles(profiles):
             + ", ".join(missing_security)
         )
     unsecured = []
+    security_tool_mismatches = []
     for profile in required_security:
         apply_profile(profile)
+        tools = selected_tools()
         if not security_enabled():
             unsecured.append(profile)
+        if not tools or any(tool not in SECURITY_TOOLS for tool in tools):
+            security_tool_mismatches.append(profile)
     if unsecured:
         raise MatrixError(
             "required secured-client profiles must enable security semantics or a secured protocol: "
             + ", ".join(unsecured)
+        )
+    if security_tool_mismatches:
+        raise MatrixError(
+            "required secured-client profiles must select one or more security interop tools only: "
+            + ", ".join(security_tool_mismatches)
         )
 
     required_negative = configured_names(
@@ -596,12 +605,18 @@ def validate_required_profiles(profiles):
     negative_without_vectors = []
     for profile in required_negative:
         apply_profile(profile)
-        if not semantic_enabled("security-negative") or not security_negative_configured():
+        tools = selected_tools()
+        if (
+            not semantic_enabled("security-negative")
+            or not tools
+            or any(tool not in SECURITY_TOOLS for tool in tools)
+            or not all(security_negative_configured_for_tool(tool) for tool in tools)
+        ):
             negative_without_vectors.append(profile)
     if negative_without_vectors:
         raise MatrixError(
             "required negative-security profiles must enable security-negative "
-            "and configure at least one negative vector: "
+            "and configure a compatible negative vector for every selected tool: "
             + ", ".join(negative_without_vectors)
         )
 
@@ -616,14 +631,17 @@ def validate_required_profiles(profiles):
     for profile in required_oauth:
         apply_profile(profile)
         tools = selected_tools()
-        if not security_enabled() or not oauth_enabled() or not any(
-            oauth_positive_configured_for_tool(tool) for tool in tools
+        if (
+            not security_enabled()
+            or not oauth_enabled()
+            or not tools
+            or any(not oauth_positive_configured_for_tool(tool) for tool in tools)
         ):
             oauth_without_vectors.append(profile)
     if oauth_without_vectors:
         raise MatrixError(
             "required OAuth profiles must enable OAUTHBEARER security and "
-            "configure a positive fixture for at least one selected tool: "
+            "configure a positive fixture for every selected tool: "
             + ", ".join(oauth_without_vectors)
         )
 
@@ -644,14 +662,14 @@ def validate_required_profiles(profiles):
         tools = selected_tools()
         if (
             not semantic_enabled("security-negative")
-            or not oauth_negative_configured()
-            or not any(oauth_negative_configured_for_tool(tool) for tool in tools)
+            or not tools
+            or any(not oauth_negative_configured_for_tool(tool) for tool in tools)
         ):
             oauth_negative_without_vectors.append(profile)
     if oauth_negative_without_vectors:
         raise MatrixError(
             "required OAuth-negative profiles must enable security-negative "
-            "and configure an OAuth negative vector for at least one selected tool: "
+            "and configure an OAuth negative vector for every selected tool: "
             + ", ".join(oauth_negative_without_vectors)
         )
 
@@ -2120,6 +2138,15 @@ def self_test():
                 raise MatrixError("Kafka CLI OAuth security config self-test failed")
         finally:
             os.unlink(oauth_props_path)
+        os.environ["ZMQ_CLIENT_MATRIX_APACHE_3_7_TOOLS"] = "java-kafka,kcat"
+        os.environ["ZMQ_CLIENT_MATRIX_REQUIRED_OAUTH_PROFILES"] = "apache_3_7"
+        try:
+            validate_required_profiles(names)
+            raise MatrixError("OAuth profile missing a selected-tool fixture was accepted")
+        except MatrixError as exc:
+            if "every selected tool" not in str(exc):
+                raise
+        os.environ["ZMQ_CLIENT_MATRIX_APACHE_3_7_TOOLS"] = "java-kafka"
         os.environ["ZMQ_CLIENT_MATRIX_REQUIRED_OAUTH_PROFILES"] = "apache_3_7"
         os.environ["ZMQ_CLIENT_MATRIX_REQUIRED_OAUTH_NEGATIVE_PROFILES"] = "apache_3_7"
         validate_required_profiles(names)
@@ -2158,6 +2185,14 @@ def self_test():
         except MatrixError as exc:
             if "security interop probes" not in str(exc):
                 raise
+        os.environ["ZMQ_CLIENT_MATRIX_REQUIRED_SECURITY_PROFILES"] = "go_1_21"
+        try:
+            validate_required_profiles(names)
+            raise MatrixError("required secured profile with unsupported tool was accepted")
+        except MatrixError as exc:
+            if "security interop tools" not in str(exc):
+                raise
+        os.environ.pop("ZMQ_CLIENT_MATRIX_REQUIRED_SECURITY_PROFILES", None)
         os.environ["ZMQ_CLIENT_MATRIX_GO_1_21_SEMANTICS"] = "security-negative"
         apply_profile("go_1_21")
         try:
