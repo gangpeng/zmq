@@ -1446,6 +1446,229 @@ test "generated non-default golden fixtures cover legacy and flexible wire encod
     }
 
     {
+        const AddPartitionsToTxnRequest = generated.add_partitions_to_txn_request.AddPartitionsToTxnRequest;
+        const AddPartitionsToTxnTopic = generated.add_partitions_to_txn_request.AddPartitionsToTxnTopic;
+        const topics = [_]AddPartitionsToTxnTopic{.{
+            .name = "topic-a",
+            .partitions = &[_]i32{ 0, 2 },
+        }};
+        const value_v3 = AddPartitionsToTxnRequest{
+            .v3_and_below_transactional_id = "txn-a",
+            .v3_and_below_producer_id = 123456789,
+            .v3_and_below_producer_epoch = 2,
+            .v3_and_below_topics = &topics,
+        };
+        try expectGoldenRoundTrip(AddPartitionsToTxnRequest, value_v3, 3, &[_]u8{
+            0x06, 0x74, 0x78, 0x6e, 0x2d, 0x61, 0x00, 0x00,
+            0x00, 0x00, 0x07, 0x5b, 0xcd, 0x15, 0x00, 0x02,
+            0x02, 0x08, 0x74, 0x6f, 0x70, 0x69, 0x63, 0x2d,
+            0x61, 0x03, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x02, 0x00, 0x00,
+        });
+
+        const transactions = [_]AddPartitionsToTxnRequest.AddPartitionsToTxnTransaction{.{
+            .transactional_id = "txn-a",
+            .producer_id = 123456789,
+            .producer_epoch = 2,
+            .verify_only = true,
+            .topics = &topics,
+        }};
+        const value_v4 = AddPartitionsToTxnRequest{
+            .transactions = &transactions,
+        };
+        try expectGoldenRoundTrip(AddPartitionsToTxnRequest, value_v4, 4, &[_]u8{
+            0x02, 0x06, 0x74, 0x78, 0x6e, 0x2d, 0x61, 0x00,
+            0x00, 0x00, 0x00, 0x07, 0x5b, 0xcd, 0x15, 0x00,
+            0x02, 0x01, 0x02, 0x08, 0x74, 0x6f, 0x70, 0x69,
+            0x63, 0x2d, 0x61, 0x03, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00,
+        });
+    }
+
+    {
+        const AddPartitionsToTxnResponse = generated.add_partitions_to_txn_response.AddPartitionsToTxnResponse;
+        const AddPartitionsToTxnTopicResult = generated.add_partitions_to_txn_response.AddPartitionsToTxnTopicResult;
+        const AddPartitionsToTxnPartitionResult = generated.add_partitions_to_txn_response.AddPartitionsToTxnPartitionResult;
+        const partition_results = [_]AddPartitionsToTxnPartitionResult{
+            .{ .partition_index = 0, .partition_error_code = 0 },
+            .{ .partition_index = 2, .partition_error_code = 48 },
+        };
+        const topic_results = [_]AddPartitionsToTxnTopicResult{.{
+            .name = "topic-a",
+            .results_by_partition = &partition_results,
+        }};
+        const value_v3 = AddPartitionsToTxnResponse{
+            .throttle_time_ms = 5,
+            .results_by_topic_v3_and_below = &topic_results,
+        };
+        try expectGoldenRoundTrip(AddPartitionsToTxnResponse, value_v3, 3, &[_]u8{
+            0x00, 0x00, 0x00, 0x05, 0x02, 0x08, 0x74, 0x6f,
+            0x70, 0x69, 0x63, 0x2d, 0x61, 0x03, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x02, 0x00, 0x30, 0x00, 0x00, 0x00,
+        });
+
+        const transaction_results = [_]AddPartitionsToTxnResponse.AddPartitionsToTxnResult{.{
+            .transactional_id = "txn-a",
+            .topic_results = &topic_results,
+        }};
+        const value_v4 = AddPartitionsToTxnResponse{
+            .throttle_time_ms = 5,
+            .error_code = 0,
+            .results_by_transaction = &transaction_results,
+        };
+        try expectGoldenRoundTrip(AddPartitionsToTxnResponse, value_v4, 4, &[_]u8{
+            0x00, 0x00, 0x00, 0x05, 0x00, 0x00, 0x02, 0x06,
+            0x74, 0x78, 0x6e, 0x2d, 0x61, 0x02, 0x08, 0x74,
+            0x6f, 0x70, 0x69, 0x63, 0x2d, 0x61, 0x03, 0x00,
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x02, 0x00, 0x30, 0x00, 0x00, 0x00, 0x00,
+        });
+    }
+
+    {
+        const AssignReplicasToDirsRequest = generated.assign_replicas_to_dirs_request.AssignReplicasToDirsRequest;
+        const partition_data = [_]AssignReplicasToDirsRequest.DirectoryData.TopicData.PartitionData{
+            .{ .partition_index = 3 },
+            .{ .partition_index = 7 },
+        };
+        const topics = [_]AssignReplicasToDirsRequest.DirectoryData.TopicData{.{
+            .topic_id = .{
+                0x10, 0x11, 0x12, 0x13,
+                0x14, 0x15, 0x16, 0x17,
+                0x18, 0x19, 0x1a, 0x1b,
+                0x1c, 0x1d, 0x1e, 0x1f,
+            },
+            .partitions = &partition_data,
+        }};
+        const directories = [_]AssignReplicasToDirsRequest.DirectoryData{.{
+            .id = .{
+                0x00, 0x01, 0x02, 0x03,
+                0x04, 0x05, 0x06, 0x07,
+                0x08, 0x09, 0x0a, 0x0b,
+                0x0c, 0x0d, 0x0e, 0x0f,
+            },
+            .topics = &topics,
+        }};
+        const value = AssignReplicasToDirsRequest{
+            .broker_id = 2,
+            .broker_epoch = 9,
+            .directories = &directories,
+        };
+        try expectGoldenRoundTrip(AssignReplicasToDirsRequest, value, 0, &[_]u8{
+            0x00, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x09, 0x02, 0x00, 0x01, 0x02,
+            0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a,
+            0x0b, 0x0c, 0x0d, 0x0e, 0x0f, 0x02, 0x10, 0x11,
+            0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18, 0x19,
+            0x1a, 0x1b, 0x1c, 0x1d, 0x1e, 0x1f, 0x03, 0x00,
+            0x00, 0x00, 0x03, 0x00, 0x00, 0x00, 0x00, 0x07,
+            0x00, 0x00, 0x00, 0x00,
+        });
+    }
+
+    {
+        const AssignReplicasToDirsResponse = generated.assign_replicas_to_dirs_response.AssignReplicasToDirsResponse;
+        const partition_data = [_]AssignReplicasToDirsResponse.DirectoryData.TopicData.PartitionData{
+            .{ .partition_index = 3, .error_code = 0 },
+            .{ .partition_index = 7, .error_code = 72 },
+        };
+        const topics = [_]AssignReplicasToDirsResponse.DirectoryData.TopicData{.{
+            .topic_id = .{
+                0x10, 0x11, 0x12, 0x13,
+                0x14, 0x15, 0x16, 0x17,
+                0x18, 0x19, 0x1a, 0x1b,
+                0x1c, 0x1d, 0x1e, 0x1f,
+            },
+            .partitions = &partition_data,
+        }};
+        const directories = [_]AssignReplicasToDirsResponse.DirectoryData{.{
+            .id = .{
+                0x00, 0x01, 0x02, 0x03,
+                0x04, 0x05, 0x06, 0x07,
+                0x08, 0x09, 0x0a, 0x0b,
+                0x0c, 0x0d, 0x0e, 0x0f,
+            },
+            .topics = &topics,
+        }};
+        const value = AssignReplicasToDirsResponse{
+            .throttle_time_ms = 11,
+            .error_code = 0,
+            .directories = &directories,
+        };
+        try expectGoldenRoundTrip(AssignReplicasToDirsResponse, value, 0, &[_]u8{
+            0x00, 0x00, 0x00, 0x0b, 0x00, 0x00, 0x02, 0x00,
+            0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08,
+            0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f, 0x02,
+            0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17,
+            0x18, 0x19, 0x1a, 0x1b, 0x1c, 0x1d, 0x1e, 0x1f,
+            0x03, 0x00, 0x00, 0x00, 0x03, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x07, 0x00, 0x48, 0x00, 0x00,
+            0x00, 0x00,
+        });
+    }
+
+    {
+        const DescribeTransactionsRequest = generated.describe_transactions_request.DescribeTransactionsRequest;
+        const transactional_ids = [_]?[]const u8{ "txn-a", "txn-b" };
+        const value = DescribeTransactionsRequest{
+            .transactional_ids = &transactional_ids,
+        };
+        try expectGoldenRoundTrip(DescribeTransactionsRequest, value, 0, &[_]u8{
+            0x03, 0x06, 0x74, 0x78, 0x6e, 0x2d, 0x61, 0x06,
+            0x74, 0x78, 0x6e, 0x2d, 0x62, 0x00,
+        });
+    }
+
+    {
+        const DescribeTransactionsResponse = generated.describe_transactions_response.DescribeTransactionsResponse;
+        const topics = [_]DescribeTransactionsResponse.TransactionState.TopicData{.{
+            .topic = "topic-a",
+            .partitions = &[_]i32{ 0, 2 },
+        }};
+        const transaction_states = [_]DescribeTransactionsResponse.TransactionState{
+            .{
+                .error_code = 0,
+                .transactional_id = "txn-a",
+                .transaction_state = "Ongoing",
+                .transaction_timeout_ms = 45_000,
+                .transaction_start_time_ms = 1_700_000_000_000,
+                .producer_id = 123456789,
+                .producer_epoch = 2,
+                .topics = &topics,
+            },
+            .{
+                .error_code = 48,
+                .transactional_id = "missing",
+                .transaction_state = "",
+                .transaction_timeout_ms = 0,
+                .transaction_start_time_ms = -1,
+                .producer_id = -1,
+                .producer_epoch = -1,
+            },
+        };
+        const value = DescribeTransactionsResponse{
+            .throttle_time_ms = 7,
+            .transaction_states = &transaction_states,
+        };
+        try expectGoldenRoundTrip(DescribeTransactionsResponse, value, 0, &[_]u8{
+            0x00, 0x00, 0x00, 0x07, 0x03, 0x00, 0x00, 0x06,
+            0x74, 0x78, 0x6e, 0x2d, 0x61, 0x08, 0x4f, 0x6e,
+            0x67, 0x6f, 0x69, 0x6e, 0x67, 0x00, 0x00, 0xaf,
+            0xc8, 0x00, 0x00, 0x01, 0x8b, 0xcf, 0xe5, 0x68,
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x07, 0x5b, 0xcd,
+            0x15, 0x00, 0x02, 0x02, 0x08, 0x74, 0x6f, 0x70,
+            0x69, 0x63, 0x2d, 0x61, 0x03, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00,
+            0x30, 0x08, 0x6d, 0x69, 0x73, 0x73, 0x69, 0x6e,
+            0x67, 0x01, 0x00, 0x00, 0x00, 0x00, 0xff, 0xff,
+            0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+            0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+            0x01, 0x00, 0x00,
+        });
+    }
+
+    {
         const ConsumerGroupHeartbeatRequest = generated.consumer_group_heartbeat_request.ConsumerGroupHeartbeatRequest;
         const null_value = ConsumerGroupHeartbeatRequest{
             .group_id = "g",
