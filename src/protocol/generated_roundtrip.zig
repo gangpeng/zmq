@@ -2187,6 +2187,322 @@ test "generated non-default golden fixtures cover legacy and flexible wire encod
     }
 
     {
+        const DescribeClusterRequest = generated.describe_cluster_request.DescribeClusterRequest;
+        const value = DescribeClusterRequest{
+            .include_cluster_authorized_operations = true,
+            .endpoint_type = 2,
+        };
+        try expectGoldenRoundTrip(DescribeClusterRequest, value, 1, &[_]u8{
+            0x01, 0x02, 0x00,
+        });
+    }
+
+    {
+        const DescribeClusterResponse = generated.describe_cluster_response.DescribeClusterResponse;
+        const brokers = [_]DescribeClusterResponse.DescribeClusterBroker{.{
+            .broker_id = 1,
+            .host = "localhost",
+            .port = 9092,
+            .rack = "rack-a",
+        }};
+        const value = DescribeClusterResponse{
+            .throttle_time_ms = 7,
+            .error_code = 0,
+            .error_message = null,
+            .endpoint_type = 2,
+            .cluster_id = "cluster-a",
+            .controller_id = 1,
+            .brokers = &brokers,
+            .cluster_authorized_operations = 9,
+        };
+        try expectGoldenRoundTrip(DescribeClusterResponse, value, 1, &[_]u8{
+            0x00, 0x00, 0x00, 0x07,
+            0x00, 0x00, 0x00, 0x02,
+            0x0a, 'c',  'l',  'u',
+            's',  't',  'e',  'r',
+            '-',  'a',  0x00, 0x00,
+            0x00, 0x01, 0x02, 0x00,
+            0x00, 0x00, 0x01, 0x0a,
+            'l',  'o',  'c',  'a',
+            'l',  'h',  'o',  's',
+            't',  0x00, 0x00, 0x23,
+            0x84, 0x07, 'r',  'a',
+            'c',  'k',  '-',  'a',
+            0x00, 0x00, 0x00, 0x00,
+            0x09, 0x00,
+        });
+    }
+
+    {
+        const DescribeQuorumRequest = generated.describe_quorum_request.DescribeQuorumRequest;
+        const partitions = [_]DescribeQuorumRequest.TopicData.PartitionData{
+            .{ .partition_index = 0 },
+            .{ .partition_index = 1 },
+        };
+        const topics = [_]DescribeQuorumRequest.TopicData{.{
+            .topic_name = "raft",
+            .partitions = &partitions,
+        }};
+        const value = DescribeQuorumRequest{
+            .topics = &topics,
+        };
+        try expectGoldenRoundTrip(DescribeQuorumRequest, value, 2, &[_]u8{
+            0x02,
+            0x05,
+            'r',
+            'a',
+            'f',
+            't',
+            0x03,
+            0x00,
+            0x00,
+            0x00,
+            0x00,
+            0x00,
+            0x00,
+            0x00,
+            0x00,
+            0x01,
+            0x00,
+            0x00,
+            0x00,
+        });
+    }
+
+    {
+        const DescribeQuorumResponse = generated.describe_quorum_response.DescribeQuorumResponse;
+        const ReplicaState = generated.describe_quorum_response.ReplicaState;
+        const voters = [_]ReplicaState{.{
+            .replica_id = 1,
+            .replica_directory_id = .{
+                0x00, 0x01, 0x02, 0x03,
+                0x04, 0x05, 0x06, 0x07,
+                0x08, 0x09, 0x0a, 0x0b,
+                0x0c, 0x0d, 0x0e, 0x0f,
+            },
+            .log_end_offset = 42,
+            .last_fetch_timestamp = 1000,
+            .last_caught_up_timestamp = 1001,
+        }};
+        const partitions = [_]DescribeQuorumResponse.TopicData.PartitionData{.{
+            .partition_index = 0,
+            .error_code = 0,
+            .error_message = null,
+            .leader_id = 1,
+            .leader_epoch = 2,
+            .high_watermark = 42,
+            .current_voters = &voters,
+            .observers = &.{},
+        }};
+        const topics = [_]DescribeQuorumResponse.TopicData{.{
+            .topic_name = "raft",
+            .partitions = &partitions,
+        }};
+        const listeners = [_]DescribeQuorumResponse.Node.Listener{.{
+            .name = "PLAINTEXT",
+            .host = "localhost",
+            .port = 9093,
+        }};
+        const nodes = [_]DescribeQuorumResponse.Node{.{
+            .node_id = 1,
+            .listeners = &listeners,
+        }};
+        const value = DescribeQuorumResponse{
+            .error_code = 0,
+            .error_message = null,
+            .topics = &topics,
+            .nodes = &nodes,
+        };
+        try expectGoldenRoundTrip(DescribeQuorumResponse, value, 2, &[_]u8{
+            0x00, 0x00,
+            0x00, 0x02,
+            0x05, 'r',
+            'a',  'f',
+            't',  0x02,
+            0x00, 0x00,
+            0x00, 0x00,
+            0x00, 0x00,
+            0x00, 0x00,
+            0x00, 0x00,
+            0x01, 0x00,
+            0x00, 0x00,
+            0x02, 0x00,
+            0x00, 0x00,
+            0x00, 0x00,
+            0x00, 0x00,
+            0x2a, 0x02,
+            0x00, 0x00,
+            0x00, 0x01,
+            0x00, 0x01,
+            0x02, 0x03,
+            0x04, 0x05,
+            0x06, 0x07,
+            0x08, 0x09,
+            0x0a, 0x0b,
+            0x0c, 0x0d,
+            0x0e, 0x0f,
+            0x00, 0x00,
+            0x00, 0x00,
+            0x00, 0x00,
+            0x00, 0x2a,
+            0x00, 0x00,
+            0x00, 0x00,
+            0x00, 0x00,
+            0x03, 0xe8,
+            0x00, 0x00,
+            0x00, 0x00,
+            0x00, 0x00,
+            0x03, 0xe9,
+            0x00, 0x01,
+            0x00, 0x00,
+            0x02, 0x00,
+            0x00, 0x00,
+            0x01, 0x02,
+            0x0a, 'P',
+            'L',  'A',
+            'I',  'N',
+            'T',  'E',
+            'X',  'T',
+            0x0a, 'l',
+            'o',  'c',
+            'a',  'l',
+            'h',  'o',
+            's',  't',
+            0x23, 0x85,
+            0x00, 0x00,
+            0x00,
+        });
+    }
+
+    {
+        const UpdateFeaturesRequest = generated.update_features_request.UpdateFeaturesRequest;
+        const feature_updates_v0 = [_]UpdateFeaturesRequest.FeatureUpdateKey{.{
+            .feature = "kraft.version",
+            .max_version_level = 1,
+            .allow_downgrade = true,
+        }};
+        const value_v0 = UpdateFeaturesRequest{
+            .timeout_ms = 30_000,
+            .feature_updates = &feature_updates_v0,
+        };
+        try expectGoldenRoundTrip(UpdateFeaturesRequest, value_v0, 0, &[_]u8{
+            0x00, 0x00, 0x75, 0x30,
+            0x02, 0x0e, 'k',  'r',
+            'a',  'f',  't',  '.',
+            'v',  'e',  'r',  's',
+            'i',  'o',  'n',  0x00,
+            0x01, 0x01, 0x00, 0x00,
+        });
+
+        const feature_updates_v1 = [_]UpdateFeaturesRequest.FeatureUpdateKey{.{
+            .feature = "kraft.version",
+            .max_version_level = 2,
+            .upgrade_type = 2,
+        }};
+        const value_v1 = UpdateFeaturesRequest{
+            .timeout_ms = 30_000,
+            .feature_updates = &feature_updates_v1,
+            .validate_only = true,
+        };
+        try expectGoldenRoundTrip(UpdateFeaturesRequest, value_v1, 1, &[_]u8{
+            0x00, 0x00, 0x75, 0x30,
+            0x02, 0x0e, 'k',  'r',
+            'a',  'f',  't',  '.',
+            'v',  'e',  'r',  's',
+            'i',  'o',  'n',  0x00,
+            0x02, 0x02, 0x00, 0x01,
+            0x00,
+        });
+    }
+
+    {
+        const UpdateFeaturesResponse = generated.update_features_response.UpdateFeaturesResponse;
+        const results = [_]UpdateFeaturesResponse.UpdatableFeatureResult{
+            .{
+                .feature = "kraft.version",
+                .error_code = 0,
+                .error_message = null,
+            },
+            .{
+                .feature = "foo",
+                .error_code = 40,
+                .error_message = "bad",
+            },
+        };
+        const value = UpdateFeaturesResponse{
+            .throttle_time_ms = 7,
+            .error_code = 0,
+            .error_message = null,
+            .results = &results,
+        };
+        try expectGoldenRoundTrip(UpdateFeaturesResponse, value, 1, &[_]u8{
+            0x00, 0x00, 0x00, 0x07,
+            0x00, 0x00, 0x00, 0x03,
+            0x0e, 'k',  'r',  'a',
+            'f',  't',  '.',  'v',
+            'e',  'r',  's',  'i',
+            'o',  'n',  0x00, 0x00,
+            0x00, 0x00, 0x04, 'f',
+            'o',  'o',  0x00, 0x28,
+            0x04, 'b',  'a',  'd',
+            0x00, 0x00,
+        });
+    }
+
+    {
+        const UnregisterBrokerRequest = generated.unregister_broker_request.UnregisterBrokerRequest;
+        const value = UnregisterBrokerRequest{ .broker_id = 100 };
+        try expectGoldenRoundTrip(UnregisterBrokerRequest, value, 0, &[_]u8{
+            0x00, 0x00, 0x00, 0x64,
+            0x00,
+        });
+    }
+
+    {
+        const UnregisterBrokerResponse = generated.unregister_broker_response.UnregisterBrokerResponse;
+        const value = UnregisterBrokerResponse{
+            .throttle_time_ms = 7,
+            .error_code = 0,
+            .error_message = null,
+        };
+        try expectGoldenRoundTrip(UnregisterBrokerResponse, value, 0, &[_]u8{
+            0x00, 0x00, 0x00, 0x07,
+            0x00, 0x00, 0x00, 0x00,
+        });
+    }
+
+    {
+        const AllocateProducerIdsRequest = generated.allocate_producer_ids_request.AllocateProducerIdsRequest;
+        const value = AllocateProducerIdsRequest{
+            .broker_id = 1,
+            .broker_epoch = 2,
+        };
+        try expectGoldenRoundTrip(AllocateProducerIdsRequest, value, 0, &[_]u8{
+            0x00, 0x00, 0x00, 0x01,
+            0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x02,
+            0x00,
+        });
+    }
+
+    {
+        const AllocateProducerIdsResponse = generated.allocate_producer_ids_response.AllocateProducerIdsResponse;
+        const value = AllocateProducerIdsResponse{
+            .throttle_time_ms = 7,
+            .error_code = 0,
+            .producer_id_start = 123456789,
+            .producer_id_len = 1000,
+        };
+        try expectGoldenRoundTrip(AllocateProducerIdsResponse, value, 0, &[_]u8{
+            0x00, 0x00, 0x00, 0x07,
+            0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x07, 0x5b,
+            0xcd, 0x15, 0x00, 0x00,
+            0x03, 0xe8, 0x00,
+        });
+    }
+
+    {
         const ControllerRegistrationRequest = generated.controller_registration_request.ControllerRegistrationRequest;
         const incarnation_id = [_]u8{
             0x20, 0x21, 0x22, 0x23,

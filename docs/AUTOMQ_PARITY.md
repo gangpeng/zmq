@@ -48,6 +48,8 @@ operator-facing behavior.
   GetTelemetrySubscriptions/PushTelemetry/ListClientMetricsResources v0,
   AlterConfigs v0/v2, IncrementalAlterConfigs v0/v1,
   DeleteTopics v3/v6, DeleteGroups v0/v2,
+  DescribeCluster v1, DescribeQuorum v2, UpdateFeatures v0/v1,
+  UnregisterBroker v0, AllocateProducerIds v0,
   AssignReplicasToDirs v0, ShareFetch/ShareAcknowledge v0,
   Initialize/Read/Write/DeleteShareGroupState and ReadShareGroupStateSummary
   v0, ConsumerGroupDescribe v0, OffsetCommit v1/v8, OffsetFetch v7/v8,
@@ -70,6 +72,8 @@ operator-facing behavior.
   telemetry UUID/compression/metric-prefix/payload resource fields,
   config admin null values/operation types, topic deletion name-to-UUID
   transitions, group deletion compact arrays,
+  cluster endpoint/rack metadata, KRaft quorum directory/listener state,
+  feature update downgrade/upgrade gates, controller PID allocation ranges,
   transaction filters/results, flexible encodings, and tagged-field
   terminators.
 
