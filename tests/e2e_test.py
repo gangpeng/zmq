@@ -498,15 +498,26 @@ def main():
         except Exception as e:
             t.check(f"{node['name']} metadata", False, str(e))
             topic_lists.append(set())
+    if topic_lists:
+        reference_topics = topic_lists[0]
+        metadata_consistent = all(topics == reference_topics for topics in topic_lists[1:])
+        if metadata_consistent:
+            t.check("Metadata topic sets are consistent across nodes", True)
+        else:
+            detail = "; ".join(
+                f"{NODES[i]['name']}={sorted(topics)}" for i, topics in enumerate(topic_lists)
+            )
+            t.check("Metadata topic sets are consistent across nodes", False, detail)
 
     # =============================================
     # Test (k): Produce to different nodes (cross-node)
     # =============================================
     print("\n[Test k] Cross-node produce/fetch")
+    cross_node_payload = b"from-node1"
     # Produce to node 1
     try:
         sock = t.connect(NODES[1]["broker_port"])
-        err, off = produce(sock, t.next(), "e2e-topic", 0, b"from-node1")
+        err, off = produce(sock, t.next(), "e2e-topic", 0, cross_node_payload)
         t.check(f"Produce to node 1: offset={off}", err == 0)
         sock.close()
     except Exception as e:
@@ -516,7 +527,10 @@ def main():
     try:
         sock = t.connect(NODES[2]["broker_port"])
         err, hw, rec_len, records = fetch(sock, t.next(), "e2e-topic", 0, 0)
-        t.check(f"Fetch from node 2: hw={hw}, {rec_len}B", err == 0)
+        t.check(
+            f"Fetch from node 2 includes cross-node payload: hw={hw}, {rec_len}B",
+            err == 0 and cross_node_payload in records,
+        )
         sock.close()
     except Exception as e:
         t.check("Fetch from node 2", False, str(e))
