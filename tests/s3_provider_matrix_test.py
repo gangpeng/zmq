@@ -12,6 +12,8 @@ Run:
 
 Global environment:
     ZMQ_S3_PROVIDER_PROFILES    Comma-separated profile names. Defaults to minio.
+    ZMQ_S3_PROVIDER_REQUIRED_PROFILES comma-separated profile names that must be present.
+    ZMQ_S3_PROVIDER_REQUIRED_OUTAGE_PROFILES comma-separated profile names that must run outage gates.
     ZMQ_S3_PROVIDER_ZIG         Zig executable. Defaults to zig.
 
 Per-profile overrides:
@@ -65,6 +67,11 @@ def profile_names():
     raw = os.environ.get("ZMQ_S3_PROVIDER_PROFILES", "minio")
     names = [name.strip() for name in raw.split(",") if name.strip()]
     return names if names else ["minio"]
+
+
+def configured_names(env_name):
+    raw = os.environ.get(env_name, "")
+    return [name.strip() for name in raw.split(",") if name.strip()]
 
 
 def profile_key(profile, suffix):
@@ -148,6 +155,44 @@ def profile_enabled(profile, suffix):
     return truthy(profile_setting(profile, suffix, "0"))
 
 
+def validate_required_profiles(profiles):
+    profile_set = set(profiles)
+    required = configured_names("ZMQ_S3_PROVIDER_REQUIRED_PROFILES")
+    missing = [profile for profile in required if profile not in profile_set]
+    if missing:
+        raise MatrixError(
+            "required S3 provider profiles missing from ZMQ_S3_PROVIDER_PROFILES: "
+            + ", ".join(missing)
+        )
+
+    required_outage = configured_names("ZMQ_S3_PROVIDER_REQUIRED_OUTAGE_PROFILES")
+    missing_outage_profiles = [profile for profile in required_outage if profile not in profile_set]
+    if missing_outage_profiles:
+        raise MatrixError(
+            "required S3 outage profiles missing from ZMQ_S3_PROVIDER_PROFILES: "
+            + ", ".join(missing_outage_profiles)
+        )
+    disabled = [
+        profile for profile in required_outage
+        if not profile_enabled(profile, "RUN_LIVE_OUTAGE")
+    ]
+    if disabled:
+        raise MatrixError(
+            "required S3 outage profiles must set RUN_LIVE_OUTAGE=1: "
+            + ", ".join(disabled)
+        )
+    missing_hooks = [
+        profile for profile in required_outage
+        if not profile_setting(profile, "OUTAGE_DOWN", None)
+        or not profile_setting(profile, "OUTAGE_UP", None)
+    ]
+    if missing_hooks:
+        raise MatrixError(
+            "required S3 outage profiles must set OUTAGE_DOWN and OUTAGE_UP hooks: "
+            + ", ".join(missing_hooks)
+        )
+
+
 def run_profile(profile):
     env = provider_env(profile)
     run([ZIG, "build", "test-minio", "--summary", "all"], timeout=600, env=env)
@@ -169,6 +214,7 @@ def main():
         return 0
 
     profiles = profile_names()
+    validate_required_profiles(profiles)
     for profile in profiles:
         run_profile(profile)
     print(f"ok: S3 provider matrix passed for {', '.join(profiles)}")
@@ -192,10 +238,13 @@ def self_test():
         os.environ["ZMQ_S3_AWS_US_EAST_1_RUN_LIVE_OUTAGE"] = "true"
         os.environ["ZMQ_S3_AWS_US_EAST_1_OUTAGE_DOWN"] = "tc qdisc add dev lo root netem loss 100%"
         os.environ["ZMQ_S3_AWS_US_EAST_1_OUTAGE_UP"] = "tc qdisc del dev lo root"
+        os.environ["ZMQ_S3_PROVIDER_REQUIRED_PROFILES"] = "minio,aws_us_east_1"
+        os.environ["ZMQ_S3_PROVIDER_REQUIRED_OUTAGE_PROFILES"] = "aws_us_east_1"
 
         names = profile_names()
         if names != ["minio", "aws_us_east_1"]:
             raise MatrixError(f"profile parsing failed: {names}")
+        validate_required_profiles(names)
 
         env = provider_env("aws_us_east_1")
         if env["ZMQ_S3_ENDPOINT"] != "s3.amazonaws.com":
@@ -227,6 +276,14 @@ def self_test():
             raise MatrixError("profile live-outage endpoint pass-through failed")
         if chaos_env["ZMQ_CHAOS_S3_DOWN"] != "tc qdisc add dev lo root netem loss 100%":
             raise MatrixError("profile live-outage down hook override failed")
+
+        os.environ["ZMQ_S3_PROVIDER_REQUIRED_OUTAGE_PROFILES"] = "minio,aws_us_east_1"
+        try:
+            validate_required_profiles(names)
+            raise MatrixError("missing required outage profile did not fail validation")
+        except MatrixError as exc:
+            if "RUN_LIVE_OUTAGE" not in str(exc):
+                raise
 
         print("ok: S3 provider matrix self-test")
         return 0
