@@ -266,6 +266,48 @@ test "generated non-default golden fixtures cover legacy and flexible wire encod
     }
 
     {
+        const StopReplicaResponse = generated.stop_replica_response.StopReplicaResponse;
+        const partition_errors = [_]StopReplicaResponse.StopReplicaPartitionError{
+            .{
+                .topic_name = "topic-a",
+                .partition_index = 0,
+                .error_code = 0,
+            },
+            .{
+                .topic_name = "topic-b",
+                .partition_index = 2,
+                .error_code = 42,
+            },
+        };
+        const value = StopReplicaResponse{
+            .error_code = 0,
+            .partition_errors = &partition_errors,
+        };
+        try expectGoldenRoundTrip(StopReplicaResponse, value, 1, &[_]u8{
+            0x00, 0x00, 0x00, 0x00,
+            0x00, 0x02, 0x00, 0x07,
+            't',  'o',  'p',  'i',
+            'c',  '-',  'a',  0x00,
+            0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x07, 't',
+            'o',  'p',  'i',  'c',
+            '-',  'b',  0x00, 0x00,
+            0x00, 0x02, 0x00, 0x2a,
+        });
+        try expectGoldenRoundTrip(StopReplicaResponse, value, 2, &[_]u8{
+            0x00, 0x00, 0x03, 0x08,
+            't',  'o',  'p',  'i',
+            'c',  '-',  'a',  0x00,
+            0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x08, 't',
+            'o',  'p',  'i',  'c',
+            '-',  'b',  0x00, 0x00,
+            0x00, 0x02, 0x00, 0x2a,
+            0x00, 0x00,
+        });
+    }
+
+    {
         const AlterPartitionRequest = generated.alter_partition_request.AlterPartitionRequest;
         const partitions = [_]AlterPartitionRequest.TopicData.PartitionData{.{
             .partition_index = 2,
@@ -608,6 +650,68 @@ test "generated non-default golden fixtures cover legacy and flexible wire encod
         };
         try expectGoldenRoundTrip(DescribeLogDirsRequest, empty_value, 2, &[_]u8{
             0x01, 0x00,
+        });
+    }
+
+    {
+        const DescribeLogDirsResponse = generated.describe_log_dirs_response.DescribeLogDirsResponse;
+        const partitions = [_]DescribeLogDirsResponse.DescribeLogDirsResult.DescribeLogDirsTopic.DescribeLogDirsPartition{.{
+            .partition_index = 0,
+            .partition_size = 1024,
+            .offset_lag = 5,
+            .is_future_key = true,
+        }};
+        const topics = [_]DescribeLogDirsResponse.DescribeLogDirsResult.DescribeLogDirsTopic{.{
+            .name = "topic-a",
+            .partitions = &partitions,
+        }};
+        const results = [_]DescribeLogDirsResponse.DescribeLogDirsResult{.{
+            .error_code = 0,
+            .log_dir = "/data/0",
+            .topics = &topics,
+            .total_bytes = 4096,
+            .usable_bytes = 2048,
+        }};
+        const value = DescribeLogDirsResponse{
+            .throttle_time_ms = 7,
+            .error_code = 0,
+            .results = &results,
+        };
+        try expectGoldenRoundTrip(DescribeLogDirsResponse, value, 1, &[_]u8{
+            0x00, 0x00, 0x00, 0x07,
+            0x00, 0x00, 0x00, 0x01,
+            0x00, 0x00, 0x00, 0x07,
+            '/',  'd',  'a',  't',
+            'a',  '/',  '0',  0x00,
+            0x00, 0x00, 0x01, 0x00,
+            0x07, 't',  'o',  'p',
+            'i',  'c',  '-',  'a',
+            0x00, 0x00, 0x00, 0x01,
+            0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x04, 0x00,
+            0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x05,
+            0x01,
+        });
+        try expectGoldenRoundTrip(DescribeLogDirsResponse, value, 4, &[_]u8{
+            0x00, 0x00, 0x00, 0x07,
+            0x00, 0x00, 0x02, 0x00,
+            0x00, 0x08, '/',  'd',
+            'a',  't',  'a',  '/',
+            '0',  0x02, 0x08, 't',
+            'o',  'p',  'i',  'c',
+            '-',  'a',  0x02, 0x00,
+            0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00,
+            0x00, 0x04, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x05, 0x01,
+            0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00,
+            0x10, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00,
+            0x08, 0x00, 0x00, 0x00,
         });
     }
 
@@ -6192,6 +6296,19 @@ test "generated non-default golden fixtures cover legacy and flexible wire encod
             'a',  'c',  'k',  '-',
             'a',  0x00, 0x01, 0x00,
             0x01, 0x02,
+        });
+    }
+
+    {
+        const UpdateMetadataResponse = generated.update_metadata_response.UpdateMetadataResponse;
+        const value = UpdateMetadataResponse{
+            .error_code = 42,
+        };
+        try expectGoldenRoundTrip(UpdateMetadataResponse, value, 5, &[_]u8{
+            0x00, 0x2a,
+        });
+        try expectGoldenRoundTrip(UpdateMetadataResponse, value, 6, &[_]u8{
+            0x00, 0x2a, 0x00,
         });
     }
 }
