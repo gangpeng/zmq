@@ -722,6 +722,161 @@ test "generated non-default golden fixtures cover legacy and flexible wire encod
     }
 
     {
+        const DescribeAclsRequest = generated.describe_acls_request.DescribeAclsRequest;
+        const value = DescribeAclsRequest{
+            .resource_type_filter = 2,
+            .resource_name_filter = "topic-a",
+            .pattern_type_filter = 3,
+            .principal_filter = "User:alice",
+            .host_filter = "*",
+            .operation = 3,
+            .permission_type = 3,
+        };
+        try expectGoldenRoundTrip(DescribeAclsRequest, value, 2, &[_]u8{
+            0x02, 0x08, 't',  'o',
+            'p',  'i',  'c',  '-',
+            'a',  0x03, 0x0b, 'U',
+            's',  'e',  'r',  ':',
+            'a',  'l',  'i',  'c',
+            'e',  0x02, '*',  0x03,
+            0x03, 0x00,
+        });
+    }
+
+    {
+        const DescribeAclsResponse = generated.describe_acls_response.DescribeAclsResponse;
+        const AclDescription = DescribeAclsResponse.DescribeAclsResource.AclDescription;
+        const acls = [_]AclDescription{.{
+            .principal = "User:alice",
+            .host = "*",
+            .operation = 3,
+            .permission_type = 3,
+        }};
+        const resources = [_]DescribeAclsResponse.DescribeAclsResource{.{
+            .resource_type = 2,
+            .resource_name = "topic-a",
+            .pattern_type = 3,
+            .acls = &acls,
+        }};
+        const value = DescribeAclsResponse{
+            .throttle_time_ms = 5,
+            .resources = &resources,
+        };
+        try expectGoldenRoundTrip(DescribeAclsResponse, value, 2, &[_]u8{
+            0x00, 0x00, 0x00, 0x05,
+            0x00, 0x00, 0x00, 0x02,
+            0x02, 0x08, 't',  'o',
+            'p',  'i',  'c',  '-',
+            'a',  0x03, 0x02, 0x0b,
+            'U',  's',  'e',  'r',
+            ':',  'a',  'l',  'i',
+            'c',  'e',  0x02, '*',
+            0x03, 0x03, 0x00, 0x00,
+            0x00,
+        });
+    }
+
+    {
+        const CreateAclsRequest = generated.create_acls_request.CreateAclsRequest;
+        const creations = [_]CreateAclsRequest.AclCreation{.{
+            .resource_type = 2,
+            .resource_name = "topic-a",
+            .resource_pattern_type = 3,
+            .principal = "User:alice",
+            .host = "*",
+            .operation = 4,
+            .permission_type = 3,
+        }};
+        const value = CreateAclsRequest{
+            .creations = &creations,
+        };
+        try expectGoldenRoundTrip(CreateAclsRequest, value, 2, &[_]u8{
+            0x02, 0x02, 0x08, 't',
+            'o',  'p',  'i',  'c',
+            '-',  'a',  0x03, 0x0b,
+            'U',  's',  'e',  'r',
+            ':',  'a',  'l',  'i',
+            'c',  'e',  0x02, '*',
+            0x04, 0x03, 0x00, 0x00,
+        });
+    }
+
+    {
+        const CreateAclsResponse = generated.create_acls_response.CreateAclsResponse;
+        const results = [_]CreateAclsResponse.AclCreationResult{
+            .{},
+            .{ .error_code = 42, .error_message = "denied" },
+        };
+        const value = CreateAclsResponse{
+            .throttle_time_ms = 6,
+            .results = &results,
+        };
+        try expectGoldenRoundTrip(CreateAclsResponse, value, 2, &[_]u8{
+            0x00, 0x00, 0x00, 0x06,
+            0x03, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x2a, 0x07,
+            'd',  'e',  'n',  'i',
+            'e',  'd',  0x00, 0x00,
+        });
+    }
+
+    {
+        const DeleteAclsRequest = generated.delete_acls_request.DeleteAclsRequest;
+        const filters = [_]DeleteAclsRequest.DeleteAclsFilter{.{
+            .resource_type_filter = 2,
+            .resource_name_filter = "topic-a",
+            .pattern_type_filter = 3,
+            .principal_filter = null,
+            .host_filter = "*",
+            .operation = 3,
+            .permission_type = 3,
+        }};
+        const value = DeleteAclsRequest{
+            .filters = &filters,
+        };
+        try expectGoldenRoundTrip(DeleteAclsRequest, value, 2, &[_]u8{
+            0x02, 0x02, 0x08, 't',
+            'o',  'p',  'i',  'c',
+            '-',  'a',  0x03, 0x00,
+            0x02, '*',  0x03, 0x03,
+            0x00, 0x00,
+        });
+    }
+
+    {
+        const DeleteAclsResponse = generated.delete_acls_response.DeleteAclsResponse;
+        const MatchingAcl = DeleteAclsResponse.DeleteAclsFilterResult.DeleteAclsMatchingAcl;
+        const matching_acls = [_]MatchingAcl{.{
+            .resource_type = 2,
+            .resource_name = "topic-a",
+            .pattern_type = 3,
+            .principal = "User:alice",
+            .host = "*",
+            .operation = 3,
+            .permission_type = 3,
+        }};
+        const filter_results = [_]DeleteAclsResponse.DeleteAclsFilterResult{.{
+            .matching_acls = &matching_acls,
+        }};
+        const value = DeleteAclsResponse{
+            .throttle_time_ms = 7,
+            .filter_results = &filter_results,
+        };
+        try expectGoldenRoundTrip(DeleteAclsResponse, value, 2, &[_]u8{
+            0x00, 0x00, 0x00, 0x07,
+            0x02, 0x00, 0x00, 0x00,
+            0x02, 0x00, 0x00, 0x00,
+            0x02, 0x08, 't',  'o',
+            'p',  'i',  'c',  '-',
+            'a',  0x03, 0x0b, 'U',
+            's',  'e',  'r',  ':',
+            'a',  'l',  'i',  'c',
+            'e',  0x02, '*',  0x03,
+            0x03, 0x00, 0x00, 0x00,
+        });
+    }
+
+    {
         const ElectLeadersRequest = generated.elect_leaders_request.ElectLeadersRequest;
         const null_value = ElectLeadersRequest{
             .election_type = 0,
