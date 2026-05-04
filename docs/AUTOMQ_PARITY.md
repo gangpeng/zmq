@@ -692,8 +692,10 @@ Status: completed for the initial catalog and DeleteGroups slice.
   has simulated convergence coverage after ownership changes. The gated KRaft
   failover harness now exercises live broker-process reassignment protocol
   convergence, old-owner write fencing, and target-broker topic/data
-  convergence. Broader live load/scale orchestration and cross-broker chaos
-  coverage remain.
+  convergence. Controller-aware scale-out planning now has deterministic
+  coverage that spreads hot partitions from an overloaded broker to multiple
+  newly active broker targets. Broader live load/scale orchestration and
+  cross-broker chaos coverage remain.
 
 ### Phase 5: Production Gates
 

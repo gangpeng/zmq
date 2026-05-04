@@ -563,6 +563,41 @@ test "AutoBalancer controller-aware plan uses active broker racks and moves fenc
     }
 }
 
+test "AutoBalancer controller-aware plan spreads hot partitions after scale out" {
+    const brokers = [_]AutoBalancer.BrokerNode{
+        .{ .node_id = 0, .rack = "rack-a" },
+        .{ .node_id = 1, .rack = "rack-b" },
+        .{ .node_id = 2, .rack = "rack-c" },
+    };
+
+    var ab = AutoBalancer.init(testing.allocator);
+    defer ab.deinit();
+
+    const loads = [_]AutoBalancer.PartitionLoad{
+        .{ .topic = "scale", .partition_id = 0, .bytes_in_rate = 10000, .bytes_out_rate = 0, .leader_node = 0 },
+        .{ .topic = "scale", .partition_id = 1, .bytes_in_rate = 8000, .bytes_out_rate = 0, .leader_node = 0 },
+        .{ .topic = "scale", .partition_id = 2, .bytes_in_rate = 6000, .bytes_out_rate = 0, .leader_node = 0 },
+    };
+
+    const plan = ab.computeControllerAwareRebalancePlan(&brokers, &loads);
+    try testing.expect(plan != null);
+    if (plan) |*p| {
+        var mp = @constCast(p);
+        defer mp.deinit();
+        try testing.expectEqual(@as(usize, 2), mp.moveCount());
+
+        var moved_to_1 = false;
+        var moved_to_2 = false;
+        for (mp.moves.items) |move| {
+            try testing.expectEqual(@as(i32, 0), move.from_node);
+            moved_to_1 = moved_to_1 or move.to_node == 1;
+            moved_to_2 = moved_to_2 or move.to_node == 2;
+        }
+        try testing.expect(moved_to_1);
+        try testing.expect(moved_to_2);
+    }
+}
+
 test "AutoBalancer empty loads returns null" {
     var ab = AutoBalancer.init(testing.allocator);
     defer ab.deinit();
