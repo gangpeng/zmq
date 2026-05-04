@@ -57,8 +57,13 @@ Release CI must set required coverage variables for environment-specific
 matrices, including `ZMQ_KRAFT_REQUIRED_NETWORK_PHASES` for scheduled
 controller/broker partition phases, `ZMQ_CHAOS_REQUIRED_NETWORK_PHASES` for
 broker chaos partitions, and provider/client/profile requirement variables for
-S3 and external-client matrices. OAuth-secured client coverage must be pinned
-with `ZMQ_CLIENT_MATRIX_REQUIRED_OAUTH_PROFILES` and
+S3 and external-client matrices. S3 provider coverage must pin provider,
+outage, ListObjectsV2 pagination, and multipart-edge profiles with
+`ZMQ_S3_PROVIDER_REQUIRED_PROFILES`,
+`ZMQ_S3_PROVIDER_REQUIRED_OUTAGE_PROFILES`,
+`ZMQ_S3_PROVIDER_REQUIRED_LIST_PAGINATION_PROFILES`, and
+`ZMQ_S3_PROVIDER_REQUIRED_MULTIPART_EDGE_PROFILES`. OAuth-secured client
+coverage must be pinned with `ZMQ_CLIENT_MATRIX_REQUIRED_OAUTH_PROFILES` and
 `ZMQ_CLIENT_MATRIX_REQUIRED_OAUTH_NEGATIVE_PROFILES` when OAUTHBEARER is part of
 the release target.
 

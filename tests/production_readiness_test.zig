@@ -804,6 +804,8 @@ test "AutoMQ parity release criteria document pins required gates" {
         "zig build test-kraft-failover --summary all",
         "ZMQ_KRAFT_REQUIRED_NETWORK_PHASES",
         "ZMQ_CHAOS_REQUIRED_NETWORK_PHASES",
+        "ZMQ_S3_PROVIDER_REQUIRED_LIST_PAGINATION_PROFILES",
+        "ZMQ_S3_PROVIDER_REQUIRED_MULTIPART_EDGE_PROFILES",
         "ZMQ_CLIENT_MATRIX_REQUIRED_OAUTH_PROFILES",
         "ZMQ_CLIENT_MATRIX_REQUIRED_OAUTH_NEGATIVE_PROFILES",
         "zig build bench --summary all",

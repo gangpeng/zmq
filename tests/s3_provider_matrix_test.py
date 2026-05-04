@@ -14,6 +14,8 @@ Global environment:
     ZMQ_S3_PROVIDER_PROFILES    Comma-separated profile names. Defaults to minio.
     ZMQ_S3_PROVIDER_REQUIRED_PROFILES comma-separated profile names that must be present.
     ZMQ_S3_PROVIDER_REQUIRED_OUTAGE_PROFILES comma-separated profile names that must run outage gates.
+    ZMQ_S3_PROVIDER_REQUIRED_LIST_PAGINATION_PROFILES
+                               comma-separated profile names that must run the ListObjectsV2 pagination gate.
     ZMQ_S3_PROVIDER_REQUIRED_MULTIPART_EDGE_PROFILES
                                comma-separated profile names that must run the multipart edge gate.
     ZMQ_S3_PROVIDER_ZIG         Zig executable. Defaults to zig.
@@ -199,6 +201,25 @@ def validate_required_profiles(profiles):
             + ", ".join(missing_hooks)
         )
 
+    required_list_pagination = configured_names("ZMQ_S3_PROVIDER_REQUIRED_LIST_PAGINATION_PROFILES")
+    missing_list_pagination_profiles = [
+        profile for profile in required_list_pagination if profile not in profile_set
+    ]
+    if missing_list_pagination_profiles:
+        raise MatrixError(
+            "required S3 list-pagination profiles missing from ZMQ_S3_PROVIDER_PROFILES: "
+            + ", ".join(missing_list_pagination_profiles)
+        )
+    disabled_list_pagination = [
+        profile for profile in required_list_pagination
+        if not profile_enabled(profile, "REQUIRE_LIST_PAGINATION")
+    ]
+    if disabled_list_pagination:
+        raise MatrixError(
+            "required S3 list-pagination profiles must set REQUIRE_LIST_PAGINATION=1: "
+            + ", ".join(disabled_list_pagination)
+        )
+
     required_multipart_edge = configured_names("ZMQ_S3_PROVIDER_REQUIRED_MULTIPART_EDGE_PROFILES")
     missing_multipart_edge_profiles = [profile for profile in required_multipart_edge if profile not in profile_set]
     if missing_multipart_edge_profiles:
@@ -265,6 +286,7 @@ def self_test():
         os.environ["ZMQ_S3_AWS_US_EAST_1_OUTAGE_UP"] = "tc qdisc del dev lo root"
         os.environ["ZMQ_S3_PROVIDER_REQUIRED_PROFILES"] = "minio,aws_us_east_1"
         os.environ["ZMQ_S3_PROVIDER_REQUIRED_OUTAGE_PROFILES"] = "aws_us_east_1"
+        os.environ["ZMQ_S3_PROVIDER_REQUIRED_LIST_PAGINATION_PROFILES"] = "aws_us_east_1"
         os.environ["ZMQ_S3_PROVIDER_REQUIRED_MULTIPART_EDGE_PROFILES"] = "aws_us_east_1"
 
         names = profile_names()
@@ -314,6 +336,15 @@ def self_test():
                 raise
 
         os.environ["ZMQ_S3_PROVIDER_REQUIRED_OUTAGE_PROFILES"] = "aws_us_east_1"
+        os.environ["ZMQ_S3_PROVIDER_REQUIRED_LIST_PAGINATION_PROFILES"] = "minio,aws_us_east_1"
+        try:
+            validate_required_profiles(names)
+            raise MatrixError("missing required list-pagination profile did not fail validation")
+        except MatrixError as exc:
+            if "REQUIRE_LIST_PAGINATION" not in str(exc):
+                raise
+
+        os.environ["ZMQ_S3_PROVIDER_REQUIRED_LIST_PAGINATION_PROFILES"] = "aws_us_east_1"
         os.environ["ZMQ_S3_PROVIDER_REQUIRED_MULTIPART_EDGE_PROFILES"] = "minio,aws_us_east_1"
         try:
             validate_required_profiles(names)
