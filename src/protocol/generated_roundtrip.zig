@@ -183,6 +183,21 @@ test "generated non-default golden fixtures cover legacy and flexible wire encod
     }
 
     {
+        const ApiVersionsRequest = generated.api_versions_request.ApiVersionsRequest;
+        const value = ApiVersionsRequest{
+            .client_software_name = "zig-client",
+            .client_software_version = "0.16.0",
+        };
+        try expectGoldenRoundTrip(ApiVersionsRequest, value, 3, &[_]u8{
+            0x0b, 'z', 'i',  'g',
+            '-',  'c', 'l',  'i',
+            'e',  'n', 't',  0x07,
+            '0',  '.', '1',  '6',
+            '.',  '0', 0x00,
+        });
+    }
+
+    {
         const StopReplicaRequest = generated.stop_replica_request.StopReplicaRequest;
         const ungrouped_partitions = [_]StopReplicaRequest.StopReplicaPartitionV0{.{
             .topic_name = "topic-a",
@@ -1917,6 +1932,51 @@ test "generated non-default golden fixtures cover legacy and flexible wire encod
     }
 
     {
+        const VoteRequest = generated.vote_request.VoteRequest;
+        const partitions = [_]VoteRequest.TopicData.PartitionData{.{
+            .partition_index = 0,
+            .candidate_epoch = 5,
+            .candidate_id = 2,
+            .candidate_directory_id = .{
+                0x00, 0x01, 0x02, 0x03,
+                0x04, 0x05, 0x06, 0x07,
+                0x08, 0x09, 0x0a, 0x0b,
+                0x0c, 0x0d, 0x0e, 0x0f,
+            },
+            .voter_directory_id = .{
+                0x10, 0x11, 0x12, 0x13,
+                0x14, 0x15, 0x16, 0x17,
+                0x18, 0x19, 0x1a, 0x1b,
+                0x1c, 0x1d, 0x1e, 0x1f,
+            },
+            .last_offset_epoch = 4,
+            .last_offset = 123,
+        }};
+        const topics = [_]VoteRequest.TopicData{.{
+            .topic_name = "metadata",
+            .partitions = &partitions,
+        }};
+        const value = VoteRequest{
+            .cluster_id = "cluster-a",
+            .voter_id = 7,
+            .topics = &topics,
+        };
+        try expectGoldenRoundTrip(VoteRequest, value, 1, &[_]u8{
+            0x0a, 'c',  'l',  'u',  's',  't',  'e',  'r',
+            '-',  'a',  0x00, 0x00, 0x00, 0x07, 0x02, 0x09,
+            'm',  'e',  't',  'a',  'd',  'a',  't',  'a',
+            0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x05, 0x00, 0x00, 0x00, 0x02, 0x00, 0x01, 0x02,
+            0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a,
+            0x0b, 0x0c, 0x0d, 0x0e, 0x0f, 0x10, 0x11, 0x12,
+            0x13, 0x14, 0x15, 0x16, 0x17, 0x18, 0x19, 0x1a,
+            0x1b, 0x1c, 0x1d, 0x1e, 0x1f, 0x00, 0x00, 0x00,
+            0x04, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x7b, 0x00, 0x00, 0x00,
+        });
+    }
+
+    {
         const VoteResponse = generated.vote_response.VoteResponse;
         const node_endpoints = [_]VoteResponse.NodeEndpoint{.{
             .node_id = 7,
@@ -1931,6 +1991,49 @@ test "generated non-default golden fixtures cover legacy and flexible wire encod
         try expectGoldenRoundTrip(VoteResponse, value, 1, &[_]u8{
             0x00, 0x00, 0x01, 0x01, 0x00, 0x0b, 0x02, 0x00,
             0x00, 0x00, 0x07, 0x03, 'n',  '1',  0x23, 0x84,
+            0x00,
+        });
+    }
+
+    {
+        const BeginQuorumEpochRequest = generated.begin_quorum_epoch_request.BeginQuorumEpochRequest;
+        const partitions = [_]BeginQuorumEpochRequest.TopicData.PartitionData{.{
+            .partition_index = 0,
+            .voter_directory_id = .{
+                0x20, 0x21, 0x22, 0x23,
+                0x24, 0x25, 0x26, 0x27,
+                0x28, 0x29, 0x2a, 0x2b,
+                0x2c, 0x2d, 0x2e, 0x2f,
+            },
+            .leader_id = 2,
+            .leader_epoch = 5,
+        }};
+        const topics = [_]BeginQuorumEpochRequest.TopicData{.{
+            .topic_name = "metadata",
+            .partitions = &partitions,
+        }};
+        const leader_endpoints = [_]BeginQuorumEpochRequest.LeaderEndpoint{.{
+            .name = "PLAINTEXT",
+            .host = "controller",
+            .port = 9093,
+        }};
+        const value = BeginQuorumEpochRequest{
+            .cluster_id = "cluster-a",
+            .voter_id = 7,
+            .topics = &topics,
+            .leader_endpoints = &leader_endpoints,
+        };
+        try expectGoldenRoundTrip(BeginQuorumEpochRequest, value, 1, &[_]u8{
+            0x0a, 'c',  'l',  'u',  's',  't',  'e',  'r',
+            '-',  'a',  0x00, 0x00, 0x00, 0x07, 0x02, 0x09,
+            'm',  'e',  't',  'a',  'd',  'a',  't',  'a',
+            0x02, 0x00, 0x00, 0x00, 0x00, 0x20, 0x21, 0x22,
+            0x23, 0x24, 0x25, 0x26, 0x27, 0x28, 0x29, 0x2a,
+            0x2b, 0x2c, 0x2d, 0x2e, 0x2f, 0x00, 0x00, 0x00,
+            0x02, 0x00, 0x00, 0x00, 0x05, 0x00, 0x00, 0x02,
+            0x0a, 'P',  'L',  'A',  'I',  'N',  'T',  'E',
+            'X',  'T',  0x0b, 'c',  'o',  'n',  't',  'r',
+            'o',  'l',  'l',  'e',  'r',  0x23, 0x85, 0x00,
             0x00,
         });
     }
@@ -6082,6 +6185,34 @@ test "generated non-default golden fixtures cover legacy and flexible wire encod
             'i',  'd',  0x09, 'c',
             'l',  'i',  'e',  'n',
             't',  '-',  'a',  0x00,
+            0x00, 0x00,
+        });
+    }
+
+    {
+        const DescribeTopicPartitionsRequest = generated.describe_topic_partitions_request.DescribeTopicPartitionsRequest;
+        const topics = [_]DescribeTopicPartitionsRequest.TopicRequest{
+            .{ .name = "topic-a" },
+            .{ .name = "topic-b" },
+        };
+        const value = DescribeTopicPartitionsRequest{
+            .topics = &topics,
+            .response_partition_limit = 50,
+            .cursor = .{
+                .topic_name = "topic-b",
+                .partition_index = 3,
+            },
+        };
+        try expectGoldenRoundTrip(DescribeTopicPartitionsRequest, value, 0, &[_]u8{
+            0x03, 0x08, 't',  'o',
+            'p',  'i',  'c',  '-',
+            'a',  0x00, 0x08, 't',
+            'o',  'p',  'i',  'c',
+            '-',  'b',  0x00, 0x00,
+            0x00, 0x00, 0x32, 0x01,
+            0x08, 't',  'o',  'p',
+            'i',  'c',  '-',  'b',
+            0x00, 0x00, 0x00, 0x03,
             0x00, 0x00,
         });
     }

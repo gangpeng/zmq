@@ -56,6 +56,8 @@ operator-facing behavior.
   ElectLeadersResponse v1/v2, Alter/ListPartitionReassignmentsResponse v0,
   StopReplicaResponse v1/v2, DescribeLogDirsResponse v1/v4,
   UpdateMetadataResponse v5/v6,
+  ApiVersionsRequest v3, VoteRequest v1, BeginQuorumEpochRequest v1,
+  DescribeTopicPartitionsRequest v0,
   Initialize/Read/Write/DeleteShareGroupState and ReadShareGroupStateSummary
   v0, ConsumerGroupDescribe v0, OffsetCommit v1/v8, OffsetFetch v7/v8,
   TxnOffsetCommit v3, DescribeProducers v0, CreatePartitionsResponse v2,
@@ -80,6 +82,8 @@ operator-facing behavior.
   and replica deltas,
   stop-replica partition errors, log-directory capacity/future-replica state,
   update-metadata response tagged terminators,
+  client software identity, KRaft voter directory IDs, leader endpoint
+  announcements, describe-topic-partitions cursors,
   telemetry UUID/compression/metric-prefix/payload resource fields,
   config admin null values/operation types, topic deletion name-to-UUID
   transitions, group deletion compact arrays,
