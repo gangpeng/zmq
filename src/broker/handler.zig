@@ -12541,6 +12541,7 @@ pub const Broker = struct {
         }
         var topics_init: usize = 0;
         var created_any = false;
+        var created_partition_reassignments = false;
         var created_topics: []bool = &.{};
         if (req.topics.len > 0) {
             created_topics = self.allocator.alloc(bool, req.topics.len) catch {
@@ -12554,8 +12555,15 @@ pub const Broker = struct {
             if (topics.len > 0) self.allocator.free(topics);
             return null;
         } else null;
+        const previous_reassignment_snapshot = if (!req.validate_only) self.encodePartitionReassignmentSnapshotRecordValue() catch {
+            if (previous_snapshot) |snapshot| self.allocator.free(snapshot);
+            if (created_topics.len > 0) self.allocator.free(created_topics);
+            if (topics.len > 0) self.allocator.free(topics);
+            return null;
+        } else null;
         defer {
             if (previous_snapshot) |snapshot| self.allocator.free(snapshot);
+            if (previous_reassignment_snapshot) |snapshot| self.allocator.free(snapshot);
             if (created_topics.len > 0) self.allocator.free(created_topics);
             if (topics.len > 0) self.allocator.free(topics);
         }
@@ -12577,7 +12585,7 @@ pub const Broker = struct {
                 error_code = @intFromEnum(ErrorCode.invalid_topic_exception);
             } else if (self.topics.contains(topic_name)) {
                 error_code = @intFromEnum(ErrorCode.topic_already_exists);
-            } else if (hasInvalidCreateTopicAssignments(topic_req.assignments, self.node_id)) {
+            } else if (hasInvalidCreateTopicAssignments(topic_req.assignments)) {
                 error_code = @intFromEnum(ErrorCode.invalid_replica_assignment);
             } else if (actual_partitions <= 0) {
                 error_code = @intFromEnum(ErrorCode.invalid_partitions);
@@ -12607,12 +12615,10 @@ pub const Broker = struct {
                     return null;
                 };
 
-                for (0..@intCast(actual_partitions)) |pi| {
-                    self.store.ensurePartition(topic_name, @intCast(pi)) catch {};
-                }
-                self.trackLocalTopicPartitionRange(topic_name, 0, actual_partitions);
+                const has_non_local_assignment = self.applyCreateTopicInitialAssignments(topic_name, &topic_req, actual_partitions) catch return null;
                 log.info("Created topic '{s}' ({d} partitions)", .{ topic_name, actual_partitions });
                 created_any = true;
+                if (has_non_local_assignment) created_partition_reassignments = true;
                 created_topics[topic_index] = true;
             }
 
@@ -12642,12 +12648,49 @@ pub const Broker = struct {
                         response.topic_id = zeroUuid();
                     }
                 }
+                self.restorePartitionReassignmentSnapshotRecord(previous_reassignment_snapshot.?) catch |restore_err| {
+                    log.err("Failed to restore CreateTopics partition assignments after shared snapshot failure: {}", .{restore_err});
+                };
                 const resp = Resp{
                     .throttle_time_ms = 0,
                     .topics = topics[0..topics_init],
                 };
                 return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
             };
+            if (created_partition_reassignments) {
+                self.persistPartitionReassignmentsDurably() catch |err| {
+                    log.warn("Failed to persist CreateTopics partition assignment metadata: {}", .{err});
+                    self.restoreTopicsAfterFailedMutation(previous_snapshot.?);
+                    for (req.topics, topics[0..topics_init], created_topics) |topic_req, *response, was_created| {
+                        if (was_created and response.error_code == @intFromEnum(ErrorCode.none)) {
+                            const topic_name = topic_req.name orelse "";
+                            const actual_partitions = self.createTopicsPartitionCount(&topic_req);
+                            self.removeTopicPartitionRange(topic_name, 0, actual_partitions);
+                            response.error_code = @intFromEnum(ErrorCode.kafka_storage_error);
+                            response.error_message = "Failed to persist partition assignment metadata";
+                            response.topic_id = zeroUuid();
+                        }
+                    }
+                    self.restorePartitionReassignmentSnapshotRecord(previous_reassignment_snapshot.?) catch |restore_err| {
+                        log.err("Failed to restore CreateTopics partition assignments after assignment persistence failure: {}", .{restore_err});
+                    };
+                    self.writeTopicSnapshotRecord() catch |rollback_err| {
+                        log.warn("Failed to append CreateTopics rollback topic snapshot after assignment failure: {}", .{rollback_err});
+                    };
+                    self.writePartitionReassignmentSnapshotRecord() catch |rollback_err| {
+                        log.warn("Failed to append CreateTopics rollback partition assignment snapshot: {}", .{rollback_err});
+                    };
+                    self.persistTopicsLocalDurably() catch |rollback_err| {
+                        log.warn("Failed to persist restored CreateTopics local topic metadata after assignment failure: {}", .{rollback_err});
+                    };
+                    self.persistPartitionReassignmentsLocal();
+                    const resp = Resp{
+                        .throttle_time_ms = 0,
+                        .topics = topics[0..topics_init],
+                    };
+                    return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+                };
+            }
             self.persistTopicAndObjectLocalMetadataDurably() catch |err| {
                 log.warn("Failed to persist CreateTopics local metadata: {}", .{err});
                 self.restoreTopicsAfterFailedMutation(previous_snapshot.?);
@@ -12661,12 +12704,19 @@ pub const Broker = struct {
                         response.topic_id = zeroUuid();
                     }
                 }
+                self.restorePartitionReassignmentSnapshotRecord(previous_reassignment_snapshot.?) catch |restore_err| {
+                    log.err("Failed to restore CreateTopics partition assignments after local metadata failure: {}", .{restore_err});
+                };
                 self.writeTopicSnapshotRecord() catch |rollback_err| {
                     log.warn("Failed to append CreateTopics rollback topic snapshot to __cluster_metadata: {}", .{rollback_err});
+                };
+                self.writePartitionReassignmentSnapshotRecord() catch |rollback_err| {
+                    log.warn("Failed to append CreateTopics rollback partition assignment snapshot to __cluster_metadata: {}", .{rollback_err});
                 };
                 self.persistTopicsLocalDurably() catch |rollback_err| {
                     log.warn("Failed to persist restored CreateTopics local topic metadata: {}", .{rollback_err});
                 };
+                self.persistPartitionReassignmentsLocal();
                 const resp = Resp{
                     .throttle_time_ms = 0,
                     .topics = topics[0..topics_init],
@@ -12712,19 +12762,76 @@ pub const Broker = struct {
         return if (topic_req.replication_factor <= 0) self.default_replication_factor else topic_req.replication_factor;
     }
 
-    fn hasInvalidCreateTopicAssignments(assignments: []const generated.create_topics_request.CreateTopicsRequest.CreatableTopic.CreatableReplicaAssignment, node_id: i32) bool {
+    fn hasInvalidCreateTopicAssignments(assignments: []const generated.create_topics_request.CreateTopicsRequest.CreatableTopic.CreatableReplicaAssignment) bool {
         if (assignments.len == 0) return false;
 
         var max_partition: i32 = -1;
         for (assignments, 0..) |assignment, assignment_idx| {
             if (assignment.partition_index < 0) return true;
-            if (assignment.broker_ids.len != 1 or assignment.broker_ids[0] != node_id) return true;
+            if (assignment.broker_ids.len != 1 or !validReplicaAssignment(assignment.broker_ids)) return true;
             if (assignment.partition_index > max_partition) max_partition = assignment.partition_index;
             for (assignments[assignment_idx + 1 ..]) |other| {
                 if (assignment.partition_index == other.partition_index) return true;
             }
         }
         return max_partition + 1 != @as(i32, @intCast(assignments.len));
+    }
+
+    fn applyCreateTopicInitialAssignments(
+        self: *Broker,
+        topic_name: []const u8,
+        topic_req: *const generated.create_topics_request.CreateTopicsRequest.CreatableTopic,
+        partition_count: i32,
+    ) !bool {
+        var has_non_local_assignment = false;
+        for (0..@as(usize, @intCast(partition_count))) |pi| {
+            const partition_index: i32 = @intCast(pi);
+            const owner = createTopicAssignmentOwner(topic_req.assignments, partition_index) orelse self.node_id;
+            if (owner == self.node_id) {
+                self.store.ensurePartition(topic_name, partition_index) catch {};
+            }
+            try self.failover_controller.registerPartitionOwner(topic_name, partition_index, owner);
+            if (owner != self.node_id) {
+                const replicas = [_]i32{owner};
+                try self.recordInitialPartitionReassignment(topic_name, partition_index, &replicas);
+                has_non_local_assignment = true;
+            }
+        }
+        return has_non_local_assignment;
+    }
+
+    fn createTopicAssignmentOwner(
+        assignments: []const generated.create_topics_request.CreateTopicsRequest.CreatableTopic.CreatableReplicaAssignment,
+        partition_index: i32,
+    ) ?i32 {
+        for (assignments) |assignment| {
+            if (assignment.partition_index == partition_index and assignment.broker_ids.len == 1) {
+                return assignment.broker_ids[0];
+            }
+        }
+        return null;
+    }
+
+    fn recordInitialPartitionReassignment(self: *Broker, topic_name: []const u8, partition_index: i32, replicas: []const i32) !void {
+        var key_buf: [256]u8 = undefined;
+        const lookup_key = reassignmentKeyBuf(&key_buf, topic_name, partition_index);
+        const removed_existing = self.partition_reassignments.fetchRemove(lookup_key);
+
+        const owned_key = try reassignmentKey(self.allocator, topic_name, partition_index);
+        var owned_key_owned = true;
+        errdefer if (owned_key_owned) self.allocator.free(owned_key);
+        var next = try self.buildPartitionReassignment(topic_name, partition_index, replicas);
+        var next_owned = true;
+        errdefer if (next_owned) next.deinit(self.allocator);
+
+        self.partition_reassignments.put(owned_key, next) catch |err| {
+            if (removed_existing) |removed| self.restorePartitionReassignmentMapEntry(removed);
+            return err;
+        };
+        owned_key_owned = false;
+        next_owned = false;
+
+        if (removed_existing) |removed| self.freePartitionReassignmentMapEntry(removed);
     }
 
     fn applyCreateTopicConfigs(
@@ -17539,9 +17646,17 @@ pub const Broker = struct {
         defer if (mutation_results.len > 0) self.allocator.free(mutation_results);
 
         const previous_snapshot = if (!req.validate_only) self.encodeTopicSnapshotRecordValue() catch return null else null;
-        defer if (previous_snapshot) |snapshot| self.allocator.free(snapshot);
+        const previous_reassignment_snapshot = if (!req.validate_only) self.encodePartitionReassignmentSnapshotRecordValue() catch {
+            if (previous_snapshot) |snapshot| self.allocator.free(snapshot);
+            return null;
+        } else null;
+        defer {
+            if (previous_snapshot) |snapshot| self.allocator.free(snapshot);
+            if (previous_reassignment_snapshot) |snapshot| self.allocator.free(snapshot);
+        }
 
         var mutated = false;
+        var mutated_reassignments = false;
         for (req.topics, 0..) |topic_req, i| {
             const result = self.applyCreatePartitionsTopic(topic_req, req.validate_only);
             mutation_results[i] = result;
@@ -17551,6 +17666,7 @@ pub const Broker = struct {
                 .error_message = result.error_message,
             };
             if (result.mutated) mutated = true;
+            if (result.partition_reassignments_mutated) mutated_reassignments = true;
         }
 
         if (mutated) {
@@ -17565,12 +17681,47 @@ pub const Broker = struct {
                         response.error_message = "Failed to persist topic metadata";
                     }
                 }
+                self.restorePartitionReassignmentSnapshotRecord(previous_reassignment_snapshot.?) catch |restore_err| {
+                    log.err("Failed to restore CreatePartitions partition assignments after shared snapshot failure: {}", .{restore_err});
+                };
                 const resp = Resp{
                     .throttle_time_ms = 0,
                     .results = results,
                 };
                 return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
             };
+            if (mutated_reassignments) {
+                self.persistPartitionReassignmentsDurably() catch |err| {
+                    log.warn("Failed to persist CreatePartitions partition assignment metadata: {}", .{err});
+                    self.restoreTopicsAfterFailedMutation(previous_snapshot.?);
+                    for (req.topics, mutation_results, results) |topic_req, mutation, *response| {
+                        if (mutation.mutated and response.error_code == @intFromEnum(ErrorCode.none)) {
+                            const topic_name = topic_req.name orelse "";
+                            self.removeTopicPartitionRange(topic_name, mutation.old_count, mutation.new_count);
+                            response.error_code = @intFromEnum(ErrorCode.kafka_storage_error);
+                            response.error_message = "Failed to persist partition assignment metadata";
+                        }
+                    }
+                    self.restorePartitionReassignmentSnapshotRecord(previous_reassignment_snapshot.?) catch |restore_err| {
+                        log.err("Failed to restore CreatePartitions partition assignments after assignment persistence failure: {}", .{restore_err});
+                    };
+                    self.writeTopicSnapshotRecord() catch |rollback_err| {
+                        log.warn("Failed to append CreatePartitions rollback topic snapshot after assignment failure: {}", .{rollback_err});
+                    };
+                    self.writePartitionReassignmentSnapshotRecord() catch |rollback_err| {
+                        log.warn("Failed to append CreatePartitions rollback partition assignment snapshot: {}", .{rollback_err});
+                    };
+                    self.persistTopicsLocalDurably() catch |rollback_err| {
+                        log.warn("Failed to persist restored CreatePartitions local topic metadata after assignment failure: {}", .{rollback_err});
+                    };
+                    self.persistPartitionReassignmentsLocal();
+                    const resp = Resp{
+                        .throttle_time_ms = 0,
+                        .results = results,
+                    };
+                    return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+                };
+            }
             self.persistTopicAndObjectLocalMetadataDurably() catch |err| {
                 log.warn("Failed to persist CreatePartitions local metadata: {}", .{err});
                 self.restoreTopicsAfterFailedMutation(previous_snapshot.?);
@@ -17582,12 +17733,19 @@ pub const Broker = struct {
                         response.error_message = "Failed to persist topic metadata";
                     }
                 }
+                self.restorePartitionReassignmentSnapshotRecord(previous_reassignment_snapshot.?) catch |restore_err| {
+                    log.err("Failed to restore CreatePartitions partition assignments after local metadata failure: {}", .{restore_err});
+                };
                 self.writeTopicSnapshotRecord() catch |rollback_err| {
                     log.warn("Failed to append CreatePartitions rollback topic snapshot to __cluster_metadata: {}", .{rollback_err});
+                };
+                self.writePartitionReassignmentSnapshotRecord() catch |rollback_err| {
+                    log.warn("Failed to append CreatePartitions rollback partition assignment snapshot to __cluster_metadata: {}", .{rollback_err});
                 };
                 self.persistTopicsLocalDurably() catch |rollback_err| {
                     log.warn("Failed to persist restored CreatePartitions local topic metadata: {}", .{rollback_err});
                 };
+                self.persistPartitionReassignmentsLocal();
                 const resp = Resp{
                     .throttle_time_ms = 0,
                     .results = results,
@@ -17619,6 +17777,7 @@ pub const Broker = struct {
         error_code: i16,
         error_message: ?[]const u8 = null,
         mutated: bool = false,
+        partition_reassignments_mutated: bool = false,
         old_count: i32 = 0,
         new_count: i32 = 0,
     };
@@ -17650,10 +17809,10 @@ pub const Broker = struct {
                 };
             }
             for (assignments) |assignment| {
-                if (assignment.broker_ids.len != 1 or assignment.broker_ids[0] != self.node_id) {
+                if (assignment.broker_ids.len != 1 or !validReplicaAssignment(assignment.broker_ids)) {
                     return .{
                         .error_code = @intFromEnum(ErrorCode.invalid_replica_assignment),
-                        .error_message = "Only single-node assignments to this broker are supported",
+                        .error_message = "Only single-replica assignments are supported",
                     };
                 }
             }
@@ -17664,22 +17823,50 @@ pub const Broker = struct {
         }
 
         const old_total_count = info.num_partitions;
+        var partition_reassignments_mutated = false;
         for (@as(usize, @intCast(old_total_count))..@as(usize, @intCast(topic_req.count))) |pi| {
-            self.store.ensurePartition(topic_name, @intCast(pi)) catch |err| {
-                log.warn("Failed to create partition {s}-{d}: {}", .{ topic_name, pi, err });
-                self.removeTopicPartitionRange(topic_name, old_total_count, @intCast(pi + 1));
+            const partition_index: i32 = @intCast(pi);
+            const owner = if (topic_req.assignments) |assignments|
+                assignments[pi - @as(usize, @intCast(old_total_count))].broker_ids[0]
+            else
+                self.node_id;
+            if (owner == self.node_id) {
+                self.store.ensurePartition(topic_name, partition_index) catch |err| {
+                    log.warn("Failed to create partition {s}-{d}: {}", .{ topic_name, pi, err });
+                    self.removeTopicPartitionRange(topic_name, old_total_count, partition_index + 1);
+                    return .{
+                        .error_code = @intFromEnum(ErrorCode.kafka_storage_error),
+                        .error_message = "Failed to create partition storage",
+                    };
+                };
+            }
+            self.failover_controller.registerPartitionOwner(topic_name, partition_index, owner) catch |err| {
+                log.warn("Failed to track CreatePartitions owner for {s}-{d}: {}", .{ topic_name, pi, err });
+                self.removeTopicPartitionRange(topic_name, old_total_count, partition_index + 1);
                 return .{
                     .error_code = @intFromEnum(ErrorCode.kafka_storage_error),
-                    .error_message = "Failed to create partition storage",
+                    .error_message = "Failed to persist partition owner",
                 };
             };
+            if (owner != self.node_id) {
+                const replicas = [_]i32{owner};
+                self.recordInitialPartitionReassignment(topic_name, partition_index, &replicas) catch |err| {
+                    log.warn("Failed to record CreatePartitions assignment for {s}-{d}: {}", .{ topic_name, pi, err });
+                    self.removeTopicPartitionRange(topic_name, old_total_count, partition_index + 1);
+                    return .{
+                        .error_code = @intFromEnum(ErrorCode.kafka_storage_error),
+                        .error_message = "Failed to persist partition assignment",
+                    };
+                };
+                partition_reassignments_mutated = true;
+            }
         }
-        self.trackLocalTopicPartitionRange(topic_name, old_total_count, topic_req.count);
         info.num_partitions = topic_req.count;
 
         return .{
             .error_code = @intFromEnum(ErrorCode.none),
             .mutated = true,
+            .partition_reassignments_mutated = partition_reassignments_mutated,
             .old_count = old_total_count,
             .new_count = topic_req.count,
         };
@@ -32721,7 +32908,7 @@ test "Broker.handleRequest CreatePartitions rejects explicit empty assignments" 
     try testing.expectEqual(before, broker.topics.get("create-partitions-empty-assignments-topic").?.num_partitions);
 }
 
-test "Broker.handleRequest CreatePartitions rejects unsupported manual assignments" {
+test "Broker.handleRequest CreatePartitions accepts remote manual assignments" {
     const Req = generated.create_partitions_request.CreatePartitionsRequest;
     const Resp = generated.create_partitions_response.CreatePartitionsResponse;
 
@@ -32763,8 +32950,57 @@ test "Broker.handleRequest CreatePartitions rejects unsupported manual assignmen
 
     try testing.expectEqual(response.?.len, rpos);
     try testing.expectEqual(@as(usize, 1), resp.results.len);
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.none)), resp.results[0].error_code);
+    try testing.expectEqual(before + 1, broker.topics.get("create-partitions-remote-assignment-topic").?.num_partitions);
+    try testing.expectEqual(@as(?i32, 2), broker.failover_controller.findPartitionOwner("create-partitions-remote-assignment-topic", before));
+    try testing.expect(!broker.store.partitions.contains("create-partitions-remote-assignment-topic-1"));
+    try testing.expectEqual(@as(u32, 1), broker.partition_reassignments.count());
+}
+
+test "Broker.handleRequest CreatePartitions rejects multi-replica assignments" {
+    const Req = generated.create_partitions_request.CreatePartitionsRequest;
+    const Resp = generated.create_partitions_response.CreatePartitionsResponse;
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+    try testing.expect(broker.ensureTopic("create-partitions-multi-replica-topic"));
+    const before = broker.topics.get("create-partitions-multi-replica-topic").?.num_partitions;
+
+    const remote_brokers = [_]i32{ 1, 2 };
+    const assignments = [_]Req.CreatePartitionsTopic.CreatePartitionsAssignment{.{
+        .broker_ids = &remote_brokers,
+    }};
+    const topics = [_]Req.CreatePartitionsTopic{.{
+        .name = "create-partitions-multi-replica-topic",
+        .count = before + 1,
+        .assignments = &assignments,
+    }};
+    const req = Req{
+        .topics = &topics,
+        .timeout_ms = 30000,
+        .validate_only = false,
+    };
+
+    var buf: [512]u8 = undefined;
+    var pos = buildTestRequest(&buf, 37, 2, 3708, header_mod.requestHeaderVersion(37, 2));
+    req.serialize(&buf, &pos, 2);
+
+    const response = broker.handleRequest(buf[0..pos]);
+    try testing.expect(response != null);
+    defer testing.allocator.free(response.?);
+
+    var rpos: usize = 0;
+    var response_header = try ResponseHeader.deserialize(testing.allocator, response.?, &rpos, header_mod.responseHeaderVersion(37, 2));
+    defer response_header.deinit(testing.allocator);
+    try testing.expectEqual(@as(i32, 3708), response_header.correlation_id);
+
+    const resp = try Resp.deserialize(testing.allocator, response.?, &rpos, 2);
+    defer if (resp.results.len > 0) testing.allocator.free(resp.results);
+
+    try testing.expectEqual(response.?.len, rpos);
+    try testing.expectEqual(@as(usize, 1), resp.results.len);
     try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.invalid_replica_assignment)), resp.results[0].error_code);
-    try testing.expectEqual(before, broker.topics.get("create-partitions-remote-assignment-topic").?.num_partitions);
+    try testing.expectEqual(before, broker.topics.get("create-partitions-multi-replica-topic").?.num_partitions);
 }
 
 test "Broker.handleRequest CreatePartitions validate_only does not expand topic" {
@@ -51691,7 +51927,7 @@ test "Broker.handleRequest CreateTopics rejects unsupported topic config" {
     try testing.expect(!broker.topics.contains("ct-invalid-config-topic"));
 }
 
-test "Broker.handleRequest CreateTopics rejects unsupported manual assignments" {
+test "Broker.handleRequest CreateTopics accepts remote manual assignments" {
     const Req = generated.create_topics_request.CreateTopicsRequest;
     const Resp = generated.create_topics_response.CreateTopicsResponse;
 
@@ -51737,8 +51973,63 @@ test "Broker.handleRequest CreateTopics rejects unsupported manual assignments" 
     }
 
     try testing.expectEqual(@as(usize, 1), resp.topics.len);
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.none)), resp.topics[0].error_code);
+    try testing.expect(broker.topics.contains("ct-remote-assignment-topic"));
+    try testing.expectEqual(@as(i32, 1), broker.topics.get("ct-remote-assignment-topic").?.num_partitions);
+    try testing.expectEqual(@as(?i32, 2), broker.failover_controller.findPartitionOwner("ct-remote-assignment-topic", 0));
+    try testing.expect(!broker.store.partitions.contains("ct-remote-assignment-topic-0"));
+    try testing.expectEqual(@as(u32, 1), broker.partition_reassignments.count());
+}
+
+test "Broker.handleRequest CreateTopics rejects multi-replica assignments" {
+    const Req = generated.create_topics_request.CreateTopicsRequest;
+    const Resp = generated.create_topics_response.CreateTopicsResponse;
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+
+    const remote_brokers = [_]i32{ 1, 2 };
+    const assignments = [_]Req.CreatableTopic.CreatableReplicaAssignment{.{
+        .partition_index = 0,
+        .broker_ids = &remote_brokers,
+    }};
+    const topics = [_]Req.CreatableTopic{.{
+        .name = "ct-multi-replica-assignment-topic",
+        .num_partitions = -1,
+        .replication_factor = -1,
+        .assignments = &assignments,
+    }};
+    const req = Req{
+        .topics = &topics,
+        .timeout_ms = 30000,
+        .validate_only = false,
+    };
+
+    var buf: [512]u8 = undefined;
+    var pos = buildTestRequest(&buf, 19, 7, 1920, header_mod.requestHeaderVersion(19, 7));
+    req.serialize(&buf, &pos, 7);
+
+    const response = broker.handleRequest(buf[0..pos]);
+    try testing.expect(response != null);
+    defer testing.allocator.free(response.?);
+
+    var rpos: usize = 0;
+    var response_header = try ResponseHeader.deserialize(testing.allocator, response.?, &rpos, header_mod.responseHeaderVersion(19, 7));
+    defer response_header.deinit(testing.allocator);
+    try testing.expectEqual(@as(i32, 1920), response_header.correlation_id);
+    const resp = try Resp.deserialize(testing.allocator, response.?, &rpos, 7);
+    defer {
+        for (resp.topics) |topic| {
+            if (topic.configs) |response_configs| {
+                if (response_configs.len > 0) testing.allocator.free(response_configs);
+            }
+        }
+        if (resp.topics.len > 0) testing.allocator.free(resp.topics);
+    }
+
+    try testing.expectEqual(@as(usize, 1), resp.topics.len);
     try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.invalid_replica_assignment)), resp.topics[0].error_code);
-    try testing.expect(!broker.topics.contains("ct-remote-assignment-topic"));
+    try testing.expect(!broker.topics.contains("ct-multi-replica-assignment-topic"));
 }
 
 test "Broker.handleRequest CreateTopics validate_only does not create topic" {
