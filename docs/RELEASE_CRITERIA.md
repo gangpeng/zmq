@@ -68,10 +68,12 @@ outage, ListObjectsV2 pagination, multipart-edge, and multipart-fault profiles w
 `ZMQ_S3_PROVIDER_REQUIRED_MULTIPART_FAULT_PROFILES`. External-client coverage
 must pin required client implementations and semantic suites with
 `ZMQ_CLIENT_MATRIX_REQUIRED_TOOLS` and
-`ZMQ_CLIENT_MATRIX_REQUIRED_SEMANTICS`; OAuth-secured client coverage must also
-be pinned with `ZMQ_CLIENT_MATRIX_REQUIRED_OAUTH_PROFILES` and
-`ZMQ_CLIENT_MATRIX_REQUIRED_OAUTH_NEGATIVE_PROFILES` when OAUTHBEARER is part
-of the release target.
+`ZMQ_CLIENT_MATRIX_REQUIRED_SEMANTICS`, and secured-client plus negative
+security coverage with `ZMQ_CLIENT_MATRIX_REQUIRED_SECURITY_PROFILES` and
+`ZMQ_CLIENT_MATRIX_REQUIRED_SECURITY_NEGATIVE_PROFILES`; OAuth-secured client
+coverage must also be pinned with `ZMQ_CLIENT_MATRIX_REQUIRED_OAUTH_PROFILES`
+and `ZMQ_CLIENT_MATRIX_REQUIRED_OAUTH_NEGATIVE_PROFILES` when OAUTHBEARER is
+part of the release target.
 
 ## Known Unsupported Or Partial Surfaces
 

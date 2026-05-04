@@ -802,8 +802,8 @@ Status: completed for the initial catalog and DeleteGroups slice.
   stateless, multi-node, security, observability, performance, chaos, and
   comparative benchmark gates, lists the release commands, and documents
   currently unsupported/partial surfaces. The default production-readiness
-  suite verifies the document keeps those gates and unsupported surfaces
-  explicit.
+  suite verifies the document keeps those gates, required provider/security
+  profile variables, and unsupported surfaces explicit.
 
 ## Rules For Future Changes
 
