@@ -37,6 +37,8 @@ Optional environment:
     ZMQ_CLIENT_MATRIX_PROFILES    Comma-separated profile names for explicit client/library version sets
     ZMQ_CLIENT_MATRIX_REQUIRED_PROFILES
                                   Comma-separated profile names that must be present
+    ZMQ_CLIENT_MATRIX_REQUIRED_VERSIONED_PROFILES
+                                  Profiles that must pin exact client/library versions
     ZMQ_CLIENT_MATRIX_REQUIRED_SECURITY_PROFILES
                                   Profiles that must run secured-client probes
     ZMQ_CLIENT_MATRIX_REQUIRED_SECURITY_NEGATIVE_PROFILES
@@ -54,10 +56,12 @@ Optional environment:
     ZMQ_CLIENT_MATRIX_ENABLE_GO   1 to include go-kafka in auto mode
     ZMQ_CLIENT_MATRIX_GO_MODULE   Go module for go-kafka (default github.com/segmentio/kafka-go@latest)
     ZMQ_CLIENT_MATRIX_PYTHON      Python executable for kafka-python/confluent-kafka probes
+    ZMQ_CLIENT_MATRIX_VERSION     Human-readable exact client/library version label
 
 Per-profile overrides:
     For profile "apache_3_7", set ZMQ_CLIENT_MATRIX_APACHE_3_7_TOOLS,
-    ZMQ_CLIENT_MATRIX_APACHE_3_7_JAVA_CLASSPATH, etc. A profile inherits the
+    ZMQ_CLIENT_MATRIX_APACHE_3_7_JAVA_CLASSPATH,
+    ZMQ_CLIENT_MATRIX_APACHE_3_7_VERSION, etc. A profile inherits the
     corresponding global setting when its override is not present.
 
 Supported probes:
@@ -459,6 +463,16 @@ def profile_setting(profile, suffix, fallback):
     return os.environ.get(profile_env_name(profile, suffix), os.environ.get(f"ZMQ_CLIENT_MATRIX_{suffix}", fallback))
 
 
+def profile_version(profile):
+    return (profile_setting(profile, "VERSION", "") or "").strip()
+
+
+def version_label_is_pinned(version):
+    if not version:
+        return False
+    return version.lower() not in {"auto", "default", "latest"}
+
+
 def apply_profile(profile):
     global ACTIVE_PROFILE, BOOTSTRAP, TOOLS, SEMANTICS, JAVA_CLASSPATH, ENABLE_GO_AUTO, GO_MODULE, PYTHON
     global SECURITY_PROTOCOL, SASL_MECHANISM, SASL_USERNAME, SASL_PASSWORD, SSL_CA_LOCATION
@@ -496,6 +510,24 @@ def validate_required_profiles(profiles):
         raise MatrixError(
             "required client matrix profiles missing from ZMQ_CLIENT_MATRIX_PROFILES: "
             + ", ".join(missing)
+        )
+
+    required_versioned = configured_names("ZMQ_CLIENT_MATRIX_REQUIRED_VERSIONED_PROFILES")
+    missing_versioned = [profile for profile in required_versioned if profile not in profile_set]
+    if missing_versioned:
+        raise MatrixError(
+            "required versioned client profiles missing from ZMQ_CLIENT_MATRIX_PROFILES: "
+            + ", ".join(missing_versioned)
+        )
+    unpinned_versions = [
+        profile for profile in required_versioned
+        if not version_label_is_pinned(profile_version(profile))
+    ]
+    if unpinned_versions:
+        raise MatrixError(
+            "required versioned client profiles must pin exact client/library versions "
+            "with ZMQ_CLIENT_MATRIX_<PROFILE>_VERSION: "
+            + ", ".join(unpinned_versions)
         )
 
     required_tools = configured_names("ZMQ_CLIENT_MATRIX_REQUIRED_TOOLS")
@@ -1982,6 +2014,7 @@ def self_test():
     try:
         os.environ["ZMQ_CLIENT_MATRIX_PROFILES"] = "apache_3_7, go_1_21"
         os.environ["ZMQ_CLIENT_MATRIX_APACHE_3_7_TOOLS"] = "java-kafka"
+        os.environ["ZMQ_CLIENT_MATRIX_APACHE_3_7_VERSION"] = "apache-kafka-clients-3.7.1"
         os.environ["ZMQ_CLIENT_MATRIX_APACHE_3_7_JAVA_CLASSPATH"] = "/opt/kafka-3.7/libs/*"
         os.environ["ZMQ_CLIENT_MATRIX_APACHE_3_7_SEMANTICS"] = (
             "admin,rebalance,transactions,security,security-negative"
@@ -1993,9 +2026,11 @@ def self_test():
         os.environ["ZMQ_CLIENT_MATRIX_APACHE_3_7_BAD_SSL_CA_LOCATION"] = "/tmp/matrix-bad-ca.pem"
         os.environ["ZMQ_CLIENT_MATRIX_APACHE_3_7_ACL_DENIED_TOPIC"] = "matrix-denied-topic"
         os.environ["ZMQ_CLIENT_MATRIX_GO_1_21_TOOLS"] = "go-kafka"
+        os.environ["ZMQ_CLIENT_MATRIX_GO_1_21_VERSION"] = "segmentio-kafka-go-v0.4.47"
         os.environ["ZMQ_CLIENT_MATRIX_GO_1_21_GO_MODULE"] = "github.com/segmentio/kafka-go@v0.4.47"
         os.environ["ZMQ_CLIENT_MATRIX_GO_1_21_SEMANTICS"] = "admin,groups"
         os.environ["ZMQ_CLIENT_MATRIX_REQUIRED_PROFILES"] = "apache_3_7,go_1_21"
+        os.environ["ZMQ_CLIENT_MATRIX_REQUIRED_VERSIONED_PROFILES"] = "apache_3_7,go_1_21"
         os.environ["ZMQ_CLIENT_MATRIX_REQUIRED_TOOLS"] = "java-kafka,go-kafka"
         os.environ["ZMQ_CLIENT_MATRIX_REQUIRED_SEMANTICS"] = (
             "admin,groups,rebalance,transactions,security,security-negative"
@@ -2007,6 +2042,14 @@ def self_test():
         if names != ["apache_3_7", "go_1_21"]:
             raise MatrixError(f"profile parsing failed: {names}")
         validate_required_profiles(names)
+        os.environ["ZMQ_CLIENT_MATRIX_GO_1_21_VERSION"] = "latest"
+        try:
+            validate_required_profiles(names)
+            raise MatrixError("unpinned required versioned client profile was accepted")
+        except MatrixError as exc:
+            if "required versioned client profiles" not in str(exc):
+                raise
+        os.environ["ZMQ_CLIENT_MATRIX_GO_1_21_VERSION"] = "segmentio-kafka-go-v0.4.47"
         os.environ["ZMQ_CLIENT_MATRIX_REQUIRED_TOOLS"] = "java-kafka,confluent-kafka"
         try:
             validate_required_profiles(names)
