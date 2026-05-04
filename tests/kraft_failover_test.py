@@ -61,6 +61,14 @@ def write_varint(value):
             return bytes(out)
 
 
+def write_signed_varint(value):
+    return write_varint((value << 1) ^ (value >> 31))
+
+
+def write_signed_varlong(value):
+    return write_varint((value << 1) ^ (value >> 63))
+
+
 def read_varint(buf, pos):
     result = 0
     shift = 0
@@ -446,6 +454,148 @@ def produce_error_code(port, topic, payload, correlation_id):
     return error_code
 
 
+def build_record_value(payload, offset_delta):
+    body = bytearray()
+    body += b"\x00"  # attributes
+    body += write_signed_varlong(0)  # timestamp_delta
+    body += write_signed_varint(offset_delta)
+    body += write_signed_varint(-1)  # null key
+    body += write_signed_varint(len(payload))
+    body += payload
+    body += write_signed_varint(0)  # headers
+    return write_signed_varint(len(body)) + bytes(body)
+
+
+def build_record_batch(
+    payloads,
+    producer_id,
+    producer_epoch,
+    base_sequence,
+    timestamp_ms=None,
+    attributes=0,
+):
+    if isinstance(payloads, (bytes, bytearray)):
+        payloads = [bytes(payloads)]
+    if not payloads:
+        raise TestError("record batch requires at least one payload")
+    if timestamp_ms is None:
+        timestamp_ms = int(time.time() * 1000)
+
+    records = b"".join(
+        build_record_value(payload, offset_delta)
+        for offset_delta, payload in enumerate(payloads)
+    )
+    batch_length = 49 + len(records)
+    header = bytearray()
+    header += struct.pack(">q", 0)  # base_offset, assigned by broker storage
+    header += struct.pack(">i", batch_length)
+    header += struct.pack(">i", 0)  # partition_leader_epoch
+    header += struct.pack(">b", 2)  # magic
+    header += struct.pack(">I", 0)  # CRC placeholder; broker treats zero as unchecked
+    header += struct.pack(">h", attributes)
+    header += struct.pack(">i", len(payloads) - 1)
+    header += struct.pack(">q", timestamp_ms)
+    header += struct.pack(">q", timestamp_ms)
+    header += struct.pack(">q", producer_id)
+    header += struct.pack(">h", producer_epoch)
+    header += struct.pack(">i", base_sequence)
+    header += struct.pack(">i", len(payloads))
+    return bytes(header) + records
+
+
+def parse_produce_v9_response(response, correlation_id, topic):
+    pos = 0
+    response_correlation, pos = read_i32(response, pos)
+    if response_correlation != correlation_id:
+        raise TestError(f"Produce v9 correlation mismatch: {response_correlation}")
+    pos = skip_tags(response, pos)
+    topics, pos = read_compact_array_len(response, pos)
+    if topics != 1:
+        raise TestError(f"Produce v9 topic response count={topics}")
+    topic_name, pos = read_compact_string(response, pos)
+    partitions, pos = read_compact_array_len(response, pos)
+    if topic_name != topic or partitions != 1:
+        raise TestError(f"Produce v9 topic={topic_name!r} partitions={partitions}")
+    partition, pos = read_i32(response, pos)
+    error_code, pos = read_i16(response, pos)
+    base_offset, pos = read_i64(response, pos)
+    _, pos = read_i64(response, pos)  # log_append_time_ms
+    _, pos = read_i64(response, pos)  # log_start_offset
+    record_errors, pos = read_compact_array_len(response, pos)
+    for _ in range(record_errors):
+        _, pos = read_i32(response, pos)
+        _, pos = read_compact_string(response, pos)
+        pos = skip_tags(response, pos)
+    error_message, pos = read_compact_string(response, pos)
+    pos = skip_tags(response, pos)
+    pos = skip_tags(response, pos)
+    _, pos = read_i32(response, pos)  # throttle_time_ms
+    pos = skip_tags(response, pos)
+    if partition != 0:
+        raise TestError(f"Produce v9 partition={partition} error_code={error_code}")
+    if pos != len(response):
+        raise TestError(f"Produce v9 response trailing bytes: {len(response) - pos}")
+    return {
+        "error_code": error_code,
+        "base_offset": base_offset,
+        "error_message": error_message,
+    }
+
+
+def produce_record_batch_result(port, topic, record_batch, correlation_id):
+    body = write_compact_string(None)  # transactional_id
+    body += struct.pack(">h", 1)  # acks
+    body += struct.pack(">i", 30000)
+    body += write_compact_array_len(1)
+    body += write_compact_string(topic)
+    body += write_compact_array_len(1)
+    body += struct.pack(">i", 0)
+    body += write_compact_bytes(record_batch)
+    body += b"\x00"  # partition tagged fields
+    body += b"\x00"  # topic tagged fields
+    body += b"\x00"  # request tagged fields
+
+    header = struct.pack(">hhi", 0, 9, correlation_id)
+    header += write_compact_string("kraft-idempotent-producer")
+    header += b"\x00"
+    frame_body = header + body
+
+    with socket.create_connection(("127.0.0.1", port), timeout=5) as sock:
+        sock.settimeout(5)
+        sock.sendall(struct.pack(">I", len(frame_body)) + frame_body)
+        response_size = struct.unpack(">I", read_exact(sock, 4))[0]
+        if response_size <= 0 or response_size > 1024 * 1024:
+            raise TestError(f"invalid Produce v9 response frame size {response_size}")
+        response = read_exact(sock, response_size)
+
+    return parse_produce_v9_response(response, correlation_id, topic)
+
+
+def wait_for_record_batch_result(port, topic, record_batch, expected_error, timeout=30):
+    deadline = time.time() + timeout
+    correlation_id = 7100
+    last_error = None
+    last_result = None
+    while time.time() < deadline:
+        try:
+            last_result = produce_record_batch_result(
+                port,
+                topic,
+                record_batch,
+                correlation_id,
+            )
+            if last_result["error_code"] == expected_error:
+                return last_result
+        except Exception as exc:
+            last_error = exc
+        correlation_id += 1
+        time.sleep(0.25)
+    raise TestError(
+        f"Produce v9 to {topic!r} did not return {expected_error}: "
+        f"last_result={last_result} last_error={last_error}"
+    )
+
+
 def wait_for_produce_error(port, topic, payload, expected_error, timeout=30):
     deadline = time.time() + timeout
     correlation_id = 4300
@@ -635,6 +785,33 @@ def wait_for_payloads(port, topic, payloads, timeout=30):
     )
 
 
+def wait_for_payload_counts(port, topic, expected_counts, timeout=30):
+    deadline = time.time() + timeout
+    correlation_id = 7200
+    last_error = None
+    last_counts = {}
+    last_high_watermark = None
+    while time.time() < deadline:
+        try:
+            high_watermark, records = fetch_records(port, topic, 0, correlation_id)
+            last_high_watermark = high_watermark
+            last_counts = {
+                payload: records.count(payload)
+                for payload in expected_counts
+            }
+            if all(last_counts[payload] == count for payload, count in expected_counts.items()):
+                return {"high_watermark": high_watermark, "counts": last_counts}
+        except Exception as exc:
+            last_error = exc
+        correlation_id += 1
+        time.sleep(0.25)
+    raise TestError(
+        f"payload counts for {topic!r} did not converge: expected={expected_counts} "
+        f"last_counts={last_counts} last_high_watermark={last_high_watermark} "
+        f"last_error={last_error}"
+    )
+
+
 def parse_offset_commit_response(response, correlation_id, expected_topic):
     pos = 0
     response_correlation, pos = read_i32(response, pos)
@@ -772,6 +949,20 @@ def init_producer_id(port, transactional_id, correlation_id):
     body += struct.pack(">i", 60000)  # transaction_timeout_ms
     response = controller_request(port, 22, 0, correlation_id, body)
     return parse_init_producer_id_response(response, correlation_id)
+
+
+def wait_for_init_producer_id(port, transactional_id, timeout=30):
+    deadline = time.time() + timeout
+    correlation_id = 7300
+    last_error = None
+    while time.time() < deadline:
+        try:
+            return init_producer_id(port, transactional_id, correlation_id)
+        except Exception as exc:
+            last_error = exc
+        correlation_id += 1
+        time.sleep(0.25)
+    raise TestError(f"InitProducerId for {transactional_id!r} did not recover: {last_error}")
 
 
 def parse_add_partitions_to_txn_response(response, correlation_id, expected_topic):
@@ -3012,14 +3203,21 @@ def main():
         topic = f"kraft-failover-{os.getpid()}-{int(time.time())}"
         group = f"kraft-failover-group-{os.getpid()}-{int(time.time())}"
         txn_topic = f"{topic}-txn"
+        idempotent_topic = f"{topic}-idempotent"
         expected_payloads = []
         wait_for_topic(broker["port"], topic)
         wait_for_topic(broker["port"], txn_topic)
+        wait_for_topic(broker["port"], idempotent_topic)
         expected_payloads.append(b"r0")
         first_offset = wait_for_produce(broker["port"], topic, expected_payloads[-1])
         committed_offset = first_offset + 1
         wait_for_payloads(broker["port"], topic, expected_payloads)
         wait_for_offset_commit(broker["port"], group, topic, committed_offset)
+        idempotent_transactional_id = f"{group}-idempotent"
+        idempotent_identity = wait_for_init_producer_id(
+            broker["port"],
+            idempotent_transactional_id,
+        )
         controller_failover_txn = wait_for_transaction_begin(
             broker["port"],
             f"{group}-controller-failover",
@@ -3136,6 +3334,28 @@ def main():
             f"{group}-broker-restart",
             txn_topic,
         )
+        idempotent_payload_0 = b"idempotent-seq-0"
+        idempotent_payload_1 = b"idempotent-seq-1"
+        idempotent_stale_payload = b"idempotent-stale-epoch"
+        idempotent_batch_0 = build_record_batch(
+            idempotent_payload_0,
+            idempotent_identity["producer_id"],
+            idempotent_identity["producer_epoch"],
+            0,
+        )
+        idempotent_first = wait_for_record_batch_result(
+            broker["port"],
+            idempotent_topic,
+            idempotent_batch_0,
+            0,
+        )
+        if idempotent_first["base_offset"] < 0:
+            raise TestError(f"initial idempotent produce returned {idempotent_first}")
+        wait_for_payload_counts(
+            broker["port"],
+            idempotent_topic,
+            {idempotent_payload_0: 1},
+        )
 
         stop_process(broker["proc"])
         broker = start_broker(tmp, voters)
@@ -3144,6 +3364,96 @@ def main():
         wait_for_committed_offset(broker["port"], group, topic, committed_offset)
         wait_for_transaction_end(broker["port"], broker_restart_txn)
         wait_for_group_heartbeat(broker["port"], classic_group_state)
+        duplicate_idempotent = wait_for_record_batch_result(
+            broker["port"],
+            idempotent_topic,
+            idempotent_batch_0,
+            0,
+        )
+        if duplicate_idempotent["base_offset"] != -1:
+            raise TestError(
+                f"duplicate idempotent batch appended after broker restart: {duplicate_idempotent}"
+            )
+        wait_for_payload_counts(
+            broker["port"],
+            idempotent_topic,
+            {idempotent_payload_0: 1},
+        )
+        idempotent_batch_1 = build_record_batch(
+            idempotent_payload_1,
+            idempotent_identity["producer_id"],
+            idempotent_identity["producer_epoch"],
+            1,
+        )
+        idempotent_second = wait_for_record_batch_result(
+            broker["port"],
+            idempotent_topic,
+            idempotent_batch_1,
+            0,
+        )
+        if idempotent_second["base_offset"] <= idempotent_first["base_offset"]:
+            raise TestError(
+                f"idempotent producer did not advance after restart: "
+                f"{idempotent_second} <= {idempotent_first}"
+            )
+        wait_for_payload_counts(
+            broker["port"],
+            idempotent_topic,
+            {idempotent_payload_0: 1, idempotent_payload_1: 1},
+        )
+        bumped_identity = wait_for_init_producer_id(
+            broker["port"],
+            idempotent_transactional_id,
+        )
+        if (
+            bumped_identity["producer_id"] != idempotent_identity["producer_id"]
+            or bumped_identity["producer_epoch"] <= idempotent_identity["producer_epoch"]
+        ):
+            raise TestError(
+                f"InitProducerId did not bump producer epoch: "
+                f"before={idempotent_identity} after={bumped_identity}"
+            )
+        stale_epoch_batch = build_record_batch(
+            idempotent_stale_payload,
+            idempotent_identity["producer_id"],
+            idempotent_identity["producer_epoch"],
+            2,
+        )
+        stale_epoch_result = wait_for_record_batch_result(
+            broker["port"],
+            idempotent_topic,
+            stale_epoch_batch,
+            47,
+        )
+        if stale_epoch_result["base_offset"] != -1:
+            raise TestError(f"stale epoch batch returned offset: {stale_epoch_result}")
+        next_epoch_batch = build_record_batch(
+            b"idempotent-next-epoch",
+            bumped_identity["producer_id"],
+            bumped_identity["producer_epoch"],
+            0,
+        )
+        next_epoch_result = wait_for_record_batch_result(
+            broker["port"],
+            idempotent_topic,
+            next_epoch_batch,
+            0,
+        )
+        if next_epoch_result["base_offset"] <= idempotent_second["base_offset"]:
+            raise TestError(
+                f"bumped idempotent producer did not append: "
+                f"{next_epoch_result} <= {idempotent_second}"
+            )
+        wait_for_payload_counts(
+            broker["port"],
+            idempotent_topic,
+            {
+                idempotent_payload_0: 1,
+                idempotent_payload_1: 1,
+                idempotent_stale_payload: 0,
+                b"idempotent-next-epoch": 1,
+            },
+        )
         expected_payloads.append(b"r4")
         fifth_offset = wait_for_produce(
             broker["port"], topic, expected_payloads[-1]
@@ -3176,6 +3486,7 @@ def main():
             f"reassignment_target_offset={automq_result['reassignment_target_offset']}, "
             f"committed_offset={committed_offset}, "
             f"transactions_checked=3, "
+            f"idempotent_producer_fencing=true, "
             f"classic_group_heartbeats=true, "
             f"network_partition={network_partition_result}, "
             f"automq_old_leader_fresh_rejoin={automq_result['old_leader_fresh_rejoin']})"
@@ -3296,6 +3607,46 @@ def self_test():
 
         heartbeat_fixture = struct.pack(">ih", 49, 0)
         parse_heartbeat_response(heartbeat_fixture, 49)
+
+        batch_fixture = build_record_batch(
+            b"idempotent-fixture",
+            1000,
+            2,
+            5,
+            timestamp_ms=123456,
+        )
+        if len(batch_fixture) < 61:
+            raise TestError("record batch fixture too short")
+        if struct.unpack_from(">i", batch_fixture, 8)[0] != len(batch_fixture) - 12:
+            raise TestError("record batch fixture length mismatch")
+        if struct.unpack_from(">b", batch_fixture, 16)[0] != 2:
+            raise TestError("record batch fixture magic mismatch")
+        if struct.unpack_from(">q", batch_fixture, 43)[0] != 1000:
+            raise TestError("record batch fixture producer id mismatch")
+        if struct.unpack_from(">h", batch_fixture, 51)[0] != 2:
+            raise TestError("record batch fixture producer epoch mismatch")
+        if struct.unpack_from(">i", batch_fixture, 53)[0] != 5:
+            raise TestError("record batch fixture base sequence mismatch")
+
+        produce_v9_fixture = struct.pack(">i", 50)
+        produce_v9_fixture += b"\x00"  # response header tagged fields
+        produce_v9_fixture += write_compact_array_len(1)
+        produce_v9_fixture += write_compact_string("idempotent-self-test")
+        produce_v9_fixture += write_compact_array_len(1)
+        produce_v9_fixture += struct.pack(">ihqqq", 0, 47, -1, -1, -1)
+        produce_v9_fixture += write_compact_array_len(0)
+        produce_v9_fixture += write_compact_string(None)
+        produce_v9_fixture += b"\x00"  # partition tagged fields
+        produce_v9_fixture += b"\x00"  # topic tagged fields
+        produce_v9_fixture += struct.pack(">i", 0)
+        produce_v9_fixture += b"\x00"  # response tagged fields
+        produce_v9 = parse_produce_v9_response(
+            produce_v9_fixture,
+            50,
+            "idempotent-self-test",
+        )
+        if produce_v9["error_code"] != 47 or produce_v9["base_offset"] != -1:
+            raise TestError(f"Produce v9 fixture parser failed: {produce_v9}")
 
         print("ok: KRaft failover harness self-test")
         return 0

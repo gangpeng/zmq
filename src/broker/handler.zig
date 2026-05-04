@@ -731,6 +731,11 @@ pub const Broker = struct {
         if (saved_sequences.len > 0) {
             log.info("Restored {d} producer sequence state(s)", .{saved_sequences.len});
         }
+        const reconciled_sequences = self.reconcileProducerSequencesWithTransactionEpochs();
+        if (reconciled_sequences > 0) {
+            log.info("Fenced {d} producer sequence state(s) from restored transaction epochs", .{reconciled_sequences});
+            self.persistProducerSequencesIfDirty();
+        }
 
         // Load persisted ACLs
         const saved_acls = try self.persistence.loadAcls();
@@ -2319,6 +2324,30 @@ pub const Broker = struct {
         if (!self.producer_sequences_dirty) return;
         try self.persistence.saveProducerSequences(&self.producer_sequences);
         self.producer_sequences_dirty = false;
+    }
+
+    fn fenceProducerSequencesForEpoch(self: *Broker, producer_id: i64, producer_epoch: i16) usize {
+        var fenced: usize = 0;
+        var it = self.producer_sequences.iterator();
+        while (it.next()) |entry| {
+            if (entry.key_ptr.producer_id != producer_id) continue;
+            if (entry.value_ptr.producer_epoch >= producer_epoch) continue;
+            entry.value_ptr.producer_epoch = producer_epoch;
+            entry.value_ptr.last_sequence = -1;
+            fenced += 1;
+        }
+        if (fenced > 0) self.producer_sequences_dirty = true;
+        return fenced;
+    }
+
+    fn reconcileProducerSequencesWithTransactionEpochs(self: *Broker) usize {
+        var fenced: usize = 0;
+        var it = self.txn_coordinator.transactions.iterator();
+        while (it.next()) |entry| {
+            const txn = entry.value_ptr;
+            fenced += self.fenceProducerSequencesForEpoch(txn.producer_id, txn.producer_epoch);
+        }
+        return fenced;
     }
 
     /// Persist per-partition offsets/HW/LSO to disk (best-effort).
@@ -15142,6 +15171,17 @@ pub const Broker = struct {
                 };
                 return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
             };
+            _ = self.fenceProducerSequencesForEpoch(result.producer_id, result.producer_epoch);
+            self.persistProducerSequencesIfDirtyDurably() catch |err| {
+                log.warn("InitProducerId producer sequence fence write failed for {s}: {}", .{ req.transactional_id orelse "", err });
+                const resp = Resp{
+                    .throttle_time_ms = 0,
+                    .error_code = @intFromEnum(ErrorCode.kafka_storage_error),
+                    .producer_id = -1,
+                    .producer_epoch = -1,
+                };
+                return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+            };
         } else {
             self.persistTransactionsIfDirty();
         }
@@ -27154,6 +27194,48 @@ test "Broker.handleRequest Produce rejects idempotent sequence gaps and stale ep
     try testing.expectEqual(@as(i64, 1), next.base_offset);
     try testing.expectEqual(@as(u64, 2), broker.partitionState(topic_name, 0).?.next_offset);
     try testing.expectEqual(@as(i32, 1), broker.producer_sequences.get(key).?.last_sequence);
+}
+
+test "Broker.handleRequest InitProducerId epoch bump fences existing idempotent sequence state" {
+    const topic_name = "produce-sequence-init-fence-topic";
+    const transactional_id = "txn-sequence-fence";
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+    try testing.expect(broker.ensureTopic(topic_name));
+
+    const init_result = try broker.txn_coordinator.initProducerId(transactional_id);
+    const key = Broker.ProducerKey{
+        .producer_id = init_result.producer_id,
+        .partition_key = PartitionStore.hashPartitionKey(topic_name, 0),
+    };
+    try broker.producer_sequences.put(key, .{
+        .last_sequence = 3,
+        .producer_epoch = init_result.producer_epoch,
+    });
+    broker.producer_sequences_dirty = false;
+
+    var buf: [256]u8 = undefined;
+    var pos = buildTestRequest(&buf, 22, 0, 318, header_mod.requestHeaderVersion(22, 0));
+    ser.writeString(&buf, &pos, transactional_id);
+    ser.writeI32(&buf, &pos, 60000);
+
+    const response = broker.handleRequest(buf[0..pos]);
+    try testing.expect(response != null);
+    defer testing.allocator.free(response.?);
+
+    var rpos: usize = 0;
+    try testing.expectEqual(@as(i32, 318), ser.readI32(response.?, &rpos));
+    _ = ser.readI32(response.?, &rpos); // throttle_time_ms
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.none)), ser.readI16(response.?, &rpos));
+    try testing.expectEqual(init_result.producer_id, ser.readI64(response.?, &rpos));
+    const bumped_epoch = ser.readI16(response.?, &rpos);
+    try testing.expectEqual(init_result.producer_epoch + 1, bumped_epoch);
+
+    const sequence_state = broker.producer_sequences.get(key).?;
+    try testing.expectEqual(bumped_epoch, sequence_state.producer_epoch);
+    try testing.expectEqual(@as(i32, -1), sequence_state.last_sequence);
+    try testing.expect(!broker.producer_sequences_dirty);
 }
 
 test "Broker rebuilds idempotent producer sequence state from S3 WAL" {
