@@ -678,7 +678,11 @@ Status: completed for the initial catalog and DeleteGroups slice.
   `ZMQ_E2E_CHAOS_MATRIX` plus per-phase down/up/expect hooks, exports
   broker/controller/container context to those hooks, verifies cross-node
   produce/fetch behavior after each heal, and fails release jobs when required
-  phases are absent through `ZMQ_E2E_REQUIRED_CHAOS_PHASES`.
+  phases are absent through `ZMQ_E2E_REQUIRED_CHAOS_PHASES`. Live Docker
+  load/scale orchestration can now be required separately with
+  `ZMQ_E2E_LOAD_SCALE_MATRIX`, per-phase apply/restore hooks, cross-node
+  produce/fetch checks after both apply and restore, and
+  `ZMQ_E2E_REQUIRED_LOAD_SCALE_PHASES` release coverage validation.
   Remaining gap: broader failover gates and client compatibility fixtures.
 - Validate rack-aware routing and auto-balancer decisions under load. Status:
   rack-aware planning has unit coverage for cross-rack target preference,
@@ -704,7 +708,9 @@ Status: completed for the initial catalog and DeleteGroups slice.
   coverage that spreads hot partitions from an overloaded broker to multiple
   newly active broker targets. Docker E2E can require named cross-broker chaos
   phases and verifies cross-node produce/fetch recovery after each heal.
-  Broader live load/scale orchestration coverage remains.
+  Live Docker load/scale orchestration hooks and required-phase validation are
+  now pinned by `test-e2e`; broader CI execution across real scale-in/out/load
+  environments remains.
 
 ### Phase 5: Production Gates
 
@@ -772,9 +778,11 @@ Status: completed for the initial catalog and DeleteGroups slice.
   jobs when required failover phases are omitted through
   `ZMQ_KRAFT_REQUIRED_NETWORK_PHASES`. `test-e2e` can now require named
   Docker cross-broker chaos phases with `ZMQ_E2E_REQUIRED_CHAOS_PHASES` and
-  per-phase `ZMQ_E2E_CHAOS_<PHASE>_{DOWN,UP,EXPECT}` hooks. Remaining work:
-  broader environment execution coverage for live provider outage profiles and
-  scheduled partition matrices.
+  per-phase `ZMQ_E2E_CHAOS_<PHASE>_{DOWN,UP,EXPECT}` hooks plus named Docker
+  live load/scale phases with `ZMQ_E2E_REQUIRED_LOAD_SCALE_PHASES` and
+  per-phase `ZMQ_E2E_LOAD_SCALE_<PHASE>_{APPLY,RESTORE}` hooks. Remaining
+  work: broader environment execution coverage for live provider outage
+  profiles, scheduled partition matrices, and scheduled load/scale matrices.
 - Add performance baselines for produce/fetch throughput, p99 latency, S3
   operations per MiB, recovery time, and memory growth.
   Status: `zig build bench` now compiles against the broker/storage/protocol

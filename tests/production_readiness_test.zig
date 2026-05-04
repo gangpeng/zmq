@@ -806,6 +806,7 @@ test "AutoMQ parity release criteria document pins required gates" {
         "ZMQ_KRAFT_REQUIRED_NETWORK_PHASES",
         "ZMQ_CHAOS_REQUIRED_NETWORK_PHASES",
         "ZMQ_E2E_REQUIRED_CHAOS_PHASES",
+        "ZMQ_E2E_REQUIRED_LOAD_SCALE_PHASES",
         "ZMQ_S3_PROVIDER_REQUIRED_PROFILES",
         "ZMQ_S3_PROVIDER_REQUIRED_OUTAGE_PROFILES",
         "ZMQ_S3_PROVIDER_REQUIRED_LIST_PAGINATION_PROFILES",
@@ -832,6 +833,7 @@ test "AutoMQ parity release criteria document pins required gates" {
         "Legacy inter-broker APIs",
         "broker-only stateless replacement",
         "cross-broker chaos",
+        "E2E load/scale",
         "comparative Kafka/AutoMQ performance",
     };
     for (unsupported_surfaces) |surface| {

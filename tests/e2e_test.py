@@ -31,6 +31,11 @@ Optional cross-broker chaos environment:
   ZMQ_E2E_CHAOS_<PHASE>_DOWN / UP      phase-specific hooks
   ZMQ_E2E_CHAOS_<PHASE>_EXPECT         phase-specific expectation
   ZMQ_E2E_REQUIRED_CHAOS_PHASES        fail if matrix omits required phases
+  ZMQ_E2E_LOAD_SCALE_MATRIX            comma-separated named scale/load phases
+  ZMQ_E2E_LOAD_SCALE_APPLY / RESTORE   default scale/load orchestration hooks
+  ZMQ_E2E_LOAD_SCALE_<PHASE>_APPLY / RESTORE
+                                      phase-specific scale/load hooks
+  ZMQ_E2E_REQUIRED_LOAD_SCALE_PHASES   fail if matrix omits required phases
 """
 
 import socket
@@ -379,6 +384,121 @@ def run_cross_broker_chaos(t, topic):
 
 
 # ---------------------------------------------------------------
+# Live load/scale orchestration gate helpers
+# ---------------------------------------------------------------
+
+def e2e_load_scale_hooks_configured():
+    return bool(
+        os.environ.get("ZMQ_E2E_LOAD_SCALE_MATRIX")
+        or os.environ.get("ZMQ_E2E_LOAD_SCALE_APPLY")
+        or os.environ.get("ZMQ_E2E_LOAD_SCALE_RESTORE")
+    )
+
+
+def e2e_load_scale_phase_env_name(phase, suffix):
+    return f"ZMQ_E2E_LOAD_SCALE_{env_phase_token(phase)}_{suffix}"
+
+
+def e2e_load_scale_phase_command(phase, suffix):
+    return os.environ.get(e2e_load_scale_phase_env_name(phase, suffix)) or os.environ.get(
+        f"ZMQ_E2E_LOAD_SCALE_{suffix}"
+    )
+
+
+def selected_e2e_load_scale_phases():
+    if not e2e_load_scale_hooks_configured():
+        return []
+
+    raw_matrix = os.environ.get("ZMQ_E2E_LOAD_SCALE_MATRIX")
+    phase_names = split_csv(raw_matrix) if raw_matrix else ["scale"]
+    if not phase_names:
+        raise AssertionError("ZMQ_E2E_LOAD_SCALE_MATRIX did not contain any phases")
+
+    phases = []
+    seen = set()
+    for phase in phase_names:
+        if phase in seen:
+            continue
+        seen.add(phase)
+        apply = e2e_load_scale_phase_command(phase, "APPLY")
+        restore = e2e_load_scale_phase_command(phase, "RESTORE")
+        if not apply or not restore:
+            raise AssertionError(
+                f"E2E load/scale phase {phase!r} requires APPLY and RESTORE hooks"
+            )
+        phases.append({"name": phase, "apply": apply, "restore": restore})
+    return phases
+
+
+def validate_required_e2e_load_scale_phase_coverage():
+    required = split_csv(os.environ.get("ZMQ_E2E_REQUIRED_LOAD_SCALE_PHASES"))
+    if not required:
+        return
+
+    configured = [phase["name"] for phase in selected_e2e_load_scale_phases()]
+    missing = [phase for phase in required if phase not in configured]
+    if missing:
+        raise AssertionError(
+            "required E2E load/scale phases not configured: " + ", ".join(missing)
+        )
+
+
+def e2e_load_scale_hook_env(phase, index):
+    env = os.environ.copy()
+    env["ZMQ_E2E_LOAD_SCALE_PHASE"] = phase["name"]
+    env["ZMQ_E2E_LOAD_SCALE_PHASE_INDEX"] = str(index)
+    env["ZMQ_E2E_BROKER_PORTS"] = ",".join(
+        f"{node['name']}:{node['broker_port']}" for node in NODES
+    )
+    env["ZMQ_E2E_CONTROLLER_PORTS"] = ",".join(
+        f"{node['name']}:{node['controller_port']}" for node in NODES
+    )
+    env["ZMQ_E2E_CONTAINERS"] = ",".join(
+        f"{node['name']}:{node['container']}" for node in NODES
+    )
+    return env
+
+
+def run_e2e_load_scale_hook(label, command, env):
+    proc = subprocess.run(
+        shlex.split(command),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        timeout=180,
+        env=env,
+    )
+    if proc.returncode != 0:
+        raise AssertionError(f"{label} failed with exit code {proc.returncode}\n{proc.stdout}")
+
+
+def run_e2e_load_scale_phases(t, topic):
+    phases = selected_e2e_load_scale_phases()
+    if not phases:
+        return
+
+    print("\n[Test m] Live load/scale phases")
+    for index, phase in enumerate(phases):
+        env = e2e_load_scale_hook_env(phase, index)
+        restored = False
+        applied_payload = f"e2e-load-scale-applied-{index}-{phase['name']}".encode()
+        restored_payload = f"e2e-load-scale-restored-{index}-{phase['name']}".encode()
+        try:
+            run_e2e_load_scale_hook(f"{phase['name']}:apply", phase["apply"], env)
+            ok, detail = wait_for_cross_node_payload(t, topic, applied_payload, timeout=30)
+            t.check(f"Load/scale {phase['name']} serves after apply", ok, detail)
+        finally:
+            run_e2e_load_scale_hook(f"{phase['name']}:restore", phase["restore"], env)
+            restored = True
+
+        ok, detail = wait_for_cross_node_payload(t, topic, restored_payload, timeout=30)
+        t.check(f"Load/scale {phase['name']} serves after restore", ok, detail)
+
+        if not restored:
+            raise AssertionError(f"E2E load/scale phase {phase['name']} did not restore")
+
+
+# ---------------------------------------------------------------
 # Test Runner
 # ---------------------------------------------------------------
 
@@ -434,8 +554,13 @@ def self_test():
         os.environ.pop("ZMQ_E2E_CHAOS_DOWN", None)
         os.environ.pop("ZMQ_E2E_CHAOS_UP", None)
         os.environ.pop("ZMQ_E2E_CHAOS_MATRIX", None)
+        os.environ.pop("ZMQ_E2E_LOAD_SCALE_APPLY", None)
+        os.environ.pop("ZMQ_E2E_LOAD_SCALE_RESTORE", None)
+        os.environ.pop("ZMQ_E2E_LOAD_SCALE_MATRIX", None)
         if selected_e2e_chaos_phases() != []:
             raise AssertionError("E2E chaos phases unexpectedly configured")
+        if selected_e2e_load_scale_phases() != []:
+            raise AssertionError("E2E load/scale phases unexpectedly configured")
 
         os.environ["ZMQ_E2E_CHAOS_DOWN"] = "true"
         os.environ["ZMQ_E2E_CHAOS_UP"] = "true"
@@ -472,6 +597,37 @@ def self_test():
             raise AssertionError("E2E chaos container context failed")
         run_e2e_chaos_hook("self-test:down", phases[1]["down"], env)
         run_e2e_chaos_hook("self-test:up", phases[1]["up"], env)
+
+        os.environ["ZMQ_E2E_LOAD_SCALE_APPLY"] = "true"
+        os.environ["ZMQ_E2E_LOAD_SCALE_RESTORE"] = "true"
+        load_scale_phases = selected_e2e_load_scale_phases()
+        if len(load_scale_phases) != 1 or load_scale_phases[0]["name"] != "scale":
+            raise AssertionError(f"default E2E load/scale phase selection failed: {load_scale_phases}")
+
+        os.environ["ZMQ_E2E_LOAD_SCALE_MATRIX"] = "scale-out, scale-in,scale-out"
+        os.environ["ZMQ_E2E_LOAD_SCALE_SCALE_IN_APPLY"] = "true"
+        os.environ["ZMQ_E2E_LOAD_SCALE_SCALE_IN_RESTORE"] = "true"
+        load_scale_phases = selected_e2e_load_scale_phases()
+        if [phase["name"] for phase in load_scale_phases] != ["scale-out", "scale-in"]:
+            raise AssertionError(f"E2E load/scale matrix parsing failed: {load_scale_phases}")
+
+        os.environ["ZMQ_E2E_REQUIRED_LOAD_SCALE_PHASES"] = "scale-out,scale-in"
+        validate_required_e2e_load_scale_phase_coverage()
+        os.environ["ZMQ_E2E_REQUIRED_LOAD_SCALE_PHASES"] = "missing-scale"
+        try:
+            validate_required_e2e_load_scale_phase_coverage()
+            raise AssertionError("missing required E2E load/scale phase was not rejected")
+        except AssertionError as exc:
+            if "required E2E load/scale phases" not in str(exc):
+                raise
+
+        load_env = e2e_load_scale_hook_env(load_scale_phases[1], 1)
+        if load_env["ZMQ_E2E_LOAD_SCALE_PHASE"] != "scale-in":
+            raise AssertionError("E2E load/scale phase context failed")
+        if load_env["ZMQ_E2E_CONTROLLER_PORTS"] != "node0:19093,node1:19095,node2:19097":
+            raise AssertionError("E2E load/scale controller port context failed")
+        run_e2e_load_scale_hook("self-test:apply", load_scale_phases[1]["apply"], load_env)
+        run_e2e_load_scale_hook("self-test:restore", load_scale_phases[1]["restore"], load_env)
     finally:
         os.environ.clear()
         os.environ.update(old_env)
@@ -493,6 +649,7 @@ def main():
 
     try:
         validate_required_e2e_chaos_phase_coverage()
+        validate_required_e2e_load_scale_phase_coverage()
     except AssertionError as exc:
         print(f"FAIL: {exc}", file=sys.stderr)
         return 1
@@ -779,6 +936,11 @@ def main():
         run_cross_broker_chaos(t, "e2e-topic")
     except Exception as e:
         t.check("Cross-broker chaos gate", False, str(e))
+
+    try:
+        run_e2e_load_scale_phases(t, "e2e-topic")
+    except Exception as e:
+        t.check("Live load/scale gate", False, str(e))
 
     # =============================================
     # Summary

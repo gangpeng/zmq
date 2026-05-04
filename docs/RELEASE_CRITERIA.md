@@ -58,9 +58,10 @@ Release CI must set required coverage variables for environment-specific
 matrices, including `ZMQ_KRAFT_REQUIRED_NETWORK_PHASES` for scheduled
 controller/broker partition phases, `ZMQ_CHAOS_REQUIRED_NETWORK_PHASES` for
 broker chaos partitions, `ZMQ_E2E_REQUIRED_CHAOS_PHASES` for Docker
-cross-broker chaos phases, and provider/client/profile requirement variables
-for S3 and external-client matrices. S3 provider coverage must pin provider,
-outage, ListObjectsV2 pagination, multipart-edge, and multipart-fault profiles with
+cross-broker chaos phases, `ZMQ_E2E_REQUIRED_LOAD_SCALE_PHASES` for live Docker
+scale-in/scale-out/load phases, and provider/client/profile requirement
+variables for S3 and external-client matrices. S3 provider coverage must pin
+provider, outage, ListObjectsV2 pagination, multipart-edge, and multipart-fault profiles with
 `ZMQ_S3_PROVIDER_REQUIRED_PROFILES`,
 `ZMQ_S3_PROVIDER_REQUIRED_OUTAGE_PROFILES`,
 `ZMQ_S3_PROVIDER_REQUIRED_LIST_PAGINATION_PROFILES`,
@@ -91,10 +92,9 @@ release:
   inter-broker behavior replaces single-node/no-op compatibility handlers.
 - Broader broker-only stateless replacement still has local cache/state
   assumptions outside the covered S3/quorum replay paths.
-- Broader live load/scale orchestration, CI execution of required scheduled
-  cross-broker chaos and KRaft failover matrices, scheduled live provider
-  outage profiles, and comparative Kafka/AutoMQ performance trend gates are
-  still release blockers.
+- CI execution of required scheduled cross-broker chaos, E2E load/scale, KRaft
+  failover matrices, scheduled live provider outage profiles, and comparative Kafka/AutoMQ performance
+  trend gates are still release blockers.
 
 ## Release Decision
 
