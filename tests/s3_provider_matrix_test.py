@@ -18,6 +18,9 @@ Global environment:
                                comma-separated profile names that must run the ListObjectsV2 pagination gate.
     ZMQ_S3_PROVIDER_REQUIRED_MULTIPART_EDGE_PROFILES
                                comma-separated profile names that must run the multipart edge gate.
+    ZMQ_S3_PROVIDER_REQUIRED_MULTIPART_FAULT_PROFILES
+                               comma-separated profile names that must run a provider-specific
+                               multipart fault-injection command.
     ZMQ_S3_PROVIDER_ZIG         Zig executable. Defaults to zig.
 
 Per-profile overrides:
@@ -35,6 +38,9 @@ Per-profile gates:
     ListObjectsV2 pagination gate for providers in that profile.
     ZMQ_S3_<PROFILE>_REQUIRE_MULTIPART_EDGE=1 enables a live uneven three-part
     multipart upload/get verification gate for providers in that profile.
+    ZMQ_S3_<PROFILE>_RUN_MULTIPART_FAULT=1 runs a provider-specific multipart
+    fault-injection command after the live MinIO/S3 suite. It requires
+    ZMQ_S3_<PROFILE>_MULTIPART_FAULT_CMD.
     ZMQ_S3_<PROFILE>_RUN_PROCESS_CRASH=1 also runs the broker-process
     crash/replacement harness with that provider's S3 settings.
     ZMQ_S3_<PROFILE>_RUN_LIVE_OUTAGE=1 also runs the live-S3 chaos outage
@@ -43,6 +49,7 @@ Per-profile gates:
 """
 
 import os
+import shlex
 import subprocess
 import sys
 
@@ -66,6 +73,20 @@ def run(cmd, timeout=300, env=None):
     )
     if proc.returncode != 0:
         raise MatrixError(f"{cmd[0]} failed with exit code {proc.returncode}\n{proc.stdout}")
+    return proc.stdout
+
+
+def run_command_string(label, command, timeout=900, env=None):
+    proc = subprocess.run(
+        shlex.split(command),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        timeout=timeout,
+        env=env,
+    )
+    if proc.returncode != 0:
+        raise MatrixError(f"{label} failed with exit code {proc.returncode}\n{proc.stdout}")
     return proc.stdout
 
 
@@ -160,6 +181,15 @@ def provider_chaos_env(profile, env):
     return chaos_env
 
 
+def provider_multipart_fault_env(profile, env):
+    fault_env = env.copy()
+    fault_env["ZMQ_S3_MULTIPART_FAULT_PROFILE"] = profile
+    fault_env["ZMQ_S3_MULTIPART_FAULT_ENDPOINT"] = env["ZMQ_S3_ENDPOINT"]
+    fault_env["ZMQ_S3_MULTIPART_FAULT_PORT"] = env["ZMQ_S3_PORT"]
+    fault_env["ZMQ_S3_MULTIPART_FAULT_BUCKET"] = env["ZMQ_S3_BUCKET"]
+    return fault_env
+
+
 def profile_enabled(profile, suffix):
     return truthy(profile_setting(profile, suffix, "0"))
 
@@ -237,6 +267,32 @@ def validate_required_profiles(profiles):
             + ", ".join(disabled_multipart_edge)
         )
 
+    required_multipart_fault = configured_names("ZMQ_S3_PROVIDER_REQUIRED_MULTIPART_FAULT_PROFILES")
+    missing_multipart_fault_profiles = [profile for profile in required_multipart_fault if profile not in profile_set]
+    if missing_multipart_fault_profiles:
+        raise MatrixError(
+            "required S3 multipart-fault profiles missing from ZMQ_S3_PROVIDER_PROFILES: "
+            + ", ".join(missing_multipart_fault_profiles)
+        )
+    disabled_multipart_fault = [
+        profile for profile in required_multipart_fault
+        if not profile_enabled(profile, "RUN_MULTIPART_FAULT")
+    ]
+    if disabled_multipart_fault:
+        raise MatrixError(
+            "required S3 multipart-fault profiles must set RUN_MULTIPART_FAULT=1: "
+            + ", ".join(disabled_multipart_fault)
+        )
+    missing_multipart_fault_cmd = [
+        profile for profile in required_multipart_fault
+        if not profile_setting(profile, "MULTIPART_FAULT_CMD", None)
+    ]
+    if missing_multipart_fault_cmd:
+        raise MatrixError(
+            "required S3 multipart-fault profiles must set MULTIPART_FAULT_CMD: "
+            + ", ".join(missing_multipart_fault_cmd)
+        )
+
 
 def run_profile(profile):
     env = provider_env(profile)
@@ -247,6 +303,19 @@ def run_profile(profile):
         run([ZIG, "build", "test-s3-process-crash", "--summary", "all"], timeout=900, env=process_env)
     if profile_enabled(profile, "RUN_LIVE_OUTAGE"):
         run([ZIG, "build", "test-chaos", "--summary", "all"], timeout=900, env=provider_chaos_env(profile, env))
+    if profile_enabled(profile, "RUN_MULTIPART_FAULT"):
+        command = profile_setting(profile, "MULTIPART_FAULT_CMD", None)
+        if not command:
+            raise MatrixError(
+                f"profile {profile} RUN_MULTIPART_FAULT requires "
+                f"{profile_key(profile, 'MULTIPART_FAULT_CMD')}"
+            )
+        run_command_string(
+            f"S3 multipart fault profile {profile}",
+            command,
+            timeout=900,
+            env=provider_multipart_fault_env(profile, env),
+        )
     print(
         "ok: S3 provider profile "
         f"{profile} endpoint={env['ZMQ_S3_ENDPOINT']}:{env['ZMQ_S3_PORT']} bucket={env['ZMQ_S3_BUCKET']}"
@@ -280,6 +349,8 @@ def self_test():
         os.environ["ZMQ_S3_AWS_US_EAST_1_SKIP_MINIO_HEALTH"] = "1"
         os.environ["ZMQ_S3_AWS_US_EAST_1_REQUIRE_LIST_PAGINATION"] = "1"
         os.environ["ZMQ_S3_AWS_US_EAST_1_REQUIRE_MULTIPART_EDGE"] = "1"
+        os.environ["ZMQ_S3_AWS_US_EAST_1_RUN_MULTIPART_FAULT"] = "1"
+        os.environ["ZMQ_S3_AWS_US_EAST_1_MULTIPART_FAULT_CMD"] = "true"
         os.environ["ZMQ_S3_AWS_US_EAST_1_RUN_PROCESS_CRASH"] = "true"
         os.environ["ZMQ_S3_AWS_US_EAST_1_RUN_LIVE_OUTAGE"] = "true"
         os.environ["ZMQ_S3_AWS_US_EAST_1_OUTAGE_DOWN"] = "tc qdisc add dev lo root netem loss 100%"
@@ -288,6 +359,7 @@ def self_test():
         os.environ["ZMQ_S3_PROVIDER_REQUIRED_OUTAGE_PROFILES"] = "aws_us_east_1"
         os.environ["ZMQ_S3_PROVIDER_REQUIRED_LIST_PAGINATION_PROFILES"] = "aws_us_east_1"
         os.environ["ZMQ_S3_PROVIDER_REQUIRED_MULTIPART_EDGE_PROFILES"] = "aws_us_east_1"
+        os.environ["ZMQ_S3_PROVIDER_REQUIRED_MULTIPART_FAULT_PROFILES"] = "aws_us_east_1"
 
         names = profile_names()
         if names != ["minio", "aws_us_east_1"]:
@@ -315,6 +387,8 @@ def self_test():
             raise MatrixError("profile pagination gate override failed")
         if env["ZMQ_S3_REQUIRE_MULTIPART_EDGE"] != "1":
             raise MatrixError("profile multipart-edge gate override failed")
+        if not profile_enabled("aws_us_east_1", "RUN_MULTIPART_FAULT"):
+            raise MatrixError("profile multipart-fault gate override failed")
         if not profile_enabled("aws_us_east_1", "RUN_PROCESS_CRASH"):
             raise MatrixError("profile process-crash gate override failed")
         if not profile_enabled("aws_us_east_1", "RUN_LIVE_OUTAGE"):
@@ -326,6 +400,16 @@ def self_test():
             raise MatrixError("profile live-outage endpoint pass-through failed")
         if chaos_env["ZMQ_CHAOS_S3_DOWN"] != "tc qdisc add dev lo root netem loss 100%":
             raise MatrixError("profile live-outage down hook override failed")
+        fault_env = provider_multipart_fault_env("aws_us_east_1", env)
+        if fault_env["ZMQ_S3_MULTIPART_FAULT_PROFILE"] != "aws_us_east_1":
+            raise MatrixError("profile multipart-fault context failed")
+        if fault_env["ZMQ_S3_MULTIPART_FAULT_BUCKET"] != "zmq-parity":
+            raise MatrixError("profile multipart-fault bucket pass-through failed")
+        run_command_string(
+            "multipart-fault self-test",
+            profile_setting("aws_us_east_1", "MULTIPART_FAULT_CMD", None),
+            env=fault_env,
+        )
 
         os.environ["ZMQ_S3_PROVIDER_REQUIRED_OUTAGE_PROFILES"] = "minio,aws_us_east_1"
         try:
@@ -351,6 +435,15 @@ def self_test():
             raise MatrixError("missing required multipart-edge profile did not fail validation")
         except MatrixError as exc:
             if "REQUIRE_MULTIPART_EDGE" not in str(exc):
+                raise
+
+        os.environ["ZMQ_S3_PROVIDER_REQUIRED_MULTIPART_EDGE_PROFILES"] = "aws_us_east_1"
+        os.environ["ZMQ_S3_PROVIDER_REQUIRED_MULTIPART_FAULT_PROFILES"] = "minio,aws_us_east_1"
+        try:
+            validate_required_profiles(names)
+            raise MatrixError("missing required multipart-fault profile did not fail validation")
+        except MatrixError as exc:
+            if "RUN_MULTIPART_FAULT" not in str(exc):
                 raise
 
         print("ok: S3 provider matrix self-test")
