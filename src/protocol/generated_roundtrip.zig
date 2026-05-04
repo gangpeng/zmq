@@ -6442,6 +6442,211 @@ test "generated non-default golden fixtures cover legacy and flexible wire encod
             0x00, 0x2a, 0x00,
         });
     }
+
+    {
+        const GetKVsRequest = generated.get_k_vs_request.GetKVsRequest;
+        const requests = [_]GetKVsRequest.GetKVRequest{
+            .{ .key = "alpha" },
+            .{ .key = "beta" },
+        };
+        const value = GetKVsRequest{
+            .get_key_requests = &requests,
+        };
+        try expectGoldenRoundTrip(GetKVsRequest, value, 0, &[_]u8{
+            0x03, 0x06, 'a',  'l',
+            'p',  'h',  'a',  0x00,
+            0x05, 'b',  'e',  't',
+            'a',  0x00, 0x00,
+        });
+    }
+
+    {
+        const GetKVsResponse = generated.get_k_vs_response.GetKVsResponse;
+        const responses = [_]GetKVsResponse.GetKVResponse{
+            .{
+                .error_code = 0,
+                .value = "one",
+            },
+            .{
+                .error_code = 42,
+                .value = null,
+            },
+        };
+        const value = GetKVsResponse{
+            .error_code = 1,
+            .throttle_time_ms = 9,
+            .get_kv_responses = &responses,
+        };
+        try expectGoldenRoundTrip(GetKVsResponse, value, 0, &[_]u8{
+            0x00, 0x01, 0x00, 0x00,
+            0x00, 0x09, 0x03, 0x00,
+            0x00, 0x04, 'o',  'n',
+            'e',  0x00, 0x00, 0x2a,
+            0x00, 0x00, 0x00,
+        });
+    }
+
+    {
+        const PutKVsRequest = generated.put_k_vs_request.PutKVsRequest;
+        const requests = [_]PutKVsRequest.PutKVRequest{
+            .{
+                .key = "alpha",
+                .value = &[_]u8{ 0xde, 0xad },
+                .overwrite = true,
+            },
+            .{
+                .key = "beta",
+                .value = null,
+                .overwrite = false,
+            },
+        };
+        const value = PutKVsRequest{
+            .put_kv_requests = &requests,
+        };
+        try expectGoldenRoundTrip(PutKVsRequest, value, 0, &[_]u8{
+            0x03, 0x06, 'a',  'l',
+            'p',  'h',  'a',  0x03,
+            0xde, 0xad, 0x01, 0x00,
+            0x05, 'b',  'e',  't',
+            'a',  0x00, 0x00, 0x00,
+            0x00,
+        });
+    }
+
+    {
+        const PutKVsResponse = generated.put_k_vs_response.PutKVsResponse;
+        const responses = [_]PutKVsResponse.PutKVResponse{.{
+            .error_code = 42,
+            .value = "prev",
+        }};
+        const value = PutKVsResponse{
+            .throttle_time_ms = 11,
+            .put_kv_responses = &responses,
+        };
+        try expectGoldenRoundTrip(PutKVsResponse, value, 0, &[_]u8{
+            0x00, 0x00, 0x00, 0x00,
+            0x00, 0x0b, 0x02, 0x00,
+            0x2a, 0x05, 'p',  'r',
+            'e',  'v',  0x00, 0x00,
+        });
+    }
+
+    {
+        const DeleteKVsRequest = generated.delete_k_vs_request.DeleteKVsRequest;
+        const requests = [_]DeleteKVsRequest.DeleteKVRequest{
+            .{ .key = "alpha" },
+            .{ .key = "beta" },
+        };
+        const value = DeleteKVsRequest{
+            .delete_kv_requests = &requests,
+        };
+        try expectGoldenRoundTrip(DeleteKVsRequest, value, 0, &[_]u8{
+            0x03, 0x06, 'a',  'l',
+            'p',  'h',  'a',  0x00,
+            0x05, 'b',  'e',  't',
+            'a',  0x00, 0x00,
+        });
+    }
+
+    {
+        const DeleteKVsResponse = generated.delete_k_vs_response.DeleteKVsResponse;
+        const responses = [_]DeleteKVsResponse.DeleteKVResponse{
+            .{
+                .error_code = 0,
+                .value = "old",
+            },
+            .{
+                .error_code = 42,
+                .value = null,
+            },
+        };
+        const value = DeleteKVsResponse{
+            .throttle_time_ms = 13,
+            .delete_kv_responses = &responses,
+        };
+        try expectGoldenRoundTrip(DeleteKVsResponse, value, 0, &[_]u8{
+            0x00, 0x00, 0x00, 0x00,
+            0x00, 0x0d, 0x03, 0x00,
+            0x00, 0x04, 'o',  'l',
+            'd',  0x00, 0x00, 0x2a,
+            0x00, 0x00, 0x00,
+        });
+    }
+
+    {
+        const GetNextNodeIdRequest = generated.get_next_node_id_request.GetNextNodeIdRequest;
+        const value = GetNextNodeIdRequest{
+            .cluster_id = "cluster-a",
+        };
+        try expectGoldenRoundTrip(GetNextNodeIdRequest, value, 0, &[_]u8{
+            0x0a, 'c', 'l',  'u',
+            's',  't', 'e',  'r',
+            '-',  'a', 0x00,
+        });
+    }
+
+    {
+        const GetNextNodeIdResponse = generated.get_next_node_id_response.GetNextNodeIdResponse;
+        const value = GetNextNodeIdResponse{
+            .throttle_time_ms = 15,
+            .node_id = 1001,
+        };
+        try expectGoldenRoundTrip(GetNextNodeIdResponse, value, 0, &[_]u8{
+            0x00, 0x00, 0x00, 0x00,
+            0x00, 0x0f, 0x00, 0x00,
+            0x03, 0xe9, 0x00,
+        });
+    }
+
+    {
+        const UpdateLicenseRequest = generated.update_license_request.UpdateLicenseRequest;
+        const value = UpdateLicenseRequest{
+            .license = "license-a",
+        };
+        try expectGoldenRoundTrip(UpdateLicenseRequest, value, 0, &[_]u8{
+            0x0a, 'l', 'i',  'c',
+            'e',  'n', 's',  'e',
+            '-',  'a', 0x00,
+        });
+    }
+
+    {
+        const UpdateLicenseResponse = generated.update_license_response.UpdateLicenseResponse;
+        const value = UpdateLicenseResponse{
+            .error_code = 42,
+            .throttle_time_ms = 17,
+            .error_message = "denied",
+        };
+        try expectGoldenRoundTrip(UpdateLicenseResponse, value, 0, &[_]u8{
+            0x00, 0x2a, 0x00, 0x00,
+            0x00, 0x11, 0x07, 'd',
+            'e',  'n',  'i',  'e',
+            'd',  0x00,
+        });
+    }
+
+    {
+        const DescribeLicenseRequest = generated.describe_license_request.DescribeLicenseRequest;
+        const value = DescribeLicenseRequest{};
+        try expectGoldenRoundTrip(DescribeLicenseRequest, value, 0, &[_]u8{0x00});
+    }
+
+    {
+        const DescribeLicenseResponse = generated.describe_license_response.DescribeLicenseResponse;
+        const value = DescribeLicenseResponse{
+            .throttle_time_ms = 19,
+            .error_message = "ok",
+            .license = "enterprise",
+        };
+        try expectGoldenRoundTrip(DescribeLicenseResponse, value, 0, &[_]u8{
+            0x00, 0x00, 0x00, 0x00,
+            0x00, 0x13, 0x03, 'o',
+            'k',  0x0b, 'e',  'n',
+            't',  'e',  'r',  'p',
+            'r',  'i',  's',  'e',
+            0x00,
+        });
+    }
 }
 
 fn expectDuplicateNodeEndpointsTagRejected(comptime Message: type) !void {
