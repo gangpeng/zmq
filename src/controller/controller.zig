@@ -1136,9 +1136,11 @@ pub const Controller = struct {
             return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
         };
 
-        const heartbeat_result = self.broker_registry.heartbeat(req.broker_id, req.broker_epoch) catch |err| {
+        const heartbeat_result = self.broker_registry.heartbeatWithOfflineLogDirs(req.broker_id, req.broker_epoch, req.want_fence, req.offline_log_dirs) catch |err| {
             const error_code = switch (err) {
                 error.BrokerNotRegistered => ErrorCode.broker_id_not_registered.toInt(),
+                error.InvalidOfflineLogDir => ErrorCode.invalid_request.toInt(),
+                else => ErrorCode.kafka_storage_error.toInt(),
             };
             const resp = Resp{
                 .throttle_time_ms = 0,
@@ -1161,12 +1163,23 @@ pub const Controller = struct {
             return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
         }
 
+        const broker_info = self.broker_registry.brokers.get(req.broker_id) orelse {
+            const resp = Resp{
+                .throttle_time_ms = 0,
+                .error_code = ErrorCode.broker_id_not_registered.toInt(),
+                .is_caught_up = false,
+                .is_fenced = true,
+                .should_shut_down = false,
+            };
+            return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+        };
+
         const resp = Resp{
             .throttle_time_ms = 0,
             .error_code = 0,
-            .is_caught_up = true,
-            .is_fenced = false,
-            .should_shut_down = false,
+            .is_caught_up = !broker_info.fenced,
+            .is_fenced = broker_info.fenced,
+            .should_shut_down = req.want_shut_down,
         };
         return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
     }
@@ -2887,6 +2900,79 @@ test "Controller handleRequest BrokerHeartbeat reports stale broker epoch" {
     const hb_resp = try HbResp.deserialize(testing.allocator, hb_response.?, &hb_rpos, 0);
     try testing.expectEqual(ErrorCode.stale_broker_epoch.toInt(), hb_resp.error_code);
     try testing.expect(hb_resp.is_fenced);
+}
+
+test "Controller handleRequest BrokerHeartbeat v1 records offline log dirs" {
+    const HbReq = generated.broker_heartbeat_request.BrokerHeartbeatRequest;
+    const HbResp = generated.broker_heartbeat_response.BrokerHeartbeatResponse;
+
+    var ctrl = Controller.init(testing.allocator, 1, "test-cluster");
+    defer ctrl.deinit();
+    try makeTestControllerLeader(&ctrl);
+
+    const dir = [_]u8{0x63} ** 16;
+    const dirs = [_][16]u8{dir};
+    try ctrl.broker_registry.registerWithEpochRackAndLogDirs(100, "host1", 9092, null, &dirs, 7, false);
+
+    var hb_buf: [256]u8 = undefined;
+    var hb_pos = buildTestRequest(&hb_buf, 63, 1, 6310, header_mod.requestHeaderVersion(63, 1));
+    const hb_req = HbReq{ .broker_id = 100, .broker_epoch = 7, .want_shut_down = true, .offline_log_dirs = &dirs };
+    hb_req.serialize(&hb_buf, &hb_pos, 1);
+
+    const hb_response = ctrl.handleRequest(hb_buf[0..hb_pos]);
+    try testing.expect(hb_response != null);
+    defer testing.allocator.free(hb_response.?);
+
+    var hb_rpos: usize = 0;
+    var hb_header = try ResponseHeader.deserialize(testing.allocator, hb_response.?, &hb_rpos, header_mod.responseHeaderVersion(63, 1));
+    defer hb_header.deinit(testing.allocator);
+    try testing.expectEqual(@as(i32, 6310), hb_header.correlation_id);
+
+    const hb_resp = try HbResp.deserialize(testing.allocator, hb_response.?, &hb_rpos, 1);
+    try testing.expectEqual(ErrorCode.none.toInt(), hb_resp.error_code);
+    try testing.expect(hb_resp.is_fenced);
+    try testing.expect(!hb_resp.is_caught_up);
+    try testing.expect(hb_resp.should_shut_down);
+
+    const info = ctrl.broker_registry.brokers.get(100) orelse return error.TestUnexpectedResult;
+    try testing.expectEqual(@as(usize, 1), info.offline_log_dirs.len);
+    try testing.expectEqualSlices(u8, dir[0..], info.offline_log_dirs[0][0..]);
+}
+
+test "Controller handleRequest BrokerHeartbeat v1 rejects unknown offline log dir" {
+    const HbReq = generated.broker_heartbeat_request.BrokerHeartbeatRequest;
+    const HbResp = generated.broker_heartbeat_response.BrokerHeartbeatResponse;
+
+    var ctrl = Controller.init(testing.allocator, 1, "test-cluster");
+    defer ctrl.deinit();
+    try makeTestControllerLeader(&ctrl);
+
+    const dir = [_]u8{0x64} ** 16;
+    const unknown_dir = [_]u8{0x65} ** 16;
+    const dirs = [_][16]u8{dir};
+    const unknown_dirs = [_][16]u8{unknown_dir};
+    try ctrl.broker_registry.registerWithEpochRackAndLogDirs(100, "host1", 9092, null, &dirs, 7, false);
+
+    var hb_buf: [256]u8 = undefined;
+    var hb_pos = buildTestRequest(&hb_buf, 63, 1, 6311, header_mod.requestHeaderVersion(63, 1));
+    const hb_req = HbReq{ .broker_id = 100, .broker_epoch = 7, .offline_log_dirs = &unknown_dirs };
+    hb_req.serialize(&hb_buf, &hb_pos, 1);
+
+    const hb_response = ctrl.handleRequest(hb_buf[0..hb_pos]);
+    try testing.expect(hb_response != null);
+    defer testing.allocator.free(hb_response.?);
+
+    var hb_rpos: usize = 0;
+    var hb_header = try ResponseHeader.deserialize(testing.allocator, hb_response.?, &hb_rpos, header_mod.responseHeaderVersion(63, 1));
+    defer hb_header.deinit(testing.allocator);
+    try testing.expectEqual(@as(i32, 6311), hb_header.correlation_id);
+
+    const hb_resp = try HbResp.deserialize(testing.allocator, hb_response.?, &hb_rpos, 1);
+    try testing.expectEqual(ErrorCode.invalid_request.toInt(), hb_resp.error_code);
+    try testing.expect(hb_resp.is_fenced);
+
+    const info = ctrl.broker_registry.brokers.get(100) orelse return error.TestUnexpectedResult;
+    try testing.expectEqual(@as(usize, 0), info.offline_log_dirs.len);
 }
 
 test "Controller handleRequest UnregisterBroker removes broker" {

@@ -24,6 +24,8 @@ pub const BrokerRegistry = struct {
         rack: ?[]u8 = null,
         /// Stable replica directory UUIDs advertised by BrokerRegistration v2+.
         log_dirs: [][16]u8 = &.{},
+        /// Log directories reported offline by the latest BrokerHeartbeat v1.
+        offline_log_dirs: [][16]u8 = &.{},
         /// Epoch assigned by controller on registration (used for WAL fencing).
         broker_epoch: i64 = 0,
         /// Last heartbeat timestamp (ms since epoch).
@@ -46,6 +48,7 @@ pub const BrokerRegistry = struct {
             self.allocator.free(entry.value_ptr.host);
             if (entry.value_ptr.rack) |r| self.allocator.free(r);
             if (entry.value_ptr.log_dirs.len > 0) self.allocator.free(entry.value_ptr.log_dirs);
+            if (entry.value_ptr.offline_log_dirs.len > 0) self.allocator.free(entry.value_ptr.offline_log_dirs);
         }
         self.brokers.deinit();
     }
@@ -87,6 +90,7 @@ pub const BrokerRegistry = struct {
             .port = port,
             .rack = rack_copy,
             .log_dirs = log_dirs_copy,
+            .offline_log_dirs = &.{},
             .broker_epoch = broker_epoch,
             .last_heartbeat_ms = now,
             .fenced = fenced,
@@ -95,6 +99,7 @@ pub const BrokerRegistry = struct {
             self.allocator.free(entry.value.host);
             if (entry.value.rack) |r| self.allocator.free(r);
             if (entry.value.log_dirs.len > 0) self.allocator.free(entry.value.log_dirs);
+            if (entry.value.offline_log_dirs.len > 0) self.allocator.free(entry.value.offline_log_dirs);
         }
 
         if (broker_epoch >= self.next_broker_epoch) self.next_broker_epoch = broker_epoch + 1;
@@ -104,6 +109,10 @@ pub const BrokerRegistry = struct {
     /// Process a heartbeat from a broker. Returns true if the broker is active.
     /// Called when a broker sends BrokerHeartbeat (API 63).
     pub fn heartbeat(self: *BrokerRegistry, broker_id: i32, broker_epoch: i64) !bool {
+        return self.heartbeatWithOfflineLogDirs(broker_id, broker_epoch, false, &.{});
+    }
+
+    pub fn heartbeatWithOfflineLogDirs(self: *BrokerRegistry, broker_id: i32, broker_epoch: i64, want_fence: bool, offline_log_dirs: []const [16]u8) !bool {
         const entry = self.brokers.getPtr(broker_id) orelse return error.BrokerNotRegistered;
 
         // Reject heartbeats from stale epochs (broker was replaced)
@@ -114,9 +123,20 @@ pub const BrokerRegistry = struct {
             return false;
         }
 
+        try self.validateOfflineLogDirs(entry.*, offline_log_dirs);
+        const offline_copy = try self.allocator.dupe([16]u8, offline_log_dirs);
+        errdefer if (offline_copy.len > 0) self.allocator.free(offline_copy);
+
         entry.last_heartbeat_ms = @import("time_compat").milliTimestamp();
-        // Unfence after first successful heartbeat
-        if (entry.fenced) {
+        if (entry.offline_log_dirs.len > 0) self.allocator.free(entry.offline_log_dirs);
+        entry.offline_log_dirs = offline_copy;
+
+        const should_fence = want_fence or allRegisteredLogDirsOffline(entry.log_dirs, offline_log_dirs);
+        const was_fenced = entry.fenced;
+        entry.fenced = should_fence;
+
+        // Unfence after first successful heartbeat when the broker is not explicitly fenced.
+        if (was_fenced and !entry.fenced) {
             entry.fenced = false;
             log.info("Broker {d} unfenced", .{broker_id});
         }
@@ -129,6 +149,7 @@ pub const BrokerRegistry = struct {
         self.allocator.free(removed.value.host);
         if (removed.value.rack) |r| self.allocator.free(r);
         if (removed.value.log_dirs.len > 0) self.allocator.free(removed.value.log_dirs);
+        if (removed.value.offline_log_dirs.len > 0) self.allocator.free(removed.value.offline_log_dirs);
         log.info("Broker {d} unregistered", .{broker_id});
         return true;
     }
@@ -139,6 +160,40 @@ pub const BrokerRegistry = struct {
             if (std.mem.eql(u8, registered[0..], directory_id[0..])) return true;
         }
         return false;
+    }
+
+    fn validateOfflineLogDirs(self: *const BrokerRegistry, info: BrokerInfo, offline_log_dirs: []const [16]u8) !void {
+        _ = self;
+        for (offline_log_dirs, 0..) |dir, index| {
+            if (isZeroUuid(dir)) return error.InvalidOfflineLogDir;
+            if (!containsLogDir(info.log_dirs, dir)) return error.InvalidOfflineLogDir;
+            for (offline_log_dirs[0..index]) |previous| {
+                if (uuidEquals(previous, dir)) return error.InvalidOfflineLogDir;
+            }
+        }
+    }
+
+    fn allRegisteredLogDirsOffline(log_dirs: []const [16]u8, offline_log_dirs: []const [16]u8) bool {
+        if (log_dirs.len == 0) return false;
+        for (log_dirs) |dir| {
+            if (!containsLogDir(offline_log_dirs, dir)) return false;
+        }
+        return true;
+    }
+
+    fn containsLogDir(log_dirs: []const [16]u8, directory_id: [16]u8) bool {
+        for (log_dirs) |registered| {
+            if (uuidEquals(registered, directory_id)) return true;
+        }
+        return false;
+    }
+
+    fn isZeroUuid(uuid: [16]u8) bool {
+        return std.mem.allEqual(u8, uuid[0..], 0);
+    }
+
+    fn uuidEquals(a: [16]u8, b: [16]u8) bool {
+        return std.mem.eql(u8, a[0..], b[0..]);
     }
 
     /// Evict brokers that haven't sent a heartbeat within timeout_ms.
@@ -324,6 +379,49 @@ test "BrokerRegistry registerWithEpochRackAndLogDirs preserves local directories
     try testing.expectEqualSlices(u8, dir_c[0..], updated.log_dirs[0][0..]);
     try testing.expect(registry.hasLogDir(100, dir_c));
     try testing.expect(!registry.hasLogDir(100, dir_a));
+}
+
+test "BrokerRegistry heartbeatWithOfflineLogDirs fences fully offline broker" {
+    var registry = BrokerRegistry.init(testing.allocator);
+    defer registry.deinit();
+
+    const dir_a = [_]u8{0xa5} ** 16;
+    const dir_b = [_]u8{0xb6} ** 16;
+    const dirs = [_][16]u8{ dir_a, dir_b };
+    try registry.registerWithEpochRackAndLogDirs(100, "host1", 9092, null, &dirs, 7, true);
+
+    const one_offline = [_][16]u8{dir_a};
+    try testing.expect(try registry.heartbeatWithOfflineLogDirs(100, 7, false, &one_offline));
+    var info = registry.brokers.get(100) orelse return error.TestUnexpectedResult;
+    try testing.expect(!info.fenced);
+    try testing.expectEqual(@as(usize, 1), info.offline_log_dirs.len);
+    try testing.expectEqualSlices(u8, dir_a[0..], info.offline_log_dirs[0][0..]);
+
+    try testing.expect(try registry.heartbeatWithOfflineLogDirs(100, 7, true, &.{}));
+    info = registry.brokers.get(100) orelse return error.TestUnexpectedResult;
+    try testing.expect(info.fenced);
+    try testing.expectEqual(@as(usize, 0), info.offline_log_dirs.len);
+
+    try testing.expect(try registry.heartbeatWithOfflineLogDirs(100, 7, false, &dirs));
+    info = registry.brokers.get(100) orelse return error.TestUnexpectedResult;
+    try testing.expect(info.fenced);
+    try testing.expectEqual(@as(usize, 2), info.offline_log_dirs.len);
+}
+
+test "BrokerRegistry heartbeatWithOfflineLogDirs rejects unknown or duplicate directories" {
+    var registry = BrokerRegistry.init(testing.allocator);
+    defer registry.deinit();
+
+    const dir_a = [_]u8{0xa7} ** 16;
+    const dir_b = [_]u8{0xb8} ** 16;
+    const dirs = [_][16]u8{dir_a};
+    try registry.registerWithEpochRackAndLogDirs(100, "host1", 9092, null, &dirs, 7, true);
+
+    const unknown = [_][16]u8{dir_b};
+    try testing.expectError(error.InvalidOfflineLogDir, registry.heartbeatWithOfflineLogDirs(100, 7, false, &unknown));
+
+    const duplicate = [_][16]u8{ dir_a, dir_a };
+    try testing.expectError(error.InvalidOfflineLogDir, registry.heartbeatWithOfflineLogDirs(100, 7, false, &duplicate));
 }
 
 test "BrokerRegistry heartbeat on unknown broker returns error" {
