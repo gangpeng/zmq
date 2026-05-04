@@ -38,6 +38,7 @@ import tempfile
 import time
 import urllib.parse
 import urllib.request
+import zlib
 
 
 def env_int(name, default):
@@ -62,6 +63,8 @@ S3_SKIP_MINIO_HEALTH = os.environ.get("ZMQ_S3_SKIP_MINIO_HEALTH", "0").lower() i
 BROKER_PORT = env_int("ZMQ_TEST_BROKER_PORT", 29092)
 CONTROLLER_PORT = env_int("ZMQ_TEST_CONTROLLER_PORT", 29093)
 METRICS_PORT = env_int("ZMQ_TEST_METRICS_PORT", 29090)
+CURRENT_LOG_PATH = None
+LAST_LOG_TAIL = ""
 
 
 class TestError(Exception):
@@ -129,14 +132,27 @@ def create_topic(name, partitions=1):
         raise TestError(f"CreateTopics error_code={error_code}")
 
 
+def build_message_set(payload):
+    message_body = (
+        struct.pack(">bb", 0, 0)  # magic, attributes
+        + struct.pack(">i", -1)  # null key
+        + struct.pack(">i", len(payload))
+        + payload
+    )
+    crc = zlib.crc32(message_body) & 0xFFFFFFFF
+    message = struct.pack(">I", crc) + message_body
+    return struct.pack(">qi", 0, len(message)) + message
+
+
 def produce(topic, payload, correlation_id):
+    message_set = build_message_set(payload)
     body = struct.pack(">h", 1)  # acks
     body += struct.pack(">i", 30000)
     body += struct.pack(">i", 1)
     body += write_string(topic)
     body += struct.pack(">i", 1)
     body += struct.pack(">i", 0)
-    body += struct.pack(">i", len(payload)) + payload
+    body += struct.pack(">i", len(message_set)) + message_set
 
     response = kafka_request(0, 0, correlation_id, body)
     body = response[4:]
@@ -347,6 +363,8 @@ def tail(path, limit=12000):
 
 
 def start_broker(data_dir, log_path):
+    global CURRENT_LOG_PATH
+    CURRENT_LOG_PATH = log_path
     log_file = open(log_path, "ab", buffering=0)
     args = [
         ZMQ_BIN,
@@ -394,11 +412,13 @@ def start_broker(data_dir, log_path):
         args.extend(["--s3-ca-file", S3_TLS_CA_FILE])
     proc = subprocess.Popen(args, stdout=log_file, stderr=subprocess.STDOUT)
     proc._zmq_log_file = log_file
+    proc._zmq_log_path = log_path
     wait_for_broker(proc, log_path)
     return proc
 
 
 def stop_broker(proc, crash=False):
+    global LAST_LOG_TAIL
     if proc is None:
         return
     try:
@@ -413,6 +433,9 @@ def stop_broker(proc, crash=False):
                 proc.kill()
                 proc.wait(timeout=10)
     finally:
+        log_path = getattr(proc, "_zmq_log_path", None)
+        if log_path:
+            LAST_LOG_TAIL = tail(log_path)
         log_file = getattr(proc, "_zmq_log_file", None)
         if log_file is not None:
             log_file.close()
@@ -470,4 +493,10 @@ if __name__ == "__main__":
         sys.exit(main())
     except TestError as exc:
         print(f"FAIL: {exc}", file=sys.stderr)
+        if LAST_LOG_TAIL:
+            print("broker log tail:", file=sys.stderr)
+            print(LAST_LOG_TAIL, file=sys.stderr)
+        elif CURRENT_LOG_PATH:
+            print("broker log tail:", file=sys.stderr)
+            print(tail(CURRENT_LOG_PATH), file=sys.stderr)
         sys.exit(1)

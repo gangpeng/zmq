@@ -12868,13 +12868,19 @@ pub const Broker = struct {
             self.writeTopicSnapshotRecord() catch |err| {
                 log.warn("Failed to append CreateTopics topic snapshot to __cluster_metadata: {}", .{err});
                 self.restoreTopicsAfterFailedMutation(previous_snapshot.?);
+                const mapped_error = autoMqQuorumErrorCode(err);
+                const mapped_message: []const u8 = switch (err) {
+                    error.NotController => "Not controller",
+                    error.QuorumCommitPending => "Timed out persisting topic metadata",
+                    else => "Failed to persist topic metadata",
+                };
                 for (req.topics, topics[0..topics_init], created_topics) |topic_req, *response, was_created| {
                     if (was_created and response.error_code == @intFromEnum(ErrorCode.none)) {
                         const topic_name = topic_req.name orelse "";
                         const actual_partitions = self.createTopicsPartitionCount(&topic_req);
                         self.removeTopicPartitionRange(topic_name, 0, actual_partitions);
-                        response.error_code = @intFromEnum(ErrorCode.kafka_storage_error);
-                        response.error_message = "Failed to persist topic metadata";
+                        response.error_code = mapped_error;
+                        response.error_message = mapped_message;
                         response.topic_id = zeroUuid();
                     }
                 }
@@ -52373,6 +52379,62 @@ test "Broker.handleRequest CreateTopics accepts remote manual assignments" {
     try testing.expectEqual(@as(?i32, 2), broker.failover_controller.findPartitionOwner("ct-remote-assignment-topic", 0));
     try testing.expect(!broker.store.partitions.contains("ct-remote-assignment-topic-0"));
     try testing.expectEqual(@as(u32, 1), broker.partition_reassignments.count());
+}
+
+test "Broker.handleRequest CreateTopics maps quorum follower to not controller" {
+    const Req = generated.create_topics_request.CreateTopicsRequest;
+    const Resp = generated.create_topics_response.CreateTopicsResponse;
+
+    var raft = RaftState.init(testing.allocator, 1, "create-topics-quorum-follower");
+    defer raft.deinit();
+    try raft.addVoter(1);
+    raft.becomeFollower(2, 2);
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+    broker.setRaftState(&raft);
+
+    const topics = [_]Req.CreatableTopic{.{
+        .name = "ct-quorum-follower-topic",
+        .num_partitions = 1,
+        .replication_factor = 1,
+    }};
+    const req = Req{
+        .topics = &topics,
+        .timeout_ms = 30000,
+        .validate_only = false,
+    };
+
+    var buf: [512]u8 = undefined;
+    var pos = buildTestRequest(&buf, 19, 7, 1932, header_mod.requestHeaderVersion(19, 7));
+    req.serialize(&buf, &pos, 7);
+
+    const response = broker.handleRequest(buf[0..pos]);
+    try testing.expect(response != null);
+    defer testing.allocator.free(response.?);
+
+    var rpos: usize = 0;
+    var response_header = try ResponseHeader.deserialize(testing.allocator, response.?, &rpos, header_mod.responseHeaderVersion(19, 7));
+    defer response_header.deinit(testing.allocator);
+    try testing.expectEqual(@as(i32, 1932), response_header.correlation_id);
+
+    const resp = try Resp.deserialize(testing.allocator, response.?, &rpos, 7);
+    defer {
+        for (resp.topics) |topic| {
+            if (topic.configs) |response_configs| {
+                if (response_configs.len > 0) testing.allocator.free(response_configs);
+            }
+        }
+        if (resp.topics.len > 0) testing.allocator.free(resp.topics);
+    }
+
+    try testing.expectEqual(response.?.len, rpos);
+    try testing.expectEqual(@as(usize, 1), resp.topics.len);
+    try testing.expectEqualStrings("ct-quorum-follower-topic", resp.topics[0].name.?);
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.not_controller)), resp.topics[0].error_code);
+    try testing.expect(!broker.topics.contains("ct-quorum-follower-topic"));
+    try testing.expect(!broker.store.partitions.contains("ct-quorum-follower-topic-0"));
+    try testing.expectEqual(@as(usize, 0), raft.log.length());
 }
 
 test "Broker.handleRequest CreateTopics rejects multi-replica assignments" {

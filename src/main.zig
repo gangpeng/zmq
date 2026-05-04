@@ -411,6 +411,12 @@ pub fn main(init: std.process.Init) !void {
             }
         }
 
+        if (ctrl.raft_state.quorumSize() <= 1 and ctrl.raft_state.role == .unattached) {
+            _ = ctrl.raft_state.startElection();
+            ctrl.raft_state.becomeLeader();
+            log.info("Single-node controller elected before serving requests", .{});
+        }
+
         handler_routing.setGlobalController(ctrl);
         global_controller_ptr = ctrl;
     }
