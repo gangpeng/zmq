@@ -725,12 +725,18 @@ Status: completed for the initial catalog and DeleteGroups slice.
   `ZMQ_S3_<PROFILE>_RUN_LIVE_OUTAGE=1`; release jobs can now pin required live
   provider coverage with `ZMQ_S3_PROVIDER_REQUIRED_PROFILES` and required
   outage-enabled profiles with `ZMQ_S3_PROVIDER_REQUIRED_OUTAGE_PROFILES`.
+  `test-chaos` can require selected scenario coverage with
+  `ZMQ_CHAOS_REQUIRED_SCENARIOS`, run scheduled named network-partition phases
+  with `ZMQ_CHAOS_NETWORK_MATRIX`, override per-phase
+  `ZMQ_CHAOS_NETWORK_<PHASE>_{DOWN,UP,EXPECT}` hooks, and fail release jobs
+  when required network phases are missing through
+  `ZMQ_CHAOS_REQUIRED_NETWORK_PHASES`.
   `test-kraft-failover` can require controller/broker network-partition hooks
   with `ZMQ_KRAFT_NETWORK_DOWN` and `ZMQ_KRAFT_NETWORK_UP`, or scheduled named
   controller/broker partition phases with `ZMQ_KRAFT_NETWORK_MATRIX` and
   `ZMQ_KRAFT_NETWORK_<PHASE>_{DOWN,UP,EXPECT}` overrides. Remaining work:
-  broader environment coverage for live provider outage profiles and scheduled
-  partition matrices.
+  broader environment execution coverage for live provider outage profiles,
+  scheduled partition matrices, and cross-broker chaos hooks.
 - Add performance baselines for produce/fetch throughput, p99 latency, S3
   operations per MiB, recovery time, and memory growth.
   Status: `zig build bench` now compiles against the broker/storage/protocol

@@ -10,12 +10,18 @@ explicitly enabled. Safe local scenarios require no Docker or cloud services:
 Optional environment:
     ZMQ_BIN                      ./zig-out/bin/zmq
     ZMQ_CHAOS_SCENARIOS          comma-separated scenario names, or "all"
+    ZMQ_CHAOS_REQUIRED_SCENARIOS fail if selected scenarios omit any required names
     ZMQ_CHAOS_BROKER_PORT        fixed broker port instead of an ephemeral port
     ZMQ_CHAOS_CONTROLLER_PORT    fixed controller port
     ZMQ_CHAOS_METRICS_PORT       fixed metrics port
     ZMQ_CHAOS_NETWORK_DOWN       command run to inject a network partition
     ZMQ_CHAOS_NETWORK_UP         command run to heal a network partition
     ZMQ_CHAOS_NETWORK_EXPECT     "fail" (default) or "survive" for probe during partition
+    ZMQ_CHAOS_NETWORK_MATRIX     comma-separated named network partition phases
+    ZMQ_CHAOS_NETWORK_<PHASE>_{DOWN,UP,EXPECT}
+                                 per-phase network partition hooks/expectation
+    ZMQ_CHAOS_REQUIRED_NETWORK_PHASES
+                                 fail if matrix omits any required phase
     ZMQ_CHAOS_S3_DOWN            command run to inject live S3 provider outage
     ZMQ_CHAOS_S3_UP              command run to heal live S3 provider outage
     ZMQ_CHAOS_S3_* or ZMQ_S3_*   live S3 settings for live-s3-outage scenario
@@ -73,6 +79,25 @@ def env_int(name, default):
         return int(os.environ.get(name, str(default)))
     except ValueError:
         return default
+
+
+def split_csv(raw):
+    if not raw:
+        return []
+    return [item.strip() for item in raw.split(",") if item.strip()]
+
+
+def env_phase_token(name):
+    token = []
+    for ch in name.upper():
+        if ch.isalnum():
+            token.append(ch)
+        else:
+            token.append("_")
+    collapsed = "_".join(part for part in "".join(token).split("_") if part)
+    if not collapsed:
+        raise TestError("empty chaos matrix phase name")
+    return collapsed
 
 
 def free_port():
@@ -584,6 +609,33 @@ def run_hook(env_name):
         raise TestError(f"{env_name} failed with exit code {proc.returncode}\n{proc.stdout}")
 
 
+def network_partition_phases():
+    phases = split_csv(os.environ.get("ZMQ_CHAOS_NETWORK_MATRIX"))
+    if not phases:
+        return [None]
+    seen = []
+    for phase in phases:
+        if phase not in seen:
+            seen.append(phase)
+    return seen
+
+
+def network_phase_env(phase, suffix):
+    if phase is None:
+        return f"ZMQ_CHAOS_NETWORK_{suffix}"
+    specific = f"ZMQ_CHAOS_NETWORK_{env_phase_token(phase)}_{suffix}"
+    if os.environ.get(specific):
+        return specific
+    return f"ZMQ_CHAOS_NETWORK_{suffix}"
+
+
+def network_phase_expect(phase):
+    if phase is None:
+        return os.environ.get("ZMQ_CHAOS_NETWORK_EXPECT", "fail")
+    specific = f"ZMQ_CHAOS_NETWORK_{env_phase_token(phase)}_EXPECT"
+    return os.environ.get(specific, os.environ.get("ZMQ_CHAOS_NETWORK_EXPECT", "fail"))
+
+
 def scenario_network_partition(tmp):
     data_dir = os.path.join(tmp, "network-partition-data")
     log_path = os.path.join(tmp, "network-partition.log")
@@ -597,24 +649,30 @@ def scenario_network_partition(tmp):
         produce(port, topic, build_record_batch(payload, current_time_ms()), 40)
         wait_for_payload(port, topic, [payload])
 
-        run_hook("ZMQ_CHAOS_NETWORK_DOWN")
-        try:
-            expect = os.environ.get("ZMQ_CHAOS_NETWORK_EXPECT", "fail")
+        for phase in network_partition_phases():
+            down_env = network_phase_env(phase, "DOWN")
+            up_env = network_phase_env(phase, "UP")
+            run_hook(down_env)
             try:
-                api_versions_count(port)
-                probe_succeeded = True
-            except Exception:
-                probe_succeeded = False
-            if expect == "fail" and probe_succeeded:
-                raise TestError("network partition probe unexpectedly succeeded")
-            if expect == "survive" and not probe_succeeded:
-                raise TestError("network partition probe unexpectedly failed")
-        finally:
-            run_hook("ZMQ_CHAOS_NETWORK_UP")
-            healed = True
+                expect = network_phase_expect(phase)
+                try:
+                    api_versions_count(port)
+                    probe_succeeded = True
+                except Exception:
+                    probe_succeeded = False
+                if expect == "fail" and probe_succeeded:
+                    raise TestError("network partition probe unexpectedly succeeded")
+                if expect == "survive" and not probe_succeeded:
+                    raise TestError("network partition probe unexpectedly failed")
+            finally:
+                run_hook(up_env)
+                healed = True
 
-        wait_for_broker(proc, port, log_path)
-        wait_for_payload(port, topic, [payload])
+            wait_for_broker(proc, port, log_path)
+            wait_for_payload(port, topic, [payload])
+            if phase is not None:
+                print(f"ok: chaos network-partition phase {phase}")
+
         print("ok: chaos network-partition")
     finally:
         if not healed and os.environ.get("ZMQ_CHAOS_NETWORK_UP"):
@@ -681,10 +739,10 @@ SCENARIO_FUNCS = {
 
 def selected_scenarios():
     raw = os.environ.get("ZMQ_CHAOS_SCENARIOS")
-    names = DEFAULT_SCENARIOS if not raw else [name.strip() for name in raw.split(",") if name.strip()]
+    names = DEFAULT_SCENARIOS if not raw else split_csv(raw)
     if len(names) == 1 and names[0] == "all":
         names = list(DEFAULT_SCENARIOS)
-        if os.environ.get("ZMQ_CHAOS_NETWORK_DOWN") or os.environ.get("ZMQ_CHAOS_NETWORK_UP"):
+        if os.environ.get("ZMQ_CHAOS_NETWORK_DOWN") or os.environ.get("ZMQ_CHAOS_NETWORK_UP") or os.environ.get("ZMQ_CHAOS_NETWORK_MATRIX"):
             names.append("network-partition")
         if os.environ.get("ZMQ_CHAOS_S3_DOWN") or os.environ.get("ZMQ_CHAOS_S3_UP"):
             names.append("live-s3-outage")
@@ -699,6 +757,22 @@ def selected_scenarios():
     return resolved
 
 
+def validate_required_coverage(scenarios):
+    required_scenarios = [ALIASES.get(name, name) for name in split_csv(os.environ.get("ZMQ_CHAOS_REQUIRED_SCENARIOS"))]
+    missing_scenarios = [name for name in required_scenarios if name not in scenarios]
+    if missing_scenarios:
+        raise TestError(f"required chaos scenarios not selected: {', '.join(missing_scenarios)}")
+
+    required_phases = split_csv(os.environ.get("ZMQ_CHAOS_REQUIRED_NETWORK_PHASES"))
+    if required_phases:
+        if "network-partition" not in scenarios:
+            raise TestError("required network partition phases need network-partition scenario")
+        configured_phases = [phase for phase in network_partition_phases() if phase is not None]
+        missing_phases = [phase for phase in required_phases if phase not in configured_phases]
+        if missing_phases:
+            raise TestError(f"required chaos network phases not configured: {', '.join(missing_phases)}")
+
+
 def main():
     if not RUN_ENABLED:
         print("skip: set ZMQ_RUN_CHAOS_TESTS=1 to run broker chaos harness")
@@ -707,6 +781,7 @@ def main():
         raise TestError(f"broker binary not found: {ZMQ_BIN}")
 
     scenarios = selected_scenarios()
+    validate_required_coverage(scenarios)
     tmp = tempfile.mkdtemp(prefix="zmq-chaos-")
     try:
         for scenario in scenarios:
@@ -736,13 +811,33 @@ def self_test():
         if selected_scenarios() != ["live-s3-outage", "network-partition"]:
             raise TestError("live S3/network scenario alias selection failed")
         os.environ["ZMQ_CHAOS_SCENARIOS"] = "all"
-        os.environ["ZMQ_CHAOS_NETWORK_DOWN"] = "true"
-        os.environ["ZMQ_CHAOS_NETWORK_UP"] = "true"
+        os.environ["ZMQ_CHAOS_NETWORK_MATRIX"] = "az-a,broker-2,az-a"
+        os.environ["ZMQ_CHAOS_NETWORK_AZ_A_DOWN"] = "true"
+        os.environ["ZMQ_CHAOS_NETWORK_AZ_A_UP"] = "true"
+        os.environ["ZMQ_CHAOS_NETWORK_BROKER_2_DOWN"] = "true"
+        os.environ["ZMQ_CHAOS_NETWORK_BROKER_2_UP"] = "true"
+        os.environ["ZMQ_CHAOS_NETWORK_BROKER_2_EXPECT"] = "survive"
         os.environ["ZMQ_CHAOS_S3_DOWN"] = "true"
         os.environ["ZMQ_CHAOS_S3_UP"] = "true"
         all_scenarios = selected_scenarios()
         if "network-partition" not in all_scenarios or "live-s3-outage" not in all_scenarios:
             raise TestError("all scenario selection did not include hooked chaos scenarios")
+        if network_partition_phases() != ["az-a", "broker-2"]:
+            raise TestError("network partition phase parsing failed")
+        if network_phase_env("broker-2", "DOWN") != "ZMQ_CHAOS_NETWORK_BROKER_2_DOWN":
+            raise TestError("network phase hook selection failed")
+        if network_phase_expect("broker-2") != "survive":
+            raise TestError("network phase expect selection failed")
+        os.environ["ZMQ_CHAOS_REQUIRED_SCENARIOS"] = "sigkill,network"
+        os.environ["ZMQ_CHAOS_REQUIRED_NETWORK_PHASES"] = "az-a,broker-2"
+        validate_required_coverage(all_scenarios)
+        os.environ["ZMQ_CHAOS_REQUIRED_NETWORK_PHASES"] = "missing-phase"
+        try:
+            validate_required_coverage(all_scenarios)
+            raise TestError("missing required network phase was not rejected")
+        except TestError as exc:
+            if "missing required network phase" in str(exc):
+                raise
         os.environ["ZMQ_CHAOS_S3_ENDPOINT"] = "s3.example.test"
         os.environ["ZMQ_CHAOS_S3_PORT"] = "443"
         os.environ["ZMQ_CHAOS_S3_BUCKET"] = "zmq-chaos"

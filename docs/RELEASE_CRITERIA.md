@@ -69,9 +69,9 @@ release:
   inter-broker behavior replaces single-node/no-op compatibility handlers.
 - Broader broker-only stateless replacement still has local cache/state
   assumptions outside the covered S3/quorum replay paths.
-- Broader live load/scale orchestration, scheduled cross-broker chaos matrices,
-  scheduled live provider outage profiles, and comparative Kafka/AutoMQ performance
-  trend gates are still release blockers.
+- Broader live load/scale orchestration, CI execution of required scheduled
+  cross-broker chaos matrices, scheduled live provider outage profiles, and
+  comparative Kafka/AutoMQ performance trend gates are still release blockers.
 
 ## Release Decision
 
