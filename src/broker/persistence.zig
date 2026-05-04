@@ -22,6 +22,9 @@ pub const MetadataPersistence = struct {
     const default_topic_retention_bytes: i64 = -1;
     const default_topic_max_message_bytes: i32 = 1048576;
     const default_topic_min_insync_replicas: i32 = 1;
+    const default_topic_segment_bytes: i64 = 1073741824;
+    const default_topic_cleanup_policy: []const u8 = "delete";
+    const default_topic_compression_type: []const u8 = "producer";
 
     pub fn init(alloc: Allocator, data_dir: ?[]const u8) MetadataPersistence {
         return .{ .data_dir = data_dir, .allocator = alloc };
@@ -144,6 +147,24 @@ pub const MetadataPersistence = struct {
         return try decodeHexAlloc(allocator, hex_text);
     }
 
+    fn normalizeTopicCleanupPolicy(text: []const u8) ?[]const u8 {
+        if (std.mem.eql(u8, text, "delete")) return "delete";
+        if (std.mem.eql(u8, text, "compact")) return "compact";
+        if (std.mem.eql(u8, text, "compact,delete")) return "compact,delete";
+        if (std.mem.eql(u8, text, "delete,compact")) return "compact,delete";
+        return null;
+    }
+
+    fn normalizeTopicCompressionType(text: []const u8) ?[]const u8 {
+        if (std.mem.eql(u8, text, "producer")) return "producer";
+        if (std.mem.eql(u8, text, "uncompressed")) return "uncompressed";
+        if (std.mem.eql(u8, text, "gzip")) return "gzip";
+        if (std.mem.eql(u8, text, "snappy")) return "snappy";
+        if (std.mem.eql(u8, text, "lz4")) return "lz4";
+        if (std.mem.eql(u8, text, "zstd")) return "zstd";
+        return null;
+    }
+
     fn freeAutoMqKvEntries(allocator: Allocator, entries: []AutoMqKvEntry) void {
         for (entries) |entry| {
             allocator.free(entry.key);
@@ -177,9 +198,10 @@ pub const MetadataPersistence = struct {
     }
 
     /// Save topic metadata to disk.
-    /// Format: topic_v3 TSV with hex-encoded names, topic IDs, and supported numeric configs.
-    /// Legacy readers only understood raw `name\tpartitions\trf`; loadTopics
-    /// keeps accepting that and topic_v2 for rolling upgrades.
+    /// Format: topic_v4 TSV with hex-encoded names, topic IDs, supported
+    /// numeric configs, and normalized string/list configs. Legacy readers only
+    /// understood raw `name\tpartitions\trf`; loadTopics keeps accepting that
+    /// plus topic_v2/topic_v3 for rolling upgrades.
     pub fn saveTopics(self: *MetadataPersistence, topics: anytype) !void {
         const dir = self.data_dir orelse return;
 
@@ -198,21 +220,32 @@ pub const MetadataPersistence = struct {
             const retention_bytes = if (has_config) info.config.retention_bytes else default_topic_retention_bytes;
             const max_message_bytes = if (has_config) info.config.max_message_bytes else default_topic_max_message_bytes;
             const min_insync_replicas = if (has_config) info.config.min_insync_replicas else default_topic_min_insync_replicas;
+            const has_segment_bytes = if (has_config) comptime hasComptimeField(@TypeOf(info.config), "segment_bytes") else false;
+            const has_cleanup_policy = if (has_config) comptime hasComptimeField(@TypeOf(info.config), "cleanup_policy") else false;
+            const has_compression_type = if (has_config) comptime hasComptimeField(@TypeOf(info.config), "compression_type") else false;
+            const segment_bytes = if (has_segment_bytes) info.config.segment_bytes else default_topic_segment_bytes;
+            const cleanup_policy = if (has_cleanup_policy) info.config.cleanup_policy else default_topic_cleanup_policy;
+            const compression_type = if (has_compression_type) info.config.compression_type else default_topic_compression_type;
             const has_topic_id = comptime hasComptimeField(@TypeOf(info.*), "topic_id");
             const topic_id: [16]u8 = if (has_topic_id) info.topic_id else [_]u8{0} ** 16;
 
-            try file.writeAll("topic_v3\t");
+            try file.writeAll("topic_v4\t");
             try writeHex(file, info.name);
             try file.writeAll("\t");
             try writeHex(file, topic_id[0..]);
-            try writer.print("\t{d}\t{d}\t{d}\t{d}\t{d}\t{d}\n", .{
+            try writer.print("\t{d}\t{d}\t{d}\t{d}\t{d}\t{d}\t{d}\t", .{
                 info.num_partitions,
                 info.replication_factor,
                 retention_ms,
                 retention_bytes,
                 max_message_bytes,
                 min_insync_replicas,
+                segment_bytes,
             });
+            try writeHex(file, cleanup_policy);
+            try file.writeAll("\t");
+            try writeHex(file, compression_type);
+            try file.writeAll("\n");
         }
         try file.sync();
     }
@@ -245,7 +278,64 @@ pub const MetadataPersistence = struct {
             var fields = std.mem.splitSequence(u8, line, "\t");
             const first = fields.next() orelse continue;
 
-            if (std.mem.eql(u8, first, "topic_v3")) {
+            if (std.mem.eql(u8, first, "topic_v4")) {
+                const name_hex = fields.next() orelse continue;
+                const topic_id_hex = fields.next() orelse continue;
+                const parts_str = fields.next() orelse continue;
+                const rf_str = fields.next() orelse continue;
+                const retention_ms_str = fields.next() orelse continue;
+                const retention_bytes_str = fields.next() orelse continue;
+                const max_message_bytes_str = fields.next() orelse continue;
+                const min_insync_replicas_str = fields.next() orelse continue;
+                const segment_bytes_str = fields.next() orelse continue;
+                const cleanup_policy_hex = fields.next() orelse continue;
+                const compression_type_hex = fields.next() orelse continue;
+
+                const name = decodeHexAlloc(self.allocator, name_hex) catch continue;
+                const topic_id = decodeUuidHex(topic_id_hex) catch {
+                    self.allocator.free(name);
+                    continue;
+                };
+                const num_parts = std.fmt.parseInt(i32, parts_str, 10) catch {
+                    self.allocator.free(name);
+                    continue;
+                };
+                const rf = std.fmt.parseInt(i16, rf_str, 10) catch {
+                    self.allocator.free(name);
+                    continue;
+                };
+                const retention_ms = std.fmt.parseInt(i64, retention_ms_str, 10) catch default_topic_retention_ms;
+                const retention_bytes = std.fmt.parseInt(i64, retention_bytes_str, 10) catch default_topic_retention_bytes;
+                const max_message_bytes = std.fmt.parseInt(i32, max_message_bytes_str, 10) catch default_topic_max_message_bytes;
+                const min_insync_replicas = std.fmt.parseInt(i32, min_insync_replicas_str, 10) catch default_topic_min_insync_replicas;
+                const segment_bytes = std.fmt.parseInt(i64, segment_bytes_str, 10) catch default_topic_segment_bytes;
+                const cleanup_policy_owned = decodeHexAlloc(self.allocator, cleanup_policy_hex) catch {
+                    self.allocator.free(name);
+                    continue;
+                };
+                defer self.allocator.free(cleanup_policy_owned);
+                const compression_type_owned = decodeHexAlloc(self.allocator, compression_type_hex) catch {
+                    self.allocator.free(name);
+                    continue;
+                };
+                defer self.allocator.free(compression_type_owned);
+                const cleanup_policy = normalizeTopicCleanupPolicy(cleanup_policy_owned) orelse default_topic_cleanup_policy;
+                const compression_type = normalizeTopicCompressionType(compression_type_owned) orelse default_topic_compression_type;
+
+                try entries.append(.{
+                    .name = name,
+                    .num_partitions = num_parts,
+                    .replication_factor = rf,
+                    .topic_id = topic_id,
+                    .retention_ms = retention_ms,
+                    .retention_bytes = retention_bytes,
+                    .max_message_bytes = max_message_bytes,
+                    .min_insync_replicas = min_insync_replicas,
+                    .segment_bytes = segment_bytes,
+                    .cleanup_policy = cleanup_policy,
+                    .compression_type = compression_type,
+                });
+            } else if (std.mem.eql(u8, first, "topic_v3")) {
                 const name_hex = fields.next() orelse continue;
                 const topic_id_hex = fields.next() orelse continue;
                 const parts_str = fields.next() orelse continue;
@@ -799,6 +889,9 @@ pub const MetadataPersistence = struct {
         retention_bytes: i64 = default_topic_retention_bytes,
         max_message_bytes: i32 = default_topic_max_message_bytes,
         min_insync_replicas: i32 = default_topic_min_insync_replicas,
+        segment_bytes: i64 = default_topic_segment_bytes,
+        cleanup_policy: []const u8 = default_topic_cleanup_policy,
+        compression_type: []const u8 = default_topic_compression_type,
     };
 
     pub const OffsetEntry = struct {
@@ -2256,6 +2349,9 @@ test "MetadataPersistence save and load topic configs round-trip" {
         retention_ms: i64,
         retention_bytes: i64,
         max_message_bytes: i32,
+        segment_bytes: i64,
+        cleanup_policy: []const u8,
+        compression_type: []const u8,
         min_insync_replicas: i32,
     };
     const Topic = struct {
@@ -2278,6 +2374,9 @@ test "MetadataPersistence save and load topic configs round-trip" {
             .retention_ms = 1234,
             .retention_bytes = 5678,
             .max_message_bytes = 9000,
+            .segment_bytes = 131072,
+            .cleanup_policy = "compact,delete",
+            .compression_type = "lz4",
             .min_insync_replicas = 2,
         },
     });
@@ -2298,6 +2397,9 @@ test "MetadataPersistence save and load topic configs round-trip" {
     try testing.expectEqual(@as(i64, 1234), loaded[0].retention_ms);
     try testing.expectEqual(@as(i64, 5678), loaded[0].retention_bytes);
     try testing.expectEqual(@as(i32, 9000), loaded[0].max_message_bytes);
+    try testing.expectEqual(@as(i64, 131072), loaded[0].segment_bytes);
+    try testing.expectEqualStrings("compact,delete", loaded[0].cleanup_policy);
+    try testing.expectEqualStrings("lz4", loaded[0].compression_type);
     try testing.expectEqual(@as(i32, 2), loaded[0].min_insync_replicas);
 }
 

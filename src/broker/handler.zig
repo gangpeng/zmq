@@ -53,6 +53,7 @@ const share_group_data_snapshot_record_key = "__zmq_share_group_data_snapshot";
 const transaction_snapshot_record_value_magic = "ZMQTX1";
 const transaction_snapshot_record_key = "__zmq_transaction_snapshot";
 const topic_snapshot_record_value_magic = "ZMQTP1";
+const topic_snapshot_record_value_magic_v2 = "ZMQTP2";
 const topic_snapshot_record_key = "__zmq_topic_snapshot";
 const topic_quorum_record_magic = "ZMQTPQ2";
 const partition_reassignment_snapshot_record_value_magic = "ZMQPR1";
@@ -753,6 +754,9 @@ pub const Broker = struct {
                     .retention_ms = entry.retention_ms,
                     .retention_bytes = entry.retention_bytes,
                     .max_message_bytes = entry.max_message_bytes,
+                    .segment_bytes = entry.segment_bytes,
+                    .cleanup_policy = if (std.mem.startsWith(u8, entry.name, "__")) "compact" else entry.cleanup_policy,
+                    .compression_type = entry.compression_type,
                     .min_insync_replicas = entry.min_insync_replicas,
                 },
             });
@@ -3515,7 +3519,7 @@ pub const Broker = struct {
         errdefer buf.deinit();
         const writer = @import("list_compat").writer(&buf);
 
-        try writer.writeAll(topic_snapshot_record_value_magic);
+        try writer.writeAll(topic_snapshot_record_value_magic_v2);
         try writer.writeInt(u32, @intCast(self.topics.count()), .big);
 
         var topic_it = self.topics.iterator();
@@ -3529,6 +3533,9 @@ pub const Broker = struct {
             try writer.writeInt(i64, topic.config.retention_bytes, .big);
             try writer.writeInt(i32, topic.config.max_message_bytes, .big);
             try writer.writeInt(i32, topic.config.min_insync_replicas, .big);
+            try writer.writeInt(i64, topic.config.segment_bytes, .big);
+            try writeSnapshotBytes(writer, topic.config.cleanup_policy);
+            try writeSnapshotBytes(writer, topic.config.compression_type);
         }
 
         return buf.toOwnedSlice();
@@ -3548,11 +3555,13 @@ pub const Broker = struct {
 
     fn decodeTopicSnapshotRecordValue(self: *Broker, value: []const u8) ![]MetadataPersistence.TopicEntry {
         if (value.len < topic_snapshot_record_value_magic.len + 4) return error.InvalidTopicSnapshot;
-        if (!std.mem.eql(u8, value[0..topic_snapshot_record_value_magic.len], topic_snapshot_record_value_magic)) {
+        const is_v2 = std.mem.eql(u8, value[0..topic_snapshot_record_value_magic_v2.len], topic_snapshot_record_value_magic_v2);
+        const is_v1 = std.mem.eql(u8, value[0..topic_snapshot_record_value_magic.len], topic_snapshot_record_value_magic);
+        if (!is_v1 and !is_v2) {
             return error.InvalidTopicSnapshot;
         }
 
-        var pos: usize = topic_snapshot_record_value_magic.len;
+        var pos: usize = if (is_v2) topic_snapshot_record_value_magic_v2.len else topic_snapshot_record_value_magic.len;
         const topic_count = try readSnapshotU32(value, &pos);
         var entries = std.array_list.Managed(MetadataPersistence.TopicEntry).init(self.allocator);
         errdefer {
@@ -3570,8 +3579,20 @@ pub const Broker = struct {
             const retention_bytes = try readSnapshotI64(value, &pos);
             const max_message_bytes = try readSnapshotI32(value, &pos);
             const min_insync_replicas = try readSnapshotI32(value, &pos);
+            const defaults = TopicConfig{};
+            const segment_bytes = if (is_v2) try readSnapshotI64(value, &pos) else defaults.segment_bytes;
+            var cleanup_policy: []const u8 = defaults.cleanup_policy;
+            var compression_type: []const u8 = defaults.compression_type;
+            if (is_v2) {
+                const cleanup_policy_bytes = try self.readSnapshotOwnedBytes(value, &pos);
+                defer self.allocator.free(cleanup_policy_bytes);
+                const compression_type_bytes = try self.readSnapshotOwnedBytes(value, &pos);
+                defer self.allocator.free(compression_type_bytes);
+                cleanup_policy = normalizeTopicCleanupPolicy(cleanup_policy_bytes) orelse return error.InvalidTopicSnapshot;
+                compression_type = normalizeTopicCompressionType(compression_type_bytes) orelse return error.InvalidTopicSnapshot;
+            }
 
-            if (name.len == 0 or num_partitions <= 0 or replication_factor <= 0 or max_message_bytes <= 0 or min_insync_replicas <= 0) {
+            if (name.len == 0 or num_partitions <= 0 or replication_factor <= 0 or max_message_bytes <= 0 or min_insync_replicas <= 0 or segment_bytes <= 0) {
                 return error.InvalidTopicSnapshot;
             }
 
@@ -3584,6 +3605,9 @@ pub const Broker = struct {
                 .retention_bytes = retention_bytes,
                 .max_message_bytes = max_message_bytes,
                 .min_insync_replicas = min_insync_replicas,
+                .segment_bytes = segment_bytes,
+                .cleanup_policy = cleanup_policy,
+                .compression_type = compression_type,
             });
         }
 
@@ -3640,10 +3664,12 @@ pub const Broker = struct {
             .replication_factor = entry.replication_factor,
             .topic_id = if (!isZeroUuid(entry.topic_id)) entry.topic_id else TopicInfo.generateTopicId(),
             .config = .{
-                .cleanup_policy = if (internal) "compact" else "delete",
                 .retention_ms = if (internal) -1 else entry.retention_ms,
                 .retention_bytes = entry.retention_bytes,
                 .max_message_bytes = entry.max_message_bytes,
+                .segment_bytes = entry.segment_bytes,
+                .cleanup_policy = if (internal) "compact" else entry.cleanup_policy,
+                .compression_type = entry.compression_type,
                 .min_insync_replicas = entry.min_insync_replicas,
             },
         });
@@ -12734,6 +12760,12 @@ pub const Broker = struct {
             topic_config.retention_bytes = if (value) |v| std.fmt.parseInt(i64, v, 10) catch return invalidTopicConfigValue() else defaults.retention_bytes;
         } else if (std.mem.eql(u8, name, "max.message.bytes")) {
             topic_config.max_message_bytes = if (value) |v| std.fmt.parseInt(i32, v, 10) catch return invalidTopicConfigValue() else defaults.max_message_bytes;
+        } else if (std.mem.eql(u8, name, "segment.bytes")) {
+            topic_config.segment_bytes = if (value) |v| std.fmt.parseInt(i64, v, 10) catch return invalidTopicConfigValue() else defaults.segment_bytes;
+        } else if (std.mem.eql(u8, name, "cleanup.policy")) {
+            topic_config.cleanup_policy = if (value) |v| normalizeTopicCleanupPolicy(v) orelse return invalidTopicConfigValue() else defaults.cleanup_policy;
+        } else if (std.mem.eql(u8, name, "compression.type")) {
+            topic_config.compression_type = if (value) |v| normalizeTopicCompressionType(v) orelse return invalidTopicConfigValue() else defaults.compression_type;
         } else if (std.mem.eql(u8, name, "min.insync.replicas")) {
             topic_config.min_insync_replicas = if (value) |v| std.fmt.parseInt(i32, v, 10) catch return invalidTopicConfigValue() else defaults.min_insync_replicas;
         } else {
@@ -12748,6 +12780,24 @@ pub const Broker = struct {
             .error_message = null,
             .mutated = true,
         };
+    }
+
+    fn normalizeTopicCleanupPolicy(value: []const u8) ?[]const u8 {
+        if (std.mem.eql(u8, value, "delete")) return "delete";
+        if (std.mem.eql(u8, value, "compact")) return "compact";
+        if (std.mem.eql(u8, value, "compact,delete")) return "compact,delete";
+        if (std.mem.eql(u8, value, "delete,compact")) return "compact,delete";
+        return null;
+    }
+
+    fn normalizeTopicCompressionType(value: []const u8) ?[]const u8 {
+        if (std.mem.eql(u8, value, "producer")) return "producer";
+        if (std.mem.eql(u8, value, "uncompressed")) return "uncompressed";
+        if (std.mem.eql(u8, value, "gzip")) return "gzip";
+        if (std.mem.eql(u8, value, "snappy")) return "snappy";
+        if (std.mem.eql(u8, value, "lz4")) return "lz4";
+        if (std.mem.eql(u8, value, "zstd")) return "zstd";
+        return null;
     }
 
     // ---------------------------------------------------------------
@@ -17438,6 +17488,13 @@ pub const Broker = struct {
         } else if (std.mem.eql(u8, name, "max.message.bytes")) {
             const parsed = if (value) |v| std.fmt.parseInt(i32, v, 10) catch return invalidTopicConfigValue() else defaults.max_message_bytes;
             topic_config.max_message_bytes = parsed;
+        } else if (std.mem.eql(u8, name, "segment.bytes")) {
+            const parsed = if (value) |v| std.fmt.parseInt(i64, v, 10) catch return invalidTopicConfigValue() else defaults.segment_bytes;
+            topic_config.segment_bytes = parsed;
+        } else if (std.mem.eql(u8, name, "cleanup.policy")) {
+            topic_config.cleanup_policy = if (value) |v| normalizeTopicCleanupPolicy(v) orelse return invalidTopicConfigValue() else defaults.cleanup_policy;
+        } else if (std.mem.eql(u8, name, "compression.type")) {
+            topic_config.compression_type = if (value) |v| normalizeTopicCompressionType(v) orelse return invalidTopicConfigValue() else defaults.compression_type;
         } else if (std.mem.eql(u8, name, "min.insync.replicas")) {
             const parsed = if (value) |v| std.fmt.parseInt(i32, v, 10) catch return invalidTopicConfigValue() else defaults.min_insync_replicas;
             topic_config.min_insync_replicas = parsed;
@@ -19205,6 +19262,13 @@ pub const Broker = struct {
         } else if (std.mem.eql(u8, name, "max.message.bytes")) {
             const parsed = if (is_delete) defaults.max_message_bytes else std.fmt.parseInt(i32, value, 10) catch return invalidTopicConfigValue();
             topic_config.max_message_bytes = parsed;
+        } else if (std.mem.eql(u8, name, "segment.bytes")) {
+            const parsed = if (is_delete) defaults.segment_bytes else std.fmt.parseInt(i64, value, 10) catch return invalidTopicConfigValue();
+            topic_config.segment_bytes = parsed;
+        } else if (std.mem.eql(u8, name, "cleanup.policy")) {
+            topic_config.cleanup_policy = if (is_delete) defaults.cleanup_policy else normalizeTopicCleanupPolicy(value) orelse return invalidTopicConfigValue();
+        } else if (std.mem.eql(u8, name, "compression.type")) {
+            topic_config.compression_type = if (is_delete) defaults.compression_type else normalizeTopicCompressionType(value) orelse return invalidTopicConfigValue();
         } else if (std.mem.eql(u8, name, "min.insync.replicas")) {
             const parsed = if (is_delete) defaults.min_insync_replicas else std.fmt.parseInt(i32, value, 10) catch return invalidTopicConfigValue();
             topic_config.min_insync_replicas = parsed;
@@ -19223,7 +19287,10 @@ pub const Broker = struct {
     }
 
     fn validateTopicConfigForReplication(topic_config: TopicConfig, replication_factor: i16) IncrementalAlterConfigResult {
+        if (topic_config.retention_ms < -1) return invalidTopicConfigValue();
+        if (topic_config.retention_bytes < -1) return invalidTopicConfigValue();
         if (topic_config.max_message_bytes <= 0) return invalidTopicConfigValue();
+        if (topic_config.segment_bytes <= 0) return invalidTopicConfigValue();
         if (topic_config.min_insync_replicas <= 0) return invalidTopicConfigValue();
         if (replication_factor > 0 and topic_config.min_insync_replicas > @as(i32, replication_factor)) {
             return .{
@@ -32024,10 +32091,24 @@ test "Broker.handleRequest AlterConfigs v2 returns generated response and update
     try testing.expect(broker.ensureTopic("alter-cfg-topic"));
     broker.topics.getPtr("alter-cfg-topic").?.replication_factor = 2;
 
-    const configs = [_]Req.AlterConfigsResource.AlterableConfig{.{
-        .name = "min.insync.replicas",
-        .value = "2",
-    }};
+    const configs = [_]Req.AlterConfigsResource.AlterableConfig{
+        .{
+            .name = "min.insync.replicas",
+            .value = "2",
+        },
+        .{
+            .name = "segment.bytes",
+            .value = "131072",
+        },
+        .{
+            .name = "cleanup.policy",
+            .value = "compact",
+        },
+        .{
+            .name = "compression.type",
+            .value = "snappy",
+        },
+    };
     const resources = [_]Req.AlterConfigsResource{.{
         .resource_type = 2,
         .resource_name = "alter-cfg-topic",
@@ -32061,6 +32142,9 @@ test "Broker.handleRequest AlterConfigs v2 returns generated response and update
     try testing.expectEqual(@as(i8, 2), resp.responses[0].resource_type);
     try testing.expectEqualStrings("alter-cfg-topic", resp.responses[0].resource_name.?);
     try testing.expectEqual(@as(i32, 2), broker.topics.get("alter-cfg-topic").?.config.min_insync_replicas);
+    try testing.expectEqual(@as(i64, 131072), broker.topics.get("alter-cfg-topic").?.config.segment_bytes);
+    try testing.expectEqualStrings("compact", broker.topics.get("alter-cfg-topic").?.config.cleanup_policy);
+    try testing.expectEqualStrings("snappy", broker.topics.get("alter-cfg-topic").?.config.compression_type);
 }
 
 test "Broker.handleRequest AlterConfigs rejects invalid topic config values" {
@@ -32255,10 +32339,20 @@ test "Broker.handleRequest AlterConfigs persists topic config through S3 replace
     try broker.open();
     try testing.expect(broker.ensureTopic("alter-cfg-s3-topic"));
 
-    const configs = [_]Req.AlterConfigsResource.AlterableConfig{.{
-        .name = "retention.ms",
-        .value = "4321",
-    }};
+    const configs = [_]Req.AlterConfigsResource.AlterableConfig{
+        .{
+            .name = "retention.ms",
+            .value = "4321",
+        },
+        .{
+            .name = "cleanup.policy",
+            .value = "compact",
+        },
+        .{
+            .name = "compression.type",
+            .value = "zstd",
+        },
+    };
     const resources = [_]Req.AlterConfigsResource{.{
         .resource_type = 2,
         .resource_name = "alter-cfg-s3-topic",
@@ -32294,6 +32388,8 @@ test "Broker.handleRequest AlterConfigs persists topic config through S3 replace
     try replacement.open();
     try testing.expect(replacement.topics.contains("alter-cfg-s3-topic"));
     try testing.expectEqual(@as(i64, 4321), replacement.topics.get("alter-cfg-s3-topic").?.config.retention_ms);
+    try testing.expectEqualStrings("compact", replacement.topics.get("alter-cfg-s3-topic").?.config.cleanup_policy);
+    try testing.expectEqualStrings("zstd", replacement.topics.get("alter-cfg-s3-topic").?.config.compression_type);
 }
 
 test "Broker.handleRequest AlterConfigs rolls back when topic snapshot S3 WAL write fails" {
@@ -32918,11 +33014,28 @@ test "Broker.handleRequest IncrementalAlterConfigs v1 returns generated response
     defer broker.deinit();
     try testing.expect(broker.ensureTopic("inc-cfg-topic"));
 
-    const configs = [_]Req.AlterConfigsResource.AlterableConfig{.{
-        .name = "retention.ms",
-        .config_operation = 0,
-        .value = "1234",
-    }};
+    const configs = [_]Req.AlterConfigsResource.AlterableConfig{
+        .{
+            .name = "retention.ms",
+            .config_operation = 0,
+            .value = "1234",
+        },
+        .{
+            .name = "segment.bytes",
+            .config_operation = 0,
+            .value = "262144",
+        },
+        .{
+            .name = "cleanup.policy",
+            .config_operation = 0,
+            .value = "compact,delete",
+        },
+        .{
+            .name = "compression.type",
+            .config_operation = 0,
+            .value = "lz4",
+        },
+    };
     const resources = [_]Req.AlterConfigsResource{.{
         .resource_type = 2,
         .resource_name = "inc-cfg-topic",
@@ -32956,6 +33069,9 @@ test "Broker.handleRequest IncrementalAlterConfigs v1 returns generated response
     try testing.expectEqual(@as(i8, 2), resp.responses[0].resource_type);
     try testing.expectEqualStrings("inc-cfg-topic", resp.responses[0].resource_name.?);
     try testing.expectEqual(@as(i64, 1234), broker.topics.get("inc-cfg-topic").?.config.retention_ms);
+    try testing.expectEqual(@as(i64, 262144), broker.topics.get("inc-cfg-topic").?.config.segment_bytes);
+    try testing.expectEqualStrings("compact,delete", broker.topics.get("inc-cfg-topic").?.config.cleanup_policy);
+    try testing.expectEqualStrings("lz4", broker.topics.get("inc-cfg-topic").?.config.compression_type);
 }
 
 test "Broker.handleRequest IncrementalAlterConfigs rejects invalid topic config values" {
@@ -39223,6 +39339,9 @@ test "Broker restores topic configs after restart" {
         topic.config.retention_ms = 1234;
         topic.config.retention_bytes = 5678;
         topic.config.max_message_bytes = 9000;
+        topic.config.segment_bytes = 33333;
+        topic.config.cleanup_policy = "compact,delete";
+        topic.config.compression_type = "lz4";
         topic.config.min_insync_replicas = 2;
         broker.persistTopics();
     }
@@ -39237,6 +39356,9 @@ test "Broker restores topic configs after restart" {
         try testing.expectEqual(@as(i64, 1234), topic.config.retention_ms);
         try testing.expectEqual(@as(i64, 5678), topic.config.retention_bytes);
         try testing.expectEqual(@as(i32, 9000), topic.config.max_message_bytes);
+        try testing.expectEqual(@as(i64, 33333), topic.config.segment_bytes);
+        try testing.expectEqualStrings("compact,delete", topic.config.cleanup_policy);
+        try testing.expectEqualStrings("lz4", topic.config.compression_type);
         try testing.expectEqual(@as(i32, 2), topic.config.min_insync_replicas);
 
         const offsets = broker.topics.get("__consumer_offsets").?;
@@ -40266,6 +40388,9 @@ test "Broker restores topic configs from S3 cluster metadata log" {
         info.config.retention_ms = 123456;
         info.config.retention_bytes = 987654;
         info.config.max_message_bytes = 262144;
+        info.config.segment_bytes = 524288;
+        info.config.cleanup_policy = "compact";
+        info.config.compression_type = "zstd";
         info.config.min_insync_replicas = 1;
         topic_id = info.topic_id;
         try broker.store.ensurePartition(topic_name, 1);
@@ -40289,6 +40414,9 @@ test "Broker restores topic configs from S3 cluster metadata log" {
         try testing.expectEqual(@as(i64, 123456), info.config.retention_ms);
         try testing.expectEqual(@as(i64, 987654), info.config.retention_bytes);
         try testing.expectEqual(@as(i32, 262144), info.config.max_message_bytes);
+        try testing.expectEqual(@as(i64, 524288), info.config.segment_bytes);
+        try testing.expectEqualStrings("compact", info.config.cleanup_policy);
+        try testing.expectEqualStrings("zstd", info.config.compression_type);
         try testing.expectEqual(@as(i32, 1), info.config.min_insync_replicas);
 
         for (0..3) |partition_index| {
@@ -51349,6 +51477,9 @@ test "Broker.handleRequest CreateTopics applies supported topic configs" {
         .{ .name = "retention.ms", .value = "1234" },
         .{ .name = "retention.bytes", .value = "5678" },
         .{ .name = "max.message.bytes", .value = "9000" },
+        .{ .name = "segment.bytes", .value = "65536" },
+        .{ .name = "cleanup.policy", .value = "delete,compact" },
+        .{ .name = "compression.type", .value = "gzip" },
         .{ .name = "min.insync.replicas", .value = "2" },
     };
     const topics = [_]Req.CreatableTopic{.{
@@ -51394,6 +51525,9 @@ test "Broker.handleRequest CreateTopics applies supported topic configs" {
     try testing.expectEqual(@as(i64, 1234), topic.config.retention_ms);
     try testing.expectEqual(@as(i64, 5678), topic.config.retention_bytes);
     try testing.expectEqual(@as(i32, 9000), topic.config.max_message_bytes);
+    try testing.expectEqual(@as(i64, 65536), topic.config.segment_bytes);
+    try testing.expectEqualStrings("compact,delete", topic.config.cleanup_policy);
+    try testing.expectEqualStrings("gzip", topic.config.compression_type);
     try testing.expectEqual(@as(i32, 2), topic.config.min_insync_replicas);
 }
 
@@ -51416,6 +51550,18 @@ test "Broker.handleRequest CreateTopics rejects invalid topic config values" {
         .name = "max.message.bytes",
         .value = "0",
     }};
+    const zero_segment_config = [_]Req.CreatableTopic.CreatableTopicConfig{.{
+        .name = "segment.bytes",
+        .value = "0",
+    }};
+    const bad_cleanup_config = [_]Req.CreatableTopic.CreatableTopicConfig{.{
+        .name = "cleanup.policy",
+        .value = "archive",
+    }};
+    const bad_compression_config = [_]Req.CreatableTopic.CreatableTopicConfig{.{
+        .name = "compression.type",
+        .value = "brotli",
+    }};
     const topics = [_]Req.CreatableTopic{
         .{
             .name = "ct-zero-min-isr-topic",
@@ -51434,6 +51580,24 @@ test "Broker.handleRequest CreateTopics rejects invalid topic config values" {
             .num_partitions = 1,
             .replication_factor = 1,
             .configs = &zero_max_message_config,
+        },
+        .{
+            .name = "ct-zero-segment-topic",
+            .num_partitions = 1,
+            .replication_factor = 1,
+            .configs = &zero_segment_config,
+        },
+        .{
+            .name = "ct-bad-cleanup-topic",
+            .num_partitions = 1,
+            .replication_factor = 1,
+            .configs = &bad_cleanup_config,
+        },
+        .{
+            .name = "ct-bad-compression-topic",
+            .num_partitions = 1,
+            .replication_factor = 1,
+            .configs = &bad_compression_config,
         },
     };
     const req = Req{
@@ -51466,13 +51630,16 @@ test "Broker.handleRequest CreateTopics rejects invalid topic config values" {
     }
 
     try testing.expectEqual(response.?.len, rpos);
-    try testing.expectEqual(@as(usize, 3), resp.topics.len);
+    try testing.expectEqual(@as(usize, 6), resp.topics.len);
     for (resp.topics) |topic| {
         try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.invalid_config)), topic.error_code);
     }
     try testing.expect(!broker.topics.contains("ct-zero-min-isr-topic"));
     try testing.expect(!broker.topics.contains("ct-high-min-isr-topic"));
     try testing.expect(!broker.topics.contains("ct-zero-max-message-topic"));
+    try testing.expect(!broker.topics.contains("ct-zero-segment-topic"));
+    try testing.expect(!broker.topics.contains("ct-bad-cleanup-topic"));
+    try testing.expect(!broker.topics.contains("ct-bad-compression-topic"));
 }
 
 test "Broker.handleRequest CreateTopics rejects unsupported topic config" {
@@ -51483,8 +51650,8 @@ test "Broker.handleRequest CreateTopics rejects unsupported topic config" {
     defer broker.deinit();
 
     const configs = [_]Req.CreatableTopic.CreatableTopicConfig{.{
-        .name = "cleanup.policy",
-        .value = "compact",
+        .name = "message.timestamp.type",
+        .value = "CreateTime",
     }};
     const topics = [_]Req.CreatableTopic{.{
         .name = "ct-invalid-config-topic",
