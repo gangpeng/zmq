@@ -635,10 +635,11 @@ Status: completed for the initial catalog and DeleteGroups slice.
 - Add three-node tests for leader election, controller failover, broker restart,
   reassignment, and scale in/out.
 - Replace single-node no-op inter-broker handlers with real controller-backed
-  behavior or stop advertising them. Status: legacy inter-broker keys 4-7 are
-  no longer advertised by ApiVersions; handlers remain non-advertised until
-  controller-backed semantics are implemented. Controller ApiVersions now has a
-  separate audited support catalog; generated controller quorum/lifecycle
+  behavior or stop advertising them. Status: ZooKeeper-era inter-broker keys
+  4-7 are generated-only in KRaft/AutoMQ mode; ApiVersions omits them, the
+  broker has no dispatch/no-op path for them, and direct probes fail closed
+  before body decode. Controller ApiVersions now has a separate audited support
+  catalog; generated controller quorum/lifecycle
   framing is in place for Vote, BeginQuorumEpoch, EndQuorumEpoch,
   DescribeQuorum, FetchSnapshot, BrokerRegistration, BrokerHeartbeat,
   UnregisterBroker, AllocateProducerIds, ControllerRegistration, AddRaftVoter,

@@ -827,8 +827,10 @@ test "AutoMQ parity release criteria document pins required gates" {
         try testing.expect(std.mem.indexOf(u8, criteria, command) != null);
     }
 
+    try testing.expect(std.mem.indexOf(u8, criteria, "ZooKeeper-era inter-broker API keys 4-7 are generated-only") != null);
+    try testing.expect(std.mem.indexOf(u8, criteria, "direct probes fail closed before body decode") != null);
+
     const unsupported_surfaces = [_][]const u8{
-        "Legacy inter-broker APIs",
         "broker-only stateless replacement",
         "cross-broker chaos",
         "E2E load/scale",

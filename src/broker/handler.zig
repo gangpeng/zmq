@@ -5080,12 +5080,6 @@ pub const Broker = struct {
             1 => self.handleFetch(request_bytes, pos, &req_header, api_version, resp_header_version),
             2 => self.handleListOffsets(request_bytes, pos, &req_header, api_version, resp_header_version),
             3 => self.handleMetadata(request_bytes, pos, &req_header, api_version, resp_header_version),
-            // Non-advertised legacy inter-broker RPCs. Version validation
-            // rejects them until real controller-backed semantics exist.
-            4 => self.handleLeaderAndIsr(request_bytes, pos, &req_header, resp_header_version),
-            5 => self.handleStopReplica(request_bytes, pos, &req_header, resp_header_version),
-            6 => self.handleUpdateMetadata(request_bytes, pos, &req_header, resp_header_version),
-            7 => self.handleControlledShutdown(&req_header, resp_header_version),
             8 => self.handleOffsetCommit(request_bytes, pos, &req_header, api_version, resp_header_version),
             9 => self.handleOffsetFetch(request_bytes, pos, &req_header, api_version, resp_header_version),
             10 => self.handleFindCoordinator(request_bytes, pos, &req_header, api_version, resp_header_version),
@@ -17635,68 +17629,6 @@ pub const Broker = struct {
     }
 
     // ---------------------------------------------------------------
-    // LeaderAndIsr (key 4) — inter-broker RPC no-op
-    // ZMQ is single-node with RF=1, so this is a protocol-compatible no-op.
-    // ---------------------------------------------------------------
-    fn handleLeaderAndIsr(self: *Broker, request_bytes: []const u8, body_start: usize, req_header: *const RequestHeader, resp_header_version: i16) ?[]u8 {
-        _ = request_bytes;
-        _ = body_start;
-        var buf = self.allocator.alloc(u8, 128) catch return null;
-        var wpos: usize = 0;
-        const rh = ResponseHeader{ .correlation_id = req_header.correlation_id };
-        rh.serialize(buf, &wpos, resp_header_version);
-        ser.writeI16(buf, &wpos, 0); // error_code = NONE
-        ser.writeArrayLen(buf, &wpos, 0); // partition_errors (empty)
-        if (resp_header_version >= 1) ser.writeEmptyTaggedFields(buf, &wpos);
-        return (self.allocator.realloc(buf, wpos) catch buf)[0..wpos];
-    }
-
-    // ---------------------------------------------------------------
-    // StopReplica (key 5) — inter-broker RPC no-op
-    // ---------------------------------------------------------------
-    fn handleStopReplica(self: *Broker, request_bytes: []const u8, body_start: usize, req_header: *const RequestHeader, resp_header_version: i16) ?[]u8 {
-        _ = request_bytes;
-        _ = body_start;
-        var buf = self.allocator.alloc(u8, 128) catch return null;
-        var wpos: usize = 0;
-        const rh = ResponseHeader{ .correlation_id = req_header.correlation_id };
-        rh.serialize(buf, &wpos, resp_header_version);
-        ser.writeI16(buf, &wpos, 0); // error_code = NONE
-        ser.writeArrayLen(buf, &wpos, 0); // partition_errors (empty)
-        if (resp_header_version >= 1) ser.writeEmptyTaggedFields(buf, &wpos);
-        return (self.allocator.realloc(buf, wpos) catch buf)[0..wpos];
-    }
-
-    // ---------------------------------------------------------------
-    // UpdateMetadata (key 6) — inter-broker RPC no-op
-    // ---------------------------------------------------------------
-    fn handleUpdateMetadata(self: *Broker, request_bytes: []const u8, body_start: usize, req_header: *const RequestHeader, resp_header_version: i16) ?[]u8 {
-        _ = request_bytes;
-        _ = body_start;
-        var buf = self.allocator.alloc(u8, 64) catch return null;
-        var wpos: usize = 0;
-        const rh = ResponseHeader{ .correlation_id = req_header.correlation_id };
-        rh.serialize(buf, &wpos, resp_header_version);
-        ser.writeI16(buf, &wpos, 0); // error_code = NONE
-        if (resp_header_version >= 1) ser.writeEmptyTaggedFields(buf, &wpos);
-        return (self.allocator.realloc(buf, wpos) catch buf)[0..wpos];
-    }
-
-    // ---------------------------------------------------------------
-    // ControlledShutdown (key 7) — inter-broker RPC no-op
-    // ---------------------------------------------------------------
-    fn handleControlledShutdown(self: *Broker, req_header: *const RequestHeader, resp_header_version: i16) ?[]u8 {
-        var buf = self.allocator.alloc(u8, 64) catch return null;
-        var wpos: usize = 0;
-        const rh = ResponseHeader{ .correlation_id = req_header.correlation_id };
-        rh.serialize(buf, &wpos, resp_header_version);
-        ser.writeI16(buf, &wpos, 0); // error_code = NONE
-        ser.writeArrayLen(buf, &wpos, 0); // remaining_partitions (empty)
-        if (resp_header_version >= 1) ser.writeEmptyTaggedFields(buf, &wpos);
-        return (self.allocator.realloc(buf, wpos) catch buf)[0..wpos];
-    }
-
-    // ---------------------------------------------------------------
     // AddOffsetsToTxn (key 25) — register __consumer_offsets in txn
     // Parses group_id, computes the __consumer_offsets partition, and adds it
     // to the transaction via txn_coordinator.addPartitionsToTxn.
@@ -26692,6 +26624,42 @@ test "Broker.handleRequest unsupported API returns error response" {
     var rpos: usize = 0;
     const corr_id = ser.readI32(response.?, &rpos);
     try testing.expectEqual(@as(i32, 77), corr_id);
+}
+
+test "Broker.handleRequest legacy inter-broker APIs fail closed before body decode" {
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+
+    const probes = [_]struct { key: i16, version: i16, correlation_id: i32 }{
+        .{ .key = 4, .version = 0, .correlation_id = 4000 },
+        .{ .key = 4, .version = 4, .correlation_id = 4004 },
+        .{ .key = 5, .version = 0, .correlation_id = 5000 },
+        .{ .key = 5, .version = 2, .correlation_id = 5002 },
+        .{ .key = 6, .version = 0, .correlation_id = 6000 },
+        .{ .key = 6, .version = 6, .correlation_id = 6006 },
+        .{ .key = 7, .version = 0, .correlation_id = 7000 },
+        .{ .key = 7, .version = 3, .correlation_id = 7003 },
+    };
+
+    for (probes) |probe| {
+        var buf: [128]u8 = undefined;
+        const req_len = buildTestRequest(
+            &buf,
+            probe.key,
+            probe.version,
+            probe.correlation_id,
+            header_mod.requestHeaderVersion(probe.key, probe.version),
+        );
+
+        const response = broker.handleRequest(buf[0..req_len]);
+        try testing.expect(response != null);
+        defer testing.allocator.free(response.?);
+
+        var rpos: usize = 0;
+        try expectTestResponseHeader(response.?, probe.key, probe.version, probe.correlation_id, &rpos);
+        try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.unsupported_version)), ser.readI16(response.?, &rpos));
+        try testing.expectEqual(response.?.len, rpos);
+    }
 }
 
 test "Broker.handleRequest advertised APIs reject versions above catalog max before body decode" {

@@ -84,8 +84,9 @@ The following surfaces must remain documented and non-advertised, or become
 fully implemented and covered by the gates above, before an AutoMQ-complete
 release:
 
-- Legacy inter-broker APIs remain non-advertised until real controller-backed
-  inter-broker behavior replaces single-node/no-op compatibility handlers.
+- ZooKeeper-era inter-broker API keys 4-7 are generated-only in KRaft mode:
+  ApiVersions omits them, the broker has no dispatch/no-op path for them, and
+  direct probes fail closed before body decode.
 - Broader broker-only stateless replacement still has local cache/state
   assumptions outside the covered S3/quorum replay paths.
 - CI execution of required scheduled cross-broker chaos, E2E load/scale, KRaft

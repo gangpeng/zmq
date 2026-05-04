@@ -280,10 +280,6 @@ pub const broker_handler_api_keys = [_]i16{
     1,
     2,
     3,
-    4,
-    5,
-    6,
-    7,
     8,
     9,
     10,
@@ -372,19 +368,14 @@ pub const broker_handler_api_keys = [_]i16{
     602,
 };
 
-/// Handler cases that intentionally remain non-advertised until real
-/// controller-backed semantics replace local/no-op legacy behavior.
-pub const non_advertised_handler_api_keys = [_]i16{
-    4, // LeaderAndIsr
-    5, // StopReplica
-    6, // UpdateMetadata
-    7, // ControlledShutdown
-};
+/// Handler cases that intentionally remain non-advertised.
+/// Keep empty: ZooKeeper-era inter-broker RPCs are generated for wire catalog
+/// coverage but have no broker dispatch path in KRaft/AutoMQ mode.
+pub const non_advertised_handler_api_keys = [_]i16{};
 
 /// Generated APIs with broker switch cases that intentionally remain
 /// non-advertised until their full coordinator/storage semantics are
-/// implemented. Keep empty when every generated handler case is either
-/// advertised or listed as a legacy non-advertised inter-broker RPC.
+/// implemented. Keep empty when every generated handler case is advertised.
 pub const fail_closed_generated_handler_api_keys = [_]i16{};
 
 /// Controller handler switch cases. Version support comes from
@@ -734,11 +725,11 @@ test "controller supported APIs have handler switch coverage" {
     }
 }
 
-test "non-advertised handler cases are explicit legacy inter-broker RPCs" {
+test "broker handler cases are advertised or generated fail-closed" {
     for (broker_handler_api_keys) |key| {
         if (findBrokerSupport(key) != null) continue;
 
-        try testing.expect(isNonAdvertisedHandlerApi(key) or isFailClosedGeneratedHandlerApi(key));
+        try testing.expect(isFailClosedGeneratedHandlerApi(key));
         try testing.expect(findGeneratedRequest(key) != null);
         try testing.expect(!isBrokerVersionSupported(key, findGeneratedRequest(key).?.min));
     }
@@ -757,7 +748,7 @@ test "fail-closed generated handler APIs are not advertised" {
     }
 }
 
-test "broker support catalog does not advertise no-op inter-broker RPCs" {
+test "legacy inter-broker RPCs are generated-only in KRaft broker mode" {
     try testing.expect(findGeneratedRequest(4) != null);
     try testing.expect(findGeneratedRequest(5) != null);
     try testing.expect(findGeneratedRequest(6) != null);
@@ -766,6 +757,10 @@ test "broker support catalog does not advertise no-op inter-broker RPCs" {
     try testing.expect(findBrokerSupport(5) == null);
     try testing.expect(findBrokerSupport(6) == null);
     try testing.expect(findBrokerSupport(7) == null);
+    try testing.expect(!hasBrokerHandler(4));
+    try testing.expect(!hasBrokerHandler(5));
+    try testing.expect(!hasBrokerHandler(6));
+    try testing.expect(!hasBrokerHandler(7));
 }
 
 test "canonical API support covers corrected Kafka and AutoMQ extension keys" {
