@@ -23,6 +23,14 @@ Usage:
   ZMQ_RUN_E2E_TESTS=1 python3 tests/e2e_test.py
   python3 tests/e2e_test.py --self-test
   docker compose down -v               # Cleanup
+
+Optional cross-broker chaos environment:
+  ZMQ_E2E_CHAOS_MATRIX                 comma-separated named phases
+  ZMQ_E2E_CHAOS_DOWN / UP              default partition/heal hooks
+  ZMQ_E2E_CHAOS_EXPECT                 "fail" (default) or "survive"
+  ZMQ_E2E_CHAOS_<PHASE>_DOWN / UP      phase-specific hooks
+  ZMQ_E2E_CHAOS_<PHASE>_EXPECT         phase-specific expectation
+  ZMQ_E2E_REQUIRED_CHAOS_PHASES        fail if matrix omits required phases
 """
 
 import socket
@@ -32,6 +40,7 @@ import sys
 import time
 import os
 import urllib.request
+import shlex
 
 RUN_ENABLED = sys.argv.count("--self-test") > 0 or os.environ.get("ZMQ_RUN_E2E_TESTS") == "1"
 
@@ -193,6 +202,183 @@ def metadata_request(sock, corr_id):
 
 
 # ---------------------------------------------------------------
+# Cross-broker chaos gate helpers
+# ---------------------------------------------------------------
+
+def split_csv(raw):
+    if not raw:
+        return []
+    return [item.strip() for item in raw.split(",") if item.strip()]
+
+
+def env_phase_token(name):
+    token = []
+    for ch in name.upper():
+        if ch.isalnum():
+            token.append(ch)
+        else:
+            token.append("_")
+    collapsed = "_".join(part for part in "".join(token).split("_") if part)
+    if not collapsed:
+        raise AssertionError("empty E2E chaos phase name")
+    return collapsed
+
+
+def e2e_chaos_hooks_configured():
+    return bool(
+        os.environ.get("ZMQ_E2E_CHAOS_MATRIX")
+        or os.environ.get("ZMQ_E2E_CHAOS_DOWN")
+        or os.environ.get("ZMQ_E2E_CHAOS_UP")
+    )
+
+
+def e2e_chaos_phase_env_name(phase, suffix):
+    return f"ZMQ_E2E_CHAOS_{env_phase_token(phase)}_{suffix}"
+
+
+def e2e_chaos_phase_command(phase, suffix):
+    return os.environ.get(e2e_chaos_phase_env_name(phase, suffix)) or os.environ.get(
+        f"ZMQ_E2E_CHAOS_{suffix}"
+    )
+
+
+def e2e_chaos_phase_expect(phase):
+    return os.environ.get(e2e_chaos_phase_env_name(phase, "EXPECT")) or os.environ.get(
+        "ZMQ_E2E_CHAOS_EXPECT", "fail"
+    )
+
+
+def selected_e2e_chaos_phases():
+    if not e2e_chaos_hooks_configured():
+        return []
+
+    raw_matrix = os.environ.get("ZMQ_E2E_CHAOS_MATRIX")
+    phase_names = split_csv(raw_matrix) if raw_matrix else ["cross-broker"]
+    if not phase_names:
+        raise AssertionError("ZMQ_E2E_CHAOS_MATRIX did not contain any phases")
+
+    phases = []
+    seen = set()
+    for phase in phase_names:
+        if phase in seen:
+            continue
+        seen.add(phase)
+        down = e2e_chaos_phase_command(phase, "DOWN")
+        up = e2e_chaos_phase_command(phase, "UP")
+        if not down or not up:
+            raise AssertionError(
+                f"E2E chaos phase {phase!r} requires DOWN and UP hooks"
+            )
+        expect = e2e_chaos_phase_expect(phase)
+        if expect not in ("fail", "survive"):
+            raise AssertionError(f"invalid E2E chaos expectation for {phase!r}: {expect!r}")
+        phases.append({"name": phase, "down": down, "up": up, "expect": expect})
+    return phases
+
+
+def validate_required_e2e_chaos_phase_coverage():
+    required = split_csv(os.environ.get("ZMQ_E2E_REQUIRED_CHAOS_PHASES"))
+    if not required:
+        return
+
+    configured = [phase["name"] for phase in selected_e2e_chaos_phases()]
+    missing = [phase for phase in required if phase not in configured]
+    if missing:
+        raise AssertionError(
+            "required E2E chaos phases not configured: " + ", ".join(missing)
+        )
+
+
+def e2e_chaos_hook_env(phase, index):
+    env = os.environ.copy()
+    env["ZMQ_E2E_CHAOS_PHASE"] = phase["name"]
+    env["ZMQ_E2E_CHAOS_PHASE_INDEX"] = str(index)
+    env["ZMQ_E2E_CHAOS_EXPECT"] = phase["expect"]
+    env["ZMQ_E2E_BROKER_PORTS"] = ",".join(
+        f"{node['name']}:{node['broker_port']}" for node in NODES
+    )
+    env["ZMQ_E2E_CONTROLLER_PORTS"] = ",".join(
+        f"{node['name']}:{node['controller_port']}" for node in NODES
+    )
+    env["ZMQ_E2E_CONTAINERS"] = ",".join(
+        f"{node['name']}:{node['container']}" for node in NODES
+    )
+    return env
+
+
+def run_e2e_chaos_hook(label, command, env):
+    proc = subprocess.run(
+        shlex.split(command),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        timeout=120,
+        env=env,
+    )
+    if proc.returncode != 0:
+        raise AssertionError(f"{label} failed with exit code {proc.returncode}\n{proc.stdout}")
+
+
+def wait_for_cross_node_payload(t, topic, payload, timeout=20):
+    deadline = time.time() + timeout
+    produced = False
+    last_detail = ""
+
+    while time.time() < deadline:
+        try:
+            if not produced:
+                sock = t.connect(NODES[1]["broker_port"])
+                err, off = produce(sock, t.next(), topic, 0, payload)
+                sock.close()
+                if err != 0:
+                    last_detail = f"produce err={err}"
+                    time.sleep(0.5)
+                    continue
+                produced = True
+
+            sock = t.connect(NODES[2]["broker_port"])
+            err, hw, rec_len, records = fetch(sock, t.next(), topic, 0, 0)
+            sock.close()
+            if err == 0 and payload in records:
+                return True, f"hw={hw}, {rec_len}B"
+            last_detail = f"fetch err={err}, {rec_len}B"
+        except Exception as exc:
+            last_detail = str(exc)
+        time.sleep(0.5)
+
+    return False, last_detail
+
+
+def run_cross_broker_chaos(t, topic):
+    phases = selected_e2e_chaos_phases()
+    if not phases:
+        return
+
+    print("\n[Test l] Cross-broker chaos phases")
+    for index, phase in enumerate(phases):
+        env = e2e_chaos_hook_env(phase, index)
+        healed = False
+        during_payload = f"e2e-chaos-during-{index}-{phase['name']}".encode()
+        healed_payload = f"e2e-chaos-healed-{index}-{phase['name']}".encode()
+        try:
+            run_e2e_chaos_hook(f"{phase['name']}:down", phase["down"], env)
+            ok, detail = wait_for_cross_node_payload(t, topic, during_payload, timeout=6)
+            if phase["expect"] == "survive":
+                t.check(f"Cross-broker chaos {phase['name']} survives", ok, detail)
+            else:
+                t.check(f"Cross-broker chaos {phase['name']} fails closed", not ok, detail)
+        finally:
+            run_e2e_chaos_hook(f"{phase['name']}:up", phase["up"], env)
+            healed = True
+
+        ok, detail = wait_for_cross_node_payload(t, topic, healed_payload, timeout=30)
+        t.check(f"Cross-broker chaos {phase['name']} heals", ok, detail)
+
+        if not healed:
+            raise AssertionError(f"E2E chaos phase {phase['name']} did not heal")
+
+
+# ---------------------------------------------------------------
 # Test Runner
 # ---------------------------------------------------------------
 
@@ -242,6 +428,54 @@ def self_test():
 
     if MINIO_PORT in seen_ports:
         raise AssertionError("MinIO port must not collide with broker/controller/metrics ports")
+
+    old_env = os.environ.copy()
+    try:
+        os.environ.pop("ZMQ_E2E_CHAOS_DOWN", None)
+        os.environ.pop("ZMQ_E2E_CHAOS_UP", None)
+        os.environ.pop("ZMQ_E2E_CHAOS_MATRIX", None)
+        if selected_e2e_chaos_phases() != []:
+            raise AssertionError("E2E chaos phases unexpectedly configured")
+
+        os.environ["ZMQ_E2E_CHAOS_DOWN"] = "true"
+        os.environ["ZMQ_E2E_CHAOS_UP"] = "true"
+        phases = selected_e2e_chaos_phases()
+        if len(phases) != 1 or phases[0]["name"] != "cross-broker":
+            raise AssertionError(f"default E2E chaos phase selection failed: {phases}")
+
+        os.environ["ZMQ_E2E_CHAOS_MATRIX"] = "az-a, broker-2,az-a"
+        os.environ["ZMQ_E2E_CHAOS_BROKER_2_DOWN"] = "true"
+        os.environ["ZMQ_E2E_CHAOS_BROKER_2_UP"] = "true"
+        os.environ["ZMQ_E2E_CHAOS_BROKER_2_EXPECT"] = "survive"
+        phases = selected_e2e_chaos_phases()
+        if [phase["name"] for phase in phases] != ["az-a", "broker-2"]:
+            raise AssertionError(f"E2E chaos matrix parsing failed: {phases}")
+        if phases[0]["expect"] != "fail" or phases[1]["expect"] != "survive":
+            raise AssertionError(f"E2E chaos expectation parsing failed: {phases}")
+
+        os.environ["ZMQ_E2E_REQUIRED_CHAOS_PHASES"] = "az-a,broker-2"
+        validate_required_e2e_chaos_phase_coverage()
+        os.environ["ZMQ_E2E_REQUIRED_CHAOS_PHASES"] = "missing-phase"
+        try:
+            validate_required_e2e_chaos_phase_coverage()
+            raise AssertionError("missing required E2E chaos phase was not rejected")
+        except AssertionError as exc:
+            if "required E2E chaos phases" not in str(exc):
+                raise
+
+        env = e2e_chaos_hook_env(phases[1], 1)
+        if env["ZMQ_E2E_CHAOS_PHASE"] != "broker-2":
+            raise AssertionError("E2E chaos phase context failed")
+        if env["ZMQ_E2E_BROKER_PORTS"] != "node0:19092,node1:19094,node2:19096":
+            raise AssertionError("E2E chaos broker port context failed")
+        if "node0:zmq-node-0" not in env["ZMQ_E2E_CONTAINERS"]:
+            raise AssertionError("E2E chaos container context failed")
+        run_e2e_chaos_hook("self-test:down", phases[1]["down"], env)
+        run_e2e_chaos_hook("self-test:up", phases[1]["up"], env)
+    finally:
+        os.environ.clear()
+        os.environ.update(old_env)
+
     print("ok: E2E harness self-test")
     return 0
 
@@ -256,6 +490,12 @@ def main():
     if not RUN_ENABLED:
         print("skip: set ZMQ_RUN_E2E_TESTS=1 to run Docker 3-node E2E harness")
         return 0
+
+    try:
+        validate_required_e2e_chaos_phase_coverage()
+    except AssertionError as exc:
+        print(f"FAIL: {exc}", file=sys.stderr)
+        return 1
 
     t = TestRunner()
 
@@ -534,6 +774,11 @@ def main():
         sock.close()
     except Exception as e:
         t.check("Fetch from node 2", False, str(e))
+
+    try:
+        run_cross_broker_chaos(t, "e2e-topic")
+    except Exception as e:
+        t.check("Cross-broker chaos gate", False, str(e))
 
     # =============================================
     # Summary

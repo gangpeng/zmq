@@ -57,8 +57,9 @@ ZMQ_RUN_BENCH_COMPARE=1 /tmp/zig-aarch64-linux-0.16.0/zig build bench-compare --
 Release CI must set required coverage variables for environment-specific
 matrices, including `ZMQ_KRAFT_REQUIRED_NETWORK_PHASES` for scheduled
 controller/broker partition phases, `ZMQ_CHAOS_REQUIRED_NETWORK_PHASES` for
-broker chaos partitions, and provider/client/profile requirement variables for
-S3 and external-client matrices. S3 provider coverage must pin provider,
+broker chaos partitions, `ZMQ_E2E_REQUIRED_CHAOS_PHASES` for Docker
+cross-broker chaos phases, and provider/client/profile requirement variables
+for S3 and external-client matrices. S3 provider coverage must pin provider,
 outage, ListObjectsV2 pagination, and multipart-edge profiles with
 `ZMQ_S3_PROVIDER_REQUIRED_PROFILES`,
 `ZMQ_S3_PROVIDER_REQUIRED_OUTAGE_PROFILES`,

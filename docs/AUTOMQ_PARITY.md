@@ -670,7 +670,12 @@ Status: completed for the initial catalog and DeleteGroups slice.
   so missing failover matrix coverage fails before the harness starts.
   The existing Docker three-node combined-mode E2E suite is now exposed as
   gated `test-e2e` with default self-test coverage, so release jobs can require
-  the multi-node Docker path explicitly with `ZMQ_RUN_E2E_TESTS=1`.
+  the multi-node Docker path explicitly with `ZMQ_RUN_E2E_TESTS=1`. The E2E
+  harness can also run named cross-broker chaos phases through
+  `ZMQ_E2E_CHAOS_MATRIX` plus per-phase down/up/expect hooks, exports
+  broker/controller/container context to those hooks, verifies cross-node
+  produce/fetch behavior after each heal, and fails release jobs when required
+  phases are absent through `ZMQ_E2E_REQUIRED_CHAOS_PHASES`.
   Remaining gap: broader failover gates and client compatibility fixtures.
 - Validate rack-aware routing and auto-balancer decisions under load. Status:
   rack-aware planning has unit coverage for cross-rack target preference,
@@ -694,8 +699,9 @@ Status: completed for the initial catalog and DeleteGroups slice.
   convergence, old-owner write fencing, and target-broker topic/data
   convergence. Controller-aware scale-out planning now has deterministic
   coverage that spreads hot partitions from an overloaded broker to multiple
-  newly active broker targets. Broader live load/scale orchestration and
-  cross-broker chaos coverage remain.
+  newly active broker targets. Docker E2E can require named cross-broker chaos
+  phases and verifies cross-node produce/fetch recovery after each heal.
+  Broader live load/scale orchestration coverage remains.
 
 ### Phase 5: Production Gates
 
@@ -754,9 +760,11 @@ Status: completed for the initial catalog and DeleteGroups slice.
   controller/broker partition phases with `ZMQ_KRAFT_NETWORK_MATRIX` and
   `ZMQ_KRAFT_NETWORK_<PHASE>_{DOWN,UP,EXPECT}` overrides, and can fail release
   jobs when required failover phases are omitted through
-  `ZMQ_KRAFT_REQUIRED_NETWORK_PHASES`. Remaining work: broader environment
-  execution coverage for live provider outage profiles, scheduled partition
-  matrices, and cross-broker chaos hooks.
+  `ZMQ_KRAFT_REQUIRED_NETWORK_PHASES`. `test-e2e` can now require named
+  Docker cross-broker chaos phases with `ZMQ_E2E_REQUIRED_CHAOS_PHASES` and
+  per-phase `ZMQ_E2E_CHAOS_<PHASE>_{DOWN,UP,EXPECT}` hooks. Remaining work:
+  broader environment execution coverage for live provider outage profiles and
+  scheduled partition matrices.
 - Add performance baselines for produce/fetch throughput, p99 latency, S3
   operations per MiB, recovery time, and memory growth.
   Status: `zig build bench` now compiles against the broker/storage/protocol
