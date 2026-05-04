@@ -1380,6 +1380,208 @@ test "generated non-default golden fixtures cover legacy and flexible wire encod
     }
 
     {
+        const FindCoordinatorRequest = generated.find_coordinator_request.FindCoordinatorRequest;
+        const legacy_value = FindCoordinatorRequest{
+            .key = "group-a",
+            .key_type = 0,
+        };
+        try expectGoldenRoundTrip(FindCoordinatorRequest, legacy_value, 2, &[_]u8{
+            0x00, 0x07, 'g',  'r',
+            'o',  'u',  'p',  '-',
+            'a',  0x00,
+        });
+
+        const coordinator_keys = [_]?[]const u8{ "txn-a", "txn-b" };
+        const flexible_value = FindCoordinatorRequest{
+            .key_type = 1,
+            .coordinator_keys = &coordinator_keys,
+        };
+        try expectGoldenRoundTrip(FindCoordinatorRequest, flexible_value, 4, &[_]u8{
+            0x01, 0x03, 0x06, 't',
+            'x',  'n',  '-',  'a',
+            0x06, 't',  'x',  'n',
+            '-',  'b',  0x00,
+        });
+    }
+
+    {
+        const FindCoordinatorResponse = generated.find_coordinator_response.FindCoordinatorResponse;
+        const legacy_value = FindCoordinatorResponse{
+            .throttle_time_ms = 5,
+            .error_code = 0,
+            .error_message = null,
+            .node_id = 2,
+            .host = "broker-2",
+            .port = 19092,
+        };
+        try expectGoldenRoundTrip(FindCoordinatorResponse, legacy_value, 2, &[_]u8{
+            0x00, 0x00, 0x00, 0x05,
+            0x00, 0x00, 0xff, 0xff,
+            0x00, 0x00, 0x00, 0x02,
+            0x00, 0x08, 'b',  'r',
+            'o',  'k',  'e',  'r',
+            '-',  '2',  0x00, 0x00,
+            0x4a, 0x94,
+        });
+
+        const coordinators = [_]FindCoordinatorResponse.Coordinator{
+            .{
+                .key = "group-a",
+                .node_id = 2,
+                .host = "broker-2",
+                .port = 19092,
+                .error_code = 0,
+                .error_message = null,
+            },
+            .{
+                .key = "txn-a",
+                .node_id = -1,
+                .host = null,
+                .port = -1,
+                .error_code = 15,
+                .error_message = "missing",
+            },
+        };
+        const flexible_value = FindCoordinatorResponse{
+            .throttle_time_ms = 5,
+            .coordinators = &coordinators,
+        };
+        try expectGoldenRoundTrip(FindCoordinatorResponse, flexible_value, 4, &[_]u8{
+            0x00, 0x00, 0x00, 0x05,
+            0x03, 0x08, 'g',  'r',
+            'o',  'u',  'p',  '-',
+            'a',  0x00, 0x00, 0x00,
+            0x02, 0x09, 'b',  'r',
+            'o',  'k',  'e',  'r',
+            '-',  '2',  0x00, 0x00,
+            0x4a, 0x94, 0x00, 0x00,
+            0x00, 0x00, 0x06, 't',
+            'x',  'n',  '-',  'a',
+            0xff,
+            0xff, 0xff, 0xff, 0x00,
+            0xff, 0xff, 0xff, 0xff,
+            0x00, 0x0f, 0x08, 'm',
+            'i',  's',  's',  'i',
+            'n',  'g',  0x00, 0x00,
+        });
+    }
+
+    {
+        const ListOffsetsRequest = generated.list_offsets_request.ListOffsetsRequest;
+        const legacy_partitions = [_]ListOffsetsRequest.ListOffsetsTopic.ListOffsetsPartition{.{
+            .partition_index = 0,
+            .timestamp = -2,
+            .max_num_offsets = 1,
+        }};
+        const legacy_topics = [_]ListOffsetsRequest.ListOffsetsTopic{.{
+            .name = "topic-a",
+            .partitions = &legacy_partitions,
+        }};
+        const legacy_value = ListOffsetsRequest{
+            .replica_id = -1,
+            .topics = &legacy_topics,
+        };
+        try expectGoldenRoundTrip(ListOffsetsRequest, legacy_value, 0, &[_]u8{
+            0xff, 0xff, 0xff, 0xff,
+            0x00, 0x00, 0x00, 0x01,
+            0x00, 0x07, 't',  'o',
+            'p',  'i',  'c',  '-',
+            'a',  0x00, 0x00, 0x00,
+            0x01, 0x00, 0x00, 0x00,
+            0x00, 0xff, 0xff, 0xff,
+            0xff, 0xff, 0xff, 0xff,
+            0xfe, 0x00, 0x00, 0x00,
+            0x01,
+        });
+
+        const flexible_partitions = [_]ListOffsetsRequest.ListOffsetsTopic.ListOffsetsPartition{.{
+            .partition_index = 0,
+            .current_leader_epoch = 9,
+            .timestamp = -1,
+        }};
+        const flexible_topics = [_]ListOffsetsRequest.ListOffsetsTopic{.{
+            .name = "topic-a",
+            .partitions = &flexible_partitions,
+        }};
+        const flexible_value = ListOffsetsRequest{
+            .replica_id = -1,
+            .isolation_level = 1,
+            .topics = &flexible_topics,
+        };
+        try expectGoldenRoundTrip(ListOffsetsRequest, flexible_value, 7, &[_]u8{
+            0xff, 0xff, 0xff, 0xff,
+            0x01, 0x02, 0x08, 't',
+            'o',  'p',  'i',  'c',
+            '-',  'a',  0x02, 0x00,
+            0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x09, 0xff,
+            0xff, 0xff, 0xff, 0xff,
+            0xff, 0xff, 0xff, 0x00,
+            0x00, 0x00,
+        });
+    }
+
+    {
+        const ListOffsetsResponse = generated.list_offsets_response.ListOffsetsResponse;
+        const legacy_partitions = [_]ListOffsetsResponse.ListOffsetsTopicResponse.ListOffsetsPartitionResponse{.{
+            .partition_index = 0,
+            .error_code = 0,
+            .old_style_offsets = &[_]i64{ 0, 42 },
+        }};
+        const legacy_topics = [_]ListOffsetsResponse.ListOffsetsTopicResponse{.{
+            .name = "topic-a",
+            .partitions = &legacy_partitions,
+        }};
+        const legacy_value = ListOffsetsResponse{
+            .topics = &legacy_topics,
+        };
+        try expectGoldenRoundTrip(ListOffsetsResponse, legacy_value, 0, &[_]u8{
+            0x00, 0x00, 0x00, 0x01,
+            0x00, 0x07, 't',  'o',
+            'p',  'i',  'c',  '-',
+            'a',
+            0x00, 0x00, 0x00, 0x01,
+            0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00,
+            0x00, 0x00, 0x00, 0x02,
+            0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x2a,
+        });
+
+        const flexible_partitions = [_]ListOffsetsResponse.ListOffsetsTopicResponse.ListOffsetsPartitionResponse{.{
+            .partition_index = 0,
+            .error_code = 0,
+            .timestamp = 1_700_000_000_000,
+            .offset = 42,
+            .leader_epoch = 9,
+        }};
+        const flexible_topics = [_]ListOffsetsResponse.ListOffsetsTopicResponse{.{
+            .name = "topic-a",
+            .partitions = &flexible_partitions,
+        }};
+        const flexible_value = ListOffsetsResponse{
+            .throttle_time_ms = 5,
+            .topics = &flexible_topics,
+        };
+        try expectGoldenRoundTrip(ListOffsetsResponse, flexible_value, 7, &[_]u8{
+            0x00, 0x00, 0x00, 0x05,
+            0x02, 0x08, 't',  'o',
+            'p',  'i',  'c',  '-',
+            'a',  0x02, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x01, 0x8b,
+            0xcf, 0xe5, 0x68, 0x00,
+            0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x2a,
+            0x00, 0x00,
+            0x00, 0x09, 0x00, 0x00,
+            0x00,
+        });
+    }
+
+    {
         const OffsetFetchRequest = generated.offset_fetch_request.OffsetFetchRequest;
         const value = OffsetFetchRequest{
             .group_id = "group-a",
