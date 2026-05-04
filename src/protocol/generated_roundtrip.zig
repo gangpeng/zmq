@@ -1938,6 +1938,65 @@ test "generated non-default golden fixtures cover legacy and flexible wire encod
     }
 
     {
+        const InitializeShareGroupStateRequest = generated.initialize_share_group_state_request.InitializeShareGroupStateRequest;
+        const partitions = [_]InitializeShareGroupStateRequest.InitializeStateData.PartitionData{
+            .{ .partition = 0, .state_epoch = 5, .start_offset = 10 },
+            .{ .partition = 2, .state_epoch = 6, .start_offset = -1 },
+        };
+        const topics = [_]InitializeShareGroupStateRequest.InitializeStateData{.{
+            .topic_id = .{
+                0x40, 0x41, 0x42, 0x43,
+                0x44, 0x45, 0x46, 0x47,
+                0x48, 0x49, 0x4a, 0x4b,
+                0x4c, 0x4d, 0x4e, 0x4f,
+            },
+            .partitions = &partitions,
+        }};
+        const value = InitializeShareGroupStateRequest{
+            .group_id = "share-g",
+            .topics = &topics,
+        };
+        try expectGoldenRoundTrip(InitializeShareGroupStateRequest, value, 0, &[_]u8{
+            0x08, 0x73, 0x68, 0x61, 0x72, 0x65, 0x2d, 0x67,
+            0x02, 0x40, 0x41, 0x42, 0x43, 0x44, 0x45, 0x46,
+            0x47, 0x48, 0x49, 0x4a, 0x4b, 0x4c, 0x4d, 0x4e,
+            0x4f, 0x03, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x05, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x0a, 0x00, 0x00, 0x00, 0x00, 0x02, 0x00,
+            0x00, 0x00, 0x06, 0xff, 0xff, 0xff, 0xff, 0xff,
+            0xff, 0xff, 0xff, 0x00, 0x00, 0x00,
+        });
+    }
+
+    {
+        const InitializeShareGroupStateResponse = generated.initialize_share_group_state_response.InitializeShareGroupStateResponse;
+        const partition_results = [_]InitializeShareGroupStateResponse.InitializeStateResult.PartitionResult{
+            .{ .partition = 0, .error_code = 0, .error_message = null },
+            .{ .partition = 2, .error_code = 42, .error_message = "bad-epoch" },
+        };
+        const results = [_]InitializeShareGroupStateResponse.InitializeStateResult{.{
+            .topic_id = .{
+                0x40, 0x41, 0x42, 0x43,
+                0x44, 0x45, 0x46, 0x47,
+                0x48, 0x49, 0x4a, 0x4b,
+                0x4c, 0x4d, 0x4e, 0x4f,
+            },
+            .partitions = &partition_results,
+        }};
+        const value = InitializeShareGroupStateResponse{
+            .results = &results,
+        };
+        try expectGoldenRoundTrip(InitializeShareGroupStateResponse, value, 0, &[_]u8{
+            0x02, 0x40, 0x41, 0x42, 0x43, 0x44, 0x45, 0x46,
+            0x47, 0x48, 0x49, 0x4a, 0x4b, 0x4c, 0x4d, 0x4e,
+            0x4f, 0x03, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x02, 0x00, 0x2a,
+            0x0a, 0x62, 0x61, 0x64, 0x2d, 0x65, 0x70, 0x6f,
+            0x63, 0x68, 0x00, 0x00, 0x00,
+        });
+    }
+
+    {
         const AlterPartitionReassignmentsRequest = generated.alter_partition_reassignments_request.AlterPartitionReassignmentsRequest;
         const null_partitions = [_]AlterPartitionReassignmentsRequest.ReassignableTopic.ReassignablePartition{.{
             .partition_index = 0,
