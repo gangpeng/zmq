@@ -94,12 +94,14 @@ pub const AlterPartitionResponse = struct {
         /// The ID of the topic
         /// Versions: 2+
         topic_id: [16]u8 = .{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 },
-        /// 
+        ///
         /// Versions: 0+
         partitions: []const PartitionData = &.{},
 
         pub fn serialize(self: *const TopicData, buf: []u8, pos: *usize, version: i16) void {
-            ser.writeCompactString(buf, pos, self.topic_name);
+            if (version <= 1) {
+                ser.writeCompactString(buf, pos, self.topic_name);
+            }
             if (version >= 2) {
                 ser.writeUuid(buf, pos, self.topic_id);
             }
@@ -112,7 +114,9 @@ pub const AlterPartitionResponse = struct {
 
         pub fn deserialize(alloc: Allocator, buf: []const u8, pos: *usize, version: i16) !TopicData {
             var result = TopicData{};
-            result.topic_name = try ser.readCompactString(buf, pos);
+            if (version <= 1) {
+                result.topic_name = try ser.readCompactString(buf, pos);
+            }
             if (version >= 2) {
                 result.topic_id = try ser.readUuid(buf, pos);
             }
@@ -130,7 +134,9 @@ pub const AlterPartitionResponse = struct {
 
         pub fn calcSize(self: *const TopicData, version: i16) usize {
             var size: usize = 0;
-            size += ser.compactStringSize(self.topic_name);
+            if (version <= 1) {
+                size += ser.compactStringSize(self.topic_name);
+            }
             if (version >= 2) {
                 size += 16;
             }
@@ -149,7 +155,7 @@ pub const AlterPartitionResponse = struct {
     /// The top level response error code
     /// Versions: 0+
     error_code: i16 = 0,
-    /// 
+    ///
     /// Versions: 0+
     topics: []const TopicData = &.{},
 

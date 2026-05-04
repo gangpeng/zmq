@@ -7254,6 +7254,346 @@ test "generated non-default golden fixtures cover legacy and flexible wire encod
             0x10, 0x00,
         });
     }
+
+    {
+        const MetadataResponse = generated.metadata_response.MetadataResponse;
+        const brokers = [_]MetadataResponse.MetadataResponseBroker{.{
+            .node_id = 7,
+            .host = "host",
+            .port = 9092,
+            .rack = "rack-a",
+        }};
+        const partitions = [_]MetadataResponse.MetadataResponseTopic.MetadataResponsePartition{.{
+            .partition_index = 1,
+            .leader_id = 7,
+            .leader_epoch = 2,
+            .replica_nodes = &[_]i32{ 7, 8 },
+            .isr_nodes = &[_]i32{7},
+            .offline_replicas = &[_]i32{8},
+        }};
+        const topics = [_]MetadataResponse.MetadataResponseTopic{.{
+            .name = "topic-a",
+            .topic_id = .{
+                0x00, 0x01, 0x02, 0x03,
+                0x04, 0x05, 0x06, 0x07,
+                0x08, 0x09, 0x0a, 0x0b,
+                0x0c, 0x0d, 0x0e, 0x0f,
+            },
+            .partitions = &partitions,
+            .topic_authorized_operations = 15,
+        }};
+        const value = MetadataResponse{
+            .throttle_time_ms = 1,
+            .brokers = &brokers,
+            .cluster_id = "cluster-a",
+            .controller_id = 7,
+            .topics = &topics,
+            .cluster_authorized_operations = 15,
+        };
+        try expectGoldenRoundTrip(MetadataResponse, value, 10, &[_]u8{
+            0x00, 0x00, 0x00, 0x01, 0x02, 0x00, 0x00, 0x00,
+            0x07, 0x05, 0x68, 0x6f, 0x73, 0x74, 0x00, 0x00,
+            0x23, 0x84, 0x07, 0x72, 0x61, 0x63, 0x6b, 0x2d,
+            0x61, 0x00, 0x0a, 0x63, 0x6c, 0x75, 0x73, 0x74,
+            0x65, 0x72, 0x2d, 0x61, 0x00, 0x00, 0x00, 0x07,
+            0x02, 0x00, 0x00, 0x08, 0x74, 0x6f, 0x70, 0x69,
+            0x63, 0x2d, 0x61, 0x00, 0x01, 0x02, 0x03, 0x04,
+            0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c,
+            0x0d, 0x0e, 0x0f, 0x00, 0x02, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x07, 0x00,
+            0x00, 0x00, 0x02, 0x03, 0x00, 0x00, 0x00, 0x07,
+            0x00, 0x00, 0x00, 0x08, 0x02, 0x00, 0x00, 0x00,
+            0x07, 0x02, 0x00, 0x00, 0x00, 0x08, 0x00, 0x00,
+            0x00, 0x00, 0x0f, 0x00, 0x00, 0x00, 0x00, 0x0f,
+            0x00,
+        });
+    }
+
+    {
+        const ControlledShutdownRequest = generated.controlled_shutdown_request.ControlledShutdownRequest;
+        const value = ControlledShutdownRequest{
+            .broker_id = 7,
+            .broker_epoch = 9,
+        };
+        try expectGoldenRoundTrip(ControlledShutdownRequest, value, 3, &[_]u8{
+            0x00, 0x00, 0x00, 0x07,
+            0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x09,
+            0x00,
+        });
+    }
+
+    {
+        const ControlledShutdownResponse = generated.controlled_shutdown_response.ControlledShutdownResponse;
+        const partitions = [_]ControlledShutdownResponse.RemainingPartition{.{
+            .topic_name = "topic-a",
+            .partition_index = 1,
+        }};
+        const value = ControlledShutdownResponse{
+            .remaining_partitions = &partitions,
+        };
+        try expectGoldenRoundTrip(ControlledShutdownResponse, value, 3, &[_]u8{
+            0x00, 0x00, 0x02, 0x08,
+            0x74, 0x6f, 0x70, 0x69,
+            0x63, 0x2d, 0x61, 0x00,
+            0x00, 0x00, 0x01, 0x00,
+            0x00,
+        });
+    }
+
+    {
+        const AlterReplicaLogDirsRequest = generated.alter_replica_log_dirs_request.AlterReplicaLogDirsRequest;
+        const topics = [_]AlterReplicaLogDirsRequest.AlterReplicaLogDir.AlterReplicaLogDirTopic{.{
+            .name = "topic-a",
+            .partitions = &[_]i32{ 1, 2 },
+        }};
+        const dirs = [_]AlterReplicaLogDirsRequest.AlterReplicaLogDir{.{
+            .path = "/data-a",
+            .topics = &topics,
+        }};
+        const value = AlterReplicaLogDirsRequest{
+            .dirs = &dirs,
+        };
+        try expectGoldenRoundTrip(AlterReplicaLogDirsRequest, value, 2, &[_]u8{
+            0x02, 0x08, 0x2f, 0x64,
+            0x61, 0x74, 0x61, 0x2d,
+            0x61, 0x02, 0x08, 0x74,
+            0x6f, 0x70, 0x69, 0x63,
+            0x2d, 0x61, 0x03, 0x00,
+            0x00, 0x00, 0x01, 0x00,
+            0x00, 0x00, 0x02, 0x00,
+            0x00, 0x00,
+        });
+    }
+
+    {
+        const AlterReplicaLogDirsResponse = generated.alter_replica_log_dirs_response.AlterReplicaLogDirsResponse;
+        const partitions = [_]AlterReplicaLogDirsResponse.AlterReplicaLogDirTopicResult.AlterReplicaLogDirPartitionResult{.{
+            .partition_index = 1,
+            .error_code = 42,
+        }};
+        const results = [_]AlterReplicaLogDirsResponse.AlterReplicaLogDirTopicResult{.{
+            .topic_name = "topic-a",
+            .partitions = &partitions,
+        }};
+        const value = AlterReplicaLogDirsResponse{
+            .throttle_time_ms = 2,
+            .results = &results,
+        };
+        try expectGoldenRoundTrip(AlterReplicaLogDirsResponse, value, 2, &[_]u8{
+            0x00, 0x00, 0x00, 0x02,
+            0x02, 0x08, 0x74, 0x6f,
+            0x70, 0x69, 0x63, 0x2d,
+            0x61, 0x02, 0x00, 0x00,
+            0x00, 0x01, 0x00, 0x2a,
+            0x00, 0x00, 0x00,
+        });
+    }
+
+    {
+        const CreateDelegationTokenRequest = generated.create_delegation_token_request.CreateDelegationTokenRequest;
+        const renewers = [_]CreateDelegationTokenRequest.CreatableRenewers{.{
+            .principal_type = "User",
+            .principal_name = "bob",
+        }};
+        const value = CreateDelegationTokenRequest{
+            .owner_principal_type = "User",
+            .owner_principal_name = "alice",
+            .renewers = &renewers,
+            .max_lifetime_ms = 1000,
+        };
+        try expectGoldenRoundTrip(CreateDelegationTokenRequest, value, 3, &[_]u8{
+            0x05, 0x55, 0x73, 0x65,
+            0x72, 0x06, 0x61, 0x6c,
+            0x69, 0x63, 0x65, 0x02,
+            0x05, 0x55, 0x73, 0x65,
+            0x72, 0x04, 0x62, 0x6f,
+            0x62, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00,
+            0x03, 0xe8, 0x00,
+        });
+    }
+
+    {
+        const CreateDelegationTokenResponse = generated.create_delegation_token_response.CreateDelegationTokenResponse;
+        const value = CreateDelegationTokenResponse{
+            .principal_type = "User",
+            .principal_name = "alice",
+            .token_requester_principal_type = "User",
+            .token_requester_principal_name = "bob",
+            .issue_timestamp_ms = 1,
+            .expiry_timestamp_ms = 2,
+            .max_timestamp_ms = 3,
+            .token_id = "token-a",
+            .hmac = &[_]u8{ 1, 2, 3 },
+            .throttle_time_ms = 4,
+        };
+        try expectGoldenRoundTrip(CreateDelegationTokenResponse, value, 3, &[_]u8{
+            0x00, 0x00, 0x05, 0x55, 0x73, 0x65, 0x72, 0x06,
+            0x61, 0x6c, 0x69, 0x63, 0x65, 0x05, 0x55, 0x73,
+            0x65, 0x72, 0x04, 0x62, 0x6f, 0x62, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x02, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x03, 0x08, 0x74,
+            0x6f, 0x6b, 0x65, 0x6e, 0x2d, 0x61, 0x04, 0x01,
+            0x02, 0x03, 0x00, 0x00, 0x00, 0x04, 0x00,
+        });
+    }
+
+    {
+        const RenewDelegationTokenRequest = generated.renew_delegation_token_request.RenewDelegationTokenRequest;
+        const value = RenewDelegationTokenRequest{
+            .hmac = &[_]u8{ 1, 2, 3 },
+            .renew_period_ms = 1000,
+        };
+        try expectGoldenRoundTrip(RenewDelegationTokenRequest, value, 2, &[_]u8{
+            0x04, 0x01, 0x02, 0x03,
+            0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x03, 0xe8,
+            0x00,
+        });
+    }
+
+    {
+        const RenewDelegationTokenResponse = generated.renew_delegation_token_response.RenewDelegationTokenResponse;
+        const value = RenewDelegationTokenResponse{
+            .expiry_timestamp_ms = 2,
+            .throttle_time_ms = 5,
+        };
+        try expectGoldenRoundTrip(RenewDelegationTokenResponse, value, 2, &[_]u8{
+            0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00,
+            0x00, 0x02, 0x00, 0x00,
+            0x00, 0x05, 0x00,
+        });
+    }
+
+    {
+        const ExpireDelegationTokenRequest = generated.expire_delegation_token_request.ExpireDelegationTokenRequest;
+        const value = ExpireDelegationTokenRequest{
+            .hmac = &[_]u8{ 1, 2, 3 },
+            .expiry_time_period_ms = 1000,
+        };
+        try expectGoldenRoundTrip(ExpireDelegationTokenRequest, value, 2, &[_]u8{
+            0x04, 0x01, 0x02, 0x03,
+            0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x03, 0xe8,
+            0x00,
+        });
+    }
+
+    {
+        const ExpireDelegationTokenResponse = generated.expire_delegation_token_response.ExpireDelegationTokenResponse;
+        const value = ExpireDelegationTokenResponse{
+            .expiry_timestamp_ms = 3,
+            .throttle_time_ms = 6,
+        };
+        try expectGoldenRoundTrip(ExpireDelegationTokenResponse, value, 2, &[_]u8{
+            0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00,
+            0x00, 0x03, 0x00, 0x00,
+            0x00, 0x06, 0x00,
+        });
+    }
+
+    {
+        const DescribeDelegationTokenResponse = generated.describe_delegation_token_response.DescribeDelegationTokenResponse;
+        const renewers = [_]DescribeDelegationTokenResponse.DescribedDelegationToken.DescribedDelegationTokenRenewer{.{
+            .principal_type = "User",
+            .principal_name = "bob",
+        }};
+        const tokens = [_]DescribeDelegationTokenResponse.DescribedDelegationToken{.{
+            .principal_type = "User",
+            .principal_name = "alice",
+            .token_requester_principal_type = "User",
+            .token_requester_principal_name = "bob",
+            .issue_timestamp = 1,
+            .expiry_timestamp = 2,
+            .max_timestamp = 3,
+            .token_id = "token-a",
+            .hmac = &[_]u8{ 1, 2, 3 },
+            .renewers = &renewers,
+        }};
+        const value = DescribeDelegationTokenResponse{
+            .tokens = &tokens,
+            .throttle_time_ms = 7,
+        };
+        try expectGoldenRoundTrip(DescribeDelegationTokenResponse, value, 3, &[_]u8{
+            0x00, 0x00, 0x02, 0x05, 0x55, 0x73, 0x65, 0x72,
+            0x06, 0x61, 0x6c, 0x69, 0x63, 0x65, 0x05, 0x55,
+            0x73, 0x65, 0x72, 0x04, 0x62, 0x6f, 0x62, 0x00,
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00,
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x02, 0x00,
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x03, 0x08,
+            0x74, 0x6f, 0x6b, 0x65, 0x6e, 0x2d, 0x61, 0x04,
+            0x01, 0x02, 0x03, 0x02, 0x05, 0x55, 0x73, 0x65,
+            0x72, 0x04, 0x62, 0x6f, 0x62, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x07, 0x00,
+        });
+    }
+
+    {
+        const AlterPartitionResponse = generated.alter_partition_response.AlterPartitionResponse;
+        const partitions = [_]AlterPartitionResponse.TopicData.PartitionData{.{
+            .partition_index = 1,
+            .error_code = 42,
+            .leader_id = 7,
+            .leader_epoch = 2,
+            .isr = &[_]i32{ 7, 8 },
+            .leader_recovery_state = 1,
+            .partition_epoch = 3,
+        }};
+        const topics = [_]AlterPartitionResponse.TopicData{.{
+            .topic_id = .{
+                0x00, 0x01, 0x02, 0x03,
+                0x04, 0x05, 0x06, 0x07,
+                0x08, 0x09, 0x0a, 0x0b,
+                0x0c, 0x0d, 0x0e, 0x0f,
+            },
+            .partitions = &partitions,
+        }};
+        const value = AlterPartitionResponse{
+            .throttle_time_ms = 8,
+            .topics = &topics,
+        };
+        try expectGoldenRoundTrip(AlterPartitionResponse, value, 3, &[_]u8{
+            0x00, 0x00, 0x00, 0x08, 0x00, 0x00, 0x02, 0x00,
+            0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08,
+            0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f, 0x02,
+            0x00, 0x00, 0x00, 0x01, 0x00, 0x2a, 0x00, 0x00,
+            0x00, 0x07, 0x00, 0x00, 0x00, 0x02, 0x03, 0x00,
+            0x00, 0x00, 0x07, 0x00, 0x00, 0x00, 0x08, 0x01,
+            0x00, 0x00, 0x00, 0x03, 0x00, 0x00, 0x00,
+        });
+    }
+
+    {
+        const EnvelopeRequest = generated.envelope_request.EnvelopeRequest;
+        const value = EnvelopeRequest{
+            .request_data = &[_]u8{ 0, 1 },
+            .request_principal = "User:alice",
+            .client_host_address = &[_]u8{ 127, 0, 0, 1 },
+        };
+        try expectGoldenRoundTrip(EnvelopeRequest, value, 0, &[_]u8{
+            0x03, 0x00, 0x01, 0x0b,
+            0x55, 0x73, 0x65, 0x72,
+            0x3a, 0x61, 0x6c, 0x69,
+            0x63, 0x65, 0x05, 0x7f,
+            0x00, 0x00, 0x01, 0x00,
+        });
+    }
+
+    {
+        const EnvelopeResponse = generated.envelope_response.EnvelopeResponse;
+        const value = EnvelopeResponse{
+            .response_data = &[_]u8{ 2, 3 },
+            .error_code = 42,
+        };
+        try expectGoldenRoundTrip(EnvelopeResponse, value, 0, &[_]u8{
+            0x03, 0x02, 0x03, 0x00,
+            0x2a, 0x00,
+        });
+    }
 }
 
 fn expectDuplicateNodeEndpointsTagRejected(comptime Message: type) !void {
