@@ -7072,6 +7072,188 @@ test "generated non-default golden fixtures cover legacy and flexible wire encod
             0x76, 0x00, 0x00, 0x00,
         });
     }
+
+    {
+        const AutomqRegisterNodeRequest = generated.automq_register_node_request.AutomqRegisterNodeRequest;
+        const tags = [_]AutomqRegisterNodeRequest.Tag{.{
+            .key = "k",
+            .value = "v",
+        }};
+        const value = AutomqRegisterNodeRequest{
+            .node_id = 7,
+            .node_epoch = 9,
+            .wal_config = "wal-a",
+            .tags = &tags,
+        };
+        try expectGoldenRoundTrip(AutomqRegisterNodeRequest, value, 0, &[_]u8{
+            0x00, 0x00, 0x00, 0x07,
+            0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x09,
+            0x06, 0x77, 0x61, 0x6c,
+            0x2d, 0x61, 0x02, 0x02,
+            0x6b, 0x02, 0x76, 0x00,
+            0x00,
+        });
+    }
+
+    {
+        const AutomqRegisterNodeResponse = generated.automq_register_node_response.AutomqRegisterNodeResponse;
+        const value = AutomqRegisterNodeResponse{
+            .throttle_time_ms = 12,
+        };
+        try expectGoldenRoundTrip(AutomqRegisterNodeResponse, value, 0, &[_]u8{
+            0x00, 0x00, 0x00, 0x00,
+            0x00, 0x0c, 0x00,
+        });
+    }
+
+    {
+        const AutomqGetNodesRequest = generated.automq_get_nodes_request.AutomqGetNodesRequest;
+        const value = AutomqGetNodesRequest{
+            .node_ids = &[_]i32{ 7, 8 },
+        };
+        try expectGoldenRoundTrip(AutomqGetNodesRequest, value, 0, &[_]u8{
+            0x03, 0x00, 0x00, 0x00,
+            0x07, 0x00, 0x00, 0x00,
+            0x08, 0x00,
+        });
+    }
+
+    {
+        const AutomqGetNodesResponse = generated.automq_get_nodes_response.AutomqGetNodesResponse;
+        const tags = [_]AutomqGetNodesResponse.NodeMetadata.Tag{.{
+            .key = "k",
+            .value = "v",
+        }};
+        const nodes = [_]AutomqGetNodesResponse.NodeMetadata{.{
+            .node_id = 7,
+            .node_epoch = 9,
+            .wal_config = "wal-a",
+            .state = "ACTIVE",
+            .has_opening_streams = true,
+            .tags = &tags,
+        }};
+        const value = AutomqGetNodesResponse{
+            .throttle_time_ms = 13,
+            .nodes = &nodes,
+        };
+        try expectGoldenRoundTrip(AutomqGetNodesResponse, value, 0, &[_]u8{
+            0x00, 0x00, 0x00, 0x00,
+            0x00, 0x0d, 0x02, 0x00,
+            0x00, 0x00, 0x07, 0x00,
+            0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x09, 0x06,
+            0x77, 0x61, 0x6c, 0x2d,
+            0x61, 0x07, 0x41, 0x43,
+            0x54, 0x49, 0x56, 0x45,
+            0x01, 0x02, 0x02, 0x6b,
+            0x02, 0x76, 0x00, 0x00,
+            0x00,
+        });
+    }
+
+    {
+        const AutomqZoneRouterRequest = generated.automq_zone_router_request.AutomqZoneRouterRequest;
+        const value = AutomqZoneRouterRequest{
+            .metadata = &[_]u8{ 1, 2, 3 },
+            .route_epoch = 9,
+            .version = 2,
+        };
+        try expectGoldenRoundTrip(AutomqZoneRouterRequest, value, 1, &[_]u8{
+            0x04, 0x01, 0x02, 0x03,
+            0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x09,
+            0x00, 0x02, 0x00,
+        });
+    }
+
+    {
+        const AutomqZoneRouterResponse = generated.automq_zone_router_response.AutomqZoneRouterResponse;
+        const responses = [_]AutomqZoneRouterResponse.Response{
+            .{ .data = &[_]u8{0xaa} },
+            .{ .data = null },
+        };
+        const value = AutomqZoneRouterResponse{
+            .throttle_time_ms = 14,
+            .responses = &responses,
+        };
+        try expectGoldenRoundTrip(AutomqZoneRouterResponse, value, 1, &[_]u8{
+            0x00, 0x00, 0x00, 0x00,
+            0x00, 0x0e, 0x03, 0x02,
+            0xaa, 0x00, 0x00, 0x00,
+            0x00,
+        });
+    }
+
+    {
+        const AutomqGetPartitionSnapshotRequest = generated.automq_get_partition_snapshot_request.AutomqGetPartitionSnapshotRequest;
+        const value = AutomqGetPartitionSnapshotRequest{
+            .session_id = 1,
+            .session_epoch = 2,
+            .request_commit = true,
+            .version = 3,
+        };
+        try expectGoldenRoundTrip(AutomqGetPartitionSnapshotRequest, value, 2, &[_]u8{
+            0x00, 0x00, 0x00, 0x01,
+            0x00, 0x00, 0x00, 0x02,
+            0x01, 0x00, 0x03, 0x00,
+        });
+    }
+
+    {
+        const ExportClusterManifestRequest = generated.export_cluster_manifest_request.ExportClusterManifestRequest;
+        const value = ExportClusterManifestRequest{};
+        try expectGoldenRoundTrip(ExportClusterManifestRequest, value, 0, &[_]u8{0x00});
+    }
+
+    {
+        const ExportClusterManifestResponse = generated.export_cluster_manifest_response.ExportClusterManifestResponse;
+        const value = ExportClusterManifestResponse{
+            .throttle_time_ms = 15,
+            .manifest = "manifest-a",
+        };
+        try expectGoldenRoundTrip(ExportClusterManifestResponse, value, 0, &[_]u8{
+            0x00, 0x00, 0x00, 0x00,
+            0x00, 0x0f, 0x0b, 0x6d,
+            0x61, 0x6e, 0x69, 0x66,
+            0x65, 0x73, 0x74, 0x2d,
+            0x61, 0x00,
+        });
+    }
+
+    {
+        const AutomqUpdateGroupRequest = generated.automq_update_group_request.AutomqUpdateGroupRequest;
+        const value = AutomqUpdateGroupRequest{
+            .link_id = "link-a",
+            .group_id = "group-a",
+            .promoted = true,
+        };
+        try expectGoldenRoundTrip(AutomqUpdateGroupRequest, value, 0, &[_]u8{
+            0x07, 0x6c, 0x69, 0x6e,
+            0x6b, 0x2d, 0x61, 0x08,
+            0x67, 0x72, 0x6f, 0x75,
+            0x70, 0x2d, 0x61, 0x01,
+            0x00,
+        });
+    }
+
+    {
+        const AutomqUpdateGroupResponse = generated.automq_update_group_response.AutomqUpdateGroupResponse;
+        const value = AutomqUpdateGroupResponse{
+            .group_id = "group-a",
+            .error_code = 42,
+            .error_message = "denied",
+            .throttle_time_ms = 16,
+        };
+        try expectGoldenRoundTrip(AutomqUpdateGroupResponse, value, 0, &[_]u8{
+            0x08, 0x67, 0x72, 0x6f,
+            0x75, 0x70, 0x2d, 0x61,
+            0x00, 0x2a, 0x07, 0x64,
+            0x65, 0x6e, 0x69, 0x65,
+            0x64, 0x00, 0x00, 0x00,
+            0x10, 0x00,
+        });
+    }
 }
 
 fn expectDuplicateNodeEndpointsTagRejected(comptime Message: type) !void {
