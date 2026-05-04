@@ -3565,6 +3565,130 @@ test "generated non-default golden fixtures cover legacy and flexible wire encod
     }
 
     {
+        const GetTelemetrySubscriptionsRequest = generated.get_telemetry_subscriptions_request.GetTelemetrySubscriptionsRequest;
+        const value = GetTelemetrySubscriptionsRequest{
+            .client_instance_id = .{
+                0x00, 0x11, 0x22, 0x33,
+                0x44, 0x55, 0x66, 0x77,
+                0x88, 0x99, 0xaa, 0xbb,
+                0xcc, 0xdd, 0xee, 0xff,
+            },
+        };
+        try expectGoldenRoundTrip(GetTelemetrySubscriptionsRequest, value, 0, &[_]u8{
+            0x00, 0x11, 0x22, 0x33,
+            0x44, 0x55, 0x66, 0x77,
+            0x88, 0x99, 0xaa, 0xbb,
+            0xcc, 0xdd, 0xee, 0xff,
+            0x00,
+        });
+    }
+
+    {
+        const GetTelemetrySubscriptionsResponse = generated.get_telemetry_subscriptions_response.GetTelemetrySubscriptionsResponse;
+        const requested_metrics = [_]?[]const u8{ "", "kafka.server" };
+        const value = GetTelemetrySubscriptionsResponse{
+            .throttle_time_ms = 7,
+            .error_code = 0,
+            .client_instance_id = .{
+                0x00, 0x11, 0x22, 0x33,
+                0x44, 0x55, 0x66, 0x77,
+                0x88, 0x99, 0xaa, 0xbb,
+                0xcc, 0xdd, 0xee, 0xff,
+            },
+            .subscription_id = 42,
+            .accepted_compression_types = &[_]i8{ 0, 1 },
+            .push_interval_ms = 5000,
+            .telemetry_max_bytes = 1_048_576,
+            .delta_temporality = true,
+            .requested_metrics = &requested_metrics,
+        };
+        try expectGoldenRoundTrip(GetTelemetrySubscriptionsResponse, value, 0, &[_]u8{
+            0x00, 0x00, 0x00, 0x07,
+            0x00, 0x00, 0x00, 0x11,
+            0x22, 0x33, 0x44, 0x55,
+            0x66, 0x77, 0x88, 0x99,
+            0xaa, 0xbb, 0xcc, 0xdd,
+            0xee, 0xff, 0x00, 0x00,
+            0x00, 0x2a, 0x03, 0x00,
+            0x01, 0x00, 0x00, 0x13,
+            0x88, 0x00, 0x10, 0x00,
+            0x00, 0x01, 0x03, 0x01,
+            0x0d, 'k',  'a',  'f',
+            'k',  'a',  '.',  's',
+            'e',  'r',  'v',  'e',
+            'r',  0x00,
+        });
+    }
+
+    {
+        const PushTelemetryRequest = generated.push_telemetry_request.PushTelemetryRequest;
+        const value = PushTelemetryRequest{
+            .client_instance_id = .{
+                0x00, 0x11, 0x22, 0x33,
+                0x44, 0x55, 0x66, 0x77,
+                0x88, 0x99, 0xaa, 0xbb,
+                0xcc, 0xdd, 0xee, 0xff,
+            },
+            .subscription_id = 42,
+            .terminating = true,
+            .compression_type = 1,
+            .metrics = &[_]u8{ 0xde, 0xad, 0xbe, 0xef },
+        };
+        try expectGoldenRoundTrip(PushTelemetryRequest, value, 0, &[_]u8{
+            0x00, 0x11, 0x22, 0x33,
+            0x44, 0x55, 0x66, 0x77,
+            0x88, 0x99, 0xaa, 0xbb,
+            0xcc, 0xdd, 0xee, 0xff,
+            0x00, 0x00, 0x00, 0x2a,
+            0x01, 0x01, 0x05, 0xde,
+            0xad, 0xbe, 0xef, 0x00,
+        });
+    }
+
+    {
+        const PushTelemetryResponse = generated.push_telemetry_response.PushTelemetryResponse;
+        const value = PushTelemetryResponse{
+            .throttle_time_ms = 7,
+            .error_code = 0,
+        };
+        try expectGoldenRoundTrip(PushTelemetryResponse, value, 0, &[_]u8{
+            0x00, 0x00, 0x00, 0x07,
+            0x00, 0x00, 0x00,
+        });
+    }
+
+    {
+        const ListClientMetricsResourcesRequest = generated.list_client_metrics_resources_request.ListClientMetricsResourcesRequest;
+        const value = ListClientMetricsResourcesRequest{};
+        try expectGoldenRoundTrip(ListClientMetricsResourcesRequest, value, 0, &[_]u8{
+            0x00,
+        });
+    }
+
+    {
+        const ListClientMetricsResourcesResponse = generated.list_client_metrics_resources_response.ListClientMetricsResourcesResponse;
+        const resources = [_]ListClientMetricsResourcesResponse.ClientMetricsResource{
+            .{ .name = "__default__" },
+            .{ .name = "client-A" },
+        };
+        const value = ListClientMetricsResourcesResponse{
+            .throttle_time_ms = 7,
+            .error_code = 0,
+            .client_metrics_resources = &resources,
+        };
+        try expectGoldenRoundTrip(ListClientMetricsResourcesResponse, value, 0, &[_]u8{
+            0x00, 0x00, 0x00, 0x07,
+            0x00, 0x00, 0x03, 0x0c,
+            '_',  '_',  'd',  'e',
+            'f',  'a',  'u',  'l',
+            't',  '_',  '_',  0x00,
+            0x09, 'c',  'l',  'i',
+            'e',  'n',  't',  '-',
+            'A',  0x00, 0x00,
+        });
+    }
+
+    {
         const AddPartitionsToTxnRequest = generated.add_partitions_to_txn_request.AddPartitionsToTxnRequest;
         const AddPartitionsToTxnTopic = generated.add_partitions_to_txn_request.AddPartitionsToTxnTopic;
         const topics = [_]AddPartitionsToTxnTopic{.{

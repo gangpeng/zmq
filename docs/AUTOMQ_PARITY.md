@@ -45,6 +45,7 @@ operator-facing behavior.
   SaslHandshake v1, SaslAuthenticate v2,
   JoinGroup v5/v9, SyncGroup v3/v5, Heartbeat v3/v4, LeaveGroup v2/v5,
   ListGroups v2/v5, DescribeGroups v4/v5,
+  GetTelemetrySubscriptions/PushTelemetry/ListClientMetricsResources v0,
   AssignReplicasToDirs v0, ShareFetch/ShareAcknowledge v0,
   Initialize/Read/Write/DeleteShareGroupState and ReadShareGroupStateSummary
   v0, ConsumerGroupDescribe v0, OffsetCommit v1/v8, OffsetFetch v7/v8,
@@ -64,6 +65,7 @@ operator-facing behavior.
   leader-epoch end offsets, delete-records low-watermarks, compact record
   bytes, SASL mechanism arrays/auth bytes/session lifetime, classic group
   membership metadata/assignments/static identities/state/type filters,
+  telemetry UUID/compression/metric-prefix/payload resource fields,
   transaction filters/results, flexible encodings, and tagged-field
   terminators.
 
