@@ -15,10 +15,14 @@ Optional environment:
     ZMQ_BIN                         ./zig-out/bin/zmq
     ZMQ_KRAFT_CONTROLLER_PORT_BASE  39093
     ZMQ_KRAFT_BROKER_PORT           39092
+    ZMQ_KRAFT_NETWORK_DOWN          command run to inject controller/broker partition
+    ZMQ_KRAFT_NETWORK_UP            command run to heal controller/broker partition
+    ZMQ_KRAFT_NETWORK_EXPECT        "fail" (default) or "survive" for Produce during partition
 """
 
 import json
 import os
+import shlex
 import shutil
 import socket
 import struct
@@ -608,6 +612,81 @@ def wait_for_payloads(port, topic, payloads, timeout=30):
         f"missing payloads after fetch retry: {missing!r}; "
         f"last_high_watermark={last_high_watermark}"
     )
+
+
+def network_hooks_configured():
+    return bool(os.environ.get("ZMQ_KRAFT_NETWORK_DOWN") or os.environ.get("ZMQ_KRAFT_NETWORK_UP"))
+
+
+def hook_context_env(processes, broker, leader_id):
+    env = os.environ.copy()
+    env["ZMQ_KRAFT_ACTIVE_LEADER_ID"] = str(leader_id)
+    env["ZMQ_KRAFT_CONTROLLER_PORTS"] = ",".join(
+        f"{node_id}:{info['port']}" for node_id, info in sorted(processes.items())
+    )
+    env["ZMQ_KRAFT_CONTROLLER_PIDS"] = ",".join(
+        f"{node_id}:{info['proc'].pid}" for node_id, info in sorted(processes.items())
+    )
+    if broker is not None:
+        env["ZMQ_KRAFT_BROKER_PORT"] = str(broker["port"])
+        env["ZMQ_KRAFT_BROKER_PID"] = str(broker["proc"].pid)
+    return env
+
+
+def run_network_hook(env_name, env):
+    raw = os.environ.get(env_name)
+    if not raw:
+        raise TestError(f"{env_name} is required for KRaft network partition gate")
+    proc = subprocess.run(
+        shlex.split(raw),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        timeout=60,
+        env=env,
+    )
+    if proc.returncode != 0:
+        raise TestError(f"{env_name} failed with exit code {proc.returncode}\n{proc.stdout}")
+
+
+def run_network_partition_probe(processes, broker, topic, expected_payloads, leader_id):
+    if not network_hooks_configured():
+        return None
+    if not os.environ.get("ZMQ_KRAFT_NETWORK_DOWN") or not os.environ.get("ZMQ_KRAFT_NETWORK_UP"):
+        raise TestError("KRaft network partition gate requires both ZMQ_KRAFT_NETWORK_DOWN and ZMQ_KRAFT_NETWORK_UP")
+    expect = os.environ.get("ZMQ_KRAFT_NETWORK_EXPECT", "fail")
+    if expect not in ("fail", "survive"):
+        raise TestError(f"invalid ZMQ_KRAFT_NETWORK_EXPECT={expect!r}")
+
+    hook_env = hook_context_env(processes, broker, leader_id)
+    payload = b"r-network-partition"
+    healed = False
+    survived = False
+    try:
+        run_network_hook("ZMQ_KRAFT_NETWORK_DOWN", hook_env)
+        try:
+            wait_for_produce(broker["port"], topic, payload, timeout=8)
+            survived = True
+        except Exception:
+            survived = False
+        if expect == "fail" and survived:
+            raise TestError("network partition produce unexpectedly succeeded")
+        if expect == "survive" and not survived:
+            raise TestError("network partition produce unexpectedly failed")
+        if survived:
+            expected_payloads.append(payload)
+    finally:
+        run_network_hook("ZMQ_KRAFT_NETWORK_UP", hook_env)
+        healed = True
+
+    healed_leader, _ = wait_for_leader(processes)
+    wait_for_all_alive_to_report(processes, healed_leader)
+    wait_for_broker_ready(broker["proc"], broker["port"], broker["log_path"])
+    wait_for_payloads(broker["port"], topic, expected_payloads)
+    expected_payloads.append(b"r-network-healed")
+    wait_for_produce(broker["port"], topic, expected_payloads[-1])
+    wait_for_payloads(broker["port"], topic, expected_payloads)
+    return {"leader_id": healed_leader, "expect": expect, "survived": survived, "healed": healed}
 
 
 def automq_put_kv(port, key, value, correlation_id, overwrite=True):
@@ -2438,6 +2517,12 @@ def main():
         first_offset = wait_for_produce(broker["port"], topic, expected_payloads[-1])
         wait_for_payloads(broker["port"], topic, expected_payloads)
 
+        network_partition_result = run_network_partition_probe(
+            processes, broker, topic, expected_payloads, leader_id
+        )
+        if network_partition_result is not None:
+            leader_id, initial = wait_for_leader(processes)
+
         stop_process(processes[leader_id]["proc"], crash=True)
         replacement_leader, after = wait_for_leader(processes, forbidden_leaders={leader_id})
         alive = {node_id for node_id, info in processes.items() if info["proc"].poll() is None}
@@ -2545,6 +2630,7 @@ def main():
             f"reassignment_topic={automq_result['reassignment_topic']}, "
             f"reassignment_target={automq_result['reassignment_target']}, "
             f"reassignment_target_offset={automq_result['reassignment_target_offset']}, "
+            f"network_partition={network_partition_result}, "
             f"automq_old_leader_fresh_rejoin={automq_result['old_leader_fresh_rejoin']})"
         )
         return 0
@@ -2556,8 +2642,50 @@ def main():
         shutil.rmtree(tmp, ignore_errors=True)
 
 
+def self_test():
+    class DummyProc:
+        def __init__(self, pid):
+            self.pid = pid
+
+    old_env = os.environ.copy()
+    try:
+        os.environ.pop("ZMQ_KRAFT_NETWORK_DOWN", None)
+        os.environ.pop("ZMQ_KRAFT_NETWORK_UP", None)
+        if network_hooks_configured():
+            raise TestError("network hooks unexpectedly configured")
+
+        os.environ["ZMQ_KRAFT_NETWORK_DOWN"] = "true"
+        os.environ["ZMQ_KRAFT_NETWORK_UP"] = "true"
+        if not network_hooks_configured():
+            raise TestError("network hooks were not detected")
+
+        processes = {
+            0: {"proc": DummyProc(1000), "port": 39093},
+            1: {"proc": DummyProc(1001), "port": 39094},
+            2: {"proc": DummyProc(1002), "port": 39095},
+        }
+        broker = {"proc": DummyProc(2000), "port": 39092}
+        env = hook_context_env(processes, broker, 1)
+        if env["ZMQ_KRAFT_ACTIVE_LEADER_ID"] != "1":
+            raise TestError("hook leader context failed")
+        if env["ZMQ_KRAFT_CONTROLLER_PORTS"] != "0:39093,1:39094,2:39095":
+            raise TestError("hook controller port context failed")
+        if env["ZMQ_KRAFT_BROKER_PID"] != "2000":
+            raise TestError("hook broker pid context failed")
+        run_network_hook("ZMQ_KRAFT_NETWORK_DOWN", env)
+        run_network_hook("ZMQ_KRAFT_NETWORK_UP", env)
+
+        print("ok: KRaft failover harness self-test")
+        return 0
+    finally:
+        os.environ.clear()
+        os.environ.update(old_env)
+
+
 if __name__ == "__main__":
     try:
+        if "--self-test" in sys.argv:
+            sys.exit(self_test())
         sys.exit(main())
     except TestError as exc:
         print(f"FAIL: {exc}", file=sys.stderr)

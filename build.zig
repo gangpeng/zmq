@@ -440,6 +440,9 @@ pub fn build(b: *std.Build) void {
         const run_kraft_failover = b.addSystemCommand(&.{ "python3", "tests/kraft_failover_test.py" });
         run_kraft_failover.step.dependOn(b.getInstallStep());
         kraft_failover_step.dependOn(&run_kraft_failover.step);
+
+        const kraft_failover_self_test = b.addSystemCommand(&.{ "python3", "tests/kraft_failover_test.py", "--self-test" });
+        test_step.dependOn(&kraft_failover_self_test.step);
     }
 
     // External broker chaos harness. The real process scenarios skip unless
