@@ -1342,23 +1342,40 @@ test "generated non-default golden fixtures cover legacy and flexible wire encod
             0x00, 0x00,
             0x00, 0x00,
             0x2a, 0x05,
-            0x00, 0x17, 0x02, 0x11,
-            'm',  'e',  't',  'a',
-            'd',  'a',  't',  'a',
-            '.',  'v',  'e',  'r',
-            's',  'i',  'o',  'n',
-            0x00, 0x00, 0x00, 0x04,
-            0x00, 0x01, 0x08, 0x00,
-            0x00, 0x00, 0x00, 0x00,
-            0x00, 0x00, 0x2a, 0x02,
-            0x17, 0x02, 0x11, 'm',
-            'e',  't',  'a',  'd',
-            'a',  't',  'a',  '.',
-            'v',  'e',  'r',  's',
-            'i',  'o',  'n',  0x00,
-            0x04, 0x00, 0x01, 0x00,
-            0x03, 0x01, 0x01, 0x09,
-            0x02, 0xaa, 0xbb,
+            0x00, 0x17,
+            0x02, 0x11,
+            'm',  'e',
+            't',  'a',
+            'd',  'a',
+            't',  'a',
+            '.',  'v',
+            'e',  'r',
+            's',  'i',
+            'o',  'n',
+            0x00, 0x00,
+            0x00, 0x04,
+            0x00, 0x01,
+            0x08, 0x00,
+            0x00, 0x00,
+            0x00, 0x00,
+            0x00, 0x00,
+            0x2a, 0x02,
+            0x17, 0x02,
+            0x11, 'm',
+            'e',  't',
+            'a',  'd',
+            'a',  't',
+            'a',  '.',
+            'v',  'e',
+            'r',  's',
+            'i',  'o',
+            'n',  0x00,
+            0x04, 0x00,
+            0x01, 0x00,
+            0x03, 0x01,
+            0x01, 0x09,
+            0x02, 0xaa,
+            0xbb,
         });
     }
 
@@ -1398,8 +1415,8 @@ test "generated non-default golden fixtures cover legacy and flexible wire encod
             .include_authorized_operations = true,
         };
         try expectGoldenRoundTrip(ConsumerGroupDescribeRequest, value, 0, &[_]u8{
-            0x03, 0x08, 'g',  'r',  'o',  'u',  'p',  '-',
-            'a',  0x08, 'g',  'r',  'o',  'u',  'p',  '-',
+            0x03, 0x08, 'g',  'r', 'o', 'u', 'p', '-',
+            'a',  0x08, 'g',  'r', 'o', 'u', 'p', '-',
             'b',  0x01, 0x00,
         });
     }
@@ -1545,6 +1562,149 @@ test "generated non-default golden fixtures cover legacy and flexible wire encod
             .topics = &topics,
         };
         try expectGoldenRoundTrip(OffsetCommitResponse, value, 8, &[_]u8{
+            0x00, 0x00, 0x00, 0x05, 0x02, 0x08, 't',  'o',
+            'p',  'i',  'c',  '-',  'a',  0x03, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x02, 0x00, 0x1e, 0x00, 0x00, 0x00,
+        });
+    }
+
+    {
+        const OffsetFetchResponse = generated.offset_fetch_response.OffsetFetchResponse;
+        const partitions = [_]OffsetFetchResponse.OffsetFetchResponseTopic.OffsetFetchResponsePartition{
+            .{
+                .partition_index = 0,
+                .committed_offset = 42,
+                .committed_leader_epoch = 9,
+                .metadata = "meta-a",
+                .error_code = 0,
+            },
+            .{
+                .partition_index = 2,
+                .committed_offset = -1,
+                .committed_leader_epoch = -1,
+                .metadata = null,
+                .error_code = 3,
+            },
+        };
+        const topics = [_]OffsetFetchResponse.OffsetFetchResponseTopic{.{
+            .name = "topic-a",
+            .partitions = &partitions,
+        }};
+        const value = OffsetFetchResponse{
+            .throttle_time_ms = 5,
+            .topics = &topics,
+            .error_code = 0,
+        };
+        try expectGoldenRoundTrip(OffsetFetchResponse, value, 7, &[_]u8{
+            0x00, 0x00, 0x00, 0x05, 0x02, 0x08, 't',  'o',
+            'p',  'i',  'c',  '-',  'a',  0x03, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x2a, 0x00, 0x00, 0x00, 0x09, 0x07, 'm',
+            'e',  't',  'a',  '-',  'a',  0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x02, 0xff, 0xff, 0xff, 0xff,
+            0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+            0x00, 0x00, 0x03, 0x00, 0x00, 0x00, 0x00, 0x00,
+        });
+    }
+
+    {
+        const OffsetFetchResponse = generated.offset_fetch_response.OffsetFetchResponse;
+        const partitions = [_]OffsetFetchResponse.OffsetFetchResponseGroup.OffsetFetchResponseTopics.OffsetFetchResponsePartitions{
+            .{
+                .partition_index = 0,
+                .committed_offset = 42,
+                .committed_leader_epoch = 9,
+                .metadata = "meta-a",
+                .error_code = 0,
+            },
+            .{
+                .partition_index = 2,
+                .committed_offset = -1,
+                .committed_leader_epoch = -1,
+                .metadata = null,
+                .error_code = 3,
+            },
+        };
+        const topics = [_]OffsetFetchResponse.OffsetFetchResponseGroup.OffsetFetchResponseTopics{.{
+            .name = "topic-a",
+            .partitions = &partitions,
+        }};
+        const groups = [_]OffsetFetchResponse.OffsetFetchResponseGroup{.{
+            .group_id = "group-a",
+            .topics = &topics,
+            .error_code = 0,
+        }};
+        const value = OffsetFetchResponse{
+            .throttle_time_ms = 5,
+            .groups = &groups,
+        };
+        try expectGoldenRoundTrip(OffsetFetchResponse, value, 8, &[_]u8{
+            0x00, 0x00, 0x00, 0x05, 0x02, 0x08, 'g',  'r',
+            'o',  'u',  'p',  '-',  'a',  0x02, 0x08, 't',
+            'o',  'p',  'i',  'c',  '-',  'a',  0x03, 0x00,
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x2a, 0x00, 0x00, 0x00, 0x09, 0x07,
+            'm',  'e',  't',  'a',  '-',  'a',  0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00, 0x02, 0xff, 0xff, 0xff,
+            0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+            0xff, 0x00, 0x00, 0x03, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00,
+        });
+    }
+
+    {
+        const TxnOffsetCommitRequest = generated.txn_offset_commit_request.TxnOffsetCommitRequest;
+        const partitions = [_]TxnOffsetCommitRequest.TxnOffsetCommitRequestTopic.TxnOffsetCommitRequestPartition{.{
+            .partition_index = 2,
+            .committed_offset = 42,
+            .committed_leader_epoch = 9,
+            .committed_metadata = "meta-a",
+        }};
+        const topics = [_]TxnOffsetCommitRequest.TxnOffsetCommitRequestTopic{.{
+            .name = "topic-a",
+            .partitions = &partitions,
+        }};
+        const value = TxnOffsetCommitRequest{
+            .transactional_id = "txn-a",
+            .group_id = "group-a",
+            .producer_id = 123456789,
+            .producer_epoch = 2,
+            .generation_id = 7,
+            .member_id = "member-a",
+            .group_instance_id = "instance-a",
+            .topics = &topics,
+        };
+        try expectGoldenRoundTrip(TxnOffsetCommitRequest, value, 3, &[_]u8{
+            0x06, 't',  'x',  'n',  '-',  'a',  0x08, 'g',
+            'r',  'o',  'u',  'p',  '-',  'a',  0x00, 0x00,
+            0x00, 0x00, 0x07, 0x5b, 0xcd, 0x15, 0x00, 0x02,
+            0x00, 0x00, 0x00, 0x07, 0x09, 'm',  'e',  'm',
+            'b',  'e',  'r',  '-',  'a',  0x0b, 'i',  'n',
+            's',  't',  'a',  'n',  'c',  'e',  '-',  'a',
+            0x02, 0x08, 't',  'o',  'p',  'i',  'c',  '-',
+            'a',  0x02, 0x00, 0x00, 0x00, 0x02, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x2a, 0x00, 0x00,
+            0x00, 0x09, 0x07, 'm',  'e',  't',  'a',  '-',
+            'a',  0x00, 0x00, 0x00,
+        });
+    }
+
+    {
+        const TxnOffsetCommitResponse = generated.txn_offset_commit_response.TxnOffsetCommitResponse;
+        const partitions = [_]TxnOffsetCommitResponse.TxnOffsetCommitResponseTopic.TxnOffsetCommitResponsePartition{
+            .{ .partition_index = 0, .error_code = 0 },
+            .{ .partition_index = 2, .error_code = 30 },
+        };
+        const topics = [_]TxnOffsetCommitResponse.TxnOffsetCommitResponseTopic{.{
+            .name = "topic-a",
+            .partitions = &partitions,
+        }};
+        const value = TxnOffsetCommitResponse{
+            .throttle_time_ms = 5,
+            .topics = &topics,
+        };
+        try expectGoldenRoundTrip(TxnOffsetCommitResponse, value, 3, &[_]u8{
             0x00, 0x00, 0x00, 0x05, 0x02, 0x08, 't',  'o',
             'p',  'i',  'c',  '-',  'a',  0x03, 0x00, 0x00,
             0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
