@@ -124,6 +124,13 @@ def write_compact_array_len(count):
     return write_varint(count + 1)
 
 
+def write_compact_i32_array(values):
+    out = bytearray(write_compact_array_len(len(values)))
+    for value in values:
+        out += struct.pack('>i', value)
+    return bytes(out)
+
+
 def read_exact(sock, size):
     data = bytearray()
     while len(data) < size:
@@ -184,6 +191,32 @@ def read_compact_array_len(buf, pos):
     return raw_len - 1, pos
 
 
+def read_i32_array(buf, pos):
+    count, pos = read_i32(buf, pos)
+    if count < 0:
+        return None, pos
+    values = []
+    for _ in range(count):
+        value, pos = read_i32(buf, pos)
+        values.append(value)
+    return values, pos
+
+
+def read_compact_i32_array(buf, pos):
+    count, pos = read_compact_array_len(buf, pos)
+    values = []
+    for _ in range(count):
+        value, pos = read_i32(buf, pos)
+        values.append(value)
+    return values, pos
+
+
+def read_bool(buf, pos):
+    if pos >= len(buf):
+        raise RuntimeError("buffer underflow while reading bool")
+    return buf[pos] != 0, pos + 1
+
+
 def skip_tags(buf, pos):
     count, pos = read_varint(buf, pos)
     for _ in range(count):
@@ -209,6 +242,15 @@ def controller_request(port, api_key, api_version, correlation_id, body=b'', tim
         if response_size <= 0 or response_size > 1024 * 1024:
             raise RuntimeError(f"invalid response frame size {response_size}")
         return read_exact(sock, response_size)
+
+
+def parse_flexible_response_header(response, correlation_id):
+    pos = 0
+    response_corr, pos = read_i32(response, pos)
+    if response_corr != correlation_id:
+        raise RuntimeError(f"correlation mismatch: {response_corr} != {correlation_id}")
+    pos = skip_tags(response, pos)
+    return pos
 
 
 def describe_quorum_body():
@@ -417,6 +459,151 @@ def metadata_request(sock, corr_id):
     return topics
 
 
+def metadata_partition_leader(port, corr_id, topic):
+    topic_b = topic.encode()
+    body = struct.pack('>i', 1) + struct.pack('>h', len(topic_b)) + topic_b
+    with socket.create_connection(('127.0.0.1', port), timeout=5) as sock:
+        sock.settimeout(5)
+        data = kafka_request(sock, 3, 1, corr_id, body)
+    if data is None or len(data) < 10:
+        raise RuntimeError("Metadata response too short")
+
+    pos = 4
+    num_brokers = struct.unpack_from('>i', data, pos)[0]
+    pos += 4
+    for _ in range(max(num_brokers, 0)):
+        pos += 4
+        host_len = struct.unpack_from('>h', data, pos)[0]
+        pos += 2 + max(host_len, 0) + 4
+    cid_len = struct.unpack_from('>h', data, pos)[0]
+    pos += 2 + max(cid_len, 0) + 4
+    num_topics = struct.unpack_from('>i', data, pos)[0]
+    pos += 4
+    if num_topics != 1:
+        raise RuntimeError(f"Metadata topic count={num_topics}")
+
+    topic_error = struct.unpack_from('>h', data, pos)[0]
+    pos += 2
+    topic_len = struct.unpack_from('>h', data, pos)[0]
+    pos += 2
+    topic_name = data[pos:pos+topic_len].decode('utf-8', errors='replace')
+    pos += topic_len
+    pos += 1  # is_internal
+    partition_count = struct.unpack_from('>i', data, pos)[0]
+    pos += 4
+    if topic_error != 0 or topic_name != topic or partition_count != 1:
+        raise RuntimeError(
+            f"Metadata topic={topic_name!r} error={topic_error} partitions={partition_count}"
+        )
+
+    partition_error = struct.unpack_from('>h', data, pos)[0]
+    pos += 2
+    partition_index = struct.unpack_from('>i', data, pos)[0]
+    pos += 4
+    leader_id = struct.unpack_from('>i', data, pos)[0]
+    pos += 4
+    replicas, pos = read_i32_array(data, pos)
+    isr, pos = read_i32_array(data, pos)
+    if partition_error != 0 or partition_index != 0:
+        raise RuntimeError(f"Metadata partition={partition_index} error={partition_error}")
+    return {"leader_id": leader_id, "replicas": replicas, "isr": isr}
+
+
+def wait_for_metadata_leader(t, port, topic, expected_leader, timeout=30):
+    deadline = time.time() + timeout
+    last_detail = ""
+    while time.time() < deadline:
+        try:
+            metadata = metadata_partition_leader(port, t.next(), topic)
+            if metadata["leader_id"] == expected_leader:
+                return metadata
+            last_detail = f"leader={metadata['leader_id']} expected={expected_leader}"
+        except Exception as exc:
+            last_detail = str(exc)
+        time.sleep(0.25)
+    raise RuntimeError(f"metadata leader did not converge for {topic}: {last_detail}")
+
+
+def alter_partition_reassignment(port, corr_id, topic, partition, replicas):
+    body = struct.pack('>i', 30000)
+    body += write_compact_array_len(1)
+    body += write_compact_string(topic)
+    body += write_compact_array_len(1)
+    body += struct.pack('>i', partition)
+    body += write_compact_i32_array(replicas) if replicas is not None else b'\x00'
+    body += b'\x00'  # partition tagged fields
+    body += b'\x00'  # topic tagged fields
+    body += b'\x00'  # request tagged fields
+
+    response = controller_request(port, 45, 0, corr_id, body)
+    pos = parse_flexible_response_header(response, corr_id)
+    _, pos = read_i32(response, pos)  # throttle_time_ms
+    top_error, pos = read_i16(response, pos)
+    _, pos = read_compact_string(response, pos)  # error_message
+    topics_len, pos = read_compact_array_len(response, pos)
+    if top_error != 0 or topics_len != 1:
+        raise RuntimeError(f"AlterPartitionReassignments top_error={top_error} topics={topics_len}")
+    topic_name, pos = read_compact_string(response, pos)
+    partitions_len, pos = read_compact_array_len(response, pos)
+    if topic_name != topic or partitions_len != 1:
+        raise RuntimeError(f"AlterPartitionReassignments topic={topic_name!r} partitions={partitions_len}")
+    response_partition, pos = read_i32(response, pos)
+    partition_error, pos = read_i16(response, pos)
+    _, pos = read_compact_string(response, pos)  # error_message
+    if response_partition != partition or partition_error != 0:
+        raise RuntimeError(f"AlterPartitionReassignments partition={response_partition} error={partition_error}")
+
+
+def list_partition_reassignment(port, corr_id, topic, partition):
+    body = struct.pack('>i', 30000)
+    body += write_compact_array_len(1)
+    body += write_compact_string(topic)
+    body += write_compact_i32_array([partition])
+    body += b'\x00'  # topic tagged fields
+    body += b'\x00'  # request tagged fields
+
+    response = controller_request(port, 46, 0, corr_id, body)
+    pos = parse_flexible_response_header(response, corr_id)
+    _, pos = read_i32(response, pos)  # throttle_time_ms
+    top_error, pos = read_i16(response, pos)
+    _, pos = read_compact_string(response, pos)  # error_message
+    topics_len, pos = read_compact_array_len(response, pos)
+    if top_error != 0:
+        raise RuntimeError(f"ListPartitionReassignments top_error={top_error}")
+    if topics_len == 0:
+        return None
+    topic_name, pos = read_compact_string(response, pos)
+    partitions_len, pos = read_compact_array_len(response, pos)
+    if topic_name != topic or partitions_len == 0:
+        return None
+    response_partition, pos = read_i32(response, pos)
+    replicas, pos = read_compact_i32_array(response, pos)
+    adding, pos = read_compact_i32_array(response, pos)
+    removing, pos = read_compact_i32_array(response, pos)
+    if response_partition != partition:
+        return None
+    return {"replicas": replicas, "adding": adding, "removing": removing}
+
+
+def wait_for_partition_reassignment(t, port, topic, partition, expected_replicas, timeout=30):
+    deadline = time.time() + timeout
+    last_state = None
+    last_detail = ""
+    while time.time() < deadline:
+        try:
+            last_state = list_partition_reassignment(port, t.next(), topic, partition)
+            if last_state is not None and last_state["replicas"] == expected_replicas:
+                return last_state
+            last_detail = f"state={last_state}"
+        except Exception as exc:
+            last_detail = str(exc)
+        time.sleep(0.25)
+    raise RuntimeError(
+        f"partition reassignment did not converge to {expected_replicas}: "
+        f"last_state={last_state} last_detail={last_detail}"
+    )
+
+
 # ---------------------------------------------------------------
 # Cross-broker chaos gate helpers
 # ---------------------------------------------------------------
@@ -576,7 +763,7 @@ def run_cross_broker_chaos(t, topic):
     if not phases:
         return
 
-    print("\n[Test l] Cross-broker chaos phases")
+    print("\n[Test m] Cross-broker chaos phases")
     for index, phase in enumerate(phases):
         env = e2e_chaos_hook_env(phase, index, topic)
         healed = False
@@ -700,7 +887,7 @@ def run_e2e_load_scale_phases(t, topic):
     if not phases:
         return
 
-    print("\n[Test m] Live load/scale phases")
+    print("\n[Test n] Live load/scale phases")
     for index, phase in enumerate(phases):
         env = e2e_load_scale_hook_env(phase, index, topic)
         restored = False
@@ -1216,6 +1403,111 @@ def main():
         sock.close()
     except Exception as e:
         t.check("Fetch from node 2", False, str(e))
+
+    # =============================================
+    # Test (l): Partition reassignment convergence
+    # =============================================
+    print("\n[Test l] Partition reassignment convergence")
+    reassign_topic = f"e2e-reassign-{os.getpid()}"
+    source_node = 1
+    target_node = 2
+    try:
+        sock = t.connect(NODES[source_node]["broker_port"])
+        err = create_topic(sock, t.next(), reassign_topic, 1)
+        sock.close()
+        t.check(f"Create {reassign_topic} on node {source_node}", err == 0 or err == 36, f"err={err}")
+    except Exception as e:
+        t.check("Create reassignment topic", False, str(e))
+
+    try:
+        metadata = wait_for_metadata_leader(
+            t,
+            NODES[source_node]["broker_port"],
+            reassign_topic,
+            source_node,
+        )
+        t.check(
+            f"Metadata leader starts on node {source_node}",
+            metadata["leader_id"] == source_node,
+            f"metadata={metadata}",
+        )
+    except Exception as e:
+        t.check("Metadata leader starts on source", False, str(e))
+
+    before_payload = b"reassign-before"
+    try:
+        sock = t.connect(NODES[source_node]["broker_port"])
+        err, off = produce(sock, t.next(), reassign_topic, 0, before_payload)
+        sock.close()
+        t.check(f"Produce on source before reassignment: offset={off}", err == 0)
+    except Exception as e:
+        t.check("Produce on source before reassignment", False, str(e))
+
+    try:
+        alter_partition_reassignment(
+            NODES[source_node]["broker_port"],
+            t.next(),
+            reassign_topic,
+            0,
+            [target_node],
+        )
+        state = wait_for_partition_reassignment(
+            t,
+            NODES[source_node]["broker_port"],
+            reassign_topic,
+            0,
+            [target_node],
+        )
+        t.check(
+            f"ListPartitionReassignments shows target node {target_node}",
+            state["replicas"] == [target_node],
+            f"state={state}",
+        )
+    except Exception as e:
+        t.check("Alter/ListPartitionReassignments", False, str(e))
+
+    try:
+        source_metadata = wait_for_metadata_leader(
+            t,
+            NODES[source_node]["broker_port"],
+            reassign_topic,
+            target_node,
+        )
+        target_metadata = wait_for_metadata_leader(
+            t,
+            NODES[target_node]["broker_port"],
+            reassign_topic,
+            target_node,
+        )
+        t.check(
+            f"Metadata converges to target node {target_node}",
+            source_metadata["leader_id"] == target_node and target_metadata["leader_id"] == target_node,
+            f"source={source_metadata} target={target_metadata}",
+        )
+    except Exception as e:
+        t.check("Metadata converges after reassignment", False, str(e))
+
+    try:
+        sock = t.connect(NODES[source_node]["broker_port"])
+        err, _ = produce(sock, t.next(), reassign_topic, 0, b"old-owner-rejected")
+        sock.close()
+        t.check("Old owner rejects Produce after reassignment", err == 6, f"err={err}")
+    except Exception as e:
+        t.check("Old owner rejects Produce after reassignment", False, str(e))
+
+    after_payload = b"reassign-after"
+    try:
+        sock = t.connect(NODES[target_node]["broker_port"])
+        err, off = produce(sock, t.next(), reassign_topic, 0, after_payload)
+        t.check(f"Target owner Produce succeeds: offset={off}", err == 0)
+        err, hw, rec_len, records = fetch(sock, t.next(), reassign_topic, 0, 0)
+        sock.close()
+        t.check(
+            f"Target owner Fetch includes reassigned payload: hw={hw}, {rec_len}B",
+            err == 0 and after_payload in records,
+        )
+    except Exception as e:
+        t.check("Target owner Produce/Fetch after reassignment", False, str(e))
 
     try:
         run_cross_broker_chaos(t, "e2e-topic")

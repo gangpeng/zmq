@@ -792,10 +792,14 @@ Status: completed for the initial catalog and DeleteGroups slice.
   has simulated convergence coverage after ownership changes. The gated KRaft
   failover harness now exercises live broker-process reassignment protocol
   convergence, old-owner write fencing, and target-broker topic/data
-  convergence. Controller-aware scale-out planning now has deterministic
-  coverage that spreads hot partitions from an overloaded broker to multiple
-  newly active broker targets. Docker E2E can require named cross-broker chaos
-  phases and verifies cross-node produce/fetch recovery after each heal.
+  convergence. Docker E2E now includes a default live reassignment check that
+  moves a single-partition topic between combined-mode brokers, verifies
+  ListPartitionReassignments and Metadata convergence, asserts the old owner is
+  fenced for Produce, and verifies target-broker Produce/Fetch after movement.
+  Controller-aware scale-out planning now has deterministic coverage that
+  spreads hot partitions from an overloaded broker to multiple newly active
+  broker targets. Docker E2E can require named cross-broker chaos phases and
+  verifies cross-node produce/fetch recovery after each heal.
   Live Docker load/scale orchestration hooks and required-phase validation are
   now pinned by `test-e2e`; broader CI execution across real scale-in/out/load
   environments remains.
