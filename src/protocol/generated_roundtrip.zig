@@ -1391,6 +1391,61 @@ test "generated non-default golden fixtures cover legacy and flexible wire encod
     }
 
     {
+        const ListTransactionsRequest = generated.list_transactions_request.ListTransactionsRequest;
+        const state_filters = [_]?[]const u8{ "Ongoing", "PrepareCommit" };
+        const producer_id_filters = [_]i64{ 123456789, 987654321 };
+        const value = ListTransactionsRequest{
+            .state_filters = &state_filters,
+            .producer_id_filters = &producer_id_filters,
+            .duration_filter = 60_000,
+        };
+        try expectGoldenRoundTrip(ListTransactionsRequest, value, 1, &[_]u8{
+            0x03, 0x08, 'O',  'n',
+            'g',  'o',  'i',  'n',
+            'g',  0x0e, 'P',  'r',
+            'e',  'p',  'a',  'r',
+            'e',  'C',  'o',  'm',
+            'm',  'i',  't',  0x03,
+            0x00, 0x00, 0x00, 0x00,
+            0x07, 0x5b, 0xcd, 0x15,
+            0x00, 0x00, 0x00, 0x00,
+            0x3a, 0xde, 0x68, 0xb1,
+            0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0xea, 0x60,
+            0x00,
+        });
+    }
+
+    {
+        const ListTransactionsResponse = generated.list_transactions_response.ListTransactionsResponse;
+        const unknown_state_filters = [_]?[]const u8{"bad-state"};
+        const transaction_states = [_]ListTransactionsResponse.TransactionState{.{
+            .transactional_id = "txn-a",
+            .producer_id = 123456789,
+            .transaction_state = "Ongoing",
+        }};
+        const value = ListTransactionsResponse{
+            .throttle_time_ms = 5,
+            .error_code = 0,
+            .unknown_state_filters = &unknown_state_filters,
+            .transaction_states = &transaction_states,
+        };
+        try expectGoldenRoundTrip(ListTransactionsResponse, value, 1, &[_]u8{
+            0x00, 0x00, 0x00, 0x05,
+            0x00, 0x00, 0x02, 0x0a,
+            'b',  'a',  'd',  '-',
+            's',  't',  'a',  't',
+            'e',  0x02, 0x06, 't',
+            'x',  'n',  '-',  'a',
+            0x00, 0x00, 0x00, 0x00,
+            0x07, 0x5b, 0xcd, 0x15,
+            0x08, 'O',  'n',  'g',
+            'o',  'i',  'n',  'g',
+            0x00, 0x00,
+        });
+    }
+
+    {
         const ConsumerGroupHeartbeatRequest = generated.consumer_group_heartbeat_request.ConsumerGroupHeartbeatRequest;
         const null_value = ConsumerGroupHeartbeatRequest{
             .group_id = "g",
