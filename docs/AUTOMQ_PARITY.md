@@ -43,6 +43,8 @@ operator-facing behavior.
   DescribeAcls/CreateAcls/DeleteAcls v2,
   OffsetForLeaderEpoch v4, DeleteRecords v2,
   SaslHandshake v1, SaslAuthenticate v2,
+  JoinGroup v5/v9, SyncGroup v3/v5, Heartbeat v3/v4, LeaveGroup v2/v5,
+  ListGroups v2/v5, DescribeGroups v4/v5,
   AssignReplicasToDirs v0, ShareFetch/ShareAcknowledge v0,
   Initialize/Read/Write/DeleteShareGroupState and ReadShareGroupStateSummary
   v0, ConsumerGroupDescribe v0, OffsetCommit v1/v8, OffsetFetch v7/v8,
@@ -60,8 +62,10 @@ operator-facing behavior.
   entities, f64 quota values, SCRAM credential mechanism/iteration lists,
   compact salt/password bytes, ACL filters/resources/matching results,
   leader-epoch end offsets, delete-records low-watermarks, compact record
-  bytes, SASL mechanism arrays/auth bytes/session lifetime, transaction
-  filters/results, flexible encodings, and tagged-field terminators.
+  bytes, SASL mechanism arrays/auth bytes/session lifetime, classic group
+  membership metadata/assignments/static identities/state/type filters,
+  transaction filters/results, flexible encodings, and tagged-field
+  terminators.
 
 ## Parity Gates
 

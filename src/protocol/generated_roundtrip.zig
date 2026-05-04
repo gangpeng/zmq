@@ -882,9 +882,9 @@ test "generated non-default golden fixtures cover legacy and flexible wire encod
             .mechanism = "SCRAM-SHA-256",
         };
         try expectGoldenRoundTrip(SaslHandshakeRequest, value, 1, &[_]u8{
-            0x00, 0x0d, 'S',  'C',
-            'R',  'A',  'M',  '-',
-            'S',  'H',  'A',  '-',
+            0x00, 0x0d, 'S', 'C',
+            'R',  'A',  'M', '-',
+            'S',  'H',  'A', '-',
             '2',  '5',  '6',
         });
     }
@@ -1679,10 +1679,9 @@ test "generated non-default golden fixtures cover legacy and flexible wire encod
         };
         try expectGoldenRoundTrip(BrokerRegistrationResponse, value, 2, &[_]u8{
             0x00, 0x00, 0x00, 0x0c,
-            0x00, 0x00,
             0x00, 0x00, 0x00, 0x00,
-            0x00, 0x00, 0x00, 0x05,
-            0x00,
+            0x00, 0x00, 0x00, 0x00,
+            0x00, 0x05, 0x00,
         });
     }
 
@@ -2005,8 +2004,8 @@ test "generated non-default golden fixtures cover legacy and flexible wire encod
             .key_type = 0,
         };
         try expectGoldenRoundTrip(FindCoordinatorRequest, legacy_value, 2, &[_]u8{
-            0x00, 0x07, 'g',  'r',
-            'o',  'u',  'p',  '-',
+            0x00, 0x07, 'g', 'r',
+            'o',  'u',  'p', '-',
             'a',  0x00,
         });
 
@@ -2076,12 +2075,12 @@ test "generated non-default golden fixtures cover legacy and flexible wire encod
             0x4a, 0x94, 0x00, 0x00,
             0x00, 0x00, 0x06, 't',
             'x',  'n',  '-',  'a',
-            0xff,
-            0xff, 0xff, 0xff, 0x00,
             0xff, 0xff, 0xff, 0xff,
-            0x00, 0x0f, 0x08, 'm',
-            'i',  's',  's',  'i',
-            'n',  'g',  0x00, 0x00,
+            0x00, 0xff, 0xff, 0xff,
+            0xff, 0x00, 0x0f, 0x08,
+            'm',  'i',  's',  's',
+            'i',  'n',  'g',  0x00,
+            0x00,
         });
     }
 
@@ -2158,15 +2157,14 @@ test "generated non-default golden fixtures cover legacy and flexible wire encod
             0x00, 0x00, 0x00, 0x01,
             0x00, 0x07, 't',  'o',
             'p',  'i',  'c',  '-',
-            'a',
-            0x00, 0x00, 0x00, 0x01,
+            'a',  0x00, 0x00, 0x00,
+            0x01, 0x00, 0x00, 0x00,
             0x00, 0x00, 0x00, 0x00,
-            0x00, 0x00,
-            0x00, 0x00, 0x00, 0x02,
-            0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x02, 0x00,
             0x00, 0x00, 0x00, 0x00,
             0x00, 0x00, 0x00, 0x00,
-            0x00, 0x00, 0x00, 0x2a,
+            0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x2a,
         });
 
         const flexible_partitions = [_]ListOffsetsResponse.ListOffsetsTopicResponse.ListOffsetsPartitionResponse{.{
@@ -2194,9 +2192,8 @@ test "generated non-default golden fixtures cover legacy and flexible wire encod
             0xcf, 0xe5, 0x68, 0x00,
             0x00, 0x00, 0x00, 0x00,
             0x00, 0x00, 0x00, 0x2a,
-            0x00, 0x00,
-            0x00, 0x09, 0x00, 0x00,
-            0x00,
+            0x00, 0x00, 0x00, 0x09,
+            0x00, 0x00, 0x00,
         });
     }
 
@@ -2304,6 +2301,571 @@ test "generated non-default golden fixtures cover legacy and flexible wire encod
             0x00, 0x00, 0x00, 0x00,
             0x00, 0x2a, 0x00, 0x00,
             0x00, 0x00, 0x00,
+        });
+    }
+
+    {
+        const JoinGroupRequest = generated.join_group_request.JoinGroupRequest;
+        const protocols = [_]JoinGroupRequest.JoinGroupRequestProtocol{
+            .{
+                .name = "range",
+                .metadata = &[_]u8{ 0x01, 0x02, 0x03 },
+            },
+            .{
+                .name = "sticky",
+                .metadata = &[_]u8{0xaa},
+            },
+        };
+        const value = JoinGroupRequest{
+            .group_id = "g1",
+            .session_timeout_ms = 45_000,
+            .rebalance_timeout_ms = 60_000,
+            .member_id = "member-A",
+            .group_instance_id = "inst-A",
+            .protocol_type = "consumer",
+            .protocols = &protocols,
+            .reason = "rebalance",
+        };
+        try expectGoldenRoundTrip(JoinGroupRequest, value, 5, &[_]u8{
+            0x00, 0x02, 'g',  '1',
+            0x00, 0x00, 0xaf, 0xc8,
+            0x00, 0x00, 0xea, 0x60,
+            0x00, 0x08, 'm',  'e',
+            'm',  'b',  'e',  'r',
+            '-',  'A',  0x00, 0x06,
+            'i',  'n',  's',  't',
+            '-',  'A',  0x00, 0x08,
+            'c',  'o',  'n',  's',
+            'u',  'm',  'e',  'r',
+            0x00, 0x00, 0x00, 0x02,
+            0x00, 0x05, 'r',  'a',
+            'n',  'g',  'e',  0x00,
+            0x00, 0x00, 0x03, 0x01,
+            0x02, 0x03, 0x00, 0x06,
+            's',  't',  'i',  'c',
+            'k',  'y',  0x00, 0x00,
+            0x00, 0x01, 0xaa,
+        });
+        try expectGoldenRoundTrip(JoinGroupRequest, value, 9, &[_]u8{
+            0x03, 'g',  '1',
+            0x00, 0x00, 0xaf,
+            0xc8, 0x00, 0x00,
+            0xea, 0x60, 0x09,
+            'm',  'e',  'm',
+            'b',  'e',  'r',
+            '-',  'A',  0x07,
+            'i',  'n',  's',
+            't',  '-',  'A',
+            0x09, 'c',  'o',
+            'n',  's',  'u',
+            'm',  'e',  'r',
+            0x03, 0x06, 'r',
+            'a',  'n',  'g',
+            'e',  0x04, 0x01,
+            0x02, 0x03, 0x00,
+            0x07, 's',  't',
+            'i',  'c',  'k',
+            'y',  0x02, 0xaa,
+            0x00, 0x0a, 'r',
+            'e',  'b',  'a',
+            'l',  'a',  'n',
+            'c',  'e',  0x00,
+        });
+    }
+
+    {
+        const JoinGroupResponse = generated.join_group_response.JoinGroupResponse;
+        const members = [_]JoinGroupResponse.JoinGroupResponseMember{
+            .{
+                .member_id = "member-A",
+                .group_instance_id = "inst-A",
+                .metadata = &[_]u8{ 0x10, 0x11 },
+            },
+            .{
+                .member_id = "member-B",
+                .group_instance_id = null,
+                .metadata = &[_]u8{0x20},
+            },
+        };
+        const value = JoinGroupResponse{
+            .throttle_time_ms = 7,
+            .error_code = 0,
+            .generation_id = 3,
+            .protocol_type = "consumer",
+            .protocol_name = "range",
+            .leader = "member-A",
+            .skip_assignment = true,
+            .member_id = "member-B",
+            .members = &members,
+        };
+        try expectGoldenRoundTrip(JoinGroupResponse, value, 5, &[_]u8{
+            0x00, 0x00, 0x00, 0x07,
+            0x00, 0x00, 0x00, 0x00,
+            0x00, 0x03, 0x00, 0x05,
+            'r',  'a',  'n',  'g',
+            'e',  0x00, 0x08, 'm',
+            'e',  'm',  'b',  'e',
+            'r',  '-',  'A',  0x00,
+            0x08, 'm',  'e',  'm',
+            'b',  'e',  'r',  '-',
+            'B',  0x00, 0x00, 0x00,
+            0x02, 0x00, 0x08, 'm',
+            'e',  'm',  'b',  'e',
+            'r',  '-',  'A',  0x00,
+            0x06, 'i',  'n',  's',
+            't',  '-',  'A',  0x00,
+            0x00, 0x00, 0x02, 0x10,
+            0x11, 0x00, 0x08, 'm',
+            'e',  'm',  'b',  'e',
+            'r',  '-',  'B',  0xff,
+            0xff, 0x00, 0x00, 0x00,
+            0x01, 0x20,
+        });
+        try expectGoldenRoundTrip(JoinGroupResponse, value, 9, &[_]u8{
+            0x00, 0x00, 0x00, 0x07,
+            0x00, 0x00, 0x00, 0x00,
+            0x00, 0x03, 0x09, 'c',
+            'o',  'n',  's',  'u',
+            'm',  'e',  'r',  0x06,
+            'r',  'a',  'n',  'g',
+            'e',  0x09, 'm',  'e',
+            'm',  'b',  'e',  'r',
+            '-',  'A',  0x01, 0x09,
+            'm',  'e',  'm',  'b',
+            'e',  'r',  '-',  'B',
+            0x03, 0x09, 'm',  'e',
+            'm',  'b',  'e',  'r',
+            '-',  'A',  0x07, 'i',
+            'n',  's',  't',  '-',
+            'A',  0x03, 0x10, 0x11,
+            0x00, 0x09, 'm',  'e',
+            'm',  'b',  'e',  'r',
+            '-',  'B',  0x00, 0x02,
+            0x20, 0x00, 0x00,
+        });
+    }
+
+    {
+        const SyncGroupRequest = generated.sync_group_request.SyncGroupRequest;
+        const assignments = [_]SyncGroupRequest.SyncGroupRequestAssignment{
+            .{
+                .member_id = "member-A",
+                .assignment = &[_]u8{ 0x01, 0x02 },
+            },
+            .{
+                .member_id = "member-B",
+                .assignment = null,
+            },
+        };
+        const value = SyncGroupRequest{
+            .group_id = "g1",
+            .generation_id = 3,
+            .member_id = "member-A",
+            .group_instance_id = "inst-A",
+            .protocol_type = "consumer",
+            .protocol_name = "range",
+            .assignments = &assignments,
+        };
+        try expectGoldenRoundTrip(SyncGroupRequest, value, 3, &[_]u8{
+            0x00, 0x02, 'g',  '1',
+            0x00, 0x00, 0x00, 0x03,
+            0x00, 0x08, 'm',  'e',
+            'm',  'b',  'e',  'r',
+            '-',  'A',  0x00, 0x06,
+            'i',  'n',  's',  't',
+            '-',  'A',  0x00, 0x00,
+            0x00, 0x02, 0x00, 0x08,
+            'm',  'e',  'm',  'b',
+            'e',  'r',  '-',  'A',
+            0x00, 0x00, 0x00, 0x02,
+            0x01, 0x02, 0x00, 0x08,
+            'm',  'e',  'm',  'b',
+            'e',  'r',  '-',  'B',
+            0xff, 0xff, 0xff, 0xff,
+        });
+        try expectGoldenRoundTrip(SyncGroupRequest, value, 5, &[_]u8{
+            0x03, 'g',  '1',
+            0x00, 0x00, 0x00,
+            0x03, 0x09, 'm',
+            'e',  'm',  'b',
+            'e',  'r',  '-',
+            'A',  0x07, 'i',
+            'n',  's',  't',
+            '-',  'A',  0x09,
+            'c',  'o',  'n',
+            's',  'u',  'm',
+            'e',  'r',  0x06,
+            'r',  'a',  'n',
+            'g',  'e',  0x03,
+            0x09, 'm',  'e',
+            'm',  'b',  'e',
+            'r',  '-',  'A',
+            0x03, 0x01, 0x02,
+            0x00, 0x09, 'm',
+            'e',  'm',  'b',
+            'e',  'r',  '-',
+            'B',  0x00, 0x00,
+            0x00,
+        });
+    }
+
+    {
+        const SyncGroupResponse = generated.sync_group_response.SyncGroupResponse;
+        const value = SyncGroupResponse{
+            .throttle_time_ms = 7,
+            .error_code = 0,
+            .protocol_type = "consumer",
+            .protocol_name = "range",
+            .assignment = &[_]u8{ 0xab, 0xcd },
+        };
+        try expectGoldenRoundTrip(SyncGroupResponse, value, 3, &[_]u8{
+            0x00, 0x00, 0x00, 0x07,
+            0x00, 0x00, 0x00, 0x00,
+            0x00, 0x02, 0xab, 0xcd,
+        });
+        try expectGoldenRoundTrip(SyncGroupResponse, value, 5, &[_]u8{
+            0x00, 0x00, 0x00, 0x07,
+            0x00, 0x00, 0x09, 'c',
+            'o',  'n',  's',  'u',
+            'm',  'e',  'r',  0x06,
+            'r',  'a',  'n',  'g',
+            'e',  0x03, 0xab, 0xcd,
+            0x00,
+        });
+    }
+
+    {
+        const HeartbeatRequest = generated.heartbeat_request.HeartbeatRequest;
+        const value = HeartbeatRequest{
+            .group_id = "g1",
+            .generation_id = 3,
+            .member_id = "member-A",
+            .group_instance_id = "inst-A",
+        };
+        try expectGoldenRoundTrip(HeartbeatRequest, value, 3, &[_]u8{
+            0x00, 0x02, 'g',  '1',
+            0x00, 0x00, 0x00, 0x03,
+            0x00, 0x08, 'm',  'e',
+            'm',  'b',  'e',  'r',
+            '-',  'A',  0x00, 0x06,
+            'i',  'n',  's',  't',
+            '-',  'A',
+        });
+        try expectGoldenRoundTrip(HeartbeatRequest, value, 4, &[_]u8{
+            0x03, 'g',  '1',
+            0x00, 0x00, 0x00,
+            0x03, 0x09, 'm',
+            'e',  'm',  'b',
+            'e',  'r',  '-',
+            'A',  0x07, 'i',
+            'n',  's',  't',
+            '-',  'A',  0x00,
+        });
+    }
+
+    {
+        const HeartbeatResponse = generated.heartbeat_response.HeartbeatResponse;
+        const value = HeartbeatResponse{
+            .throttle_time_ms = 7,
+            .error_code = 25,
+        };
+        try expectGoldenRoundTrip(HeartbeatResponse, value, 3, &[_]u8{
+            0x00, 0x00, 0x00, 0x07,
+            0x00, 0x19,
+        });
+        try expectGoldenRoundTrip(HeartbeatResponse, value, 4, &[_]u8{
+            0x00, 0x00, 0x00, 0x07,
+            0x00, 0x19, 0x00,
+        });
+    }
+
+    {
+        const LeaveGroupRequest = generated.leave_group_request.LeaveGroupRequest;
+        const legacy_value = LeaveGroupRequest{
+            .group_id = "g1",
+            .member_id = "member-A",
+        };
+        try expectGoldenRoundTrip(LeaveGroupRequest, legacy_value, 2, &[_]u8{
+            0x00, 0x02, 'g', '1',
+            0x00, 0x08, 'm', 'e',
+            'm',  'b',  'e', 'r',
+            '-',  'A',
+        });
+
+        const members = [_]LeaveGroupRequest.MemberIdentity{
+            .{
+                .member_id = "member-A",
+                .group_instance_id = "inst-A",
+                .reason = "shutdown",
+            },
+            .{
+                .member_id = "member-B",
+                .group_instance_id = null,
+                .reason = "rebalance",
+            },
+        };
+        const flexible_value = LeaveGroupRequest{
+            .group_id = "g1",
+            .members = &members,
+        };
+        try expectGoldenRoundTrip(LeaveGroupRequest, flexible_value, 5, &[_]u8{
+            0x03, 'g',  '1',
+            0x03, 0x09, 'm',
+            'e',  'm',  'b',
+            'e',  'r',  '-',
+            'A',  0x07, 'i',
+            'n',  's',  't',
+            '-',  'A',  0x09,
+            's',  'h',  'u',
+            't',  'd',  'o',
+            'w',  'n',  0x00,
+            0x09, 'm',  'e',
+            'm',  'b',  'e',
+            'r',  '-',  'B',
+            0x00, 0x0a, 'r',
+            'e',  'b',  'a',
+            'l',  'a',  'n',
+            'c',  'e',  0x00,
+            0x00,
+        });
+    }
+
+    {
+        const LeaveGroupResponse = generated.leave_group_response.LeaveGroupResponse;
+        const legacy_value = LeaveGroupResponse{
+            .throttle_time_ms = 7,
+            .error_code = 0,
+        };
+        try expectGoldenRoundTrip(LeaveGroupResponse, legacy_value, 2, &[_]u8{
+            0x00, 0x00, 0x00, 0x07,
+            0x00, 0x00,
+        });
+
+        const members = [_]LeaveGroupResponse.MemberResponse{
+            .{
+                .member_id = "member-A",
+                .group_instance_id = "inst-A",
+                .error_code = 0,
+            },
+            .{
+                .member_id = "member-B",
+                .group_instance_id = null,
+                .error_code = 25,
+            },
+        };
+        const flexible_value = LeaveGroupResponse{
+            .throttle_time_ms = 7,
+            .error_code = 0,
+            .members = &members,
+        };
+        try expectGoldenRoundTrip(LeaveGroupResponse, flexible_value, 5, &[_]u8{
+            0x00, 0x00, 0x00, 0x07,
+            0x00, 0x00, 0x03, 0x09,
+            'm',  'e',  'm',  'b',
+            'e',  'r',  '-',  'A',
+            0x07, 'i',  'n',  's',
+            't',  '-',  'A',  0x00,
+            0x00, 0x00, 0x09, 'm',
+            'e',  'm',  'b',  'e',
+            'r',  '-',  'B',  0x00,
+            0x00, 0x19, 0x00, 0x00,
+        });
+    }
+
+    {
+        const ListGroupsRequest = generated.list_groups_request.ListGroupsRequest;
+        const states = [_]?[]const u8{"Stable"};
+        const types = [_]?[]const u8{ "consumer", "share" };
+        const value = ListGroupsRequest{
+            .states_filter = &states,
+            .types_filter = &types,
+        };
+        try expectGoldenRoundTrip(ListGroupsRequest, value, 5, &[_]u8{
+            0x02,
+            0x07,
+            'S',
+            't',
+            'a',
+            'b',
+            'l',
+            'e',
+            0x03,
+            0x09,
+            'c',
+            'o',
+            'n',
+            's',
+            'u',
+            'm',
+            'e',
+            'r',
+            0x06,
+            's',
+            'h',
+            'a',
+            'r',
+            'e',
+            0x00,
+        });
+    }
+
+    {
+        const ListGroupsResponse = generated.list_groups_response.ListGroupsResponse;
+        const groups = [_]ListGroupsResponse.ListedGroup{
+            .{
+                .group_id = "g1",
+                .protocol_type = "consumer",
+                .group_state = "Stable",
+                .group_type = "classic",
+            },
+            .{
+                .group_id = "share-g",
+                .protocol_type = "share",
+                .group_state = "Empty",
+                .group_type = "share",
+            },
+        };
+        const value = ListGroupsResponse{
+            .throttle_time_ms = 7,
+            .error_code = 0,
+            .groups = &groups,
+        };
+        try expectGoldenRoundTrip(ListGroupsResponse, value, 2, &[_]u8{
+            0x00, 0x00, 0x00, 0x07,
+            0x00, 0x00, 0x00, 0x00,
+            0x00, 0x02, 0x00, 0x02,
+            'g',  '1',  0x00, 0x08,
+            'c',  'o',  'n',  's',
+            'u',  'm',  'e',  'r',
+            0x00, 0x07, 's',  'h',
+            'a',  'r',  'e',  '-',
+            'g',  0x00, 0x05, 's',
+            'h',  'a',  'r',  'e',
+        });
+        try expectGoldenRoundTrip(ListGroupsResponse, value, 5, &[_]u8{
+            0x00, 0x00, 0x00, 0x07,
+            0x00, 0x00, 0x03, 0x03,
+            'g',  '1',  0x09, 'c',
+            'o',  'n',  's',  'u',
+            'm',  'e',  'r',  0x07,
+            'S',  't',  'a',  'b',
+            'l',  'e',  0x08, 'c',
+            'l',  'a',  's',  's',
+            'i',  'c',  0x00, 0x08,
+            's',  'h',  'a',  'r',
+            'e',  '-',  'g',  0x06,
+            's',  'h',  'a',  'r',
+            'e',  0x06, 'E',  'm',
+            'p',  't',  'y',  0x06,
+            's',  'h',  'a',  'r',
+            'e',  0x00, 0x00,
+        });
+    }
+
+    {
+        const DescribeGroupsRequest = generated.describe_groups_request.DescribeGroupsRequest;
+        const groups = [_]?[]const u8{ "g1", "share-g" };
+        const value = DescribeGroupsRequest{
+            .groups = &groups,
+            .include_authorized_operations = true,
+        };
+        try expectGoldenRoundTrip(DescribeGroupsRequest, value, 3, &[_]u8{
+            0x00, 0x00, 0x00, 0x02,
+            0x00, 0x02, 'g',  '1',
+            0x00, 0x07, 's',  'h',
+            'a',  'r',  'e',  '-',
+            'g',  0x01,
+        });
+        try expectGoldenRoundTrip(DescribeGroupsRequest, value, 5, &[_]u8{
+            0x03,
+            0x03,
+            'g',
+            '1',
+            0x08,
+            's',
+            'h',
+            'a',
+            'r',
+            'e',
+            '-',
+            'g',
+            0x01,
+            0x00,
+        });
+    }
+
+    {
+        const DescribeGroupsResponse = generated.describe_groups_response.DescribeGroupsResponse;
+        const members = [_]DescribeGroupsResponse.DescribedGroup.DescribedGroupMember{.{
+            .member_id = "member-A",
+            .group_instance_id = "inst-A",
+            .client_id = "client-1",
+            .client_host = "/127.0.0.1",
+            .member_metadata = &[_]u8{ 0x01, 0x02 },
+            .member_assignment = &[_]u8{0x0a},
+        }};
+        const groups = [_]DescribeGroupsResponse.DescribedGroup{.{
+            .error_code = 0,
+            .group_id = "g1",
+            .group_state = "Stable",
+            .protocol_type = "consumer",
+            .protocol_data = "range",
+            .members = &members,
+            .authorized_operations = 9,
+        }};
+        const value = DescribeGroupsResponse{
+            .throttle_time_ms = 7,
+            .groups = &groups,
+        };
+        try expectGoldenRoundTrip(DescribeGroupsResponse, value, 4, &[_]u8{
+            0x00, 0x00, 0x00, 0x07,
+            0x00, 0x00, 0x00, 0x01,
+            0x00, 0x00, 0x00, 0x02,
+            'g',  '1',  0x00, 0x06,
+            'S',  't',  'a',  'b',
+            'l',  'e',  0x00, 0x08,
+            'c',  'o',  'n',  's',
+            'u',  'm',  'e',  'r',
+            0x00, 0x05, 'r',  'a',
+            'n',  'g',  'e',  0x00,
+            0x00, 0x00, 0x01, 0x00,
+            0x08, 'm',  'e',  'm',
+            'b',  'e',  'r',  '-',
+            'A',  0x00, 0x06, 'i',
+            'n',  's',  't',  '-',
+            'A',  0x00, 0x08, 'c',
+            'l',  'i',  'e',  'n',
+            't',  '-',  '1',  0x00,
+            0x0a, '/',  '1',  '2',
+            '7',  '.',  '0',  '.',
+            '0',  '.',  '1',  0x00,
+            0x00, 0x00, 0x02, 0x01,
+            0x02, 0x00, 0x00, 0x00,
+            0x01, 0x0a, 0x00, 0x00,
+            0x00, 0x09,
+        });
+        try expectGoldenRoundTrip(DescribeGroupsResponse, value, 5, &[_]u8{
+            0x00, 0x00, 0x00, 0x07,
+            0x02, 0x00, 0x00, 0x03,
+            'g',  '1',  0x07, 'S',
+            't',  'a',  'b',  'l',
+            'e',  0x09, 'c',  'o',
+            'n',  's',  'u',  'm',
+            'e',  'r',  0x06, 'r',
+            'a',  'n',  'g',  'e',
+            0x02, 0x09, 'm',  'e',
+            'm',  'b',  'e',  'r',
+            '-',  'A',  0x07, 'i',
+            'n',  's',  't',  '-',
+            'A',  0x09, 'c',  'l',
+            'i',  'e',  'n',  't',
+            '-',  '1',  0x0b, '/',
+            '1',  '2',  '7',  '.',
+            '0',  '.',  '0',  '.',
+            '1',  0x03, 0x01, 0x02,
+            0x02, 0x0a, 0x00, 0x00,
+            0x00, 0x00, 0x09, 0x00,
+            0x00,
         });
     }
 
