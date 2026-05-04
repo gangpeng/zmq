@@ -2142,6 +2142,113 @@ test "generated non-default golden fixtures cover legacy and flexible wire encod
     }
 
     {
+        const OffsetForLeaderEpochRequest = generated.offset_for_leader_epoch_request.OffsetForLeaderEpochRequest;
+        const partitions = [_]OffsetForLeaderEpochRequest.OffsetForLeaderTopic.OffsetForLeaderPartition{.{
+            .partition = 0,
+            .current_leader_epoch = 3,
+            .leader_epoch = 2,
+        }};
+        const topics = [_]OffsetForLeaderEpochRequest.OffsetForLeaderTopic{.{
+            .topic = "topic-a",
+            .partitions = &partitions,
+        }};
+        const value = OffsetForLeaderEpochRequest{
+            .replica_id = -1,
+            .topics = &topics,
+        };
+        try expectGoldenRoundTrip(OffsetForLeaderEpochRequest, value, 4, &[_]u8{
+            0xff, 0xff, 0xff, 0xff,
+            0x02, 0x08, 't',  'o',
+            'p',  'i',  'c',  '-',
+            'a',  0x02, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00,
+            0x00, 0x03, 0x00, 0x00,
+            0x00, 0x02, 0x00, 0x00,
+            0x00,
+        });
+    }
+
+    {
+        const OffsetForLeaderEpochResponse = generated.offset_for_leader_epoch_response.OffsetForLeaderEpochResponse;
+        const partitions = [_]OffsetForLeaderEpochResponse.OffsetForLeaderTopicResult.EpochEndOffset{.{
+            .partition = 0,
+            .leader_epoch = 2,
+            .end_offset = 42,
+        }};
+        const topics = [_]OffsetForLeaderEpochResponse.OffsetForLeaderTopicResult{.{
+            .topic = "topic-a",
+            .partitions = &partitions,
+        }};
+        const value = OffsetForLeaderEpochResponse{
+            .throttle_time_ms = 9,
+            .topics = &topics,
+        };
+        try expectGoldenRoundTrip(OffsetForLeaderEpochResponse, value, 4, &[_]u8{
+            0x00, 0x00, 0x00, 0x09,
+            0x02, 0x08, 't',  'o',
+            'p',  'i',  'c',  '-',
+            'a',  0x02, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x02,
+            0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x2a,
+            0x00, 0x00, 0x00,
+        });
+    }
+
+    {
+        const DeleteRecordsRequest = generated.delete_records_request.DeleteRecordsRequest;
+        const partitions = [_]DeleteRecordsRequest.DeleteRecordsTopic.DeleteRecordsPartition{.{
+            .partition_index = 0,
+            .offset = 42,
+        }};
+        const topics = [_]DeleteRecordsRequest.DeleteRecordsTopic{.{
+            .name = "topic-a",
+            .partitions = &partitions,
+        }};
+        const value = DeleteRecordsRequest{
+            .topics = &topics,
+            .timeout_ms = 30000,
+        };
+        try expectGoldenRoundTrip(DeleteRecordsRequest, value, 2, &[_]u8{
+            0x02, 0x08, 't',  'o',
+            'p',  'i',  'c',  '-',
+            'a',  0x02, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00,
+            0x00, 0x2a, 0x00, 0x00,
+            0x00, 0x00, 0x75, 0x30,
+            0x00,
+        });
+    }
+
+    {
+        const DeleteRecordsResponse = generated.delete_records_response.DeleteRecordsResponse;
+        const partitions = [_]DeleteRecordsResponse.DeleteRecordsTopicResult.DeleteRecordsPartitionResult{.{
+            .partition_index = 0,
+            .low_watermark = 42,
+        }};
+        const topics = [_]DeleteRecordsResponse.DeleteRecordsTopicResult{.{
+            .name = "topic-a",
+            .partitions = &partitions,
+        }};
+        const value = DeleteRecordsResponse{
+            .throttle_time_ms = 8,
+            .topics = &topics,
+        };
+        try expectGoldenRoundTrip(DeleteRecordsResponse, value, 2, &[_]u8{
+            0x00, 0x00, 0x00, 0x08,
+            0x02, 0x08, 't',  'o',
+            'p',  'i',  'c',  '-',
+            'a',  0x02, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00,
+            0x00, 0x2a, 0x00, 0x00,
+            0x00, 0x00, 0x00,
+        });
+    }
+
+    {
         const OffsetFetchRequest = generated.offset_fetch_request.OffsetFetchRequest;
         const value = OffsetFetchRequest{
             .group_id = "group-a",
