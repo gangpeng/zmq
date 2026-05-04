@@ -1058,6 +1058,491 @@ test "generated non-default golden fixtures cover legacy and flexible wire encod
     }
 
     {
+        const AlterConfigsRequest = generated.alter_configs_request.AlterConfigsRequest;
+        const configs = [_]AlterConfigsRequest.AlterConfigsResource.AlterableConfig{
+            .{
+                .name = "retention.ms",
+                .value = "60000",
+            },
+            .{
+                .name = "cleanup.policy",
+                .value = null,
+            },
+        };
+        const resources = [_]AlterConfigsRequest.AlterConfigsResource{.{
+            .resource_type = 2,
+            .resource_name = "topic-a",
+            .configs = &configs,
+        }};
+        const value = AlterConfigsRequest{
+            .resources = &resources,
+            .validate_only = true,
+        };
+        try expectGoldenRoundTrip(AlterConfigsRequest, value, 0, &[_]u8{
+            0x00, 0x00, 0x00, 0x01,
+            0x02, 0x00, 0x07, 't',
+            'o',  'p',  'i',  'c',
+            '-',  'a',  0x00, 0x00,
+            0x00, 0x02, 0x00, 0x0c,
+            'r',  'e',  't',  'e',
+            'n',  't',  'i',  'o',
+            'n',  '.',  'm',  's',
+            0x00, 0x05, '6',  '0',
+            '0',  '0',  '0',  0x00,
+            0x0e, 'c',  'l',  'e',
+            'a',  'n',  'u',  'p',
+            '.',  'p',  'o',  'l',
+            'i',  'c',  'y',  0xff,
+            0xff, 0x01,
+        });
+        try expectGoldenRoundTrip(AlterConfigsRequest, value, 2, &[_]u8{
+            0x02,
+            0x02,
+            0x08,
+            't',
+            'o',
+            'p',
+            'i',
+            'c',
+            '-',
+            'a',
+            0x03,
+            0x0d,
+            'r',
+            'e',
+            't',
+            'e',
+            'n',
+            't',
+            'i',
+            'o',
+            'n',
+            '.',
+            'm',
+            's',
+            0x06,
+            '6',
+            '0',
+            '0',
+            '0',
+            '0',
+            0x00,
+            0x0f,
+            'c',
+            'l',
+            'e',
+            'a',
+            'n',
+            'u',
+            'p',
+            '.',
+            'p',
+            'o',
+            'l',
+            'i',
+            'c',
+            'y',
+            0x00,
+            0x00,
+            0x00,
+            0x01,
+            0x00,
+        });
+    }
+
+    {
+        const AlterConfigsResponse = generated.alter_configs_response.AlterConfigsResponse;
+        const responses = [_]AlterConfigsResponse.AlterConfigsResourceResponse{
+            .{
+                .error_code = 0,
+                .error_message = null,
+                .resource_type = 2,
+                .resource_name = "topic-a",
+            },
+            .{
+                .error_code = 40,
+                .error_message = "bad",
+                .resource_type = 2,
+                .resource_name = "topic-b",
+            },
+        };
+        const value = AlterConfigsResponse{
+            .throttle_time_ms = 7,
+            .responses = &responses,
+        };
+        try expectGoldenRoundTrip(AlterConfigsResponse, value, 0, &[_]u8{
+            0x00, 0x00, 0x00, 0x07,
+            0x00, 0x00, 0x00, 0x02,
+            0x00, 0x00, 0xff, 0xff,
+            0x02, 0x00, 0x07, 't',
+            'o',  'p',  'i',  'c',
+            '-',  'a',  0x00, 0x28,
+            0x00, 0x03, 'b',  'a',
+            'd',  0x02, 0x00, 0x07,
+            't',  'o',  'p',  'i',
+            'c',  '-',  'b',
+        });
+        try expectGoldenRoundTrip(AlterConfigsResponse, value, 2, &[_]u8{
+            0x00, 0x00, 0x00, 0x07,
+            0x03, 0x00, 0x00, 0x00,
+            0x02, 0x08, 't',  'o',
+            'p',  'i',  'c',  '-',
+            'a',  0x00, 0x00, 0x28,
+            0x04, 'b',  'a',  'd',
+            0x02, 0x08, 't',  'o',
+            'p',  'i',  'c',  '-',
+            'b',  0x00, 0x00,
+        });
+    }
+
+    {
+        const IncrementalAlterConfigsRequest = generated.incremental_alter_configs_request.IncrementalAlterConfigsRequest;
+        const configs = [_]IncrementalAlterConfigsRequest.AlterConfigsResource.AlterableConfig{
+            .{
+                .name = "retention.ms",
+                .config_operation = 0,
+                .value = "60000",
+            },
+            .{
+                .name = "cleanup.policy",
+                .config_operation = 1,
+                .value = null,
+            },
+        };
+        const resources = [_]IncrementalAlterConfigsRequest.AlterConfigsResource{.{
+            .resource_type = 2,
+            .resource_name = "topic-a",
+            .configs = &configs,
+        }};
+        const value = IncrementalAlterConfigsRequest{
+            .resources = &resources,
+            .validate_only = true,
+        };
+        try expectGoldenRoundTrip(IncrementalAlterConfigsRequest, value, 0, &[_]u8{
+            0x00, 0x00, 0x00, 0x01,
+            0x02, 0x00, 0x07, 't',
+            'o',  'p',  'i',  'c',
+            '-',  'a',  0x00, 0x00,
+            0x00, 0x02, 0x00, 0x0c,
+            'r',  'e',  't',  'e',
+            'n',  't',  'i',  'o',
+            'n',  '.',  'm',  's',
+            0x00, 0x00, 0x05, '6',
+            '0',  '0',  '0',  '0',
+            0x00, 0x0e, 'c',  'l',
+            'e',  'a',  'n',  'u',
+            'p',  '.',  'p',  'o',
+            'l',  'i',  'c',  'y',
+            0x01, 0xff, 0xff, 0x01,
+        });
+        try expectGoldenRoundTrip(IncrementalAlterConfigsRequest, value, 1, &[_]u8{
+            0x02,
+            0x02,
+            0x08,
+            't',
+            'o',
+            'p',
+            'i',
+            'c',
+            '-',
+            'a',
+            0x03,
+            0x0d,
+            'r',
+            'e',
+            't',
+            'e',
+            'n',
+            't',
+            'i',
+            'o',
+            'n',
+            '.',
+            'm',
+            's',
+            0x00,
+            0x06,
+            '6',
+            '0',
+            '0',
+            '0',
+            '0',
+            0x00,
+            0x0f,
+            'c',
+            'l',
+            'e',
+            'a',
+            'n',
+            'u',
+            'p',
+            '.',
+            'p',
+            'o',
+            'l',
+            'i',
+            'c',
+            'y',
+            0x01,
+            0x00,
+            0x00,
+            0x00,
+            0x01,
+            0x00,
+        });
+    }
+
+    {
+        const IncrementalAlterConfigsResponse = generated.incremental_alter_configs_response.IncrementalAlterConfigsResponse;
+        const responses = [_]IncrementalAlterConfigsResponse.AlterConfigsResourceResponse{
+            .{
+                .error_code = 0,
+                .error_message = null,
+                .resource_type = 2,
+                .resource_name = "topic-a",
+            },
+            .{
+                .error_code = 40,
+                .error_message = "bad",
+                .resource_type = 2,
+                .resource_name = "topic-b",
+            },
+        };
+        const value = IncrementalAlterConfigsResponse{
+            .throttle_time_ms = 7,
+            .responses = &responses,
+        };
+        try expectGoldenRoundTrip(IncrementalAlterConfigsResponse, value, 0, &[_]u8{
+            0x00, 0x00, 0x00, 0x07,
+            0x00, 0x00, 0x00, 0x02,
+            0x00, 0x00, 0xff, 0xff,
+            0x02, 0x00, 0x07, 't',
+            'o',  'p',  'i',  'c',
+            '-',  'a',  0x00, 0x28,
+            0x00, 0x03, 'b',  'a',
+            'd',  0x02, 0x00, 0x07,
+            't',  'o',  'p',  'i',
+            'c',  '-',  'b',
+        });
+        try expectGoldenRoundTrip(IncrementalAlterConfigsResponse, value, 1, &[_]u8{
+            0x00, 0x00, 0x00, 0x07,
+            0x03, 0x00, 0x00, 0x00,
+            0x02, 0x08, 't',  'o',
+            'p',  'i',  'c',  '-',
+            'a',  0x00, 0x00, 0x28,
+            0x04, 'b',  'a',  'd',
+            0x02, 0x08, 't',  'o',
+            'p',  'i',  'c',  '-',
+            'b',  0x00, 0x00,
+        });
+    }
+
+    {
+        const DeleteTopicsRequest = generated.delete_topics_request.DeleteTopicsRequest;
+        const topic_names = [_]?[]const u8{ "topic-a", "topic-b" };
+        const legacy_value = DeleteTopicsRequest{
+            .topic_names = &topic_names,
+            .timeout_ms = 30_000,
+        };
+        try expectGoldenRoundTrip(DeleteTopicsRequest, legacy_value, 3, &[_]u8{
+            0x00, 0x00, 0x00, 0x02,
+            0x00, 0x07, 't',  'o',
+            'p',  'i',  'c',  '-',
+            'a',  0x00, 0x07, 't',
+            'o',  'p',  'i',  'c',
+            '-',  'b',  0x00, 0x00,
+            0x75, 0x30,
+        });
+
+        const topics = [_]DeleteTopicsRequest.DeleteTopicState{
+            .{
+                .name = "topic-a",
+                .topic_id = .{
+                    0x00, 0x01, 0x02, 0x03,
+                    0x04, 0x05, 0x06, 0x07,
+                    0x08, 0x09, 0x0a, 0x0b,
+                    0x0c, 0x0d, 0x0e, 0x0f,
+                },
+            },
+            .{
+                .name = null,
+                .topic_id = .{
+                    0x10, 0x11, 0x12, 0x13,
+                    0x14, 0x15, 0x16, 0x17,
+                    0x18, 0x19, 0x1a, 0x1b,
+                    0x1c, 0x1d, 0x1e, 0x1f,
+                },
+            },
+        };
+        const flexible_value = DeleteTopicsRequest{
+            .topics = &topics,
+            .timeout_ms = 30_000,
+        };
+        try expectGoldenRoundTrip(DeleteTopicsRequest, flexible_value, 6, &[_]u8{
+            0x03,
+            0x08,
+            't',
+            'o',
+            'p',
+            'i',
+            'c',
+            '-',
+            'a',
+            0x00,
+            0x01,
+            0x02,
+            0x03,
+            0x04,
+            0x05,
+            0x06,
+            0x07,
+            0x08,
+            0x09,
+            0x0a,
+            0x0b,
+            0x0c,
+            0x0d,
+            0x0e,
+            0x0f,
+            0x00,
+            0x00,
+            0x10,
+            0x11,
+            0x12,
+            0x13,
+            0x14,
+            0x15,
+            0x16,
+            0x17,
+            0x18,
+            0x19,
+            0x1a,
+            0x1b,
+            0x1c,
+            0x1d,
+            0x1e,
+            0x1f,
+            0x00,
+            0x00,
+            0x00,
+            0x75,
+            0x30,
+            0x00,
+        });
+    }
+
+    {
+        const DeleteTopicsResponse = generated.delete_topics_response.DeleteTopicsResponse;
+        const responses = [_]DeleteTopicsResponse.DeletableTopicResult{
+            .{
+                .name = "topic-a",
+                .topic_id = .{
+                    0x00, 0x01, 0x02, 0x03,
+                    0x04, 0x05, 0x06, 0x07,
+                    0x08, 0x09, 0x0a, 0x0b,
+                    0x0c, 0x0d, 0x0e, 0x0f,
+                },
+                .error_code = 0,
+                .error_message = null,
+            },
+            .{
+                .name = "topic-b",
+                .topic_id = .{
+                    0x10, 0x11, 0x12, 0x13,
+                    0x14, 0x15, 0x16, 0x17,
+                    0x18, 0x19, 0x1a, 0x1b,
+                    0x1c, 0x1d, 0x1e, 0x1f,
+                },
+                .error_code = 3,
+                .error_message = "missing",
+            },
+        };
+        const value = DeleteTopicsResponse{
+            .throttle_time_ms = 7,
+            .responses = &responses,
+        };
+        try expectGoldenRoundTrip(DeleteTopicsResponse, value, 3, &[_]u8{
+            0x00, 0x00, 0x00, 0x07,
+            0x00, 0x00, 0x00, 0x02,
+            0x00, 0x07, 't',  'o',
+            'p',  'i',  'c',  '-',
+            'a',  0x00, 0x00, 0x00,
+            0x07, 't',  'o',  'p',
+            'i',  'c',  '-',  'b',
+            0x00, 0x03,
+        });
+        try expectGoldenRoundTrip(DeleteTopicsResponse, value, 6, &[_]u8{
+            0x00, 0x00, 0x00, 0x07,
+            0x03, 0x08, 't',  'o',
+            'p',  'i',  'c',  '-',
+            'a',  0x00, 0x01, 0x02,
+            0x03, 0x04, 0x05, 0x06,
+            0x07, 0x08, 0x09, 0x0a,
+            0x0b, 0x0c, 0x0d, 0x0e,
+            0x0f, 0x00, 0x00, 0x00,
+            0x00, 0x08, 't',  'o',
+            'p',  'i',  'c',  '-',
+            'b',  0x10, 0x11, 0x12,
+            0x13, 0x14, 0x15, 0x16,
+            0x17, 0x18, 0x19, 0x1a,
+            0x1b, 0x1c, 0x1d, 0x1e,
+            0x1f, 0x00, 0x03, 0x08,
+            'm',  'i',  's',  's',
+            'i',  'n',  'g',  0x00,
+            0x00,
+        });
+    }
+
+    {
+        const DeleteGroupsRequest = generated.delete_groups_request.DeleteGroupsRequest;
+        const groups = [_]?[]const u8{ "g1", "g2" };
+        const value = DeleteGroupsRequest{
+            .groups_names = &groups,
+        };
+        try expectGoldenRoundTrip(DeleteGroupsRequest, value, 0, &[_]u8{
+            0x00, 0x00, 0x00, 0x02,
+            0x00, 0x02, 'g',  '1',
+            0x00, 0x02, 'g',  '2',
+        });
+        try expectGoldenRoundTrip(DeleteGroupsRequest, value, 2, &[_]u8{
+            0x03,
+            0x03,
+            'g',
+            '1',
+            0x03,
+            'g',
+            '2',
+            0x00,
+        });
+    }
+
+    {
+        const DeleteGroupsResponse = generated.delete_groups_response.DeleteGroupsResponse;
+        const results = [_]DeleteGroupsResponse.DeletableGroupResult{
+            .{ .group_id = "g1", .error_code = 0 },
+            .{ .group_id = "g2", .error_code = 69 },
+        };
+        const value = DeleteGroupsResponse{
+            .throttle_time_ms = 7,
+            .results = &results,
+        };
+        try expectGoldenRoundTrip(DeleteGroupsResponse, value, 0, &[_]u8{
+            0x00, 0x00, 0x00, 0x07,
+            0x00, 0x00, 0x00, 0x02,
+            0x00, 0x02, 'g',  '1',
+            0x00, 0x00, 0x00, 0x02,
+            'g',  '2',  0x00, 0x45,
+        });
+        try expectGoldenRoundTrip(DeleteGroupsResponse, value, 2, &[_]u8{
+            0x00, 0x00, 0x00, 0x07,
+            0x03, 0x03, 'g',  '1',
+            0x00, 0x00, 0x00, 0x03,
+            'g',  '2',  0x00, 0x45,
+            0x00, 0x00,
+        });
+    }
+
+    {
         const ProduceRequest = generated.produce_request.ProduceRequest;
         const partitions = [_]ProduceRequest.TopicProduceData.PartitionProduceData{
             .{ .index = 2, .records = &[_]u8{ 0x01, 0x02, 0x03 } },

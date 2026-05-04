@@ -46,6 +46,8 @@ operator-facing behavior.
   JoinGroup v5/v9, SyncGroup v3/v5, Heartbeat v3/v4, LeaveGroup v2/v5,
   ListGroups v2/v5, DescribeGroups v4/v5,
   GetTelemetrySubscriptions/PushTelemetry/ListClientMetricsResources v0,
+  AlterConfigs v0/v2, IncrementalAlterConfigs v0/v1,
+  DeleteTopics v3/v6, DeleteGroups v0/v2,
   AssignReplicasToDirs v0, ShareFetch/ShareAcknowledge v0,
   Initialize/Read/Write/DeleteShareGroupState and ReadShareGroupStateSummary
   v0, ConsumerGroupDescribe v0, OffsetCommit v1/v8, OffsetFetch v7/v8,
@@ -66,6 +68,8 @@ operator-facing behavior.
   bytes, SASL mechanism arrays/auth bytes/session lifetime, classic group
   membership metadata/assignments/static identities/state/type filters,
   telemetry UUID/compression/metric-prefix/payload resource fields,
+  config admin null values/operation types, topic deletion name-to-UUID
+  transitions, group deletion compact arrays,
   transaction filters/results, flexible encodings, and tagged-field
   terminators.
 
