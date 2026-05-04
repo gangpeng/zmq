@@ -1742,6 +1742,119 @@ test "generated non-default golden fixtures cover legacy and flexible wire encod
     }
 
     {
+        const ShareFetchRequest = generated.share_fetch_request.ShareFetchRequest;
+        const acknowledgement_batches = [_]ShareFetchRequest.FetchTopic.FetchPartition.AcknowledgementBatch{.{
+            .first_offset = 5,
+            .last_offset = 7,
+            .acknowledge_types = &[_]i8{ 1, 2 },
+        }};
+        const partitions = [_]ShareFetchRequest.FetchTopic.FetchPartition{.{
+            .partition_index = 0,
+            .partition_max_bytes = 1024,
+            .acknowledgement_batches = &acknowledgement_batches,
+        }};
+        const topics = [_]ShareFetchRequest.FetchTopic{.{
+            .topic_id = .{
+                0x20, 0x21, 0x22, 0x23,
+                0x24, 0x25, 0x26, 0x27,
+                0x28, 0x29, 0x2a, 0x2b,
+                0x2c, 0x2d, 0x2e, 0x2f,
+            },
+            .partitions = &partitions,
+        }};
+        const forgotten_topics = [_]ShareFetchRequest.ForgottenTopic{.{
+            .topic_id = .{
+                0x30, 0x31, 0x32, 0x33,
+                0x34, 0x35, 0x36, 0x37,
+                0x38, 0x39, 0x3a, 0x3b,
+                0x3c, 0x3d, 0x3e, 0x3f,
+            },
+            .partitions = &[_]i32{3},
+        }};
+        const value = ShareFetchRequest{
+            .group_id = "share-g",
+            .member_id = "member-1",
+            .share_session_epoch = 2,
+            .max_wait_ms = 500,
+            .min_bytes = 1,
+            .max_bytes = 4096,
+            .topics = &topics,
+            .forgotten_topics_data = &forgotten_topics,
+        };
+        try expectGoldenRoundTrip(ShareFetchRequest, value, 0, &[_]u8{
+            0x08, 0x73, 0x68, 0x61, 0x72, 0x65, 0x2d, 0x67,
+            0x09, 0x6d, 0x65, 0x6d, 0x62, 0x65, 0x72, 0x2d,
+            0x31, 0x00, 0x00, 0x00, 0x02, 0x00, 0x00, 0x01,
+            0xf4, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x10,
+            0x00, 0x02, 0x20, 0x21, 0x22, 0x23, 0x24, 0x25,
+            0x26, 0x27, 0x28, 0x29, 0x2a, 0x2b, 0x2c, 0x2d,
+            0x2e, 0x2f, 0x02, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x04, 0x00, 0x02, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x05, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x07, 0x03, 0x01, 0x02, 0x00,
+            0x00, 0x00, 0x02, 0x30, 0x31, 0x32, 0x33, 0x34,
+            0x35, 0x36, 0x37, 0x38, 0x39, 0x3a, 0x3b, 0x3c,
+            0x3d, 0x3e, 0x3f, 0x02, 0x00, 0x00, 0x00, 0x03,
+            0x00, 0x00,
+        });
+    }
+
+    {
+        const ShareFetchResponse = generated.share_fetch_response.ShareFetchResponse;
+        const acquired_records = [_]ShareFetchResponse.ShareFetchableTopicResponse.PartitionData.AcquiredRecords{.{
+            .first_offset = 5,
+            .last_offset = 7,
+            .delivery_count = 2,
+        }};
+        const partition_data = [_]ShareFetchResponse.ShareFetchableTopicResponse.PartitionData{.{
+            .partition_index = 0,
+            .error_code = 0,
+            .error_message = null,
+            .acknowledge_error_code = 0,
+            .acknowledge_error_message = null,
+            .current_leader = .{ .leader_id = 2, .leader_epoch = 9 },
+            .records = "abc",
+            .acquired_records = &acquired_records,
+        }};
+        const responses = [_]ShareFetchResponse.ShareFetchableTopicResponse{.{
+            .topic_id = .{
+                0x20, 0x21, 0x22, 0x23,
+                0x24, 0x25, 0x26, 0x27,
+                0x28, 0x29, 0x2a, 0x2b,
+                0x2c, 0x2d, 0x2e, 0x2f,
+            },
+            .partitions = &partition_data,
+        }};
+        const node_endpoints = [_]ShareFetchResponse.NodeEndpoint{.{
+            .node_id = 2,
+            .host = "broker-2",
+            .port = 19092,
+            .rack = "az-a",
+        }};
+        const value = ShareFetchResponse{
+            .throttle_time_ms = 3,
+            .error_code = 0,
+            .error_message = null,
+            .responses = &responses,
+            .node_endpoints = &node_endpoints,
+        };
+        try expectGoldenRoundTrip(ShareFetchResponse, value, 0, &[_]u8{
+            0x00, 0x00, 0x00, 0x03, 0x00, 0x00, 0x00, 0x02,
+            0x20, 0x21, 0x22, 0x23, 0x24, 0x25, 0x26, 0x27,
+            0x28, 0x29, 0x2a, 0x2b, 0x2c, 0x2d, 0x2e, 0x2f,
+            0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x02, 0x00,
+            0x00, 0x00, 0x09, 0x00, 0x04, 0x61, 0x62, 0x63,
+            0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x05, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x07, 0x00, 0x02, 0x00, 0x00, 0x00, 0x02, 0x00,
+            0x00, 0x00, 0x02, 0x09, 0x62, 0x72, 0x6f, 0x6b,
+            0x65, 0x72, 0x2d, 0x32, 0x00, 0x00, 0x4a, 0x94,
+            0x05, 0x61, 0x7a, 0x2d, 0x61, 0x00, 0x00,
+        });
+    }
+
+    {
         const AlterPartitionReassignmentsRequest = generated.alter_partition_reassignments_request.AlterPartitionReassignmentsRequest;
         const null_partitions = [_]AlterPartitionReassignmentsRequest.ReassignableTopic.ReassignablePartition{.{
             .partition_index = 0,
