@@ -808,6 +808,13 @@ Status: completed for the initial catalog and DeleteGroups slice.
   spreads hot partitions from an overloaded broker to multiple newly active
   broker targets. Docker E2E can require named cross-broker chaos phases and
   verifies cross-node produce/fetch recovery after each heal.
+  S3 WAL live refresh now forces shared-WAL discovery before Produce/Fetch
+  visibility decisions, skips already-covered stale WAL overlaps during live
+  refresh without weakening strict replacement recovery, maps recovery failures
+  to storage errors, and has default-suite coverage for immediate cross-broker
+  read-after-write plus reassignment-target recovery. The clean three-node
+  Docker E2E gate was re-executed successfully with `45/45` passing, including
+  cross-node fetch and target-owner Produce/Fetch after reassignment.
   Live Docker load/scale orchestration hooks and required-phase validation are
   now pinned by `test-e2e`; broader CI execution across real scale-in/out/load
   environments remains.

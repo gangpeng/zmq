@@ -225,6 +225,15 @@ pub const PartitionStore = struct {
     /// or broker replacement. The S3 object payload remains the source of truth;
     /// this reconstructs stream ranges from the ObjectWriter index.
     pub fn recoverS3WalObjects(self: *PartitionStore) !u64 {
+        return self.recoverS3WalObjectsWithPolicy(.strict);
+    }
+
+    const S3WalRecoveryPolicy = enum {
+        strict,
+        live_refresh,
+    };
+
+    fn recoverS3WalObjectsWithPolicy(self: *PartitionStore, policy: S3WalRecoveryPolicy) !u64 {
         const om = self.object_manager orelse return 0;
         if (self.s3_storage == null) return 0;
 
@@ -255,9 +264,11 @@ pub const PartitionStore = struct {
             defer self.allocator.free(ranges);
             if (ranges.len == 0) continue;
 
-            try self.rejectOverlappingS3WalRanges(om, key, ranges);
+            const recoverable_ranges = try self.filterRecoverableS3WalRanges(om, key, &reader, ranges, policy);
+            defer self.allocator.free(recoverable_ranges);
+            if (recoverable_ranges.len == 0) continue;
 
-            for (ranges) |range| {
+            for (recoverable_ranges) |range| {
                 if (om.getStream(range.stream_id) == null) {
                     _ = try om.createStreamWithId(range.stream_id, om.node_id);
                 }
@@ -266,7 +277,7 @@ pub const PartitionStore = struct {
             const object_id = om.allocateObjectId();
             const order_id = om.next_order_id;
             om.next_order_id += 1;
-            try om.commitStreamSetObject(object_id, om.node_id, order_id, ranges, key, object_data.len);
+            try om.commitStreamSetObject(object_id, om.node_id, order_id, recoverable_ranges, key, object_data.len);
             recovered += 1;
         }
 
@@ -282,7 +293,7 @@ pub const PartitionStore = struct {
             return false;
         }
 
-        const recovered = try self.recoverS3WalObjects();
+        const recovered = try self.recoverS3WalObjectsWithPolicy(.live_refresh);
         const repaired = self.repairPartitionStatesFromObjectManager();
         self.last_s3_wal_recovery_ms = now_ms;
         return recovered > 0 or repaired;
@@ -296,20 +307,93 @@ pub const PartitionStore = struct {
         return state.next_offset == 0 and state.high_watermark == 0;
     }
 
-    fn rejectOverlappingS3WalRanges(self: *PartitionStore, om: *ObjectManager, key: []const u8, ranges: []const stream_mod.StreamOffsetRange) !void {
+    fn filterRecoverableS3WalRanges(self: *PartitionStore, om: *ObjectManager, key: []const u8, reader: *const ObjectReader, ranges: []const stream_mod.StreamOffsetRange, policy: S3WalRecoveryPolicy) ![]stream_mod.StreamOffsetRange {
+        var recoverable = std.array_list.Managed(stream_mod.StreamOffsetRange).init(self.allocator);
+        errdefer recoverable.deinit();
+
         for (ranges) |range| {
             if (range.end_offset <= range.start_offset) {
                 log.warn("S3 WAL object {s} has invalid stream range {d}[{d},{d})", .{ key, range.stream_id, range.start_offset, range.end_offset });
                 return error.InvalidS3WalRange;
             }
 
-            const overlaps = try om.getObjects(range.stream_id, range.start_offset, range.end_offset, 1);
+            const overlaps = try om.getObjects(range.stream_id, range.start_offset, range.end_offset, 4096);
             defer if (overlaps.len > 0) self.allocator.free(overlaps);
             if (overlaps.len > 0) {
+                if (try self.s3WalRangeAlreadyRecovered(reader, range, overlaps)) {
+                    log.info("Skipping already recovered S3 WAL range {s}: stream {d}[{d},{d})", .{ key, range.stream_id, range.start_offset, range.end_offset });
+                    continue;
+                }
+                if (policy == .live_refresh and s3WalRangeFullyCovered(range, overlaps)) {
+                    log.warn("Skipping stale overlapping S3 WAL range during live refresh {s}: stream {d}[{d},{d})", .{ key, range.stream_id, range.start_offset, range.end_offset });
+                    continue;
+                }
                 log.warn("S3 WAL object {s} overlaps existing stream range {d}[{d},{d})", .{ key, range.stream_id, range.start_offset, range.end_offset });
                 return error.S3WalOffsetOverlap;
             }
+
+            try recoverable.append(range);
         }
+
+        return try recoverable.toOwnedSlice();
+    }
+
+    fn s3WalRangeFullyCovered(range: stream_mod.StreamOffsetRange, overlaps: []const stream_mod.S3ObjectMetadata) bool {
+        var covered_until = range.start_offset;
+        for (overlaps) |meta| {
+            if (meta.end_offset <= covered_until) continue;
+            if (meta.start_offset > covered_until) return false;
+            covered_until = @max(covered_until, meta.end_offset);
+            if (covered_until >= range.end_offset) return true;
+        }
+        return false;
+    }
+
+    fn s3WalRangeAlreadyRecovered(self: *PartitionStore, reader: *const ObjectReader, range: stream_mod.StreamOffsetRange, overlaps: []const stream_mod.S3ObjectMetadata) !bool {
+        var candidate_entries: usize = 0;
+        for (reader.index_entries, 0..) |entry, entry_index| {
+            if (entry.stream_id != range.stream_id) continue;
+            const entry_end = std.math.add(u64, entry.start_offset, entry.end_offset_delta) catch std.math.maxInt(u64);
+            if (entry_end <= range.start_offset or entry.start_offset >= range.end_offset) continue;
+
+            candidate_entries += 1;
+            const candidate_block = reader.readBlock(entry_index) orelse return false;
+            if (!try self.s3WalEntryAlreadyRecovered(entry, entry_end, candidate_block, overlaps)) {
+                return false;
+            }
+        }
+        return candidate_entries > 0;
+    }
+
+    fn s3WalEntryAlreadyRecovered(self: *PartitionStore, candidate_entry: ObjectWriter.DataBlockIndex, candidate_end: u64, candidate_block: []const u8, overlaps: []const stream_mod.S3ObjectMetadata) !bool {
+        for (overlaps) |meta| {
+            if (meta.start_offset > candidate_entry.start_offset or meta.end_offset < candidate_end) continue;
+
+            const object_data = blk: {
+                if (self.s3_storage) |*s3| {
+                    break :blk (try s3.getObject(meta.s3_key)) orelse return error.S3ObjectMissing;
+                }
+                return error.S3StorageUnavailable;
+            };
+            defer self.allocator.free(object_data);
+
+            var existing_reader = ObjectReader.parse(self.allocator, object_data) catch |err| {
+                log.warn("Failed to parse existing S3 object {s} while checking WAL duplicate: {}", .{ meta.s3_key, err });
+                return err;
+            };
+            defer existing_reader.deinit();
+
+            const indexes = try existing_reader.findEntryIndexes(self.allocator, candidate_entry.stream_id, candidate_entry.start_offset, candidate_end);
+            defer self.allocator.free(indexes);
+            for (indexes) |index| {
+                const existing_entry = existing_reader.index_entries[index];
+                const existing_end = std.math.add(u64, existing_entry.start_offset, existing_entry.end_offset_delta) catch std.math.maxInt(u64);
+                if (existing_entry.start_offset != candidate_entry.start_offset or existing_end != candidate_end) continue;
+                const existing_block = existing_reader.readBlock(index) orelse continue;
+                if (std.mem.eql(u8, existing_block, candidate_block)) return true;
+            }
+        }
+        return false;
     }
 
     fn objectManagerHasS3Key(om: *ObjectManager, key: []const u8) bool {
@@ -549,7 +633,7 @@ pub const PartitionStore = struct {
         try self.ensurePartition(topic, partition_id);
 
         if (self.s3_wal_mode) {
-            _ = try self.refreshS3WalObjects(self.shouldRefreshS3WalBeforeProduce(topic, partition_id));
+            _ = try self.refreshS3WalObjects(true);
         }
 
         var key_buf: [256]u8 = undefined;
@@ -806,7 +890,7 @@ pub const PartitionStore = struct {
         };
 
         if (self.s3_wal_mode) {
-            _ = try self.refreshS3WalObjects(state.next_offset == 0 or start_offset >= state.next_offset);
+            _ = try self.refreshS3WalObjects(true);
             state = self.partitions.get(key) orelse state;
         }
 
@@ -1495,6 +1579,49 @@ test "PartitionStore rebuilds S3 WAL metadata and fetches object data" {
     try testing.expectEqualStrings("ab", result.records);
 }
 
+test "PartitionStore S3 WAL recovery skips byte-identical overlapping replay" {
+    var mock_s3 = MockS3.init(testing.allocator);
+    defer mock_s3.deinit();
+    var s3_storage = S3Storage.initMock(testing.allocator, &mock_s3);
+
+    const stream_id = PartitionStore.hashPartitionKey("s3-duplicate-replay-topic", 0);
+    {
+        var batcher = S3WalBatcher.init(testing.allocator);
+        defer batcher.deinit();
+        try batcher.append(stream_id, 0, "same-record");
+        try testing.expect(batcher.flushNow(&s3_storage));
+    }
+    {
+        var duplicate_batcher = S3WalBatcher.init(testing.allocator);
+        defer duplicate_batcher.deinit();
+        duplicate_batcher.s3_object_counter = 1;
+        try duplicate_batcher.append(stream_id, 0, "same-record");
+        try testing.expect(duplicate_batcher.flushNow(&s3_storage));
+    }
+
+    try testing.expectEqual(@as(usize, 2), mock_s3.objectCount());
+
+    var object_manager = ObjectManager.init(testing.allocator, 1);
+    defer object_manager.deinit();
+
+    var store = PartitionStore.init(testing.allocator);
+    defer store.deinit();
+    store.s3_storage = s3_storage;
+    store.object_manager = &object_manager;
+
+    try testing.expectEqual(@as(u64, 1), try store.recoverS3WalObjects());
+    try testing.expectEqual(@as(usize, 1), object_manager.getStreamSetObjectCount());
+    try testing.expectEqual(@as(u64, 1), object_manager.getStream(stream_id).?.end_offset);
+
+    try store.ensurePartition("s3-duplicate-replay-topic", 0);
+    try testing.expect(store.repairPartitionStatesFromObjectManager());
+
+    const result = try store.fetch("s3-duplicate-replay-topic", 0, 0, 1024);
+    defer if (result.records.len > 0) testing.allocator.free(@constCast(result.records));
+    try testing.expectEqual(@as(i16, 0), result.error_code);
+    try testing.expectEqualStrings("same-record", result.records);
+}
+
 test "PartitionStore rebuilds S3 WAL data after local store replacement" {
     var mock_s3 = MockS3.init(testing.allocator);
     defer mock_s3.deinit();
@@ -1624,6 +1751,82 @@ test "PartitionStore S3 WAL alternating writers refresh offsets and fetch visibi
     try testing.expectEqualStrings("abc", fetched.records);
 }
 
+test "PartitionStore S3 WAL produce forces recovery before assigning offset" {
+    var mock_s3 = MockS3.init(testing.allocator);
+    defer mock_s3.deinit();
+    const s3_storage = S3Storage.initMock(testing.allocator, &mock_s3);
+
+    var object_manager_a = ObjectManager.init(testing.allocator, 1);
+    defer object_manager_a.deinit();
+    var object_manager_b = ObjectManager.init(testing.allocator, 2);
+    defer object_manager_b.deinit();
+
+    var store_a = PartitionStore.init(testing.allocator);
+    defer store_a.deinit();
+    store_a.s3_wal_mode = true;
+    store_a.s3_storage = s3_storage;
+    store_a.s3_wal_batcher = S3WalBatcher.init(testing.allocator);
+    store_a.setObjectManager(&object_manager_a);
+
+    var store_b = PartitionStore.init(testing.allocator);
+    defer store_b.deinit();
+    store_b.s3_wal_mode = true;
+    store_b.s3_storage = s3_storage;
+    store_b.s3_wal_batcher = S3WalBatcher.init(testing.allocator);
+    store_b.setObjectManager(&object_manager_b);
+
+    try testing.expectEqual(@as(i64, 0), (try store_a.produce("s3-produce-refresh-topic", 0, "a")).base_offset);
+
+    try store_b.ensurePartition("s3-produce-refresh-topic", 0);
+    try testing.expect(try store_b.refreshS3WalObjects(true));
+    try testing.expectEqual(@as(i64, 1), (try store_a.produce("s3-produce-refresh-topic", 0, "b")).base_offset);
+
+    store_b.last_s3_wal_recovery_ms = @import("time_compat").milliTimestamp();
+    try testing.expectEqual(@as(i64, 2), (try store_b.produce("s3-produce-refresh-topic", 0, "c")).base_offset);
+}
+
+test "PartitionStore S3 WAL fetch forces recovery for fresh cross-broker data" {
+    var mock_s3 = MockS3.init(testing.allocator);
+    defer mock_s3.deinit();
+    const s3_storage = S3Storage.initMock(testing.allocator, &mock_s3);
+
+    var object_manager_a = ObjectManager.init(testing.allocator, 1);
+    defer object_manager_a.deinit();
+    var object_manager_b = ObjectManager.init(testing.allocator, 2);
+    defer object_manager_b.deinit();
+
+    var store_a = PartitionStore.init(testing.allocator);
+    defer store_a.deinit();
+    store_a.s3_wal_mode = true;
+    store_a.s3_storage = s3_storage;
+    store_a.s3_wal_batcher = S3WalBatcher.init(testing.allocator);
+    store_a.setObjectManager(&object_manager_a);
+
+    var store_b = PartitionStore.init(testing.allocator);
+    defer store_b.deinit();
+    store_b.s3_wal_mode = true;
+    store_b.s3_storage = s3_storage;
+    store_b.s3_wal_batcher = S3WalBatcher.init(testing.allocator);
+    store_b.setObjectManager(&object_manager_b);
+
+    try testing.expectEqual(@as(i64, 0), (try store_a.produce("s3-fetch-refresh-topic", 0, "a")).base_offset);
+    try store_b.ensurePartition("s3-fetch-refresh-topic", 0);
+
+    const first_fetch = try store_b.fetch("s3-fetch-refresh-topic", 0, 0, 1024);
+    defer if (first_fetch.records.len > 0) testing.allocator.free(@constCast(first_fetch.records));
+    try testing.expectEqual(@as(i16, 0), first_fetch.error_code);
+    try testing.expectEqualStrings("a", first_fetch.records);
+
+    try testing.expectEqual(@as(i64, 1), (try store_a.produce("s3-fetch-refresh-topic", 0, "b")).base_offset);
+    store_b.last_s3_wal_recovery_ms = @import("time_compat").milliTimestamp();
+
+    const second_fetch = try store_b.fetch("s3-fetch-refresh-topic", 0, 0, 1024);
+    defer if (second_fetch.records.len > 0) testing.allocator.free(@constCast(second_fetch.records));
+    try testing.expectEqual(@as(i16, 0), second_fetch.error_code);
+    try testing.expectEqual(@as(i64, 2), second_fetch.high_watermark);
+    try testing.expectEqualStrings("ab", second_fetch.records);
+}
+
 test "PartitionStore fails S3 WAL recovery on overlapping object ranges" {
     var mock_s3 = MockS3.init(testing.allocator);
     defer mock_s3.deinit();
@@ -1653,6 +1856,44 @@ test "PartitionStore fails S3 WAL recovery on overlapping object ranges" {
     store.object_manager = &object_manager;
 
     try testing.expectError(error.S3WalOffsetOverlap, store.recoverS3WalObjects());
+}
+
+test "PartitionStore live S3 WAL refresh skips fully covered stale overlap" {
+    var mock_s3 = MockS3.init(testing.allocator);
+    defer mock_s3.deinit();
+    var s3_storage = S3Storage.initMock(testing.allocator, &mock_s3);
+
+    const stream_id = PartitionStore.hashPartitionKey("s3-live-overlap-topic", 0);
+    {
+        var batcher = S3WalBatcher.init(testing.allocator);
+        defer batcher.deinit();
+        try batcher.append(stream_id, 0, "first");
+        try testing.expect(batcher.flushNow(&s3_storage));
+    }
+    {
+        var stale_batcher = S3WalBatcher.init(testing.allocator);
+        defer stale_batcher.deinit();
+        stale_batcher.setEpoch(1);
+        try stale_batcher.append(stream_id, 0, "stale");
+        try testing.expect(stale_batcher.flushNow(&s3_storage));
+    }
+
+    var object_manager = ObjectManager.init(testing.allocator, 1);
+    defer object_manager.deinit();
+
+    var store = PartitionStore.init(testing.allocator);
+    defer store.deinit();
+    store.s3_wal_mode = true;
+    store.s3_storage = s3_storage;
+    store.object_manager = &object_manager;
+
+    try store.ensurePartition("s3-live-overlap-topic", 0);
+    try testing.expect(try store.refreshS3WalObjects(true));
+
+    const result = try store.fetch("s3-live-overlap-topic", 0, 0, 1024);
+    defer if (result.records.len > 0) testing.allocator.free(@constCast(result.records));
+    try testing.expectEqual(@as(i16, 0), result.error_code);
+    try testing.expectEqualStrings("first", result.records);
 }
 
 test "PartitionStore fetch filters interleaved S3 WAL stream blocks" {
@@ -1935,7 +2176,7 @@ test "PartitionStore S3 WAL failed sync produce is not visible or retained" {
     try testing.expectEqualStrings("rec-a", visible.records);
 }
 
-test "PartitionStore S3 WAL hot local produce and fetch do not require repeated S3 listing" {
+test "PartitionStore S3 WAL hot local produce and fetch tolerate repeated S3 listing" {
     var mock_s3 = MockS3.init(testing.allocator);
     defer mock_s3.deinit();
     const s3_storage = S3Storage.initMock(testing.allocator, &mock_s3);
@@ -1953,7 +2194,7 @@ test "PartitionStore S3 WAL hot local produce and fetch do not require repeated 
     const first = try store.produce("hot-local-topic", 0, "a");
     try testing.expectEqual(@as(i64, 0), first.base_offset);
 
-    mock_s3.failNextListObjects(1);
+    const list_count_after_first = mock_s3.list_count;
 
     const second = try store.produce("hot-local-topic", 0, "b");
     try testing.expectEqual(@as(i64, 1), second.base_offset);
@@ -1963,6 +2204,7 @@ test "PartitionStore S3 WAL hot local produce and fetch do not require repeated 
     try testing.expectEqual(@as(i16, 0), fetched.error_code);
     try testing.expectEqual(@as(i64, 2), fetched.high_watermark);
     try testing.expectEqualStrings("ab", fetched.records);
+    try testing.expect(mock_s3.list_count > list_count_after_first);
 }
 
 test "PartitionStore S3 WAL empty fetch does not probe legacy data objects" {

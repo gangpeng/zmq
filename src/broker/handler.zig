@@ -80,10 +80,10 @@ const max_local_replica_directories: usize = 16;
 /// Owns all broker-level state: partition storage, consumer group
 /// coordination, transactions, quotas, metrics.
 pub const Broker = struct {
-    // No global mutex needed — the broker runs in a single-threaded
-    // epoll/io_uring event loop with inline handler calls. Removing the mutex
-    // eliminates unnecessary synchronization overhead.
-    // If multi-threaded processing is added later, use per-partition locks instead.
+    // Broker request handling is single-threaded, but combined controller+broker
+    // mode also invokes broker metadata replay from controller/election threads.
+    // Serialize broker-owned maps and alloc/free paths at the public entrypoints.
+    state_mutex: @import("mutex_compat").Mutex = .{},
     store: PartitionStore,
     groups: GroupCoordinator,
     txn_coordinator: TxnCoordinator,
@@ -139,6 +139,14 @@ pub const Broker = struct {
     /// Raft consensus state. Non-null when this node has the controller role.
     /// Null in broker-only mode (metadata comes from the controller via MetadataClient).
     raft_state: ?*RaftState = null,
+    /// Per-record-family cursors for applying committed Raft metadata into
+    /// broker-local views. Replaying every committed snapshot on every request
+    /// creates unnecessary allocator churn and can race with background commit
+    /// hooks in combined controller+broker mode.
+    last_applied_auto_mq_metadata_offset: ?u64 = null,
+    last_applied_auto_mq_object_offset: ?u64 = null,
+    last_applied_topic_quorum_offset: ?u64 = null,
+    last_applied_partition_reassignment_offset: ?u64 = null,
     /// Cached leader epoch received from the controller (used in broker-only mode).
     cached_leader_epoch: i32 = 0,
     /// Cached broker epoch assigned by the controller during BrokerRegistration.
@@ -1072,9 +1080,22 @@ pub const Broker = struct {
         }
     }
 
+    fn localFailoverTickEnabled(self: *const Broker) bool {
+        if (self.raft_state) |raft| {
+            return raft.quorumSize() <= 1;
+        }
+        return self.cached_broker_epoch == 0;
+    }
+
     /// Periodic maintenance — should be called every ~1 second.
     /// Handles: session timeout eviction, rebalance timeouts, S3 flush, metrics.
     pub fn tick(self: *Broker) void {
+        self.state_mutex.lock();
+        defer self.state_mutex.unlock();
+        self.tickUnlocked();
+    }
+
+    fn tickUnlocked(self: *Broker) void {
         // Evict expired consumer group members using each group's JoinGroup
         // session timeout.
         const evicted = self.groups.evictExpiredMembers();
@@ -1148,13 +1169,18 @@ pub const Broker = struct {
         // Expire delayed fetches
         self.expireDelayedFetches();
 
-        // Check for failed nodes and trigger failover
-        const failovers = self.failover_controller.tick(@import("time_compat").milliTimestamp());
-        if (failovers > 0) {
-            log.info("Failover: {d} nodes failed over", .{failovers});
-            // Sync WAL epoch with failover controller
-            if (self.store.s3_wal_batcher) |*batcher| {
-                batcher.setEpoch(self.failover_controller.wal_epoch);
+        // Check for failed nodes and trigger local failover only in standalone
+        // ownership mode. Multi-node KRaft ownership is controller/quorum
+        // driven; a broker-local heartbeat timer would create split-brain
+        // metadata and can race with replicated ownership snapshots.
+        if (self.localFailoverTickEnabled()) {
+            const failovers = self.failover_controller.tick(@import("time_compat").milliTimestamp());
+            if (failovers > 0) {
+                log.info("Failover: {d} nodes failed over", .{failovers});
+                // Sync WAL epoch with failover controller
+                if (self.store.s3_wal_batcher) |*batcher| {
+                    batcher.setEpoch(self.failover_controller.wal_epoch);
+                }
             }
         }
 
@@ -1422,6 +1448,12 @@ pub const Broker = struct {
     /// primarily a safety net for future response-delayed batching.
     /// Returns true if flush succeeded (or nothing to flush).
     pub fn flushPendingWal(self: *Broker) bool {
+        self.state_mutex.lock();
+        defer self.state_mutex.unlock();
+        return self.flushPendingWalUnlocked();
+    }
+
+    fn flushPendingWalUnlocked(self: *Broker) bool {
         const batcher = &(self.store.s3_wal_batcher orelse return true);
         if (batcher.flush_mode != .group_commit) return true;
         if (!batcher.hasPendingFlush()) return true;
@@ -5221,7 +5253,6 @@ pub const Broker = struct {
     }
 
     /// Process a raw Kafka protocol request frame and return the response.
-    /// No mutex needed — single-threaded event loop.
     pub fn handleRequest(self: *Broker, request_bytes: []const u8) ?[]u8 {
         self.wireInternalPointers();
 
@@ -5321,7 +5352,7 @@ pub const Broker = struct {
         // Record per-API latency
         const t_start = @import("time_compat").nanoTimestamp();
 
-        if ((api_key >= 501 and api_key <= 519) or (api_key >= 600 and api_key <= 602)) {
+        if (shouldRefreshQuorumStateForApi(api_key)) {
             self.refreshAutoMqQuorumStateForRequest();
         }
 
@@ -10519,11 +10550,19 @@ pub const Broker = struct {
         const raft = self.raft_state orelse return 0;
 
         var applied: usize = 0;
+        var cleared_for_full_replay = false;
         for (raft.log.entries.items) |entry| {
             if (entry.offset > raft.commit_index) break;
+            if (self.last_applied_auto_mq_metadata_offset) |last_offset| {
+                if (entry.offset <= last_offset) continue;
+            }
             if (!isAutoMqMetadataRecord(entry.data)) continue;
-            if (applied == 0) self.clearAutoMqMetadata();
+            if (self.last_applied_auto_mq_metadata_offset == null and !cleared_for_full_replay) {
+                self.clearAutoMqMetadata();
+                cleared_for_full_replay = true;
+            }
             try self.applyAutoMqMetadataRecord(entry.data);
+            self.last_applied_auto_mq_metadata_offset = entry.offset;
             applied += 1;
         }
         return applied;
@@ -10621,8 +10660,12 @@ pub const Broker = struct {
         var applied: usize = 0;
         for (raft.log.entries.items) |entry| {
             if (entry.offset > raft.commit_index) break;
+            if (self.last_applied_auto_mq_object_offset) |last_offset| {
+                if (entry.offset <= last_offset) continue;
+            }
             if (!isAutoMqObjectMetadataRecord(entry.data)) continue;
             try self.applyAutoMqObjectMetadataRecord(entry.data);
+            self.last_applied_auto_mq_object_offset = entry.offset;
             applied += 1;
         }
         return applied;
@@ -10672,8 +10715,12 @@ pub const Broker = struct {
         var applied: usize = 0;
         for (raft.log.entries.items) |entry| {
             if (entry.offset > raft.commit_index) break;
+            if (self.last_applied_topic_quorum_offset) |last_offset| {
+                if (entry.offset <= last_offset) continue;
+            }
             if (!isTopicQuorumRecord(entry.data)) continue;
             try self.applyTopicQuorumRecord(entry.data);
+            self.last_applied_topic_quorum_offset = entry.offset;
             applied += 1;
         }
         return applied;
@@ -10723,14 +10770,24 @@ pub const Broker = struct {
         var applied: usize = 0;
         for (raft.log.entries.items) |entry| {
             if (entry.offset > raft.commit_index) break;
+            if (self.last_applied_partition_reassignment_offset) |last_offset| {
+                if (entry.offset <= last_offset) continue;
+            }
             if (!isPartitionReassignmentQuorumRecord(entry.data)) continue;
             try self.applyPartitionReassignmentQuorumRecord(entry.data);
+            self.last_applied_partition_reassignment_offset = entry.offset;
             applied += 1;
         }
         return applied;
     }
 
     pub fn applyCommittedAutoMqQuorumRecords(self: *Broker) !usize {
+        self.state_mutex.lock();
+        defer self.state_mutex.unlock();
+        return self.applyCommittedAutoMqQuorumRecordsUnlocked();
+    }
+
+    fn applyCommittedAutoMqQuorumRecordsUnlocked(self: *Broker) !usize {
         const metadata_applied = try self.replayCommittedAutoMqMetadataRecords();
         const object_applied = try self.replayCommittedAutoMqObjectMetadataRecords();
         const topic_applied = try self.replayCommittedTopicQuorumRecords();
@@ -10751,6 +10808,15 @@ pub const Broker = struct {
         _ = self.applyCommittedAutoMqQuorumRecords() catch |err| {
             log.warn("Failed to refresh AutoMQ quorum metadata before request: {}", .{err});
         };
+    }
+
+    fn shouldRefreshQuorumStateForApi(api_key: i16) bool {
+        return (api_key >= 501 and api_key <= 519) or
+            (api_key >= 600 and api_key <= 602) or
+            switch (api_key) {
+                0, 1, 3, 19, 20, 37, 45, 46 => true,
+                else => false,
+            };
     }
 
     fn makeStreamObjectKey(self: *Broker, object_id: u64, stream_id: u64, start_offset: u64, end_offset: u64) ![]u8 {
@@ -11236,6 +11302,9 @@ pub const Broker = struct {
                 } else if (err == error.S3WalFlushFailed or err == error.S3StorageUnavailable) {
                     log.warn("S3 WAL storage error for {s}-{d}: {}", .{ topic_name, partition_req.index, err });
                     was_storage_error = true;
+                } else {
+                    log.warn("Produce storage path failed for {s}-{d}: {}", .{ topic_name, partition_req.index, err });
+                    was_storage_error = true;
                 }
                 break :blk null;
             }
@@ -11601,7 +11670,7 @@ pub const Broker = struct {
         const fetch_result = self.store.fetchWithIsolation(topic_name, partition_req.partition, fetch_offset, 1024 * 1024, isolation_level) catch |err| blk: {
             log.debug("Fetch failed for {s}-{d} at offset {d}: {}", .{ topic_name, partition_req.partition, fetch_offset, err });
             break :blk PartitionStore.FetchResult{
-                .error_code = @intFromEnum(ErrorCode.unknown_topic_or_partition),
+                .error_code = @intFromEnum(ErrorCode.kafka_storage_error),
                 .records = &.{},
                 .high_watermark = 0,
                 .last_stable_offset = -1,
@@ -23848,6 +23917,12 @@ pub const Broker = struct {
         const TopicResponse = Resp.ReassignableTopicResponse;
         const PartitionResponse = TopicResponse.ReassignablePartitionResponse;
 
+        if (self.forwardControllerMutationToLeader(request_bytes)) |forwarded| {
+            if (forwarded) |response| return response;
+        } else |err| {
+            log.warn("Failed to forward AlterPartitionReassignments to controller leader: {}", .{err});
+        }
+
         var pos = body_start;
         if (!validateAlterPartitionReassignmentsRequestFrame(request_bytes, body_start)) {
             log.warn("Malformed AlterPartitionReassignments request", .{});
@@ -24180,6 +24255,12 @@ pub const Broker = struct {
     fn handleListPartitionReassignments(self: *Broker, request_bytes: []const u8, body_start: usize, req_header: *const RequestHeader, api_version: i16, resp_header_version: i16) ?[]u8 {
         const Req = generated.list_partition_reassignments_request.ListPartitionReassignmentsRequest;
         const Resp = generated.list_partition_reassignments_response.ListPartitionReassignmentsResponse;
+
+        if (self.forwardControllerMutationToLeader(request_bytes)) |forwarded| {
+            if (forwarded) |response| return response;
+        } else |err| {
+            log.warn("Failed to forward ListPartitionReassignments to controller leader: {}", .{err});
+        }
 
         var pos = body_start;
         if (!validateListPartitionReassignmentsRequestFrame(request_bytes, body_start)) {
@@ -43553,6 +43634,30 @@ test "Broker tick skips scheduled controller-aware rebalance before interval ela
     try testing.expectEqual(@as(?i32, 3), broker.failover_controller.findPartitionOwner("rebalance-scheduled-skip", 0));
 }
 
+test "Broker tick does not run local failover under multi-node KRaft ownership" {
+    var raft = RaftState.init(testing.allocator, 1, "broker-local-failover-kraft");
+    defer raft.deinit();
+    try raft.addVoter(1);
+    try raft.addVoter(2);
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+    broker.setRaftState(&raft);
+
+    try broker.failover_controller.registerNode(1);
+    try broker.failover_controller.registerNode(2);
+    try broker.failover_controller.registerPartitionOwner("kraft-owned", 0, 2);
+    if (broker.failover_controller.known_nodes.getPtr(2)) |state| {
+        state.last_heartbeat_ms = 0;
+    }
+
+    broker.tick();
+
+    try testing.expectEqual(@as(?i32, 2), broker.failover_controller.findPartitionOwner("kraft-owned", 0));
+    try testing.expectEqual(@as(usize, 1), broker.failover_controller.nodePartitionCount(2));
+    try testing.expect(!broker.failover_controller.known_nodes.get(2).?.is_fenced);
+}
+
 test "Broker rejects stale auto-balancer plan before mutating reassignment state" {
     var broker = Broker.init(testing.allocator, 1, 9092);
     defer broker.deinit();
@@ -43617,6 +43722,7 @@ test "Broker topic quorum records replay topic metadata before reassignments" {
         defer observer.deinit();
         observer.setRaftState(&raft);
         try testing.expectEqual(@as(usize, 2), try observer.applyCommittedAutoMqQuorumRecords());
+        try testing.expectEqual(@as(usize, 0), try observer.applyCommittedAutoMqQuorumRecords());
         try testing.expect(observer.topics.contains(topic_name));
         try testing.expectEqual(@as(?i32, 2), observer.failover_controller.findPartitionOwner(topic_name, 0));
         try testing.expectEqual(@as(u32, 1), observer.partition_reassignments.count());
@@ -43627,6 +43733,7 @@ test "Broker topic quorum records replay topic metadata before reassignments" {
         defer target.deinit();
         target.setRaftState(&raft);
         try testing.expectEqual(@as(usize, 2), try target.applyCommittedAutoMqQuorumRecords());
+        try testing.expectEqual(@as(usize, 0), try target.applyCommittedAutoMqQuorumRecords());
         try testing.expect(target.topics.contains(topic_name));
         try testing.expectEqual(@as(?i32, 2), target.failover_controller.findPartitionOwner(topic_name, 0));
         try testing.expectEqual(@as(u32, 0), target.partition_reassignments.count());
@@ -44938,8 +45045,8 @@ test "Broker.handleRequest BeginQuorumEpoch applies internal AutoMQ AppendEntrie
     try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.none)), resp.error_code);
     try testing.expectEqual(@as(usize, 1), raft.log.length());
     try testing.expectEqual(@as(u64, 0), raft.commit_index);
-    try testing.expectEqual(@as(usize, 1), try broker.replayCommittedAutoMqMetadataRecords());
     try testing.expectEqualStrings("beta", broker.auto_mq_kvs.get("alpha").?);
+    try testing.expectEqual(@as(usize, 0), try broker.replayCommittedAutoMqMetadataRecords());
 }
 
 test "Broker replays replicated AutoMQ object metadata AppendEntries payload" {
@@ -44982,7 +45089,6 @@ test "Broker replays replicated AutoMQ object metadata AppendEntries payload" {
 
     try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.none)), resp.error_code);
     try testing.expectEqual(@as(usize, 1), raft.log.length());
-    try testing.expectEqual(@as(usize, 1), try follower.replayCommittedAutoMqObjectMetadataRecords());
 
     const restored_stream = follower.object_manager.getStream(stream_id).?;
     try testing.expectEqual(@as(u64, 10), restored_stream.end_offset);
@@ -44990,6 +45096,7 @@ test "Broker replays replicated AutoMQ object metadata AppendEntries payload" {
     try testing.expectEqual(stream_id, restored_object.stream_id);
     try testing.expectEqual(@as(u64, 10), restored_object.end_offset);
     try testing.expect(follower.object_manager.prepared_registry.contains(prepared_only_object_id));
+    try testing.expectEqual(@as(usize, 0), try follower.replayCommittedAutoMqObjectMetadataRecords());
 }
 
 test "Broker replays replicated AutoMQ state after follower promotion" {

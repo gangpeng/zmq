@@ -148,39 +148,69 @@ pub const FailoverController = struct {
             self.node_id,
         });
 
-        // 2. Take ownership of failed node's partitions.
+        // 2. Take ownership of failed node's partitions. Copy topic names
+        // instead of shallow-moving them so each NodeState has unambiguous
+        // ownership even if later reassignment cleanup scans all nodes.
         if (failed.owned_partitions.items.len == 0) return;
         const target = self.known_nodes.getPtr(self.node_id) orelse {
             log.warn("Failover: local node {d} is not registered; leaving partitions on fenced node {d}", .{ self.node_id, failed.node_id });
             return;
         };
-        target.owned_partitions.appendSlice(failed.owned_partitions.items) catch |err| {
+
+        var moved = std.array_list.Managed(PartitionId).init(self.allocator);
+        defer moved.deinit();
+        var moved_committed = false;
+        defer if (!moved_committed) {
+            for (moved.items) |partition| self.freePartitionId(partition);
+        };
+
+        for (failed.owned_partitions.items) |partition| {
+            const topic_copy = self.allocator.dupe(u8, partition.topic) catch |err| {
+                log.err("Failover: failed to copy partition topic for node {d}: {}", .{ failed.node_id, err });
+                return;
+            };
+            moved.append(.{
+                .topic = topic_copy,
+                .partition = partition.partition,
+                .owns_topic = true,
+            }) catch |err| {
+                self.allocator.free(topic_copy);
+                log.err("Failover: failed to stage partition transfer from node {d} to node {d}: {}", .{ failed.node_id, self.node_id, err });
+                return;
+            };
+        }
+
+        target.owned_partitions.appendSlice(moved.items) catch |err| {
             log.err("Failover: failed to transfer partitions from node {d} to node {d}: {}", .{ failed.node_id, self.node_id, err });
             return;
         };
+        moved_committed = true;
         for (failed.owned_partitions.items) |partition| {
             log.info("Reassigning {s}-{d} to node {d}", .{ partition.topic, partition.partition, self.node_id });
         }
 
-        // 3. Clear the failed node's partition list (they now belong to us)
+        // 3. Clear the failed node's partition list. The target owns copied
+        // entries; the failed state still owns and must free its old entries.
+        for (failed.owned_partitions.items) |partition| self.freePartitionId(partition);
         failed.owned_partitions.clearRetainingCapacity();
     }
 
     /// Reassign a partition to a target node.
     /// Updates metadata so partition.leader = target, partition.isr = [target].
     pub fn reassignPartition(self: *FailoverController, partition: PartitionId, target: i32) !void {
-        try self.registerNode(target);
-        self.removePartitionOwnership(partition.topic, partition.partition);
-
         const topic_copy = try self.allocator.dupe(u8, partition.topic);
         errdefer self.allocator.free(topic_copy);
+
+        try self.registerNode(target);
+        self.removePartitionOwnership(topic_copy, partition.partition);
+
         const target_state = self.known_nodes.getPtr(target) orelse return error.UnknownFailoverTarget;
         try target_state.owned_partitions.append(.{
             .topic = topic_copy,
             .partition = partition.partition,
             .owns_topic = true,
         });
-        log.info("Reassigning {s}-{d} to node {d}", .{ partition.topic, partition.partition, target });
+        log.info("Reassigning {s}-{d} to node {d}", .{ topic_copy, partition.partition, target });
     }
 
     /// WAL epoch fencing — check if our epoch is still valid.
@@ -333,6 +363,39 @@ test "FailoverController explicit reassignment replaces stale ownership" {
     try fc.reassignPartition(.{ .topic = "topic-b", .partition = 0 }, 0);
     try testing.expectEqual(@as(?i32, 0), fc.findPartitionOwner("topic-b", 0));
     try testing.expectEqual(@as(usize, 1), fc.nodePartitionCount(0));
+}
+
+test "FailoverController reassignment tolerates stored topic slice" {
+    var fc = FailoverController.init(testing.allocator, 0);
+    defer fc.deinit();
+
+    try fc.registerNode(0);
+    try fc.registerNode(1);
+    try fc.registerPartitionOwner("topic-stored", 0, 1);
+
+    const stored_topic = fc.known_nodes.getPtr(1).?.owned_partitions.items[0].topic;
+    try fc.reassignPartition(.{ .topic = stored_topic, .partition = 0 }, 0);
+
+    try testing.expectEqual(@as(?i32, 0), fc.findPartitionOwner("topic-stored", 0));
+    try testing.expectEqual(@as(usize, 0), fc.nodePartitionCount(1));
+    try testing.expectEqual(@as(usize, 1), fc.nodePartitionCount(0));
+}
+
+test "FailoverController timeout transfer copies topic ownership" {
+    var fc = FailoverController.init(testing.allocator, 0);
+    defer fc.deinit();
+
+    try fc.registerNode(0);
+    try fc.registerNode(1);
+    try fc.registerPartitionOwner("topic-copy", 0, 1);
+    try fc.registerPartitionOwner("topic-copy", 1, 1);
+
+    if (fc.known_nodes.getPtr(1)) |state| state.last_heartbeat_ms = 0;
+    try testing.expectEqual(@as(u32, 1), fc.tick(@import("time_compat").milliTimestamp()));
+
+    try fc.reassignPartition(.{ .topic = "topic-copy", .partition = 0 }, 1);
+    try testing.expectEqual(@as(?i32, 1), fc.findPartitionOwner("topic-copy", 0));
+    try testing.expectEqual(@as(?i32, 0), fc.findPartitionOwner("topic-copy", 1));
 }
 
 test "FailoverController does not failover self" {
