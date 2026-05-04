@@ -44,6 +44,10 @@ Per-profile gates:
     ZMQ_S3_<PROFILE>_RUN_MULTIPART_FAULT=1 runs a provider-specific multipart
     fault-injection command after the live MinIO/S3 suite. It requires
     ZMQ_S3_<PROFILE>_MULTIPART_FAULT_CMD.
+    Multipart fault commands receive ZMQ_S3_MULTIPART_FAULT_* context for the
+    selected endpoint, bucket, credentials, scheme, region, path-style mode,
+    and TLS CA file so the injected fault targets the same provider profile
+    that passed the live S3 suite.
     ZMQ_S3_<PROFILE>_RUN_PROCESS_CRASH=1 also runs the broker-process
     crash/replacement harness with that provider's S3 settings.
     ZMQ_S3_<PROFILE>_RUN_LIVE_OUTAGE=1 also runs the live-S3 chaos outage
@@ -187,9 +191,20 @@ def provider_chaos_env(profile, env):
 def provider_multipart_fault_env(profile, env):
     fault_env = env.copy()
     fault_env["ZMQ_S3_MULTIPART_FAULT_PROFILE"] = profile
-    fault_env["ZMQ_S3_MULTIPART_FAULT_ENDPOINT"] = env["ZMQ_S3_ENDPOINT"]
-    fault_env["ZMQ_S3_MULTIPART_FAULT_PORT"] = env["ZMQ_S3_PORT"]
-    fault_env["ZMQ_S3_MULTIPART_FAULT_BUCKET"] = env["ZMQ_S3_BUCKET"]
+    for suffix in (
+        "ENDPOINT",
+        "PORT",
+        "BUCKET",
+        "ACCESS_KEY",
+        "SECRET_KEY",
+        "SCHEME",
+        "REGION",
+        "PATH_STYLE",
+        "TLS_CA_FILE",
+    ):
+        value = env.get(f"ZMQ_S3_{suffix}")
+        if value:
+            fault_env[f"ZMQ_S3_MULTIPART_FAULT_{suffix}"] = value
     return fault_env
 
 
@@ -364,9 +379,12 @@ def self_test():
         os.environ["ZMQ_S3_AWS_US_EAST_1_ENDPOINT"] = "s3.amazonaws.com"
         os.environ["ZMQ_S3_AWS_US_EAST_1_PORT"] = "443"
         os.environ["ZMQ_S3_AWS_US_EAST_1_BUCKET"] = "zmq-parity"
+        os.environ["ZMQ_S3_AWS_US_EAST_1_ACCESS_KEY"] = "akid"
+        os.environ["ZMQ_S3_AWS_US_EAST_1_SECRET_KEY"] = "secret"
         os.environ["ZMQ_S3_AWS_US_EAST_1_REGION"] = "us-east-1"
         os.environ["ZMQ_S3_AWS_US_EAST_1_SCHEME"] = "https"
         os.environ["ZMQ_S3_AWS_US_EAST_1_PATH_STYLE"] = "false"
+        os.environ["ZMQ_S3_AWS_US_EAST_1_TLS_CA_FILE"] = "/tmp/aws-ca.pem"
         os.environ["ZMQ_S3_AWS_US_EAST_1_SKIP_ENSURE_BUCKET"] = "1"
         os.environ["ZMQ_S3_AWS_US_EAST_1_SKIP_MINIO_HEALTH"] = "1"
         os.environ["ZMQ_S3_AWS_US_EAST_1_REQUIRE_LIST_PAGINATION"] = "1"
@@ -396,12 +414,18 @@ def self_test():
             raise MatrixError("profile port override failed")
         if env["ZMQ_S3_BUCKET"] != "zmq-parity":
             raise MatrixError("profile bucket override failed")
+        if env["ZMQ_S3_ACCESS_KEY"] != "akid":
+            raise MatrixError("profile access-key override failed")
+        if env["ZMQ_S3_SECRET_KEY"] != "secret":
+            raise MatrixError("profile secret-key override failed")
         if env["ZMQ_S3_REGION"] != "us-east-1":
             raise MatrixError("profile region override failed")
         if env["ZMQ_S3_SCHEME"] != "https":
             raise MatrixError("profile scheme override failed")
         if env["ZMQ_S3_PATH_STYLE"] != "false":
             raise MatrixError("profile path-style override failed")
+        if env["ZMQ_S3_TLS_CA_FILE"] != "/tmp/aws-ca.pem":
+            raise MatrixError("profile TLS CA override failed")
         if env["ZMQ_S3_SKIP_ENSURE_BUCKET"] != "1":
             raise MatrixError("profile skip-ensure-bucket override failed")
         if env["ZMQ_S3_SKIP_MINIO_HEALTH"] != "1":
@@ -428,6 +452,18 @@ def self_test():
             raise MatrixError("profile multipart-fault context failed")
         if fault_env["ZMQ_S3_MULTIPART_FAULT_BUCKET"] != "zmq-parity":
             raise MatrixError("profile multipart-fault bucket pass-through failed")
+        if fault_env["ZMQ_S3_MULTIPART_FAULT_ACCESS_KEY"] != "akid":
+            raise MatrixError("profile multipart-fault access-key pass-through failed")
+        if fault_env["ZMQ_S3_MULTIPART_FAULT_SECRET_KEY"] != "secret":
+            raise MatrixError("profile multipart-fault secret-key pass-through failed")
+        if fault_env["ZMQ_S3_MULTIPART_FAULT_SCHEME"] != "https":
+            raise MatrixError("profile multipart-fault scheme pass-through failed")
+        if fault_env["ZMQ_S3_MULTIPART_FAULT_REGION"] != "us-east-1":
+            raise MatrixError("profile multipart-fault region pass-through failed")
+        if fault_env["ZMQ_S3_MULTIPART_FAULT_PATH_STYLE"] != "false":
+            raise MatrixError("profile multipart-fault path-style pass-through failed")
+        if fault_env["ZMQ_S3_MULTIPART_FAULT_TLS_CA_FILE"] != "/tmp/aws-ca.pem":
+            raise MatrixError("profile multipart-fault TLS CA pass-through failed")
         run_command_string(
             "multipart-fault self-test",
             profile_setting("aws_us_east_1", "MULTIPART_FAULT_CMD", None),
