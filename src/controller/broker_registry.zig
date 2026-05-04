@@ -106,7 +106,7 @@ pub const BrokerRegistry = struct {
         log.info("Broker {d} registered: {s}:{d} epoch={d}", .{ broker_id, host, port, broker_epoch });
     }
 
-    /// Process a heartbeat from a broker. Returns true if the broker is active.
+    /// Process a heartbeat from a broker. Returns false for stale epochs.
     /// Called when a broker sends BrokerHeartbeat (API 63).
     pub fn heartbeat(self: *BrokerRegistry, broker_id: i32, broker_epoch: i64) !bool {
         return self.heartbeatWithOfflineLogDirs(broker_id, broker_epoch, false, &.{});
@@ -123,24 +123,40 @@ pub const BrokerRegistry = struct {
             return false;
         }
 
+        const should_fence = want_fence or allRegisteredLogDirsOffline(entry.log_dirs, offline_log_dirs);
+        try self.installLogDirStatus(broker_id, broker_epoch, should_fence, offline_log_dirs);
+        if (!should_fence) log.info("Broker {d} unfenced", .{broker_id});
+        return true;
+    }
+
+    pub fn validateHeartbeatOfflineLogDirs(self: *const BrokerRegistry, broker_id: i32, broker_epoch: i64, offline_log_dirs: []const [16]u8) !void {
+        const entry = self.brokers.get(broker_id) orelse return error.BrokerNotRegistered;
+        if (broker_epoch != entry.broker_epoch) return error.StaleBrokerEpoch;
+        try self.validateOfflineLogDirs(entry, offline_log_dirs);
+    }
+
+    pub fn desiredFencedForOfflineLogDirs(self: *const BrokerRegistry, broker_id: i32, want_fence: bool, offline_log_dirs: []const [16]u8) !bool {
+        const entry = self.brokers.get(broker_id) orelse return error.BrokerNotRegistered;
+        return want_fence or allRegisteredLogDirsOffline(entry.log_dirs, offline_log_dirs);
+    }
+
+    pub fn offlineLogDirsChanged(self: *const BrokerRegistry, broker_id: i32, offline_log_dirs: []const [16]u8) bool {
+        const entry = self.brokers.get(broker_id) orelse return false;
+        return !uuidSliceEquals(entry.offline_log_dirs, offline_log_dirs);
+    }
+
+    pub fn installLogDirStatus(self: *BrokerRegistry, broker_id: i32, broker_epoch: i64, fenced: bool, offline_log_dirs: []const [16]u8) !void {
+        const entry = self.brokers.getPtr(broker_id) orelse return error.BrokerNotRegistered;
+        if (broker_epoch != entry.broker_epoch) return error.StaleBrokerEpoch;
         try self.validateOfflineLogDirs(entry.*, offline_log_dirs);
+
         const offline_copy = try self.allocator.dupe([16]u8, offline_log_dirs);
         errdefer if (offline_copy.len > 0) self.allocator.free(offline_copy);
 
         entry.last_heartbeat_ms = @import("time_compat").milliTimestamp();
         if (entry.offline_log_dirs.len > 0) self.allocator.free(entry.offline_log_dirs);
         entry.offline_log_dirs = offline_copy;
-
-        const should_fence = want_fence or allRegisteredLogDirsOffline(entry.log_dirs, offline_log_dirs);
-        const was_fenced = entry.fenced;
-        entry.fenced = should_fence;
-
-        // Unfence after first successful heartbeat when the broker is not explicitly fenced.
-        if (was_fenced and !entry.fenced) {
-            entry.fenced = false;
-            log.info("Broker {d} unfenced", .{broker_id});
-        }
-        return true;
+        entry.fenced = fenced;
     }
 
     /// Remove a broker registration. Returns false when the broker is unknown.
@@ -194,6 +210,14 @@ pub const BrokerRegistry = struct {
 
     fn uuidEquals(a: [16]u8, b: [16]u8) bool {
         return std.mem.eql(u8, a[0..], b[0..]);
+    }
+
+    fn uuidSliceEquals(a: []const [16]u8, b: []const [16]u8) bool {
+        if (a.len != b.len) return false;
+        for (a, b) |left, right| {
+            if (!uuidEquals(left, right)) return false;
+        }
+        return true;
     }
 
     /// Evict brokers that haven't sent a heartbeat within timeout_ms.

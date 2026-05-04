@@ -717,6 +717,8 @@ pub const Controller = struct {
         broker_unregistration = 4,
         full_snapshot_v2 = 5,
         full_snapshot_v3 = 6,
+        broker_log_dir_status = 7,
+        full_snapshot_v4 = 8,
     };
 
     fn controllerBytesFieldSize(bytes: []const u8) !usize {
@@ -742,7 +744,8 @@ pub const Controller = struct {
             data.len > controller_metadata_record_magic.len and
             (data[controller_metadata_record_magic.len] == @intFromEnum(ControllerMetadataRecordKind.full_snapshot) or
                 data[controller_metadata_record_magic.len] == @intFromEnum(ControllerMetadataRecordKind.full_snapshot_v2) or
-                data[controller_metadata_record_magic.len] == @intFromEnum(ControllerMetadataRecordKind.full_snapshot_v3));
+                data[controller_metadata_record_magic.len] == @intFromEnum(ControllerMetadataRecordKind.full_snapshot_v3) or
+                data[controller_metadata_record_magic.len] == @intFromEnum(ControllerMetadataRecordKind.full_snapshot_v4));
     }
 
     fn controllerRecordKindFromByte(byte: u8) !ControllerMetadataRecordKind {
@@ -753,6 +756,8 @@ pub const Controller = struct {
             4 => .broker_unregistration,
             5 => .full_snapshot_v2,
             6 => .full_snapshot_v3,
+            7 => .broker_log_dir_status,
+            8 => .full_snapshot_v4,
             else => error.InvalidAutoMqMetadataRecord,
         };
     }
@@ -813,6 +818,25 @@ pub const Controller = struct {
         return buf;
     }
 
+    fn buildBrokerLogDirStatusRecord(self: *Controller, broker_id: i32, broker_epoch: i64, fenced: bool, offline_log_dirs: []const [16]u8) ![]u8 {
+        var total_len = try checkedAddSize(controller_metadata_record_magic.len, 1);
+        total_len = try checkedAddSize(total_len, 4 + 8 + 1);
+        total_len = try checkedAddSize(total_len, try controllerLogDirsFieldSize(offline_log_dirs));
+
+        const buf = try self.allocator.alloc(u8, total_len);
+        var pos: usize = 0;
+        @memcpy(buf[pos .. pos + controller_metadata_record_magic.len], controller_metadata_record_magic);
+        pos += controller_metadata_record_magic.len;
+        buf[pos] = @intFromEnum(ControllerMetadataRecordKind.broker_log_dir_status);
+        pos += 1;
+        writeRecordI32(buf, &pos, broker_id);
+        writeRecordI64(buf, &pos, broker_epoch);
+        writeRecordBool(buf, &pos, fenced);
+        try writeRecordLogDirs(buf, &pos, offline_log_dirs);
+        std.debug.assert(pos == buf.len);
+        return buf;
+    }
+
     fn buildControllerFullSnapshotRecord(self: *Controller) ![]u8 {
         if (self.broker_registry.count() > std.math.maxInt(u32)) return error.RecordTooLarge;
 
@@ -824,13 +848,14 @@ pub const Controller = struct {
             total_len = try checkedAddSize(total_len, try controllerBytesFieldSize(entry.value_ptr.host));
             total_len = try checkedAddSize(total_len, try controllerOptionalBytesFieldSize(entry.value_ptr.rack));
             total_len = try checkedAddSize(total_len, try controllerLogDirsFieldSize(entry.value_ptr.log_dirs));
+            total_len = try checkedAddSize(total_len, try controllerLogDirsFieldSize(entry.value_ptr.offline_log_dirs));
         }
 
         const buf = try self.allocator.alloc(u8, total_len);
         var pos: usize = 0;
         @memcpy(buf[pos .. pos + controller_metadata_record_magic.len], controller_metadata_record_magic);
         pos += controller_metadata_record_magic.len;
-        buf[pos] = @intFromEnum(ControllerMetadataRecordKind.full_snapshot_v3);
+        buf[pos] = @intFromEnum(ControllerMetadataRecordKind.full_snapshot_v4);
         pos += 1;
         writeRecordI64(buf, &pos, self.next_producer_id);
         writeRecordI64(buf, &pos, self.broker_registry.next_broker_epoch);
@@ -846,6 +871,7 @@ pub const Controller = struct {
             try writeRecordBytes(buf, &pos, broker.host);
             try writeRecordOptionalBytes(buf, &pos, broker.rack);
             try writeRecordLogDirs(buf, &pos, broker.log_dirs);
+            try writeRecordLogDirs(buf, &pos, broker.offline_log_dirs);
         }
         std.debug.assert(pos == buf.len);
         return buf;
@@ -906,6 +932,16 @@ pub const Controller = struct {
         _ = self.broker_registry.unregister(broker_id);
     }
 
+    fn applyBrokerLogDirStatusRecord(self: *Controller, data: []const u8, pos: *usize) !void {
+        const broker_id = try readRecordI32(data, pos);
+        const broker_epoch = try readRecordI64(data, pos);
+        const fenced = try readRecordBool(data, pos);
+        const offline_log_dirs = try self.readRecordLogDirs(data, pos);
+        defer self.freeRecordLogDirs(offline_log_dirs);
+        if (pos.* != data.len) return error.InvalidAutoMqMetadataRecord;
+        try self.broker_registry.installLogDirStatus(broker_id, broker_epoch, fenced, offline_log_dirs);
+    }
+
     fn applyProducerIdAllocationRecord(self: *Controller, data: []const u8, pos: *usize) !void {
         const next_producer_id = try readRecordI64(data, pos);
         if (pos.* != data.len) return error.InvalidAutoMqMetadataRecord;
@@ -931,7 +967,7 @@ pub const Controller = struct {
         if (log_dirs.len > 0) self.allocator.free(log_dirs);
     }
 
-    fn applyControllerFullSnapshotRecord(self: *Controller, data: []const u8, pos: *usize, has_rack_metadata: bool, has_log_dirs: bool) !void {
+    fn applyControllerFullSnapshotRecord(self: *Controller, data: []const u8, pos: *usize, has_rack_metadata: bool, has_log_dirs: bool, has_offline_log_dirs: bool) !void {
         const next_producer_id = try readRecordI64(data, pos);
         const next_broker_epoch = try readRecordI64(data, pos);
         const broker_count = try readRecordU32(data, pos);
@@ -949,6 +985,7 @@ pub const Controller = struct {
             _ = try readRecordBytes(data, &scan_pos);
             if (has_rack_metadata) _ = try readRecordOptionalBytes(data, &scan_pos);
             if (has_log_dirs) try skipRecordLogDirs(data, &scan_pos);
+            if (has_offline_log_dirs) try skipRecordLogDirs(data, &scan_pos);
         }
         if (scan_pos != data.len) return error.InvalidAutoMqMetadataRecord;
 
@@ -967,6 +1004,8 @@ pub const Controller = struct {
             const rack = if (has_rack_metadata) try readRecordOptionalBytes(data, pos) else null;
             const log_dirs = if (has_log_dirs) try self.readRecordLogDirs(data, pos) else &.{};
             defer self.freeRecordLogDirs(log_dirs);
+            const offline_log_dirs = if (has_offline_log_dirs) try self.readRecordLogDirs(data, pos) else &.{};
+            defer self.freeRecordLogDirs(offline_log_dirs);
             try self.broker_registry.registerWithEpochRackAndLogDirs(
                 broker_id,
                 host,
@@ -976,6 +1015,9 @@ pub const Controller = struct {
                 broker_epoch,
                 fenced,
             );
+            if (has_offline_log_dirs) {
+                try self.broker_registry.installLogDirStatus(broker_id, broker_epoch, fenced, offline_log_dirs);
+            }
         }
         self.broker_registry.next_broker_epoch = @max(self.broker_registry.next_broker_epoch, next_broker_epoch);
         pos.* = data.len;
@@ -991,10 +1033,12 @@ pub const Controller = struct {
         switch (kind) {
             .broker_registration => try self.applyBrokerRegistrationRecord(data, &pos),
             .producer_id_allocation => try self.applyProducerIdAllocationRecord(data, &pos),
-            .full_snapshot => try self.applyControllerFullSnapshotRecord(data, &pos, false, false),
+            .full_snapshot => try self.applyControllerFullSnapshotRecord(data, &pos, false, false, false),
             .broker_unregistration => try self.applyBrokerUnregistrationRecord(data, &pos),
-            .full_snapshot_v2 => try self.applyControllerFullSnapshotRecord(data, &pos, true, false),
-            .full_snapshot_v3 => try self.applyControllerFullSnapshotRecord(data, &pos, true, true),
+            .full_snapshot_v2 => try self.applyControllerFullSnapshotRecord(data, &pos, true, false, false),
+            .full_snapshot_v3 => try self.applyControllerFullSnapshotRecord(data, &pos, true, true, false),
+            .broker_log_dir_status => try self.applyBrokerLogDirStatusRecord(data, &pos),
+            .full_snapshot_v4 => try self.applyControllerFullSnapshotRecord(data, &pos, true, true, true),
         }
     }
 
@@ -1136,31 +1180,106 @@ pub const Controller = struct {
             return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
         };
 
-        const heartbeat_result = self.broker_registry.heartbeatWithOfflineLogDirs(req.broker_id, req.broker_epoch, req.want_fence, req.offline_log_dirs) catch |err| {
-            const error_code = switch (err) {
-                error.BrokerNotRegistered => ErrorCode.broker_id_not_registered.toInt(),
-                error.InvalidOfflineLogDir => ErrorCode.invalid_request.toInt(),
-                else => ErrorCode.kafka_storage_error.toInt(),
+        const persist_log_dir_status = req.want_fence or req.offline_log_dirs.len > 0 or self.broker_registry.offlineLogDirsChanged(req.broker_id, req.offline_log_dirs);
+        if (persist_log_dir_status) {
+            self.broker_registry.validateHeartbeatOfflineLogDirs(req.broker_id, req.broker_epoch, req.offline_log_dirs) catch |err| {
+                const error_code = switch (err) {
+                    error.BrokerNotRegistered => ErrorCode.broker_id_not_registered.toInt(),
+                    error.StaleBrokerEpoch => ErrorCode.stale_broker_epoch.toInt(),
+                    error.InvalidOfflineLogDir => ErrorCode.invalid_request.toInt(),
+                };
+                const resp = Resp{
+                    .throttle_time_ms = 0,
+                    .error_code = error_code,
+                    .is_caught_up = false,
+                    .is_fenced = true,
+                    .should_shut_down = false,
+                };
+                return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
             };
-            const resp = Resp{
-                .throttle_time_ms = 0,
-                .error_code = error_code,
-                .is_caught_up = false,
-                .is_fenced = true,
-                .should_shut_down = false,
-            };
-            return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
-        };
 
-        if (!heartbeat_result) {
-            const resp = Resp{
-                .throttle_time_ms = 0,
-                .error_code = ErrorCode.stale_broker_epoch.toInt(),
-                .is_caught_up = false,
-                .is_fenced = true,
-                .should_shut_down = false,
+            const desired_fenced = self.broker_registry.desiredFencedForOfflineLogDirs(req.broker_id, req.want_fence, req.offline_log_dirs) catch {
+                const resp = Resp{
+                    .throttle_time_ms = 0,
+                    .error_code = ErrorCode.broker_id_not_registered.toInt(),
+                    .is_caught_up = false,
+                    .is_fenced = true,
+                    .should_shut_down = false,
+                };
+                return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
             };
-            return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+
+            const record = self.buildBrokerLogDirStatusRecord(req.broker_id, req.broker_epoch, desired_fenced, req.offline_log_dirs) catch {
+                const resp = Resp{
+                    .throttle_time_ms = 0,
+                    .error_code = ErrorCode.kafka_storage_error.toInt(),
+                    .is_caught_up = false,
+                    .is_fenced = true,
+                    .should_shut_down = false,
+                };
+                return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+            };
+            defer self.allocator.free(record);
+
+            const offset = self.appendControllerMetadataRecord(record) catch |err| {
+                const error_code: i16 = switch (err) {
+                    error.NotController => ErrorCode.not_controller.toInt(),
+                    else => ErrorCode.kafka_storage_error.toInt(),
+                };
+                const resp = Resp{
+                    .throttle_time_ms = 0,
+                    .error_code = error_code,
+                    .is_caught_up = false,
+                    .is_fenced = true,
+                    .should_shut_down = false,
+                };
+                return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+            };
+
+            self.broker_registry.installLogDirStatus(req.broker_id, req.broker_epoch, desired_fenced, req.offline_log_dirs) catch |err| {
+                const error_code: i16 = switch (err) {
+                    error.BrokerNotRegistered => ErrorCode.broker_id_not_registered.toInt(),
+                    error.StaleBrokerEpoch => ErrorCode.stale_broker_epoch.toInt(),
+                    error.InvalidOfflineLogDir => ErrorCode.invalid_request.toInt(),
+                    else => ErrorCode.kafka_storage_error.toInt(),
+                };
+                const resp = Resp{
+                    .throttle_time_ms = 0,
+                    .error_code = error_code,
+                    .is_caught_up = false,
+                    .is_fenced = true,
+                    .should_shut_down = false,
+                };
+                return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+            };
+            self.last_applied_controller_metadata_offset = offset;
+        } else {
+            const heartbeat_result = self.broker_registry.heartbeatWithOfflineLogDirs(req.broker_id, req.broker_epoch, req.want_fence, req.offline_log_dirs) catch |err| {
+                const error_code = switch (err) {
+                    error.BrokerNotRegistered => ErrorCode.broker_id_not_registered.toInt(),
+                    error.InvalidOfflineLogDir => ErrorCode.invalid_request.toInt(),
+                    else => ErrorCode.kafka_storage_error.toInt(),
+                };
+                const resp = Resp{
+                    .throttle_time_ms = 0,
+                    .error_code = error_code,
+                    .is_caught_up = false,
+                    .is_fenced = true,
+                    .should_shut_down = false,
+                };
+                return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+            };
+
+            if (!heartbeat_result) {
+                const resp = Resp{
+                    .throttle_time_ms = 0,
+                    .error_code = ErrorCode.stale_broker_epoch.toInt(),
+                    .is_caught_up = false,
+                    .is_fenced = true,
+                    .should_shut_down = false,
+                };
+                return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+            }
         }
 
         const broker_info = self.broker_registry.brokers.get(req.broker_id) orelse {
@@ -2975,6 +3094,33 @@ test "Controller handleRequest BrokerHeartbeat v1 rejects unknown offline log di
     try testing.expectEqual(@as(usize, 0), info.offline_log_dirs.len);
 }
 
+test "Controller replays durable broker offline log-dir status" {
+    var ctrl = Controller.init(testing.allocator, 1, "controller-offline-log-dir-replay");
+    defer ctrl.deinit();
+    try makeTestControllerLeader(&ctrl);
+
+    const broker_epoch = ctrl.broker_registry.next_broker_epoch;
+    const dir = [_]u8{0x66} ** 16;
+    const dirs = [_][16]u8{dir};
+    const registration = try ctrl.buildBrokerRegistrationRecordWithRackAndLogDirs(100, "host1", 9092, null, &dirs, broker_epoch);
+    defer ctrl.allocator.free(registration);
+    var offset = try ctrl.appendControllerMetadataRecord(registration);
+    try ctrl.broker_registry.registerWithEpochRackAndLogDirs(100, "host1", 9092, null, &dirs, broker_epoch, false);
+    ctrl.last_applied_controller_metadata_offset = offset;
+
+    const status = try ctrl.buildBrokerLogDirStatusRecord(100, broker_epoch, true, &dirs);
+    defer ctrl.allocator.free(status);
+    offset = try ctrl.appendControllerMetadataRecord(status);
+    try ctrl.broker_registry.installLogDirStatus(100, broker_epoch, true, &dirs);
+    ctrl.last_applied_controller_metadata_offset = offset;
+
+    try testing.expectEqual(@as(usize, 2), try ctrl.replayCommittedControllerMetadataRecords());
+    const info = ctrl.broker_registry.brokers.get(100) orelse return error.TestUnexpectedResult;
+    try testing.expect(info.fenced);
+    try testing.expectEqual(@as(usize, 1), info.offline_log_dirs.len);
+    try testing.expectEqualSlices(u8, dir[0..], info.offline_log_dirs[0][0..]);
+}
+
 test "Controller handleRequest UnregisterBroker removes broker" {
     const Req = generated.unregister_broker_request.UnregisterBrokerRequest;
     const Resp = generated.unregister_broker_response.UnregisterBrokerResponse;
@@ -3289,6 +3435,7 @@ test "Controller full snapshot survives Raft log compaction" {
     defer ctrl.allocator.free(broker_record);
     var offset = try ctrl.appendControllerMetadataRecord(broker_record);
     try ctrl.broker_registry.registerWithEpochRackAndLogDirs(100, "host1", 9092, "rack-a", &log_dirs, broker_epoch, false);
+    try ctrl.broker_registry.installLogDirStatus(100, broker_epoch, true, &log_dirs);
     ctrl.last_applied_controller_metadata_offset = offset;
 
     const pid_record = try ctrl.buildProducerIdAllocationRecord(2000);
@@ -3314,7 +3461,9 @@ test "Controller full snapshot survives Raft log compaction" {
     try testing.expectEqualStrings("rack-a", broker.rack orelse return error.TestUnexpectedResult);
     try testing.expectEqual(@as(usize, 1), broker.log_dirs.len);
     try testing.expectEqualSlices(u8, log_dir[0..], broker.log_dirs[0][0..]);
-    try testing.expect(!broker.fenced);
+    try testing.expect(broker.fenced);
+    try testing.expectEqual(@as(usize, 1), broker.offline_log_dirs.len);
+    try testing.expectEqualSlices(u8, log_dir[0..], broker.offline_log_dirs[0][0..]);
 }
 
 test "Controller handleRequest ControllerRegistration accepts known voter" {
