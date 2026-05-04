@@ -703,8 +703,11 @@ Status: completed for the initial catalog and DeleteGroups slice.
   Python interpreters, tool lists, semantic suites, TLS/SASL settings, and
   bootstrap endpoints. Release jobs can now pin required version profiles with
   `ZMQ_CLIENT_MATRIX_REQUIRED_PROFILES`, required secured-client profiles with
-  `ZMQ_CLIENT_MATRIX_REQUIRED_SECURITY_PROFILES`, and required negative-security
-  profiles with `ZMQ_CLIENT_MATRIX_REQUIRED_SECURITY_NEGATIVE_PROFILES`.
+  `ZMQ_CLIENT_MATRIX_REQUIRED_SECURITY_PROFILES`, required negative-security
+  profiles with `ZMQ_CLIENT_MATRIX_REQUIRED_SECURITY_NEGATIVE_PROFILES`,
+  required OAuth-positive profiles with
+  `ZMQ_CLIENT_MATRIX_REQUIRED_OAUTH_PROFILES`, and required OAuth-negative
+  profiles with `ZMQ_CLIENT_MATRIX_REQUIRED_OAUTH_NEGATIVE_PROFILES`.
   `ZMQ_CLIENT_MATRIX_SEMANTICS` can require real-client admin topic/config
   operations, consumer-group list/describe or group reads, multi-consumer
   rebalance assignment convergence for kafka-python, confluent-kafka, and Java
@@ -712,8 +715,10 @@ Status: completed for the initial catalog and DeleteGroups slice.
   kafka-clients, secured-client runs for kcat, Kafka CLI, kafka-python,
   confluent-kafka, and Java kafka-clients, and bad-credential,
   bad-OAuth-token/JAAS/config, bad-TLS-trust, and ACL-denied-produce
-  fail-closed checks over those secured-client profiles. Remaining work: expand
-  live secured-client CI environments.
+  fail-closed checks over those secured-client profiles. Release jobs can now
+  require named OAUTHBEARER profiles and OAuth-specific negative profiles so
+  generic SASL/TLS security coverage cannot satisfy the OAuth interop gate.
+  Remaining work: expand live secured-client CI environments.
 - Add chaos tests for SIGKILL, network partition, S3 outage, clock skew, and
   slow/partial clients.
   Status: gated `test-chaos` starts real broker processes and now verifies

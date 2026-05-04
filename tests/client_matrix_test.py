@@ -41,6 +41,10 @@ Optional environment:
                                   Profiles that must run secured-client probes
     ZMQ_CLIENT_MATRIX_REQUIRED_SECURITY_NEGATIVE_PROFILES
                                   Profiles that must run configured negative security probes
+    ZMQ_CLIENT_MATRIX_REQUIRED_OAUTH_PROFILES
+                                  Profiles that must run OAUTHBEARER secured-client probes
+    ZMQ_CLIENT_MATRIX_REQUIRED_OAUTH_NEGATIVE_PROFILES
+                                  Profiles that must run OAuth-specific negative probes
     ZMQ_CLIENT_MATRIX_JAVA_CLASSPATH
                                   Classpath containing kafka-clients jars for java-kafka
     ZMQ_CLIENT_MATRIX_ENABLE_GO   1 to include go-kafka in auto mode
@@ -309,6 +313,14 @@ def oauthbearer_config_negative_enabled():
     return oauth_enabled() and bool(BAD_OAUTHBEARER_CONFIG)
 
 
+def oauth_negative_configured():
+    return (
+        oauth_token_negative_enabled()
+        or oauth_jaas_negative_enabled()
+        or oauthbearer_config_negative_enabled()
+    )
+
+
 def tls_negative_enabled():
     return bool(BAD_SSL_CA_LOCATION) and SECURITY_PROTOCOL.upper() in ("SSL", "SASL_SSL")
 
@@ -343,6 +355,10 @@ def oauth_positive_configured_for_tool(tool):
 def security_negative_configured_for_tool(tool):
     if sasl_negative_enabled() or tls_negative_enabled() or acl_negative_enabled():
         return True
+    return oauth_negative_configured_for_tool(tool)
+
+
+def oauth_negative_configured_for_tool(tool):
     if tool in ("kafka-python", "confluent-kafka") and oauth_token_negative_enabled():
         return True
     if tool in ("kafka-cli", "java-kafka") and oauth_jaas_negative_enabled():
@@ -514,6 +530,56 @@ def validate_required_profiles(profiles):
             "required negative-security profiles must enable security-negative "
             "and configure at least one negative vector: "
             + ", ".join(negative_without_vectors)
+        )
+
+    required_oauth = configured_names("ZMQ_CLIENT_MATRIX_REQUIRED_OAUTH_PROFILES")
+    missing_oauth = [profile for profile in required_oauth if profile not in profile_set]
+    if missing_oauth:
+        raise MatrixError(
+            "required OAuth profiles missing from ZMQ_CLIENT_MATRIX_PROFILES: "
+            + ", ".join(missing_oauth)
+        )
+    oauth_without_vectors = []
+    for profile in required_oauth:
+        apply_profile(profile)
+        tools = selected_tools()
+        if not security_enabled() or not oauth_enabled() or not any(
+            oauth_positive_configured_for_tool(tool) for tool in tools
+        ):
+            oauth_without_vectors.append(profile)
+    if oauth_without_vectors:
+        raise MatrixError(
+            "required OAuth profiles must enable OAUTHBEARER security and "
+            "configure a positive fixture for at least one selected tool: "
+            + ", ".join(oauth_without_vectors)
+        )
+
+    required_oauth_negative = configured_names(
+        "ZMQ_CLIENT_MATRIX_REQUIRED_OAUTH_NEGATIVE_PROFILES"
+    )
+    missing_oauth_negative = [
+        profile for profile in required_oauth_negative if profile not in profile_set
+    ]
+    if missing_oauth_negative:
+        raise MatrixError(
+            "required OAuth-negative profiles missing from ZMQ_CLIENT_MATRIX_PROFILES: "
+            + ", ".join(missing_oauth_negative)
+        )
+    oauth_negative_without_vectors = []
+    for profile in required_oauth_negative:
+        apply_profile(profile)
+        tools = selected_tools()
+        if (
+            not semantic_enabled("security-negative")
+            or not oauth_negative_configured()
+            or not any(oauth_negative_configured_for_tool(tool) for tool in tools)
+        ):
+            oauth_negative_without_vectors.append(profile)
+    if oauth_negative_without_vectors:
+        raise MatrixError(
+            "required OAuth-negative profiles must enable security-negative "
+            "and configure an OAuth negative vector for at least one selected tool: "
+            + ", ".join(oauth_negative_without_vectors)
         )
 
 
@@ -1948,6 +2014,18 @@ def self_test():
                 raise MatrixError("Kafka CLI OAuth security config self-test failed")
         finally:
             os.unlink(oauth_props_path)
+        os.environ["ZMQ_CLIENT_MATRIX_REQUIRED_OAUTH_PROFILES"] = "apache_3_7"
+        os.environ["ZMQ_CLIENT_MATRIX_REQUIRED_OAUTH_NEGATIVE_PROFILES"] = "apache_3_7"
+        validate_required_profiles(names)
+        os.environ["ZMQ_CLIENT_MATRIX_REQUIRED_OAUTH_PROFILES"] = "go_1_21"
+        try:
+            validate_required_profiles(names)
+            raise MatrixError("non-OAuth required client profile was accepted")
+        except MatrixError as exc:
+            if "required OAuth profiles" not in str(exc):
+                raise
+        os.environ.pop("ZMQ_CLIENT_MATRIX_REQUIRED_OAUTH_PROFILES", None)
+        os.environ.pop("ZMQ_CLIENT_MATRIX_REQUIRED_OAUTH_NEGATIVE_PROFILES", None)
         os.environ["ZMQ_CLIENT_MATRIX_APACHE_3_7_SASL_MECHANISM"] = "PLAIN"
 
         apply_profile("go_1_21")
