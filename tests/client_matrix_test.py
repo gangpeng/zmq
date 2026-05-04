@@ -45,6 +45,10 @@ Optional environment:
                                   Profiles that must run OAUTHBEARER secured-client probes
     ZMQ_CLIENT_MATRIX_REQUIRED_OAUTH_NEGATIVE_PROFILES
                                   Profiles that must run OAuth-specific negative probes
+    ZMQ_CLIENT_MATRIX_REQUIRED_TOOLS
+                                  Client tools that must be covered across all selected profiles
+    ZMQ_CLIENT_MATRIX_REQUIRED_SEMANTICS
+                                  Semantic probes that must be covered across all selected profiles
     ZMQ_CLIENT_MATRIX_JAVA_CLASSPATH
                                   Classpath containing kafka-clients jars for java-kafka
     ZMQ_CLIENT_MATRIX_ENABLE_GO   1 to include go-kafka in auto mode
@@ -100,6 +104,7 @@ SEMANTIC_ORDER = [
 REBALANCE_TOOLS = {"kafka-python", "confluent-kafka", "java-kafka"}
 TRANSACTION_TOOLS = {"confluent-kafka", "java-kafka"}
 SECURITY_TOOLS = {"kcat", "kafka-cli", "kafka-python", "confluent-kafka", "java-kafka"}
+SUPPORTED_TOOLS = {"kcat", "kafka-cli", "kafka-python", "confluent-kafka", "java-kafka", "go-kafka"}
 JAVA_CLASSPATH = os.environ.get("ZMQ_CLIENT_MATRIX_JAVA_CLASSPATH")
 ENABLE_GO_AUTO = os.environ.get("ZMQ_CLIENT_MATRIX_ENABLE_GO") == "1"
 GO_MODULE = os.environ.get("ZMQ_CLIENT_MATRIX_GO_MODULE", "github.com/segmentio/kafka-go@latest")
@@ -492,6 +497,42 @@ def validate_required_profiles(profiles):
             "required client matrix profiles missing from ZMQ_CLIENT_MATRIX_PROFILES: "
             + ", ".join(missing)
         )
+
+    required_tools = configured_names("ZMQ_CLIENT_MATRIX_REQUIRED_TOOLS")
+    unknown_required_tools = [tool for tool in required_tools if tool not in SUPPORTED_TOOLS]
+    if unknown_required_tools:
+        raise MatrixError(
+            "unknown required client matrix tools: " + ", ".join(unknown_required_tools)
+        )
+    if required_tools:
+        covered_tools = set()
+        for profile in profiles:
+            apply_profile(profile)
+            covered_tools.update(selected_tools())
+        missing_tools = [tool for tool in required_tools if tool not in covered_tools]
+        if missing_tools:
+            raise MatrixError(
+                "required client matrix tools not covered by selected profiles: "
+                + ", ".join(missing_tools)
+            )
+
+    required_semantics = parse_semantics(
+        ",".join(configured_names("ZMQ_CLIENT_MATRIX_REQUIRED_SEMANTICS"))
+    ) if os.environ.get("ZMQ_CLIENT_MATRIX_REQUIRED_SEMANTICS") else set()
+    if required_semantics:
+        covered_semantics = set()
+        for profile in profiles:
+            apply_profile(profile)
+            covered_semantics.update(SEMANTICS)
+        missing_semantics = [
+            semantic for semantic in SEMANTIC_ORDER
+            if semantic in required_semantics and semantic not in covered_semantics
+        ]
+        if missing_semantics:
+            raise MatrixError(
+                "required client matrix semantics not covered by selected profiles: "
+                + ", ".join(missing_semantics)
+            )
 
     required_security = configured_names("ZMQ_CLIENT_MATRIX_REQUIRED_SECURITY_PROFILES")
     missing_security = [profile for profile in required_security if profile not in profile_set]
@@ -1955,6 +1996,10 @@ def self_test():
         os.environ["ZMQ_CLIENT_MATRIX_GO_1_21_GO_MODULE"] = "github.com/segmentio/kafka-go@v0.4.47"
         os.environ["ZMQ_CLIENT_MATRIX_GO_1_21_SEMANTICS"] = "admin,groups"
         os.environ["ZMQ_CLIENT_MATRIX_REQUIRED_PROFILES"] = "apache_3_7,go_1_21"
+        os.environ["ZMQ_CLIENT_MATRIX_REQUIRED_TOOLS"] = "java-kafka,go-kafka"
+        os.environ["ZMQ_CLIENT_MATRIX_REQUIRED_SEMANTICS"] = (
+            "admin,groups,rebalance,transactions,security,security-negative"
+        )
         os.environ["ZMQ_CLIENT_MATRIX_REQUIRED_SECURITY_PROFILES"] = "apache_3_7"
         os.environ["ZMQ_CLIENT_MATRIX_REQUIRED_SECURITY_NEGATIVE_PROFILES"] = "apache_3_7"
 
@@ -1962,6 +2007,24 @@ def self_test():
         if names != ["apache_3_7", "go_1_21"]:
             raise MatrixError(f"profile parsing failed: {names}")
         validate_required_profiles(names)
+        os.environ["ZMQ_CLIENT_MATRIX_REQUIRED_TOOLS"] = "java-kafka,confluent-kafka"
+        try:
+            validate_required_profiles(names)
+            raise MatrixError("missing required client tool was accepted")
+        except MatrixError as exc:
+            if "required client matrix tools" not in str(exc):
+                raise
+        os.environ["ZMQ_CLIENT_MATRIX_REQUIRED_TOOLS"] = "java-kafka,go-kafka"
+        os.environ["ZMQ_CLIENT_MATRIX_GO_1_21_SEMANTICS"] = "admin"
+        try:
+            validate_required_profiles(names)
+            raise MatrixError("missing required client semantic was accepted")
+        except MatrixError as exc:
+            if "required client matrix semantics" not in str(exc):
+                raise
+        os.environ["ZMQ_CLIENT_MATRIX_GO_1_21_SEMANTICS"] = "admin,groups"
+        os.environ.pop("ZMQ_CLIENT_MATRIX_REQUIRED_TOOLS", None)
+        os.environ.pop("ZMQ_CLIENT_MATRIX_REQUIRED_SEMANTICS", None)
 
         apply_profile("apache_3_7")
         if TOOLS != "java-kafka" or JAVA_CLASSPATH != "/opt/kafka-3.7/libs/*":
