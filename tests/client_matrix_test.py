@@ -35,6 +35,12 @@ Optional environment:
     ZMQ_CLIENT_MATRIX_BAD_SSL_CA_LOCATION
     ZMQ_CLIENT_MATRIX_ACL_DENIED_TOPIC
     ZMQ_CLIENT_MATRIX_PROFILES    Comma-separated profile names for explicit client/library version sets
+    ZMQ_CLIENT_MATRIX_REQUIRED_PROFILES
+                                  Comma-separated profile names that must be present
+    ZMQ_CLIENT_MATRIX_REQUIRED_SECURITY_PROFILES
+                                  Profiles that must run secured-client probes
+    ZMQ_CLIENT_MATRIX_REQUIRED_SECURITY_NEGATIVE_PROFILES
+                                  Profiles that must run configured negative security probes
     ZMQ_CLIENT_MATRIX_JAVA_CLASSPATH
                                   Classpath containing kafka-clients jars for java-kafka
     ZMQ_CLIENT_MATRIX_ENABLE_GO   1 to include go-kafka in auto mode
@@ -421,6 +427,11 @@ def profile_names():
     return names if names else ["default"]
 
 
+def configured_names(env_name):
+    raw = os.environ.get(env_name, "")
+    return [name.strip() for name in raw.split(",") if name.strip()]
+
+
 def profile_setting(profile, suffix, fallback):
     if profile == "default":
         return os.environ.get(f"ZMQ_CLIENT_MATRIX_{suffix}", fallback)
@@ -454,6 +465,56 @@ def apply_profile(profile):
     ENABLE_GO_AUTO = profile_setting(profile, "ENABLE_GO", "0") == "1"
     GO_MODULE = profile_setting(profile, "GO_MODULE", "github.com/segmentio/kafka-go@latest")
     PYTHON = profile_setting(profile, "PYTHON", sys.executable)
+
+
+def validate_required_profiles(profiles):
+    profile_set = set(profiles)
+    required = configured_names("ZMQ_CLIENT_MATRIX_REQUIRED_PROFILES")
+    missing = [profile for profile in required if profile not in profile_set]
+    if missing:
+        raise MatrixError(
+            "required client matrix profiles missing from ZMQ_CLIENT_MATRIX_PROFILES: "
+            + ", ".join(missing)
+        )
+
+    required_security = configured_names("ZMQ_CLIENT_MATRIX_REQUIRED_SECURITY_PROFILES")
+    missing_security = [profile for profile in required_security if profile not in profile_set]
+    if missing_security:
+        raise MatrixError(
+            "required secured-client profiles missing from ZMQ_CLIENT_MATRIX_PROFILES: "
+            + ", ".join(missing_security)
+        )
+    unsecured = []
+    for profile in required_security:
+        apply_profile(profile)
+        if not security_enabled():
+            unsecured.append(profile)
+    if unsecured:
+        raise MatrixError(
+            "required secured-client profiles must enable security semantics or a secured protocol: "
+            + ", ".join(unsecured)
+        )
+
+    required_negative = configured_names(
+        "ZMQ_CLIENT_MATRIX_REQUIRED_SECURITY_NEGATIVE_PROFILES"
+    )
+    missing_negative = [profile for profile in required_negative if profile not in profile_set]
+    if missing_negative:
+        raise MatrixError(
+            "required negative-security profiles missing from ZMQ_CLIENT_MATRIX_PROFILES: "
+            + ", ".join(missing_negative)
+        )
+    negative_without_vectors = []
+    for profile in required_negative:
+        apply_profile(profile)
+        if not semantic_enabled("security-negative") or not security_negative_configured():
+            negative_without_vectors.append(profile)
+    if negative_without_vectors:
+        raise MatrixError(
+            "required negative-security profiles must enable security-negative "
+            "and configure at least one negative vector: "
+            + ", ".join(negative_without_vectors)
+        )
 
 
 def matrix_topic(tool):
@@ -1772,6 +1833,7 @@ def main():
         return 0
 
     profiles = profile_names()
+    validate_required_profiles(profiles)
     for profile in profiles:
         apply_profile(profile)
         run_profile()
@@ -1826,10 +1888,14 @@ def self_test():
         os.environ["ZMQ_CLIENT_MATRIX_GO_1_21_TOOLS"] = "go-kafka"
         os.environ["ZMQ_CLIENT_MATRIX_GO_1_21_GO_MODULE"] = "github.com/segmentio/kafka-go@v0.4.47"
         os.environ["ZMQ_CLIENT_MATRIX_GO_1_21_SEMANTICS"] = "admin,groups"
+        os.environ["ZMQ_CLIENT_MATRIX_REQUIRED_PROFILES"] = "apache_3_7,go_1_21"
+        os.environ["ZMQ_CLIENT_MATRIX_REQUIRED_SECURITY_PROFILES"] = "apache_3_7"
+        os.environ["ZMQ_CLIENT_MATRIX_REQUIRED_SECURITY_NEGATIVE_PROFILES"] = "apache_3_7"
 
         names = profile_names()
         if names != ["apache_3_7", "go_1_21"]:
             raise MatrixError(f"profile parsing failed: {names}")
+        validate_required_profiles(names)
 
         apply_profile("apache_3_7")
         if TOOLS != "java-kafka" or JAVA_CLASSPATH != "/opt/kafka-3.7/libs/*":
@@ -1958,6 +2024,22 @@ def self_test():
         os.environ.pop("ZMQ_CLIENT_MATRIX_GO_1_21_OAUTH_TOKEN", None)
         os.environ.pop("ZMQ_CLIENT_MATRIX_GO_1_21_BAD_OAUTH_TOKEN", None)
         apply_profile("go_1_21")
+        os.environ["ZMQ_CLIENT_MATRIX_REQUIRED_SECURITY_PROFILES"] = "apache_3_7,go_1_21"
+        try:
+            validate_required_profiles(names)
+            raise MatrixError("unsecured required client profile was accepted")
+        except MatrixError as exc:
+            if "secured-client profiles" not in str(exc):
+                raise
+        os.environ["ZMQ_CLIENT_MATRIX_REQUIRED_SECURITY_PROFILES"] = "apache_3_7"
+        os.environ["ZMQ_CLIENT_MATRIX_REQUIRED_SECURITY_NEGATIVE_PROFILES"] = "go_1_21"
+        try:
+            validate_required_profiles(names)
+            raise MatrixError("negative-security profile without vectors was accepted")
+        except MatrixError as exc:
+            if "negative-security profiles" not in str(exc):
+                raise
+        os.environ["ZMQ_CLIENT_MATRIX_REQUIRED_SECURITY_NEGATIVE_PROFILES"] = "apache_3_7"
         try:
             parse_semantics("basic,unknown")
             raise MatrixError("unknown semantic probe was accepted")
