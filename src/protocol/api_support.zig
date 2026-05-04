@@ -133,7 +133,7 @@ pub const controller_supported_apis = [_]ControllerApiSupport{
     .{ .key = 54, .name = "EndQuorumEpoch", .min = 0, .max = 1 },
     .{ .key = 55, .name = "DescribeQuorum", .min = 0, .max = 2 },
     .{ .key = 59, .name = "FetchSnapshot", .min = 0, .max = 1 },
-    .{ .key = 62, .name = "BrokerRegistration", .min = 0, .max = 0 },
+    .{ .key = 62, .name = "BrokerRegistration", .min = 0, .max = 2 },
     .{ .key = 63, .name = "BrokerHeartbeat", .min = 0, .max = 0 },
     .{ .key = 64, .name = "UnregisterBroker", .min = 0, .max = 0 },
     .{ .key = 67, .name = "AllocateProducerIds", .min = 0, .max = 0 },

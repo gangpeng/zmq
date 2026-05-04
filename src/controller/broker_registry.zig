@@ -22,6 +22,8 @@ pub const BrokerRegistry = struct {
         host: []u8,
         port: u16,
         rack: ?[]u8 = null,
+        /// Stable replica directory UUIDs advertised by BrokerRegistration v2+.
+        log_dirs: [][16]u8 = &.{},
         /// Epoch assigned by controller on registration (used for WAL fencing).
         broker_epoch: i64 = 0,
         /// Last heartbeat timestamp (ms since epoch).
@@ -43,6 +45,7 @@ pub const BrokerRegistry = struct {
         while (it.next()) |entry| {
             self.allocator.free(entry.value_ptr.host);
             if (entry.value_ptr.rack) |r| self.allocator.free(r);
+            if (entry.value_ptr.log_dirs.len > 0) self.allocator.free(entry.value_ptr.log_dirs);
         }
         self.brokers.deinit();
     }
@@ -63,6 +66,11 @@ pub const BrokerRegistry = struct {
 
     /// Install a registration with optional topology metadata.
     pub fn registerWithEpochAndRack(self: *BrokerRegistry, broker_id: i32, host: []const u8, port: u16, rack: ?[]const u8, broker_epoch: i64, fenced: bool) !void {
+        try self.registerWithEpochRackAndLogDirs(broker_id, host, port, rack, &.{}, broker_epoch, fenced);
+    }
+
+    /// Install a registration with optional topology and local JBOD directory metadata.
+    pub fn registerWithEpochRackAndLogDirs(self: *BrokerRegistry, broker_id: i32, host: []const u8, port: u16, rack: ?[]const u8, log_dirs: []const [16]u8, broker_epoch: i64, fenced: bool) !void {
         if (broker_epoch <= 0) return error.InvalidBrokerEpoch;
         const now = @import("time_compat").milliTimestamp();
 
@@ -70,12 +78,15 @@ pub const BrokerRegistry = struct {
         errdefer self.allocator.free(host_copy);
         const rack_copy = if (rack) |r| try self.allocator.dupe(u8, r) else null;
         errdefer if (rack_copy) |r| self.allocator.free(r);
+        const log_dirs_copy = try self.allocator.dupe([16]u8, log_dirs);
+        errdefer if (log_dirs_copy.len > 0) self.allocator.free(log_dirs_copy);
 
         const old = try self.brokers.fetchPut(broker_id, .{
             .broker_id = broker_id,
             .host = host_copy,
             .port = port,
             .rack = rack_copy,
+            .log_dirs = log_dirs_copy,
             .broker_epoch = broker_epoch,
             .last_heartbeat_ms = now,
             .fenced = fenced,
@@ -83,6 +94,7 @@ pub const BrokerRegistry = struct {
         if (old) |entry| {
             self.allocator.free(entry.value.host);
             if (entry.value.rack) |r| self.allocator.free(r);
+            if (entry.value.log_dirs.len > 0) self.allocator.free(entry.value.log_dirs);
         }
 
         if (broker_epoch >= self.next_broker_epoch) self.next_broker_epoch = broker_epoch + 1;
@@ -116,8 +128,17 @@ pub const BrokerRegistry = struct {
         const removed = self.brokers.fetchRemove(broker_id) orelse return false;
         self.allocator.free(removed.value.host);
         if (removed.value.rack) |r| self.allocator.free(r);
+        if (removed.value.log_dirs.len > 0) self.allocator.free(removed.value.log_dirs);
         log.info("Broker {d} unregistered", .{broker_id});
         return true;
+    }
+
+    pub fn hasLogDir(self: *const BrokerRegistry, broker_id: i32, directory_id: [16]u8) bool {
+        const info = self.brokers.get(broker_id) orelse return false;
+        for (info.log_dirs) |registered| {
+            if (std.mem.eql(u8, registered[0..], directory_id[0..])) return true;
+        }
+        return false;
     }
 
     /// Evict brokers that haven't sent a heartbeat within timeout_ms.
@@ -276,6 +297,33 @@ test "BrokerRegistry registerWithEpochAndRack preserves rack metadata" {
     try testing.expectEqualStrings("host2", updated.host);
     try testing.expectEqualStrings("rack-b", updated.rack orelse return error.TestUnexpectedResult);
     try testing.expect(!updated.fenced);
+}
+
+test "BrokerRegistry registerWithEpochRackAndLogDirs preserves local directories" {
+    var registry = BrokerRegistry.init(testing.allocator);
+    defer registry.deinit();
+
+    const dir_a = [_]u8{0xa1} ** 16;
+    const dir_b = [_]u8{0xb2} ** 16;
+    const dirs = [_][16]u8{ dir_a, dir_b };
+    try registry.registerWithEpochRackAndLogDirs(100, "host1", 9092, "rack-a", &dirs, 7, true);
+
+    const info = registry.brokers.get(100) orelse return error.TestUnexpectedResult;
+    try testing.expectEqual(@as(usize, 2), info.log_dirs.len);
+    try testing.expectEqualSlices(u8, dir_a[0..], info.log_dirs[0][0..]);
+    try testing.expectEqualSlices(u8, dir_b[0..], info.log_dirs[1][0..]);
+    try testing.expect(registry.hasLogDir(100, dir_a));
+    try testing.expect(!registry.hasLogDir(100, [_]u8{0xc3} ** 16));
+
+    const dir_c = [_]u8{0xc4} ** 16;
+    const replacement = [_][16]u8{dir_c};
+    try registry.registerWithEpochRackAndLogDirs(100, "host2", 9093, null, &replacement, 8, false);
+
+    const updated = registry.brokers.get(100) orelse return error.TestUnexpectedResult;
+    try testing.expectEqual(@as(usize, 1), updated.log_dirs.len);
+    try testing.expectEqualSlices(u8, dir_c[0..], updated.log_dirs[0][0..]);
+    try testing.expect(registry.hasLogDir(100, dir_c));
+    try testing.expect(!registry.hasLogDir(100, dir_a));
 }
 
 test "BrokerRegistry heartbeat on unknown broker returns error" {

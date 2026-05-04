@@ -223,9 +223,11 @@ pub const MetadataClient = struct {
         // Build BrokerRegistration request (API 62)
         var buf: [512]u8 = undefined;
         var wpos: usize = 0;
+        const has_local_log_dir = !isZeroUuid(self.local_replica_directory_id.*);
+        const registration_version: i16 = if (has_local_log_dir) 2 else 0;
 
         ser.writeI16(&buf, &wpos, 62); // api_key
-        ser.writeI16(&buf, &wpos, 0); // api_version
+        ser.writeI16(&buf, &wpos, registration_version); // api_version
         ser.writeI32(&buf, &wpos, 1); // correlation_id
         ser.writeCompactString(&buf, &wpos, "zmq-broker"); // client_id
         ser.writeEmptyTaggedFields(&buf, &wpos);
@@ -244,7 +246,7 @@ pub const MetadataClient = struct {
             .listeners = &listeners,
             .log_dirs = log_dirs,
         };
-        req.serialize(&buf, &wpos, 0);
+        req.serialize(&buf, &wpos, registration_version);
 
         if (self.controller_pool.sendRequest(leader, buf[0..wpos])) |response| {
             defer self.allocator.free(response);
@@ -254,7 +256,7 @@ pub const MetadataClient = struct {
                 return;
             };
             defer resp_header.deinit(self.allocator);
-            const resp = Resp.deserialize(self.allocator, response, &rpos, 0) catch {
+            const resp = Resp.deserialize(self.allocator, response, &rpos, registration_version) catch {
                 log.warn("Malformed BrokerRegistration response body", .{});
                 return;
             };
