@@ -630,6 +630,98 @@ test "generated non-default golden fixtures cover legacy and flexible wire encod
     }
 
     {
+        const DescribeUserScramCredentialsResponse = generated.describe_user_scram_credentials_response.DescribeUserScramCredentialsResponse;
+        const CredentialInfo = DescribeUserScramCredentialsResponse.DescribeUserScramCredentialsResult.CredentialInfo;
+        const alice_credentials = [_]CredentialInfo{
+            .{ .mechanism = 1, .iterations = 4096 },
+            .{ .mechanism = 2, .iterations = 8192 },
+        };
+        const missing_credentials = [_]CredentialInfo{};
+        const results = [_]DescribeUserScramCredentialsResponse.DescribeUserScramCredentialsResult{
+            .{
+                .user = "alice",
+                .credential_infos = &alice_credentials,
+            },
+            .{
+                .user = "missing",
+                .error_code = 42,
+                .error_message = "unknown",
+                .credential_infos = &missing_credentials,
+            },
+        };
+        const value = DescribeUserScramCredentialsResponse{
+            .throttle_time_ms = 4,
+            .results = &results,
+        };
+        try expectGoldenRoundTrip(DescribeUserScramCredentialsResponse, value, 0, &[_]u8{
+            0x00, 0x00, 0x00, 0x04,
+            0x00, 0x00, 0x00, 0x03,
+            0x06, 'a',  'l',  'i',
+            'c',  'e',  0x00, 0x00,
+            0x00, 0x03, 0x01, 0x00,
+            0x00, 0x10, 0x00, 0x00,
+            0x02, 0x00, 0x00, 0x20,
+            0x00, 0x00, 0x00, 0x08,
+            'm',  'i',  's',  's',
+            'i',  'n',  'g',  0x00,
+            0x2a, 0x08, 'u',  'n',
+            'k',  'n',  'o',  'w',
+            'n',  0x01, 0x00, 0x00,
+        });
+    }
+
+    {
+        const AlterUserScramCredentialsRequest = generated.alter_user_scram_credentials_request.AlterUserScramCredentialsRequest;
+        const deletions = [_]AlterUserScramCredentialsRequest.ScramCredentialDeletion{.{
+            .name = "bob",
+            .mechanism = 1,
+        }};
+        const upsertions = [_]AlterUserScramCredentialsRequest.ScramCredentialUpsertion{.{
+            .name = "alice",
+            .mechanism = 1,
+            .iterations = 4096,
+            .salt = &[_]u8{ 0xaa, 0xbb, 0xcc },
+            .salted_password = &[_]u8{ 0x01, 0x02, 0x03, 0x04 },
+        }};
+        const value = AlterUserScramCredentialsRequest{
+            .deletions = &deletions,
+            .upsertions = &upsertions,
+        };
+        try expectGoldenRoundTrip(AlterUserScramCredentialsRequest, value, 0, &[_]u8{
+            0x02, 0x04, 'b',  'o',
+            'b',  0x01, 0x00, 0x02,
+            0x06, 'a',  'l',  'i',
+            'c',  'e',  0x01, 0x00,
+            0x00, 0x10, 0x00, 0x04,
+            0xaa, 0xbb, 0xcc, 0x05,
+            0x01, 0x02, 0x03, 0x04,
+            0x00, 0x00,
+        });
+    }
+
+    {
+        const AlterUserScramCredentialsResponse = generated.alter_user_scram_credentials_response.AlterUserScramCredentialsResponse;
+        const results = [_]AlterUserScramCredentialsResponse.AlterUserScramCredentialsResult{
+            .{ .user = "alice" },
+            .{ .user = "bob", .error_code = 42, .error_message = "missing" },
+        };
+        const value = AlterUserScramCredentialsResponse{
+            .throttle_time_ms = 6,
+            .results = &results,
+        };
+        try expectGoldenRoundTrip(AlterUserScramCredentialsResponse, value, 0, &[_]u8{
+            0x00, 0x00, 0x00, 0x06,
+            0x03, 0x06, 'a',  'l',
+            'i',  'c',  'e',  0x00,
+            0x00, 0x00, 0x00, 0x04,
+            'b',  'o',  'b',  0x00,
+            0x2a, 0x08, 'm',  'i',
+            's',  's',  'i',  'n',
+            'g',  0x00, 0x00,
+        });
+    }
+
+    {
         const ElectLeadersRequest = generated.elect_leaders_request.ElectLeadersRequest;
         const null_value = ElectLeadersRequest{
             .election_type = 0,
