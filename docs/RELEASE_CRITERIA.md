@@ -88,9 +88,6 @@ release:
   assignment revocation, and coordinator migration semantics are implemented.
 - Share-group APIs remain non-advertised until durable share-group coordinator
   and share-session data-plane semantics are complete.
-- `AssignReplicasToDirs` remains non-advertised until full multi-directory
-  JBOD movement semantics are complete; controller-backed log-directory
-  registration, replay, and offline-heartbeat fencing are implemented.
 - Legacy inter-broker APIs remain non-advertised until real controller-backed
   inter-broker behavior replaces single-node/no-op compatibility handlers.
 - Broader broker-only stateless replacement still has local cache/state

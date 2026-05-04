@@ -38,8 +38,8 @@ pub const MetadataClient = struct {
     /// Pointer to the Broker's cached_broker_epoch field.
     /// Updated after successful BrokerRegistration so broker handlers can reject stale controller commands.
     cached_broker_epoch: *i64,
-    /// Local replica directory identity advertised in BrokerRegistration.
-    local_replica_directory_id: *const [16]u8,
+    /// Local replica directory identities advertised in BrokerRegistration.
+    local_replica_directory_ids: []const [16]u8,
     /// Pointer to the Broker's is_fenced_by_controller field.
     /// Set to true when the controller heartbeat says we are fenced.
     is_fenced: *bool,
@@ -69,7 +69,7 @@ pub const MetadataClient = struct {
         port: u16,
         cached_epoch: *i32,
         cached_broker_epoch: *i64,
-        local_replica_directory_id: *const [16]u8,
+        local_replica_directory_ids: []const [16]u8,
         is_fenced: *bool,
         last_heartbeat_ms: *i64,
         should_stop: *bool,
@@ -82,7 +82,7 @@ pub const MetadataClient = struct {
             .advertised_port = port,
             .cached_leader_epoch = cached_epoch,
             .cached_broker_epoch = cached_broker_epoch,
-            .local_replica_directory_id = local_replica_directory_id,
+            .local_replica_directory_ids = local_replica_directory_ids,
             .is_fenced = is_fenced,
             .last_heartbeat_ms = last_heartbeat_ms,
             .should_stop = should_stop,
@@ -107,11 +107,6 @@ pub const MetadataClient = struct {
     pub fn setTlsContext(self: *MetadataClient, ctx: *TlsClientContext) void {
         self.controller_pool.setTlsContext(ctx);
         log.info("MetadataClient TLS enabled for broker {d}", .{self.broker_id});
-    }
-
-    fn isZeroUuid(uuid: [16]u8) bool {
-        const zero = [_]u8{0} ** 16;
-        return std.mem.eql(u8, &uuid, &zero);
     }
 
     /// Background loop: discover leader, register, then heartbeat.
@@ -223,7 +218,7 @@ pub const MetadataClient = struct {
         // Build BrokerRegistration request (API 62)
         var buf: [512]u8 = undefined;
         var wpos: usize = 0;
-        const has_local_log_dir = !isZeroUuid(self.local_replica_directory_id.*);
+        const has_local_log_dir = self.local_replica_directory_ids.len > 0;
         const registration_version: i16 = if (has_local_log_dir) 2 else 0;
 
         ser.writeI16(&buf, &wpos, 62); // api_key
@@ -238,13 +233,11 @@ pub const MetadataClient = struct {
             .port = self.advertised_port,
             .security_protocol = 0,
         }};
-        const log_dirs_storage = [_][16]u8{self.local_replica_directory_id.*};
-        const log_dirs: []const [16]u8 = if (isZeroUuid(self.local_replica_directory_id.*)) &.{} else &log_dirs_storage;
         const req = Req{
             .broker_id = self.broker_id,
             .cluster_id = null,
             .listeners = &listeners,
-            .log_dirs = log_dirs,
+            .log_dirs = self.local_replica_directory_ids,
         };
         req.serialize(&buf, &wpos, registration_version);
 
@@ -383,7 +376,7 @@ const testing = std.testing;
 test "MetadataClient staleness detection fences broker" {
     var cached_epoch: i32 = 0;
     var cached_broker_epoch: i64 = 0;
-    const local_replica_directory_id = [_]u8{0} ** 16;
+    const local_replica_directory_ids: []const [16]u8 = &.{};
     var is_fenced: bool = false;
     var last_hb: i64 = @import("time_compat").milliTimestamp() - 60_000; // 60s ago
     var should_stop: bool = false;
@@ -395,7 +388,7 @@ test "MetadataClient staleness detection fences broker" {
         9092,
         &cached_epoch,
         &cached_broker_epoch,
-        &local_replica_directory_id,
+        local_replica_directory_ids,
         &is_fenced,
         &last_hb,
         &should_stop,
@@ -419,7 +412,7 @@ test "MetadataClient staleness detection fences broker" {
 test "MetadataClient fresh heartbeat prevents fencing" {
     var cached_epoch: i32 = 0;
     var cached_broker_epoch: i64 = 0;
-    const local_replica_directory_id = [_]u8{0} ** 16;
+    const local_replica_directory_ids: []const [16]u8 = &.{};
     var is_fenced: bool = false;
     var last_hb: i64 = @import("time_compat").milliTimestamp(); // Just now
     var should_stop: bool = false;
@@ -431,7 +424,7 @@ test "MetadataClient fresh heartbeat prevents fencing" {
         9092,
         &cached_epoch,
         &cached_broker_epoch,
-        &local_replica_directory_id,
+        local_replica_directory_ids,
         &is_fenced,
         &last_hb,
         &should_stop,
@@ -451,7 +444,7 @@ test "MetadataClient fresh heartbeat prevents fencing" {
 test "MetadataClient zero last_heartbeat skips staleness check" {
     var cached_epoch: i32 = 0;
     var cached_broker_epoch: i64 = 0;
-    const local_replica_directory_id = [_]u8{0} ** 16;
+    const local_replica_directory_ids: []const [16]u8 = &.{};
     var is_fenced: bool = false;
     var last_hb: i64 = 0; // Never had a heartbeat (just started)
     var should_stop: bool = false;
@@ -463,7 +456,7 @@ test "MetadataClient zero last_heartbeat skips staleness check" {
         9092,
         &cached_epoch,
         &cached_broker_epoch,
-        &local_replica_directory_id,
+        local_replica_directory_ids,
         &is_fenced,
         &last_hb,
         &should_stop,
@@ -485,7 +478,7 @@ test "MetadataClient parseDescribeQuorumResponse valid" {
 
     var cached_epoch: i32 = 0;
     var cached_broker_epoch: i64 = 0;
-    const local_replica_directory_id = [_]u8{0} ** 16;
+    const local_replica_directory_ids: []const [16]u8 = &.{};
     var is_fenced: bool = false;
     var last_hb: i64 = 0;
     var should_stop: bool = false;
@@ -497,7 +490,7 @@ test "MetadataClient parseDescribeQuorumResponse valid" {
         9092,
         &cached_epoch,
         &cached_broker_epoch,
-        &local_replica_directory_id,
+        local_replica_directory_ids,
         &is_fenced,
         &last_hb,
         &should_stop,
@@ -533,7 +526,7 @@ test "MetadataClient parseDescribeQuorumResponse no leader" {
 
     var cached_epoch: i32 = 0;
     var cached_broker_epoch: i64 = 0;
-    const local_replica_directory_id = [_]u8{0} ** 16;
+    const local_replica_directory_ids: []const [16]u8 = &.{};
     var is_fenced: bool = false;
     var last_hb: i64 = 0;
     var should_stop: bool = false;
@@ -545,7 +538,7 @@ test "MetadataClient parseDescribeQuorumResponse no leader" {
         9092,
         &cached_epoch,
         &cached_broker_epoch,
-        &local_replica_directory_id,
+        local_replica_directory_ids,
         &is_fenced,
         &last_hb,
         &should_stop,
@@ -575,7 +568,7 @@ test "MetadataClient parseDescribeQuorumResponse no leader" {
 test "MetadataClient setTlsContext propagates to controller pool" {
     var cached_epoch: i32 = 0;
     var cached_broker_epoch: i64 = 0;
-    const local_replica_directory_id = [_]u8{0} ** 16;
+    const local_replica_directory_ids: []const [16]u8 = &.{};
     var is_fenced: bool = false;
     var last_hb: i64 = 0;
     var should_stop: bool = false;
@@ -587,7 +580,7 @@ test "MetadataClient setTlsContext propagates to controller pool" {
         9092,
         &cached_epoch,
         &cached_broker_epoch,
-        &local_replica_directory_id,
+        local_replica_directory_ids,
         &is_fenced,
         &last_hb,
         &should_stop,

@@ -96,6 +96,7 @@ pub const broker_supported_apis = [_]BrokerApiSupport{
     .{ .key = 69, .name = "ConsumerGroupDescribe", .metric = "consumer_group_describe", .min = 0, .max = 0 },
     .{ .key = 71, .name = "GetTelemetrySubscriptions", .metric = "get_telemetry_subscriptions", .min = 0, .max = 0 },
     .{ .key = 72, .name = "PushTelemetry", .metric = "push_telemetry", .min = 0, .max = 0 },
+    .{ .key = 73, .name = "AssignReplicasToDirs", .metric = "assign_replicas_to_dirs", .min = 0, .max = 0 },
     .{ .key = 74, .name = "ListClientMetricsResources", .metric = "list_client_metrics_resources", .min = 0, .max = 0 },
     .{ .key = 75, .name = "DescribeTopicPartitions", .metric = "describe_topic_partitions", .min = 0, .max = 0 },
     .{ .key = 501, .name = "CreateStreams", .metric = "automq_create_streams", .min = 0, .max = 1 },
@@ -377,7 +378,6 @@ pub const non_advertised_handler_api_keys = [_]i16{
 /// stays here until full KIP-848 epoch/revocation semantics exist.
 pub const fail_closed_generated_handler_api_keys = [_]i16{
     68, // ConsumerGroupHeartbeat (KIP-848)
-    73, // AssignReplicasToDirs (KIP-858)
     76, // ShareGroupHeartbeat (KIP-932)
     77, // ShareGroupDescribe (KIP-932)
     78, // ShareFetch (KIP-932)

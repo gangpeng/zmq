@@ -68,6 +68,7 @@ const acl_snapshot_record_key = "__zmq_acl_snapshot";
 const finalized_feature_snapshot_record_value_magic = "ZMQFF1";
 const finalized_feature_snapshot_record_key = "__zmq_finalized_feature_snapshot";
 const auto_mq_quorum_commit_timeout_ms: i64 = 5000;
+const max_local_replica_directories: usize = 16;
 
 /// Stateful Kafka broker.
 ///
@@ -139,6 +140,10 @@ pub const Broker = struct {
     /// Local JBOD directory identity advertised to the controller.
     /// A zero value keeps legacy single-dir tests permissive.
     local_replica_directory_id: [16]u8 = .{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 },
+    /// Configured local JBOD directory identities. Empty means legacy permissive
+    /// single-dir mode; non-empty constrains AssignReplicasToDirs targets.
+    local_replica_directory_ids: [max_local_replica_directories][16]u8 = [_][16]u8{.{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 }} ** max_local_replica_directories,
+    local_replica_directory_count: usize = 0,
     /// Set to true when the controller fences this broker (e.g., heartbeat timeout).
     /// When fenced, the broker rejects all produce requests with NOT_LEADER_OR_FOLLOWER.
     is_fenced_by_controller: bool = false,
@@ -438,9 +443,21 @@ pub const Broker = struct {
         client_telemetry_export_path: ?[]const u8 = null,
         /// Local replica directory UUID advertised through BrokerRegistration.
         replica_directory_id: [16]u8 = .{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 },
+        /// All local replica directory UUIDs advertised through BrokerRegistration v2.
+        /// When empty, `replica_directory_id` is used for backward-compatible tests.
+        replica_directory_ids: []const [16]u8 = &.{},
     };
 
     pub const WalFlushMode = storage.wal.WalFlushMode;
+
+    pub const ReplicaDirectoryIdSet = struct {
+        ids: [max_local_replica_directories][16]u8 = [_][16]u8{.{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 }} ** max_local_replica_directories,
+        len: usize = 0,
+
+        pub fn slice(self: *const ReplicaDirectoryIdSet) []const [16]u8 {
+            return self.ids[0..self.len];
+        }
+    };
 
     fn defaultAutoMqNextNodeId(node_id: i32) i32 {
         if (node_id == std.math.maxInt(i32)) return std.math.maxInt(i32);
@@ -460,6 +477,60 @@ pub const Broker = struct {
         id[8] = (id[8] & 0x3f) | 0x80;
         if (isZeroUuid(id)) id[15] = 1;
         return id;
+    }
+
+    pub fn deriveReplicaDirectoryIds(log_dirs: ?[]const u8) ReplicaDirectoryIdSet {
+        var result = ReplicaDirectoryIdSet{};
+        const raw = log_dirs orelse return result;
+
+        var dirs = std.mem.splitScalar(u8, raw, ',');
+        while (dirs.next()) |dir| {
+            if (result.len >= max_local_replica_directories) break;
+            const trimmed = std.mem.trim(u8, dir, " \t\r\n");
+            if (trimmed.len == 0) continue;
+            const id = deriveReplicaDirectoryId(trimmed);
+            if (isZeroUuid(id)) continue;
+            if (replicaDirectoryIdIn(result.ids[0..result.len], id)) continue;
+            result.ids[result.len] = id;
+            result.len += 1;
+        }
+
+        return result;
+    }
+
+    pub fn localReplicaDirectoryIds(self: *const Broker) []const [16]u8 {
+        return self.local_replica_directory_ids[0..self.local_replica_directory_count];
+    }
+
+    fn configureReplicaDirectories(self: *Broker, primary: [16]u8, configured: []const [16]u8) void {
+        self.local_replica_directory_ids = [_][16]u8{zeroUuid()} ** max_local_replica_directories;
+        self.local_replica_directory_count = 0;
+        self.local_replica_directory_id = zeroUuid();
+
+        if (configured.len > 0) {
+            for (configured) |directory_id| self.addLocalReplicaDirectory(directory_id);
+        } else {
+            self.addLocalReplicaDirectory(primary);
+        }
+
+        if (self.local_replica_directory_count > 0) {
+            self.local_replica_directory_id = self.local_replica_directory_ids[0];
+        }
+    }
+
+    fn addLocalReplicaDirectory(self: *Broker, directory_id: [16]u8) void {
+        if (isZeroUuid(directory_id)) return;
+        if (replicaDirectoryIdIn(self.localReplicaDirectoryIds(), directory_id)) return;
+        if (self.local_replica_directory_count >= max_local_replica_directories) return;
+        self.local_replica_directory_ids[self.local_replica_directory_count] = directory_id;
+        self.local_replica_directory_count += 1;
+    }
+
+    fn hasLocalReplicaDirectory(self: *const Broker, directory_id: [16]u8) bool {
+        if (isZeroUuid(directory_id)) return false;
+        const directories = self.localReplicaDirectoryIds();
+        if (directories.len == 0) return true;
+        return replicaDirectoryIdIn(directories, directory_id);
     }
 
     pub fn initWithConfig(alloc: Allocator, node_id: i32, port: u16, config: BrokerConfig) Broker {
@@ -499,7 +570,6 @@ pub const Broker = struct {
             .finalized_features = std.StringHashMap(i16).init(alloc),
             .client_telemetry_samples = std.StringHashMap(ClientTelemetrySample).init(alloc),
             .client_telemetry_export_path = config.client_telemetry_export_path,
-            .local_replica_directory_id = config.replica_directory_id,
             .share_group_states = std.StringHashMap(SharePartitionState).init(alloc),
             .share_group_sessions = std.StringHashMap(i32).init(alloc),
             .replica_directory_assignments = std.StringHashMap(ReplicaDirectoryAssignment).init(alloc),
@@ -529,6 +599,8 @@ pub const Broker = struct {
             // Initialize ObjectManager for Stream/StreamSetObject/StreamObject tracking
             .object_manager = ObjectManager.init(alloc, node_id),
         };
+
+        broker.configureReplicaDirectories(config.replica_directory_id, config.replica_directory_ids);
 
         // Initialize delayed fetch purgatory
         broker.delayed_fetches = std.array_list.Managed(DelayedFetch).init(alloc);
@@ -5278,7 +5350,7 @@ pub const Broker = struct {
             0, 1, 2, 21, 23, 61 => .topic, // Produce, Fetch, ListOffsets, DeleteRecords, OffsetForLeaderEpoch, DescribeProducers
             8, 9, 10, 11, 12, 13, 14, 15, 16, 42, 47, 69 => .group, // group-related
             22, 24, 25, 26, 27, 28, 65, 66 => .transactional_id, // txn-related
-            3, 18, 19, 20, 29, 30, 31, 32, 33, 35, 37, 43, 44, 45, 46, 48, 49, 50, 51, 52, 53, 54, 55, 57, 60, 71, 72, 74, 75 => .cluster, // metadata/admin/quorum
+            3, 18, 19, 20, 29, 30, 31, 32, 33, 35, 37, 43, 44, 45, 46, 48, 49, 50, 51, 52, 53, 54, 55, 57, 60, 71, 72, 73, 74, 75 => .cluster, // metadata/admin/quorum
             501...519, 600...602 => .cluster, // AutoMQ stream/object/controller extensions
             else => .unknown,
         };
@@ -5298,7 +5370,7 @@ pub const Broker = struct {
             22, 24, 25, 26, 27, 28 => .write, // Txn ops
             30 => .alter, // CreateAcls
             31 => .alter, // DeleteAcls
-            33, 43, 44, 45, 49, 51, 57, 72 => .alter, // Alter/admin APIs
+            33, 43, 44, 45, 49, 51, 57, 72, 73 => .alter, // Alter/admin APIs
             52, 53, 54 => .cluster_action, // KRaft quorum mutations
             501, 502, 503, 508, 509, 514, 516, 518, 601 => .describe, // AutoMQ reads/lifecycle probes
             504, 511 => .delete, // AutoMQ deletes
@@ -5390,6 +5462,7 @@ pub const Broker = struct {
             69 => self.handleConsumerGroupDescribeAuthorizationError(request_bytes, body_start, req_header, api_version, resp_header_version, err_code),
             71 => self.handleGetTelemetrySubscriptionsAuthorizationError(request_bytes, body_start, req_header, api_version, resp_header_version, err_code),
             72 => self.handlePushTelemetryAuthorizationError(request_bytes, body_start, req_header, api_version, resp_header_version, err_code),
+            73 => self.handleAssignReplicasToDirsAuthorizationError(request_bytes, body_start, req_header, api_version, resp_header_version, err_code),
             74 => self.handleListClientMetricsResourcesAuthorizationError(request_bytes, body_start, req_header, api_version, resp_header_version, err_code),
             75 => self.handleDescribeTopicPartitionsAuthorizationError(request_bytes, body_start, req_header, api_version, resp_header_version, err_code),
             501 => self.handleCreateStreamsAuthorizationError(request_bytes, body_start, req_header, api_version, resp_header_version, err_code),
@@ -7936,6 +8009,43 @@ pub const Broker = struct {
         const resp = Resp{
             .throttle_time_ms = 0,
             .error_code = @intFromEnum(err_code),
+        };
+        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+    }
+
+    fn handleAssignReplicasToDirsAuthorizationError(
+        self: *Broker,
+        request_bytes: []const u8,
+        body_start: usize,
+        req_header: *const RequestHeader,
+        api_version: i16,
+        resp_header_version: i16,
+        err_code: ErrorCode,
+    ) ?[]u8 {
+        const Req = generated.assign_replicas_to_dirs_request.AssignReplicasToDirsRequest;
+        const Resp = generated.assign_replicas_to_dirs_response.AssignReplicasToDirsResponse;
+
+        if (!validateAssignReplicasToDirsRequestFrame(request_bytes, body_start)) {
+            log.warn("Malformed denied AssignReplicasToDirs request", .{});
+            return null;
+        }
+
+        var pos = body_start;
+        var req = Req.deserialize(self.allocator, request_bytes, &pos, api_version) catch |err| {
+            log.warn("Failed to decode denied AssignReplicasToDirs request: {}", .{err});
+            return null;
+        };
+        defer self.freeAssignReplicasToDirsRequest(&req);
+
+        var pending_assignments = std.array_list.Managed(PendingReplicaDirectoryAssignment).init(self.allocator);
+        defer pending_assignments.deinit();
+        const directories = self.buildAssignReplicasToDirsDirectories(req, err_code, &pending_assignments) catch return null;
+        defer self.freeAssignReplicasToDirsDirectories(directories);
+
+        const resp = Resp{
+            .throttle_time_ms = 0,
+            .error_code = err_code.toInt(),
+            .directories = directories,
         };
         return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
     }
@@ -15147,6 +15257,13 @@ pub const Broker = struct {
         return std.mem.eql(u8, &uuid, &zero);
     }
 
+    fn replicaDirectoryIdIn(haystack: []const [16]u8, needle: [16]u8) bool {
+        for (haystack) |candidate| {
+            if (std.mem.eql(u8, candidate[0..], needle[0..])) return true;
+        }
+        return false;
+    }
+
     fn writeU64Big(dst: []u8, value: u64) void {
         std.debug.assert(dst.len == 8);
         for (0..8) |idx| {
@@ -19020,7 +19137,7 @@ pub const Broker = struct {
     }
 
     // ---------------------------------------------------------------
-    // AssignReplicasToDirs (key 73) — non-advertised until JBOD dirs are durable/controller-backed
+    // AssignReplicasToDirs (key 73) — advertised logical JBOD directory assignment.
     // ---------------------------------------------------------------
     fn handleAssignReplicasToDirs(self: *Broker, request_bytes: []const u8, body_start: usize, req_header: *const RequestHeader, api_version: i16, resp_header_version: i16) ?[]u8 {
         const Req = generated.assign_replicas_to_dirs_request.AssignReplicasToDirsRequest;
@@ -19216,7 +19333,7 @@ pub const Broker = struct {
 
     fn validateReplicaDirectoryAssignmentTarget(self: *const Broker, directory_id: [16]u8, topic_id: [16]u8, partition_index: i32) ErrorCode {
         if (isZeroUuid(directory_id)) return ErrorCode.log_dir_not_found;
-        if (!isZeroUuid(self.local_replica_directory_id) and !std.mem.eql(u8, &directory_id, &self.local_replica_directory_id)) return ErrorCode.log_dir_not_found;
+        if (!self.hasLocalReplicaDirectory(directory_id)) return ErrorCode.log_dir_not_found;
         if (isZeroUuid(topic_id)) return ErrorCode.unknown_topic_id;
         const topic_name = self.findTopicNameById(topic_id) orelse return ErrorCode.unknown_topic_id;
         if (!self.topicPartitionExists(topic_name, partition_index)) return ErrorCode.unknown_topic_or_partition;
@@ -21426,6 +21543,7 @@ pub const Broker = struct {
         const Req = generated.describe_log_dirs_request.DescribeLogDirsRequest;
         const Resp = generated.describe_log_dirs_response.DescribeLogDirsResponse;
         const Result = Resp.DescribeLogDirsResult;
+        const Topic = Result.DescribeLogDirsTopic;
 
         var pos = body_start;
         var req = Req.deserialize(self.allocator, request_bytes, &pos, api_version) catch |err| {
@@ -21435,24 +21553,60 @@ pub const Broker = struct {
         defer self.freeDescribeLogDirsRequest(&req);
 
         const rh = ResponseHeader{ .correlation_id = req_header.correlation_id };
-        const log_dir = if (self.store.data_dir) |d| d else "/data/automq";
-        const topics = self.collectDescribeLogDirsTopics(&req) catch return null;
+        const local_dirs = self.localReplicaDirectoryIds();
+        var allocated_results: []Result = &.{};
+        var allocated_log_dirs: [][]const u8 = &.{};
+        var single_topics: []Topic = &.{};
         defer {
-            self.freeDescribeLogDirsTopics(topics);
-            if (topics.len > 0) self.allocator.free(topics);
+            self.freeDescribeLogDirsTopics(single_topics);
+            if (single_topics.len > 0) self.allocator.free(single_topics);
+            for (allocated_results) |result| {
+                self.freeDescribeLogDirsTopics(result.topics);
+                if (result.topics.len > 0) self.allocator.free(result.topics);
+            }
+            if (allocated_results.len > 0) self.allocator.free(allocated_results);
+            for (allocated_log_dirs) |name| {
+                if (name.len > 0) self.allocator.free(name);
+            }
+            if (allocated_log_dirs.len > 0) self.allocator.free(allocated_log_dirs);
         }
 
-        const results = [_]Result{.{
-            .error_code = @intFromEnum(ErrorCode.none),
-            .log_dir = log_dir,
-            .topics = topics,
-            .total_bytes = -1,
-            .usable_bytes = -1,
-        }};
+        var single_result: [1]Result = undefined;
+        const results: []const Result = if (local_dirs.len <= 1) blk: {
+            const log_dir = if (self.store.data_dir) |d| d else "/data/automq";
+            single_topics = self.collectDescribeLogDirsTopics(&req) catch return null;
+            single_result[0] = .{
+                .error_code = @intFromEnum(ErrorCode.none),
+                .log_dir = log_dir,
+                .topics = single_topics,
+                .total_bytes = -1,
+                .usable_bytes = -1,
+            };
+            break :blk single_result[0..1];
+        } else blk: {
+            allocated_results = self.allocator.alloc(Result, local_dirs.len) catch return null;
+            @memset(allocated_results, .{});
+            allocated_log_dirs = self.allocator.alloc([]const u8, local_dirs.len) catch return null;
+            @memset(allocated_log_dirs, &.{});
+
+            for (local_dirs, 0..) |directory_id, idx| {
+                const log_dir_name = self.replicaDirectoryLogDirName(directory_id) catch return null;
+                allocated_log_dirs[idx] = log_dir_name;
+                const topics = self.collectDescribeLogDirsTopicsForDirectory(&req, directory_id) catch return null;
+                allocated_results[idx] = .{
+                    .error_code = @intFromEnum(ErrorCode.none),
+                    .log_dir = log_dir_name,
+                    .topics = topics,
+                    .total_bytes = -1,
+                    .usable_bytes = -1,
+                };
+            }
+            break :blk allocated_results;
+        };
         const resp_body = Resp{
             .throttle_time_ms = 0,
             .error_code = @intFromEnum(ErrorCode.none),
-            .results = &results,
+            .results = results,
         };
 
         const needed = rh.calcSize(resp_header_version) + resp_body.calcSize(api_version);
@@ -21460,6 +21614,11 @@ pub const Broker = struct {
         var wpos: usize = 0;
         rh.serialize(buf, &wpos, resp_header_version);
         resp_body.serialize(buf, &wpos, api_version);
+        if (local_dirs.len <= 1) {
+            self.freeDescribeLogDirsTopics(single_topics);
+            if (single_topics.len > 0) self.allocator.free(single_topics);
+            single_topics = &.{};
+        }
         return (self.allocator.realloc(buf, wpos) catch buf)[0..wpos];
     }
 
@@ -21473,6 +21632,14 @@ pub const Broker = struct {
     }
 
     fn collectDescribeLogDirsTopics(self: *Broker, req: *const generated.describe_log_dirs_request.DescribeLogDirsRequest) ![]generated.describe_log_dirs_response.DescribeLogDirsResponse.DescribeLogDirsResult.DescribeLogDirsTopic {
+        return self.collectDescribeLogDirsTopicsForDirectoryFilter(req, null);
+    }
+
+    fn collectDescribeLogDirsTopicsForDirectory(self: *Broker, req: *const generated.describe_log_dirs_request.DescribeLogDirsRequest, directory_id: [16]u8) ![]generated.describe_log_dirs_response.DescribeLogDirsResponse.DescribeLogDirsResult.DescribeLogDirsTopic {
+        return self.collectDescribeLogDirsTopicsForDirectoryFilter(req, directory_id);
+    }
+
+    fn collectDescribeLogDirsTopicsForDirectoryFilter(self: *Broker, req: *const generated.describe_log_dirs_request.DescribeLogDirsRequest, directory_filter: ?[16]u8) ![]generated.describe_log_dirs_response.DescribeLogDirsResponse.DescribeLogDirsResult.DescribeLogDirsTopic {
         const Topic = generated.describe_log_dirs_response.DescribeLogDirsResponse.DescribeLogDirsResult.DescribeLogDirsTopic;
 
         var topics = std.array_list.Managed(Topic).init(self.allocator);
@@ -21485,7 +21652,8 @@ pub const Broker = struct {
             var topic_iter = self.topics.iterator();
             while (topic_iter.next()) |entry| {
                 const info = entry.value_ptr;
-                const partitions = try self.collectDescribeLogDirsPartitions(info.name, info.*, &.{});
+                const partitions = try self.collectDescribeLogDirsPartitionsForDirectory(info.name, info.*, &.{}, directory_filter);
+                if (directory_filter != null and partitions.len == 0) continue;
                 topics.append(.{
                     .name = info.name,
                     .partitions = partitions,
@@ -21498,7 +21666,8 @@ pub const Broker = struct {
             for (req.topics.?) |topic_req| {
                 const topic_name = topic_req.topic orelse "";
                 const info = self.topics.get(topic_name);
-                const partitions = try self.collectDescribeLogDirsPartitions(topic_name, info, topic_req.partitions);
+                const partitions = try self.collectDescribeLogDirsPartitionsForDirectory(topic_name, info, topic_req.partitions, directory_filter);
+                if (directory_filter != null and partitions.len == 0 and info != null) continue;
                 topics.append(.{
                     .name = topic_req.topic,
                     .partitions = partitions,
@@ -21514,6 +21683,10 @@ pub const Broker = struct {
     }
 
     fn collectDescribeLogDirsPartitions(self: *Broker, topic_name: []const u8, topic_info: ?TopicInfo, requested_partitions: []const i32) ![]generated.describe_log_dirs_response.DescribeLogDirsResponse.DescribeLogDirsResult.DescribeLogDirsTopic.DescribeLogDirsPartition {
+        return self.collectDescribeLogDirsPartitionsForDirectory(topic_name, topic_info, requested_partitions, null);
+    }
+
+    fn collectDescribeLogDirsPartitionsForDirectory(self: *Broker, topic_name: []const u8, topic_info: ?TopicInfo, requested_partitions: []const i32, directory_filter: ?[16]u8) ![]generated.describe_log_dirs_response.DescribeLogDirsResponse.DescribeLogDirsResult.DescribeLogDirsTopic.DescribeLogDirsPartition {
         const Partition = generated.describe_log_dirs_response.DescribeLogDirsResponse.DescribeLogDirsResult.DescribeLogDirsTopic.DescribeLogDirsPartition;
         const info = topic_info orelse return &.{};
 
@@ -21523,17 +21696,44 @@ pub const Broker = struct {
         if (requested_partitions.len == 0) {
             const num_parts: usize = @intCast(@max(info.num_partitions, 0));
             for (0..num_parts) |partition_index| {
+                if (directory_filter) |dir| {
+                    if (!self.partitionBelongsToReplicaDirectory(info.topic_id, @intCast(partition_index), dir)) continue;
+                }
                 try partitions.append(self.describeLogDirPartition(topic_name, @intCast(partition_index)));
             }
         } else {
             for (requested_partitions) |partition_index| {
                 if (partition_index < 0 or partition_index >= info.num_partitions) continue;
+                if (directory_filter) |dir| {
+                    if (!self.partitionBelongsToReplicaDirectory(info.topic_id, partition_index, dir)) continue;
+                }
                 try partitions.append(self.describeLogDirPartition(topic_name, partition_index));
             }
         }
 
         if (partitions.items.len == 0) return &.{};
         return partitions.toOwnedSlice();
+    }
+
+    fn partitionBelongsToReplicaDirectory(self: *Broker, topic_id: [16]u8, partition_index: i32, directory_id: [16]u8) bool {
+        const assigned = self.getReplicaDirectoryAssignment(topic_id, partition_index) catch null;
+        if (assigned) |current| return std.mem.eql(u8, current[0..], directory_id[0..]);
+
+        const local_dirs = self.localReplicaDirectoryIds();
+        if (local_dirs.len == 0) return false;
+        return std.mem.eql(u8, local_dirs[0][0..], directory_id[0..]);
+    }
+
+    fn replicaDirectoryLogDirName(self: *Broker, directory_id: [16]u8) ![]const u8 {
+        const name = try self.allocator.alloc(u8, "replica-dir:".len + 32);
+        @memcpy(name[0.."replica-dir:".len], "replica-dir:");
+        var pos: usize = "replica-dir:".len;
+        for (directory_id) |byte| {
+            name[pos] = shareStateHex(byte >> 4);
+            name[pos + 1] = shareStateHex(byte & 0x0f);
+            pos += 2;
+        }
+        return name;
     }
 
     fn describeLogDirPartition(self: *Broker, topic_name: []const u8, partition_index: i32) generated.describe_log_dirs_response.DescribeLogDirsResponse.DescribeLogDirsResult.DescribeLogDirsTopic.DescribeLogDirsPartition {
@@ -35198,6 +35398,125 @@ test "Broker.handleRequest AssignReplicasToDirs rejects unregistered local direc
     try testing.expectEqualSlices(u8, local_directory_id[0..], stored[0..]);
 }
 
+test "Broker.handleRequest AssignReplicasToDirs accepts configured multi-directory targets" {
+    const Req = generated.assign_replicas_to_dirs_request.AssignReplicasToDirsRequest;
+    const Resp = generated.assign_replicas_to_dirs_response.AssignReplicasToDirsResponse;
+    const DirectoryData = Req.DirectoryData;
+    const TopicData = DirectoryData.TopicData;
+    const PartitionData = TopicData.PartitionData;
+    const LogDirsReq = generated.describe_log_dirs_request.DescribeLogDirsRequest;
+    const LogDirsResp = generated.describe_log_dirs_response.DescribeLogDirsResponse;
+
+    const dir_a = [_]u8{0xa1} ** 16;
+    const dir_b = [_]u8{0xb2} ** 16;
+    const unknown_dir = [_]u8{0xc3} ** 16;
+    const local_dirs = [_][16]u8{ dir_a, dir_b };
+    var broker = Broker.initWithConfig(testing.allocator, 1, 9092, .{ .replica_directory_ids = &local_dirs });
+    defer broker.deinit();
+    broker.default_num_partitions = 2;
+
+    try testing.expectEqual(@as(usize, 2), broker.localReplicaDirectoryIds().len);
+    try testing.expectEqualSlices(u8, dir_a[0..], broker.local_replica_directory_id[0..]);
+
+    _ = broker.ensureTopic("assign-dir-multi-topic");
+    const topic_id = broker.topics.get("assign-dir-multi-topic").?.topic_id;
+    const partitions_a = [_]PartitionData{.{ .partition_index = 0 }};
+    const partitions_b = [_]PartitionData{.{ .partition_index = 1 }};
+    const partitions_unknown = [_]PartitionData{.{ .partition_index = 0 }};
+    const topics_a = [_]TopicData{.{ .topic_id = topic_id, .partitions = &partitions_a }};
+    const topics_b = [_]TopicData{.{ .topic_id = topic_id, .partitions = &partitions_b }};
+    const topics_unknown = [_]TopicData{.{ .topic_id = topic_id, .partitions = &partitions_unknown }};
+    const directories = [_]DirectoryData{
+        .{ .id = dir_a, .topics = &topics_a },
+        .{ .id = dir_b, .topics = &topics_b },
+        .{ .id = unknown_dir, .topics = &topics_unknown },
+    };
+    const req = Req{
+        .broker_id = 1,
+        .broker_epoch = 1,
+        .directories = &directories,
+    };
+
+    var buf: [1024]u8 = undefined;
+    var pos = buildTestRequest(&buf, 73, 0, 7310, header_mod.requestHeaderVersion(73, 0));
+    req.serialize(&buf, &pos, 0);
+
+    const response = broker.handleRequest(buf[0..pos]);
+    try testing.expect(response != null);
+    defer testing.allocator.free(response.?);
+
+    var rpos: usize = 0;
+    var response_header = try ResponseHeader.deserialize(testing.allocator, response.?, &rpos, header_mod.responseHeaderVersion(73, 0));
+    defer response_header.deinit(testing.allocator);
+    try testing.expectEqual(@as(i32, 7310), response_header.correlation_id);
+
+    const resp = try Resp.deserialize(testing.allocator, response.?, &rpos, 0);
+    defer {
+        for (resp.directories) |directory| {
+            for (directory.topics) |topic| {
+                if (topic.partitions.len > 0) testing.allocator.free(topic.partitions);
+            }
+            if (directory.topics.len > 0) testing.allocator.free(directory.topics);
+        }
+        if (resp.directories.len > 0) testing.allocator.free(resp.directories);
+    }
+
+    try testing.expectEqual(response.?.len, rpos);
+    try testing.expectEqual(ErrorCode.none.toInt(), resp.error_code);
+    try testing.expectEqual(ErrorCode.none.toInt(), resp.directories[0].topics[0].partitions[0].error_code);
+    try testing.expectEqual(ErrorCode.none.toInt(), resp.directories[1].topics[0].partitions[0].error_code);
+    try testing.expectEqual(ErrorCode.log_dir_not_found.toInt(), resp.directories[2].topics[0].partitions[0].error_code);
+
+    const stored_a = (try broker.getReplicaDirectoryAssignment(topic_id, 0)) orelse return error.ExpectedReplicaDirectoryAssignment;
+    const stored_b = (try broker.getReplicaDirectoryAssignment(topic_id, 1)) orelse return error.ExpectedReplicaDirectoryAssignment;
+    try testing.expectEqualSlices(u8, dir_a[0..], stored_a[0..]);
+    try testing.expectEqualSlices(u8, dir_b[0..], stored_b[0..]);
+
+    const log_req = LogDirsReq{ .topics = null };
+    var log_buf: [512]u8 = undefined;
+    var log_pos = buildTestRequest(&log_buf, 35, 2, 3515, header_mod.requestHeaderVersion(35, 2));
+    log_req.serialize(&log_buf, &log_pos, 2);
+
+    const log_response = broker.handleRequest(log_buf[0..log_pos]);
+    try testing.expect(log_response != null);
+    defer testing.allocator.free(log_response.?);
+
+    var log_rpos: usize = 0;
+    var log_response_header = try ResponseHeader.deserialize(testing.allocator, log_response.?, &log_rpos, header_mod.responseHeaderVersion(35, 2));
+    defer log_response_header.deinit(testing.allocator);
+    try testing.expectEqual(@as(i32, 3515), log_response_header.correlation_id);
+
+    const log_resp = try LogDirsResp.deserialize(testing.allocator, log_response.?, &log_rpos, 2);
+    defer {
+        for (log_resp.results) |result| {
+            for (result.topics) |topic| {
+                if (topic.partitions.len > 0) testing.allocator.free(topic.partitions);
+            }
+            if (result.topics.len > 0) testing.allocator.free(result.topics);
+        }
+        if (log_resp.results.len > 0) testing.allocator.free(log_resp.results);
+    }
+
+    try testing.expectEqual(log_response.?.len, log_rpos);
+    try testing.expectEqual(@as(usize, 2), log_resp.results.len);
+    try testing.expect(std.mem.startsWith(u8, log_resp.results[0].log_dir orelse "", "replica-dir:"));
+    try testing.expectEqual(@as(usize, 1), log_resp.results[0].topics.len);
+    try testing.expectEqual(@as(usize, 1), log_resp.results[0].topics[0].partitions.len);
+    try testing.expectEqual(@as(i32, 0), log_resp.results[0].topics[0].partitions[0].partition_index);
+    try testing.expectEqual(@as(usize, 1), log_resp.results[1].topics.len);
+    try testing.expectEqual(@as(usize, 1), log_resp.results[1].topics[0].partitions.len);
+    try testing.expectEqual(@as(i32, 1), log_resp.results[1].topics[0].partitions[0].partition_index);
+}
+
+test "Broker deriveReplicaDirectoryIds parses comma-separated log dirs" {
+    const ids = Broker.deriveReplicaDirectoryIds(" /tmp/zmq-a ,/tmp/zmq-b,/tmp/zmq-a, ");
+    const zero = [_]u8{0} ** 16;
+    try testing.expectEqual(@as(usize, 2), ids.len);
+    try testing.expect(!std.mem.eql(u8, ids.ids[0][0..], zero[0..]));
+    try testing.expect(!std.mem.eql(u8, ids.ids[1][0..], zero[0..]));
+    try testing.expect(!std.mem.eql(u8, ids.ids[0][0..], ids.ids[1][0..]));
+}
+
 test "Broker.handleRequest AssignReplicasToDirs persists local assignments across restart" {
     const Req = generated.assign_replicas_to_dirs_request.AssignReplicasToDirsRequest;
     const Resp = generated.assign_replicas_to_dirs_response.AssignReplicasToDirsResponse;
@@ -35537,6 +35856,60 @@ test "Broker.handleRequest AssignReplicasToDirs rejects malformed request" {
 
     try testing.expectEqual(response.?.len, rpos);
     try testing.expectEqual(ErrorCode.invalid_request.toInt(), resp.error_code);
+}
+
+test "Broker.handleRequest AssignReplicasToDirs authorization denial uses generated response" {
+    const Req = generated.assign_replicas_to_dirs_request.AssignReplicasToDirsRequest;
+    const Resp = generated.assign_replicas_to_dirs_response.AssignReplicasToDirsResponse;
+    const DirectoryData = Req.DirectoryData;
+    const TopicData = DirectoryData.TopicData;
+    const PartitionData = TopicData.PartitionData;
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+    try broker.authorizer.addAcl("other-client", .cluster, "*", .literal, .alter, .allow, "*");
+
+    const directory_id = [_]u8{0xd4} ** 16;
+    _ = broker.ensureTopic("assign-dir-denied-topic");
+    const topic_id = broker.topics.get("assign-dir-denied-topic").?.topic_id;
+    const partitions = [_]PartitionData{.{ .partition_index = 0 }};
+    const topics = [_]TopicData{.{ .topic_id = topic_id, .partitions = &partitions }};
+    const directories = [_]DirectoryData{.{ .id = directory_id, .topics = &topics }};
+    const req = Req{
+        .broker_id = 1,
+        .broker_epoch = 1,
+        .directories = &directories,
+    };
+
+    var buf: [256]u8 = undefined;
+    var pos = buildTestRequest(&buf, 73, 0, 7311, header_mod.requestHeaderVersion(73, 0));
+    req.serialize(&buf, &pos, 0);
+
+    const response = broker.handleRequest(buf[0..pos]);
+    try testing.expect(response != null);
+    defer testing.allocator.free(response.?);
+
+    var rpos: usize = 0;
+    var response_header = try ResponseHeader.deserialize(testing.allocator, response.?, &rpos, header_mod.responseHeaderVersion(73, 0));
+    defer response_header.deinit(testing.allocator);
+    try testing.expectEqual(@as(i32, 7311), response_header.correlation_id);
+
+    const resp = try Resp.deserialize(testing.allocator, response.?, &rpos, 0);
+    defer {
+        for (resp.directories) |directory| {
+            for (directory.topics) |topic| {
+                if (topic.partitions.len > 0) testing.allocator.free(topic.partitions);
+            }
+            if (directory.topics.len > 0) testing.allocator.free(directory.topics);
+        }
+        if (resp.directories.len > 0) testing.allocator.free(resp.directories);
+    }
+
+    try testing.expectEqual(response.?.len, rpos);
+    try testing.expectEqual(ErrorCode.cluster_authorization_failed.toInt(), resp.error_code);
+    try testing.expectEqual(@as(usize, 1), resp.directories.len);
+    try testing.expectEqual(ErrorCode.cluster_authorization_failed.toInt(), resp.directories[0].topics[0].partitions[0].error_code);
+    try testing.expect((try broker.getReplicaDirectoryAssignment(topic_id, 0)) == null);
 }
 
 test "Broker.handleRequest ListClientMetricsResources returns collected client resources" {

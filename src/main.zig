@@ -67,6 +67,16 @@ fn parseS3Scheme(text: []const u8, default: storage.S3Client.Scheme) storage.S3C
     return default;
 }
 
+fn firstLogDir(log_dirs: ?[]const u8) ?[]const u8 {
+    const raw = log_dirs orelse return null;
+    var parts = std.mem.splitScalar(u8, raw, ',');
+    while (parts.next()) |part| {
+        const trimmed = std.mem.trim(u8, part, " \t\r\n");
+        if (trimmed.len > 0) return trimmed;
+    }
+    return null;
+}
+
 /// Global pointers for signal handler access.
 var global_server: ?*Server = null;
 var global_controller_server: ?*Server = null;
@@ -360,6 +370,8 @@ pub fn main(init: std.process.Init) !void {
         .group_commit
     else
         .sync;
+    const storage_data_dir = firstLogDir(data_dir);
+    const replica_directory_ids = Broker.deriveReplicaDirectoryIds(data_dir);
 
     // ═══════════════════════════════════════════════════════════
     // CONTROLLER COMPONENTS (if controller role)
@@ -369,7 +381,7 @@ pub fn main(init: std.process.Init) !void {
 
     if (process_roles.is_controller) {
         const ctrl = try alloc.create(Controller);
-        ctrl.* = if (data_dir) |dir|
+        ctrl.* = if (storage_data_dir) |dir|
             Controller.initWithDataDir(alloc, node_id, cluster_id, dir)
         else
             Controller.init(alloc, node_id, cluster_id);
@@ -382,7 +394,7 @@ pub fn main(init: std.process.Init) !void {
             parseAndRegisterVoters(&ctrl.raft_state, voters_str.?, &raft_pool.?);
         }
 
-        if (data_dir != null) {
+        if (storage_data_dir != null) {
             const recovered = ctrl.raft_state.loadPersistedLog() catch |err| blk: {
                 log.warn("Controller Raft log recovery failed: {}", .{err});
                 break :blk 0;
@@ -416,9 +428,8 @@ pub fn main(init: std.process.Init) !void {
 
     if (process_roles.is_broker) {
         const brk = try alloc.create(Broker);
-        const replica_directory_id = Broker.deriveReplicaDirectoryId(data_dir);
         brk.* = Broker.initWithConfig(alloc, node_id, port, .{
-            .data_dir = data_dir,
+            .data_dir = storage_data_dir,
             .s3_endpoint_host = s3_host,
             .s3_endpoint_port = s3_port,
             .s3_bucket = s3_bucket,
@@ -436,7 +447,7 @@ pub fn main(init: std.process.Init) !void {
             .s3_block_cache_size = s3_block_cache_size,
             .compaction_interval_ms = compaction_interval,
             .client_telemetry_export_path = client_telemetry_export_path,
-            .replica_directory_id = replica_directory_id,
+            .replica_directory_ids = replica_directory_ids.slice(),
         });
         broker = brk;
         // Re-wire internal pointers that became stale after the struct copy
@@ -505,7 +516,7 @@ pub fn main(init: std.process.Init) !void {
                 port,
                 &brk.cached_leader_epoch,
                 &brk.cached_broker_epoch,
-                &brk.local_replica_directory_id,
+                brk.localReplicaDirectoryIds(),
                 &brk.is_fenced_by_controller,
                 &brk.last_successful_heartbeat_ms,
                 &global_shutdown,
@@ -582,7 +593,7 @@ pub fn main(init: std.process.Init) !void {
     // ═══════════════════════════════════════════════════════════
 
     // Print startup banner
-    const storage_mode: []const u8 = if (s3_host != null) "S3" else if (data_dir != null) "persistent" else "in-memory";
+    const storage_mode: []const u8 = if (s3_host != null) "S3" else if (storage_data_dir != null) "persistent" else "in-memory";
     try stdout.print("  Node ID: {d}\n", .{node_id});
     try stdout.print("  Cluster: {s}\n", .{cluster_id});
     try stdout.print("  Roles: {s}\n", .{process_roles.name()});
