@@ -620,6 +620,120 @@ def wait_for_payloads(port, topic, payloads, timeout=30):
     )
 
 
+def parse_offset_commit_response(response, correlation_id, expected_topic):
+    pos = 0
+    response_correlation, pos = read_i32(response, pos)
+    if response_correlation != correlation_id:
+        raise TestError(f"OffsetCommit correlation mismatch: {response_correlation}")
+    _, pos = read_i32(response, pos)  # throttle_time_ms
+    topics, pos = read_i32(response, pos)
+    if topics != 1:
+        raise TestError(f"OffsetCommit topic response count={topics}")
+    topic_name, pos = read_string(response, pos)
+    partitions, pos = read_i32(response, pos)
+    if topic_name != expected_topic or partitions != 1:
+        raise TestError(
+            f"OffsetCommit topic={topic_name!r} partitions={partitions}"
+        )
+    partition, pos = read_i32(response, pos)
+    error_code, pos = read_i16(response, pos)
+    if partition != 0:
+        raise TestError(f"OffsetCommit partition={partition} error_code={error_code}")
+    return error_code
+
+
+def commit_offset(port, group, topic, offset, correlation_id):
+    body = write_string(group)
+    body += struct.pack(">i", -1)  # generation_id: simple commit
+    body += write_string("")  # member_id
+    body += struct.pack(">i", 1)  # topics
+    body += write_string(topic)
+    body += struct.pack(">i", 1)  # partitions
+    body += struct.pack(">i", 0)  # partition_index
+    body += struct.pack(">q", offset)
+    body += write_string("kraft-failover")
+
+    response = controller_request(port, 8, 5, correlation_id, body)
+    error_code = parse_offset_commit_response(response, correlation_id, topic)
+    if error_code != 0:
+        raise TestError(f"OffsetCommit error_code={error_code}")
+
+
+def parse_offset_fetch_response(response, correlation_id, expected_topic):
+    pos = 0
+    response_correlation, pos = read_i32(response, pos)
+    if response_correlation != correlation_id:
+        raise TestError(f"OffsetFetch correlation mismatch: {response_correlation}")
+    topics, pos = read_i32(response, pos)
+    if topics != 1:
+        raise TestError(f"OffsetFetch topic response count={topics}")
+    topic_name, pos = read_string(response, pos)
+    partitions, pos = read_i32(response, pos)
+    if topic_name != expected_topic or partitions != 1:
+        raise TestError(f"OffsetFetch topic={topic_name!r} partitions={partitions}")
+    partition, pos = read_i32(response, pos)
+    committed, pos = read_i64(response, pos)
+    metadata, pos = read_string(response, pos)
+    error_code, pos = read_i16(response, pos)
+    if partition != 0 or error_code != 0:
+        raise TestError(f"OffsetFetch partition={partition} error_code={error_code}")
+    return {"offset": committed, "metadata": metadata}
+
+
+def fetch_committed_offset(port, group, topic, correlation_id):
+    body = write_string(group)
+    body += struct.pack(">i", 1)  # topics
+    body += write_string(topic)
+    body += struct.pack(">i", 1)  # partitions
+    body += struct.pack(">i", 0)
+
+    response = controller_request(port, 9, 1, correlation_id, body)
+    return parse_offset_fetch_response(response, correlation_id, topic)["offset"]
+
+
+def wait_for_committed_offset(port, group, topic, expected_offset, timeout=30):
+    deadline = time.time() + timeout
+    correlation_id = 6200
+    last_offset = None
+    last_error = None
+    while time.time() < deadline:
+        try:
+            last_offset = fetch_committed_offset(port, group, topic, correlation_id)
+            if last_offset == expected_offset:
+                return last_offset
+        except Exception as exc:
+            last_error = exc
+        correlation_id += 1
+        time.sleep(0.25)
+    raise TestError(
+        f"committed offset did not converge: expected={expected_offset} "
+        f"last_offset={last_offset} last_error={last_error}"
+    )
+
+
+def wait_for_offset_commit(port, group, topic, expected_offset, timeout=30):
+    deadline = time.time() + timeout
+    correlation_id = 6300
+    last_error = None
+    while time.time() < deadline:
+        try:
+            commit_offset(port, group, topic, expected_offset, correlation_id)
+            return wait_for_committed_offset(
+                port,
+                group,
+                topic,
+                expected_offset,
+                timeout=max(1, int(deadline - time.time())),
+            )
+        except Exception as exc:
+            last_error = exc
+        correlation_id += 1
+        time.sleep(0.25)
+    raise TestError(
+        f"OffsetCommit did not persist offset {expected_offset}: {last_error}"
+    )
+
+
 def network_hooks_configured():
     return bool(
         os.environ.get("ZMQ_KRAFT_NETWORK_MATRIX")
@@ -2615,17 +2729,21 @@ def main():
         broker = start_broker(tmp, voters)
         wait_for_broker_ready(broker["proc"], broker["port"], broker["log_path"])
         topic = f"kraft-failover-{os.getpid()}-{int(time.time())}"
+        group = f"kraft-failover-group-{os.getpid()}-{int(time.time())}"
         expected_payloads = []
         wait_for_topic(broker["port"], topic)
         expected_payloads.append(b"r0")
         first_offset = wait_for_produce(broker["port"], topic, expected_payloads[-1])
+        committed_offset = first_offset + 1
         wait_for_payloads(broker["port"], topic, expected_payloads)
+        wait_for_offset_commit(broker["port"], group, topic, committed_offset)
 
         network_partition_result = run_network_partition_matrix(
             processes, broker, topic, expected_payloads, leader_id
         )
         if network_partition_result is not None:
             leader_id, initial = wait_for_leader(processes)
+        wait_for_committed_offset(broker["port"], group, topic, committed_offset)
 
         stop_process(processes[leader_id]["proc"], crash=True)
         replacement_leader, after = wait_for_leader(processes, forbidden_leaders={leader_id})
@@ -2637,11 +2755,14 @@ def main():
 
         wait_for_all_alive_to_report(processes, replacement_leader)
         wait_for_payloads(broker["port"], topic, expected_payloads)
+        wait_for_committed_offset(broker["port"], group, topic, committed_offset)
         expected_payloads.append(b"r1")
         second_offset = wait_for_produce(broker["port"], topic, expected_payloads[-1])
         if second_offset <= first_offset:
             raise TestError(f"broker did not continue after failover: {second_offset} <= {first_offset}")
         wait_for_payloads(broker["port"], topic, expected_payloads)
+        committed_offset = second_offset + 1
+        wait_for_offset_commit(broker["port"], group, topic, committed_offset)
 
         shutil.rmtree(os.path.join(tmp, f"controller-{leader_id}"), ignore_errors=True)
         processes[leader_id] = start_controller(tmp, leader_id, ports[leader_id], voters)
@@ -2659,6 +2780,7 @@ def main():
             )
 
         wait_for_payloads(broker["port"], topic, expected_payloads)
+        wait_for_committed_offset(broker["port"], group, topic, committed_offset)
         expected_payloads.append(b"r2")
         third_offset = wait_for_produce(broker["port"], topic, expected_payloads[-1])
         if third_offset <= second_offset:
@@ -2666,6 +2788,8 @@ def main():
                 f"broker did not continue after old leader rejoin: {third_offset} <= {second_offset}"
             )
         wait_for_payloads(broker["port"], topic, expected_payloads)
+        committed_offset = third_offset + 1
+        wait_for_offset_commit(broker["port"], group, topic, committed_offset)
 
         alive = {node_id for node_id, info in processes.items() if info["proc"].poll() is None}
         restart_controller_id = next(
@@ -2692,6 +2816,7 @@ def main():
             )
 
         wait_for_payloads(broker["port"], topic, expected_payloads)
+        wait_for_committed_offset(broker["port"], group, topic, committed_offset)
         expected_payloads.append(b"r3")
         fourth_offset = wait_for_produce(
             broker["port"], topic, expected_payloads[-1]
@@ -2701,11 +2826,14 @@ def main():
                 f"broker did not continue after controller restart: {fourth_offset} <= {third_offset}"
             )
         wait_for_payloads(broker["port"], topic, expected_payloads)
+        committed_offset = fourth_offset + 1
+        wait_for_offset_commit(broker["port"], group, topic, committed_offset)
 
         stop_process(broker["proc"])
         broker = start_broker(tmp, voters)
         wait_for_broker_ready(broker["proc"], broker["port"], broker["log_path"])
         wait_for_payloads(broker["port"], topic, expected_payloads)
+        wait_for_committed_offset(broker["port"], group, topic, committed_offset)
         expected_payloads.append(b"r4")
         fifth_offset = wait_for_produce(
             broker["port"], topic, expected_payloads[-1]
@@ -2715,6 +2843,8 @@ def main():
                 f"broker did not continue after broker restart: {fifth_offset} <= {fourth_offset}"
             )
         wait_for_payloads(broker["port"], topic, expected_payloads)
+        committed_offset = fifth_offset + 1
+        wait_for_offset_commit(broker["port"], group, topic, committed_offset)
 
         automq_result = run_automq_metadata_failover_scenario(tmp)
 
@@ -2734,6 +2864,7 @@ def main():
             f"reassignment_topic={automq_result['reassignment_topic']}, "
             f"reassignment_target={automq_result['reassignment_target']}, "
             f"reassignment_target_offset={automq_result['reassignment_target_offset']}, "
+            f"committed_offset={committed_offset}, "
             f"network_partition={network_partition_result}, "
             f"automq_old_leader_fresh_rejoin={automq_result['old_leader_fresh_rejoin']})"
         )
@@ -2803,6 +2934,23 @@ def self_test():
         env["ZMQ_KRAFT_NETWORK_EXPECT"] = "fail"
         run_network_hook("self-test:down", phases[0]["down"], env)
         run_network_hook("self-test:up", phases[0]["up"], env)
+
+        commit_fixture = struct.pack(">ii", 42, 0)
+        commit_fixture += struct.pack(">i", 1)
+        commit_fixture += write_string("offset-self-test")
+        commit_fixture += struct.pack(">iih", 1, 0, 0)
+        if parse_offset_commit_response(commit_fixture, 42, "offset-self-test") != 0:
+            raise TestError("OffsetCommit fixture parser failed")
+
+        fetch_fixture = struct.pack(">i", 43)
+        fetch_fixture += struct.pack(">i", 1)
+        fetch_fixture += write_string("offset-self-test")
+        fetch_fixture += struct.pack(">iiq", 1, 0, 7)
+        fetch_fixture += write_string("kraft-failover")
+        fetch_fixture += struct.pack(">h", 0)
+        fetched = parse_offset_fetch_response(fetch_fixture, 43, "offset-self-test")
+        if fetched["offset"] != 7 or fetched["metadata"] != "kraft-failover":
+            raise TestError(f"OffsetFetch fixture parser failed: {fetched}")
 
         print("ok: KRaft failover harness self-test")
         return 0
