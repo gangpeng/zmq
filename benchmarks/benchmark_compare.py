@@ -99,6 +99,16 @@ def parse_targets(raw):
             raise ValueError(f"Unknown target '{target}'. Valid targets: {', '.join(ALL_TARGETS)}")
     return targets
 
+def required_targets_from_env():
+    raw = os.environ.get("ZMQ_BENCH_COMPARE_REQUIRED_TARGETS", "")
+    if not raw.strip():
+        return []
+    return parse_targets(raw)
+
+def missing_required_targets(selected_targets, required_targets):
+    selected = set(selected_targets)
+    return [target for target in required_targets if target not in selected]
+
 # ── Kafka wire protocol helpers ──
 # Uses lowest versions compatible with all three targets:
 #   - Produce v0: supported by ZMQ (0-11), Kafka 4.2 (0-13), AutoMQ (0-11)
@@ -489,10 +499,15 @@ def result_error_rate(result):
         return 0.0
     return errors / denominator
 
-def evaluate_comparison_gates(all_results, thresholds=None, require_baseline=False):
+def evaluate_comparison_gates(all_results, thresholds=None, require_baseline=False, required_targets=None):
     """Return release-gate failures for ZMQ-vs-baseline comparative results."""
     thresholds = thresholds or comparison_gate_thresholds()
+    required_targets = required_targets or []
     failures = []
+
+    for target in required_targets:
+        if target not in all_results:
+            failures.append(f"required benchmark target {TARGET_LABELS[target]} did not produce results")
 
     if "zmq" not in all_results:
         if require_baseline:
@@ -686,6 +701,7 @@ def main():
 
     try:
         gate_thresholds = comparison_gate_thresholds()
+        required_targets = required_targets_from_env()
     except ValueError as exc:
         print(f"  ERROR: {exc}")
         return 1
@@ -695,6 +711,11 @@ def main():
         targets = parse_targets(args.target)
     except ValueError as exc:
         print(f"  ERROR: {exc}")
+        return 1
+    missing_targets = missing_required_targets(targets, required_targets)
+    if missing_targets:
+        labels = ", ".join(TARGET_LABELS[target] for target in missing_targets)
+        print(f"  ERROR: required benchmark target(s) not selected: {labels}")
         return 1
 
     manage_docker = len(targets) > 1
@@ -743,6 +764,7 @@ def main():
         all_results,
         thresholds=gate_thresholds,
         require_baseline=args.require_enabled,
+        required_targets=required_targets,
     )
     exit_code = 0
     if args.require_enabled or os.environ.get("ZMQ_BENCH_COMPARE_ENFORCE_GATES") == "1":
@@ -805,6 +827,14 @@ def self_test():
     }
     if evaluate_comparison_gates({"zmq": passing_result, "kafka": baseline_result}, thresholds, True):
         raise AssertionError("passing comparison gate failed")
+    required_failures = evaluate_comparison_gates(
+        {"zmq": passing_result, "kafka": baseline_result},
+        thresholds,
+        True,
+        required_targets=["zmq", "kafka", "automq"],
+    )
+    if not any("AutoMQ" in failure and "did not produce results" in failure for failure in required_failures):
+        raise AssertionError("missing required benchmark target was not reported")
 
     failing_result = dict(passing_result)
     failing_result["fetch"] = {
@@ -831,9 +861,14 @@ def self_test():
         os.environ["ZMQ_BENCH_COMPARE_MAX_P50_LATENCY_RATIO"] = "4"
         os.environ["ZMQ_BENCH_COMPARE_MAX_P99_LATENCY_RATIO"] = "8"
         os.environ["ZMQ_BENCH_COMPARE_MAX_ERROR_RATE"] = "0.01"
+        os.environ["ZMQ_BENCH_COMPARE_REQUIRED_TARGETS"] = "kafka,automq"
         env_thresholds = comparison_gate_thresholds()
         if env_thresholds["min_throughput_ratio"] != 0.25 or env_thresholds["max_error_rate"] != 0.01:
             raise AssertionError("environment threshold parsing failed")
+        if required_targets_from_env() != ["kafka", "automq"]:
+            raise AssertionError("environment required target parsing failed")
+        if missing_required_targets(["zmq", "kafka"], required_targets_from_env()) != ["automq"]:
+            raise AssertionError("required target selection validation failed")
     finally:
         os.environ.clear()
         os.environ.update(old_env)

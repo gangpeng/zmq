@@ -28,8 +28,8 @@ single-node demo are not sufficient by themselves.
 - `Performance`: repeatable local and live-S3 benchmarks report produce/fetch
   throughput, p99 latency, S3 operations per MiB, recovery time, and bounded
   memory growth. Comparative trend gates must run against Kafka or AutoMQ
-  baselines before release and enforce configured throughput, latency, and
-  error-rate regression thresholds.
+  baselines before release, enforce configured target coverage, and enforce
+  configured throughput, latency, and error-rate regression thresholds.
 - `Chaos`: SIGKILL, broker/controller restart, network partition, S3 outage,
   clock-skewed records, and slow/partial client scenarios must pass in the
   gated chaos suites.
