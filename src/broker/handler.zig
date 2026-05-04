@@ -43668,6 +43668,161 @@ test "Broker restores partition reassignment state from S3 cluster metadata log"
     }
 }
 
+test "Broker restores CreateTopics manual assignment from S3 cluster metadata log" {
+    const Req = generated.create_topics_request.CreateTopicsRequest;
+    const Resp = generated.create_topics_response.CreateTopicsResponse;
+
+    var mock_s3 = storage.MockS3.init(testing.allocator);
+    defer mock_s3.deinit();
+    const s3_storage = storage.S3Storage.initMock(testing.allocator, &mock_s3);
+
+    const topic_name = "ct-manual-s3-recovery";
+    const remote_brokers = [_]i32{2};
+    const assignments = [_]Req.CreatableTopic.CreatableReplicaAssignment{.{
+        .partition_index = 0,
+        .broker_ids = &remote_brokers,
+    }};
+    const topics = [_]Req.CreatableTopic{.{
+        .name = topic_name,
+        .num_partitions = -1,
+        .replication_factor = -1,
+        .assignments = &assignments,
+    }};
+    const req = Req{
+        .topics = &topics,
+        .timeout_ms = 30000,
+        .validate_only = false,
+    };
+
+    {
+        var broker = Broker.init(testing.allocator, 1, 9092);
+        defer broker.deinit();
+        broker.store.s3_wal_mode = true;
+        broker.store.s3_storage = s3_storage;
+        broker.store.s3_wal_batcher = storage.wal.S3WalBatcher.init(testing.allocator);
+
+        try broker.open();
+
+        var buf: [512]u8 = undefined;
+        var pos = buildTestRequest(&buf, 19, 7, 1931, header_mod.requestHeaderVersion(19, 7));
+        req.serialize(&buf, &pos, 7);
+
+        const response = broker.handleRequest(buf[0..pos]);
+        try testing.expect(response != null);
+        defer testing.allocator.free(response.?);
+
+        var rpos: usize = 0;
+        var response_header = try ResponseHeader.deserialize(testing.allocator, response.?, &rpos, header_mod.responseHeaderVersion(19, 7));
+        defer response_header.deinit(testing.allocator);
+        try testing.expectEqual(@as(i32, 1931), response_header.correlation_id);
+
+        const resp = try Resp.deserialize(testing.allocator, response.?, &rpos, 7);
+        defer {
+            for (resp.topics) |topic| {
+                if (topic.configs) |response_configs| {
+                    if (response_configs.len > 0) testing.allocator.free(response_configs);
+                }
+            }
+            if (resp.topics.len > 0) testing.allocator.free(resp.topics);
+        }
+
+        try testing.expectEqual(response.?.len, rpos);
+        try testing.expectEqual(@as(usize, 1), resp.topics.len);
+        try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.none)), resp.topics[0].error_code);
+        try testing.expectEqual(@as(?i32, 2), broker.failover_controller.findPartitionOwner(topic_name, 0));
+        try testing.expectEqual(@as(u32, 1), broker.partition_reassignments.count());
+        try testing.expect(mock_s3.objectCount() > 0);
+    }
+
+    {
+        var broker = Broker.init(testing.allocator, 1, 9092);
+        defer broker.deinit();
+        broker.store.s3_wal_mode = true;
+        broker.store.s3_storage = s3_storage;
+        broker.store.s3_wal_batcher = storage.wal.S3WalBatcher.init(testing.allocator);
+
+        try broker.open();
+        try testing.expect(broker.topics.contains(topic_name));
+        try testing.expectEqual(@as(i32, 1), broker.topics.get(topic_name).?.num_partitions);
+        try testing.expectEqual(@as(?i32, 2), broker.failover_controller.findPartitionOwner(topic_name, 0));
+        try testing.expectEqual(@as(u32, 1), broker.partition_reassignments.count());
+    }
+}
+
+test "Broker restores CreatePartitions manual assignment from S3 cluster metadata log" {
+    const Req = generated.create_partitions_request.CreatePartitionsRequest;
+    const Resp = generated.create_partitions_response.CreatePartitionsResponse;
+
+    var mock_s3 = storage.MockS3.init(testing.allocator);
+    defer mock_s3.deinit();
+    const s3_storage = storage.S3Storage.initMock(testing.allocator, &mock_s3);
+
+    const topic_name = "cp-manual-s3-recovery";
+    const remote_brokers = [_]i32{2};
+    const assignments = [_]Req.CreatePartitionsTopic.CreatePartitionsAssignment{.{
+        .broker_ids = &remote_brokers,
+    }};
+    const topics = [_]Req.CreatePartitionsTopic{.{
+        .name = topic_name,
+        .count = 2,
+        .assignments = &assignments,
+    }};
+    const req = Req{
+        .topics = &topics,
+        .timeout_ms = 30000,
+        .validate_only = false,
+    };
+
+    {
+        var broker = Broker.init(testing.allocator, 1, 9092);
+        defer broker.deinit();
+        broker.store.s3_wal_mode = true;
+        broker.store.s3_storage = s3_storage;
+        broker.store.s3_wal_batcher = storage.wal.S3WalBatcher.init(testing.allocator);
+
+        try broker.open();
+        try testing.expect(broker.ensureTopic(topic_name));
+
+        var buf: [512]u8 = undefined;
+        var pos = buildTestRequest(&buf, 37, 2, 3731, header_mod.requestHeaderVersion(37, 2));
+        req.serialize(&buf, &pos, 2);
+
+        const response = broker.handleRequest(buf[0..pos]);
+        try testing.expect(response != null);
+        defer testing.allocator.free(response.?);
+
+        var rpos: usize = 0;
+        var response_header = try ResponseHeader.deserialize(testing.allocator, response.?, &rpos, header_mod.responseHeaderVersion(37, 2));
+        defer response_header.deinit(testing.allocator);
+        try testing.expectEqual(@as(i32, 3731), response_header.correlation_id);
+
+        const resp = try Resp.deserialize(testing.allocator, response.?, &rpos, 2);
+        defer if (resp.results.len > 0) testing.allocator.free(resp.results);
+
+        try testing.expectEqual(response.?.len, rpos);
+        try testing.expectEqual(@as(usize, 1), resp.results.len);
+        try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.none)), resp.results[0].error_code);
+        try testing.expectEqual(@as(?i32, 2), broker.failover_controller.findPartitionOwner(topic_name, 1));
+        try testing.expectEqual(@as(u32, 1), broker.partition_reassignments.count());
+        try testing.expect(mock_s3.objectCount() > 0);
+    }
+
+    {
+        var broker = Broker.init(testing.allocator, 1, 9092);
+        defer broker.deinit();
+        broker.store.s3_wal_mode = true;
+        broker.store.s3_storage = s3_storage;
+        broker.store.s3_wal_batcher = storage.wal.S3WalBatcher.init(testing.allocator);
+
+        try broker.open();
+        try testing.expect(broker.topics.contains(topic_name));
+        try testing.expectEqual(@as(i32, 2), broker.topics.get(topic_name).?.num_partitions);
+        try testing.expectEqual(@as(?i32, 1), broker.failover_controller.findPartitionOwner(topic_name, 0));
+        try testing.expectEqual(@as(?i32, 2), broker.failover_controller.findPartitionOwner(topic_name, 1));
+        try testing.expectEqual(@as(u32, 1), broker.partition_reassignments.count());
+    }
+}
+
 test "Broker AlterPartitionReassignments fails closed when reassignment snapshot S3 WAL write fails" {
     const AlterReq = generated.alter_partition_reassignments_request.AlterPartitionReassignmentsRequest;
     const AlterResp = generated.alter_partition_reassignments_response.AlterPartitionReassignmentsResponse;
