@@ -734,6 +734,146 @@ def wait_for_offset_commit(port, group, topic, expected_offset, timeout=30):
     )
 
 
+def parse_init_producer_id_response(response, correlation_id):
+    pos = 0
+    response_correlation, pos = read_i32(response, pos)
+    if response_correlation != correlation_id:
+        raise TestError(f"InitProducerId correlation mismatch: {response_correlation}")
+    _, pos = read_i32(response, pos)  # throttle_time_ms
+    error_code, pos = read_i16(response, pos)
+    producer_id, pos = read_i64(response, pos)
+    producer_epoch, pos = read_i16(response, pos)
+    if error_code != 0:
+        raise TestError(f"InitProducerId error_code={error_code}")
+    if producer_id < 0 or producer_epoch < 0:
+        raise TestError(
+            f"InitProducerId invalid producer identity id={producer_id} epoch={producer_epoch}"
+        )
+    return {"producer_id": producer_id, "producer_epoch": producer_epoch}
+
+
+def init_producer_id(port, transactional_id, correlation_id):
+    body = write_string(transactional_id)
+    body += struct.pack(">i", 60000)  # transaction_timeout_ms
+    response = controller_request(port, 22, 0, correlation_id, body)
+    return parse_init_producer_id_response(response, correlation_id)
+
+
+def parse_add_partitions_to_txn_response(response, correlation_id, expected_topic):
+    pos = 0
+    response_correlation, pos = read_i32(response, pos)
+    if response_correlation != correlation_id:
+        raise TestError(f"AddPartitionsToTxn correlation mismatch: {response_correlation}")
+    _, pos = read_i32(response, pos)  # throttle_time_ms
+    topics, pos = read_i32(response, pos)
+    if topics != 1:
+        raise TestError(f"AddPartitionsToTxn topic response count={topics}")
+    topic_name, pos = read_string(response, pos)
+    partitions, pos = read_i32(response, pos)
+    if topic_name != expected_topic or partitions != 1:
+        raise TestError(
+            f"AddPartitionsToTxn topic={topic_name!r} partitions={partitions}"
+        )
+    partition, pos = read_i32(response, pos)
+    error_code, pos = read_i16(response, pos)
+    if partition != 0:
+        raise TestError(
+            f"AddPartitionsToTxn partition={partition} error_code={error_code}"
+        )
+    if error_code != 0:
+        raise TestError(f"AddPartitionsToTxn error_code={error_code}")
+
+
+def add_partitions_to_txn(port, transactional_id, producer_id, producer_epoch, topic, correlation_id):
+    body = write_string(transactional_id)
+    body += struct.pack(">q", producer_id)
+    body += struct.pack(">h", producer_epoch)
+    body += struct.pack(">i", 1)  # topics
+    body += write_string(topic)
+    body += struct.pack(">i", 1)  # partitions
+    body += struct.pack(">i", 0)
+
+    response = controller_request(port, 24, 0, correlation_id, body)
+    parse_add_partitions_to_txn_response(response, correlation_id, topic)
+
+
+def parse_end_txn_response(response, correlation_id):
+    pos = 0
+    response_correlation, pos = read_i32(response, pos)
+    if response_correlation != correlation_id:
+        raise TestError(f"EndTxn correlation mismatch: {response_correlation}")
+    _, pos = read_i32(response, pos)  # throttle_time_ms
+    error_code, pos = read_i16(response, pos)
+    if error_code != 0:
+        raise TestError(f"EndTxn error_code={error_code}")
+
+
+def end_txn(port, transactional_id, producer_id, producer_epoch, committed, correlation_id):
+    body = write_string(transactional_id)
+    body += struct.pack(">q", producer_id)
+    body += struct.pack(">h", producer_epoch)
+    body += b"\x01" if committed else b"\x00"
+
+    response = controller_request(port, 26, 0, correlation_id, body)
+    parse_end_txn_response(response, correlation_id)
+
+
+def begin_transaction(port, transactional_id, topic, correlation_id):
+    identity = init_producer_id(port, transactional_id, correlation_id)
+    add_partitions_to_txn(
+        port,
+        transactional_id,
+        identity["producer_id"],
+        identity["producer_epoch"],
+        topic,
+        correlation_id + 1,
+    )
+    return {
+        "transactional_id": transactional_id,
+        "producer_id": identity["producer_id"],
+        "producer_epoch": identity["producer_epoch"],
+        "topic": topic,
+    }
+
+
+def wait_for_transaction_begin(port, transactional_id, topic, timeout=30):
+    deadline = time.time() + timeout
+    correlation_id = 6400
+    last_error = None
+    while time.time() < deadline:
+        try:
+            return begin_transaction(port, transactional_id, topic, correlation_id)
+        except Exception as exc:
+            last_error = exc
+        correlation_id += 2
+        time.sleep(0.25)
+    raise TestError(f"transaction {transactional_id!r} did not begin: {last_error}")
+
+
+def wait_for_transaction_end(port, txn, committed=True, timeout=30):
+    deadline = time.time() + timeout
+    correlation_id = 6600
+    last_error = None
+    while time.time() < deadline:
+        try:
+            end_txn(
+                port,
+                txn["transactional_id"],
+                txn["producer_id"],
+                txn["producer_epoch"],
+                committed,
+                correlation_id,
+            )
+            return
+        except Exception as exc:
+            last_error = exc
+        correlation_id += 1
+        time.sleep(0.25)
+    raise TestError(
+        f"transaction {txn['transactional_id']!r} did not end cleanly: {last_error}"
+    )
+
+
 def network_hooks_configured():
     return bool(
         os.environ.get("ZMQ_KRAFT_NETWORK_MATRIX")
@@ -2730,13 +2870,20 @@ def main():
         wait_for_broker_ready(broker["proc"], broker["port"], broker["log_path"])
         topic = f"kraft-failover-{os.getpid()}-{int(time.time())}"
         group = f"kraft-failover-group-{os.getpid()}-{int(time.time())}"
+        txn_topic = f"{topic}-txn"
         expected_payloads = []
         wait_for_topic(broker["port"], topic)
+        wait_for_topic(broker["port"], txn_topic)
         expected_payloads.append(b"r0")
         first_offset = wait_for_produce(broker["port"], topic, expected_payloads[-1])
         committed_offset = first_offset + 1
         wait_for_payloads(broker["port"], topic, expected_payloads)
         wait_for_offset_commit(broker["port"], group, topic, committed_offset)
+        controller_failover_txn = wait_for_transaction_begin(
+            broker["port"],
+            f"{group}-controller-failover",
+            txn_topic,
+        )
 
         network_partition_result = run_network_partition_matrix(
             processes, broker, topic, expected_payloads, leader_id
@@ -2756,6 +2903,7 @@ def main():
         wait_for_all_alive_to_report(processes, replacement_leader)
         wait_for_payloads(broker["port"], topic, expected_payloads)
         wait_for_committed_offset(broker["port"], group, topic, committed_offset)
+        wait_for_transaction_end(broker["port"], controller_failover_txn)
         expected_payloads.append(b"r1")
         second_offset = wait_for_produce(broker["port"], topic, expected_payloads[-1])
         if second_offset <= first_offset:
@@ -2763,6 +2911,12 @@ def main():
         wait_for_payloads(broker["port"], topic, expected_payloads)
         committed_offset = second_offset + 1
         wait_for_offset_commit(broker["port"], group, topic, committed_offset)
+        post_failover_txn = wait_for_transaction_begin(
+            broker["port"],
+            f"{group}-post-failover",
+            txn_topic,
+        )
+        wait_for_transaction_end(broker["port"], post_failover_txn)
 
         shutil.rmtree(os.path.join(tmp, f"controller-{leader_id}"), ignore_errors=True)
         processes[leader_id] = start_controller(tmp, leader_id, ports[leader_id], voters)
@@ -2828,12 +2982,18 @@ def main():
         wait_for_payloads(broker["port"], topic, expected_payloads)
         committed_offset = fourth_offset + 1
         wait_for_offset_commit(broker["port"], group, topic, committed_offset)
+        broker_restart_txn = wait_for_transaction_begin(
+            broker["port"],
+            f"{group}-broker-restart",
+            txn_topic,
+        )
 
         stop_process(broker["proc"])
         broker = start_broker(tmp, voters)
         wait_for_broker_ready(broker["proc"], broker["port"], broker["log_path"])
         wait_for_payloads(broker["port"], topic, expected_payloads)
         wait_for_committed_offset(broker["port"], group, topic, committed_offset)
+        wait_for_transaction_end(broker["port"], broker_restart_txn)
         expected_payloads.append(b"r4")
         fifth_offset = wait_for_produce(
             broker["port"], topic, expected_payloads[-1]
@@ -2865,6 +3025,7 @@ def main():
             f"reassignment_target={automq_result['reassignment_target']}, "
             f"reassignment_target_offset={automq_result['reassignment_target_offset']}, "
             f"committed_offset={committed_offset}, "
+            f"transactions_checked=3, "
             f"network_partition={network_partition_result}, "
             f"automq_old_leader_fresh_rejoin={automq_result['old_leader_fresh_rejoin']})"
         )
@@ -2951,6 +3112,20 @@ def self_test():
         fetched = parse_offset_fetch_response(fetch_fixture, 43, "offset-self-test")
         if fetched["offset"] != 7 or fetched["metadata"] != "kraft-failover":
             raise TestError(f"OffsetFetch fixture parser failed: {fetched}")
+
+        init_fixture = struct.pack(">iihqh", 44, 0, 0, 1000, 0)
+        identity = parse_init_producer_id_response(init_fixture, 44)
+        if identity["producer_id"] != 1000 or identity["producer_epoch"] != 0:
+            raise TestError(f"InitProducerId fixture parser failed: {identity}")
+
+        add_txn_fixture = struct.pack(">ii", 45, 0)
+        add_txn_fixture += struct.pack(">i", 1)
+        add_txn_fixture += write_string("txn-self-test")
+        add_txn_fixture += struct.pack(">iih", 1, 0, 0)
+        parse_add_partitions_to_txn_response(add_txn_fixture, 45, "txn-self-test")
+
+        end_txn_fixture = struct.pack(">iih", 46, 0, 0)
+        parse_end_txn_response(end_txn_fixture, 46)
 
         print("ok: KRaft failover harness self-test")
         return 0
