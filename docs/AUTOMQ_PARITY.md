@@ -34,6 +34,8 @@ operator-facing behavior.
   If the local object snapshot is absent, flushed S3 WAL objects can rebuild
   ObjectManager stream-set metadata from their object indexes.
   Latest default-suite protocol tranche: generated AddPartitionsToTxn v3/v4,
+  AddOffsetsToTxn v2/v4, InitProducerId v1/v5, EndTxn v2/v4,
+  WriteTxnMarkers v0/v1,
   AssignReplicasToDirs v0, ShareFetch/ShareAcknowledge v0,
   Initialize/Read/Write/DeleteShareGroupState and ReadShareGroupStateSummary
   v0, ConsumerGroupDescribe v0, OffsetCommit v1/v8, OffsetFetch v7/v8,
@@ -43,7 +45,8 @@ operator-facing behavior.
   compact arrays, nullable compact strings, UUID fields, topic-admin legacy and
   flexible responses, producer-state introspection, share
   acknowledgement/state batches, commit timestamps/member epochs/static member
-  identity, offset-fetch grouped response transitions, compact record bytes, transaction
+  identity, offset-fetch grouped response transitions, transactional identity,
+  PID recovery, commit/abort markers, compact record bytes, transaction
   filters/results, flexible
   encodings, and tagged-field terminators.
 

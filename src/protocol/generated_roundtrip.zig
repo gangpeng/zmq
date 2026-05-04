@@ -1713,6 +1713,187 @@ test "generated non-default golden fixtures cover legacy and flexible wire encod
     }
 
     {
+        const InitProducerIdRequest = generated.init_producer_id_request.InitProducerIdRequest;
+        const value_v1 = InitProducerIdRequest{
+            .transactional_id = "txn-a",
+            .transaction_timeout_ms = 45_000,
+        };
+        try expectGoldenRoundTrip(InitProducerIdRequest, value_v1, 1, &[_]u8{
+            0x00, 0x05, 0x74, 0x78, 0x6e, 0x2d, 0x61,
+            0x00, 0x00, 0xaf, 0xc8,
+        });
+
+        const value_v5 = InitProducerIdRequest{
+            .transactional_id = "txn-a",
+            .transaction_timeout_ms = 45_000,
+            .producer_id = 123456789,
+            .producer_epoch = 2,
+        };
+        try expectGoldenRoundTrip(InitProducerIdRequest, value_v5, 5, &[_]u8{
+            0x06, 0x74, 0x78, 0x6e, 0x2d, 0x61, 0x00, 0x00,
+            0xaf, 0xc8, 0x00, 0x00, 0x00, 0x00, 0x07, 0x5b,
+            0xcd, 0x15, 0x00, 0x02, 0x00,
+        });
+    }
+
+    {
+        const InitProducerIdResponse = generated.init_producer_id_response.InitProducerIdResponse;
+        const value = InitProducerIdResponse{
+            .throttle_time_ms = 7,
+            .error_code = 0,
+            .producer_id = 123456789,
+            .producer_epoch = 2,
+        };
+        try expectGoldenRoundTrip(InitProducerIdResponse, value, 5, &[_]u8{
+            0x00, 0x00, 0x00, 0x07, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x07, 0x5b, 0xcd, 0x15, 0x00, 0x02,
+            0x00,
+        });
+    }
+
+    {
+        const AddOffsetsToTxnRequest = generated.add_offsets_to_txn_request.AddOffsetsToTxnRequest;
+        const value_v2 = AddOffsetsToTxnRequest{
+            .transactional_id = "txn-a",
+            .producer_id = 123456789,
+            .producer_epoch = 2,
+            .group_id = "group-a",
+        };
+        try expectGoldenRoundTrip(AddOffsetsToTxnRequest, value_v2, 2, &[_]u8{
+            0x00, 0x05, 0x74, 0x78, 0x6e, 0x2d, 0x61, 0x00,
+            0x00, 0x00, 0x00, 0x07, 0x5b, 0xcd, 0x15, 0x00,
+            0x02, 0x00, 0x07, 0x67, 0x72, 0x6f, 0x75, 0x70,
+            0x2d, 0x61,
+        });
+
+        const value_v4 = AddOffsetsToTxnRequest{
+            .transactional_id = "txn-a",
+            .producer_id = 123456789,
+            .producer_epoch = 2,
+            .group_id = "group-a",
+        };
+        try expectGoldenRoundTrip(AddOffsetsToTxnRequest, value_v4, 4, &[_]u8{
+            0x06, 0x74, 0x78, 0x6e, 0x2d, 0x61, 0x00, 0x00,
+            0x00, 0x00, 0x07, 0x5b, 0xcd, 0x15, 0x00, 0x02,
+            0x08, 0x67, 0x72, 0x6f, 0x75, 0x70, 0x2d, 0x61,
+            0x00,
+        });
+    }
+
+    {
+        const AddOffsetsToTxnResponse = generated.add_offsets_to_txn_response.AddOffsetsToTxnResponse;
+        const value = AddOffsetsToTxnResponse{
+            .throttle_time_ms = 5,
+            .error_code = 48,
+        };
+        try expectGoldenRoundTrip(AddOffsetsToTxnResponse, value, 4, &[_]u8{
+            0x00, 0x00, 0x00, 0x05, 0x00, 0x30, 0x00,
+        });
+    }
+
+    {
+        const EndTxnRequest = generated.end_txn_request.EndTxnRequest;
+        const value_v2 = EndTxnRequest{
+            .transactional_id = "txn-a",
+            .producer_id = 123456789,
+            .producer_epoch = 2,
+            .committed = true,
+        };
+        try expectGoldenRoundTrip(EndTxnRequest, value_v2, 2, &[_]u8{
+            0x00, 0x05, 0x74, 0x78, 0x6e, 0x2d, 0x61, 0x00,
+            0x00, 0x00, 0x00, 0x07, 0x5b, 0xcd, 0x15, 0x00,
+            0x02, 0x01,
+        });
+
+        const value_v4 = EndTxnRequest{
+            .transactional_id = "txn-a",
+            .producer_id = 123456789,
+            .producer_epoch = 2,
+            .committed = false,
+        };
+        try expectGoldenRoundTrip(EndTxnRequest, value_v4, 4, &[_]u8{
+            0x06, 0x74, 0x78, 0x6e, 0x2d, 0x61, 0x00, 0x00,
+            0x00, 0x00, 0x07, 0x5b, 0xcd, 0x15, 0x00, 0x02,
+            0x00, 0x00,
+        });
+    }
+
+    {
+        const EndTxnResponse = generated.end_txn_response.EndTxnResponse;
+        const value = EndTxnResponse{
+            .throttle_time_ms = 5,
+            .error_code = 48,
+        };
+        try expectGoldenRoundTrip(EndTxnResponse, value, 4, &[_]u8{
+            0x00, 0x00, 0x00, 0x05, 0x00, 0x30, 0x00,
+        });
+    }
+
+    {
+        const WriteTxnMarkersRequest = generated.write_txn_markers_request.WriteTxnMarkersRequest;
+        const Topic = WriteTxnMarkersRequest.WritableTxnMarker.WritableTxnMarkerTopic;
+        const Marker = WriteTxnMarkersRequest.WritableTxnMarker;
+        const topics = [_]Topic{.{
+            .name = "topic-a",
+            .partition_indexes = &[_]i32{ 0, 2 },
+        }};
+        const markers = [_]Marker{.{
+            .producer_id = 123456789,
+            .producer_epoch = 2,
+            .transaction_result = true,
+            .topics = &topics,
+            .coordinator_epoch = 3,
+        }};
+        const value = WriteTxnMarkersRequest{
+            .markers = &markers,
+        };
+        try expectGoldenRoundTrip(WriteTxnMarkersRequest, value, 0, &[_]u8{
+            0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00,
+            0x07, 0x5b, 0xcd, 0x15, 0x00, 0x02, 0x01, 0x00,
+            0x00, 0x00, 0x01, 0x00, 0x07, 0x74, 0x6f, 0x70,
+            0x69, 0x63, 0x2d, 0x61, 0x00, 0x00, 0x00, 0x02,
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x02,
+            0x00, 0x00, 0x00, 0x03,
+        });
+        try expectGoldenRoundTrip(WriteTxnMarkersRequest, value, 1, &[_]u8{
+            0x02, 0x00, 0x00, 0x00, 0x00, 0x07, 0x5b, 0xcd,
+            0x15, 0x00, 0x02, 0x01, 0x02, 0x08, 0x74, 0x6f,
+            0x70, 0x69, 0x63, 0x2d, 0x61, 0x03, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x02, 0x00, 0x00,
+            0x00, 0x00, 0x03, 0x00, 0x00,
+        });
+    }
+
+    {
+        const WriteTxnMarkersResponse = generated.write_txn_markers_response.WriteTxnMarkersResponse;
+        const PartitionResult = WriteTxnMarkersResponse.WritableTxnMarkerResult.WritableTxnMarkerTopicResult.WritableTxnMarkerPartitionResult;
+        const TopicResult = WriteTxnMarkersResponse.WritableTxnMarkerResult.WritableTxnMarkerTopicResult;
+        const MarkerResult = WriteTxnMarkersResponse.WritableTxnMarkerResult;
+        const partitions = [_]PartitionResult{
+            .{ .partition_index = 0, .error_code = 0 },
+            .{ .partition_index = 2, .error_code = 48 },
+        };
+        const topics = [_]TopicResult{.{
+            .name = "topic-a",
+            .partitions = &partitions,
+        }};
+        const markers = [_]MarkerResult{.{
+            .producer_id = 123456789,
+            .topics = &topics,
+        }};
+        const value = WriteTxnMarkersResponse{
+            .markers = &markers,
+        };
+        try expectGoldenRoundTrip(WriteTxnMarkersResponse, value, 1, &[_]u8{
+            0x02, 0x00, 0x00, 0x00, 0x00, 0x07, 0x5b, 0xcd,
+            0x15, 0x02, 0x08, 0x74, 0x6f, 0x70, 0x69, 0x63,
+            0x2d, 0x61, 0x03, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x02, 0x00, 0x30,
+            0x00, 0x00, 0x00, 0x00,
+        });
+    }
+
+    {
         const DescribeProducersRequest = generated.describe_producers_request.DescribeProducersRequest;
         const partition_indexes = [_]i32{ 0, 2 };
         const topics = [_]DescribeProducersRequest.TopicRequest{.{
