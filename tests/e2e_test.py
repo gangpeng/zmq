@@ -101,6 +101,194 @@ def kafka_request(sock, api_key, api_version, correlation_id, body=b''):
     return resp[4:4+size]
 
 
+def write_varint(value):
+    out = bytearray()
+    while True:
+        b = value & 0x7F
+        value >>= 7
+        if value:
+            out.append(b | 0x80)
+        else:
+            out.append(b)
+            return bytes(out)
+
+
+def write_compact_string(value):
+    if value is None:
+        return b'\x00'
+    raw = value.encode()
+    return write_varint(len(raw) + 1) + raw
+
+
+def write_compact_array_len(count):
+    return write_varint(count + 1)
+
+
+def read_exact(sock, size):
+    data = bytearray()
+    while len(data) < size:
+        chunk = sock.recv(size - len(data))
+        if not chunk:
+            raise RuntimeError(f"connection closed after {len(data)}/{size} bytes")
+        data.extend(chunk)
+    return bytes(data)
+
+
+def read_varint(buf, pos):
+    result = 0
+    shift = 0
+    for _ in range(5):
+        if pos >= len(buf):
+            raise RuntimeError("buffer underflow while reading varint")
+        b = buf[pos]
+        pos += 1
+        result |= (b & 0x7F) << shift
+        if b & 0x80 == 0:
+            return result, pos
+        shift += 7
+    raise RuntimeError("varint too long")
+
+
+def read_i16(buf, pos):
+    if pos + 2 > len(buf):
+        raise RuntimeError("buffer underflow while reading i16")
+    return struct.unpack_from('>h', buf, pos)[0], pos + 2
+
+
+def read_i32(buf, pos):
+    if pos + 4 > len(buf):
+        raise RuntimeError("buffer underflow while reading i32")
+    return struct.unpack_from('>i', buf, pos)[0], pos + 4
+
+
+def read_i64(buf, pos):
+    if pos + 8 > len(buf):
+        raise RuntimeError("buffer underflow while reading i64")
+    return struct.unpack_from('>q', buf, pos)[0], pos + 8
+
+
+def read_compact_string(buf, pos):
+    raw_len, pos = read_varint(buf, pos)
+    if raw_len == 0:
+        return None, pos
+    length = raw_len - 1
+    if pos + length > len(buf):
+        raise RuntimeError("buffer underflow while reading compact string")
+    return buf[pos:pos+length].decode('utf-8', errors='replace'), pos + length
+
+
+def read_compact_array_len(buf, pos):
+    raw_len, pos = read_varint(buf, pos)
+    if raw_len == 0:
+        return 0, pos
+    return raw_len - 1, pos
+
+
+def skip_tags(buf, pos):
+    count, pos = read_varint(buf, pos)
+    for _ in range(count):
+        _, pos = read_varint(buf, pos)
+        size, pos = read_varint(buf, pos)
+        if pos + size > len(buf):
+            raise RuntimeError("buffer underflow while skipping tagged field")
+        pos += size
+    return pos
+
+
+def controller_request(port, api_key, api_version, correlation_id, body=b'', timeout=5):
+    """Send a flexible KRaft controller request."""
+    header = struct.pack('>hhi', api_key, api_version, correlation_id)
+    header += write_compact_string('e2e-test')
+    header += b'\x00'
+    frame_body = header + body
+
+    with socket.create_connection(('127.0.0.1', port), timeout=timeout) as sock:
+        sock.settimeout(timeout)
+        sock.sendall(struct.pack('>I', len(frame_body)) + frame_body)
+        response_size = struct.unpack('>I', read_exact(sock, 4))[0]
+        if response_size <= 0 or response_size > 1024 * 1024:
+            raise RuntimeError(f"invalid response frame size {response_size}")
+        return read_exact(sock, response_size)
+
+
+def describe_quorum_body():
+    body = bytearray()
+    body += write_compact_array_len(1)
+    body += write_compact_string('__cluster_metadata')
+    body += write_compact_array_len(1)
+    body += struct.pack('>i', 0)
+    body += b'\x00'  # partition tagged fields
+    body += b'\x00'  # topic tagged fields
+    body += b'\x00'  # request tagged fields
+    return bytes(body)
+
+
+def describe_quorum(port, corr_id):
+    """Describe the metadata quorum; returns leader_id/epoch/voters."""
+    data = controller_request(port, 55, 0, corr_id, describe_quorum_body())
+    pos = 0
+    response_corr, pos = read_i32(data, pos)
+    if response_corr != corr_id:
+        raise RuntimeError(f"DescribeQuorum correlation mismatch: {response_corr}")
+    pos = skip_tags(data, pos)
+    top_error, pos = read_i16(data, pos)
+    if top_error != 0:
+        raise RuntimeError(f"DescribeQuorum top-level error_code={top_error}")
+
+    topics_len, pos = read_compact_array_len(data, pos)
+    if topics_len == 0:
+        raise RuntimeError("DescribeQuorum returned no topics")
+    _, pos = read_compact_string(data, pos)
+    partitions_len, pos = read_compact_array_len(data, pos)
+    if partitions_len == 0:
+        raise RuntimeError("DescribeQuorum returned no partitions")
+
+    partition_index, pos = read_i32(data, pos)
+    partition_error, pos = read_i16(data, pos)
+    leader_id, pos = read_i32(data, pos)
+    leader_epoch, pos = read_i32(data, pos)
+    high_watermark, pos = read_i64(data, pos)
+    voters_len, pos = read_compact_array_len(data, pos)
+    voters = []
+    for _ in range(voters_len):
+        voter_id, pos = read_i32(data, pos)
+        _, pos = read_i64(data, pos)
+        pos = skip_tags(data, pos)
+        voters.append(voter_id)
+    observers_len, pos = read_compact_array_len(data, pos)
+    for _ in range(observers_len):
+        _, pos = read_i32(data, pos)
+        _, pos = read_i64(data, pos)
+        pos = skip_tags(data, pos)
+    pos = skip_tags(data, pos)
+
+    return {
+        "partition_index": partition_index,
+        "error_code": partition_error,
+        "leader_id": leader_id,
+        "leader_epoch": leader_epoch,
+        "high_watermark": high_watermark,
+        "voters": voters,
+    }
+
+
+def wait_for_controller_leader(t, forbidden_leaders=frozenset(), timeout=30):
+    deadline = time.time() + timeout
+    last_detail = ""
+    while time.time() < deadline:
+        for node in NODES:
+            try:
+                quorum = describe_quorum(node["controller_port"], t.next())
+                leader_id = quorum["leader_id"]
+                if quorum["error_code"] == 0 and leader_id >= 0 and leader_id not in forbidden_leaders:
+                    return leader_id, quorum
+                last_detail = f"{node['name']} leader={leader_id} err={quorum['error_code']}"
+            except Exception as exc:
+                last_detail = f"{node['name']}: {exc}"
+        time.sleep(1)
+    raise RuntimeError(f"controller leader not discovered: {last_detail}")
+
+
 def api_versions(sock, corr_id):
     """Send ApiVersions and return number of API keys."""
     data = kafka_request(sock, 18, 0, corr_id)
@@ -710,6 +898,8 @@ def main():
         return 1
 
     t = TestRunner()
+    active_controller_leader = None
+    active_controller_epoch = -1
 
     print("\n\u2554\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2557")
     print("\u2551  ZMQ \u2014 3-Node E2E Test Suite (combined mode + MinIO S3)   \u2551")
@@ -758,14 +948,17 @@ def main():
     # =============================================
     print("\n[Test b] KRaft leader election")
     try:
-        # Connect to controller port and send ApiVersions
-        sock = t.connect(NODES[0]["controller_port"])
-        n = api_versions(sock, t.next())
-        t.check(f"Controller port :{NODES[0]['controller_port']} responds ({n} APIs)", n >= 1 or n == 0)
-        # Controller port may return fewer APIs (only KRaft subset) or 0 if parsing differs
-        sock.close()
+        leader_id, quorum = wait_for_controller_leader(t)
+        active_controller_leader = leader_id
+        active_controller_epoch = quorum["leader_epoch"]
+        expected_voters = set(range(len(NODES)))
+        t.check(
+            f"Controller leader elected: node {leader_id} epoch={active_controller_epoch}",
+            leader_id in expected_voters and set(quorum["voters"]) == expected_voters,
+            f"quorum={quorum}",
+        )
     except Exception as e:
-        t.check("Controller port responds", False, str(e))
+        t.check("Controller leader elected via DescribeQuorum", False, str(e))
 
     # =============================================
     # Test (c): Topic creation and deletion
@@ -900,14 +1093,34 @@ def main():
     sock_o.close()
 
     # =============================================
-    # Test (h): Node failure — kill node 0, verify 1/2 serve
+    # Test (h): Node failure — kill active controller leader, verify survivors serve
     # =============================================
     print("\n[Test h] Node failure resilience")
-    subprocess.run(["docker", "stop", NODES[0]["container"]], capture_output=True, timeout=30)
+    stopped_node = active_controller_leader if active_controller_leader in range(len(NODES)) else 0
+    stopped = NODES[stopped_node]
+    subprocess.run(["docker", "stop", stopped["container"]], capture_output=True, timeout=30)
     time.sleep(2)
-    t.check("Node 0 stopped", True)
+    t.check(f"Node {stopped_node} stopped (active controller leader)", True)
 
-    for i in [1, 2]:
+    if active_controller_leader is not None:
+        try:
+            replacement_leader, replacement_quorum = wait_for_controller_leader(
+                t,
+                forbidden_leaders={active_controller_leader},
+                timeout=45,
+            )
+            t.check(
+                f"Replacement controller leader elected: node {replacement_leader}",
+                replacement_leader != active_controller_leader
+                and replacement_quorum["leader_epoch"] > active_controller_epoch,
+                f"quorum={replacement_quorum}",
+            )
+        except Exception as e:
+            t.check("Replacement controller leader elected", False, str(e))
+
+    for i in range(len(NODES)):
+        if i == stopped_node:
+            continue
         try:
             sock = t.connect(NODES[i]["broker_port"])
             n = api_versions(sock, t.next())
@@ -923,13 +1136,13 @@ def main():
     # Test (i): Restart recovery
     # =============================================
     print("\n[Test i] Restart recovery")
-    subprocess.run(["docker", "start", NODES[0]["container"]], capture_output=True, timeout=30)
+    subprocess.run(["docker", "start", stopped["container"]], capture_output=True, timeout=30)
 
     restart_ok = False
     restart_detail = ""
     for _ in range(30):
         try:
-            sock = t.connect(NODES[0]["broker_port"])
+            sock = t.connect(stopped["broker_port"])
             n = api_versions(sock, t.next())
             sock.close()
             if n >= 10:
@@ -940,7 +1153,17 @@ def main():
         except Exception as e:
             restart_detail = str(e)
         time.sleep(1)
-    t.check(f"Node 0 restarted and responds ({restart_detail})", restart_ok, restart_detail)
+    t.check(f"Node {stopped_node} restarted and responds ({restart_detail})", restart_ok, restart_detail)
+
+    try:
+        restarted_leader, restarted_quorum = wait_for_controller_leader(t, timeout=30)
+        t.check(
+            f"Controller quorum healthy after node {stopped_node} restart: leader={restarted_leader}",
+            restarted_leader in range(len(NODES)),
+            f"quorum={restarted_quorum}",
+        )
+    except Exception as e:
+        t.check("Controller quorum healthy after restart", False, str(e))
 
     # =============================================
     # Test (j): Metadata consistency across nodes

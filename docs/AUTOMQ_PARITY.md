@@ -766,7 +766,10 @@ Status: completed for the initial catalog and DeleteGroups slice.
   and amd64 E2E builders do not silently download an incompatible compiler. The
   E2E Produce helper now emits valid Kafka v0 MessageSet records, so broker
   offset rewrites preserve payload values, and the local Docker combined-mode
-  S3 WAL gate passes all 35 checks including restart recovery and cross-node
+  S3 WAL gate now discovers the active controller leader through DescribeQuorum,
+  stops that leader instead of a fixed node, verifies replacement leader
+  election with an advanced epoch, restarts the failed node, reconfirms quorum
+  health, and passes all 37 checks including restart recovery and cross-node
   produce/fetch visibility.
   Remaining gap: broader failover gates and client compatibility fixtures.
 - Validate rack-aware routing and auto-balancer decisions under load. Status:
