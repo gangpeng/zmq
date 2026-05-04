@@ -94,6 +94,12 @@ def write_compact_bytes(value):
     return write_varint(len(value) + 1) + value
 
 
+def write_bytes(value):
+    if value is None:
+        return struct.pack(">i", -1)
+    return struct.pack(">i", len(value)) + value
+
+
 def write_compact_array_len(count):
     return write_varint(count + 1)
 
@@ -140,6 +146,15 @@ def read_string(buf, pos):
     if pos + length > len(buf):
         raise TestError("buffer underflow while reading string")
     return buf[pos : pos + length].decode("utf-8", errors="replace"), pos + length
+
+
+def read_bytes(buf, pos):
+    length, pos = read_i32(buf, pos)
+    if length < 0:
+        return None, pos
+    if pos + length > len(buf):
+        raise TestError("buffer underflow while reading bytes")
+    return buf[pos : pos + length], pos + length
 
 
 def read_compact_string(buf, pos):
@@ -871,6 +886,132 @@ def wait_for_transaction_end(port, txn, committed=True, timeout=30):
         time.sleep(0.25)
     raise TestError(
         f"transaction {txn['transactional_id']!r} did not end cleanly: {last_error}"
+    )
+
+
+def parse_join_group_response(response, correlation_id):
+    pos = 0
+    response_correlation, pos = read_i32(response, pos)
+    if response_correlation != correlation_id:
+        raise TestError(f"JoinGroup correlation mismatch: {response_correlation}")
+    error_code, pos = read_i16(response, pos)
+    generation_id, pos = read_i32(response, pos)
+    protocol_name, pos = read_string(response, pos)
+    leader, pos = read_string(response, pos)
+    member_id, pos = read_string(response, pos)
+    member_count, pos = read_i32(response, pos)
+    members = []
+    for _ in range(member_count):
+        response_member_id, pos = read_string(response, pos)
+        metadata, pos = read_bytes(response, pos)
+        members.append({"member_id": response_member_id, "metadata": metadata})
+    if error_code != 0:
+        raise TestError(f"JoinGroup error_code={error_code}")
+    if generation_id < 0 or not member_id:
+        raise TestError(
+            f"JoinGroup invalid generation/member generation={generation_id} member={member_id!r}"
+        )
+    return {
+        "generation_id": generation_id,
+        "protocol_name": protocol_name,
+        "leader": leader,
+        "member_id": member_id,
+        "members": members,
+    }
+
+
+def join_group(port, group_id, correlation_id):
+    body = write_string(group_id)
+    body += struct.pack(">i", 30000)  # session_timeout_ms
+    body += write_string("")  # dynamic member
+    body += write_string("consumer")
+    body += struct.pack(">i", 1)  # supported protocols
+    body += write_string("range")
+    body += write_bytes(b"range-metadata")
+
+    response = controller_request(port, 11, 0, correlation_id, body)
+    result = parse_join_group_response(response, correlation_id)
+    result["group_id"] = group_id
+    return result
+
+
+def parse_sync_group_response(response, correlation_id):
+    pos = 0
+    response_correlation, pos = read_i32(response, pos)
+    if response_correlation != correlation_id:
+        raise TestError(f"SyncGroup correlation mismatch: {response_correlation}")
+    error_code, pos = read_i16(response, pos)
+    assignment, pos = read_bytes(response, pos)
+    if error_code != 0:
+        raise TestError(f"SyncGroup error_code={error_code}")
+    return assignment
+
+
+def sync_group(port, group_state, correlation_id):
+    assignment = b"kraft-failover-assignment"
+    body = write_string(group_state["group_id"])
+    body += struct.pack(">i", group_state["generation_id"])
+    body += write_string(group_state["member_id"])
+    body += struct.pack(">i", 1)  # assignments
+    body += write_string(group_state["member_id"])
+    body += write_bytes(assignment)
+
+    response = controller_request(port, 14, 0, correlation_id, body)
+    returned_assignment = parse_sync_group_response(response, correlation_id)
+    if returned_assignment != assignment:
+        raise TestError(f"SyncGroup assignment mismatch: {returned_assignment!r}")
+
+
+def parse_heartbeat_response(response, correlation_id):
+    pos = 0
+    response_correlation, pos = read_i32(response, pos)
+    if response_correlation != correlation_id:
+        raise TestError(f"Heartbeat correlation mismatch: {response_correlation}")
+    error_code, pos = read_i16(response, pos)
+    if error_code != 0:
+        raise TestError(f"Heartbeat error_code={error_code}")
+
+
+def heartbeat_group(port, group_state, correlation_id):
+    body = write_string(group_state["group_id"])
+    body += struct.pack(">i", group_state["generation_id"])
+    body += write_string(group_state["member_id"])
+
+    response = controller_request(port, 12, 0, correlation_id, body)
+    parse_heartbeat_response(response, correlation_id)
+
+
+def wait_for_group_stable(port, group_id, timeout=30):
+    deadline = time.time() + timeout
+    correlation_id = 6700
+    last_error = None
+    while time.time() < deadline:
+        try:
+            group_state = join_group(port, group_id, correlation_id)
+            sync_group(port, group_state, correlation_id + 1)
+            heartbeat_group(port, group_state, correlation_id + 2)
+            return group_state
+        except Exception as exc:
+            last_error = exc
+        correlation_id += 3
+        time.sleep(0.25)
+    raise TestError(f"consumer group {group_id!r} did not become stable: {last_error}")
+
+
+def wait_for_group_heartbeat(port, group_state, timeout=30):
+    deadline = time.time() + timeout
+    correlation_id = 6900
+    last_error = None
+    while time.time() < deadline:
+        try:
+            heartbeat_group(port, group_state, correlation_id)
+            return
+        except Exception as exc:
+            last_error = exc
+        correlation_id += 1
+        time.sleep(0.25)
+    raise TestError(
+        f"consumer group {group_state['group_id']!r} heartbeat did not recover: {last_error}"
     )
 
 
@@ -2884,6 +3025,10 @@ def main():
             f"{group}-controller-failover",
             txn_topic,
         )
+        classic_group_state = wait_for_group_stable(
+            broker["port"],
+            f"{group}-classic",
+        )
 
         network_partition_result = run_network_partition_matrix(
             processes, broker, topic, expected_payloads, leader_id
@@ -2891,6 +3036,7 @@ def main():
         if network_partition_result is not None:
             leader_id, initial = wait_for_leader(processes)
         wait_for_committed_offset(broker["port"], group, topic, committed_offset)
+        wait_for_group_heartbeat(broker["port"], classic_group_state)
 
         stop_process(processes[leader_id]["proc"], crash=True)
         replacement_leader, after = wait_for_leader(processes, forbidden_leaders={leader_id})
@@ -2904,6 +3050,7 @@ def main():
         wait_for_payloads(broker["port"], topic, expected_payloads)
         wait_for_committed_offset(broker["port"], group, topic, committed_offset)
         wait_for_transaction_end(broker["port"], controller_failover_txn)
+        wait_for_group_heartbeat(broker["port"], classic_group_state)
         expected_payloads.append(b"r1")
         second_offset = wait_for_produce(broker["port"], topic, expected_payloads[-1])
         if second_offset <= first_offset:
@@ -2935,6 +3082,7 @@ def main():
 
         wait_for_payloads(broker["port"], topic, expected_payloads)
         wait_for_committed_offset(broker["port"], group, topic, committed_offset)
+        wait_for_group_heartbeat(broker["port"], classic_group_state)
         expected_payloads.append(b"r2")
         third_offset = wait_for_produce(broker["port"], topic, expected_payloads[-1])
         if third_offset <= second_offset:
@@ -2971,6 +3119,7 @@ def main():
 
         wait_for_payloads(broker["port"], topic, expected_payloads)
         wait_for_committed_offset(broker["port"], group, topic, committed_offset)
+        wait_for_group_heartbeat(broker["port"], classic_group_state)
         expected_payloads.append(b"r3")
         fourth_offset = wait_for_produce(
             broker["port"], topic, expected_payloads[-1]
@@ -2994,6 +3143,7 @@ def main():
         wait_for_payloads(broker["port"], topic, expected_payloads)
         wait_for_committed_offset(broker["port"], group, topic, committed_offset)
         wait_for_transaction_end(broker["port"], broker_restart_txn)
+        wait_for_group_heartbeat(broker["port"], classic_group_state)
         expected_payloads.append(b"r4")
         fifth_offset = wait_for_produce(
             broker["port"], topic, expected_payloads[-1]
@@ -3026,6 +3176,7 @@ def main():
             f"reassignment_target_offset={automq_result['reassignment_target_offset']}, "
             f"committed_offset={committed_offset}, "
             f"transactions_checked=3, "
+            f"classic_group_heartbeats=true, "
             f"network_partition={network_partition_result}, "
             f"automq_old_leader_fresh_rejoin={automq_result['old_leader_fresh_rejoin']})"
         )
@@ -3126,6 +3277,25 @@ def self_test():
 
         end_txn_fixture = struct.pack(">iih", 46, 0, 0)
         parse_end_txn_response(end_txn_fixture, 46)
+
+        join_fixture = struct.pack(">ihi", 47, 0, 3)
+        join_fixture += write_string("range")
+        join_fixture += write_string("member-1")
+        join_fixture += write_string("member-1")
+        join_fixture += struct.pack(">i", 1)
+        join_fixture += write_string("member-1")
+        join_fixture += write_bytes(b"metadata")
+        joined = parse_join_group_response(join_fixture, 47)
+        if joined["generation_id"] != 3 or joined["member_id"] != "member-1":
+            raise TestError(f"JoinGroup fixture parser failed: {joined}")
+
+        sync_fixture = struct.pack(">ih", 48, 0)
+        sync_fixture += write_bytes(b"assignment")
+        if parse_sync_group_response(sync_fixture, 48) != b"assignment":
+            raise TestError("SyncGroup fixture parser failed")
+
+        heartbeat_fixture = struct.pack(">ih", 49, 0)
+        parse_heartbeat_response(heartbeat_fixture, 49)
 
         print("ok: KRaft failover harness self-test")
         return 0
