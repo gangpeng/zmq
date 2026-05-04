@@ -201,12 +201,14 @@ Status: completed for the initial catalog and DeleteGroups slice.
   AssignReplicasToDirs key 73 remains non-advertised until durable
   controller-backed JBOD directory semantics exist, but direct requests now
   validate/decode generated flexible frames, validate broker identity and the
-  cached controller-assigned broker epoch for broker-only nodes, validate
-  directory/topic/partition targets, reject duplicate assignments, return
-  generated per-partition errors, maintain local replica-directory assignment
-  state, restore that state across local broker restart, append assignment
-  snapshots to `__cluster_metadata` for broker replacement replay, and roll back
-  local/shared assignment visibility when snapshot persistence fails.
+  cached controller-assigned broker epoch for broker-only nodes, advertise a
+  stable local replica-directory UUID through BrokerRegistration, validate
+  directory/topic/partition targets against the configured local directory,
+  reject duplicate assignments, return generated per-partition errors, maintain
+  local replica-directory assignment state, restore that state across local
+  broker restart, append assignment snapshots to `__cluster_metadata` for
+  broker replacement replay, and roll back local/shared assignment visibility
+  when snapshot persistence fails.
   ShareGroupHeartbeat and ShareGroupDescribe remain non-advertised until durable
   share-group coordinator semantics exist, but direct v0 probes now join,
   heartbeat, update subscriptions/rack metadata, leave, return deterministic

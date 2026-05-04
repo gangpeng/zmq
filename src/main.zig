@@ -416,6 +416,7 @@ pub fn main(init: std.process.Init) !void {
 
     if (process_roles.is_broker) {
         const brk = try alloc.create(Broker);
+        const replica_directory_id = Broker.deriveReplicaDirectoryId(data_dir);
         brk.* = Broker.initWithConfig(alloc, node_id, port, .{
             .data_dir = data_dir,
             .s3_endpoint_host = s3_host,
@@ -435,6 +436,7 @@ pub fn main(init: std.process.Init) !void {
             .s3_block_cache_size = s3_block_cache_size,
             .compaction_interval_ms = compaction_interval,
             .client_telemetry_export_path = client_telemetry_export_path,
+            .replica_directory_id = replica_directory_id,
         });
         broker = brk;
         // Re-wire internal pointers that became stale after the struct copy
@@ -503,6 +505,7 @@ pub fn main(init: std.process.Init) !void {
                 port,
                 &brk.cached_leader_epoch,
                 &brk.cached_broker_epoch,
+                &brk.local_replica_directory_id,
                 &brk.is_fenced_by_controller,
                 &brk.last_successful_heartbeat_ms,
                 &global_shutdown,

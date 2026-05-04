@@ -136,6 +136,9 @@ pub const Broker = struct {
     /// Cached broker epoch assigned by the controller during BrokerRegistration.
     /// A zero value means single-node/unregistered mode and does not enforce epoch checks.
     cached_broker_epoch: i64 = 0,
+    /// Local JBOD directory identity advertised to the controller.
+    /// A zero value keeps legacy single-dir tests permissive.
+    local_replica_directory_id: [16]u8 = .{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 },
     /// Set to true when the controller fences this broker (e.g., heartbeat timeout).
     /// When fenced, the broker rejects all produce requests with NOT_LEADER_OR_FOLLOWER.
     is_fenced_by_controller: bool = false,
@@ -433,6 +436,8 @@ pub const Broker = struct {
         tls_client_auth: []const u8 = "none",
         /// Optional append-only JSONL sink for KIP-714 PushTelemetry payloads.
         client_telemetry_export_path: ?[]const u8 = null,
+        /// Local replica directory UUID advertised through BrokerRegistration.
+        replica_directory_id: [16]u8 = .{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 },
     };
 
     pub const WalFlushMode = storage.wal.WalFlushMode;
@@ -444,6 +449,17 @@ pub const Broker = struct {
 
     pub fn init(alloc: Allocator, node_id: i32, port: u16) Broker {
         return initWithConfig(alloc, node_id, port, .{});
+    }
+
+    pub fn deriveReplicaDirectoryId(path: ?[]const u8) [16]u8 {
+        const value = path orelse return zeroUuid();
+        var id: [16]u8 = undefined;
+        writeU64Big(id[0..8], std.hash.Wyhash.hash(0x5a6d_715f_6c6f_6731, value));
+        writeU64Big(id[8..16], std.hash.Wyhash.hash(0x5a6d_715f_6c6f_6732, value));
+        id[6] = (id[6] & 0x0f) | 0x40;
+        id[8] = (id[8] & 0x3f) | 0x80;
+        if (isZeroUuid(id)) id[15] = 1;
+        return id;
     }
 
     pub fn initWithConfig(alloc: Allocator, node_id: i32, port: u16, config: BrokerConfig) Broker {
@@ -483,6 +499,7 @@ pub const Broker = struct {
             .finalized_features = std.StringHashMap(i16).init(alloc),
             .client_telemetry_samples = std.StringHashMap(ClientTelemetrySample).init(alloc),
             .client_telemetry_export_path = config.client_telemetry_export_path,
+            .local_replica_directory_id = config.replica_directory_id,
             .share_group_states = std.StringHashMap(SharePartitionState).init(alloc),
             .share_group_sessions = std.StringHashMap(i32).init(alloc),
             .replica_directory_assignments = std.StringHashMap(ReplicaDirectoryAssignment).init(alloc),
@@ -15130,6 +15147,14 @@ pub const Broker = struct {
         return std.mem.eql(u8, &uuid, &zero);
     }
 
+    fn writeU64Big(dst: []u8, value: u64) void {
+        std.debug.assert(dst.len == 8);
+        for (0..8) |idx| {
+            const shift: u6 = @intCast((7 - idx) * 8);
+            dst[idx] = @intCast((value >> shift) & 0xff);
+        }
+    }
+
     // ---------------------------------------------------------------
     // InitProducerId (key 22)
     // ---------------------------------------------------------------
@@ -19191,6 +19216,7 @@ pub const Broker = struct {
 
     fn validateReplicaDirectoryAssignmentTarget(self: *const Broker, directory_id: [16]u8, topic_id: [16]u8, partition_index: i32) ErrorCode {
         if (isZeroUuid(directory_id)) return ErrorCode.log_dir_not_found;
+        if (!isZeroUuid(self.local_replica_directory_id) and !std.mem.eql(u8, &directory_id, &self.local_replica_directory_id)) return ErrorCode.log_dir_not_found;
         if (isZeroUuid(topic_id)) return ErrorCode.unknown_topic_id;
         const topic_name = self.findTopicNameById(topic_id) orelse return ErrorCode.unknown_topic_id;
         if (!self.topicPartitionExists(topic_name, partition_index)) return ErrorCode.unknown_topic_or_partition;
@@ -35097,6 +35123,79 @@ test "Broker.handleRequest AssignReplicasToDirs rejects stale broker epoch" {
     try testing.expectEqual(@as(usize, 1), resp.directories.len);
     try testing.expectEqual(ErrorCode.stale_broker_epoch.toInt(), resp.directories[0].topics[0].partitions[0].error_code);
     try testing.expect((try broker.getReplicaDirectoryAssignment(topic_id, 0)) == null);
+}
+
+test "Broker.handleRequest AssignReplicasToDirs rejects unregistered local directory" {
+    const Req = generated.assign_replicas_to_dirs_request.AssignReplicasToDirsRequest;
+    const Resp = generated.assign_replicas_to_dirs_response.AssignReplicasToDirsResponse;
+    const DirectoryData = Req.DirectoryData;
+    const TopicData = DirectoryData.TopicData;
+    const PartitionData = TopicData.PartitionData;
+
+    const local_directory_id = [_]u8{0x31} ** 16;
+    const unknown_directory_id = [_]u8{0x32} ** 16;
+    var broker = Broker.initWithConfig(testing.allocator, 1, 9092, .{ .replica_directory_id = local_directory_id });
+    defer broker.deinit();
+
+    _ = broker.ensureTopic("assign-dir-local-dir-topic");
+    const topic_id = broker.topics.get("assign-dir-local-dir-topic").?.topic_id;
+    const partitions = [_]PartitionData{.{
+        .partition_index = 0,
+    }};
+    const unknown_topics = [_]TopicData{.{
+        .topic_id = topic_id,
+        .partitions = &partitions,
+    }};
+    const local_topics = [_]TopicData{.{
+        .topic_id = topic_id,
+        .partitions = &partitions,
+    }};
+    const directories = [_]DirectoryData{
+        .{
+            .id = unknown_directory_id,
+            .topics = &unknown_topics,
+        },
+        .{
+            .id = local_directory_id,
+            .topics = &local_topics,
+        },
+    };
+    const req = Req{
+        .broker_id = 1,
+        .broker_epoch = 1,
+        .directories = &directories,
+    };
+
+    var buf: [512]u8 = undefined;
+    var pos = buildTestRequest(&buf, 73, 0, 7309, header_mod.requestHeaderVersion(73, 0));
+    req.serialize(&buf, &pos, 0);
+
+    const response = broker.handleRequest(buf[0..pos]);
+    try testing.expect(response != null);
+    defer testing.allocator.free(response.?);
+
+    var rpos: usize = 0;
+    var response_header = try ResponseHeader.deserialize(testing.allocator, response.?, &rpos, header_mod.responseHeaderVersion(73, 0));
+    defer response_header.deinit(testing.allocator);
+    try testing.expectEqual(@as(i32, 7309), response_header.correlation_id);
+
+    const resp = try Resp.deserialize(testing.allocator, response.?, &rpos, 0);
+    defer {
+        for (resp.directories) |directory| {
+            for (directory.topics) |topic| {
+                if (topic.partitions.len > 0) testing.allocator.free(topic.partitions);
+            }
+            if (directory.topics.len > 0) testing.allocator.free(directory.topics);
+        }
+        if (resp.directories.len > 0) testing.allocator.free(resp.directories);
+    }
+
+    try testing.expectEqual(response.?.len, rpos);
+    try testing.expectEqual(ErrorCode.none.toInt(), resp.error_code);
+    try testing.expectEqual(ErrorCode.log_dir_not_found.toInt(), resp.directories[0].topics[0].partitions[0].error_code);
+    try testing.expectEqual(ErrorCode.none.toInt(), resp.directories[1].topics[0].partitions[0].error_code);
+    const stored = (try broker.getReplicaDirectoryAssignment(topic_id, 0)) orelse return error.ExpectedReplicaDirectoryAssignment;
+    try testing.expectEqualSlices(u8, local_directory_id[0..], stored[0..]);
 }
 
 test "Broker.handleRequest AssignReplicasToDirs persists local assignments across restart" {
