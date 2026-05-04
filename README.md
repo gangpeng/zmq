@@ -99,10 +99,18 @@ zig build
 # Optimized release build
 zig build -Doptimize=ReleaseFast
 
+# Release build that verifies native compression library linkage
+zig build -Doptimize=ReleaseFast -Dnative-compression=true
+
 # Or use the Makefile shortcuts
 make build          # debug
 make release        # release
 ```
+
+`-Dnative-compression=true` links the system libraries named by
+`-Dnative-compression-libs` (default: `z,lz4,zstd,snappy`) for release
+environments that want to enforce native codec library availability. Default
+builds stay dependency-free.
 
 The broker binary is output to `./zig-out/bin/zmq`.
 

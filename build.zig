@@ -6,6 +6,16 @@ pub fn build(b: *std.Build) void {
     // ---------------------------------------------------------------
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
+    const native_compression = b.option(
+        bool,
+        "native-compression",
+        "Link optional native zlib/lz4/zstd/snappy system libraries",
+    ) orelse false;
+    const native_compression_libs = b.option(
+        []const u8,
+        "native-compression-libs",
+        "Comma-separated native compression libraries to link",
+    ) orelse "z,lz4,zstd,snappy";
 
     const time_compat_mod = b.addModule("time_compat", .{
         .root_source_file = b.path("src/core/time_compat.zig"),
@@ -253,14 +263,7 @@ pub fn build(b: *std.Build) void {
         .root_module = exe_mod,
     });
 
-    // C compression libraries are optional — Zig's std.compress provides
-    // gzip/zlib and zstd. LZ4 and Snappy will use C FFI when available.
-    // For now, build without C library dependencies.
-    // TODO (Phase 0.5): Add optional C library linking for lz4 and snappy
-    // exe.linkSystemLibrary("z");
-    // exe.linkSystemLibrary("lz4");
-    // exe.linkSystemLibrary("zstd");
-    // exe.linkSystemLibrary("snappy");
+    linkNativeCompressionLibraries(exe, native_compression, native_compression_libs);
 
     b.installArtifact(exe);
 
@@ -326,6 +329,7 @@ pub fn build(b: *std.Build) void {
         const t = b.addTest(.{
             .root_module = test_mod,
         });
+        linkNativeCompressionLibraries(t, native_compression, native_compression_libs);
 
         const run_t = b.addRunArtifact(t);
         test_step.dependOn(&run_t.step);
@@ -356,6 +360,7 @@ pub fn build(b: *std.Build) void {
         const integration_test = b.addTest(.{
             .root_module = integration_mod,
         });
+        linkNativeCompressionLibraries(integration_test, native_compression, native_compression_libs);
 
         const run_integration = b.addRunArtifact(integration_test);
         test_step.dependOn(&run_integration.step);
@@ -391,6 +396,7 @@ pub fn build(b: *std.Build) void {
         const minio_test = b.addTest(.{
             .root_module = minio_mod,
         });
+        linkNativeCompressionLibraries(minio_test, native_compression, native_compression_libs);
 
         const run_minio = b.addRunArtifact(minio_test);
         minio_test_step.dependOn(&run_minio.step);
@@ -502,6 +508,7 @@ pub fn build(b: *std.Build) void {
         .name = "bench",
         .root_module = bench_mod,
     });
+    linkNativeCompressionLibraries(bench_exe, native_compression, native_compression_libs);
 
     const bench_run = b.addRunArtifact(bench_exe);
     const bench_step = b.step("bench", "Run performance benchmarks");
@@ -516,5 +523,20 @@ pub fn build(b: *std.Build) void {
 
         const bench_compare_self_test = b.addSystemCommand(&.{ "python3", "benchmarks/benchmark_compare.py", "--self-test" });
         test_step.dependOn(&bench_compare_self_test.step);
+    }
+}
+
+fn linkNativeCompressionLibraries(
+    artifact: *std.Build.Step.Compile,
+    enabled: bool,
+    libs_csv: []const u8,
+) void {
+    if (!enabled) return;
+
+    var libs = std.mem.tokenizeScalar(u8, libs_csv, ',');
+    while (libs.next()) |raw_lib| {
+        const lib = std.mem.trim(u8, raw_lib, " \t\r\n");
+        if (lib.len == 0) continue;
+        artifact.root_module.linkSystemLibrary(lib, .{ .needed = true });
     }
 }
