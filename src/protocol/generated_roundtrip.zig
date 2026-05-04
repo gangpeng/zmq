@@ -877,6 +877,65 @@ test "generated non-default golden fixtures cover legacy and flexible wire encod
     }
 
     {
+        const SaslHandshakeRequest = generated.sasl_handshake_request.SaslHandshakeRequest;
+        const value = SaslHandshakeRequest{
+            .mechanism = "SCRAM-SHA-256",
+        };
+        try expectGoldenRoundTrip(SaslHandshakeRequest, value, 1, &[_]u8{
+            0x00, 0x0d, 'S',  'C',
+            'R',  'A',  'M',  '-',
+            'S',  'H',  'A',  '-',
+            '2',  '5',  '6',
+        });
+    }
+
+    {
+        const SaslHandshakeResponse = generated.sasl_handshake_response.SaslHandshakeResponse;
+        const mechanisms = [_]?[]const u8{ "PLAIN", "SCRAM-SHA-256" };
+        const value = SaslHandshakeResponse{
+            .mechanisms = &mechanisms,
+        };
+        try expectGoldenRoundTrip(SaslHandshakeResponse, value, 1, &[_]u8{
+            0x00, 0x00, 0x00, 0x00,
+            0x00, 0x02, 0x00, 0x05,
+            'P',  'L',  'A',  'I',
+            'N',  0x00, 0x0d, 'S',
+            'C',  'R',  'A',  'M',
+            '-',  'S',  'H',  'A',
+            '-',  '2',  '5',  '6',
+        });
+    }
+
+    {
+        const SaslAuthenticateRequest = generated.sasl_authenticate_request.SaslAuthenticateRequest;
+        const value = SaslAuthenticateRequest{
+            .auth_bytes = &[_]u8{ 0x01, 0x02, 0x03 },
+        };
+        try expectGoldenRoundTrip(SaslAuthenticateRequest, value, 2, &[_]u8{
+            0x04, 0x01, 0x02, 0x03,
+            0x00,
+        });
+    }
+
+    {
+        const SaslAuthenticateResponse = generated.sasl_authenticate_response.SaslAuthenticateResponse;
+        const value = SaslAuthenticateResponse{
+            .error_code = 33,
+            .error_message = "bad auth",
+            .auth_bytes = &[_]u8{ 0xaa, 0xbb },
+            .session_lifetime_ms = 60000,
+        };
+        try expectGoldenRoundTrip(SaslAuthenticateResponse, value, 2, &[_]u8{
+            0x00, 0x21, 0x09, 'b',
+            'a',  'd',  ' ',  'a',
+            'u',  't',  'h',  0x03,
+            0xaa, 0xbb, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00,
+            0xea, 0x60, 0x00,
+        });
+    }
+
+    {
         const ElectLeadersRequest = generated.elect_leaders_request.ElectLeadersRequest;
         const null_value = ElectLeadersRequest{
             .election_type = 0,
