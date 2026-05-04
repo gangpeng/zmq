@@ -1120,6 +1120,7 @@ pub const Broker = struct {
             if (raft.role == .leader) 1.0 else 0.0
         else
             0.0;
+        const broker_state: f64 = if (self.is_shutting_down) 7.0 else 3.0;
         self.metrics.setGauge("kafka_server_group_count", @floatFromInt(group_count));
         self.metrics.setGauge("kafka_server_topic_count", @floatFromInt(topic_count));
         self.metrics.setGauge("kafka_server_member_count", @floatFromInt(self.groups.totalMemberCount()));
@@ -1129,10 +1130,16 @@ pub const Broker = struct {
         self.metrics.setGauge("Kafka_partition_count", @floatFromInt(partition_count));
         self.metrics.setGauge("Kafka_partition_total_count", @floatFromInt(partition_count));
         self.metrics.setGauge("kafka_controller_kafkacontroller_activecontrollercount", active_controller_count);
+        self.metrics.setGauge("kafka_server_kafkaserver_brokerstate", broker_state);
+        self.metrics.setGauge("kafka_server_kafkarequesthandlerpool_requesthandleravgidlepercent", 1.0);
+        self.metrics.setGauge("kafka_network_socketserver_networkprocessoravgidlepercent", 1.0);
         self.metrics.setGauge("kafka_server_replicamanager_partitioncount", @floatFromInt(partition_count));
         self.metrics.setGauge("kafka_server_replicamanager_leadercount", @floatFromInt(leader_partition_count));
         self.metrics.setGauge("kafka_server_replicamanager_underreplicatedpartitions", 0.0);
         self.metrics.setGauge("kafka_server_replicamanager_offlinepartitionscount", 0.0);
+        self.metrics.setGauge("kafka_server_replicamanager_reassigningpartitions", @floatFromInt(self.partition_reassignments.count()));
+        self.metrics.setLabeledGauge("kafka_server_delayedoperationpurgatory_purgatorysize", &.{"Fetch"}, @floatFromInt(self.delayed_fetches.items.len));
+        self.metrics.setLabeledGauge("kafka_server_delayedoperationpurgatory_purgatorysize", &.{"Produce"}, 0.0);
 
         // Periodically persist committed offsets and group state
         self.persistOffsets();
@@ -54580,6 +54587,27 @@ test "Broker tick exports AutoMQ-compatible broker gauges" {
     if (broker.topics.getPtr("automq-metric-topic-b")) |topic| topic.num_partitions = 3;
     const subscriptions = [_][]const u8{"automq-metric-topic-a"};
     _ = try broker.groups.joinGroup("automq-metric-group", "member-a", "consumer", &subscriptions);
+    try broker.delayed_fetches.append(.{
+        .correlation_id = 9001,
+        .topic = try testing.allocator.dupe(u8, "automq-metric-topic-a"),
+        .partition_id = 0,
+        .fetch_offset = 0,
+        .max_bytes = 1,
+        .deadline_ms = @import("time_compat").milliTimestamp() + 60_000,
+        .api_version = 16,
+        .resp_header_version = 1,
+        .client_id = null,
+    });
+    try broker.partition_reassignments.put(
+        try testing.allocator.dupe(u8, "automq-metric-topic-a-0"),
+        .{
+            .topic = try testing.allocator.dupe(u8, "automq-metric-topic-a"),
+            .partition_index = 0,
+            .replicas = try testing.allocator.dupe(i32, &[_]i32{2}),
+            .adding_replicas = try testing.allocator.dupe(i32, &[_]i32{2}),
+            .removing_replicas = &.{},
+        },
+    );
 
     broker.tick();
 
@@ -54591,7 +54619,13 @@ test "Broker tick exports AutoMQ-compatible broker gauges" {
     try testing.expectEqual(@as(f64, 4.0), broker.metrics.gauges.get("kafka_server_replicamanager_leadercount").?.value);
     try testing.expectEqual(@as(f64, 0.0), broker.metrics.gauges.get("kafka_server_replicamanager_underreplicatedpartitions").?.value);
     try testing.expectEqual(@as(f64, 0.0), broker.metrics.gauges.get("kafka_server_replicamanager_offlinepartitionscount").?.value);
+    try testing.expectEqual(@as(f64, 1.0), broker.metrics.gauges.get("kafka_server_replicamanager_reassigningpartitions").?.value);
     try testing.expectEqual(@as(f64, 0.0), broker.metrics.gauges.get("kafka_controller_kafkacontroller_activecontrollercount").?.value);
+    try testing.expectEqual(@as(f64, 3.0), broker.metrics.gauges.get("kafka_server_kafkaserver_brokerstate").?.value);
+    try testing.expectEqual(@as(f64, 1.0), broker.metrics.gauges.get("kafka_server_kafkarequesthandlerpool_requesthandleravgidlepercent").?.value);
+    try testing.expectEqual(@as(f64, 1.0), broker.metrics.gauges.get("kafka_network_socketserver_networkprocessoravgidlepercent").?.value);
+    try testing.expectEqual(@as(f64, 1.0), broker.metrics.labeled_gauges.get("kafka_server_delayedoperationpurgatory_purgatorysize{delayed_operation=\"Fetch\"}").?.value);
+    try testing.expectEqual(@as(f64, 0.0), broker.metrics.labeled_gauges.get("kafka_server_delayedoperationpurgatory_purgatorysize{delayed_operation=\"Produce\"}").?.value);
 }
 
 test "Broker client telemetry metrics are registered" {

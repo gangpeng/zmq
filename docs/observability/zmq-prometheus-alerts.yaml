@@ -57,6 +57,33 @@ groups:
           summary: No ZMQ controller is reporting active-controller status.
           description: Controller failover or registration may be stalled.
 
+      - alert: ZMQBrokerNotRunning
+        expr: kafka_server_kafkaserver_brokerstate != 3
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: ZMQ broker state is not reporting running.
+          description: KafkaServer BrokerState should remain RUNNING after startup completes.
+
+      - alert: ZMQLowRequestHandlerIdle
+        expr: kafka_server_kafkarequesthandlerpool_requesthandleravgidlepercent < 0.1
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: ZMQ request handler idle ratio is low.
+          description: Sustained low request-handler idle time indicates request saturation.
+
+      - alert: ZMQLowNetworkProcessorIdle
+        expr: kafka_network_socketserver_networkprocessoravgidlepercent < 0.1
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: ZMQ network processor idle ratio is low.
+          description: Sustained low network-processor idle time indicates network saturation.
+
       - alert: ZMQOfflinePartitions
         expr: kafka_server_replicamanager_offlinepartitionscount > 0
         for: 1m
@@ -74,6 +101,24 @@ groups:
         annotations:
           summary: ZMQ replica manager reports under-replicated partitions.
           description: Replication lag can reduce durability during broker failure.
+
+      - alert: ZMQPartitionReassignmentStuck
+        expr: kafka_server_replicamanager_reassigningpartitions > 0
+        for: 30m
+        labels:
+          severity: warning
+        annotations:
+          summary: ZMQ partition reassignment has been active for more than 30 minutes.
+          description: Stuck reassignments can indicate balancer convergence or broker-routing issues.
+
+      - alert: ZMQDelayedFetchPurgatoryBacklog
+        expr: kafka_server_delayedoperationpurgatory_purgatorysize{delayed_operation="Fetch"} > 1000
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: ZMQ delayed fetch purgatory backlog is high.
+          description: A large delayed-fetch backlog can indicate fetch wait or response-drain regressions.
 
       - alert: ZMQFailedProduceRequests
         expr: rate(kafka_server_brokertopicmetrics_failedproducerequests_total[5m]) > 0

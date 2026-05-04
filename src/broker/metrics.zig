@@ -40,10 +40,19 @@ pub fn registerBrokerMetrics(registry: *MetricRegistry) !void {
     try registry.registerGauge("Kafka_partition_count", "AutoMQ-compatible local partition count");
     try registry.registerGauge("Kafka_partition_total_count", "AutoMQ-compatible cluster partition count");
     try registry.registerGauge("kafka_controller_kafkacontroller_activecontrollercount", "JMX-compatible active controller count");
+    try registry.registerGauge("kafka_server_kafkaserver_brokerstate", "JMX-compatible broker lifecycle state");
+    try registry.registerGauge("kafka_server_kafkarequesthandlerpool_requesthandleravgidlepercent", "JMX-compatible request handler idle fraction");
+    try registry.registerGauge("kafka_network_socketserver_networkprocessoravgidlepercent", "JMX-compatible network processor idle fraction");
     try registry.registerGauge("kafka_server_replicamanager_partitioncount", "JMX-compatible local partition count");
     try registry.registerGauge("kafka_server_replicamanager_leadercount", "JMX-compatible local leader partition count");
     try registry.registerGauge("kafka_server_replicamanager_underreplicatedpartitions", "JMX-compatible under-replicated partition count");
     try registry.registerGauge("kafka_server_replicamanager_offlinepartitionscount", "JMX-compatible offline partition count");
+    try registry.registerGauge("kafka_server_replicamanager_reassigningpartitions", "JMX-compatible active partition reassignment count");
+    try registry.registerLabeledGauge(
+        "kafka_server_delayedoperationpurgatory_purgatorysize",
+        "JMX-compatible delayed operation purgatory size",
+        &.{"delayed_operation"},
+    );
     try registry.registerCounter("kafka_server_brokertopicmetrics_totalproducerequests_total", "JMX-compatible total produce requests");
     try registry.registerCounter("kafka_server_brokertopicmetrics_totalfetchrequests_total", "JMX-compatible total fetch requests");
     try registry.registerCounter("kafka_server_brokertopicmetrics_messagesin_total", "JMX-compatible produced record count");
@@ -216,10 +225,15 @@ test "registerBrokerMetrics" {
     try testing.expect(registry.gauges.contains("Kafka_partition_count"));
     try testing.expect(registry.gauges.contains("Kafka_partition_total_count"));
     try testing.expect(registry.gauges.contains("kafka_controller_kafkacontroller_activecontrollercount"));
+    try testing.expect(registry.gauges.contains("kafka_server_kafkaserver_brokerstate"));
+    try testing.expect(registry.gauges.contains("kafka_server_kafkarequesthandlerpool_requesthandleravgidlepercent"));
+    try testing.expect(registry.gauges.contains("kafka_network_socketserver_networkprocessoravgidlepercent"));
     try testing.expect(registry.gauges.contains("kafka_server_replicamanager_partitioncount"));
     try testing.expect(registry.gauges.contains("kafka_server_replicamanager_leadercount"));
     try testing.expect(registry.gauges.contains("kafka_server_replicamanager_underreplicatedpartitions"));
     try testing.expect(registry.gauges.contains("kafka_server_replicamanager_offlinepartitionscount"));
+    try testing.expect(registry.gauges.contains("kafka_server_replicamanager_reassigningpartitions"));
+    try testing.expect(registry.labeled_gauge_meta.contains("kafka_server_delayedoperationpurgatory_purgatorysize"));
     try testing.expect(registry.counters.contains("kafka_server_brokertopicmetrics_totalproducerequests_total"));
     try testing.expect(registry.counters.contains("kafka_server_brokertopicmetrics_totalfetchrequests_total"));
     try testing.expect(registry.counters.contains("kafka_server_brokertopicmetrics_messagesin_total"));

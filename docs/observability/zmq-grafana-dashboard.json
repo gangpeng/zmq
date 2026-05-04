@@ -115,6 +115,18 @@
         {
           "expr": "kafka_server_group_count",
           "legendFormat": "groups"
+        },
+        {
+          "expr": "kafka_server_kafkaserver_brokerstate",
+          "legendFormat": "broker state"
+        },
+        {
+          "expr": "kafka_server_kafkarequesthandlerpool_requesthandleravgidlepercent",
+          "legendFormat": "request handler idle"
+        },
+        {
+          "expr": "kafka_network_socketserver_networkprocessoravgidlepercent",
+          "legendFormat": "network processor idle"
         }
       ],
       "title": "Broker State",
@@ -393,6 +405,14 @@
         {
           "expr": "kafka_server_replicamanager_offlinepartitionscount",
           "legendFormat": "offline"
+        },
+        {
+          "expr": "kafka_server_replicamanager_reassigningpartitions",
+          "legendFormat": "reassigning"
+        },
+        {
+          "expr": "kafka_server_delayedoperationpurgatory_purgatorysize",
+          "legendFormat": "{{delayed_operation}} purgatory"
         }
       ],
       "title": "JMX Controller And Replica Manager",
