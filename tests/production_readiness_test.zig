@@ -698,6 +698,11 @@ test "Observability dashboard and alerts reference exported metrics" {
         "kafka_server_replicamanager_atminisrpartitioncount",
         "kafka_server_replicamanager_offlinepartitionscount",
         "kafka_server_replicamanager_reassigningpartitions",
+        "kafka_controller_kafkacontroller_globaltopiccount",
+        "kafka_controller_kafkacontroller_globalpartitioncount",
+        "kafka_controller_kafkacontroller_offlinepartitionscount",
+        "kafka_controller_kafkacontroller_preferredreplicaimbalancecount",
+        "kafka_log_logmanager_offlinelogdirectorycount",
         "kafka_server_delayedoperationpurgatory_purgatorysize",
     };
     for (dashboard_metrics) |metric| {
@@ -749,6 +754,9 @@ test "Observability dashboard and alerts reference exported metrics" {
         "kafka_server_brokertopicmetrics_bytesrejected_total",
         "kafka_network_requestmetrics_localtimems_total",
         "kafka_network_requestmetrics_requests_total",
+        "kafka_log_logmanager_offlinelogdirectorycount",
+        "kafka_controller_kafkacontroller_offlinepartitionscount",
+        "kafka_controller_kafkacontroller_preferredreplicaimbalancecount",
     };
     for (alert_metrics) |metric| {
         try testing.expect(std.mem.indexOf(u8, alerts, metric) != null);
@@ -772,6 +780,9 @@ test "Observability dashboard and alerts reference exported metrics" {
         "ZMQFailedFetchRequests",
         "ZMQRejectedProduceBytes",
         "ZMQHighJmxRequestLocalTime",
+        "ZMQOfflineLogDirectories",
+        "ZMQControllerOfflinePartitions",
+        "ZMQPreferredReplicaImbalance",
     };
     for (alert_names) |name| {
         try testing.expect(std.mem.indexOf(u8, alerts, name) != null);

@@ -138,6 +138,33 @@ groups:
           summary: ZMQ delayed fetch purgatory backlog is high.
           description: A large delayed-fetch backlog can indicate fetch wait or response-drain regressions.
 
+      - alert: ZMQOfflineLogDirectories
+        expr: kafka_log_logmanager_offlinelogdirectorycount > 0
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: ZMQ broker has offline log directories.
+          description: Offline log directories typically indicate disk failures or filesystem errors.
+
+      - alert: ZMQControllerOfflinePartitions
+        expr: kafka_controller_kafkacontroller_offlinepartitionscount > 0
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: ZMQ controller reports offline partitions.
+          description: Offline partitions cannot accept produce or fetch traffic until the controller restores leadership.
+
+      - alert: ZMQPreferredReplicaImbalance
+        expr: kafka_controller_kafkacontroller_preferredreplicaimbalancecount > 0
+        for: 30m
+        labels:
+          severity: warning
+        annotations:
+          summary: ZMQ has partitions whose leader is not the preferred replica.
+          description: Sustained preferred-replica imbalance can lead to skewed broker load and rack-affinity regressions.
+
       - alert: ZMQFailedProduceRequests
         expr: rate(kafka_server_brokertopicmetrics_failedproducerequests_total[5m]) > 0
         for: 5m

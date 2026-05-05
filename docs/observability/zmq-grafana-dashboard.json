@@ -427,6 +427,26 @@
           "legendFormat": "reassigning"
         },
         {
+          "expr": "kafka_controller_kafkacontroller_globaltopiccount",
+          "legendFormat": "global topics"
+        },
+        {
+          "expr": "kafka_controller_kafkacontroller_globalpartitioncount",
+          "legendFormat": "global partitions"
+        },
+        {
+          "expr": "kafka_controller_kafkacontroller_offlinepartitionscount",
+          "legendFormat": "controller offline partitions"
+        },
+        {
+          "expr": "kafka_controller_kafkacontroller_preferredreplicaimbalancecount",
+          "legendFormat": "preferred replica imbalance"
+        },
+        {
+          "expr": "kafka_log_logmanager_offlinelogdirectorycount",
+          "legendFormat": "offline log directories"
+        },
+        {
           "expr": "kafka_server_delayedoperationpurgatory_purgatorysize",
           "legendFormat": "{{delayed_operation}} purgatory"
         }
