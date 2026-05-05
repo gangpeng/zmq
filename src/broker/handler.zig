@@ -23139,6 +23139,11 @@ pub const Broker = struct {
         };
         defer self.freeDescribeLogDirsRequest(&req);
 
+        if (pos != request_bytes.len) {
+            log.warn("DescribeLogDirs request has {d} trailing bytes", .{request_bytes.len - pos});
+            return null;
+        }
+
         const rh = ResponseHeader{ .correlation_id = req_header.correlation_id };
         const local_dirs = self.localReplicaDirectoryIds();
         var allocated_results: []Result = &.{};
