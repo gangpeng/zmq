@@ -427,6 +427,12 @@ pub const Controller = struct {
         };
         defer self.freeDescribeQuorumRequest(&req);
 
+        if (pos != request_bytes.len) {
+            log.warn("DescribeQuorum request has {d} trailing bytes", .{request_bytes.len - pos});
+            const resp = Resp{ .error_code = ErrorCode.invalid_request.toInt(), .topics = &.{} };
+            return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+        }
+
         const voter_count = self.raft_state.quorumSize();
         const voters = self.allocator.alloc(ReplicaState, voter_count) catch return null;
         defer self.allocator.free(voters);
@@ -1090,6 +1096,12 @@ pub const Controller = struct {
         };
         defer self.freeBrokerRegistrationRequest(&req);
 
+        if (pos != request_bytes.len) {
+            log.warn("BrokerRegistration request has {d} trailing bytes", .{request_bytes.len - pos});
+            const resp = Resp{ .error_code = ErrorCode.invalid_request.toInt(), .broker_epoch = -1 };
+            return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+        }
+
         const listener = if (req.listeners.len > 0) req.listeners[0] else null;
         const host = if (listener) |l| (l.host orelse "unknown") else "unknown";
         const broker_port: u16 = if (listener) |l| l.port else 0;
@@ -1156,6 +1168,12 @@ pub const Controller = struct {
             return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
         };
         defer if (req.offline_log_dirs.len > 0) self.allocator.free(req.offline_log_dirs);
+
+        if (pos != request_bytes.len) {
+            log.warn("BrokerHeartbeat request has {d} trailing bytes", .{request_bytes.len - pos});
+            const resp = Resp{ .error_code = ErrorCode.invalid_request.toInt(), .is_caught_up = false, .is_fenced = true, .should_shut_down = false };
+            return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+        }
 
         if (self.raft_state.role != .leader) {
             const resp = Resp{
@@ -1588,6 +1606,12 @@ pub const Controller = struct {
         };
         _ = req.broker_id;
         _ = req.broker_epoch;
+
+        if (pos != request_bytes.len) {
+            log.warn("AllocateProducerIds request has {d} trailing bytes", .{request_bytes.len - pos});
+            const resp = Resp{ .error_code = ErrorCode.invalid_request.toInt(), .producer_id_start = -1, .producer_id_len = 0 };
+            return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+        }
 
         if (self.raft_state.role != .leader) {
             const resp = Resp{ .error_code = ErrorCode.not_controller.toInt(), .producer_id_start = -1, .producer_id_len = 0 };
@@ -4210,4 +4234,73 @@ test "Controller handleRequest RemoveRaftVoter rejects trailing bytes" {
     req.serialize(&buf, &pos, 0);
 
     try expectControllerTrailingByteRejected(&ctrl, &buf, pos, 81, 0, 9104, true);
+}
+
+test "Controller handleRequest BrokerRegistration rejects trailing bytes" {
+    const Req = generated.broker_registration_request.BrokerRegistrationRequest;
+
+    var ctrl = Controller.init(testing.allocator, 1, "test-cluster");
+    defer ctrl.deinit();
+
+    var buf: [256]u8 = undefined;
+    var pos = buildTestRequest(&buf, 62, 0, 9105, 2);
+    const req = Req{
+        .broker_id = 100,
+        .cluster_id = "test-cluster",
+        .incarnation_id = [_]u8{0} ** 16,
+        .listeners = &.{},
+        .features = &.{},
+        .rack = null,
+    };
+    req.serialize(&buf, &pos, 0);
+
+    try expectControllerTrailingByteRejected(&ctrl, &buf, pos, 62, 0, 9105, true);
+}
+
+test "Controller handleRequest BrokerHeartbeat rejects trailing bytes" {
+    const Req = generated.broker_heartbeat_request.BrokerHeartbeatRequest;
+
+    var ctrl = Controller.init(testing.allocator, 1, "test-cluster");
+    defer ctrl.deinit();
+
+    var buf: [128]u8 = undefined;
+    var pos = buildTestRequest(&buf, 63, 0, 9106, 2);
+    const req = Req{
+        .broker_id = 100,
+        .broker_epoch = 1,
+        .current_metadata_offset = 0,
+        .want_fence = false,
+        .want_shut_down = false,
+    };
+    req.serialize(&buf, &pos, 0);
+
+    try expectControllerTrailingByteRejected(&ctrl, &buf, pos, 63, 0, 9106, true);
+}
+
+test "Controller handleRequest AllocateProducerIds rejects trailing bytes" {
+    const Req = generated.allocate_producer_ids_request.AllocateProducerIdsRequest;
+
+    var ctrl = Controller.init(testing.allocator, 1, "test-cluster");
+    defer ctrl.deinit();
+
+    var buf: [128]u8 = undefined;
+    var pos = buildTestRequest(&buf, 67, 0, 9107, 2);
+    const req = Req{ .broker_id = 1, .broker_epoch = 1 };
+    req.serialize(&buf, &pos, 0);
+
+    try expectControllerTrailingByteRejected(&ctrl, &buf, pos, 67, 0, 9107, true);
+}
+
+test "Controller handleRequest DescribeQuorum rejects trailing bytes" {
+    const Req = generated.describe_quorum_request.DescribeQuorumRequest;
+
+    var ctrl = Controller.init(testing.allocator, 1, "test-cluster");
+    defer ctrl.deinit();
+
+    var buf: [128]u8 = undefined;
+    var pos = buildTestRequest(&buf, 55, 0, 9108, 2);
+    const req = Req{ .topics = &.{} };
+    req.serialize(&buf, &pos, 0);
+
+    try expectControllerTrailingByteRejected(&ctrl, &buf, pos, 55, 0, 9108, false);
 }

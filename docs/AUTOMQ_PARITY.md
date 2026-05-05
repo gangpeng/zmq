@@ -454,9 +454,15 @@ Status: completed for the initial catalog and DeleteGroups slice.
   BeginQuorumEpoch internal AppendEntries bridge exempted.
   Controller-side trailing-byte coverage now also runs end-to-end through
   `Controller.handleRequest` for Vote, EndQuorumEpoch, UnregisterBroker,
-  AddRaftVoter, and RemoveRaftVoter, asserting schema-shaped
+  AddRaftVoter, RemoveRaftVoter, BrokerRegistration, BrokerHeartbeat,
+  AllocateProducerIds, and DescribeQuorum, asserting schema-shaped
   `invalid_request` responses with preserved correlation IDs and
-  throttle/error prefixes.
+  throttle/error prefixes. BrokerRegistration, BrokerHeartbeat,
+  AllocateProducerIds, and DescribeQuorum now enforce
+  `pos == request_bytes.len` after generated decode in addition to existing
+  per-validator coverage for Vote/EndQuorumEpoch/UnregisterBroker/
+  AddRaftVoter/RemoveRaftVoter/UpdateRaftVoter/ControllerRegistration/
+  FetchSnapshot.
   MetadataRequest generated decoding now preserves nullable `Topics` semantics:
   v1+ null requests all topics, explicit empty arrays request no topic results,
   and v0 null topics are rejected as malformed.
