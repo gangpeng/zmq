@@ -299,6 +299,37 @@ test "registerBrokerMetrics covers broker API metric catalog" {
     try testing.expect(registry.counters.contains("kafka_server_fetch_throttle_total"));
 }
 
+test "registerBrokerMetrics new JMX gauges export with HELP and TYPE" {
+    var registry = MetricRegistry.init(testing.allocator);
+    defer registry.deinit();
+
+    try registerBrokerMetrics(&registry);
+    registry.setGauge("kafka_controller_kafkacontroller_globaltopiccount", 7.0);
+    registry.setGauge("kafka_controller_kafkacontroller_globalpartitioncount", 21.0);
+    registry.setGauge("kafka_controller_kafkacontroller_offlinepartitionscount", 0.0);
+    registry.setGauge("kafka_controller_kafkacontroller_preferredreplicaimbalancecount", 0.0);
+    registry.setGauge("kafka_log_logmanager_offlinelogdirectorycount", 0.0);
+    registry.incrementCounter("kafka_server_replicamanager_failedisrupdatesperseccount_total");
+
+    const output = try registry.exportPrometheus(testing.allocator);
+    defer testing.allocator.free(output);
+
+    const expected = [_][]const u8{
+        "# HELP kafka_controller_kafkacontroller_globaltopiccount",
+        "# TYPE kafka_controller_kafkacontroller_globaltopiccount gauge",
+        "kafka_controller_kafkacontroller_globaltopiccount 7",
+        "kafka_controller_kafkacontroller_globalpartitioncount 21",
+        "kafka_controller_kafkacontroller_offlinepartitionscount 0",
+        "kafka_controller_kafkacontroller_preferredreplicaimbalancecount 0",
+        "kafka_log_logmanager_offlinelogdirectorycount 0",
+        "# TYPE kafka_server_replicamanager_failedisrupdatesperseccount_total counter",
+        "kafka_server_replicamanager_failedisrupdatesperseccount_total 1",
+    };
+    for (expected) |needle| {
+        try testing.expect(std.mem.indexOf(u8, output, needle) != null);
+    }
+}
+
 test "registerS3Metrics" {
     var registry = MetricRegistry.init(testing.allocator);
     defer registry.deinit();
