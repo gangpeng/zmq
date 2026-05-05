@@ -23382,6 +23382,11 @@ pub const Broker = struct {
         };
         defer self.freeElectLeadersRequest(&req);
 
+        if (pos != request_bytes.len) {
+            log.warn("ElectLeaders request has {d} trailing bytes", .{request_bytes.len - pos});
+            return null;
+        }
+
         const top_error: i16 = if (req.election_type == 0 or req.election_type == 1)
             @intFromEnum(ErrorCode.none)
         else
