@@ -55304,3 +55304,293 @@ test "Broker handleGetOpeningStreams rejects trailing bytes" {
 
     try expectTrailingByteRejectedWithGeneratedResponse(Resp, &broker, buf[0..], pos, 508, 0, 9305);
 }
+
+test "Broker handleOpenStreams rejects trailing bytes" {
+    const Req = generated.open_streams_request.OpenStreamsRequest;
+    const Resp = generated.open_streams_response.OpenStreamsResponse;
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+
+    const req = Req{ .node_id = 1, .node_epoch = 1, .open_stream_requests = &.{} };
+
+    var buf: [128]u8 = undefined;
+    var pos = buildTestRequest(&buf, 502, 0, 9306, header_mod.requestHeaderVersion(502, 0));
+    req.serialize(&buf, &pos, 0);
+
+    try expectTrailingByteRejectedWithGeneratedResponse(Resp, &broker, buf[0..], pos, 502, 0, 9306);
+}
+
+test "Broker handleCloseStreams rejects trailing bytes" {
+    const Req = generated.close_streams_request.CloseStreamsRequest;
+    const Resp = generated.close_streams_response.CloseStreamsResponse;
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+
+    const req = Req{ .node_id = 1, .node_epoch = 1, .close_stream_requests = &.{} };
+
+    var buf: [128]u8 = undefined;
+    var pos = buildTestRequest(&buf, 503, 0, 9307, header_mod.requestHeaderVersion(503, 0));
+    req.serialize(&buf, &pos, 0);
+
+    try expectTrailingByteRejectedWithGeneratedResponse(Resp, &broker, buf[0..], pos, 503, 0, 9307);
+}
+
+test "Broker handleDeleteStreams rejects trailing bytes" {
+    const Req = generated.delete_streams_request.DeleteStreamsRequest;
+    const Resp = generated.delete_streams_response.DeleteStreamsResponse;
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+
+    const req = Req{ .node_id = 1, .node_epoch = 1, .delete_stream_requests = &.{} };
+
+    var buf: [128]u8 = undefined;
+    var pos = buildTestRequest(&buf, 504, 0, 9308, header_mod.requestHeaderVersion(504, 0));
+    req.serialize(&buf, &pos, 0);
+
+    try expectTrailingByteRejectedWithGeneratedResponse(Resp, &broker, buf[0..], pos, 504, 0, 9308);
+}
+
+test "Broker handlePrepareS3Object rejects trailing bytes" {
+    const Req = generated.prepare_s3_object_request.PrepareS3ObjectRequest;
+    const Resp = generated.prepare_s3_object_response.PrepareS3ObjectResponse;
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+
+    const req = Req{ .node_id = 1, .prepared_count = 1, .time_to_live_in_ms = 1000 };
+
+    var buf: [128]u8 = undefined;
+    var pos = buildTestRequest(&buf, 505, 0, 9309, header_mod.requestHeaderVersion(505, 0));
+    req.serialize(&buf, &pos, 0);
+
+    try expectTrailingByteRejectedWithGeneratedResponse(Resp, &broker, buf[0..], pos, 505, 0, 9309);
+}
+
+test "Broker handleCommitStreamSetObject rejects trailing bytes" {
+    const Req = generated.commit_stream_set_object_request.CommitStreamSetObjectRequest;
+    const Resp = generated.commit_stream_set_object_response.CommitStreamSetObjectResponse;
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+
+    const req = Req{
+        .node_id = 1,
+        .node_epoch = 1,
+        .object_id = 1,
+        .order_id = 0,
+        .object_size = 100,
+        .object_stream_ranges = &.{},
+        .stream_objects = &.{},
+        .compacted_object_ids = &.{},
+    };
+
+    var buf: [256]u8 = undefined;
+    var pos = buildTestRequest(&buf, 506, 0, 9310, header_mod.requestHeaderVersion(506, 0));
+    req.serialize(&buf, &pos, 0);
+
+    try expectTrailingByteRejectedWithGeneratedResponse(Resp, &broker, buf[0..], pos, 506, 0, 9310);
+}
+
+test "Broker handleCommitStreamObject rejects trailing bytes" {
+    const Req = generated.commit_stream_object_request.CommitStreamObjectRequest;
+    const Resp = generated.commit_stream_object_response.CommitStreamObjectResponse;
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+
+    const req = Req{
+        .node_id = 1,
+        .node_epoch = 1,
+        .object_id = 1,
+        .object_size = 100,
+        .stream_id = 1,
+        .start_offset = 0,
+        .end_offset = 100,
+        .source_object_ids = &.{},
+    };
+
+    var buf: [256]u8 = undefined;
+    var pos = buildTestRequest(&buf, 507, 0, 9311, header_mod.requestHeaderVersion(507, 0));
+    req.serialize(&buf, &pos, 0);
+
+    try expectTrailingByteRejectedWithGeneratedResponse(Resp, &broker, buf[0..], pos, 507, 0, 9311);
+}
+
+test "Broker handleGetKVs rejects trailing bytes" {
+    const Req = generated.get_k_vs_request.GetKVsRequest;
+    const Resp = generated.get_k_vs_response.GetKVsResponse;
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+
+    const req = Req{ .get_key_requests = &.{} };
+
+    var buf: [128]u8 = undefined;
+    var pos = buildTestRequest(&buf, 509, 0, 9312, header_mod.requestHeaderVersion(509, 0));
+    req.serialize(&buf, &pos, 0);
+
+    try expectTrailingByteRejectedWithGeneratedResponse(Resp, &broker, buf[0..], pos, 509, 0, 9312);
+}
+
+test "Broker handlePutKVs rejects trailing bytes" {
+    const Req = generated.put_k_vs_request.PutKVsRequest;
+    const Resp = generated.put_k_vs_response.PutKVsResponse;
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+
+    const req = Req{ .put_kv_requests = &.{} };
+
+    var buf: [128]u8 = undefined;
+    var pos = buildTestRequest(&buf, 510, 0, 9313, header_mod.requestHeaderVersion(510, 0));
+    req.serialize(&buf, &pos, 0);
+
+    try expectTrailingByteRejectedWithGeneratedResponse(Resp, &broker, buf[0..], pos, 510, 0, 9313);
+}
+
+test "Broker handleDeleteKVs rejects trailing bytes" {
+    const Req = generated.delete_k_vs_request.DeleteKVsRequest;
+    const Resp = generated.delete_k_vs_response.DeleteKVsResponse;
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+
+    const req = Req{ .delete_kv_requests = &.{} };
+
+    var buf: [128]u8 = undefined;
+    var pos = buildTestRequest(&buf, 511, 0, 9314, header_mod.requestHeaderVersion(511, 0));
+    req.serialize(&buf, &pos, 0);
+
+    try expectTrailingByteRejectedWithGeneratedResponse(Resp, &broker, buf[0..], pos, 511, 0, 9314);
+}
+
+test "Broker handleAutomqZoneRouter rejects trailing bytes" {
+    const Req = generated.automq_zone_router_request.AutomqZoneRouterRequest;
+    const Resp = generated.automq_zone_router_response.AutomqZoneRouterResponse;
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+
+    const req = Req{ .metadata = null, .route_epoch = 0, .version = 0 };
+
+    var buf: [128]u8 = undefined;
+    var pos = buildTestRequest(&buf, 515, 0, 9315, header_mod.requestHeaderVersion(515, 0));
+    req.serialize(&buf, &pos, 0);
+
+    try expectTrailingByteRejectedWithGeneratedResponse(Resp, &broker, buf[0..], pos, 515, 0, 9315);
+}
+
+test "Broker handleAutomqGetPartitionSnapshot rejects trailing bytes" {
+    const Req = generated.automq_get_partition_snapshot_request.AutomqGetPartitionSnapshotRequest;
+    const Resp = generated.automq_get_partition_snapshot_response.AutomqGetPartitionSnapshotResponse;
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+
+    const req = Req{ .session_id = 1, .session_epoch = 0, .request_commit = false, .version = 0 };
+
+    var buf: [128]u8 = undefined;
+    var pos = buildTestRequest(&buf, 516, 0, 9316, header_mod.requestHeaderVersion(516, 0));
+    req.serialize(&buf, &pos, 0);
+
+    try expectTrailingByteRejectedWithGeneratedResponse(Resp, &broker, buf[0..], pos, 516, 0, 9316);
+}
+
+test "Broker handleUpdateLicense rejects trailing bytes" {
+    const Req = generated.update_license_request.UpdateLicenseRequest;
+    const Resp = generated.update_license_response.UpdateLicenseResponse;
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+
+    const req = Req{ .license = null };
+
+    var buf: [128]u8 = undefined;
+    var pos = buildTestRequest(&buf, 517, 0, 9317, header_mod.requestHeaderVersion(517, 0));
+    req.serialize(&buf, &pos, 0);
+
+    try expectTrailingByteRejectedWithGeneratedResponse(Resp, &broker, buf[0..], pos, 517, 0, 9317);
+}
+
+test "Broker handleDescribeLicense rejects trailing bytes" {
+    const Req = generated.describe_license_request.DescribeLicenseRequest;
+    const Resp = generated.describe_license_response.DescribeLicenseResponse;
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+
+    const req = Req{};
+
+    var buf: [128]u8 = undefined;
+    var pos = buildTestRequest(&buf, 518, 0, 9318, header_mod.requestHeaderVersion(518, 0));
+    req.serialize(&buf, &pos, 0);
+
+    try expectTrailingByteRejectedWithGeneratedResponse(Resp, &broker, buf[0..], pos, 518, 0, 9318);
+}
+
+test "Broker handleExportClusterManifest rejects trailing bytes" {
+    const Req = generated.export_cluster_manifest_request.ExportClusterManifestRequest;
+    const Resp = generated.export_cluster_manifest_response.ExportClusterManifestResponse;
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+
+    const req = Req{};
+
+    var buf: [128]u8 = undefined;
+    var pos = buildTestRequest(&buf, 519, 0, 9319, header_mod.requestHeaderVersion(519, 0));
+    req.serialize(&buf, &pos, 0);
+
+    try expectTrailingByteRejectedWithGeneratedResponse(Resp, &broker, buf[0..], pos, 519, 0, 9319);
+}
+
+test "Broker handleGetNextNodeId rejects trailing bytes" {
+    const Req = generated.get_next_node_id_request.GetNextNodeIdRequest;
+    const Resp = generated.get_next_node_id_response.GetNextNodeIdResponse;
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+
+    const req = Req{ .cluster_id = null };
+
+    var buf: [128]u8 = undefined;
+    var pos = buildTestRequest(&buf, 600, 0, 9320, header_mod.requestHeaderVersion(600, 0));
+    req.serialize(&buf, &pos, 0);
+
+    try expectTrailingByteRejectedWithGeneratedResponse(Resp, &broker, buf[0..], pos, 600, 0, 9320);
+}
+
+test "Broker handleDescribeStreams rejects trailing bytes" {
+    const Req = generated.describe_streams_request.DescribeStreamsRequest;
+    const Resp = generated.describe_streams_response.DescribeStreamsResponse;
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+
+    const req = Req{ .topic_partitions = &.{}, .node_id = -1, .stream_id = -1 };
+
+    var buf: [128]u8 = undefined;
+    var pos = buildTestRequest(&buf, 601, 0, 9321, header_mod.requestHeaderVersion(601, 0));
+    req.serialize(&buf, &pos, 0);
+
+    try expectTrailingByteRejectedWithGeneratedResponse(Resp, &broker, buf[0..], pos, 601, 0, 9321);
+}
+
+test "Broker handleAutomqUpdateGroup rejects trailing bytes" {
+    const Req = generated.automq_update_group_request.AutomqUpdateGroupRequest;
+    const Resp = generated.automq_update_group_response.AutomqUpdateGroupResponse;
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+
+    const req = Req{ .link_id = null, .group_id = null, .promoted = false };
+
+    var buf: [128]u8 = undefined;
+    var pos = buildTestRequest(&buf, 602, 0, 9322, header_mod.requestHeaderVersion(602, 0));
+    req.serialize(&buf, &pos, 0);
+
+    try expectTrailingByteRejectedWithGeneratedResponse(Resp, &broker, buf[0..], pos, 602, 0, 9322);
+}
