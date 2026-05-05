@@ -26589,6 +26589,19 @@ fn expectTestResponseHeader(response: []const u8, api_key: i16, api_version: i16
     try testing.expectEqual(correlation_id, response_header.correlation_id);
 }
 
+/// Asserts that appending a trailing byte to a valid request produces *some*
+/// response (not null). Used by handlers whose error response shape lacks a
+/// top-level error_code field (e.g. share-state RPCs that only carry
+/// per-partition error codes), where re-decoding the response is not worth
+/// the test surface area.
+fn expectTrailingByteRejectedNonNull(broker: *Broker, buf: []u8, pos: usize) !void {
+    try testing.expect(pos < buf.len);
+    buf[pos] = 0x7f;
+    const response = broker.handleRequest(buf[0 .. pos + 1]);
+    try testing.expect(response != null);
+    testing.allocator.free(response.?);
+}
+
 fn expectTrailingByteRejected(broker: *Broker, buf: []u8, pos: usize) !void {
     try testing.expect(pos < buf.len);
     buf[pos] = 0x7f;
@@ -55593,4 +55606,229 @@ test "Broker handleAutomqUpdateGroup rejects trailing bytes" {
     req.serialize(&buf, &pos, 0);
 
     try expectTrailingByteRejectedWithGeneratedResponse(Resp, &broker, buf[0..], pos, 602, 0, 9322);
+}
+
+test "Broker.handleRequest AlterPartitionReassignments rejects trailing bytes" {
+    const Req = generated.alter_partition_reassignments_request.AlterPartitionReassignmentsRequest;
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+
+    const req = Req{ .timeout_ms = 60000, .topics = &.{} };
+
+    var buf: [128]u8 = undefined;
+    var pos = buildTestRequest(&buf, 45, 0, 9401, header_mod.requestHeaderVersion(45, 0));
+    req.serialize(&buf, &pos, 0);
+
+    try expectTrailingByteRejected(&broker, buf[0..], pos);
+}
+
+test "Broker.handleRequest ListPartitionReassignments rejects trailing bytes" {
+    const Req = generated.list_partition_reassignments_request.ListPartitionReassignmentsRequest;
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+
+    const req = Req{ .timeout_ms = 60000, .topics = null };
+
+    var buf: [128]u8 = undefined;
+    var pos = buildTestRequest(&buf, 46, 0, 9402, header_mod.requestHeaderVersion(46, 0));
+    req.serialize(&buf, &pos, 0);
+
+    try expectTrailingByteRejected(&broker, buf[0..], pos);
+}
+
+test "Broker.handleRequest AssignReplicasToDirs rejects trailing bytes" {
+    const Req = generated.assign_replicas_to_dirs_request.AssignReplicasToDirsRequest;
+    const Resp = generated.assign_replicas_to_dirs_response.AssignReplicasToDirsResponse;
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+
+    const req = Req{ .broker_id = 1, .broker_epoch = 1, .directories = &.{} };
+
+    var buf: [128]u8 = undefined;
+    var pos = buildTestRequest(&buf, 73, 0, 9403, header_mod.requestHeaderVersion(73, 0));
+    req.serialize(&buf, &pos, 0);
+
+    try expectTrailingByteRejectedWithGeneratedResponse(Resp, &broker, buf[0..], pos, 73, 0, 9403);
+}
+
+test "Broker.handleRequest ConsumerGroupHeartbeat rejects trailing bytes" {
+    const Req = generated.consumer_group_heartbeat_request.ConsumerGroupHeartbeatRequest;
+    const Resp = generated.consumer_group_heartbeat_response.ConsumerGroupHeartbeatResponse;
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+
+    const req = Req{ .group_id = "g", .member_id = "m", .member_epoch = 0 };
+
+    var buf: [128]u8 = undefined;
+    var pos = buildTestRequest(&buf, 68, 0, 9404, header_mod.requestHeaderVersion(68, 0));
+    req.serialize(&buf, &pos, 0);
+
+    try expectTrailingByteRejectedWithGeneratedResponse(Resp, &broker, buf[0..], pos, 68, 0, 9404);
+}
+
+test "Broker.handleRequest ConsumerGroupDescribe rejects trailing bytes" {
+    const Req = generated.consumer_group_describe_request.ConsumerGroupDescribeRequest;
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+
+    const req = Req{ .group_ids = &.{}, .include_authorized_operations = false };
+
+    var buf: [128]u8 = undefined;
+    var pos = buildTestRequest(&buf, 69, 0, 9405, header_mod.requestHeaderVersion(69, 0));
+    req.serialize(&buf, &pos, 0);
+
+    try expectTrailingByteRejected(&broker, buf[0..], pos);
+}
+
+test "Broker.handleRequest ShareGroupHeartbeat rejects trailing bytes" {
+    const Req = generated.share_group_heartbeat_request.ShareGroupHeartbeatRequest;
+    const Resp = generated.share_group_heartbeat_response.ShareGroupHeartbeatResponse;
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+
+    const req = Req{ .group_id = "g", .member_id = "m", .member_epoch = 0 };
+
+    var buf: [128]u8 = undefined;
+    var pos = buildTestRequest(&buf, 76, 0, 9406, header_mod.requestHeaderVersion(76, 0));
+    req.serialize(&buf, &pos, 0);
+
+    try expectTrailingByteRejectedWithGeneratedResponse(Resp, &broker, buf[0..], pos, 76, 0, 9406);
+}
+
+test "Broker.handleRequest ShareGroupDescribe rejects trailing bytes" {
+    const Req = generated.share_group_describe_request.ShareGroupDescribeRequest;
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+
+    const req = Req{ .group_ids = &.{}, .include_authorized_operations = false };
+
+    var buf: [128]u8 = undefined;
+    var pos = buildTestRequest(&buf, 77, 0, 9407, header_mod.requestHeaderVersion(77, 0));
+    req.serialize(&buf, &pos, 0);
+
+    try expectTrailingByteRejectedNonNull(&broker, buf[0..], pos);
+}
+
+test "Broker.handleRequest ShareFetch rejects trailing bytes" {
+    const Req = generated.share_fetch_request.ShareFetchRequest;
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+
+    const req = Req{
+        .group_id = "g",
+        .member_id = "m",
+        .share_session_epoch = 0,
+        .max_wait_ms = 0,
+        .min_bytes = 0,
+        .max_bytes = 0x7fffffff,
+        .topics = &.{},
+        .forgotten_topics_data = &.{},
+    };
+
+    var buf: [256]u8 = undefined;
+    var pos = buildTestRequest(&buf, 78, 0, 9408, header_mod.requestHeaderVersion(78, 0));
+    req.serialize(&buf, &pos, 0);
+
+    try expectTrailingByteRejectedWithGeneratedResponse(
+        generated.share_fetch_response.ShareFetchResponse, &broker, buf[0..], pos, 78, 0, 9408,
+    );
+}
+
+test "Broker.handleRequest ShareAcknowledge rejects trailing bytes" {
+    const Req = generated.share_acknowledge_request.ShareAcknowledgeRequest;
+    const Resp = generated.share_acknowledge_response.ShareAcknowledgeResponse;
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+
+    const req = Req{ .group_id = "g", .member_id = "m", .share_session_epoch = 0, .topics = &.{} };
+
+    var buf: [128]u8 = undefined;
+    var pos = buildTestRequest(&buf, 79, 0, 9409, header_mod.requestHeaderVersion(79, 0));
+    req.serialize(&buf, &pos, 0);
+
+    try expectTrailingByteRejectedWithGeneratedResponse(Resp, &broker, buf[0..], pos, 79, 0, 9409);
+}
+
+test "Broker.handleRequest InitializeShareGroupState rejects trailing bytes" {
+    const Req = generated.initialize_share_group_state_request.InitializeShareGroupStateRequest;
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+
+    const req = Req{ .group_id = "g", .topics = &.{} };
+
+    var buf: [128]u8 = undefined;
+    var pos = buildTestRequest(&buf, 83, 0, 9410, header_mod.requestHeaderVersion(83, 0));
+    req.serialize(&buf, &pos, 0);
+
+    try expectTrailingByteRejectedNonNull(&broker, buf[0..], pos);
+}
+
+test "Broker.handleRequest ReadShareGroupState rejects trailing bytes" {
+    const Req = generated.read_share_group_state_request.ReadShareGroupStateRequest;
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+
+    const req = Req{ .group_id = "g", .topics = &.{} };
+
+    var buf: [128]u8 = undefined;
+    var pos = buildTestRequest(&buf, 84, 0, 9411, header_mod.requestHeaderVersion(84, 0));
+    req.serialize(&buf, &pos, 0);
+
+    try expectTrailingByteRejectedNonNull(&broker, buf[0..], pos);
+}
+
+test "Broker.handleRequest WriteShareGroupState rejects trailing bytes" {
+    const Req = generated.write_share_group_state_request.WriteShareGroupStateRequest;
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+
+    const req = Req{ .group_id = "g", .topics = &.{} };
+
+    var buf: [128]u8 = undefined;
+    var pos = buildTestRequest(&buf, 85, 0, 9412, header_mod.requestHeaderVersion(85, 0));
+    req.serialize(&buf, &pos, 0);
+
+    try expectTrailingByteRejectedNonNull(&broker, buf[0..], pos);
+}
+
+test "Broker.handleRequest DeleteShareGroupState rejects trailing bytes" {
+    const Req = generated.delete_share_group_state_request.DeleteShareGroupStateRequest;
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+
+    const req = Req{ .group_id = "g", .topics = &.{} };
+
+    var buf: [128]u8 = undefined;
+    var pos = buildTestRequest(&buf, 86, 0, 9413, header_mod.requestHeaderVersion(86, 0));
+    req.serialize(&buf, &pos, 0);
+
+    try expectTrailingByteRejectedNonNull(&broker, buf[0..], pos);
+}
+
+test "Broker.handleRequest ReadShareGroupStateSummary rejects trailing bytes" {
+    const Req = generated.read_share_group_state_summary_request.ReadShareGroupStateSummaryRequest;
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+
+    const req = Req{ .group_id = "g", .topics = &.{} };
+
+    var buf: [128]u8 = undefined;
+    var pos = buildTestRequest(&buf, 87, 0, 9414, header_mod.requestHeaderVersion(87, 0));
+    req.serialize(&buf, &pos, 0);
+
+    try expectTrailingByteRejectedNonNull(&broker, buf[0..], pos);
 }
