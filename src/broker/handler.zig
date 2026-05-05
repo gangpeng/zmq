@@ -9889,6 +9889,19 @@ pub const Broker = struct {
         return RequestType.deserialize(allocator, request_bytes, &pos, api_version);
     }
 
+    /// Like parseGeneratedRequest but fails closed when the generated decoder
+    /// leaves trailing bytes in the request frame. Used by handlers that have
+    /// no per-request validator and would otherwise silently accept extra
+    /// bytes from misbehaving or malicious clients. Callers must use an arena
+    /// allocator so the decoder's heap allocations are cleaned up on error.
+    fn parseGeneratedRequestStrict(comptime RequestType: type, allocator: Allocator, request_bytes: []const u8, body_start: usize, api_version: i16) !RequestType {
+        if (body_start > request_bytes.len) return error.BufferUnderflow;
+        var pos = body_start;
+        const result = try RequestType.deserialize(allocator, request_bytes, &pos, api_version);
+        if (pos != request_bytes.len) return error.UnexpectedTrailingBytes;
+        return result;
+    }
+
     fn errorCode(code: ErrorCode) i16 {
         return code.toInt();
     }
@@ -18437,7 +18450,7 @@ pub const Broker = struct {
         defer arena.deinit();
         const arena_alloc = arena.allocator();
 
-        const req = parseGeneratedRequest(Req, arena_alloc, request_bytes, body_start, api_version) catch {
+        const req = parseGeneratedRequestStrict(Req, arena_alloc, request_bytes, body_start, api_version) catch {
             const resp = Resp{ .error_code = errorCode(.invalid_request), .throttle_time_ms = 0 };
             return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
         };
@@ -18492,7 +18505,7 @@ pub const Broker = struct {
         defer arena.deinit();
         const arena_alloc = arena.allocator();
 
-        const req = parseGeneratedRequest(Req, arena_alloc, request_bytes, body_start, api_version) catch {
+        const req = parseGeneratedRequestStrict(Req, arena_alloc, request_bytes, body_start, api_version) catch {
             const resp = Resp{ .error_code = errorCode(.invalid_request), .throttle_time_ms = 0 };
             return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
         };
@@ -18557,7 +18570,7 @@ pub const Broker = struct {
         defer arena.deinit();
         const arena_alloc = arena.allocator();
 
-        const req = parseGeneratedRequest(Req, arena_alloc, request_bytes, body_start, api_version) catch {
+        const req = parseGeneratedRequestStrict(Req, arena_alloc, request_bytes, body_start, api_version) catch {
             const resp = Resp{ .error_code = errorCode(.invalid_request), .throttle_time_ms = 0 };
             return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
         };
@@ -18620,7 +18633,7 @@ pub const Broker = struct {
         defer arena.deinit();
         const arena_alloc = arena.allocator();
 
-        const req = parseGeneratedRequest(Req, arena_alloc, request_bytes, body_start, api_version) catch {
+        const req = parseGeneratedRequestStrict(Req, arena_alloc, request_bytes, body_start, api_version) catch {
             const resp = Resp{ .error_code = errorCode(.invalid_request), .throttle_time_ms = 0 };
             return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
         };
@@ -18672,7 +18685,7 @@ pub const Broker = struct {
 
         var arena = std.heap.ArenaAllocator.init(self.allocator);
         defer arena.deinit();
-        const req = parseGeneratedRequest(Req, arena.allocator(), request_bytes, body_start, api_version) catch {
+        const req = parseGeneratedRequestStrict(Req, arena.allocator(), request_bytes, body_start, api_version) catch {
             const resp = Resp{ .error_code = errorCode(.invalid_request), .throttle_time_ms = 0, .first_s3_object_id = -1 };
             return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
         };
@@ -18718,7 +18731,7 @@ pub const Broker = struct {
         var arena = std.heap.ArenaAllocator.init(self.allocator);
         defer arena.deinit();
         const arena_alloc = arena.allocator();
-        const req = parseGeneratedRequest(Req, arena_alloc, request_bytes, body_start, api_version) catch {
+        const req = parseGeneratedRequestStrict(Req, arena_alloc, request_bytes, body_start, api_version) catch {
             const resp = Resp{ .error_code = errorCode(.invalid_request), .throttle_time_ms = 0 };
             return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
         };
@@ -18808,7 +18821,7 @@ pub const Broker = struct {
 
         var arena = std.heap.ArenaAllocator.init(self.allocator);
         defer arena.deinit();
-        const req = parseGeneratedRequest(Req, arena.allocator(), request_bytes, body_start, api_version) catch {
+        const req = parseGeneratedRequestStrict(Req, arena.allocator(), request_bytes, body_start, api_version) catch {
             const resp = Resp{ .error_code = errorCode(.invalid_request), .throttle_time_ms = 0 };
             return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
         };
@@ -18893,7 +18906,7 @@ pub const Broker = struct {
         var arena = std.heap.ArenaAllocator.init(self.allocator);
         defer arena.deinit();
         const arena_alloc = arena.allocator();
-        const req = parseGeneratedRequest(Req, arena_alloc, request_bytes, body_start, api_version) catch {
+        const req = parseGeneratedRequestStrict(Req, arena_alloc, request_bytes, body_start, api_version) catch {
             const resp = Resp{ .error_code = errorCode(.invalid_request), .throttle_time_ms = 0 };
             return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
         };
@@ -18924,7 +18937,7 @@ pub const Broker = struct {
         var arena = std.heap.ArenaAllocator.init(self.allocator);
         defer arena.deinit();
         const arena_alloc = arena.allocator();
-        const req = parseGeneratedRequest(Req, arena_alloc, request_bytes, body_start, api_version) catch {
+        const req = parseGeneratedRequestStrict(Req, arena_alloc, request_bytes, body_start, api_version) catch {
             const resp = Resp{ .error_code = errorCode(.invalid_request), .throttle_time_ms = 0 };
             return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
         };
@@ -18953,7 +18966,7 @@ pub const Broker = struct {
         var arena = std.heap.ArenaAllocator.init(self.allocator);
         defer arena.deinit();
         const arena_alloc = arena.allocator();
-        const req = parseGeneratedRequest(Req, arena_alloc, request_bytes, body_start, api_version) catch {
+        const req = parseGeneratedRequestStrict(Req, arena_alloc, request_bytes, body_start, api_version) catch {
             const resp = Resp{ .error_code = errorCode(.invalid_request), .throttle_time_ms = 0 };
             return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
         };
@@ -19032,7 +19045,7 @@ pub const Broker = struct {
         var arena = std.heap.ArenaAllocator.init(self.allocator);
         defer arena.deinit();
         const arena_alloc = arena.allocator();
-        const req = parseGeneratedRequest(Req, arena_alloc, request_bytes, body_start, api_version) catch {
+        const req = parseGeneratedRequestStrict(Req, arena_alloc, request_bytes, body_start, api_version) catch {
             const resp = Resp{ .error_code = errorCode(.invalid_request), .throttle_time_ms = 0 };
             return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
         };
@@ -19092,7 +19105,7 @@ pub const Broker = struct {
         var arena = std.heap.ArenaAllocator.init(self.allocator);
         defer arena.deinit();
         const arena_alloc = arena.allocator();
-        const req = parseGeneratedRequest(Req, arena_alloc, request_bytes, body_start, api_version) catch {
+        const req = parseGeneratedRequestStrict(Req, arena_alloc, request_bytes, body_start, api_version) catch {
             const resp = Resp{ .error_code = errorCode(.invalid_request), .throttle_time_ms = 0 };
             return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
         };
@@ -19148,7 +19161,7 @@ pub const Broker = struct {
 
         var arena = std.heap.ArenaAllocator.init(self.allocator);
         defer arena.deinit();
-        const req = parseGeneratedRequest(Req, arena.allocator(), request_bytes, body_start, api_version) catch {
+        const req = parseGeneratedRequestStrict(Req, arena.allocator(), request_bytes, body_start, api_version) catch {
             const resp = Resp{ .error_code = errorCode(.invalid_request), .throttle_time_ms = 0 };
             return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
         };
@@ -19199,7 +19212,7 @@ pub const Broker = struct {
         var arena = std.heap.ArenaAllocator.init(self.allocator);
         defer arena.deinit();
         const arena_alloc = arena.allocator();
-        const req = parseGeneratedRequest(Req, arena_alloc, request_bytes, body_start, api_version) catch {
+        const req = parseGeneratedRequestStrict(Req, arena_alloc, request_bytes, body_start, api_version) catch {
             const resp = Resp{ .error_code = errorCode(.invalid_request), .throttle_time_ms = 0 };
             return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
         };
@@ -19261,7 +19274,7 @@ pub const Broker = struct {
         var arena = std.heap.ArenaAllocator.init(self.allocator);
         defer arena.deinit();
         const arena_alloc = arena.allocator();
-        const req = parseGeneratedRequest(Req, arena_alloc, request_bytes, body_start, api_version) catch {
+        const req = parseGeneratedRequestStrict(Req, arena_alloc, request_bytes, body_start, api_version) catch {
             const resp = Resp{ .error_code = errorCode(.invalid_request), .throttle_time_ms = 0 };
             return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
         };
@@ -19325,7 +19338,7 @@ pub const Broker = struct {
         var arena = std.heap.ArenaAllocator.init(self.allocator);
         defer arena.deinit();
         const arena_alloc = arena.allocator();
-        const req = parseGeneratedRequest(Req, arena_alloc, request_bytes, body_start, api_version) catch {
+        const req = parseGeneratedRequestStrict(Req, arena_alloc, request_bytes, body_start, api_version) catch {
             const resp = Resp{ .error_code = errorCode(.invalid_request), .throttle_time_ms = 0 };
             return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
         };
@@ -19373,7 +19386,7 @@ pub const Broker = struct {
 
         var arena = std.heap.ArenaAllocator.init(self.allocator);
         defer arena.deinit();
-        const req = parseGeneratedRequest(Req, arena.allocator(), request_bytes, body_start, api_version) catch {
+        const req = parseGeneratedRequestStrict(Req, arena.allocator(), request_bytes, body_start, api_version) catch {
             const resp = Resp{ .error_code = errorCode(.invalid_request), .throttle_time_ms = 0, .error_message = "invalid request" };
             return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
         };
@@ -19408,7 +19421,7 @@ pub const Broker = struct {
 
         var arena = std.heap.ArenaAllocator.init(self.allocator);
         defer arena.deinit();
-        _ = parseGeneratedRequest(Req, arena.allocator(), request_bytes, body_start, api_version) catch {
+        _ = parseGeneratedRequestStrict(Req, arena.allocator(), request_bytes, body_start, api_version) catch {
             const resp = Resp{ .error_code = errorCode(.invalid_request), .throttle_time_ms = 0, .error_message = "invalid request", .license = "" };
             return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
         };
@@ -19424,7 +19437,7 @@ pub const Broker = struct {
         var arena = std.heap.ArenaAllocator.init(self.allocator);
         defer arena.deinit();
         const arena_alloc = arena.allocator();
-        _ = parseGeneratedRequest(Req, arena_alloc, request_bytes, body_start, api_version) catch {
+        _ = parseGeneratedRequestStrict(Req, arena_alloc, request_bytes, body_start, api_version) catch {
             const resp = Resp{ .error_code = errorCode(.invalid_request), .throttle_time_ms = 0, .manifest = "" };
             return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
         };
@@ -19447,7 +19460,7 @@ pub const Broker = struct {
 
         var arena = std.heap.ArenaAllocator.init(self.allocator);
         defer arena.deinit();
-        _ = parseGeneratedRequest(Req, arena.allocator(), request_bytes, body_start, api_version) catch {
+        _ = parseGeneratedRequestStrict(Req, arena.allocator(), request_bytes, body_start, api_version) catch {
             const resp = Resp{ .error_code = errorCode(.invalid_request), .throttle_time_ms = 0, .node_id = -1 };
             return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
         };
@@ -19487,7 +19500,7 @@ pub const Broker = struct {
         var arena = std.heap.ArenaAllocator.init(self.allocator);
         defer arena.deinit();
         const arena_alloc = arena.allocator();
-        const req = parseGeneratedRequest(Req, arena_alloc, request_bytes, body_start, api_version) catch {
+        const req = parseGeneratedRequestStrict(Req, arena_alloc, request_bytes, body_start, api_version) catch {
             const resp = Resp{ .error_code = errorCode(.invalid_request), .throttle_time_ms = 0 };
             return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
         };
@@ -19539,7 +19552,7 @@ pub const Broker = struct {
 
         var arena = std.heap.ArenaAllocator.init(self.allocator);
         defer arena.deinit();
-        const req = parseGeneratedRequest(Req, arena.allocator(), request_bytes, body_start, api_version) catch {
+        const req = parseGeneratedRequestStrict(Req, arena.allocator(), request_bytes, body_start, api_version) catch {
             const resp = Resp{ .group_id = null, .error_code = errorCode(.invalid_request), .error_message = "invalid request", .throttle_time_ms = 0 };
             return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
         };
@@ -26582,6 +26595,41 @@ fn expectTrailingByteRejected(broker: *Broker, buf: []u8, pos: usize) !void {
     const response = broker.handleRequest(buf[0 .. pos + 1]);
     defer if (response) |bytes| testing.allocator.free(bytes);
     try testing.expect(response == null);
+}
+
+/// Asserts that appending a trailing byte to a valid request produces a
+/// schema-shaped invalid_request response decoded by `RespType`. Used by
+/// AutoMQ extension handlers that fail closed by emitting a top-level
+/// error_code (after a throttle_time_ms prefix) instead of dropping the
+/// connection.
+fn expectTrailingByteRejectedWithGeneratedResponse(
+    comptime RespType: type,
+    broker: *Broker,
+    buf: []u8,
+    pos: usize,
+    api_key: i16,
+    api_version: i16,
+    correlation_id: i32,
+) !void {
+    try testing.expect(pos < buf.len);
+    buf[pos] = 0x7f;
+    const response = broker.handleRequest(buf[0 .. pos + 1]);
+    try testing.expect(response != null);
+    defer testing.allocator.free(response.?);
+
+    var rpos: usize = 0;
+    var resp_header = try ResponseHeader.deserialize(
+        testing.allocator,
+        response.?,
+        &rpos,
+        header_mod.responseHeaderVersion(api_key, api_version),
+    );
+    defer resp_header.deinit(testing.allocator);
+    try testing.expectEqual(correlation_id, resp_header.correlation_id);
+
+    const resp = try RespType.deserialize(testing.allocator, response.?, &rpos, api_version);
+    defer if (@hasDecl(RespType, "deinit")) resp.deinit(testing.allocator);
+    try testing.expectEqual(ErrorCode.invalid_request.toInt(), resp.error_code);
 }
 
 fn expectTxnControlRecordType(records: []const u8, expected: TxnCoordinator.ControlRecordType) !void {
@@ -55175,4 +55223,84 @@ test "Broker tick WAL cleanup removes flushed segments" {
 
     const segments_after = broker.store.fs_wal.?.segmentCount();
     try testing.expect(segments_after < segments_before);
+}
+
+test "Broker handleAutomqRegisterNode rejects trailing bytes" {
+    const Req = generated.automq_register_node_request.AutomqRegisterNodeRequest;
+    const Resp = generated.automq_register_node_response.AutomqRegisterNodeResponse;
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+
+    const req = Req{ .node_id = 7, .node_epoch = 1, .wal_config = null, .tags = &.{} };
+
+    var buf: [256]u8 = undefined;
+    var pos = buildTestRequest(&buf, 513, 0, 9301, header_mod.requestHeaderVersion(513, 0));
+    req.serialize(&buf, &pos, 0);
+
+    try expectTrailingByteRejectedWithGeneratedResponse(Resp, &broker, buf[0..], pos, 513, 0, 9301);
+}
+
+test "Broker handleAutomqGetNodes rejects trailing bytes" {
+    const Req = generated.automq_get_nodes_request.AutomqGetNodesRequest;
+    const Resp = generated.automq_get_nodes_response.AutomqGetNodesResponse;
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+
+    const req = Req{ .node_ids = &.{} };
+
+    var buf: [128]u8 = undefined;
+    var pos = buildTestRequest(&buf, 514, 0, 9302, header_mod.requestHeaderVersion(514, 0));
+    req.serialize(&buf, &pos, 0);
+
+    try expectTrailingByteRejectedWithGeneratedResponse(Resp, &broker, buf[0..], pos, 514, 0, 9302);
+}
+
+test "Broker handleCreateStreams rejects trailing bytes" {
+    const Req = generated.create_streams_request.CreateStreamsRequest;
+    const Resp = generated.create_streams_response.CreateStreamsResponse;
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+
+    const req = Req{ .node_id = 1, .node_epoch = 1, .create_stream_requests = &.{} };
+
+    var buf: [128]u8 = undefined;
+    var pos = buildTestRequest(&buf, 501, 0, 9303, header_mod.requestHeaderVersion(501, 0));
+    req.serialize(&buf, &pos, 0);
+
+    try expectTrailingByteRejectedWithGeneratedResponse(Resp, &broker, buf[0..], pos, 501, 0, 9303);
+}
+
+test "Broker handleTrimStreams rejects trailing bytes" {
+    const Req = generated.trim_streams_request.TrimStreamsRequest;
+    const Resp = generated.trim_streams_response.TrimStreamsResponse;
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+
+    const req = Req{ .trim_stream_requests = &.{} };
+
+    var buf: [128]u8 = undefined;
+    var pos = buildTestRequest(&buf, 512, 0, 9304, header_mod.requestHeaderVersion(512, 0));
+    req.serialize(&buf, &pos, 0);
+
+    try expectTrailingByteRejectedWithGeneratedResponse(Resp, &broker, buf[0..], pos, 512, 0, 9304);
+}
+
+test "Broker handleGetOpeningStreams rejects trailing bytes" {
+    const Req = generated.get_opening_streams_request.GetOpeningStreamsRequest;
+    const Resp = generated.get_opening_streams_response.GetOpeningStreamsResponse;
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+
+    const req = Req{ .node_id = 1, .node_epoch = 1, .failover_mode = false };
+
+    var buf: [128]u8 = undefined;
+    var pos = buildTestRequest(&buf, 508, 0, 9305, header_mod.requestHeaderVersion(508, 0));
+    req.serialize(&buf, &pos, 0);
+
+    try expectTrailingByteRejectedWithGeneratedResponse(Resp, &broker, buf[0..], pos, 508, 0, 9305);
 }
