@@ -473,6 +473,13 @@ Status: completed for the initial catalog and DeleteGroups slice.
   wire semantics. EndQuorumEpoch v1 frame validation no longer expects the
   v0-only `preferred_successors` array; the validator now matches the
   generated serializer's per-version layout.
+  BeginQuorumEpoch v1 responses also populate `node_endpoints` symmetrically.
+  All 22 AutoMQ extension key handlers (501-519, 600-602) now use a strict
+  `parseGeneratedRequestStrict` that fails closed with schema-shaped
+  `invalid_request` when clients append trailing bytes the schema does not
+  consume; default suite pins end-to-end trailing-byte rejection for every
+  AutoMQ extension key with preserved correlation IDs and throttle/error
+  prefix ordering.
   MetadataRequest generated decoding now preserves nullable `Topics` semantics:
   v1+ null requests all topics, explicit empty arrays request no topic results,
   and v0 null topics are rejected as malformed.
