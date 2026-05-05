@@ -455,7 +455,8 @@ Status: completed for the initial catalog and DeleteGroups slice.
   Controller-side trailing-byte coverage now also runs end-to-end through
   `Controller.handleRequest` for Vote, EndQuorumEpoch, UnregisterBroker,
   AddRaftVoter, RemoveRaftVoter, BrokerRegistration, BrokerHeartbeat,
-  AllocateProducerIds, and DescribeQuorum, asserting schema-shaped
+  AllocateProducerIds, DescribeQuorum, ControllerRegistration,
+  UpdateRaftVoter, and FetchSnapshot, asserting schema-shaped
   `invalid_request` responses with preserved correlation IDs and
   throttle/error prefixes. BrokerRegistration, BrokerHeartbeat,
   AllocateProducerIds, and DescribeQuorum now enforce

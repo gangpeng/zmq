@@ -4304,3 +4304,62 @@ test "Controller handleRequest DescribeQuorum rejects trailing bytes" {
 
     try expectControllerTrailingByteRejected(&ctrl, &buf, pos, 55, 0, 9108, false);
 }
+
+test "Controller handleRequest ControllerRegistration rejects trailing bytes" {
+    const Req = generated.controller_registration_request.ControllerRegistrationRequest;
+
+    var ctrl = Controller.init(testing.allocator, 1, "test-cluster");
+    defer ctrl.deinit();
+
+    var buf: [256]u8 = undefined;
+    var pos = buildTestRequest(&buf, 70, 0, 9109, 2);
+    const req = Req{
+        .controller_id = 1,
+        .incarnation_id = [_]u8{0} ** 16,
+        .zk_migration_ready = false,
+        .listeners = &.{},
+        .features = &.{},
+    };
+    req.serialize(&buf, &pos, 0);
+
+    try expectControllerTrailingByteRejected(&ctrl, &buf, pos, 70, 0, 9109, true);
+}
+
+test "Controller handleRequest UpdateRaftVoter rejects trailing bytes" {
+    const Req = generated.update_raft_voter_request.UpdateRaftVoterRequest;
+
+    var ctrl = Controller.init(testing.allocator, 1, "test-cluster");
+    defer ctrl.deinit();
+
+    var buf: [256]u8 = undefined;
+    var pos = buildTestRequest(&buf, 82, 0, 9110, 2);
+    const req = Req{
+        .cluster_id = null,
+        .voter_id = 3,
+        .voter_directory_id = [_]u8{0} ** 16,
+        .listeners = &.{},
+        .k_raft_version_feature = .{},
+    };
+    req.serialize(&buf, &pos, 0);
+
+    try expectControllerTrailingByteRejected(&ctrl, &buf, pos, 82, 0, 9110, true);
+}
+
+test "Controller handleRequest FetchSnapshot rejects trailing bytes" {
+    const Req = generated.fetch_snapshot_request.FetchSnapshotRequest;
+
+    var ctrl = Controller.init(testing.allocator, 1, "test-cluster");
+    defer ctrl.deinit();
+
+    var buf: [128]u8 = undefined;
+    var pos = buildTestRequest(&buf, 59, 0, 9111, 2);
+    const req = Req{
+        .cluster_id = null,
+        .replica_id = -1,
+        .max_bytes = 1024,
+        .topics = &.{},
+    };
+    req.serialize(&buf, &pos, 0);
+
+    try expectControllerTrailingByteRejected(&ctrl, &buf, pos, 59, 0, 9111, true);
+}
