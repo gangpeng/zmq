@@ -217,9 +217,13 @@ pub const Controller = struct {
             };
         }
 
+        const node_endpoints = self.collectVoteNodeEndpoints(api_version) catch &.{};
+        defer if (node_endpoints.len > 0) self.allocator.free(node_endpoints);
+
         const resp = Resp{
             .error_code = ErrorCode.none.toInt(),
             .topics = topics,
+            .node_endpoints = node_endpoints,
         };
         return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
     }
@@ -321,7 +325,10 @@ pub const Controller = struct {
             self.raft_state.election_timer.reset();
         }
 
-        const resp = Resp{ .error_code = ErrorCode.none.toInt(), .topics = &.{} };
+        const node_endpoints = self.collectEndQuorumEpochNodeEndpoints(api_version) catch &.{};
+        defer if (node_endpoints.len > 0) self.allocator.free(node_endpoints);
+
+        const resp = Resp{ .error_code = ErrorCode.none.toInt(), .topics = &.{}, .node_endpoints = node_endpoints };
         return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
     }
 
@@ -679,6 +686,38 @@ pub const Controller = struct {
 
     fn collectFetchSnapshotNodeEndpoints(self: *Controller, api_version: i16) ![]const generated.fetch_snapshot_response.FetchSnapshotResponse.NodeEndpoint {
         const NodeEndpoint = generated.fetch_snapshot_response.FetchSnapshotResponse.NodeEndpoint;
+        if (api_version < 1) return &.{};
+        const leader_id = self.raft_state.leader_id orelse return &.{};
+        const voter = self.raft_state.voters.get(leader_id) orelse return &.{};
+        const endpoint = chooseControllerEndpoint(voter.endpoints) orelse return &.{};
+
+        const endpoints = try self.allocator.alloc(NodeEndpoint, 1);
+        endpoints[0] = .{
+            .node_id = leader_id,
+            .host = endpoint.host,
+            .port = endpoint.port,
+        };
+        return endpoints;
+    }
+
+    fn collectVoteNodeEndpoints(self: *Controller, api_version: i16) ![]const generated.vote_response.VoteResponse.NodeEndpoint {
+        const NodeEndpoint = generated.vote_response.VoteResponse.NodeEndpoint;
+        if (api_version < 1) return &.{};
+        const leader_id = self.raft_state.leader_id orelse return &.{};
+        const voter = self.raft_state.voters.get(leader_id) orelse return &.{};
+        const endpoint = chooseControllerEndpoint(voter.endpoints) orelse return &.{};
+
+        const endpoints = try self.allocator.alloc(NodeEndpoint, 1);
+        endpoints[0] = .{
+            .node_id = leader_id,
+            .host = endpoint.host,
+            .port = endpoint.port,
+        };
+        return endpoints;
+    }
+
+    fn collectEndQuorumEpochNodeEndpoints(self: *Controller, api_version: i16) ![]const generated.end_quorum_epoch_response.EndQuorumEpochResponse.NodeEndpoint {
+        const NodeEndpoint = generated.end_quorum_epoch_response.EndQuorumEpochResponse.NodeEndpoint;
         if (api_version < 1) return &.{};
         const leader_id = self.raft_state.leader_id orelse return &.{};
         const voter = self.raft_state.voters.get(leader_id) orelse return &.{};
@@ -1950,7 +1989,12 @@ fn skipEndQuorumTopics(buf: []const u8, pos: *usize, flexible: bool) bool {
         const partition_count = readKafkaArrayCount(buf, pos, flexible) orelse return false;
         for (0..partition_count) |_| {
             if (!skipFixedBytes(buf, pos, 12)) return false; // partition_index + leader_id + leader_epoch
-            if (!skipKafkaI32Array(buf, pos, flexible)) return false; // preferred_successors
+            // preferred_successors is only present at v0; at v1+ it is replaced
+            // by preferred_candidates (parsed below). Match the generated
+            // serializer's per-version layout.
+            if (!flexible) {
+                if (!skipKafkaI32Array(buf, pos, false)) return false; // preferred_successors
+            }
             if (flexible and !skipEndQuorumPreferredCandidates(buf, pos)) return false;
             if (flexible) ser.skipTaggedFields(buf, pos) catch return false;
         }
@@ -4362,4 +4406,111 @@ test "Controller handleRequest FetchSnapshot rejects trailing bytes" {
     req.serialize(&buf, &pos, 0);
 
     try expectControllerTrailingByteRejected(&ctrl, &buf, pos, 59, 0, 9111, true);
+}
+
+test "Controller handleRequest Vote v1 populates leader node endpoint" {
+    const Req = generated.vote_request.VoteRequest;
+    const Resp = generated.vote_response.VoteResponse;
+
+    var ctrl = Controller.init(testing.allocator, 1, "test-cluster");
+    defer ctrl.deinit();
+    try makeTestControllerLeader(&ctrl);
+
+    const directory_id = [_]u8{9} ** 16;
+    const endpoint_views = [_]RaftState.VoterEndpointView{.{
+        .name = "CONTROLLER",
+        .host = "controller-1.example",
+        .port = 19193,
+    }};
+    _ = try ctrl.raft_state.proposeUpdateVoter(1, directory_id, &endpoint_views, 0, 1);
+    ctrl.raft_state.commit_index = ctrl.raft_state.log.lastOffset();
+    ctrl.raft_state.applyCommittedConfigs();
+
+    try ctrl.raft_state.addVoter(2);
+
+    var buf: [256]u8 = undefined;
+    var pos = buildTestRequest(&buf, 52, 1, 9200, header_mod.requestHeaderVersion(52, 1));
+    const partitions = [_]Req.TopicData.PartitionData{.{
+        .partition_index = 0,
+        .candidate_epoch = ctrl.raft_state.current_epoch + 1,
+        .candidate_id = 2,
+        .last_offset_epoch = 0,
+        .last_offset = 0,
+    }};
+    const topics = [_]Req.TopicData{.{ .topic_name = "__cluster_metadata", .partitions = &partitions }};
+    const req = Req{ .cluster_id = null, .voter_id = 1, .topics = &topics };
+    req.serialize(&buf, &pos, 1);
+
+    const response = ctrl.handleRequest(buf[0..pos]);
+    try testing.expect(response != null);
+    defer testing.allocator.free(response.?);
+
+    var rpos: usize = 0;
+    var resp_header = try ResponseHeader.deserialize(testing.allocator, response.?, &rpos, header_mod.responseHeaderVersion(52, 1));
+    defer resp_header.deinit(testing.allocator);
+    try testing.expectEqual(@as(i32, 9200), resp_header.correlation_id);
+
+    const resp = try Resp.deserialize(testing.allocator, response.?, &rpos, 1);
+    defer freeDeserializedVoteResponse(&resp);
+
+    try testing.expectEqual(@as(usize, 1), resp.node_endpoints.len);
+    try testing.expectEqual(@as(i32, 1), resp.node_endpoints[0].node_id);
+    try testing.expectEqualStrings("controller-1.example", resp.node_endpoints[0].host.?);
+    try testing.expectEqual(@as(u16, 19193), resp.node_endpoints[0].port);
+}
+
+test "Controller handleRequest EndQuorumEpoch v1 populates leader node endpoint" {
+    const Req = generated.end_quorum_epoch_request.EndQuorumEpochRequest;
+    const Resp = generated.end_quorum_epoch_response.EndQuorumEpochResponse;
+
+    var ctrl = Controller.init(testing.allocator, 1, "test-cluster");
+    defer ctrl.deinit();
+    try makeTestControllerLeader(&ctrl);
+
+    const directory_id = [_]u8{11} ** 16;
+    const endpoint_views = [_]RaftState.VoterEndpointView{.{
+        .name = "CONTROLLER",
+        .host = "controller-2.example",
+        .port = 19293,
+    }};
+    _ = try ctrl.raft_state.proposeUpdateVoter(1, directory_id, &endpoint_views, 0, 1);
+    ctrl.raft_state.commit_index = ctrl.raft_state.log.lastOffset();
+    ctrl.raft_state.applyCommittedConfigs();
+
+    var buf: [256]u8 = undefined;
+    var pos = buildTestRequest(&buf, 54, 1, 9201, header_mod.requestHeaderVersion(54, 1));
+    const partitions = [_]Req.TopicData.PartitionData{.{
+        .partition_index = 0,
+        .leader_id = 1,
+        .leader_epoch = ctrl.raft_state.current_epoch,
+        .preferred_successors = &.{},
+        .preferred_candidates = &.{},
+    }};
+    const topics = [_]Req.TopicData{.{ .topic_name = "__cluster_metadata", .partitions = &partitions }};
+    const req = Req{ .cluster_id = null, .topics = &topics };
+    req.serialize(&buf, &pos, 1);
+
+    const response = ctrl.handleRequest(buf[0..pos]);
+    try testing.expect(response != null);
+    defer testing.allocator.free(response.?);
+
+    var rpos: usize = 0;
+    var resp_header = try ResponseHeader.deserialize(testing.allocator, response.?, &rpos, header_mod.responseHeaderVersion(54, 1));
+    defer resp_header.deinit(testing.allocator);
+    try testing.expectEqual(@as(i32, 9201), resp_header.correlation_id);
+
+    const resp = try Resp.deserialize(testing.allocator, response.?, &rpos, 1);
+    defer {
+        for (resp.topics) |topic| {
+            if (topic.partitions.len > 0) testing.allocator.free(topic.partitions);
+        }
+        if (resp.topics.len > 0) testing.allocator.free(resp.topics);
+        if (resp.node_endpoints.len > 0) testing.allocator.free(resp.node_endpoints);
+    }
+
+    try testing.expectEqual(@as(i16, 0), resp.error_code);
+    try testing.expectEqual(@as(usize, 1), resp.node_endpoints.len);
+    try testing.expectEqual(@as(i32, 1), resp.node_endpoints[0].node_id);
+    try testing.expectEqualStrings("controller-2.example", resp.node_endpoints[0].host.?);
+    try testing.expectEqual(@as(u16, 19293), resp.node_endpoints[0].port);
 }

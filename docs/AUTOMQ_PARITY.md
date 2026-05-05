@@ -468,6 +468,11 @@ Status: completed for the initial catalog and DeleteGroups slice.
   per-validator coverage for Vote/EndQuorumEpoch/UnregisterBroker/
   AddRaftVoter/RemoveRaftVoter/UpdateRaftVoter/ControllerRegistration/
   FetchSnapshot.
+  Vote v1 and EndQuorumEpoch v1 responses now populate `node_endpoints`
+  with the current leader's controller listener, matching Kafka KIP-595
+  wire semantics. EndQuorumEpoch v1 frame validation no longer expects the
+  v0-only `preferred_successors` array; the validator now matches the
+  generated serializer's per-version layout.
   MetadataRequest generated decoding now preserves nullable `Topics` semantics:
   v1+ null requests all topics, explicit empty arrays request no topic results,
   and v0 null topics are rejected as malformed.
