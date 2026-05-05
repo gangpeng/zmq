@@ -4078,3 +4078,136 @@ test "Controller AllocateProducerIds increments monotonically" {
     // Second block starts after first
     try testing.expect(start2 >= start1 + 1000);
 }
+
+/// Builds a valid request, appends a trailing byte beyond the schema-encoded
+/// payload, and asserts the controller fails closed with the schema-shaped
+/// `invalid_request` error code instead of accepting partial reads.
+fn expectControllerTrailingByteRejected(
+    ctrl: *Controller,
+    buf: []u8,
+    pos: usize,
+    api_key: i16,
+    api_version: i16,
+    correlation_id: i32,
+    has_throttle_prefix: bool,
+) !void {
+    try testing.expect(pos < buf.len);
+    buf[pos] = 0x7f; // arbitrary non-zero trailing byte
+    const response = ctrl.handleRequest(buf[0 .. pos + 1]);
+    try testing.expect(response != null);
+    defer testing.allocator.free(response.?);
+
+    var rpos: usize = 0;
+    var resp_header = try ResponseHeader.deserialize(
+        testing.allocator,
+        response.?,
+        &rpos,
+        header_mod.responseHeaderVersion(api_key, api_version),
+    );
+    defer resp_header.deinit(testing.allocator);
+    try testing.expectEqual(correlation_id, resp_header.correlation_id);
+
+    if (has_throttle_prefix) {
+        if (rpos + 4 > response.?.len) return error.TestUnexpectedResult;
+        rpos += 4; // skip throttle_time_ms
+    }
+    if (rpos + 2 > response.?.len) return error.TestUnexpectedResult;
+    const error_code = ser.readI16(response.?, &rpos);
+    try testing.expectEqual(ErrorCode.invalid_request.toInt(), error_code);
+}
+
+test "Controller handleRequest Vote rejects trailing bytes" {
+    const Req = generated.vote_request.VoteRequest;
+
+    var ctrl = Controller.init(testing.allocator, 1, "test-cluster");
+    defer ctrl.deinit();
+    try ctrl.raft_state.addVoter(2);
+
+    var buf: [256]u8 = undefined;
+    var pos = buildTestRequest(&buf, 52, 0, 9100, 2);
+    const partitions = [_]Req.TopicData.PartitionData{.{
+        .partition_index = 0,
+        .candidate_epoch = 1,
+        .candidate_id = 2,
+        .last_offset_epoch = 0,
+        .last_offset = 0,
+    }};
+    const topics = [_]Req.TopicData{.{ .topic_name = "__cluster_metadata", .partitions = &partitions }};
+    const req = Req{ .cluster_id = null, .topics = &topics };
+    req.serialize(&buf, &pos, 0);
+
+    try expectControllerTrailingByteRejected(&ctrl, &buf, pos, 52, 0, 9100, false);
+}
+
+test "Controller handleRequest EndQuorumEpoch rejects trailing bytes" {
+    const Req = generated.end_quorum_epoch_request.EndQuorumEpochRequest;
+
+    var ctrl = Controller.init(testing.allocator, 1, "test-cluster");
+    defer ctrl.deinit();
+
+    var buf: [256]u8 = undefined;
+    var pos = buildTestRequest(&buf, 54, 0, 9101, 1);
+    const partitions = [_]Req.TopicData.PartitionData{.{
+        .partition_index = 0,
+        .leader_id = 2,
+        .leader_epoch = 1,
+        .preferred_successors = &.{},
+    }};
+    const topics = [_]Req.TopicData{.{ .topic_name = "__cluster_metadata", .partitions = &partitions }};
+    const req = Req{ .cluster_id = null, .topics = &topics };
+    req.serialize(&buf, &pos, 0);
+
+    try expectControllerTrailingByteRejected(&ctrl, &buf, pos, 54, 0, 9101, false);
+}
+
+test "Controller handleRequest UnregisterBroker rejects trailing bytes" {
+    const Req = generated.unregister_broker_request.UnregisterBrokerRequest;
+
+    var ctrl = Controller.init(testing.allocator, 1, "test-cluster");
+    defer ctrl.deinit();
+
+    var buf: [128]u8 = undefined;
+    var pos = buildTestRequest(&buf, 64, 0, 9102, 2);
+    const req = Req{ .broker_id = 100 };
+    req.serialize(&buf, &pos, 0);
+
+    try expectControllerTrailingByteRejected(&ctrl, &buf, pos, 64, 0, 9102, true);
+}
+
+test "Controller handleRequest AddRaftVoter rejects trailing bytes" {
+    const Req = generated.add_raft_voter_request.AddRaftVoterRequest;
+
+    var ctrl = Controller.init(testing.allocator, 1, "test-cluster");
+    defer ctrl.deinit();
+
+    var buf: [256]u8 = undefined;
+    var pos = buildTestRequest(&buf, 80, 0, 9103, 2);
+    const req = Req{
+        .cluster_id = null,
+        .timeout_ms = 1000,
+        .voter_id = 3,
+        .voter_directory_id = [_]u8{0} ** 16,
+        .listeners = &.{},
+    };
+    req.serialize(&buf, &pos, 0);
+
+    try expectControllerTrailingByteRejected(&ctrl, &buf, pos, 80, 0, 9103, true);
+}
+
+test "Controller handleRequest RemoveRaftVoter rejects trailing bytes" {
+    const Req = generated.remove_raft_voter_request.RemoveRaftVoterRequest;
+
+    var ctrl = Controller.init(testing.allocator, 1, "test-cluster");
+    defer ctrl.deinit();
+
+    var buf: [128]u8 = undefined;
+    var pos = buildTestRequest(&buf, 81, 0, 9104, 2);
+    const req = Req{
+        .cluster_id = null,
+        .voter_id = 3,
+        .voter_directory_id = [_]u8{0} ** 16,
+    };
+    req.serialize(&buf, &pos, 0);
+
+    try expectControllerTrailingByteRejected(&ctrl, &buf, pos, 81, 0, 9104, true);
+}

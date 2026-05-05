@@ -452,6 +452,11 @@ Status: completed for the initial catalog and DeleteGroups slice.
   Source-level audits now fail the default suite if broker or controller
   request-frame validators accept trailing bytes, with only the documented
   BeginQuorumEpoch internal AppendEntries bridge exempted.
+  Controller-side trailing-byte coverage now also runs end-to-end through
+  `Controller.handleRequest` for Vote, EndQuorumEpoch, UnregisterBroker,
+  AddRaftVoter, and RemoveRaftVoter, asserting schema-shaped
+  `invalid_request` responses with preserved correlation IDs and
+  throttle/error prefixes.
   MetadataRequest generated decoding now preserves nullable `Topics` semantics:
   v1+ null requests all topics, explicit empty arrays request no topic results,
   and v0 null topics are rejected as malformed.
