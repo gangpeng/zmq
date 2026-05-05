@@ -22,6 +22,7 @@ Usage:
   docker compose up -d                 # Start cluster first
   ZMQ_RUN_E2E_TESTS=1 python3 tests/e2e_test.py
   python3 tests/e2e_test.py --self-test
+  python3 tests/e2e_test.py --load-scale-fixture apply
   docker compose down -v               # Cleanup
 
 Optional cross-broker chaos environment:
@@ -36,6 +37,11 @@ Optional cross-broker chaos environment:
   ZMQ_E2E_LOAD_SCALE_<PHASE>_APPLY / RESTORE
                                       phase-specific scale/load hooks
   ZMQ_E2E_REQUIRED_LOAD_SCALE_PHASES   fail if matrix omits required phases
+  ZMQ_E2E_LOAD_SCALE_FIXTURE_NODE      node stopped/started by fixture (node0)
+  ZMQ_E2E_LOAD_SCALE_FIXTURE_PRODUCER_NODE
+                                      node used by fixture marker produce (node1)
+  ZMQ_E2E_LOAD_SCALE_FIXTURE_LOAD_RECORDS
+                                      record count for fixture load phase
 
 Hook context:
   ZMQ_E2E_TOPIC                        active test topic for the phase
@@ -614,6 +620,17 @@ def split_csv(raw):
     return [item.strip() for item in raw.split(",") if item.strip()]
 
 
+def cli_arg_value(name):
+    for index, arg in enumerate(sys.argv):
+        if arg == name:
+            if index + 1 >= len(sys.argv):
+                raise AssertionError(f"{name} requires a value")
+            return sys.argv[index + 1]
+        if arg.startswith(name + "="):
+            return arg[len(name) + 1:]
+    return None
+
+
 def env_phase_token(name):
     token = []
     for ch in name.upper():
@@ -882,6 +899,175 @@ def run_e2e_load_scale_hook(label, command, env):
         raise AssertionError(f"{label} failed with exit code {proc.returncode}\n{proc.stdout}")
 
 
+def parse_named_map(raw, var_name):
+    if not raw:
+        raise AssertionError(f"{var_name} is required")
+    result = {}
+    for item in split_csv(raw):
+        if ":" not in item:
+            raise AssertionError(f"{var_name} entry {item!r} must be name:value")
+        name, value = item.split(":", 1)
+        name = name.strip()
+        value = value.strip()
+        if not name or not value:
+            raise AssertionError(f"{var_name} entry {item!r} must be name:value")
+        result[name] = value
+    if not result:
+        raise AssertionError(f"{var_name} did not contain any entries")
+    return result
+
+
+def parse_named_ports(raw, var_name):
+    values = parse_named_map(raw, var_name)
+    ports = {}
+    for name, value in values.items():
+        try:
+            port = int(value)
+        except ValueError as exc:
+            raise AssertionError(f"{var_name} entry {name}:{value} has invalid port") from exc
+        if port <= 0 or port > 65535:
+            raise AssertionError(f"{var_name} entry {name}:{value} has invalid port")
+        ports[name] = port
+    return ports
+
+
+def e2e_load_scale_fixture_env(phase_name, key, default=None):
+    token = env_phase_token(phase_name)
+    return (
+        os.environ.get(f"ZMQ_E2E_LOAD_SCALE_{token}_FIXTURE_{key}")
+        or os.environ.get(f"ZMQ_E2E_LOAD_SCALE_FIXTURE_{key}")
+        or default
+    )
+
+
+def e2e_load_scale_fixture_payload(kind, phase_name, phase_index):
+    suffix = "applied" if kind == "apply" else "restored"
+    return f"e2e-load-scale-{suffix}-{phase_index}-{phase_name}".encode()
+
+
+def docker_container_running(container):
+    proc = subprocess.run(
+        ["docker", "inspect", "-f", "{{.State.Running}}", container],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        timeout=30,
+    )
+    if proc.returncode != 0:
+        raise AssertionError(f"docker inspect {container} failed\n{proc.stdout}")
+    return proc.stdout.strip().lower() == "true"
+
+
+def run_docker_container_command(action, container):
+    proc = subprocess.run(
+        ["docker", action, container],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        timeout=60,
+    )
+    if proc.returncode != 0:
+        raise AssertionError(f"docker {action} {container} failed\n{proc.stdout}")
+
+
+def wait_for_broker_port(port, should_be_up, timeout=45):
+    deadline = time.time() + timeout
+    last_detail = ""
+    while time.time() < deadline:
+        try:
+            with socket.create_connection(("127.0.0.1", port), timeout=2) as sock:
+                sock.settimeout(3)
+                n = api_versions(sock, int(time.time() * 1000) & 0x7fffffff)
+            if should_be_up and n >= 10:
+                return
+            last_detail = f"broker accepted connection with {n} APIs"
+        except Exception as exc:
+            if not should_be_up:
+                return
+            last_detail = str(exc)
+        time.sleep(1)
+    state = "up" if should_be_up else "down"
+    raise AssertionError(f"broker port {port} did not become {state}: {last_detail}")
+
+
+def produce_fixture_payload(port, topic, payload, retries=20):
+    last_detail = ""
+    for attempt in range(retries):
+        try:
+            with socket.create_connection(("127.0.0.1", port), timeout=5) as sock:
+                sock.settimeout(5)
+                err, off = produce(sock, 700000 + attempt, topic, 0, payload)
+            if err == 0:
+                return off
+            last_detail = f"produce err={err}"
+        except Exception as exc:
+            last_detail = str(exc)
+        time.sleep(0.5)
+    raise AssertionError(f"fixture could not produce payload to {port}: {last_detail}")
+
+
+def run_load_scale_fixture(kind):
+    if kind not in ("apply", "restore"):
+        raise AssertionError("--load-scale-fixture must be apply or restore")
+
+    phase_name = os.environ.get("ZMQ_E2E_LOAD_SCALE_PHASE")
+    if not phase_name:
+        raise AssertionError("ZMQ_E2E_LOAD_SCALE_PHASE is required")
+    try:
+        phase_index = int(os.environ.get("ZMQ_E2E_LOAD_SCALE_PHASE_INDEX", "0"))
+    except ValueError as exc:
+        raise AssertionError("ZMQ_E2E_LOAD_SCALE_PHASE_INDEX must be an integer") from exc
+    topic = os.environ.get("ZMQ_E2E_TOPIC")
+    if not topic:
+        raise AssertionError("ZMQ_E2E_TOPIC is required")
+
+    broker_ports = parse_named_ports(os.environ.get("ZMQ_E2E_BROKER_PORTS"), "ZMQ_E2E_BROKER_PORTS")
+    containers = parse_named_map(os.environ.get("ZMQ_E2E_CONTAINERS"), "ZMQ_E2E_CONTAINERS")
+    action = e2e_load_scale_fixture_env(phase_name, "ACTION", phase_name).lower()
+    target_node = e2e_load_scale_fixture_env(phase_name, "NODE", "node0")
+    producer_node = e2e_load_scale_fixture_env(phase_name, "PRODUCER_NODE", "node1")
+    dry_run = e2e_load_scale_fixture_env(phase_name, "DRY_RUN", "0") == "1"
+
+    if target_node not in broker_ports or target_node not in containers:
+        raise AssertionError(f"unknown fixture target node {target_node!r}")
+    if producer_node not in broker_ports:
+        raise AssertionError(f"unknown fixture producer node {producer_node!r}")
+
+    if action == "scale-in":
+        if kind == "apply":
+            if not dry_run and docker_container_running(containers[target_node]):
+                run_docker_container_command("stop", containers[target_node])
+                wait_for_broker_port(broker_ports[target_node], should_be_up=False, timeout=20)
+        else:
+            if not dry_run and not docker_container_running(containers[target_node]):
+                run_docker_container_command("start", containers[target_node])
+            if not dry_run:
+                wait_for_broker_port(broker_ports[target_node], should_be_up=True, timeout=60)
+    elif action == "scale-out":
+        if kind == "apply":
+            if not dry_run and not docker_container_running(containers[target_node]):
+                run_docker_container_command("start", containers[target_node])
+            if not dry_run:
+                wait_for_broker_port(broker_ports[target_node], should_be_up=True, timeout=60)
+    elif action == "load":
+        if kind == "apply" and not dry_run:
+            records = int(e2e_load_scale_fixture_env(phase_name, "LOAD_RECORDS", "30"))
+            for index in range(records):
+                node_names = sorted(broker_ports)
+                node_name = node_names[index % len(node_names)]
+                payload = f"e2e-load-scale-load-{phase_index}-{index}".encode()
+                produce_fixture_payload(broker_ports[node_name], topic, payload, retries=6)
+    elif action not in ("probe", "noop"):
+        raise AssertionError(f"unknown load/scale fixture action {action!r}")
+
+    if not dry_run:
+        marker = e2e_load_scale_fixture_payload(kind, phase_name, phase_index)
+        produce_fixture_payload(broker_ports[producer_node], topic, marker)
+
+    print(f"ok: load/scale fixture {kind} phase={phase_name} action={action} dry_run={dry_run}")
+    return 0
+
+
 def run_e2e_load_scale_phases(t, topic):
     phases = selected_e2e_load_scale_phases()
     if not phases:
@@ -975,6 +1161,7 @@ def self_test():
         os.environ.pop("ZMQ_E2E_LOAD_SCALE_APPLY", None)
         os.environ.pop("ZMQ_E2E_LOAD_SCALE_RESTORE", None)
         os.environ.pop("ZMQ_E2E_LOAD_SCALE_MATRIX", None)
+        os.environ.pop("ZMQ_E2E_LOAD_SCALE_FIXTURE_DRY_RUN", None)
         if selected_e2e_chaos_phases() != []:
             raise AssertionError("E2E chaos phases unexpectedly configured")
         if selected_e2e_load_scale_phases() != []:
@@ -1058,6 +1245,26 @@ def self_test():
             raise AssertionError("E2E load/scale MinIO context failed")
         run_e2e_load_scale_hook("self-test:apply", load_scale_phases[1]["apply"], load_env)
         run_e2e_load_scale_hook("self-test:restore", load_scale_phases[1]["restore"], load_env)
+
+        expected_apply_payload = e2e_load_scale_fixture_payload("apply", "scale-in", 1)
+        expected_restore_payload = e2e_load_scale_fixture_payload("restore", "scale-in", 1)
+        if expected_apply_payload != b"e2e-load-scale-applied-1-scale-in":
+            raise AssertionError("E2E load/scale apply fixture payload drifted")
+        if expected_restore_payload != b"e2e-load-scale-restored-1-scale-in":
+            raise AssertionError("E2E load/scale restore fixture payload drifted")
+
+        fixture_command_base = f"{shlex.quote(sys.executable)} {shlex.quote(__file__)} --load-scale-fixture"
+        load_env["ZMQ_E2E_LOAD_SCALE_FIXTURE_DRY_RUN"] = "1"
+        run_e2e_load_scale_hook(
+            "self-test:fixture-apply",
+            f"{fixture_command_base} apply",
+            load_env,
+        )
+        run_e2e_load_scale_hook(
+            "self-test:fixture-restore",
+            f"{fixture_command_base} restore",
+            load_env,
+        )
     finally:
         os.environ.clear()
         os.environ.update(old_env)
@@ -1071,6 +1278,9 @@ def self_test():
 # ---------------------------------------------------------------
 
 def main():
+    load_scale_fixture_kind = cli_arg_value("--load-scale-fixture")
+    if load_scale_fixture_kind is not None:
+        return run_load_scale_fixture(load_scale_fixture_kind)
     if "--self-test" in sys.argv:
         return self_test()
     if not RUN_ENABLED:
