@@ -40,6 +40,12 @@ pub fn registerBrokerMetrics(registry: *MetricRegistry) !void {
     try registry.registerGauge("Kafka_partition_count", "AutoMQ-compatible local partition count");
     try registry.registerGauge("Kafka_partition_total_count", "AutoMQ-compatible cluster partition count");
     try registry.registerGauge("kafka_controller_kafkacontroller_activecontrollercount", "JMX-compatible active controller count");
+    try registry.registerGauge("kafka_controller_kafkacontroller_globaltopiccount", "JMX-compatible cluster-wide topic count observed by the controller");
+    try registry.registerGauge("kafka_controller_kafkacontroller_globalpartitioncount", "JMX-compatible cluster-wide partition count observed by the controller");
+    try registry.registerGauge("kafka_controller_kafkacontroller_offlinepartitionscount", "JMX-compatible offline partition count observed by the controller");
+    try registry.registerGauge("kafka_controller_kafkacontroller_preferredreplicaimbalancecount", "JMX-compatible count of partitions whose current leader is not the preferred replica");
+    try registry.registerGauge("kafka_log_logmanager_offlinelogdirectorycount", "JMX-compatible offline log directory count");
+    try registry.registerCounter("kafka_server_replicamanager_failedisrupdatesperseccount_total", "JMX-compatible total failed ISR update events");
     try registry.registerGauge("kafka_server_kafkaserver_brokerstate", "JMX-compatible broker lifecycle state");
     try registry.registerGauge("kafka_server_kafkarequesthandlerpool_requesthandleravgidlepercent", "JMX-compatible request handler idle fraction");
     try registry.registerGauge("kafka_network_socketserver_networkprocessoravgidlepercent", "JMX-compatible network processor idle fraction");
@@ -231,6 +237,12 @@ test "registerBrokerMetrics" {
     try testing.expect(registry.gauges.contains("Kafka_partition_count"));
     try testing.expect(registry.gauges.contains("Kafka_partition_total_count"));
     try testing.expect(registry.gauges.contains("kafka_controller_kafkacontroller_activecontrollercount"));
+    try testing.expect(registry.gauges.contains("kafka_controller_kafkacontroller_globaltopiccount"));
+    try testing.expect(registry.gauges.contains("kafka_controller_kafkacontroller_globalpartitioncount"));
+    try testing.expect(registry.gauges.contains("kafka_controller_kafkacontroller_offlinepartitionscount"));
+    try testing.expect(registry.gauges.contains("kafka_controller_kafkacontroller_preferredreplicaimbalancecount"));
+    try testing.expect(registry.gauges.contains("kafka_log_logmanager_offlinelogdirectorycount"));
+    try testing.expect(registry.counters.contains("kafka_server_replicamanager_failedisrupdatesperseccount_total"));
     try testing.expect(registry.gauges.contains("kafka_server_kafkaserver_brokerstate"));
     try testing.expect(registry.gauges.contains("kafka_server_kafkarequesthandlerpool_requesthandleravgidlepercent"));
     try testing.expect(registry.gauges.contains("kafka_network_socketserver_networkprocessoravgidlepercent"));

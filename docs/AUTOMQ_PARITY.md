@@ -168,11 +168,17 @@ epochs.
 Latest default-suite observability tranche: JMX-compatible broker-state,
 request-handler idle, network-processor idle, request-channel queue,
 delayed-operation purgatory, reassigning-partition, and min-ISR gauges are
-registered and emitted from broker tick state. Checked-in Grafana and
-Prometheus fixtures now reference these metrics, including broker-not-running,
-low-idle, request-channel backlog, under-min-ISR, stuck-reassignment, and
-delayed-fetch purgatory alerts, and default readiness tests fail if the
-artifacts drift from the registered metric corpus.
+registered and emitted from broker tick state. Additional JMX-compatible
+controller-side gauges (`globaltopiccount`, `globalpartitioncount`,
+`offlinepartitionscount`, `preferredreplicaimbalancecount`),
+`kafka_log_logmanager_offlinelogdirectorycount`, and the
+`kafka_server_replicamanager_failedisrupdatesperseccount_total` counter are
+now registered and the gauges emit from broker tick state with default-suite
+coverage. Checked-in Grafana and Prometheus fixtures now reference these
+metrics, including broker-not-running, low-idle, request-channel backlog,
+under-min-ISR, stuck-reassignment, and delayed-fetch purgatory alerts, and
+default readiness tests fail if the artifacts drift from the registered
+metric corpus.
 
 ## Execution Plan
 

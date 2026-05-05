@@ -1203,6 +1203,15 @@ pub const Broker = struct {
         self.metrics.setGauge("Kafka_partition_count", @floatFromInt(partition_count));
         self.metrics.setGauge("Kafka_partition_total_count", @floatFromInt(partition_count));
         self.metrics.setGauge("kafka_controller_kafkacontroller_activecontrollercount", active_controller_count);
+        // Cluster-wide JMX gauges. In single-broker deployments these mirror the
+        // local topic/partition counts; multi-broker controllers will replace
+        // these with quorum-aggregated values when broker registry replication
+        // covers cross-broker topic state.
+        self.metrics.setGauge("kafka_controller_kafkacontroller_globaltopiccount", @floatFromInt(topic_count));
+        self.metrics.setGauge("kafka_controller_kafkacontroller_globalpartitioncount", @floatFromInt(partition_count));
+        self.metrics.setGauge("kafka_controller_kafkacontroller_offlinepartitionscount", 0.0);
+        self.metrics.setGauge("kafka_controller_kafkacontroller_preferredreplicaimbalancecount", 0.0);
+        self.metrics.setGauge("kafka_log_logmanager_offlinelogdirectorycount", 0.0);
         self.metrics.setGauge("kafka_server_kafkaserver_brokerstate", broker_state);
         self.metrics.setGauge("kafka_server_kafkarequesthandlerpool_requesthandleravgidlepercent", 1.0);
         self.metrics.setGauge("kafka_network_socketserver_networkprocessoravgidlepercent", 1.0);
@@ -54857,6 +54866,11 @@ test "Broker tick exports AutoMQ-compatible broker gauges" {
     try testing.expectEqual(@as(f64, 0.0), broker.metrics.gauges.get("kafka_server_replicamanager_offlinepartitionscount").?.value);
     try testing.expectEqual(@as(f64, 1.0), broker.metrics.gauges.get("kafka_server_replicamanager_reassigningpartitions").?.value);
     try testing.expectEqual(@as(f64, 0.0), broker.metrics.gauges.get("kafka_controller_kafkacontroller_activecontrollercount").?.value);
+    try testing.expectEqual(@as(f64, 2.0), broker.metrics.gauges.get("kafka_controller_kafkacontroller_globaltopiccount").?.value);
+    try testing.expectEqual(@as(f64, 4.0), broker.metrics.gauges.get("kafka_controller_kafkacontroller_globalpartitioncount").?.value);
+    try testing.expectEqual(@as(f64, 0.0), broker.metrics.gauges.get("kafka_controller_kafkacontroller_offlinepartitionscount").?.value);
+    try testing.expectEqual(@as(f64, 0.0), broker.metrics.gauges.get("kafka_controller_kafkacontroller_preferredreplicaimbalancecount").?.value);
+    try testing.expectEqual(@as(f64, 0.0), broker.metrics.gauges.get("kafka_log_logmanager_offlinelogdirectorycount").?.value);
     try testing.expectEqual(@as(f64, 3.0), broker.metrics.gauges.get("kafka_server_kafkaserver_brokerstate").?.value);
     try testing.expectEqual(@as(f64, 1.0), broker.metrics.gauges.get("kafka_server_kafkarequesthandlerpool_requesthandleravgidlepercent").?.value);
     try testing.expectEqual(@as(f64, 1.0), broker.metrics.gauges.get("kafka_network_socketserver_networkprocessoravgidlepercent").?.value);
