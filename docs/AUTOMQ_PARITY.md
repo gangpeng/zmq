@@ -174,11 +174,15 @@ controller-side gauges (`globaltopiccount`, `globalpartitioncount`,
 `kafka_log_logmanager_offlinelogdirectorycount`, and the
 `kafka_server_replicamanager_failedisrupdatesperseccount_total` counter are
 now registered and the gauges emit from broker tick state with default-suite
-coverage. Checked-in Grafana and Prometheus fixtures now reference these
+coverage. The ISR shrink and failed-ISR-update counters now also increment
+when the local FailoverController fences nodes during broker tick.
+Checked-in Grafana and Prometheus fixtures now reference these
 metrics, including broker-not-running, low-idle, request-channel backlog,
-under-min-ISR, stuck-reassignment, and delayed-fetch purgatory alerts, and
-default readiness tests fail if the artifacts drift from the registered
-metric corpus.
+under-min-ISR, stuck-reassignment, delayed-fetch purgatory, offline log
+directory, controller offline partition, and preferred-replica imbalance
+alerts, and default readiness tests fail if the artifacts drift from the
+registered metric corpus. Default-suite Prometheus export coverage pins
+HELP/TYPE headers and value rendering for the new JMX gauges and counter.
 
 ## Execution Plan
 

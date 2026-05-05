@@ -1181,6 +1181,12 @@ pub const Broker = struct {
                 if (self.store.s3_wal_batcher) |*batcher| {
                     batcher.setEpoch(self.failover_controller.wal_epoch);
                 }
+                // Each fenced broker shrinks the in-sync replica set for any
+                // partitions it owned. Mirror that as an ISR shrink event in the
+                // JMX-compatible counter so dashboards can detect failover bursts.
+                const failovers_f: u64 = @intCast(failovers);
+                self.metrics.addCounter("kafka_server_replicamanager_isrshrinks_total", failovers_f);
+                self.metrics.addCounter("kafka_server_replicamanager_failedisrupdatesperseccount_total", failovers_f);
             }
         }
 
@@ -43665,6 +43671,29 @@ test "Broker tick does not run local failover under multi-node KRaft ownership" 
     try testing.expectEqual(@as(?i32, 2), broker.failover_controller.findPartitionOwner("kraft-owned", 0));
     try testing.expectEqual(@as(usize, 1), broker.failover_controller.nodePartitionCount(2));
     try testing.expect(!broker.failover_controller.known_nodes.get(2).?.is_fenced);
+}
+
+test "Broker tick increments JMX ISR shrink counter when failover fences a node" {
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+
+    try broker.failover_controller.registerNode(1);
+    try broker.failover_controller.registerNode(2);
+    try broker.failover_controller.registerPartitionOwner("isr-shrink-topic", 0, 2);
+    if (broker.failover_controller.known_nodes.getPtr(2)) |state| {
+        state.last_heartbeat_ms = 0; // force timeout
+    }
+
+    const initial_shrinks = if (broker.metrics.counters.get("kafka_server_replicamanager_isrshrinks_total")) |c| c.value else 0;
+    const initial_failed = if (broker.metrics.counters.get("kafka_server_replicamanager_failedisrupdatesperseccount_total")) |c| c.value else 0;
+
+    broker.tick();
+
+    const after_shrinks = broker.metrics.counters.get("kafka_server_replicamanager_isrshrinks_total").?.value;
+    const after_failed = broker.metrics.counters.get("kafka_server_replicamanager_failedisrupdatesperseccount_total").?.value;
+    try testing.expect(after_shrinks > initial_shrinks);
+    try testing.expect(after_failed > initial_failed);
+    try testing.expect(broker.failover_controller.known_nodes.get(2).?.is_fenced);
 }
 
 test "Broker rejects stale auto-balancer plan before mutating reassignment state" {

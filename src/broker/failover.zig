@@ -76,16 +76,19 @@ pub const FailoverController = struct {
         }
     }
 
-    /// Record a heartbeat from a node.
-    pub fn recordHeartbeat(self: *FailoverController, nid: i32) void {
+    /// Record a heartbeat from a node. Returns true if this heartbeat
+    /// un-fenced a previously fenced node (an ISR-expand-equivalent event).
+    pub fn recordHeartbeat(self: *FailoverController, nid: i32) bool {
         if (self.known_nodes.getPtr(nid)) |state| {
             const was_fenced = state.is_fenced;
             state.last_heartbeat_ms = @import("time_compat").milliTimestamp();
             state.is_fenced = false;
             if (was_fenced) {
                 log.info("Node {d} un-fenced after heartbeat", .{nid});
+                return true;
             }
         }
+        return false;
     }
 
     /// Record the node that currently owns a partition. Topic names are copied
@@ -288,7 +291,7 @@ test "FailoverController heartbeat prevents failover" {
     defer fc.deinit();
 
     try fc.registerNode(1);
-    fc.recordHeartbeat(1);
+    _ = fc.recordHeartbeat(1);
 
     // Tick with current time — node 1 just heartbeated, no failover
     const now = @import("time_compat").milliTimestamp();
@@ -466,7 +469,7 @@ test "FailoverController heartbeat un-fences previously fenced node" {
     }
 
     // Heartbeat should un-fence
-    fc.recordHeartbeat(1);
+    _ = fc.recordHeartbeat(1);
     if (fc.known_nodes.get(1)) |state| {
         try testing.expect(!state.is_fenced);
     }
