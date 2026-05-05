@@ -10,6 +10,10 @@ const ResponseHeader = header_mod.ResponseHeader;
 const RaftClientPool = @import("network").RaftClientPool;
 const TlsClientContext = @import("security").tls.TlsClientContext;
 
+fn monotonicMs() i64 {
+    return @intCast(@import("time_compat").monotonicMilliTimestamp());
+}
+
 /// MetadataClient connects a broker-only node to the controller quorum.
 ///
 /// Responsibilities:
@@ -44,7 +48,8 @@ pub const MetadataClient = struct {
     /// Set to true when the controller heartbeat says we are fenced.
     is_fenced: *bool,
     /// Pointer to the Broker's last_successful_heartbeat_ms field.
-    /// Updated on each successful heartbeat for staleness detection.
+    /// Updated on each successful heartbeat with monotonic milliseconds for
+    /// controller-lease staleness detection.
     last_heartbeat_ms: *i64,
     /// Broker epoch assigned by the controller on registration.
     broker_epoch: i64 = 0,
@@ -205,6 +210,10 @@ pub const MetadataClient = struct {
         if (resp.nodes.len > 0) self.allocator.free(resp.nodes);
     }
 
+    fn controllerLeaseExpired(self: *const MetadataClient, now_ms: i64) bool {
+        return self.last_heartbeat_ms.* > 0 and (now_ms - self.last_heartbeat_ms.*) > self.controller_lease_ms;
+    }
+
     /// Register this broker with the controller leader.
     fn registerWithController(self: *MetadataClient) void {
         const Req = generated.broker_registration_request.BrokerRegistrationRequest;
@@ -272,8 +281,8 @@ pub const MetadataClient = struct {
 
         // Staleness check: if no successful heartbeat within lease period,
         // self-fence to prevent split-brain writes during network partition.
-        const now = @import("time_compat").milliTimestamp();
-        if (self.last_heartbeat_ms.* > 0 and (now - self.last_heartbeat_ms.*) > self.controller_lease_ms) {
+        const now = monotonicMs();
+        if (self.controllerLeaseExpired(now)) {
             if (!self.is_fenced.*) {
                 log.warn("Controller lease expired ({d}ms since last heartbeat), self-fencing broker", .{
                     now - self.last_heartbeat_ms.*,
@@ -352,7 +361,7 @@ pub const MetadataClient = struct {
                     log.info("Controller unfenced this broker (id={d}), resuming writes", .{self.broker_id});
                 }
                 self.is_fenced.* = false;
-                self.last_heartbeat_ms.* = @import("time_compat").milliTimestamp();
+                self.last_heartbeat_ms.* = monotonicMs();
             }
 
             if (resp.should_shut_down) {
@@ -378,7 +387,7 @@ test "MetadataClient staleness detection fences broker" {
     var cached_broker_epoch: i64 = 0;
     const local_replica_directory_ids: []const [16]u8 = &.{};
     var is_fenced: bool = false;
-    var last_hb: i64 = @import("time_compat").milliTimestamp() - 60_000; // 60s ago
+    var last_hb: i64 = monotonicMs() - 60_000; // 60s ago
     var should_stop: bool = false;
 
     var mc = MetadataClient.init(
@@ -402,8 +411,7 @@ test "MetadataClient staleness detection fences broker" {
     // and lease 10s, the broker should be fenced.
     // Since there's no leader_id, it will try discoverLeader which loops,
     // so we test the staleness logic directly.
-    const now = @import("time_compat").milliTimestamp();
-    if (last_hb > 0 and (now - last_hb) > mc.controller_lease_ms) {
+    if (mc.controllerLeaseExpired(monotonicMs())) {
         is_fenced = true;
     }
     try testing.expect(is_fenced);
@@ -414,7 +422,7 @@ test "MetadataClient fresh heartbeat prevents fencing" {
     var cached_broker_epoch: i64 = 0;
     const local_replica_directory_ids: []const [16]u8 = &.{};
     var is_fenced: bool = false;
-    var last_hb: i64 = @import("time_compat").milliTimestamp(); // Just now
+    var last_hb: i64 = monotonicMs(); // Just now
     var should_stop: bool = false;
 
     var mc = MetadataClient.init(
@@ -434,8 +442,7 @@ test "MetadataClient fresh heartbeat prevents fencing" {
     mc.controller_lease_ms = 30_000;
 
     // Fresh heartbeat — should NOT be fenced
-    const now = @import("time_compat").milliTimestamp();
-    if (last_hb > 0 and (now - last_hb) > mc.controller_lease_ms) {
+    if (mc.controllerLeaseExpired(monotonicMs())) {
         is_fenced = true;
     }
     try testing.expect(!is_fenced);
@@ -465,9 +472,7 @@ test "MetadataClient zero last_heartbeat skips staleness check" {
 
     // With last_hb == 0, staleness check should be skipped
     // (broker just started, hasn't registered yet)
-    const now = @import("time_compat").milliTimestamp();
-    _ = now;
-    if (last_hb > 0 and (@import("time_compat").milliTimestamp() - last_hb) > mc.controller_lease_ms) {
+    if (mc.controllerLeaseExpired(monotonicMs())) {
         is_fenced = true;
     }
     try testing.expect(!is_fenced);

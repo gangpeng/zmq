@@ -20,6 +20,10 @@ const stream_mod = storage.stream;
 const ObjectManager = stream_mod.ObjectManager;
 const log = std.log.scoped(.partition_store);
 
+fn monotonicMs() i64 {
+    return @intCast(@import("time_compat").monotonicMilliTimestamp());
+}
+
 /// Topic-partition storage engine.
 ///
 /// Multi-tier storage pipeline:
@@ -56,7 +60,7 @@ pub const PartitionStore = struct {
     use_filesystem: bool,
     /// S3 WAL mode: when true, produce acks only after S3 write completes.
     s3_wal_mode: bool = false,
-    /// Last time this process refreshed ObjectManager state from shared S3 WAL
+    /// Last monotonic time this process refreshed ObjectManager state from shared S3 WAL
     /// objects. This keeps the hot produce path from listing S3 on every batch.
     last_s3_wal_recovery_ms: i64 = 0,
 
@@ -163,17 +167,15 @@ pub const PartitionStore = struct {
             try wal.open();
             // Replay partition-aware WAL records into LogCache so locally
             // acknowledged filesystem WAL data remains fetchable after restart.
-            _ = wal.recoverWithContext(self, struct {
+            _ = try wal.recoverStrictWithContext(self, struct {
                 fn cb(store: *PartitionStore, data: []const u8, _: u64) !void {
-                    const decoded = PartitionStore.decodeFilesystemWalRecord(data) orelse return;
+                    const decoded = PartitionStore.decodeFilesystemWalRecord(data) orelse return error.InvalidFilesystemWalRecord;
                     const stream_id = PartitionStore.hashPartitionKey(decoded.topic, decoded.partition_id);
                     const owned = try store.allocator.dupe(u8, decoded.records);
                     errdefer store.allocator.free(owned);
                     try store.cache.putOwned(stream_id, decoded.base_offset, owned);
                 }
-            }.cb) catch |err| {
-                log.warn("WAL recovery failed: {}", .{err});
-            };
+            }.cb);
         }
         // Ensure S3 bucket exists (retry a few times for container startup)
         if (self.s3_client) |*client| {
@@ -288,7 +290,7 @@ pub const PartitionStore = struct {
         if (!self.s3_wal_mode) return false;
         if (self.object_manager == null or self.s3_storage == null) return false;
 
-        const now_ms = @import("time_compat").milliTimestamp();
+        const now_ms = monotonicMs();
         if (!force and self.last_s3_wal_recovery_ms > 0 and now_ms - self.last_s3_wal_recovery_ms < 250) {
             return false;
         }
@@ -539,11 +541,24 @@ pub const PartitionStore = struct {
         }
         // Only allocate on the heap for the actual insertion
         const key = try self.partitionKey(topic, partition_id);
+        var key_owned = true;
+        errdefer if (key_owned) self.allocator.free(key);
         const topic_copy = try self.allocator.dupe(u8, topic);
+        var topic_copy_owned = true;
+        errdefer if (topic_copy_owned) self.allocator.free(topic_copy);
         try self.partitions.put(key, .{
             .topic = topic_copy,
             .partition_id = partition_id,
         });
+        key_owned = false;
+        topic_copy_owned = false;
+        var partition_inserted = true;
+        errdefer if (partition_inserted) {
+            if (self.partitions.fetchRemove(key)) |removed| {
+                self.allocator.free(removed.value.topic);
+                self.allocator.free(removed.key);
+            }
+        };
 
         // Create a Stream in ObjectManager for this partition
         if (self.object_manager) |om| {
@@ -551,9 +566,11 @@ pub const PartitionStore = struct {
             if (om.getStream(stream_id) == null) {
                 _ = om.createStreamWithId(stream_id, om.node_id) catch |err| {
                     log.warn("Failed to create stream for {s}-{d}: {}", .{ topic, partition_id, err });
+                    return err;
                 };
             }
         }
+        partition_inserted = false;
     }
 
     const FilesystemWalRecord = struct {
@@ -961,7 +978,10 @@ pub const PartitionStore = struct {
 
         // Tier 3: Read from S3 via ObjectManager (preferred) or legacy key guessing
         if (self.object_manager) |om| {
-            const s3_metas = om.getObjects(stream_id, start_offset, effective_end_offset, 4096) catch &[0]stream_mod.S3ObjectMetadata{};
+            const s3_metas = om.getObjects(stream_id, start_offset, effective_end_offset, 4096) catch |err| {
+                log.warn("ObjectManager fetch metadata lookup failed for stream={d}: {}", .{ stream_id, err });
+                return storageErrorFetchResult(state);
+            };
             defer if (s3_metas.len > 0) self.allocator.free(s3_metas);
 
             if (s3_metas.len > 0) {
@@ -1025,7 +1045,7 @@ pub const PartitionStore = struct {
                     if (cache_fetch_deferred and max_s3_end_offset < effective_end_offset) {
                         try self.appendCachedRecordsFromOffset(&result_list, cached_records, max_s3_end_offset, max_bytes);
                     }
-                    const result_data = result_list.toOwnedSlice() catch &.{};
+                    const result_data = try result_list.toOwnedSlice();
                     // Cache in S3BlockCache
                     if (self.s3_block_cache) |*block_cache| {
                         const bc_key = self.s3BlockCacheKey(topic, partition_id, start_offset, effective_end_offset, max_bytes, isolation_level) catch null;
@@ -1052,10 +1072,15 @@ pub const PartitionStore = struct {
         if (self.s3_storage) |*s3| {
             const obj_key = std.fmt.allocPrint(self.allocator, "data/{s}/{d}/obj-{d:0>10}", .{
                 topic, partition_id, start_offset / 100, // find object by offset range
-            }) catch return .{ .error_code = 0, .records = &.{}, .high_watermark = @intCast(state.high_watermark), .last_stable_offset = @intCast(state.high_watermark) };
+            }) catch return error.OutOfMemory;
             defer self.allocator.free(obj_key);
 
-            if (s3.getObject(obj_key) catch null) |obj_data| {
+            const obj_data_or_null = s3.getObject(obj_key) catch |err| {
+                log.warn("Legacy S3 fallback fetch failed for {s}: {}", .{ obj_key, err });
+                return storageErrorFetchResult(state);
+            };
+
+            if (obj_data_or_null) |obj_data| {
                 // Parse S3 object and extract records for requested offset range
                 var reader = ObjectReader.parse(self.allocator, obj_data) catch {
                     self.allocator.free(obj_data);
@@ -1071,13 +1096,17 @@ pub const PartitionStore = struct {
 
                     const s3_buf = self.allocator.alloc(u8, s3_size) catch {
                         self.allocator.free(obj_data);
-                        return .{ .error_code = 0, .records = &.{}, .high_watermark = @intCast(state.high_watermark), .last_stable_offset = @intCast(state.high_watermark) };
+                        return error.OutOfMemory;
                     };
                     var s3_pos: usize = 0;
                     for (entry_indexes) |entry_index| {
                         if (reader.readBlock(entry_index)) |block| {
                             @memcpy(s3_buf[s3_pos .. s3_pos + block.len], block);
                             s3_pos += block.len;
+                        } else {
+                            self.allocator.free(s3_buf);
+                            self.allocator.free(obj_data);
+                            return storageErrorFetchResult(state);
                         }
                     }
 
@@ -1361,10 +1390,10 @@ pub const PartitionStore = struct {
             if (!std.mem.startsWith(u8, state.topic, "__")) continue;
 
             const stream_id = hashPartitionKey(state.topic, state.partition_id);
-            const cached = self.cache.get(stream_id, state.log_start_offset, state.next_offset, self.allocator) catch continue;
+            const cached = try self.cache.get(stream_id, state.log_start_offset, state.next_offset, self.allocator);
             defer self.allocator.free(cached);
 
-            if (cached.len <= 1) continue;
+            if (cached.len == 0) continue;
 
             // Build a key → latest-offset map by scanning records
             // For each record batch, try to parse individual records and extract keys
@@ -1373,13 +1402,13 @@ pub const PartitionStore = struct {
 
             for (cached) |rec| {
                 if (rec.data.len >= rec_batch.BATCH_HEADER_SIZE) {
-                    const hdr = rec_batch.RecordBatchHeader.parse(rec.data) catch continue;
+                    const hdr = try rec_batch.RecordBatchHeader.parse(rec.data);
                     if (hdr.magic == 2 and !hdr.isControlBatch()) {
                         var rpos: usize = rec_batch.BATCH_HEADER_SIZE;
                         for (0..@as(usize, @intCast(@max(hdr.record_count, 0)))) |_| {
-                            const record = rec_batch.parseRecord(rec.data, &rpos) catch break;
+                            const record = try rec_batch.parseRecord(rec.data, &rpos);
                             if (record.key) |k| {
-                                key_latest.put(k, rec.offset) catch {};
+                                try key_latest.put(k, rec.offset);
                             }
                         }
                     }
@@ -1529,6 +1558,67 @@ test "PartitionStore restores filesystem WAL records into fetch cache" {
         defer if (result.records.len > 0) testing.allocator.free(@constCast(result.records));
         try testing.expectEqual(@as(i16, 0), result.error_code);
         try testing.expectEqualStrings("alphabeta", result.records);
+    }
+}
+
+test "PartitionStore fails closed on malformed filesystem WAL record during open" {
+    const tmp_dir = "/tmp/automq-store-wal-malformed-test";
+    fs.deleteTreeAbsolute(tmp_dir) catch {};
+    defer fs.deleteTreeAbsolute(tmp_dir) catch {};
+
+    {
+        var store = PartitionStore.initWithConfig(testing.allocator, .{
+            .data_dir = tmp_dir,
+            .wal_segment_size = 1024 * 1024,
+        });
+        defer store.deinit();
+        try store.open();
+        _ = try store.fs_wal.?.appendSync("not-a-zmq-partition-wal-record");
+    }
+
+    {
+        var store = PartitionStore.initWithConfig(testing.allocator, .{
+            .data_dir = tmp_dir,
+            .wal_segment_size = 1024 * 1024,
+        });
+        defer store.deinit();
+        try testing.expectError(error.InvalidFilesystemWalRecord, store.open());
+    }
+}
+
+test "PartitionStore fails closed on corrupt filesystem WAL record during open" {
+    const tmp_dir = "/tmp/automq-store-wal-corrupt-test";
+    fs.deleteTreeAbsolute(tmp_dir) catch {};
+    defer fs.deleteTreeAbsolute(tmp_dir) catch {};
+
+    {
+        var store = PartitionStore.initWithConfig(testing.allocator, .{
+            .data_dir = tmp_dir,
+            .wal_segment_size = 1024 * 1024,
+        });
+        defer store.deinit();
+        try store.open();
+        _ = try store.produce("corrupt-wal-topic", 0, "durable-before-corruption");
+        try store.sync();
+    }
+
+    const seg_path = try std.fmt.allocPrint(testing.allocator, "{s}/wal-{d:0>20}.log", .{ tmp_dir, @as(u64, 0) });
+    defer testing.allocator.free(seg_path);
+
+    {
+        const file = try fs.openFileAbsolute(seg_path, .{ .mode = .read_write });
+        defer file.close();
+        try file.seekTo(1);
+        try file.writeAll(&[_]u8{0xFF});
+    }
+
+    {
+        var store = PartitionStore.initWithConfig(testing.allocator, .{
+            .data_dir = tmp_dir,
+            .wal_segment_size = 1024 * 1024,
+        });
+        defer store.deinit();
+        try testing.expectError(error.WalCrcMismatch, store.open());
     }
 }
 
@@ -1781,7 +1871,7 @@ test "PartitionStore S3 WAL produce forces recovery before assigning offset" {
     try testing.expect(try store_b.refreshS3WalObjects(true));
     try testing.expectEqual(@as(i64, 1), (try store_a.produce("s3-produce-refresh-topic", 0, "b")).base_offset);
 
-    store_b.last_s3_wal_recovery_ms = @import("time_compat").milliTimestamp();
+    store_b.last_s3_wal_recovery_ms = monotonicMs();
     try testing.expectEqual(@as(i64, 2), (try store_b.produce("s3-produce-refresh-topic", 0, "c")).base_offset);
 }
 
@@ -1818,7 +1908,7 @@ test "PartitionStore S3 WAL fetch forces recovery for fresh cross-broker data" {
     try testing.expectEqualStrings("a", first_fetch.records);
 
     try testing.expectEqual(@as(i64, 1), (try store_a.produce("s3-fetch-refresh-topic", 0, "b")).base_offset);
-    store_b.last_s3_wal_recovery_ms = @import("time_compat").milliTimestamp();
+    store_b.last_s3_wal_recovery_ms = monotonicMs();
 
     const second_fetch = try store_b.fetch("s3-fetch-refresh-topic", 0, 0, 1024);
     defer if (second_fetch.records.len > 0) testing.allocator.free(@constCast(second_fetch.records));
@@ -2131,6 +2221,71 @@ test "PartitionStore returns storage error for injected ObjectManager S3 get fau
     try testing.expectEqualStrings("a", recovered.records);
 }
 
+test "PartitionStore returns storage error when ObjectManager metadata lookup fails" {
+    var object_manager = ObjectManager.init(testing.allocator, 1);
+    defer object_manager.deinit();
+
+    var store = PartitionStore.init(testing.allocator);
+    defer store.deinit();
+    store.object_manager = &object_manager;
+    try store.ensurePartition("metadata-lookup-fault-topic", 0);
+
+    const stream_id = PartitionStore.hashPartitionKey("metadata-lookup-fault-topic", 0);
+    const ranges = [_]stream_mod.StreamOffsetRange{.{
+        .stream_id = stream_id,
+        .start_offset = 0,
+        .end_offset = 1,
+    }};
+    try object_manager.commitStreamSetObject(100, 1, 1, &ranges, "wal/metadata-lookup-object", 1);
+
+    var key_buf: [256]u8 = undefined;
+    const key = PartitionStore.partitionKeyBuf(&key_buf, "metadata-lookup-fault-topic", 0);
+    const state = store.partitions.getPtr(key).?;
+    state.next_offset = 1;
+    state.high_watermark = 1;
+    state.last_stable_offset = 1;
+
+    const original_allocator = object_manager.allocator;
+    var failing_allocator = std.testing.FailingAllocator.init(testing.allocator, .{ .fail_index = 0 });
+    object_manager.allocator = failing_allocator.allocator();
+    defer object_manager.allocator = original_allocator;
+
+    const failed = try store.fetch("metadata-lookup-fault-topic", 0, 0, 1024);
+    try testing.expectEqual(PartitionStore.KAFKA_STORAGE_ERROR, failed.error_code);
+    try testing.expectEqual(@as(usize, 0), failed.records.len);
+}
+
+test "PartitionStore legacy S3 fallback returns storage error on get fault" {
+    var mock_s3 = MockS3.init(testing.allocator);
+    defer mock_s3.deinit();
+    var s3_storage = S3Storage.initMock(testing.allocator, &mock_s3);
+
+    var store = PartitionStore.init(testing.allocator);
+    defer store.deinit();
+    store.s3_storage = s3_storage;
+    try store.ensurePartition("legacy-get-fault-topic", 0);
+
+    const stream_id = PartitionStore.hashPartitionKey("legacy-get-fault-topic", 0);
+    var writer = ObjectWriter.init(testing.allocator);
+    defer writer.deinit();
+    try writer.addDataBlock(stream_id, 0, 1, 1, "a");
+    const obj_data = try writer.build();
+    defer testing.allocator.free(obj_data);
+    try s3_storage.putObject("data/legacy-get-fault-topic/0/obj-0000000000", obj_data);
+
+    var key_buf: [256]u8 = undefined;
+    const key = PartitionStore.partitionKeyBuf(&key_buf, "legacy-get-fault-topic", 0);
+    const state = store.partitions.getPtr(key).?;
+    state.next_offset = 1;
+    state.high_watermark = 1;
+    state.last_stable_offset = 1;
+
+    mock_s3.failNextGetObjects(1);
+    const failed = try store.fetch("legacy-get-fault-topic", 0, 0, 1024);
+    try testing.expectEqual(PartitionStore.KAFKA_STORAGE_ERROR, failed.error_code);
+    try testing.expectEqual(@as(usize, 0), failed.records.len);
+}
+
 test "PartitionStore S3 WAL failed sync produce is not visible or retained" {
     var mock_s3 = MockS3.init(testing.allocator);
     defer mock_s3.deinit();
@@ -2329,6 +2484,39 @@ test "PartitionStore applyRetention runs without error" {
     _ = try store.applyRetention(.{ .retention_bytes = 100 });
 }
 
+test "PartitionStore compactLogs fails closed on cache allocation failure" {
+    var store = PartitionStore.init(testing.allocator);
+    defer store.deinit();
+
+    _ = try store.produce("__consumer_offsets", 0, "offset-record");
+
+    const original_allocator = store.allocator;
+    var failing_allocator = std.testing.FailingAllocator.init(testing.allocator, .{ .fail_index = 0 });
+    store.allocator = failing_allocator.allocator();
+    defer store.allocator = original_allocator;
+
+    try testing.expectError(error.OutOfMemory, store.compactLogs());
+}
+
+test "PartitionStore compactLogs fails closed on malformed internal batch" {
+    const rec_batch = @import("protocol").record_batch;
+
+    var store = PartitionStore.init(testing.allocator);
+    defer store.deinit();
+
+    var malformed = [_]u8{0} ** rec_batch.BATCH_HEADER_SIZE;
+    malformed[16] = 9; // magic byte
+
+    try store.ensurePartition("__consumer_offsets", 0);
+    const state = store.partitions.getPtr("__consumer_offsets-0").?;
+    state.next_offset = 1;
+    state.high_watermark = 1;
+    const stream_id = PartitionStore.hashPartitionKey("__consumer_offsets", 0);
+    try store.cache.put(stream_id, 0, &malformed);
+
+    try testing.expectError(error.UnsupportedMagic, store.compactLogs());
+}
+
 test "PartitionStore totalRecords in memory mode" {
     var store = PartitionStore.init(testing.allocator);
     defer store.deinit();
@@ -2352,6 +2540,23 @@ test "PartitionStore ensurePartition idempotent" {
     const key = try store.partitionKey("t", 0);
     defer testing.allocator.free(key);
     try testing.expect(store.partitions.contains(key));
+}
+
+test "PartitionStore ensurePartition fails closed when stream metadata allocation fails" {
+    var failing_allocator = std.testing.FailingAllocator.init(testing.allocator, .{ .fail_index = 0 });
+    var om = ObjectManager.init(failing_allocator.allocator(), 0);
+    defer om.deinit();
+
+    var store = PartitionStore.init(testing.allocator);
+    defer store.deinit();
+    store.setObjectManager(&om);
+
+    try testing.expectError(error.OutOfMemory, store.ensurePartition("stream-oom-topic", 0));
+
+    const key = try store.partitionKey("stream-oom-topic", 0);
+    defer testing.allocator.free(key);
+    try testing.expect(!store.partitions.contains(key));
+    try testing.expect(om.getStream(PartitionStore.hashPartitionKey("stream-oom-topic", 0)) == null);
 }
 
 // ---------------------------------------------------------------

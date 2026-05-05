@@ -476,29 +476,7 @@ pub const ScramSha256Authenticator = struct {
 
         const iterations: u32 = 4096;
 
-        // Compute SaltedPassword = Hi(password, salt, iterations)
-        // Hi is PBKDF2-HMAC-SHA256
-        var salted_password: [32]u8 = undefined;
-        computeSaltedPassword(password, &salt, iterations, &salted_password);
-
-        // ClientKey = HMAC(SaltedPassword, "Client Key")
-        var client_key: [32]u8 = undefined;
-        hmacSha256(&salted_password, "Client Key", &client_key);
-
-        // StoredKey = SHA256(ClientKey)
-        var stored_key: [32]u8 = undefined;
-        std.crypto.hash.sha2.Sha256.hash(&client_key, &stored_key, .{});
-
-        // ServerKey = HMAC(SaltedPassword, "Server Key")
-        var server_key: [32]u8 = undefined;
-        hmacSha256(&salted_password, "Server Key", &server_key);
-
-        try self.users.put(user_copy, .{
-            .salt = salt,
-            .iterations = iterations,
-            .stored_key = stored_key,
-            .server_key = server_key,
-        });
+        try self.users.put(user_copy, credentialFromPassword(password, salt, iterations));
     }
 
     /// Upsert a user with Kafka AlterUserScramCredentials pre-computed material.
@@ -510,21 +488,7 @@ pub const ScramSha256Authenticator = struct {
         const user_copy = try self.allocator.dupe(u8, username);
         errdefer self.allocator.free(user_copy);
 
-        var client_key: [32]u8 = undefined;
-        hmacSha256(&salted_password, "Client Key", &client_key);
-
-        var stored_key: [32]u8 = undefined;
-        std.crypto.hash.sha2.Sha256.hash(&client_key, &stored_key, .{});
-
-        var server_key: [32]u8 = undefined;
-        hmacSha256(&salted_password, "Server Key", &server_key);
-
-        try self.users.put(user_copy, .{
-            .salt = salt,
-            .iterations = iterations,
-            .stored_key = stored_key,
-            .server_key = server_key,
-        });
+        try self.users.put(user_copy, credentialFromSaltedPassword(salt, iterations, salted_password));
     }
 
     pub fn removeUser(self: *ScramSha256Authenticator, username: []const u8) bool {
@@ -538,6 +502,34 @@ pub const ScramSha256Authenticator = struct {
     /// Look up a user's SCRAM credential.
     pub fn getCredential(self: *const ScramSha256Authenticator, username: []const u8) ?ScramCredential {
         return self.users.get(username);
+    }
+
+    /// Build an in-memory SCRAM credential from a plaintext secret.
+    /// This is useful for Kafka delegation-token auth, where the broker already
+    /// knows the token HMAC and must verify a transient SCRAM exchange without
+    /// adding a durable SCRAM user.
+    pub fn credentialFromPassword(password: []const u8, salt: [32]u8, iterations: u32) ScramCredential {
+        var salted_password: [32]u8 = undefined;
+        computeSaltedPassword(password, &salt, iterations, &salted_password);
+        return credentialFromSaltedPassword(salt, iterations, salted_password);
+    }
+
+    fn credentialFromSaltedPassword(salt: [32]u8, iterations: u32, salted_password: [32]u8) ScramCredential {
+        var client_key: [32]u8 = undefined;
+        hmacSha256(&salted_password, "Client Key", &client_key);
+
+        var stored_key: [32]u8 = undefined;
+        std.crypto.hash.sha2.Sha256.hash(&client_key, &stored_key, .{});
+
+        var server_key: [32]u8 = undefined;
+        hmacSha256(&salted_password, "Server Key", &server_key);
+
+        return .{
+            .salt = salt,
+            .iterations = iterations,
+            .stored_key = stored_key,
+            .server_key = server_key,
+        };
     }
 
     /// Verify a client proof against stored credentials.
@@ -599,6 +591,12 @@ pub const ScramStateMachine = struct {
     auth_message: ?[]u8,
     /// Username extracted from client-first-message.
     username: ?[]u8,
+    /// Optional broker-supplied authorization identity. Delegation-token SCRAM
+    /// uses the token id as the SCRAM username but authenticates as the token
+    /// owner principal.
+    authorization_id: ?[]u8,
+    /// Optional credential lifetime used by delegation-token authentication.
+    authorization_expires_at_ms: ?i64,
     /// The credential looked up for the username (cached after client-first-message).
     credential: ?ScramSha256Authenticator.ScramCredential,
     /// The complete server-first-message (stored for auth_message construction).
@@ -614,6 +612,8 @@ pub const ScramStateMachine = struct {
             .server_nonce = null,
             .auth_message = null,
             .username = null,
+            .authorization_id = null,
+            .authorization_expires_at_ms = null,
             .credential = null,
             .server_first_message = null,
             .client_first_message_bare = null,
@@ -626,8 +626,19 @@ pub const ScramStateMachine = struct {
         if (self.server_nonce) |n| self.allocator.free(n);
         if (self.auth_message) |m| self.allocator.free(m);
         if (self.username) |u| self.allocator.free(u);
+        if (self.authorization_id) |a| self.allocator.free(a);
         if (self.server_first_message) |m| self.allocator.free(m);
         if (self.client_first_message_bare) |m| self.allocator.free(m);
+    }
+
+    pub fn setAuthorizationIdentity(self: *ScramStateMachine, authorization_id: []const u8, expires_at_ms: ?i64) !void {
+        if (self.authorization_id) |old| {
+            self.allocator.free(old);
+            self.authorization_id = null;
+        }
+        self.authorization_expires_at_ms = null;
+        self.authorization_id = try self.allocator.dupe(u8, authorization_id);
+        self.authorization_expires_at_ms = expires_at_ms;
     }
 
     /// Handle client-first-message: parse username and client nonce, generate server-first-message.
@@ -638,6 +649,25 @@ pub const ScramStateMachine = struct {
     pub fn handleClientFirst(
         self: *ScramStateMachine,
         authenticator: *const ScramSha256Authenticator,
+        client_first: []const u8,
+    ) ?[]u8 {
+        return self.handleClientFirstInternal(authenticator, null, client_first);
+    }
+
+    /// Handle a client-first-message using a caller-supplied credential instead
+    /// of a durable SCRAM user lookup. Used by broker-local delegation tokens.
+    pub fn handleClientFirstWithCredential(
+        self: *ScramStateMachine,
+        credential: ScramSha256Authenticator.ScramCredential,
+        client_first: []const u8,
+    ) ?[]u8 {
+        return self.handleClientFirstInternal(null, credential, client_first);
+    }
+
+    fn handleClientFirstInternal(
+        self: *ScramStateMachine,
+        authenticator: ?*const ScramSha256Authenticator,
+        supplied_credential: ?ScramSha256Authenticator.ScramCredential,
         client_first: []const u8,
     ) ?[]u8 {
         if (self.state != .initial) {
@@ -669,10 +699,17 @@ pub const ScramStateMachine = struct {
         };
 
         // Look up user credential
-        const credential = authenticator.getCredential(username) orelse {
-            log.warn("SCRAM: unknown user '{s}'", .{username});
-            self.state = .failed;
-            return null;
+        const credential = supplied_credential orelse blk: {
+            const auth = authenticator orelse {
+                log.warn("SCRAM: no credential resolver for user '{s}'", .{username});
+                self.state = .failed;
+                return null;
+            };
+            break :blk auth.getCredential(username) orelse {
+                log.warn("SCRAM: unknown user '{s}'", .{username});
+                self.state = .failed;
+                return null;
+            };
         };
 
         // Store client-first-message-bare for auth_message construction
@@ -935,7 +972,7 @@ fn computeSaltedPassword(password: []const u8, salt: []const u8, iterations: u32
 /// SASL/OAUTHBEARER authenticator.
 ///
 /// Implements the Kafka OAUTHBEARER SASL mechanism (KIP-255).
-/// Accepts a JWT bearer token, validates expiration and optional
+/// Accepts a JWT bearer token, validates required expiration and optional
 /// issuer/audience claims, and extracts the principal from the "sub" claim.
 ///
 /// NOTE: AutoMQ inherits Java's JSSE OAUTHBEARER implementation with full
@@ -992,6 +1029,11 @@ pub const OAuthBearerAuthenticator = struct {
             jwt.deinit();
             return .{ .success = false, .principal = null };
         }
+        const expires_at_ms = if (jwt.expires_at) |exp| epochSecondsToMillis(exp) else {
+            log.warn("OAUTHBEARER: token missing 'exp' claim", .{});
+            jwt.deinit();
+            return .{ .success = false, .principal = null };
+        };
 
         // Validate issuer if configured
         if (self.expected_issuer) |expected| {
@@ -1031,7 +1073,7 @@ pub const OAuthBearerAuthenticator = struct {
         jwt.deinit();
 
         log.info("OAUTHBEARER authentication success: principal={s}", .{principal_copy});
-        return .{ .success = true, .principal = principal_copy };
+        return .{ .success = true, .principal = principal_copy, .expires_at_ms = expires_at_ms };
     }
 
     /// Extract the Bearer JWT from the OAUTHBEARER SASL token format.
@@ -1067,6 +1109,7 @@ pub const OAuthBearerAuthenticator = struct {
     pub const AuthResult = struct {
         success: bool,
         principal: ?[]u8,
+        expires_at_ms: ?i64 = null,
 
         pub fn deinit(self: *AuthResult, alloc: Allocator) void {
             if (self.principal) |principal| {
@@ -1076,6 +1119,13 @@ pub const OAuthBearerAuthenticator = struct {
         }
     };
 };
+
+fn epochSecondsToMillis(seconds: i64) i64 {
+    if (seconds <= 0) return 0;
+    const max_seconds = @divFloor(std.math.maxInt(i64), @as(i64, 1000));
+    if (seconds > max_seconds) return std.math.maxInt(i64);
+    return seconds * 1000;
+}
 
 // ---------------------------------------------------------------
 // SCRAM Tests
@@ -1204,6 +1254,7 @@ test "OAuthBearerAuthenticator valid token" {
     try testing.expect(result.success);
     try testing.expect(result.principal != null);
     try testing.expectEqualStrings("oauthuser", result.principal.?);
+    try testing.expectEqual(@as(i64, 9999999999000), result.expires_at_ms.?);
 }
 
 test "OAuthBearerAuthenticator expired token" {
@@ -1251,6 +1302,18 @@ test "OAuthBearerAuthenticator rejects future not-before tokens" {
     var result = oauth.authenticate(testing.allocator, sasl_token);
     defer result.deinit(testing.allocator);
     try testing.expect(!result.success);
+}
+
+test "OAuthBearerAuthenticator rejects token without expiration" {
+    const oauth = OAuthBearerAuthenticator.init();
+
+    const jwt = "eyJhbGciOiJub25lIn0.eyJzdWIiOiJub2V4cCJ9.";
+    const sasl_token = "n,,\x01auth=Bearer " ++ jwt ++ "\x01\x01";
+
+    var result = oauth.authenticate(testing.allocator, sasl_token);
+    defer result.deinit(testing.allocator);
+    try testing.expect(!result.success);
+    try testing.expect(result.expires_at_ms == null);
 }
 
 test "OAuthBearerAuthenticator raw JWT token" {

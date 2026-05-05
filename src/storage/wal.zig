@@ -11,6 +11,10 @@ const stream_mod = @import("stream.zig");
 const ObjectManager = stream_mod.ObjectManager;
 const StreamOffsetRange = stream_mod.StreamOffsetRange;
 
+fn monotonicMs() i64 {
+    return @intCast(@import("time_compat").monotonicMilliTimestamp());
+}
+
 /// Write-Ahead Log (WAL) for durable local writes.
 ///
 /// Records are written to the WAL before being acknowledged to producers.
@@ -108,7 +112,7 @@ pub const Wal = struct {
         // acknowledged records before recover() can replay them.
         try self.loadExistingSegments();
         try self.openSegment(self.next_segment_id);
-        self.last_fsync_ms = @import("time_compat").milliTimestamp();
+        self.last_fsync_ms = monotonicMs();
         self.next_segment_id += 1;
     }
 
@@ -159,7 +163,7 @@ pub const Wal = struct {
                 try self.syncSegment(seg);
             }
         } else if (self.fsync_policy == .periodic) {
-            const now = @import("time_compat").milliTimestamp();
+            const now = monotonicMs();
             if (self.fsync_interval_ms <= 0 or now - self.last_fsync_ms >= self.fsync_interval_ms) {
                 try self.syncSegmentAt(seg, now);
             }
@@ -183,7 +187,7 @@ pub const Wal = struct {
     }
 
     fn syncSegment(self: *Wal, seg: *Segment) !void {
-        try self.syncSegmentAt(seg, @import("time_compat").milliTimestamp());
+        try self.syncSegmentAt(seg, monotonicMs());
     }
 
     fn syncSegmentAt(self: *Wal, seg: *Segment, now_ms: i64) !void {
@@ -237,19 +241,19 @@ pub const Wal = struct {
                 continue;
             }
             const id_part = entry.name[4 .. entry.name.len - 4];
-            const id = std.fmt.parseInt(u64, id_part, 10) catch continue;
+            const id = std.fmt.parseInt(u64, id_part, 10) catch return error.InvalidWalSegmentName;
 
             const path = try std.fmt.allocPrint(self.allocator, "{s}/{s}", .{ self.dir_path, entry.name });
             errdefer self.allocator.free(path);
 
-            const file = fs.openFileAbsolute(path, .{}) catch {
+            const file = fs.openFileAbsolute(path, .{}) catch |err| {
                 self.allocator.free(path);
-                continue;
+                return err;
             };
-            const stat = file.stat() catch {
+            const stat = file.stat() catch |err| {
                 file.close();
                 self.allocator.free(path);
-                continue;
+                return err;
             };
             file.close();
 
@@ -316,6 +320,25 @@ pub const Wal = struct {
         context: anytype,
         comptime callback: fn (@TypeOf(context), data: []const u8, offset: u64) anyerror!void,
     ) !u64 {
+        return self.recoverWithContextMode(context, callback, false);
+    }
+
+    /// Recover records from the WAL directory and fail on any readable segment
+    /// corruption instead of treating it as a soft truncation point.
+    pub fn recoverStrictWithContext(
+        self: *Wal,
+        context: anytype,
+        comptime callback: fn (@TypeOf(context), data: []const u8, offset: u64) anyerror!void,
+    ) !u64 {
+        return self.recoverWithContextMode(context, callback, true);
+    }
+
+    fn recoverWithContextMode(
+        self: *Wal,
+        context: anytype,
+        comptime callback: fn (@TypeOf(context), data: []const u8, offset: u64) anyerror!void,
+        comptime fail_closed: bool,
+    ) !u64 {
         log.info("Starting WAL recovery from {s}", .{self.dir_path});
         var dir = try fs.openDirAbsolute(self.dir_path, .{ .iterate = true });
         defer dir.close();
@@ -350,21 +373,35 @@ pub const Wal = struct {
             const path = try std.fmt.allocPrint(self.allocator, "{s}/{s}", .{ self.dir_path, filename });
             defer self.allocator.free(path);
 
-            const file = fs.openFileAbsolute(path, .{}) catch continue;
+            const file = fs.openFileAbsolute(path, .{}) catch |err| {
+                if (fail_closed) return err;
+                continue;
+            };
             defer file.close();
 
-            const content = file.readToEndAlloc(self.allocator, 1024 * 1024 * 1024) catch continue;
+            const content = file.readToEndAlloc(self.allocator, 1024 * 1024 * 1024) catch |err| {
+                if (fail_closed) return err;
+                continue;
+            };
             defer self.allocator.free(content);
 
             var pos: usize = 0;
             while (pos + HEADER_SIZE <= content.len) {
                 // Validate magic
-                if (content[pos] != MAGIC) break;
+                if (content[pos] != MAGIC) {
+                    log.warn("WAL corruption detected: bad magic at offset {d} in {s}", .{ pos, filename });
+                    if (fail_closed) return error.WalCorruptMagic;
+                    break;
+                }
 
                 const stored_crc = std.mem.readInt(u32, content[pos + 1 ..][0..4], .big);
                 const record_len = std.mem.readInt(u32, content[pos + 5 ..][0..4], .big);
 
-                if (pos + HEADER_SIZE + record_len > content.len) break;
+                if (pos + HEADER_SIZE + record_len > content.len) {
+                    log.warn("WAL corruption detected: truncated record at offset {d} in {s}", .{ pos, filename });
+                    if (fail_closed) return error.WalTruncatedRecord;
+                    break;
+                }
 
                 // Validate CRC
                 var crc_buf: [4]u8 = undefined;
@@ -375,6 +412,7 @@ pub const Wal = struct {
 
                 if (computed_crc != stored_crc) {
                     log.warn("WAL corruption detected: CRC mismatch at offset {d} in {s}", .{ pos, filename });
+                    if (fail_closed) return error.WalCrcMismatch;
                     break; // Corruption — stop here
                 }
 
@@ -384,6 +422,11 @@ pub const Wal = struct {
                 pos += HEADER_SIZE + record_len;
                 total_offset += HEADER_SIZE + record_len;
                 recovered += 1;
+            }
+
+            if (fail_closed and pos != content.len) {
+                log.warn("WAL corruption detected: truncated header at offset {d} in {s}", .{ pos, filename });
+                return error.WalTruncatedRecord;
             }
         }
 
@@ -537,6 +580,26 @@ test "Wal open preserves existing segments for recovery" {
         try testing.expectEqual(@as(u64, 1), count);
         try testing.expect(wal.segmentCount() >= 2);
     }
+}
+
+test "Wal open fails closed on malformed segment name" {
+    const tmp_dir = "/tmp/automq-wal-malformed-segment-name-test";
+    fs.deleteTreeAbsolute(tmp_dir) catch {};
+    defer fs.deleteTreeAbsolute(tmp_dir) catch {};
+    try fs.makeDirAbsolute(tmp_dir);
+
+    const seg_path = try std.fmt.allocPrint(testing.allocator, "{s}/wal-not-a-number.log", .{tmp_dir});
+    defer testing.allocator.free(seg_path);
+
+    {
+        const file = try fs.createFileAbsolute(seg_path, .{ .truncate = true });
+        defer file.close();
+        try file.writeAll("not-a-valid-segment");
+    }
+
+    var wal = Wal.init(testing.allocator, tmp_dir, 1024 * 1024);
+    defer wal.deinit();
+    try testing.expectError(error.InvalidWalSegmentName, wal.open());
 }
 
 test "Wal CRC corruption detection during recovery" {
@@ -793,7 +856,7 @@ pub const S3WalBatcher = struct {
     pub fn init(alloc: Allocator) S3WalBatcher {
         return .{
             .buffer = std.array_list.Managed(BatchEntry).init(alloc),
-            .last_flush_ms = @import("time_compat").milliTimestamp(),
+            .last_flush_ms = monotonicMs(),
             .allocator = alloc,
             .pending_hw_updates = std.AutoHashMap(u64, u64).init(alloc),
         };
@@ -803,7 +866,7 @@ pub const S3WalBatcher = struct {
     pub fn initWithConfig(alloc: Allocator, config: S3WalConfig) S3WalBatcher {
         return .{
             .buffer = std.array_list.Managed(BatchEntry).init(alloc),
-            .last_flush_ms = @import("time_compat").milliTimestamp(),
+            .last_flush_ms = monotonicMs(),
             .allocator = alloc,
             .max_batch_size = config.batch_size,
             .flush_interval_ms = config.flush_interval_ms,
@@ -846,7 +909,7 @@ pub const S3WalBatcher = struct {
     /// Called from the broker's periodic tick.
     pub fn shouldFlush(self: *const S3WalBatcher) bool {
         if (self.buffer.items.len == 0) return false;
-        const now = @import("time_compat").milliTimestamp();
+        const now = monotonicMs();
         const time_elapsed = now - self.last_flush_ms;
         return self.buffer_size >= self.max_batch_size or time_elapsed >= self.flush_interval_ms;
     }
@@ -915,7 +978,7 @@ pub const S3WalBatcher = struct {
         }
         self.buffer.clearRetainingCapacity();
         self.buffer_size = 0;
-        self.last_flush_ms = @import("time_compat").milliTimestamp();
+        self.last_flush_ms = monotonicMs();
         self.batch_upload_count += 1;
         self.s3_object_counter += 1;
 
@@ -956,7 +1019,11 @@ pub const S3WalBatcher = struct {
 
         // Compute stream ranges BEFORE flushBuild clears the buffer
         const ranges = if (self.object_manager != null)
-            self.computeStreamRanges() catch null
+            self.computeStreamRanges() catch |err| {
+                log.warn("S3 WAL stream-range computation failed: {}", .{err});
+                self.batch_upload_failures += 1;
+                return false;
+            }
         else
             null;
         defer if (ranges) |r| self.allocator.free(r);
@@ -983,14 +1050,11 @@ pub const S3WalBatcher = struct {
                 return false;
             };
 
-            self.markFlushSuccess();
-
             // Register as StreamSetObject in ObjectManager
             if (self.object_manager) |om| {
                 if (ranges) |r| {
                     const obj_id = om.allocateObjectId();
                     const order_id = om.next_order_id;
-                    om.next_order_id += 1;
                     om.commitStreamSetObject(
                         obj_id,
                         om.node_id,
@@ -1000,9 +1064,14 @@ pub const S3WalBatcher = struct {
                         data.len,
                     ) catch |err| {
                         log.warn("Failed to register SSO with ObjectManager: {}", .{err});
+                        self.batch_upload_failures += 1;
+                        return false;
                     };
+                    om.next_order_id += 1;
                 }
             }
+
+            self.markFlushSuccess();
 
             return true; // Data is now durable in S3
         }
@@ -1104,7 +1173,7 @@ pub const S3WalBatcher = struct {
         const StorageT = StorageChild(@TypeOf(s3_storage));
         if (comptime !@hasDecl(StorageT, "listObjectKeys")) return false;
 
-        const now_ms = @import("time_compat").milliTimestamp();
+        const now_ms = monotonicMs();
         if (self.last_epoch_fence_check_ms > 0 and now_ms - self.last_epoch_fence_check_ms < self.epoch_fence_check_interval_ms) {
             return false;
         }
@@ -1696,6 +1765,28 @@ test "S3WalBatcher flushNow registers SSO with ObjectManager" {
     try testing.expectEqual(@as(usize, 1), r2.len);
 }
 
+test "S3WalBatcher flushNow fails closed when ObjectManager registration fails" {
+    var failing_allocator = std.testing.FailingAllocator.init(testing.allocator, .{ .fail_index = 0 });
+    var om = ObjectManager.init(failing_allocator.allocator(), 0);
+    defer om.deinit();
+
+    var batcher = S3WalBatcher.init(testing.allocator);
+    defer batcher.deinit();
+    batcher.setObjectManager(&om);
+
+    var mock_s3 = MockS3Type.init(testing.allocator);
+    defer mock_s3.deinit();
+
+    try batcher.append(1, 0, "unacked-record");
+
+    try testing.expect(!batcher.flushNow(&mock_s3));
+    try testing.expectEqual(@as(usize, 1), batcher.pendingCount());
+    try testing.expectEqual(@as(usize, 0), om.getStreamSetObjectCount());
+    try testing.expectEqual(@as(u64, 1), batcher.batch_upload_failures);
+    try testing.expectEqual(@as(u64, 0), batcher.batch_upload_count);
+    try testing.expectEqual(@as(usize, 1), mock_s3.objectCount());
+}
+
 test "S3WalBatcher setObjectManager" {
     var om = ObjectManager.init(testing.allocator, 0);
     defer om.deinit();
@@ -1901,7 +1992,7 @@ test "Wal periodic fsync policy syncs after elapsed interval" {
         _ = try wal.append("data-before-interval");
         try testing.expectEqual(opened_fsync_ms, wal.last_fsync_ms);
 
-        const stale_fsync_ms = @import("time_compat").milliTimestamp() - wal.fsync_interval_ms - 1;
+        const stale_fsync_ms = monotonicMs() - wal.fsync_interval_ms - 1;
         wal.last_fsync_ms = stale_fsync_ms;
         _ = try wal.append("data-after-interval");
 

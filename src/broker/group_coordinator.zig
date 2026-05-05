@@ -5,6 +5,10 @@ const log = std.log.scoped(.group_coordinator);
 const MetricRegistry = @import("core").MetricRegistry;
 const ErrorCode = @import("protocol").ErrorCode;
 
+fn monotonicMs() i64 {
+    return @intCast(@import("time_compat").monotonicMilliTimestamp());
+}
+
 pub const CommittedOffsetValue = struct {
     offset: i64,
     leader_epoch: i32 = -1,
@@ -59,7 +63,7 @@ pub const GroupCoordinator = struct {
     /// Should be called periodically (e.g., every 1 second).
     /// Returns the number of members evicted.
     pub fn evictExpiredMembers(self: *GroupCoordinator) u32 {
-        const now = @import("time_compat").milliTimestamp();
+        const now = monotonicMs();
         var evicted: u32 = 0;
 
         var git = self.groups.iterator();
@@ -68,37 +72,44 @@ pub const GroupCoordinator = struct {
             if (group.state == .dead or group.state == .empty) continue;
             const session_timeout_ms = if (group.session_timeout_ms > 0) group.session_timeout_ms else ConsumerGroup.default_session_timeout_ms;
 
-            // Collect expired members
-            var expired = std.array_list.Managed([]const u8).init(self.allocator);
-            defer expired.deinit();
+            var group_evicted: u32 = 0;
+            var expired_batch: [64][]const u8 = undefined;
+            while (true) {
+                var expired_count: usize = 0;
 
-            var mit = group.members.iterator();
-            while (mit.next()) |mentry| {
-                const member = mentry.value_ptr;
-                if ((now - member.last_heartbeat_ms) > session_timeout_ms) {
-                    expired.append(mentry.key_ptr.*) catch {};
+                var mit = group.members.iterator();
+                while (mit.next()) |mentry| {
+                    const member = mentry.value_ptr;
+                    if ((now - member.last_heartbeat_ms) > session_timeout_ms) {
+                        expired_batch[expired_count] = mentry.key_ptr.*;
+                        expired_count += 1;
+                        if (expired_count == expired_batch.len) break;
+                    }
                 }
-            }
 
-            // Remove expired members
-            for (expired.items) |mid| {
-                if (group.members.fetchRemove(mid)) |entry| {
-                    var member_copy = entry.value;
-                    member_copy.deinitMember(self.allocator);
-                    evicted += 1;
-                    log.info("Evicted expired member from group: heartbeat timeout", .{});
+                if (expired_count == 0) break;
+
+                // Remove expired members after the iterator is no longer live.
+                for (expired_batch[0..expired_count]) |mid| {
+                    if (group.members.fetchRemove(mid)) |entry| {
+                        var member_copy = entry.value;
+                        member_copy.deinitMember(self.allocator);
+                        evicted += 1;
+                        group_evicted += 1;
+                        log.info("Evicted expired member from group: heartbeat timeout", .{});
+                    }
                 }
             }
 
             // If group became empty, transition to empty state
             if (group.members.count() == 0) {
                 group.state = .empty;
-            } else if (expired.items.len > 0) {
+            } else if (group_evicted > 0) {
                 // Trigger rebalance if members were evicted
                 group.state = .preparing_rebalance;
-                group.rebalance_start_ms = @import("time_compat").milliTimestamp();
+                group.rebalance_start_ms = monotonicMs();
                 group.generation_id += 1;
-                log.info("Group rebalance triggered: {d} members evicted, generation={d}", .{ expired.items.len, group.generation_id });
+                log.info("Group rebalance triggered: {d} members evicted, generation={d}", .{ group_evicted, group.generation_id });
             }
         }
 
@@ -109,7 +120,7 @@ pub const GroupCoordinator = struct {
     /// state for longer than its rebalance_timeout_ms, force-complete the rebalance.
     /// Transitions to COMPLETING_REBALANCE (not directly STABLE).
     pub fn checkRebalanceTimeouts(self: *GroupCoordinator) u32 {
-        const now = @import("time_compat").milliTimestamp();
+        const now = monotonicMs();
         var forced: u32 = 0;
 
         var git = self.groups.iterator();
@@ -205,7 +216,7 @@ pub const GroupCoordinator = struct {
             if (existing_mid) |emid| {
                 // Static member rejoin — update heartbeat, don't trigger rebalance
                 if (group.members.getPtr(emid)) |existing_member| {
-                    existing_member.last_heartbeat_ms = @import("time_compat").milliTimestamp();
+                    existing_member.last_heartbeat_ms = monotonicMs();
                     if (selected_protocol_name) |protocol_name| {
                         if (existing_member.protocol_name) |old| self.allocator.free(old);
                         existing_member.protocol_name = try self.allocator.dupe(u8, protocol_name);
@@ -273,7 +284,7 @@ pub const GroupCoordinator = struct {
         if (group.state == .empty or group.state == .stable) {
             group.state = .preparing_rebalance;
             group.generation_id += 1;
-            group.rebalance_start_ms = @import("time_compat").milliTimestamp();
+            group.rebalance_start_ms = monotonicMs();
             log.info("Group {s} transitioning to preparing_rebalance: generation={d}", .{ group_id, group.generation_id });
         }
 
@@ -376,7 +387,7 @@ pub const GroupCoordinator = struct {
         group.generation_id += 1;
         if (group.state == .stable) {
             group.state = .preparing_rebalance;
-            group.rebalance_start_ms = @import("time_compat").milliTimestamp();
+            group.rebalance_start_ms = monotonicMs();
         }
         return true;
     }
@@ -437,7 +448,7 @@ pub const GroupCoordinator = struct {
 
         if (group.generation_id != generation_id) return @intFromEnum(ErrorCode.illegal_generation);
 
-        member.last_heartbeat_ms = @import("time_compat").milliTimestamp();
+        member.last_heartbeat_ms = monotonicMs();
         // Tell client to rejoin if group is rebalancing
         if (group.state == .preparing_rebalance or group.state == .completing_rebalance) {
             log.debug("Heartbeat: signaling REBALANCE_IN_PROGRESS to member {s} in group {s}", .{ member_id, group_id });
@@ -467,7 +478,7 @@ pub const GroupCoordinator = struct {
         }
 
         if (group.generation_id != member_epoch) return @intFromEnum(ErrorCode.fenced_member_epoch);
-        member.last_heartbeat_ms = @import("time_compat").milliTimestamp();
+        member.last_heartbeat_ms = monotonicMs();
         return @intFromEnum(ErrorCode.none);
     }
 
@@ -1107,6 +1118,27 @@ pub const GroupCoordinator = struct {
         metadata: ?[]const u8 = null,
     };
 
+    fn parseCommittedOffsetKeyForGroup(key: []const u8, group_id: []const u8) !?struct {
+        topic: []const u8,
+        partition: i32,
+    } {
+        if (key.len <= group_id.len or key[group_id.len] != ':' or !std.mem.startsWith(u8, key, group_id)) {
+            return null;
+        }
+
+        const rest = key[group_id.len + 1 ..];
+        const partition_sep = std.mem.lastIndexOfScalar(u8, rest, ':') orelse return error.CorruptCommittedOffsetKey;
+        if (partition_sep == 0 or partition_sep + 1 >= rest.len) return error.CorruptCommittedOffsetKey;
+
+        const partition = std.fmt.parseInt(i32, rest[partition_sep + 1 ..], 10) catch return error.CorruptCommittedOffsetKey;
+        if (partition < 0) return error.CorruptCommittedOffsetKey;
+
+        return .{
+            .topic = rest[0..partition_sep],
+            .partition = partition,
+        };
+    }
+
     /// Return all committed offsets for a group, sorted by topic and partition.
     /// Topic slices are borrowed from the coordinator's committed-offset keys.
     pub fn listCommittedOffsets(self: *const GroupCoordinator, allocator: Allocator, group_id: []const u8) ![]CommittedOffset {
@@ -1116,18 +1148,10 @@ pub const GroupCoordinator = struct {
         var it = self.committed_offsets.iterator();
         while (it.next()) |entry| {
             const key = entry.key_ptr.*;
-            if (key.len <= group_id.len or key[group_id.len] != ':' or !std.mem.startsWith(u8, key, group_id)) {
-                continue;
-            }
-
-            const rest = key[group_id.len + 1 ..];
-            const partition_sep = std.mem.lastIndexOfScalar(u8, rest, ':') orelse continue;
-            if (partition_sep == 0 or partition_sep + 1 >= rest.len) continue;
-
-            const partition = std.fmt.parseInt(i32, rest[partition_sep + 1 ..], 10) catch continue;
+            const parsed = try parseCommittedOffsetKeyForGroup(key, group_id) orelse continue;
             try offsets.append(.{
-                .topic = rest[0..partition_sep],
-                .partition = partition,
+                .topic = parsed.topic,
+                .partition = parsed.partition,
                 .offset = entry.value_ptr.offset,
                 .leader_epoch = entry.value_ptr.leader_epoch,
                 .metadata = entry.value_ptr.metadata,
@@ -1227,7 +1251,7 @@ pub const ConsumerGroup = struct {
         pub fn initMember(alloc: Allocator, mid: []u8) GroupMember {
             return .{
                 .member_id = mid,
-                .last_heartbeat_ms = @import("time_compat").milliTimestamp(),
+                .last_heartbeat_ms = monotonicMs(),
                 .subscribed_topics = std.array_list.Managed([]u8).init(alloc),
             };
         }
@@ -1393,6 +1417,37 @@ test "GroupCoordinator offset commit and fetch" {
     // Unknown partition returns null
     const offset2 = try coord.fetchOffset("g1", "topic-a", 99);
     try testing.expect(offset2 == null);
+}
+
+test "GroupCoordinator listCommittedOffsets preserves topic names with colons" {
+    var coord = GroupCoordinator.init(testing.allocator);
+    defer coord.deinit();
+
+    try coord.commitOffsetWithMetadata("g1", "topic:with:colons", 3, 123, 9, "metadata");
+
+    const offsets = try coord.listCommittedOffsets(testing.allocator, "g1");
+    defer testing.allocator.free(offsets);
+
+    try testing.expectEqual(@as(usize, 1), offsets.len);
+    try testing.expectEqualStrings("topic:with:colons", offsets[0].topic);
+    try testing.expectEqual(@as(i32, 3), offsets[0].partition);
+    try testing.expectEqual(@as(i64, 123), offsets[0].offset);
+    try testing.expectEqual(@as(i32, 9), offsets[0].leader_epoch);
+    try testing.expectEqualStrings("metadata", offsets[0].metadata.?);
+}
+
+test "GroupCoordinator listCommittedOffsets fails closed on corrupt matching key" {
+    var coord = GroupCoordinator.init(testing.allocator);
+    defer coord.deinit();
+
+    try coord.commitOffset("corrupt-group", "topic-a", 0, 42);
+    const corrupt_key = try testing.allocator.dupe(u8, "corrupt-group:topic-b:not-a-partition");
+    var key_inserted = false;
+    errdefer if (!key_inserted) testing.allocator.free(corrupt_key);
+    try coord.committed_offsets.put(corrupt_key, .{ .offset = 99 });
+    key_inserted = true;
+
+    try testing.expectError(error.CorruptCommittedOffsetKey, coord.listCommittedOffsets(testing.allocator, "corrupt-group"));
 }
 
 test "GroupCoordinator multiple members trigger rebalance" {
@@ -1641,7 +1696,7 @@ test "GroupCoordinator session timeout eviction" {
 
     // Artificially set the last heartbeat to far in the past
     const member = group.members.getPtr(r1.member_id).?;
-    member.last_heartbeat_ms = @import("time_compat").milliTimestamp() - 60000; // 60 seconds ago
+    member.last_heartbeat_ms = monotonicMs() - 60000; // 60 seconds ago
 
     // Evict with a 30-second timeout — member should be evicted
     const evicted = coord.evictExpiredMembers();
@@ -1650,6 +1705,33 @@ test "GroupCoordinator session timeout eviction" {
     // Group should be empty now
     try testing.expectEqual(@as(usize, 0), group.memberCount());
     try testing.expectEqual(ConsumerGroup.GroupState.empty, group.state);
+}
+
+test "GroupCoordinator heartbeat and rebalance freshness use monotonic timestamps" {
+    var coord = GroupCoordinator.init(testing.allocator);
+    defer coord.deinit();
+
+    const before_join = monotonicMs();
+    const result = try coord.joinGroup("monotonic-group", null, "consumer", null);
+    const group = coord.groups.getPtr("monotonic-group").?;
+    const member = group.members.getPtr(result.member_id).?;
+    const joined_at = member.last_heartbeat_ms;
+    const after_join = monotonicMs();
+    try testing.expect(joined_at >= before_join);
+    try testing.expect(joined_at <= after_join);
+    try testing.expect(group.rebalance_start_ms >= before_join);
+    try testing.expect(group.rebalance_start_ms <= after_join);
+
+    const before_heartbeat = monotonicMs();
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.rebalance_in_progress)), coord.heartbeat("monotonic-group", result.member_id, result.generation_id));
+    const after_heartbeat = monotonicMs();
+    try testing.expect(member.last_heartbeat_ms >= before_heartbeat);
+    try testing.expect(member.last_heartbeat_ms <= after_heartbeat);
+
+    group.rebalance_timeout_ms = 10;
+    group.rebalance_start_ms = monotonicMs() - 100;
+    try testing.expectEqual(@as(u32, 1), coord.checkRebalanceTimeouts());
+    try testing.expectEqual(ConsumerGroup.GroupState.completing_rebalance, group.state);
 }
 
 test "GroupCoordinator session timeout triggers rebalance when members remain" {
@@ -1666,13 +1748,33 @@ test "GroupCoordinator session timeout triggers rebalance when members remain" {
 
     // Expire only the first member
     const m1 = group.members.getPtr(r1.member_id).?;
-    m1.last_heartbeat_ms = @import("time_compat").milliTimestamp() - 60000;
+    m1.last_heartbeat_ms = monotonicMs() - 60000;
 
     const evicted = coord.evictExpiredMembers();
     try testing.expectEqual(@as(u32, 1), evicted);
     try testing.expectEqual(@as(usize, 1), group.memberCount());
     // Should trigger rebalance since members remain
     try testing.expectEqual(ConsumerGroup.GroupState.preparing_rebalance, group.state);
+}
+
+test "GroupCoordinator session timeout eviction does not allocate" {
+    var failing_allocator = std.testing.FailingAllocator.init(testing.allocator, .{});
+    var coord = GroupCoordinator.init(failing_allocator.allocator());
+    defer coord.deinit();
+
+    const r1 = try coord.joinGroup("evict-no-alloc-group", null, "consumer", null);
+    _ = try coord.joinGroup("evict-no-alloc-group", null, "consumer", null);
+
+    const group = coord.groups.getPtr("evict-no-alloc-group").?;
+    const member = group.members.getPtr(r1.member_id).?;
+    member.last_heartbeat_ms = monotonicMs() - 60_000;
+
+    failing_allocator.fail_index = failing_allocator.alloc_index;
+
+    const evicted = coord.evictExpiredMembers();
+    try testing.expectEqual(@as(u32, 1), evicted);
+    try testing.expectEqual(@as(usize, 1), group.memberCount());
+    try testing.expect(!failing_allocator.has_induced_failure);
 }
 
 test "GroupCoordinator session timeout eviction uses each group's configured timeout" {
@@ -1687,7 +1789,7 @@ test "GroupCoordinator session timeout eviction uses each group's configured tim
     short_group.session_timeout_ms = 10_000;
     long_group.session_timeout_ms = 300_000;
 
-    const now = @import("time_compat").milliTimestamp();
+    const now = monotonicMs();
     short_group.members.getPtr(short_member.member_id).?.last_heartbeat_ms = now - 60_000;
     long_group.members.getPtr(long_member.member_id).?.last_heartbeat_ms = now - 60_000;
 
@@ -2050,10 +2152,10 @@ test "GroupCoordinator evictExpiredMembers removes timed-out members" {
 
     // Expire members r1 and r2 by setting their heartbeat far in the past
     if (group.members.getPtr(r1.member_id)) |m| {
-        m.last_heartbeat_ms = @import("time_compat").milliTimestamp() - 120_000; // 2 min ago
+        m.last_heartbeat_ms = monotonicMs() - 120_000; // 2 min ago
     }
     if (group.members.getPtr(r2.member_id)) |m| {
-        m.last_heartbeat_ms = @import("time_compat").milliTimestamp() - 90_000; // 1.5 min ago
+        m.last_heartbeat_ms = monotonicMs() - 90_000; // 1.5 min ago
     }
     // r3 keeps a recent heartbeat (already set by joinGroup)
 

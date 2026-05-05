@@ -140,7 +140,7 @@ const TimedResult = struct {
 };
 
 fn nowNs() u64 {
-    return @intCast(time.nanoTimestamp());
+    return time.monotonicNanoTimestamp();
 }
 
 fn getenv(name: [:0]const u8) ?[]const u8 {
@@ -233,6 +233,16 @@ fn requireThroughput(name: []const u8, mib_per_sec: f64, p99_ns: u64, min_mib_pe
         std.debug.print(
             "benchmark gate failed for {s}: throughput={d:.2}MiB/s min={d:.2}MiB/s p99={d:.2}ms max={d:.2}ms\n",
             .{ name, mib_per_sec, min_mib_per_sec, p99_ms, max_p99_ms },
+        );
+        return error.BenchmarkGateFailed;
+    }
+}
+
+fn requireMaxValue(name: []const u8, value: f64, max_value: f64, unit: []const u8) !void {
+    if (value > max_value) {
+        std.debug.print(
+            "benchmark gate failed for {s}: value={d:.2}{s} max={d:.2}{s}\n",
+            .{ name, value, unit, max_value, unit },
         );
         return error.BenchmarkGateFailed;
     }
@@ -377,6 +387,12 @@ fn benchPartitionStoreS3Wal(writer: anytype) !void {
         measured_lists,
         requests_per_mib,
     });
+    try requireMaxValue(
+        "S3 WAL request volume",
+        requests_per_mib,
+        envF64("ZMQ_BENCH_S3_WAL_MAX_REQUESTS_PER_MIB", 1024.0),
+        " requests/MiB",
+    );
 
     var replacement_om = storage.ObjectManager.init(alloc, 1);
     defer replacement_om.deinit();
@@ -396,11 +412,18 @@ fn benchPartitionStoreS3Wal(writer: anytype) !void {
     if (fetched.error_code != 0 or fetched.records.len == 0) return error.BenchmarkRecoveryFetchFailed;
 
     const recovered_per_sec = @as(f64, @floatFromInt(recovered)) / (@as(f64, @floatFromInt(rebuild_ns)) / 1e9);
+    const rebuild_ms = @as(f64, @floatFromInt(rebuild_ns)) / 1e6;
     try writer.print("S3 WAL rebuild           objects={d} rate={d:.0}/s total={d:.2} ms\n", .{
         recovered,
         recovered_per_sec,
-        @as(f64, @floatFromInt(rebuild_ns)) / 1e6,
+        rebuild_ms,
     });
+    try requireMaxValue(
+        "S3 WAL rebuild",
+        rebuild_ms,
+        envF64("ZMQ_BENCH_S3_WAL_MAX_REBUILD_MS", 10_000.0),
+        " ms",
+    );
 }
 
 fn liveS3Config() storage.S3Client.Config {
@@ -530,6 +553,12 @@ fn benchLiveS3Provider(writer: anytype) !void {
         get_result.p99_ns,
         envF64("ZMQ_BENCH_LIVE_S3_MIN_GET_MIB_PER_SEC", 0.05),
         envF64("ZMQ_BENCH_LIVE_S3_MAX_GET_P99_MS", 10_000.0),
+    );
+    try requireMaxValue(
+        "Live S3 request volume",
+        requests_per_mib,
+        envF64("ZMQ_BENCH_LIVE_S3_MAX_REQUESTS_PER_MIB", 512.0),
+        " requests/MiB",
     );
 }
 

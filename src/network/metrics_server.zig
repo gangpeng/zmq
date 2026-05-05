@@ -200,6 +200,14 @@ pub const MetricsServer = struct {
         };
     }
 
+    fn metricsUnavailableResponse() ProbeResponse {
+        return .{
+            .status = "500 Internal Server Error",
+            .content_type = "text/plain",
+            .body = "metrics export failed\n",
+        };
+    }
+
     pub fn readinessState(self: *const MetricsServer) ReadinessState {
         if (self.shutting_down) return .shutting_down;
         if (!self.startup_complete) return .starting;
@@ -222,42 +230,71 @@ pub const MetricsServer = struct {
     }
 
     fn servePlainMetrics(self: *MetricsServer, client: posix.socket_t) void {
-        const metrics_body = self.registry.exportPrometheus(self.allocator) catch return;
-        defer self.allocator.free(metrics_body);
+        const response = self.buildMetricsResponse() catch |err| {
+            log.warn("Prometheus metrics response failed: {}", .{err});
+            const fallback = metricsUnavailableResponse();
+            self.sendPlainResponse(client, fallback.status, fallback.content_type, fallback.body);
+            return;
+        };
+        defer self.allocator.free(response);
 
-        var resp_buf = std.array_list.Managed(u8).init(self.allocator);
-        defer resp_buf.deinit();
-        const writer = @import("list_compat").writer(&resp_buf);
-        writer.print("HTTP/1.1 200 OK\r\nContent-Type: text/plain; version=0.0.4; charset=utf-8\r\nContent-Length: {d}\r\nConnection: close\r\n\r\n", .{metrics_body.len}) catch return;
-        writer.writeAll(metrics_body) catch return;
-
-        _ = @import("posix_compat").write(client, resp_buf.items) catch {};
+        writeAllPlain(client, response);
     }
 
     fn serveSslMetrics(self: *MetricsServer, ossl: *OpenSslLib, ssl: *anyopaque) void {
-        const metrics_body = self.registry.exportPrometheus(self.allocator) catch return;
+        const response = self.buildMetricsResponse() catch |err| {
+            log.warn("Prometheus metrics TLS response failed: {}", .{err});
+            const fallback = metricsUnavailableResponse();
+            self.sendSslResponse(ossl, ssl, fallback.status, fallback.content_type, fallback.body);
+            return;
+        };
+        defer self.allocator.free(response);
+
+        writeAllSsl(ossl, ssl, response);
+    }
+
+    fn buildMetricsResponse(self: *MetricsServer) ![]u8 {
+        const metrics_body = try self.registry.exportPrometheus(self.allocator);
         defer self.allocator.free(metrics_body);
 
         var resp_buf = std.array_list.Managed(u8).init(self.allocator);
-        defer resp_buf.deinit();
+        errdefer resp_buf.deinit();
         const writer = @import("list_compat").writer(&resp_buf);
-        writer.print("HTTP/1.1 200 OK\r\nContent-Type: text/plain; version=0.0.4; charset=utf-8\r\nContent-Length: {d}\r\nConnection: close\r\n\r\n", .{metrics_body.len}) catch return;
-        writer.writeAll(metrics_body) catch return;
+        try writer.print("HTTP/1.1 200 OK\r\nContent-Type: text/plain; version=0.0.4; charset=utf-8\r\nContent-Length: {d}\r\nConnection: close\r\n\r\n", .{metrics_body.len});
+        try writer.writeAll(metrics_body);
 
-        _ = ossl.SSL_write(ssl, resp_buf.items.ptr, @intCast(resp_buf.items.len));
+        return resp_buf.toOwnedSlice();
     }
 
     fn sendPlainResponse(self: *MetricsServer, client: posix.socket_t, status: []const u8, content_type: []const u8, body: []const u8) void {
         _ = self;
         var buf: [512]u8 = undefined;
         const resp = std.fmt.bufPrint(&buf, "HTTP/1.1 {s}\r\nContent-Type: {s}\r\nContent-Length: {d}\r\nConnection: close\r\n\r\n{s}", .{ status, content_type, body.len, body }) catch return;
-        _ = @import("posix_compat").write(client, resp) catch {};
+        writeAllPlain(client, resp);
     }
 
     fn sendSslResponse(_: *MetricsServer, ossl: *OpenSslLib, ssl: *anyopaque, status: []const u8, content_type: []const u8, body: []const u8) void {
         var buf: [512]u8 = undefined;
         const resp = std.fmt.bufPrint(&buf, "HTTP/1.1 {s}\r\nContent-Type: {s}\r\nContent-Length: {d}\r\nConnection: close\r\n\r\n{s}", .{ status, content_type, body.len, body }) catch return;
-        _ = ossl.SSL_write(ssl, resp.ptr, @intCast(resp.len));
+        writeAllSsl(ossl, ssl, resp);
+    }
+
+    fn writeAllPlain(client: posix.socket_t, response: []const u8) void {
+        var written: usize = 0;
+        while (written < response.len) {
+            const n = @import("posix_compat").write(client, response[written..]) catch return;
+            if (n == 0) return;
+            written += n;
+        }
+    }
+
+    fn writeAllSsl(ossl: *OpenSslLib, ssl: *anyopaque, response: []const u8) void {
+        var written: usize = 0;
+        while (written < response.len) {
+            const n = ossl.SSL_write(ssl, response[written..].ptr, @intCast(response.len - written));
+            if (n <= 0) return;
+            written += @intCast(n);
+        }
     }
 
     pub fn stop(self: *MetricsServer) void {
@@ -347,4 +384,33 @@ test "MetricsServer routes metrics through dynamic exporter" {
         .metrics => {},
         .static => return error.ExpectedMetricsRoute,
     }
+}
+
+test "MetricsServer /metrics returns 500 when exporter allocation fails" {
+    var registry = MetricRegistry.init(testing.allocator);
+    defer registry.deinit();
+    try registry.registerCounter("metrics_failure_total", "Metrics failure test counter");
+
+    var failing_allocator = std.testing.FailingAllocator.init(testing.allocator, .{ .fail_index = 0 });
+    var server = MetricsServer.init(failing_allocator.allocator(), 19090, &registry);
+
+    const linux = std.os.linux;
+    var pipe_fds: [2]i32 = undefined;
+    try testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.pipe(&pipe_fds)));
+    defer @import("posix_compat").close(pipe_fds[0]);
+    defer if (pipe_fds[1] >= 0) @import("posix_compat").close(pipe_fds[1]);
+
+    server.servePlainMetrics(pipe_fds[1]);
+    @import("posix_compat").close(pipe_fds[1]);
+    pipe_fds[1] = -1;
+    try testing.expect(failing_allocator.has_induced_failure);
+
+    var response_buf: [1024]u8 = undefined;
+    const response_len = try posix.read(pipe_fds[0], &response_buf);
+    const response = response_buf[0..response_len];
+
+    try testing.expect(std.mem.indexOf(u8, response, "HTTP/1.1 500 Internal Server Error\r\n") != null);
+    try testing.expect(std.mem.indexOf(u8, response, "Content-Type: text/plain\r\n") != null);
+    try testing.expect(std.mem.indexOf(u8, response, "metrics export failed\n") != null);
+    try testing.expect(std.mem.indexOf(u8, response, "HTTP/1.1 200 OK\r\n") == null);
 }

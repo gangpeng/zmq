@@ -5,7 +5,6 @@ const testing = std.testing;
 ///
 /// Kafka uses 64-bit millisecond timestamps (Unix epoch) throughout
 /// its protocol and storage formats.
-
 /// Get the current wall-clock time in milliseconds since Unix epoch.
 pub fn currentTimeMillis() i64 {
     const ts = @import("time_compat").milliTimestamp();
@@ -14,12 +13,12 @@ pub fn currentTimeMillis() i64 {
 
 /// Get a monotonic timestamp in nanoseconds (for measuring durations).
 pub fn monotonicNanos() u64 {
-    return @intCast(@import("time_compat").nanoTimestamp());
+    return @import("time_compat").monotonicNanoTimestamp();
 }
 
 /// Get a monotonic timestamp in milliseconds.
 pub fn monotonicMillis() u64 {
-    return monotonicNanos() / std.time.ns_per_ms;
+    return @import("time_compat").monotonicMilliTimestamp();
 }
 
 /// Timer for measuring elapsed durations.

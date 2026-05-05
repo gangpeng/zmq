@@ -2,6 +2,10 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 const log = std.log.scoped(.failover);
 
+fn monotonicMs() i64 {
+    return @intCast(@import("time_compat").monotonicMilliTimestamp());
+}
+
 /// FailoverController detects failed nodes and reassigns their partitions.
 /// In ZMQ's cloud-native architecture, data lives in S3, so failover
 /// only requires metadata reassignment — no data movement.
@@ -35,7 +39,7 @@ pub const FailoverController = struct {
             return .{
                 .allocator = alloc,
                 .node_id = nid,
-                .last_heartbeat_ms = @import("time_compat").milliTimestamp(),
+                .last_heartbeat_ms = monotonicMs(),
                 .is_fenced = false,
                 .owned_partitions = std.array_list.Managed(PartitionId).init(alloc),
             };
@@ -81,7 +85,7 @@ pub const FailoverController = struct {
     pub fn recordHeartbeat(self: *FailoverController, nid: i32) bool {
         if (self.known_nodes.getPtr(nid)) |state| {
             const was_fenced = state.is_fenced;
-            state.last_heartbeat_ms = @import("time_compat").milliTimestamp();
+            state.last_heartbeat_ms = monotonicMs();
             state.is_fenced = false;
             if (was_fenced) {
                 log.info("Node {d} un-fenced after heartbeat", .{nid});
@@ -128,7 +132,7 @@ pub const FailoverController = struct {
             if (state.node_id == self.node_id) continue; // Don't failover self
             if (state.is_fenced) continue; // Already fenced
 
-            if ((now_ms - state.last_heartbeat_ms) > FAILOVER_TIMEOUT_MS) {
+            if (state.last_heartbeat_ms == 0 or (now_ms - state.last_heartbeat_ms) > FAILOVER_TIMEOUT_MS) {
                 self.failoverNode(state);
                 failover_count += 1;
             }
@@ -294,7 +298,7 @@ test "FailoverController heartbeat prevents failover" {
     _ = fc.recordHeartbeat(1);
 
     // Tick with current time — node 1 just heartbeated, no failover
-    const now = @import("time_compat").milliTimestamp();
+    const now = monotonicMs();
     const count = fc.tick(now);
     try testing.expectEqual(@as(u32, 0), count);
 }
@@ -310,7 +314,7 @@ test "FailoverController detects timeout and fences node" {
     }
 
     // Tick with current time — should detect failure
-    const now = @import("time_compat").milliTimestamp();
+    const now = monotonicMs();
     const count = fc.tick(now);
     try testing.expectEqual(@as(u32, 1), count);
 
@@ -339,7 +343,7 @@ test "FailoverController transfers partition ownership on timeout" {
         state.last_heartbeat_ms = 0;
     }
 
-    const now = @import("time_compat").milliTimestamp();
+    const now = monotonicMs();
     const count = fc.tick(now);
     try testing.expectEqual(@as(u32, 1), count);
     try testing.expectEqual(@as(?i32, 0), fc.findPartitionOwner("topic-a", 0));
@@ -394,7 +398,7 @@ test "FailoverController timeout transfer copies topic ownership" {
     try fc.registerPartitionOwner("topic-copy", 1, 1);
 
     if (fc.known_nodes.getPtr(1)) |state| state.last_heartbeat_ms = 0;
-    try testing.expectEqual(@as(u32, 1), fc.tick(@import("time_compat").milliTimestamp()));
+    try testing.expectEqual(@as(u32, 1), fc.tick(monotonicMs()));
 
     try fc.reassignPartition(.{ .topic = "topic-copy", .partition = 0 }, 1);
     try testing.expectEqual(@as(?i32, 1), fc.findPartitionOwner("topic-copy", 0));
@@ -411,7 +415,7 @@ test "FailoverController does not failover self" {
         state.last_heartbeat_ms = 0;
     }
 
-    const now = @import("time_compat").milliTimestamp();
+    const now = monotonicMs();
     const count = fc.tick(now);
     try testing.expectEqual(@as(u32, 0), count);
 }
@@ -425,7 +429,7 @@ test "FailoverController does not re-fence already fenced node" {
         state.last_heartbeat_ms = 0;
     }
 
-    const now = @import("time_compat").milliTimestamp();
+    const now = monotonicMs();
     _ = fc.tick(now); // First tick fences
     const count2 = fc.tick(now); // Second tick should not re-fence
     try testing.expectEqual(@as(u32, 0), count2);
@@ -444,7 +448,7 @@ test "FailoverController epoch bumps on each failover" {
 
     try testing.expectEqual(@as(u64, 1), fc.currentEpoch());
 
-    const now = @import("time_compat").milliTimestamp();
+    const now = monotonicMs();
     const count = fc.tick(now);
     try testing.expectEqual(@as(u32, 2), count);
 
@@ -460,7 +464,7 @@ test "FailoverController heartbeat un-fences previously fenced node" {
 
     // Force timeout and fence
     if (fc.known_nodes.getPtr(1)) |state| state.last_heartbeat_ms = 0;
-    const now = @import("time_compat").milliTimestamp();
+    const now = monotonicMs();
     _ = fc.tick(now);
 
     // Verify fenced

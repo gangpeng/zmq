@@ -20,17 +20,17 @@ Optional environment:
     ZMQ_CLIENT_MATRIX_SASL_USERNAME
     ZMQ_CLIENT_MATRIX_SASL_PASSWORD
     ZMQ_CLIENT_MATRIX_OAUTH_TOKEN
-                                  Valid JWT token for kafka-python/confluent-kafka OAUTHBEARER probes
+                                  Valid JWT token with string sub and future numeric exp for kafka-python/confluent-kafka OAUTHBEARER probes
     ZMQ_CLIENT_MATRIX_BAD_OAUTH_TOKEN
-                                  Invalid/expired JWT token expected to fail OAUTHBEARER authentication
+                                  Invalid/expired/missing-exp/missing-sub/future-nbf JWT token expected to fail OAUTHBEARER authentication
     ZMQ_CLIENT_MATRIX_OAUTH_JAAS_CONFIG
-                                  Java/Kafka CLI OAUTHBEARER JAAS config
+                                  Java/Kafka CLI OAUTHBEARER JAAS config with non-empty sub and future numeric exp
     ZMQ_CLIENT_MATRIX_BAD_OAUTH_JAAS_CONFIG
-                                  Java/Kafka CLI OAUTHBEARER JAAS config expected to fail
+                                  Java/Kafka CLI OAUTHBEARER JAAS config expected to fail due to malformed config, missing/expired exp, missing sub, or future nbf
     ZMQ_CLIENT_MATRIX_OAUTHBEARER_CONFIG
-                                  kcat/librdkafka OAUTHBEARER config string
+                                  kcat/librdkafka OAUTHBEARER config with principal/sub and positive lifeSeconds
     ZMQ_CLIENT_MATRIX_BAD_OAUTHBEARER_CONFIG
-                                  kcat/librdkafka OAUTHBEARER config string expected to fail
+                                  kcat/librdkafka OAUTHBEARER config expected to fail due to malformed config, missing principal, unsupported principal claim, or expired lifetime
     ZMQ_CLIENT_MATRIX_SSL_CA_LOCATION
     ZMQ_CLIENT_MATRIX_BAD_SSL_CA_LOCATION
     ZMQ_CLIENT_MATRIX_ACL_DENIED_TOPIC
@@ -83,8 +83,11 @@ Semantic probes:
                       verify bad credentials, bad TLS trust, or ACL-denied produce fail closed where configured
 """
 
+import base64
 import importlib.util
+import json
 import os
+import shlex
 import shutil
 import subprocess
 import sys
@@ -187,6 +190,263 @@ def oauth_token_expiry():
         return int(raw)
     except ValueError:
         raise MatrixError(f"invalid ZMQ_CLIENT_MATRIX_OAUTH_TOKEN_EXPIRY: {raw!r}")
+
+
+def decode_jwt_payload(token):
+    parts = token.split(".")
+    if len(parts) != 3 or not parts[1]:
+        raise MatrixError("OAuth token fixture is not a compact JWT")
+    padded_payload = parts[1] + "=" * (-len(parts[1]) % 4)
+    try:
+        payload_bytes = base64.urlsafe_b64decode(padded_payload.encode("ascii"))
+        payload = json.loads(payload_bytes.decode("utf-8"))
+    except Exception as exc:
+        raise MatrixError(f"OAuth token fixture has an invalid JWT payload: {exc}") from exc
+    if not isinstance(payload, dict):
+        raise MatrixError("OAuth token fixture JWT payload must be a JSON object")
+    return payload
+
+
+def numeric_date_claim(payload, name):
+    value = payload.get(name)
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value
+    return None
+
+
+def raw_oauth_token_positive_configured(token):
+    try:
+        payload = decode_jwt_payload(token)
+    except MatrixError:
+        return False
+    subject = payload.get("sub")
+    exp = numeric_date_claim(payload, "exp")
+    nbf = numeric_date_claim(payload, "nbf")
+    now = int(time.time())
+    return (
+        isinstance(subject, str)
+        and bool(subject)
+        and exp is not None
+        and exp > now
+        and (nbf is None or nbf <= now)
+    )
+
+
+def raw_oauth_token_negative_configured(token):
+    try:
+        payload = decode_jwt_payload(token)
+    except MatrixError:
+        return True
+    subject = payload.get("sub")
+    exp = numeric_date_claim(payload, "exp")
+    nbf = numeric_date_claim(payload, "nbf")
+    now = int(time.time())
+    return (
+        not isinstance(subject, str)
+        or not subject
+        or exp is None
+        or exp <= now
+        or (nbf is not None and nbf > now)
+    )
+
+
+def parse_oauth_jaas_options(config):
+    lexer = shlex.shlex(config or "", posix=True)
+    lexer.whitespace_split = True
+    lexer.commenters = ""
+    try:
+        tokens = list(lexer)
+    except ValueError as exc:
+        raise MatrixError(f"OAuth JAAS fixture is malformed: {exc}") from exc
+
+    cleaned = []
+    saw_terminator = False
+    for token in tokens:
+        if token == ";":
+            saw_terminator = True
+            continue
+        if saw_terminator:
+            raise MatrixError("OAuth JAAS fixture has tokens after the terminating semicolon")
+        if token.endswith(";"):
+            saw_terminator = True
+            token = token[:-1]
+        if token:
+            cleaned.append(token)
+
+    if not saw_terminator:
+        raise MatrixError("OAuth JAAS fixture is missing its terminating semicolon")
+
+    module_index = None
+    for index, token in enumerate(cleaned):
+        if token.endswith("OAuthBearerLoginModule"):
+            module_index = index
+            break
+    if module_index is None:
+        raise MatrixError("OAuth JAAS fixture is missing OAuthBearerLoginModule")
+    if module_index + 1 >= len(cleaned) or cleaned[module_index + 1] != "required":
+        raise MatrixError("OAuth JAAS fixture must use a required OAuthBearerLoginModule")
+
+    options = {}
+    for token in cleaned[module_index + 2:]:
+        if "=" not in token:
+            raise MatrixError(f"OAuth JAAS fixture has an invalid option token: {token!r}")
+        key, value = token.split("=", 1)
+        if not key:
+            raise MatrixError("OAuth JAAS fixture has an empty option key")
+        options[key] = value
+    return options
+
+
+def jaas_numeric_claim(options, name):
+    value = options.get(f"unsecuredLoginNumberClaim_{name}")
+    if value is None:
+        return None
+    try:
+        return int(value, 10)
+    except ValueError:
+        return None
+
+
+def oauth_jaas_positive_configured(config):
+    try:
+        options = parse_oauth_jaas_options(config)
+    except MatrixError:
+        return False
+    subject = options.get("unsecuredLoginStringClaim_sub")
+    exp = jaas_numeric_claim(options, "exp")
+    nbf = jaas_numeric_claim(options, "nbf")
+    now = int(time.time())
+    return bool(subject) and exp is not None and exp > now and (nbf is None or nbf <= now)
+
+
+def oauth_jaas_negative_configured(config):
+    try:
+        options = parse_oauth_jaas_options(config)
+    except MatrixError:
+        return True
+    subject = options.get("unsecuredLoginStringClaim_sub")
+    exp = jaas_numeric_claim(options, "exp")
+    nbf = jaas_numeric_claim(options, "nbf")
+    now = int(time.time())
+    return (
+        not subject
+        or exp is None
+        or exp <= now
+        or (nbf is not None and nbf > now)
+    )
+
+
+def parse_librdkafka_oauthbearer_config(config):
+    if not config:
+        raise MatrixError("librdkafka OAUTHBEARER fixture must not be empty")
+
+    parsed = {}
+    extensions = {}
+    index = 0
+    length = len(config)
+    standard_prefixes = [
+        "principalClaimName=",
+        "principal=",
+        "scopeClaimName=",
+        "scope=",
+        "lifeSeconds=",
+    ]
+    while index < length:
+        if config[index] == " ":
+            index += 1
+            continue
+
+        matched = False
+        for prefix in standard_prefixes:
+            if not config.startswith(prefix, index):
+                continue
+            matched = True
+            key = prefix[:-1]
+            if key in parsed:
+                raise MatrixError(f"librdkafka OAUTHBEARER fixture has duplicate {key}")
+            value_start = index + len(prefix)
+            value_end = config.find(" ", value_start)
+            if value_end == -1:
+                value_end = length
+            value = config[value_start:value_end]
+            if not value:
+                raise MatrixError(f"librdkafka OAUTHBEARER fixture has empty {key}")
+            if '"' in value:
+                raise MatrixError(f"librdkafka OAUTHBEARER fixture has a quote in {key}")
+            parsed[key] = value
+            index = value_end
+            break
+        if matched:
+            continue
+
+        if config.startswith("extension_", index):
+            key_start = index + len("extension_")
+            key_end = config.find("=", key_start)
+            if key_end == -1:
+                raise MatrixError("librdkafka OAUTHBEARER fixture has malformed extension")
+            key = config[key_start:key_end]
+            value_start = key_end + 1
+            value_end = config.find(" ", value_start)
+            if value_end == -1:
+                value_end = length
+            value = config[value_start:value_end]
+            if not key:
+                raise MatrixError("librdkafka OAUTHBEARER fixture has an empty extension key")
+            if key == "auth" or not key.isalpha():
+                raise MatrixError("librdkafka OAUTHBEARER fixture has an invalid extension key")
+            if any((ord(ch) < 0x21 or ord(ch) > 0x7e) for ch in value):
+                raise MatrixError("librdkafka OAUTHBEARER fixture has an invalid extension value")
+            extensions[key] = value
+            index = value_end
+            continue
+
+        raise MatrixError("librdkafka OAUTHBEARER fixture has an unrecognized token")
+
+    principal = parsed.get("principal")
+    if not principal:
+        raise MatrixError("librdkafka OAUTHBEARER fixture must include principal")
+    principal_claim_name = parsed.get("principalClaimName", "sub")
+    if principal_claim_name != "sub":
+        raise MatrixError(
+            "librdkafka OAUTHBEARER fixture must emit the broker-supported sub claim"
+        )
+    life_seconds_text = parsed.get("lifeSeconds")
+    if life_seconds_text is None:
+        life_seconds = 3600
+    else:
+        try:
+            life_seconds = int(life_seconds_text, 10)
+        except ValueError as exc:
+            raise MatrixError("librdkafka OAUTHBEARER fixture has non-integral lifeSeconds") from exc
+        if life_seconds <= 0 or life_seconds > 2147483647:
+            raise MatrixError("librdkafka OAUTHBEARER fixture has out-of-range lifeSeconds")
+
+    return {
+        "principal": principal,
+        "principalClaimName": principal_claim_name,
+        "scopeClaimName": parsed.get("scopeClaimName", "scope"),
+        "scope": parsed.get("scope"),
+        "lifeSeconds": life_seconds,
+        "extensions": extensions,
+    }
+
+
+def librdkafka_oauthbearer_positive_configured(config):
+    try:
+        parse_librdkafka_oauthbearer_config(config)
+        return True
+    except MatrixError:
+        return False
+
+
+def librdkafka_oauthbearer_negative_configured(config):
+    try:
+        parse_librdkafka_oauthbearer_config(config)
+    except MatrixError:
+        return True
+    return False
 
 
 def security_properties(password_override=None, ssl_ca_override=None, jaas_config_override=None):
@@ -311,15 +571,19 @@ def sasl_negative_enabled():
 
 
 def oauth_token_negative_enabled():
-    return oauth_enabled() and bool(BAD_OAUTH_TOKEN)
+    return oauth_enabled() and bool(BAD_OAUTH_TOKEN) and raw_oauth_token_negative_configured(BAD_OAUTH_TOKEN)
 
 
 def oauth_jaas_negative_enabled():
-    return oauth_enabled() and bool(BAD_OAUTH_JAAS_CONFIG)
+    return oauth_enabled() and bool(BAD_OAUTH_JAAS_CONFIG) and oauth_jaas_negative_configured(BAD_OAUTH_JAAS_CONFIG)
 
 
 def oauthbearer_config_negative_enabled():
-    return oauth_enabled() and bool(BAD_OAUTHBEARER_CONFIG)
+    return (
+        oauth_enabled()
+        and bool(BAD_OAUTHBEARER_CONFIG)
+        and librdkafka_oauthbearer_negative_configured(BAD_OAUTHBEARER_CONFIG)
+    )
 
 
 def oauth_negative_configured():
@@ -353,11 +617,11 @@ def oauth_positive_configured_for_tool(tool):
     if not oauth_enabled():
         return True
     if tool in ("kafka-python", "confluent-kafka"):
-        return bool(OAUTH_TOKEN)
+        return bool(OAUTH_TOKEN) and raw_oauth_token_positive_configured(OAUTH_TOKEN)
     if tool in ("kafka-cli", "java-kafka"):
-        return bool(OAUTH_JAAS_CONFIG)
+        return bool(OAUTH_JAAS_CONFIG) and oauth_jaas_positive_configured(OAUTH_JAAS_CONFIG)
     if tool == "kcat":
-        return bool(OAUTHBEARER_CONFIG)
+        return bool(OAUTHBEARER_CONFIG) and librdkafka_oauthbearer_positive_configured(OAUTHBEARER_CONFIG)
     return False
 
 
@@ -2116,7 +2380,7 @@ def self_test():
         os.environ["ZMQ_CLIENT_MATRIX_APACHE_3_7_SASL_MECHANISM"] = "OAUTHBEARER"
         os.environ["ZMQ_CLIENT_MATRIX_APACHE_3_7_OAUTH_JAAS_CONFIG"] = (
             'org.apache.kafka.common.security.oauthbearer.OAuthBearerLoginModule required '
-            'unsecuredLoginStringClaim_sub="matrix-user";'
+            'unsecuredLoginStringClaim_sub="matrix-user" unsecuredLoginNumberClaim_exp="9999999999";'
         )
         os.environ["ZMQ_CLIENT_MATRIX_APACHE_3_7_BAD_OAUTH_JAAS_CONFIG"] = (
             'org.apache.kafka.common.security.oauthbearer.OAuthBearerLoginModule required '
@@ -2130,6 +2394,33 @@ def self_test():
         java_env = active_security_env()
         if "unsecuredLoginStringClaim_sub" not in java_env.get("ZMQ_CLIENT_MATRIX_OAUTH_JAAS_CONFIG", ""):
             raise MatrixError("Java OAuth environment self-test failed")
+        os.environ["ZMQ_CLIENT_MATRIX_APACHE_3_7_BAD_OAUTH_JAAS_CONFIG"] = (
+            'org.apache.kafka.common.security.oauthbearer.OAuthBearerLoginModule required '
+            'unsecuredLoginStringClaim_sub="matrix-user" unsecuredLoginNumberClaim_exp="9999999999";'
+        )
+        apply_profile("apache_3_7")
+        if oauth_negative_configured_for_tool("java-kafka"):
+            raise MatrixError("future-valid Java bad OAuth JAAS fixture was accepted as negative")
+        os.environ["ZMQ_CLIENT_MATRIX_APACHE_3_7_BAD_OAUTH_JAAS_CONFIG"] = (
+            'org.apache.kafka.common.security.oauthbearer.OAuthBearerLoginModule required '
+            'unsecuredLoginStringClaim_sub="matrix-user" unsecuredLoginNumberClaim_exp="1000";'
+        )
+        os.environ["ZMQ_CLIENT_MATRIX_APACHE_3_7_OAUTH_JAAS_CONFIG"] = (
+            'org.apache.kafka.common.security.oauthbearer.OAuthBearerLoginModule required '
+            'unsecuredLoginStringClaim_sub="matrix-user";'
+        )
+        apply_profile("apache_3_7")
+        try:
+            ensure_tool_supports_semantics("java-kafka")
+            raise MatrixError("missing-exp Java OAuth JAAS fixture was accepted as positive")
+        except MatrixError as exc:
+            if "positive OAuth fixture" not in str(exc):
+                raise
+        os.environ["ZMQ_CLIENT_MATRIX_APACHE_3_7_OAUTH_JAAS_CONFIG"] = (
+            'org.apache.kafka.common.security.oauthbearer.OAuthBearerLoginModule required '
+            'unsecuredLoginStringClaim_sub="matrix-user" unsecuredLoginNumberClaim_exp="9999999999";'
+        )
+        apply_profile("apache_3_7")
         oauth_props_path = kafka_cli_security_config_path()
         try:
             with open(oauth_props_path, "r", encoding="utf-8") as f:
@@ -2138,6 +2429,20 @@ def self_test():
                 raise MatrixError("Kafka CLI OAuth security config self-test failed")
         finally:
             os.unlink(oauth_props_path)
+        if not librdkafka_oauthbearer_positive_configured(
+            "principal=matrix-user lifeSeconds=3600 extension_trace=ok"
+        ):
+            raise MatrixError("kcat OAuth positive config self-test failed")
+        if librdkafka_oauthbearer_positive_configured(
+            "principalClaimName=azp principal=matrix-user lifeSeconds=3600"
+        ):
+            raise MatrixError("kcat OAuth config with unsupported principal claim was accepted")
+        if not librdkafka_oauthbearer_negative_configured(
+            "principalClaimName=azp principal=matrix-user lifeSeconds=3600"
+        ):
+            raise MatrixError("kcat unsupported-principal-claim config was not accepted as negative")
+        if librdkafka_oauthbearer_negative_configured("principal=matrix-user lifeSeconds=3600"):
+            raise MatrixError("future-valid kcat bad OAuth config was accepted as negative")
         os.environ["ZMQ_CLIENT_MATRIX_APACHE_3_7_TOOLS"] = "java-kafka,kcat"
         os.environ["ZMQ_CLIENT_MATRIX_REQUIRED_OAUTH_PROFILES"] = "apache_3_7"
         try:
@@ -2146,6 +2451,33 @@ def self_test():
         except MatrixError as exc:
             if "every selected tool" not in str(exc):
                 raise
+        os.environ["ZMQ_CLIENT_MATRIX_APACHE_3_7_OAUTHBEARER_CONFIG"] = (
+            "principal=matrix-user lifeSeconds=3600"
+        )
+        validate_required_profiles(names)
+        os.environ["ZMQ_CLIENT_MATRIX_REQUIRED_OAUTH_NEGATIVE_PROFILES"] = "apache_3_7"
+        try:
+            validate_required_profiles(names)
+            raise MatrixError("OAuth-negative profile missing a kcat negative fixture was accepted")
+        except MatrixError as exc:
+            if "OAuth negative vector" not in str(exc):
+                raise
+        os.environ["ZMQ_CLIENT_MATRIX_APACHE_3_7_BAD_OAUTHBEARER_CONFIG"] = (
+            "principalClaimName=azp principal=matrix-user lifeSeconds=3600"
+        )
+        validate_required_profiles(names)
+        os.environ["ZMQ_CLIENT_MATRIX_APACHE_3_7_BAD_OAUTHBEARER_CONFIG"] = (
+            "principal=matrix-user lifeSeconds=3600"
+        )
+        try:
+            validate_required_profiles(names)
+            raise MatrixError("future-valid kcat bad OAuth config was accepted")
+        except MatrixError as exc:
+            if "OAuth negative vector" not in str(exc):
+                raise
+        os.environ.pop("ZMQ_CLIENT_MATRIX_APACHE_3_7_OAUTHBEARER_CONFIG", None)
+        os.environ.pop("ZMQ_CLIENT_MATRIX_APACHE_3_7_BAD_OAUTHBEARER_CONFIG", None)
+        os.environ.pop("ZMQ_CLIENT_MATRIX_REQUIRED_OAUTH_NEGATIVE_PROFILES", None)
         os.environ["ZMQ_CLIENT_MATRIX_APACHE_3_7_TOOLS"] = "java-kafka"
         os.environ["ZMQ_CLIENT_MATRIX_REQUIRED_OAUTH_PROFILES"] = "apache_3_7"
         os.environ["ZMQ_CLIENT_MATRIX_REQUIRED_OAUTH_NEGATIVE_PROFILES"] = "apache_3_7"
@@ -2236,6 +2568,39 @@ def self_test():
             raise MatrixError("kafka-python OAuth token provider self-test failed")
         if not security_negative_configured_for_tool("kafka-python"):
             raise MatrixError("kafka-python OAuth negative vector self-test failed")
+        os.environ["ZMQ_CLIENT_MATRIX_GO_1_21_BAD_OAUTH_TOKEN"] = (
+            "eyJhbGciOiJub25lIn0.eyJzdWIiOiJub2V4cCJ9."
+        )
+        apply_profile("go_1_21")
+        if not security_negative_configured_for_tool("kafka-python"):
+            raise MatrixError("kafka-python missing-exp OAuth negative vector self-test failed")
+        os.environ["ZMQ_CLIENT_MATRIX_GO_1_21_BAD_OAUTH_TOKEN"] = (
+            "eyJhbGciOiJub25lIn0.eyJzdWIiOiJtYXRyaXgtdXNlciIsImV4cCI6OTk5OTk5OTk5OX0."
+        )
+        apply_profile("go_1_21")
+        try:
+            ensure_tool_supports_semantics("kafka-python")
+            raise MatrixError("future-valid bad OAuth token was accepted as a negative vector")
+        except MatrixError as exc:
+            if "negative vector" not in str(exc):
+                raise
+        os.environ["ZMQ_CLIENT_MATRIX_GO_1_21_BAD_OAUTH_TOKEN"] = (
+            "eyJhbGciOiJub25lIn0.eyJzdWIiOiJtYXRyaXgtdXNlciIsImV4cCI6MTAwMH0."
+        )
+        os.environ["ZMQ_CLIENT_MATRIX_GO_1_21_OAUTH_TOKEN"] = (
+            "eyJhbGciOiJub25lIn0.eyJzdWIiOiJub2V4cCJ9."
+        )
+        apply_profile("go_1_21")
+        try:
+            ensure_tool_supports_semantics("kafka-python")
+            raise MatrixError("missing-exp OAuth token was accepted as a positive fixture")
+        except MatrixError as exc:
+            if "positive OAuth fixture" not in str(exc):
+                raise
+        os.environ["ZMQ_CLIENT_MATRIX_GO_1_21_OAUTH_TOKEN"] = (
+            "eyJhbGciOiJub25lIn0.eyJzdWIiOiJtYXRyaXgtdXNlciIsImV4cCI6OTk5OTk5OTk5OX0."
+        )
+        apply_profile("go_1_21")
         os.environ["ZMQ_CLIENT_MATRIX_GO_1_21_TOOLS"] = "go-kafka"
         os.environ["ZMQ_CLIENT_MATRIX_GO_1_21_SEMANTICS"] = "admin,groups"
         os.environ.pop("ZMQ_CLIENT_MATRIX_GO_1_21_SECURITY_PROTOCOL", None)

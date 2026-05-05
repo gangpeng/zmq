@@ -2,6 +2,10 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 const log = std.log.scoped(.auto_balancer);
 
+fn monotonicMs() i64 {
+    return @intCast(@import("time_compat").monotonicMilliTimestamp());
+}
+
 /// AutoBalancer computes partition assignments to balance load across nodes.
 /// In ZMQ's cloud-native architecture, partition reassignment is a
 /// metadata-only operation since data lives in S3 — no data movement needed.
@@ -69,7 +73,7 @@ pub const AutoBalancer = struct {
             .allocator = alloc,
             .enabled = true,
             .check_interval_ms = 300_000, // 5 minutes default
-            .last_check_ms = @import("time_compat").milliTimestamp(),
+            .last_check_ms = monotonicMs(),
         };
     }
 
@@ -80,12 +84,12 @@ pub const AutoBalancer = struct {
     /// Check if it's time to rebalance.
     pub fn shouldCheck(self: *const AutoBalancer) bool {
         if (!self.enabled) return false;
-        const now = @import("time_compat").milliTimestamp();
-        return (now - self.last_check_ms) >= self.check_interval_ms;
+        const now = monotonicMs();
+        return self.last_check_ms == 0 or (now - self.last_check_ms) >= self.check_interval_ms;
     }
 
     pub fn markChecked(self: *AutoBalancer) void {
-        self.last_check_ms = @import("time_compat").milliTimestamp();
+        self.last_check_ms = monotonicMs();
     }
 
     /// Compute partition assignments to balance load across nodes.
@@ -95,10 +99,10 @@ pub const AutoBalancer = struct {
         self: *AutoBalancer,
         nodes: []const i32,
         loads: []const PartitionLoad,
-    ) ?RebalancePlan {
+    ) !?RebalancePlan {
         if (nodes.len == 0) return null;
 
-        const node_infos = self.allocator.alloc(NodeInfo, nodes.len) catch return null;
+        const node_infos = try self.allocator.alloc(NodeInfo, nodes.len);
         defer self.allocator.free(node_infos);
         for (nodes, 0..) |node_id, i| {
             node_infos[i] = .{ .node_id = node_id };
@@ -115,7 +119,7 @@ pub const AutoBalancer = struct {
         self: *AutoBalancer,
         nodes: []const NodeInfo,
         loads: []const PartitionLoad,
-    ) ?RebalancePlan {
+    ) !?RebalancePlan {
         return self.computeRackAwareRebalancePlanWithOptions(nodes, loads, .{});
     }
 
@@ -127,10 +131,10 @@ pub const AutoBalancer = struct {
         self: *AutoBalancer,
         brokers: []const BrokerNode,
         loads: []const PartitionLoad,
-    ) ?RebalancePlan {
+    ) !?RebalancePlan {
         if (loads.len == 0) return null;
 
-        const nodes = self.collectActiveBrokerNodes(brokers) catch return null;
+        const nodes = try self.collectActiveBrokerNodes(brokers);
         defer self.allocator.free(nodes);
         if (nodes.len == 0) return null;
 
@@ -146,11 +150,11 @@ pub const AutoBalancer = struct {
         nodes: []const NodeInfo,
         loads: []const PartitionLoad,
         options: PlannerOptions,
-    ) ?RebalancePlan {
+    ) !?RebalancePlan {
         if (nodes.len == 0 or loads.len == 0) return null;
         if (nodes.len <= 1 and !options.move_inactive_leaders) return null;
 
-        const sorted_loads = self.allocator.dupe(PartitionLoad, loads) catch return null;
+        const sorted_loads = try self.allocator.dupe(PartitionLoad, loads);
         defer self.allocator.free(sorted_loads);
         std.mem.sort(PartitionLoad, sorted_loads, {}, partitionLoadGreaterThan);
 
@@ -158,7 +162,7 @@ pub const AutoBalancer = struct {
         var node_loads = std.AutoHashMap(i32, f64).init(self.allocator);
         defer node_loads.deinit();
         for (nodes) |node| {
-            node_loads.put(node.node_id, 0.0) catch continue;
+            try node_loads.put(node.node_id, 0.0);
         }
         for (sorted_loads) |pl| {
             if (node_loads.getPtr(pl.leader_node)) |nl| {
@@ -183,18 +187,19 @@ pub const AutoBalancer = struct {
 
         // Find overloaded nodes and generate moves
         var plan = RebalancePlan.init(self.allocator);
+        errdefer plan.deinit();
         if (options.move_inactive_leaders) {
             for (sorted_loads) |pl| {
                 if (node_loads.get(pl.leader_node) != null) continue;
                 const target = self.chooseLeastLoadedTarget(nodes, &node_loads) orelse continue;
                 if (target.node_id == pl.leader_node) continue;
 
-                plan.moves.append(.{
+                try plan.moves.append(.{
                     .topic = pl.topic,
                     .partition_id = pl.partition_id,
                     .from_node = pl.leader_node,
                     .to_node = target.node_id,
-                }) catch continue;
+                });
 
                 if (node_loads.getPtr(target.node_id)) |to| {
                     to.* += pl.totalLoad();
@@ -211,12 +216,12 @@ pub const AutoBalancer = struct {
             const target = self.chooseRebalanceTarget(nodes, &node_loads, pl.leader_node, current_node_load) orelse continue;
 
             if (target.node_id != pl.leader_node and target.load < current_node_load * 0.8) {
-                plan.moves.append(.{
+                try plan.moves.append(.{
                     .topic = pl.topic,
                     .partition_id = pl.partition_id,
                     .from_node = pl.leader_node,
                     .to_node = target.node_id,
-                }) catch continue;
+                });
 
                 // Update load tracking
                 if (node_loads.getPtr(pl.leader_node)) |from| {
@@ -228,7 +233,7 @@ pub const AutoBalancer = struct {
             }
         }
 
-        self.last_check_ms = @import("time_compat").milliTimestamp();
+        self.last_check_ms = monotonicMs();
 
         if (plan.moveCount() > 0) {
             log.info("Rebalance plan: {d} partition moves", .{plan.moveCount()});
@@ -376,7 +381,7 @@ test "AutoBalancer single node returns null plan" {
         .{ .topic = "t", .partition_id = 0, .bytes_in_rate = 1000, .bytes_out_rate = 500, .leader_node = 0 },
     };
 
-    const plan = ab.computeRebalancePlan(&nodes, &loads);
+    const plan = try ab.computeRebalancePlan(&nodes, &loads);
     try testing.expect(plan == null);
 }
 
@@ -390,7 +395,7 @@ test "AutoBalancer balanced cluster returns null plan" {
         .{ .topic = "t", .partition_id = 1, .bytes_in_rate = 1000, .bytes_out_rate = 500, .leader_node = 1 },
     };
 
-    const plan = ab.computeRebalancePlan(&nodes, &loads);
+    const plan = try ab.computeRebalancePlan(&nodes, &loads);
     if (plan) |*p| {
         var mp = @constCast(p);
         mp.deinit();
@@ -410,7 +415,7 @@ test "AutoBalancer imbalanced cluster generates moves" {
         .{ .topic = "t", .partition_id = 3, .bytes_in_rate = 100, .bytes_out_rate = 100, .leader_node = 1 },
     };
 
-    const plan = ab.computeRebalancePlan(&nodes, &loads);
+    const plan = try ab.computeRebalancePlan(&nodes, &loads);
     try testing.expect(plan != null);
     if (plan) |*p| {
         var mp = @constCast(p);
@@ -433,7 +438,7 @@ test "AutoBalancer rack-aware plan prefers different rack target" {
         .{ .topic = "t", .partition_id = 1, .bytes_in_rate = 6000, .bytes_out_rate = 6000, .leader_node = 0 },
     };
 
-    const plan = ab.computeRackAwareRebalancePlan(&nodes, &loads);
+    const plan = try ab.computeRackAwareRebalancePlan(&nodes, &loads);
     try testing.expect(plan != null);
     if (plan) |*p| {
         var mp = @constCast(p);
@@ -457,7 +462,7 @@ test "AutoBalancer rack-aware plan falls back when racks are equivalent" {
         .{ .topic = "t", .partition_id = 1, .bytes_in_rate = 100, .bytes_out_rate = 100, .leader_node = 1 },
     };
 
-    const plan = ab.computeRackAwareRebalancePlan(&nodes, &loads);
+    const plan = try ab.computeRackAwareRebalancePlan(&nodes, &loads);
     try testing.expect(plan != null);
     if (plan) |*p| {
         var mp = @constCast(p);
@@ -477,7 +482,7 @@ test "AutoBalancer ignores stale unknown-node load when computing average" {
         .{ .topic = "stale", .partition_id = 0, .bytes_in_rate = 100000, .bytes_out_rate = 100000, .leader_node = 99 },
     };
 
-    const plan = ab.computeRebalancePlan(&nodes, &loads);
+    const plan = try ab.computeRebalancePlan(&nodes, &loads);
     try testing.expect(plan != null);
     if (plan) |*p| {
         var mp = @constCast(p);
@@ -502,7 +507,7 @@ test "AutoBalancer plan converges simulated node load within tolerance" {
         .{ .topic = "t", .partition_id = 5, .bytes_in_rate = 1000, .bytes_out_rate = 0, .leader_node = 2 },
     };
 
-    const plan = ab.computeRebalancePlan(&nodes, &loads);
+    const plan = try ab.computeRebalancePlan(&nodes, &loads);
     try testing.expect(plan != null);
     if (plan) |*p| {
         var mp = @constCast(p);
@@ -551,7 +556,7 @@ test "AutoBalancer controller-aware plan uses active broker racks and moves fenc
         .{ .topic = "fenced", .partition_id = 0, .bytes_in_rate = 100, .bytes_out_rate = 0, .leader_node = 2 },
     };
 
-    const plan = ab.computeControllerAwareRebalancePlan(&brokers, &loads);
+    const plan = try ab.computeControllerAwareRebalancePlan(&brokers, &loads);
     try testing.expect(plan != null);
     if (plan) |*p| {
         var mp = @constCast(p);
@@ -579,7 +584,7 @@ test "AutoBalancer controller-aware plan spreads hot partitions after scale out"
         .{ .topic = "scale", .partition_id = 2, .bytes_in_rate = 6000, .bytes_out_rate = 0, .leader_node = 0 },
     };
 
-    const plan = ab.computeControllerAwareRebalancePlan(&brokers, &loads);
+    const plan = try ab.computeControllerAwareRebalancePlan(&brokers, &loads);
     try testing.expect(plan != null);
     if (plan) |*p| {
         var mp = @constCast(p);
@@ -605,6 +610,24 @@ test "AutoBalancer empty loads returns null" {
     const nodes = [_]i32{ 0, 1 };
     const loads = [_]AutoBalancer.PartitionLoad{};
 
-    const plan = ab.computeRebalancePlan(&nodes, &loads);
+    const plan = try ab.computeRebalancePlan(&nodes, &loads);
     try testing.expect(plan == null);
+}
+
+test "AutoBalancer node load allocation failure fails closed" {
+    var failing_allocator = std.testing.FailingAllocator.init(testing.allocator, .{ .fail_index = 1 });
+    var ab = AutoBalancer.init(failing_allocator.allocator());
+    defer ab.deinit();
+
+    const nodes = [_]AutoBalancer.NodeInfo{
+        .{ .node_id = 0, .rack = "rack-a" },
+        .{ .node_id = 1, .rack = "rack-b" },
+    };
+    const loads = [_]AutoBalancer.PartitionLoad{
+        .{ .topic = "oom", .partition_id = 0, .bytes_in_rate = 6000, .bytes_out_rate = 6000, .leader_node = 0 },
+        .{ .topic = "oom", .partition_id = 1, .bytes_in_rate = 100, .bytes_out_rate = 100, .leader_node = 1 },
+    };
+
+    try testing.expectError(error.OutOfMemory, ab.computeRackAwareRebalancePlan(&nodes, &loads));
+    try testing.expect(failing_allocator.has_induced_failure);
 }

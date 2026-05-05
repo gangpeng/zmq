@@ -5,6 +5,10 @@ const fs = @import("fs_compat");
 const log = std.log.scoped(.raft);
 const MetricRegistry = @import("core").MetricRegistry;
 
+fn monotonicMs() i64 {
+    return @intCast(@import("time_compat").monotonicMilliTimestamp());
+}
+
 /// KRaft Raft consensus state machine.
 ///
 /// Implements the Raft consensus protocol as used by Kafka's KRaft mode.
@@ -61,6 +65,13 @@ pub const RaftState = struct {
         resigned,
     };
 
+    const VolatileRoleState = struct {
+        current_epoch: i32,
+        role: Role,
+        leader_id: ?i32,
+        voted_for: ?i32,
+    };
+
     pub const VoterInfo = struct {
         node_id: i32,
         voter_directory_id: [16]u8 = zero_uuid,
@@ -71,6 +82,22 @@ pub const RaftState = struct {
         next_index: u64 = 0,
         last_heartbeat_ms: i64 = 0,
     };
+
+    fn captureRoleState(self: *const RaftState) VolatileRoleState {
+        return .{
+            .current_epoch = self.current_epoch,
+            .role = self.role,
+            .leader_id = self.leader_id,
+            .voted_for = self.voted_for,
+        };
+    }
+
+    fn restoreRoleState(self: *RaftState, previous: VolatileRoleState) void {
+        self.current_epoch = previous.current_epoch;
+        self.role = previous.role;
+        self.leader_id = previous.leader_id;
+        self.voted_for = previous.voted_for;
+    }
 
     pub const VoterEndpoint = struct {
         name: []u8,
@@ -220,6 +247,8 @@ pub const RaftState = struct {
             return .{ .vote_granted = false, .epoch = self.current_epoch };
         }
 
+        const previous = self.captureRoleState();
+
         // Grant vote
         if (candidate_epoch > self.current_epoch) {
             self.current_epoch = candidate_epoch;
@@ -229,7 +258,12 @@ pub const RaftState = struct {
         self.voted_for = candidate_id;
         // Persist to disk BEFORE granting the vote — crash safety requires
         // that voted_for is durable before the vote response is sent.
-        self.persistRaftMeta();
+        self.persistRaftMeta() catch |err| {
+            self.restoreRoleState(previous);
+            log.warn("Vote rejected from node {d}: failed to persist raft.meta for epoch {d}: {}", .{ candidate_id, candidate_epoch, err });
+            if (self.metrics) |m| m.incrementCounter("raft_votes_rejected_total");
+            return .{ .vote_granted = false, .epoch = self.current_epoch };
+        };
         // Reset election timer: granting a vote means the cluster is active,
         // so we shouldn't start our own election immediately.
         self.election_timer.reset();
@@ -249,13 +283,18 @@ pub const RaftState = struct {
     };
 
     /// Start an election. Transitions to candidate and votes for self.
-    pub fn startElection(self: *RaftState) ElectionResult {
+    pub fn startElection(self: *RaftState) !ElectionResult {
+        const previous = self.captureRoleState();
         self.current_epoch += 1;
         self.role = .candidate;
         self.voted_for = self.node_id;
         self.leader_id = null;
         // Persist new epoch and self-vote to disk before broadcasting
-        self.persistRaftMeta();
+        self.persistRaftMeta() catch |err| {
+            self.restoreRoleState(previous);
+            log.warn("Election not started: failed to persist raft.meta for epoch {d}: {}", .{ previous.current_epoch + 1, err });
+            return err;
+        };
         self.election_timer.reset();
         log.info("Starting election: node {d} becoming candidate for epoch {d}", .{ self.node_id, self.current_epoch });
 
@@ -347,17 +386,22 @@ pub const RaftState = struct {
     /// Called when we discover a leader with a higher epoch.
     /// Only accepts epoch >= current_epoch. Lower epochs are ignored
     /// (they represent stale messages from a previous leader).
-    pub fn becomeFollower(self: *RaftState, epoch: i32, leader_id: i32) void {
+    pub fn becomeFollower(self: *RaftState, epoch: i32, leader_id: i32) !void {
         if (epoch < self.current_epoch) {
             log.debug("Ignoring stale becomeFollower: epoch {d} < current {d}", .{ epoch, self.current_epoch });
             return;
         }
+        const previous = self.captureRoleState();
         self.current_epoch = epoch;
         self.role = .follower;
         self.leader_id = leader_id;
         self.voted_for = null;
         // Persist epoch change to disk
-        self.persistRaftMeta();
+        self.persistRaftMeta() catch |err| {
+            self.restoreRoleState(previous);
+            log.warn("Failed to become follower for leader {d} epoch={d}: could not persist raft.meta: {}", .{ leader_id, epoch, err });
+            return err;
+        };
         self.election_timer.reset();
         log.info("Node {d} became follower: epoch={d}, leader={d}", .{ self.node_id, epoch, leader_id });
 
@@ -378,6 +422,8 @@ pub const RaftState = struct {
         if (self.data_dir) |dir| {
             self.persistEntry(dir, self.current_epoch, offset, data) catch |err| {
                 log.warn("Failed to persist raft log entry: {}", .{err});
+                self.log.truncateFrom(offset);
+                return err;
             };
         }
 
@@ -421,19 +467,23 @@ pub const RaftState = struct {
     /// Persist current_epoch and voted_for to disk.
     /// Called before granting a vote or changing epoch to ensure crash safety.
     /// Without this, a process restart could lead to double-voting in the same epoch.
-    fn persistRaftMeta(self: *RaftState) void {
+    fn persistRaftMeta(self: *RaftState) !void {
         const dir = self.data_dir orelse return;
-        const path = std.fmt.allocPrint(self.allocator, "{s}/raft.meta", .{dir}) catch return;
+        const path = try std.fmt.allocPrint(self.allocator, "{s}/raft.meta", .{dir});
         defer self.allocator.free(path);
+        const tmp_path = try std.fmt.allocPrint(self.allocator, "{s}/raft.meta.tmp", .{dir});
+        defer self.allocator.free(tmp_path);
+        errdefer fs.deleteFileAbsolute(tmp_path) catch {};
 
         // Ensure directory exists
         fs.makeDirAbsolute(dir) catch |err| switch (err) {
             error.PathAlreadyExists => {},
-            else => return,
+            else => return err,
         };
 
-        const file = fs.createFileAbsolute(path, .{ .truncate = true }) catch return;
-        defer file.close();
+        const file = try fs.createFileAbsolute(tmp_path, .{ .truncate = true });
+        var file_open = true;
+        defer if (file_open) file.close();
 
         // Write: current_epoch(i32, 4B) + voted_for_present(u8, 1B) + voted_for(i32, 4B)
         var buf: [9]u8 = undefined;
@@ -445,28 +495,34 @@ pub const RaftState = struct {
             buf[4] = 0;
             std.mem.writeInt(i32, buf[5..9], 0, .big);
         }
-        file.writeAll(&buf) catch |err| {
-            log.warn("Failed to persist raft.meta (epoch={d}, voted_for={?d}): {}", .{ self.current_epoch, self.voted_for, err });
-        };
+        try file.writeAll(&buf);
+        try file.sync();
+        file.close();
+        file_open = false;
+        try renameAbsolute(tmp_path, path);
     }
 
     /// Load persisted current_epoch and voted_for from disk on startup.
     /// Returns true if metadata was loaded successfully.
-    pub fn loadPersistedMeta(self: *RaftState) bool {
+    pub fn loadPersistedMeta(self: *RaftState) !bool {
         const dir = self.data_dir orelse return false;
-        const path = std.fmt.allocPrint(self.allocator, "{s}/raft.meta", .{dir}) catch return false;
+        const path = try std.fmt.allocPrint(self.allocator, "{s}/raft.meta", .{dir});
         defer self.allocator.free(path);
 
-        const file = fs.openFileAbsolute(path, .{}) catch return false;
+        const file = fs.openFileAbsolute(path, .{}) catch |err| switch (err) {
+            error.FileNotFound => return false,
+            else => return err,
+        };
         defer file.close();
 
-        var buf: [9]u8 = undefined;
-        const n = file.readAll(&buf) catch return false;
-        if (n < 9) return false;
+        const content = try file.readToEndAlloc(self.allocator, 64);
+        defer self.allocator.free(content);
+        if (content.len != 9) return error.CorruptRaftMeta;
+        if (content[4] != 0 and content[4] != 1) return error.CorruptRaftMeta;
 
-        const epoch = std.mem.readInt(i32, buf[0..4], .big);
-        const has_voted = buf[4] == 1;
-        const voted = std.mem.readInt(i32, buf[5..9], .big);
+        const epoch = std.mem.readInt(i32, content[0..4], .big);
+        const has_voted = content[4] == 1;
+        const voted = std.mem.readInt(i32, content[5..9], .big);
 
         if (epoch > self.current_epoch) {
             self.current_epoch = epoch;
@@ -481,35 +537,48 @@ pub const RaftState = struct {
     /// Load and replay persisted raft log entries on startup.
     pub fn loadPersistedLog(self: *RaftState) !u64 {
         // Load persisted epoch and voted_for first
-        _ = self.loadPersistedMeta();
+        _ = try self.loadPersistedMeta();
 
         // Load snapshot metadata (if any) to know which entries were compacted
-        _ = self.loadSnapshotMeta();
+        _ = try self.loadSnapshotMeta();
 
         const dir = self.data_dir orelse return 0;
         log.info("Starting Raft log recovery from {s}", .{dir});
         const path = try std.fmt.allocPrint(self.allocator, "{s}/raft.log", .{dir});
         defer self.allocator.free(path);
 
-        const file = fs.openFileAbsolute(path, .{}) catch return 0;
+        const file = fs.openFileAbsolute(path, .{}) catch |err| switch (err) {
+            error.FileNotFound => return 0,
+            else => return err,
+        };
         defer file.close();
 
-        const content = file.readToEndAlloc(self.allocator, 256 * 1024 * 1024) catch return 0;
+        const content = try file.readToEndAlloc(self.allocator, 256 * 1024 * 1024);
         defer self.allocator.free(content);
+
+        const rollback_offset = self.log.nextOffset();
+        errdefer self.log.truncateFrom(rollback_offset);
 
         var recovered: u64 = 0;
         var pos: usize = 0;
-        while (pos + 20 <= content.len) {
-            const epoch: i32 = @intCast(std.mem.readInt(i64, content[pos..][0..8], .big));
-            // skip offset at pos+8
-            const data_len = std.mem.readInt(u32, content[pos + 16 ..][0..4], .big);
+        while (pos < content.len) {
+            if (content.len - pos < 20) return error.CorruptRaftLog;
+            const epoch_raw = std.mem.readInt(i64, content[pos..][0..8], .big);
+            if (epoch_raw < std.math.minInt(i32) or epoch_raw > std.math.maxInt(i32)) return error.CorruptRaftLog;
+            const epoch: i32 = @intCast(epoch_raw);
+            const persisted_offset = std.mem.readInt(u64, content[pos + 8 ..][0..8], .big);
+            const data_len: usize = @intCast(std.mem.readInt(u32, content[pos + 16 ..][0..4], .big));
             pos += 20;
-            if (pos + data_len > content.len) break;
+            if (data_len > content.len - pos) return error.CorruptRaftLog;
+            if (persisted_offset != self.log.nextOffset()) {
+                log.warn("Raft log recovery rejected non-contiguous offset: persisted={d}, expected={d}", .{
+                    persisted_offset,
+                    self.log.nextOffset(),
+                });
+                return error.CorruptRaftLog;
+            }
             const data = content[pos .. pos + data_len];
-            _ = self.log.append(epoch, data) catch |err| {
-                log.warn("Raft log recovery truncated at entry {d}: {}", .{ recovered, err });
-                break;
-            };
+            _ = try self.log.append(epoch, data);
             pos += data_len;
             recovered += 1;
 
@@ -838,7 +907,10 @@ pub const RaftState = struct {
 
         // Accept leadership
         if (leader_epoch >= self.current_epoch) {
-            self.becomeFollower(leader_epoch, leader_id);
+            self.becomeFollower(leader_epoch, leader_id) catch |err| {
+                log.warn("AppendEntries rejected: failed to persist follower epoch {d} from leader {d}: {}", .{ leader_epoch, leader_id, err });
+                return .{ .success = false, .epoch = self.current_epoch, .match_index = self.log.lastOffset() };
+            };
         }
 
         // Validate prev_log match (skip for first entry)
@@ -862,10 +934,19 @@ pub const RaftState = struct {
             }
             // Only append if we don't already have this entry
             if (self.log.get(entry.offset) == null) {
-                const appended_offset = self.log.append(entry.epoch, entry.data) catch continue;
+                if (self.log.nextOffset() != entry.offset) {
+                    log.warn("AppendEntries rejected: non-contiguous entry offset {d}, next offset {d}", .{ entry.offset, self.log.nextOffset() });
+                    return .{ .success = false, .epoch = self.current_epoch, .match_index = self.log.lastOffset() };
+                }
+                const appended_offset = self.log.append(entry.epoch, entry.data) catch |err| {
+                    log.warn("AppendEntries rejected: failed to append follower raft log entry: {}", .{err});
+                    return .{ .success = false, .epoch = self.current_epoch, .match_index = self.log.lastOffset() };
+                };
                 if (self.data_dir) |dir| {
                     self.persistEntry(dir, entry.epoch, appended_offset, entry.data) catch |err| {
-                        log.warn("Failed to persist follower raft log entry: {}", .{err});
+                        log.warn("AppendEntries rejected: failed to persist follower raft log entry: {}", .{err});
+                        self.log.truncateFrom(appended_offset);
+                        return .{ .success = false, .epoch = self.current_epoch, .match_index = self.log.lastOffset() };
                     };
                 }
             }
@@ -881,7 +962,7 @@ pub const RaftState = struct {
 
     /// Handle an AppendEntries response from a follower.
     /// Updates match_index and next_index for the follower.
-    pub fn handleAppendEntriesResponse(self: *RaftState, follower_id: i32, response: AppendEntriesResponse) void {
+    pub fn handleAppendEntriesResponse(self: *RaftState, follower_id: i32, response: AppendEntriesResponse) !void {
         if (self.role != .leader) return;
 
         // If the follower has a higher epoch, step down.
@@ -891,6 +972,10 @@ pub const RaftState = struct {
             self.role = .unattached;
             self.leader_id = null;
             self.voted_for = null;
+            self.persistRaftMeta() catch |err| {
+                log.warn("Stepped down in memory but failed to persist higher follower epoch {d}: {}", .{ response.epoch, err });
+                return err;
+            };
             self.election_timer.reset();
             return;
         }
@@ -899,7 +984,7 @@ pub const RaftState = struct {
         if (response.success) {
             voter.match_index = response.match_index;
             voter.next_index = if (self.log.length() == 0) 0 else response.match_index + 1;
-            voter.last_heartbeat_ms = @import("time_compat").milliTimestamp();
+            voter.last_heartbeat_ms = monotonicMs();
 
             // Recompute commit index after match_index update
             self.updateCommitIndex();
@@ -960,7 +1045,11 @@ pub const RaftState = struct {
                         const old_commit = self.commit_index;
                         self.commit_index = new_commit;
                         // Apply any newly committed config changes
-                        self.applyCommittedConfigs();
+                        self.applyCommittedConfigs() catch |err| {
+                            log.warn("Failed to apply committed config changes at offset {d}: {}", .{ new_commit, err });
+                            self.commit_index = old_commit;
+                            return;
+                        };
                         if (self.metrics) |m| {
                             m.addCounter("raft_log_entries_committed_total", new_commit - old_commit);
                             m.setGauge("raft_commit_index", @floatFromInt(new_commit));
@@ -1080,7 +1169,7 @@ pub const RaftState = struct {
     /// Apply any committed config change entries.
     /// Called after commit_index advances. Scans newly committed entries
     /// for config changes and applies them to the voter set.
-    pub fn applyCommittedConfigs(self: *RaftState) void {
+    pub fn applyCommittedConfigs(self: *RaftState) !void {
         for (self.log.entries.items) |entry| {
             if (entry.offset > self.commit_index) break;
             // Only process entries we haven't applied yet
@@ -1088,17 +1177,14 @@ pub const RaftState = struct {
                 if (entry.offset <= last_offset) continue;
             }
 
-            if (ConfigChangeEntry.deserializeVoterMetadataChange(self.allocator, entry.data) catch null) |change| {
+            if (ConfigChangeEntry.isVoterMetadataChange(entry.data)) {
+                const change = (try ConfigChangeEntry.deserializeVoterMetadataChange(self.allocator, entry.data)) orelse return error.CorruptConfigChangeEntry;
                 var mutable_change = change;
                 defer mutable_change.deinit(self.allocator);
                 switch (change.change_type) {
                     .add_voter => {
-                        self.addVoter(change.voter_id) catch |err| {
-                            log.warn("Config apply failed: add voter {d}: {}", .{ change.voter_id, err });
-                            self.last_applied_config_offset = entry.offset;
-                            self.pending_config_change = false;
-                            continue;
-                        };
+                        const had_voter = self.voters.contains(change.voter_id);
+                        try self.addVoter(change.voter_id);
                         self.updateVoterMetadata(
                             change.voter_id,
                             change.voter_directory_id,
@@ -1107,6 +1193,8 @@ pub const RaftState = struct {
                             change.k_raft_max_supported_version,
                         ) catch |err| {
                             log.warn("Config apply failed: add voter {d} endpoint metadata: {}", .{ change.voter_id, err });
+                            if (!had_voter) self.removeVoter(change.voter_id);
+                            return err;
                         };
                         log.info("Config applied: added voter {d} with endpoint metadata (now {d} voters)", .{
                             change.voter_id, self.voters.count(),
@@ -1121,9 +1209,7 @@ pub const RaftState = struct {
                             change.k_raft_max_supported_version,
                         ) catch |err| {
                             log.warn("Config apply failed: update voter {d}: {}", .{ change.voter_id, err });
-                            self.last_applied_config_offset = entry.offset;
-                            self.pending_config_change = false;
-                            continue;
+                            return err;
                         };
                         log.info("Config applied: updated voter {d} endpoint metadata", .{change.voter_id});
                     },
@@ -1134,7 +1220,7 @@ pub const RaftState = struct {
             } else if (ConfigChangeEntry.deserialize(entry.data)) |config| {
                 switch (config.change_type) {
                     .add_voter => {
-                        self.addVoter(config.voter_id) catch {};
+                        try self.addVoter(config.voter_id);
                         log.info("Config applied: added voter {d} (now {d} voters)", .{
                             config.voter_id, self.voters.count(),
                         });
@@ -1175,31 +1261,26 @@ pub const RaftState = struct {
 
     /// Create a snapshot at the current commit_index and truncate the log.
     /// Only entries at or after commit_index are kept.
-    pub fn takeSnapshot(self: *RaftState) void {
+    pub fn takeSnapshot(self: *RaftState) !void {
         if (self.commit_index == 0) return;
         if (self.commit_index <= self.last_snapshot_offset) return;
 
-        // Record snapshot metadata
+        var snapshot_epoch = self.last_snapshot_epoch;
         if (self.log.get(self.commit_index)) |entry| {
-            self.last_snapshot_epoch = entry.epoch;
+            snapshot_epoch = entry.epoch;
         }
-        self.last_snapshot_offset = self.commit_index;
+        const snapshot_offset = self.commit_index;
 
-        // Truncate log entries before commit_index
-        self.log.truncateBefore(self.commit_index);
-
-        // Persist snapshot metadata
         if (self.data_dir) |dir| {
-            self.persistSnapshotMeta(dir) catch {};
-
-            // Persist prepared object registry alongside the Raft snapshot.
-            // This ensures prepared objects survive Raft log truncation.
             if (self.prepared_registry_data) |reg_data| {
-                self.persistPreparedRegistry(dir, reg_data) catch |err| {
-                    log.warn("Failed to persist prepared.snapshot: {}", .{err});
-                };
+                try self.persistPreparedRegistry(dir, reg_data);
             }
+            try self.persistSnapshotMeta(dir, snapshot_offset, snapshot_epoch);
         }
+
+        self.last_snapshot_epoch = snapshot_epoch;
+        self.last_snapshot_offset = snapshot_offset;
+        self.log.truncateBefore(snapshot_offset);
 
         if (self.metrics) |m| {
             m.incrementCounter("raft_snapshots_taken_total");
@@ -1212,34 +1293,72 @@ pub const RaftState = struct {
         return self.log.length() > max_entries;
     }
 
-    fn persistSnapshotMeta(self: *RaftState, dir: []const u8) !void {
+    fn persistSnapshotMeta(self: *RaftState, dir: []const u8, snapshot_offset: u64, snapshot_epoch: i32) !void {
+        const path = try std.fmt.allocPrint(self.allocator, "{s}/snapshot.meta", .{dir});
+        defer self.allocator.free(path);
+        const tmp_path = try std.fmt.allocPrint(self.allocator, "{s}/snapshot.meta.tmp", .{dir});
+        defer self.allocator.free(tmp_path);
+        errdefer fs.deleteFileAbsolute(tmp_path) catch {};
+
+        const file = try fs.createFileAbsolute(tmp_path, .{ .truncate = true });
+        var file_open = true;
+        defer if (file_open) file.close();
+
+        var buf: [16]u8 = undefined;
+        std.mem.writeInt(u64, buf[0..8], snapshot_offset, .big);
+        std.mem.writeInt(i32, buf[8..12], snapshot_epoch, .big);
+        std.mem.writeInt(i32, buf[12..16], self.current_epoch, .big);
+        try file.writeAll(&buf);
+        try file.sync();
+        file.close();
+        file_open = false;
+        try renameAbsolute(tmp_path, path);
+    }
+
+    fn renameAbsolute(old_path: []const u8, new_path: []const u8) !void {
+        const old_path_z = try std.posix.toPosixPath(old_path);
+        const new_path_z = try std.posix.toPosixPath(new_path);
+        switch (std.posix.errno(std.os.linux.rename(&old_path_z, &new_path_z))) {
+            .SUCCESS => return,
+            .ACCES => return error.AccessDenied,
+            .PERM => return error.PermissionDenied,
+            .BUSY => return error.FileBusy,
+            .DQUOT => return error.DiskQuota,
+            .EXIST => return error.PathAlreadyExists,
+            .FAULT => unreachable,
+            .INVAL => return error.InvalidPath,
+            .ISDIR => return error.IsDir,
+            .LOOP => return error.SymLinkLoop,
+            .MLINK => return error.LinkQuotaExceeded,
+            .NAMETOOLONG => return error.NameTooLong,
+            .NOENT => return error.FileNotFound,
+            .NOMEM => return error.SystemResources,
+            .NOSPC => return error.NoSpaceLeft,
+            .NOTDIR => return error.NotDir,
+            .NOTEMPTY => return error.PathAlreadyExists,
+            .ROFS => return error.ReadOnlyFileSystem,
+            .XDEV => return error.RenameAcrossMountPoints,
+            else => |err| return std.posix.unexpectedErrno(err),
+        }
+    }
+
+    pub fn loadSnapshotMeta(self: *RaftState) !bool {
+        const dir = self.data_dir orelse return false;
         const path = try std.fmt.allocPrint(self.allocator, "{s}/snapshot.meta", .{dir});
         defer self.allocator.free(path);
 
-        const file = try fs.createFileAbsolute(path, .{ .truncate = true });
+        const file = fs.openFileAbsolute(path, .{}) catch |err| switch (err) {
+            error.FileNotFound => return false,
+            else => return err,
+        };
         defer file.close();
 
-        var buf: [16]u8 = undefined;
-        std.mem.writeInt(u64, buf[0..8], self.last_snapshot_offset, .big);
-        std.mem.writeInt(i32, buf[8..12], self.last_snapshot_epoch, .big);
-        std.mem.writeInt(i32, buf[12..16], self.current_epoch, .big);
-        try file.writeAll(&buf);
-    }
+        const content = try file.readToEndAlloc(self.allocator, 64);
+        defer self.allocator.free(content);
+        if (content.len != 16) return error.CorruptRaftSnapshotMeta;
 
-    pub fn loadSnapshotMeta(self: *RaftState) bool {
-        const dir = self.data_dir orelse return false;
-        const path = std.fmt.allocPrint(self.allocator, "{s}/snapshot.meta", .{dir}) catch return false;
-        defer self.allocator.free(path);
-
-        const file = fs.openFileAbsolute(path, .{}) catch return false;
-        defer file.close();
-
-        var buf: [16]u8 = undefined;
-        const n = file.readAll(&buf) catch return false;
-        if (n < 16) return false;
-
-        self.last_snapshot_offset = std.mem.readInt(u64, buf[0..8], .big);
-        self.last_snapshot_epoch = std.mem.readInt(i32, buf[8..12], .big);
+        self.last_snapshot_offset = std.mem.readInt(u64, content[0..8], .big);
+        self.last_snapshot_epoch = std.mem.readInt(i32, content[8..12], .big);
         return true;
     }
 
@@ -1247,36 +1366,44 @@ pub const RaftState = struct {
     fn persistPreparedRegistry(self: *RaftState, dir: []const u8, data: []const u8) !void {
         const path = try std.fmt.allocPrint(self.allocator, "{s}/prepared.snapshot", .{dir});
         defer self.allocator.free(path);
+        const tmp_path = try std.fmt.allocPrint(self.allocator, "{s}/prepared.snapshot.tmp", .{dir});
+        defer self.allocator.free(tmp_path);
+        errdefer fs.deleteFileAbsolute(tmp_path) catch {};
 
-        const file = try fs.createFileAbsolute(path, .{ .truncate = true });
-        defer file.close();
+        const file = try fs.createFileAbsolute(tmp_path, .{ .truncate = true });
+        var file_open = true;
+        defer if (file_open) file.close();
 
         try file.writeAll(data);
+        try file.sync();
+        file.close();
+        file_open = false;
+        try renameAbsolute(tmp_path, path);
         log.info("Persisted prepared.snapshot ({d} bytes)", .{data.len});
     }
 
     /// Load persisted PreparedObjectRegistry data from {data_dir}/prepared.snapshot.
     /// Returns the raw bytes (caller-owned) or null if the file doesn't exist.
-    pub fn loadPreparedRegistry(self: *RaftState) ?[]u8 {
+    pub fn loadPreparedRegistry(self: *RaftState) !?[]u8 {
         const dir = self.data_dir orelse return null;
-        const path = std.fmt.allocPrint(self.allocator, "{s}/prepared.snapshot", .{dir}) catch return null;
+        const path = try std.fmt.allocPrint(self.allocator, "{s}/prepared.snapshot", .{dir});
         defer self.allocator.free(path);
 
-        const file = fs.openFileAbsolute(path, .{}) catch return null;
+        const file = fs.openFileAbsolute(path, .{}) catch |err| switch (err) {
+            error.FileNotFound => return null,
+            else => return err,
+        };
         defer file.close();
 
-        const stat = file.stat() catch return null;
+        const stat = try file.stat();
         if (stat.size == 0) return null;
 
-        const buf = self.allocator.alloc(u8, stat.size) catch return null;
+        const buf = try self.allocator.alloc(u8, stat.size);
+        errdefer self.allocator.free(buf);
         const n = file.readAll(buf) catch {
-            self.allocator.free(buf);
-            return null;
+            return error.PreparedSnapshotReadFailed;
         };
-        if (n != stat.size) {
-            self.allocator.free(buf);
-            return null;
-        }
+        if (n != stat.size) return error.CorruptPreparedSnapshot;
 
         log.info("Loaded prepared.snapshot ({d} bytes)", .{n});
         return buf;
@@ -1311,6 +1438,7 @@ pub const RaftLog = struct {
     pub fn append(self: *RaftLog, epoch: i32, data: []const u8) !u64 {
         const offset = self.nextOffset();
         const data_copy = try self.allocator.dupe(u8, data);
+        errdefer self.allocator.free(data_copy);
         try self.entries.append(.{
             .offset = offset,
             .epoch = epoch,
@@ -1487,11 +1615,11 @@ pub const ElectionTimer = struct {
     pub fn reset(self: *ElectionTimer) void {
         const range: u64 = @intCast(self.max_timeout_ms - self.min_timeout_ms);
         const jitter = self.prng.random().intRangeAtMost(u64, 0, range);
-        self.deadline_ms = @import("time_compat").milliTimestamp() + self.min_timeout_ms + @as(i64, @intCast(jitter));
+        self.deadline_ms = monotonicMs() + self.min_timeout_ms + @as(i64, @intCast(jitter));
     }
 
     pub fn isExpired(self: *const ElectionTimer) bool {
-        return @import("time_compat").milliTimestamp() >= self.deadline_ms;
+        return monotonicMs() >= self.deadline_ms;
     }
 
     /// Re-seed the PRNG with better entropy (node_id + timestamp).
@@ -1526,6 +1654,16 @@ test "RaftLog append and query" {
     try testing.expectEqualStrings("entry-1", entry.data);
 }
 
+test "RaftLog append frees copied data when entry allocation fails" {
+    var failing_allocator = std.testing.FailingAllocator.init(testing.allocator, .{ .fail_index = 1 });
+    var raft_log = RaftLog.init(failing_allocator.allocator());
+    defer raft_log.deinit();
+
+    try testing.expectError(error.OutOfMemory, raft_log.append(1, "entry-0"));
+    try testing.expect(failing_allocator.has_induced_failure);
+    try testing.expectEqual(@as(usize, 0), raft_log.length());
+}
+
 test "RaftState election" {
     var state = RaftState.init(testing.allocator, 0, "test-cluster");
     defer state.deinit();
@@ -1539,7 +1677,7 @@ test "RaftState election" {
     try testing.expectEqual(@as(usize, 2), state.majorityThreshold());
 
     // Start election
-    const result = state.startElection();
+    const result = try state.startElection();
     try testing.expectEqual(RaftState.Role.candidate, state.role);
     try testing.expectEqual(@as(i32, 1), result.epoch);
     try testing.expectEqual(@as(?i32, 0), state.voted_for);
@@ -1577,7 +1715,7 @@ test "RaftState become follower" {
     var state = RaftState.init(testing.allocator, 1, "test-cluster");
     defer state.deinit();
 
-    state.becomeFollower(5, 0);
+    try state.becomeFollower(5, 0);
     try testing.expectEqual(RaftState.Role.follower, state.role);
     try testing.expectEqual(@as(i32, 5), state.current_epoch);
     try testing.expectEqual(@as(?i32, 0), state.leader_id);
@@ -1589,7 +1727,7 @@ test "RaftState leader append" {
 
     try state.addVoter(0);
 
-    _ = state.startElection();
+    _ = try state.startElection();
     state.becomeLeader();
 
     const offset = try state.appendEntry("topic-create-record");
@@ -1624,7 +1762,7 @@ test "RaftState commit index update" {
     try state.addVoter(1);
     try state.addVoter(2);
 
-    _ = state.startElection();
+    _ = try state.startElection();
     state.becomeLeader();
 
     // Append entries
@@ -1636,7 +1774,7 @@ test "RaftState commit index update" {
     try testing.expectEqual(@as(u64, 0), state.commit_index);
 
     // Simulate follower 1 acknowledging up to offset 2
-    state.handleAppendEntriesResponse(1, .{ .success = true, .epoch = 1, .match_index = 2 });
+    try state.handleAppendEntriesResponse(1, .{ .success = true, .epoch = 1, .match_index = 2 });
 
     // Now: node 0 (leader) match = lastOffset()=2, node 1 match = 2, node 2 match = 0
     // Sorted: [0, 2, 2], median at index 3-2=1 → 2
@@ -1652,7 +1790,7 @@ test "RaftState commit index needs majority" {
     try state.addVoter(1);
     try state.addVoter(2);
 
-    _ = state.startElection();
+    _ = try state.startElection();
     state.becomeLeader();
 
     _ = try state.appendEntry("data");
@@ -1673,7 +1811,7 @@ test "RaftState raft log persistence" {
         var state = RaftState.initWithDataDir(testing.allocator, 0, "test-cluster", tmp_dir);
         defer state.deinit();
 
-        _ = state.startElection();
+        _ = try state.startElection();
         state.becomeLeader();
 
         _ = try state.appendEntry("entry-A");
@@ -1703,13 +1841,13 @@ test "RaftState leader steps down on higher epoch" {
     try state.addVoter(0);
     try state.addVoter(1);
 
-    _ = state.startElection();
+    _ = try state.startElection();
     state.becomeLeader();
     try testing.expectEqual(RaftState.Role.leader, state.role);
     try testing.expectEqual(@as(i32, 1), state.current_epoch);
 
     // Receive BeginQuorumEpoch from node 1 with higher epoch
-    state.becomeFollower(5, 1);
+    try state.becomeFollower(5, 1);
     try testing.expectEqual(RaftState.Role.follower, state.role);
     try testing.expectEqual(@as(i32, 5), state.current_epoch);
     try testing.expectEqual(@as(?i32, 1), state.leader_id);
@@ -1723,7 +1861,7 @@ test "RaftState rejects vote for stale epoch" {
     try state.addVoter(1);
 
     // Move to epoch 5 by becoming follower
-    state.becomeFollower(5, 1);
+    try state.becomeFollower(5, 1);
 
     // Vote request with epoch 3 (stale) should be rejected
     const result = state.handleVoteRequest(1, 3, 0, 0);
@@ -1750,7 +1888,7 @@ test "RaftState election resets voted_for" {
     try state.addVoter(2);
 
     // Start election — should vote for self
-    const result = state.startElection();
+    const result = try state.startElection();
     try testing.expectEqual(@as(?i32, 0), state.voted_for);
     try testing.expectEqual(RaftState.Role.candidate, state.role);
     try testing.expect(result.epoch > 0);
@@ -1774,7 +1912,7 @@ test "Election Safety: at most one leader per epoch" {
     try state1.addVoter(1);
 
     // Node 0 starts election at epoch 1
-    _ = state0.startElection();
+    _ = try state0.startElection();
     try testing.expectEqual(@as(i32, 1), state0.current_epoch);
     try testing.expectEqual(@as(?i32, 0), state0.voted_for);
 
@@ -1867,11 +2005,11 @@ test "becomeFollower ignores stale epoch" {
     try state.addVoter(1);
 
     // Move to epoch 5
-    state.becomeFollower(5, 1);
+    try state.becomeFollower(5, 1);
     try testing.expectEqual(@as(i32, 5), state.current_epoch);
 
     // Try to step down to epoch 3 — should be ignored
-    state.becomeFollower(3, 2);
+    try state.becomeFollower(3, 2);
     try testing.expectEqual(@as(i32, 5), state.current_epoch);
     try testing.expectEqual(@as(?i32, 1), state.leader_id); // Still leader 1
 }
@@ -1883,12 +2021,12 @@ test "handleAppendEntriesResponse step-down becomes unattached" {
     try state.addVoter(0);
     try state.addVoter(1);
 
-    _ = state.startElection();
+    _ = try state.startElection();
     state.becomeLeader();
     try testing.expectEqual(RaftState.Role.leader, state.role);
 
     // Follower responds with higher epoch — leader must step down
-    state.handleAppendEntriesResponse(1, .{ .success = false, .epoch = 10, .match_index = 0 });
+    try state.handleAppendEntriesResponse(1, .{ .success = false, .epoch = 10, .match_index = 0 });
     try testing.expectEqual(RaftState.Role.unattached, state.role);
     try testing.expectEqual(@as(i32, 10), state.current_epoch);
     try testing.expectEqual(@as(?i32, null), state.leader_id);
@@ -1901,7 +2039,7 @@ test "handleAppendEntriesResponse decrements next_index on failure" {
     try state.addVoter(0);
     try state.addVoter(1);
 
-    _ = state.startElection();
+    _ = try state.startElection();
     state.becomeLeader();
 
     // Append a few entries so next_index is > 0
@@ -1917,7 +2055,7 @@ test "handleAppendEntriesResponse decrements next_index on failure" {
     try testing.expect(initial_next > 0);
 
     // Follower rejects (log mismatch) — next_index should decrement
-    state.handleAppendEntriesResponse(1, .{ .success = false, .epoch = 1, .match_index = 0 });
+    try state.handleAppendEntriesResponse(1, .{ .success = false, .epoch = 1, .match_index = 0 });
     const new_next = if (state.voters.getPtr(1)) |v| v.next_index else 0;
     try testing.expectEqual(initial_next - 1, new_next);
 }
@@ -1933,7 +2071,7 @@ test "Commit index requires current epoch entry (Raft Figure 8 scenario)" {
     try state.addVoter(2);
 
     // Epoch 1: node 0 is leader, appends entry
-    _ = state.startElection(); // epoch 1
+    _ = try state.startElection(); // epoch 1
     state.becomeLeader();
     _ = try state.appendEntry("epoch-1-entry"); // offset 0, epoch 1
 
@@ -1948,7 +2086,7 @@ test "Commit index requires current epoch entry (Raft Figure 8 scenario)" {
     }
 
     // Follower 1 acks the epoch-1 entry (offset 0)
-    state.handleAppendEntriesResponse(1, .{ .success = true, .epoch = 3, .match_index = 0 });
+    try state.handleAppendEntriesResponse(1, .{ .success = true, .epoch = 3, .match_index = 0 });
 
     // Even though majority (nodes 0 and 1) have offset 0, it's an epoch-1 entry.
     // The leader at epoch 3 must NOT commit it until an epoch-3 entry is replicated.
@@ -1958,7 +2096,7 @@ test "Commit index requires current epoch entry (Raft Figure 8 scenario)" {
     _ = try state.appendEntry("epoch-3-entry"); // offset 1, epoch 3
 
     // Follower 1 acks up to offset 1
-    state.handleAppendEntriesResponse(1, .{ .success = true, .epoch = 3, .match_index = 1 });
+    try state.handleAppendEntriesResponse(1, .{ .success = true, .epoch = 3, .match_index = 1 });
 
     // Now offset 1 (epoch 3) is replicated on majority — commit should advance
     try testing.expectEqual(@as(u64, 1), state.commit_index);
@@ -2017,8 +2155,8 @@ test "Split vote scenario: both candidates at same epoch" {
     }
 
     // Both start elections — both get epoch 1, both vote for themselves
-    _ = state0.startElection();
-    _ = state1.startElection();
+    _ = try state0.startElection();
+    _ = try state1.startElection();
 
     // Node 2 receives vote request from node 0 first — grants
     const resp0 = state2.handleVoteRequest(0, 1, 0, 0);
@@ -2041,13 +2179,13 @@ test "Consecutive elections increment epoch" {
     try state.addVoter(2);
 
     // Multiple failed elections should keep incrementing epoch
-    const r1 = state.startElection();
+    const r1 = try state.startElection();
     try testing.expectEqual(@as(i32, 1), r1.epoch);
 
-    const r2 = state.startElection();
+    const r2 = try state.startElection();
     try testing.expectEqual(@as(i32, 2), r2.epoch);
 
-    const r3 = state.startElection();
+    const r3 = try state.startElection();
     try testing.expectEqual(@as(i32, 3), r3.epoch);
 
     // Epoch should be monotonically increasing
@@ -2066,7 +2204,7 @@ test "Leader cannot be created without majority" {
     try testing.expectEqual(@as(usize, 2), state.majorityThreshold());
 
     // Self-vote gives us 1 vote — not enough
-    _ = state.startElection();
+    _ = try state.startElection();
     try testing.expectEqual(RaftState.Role.candidate, state.role);
 
     // Only 1 vote (self) — quorumSize > 1, so single-node auto-promote doesn't apply
@@ -2081,7 +2219,7 @@ test "Single-node cluster immediately becomes leader" {
     try testing.expectEqual(@as(usize, 1), state.quorumSize());
     try testing.expectEqual(@as(usize, 1), state.majorityThreshold());
 
-    _ = state.startElection();
+    _ = try state.startElection();
     // In single-node, quorumSize <= 1, so the election loop auto-promotes
     if (state.quorumSize() <= 1) {
         state.becomeLeader();
@@ -2099,7 +2237,7 @@ test "RaftState persists and loads epoch and voted_for" {
         var state = RaftState.initWithDataDir(testing.allocator, 0, "test", tmp_dir);
         defer state.deinit();
 
-        _ = state.startElection(); // epoch=1, voted_for=0
+        _ = try state.startElection(); // epoch=1, voted_for=0
         try testing.expectEqual(@as(i32, 1), state.current_epoch);
         try testing.expectEqual(@as(?i32, 0), state.voted_for);
     }
@@ -2109,7 +2247,7 @@ test "RaftState persists and loads epoch and voted_for" {
         var state = RaftState.initWithDataDir(testing.allocator, 0, "test", tmp_dir);
         defer state.deinit();
 
-        const loaded = state.loadPersistedMeta();
+        const loaded = try state.loadPersistedMeta();
         try testing.expect(loaded);
         try testing.expectEqual(@as(i32, 1), state.current_epoch);
         try testing.expectEqual(@as(?i32, 0), state.voted_for);
@@ -2136,7 +2274,7 @@ test "RaftState voted_for persists prevents double-voting after restart" {
         var state = RaftState.initWithDataDir(testing.allocator, 1, "test", tmp_dir);
         defer state.deinit();
 
-        _ = state.loadPersistedMeta();
+        _ = try state.loadPersistedMeta();
         // voted_for should still be 0 from before crash
         try testing.expectEqual(@as(?i32, 0), state.voted_for);
         try testing.expectEqual(@as(i32, 1), state.current_epoch);
@@ -2155,7 +2293,7 @@ test "RaftState handleAppendEntries validates prev_log" {
     try state.addVoter(1);
 
     // Become follower at epoch 1
-    state.becomeFollower(1, 0);
+    try state.becomeFollower(1, 0);
 
     // Append some entries as if leader replicated them
     _ = try state.log.append(1, "entry-0");
@@ -2177,7 +2315,7 @@ test "RaftState handleAppendEntries truncates conflicting entries" {
     try state.addVoter(0);
     try state.addVoter(1);
 
-    state.becomeFollower(1, 0);
+    try state.becomeFollower(1, 0);
 
     // Append entries from old leader (epoch 1)
     _ = try state.log.append(1, "old-entry-0");
@@ -2205,7 +2343,7 @@ test "RaftState handleAppendEntries advances commit_index" {
     try state.addVoter(0);
     try state.addVoter(1);
 
-    state.becomeFollower(1, 0);
+    try state.becomeFollower(1, 0);
     _ = try state.log.append(1, "entry-0");
     _ = try state.log.append(1, "entry-1");
 
@@ -2243,6 +2381,78 @@ test "RaftState handleAppendEntries persists follower entries" {
         try testing.expectEqual(@as(usize, 1), state.log.length());
         try testing.expectEqualStrings("replicated-controller-record", state.log.entries.items[0].data);
     }
+}
+
+test "RaftState appendEntry fails closed when raft log persistence fails" {
+    const bad_dir = "/tmp/zmq-raft-leader-append-persist-fail-test";
+    fs.deleteTreeAbsolute(bad_dir) catch {};
+    fs.deleteFileAbsolute(bad_dir) catch {};
+    defer fs.deleteFileAbsolute(bad_dir) catch {};
+
+    {
+        const file = try fs.createFileAbsolute(bad_dir, .{ .truncate = true });
+        defer file.close();
+    }
+
+    var state = RaftState.initWithDataDir(testing.allocator, 0, "cluster", bad_dir);
+    defer state.deinit();
+    state.role = .leader;
+    state.current_epoch = 4;
+
+    if (state.appendEntry("must-not-ack")) |_| {
+        return error.ExpectedPersistenceFailure;
+    } else |_| {}
+    try testing.expectEqual(@as(usize, 0), state.log.length());
+}
+
+test "RaftState handleAppendEntries rejects follower append allocation failure" {
+    var failing_allocator = std.testing.FailingAllocator.init(testing.allocator, .{ .fail_index = 0 });
+    var state = RaftState.init(failing_allocator.allocator(), 1, "cluster");
+    defer state.deinit();
+
+    const entries = [_]RaftState.AppendEntry{
+        .{ .offset = 0, .epoch = 2, .data = "replicated-controller-record" },
+    };
+    const resp = state.handleAppendEntries(2, 0, 0, 0, &entries, 0);
+    try testing.expect(!resp.success);
+    try testing.expect(failing_allocator.has_induced_failure);
+    try testing.expectEqual(@as(usize, 0), state.log.length());
+    try testing.expectEqual(@as(u64, 0), state.commit_index);
+}
+
+test "RaftState handleAppendEntries rejects follower persistence failure" {
+    const bad_dir = "/tmp/zmq-raft-follower-append-persist-fail-test";
+    fs.deleteTreeAbsolute(bad_dir) catch {};
+    fs.deleteFileAbsolute(bad_dir) catch {};
+    defer fs.deleteFileAbsolute(bad_dir) catch {};
+
+    {
+        const file = try fs.createFileAbsolute(bad_dir, .{ .truncate = true });
+        defer file.close();
+    }
+
+    var state = RaftState.initWithDataDir(testing.allocator, 1, "cluster", bad_dir);
+    defer state.deinit();
+
+    const entries = [_]RaftState.AppendEntry{
+        .{ .offset = 0, .epoch = 3, .data = "replicated-controller-record" },
+    };
+    const resp = state.handleAppendEntries(3, 0, 0, 0, &entries, 0);
+    try testing.expect(!resp.success);
+    try testing.expectEqual(@as(usize, 0), state.log.length());
+    try testing.expectEqual(@as(u64, 0), state.commit_index);
+}
+
+test "RaftState handleAppendEntries rejects non-contiguous follower entries" {
+    var state = RaftState.init(testing.allocator, 1, "cluster");
+    defer state.deinit();
+
+    const entries = [_]RaftState.AppendEntry{
+        .{ .offset = 2, .epoch = 3, .data = "gap-entry" },
+    };
+    const resp = state.handleAppendEntries(3, 0, 0, 0, &entries, 0);
+    try testing.expect(!resp.success);
+    try testing.expectEqual(@as(usize, 0), state.log.length());
 }
 
 test "RaftState pre-vote does not change epoch" {
@@ -2346,7 +2556,7 @@ test "RaftState takeSnapshot truncates committed entries" {
     defer state.deinit();
 
     try state.addVoter(0);
-    _ = state.startElection();
+    _ = try state.startElection();
     state.becomeLeader();
 
     // Append several entries
@@ -2362,7 +2572,7 @@ test "RaftState takeSnapshot truncates committed entries" {
     try testing.expectEqual(@as(usize, 5), state.log.length());
 
     // Take snapshot at commit_index=3
-    state.takeSnapshot();
+    try state.takeSnapshot();
     try testing.expectEqual(@as(u64, 3), state.last_snapshot_offset);
     // Entries 0,1,2 removed; entries 3,4 kept
     try testing.expectEqual(@as(usize, 2), state.log.length());
@@ -2373,7 +2583,7 @@ test "RaftState shouldSnapshot checks log size" {
     defer state.deinit();
 
     try state.addVoter(0);
-    _ = state.startElection();
+    _ = try state.startElection();
     state.becomeLeader();
 
     // Below threshold
@@ -2395,7 +2605,7 @@ test "RaftState proposeAddVoter appends config entry" {
     defer state.deinit();
 
     try state.addVoter(0);
-    _ = state.startElection();
+    _ = try state.startElection();
     state.becomeLeader();
 
     // Propose adding voter 1
@@ -2414,7 +2624,7 @@ test "RaftState proposeAddVoter rejects duplicate" {
     defer state.deinit();
 
     try state.addVoter(0);
-    _ = state.startElection();
+    _ = try state.startElection();
     state.becomeLeader();
 
     const result = state.proposeAddVoter(0); // Already a voter
@@ -2426,7 +2636,7 @@ test "RaftState proposeAddVoter rejects when config pending" {
     defer state.deinit();
 
     try state.addVoter(0);
-    _ = state.startElection();
+    _ = try state.startElection();
     state.becomeLeader();
 
     _ = try state.proposeAddVoter(1); // First one succeeds
@@ -2439,7 +2649,7 @@ test "RaftState proposeAddVoterWithMetadata applies endpoint metadata after comm
     defer state.deinit();
 
     try state.addVoter(0);
-    _ = state.startElection();
+    _ = try state.startElection();
     state.becomeLeader();
 
     const directory_id = [_]u8{3} ** 16;
@@ -2455,7 +2665,7 @@ test "RaftState proposeAddVoterWithMetadata applies endpoint metadata after comm
     try testing.expect(!state.voters.contains(2));
 
     state.commit_index = offset;
-    state.applyCommittedConfigs();
+    try state.applyCommittedConfigs();
 
     try testing.expect(!state.pending_config_change);
     const voter = state.voters.get(2).?;
@@ -2472,7 +2682,7 @@ test "RaftState proposeRemoveVoter works" {
 
     try state.addVoter(0);
     try state.addVoter(1);
-    _ = state.startElection();
+    _ = try state.startElection();
     state.becomeLeader();
 
     const offset = try state.proposeRemoveVoter(1);
@@ -2485,7 +2695,7 @@ test "RaftState proposeRemoveVoter rejects last voter" {
     defer state.deinit();
 
     try state.addVoter(0);
-    _ = state.startElection();
+    _ = try state.startElection();
     state.becomeLeader();
 
     const result = state.proposeRemoveVoter(0);
@@ -2497,7 +2707,7 @@ test "RaftState applyCommittedConfigs adds voter" {
     defer state.deinit();
 
     try state.addVoter(0);
-    _ = state.startElection();
+    _ = try state.startElection();
     state.becomeLeader();
 
     // Propose and commit
@@ -2506,7 +2716,7 @@ test "RaftState applyCommittedConfigs adds voter" {
 
     // Simulate commit (manually advance commit_index)
     state.commit_index = 0;
-    state.applyCommittedConfigs();
+    try state.applyCommittedConfigs();
 
     try testing.expectEqual(@as(usize, 2), state.voters.count());
     try testing.expect(state.voters.contains(1));
@@ -2519,12 +2729,12 @@ test "RaftState applyCommittedConfigs removes voter" {
 
     try state.addVoter(0);
     try state.addVoter(1);
-    _ = state.startElection();
+    _ = try state.startElection();
     state.becomeLeader();
 
     _ = try state.proposeRemoveVoter(1);
     state.commit_index = 0;
-    state.applyCommittedConfigs();
+    try state.applyCommittedConfigs();
 
     try testing.expectEqual(@as(usize, 1), state.voters.count());
     try testing.expect(!state.voters.contains(1));
@@ -2536,14 +2746,61 @@ test "RaftState removing self causes resignation" {
 
     try state.addVoter(0);
     try state.addVoter(1);
-    _ = state.startElection();
+    _ = try state.startElection();
     state.becomeLeader();
 
     _ = try state.proposeRemoveVoter(0); // Remove self
     state.commit_index = 0;
-    state.applyCommittedConfigs();
+    try state.applyCommittedConfigs();
 
     try testing.expectEqual(RaftState.Role.resigned, state.role);
+}
+
+test "RaftState applyCommittedConfigs rejects malformed voter metadata change" {
+    var state = RaftState.init(testing.allocator, 0, "cluster");
+    defer state.deinit();
+
+    try state.addVoter(0);
+    _ = try state.startElection();
+    state.becomeLeader();
+
+    var malformed: [8]u8 = undefined;
+    @memcpy(malformed[0..7], "ZMQCFGU");
+    malformed[7] = @intFromEnum(RaftState.ConfigChangeType.add_voter);
+    _ = try state.log.append(state.current_epoch, &malformed);
+    state.commit_index = 0;
+    state.pending_config_change = true;
+
+    try testing.expectError(error.InvalidConfigChangeEntry, state.applyCommittedConfigs());
+    try testing.expect(state.pending_config_change);
+    try testing.expect(state.last_applied_config_offset == null);
+}
+
+test "RaftState applyCommittedConfigs rejects update for missing voter" {
+    var state = RaftState.init(testing.allocator, 0, "cluster");
+    defer state.deinit();
+
+    try state.addVoter(0);
+    _ = try state.startElection();
+    state.becomeLeader();
+
+    const directory_id = [_]u8{6} ** 16;
+    const endpoints = [_]RaftState.VoterEndpointView{.{
+        .name = "CONTROLLER",
+        .host = "missing-voter.example",
+        .port = 19093,
+    }};
+    const data = try RaftState.ConfigChangeEntry.serializeVoterUpdate(testing.allocator, 9, directory_id, &endpoints, 0, 1);
+    defer testing.allocator.free(data);
+
+    _ = try state.log.append(state.current_epoch, data);
+    state.commit_index = 0;
+    state.pending_config_change = true;
+
+    try testing.expectError(error.VoterNotFound, state.applyCommittedConfigs());
+    try testing.expect(state.pending_config_change);
+    try testing.expect(state.last_applied_config_offset == null);
+    try testing.expect(!state.voters.contains(9));
 }
 
 test "RaftState proposeUpdateVoter applies endpoint metadata after commit" {
@@ -2552,7 +2809,7 @@ test "RaftState proposeUpdateVoter applies endpoint metadata after commit" {
 
     try state.addVoter(0);
     try state.addVoter(1);
-    _ = state.startElection();
+    _ = try state.startElection();
     state.becomeLeader();
 
     const directory_id = [_]u8{1} ** 16;
@@ -2567,7 +2824,7 @@ test "RaftState proposeUpdateVoter applies endpoint metadata after commit" {
     try testing.expect(state.pending_config_change);
 
     state.commit_index = offset;
-    state.applyCommittedConfigs();
+    try state.applyCommittedConfigs();
 
     try testing.expect(!state.pending_config_change);
     const voter = state.voters.get(1).?;
@@ -2622,12 +2879,12 @@ test "RaftState replays persisted UpdateVoter metadata after static voter regist
 
         try state.addVoter(0);
         try state.addVoter(1);
-        _ = state.startElection();
+        _ = try state.startElection();
         state.becomeLeader();
 
         const offset = try state.proposeUpdateVoter(1, directory_id, &endpoints, 1, 3);
         state.commit_index = offset;
-        state.applyCommittedConfigs();
+        try state.applyCommittedConfigs();
     }
 
     {
@@ -2640,7 +2897,7 @@ test "RaftState replays persisted UpdateVoter metadata after static voter regist
         try testing.expectEqual(@as(u64, 1), recovered);
 
         state.commit_index = state.log.lastOffset();
-        state.applyCommittedConfigs();
+        try state.applyCommittedConfigs();
 
         const voter = state.voters.get(1).?;
         try testing.expectEqualSlices(u8, &directory_id, &voter.voter_directory_id);
@@ -2717,7 +2974,7 @@ test "RaftState loadPersistedMeta round-trip" {
         try state.addVoter(5);
         try state.addVoter(6);
 
-        _ = state.startElection(); // epoch=1, voted_for=5, persisted automatically
+        _ = try state.startElection(); // epoch=1, voted_for=5, persisted automatically
         try testing.expectEqual(@as(i32, 1), state.current_epoch);
         try testing.expectEqual(@as(?i32, 5), state.voted_for);
     }
@@ -2727,7 +2984,7 @@ test "RaftState loadPersistedMeta round-trip" {
         var state = RaftState.initWithDataDir(testing.allocator, 5, "test-cluster", tmp_dir);
         defer state.deinit();
 
-        const loaded = state.loadPersistedMeta();
+        const loaded = try state.loadPersistedMeta();
         try testing.expect(loaded);
         try testing.expectEqual(@as(i32, 1), state.current_epoch);
         try testing.expectEqual(@as(?i32, 5), state.voted_for);
@@ -2745,10 +3002,166 @@ test "RaftState loadPersistedMeta returns false without file" {
     var state = RaftState.initWithDataDir(testing.allocator, 1, "test-cluster", tmp_dir);
     defer state.deinit();
 
-    const loaded = state.loadPersistedMeta();
+    const loaded = try state.loadPersistedMeta();
     try testing.expect(!loaded);
     // Epoch should remain at default (0)
     try testing.expectEqual(@as(i32, 0), state.current_epoch);
+    try testing.expectEqual(@as(?i32, null), state.voted_for);
+}
+
+test "RaftState loadPersistedMeta rejects malformed metadata" {
+    const tmp_dir = "/tmp/zmq-raft-meta-corrupt-test";
+    const meta_path = "/tmp/zmq-raft-meta-corrupt-test/raft.meta";
+    fs.deleteTreeAbsolute(tmp_dir) catch {};
+    defer fs.deleteTreeAbsolute(tmp_dir) catch {};
+    try fs.makeDirAbsolute(tmp_dir);
+
+    {
+        const file = try fs.createFileAbsolute(meta_path, .{ .truncate = true });
+        defer file.close();
+        try file.writeAll("short");
+    }
+
+    var state = RaftState.initWithDataDir(testing.allocator, 1, "test-cluster", tmp_dir);
+    defer state.deinit();
+
+    try testing.expectError(error.CorruptRaftMeta, state.loadPersistedMeta());
+    try testing.expectError(error.CorruptRaftMeta, state.loadPersistedLog());
+}
+
+test "RaftState startElection fails closed when raft metadata cannot be persisted" {
+    const bad_dir = "/tmp/zmq-raft-election-meta-fail-test";
+    fs.deleteTreeAbsolute(bad_dir) catch {};
+    fs.deleteFileAbsolute(bad_dir) catch {};
+    defer fs.deleteFileAbsolute(bad_dir) catch {};
+
+    {
+        const file = try fs.createFileAbsolute(bad_dir, .{ .truncate = true });
+        defer file.close();
+    }
+
+    var state = RaftState.initWithDataDir(testing.allocator, 7, "cluster", bad_dir);
+    defer state.deinit();
+    state.current_epoch = 4;
+    state.role = .follower;
+    state.leader_id = 1;
+    state.voted_for = null;
+
+    if (state.startElection()) |_| {
+        return error.ExpectedPersistenceFailure;
+    } else |_| {}
+
+    try testing.expectEqual(@as(i32, 4), state.current_epoch);
+    try testing.expectEqual(RaftState.Role.follower, state.role);
+    try testing.expectEqual(@as(?i32, 1), state.leader_id);
+    try testing.expectEqual(@as(?i32, null), state.voted_for);
+}
+
+test "RaftState vote request denies and rolls back when raft metadata cannot be persisted" {
+    const bad_dir = "/tmp/zmq-raft-vote-meta-fail-test";
+    fs.deleteTreeAbsolute(bad_dir) catch {};
+    fs.deleteFileAbsolute(bad_dir) catch {};
+    defer fs.deleteFileAbsolute(bad_dir) catch {};
+
+    {
+        const file = try fs.createFileAbsolute(bad_dir, .{ .truncate = true });
+        defer file.close();
+    }
+
+    var state = RaftState.initWithDataDir(testing.allocator, 1, "cluster", bad_dir);
+    defer state.deinit();
+    state.current_epoch = 3;
+    state.role = .leader;
+    state.leader_id = 1;
+    state.voted_for = null;
+
+    const resp = state.handleVoteRequest(2, 4, 0, 0);
+    try testing.expect(!resp.vote_granted);
+    try testing.expectEqual(@as(i32, 3), resp.epoch);
+    try testing.expectEqual(@as(i32, 3), state.current_epoch);
+    try testing.expectEqual(RaftState.Role.leader, state.role);
+    try testing.expectEqual(@as(?i32, 1), state.leader_id);
+    try testing.expectEqual(@as(?i32, null), state.voted_for);
+}
+
+test "RaftState becomeFollower fails closed when raft metadata cannot be persisted" {
+    const bad_dir = "/tmp/zmq-raft-follower-meta-fail-test";
+    fs.deleteTreeAbsolute(bad_dir) catch {};
+    fs.deleteFileAbsolute(bad_dir) catch {};
+    defer fs.deleteFileAbsolute(bad_dir) catch {};
+
+    {
+        const file = try fs.createFileAbsolute(bad_dir, .{ .truncate = true });
+        defer file.close();
+    }
+
+    var state = RaftState.initWithDataDir(testing.allocator, 1, "cluster", bad_dir);
+    defer state.deinit();
+    state.current_epoch = 2;
+    state.role = .candidate;
+    state.voted_for = 1;
+
+    if (state.becomeFollower(3, 2)) |_| {
+        return error.ExpectedPersistenceFailure;
+    } else |_| {}
+
+    try testing.expectEqual(@as(i32, 2), state.current_epoch);
+    try testing.expectEqual(RaftState.Role.candidate, state.role);
+    try testing.expectEqual(@as(?i32, null), state.leader_id);
+    try testing.expectEqual(@as(?i32, 1), state.voted_for);
+}
+
+test "RaftState handleAppendEntries rejects higher epoch when raft metadata cannot be persisted" {
+    const bad_dir = "/tmp/zmq-raft-append-epoch-meta-fail-test";
+    fs.deleteTreeAbsolute(bad_dir) catch {};
+    fs.deleteFileAbsolute(bad_dir) catch {};
+    defer fs.deleteFileAbsolute(bad_dir) catch {};
+
+    {
+        const file = try fs.createFileAbsolute(bad_dir, .{ .truncate = true });
+        defer file.close();
+    }
+
+    var state = RaftState.initWithDataDir(testing.allocator, 1, "cluster", bad_dir);
+    defer state.deinit();
+    state.current_epoch = 2;
+    state.role = .candidate;
+    state.voted_for = 1;
+
+    const resp = state.handleAppendEntries(3, 2, 0, 0, &.{}, 0);
+    try testing.expect(!resp.success);
+    try testing.expectEqual(@as(i32, 2), resp.epoch);
+    try testing.expectEqual(@as(i32, 2), state.current_epoch);
+    try testing.expectEqual(RaftState.Role.candidate, state.role);
+    try testing.expectEqual(@as(?i32, 1), state.voted_for);
+}
+
+test "RaftState higher epoch AppendEntries response steps down even when raft metadata persist fails" {
+    const bad_dir = "/tmp/zmq-raft-response-epoch-meta-fail-test";
+    fs.deleteTreeAbsolute(bad_dir) catch {};
+    fs.deleteFileAbsolute(bad_dir) catch {};
+    defer fs.deleteFileAbsolute(bad_dir) catch {};
+
+    {
+        const file = try fs.createFileAbsolute(bad_dir, .{ .truncate = true });
+        defer file.close();
+    }
+
+    var state = RaftState.initWithDataDir(testing.allocator, 1, "cluster", bad_dir);
+    defer state.deinit();
+    try state.addVoter(1);
+    try state.addVoter(2);
+    state.current_epoch = 2;
+    state.role = .leader;
+    state.leader_id = 1;
+
+    if (state.handleAppendEntriesResponse(2, .{ .success = false, .epoch = 5, .match_index = 0 })) |_| {
+        return error.ExpectedPersistenceFailure;
+    } else |_| {}
+
+    try testing.expectEqual(@as(i32, 5), state.current_epoch);
+    try testing.expectEqual(RaftState.Role.unattached, state.role);
+    try testing.expectEqual(@as(?i32, null), state.leader_id);
     try testing.expectEqual(@as(?i32, null), state.voted_for);
 }
 
@@ -2763,7 +3176,7 @@ test "RaftState loadPersistedLog replays entries" {
         defer state.deinit();
         try state.addVoter(0);
 
-        _ = state.startElection();
+        _ = try state.startElection();
         state.becomeLeader();
 
         _ = try state.appendEntry("alpha");
@@ -2810,6 +3223,78 @@ test "RaftState loadPersistedLog handles empty log" {
     try testing.expectEqual(@as(usize, 0), state.log.length());
 }
 
+fn writePersistedRaftLogRecord(path: []const u8, epoch: i64, offset: u64, data: []const u8) !void {
+    const file = try fs.createFileAbsolute(path, .{ .truncate = false });
+    defer file.close();
+    const stat = try file.stat();
+    try file.seekTo(stat.size);
+
+    var header: [20]u8 = undefined;
+    std.mem.writeInt(i64, header[0..8], epoch, .big);
+    std.mem.writeInt(u64, header[8..16], offset, .big);
+    std.mem.writeInt(u32, header[16..20], @intCast(data.len), .big);
+    try file.writeAll(&header);
+    try file.writeAll(data);
+}
+
+test "RaftState loadPersistedLog rejects truncated record" {
+    const tmp_dir = "/tmp/zmq-raft-log-truncated-test";
+    fs.deleteTreeAbsolute(tmp_dir) catch {};
+    defer fs.deleteTreeAbsolute(tmp_dir) catch {};
+    fs.makeDirAbsolute(tmp_dir) catch {};
+
+    const path = tmp_dir ++ "/raft.log";
+    {
+        const file = try fs.createFileAbsolute(path, .{ .truncate = true });
+        defer file.close();
+        var header: [20]u8 = undefined;
+        std.mem.writeInt(i64, header[0..8], 1, .big);
+        std.mem.writeInt(u64, header[8..16], 0, .big);
+        std.mem.writeInt(u32, header[16..20], 5, .big);
+        try file.writeAll(&header);
+        try file.writeAll("ab");
+    }
+
+    var state = RaftState.initWithDataDir(testing.allocator, 0, "test-cluster", tmp_dir);
+    defer state.deinit();
+
+    try testing.expectError(error.CorruptRaftLog, state.loadPersistedLog());
+    try testing.expectEqual(@as(usize, 0), state.log.length());
+}
+
+test "RaftState loadPersistedLog rejects non-contiguous offsets" {
+    const tmp_dir = "/tmp/zmq-raft-log-non-contiguous-test";
+    fs.deleteTreeAbsolute(tmp_dir) catch {};
+    defer fs.deleteTreeAbsolute(tmp_dir) catch {};
+    fs.makeDirAbsolute(tmp_dir) catch {};
+
+    const path = tmp_dir ++ "/raft.log";
+    try writePersistedRaftLogRecord(path, 1, 0, "first");
+    try writePersistedRaftLogRecord(path, 1, 2, "gap");
+
+    var state = RaftState.initWithDataDir(testing.allocator, 0, "test-cluster", tmp_dir);
+    defer state.deinit();
+
+    try testing.expectError(error.CorruptRaftLog, state.loadPersistedLog());
+    try testing.expectEqual(@as(usize, 0), state.log.length());
+}
+
+test "RaftState loadPersistedLog rejects invalid persisted epoch" {
+    const tmp_dir = "/tmp/zmq-raft-log-invalid-epoch-test";
+    fs.deleteTreeAbsolute(tmp_dir) catch {};
+    defer fs.deleteTreeAbsolute(tmp_dir) catch {};
+    fs.makeDirAbsolute(tmp_dir) catch {};
+
+    const path = tmp_dir ++ "/raft.log";
+    try writePersistedRaftLogRecord(path, @as(i64, std.math.maxInt(i32)) + 1, 0, "bad-epoch");
+
+    var state = RaftState.initWithDataDir(testing.allocator, 0, "test-cluster", tmp_dir);
+    defer state.deinit();
+
+    try testing.expectError(error.CorruptRaftLog, state.loadPersistedLog());
+    try testing.expectEqual(@as(usize, 0), state.log.length());
+}
+
 test "RaftState getAppendEntriesForFollower returns null when not leader" {
     var state = RaftState.init(testing.allocator, 1, "cluster");
     defer state.deinit();
@@ -2818,7 +3303,7 @@ test "RaftState getAppendEntriesForFollower returns null when not leader" {
     try state.addVoter(2);
 
     // Node is a follower — should return null
-    state.becomeFollower(1, 2);
+    try state.becomeFollower(1, 2);
     try testing.expectEqual(RaftState.Role.follower, state.role);
 
     const result = state.getAppendEntriesForFollower(2);
@@ -2832,7 +3317,7 @@ test "RaftState getAppendEntriesForFollower returns entries for lagging follower
     try state.addVoter(1);
     try state.addVoter(2);
 
-    _ = state.startElection();
+    _ = try state.startElection();
     state.becomeLeader();
 
     // Append 5 entries as leader
@@ -2871,14 +3356,14 @@ test "RaftState first entry remains replicable after empty heartbeat" {
     try state.addVoter(1);
     try state.addVoter(2);
 
-    _ = state.startElection();
+    _ = try state.startElection();
     state.becomeLeader();
 
     const empty = state.getAppendEntriesForFollower(2) orelse return error.UnexpectedNull;
     try testing.expectEqual(@as(u64, 0), empty.entries_start_index);
     try testing.expectEqual(@as(usize, 0), empty.entries_count);
 
-    state.handleAppendEntriesResponse(2, .{
+    try state.handleAppendEntriesResponse(2, .{
         .success = true,
         .epoch = state.current_epoch,
         .match_index = 0,
@@ -2899,7 +3384,7 @@ test "RaftState getAppendEntriesForFollower returns null for unknown voter" {
     try state.addVoter(1);
     try state.addVoter(2);
 
-    _ = state.startElection();
+    _ = try state.startElection();
     state.becomeLeader();
 
     _ = try state.appendEntry("data");
@@ -2920,7 +3405,7 @@ test "RaftState loadSnapshotMeta round-trip" {
         defer state.deinit();
         try state.addVoter(0);
 
-        _ = state.startElection();
+        _ = try state.startElection();
         state.becomeLeader();
 
         _ = try state.appendEntry("snap-e0");
@@ -2930,7 +3415,7 @@ test "RaftState loadSnapshotMeta round-trip" {
 
         // Manually advance commit_index to simulate majority ack
         state.commit_index = 3;
-        state.takeSnapshot();
+        try state.takeSnapshot();
 
         try testing.expectEqual(@as(u64, 3), state.last_snapshot_offset);
         try testing.expectEqual(@as(i32, 1), state.last_snapshot_epoch);
@@ -2941,9 +3426,108 @@ test "RaftState loadSnapshotMeta round-trip" {
         var state = RaftState.initWithDataDir(testing.allocator, 0, "test-cluster", tmp_dir);
         defer state.deinit();
 
-        const loaded = state.loadSnapshotMeta();
+        const loaded = try state.loadSnapshotMeta();
         try testing.expect(loaded);
         try testing.expectEqual(@as(u64, 3), state.last_snapshot_offset);
         try testing.expectEqual(@as(i32, 1), state.last_snapshot_epoch);
     }
+}
+
+test "RaftState takeSnapshot fails closed when snapshot metadata cannot be persisted" {
+    const bad_dir = "/tmp/zmq-raft-snapshot-meta-notdir-test";
+    fs.deleteTreeAbsolute(bad_dir) catch {};
+    fs.deleteFileAbsolute(bad_dir) catch {};
+    defer fs.deleteFileAbsolute(bad_dir) catch {};
+
+    {
+        const file = try fs.createFileAbsolute(bad_dir, .{ .truncate = true });
+        defer file.close();
+        try file.writeAll("not-a-directory");
+    }
+
+    var state = RaftState.init(testing.allocator, 0, "cluster");
+    defer state.deinit();
+
+    try state.addVoter(0);
+    _ = try state.startElection();
+    state.becomeLeader();
+
+    _ = try state.appendEntry("e0");
+    _ = try state.appendEntry("e1");
+    _ = try state.appendEntry("e2");
+    state.commit_index = 2;
+    state.data_dir = bad_dir;
+
+    const before_len = state.log.length();
+    state.takeSnapshot() catch {
+        try testing.expectEqual(@as(u64, 0), state.last_snapshot_offset);
+        try testing.expectEqual(before_len, state.log.length());
+        return;
+    };
+    return error.ExpectedSnapshotFailure;
+}
+
+test "RaftState takeSnapshot fails closed when prepared registry persistence fails" {
+    const tmp_dir = "/tmp/zmq-raft-prepared-snapshot-fail-test";
+    const blocked_tmp = "/tmp/zmq-raft-prepared-snapshot-fail-test/prepared.snapshot.tmp";
+    fs.deleteTreeAbsolute(tmp_dir) catch {};
+    defer fs.deleteTreeAbsolute(tmp_dir) catch {};
+    try fs.makeDirAbsolute(tmp_dir);
+    try fs.makeDirAbsolute(blocked_tmp);
+
+    var state = RaftState.init(testing.allocator, 0, "cluster");
+    defer state.deinit();
+    state.data_dir = tmp_dir;
+    state.prepared_registry_data = "registry";
+
+    try state.addVoter(0);
+    _ = try state.startElection();
+    state.becomeLeader();
+
+    _ = try state.appendEntry("e0");
+    _ = try state.appendEntry("e1");
+    _ = try state.appendEntry("e2");
+    state.commit_index = 2;
+
+    const before_len = state.log.length();
+    state.takeSnapshot() catch {
+        try testing.expectEqual(@as(u64, 0), state.last_snapshot_offset);
+        try testing.expectEqual(before_len, state.log.length());
+        return;
+    };
+    return error.ExpectedSnapshotFailure;
+}
+
+test "RaftState loadSnapshotMeta rejects malformed metadata" {
+    const tmp_dir = "/tmp/zmq-raft-snapshot-meta-corrupt-test";
+    const snapshot_path = "/tmp/zmq-raft-snapshot-meta-corrupt-test/snapshot.meta";
+    fs.deleteTreeAbsolute(tmp_dir) catch {};
+    defer fs.deleteTreeAbsolute(tmp_dir) catch {};
+    try fs.makeDirAbsolute(tmp_dir);
+
+    {
+        const file = try fs.createFileAbsolute(snapshot_path, .{ .truncate = true });
+        defer file.close();
+        try file.writeAll("short");
+    }
+
+    var state = RaftState.initWithDataDir(testing.allocator, 0, "cluster", tmp_dir);
+    defer state.deinit();
+
+    try testing.expectError(error.CorruptRaftSnapshotMeta, state.loadSnapshotMeta());
+    try testing.expectError(error.CorruptRaftSnapshotMeta, state.loadPersistedLog());
+}
+
+test "RaftState loadPreparedRegistry fails closed on unreadable snapshot" {
+    const tmp_dir = "/tmp/zmq-raft-prepared-snapshot-unreadable-test";
+    const prepared_path = "/tmp/zmq-raft-prepared-snapshot-unreadable-test/prepared.snapshot";
+    fs.deleteTreeAbsolute(tmp_dir) catch {};
+    defer fs.deleteTreeAbsolute(tmp_dir) catch {};
+    try fs.makeDirAbsolute(tmp_dir);
+    try fs.makeDirAbsolute(prepared_path);
+
+    var state = RaftState.initWithDataDir(testing.allocator, 0, "cluster", tmp_dir);
+    defer state.deinit();
+
+    try testing.expectError(error.PreparedSnapshotReadFailed, state.loadPreparedRegistry());
 }

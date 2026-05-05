@@ -3,6 +3,10 @@ const testing = std.testing;
 const Allocator = std.mem.Allocator;
 const MetricRegistry = @import("core").MetricRegistry;
 
+fn monotonicMs() i64 {
+    return @intCast(@import("time_compat").monotonicMilliTimestamp());
+}
+
 /// LogCache — FIFO cache for recently written (uncommitted) data.
 ///
 /// Records are written here immediately after the WAL append.
@@ -33,7 +37,7 @@ pub const LogCache = struct {
             return .{
                 .id = id,
                 .records = std.array_list.Managed(CachedRecord).init(alloc),
-                .created_at_ms = @import("time_compat").milliTimestamp(),
+                .created_at_ms = monotonicMs(),
                 .allocator = alloc,
             };
         }

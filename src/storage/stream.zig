@@ -3,6 +3,14 @@ const testing = std.testing;
 const Allocator = std.mem.Allocator;
 const log = std.log.scoped(.stream);
 
+fn wallClockMs() i64 {
+    return @import("time_compat").milliTimestamp();
+}
+
+fn monotonicMs() i64 {
+    return @intCast(@import("time_compat").monotonicMilliTimestamp());
+}
+
 // ---------------------------------------------------------------
 // Stream — represents a partition's append-only data lifecycle
 // ---------------------------------------------------------------
@@ -337,6 +345,7 @@ pub const ObjectManager = struct {
         if (self.streams.contains(stream_id)) return error.DuplicateStream;
 
         var stream = Stream.init(self.allocator, stream_id, node_id);
+        errdefer stream.deinit();
         // Create the initial range
         try stream.ranges.append(.{
             .epoch = stream.epoch,
@@ -587,12 +596,12 @@ pub const ObjectManager = struct {
     /// Prepared objects are allocated with prepareObject()/registerPreparedStreamObject()
     /// but never committed (e.g., the producer crashed between allocation and S3 upload).
     /// This prevents leaked object IDs from accumulating indefinitely.
-    pub fn expirePreparedObjects(self: *ObjectManager, prepared_ttl_ms: i64) u64 {
+    pub fn expirePreparedObjects(self: *ObjectManager, prepared_ttl_ms: i64) !u64 {
         return self.expirePreparedObjectsAt(prepared_ttl_ms, @import("time_compat").milliTimestamp());
     }
 
     /// Expire prepared objects with an explicit "now" timestamp for testability.
-    pub fn expirePreparedObjectsAt(self: *ObjectManager, prepared_ttl_ms: i64, now_ms: i64) u64 {
+    pub fn expirePreparedObjectsAt(self: *ObjectManager, prepared_ttl_ms: i64, now_ms: i64) !u64 {
         var expired_count: u64 = 0;
 
         // Collect expired SO IDs (can't modify map while iterating)
@@ -603,7 +612,7 @@ pub const ObjectManager = struct {
             while (it.next()) |entry| {
                 const so = entry.value_ptr;
                 if (so.state == .prepared and self.isPreparedObjectExpired(so.object_id, so.state_changed_ms, prepared_ttl_ms, now_ms)) {
-                    expired_so_ids.append(so.object_id) catch continue;
+                    try expired_so_ids.append(so.object_id);
                 }
             }
         }
@@ -622,7 +631,7 @@ pub const ObjectManager = struct {
             while (it.next()) |entry| {
                 const sso = entry.value_ptr;
                 if (sso.state == .prepared and self.isPreparedObjectExpired(sso.object_id, sso.state_changed_ms, prepared_ttl_ms, now_ms)) {
-                    expired_sso_ids.append(sso.object_id) catch continue;
+                    try expired_sso_ids.append(sso.object_id);
                 }
             }
         }
@@ -633,7 +642,7 @@ pub const ObjectManager = struct {
             expired_count += 1;
         }
 
-        const expired_registry_ids = self.prepared_registry.collectExpiredPreparedIds(prepared_ttl_ms, now_ms, self.allocator) catch return expired_count;
+        const expired_registry_ids = try self.prepared_registry.collectExpiredPreparedIds(prepared_ttl_ms, now_ms, self.allocator);
         defer self.allocator.free(expired_registry_ids);
         for (expired_registry_ids) |obj_id| {
             if (self.stream_objects.contains(obj_id) or self.stream_set_objects.contains(obj_id)) continue;
@@ -663,6 +672,35 @@ pub const ObjectManager = struct {
         return self.collectDestroyedObjectsAt(retention_ms, allocator, @import("time_compat").milliTimestamp());
     }
 
+    /// Count mark_destroyed objects ready for physical deletion without
+    /// mutating metadata. Callers use this to reserve orphan retry capacity
+    /// before collecting/removing metadata.
+    pub fn countDestroyedObjectsReadyAt(self: *const ObjectManager, retention_ms: i64, now_ms: i64) usize {
+        var count: usize = 0;
+
+        var so_it = self.stream_objects.iterator();
+        while (so_it.next()) |entry| {
+            const so = entry.value_ptr;
+            if (so.state == .mark_destroyed and so.state_changed_ms > 0 and
+                now_ms - so.state_changed_ms >= retention_ms)
+            {
+                count += 1;
+            }
+        }
+
+        var sso_it = self.stream_set_objects.iterator();
+        while (sso_it.next()) |entry| {
+            const sso = entry.value_ptr;
+            if (sso.state == .mark_destroyed and sso.state_changed_ms > 0 and
+                now_ms - sso.state_changed_ms >= retention_ms)
+            {
+                count += 1;
+            }
+        }
+
+        return count;
+    }
+
     /// Collect destroyed objects with an explicit "now" timestamp for testability.
     pub fn collectDestroyedObjectsAt(self: *ObjectManager, retention_ms: i64, allocator: Allocator, now_ms: i64) ![][]u8 {
         var keys = std.array_list.Managed([]u8).init(allocator);
@@ -681,7 +719,7 @@ pub const ObjectManager = struct {
                 if (so.state == .mark_destroyed and so.state_changed_ms > 0 and
                     now_ms - so.state_changed_ms >= retention_ms)
                 {
-                    ready_so_ids.append(so.object_id) catch continue;
+                    try ready_so_ids.append(so.object_id);
                 }
             }
         }
@@ -691,6 +729,8 @@ pub const ObjectManager = struct {
                 try keys.append(key_copy);
                 log.info("Collecting destroyed SO {d} for physical deletion (key='{s}')", .{ obj_id, so.s3_key });
             }
+        }
+        for (ready_so_ids.items) |obj_id| {
             self.removeStreamObject(obj_id);
         }
 
@@ -704,7 +744,7 @@ pub const ObjectManager = struct {
                 if (sso.state == .mark_destroyed and sso.state_changed_ms > 0 and
                     now_ms - sso.state_changed_ms >= retention_ms)
                 {
-                    ready_sso_ids.append(sso.object_id) catch continue;
+                    try ready_sso_ids.append(sso.object_id);
                 }
             }
         }
@@ -714,6 +754,8 @@ pub const ObjectManager = struct {
                 try keys.append(key_copy);
                 log.info("Collecting destroyed SSO {d} for physical deletion (key='{s}')", .{ obj_id, sso.s3_key });
             }
+        }
+        for (ready_sso_ids.items) |obj_id| {
             self.removeStreamSetObject(obj_id);
         }
 
@@ -740,11 +782,15 @@ pub const ObjectManager = struct {
             self.next_object_id = object_id + 1;
         }
         var range_list = std.array_list.Managed(StreamOffsetRange).init(self.allocator);
+        var range_list_owned = true;
+        errdefer if (range_list_owned) range_list.deinit();
         for (ranges) |r| {
             try range_list.append(r);
         }
 
         const key_copy = try self.allocator.dupe(u8, s3_key);
+        var key_copy_owned = true;
+        errdefer if (key_copy_owned) self.allocator.free(key_copy);
 
         try self.stream_set_objects.put(object_id, .{
             .object_id = object_id,
@@ -755,6 +801,9 @@ pub const ObjectManager = struct {
             .s3_key = key_copy,
             .stream_ranges = range_list,
         });
+        range_list_owned = false;
+        key_copy_owned = false;
+        errdefer self.removeStreamSetObject(object_id);
 
         // Update secondary SSO index for each stream
         for (ranges) |r| {
@@ -763,6 +812,9 @@ pub const ObjectManager = struct {
                 gop.value_ptr.* = std.array_list.Managed(u64).init(self.allocator);
             }
             try gop.value_ptr.append(object_id);
+        }
+
+        for (ranges) |r| {
             if (self.streams.getPtr(r.stream_id)) |stream| {
                 stream.advanceEndOffset(r.end_offset);
             }
@@ -807,6 +859,8 @@ pub const ObjectManager = struct {
         }
 
         const key_copy = try self.allocator.dupe(u8, s3_key);
+        var key_copy_owned = true;
+        errdefer if (key_copy_owned) self.allocator.free(key_copy);
 
         try self.stream_objects.put(object_id, .{
             .object_id = object_id,
@@ -817,6 +871,8 @@ pub const ObjectManager = struct {
             .s3_key = key_copy,
             .max_timestamp_ms = max_timestamp_ms,
         });
+        key_copy_owned = false;
+        errdefer self.removeStreamObject(object_id);
 
         // Update stream_object_index — insert maintaining sorted order by start_offset
         var gop = try self.stream_object_index.getOrPut(stream_id);
@@ -1485,8 +1541,14 @@ pub const PreparedObjectRegistry = struct {
     /// Previous buffer — preserved from the last rotation, contains older prepared
     /// objects that may have been in the Raft log section that was truncated.
     previous: std.AutoHashMap(u64, PreparedEntry),
-    /// Timestamp (ms) of the last buffer rotation.
+    /// Persisted timestamp (ms) of the last buffer rotation.
+    ///
+    /// This remains in the snapshot format for compatibility. Runtime elapsed
+    /// checks use last_rotation_monotonic_ms so wall-clock jumps or restored
+    /// snapshots cannot suppress or force rotations in a live process.
     last_rotation_ms: i64,
+    /// In-memory monotonic timestamp (ms) of the last buffer rotation.
+    last_rotation_monotonic_ms: i64,
     /// Rotation interval in milliseconds (default 60 minutes, matching AutoMQ).
     rotation_interval_ms: i64,
     allocator: Allocator,
@@ -1505,10 +1567,13 @@ pub const PreparedObjectRegistry = struct {
     const REGISTRY_VERSION: u8 = 2;
 
     pub fn init(alloc: Allocator) PreparedObjectRegistry {
+        const wall_now = wallClockMs();
+        const monotonic_now = monotonicMs();
         return .{
             .current = std.AutoHashMap(u64, PreparedEntry).init(alloc),
             .previous = std.AutoHashMap(u64, PreparedEntry).init(alloc),
-            .last_rotation_ms = @import("time_compat").milliTimestamp(),
+            .last_rotation_ms = wall_now,
+            .last_rotation_monotonic_ms = monotonic_now,
             .rotation_interval_ms = 60 * 60 * 1000, // 60 minutes
             .allocator = alloc,
         };
@@ -1520,6 +1585,7 @@ pub const PreparedObjectRegistry = struct {
             .current = std.AutoHashMap(u64, PreparedEntry).init(alloc),
             .previous = std.AutoHashMap(u64, PreparedEntry).init(alloc),
             .last_rotation_ms = now_ms,
+            .last_rotation_monotonic_ms = now_ms,
             .rotation_interval_ms = 60 * 60 * 1000,
             .allocator = alloc,
         };
@@ -1532,11 +1598,11 @@ pub const PreparedObjectRegistry = struct {
 
     /// Register a newly prepared object in the current buffer.
     pub fn trackPrepared(self: *PreparedObjectRegistry, object_id: u64) void {
-        self.trackPreparedAt(object_id, @import("time_compat").milliTimestamp());
+        self.trackPreparedAt(object_id, wallClockMs());
     }
 
     pub fn trackPreparedWithTtl(self: *PreparedObjectRegistry, object_id: u64, ttl_ms: i64) void {
-        self.trackPreparedWithTtlAt(object_id, @import("time_compat").milliTimestamp(), ttl_ms);
+        self.trackPreparedWithTtlAt(object_id, wallClockMs(), ttl_ms);
     }
 
     /// Register a newly prepared object with an explicit timestamp for testability.
@@ -1563,18 +1629,23 @@ pub const PreparedObjectRegistry = struct {
     /// Rotate buffers if the rotation interval has elapsed.
     /// Discards the previous buffer, moves current to previous, creates a new current.
     pub fn maybeRotate(self: *PreparedObjectRegistry) void {
-        self.maybeRotateAt(@import("time_compat").milliTimestamp());
+        self.maybeRotateWithClocks(monotonicMs(), wallClockMs());
     }
 
-    /// Rotate with an explicit timestamp for testability.
+    /// Rotate with an explicit monotonic timestamp for testability.
     pub fn maybeRotateAt(self: *PreparedObjectRegistry, now_ms: i64) void {
-        if (now_ms - self.last_rotation_ms < self.rotation_interval_ms) return;
+        self.maybeRotateWithClocks(now_ms, now_ms);
+    }
+
+    fn maybeRotateWithClocks(self: *PreparedObjectRegistry, now_monotonic_ms: i64, now_wall_ms: i64) void {
+        if (now_monotonic_ms - self.last_rotation_monotonic_ms < self.rotation_interval_ms) return;
 
         // Discard the previous buffer, move current → previous
         self.previous.deinit();
         self.previous = self.current;
         self.current = std.AutoHashMap(u64, PreparedEntry).init(self.allocator);
-        self.last_rotation_ms = now_ms;
+        self.last_rotation_ms = now_wall_ms;
+        self.last_rotation_monotonic_ms = now_monotonic_ms;
 
         log.debug("PreparedObjectRegistry rotated: previous={d} entries", .{self.previous.count()});
     }
@@ -1757,6 +1828,7 @@ pub const PreparedObjectRegistry = struct {
         self.current = new_current;
         self.previous = new_previous;
         self.last_rotation_ms = last_rotation;
+        self.last_rotation_monotonic_ms = monotonicMs();
         self.rotation_interval_ms = rotation_interval;
 
         log.info("PreparedObjectRegistry loaded: current={d}, previous={d}", .{ cur_count, prev_count });
@@ -2899,6 +2971,41 @@ test "ObjectManager collectDestroyedObjects does not affect committed objects" {
     try testing.expectEqual(S3ObjectState.committed, so.state);
 }
 
+test "ObjectManager collectDestroyedObjects fails closed on allocation failure" {
+    var om = ObjectManager.init(testing.allocator, 0);
+    defer om.deinit();
+
+    try om.commitStreamObject(1, 1, 0, 100, "so/oom/1", 1024);
+    om.markDestroyedAt(1, 1000);
+
+    const original_allocator = om.allocator;
+    var failing_allocator = std.testing.FailingAllocator.init(testing.allocator, .{ .fail_index = 0 });
+    om.allocator = failing_allocator.allocator();
+    defer om.allocator = original_allocator;
+
+    try testing.expectError(error.OutOfMemory, om.collectDestroyedObjectsAt(100, testing.allocator, 50000));
+    try testing.expectEqual(@as(usize, 1), om.getStreamObjectCount());
+    const so = om.stream_objects.get(1).?;
+    try testing.expectEqual(S3ObjectState.mark_destroyed, so.state);
+}
+
+test "ObjectManager collectDestroyedObjects keeps metadata when later key copy fails" {
+    var om = ObjectManager.init(testing.allocator, 0);
+    defer om.deinit();
+
+    try om.commitStreamObject(1, 1, 0, 100, "so/oom/1", 1024);
+    try om.commitStreamObject(2, 1, 100, 200, "so/oom/2", 1024);
+    om.markDestroyedAt(1, 1000);
+    om.markDestroyedAt(2, 1000);
+
+    var failing_allocator = std.testing.FailingAllocator.init(testing.allocator, .{ .fail_index = 2 });
+
+    try testing.expectError(error.OutOfMemory, om.collectDestroyedObjectsAt(100, failing_allocator.allocator(), 50000));
+    try testing.expectEqual(@as(usize, 2), om.getStreamObjectCount());
+    try testing.expectEqual(S3ObjectState.mark_destroyed, om.stream_objects.get(1).?.state);
+    try testing.expectEqual(S3ObjectState.mark_destroyed, om.stream_objects.get(2).?.state);
+}
+
 test "ObjectManager expirePreparedObjects cleans stale prepared SOs" {
     var om = ObjectManager.init(testing.allocator, 0);
     defer om.deinit();
@@ -2913,18 +3020,34 @@ test "ObjectManager expirePreparedObjects cleans stale prepared SOs" {
     try testing.expectEqual(@as(usize, 3), om.getStreamObjectCount());
 
     // At time 2000 with 3600000ms TTL (1 hour) — not yet expired
-    const expired_early = om.expirePreparedObjectsAt(3600000, 2000);
+    const expired_early = try om.expirePreparedObjectsAt(3600000, 2000);
     try testing.expectEqual(@as(u64, 0), expired_early);
     try testing.expectEqual(@as(usize, 3), om.getStreamObjectCount());
 
     // At time 3601001 with 3600000ms TTL — both prepared objects have expired
-    const expired = om.expirePreparedObjectsAt(3600000, 3601001);
+    const expired = try om.expirePreparedObjectsAt(3600000, 3601001);
     try testing.expectEqual(@as(u64, 2), expired);
 
     // Only the committed object remains
     try testing.expectEqual(@as(usize, 1), om.getStreamObjectCount());
     const so = om.stream_objects.get(3).?;
     try testing.expectEqual(S3ObjectState.committed, so.state);
+}
+
+test "ObjectManager expirePreparedObjects fails closed on allocation failure" {
+    var om = ObjectManager.init(testing.allocator, 0);
+    defer om.deinit();
+
+    try om.registerPreparedStreamObjectAt(1, 1, "so/prepared/oom", 1000);
+
+    const original_allocator = om.allocator;
+    var failing_allocator = std.testing.FailingAllocator.init(testing.allocator, .{ .fail_index = 0 });
+    om.allocator = failing_allocator.allocator();
+    defer om.allocator = original_allocator;
+
+    try testing.expectError(error.OutOfMemory, om.expirePreparedObjectsAt(100, 50000));
+    try testing.expectEqual(@as(usize, 1), om.getStreamObjectCount());
+    try testing.expect(om.prepared_registry.contains(1));
 }
 
 test "ObjectManager prepareObject allocates unique IDs" {
@@ -2947,11 +3070,11 @@ test "ObjectManager expires registry-only prepared IDs by object TTL" {
     try testing.expect(om.prepared_registry.contains(object_id));
     try testing.expectEqual(@as(usize, 0), om.getStreamObjectCount());
 
-    const expired_early = om.expirePreparedObjectsAt(3600000, 1499);
+    const expired_early = try om.expirePreparedObjectsAt(3600000, 1499);
     try testing.expectEqual(@as(u64, 0), expired_early);
     try testing.expect(om.prepared_registry.contains(object_id));
 
-    const expired = om.expirePreparedObjectsAt(3600000, 1500);
+    const expired = try om.expirePreparedObjectsAt(3600000, 1500);
     try testing.expectEqual(@as(u64, 1), expired);
     try testing.expect(!om.prepared_registry.contains(object_id));
 }
@@ -3160,6 +3283,29 @@ test "PreparedObjectRegistry rotation respects interval" {
     try testing.expect(reg.contains(10)); // Still visible in previous
 }
 
+test "PreparedObjectRegistry rotation uses monotonic runtime baseline" {
+    var reg = PreparedObjectRegistry.initWithTime(testing.allocator, 1000);
+    defer reg.deinit();
+    reg.rotation_interval_ms = 100;
+    reg.trackPreparedAt(10, 1000);
+
+    // Simulate a restored or clock-skewed persisted wall-clock timestamp.
+    // Rotation must still be gated by the runtime monotonic baseline.
+    reg.last_rotation_ms = 9_999_999;
+    reg.last_rotation_monotonic_ms = 1000;
+
+    reg.maybeRotateAt(1050);
+    try testing.expect(reg.current.contains(10));
+    try testing.expectEqual(@as(usize, 0), reg.previous.count());
+    try testing.expectEqual(@as(i64, 9_999_999), reg.last_rotation_ms);
+
+    reg.maybeRotateAt(1101);
+    try testing.expect(!reg.current.contains(10));
+    try testing.expect(reg.previous.contains(10));
+    try testing.expectEqual(@as(i64, 1101), reg.last_rotation_monotonic_ms);
+    try testing.expectEqual(@as(i64, 1101), reg.last_rotation_ms);
+}
+
 test "PreparedObjectRegistry serialize and deserialize roundtrip" {
     var reg = PreparedObjectRegistry.initWithTime(testing.allocator, 5000);
     defer reg.deinit();
@@ -3323,7 +3469,7 @@ test "ObjectManager expirePreparedObjects untracks from prepared_registry" {
     try testing.expect(om.prepared_registry.contains(42));
 
     // Expire with TTL=500 at t=2000 — object has been prepared for 1000ms > 500ms TTL
-    const expired = om.expirePreparedObjectsAt(500, 2000);
+    const expired = try om.expirePreparedObjectsAt(500, 2000);
     try testing.expectEqual(@as(u64, 1), expired);
 
     // Should be gone from both the object store AND the prepared registry

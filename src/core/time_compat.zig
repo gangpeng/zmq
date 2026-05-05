@@ -11,8 +11,20 @@ pub fn nanoTimestamp() i128 {
     }
 }
 
+pub fn monotonicNanoTimestamp() u64 {
+    var ts: linux.timespec = undefined;
+    switch (posix.errno(linux.clock_gettime(.MONOTONIC, &ts))) {
+        .SUCCESS => return @intCast((@as(i128, ts.sec) * std.time.ns_per_s) + ts.nsec),
+        else => return @intCast(nanoTimestamp()),
+    }
+}
+
 pub fn milliTimestamp() i64 {
     return @intCast(@divTrunc(nanoTimestamp(), std.time.ns_per_ms));
+}
+
+pub fn monotonicMilliTimestamp() u64 {
+    return monotonicNanoTimestamp() / std.time.ns_per_ms;
 }
 
 pub fn timestamp() i64 {

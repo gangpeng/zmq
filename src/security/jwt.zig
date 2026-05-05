@@ -21,10 +21,11 @@ pub const JwtToken = struct {
     /// Raw signature bytes (base64url-decoded)
     signature: []const u8,
     /// Extracted claims
-    subject: ?[]const u8 = null,
-    issuer: ?[]const u8 = null,
-    audience: ?[]const u8 = null,
-    scope: ?[]const u8 = null,
+    subject: ?[]u8 = null,
+    issuer: ?[]u8 = null,
+    audience: ?[]u8 = null,
+    audience_values: [][]u8 = &.{},
+    scope: ?[]u8 = null,
     expires_at: ?i64 = null,
     issued_at: ?i64 = null,
     not_before: ?i64 = null,
@@ -42,12 +43,13 @@ pub const JwtToken = struct {
         const sig_b64 = rest[second_dot + 1 ..];
 
         // Decode each part
+        var transferred_to_jwt = false;
         const header_json = try base64UrlDecode(alloc, header_b64);
-        errdefer alloc.free(header_json);
+        errdefer if (!transferred_to_jwt) alloc.free(header_json);
         const payload_json = try base64UrlDecode(alloc, payload_b64);
-        errdefer alloc.free(payload_json);
+        errdefer if (!transferred_to_jwt) alloc.free(payload_json);
         const signature = try base64UrlDecode(alloc, sig_b64);
-        errdefer alloc.free(signature);
+        errdefer if (!transferred_to_jwt) alloc.free(signature);
 
         // Extract claims from payload JSON
         var jwt = JwtToken{
@@ -57,13 +59,9 @@ pub const JwtToken = struct {
             .allocator = alloc,
         };
 
-        jwt.subject = extractStringClaim(payload_json, "\"sub\"");
-        jwt.issuer = extractStringClaim(payload_json, "\"iss\"");
-        jwt.audience = extractStringClaim(payload_json, "\"aud\"");
-        jwt.scope = extractStringClaim(payload_json, "\"scope\"");
-        jwt.expires_at = extractIntClaim(payload_json, "\"exp\"");
-        jwt.issued_at = extractIntClaim(payload_json, "\"iat\"");
-        jwt.not_before = extractIntClaim(payload_json, "\"nbf\"");
+        transferred_to_jwt = true;
+        errdefer jwt.deinit();
+        try jwt.extractClaims();
 
         return jwt;
     }
@@ -88,7 +86,10 @@ pub const JwtToken = struct {
         if (self.audience) |actual| {
             if (std.mem.eql(u8, actual, expected)) return true;
         }
-        return stringArrayClaimContains(self.payload_json, "\"aud\"", expected);
+        for (self.audience_values) |actual| {
+            if (std.mem.eql(u8, actual, expected)) return true;
+        }
+        return false;
     }
 
     /// Get the principal (subject claim).
@@ -97,9 +98,66 @@ pub const JwtToken = struct {
     }
 
     pub fn deinit(self: *JwtToken) void {
+        if (self.subject) |subject| self.allocator.free(subject);
+        if (self.issuer) |issuer| self.allocator.free(issuer);
+        if (self.audience) |audience| self.allocator.free(audience);
+        for (self.audience_values) |audience| self.allocator.free(audience);
+        if (self.audience_values.len > 0) self.allocator.free(self.audience_values);
+        if (self.scope) |scope| self.allocator.free(scope);
         self.allocator.free(self.header_json);
         self.allocator.free(self.payload_json);
         self.allocator.free(self.signature);
+    }
+
+    fn extractClaims(self: *JwtToken) !void {
+        var parsed = try std.json.parseFromSlice(std.json.Value, self.allocator, self.payload_json, .{
+            .duplicate_field_behavior = .@"error",
+            .parse_numbers = true,
+        });
+        defer parsed.deinit();
+
+        const object = switch (parsed.value) {
+            .object => |*object| object,
+            else => return error.InvalidJwtPayload,
+        };
+
+        self.subject = try copyOptionalStringClaim(self.allocator, object, "sub");
+        self.issuer = try copyOptionalStringClaim(self.allocator, object, "iss");
+        self.scope = try copyOptionalStringClaim(self.allocator, object, "scope");
+        self.expires_at = optionalIntClaim(object, "exp");
+        self.issued_at = optionalIntClaim(object, "iat");
+        self.not_before = optionalIntClaim(object, "nbf");
+        try self.copyAudienceClaim(object);
+    }
+
+    fn copyAudienceClaim(self: *JwtToken, object: *const std.json.ObjectMap) !void {
+        const value = object.get("aud") orelse return;
+        switch (value) {
+            .string => |audience| {
+                self.audience = try self.allocator.dupe(u8, audience);
+            },
+            .array => |array| {
+                var audiences = std.array_list.Managed([]u8).init(self.allocator);
+                errdefer {
+                    for (audiences.items) |audience| self.allocator.free(audience);
+                    audiences.deinit();
+                }
+
+                for (array.items) |item| {
+                    switch (item) {
+                        .string => |audience| {
+                            const copy = try self.allocator.dupe(u8, audience);
+                            errdefer self.allocator.free(copy);
+                            try audiences.append(copy);
+                        },
+                        else => {},
+                    }
+                }
+
+                self.audience_values = try audiences.toOwnedSlice();
+            },
+            else => {},
+        }
     }
 };
 
@@ -136,78 +194,21 @@ fn base64UrlDecode(alloc: Allocator, input: []const u8) ![]u8 {
     return result;
 }
 
-/// Extract a string claim value from JSON.
-/// Simple substring search — finds "key":"value" patterns.
-/// This is a minimal JSON parser sufficient for JWT claims.
-fn extractStringClaim(json: []const u8, key: []const u8) ?[]const u8 {
-    const key_pos = std.mem.indexOf(u8, json, key) orelse return null;
-    const after_key = json[key_pos + key.len ..];
-
-    // Skip whitespace and colon
-    var i: usize = 0;
-    while (i < after_key.len and (after_key[i] == ' ' or after_key[i] == ':' or after_key[i] == '\t')) : (i += 1) {}
-
-    if (i >= after_key.len or after_key[i] != '"') return null;
-    i += 1; // skip opening quote
-
-    const value_start = i;
-    // Find closing quote (handle escaped quotes)
-    while (i < after_key.len) : (i += 1) {
-        if (after_key[i] == '"' and (i == 0 or after_key[i - 1] != '\\')) break;
-    }
-    if (i >= after_key.len) return null;
-
-    return after_key[value_start..i];
+fn copyOptionalStringClaim(alloc: Allocator, object: *const std.json.ObjectMap, key: []const u8) !?[]u8 {
+    const value = object.get(key) orelse return null;
+    return switch (value) {
+        .string => |s| try alloc.dupe(u8, s),
+        else => null,
+    };
 }
 
-/// Extract an integer claim value from JSON.
-fn extractIntClaim(json: []const u8, key: []const u8) ?i64 {
-    const key_pos = std.mem.indexOf(u8, json, key) orelse return null;
-    const after_key = json[key_pos + key.len ..];
-
-    // Skip whitespace and colon
-    var i: usize = 0;
-    while (i < after_key.len and (after_key[i] == ' ' or after_key[i] == ':' or after_key[i] == '\t')) : (i += 1) {}
-
-    if (i >= after_key.len) return null;
-
-    // Parse integer
-    const start = i;
-    while (i < after_key.len and (after_key[i] >= '0' and after_key[i] <= '9')) : (i += 1) {}
-    if (i == start) return null;
-
-    return std.fmt.parseInt(i64, after_key[start..i], 10) catch null;
-}
-
-/// Return true when a JSON string-array claim contains `expected`.
-/// This intentionally remains a minimal JWT-claim parser; it handles the
-/// compact provider tokens used by the broker's OAUTHBEARER gate without
-/// pulling a full JSON DOM into the authentication hot path.
-fn stringArrayClaimContains(json: []const u8, key: []const u8, expected: []const u8) bool {
-    const key_pos = std.mem.indexOf(u8, json, key) orelse return false;
-    const after_key = json[key_pos + key.len ..];
-
-    var i: usize = 0;
-    while (i < after_key.len and (after_key[i] == ' ' or after_key[i] == ':' or after_key[i] == '\t')) : (i += 1) {}
-    if (i >= after_key.len or after_key[i] != '[') return false;
-    i += 1;
-
-    while (i < after_key.len) {
-        while (i < after_key.len and (after_key[i] == ' ' or after_key[i] == '\t' or after_key[i] == '\n' or after_key[i] == '\r' or after_key[i] == ',')) : (i += 1) {}
-        if (i >= after_key.len or after_key[i] == ']') return false;
-        if (after_key[i] != '"') return false;
-        i += 1;
-
-        const value_start = i;
-        while (i < after_key.len) : (i += 1) {
-            if (after_key[i] == '"' and (i == 0 or after_key[i - 1] != '\\')) break;
-        }
-        if (i >= after_key.len) return false;
-        if (std.mem.eql(u8, after_key[value_start..i], expected)) return true;
-        i += 1;
-    }
-
-    return false;
+fn optionalIntClaim(object: *const std.json.ObjectMap, key: []const u8) ?i64 {
+    const value = object.get(key) orelse return null;
+    return switch (value) {
+        .integer => |i| i,
+        .number_string => |s| std.fmt.parseInt(i64, s, 10) catch null,
+        else => null,
+    };
 }
 
 // ---------------------------------------------------------------
@@ -266,19 +267,22 @@ test "base64UrlDecode with url-safe chars" {
     try testing.expectEqualStrings("test", decoded2);
 }
 
-test "extractStringClaim" {
-    const json = "{\"sub\":\"alice\",\"iss\":\"myserver\",\"aud\":\"kafka\"}";
-    try testing.expectEqualStrings("alice", extractStringClaim(json, "\"sub\"").?);
-    try testing.expectEqualStrings("myserver", extractStringClaim(json, "\"iss\"").?);
-    try testing.expectEqualStrings("kafka", extractStringClaim(json, "\"aud\"").?);
-    try testing.expect(extractStringClaim(json, "\"missing\"") == null);
+test "JwtToken parses JSON claims structurally" {
+    const token_with_embedded_key_text = "eyJhbGciOiJub25lIn0.eyJub2lzZSI6Ilwic3ViXCI6XCJldmlsXCIiLCJzdWIiOiJyZWFsLXVzZXIiLCJleHAiOjk5OTk5OTk5OTl9.";
+    var embedded = try JwtToken.parse(testing.allocator, token_with_embedded_key_text);
+    defer embedded.deinit();
+    try testing.expectEqualStrings("real-user", embedded.subject.?);
+    try testing.expectEqual(@as(i64, 9999999999), embedded.expires_at.?);
+
+    const token_with_escaped_subject = "eyJhbGciOiJub25lIn0.eyJzdWIiOiJ1c2VyXHUwMDJEb25lIiwiZXhwIjo5OTk5OTk5OTk5fQ.";
+    var escaped = try JwtToken.parse(testing.allocator, token_with_escaped_subject);
+    defer escaped.deinit();
+    try testing.expectEqualStrings("user-one", escaped.subject.?);
 }
 
-test "extractIntClaim" {
-    const json = "{\"exp\":1234567890,\"iat\":1000000000}";
-    try testing.expectEqual(@as(i64, 1234567890), extractIntClaim(json, "\"exp\"").?);
-    try testing.expectEqual(@as(i64, 1000000000), extractIntClaim(json, "\"iat\"").?);
-    try testing.expect(extractIntClaim(json, "\"missing\"") == null);
+test "JwtToken rejects duplicate payload claims" {
+    const duplicate_exp_token = "eyJhbGciOiJub25lIn0.eyJzdWIiOiJkdXAiLCJleHAiOjEwMDAsImV4cCI6OTk5OTk5OTk5OX0.";
+    try testing.expectError(error.DuplicateField, JwtToken.parse(testing.allocator, duplicate_exp_token));
 }
 
 test "JwtToken audience array and not-before claims" {
@@ -294,4 +298,12 @@ test "JwtToken audience array and not-before claims" {
     defer not_before_jwt.deinit();
     try testing.expectEqual(@as(i64, 9999999999), not_before_jwt.not_before.?);
     try testing.expect(not_before_jwt.isNotYetValid());
+}
+
+test "JwtToken audience array handles escaped JSON strings" {
+    const escaped_array_audience_token = "eyJhbGciOiJub25lIn0.eyJzdWIiOiJhdWR1c2VyIiwiYXVkIjpbIm5vdC1rYWZrYSIsImthZlx1MDA2YmEiXSwiZXhwIjo5OTk5OTk5OTk5fQ.";
+    var jwt = try JwtToken.parse(testing.allocator, escaped_array_audience_token);
+    defer jwt.deinit();
+    try testing.expect(jwt.hasAudience("kafka"));
+    try testing.expect(!jwt.hasAudience("kaf\\u006ba"));
 }

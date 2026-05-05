@@ -72,8 +72,16 @@ const acl_snapshot_record_value_magic = "ZMQAC1";
 const acl_snapshot_record_key = "__zmq_acl_snapshot";
 const finalized_feature_snapshot_record_value_magic = "ZMQFF1";
 const finalized_feature_snapshot_record_key = "__zmq_finalized_feature_snapshot";
+const delegation_token_snapshot_record_value_magic = "ZMQDT1";
+const delegation_token_snapshot_record_key = "__zmq_delegation_token_snapshot";
 const auto_mq_quorum_commit_timeout_ms: i64 = 5000;
 const max_local_replica_directories: usize = 16;
+const delegation_token_default_lifetime_ms: i64 = 24 * 60 * 60 * 1000;
+const delegation_token_hmac_len: usize = 32;
+
+fn monotonicMs() i64 {
+    return @intCast(@import("time_compat").monotonicMilliTimestamp());
+}
 
 /// Stateful Kafka broker.
 ///
@@ -183,6 +191,20 @@ pub const Broker = struct {
     /// Used to resolve the real principal for ACL checks instead of trusting
     /// the unauthenticated client_id header.
     authenticated_sessions: std.StringHashMap([]u8),
+    /// Optional SASL session expiries keyed by client ID. OAUTHBEARER and
+    /// delegation-token SCRAM sessions must expire no later than their bearer
+    /// credential.
+    authenticated_session_expiries: std.StringHashMap(i64),
+    /// Client IDs whose current SASL session was authenticated by a delegation
+    /// token, mapped to the token expiry timestamp in milliseconds. Kafka
+    /// forbids delegation-token lifecycle APIs on these sessions, and the
+    /// session must expire no later than the token itself.
+    delegation_token_authenticated_sessions: std.StringHashMap(i64),
+    /// Broker-local delegation tokens keyed by lowercase HMAC hex.
+    /// This gives advertised token APIs real create/renew/expire/describe
+    /// semantics with local and __cluster_metadata snapshot persistence plus
+    /// SASL/SCRAM token authentication.
+    delegation_tokens: std.StringHashMap(DelegationToken),
     /// Map of client_id → negotiated SASL mechanism name.
     /// Tracks which mechanism each client selected during SaslHandshake.
     sasl_mechanisms: std.StringHashMap([]u8),
@@ -197,7 +219,7 @@ pub const Broker = struct {
     s3_flush_failures: u64 = 0,
     /// Dirty flag for producer sequence persistence.
     producer_sequences_dirty: bool = false,
-    /// Timestamp of last retention enforcement run.
+    /// Monotonic timestamp of last retention enforcement run.
     /// Retention runs every 60 seconds (matching AutoMQ's LogCleaner interval).
     last_retention_check_ms: i64 = 0,
     /// Failover controller for broker failure handling.
@@ -231,7 +253,7 @@ pub const Broker = struct {
         /// Starting offset the client is fetching from.
         fetch_offset: u64,
         max_bytes: usize,
-        /// Wall-clock deadline (ms) after which the fetch expires without data.
+        /// Monotonic deadline (ms) after which the fetch expires without data.
         deadline_ms: i64,
         /// Kafka API version of the original fetch request.
         api_version: i16,
@@ -246,7 +268,7 @@ pub const Broker = struct {
         }
 
         pub fn isExpired(self: *const DelayedFetch) bool {
-            return @import("time_compat").milliTimestamp() >= self.deadline_ms;
+            return monotonicMs() >= self.deadline_ms;
         }
     };
 
@@ -336,6 +358,67 @@ pub const Broker = struct {
             if (self.metrics.len > 0) alloc.free(self.metrics);
             self.metrics = &.{};
             self.last_seen_ms = 0;
+        }
+    };
+
+    pub const DelegationTokenRenewer = struct {
+        principal_type: []u8,
+        principal_name: []u8,
+
+        pub fn deinit(self: *DelegationTokenRenewer, alloc: Allocator) void {
+            alloc.free(self.principal_type);
+            alloc.free(self.principal_name);
+            self.principal_type = &.{};
+            self.principal_name = &.{};
+        }
+    };
+
+    pub const DelegationToken = struct {
+        owner_principal_type: []u8,
+        owner_principal_name: []u8,
+        requester_principal_type: []u8,
+        requester_principal_name: []u8,
+        token_id: []u8,
+        hmac: []u8,
+        renewers: []DelegationTokenRenewer,
+        issue_timestamp_ms: i64,
+        expiry_timestamp_ms: i64,
+        max_timestamp_ms: i64,
+
+        pub fn deinit(self: *DelegationToken, alloc: Allocator) void {
+            alloc.free(self.owner_principal_type);
+            alloc.free(self.owner_principal_name);
+            alloc.free(self.requester_principal_type);
+            alloc.free(self.requester_principal_name);
+            alloc.free(self.token_id);
+            alloc.free(self.hmac);
+            for (self.renewers) |*renewer| renewer.deinit(alloc);
+            if (self.renewers.len > 0) alloc.free(self.renewers);
+            self.* = .{
+                .owner_principal_type = &.{},
+                .owner_principal_name = &.{},
+                .requester_principal_type = &.{},
+                .requester_principal_name = &.{},
+                .token_id = &.{},
+                .hmac = &.{},
+                .renewers = &.{},
+                .issue_timestamp_ms = 0,
+                .expiry_timestamp_ms = 0,
+                .max_timestamp_ms = 0,
+            };
+        }
+
+        pub fn principalMatches(self: *const DelegationToken, principal_type: []const u8, principal_name: []const u8) bool {
+            return (std.mem.eql(u8, self.owner_principal_type, principal_type) and std.mem.eql(u8, self.owner_principal_name, principal_name)) or
+                (std.mem.eql(u8, self.requester_principal_type, principal_type) and std.mem.eql(u8, self.requester_principal_name, principal_name));
+        }
+
+        pub fn canRenew(self: *const DelegationToken, principal_type: []const u8, principal_name: []const u8) bool {
+            if (self.principalMatches(principal_type, principal_name)) return true;
+            for (self.renewers) |renewer| {
+                if (std.mem.eql(u8, renewer.principal_type, principal_type) and std.mem.eql(u8, renewer.principal_name, principal_name)) return true;
+            }
+            return false;
         }
     };
 
@@ -607,6 +690,9 @@ pub const Broker = struct {
             .scram_authenticator = ScramSha256Authenticator.init(alloc),
             .oauth_authenticator = OAuthBearerAuthenticator.init(),
             .authenticated_sessions = std.StringHashMap([]u8).init(alloc),
+            .authenticated_session_expiries = std.StringHashMap(i64).init(alloc),
+            .delegation_token_authenticated_sessions = std.StringHashMap(i64).init(alloc),
+            .delegation_tokens = std.StringHashMap(DelegationToken).init(alloc),
             .sasl_mechanisms = std.StringHashMap([]u8).init(alloc),
             .scram_sessions = std.StringHashMap(ScramStateMachine).init(alloc),
             .fetch_sessions = FetchSessionManager.init(alloc),
@@ -763,6 +849,7 @@ pub const Broker = struct {
                 cm.s3_storage = storage_ref;
             }
             cm.metrics = &self.metrics;
+            cm.setMetadataCheckpoint(self, persistCompactionObjectMetadataCheckpoint);
         }
         // Wire metrics into group coordinator for consumer lag tracking
         self.groups.metrics = &self.metrics;
@@ -837,16 +924,8 @@ pub const Broker = struct {
         defer self.persistence.freeOffsetEntries(saved_offsets);
 
         for (saved_offsets) |entry| {
-            // Key format: "group:topic:partition" (as stored by GroupCoordinator.commitOffset)
-            var parts = std.mem.splitSequence(u8, entry.key, ":");
-            const group_id = parts.next() orelse continue;
-            const topic = parts.next() orelse continue;
-            const partition_str = parts.next() orelse continue;
-            const partition = std.fmt.parseInt(i32, partition_str, 10) catch continue;
-
-            self.groups.commitOffsetWithMetadata(group_id, topic, partition, entry.offset, entry.leader_epoch, entry.metadata) catch |err| {
-                log.warn("Failed to restore offset for {s}/{s}-{d}: {}", .{ group_id, topic, partition, err });
-            };
+            const key = try parsePersistedOffsetKey(entry.key);
+            try self.groups.commitOffsetWithMetadata(key.group_id, key.topic, key.partition, entry.offset, entry.leader_epoch, entry.metadata);
         }
 
         // Load persisted consumer-group lifecycle state after offsets so active
@@ -916,6 +995,13 @@ pub const Broker = struct {
             log.info("Restored {d} ACL(s) from acls.meta", .{saved_acls.len});
         }
 
+        const saved_delegation_tokens = try self.persistence.loadDelegationTokens();
+        defer self.persistence.freeDelegationTokenEntries(saved_delegation_tokens);
+        try self.restoreDelegationTokens(saved_delegation_tokens);
+        if (self.delegation_tokens.count() > 0) {
+            log.info("Restored {d} delegation token(s) from delegation_tokens.meta", .{self.delegation_tokens.count()});
+        }
+
         // Load persisted partition offsets and visibility state after topics and
         // internal partitions exist.
         const saved_partition_states = try self.persistence.loadPartitionStates();
@@ -933,7 +1019,7 @@ pub const Broker = struct {
         }
         const recovered_cluster_records = try self.restoreClusterMetadataFromLog();
         if (recovered_cluster_records.total() > 0) {
-            log.info("Restored cluster metadata from __cluster_metadata (topics={d}, partition_states={d}, reassignments={d}, replica_dirs={d}, client_quotas={d}, scram_credentials={d}, acls={d}, finalized_features={d})", .{
+            log.info("Restored cluster metadata from __cluster_metadata (topics={d}, partition_states={d}, reassignments={d}, replica_dirs={d}, client_quotas={d}, scram_credentials={d}, acls={d}, finalized_features={d}, delegation_tokens={d})", .{
                 recovered_cluster_records.topic_snapshots,
                 recovered_cluster_records.partition_state_snapshots,
                 recovered_cluster_records.partition_reassignment_snapshots,
@@ -942,6 +1028,7 @@ pub const Broker = struct {
                 recovered_cluster_records.scram_credential_snapshots,
                 recovered_cluster_records.acl_snapshots,
                 recovered_cluster_records.finalized_feature_snapshots,
+                recovered_cluster_records.delegation_token_snapshots,
             });
             self.persistence.saveTopics(&self.topics) catch |err| {
                 log.warn("Failed to persist replayed topic metadata: {}", .{err});
@@ -960,6 +1047,11 @@ pub const Broker = struct {
             self.persistFinalizedFeaturesDurably() catch |err| {
                 log.warn("Failed to persist replayed finalized feature metadata: {}", .{err});
             };
+            if (recovered_cluster_records.delegation_token_snapshots > 0) {
+                self.persistDelegationTokensLocalDurably() catch |err| {
+                    log.warn("Failed to persist replayed delegation token metadata: {}", .{err});
+                };
+            }
             if (self.store.repairPartitionStatesFromObjectManager()) {
                 log.info("Repaired partition state after topic metadata replay", .{});
                 self.persistPartitionStates();
@@ -1174,7 +1266,7 @@ pub const Broker = struct {
         // driven; a broker-local heartbeat timer would create split-brain
         // metadata and can race with replicated ownership snapshots.
         if (self.localFailoverTickEnabled()) {
-            const failovers = self.failover_controller.tick(@import("time_compat").milliTimestamp());
+            const failovers = self.failover_controller.tick(monotonicMs());
             if (failovers > 0) {
                 log.info("Failover: {d} nodes failed over", .{failovers});
                 // Sync WAL epoch with failover controller
@@ -1244,9 +1336,9 @@ pub const Broker = struct {
         // NOTE: AutoMQ runs this in LogCleaner on a dedicated thread every 60s.
         // ZMQ runs it inline on the event loop since it only updates offsets
         // (no I/O), and compaction handles the actual S3 deletes.
-        const now_ms = @import("time_compat").milliTimestamp();
-        if (now_ms - self.last_retention_check_ms >= 60_000) {
-            self.last_retention_check_ms = now_ms;
+        const retention_check_ms = monotonicMs();
+        if (self.last_retention_check_ms == 0 or retention_check_ms - self.last_retention_check_ms >= 60_000) {
+            self.last_retention_check_ms = retention_check_ms;
             self.enforceRetentionPolicies();
         }
 
@@ -1296,14 +1388,14 @@ pub const Broker = struct {
     };
 
     fn expireTransactionsWithControlMarkers(self: *Broker) u32 {
-        const now = @import("time_compat").milliTimestamp();
+        const now = monotonicMs();
         var expired: [64]ExpiredTransaction = undefined;
         var expired_count: usize = 0;
 
         var it = self.txn_coordinator.transactions.iterator();
         while (it.next()) |entry| {
             const txn = entry.value_ptr;
-            if (txn.status == .ongoing and now - txn.start_time_ms > txn.timeout_ms and expired_count < expired.len) {
+            if (txn.status == .ongoing and TxnCoordinator.isTransactionTimedOut(txn, now) and expired_count < expired.len) {
                 expired[expired_count] = .{
                     .producer_id = txn.producer_id,
                     .producer_epoch = txn.producer_epoch,
@@ -1534,6 +1626,7 @@ pub const Broker = struct {
         self.persistProducerSequencesIfDirty();
         self.persistAutoMqMetadata();
         self.persistFinalizedFeaturesLocal();
+        self.persistDelegationTokensLocal();
         self.persistShareGroupStatesLocal();
         self.persistShareGroupSessionsLocal();
         self.persistPartitionReassignmentsLocal();
@@ -1592,6 +1685,18 @@ pub const Broker = struct {
             self.allocator.free(entry.value_ptr.*);
         }
         self.authenticated_sessions.deinit();
+        var session_expiry_it = self.authenticated_session_expiries.keyIterator();
+        while (session_expiry_it.next()) |key| {
+            self.allocator.free(key.*);
+        }
+        self.authenticated_session_expiries.deinit();
+        var token_sess_it = self.delegation_token_authenticated_sessions.keyIterator();
+        while (token_sess_it.next()) |key| {
+            self.allocator.free(key.*);
+        }
+        self.delegation_token_authenticated_sessions.deinit();
+        self.clearDelegationTokens();
+        self.delegation_tokens.deinit();
         self.fetch_sessions.deinit();
         // Clean up failover controller
         self.failover_controller.deinit();
@@ -1703,6 +1808,11 @@ pub const Broker = struct {
         defer self.allocator.free(prepared_snapshot);
 
         try self.persistence.savePreparedObjectRegistrySnapshot(prepared_snapshot);
+    }
+
+    fn persistCompactionObjectMetadataCheckpoint(ctx: *anyopaque) !void {
+        const self: *Broker = @ptrCast(@alignCast(ctx));
+        try self.persistObjectManagerMutationDurably();
     }
 
     fn freeOrphanedKeys(self: *Broker, keys: [][]u8) void {
@@ -1899,6 +2009,101 @@ pub const Broker = struct {
             entry.value_ptr.deinit(self.allocator);
         }
         self.client_telemetry_samples.clearRetainingCapacity();
+    }
+
+    fn clearDelegationTokens(self: *Broker) void {
+        var it = self.delegation_tokens.iterator();
+        while (it.next()) |entry| {
+            self.allocator.free(entry.key_ptr.*);
+            entry.value_ptr.deinit(self.allocator);
+        }
+        self.delegation_tokens.clearRetainingCapacity();
+    }
+
+    fn persistDelegationTokensLocal(self: *Broker) void {
+        self.persistDelegationTokensLocalDurably() catch |err| {
+            log.warn("Failed to persist delegation tokens: {}", .{err});
+        };
+    }
+
+    fn persistDelegationTokensLocalDurably(self: *Broker) !void {
+        try self.persistence.saveDelegationTokens(&self.delegation_tokens);
+    }
+
+    fn persistDelegationTokensDurably(self: *Broker) !void {
+        try self.persistDelegationTokensLocalDurably();
+        try self.writeDelegationTokenSnapshotRecord();
+    }
+
+    fn restoreDelegationTokensAfterFailedMutation(self: *Broker, snapshot_value: []const u8) void {
+        self.applyDelegationTokenSnapshotRecord(snapshot_value) catch |restore_err| {
+            log.err("Failed to restore delegation token snapshot after failed mutation: {}", .{restore_err});
+        };
+    }
+
+    fn restoreDelegationTokens(self: *Broker, entries: []const MetadataPersistence.DelegationTokenEntry) !void {
+        self.clearDelegationTokens();
+        const now_ms = @import("time_compat").milliTimestamp();
+
+        for (entries) |entry| {
+            if (entry.expiry_timestamp_ms <= now_ms) continue;
+            if (entry.max_timestamp_ms < entry.expiry_timestamp_ms) continue;
+            if (!validDelegationPrincipal(entry.owner_principal_type, entry.owner_principal_name)) continue;
+            if (!validDelegationPrincipal(entry.requester_principal_type, entry.requester_principal_name)) continue;
+            const key_buf = hmacKeyFromBytes(entry.hmac) orelse continue;
+            if (self.delegation_tokens.contains(&key_buf)) continue;
+
+            const key_copy = try self.allocator.dupe(u8, &key_buf);
+            errdefer self.allocator.free(key_copy);
+
+            var token = DelegationToken{
+                .owner_principal_type = &.{},
+                .owner_principal_name = &.{},
+                .requester_principal_type = &.{},
+                .requester_principal_name = &.{},
+                .token_id = &.{},
+                .hmac = &.{},
+                .renewers = &.{},
+                .issue_timestamp_ms = entry.issue_timestamp_ms,
+                .expiry_timestamp_ms = entry.expiry_timestamp_ms,
+                .max_timestamp_ms = entry.max_timestamp_ms,
+            };
+            var token_moved = false;
+            errdefer if (!token_moved) token.deinit(self.allocator);
+
+            token.owner_principal_type = try self.allocator.dupe(u8, entry.owner_principal_type);
+            token.owner_principal_name = try self.allocator.dupe(u8, entry.owner_principal_name);
+            token.requester_principal_type = try self.allocator.dupe(u8, entry.requester_principal_type);
+            token.requester_principal_name = try self.allocator.dupe(u8, entry.requester_principal_name);
+            token.token_id = try self.allocator.dupe(u8, entry.token_id);
+            token.hmac = try self.allocator.dupe(u8, entry.hmac);
+            token.renewers = try self.copyPersistedDelegationTokenRenewers(entry.renewers);
+
+            try self.delegation_tokens.put(key_copy, token);
+            token_moved = true;
+        }
+    }
+
+    fn copyPersistedDelegationTokenRenewers(self: *Broker, renewers: []const MetadataPersistence.DelegationTokenRenewerEntry) ![]DelegationTokenRenewer {
+        if (renewers.len == 0) return &.{};
+
+        const result = try self.allocator.alloc(DelegationTokenRenewer, renewers.len);
+        var initialized: usize = 0;
+        errdefer {
+            for (result[0..initialized]) |*renewer| renewer.deinit(self.allocator);
+            self.allocator.free(result);
+        }
+
+        for (renewers, 0..) |renewer, i| {
+            if (!validDelegationPrincipal(renewer.principal_type, renewer.principal_name)) return error.InvalidPrincipal;
+            result[i] = .{
+                .principal_type = try self.allocator.dupe(u8, renewer.principal_type),
+                .principal_name = try self.allocator.dupe(u8, renewer.principal_name),
+            };
+            initialized += 1;
+        }
+
+        return result;
     }
 
     fn clearShareGroupStates(self: *Broker) void {
@@ -2442,8 +2647,15 @@ pub const Broker = struct {
 
         // Create partition state
         const np: usize = @intCast(self.default_num_partitions);
+        var partitions_created: i32 = 0;
         for (0..np) |pi| {
-            self.store.ensurePartition(topic_name, @intCast(pi)) catch {};
+            self.store.ensurePartition(topic_name, @intCast(pi)) catch |err| {
+                log.warn("Failed to create partition state for auto-created topic {s}-{d}: {}", .{ topic_name, pi, err });
+                self.restoreTopicsAfterFailedMutation(previous_snapshot);
+                self.removeTopicPartitionRange(topic_name, 0, partitions_created);
+                return false;
+            };
+            partitions_created += 1;
         }
         self.trackLocalTopicPartitionRange(topic_name, 0, self.default_num_partitions);
 
@@ -2464,13 +2676,18 @@ pub const Broker = struct {
         if (self.topics.getPtr(name)) |topic| {
             topic.config.cleanup_policy = "compact";
             topic.config.retention_ms = -1;
+            for (0..@as(usize, @intCast(partitions))) |pi| {
+                try self.store.ensurePartition(name, @intCast(pi));
+            }
+            self.trackLocalTopicPartitionRange(name, 0, partitions);
             return;
         }
 
+        var topic_inserted = false;
         const name_copy = try self.allocator.dupe(u8, name);
-        errdefer self.allocator.free(name_copy);
+        errdefer if (!topic_inserted) self.allocator.free(name_copy);
         const key_copy = try self.allocator.dupe(u8, name);
-        errdefer self.allocator.free(key_copy);
+        errdefer if (!topic_inserted) self.allocator.free(key_copy);
 
         try self.topics.put(key_copy, .{
             .name = name_copy,
@@ -2482,9 +2699,18 @@ pub const Broker = struct {
                 .retention_ms = -1,
             },
         });
+        topic_inserted = true;
+        errdefer {
+            if (self.topics.fetchRemove(name)) |removed| {
+                self.freeTopicMapEntry(removed);
+            }
+        }
 
+        var partitions_created: i32 = 0;
+        errdefer self.removeTopicPartitionRange(name, 0, partitions_created);
         for (0..@as(usize, @intCast(partitions))) |pi| {
-            self.store.ensurePartition(name, @intCast(pi)) catch {};
+            try self.store.ensurePartition(name, @intCast(pi));
+            partitions_created += 1;
         }
         self.trackLocalTopicPartitionRange(name, 0, partitions);
 
@@ -2689,6 +2915,29 @@ pub const Broker = struct {
 
     fn persistFinalizedFeaturesDurably(self: *Broker) !void {
         try self.persistence.saveFinalizedFeatures(&self.finalized_features, self.finalized_features_epoch);
+    }
+
+    const PersistedOffsetKey = struct {
+        group_id: []const u8,
+        topic: []const u8,
+        partition: i32,
+    };
+
+    fn parsePersistedOffsetKey(key: []const u8) !PersistedOffsetKey {
+        const group_sep = std.mem.indexOfScalar(u8, key, ':') orelse return error.InvalidOffsetSnapshot;
+        const partition_sep = std.mem.lastIndexOfScalar(u8, key, ':') orelse return error.InvalidOffsetSnapshot;
+        if (group_sep == 0 or partition_sep <= group_sep + 1 or partition_sep + 1 >= key.len) {
+            return error.InvalidOffsetSnapshot;
+        }
+
+        const partition = std.fmt.parseInt(i32, key[partition_sep + 1 ..], 10) catch return error.InvalidOffsetSnapshot;
+        if (partition < 0) return error.InvalidOffsetSnapshot;
+
+        return .{
+            .group_id = key[0..group_sep],
+            .topic = key[group_sep + 1 .. partition_sep],
+            .partition = partition,
+        };
     }
 
     fn persistPartitionReassignmentsDurably(self: *Broker) !void {
@@ -2956,7 +3205,8 @@ pub const Broker = struct {
                 var member = ConsumerGroup.GroupMember.initMember(self.allocator, member_id);
                 errdefer member.deinitMember(self.allocator);
 
-                member.last_heartbeat_ms = member_entry.last_heartbeat_ms;
+                _ = member_entry.last_heartbeat_ms;
+                member.last_heartbeat_ms = monotonicMs();
                 if (member_entry.group_instance_id) |group_instance_id| {
                     member.group_instance_id = try self.allocator.dupe(u8, group_instance_id);
                 }
@@ -3292,7 +3542,8 @@ pub const Broker = struct {
                 if (snapshot_version >= 2) {
                     member.rack_id = try self.readSnapshotOptionalOwnedBytes(value, &pos);
                 }
-                member.last_heartbeat_ms = try readSnapshotI64(value, &pos);
+                _ = try readSnapshotI64(value, &pos);
+                member.last_heartbeat_ms = monotonicMs();
                 member.assignment = try self.readSnapshotOptionalOwnedBytes(value, &pos);
                 member.protocol_name = try self.readSnapshotOptionalOwnedBytes(value, &pos);
                 member.protocol_metadata = try self.readSnapshotOptionalOwnedBytes(value, &pos);
@@ -4179,6 +4430,177 @@ pub const Broker = struct {
         try self.restoreFinalizedFeatures(snapshot);
     }
 
+    fn encodeDelegationTokenSnapshotRecordValue(self: *Broker) ![]u8 {
+        var buf = std.array_list.Managed(u8).init(self.allocator);
+        errdefer buf.deinit();
+        const writer = @import("list_compat").writer(&buf);
+
+        try writer.writeAll(delegation_token_snapshot_record_value_magic);
+        try writer.writeInt(u32, @intCast(self.delegation_tokens.count()), .big);
+
+        var it = self.delegation_tokens.iterator();
+        while (it.next()) |entry| {
+            const token = entry.value_ptr;
+            try writeSnapshotBytes(writer, entry.key_ptr.*);
+            try writeSnapshotBytes(writer, token.owner_principal_type);
+            try writeSnapshotBytes(writer, token.owner_principal_name);
+            try writeSnapshotBytes(writer, token.requester_principal_type);
+            try writeSnapshotBytes(writer, token.requester_principal_name);
+            try writeSnapshotBytes(writer, token.token_id);
+            try writeSnapshotBytes(writer, token.hmac);
+            try writer.writeInt(i64, token.issue_timestamp_ms, .big);
+            try writer.writeInt(i64, token.expiry_timestamp_ms, .big);
+            try writer.writeInt(i64, token.max_timestamp_ms, .big);
+            try writer.writeInt(u32, @intCast(token.renewers.len), .big);
+            for (token.renewers) |renewer| {
+                try writeSnapshotBytes(writer, renewer.principal_type);
+                try writeSnapshotBytes(writer, renewer.principal_name);
+            }
+        }
+
+        return buf.toOwnedSlice();
+    }
+
+    fn decodeDelegationTokenSnapshotRecordValue(self: *Broker, value: []const u8) ![]MetadataPersistence.DelegationTokenEntry {
+        if (value.len < delegation_token_snapshot_record_value_magic.len + 4) return error.InvalidDelegationTokenSnapshot;
+        if (!std.mem.eql(u8, value[0..delegation_token_snapshot_record_value_magic.len], delegation_token_snapshot_record_value_magic)) {
+            return error.InvalidDelegationTokenSnapshot;
+        }
+
+        var pos: usize = delegation_token_snapshot_record_value_magic.len;
+        const token_count = try readSnapshotU32(value, &pos);
+        if (token_count > 100_000) return error.InvalidDelegationTokenSnapshot;
+
+        var entries = std.array_list.Managed(MetadataPersistence.DelegationTokenEntry).init(self.allocator);
+        var seen = std.StringHashMap(void).init(self.allocator);
+        defer seen.deinit();
+        errdefer {
+            self.freeDecodedDelegationTokenEntries(entries.items);
+            entries.deinit();
+        }
+
+        for (0..token_count) |_| {
+            var entry = MetadataPersistence.DelegationTokenEntry{
+                .key = try self.readSnapshotOwnedBytes(value, &pos),
+                .owner_principal_type = &.{},
+                .owner_principal_name = &.{},
+                .requester_principal_type = &.{},
+                .requester_principal_name = &.{},
+                .token_id = &.{},
+                .hmac = &.{},
+                .renewers = &.{},
+                .issue_timestamp_ms = 0,
+                .expiry_timestamp_ms = 0,
+                .max_timestamp_ms = 0,
+            };
+            var entry_owned = true;
+            errdefer if (entry_owned) {
+                var to_free = entry;
+                self.freeDelegationTokenEntryFields(&to_free);
+            };
+
+            entry.owner_principal_type = try self.readSnapshotOwnedBytes(value, &pos);
+            entry.owner_principal_name = try self.readSnapshotOwnedBytes(value, &pos);
+            entry.requester_principal_type = try self.readSnapshotOwnedBytes(value, &pos);
+            entry.requester_principal_name = try self.readSnapshotOwnedBytes(value, &pos);
+            entry.token_id = try self.readSnapshotOwnedBytes(value, &pos);
+            entry.hmac = try self.readSnapshotOwnedBytes(value, &pos);
+            entry.issue_timestamp_ms = try readSnapshotI64(value, &pos);
+            entry.expiry_timestamp_ms = try readSnapshotI64(value, &pos);
+            entry.max_timestamp_ms = try readSnapshotI64(value, &pos);
+
+            const expected_key = hmacKeyFromBytes(entry.hmac) orelse return error.InvalidDelegationTokenSnapshot;
+            if (entry.key.len != delegation_token_hmac_len * 2 or
+                !std.mem.eql(u8, &expected_key, entry.key) or
+                !validDelegationPrincipal(entry.owner_principal_type, entry.owner_principal_name) or
+                !validDelegationPrincipal(entry.requester_principal_type, entry.requester_principal_name) or
+                entry.token_id.len == 0 or
+                entry.max_timestamp_ms < entry.expiry_timestamp_ms)
+            {
+                return error.InvalidDelegationTokenSnapshot;
+            }
+            if (seen.contains(entry.key)) return error.InvalidDelegationTokenSnapshot;
+            try seen.put(entry.key, {});
+
+            const renewer_count = try readSnapshotU32(value, &pos);
+            if (renewer_count > 100_000) return error.InvalidDelegationTokenSnapshot;
+            if (renewer_count > 0) {
+                entry.renewers = try self.allocator.alloc(MetadataPersistence.DelegationTokenRenewerEntry, renewer_count);
+                var initialized: usize = 0;
+                errdefer {
+                    for (entry.renewers[0..initialized]) |renewer| {
+                        self.allocator.free(renewer.principal_type);
+                        self.allocator.free(renewer.principal_name);
+                    }
+                    self.allocator.free(entry.renewers);
+                    entry.renewers = &.{};
+                }
+
+                while (initialized < renewer_count) : (initialized += 1) {
+                    const principal_type = try self.readSnapshotOwnedBytes(value, &pos);
+                    var principal_type_owned = true;
+                    errdefer if (principal_type_owned) self.allocator.free(principal_type);
+
+                    const principal_name = try self.readSnapshotOwnedBytes(value, &pos);
+                    var principal_name_owned = true;
+                    errdefer if (principal_name_owned) self.allocator.free(principal_name);
+
+                    if (!validDelegationPrincipal(principal_type, principal_name)) return error.InvalidDelegationTokenSnapshot;
+                    entry.renewers[initialized] = .{
+                        .principal_type = principal_type,
+                        .principal_name = principal_name,
+                    };
+                    principal_type_owned = false;
+                    principal_name_owned = false;
+                }
+            }
+
+            try entries.append(entry);
+            entry_owned = false;
+        }
+
+        if (pos != value.len) return error.InvalidDelegationTokenSnapshot;
+        return try entries.toOwnedSlice();
+    }
+
+    fn freeDelegationTokenEntryFields(self: *Broker, entry: *MetadataPersistence.DelegationTokenEntry) void {
+        self.allocator.free(entry.key);
+        self.allocator.free(entry.owner_principal_type);
+        self.allocator.free(entry.owner_principal_name);
+        self.allocator.free(entry.requester_principal_type);
+        self.allocator.free(entry.requester_principal_name);
+        self.allocator.free(entry.token_id);
+        self.allocator.free(entry.hmac);
+        for (entry.renewers) |renewer| {
+            self.allocator.free(renewer.principal_type);
+            self.allocator.free(renewer.principal_name);
+        }
+        if (entry.renewers.len > 0) self.allocator.free(entry.renewers);
+        entry.* = .{
+            .key = &.{},
+            .owner_principal_type = &.{},
+            .owner_principal_name = &.{},
+            .requester_principal_type = &.{},
+            .requester_principal_name = &.{},
+            .token_id = &.{},
+            .hmac = &.{},
+            .renewers = &.{},
+            .issue_timestamp_ms = 0,
+            .expiry_timestamp_ms = 0,
+            .max_timestamp_ms = 0,
+        };
+    }
+
+    fn freeDecodedDelegationTokenEntries(self: *Broker, entries: []MetadataPersistence.DelegationTokenEntry) void {
+        for (entries) |*entry| self.freeDelegationTokenEntryFields(entry);
+    }
+
+    fn applyDelegationTokenSnapshotRecord(self: *Broker, value: []const u8) !void {
+        const entries = try self.decodeDelegationTokenSnapshotRecordValue(value);
+        defer self.persistence.freeDelegationTokenEntries(entries);
+        try self.restoreDelegationTokens(entries);
+    }
+
     const ClientQuotaSnapshot = struct {
         default_produce_rate: f64,
         default_fetch_rate: f64,
@@ -5002,6 +5424,41 @@ pub const Broker = struct {
         try self.persistPartitionStatesDurably();
     }
 
+    /// Write a full delegation-token snapshot to __cluster_metadata so token
+    /// lifecycle mutations survive shared-storage broker replacement.
+    fn writeDelegationTokenSnapshotRecord(self: *Broker) !void {
+        const info = self.topics.get("__cluster_metadata") orelse return;
+        if (info.num_partitions <= 0) return;
+
+        const value = try self.encodeDelegationTokenSnapshotRecordValue();
+        defer self.allocator.free(value);
+
+        const rec_batch = protocol.record_batch;
+        const records = [_]rec_batch.Record{
+            .{
+                .offset_delta = 0,
+                .key = delegation_token_snapshot_record_key,
+                .value = value,
+            },
+        };
+
+        const batch = try rec_batch.buildRecordBatch(
+            self.allocator,
+            0,
+            &records,
+            -1,
+            -1,
+            -1,
+            @import("time_compat").milliTimestamp(),
+            @import("time_compat").milliTimestamp(),
+            0,
+        );
+        defer self.allocator.free(batch);
+
+        _ = try self.store.produce("__cluster_metadata", 0, batch);
+        try self.persistPartitionStatesDurably();
+    }
+
     const ClusterMetadataReplayCounts = struct {
         topic_snapshots: usize = 0,
         partition_state_snapshots: usize = 0,
@@ -5011,9 +5468,10 @@ pub const Broker = struct {
         scram_credential_snapshots: usize = 0,
         acl_snapshots: usize = 0,
         finalized_feature_snapshots: usize = 0,
+        delegation_token_snapshots: usize = 0,
 
         fn total(self: @This()) usize {
-            return self.topic_snapshots + self.partition_state_snapshots + self.partition_reassignment_snapshots + self.replica_directory_assignment_snapshots + self.client_quota_snapshots + self.scram_credential_snapshots + self.acl_snapshots + self.finalized_feature_snapshots;
+            return self.topic_snapshots + self.partition_state_snapshots + self.partition_reassignment_snapshots + self.replica_directory_assignment_snapshots + self.client_quota_snapshots + self.scram_credential_snapshots + self.acl_snapshots + self.finalized_feature_snapshots + self.delegation_token_snapshots;
         }
     };
 
@@ -5027,6 +5485,7 @@ pub const Broker = struct {
         scram_credential_snapshot,
         acl_snapshot,
         finalized_feature_snapshot,
+        delegation_token_snapshot,
     };
 
     fn restoreClusterMetadataFromLog(self: *Broker) !ClusterMetadataReplayCounts {
@@ -5047,6 +5506,7 @@ pub const Broker = struct {
             restored.scram_credential_snapshots += partition_counts.scram_credential_snapshots;
             restored.acl_snapshots += partition_counts.acl_snapshots;
             restored.finalized_feature_snapshots += partition_counts.finalized_feature_snapshots;
+            restored.delegation_token_snapshots += partition_counts.delegation_token_snapshots;
         }
         return restored;
     }
@@ -5056,17 +5516,17 @@ pub const Broker = struct {
         var pos: usize = 0;
         var restored = ClusterMetadataReplayCounts{};
 
-        while (pos + rec_batch.BATCH_HEADER_SIZE <= batches.len) {
-            const header = rec_batch.RecordBatchHeader.parse(batches[pos..]) catch break;
-            const batch_size = header.totalBatchSize();
-            if (batch_size == 0 or pos + batch_size > batches.len) break;
+        while (pos < batches.len) {
+            if (batches.len - pos < rec_batch.BATCH_HEADER_SIZE) return error.MalformedInternalRecordBatch;
+            const header = try rec_batch.RecordBatchHeader.parse(batches[pos..]);
+            const batch_size = try checkedInternalReplayBatchSize(header, batches.len - pos);
+            const batch = batches[pos .. pos + batch_size];
 
-            if (header.magic == 2 and !header.isControlBatch() and header.record_count > 0) {
-                var record_pos = pos + rec_batch.BATCH_HEADER_SIZE;
-                const batch_end = pos + batch_size;
-                for (0..@as(usize, @intCast(header.record_count))) |_| {
-                    if (record_pos >= batch_end) break;
-                    const record = rec_batch.parseRecord(batches, &record_pos) catch break;
+            if (header.magic == 2 and !header.isControlBatch()) {
+                const record_count = try checkedInternalReplayRecordCount(header);
+                var record_pos: usize = rec_batch.BATCH_HEADER_SIZE;
+                for (0..record_count) |_| {
+                    const record = try rec_batch.parseRecord(batch, &record_pos);
                     const key = record.key orelse continue;
                     const value = record.value orelse continue;
                     switch (try self.applyClusterMetadataRecord(key, value)) {
@@ -5079,14 +5539,29 @@ pub const Broker = struct {
                         .scram_credential_snapshot => restored.scram_credential_snapshots += 1,
                         .acl_snapshot => restored.acl_snapshots += 1,
                         .finalized_feature_snapshot => restored.finalized_feature_snapshots += 1,
+                        .delegation_token_snapshot => restored.delegation_token_snapshots += 1,
                     }
                 }
+                if (record_pos != batch.len) return error.MalformedInternalRecordBatch;
             }
 
             pos += batch_size;
         }
 
         return restored;
+    }
+
+    fn checkedInternalReplayBatchSize(header: protocol.record_batch.RecordBatchHeader, remaining: usize) !usize {
+        const total_i64 = @as(i64, header.batch_length) + 12;
+        if (total_i64 < @as(i64, @intCast(protocol.record_batch.BATCH_HEADER_SIZE))) return error.MalformedInternalRecordBatch;
+        const batch_size: usize = @intCast(total_i64);
+        if (batch_size > remaining) return error.MalformedInternalRecordBatch;
+        return batch_size;
+    }
+
+    fn checkedInternalReplayRecordCount(header: protocol.record_batch.RecordBatchHeader) !usize {
+        if (header.record_count < 0) return error.MalformedInternalRecordBatch;
+        return @intCast(header.record_count);
     }
 
     fn applyClusterMetadataRecord(self: *Broker, key: []const u8, value: []const u8) !ClusterMetadataReplayKind {
@@ -5121,6 +5596,10 @@ pub const Broker = struct {
         if (std.mem.eql(u8, key, finalized_feature_snapshot_record_key)) {
             try self.applyFinalizedFeatureSnapshotRecord(value);
             return .finalized_feature_snapshot;
+        }
+        if (std.mem.eql(u8, key, delegation_token_snapshot_record_key)) {
+            try self.applyDelegationTokenSnapshotRecord(value);
+            return .delegation_token_snapshot;
         }
         return .none;
     }
@@ -5164,17 +5643,17 @@ pub const Broker = struct {
         var pos: usize = 0;
         var restored = ConsumerOffsetsReplayCounts{};
 
-        while (pos + rec_batch.BATCH_HEADER_SIZE <= batches.len) {
-            const header = rec_batch.RecordBatchHeader.parse(batches[pos..]) catch break;
-            const batch_size = header.totalBatchSize();
-            if (batch_size == 0 or pos + batch_size > batches.len) break;
+        while (pos < batches.len) {
+            if (batches.len - pos < rec_batch.BATCH_HEADER_SIZE) return error.MalformedInternalRecordBatch;
+            const header = try rec_batch.RecordBatchHeader.parse(batches[pos..]);
+            const batch_size = try checkedInternalReplayBatchSize(header, batches.len - pos);
+            const batch = batches[pos .. pos + batch_size];
 
-            if (header.magic == 2 and !header.isControlBatch() and header.record_count > 0) {
-                var record_pos = pos + rec_batch.BATCH_HEADER_SIZE;
-                const batch_end = pos + batch_size;
-                for (0..@as(usize, @intCast(header.record_count))) |_| {
-                    if (record_pos >= batch_end) break;
-                    const record = rec_batch.parseRecord(batches, &record_pos) catch break;
+            if (header.magic == 2 and !header.isControlBatch()) {
+                const record_count = try checkedInternalReplayRecordCount(header);
+                var record_pos: usize = rec_batch.BATCH_HEADER_SIZE;
+                for (0..record_count) |_| {
+                    const record = try rec_batch.parseRecord(batch, &record_pos);
                     const key = record.key orelse continue;
                     switch (try self.applyConsumerOffsetRecord(key, record.value)) {
                         .none => {},
@@ -5183,6 +5662,7 @@ pub const Broker = struct {
                         .share_group_data_snapshot => restored.share_group_data_snapshots += 1,
                     }
                 }
+                if (record_pos != batch.len) return error.MalformedInternalRecordBatch;
             }
 
             pos += batch_size;
@@ -5238,21 +5718,22 @@ pub const Broker = struct {
         var pos: usize = 0;
         var restored: usize = 0;
 
-        while (pos + rec_batch.BATCH_HEADER_SIZE <= batches.len) {
-            const header = rec_batch.RecordBatchHeader.parse(batches[pos..]) catch break;
-            const batch_size = header.totalBatchSize();
-            if (batch_size == 0 or pos + batch_size > batches.len) break;
+        while (pos < batches.len) {
+            if (batches.len - pos < rec_batch.BATCH_HEADER_SIZE) return error.MalformedInternalRecordBatch;
+            const header = try rec_batch.RecordBatchHeader.parse(batches[pos..]);
+            const batch_size = try checkedInternalReplayBatchSize(header, batches.len - pos);
+            const batch = batches[pos .. pos + batch_size];
 
-            if (header.magic == 2 and !header.isControlBatch() and header.record_count > 0) {
-                var record_pos = pos + rec_batch.BATCH_HEADER_SIZE;
-                const batch_end = pos + batch_size;
-                for (0..@as(usize, @intCast(header.record_count))) |_| {
-                    if (record_pos >= batch_end) break;
-                    const record = rec_batch.parseRecord(batches, &record_pos) catch break;
+            if (header.magic == 2 and !header.isControlBatch()) {
+                const record_count = try checkedInternalReplayRecordCount(header);
+                var record_pos: usize = rec_batch.BATCH_HEADER_SIZE;
+                for (0..record_count) |_| {
+                    const record = try rec_batch.parseRecord(batch, &record_pos);
                     const key = record.key orelse continue;
                     const value = record.value orelse continue;
                     if (try self.applyTransactionStateRecord(key, value)) restored += 1;
                 }
+                if (record_pos != batch.len) return error.MalformedInternalRecordBatch;
             }
 
             pos += batch_size;
@@ -5310,7 +5791,7 @@ pub const Broker = struct {
 
         if (self.sasl_enabled and !isSaslAuthenticationApi(api_key)) {
             const client_id = req_header.client_id orelse "anonymous";
-            if (self.authenticated_sessions.get(client_id) == null) {
+            if (self.authenticatedPrincipalForClient(client_id) == null) {
                 log.warn("Unauthenticated SASL request rejected: api_key={d} client_id={s}", .{ api_key, client_id });
                 const resource_type = resourceTypeForApiKey(api_key);
                 return self.handleAuthorizationError(
@@ -5329,7 +5810,7 @@ pub const Broker = struct {
         if (self.authorizer.aclCount() > 0 or !self.authorizer.allow_everyone_if_no_acl) {
             const client_id = req_header.client_id orelse "anonymous";
             // Use authenticated principal if SASL was completed, otherwise fall back to client_id
-            const principal = self.authenticated_sessions.get(client_id) orelse client_id;
+            const principal = self.authenticatedPrincipalForClient(client_id) orelse client_id;
             const resource_type = resourceTypeForApiKey(api_key);
             if (resource_type != .unknown) {
                 const operation = operationForApiKey(api_key);
@@ -5365,7 +5846,7 @@ pub const Broker = struct {
         self.metrics.addLabeledCounter("kafka_network_requestmetrics_requestbytes_total", &.{ api_type_for_metrics, api_version_str }, @intCast(request_bytes.len));
 
         // Record per-API latency
-        const t_start = @import("time_compat").nanoTimestamp();
+        const t_start = @import("time_compat").monotonicNanoTimestamp();
 
         if (shouldRefreshQuorumStateForApi(api_key)) {
             self.refreshAutoMqQuorumStateForRequest();
@@ -5403,9 +5884,14 @@ pub const Broker = struct {
             31 => self.handleDeleteAcls(request_bytes, pos, &req_header, api_version, resp_header_version),
             32 => self.handleDescribeConfigs(request_bytes, pos, &req_header, api_version, resp_header_version),
             33 => self.handleAlterConfigs(request_bytes, pos, &req_header, api_version, resp_header_version),
+            34 => self.handleAlterReplicaLogDirs(request_bytes, pos, &req_header, api_version, resp_header_version),
             35 => self.handleDescribeLogDirs(request_bytes, pos, &req_header, api_version, resp_header_version),
             36 => self.handleSaslAuthenticate(request_bytes, pos, &req_header, api_version, resp_header_version),
             37 => self.handleCreatePartitions(request_bytes, pos, &req_header, api_version, resp_header_version),
+            38 => self.handleCreateDelegationToken(request_bytes, pos, &req_header, api_version, resp_header_version),
+            39 => self.handleRenewDelegationToken(request_bytes, pos, &req_header, api_version, resp_header_version),
+            40 => self.handleExpireDelegationToken(request_bytes, pos, &req_header, api_version, resp_header_version),
+            41 => self.handleDescribeDelegationToken(request_bytes, pos, &req_header, api_version, resp_header_version),
             42 => self.handleDeleteGroups(request_bytes, pos, &req_header, api_version, resp_header_version),
             43 => self.handleElectLeaders(request_bytes, pos, &req_header, api_version, resp_header_version),
             44 => self.handleIncrementalAlterConfigs(request_bytes, pos, &req_header, api_version, resp_header_version),
@@ -5467,11 +5953,11 @@ pub const Broker = struct {
             else => self.handleUnsupported(&req_header, api_key, resp_header_version),
         };
 
-        const t_done = @import("time_compat").nanoTimestamp();
+        const t_done = @import("time_compat").monotonicNanoTimestamp();
 
         // Record per-API latency in histogram
         const latency_ns = t_done - t_start;
-        const latency_secs: f64 = @as(f64, @floatFromInt(@max(latency_ns, 0))) / 1_000_000_000.0;
+        const latency_secs: f64 = @as(f64, @floatFromInt(latency_ns)) / 1_000_000_000.0;
         self.metrics.observeHistogram("kafka_server_request_latency_seconds", latency_secs);
         if (api_key == 0) {
             self.metrics.observeHistogram("kafka_server_produce_latency_seconds", latency_secs);
@@ -5500,6 +5986,7 @@ pub const Broker = struct {
             var error_metric_buf: [64]u8 = undefined;
             const error_metric_name = errorNameForMetrics(error_code, &error_metric_buf);
             self.metrics.incrementLabeledCounter("Kafka_request_error_count_total", &.{ api_type_for_metrics, api_version_str, error_metric_name });
+            self.metrics.incrementLabeledCounter("kafka_network_requestmetrics_errors_total", &.{ api_type_for_metrics, api_version_str, error_metric_name });
             if (error_code != 0) {
                 if (api_key == 0) {
                     self.metrics.incrementCounter("kafka_server_brokertopicmetrics_failedproducerequests_total");
@@ -5556,6 +6043,7 @@ pub const Broker = struct {
         if (api_key == 8) return 0; // OffsetCommit errors are partition scoped, not at a fixed top-level offset.
         if (api_key == 9) return 0; // OffsetFetch errors are topic/group scoped, not at a fixed top-level offset.
         if (api_key == 10 and api_version >= 4) return 0; // FindCoordinator v4+ has coordinator-scoped errors.
+        if (api_key == 34) return 0; // AlterReplicaLogDirs errors are partition scoped.
         if (api_key == 42) return 0; // DeleteGroups errors are per requested group.
         if (api_key == 69) return 0; // ConsumerGroupDescribe errors are per described group.
 
@@ -5641,7 +6129,7 @@ pub const Broker = struct {
             0, 1, 2, 21, 23, 61 => .topic, // Produce, Fetch, ListOffsets, DeleteRecords, OffsetForLeaderEpoch, DescribeProducers
             8, 9, 10, 11, 12, 13, 14, 15, 16, 42, 47, 68, 69, 76, 77, 78, 79, 83, 84, 85, 86, 87 => .group, // group-related
             22, 24, 25, 26, 27, 28, 65, 66 => .transactional_id, // txn-related
-            3, 18, 19, 20, 29, 30, 31, 32, 33, 35, 37, 43, 44, 45, 46, 48, 49, 50, 51, 52, 53, 54, 55, 57, 60, 71, 72, 73, 74, 75 => .cluster, // metadata/admin/quorum
+            3, 18, 19, 20, 29, 30, 31, 32, 33, 34, 35, 37, 38, 39, 40, 41, 43, 44, 45, 46, 48, 49, 50, 51, 52, 53, 54, 55, 57, 60, 71, 72, 73, 74, 75 => .cluster, // metadata/admin/quorum
             501...519, 600...602 => .cluster, // AutoMQ stream/object/controller extensions
             else => .unknown,
         };
@@ -5652,16 +6140,16 @@ pub const Broker = struct {
         return switch (api_key) {
             0 => .write, // Produce
             1 => .read, // Fetch
-            2, 9, 15, 16, 23, 29, 32, 35, 46, 48, 50, 55, 60, 61, 65, 66, 69, 71, 74, 75, 77, 84, 87 => .describe, // ListOffsets, OffsetFetch, Describe*
+            2, 9, 15, 16, 23, 29, 32, 35, 41, 46, 48, 50, 55, 60, 61, 65, 66, 69, 71, 74, 75, 77, 84, 87 => .describe, // ListOffsets, OffsetFetch, Describe*
             3, 18 => .describe, // Metadata, ApiVersions
             8 => .read, // OffsetCommit
             10, 11, 12, 13, 14, 68, 76, 78, 79 => .read, // Group ops
-            19, 37 => .create, // CreateTopics, CreatePartitions
+            19, 37, 38 => .create, // CreateTopics, CreatePartitions, CreateDelegationToken
             20, 21, 42, 47 => .delete, // DeleteTopics, DeleteRecords, DeleteGroups, OffsetDelete
             22, 24, 25, 26, 27, 28 => .write, // Txn ops
             30 => .alter, // CreateAcls
             31 => .alter, // DeleteAcls
-            33, 43, 44, 45, 49, 51, 57, 72, 73, 83, 85, 86 => .alter, // Alter/admin APIs
+            33, 34, 39, 40, 43, 44, 45, 49, 51, 57, 72, 73, 83, 85, 86 => .alter, // Alter/admin APIs
             52, 53, 54 => .cluster_action, // KRaft quorum mutations
             501, 502, 503, 508, 509, 514, 516, 518, 601 => .describe, // AutoMQ reads/lifecycle probes
             504, 511 => .delete, // AutoMQ deletes
@@ -5729,8 +6217,13 @@ pub const Broker = struct {
             31 => self.handleDeleteAclsAuthorizationError(request_bytes, body_start, req_header, api_version, resp_header_version, err_code),
             32 => self.handleDescribeConfigsAuthorizationError(request_bytes, body_start, req_header, api_version, resp_header_version, err_code),
             33 => self.handleAlterConfigsAuthorizationError(request_bytes, body_start, req_header, api_version, resp_header_version, err_code),
+            34 => self.handleAlterReplicaLogDirsAuthorizationError(request_bytes, body_start, req_header, api_version, resp_header_version, err_code),
             35 => self.handleDescribeLogDirsAuthorizationError(request_bytes, body_start, req_header, api_version, resp_header_version, err_code),
             37 => self.handleCreatePartitionsAuthorizationError(request_bytes, body_start, req_header, api_version, resp_header_version, err_code),
+            38 => self.handleCreateDelegationTokenAuthorizationError(request_bytes, body_start, req_header, api_version, resp_header_version, err_code),
+            39 => self.handleRenewDelegationTokenAuthorizationError(request_bytes, body_start, req_header, api_version, resp_header_version, err_code),
+            40 => self.handleExpireDelegationTokenAuthorizationError(request_bytes, body_start, req_header, api_version, resp_header_version, err_code),
+            41 => self.handleDescribeDelegationTokenAuthorizationError(request_bytes, body_start, req_header, api_version, resp_header_version, err_code),
             42 => self.handleDeleteGroupsAuthorizationError(request_bytes, body_start, req_header, api_version, resp_header_version, err_code),
             43 => self.handleElectLeadersAuthorizationError(request_bytes, body_start, req_header, api_version, resp_header_version, err_code),
             44 => self.handleIncrementalAlterConfigsAuthorizationError(request_bytes, body_start, req_header, api_version, resp_header_version, err_code),
@@ -7019,6 +7512,131 @@ pub const Broker = struct {
         const resp = Resp{
             .throttle_time_ms = 0,
             .results = results,
+        };
+        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+    }
+
+    fn handleCreateDelegationTokenAuthorizationError(
+        self: *Broker,
+        request_bytes: []const u8,
+        body_start: usize,
+        req_header: *const RequestHeader,
+        api_version: i16,
+        resp_header_version: i16,
+        err_code: ErrorCode,
+    ) ?[]u8 {
+        const Req = generated.create_delegation_token_request.CreateDelegationTokenRequest;
+        const Resp = generated.create_delegation_token_response.CreateDelegationTokenResponse;
+
+        if (!validateCreateDelegationTokenRequestFrame(request_bytes, body_start, api_version)) {
+            log.warn("Malformed denied CreateDelegationToken request", .{});
+            return null;
+        }
+
+        var pos = body_start;
+        var req = Req.deserialize(self.allocator, request_bytes, &pos, api_version) catch |err| {
+            log.warn("Failed to decode denied CreateDelegationToken request: {}", .{err});
+            return null;
+        };
+        defer self.freeCreateDelegationTokenRequest(&req);
+
+        const resp = Resp{
+            .error_code = @intFromEnum(err_code),
+            .throttle_time_ms = 0,
+        };
+        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+    }
+
+    fn handleRenewDelegationTokenAuthorizationError(
+        self: *Broker,
+        request_bytes: []const u8,
+        body_start: usize,
+        req_header: *const RequestHeader,
+        api_version: i16,
+        resp_header_version: i16,
+        err_code: ErrorCode,
+    ) ?[]u8 {
+        const Req = generated.renew_delegation_token_request.RenewDelegationTokenRequest;
+        const Resp = generated.renew_delegation_token_response.RenewDelegationTokenResponse;
+
+        if (!validateRenewDelegationTokenRequestFrame(request_bytes, body_start, api_version)) {
+            log.warn("Malformed denied RenewDelegationToken request", .{});
+            return null;
+        }
+
+        var pos = body_start;
+        _ = Req.deserialize(self.allocator, request_bytes, &pos, api_version) catch |err| {
+            log.warn("Failed to decode denied RenewDelegationToken request: {}", .{err});
+            return null;
+        };
+
+        const resp = Resp{
+            .error_code = @intFromEnum(err_code),
+            .expiry_timestamp_ms = 0,
+            .throttle_time_ms = 0,
+        };
+        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+    }
+
+    fn handleExpireDelegationTokenAuthorizationError(
+        self: *Broker,
+        request_bytes: []const u8,
+        body_start: usize,
+        req_header: *const RequestHeader,
+        api_version: i16,
+        resp_header_version: i16,
+        err_code: ErrorCode,
+    ) ?[]u8 {
+        const Req = generated.expire_delegation_token_request.ExpireDelegationTokenRequest;
+        const Resp = generated.expire_delegation_token_response.ExpireDelegationTokenResponse;
+
+        if (!validateExpireDelegationTokenRequestFrame(request_bytes, body_start, api_version)) {
+            log.warn("Malformed denied ExpireDelegationToken request", .{});
+            return null;
+        }
+
+        var pos = body_start;
+        _ = Req.deserialize(self.allocator, request_bytes, &pos, api_version) catch |err| {
+            log.warn("Failed to decode denied ExpireDelegationToken request: {}", .{err});
+            return null;
+        };
+
+        const resp = Resp{
+            .error_code = @intFromEnum(err_code),
+            .expiry_timestamp_ms = 0,
+            .throttle_time_ms = 0,
+        };
+        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+    }
+
+    fn handleDescribeDelegationTokenAuthorizationError(
+        self: *Broker,
+        request_bytes: []const u8,
+        body_start: usize,
+        req_header: *const RequestHeader,
+        api_version: i16,
+        resp_header_version: i16,
+        err_code: ErrorCode,
+    ) ?[]u8 {
+        const Req = generated.describe_delegation_token_request.DescribeDelegationTokenRequest;
+        const Resp = generated.describe_delegation_token_response.DescribeDelegationTokenResponse;
+
+        if (!validateDescribeDelegationTokenRequestFrame(request_bytes, body_start, api_version)) {
+            log.warn("Malformed denied DescribeDelegationToken request", .{});
+            return null;
+        }
+
+        var pos = body_start;
+        var req = Req.deserialize(self.allocator, request_bytes, &pos, api_version) catch |err| {
+            log.warn("Failed to decode denied DescribeDelegationToken request: {}", .{err});
+            return null;
+        };
+        defer self.freeDescribeDelegationTokenRequest(&req);
+
+        const resp = Resp{
+            .error_code = @intFromEnum(err_code),
+            .tokens = &.{},
+            .throttle_time_ms = 0,
         };
         return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
     }
@@ -9036,6 +9654,42 @@ pub const Broker = struct {
         return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
     }
 
+    fn handleAlterReplicaLogDirsAuthorizationError(
+        self: *Broker,
+        request_bytes: []const u8,
+        body_start: usize,
+        req_header: *const RequestHeader,
+        api_version: i16,
+        resp_header_version: i16,
+        err_code: ErrorCode,
+    ) ?[]u8 {
+        const Req = generated.alter_replica_log_dirs_request.AlterReplicaLogDirsRequest;
+        const Resp = generated.alter_replica_log_dirs_response.AlterReplicaLogDirsResponse;
+
+        if (!validateAlterReplicaLogDirsRequestFrame(request_bytes, body_start, api_version)) {
+            log.warn("Malformed denied AlterReplicaLogDirs request", .{});
+            return null;
+        }
+
+        var pos = body_start;
+        var req = Req.deserialize(self.allocator, request_bytes, &pos, api_version) catch |err| {
+            log.warn("Failed to decode denied AlterReplicaLogDirs request: {}", .{err});
+            return null;
+        };
+        defer self.freeAlterReplicaLogDirsRequest(&req);
+
+        var pending_assignments = std.array_list.Managed(PendingReplicaDirectoryAssignment).init(self.allocator);
+        defer pending_assignments.deinit();
+        const results = self.buildAlterReplicaLogDirsResults(req, err_code, &pending_assignments) catch return null;
+        defer self.freeAlterReplicaLogDirsResults(results);
+
+        const resp = Resp{
+            .throttle_time_ms = 0,
+            .results = results,
+        };
+        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+    }
+
     fn handleAssignReplicasToDirsAuthorizationError(
         self: *Broker,
         request_bytes: []const u8,
@@ -10246,7 +10900,7 @@ pub const Broker = struct {
         // after local commit lets followers observe leader_commit before a
         // failover, without weakening quorum availability if a follower is down.
         const deadline_ms = committed_ms + 750;
-        while (@import("time_compat").milliTimestamp() < deadline_ms) {
+        while (monotonicMs() < deadline_ms) {
             if (self.autoMqRecordHasFreshAllFollowerAck(offset, committed_ms)) return;
             @import("time_compat").sleep(10 * std.time.ns_per_ms);
         }
@@ -10256,7 +10910,7 @@ pub const Broker = struct {
         const raft = self.raft_state orelse return 0;
         if (raft.role != .leader) return error.NotController;
 
-        const append_started_ms = @import("time_compat").milliTimestamp();
+        const append_started_ms = monotonicMs();
         const offset = try raft.appendEntry(record);
         if (raft.quorumSize() <= 1) {
             raft.commit_index = offset;
@@ -10264,9 +10918,9 @@ pub const Broker = struct {
         }
 
         const deadline_ms = append_started_ms + auto_mq_quorum_commit_timeout_ms;
-        while (@import("time_compat").milliTimestamp() < deadline_ms) {
+        while (monotonicMs() < deadline_ms) {
             if (raft.commit_index >= offset and self.autoMqRecordHasFreshMajorityAck(offset, append_started_ms)) {
-                self.waitForAutoMqCommitPropagation(offset, @import("time_compat").milliTimestamp());
+                self.waitForAutoMqCommitPropagation(offset, monotonicMs());
                 return offset;
             }
             @import("time_compat").sleep(10 * std.time.ns_per_ms);
@@ -10300,7 +10954,7 @@ pub const Broker = struct {
     fn compactAutoMqQuorumMetadataSnapshot(self: *Broker) !void {
         const raft = self.raft_state orelse return;
         try self.prepareAutoMqMetadataSnapshotForRaftCompaction();
-        raft.takeSnapshot();
+        try raft.takeSnapshot();
     }
 
     fn commitAutoMqDeleteKvRecord(self: *Broker, key: []const u8) !void {
@@ -11225,6 +11879,7 @@ pub const Broker = struct {
         // Idempotent producer dedup + CRC validation
         var is_duplicate = false;
         var crc_valid = true;
+        var malformed_record_batch = false;
         var transaction_error_code: i16 = @intFromEnum(ErrorCode.none);
         var sequence_error_code: i16 = @intFromEnum(ErrorCode.none);
         const PendingProducerSequenceUpdate = struct {
@@ -11233,14 +11888,32 @@ pub const Broker = struct {
         };
         var pending_producer_sequence: ?PendingProducerSequenceUpdate = null;
         if (partition_req.records) |rec| {
-            if (rec.len >= 53) { // Minimum V2 record batch header
+            if (rec.len >= protocol.record_batch.BATCH_HEADER_SIZE) {
                 const rec_batch = protocol.record_batch;
                 const crc32c = @import("core").crc32c;
-                const batch_header = rec_batch.RecordBatchHeader.parse(rec) catch null;
-                if (batch_header) |hdr| {
+                var batch_pos: usize = 0;
+                while (batch_pos < rec.len) {
+                    if (rec.len - batch_pos < rec_batch.BATCH_HEADER_SIZE) {
+                        malformed_record_batch = true;
+                        log.warn("Malformed Produce record batch for {s}-{d}: trailing {d} byte(s)", .{ topic_name, partition_req.index, rec.len - batch_pos });
+                        break;
+                    }
+
+                    const hdr = rec_batch.RecordBatchHeader.parse(rec[batch_pos..]) catch |err| {
+                        malformed_record_batch = true;
+                        log.warn("Malformed Produce record batch for {s}-{d}: {}", .{ topic_name, partition_req.index, err });
+                        break;
+                    };
+                    const batch_size = checkedUserLogRecordBatchSize(hdr, rec.len - batch_pos) catch |err| {
+                        malformed_record_batch = true;
+                        log.warn("Malformed Produce record batch for {s}-{d}: {}", .{ topic_name, partition_req.index, err });
+                        break;
+                    };
+                    const batch = rec[batch_pos .. batch_pos + batch_size];
+
                     // CRC-32C validation: covers bytes from attributes (offset 21) to end
-                    if (hdr.crc != 0 and rec.len > 21) {
-                        const computed_crc = crc32c.compute(rec[21..]);
+                    if (hdr.magic == 2 and hdr.crc != 0 and batch.len > 21) {
+                        const computed_crc = crc32c.compute(batch[21..]);
                         if (computed_crc != @as(u32, @bitCast(hdr.crc))) {
                             crc_valid = false;
                             log.warn("CRC mismatch on produce: expected={x} computed={x}", .{
@@ -11292,6 +11965,8 @@ pub const Broker = struct {
                             partition_req.index,
                         );
                     }
+
+                    batch_pos += batch_size;
                 }
             }
         }
@@ -11314,10 +11989,28 @@ pub const Broker = struct {
 
         const required_acks_error_code = self.requiredAcksProduceError(topic_name, required_acks);
 
+        var producer_sequence_storage_error = false;
+        const producer_sequence_needs_update = pending_producer_sequence != null and
+            !is_duplicate and
+            !malformed_record_batch and
+            crc_valid and
+            required_acks_error_code == @intFromEnum(ErrorCode.none) and
+            transaction_error_code == @intFromEnum(ErrorCode.none) and
+            sequence_error_code == @intFromEnum(ErrorCode.none);
+        if (producer_sequence_needs_update) {
+            const update = pending_producer_sequence.?;
+            if (self.producer_sequences.get(update.key) == null) {
+                self.producer_sequences.ensureUnusedCapacity(1) catch |err| {
+                    log.warn("Producer sequence state reservation failed for {s}-{d}: {}", .{ topic_name, partition_req.index, err });
+                    producer_sequence_storage_error = true;
+                };
+            }
+        }
+
         // Actually produce (skip if duplicate or CRC invalid)
         var was_wal_fenced = false;
         var was_storage_error = false;
-        const produce_result = if (is_duplicate or !crc_valid or required_acks_error_code != @intFromEnum(ErrorCode.none) or transaction_error_code != @intFromEnum(ErrorCode.none) or sequence_error_code != @intFromEnum(ErrorCode.none))
+        const produce_result = if (is_duplicate or producer_sequence_storage_error or malformed_record_batch or !crc_valid or required_acks_error_code != @intFromEnum(ErrorCode.none) or transaction_error_code != @intFromEnum(ErrorCode.none) or sequence_error_code != @intFromEnum(ErrorCode.none))
             null
         else if (partition_req.records) |rec|
             self.store.produce(topic_name, partition_req.index, rec) catch |err| blk: {
@@ -11341,7 +12034,7 @@ pub const Broker = struct {
 
         if (produce_result != null) {
             if (pending_producer_sequence) |update| {
-                self.producer_sequences.put(update.key, update.state) catch {};
+                self.producer_sequences.putAssumeCapacity(update.key, update.state);
                 self.producer_sequences_dirty = true;
             }
             if (partition_req.records) |rec| {
@@ -11356,7 +12049,7 @@ pub const Broker = struct {
             transaction_error_code
         else if (is_duplicate)
             @intFromEnum(ErrorCode.none) // idempotent success
-        else if (!crc_valid)
+        else if (malformed_record_batch or !crc_valid)
             @intFromEnum(ErrorCode.corrupt_message)
         else if (sequence_error_code != @intFromEnum(ErrorCode.none))
             sequence_error_code
@@ -11364,6 +12057,8 @@ pub const Broker = struct {
             @intFromEnum(ErrorCode.none)
         else if (was_wal_fenced)
             @intFromEnum(ErrorCode.not_leader_or_follower)
+        else if (producer_sequence_storage_error)
+            @intFromEnum(ErrorCode.kafka_storage_error)
         else if (was_storage_error)
             @intFromEnum(ErrorCode.kafka_storage_error)
         else if (partition_req.records) |rec| blk: {
@@ -11475,6 +12170,15 @@ pub const Broker = struct {
         return 1;
     }
 
+    fn checkedUserLogRecordBatchSize(header: protocol.record_batch.RecordBatchHeader, remaining: usize) !usize {
+        const total_i64 = @as(i64, header.batch_length) + 12;
+        if (total_i64 < @as(i64, @intCast(protocol.record_batch.BATCH_HEADER_SIZE))) return error.MalformedUserRecordBatch;
+        const batch_size: usize = @intCast(total_i64);
+        if (batch_size > remaining) return error.MalformedUserRecordBatch;
+        if (header.record_count < 0) return error.MalformedUserRecordBatch;
+        return batch_size;
+    }
+
     fn applyRecoveredProducerSequence(
         self: *Broker,
         producer_id: i64,
@@ -11508,10 +12212,16 @@ pub const Broker = struct {
         var pos: usize = 0;
         var rebuilt = ProducerSequenceReplayCounts{};
 
-        while (pos + rec_batch.BATCH_HEADER_SIZE <= batches.len) {
-            const hdr = rec_batch.RecordBatchHeader.parse(batches[pos..]) catch break;
-            const batch_size = hdr.totalBatchSize();
-            if (batch_size == 0 or pos + batch_size > batches.len) break;
+        if (batches.len == 0) return rebuilt;
+        if (batches.len < rec_batch.BATCH_HEADER_SIZE) {
+            rebuilt.records = 1;
+            return rebuilt;
+        }
+
+        while (pos < batches.len) {
+            if (batches.len - pos < rec_batch.BATCH_HEADER_SIZE) return error.MalformedUserRecordBatch;
+            const hdr = try rec_batch.RecordBatchHeader.parse(batches[pos..]);
+            const batch_size = try checkedUserLogRecordBatchSize(hdr, batches.len - pos);
             rebuilt.records += @intCast(@max(hdr.record_count, 1));
 
             if (hdr.magic == 2 and !hdr.isControlBatch() and hdr.producer_id >= 0) {
@@ -11538,7 +12248,7 @@ pub const Broker = struct {
 
             var offset = state.log_start_offset;
             while (offset < state.next_offset) {
-                const result = try self.store.fetch(state.topic, state.partition_id, offset, 64 * 1024 * 1024);
+                const result = try self.store.fetch(state.topic, state.partition_id, offset, 1);
                 defer if (result.records.len > 0) self.allocator.free(@constCast(result.records));
                 if (result.error_code != @intFromEnum(ErrorCode.none)) return error.ProducerSequenceLogUnavailable;
                 if (result.records.len == 0) break;
@@ -12423,13 +13133,21 @@ pub const Broker = struct {
 
             for (req.groups, 0..) |group_req, group_idx| {
                 const group_id = group_req.group_id orelse "";
-                const group_error = self.offsetFetchGroupErrorForRequest(group_req, api_version);
-                const topics = if (group_error != ErrorCode.none)
-                    &.{}
-                else if (group_fetch_all_flags[group_idx])
-                    self.buildOffsetFetchGroupAllTopics(group_id) orelse return null
-                else
-                    self.buildOffsetFetchGroupRequestedTopics(group_id, group_req.topics orelse &.{}) orelse return null;
+                var group_error = self.offsetFetchGroupErrorForRequest(group_req, api_version);
+                const topics = blk: {
+                    if (group_error != ErrorCode.none) break :blk &.{};
+                    if (group_fetch_all_flags[group_idx]) {
+                        break :blk self.buildOffsetFetchGroupAllTopics(group_id) catch |err| {
+                            log.warn("OffsetFetch all-topic committed-offset scan failed for {s}: {}", .{ group_id, err });
+                            if (err == error.CorruptCommittedOffsetKey) {
+                                group_error = ErrorCode.kafka_storage_error;
+                                break :blk &.{};
+                            }
+                            return null;
+                        };
+                    }
+                    break :blk self.buildOffsetFetchGroupRequestedTopics(group_id, group_req.topics orelse &.{}) orelse return null;
+                };
 
                 groups[groups_init] = .{
                     .group_id = group_req.group_id,
@@ -12448,18 +13166,27 @@ pub const Broker = struct {
 
         const group_id = req.group_id orelse "";
         const group_error = self.offsetFetchGroupError(group_id);
-        const topics = if (group_error != ErrorCode.none and api_version >= 2)
-            &.{}
-        else if (legacy_fetch_all)
-            self.buildOffsetFetchLegacyAllTopics(group_id) orelse return null
-        else
-            self.buildOffsetFetchLegacyRequestedTopics(group_id, req.topics orelse &.{}, if (api_version < 2) group_error else ErrorCode.none) orelse return null;
+        var response_error = if (api_version >= 2) group_error else ErrorCode.none;
+        const topics = blk: {
+            if (group_error != ErrorCode.none and api_version >= 2) break :blk &.{};
+            if (legacy_fetch_all) {
+                break :blk self.buildOffsetFetchLegacyAllTopics(group_id) catch |err| {
+                    log.warn("OffsetFetch all-topic committed-offset scan failed for {s}: {}", .{ group_id, err });
+                    if (err == error.CorruptCommittedOffsetKey and api_version >= 2) {
+                        response_error = ErrorCode.kafka_storage_error;
+                        break :blk &.{};
+                    }
+                    return null;
+                };
+            }
+            break :blk self.buildOffsetFetchLegacyRequestedTopics(group_id, req.topics orelse &.{}, if (api_version < 2) group_error else ErrorCode.none) orelse return null;
+        };
         defer self.freeOffsetFetchLegacyTopics(topics);
 
         const resp = Resp{
             .throttle_time_ms = 0,
             .topics = topics,
-            .error_code = @intFromEnum(if (api_version >= 2) group_error else ErrorCode.none),
+            .error_code = @intFromEnum(response_error),
         };
         return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
     }
@@ -12573,18 +13300,18 @@ pub const Broker = struct {
         return topics[0..topics_init];
     }
 
-    fn buildOffsetFetchLegacyAllTopics(self: *Broker, group_id: []const u8) ?[]const generated.offset_fetch_response.OffsetFetchResponse.OffsetFetchResponseTopic {
+    fn buildOffsetFetchLegacyAllTopics(self: *Broker, group_id: []const u8) ![]const generated.offset_fetch_response.OffsetFetchResponse.OffsetFetchResponseTopic {
         const TopicResponse = generated.offset_fetch_response.OffsetFetchResponse.OffsetFetchResponseTopic;
         const PartitionResponse = TopicResponse.OffsetFetchResponsePartition;
 
-        const offsets = self.groups.listCommittedOffsets(self.allocator, group_id) catch return null;
+        const offsets = try self.groups.listCommittedOffsets(self.allocator, group_id);
         defer {
             if (offsets.len > 0) self.allocator.free(offsets);
         }
         if (offsets.len == 0) return &.{};
 
         const topic_count = countCommittedOffsetTopics(offsets);
-        const topics = self.allocator.alloc(TopicResponse, topic_count) catch return null;
+        const topics = try self.allocator.alloc(TopicResponse, topic_count);
         var topics_init: usize = 0;
         var success = false;
         defer {
@@ -12602,7 +13329,7 @@ pub const Broker = struct {
                 offset_idx += 1;
             }
 
-            const partitions = self.allocator.alloc(PartitionResponse, offset_idx - start) catch return null;
+            const partitions = try self.allocator.alloc(PartitionResponse, offset_idx - start);
             var transferred = false;
             defer {
                 if (!transferred and partitions.len > 0) self.allocator.free(partitions);
@@ -12749,18 +13476,18 @@ pub const Broker = struct {
         return topics[0..topics_init];
     }
 
-    fn buildOffsetFetchGroupAllTopics(self: *Broker, group_id: []const u8) ?[]const generated.offset_fetch_response.OffsetFetchResponse.OffsetFetchResponseGroup.OffsetFetchResponseTopics {
+    fn buildOffsetFetchGroupAllTopics(self: *Broker, group_id: []const u8) ![]const generated.offset_fetch_response.OffsetFetchResponse.OffsetFetchResponseGroup.OffsetFetchResponseTopics {
         const TopicResponse = generated.offset_fetch_response.OffsetFetchResponse.OffsetFetchResponseGroup.OffsetFetchResponseTopics;
         const PartitionResponse = TopicResponse.OffsetFetchResponsePartitions;
 
-        const offsets = self.groups.listCommittedOffsets(self.allocator, group_id) catch return null;
+        const offsets = try self.groups.listCommittedOffsets(self.allocator, group_id);
         defer {
             if (offsets.len > 0) self.allocator.free(offsets);
         }
         if (offsets.len == 0) return &.{};
 
         const topic_count = countCommittedOffsetTopics(offsets);
-        const topics = self.allocator.alloc(TopicResponse, topic_count) catch return null;
+        const topics = try self.allocator.alloc(TopicResponse, topic_count);
         var topics_init: usize = 0;
         var success = false;
         defer {
@@ -12778,7 +13505,7 @@ pub const Broker = struct {
                 offset_idx += 1;
             }
 
-            const partitions = self.allocator.alloc(PartitionResponse, offset_idx - start) catch return null;
+            const partitions = try self.allocator.alloc(PartitionResponse, offset_idx - start);
             var transferred = false;
             defer {
                 if (!transferred and partitions.len > 0) self.allocator.free(partitions);
@@ -12942,11 +13669,23 @@ pub const Broker = struct {
                     return null;
                 };
 
-                const has_non_local_assignment = self.applyCreateTopicInitialAssignments(topic_name, &topic_req, actual_partitions) catch return null;
-                log.info("Created topic '{s}' ({d} partitions)", .{ topic_name, actual_partitions });
-                created_any = true;
-                if (has_non_local_assignment) created_partition_reassignments = true;
-                created_topics[topic_index] = true;
+                const has_non_local_assignment = self.applyCreateTopicInitialAssignments(topic_name, &topic_req, actual_partitions) catch |err| blk: {
+                    log.warn("Failed to create partition metadata for topic {s}: {}", .{ topic_name, err });
+                    self.removeTopicPartitionRange(topic_name, 0, actual_partitions);
+                    _ = self.clearPartitionReassignmentsForTopic(topic_name);
+                    if (self.topics.fetchRemove(topic_name)) |removed| {
+                        self.freeTopicMapEntry(removed);
+                    }
+                    error_code = @intFromEnum(ErrorCode.kafka_storage_error);
+                    error_message = "Failed to create partition metadata";
+                    break :blk false;
+                };
+                if (error_code == @intFromEnum(ErrorCode.none)) {
+                    log.info("Created topic '{s}' ({d} partitions)", .{ topic_name, actual_partitions });
+                    created_any = true;
+                    if (has_non_local_assignment) created_partition_reassignments = true;
+                    created_topics[topic_index] = true;
+                }
             }
 
             topics[topics_init] = .{
@@ -13121,7 +13860,7 @@ pub const Broker = struct {
             const partition_index: i32 = @intCast(pi);
             const owner = createTopicAssignmentOwner(topic_req.assignments, partition_index) orelse self.node_id;
             if (owner == self.node_id) {
-                self.store.ensurePartition(topic_name, partition_index) catch {};
+                try self.store.ensurePartition(topic_name, partition_index);
             }
             try self.failover_controller.registerPartitionOwner(topic_name, partition_index, owner);
             if (owner != self.node_id) {
@@ -18215,6 +18954,608 @@ pub const Broker = struct {
     }
 
     // ---------------------------------------------------------------
+    // Delegation token APIs (keys 38-41)
+    // ---------------------------------------------------------------
+    const PrincipalRef = struct {
+        principal_type: []const u8,
+        principal_name: []const u8,
+    };
+
+    fn normalizePrincipal(principal: []const u8) PrincipalRef {
+        if (std.mem.indexOfScalar(u8, principal, ':')) |colon| {
+            if (colon > 0 and colon + 1 < principal.len) {
+                return .{
+                    .principal_type = principal[0..colon],
+                    .principal_name = principal[colon + 1 ..],
+                };
+            }
+        }
+        return .{
+            .principal_type = "User",
+            .principal_name = if (principal.len > 0) principal else "anonymous",
+        };
+    }
+
+    fn authenticatedPrincipalForClient(self: *Broker, client_id: []const u8) ?[]const u8 {
+        self.expireAuthenticatedSessionIfNeeded(client_id, @import("time_compat").milliTimestamp());
+        return self.authenticated_sessions.get(client_id);
+    }
+
+    fn requestPrincipal(self: *Broker, req_header: *const RequestHeader) PrincipalRef {
+        const client_id = req_header.client_id orelse "anonymous";
+        return normalizePrincipal(self.authenticatedPrincipalForClient(client_id) orelse client_id);
+    }
+
+    fn sessionAuthenticatedViaDelegationToken(self: *Broker, req_header: *const RequestHeader) bool {
+        const client_id = req_header.client_id orelse "anonymous";
+        self.expireAuthenticatedSessionIfNeeded(client_id, @import("time_compat").milliTimestamp());
+        return self.delegation_token_authenticated_sessions.contains(client_id);
+    }
+
+    fn expireAuthenticatedSessionIfNeeded(self: *Broker, client_id: []const u8, now_ms: i64) void {
+        var expires_at_ms = self.authenticated_session_expiries.get(client_id) orelse std.math.maxInt(i64);
+        if (self.delegation_token_authenticated_sessions.get(client_id)) |token_expires_at_ms| {
+            expires_at_ms = @min(expires_at_ms, token_expires_at_ms);
+        }
+        if (expires_at_ms == std.math.maxInt(i64)) return;
+        if (expires_at_ms > 0 and now_ms >= expires_at_ms) {
+            log.info("SASL session expired for client_id={s}", .{client_id});
+            self.removeAuthenticatedSession(client_id);
+        }
+    }
+
+    fn validDelegationPrincipal(principal_type: ?[]const u8, principal_name: ?[]const u8) bool {
+        const ptype = principal_type orelse return false;
+        const pname = principal_name orelse return false;
+        return ptype.len > 0 and pname.len > 0;
+    }
+
+    fn delegationTokenLifetime(requested_lifetime_ms: i64) i64 {
+        return if (requested_lifetime_ms <= 0) delegation_token_default_lifetime_ms else requested_lifetime_ms;
+    }
+
+    fn boundedTimestampAdd(timestamp_ms: i64, period_ms: i64) i64 {
+        if (period_ms <= 0) return timestamp_ms;
+        if (timestamp_ms > std.math.maxInt(i64) - period_ms) return std.math.maxInt(i64);
+        return timestamp_ms + period_ms;
+    }
+
+    fn hmacKeyFromBytes(hmac: []const u8) ?[delegation_token_hmac_len * 2]u8 {
+        if (hmac.len != delegation_token_hmac_len) return null;
+        const hex = "0123456789abcdef";
+        var key: [delegation_token_hmac_len * 2]u8 = undefined;
+        for (hmac, 0..) |byte, i| {
+            key[i * 2] = hex[byte >> 4];
+            key[i * 2 + 1] = hex[byte & 0x0f];
+        }
+        return key;
+    }
+
+    fn copyDelegationTokenRenewers(
+        self: *Broker,
+        renewers: []const generated.create_delegation_token_request.CreateDelegationTokenRequest.CreatableRenewers,
+    ) ![]DelegationTokenRenewer {
+        if (renewers.len == 0) return &.{};
+
+        const result = try self.allocator.alloc(DelegationTokenRenewer, renewers.len);
+        var initialized: usize = 0;
+        errdefer {
+            for (result[0..initialized]) |*renewer| renewer.deinit(self.allocator);
+            self.allocator.free(result);
+        }
+
+        for (renewers, 0..) |renewer, i| {
+            if (!validDelegationPrincipal(renewer.principal_type, renewer.principal_name)) return error.InvalidPrincipal;
+            result[i] = .{
+                .principal_type = try self.allocator.dupe(u8, renewer.principal_type.?),
+                .principal_name = try self.allocator.dupe(u8, renewer.principal_name.?),
+            };
+            initialized += 1;
+        }
+
+        return result;
+    }
+
+    fn putDelegationToken(
+        self: *Broker,
+        owner: PrincipalRef,
+        requester: PrincipalRef,
+        renewers: []const generated.create_delegation_token_request.CreateDelegationTokenRequest.CreatableRenewers,
+        max_lifetime_ms: i64,
+        now_ms: i64,
+    ) !*DelegationToken {
+        const lifetime_ms = delegationTokenLifetime(max_lifetime_ms);
+        const max_timestamp_ms = boundedTimestampAdd(now_ms, lifetime_ms);
+
+        var attempts: usize = 0;
+        while (attempts < 8) : (attempts += 1) {
+            var raw_hmac: [delegation_token_hmac_len]u8 = undefined;
+            @import("random_compat").bytes(&raw_hmac);
+            const key_buf = hmacKeyFromBytes(&raw_hmac).?;
+            if (self.delegation_tokens.contains(&key_buf)) continue;
+
+            const key_copy = try self.allocator.dupe(u8, &key_buf);
+            errdefer self.allocator.free(key_copy);
+
+            const token_uuid = @import("core").Uuid.random();
+            const token_id_buf = token_uuid.toString();
+
+            var token = DelegationToken{
+                .owner_principal_type = &.{},
+                .owner_principal_name = &.{},
+                .requester_principal_type = &.{},
+                .requester_principal_name = &.{},
+                .token_id = &.{},
+                .hmac = &.{},
+                .renewers = &.{},
+                .issue_timestamp_ms = now_ms,
+                .expiry_timestamp_ms = max_timestamp_ms,
+                .max_timestamp_ms = max_timestamp_ms,
+            };
+            var token_moved = false;
+            errdefer if (!token_moved) token.deinit(self.allocator);
+
+            token.owner_principal_type = try self.allocator.dupe(u8, owner.principal_type);
+            token.owner_principal_name = try self.allocator.dupe(u8, owner.principal_name);
+            token.requester_principal_type = try self.allocator.dupe(u8, requester.principal_type);
+            token.requester_principal_name = try self.allocator.dupe(u8, requester.principal_name);
+            token.token_id = try self.allocator.dupe(u8, &token_id_buf);
+            token.hmac = try self.allocator.dupe(u8, &raw_hmac);
+            token.renewers = try self.copyDelegationTokenRenewers(renewers);
+
+            try self.delegation_tokens.put(key_copy, token);
+            token_moved = true;
+            return self.delegation_tokens.getPtr(key_copy).?;
+        }
+
+        return error.DelegationTokenCollision;
+    }
+
+    fn removeDelegationTokenByKey(self: *Broker, key: []const u8) void {
+        if (self.delegation_tokens.fetchRemove(key)) |removed| {
+            self.allocator.free(removed.key);
+            var token = removed.value;
+            token.deinit(self.allocator);
+        }
+    }
+
+    fn purgeExpiredDelegationTokens(self: *Broker, now_ms: i64) void {
+        while (true) {
+            var expired_key: ?[]const u8 = null;
+            var it = self.delegation_tokens.iterator();
+            while (it.next()) |entry| {
+                if (entry.value_ptr.expiry_timestamp_ms <= now_ms) {
+                    expired_key = entry.key_ptr.*;
+                    break;
+                }
+            }
+
+            const key = expired_key orelse break;
+            self.removeDelegationTokenByKey(key);
+        }
+    }
+
+    fn delegationTokenByHmac(self: *Broker, hmac: ?[]const u8) ?*DelegationToken {
+        const key_buf = hmacKeyFromBytes(hmac orelse return null) orelse return null;
+        return self.delegation_tokens.getPtr(&key_buf);
+    }
+
+    fn delegationTokenByTokenId(self: *Broker, token_id: []const u8) ?*DelegationToken {
+        var it = self.delegation_tokens.iterator();
+        while (it.next()) |entry| {
+            if (std.mem.eql(u8, entry.value_ptr.token_id, token_id)) return entry.value_ptr;
+        }
+        return null;
+    }
+
+    fn delegationTokenScramCredential(self: *Broker, token: *const DelegationToken) !ScramSha256Authenticator.ScramCredential {
+        const encoder = std.base64.standard.Encoder;
+        const encoded_len = encoder.calcSize(token.hmac.len);
+        const password = try self.allocator.alloc(u8, encoded_len);
+        defer self.allocator.free(password);
+        _ = encoder.encode(password, token.hmac);
+
+        var salt: [32]u8 = undefined;
+        @import("random_compat").bytes(&salt);
+        return ScramSha256Authenticator.credentialFromPassword(password, salt, 4096);
+    }
+
+    fn delegationTokenOwnerPrincipal(self: *Broker, token: *const DelegationToken) ![]u8 {
+        return try std.fmt.allocPrint(self.allocator, "{s}:{s}", .{ token.owner_principal_type, token.owner_principal_name });
+    }
+
+    fn delegationTokenOwnerMatches(
+        token: *const DelegationToken,
+        owners: ?[]const generated.describe_delegation_token_request.DescribeDelegationTokenRequest.DescribeDelegationTokenOwner,
+    ) bool {
+        const requested_owners = owners orelse return true;
+        if (requested_owners.len == 0) return false;
+
+        for (requested_owners) |owner| {
+            const owner_type = owner.principal_type orelse continue;
+            const owner_name = owner.principal_name orelse continue;
+            if (std.mem.eql(u8, token.owner_principal_type, owner_type) and std.mem.eql(u8, token.owner_principal_name, owner_name)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    fn buildDelegationTokenDescriptions(
+        self: *Broker,
+        owners: ?[]const generated.describe_delegation_token_request.DescribeDelegationTokenRequest.DescribeDelegationTokenOwner,
+    ) ![]generated.describe_delegation_token_response.DescribeDelegationTokenResponse.DescribedDelegationToken {
+        const Resp = generated.describe_delegation_token_response.DescribeDelegationTokenResponse;
+        const TokenDesc = Resp.DescribedDelegationToken;
+        const RenewerDesc = TokenDesc.DescribedDelegationTokenRenewer;
+
+        var count: usize = 0;
+        var count_it = self.delegation_tokens.iterator();
+        while (count_it.next()) |entry| {
+            if (delegationTokenOwnerMatches(entry.value_ptr, owners)) count += 1;
+        }
+        if (count == 0) return &.{};
+
+        const tokens = try self.allocator.alloc(TokenDesc, count);
+        var initialized: usize = 0;
+        errdefer {
+            self.freeDelegationTokenDescriptions(tokens[0..initialized]);
+            self.allocator.free(tokens);
+        }
+
+        var it = self.delegation_tokens.iterator();
+        while (it.next()) |entry| {
+            const token = entry.value_ptr;
+            if (!delegationTokenOwnerMatches(token, owners)) continue;
+
+            var renewer_descs: []RenewerDesc = &.{};
+            if (token.renewers.len > 0) {
+                renewer_descs = try self.allocator.alloc(RenewerDesc, token.renewers.len);
+                for (token.renewers, 0..) |renewer, idx| {
+                    renewer_descs[idx] = .{
+                        .principal_type = renewer.principal_type,
+                        .principal_name = renewer.principal_name,
+                    };
+                }
+            }
+
+            tokens[initialized] = .{
+                .principal_type = token.owner_principal_type,
+                .principal_name = token.owner_principal_name,
+                .token_requester_principal_type = token.requester_principal_type,
+                .token_requester_principal_name = token.requester_principal_name,
+                .issue_timestamp = token.issue_timestamp_ms,
+                .expiry_timestamp = token.expiry_timestamp_ms,
+                .max_timestamp = token.max_timestamp_ms,
+                .token_id = token.token_id,
+                .hmac = token.hmac,
+                .renewers = renewer_descs,
+            };
+            initialized += 1;
+        }
+
+        return tokens;
+    }
+
+    fn freeDelegationTokenDescriptions(
+        self: *Broker,
+        tokens: []const generated.describe_delegation_token_response.DescribeDelegationTokenResponse.DescribedDelegationToken,
+    ) void {
+        for (tokens) |token| {
+            if (token.renewers.len > 0) self.allocator.free(token.renewers);
+        }
+    }
+
+    fn handleCreateDelegationToken(self: *Broker, request_bytes: []const u8, body_start: usize, req_header: *const RequestHeader, api_version: i16, resp_header_version: i16) ?[]u8 {
+        const Req = generated.create_delegation_token_request.CreateDelegationTokenRequest;
+        const Resp = generated.create_delegation_token_response.CreateDelegationTokenResponse;
+
+        if (!validateCreateDelegationTokenRequestFrame(request_bytes, body_start, api_version)) {
+            log.warn("Malformed CreateDelegationToken request", .{});
+            return null;
+        }
+
+        var pos = body_start;
+        var req = Req.deserialize(self.allocator, request_bytes, &pos, api_version) catch |err| {
+            log.warn("Failed to decode CreateDelegationToken request: {}", .{err});
+            return null;
+        };
+        defer self.freeCreateDelegationTokenRequest(&req);
+
+        if (self.sessionAuthenticatedViaDelegationToken(req_header)) {
+            const resp = Resp{
+                .error_code = @intFromEnum(ErrorCode.delegation_token_request_not_allowed),
+                .throttle_time_ms = 0,
+            };
+            return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+        }
+
+        const requester = self.requestPrincipal(req_header);
+        const owner = PrincipalRef{
+            .principal_type = req.owner_principal_type orelse requester.principal_type,
+            .principal_name = req.owner_principal_name orelse requester.principal_name,
+        };
+        if (!validDelegationPrincipal(owner.principal_type, owner.principal_name)) {
+            const resp = Resp{
+                .error_code = @intFromEnum(ErrorCode.invalid_principal_type),
+                .throttle_time_ms = 0,
+            };
+            return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+        }
+
+        const previous_snapshot = self.encodeDelegationTokenSnapshotRecordValue() catch |err| {
+            log.warn("Failed to capture delegation token snapshot before create: {}", .{err});
+            return null;
+        };
+        defer self.allocator.free(previous_snapshot);
+
+        const now_ms = @import("time_compat").milliTimestamp();
+        const token = self.putDelegationToken(owner, requester, req.renewers, req.max_lifetime_ms, now_ms) catch |err| {
+            if (err == error.InvalidPrincipal) {
+                const resp = Resp{
+                    .error_code = @intFromEnum(ErrorCode.invalid_principal_type),
+                    .throttle_time_ms = 0,
+                };
+                return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+            }
+            log.warn("Failed to create delegation token: {}", .{err});
+            return null;
+        };
+
+        self.persistDelegationTokensDurably() catch |err| {
+            log.warn("Failed to persist created delegation token: {}", .{err});
+            self.restoreDelegationTokensAfterFailedMutation(previous_snapshot);
+            self.persistDelegationTokensLocalDurably() catch |restore_err| {
+                log.warn("Failed to persist restored delegation token metadata: {}", .{restore_err});
+            };
+            const resp = Resp{
+                .error_code = @intFromEnum(ErrorCode.kafka_storage_error),
+                .throttle_time_ms = 0,
+            };
+            return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+        };
+
+        const resp = Resp{
+            .error_code = @intFromEnum(ErrorCode.none),
+            .principal_type = token.owner_principal_type,
+            .principal_name = token.owner_principal_name,
+            .token_requester_principal_type = token.requester_principal_type,
+            .token_requester_principal_name = token.requester_principal_name,
+            .issue_timestamp_ms = token.issue_timestamp_ms,
+            .expiry_timestamp_ms = token.expiry_timestamp_ms,
+            .max_timestamp_ms = token.max_timestamp_ms,
+            .token_id = token.token_id,
+            .hmac = token.hmac,
+            .throttle_time_ms = 0,
+        };
+        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+    }
+
+    fn handleRenewDelegationToken(self: *Broker, request_bytes: []const u8, body_start: usize, req_header: *const RequestHeader, api_version: i16, resp_header_version: i16) ?[]u8 {
+        const Req = generated.renew_delegation_token_request.RenewDelegationTokenRequest;
+        const Resp = generated.renew_delegation_token_response.RenewDelegationTokenResponse;
+
+        if (!validateRenewDelegationTokenRequestFrame(request_bytes, body_start, api_version)) {
+            log.warn("Malformed RenewDelegationToken request", .{});
+            return null;
+        }
+
+        var pos = body_start;
+        const req = Req.deserialize(self.allocator, request_bytes, &pos, api_version) catch |err| {
+            log.warn("Failed to decode RenewDelegationToken request: {}", .{err});
+            return null;
+        };
+
+        if (self.sessionAuthenticatedViaDelegationToken(req_header)) {
+            const resp = Resp{
+                .error_code = @intFromEnum(ErrorCode.delegation_token_request_not_allowed),
+                .expiry_timestamp_ms = 0,
+                .throttle_time_ms = 0,
+            };
+            return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+        }
+
+        const now_ms = @import("time_compat").milliTimestamp();
+        self.purgeExpiredDelegationTokens(now_ms);
+
+        const token = self.delegationTokenByHmac(req.hmac) orelse {
+            const resp = Resp{
+                .error_code = @intFromEnum(ErrorCode.delegation_token_not_found),
+                .expiry_timestamp_ms = 0,
+                .throttle_time_ms = 0,
+            };
+            return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+        };
+
+        const requester = self.requestPrincipal(req_header);
+        if (!token.canRenew(requester.principal_type, requester.principal_name)) {
+            const resp = Resp{
+                .error_code = @intFromEnum(ErrorCode.delegation_token_authorization_failed),
+                .expiry_timestamp_ms = token.expiry_timestamp_ms,
+                .throttle_time_ms = 0,
+            };
+            return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+        }
+
+        const requested_period_ms = delegationTokenLifetime(req.renew_period_ms);
+        const requested_expiry_ms = boundedTimestampAdd(now_ms, requested_period_ms);
+        const old_expiry_timestamp_ms = token.expiry_timestamp_ms;
+        const previous_snapshot = self.encodeDelegationTokenSnapshotRecordValue() catch |err| {
+            log.warn("Failed to capture delegation token snapshot before renewal: {}", .{err});
+            return null;
+        };
+        defer self.allocator.free(previous_snapshot);
+        token.expiry_timestamp_ms = @min(requested_expiry_ms, token.max_timestamp_ms);
+        self.persistDelegationTokensDurably() catch |err| {
+            log.warn("Failed to persist renewed delegation token: {}", .{err});
+            self.restoreDelegationTokensAfterFailedMutation(previous_snapshot);
+            self.persistDelegationTokensLocalDurably() catch |restore_err| {
+                log.warn("Failed to persist restored delegation token metadata: {}", .{restore_err});
+            };
+            const resp = Resp{
+                .error_code = @intFromEnum(ErrorCode.kafka_storage_error),
+                .expiry_timestamp_ms = old_expiry_timestamp_ms,
+                .throttle_time_ms = 0,
+            };
+            return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+        };
+
+        const resp = Resp{
+            .error_code = @intFromEnum(ErrorCode.none),
+            .expiry_timestamp_ms = token.expiry_timestamp_ms,
+            .throttle_time_ms = 0,
+        };
+        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+    }
+
+    fn handleExpireDelegationToken(self: *Broker, request_bytes: []const u8, body_start: usize, req_header: *const RequestHeader, api_version: i16, resp_header_version: i16) ?[]u8 {
+        const Req = generated.expire_delegation_token_request.ExpireDelegationTokenRequest;
+        const Resp = generated.expire_delegation_token_response.ExpireDelegationTokenResponse;
+
+        if (!validateExpireDelegationTokenRequestFrame(request_bytes, body_start, api_version)) {
+            log.warn("Malformed ExpireDelegationToken request", .{});
+            return null;
+        }
+
+        var pos = body_start;
+        const req = Req.deserialize(self.allocator, request_bytes, &pos, api_version) catch |err| {
+            log.warn("Failed to decode ExpireDelegationToken request: {}", .{err});
+            return null;
+        };
+
+        if (self.sessionAuthenticatedViaDelegationToken(req_header)) {
+            const resp = Resp{
+                .error_code = @intFromEnum(ErrorCode.delegation_token_request_not_allowed),
+                .expiry_timestamp_ms = 0,
+                .throttle_time_ms = 0,
+            };
+            return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+        }
+
+        const now_ms = @import("time_compat").milliTimestamp();
+        self.purgeExpiredDelegationTokens(now_ms);
+
+        const key_buf = hmacKeyFromBytes(req.hmac orelse &.{}) orelse {
+            const resp = Resp{
+                .error_code = @intFromEnum(ErrorCode.delegation_token_not_found),
+                .expiry_timestamp_ms = 0,
+                .throttle_time_ms = 0,
+            };
+            return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+        };
+
+        const token = self.delegation_tokens.getPtr(&key_buf) orelse {
+            const resp = Resp{
+                .error_code = @intFromEnum(ErrorCode.delegation_token_not_found),
+                .expiry_timestamp_ms = 0,
+                .throttle_time_ms = 0,
+            };
+            return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+        };
+
+        const requester = self.requestPrincipal(req_header);
+        if (!token.canRenew(requester.principal_type, requester.principal_name)) {
+            const resp = Resp{
+                .error_code = @intFromEnum(ErrorCode.delegation_token_authorization_failed),
+                .expiry_timestamp_ms = token.expiry_timestamp_ms,
+                .throttle_time_ms = 0,
+            };
+            return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+        }
+
+        const expiry_timestamp_ms = if (req.expiry_time_period_ms <= 0)
+            now_ms
+        else
+            @min(boundedTimestampAdd(now_ms, req.expiry_time_period_ms), token.max_timestamp_ms);
+        const old_expiry_timestamp_ms = token.expiry_timestamp_ms;
+        const previous_snapshot = self.encodeDelegationTokenSnapshotRecordValue() catch |err| {
+            log.warn("Failed to capture delegation token snapshot before expiry: {}", .{err});
+            return null;
+        };
+        defer self.allocator.free(previous_snapshot);
+        if (expiry_timestamp_ms <= now_ms) {
+            self.removeDelegationTokenByKey(&key_buf);
+        } else {
+            token.expiry_timestamp_ms = expiry_timestamp_ms;
+        }
+        self.persistDelegationTokensDurably() catch |err| {
+            log.warn("Failed to persist expired delegation token: {}", .{err});
+            self.restoreDelegationTokensAfterFailedMutation(previous_snapshot);
+            self.persistDelegationTokensLocalDurably() catch |restore_err| {
+                log.warn("Failed to persist restored delegation token metadata: {}", .{restore_err});
+            };
+            const resp = Resp{
+                .error_code = @intFromEnum(ErrorCode.kafka_storage_error),
+                .expiry_timestamp_ms = old_expiry_timestamp_ms,
+                .throttle_time_ms = 0,
+            };
+            return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+        };
+
+        const resp = Resp{
+            .error_code = @intFromEnum(ErrorCode.none),
+            .expiry_timestamp_ms = expiry_timestamp_ms,
+            .throttle_time_ms = 0,
+        };
+        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+    }
+
+    fn handleDescribeDelegationToken(self: *Broker, request_bytes: []const u8, body_start: usize, req_header: *const RequestHeader, api_version: i16, resp_header_version: i16) ?[]u8 {
+        const Req = generated.describe_delegation_token_request.DescribeDelegationTokenRequest;
+        const Resp = generated.describe_delegation_token_response.DescribeDelegationTokenResponse;
+
+        if (!validateDescribeDelegationTokenRequestFrame(request_bytes, body_start, api_version)) {
+            log.warn("Malformed DescribeDelegationToken request", .{});
+            return null;
+        }
+
+        var pos = body_start;
+        var req = Req.deserialize(self.allocator, request_bytes, &pos, api_version) catch |err| {
+            log.warn("Failed to decode DescribeDelegationToken request: {}", .{err});
+            return null;
+        };
+        defer self.freeDescribeDelegationTokenRequest(&req);
+
+        if (self.sessionAuthenticatedViaDelegationToken(req_header)) {
+            const resp = Resp{
+                .error_code = @intFromEnum(ErrorCode.delegation_token_request_not_allowed),
+                .tokens = &.{},
+                .throttle_time_ms = 0,
+            };
+            return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+        }
+
+        const now_ms = @import("time_compat").milliTimestamp();
+        self.purgeExpiredDelegationTokens(now_ms);
+
+        const tokens = self.buildDelegationTokenDescriptions(req.owners) catch |err| {
+            log.warn("Failed to describe delegation tokens: {}", .{err});
+            return null;
+        };
+        defer {
+            self.freeDelegationTokenDescriptions(tokens);
+            if (tokens.len > 0) self.allocator.free(tokens);
+        }
+
+        const resp = Resp{
+            .error_code = @intFromEnum(ErrorCode.none),
+            .tokens = tokens,
+            .throttle_time_ms = 0,
+        };
+        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+    }
+
+    fn freeCreateDelegationTokenRequest(self: *Broker, req: *generated.create_delegation_token_request.CreateDelegationTokenRequest) void {
+        if (req.renewers.len > 0) self.allocator.free(req.renewers);
+    }
+
+    fn freeDescribeDelegationTokenRequest(self: *Broker, req: *generated.describe_delegation_token_request.DescribeDelegationTokenRequest) void {
+        if (req.owners) |owners| {
+            if (owners.len > 0) self.allocator.free(owners);
+        }
+    }
+
+    // ---------------------------------------------------------------
     // AddOffsetsToTxn (key 25) — register __consumer_offsets in txn
     // Parses group_id, computes the __consumer_offsets partition, and adds it
     // to the transaction via txn_coordinator.addPartitionsToTxn.
@@ -20724,6 +22065,232 @@ pub const Broker = struct {
     }
 
     // ---------------------------------------------------------------
+    // AlterReplicaLogDirs (key 34) — legacy path-based JBOD reassignment.
+    // ---------------------------------------------------------------
+    fn handleAlterReplicaLogDirs(self: *Broker, request_bytes: []const u8, body_start: usize, req_header: *const RequestHeader, api_version: i16, resp_header_version: i16) ?[]u8 {
+        const Req = generated.alter_replica_log_dirs_request.AlterReplicaLogDirsRequest;
+        const Resp = generated.alter_replica_log_dirs_response.AlterReplicaLogDirsResponse;
+
+        if (!validateAlterReplicaLogDirsRequestFrame(request_bytes, body_start, api_version)) {
+            log.warn("Malformed AlterReplicaLogDirs request", .{});
+            return null;
+        }
+
+        var pos = body_start;
+        var req = Req.deserialize(self.allocator, request_bytes, &pos, api_version) catch |err| {
+            log.warn("Failed to decode AlterReplicaLogDirs request: {}", .{err});
+            return null;
+        };
+        defer self.freeAlterReplicaLogDirsRequest(&req);
+
+        var pending_assignments = std.array_list.Managed(PendingReplicaDirectoryAssignment).init(self.allocator);
+        defer {
+            for (pending_assignments.items) |assignment| {
+                if (assignment.key.len > 0) self.allocator.free(assignment.key);
+            }
+            pending_assignments.deinit();
+        }
+
+        const results = self.buildAlterReplicaLogDirsResults(req, null, &pending_assignments) catch return null;
+        defer self.freeAlterReplicaLogDirsResults(results);
+
+        if (pending_assignments.items.len > 0) {
+            var previous_assignments = self.cloneReplicaDirectoryAssignments() catch return null;
+            defer self.freeReplicaDirectoryAssignmentSnapshot(&previous_assignments);
+
+            var mutation_failed = false;
+            self.commitReplicaDirectoryAssignments(pending_assignments.items) catch |err| {
+                log.warn("Failed to commit AlterReplicaLogDirs assignments: {}", .{err});
+                mutation_failed = true;
+            };
+            if (!mutation_failed) {
+                self.writeReplicaDirectoryAssignmentSnapshotRecord() catch |err| {
+                    log.warn("AlterReplicaLogDirs shared assignment snapshot write failed: {}", .{err});
+                    mutation_failed = true;
+                };
+            }
+            if (!mutation_failed) {
+                self.persistReplicaDirectoryAssignmentsDurably() catch |err| {
+                    log.warn("AlterReplicaLogDirs assignment snapshot write failed: {}", .{err});
+                    mutation_failed = true;
+                };
+            }
+
+            if (mutation_failed) {
+                self.restoreReplicaDirectoryAssignmentSnapshot(&previous_assignments);
+                self.writeReplicaDirectoryAssignmentSnapshotRecord() catch |rollback_err| {
+                    log.warn("Failed to append AlterReplicaLogDirs rollback assignment snapshot to __cluster_metadata: {}", .{rollback_err});
+                };
+                self.persistReplicaDirectoryAssignmentsDurably() catch |rollback_err| {
+                    log.warn("Failed to persist restored replica directory assignments: {}", .{rollback_err});
+                };
+                markAlterReplicaLogDirsStorageError(results);
+            }
+        }
+
+        const resp = Resp{
+            .throttle_time_ms = 0,
+            .results = results,
+        };
+        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+    }
+
+    fn buildAlterReplicaLogDirsResults(
+        self: *Broker,
+        req: generated.alter_replica_log_dirs_request.AlterReplicaLogDirsRequest,
+        forced_error: ?ErrorCode,
+        pending_assignments: *std.array_list.Managed(PendingReplicaDirectoryAssignment),
+    ) ![]generated.alter_replica_log_dirs_response.AlterReplicaLogDirsResponse.AlterReplicaLogDirTopicResult {
+        const TopicResult = generated.alter_replica_log_dirs_response.AlterReplicaLogDirsResponse.AlterReplicaLogDirTopicResult;
+        const PartitionResult = TopicResult.AlterReplicaLogDirPartitionResult;
+
+        var results = std.array_list.Managed(TopicResult).init(self.allocator);
+        errdefer {
+            self.freeAlterReplicaLogDirsResultChildren(results.items);
+            results.deinit();
+        }
+
+        for (req.dirs) |dir| {
+            const directory_id = self.resolveAlterReplicaLogDirPath(dir.path);
+            const directory_error: ?ErrorCode = if (forced_error) |err|
+                err
+            else if (directory_id == null)
+                ErrorCode.log_dir_not_found
+            else
+                null;
+
+            for (dir.topics) |topic| {
+                var partitions: []PartitionResult = &.{};
+                if (topic.partitions.len > 0) {
+                    partitions = try self.allocator.alloc(PartitionResult, topic.partitions.len);
+                }
+                var transferred = false;
+                errdefer if (!transferred and partitions.len > 0) self.allocator.free(partitions);
+
+                for (topic.partitions, 0..) |partition_index, partition_idx| {
+                    var error_code = directory_error orelse self.validateAlterReplicaLogDirsTarget(directory_id.?, topic.name, partition_index);
+
+                    if (error_code == .none) {
+                        const topic_id = self.topics.get(topic.name.?).?.topic_id;
+                        const key = try self.replicaDirectoryAssignmentKey(topic_id, partition_index);
+                        var duplicate = false;
+                        for (pending_assignments.items) |assignment| {
+                            if (std.mem.eql(u8, assignment.key, key)) {
+                                duplicate = true;
+                                break;
+                            }
+                        }
+
+                        if (duplicate) {
+                            self.allocator.free(key);
+                            error_code = .invalid_request;
+                        } else if (forced_error == null) {
+                            try pending_assignments.append(.{
+                                .key = key,
+                                .topic_id = topic_id,
+                                .partition_index = partition_index,
+                                .directory_id = directory_id.?,
+                            });
+                        } else {
+                            self.allocator.free(key);
+                        }
+                    }
+
+                    partitions[partition_idx] = .{
+                        .partition_index = partition_index,
+                        .error_code = error_code.toInt(),
+                    };
+                }
+
+                try results.append(.{
+                    .topic_name = topic.name,
+                    .partitions = partitions,
+                });
+                transferred = true;
+            }
+        }
+
+        if (results.items.len == 0) {
+            results.deinit();
+            return &.{};
+        }
+        return try results.toOwnedSlice();
+    }
+
+    fn validateAlterReplicaLogDirsTarget(self: *const Broker, directory_id: [16]u8, topic_name: ?[]const u8, partition_index: i32) ErrorCode {
+        if (!self.hasLocalReplicaDirectory(directory_id)) return .log_dir_not_found;
+        const name = topic_name orelse return .unknown_topic_or_partition;
+        if (!self.topicPartitionExists(name, partition_index)) return .unknown_topic_or_partition;
+        return .none;
+    }
+
+    fn resolveAlterReplicaLogDirPath(self: *const Broker, path: ?[]const u8) ?[16]u8 {
+        const raw = path orelse return null;
+        if (raw.len == 0) return null;
+
+        const prefix = "replica-dir:";
+        const directory_id = if (std.mem.startsWith(u8, raw, prefix) and raw.len == prefix.len + 32)
+            parseReplicaDirectoryName(raw[prefix.len..]) orelse return null
+        else
+            deriveReplicaDirectoryId(raw);
+
+        if (isZeroUuid(directory_id)) return null;
+        if (!self.hasLocalReplicaDirectory(directory_id)) return null;
+        return directory_id;
+    }
+
+    fn parseReplicaDirectoryName(hex: []const u8) ?[16]u8 {
+        if (hex.len != 32) return null;
+        var directory_id: [16]u8 = undefined;
+        for (&directory_id, 0..) |*byte, idx| {
+            const high = hexNibble(hex[idx * 2]) orelse return null;
+            const low = hexNibble(hex[idx * 2 + 1]) orelse return null;
+            byte.* = (high << 4) | low;
+        }
+        return directory_id;
+    }
+
+    fn hexNibble(ch: u8) ?u8 {
+        return switch (ch) {
+            '0'...'9' => ch - '0',
+            'a'...'f' => ch - 'a' + 10,
+            'A'...'F' => ch - 'A' + 10,
+            else => null,
+        };
+    }
+
+    fn markAlterReplicaLogDirsStorageError(results: []generated.alter_replica_log_dirs_response.AlterReplicaLogDirsResponse.AlterReplicaLogDirTopicResult) void {
+        for (results) |topic| {
+            for (@constCast(topic.partitions)) |*partition| {
+                if (partition.error_code == ErrorCode.none.toInt()) {
+                    partition.error_code = ErrorCode.kafka_storage_error.toInt();
+                }
+            }
+        }
+    }
+
+    fn freeAlterReplicaLogDirsRequest(self: *Broker, req: *generated.alter_replica_log_dirs_request.AlterReplicaLogDirsRequest) void {
+        for (req.dirs) |dir| {
+            for (dir.topics) |topic| {
+                if (topic.partitions.len > 0) self.allocator.free(topic.partitions);
+            }
+            if (dir.topics.len > 0) self.allocator.free(dir.topics);
+        }
+        if (req.dirs.len > 0) self.allocator.free(req.dirs);
+    }
+
+    fn freeAlterReplicaLogDirsResults(self: *Broker, results: []const generated.alter_replica_log_dirs_response.AlterReplicaLogDirsResponse.AlterReplicaLogDirTopicResult) void {
+        self.freeAlterReplicaLogDirsResultChildren(results);
+        if (results.len > 0) self.allocator.free(results);
+    }
+
+    fn freeAlterReplicaLogDirsResultChildren(self: *Broker, results: []const generated.alter_replica_log_dirs_response.AlterReplicaLogDirsResponse.AlterReplicaLogDirTopicResult) void {
+        for (results) |topic| {
+            if (topic.partitions.len > 0) self.allocator.free(topic.partitions);
+        }
+    }
+
+    // ---------------------------------------------------------------
     // AssignReplicasToDirs (key 73) — advertised logical JBOD directory assignment.
     // ---------------------------------------------------------------
     fn handleAssignReplicasToDirs(self: *Broker, request_bytes: []const u8, body_start: usize, req_header: *const RequestHeader, api_version: i16, resp_header_version: i16) ?[]u8 {
@@ -21424,6 +22991,35 @@ pub const Broker = struct {
         return count;
     }
 
+    const ScramClientFirstInfo = struct {
+        username: []const u8,
+        token_auth: bool,
+    };
+
+    fn parseScramClientFirstInfo(client_first: []const u8) ?ScramClientFirstInfo {
+        const gs2_prefix = "n,,";
+        if (!std.mem.startsWith(u8, client_first, gs2_prefix)) return null;
+        const bare = client_first[gs2_prefix.len..];
+
+        const username = ScramStateMachine.parseAttribute(bare, 'n') orelse return null;
+        _ = ScramStateMachine.parseAttribute(bare, 'r') orelse return null;
+
+        return .{
+            .username = username,
+            .token_auth = scramHasTokenAuthExtension(bare),
+        };
+    }
+
+    fn scramHasTokenAuthExtension(client_first_bare: []const u8) bool {
+        var iter = std.mem.splitScalar(u8, client_first_bare, ',');
+        while (iter.next()) |part| {
+            if (std.mem.startsWith(u8, part, "tokenauth=")) {
+                return std.mem.eql(u8, part["tokenauth=".len..], "true");
+            }
+        }
+        return false;
+    }
+
     /// Write each mechanism name from the comma-separated list into the response buffer.
     fn writeMechanismNames(enabled: []const u8, buf: []u8, wpos: *usize) void {
         var iter = std.mem.splitSequence(u8, enabled, ",");
@@ -21476,9 +23072,13 @@ pub const Broker = struct {
                         const full_principal = std.fmt.allocPrint(self.allocator, "User:{s}", .{principal}) catch {
                             return self.serializeSaslAuthenticateResponse(req_header, resp_header_version, api_version, @intFromEnum(ErrorCode.sasl_authentication_failed), "Internal error", &.{});
                         };
-                        self.storeAuthenticatedPrincipal(client_id, full_principal);
+                        if (!self.storeAuthenticatedPrincipal(client_id, full_principal, false, result.expires_at_ms)) {
+                            return self.serializeSaslAuthenticateResponse(req_header, resp_header_version, api_version, @intFromEnum(ErrorCode.sasl_authentication_failed), "Internal error", &.{});
+                        }
+                        const now_ms = @import("time_compat").milliTimestamp();
+                        const session_lifetime_ms = if (result.expires_at_ms) |expires_at_ms| @max(@as(i64, 0), expires_at_ms - now_ms) else 0;
+                        return self.serializeSaslAuthenticateResponseWithLifetime(req_header, resp_header_version, api_version, @intFromEnum(ErrorCode.none), "", &.{}, session_lifetime_ms);
                     }
-                    return self.serializeSaslAuthenticateResponse(req_header, resp_header_version, api_version, @intFromEnum(ErrorCode.none), "", &.{});
                 }
             }
             // OAUTHBEARER authentication failed
@@ -21498,47 +23098,80 @@ pub const Broker = struct {
                 if (sm.state == .server_first_sent) {
                     if (sm.handleClientFinal(&self.scram_authenticator, token)) |server_final| {
                         defer self.allocator.free(server_final);
+                        const now_ms = @import("time_compat").milliTimestamp();
+                        if (sm.authorization_expires_at_ms) |expires_at_ms| {
+                            if (now_ms >= expires_at_ms) {
+                                const response = self.serializeSaslAuthenticateResponse(req_header, resp_header_version, api_version, @intFromEnum(ErrorCode.sasl_authentication_failed), "SCRAM-SHA-256 delegation token expired", &.{});
+                                self.removeScramSession(client_id);
+                                return response;
+                            }
+                        }
                         // Authentication succeeded — store principal and return server-final
-                        if (sm.username) |username| {
-                            const full_principal = std.fmt.allocPrint(self.allocator, "User:{s}", .{username}) catch {
+                        if (sm.authorization_id orelse sm.username) |principal| {
+                            const via_delegation_token = sm.authorization_id != null;
+                            const session_expires_at_ms = if (via_delegation_token) sm.authorization_expires_at_ms else null;
+                            const full_principal = if (via_delegation_token)
+                                self.allocator.dupe(u8, principal) catch {
+                                    return self.serializeSaslAuthenticateResponse(req_header, resp_header_version, api_version, @intFromEnum(ErrorCode.sasl_authentication_failed), "Internal error", &.{});
+                                }
+                            else
+                                std.fmt.allocPrint(self.allocator, "User:{s}", .{principal}) catch {
+                                    return self.serializeSaslAuthenticateResponse(req_header, resp_header_version, api_version, @intFromEnum(ErrorCode.sasl_authentication_failed), "Internal error", &.{});
+                                };
+                            if (!self.storeAuthenticatedPrincipal(client_id, full_principal, via_delegation_token, session_expires_at_ms)) {
+                                self.removeScramSession(client_id);
                                 return self.serializeSaslAuthenticateResponse(req_header, resp_header_version, api_version, @intFromEnum(ErrorCode.sasl_authentication_failed), "Internal error", &.{});
-                            };
-                            self.storeAuthenticatedPrincipal(client_id, full_principal);
+                            }
                         }
-                        const response = self.serializeSaslAuthenticateResponse(req_header, resp_header_version, api_version, @intFromEnum(ErrorCode.none), "", server_final);
-                        // Clean up the completed SCRAM session
-                        if (self.scram_sessions.fetchRemove(client_id)) |old| {
-                            self.allocator.free(old.key);
-                            var old_sm = old.value;
-                            old_sm.deinit();
-                        }
+                        const session_lifetime_ms = if (sm.authorization_expires_at_ms) |expires_at_ms| @max(@as(i64, 0), expires_at_ms - now_ms) else 0;
+                        const response = self.serializeSaslAuthenticateResponseWithLifetime(req_header, resp_header_version, api_version, @intFromEnum(ErrorCode.none), "", server_final, session_lifetime_ms);
+                        self.removeScramSession(client_id);
                         return response;
                     } else {
                         // Client proof verification failed
                         const response = self.serializeSaslAuthenticateResponse(req_header, resp_header_version, api_version, @intFromEnum(ErrorCode.sasl_authentication_failed), "SCRAM-SHA-256 authentication failed", &.{});
-                        // Clean up the failed session
-                        if (self.scram_sessions.fetchRemove(client_id)) |old| {
-                            self.allocator.free(old.key);
-                            var old_sm = old.value;
-                            old_sm.deinit();
-                        }
+                        self.removeScramSession(client_id);
                         return response;
                     }
                 } else {
                     // Unexpected state — session exists but not in server_first_sent
                     const response = self.serializeSaslAuthenticateResponse(req_header, resp_header_version, api_version, @intFromEnum(ErrorCode.sasl_authentication_failed), "SCRAM-SHA-256 unexpected state", &.{});
-                    if (self.scram_sessions.fetchRemove(client_id)) |old| {
-                        self.allocator.free(old.key);
-                        var old_sm = old.value;
-                        old_sm.deinit();
-                    }
+                    self.removeScramSession(client_id);
                     return response;
                 }
             } else {
                 // No existing session — this is the client-first-message (round 1)
                 var sm = ScramStateMachine.init(self.allocator);
-                if (sm.handleClientFirst(&self.scram_authenticator, token)) |server_first| {
-                    defer self.allocator.free(server_first);
+                const server_first = server_first_blk: {
+                    if (parseScramClientFirstInfo(token)) |first| {
+                        if (first.token_auth) {
+                            const now_ms = @import("time_compat").milliTimestamp();
+                            self.purgeExpiredDelegationTokens(now_ms);
+                            const delegation_token = self.delegationTokenByTokenId(first.username) orelse break :server_first_blk null;
+                            if (delegation_token.expiry_timestamp_ms <= now_ms) break :server_first_blk null;
+                            const credential = self.delegationTokenScramCredential(delegation_token) catch {
+                                sm.deinit();
+                                return self.serializeSaslAuthenticateResponse(req_header, resp_header_version, api_version, @intFromEnum(ErrorCode.sasl_authentication_failed), "Internal error", &.{});
+                            };
+                            const response = sm.handleClientFirstWithCredential(credential, token) orelse break :server_first_blk null;
+                            const principal = self.delegationTokenOwnerPrincipal(delegation_token) catch {
+                                self.allocator.free(response);
+                                sm.deinit();
+                                return self.serializeSaslAuthenticateResponse(req_header, resp_header_version, api_version, @intFromEnum(ErrorCode.sasl_authentication_failed), "Internal error", &.{});
+                            };
+                            defer self.allocator.free(principal);
+                            sm.setAuthorizationIdentity(principal, delegation_token.expiry_timestamp_ms) catch {
+                                self.allocator.free(response);
+                                sm.deinit();
+                                return self.serializeSaslAuthenticateResponse(req_header, resp_header_version, api_version, @intFromEnum(ErrorCode.sasl_authentication_failed), "Internal error", &.{});
+                            };
+                            break :server_first_blk response;
+                        }
+                    }
+                    break :server_first_blk sm.handleClientFirst(&self.scram_authenticator, token);
+                };
+                if (server_first) |sf| {
+                    defer self.allocator.free(sf);
                     // Store the state machine for this client's next round
                     const key = self.allocator.dupe(u8, client_id) catch {
                         sm.deinit();
@@ -21552,7 +23185,7 @@ pub const Broker = struct {
                     // Return server-first-message to client (intermediate challenge)
                     // Kafka sends error_code=0 for SCRAM challenge responses; the client
                     // knows the exchange is not yet complete from the SCRAM state machine.
-                    return self.serializeSaslAuthenticateResponse(req_header, resp_header_version, api_version, @intFromEnum(ErrorCode.none), "", server_first);
+                    return self.serializeSaslAuthenticateResponse(req_header, resp_header_version, api_version, @intFromEnum(ErrorCode.none), "", sf);
                 } else {
                     // Failed to parse client-first (unknown user, bad format, etc.)
                     sm.deinit();
@@ -21569,7 +23202,9 @@ pub const Broker = struct {
                         const full_principal = std.fmt.allocPrint(self.allocator, "User:{s}", .{principal}) catch {
                             return self.serializeSaslAuthenticateResponse(req_header, resp_header_version, api_version, @intFromEnum(ErrorCode.sasl_authentication_failed), "Internal error", &.{});
                         };
-                        self.storeAuthenticatedPrincipal(client_id, full_principal);
+                        if (!self.storeAuthenticatedPrincipal(client_id, full_principal, false, null)) {
+                            return self.serializeSaslAuthenticateResponse(req_header, resp_header_version, api_version, @intFromEnum(ErrorCode.sasl_authentication_failed), "Internal error", &.{});
+                        }
                     }
                     return self.serializeSaslAuthenticateResponse(req_header, resp_header_version, api_version, @intFromEnum(ErrorCode.none), "", &.{});
                 }
@@ -21587,34 +23222,91 @@ pub const Broker = struct {
     }
 
     fn serializeSaslAuthenticateResponse(self: *Broker, req_header: *const RequestHeader, resp_header_version: i16, api_version: i16, error_code: i16, error_message: ?[]const u8, auth_bytes: ?[]const u8) ?[]u8 {
+        return self.serializeSaslAuthenticateResponseWithLifetime(req_header, resp_header_version, api_version, error_code, error_message, auth_bytes, 0);
+    }
+
+    fn serializeSaslAuthenticateResponseWithLifetime(self: *Broker, req_header: *const RequestHeader, resp_header_version: i16, api_version: i16, error_code: i16, error_message: ?[]const u8, auth_bytes: ?[]const u8, session_lifetime_ms: i64) ?[]u8 {
         const Resp = generated.sasl_authenticate_response.SaslAuthenticateResponse;
         const resp = Resp{
             .error_code = error_code,
             .error_message = error_message,
             .auth_bytes = auth_bytes,
-            .session_lifetime_ms = 0,
+            .session_lifetime_ms = session_lifetime_ms,
         };
         return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
     }
 
     /// Store an authenticated principal in the session map.
     /// Takes ownership of `full_principal` — caller must not free it on success.
-    fn storeAuthenticatedPrincipal(self: *Broker, client_id: []const u8, full_principal: []u8) void {
+    fn storeAuthenticatedPrincipal(self: *Broker, client_id: []const u8, full_principal: []u8, via_delegation_token: bool, expires_at_ms: ?i64) bool {
+        self.removeAuthenticatedSession(client_id);
+
         const key = self.allocator.dupe(u8, client_id) catch {
             self.allocator.free(full_principal);
             log.warn("Failed to store authenticated principal: allocation failed", .{});
-            return;
+            return false;
         };
-        // Remove old session entry if client re-authenticates
-        if (self.authenticated_sessions.fetchRemove(key)) |old| {
-            self.allocator.free(old.key);
-            self.allocator.free(old.value);
-        }
         self.authenticated_sessions.put(key, full_principal) catch {
             self.allocator.free(key);
             self.allocator.free(full_principal);
             log.warn("Failed to store authenticated principal: map insertion failed", .{});
+            return false;
         };
+
+        if (expires_at_ms) |session_expires_at_ms| {
+            const expiry_key = self.allocator.dupe(u8, client_id) catch {
+                self.removeAuthenticatedSession(client_id);
+                log.warn("Failed to store SASL session expiry: allocation failed", .{});
+                return false;
+            };
+            self.authenticated_session_expiries.put(expiry_key, session_expires_at_ms) catch {
+                self.allocator.free(expiry_key);
+                self.removeAuthenticatedSession(client_id);
+                log.warn("Failed to store SASL session expiry: map insertion failed", .{});
+                return false;
+            };
+        }
+
+        if (via_delegation_token) {
+            const token_expires_at_ms = expires_at_ms orelse {
+                self.removeAuthenticatedSession(client_id);
+                log.warn("Failed to mark delegation-token authenticated session: missing expiry", .{});
+                return false;
+            };
+            const token_key = self.allocator.dupe(u8, client_id) catch {
+                self.removeAuthenticatedSession(client_id);
+                log.warn("Failed to mark delegation-token authenticated session: allocation failed", .{});
+                return false;
+            };
+            self.delegation_token_authenticated_sessions.put(token_key, token_expires_at_ms) catch {
+                self.allocator.free(token_key);
+                self.removeAuthenticatedSession(client_id);
+                log.warn("Failed to mark delegation-token authenticated session: map insertion failed", .{});
+                return false;
+            };
+        }
+        return true;
+    }
+
+    fn removeAuthenticatedSession(self: *Broker, client_id: []const u8) void {
+        if (self.authenticated_sessions.fetchRemove(client_id)) |old| {
+            self.allocator.free(old.key);
+            self.allocator.free(old.value);
+        }
+        if (self.authenticated_session_expiries.fetchRemove(client_id)) |old| {
+            self.allocator.free(old.key);
+        }
+        if (self.delegation_token_authenticated_sessions.fetchRemove(client_id)) |old| {
+            self.allocator.free(old.key);
+        }
+    }
+
+    fn removeScramSession(self: *Broker, client_id: []const u8) void {
+        if (self.scram_sessions.fetchRemove(client_id)) |old| {
+            self.allocator.free(old.key);
+            var old_sm = old.value;
+            old_sm.deinit();
+        }
     }
 
     // ---------------------------------------------------------------
@@ -23397,7 +25089,10 @@ pub const Broker = struct {
             if (self.raft_state) |raft| {
                 if (raft.role != .leader) {
                     // If we're not the leader, start an election
-                    _ = raft.startElection();
+                    _ = raft.startElection() catch |err| {
+                        log.warn("ElectLeaders skipped: failed to persist raft.meta: {}", .{err});
+                        return null;
+                    };
                     if (raft.quorumSize() <= 1) {
                         raft.becomeLeader();
                     }
@@ -24129,7 +25824,7 @@ pub const Broker = struct {
         brokers: []const AutoBalancer.BrokerNode,
         loads: []const AutoBalancer.PartitionLoad,
     ) !ControllerAwareRebalanceResult {
-        var plan = self.auto_balancer.computeControllerAwareRebalancePlan(brokers, loads) orelse return .{};
+        var plan = try self.auto_balancer.computeControllerAwareRebalancePlan(brokers, loads) orelse return .{};
         defer plan.deinit();
 
         const planned = plan.moveCount();
@@ -24803,6 +26498,81 @@ pub const Broker = struct {
         const metrics = ser.readCompactBytes(buf, &pos) catch return false;
         if (metrics == null) return false;
         ser.skipTaggedFields(buf, &pos) catch return false;
+        return pos == buf.len;
+    }
+
+    fn validateCreateDelegationTokenRequestFrame(buf: []const u8, start_pos: usize, api_version: i16) bool {
+        const flexible = api_version >= 2;
+        var pos = start_pos;
+
+        if (api_version >= 3) {
+            if (!skipKafkaString(buf, &pos, flexible)) return false; // owner_principal_type
+            if (!skipKafkaString(buf, &pos, flexible)) return false; // owner_principal_name
+        }
+
+        const renewer_count = readKafkaArrayCount(buf, &pos, flexible) orelse return false;
+        for (0..renewer_count) |_| {
+            if (!skipKafkaString(buf, &pos, flexible)) return false; // principal_type
+            if (!skipKafkaString(buf, &pos, flexible)) return false; // principal_name
+            if (flexible) ser.skipTaggedFields(buf, &pos) catch return false;
+        }
+
+        if (!skipFixedBytes(buf, &pos, 8)) return false; // max_lifetime_ms
+        if (flexible) ser.skipTaggedFields(buf, &pos) catch return false;
+        return pos == buf.len;
+    }
+
+    fn validateRenewDelegationTokenRequestFrame(buf: []const u8, start_pos: usize, api_version: i16) bool {
+        const flexible = api_version >= 2;
+        var pos = start_pos;
+        if (!skipKafkaBytes(buf, &pos, flexible)) return false; // hmac
+        if (!skipFixedBytes(buf, &pos, 8)) return false; // renew_period_ms
+        if (flexible) ser.skipTaggedFields(buf, &pos) catch return false;
+        return pos == buf.len;
+    }
+
+    fn validateExpireDelegationTokenRequestFrame(buf: []const u8, start_pos: usize, api_version: i16) bool {
+        const flexible = api_version >= 2;
+        var pos = start_pos;
+        if (!skipKafkaBytes(buf, &pos, flexible)) return false; // hmac
+        if (!skipFixedBytes(buf, &pos, 8)) return false; // expiry_time_period_ms
+        if (flexible) ser.skipTaggedFields(buf, &pos) catch return false;
+        return pos == buf.len;
+    }
+
+    fn validateDescribeDelegationTokenRequestFrame(buf: []const u8, start_pos: usize, api_version: i16) bool {
+        const flexible = api_version >= 2;
+        var pos = start_pos;
+
+        const owners = readKafkaArrayHeader(buf, &pos, flexible) orelse return false;
+        if (!owners.is_null) {
+            for (0..owners.count) |_| {
+                if (!skipKafkaString(buf, &pos, flexible)) return false; // principal_type
+                if (!skipKafkaString(buf, &pos, flexible)) return false; // principal_name
+                if (flexible) ser.skipTaggedFields(buf, &pos) catch return false;
+            }
+        }
+
+        if (flexible) ser.skipTaggedFields(buf, &pos) catch return false;
+        return pos == buf.len;
+    }
+
+    fn validateAlterReplicaLogDirsRequestFrame(buf: []const u8, start_pos: usize, api_version: i16) bool {
+        const flexible = api_version >= 2;
+        var pos = start_pos;
+
+        const directory_count = readKafkaArrayCount(buf, &pos, flexible) orelse return false;
+        for (0..directory_count) |_| {
+            if (!skipKafkaString(buf, &pos, flexible)) return false; // path
+            const topic_count = readKafkaArrayCount(buf, &pos, flexible) orelse return false;
+            for (0..topic_count) |_| {
+                if (!skipKafkaString(buf, &pos, flexible)) return false; // topic name
+                if (!skipKafkaI32Array(buf, &pos, flexible)) return false; // partitions
+                if (flexible) ser.skipTaggedFields(buf, &pos) catch return false;
+            }
+            if (flexible) ser.skipTaggedFields(buf, &pos) catch return false;
+        }
+        if (flexible) ser.skipTaggedFields(buf, &pos) catch return false;
         return pos == buf.len;
     }
 
@@ -26143,7 +27913,7 @@ pub const Broker = struct {
                         batcher.fence();
                     }
                 }
-                raft.becomeFollower(leader_epoch, leader_id);
+                try raft.becomeFollower(leader_epoch, leader_id);
             }
             return .{ .success = true, .epoch = raft.current_epoch, .match_index = raft.log.lastOffset() };
         }
@@ -26261,7 +28031,14 @@ pub const Broker = struct {
                             batcher.fence();
                         }
                     }
-                    raft.becomeFollower(leader.epoch, leader.id);
+                    raft.becomeFollower(leader.epoch, leader.id) catch |err| {
+                        log.warn("BeginQuorumEpoch rejected: failed to persist leader epoch {d}: {}", .{ leader.epoch, err });
+                        const resp = Resp{
+                            .error_code = errorCode(.kafka_storage_error),
+                            .topics = &.{},
+                        };
+                        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+                    };
                     log.info("Acknowledged leader {d} epoch={d}", .{ leader.id, leader.epoch });
                 }
             }
@@ -26599,6 +28376,131 @@ fn expectTestResponseHeader(response: []const u8, api_key: i16, api_version: i16
     try testing.expectEqual(correlation_id, response_header.correlation_id);
 }
 
+fn testHmacSha256(key: []const u8, data: []const u8, out: *[32]u8) void {
+    const HmacSha256 = std.crypto.auth.hmac.sha2.HmacSha256;
+    HmacSha256.create(out, data, key);
+}
+
+fn testComputeSaltedPassword(password: []const u8, salt: []const u8, iterations: u32, out: *[32]u8) !void {
+    var salt_with_i: [64]u8 = undefined;
+    if (salt.len + 4 > salt_with_i.len) return error.SaltTooLong;
+    @memcpy(salt_with_i[0..salt.len], salt);
+    std.mem.writeInt(u32, salt_with_i[salt.len..][0..4], 1, .big);
+
+    var u_prev: [32]u8 = undefined;
+    testHmacSha256(password, salt_with_i[0 .. salt.len + 4], &u_prev);
+
+    var result = u_prev;
+    var i: u32 = 1;
+    while (i < iterations) : (i += 1) {
+        var u_next: [32]u8 = undefined;
+        testHmacSha256(password, &u_prev, &u_next);
+        for (&result, u_next) |*r, n| r.* ^= n;
+        u_prev = u_next;
+    }
+
+    out.* = result;
+}
+
+fn testBase64Encode(alloc: Allocator, data: []const u8) ![]u8 {
+    const encoder = std.base64.standard.Encoder;
+    const encoded = try alloc.alloc(u8, encoder.calcSize(data.len));
+    _ = encoder.encode(encoded, data);
+    return encoded;
+}
+
+fn testBuildScramClientFinal(
+    alloc: Allocator,
+    password: []const u8,
+    client_first_bare: []const u8,
+    server_first: []const u8,
+) ![]u8 {
+    const combined_nonce = ScramStateMachine.parseAttribute(server_first, 'r') orelse return error.MissingNonce;
+    const salt_b64 = ScramStateMachine.parseAttribute(server_first, 's') orelse return error.MissingSalt;
+    const iter_str = ScramStateMachine.parseAttribute(server_first, 'i') orelse return error.MissingIterations;
+    const iterations = try std.fmt.parseInt(u32, iter_str, 10);
+
+    const decoder = std.base64.standard.Decoder;
+    const salt_len = try decoder.calcSizeForSlice(salt_b64);
+    const salt = try alloc.alloc(u8, salt_len);
+    defer alloc.free(salt);
+    try decoder.decode(salt, salt_b64);
+
+    var salted_password: [32]u8 = undefined;
+    try testComputeSaltedPassword(password, salt, iterations, &salted_password);
+
+    var client_key: [32]u8 = undefined;
+    testHmacSha256(&salted_password, "Client Key", &client_key);
+
+    var stored_key: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(&client_key, &stored_key, .{});
+
+    const client_final_without_proof = try std.fmt.allocPrint(alloc, "c=biws,r={s}", .{combined_nonce});
+    defer alloc.free(client_final_without_proof);
+
+    const auth_message = try std.fmt.allocPrint(alloc, "{s},{s},{s}", .{ client_first_bare, server_first, client_final_without_proof });
+    defer alloc.free(auth_message);
+
+    var client_signature: [32]u8 = undefined;
+    testHmacSha256(&stored_key, auth_message, &client_signature);
+
+    var client_proof: [32]u8 = undefined;
+    for (&client_proof, client_key, client_signature) |*proof_byte, key_byte, sig_byte| {
+        proof_byte.* = key_byte ^ sig_byte;
+    }
+
+    const proof_b64 = try testBase64Encode(alloc, &client_proof);
+    defer alloc.free(proof_b64);
+
+    return try std.fmt.allocPrint(alloc, "c=biws,r={s},p={s}", .{ combined_nonce, proof_b64 });
+}
+
+const TestDelegationToken = struct {
+    token_id: [36]u8,
+    hmac: [delegation_token_hmac_len]u8,
+};
+
+fn testCreateDelegationTokenForOwner(broker: *Broker, owner_name: []const u8, correlation_id: i32) !TestDelegationToken {
+    const CreateReq = generated.create_delegation_token_request.CreateDelegationTokenRequest;
+    const CreateResp = generated.create_delegation_token_response.CreateDelegationTokenResponse;
+
+    const req = CreateReq{
+        .owner_principal_type = "User",
+        .owner_principal_name = owner_name,
+        .renewers = &.{},
+        .max_lifetime_ms = delegation_token_default_lifetime_ms,
+    };
+
+    var buf: [512]u8 = undefined;
+    var pos = buildTestRequest(&buf, 38, 3, correlation_id, header_mod.requestHeaderVersion(38, 3));
+    req.serialize(&buf, &pos, 3);
+
+    const response = broker.handleRequest(buf[0..pos]) orelse return error.NoResponse;
+    defer testing.allocator.free(response);
+
+    var rpos: usize = 0;
+    try expectTestResponseHeader(response, 38, 3, correlation_id, &rpos);
+    const resp = try CreateResp.deserialize(testing.allocator, response, &rpos, 3);
+    try testing.expectEqual(response.len, rpos);
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.none)), resp.error_code);
+    try testing.expect(resp.token_id != null);
+    try testing.expectEqual(@as(usize, 36), resp.token_id.?.len);
+    try testing.expect(resp.hmac != null);
+    try testing.expectEqual(@as(usize, delegation_token_hmac_len), resp.hmac.?.len);
+
+    var result: TestDelegationToken = undefined;
+    @memcpy(&result.token_id, resp.token_id.?[0..36]);
+    @memcpy(&result.hmac, resp.hmac.?[0..delegation_token_hmac_len]);
+    return result;
+}
+
+fn freeDeserializedDescribeDelegationTokenResponse(resp: *const generated.describe_delegation_token_response.DescribeDelegationTokenResponse) void {
+    for (resp.tokens) |token| {
+        if (token.renewers.len > 0) testing.allocator.free(token.renewers);
+    }
+    if (resp.tokens.len > 0) testing.allocator.free(resp.tokens);
+}
+
 /// Asserts that appending a trailing byte to a valid request produces *some*
 /// response (not null). Used by handlers whose error response shape lacks a
 /// top-level error_code field (e.g. share-state RPCs that only carry
@@ -26931,6 +28833,71 @@ fn expectApiVersionsResponseMatchesCatalog(response: []const u8, api_version: i1
     }
 
     try testing.expectEqual(response.len, rpos);
+}
+
+test "Broker internal log replay rejects malformed record batch headers" {
+    const rec_batch = protocol.record_batch;
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+
+    var malformed = [_]u8{0} ** rec_batch.BATCH_HEADER_SIZE;
+    malformed[16] = 9;
+
+    try testing.expectError(error.UnsupportedMagic, broker.applyClusterMetadataRecordBatches(&malformed));
+    try testing.expectError(error.UnsupportedMagic, broker.applyConsumerOffsetRecordBatches(&malformed));
+    try testing.expectError(error.UnsupportedMagic, broker.applyTransactionStateRecordBatches(&malformed));
+}
+
+test "Broker internal log replay rejects truncated record payloads" {
+    const rec_batch = protocol.record_batch;
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+
+    var malformed = [_]u8{0} ** rec_batch.BATCH_HEADER_SIZE;
+    malformed[16] = 2;
+    std.mem.writeInt(i32, malformed[8..12], @intCast(rec_batch.BATCH_HEADER_SIZE - 12), .big);
+    std.mem.writeInt(i32, malformed[57..61], 1, .big);
+
+    try testing.expectError(error.BufferUnderflow, broker.applyClusterMetadataRecordBatches(&malformed));
+    try testing.expectError(error.BufferUnderflow, broker.applyConsumerOffsetRecordBatches(&malformed));
+    try testing.expectError(error.BufferUnderflow, broker.applyTransactionStateRecordBatches(&malformed));
+}
+
+test "Broker internal log replay rejects trailing bytes" {
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+
+    try testing.expectError(error.MalformedInternalRecordBatch, broker.applyClusterMetadataRecordBatches("tail"));
+    try testing.expectError(error.MalformedInternalRecordBatch, broker.applyConsumerOffsetRecordBatches("tail"));
+    try testing.expectError(error.MalformedInternalRecordBatch, broker.applyTransactionStateRecordBatches("tail"));
+}
+
+test "Broker.ensureTopic rolls back when partition state creation fails" {
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+
+    const original_store_allocator = broker.store.allocator;
+    var failing_allocator = std.testing.FailingAllocator.init(testing.allocator, .{ .fail_index = 0 });
+    broker.store.allocator = failing_allocator.allocator();
+    defer broker.store.allocator = original_store_allocator;
+
+    try testing.expect(!broker.ensureTopic("auto-partition-create-fail-topic"));
+    try testing.expect(broker.topics.get("auto-partition-create-fail-topic") == null);
+    try testing.expect(broker.partitionState("auto-partition-create-fail-topic", 0) == null);
+}
+
+test "Broker.ensureInternalTopic rolls back when partition state creation fails" {
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+
+    const original_store_allocator = broker.store.allocator;
+    var failing_allocator = std.testing.FailingAllocator.init(testing.allocator, .{ .fail_index = 0 });
+    broker.store.allocator = failing_allocator.allocator();
+    defer broker.store.allocator = original_store_allocator;
+
+    try testing.expectError(error.OutOfMemory, broker.ensureInternalTopic("__internal_partition_create_fail", 1));
+    try testing.expect(broker.topics.get("__internal_partition_create_fail") == null);
+    try testing.expect(broker.partitionState("__internal_partition_create_fail", 0) == null);
 }
 
 test "Broker.handleRequest rejects too-short request" {
@@ -27323,6 +29290,34 @@ test "Broker.handleRequest legacy inter-broker APIs fail closed before body deco
 
         var rpos: usize = 0;
         try expectTestResponseHeader(response.?, probe.key, probe.version, probe.correlation_id, &rpos);
+        try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.unsupported_version)), ser.readI16(response.?, &rpos));
+        try testing.expectEqual(response.?.len, rpos);
+    }
+}
+
+test "Broker.handleRequest generated non-broker APIs fail closed before body decode" {
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+
+    for (api_support.generated_non_broker_request_api_keys) |key| {
+        const schema = api_support.findGeneratedRequest(key).?;
+        const version = schema.max;
+        const correlation_id: i32 = 580_000 + @as(i32, @intCast(key));
+        var buf: [128]u8 = undefined;
+        const req_len = buildTestRequest(
+            &buf,
+            key,
+            version,
+            correlation_id,
+            header_mod.requestHeaderVersion(key, version),
+        );
+
+        const response = broker.handleRequest(buf[0..req_len]);
+        try testing.expect(response != null);
+        defer testing.allocator.free(response.?);
+
+        var rpos: usize = 0;
+        try expectTestResponseHeader(response.?, key, version, correlation_id, &rpos);
         try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.unsupported_version)), ser.readI16(response.?, &rpos));
         try testing.expectEqual(response.?.len, rpos);
     }
@@ -28138,6 +30133,284 @@ test "Broker.handleRequest SaslAuthenticate rejects trailing bytes" {
     try expectTrailingByteRejected(&broker, &buf, pos);
 }
 
+test "Broker.handleRequest SASL OAUTHBEARER returns token lifetime and expires session" {
+    const HandshakeReq = generated.sasl_handshake_request.SaslHandshakeRequest;
+    const HandshakeResp = generated.sasl_handshake_response.SaslHandshakeResponse;
+    const AuthReq = generated.sasl_authenticate_request.SaslAuthenticateRequest;
+    const AuthResp = generated.sasl_authenticate_response.SaslAuthenticateResponse;
+    const MetadataReq = generated.metadata_request.MetadataRequest;
+    const MetadataTopic = MetadataReq.MetadataRequestTopic;
+    const MetadataResp = generated.metadata_response.MetadataResponse;
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+    broker.sasl_enabled = true;
+    broker.sasl_enabled_mechanisms = "OAUTHBEARER";
+
+    const handshake_req = HandshakeReq{ .mechanism = "OAUTHBEARER" };
+    var handshake_buf: [256]u8 = undefined;
+    var handshake_pos = buildTestRequest(&handshake_buf, 17, 1, 3640, header_mod.requestHeaderVersion(17, 1));
+    handshake_req.serialize(&handshake_buf, &handshake_pos, 1);
+
+    const handshake_response = broker.handleRequest(handshake_buf[0..handshake_pos]);
+    try testing.expect(handshake_response != null);
+    defer testing.allocator.free(handshake_response.?);
+
+    var handshake_rpos: usize = 0;
+    try expectTestResponseHeader(handshake_response.?, 17, 1, 3640, &handshake_rpos);
+    const handshake_resp = try HandshakeResp.deserialize(testing.allocator, handshake_response.?, &handshake_rpos, 1);
+    defer if (handshake_resp.mechanisms.len > 0) testing.allocator.free(handshake_resp.mechanisms);
+    try testing.expectEqual(handshake_response.?.len, handshake_rpos);
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.none)), handshake_resp.error_code);
+    try testing.expectEqualStrings("OAUTHBEARER", broker.sasl_mechanisms.get("test-client").?);
+
+    const jwt = "eyJhbGciOiJub25lIn0.eyJzdWIiOiJvYXV0aHVzZXIiLCJleHAiOjk5OTk5OTk5OTl9.";
+    const sasl_token = "n,,\x01auth=Bearer " ++ jwt ++ "\x01\x01";
+    const auth_req = AuthReq{ .auth_bytes = sasl_token };
+    var auth_buf: [512]u8 = undefined;
+    var auth_pos = buildTestRequest(&auth_buf, 36, 2, 3641, header_mod.requestHeaderVersion(36, 2));
+    auth_req.serialize(&auth_buf, &auth_pos, 2);
+
+    const auth_response = broker.handleRequest(auth_buf[0..auth_pos]);
+    try testing.expect(auth_response != null);
+    defer testing.allocator.free(auth_response.?);
+
+    var auth_rpos: usize = 0;
+    try expectTestResponseHeader(auth_response.?, 36, 2, 3641, &auth_rpos);
+    const auth_resp = try AuthResp.deserialize(testing.allocator, auth_response.?, &auth_rpos, 2);
+    try testing.expectEqual(auth_response.?.len, auth_rpos);
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.none)), auth_resp.error_code);
+    try testing.expect(auth_resp.session_lifetime_ms > 0);
+    try testing.expectEqualStrings("User:oauthuser", broker.authenticated_sessions.get("test-client").?);
+    try testing.expect(broker.authenticated_session_expiries.contains("test-client"));
+    try testing.expect(!broker.delegation_token_authenticated_sessions.contains("test-client"));
+
+    if (broker.authenticated_session_expiries.getPtr("test-client")) |expires_at| {
+        expires_at.* = @import("time_compat").milliTimestamp() - 1;
+    } else {
+        return error.TestExpectedOAuthSessionExpiry;
+    }
+
+    const metadata_topics = [_]MetadataTopic{.{
+        .name = "oauth-expired-topic",
+    }};
+    const metadata_req = MetadataReq{
+        .topics = &metadata_topics,
+        .allow_auto_topic_creation = false,
+        .include_topic_authorized_operations = true,
+    };
+    var metadata_buf: [512]u8 = undefined;
+    var metadata_pos = buildTestRequest(&metadata_buf, 3, 12, 3642, header_mod.requestHeaderVersion(3, 12));
+    metadata_req.serialize(&metadata_buf, &metadata_pos, 12);
+
+    const expired_response = broker.handleRequest(metadata_buf[0..metadata_pos]);
+    try testing.expect(expired_response != null);
+    defer testing.allocator.free(expired_response.?);
+
+    var expired_rpos: usize = 0;
+    try expectTestResponseHeader(expired_response.?, 3, 12, 3642, &expired_rpos);
+    const expired_resp = try MetadataResp.deserialize(testing.allocator, expired_response.?, &expired_rpos, 12);
+    defer freeDeserializedMetadataResponse(&expired_resp);
+    try testing.expectEqual(expired_response.?.len, expired_rpos);
+    try testing.expectEqual(@as(usize, 1), expired_resp.topics.len);
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.cluster_authorization_failed)), expired_resp.topics[0].error_code);
+    try testing.expect(broker.authenticated_sessions.get("test-client") == null);
+    try testing.expect(!broker.authenticated_session_expiries.contains("test-client"));
+}
+
+test "Broker.handleRequest SASL SCRAM authenticates delegation token as owner" {
+    const HandshakeReq = generated.sasl_handshake_request.SaslHandshakeRequest;
+    const HandshakeResp = generated.sasl_handshake_response.SaslHandshakeResponse;
+    const AuthReq = generated.sasl_authenticate_request.SaslAuthenticateRequest;
+    const AuthResp = generated.sasl_authenticate_response.SaslAuthenticateResponse;
+    const CreateReq = generated.create_delegation_token_request.CreateDelegationTokenRequest;
+    const CreateResp = generated.create_delegation_token_response.CreateDelegationTokenResponse;
+    const MetadataReq = generated.metadata_request.MetadataRequest;
+    const MetadataTopic = MetadataReq.MetadataRequestTopic;
+    const MetadataResp = generated.metadata_response.MetadataResponse;
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+
+    const issued = try testCreateDelegationTokenForOwner(&broker, "token-owner", 3867);
+
+    broker.sasl_enabled = true;
+    broker.sasl_enabled_mechanisms = "SCRAM-SHA-256";
+
+    const handshake_req = HandshakeReq{ .mechanism = "SCRAM-SHA-256" };
+    var handshake_buf: [256]u8 = undefined;
+    var handshake_pos = buildTestRequest(&handshake_buf, 17, 1, 3667, header_mod.requestHeaderVersion(17, 1));
+    handshake_req.serialize(&handshake_buf, &handshake_pos, 1);
+
+    const handshake_response = broker.handleRequest(handshake_buf[0..handshake_pos]);
+    try testing.expect(handshake_response != null);
+    defer testing.allocator.free(handshake_response.?);
+
+    var handshake_rpos: usize = 0;
+    try expectTestResponseHeader(handshake_response.?, 17, 1, 3667, &handshake_rpos);
+    const handshake_resp = try HandshakeResp.deserialize(testing.allocator, handshake_response.?, &handshake_rpos, 1);
+    defer if (handshake_resp.mechanisms.len > 0) testing.allocator.free(handshake_resp.mechanisms);
+    try testing.expectEqual(handshake_response.?.len, handshake_rpos);
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.none)), handshake_resp.error_code);
+
+    const client_nonce = "delegationTokenNonce";
+    const client_first_bare = try std.fmt.allocPrint(testing.allocator, "n={s},r={s},tokenauth=true", .{ issued.token_id[0..], client_nonce });
+    defer testing.allocator.free(client_first_bare);
+    const client_first = try std.fmt.allocPrint(testing.allocator, "n,,{s}", .{client_first_bare});
+    defer testing.allocator.free(client_first);
+
+    const first_req = AuthReq{ .auth_bytes = client_first };
+    var first_buf: [512]u8 = undefined;
+    var first_pos = buildTestRequest(&first_buf, 36, 2, 3668, header_mod.requestHeaderVersion(36, 2));
+    first_req.serialize(&first_buf, &first_pos, 2);
+
+    const first_response = broker.handleRequest(first_buf[0..first_pos]);
+    try testing.expect(first_response != null);
+    defer testing.allocator.free(first_response.?);
+
+    var first_rpos: usize = 0;
+    try expectTestResponseHeader(first_response.?, 36, 2, 3668, &first_rpos);
+    const first_resp = try AuthResp.deserialize(testing.allocator, first_response.?, &first_rpos, 2);
+    try testing.expectEqual(first_response.?.len, first_rpos);
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.none)), first_resp.error_code);
+    try testing.expect(first_resp.auth_bytes != null);
+    try testing.expect(first_resp.auth_bytes.?.len > 0);
+
+    const password = try testBase64Encode(testing.allocator, &issued.hmac);
+    defer testing.allocator.free(password);
+    const client_final = try testBuildScramClientFinal(testing.allocator, password, client_first_bare, first_resp.auth_bytes.?);
+    defer testing.allocator.free(client_final);
+
+    const final_req = AuthReq{ .auth_bytes = client_final };
+    var final_buf: [512]u8 = undefined;
+    var final_pos = buildTestRequest(&final_buf, 36, 2, 3669, header_mod.requestHeaderVersion(36, 2));
+    final_req.serialize(&final_buf, &final_pos, 2);
+
+    const final_response = broker.handleRequest(final_buf[0..final_pos]);
+    try testing.expect(final_response != null);
+    defer testing.allocator.free(final_response.?);
+
+    var final_rpos: usize = 0;
+    try expectTestResponseHeader(final_response.?, 36, 2, 3669, &final_rpos);
+    const final_resp = try AuthResp.deserialize(testing.allocator, final_response.?, &final_rpos, 2);
+    try testing.expectEqual(final_response.?.len, final_rpos);
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.none)), final_resp.error_code);
+    try testing.expect(final_resp.auth_bytes != null);
+    try testing.expect(std.mem.startsWith(u8, final_resp.auth_bytes.?, "v="));
+    try testing.expect(final_resp.session_lifetime_ms > 0);
+    try testing.expect(final_resp.session_lifetime_ms <= delegation_token_default_lifetime_ms);
+    try testing.expectEqualStrings("User:token-owner", broker.authenticated_sessions.get("test-client").?);
+    try testing.expect(broker.delegation_token_authenticated_sessions.contains("test-client"));
+
+    const denied_req = CreateReq{ .renewers = &.{}, .max_lifetime_ms = 1 };
+    var denied_buf: [256]u8 = undefined;
+    var denied_pos = buildTestRequest(&denied_buf, 38, 3, 3868, header_mod.requestHeaderVersion(38, 3));
+    denied_req.serialize(&denied_buf, &denied_pos, 3);
+
+    const denied_response = broker.handleRequest(denied_buf[0..denied_pos]);
+    try testing.expect(denied_response != null);
+    defer testing.allocator.free(denied_response.?);
+
+    var denied_rpos: usize = 0;
+    try expectTestResponseHeader(denied_response.?, 38, 3, 3868, &denied_rpos);
+    const denied_resp = try CreateResp.deserialize(testing.allocator, denied_response.?, &denied_rpos, 3);
+    try testing.expectEqual(denied_response.?.len, denied_rpos);
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.delegation_token_request_not_allowed)), denied_resp.error_code);
+
+    if (broker.delegation_token_authenticated_sessions.getPtr("test-client")) |expires_at| {
+        expires_at.* = @import("time_compat").milliTimestamp() - 1;
+    } else {
+        return error.TestExpectedDelegationTokenSession;
+    }
+
+    const metadata_topics = [_]MetadataTopic{.{
+        .name = "token-expired-topic",
+    }};
+    const metadata_req = MetadataReq{
+        .topics = &metadata_topics,
+        .allow_auto_topic_creation = false,
+        .include_topic_authorized_operations = true,
+    };
+    var metadata_buf: [512]u8 = undefined;
+    var metadata_pos = buildTestRequest(&metadata_buf, 3, 12, 3870, header_mod.requestHeaderVersion(3, 12));
+    metadata_req.serialize(&metadata_buf, &metadata_pos, 12);
+
+    const expired_response = broker.handleRequest(metadata_buf[0..metadata_pos]);
+    try testing.expect(expired_response != null);
+    defer testing.allocator.free(expired_response.?);
+
+    var expired_rpos: usize = 0;
+    try expectTestResponseHeader(expired_response.?, 3, 12, 3870, &expired_rpos);
+    const expired_resp = try MetadataResp.deserialize(testing.allocator, expired_response.?, &expired_rpos, 12);
+    defer freeDeserializedMetadataResponse(&expired_resp);
+    try testing.expectEqual(expired_response.?.len, expired_rpos);
+    try testing.expectEqual(@as(usize, 1), expired_resp.topics.len);
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.cluster_authorization_failed)), expired_resp.topics[0].error_code);
+    try testing.expect(broker.authenticated_sessions.get("test-client") == null);
+    try testing.expect(!broker.delegation_token_authenticated_sessions.contains("test-client"));
+}
+
+test "Broker.handleRequest SASL SCRAM rejects delegation token bad proof" {
+    const HandshakeReq = generated.sasl_handshake_request.SaslHandshakeRequest;
+    const AuthReq = generated.sasl_authenticate_request.SaslAuthenticateRequest;
+    const AuthResp = generated.sasl_authenticate_response.SaslAuthenticateResponse;
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+
+    const issued = try testCreateDelegationTokenForOwner(&broker, "bad-proof-owner", 3869);
+
+    broker.sasl_enabled = true;
+    broker.sasl_enabled_mechanisms = "SCRAM-SHA-256";
+
+    const handshake_req = HandshakeReq{ .mechanism = "SCRAM-SHA-256" };
+    var handshake_buf: [256]u8 = undefined;
+    var handshake_pos = buildTestRequest(&handshake_buf, 17, 1, 3670, header_mod.requestHeaderVersion(17, 1));
+    handshake_req.serialize(&handshake_buf, &handshake_pos, 1);
+    const handshake_response = broker.handleRequest(handshake_buf[0..handshake_pos]);
+    try testing.expect(handshake_response != null);
+    defer testing.allocator.free(handshake_response.?);
+
+    const client_nonce = "badProofNonce";
+    const client_first_bare = try std.fmt.allocPrint(testing.allocator, "n={s},r={s},tokenauth=true", .{ issued.token_id[0..], client_nonce });
+    defer testing.allocator.free(client_first_bare);
+    const client_first = try std.fmt.allocPrint(testing.allocator, "n,,{s}", .{client_first_bare});
+    defer testing.allocator.free(client_first);
+
+    const first_req = AuthReq{ .auth_bytes = client_first };
+    var first_buf: [512]u8 = undefined;
+    var first_pos = buildTestRequest(&first_buf, 36, 2, 3671, header_mod.requestHeaderVersion(36, 2));
+    first_req.serialize(&first_buf, &first_pos, 2);
+    const first_response = broker.handleRequest(first_buf[0..first_pos]);
+    try testing.expect(first_response != null);
+    defer testing.allocator.free(first_response.?);
+
+    var first_rpos: usize = 0;
+    try expectTestResponseHeader(first_response.?, 36, 2, 3671, &first_rpos);
+    const first_resp = try AuthResp.deserialize(testing.allocator, first_response.?, &first_rpos, 2);
+    try testing.expectEqual(first_response.?.len, first_rpos);
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.none)), first_resp.error_code);
+
+    const client_final = try testBuildScramClientFinal(testing.allocator, "wrong-token-secret", client_first_bare, first_resp.auth_bytes.?);
+    defer testing.allocator.free(client_final);
+
+    const final_req = AuthReq{ .auth_bytes = client_final };
+    var final_buf: [512]u8 = undefined;
+    var final_pos = buildTestRequest(&final_buf, 36, 2, 3672, header_mod.requestHeaderVersion(36, 2));
+    final_req.serialize(&final_buf, &final_pos, 2);
+    const final_response = broker.handleRequest(final_buf[0..final_pos]);
+    try testing.expect(final_response != null);
+    defer testing.allocator.free(final_response.?);
+
+    var final_rpos: usize = 0;
+    try expectTestResponseHeader(final_response.?, 36, 2, 3672, &final_rpos);
+    const final_resp = try AuthResp.deserialize(testing.allocator, final_response.?, &final_rpos, 2);
+    try testing.expectEqual(final_response.?.len, final_rpos);
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.sasl_authentication_failed)), final_resp.error_code);
+    try testing.expect(broker.authenticated_sessions.get("test-client") == null);
+    try testing.expect(!broker.delegation_token_authenticated_sessions.contains("test-client"));
+}
+
 test "Broker.handleRequest Produce v0 returns generated response" {
     const Resp = generated.produce_response.ProduceResponse;
 
@@ -28264,6 +30537,107 @@ test "Broker.handleRequest Produce v9 returns generated flexible response" {
     try testing.expectEqualStrings("produce-v9-topic", resp.responses[0].name.?);
     try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.none)), resp.responses[0].partition_responses[0].error_code);
     try testing.expectEqual(@as(i32, 0), resp.throttle_time_ms);
+}
+
+test "Broker.handleRequest Produce rejects malformed record batch headers" {
+    const Req = generated.produce_request.ProduceRequest;
+    const Topic = Req.TopicProduceData;
+    const Partition = Topic.PartitionProduceData;
+    const Resp = generated.produce_response.ProduceResponse;
+    const rec_batch = protocol.record_batch;
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+
+    var malformed = [_]u8{0} ** rec_batch.BATCH_HEADER_SIZE;
+    malformed[16] = 9;
+
+    const partitions = [_]Partition{.{
+        .index = 0,
+        .records = &malformed,
+    }};
+    const topics = [_]Topic{.{
+        .name = "produce-malformed-batch-topic",
+        .partition_data = &partitions,
+    }};
+    const req = Req{
+        .transactional_id = null,
+        .acks = 1,
+        .timeout_ms = 30000,
+        .topic_data = &topics,
+    };
+
+    var buf: [1024]u8 = undefined;
+    var pos = buildTestRequest(&buf, 0, 9, 320, header_mod.requestHeaderVersion(0, 9));
+    req.serialize(&buf, &pos, 9);
+
+    const response = broker.handleRequest(buf[0..pos]);
+    try testing.expect(response != null);
+    defer testing.allocator.free(response.?);
+
+    var rpos: usize = 0;
+    var response_header = try ResponseHeader.deserialize(testing.allocator, response.?, &rpos, header_mod.responseHeaderVersion(0, 9));
+    defer response_header.deinit(testing.allocator);
+    try testing.expectEqual(@as(i32, 320), response_header.correlation_id);
+
+    const resp = try Resp.deserialize(testing.allocator, response.?, &rpos, 9);
+    defer freeDeserializedProduceResponse(&resp);
+
+    try testing.expectEqual(response.?.len, rpos);
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.corrupt_message)), resp.responses[0].partition_responses[0].error_code);
+    try testing.expectEqual(@as(i64, -1), resp.responses[0].partition_responses[0].base_offset);
+    try testing.expectEqual(@as(u64, 0), broker.partitionState("produce-malformed-batch-topic", 0).?.next_offset);
+}
+
+test "Broker.handleRequest Produce rejects malformed record batch length" {
+    const Req = generated.produce_request.ProduceRequest;
+    const Topic = Req.TopicProduceData;
+    const Partition = Topic.PartitionProduceData;
+    const Resp = generated.produce_response.ProduceResponse;
+    const rec_batch = protocol.record_batch;
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+
+    var malformed = [_]u8{0} ** rec_batch.BATCH_HEADER_SIZE;
+    malformed[16] = 2;
+    std.mem.writeInt(i32, malformed[8..12], 0, .big);
+
+    const partitions = [_]Partition{.{
+        .index = 0,
+        .records = &malformed,
+    }};
+    const topics = [_]Topic{.{
+        .name = "produce-malformed-batch-length-topic",
+        .partition_data = &partitions,
+    }};
+    const req = Req{
+        .transactional_id = null,
+        .acks = 1,
+        .timeout_ms = 30000,
+        .topic_data = &topics,
+    };
+
+    var buf: [1024]u8 = undefined;
+    var pos = buildTestRequest(&buf, 0, 9, 324, header_mod.requestHeaderVersion(0, 9));
+    req.serialize(&buf, &pos, 9);
+
+    const response = broker.handleRequest(buf[0..pos]);
+    try testing.expect(response != null);
+    defer testing.allocator.free(response.?);
+
+    var rpos: usize = 0;
+    var response_header = try ResponseHeader.deserialize(testing.allocator, response.?, &rpos, header_mod.responseHeaderVersion(0, 9));
+    defer response_header.deinit(testing.allocator);
+    try testing.expectEqual(@as(i32, 324), response_header.correlation_id);
+
+    const resp = try Resp.deserialize(testing.allocator, response.?, &rpos, 9);
+    defer freeDeserializedProduceResponse(&resp);
+
+    try testing.expectEqual(response.?.len, rpos);
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.corrupt_message)), resp.responses[0].partition_responses[0].error_code);
+    try testing.expectEqual(@as(i64, -1), resp.responses[0].partition_responses[0].base_offset);
+    try testing.expectEqual(@as(u64, 0), broker.partitionState("produce-malformed-batch-length-topic", 0).?.next_offset);
 }
 
 test "Broker.handleRequest Produce enforces required acks before append" {
@@ -28905,6 +31279,75 @@ test "Broker.handleRequest Produce reports storage error when producer sequence 
     try testing.expect(broker.producer_sequences_dirty);
 }
 
+test "Broker.handleRequest Produce reserves producer sequence state before append" {
+    const Req = generated.produce_request.ProduceRequest;
+    const Topic = Req.TopicProduceData;
+    const Partition = Topic.PartitionProduceData;
+    const Resp = generated.produce_response.ProduceResponse;
+    const rec_batch = protocol.record_batch;
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+
+    var failing_allocator = std.testing.FailingAllocator.init(testing.allocator, .{ .fail_index = 0 });
+    broker.producer_sequences.deinit();
+    broker.producer_sequences = std.AutoHashMap(Broker.ProducerKey, Broker.ProducerSequenceState).init(failing_allocator.allocator());
+
+    const records = [_]rec_batch.Record{.{
+        .offset_delta = 0,
+        .value = "seq-reserve-fail-value",
+    }};
+    const batch = try rec_batch.buildRecordBatch(
+        testing.allocator,
+        0,
+        &records,
+        64011,
+        4,
+        0,
+        12345,
+        12345,
+        0,
+    );
+    defer testing.allocator.free(batch);
+
+    const partitions = [_]Partition{.{
+        .index = 0,
+        .records = batch,
+    }};
+    const topics = [_]Topic{.{
+        .name = "produce-sequence-reserve-fail-topic",
+        .partition_data = &partitions,
+    }};
+    const req = Req{
+        .transactional_id = null,
+        .acks = 1,
+        .timeout_ms = 30000,
+        .topic_data = &topics,
+    };
+
+    var buf: [2048]u8 = undefined;
+    var pos = buildTestRequest(&buf, 0, 9, 323, header_mod.requestHeaderVersion(0, 9));
+    req.serialize(&buf, &pos, 9);
+
+    const response = broker.handleRequest(buf[0..pos]);
+    try testing.expect(response != null);
+    defer testing.allocator.free(response.?);
+
+    var rpos: usize = 0;
+    var response_header = try ResponseHeader.deserialize(testing.allocator, response.?, &rpos, header_mod.responseHeaderVersion(0, 9));
+    defer response_header.deinit(testing.allocator);
+    try testing.expectEqual(@as(i32, 323), response_header.correlation_id);
+
+    const resp = try Resp.deserialize(testing.allocator, response.?, &rpos, 9);
+    defer freeDeserializedProduceResponse(&resp);
+    try testing.expectEqual(response.?.len, rpos);
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.kafka_storage_error)), resp.responses[0].partition_responses[0].error_code);
+    try testing.expectEqual(@as(i64, -1), resp.responses[0].partition_responses[0].base_offset);
+    try testing.expectEqual(@as(u64, 0), broker.partitionState("produce-sequence-reserve-fail-topic", 0).?.next_offset);
+    try testing.expectEqual(@as(u32, 0), broker.producer_sequences.count());
+    try testing.expect(!broker.producer_sequences_dirty);
+}
+
 test "Broker.handleRequest Produce does not advance idempotent sequence on S3 WAL failure" {
     const Req = generated.produce_request.ProduceRequest;
     const Topic = Req.TopicProduceData;
@@ -29165,6 +31608,62 @@ test "Broker.handleRequest InitProducerId epoch bump fences existing idempotent 
     try testing.expectEqual(bumped_epoch, sequence_state.producer_epoch);
     try testing.expectEqual(@as(i32, -1), sequence_state.last_sequence);
     try testing.expect(!broker.producer_sequences_dirty);
+}
+
+test "Broker producer sequence recovery rejects malformed record batch length" {
+    const rec_batch = protocol.record_batch;
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+
+    var malformed = [_]u8{0} ** rec_batch.BATCH_HEADER_SIZE;
+    malformed[16] = 2;
+    std.mem.writeInt(i32, malformed[8..12], 0, .big);
+
+    try testing.expectError(error.MalformedUserRecordBatch, broker.rebuildProducerSequencesFromRecordBatches("produce-sequence-malformed-recovery", 0, &malformed));
+}
+
+test "Broker rebuilds idempotent producer sequence state after short raw records" {
+    const rec_batch = protocol.record_batch;
+    const topic_name = "produce-sequence-mixed-recovery";
+    const producer_id: i64 = 62012;
+    const producer_epoch: i16 = 5;
+    const base_sequence: i32 = 9;
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+    try testing.expect(broker.ensureTopic(topic_name));
+
+    _ = try broker.store.produce(topic_name, 0, "raw");
+
+    const records = [_]rec_batch.Record{.{
+        .offset_delta = 0,
+        .value = "seq-after-raw",
+    }};
+    const batch = try rec_batch.buildRecordBatch(
+        testing.allocator,
+        0,
+        &records,
+        producer_id,
+        producer_epoch,
+        base_sequence,
+        12345,
+        12345,
+        0,
+    );
+    defer testing.allocator.free(batch);
+    _ = try broker.store.produce(topic_name, 0, batch);
+
+    const rebuilt = try broker.rebuildProducerSequencesFromLogs();
+    try testing.expectEqual(@as(usize, 1), rebuilt);
+
+    const key = Broker.ProducerKey{
+        .producer_id = producer_id,
+        .partition_key = PartitionStore.hashPartitionKey(topic_name, 0),
+    };
+    const rebuilt_state = broker.producer_sequences.get(key).?;
+    try testing.expectEqual(@as(i16, producer_epoch), rebuilt_state.producer_epoch);
+    try testing.expectEqual(@as(i32, base_sequence), rebuilt_state.last_sequence);
 }
 
 test "Broker rebuilds idempotent producer sequence state from S3 WAL" {
@@ -31530,6 +34029,53 @@ test "Broker.handleRequest TxnOffsetCommit persists committed offsets" {
     try testing.expectEqualStrings("persisted", restored.?.metadata.?);
 }
 
+test "Broker.open restores persisted offset topics containing colons" {
+    const fs = @import("fs_compat");
+
+    const tmp_dir = "/tmp/zmq-offset-colon-topic-restore-test";
+    fs.deleteTreeAbsolute(tmp_dir) catch {};
+    try fs.makeDirAbsolute(tmp_dir);
+    defer fs.deleteTreeAbsolute(tmp_dir) catch {};
+
+    {
+        var broker = Broker.initWithConfig(testing.allocator, 1, 9092, .{ .data_dir = tmp_dir });
+        defer broker.deinit();
+        try broker.open();
+        try broker.groups.commitOffsetWithMetadata("colon-group", "topic:with:colons", 3, 77, 5, "colon-meta");
+        try broker.persistOffsetsDurably();
+    }
+
+    var restarted = Broker.initWithConfig(testing.allocator, 1, 9092, .{ .data_dir = tmp_dir });
+    defer restarted.deinit();
+    try restarted.open();
+
+    const restored = try restarted.groups.fetchOffsetRecord("colon-group", "topic:with:colons", 3);
+    try testing.expect(restored != null);
+    try testing.expectEqual(@as(i64, 77), restored.?.offset);
+    try testing.expectEqual(@as(i32, 5), restored.?.leader_epoch);
+    try testing.expectEqualStrings("colon-meta", restored.?.metadata.?);
+}
+
+test "Broker.open rejects malformed persisted offset keys" {
+    const fs = @import("fs_compat");
+
+    const tmp_dir = "/tmp/zmq-offset-malformed-key-restore-test";
+    fs.deleteTreeAbsolute(tmp_dir) catch {};
+    try fs.makeDirAbsolute(tmp_dir);
+    defer fs.deleteTreeAbsolute(tmp_dir) catch {};
+
+    const offsets_path = try std.fmt.allocPrint(testing.allocator, "{s}/offsets.meta", .{tmp_dir});
+    defer testing.allocator.free(offsets_path);
+    const file = try fs.createFileAbsolute(offsets_path, .{ .truncate = true });
+    defer file.close();
+    try file.writeAll("group:topic:not-a-partition\t7\t-1\t0\t\n");
+    try file.sync();
+
+    var broker = Broker.initWithConfig(testing.allocator, 1, 9092, .{ .data_dir = tmp_dir });
+    defer broker.deinit();
+    try testing.expectError(error.InvalidOffsetSnapshot, broker.open());
+}
+
 test "Broker.handleRequest TxnOffsetCommit rolls back local offset persistence failures" {
     const fs = @import("fs_compat");
     const Req = generated.txn_offset_commit_request.TxnOffsetCommitRequest;
@@ -33652,6 +36198,759 @@ test "Broker.handleRequest CreatePartitions rejects trailing bytes" {
     req.serialize(&buf, &pos, 2);
 
     try expectTrailingByteRejected(&broker, &buf, pos);
+}
+
+test "Broker.handleRequest delegation token APIs create describe renew and expire local tokens" {
+    const CreateReq = generated.create_delegation_token_request.CreateDelegationTokenRequest;
+    const CreateResp = generated.create_delegation_token_response.CreateDelegationTokenResponse;
+    const RenewReq = generated.renew_delegation_token_request.RenewDelegationTokenRequest;
+    const RenewResp = generated.renew_delegation_token_response.RenewDelegationTokenResponse;
+    const ExpireReq = generated.expire_delegation_token_request.ExpireDelegationTokenRequest;
+    const ExpireResp = generated.expire_delegation_token_response.ExpireDelegationTokenResponse;
+    const DescribeReq = generated.describe_delegation_token_request.DescribeDelegationTokenRequest;
+    const DescribeResp = generated.describe_delegation_token_response.DescribeDelegationTokenResponse;
+    const none = @as(i16, @intFromEnum(ErrorCode.none));
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+
+    var issued_hmac: [delegation_token_hmac_len]u8 = undefined;
+    var issued_token_id: [36]u8 = undefined;
+    var max_timestamp_ms: i64 = 0;
+
+    {
+        const renewers = [_]CreateReq.CreatableRenewers{.{
+            .principal_type = "User",
+            .principal_name = "renewer",
+        }};
+        const req = CreateReq{
+            .owner_principal_type = "User",
+            .owner_principal_name = "owner",
+            .renewers = &renewers,
+            .max_lifetime_ms = 60000,
+        };
+
+        var buf: [512]u8 = undefined;
+        var pos = buildTestRequest(&buf, 38, 3, 3803, header_mod.requestHeaderVersion(38, 3));
+        req.serialize(&buf, &pos, 3);
+
+        const response = broker.handleRequest(buf[0..pos]);
+        try testing.expect(response != null);
+        defer testing.allocator.free(response.?);
+
+        var rpos: usize = 0;
+        var response_header = try ResponseHeader.deserialize(testing.allocator, response.?, &rpos, header_mod.responseHeaderVersion(38, 3));
+        defer response_header.deinit(testing.allocator);
+        try testing.expectEqual(@as(i32, 3803), response_header.correlation_id);
+
+        const resp = try CreateResp.deserialize(testing.allocator, response.?, &rpos, 3);
+        try testing.expectEqual(response.?.len, rpos);
+        try testing.expectEqual(none, resp.error_code);
+        try testing.expectEqual(@as(i32, 0), resp.throttle_time_ms);
+        try testing.expectEqualStrings("User", resp.principal_type.?);
+        try testing.expectEqualStrings("owner", resp.principal_name.?);
+        try testing.expectEqualStrings("User", resp.token_requester_principal_type.?);
+        try testing.expectEqualStrings("test-client", resp.token_requester_principal_name.?);
+        try testing.expect(resp.issue_timestamp_ms > 0);
+        try testing.expect(resp.expiry_timestamp_ms >= resp.issue_timestamp_ms);
+        try testing.expectEqual(resp.expiry_timestamp_ms, resp.max_timestamp_ms);
+        try testing.expect(resp.token_id != null);
+        try testing.expectEqual(@as(usize, 36), resp.token_id.?.len);
+        @memcpy(&issued_token_id, resp.token_id.?[0..36]);
+        try testing.expect(resp.hmac != null);
+        try testing.expectEqual(@as(usize, delegation_token_hmac_len), resp.hmac.?.len);
+        @memcpy(&issued_hmac, resp.hmac.?[0..delegation_token_hmac_len]);
+        max_timestamp_ms = resp.max_timestamp_ms;
+    }
+
+    {
+        const req = DescribeReq{ .owners = null };
+
+        var buf: [512]u8 = undefined;
+        var pos = buildTestRequest(&buf, 41, 3, 4103, header_mod.requestHeaderVersion(41, 3));
+        req.serialize(&buf, &pos, 3);
+
+        const response = broker.handleRequest(buf[0..pos]);
+        try testing.expect(response != null);
+        defer testing.allocator.free(response.?);
+
+        var rpos: usize = 0;
+        var response_header = try ResponseHeader.deserialize(testing.allocator, response.?, &rpos, header_mod.responseHeaderVersion(41, 3));
+        defer response_header.deinit(testing.allocator);
+        try testing.expectEqual(@as(i32, 4103), response_header.correlation_id);
+
+        const resp = try DescribeResp.deserialize(testing.allocator, response.?, &rpos, 3);
+        defer freeDeserializedDescribeDelegationTokenResponse(&resp);
+        try testing.expectEqual(response.?.len, rpos);
+        try testing.expectEqual(none, resp.error_code);
+        try testing.expectEqual(@as(usize, 1), resp.tokens.len);
+        try testing.expectEqualStrings("User", resp.tokens[0].principal_type.?);
+        try testing.expectEqualStrings("owner", resp.tokens[0].principal_name.?);
+        try testing.expectEqualStrings("User", resp.tokens[0].token_requester_principal_type.?);
+        try testing.expectEqualStrings("test-client", resp.tokens[0].token_requester_principal_name.?);
+        try testing.expectEqualSlices(u8, &issued_token_id, resp.tokens[0].token_id.?);
+        try testing.expectEqualSlices(u8, &issued_hmac, resp.tokens[0].hmac.?);
+        try testing.expectEqual(@as(usize, 1), resp.tokens[0].renewers.len);
+        try testing.expectEqualStrings("User", resp.tokens[0].renewers[0].principal_type.?);
+        try testing.expectEqualStrings("renewer", resp.tokens[0].renewers[0].principal_name.?);
+    }
+
+    {
+        const owners = [_]DescribeReq.DescribeDelegationTokenOwner{.{
+            .principal_type = "User",
+            .principal_name = "owner",
+        }};
+        const req = DescribeReq{ .owners = &owners };
+
+        var buf: [512]u8 = undefined;
+        var pos = buildTestRequest(&buf, 41, 3, 4113, header_mod.requestHeaderVersion(41, 3));
+        req.serialize(&buf, &pos, 3);
+
+        const response = broker.handleRequest(buf[0..pos]);
+        try testing.expect(response != null);
+        defer testing.allocator.free(response.?);
+
+        var rpos: usize = 0;
+        var response_header = try ResponseHeader.deserialize(testing.allocator, response.?, &rpos, header_mod.responseHeaderVersion(41, 3));
+        defer response_header.deinit(testing.allocator);
+        try testing.expectEqual(@as(i32, 4113), response_header.correlation_id);
+
+        const resp = try DescribeResp.deserialize(testing.allocator, response.?, &rpos, 3);
+        defer freeDeserializedDescribeDelegationTokenResponse(&resp);
+        try testing.expectEqual(response.?.len, rpos);
+        try testing.expectEqual(none, resp.error_code);
+        try testing.expectEqual(@as(usize, 1), resp.tokens.len);
+    }
+
+    {
+        const owners = [_]DescribeReq.DescribeDelegationTokenOwner{};
+        const req = DescribeReq{ .owners = &owners };
+
+        var buf: [256]u8 = undefined;
+        var pos = buildTestRequest(&buf, 41, 3, 4123, header_mod.requestHeaderVersion(41, 3));
+        req.serialize(&buf, &pos, 3);
+
+        const response = broker.handleRequest(buf[0..pos]);
+        try testing.expect(response != null);
+        defer testing.allocator.free(response.?);
+
+        var rpos: usize = 0;
+        var response_header = try ResponseHeader.deserialize(testing.allocator, response.?, &rpos, header_mod.responseHeaderVersion(41, 3));
+        defer response_header.deinit(testing.allocator);
+        try testing.expectEqual(@as(i32, 4123), response_header.correlation_id);
+
+        const resp = try DescribeResp.deserialize(testing.allocator, response.?, &rpos, 3);
+        defer freeDeserializedDescribeDelegationTokenResponse(&resp);
+        try testing.expectEqual(response.?.len, rpos);
+        try testing.expectEqual(none, resp.error_code);
+        try testing.expectEqual(@as(usize, 0), resp.tokens.len);
+    }
+
+    {
+        const owners = [_]DescribeReq.DescribeDelegationTokenOwner{.{
+            .principal_type = "User",
+            .principal_name = "missing-owner",
+        }};
+        const req = DescribeReq{ .owners = &owners };
+
+        var buf: [256]u8 = undefined;
+        var pos = buildTestRequest(&buf, 41, 3, 4133, header_mod.requestHeaderVersion(41, 3));
+        req.serialize(&buf, &pos, 3);
+
+        const response = broker.handleRequest(buf[0..pos]);
+        try testing.expect(response != null);
+        defer testing.allocator.free(response.?);
+
+        var rpos: usize = 0;
+        var response_header = try ResponseHeader.deserialize(testing.allocator, response.?, &rpos, header_mod.responseHeaderVersion(41, 3));
+        defer response_header.deinit(testing.allocator);
+        try testing.expectEqual(@as(i32, 4133), response_header.correlation_id);
+
+        const resp = try DescribeResp.deserialize(testing.allocator, response.?, &rpos, 3);
+        defer freeDeserializedDescribeDelegationTokenResponse(&resp);
+        try testing.expectEqual(response.?.len, rpos);
+        try testing.expectEqual(none, resp.error_code);
+        try testing.expectEqual(@as(usize, 0), resp.tokens.len);
+    }
+
+    {
+        const req = RenewReq{
+            .hmac = &issued_hmac,
+            .renew_period_ms = delegation_token_default_lifetime_ms,
+        };
+
+        var buf: [256]u8 = undefined;
+        var pos = buildTestRequest(&buf, 39, 2, 3902, header_mod.requestHeaderVersion(39, 2));
+        req.serialize(&buf, &pos, 2);
+
+        const response = broker.handleRequest(buf[0..pos]);
+        try testing.expect(response != null);
+        defer testing.allocator.free(response.?);
+
+        var rpos: usize = 0;
+        var response_header = try ResponseHeader.deserialize(testing.allocator, response.?, &rpos, header_mod.responseHeaderVersion(39, 2));
+        defer response_header.deinit(testing.allocator);
+        try testing.expectEqual(@as(i32, 3902), response_header.correlation_id);
+
+        const resp = try RenewResp.deserialize(testing.allocator, response.?, &rpos, 2);
+        try testing.expectEqual(response.?.len, rpos);
+        try testing.expectEqual(none, resp.error_code);
+        try testing.expectEqual(max_timestamp_ms, resp.expiry_timestamp_ms);
+    }
+
+    {
+        const req = ExpireReq{
+            .hmac = &issued_hmac,
+            .expiry_time_period_ms = 0,
+        };
+
+        var buf: [256]u8 = undefined;
+        var pos = buildTestRequest(&buf, 40, 2, 4002, header_mod.requestHeaderVersion(40, 2));
+        req.serialize(&buf, &pos, 2);
+
+        const response = broker.handleRequest(buf[0..pos]);
+        try testing.expect(response != null);
+        defer testing.allocator.free(response.?);
+
+        var rpos: usize = 0;
+        var response_header = try ResponseHeader.deserialize(testing.allocator, response.?, &rpos, header_mod.responseHeaderVersion(40, 2));
+        defer response_header.deinit(testing.allocator);
+        try testing.expectEqual(@as(i32, 4002), response_header.correlation_id);
+
+        const resp = try ExpireResp.deserialize(testing.allocator, response.?, &rpos, 2);
+        try testing.expectEqual(response.?.len, rpos);
+        try testing.expectEqual(none, resp.error_code);
+        try testing.expect(resp.expiry_timestamp_ms > 0);
+    }
+
+    {
+        const req = DescribeReq{ .owners = null };
+
+        var buf: [256]u8 = undefined;
+        var pos = buildTestRequest(&buf, 41, 3, 4143, header_mod.requestHeaderVersion(41, 3));
+        req.serialize(&buf, &pos, 3);
+
+        const response = broker.handleRequest(buf[0..pos]);
+        try testing.expect(response != null);
+        defer testing.allocator.free(response.?);
+
+        var rpos: usize = 0;
+        var response_header = try ResponseHeader.deserialize(testing.allocator, response.?, &rpos, header_mod.responseHeaderVersion(41, 3));
+        defer response_header.deinit(testing.allocator);
+        try testing.expectEqual(@as(i32, 4143), response_header.correlation_id);
+
+        const resp = try DescribeResp.deserialize(testing.allocator, response.?, &rpos, 3);
+        defer freeDeserializedDescribeDelegationTokenResponse(&resp);
+        try testing.expectEqual(response.?.len, rpos);
+        try testing.expectEqual(none, resp.error_code);
+        try testing.expectEqual(@as(usize, 0), resp.tokens.len);
+    }
+}
+
+test "Broker.handleRequest delegation token APIs report missing HMACs" {
+    const RenewReq = generated.renew_delegation_token_request.RenewDelegationTokenRequest;
+    const RenewResp = generated.renew_delegation_token_response.RenewDelegationTokenResponse;
+    const ExpireReq = generated.expire_delegation_token_request.ExpireDelegationTokenRequest;
+    const ExpireResp = generated.expire_delegation_token_response.ExpireDelegationTokenResponse;
+    const not_found = @as(i16, @intFromEnum(ErrorCode.delegation_token_not_found));
+    const missing_hmac = [_]u8{0xa5} ** delegation_token_hmac_len;
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+
+    {
+        const req = RenewReq{
+            .hmac = &missing_hmac,
+            .renew_period_ms = 60000,
+        };
+
+        var buf: [256]u8 = undefined;
+        var pos = buildTestRequest(&buf, 39, 2, 3912, header_mod.requestHeaderVersion(39, 2));
+        req.serialize(&buf, &pos, 2);
+
+        const response = broker.handleRequest(buf[0..pos]);
+        try testing.expect(response != null);
+        defer testing.allocator.free(response.?);
+
+        var rpos: usize = 0;
+        var response_header = try ResponseHeader.deserialize(testing.allocator, response.?, &rpos, header_mod.responseHeaderVersion(39, 2));
+        defer response_header.deinit(testing.allocator);
+        try testing.expectEqual(@as(i32, 3912), response_header.correlation_id);
+
+        const resp = try RenewResp.deserialize(testing.allocator, response.?, &rpos, 2);
+        try testing.expectEqual(response.?.len, rpos);
+        try testing.expectEqual(not_found, resp.error_code);
+        try testing.expectEqual(@as(i64, 0), resp.expiry_timestamp_ms);
+    }
+
+    {
+        const req = ExpireReq{
+            .hmac = &missing_hmac,
+            .expiry_time_period_ms = 0,
+        };
+
+        var buf: [256]u8 = undefined;
+        var pos = buildTestRequest(&buf, 40, 2, 4012, header_mod.requestHeaderVersion(40, 2));
+        req.serialize(&buf, &pos, 2);
+
+        const response = broker.handleRequest(buf[0..pos]);
+        try testing.expect(response != null);
+        defer testing.allocator.free(response.?);
+
+        var rpos: usize = 0;
+        var response_header = try ResponseHeader.deserialize(testing.allocator, response.?, &rpos, header_mod.responseHeaderVersion(40, 2));
+        defer response_header.deinit(testing.allocator);
+        try testing.expectEqual(@as(i32, 4012), response_header.correlation_id);
+
+        const resp = try ExpireResp.deserialize(testing.allocator, response.?, &rpos, 2);
+        try testing.expectEqual(response.?.len, rpos);
+        try testing.expectEqual(not_found, resp.error_code);
+        try testing.expectEqual(@as(i64, 0), resp.expiry_timestamp_ms);
+    }
+}
+
+test "Broker.handleRequest delegation tokens survive local broker restart" {
+    const fs = @import("fs_compat");
+    const CreateReq = generated.create_delegation_token_request.CreateDelegationTokenRequest;
+    const CreateResp = generated.create_delegation_token_response.CreateDelegationTokenResponse;
+    const DescribeReq = generated.describe_delegation_token_request.DescribeDelegationTokenRequest;
+    const DescribeResp = generated.describe_delegation_token_response.DescribeDelegationTokenResponse;
+    const none = @as(i16, @intFromEnum(ErrorCode.none));
+
+    const tmp_dir = "/tmp/zmq-delegation-token-persist-test";
+    fs.deleteTreeAbsolute(tmp_dir) catch {};
+    try fs.makeDirAbsolute(tmp_dir);
+    defer fs.deleteTreeAbsolute(tmp_dir) catch {};
+
+    var issued_hmac: [delegation_token_hmac_len]u8 = undefined;
+
+    {
+        var broker = Broker.initWithConfig(testing.allocator, 1, 9092, .{ .data_dir = tmp_dir });
+        defer broker.deinit();
+        try broker.open();
+
+        const req = CreateReq{
+            .owner_principal_type = "User",
+            .owner_principal_name = "persisted-owner",
+            .renewers = &.{},
+            .max_lifetime_ms = delegation_token_default_lifetime_ms * 2,
+        };
+
+        var buf: [512]u8 = undefined;
+        var pos = buildTestRequest(&buf, 38, 3, 3863, header_mod.requestHeaderVersion(38, 3));
+        req.serialize(&buf, &pos, 3);
+
+        const response = broker.handleRequest(buf[0..pos]);
+        try testing.expect(response != null);
+        defer testing.allocator.free(response.?);
+
+        var rpos: usize = 0;
+        try expectTestResponseHeader(response.?, 38, 3, 3863, &rpos);
+        const resp = try CreateResp.deserialize(testing.allocator, response.?, &rpos, 3);
+        try testing.expectEqual(response.?.len, rpos);
+        try testing.expectEqual(none, resp.error_code);
+        try testing.expect(resp.hmac != null);
+        try testing.expectEqual(@as(usize, delegation_token_hmac_len), resp.hmac.?.len);
+        @memcpy(&issued_hmac, resp.hmac.?[0..delegation_token_hmac_len]);
+    }
+
+    {
+        var broker = Broker.initWithConfig(testing.allocator, 1, 9092, .{ .data_dir = tmp_dir });
+        defer broker.deinit();
+        try broker.open();
+
+        const req = DescribeReq{ .owners = null };
+        var buf: [256]u8 = undefined;
+        var pos = buildTestRequest(&buf, 41, 3, 4163, header_mod.requestHeaderVersion(41, 3));
+        req.serialize(&buf, &pos, 3);
+
+        const response = broker.handleRequest(buf[0..pos]);
+        try testing.expect(response != null);
+        defer testing.allocator.free(response.?);
+
+        var rpos: usize = 0;
+        try expectTestResponseHeader(response.?, 41, 3, 4163, &rpos);
+        const resp = try DescribeResp.deserialize(testing.allocator, response.?, &rpos, 3);
+        defer freeDeserializedDescribeDelegationTokenResponse(&resp);
+        try testing.expectEqual(response.?.len, rpos);
+        try testing.expectEqual(none, resp.error_code);
+        try testing.expectEqual(@as(usize, 1), resp.tokens.len);
+        try testing.expectEqualStrings("persisted-owner", resp.tokens[0].principal_name.?);
+        try testing.expectEqualSlices(u8, &issued_hmac, resp.tokens[0].hmac.?);
+    }
+}
+
+test "Broker restores delegation tokens from S3 cluster metadata log" {
+    const CreateReq = generated.create_delegation_token_request.CreateDelegationTokenRequest;
+    const CreateResp = generated.create_delegation_token_response.CreateDelegationTokenResponse;
+    const DescribeReq = generated.describe_delegation_token_request.DescribeDelegationTokenRequest;
+    const DescribeResp = generated.describe_delegation_token_response.DescribeDelegationTokenResponse;
+    const none = @as(i16, @intFromEnum(ErrorCode.none));
+
+    var mock_s3 = storage.MockS3.init(testing.allocator);
+    defer mock_s3.deinit();
+    const s3_storage = storage.S3Storage.initMock(testing.allocator, &mock_s3);
+
+    var issued_hmac: [delegation_token_hmac_len]u8 = undefined;
+
+    {
+        var broker = Broker.init(testing.allocator, 1, 9092);
+        defer broker.deinit();
+        broker.store.s3_wal_mode = true;
+        broker.store.s3_storage = s3_storage;
+        broker.store.s3_wal_batcher = storage.wal.S3WalBatcher.init(testing.allocator);
+
+        try broker.open();
+        const object_count_before = mock_s3.objectCount();
+
+        const renewers = [_]CreateReq.CreatableRenewers{.{
+            .principal_type = "User",
+            .principal_name = "s3-renewer",
+        }};
+        const req = CreateReq{
+            .owner_principal_type = "User",
+            .owner_principal_name = "s3-owner",
+            .renewers = &renewers,
+            .max_lifetime_ms = delegation_token_default_lifetime_ms * 2,
+        };
+
+        var buf: [512]u8 = undefined;
+        var pos = buildTestRequest(&buf, 38, 3, 3864, header_mod.requestHeaderVersion(38, 3));
+        req.serialize(&buf, &pos, 3);
+
+        const response = broker.handleRequest(buf[0..pos]);
+        try testing.expect(response != null);
+        defer testing.allocator.free(response.?);
+
+        var rpos: usize = 0;
+        try expectTestResponseHeader(response.?, 38, 3, 3864, &rpos);
+        const resp = try CreateResp.deserialize(testing.allocator, response.?, &rpos, 3);
+        try testing.expectEqual(response.?.len, rpos);
+        try testing.expectEqual(none, resp.error_code);
+        try testing.expect(resp.hmac != null);
+        try testing.expectEqual(@as(usize, delegation_token_hmac_len), resp.hmac.?.len);
+        @memcpy(&issued_hmac, resp.hmac.?[0..delegation_token_hmac_len]);
+        try testing.expect(mock_s3.objectCount() > object_count_before);
+    }
+
+    {
+        var broker = Broker.init(testing.allocator, 1, 9092);
+        defer broker.deinit();
+        broker.store.s3_wal_mode = true;
+        broker.store.s3_storage = s3_storage;
+        broker.store.s3_wal_batcher = storage.wal.S3WalBatcher.init(testing.allocator);
+
+        try broker.open();
+
+        const req = DescribeReq{ .owners = null };
+        var buf: [256]u8 = undefined;
+        var pos = buildTestRequest(&buf, 41, 3, 4164, header_mod.requestHeaderVersion(41, 3));
+        req.serialize(&buf, &pos, 3);
+
+        const response = broker.handleRequest(buf[0..pos]);
+        try testing.expect(response != null);
+        defer testing.allocator.free(response.?);
+
+        var rpos: usize = 0;
+        try expectTestResponseHeader(response.?, 41, 3, 4164, &rpos);
+        const resp = try DescribeResp.deserialize(testing.allocator, response.?, &rpos, 3);
+        defer freeDeserializedDescribeDelegationTokenResponse(&resp);
+        try testing.expectEqual(response.?.len, rpos);
+        try testing.expectEqual(none, resp.error_code);
+        try testing.expectEqual(@as(usize, 1), resp.tokens.len);
+        try testing.expectEqualStrings("s3-owner", resp.tokens[0].principal_name.?);
+        try testing.expectEqualSlices(u8, &issued_hmac, resp.tokens[0].hmac.?);
+        try testing.expectEqual(@as(usize, 1), resp.tokens[0].renewers.len);
+        try testing.expectEqualStrings("s3-renewer", resp.tokens[0].renewers[0].principal_name.?);
+    }
+}
+
+test "Broker CreateDelegationToken fails closed when delegation token snapshot S3 WAL write fails" {
+    const Req = generated.create_delegation_token_request.CreateDelegationTokenRequest;
+    const Resp = generated.create_delegation_token_response.CreateDelegationTokenResponse;
+
+    var mock_s3 = storage.MockS3.init(testing.allocator);
+    defer mock_s3.deinit();
+    const s3_storage = storage.S3Storage.initMock(testing.allocator, &mock_s3);
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+    broker.store.s3_wal_mode = true;
+    broker.store.s3_storage = s3_storage;
+    broker.store.s3_wal_batcher = storage.wal.S3WalBatcher.init(testing.allocator);
+
+    try broker.open();
+    const object_count_before = mock_s3.objectCount();
+    mock_s3.failNextPutObjects(3);
+
+    const req = Req{
+        .owner_principal_type = "User",
+        .owner_principal_name = "s3-create-fail-owner",
+        .renewers = &.{},
+        .max_lifetime_ms = delegation_token_default_lifetime_ms,
+    };
+
+    var buf: [512]u8 = undefined;
+    var pos = buildTestRequest(&buf, 38, 3, 3865, header_mod.requestHeaderVersion(38, 3));
+    req.serialize(&buf, &pos, 3);
+
+    const response = broker.handleRequest(buf[0..pos]);
+    try testing.expect(response != null);
+    defer testing.allocator.free(response.?);
+
+    var rpos: usize = 0;
+    try expectTestResponseHeader(response.?, 38, 3, 3865, &rpos);
+    const resp = try Resp.deserialize(testing.allocator, response.?, &rpos, 3);
+    try testing.expectEqual(response.?.len, rpos);
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.kafka_storage_error)), resp.error_code);
+    try testing.expectEqual(@as(usize, 0), broker.delegation_tokens.count());
+    try testing.expectEqual(object_count_before, mock_s3.objectCount());
+}
+
+test "Broker RenewDelegationToken rolls back when delegation token snapshot S3 WAL write fails" {
+    const CreateReq = generated.create_delegation_token_request.CreateDelegationTokenRequest;
+    const CreateResp = generated.create_delegation_token_response.CreateDelegationTokenResponse;
+    const RenewReq = generated.renew_delegation_token_request.RenewDelegationTokenRequest;
+    const RenewResp = generated.renew_delegation_token_response.RenewDelegationTokenResponse;
+    const DescribeReq = generated.describe_delegation_token_request.DescribeDelegationTokenRequest;
+    const DescribeResp = generated.describe_delegation_token_response.DescribeDelegationTokenResponse;
+
+    var mock_s3 = storage.MockS3.init(testing.allocator);
+    defer mock_s3.deinit();
+    const s3_storage = storage.S3Storage.initMock(testing.allocator, &mock_s3);
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+    broker.store.s3_wal_mode = true;
+    broker.store.s3_storage = s3_storage;
+    broker.store.s3_wal_batcher = storage.wal.S3WalBatcher.init(testing.allocator);
+
+    try broker.open();
+
+    var issued_hmac: [delegation_token_hmac_len]u8 = undefined;
+    var original_expiry_timestamp_ms: i64 = 0;
+    {
+        const create_req = CreateReq{
+            .owner_principal_type = "User",
+            .owner_principal_name = "s3-renew-fail-owner",
+            .renewers = &.{},
+            .max_lifetime_ms = delegation_token_default_lifetime_ms * 2,
+        };
+
+        var create_buf: [512]u8 = undefined;
+        var create_pos = buildTestRequest(&create_buf, 38, 3, 3866, header_mod.requestHeaderVersion(38, 3));
+        create_req.serialize(&create_buf, &create_pos, 3);
+
+        const create_response = broker.handleRequest(create_buf[0..create_pos]);
+        try testing.expect(create_response != null);
+        defer testing.allocator.free(create_response.?);
+
+        var create_rpos: usize = 0;
+        try expectTestResponseHeader(create_response.?, 38, 3, 3866, &create_rpos);
+        const create_resp = try CreateResp.deserialize(testing.allocator, create_response.?, &create_rpos, 3);
+        try testing.expectEqual(create_response.?.len, create_rpos);
+        try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.none)), create_resp.error_code);
+        try testing.expect(create_resp.hmac != null);
+        @memcpy(&issued_hmac, create_resp.hmac.?[0..delegation_token_hmac_len]);
+        original_expiry_timestamp_ms = create_resp.expiry_timestamp_ms;
+    }
+
+    const object_count_before = mock_s3.objectCount();
+    mock_s3.failNextPutObjects(3);
+
+    const renew_req = RenewReq{
+        .hmac = &issued_hmac,
+        .renew_period_ms = 1,
+    };
+    var renew_buf: [256]u8 = undefined;
+    var renew_pos = buildTestRequest(&renew_buf, 39, 2, 3966, header_mod.requestHeaderVersion(39, 2));
+    renew_req.serialize(&renew_buf, &renew_pos, 2);
+
+    const renew_response = broker.handleRequest(renew_buf[0..renew_pos]);
+    try testing.expect(renew_response != null);
+    defer testing.allocator.free(renew_response.?);
+
+    var renew_rpos: usize = 0;
+    try expectTestResponseHeader(renew_response.?, 39, 2, 3966, &renew_rpos);
+    const renew_resp = try RenewResp.deserialize(testing.allocator, renew_response.?, &renew_rpos, 2);
+    try testing.expectEqual(renew_response.?.len, renew_rpos);
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.kafka_storage_error)), renew_resp.error_code);
+    try testing.expectEqual(original_expiry_timestamp_ms, renew_resp.expiry_timestamp_ms);
+    try testing.expectEqual(object_count_before, mock_s3.objectCount());
+
+    const describe_req = DescribeReq{ .owners = null };
+    var describe_buf: [256]u8 = undefined;
+    var describe_pos = buildTestRequest(&describe_buf, 41, 3, 4166, header_mod.requestHeaderVersion(41, 3));
+    describe_req.serialize(&describe_buf, &describe_pos, 3);
+
+    const describe_response = broker.handleRequest(describe_buf[0..describe_pos]);
+    try testing.expect(describe_response != null);
+    defer testing.allocator.free(describe_response.?);
+
+    var describe_rpos: usize = 0;
+    try expectTestResponseHeader(describe_response.?, 41, 3, 4166, &describe_rpos);
+    const describe_resp = try DescribeResp.deserialize(testing.allocator, describe_response.?, &describe_rpos, 3);
+    defer freeDeserializedDescribeDelegationTokenResponse(&describe_resp);
+    try testing.expectEqual(describe_response.?.len, describe_rpos);
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.none)), describe_resp.error_code);
+    try testing.expectEqual(@as(usize, 1), describe_resp.tokens.len);
+    try testing.expectEqual(original_expiry_timestamp_ms, describe_resp.tokens[0].expiry_timestamp);
+}
+
+test "Broker.handleRequest delegation token APIs authorization denial uses generated responses" {
+    const CreateReq = generated.create_delegation_token_request.CreateDelegationTokenRequest;
+    const CreateResp = generated.create_delegation_token_response.CreateDelegationTokenResponse;
+    const RenewReq = generated.renew_delegation_token_request.RenewDelegationTokenRequest;
+    const RenewResp = generated.renew_delegation_token_response.RenewDelegationTokenResponse;
+    const ExpireReq = generated.expire_delegation_token_request.ExpireDelegationTokenRequest;
+    const ExpireResp = generated.expire_delegation_token_response.ExpireDelegationTokenResponse;
+    const DescribeReq = generated.describe_delegation_token_request.DescribeDelegationTokenRequest;
+    const DescribeResp = generated.describe_delegation_token_response.DescribeDelegationTokenResponse;
+    const denied = @as(i16, @intFromEnum(ErrorCode.cluster_authorization_failed));
+    const hmac = [_]u8{ 5, 6, 7, 8 };
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+    try broker.authorizer.addAcl("other-client", .cluster, "*", .literal, .all, .allow, "*");
+
+    {
+        const req = CreateReq{ .renewers = &.{}, .max_lifetime_ms = 1 };
+        var buf: [256]u8 = undefined;
+        var pos = buildTestRequest(&buf, 38, 3, 3813, header_mod.requestHeaderVersion(38, 3));
+        req.serialize(&buf, &pos, 3);
+
+        const response = broker.handleRequest(buf[0..pos]);
+        try testing.expect(response != null);
+        defer testing.allocator.free(response.?);
+
+        var rpos: usize = 0;
+        var response_header = try ResponseHeader.deserialize(testing.allocator, response.?, &rpos, header_mod.responseHeaderVersion(38, 3));
+        defer response_header.deinit(testing.allocator);
+        try testing.expectEqual(@as(i32, 3813), response_header.correlation_id);
+        const resp = try CreateResp.deserialize(testing.allocator, response.?, &rpos, 3);
+        try testing.expectEqual(response.?.len, rpos);
+        try testing.expectEqual(denied, resp.error_code);
+    }
+
+    {
+        const req = RenewReq{ .hmac = &hmac, .renew_period_ms = 1 };
+        var buf: [256]u8 = undefined;
+        var pos = buildTestRequest(&buf, 39, 2, 3912, header_mod.requestHeaderVersion(39, 2));
+        req.serialize(&buf, &pos, 2);
+
+        const response = broker.handleRequest(buf[0..pos]);
+        try testing.expect(response != null);
+        defer testing.allocator.free(response.?);
+
+        var rpos: usize = 0;
+        var response_header = try ResponseHeader.deserialize(testing.allocator, response.?, &rpos, header_mod.responseHeaderVersion(39, 2));
+        defer response_header.deinit(testing.allocator);
+        try testing.expectEqual(@as(i32, 3912), response_header.correlation_id);
+        const resp = try RenewResp.deserialize(testing.allocator, response.?, &rpos, 2);
+        try testing.expectEqual(response.?.len, rpos);
+        try testing.expectEqual(denied, resp.error_code);
+    }
+
+    {
+        const req = ExpireReq{ .hmac = &hmac, .expiry_time_period_ms = 1 };
+        var buf: [256]u8 = undefined;
+        var pos = buildTestRequest(&buf, 40, 2, 4012, header_mod.requestHeaderVersion(40, 2));
+        req.serialize(&buf, &pos, 2);
+
+        const response = broker.handleRequest(buf[0..pos]);
+        try testing.expect(response != null);
+        defer testing.allocator.free(response.?);
+
+        var rpos: usize = 0;
+        var response_header = try ResponseHeader.deserialize(testing.allocator, response.?, &rpos, header_mod.responseHeaderVersion(40, 2));
+        defer response_header.deinit(testing.allocator);
+        try testing.expectEqual(@as(i32, 4012), response_header.correlation_id);
+        const resp = try ExpireResp.deserialize(testing.allocator, response.?, &rpos, 2);
+        try testing.expectEqual(response.?.len, rpos);
+        try testing.expectEqual(denied, resp.error_code);
+    }
+
+    {
+        const req = DescribeReq{ .owners = null };
+        var buf: [256]u8 = undefined;
+        var pos = buildTestRequest(&buf, 41, 3, 4113, header_mod.requestHeaderVersion(41, 3));
+        req.serialize(&buf, &pos, 3);
+
+        const response = broker.handleRequest(buf[0..pos]);
+        try testing.expect(response != null);
+        defer testing.allocator.free(response.?);
+
+        var rpos: usize = 0;
+        var response_header = try ResponseHeader.deserialize(testing.allocator, response.?, &rpos, header_mod.responseHeaderVersion(41, 3));
+        defer response_header.deinit(testing.allocator);
+        try testing.expectEqual(@as(i32, 4113), response_header.correlation_id);
+        const resp = try DescribeResp.deserialize(testing.allocator, response.?, &rpos, 3);
+        defer if (resp.tokens.len > 0) testing.allocator.free(resp.tokens);
+        try testing.expectEqual(response.?.len, rpos);
+        try testing.expectEqual(denied, resp.error_code);
+        try testing.expectEqual(@as(usize, 0), resp.tokens.len);
+    }
+}
+
+test "Broker.handleRequest delegation token APIs reject truncated request bodies" {
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+
+    const probes = [_]struct { key: i16, version: i16, correlation_id: i32 }{
+        .{ .key = 38, .version = 3, .correlation_id = 3823 },
+        .{ .key = 39, .version = 2, .correlation_id = 3922 },
+        .{ .key = 40, .version = 2, .correlation_id = 4022 },
+        .{ .key = 41, .version = 3, .correlation_id = 4123 },
+    };
+
+    for (probes) |probe| {
+        var buf: [128]u8 = undefined;
+        const req_len = buildTestRequest(&buf, probe.key, probe.version, probe.correlation_id, header_mod.requestHeaderVersion(probe.key, probe.version));
+        try testing.expect(broker.handleRequest(buf[0..req_len]) == null);
+    }
+}
+
+test "Broker.handleRequest delegation token APIs reject trailing bytes" {
+    const CreateReq = generated.create_delegation_token_request.CreateDelegationTokenRequest;
+    const RenewReq = generated.renew_delegation_token_request.RenewDelegationTokenRequest;
+    const ExpireReq = generated.expire_delegation_token_request.ExpireDelegationTokenRequest;
+    const DescribeReq = generated.describe_delegation_token_request.DescribeDelegationTokenRequest;
+    const hmac = [_]u8{ 9, 10, 11, 12 };
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+
+    {
+        const req = CreateReq{ .renewers = &.{}, .max_lifetime_ms = 1 };
+        var buf: [256]u8 = undefined;
+        var pos = buildTestRequest(&buf, 38, 3, 3833, header_mod.requestHeaderVersion(38, 3));
+        req.serialize(&buf, &pos, 3);
+        try expectTrailingByteRejected(&broker, buf[0..], pos);
+    }
+
+    {
+        const req = RenewReq{ .hmac = &hmac, .renew_period_ms = 1 };
+        var buf: [256]u8 = undefined;
+        var pos = buildTestRequest(&buf, 39, 2, 3932, header_mod.requestHeaderVersion(39, 2));
+        req.serialize(&buf, &pos, 2);
+        try expectTrailingByteRejected(&broker, buf[0..], pos);
+    }
+
+    {
+        const req = ExpireReq{ .hmac = &hmac, .expiry_time_period_ms = 1 };
+        var buf: [256]u8 = undefined;
+        var pos = buildTestRequest(&buf, 40, 2, 4032, header_mod.requestHeaderVersion(40, 2));
+        req.serialize(&buf, &pos, 2);
+        try expectTrailingByteRejected(&broker, buf[0..], pos);
+    }
+
+    {
+        const req = DescribeReq{ .owners = null };
+        var buf: [256]u8 = undefined;
+        var pos = buildTestRequest(&buf, 41, 3, 4133, header_mod.requestHeaderVersion(41, 3));
+        req.serialize(&buf, &pos, 3);
+        try expectTrailingByteRejected(&broker, buf[0..], pos);
+    }
 }
 
 test "Broker.handleRequest IncrementalAlterConfigs v1 returns generated response and updates topic config" {
@@ -36894,6 +40193,186 @@ test "Broker.handleRequest PushTelemetry rejects trailing bytes" {
     try expectTrailingByteRejected(&broker, buf[0..], pos);
 }
 
+test "Broker.handleRequest AlterReplicaLogDirs stores local directory assignments" {
+    const Req = generated.alter_replica_log_dirs_request.AlterReplicaLogDirsRequest;
+    const Resp = generated.alter_replica_log_dirs_response.AlterReplicaLogDirsResponse;
+    const Dir = Req.AlterReplicaLogDir;
+    const Topic = Dir.AlterReplicaLogDirTopic;
+
+    const dir_a_path = "/tmp/zmq-alter-replica-dir-a";
+    const dir_b_path = "/tmp/zmq-alter-replica-dir-b";
+    var directory_ids = Broker.deriveReplicaDirectoryIds(dir_a_path ++ "," ++ dir_b_path);
+    var broker = Broker.initWithConfig(testing.allocator, 1, 9092, .{ .replica_directory_ids = directory_ids.slice() });
+    defer broker.deinit();
+    broker.default_num_partitions = 2;
+
+    _ = broker.ensureTopic("alter-replica-log-dirs-topic");
+    const topic_id = broker.topics.get("alter-replica-log-dirs-topic").?.topic_id;
+
+    const partitions = [_]i32{1};
+    const topics = [_]Topic{.{
+        .name = "alter-replica-log-dirs-topic",
+        .partitions = &partitions,
+    }};
+    const dirs = [_]Dir{.{
+        .path = dir_b_path,
+        .topics = &topics,
+    }};
+    const req = Req{ .dirs = &dirs };
+
+    var buf: [512]u8 = undefined;
+    var pos = buildTestRequest(&buf, 34, 2, 3400, header_mod.requestHeaderVersion(34, 2));
+    req.serialize(&buf, &pos, 2);
+
+    const response = broker.handleRequest(buf[0..pos]);
+    try testing.expect(response != null);
+    defer testing.allocator.free(response.?);
+
+    var rpos: usize = 0;
+    var response_header = try ResponseHeader.deserialize(testing.allocator, response.?, &rpos, header_mod.responseHeaderVersion(34, 2));
+    defer response_header.deinit(testing.allocator);
+    try testing.expectEqual(@as(i32, 3400), response_header.correlation_id);
+
+    const resp = try Resp.deserialize(testing.allocator, response.?, &rpos, 2);
+    defer {
+        for (resp.results) |result| {
+            if (result.partitions.len > 0) testing.allocator.free(result.partitions);
+        }
+        if (resp.results.len > 0) testing.allocator.free(resp.results);
+    }
+
+    try testing.expectEqual(response.?.len, rpos);
+    try testing.expectEqual(@as(i32, 0), resp.throttle_time_ms);
+    try testing.expectEqual(@as(usize, 1), resp.results.len);
+    try testing.expectEqualStrings("alter-replica-log-dirs-topic", resp.results[0].topic_name.?);
+    try testing.expectEqual(@as(usize, 1), resp.results[0].partitions.len);
+    try testing.expectEqual(@as(i32, 1), resp.results[0].partitions[0].partition_index);
+    try testing.expectEqual(ErrorCode.none.toInt(), resp.results[0].partitions[0].error_code);
+
+    const stored = (try broker.getReplicaDirectoryAssignment(topic_id, 1)) orelse return error.ExpectedReplicaDirectoryAssignment;
+    try testing.expectEqualSlices(u8, directory_ids.ids[1][0..], stored[0..]);
+}
+
+test "Broker.handleRequest AlterReplicaLogDirs reports per-partition validation errors" {
+    const Req = generated.alter_replica_log_dirs_request.AlterReplicaLogDirsRequest;
+    const Resp = generated.alter_replica_log_dirs_response.AlterReplicaLogDirsResponse;
+    const Dir = Req.AlterReplicaLogDir;
+    const Topic = Dir.AlterReplicaLogDirTopic;
+
+    const dir_path = "/tmp/zmq-alter-replica-dir-valid";
+    const missing_dir_path = "/tmp/zmq-alter-replica-dir-missing";
+    var directory_ids = Broker.deriveReplicaDirectoryIds(dir_path);
+    var broker = Broker.initWithConfig(testing.allocator, 1, 9092, .{ .replica_directory_ids = directory_ids.slice() });
+    defer broker.deinit();
+
+    _ = broker.ensureTopic("alter-replica-log-dirs-validation-topic");
+    const topic_id = broker.topics.get("alter-replica-log-dirs-validation-topic").?.topic_id;
+
+    const duplicate_and_missing = [_]i32{ 0, 0, 9 };
+    const known_topics = [_]Topic{.{
+        .name = "alter-replica-log-dirs-validation-topic",
+        .partitions = &duplicate_and_missing,
+    }};
+    const unknown_partitions = [_]i32{0};
+    const unknown_topics = [_]Topic{.{
+        .name = "missing-alter-replica-log-dirs-topic",
+        .partitions = &unknown_partitions,
+    }};
+    const missing_dir_topics = [_]Topic{.{
+        .name = "alter-replica-log-dirs-validation-topic",
+        .partitions = &unknown_partitions,
+    }};
+    const dirs = [_]Dir{
+        .{ .path = dir_path, .topics = &known_topics },
+        .{ .path = dir_path, .topics = &unknown_topics },
+        .{ .path = missing_dir_path, .topics = &missing_dir_topics },
+    };
+    const req = Req{ .dirs = &dirs };
+
+    var buf: [1024]u8 = undefined;
+    var pos = buildTestRequest(&buf, 34, 2, 3401, header_mod.requestHeaderVersion(34, 2));
+    req.serialize(&buf, &pos, 2);
+
+    const response = broker.handleRequest(buf[0..pos]);
+    try testing.expect(response != null);
+    defer testing.allocator.free(response.?);
+
+    var rpos: usize = 0;
+    var response_header = try ResponseHeader.deserialize(testing.allocator, response.?, &rpos, header_mod.responseHeaderVersion(34, 2));
+    defer response_header.deinit(testing.allocator);
+    try testing.expectEqual(@as(i32, 3401), response_header.correlation_id);
+
+    const resp = try Resp.deserialize(testing.allocator, response.?, &rpos, 2);
+    defer {
+        for (resp.results) |result| {
+            if (result.partitions.len > 0) testing.allocator.free(result.partitions);
+        }
+        if (resp.results.len > 0) testing.allocator.free(resp.results);
+    }
+
+    try testing.expectEqual(response.?.len, rpos);
+    try testing.expectEqual(@as(usize, 3), resp.results.len);
+    try testing.expectEqual(ErrorCode.none.toInt(), resp.results[0].partitions[0].error_code);
+    try testing.expectEqual(ErrorCode.invalid_request.toInt(), resp.results[0].partitions[1].error_code);
+    try testing.expectEqual(ErrorCode.unknown_topic_or_partition.toInt(), resp.results[0].partitions[2].error_code);
+    try testing.expectEqual(ErrorCode.unknown_topic_or_partition.toInt(), resp.results[1].partitions[0].error_code);
+    try testing.expectEqual(ErrorCode.log_dir_not_found.toInt(), resp.results[2].partitions[0].error_code);
+
+    const stored = (try broker.getReplicaDirectoryAssignment(topic_id, 0)) orelse return error.ExpectedReplicaDirectoryAssignment;
+    try testing.expectEqualSlices(u8, directory_ids.ids[0][0..], stored[0..]);
+    try testing.expect((try broker.getReplicaDirectoryAssignment(topic_id, 9)) == null);
+}
+
+test "Broker.handleRequest AlterReplicaLogDirs authorization denial uses generated response" {
+    const Req = generated.alter_replica_log_dirs_request.AlterReplicaLogDirsRequest;
+    const Resp = generated.alter_replica_log_dirs_response.AlterReplicaLogDirsResponse;
+    const Dir = Req.AlterReplicaLogDir;
+    const Topic = Dir.AlterReplicaLogDirTopic;
+
+    const dir_path = "/tmp/zmq-alter-replica-dir-denied";
+    var directory_ids = Broker.deriveReplicaDirectoryIds(dir_path);
+    var broker = Broker.initWithConfig(testing.allocator, 1, 9092, .{ .replica_directory_ids = directory_ids.slice() });
+    defer broker.deinit();
+    try broker.authorizer.addAcl("other-client", .cluster, "*", .literal, .alter, .allow, "*");
+
+    _ = broker.ensureTopic("alter-replica-log-dirs-denied-topic");
+    const topic_id = broker.topics.get("alter-replica-log-dirs-denied-topic").?.topic_id;
+
+    const partitions = [_]i32{0};
+    const topics = [_]Topic{.{
+        .name = "alter-replica-log-dirs-denied-topic",
+        .partitions = &partitions,
+    }};
+    const dirs = [_]Dir{.{ .path = dir_path, .topics = &topics }};
+    const req = Req{ .dirs = &dirs };
+
+    var buf: [512]u8 = undefined;
+    var pos = buildTestRequest(&buf, 34, 2, 3402, header_mod.requestHeaderVersion(34, 2));
+    req.serialize(&buf, &pos, 2);
+
+    const response = broker.handleRequest(buf[0..pos]);
+    try testing.expect(response != null);
+    defer testing.allocator.free(response.?);
+
+    var rpos: usize = 0;
+    var response_header = try ResponseHeader.deserialize(testing.allocator, response.?, &rpos, header_mod.responseHeaderVersion(34, 2));
+    defer response_header.deinit(testing.allocator);
+    try testing.expectEqual(@as(i32, 3402), response_header.correlation_id);
+
+    const resp = try Resp.deserialize(testing.allocator, response.?, &rpos, 2);
+    defer {
+        for (resp.results) |result| {
+            if (result.partitions.len > 0) testing.allocator.free(result.partitions);
+        }
+        if (resp.results.len > 0) testing.allocator.free(resp.results);
+    }
+
+    try testing.expectEqual(response.?.len, rpos);
+    try testing.expectEqual(@as(usize, 1), resp.results.len);
+    try testing.expectEqual(ErrorCode.cluster_authorization_failed.toInt(), resp.results[0].partitions[0].error_code);
+    try testing.expect((try broker.getReplicaDirectoryAssignment(topic_id, 0)) == null);
+}
+
 test "Broker.handleRequest AssignReplicasToDirs stores local directory assignments" {
     const Req = generated.assign_replicas_to_dirs_request.AssignReplicasToDirsRequest;
     const Resp = generated.assign_replicas_to_dirs_response.AssignReplicasToDirsResponse;
@@ -38547,7 +42026,7 @@ test "Broker replays committed AutoMQ object metadata quorum snapshots" {
     var raft = RaftState.init(testing.allocator, 1, "automq-object-quorum");
     defer raft.deinit();
     try raft.addVoter(1);
-    _ = raft.startElection();
+    _ = try raft.startElection();
     raft.becomeLeader();
 
     const CreateReq = generated.create_streams_request.CreateStreamsRequest;
@@ -38652,7 +42131,7 @@ test "Broker rejects AutoMQ object metadata mutation when not leader" {
     var raft = RaftState.init(testing.allocator, 1, "automq-object-follower");
     defer raft.deinit();
     try raft.addVoter(1);
-    raft.becomeFollower(2, 2);
+    try raft.becomeFollower(2, 2);
 
     var broker = Broker.initWithConfig(testing.allocator, 1, 9092, .{});
     defer broker.deinit();
@@ -39590,7 +43069,7 @@ test "Broker replays committed AutoMQ metadata quorum records" {
     var raft = RaftState.init(testing.allocator, 1, "automq-metadata-quorum");
     defer raft.deinit();
     try raft.addVoter(1);
-    _ = raft.startElection();
+    _ = try raft.startElection();
     raft.becomeLeader();
 
     const PutReq = generated.put_k_vs_request.PutKVsRequest;
@@ -39684,7 +43163,7 @@ test "Broker compacts AutoMQ quorum metadata into replayable full snapshot" {
     var raft = RaftState.init(testing.allocator, 1, "automq-metadata-compaction");
     defer raft.deinit();
     try raft.addVoter(1);
-    _ = raft.startElection();
+    _ = try raft.startElection();
     raft.becomeLeader();
 
     var stream_id: u64 = 0;
@@ -39758,7 +43237,7 @@ test "Broker rejects AutoMQ metadata quorum mutation when not leader" {
     var raft = RaftState.init(testing.allocator, 1, "automq-metadata-follower");
     defer raft.deinit();
     try raft.addVoter(1);
-    raft.becomeFollower(2, 2);
+    try raft.becomeFollower(2, 2);
 
     var broker = Broker.initWithConfig(testing.allocator, 1, 9092, .{});
     defer broker.deinit();
@@ -42695,6 +46174,8 @@ test "Broker.isVersionSupported" {
     try testing.expect(!Broker.isVersionSupported(7, 0));
     try testing.expect(Broker.isVersionSupported(42, 2));
     try testing.expect(!Broker.isVersionSupported(42, 3));
+    try testing.expect(Broker.isVersionSupported(38, 3));
+    try testing.expect(!Broker.isVersionSupported(38, 4));
     try testing.expect(Broker.isVersionSupported(44, 1));
     try testing.expect(Broker.isVersionSupported(45, 0));
     try testing.expect(Broker.isVersionSupported(46, 0));
@@ -43682,7 +47163,7 @@ test "Broker tick runs scheduled controller-aware rebalance when interval elapse
         .leader_node = 3,
     }};
     try broker.setControllerAwareRebalanceInputs(&brokers, &loads);
-    broker.auto_balancer.last_check_ms = @import("time_compat").milliTimestamp() - broker.auto_balancer.check_interval_ms - 1;
+    broker.auto_balancer.last_check_ms = monotonicMs() - broker.auto_balancer.check_interval_ms - 1;
 
     broker.tick();
 
@@ -43710,7 +47191,7 @@ test "Broker tick skips scheduled controller-aware rebalance before interval ela
         .leader_node = 3,
     }};
     try broker.setControllerAwareRebalanceInputs(&brokers, &loads);
-    broker.auto_balancer.last_check_ms = @import("time_compat").milliTimestamp();
+    broker.auto_balancer.last_check_ms = monotonicMs();
 
     broker.tick();
 
@@ -43800,7 +47281,7 @@ test "Broker topic quorum records replay topic metadata before reassignments" {
     var raft = RaftState.init(testing.allocator, 1, "topic-quorum");
     defer raft.deinit();
     try raft.addVoter(1);
-    _ = raft.startElection();
+    _ = try raft.startElection();
     raft.becomeLeader();
 
     const topic_name = "topic-quorum-reassignment";
@@ -43855,7 +47336,7 @@ test "Broker partition reassignment quorum records replay assignment and cancell
     var raft = RaftState.init(testing.allocator, 1, "reassign-quorum");
     defer raft.deinit();
     try raft.addVoter(1);
-    _ = raft.startElection();
+    _ = try raft.startElection();
     raft.becomeLeader();
 
     const topic_name = "reassign-quorum-topic";
@@ -43932,7 +47413,7 @@ test "Broker partition reassignment quorum mutation fails closed on non-leader" 
     var raft = RaftState.init(testing.allocator, 1, "reassign-quorum-follower");
     defer raft.deinit();
     try raft.addVoter(1);
-    raft.becomeFollower(2, 2);
+    try raft.becomeFollower(2, 2);
 
     var broker = Broker.init(testing.allocator, 1, 9092);
     defer broker.deinit();
@@ -45017,7 +48498,7 @@ test "Broker.handleRequest BeginQuorumEpoch fences S3 WAL writer on higher leade
 
     var raft = RaftState.init(testing.allocator, 5, "begin-fence-s3-wal");
     defer raft.deinit();
-    _ = raft.startElection();
+    _ = try raft.startElection();
     raft.becomeLeader();
     try testing.expectEqual(.leader, raft.role);
     try testing.expectEqual(@as(i32, 1), raft.current_epoch);
@@ -45079,7 +48560,7 @@ test "Broker.handleRequest internal AppendEntries fences S3 WAL produce path on 
 
     var raft = RaftState.init(testing.allocator, 5, "appendentries-fence-s3-wal");
     defer raft.deinit();
-    _ = raft.startElection();
+    _ = try raft.startElection();
     raft.becomeLeader();
 
     var broker = Broker.init(testing.allocator, 5, 19094);
@@ -45127,7 +48608,7 @@ test "Broker.handleRequest BeginQuorumEpoch applies internal AutoMQ AppendEntrie
     defer raft.deinit();
     try raft.addVoter(1);
     try raft.addVoter(2);
-    raft.becomeFollower(1, 1);
+    try raft.becomeFollower(1, 1);
 
     var broker = Broker.init(testing.allocator, 2, 19095);
     defer broker.deinit();
@@ -45165,7 +48646,7 @@ test "Broker replays replicated AutoMQ object metadata AppendEntries payload" {
     defer raft.deinit();
     try raft.addVoter(1);
     try raft.addVoter(2);
-    raft.becomeFollower(1, 1);
+    try raft.becomeFollower(1, 1);
 
     var source = Broker.init(testing.allocator, 1, 19094);
     defer source.deinit();
@@ -45217,7 +48698,7 @@ test "Broker replays replicated AutoMQ state after follower promotion" {
     defer raft.deinit();
     try raft.addVoter(1);
     try raft.addVoter(2);
-    raft.becomeFollower(1, 1);
+    try raft.becomeFollower(1, 1);
 
     var source = Broker.init(testing.allocator, 1, 19094);
     defer source.deinit();
@@ -45276,7 +48757,7 @@ test "Broker replays replicated AutoMQ state after follower promotion" {
     }
 
     raft.metrics = null;
-    _ = raft.startElection();
+    _ = try raft.startElection();
     raft.becomeLeader();
     try testing.expectEqual(.leader, raft.role);
 
@@ -45358,7 +48839,7 @@ test "Broker.handleRequest EndQuorumEpoch authorization denial uses generated re
 
     var raft = RaftState.init(testing.allocator, 5, "end-denied-cluster");
     defer raft.deinit();
-    raft.becomeFollower(3, 7);
+    try raft.becomeFollower(3, 7);
 
     var broker = Broker.init(testing.allocator, 5, 19094);
     defer broker.deinit();
@@ -52022,6 +55503,93 @@ test "Broker.handleRequest OffsetFetch v8 null topics fetches all committed offs
     try testing.expectEqual(@as(i64, 88), resp.groups[0].topics[1].partitions[0].committed_offset);
 }
 
+test "Broker.handleRequest OffsetFetch v7 all topics reports corrupt offset key as storage error" {
+    const Req = generated.offset_fetch_request.OffsetFetchRequest;
+    const Resp = generated.offset_fetch_response.OffsetFetchResponse;
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+
+    const corrupt_key = try testing.allocator.dupe(u8, "of-corrupt-v7:topic:not-a-partition");
+    var key_inserted = false;
+    errdefer if (!key_inserted) testing.allocator.free(corrupt_key);
+    try broker.groups.committed_offsets.put(corrupt_key, .{ .offset = 9 });
+    key_inserted = true;
+
+    const req = Req{
+        .group_id = "of-corrupt-v7",
+        .topics = null,
+        .require_stable = false,
+    };
+
+    var buf: [512]u8 = undefined;
+    var pos = buildTestRequest(&buf, 9, 7, 927, header_mod.requestHeaderVersion(9, 7));
+    req.serialize(&buf, &pos, 7);
+
+    const response = broker.handleRequest(buf[0..pos]);
+    try testing.expect(response != null);
+    defer testing.allocator.free(response.?);
+
+    var rpos: usize = 0;
+    var response_header = try ResponseHeader.deserialize(testing.allocator, response.?, &rpos, header_mod.responseHeaderVersion(9, 7));
+    defer response_header.deinit(testing.allocator);
+    try testing.expectEqual(@as(i32, 927), response_header.correlation_id);
+
+    const resp = try Resp.deserialize(testing.allocator, response.?, &rpos, 7);
+    defer broker.freeOffsetFetchLegacyTopics(resp.topics);
+    try testing.expectEqual(response.?.len, rpos);
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.kafka_storage_error)), resp.error_code);
+    try testing.expectEqual(@as(usize, 0), resp.topics.len);
+}
+
+test "Broker.handleRequest OffsetFetch v8 all topics reports corrupt offset key as storage error" {
+    const Req = generated.offset_fetch_request.OffsetFetchRequest;
+    const Resp = generated.offset_fetch_response.OffsetFetchResponse;
+    const Group = Req.OffsetFetchRequestGroup;
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+
+    const corrupt_key = try testing.allocator.dupe(u8, "of-corrupt-v8:topic:not-a-partition");
+    var key_inserted = false;
+    errdefer if (!key_inserted) testing.allocator.free(corrupt_key);
+    try broker.groups.committed_offsets.put(corrupt_key, .{ .offset = 9 });
+    key_inserted = true;
+
+    const groups = [_]Group{.{
+        .group_id = "of-corrupt-v8",
+        .topics = null,
+    }};
+    const req = Req{
+        .groups = &groups,
+        .require_stable = false,
+    };
+
+    var buf: [512]u8 = undefined;
+    var pos = buildTestRequest(&buf, 9, 8, 938, header_mod.requestHeaderVersion(9, 8));
+    req.serialize(&buf, &pos, 8);
+
+    const response = broker.handleRequest(buf[0..pos]);
+    try testing.expect(response != null);
+    defer testing.allocator.free(response.?);
+
+    var rpos: usize = 0;
+    var response_header = try ResponseHeader.deserialize(testing.allocator, response.?, &rpos, header_mod.responseHeaderVersion(9, 8));
+    defer response_header.deinit(testing.allocator);
+    try testing.expectEqual(@as(i32, 938), response_header.correlation_id);
+
+    const resp = try Resp.deserialize(testing.allocator, response.?, &rpos, 8);
+    defer {
+        broker.freeOffsetFetchGroups(resp.groups);
+        if (resp.groups.len > 0) testing.allocator.free(resp.groups);
+    }
+    try testing.expectEqual(response.?.len, rpos);
+    try testing.expectEqual(@as(usize, 1), resp.groups.len);
+    try testing.expectEqualStrings("of-corrupt-v8", resp.groups[0].group_id.?);
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.kafka_storage_error)), resp.groups[0].error_code);
+    try testing.expectEqual(@as(usize, 0), resp.groups[0].topics.len);
+}
+
 test "Broker.handleRequest OffsetFetch rejects truncated request" {
     var broker = Broker.init(testing.allocator, 1, 9092);
     defer broker.deinit();
@@ -52261,6 +55829,60 @@ test "Broker.handleRequest CreateTopics v7 returns generated response" {
     try testing.expect(resp.topics[0].configs == null);
     try testing.expect(!std.mem.eql(u8, &resp.topics[0].topic_id, &[_]u8{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 }));
     try testing.expect(broker.topics.contains("ct-generated-topic"));
+}
+
+test "Broker.handleRequest CreateTopics fails closed when partition storage allocation fails" {
+    const Req = generated.create_topics_request.CreateTopicsRequest;
+    const Resp = generated.create_topics_response.CreateTopicsResponse;
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+
+    const original_store_allocator = broker.store.allocator;
+    var failing_allocator = std.testing.FailingAllocator.init(testing.allocator, .{ .fail_index = 0 });
+    broker.store.allocator = failing_allocator.allocator();
+    defer broker.store.allocator = original_store_allocator;
+
+    const topics = [_]Req.CreatableTopic{.{
+        .name = "ct-partition-storage-fail-topic",
+        .num_partitions = 1,
+        .replication_factor = 1,
+    }};
+    const req = Req{
+        .topics = &topics,
+        .timeout_ms = 30000,
+        .validate_only = false,
+    };
+
+    var buf: [512]u8 = undefined;
+    var pos = buildTestRequest(&buf, 19, 7, 1927, header_mod.requestHeaderVersion(19, 7));
+    req.serialize(&buf, &pos, 7);
+
+    const response = broker.handleRequest(buf[0..pos]);
+    try testing.expect(response != null);
+    defer testing.allocator.free(response.?);
+
+    var rpos: usize = 0;
+    var response_header = try ResponseHeader.deserialize(testing.allocator, response.?, &rpos, header_mod.responseHeaderVersion(19, 7));
+    defer response_header.deinit(testing.allocator);
+    try testing.expectEqual(@as(i32, 1927), response_header.correlation_id);
+
+    const resp = try Resp.deserialize(testing.allocator, response.?, &rpos, 7);
+    defer {
+        for (resp.topics) |topic| {
+            if (topic.configs) |response_configs| {
+                if (response_configs.len > 0) testing.allocator.free(response_configs);
+            }
+        }
+        if (resp.topics.len > 0) testing.allocator.free(resp.topics);
+    }
+
+    try testing.expectEqual(response.?.len, rpos);
+    try testing.expectEqual(@as(usize, 1), resp.topics.len);
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.kafka_storage_error)), resp.topics[0].error_code);
+    try testing.expect(!broker.topics.contains("ct-partition-storage-fail-topic"));
+    try testing.expect(!broker.store.partitions.contains("ct-partition-storage-fail-topic-0"));
+    try testing.expect(broker.object_manager.getStream(PartitionStore.hashPartitionKey("ct-partition-storage-fail-topic", 0)) == null);
 }
 
 test "Broker.handleRequest CreateTopics authorization denial uses generated response" {
@@ -52604,7 +56226,7 @@ test "Broker.handleRequest CreateTopics maps quorum follower to not controller" 
     var raft = RaftState.init(testing.allocator, 1, "create-topics-quorum-follower");
     defer raft.deinit();
     try raft.addVoter(1);
-    raft.becomeFollower(2, 2);
+    try raft.becomeFollower(2, 2);
 
     var broker = Broker.init(testing.allocator, 1, 9092);
     defer broker.deinit();
@@ -53136,7 +56758,7 @@ test "Broker tick uses per-group session timeouts for member eviction" {
     short_group.session_timeout_ms = 10_000;
     long_group.session_timeout_ms = 300_000;
 
-    const now = @import("time_compat").milliTimestamp();
+    const now = monotonicMs();
     short_group.members.getPtr(short_member.member_id).?.last_heartbeat_ms = now - 60_000;
     long_group.members.getPtr(long_member.member_id).?.last_heartbeat_ms = now - 60_000;
 
@@ -53162,7 +56784,8 @@ test "Broker tick writes abort marker for timed-out transaction" {
     const before = broker.partitionState("txn-timeout-topic", 0).?;
     if (broker.txn_coordinator.transactions.getPtr(init_result.producer_id)) |txn| {
         txn.timeout_ms = 1;
-        txn.start_time_ms = @import("time_compat").milliTimestamp() - 10_000;
+        txn.start_time_ms = @import("time_compat").milliTimestamp();
+        txn.start_monotonic_ms = monotonicMs() - 10_000;
     }
 
     broker.tick();
@@ -53209,7 +56832,8 @@ test "Broker tick rolls back timed-out transaction when atomic S3 WAL abort flus
 
     if (broker.txn_coordinator.transactions.getPtr(init_result.producer_id)) |txn| {
         txn.timeout_ms = 1;
-        txn.start_time_ms = @import("time_compat").milliTimestamp() - 10_000;
+        txn.start_time_ms = @import("time_compat").milliTimestamp();
+        txn.start_monotonic_ms = monotonicMs() - 10_000;
     }
 
     mock_s3.failNextPutObjects(3);
@@ -53252,7 +56876,8 @@ test "Broker restores timed-out transaction S3 WAL abort after stateless replace
 
         if (broker.txn_coordinator.transactions.getPtr(producer_id)) |txn| {
             txn.timeout_ms = 1;
-            txn.start_time_ms = @import("time_compat").milliTimestamp() - 10_000;
+            txn.start_time_ms = @import("time_compat").milliTimestamp();
+            txn.start_monotonic_ms = monotonicMs() - 10_000;
         }
 
         const object_count_before = mock_s3.objectCount();
@@ -54907,6 +58532,10 @@ test "Broker exports AutoMQ-compatible request metrics" {
     const error_entry = broker.metrics.labeled_counters.get(error_key);
     try testing.expect(error_entry != null);
     try testing.expectEqual(@as(u64, 1), error_entry.?.value);
+    const jmx_error_key = "kafka_network_requestmetrics_errors_total{request=\"ApiVersions\",version=\"3\",error=\"NONE\"}";
+    const jmx_error_entry = broker.metrics.labeled_counters.get(jmx_error_key);
+    try testing.expect(jmx_error_entry != null);
+    try testing.expectEqual(@as(u64, 1), jmx_error_entry.?.value);
 
     try testing.expectEqual(@as(u64, pos), broker.metrics.counters.get("kafka_server_brokertopicmetrics_bytesin_total").?.value);
     try testing.expectEqual(@as(u64, response.?.len), broker.metrics.counters.get("kafka_server_brokertopicmetrics_bytesout_total").?.value);
@@ -54919,6 +58548,8 @@ test "Broker exports AutoMQ-compatible request metrics" {
     try testing.expect(std.mem.indexOf(u8, output, "# TYPE kafka_network_requestmetrics_requests_total counter") != null);
     try testing.expect(std.mem.indexOf(u8, output, jmx_request_key) != null);
     try testing.expect(std.mem.indexOf(u8, output, "# TYPE kafka_network_requestmetrics_localtimems_total counter") != null);
+    try testing.expect(std.mem.indexOf(u8, output, "# TYPE kafka_network_requestmetrics_errors_total counter") != null);
+    try testing.expect(std.mem.indexOf(u8, output, jmx_error_key) != null);
 }
 
 test "Broker tick exports AutoMQ-compatible broker gauges" {
@@ -54936,7 +58567,7 @@ test "Broker tick exports AutoMQ-compatible broker gauges" {
         .partition_id = 0,
         .fetch_offset = 0,
         .max_bytes = 1,
-        .deadline_ms = @import("time_compat").milliTimestamp() + 60_000,
+        .deadline_ms = monotonicMs() + 60_000,
         .api_version = 16,
         .resp_header_version = 1,
         .client_id = null,
@@ -55018,6 +58649,11 @@ test "Broker error counter increments on API error" {
     const automq_entry = broker.metrics.labeled_counters.get(automq_key);
     try testing.expect(automq_entry != null);
     try testing.expectEqual(@as(u64, 1), automq_entry.?.value);
+
+    const jmx_key = "kafka_network_requestmetrics_errors_total{request=\"Heartbeat\",version=\"0\",error=\"UNKNOWN_MEMBER_ID\"}";
+    const jmx_entry = broker.metrics.labeled_counters.get(jmx_key);
+    try testing.expect(jmx_entry != null);
+    try testing.expectEqual(@as(u64, 1), jmx_entry.?.value);
 }
 
 test "Broker consumer lag computed on offset commit" {
@@ -55076,6 +58712,15 @@ test "Broker ACL mappings cover previously unmapped advertised APIs" {
 
     try testing.expectEqual(Authorizer.ResourceType.cluster, Broker.resourceTypeForApiKey(30));
     try testing.expectEqual(Authorizer.Operation.alter, Broker.operationForApiKey(30));
+
+    try testing.expectEqual(Authorizer.ResourceType.cluster, Broker.resourceTypeForApiKey(38));
+    try testing.expectEqual(Authorizer.Operation.create, Broker.operationForApiKey(38));
+    try testing.expectEqual(Authorizer.ResourceType.cluster, Broker.resourceTypeForApiKey(39));
+    try testing.expectEqual(Authorizer.Operation.alter, Broker.operationForApiKey(39));
+    try testing.expectEqual(Authorizer.ResourceType.cluster, Broker.resourceTypeForApiKey(40));
+    try testing.expectEqual(Authorizer.Operation.alter, Broker.operationForApiKey(40));
+    try testing.expectEqual(Authorizer.ResourceType.cluster, Broker.resourceTypeForApiKey(41));
+    try testing.expectEqual(Authorizer.Operation.describe, Broker.operationForApiKey(41));
 
     try testing.expectEqual(Authorizer.ResourceType.cluster, Broker.resourceTypeForApiKey(52));
     try testing.expectEqual(Authorizer.Operation.cluster_action, Broker.operationForApiKey(52));
@@ -55648,6 +59293,21 @@ test "Broker.handleRequest ListPartitionReassignments rejects trailing bytes" {
     try expectTrailingByteRejected(&broker, buf[0..], pos);
 }
 
+test "Broker.handleRequest AlterReplicaLogDirs rejects trailing bytes" {
+    const Req = generated.alter_replica_log_dirs_request.AlterReplicaLogDirsRequest;
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+
+    const req = Req{ .dirs = &.{} };
+
+    var buf: [128]u8 = undefined;
+    var pos = buildTestRequest(&buf, 34, 2, 9403, header_mod.requestHeaderVersion(34, 2));
+    req.serialize(&buf, &pos, 2);
+
+    try expectTrailingByteRejected(&broker, buf[0..], pos);
+}
+
 test "Broker.handleRequest AssignReplicasToDirs rejects trailing bytes" {
     const Req = generated.assign_replicas_to_dirs_request.AssignReplicasToDirsRequest;
     const Resp = generated.assign_replicas_to_dirs_response.AssignReplicasToDirsResponse;
@@ -55748,7 +59408,13 @@ test "Broker.handleRequest ShareFetch rejects trailing bytes" {
     req.serialize(&buf, &pos, 0);
 
     try expectTrailingByteRejectedWithGeneratedResponse(
-        generated.share_fetch_response.ShareFetchResponse, &broker, buf[0..], pos, 78, 0, 9408,
+        generated.share_fetch_response.ShareFetchResponse,
+        &broker,
+        buf[0..],
+        pos,
+        78,
+        0,
+        9408,
     );
 }
 

@@ -201,6 +201,15 @@ groups:
           summary: ZMQ JMX-compatible local request time is above 1 second.
           description: Broker-local request handling time is sustained above the operational latency SLO.
 
+      - alert: ZMQJmxRequestErrors
+        expr: sum(rate(kafka_network_requestmetrics_errors_total{error!="NONE"}[5m])) > 0
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: ZMQ JMX-compatible request metrics report errors.
+          description: RequestMetrics ErrorsPerSec should stay at zero for steady-state broker traffic.
+
   - name: zmq-storage
     rules:
       - alert: ZMQS3RequestErrors

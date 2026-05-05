@@ -66,7 +66,7 @@ test "TLS handshake timeout enforcement" {
     defer conn.deinit();
 
     // New connection: not timed out (handshake_start_ms defaults to 0)
-    try testing.expect(!conn.isHandshakeTimedOut(@import("time_compat").milliTimestamp()));
+    try testing.expect(!conn.isHandshakeTimedOut(@intCast(@import("time_compat").monotonicMilliTimestamp())));
 
     // Simulated stale connection: started 31 seconds ago
     conn.handshake_start_ms = 1000;
@@ -677,6 +677,7 @@ test "Observability dashboard and alerts reference exported metrics" {
         "kafka_network_requestmetrics_remotetimems_total",
         "kafka_network_requestmetrics_responsequeuetimems_total",
         "kafka_network_requestmetrics_responsesendtimems_total",
+        "kafka_network_requestmetrics_errors_total",
         "kafka_network_requestchannel_requestqueuesize",
         "kafka_network_requestchannel_responsequeuesize",
         "kafka_server_brokertopicmetrics_totalproducerequests_total",
@@ -754,6 +755,7 @@ test "Observability dashboard and alerts reference exported metrics" {
         "kafka_server_brokertopicmetrics_bytesrejected_total",
         "kafka_network_requestmetrics_localtimems_total",
         "kafka_network_requestmetrics_requests_total",
+        "kafka_network_requestmetrics_errors_total",
         "kafka_log_logmanager_offlinelogdirectorycount",
         "kafka_controller_kafkacontroller_offlinepartitionscount",
         "kafka_controller_kafkacontroller_preferredreplicaimbalancecount",
@@ -780,6 +782,7 @@ test "Observability dashboard and alerts reference exported metrics" {
         "ZMQFailedFetchRequests",
         "ZMQRejectedProduceBytes",
         "ZMQHighJmxRequestLocalTime",
+        "ZMQJmxRequestErrors",
         "ZMQOfflineLogDirectories",
         "ZMQControllerOfflinePartitions",
         "ZMQPreferredReplicaImbalance",
@@ -828,6 +831,8 @@ test "AutoMQ parity release criteria document pins required gates" {
     for (required_gates) |gate| {
         try testing.expect(std.mem.indexOf(u8, criteria, gate) != null);
     }
+    try testing.expect(std.mem.indexOf(u8, criteria, "Runtime elapsed-time gates must use monotonic clocks") != null);
+    try testing.expect(std.mem.indexOf(u8, criteria, "outbound TLS hostname verification") != null);
 
     const required_commands = [_][]const u8{
         "zig build test --summary all",
@@ -857,6 +862,14 @@ test "AutoMQ parity release criteria document pins required gates" {
         "ZMQ_CLIENT_MATRIX_REQUIRED_OAUTH_NEGATIVE_PROFILES",
         "zig build bench --summary all",
         "ZMQ_RUN_BENCH_LIVE_S3=1",
+        "ZMQ_BENCH_S3_WAL_MAX_REQUESTS_PER_MIB",
+        "ZMQ_BENCH_S3_WAL_MAX_REBUILD_MS",
+        "ZMQ_BENCH_LIVE_S3_MAX_REQUESTS_PER_MIB",
+        "ZMQ_BENCH_COMPARE_REQUIRED_TARGETS",
+        "ZMQ_BENCH_COMPARE_MIN_THROUGHPUT_RATIO",
+        "ZMQ_BENCH_COMPARE_MAX_P50_LATENCY_RATIO",
+        "ZMQ_BENCH_COMPARE_MAX_P99_LATENCY_RATIO",
+        "ZMQ_BENCH_COMPARE_MAX_ERROR_RATE",
         "zig build bench-compare --summary all",
     };
     for (required_commands) |command| {

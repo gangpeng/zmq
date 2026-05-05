@@ -3,6 +3,14 @@ const testing = std.testing;
 const Allocator = std.mem.Allocator;
 const ErrorCode = @import("protocol").ErrorCode;
 
+fn wallClockMs() i64 {
+    return @import("time_compat").milliTimestamp();
+}
+
+fn monotonicMs() i64 {
+    return @intCast(@import("time_compat").monotonicMilliTimestamp());
+}
+
 /// Transaction coordinator.
 ///
 /// Manages the lifecycle of Kafka transactions:
@@ -34,7 +42,10 @@ pub const TransactionCoordinator = struct {
         transactional_id: ?[]u8,
         status: TxnStatus = .empty,
         partitions: std.array_list.Managed(TopicPartition),
+        /// Kafka-visible transaction start time in Unix epoch milliseconds.
         start_time_ms: i64,
+        /// Runtime timeout baseline from a monotonic clock.
+        start_monotonic_ms: i64,
         timeout_ms: i32 = 60000,
 
         pub const TopicPartition = struct {
@@ -55,6 +66,19 @@ pub const TransactionCoordinator = struct {
             self.partitions.deinit();
         }
     };
+
+    fn resetTransactionStart(txn: *TransactionState) void {
+        txn.start_time_ms = wallClockMs();
+        txn.start_monotonic_ms = monotonicMs();
+    }
+
+    fn transactionTimedOut(txn: *const TransactionState, now_monotonic_ms: i64) bool {
+        return now_monotonic_ms - txn.start_monotonic_ms > txn.timeout_ms;
+    }
+
+    pub fn isTransactionTimedOut(txn: *const TransactionState, now_monotonic_ms: i64) bool {
+        return transactionTimedOut(txn, now_monotonic_ms);
+    }
 
     /// Control record types for transaction markers (fix #5).
     pub const ControlRecordType = enum(i16) {
@@ -116,7 +140,8 @@ pub const TransactionCoordinator = struct {
             .transactional_id = tid_copy,
             .status = .empty,
             .partitions = std.array_list.Managed(TransactionState.TopicPartition).init(self.allocator),
-            .start_time_ms = @import("time_compat").milliTimestamp(),
+            .start_time_ms = wallClockMs(),
+            .start_monotonic_ms = monotonicMs(),
             .timeout_ms = if (transactional_id != null) transaction_timeout_ms else default_transaction_timeout_ms,
         });
 
@@ -205,7 +230,7 @@ pub const TransactionCoordinator = struct {
             txn.producer_epoch = 0;
             txn.status = .empty;
             txn.clearPartitions(self.allocator);
-            txn.start_time_ms = @import("time_compat").milliTimestamp();
+            resetTransactionStart(txn);
             if (txn.transactional_id != null) txn.timeout_ms = transaction_timeout_ms;
             const txn_copy = txn.*;
             _ = self.transactions.fetchRemove(old_pid);
@@ -221,7 +246,7 @@ pub const TransactionCoordinator = struct {
         txn.producer_epoch += 1;
         txn.status = .empty;
         txn.clearPartitions(self.allocator);
-        txn.start_time_ms = @import("time_compat").milliTimestamp();
+        resetTransactionStart(txn);
         if (txn.transactional_id != null) txn.timeout_ms = transaction_timeout_ms;
         self.dirty = true;
         return .{
@@ -242,8 +267,7 @@ pub const TransactionCoordinator = struct {
 
         // Enforce transaction timeout
         if (txn.status == .ongoing) {
-            const elapsed = @import("time_compat").milliTimestamp() - txn.start_time_ms;
-            if (elapsed > txn.timeout_ms) {
+            if (transactionTimedOut(txn, monotonicMs())) {
                 txn.status = .prepare_abort;
                 self.dirty = true;
                 return @intFromEnum(ErrorCode.invalid_txn_state);
@@ -252,7 +276,7 @@ pub const TransactionCoordinator = struct {
 
         if (txn.status == .empty) {
             txn.status = .ongoing;
-            txn.start_time_ms = @import("time_compat").milliTimestamp();
+            resetTransactionStart(txn);
         }
 
         if (txn.status != .ongoing) return @intFromEnum(ErrorCode.invalid_txn_state);
@@ -391,7 +415,7 @@ pub const TransactionCoordinator = struct {
     /// transactions that have been in ONGOING state too long. This prevents resource
     /// leaks from abandoned producers.
     pub fn expireTransactions(self: *TransactionCoordinator) u32 {
-        const now = @import("time_compat").milliTimestamp();
+        const now = monotonicMs();
         var expired_pids: [64]i64 = undefined;
         var num_expired: usize = 0;
 
@@ -400,7 +424,7 @@ pub const TransactionCoordinator = struct {
         while (it.next()) |entry| {
             const txn = entry.value_ptr;
             if (txn.status == .ongoing) {
-                if (now - txn.start_time_ms > txn.timeout_ms) {
+                if (transactionTimedOut(txn, now)) {
                     if (num_expired < 64) {
                         expired_pids[num_expired] = txn.producer_id;
                         num_expired += 1;
@@ -497,7 +521,8 @@ pub const TransactionCoordinator = struct {
                 .transactional_id = tid_copy,
                 .status = @enumFromInt(entry.status),
                 .partitions = partitions,
-                .start_time_ms = @import("time_compat").milliTimestamp(),
+                .start_time_ms = wallClockMs(),
+                .start_monotonic_ms = monotonicMs(),
                 .timeout_ms = entry.timeout_ms,
             });
         }
@@ -836,6 +861,23 @@ test "TransactionCoordinator InitProducerId validates transactional timeout" {
     try testing.expectEqual(@as(i32, TransactionCoordinator.default_transaction_timeout_ms), coord.transactions.get(non_txn.producer_id).?.timeout_ms);
 }
 
+test "TransactionCoordinator keeps wall-clock start time separate from timeout clock" {
+    var coord = TransactionCoordinator.init(testing.allocator);
+    defer coord.deinit();
+
+    const wall_before = wallClockMs();
+    const mono_before = monotonicMs();
+    const result = try coord.initProducerId("timebase-txn");
+    const txn = coord.transactions.get(result.producer_id).?;
+    const wall_after = wallClockMs();
+    const mono_after = monotonicMs();
+
+    try testing.expect(txn.start_time_ms >= wall_before);
+    try testing.expect(txn.start_time_ms <= wall_after);
+    try testing.expect(txn.start_monotonic_ms >= mono_before);
+    try testing.expect(txn.start_monotonic_ms <= mono_after);
+}
+
 // ---------------------------------------------------------------
 // Gap-fix tests: epoch validation, idempotent add, timeout, overflow
 // ---------------------------------------------------------------
@@ -905,7 +947,8 @@ test "TransactionCoordinator addPartitionsToTxn timeout returns protocol error a
     coord.dirty = false;
     if (coord.transactions.getPtr(pid)) |txn| {
         txn.timeout_ms = 1;
-        txn.start_time_ms = @import("time_compat").milliTimestamp() - 10_000;
+        txn.start_time_ms = wallClockMs();
+        txn.start_monotonic_ms = monotonicMs() - 10_000;
     }
 
     const err = try coord.addPartitionsToTxn(pid, result.producer_epoch, "topic-a", 1);
@@ -955,9 +998,11 @@ test "TransactionCoordinator expireTransactions auto-aborts" {
     _ = try coord.addPartitionsToTxn(pid, result.producer_epoch, "topic", 0);
     try testing.expectEqual(TransactionCoordinator.TxnStatus.ongoing, coord.getStatus(pid).?);
 
-    // Manipulate start_time to simulate timeout (set 120s in the past)
+    // Manipulate only the monotonic start time to simulate timeout. The
+    // Kafka-visible wall-clock start time is not the timeout source.
     if (coord.transactions.getPtr(pid)) |txn| {
-        txn.start_time_ms = @import("time_compat").milliTimestamp() - 120_000;
+        txn.start_time_ms = wallClockMs();
+        txn.start_monotonic_ms = monotonicMs() - 120_000;
     }
 
     const expired = coord.expireTransactions();

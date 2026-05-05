@@ -59,7 +59,11 @@ pub const ElectionLoop = struct {
 
                         // In a single-node cluster, skip pre-vote
                         if (self.raft_state.quorumSize() <= 1) {
-                            const result = self.raft_state.startElection();
+                            const result = self.raft_state.startElection() catch |err| {
+                                log.warn("Skipping single-node election: failed to persist raft.meta: {}", .{err});
+                                self.raft_state.election_timer.reset();
+                                continue;
+                            };
                             _ = result;
                             self.raft_state.becomeLeader();
                             log.info("Single-node cluster: became leader at epoch {d}", .{self.raft_state.current_epoch});
@@ -69,7 +73,11 @@ pub const ElectionLoop = struct {
                             if (self.broadcastAndCountPreVotes(pre_result)) {
                                 // Majority agrees — proceed to real election
                                 log.info("Pre-vote succeeded, starting real election", .{});
-                                const result = self.raft_state.startElection();
+                                const result = self.raft_state.startElection() catch |err| {
+                                    log.warn("Skipping election after successful pre-vote: failed to persist raft.meta: {}", .{err});
+                                    self.raft_state.election_timer.reset();
+                                    continue;
+                                };
                                 self.broadcastAndCountVotes(result);
                             } else {
                                 // Pre-vote failed — leader might still be alive, don't disrupt
@@ -84,13 +92,21 @@ pub const ElectionLoop = struct {
                     if (self.raft_state.isElectionTimedOut()) {
                         log.info("Election timed out, retrying with pre-vote", .{});
                         if (self.raft_state.quorumSize() <= 1) {
-                            const result = self.raft_state.startElection();
+                            const result = self.raft_state.startElection() catch |err| {
+                                log.warn("Skipping retry election: failed to persist raft.meta: {}", .{err});
+                                self.raft_state.election_timer.reset();
+                                continue;
+                            };
                             _ = result;
                             self.raft_state.becomeLeader();
                         } else {
                             const pre_result = self.raft_state.startPreVote();
                             if (self.broadcastAndCountPreVotes(pre_result)) {
-                                const result = self.raft_state.startElection();
+                                const result = self.raft_state.startElection() catch |err| {
+                                    log.warn("Skipping retry election after successful pre-vote: failed to persist raft.meta: {}", .{err});
+                                    self.raft_state.election_timer.reset();
+                                    continue;
+                                };
                                 self.broadcastAndCountVotes(result);
                             } else {
                                 self.raft_state.election_timer.reset();
@@ -123,9 +139,14 @@ pub const ElectionLoop = struct {
                     // Serialize prepared object registry before snapshot so it
                     // survives Raft log truncation
                     if (self.pre_snapshot_fn) |pre_fn| {
-                        self.raft_state.prepared_registry_data = pre_fn();
+                        self.raft_state.prepared_registry_data = pre_fn() orelse {
+                            log.warn("Skipping Raft snapshot because prepared-object registry serialization failed", .{});
+                            continue;
+                        };
                     }
-                    self.raft_state.takeSnapshot();
+                    self.raft_state.takeSnapshot() catch |err| {
+                        log.warn("Skipping Raft snapshot because persistence failed: {}", .{err});
+                    };
                     // Free serialized data after persistence
                     if (self.raft_state.prepared_registry_data) |d| {
                         if (self.snapshot_allocator) |sa| {
@@ -241,14 +262,18 @@ pub const ElectionLoop = struct {
                     .success = true,
                     .epoch = ae_req.epoch,
                     .match_index = match_index,
-                });
+                }) catch |err| {
+                    log.warn("Failed to process AppendEntries success response from follower {d}: {}", .{ follower_id, err });
+                };
             } else {
                 // Follower rejected — decrement next_index for retry
                 raft.handleAppendEntriesResponse(follower_id, .{
                     .success = false,
                     .epoch = ae_req.epoch,
                     .match_index = 0,
-                });
+                }) catch |err| {
+                    log.warn("Failed to process AppendEntries rejection from follower {d}: {}", .{ follower_id, err });
+                };
             }
         }
     }
@@ -257,18 +282,22 @@ pub const ElectionLoop = struct {
         const pool = self.raft_client_pool orelse return;
         const raft = self.raft_state;
 
-        var stale_ids = std.array_list.Managed(i32).init(pool.allocator);
-        defer stale_ids.deinit();
-
-        var client_it = pool.clients.iterator();
-        while (client_it.next()) |entry| {
-            const peer_id = entry.key_ptr.*;
-            if (peer_id == raft.node_id or !raft.voters.contains(peer_id)) {
-                stale_ids.append(peer_id) catch continue;
+        while (true) {
+            var stale_ids: [64]i32 = undefined;
+            var stale_count: usize = 0;
+            var client_it = pool.clients.iterator();
+            while (client_it.next()) |entry| {
+                const peer_id = entry.key_ptr.*;
+                if (peer_id == raft.node_id or !raft.voters.contains(peer_id)) {
+                    stale_ids[stale_count] = peer_id;
+                    stale_count += 1;
+                    if (stale_count == stale_ids.len) break;
+                }
             }
-        }
-        for (stale_ids.items) |peer_id| {
-            pool.removePeer(peer_id);
+            if (stale_count == 0) break;
+            for (stale_ids[0..stale_count]) |peer_id| {
+                pool.removePeer(peer_id);
+            }
         }
 
         var voter_it = raft.voters.iterator();
@@ -314,7 +343,7 @@ test "ElectionLoop single-node auto-promote" {
     try std.testing.expectEqual(RaftState.Role.unattached, raft.role);
 
     // Simulate what the election loop does for single-node
-    const result = raft.startElection();
+    const result = try raft.startElection();
     try std.testing.expectEqual(@as(i32, 1), result.epoch);
 
     if (raft.quorumSize() <= 1) {
@@ -334,7 +363,7 @@ test "ElectionLoop multi-node stays candidate" {
     try raft.addVoter(3);
 
     // Start election
-    _ = raft.startElection();
+    _ = try raft.startElection();
     try std.testing.expectEqual(RaftState.Role.candidate, raft.role);
 
     // Without majority votes, should stay candidate
@@ -347,7 +376,7 @@ test "ElectionLoop leader sends heartbeats on tick" {
     defer raft.deinit();
 
     try raft.addVoter(0);
-    _ = raft.startElection();
+    _ = try raft.startElection();
     raft.becomeLeader();
 
     // Verify state is correct for heartbeat sending
@@ -365,11 +394,11 @@ test "ElectionLoop follower transitions to candidate on timeout" {
     try raft.addVoter(2);
 
     // Start as follower
-    raft.becomeFollower(1, 0);
+    try raft.becomeFollower(1, 0);
     try std.testing.expectEqual(RaftState.Role.follower, raft.role);
 
     // Simulate election timeout by starting election
-    const result = raft.startElection();
+    const result = try raft.startElection();
     try std.testing.expectEqual(RaftState.Role.candidate, raft.role);
     try std.testing.expectEqual(@as(i32, 2), result.epoch);
 }
@@ -384,11 +413,11 @@ test "ElectionLoop candidate retries election on timeout" {
     try raft.addVoter(2);
 
     // First election — epoch 1
-    _ = raft.startElection();
+    _ = try raft.startElection();
     try std.testing.expectEqual(@as(i32, 1), raft.current_epoch);
 
     // No majority → stays candidate → timeout → new election
-    const result2 = raft.startElection();
+    const result2 = try raft.startElection();
     try std.testing.expectEqual(@as(i32, 2), result2.epoch);
     try std.testing.expectEqual(RaftState.Role.candidate, raft.role);
 }
@@ -440,4 +469,29 @@ test "ElectionLoop syncs RaftClientPool from committed voter endpoints" {
     const client3 = pool.getClient(3).?;
     try std.testing.expectEqualStrings("controller-3.example", client3.host);
     try std.testing.expectEqual(@as(u16, 29093), client3.port);
+}
+
+test "ElectionLoop removes stale Raft peers without allocation" {
+    var failing_allocator = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    var raft = RaftState.init(failing_allocator.allocator(), 1, "test-cluster");
+    defer raft.deinit();
+
+    try raft.addVoter(1);
+
+    var pool = RaftClientPool.init(failing_allocator.allocator());
+    defer pool.deinit();
+    try pool.addPeer(2, "removed-controller-2.example", 29093);
+
+    failing_allocator.fail_index = failing_allocator.alloc_index;
+
+    var should_stop = false;
+    var loop = ElectionLoop{
+        .raft_state = &raft,
+        .should_stop = &should_stop,
+        .raft_client_pool = &pool,
+    };
+    loop.syncClientPoolWithVoterMetadata();
+
+    try std.testing.expect(pool.getClient(2) == null);
+    try std.testing.expect(!failing_allocator.has_induced_failure);
 }

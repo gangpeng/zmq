@@ -3,6 +3,10 @@ const testing = std.testing;
 const Allocator = std.mem.Allocator;
 const log = std.log.scoped(.broker_registry);
 
+fn monotonicMs() i64 {
+    return @intCast(@import("time_compat").monotonicMilliTimestamp());
+}
+
 /// Tracks live brokers registered with the controller quorum.
 ///
 /// Broker-only nodes send BrokerRegistration on startup and periodic
@@ -28,7 +32,7 @@ pub const BrokerRegistry = struct {
         offline_log_dirs: [][16]u8 = &.{},
         /// Epoch assigned by controller on registration (used for WAL fencing).
         broker_epoch: i64 = 0,
-        /// Last heartbeat timestamp (ms since epoch).
+        /// Last heartbeat timestamp from a monotonic clock.
         last_heartbeat_ms: i64 = 0,
         /// A fenced broker is not accepting client traffic.
         /// Unfenced after first successful heartbeat.
@@ -75,7 +79,7 @@ pub const BrokerRegistry = struct {
     /// Install a registration with optional topology and local JBOD directory metadata.
     pub fn registerWithEpochRackAndLogDirs(self: *BrokerRegistry, broker_id: i32, host: []const u8, port: u16, rack: ?[]const u8, log_dirs: []const [16]u8, broker_epoch: i64, fenced: bool) !void {
         if (broker_epoch <= 0) return error.InvalidBrokerEpoch;
-        const now = @import("time_compat").milliTimestamp();
+        const now = monotonicMs();
 
         const host_copy = try self.allocator.dupe(u8, host);
         errdefer self.allocator.free(host_copy);
@@ -153,7 +157,7 @@ pub const BrokerRegistry = struct {
         const offline_copy = try self.allocator.dupe([16]u8, offline_log_dirs);
         errdefer if (offline_copy.len > 0) self.allocator.free(offline_copy);
 
-        entry.last_heartbeat_ms = @import("time_compat").milliTimestamp();
+        entry.last_heartbeat_ms = monotonicMs();
         if (entry.offline_log_dirs.len > 0) self.allocator.free(entry.offline_log_dirs);
         entry.offline_log_dirs = offline_copy;
         entry.fenced = fenced;
@@ -223,7 +227,7 @@ pub const BrokerRegistry = struct {
     /// Evict brokers that haven't sent a heartbeat within timeout_ms.
     /// Returns the number of evicted brokers.
     pub fn evictExpired(self: *BrokerRegistry, timeout_ms: i64) usize {
-        const now = @import("time_compat").milliTimestamp();
+        const now = monotonicMs();
         var to_evict: [64]i32 = undefined;
         var evict_count: usize = 0;
 
@@ -307,12 +311,32 @@ test "BrokerRegistry evict expired" {
 
     // Force expiration by setting last_heartbeat_ms to the past
     if (registry.brokers.getPtr(100)) |info| {
-        info.last_heartbeat_ms = @import("time_compat").milliTimestamp() - 60_000;
+        info.last_heartbeat_ms = monotonicMs() - 60_000;
     }
 
     const evicted = registry.evictExpired(30_000);
     try testing.expectEqual(@as(usize, 1), evicted);
     try testing.expectEqual(@as(usize, 1), registry.count());
+}
+
+test "BrokerRegistry heartbeat freshness uses monotonic timestamps" {
+    var registry = BrokerRegistry.init(testing.allocator);
+    defer registry.deinit();
+
+    const before = monotonicMs();
+    const epoch = try registry.register(100, "broker1", 9092);
+    var info = registry.brokers.get(100) orelse return error.TestUnexpectedResult;
+    const registered_at = info.last_heartbeat_ms;
+    const after_register = monotonicMs();
+    try testing.expect(registered_at >= before);
+    try testing.expect(registered_at <= after_register);
+
+    _ = try registry.heartbeat(100, epoch);
+    info = registry.brokers.get(100) orelse return error.TestUnexpectedResult;
+    const heartbeat_at = info.last_heartbeat_ms;
+    const after_heartbeat = monotonicMs();
+    try testing.expect(heartbeat_at >= registered_at);
+    try testing.expect(heartbeat_at <= after_heartbeat);
 }
 
 test "BrokerRegistry re-register replaces old entry" {
@@ -484,7 +508,7 @@ test "BrokerRegistry eviction does not affect healthy brokers" {
 
     // Force only broker 101 to expire
     if (registry.brokers.getPtr(101)) |info| {
-        info.last_heartbeat_ms = @import("time_compat").milliTimestamp() - 60_000;
+        info.last_heartbeat_ms = monotonicMs() - 60_000;
     }
 
     const evicted = registry.evictExpired(30_000);

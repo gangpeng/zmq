@@ -97,6 +97,12 @@ pub const ConfigFile = struct {
         return std.fmt.parseInt(T, str, 10) catch default;
     }
 
+    /// Get an integer property, failing when the property exists but is invalid.
+    pub fn getIntStrict(self: *const ConfigFile, comptime T: type, key: []const u8) !?T {
+        const str = self.props.get(key) orelse return null;
+        return std.fmt.parseInt(T, str, 10) catch error.InvalidConfigInteger;
+    }
+
     /// Get a boolean property.
     pub fn getBool(self: *const ConfigFile, key: []const u8, default: bool) bool {
         const str = self.props.get(key) orelse return default;
@@ -110,6 +116,39 @@ pub const ConfigFile = struct {
         return self.props.count();
     }
 };
+
+pub const ControllerVoter = struct {
+    node_id: i32,
+    host: []const u8,
+    port: u16,
+};
+
+pub fn parseControllerVoter(raw: []const u8) !ControllerVoter {
+    const entry = std.mem.trim(u8, raw, " \t\r\n");
+    if (entry.len == 0) return error.InvalidControllerVoter;
+
+    const at_pos = std.mem.indexOfScalar(u8, entry, '@') orelse return error.InvalidControllerVoter;
+    if (at_pos == 0 or at_pos + 1 >= entry.len) return error.InvalidControllerVoter;
+
+    const node_id = std.fmt.parseInt(i32, entry[0..at_pos], 10) catch return error.InvalidControllerVoter;
+    if (node_id < 0) return error.InvalidControllerVoter;
+    const addr = entry[at_pos + 1 ..];
+    const colon = std.mem.lastIndexOfScalar(u8, addr, ':') orelse return error.InvalidControllerVoter;
+    if (colon == 0 or colon + 1 >= addr.len) return error.InvalidControllerVoter;
+
+    const host = std.mem.trim(u8, addr[0..colon], " \t\r\n");
+    const port_text = std.mem.trim(u8, addr[colon + 1 ..], " \t\r\n");
+    if (host.len == 0 or port_text.len == 0) return error.InvalidControllerVoter;
+
+    const port = std.fmt.parseInt(u16, port_text, 10) catch return error.InvalidControllerVoter;
+    if (port == 0) return error.InvalidControllerVoter;
+
+    return .{
+        .node_id = node_id,
+        .host = host,
+        .port = port,
+    };
+}
 
 /// Apply config file properties to BrokerConfig.
 /// Supports the following Kafka-standard properties:
@@ -224,6 +263,20 @@ test "ConfigFile getters with defaults" {
     try testing.expect(cfg.getString("nonexistent") == null);
 }
 
+test "ConfigFile getIntStrict rejects malformed integers" {
+    var cfg = ConfigFile.init(testing.allocator);
+    defer cfg.deinit();
+
+    try cfg.parse(
+        \\broker.id=7
+        \\controller.listener.port=bad
+    );
+
+    try testing.expectEqual(@as(i32, 7), (try cfg.getIntStrict(i32, "broker.id")).?);
+    try testing.expect((try cfg.getIntStrict(u16, "missing")) == null);
+    try testing.expectError(error.InvalidConfigInteger, cfg.getIntStrict(u16, "controller.listener.port"));
+}
+
 test "ConfigFile override duplicate keys" {
     var cfg = ConfigFile.init(testing.allocator);
     defer cfg.deinit();
@@ -259,6 +312,35 @@ test "ConfigFile values with equals sign" {
 
     try cfg.parse("url=http://host:9000/path?a=1&b=2\n");
     try testing.expectEqualStrings("http://host:9000/path?a=1&b=2", cfg.getString("url").?);
+}
+
+test "parseControllerVoter parses strict controller quorum entries" {
+    const voter = try parseControllerVoter(" 1@controller-1:9093 ");
+    try testing.expectEqual(@as(i32, 1), voter.node_id);
+    try testing.expectEqualStrings("controller-1", voter.host);
+    try testing.expectEqual(@as(u16, 9093), voter.port);
+
+    const ipv6 = try parseControllerVoter("2@::1:19093");
+    try testing.expectEqual(@as(i32, 2), ipv6.node_id);
+    try testing.expectEqualStrings("::1", ipv6.host);
+    try testing.expectEqual(@as(u16, 19093), ipv6.port);
+}
+
+test "parseControllerVoter rejects malformed controller quorum entries" {
+    const invalid = [_][]const u8{
+        "",
+        "localhost:9093",
+        "x@localhost:9093",
+        "-1@localhost:9093",
+        "1@:9093",
+        "1@localhost:",
+        "1@localhost:notaport",
+        "1@localhost:0",
+        "1@localhost:70000",
+    };
+    for (invalid) |entry| {
+        try testing.expectError(error.InvalidControllerVoter, parseControllerVoter(entry));
+    }
 }
 
 test "ConfigFile applies client telemetry export sink" {

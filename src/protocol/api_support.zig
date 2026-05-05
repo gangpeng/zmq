@@ -71,9 +71,14 @@ pub const broker_supported_apis = [_]BrokerApiSupport{
     .{ .key = 31, .name = "DeleteAcls", .metric = "delete_acls", .min = 0, .max = 3 },
     .{ .key = 32, .name = "DescribeConfigs", .metric = "describe_configs", .min = 0, .max = 4 },
     .{ .key = 33, .name = "AlterConfigs", .metric = "alter_configs", .min = 0, .max = 2 },
+    .{ .key = 34, .name = "AlterReplicaLogDirs", .metric = "alter_replica_log_dirs", .min = 0, .max = 2 },
     .{ .key = 35, .name = "DescribeLogDirs", .metric = "describe_log_dirs", .min = 0, .max = 4 },
     .{ .key = 36, .name = "SaslAuthenticate", .metric = "sasl_authenticate", .min = 0, .max = 2 },
     .{ .key = 37, .name = "CreatePartitions", .metric = "create_partitions", .min = 0, .max = 3 },
+    .{ .key = 38, .name = "CreateDelegationToken", .metric = "create_delegation_token", .min = 0, .max = 3 },
+    .{ .key = 39, .name = "RenewDelegationToken", .metric = "renew_delegation_token", .min = 0, .max = 2 },
+    .{ .key = 40, .name = "ExpireDelegationToken", .metric = "expire_delegation_token", .min = 0, .max = 2 },
+    .{ .key = 41, .name = "DescribeDelegationToken", .metric = "describe_delegation_token", .min = 0, .max = 3 },
     .{ .key = 42, .name = "DeleteGroups", .metric = "delete_groups", .min = 0, .max = 2 },
     .{ .key = 43, .name = "ElectLeaders", .metric = "elect_leaders", .min = 0, .max = 2 },
     .{ .key = 44, .name = "IncrementalAlterConfigs", .metric = "incremental_alter_configs", .min = 0, .max = 1 },
@@ -306,9 +311,14 @@ pub const broker_handler_api_keys = [_]i16{
     31,
     32,
     33,
+    34,
     35,
     36,
     37,
+    38,
+    39,
+    40,
+    41,
     42,
     43,
     44,
@@ -377,6 +387,23 @@ pub const non_advertised_handler_api_keys = [_]i16{};
 /// non-advertised until their full coordinator/storage semantics are
 /// implemented. Keep empty when every generated handler case is advertised.
 pub const fail_closed_generated_handler_api_keys = [_]i16{};
+
+/// Generated request APIs that are intentionally not broker-port client APIs.
+/// Controller-only and internal forwarding APIs must remain non-advertised on
+/// the broker and fail closed before request body decoding.
+pub const generated_non_broker_request_api_keys = [_]i16{
+    56, // AlterPartition
+    58, // Envelope
+    59, // FetchSnapshot
+    62, // BrokerRegistration
+    63, // BrokerHeartbeat
+    64, // UnregisterBroker
+    67, // AllocateProducerIds
+    70, // ControllerRegistration
+    80, // AddRaftVoter
+    81, // RemoveRaftVoter
+    82, // UpdateRaftVoter
+};
 
 /// Controller handler switch cases. Version support comes from
 /// controller_supported_apis; this table only audits dispatch drift.
@@ -478,6 +505,13 @@ pub fn isFailClosedGeneratedHandlerApi(api_key: i16) bool {
 
 pub fn isGeneratedAutoMqExtension(api_key: i16) bool {
     return findGeneratedRequest(api_key) != null and api_key >= 501;
+}
+
+pub fn isGeneratedNonBrokerRequestApi(api_key: i16) bool {
+    for (generated_non_broker_request_api_keys) |key| {
+        if (key == api_key) return true;
+    }
+    return false;
 }
 
 fn countOccurrences(haystack: []const u8, needle: []const u8) usize {
@@ -745,6 +779,19 @@ test "fail-closed generated handler APIs are not advertised" {
         try testing.expect(hasBrokerHandler(key));
         try testing.expect(findBrokerSupport(key) == null);
         try testing.expect(findGeneratedRequest(key) != null);
+    }
+}
+
+test "generated non-broker request APIs are not broker advertised or dispatched" {
+    var previous: ?i16 = null;
+    for (generated_non_broker_request_api_keys) |key| {
+        if (previous) |prev| try testing.expect(key > prev);
+        previous = key;
+
+        try testing.expect(isGeneratedNonBrokerRequestApi(key));
+        try testing.expect(findGeneratedRequest(key) != null);
+        try testing.expect(findBrokerSupport(key) == null);
+        try testing.expect(!hasBrokerHandler(key));
     }
 }
 

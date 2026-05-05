@@ -3,6 +3,10 @@ const testing = std.testing;
 const Allocator = std.mem.Allocator;
 const log = std.log.scoped(.quota);
 
+fn monotonicMs() i64 {
+    return @intCast(@import("time_compat").monotonicMilliTimestamp());
+}
+
 /// Client quota manager.
 ///
 /// Tracks per-client produce/fetch byte rates and request rates.
@@ -98,10 +102,10 @@ pub const QuotaManager = struct {
         const limit = selected.limit;
         if (limit <= 0) return 0; // unlimited
 
-        const now = @import("time_compat").milliTimestamp();
+        const now = monotonicMs();
 
         // Reset window if expired
-        if (now - window.window_start_ms >= window.window_size_ms) {
+        if (window.window_start_ms == 0 or now - window.window_start_ms >= window.window_size_ms) {
             window.bytes_in_window = 0;
             window.window_start_ms = now;
         }

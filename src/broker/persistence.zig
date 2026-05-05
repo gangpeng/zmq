@@ -12,6 +12,18 @@ fn hasComptimeField(comptime T: type, comptime field_name: []const u8) bool {
     };
 }
 
+fn isValidEnumInt(comptime T: type, value: i8) bool {
+    return switch (@typeInfo(T)) {
+        .@"enum" => |enum_info| {
+            inline for (enum_info.fields) |field| {
+                if (field.value == value) return true;
+            }
+            return false;
+        },
+        else => false,
+    };
+}
+
 /// Persists broker metadata (topics, offsets) to a JSON file in the data directory.
 /// Loaded on startup, saved on changes.
 pub const MetadataPersistence = struct {
@@ -45,6 +57,25 @@ pub const MetadataPersistence = struct {
         group_id: []u8,
         link_id: []u8,
         promoted: bool,
+    };
+
+    pub const DelegationTokenRenewerEntry = struct {
+        principal_type: []u8,
+        principal_name: []u8,
+    };
+
+    pub const DelegationTokenEntry = struct {
+        key: []u8,
+        owner_principal_type: []u8,
+        owner_principal_name: []u8,
+        requester_principal_type: []u8,
+        requester_principal_name: []u8,
+        token_id: []u8,
+        hmac: []u8,
+        renewers: []DelegationTokenRenewerEntry,
+        issue_timestamp_ms: i64,
+        expiry_timestamp_ms: i64,
+        max_timestamp_ms: i64,
     };
 
     pub const AutoMqMetadataSnapshot = struct {
@@ -102,6 +133,27 @@ pub const MetadataPersistence = struct {
         return out;
     }
 
+    fn parseIntForSnapshot(comptime T: type, text: []const u8, comptime snapshot_error: anyerror) !T {
+        return std.fmt.parseInt(T, text, 10) catch return snapshot_error;
+    }
+
+    fn decodeHexAllocForSnapshot(allocator: Allocator, text: []const u8, comptime snapshot_error: anyerror) ![]u8 {
+        return decodeHexAlloc(allocator, text) catch |err| switch (err) {
+            error.InvalidHex => snapshot_error,
+            else => err,
+        };
+    }
+
+    fn decodeUuidHexForSnapshot(text: []const u8, comptime snapshot_error: anyerror) ![16]u8 {
+        return decodeUuidHex(text) catch return snapshot_error;
+    }
+
+    fn decodeOptionalHexAllocForSnapshot(allocator: Allocator, has_value_text: []const u8, hex_text: []const u8, comptime snapshot_error: anyerror) !?[]u8 {
+        const has_value = parseBoolFlag(has_value_text) catch return snapshot_error;
+        if (!has_value) return null;
+        return try decodeHexAllocForSnapshot(allocator, hex_text, snapshot_error);
+    }
+
     fn decodeUuidHex(text: []const u8) ![16]u8 {
         if (text.len != 32) return error.InvalidHex;
 
@@ -134,6 +186,13 @@ pub const MetadataPersistence = struct {
             try values.append(try std.fmt.parseInt(i32, field, 10));
         }
         return values.toOwnedSlice();
+    }
+
+    fn parseI32CsvAllocForSnapshot(allocator: Allocator, text: []const u8, comptime snapshot_error: anyerror) ![]i32 {
+        return parseI32CsvAlloc(allocator, text) catch |err| switch (err) {
+            error.InvalidCsv, error.InvalidCharacter, error.Overflow => snapshot_error,
+            else => err,
+        };
     }
 
     fn parseBoolFlag(text: []const u8) !bool {
@@ -258,69 +317,59 @@ pub const MetadataPersistence = struct {
         defer self.allocator.free(path);
 
         const file = fs.openFileAbsolute(path, .{}) catch |err| {
-            log.debug("No topics.meta found: {}", .{err});
-            return &.{};
+            return switch (err) {
+                error.FileNotFound => &.{},
+                else => err,
+            };
         };
         defer file.close();
 
-        const content = file.readToEndAlloc(self.allocator, 1024 * 1024) catch |err| {
-            log.warn("Failed to read topics.meta: {}", .{err});
-            return &.{};
-        };
+        const content = try file.readToEndAlloc(self.allocator, 1024 * 1024);
         defer self.allocator.free(content);
 
         var entries = std.array_list.Managed(TopicEntry).init(self.allocator);
+        errdefer {
+            for (entries.items) |entry| self.allocator.free(entry.name);
+            entries.deinit();
+        }
 
         var lines = std.mem.splitSequence(u8, content, "\n");
         while (lines.next()) |line| {
             if (line.len == 0) continue;
 
             var fields = std.mem.splitSequence(u8, line, "\t");
-            const first = fields.next() orelse continue;
+            const first = fields.next() orelse return error.InvalidTopicSnapshot;
 
             if (std.mem.eql(u8, first, "topic_v4")) {
-                const name_hex = fields.next() orelse continue;
-                const topic_id_hex = fields.next() orelse continue;
-                const parts_str = fields.next() orelse continue;
-                const rf_str = fields.next() orelse continue;
-                const retention_ms_str = fields.next() orelse continue;
-                const retention_bytes_str = fields.next() orelse continue;
-                const max_message_bytes_str = fields.next() orelse continue;
-                const min_insync_replicas_str = fields.next() orelse continue;
-                const segment_bytes_str = fields.next() orelse continue;
-                const cleanup_policy_hex = fields.next() orelse continue;
-                const compression_type_hex = fields.next() orelse continue;
+                const name_hex = fields.next() orelse return error.InvalidTopicSnapshot;
+                const topic_id_hex = fields.next() orelse return error.InvalidTopicSnapshot;
+                const parts_str = fields.next() orelse return error.InvalidTopicSnapshot;
+                const rf_str = fields.next() orelse return error.InvalidTopicSnapshot;
+                const retention_ms_str = fields.next() orelse return error.InvalidTopicSnapshot;
+                const retention_bytes_str = fields.next() orelse return error.InvalidTopicSnapshot;
+                const max_message_bytes_str = fields.next() orelse return error.InvalidTopicSnapshot;
+                const min_insync_replicas_str = fields.next() orelse return error.InvalidTopicSnapshot;
+                const segment_bytes_str = fields.next() orelse return error.InvalidTopicSnapshot;
+                const cleanup_policy_hex = fields.next() orelse return error.InvalidTopicSnapshot;
+                const compression_type_hex = fields.next() orelse return error.InvalidTopicSnapshot;
+                if (fields.next() != null) return error.InvalidTopicSnapshot;
 
-                const name = decodeHexAlloc(self.allocator, name_hex) catch continue;
-                const topic_id = decodeUuidHex(topic_id_hex) catch {
-                    self.allocator.free(name);
-                    continue;
-                };
-                const num_parts = std.fmt.parseInt(i32, parts_str, 10) catch {
-                    self.allocator.free(name);
-                    continue;
-                };
-                const rf = std.fmt.parseInt(i16, rf_str, 10) catch {
-                    self.allocator.free(name);
-                    continue;
-                };
-                const retention_ms = std.fmt.parseInt(i64, retention_ms_str, 10) catch default_topic_retention_ms;
-                const retention_bytes = std.fmt.parseInt(i64, retention_bytes_str, 10) catch default_topic_retention_bytes;
-                const max_message_bytes = std.fmt.parseInt(i32, max_message_bytes_str, 10) catch default_topic_max_message_bytes;
-                const min_insync_replicas = std.fmt.parseInt(i32, min_insync_replicas_str, 10) catch default_topic_min_insync_replicas;
-                const segment_bytes = std.fmt.parseInt(i64, segment_bytes_str, 10) catch default_topic_segment_bytes;
-                const cleanup_policy_owned = decodeHexAlloc(self.allocator, cleanup_policy_hex) catch {
-                    self.allocator.free(name);
-                    continue;
-                };
+                const name = try decodeHexAllocForSnapshot(self.allocator, name_hex, error.InvalidTopicSnapshot);
+                errdefer self.allocator.free(name);
+                const topic_id = try decodeUuidHexForSnapshot(topic_id_hex, error.InvalidTopicSnapshot);
+                const num_parts = try parseIntForSnapshot(i32, parts_str, error.InvalidTopicSnapshot);
+                const rf = try parseIntForSnapshot(i16, rf_str, error.InvalidTopicSnapshot);
+                const retention_ms = try parseIntForSnapshot(i64, retention_ms_str, error.InvalidTopicSnapshot);
+                const retention_bytes = try parseIntForSnapshot(i64, retention_bytes_str, error.InvalidTopicSnapshot);
+                const max_message_bytes = try parseIntForSnapshot(i32, max_message_bytes_str, error.InvalidTopicSnapshot);
+                const min_insync_replicas = try parseIntForSnapshot(i32, min_insync_replicas_str, error.InvalidTopicSnapshot);
+                const segment_bytes = try parseIntForSnapshot(i64, segment_bytes_str, error.InvalidTopicSnapshot);
+                const cleanup_policy_owned = try decodeHexAllocForSnapshot(self.allocator, cleanup_policy_hex, error.InvalidTopicSnapshot);
                 defer self.allocator.free(cleanup_policy_owned);
-                const compression_type_owned = decodeHexAlloc(self.allocator, compression_type_hex) catch {
-                    self.allocator.free(name);
-                    continue;
-                };
+                const compression_type_owned = try decodeHexAllocForSnapshot(self.allocator, compression_type_hex, error.InvalidTopicSnapshot);
                 defer self.allocator.free(compression_type_owned);
-                const cleanup_policy = normalizeTopicCleanupPolicy(cleanup_policy_owned) orelse default_topic_cleanup_policy;
-                const compression_type = normalizeTopicCompressionType(compression_type_owned) orelse default_topic_compression_type;
+                const cleanup_policy = normalizeTopicCleanupPolicy(cleanup_policy_owned) orelse return error.InvalidTopicSnapshot;
+                const compression_type = normalizeTopicCompressionType(compression_type_owned) orelse return error.InvalidTopicSnapshot;
 
                 try entries.append(.{
                     .name = name,
@@ -336,32 +385,25 @@ pub const MetadataPersistence = struct {
                     .compression_type = compression_type,
                 });
             } else if (std.mem.eql(u8, first, "topic_v3")) {
-                const name_hex = fields.next() orelse continue;
-                const topic_id_hex = fields.next() orelse continue;
-                const parts_str = fields.next() orelse continue;
-                const rf_str = fields.next() orelse continue;
-                const retention_ms_str = fields.next() orelse continue;
-                const retention_bytes_str = fields.next() orelse continue;
-                const max_message_bytes_str = fields.next() orelse continue;
-                const min_insync_replicas_str = fields.next() orelse continue;
+                const name_hex = fields.next() orelse return error.InvalidTopicSnapshot;
+                const topic_id_hex = fields.next() orelse return error.InvalidTopicSnapshot;
+                const parts_str = fields.next() orelse return error.InvalidTopicSnapshot;
+                const rf_str = fields.next() orelse return error.InvalidTopicSnapshot;
+                const retention_ms_str = fields.next() orelse return error.InvalidTopicSnapshot;
+                const retention_bytes_str = fields.next() orelse return error.InvalidTopicSnapshot;
+                const max_message_bytes_str = fields.next() orelse return error.InvalidTopicSnapshot;
+                const min_insync_replicas_str = fields.next() orelse return error.InvalidTopicSnapshot;
+                if (fields.next() != null) return error.InvalidTopicSnapshot;
 
-                const name = decodeHexAlloc(self.allocator, name_hex) catch continue;
-                const topic_id = decodeUuidHex(topic_id_hex) catch {
-                    self.allocator.free(name);
-                    continue;
-                };
-                const num_parts = std.fmt.parseInt(i32, parts_str, 10) catch {
-                    self.allocator.free(name);
-                    continue;
-                };
-                const rf = std.fmt.parseInt(i16, rf_str, 10) catch {
-                    self.allocator.free(name);
-                    continue;
-                };
-                const retention_ms = std.fmt.parseInt(i64, retention_ms_str, 10) catch default_topic_retention_ms;
-                const retention_bytes = std.fmt.parseInt(i64, retention_bytes_str, 10) catch default_topic_retention_bytes;
-                const max_message_bytes = std.fmt.parseInt(i32, max_message_bytes_str, 10) catch default_topic_max_message_bytes;
-                const min_insync_replicas = std.fmt.parseInt(i32, min_insync_replicas_str, 10) catch default_topic_min_insync_replicas;
+                const name = try decodeHexAllocForSnapshot(self.allocator, name_hex, error.InvalidTopicSnapshot);
+                errdefer self.allocator.free(name);
+                const topic_id = try decodeUuidHexForSnapshot(topic_id_hex, error.InvalidTopicSnapshot);
+                const num_parts = try parseIntForSnapshot(i32, parts_str, error.InvalidTopicSnapshot);
+                const rf = try parseIntForSnapshot(i16, rf_str, error.InvalidTopicSnapshot);
+                const retention_ms = try parseIntForSnapshot(i64, retention_ms_str, error.InvalidTopicSnapshot);
+                const retention_bytes = try parseIntForSnapshot(i64, retention_bytes_str, error.InvalidTopicSnapshot);
+                const max_message_bytes = try parseIntForSnapshot(i32, max_message_bytes_str, error.InvalidTopicSnapshot);
+                const min_insync_replicas = try parseIntForSnapshot(i32, min_insync_replicas_str, error.InvalidTopicSnapshot);
 
                 try entries.append(.{
                     .name = name,
@@ -374,27 +416,23 @@ pub const MetadataPersistence = struct {
                     .min_insync_replicas = min_insync_replicas,
                 });
             } else if (std.mem.eql(u8, first, "topic_v2")) {
-                const name_hex = fields.next() orelse continue;
-                const parts_str = fields.next() orelse continue;
-                const rf_str = fields.next() orelse continue;
-                const retention_ms_str = fields.next() orelse continue;
-                const retention_bytes_str = fields.next() orelse continue;
-                const max_message_bytes_str = fields.next() orelse continue;
-                const min_insync_replicas_str = fields.next() orelse continue;
+                const name_hex = fields.next() orelse return error.InvalidTopicSnapshot;
+                const parts_str = fields.next() orelse return error.InvalidTopicSnapshot;
+                const rf_str = fields.next() orelse return error.InvalidTopicSnapshot;
+                const retention_ms_str = fields.next() orelse return error.InvalidTopicSnapshot;
+                const retention_bytes_str = fields.next() orelse return error.InvalidTopicSnapshot;
+                const max_message_bytes_str = fields.next() orelse return error.InvalidTopicSnapshot;
+                const min_insync_replicas_str = fields.next() orelse return error.InvalidTopicSnapshot;
+                if (fields.next() != null) return error.InvalidTopicSnapshot;
 
-                const name = decodeHexAlloc(self.allocator, name_hex) catch continue;
-                const num_parts = std.fmt.parseInt(i32, parts_str, 10) catch {
-                    self.allocator.free(name);
-                    continue;
-                };
-                const rf = std.fmt.parseInt(i16, rf_str, 10) catch {
-                    self.allocator.free(name);
-                    continue;
-                };
-                const retention_ms = std.fmt.parseInt(i64, retention_ms_str, 10) catch default_topic_retention_ms;
-                const retention_bytes = std.fmt.parseInt(i64, retention_bytes_str, 10) catch default_topic_retention_bytes;
-                const max_message_bytes = std.fmt.parseInt(i32, max_message_bytes_str, 10) catch default_topic_max_message_bytes;
-                const min_insync_replicas = std.fmt.parseInt(i32, min_insync_replicas_str, 10) catch default_topic_min_insync_replicas;
+                const name = try decodeHexAllocForSnapshot(self.allocator, name_hex, error.InvalidTopicSnapshot);
+                errdefer self.allocator.free(name);
+                const num_parts = try parseIntForSnapshot(i32, parts_str, error.InvalidTopicSnapshot);
+                const rf = try parseIntForSnapshot(i16, rf_str, error.InvalidTopicSnapshot);
+                const retention_ms = try parseIntForSnapshot(i64, retention_ms_str, error.InvalidTopicSnapshot);
+                const retention_bytes = try parseIntForSnapshot(i64, retention_bytes_str, error.InvalidTopicSnapshot);
+                const max_message_bytes = try parseIntForSnapshot(i32, max_message_bytes_str, error.InvalidTopicSnapshot);
+                const min_insync_replicas = try parseIntForSnapshot(i32, min_insync_replicas_str, error.InvalidTopicSnapshot);
 
                 try entries.append(.{
                     .name = name,
@@ -406,14 +444,17 @@ pub const MetadataPersistence = struct {
                     .min_insync_replicas = min_insync_replicas,
                 });
             } else {
-                const parts_str = fields.next() orelse continue;
-                const rf_str = fields.next() orelse continue;
+                const parts_str = fields.next() orelse return error.InvalidTopicSnapshot;
+                const rf_str = fields.next() orelse return error.InvalidTopicSnapshot;
+                if (fields.next() != null) return error.InvalidTopicSnapshot;
 
-                const num_parts = std.fmt.parseInt(i32, parts_str, 10) catch continue;
-                const rf = std.fmt.parseInt(i16, rf_str, 10) catch continue;
+                const num_parts = try parseIntForSnapshot(i32, parts_str, error.InvalidTopicSnapshot);
+                const rf = try parseIntForSnapshot(i16, rf_str, error.InvalidTopicSnapshot);
+                const name = try self.allocator.dupe(u8, first);
+                errdefer self.allocator.free(name);
 
                 try entries.append(.{
-                    .name = try self.allocator.dupe(u8, first),
+                    .name = name,
                     .num_partitions = num_parts,
                     .replication_factor = rf,
                 });
@@ -457,36 +498,47 @@ pub const MetadataPersistence = struct {
         defer self.allocator.free(path);
 
         const file = fs.openFileAbsolute(path, .{}) catch |err| {
-            log.debug("No offsets.meta found: {}", .{err});
-            return &.{};
+            return switch (err) {
+                error.FileNotFound => &.{},
+                else => err,
+            };
         };
         defer file.close();
 
-        const content = file.readToEndAlloc(self.allocator, 1024 * 1024) catch |err| {
-            log.warn("Failed to read offsets.meta: {}", .{err});
-            return &.{};
-        };
+        const content = try file.readToEndAlloc(self.allocator, 1024 * 1024);
         defer self.allocator.free(content);
 
         var entries = std.array_list.Managed(OffsetEntry).init(self.allocator);
+        errdefer {
+            for (entries.items) |entry| {
+                self.allocator.free(entry.key);
+                if (entry.metadata) |metadata| self.allocator.free(metadata);
+            }
+            entries.deinit();
+        }
 
         var lines = std.mem.splitSequence(u8, content, "\n");
         while (lines.next()) |line| {
             if (line.len == 0) continue;
             var fields = std.mem.splitSequence(u8, line, "\t");
-            const key = fields.next() orelse continue;
-            const val_str = fields.next() orelse continue;
-            const offset = std.fmt.parseInt(i64, val_str, 10) catch continue;
+            const key = fields.next() orelse return error.InvalidOffsetSnapshot;
+            const val_str = fields.next() orelse return error.InvalidOffsetSnapshot;
+            const offset = try parseIntForSnapshot(i64, val_str, error.InvalidOffsetSnapshot);
             const leader_epoch_str = fields.next() orelse "";
             const leader_epoch = if (leader_epoch_str.len > 0)
-                std.fmt.parseInt(i32, leader_epoch_str, 10) catch -1
+                try parseIntForSnapshot(i32, leader_epoch_str, error.InvalidOffsetSnapshot)
             else
                 -1;
             const has_metadata_str = fields.next() orelse "0";
             const metadata_hex = fields.next() orelse "";
-            const metadata = decodeOptionalHexAlloc(self.allocator, has_metadata_str, metadata_hex) catch continue;
+            if (fields.next() != null) return error.InvalidOffsetSnapshot;
+            if (std.mem.eql(u8, has_metadata_str, "0") and metadata_hex.len != 0) return error.InvalidOffsetSnapshot;
+            const metadata = try decodeOptionalHexAllocForSnapshot(self.allocator, has_metadata_str, metadata_hex, error.InvalidOffsetSnapshot);
+            errdefer if (metadata) |owned_metadata| self.allocator.free(owned_metadata);
+            const key_copy = try self.allocator.dupe(u8, key);
+            errdefer self.allocator.free(key_copy);
             try entries.append(.{
-                .key = try self.allocator.dupe(u8, key),
+                .key = key_copy,
                 .offset = offset,
                 .leader_epoch = leader_epoch,
                 .metadata = metadata,
@@ -604,15 +656,14 @@ pub const MetadataPersistence = struct {
         defer self.allocator.free(path);
 
         const file = fs.openFileAbsolute(path, .{}) catch |err| {
-            log.debug("No consumer_groups.meta found: {}", .{err});
-            return &.{};
+            return switch (err) {
+                error.FileNotFound => &.{},
+                else => err,
+            };
         };
         defer file.close();
 
-        const content = file.readToEndAlloc(self.allocator, 4 * 1024 * 1024) catch |err| {
-            log.warn("Failed to read consumer_groups.meta: {}", .{err});
-            return &.{};
-        };
+        const content = try file.readToEndAlloc(self.allocator, 4 * 1024 * 1024);
         defer self.allocator.free(content);
 
         var entries = std.array_list.Managed(ConsumerGroupEntry).init(self.allocator);
@@ -626,203 +677,120 @@ pub const MetadataPersistence = struct {
             if (line.len == 0) continue;
 
             var fields = std.mem.splitSequence(u8, line, "\t");
-            const tag = fields.next() orelse continue;
-            if (!std.mem.eql(u8, tag, "group_v1")) continue;
+            const tag = fields.next() orelse return error.InvalidConsumerGroupSnapshot;
+            if (!std.mem.eql(u8, tag, "group_v1")) return error.InvalidConsumerGroupSnapshot;
 
-            const group_id_hex = fields.next() orelse continue;
-            const state_str = fields.next() orelse continue;
-            const generation_str = fields.next() orelse continue;
-            const next_member_id_str = fields.next() orelse continue;
-            const has_leader_str = fields.next() orelse continue;
+            const group_id_hex = fields.next() orelse return error.InvalidConsumerGroupSnapshot;
+            const state_str = fields.next() orelse return error.InvalidConsumerGroupSnapshot;
+            const generation_str = fields.next() orelse return error.InvalidConsumerGroupSnapshot;
+            const next_member_id_str = fields.next() orelse return error.InvalidConsumerGroupSnapshot;
+            const has_leader_str = fields.next() orelse return error.InvalidConsumerGroupSnapshot;
             const leader_hex = fields.next() orelse "";
-            const rebalance_timeout_str = fields.next() orelse continue;
-            const session_timeout_str = fields.next() orelse continue;
-            const member_count_str = fields.next() orelse continue;
+            const rebalance_timeout_str = fields.next() orelse return error.InvalidConsumerGroupSnapshot;
+            const session_timeout_str = fields.next() orelse return error.InvalidConsumerGroupSnapshot;
+            const member_count_str = fields.next() orelse return error.InvalidConsumerGroupSnapshot;
 
-            const group_id = decodeHexAlloc(self.allocator, group_id_hex) catch continue;
-            const leader_id = decodeOptionalHexAlloc(self.allocator, has_leader_str, leader_hex) catch {
-                self.allocator.free(group_id);
-                continue;
-            };
+            if (std.mem.eql(u8, has_leader_str, "0") and leader_hex.len != 0) return error.InvalidConsumerGroupSnapshot;
+            const group_id = try decodeHexAllocForSnapshot(self.allocator, group_id_hex, error.InvalidConsumerGroupSnapshot);
+            errdefer self.allocator.free(group_id);
+            const leader_id = try decodeOptionalHexAllocForSnapshot(self.allocator, has_leader_str, leader_hex, error.InvalidConsumerGroupSnapshot);
+            errdefer if (leader_id) |owned_leader| self.allocator.free(owned_leader);
 
-            const state = std.fmt.parseInt(u8, state_str, 10) catch {
-                self.allocator.free(group_id);
-                if (leader_id) |owned_leader| self.allocator.free(owned_leader);
-                continue;
-            };
-            const generation_id = std.fmt.parseInt(i32, generation_str, 10) catch {
-                self.allocator.free(group_id);
-                if (leader_id) |owned_leader| self.allocator.free(owned_leader);
-                continue;
-            };
-            const next_member_id = std.fmt.parseInt(u64, next_member_id_str, 10) catch {
-                self.allocator.free(group_id);
-                if (leader_id) |owned_leader| self.allocator.free(owned_leader);
-                continue;
-            };
-            const rebalance_timeout_ms = std.fmt.parseInt(i64, rebalance_timeout_str, 10) catch {
-                self.allocator.free(group_id);
-                if (leader_id) |owned_leader| self.allocator.free(owned_leader);
-                continue;
-            };
-            const session_timeout_ms = std.fmt.parseInt(i64, session_timeout_str, 10) catch {
-                self.allocator.free(group_id);
-                if (leader_id) |owned_leader| self.allocator.free(owned_leader);
-                continue;
-            };
-            const member_count = std.fmt.parseInt(usize, member_count_str, 10) catch {
-                self.allocator.free(group_id);
-                if (leader_id) |owned_leader| self.allocator.free(owned_leader);
-                continue;
-            };
+            const state = try parseIntForSnapshot(u8, state_str, error.InvalidConsumerGroupSnapshot);
+            const generation_id = try parseIntForSnapshot(i32, generation_str, error.InvalidConsumerGroupSnapshot);
+            const next_member_id = try parseIntForSnapshot(u64, next_member_id_str, error.InvalidConsumerGroupSnapshot);
+            const rebalance_timeout_ms = try parseIntForSnapshot(i64, rebalance_timeout_str, error.InvalidConsumerGroupSnapshot);
+            const session_timeout_ms = try parseIntForSnapshot(i64, session_timeout_str, error.InvalidConsumerGroupSnapshot);
+            const member_count = try parseIntForSnapshot(usize, member_count_str, error.InvalidConsumerGroupSnapshot);
+            if (member_count > 100_000) return error.InvalidConsumerGroupSnapshot;
+
             var group_protocol_type: ?[]u8 = null;
+            errdefer if (group_protocol_type) |owned_protocol_type| self.allocator.free(owned_protocol_type);
             if (fields.next()) |has_protocol_type_str| {
-                const protocol_type_hex = fields.next() orelse "";
-                group_protocol_type = decodeOptionalHexAlloc(self.allocator, has_protocol_type_str, protocol_type_hex) catch {
-                    self.allocator.free(group_id);
-                    if (leader_id) |owned_leader| self.allocator.free(owned_leader);
-                    continue;
-                };
+                const protocol_type_hex = fields.next() orelse return error.InvalidConsumerGroupSnapshot;
+                if (std.mem.eql(u8, has_protocol_type_str, "0") and protocol_type_hex.len != 0) return error.InvalidConsumerGroupSnapshot;
+                group_protocol_type = try decodeOptionalHexAllocForSnapshot(self.allocator, has_protocol_type_str, protocol_type_hex, error.InvalidConsumerGroupSnapshot);
             }
             var group_protocol_name: ?[]u8 = null;
+            errdefer if (group_protocol_name) |owned_protocol_name| self.allocator.free(owned_protocol_name);
             if (fields.next()) |has_protocol_name_str| {
-                const protocol_name_hex = fields.next() orelse "";
-                group_protocol_name = decodeOptionalHexAlloc(self.allocator, has_protocol_name_str, protocol_name_hex) catch {
-                    self.allocator.free(group_id);
-                    if (leader_id) |owned_leader| self.allocator.free(owned_leader);
-                    if (group_protocol_type) |owned_protocol_type| self.allocator.free(owned_protocol_type);
-                    continue;
-                };
+                const protocol_name_hex = fields.next() orelse return error.InvalidConsumerGroupSnapshot;
+                if (std.mem.eql(u8, has_protocol_name_str, "0") and protocol_name_hex.len != 0) return error.InvalidConsumerGroupSnapshot;
+                group_protocol_name = try decodeOptionalHexAllocForSnapshot(self.allocator, has_protocol_name_str, protocol_name_hex, error.InvalidConsumerGroupSnapshot);
             }
+            if (fields.next() != null) return error.InvalidConsumerGroupSnapshot;
 
             var members = std.array_list.Managed(ConsumerGroupMemberEntry).init(self.allocator);
             defer members.deinit();
-            var valid_group = true;
+            errdefer self.freeConsumerGroupMemberEntries(members.items);
             for (0..member_count) |_| {
-                const member_line = lines.next() orelse {
-                    valid_group = false;
-                    break;
-                };
+                const member_line = lines.next() orelse return error.InvalidConsumerGroupSnapshot;
+                if (member_line.len == 0) return error.InvalidConsumerGroupSnapshot;
                 var member_fields = std.mem.splitSequence(u8, member_line, "\t");
-                const member_tag = member_fields.next() orelse {
-                    valid_group = false;
-                    break;
-                };
-                if (!std.mem.eql(u8, member_tag, "member_v1")) {
-                    valid_group = false;
-                    break;
-                }
+                const member_tag = member_fields.next() orelse return error.InvalidConsumerGroupSnapshot;
+                if (!std.mem.eql(u8, member_tag, "member_v1")) return error.InvalidConsumerGroupSnapshot;
 
-                const member_id_hex = member_fields.next() orelse {
-                    valid_group = false;
-                    break;
-                };
-                const has_instance_str = member_fields.next() orelse {
-                    valid_group = false;
-                    break;
-                };
+                const member_id_hex = member_fields.next() orelse return error.InvalidConsumerGroupSnapshot;
+                const has_instance_str = member_fields.next() orelse return error.InvalidConsumerGroupSnapshot;
                 const instance_hex = member_fields.next() orelse "";
-                const heartbeat_str = member_fields.next() orelse {
-                    valid_group = false;
-                    break;
-                };
-                const has_assignment_str = member_fields.next() orelse {
-                    valid_group = false;
-                    break;
-                };
+                const heartbeat_str = member_fields.next() orelse return error.InvalidConsumerGroupSnapshot;
+                const has_assignment_str = member_fields.next() orelse return error.InvalidConsumerGroupSnapshot;
                 const assignment_hex = member_fields.next() orelse "";
-                const has_protocol_str = member_fields.next() orelse {
-                    valid_group = false;
-                    break;
-                };
+                const has_protocol_str = member_fields.next() orelse return error.InvalidConsumerGroupSnapshot;
                 const protocol_hex = member_fields.next() orelse "";
-                const subscription_count_str = member_fields.next() orelse {
-                    valid_group = false;
-                    break;
-                };
+                const subscription_count_str = member_fields.next() orelse return error.InvalidConsumerGroupSnapshot;
 
-                const member_id = decodeHexAlloc(self.allocator, member_id_hex) catch {
-                    valid_group = false;
-                    break;
-                };
-                const group_instance_id = decodeOptionalHexAlloc(self.allocator, has_instance_str, instance_hex) catch {
-                    self.allocator.free(member_id);
-                    valid_group = false;
-                    break;
-                };
-                const last_heartbeat_ms = std.fmt.parseInt(i64, heartbeat_str, 10) catch {
-                    self.allocator.free(member_id);
-                    if (group_instance_id) |owned_instance| self.allocator.free(owned_instance);
-                    valid_group = false;
-                    break;
-                };
-                const assignment = decodeOptionalHexAlloc(self.allocator, has_assignment_str, assignment_hex) catch {
-                    self.allocator.free(member_id);
-                    if (group_instance_id) |owned_instance| self.allocator.free(owned_instance);
-                    valid_group = false;
-                    break;
-                };
-                const protocol_name = decodeOptionalHexAlloc(self.allocator, has_protocol_str, protocol_hex) catch {
-                    self.allocator.free(member_id);
-                    if (group_instance_id) |owned_instance| self.allocator.free(owned_instance);
-                    if (assignment) |owned_assignment| self.allocator.free(owned_assignment);
-                    valid_group = false;
-                    break;
-                };
-                const subscription_count = std.fmt.parseInt(usize, subscription_count_str, 10) catch {
-                    self.allocator.free(member_id);
-                    if (group_instance_id) |owned_instance| self.allocator.free(owned_instance);
-                    if (assignment) |owned_assignment| self.allocator.free(owned_assignment);
-                    if (protocol_name) |owned_protocol| self.allocator.free(owned_protocol);
-                    valid_group = false;
-                    break;
-                };
+                if (std.mem.eql(u8, has_instance_str, "0") and instance_hex.len != 0) return error.InvalidConsumerGroupSnapshot;
+                if (std.mem.eql(u8, has_assignment_str, "0") and assignment_hex.len != 0) return error.InvalidConsumerGroupSnapshot;
+                if (std.mem.eql(u8, has_protocol_str, "0") and protocol_hex.len != 0) return error.InvalidConsumerGroupSnapshot;
+
+                const member_id = try decodeHexAllocForSnapshot(self.allocator, member_id_hex, error.InvalidConsumerGroupSnapshot);
+                errdefer self.allocator.free(member_id);
+                const group_instance_id = try decodeOptionalHexAllocForSnapshot(self.allocator, has_instance_str, instance_hex, error.InvalidConsumerGroupSnapshot);
+                errdefer if (group_instance_id) |owned_instance| self.allocator.free(owned_instance);
+                const last_heartbeat_ms = try parseIntForSnapshot(i64, heartbeat_str, error.InvalidConsumerGroupSnapshot);
+                const assignment = try decodeOptionalHexAllocForSnapshot(self.allocator, has_assignment_str, assignment_hex, error.InvalidConsumerGroupSnapshot);
+                errdefer if (assignment) |owned_assignment| self.allocator.free(owned_assignment);
+                const protocol_name = try decodeOptionalHexAllocForSnapshot(self.allocator, has_protocol_str, protocol_hex, error.InvalidConsumerGroupSnapshot);
+                errdefer if (protocol_name) |owned_protocol| self.allocator.free(owned_protocol);
+                const subscription_count = try parseIntForSnapshot(usize, subscription_count_str, error.InvalidConsumerGroupSnapshot);
+                if (subscription_count > 100_000) return error.InvalidConsumerGroupSnapshot;
 
                 var subscriptions = std.array_list.Managed([]u8).init(self.allocator);
                 defer subscriptions.deinit();
+                errdefer {
+                    for (subscriptions.items) |subscription| self.allocator.free(subscription);
+                }
                 for (0..subscription_count) |_| {
-                    const subscription_hex = member_fields.next() orelse {
-                        valid_group = false;
-                        break;
-                    };
-                    const subscription = decodeHexAlloc(self.allocator, subscription_hex) catch {
-                        valid_group = false;
-                        break;
-                    };
+                    const subscription_hex = member_fields.next() orelse return error.InvalidConsumerGroupSnapshot;
+                    const subscription = try decodeHexAllocForSnapshot(self.allocator, subscription_hex, error.InvalidConsumerGroupSnapshot);
                     subscriptions.append(subscription) catch |err| {
                         self.allocator.free(subscription);
                         return err;
                     };
                 }
                 var protocol_metadata: ?[]u8 = null;
+                errdefer if (protocol_metadata) |owned_metadata| self.allocator.free(owned_metadata);
                 if (member_fields.next()) |has_metadata_str| {
-                    const metadata_hex = member_fields.next() orelse "";
-                    protocol_metadata = decodeOptionalHexAlloc(self.allocator, has_metadata_str, metadata_hex) catch blk: {
-                        valid_group = false;
-                        break :blk null;
-                    };
+                    const metadata_hex = member_fields.next() orelse return error.InvalidConsumerGroupSnapshot;
+                    if (std.mem.eql(u8, has_metadata_str, "0") and metadata_hex.len != 0) return error.InvalidConsumerGroupSnapshot;
+                    protocol_metadata = try decodeOptionalHexAllocForSnapshot(self.allocator, has_metadata_str, metadata_hex, error.InvalidConsumerGroupSnapshot);
                 }
                 var rack_id: ?[]u8 = null;
+                errdefer if (rack_id) |owned_rack| self.allocator.free(owned_rack);
                 if (member_fields.next()) |has_rack_str| {
-                    const rack_hex = member_fields.next() orelse "";
-                    rack_id = decodeOptionalHexAlloc(self.allocator, has_rack_str, rack_hex) catch blk: {
-                        valid_group = false;
-                        break :blk null;
-                    };
+                    const rack_hex = member_fields.next() orelse return error.InvalidConsumerGroupSnapshot;
+                    if (std.mem.eql(u8, has_rack_str, "0") and rack_hex.len != 0) return error.InvalidConsumerGroupSnapshot;
+                    rack_id = try decodeOptionalHexAllocForSnapshot(self.allocator, has_rack_str, rack_hex, error.InvalidConsumerGroupSnapshot);
                 }
-                if (!valid_group) {
-                    self.allocator.free(member_id);
-                    if (group_instance_id) |owned_instance| self.allocator.free(owned_instance);
-                    if (assignment) |owned_assignment| self.allocator.free(owned_assignment);
-                    if (protocol_name) |owned_protocol| self.allocator.free(owned_protocol);
-                    if (protocol_metadata) |owned_metadata| self.allocator.free(owned_metadata);
-                    if (rack_id) |owned_rack| self.allocator.free(owned_rack);
-                    for (subscriptions.items) |subscription| self.allocator.free(subscription);
-                    break;
-                }
+                if (member_fields.next() != null) return error.InvalidConsumerGroupSnapshot;
 
                 const owned_subscriptions = try subscriptions.toOwnedSlice();
-                members.append(.{
+                errdefer {
+                    for (owned_subscriptions) |subscription| self.allocator.free(subscription);
+                    if (owned_subscriptions.len > 0) self.allocator.free(owned_subscriptions);
+                }
+                try members.append(.{
                     .member_id = member_id,
                     .group_instance_id = group_instance_id,
                     .last_heartbeat_ms = last_heartbeat_ms,
@@ -831,30 +799,15 @@ pub const MetadataPersistence = struct {
                     .protocol_metadata = protocol_metadata,
                     .rack_id = rack_id,
                     .subscriptions = owned_subscriptions,
-                }) catch |err| {
-                    self.allocator.free(member_id);
-                    if (group_instance_id) |owned_instance| self.allocator.free(owned_instance);
-                    if (assignment) |owned_assignment| self.allocator.free(owned_assignment);
-                    if (protocol_name) |owned_protocol| self.allocator.free(owned_protocol);
-                    if (protocol_metadata) |owned_metadata| self.allocator.free(owned_metadata);
-                    if (rack_id) |owned_rack| self.allocator.free(owned_rack);
-                    for (owned_subscriptions) |subscription| self.allocator.free(subscription);
-                    if (owned_subscriptions.len > 0) self.allocator.free(owned_subscriptions);
-                    return err;
-                };
-            }
-
-            if (!valid_group) {
-                self.allocator.free(group_id);
-                if (leader_id) |owned_leader| self.allocator.free(owned_leader);
-                if (group_protocol_type) |owned_protocol_type| self.allocator.free(owned_protocol_type);
-                if (group_protocol_name) |owned_protocol_name| self.allocator.free(owned_protocol_name);
-                self.freeConsumerGroupMemberEntries(members.items);
-                continue;
+                });
             }
 
             const owned_members = try members.toOwnedSlice();
-            entries.append(.{
+            errdefer {
+                self.freeConsumerGroupMemberEntries(owned_members);
+                if (owned_members.len > 0) self.allocator.free(owned_members);
+            }
+            try entries.append(.{
                 .group_id = group_id,
                 .state = state,
                 .generation_id = generation_id,
@@ -865,15 +818,7 @@ pub const MetadataPersistence = struct {
                 .rebalance_timeout_ms = rebalance_timeout_ms,
                 .session_timeout_ms = session_timeout_ms,
                 .members = owned_members,
-            }) catch |err| {
-                self.allocator.free(group_id);
-                if (leader_id) |owned_leader| self.allocator.free(owned_leader);
-                if (group_protocol_type) |owned_protocol_type| self.allocator.free(owned_protocol_type);
-                if (group_protocol_name) |owned_protocol_name| self.allocator.free(owned_protocol_name);
-                self.freeConsumerGroupMemberEntries(owned_members);
-                if (owned_members.len > 0) self.allocator.free(owned_members);
-                return err;
-            };
+            });
         }
 
         log.info("Loaded {d} consumer group(s) from consumer_groups.meta", .{entries.items.len});
@@ -1095,15 +1040,14 @@ pub const MetadataPersistence = struct {
         defer self.allocator.free(path);
 
         const file = fs.openFileAbsolute(path, .{}) catch |err| {
-            log.debug("No transactions.meta found: {}", .{err});
-            return .{ .next_producer_id = 1000, .entries = &.{} };
+            return switch (err) {
+                error.FileNotFound => .{ .next_producer_id = 1000, .entries = &.{} },
+                else => err,
+            };
         };
         defer file.close();
 
-        const content = file.readToEndAlloc(self.allocator, 1024 * 1024) catch |err| {
-            log.warn("Failed to read transactions.meta: {}", .{err});
-            return .{ .next_producer_id = 1000, .entries = &.{} };
-        };
+        const content = try file.readToEndAlloc(self.allocator, 1024 * 1024);
         defer self.allocator.free(content);
 
         var entries = std.array_list.Managed(TransactionEntry).init(self.allocator);
@@ -1118,15 +1062,15 @@ pub const MetadataPersistence = struct {
         var next_pid: i64 = 1000;
 
         var lines = std.mem.splitSequence(u8, content, "\n");
-        // First line: next_producer_id\t{value}
-        if (lines.next()) |first_line| {
-            if (first_line.len > 0) {
-                var fields = std.mem.splitSequence(u8, first_line, "\t");
-                _ = fields.next(); // skip "next_producer_id" label
-                if (fields.next()) |val_str| {
-                    next_pid = std.fmt.parseInt(i64, val_str, 10) catch 1000;
-                }
-            }
+        const first_line = lines.next() orelse return error.InvalidTransactionSnapshot;
+        if (first_line.len == 0) return error.InvalidTransactionSnapshot;
+        {
+            var fields = std.mem.splitSequence(u8, first_line, "\t");
+            const tag = fields.next() orelse return error.InvalidTransactionSnapshot;
+            if (!std.mem.eql(u8, tag, "next_producer_id")) return error.InvalidTransactionSnapshot;
+            const val_str = fields.next() orelse return error.InvalidTransactionSnapshot;
+            next_pid = try parseIntForSnapshot(i64, val_str, error.InvalidTransactionSnapshot);
+            if (fields.next() != null) return error.InvalidTransactionSnapshot;
         }
 
         // Remaining lines: txn_v2 rows, or legacy producer_id rows from older snapshots.
@@ -1134,24 +1078,24 @@ pub const MetadataPersistence = struct {
             if (line.len == 0) continue;
 
             var fields = std.mem.splitSequence(u8, line, "\t");
-            const first = fields.next() orelse continue;
+            const first = fields.next() orelse return error.InvalidTransactionSnapshot;
 
             if (std.mem.eql(u8, first, "txn_v2")) {
-                const pid_str = fields.next() orelse continue;
-                const epoch_str = fields.next() orelse continue;
-                const status_str = fields.next() orelse continue;
-                const timeout_str = fields.next() orelse continue;
-                const tid_hex = fields.next() orelse continue;
-                const partition_count_str = fields.next() orelse continue;
+                const pid_str = fields.next() orelse return error.InvalidTransactionSnapshot;
+                const epoch_str = fields.next() orelse return error.InvalidTransactionSnapshot;
+                const status_str = fields.next() orelse return error.InvalidTransactionSnapshot;
+                const timeout_str = fields.next() orelse return error.InvalidTransactionSnapshot;
+                const tid_hex = fields.next() orelse return error.InvalidTransactionSnapshot;
+                const partition_count_str = fields.next() orelse return error.InvalidTransactionSnapshot;
 
-                const pid = std.fmt.parseInt(i64, pid_str, 10) catch continue;
-                const epoch = std.fmt.parseInt(i16, epoch_str, 10) catch continue;
-                const status = std.fmt.parseInt(u8, status_str, 10) catch continue;
-                const timeout = std.fmt.parseInt(i32, timeout_str, 10) catch continue;
-                const partition_count = std.fmt.parseInt(usize, partition_count_str, 10) catch continue;
+                const pid = try parseIntForSnapshot(i64, pid_str, error.InvalidTransactionSnapshot);
+                const epoch = try parseIntForSnapshot(i16, epoch_str, error.InvalidTransactionSnapshot);
+                const status = try parseIntForSnapshot(u8, status_str, error.InvalidTransactionSnapshot);
+                const timeout = try parseIntForSnapshot(i32, timeout_str, error.InvalidTransactionSnapshot);
+                const partition_count = try parseIntForSnapshot(usize, partition_count_str, error.InvalidTransactionSnapshot);
 
                 const tid: ?[]u8 = if (tid_hex.len > 0)
-                    decodeHexAlloc(self.allocator, tid_hex) catch continue
+                    try decodeHexAllocForSnapshot(self.allocator, tid_hex, error.InvalidTransactionSnapshot)
                 else
                     null;
                 errdefer if (tid) |owned_tid| self.allocator.free(owned_tid);
@@ -1160,6 +1104,7 @@ pub const MetadataPersistence = struct {
                 defer partitions.deinit();
                 errdefer for (partitions.items) |partition| self.allocator.free(partition.topic);
                 var valid_partitions = true;
+                var partition_error: anyerror = error.InvalidTransactionSnapshot;
                 for (0..partition_count) |_| {
                     const topic_hex = fields.next() orelse {
                         valid_partitions = false;
@@ -1169,22 +1114,25 @@ pub const MetadataPersistence = struct {
                         valid_partitions = false;
                         break;
                     };
-                    const topic = decodeHexAlloc(self.allocator, topic_hex) catch {
+                    const topic = decodeHexAllocForSnapshot(self.allocator, topic_hex, error.InvalidTransactionSnapshot) catch |err| {
+                        partition_error = err;
                         valid_partitions = false;
                         break;
                     };
                     errdefer self.allocator.free(topic);
-                    const partition = std.fmt.parseInt(i32, partition_str, 10) catch {
+                    const partition = parseIntForSnapshot(i32, partition_str, error.InvalidTransactionSnapshot) catch |err| {
                         self.allocator.free(topic);
+                        partition_error = err;
                         valid_partitions = false;
                         break;
                     };
                     try partitions.append(.{ .topic = topic, .partition = partition });
                 }
                 if (!valid_partitions) {
-                    for (partitions.items) |partition| self.allocator.free(partition.topic);
-                    if (tid) |owned_tid| self.allocator.free(owned_tid);
-                    continue;
+                    return partition_error;
+                }
+                if (fields.next() != null) {
+                    return error.InvalidTransactionSnapshot;
                 }
 
                 const owned_partitions = try partitions.toOwnedSlice();
@@ -1204,15 +1152,16 @@ pub const MetadataPersistence = struct {
             }
 
             const pid_str = first;
-            const epoch_str = fields.next() orelse continue;
-            const status_str = fields.next() orelse continue;
-            const timeout_str = fields.next() orelse continue;
-            const tid_str = fields.next() orelse continue;
+            const epoch_str = fields.next() orelse return error.InvalidTransactionSnapshot;
+            const status_str = fields.next() orelse return error.InvalidTransactionSnapshot;
+            const timeout_str = fields.next() orelse return error.InvalidTransactionSnapshot;
+            const tid_str = fields.next() orelse return error.InvalidTransactionSnapshot;
+            if (fields.next() != null) return error.InvalidTransactionSnapshot;
 
-            const pid = std.fmt.parseInt(i64, pid_str, 10) catch continue;
-            const epoch = std.fmt.parseInt(i16, epoch_str, 10) catch continue;
-            const status = std.fmt.parseInt(u8, status_str, 10) catch continue;
-            const timeout = std.fmt.parseInt(i32, timeout_str, 10) catch continue;
+            const pid = try parseIntForSnapshot(i64, pid_str, error.InvalidTransactionSnapshot);
+            const epoch = try parseIntForSnapshot(i16, epoch_str, error.InvalidTransactionSnapshot);
+            const status = try parseIntForSnapshot(u8, status_str, error.InvalidTransactionSnapshot);
+            const timeout = try parseIntForSnapshot(i32, timeout_str, error.InvalidTransactionSnapshot);
 
             const tid: ?[]u8 = if (tid_str.len > 0)
                 try self.allocator.dupe(u8, tid_str)
@@ -1278,33 +1227,34 @@ pub const MetadataPersistence = struct {
         defer self.allocator.free(path);
 
         const file = fs.openFileAbsolute(path, .{}) catch |err| {
-            log.debug("No producer_state.meta found: {}", .{err});
-            return &.{};
+            return switch (err) {
+                error.FileNotFound => &.{},
+                else => err,
+            };
         };
         defer file.close();
 
-        const content = file.readToEndAlloc(self.allocator, 1024 * 1024) catch |err| {
-            log.warn("Failed to read producer_state.meta: {}", .{err});
-            return &.{};
-        };
+        const content = try file.readToEndAlloc(self.allocator, 1024 * 1024);
         defer self.allocator.free(content);
 
         var entries = std.array_list.Managed(ProducerSequenceEntry).init(self.allocator);
+        errdefer entries.deinit();
 
         var lines = std.mem.splitSequence(u8, content, "\n");
         while (lines.next()) |line| {
             if (line.len == 0) continue;
 
             var fields = std.mem.splitSequence(u8, line, "\t");
-            const pid_str = fields.next() orelse continue;
-            const pkey_str = fields.next() orelse continue;
-            const seq_str = fields.next() orelse continue;
-            const epoch_str = fields.next() orelse continue;
+            const pid_str = fields.next() orelse return error.InvalidProducerSequenceSnapshot;
+            const pkey_str = fields.next() orelse return error.InvalidProducerSequenceSnapshot;
+            const seq_str = fields.next() orelse return error.InvalidProducerSequenceSnapshot;
+            const epoch_str = fields.next() orelse return error.InvalidProducerSequenceSnapshot;
+            if (fields.next() != null) return error.InvalidProducerSequenceSnapshot;
 
-            const pid = std.fmt.parseInt(i64, pid_str, 10) catch continue;
-            const pkey = std.fmt.parseInt(u64, pkey_str, 10) catch continue;
-            const seq = std.fmt.parseInt(i32, seq_str, 10) catch continue;
-            const epoch = std.fmt.parseInt(i16, epoch_str, 10) catch continue;
+            const pid = try parseIntForSnapshot(i64, pid_str, error.InvalidProducerSequenceSnapshot);
+            const pkey = try parseIntForSnapshot(u64, pkey_str, error.InvalidProducerSequenceSnapshot);
+            const seq = try parseIntForSnapshot(i32, seq_str, error.InvalidProducerSequenceSnapshot);
+            const epoch = try parseIntForSnapshot(i16, epoch_str, error.InvalidProducerSequenceSnapshot);
 
             try entries.append(.{
                 .producer_id = pid,
@@ -1359,15 +1309,14 @@ pub const MetadataPersistence = struct {
         defer self.allocator.free(path);
 
         const file = fs.openFileAbsolute(path, .{}) catch |err| {
-            log.debug("No partition_state.meta found: {}", .{err});
-            return &.{};
+            return switch (err) {
+                error.FileNotFound => &.{},
+                else => err,
+            };
         };
         defer file.close();
 
-        const content = file.readToEndAlloc(self.allocator, 4 * 1024 * 1024) catch |err| {
-            log.warn("Failed to read partition_state.meta: {}", .{err});
-            return &.{};
-        };
+        const content = try file.readToEndAlloc(self.allocator, 4 * 1024 * 1024);
         defer self.allocator.free(content);
 
         var entries = std.array_list.Managed(PartitionStateEntry).init(self.allocator);
@@ -1381,42 +1330,29 @@ pub const MetadataPersistence = struct {
             if (line.len == 0) continue;
 
             var fields = std.mem.splitSequence(u8, line, "\t");
-            const tag = fields.next() orelse continue;
-            if (!std.mem.eql(u8, tag, "partition")) continue;
+            const tag = fields.next() orelse return error.InvalidPartitionStateSnapshot;
+            if (!std.mem.eql(u8, tag, "partition")) return error.InvalidPartitionStateSnapshot;
 
-            const topic_hex = fields.next() orelse continue;
-            const partition_str = fields.next() orelse continue;
-            const next_offset_str = fields.next() orelse continue;
-            const log_start_str = fields.next() orelse continue;
-            const hw_str = fields.next() orelse continue;
-            const lso_str = fields.next() orelse continue;
+            const topic_hex = fields.next() orelse return error.InvalidPartitionStateSnapshot;
+            const partition_str = fields.next() orelse return error.InvalidPartitionStateSnapshot;
+            const next_offset_str = fields.next() orelse return error.InvalidPartitionStateSnapshot;
+            const log_start_str = fields.next() orelse return error.InvalidPartitionStateSnapshot;
+            const hw_str = fields.next() orelse return error.InvalidPartitionStateSnapshot;
+            const lso_str = fields.next() orelse return error.InvalidPartitionStateSnapshot;
             const unstable_str = fields.next() orelse "null";
+            if (fields.next() != null) return error.InvalidPartitionStateSnapshot;
 
-            const topic = decodeHexAlloc(self.allocator, topic_hex) catch continue;
-            const partition_id = std.fmt.parseInt(i32, partition_str, 10) catch {
-                self.allocator.free(topic);
-                continue;
-            };
-            const next_offset = std.fmt.parseInt(u64, next_offset_str, 10) catch {
-                self.allocator.free(topic);
-                continue;
-            };
-            const log_start_offset = std.fmt.parseInt(u64, log_start_str, 10) catch {
-                self.allocator.free(topic);
-                continue;
-            };
-            const high_watermark = std.fmt.parseInt(u64, hw_str, 10) catch {
-                self.allocator.free(topic);
-                continue;
-            };
-            const last_stable_offset = std.fmt.parseInt(u64, lso_str, 10) catch {
-                self.allocator.free(topic);
-                continue;
-            };
+            const topic = try decodeHexAllocForSnapshot(self.allocator, topic_hex, error.InvalidPartitionStateSnapshot);
+            errdefer self.allocator.free(topic);
+            const partition_id = try parseIntForSnapshot(i32, partition_str, error.InvalidPartitionStateSnapshot);
+            const next_offset = try parseIntForSnapshot(u64, next_offset_str, error.InvalidPartitionStateSnapshot);
+            const log_start_offset = try parseIntForSnapshot(u64, log_start_str, error.InvalidPartitionStateSnapshot);
+            const high_watermark = try parseIntForSnapshot(u64, hw_str, error.InvalidPartitionStateSnapshot);
+            const last_stable_offset = try parseIntForSnapshot(u64, lso_str, error.InvalidPartitionStateSnapshot);
             const first_unstable_txn_offset: ?u64 = if (std.mem.eql(u8, unstable_str, "null"))
                 null
             else
-                std.fmt.parseInt(u64, unstable_str, 10) catch null;
+                try parseIntForSnapshot(u64, unstable_str, error.InvalidPartitionStateSnapshot);
 
             entries.append(.{
                 .topic = topic,
@@ -1427,7 +1363,6 @@ pub const MetadataPersistence = struct {
                 .last_stable_offset = last_stable_offset,
                 .first_unstable_txn_offset = first_unstable_txn_offset,
             }) catch |err| {
-                self.allocator.free(topic);
                 return err;
             };
         }
@@ -1472,15 +1407,14 @@ pub const MetadataPersistence = struct {
         defer self.allocator.free(path);
 
         const file = fs.openFileAbsolute(path, .{}) catch |err| {
-            log.debug("No partition_reassignments.meta found: {}", .{err});
-            return &.{};
+            return switch (err) {
+                error.FileNotFound => &.{},
+                else => err,
+            };
         };
         defer file.close();
 
-        const content = file.readToEndAlloc(self.allocator, 4 * 1024 * 1024) catch |err| {
-            log.warn("Failed to read partition_reassignments.meta: {}", .{err});
-            return &.{};
-        };
+        const content = try file.readToEndAlloc(self.allocator, 4 * 1024 * 1024);
         defer self.allocator.free(content);
 
         var entries = std.array_list.Managed(PartitionReassignmentEntry).init(self.allocator);
@@ -1499,35 +1433,25 @@ pub const MetadataPersistence = struct {
             if (line.len == 0) continue;
 
             var fields = std.mem.splitSequence(u8, line, "\t");
-            const tag = fields.next() orelse continue;
-            if (!std.mem.eql(u8, tag, "reassignment")) continue;
+            const tag = fields.next() orelse return error.InvalidPartitionReassignmentSnapshot;
+            if (!std.mem.eql(u8, tag, "reassignment")) return error.InvalidPartitionReassignmentSnapshot;
 
-            const topic_hex = fields.next() orelse continue;
-            const partition_str = fields.next() orelse continue;
-            const replicas_str = fields.next() orelse continue;
-            const adding_str = fields.next() orelse continue;
-            const removing_str = fields.next() orelse continue;
+            const topic_hex = fields.next() orelse return error.InvalidPartitionReassignmentSnapshot;
+            const partition_str = fields.next() orelse return error.InvalidPartitionReassignmentSnapshot;
+            const replicas_str = fields.next() orelse return error.InvalidPartitionReassignmentSnapshot;
+            const adding_str = fields.next() orelse return error.InvalidPartitionReassignmentSnapshot;
+            const removing_str = fields.next() orelse return error.InvalidPartitionReassignmentSnapshot;
+            if (fields.next() != null) return error.InvalidPartitionReassignmentSnapshot;
 
-            const topic = decodeHexAlloc(self.allocator, topic_hex) catch continue;
-            const partition_index = std.fmt.parseInt(i32, partition_str, 10) catch {
-                self.allocator.free(topic);
-                continue;
-            };
-            const replicas = parseI32CsvAlloc(self.allocator, replicas_str) catch {
-                self.allocator.free(topic);
-                continue;
-            };
-            const adding_replicas = parseI32CsvAlloc(self.allocator, adding_str) catch {
-                self.allocator.free(topic);
-                if (replicas.len > 0) self.allocator.free(replicas);
-                continue;
-            };
-            const removing_replicas = parseI32CsvAlloc(self.allocator, removing_str) catch {
-                self.allocator.free(topic);
-                if (replicas.len > 0) self.allocator.free(replicas);
-                if (adding_replicas.len > 0) self.allocator.free(adding_replicas);
-                continue;
-            };
+            const topic = try decodeHexAllocForSnapshot(self.allocator, topic_hex, error.InvalidPartitionReassignmentSnapshot);
+            errdefer self.allocator.free(topic);
+            const partition_index = try parseIntForSnapshot(i32, partition_str, error.InvalidPartitionReassignmentSnapshot);
+            const replicas = try parseI32CsvAllocForSnapshot(self.allocator, replicas_str, error.InvalidPartitionReassignmentSnapshot);
+            errdefer if (replicas.len > 0) self.allocator.free(replicas);
+            const adding_replicas = try parseI32CsvAllocForSnapshot(self.allocator, adding_str, error.InvalidPartitionReassignmentSnapshot);
+            errdefer if (adding_replicas.len > 0) self.allocator.free(adding_replicas);
+            const removing_replicas = try parseI32CsvAllocForSnapshot(self.allocator, removing_str, error.InvalidPartitionReassignmentSnapshot);
+            errdefer if (removing_replicas.len > 0) self.allocator.free(removing_replicas);
 
             entries.append(.{
                 .topic = topic,
@@ -1536,10 +1460,6 @@ pub const MetadataPersistence = struct {
                 .adding_replicas = adding_replicas,
                 .removing_replicas = removing_replicas,
             }) catch |err| {
-                self.allocator.free(topic);
-                if (replicas.len > 0) self.allocator.free(replicas);
-                if (adding_replicas.len > 0) self.allocator.free(adding_replicas);
-                if (removing_replicas.len > 0) self.allocator.free(removing_replicas);
                 return err;
             };
         }
@@ -1589,15 +1509,14 @@ pub const MetadataPersistence = struct {
         defer self.allocator.free(path);
 
         const file = fs.openFileAbsolute(path, .{}) catch |err| {
-            log.debug("No replica_directory_assignments.meta found: {}", .{err});
-            return &.{};
+            return switch (err) {
+                error.FileNotFound => &.{},
+                else => err,
+            };
         };
         defer file.close();
 
-        const content = file.readToEndAlloc(self.allocator, 1024 * 1024) catch |err| {
-            log.warn("Failed to read replica_directory_assignments.meta: {}", .{err});
-            return &.{};
-        };
+        const content = try file.readToEndAlloc(self.allocator, 1024 * 1024);
         defer self.allocator.free(content);
 
         var entries = std.array_list.Managed(ReplicaDirectoryAssignmentEntry).init(self.allocator);
@@ -1608,16 +1527,17 @@ pub const MetadataPersistence = struct {
             if (line.len == 0) continue;
 
             var fields = std.mem.splitSequence(u8, line, "\t");
-            const tag = fields.next() orelse continue;
-            if (!std.mem.eql(u8, tag, "replica_dir")) continue;
+            const tag = fields.next() orelse return error.InvalidReplicaDirectoryAssignmentSnapshot;
+            if (!std.mem.eql(u8, tag, "replica_dir")) return error.InvalidReplicaDirectoryAssignmentSnapshot;
 
-            const topic_id_hex = fields.next() orelse continue;
-            const partition_str = fields.next() orelse continue;
-            const directory_id_hex = fields.next() orelse continue;
+            const topic_id_hex = fields.next() orelse return error.InvalidReplicaDirectoryAssignmentSnapshot;
+            const partition_str = fields.next() orelse return error.InvalidReplicaDirectoryAssignmentSnapshot;
+            const directory_id_hex = fields.next() orelse return error.InvalidReplicaDirectoryAssignmentSnapshot;
+            if (fields.next() != null) return error.InvalidReplicaDirectoryAssignmentSnapshot;
 
-            const topic_id = decodeUuidHex(topic_id_hex) catch continue;
-            const partition_index = std.fmt.parseInt(i32, partition_str, 10) catch continue;
-            const directory_id = decodeUuidHex(directory_id_hex) catch continue;
+            const topic_id = try decodeUuidHexForSnapshot(topic_id_hex, error.InvalidReplicaDirectoryAssignmentSnapshot);
+            const partition_index = try parseIntForSnapshot(i32, partition_str, error.InvalidReplicaDirectoryAssignmentSnapshot);
+            const directory_id = try decodeUuidHexForSnapshot(directory_id_hex, error.InvalidReplicaDirectoryAssignmentSnapshot);
 
             try entries.append(.{
                 .topic_id = topic_id,
@@ -1676,15 +1596,14 @@ pub const MetadataPersistence = struct {
         defer self.allocator.free(path);
 
         const file = fs.openFileAbsolute(path, .{}) catch |err| {
-            log.debug("No share_group_states.meta found: {}", .{err});
-            return &.{};
+            return switch (err) {
+                error.FileNotFound => &.{},
+                else => err,
+            };
         };
         defer file.close();
 
-        const content = file.readToEndAlloc(self.allocator, 4 * 1024 * 1024) catch |err| {
-            log.warn("Failed to read share_group_states.meta: {}", .{err});
-            return &.{};
-        };
+        const content = try file.readToEndAlloc(self.allocator, 4 * 1024 * 1024);
         defer self.allocator.free(content);
 
         var entries = std.array_list.Managed(ShareGroupStateEntry).init(self.allocator);
@@ -1701,67 +1620,36 @@ pub const MetadataPersistence = struct {
             if (line.len == 0) continue;
 
             var fields = std.mem.splitSequence(u8, line, "\t");
-            const tag = fields.next() orelse continue;
-            if (!std.mem.eql(u8, tag, "share_state")) continue;
+            const tag = fields.next() orelse return error.InvalidShareGroupStateSnapshot;
+            if (!std.mem.eql(u8, tag, "share_state")) return error.InvalidShareGroupStateSnapshot;
 
-            const key_hex = fields.next() orelse continue;
-            const state_epoch_str = fields.next() orelse continue;
-            const start_offset_str = fields.next() orelse continue;
-            const batch_count_str = fields.next() orelse continue;
+            const key_hex = fields.next() orelse return error.InvalidShareGroupStateSnapshot;
+            const state_epoch_str = fields.next() orelse return error.InvalidShareGroupStateSnapshot;
+            const start_offset_str = fields.next() orelse return error.InvalidShareGroupStateSnapshot;
+            const batch_count_str = fields.next() orelse return error.InvalidShareGroupStateSnapshot;
 
-            const key = decodeHexAlloc(self.allocator, key_hex) catch continue;
-            const state_epoch = std.fmt.parseInt(i32, state_epoch_str, 10) catch {
-                self.allocator.free(key);
-                continue;
-            };
-            const start_offset = std.fmt.parseInt(i64, start_offset_str, 10) catch {
-                self.allocator.free(key);
-                continue;
-            };
-            const batch_count = std.fmt.parseInt(usize, batch_count_str, 10) catch {
-                self.allocator.free(key);
-                continue;
-            };
+            const key = try decodeHexAllocForSnapshot(self.allocator, key_hex, error.InvalidShareGroupStateSnapshot);
+            errdefer self.allocator.free(key);
+            const state_epoch = try parseIntForSnapshot(i32, state_epoch_str, error.InvalidShareGroupStateSnapshot);
+            const start_offset = try parseIntForSnapshot(i64, start_offset_str, error.InvalidShareGroupStateSnapshot);
+            const batch_count = try parseIntForSnapshot(usize, batch_count_str, error.InvalidShareGroupStateSnapshot);
+            if (batch_count > 1_000_000) return error.InvalidShareGroupStateSnapshot;
 
-            const batches: []ShareStateBatchEntry = if (batch_count > 0) self.allocator.alloc(ShareStateBatchEntry, batch_count) catch {
-                self.allocator.free(key);
-                continue;
-            } else &.{};
-            var valid_batches = true;
+            const batches: []ShareStateBatchEntry = if (batch_count > 0)
+                try self.allocator.alloc(ShareStateBatchEntry, batch_count)
+            else
+                &.{};
+            errdefer if (batches.len > 0) self.allocator.free(batches);
             for (batches) |*batch| {
-                const first_offset_str = fields.next() orelse {
-                    valid_batches = false;
-                    break;
-                };
-                const last_offset_str = fields.next() orelse {
-                    valid_batches = false;
-                    break;
-                };
-                const delivery_state_str = fields.next() orelse {
-                    valid_batches = false;
-                    break;
-                };
-                const delivery_count_str = fields.next() orelse {
-                    valid_batches = false;
-                    break;
-                };
+                const first_offset_str = fields.next() orelse return error.InvalidShareGroupStateSnapshot;
+                const last_offset_str = fields.next() orelse return error.InvalidShareGroupStateSnapshot;
+                const delivery_state_str = fields.next() orelse return error.InvalidShareGroupStateSnapshot;
+                const delivery_count_str = fields.next() orelse return error.InvalidShareGroupStateSnapshot;
 
-                const first_offset = std.fmt.parseInt(i64, first_offset_str, 10) catch {
-                    valid_batches = false;
-                    break;
-                };
-                const last_offset = std.fmt.parseInt(i64, last_offset_str, 10) catch {
-                    valid_batches = false;
-                    break;
-                };
-                const delivery_state = std.fmt.parseInt(i8, delivery_state_str, 10) catch {
-                    valid_batches = false;
-                    break;
-                };
-                const delivery_count = std.fmt.parseInt(i16, delivery_count_str, 10) catch {
-                    valid_batches = false;
-                    break;
-                };
+                const first_offset = try parseIntForSnapshot(i64, first_offset_str, error.InvalidShareGroupStateSnapshot);
+                const last_offset = try parseIntForSnapshot(i64, last_offset_str, error.InvalidShareGroupStateSnapshot);
+                const delivery_state = try parseIntForSnapshot(i8, delivery_state_str, error.InvalidShareGroupStateSnapshot);
+                const delivery_count = try parseIntForSnapshot(i16, delivery_count_str, error.InvalidShareGroupStateSnapshot);
 
                 batch.* = .{
                     .first_offset = first_offset,
@@ -1770,11 +1658,7 @@ pub const MetadataPersistence = struct {
                     .delivery_count = delivery_count,
                 };
             }
-            if (!valid_batches) {
-                self.allocator.free(key);
-                if (batches.len > 0) self.allocator.free(batches);
-                continue;
-            }
+            if (fields.next() != null) return error.InvalidShareGroupStateSnapshot;
 
             try entries.append(.{
                 .key = key,
@@ -1824,15 +1708,14 @@ pub const MetadataPersistence = struct {
         defer self.allocator.free(path);
 
         const file = fs.openFileAbsolute(path, .{}) catch |err| {
-            log.debug("No share_group_sessions.meta found: {}", .{err});
-            return &.{};
+            return switch (err) {
+                error.FileNotFound => &.{},
+                else => err,
+            };
         };
         defer file.close();
 
-        const content = file.readToEndAlloc(self.allocator, 1024 * 1024) catch |err| {
-            log.warn("Failed to read share_group_sessions.meta: {}", .{err});
-            return &.{};
-        };
+        const content = try file.readToEndAlloc(self.allocator, 1024 * 1024);
         defer self.allocator.free(content);
 
         var entries = std.array_list.Managed(ShareGroupSessionEntry).init(self.allocator);
@@ -1846,17 +1729,16 @@ pub const MetadataPersistence = struct {
             if (line.len == 0) continue;
 
             var fields = std.mem.splitSequence(u8, line, "\t");
-            const tag = fields.next() orelse continue;
-            if (!std.mem.eql(u8, tag, "share_session")) continue;
+            const tag = fields.next() orelse return error.InvalidShareGroupSessionSnapshot;
+            if (!std.mem.eql(u8, tag, "share_session")) return error.InvalidShareGroupSessionSnapshot;
 
-            const key_hex = fields.next() orelse continue;
-            const epoch_str = fields.next() orelse continue;
+            const key_hex = fields.next() orelse return error.InvalidShareGroupSessionSnapshot;
+            const epoch_str = fields.next() orelse return error.InvalidShareGroupSessionSnapshot;
+            if (fields.next() != null) return error.InvalidShareGroupSessionSnapshot;
 
-            const key = decodeHexAlloc(self.allocator, key_hex) catch continue;
-            const epoch = std.fmt.parseInt(i32, epoch_str, 10) catch {
-                self.allocator.free(key);
-                continue;
-            };
+            const key = try decodeHexAllocForSnapshot(self.allocator, key_hex, error.InvalidShareGroupSessionSnapshot);
+            errdefer self.allocator.free(key);
+            const epoch = try parseIntForSnapshot(i32, epoch_str, error.InvalidShareGroupSessionSnapshot);
 
             try entries.append(.{
                 .key = key,
@@ -1870,6 +1752,210 @@ pub const MetadataPersistence = struct {
 
     pub fn freeShareGroupSessionEntries(self: *MetadataPersistence, entries: []ShareGroupSessionEntry) void {
         for (entries) |entry| self.allocator.free(entry.key);
+        if (entries.len > 0) self.allocator.free(entries);
+    }
+
+    /// Save broker-local delegation tokens to disk.
+    /// Format: delegation_tokens.meta TSV with hex-encoded principal and token
+    /// fields plus an inline renewer list. Shared-storage replay is handled by
+    /// the broker's __cluster_metadata delegation-token snapshot records.
+    pub fn saveDelegationTokens(self: *MetadataPersistence, tokens: anytype) !void {
+        const dir = self.data_dir orelse return;
+
+        const path = try std.fmt.allocPrint(self.allocator, "{s}/delegation_tokens.meta", .{dir});
+        defer self.allocator.free(path);
+
+        const file = try fs.createFileAbsolute(path, .{ .truncate = true });
+        defer file.close();
+        const writer = file.writer();
+
+        var it = tokens.iterator();
+        while (it.next()) |entry| {
+            const token = entry.value_ptr;
+            try file.writeAll("delegation_token_v1\t");
+            try writeHex(file, entry.key_ptr.*);
+            try file.writeAll("\t");
+            try writeHex(file, token.owner_principal_type);
+            try file.writeAll("\t");
+            try writeHex(file, token.owner_principal_name);
+            try file.writeAll("\t");
+            try writeHex(file, token.requester_principal_type);
+            try file.writeAll("\t");
+            try writeHex(file, token.requester_principal_name);
+            try file.writeAll("\t");
+            try writeHex(file, token.token_id);
+            try file.writeAll("\t");
+            try writeHex(file, token.hmac);
+            try writer.print("\t{d}\t{d}\t{d}\t{d}", .{
+                token.issue_timestamp_ms,
+                token.expiry_timestamp_ms,
+                token.max_timestamp_ms,
+                token.renewers.len,
+            });
+            for (token.renewers) |renewer| {
+                try file.writeAll("\t");
+                try writeHex(file, renewer.principal_type);
+                try file.writeAll("\t");
+                try writeHex(file, renewer.principal_name);
+            }
+            try file.writeAll("\n");
+        }
+        try file.sync();
+    }
+
+    pub fn loadDelegationTokens(self: *MetadataPersistence) ![]DelegationTokenEntry {
+        const dir = self.data_dir orelse return &.{};
+
+        const path = try std.fmt.allocPrint(self.allocator, "{s}/delegation_tokens.meta", .{dir});
+        defer self.allocator.free(path);
+
+        const file = fs.openFileAbsolute(path, .{}) catch |err| {
+            return switch (err) {
+                error.FileNotFound => &.{},
+                else => err,
+            };
+        };
+        defer file.close();
+
+        const content = try file.readToEndAlloc(self.allocator, 4 * 1024 * 1024);
+        defer self.allocator.free(content);
+
+        var entries = std.array_list.Managed(DelegationTokenEntry).init(self.allocator);
+        errdefer {
+            for (entries.items) |*entry| freeDelegationTokenEntry(self.allocator, entry);
+            entries.deinit();
+        }
+
+        var lines = std.mem.splitSequence(u8, content, "\n");
+        while (lines.next()) |line| {
+            if (line.len == 0) continue;
+
+            var fields = std.mem.splitSequence(u8, line, "\t");
+            const tag = fields.next() orelse return error.InvalidDelegationTokenSnapshot;
+            if (!std.mem.eql(u8, tag, "delegation_token_v1")) return error.InvalidDelegationTokenSnapshot;
+
+            const key_hex = fields.next() orelse return error.InvalidDelegationTokenSnapshot;
+            const owner_type_hex = fields.next() orelse return error.InvalidDelegationTokenSnapshot;
+            const owner_name_hex = fields.next() orelse return error.InvalidDelegationTokenSnapshot;
+            const requester_type_hex = fields.next() orelse return error.InvalidDelegationTokenSnapshot;
+            const requester_name_hex = fields.next() orelse return error.InvalidDelegationTokenSnapshot;
+            const token_id_hex = fields.next() orelse return error.InvalidDelegationTokenSnapshot;
+            const hmac_hex = fields.next() orelse return error.InvalidDelegationTokenSnapshot;
+            const issue_timestamp_str = fields.next() orelse return error.InvalidDelegationTokenSnapshot;
+            const expiry_timestamp_str = fields.next() orelse return error.InvalidDelegationTokenSnapshot;
+            const max_timestamp_str = fields.next() orelse return error.InvalidDelegationTokenSnapshot;
+            const renewer_count_str = fields.next() orelse return error.InvalidDelegationTokenSnapshot;
+
+            var entry = DelegationTokenEntry{
+                .key = try decodeHexAlloc(self.allocator, key_hex),
+                .owner_principal_type = &.{},
+                .owner_principal_name = &.{},
+                .requester_principal_type = &.{},
+                .requester_principal_name = &.{},
+                .token_id = &.{},
+                .hmac = &.{},
+                .renewers = &.{},
+                .issue_timestamp_ms = 0,
+                .expiry_timestamp_ms = 0,
+                .max_timestamp_ms = 0,
+            };
+            var entry_owned = true;
+            defer if (entry_owned) freeDelegationTokenEntry(self.allocator, &entry);
+
+            entry.owner_principal_type = try decodeHexAlloc(self.allocator, owner_type_hex);
+            entry.owner_principal_name = try decodeHexAlloc(self.allocator, owner_name_hex);
+            entry.requester_principal_type = try decodeHexAlloc(self.allocator, requester_type_hex);
+            entry.requester_principal_name = try decodeHexAlloc(self.allocator, requester_name_hex);
+            entry.token_id = try decodeHexAlloc(self.allocator, token_id_hex);
+            entry.hmac = try decodeHexAlloc(self.allocator, hmac_hex);
+            entry.issue_timestamp_ms = try std.fmt.parseInt(i64, issue_timestamp_str, 10);
+            entry.expiry_timestamp_ms = try std.fmt.parseInt(i64, expiry_timestamp_str, 10);
+            entry.max_timestamp_ms = try std.fmt.parseInt(i64, max_timestamp_str, 10);
+
+            const renewer_count = try std.fmt.parseInt(usize, renewer_count_str, 10);
+            if (renewer_count > 100_000) return error.InvalidDelegationTokenSnapshot;
+            if (renewer_count > 0) {
+                entry.renewers = try self.allocator.alloc(DelegationTokenRenewerEntry, renewer_count);
+                var initialized: usize = 0;
+                var valid_renewers = true;
+                while (initialized < renewer_count) : (initialized += 1) {
+                    const renewer_type_hex = fields.next() orelse {
+                        valid_renewers = false;
+                        break;
+                    };
+                    const renewer_name_hex = fields.next() orelse {
+                        valid_renewers = false;
+                        break;
+                    };
+                    const renewer_type = decodeHexAlloc(self.allocator, renewer_type_hex) catch {
+                        valid_renewers = false;
+                        break;
+                    };
+                    const renewer_name = decodeHexAlloc(self.allocator, renewer_name_hex) catch {
+                        self.allocator.free(renewer_type);
+                        valid_renewers = false;
+                        break;
+                    };
+                    entry.renewers[initialized] = .{
+                        .principal_type = renewer_type,
+                        .principal_name = renewer_name,
+                    };
+                }
+                if (!valid_renewers or initialized != renewer_count) {
+                    for (entry.renewers[0..initialized]) |*renewer| {
+                        self.allocator.free(renewer.principal_type);
+                        self.allocator.free(renewer.principal_name);
+                    }
+                    self.allocator.free(entry.renewers);
+                    entry.renewers = &.{};
+                    return error.InvalidDelegationTokenSnapshot;
+                }
+            }
+
+            if (fields.next() != null) return error.InvalidDelegationTokenSnapshot;
+
+            if (entry.key.len == 0 or entry.owner_principal_type.len == 0 or entry.owner_principal_name.len == 0 or entry.requester_principal_type.len == 0 or entry.requester_principal_name.len == 0 or entry.token_id.len == 0 or entry.hmac.len == 0) {
+                return error.InvalidDelegationTokenSnapshot;
+            }
+
+            try entries.append(entry);
+            entry_owned = false;
+        }
+
+        log.info("Loaded {d} delegation token(s) from delegation_tokens.meta", .{entries.items.len});
+        return entries.toOwnedSlice();
+    }
+
+    fn freeDelegationTokenEntry(allocator: Allocator, entry: *DelegationTokenEntry) void {
+        allocator.free(entry.key);
+        allocator.free(entry.owner_principal_type);
+        allocator.free(entry.owner_principal_name);
+        allocator.free(entry.requester_principal_type);
+        allocator.free(entry.requester_principal_name);
+        allocator.free(entry.token_id);
+        allocator.free(entry.hmac);
+        for (entry.renewers) |renewer| {
+            allocator.free(renewer.principal_type);
+            allocator.free(renewer.principal_name);
+        }
+        if (entry.renewers.len > 0) allocator.free(entry.renewers);
+        entry.* = .{
+            .key = &.{},
+            .owner_principal_type = &.{},
+            .owner_principal_name = &.{},
+            .requester_principal_type = &.{},
+            .requester_principal_name = &.{},
+            .token_id = &.{},
+            .hmac = &.{},
+            .renewers = &.{},
+            .issue_timestamp_ms = 0,
+            .expiry_timestamp_ms = 0,
+            .max_timestamp_ms = 0,
+        };
+    }
+
+    pub fn freeDelegationTokenEntries(self: *MetadataPersistence, entries: []DelegationTokenEntry) void {
+        for (entries) |*entry| freeDelegationTokenEntry(self.allocator, entry);
         if (entries.len > 0) self.allocator.free(entries);
     }
 
@@ -1902,15 +1988,14 @@ pub const MetadataPersistence = struct {
         defer self.allocator.free(path);
 
         const file = fs.openFileAbsolute(path, .{}) catch |err| {
-            log.debug("No finalized_features.meta found: {}", .{err});
-            return .{ .epoch = -1, .features = &.{} };
+            return switch (err) {
+                error.FileNotFound => .{ .epoch = -1, .features = &.{} },
+                else => err,
+            };
         };
         defer file.close();
 
-        const content = file.readToEndAlloc(self.allocator, 1024 * 1024) catch |err| {
-            log.warn("Failed to read finalized_features.meta: {}", .{err});
-            return .{ .epoch = -1, .features = &.{} };
-        };
+        const content = try file.readToEndAlloc(self.allocator, 1024 * 1024);
         defer self.allocator.free(content);
 
         var epoch: i64 = -1;
@@ -1925,24 +2010,23 @@ pub const MetadataPersistence = struct {
             if (line.len == 0) continue;
 
             var fields = std.mem.splitSequence(u8, line, "\t");
-            const tag = fields.next() orelse continue;
+            const tag = fields.next() orelse return error.InvalidFinalizedFeatureSnapshot;
             if (std.mem.eql(u8, tag, "epoch")) {
-                const epoch_str = fields.next() orelse continue;
-                epoch = std.fmt.parseInt(i64, epoch_str, 10) catch epoch;
+                const epoch_str = fields.next() orelse return error.InvalidFinalizedFeatureSnapshot;
+                if (fields.next() != null) return error.InvalidFinalizedFeatureSnapshot;
+                epoch = try parseIntForSnapshot(i64, epoch_str, error.InvalidFinalizedFeatureSnapshot);
                 continue;
             }
-            if (!std.mem.eql(u8, tag, "feature")) continue;
+            if (!std.mem.eql(u8, tag, "feature")) return error.InvalidFinalizedFeatureSnapshot;
 
-            const name_hex = fields.next() orelse continue;
-            const max_version_str = fields.next() orelse continue;
-            const name = decodeHexAlloc(self.allocator, name_hex) catch continue;
-            const max_version_level = std.fmt.parseInt(i16, max_version_str, 10) catch {
-                self.allocator.free(name);
-                continue;
-            };
+            const name_hex = fields.next() orelse return error.InvalidFinalizedFeatureSnapshot;
+            const max_version_str = fields.next() orelse return error.InvalidFinalizedFeatureSnapshot;
+            if (fields.next() != null) return error.InvalidFinalizedFeatureSnapshot;
+            const name = try decodeHexAllocForSnapshot(self.allocator, name_hex, error.InvalidFinalizedFeatureSnapshot);
+            errdefer self.allocator.free(name);
+            const max_version_level = try parseIntForSnapshot(i16, max_version_str, error.InvalidFinalizedFeatureSnapshot);
             if (name.len == 0 or max_version_level < 1) {
-                self.allocator.free(name);
-                continue;
+                return error.InvalidFinalizedFeatureSnapshot;
             }
 
             try entries.append(.{
@@ -2007,39 +2091,66 @@ pub const MetadataPersistence = struct {
         defer self.allocator.free(path);
 
         const file = fs.openFileAbsolute(path, .{}) catch |err| {
-            log.debug("No acls.meta found: {}", .{err});
-            return &.{};
+            return switch (err) {
+                error.FileNotFound => &.{},
+                else => err,
+            };
         };
         defer file.close();
 
-        const content = file.readToEndAlloc(self.allocator, 1024 * 1024) catch |err| {
-            log.warn("Failed to read acls.meta: {}", .{err});
-            return &.{};
-        };
+        const content = try file.readToEndAlloc(self.allocator, 1024 * 1024);
         defer self.allocator.free(content);
 
         var entries = std.array_list.Managed(AclEntry).init(self.allocator);
+        errdefer {
+            for (entries.items) |entry| {
+                self.allocator.free(entry.principal);
+                self.allocator.free(entry.resource_name);
+                self.allocator.free(entry.host);
+            }
+            entries.deinit();
+        }
 
         var lines = std.mem.splitSequence(u8, content, "\n");
         while (lines.next()) |line| {
             if (line.len == 0) continue;
             var fields = std.mem.splitSequence(u8, line, "\t");
-            const principal = fields.next() orelse continue;
-            const rt_str = fields.next() orelse continue;
-            const rn = fields.next() orelse continue;
-            const pt_str = fields.next() orelse continue;
-            const op_str = fields.next() orelse continue;
-            const perm_str = fields.next() orelse continue;
-            const host = fields.next() orelse continue;
+            const principal = fields.next() orelse return error.InvalidAclSnapshot;
+            const rt_str = fields.next() orelse return error.InvalidAclSnapshot;
+            const rn = fields.next() orelse return error.InvalidAclSnapshot;
+            const pt_str = fields.next() orelse return error.InvalidAclSnapshot;
+            const op_str = fields.next() orelse return error.InvalidAclSnapshot;
+            const perm_str = fields.next() orelse return error.InvalidAclSnapshot;
+            const host = fields.next() orelse return error.InvalidAclSnapshot;
+            if (fields.next() != null) return error.InvalidAclSnapshot;
+
+            const resource_type = try parseIntForSnapshot(i8, rt_str, error.InvalidAclSnapshot);
+            const pattern_type = try parseIntForSnapshot(i8, pt_str, error.InvalidAclSnapshot);
+            const operation = try parseIntForSnapshot(i8, op_str, error.InvalidAclSnapshot);
+            const permission = try parseIntForSnapshot(i8, perm_str, error.InvalidAclSnapshot);
+            if (!isValidEnumInt(Authorizer.ResourceType, resource_type) or
+                !isValidEnumInt(Authorizer.PatternType, pattern_type) or
+                !isValidEnumInt(Authorizer.Operation, operation) or
+                !isValidEnumInt(Authorizer.Permission, permission))
+            {
+                return error.InvalidAclSnapshot;
+            }
+
+            const principal_copy = try self.allocator.dupe(u8, principal);
+            errdefer self.allocator.free(principal_copy);
+            const resource_name_copy = try self.allocator.dupe(u8, rn);
+            errdefer self.allocator.free(resource_name_copy);
+            const host_copy = try self.allocator.dupe(u8, host);
+            errdefer self.allocator.free(host_copy);
 
             try entries.append(.{
-                .principal = try self.allocator.dupe(u8, principal),
-                .resource_type = std.fmt.parseInt(i8, rt_str, 10) catch continue,
-                .resource_name = try self.allocator.dupe(u8, rn),
-                .pattern_type = std.fmt.parseInt(i8, pt_str, 10) catch continue,
-                .operation = std.fmt.parseInt(i8, op_str, 10) catch continue,
-                .permission = std.fmt.parseInt(i8, perm_str, 10) catch continue,
-                .host = try self.allocator.dupe(u8, host),
+                .principal = principal_copy,
+                .resource_type = resource_type,
+                .resource_name = resource_name_copy,
+                .pattern_type = pattern_type,
+                .operation = operation,
+                .permission = permission,
+                .host = host_copy,
             });
         }
 
@@ -2119,15 +2230,14 @@ pub const MetadataPersistence = struct {
         defer self.allocator.free(path);
 
         const file = fs.openFileAbsolute(path, .{}) catch |err| {
-            log.debug("No automq.meta found: {}", .{err});
-            return emptyAutoMqMetadataSnapshot();
+            return switch (err) {
+                error.FileNotFound => emptyAutoMqMetadataSnapshot(),
+                else => err,
+            };
         };
         defer file.close();
 
-        const content = file.readToEndAlloc(self.allocator, 4 * 1024 * 1024) catch |err| {
-            log.warn("Failed to read automq.meta: {}", .{err});
-            return emptyAutoMqMetadataSnapshot();
-        };
+        const content = try file.readToEndAlloc(self.allocator, 4 * 1024 * 1024);
         defer self.allocator.free(content);
 
         var next_node_id: i32 = 1;
@@ -2159,65 +2269,71 @@ pub const MetadataPersistence = struct {
             if (line.len == 0) continue;
 
             var fields = std.mem.splitSequence(u8, line, "\t");
-            const tag = fields.next() orelse continue;
+            const tag = fields.next() orelse return error.InvalidAutoMqMetadataSnapshot;
 
             if (std.mem.eql(u8, tag, "version")) {
-                continue;
+                const value = fields.next() orelse return error.InvalidAutoMqMetadataSnapshot;
+                if (fields.next() != null) return error.InvalidAutoMqMetadataSnapshot;
+                const version = try parseIntForSnapshot(u8, value, error.InvalidAutoMqMetadataSnapshot);
+                if (version != 1) return error.InvalidAutoMqMetadataSnapshot;
             } else if (std.mem.eql(u8, tag, "next_node_id")) {
-                const value = fields.next() orelse continue;
-                next_node_id = std.fmt.parseInt(i32, value, 10) catch next_node_id;
+                const value = fields.next() orelse return error.InvalidAutoMqMetadataSnapshot;
+                if (fields.next() != null) return error.InvalidAutoMqMetadataSnapshot;
+                next_node_id = try parseIntForSnapshot(i32, value, error.InvalidAutoMqMetadataSnapshot);
             } else if (std.mem.eql(u8, tag, "zone_router_epoch")) {
-                const value = fields.next() orelse continue;
-                zone_router_epoch = std.fmt.parseInt(i64, value, 10) catch zone_router_epoch;
+                const value = fields.next() orelse return error.InvalidAutoMqMetadataSnapshot;
+                if (fields.next() != null) return error.InvalidAutoMqMetadataSnapshot;
+                zone_router_epoch = try parseIntForSnapshot(i64, value, error.InvalidAutoMqMetadataSnapshot);
             } else if (std.mem.eql(u8, tag, "license")) {
-                const encoded = fields.next() orelse continue;
-                const decoded = decodeHexAlloc(self.allocator, encoded) catch continue;
+                const encoded = fields.next() orelse return error.InvalidAutoMqMetadataSnapshot;
+                if (fields.next() != null) return error.InvalidAutoMqMetadataSnapshot;
+                const decoded = try decodeHexAllocForSnapshot(self.allocator, encoded, error.InvalidAutoMqMetadataSnapshot);
                 if (license) |old| self.allocator.free(old);
                 license = decoded;
             } else if (std.mem.eql(u8, tag, "zone_router_metadata")) {
-                const encoded = fields.next() orelse continue;
-                const decoded = decodeHexAlloc(self.allocator, encoded) catch continue;
+                const encoded = fields.next() orelse return error.InvalidAutoMqMetadataSnapshot;
+                if (fields.next() != null) return error.InvalidAutoMqMetadataSnapshot;
+                const decoded = try decodeHexAllocForSnapshot(self.allocator, encoded, error.InvalidAutoMqMetadataSnapshot);
                 if (zone_router_metadata) |old| self.allocator.free(old);
                 zone_router_metadata = decoded;
             } else if (std.mem.eql(u8, tag, "kv")) {
-                const key_hex = fields.next() orelse continue;
-                const value_hex = fields.next() orelse continue;
-                const key = decodeHexAlloc(self.allocator, key_hex) catch continue;
-                const value = decodeHexAlloc(self.allocator, value_hex) catch {
-                    self.allocator.free(key);
-                    continue;
-                };
+                const key_hex = fields.next() orelse return error.InvalidAutoMqMetadataSnapshot;
+                const value_hex = fields.next() orelse return error.InvalidAutoMqMetadataSnapshot;
+                if (fields.next() != null) return error.InvalidAutoMqMetadataSnapshot;
+                const key = try decodeHexAllocForSnapshot(self.allocator, key_hex, error.InvalidAutoMqMetadataSnapshot);
+                errdefer self.allocator.free(key);
+                const value = try decodeHexAllocForSnapshot(self.allocator, value_hex, error.InvalidAutoMqMetadataSnapshot);
+                errdefer self.allocator.free(value);
                 kvs.append(.{ .key = key, .value = value }) catch |err| {
-                    self.allocator.free(key);
-                    self.allocator.free(value);
                     return err;
                 };
             } else if (std.mem.eql(u8, tag, "node")) {
-                const node_id_str = fields.next() orelse continue;
-                const node_epoch_str = fields.next() orelse continue;
-                const wal_config_hex = fields.next() orelse continue;
-                const node_id = std.fmt.parseInt(i32, node_id_str, 10) catch continue;
-                const node_epoch = std.fmt.parseInt(i64, node_epoch_str, 10) catch continue;
-                const wal_config = decodeHexAlloc(self.allocator, wal_config_hex) catch continue;
+                const node_id_str = fields.next() orelse return error.InvalidAutoMqMetadataSnapshot;
+                const node_epoch_str = fields.next() orelse return error.InvalidAutoMqMetadataSnapshot;
+                const wal_config_hex = fields.next() orelse return error.InvalidAutoMqMetadataSnapshot;
+                if (fields.next() != null) return error.InvalidAutoMqMetadataSnapshot;
+                const node_id = try parseIntForSnapshot(i32, node_id_str, error.InvalidAutoMqMetadataSnapshot);
+                const node_epoch = try parseIntForSnapshot(i64, node_epoch_str, error.InvalidAutoMqMetadataSnapshot);
+                const wal_config = try decodeHexAllocForSnapshot(self.allocator, wal_config_hex, error.InvalidAutoMqMetadataSnapshot);
+                errdefer self.allocator.free(wal_config);
                 nodes.append(.{ .node_id = node_id, .node_epoch = node_epoch, .wal_config = wal_config }) catch |err| {
-                    self.allocator.free(wal_config);
                     return err;
                 };
             } else if (std.mem.eql(u8, tag, "group")) {
-                const group_id_hex = fields.next() orelse continue;
-                const link_id_hex = fields.next() orelse continue;
-                const promoted_str = fields.next() orelse continue;
-                const promoted_int = std.fmt.parseInt(u8, promoted_str, 10) catch continue;
-                const group_id = decodeHexAlloc(self.allocator, group_id_hex) catch continue;
-                const link_id = decodeHexAlloc(self.allocator, link_id_hex) catch {
-                    self.allocator.free(group_id);
-                    continue;
-                };
-                group_promotions.append(.{ .group_id = group_id, .link_id = link_id, .promoted = promoted_int != 0 }) catch |err| {
-                    self.allocator.free(group_id);
-                    self.allocator.free(link_id);
+                const group_id_hex = fields.next() orelse return error.InvalidAutoMqMetadataSnapshot;
+                const link_id_hex = fields.next() orelse return error.InvalidAutoMqMetadataSnapshot;
+                const promoted_str = fields.next() orelse return error.InvalidAutoMqMetadataSnapshot;
+                if (fields.next() != null) return error.InvalidAutoMqMetadataSnapshot;
+                const promoted = parseBoolFlag(promoted_str) catch return error.InvalidAutoMqMetadataSnapshot;
+                const group_id = try decodeHexAllocForSnapshot(self.allocator, group_id_hex, error.InvalidAutoMqMetadataSnapshot);
+                errdefer self.allocator.free(group_id);
+                const link_id = try decodeHexAllocForSnapshot(self.allocator, link_id_hex, error.InvalidAutoMqMetadataSnapshot);
+                errdefer self.allocator.free(link_id);
+                group_promotions.append(.{ .group_id = group_id, .link_id = link_id, .promoted = promoted }) catch |err| {
                     return err;
                 };
+            } else {
+                return error.InvalidAutoMqMetadataSnapshot;
             }
         }
 
@@ -2261,15 +2377,14 @@ pub const MetadataPersistence = struct {
         defer self.allocator.free(path);
 
         const file = fs.openFileAbsolute(path, .{}) catch |err| {
-            log.debug("No objects.snapshot found: {}", .{err});
-            return null;
+            return switch (err) {
+                error.FileNotFound => null,
+                else => err,
+            };
         };
         defer file.close();
 
-        return file.readToEndAlloc(self.allocator, 64 * 1024 * 1024) catch |err| {
-            log.warn("Failed to read objects.snapshot: {}", .{err});
-            return null;
-        };
+        return try file.readToEndAlloc(self.allocator, 64 * 1024 * 1024);
     }
 
     /// Save the PreparedObjectRegistry binary snapshot to disk.
@@ -2294,21 +2409,30 @@ pub const MetadataPersistence = struct {
         defer self.allocator.free(path);
 
         const file = fs.openFileAbsolute(path, .{}) catch |err| {
-            log.debug("No prepared.snapshot found: {}", .{err});
-            return null;
+            return switch (err) {
+                error.FileNotFound => null,
+                else => err,
+            };
         };
         defer file.close();
 
-        return file.readToEndAlloc(self.allocator, 1024 * 1024) catch |err| {
-            log.warn("Failed to read prepared.snapshot: {}", .{err});
-            return null;
-        };
+        return try file.readToEndAlloc(self.allocator, 1024 * 1024);
     }
 };
 
 // ---------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------
+
+fn writeTestMetadataFile(tmp_dir: []const u8, file_name: []const u8, contents: []const u8) !void {
+    const path = try std.fmt.allocPrint(testing.allocator, "{s}/{s}", .{ tmp_dir, file_name });
+    defer testing.allocator.free(path);
+
+    const file = try fs.createFileAbsolute(path, .{ .truncate = true });
+    defer file.close();
+    try file.writeAll(contents);
+    try file.sync();
+}
 
 test "MetadataPersistence save and load topics" {
     const tmp_dir = "/tmp/automq-meta-test";
@@ -2794,6 +2918,74 @@ test "MetadataPersistence save and load share group sessions round-trip" {
     try testing.expectEqual(@as(usize, 1), loaded.len);
     try testing.expectEqualStrings("10:group\tname-member\nid", loaded[0].key);
     try testing.expectEqual(@as(i32, 7), loaded[0].epoch);
+}
+
+test "MetadataPersistence load delegation tokens fails closed on malformed row" {
+    const tmp_dir = "/tmp/automq-delegation-token-malformed-test";
+    fs.deleteTreeAbsolute(tmp_dir) catch {};
+    fs.makeDirAbsolute(tmp_dir) catch {};
+    defer fs.deleteTreeAbsolute(tmp_dir) catch {};
+
+    const path = try std.fmt.allocPrint(testing.allocator, "{s}/delegation_tokens.meta", .{tmp_dir});
+    defer testing.allocator.free(path);
+
+    {
+        const file = try fs.createFileAbsolute(path, .{ .truncate = true });
+        defer file.close();
+        try file.writeAll("delegation_token_v1\t6b6579\n");
+        try file.sync();
+    }
+
+    var persistence = MetadataPersistence.init(testing.allocator, tmp_dir);
+    try testing.expectError(error.InvalidDelegationTokenSnapshot, persistence.loadDelegationTokens());
+}
+
+test "MetadataPersistence high-risk snapshots fail closed on malformed rows" {
+    const tmp_dir = "/tmp/automq-strict-snapshot-malformed-test";
+    fs.deleteTreeAbsolute(tmp_dir) catch {};
+    fs.makeDirAbsolute(tmp_dir) catch {};
+    defer fs.deleteTreeAbsolute(tmp_dir) catch {};
+
+    var persistence = MetadataPersistence.init(testing.allocator, tmp_dir);
+
+    try writeTestMetadataFile(tmp_dir, "topics.meta", "topic_v4\t746f706963\tbad\n");
+    try testing.expectError(error.InvalidTopicSnapshot, persistence.loadTopics());
+
+    try writeTestMetadataFile(tmp_dir, "offsets.meta", "group:topic:0\tbad\n");
+    try testing.expectError(error.InvalidOffsetSnapshot, persistence.loadOffsets());
+
+    try writeTestMetadataFile(tmp_dir, "consumer_groups.meta", "group_v1\t67726f7570\t1\t0\t0\t0\t\t1000\t1000\t1\t0\t\t0\t\n");
+    try testing.expectError(error.InvalidConsumerGroupSnapshot, persistence.loadConsumerGroups());
+
+    try writeTestMetadataFile(tmp_dir, "transactions.meta", "next_producer_id\t1000\ntxn_v2\t1000\t0\t1\t60000\t74786e\t1\t746f706963\n");
+    try testing.expectError(error.InvalidTransactionSnapshot, persistence.loadTransactions());
+
+    try writeTestMetadataFile(tmp_dir, "producer_state.meta", "1000\t42\tbad\t0\n");
+    try testing.expectError(error.InvalidProducerSequenceSnapshot, persistence.loadProducerSequences());
+
+    try writeTestMetadataFile(tmp_dir, "partition_state.meta", "partition\t746f706963\t0\t1\t0\t0\t0\tbad\n");
+    try testing.expectError(error.InvalidPartitionStateSnapshot, persistence.loadPartitionStates());
+
+    try writeTestMetadataFile(tmp_dir, "partition_reassignments.meta", "reassignment\t746f706963\t0\t1,,2\t\t\n");
+    try testing.expectError(error.InvalidPartitionReassignmentSnapshot, persistence.loadPartitionReassignments());
+
+    try writeTestMetadataFile(tmp_dir, "replica_directory_assignments.meta", "replica_dir\t0011\t0\t2233\n");
+    try testing.expectError(error.InvalidReplicaDirectoryAssignmentSnapshot, persistence.loadReplicaDirectoryAssignments());
+
+    try writeTestMetadataFile(tmp_dir, "share_group_states.meta", "share_state\t6b6579\t1\t0\t1\t5\t8\t2\n");
+    try testing.expectError(error.InvalidShareGroupStateSnapshot, persistence.loadShareGroupStates());
+
+    try writeTestMetadataFile(tmp_dir, "share_group_sessions.meta", "share_session\t6b657\t1\n");
+    try testing.expectError(error.InvalidShareGroupSessionSnapshot, persistence.loadShareGroupSessions());
+
+    try writeTestMetadataFile(tmp_dir, "finalized_features.meta", "epoch\t1\nfeature\t6d657461646174612e76657273696f6e\tbad\n");
+    try testing.expectError(error.InvalidFinalizedFeatureSnapshot, persistence.loadFinalizedFeatures());
+
+    try writeTestMetadataFile(tmp_dir, "acls.meta", "User:alice\t99\ttopic\t3\t4\t3\t*\n");
+    try testing.expectError(error.InvalidAclSnapshot, persistence.loadAcls());
+
+    try writeTestMetadataFile(tmp_dir, "automq.meta", "version\t1\nlicense\tabc\n");
+    try testing.expectError(error.InvalidAutoMqMetadataSnapshot, persistence.loadAutoMqMetadata());
 }
 
 test "MetadataPersistence save and load finalized features round-trip" {

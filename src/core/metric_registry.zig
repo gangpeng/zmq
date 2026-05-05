@@ -415,6 +415,7 @@ pub const MetricRegistry = struct {
         defer self.mutex.unlock();
 
         var buf = std.array_list.Managed(u8).init(alloc);
+        errdefer buf.deinit();
         const writer = @import("list_compat").writer(&buf);
 
         // Counters

@@ -175,7 +175,7 @@ pub const S3Client = struct {
 
     /// Upload an object.
     pub fn putObject(self: *S3Client, key: []const u8, data: []const u8) !void {
-        const start_ns = @import("time_compat").nanoTimestamp();
+        const start_ns = @import("time_compat").monotonicNanoTimestamp();
         const path = try self.objectPath(key);
         defer self.allocator.free(path);
 
@@ -204,7 +204,7 @@ pub const S3Client = struct {
     /// on transient failures (connection errors, non-2xx responses).
     pub fn getObject(self: *S3Client, key: []const u8) ![]u8 {
         const MAX_RETRIES: u32 = 3;
-        const start_ns = @import("time_compat").nanoTimestamp();
+        const start_ns = @import("time_compat").monotonicNanoTimestamp();
         var attempt: u32 = 0;
 
         while (true) {
@@ -361,7 +361,7 @@ pub const S3Client = struct {
 
     /// Delete an object.
     pub fn deleteObject(self: *S3Client, key: []const u8) !void {
-        const start_ns = @import("time_compat").nanoTimestamp();
+        const start_ns = @import("time_compat").monotonicNanoTimestamp();
         const path = try self.objectPath(key);
         defer self.allocator.free(path);
 
@@ -1101,9 +1101,9 @@ pub const S3Client = struct {
     }
 
     /// Record S3 request duration in seconds.
-    fn recordS3Duration(self: *S3Client, operation: []const u8, start_ns: i128) void {
+    fn recordS3Duration(self: *S3Client, operation: []const u8, start_ns: u64) void {
         if (self.metrics) |m| {
-            const elapsed_ns = @import("time_compat").nanoTimestamp() - start_ns;
+            const elapsed_ns = @import("time_compat").monotonicNanoTimestamp() - start_ns;
             const elapsed_secs: f64 = @as(f64, @floatFromInt(elapsed_ns)) / 1_000_000_000.0;
             m.observeLabeledHistogram("s3_request_duration_seconds", &.{operation}, elapsed_secs);
         }

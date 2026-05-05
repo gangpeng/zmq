@@ -10,7 +10,8 @@ const storage = @import("storage");
 const broker_mod = @import("broker");
 const handler = broker_mod.handler;
 const Broker = broker_mod.Broker;
-const ConfigFile = @import("config.zig").ConfigFile;
+const config_mod = @import("config.zig");
+const ConfigFile = config_mod.ConfigFile;
 const raft_mod = @import("raft");
 const ElectionLoop = raft_mod.ElectionLoop;
 const RaftState = raft_mod.RaftState;
@@ -65,6 +66,75 @@ fn parseS3Scheme(text: []const u8, default: storage.S3Client.Scheme) storage.S3C
     if (std.ascii.eqlIgnoreCase(text, "https")) return .https;
     if (std.ascii.eqlIgnoreCase(text, "http")) return .http;
     return default;
+}
+
+fn nextRequiredArg(stdout: *Stdout, args: *std.process.Args.Iterator, flag: []const u8) ![]const u8 {
+    return args.next() orelse {
+        try stdout.print("  ERROR: missing value for {s}\n", .{flag});
+        return error.InvalidConfiguration;
+    };
+}
+
+fn parseRequiredIntArg(comptime T: type, stdout: *Stdout, args: *std.process.Args.Iterator, flag: []const u8) !T {
+    const text = try nextRequiredArg(stdout, args, flag);
+    return std.fmt.parseInt(T, text, 10) catch {
+        try stdout.print("  ERROR: invalid integer for {s}: '{s}'\n", .{ flag, text });
+        return error.InvalidConfiguration;
+    };
+}
+
+fn parseRequiredPortArg(stdout: *Stdout, args: *std.process.Args.Iterator, flag: []const u8) !u16 {
+    const value = try parseRequiredIntArg(u16, stdout, args, flag);
+    if (value == 0) {
+        try stdout.print("  ERROR: {s} must be in the range 1-65535\n", .{flag});
+        return error.InvalidConfiguration;
+    }
+    return value;
+}
+
+fn parseRequiredNodeIdArg(stdout: *Stdout, args: *std.process.Args.Iterator, flag: []const u8) !i32 {
+    const value = try parseRequiredIntArg(i32, stdout, args, flag);
+    if (value < 0) {
+        try stdout.print("  ERROR: {s} must be non-negative\n", .{flag});
+        return error.InvalidConfiguration;
+    }
+    return value;
+}
+
+fn applyConfigIntStrict(comptime T: type, stdout: *Stdout, cfg: *const ConfigFile, key: []const u8, target: *T) !void {
+    const value = cfg.getIntStrict(T, key) catch {
+        try stdout.print("  ERROR: invalid integer for config '{s}'\n", .{key});
+        return error.InvalidConfiguration;
+    };
+    if (value) |v| target.* = v;
+}
+
+fn applyConfigPortStrict(stdout: *Stdout, cfg: *const ConfigFile, key: []const u8, target: *u16) !void {
+    const value = cfg.getIntStrict(u16, key) catch {
+        try stdout.print("  ERROR: invalid port for config '{s}'\n", .{key});
+        return error.InvalidConfiguration;
+    };
+    if (value) |v| {
+        if (v == 0) {
+            try stdout.print("  ERROR: config '{s}' must be in the range 1-65535\n", .{key});
+            return error.InvalidConfiguration;
+        }
+        target.* = v;
+    }
+}
+
+fn applyConfigNodeIdStrict(stdout: *Stdout, cfg: *const ConfigFile, key: []const u8, target: *i32) !void {
+    const value = cfg.getIntStrict(i32, key) catch {
+        try stdout.print("  ERROR: invalid node id for config '{s}'\n", .{key});
+        return error.InvalidConfiguration;
+    };
+    if (value) |v| {
+        if (v < 0) {
+            try stdout.print("  ERROR: config '{s}' must be non-negative\n", .{key});
+            return error.InvalidConfiguration;
+        }
+        target.* = v;
+    }
 }
 
 fn firstLogDir(log_dirs: ?[]const u8) ?[]const u8 {
@@ -199,6 +269,17 @@ pub fn main(init: std.process.Init) !void {
     var process_roles: ProcessRoles = ProcessRoles.combined;
     // Controller listener port (KRaft consensus + broker registration).
     var controller_port: u16 = 9093;
+    var cli_port_set = false;
+    var cli_metrics_port_set = false;
+    var cli_s3_port_set = false;
+    var cli_node_id_set = false;
+    var cli_process_roles_set = false;
+    var cli_controller_port_set = false;
+    var cli_s3_wal_batch_size_set = false;
+    var cli_s3_wal_flush_interval_set = false;
+    var cli_cache_max_size_set = false;
+    var cli_s3_block_cache_size_set = false;
+    var cli_compaction_interval_set = false;
     // Configurable S3 WAL and performance parameters
     var s3_wal_batch_size: usize = 4 * 1024 * 1024;
     var s3_wal_flush_interval: i64 = 250;
@@ -220,72 +301,95 @@ pub fn main(init: std.process.Init) !void {
 
     while (args.next()) |arg| {
         if (std.mem.eql(u8, arg, "--port")) {
-            if (args.next()) |p| port = std.fmt.parseInt(u16, p, 10) catch port;
+            port = try parseRequiredPortArg(&stdout, &args, "--port");
+            cli_port_set = true;
         } else if (std.mem.eql(u8, arg, "--data-dir")) {
-            data_dir = args.next();
+            data_dir = try nextRequiredArg(&stdout, &args, "--data-dir");
         } else if (std.mem.eql(u8, arg, "--s3-endpoint")) {
-            s3_host = args.next();
+            s3_host = try nextRequiredArg(&stdout, &args, "--s3-endpoint");
         } else if (std.mem.eql(u8, arg, "--s3-port")) {
-            if (args.next()) |p| s3_port = std.fmt.parseInt(u16, p, 10) catch 9000;
+            s3_port = try parseRequiredPortArg(&stdout, &args, "--s3-port");
+            cli_s3_port_set = true;
         } else if (std.mem.eql(u8, arg, "--s3-bucket")) {
-            if (args.next()) |b| s3_bucket = b;
+            s3_bucket = try nextRequiredArg(&stdout, &args, "--s3-bucket");
         } else if (std.mem.eql(u8, arg, "--s3-access-key")) {
-            if (args.next()) |k| s3_access_key = k;
+            s3_access_key = try nextRequiredArg(&stdout, &args, "--s3-access-key");
         } else if (std.mem.eql(u8, arg, "--s3-secret-key")) {
-            if (args.next()) |k| s3_secret_key = k;
+            s3_secret_key = try nextRequiredArg(&stdout, &args, "--s3-secret-key");
         } else if (std.mem.eql(u8, arg, "--s3-scheme")) {
-            if (args.next()) |v| s3_scheme = parseS3Scheme(v, s3_scheme);
+            s3_scheme = parseS3Scheme(try nextRequiredArg(&stdout, &args, "--s3-scheme"), s3_scheme);
         } else if (std.mem.eql(u8, arg, "--s3-region")) {
-            if (args.next()) |r| s3_region = r;
+            s3_region = try nextRequiredArg(&stdout, &args, "--s3-region");
         } else if (std.mem.eql(u8, arg, "--s3-path-style")) {
-            if (args.next()) |v| s3_path_style = parseBoolFlag(v, s3_path_style);
+            s3_path_style = parseBoolFlag(try nextRequiredArg(&stdout, &args, "--s3-path-style"), s3_path_style);
         } else if (std.mem.eql(u8, arg, "--s3-ca-file")) {
-            s3_tls_ca_file = args.next();
+            s3_tls_ca_file = try nextRequiredArg(&stdout, &args, "--s3-ca-file");
         } else if (std.mem.eql(u8, arg, "--metrics-port")) {
-            if (args.next()) |p| metrics_port = std.fmt.parseInt(u16, p, 10) catch 9090;
+            metrics_port = try parseRequiredPortArg(&stdout, &args, "--metrics-port");
+            cli_metrics_port_set = true;
         } else if (std.mem.eql(u8, arg, "--node-id")) {
-            if (args.next()) |n| node_id = std.fmt.parseInt(i32, n, 10) catch 0;
+            node_id = try parseRequiredNodeIdArg(&stdout, &args, "--node-id");
+            cli_node_id_set = true;
         } else if (std.mem.eql(u8, arg, "--advertised-host")) {
-            if (args.next()) |h| advertised_host = h;
+            advertised_host = try nextRequiredArg(&stdout, &args, "--advertised-host");
         } else if (std.mem.eql(u8, arg, "--config")) {
-            config_path = args.next();
+            config_path = try nextRequiredArg(&stdout, &args, "--config");
         } else if (std.mem.eql(u8, arg, "--cluster-id")) {
-            if (args.next()) |c| cluster_id = c;
+            cluster_id = try nextRequiredArg(&stdout, &args, "--cluster-id");
         } else if (std.mem.eql(u8, arg, "--voters")) {
-            voters_str = args.next();
+            voters_str = try nextRequiredArg(&stdout, &args, "--voters");
         } else if (std.mem.eql(u8, arg, "--workers")) {
-            if (args.next()) |w| num_workers = std.fmt.parseInt(usize, w, 10) catch 4;
+            num_workers = try parseRequiredIntArg(usize, &stdout, &args, "--workers");
         } else if (std.mem.eql(u8, arg, "--process-roles")) {
-            if (args.next()) |r| process_roles = ProcessRoles.parse(r) catch ProcessRoles.combined;
+            const role_text = try nextRequiredArg(&stdout, &args, "--process-roles");
+            process_roles = ProcessRoles.parse(role_text) catch {
+                try stdout.print("  ERROR: invalid --process-roles '{s}'\n", .{role_text});
+                return error.InvalidConfiguration;
+            };
+            cli_process_roles_set = true;
         } else if (std.mem.eql(u8, arg, "--controller-port")) {
-            if (args.next()) |p| controller_port = std.fmt.parseInt(u16, p, 10) catch 9093;
+            controller_port = try parseRequiredPortArg(&stdout, &args, "--controller-port");
+            cli_controller_port_set = true;
             // S3 WAL and cache configuration CLI flags
         } else if (std.mem.eql(u8, arg, "--s3-wal-batch-size")) {
-            if (args.next()) |v| s3_wal_batch_size = std.fmt.parseInt(usize, v, 10) catch s3_wal_batch_size;
+            s3_wal_batch_size = try parseRequiredIntArg(usize, &stdout, &args, "--s3-wal-batch-size");
+            cli_s3_wal_batch_size_set = true;
         } else if (std.mem.eql(u8, arg, "--s3-wal-flush-interval")) {
-            if (args.next()) |v| s3_wal_flush_interval = std.fmt.parseInt(i64, v, 10) catch s3_wal_flush_interval;
+            s3_wal_flush_interval = try parseRequiredIntArg(i64, &stdout, &args, "--s3-wal-flush-interval");
+            cli_s3_wal_flush_interval_set = true;
         } else if (std.mem.eql(u8, arg, "--s3-wal-flush-mode")) {
-            if (args.next()) |v| s3_wal_flush_mode = v;
+            s3_wal_flush_mode = try nextRequiredArg(&stdout, &args, "--s3-wal-flush-mode");
         } else if (std.mem.eql(u8, arg, "--cache-max-size")) {
-            if (args.next()) |v| cache_max_size = std.fmt.parseInt(u64, v, 10) catch cache_max_size;
+            cache_max_size = try parseRequiredIntArg(u64, &stdout, &args, "--cache-max-size");
+            cli_cache_max_size_set = true;
         } else if (std.mem.eql(u8, arg, "--s3-block-cache-size")) {
-            if (args.next()) |v| s3_block_cache_size = std.fmt.parseInt(u64, v, 10) catch s3_block_cache_size;
+            s3_block_cache_size = try parseRequiredIntArg(u64, &stdout, &args, "--s3-block-cache-size");
+            cli_s3_block_cache_size_set = true;
         } else if (std.mem.eql(u8, arg, "--compaction-interval")) {
-            if (args.next()) |v| compaction_interval = std.fmt.parseInt(i64, v, 10) catch compaction_interval;
+            compaction_interval = try parseRequiredIntArg(i64, &stdout, &args, "--compaction-interval");
+            cli_compaction_interval_set = true;
         } else if (std.mem.eql(u8, arg, "--security-protocol")) {
-            if (args.next()) |v| security_protocol = v;
+            security_protocol = try nextRequiredArg(&stdout, &args, "--security-protocol");
         } else if (std.mem.eql(u8, arg, "--tls-cert-file")) {
-            tls_cert_file = args.next();
+            tls_cert_file = try nextRequiredArg(&stdout, &args, "--tls-cert-file");
         } else if (std.mem.eql(u8, arg, "--tls-key-file")) {
-            tls_key_file = args.next();
+            tls_key_file = try nextRequiredArg(&stdout, &args, "--tls-key-file");
         } else if (std.mem.eql(u8, arg, "--tls-ca-file")) {
-            tls_ca_file = args.next();
+            tls_ca_file = try nextRequiredArg(&stdout, &args, "--tls-ca-file");
         } else if (std.mem.eql(u8, arg, "--tls-client-auth")) {
-            if (args.next()) |v| tls_client_auth_str = v;
+            tls_client_auth_str = try nextRequiredArg(&stdout, &args, "--tls-client-auth");
         } else if (std.mem.eql(u8, arg, "--client-telemetry-export-file")) {
-            client_telemetry_export_path = args.next();
+            client_telemetry_export_path = try nextRequiredArg(&stdout, &args, "--client-telemetry-export-file");
         } else {
-            port = std.fmt.parseInt(u16, arg, 10) catch port;
+            port = std.fmt.parseInt(u16, arg, 10) catch {
+                try stdout.print("  ERROR: unknown argument '{s}'\n", .{arg});
+                return error.InvalidConfiguration;
+            };
+            if (port == 0) {
+                try stdout.print("  ERROR: positional port must be in the range 1-65535\n", .{});
+                return error.InvalidConfiguration;
+            }
+            cli_port_set = true;
         }
     }
 
@@ -295,11 +399,12 @@ pub fn main(init: std.process.Init) !void {
 
     if (config_path) |cp| {
         cfg.load(cp) catch |err| {
-            try stdout.print("  WARNING: Failed to load config '{s}': {}\n", .{ cp, err });
+            try stdout.print("  ERROR: Failed to load config '{s}': {}\n", .{ cp, err });
+            return error.InvalidConfiguration;
         };
         if (data_dir == null) data_dir = cfg.getString("log.dirs");
         if (s3_host == null) s3_host = cfg.getString("s3.endpoint.host");
-        s3_port = cfg.getInt(u16, "s3.endpoint.port", s3_port);
+        if (!cli_s3_port_set) try applyConfigPortStrict(&stdout, &cfg, "s3.endpoint.port", &s3_port);
         s3_bucket = cfg.getStringOr("s3.bucket", s3_bucket);
         s3_access_key = cfg.getStringOr("s3.access.key", s3_access_key);
         s3_secret_key = cfg.getStringOr("s3.secret.key", s3_secret_key);
@@ -307,22 +412,31 @@ pub fn main(init: std.process.Init) !void {
         s3_region = cfg.getStringOr("s3.region", s3_region);
         s3_path_style = cfg.getBool("s3.path.style", s3_path_style);
         if (s3_tls_ca_file == null) s3_tls_ca_file = cfg.getString("s3.tls.ca.file");
-        port = cfg.getInt(u16, "listeners.port", port);
-        metrics_port = cfg.getInt(u16, "metrics.port", metrics_port);
-        node_id = cfg.getInt(i32, "broker.id", node_id);
+        if (!cli_port_set) try applyConfigPortStrict(&stdout, &cfg, "listeners.port", &port);
+        if (!cli_metrics_port_set) try applyConfigPortStrict(&stdout, &cfg, "metrics.port", &metrics_port);
+        if (!cli_node_id_set) try applyConfigNodeIdStrict(&stdout, &cfg, "broker.id", &node_id);
         cluster_id = cfg.getStringOr("cluster.id", cluster_id);
+        if (voters_str == null) voters_str = cfg.getString("controller.quorum.voters");
         // Load S3 WAL and cache config from config file
-        s3_wal_batch_size = @intCast(cfg.getInt(u64, "s3.wal.batch.size", @intCast(s3_wal_batch_size)));
-        s3_wal_flush_interval = cfg.getInt(i64, "s3.wal.flush.interval.ms", s3_wal_flush_interval);
-        if (cfg.getString("s3.wal.flush.mode")) |m| s3_wal_flush_mode = m;
-        s3_block_cache_size = @intCast(cfg.getInt(u64, "s3.block.cache.size", @intCast(s3_block_cache_size)));
-        cache_max_size = @intCast(cfg.getInt(u64, "log.cache.max.size", @intCast(cache_max_size)));
-        compaction_interval = cfg.getInt(i64, "s3.compaction.interval.ms", compaction_interval);
-        // Process role and controller port from config file (CLI takes precedence)
-        if (cfg.getString("process.roles")) |r| {
-            process_roles = ProcessRoles.parse(r) catch process_roles;
+        if (!cli_s3_wal_batch_size_set) {
+            var s3_wal_batch_size_cfg: u64 = @intCast(s3_wal_batch_size);
+            try applyConfigIntStrict(u64, &stdout, &cfg, "s3.wal.batch.size", &s3_wal_batch_size_cfg);
+            s3_wal_batch_size = @intCast(s3_wal_batch_size_cfg);
         }
-        controller_port = cfg.getInt(u16, "controller.listener.port", controller_port);
+        if (!cli_s3_wal_flush_interval_set) try applyConfigIntStrict(i64, &stdout, &cfg, "s3.wal.flush.interval.ms", &s3_wal_flush_interval);
+        if (cfg.getString("s3.wal.flush.mode")) |m| s3_wal_flush_mode = m;
+        if (!cli_s3_block_cache_size_set) try applyConfigIntStrict(u64, &stdout, &cfg, "s3.block.cache.size", &s3_block_cache_size);
+        if (!cli_cache_max_size_set) try applyConfigIntStrict(u64, &stdout, &cfg, "log.cache.max.size", &cache_max_size);
+        if (!cli_compaction_interval_set) try applyConfigIntStrict(i64, &stdout, &cfg, "s3.compaction.interval.ms", &compaction_interval);
+        // Process role and controller port from config file (CLI takes precedence)
+        if (!cli_process_roles_set and cfg.getString("process.roles") != null) {
+            const r = cfg.getString("process.roles").?;
+            process_roles = ProcessRoles.parse(r) catch {
+                try stdout.print("  ERROR: invalid process.roles '{s}'\n", .{r});
+                return error.InvalidConfiguration;
+            };
+        }
+        if (!cli_controller_port_set) try applyConfigPortStrict(&stdout, &cfg, "controller.listener.port", &controller_port);
         // TLS configuration from config file (CLI flags take precedence)
         if (cfg.getString("security.protocol")) |p| security_protocol = p;
         if (cfg.getString("ssl.certfile")) |f| tls_cert_file = f;
@@ -330,6 +444,11 @@ pub fn main(init: std.process.Init) !void {
         if (cfg.getString("ssl.cafile")) |f| tls_ca_file = f;
         if (cfg.getString("ssl.client.auth")) |a| tls_client_auth_str = a;
         if (client_telemetry_export_path == null) client_telemetry_export_path = cfg.getString("client.telemetry.export.file");
+    }
+
+    if (num_workers == 0) {
+        try stdout.print("  ERROR: --workers must be greater than zero\n", .{});
+        return error.InvalidConfiguration;
     }
 
     // Validate: broker-only mode requires --voters to know the controller quorum
@@ -388,23 +507,29 @@ pub fn main(init: std.process.Init) !void {
         controller = ctrl;
 
         if (voters_str == null) {
-            ctrl.raft_state.addVoter(node_id) catch {};
+            try ctrl.raft_state.addVoter(node_id);
         } else {
             raft_pool = RaftClientPool.init(alloc);
-            parseAndRegisterVoters(&ctrl.raft_state, voters_str.?, &raft_pool.?);
+            parseAndRegisterVoters(&ctrl.raft_state, voters_str.?, &raft_pool.?) catch |err| {
+                try stdout.print("  ERROR: Invalid controller quorum voters '{s}': {}\n", .{ voters_str.?, err });
+                return error.InvalidConfiguration;
+            };
         }
 
         if (storage_data_dir != null) {
-            const recovered = ctrl.raft_state.loadPersistedLog() catch |err| blk: {
-                log.warn("Controller Raft log recovery failed: {}", .{err});
-                break :blk 0;
+            const recovered = ctrl.raft_state.loadPersistedLog() catch |err| {
+                try stdout.print("  ERROR: Controller Raft log recovery failed: {}\n", .{err});
+                return error.ControllerRaftLogRecoveryFailed;
             };
             if (recovered > 0) {
                 // This implementation persists only the log image, not a separate
                 // commit-index file. Static voters must already be registered so
                 // UpdateRaftVoter records can reapply endpoint metadata on restart.
                 ctrl.raft_state.commit_index = ctrl.raft_state.log.lastOffset();
-                ctrl.raft_state.applyCommittedConfigs();
+                ctrl.raft_state.applyCommittedConfigs() catch |err| {
+                    try stdout.print("  ERROR: Controller Raft config replay failed: {}\n", .{err});
+                    return error.ControllerRaftConfigReplayFailed;
+                };
                 _ = ctrl.replayCommittedControllerMetadataRecords() catch |err| {
                     log.warn("Controller metadata replay failed: {}", .{err});
                 };
@@ -412,7 +537,10 @@ pub fn main(init: std.process.Init) !void {
         }
 
         if (ctrl.raft_state.quorumSize() <= 1 and ctrl.raft_state.role == .unattached) {
-            _ = ctrl.raft_state.startElection();
+            _ = ctrl.raft_state.startElection() catch |err| {
+                try stdout.print("  ERROR: Failed to persist Raft epoch/vote metadata: {}\n", .{err});
+                return;
+            };
             ctrl.raft_state.becomeLeader();
             log.info("Single-node controller elected before serving requests", .{});
         }
@@ -474,7 +602,10 @@ pub fn main(init: std.process.Init) !void {
             ctrl.raft_commit_hook = &applyCommittedAutoMqQuorumRecords;
         }
         if (voters_str) |vs| {
-            parseVotersIntoBrokerPeers(brk, vs, port);
+            parseVotersIntoBrokerPeers(brk, vs, port) catch |err| {
+                try stdout.print("  ERROR: Invalid controller quorum voters '{s}': {}\n", .{ vs, err });
+                return error.InvalidConfiguration;
+            };
         }
         if (!process_roles.is_controller) {
             // Broker-only nodes must prove controller registration/heartbeat
@@ -491,10 +622,14 @@ pub fn main(init: std.process.Init) !void {
         // This restores prepared object tracking that survived across a restart,
         // protecting against data loss when the Raft log is truncated by a snapshot.
         if (controller) |ctrl| {
-            if (ctrl.raft_state.loadPreparedRegistry()) |reg_data| {
+            if (ctrl.raft_state.loadPreparedRegistry() catch |err| {
+                try stdout.print("  ERROR: Failed to load prepared.snapshot: {}\n", .{err});
+                return error.PreparedSnapshotRecoveryFailed;
+            }) |reg_data| {
                 defer alloc.free(reg_data);
                 brk.object_manager.prepared_registry.deserialize(reg_data) catch |err| {
-                    log.warn("Failed to load prepared.snapshot: {s}", .{@errorName(err)});
+                    try stdout.print("  ERROR: Malformed prepared.snapshot: {}\n", .{err});
+                    return error.PreparedSnapshotRecoveryFailed;
                 };
             }
         }
@@ -532,7 +667,10 @@ pub fn main(init: std.process.Init) !void {
             );
             metadata_client = mc;
             if (voters_str) |vs| {
-                parseVotersIntoMetadataClient(mc, vs);
+                parseVotersIntoMetadataClient(mc, vs) catch |err| {
+                    try stdout.print("  ERROR: Invalid controller quorum voters '{s}': {}\n", .{ vs, err });
+                    return error.InvalidConfiguration;
+                };
             }
         }
     }
@@ -757,11 +895,18 @@ fn performGracefulShutdown(broker_opt: ?*Broker, controller_opt: ?*Controller) v
         if (!prepareControllerMetadataSnapshotForShutdown(ctrl)) can_snapshot = false;
         if (broker_opt) |brk| {
             if (!prepareAutoMqMetadataSnapshotForShutdown(brk)) can_snapshot = false;
-            const reg_data = brk.object_manager.prepared_registry.serialize(ctrl.raft_state.allocator) catch null;
+            const reg_data = brk.object_manager.prepared_registry.serialize(ctrl.raft_state.allocator) catch |err| blk: {
+                log.warn("Graceful shutdown: skipping Raft snapshot because prepared registry serialization failed: {}", .{err});
+                can_snapshot = false;
+                break :blk null;
+            };
             ctrl.raft_state.prepared_registry_data = reg_data;
         }
         if (can_snapshot) {
-            ctrl.raft_state.takeSnapshot();
+            ctrl.raft_state.takeSnapshot() catch |err| {
+                log.warn("Graceful shutdown: Raft snapshot failed: {}", .{err});
+                can_snapshot = false;
+            };
         }
         // Free the serialized data after snapshot persistence
         if (ctrl.raft_state.prepared_registry_data) |d| {
@@ -776,82 +921,45 @@ fn performGracefulShutdown(broker_opt: ?*Broker, controller_opt: ?*Controller) v
     log.info("Graceful shutdown: cleanup sequence complete", .{});
 }
 
-fn parseAndRegisterVoters(raft: *RaftState, voters: []const u8, pool: *RaftClientPool) void {
+fn parseAndRegisterVoters(raft: *RaftState, voters: []const u8, pool: *RaftClientPool) !void {
     // Format: "0@localhost:9092,1@host2:9093"
-    var start: usize = 0;
-    for (voters, 0..) |c, i| {
-        if (c == ',' or i == voters.len - 1) {
-            const end = if (c == ',') i else i + 1;
-            const entry = voters[start..end];
-            // Parse "id@host:port"
-            if (std.mem.indexOf(u8, entry, "@")) |at_pos| {
-                const id_str = entry[0..at_pos];
-                const voter_id = std.fmt.parseInt(i32, id_str, 10) catch continue;
-                raft.addVoter(voter_id) catch continue;
+    var parsed_any = false;
+    var entries = std.mem.splitScalar(u8, voters, ',');
+    while (entries.next()) |raw_entry| {
+        const voter = try config_mod.parseControllerVoter(raw_entry);
+        parsed_any = true;
+        try raft.addVoter(voter.node_id);
 
-                // Add peer to RaftClientPool (skip self)
-                if (voter_id != raft.node_id) {
-                    const addr_part = entry[at_pos + 1 ..];
-                    if (std.mem.indexOf(u8, addr_part, ":")) |colon| {
-                        const host = addr_part[0..colon];
-                        const port_str = addr_part[colon + 1 ..];
-                        const peer_port = std.fmt.parseInt(u16, port_str, 10) catch continue;
-                        pool.addPeer(voter_id, host, peer_port) catch continue;
-                    }
-                }
-            }
-            start = i + 1;
+        // Add peer to RaftClientPool (skip self)
+        if (voter.node_id != raft.node_id) {
+            try pool.addPeer(voter.node_id, voter.host, voter.port);
         }
     }
+    if (!parsed_any) return error.InvalidControllerVoter;
 }
 
-fn parseVotersIntoMetadataClient(mc: *MetadataClient, voters: []const u8) void {
+fn parseVotersIntoMetadataClient(mc: *MetadataClient, voters: []const u8) !void {
     // Format: "0@localhost:9093,1@host2:9093"
-    var start: usize = 0;
-    for (voters, 0..) |c, i| {
-        if (c == ',' or i == voters.len - 1) {
-            const end = if (c == ',') i else i + 1;
-            const entry = voters[start..end];
-            if (std.mem.indexOf(u8, entry, "@")) |at_pos| {
-                const id_str = entry[0..at_pos];
-                const voter_id = std.fmt.parseInt(i32, id_str, 10) catch continue;
-                const addr_part = entry[at_pos + 1 ..];
-                if (std.mem.indexOf(u8, addr_part, ":")) |colon| {
-                    const host = addr_part[0..colon];
-                    const port_str = addr_part[colon + 1 ..];
-                    const voter_port = std.fmt.parseInt(u16, port_str, 10) catch continue;
-                    mc.addVoter(voter_id, host, voter_port) catch continue;
-                }
-            }
-            start = i + 1;
-        }
+    var parsed_any = false;
+    var entries = std.mem.splitScalar(u8, voters, ',');
+    while (entries.next()) |raw_entry| {
+        const voter = try config_mod.parseControllerVoter(raw_entry);
+        parsed_any = true;
+        try mc.addVoter(voter.node_id, voter.host, voter.port);
     }
+    if (!parsed_any) return error.InvalidControllerVoter;
 }
 
-fn parseVotersIntoBrokerPeers(brk: *Broker, voters: []const u8, broker_port: u16) void {
+fn parseVotersIntoBrokerPeers(brk: *Broker, voters: []const u8, broker_port: u16) !void {
     // Static controller voter strings do not carry broker listener ports.
     // Combined-mode Docker/E2E clusters use the same internal broker port on
     // each node, so use the local broker port with the parsed peer host.
-    var start: usize = 0;
-    for (voters, 0..) |c, i| {
-        if (c == ',' or i == voters.len - 1) {
-            const end = if (c == ',') i else i + 1;
-            const entry = voters[start..end];
-            if (std.mem.indexOf(u8, entry, "@")) |at_pos| {
-                const id_str = entry[0..at_pos];
-                const voter_id = std.fmt.parseInt(i32, id_str, 10) catch {
-                    start = i + 1;
-                    continue;
-                };
-                const addr_part = entry[at_pos + 1 ..];
-                if (std.mem.indexOf(u8, addr_part, ":")) |colon| {
-                    const host = addr_part[0..colon];
-                    brk.addBrokerPeer(voter_id, host, broker_port) catch |err| {
-                        log.warn("Failed to register broker peer {d} at {s}:{d}: {}", .{ voter_id, host, broker_port, err });
-                    };
-                }
-            }
-            start = i + 1;
-        }
+    var parsed_any = false;
+    var entries = std.mem.splitScalar(u8, voters, ',');
+    while (entries.next()) |raw_entry| {
+        const voter = try config_mod.parseControllerVoter(raw_entry);
+        parsed_any = true;
+        try brk.addBrokerPeer(voter.node_id, voter.host, broker_port);
     }
+    if (!parsed_any) return error.InvalidControllerVoter;
 }

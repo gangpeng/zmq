@@ -14,6 +14,10 @@ const MetricRegistry = @import("core").MetricRegistry;
 var global_openssl: ?*const OpenSslLib = null;
 const IoUring = linux.IoUring;
 
+fn monotonicMs() i64 {
+    return @intCast(@import("time_compat").monotonicMilliTimestamp());
+}
+
 /// Kafka TCP server.
 ///
 /// Uses Linux io_uring for batched, zero-syscall I/O:
@@ -61,6 +65,7 @@ pub const Server = struct {
     const MAX_RECV_BUFFER: usize = 104_857_600;
     const MAX_SEND_BUFFER: usize = 16_777_216;
     const RING_ENTRIES: u16 = 256;
+    const CLOSE_BATCH_LIMIT: usize = 256;
 
     const Connection = struct {
         fd: posix.socket_t,
@@ -92,7 +97,7 @@ pub const Server = struct {
                 .allocator = alloc,
                 .recv_buf = std.array_list.Managed(u8).init(alloc),
                 .send_buf = std.array_list.Managed(u8).init(alloc),
-                .last_activity_ms = @import("time_compat").milliTimestamp(),
+                .last_activity_ms = monotonicMs(),
             };
         }
 
@@ -188,12 +193,13 @@ pub const Server = struct {
         var recv_bufs: [256][16384]u8 = undefined;
         var recv_buf_map = std.AutoHashMap(posix.socket_t, u8).init(self.allocator);
         defer recv_buf_map.deinit();
+        var recv_slots_in_use = [_]bool{false} ** 256;
         var next_recv_slot: u8 = 0;
 
         // Submit initial accept
         var accept_addr: posix.sockaddr = undefined;
         var accept_addr_len: posix.socklen_t = @sizeOf(posix.sockaddr);
-        self.submitAccept(&ring, sock, &accept_addr, &accept_addr_len) catch {};
+        try self.submitAccept(&ring, sock, &accept_addr, &accept_addr_len);
 
         var loop_count: u64 = 0;
         var cqes: [64]linux.io_uring_cqe = undefined;
@@ -206,7 +212,7 @@ pub const Server = struct {
                 continue;
             };
 
-            const now_ms = @import("time_compat").milliTimestamp();
+            const now_ms = monotonicMs();
 
             for (cqes[0..completed]) |*cqe| {
                 const user_data = cqe.user_data;
@@ -226,22 +232,38 @@ pub const Server = struct {
 
                         connections.put(client_fd, Connection.init(self.allocator, client_fd)) catch {
                             @import("posix_compat").close(client_fd);
+                            self.resubmitIoUringAcceptOrStop(&ring, sock, &accept_addr, &accept_addr_len);
+                            continue;
                         };
 
                         // Assign recv buffer slot
-                        if (next_recv_slot < 255) {
-                            recv_buf_map.put(client_fd, next_recv_slot) catch {};
-                            next_recv_slot += 1;
+                        if (acquireIoUringRecvSlot(&recv_slots_in_use, &next_recv_slot)) |slot| {
+                            recv_buf_map.put(client_fd, slot) catch {
+                                recv_slots_in_use[@as(usize, slot)] = false;
+                                closeIoUringConnection(&connections, &recv_buf_map, &recv_slots_in_use, client_fd);
+                                self.resubmitIoUringAcceptOrStop(&ring, sock, &accept_addr, &accept_addr_len);
+                                continue;
+                            };
+                        } else {
+                            log.warn("Connection rejected: no io_uring recv buffers available", .{});
+                            closeIoUringConnection(&connections, &recv_buf_map, &recv_slots_in_use, client_fd);
+                            self.resubmitIoUringAcceptOrStop(&ring, sock, &accept_addr, &accept_addr_len);
+                            continue;
                         }
 
                         // Submit recv for this connection
-                        self.submitRecv(&ring, client_fd, &recv_bufs, &recv_buf_map) catch {};
+                        self.submitRecv(&ring, client_fd, &recv_bufs, &recv_buf_map) catch |err| {
+                            log.warn("io_uring recv submission failed for fd={d}: {}", .{ client_fd, err });
+                            closeIoUringConnection(&connections, &recv_buf_map, &recv_slots_in_use, client_fd);
+                            self.resubmitIoUringAcceptOrStop(&ring, sock, &accept_addr, &accept_addr_len);
+                            continue;
+                        };
 
                         log.debug("Accepted connection fd={d}", .{client_fd});
                     }
 
                     // Re-submit accept for next connection
-                    self.submitAccept(&ring, sock, &accept_addr, &accept_addr_len) catch {};
+                    self.resubmitIoUringAcceptOrStop(&ring, sock, &accept_addr, &accept_addr_len);
                 } else if (op == OP_RECV) {
                     const fd = getUserDataFd(user_data);
                     if (connections.getPtr(fd)) |conn| {
@@ -249,8 +271,7 @@ pub const Server = struct {
 
                         if (res <= 0) {
                             // Connection closed or error
-                            conn.deinit();
-                            _ = connections.remove(fd);
+                            closeIoUringConnection(&connections, &recv_buf_map, &recv_slots_in_use, fd);
                             continue;
                         }
 
@@ -260,20 +281,35 @@ pub const Server = struct {
 
                         // Get the recv buffer data
                         if (recv_buf_map.get(fd)) |slot| {
-                            conn.recv_buf.appendSlice(recv_bufs[slot][0..bytes_read]) catch {};
+                            conn.recv_buf.appendSlice(recv_bufs[slot][0..bytes_read]) catch {
+                                closeIoUringConnection(&connections, &recv_buf_map, &recv_slots_in_use, fd);
+                                continue;
+                            };
+                        } else {
+                            closeIoUringConnection(&connections, &recv_buf_map, &recv_slots_in_use, fd);
+                            continue;
                         }
 
                         // Process complete frames inline
-                        self.processFrames(conn);
+                        self.processFrames(conn) catch {
+                            closeIoUringConnection(&connections, &recv_buf_map, &recv_slots_in_use, fd);
+                            continue;
+                        };
 
                         // If we have data to send, flush it
                         if (conn.send_buf.items.len > 0 and !conn.send_pending) {
-                            self.submitSend(&ring, fd, conn) catch {};
+                            self.submitSend(&ring, fd, conn) catch {
+                                closeIoUringConnection(&connections, &recv_buf_map, &recv_slots_in_use, fd);
+                                continue;
+                            };
                         }
 
                         // Submit next recv
                         if (!conn.closed) {
-                            self.submitRecv(&ring, fd, &recv_bufs, &recv_buf_map) catch {};
+                            self.submitRecv(&ring, fd, &recv_bufs, &recv_buf_map) catch {
+                                closeIoUringConnection(&connections, &recv_buf_map, &recv_slots_in_use, fd);
+                                continue;
+                            };
                         }
                     }
                 } else if (op == OP_SEND) {
@@ -281,19 +317,30 @@ pub const Server = struct {
                     if (connections.getPtr(fd)) |conn| {
                         conn.send_pending = false;
 
-                        if (res > 0) {
-                            const bytes_written: usize = @intCast(res);
-                            // Remove written bytes
-                            const remaining = conn.send_buf.items.len - bytes_written;
-                            if (remaining > 0) {
-                                std.mem.copyForwards(u8, conn.send_buf.items[0..remaining], conn.send_buf.items[bytes_written..]);
-                            }
-                            conn.send_buf.shrinkRetainingCapacity(remaining);
+                        if (res <= 0) {
+                            closeIoUringConnection(&connections, &recv_buf_map, &recv_slots_in_use, fd);
+                            continue;
                         }
+
+                        const bytes_written: usize = @intCast(res);
+                        if (bytes_written > conn.send_buf.items.len) {
+                            closeIoUringConnection(&connections, &recv_buf_map, &recv_slots_in_use, fd);
+                            continue;
+                        }
+
+                        // Remove written bytes
+                        const remaining = conn.send_buf.items.len - bytes_written;
+                        if (remaining > 0) {
+                            std.mem.copyForwards(u8, conn.send_buf.items[0..remaining], conn.send_buf.items[bytes_written..]);
+                        }
+                        conn.send_buf.shrinkRetainingCapacity(remaining);
 
                         // If more data to send, submit another send
                         if (conn.send_buf.items.len > 0 and !conn.send_pending) {
-                            self.submitSend(&ring, fd, conn) catch {};
+                            self.submitSend(&ring, fd, conn) catch {
+                                closeIoUringConnection(&connections, &recv_buf_map, &recv_slots_in_use, fd);
+                                continue;
+                            };
                         }
                     }
                 }
@@ -307,28 +354,23 @@ pub const Server = struct {
             // Periodic idle eviction
             loop_count += 1;
             if (loop_count % 5000 == 0) {
-                var to_close = std.array_list.Managed(posix.socket_t).init(self.allocator);
-                defer to_close.deinit();
+                var to_close: [CLOSE_BATCH_LIMIT]posix.socket_t = undefined;
+                var to_close_len: usize = 0;
                 var idle_it = connections.iterator();
                 while (idle_it.next()) |entry| {
                     if (entry.value_ptr.isIdle(now_ms)) {
-                        to_close.append(entry.key_ptr.*) catch {};
+                        if (to_close_len == to_close.len) break;
+                        to_close[to_close_len] = entry.key_ptr.*;
+                        to_close_len += 1;
                     }
                 }
-                for (to_close.items) |idle_fd| {
-                    if (connections.fetchRemove(idle_fd)) |entry| {
-                        var conn = entry.value;
-                        conn.deinit();
-                    }
+                for (to_close[0..to_close_len]) |idle_fd| {
+                    closeIoUringConnection(&connections, &recv_buf_map, &recv_slots_in_use, idle_fd);
                 }
             }
 
             // Update active connections gauge after each io_uring iteration
-            if (self.metrics) |m| {
-                const active_connections = @as(f64, @floatFromInt(connections.count()));
-                m.setGauge("kafka_network_connections_active", active_connections);
-                m.setGauge("Kafka_server_connection_count", active_connections);
-            }
+            updateActiveConnectionMetrics(self.metrics, connections.count());
         }
 
         @import("posix_compat").close(sock);
@@ -342,7 +384,7 @@ pub const Server = struct {
     }
 
     fn submitRecv(_: *Server, ring: *IoUring, fd: posix.socket_t, recv_bufs: *[256][16384]u8, recv_buf_map: *std.AutoHashMap(posix.socket_t, u8)) !void {
-        const slot = recv_buf_map.get(fd) orelse return;
+        const slot = recv_buf_map.get(fd) orelse return error.NoRecvBufferSlot;
         _ = try ring.recv(makeUserData(OP_RECV, fd), fd, .{ .buffer = &recv_bufs[slot] }, 0);
         _ = try ring.submit();
     }
@@ -350,11 +392,47 @@ pub const Server = struct {
     fn submitSend(_: *Server, ring: *IoUring, fd: posix.socket_t, conn: *Connection) !void {
         if (conn.send_buf.items.len == 0) return;
         conn.send_pending = true;
+        errdefer conn.send_pending = false;
         _ = try ring.send(makeUserData(OP_SEND, fd), fd, conn.send_buf.items, 0);
         _ = try ring.submit();
     }
 
-    fn processFrames(self: *Server, conn: *Connection) void {
+    fn resubmitIoUringAcceptOrStop(self: *Server, ring: *IoUring, sock: posix.socket_t, addr: *posix.sockaddr, addr_len: *posix.socklen_t) void {
+        self.submitAccept(ring, sock, addr, addr_len) catch |err| {
+            log.warn("io_uring accept submission failed: {}", .{err});
+            self.running = false;
+        };
+    }
+
+    fn acquireIoUringRecvSlot(recv_slots_in_use: *[256]bool, next_recv_slot: *u8) ?u8 {
+        var checked: usize = 0;
+        while (checked < recv_slots_in_use.len) : (checked += 1) {
+            const slot = next_recv_slot.*;
+            next_recv_slot.* = @intCast((@as(usize, slot) + 1) % recv_slots_in_use.len);
+            if (!recv_slots_in_use[@as(usize, slot)]) {
+                recv_slots_in_use[@as(usize, slot)] = true;
+                return slot;
+            }
+        }
+        return null;
+    }
+
+    fn closeIoUringConnection(
+        connections: *std.AutoHashMap(posix.socket_t, Connection),
+        recv_buf_map: *std.AutoHashMap(posix.socket_t, u8),
+        recv_slots_in_use: *[256]bool,
+        fd: posix.socket_t,
+    ) void {
+        if (recv_buf_map.fetchRemove(fd)) |entry| {
+            recv_slots_in_use[@as(usize, entry.value)] = false;
+        }
+        if (connections.fetchRemove(fd)) |entry| {
+            var conn = entry.value;
+            conn.deinit();
+        }
+    }
+
+    fn processFrames(self: *Server, conn: *Connection) !void {
         var frames_processed: u32 = 0;
         while (true) {
             const avail = conn.recv_buf.items.len - conn.recv_cursor;
@@ -362,7 +440,7 @@ pub const Server = struct {
             if (conn.send_buf.items.len > MAX_SEND_BUFFER) break;
 
             const frame_size = std.mem.readInt(u32, conn.recv_buf.items[conn.recv_cursor..][0..4], .big);
-            if (frame_size > MAX_FRAME_SIZE) break;
+            if (frame_size > MAX_FRAME_SIZE) return error.FrameTooLarge;
 
             const total_needed = 4 + @as(usize, frame_size);
             if (avail < total_needed) break;
@@ -374,8 +452,7 @@ pub const Server = struct {
                 defer self.allocator.free(response);
                 var size_buf: [4]u8 = undefined;
                 std.mem.writeInt(u32, &size_buf, @intCast(response.len), .big);
-                conn.send_buf.appendSlice(&size_buf) catch {};
-                conn.send_buf.appendSlice(response) catch {};
+                try appendResponseFrame(conn, &size_buf, response);
                 conn.bytes_out += response.len + 4;
                 conn.request_count += 1;
             }
@@ -393,6 +470,13 @@ pub const Server = struct {
             conn.recv_buf.shrinkRetainingCapacity(remaining);
             conn.recv_cursor = 0;
         }
+    }
+
+    fn appendResponseFrame(conn: *Connection, size_buf: *const [4]u8, response: []const u8) !void {
+        const send_start = conn.send_buf.items.len;
+        errdefer conn.send_buf.shrinkRetainingCapacity(send_start);
+        try conn.send_buf.appendSlice(size_buf);
+        try conn.send_buf.appendSlice(response);
     }
 
     // ── Epoll fallback ───────────────────────────────────────────────
@@ -428,7 +512,7 @@ pub const Server = struct {
         var events: [256]linux.epoll_event = undefined;
         var loop_count: u64 = 0;
         var listener_removed_from_epoll = false;
-        var last_tick_ms: i64 = @import("time_compat").milliTimestamp();
+        var last_tick_ms: i64 = monotonicMs();
 
         while (self.running) {
             // When draining, stop accepting new connections by removing the
@@ -449,7 +533,7 @@ pub const Server = struct {
             else
                 100;
             const nready = @import("posix_compat").epoll_wait(epfd, &events, timeout);
-            const now_ms = @import("time_compat").milliTimestamp();
+            const now_ms = monotonicMs();
 
             for (events[0..nready]) |ev| {
                 const fd = ev.data.fd;
@@ -501,7 +585,7 @@ pub const Server = struct {
                                 // Record handshake start time for timeout enforcement.
                                 // Connections that don't complete the handshake within 30s
                                 // are forcibly closed to prevent slow-client DoS attacks.
-                                conn.handshake_start_ms = @import("time_compat").milliTimestamp();
+                                conn.handshake_start_ms = monotonicMs();
                                 // Set global OpenSSL ref for connection cleanup
                                 if (tls_ctx.getOpenSsl()) |ossl| {
                                     global_openssl = ossl;
@@ -541,7 +625,14 @@ pub const Server = struct {
                                     }
                                 };
                             } else {
-                                self.flushSendBuffer(fd, conn) catch {};
+                                self.flushSendBuffer(fd, conn) catch {
+                                    @import("posix_compat").epoll_ctl(epfd, linux.EPOLL.CTL_DEL, fd, null) catch {};
+                                    if (connections.fetchRemove(fd)) |entry| {
+                                        var c = entry.value;
+                                        c.deinit();
+                                    }
+                                    continue;
+                                };
                                 if (conn.send_buf.items.len == 0) {
                                     var mod_ev = linux.epoll_event{
                                         .events = linux.EPOLL.IN | linux.EPOLL.RDHUP,
@@ -574,26 +665,30 @@ pub const Server = struct {
 
             loop_count += 1;
             if (loop_count % 5000 == 0) {
-                var to_close = std.array_list.Managed(posix.socket_t).init(self.allocator);
-                defer to_close.deinit();
+                var to_close: [CLOSE_BATCH_LIMIT]posix.socket_t = undefined;
+                var to_close_len: usize = 0;
                 var idle_it = connections.iterator();
                 while (idle_it.next()) |entry| {
                     const c = entry.value_ptr;
                     if (c.isIdle(now_ms)) {
-                        to_close.append(entry.key_ptr.*) catch {};
+                        if (to_close_len == to_close.len) break;
+                        to_close[to_close_len] = entry.key_ptr.*;
+                        to_close_len += 1;
                     }
                     // Enforce TLS handshake timeout (30s) to prevent slow-client DoS.
                     // An attacker that opens many connections and trickles ClientHello
                     // bytes one at a time can exhaust server resources. This forces
                     // incomplete handshakes to be closed.
                     else if (!c.tls_handshake_done and tls_mod.isHandshakeTimedOut(c.handshake_start_ms, now_ms)) {
+                        if (to_close_len == to_close.len) break;
                         log.warn("TLS handshake timeout on fd={d} (started {d}ms ago)", .{
                             c.fd, now_ms - c.handshake_start_ms,
                         });
-                        to_close.append(entry.key_ptr.*) catch {};
+                        to_close[to_close_len] = entry.key_ptr.*;
+                        to_close_len += 1;
                     }
                 }
-                for (to_close.items) |idle_fd| {
+                for (to_close[0..to_close_len]) |idle_fd| {
                     @import("posix_compat").epoll_ctl(epfd, linux.EPOLL.CTL_DEL, idle_fd, null) catch {};
                     if (connections.fetchRemove(idle_fd)) |entry| {
                         var conn = entry.value;
@@ -603,26 +698,24 @@ pub const Server = struct {
             }
 
             // Update active connections gauge after each epoll iteration
-            if (self.metrics) |m| {
-                const active_connections = @as(f64, @floatFromInt(connections.count()));
-                m.setGauge("kafka_network_connections_active", active_connections);
-                m.setGauge("Kafka_server_connection_count", active_connections);
-            }
+            updateActiveConnectionMetrics(self.metrics, connections.count());
 
             // Check if drain phase is complete (all connections done or timeout elapsed).
             // During drain, connections with empty send buffers (no in-flight response)
             // are closed proactively to speed up shutdown.
             if (self.draining) {
                 // Close connections that have finished sending (no pending data)
-                var drain_close = std.array_list.Managed(posix.socket_t).init(self.allocator);
-                defer drain_close.deinit();
+                var drain_close: [CLOSE_BATCH_LIMIT]posix.socket_t = undefined;
+                var drain_close_len: usize = 0;
                 var drain_it = connections.iterator();
                 while (drain_it.next()) |entry| {
                     if (entry.value_ptr.send_buf.items.len == 0) {
-                        drain_close.append(entry.key_ptr.*) catch {};
+                        if (drain_close_len == drain_close.len) break;
+                        drain_close[drain_close_len] = entry.key_ptr.*;
+                        drain_close_len += 1;
                     }
                 }
-                for (drain_close.items) |drain_fd| {
+                for (drain_close[0..drain_close_len]) |drain_fd| {
                     @import("posix_compat").epoll_ctl(epfd, linux.EPOLL.CTL_DEL, drain_fd, null) catch {};
                     if (connections.fetchRemove(drain_fd)) |entry| {
                         var conn = entry.value;
@@ -724,10 +817,10 @@ pub const Server = struct {
         try conn.recv_buf.appendSlice(read_buf[0..bytes_read]);
         conn.bytes_in += bytes_read;
 
-        self.processFrames(conn);
+        try self.processFrames(conn);
 
         if (conn.send_buf.items.len > 0) {
-            self.flushSendBuffer(fd, conn) catch {};
+            try self.flushSendBuffer(fd, conn);
         }
     }
 
@@ -771,7 +864,7 @@ pub const Server = struct {
     pub fn initiateGracefulDrain(self: *Server) void {
         if (self.draining) return; // Already draining
         self.draining = true;
-        self.drain_start_ms = @import("time_compat").milliTimestamp();
+        self.drain_start_ms = monotonicMs();
         log.info("Graceful shutdown initiated: draining connections (timeout={d}ms)", .{self.drain_timeout_ms});
     }
 
@@ -800,6 +893,14 @@ pub const Server = struct {
     };
 };
 
+fn updateActiveConnectionMetrics(metrics: ?*MetricRegistry, active_count: usize) void {
+    const registry = metrics orelse return;
+    const active_connections = @as(f64, @floatFromInt(active_count));
+    registry.setGauge("kafka_server_active_connections", active_connections);
+    registry.setGauge("kafka_network_connections_active", active_connections);
+    registry.setGauge("Kafka_server_connection_count", active_connections);
+}
+
 // ---------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------
@@ -810,11 +911,121 @@ fn testHandler(_: []const u8, _: Allocator) ?[]u8 {
     return null;
 }
 
+fn okResponseHandler(_: []const u8, allocator: Allocator) ?[]u8 {
+    return allocator.dupe(u8, "ok") catch null;
+}
+
+test "Server updates active connection metric aliases" {
+    var registry = MetricRegistry.init(testing.allocator);
+    defer registry.deinit();
+    try registry.registerGauge("kafka_server_active_connections", "Active Kafka server connections");
+    try registry.registerGauge("kafka_network_connections_active", "Active network connections");
+    try registry.registerGauge("Kafka_server_connection_count", "AutoMQ-compatible active connection count");
+
+    updateActiveConnectionMetrics(&registry, 3);
+    try testing.expectEqual(@as(f64, 3.0), registry.gauges.get("kafka_server_active_connections").?.value);
+    try testing.expectEqual(@as(f64, 3.0), registry.gauges.get("kafka_network_connections_active").?.value);
+    try testing.expectEqual(@as(f64, 3.0), registry.gauges.get("Kafka_server_connection_count").?.value);
+
+    updateActiveConnectionMetrics(null, 7);
+}
+
 test "Server init creates valid server" {
     const server = try Server.init(testing.allocator, "127.0.0.1", 0, &testHandler, 4);
     try testing.expect(!server.running);
     try testing.expect(!server.draining);
     try testing.expectEqual(@as(i64, 30_000), server.drain_timeout_ms);
+}
+
+test "Server processFrames fails closed when response enqueue allocation fails" {
+    var failing_allocator = std.testing.FailingAllocator.init(testing.allocator, .{ .fail_index = 0 });
+    var conn = Server.Connection{
+        .fd = -1,
+        .allocator = testing.allocator,
+        .recv_buf = std.array_list.Managed(u8).init(testing.allocator),
+        .send_buf = std.array_list.Managed(u8).init(failing_allocator.allocator()),
+        .last_activity_ms = monotonicMs(),
+        .closed = true,
+    };
+    defer conn.deinit();
+
+    var frame_size: [4]u8 = undefined;
+    std.mem.writeInt(u32, &frame_size, 2, .big);
+    try conn.recv_buf.appendSlice(&frame_size);
+    try conn.recv_buf.appendSlice("hi");
+
+    var server = try Server.init(testing.allocator, "127.0.0.1", 0, &okResponseHandler, 4);
+    try testing.expectError(error.OutOfMemory, server.processFrames(&conn));
+    try testing.expect(failing_allocator.has_induced_failure);
+    try testing.expectEqual(@as(usize, 0), conn.send_buf.items.len);
+    try testing.expectEqual(@as(usize, 0), conn.recv_cursor);
+    try testing.expectEqual(@as(usize, 6), conn.recv_buf.items.len);
+    try testing.expectEqual(@as(u64, 0), conn.request_count);
+    try testing.expectEqual(@as(u64, 0), conn.bytes_out);
+}
+
+test "Server processFrames fails closed on oversized frame header" {
+    var conn = Server.Connection{
+        .fd = -1,
+        .allocator = testing.allocator,
+        .recv_buf = std.array_list.Managed(u8).init(testing.allocator),
+        .send_buf = std.array_list.Managed(u8).init(testing.allocator),
+        .last_activity_ms = monotonicMs(),
+        .closed = true,
+    };
+    defer conn.deinit();
+
+    var frame_size: [4]u8 = undefined;
+    std.mem.writeInt(u32, &frame_size, Server.MAX_FRAME_SIZE + 1, .big);
+    try conn.recv_buf.appendSlice(&frame_size);
+
+    var server = try Server.init(testing.allocator, "127.0.0.1", 0, &okResponseHandler, 4);
+    try testing.expectError(error.FrameTooLarge, server.processFrames(&conn));
+    try testing.expectEqual(@as(usize, 0), conn.recv_cursor);
+    try testing.expectEqual(@as(usize, 4), conn.recv_buf.items.len);
+    try testing.expectEqual(@as(usize, 0), conn.send_buf.items.len);
+    try testing.expectEqual(@as(u64, 0), conn.request_count);
+}
+
+test "Server submitRecv fails closed when io_uring recv slot is missing" {
+    var server = try Server.init(testing.allocator, "127.0.0.1", 0, &testHandler, 4);
+    var ring: IoUring = undefined;
+    var recv_bufs: [256][16384]u8 = undefined;
+    var recv_buf_map = std.AutoHashMap(posix.socket_t, u8).init(testing.allocator);
+    defer recv_buf_map.deinit();
+
+    try testing.expectError(error.NoRecvBufferSlot, server.submitRecv(&ring, 7, &recv_bufs, &recv_buf_map));
+}
+
+test "Server io_uring close releases recv buffer slot" {
+    var connections = std.AutoHashMap(posix.socket_t, Server.Connection).init(testing.allocator);
+    defer {
+        var it = connections.valueIterator();
+        while (it.next()) |conn| conn.deinit();
+        connections.deinit();
+    }
+    var recv_buf_map = std.AutoHashMap(posix.socket_t, u8).init(testing.allocator);
+    defer recv_buf_map.deinit();
+    var recv_slots_in_use = [_]bool{false} ** 256;
+    var next_recv_slot: u8 = 0;
+
+    const slot = Server.acquireIoUringRecvSlot(&recv_slots_in_use, &next_recv_slot).?;
+    try testing.expect(recv_slots_in_use[@as(usize, slot)]);
+    try recv_buf_map.put(7, slot);
+    try connections.put(7, .{
+        .fd = -1,
+        .allocator = testing.allocator,
+        .recv_buf = std.array_list.Managed(u8).init(testing.allocator),
+        .send_buf = std.array_list.Managed(u8).init(testing.allocator),
+        .last_activity_ms = monotonicMs(),
+        .closed = true,
+    });
+
+    Server.closeIoUringConnection(&connections, &recv_buf_map, &recv_slots_in_use, 7);
+
+    try testing.expect(!recv_slots_in_use[@as(usize, slot)]);
+    try testing.expect(!recv_buf_map.contains(7));
+    try testing.expect(!connections.contains(7));
 }
 
 test "Server stop sets running to false" {
@@ -851,14 +1062,14 @@ test "Server initiateGracefulDrain is idempotent" {
 
 test "Server isDrainComplete returns false when not draining" {
     var server = try Server.init(testing.allocator, "127.0.0.1", 0, &testHandler, 4);
-    try testing.expect(!server.isDrainComplete(5, @import("time_compat").milliTimestamp()));
+    try testing.expect(!server.isDrainComplete(5, monotonicMs()));
 }
 
 test "Server isDrainComplete returns true when no connections" {
     var server = try Server.init(testing.allocator, "127.0.0.1", 0, &testHandler, 4);
     server.draining = true;
-    server.drain_start_ms = @import("time_compat").milliTimestamp();
-    try testing.expect(server.isDrainComplete(0, @import("time_compat").milliTimestamp()));
+    server.drain_start_ms = monotonicMs();
+    try testing.expect(server.isDrainComplete(0, monotonicMs()));
 }
 
 test "Server isDrainComplete returns true on timeout" {
@@ -866,16 +1077,16 @@ test "Server isDrainComplete returns true on timeout" {
     server.draining = true;
     server.drain_timeout_ms = 100;
     // Simulate drain started 200ms ago
-    server.drain_start_ms = @import("time_compat").milliTimestamp() - 200;
-    try testing.expect(server.isDrainComplete(5, @import("time_compat").milliTimestamp()));
+    server.drain_start_ms = monotonicMs() - 200;
+    try testing.expect(server.isDrainComplete(5, monotonicMs()));
 }
 
 test "Server isDrainComplete returns false when connections active and timeout not reached" {
     var server = try Server.init(testing.allocator, "127.0.0.1", 0, &testHandler, 4);
     server.draining = true;
     server.drain_timeout_ms = 30_000;
-    server.drain_start_ms = @import("time_compat").milliTimestamp();
-    try testing.expect(!server.isDrainComplete(5, @import("time_compat").milliTimestamp()));
+    server.drain_start_ms = monotonicMs();
+    try testing.expect(!server.isDrainComplete(5, monotonicMs()));
 }
 
 test "Server double signal: first drains, second force-stops" {

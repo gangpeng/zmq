@@ -143,6 +143,11 @@ pub fn registerBrokerMetrics(registry: *MetricRegistry) !void {
         "JMX-compatible Kafka network response send time by request type and version",
         &.{ "request", "version" },
     );
+    try registry.registerLabeledCounter(
+        "kafka_network_requestmetrics_errors_total",
+        "JMX-compatible Kafka network request errors by request type, version, and error",
+        &.{ "request", "version", "error" },
+    );
     // Per-API error counter (labeled by api name and error code)
     try registry.registerLabeledCounter(
         "kafka_server_api_errors_total",
@@ -275,6 +280,7 @@ test "registerBrokerMetrics" {
     try testing.expect(registry.labeled_counter_meta.contains("kafka_network_requestmetrics_remotetimems_total"));
     try testing.expect(registry.labeled_counter_meta.contains("kafka_network_requestmetrics_responsequeuetimems_total"));
     try testing.expect(registry.labeled_counter_meta.contains("kafka_network_requestmetrics_responsesendtimems_total"));
+    try testing.expect(registry.labeled_counter_meta.contains("kafka_network_requestmetrics_errors_total"));
     try testing.expect(registry.labeled_counter_meta.contains("kafka_server_api_errors_total"));
     try testing.expect(registry.labeled_gauge_meta.contains("kafka_consumer_lag"));
     try testing.expect(registry.gauges.contains("kafka_network_connections_active"));

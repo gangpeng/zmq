@@ -3,6 +3,10 @@ const testing = std.testing;
 const Allocator = std.mem.Allocator;
 const log = std.log.scoped(.fetch_session);
 
+fn monotonicMs() i64 {
+    return @intCast(@import("time_compat").monotonicMilliTimestamp());
+}
+
 /// KIP-227 Incremental Fetch Sessions.
 ///
 /// Tracks per-connection fetch state so that subsequent fetches only
@@ -119,7 +123,7 @@ pub const FetchSession = struct {
         return .{
             .partition_hwm = std.StringHashMap(i64).init(alloc),
             .allocator = alloc,
-            .created_ms = @import("time_compat").milliTimestamp(),
+            .created_ms = monotonicMs(),
         };
     }
 

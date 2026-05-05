@@ -2,6 +2,10 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 const log = std.log.scoped(.connections);
 
+fn monotonicMs() i64 {
+    return @intCast(@import("time_compat").monotonicMilliTimestamp());
+}
+
 /// Connection manager tracks all active client connections.
 ///
 /// Provides connection IDs, per-connection state, idle timeout
@@ -46,7 +50,7 @@ pub const ConnectionManager = struct {
         const id = self.next_id;
         self.next_id += 1;
 
-        const now = @import("time_compat").milliTimestamp();
+        const now = monotonicMs();
         try self.connections.put(id, .{
             .id = id,
             .fd = fd,
@@ -65,7 +69,7 @@ pub const ConnectionManager = struct {
     /// Update last active timestamp and request count.
     pub fn recordActivity(self: *ConnectionManager, id: u64, bytes_in: u64, bytes_out: u64) void {
         if (self.connections.getPtr(id)) |info| {
-            info.last_active_ms = @import("time_compat").milliTimestamp();
+            info.last_active_ms = monotonicMs();
             info.bytes_received += bytes_in;
             info.bytes_sent += bytes_out;
             info.requests_processed += 1;
@@ -86,7 +90,7 @@ pub const ConnectionManager = struct {
 
     /// Find connections idle longer than `timeout_ms` and return their IDs.
     pub fn findIdleConnections(self: *const ConnectionManager, timeout_ms: i64, result_buf: []u64) usize {
-        const now = @import("time_compat").milliTimestamp();
+        const now = monotonicMs();
         var found: usize = 0;
         var it = self.connections.iterator();
         while (it.next()) |entry| {

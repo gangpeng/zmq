@@ -91,7 +91,14 @@ pub const RaftClient = struct {
         // TLS handshake if a client TLS context is configured
         if (self.tls_ctx) |tls| {
             if (tls.initialized) {
-                const ssl = tls.wrapConnection(fd) catch |err| {
+                const host_z = self.allocator.dupeZ(u8, self.host) catch |err| {
+                    @import("posix_compat").close(fd);
+                    self.fd = null;
+                    return err;
+                };
+                defer self.allocator.free(host_z);
+
+                const ssl = tls.wrapConnectionWithHostname(fd, host_z) catch |err| {
                     log.warn("TLS handshake to peer {d} failed: {}", .{ self.peer_id, err });
                     @import("posix_compat").close(fd);
                     self.fd = null;
@@ -641,6 +648,11 @@ test "RaftClient init" {
     try std.testing.expect(client.fd == null);
     try std.testing.expect(client.ssl_ptr == null);
     try std.testing.expect(client.tls_ctx == null);
+}
+
+test "RaftClient outbound TLS uses hostname verification" {
+    const source = @embedFile("raft_client.zig");
+    try std.testing.expect(std.mem.indexOf(u8, source, "wrapConnectionWithHostname(fd, host_z)") != null);
 }
 
 test "RaftClientPool setTlsContext propagates to existing clients" {

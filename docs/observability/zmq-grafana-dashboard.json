@@ -297,6 +297,10 @@
           "legendFormat": "{{request}} requests"
         },
         {
+          "expr": "sum(rate(kafka_network_requestmetrics_errors_total{error!=\"NONE\"}[5m])) by (request, error)",
+          "legendFormat": "{{request}} {{error}} errors"
+        },
+        {
           "expr": "sum(rate(kafka_network_requestmetrics_totaltimems_total[5m])) by (request)",
           "legendFormat": "{{request}} total ms"
         },

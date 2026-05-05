@@ -13,6 +13,10 @@ const S3Storage = @import("s3_client.zig").S3Storage;
 const MockS3 = @import("s3.zig").MockS3;
 const MetricRegistry = @import("core").MetricRegistry;
 
+fn monotonicMs() i64 {
+    return @intCast(@import("time_compat").monotonicMilliTimestamp());
+}
+
 /// CompactionManager periodically splits multi-stream StreamSetObjects into
 /// per-stream StreamObjects, and merges small StreamObjects into larger ones.
 ///
@@ -38,7 +42,7 @@ pub const CompactionManager = struct {
     /// Maximum size of a merged StreamObject (default 256MB).
     merge_max_size: u64 = 256 * 1024 * 1024,
 
-    /// Timestamp of last compaction run.
+    /// Monotonic timestamp of last compaction run.
     last_compaction_ms: i64 = 0,
 
     /// Stats
@@ -71,6 +75,12 @@ pub const CompactionManager = struct {
     /// Optional Prometheus metric registry for compaction observability.
     metrics: ?*MetricRegistry = null,
 
+    /// Optional durable metadata checkpoint hook. Broker wires this to the
+    /// ObjectManager snapshot/quorum path so compaction never deletes old S3
+    /// data before replacement metadata has crossed a durability boundary.
+    metadata_checkpoint_ctx: ?*anyopaque = null,
+    metadata_checkpoint_fn: ?*const fn (ctx: *anyopaque) anyerror!void = null,
+
     pub fn init(
         allocator: Allocator,
         object_manager: *ObjectManager,
@@ -100,10 +110,25 @@ pub const CompactionManager = struct {
         self.s3_storage = storage;
     }
 
+    pub fn setMetadataCheckpoint(
+        self: *CompactionManager,
+        ctx: *anyopaque,
+        checkpoint_fn: *const fn (ctx: *anyopaque) anyerror!void,
+    ) void {
+        self.metadata_checkpoint_ctx = ctx;
+        self.metadata_checkpoint_fn = checkpoint_fn;
+    }
+
+    fn checkpointMetadata(self: *CompactionManager) !void {
+        const checkpoint_fn = self.metadata_checkpoint_fn orelse return;
+        const ctx = self.metadata_checkpoint_ctx orelse return error.MissingMetadataCheckpointContext;
+        try checkpoint_fn(ctx);
+    }
+
     /// Called from Broker.tick(). Checks if enough time has elapsed and runs compaction.
     pub fn maybeCompact(self: *CompactionManager) void {
-        const now = @import("time_compat").milliTimestamp();
-        if (now - self.last_compaction_ms < self.compaction_interval_ms) return;
+        const now = monotonicMs();
+        if (self.last_compaction_ms > 0 and now - self.last_compaction_ms < self.compaction_interval_ms) return;
         self.last_compaction_ms = now;
 
         self.runCompaction() catch |err| {
@@ -122,7 +147,7 @@ pub const CompactionManager = struct {
     /// phases (destroy marked, expire prepared) are added after the core compaction
     /// phases to match AutoMQ's S3ObjectControlManager behavior.
     pub fn runCompaction(self: *CompactionManager) !void {
-        const start_ns = @import("time_compat").nanoTimestamp();
+        const start_ns = @import("time_compat").monotonicNanoTimestamp();
         log.info("Starting compaction cycle (SSOs={d}, SOs={d})", .{
             self.object_manager.getStreamSetObjectCount(),
             self.object_manager.getStreamObjectCount(),
@@ -135,30 +160,30 @@ pub const CompactionManager = struct {
 
         self.cleanupOrphans();
 
-        self.journalBegin("split", 0);
+        try self.journalBegin("split", 0);
         const splits = try self.forceSplitAll();
-        self.journalComplete();
+        try self.journalComplete();
 
-        self.journalBegin("merge", 0);
+        try self.journalBegin("merge", 0);
         const merges = try self.mergeAll();
-        self.journalComplete();
+        try self.journalComplete();
 
-        self.journalBegin("cleanup", 0);
+        try self.journalBegin("cleanup", 0);
         const cleanups = try self.cleanupExpired();
         self.total_cleanups += cleanups;
-        self.journalComplete();
+        try self.journalComplete();
 
         // Lifecycle Phase 1: Physically delete mark_destroyed objects whose
         // retention period has elapsed. This gives consumers a grace period
         // to finish reading data before it disappears from S3.
-        self.journalBegin("destroy", 0);
-        const destroyed = self.cleanupDestroyed();
+        try self.journalBegin("destroy", 0);
+        const destroyed = try self.cleanupDestroyed();
         self.total_destroyed += destroyed;
-        self.journalComplete();
+        try self.journalComplete();
 
         // Lifecycle Phase 2: Expire prepared objects that were never committed
         // (e.g., producer crashed between prepareObject and commitStreamObject).
-        const expired_prepared = self.object_manager.expirePreparedObjects(self.prepared_ttl_ms);
+        const expired_prepared = try self.object_manager.expirePreparedObjects(self.prepared_ttl_ms);
         self.total_expired_prepared += expired_prepared;
         if (expired_prepared > 0) {
             log.info("Expired {d} prepared objects (TTL={d}ms)", .{ expired_prepared, self.prepared_ttl_ms });
@@ -175,7 +200,7 @@ pub const CompactionManager = struct {
             m.addCounter("compaction_cleanups_total", cleanups);
             m.addCounter("compaction_destroyed_total", destroyed);
             m.addCounter("compaction_expired_prepared_total", expired_prepared);
-            const elapsed_ns = @import("time_compat").nanoTimestamp() - start_ns;
+            const elapsed_ns = @import("time_compat").monotonicNanoTimestamp() - start_ns;
             const elapsed_secs: f64 = @as(f64, @floatFromInt(elapsed_ns)) / 1_000_000_000.0;
             m.observeHistogram("compaction_cycle_duration_seconds", elapsed_secs);
             m.setGauge("compaction_orphaned_keys", @floatFromInt(self.orphaned_keys.items.len));
@@ -302,7 +327,21 @@ pub const CompactionManager = struct {
             );
             defer self.allocator.free(so_key);
 
+            const split_orphan_key = try self.allocator.dupe(u8, so_key);
+            var split_orphan_key_owned = true;
+            defer if (split_orphan_key_owned) self.allocator.free(split_orphan_key);
+            try self.orphaned_keys.ensureUnusedCapacity(1);
+
             try self.putS3Object(so_key, so_data);
+            var split_object_active = true;
+            errdefer if (split_object_active) {
+                self.object_manager.removeStreamObject(new_obj_id);
+                if (!self.deleteS3Object(so_key)) {
+                    log.warn("Orphaned failed split SO in S3: '{s}'", .{so_key});
+                    self.orphaned_keys.appendAssumeCapacity(split_orphan_key);
+                    split_orphan_key_owned = false;
+                }
+            };
 
             // 6. Register with ObjectManager
             try self.object_manager.commitStreamObject(
@@ -313,10 +352,12 @@ pub const CompactionManager = struct {
                 so_key,
                 so_data.len,
             );
+            try self.checkpointMetadata();
 
             log.info("Split SSO {d}: created SO {d} for stream {d} [{d}..{d})", .{
                 sso_id, new_obj_id, sid, so_start_offset, so_end_offset,
             });
+            split_object_active = false;
         }
 
         // 7. Remove SSO from ObjectManager first (so fetch queries no longer see it),
@@ -328,16 +369,21 @@ pub const CompactionManager = struct {
         //     exist in the index, but getObjects() prefers SOs over SSOs at the same
         //     offset, so consumers won't see duplicates
         const sso_key_copy = if (self.object_manager.stream_set_objects.get(sso_id)) |sso_final|
-            self.allocator.dupe(u8, sso_final.s3_key) catch null
+            try self.allocator.dupe(u8, sso_final.s3_key)
         else
             null;
+        if (sso_key_copy != null) {
+            try self.orphaned_keys.ensureUnusedCapacity(1);
+        }
         self.object_manager.removeStreamSetObject(sso_id);
         if (sso_key_copy) |key| {
+            var key_owned = true;
+            defer if (key_owned) self.allocator.free(key);
+            try self.checkpointMetadata();
             if (!self.deleteS3Object(key)) {
                 log.warn("Orphaned SSO in S3: '{s}' (will be cleaned up later)", .{key});
-                self.orphaned_keys.append(key) catch self.allocator.free(key);
-            } else {
-                self.allocator.free(key);
+                self.orphaned_keys.appendAssumeCapacity(key);
+                key_owned = false;
             }
         }
     }
@@ -478,7 +524,22 @@ pub const CompactionManager = struct {
         );
         defer self.allocator.free(merged_key);
 
+        const merged_orphan_key = try self.allocator.dupe(u8, merged_key);
+        var merged_orphan_key_owned = true;
+        defer if (merged_orphan_key_owned) self.allocator.free(merged_orphan_key);
+        try self.orphaned_keys.ensureUnusedCapacity(1);
+
         try self.putS3Object(merged_key, merged_data);
+        var merged_object_active = true;
+        errdefer if (merged_object_active) {
+            self.object_manager.removeStreamObject(new_obj_id);
+            if (!self.deleteS3Object(merged_key)) {
+                log.warn("Orphaned failed merged SO in S3: '{s}'", .{merged_key});
+                self.orphaned_keys.appendAssumeCapacity(merged_orphan_key);
+                merged_orphan_key_owned = false;
+            }
+        };
+
         try self.object_manager.commitStreamObject(
             new_obj_id,
             stream_id,
@@ -487,30 +548,40 @@ pub const CompactionManager = struct {
             merged_key,
             merged_data.len,
         );
+        try self.checkpointMetadata();
+        merged_object_active = false;
 
         // Remove old SOs: first collect S3 keys, then remove from ObjectManager,
         // then delete from S3. This ensures fetch queries see the merged object
         // and not the old SOs, even if S3 deletion fails (orphaned files).
         var old_keys = std.array_list.Managed([]u8).init(self.allocator);
         defer {
-            for (old_keys.items) |k| self.allocator.free(k);
+            for (old_keys.items) |k| {
+                if (k.len > 0) self.allocator.free(k);
+            }
             old_keys.deinit();
         }
         for (object_ids) |obj_id| {
             if (self.object_manager.stream_objects.get(obj_id)) |so| {
-                const key_copy = self.allocator.dupe(u8, so.s3_key) catch continue;
+                const key_copy = try self.allocator.dupe(u8, so.s3_key);
                 old_keys.append(key_copy) catch {
                     self.allocator.free(key_copy);
+                    return error.OutOfMemory;
                 };
             }
+        }
+        try self.orphaned_keys.ensureUnusedCapacity(old_keys.items.len);
+        for (object_ids) |obj_id| {
             self.object_manager.removeStreamObject(obj_id);
         }
+        try self.checkpointMetadata();
         // Now delete from S3 (ObjectManager no longer references these)
-        for (old_keys.items) |key| {
+        for (old_keys.items) |*key_ptr| {
+            const key = key_ptr.*;
             if (!self.deleteS3Object(key)) {
                 log.warn("Orphaned SO in S3: '{s}'", .{key});
-                const orphan_copy = self.allocator.dupe(u8, key) catch continue;
-                self.orphaned_keys.append(orphan_copy) catch self.allocator.free(orphan_copy);
+                self.orphaned_keys.appendAssumeCapacity(key);
+                key_ptr.* = &.{};
             }
         }
 
@@ -561,21 +632,31 @@ pub const CompactionManager = struct {
     /// has elapsed. Uses write-before-delete: collectDestroyedObjects removes
     /// objects from metadata first, then we delete from S3. Failed S3 deletes
     /// are tracked in orphaned_keys for retry on the next cycle.
-    fn cleanupDestroyed(self: *CompactionManager) u64 {
-        const keys = self.object_manager.collectDestroyedObjects(
+    fn cleanupDestroyed(self: *CompactionManager) !u64 {
+        const now_ms = @import("time_compat").milliTimestamp();
+        const ready_count = self.object_manager.countDestroyedObjectsReadyAt(
+            self.mark_destroyed_retention_ms,
+            now_ms,
+        );
+        try self.orphaned_keys.ensureUnusedCapacity(ready_count);
+
+        const keys = self.object_manager.collectDestroyedObjectsAt(
             self.mark_destroyed_retention_ms,
             self.allocator,
+            now_ms,
         ) catch |err| {
             log.warn("Failed to collect destroyed objects: {}", .{err});
-            return 0;
+            return err;
         };
         defer self.allocator.free(keys);
+
+        try self.checkpointMetadata();
 
         var destroyed_count: u64 = 0;
         for (keys) |key| {
             if (!self.deleteS3Object(key)) {
                 log.warn("Orphaned destroyed object in S3: '{s}'", .{key});
-                self.orphaned_keys.append(key) catch self.allocator.free(key);
+                self.orphaned_keys.appendAssumeCapacity(key);
             } else {
                 self.allocator.free(key);
             }
@@ -591,21 +672,18 @@ pub const CompactionManager = struct {
     // ---- Compaction Journal ----
 
     /// Write a journal entry before starting a compaction operation.
-    fn journalBegin(self: *CompactionManager, op: []const u8, object_id: u64) void {
+    fn journalBegin(self: *CompactionManager, op: []const u8, object_id: u64) !void {
         const dir = self.journal_path orelse return;
-        const path = std.fmt.allocPrint(self.allocator, "{s}/compaction.journal", .{dir}) catch |err| {
-            log.warn("Failed to allocate compaction journal path: {}", .{err});
-            return;
-        };
+        var buf: [64]u8 = undefined;
+        if (op.len > buf.len - 9) return error.CompactionJournalOpTooLong;
+
+        const path = try std.fmt.allocPrint(self.allocator, "{s}/compaction.journal", .{dir});
         defer self.allocator.free(path);
 
-        const file = fs.createFileAbsolute(path, .{ .truncate = true }) catch |err| {
-            log.warn("Failed to create compaction journal: {}", .{err});
-            return;
-        };
-        defer file.close();
+        const file = try fs.createFileAbsolute(path, .{ .truncate = true });
+        var file_open = true;
+        defer if (file_open) file.close();
 
-        var buf: [64]u8 = undefined;
         var pos: usize = 0;
         // Write: op_len(u8) + op + object_id(u64)
         buf[pos] = @intCast(op.len);
@@ -614,21 +692,20 @@ pub const CompactionManager = struct {
         pos += op.len;
         std.mem.writeInt(u64, buf[pos..][0..8], object_id, .big);
         pos += 8;
-        file.writeAll(buf[0..pos]) catch |err| {
-            log.warn("Failed to write compaction journal: {}", .{err});
-        };
+        try file.writeAll(buf[0..pos]);
+        try file.sync();
+        file.close();
+        file_open = false;
     }
 
     /// Clear the journal after successful completion.
-    fn journalComplete(self: *CompactionManager) void {
+    fn journalComplete(self: *CompactionManager) !void {
         const dir = self.journal_path orelse return;
-        const path = std.fmt.allocPrint(self.allocator, "{s}/compaction.journal", .{dir}) catch |err| {
-            log.warn("Failed to allocate journal path for cleanup: {}", .{err});
-            return;
-        };
+        const path = try std.fmt.allocPrint(self.allocator, "{s}/compaction.journal", .{dir});
         defer self.allocator.free(path);
-        fs.deleteFileAbsolute(path) catch |err| {
-            log.warn("Failed to delete compaction journal: {}", .{err});
+        fs.deleteFileAbsolute(path) catch |err| switch (err) {
+            error.FileNotFound => return,
+            else => return err,
         };
     }
 
@@ -636,7 +713,7 @@ pub const CompactionManager = struct {
 
     fn getS3Object(self: *CompactionManager, key: []const u8) ![]u8 {
         if (self.mock_s3) |s3| {
-            const data = s3.getObject(key) orelse return error.S3ObjectNotFound;
+            const data = (try s3.getObjectOrError(key)) orelse return error.S3ObjectNotFound;
             return try self.allocator.dupe(u8, data);
         }
         if (self.s3_storage) |s3| {
@@ -679,6 +756,17 @@ pub const CompactionManager = struct {
 // ---------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------
+
+const TestMetadataCheckpoint = struct {
+    calls: usize = 0,
+    fail_on: usize = std.math.maxInt(usize),
+
+    fn checkpoint(ctx: *anyopaque) !void {
+        const self: *TestMetadataCheckpoint = @ptrCast(@alignCast(ctx));
+        self.calls += 1;
+        if (self.calls == self.fail_on) return error.InjectedMetadataCheckpointFailure;
+    }
+};
 
 test "CompactionManager forceSplit splits multi-stream SSO" {
     // Setup: ObjectManager + MockS3
@@ -1031,6 +1119,157 @@ test "CompactionManager split uses write-before-delete pattern" {
     try testing.expectEqual(@as(usize, 1), r2.len);
 }
 
+test "CompactionManager split preserves metadata on S3 read failure" {
+    var om = ObjectManager.init(testing.allocator, 0);
+    defer om.deinit();
+
+    var mock_s3 = MockS3.init(testing.allocator);
+    defer mock_s3.deinit();
+
+    var writer = ObjectWriter.init(testing.allocator);
+    defer writer.deinit();
+    try writer.addDataBlock(1, 0, 10, 10, "stream1-data");
+    try writer.addDataBlock(2, 0, 5, 5, "stream2-data");
+    const obj_data = try writer.build();
+    defer testing.allocator.free(obj_data);
+
+    try mock_s3.putObject("sso/read-fail/1", obj_data);
+    const ranges = [_]StreamOffsetRange{
+        .{ .stream_id = 1, .start_offset = 0, .end_offset = 10 },
+        .{ .stream_id = 2, .start_offset = 0, .end_offset = 5 },
+    };
+    try om.commitStreamSetObject(1, 0, 1, &ranges, "sso/read-fail/1", obj_data.len);
+
+    var cm = CompactionManager.init(testing.allocator, &om);
+    defer cm.deinit();
+    cm.setMockS3(&mock_s3);
+
+    mock_s3.failNextGetObjects(1);
+    try testing.expectError(error.InjectedGetFailure, cm.splitStreamSetObject(1));
+    try testing.expectEqual(@as(usize, 1), om.getStreamSetObjectCount());
+    try testing.expectEqual(@as(usize, 0), om.getStreamObjectCount());
+    try testing.expect(mock_s3.getObject("sso/read-fail/1") != null);
+    try testing.expectEqual(@as(u64, 0), cm.total_splits);
+}
+
+test "CompactionManager split tracks SSO delete failure as orphan" {
+    var om = ObjectManager.init(testing.allocator, 0);
+    defer om.deinit();
+
+    var mock_s3 = MockS3.init(testing.allocator);
+    defer mock_s3.deinit();
+
+    var writer = ObjectWriter.init(testing.allocator);
+    defer writer.deinit();
+    try writer.addDataBlock(1, 0, 10, 10, "stream1-data");
+    try writer.addDataBlock(2, 0, 5, 5, "stream2-data");
+    const obj_data = try writer.build();
+    defer testing.allocator.free(obj_data);
+
+    try mock_s3.putObject("sso/delete-fail/1", obj_data);
+    const ranges = [_]StreamOffsetRange{
+        .{ .stream_id = 1, .start_offset = 0, .end_offset = 10 },
+        .{ .stream_id = 2, .start_offset = 0, .end_offset = 5 },
+    };
+    try om.commitStreamSetObject(1, 0, 1, &ranges, "sso/delete-fail/1", obj_data.len);
+
+    var cm = CompactionManager.init(testing.allocator, &om);
+    defer cm.deinit();
+    cm.setMockS3(&mock_s3);
+
+    mock_s3.failNextDeleteObjects(1);
+    try cm.runCompaction();
+
+    try testing.expectEqual(@as(usize, 0), om.getStreamSetObjectCount());
+    try testing.expectEqual(@as(usize, 2), om.getStreamObjectCount());
+    try testing.expectEqual(@as(usize, 1), cm.orphaned_keys.items.len);
+    try testing.expectEqualStrings("sso/delete-fail/1", cm.orphaned_keys.items[0]);
+    try testing.expect(mock_s3.getObject("sso/delete-fail/1") != null);
+
+    try cm.runCompaction();
+    try testing.expectEqual(@as(usize, 0), cm.orphaned_keys.items.len);
+    try testing.expect(mock_s3.getObject("sso/delete-fail/1") == null);
+}
+
+test "CompactionManager split rolls back uploaded SO when metadata commit fails" {
+    var failing_allocator = std.testing.FailingAllocator.init(testing.allocator, .{});
+    var om = ObjectManager.init(failing_allocator.allocator(), 0);
+    defer om.deinit();
+
+    var mock_s3 = MockS3.init(testing.allocator);
+    defer mock_s3.deinit();
+
+    var writer = ObjectWriter.init(testing.allocator);
+    defer writer.deinit();
+    try writer.addDataBlock(1, 0, 10, 10, "stream1-data");
+    try writer.addDataBlock(2, 0, 5, 5, "stream2-data");
+    const obj_data = try writer.build();
+    defer testing.allocator.free(obj_data);
+
+    try mock_s3.putObject("sso/split-commit-fail/1", obj_data);
+    const ranges = [_]StreamOffsetRange{
+        .{ .stream_id = 1, .start_offset = 0, .end_offset = 10 },
+        .{ .stream_id = 2, .start_offset = 0, .end_offset = 5 },
+    };
+    try om.commitStreamSetObject(1, 0, 1, &ranges, "sso/split-commit-fail/1", obj_data.len);
+
+    var cm = CompactionManager.init(testing.allocator, &om);
+    defer cm.deinit();
+    cm.setMockS3(&mock_s3);
+
+    failing_allocator.fail_index = failing_allocator.alloc_index;
+    mock_s3.failNextDeleteObjects(1);
+    try testing.expectError(error.OutOfMemory, cm.splitStreamSetObject(1));
+    try testing.expect(failing_allocator.has_induced_failure);
+
+    try testing.expectEqual(@as(usize, 1), om.getStreamSetObjectCount());
+    try testing.expectEqual(@as(usize, 0), om.getStreamObjectCount());
+    try testing.expect(mock_s3.getObject("sso/split-commit-fail/1") != null);
+    try testing.expectEqual(@as(usize, 1), cm.orphaned_keys.items.len);
+    try testing.expectEqualStrings("data/so/1/0-2", cm.orphaned_keys.items[0]);
+    try testing.expect(mock_s3.getObject("data/so/1/0-2") != null);
+
+    cm.cleanupOrphans();
+    try testing.expectEqual(@as(usize, 0), cm.orphaned_keys.items.len);
+    try testing.expect(mock_s3.getObject("data/so/1/0-2") == null);
+}
+
+test "CompactionManager split checkpoints metadata before retiring SSO" {
+    var om = ObjectManager.init(testing.allocator, 0);
+    defer om.deinit();
+
+    var mock_s3 = MockS3.init(testing.allocator);
+    defer mock_s3.deinit();
+
+    var writer = ObjectWriter.init(testing.allocator);
+    defer writer.deinit();
+    try writer.addDataBlock(1, 0, 10, 10, "stream1-data");
+    try writer.addDataBlock(2, 0, 5, 5, "stream2-data");
+    const obj_data = try writer.build();
+    defer testing.allocator.free(obj_data);
+
+    try mock_s3.putObject("sso/split-checkpoint-fail/1", obj_data);
+    const ranges = [_]StreamOffsetRange{
+        .{ .stream_id = 1, .start_offset = 0, .end_offset = 10 },
+        .{ .stream_id = 2, .start_offset = 0, .end_offset = 5 },
+    };
+    try om.commitStreamSetObject(1, 0, 1, &ranges, "sso/split-checkpoint-fail/1", obj_data.len);
+
+    var cm = CompactionManager.init(testing.allocator, &om);
+    defer cm.deinit();
+    cm.setMockS3(&mock_s3);
+
+    var checkpoint = TestMetadataCheckpoint{ .fail_on = 1 };
+    cm.setMetadataCheckpoint(&checkpoint, TestMetadataCheckpoint.checkpoint);
+
+    try testing.expectError(error.InjectedMetadataCheckpointFailure, cm.splitStreamSetObject(1));
+    try testing.expectEqual(@as(usize, 1), checkpoint.calls);
+    try testing.expectEqual(@as(usize, 1), om.getStreamSetObjectCount());
+    try testing.expectEqual(@as(usize, 0), om.getStreamObjectCount());
+    try testing.expect(mock_s3.getObject("sso/split-checkpoint-fail/1") != null);
+    try testing.expect(mock_s3.getObject("data/so/1/0-2") == null);
+}
+
 test "CompactionManager merge aborts if SO read fails" {
     // If one SO can't be read from S3, the merge should abort entirely
     // to prevent data loss (we can't merge what we can't read).
@@ -1111,6 +1350,45 @@ test "CompactionManager merge removes old SOs from ObjectManager before S3" {
     try testing.expectEqual(@as(u64, 120), results[0].end_offset);
 }
 
+test "CompactionManager merge tracks old SO delete failures as orphans" {
+    var om = ObjectManager.init(testing.allocator, 0);
+    defer om.deinit();
+
+    var mock_s3 = MockS3.init(testing.allocator);
+    defer mock_s3.deinit();
+
+    var i: u64 = 0;
+    while (i < 12) : (i += 1) {
+        var writer = ObjectWriter.init(testing.allocator);
+        defer writer.deinit();
+        try writer.addDataBlock(1, i * 10, 10, 10, "merge-orphan-data");
+        const data = try writer.build();
+        defer testing.allocator.free(data);
+
+        const key = try std.fmt.allocPrint(testing.allocator, "so/merge-orphan/{d}", .{i});
+        defer testing.allocator.free(key);
+        try mock_s3.putObject(key, data);
+        try om.commitStreamObject(i + 1, 1, i * 10, (i + 1) * 10, key, data.len);
+    }
+
+    var cm = CompactionManager.init(testing.allocator, &om);
+    defer cm.deinit();
+    cm.setMockS3(&mock_s3);
+    cm.merge_min_object_count = 10;
+
+    mock_s3.failNextDeleteObjects(12);
+    try cm.runCompaction();
+
+    try testing.expectEqual(@as(usize, 1), om.getStreamObjectCount());
+    try testing.expectEqual(@as(usize, 12), cm.orphaned_keys.items.len);
+    try testing.expect(mock_s3.getObject("so/merge-orphan/0") != null);
+
+    try cm.runCompaction();
+
+    try testing.expectEqual(@as(usize, 0), cm.orphaned_keys.items.len);
+    try testing.expect(mock_s3.getObject("so/merge-orphan/0") == null);
+}
+
 test "CompactionManager deleteS3Object failure does not crash" {
     var om = ObjectManager.init(testing.allocator, 0);
     defer om.deinit();
@@ -1120,6 +1398,79 @@ test "CompactionManager deleteS3Object failure does not crash" {
     defer cm.deinit();
     const result = cm.deleteS3Object("nonexistent-key");
     try testing.expect(!result);
+}
+
+test "CompactionManager writes and clears durable journal entries" {
+    const tmp_dir = "/tmp/zmq-compaction-journal-roundtrip-test";
+    const journal_file_path = tmp_dir ++ "/compaction.journal";
+    fs.deleteTreeAbsolute(tmp_dir) catch {};
+    defer fs.deleteTreeAbsolute(tmp_dir) catch {};
+    try fs.makeDirAbsolute(tmp_dir);
+
+    var om = ObjectManager.init(testing.allocator, 0);
+    defer om.deinit();
+
+    var cm = CompactionManager.init(testing.allocator, &om);
+    defer cm.deinit();
+    cm.journal_path = tmp_dir;
+
+    try cm.journalBegin("split", 42);
+
+    const file = try fs.openFileAbsolute(journal_file_path, .{});
+    defer file.close();
+    const content = try file.readToEndAlloc(testing.allocator, 64);
+    defer testing.allocator.free(content);
+
+    try testing.expectEqual(@as(usize, 14), content.len);
+    try testing.expectEqual(@as(u8, 5), content[0]);
+    try testing.expectEqualStrings("split", content[1..6]);
+    try testing.expectEqual(@as(u64, 42), std.mem.readInt(u64, content[6..14], .big));
+
+    try cm.journalComplete();
+    try testing.expectError(error.FileNotFound, fs.openFileAbsolute(journal_file_path, .{}));
+}
+
+test "CompactionManager fails closed when compaction journal cannot be persisted" {
+    const bad_journal_path = "/tmp/zmq-compaction-journal-notdir-test";
+    fs.deleteTreeAbsolute(bad_journal_path) catch {};
+    fs.deleteFileAbsolute(bad_journal_path) catch {};
+    defer fs.deleteFileAbsolute(bad_journal_path) catch {};
+
+    {
+        const file = try fs.createFileAbsolute(bad_journal_path, .{ .truncate = true });
+        defer file.close();
+    }
+
+    var om = ObjectManager.init(testing.allocator, 0);
+    defer om.deinit();
+
+    var mock_s3 = MockS3.init(testing.allocator);
+    defer mock_s3.deinit();
+
+    var writer = ObjectWriter.init(testing.allocator);
+    defer writer.deinit();
+    try writer.addDataBlock(1, 0, 10, 10, "stream1-data");
+    try writer.addDataBlock(2, 0, 5, 5, "stream2-data");
+    const obj_data = try writer.build();
+    defer testing.allocator.free(obj_data);
+
+    try mock_s3.putObject("sso/journal-fail/1", obj_data);
+    const ranges = [_]StreamOffsetRange{
+        .{ .stream_id = 1, .start_offset = 0, .end_offset = 10 },
+        .{ .stream_id = 2, .start_offset = 0, .end_offset = 5 },
+    };
+    try om.commitStreamSetObject(1, 0, 1, &ranges, "sso/journal-fail/1", obj_data.len);
+
+    var cm = CompactionManager.init(testing.allocator, &om);
+    defer cm.deinit();
+    cm.setMockS3(&mock_s3);
+    cm.journal_path = bad_journal_path;
+
+    try testing.expectError(error.NotDir, cm.runCompaction());
+    try testing.expectEqual(@as(usize, 1), om.getStreamSetObjectCount());
+    try testing.expectEqual(@as(usize, 0), om.getStreamObjectCount());
+    try testing.expectEqual(@as(u64, 0), cm.total_splits);
+    try testing.expect(mock_s3.getObject("sso/journal-fail/1") != null);
 }
 
 test "CompactionManager split then merge preserves data end-to-end" {
@@ -1302,6 +1653,71 @@ test "CompactionManager cleanupExpired marks retention-trimmed SOs for destructi
     try testing.expectEqual(@as(usize, 1), results.len);
     try testing.expectEqual(@as(u64, 100), results[0].start_offset);
     try testing.expectEqual(@as(u64, 150), results[0].end_offset);
+}
+
+test "CompactionManager cleanupDestroyed fails closed when orphan retry capacity cannot be reserved" {
+    var om = ObjectManager.init(testing.allocator, 0);
+    defer om.deinit();
+
+    var mock_s3 = MockS3.init(testing.allocator);
+    defer mock_s3.deinit();
+
+    var writer = ObjectWriter.init(testing.allocator);
+    defer writer.deinit();
+    try writer.addDataBlock(1, 0, 50, 50, "destroy-data");
+    const data = try writer.build();
+    defer testing.allocator.free(data);
+
+    try mock_s3.putObject("so/destroy-capacity-fail", data);
+    try om.commitStreamObject(10, 1, 0, 50, "so/destroy-capacity-fail", data.len);
+    om.markDestroyedAt(10, 1);
+
+    var failing_allocator = std.testing.FailingAllocator.init(testing.allocator, .{ .fail_index = 0 });
+    var cm = CompactionManager.init(failing_allocator.allocator(), &om);
+    defer cm.deinit();
+    cm.setMockS3(&mock_s3);
+    cm.mark_destroyed_retention_ms = 0;
+
+    try testing.expectError(error.OutOfMemory, cm.cleanupDestroyed());
+    try testing.expect(failing_allocator.has_induced_failure);
+    try testing.expectEqual(@as(usize, 1), om.getStreamObjectCount());
+    try testing.expectEqual(stream_mod.S3ObjectState.mark_destroyed, om.stream_objects.get(10).?.state);
+    try testing.expectEqual(@as(usize, 0), cm.orphaned_keys.items.len);
+    try testing.expect(mock_s3.getObject("so/destroy-capacity-fail") != null);
+}
+
+test "CompactionManager cleanupDestroyed preserves failed delete keys for retry" {
+    var om = ObjectManager.init(testing.allocator, 0);
+    defer om.deinit();
+
+    var mock_s3 = MockS3.init(testing.allocator);
+    defer mock_s3.deinit();
+
+    var writer = ObjectWriter.init(testing.allocator);
+    defer writer.deinit();
+    try writer.addDataBlock(1, 0, 50, 50, "destroy-data");
+    const data = try writer.build();
+    defer testing.allocator.free(data);
+
+    try mock_s3.putObject("so/destroy-delete-fail", data);
+    try om.commitStreamObject(10, 1, 0, 50, "so/destroy-delete-fail", data.len);
+    om.markDestroyedAt(10, 1);
+
+    var cm = CompactionManager.init(testing.allocator, &om);
+    defer cm.deinit();
+    cm.setMockS3(&mock_s3);
+    cm.mark_destroyed_retention_ms = 0;
+
+    mock_s3.failNextDeleteObjects(1);
+    try testing.expectEqual(@as(u64, 1), try cm.cleanupDestroyed());
+    try testing.expectEqual(@as(usize, 0), om.getStreamObjectCount());
+    try testing.expectEqual(@as(usize, 1), cm.orphaned_keys.items.len);
+    try testing.expectEqualStrings("so/destroy-delete-fail", cm.orphaned_keys.items[0]);
+    try testing.expect(mock_s3.getObject("so/destroy-delete-fail") != null);
+
+    cm.cleanupOrphans();
+    try testing.expectEqual(@as(usize, 0), cm.orphaned_keys.items.len);
+    try testing.expect(mock_s3.getObject("so/destroy-delete-fail") == null);
 }
 
 test "CompactionManager idempotent split skips existing SOs" {

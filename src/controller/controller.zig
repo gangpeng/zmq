@@ -14,6 +14,10 @@ const ErrorCode = protocol.ErrorCode;
 const RaftState = @import("raft").RaftState;
 const BrokerRegistry = @import("broker_registry.zig").BrokerRegistry;
 
+fn monotonicMs() i64 {
+    return @intCast(@import("time_compat").monotonicMilliTimestamp());
+}
+
 /// KRaft metadata controller.
 ///
 /// Owns the Raft consensus state machine and manages cluster metadata.
@@ -290,7 +294,11 @@ pub const Controller = struct {
 
         if (observed_leader) |leader| {
             if (leader.epoch >= self.raft_state.current_epoch) {
-                self.raft_state.becomeFollower(leader.epoch, leader.id);
+                self.raft_state.becomeFollower(leader.epoch, leader.id) catch |err| {
+                    log.warn("BeginQuorumEpoch rejected: failed to persist leader epoch {d}: {}", .{ leader.epoch, err });
+                    const resp = Resp{ .error_code = ErrorCode.kafka_storage_error.toInt(), .topics = &.{}, .node_endpoints = &.{} };
+                    return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+                };
                 log.info("Acknowledged leader {d} epoch={d}", .{ leader.id, leader.epoch });
             }
         }
@@ -341,7 +349,7 @@ pub const Controller = struct {
 
         if (pos.* == request_bytes.len) {
             if (leader_epoch >= self.raft_state.current_epoch) {
-                self.raft_state.becomeFollower(leader_epoch, leader_id);
+                try self.raft_state.becomeFollower(leader_epoch, leader_id);
             }
             return .{ .success = true, .epoch = self.raft_state.current_epoch, .match_index = self.raft_state.log.lastOffset() };
         }
@@ -2208,7 +2216,7 @@ fn buildTestRequest(buf: []u8, api_key: i16, api_version: i16, correlation_id: i
 
 fn makeTestControllerLeader(ctrl: *Controller) !void {
     try ctrl.raft_state.addVoter(ctrl.node_id);
-    _ = ctrl.raft_state.startElection();
+    _ = try ctrl.raft_state.startElection();
     ctrl.raft_state.becomeLeader();
 }
 
@@ -2421,7 +2429,7 @@ test "Controller handleRequest Vote rejects stale epoch" {
 
     // Put controller at epoch 5 as follower of node 2
     try ctrl.raft_state.addVoter(1);
-    ctrl.raft_state.becomeFollower(5, 2);
+    try ctrl.raft_state.becomeFollower(5, 2);
 
     // Add voter 3 so it can be a candidate
     try ctrl.raft_state.addVoter(3);
@@ -2521,7 +2529,7 @@ test "Controller handleRequest BeginQuorumEpoch ignores stale epoch" {
     defer ctrl.deinit();
 
     // Put controller at epoch 5
-    ctrl.raft_state.becomeFollower(5, 2);
+    try ctrl.raft_state.becomeFollower(5, 2);
     try testing.expectEqual(@as(i32, 5), ctrl.raft_state.current_epoch);
 
     // Send BeginQuorumEpoch with stale epoch 3
@@ -2585,7 +2593,7 @@ test "Controller handleRequest DescribeQuorum returns quorum info" {
 
     // Add self as voter and become leader
     try ctrl.raft_state.addVoter(1);
-    _ = ctrl.raft_state.startElection();
+    _ = try ctrl.raft_state.startElection();
     ctrl.raft_state.becomeLeader();
 
     // DescribeQuorum (55, v0) is flexible → header v2 / response v1
@@ -2640,7 +2648,7 @@ test "Controller handleRequest DescribeQuorum v2 returns voter node endpoints" {
     }};
     _ = try ctrl.raft_state.proposeUpdateVoter(1, directory_id, &endpoint_views, 0, 1);
     ctrl.raft_state.commit_index = ctrl.raft_state.log.lastOffset();
-    ctrl.raft_state.applyCommittedConfigs();
+    try ctrl.raft_state.applyCommittedConfigs();
 
     var buf: [256]u8 = undefined;
     var pos = buildTestRequest(&buf, 55, 2, 5502, header_mod.requestHeaderVersion(55, 2));
@@ -2742,7 +2750,7 @@ test "Controller handleRequest FetchSnapshot v1 returns current leader endpoint 
     }};
     _ = try ctrl.raft_state.proposeUpdateVoter(1, directory_id, &endpoint_views, 0, 1);
     ctrl.raft_state.commit_index = ctrl.raft_state.log.lastOffset();
-    ctrl.raft_state.applyCommittedConfigs();
+    try ctrl.raft_state.applyCommittedConfigs();
 
     const snapshot_id = Req.TopicSnapshot.PartitionSnapshot.SnapshotId{ .end_offset = 7, .epoch = 2 };
     const partitions = [_]Req.TopicSnapshot.PartitionSnapshot{.{
@@ -2803,7 +2811,7 @@ test "Controller handleRequest FetchSnapshot returns compacted controller snapsh
     ctrl.last_applied_controller_metadata_offset = broker_offset;
 
     try ctrl.prepareControllerMetadataSnapshotForRaftCompaction();
-    ctrl.raft_state.takeSnapshot();
+    try ctrl.raft_state.takeSnapshot();
 
     const snapshot_offset = ctrl.raft_state.last_snapshot_offset;
     const snapshot_epoch = ctrl.raft_state.last_snapshot_epoch;
@@ -2869,7 +2877,7 @@ test "Controller handleRequest FetchSnapshot rejects positions beyond compacted 
     ctrl.last_applied_controller_metadata_offset = broker_offset;
 
     try ctrl.prepareControllerMetadataSnapshotForRaftCompaction();
-    ctrl.raft_state.takeSnapshot();
+    try ctrl.raft_state.takeSnapshot();
 
     const snapshot_offset = ctrl.raft_state.last_snapshot_offset;
     const snapshot_epoch = ctrl.raft_state.last_snapshot_epoch;
@@ -3318,7 +3326,7 @@ test "Controller replays replicated broker registration after follower promotion
     defer follower.deinit();
     try follower.raft_state.addVoter(1);
     try follower.raft_state.addVoter(2);
-    follower.raft_state.becomeFollower(leader.raft_state.current_epoch, 1);
+    try follower.raft_state.becomeFollower(leader.raft_state.current_epoch, 1);
 
     var append_buf: [1024]u8 = undefined;
     var append_pos = buildTestRequest(&append_buf, 53, 0, 5308, header_mod.requestHeaderVersion(53, 0));
@@ -3337,7 +3345,7 @@ test "Controller replays replicated broker registration after follower promotion
     try testing.expectEqual(ErrorCode.none.toInt(), append_resp.error_code);
     try testing.expectEqual(@as(usize, 1), follower.broker_registry.count());
 
-    _ = follower.raft_state.startElection();
+    _ = try follower.raft_state.startElection();
     follower.raft_state.becomeLeader();
 
     var hb_buf: [256]u8 = undefined;
@@ -3414,7 +3422,7 @@ test "Controller tick evicts dead brokers" {
 
     // Force the broker's last_heartbeat_ms to be 60 seconds in the past
     if (ctrl.broker_registry.brokers.getPtr(100)) |info| {
-        info.last_heartbeat_ms = @import("time_compat").milliTimestamp() - 60_000;
+        info.last_heartbeat_ms = monotonicMs() - 60_000;
     }
 
     // tick() calls evictExpired(30_000) — broker should be evicted
@@ -3535,7 +3543,7 @@ test "Controller full snapshot survives Raft log compaction" {
     try testing.expectEqual(@as(usize, 3), ctrl.raft_state.log.length());
     try testing.expectEqual(@as(u64, 2), ctrl.raft_state.commit_index);
 
-    ctrl.raft_state.takeSnapshot();
+    try ctrl.raft_state.takeSnapshot();
     try testing.expectEqual(@as(usize, 1), ctrl.raft_state.log.length());
     try testing.expectEqual(@as(u64, 2), ctrl.raft_state.log.entries.items[0].offset);
 
@@ -3603,7 +3611,7 @@ test "Controller handleRequest ControllerRegistration accepts known voter" {
 
     try testing.expect(ctrl.raft_state.pending_config_change);
     ctrl.raft_state.commit_index = ctrl.raft_state.log.lastOffset();
-    ctrl.raft_state.applyCommittedConfigs();
+    try ctrl.raft_state.applyCommittedConfigs();
 
     const voter = ctrl.raft_state.voters.get(1).?;
     try testing.expectEqual(@as(i16, 0), voter.k_raft_min_supported_version);
@@ -3792,7 +3800,7 @@ test "Controller handleRequest AddRaftVoter uses generated key 80" {
     var ctrl = Controller.init(testing.allocator, 1, "test-cluster");
     defer ctrl.deinit();
     try ctrl.raft_state.addVoter(1);
-    _ = ctrl.raft_state.startElection();
+    _ = try ctrl.raft_state.startElection();
     ctrl.raft_state.becomeLeader();
 
     var buf: [256]u8 = undefined;
@@ -3853,7 +3861,7 @@ test "Controller handleRequest AddRaftVoter persists listener metadata after com
     try testing.expectEqual(ErrorCode.none.toInt(), resp.error_code);
 
     ctrl.raft_state.commit_index = ctrl.raft_state.log.lastOffset();
-    ctrl.raft_state.applyCommittedConfigs();
+    try ctrl.raft_state.applyCommittedConfigs();
     const voter = ctrl.raft_state.voters.get(2).?;
     try testing.expectEqualSlices(u8, &directory_id, &voter.voter_directory_id);
     try testing.expectEqual(@as(usize, 1), voter.endpoints.len);
@@ -3870,7 +3878,7 @@ test "Controller handleRequest RemoveRaftVoter uses generated key 81" {
     defer ctrl.deinit();
     try ctrl.raft_state.addVoter(1);
     try ctrl.raft_state.addVoter(2);
-    _ = ctrl.raft_state.startElection();
+    _ = try ctrl.raft_state.startElection();
     ctrl.raft_state.becomeLeader();
 
     var buf: [256]u8 = undefined;
@@ -3978,7 +3986,7 @@ test "Controller handleRequest UpdateRaftVoter proposes endpoint update" {
     try testing.expect(ctrl.raft_state.pending_config_change);
 
     ctrl.raft_state.commit_index = ctrl.raft_state.log.lastOffset();
-    ctrl.raft_state.applyCommittedConfigs();
+    try ctrl.raft_state.applyCommittedConfigs();
     const voter = ctrl.raft_state.voters.get(1).?;
     try testing.expectEqual(@as(usize, 1), voter.endpoints.len);
     try testing.expectEqualStrings("CONTROLLER", voter.endpoints[0].name);
@@ -4443,7 +4451,7 @@ test "Controller handleRequest Vote v1 populates leader node endpoint" {
     }};
     _ = try ctrl.raft_state.proposeUpdateVoter(1, directory_id, &endpoint_views, 0, 1);
     ctrl.raft_state.commit_index = ctrl.raft_state.log.lastOffset();
-    ctrl.raft_state.applyCommittedConfigs();
+    try ctrl.raft_state.applyCommittedConfigs();
 
     try ctrl.raft_state.addVoter(2);
 
@@ -4494,7 +4502,7 @@ test "Controller handleRequest EndQuorumEpoch v1 populates leader node endpoint"
     }};
     _ = try ctrl.raft_state.proposeUpdateVoter(1, directory_id, &endpoint_views, 0, 1);
     ctrl.raft_state.commit_index = ctrl.raft_state.log.lastOffset();
-    ctrl.raft_state.applyCommittedConfigs();
+    try ctrl.raft_state.applyCommittedConfigs();
 
     var buf: [256]u8 = undefined;
     var pos = buildTestRequest(&buf, 54, 1, 9201, header_mod.requestHeaderVersion(54, 1));
@@ -4550,7 +4558,7 @@ test "Controller handleRequest BeginQuorumEpoch v1 populates leader node endpoin
     }};
     _ = try ctrl.raft_state.proposeUpdateVoter(1, directory_id, &endpoint_views, 0, 1);
     ctrl.raft_state.commit_index = ctrl.raft_state.log.lastOffset();
-    ctrl.raft_state.applyCommittedConfigs();
+    try ctrl.raft_state.applyCommittedConfigs();
 
     var buf: [256]u8 = undefined;
     var pos = buildTestRequest(&buf, 53, 1, 9202, header_mod.requestHeaderVersion(53, 1));

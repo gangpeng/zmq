@@ -7,6 +7,10 @@ const Allocator = std.mem.Allocator;
 const OpenSslLib = @import("openssl.zig").OpenSslLib;
 const fs = @import("fs_compat");
 
+fn monotonicMs() i64 {
+    return @intCast(@import("time_compat").monotonicMilliTimestamp());
+}
+
 /// TLS configuration for the broker.
 ///
 /// Supports both client-facing (data plane) and inter-broker (control plane)
@@ -102,6 +106,28 @@ pub const TlsConfig = struct {
         }
         if (self.client_auth != .none and self.ca_file == null) {
             return error.NoTrustAnchorsConfigured;
+        }
+    }
+
+    /// Validate outbound TLS configuration.
+    ///
+    /// Client contexts do not require a local certificate unless mTLS is
+    /// configured, but they still must fail closed for unsupported Kafka-style
+    /// JKS fields, invalid protocol ranges, and partial client cert/key config.
+    pub fn validateClient(self: *const TlsConfig) !void {
+        if (!self.needsTls()) return;
+
+        if (@intFromEnum(self.min_tls_version) > @intFromEnum(self.max_tls_version)) {
+            return error.InvalidTlsVersionRange;
+        }
+        if (self.keystore_path != null or self.keystore_password != null) {
+            return error.UnsupportedKeystoreFormat;
+        }
+        if (self.truststore_path != null or self.truststore_password != null) {
+            return error.UnsupportedTruststoreFormat;
+        }
+        if ((self.cert_file == null) != (self.key_file == null)) {
+            return error.IncompleteClientCertificateConfig;
         }
     }
 };
@@ -223,7 +249,7 @@ pub const TlsConnection = struct {
             .ssl_ptr = ssl,
             .openssl = openssl,
             .allocator = alloc,
-            .handshake_start_ms = @import("time_compat").milliTimestamp(),
+            .handshake_start_ms = monotonicMs(),
         };
     }
 
@@ -238,9 +264,9 @@ pub const TlsConnection = struct {
     pub fn doHandshake(self: *TlsConnection) !void {
         const ssl = self.ssl_ptr orelse {
             log.err("TLS handshake attempted but no SSL object — TLS not configured.", .{});
-            return error.TlsNotImplemented;
+            return error.TlsContextUnavailable;
         };
-        const ossl = self.openssl orelse return error.TlsNotImplemented;
+        const ossl = self.openssl orelse return error.TlsContextUnavailable;
 
         const ret = ossl.SSL_accept(ssl);
         if (ret == 1) {
@@ -567,6 +593,7 @@ pub const TlsClientContext = struct {
 
     pub fn init(config: TlsConfig) !TlsClientContext {
         if (!config.needsTls()) return TlsClientContext{};
+        try config.validateClient();
 
         var ossl = OpenSslLib.load() catch |err| {
             log.err("Cannot initialize client TLS: OpenSSL not available ({s})", .{@errorName(err)});
@@ -669,7 +696,8 @@ pub const TlsClientContext = struct {
         // SAN/CN during the handshake.
         if (hostname) |host| {
             if (!ossl.setHostnameVerification(ssl, host)) {
-                log.warn("Could not enable hostname verification for fd={d} — SSL_set1_host failed or unavailable", .{fd});
+                log.warn("TLS client hostname verification could not be enabled for fd={d}", .{fd});
+                return error.HostnameVerificationUnavailable;
             } else {
                 log.debug("Hostname verification enabled for fd={d}: {s}", .{ fd, host });
             }
@@ -733,13 +761,6 @@ pub const TlsClientContext = struct {
         self.initialized = false;
     }
 };
-
-/// Generate a self-signed certificate for development/testing.
-pub fn generateSelfSignedCert(alloc: Allocator, output_dir: []const u8) !struct { cert: []const u8, key: []const u8 } {
-    _ = alloc;
-    _ = output_dir;
-    return error.NotImplemented;
-}
 
 /// Validate a peer certificate after a successful TLS handshake.
 /// This is a standalone function for use by server.zig's epoll loop, which
@@ -813,6 +834,120 @@ fn tlsRotationTestPath(tmp: *const testing.TmpDir, name: []const u8) ![]u8 {
     });
 }
 
+var fake_tls_test_handle: u8 = 0;
+
+fn fakeOpaque() *anyopaque {
+    return @ptrCast(&fake_tls_test_handle);
+}
+
+fn fakeTlsMethod() callconv(.c) ?*anyopaque {
+    return fakeOpaque();
+}
+
+fn fakeSslCtxNew(_: ?*anyopaque) callconv(.c) ?*anyopaque {
+    return fakeOpaque();
+}
+
+fn fakeSslCtxFree(_: ?*anyopaque) callconv(.c) void {}
+
+fn fakeSslCtxUseFile(_: ?*anyopaque, _: [*:0]const u8, _: c_int) callconv(.c) c_int {
+    return 1;
+}
+
+fn fakeSslCtxUseCertFile(_: ?*anyopaque, _: [*:0]const u8) callconv(.c) c_int {
+    return 1;
+}
+
+fn fakeSslCtxCheckPrivateKey(_: ?*anyopaque) callconv(.c) c_int {
+    return 1;
+}
+
+fn fakeSslCtxLoadVerifyLocations(_: ?*anyopaque, _: ?[*:0]const u8, _: ?[*:0]const u8) callconv(.c) c_int {
+    return 1;
+}
+
+fn fakeSslCtxSetVerify(_: ?*anyopaque, _: c_int, _: ?*anyopaque) callconv(.c) void {}
+
+fn fakeSslCtxCtrl(_: ?*anyopaque, _: c_int, _: c_long, _: ?*anyopaque) callconv(.c) c_long {
+    return 1;
+}
+
+fn fakeSslNew(_: ?*anyopaque) callconv(.c) ?*anyopaque {
+    return fakeOpaque();
+}
+
+fn fakeSslFree(_: ?*anyopaque) callconv(.c) void {}
+
+fn fakeSslSetFd(_: ?*anyopaque, _: c_int) callconv(.c) c_int {
+    return 1;
+}
+
+fn fakeSslHandshake(_: ?*anyopaque) callconv(.c) c_int {
+    return 1;
+}
+
+fn fakeSslRead(_: ?*anyopaque, _: [*]u8, _: c_int) callconv(.c) c_int {
+    return -1;
+}
+
+fn fakeSslWrite(_: ?*anyopaque, _: [*]const u8, _: c_int) callconv(.c) c_int {
+    return -1;
+}
+
+fn fakeSslShutdown(_: ?*anyopaque) callconv(.c) c_int {
+    return 1;
+}
+
+fn fakeSslGetError(_: ?*anyopaque, _: c_int) callconv(.c) c_int {
+    return OpenSslLib.SSL_ERROR_SSL;
+}
+
+fn fakeSslCtxSetCipherList(_: ?*anyopaque, _: [*:0]const u8) callconv(.c) c_int {
+    return 1;
+}
+
+fn fakeOpenSslInit(_: u64, _: ?*anyopaque) callconv(.c) c_int {
+    return 1;
+}
+
+fn fakeErrGetError() callconv(.c) c_ulong {
+    return 0;
+}
+
+fn fakeErrErrorString(_: c_ulong, buf: [*]u8, len: usize) callconv(.c) void {
+    if (len > 0) buf[0] = 0;
+}
+
+fn fakeOpenSslLibWithoutHostnameVerification() OpenSslLib {
+    return .{
+        .ssl_handle = fakeOpaque(),
+        .crypto_handle = fakeOpaque(),
+        .TLS_server_method = fakeTlsMethod,
+        .TLS_client_method = fakeTlsMethod,
+        .SSL_CTX_new = fakeSslCtxNew,
+        .SSL_CTX_free = fakeSslCtxFree,
+        .SSL_CTX_use_certificate_chain_file = fakeSslCtxUseCertFile,
+        .SSL_CTX_use_PrivateKey_file = fakeSslCtxUseFile,
+        .SSL_CTX_check_private_key = fakeSslCtxCheckPrivateKey,
+        .SSL_CTX_load_verify_locations = fakeSslCtxLoadVerifyLocations,
+        .SSL_CTX_set_verify = fakeSslCtxSetVerify,
+        .SSL_CTX_ctrl = fakeSslCtxCtrl,
+        .SSL_new = fakeSslNew,
+        .SSL_free = fakeSslFree,
+        .SSL_set_fd = fakeSslSetFd,
+        .SSL_accept = fakeSslHandshake,
+        .SSL_connect = fakeSslHandshake,
+        .SSL_read = fakeSslRead,
+        .SSL_write = fakeSslWrite,
+        .SSL_shutdown = fakeSslShutdown,
+        .SSL_get_error = fakeSslGetError,
+        .SSL_CTX_set_cipher_list = fakeSslCtxSetCipherList,
+        .OPENSSL_init_ssl = fakeOpenSslInit,
+        .ERR_get_error = fakeErrGetError,
+        .ERR_error_string_n = fakeErrErrorString,
+    };
+}
+
 test "TlsConfig defaults" {
     const config = TlsConfig{};
     try testing.expect(!config.needsTls());
@@ -880,6 +1015,35 @@ test "TlsConfig validate rejects inverted TLS version range" {
         .max_tls_version = .tls_1_2,
     };
     try testing.expectError(error.InvalidTlsVersionRange, config.validate());
+}
+
+test "TlsConfig validateClient allows CA-only outbound TLS" {
+    const config = TlsConfig{
+        .protocol = .ssl,
+        .ca_file = "/path/to/ca.pem",
+    };
+    try config.validateClient();
+}
+
+test "TlsConfig validateClient rejects invalid outbound TLS config" {
+    const inverted = TlsConfig{
+        .protocol = .ssl,
+        .min_tls_version = .tls_1_3,
+        .max_tls_version = .tls_1_2,
+    };
+    try testing.expectError(error.InvalidTlsVersionRange, inverted.validateClient());
+
+    const unsupported_truststore = TlsConfig{
+        .protocol = .ssl,
+        .truststore_path = "/path/to/kafka.truststore.jks",
+    };
+    try testing.expectError(error.UnsupportedTruststoreFormat, unsupported_truststore.validateClient());
+
+    const partial_mtls = TlsConfig{
+        .protocol = .ssl,
+        .cert_file = "/path/to/client.pem",
+    };
+    try testing.expectError(error.IncompleteClientCertificateConfig, partial_mtls.validateClient());
 }
 
 test "TlsConfig validate requires trust anchors for mTLS" {
@@ -1160,15 +1324,25 @@ test "Verify result check on fresh SSL returns OK" {
     try testing.expectEqual(OpenSslLib.X509_V_OK, result);
 }
 
-test "TlsClientContext wrapConnectionWithHostname exists" {
-    // C1: Verify the hostname verification entry point exists in TlsClientContext
-    const config = TlsConfig{};
-    var ctx = try TlsClientContext.init(config);
-    defer ctx.deinit();
-    // Can't actually call wrapConnectionWithHostname without a real socket/SSL,
-    // but we verify the function signature exists at comptime
-    const FnType = @TypeOf(TlsClientContext.wrapConnectionWithHostname);
-    try testing.expect(@TypeOf(FnType) != void);
+test "TlsClientContext rejects invalid outbound TLS config before OpenSSL load" {
+    const config = TlsConfig{
+        .protocol = .ssl,
+        .keystore_path = "/path/to/kafka.keystore.jks",
+    };
+    try testing.expectError(error.UnsupportedKeystoreFormat, TlsClientContext.init(config));
+}
+
+test "TlsClientContext wrapConnectionWithHostname fails closed without hostname verification" {
+    var ctx = TlsClientContext{
+        .ssl_ctx = fakeOpaque(),
+        .openssl = fakeOpenSslLibWithoutHostnameVerification(),
+        .initialized = true,
+    };
+
+    try testing.expectError(
+        error.HostnameVerificationUnavailable,
+        ctx.wrapConnectionWithHostname(42, "kafka.example.com"),
+    );
 }
 
 test "validatePeerCertificatePostHandshake with no peer cert returns null principal" {
