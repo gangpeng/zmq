@@ -17533,27 +17533,13 @@ pub const Broker = struct {
 
         if (!validateShareFetchRequestFrame(request_bytes, body_start)) {
             log.warn("Malformed ShareFetch request", .{});
-            const resp = Resp{
-                .throttle_time_ms = 0,
-                .error_code = ErrorCode.invalid_request.toInt(),
-                .error_message = "malformed ShareFetch request",
-                .responses = &.{},
-                .node_endpoints = &.{},
-            };
-            return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+            return self.shareFetchErrorResponse(req_header, resp_header_version, api_version, ErrorCode.invalid_request, "malformed ShareFetch request");
         }
 
         var pos = body_start;
         var req = Req.deserialize(self.allocator, request_bytes, &pos, api_version) catch |err| {
             log.warn("Failed to decode ShareFetch request: {}", .{err});
-            const resp = Resp{
-                .throttle_time_ms = 0,
-                .error_code = ErrorCode.invalid_request.toInt(),
-                .error_message = "malformed ShareFetch request",
-                .responses = &.{},
-                .node_endpoints = &.{},
-            };
-            return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+            return self.shareFetchErrorResponse(req_header, resp_header_version, api_version, ErrorCode.invalid_request, "malformed ShareFetch request");
         };
         defer self.freeShareFetchRequest(&req);
 
@@ -17568,15 +17554,31 @@ pub const Broker = struct {
         const semantics_error = if (member_error == ErrorCode.none) validateShareFetchRequestSemantics(req) else ErrorCode.none;
         var session_error = ErrorCode.none;
         if (member_error == ErrorCode.none and semantics_error == ErrorCode.none) {
-            previous_sessions = self.cloneShareGroupSessions() catch return null;
+            previous_sessions = self.cloneShareGroupSessions() catch |err| {
+                log.warn("ShareFetch session rollback snapshot materialization failed: {}", .{err});
+                return self.shareFetchErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error, "Failed to materialize ShareFetch rollback state");
+            };
             previous_sessions_valid = true;
-            previous_states = self.cloneShareGroupStates() catch return null;
+            previous_states = self.cloneShareGroupStates() catch |err| {
+                log.warn("ShareFetch state rollback snapshot materialization failed: {}", .{err});
+                return self.shareFetchErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error, "Failed to materialize ShareFetch rollback state");
+            };
             previous_states_valid = true;
-            session_error = self.updateShareSessionEpoch(req.group_id.?, req.member_id.?, req.share_session_epoch) catch return null;
+            session_error = self.updateShareSessionEpoch(req.group_id.?, req.member_id.?, req.share_session_epoch) catch |err| {
+                log.warn("ShareFetch session update failed: {}", .{err});
+                self.restoreShareDataPlaneSnapshots(&previous_sessions, &previous_states);
+                return self.shareFetchErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error, "Failed to update ShareFetch session");
+            };
         }
         const request_error = if (member_error != ErrorCode.none) member_error else if (semantics_error != ErrorCode.none) semantics_error else session_error;
 
-        const responses = self.buildShareFetchResponses(req, request_error) catch return null;
+        const responses = self.buildShareFetchResponses(req, request_error) catch |err| {
+            log.warn("ShareFetch response materialization failed: {}", .{err});
+            if (previous_sessions_valid and previous_states_valid) {
+                self.restoreShareDataPlaneSnapshots(&previous_sessions, &previous_states);
+            }
+            return self.shareFetchErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error, "Failed to materialize ShareFetch response");
+        };
         defer self.freeShareFetchResponses(responses);
 
         var response_error = request_error;
@@ -17593,7 +17595,10 @@ pub const Broker = struct {
             .responses = responses,
             .node_endpoints = &.{},
         };
-        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version) orelse {
+            log.warn("ShareFetch response serialization failed", .{});
+            return self.shareFetchErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error, "Failed to serialize ShareFetch response");
+        };
     }
 
     fn buildShareFetchResponses(
@@ -17790,27 +17795,13 @@ pub const Broker = struct {
 
         if (!validateShareAcknowledgeRequestFrame(request_bytes, body_start)) {
             log.warn("Malformed ShareAcknowledge request", .{});
-            const resp = Resp{
-                .throttle_time_ms = 0,
-                .error_code = ErrorCode.invalid_request.toInt(),
-                .error_message = "malformed ShareAcknowledge request",
-                .responses = &.{},
-                .node_endpoints = &.{},
-            };
-            return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+            return self.shareAcknowledgeErrorResponse(req_header, resp_header_version, api_version, ErrorCode.invalid_request, "malformed ShareAcknowledge request");
         }
 
         var pos = body_start;
         var req = Req.deserialize(self.allocator, request_bytes, &pos, api_version) catch |err| {
             log.warn("Failed to decode ShareAcknowledge request: {}", .{err});
-            const resp = Resp{
-                .throttle_time_ms = 0,
-                .error_code = ErrorCode.invalid_request.toInt(),
-                .error_message = "malformed ShareAcknowledge request",
-                .responses = &.{},
-                .node_endpoints = &.{},
-            };
-            return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+            return self.shareAcknowledgeErrorResponse(req_header, resp_header_version, api_version, ErrorCode.invalid_request, "malformed ShareAcknowledge request");
         };
         defer self.freeShareAcknowledgeRequest(&req);
 
@@ -17824,15 +17815,31 @@ pub const Broker = struct {
         const member_error = self.validateShareGroupMember(req.group_id, req.member_id);
         var session_error = ErrorCode.none;
         if (member_error == ErrorCode.none) {
-            previous_sessions = self.cloneShareGroupSessions() catch return null;
+            previous_sessions = self.cloneShareGroupSessions() catch |err| {
+                log.warn("ShareAcknowledge session rollback snapshot materialization failed: {}", .{err});
+                return self.shareAcknowledgeErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error, "Failed to materialize ShareAcknowledge rollback state");
+            };
             previous_sessions_valid = true;
-            previous_states = self.cloneShareGroupStates() catch return null;
+            previous_states = self.cloneShareGroupStates() catch |err| {
+                log.warn("ShareAcknowledge state rollback snapshot materialization failed: {}", .{err});
+                return self.shareAcknowledgeErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error, "Failed to materialize ShareAcknowledge rollback state");
+            };
             previous_states_valid = true;
-            session_error = self.updateShareSessionEpoch(req.group_id.?, req.member_id.?, req.share_session_epoch) catch return null;
+            session_error = self.updateShareSessionEpoch(req.group_id.?, req.member_id.?, req.share_session_epoch) catch |err| {
+                log.warn("ShareAcknowledge session update failed: {}", .{err});
+                self.restoreShareDataPlaneSnapshots(&previous_sessions, &previous_states);
+                return self.shareAcknowledgeErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error, "Failed to update ShareAcknowledge session");
+            };
         }
         const request_error = if (member_error != ErrorCode.none) member_error else session_error;
 
-        const responses = self.buildShareAcknowledgeResponses(req, request_error) catch return null;
+        const responses = self.buildShareAcknowledgeResponses(req, request_error) catch |err| {
+            log.warn("ShareAcknowledge response materialization failed: {}", .{err});
+            if (previous_sessions_valid and previous_states_valid) {
+                self.restoreShareDataPlaneSnapshots(&previous_sessions, &previous_states);
+            }
+            return self.shareAcknowledgeErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error, "Failed to materialize ShareAcknowledge response");
+        };
         defer self.freeShareAcknowledgeResponses(responses);
 
         var response_error = request_error;
@@ -17849,7 +17856,10 @@ pub const Broker = struct {
             .responses = responses,
             .node_endpoints = &.{},
         };
-        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version) orelse {
+            log.warn("ShareAcknowledge response serialization failed", .{});
+            return self.shareAcknowledgeErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error, "Failed to serialize ShareAcknowledge response");
+        };
     }
 
     fn buildShareAcknowledgeResponses(
@@ -32063,6 +32073,63 @@ fn freeDeserializedShareGroupDescribeResponse(resp: *const generated.share_group
         if (group.members.len > 0) testing.allocator.free(group.members);
     }
     if (resp.groups.len > 0) testing.allocator.free(resp.groups);
+}
+
+fn freeDeserializedShareFetchResponse(resp: *const generated.share_fetch_response.ShareFetchResponse) void {
+    for (resp.responses) |topic| {
+        for (topic.partitions) |partition| {
+            if (partition.acquired_records.len > 0) testing.allocator.free(partition.acquired_records);
+        }
+        if (topic.partitions.len > 0) testing.allocator.free(topic.partitions);
+    }
+    if (resp.responses.len > 0) testing.allocator.free(resp.responses);
+    if (resp.node_endpoints.len > 0) testing.allocator.free(resp.node_endpoints);
+}
+
+fn freeDeserializedShareAcknowledgeResponse(resp: *const generated.share_acknowledge_response.ShareAcknowledgeResponse) void {
+    for (resp.responses) |topic| {
+        if (topic.partitions.len > 0) testing.allocator.free(topic.partitions);
+    }
+    if (resp.responses.len > 0) testing.allocator.free(resp.responses);
+    if (resp.node_endpoints.len > 0) testing.allocator.free(resp.node_endpoints);
+}
+
+fn expectShareFetchErrorResponseBytes(response: []const u8, correlation_id: i32, err_code: ErrorCode) !void {
+    const Resp = generated.share_fetch_response.ShareFetchResponse;
+
+    var rpos: usize = 0;
+    var response_header = try ResponseHeader.deserialize(testing.allocator, response, &rpos, header_mod.responseHeaderVersion(78, 0));
+    defer response_header.deinit(testing.allocator);
+    try testing.expectEqual(correlation_id, response_header.correlation_id);
+
+    const resp = try Resp.deserialize(testing.allocator, response, &rpos, 0);
+    defer freeDeserializedShareFetchResponse(&resp);
+
+    try testing.expectEqual(response.len, rpos);
+    try testing.expectEqual(@as(i32, 0), resp.throttle_time_ms);
+    try testing.expectEqual(@as(i16, @intFromEnum(err_code)), resp.error_code);
+    try testing.expect(resp.error_message != null);
+    try testing.expectEqual(@as(usize, 0), resp.responses.len);
+    try testing.expectEqual(@as(usize, 0), resp.node_endpoints.len);
+}
+
+fn expectShareAcknowledgeErrorResponseBytes(response: []const u8, correlation_id: i32, err_code: ErrorCode) !void {
+    const Resp = generated.share_acknowledge_response.ShareAcknowledgeResponse;
+
+    var rpos: usize = 0;
+    var response_header = try ResponseHeader.deserialize(testing.allocator, response, &rpos, header_mod.responseHeaderVersion(79, 0));
+    defer response_header.deinit(testing.allocator);
+    try testing.expectEqual(correlation_id, response_header.correlation_id);
+
+    const resp = try Resp.deserialize(testing.allocator, response, &rpos, 0);
+    defer freeDeserializedShareAcknowledgeResponse(&resp);
+
+    try testing.expectEqual(response.len, rpos);
+    try testing.expectEqual(@as(i32, 0), resp.throttle_time_ms);
+    try testing.expectEqual(@as(i16, @intFromEnum(err_code)), resp.error_code);
+    try testing.expect(resp.error_message != null);
+    try testing.expectEqual(@as(usize, 0), resp.responses.len);
+    try testing.expectEqual(@as(usize, 0), resp.node_endpoints.len);
 }
 
 fn expectShareGroupDescribeErrorResponseBytes(response: []const u8, correlation_id: i32, err_code: ErrorCode) !void {
@@ -65049,6 +65116,123 @@ test "Broker.handleRequest ShareFetch rejects malformed request" {
     try testing.expectEqualStrings("malformed ShareFetch request", resp.error_message.?);
 }
 
+test "Broker.handleRequest ShareFetch fails closed when session snapshot materialization fails" {
+    const Req = generated.share_fetch_request.ShareFetchRequest;
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+
+    const subscriptions = [_][]const u8{};
+    const joined = try broker.groups.joinGroupWithProtocol("share-fetch-session-oom-group", "share-member", null, "share", "range", null, &subscriptions);
+    try testing.expectEqual(ErrorCode.none.toInt(), joined.error_code);
+    try testing.expect(broker.markShareGroupStable("share-fetch-session-oom-group"));
+    try testing.expectEqual(ErrorCode.none, try broker.updateShareSessionEpoch("share-fetch-session-oom-group", "share-member", 0));
+
+    const req = Req{
+        .group_id = "share-fetch-session-oom-group",
+        .member_id = "share-member",
+        .share_session_epoch = 1,
+        .max_wait_ms = 1,
+        .min_bytes = 0,
+        .max_bytes = 1024,
+        .topics = &.{},
+        .forgotten_topics_data = &.{},
+    };
+
+    var buf: [256]u8 = undefined;
+    var pos = buildTestRequest(&buf, 78, 0, 7811, header_mod.requestHeaderVersion(78, 0));
+    req.serialize(&buf, &pos, 0);
+
+    var failing_allocator = OneShotFailingAllocator.init(testing.allocator, 0);
+    const response_allocator = failing_allocator.allocator();
+    broker.allocator = response_allocator;
+
+    const response = broker.handleRequest(buf[0..pos]);
+    broker.allocator = testing.allocator;
+
+    defer if (response) |bytes| response_allocator.free(bytes);
+    try testing.expect(failing_allocator.failed);
+    try testing.expect(response != null);
+    try expectShareFetchErrorResponseBytes(response.?, 7811, ErrorCode.kafka_storage_error);
+
+    const session_key = try broker.shareGroupMemberKey("share-fetch-session-oom-group", "share-member");
+    defer testing.allocator.free(session_key);
+    try testing.expectEqual(@as(i32, 0), broker.share_group_sessions.get(session_key).?);
+}
+
+test "Broker.handleRequest ShareFetch fails closed when response materialization fails" {
+    const Req = generated.share_fetch_request.ShareFetchRequest;
+    const FetchTopic = Req.FetchTopic;
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+
+    const topics = [_]FetchTopic{.{
+        .topic_id = [_]u8{0} ** 16,
+        .partitions = &.{},
+    }};
+    const req = Req{
+        .group_id = "missing-share-fetch-group",
+        .member_id = "missing-share-member",
+        .share_session_epoch = 0,
+        .max_wait_ms = 1,
+        .min_bytes = 0,
+        .max_bytes = 1024,
+        .topics = &topics,
+        .forgotten_topics_data = &.{},
+    };
+
+    var buf: [256]u8 = undefined;
+    var pos = buildTestRequest(&buf, 78, 0, 7812, header_mod.requestHeaderVersion(78, 0));
+    req.serialize(&buf, &pos, 0);
+
+    var failing_allocator = OneShotFailingAllocator.init(testing.allocator, 1);
+    const response_allocator = failing_allocator.allocator();
+    broker.allocator = response_allocator;
+
+    const response = broker.handleRequest(buf[0..pos]);
+    broker.allocator = testing.allocator;
+
+    defer if (response) |bytes| response_allocator.free(bytes);
+    try testing.expect(failing_allocator.failed);
+    try testing.expect(response != null);
+    try expectShareFetchErrorResponseBytes(response.?, 7812, ErrorCode.kafka_storage_error);
+}
+
+test "Broker.handleRequest ShareFetch fails closed when serialization fails" {
+    const Req = generated.share_fetch_request.ShareFetchRequest;
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+
+    const req = Req{
+        .group_id = "missing-share-fetch-group",
+        .member_id = "missing-share-member",
+        .share_session_epoch = 0,
+        .max_wait_ms = 1,
+        .min_bytes = 0,
+        .max_bytes = 1024,
+        .topics = &.{},
+        .forgotten_topics_data = &.{},
+    };
+
+    var buf: [256]u8 = undefined;
+    var pos = buildTestRequest(&buf, 78, 0, 7813, header_mod.requestHeaderVersion(78, 0));
+    req.serialize(&buf, &pos, 0);
+
+    var failing_allocator = OneShotFailingAllocator.init(testing.allocator, 0);
+    const response_allocator = failing_allocator.allocator();
+    broker.allocator = response_allocator;
+
+    const response = broker.handleRequest(buf[0..pos]);
+    broker.allocator = testing.allocator;
+
+    defer if (response) |bytes| response_allocator.free(bytes);
+    try testing.expect(failing_allocator.failed);
+    try testing.expect(response != null);
+    try expectShareFetchErrorResponseBytes(response.?, 7813, ErrorCode.kafka_storage_error);
+}
+
 test "Broker.handleRequest ShareAcknowledge advances local share state" {
     const Req = generated.share_acknowledge_request.ShareAcknowledgeRequest;
     const Resp = generated.share_acknowledge_response.ShareAcknowledgeResponse;
@@ -65169,6 +65353,111 @@ test "Broker.handleRequest ShareAcknowledge rejects malformed request" {
     try testing.expectEqual(response.?.len, rpos);
     try testing.expectEqual(ErrorCode.invalid_request.toInt(), resp.error_code);
     try testing.expectEqualStrings("malformed ShareAcknowledge request", resp.error_message.?);
+}
+
+test "Broker.handleRequest ShareAcknowledge fails closed when session snapshot materialization fails" {
+    const Req = generated.share_acknowledge_request.ShareAcknowledgeRequest;
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+
+    const subscriptions = [_][]const u8{};
+    const joined = try broker.groups.joinGroupWithProtocol("share-ack-session-oom-group", "share-member", null, "share", "range", null, &subscriptions);
+    try testing.expectEqual(ErrorCode.none.toInt(), joined.error_code);
+    try testing.expect(broker.markShareGroupStable("share-ack-session-oom-group"));
+    try testing.expectEqual(ErrorCode.none, try broker.updateShareSessionEpoch("share-ack-session-oom-group", "share-member", 0));
+
+    const req = Req{
+        .group_id = "share-ack-session-oom-group",
+        .member_id = "share-member",
+        .share_session_epoch = 1,
+        .topics = &.{},
+    };
+
+    var buf: [256]u8 = undefined;
+    var pos = buildTestRequest(&buf, 79, 0, 7911, header_mod.requestHeaderVersion(79, 0));
+    req.serialize(&buf, &pos, 0);
+
+    var failing_allocator = OneShotFailingAllocator.init(testing.allocator, 0);
+    const response_allocator = failing_allocator.allocator();
+    broker.allocator = response_allocator;
+
+    const response = broker.handleRequest(buf[0..pos]);
+    broker.allocator = testing.allocator;
+
+    defer if (response) |bytes| response_allocator.free(bytes);
+    try testing.expect(failing_allocator.failed);
+    try testing.expect(response != null);
+    try expectShareAcknowledgeErrorResponseBytes(response.?, 7911, ErrorCode.kafka_storage_error);
+
+    const session_key = try broker.shareGroupMemberKey("share-ack-session-oom-group", "share-member");
+    defer testing.allocator.free(session_key);
+    try testing.expectEqual(@as(i32, 0), broker.share_group_sessions.get(session_key).?);
+}
+
+test "Broker.handleRequest ShareAcknowledge fails closed when response materialization fails" {
+    const Req = generated.share_acknowledge_request.ShareAcknowledgeRequest;
+    const AcknowledgeTopic = Req.AcknowledgeTopic;
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+
+    const topics = [_]AcknowledgeTopic{.{
+        .topic_id = [_]u8{0} ** 16,
+        .partitions = &.{},
+    }};
+    const req = Req{
+        .group_id = "missing-share-ack-group",
+        .member_id = "missing-share-member",
+        .share_session_epoch = 0,
+        .topics = &topics,
+    };
+
+    var buf: [256]u8 = undefined;
+    var pos = buildTestRequest(&buf, 79, 0, 7912, header_mod.requestHeaderVersion(79, 0));
+    req.serialize(&buf, &pos, 0);
+
+    var failing_allocator = OneShotFailingAllocator.init(testing.allocator, 1);
+    const response_allocator = failing_allocator.allocator();
+    broker.allocator = response_allocator;
+
+    const response = broker.handleRequest(buf[0..pos]);
+    broker.allocator = testing.allocator;
+
+    defer if (response) |bytes| response_allocator.free(bytes);
+    try testing.expect(failing_allocator.failed);
+    try testing.expect(response != null);
+    try expectShareAcknowledgeErrorResponseBytes(response.?, 7912, ErrorCode.kafka_storage_error);
+}
+
+test "Broker.handleRequest ShareAcknowledge fails closed when serialization fails" {
+    const Req = generated.share_acknowledge_request.ShareAcknowledgeRequest;
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+
+    const req = Req{
+        .group_id = "missing-share-ack-group",
+        .member_id = "missing-share-member",
+        .share_session_epoch = 0,
+        .topics = &.{},
+    };
+
+    var buf: [256]u8 = undefined;
+    var pos = buildTestRequest(&buf, 79, 0, 7913, header_mod.requestHeaderVersion(79, 0));
+    req.serialize(&buf, &pos, 0);
+
+    var failing_allocator = OneShotFailingAllocator.init(testing.allocator, 0);
+    const response_allocator = failing_allocator.allocator();
+    broker.allocator = response_allocator;
+
+    const response = broker.handleRequest(buf[0..pos]);
+    broker.allocator = testing.allocator;
+
+    defer if (response) |bytes| response_allocator.free(bytes);
+    try testing.expect(failing_allocator.failed);
+    try testing.expect(response != null);
+    try expectShareAcknowledgeErrorResponseBytes(response.?, 7913, ErrorCode.kafka_storage_error);
 }
 
 test "Broker share session epoch persists across local restart" {
