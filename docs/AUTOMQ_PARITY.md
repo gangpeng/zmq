@@ -247,8 +247,9 @@ now surfaces malformed DescribeQuorum responses, including trailing response
 bytes, separately from no-leader quorum state, S3 WAL recovery fails closed when
 a listed WAL object is missing during GET and can retry cleanly, malformed
 epoch-prefixed WAL object keys fence S3 writers instead of being skipped, and
-DeleteTopics partition cleanup removes known local partition state without heap
-key formatting.
+AddRaftVoter now rejects empty listener sets so committed voters cannot be
+silently omitted from Raft peer wiring; DeleteTopics partition cleanup removes
+known local partition state without heap key formatting.
 
 ## Capability Matrix
 

@@ -1492,43 +1492,37 @@ pub const Controller = struct {
         };
         defer if (req.listeners.len > 0) self.allocator.free(req.listeners);
 
-        if (req.voter_id < 0) {
+        if (req.voter_id < 0 or req.listeners.len == 0) {
             const resp = Resp{ .throttle_time_ms = 0, .error_code = ErrorCode.invalid_request.toInt(), .error_message = null };
             return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
         }
 
-        var endpoint_views: []RaftState.VoterEndpointView = &.{};
-        if (req.listeners.len > 0) {
-            endpoint_views = self.allocator.alloc(RaftState.VoterEndpointView, req.listeners.len) catch return null;
-            for (req.listeners, 0..) |listener, index| {
-                const name = listener.name orelse {
-                    self.allocator.free(endpoint_views);
-                    const resp = Resp{ .throttle_time_ms = 0, .error_code = ErrorCode.invalid_request.toInt(), .error_message = null };
-                    return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
-                };
-                const host = listener.host orelse {
-                    self.allocator.free(endpoint_views);
-                    const resp = Resp{ .throttle_time_ms = 0, .error_code = ErrorCode.invalid_request.toInt(), .error_message = null };
-                    return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
-                };
-                if (name.len == 0 or host.len == 0 or listener.port == 0) {
-                    self.allocator.free(endpoint_views);
-                    const resp = Resp{ .throttle_time_ms = 0, .error_code = ErrorCode.invalid_request.toInt(), .error_message = null };
-                    return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
-                }
-                endpoint_views[index] = .{
-                    .name = name,
-                    .host = host,
-                    .port = listener.port,
-                };
+        const endpoint_views = self.allocator.alloc(RaftState.VoterEndpointView, req.listeners.len) catch return null;
+        for (req.listeners, 0..) |listener, index| {
+            const name = listener.name orelse {
+                self.allocator.free(endpoint_views);
+                const resp = Resp{ .throttle_time_ms = 0, .error_code = ErrorCode.invalid_request.toInt(), .error_message = null };
+                return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+            };
+            const host = listener.host orelse {
+                self.allocator.free(endpoint_views);
+                const resp = Resp{ .throttle_time_ms = 0, .error_code = ErrorCode.invalid_request.toInt(), .error_message = null };
+                return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+            };
+            if (name.len == 0 or host.len == 0 or listener.port == 0) {
+                self.allocator.free(endpoint_views);
+                const resp = Resp{ .throttle_time_ms = 0, .error_code = ErrorCode.invalid_request.toInt(), .error_message = null };
+                return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
             }
+            endpoint_views[index] = .{
+                .name = name,
+                .host = host,
+                .port = listener.port,
+            };
         }
-        defer if (endpoint_views.len > 0) self.allocator.free(endpoint_views);
+        defer self.allocator.free(endpoint_views);
 
-        const offset = (if (endpoint_views.len > 0)
-            self.raft_state.proposeAddVoterWithMetadata(req.voter_id, req.voter_directory_id, endpoint_views)
-        else
-            self.raft_state.proposeAddVoter(req.voter_id)) catch |err| {
+        const offset = self.raft_state.proposeAddVoterWithMetadata(req.voter_id, req.voter_directory_id, endpoint_views) catch |err| {
             const error_code: i16 = switch (err) {
                 error.NotLeader => ErrorCode.not_controller.toInt(),
                 error.ConfigChangePending => ErrorCode.concurrent_transactions.toInt(),
@@ -3877,9 +3871,21 @@ test "Controller handleRequest AddRaftVoter uses generated key 80" {
     _ = try ctrl.raft_state.startElection();
     ctrl.raft_state.becomeLeader();
 
+    const listeners = [_]Req.Listener{.{
+        .name = "CONTROLLER",
+        .host = "controller-2.example",
+        .port = 29093,
+    }};
+
     var buf: [256]u8 = undefined;
     var pos = buildTestRequest(&buf, 80, 0, 80, header_mod.requestHeaderVersion(80, 0));
-    const req = Req{ .cluster_id = "test-cluster", .timeout_ms = 1000, .voter_id = 2 };
+    const req = Req{
+        .cluster_id = "test-cluster",
+        .timeout_ms = 1000,
+        .voter_id = 2,
+        .voter_directory_id = [_]u8{2} ** 16,
+        .listeners = &listeners,
+    };
     req.serialize(&buf, &pos, 0);
 
     const response = ctrl.handleRequest(buf[0..pos]);
@@ -3894,6 +3900,40 @@ test "Controller handleRequest AddRaftVoter uses generated key 80" {
     const resp = try Resp.deserialize(testing.allocator, response.?, &rpos, 0);
     try testing.expectEqual(ErrorCode.none.toInt(), resp.error_code);
     try testing.expect(ctrl.raft_state.pending_config_change);
+}
+
+test "Controller handleRequest AddRaftVoter rejects empty listeners" {
+    const Req = generated.add_raft_voter_request.AddRaftVoterRequest;
+    const Resp = generated.add_raft_voter_response.AddRaftVoterResponse;
+
+    var ctrl = Controller.init(testing.allocator, 1, "test-cluster");
+    defer ctrl.deinit();
+    try makeTestControllerLeader(&ctrl);
+
+    var buf: [256]u8 = undefined;
+    var pos = buildTestRequest(&buf, 80, 0, 8003, header_mod.requestHeaderVersion(80, 0));
+    const req = Req{
+        .cluster_id = "test-cluster",
+        .timeout_ms = 1000,
+        .voter_id = 2,
+        .voter_directory_id = [_]u8{2} ** 16,
+        .listeners = &.{},
+    };
+    req.serialize(&buf, &pos, 0);
+
+    const response = ctrl.handleRequest(buf[0..pos]);
+    try testing.expect(response != null);
+    defer testing.allocator.free(response.?);
+
+    var rpos: usize = 0;
+    var resp_header = try ResponseHeader.deserialize(testing.allocator, response.?, &rpos, header_mod.responseHeaderVersion(80, 0));
+    defer resp_header.deinit(testing.allocator);
+    try testing.expectEqual(@as(i32, 8003), resp_header.correlation_id);
+
+    const resp = try Resp.deserialize(testing.allocator, response.?, &rpos, 0);
+    try testing.expectEqual(ErrorCode.invalid_request.toInt(), resp.error_code);
+    try testing.expect(!ctrl.raft_state.pending_config_change);
+    try testing.expect(!ctrl.raft_state.voters.contains(2));
 }
 
 test "Controller handleRequest AddRaftVoter persists listener metadata after commit" {
