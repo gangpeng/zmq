@@ -25514,17 +25514,20 @@ pub const Broker = struct {
 
         if (!validateDescribeProducersRequestFrame(request_bytes, body_start)) {
             log.warn("Malformed DescribeProducers request", .{});
-            return null;
+            return self.describeProducersErrorResponse(req_header, resp_header_version, api_version, ErrorCode.invalid_request, "Invalid request");
         }
 
         var pos = body_start;
         var req = Req.deserialize(self.allocator, request_bytes, &pos, api_version) catch |err| {
             log.warn("Failed to decode DescribeProducers request: {}", .{err});
-            return null;
+            return self.describeProducersErrorResponse(req_header, resp_header_version, api_version, ErrorCode.invalid_request, "Invalid request");
         };
         defer self.freeDescribeProducersRequest(&req);
 
-        const topic_responses = self.allocator.alloc(TopicResponse, req.topics.len) catch return null;
+        const topic_responses = self.allocator.alloc(TopicResponse, req.topics.len) catch |err| {
+            log.warn("DescribeProducers topic response allocation failed: {}", .{err});
+            return self.describeProducersErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error, "Failed to materialize DescribeProducers response");
+        };
         var topic_init: usize = 0;
         defer {
             self.freeDescribeProducersTopicResponses(topic_responses[0..topic_init]);
@@ -25534,7 +25537,10 @@ pub const Broker = struct {
         for (req.topics) |topic_req| {
             const topic_name = topic_req.name orelse "";
             const topic_info = self.topics.get(topic_name);
-            const partition_responses = self.allocator.alloc(PartitionResponse, topic_req.partition_indexes.len) catch return null;
+            const partition_responses = self.allocator.alloc(PartitionResponse, topic_req.partition_indexes.len) catch |err| {
+                log.warn("DescribeProducers partition response allocation failed: {}", .{err});
+                return self.describeProducersErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error, "Failed to materialize DescribeProducers response");
+            };
             var partition_init: usize = 0;
             var transferred = false;
             defer {
@@ -25553,10 +25559,12 @@ pub const Broker = struct {
                 else
                     @intFromEnum(ErrorCode.unknown_topic_or_partition);
 
-                const active_producers = if (partition_error == 0)
-                    (self.collectDescribeProducerStates(topic_name, partition_index) catch return null)
-                else
-                    &[_]generated.describe_producers_response.DescribeProducersResponse.TopicResponse.PartitionResponse.ProducerState{};
+                const active_producers = if (partition_error == 0) blk: {
+                    break :blk self.collectDescribeProducerStates(topic_name, partition_index) catch |err| {
+                        log.warn("DescribeProducers producer-state materialization failed: {}", .{err});
+                        return self.describeProducersErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error, "Failed to materialize DescribeProducers response");
+                    };
+                } else &[_]generated.describe_producers_response.DescribeProducersResponse.TopicResponse.PartitionResponse.ProducerState{};
 
                 partition_responses[partition_init] = .{
                     .partition_index = partition_index,
@@ -25579,13 +25587,32 @@ pub const Broker = struct {
             .throttle_time_ms = 0,
             .topics = topic_responses[0..topic_init],
         };
-        const rh = ResponseHeader{ .correlation_id = req_header.correlation_id };
-        const needed = rh.calcSize(resp_header_version) + resp_body.calcSize(api_version);
-        var buf = self.allocator.alloc(u8, needed) catch return null;
-        var wpos: usize = 0;
-        rh.serialize(buf, &wpos, resp_header_version);
-        resp_body.serialize(buf, &wpos, api_version);
-        return (self.allocator.realloc(buf, wpos) catch buf)[0..wpos];
+        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp_body, api_version) orelse {
+            log.warn("DescribeProducers response serialization failed", .{});
+            return self.describeProducersErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error, "Failed to serialize DescribeProducers response");
+        };
+    }
+
+    fn describeProducersErrorResponse(self: *Broker, req_header: *const RequestHeader, resp_header_version: i16, api_version: i16, err_code: ErrorCode, message: ?[]const u8) ?[]u8 {
+        const Resp = generated.describe_producers_response.DescribeProducersResponse;
+        const TopicResponse = Resp.TopicResponse;
+        const PartitionResponse = TopicResponse.PartitionResponse;
+
+        const partitions = [_]PartitionResponse{.{
+            .partition_index = -1,
+            .error_code = @intFromEnum(err_code),
+            .error_message = message,
+            .active_producers = &.{},
+        }};
+        const topics = [_]TopicResponse{.{
+            .name = "",
+            .partitions = &partitions,
+        }};
+        const resp = Resp{
+            .throttle_time_ms = 0,
+            .topics = &topics,
+        };
+        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
     }
 
     fn freeDescribeProducersRequest(self: *Broker, req: *generated.describe_producers_request.DescribeProducersRequest) void {
@@ -28930,6 +28957,38 @@ fn expectDescribeLogDirsErrorResponseBytes(response: []const u8, api_version: i1
     try testing.expectEqual(@as(i16, @intFromEnum(err_code)), resp.results[0].error_code);
     try testing.expect(resp.results[0].log_dir != null);
     try testing.expectEqual(@as(usize, 0), resp.results[0].topics.len);
+}
+
+fn freeDeserializedDescribeProducersResponse(resp: *const generated.describe_producers_response.DescribeProducersResponse) void {
+    for (resp.topics) |topic| {
+        for (topic.partitions) |partition| {
+            if (partition.active_producers.len > 0) testing.allocator.free(partition.active_producers);
+        }
+        if (topic.partitions.len > 0) testing.allocator.free(topic.partitions);
+    }
+    if (resp.topics.len > 0) testing.allocator.free(resp.topics);
+}
+
+fn expectDescribeProducersErrorResponseBytes(response: []const u8, correlation_id: i32, err_code: ErrorCode) !void {
+    const Resp = generated.describe_producers_response.DescribeProducersResponse;
+
+    var rpos: usize = 0;
+    var response_header = try ResponseHeader.deserialize(testing.allocator, response, &rpos, header_mod.responseHeaderVersion(61, 0));
+    defer response_header.deinit(testing.allocator);
+    try testing.expectEqual(correlation_id, response_header.correlation_id);
+
+    const resp = try Resp.deserialize(testing.allocator, response, &rpos, 0);
+    defer freeDeserializedDescribeProducersResponse(&resp);
+
+    try testing.expectEqual(response.len, rpos);
+    try testing.expectEqual(@as(i32, 0), resp.throttle_time_ms);
+    try testing.expectEqual(@as(usize, 1), resp.topics.len);
+    try testing.expectEqualStrings("", resp.topics[0].name.?);
+    try testing.expectEqual(@as(usize, 1), resp.topics[0].partitions.len);
+    try testing.expectEqual(@as(i32, -1), resp.topics[0].partitions[0].partition_index);
+    try testing.expectEqual(@as(i16, @intFromEnum(err_code)), resp.topics[0].partitions[0].error_code);
+    try testing.expect(resp.topics[0].partitions[0].error_message != null);
+    try testing.expectEqual(@as(usize, 0), resp.topics[0].partitions[0].active_producers.len);
 }
 
 fn expectDescribeTransactionsErrorResponseBytes(response: []const u8, correlation_id: i32, err_code: ErrorCode) !void {
@@ -50729,14 +50788,20 @@ test "Broker.handleRequest DescribeProducers rejects truncated request" {
 
     var buf: [128]u8 = undefined;
     const req_len = buildTestRequest(&buf, 61, 0, 6101, header_mod.requestHeaderVersion(61, 0));
-    try testing.expect(broker.handleRequest(buf[0..req_len]) == null);
+    const response = broker.handleRequest(buf[0..req_len]);
+    try testing.expect(response != null);
+    defer testing.allocator.free(response.?);
+    try expectDescribeProducersErrorResponseBytes(response.?, 6101, ErrorCode.invalid_request);
 
     var partial: [128]u8 = undefined;
     var partial_pos = buildTestRequest(&partial, 61, 0, 6103, header_mod.requestHeaderVersion(61, 0));
     ser.writeCompactArrayLen(&partial, &partial_pos, 1);
     ser.writeCompactString(&partial, &partial_pos, "producer-truncated-topic");
     ser.writeCompactArrayLen(&partial, &partial_pos, 1);
-    try testing.expect(broker.handleRequest(partial[0..partial_pos]) == null);
+    const partial_response = broker.handleRequest(partial[0..partial_pos]);
+    try testing.expect(partial_response != null);
+    defer testing.allocator.free(partial_response.?);
+    try expectDescribeProducersErrorResponseBytes(partial_response.?, 6103, ErrorCode.invalid_request);
 }
 
 test "Broker.handleRequest DescribeProducers rejects trailing bytes" {
@@ -50750,7 +50815,44 @@ test "Broker.handleRequest DescribeProducers rejects trailing bytes" {
     var pos = buildTestRequest(&buf, 61, 0, 6104, header_mod.requestHeaderVersion(61, 0));
     req.serialize(&buf, &pos, 0);
 
-    try expectTrailingByteRejected(&broker, buf[0..], pos);
+    try testing.expect(pos < buf.len);
+    buf[pos] = 0x7f;
+    const response = broker.handleRequest(buf[0 .. pos + 1]);
+    try testing.expect(response != null);
+    defer testing.allocator.free(response.?);
+
+    try expectDescribeProducersErrorResponseBytes(response.?, 6104, ErrorCode.invalid_request);
+}
+
+test "Broker.handleRequest DescribeProducers fails closed when response materialization fails" {
+    const Req = generated.describe_producers_request.DescribeProducersRequest;
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+    try broker.authorizer.addSuperUser("test-client");
+
+    const topics = [_]Req.TopicRequest{.{
+        .name = "producer-storage-fail-topic",
+        .partition_indexes = &.{},
+    }};
+    const req = Req{ .topics = &topics };
+
+    var buf: [256]u8 = undefined;
+    var pos = buildTestRequest(&buf, 61, 0, 6105, header_mod.requestHeaderVersion(61, 0));
+    req.serialize(&buf, &pos, 0);
+
+    var failing_allocator = OneShotFailingAllocator.init(testing.allocator, 1);
+    const response_allocator = failing_allocator.allocator();
+    broker.allocator = response_allocator;
+
+    const response = broker.handleRequest(buf[0..pos]);
+    broker.allocator = testing.allocator;
+
+    try testing.expect(failing_allocator.failed);
+    try testing.expect(response != null);
+    defer response_allocator.free(response.?);
+
+    try expectDescribeProducersErrorResponseBytes(response.?, 6105, ErrorCode.kafka_storage_error);
 }
 
 test "Broker.handleRequest DescribeProducers authorization denial uses generated response" {

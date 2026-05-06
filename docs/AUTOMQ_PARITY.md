@@ -291,6 +291,9 @@ instead of silent connection closes;
 DescribeCluster malformed frames now return generated invalid-request responses,
 and response serialization failures now surface storage errors instead of silent
 connection closes;
+DescribeProducers malformed frames now return generated invalid-request
+responses, and producer response materialization failures now surface storage
+errors instead of silent connection closes;
 generated VoteRequest decode now frees partially materialized topic arrays when
 nested allocation fails before handler validation;
 ControllerRegistration, AddRaftVoter, and UpdateRaftVoter endpoint
