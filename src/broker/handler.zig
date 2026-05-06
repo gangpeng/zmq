@@ -8727,6 +8727,20 @@ pub const Broker = struct {
             .producer_id = -1,
             .producer_epoch = -1,
         };
+        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version) orelse {
+            log.warn("InitProducerId denied response serialization failed", .{});
+            return self.initProducerIdErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error);
+        };
+    }
+
+    fn initProducerIdErrorResponse(self: *Broker, req_header: *const RequestHeader, resp_header_version: i16, api_version: i16, err_code: ErrorCode) ?[]u8 {
+        const Resp = generated.init_producer_id_response.InitProducerIdResponse;
+        const resp = Resp{
+            .throttle_time_ms = 0,
+            .error_code = @intFromEnum(err_code),
+            .producer_id = -1,
+            .producer_epoch = -1,
+        };
         return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
     }
 
@@ -8746,18 +8760,21 @@ pub const Broker = struct {
 
         if (!validateAddPartitionsToTxnRequestFrame(request_bytes, body_start, api_version)) {
             log.warn("Malformed denied AddPartitionsToTxn request", .{});
-            return null;
+            return self.addPartitionsToTxnErrorResponse(req_header, resp_header_version, api_version, ErrorCode.invalid_request);
         }
 
         var pos = body_start;
         var req = Req.deserialize(self.allocator, request_bytes, &pos, api_version) catch |err| {
             log.warn("Failed to decode denied AddPartitionsToTxn request: {}", .{err});
-            return null;
+            return self.addPartitionsToTxnErrorResponse(req_header, resp_header_version, api_version, ErrorCode.invalid_request);
         };
         defer self.freeAddPartitionsToTxnRequest(&req);
 
         if (api_version >= 4) {
-            const txn_results = self.allocator.alloc(TxnResult, req.transactions.len) catch return null;
+            const txn_results = self.allocator.alloc(TxnResult, req.transactions.len) catch |err| {
+                log.warn("AddPartitionsToTxn denied transaction response allocation failed: {}", .{err});
+                return self.addPartitionsToTxnErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error);
+            };
             var txn_results_init: usize = 0;
             defer {
                 self.freeAddPartitionsToTxnResults(txn_results[0..txn_results_init]);
@@ -8772,7 +8789,10 @@ pub const Broker = struct {
                     txn_req.verify_only,
                     err_i16,
                     txn_req.topics,
-                ) catch return null;
+                ) catch |err| {
+                    log.warn("AddPartitionsToTxn denied topic response allocation failed: {}", .{err});
+                    return self.addPartitionsToTxnErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error);
+                };
                 var transferred = false;
                 defer {
                     if (!transferred) {
@@ -8794,7 +8814,10 @@ pub const Broker = struct {
                 .error_code = err_i16,
                 .results_by_transaction = txn_results[0..txn_results_init],
             };
-            return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+            return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version) orelse {
+                log.warn("AddPartitionsToTxn denied response serialization failed", .{});
+                return self.addPartitionsToTxnErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error);
+            };
         }
 
         const topic_results = self.buildAddPartitionsToTxnTopicResults(
@@ -8804,7 +8827,10 @@ pub const Broker = struct {
             false,
             err_i16,
             req.v3_and_below_topics,
-        ) catch return null;
+        ) catch |err| {
+            log.warn("AddPartitionsToTxn denied legacy topic response allocation failed: {}", .{err});
+            return self.addPartitionsToTxnErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error);
+        };
         defer {
             self.freeAddPartitionsToTxnTopicResults(topic_results);
             if (topic_results.len > 0) self.allocator.free(topic_results);
@@ -8813,6 +8839,30 @@ pub const Broker = struct {
         const resp = Resp{
             .throttle_time_ms = 0,
             .results_by_topic_v3_and_below = topic_results,
+        };
+        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version) orelse {
+            log.warn("AddPartitionsToTxn denied legacy response serialization failed", .{});
+            return self.addPartitionsToTxnErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error);
+        };
+    }
+
+    fn addPartitionsToTxnErrorResponse(self: *Broker, req_header: *const RequestHeader, resp_header_version: i16, api_version: i16, err_code: ErrorCode) ?[]u8 {
+        const Resp = generated.add_partitions_to_txn_response.AddPartitionsToTxnResponse;
+        const TopicResult = generated.add_partitions_to_txn_response.AddPartitionsToTxnTopicResult;
+        const PartitionResult = generated.add_partitions_to_txn_response.AddPartitionsToTxnPartitionResult;
+        const partition_results = [_]PartitionResult{.{
+            .partition_index = -1,
+            .partition_error_code = @intFromEnum(err_code),
+        }};
+        const topic_results = [_]TopicResult{.{
+            .name = null,
+            .results_by_partition = &partition_results,
+        }};
+        const resp = Resp{
+            .throttle_time_ms = 0,
+            .error_code = @intFromEnum(err_code),
+            .results_by_transaction = &.{},
+            .results_by_topic_v3_and_below = if (api_version <= 3) &topic_results else &.{},
         };
         return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
     }
@@ -8823,10 +8873,34 @@ pub const Broker = struct {
             .throttle_time_ms = 0,
             .error_code = @intFromEnum(err_code),
         };
+        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version) orelse {
+            log.warn("AddOffsetsToTxn denied response serialization failed", .{});
+            return self.addOffsetsToTxnErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error);
+        };
+    }
+
+    fn addOffsetsToTxnErrorResponse(self: *Broker, req_header: *const RequestHeader, resp_header_version: i16, api_version: i16, err_code: ErrorCode) ?[]u8 {
+        const Resp = generated.add_offsets_to_txn_response.AddOffsetsToTxnResponse;
+        const resp = Resp{
+            .throttle_time_ms = 0,
+            .error_code = @intFromEnum(err_code),
+        };
         return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
     }
 
     fn handleEndTxnAuthorizationError(self: *Broker, req_header: *const RequestHeader, api_version: i16, resp_header_version: i16, err_code: ErrorCode) ?[]u8 {
+        const Resp = generated.end_txn_response.EndTxnResponse;
+        const resp = Resp{
+            .throttle_time_ms = 0,
+            .error_code = @intFromEnum(err_code),
+        };
+        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version) orelse {
+            log.warn("EndTxn denied response serialization failed", .{});
+            return self.endTxnErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error);
+        };
+    }
+
+    fn endTxnErrorResponse(self: *Broker, req_header: *const RequestHeader, resp_header_version: i16, api_version: i16, err_code: ErrorCode) ?[]u8 {
         const Resp = generated.end_txn_response.EndTxnResponse;
         const resp = Resp{
             .throttle_time_ms = 0,
@@ -8853,17 +8927,20 @@ pub const Broker = struct {
 
         if (!validateWriteTxnMarkersRequestFrame(request_bytes, body_start, api_version)) {
             log.warn("Malformed denied WriteTxnMarkers request", .{});
-            return null;
+            return self.writeTxnMarkersErrorResponse(req_header, resp_header_version, api_version, ErrorCode.invalid_request);
         }
 
         var pos = body_start;
         var req = Req.deserialize(self.allocator, request_bytes, &pos, api_version) catch |err| {
             log.warn("Failed to decode denied WriteTxnMarkers request: {}", .{err});
-            return null;
+            return self.writeTxnMarkersErrorResponse(req_header, resp_header_version, api_version, ErrorCode.invalid_request);
         };
         defer self.freeWriteTxnMarkersRequest(&req);
 
-        const markers = self.allocator.alloc(MarkerResult, req.markers.len) catch return null;
+        const markers = self.allocator.alloc(MarkerResult, req.markers.len) catch |err| {
+            log.warn("WriteTxnMarkers denied marker response allocation failed: {}", .{err});
+            return self.writeTxnMarkersErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error);
+        };
         var markers_init: usize = 0;
         defer {
             self.freeWriteTxnMarkersResults(markers[0..markers_init]);
@@ -8871,7 +8948,10 @@ pub const Broker = struct {
         }
 
         for (req.markers) |marker| {
-            const topics = self.allocator.alloc(TopicResult, marker.topics.len) catch return null;
+            const topics = self.allocator.alloc(TopicResult, marker.topics.len) catch |err| {
+                log.warn("WriteTxnMarkers denied topic response allocation failed: {}", .{err});
+                return self.writeTxnMarkersErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error);
+            };
             var topics_init: usize = 0;
             var topics_transferred = false;
             defer {
@@ -8882,7 +8962,10 @@ pub const Broker = struct {
             }
 
             for (marker.topics) |topic_req| {
-                const partitions = self.allocator.alloc(PartitionResult, topic_req.partition_indexes.len) catch return null;
+                const partitions = self.allocator.alloc(PartitionResult, topic_req.partition_indexes.len) catch |err| {
+                    log.warn("WriteTxnMarkers denied partition response allocation failed: {}", .{err});
+                    return self.writeTxnMarkersErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error);
+                };
                 var partitions_transferred = false;
                 defer if (!partitions_transferred and partitions.len > 0) self.allocator.free(partitions);
 
@@ -8910,6 +8993,30 @@ pub const Broker = struct {
         }
 
         const resp = Resp{ .markers = markers[0..markers_init] };
+        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version) orelse {
+            log.warn("WriteTxnMarkers denied response serialization failed", .{});
+            return self.writeTxnMarkersErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error);
+        };
+    }
+
+    fn writeTxnMarkersErrorResponse(self: *Broker, req_header: *const RequestHeader, resp_header_version: i16, api_version: i16, err_code: ErrorCode) ?[]u8 {
+        const Resp = generated.write_txn_markers_response.WriteTxnMarkersResponse;
+        const MarkerResult = Resp.WritableTxnMarkerResult;
+        const TopicResult = MarkerResult.WritableTxnMarkerTopicResult;
+        const PartitionResult = TopicResult.WritableTxnMarkerPartitionResult;
+        const partitions = [_]PartitionResult{.{
+            .partition_index = -1,
+            .error_code = @intFromEnum(err_code),
+        }};
+        const topics = [_]TopicResult{.{
+            .name = null,
+            .partitions = &partitions,
+        }};
+        const markers = [_]MarkerResult{.{
+            .producer_id = -1,
+            .topics = &topics,
+        }};
+        const resp = Resp{ .markers = &markers };
         return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
     }
 
@@ -8930,17 +9037,20 @@ pub const Broker = struct {
 
         if (!validateTxnOffsetCommitRequestFrame(request_bytes, body_start, api_version)) {
             log.warn("Malformed denied TxnOffsetCommit request", .{});
-            return null;
+            return self.txnOffsetCommitErrorResponse(req_header, resp_header_version, api_version, ErrorCode.invalid_request);
         }
 
         var pos = body_start;
         var req = Req.deserialize(self.allocator, request_bytes, &pos, api_version) catch |err| {
             log.warn("Failed to decode denied TxnOffsetCommit request: {}", .{err});
-            return null;
+            return self.txnOffsetCommitErrorResponse(req_header, resp_header_version, api_version, ErrorCode.invalid_request);
         };
         defer self.freeTxnOffsetCommitRequest(&req);
 
-        const topics = self.allocator.alloc(TopicResponse, req.topics.len) catch return null;
+        const topics = self.allocator.alloc(TopicResponse, req.topics.len) catch |err| {
+            log.warn("TxnOffsetCommit denied topic response allocation failed: {}", .{err});
+            return self.txnOffsetCommitErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error);
+        };
         var topics_init: usize = 0;
         defer {
             self.freeTxnOffsetCommitTopics(topics[0..topics_init]);
@@ -8948,7 +9058,10 @@ pub const Broker = struct {
         }
 
         for (req.topics) |topic_req| {
-            const partitions = self.allocator.alloc(PartitionResponse, topic_req.partitions.len) catch return null;
+            const partitions = self.allocator.alloc(PartitionResponse, topic_req.partitions.len) catch |err| {
+                log.warn("TxnOffsetCommit denied partition response allocation failed: {}", .{err});
+                return self.txnOffsetCommitErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error);
+            };
             var transferred = false;
             defer {
                 if (!transferred and partitions.len > 0) self.allocator.free(partitions);
@@ -8972,6 +9085,28 @@ pub const Broker = struct {
         const resp = Resp{
             .throttle_time_ms = 0,
             .topics = topics[0..topics_init],
+        };
+        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version) orelse {
+            log.warn("TxnOffsetCommit denied response serialization failed", .{});
+            return self.txnOffsetCommitErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error);
+        };
+    }
+
+    fn txnOffsetCommitErrorResponse(self: *Broker, req_header: *const RequestHeader, resp_header_version: i16, api_version: i16, err_code: ErrorCode) ?[]u8 {
+        const Resp = generated.txn_offset_commit_response.TxnOffsetCommitResponse;
+        const TopicResponse = Resp.TxnOffsetCommitResponseTopic;
+        const PartitionResponse = TopicResponse.TxnOffsetCommitResponsePartition;
+        const partitions = [_]PartitionResponse{.{
+            .partition_index = -1,
+            .error_code = @intFromEnum(err_code),
+        }};
+        const topics = [_]TopicResponse{.{
+            .name = null,
+            .partitions = &partitions,
+        }};
+        const resp = Resp{
+            .throttle_time_ms = 0,
+            .topics = &topics,
         };
         return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
     }
@@ -29904,6 +30039,51 @@ fn readGeneratedTopLevelErrorCode(comptime RespType: type, response: []const u8,
     return resp.error_code;
 }
 
+fn expectWriteTxnMarkersErrorResponseBytes(broker: *Broker, response: []const u8, api_version: i16, correlation_id: i32, err_code: ErrorCode) !void {
+    const Resp = generated.write_txn_markers_response.WriteTxnMarkersResponse;
+
+    var rpos: usize = 0;
+    var response_header = try ResponseHeader.deserialize(testing.allocator, response, &rpos, header_mod.responseHeaderVersion(27, api_version));
+    defer response_header.deinit(testing.allocator);
+    try testing.expectEqual(correlation_id, response_header.correlation_id);
+
+    const resp = try Resp.deserialize(testing.allocator, response, &rpos, api_version);
+    defer {
+        broker.freeWriteTxnMarkersResults(resp.markers);
+        if (resp.markers.len > 0) testing.allocator.free(resp.markers);
+    }
+    try testing.expectEqual(response.len, rpos);
+    try testing.expectEqual(@as(usize, 1), resp.markers.len);
+    try testing.expectEqual(@as(i64, -1), resp.markers[0].producer_id);
+    try testing.expectEqual(@as(usize, 1), resp.markers[0].topics.len);
+    try testing.expect(resp.markers[0].topics[0].name == null);
+    try testing.expectEqual(@as(usize, 1), resp.markers[0].topics[0].partitions.len);
+    try testing.expectEqual(@as(i32, -1), resp.markers[0].topics[0].partitions[0].partition_index);
+    try testing.expectEqual(@as(i16, @intFromEnum(err_code)), resp.markers[0].topics[0].partitions[0].error_code);
+}
+
+fn expectTxnOffsetCommitErrorResponseBytes(broker: *Broker, response: []const u8, api_version: i16, correlation_id: i32, err_code: ErrorCode) !void {
+    const Resp = generated.txn_offset_commit_response.TxnOffsetCommitResponse;
+
+    var rpos: usize = 0;
+    var response_header = try ResponseHeader.deserialize(testing.allocator, response, &rpos, header_mod.responseHeaderVersion(28, api_version));
+    defer response_header.deinit(testing.allocator);
+    try testing.expectEqual(correlation_id, response_header.correlation_id);
+
+    const resp = try Resp.deserialize(testing.allocator, response, &rpos, api_version);
+    defer {
+        broker.freeTxnOffsetCommitTopics(resp.topics);
+        if (resp.topics.len > 0) testing.allocator.free(resp.topics);
+    }
+    try testing.expectEqual(response.len, rpos);
+    try testing.expectEqual(@as(i32, 0), resp.throttle_time_ms);
+    try testing.expectEqual(@as(usize, 1), resp.topics.len);
+    try testing.expect(resp.topics[0].name == null);
+    try testing.expectEqual(@as(usize, 1), resp.topics[0].partitions.len);
+    try testing.expectEqual(@as(i32, -1), resp.topics[0].partitions[0].partition_index);
+    try testing.expectEqual(@as(i16, @intFromEnum(err_code)), resp.topics[0].partitions[0].error_code);
+}
+
 fn freeDeserializedBeginQuorumEpochResponse(resp: *const generated.begin_quorum_epoch_response.BeginQuorumEpochResponse) void {
     for (resp.topics) |topic| {
         if (topic.partitions.len > 0) testing.allocator.free(topic.partitions);
@@ -34944,6 +35124,86 @@ test "Broker.handleRequest WriteTxnMarkers authorization denial uses generated r
     try testing.expectEqual(@as(usize, 0), broker.txn_coordinator.transactionCount());
 }
 
+test "Broker.handleRequest WriteTxnMarkers authorization denial rejects malformed request" {
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+    try broker.authorizer.addAcl("other-client", .transactional_id, "*", .literal, .write, .allow, "*");
+
+    var buf: [128]u8 = undefined;
+    const req_len = buildTestRequest(&buf, 27, 1, 2716, header_mod.requestHeaderVersion(27, 1));
+
+    const response = broker.handleRequest(buf[0..req_len]);
+    try testing.expect(response != null);
+    defer testing.allocator.free(response.?);
+
+    try expectWriteTxnMarkersErrorResponseBytes(&broker, response.?, 1, 2716, ErrorCode.invalid_request);
+}
+
+test "Broker.handleRequest WriteTxnMarkers authorization denial fails closed when response construction fails" {
+    const Req = generated.write_txn_markers_request.WriteTxnMarkersRequest;
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+    try broker.authorizer.addAcl("other-client", .transactional_id, "*", .literal, .write, .allow, "*");
+
+    const partition_indexes = [_]i32{0};
+    const topics = [_]Req.WritableTxnMarker.WritableTxnMarkerTopic{.{
+        .name = "write-markers-auth-denied-oom-topic",
+        .partition_indexes = &partition_indexes,
+    }};
+    const markers = [_]Req.WritableTxnMarker{.{
+        .producer_id = 789,
+        .producer_epoch = 6,
+        .transaction_result = true,
+        .topics = &topics,
+        .coordinator_epoch = 3,
+    }};
+    const req = Req{ .markers = &markers };
+
+    var buf: [512]u8 = undefined;
+    var pos = buildTestRequest(&buf, 27, 1, 2717, header_mod.requestHeaderVersion(27, 1));
+    req.serialize(&buf, &pos, 1);
+
+    var failing_allocator = OneShotFailingAllocator.init(testing.allocator, 3);
+    const response_allocator = failing_allocator.allocator();
+    broker.allocator = response_allocator;
+
+    const response = broker.handleRequest(buf[0..pos]);
+    broker.allocator = testing.allocator;
+
+    try testing.expect(failing_allocator.failed);
+    try testing.expect(response != null);
+    defer response_allocator.free(response.?);
+
+    try expectWriteTxnMarkersErrorResponseBytes(&broker, response.?, 1, 2717, ErrorCode.kafka_storage_error);
+}
+
+test "Broker.handleRequest WriteTxnMarkers authorization denial fails closed when serialization fails" {
+    const Req = generated.write_txn_markers_request.WriteTxnMarkersRequest;
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+    try broker.authorizer.addAcl("other-client", .transactional_id, "*", .literal, .write, .allow, "*");
+
+    const req = Req{ .markers = &.{} };
+    var buf: [128]u8 = undefined;
+    var pos = buildTestRequest(&buf, 27, 1, 2718, header_mod.requestHeaderVersion(27, 1));
+    req.serialize(&buf, &pos, 1);
+
+    var failing_allocator = OneShotFailingAllocator.init(testing.allocator, 0);
+    const response_allocator = failing_allocator.allocator();
+    broker.allocator = response_allocator;
+
+    const response = broker.handleRequest(buf[0..pos]);
+    broker.allocator = testing.allocator;
+
+    try testing.expect(failing_allocator.failed);
+    try testing.expect(response != null);
+    defer response_allocator.free(response.?);
+
+    try expectWriteTxnMarkersErrorResponseBytes(&broker, response.?, 1, 2718, ErrorCode.kafka_storage_error);
+}
+
 test "Broker.handleRequest ListTransactions v1 filters transaction state and producer id" {
     const Req = generated.list_transactions_request.ListTransactionsRequest;
     const Resp = generated.list_transactions_response.ListTransactionsResponse;
@@ -36298,6 +36558,103 @@ test "Broker.handleRequest TxnOffsetCommit authorization denial uses generated r
     try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.transactional_id_authorization_failed)), resp.topics[0].partitions[1].error_code);
     try testing.expectEqual(@as(?i64, null), try broker.groups.fetchOffset("txn-offset-auth-denied-group", "txn-offset-auth-denied-topic", 0));
     try testing.expectEqual(@as(?i64, null), try broker.groups.fetchOffset("txn-offset-auth-denied-group", "txn-offset-auth-denied-topic", 1));
+}
+
+test "Broker.handleRequest TxnOffsetCommit authorization denial rejects malformed request" {
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+    try broker.authorizer.addAcl("other-client", .transactional_id, "*", .literal, .write, .allow, "*");
+
+    var buf: [128]u8 = undefined;
+    const req_len = buildTestRequest(&buf, 28, 3, 2819, header_mod.requestHeaderVersion(28, 3));
+
+    const response = broker.handleRequest(buf[0..req_len]);
+    try testing.expect(response != null);
+    defer testing.allocator.free(response.?);
+
+    try expectTxnOffsetCommitErrorResponseBytes(&broker, response.?, 3, 2819, ErrorCode.invalid_request);
+}
+
+test "Broker.handleRequest TxnOffsetCommit authorization denial fails closed when response construction fails" {
+    const Req = generated.txn_offset_commit_request.TxnOffsetCommitRequest;
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+    try broker.authorizer.addAcl("other-client", .transactional_id, "*", .literal, .write, .allow, "*");
+
+    const partitions = [_]Req.TxnOffsetCommitRequestTopic.TxnOffsetCommitRequestPartition{.{
+        .partition_index = 0,
+        .committed_offset = 100,
+        .committed_leader_epoch = -1,
+        .committed_metadata = "denied-oom",
+    }};
+    const topics = [_]Req.TxnOffsetCommitRequestTopic{.{
+        .name = "txn-offset-auth-denied-oom-topic",
+        .partitions = &partitions,
+    }};
+    const req = Req{
+        .transactional_id = "txn-offset-auth-denied-oom",
+        .group_id = "txn-offset-auth-denied-oom-group",
+        .producer_id = 321,
+        .producer_epoch = 2,
+        .generation_id = -1,
+        .member_id = "",
+        .group_instance_id = null,
+        .topics = &topics,
+    };
+
+    var buf: [1024]u8 = undefined;
+    var pos = buildTestRequest(&buf, 28, 3, 2820, header_mod.requestHeaderVersion(28, 3));
+    req.serialize(&buf, &pos, 3);
+
+    var failing_allocator = OneShotFailingAllocator.init(testing.allocator, 2);
+    const response_allocator = failing_allocator.allocator();
+    broker.allocator = response_allocator;
+
+    const response = broker.handleRequest(buf[0..pos]);
+    broker.allocator = testing.allocator;
+
+    try testing.expect(failing_allocator.failed);
+    try testing.expect(response != null);
+    defer response_allocator.free(response.?);
+
+    try expectTxnOffsetCommitErrorResponseBytes(&broker, response.?, 3, 2820, ErrorCode.kafka_storage_error);
+}
+
+test "Broker.handleRequest TxnOffsetCommit authorization denial fails closed when serialization fails" {
+    const Req = generated.txn_offset_commit_request.TxnOffsetCommitRequest;
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+    try broker.authorizer.addAcl("other-client", .transactional_id, "*", .literal, .write, .allow, "*");
+
+    const req = Req{
+        .transactional_id = "txn-offset-auth-denied-serialize-fail",
+        .group_id = "txn-offset-auth-denied-serialize-fail-group",
+        .producer_id = 321,
+        .producer_epoch = 2,
+        .generation_id = -1,
+        .member_id = "",
+        .group_instance_id = null,
+        .topics = &.{},
+    };
+
+    var buf: [512]u8 = undefined;
+    var pos = buildTestRequest(&buf, 28, 3, 2821, header_mod.requestHeaderVersion(28, 3));
+    req.serialize(&buf, &pos, 3);
+
+    var failing_allocator = OneShotFailingAllocator.init(testing.allocator, 0);
+    const response_allocator = failing_allocator.allocator();
+    broker.allocator = response_allocator;
+
+    const response = broker.handleRequest(buf[0..pos]);
+    broker.allocator = testing.allocator;
+
+    try testing.expect(failing_allocator.failed);
+    try testing.expect(response != null);
+    defer response_allocator.free(response.?);
+
+    try expectTxnOffsetCommitErrorResponseBytes(&broker, response.?, 3, 2821, ErrorCode.kafka_storage_error);
 }
 
 test "Broker.handleRequest DescribeAcls v2 returns generated filtered ACLs" {
@@ -48678,6 +49035,40 @@ test "Broker.handleRequest InitProducerId authorization denial uses generated re
     try testing.expectEqual(@as(usize, 0), broker.txn_coordinator.transactionCount());
 }
 
+test "Broker.handleRequest InitProducerId authorization denial fails closed when serialization fails" {
+    const Req = generated.init_producer_id_request.InitProducerIdRequest;
+    const Resp = generated.init_producer_id_response.InitProducerIdResponse;
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+    try broker.authorizer.addAcl("other-client", .transactional_id, "*", .literal, .write, .allow, "*");
+
+    const req = Req{
+        .transactional_id = "init-auth-denied-serialize-fail",
+        .transaction_timeout_ms = 60000,
+        .producer_id = -1,
+        .producer_epoch = -1,
+    };
+
+    var buf: [512]u8 = undefined;
+    var pos = buildTestRequest(&buf, 22, 4, 2217, header_mod.requestHeaderVersion(22, 4));
+    req.serialize(&buf, &pos, 4);
+
+    var failing_allocator = OneShotFailingAllocator.init(testing.allocator, 0);
+    const response_allocator = failing_allocator.allocator();
+    broker.allocator = response_allocator;
+
+    const response = broker.handleRequest(buf[0..pos]);
+    broker.allocator = testing.allocator;
+
+    try testing.expect(failing_allocator.failed);
+    try testing.expect(response != null);
+    defer response_allocator.free(response.?);
+
+    const error_code = try readGeneratedTopLevelErrorCode(Resp, response.?, 22, 4, 2217);
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.kafka_storage_error)), error_code);
+}
+
 test "Broker.handleRequest AddPartitionsToTxn v4 returns generated response and registers partitions" {
     const Req = generated.add_partitions_to_txn_request.AddPartitionsToTxnRequest;
     const Topic = generated.add_partitions_to_txn_request.AddPartitionsToTxnTopic;
@@ -49255,6 +49646,114 @@ test "Broker.handleRequest AddPartitionsToTxn v3 authorization denial uses gener
     try testing.expectEqual(@as(usize, 0), broker.txn_coordinator.transactionCount());
 }
 
+test "Broker.handleRequest AddPartitionsToTxn authorization denial rejects malformed requests" {
+    const Resp = generated.add_partitions_to_txn_response.AddPartitionsToTxnResponse;
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+    try broker.authorizer.addAcl("other-client", .transactional_id, "*", .literal, .write, .allow, "*");
+
+    {
+        var buf: [128]u8 = undefined;
+        const req_len = buildTestRequest(&buf, 24, 4, 2418, header_mod.requestHeaderVersion(24, 4));
+
+        const response = broker.handleRequest(buf[0..req_len]);
+        try testing.expect(response != null);
+        defer testing.allocator.free(response.?);
+
+        const error_code = try readGeneratedTopLevelErrorCode(Resp, response.?, 24, 4, 2418);
+        try testing.expectEqual(ErrorCode.invalid_request.toInt(), error_code);
+    }
+
+    {
+        var buf: [128]u8 = undefined;
+        const req_len = buildTestRequest(&buf, 24, 3, 2419, header_mod.requestHeaderVersion(24, 3));
+
+        const response = broker.handleRequest(buf[0..req_len]);
+        try testing.expect(response != null);
+        defer testing.allocator.free(response.?);
+
+        var rpos: usize = 0;
+        try expectTestResponseHeader(response.?, 24, 3, 2419, &rpos);
+        const resp = try Resp.deserialize(testing.allocator, response.?, &rpos, 3);
+        defer {
+            broker.freeAddPartitionsToTxnTopicResults(resp.results_by_topic_v3_and_below);
+            if (resp.results_by_topic_v3_and_below.len > 0) testing.allocator.free(resp.results_by_topic_v3_and_below);
+        }
+        try testing.expectEqual(response.?.len, rpos);
+        try testing.expectEqual(@as(usize, 1), resp.results_by_topic_v3_and_below.len);
+        try testing.expect(resp.results_by_topic_v3_and_below[0].name == null);
+        try testing.expectEqual(@as(usize, 1), resp.results_by_topic_v3_and_below[0].results_by_partition.len);
+        try testing.expectEqual(@as(i32, -1), resp.results_by_topic_v3_and_below[0].results_by_partition[0].partition_index);
+        try testing.expectEqual(ErrorCode.invalid_request.toInt(), resp.results_by_topic_v3_and_below[0].results_by_partition[0].partition_error_code);
+    }
+}
+
+test "Broker.handleRequest AddPartitionsToTxn authorization denial fails closed when response construction fails" {
+    const Req = generated.add_partitions_to_txn_request.AddPartitionsToTxnRequest;
+    const Txn = Req.AddPartitionsToTxnTransaction;
+    const Resp = generated.add_partitions_to_txn_response.AddPartitionsToTxnResponse;
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+    try broker.authorizer.addAcl("other-client", .transactional_id, "*", .literal, .write, .allow, "*");
+
+    const txns = [_]Txn{.{
+        .transactional_id = "add-parts-denied-oom",
+        .producer_id = 123,
+        .producer_epoch = 4,
+        .verify_only = false,
+        .topics = &.{},
+    }};
+    const req = Req{ .transactions = &txns };
+
+    var buf: [512]u8 = undefined;
+    var pos = buildTestRequest(&buf, 24, 4, 2420, header_mod.requestHeaderVersion(24, 4));
+    req.serialize(&buf, &pos, 4);
+
+    var failing_allocator = OneShotFailingAllocator.init(testing.allocator, 1);
+    const response_allocator = failing_allocator.allocator();
+    broker.allocator = response_allocator;
+
+    const response = broker.handleRequest(buf[0..pos]);
+    broker.allocator = testing.allocator;
+
+    try testing.expect(failing_allocator.failed);
+    try testing.expect(response != null);
+    defer response_allocator.free(response.?);
+
+    const error_code = try readGeneratedTopLevelErrorCode(Resp, response.?, 24, 4, 2420);
+    try testing.expectEqual(ErrorCode.kafka_storage_error.toInt(), error_code);
+}
+
+test "Broker.handleRequest AddPartitionsToTxn authorization denial fails closed when serialization fails" {
+    const Req = generated.add_partitions_to_txn_request.AddPartitionsToTxnRequest;
+    const Resp = generated.add_partitions_to_txn_response.AddPartitionsToTxnResponse;
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+    try broker.authorizer.addAcl("other-client", .transactional_id, "*", .literal, .write, .allow, "*");
+
+    const req = Req{ .transactions = &.{} };
+    var buf: [128]u8 = undefined;
+    var pos = buildTestRequest(&buf, 24, 4, 2421, header_mod.requestHeaderVersion(24, 4));
+    req.serialize(&buf, &pos, 4);
+
+    var failing_allocator = OneShotFailingAllocator.init(testing.allocator, 0);
+    const response_allocator = failing_allocator.allocator();
+    broker.allocator = response_allocator;
+
+    const response = broker.handleRequest(buf[0..pos]);
+    broker.allocator = testing.allocator;
+
+    try testing.expect(failing_allocator.failed);
+    try testing.expect(response != null);
+    defer response_allocator.free(response.?);
+
+    const error_code = try readGeneratedTopLevelErrorCode(Resp, response.?, 24, 4, 2421);
+    try testing.expectEqual(ErrorCode.kafka_storage_error.toInt(), error_code);
+}
+
 fn handleAddOffsetsToTxnForTest(
     broker: *Broker,
     transactional_id: ?[]const u8,
@@ -49518,6 +50017,40 @@ test "Broker.handleRequest AddOffsetsToTxn authorization denial uses generated r
     const resp = try Resp.deserialize(testing.allocator, response.?, &rpos, 3);
     try testing.expectEqual(response.?.len, rpos);
     try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.transactional_id_authorization_failed)), resp.error_code);
+}
+
+test "Broker.handleRequest AddOffsetsToTxn authorization denial fails closed when serialization fails" {
+    const Req = generated.add_offsets_to_txn_request.AddOffsetsToTxnRequest;
+    const Resp = generated.add_offsets_to_txn_response.AddOffsetsToTxnResponse;
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+    try broker.authorizer.addAcl("other-client", .transactional_id, "*", .literal, .write, .allow, "*");
+
+    const req = Req{
+        .transactional_id = "add-offsets-auth-denied-serialize-fail",
+        .producer_id = 1,
+        .producer_epoch = 0,
+        .group_id = "add-offsets-auth-denied-serialize-fail-group",
+    };
+
+    var buf: [512]u8 = undefined;
+    var pos = buildTestRequest(&buf, 25, 3, 2513, header_mod.requestHeaderVersion(25, 3));
+    req.serialize(&buf, &pos, 3);
+
+    var failing_allocator = OneShotFailingAllocator.init(testing.allocator, 0);
+    const response_allocator = failing_allocator.allocator();
+    broker.allocator = response_allocator;
+
+    const response = broker.handleRequest(buf[0..pos]);
+    broker.allocator = testing.allocator;
+
+    try testing.expect(failing_allocator.failed);
+    try testing.expect(response != null);
+    defer response_allocator.free(response.?);
+
+    const error_code = try readGeneratedTopLevelErrorCode(Resp, response.?, 25, 3, 2513);
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.kafka_storage_error)), error_code);
 }
 
 fn handleEndTxnForTestVersion(
@@ -49998,6 +50531,40 @@ test "Broker.handleRequest EndTxn authorization denial uses generated response" 
     const resp = try Resp.deserialize(testing.allocator, response.?, &rpos, 3);
     try testing.expectEqual(response.?.len, rpos);
     try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.transactional_id_authorization_failed)), resp.error_code);
+}
+
+test "Broker.handleRequest EndTxn authorization denial fails closed when serialization fails" {
+    const Req = generated.end_txn_request.EndTxnRequest;
+    const Resp = generated.end_txn_response.EndTxnResponse;
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+    try broker.authorizer.addAcl("other-client", .transactional_id, "*", .literal, .write, .allow, "*");
+
+    const req = Req{
+        .transactional_id = "end-txn-auth-denied-serialize-fail",
+        .producer_id = 1,
+        .producer_epoch = 0,
+        .committed = true,
+    };
+
+    var buf: [512]u8 = undefined;
+    var pos = buildTestRequest(&buf, 26, 3, 2614, header_mod.requestHeaderVersion(26, 3));
+    req.serialize(&buf, &pos, 3);
+
+    var failing_allocator = OneShotFailingAllocator.init(testing.allocator, 0);
+    const response_allocator = failing_allocator.allocator();
+    broker.allocator = response_allocator;
+
+    const response = broker.handleRequest(buf[0..pos]);
+    broker.allocator = testing.allocator;
+
+    try testing.expect(failing_allocator.failed);
+    try testing.expect(response != null);
+    defer response_allocator.free(response.?);
+
+    const error_code = try readGeneratedTopLevelErrorCode(Resp, response.?, 26, 3, 2614);
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.kafka_storage_error)), error_code);
 }
 
 test "Broker.isVersionSupported" {

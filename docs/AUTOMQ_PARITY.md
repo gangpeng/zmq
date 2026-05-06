@@ -650,6 +650,12 @@ Status: completed for the initial catalog and DeleteGroups slice.
   Vote, BeginQuorumEpoch, and EndQuorumEpoch authorization-denial builders now
   fail closed with generated invalid-request or storage-error responses when
   denied quorum frames or denial response construction fail.
+  Transaction authorization-denial builders now also fail closed: malformed
+  AddPartitionsToTxn, WriteTxnMarkers, and TxnOffsetCommit denied frames return
+  generated invalid-request responses, and InitProducerId,
+  AddPartitionsToTxn, AddOffsetsToTxn, EndTxn, WriteTxnMarkers, and
+  TxnOffsetCommit denial response materialization or serialization failures
+  return generated storage-error responses.
   ListClientMetricsResources now advertises key 74 v0, decodes generated
   flexible requests, rejects malformed frames, returns a default generated
   resource, and lists active client resources for retained telemetry samples.
