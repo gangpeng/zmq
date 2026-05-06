@@ -939,6 +939,67 @@ def wait_for_offset_commit(port, group, topic, expected_offset, timeout=30):
     )
 
 
+def parse_offset_delete_response(response, correlation_id, expected_topic):
+    pos = 0
+    response_correlation, pos = read_i32(response, pos)
+    if response_correlation != correlation_id:
+        raise TestError(f"OffsetDelete correlation mismatch: {response_correlation}")
+    top_error, pos = read_i16(response, pos)
+    _, pos = read_i32(response, pos)  # throttle_time_ms
+    topics, pos = read_i32(response, pos)
+    if topics != 1:
+        raise TestError(f"OffsetDelete topic response count={topics}")
+    topic_name, pos = read_string(response, pos)
+    partitions, pos = read_i32(response, pos)
+    if topic_name != expected_topic or partitions != 1:
+        raise TestError(f"OffsetDelete topic={topic_name!r} partitions={partitions}")
+    partition, pos = read_i32(response, pos)
+    partition_error, pos = read_i16(response, pos)
+    if pos != len(response):
+        raise TestError(f"OffsetDelete response trailing bytes: {len(response) - pos}")
+    if top_error != 0:
+        raise TestError(f"OffsetDelete top-level error_code={top_error}")
+    if partition != 0:
+        raise TestError(
+            f"OffsetDelete partition={partition} error_code={partition_error}"
+        )
+    return partition_error
+
+
+def delete_offset(port, group, topic, correlation_id):
+    body = write_string(group)
+    body += struct.pack(">i", 1)  # topics
+    body += write_string(topic)
+    body += struct.pack(">i", 1)  # partitions
+    body += struct.pack(">i", 0)  # partition_index
+
+    response = controller_request(port, 47, 0, correlation_id, body)
+    error_code = parse_offset_delete_response(response, correlation_id, topic)
+    if error_code != 0:
+        raise TestError(f"OffsetDelete error_code={error_code}")
+
+
+def wait_for_offset_delete(port, group, topic, timeout=30):
+    deadline = time.time() + timeout
+    correlation_id = 6400
+    last_error = None
+    while time.time() < deadline:
+        try:
+            delete_offset(port, group, topic, correlation_id)
+            return wait_for_committed_offset(
+                port,
+                group,
+                topic,
+                -1,
+                timeout=max(1, int(deadline - time.time())),
+            )
+        except Exception as exc:
+            last_error = exc
+        correlation_id += 1
+        time.sleep(0.25)
+    raise TestError(f"OffsetDelete did not remove offset for {group!r}: {last_error}")
+
+
 def parse_init_producer_id_response(response, correlation_id):
     pos = 0
     response_correlation, pos = read_i32(response, pos)
@@ -3383,6 +3444,7 @@ def main():
         wait_for_broker_ready(broker["proc"], broker["port"], broker["log_path"])
         topic = f"kraft-failover-{os.getpid()}-{int(time.time())}"
         group = f"kraft-failover-group-{os.getpid()}-{int(time.time())}"
+        offset_delete_group = f"{group}-offset-delete"
         txn_topic = f"{topic}-txn"
         idempotent_topic = f"{topic}-idempotent"
         expected_payloads = []
@@ -3394,6 +3456,17 @@ def main():
         committed_offset = first_offset + 1
         wait_for_payloads(broker["port"], topic, expected_payloads)
         wait_for_offset_commit(broker["port"], group, topic, committed_offset)
+        offset_delete_group_state = wait_for_group_stable(
+            broker["port"],
+            offset_delete_group,
+        )
+        wait_for_offset_commit(
+            broker["port"],
+            offset_delete_group,
+            topic,
+            committed_offset,
+        )
+        wait_for_offset_delete(broker["port"], offset_delete_group, topic)
         idempotent_transactional_id = f"{group}-idempotent"
         idempotent_identity = wait_for_init_producer_id(
             broker["port"],
@@ -3415,6 +3488,8 @@ def main():
         if network_partition_result is not None:
             leader_id, initial = wait_for_leader(processes)
         wait_for_committed_offset(broker["port"], group, topic, committed_offset)
+        wait_for_committed_offset(broker["port"], offset_delete_group, topic, -1)
+        wait_for_group_heartbeat(broker["port"], offset_delete_group_state)
         wait_for_group_heartbeat(broker["port"], classic_group_state)
 
         stop_process(processes[leader_id]["proc"], crash=True)
@@ -3428,6 +3503,8 @@ def main():
         wait_for_all_alive_to_report(processes, replacement_leader)
         wait_for_payloads(broker["port"], topic, expected_payloads)
         wait_for_committed_offset(broker["port"], group, topic, committed_offset)
+        wait_for_committed_offset(broker["port"], offset_delete_group, topic, -1)
+        wait_for_group_heartbeat(broker["port"], offset_delete_group_state)
         wait_for_transaction_end(broker["port"], controller_failover_txn)
         wait_for_group_heartbeat(broker["port"], classic_group_state)
         expected_payloads.append(b"r1")
@@ -3461,6 +3538,8 @@ def main():
 
         wait_for_payloads(broker["port"], topic, expected_payloads)
         wait_for_committed_offset(broker["port"], group, topic, committed_offset)
+        wait_for_committed_offset(broker["port"], offset_delete_group, topic, -1)
+        wait_for_group_heartbeat(broker["port"], offset_delete_group_state)
         wait_for_group_heartbeat(broker["port"], classic_group_state)
         expected_payloads.append(b"r2")
         third_offset = wait_for_produce(broker["port"], topic, expected_payloads[-1])
@@ -3498,6 +3577,8 @@ def main():
 
         wait_for_payloads(broker["port"], topic, expected_payloads)
         wait_for_committed_offset(broker["port"], group, topic, committed_offset)
+        wait_for_committed_offset(broker["port"], offset_delete_group, topic, -1)
+        wait_for_group_heartbeat(broker["port"], offset_delete_group_state)
         wait_for_group_heartbeat(broker["port"], classic_group_state)
         expected_payloads.append(b"r3")
         fourth_offset = wait_for_produce(
@@ -3543,6 +3624,8 @@ def main():
         wait_for_broker_ready(broker["proc"], broker["port"], broker["log_path"])
         wait_for_payloads(broker["port"], topic, expected_payloads)
         wait_for_committed_offset(broker["port"], group, topic, committed_offset)
+        wait_for_committed_offset(broker["port"], offset_delete_group, topic, -1)
+        wait_for_group_heartbeat(broker["port"], offset_delete_group_state)
         wait_for_transaction_end(broker["port"], broker_restart_txn)
         wait_for_group_heartbeat(broker["port"], classic_group_state)
         duplicate_idempotent = wait_for_record_batch_result(
@@ -3755,6 +3838,13 @@ def self_test():
         fetched = parse_offset_fetch_response(fetch_fixture, 43, "offset-self-test")
         if fetched["offset"] != 7 or fetched["metadata"] != "kraft-failover":
             raise TestError(f"OffsetFetch fixture parser failed: {fetched}")
+
+        delete_fixture = struct.pack(">ihi", 144, 0, 0)
+        delete_fixture += struct.pack(">i", 1)
+        delete_fixture += write_string("offset-delete-self-test")
+        delete_fixture += struct.pack(">iih", 1, 0, 0)
+        if parse_offset_delete_response(delete_fixture, 144, "offset-delete-self-test") != 0:
+            raise TestError("OffsetDelete fixture parser failed")
 
         init_fixture = struct.pack(">iihqh", 44, 0, 0, 1000, 0)
         identity = parse_init_producer_id_response(init_fixture, 44)
