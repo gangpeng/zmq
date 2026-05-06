@@ -23436,17 +23436,20 @@ pub const Broker = struct {
 
         if (!validateOffsetForLeaderEpochRequestFrame(request_bytes, body_start, api_version)) {
             log.warn("Malformed OffsetForLeaderEpoch request", .{});
-            return null;
+            return self.offsetForLeaderEpochErrorResponse(req_header, resp_header_version, api_version, ErrorCode.invalid_request);
         }
 
         var pos = body_start;
         var req = Req.deserialize(self.allocator, request_bytes, &pos, api_version) catch |err| {
             log.warn("Failed to decode OffsetForLeaderEpoch request: {}", .{err});
-            return null;
+            return self.offsetForLeaderEpochErrorResponse(req_header, resp_header_version, api_version, ErrorCode.invalid_request);
         };
         defer self.freeOffsetForLeaderEpochRequest(&req);
 
-        const topics = self.allocator.alloc(TopicResult, req.topics.len) catch return null;
+        const topics = self.allocator.alloc(TopicResult, req.topics.len) catch |err| {
+            log.warn("OffsetForLeaderEpoch topic response allocation failed: {}", .{err});
+            return self.offsetForLeaderEpochErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error);
+        };
         var topics_init: usize = 0;
         defer {
             self.freeOffsetForLeaderEpochTopics(topics[0..topics_init]);
@@ -23454,7 +23457,10 @@ pub const Broker = struct {
         }
 
         for (req.topics) |topic_req| {
-            const partitions = self.allocator.alloc(PartitionResult, topic_req.partitions.len) catch return null;
+            const partitions = self.allocator.alloc(PartitionResult, topic_req.partitions.len) catch |err| {
+                log.warn("OffsetForLeaderEpoch partition response allocation failed: {}", .{err});
+                return self.offsetForLeaderEpochErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error);
+            };
             var transferred = false;
             defer {
                 if (!transferred and partitions.len > 0) self.allocator.free(partitions);
@@ -23476,6 +23482,26 @@ pub const Broker = struct {
         const resp = Resp{
             .throttle_time_ms = 0,
             .topics = topics[0..topics_init],
+        };
+        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+    }
+
+    fn offsetForLeaderEpochErrorResponse(self: *Broker, req_header: *const RequestHeader, resp_header_version: i16, api_version: i16, err_code: ErrorCode) ?[]u8 {
+        const Resp = generated.offset_for_leader_epoch_response.OffsetForLeaderEpochResponse;
+
+        const partitions = [_]Resp.OffsetForLeaderTopicResult.EpochEndOffset{.{
+            .error_code = @intFromEnum(err_code),
+            .partition = -1,
+            .leader_epoch = -1,
+            .end_offset = -1,
+        }};
+        const topics = [_]Resp.OffsetForLeaderTopicResult{.{
+            .topic = "",
+            .partitions = &partitions,
+        }};
+        const resp = Resp{
+            .throttle_time_ms = 0,
+            .topics = &topics,
         };
         return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
     }
@@ -29039,6 +29065,33 @@ fn expectFindCoordinatorErrorResponseBytes(response: []const u8, api_version: i1
     }
 }
 
+fn expectOffsetForLeaderEpochErrorResponseBytes(response: []const u8, api_version: i16, correlation_id: i32, err_code: ErrorCode) !void {
+    const Resp = generated.offset_for_leader_epoch_response.OffsetForLeaderEpochResponse;
+
+    var rpos: usize = 0;
+    var response_header = try ResponseHeader.deserialize(testing.allocator, response, &rpos, header_mod.responseHeaderVersion(23, api_version));
+    defer response_header.deinit(testing.allocator);
+    try testing.expectEqual(correlation_id, response_header.correlation_id);
+
+    const resp = try Resp.deserialize(testing.allocator, response, &rpos, api_version);
+    defer {
+        for (resp.topics) |topic| {
+            if (topic.partitions.len > 0) testing.allocator.free(topic.partitions);
+        }
+        if (resp.topics.len > 0) testing.allocator.free(resp.topics);
+    }
+
+    try testing.expectEqual(response.len, rpos);
+    try testing.expectEqual(@as(i32, 0), resp.throttle_time_ms);
+    try testing.expectEqual(@as(usize, 1), resp.topics.len);
+    try testing.expectEqualStrings("", resp.topics[0].topic.?);
+    try testing.expectEqual(@as(usize, 1), resp.topics[0].partitions.len);
+    try testing.expectEqual(@as(i16, @intFromEnum(err_code)), resp.topics[0].partitions[0].error_code);
+    try testing.expectEqual(@as(i32, -1), resp.topics[0].partitions[0].partition);
+    try testing.expectEqual(@as(i32, -1), resp.topics[0].partitions[0].leader_epoch);
+    try testing.expectEqual(@as(i64, -1), resp.topics[0].partitions[0].end_offset);
+}
+
 fn freeDeserializedProduceResponse(resp: *const generated.produce_response.ProduceResponse) void {
     for (resp.responses) |topic| {
         for (topic.partition_responses) |partition| {
@@ -33062,7 +33115,11 @@ test "Broker.handleRequest OffsetForLeaderEpoch rejects truncated request" {
 
     var buf: [128]u8 = undefined;
     const req_len = buildTestRequest(&buf, 23, 4, 2305, header_mod.requestHeaderVersion(23, 4));
-    try testing.expect(broker.handleRequest(buf[0..req_len]) == null);
+    const response = broker.handleRequest(buf[0..req_len]);
+    try testing.expect(response != null);
+    defer testing.allocator.free(response.?);
+
+    try expectOffsetForLeaderEpochErrorResponseBytes(response.?, 4, 2305, ErrorCode.invalid_request);
 }
 
 test "Broker.handleRequest OffsetForLeaderEpoch rejects trailing bytes" {
@@ -33076,7 +33133,53 @@ test "Broker.handleRequest OffsetForLeaderEpoch rejects trailing bytes" {
     var pos = buildTestRequest(&buf, 23, 4, 2307, header_mod.requestHeaderVersion(23, 4));
     req.serialize(&buf, &pos, 4);
 
-    try expectTrailingByteRejected(&broker, buf[0..], pos);
+    try testing.expect(pos < buf.len);
+    buf[pos] = 0x7f;
+    const response = broker.handleRequest(buf[0 .. pos + 1]);
+    try testing.expect(response != null);
+    defer testing.allocator.free(response.?);
+
+    try expectOffsetForLeaderEpochErrorResponseBytes(response.?, 4, 2307, ErrorCode.invalid_request);
+}
+
+test "Broker.handleRequest OffsetForLeaderEpoch fails closed when topic response allocation fails" {
+    const Req = generated.offset_for_leader_epoch_request.OffsetForLeaderEpochRequest;
+    const Topic = Req.OffsetForLeaderTopic;
+    const Partition = Topic.OffsetForLeaderPartition;
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+
+    const partitions = [_]Partition{.{
+        .partition = 0,
+        .current_leader_epoch = -1,
+        .leader_epoch = 0,
+    }};
+    const topics = [_]Topic{.{
+        .topic = "leader-epoch-storage-fail-topic",
+        .partitions = &partitions,
+    }};
+    const req = Req{
+        .replica_id = -1,
+        .topics = &topics,
+    };
+
+    var buf: [512]u8 = undefined;
+    var pos = buildTestRequest(&buf, 23, 4, 2308, header_mod.requestHeaderVersion(23, 4));
+    req.serialize(&buf, &pos, 4);
+
+    var failing_allocator = OneShotFailingAllocator.init(testing.allocator, 2);
+    const response_allocator = failing_allocator.allocator();
+    broker.allocator = response_allocator;
+
+    const response = broker.handleRequest(buf[0..pos]);
+    broker.allocator = testing.allocator;
+
+    try testing.expect(failing_allocator.failed);
+    try testing.expect(response != null);
+    defer response_allocator.free(response.?);
+
+    try expectOffsetForLeaderEpochErrorResponseBytes(response.?, 4, 2308, ErrorCode.kafka_storage_error);
 }
 
 test "Broker.handleRequest OffsetForLeaderEpoch authorization denial uses generated response" {

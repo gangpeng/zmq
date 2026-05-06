@@ -273,6 +273,9 @@ or selected-mechanism session storage allocation fails;
 Metadata and FindCoordinator malformed frames now return generated
 invalid-request responses, and response materialization allocation failures now
 surface storage errors instead of silent connection closes;
+OffsetForLeaderEpoch malformed frames now return generated invalid-request
+responses, and response topic/partition allocation failures now surface storage
+errors instead of silent connection closes;
 generated VoteRequest decode now frees partially materialized topic arrays when
 nested allocation fails before handler validation;
 ControllerRegistration, AddRaftVoter, and UpdateRaftVoter endpoint
