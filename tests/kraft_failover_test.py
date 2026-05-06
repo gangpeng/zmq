@@ -59,6 +59,22 @@ ACL_PATTERN_TYPE_LITERAL = 3
 ACL_OPERATION_ALL = 2
 ACL_OPERATION_DESCRIBE = 8
 ACL_PERMISSION_ALLOW = 3
+CONTROLLER_API_VERSIONS = {
+    18: (0, 4),
+    52: (0, 1),
+    53: (0, 1),
+    54: (0, 1),
+    55: (0, 2),
+    59: (0, 1),
+    62: (0, 2),
+    63: (0, 1),
+    64: (0, 0),
+    67: (0, 0),
+    70: (0, 0),
+    80: (0, 0),
+    81: (0, 0),
+    82: (0, 0),
+}
 
 
 class TestError(Exception):
@@ -1470,6 +1486,49 @@ def api_versions_v3(port, correlation_id):
     body += b"\x00"  # request tagged fields
     response = flexible_kafka_request(port, 18, 3, correlation_id, body)
     return parse_api_versions_features_response(response, correlation_id)
+
+
+def require_controller_api_versions(response):
+    if response["throttle_time_ms"] != 0 or response["error_code"] != ERROR_NONE:
+        raise TestError(f"Controller ApiVersions top-level mismatch: {response}")
+    actual = {
+        item["api_key"]: (item["min_version"], item["max_version"])
+        for item in response["apis"]
+    }
+    if actual != CONTROLLER_API_VERSIONS:
+        raise TestError(
+            f"Controller ApiVersions mismatch: expected={CONTROLLER_API_VERSIONS} "
+            f"actual={actual}"
+        )
+    for unexpected in (71, 72):
+        if unexpected in actual:
+            raise TestError(
+                f"Controller ApiVersions advertised telemetry key {unexpected}"
+            )
+
+
+def wait_for_controller_api_versions_checkpoint(
+    port,
+    state,
+    label,
+    timeout=30,
+):
+    deadline = time.time() + timeout
+    correlation_id = state.get("correlation_id", 9340)
+    last_error = None
+    while time.time() < deadline:
+        try:
+            response = api_versions_v3(port, correlation_id)
+            require_controller_api_versions(response)
+            state["correlation_id"] = correlation_id + 1
+            return response
+        except Exception as exc:
+            last_error = exc
+        correlation_id += 1
+        time.sleep(0.25)
+    raise TestError(
+        f"Controller ApiVersions did not recover during {label}: {last_error}"
+    )
 
 
 def require_finalized_feature_visible(response, feature, max_version_level):
@@ -10465,6 +10524,12 @@ def main():
             raise TestError(f"discovered leader {leader_id}, expected one of {sorted(processes)}")
         if sorted(initial["voters"]) != [0, 1, 2]:
             raise TestError(f"unexpected voter set from DescribeQuorum: {initial['voters']}")
+        controller_api_versions_state = {"correlation_id": 9340}
+        wait_for_controller_api_versions_checkpoint(
+            processes[leader_id]["port"],
+            controller_api_versions_state,
+            "initial leader",
+        )
         describe_quorum_state = {"correlation_id": 9140}
         wait_for_describe_quorum_v2_checkpoint(
             processes[leader_id]["port"],
@@ -11091,6 +11156,11 @@ def main():
         )
         if network_partition_result is not None:
             leader_id, initial = wait_for_leader(processes)
+            wait_for_controller_api_versions_checkpoint(
+                processes[leader_id]["port"],
+                controller_api_versions_state,
+                "network partition matrix",
+            )
             wait_for_describe_quorum_v2_checkpoint(
                 processes[leader_id]["port"],
                 ports,
@@ -11224,6 +11294,11 @@ def main():
             raise TestError(f"leader epoch did not advance: before={initial} after={after}")
 
         wait_for_all_alive_to_report(processes, replacement_leader)
+        wait_for_controller_api_versions_checkpoint(
+            processes[replacement_leader]["port"],
+            controller_api_versions_state,
+            "controller leader failover",
+        )
         wait_for_describe_quorum_v2_checkpoint(
             processes[replacement_leader]["port"],
             ports,
@@ -11393,6 +11468,11 @@ def main():
                 f"restarted old leader {leader_id} did not rejoin leader "
                 f"{replacement_leader}: {rejoined_quorum}"
             )
+        wait_for_controller_api_versions_checkpoint(
+            processes[replacement_leader]["port"],
+            controller_api_versions_state,
+            "old leader fresh rejoin",
+        )
         wait_for_describe_quorum_v2_checkpoint(
             processes[replacement_leader]["port"],
             ports,
@@ -11559,6 +11639,11 @@ def main():
                 f"restarted controller {restart_controller_id} did not rejoin leader "
                 f"{replacement_leader}: {restarted_quorum}"
             )
+        wait_for_controller_api_versions_checkpoint(
+            processes[replacement_leader]["port"],
+            controller_api_versions_state,
+            "surviving controller restart",
+        )
         wait_for_describe_quorum_v2_checkpoint(
             processes[replacement_leader]["port"],
             ports,
@@ -11712,6 +11797,11 @@ def main():
         stop_process(broker["proc"])
         broker = start_broker(tmp, voters)
         wait_for_broker_ready(broker["proc"], broker["port"], broker["log_path"])
+        wait_for_controller_api_versions_checkpoint(
+            processes[replacement_leader]["port"],
+            controller_api_versions_state,
+            "broker restart",
+        )
         wait_for_describe_quorum_v2_checkpoint(
             processes[replacement_leader]["port"],
             ports,
@@ -11993,6 +12083,7 @@ def main():
             f"allocate_producer_ids_checked=true, "
             f"describe_quorum_v2_checked=true, "
             f"fetch_snapshot_v1_checked=true, "
+            f"controller_api_versions_checked=true, "
             f"committed_offset={committed_offset}, "
             f"transactions_checked=5, "
             f"transaction_introspection_checked=true, "
@@ -12612,6 +12703,25 @@ def self_test():
             api_versions_v3_fixture, 177
         )
         require_finalized_feature_visible(api_versions_v3, "metadata.version", 1)
+
+        controller_api_versions_fixture = struct.pack(">i", 187)
+        controller_api_versions_fixture += struct.pack(">h", ERROR_NONE)
+        controller_api_versions_fixture += write_compact_array_len(
+            len(CONTROLLER_API_VERSIONS)
+        )
+        for api_key, versions in sorted(CONTROLLER_API_VERSIONS.items()):
+            min_version, max_version = versions
+            controller_api_versions_fixture += struct.pack(
+                ">hhh", api_key, min_version, max_version
+            )
+            controller_api_versions_fixture += b"\x00"  # ApiVersion tagged fields
+        controller_api_versions_fixture += struct.pack(">i", 0)
+        controller_api_versions_fixture += b"\x00"  # response tagged fields
+        controller_api_versions = parse_api_versions_features_response(
+            controller_api_versions_fixture,
+            187,
+        )
+        require_controller_api_versions(controller_api_versions)
 
         acl_fixture = {
             "resource_type": ACL_RESOURCE_TYPE_TOPIC,
