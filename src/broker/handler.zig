@@ -14368,13 +14368,13 @@ pub const Broker = struct {
 
         if (!validateHeartbeatRequestFrame(request_bytes, body_start, api_version)) {
             log.warn("Malformed Heartbeat request", .{});
-            return null;
+            return self.heartbeatErrorResponse(req_header, resp_header_version, api_version, ErrorCode.invalid_request);
         }
 
         var pos = body_start;
         const req = Req.deserialize(self.allocator, request_bytes, &pos, api_version) catch |err| {
             log.warn("Failed to decode Heartbeat request: {}", .{err});
-            return null;
+            return self.heartbeatErrorResponse(req_header, resp_header_version, api_version, ErrorCode.invalid_request);
         };
 
         const error_code = self.groups.heartbeatWithInstanceId(req.group_id orelse "", req.member_id orelse "", nonEmptyStringOrNull(req.group_instance_id), req.generation_id);
@@ -14383,7 +14383,10 @@ pub const Broker = struct {
             .throttle_time_ms = 0,
             .error_code = error_code,
         };
-        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version) orelse {
+            log.warn("Heartbeat response serialization failed", .{});
+            return self.heartbeatErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error);
+        };
     }
 
     // ---------------------------------------------------------------
@@ -18727,17 +18730,20 @@ pub const Broker = struct {
 
         if (!validateListGroupsRequestFrame(request_bytes, body_start, api_version)) {
             log.warn("Malformed ListGroups request", .{});
-            return null;
+            return self.listGroupsErrorResponse(req_header, resp_header_version, api_version, ErrorCode.invalid_request);
         }
 
         var pos = body_start;
         var req = Req.deserialize(self.allocator, request_bytes, &pos, api_version) catch |err| {
             log.warn("Failed to decode ListGroups request: {}", .{err});
-            return null;
+            return self.listGroupsErrorResponse(req_header, resp_header_version, api_version, ErrorCode.invalid_request);
         };
         defer self.freeListGroupsRequest(&req);
 
-        const listed_groups = self.collectListedGroups(req) catch return null;
+        const listed_groups = self.collectListedGroups(req) catch |err| {
+            log.warn("ListGroups response materialization failed: {}", .{err});
+            return self.listGroupsErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error);
+        };
         defer if (listed_groups.len > 0) self.allocator.free(listed_groups);
 
         const resp = Resp{
@@ -18745,7 +18751,10 @@ pub const Broker = struct {
             .error_code = @intFromEnum(ErrorCode.none),
             .groups = listed_groups,
         };
-        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version) orelse {
+            log.warn("ListGroups response serialization failed", .{});
+            return self.listGroupsErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error);
+        };
     }
 
     fn freeListGroupsRequest(self: *Broker, req: *generated.list_groups_request.ListGroupsRequest) void {
@@ -35995,16 +36004,24 @@ test "Broker.handleRequest ListGroups v5 applies group type filters" {
 }
 
 test "Broker.handleRequest ListGroups rejects truncated request" {
+    const Resp = generated.list_groups_response.ListGroupsResponse;
+
     var broker = Broker.init(testing.allocator, 1, 9092);
     defer broker.deinit();
 
     var buf: [128]u8 = undefined;
     const req_len = buildTestRequest(&buf, 16, 4, 1606, header_mod.requestHeaderVersion(16, 4));
-    try testing.expect(broker.handleRequest(buf[0..req_len]) == null);
+    const response = broker.handleRequest(buf[0..req_len]);
+    try testing.expect(response != null);
+    defer testing.allocator.free(response.?);
+
+    const error_code = try readGeneratedTopLevelErrorCode(Resp, response.?, 16, 4, 1606);
+    try testing.expectEqual(ErrorCode.invalid_request.toInt(), error_code);
 }
 
 test "Broker.handleRequest ListGroups rejects trailing bytes" {
     const Req = generated.list_groups_request.ListGroupsRequest;
+    const Resp = generated.list_groups_response.ListGroupsResponse;
 
     var broker = Broker.init(testing.allocator, 1, 9092);
     defer broker.deinit();
@@ -36020,7 +36037,71 @@ test "Broker.handleRequest ListGroups rejects trailing bytes" {
     var pos = buildTestRequest(&buf, 16, 5, 1610, header_mod.requestHeaderVersion(16, 5));
     req.serialize(&buf, &pos, 5);
 
-    try expectTrailingByteRejected(&broker, &buf, pos);
+    try testing.expect(pos < buf.len);
+    buf[pos] = 0x7f;
+    const response = broker.handleRequest(buf[0 .. pos + 1]);
+    try testing.expect(response != null);
+    defer testing.allocator.free(response.?);
+
+    const error_code = try readGeneratedTopLevelErrorCode(Resp, response.?, 16, 5, 1610);
+    try testing.expectEqual(ErrorCode.invalid_request.toInt(), error_code);
+}
+
+test "Broker.handleRequest ListGroups fails closed when response materialization fails" {
+    const Req = generated.list_groups_request.ListGroupsRequest;
+    const Resp = generated.list_groups_response.ListGroupsResponse;
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+    _ = try broker.groups.joinGroup("list-groups-materialize-fail", null, "consumer", null);
+
+    const req = Req{};
+
+    var buf: [128]u8 = undefined;
+    var pos = buildTestRequest(&buf, 16, 5, 1611, header_mod.requestHeaderVersion(16, 5));
+    req.serialize(&buf, &pos, 5);
+
+    var failing_allocator = OneShotFailingAllocator.init(testing.allocator, 0);
+    const response_allocator = failing_allocator.allocator();
+    broker.allocator = response_allocator;
+
+    const response = broker.handleRequest(buf[0..pos]);
+    broker.allocator = testing.allocator;
+
+    try testing.expect(failing_allocator.failed);
+    try testing.expect(response != null);
+    defer response_allocator.free(response.?);
+
+    const error_code = try readGeneratedTopLevelErrorCode(Resp, response.?, 16, 5, 1611);
+    try testing.expectEqual(ErrorCode.kafka_storage_error.toInt(), error_code);
+}
+
+test "Broker.handleRequest ListGroups fails closed when response serialization fails" {
+    const Req = generated.list_groups_request.ListGroupsRequest;
+    const Resp = generated.list_groups_response.ListGroupsResponse;
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+
+    const req = Req{};
+
+    var buf: [128]u8 = undefined;
+    var pos = buildTestRequest(&buf, 16, 5, 1612, header_mod.requestHeaderVersion(16, 5));
+    req.serialize(&buf, &pos, 5);
+
+    var failing_allocator = OneShotFailingAllocator.init(testing.allocator, 0);
+    const response_allocator = failing_allocator.allocator();
+    broker.allocator = response_allocator;
+
+    const response = broker.handleRequest(buf[0..pos]);
+    broker.allocator = testing.allocator;
+
+    try testing.expect(failing_allocator.failed);
+    try testing.expect(response != null);
+    defer response_allocator.free(response.?);
+
+    const error_code = try readGeneratedTopLevelErrorCode(Resp, response.?, 16, 5, 1612);
+    try testing.expectEqual(ErrorCode.kafka_storage_error.toInt(), error_code);
 }
 
 test "Broker.handleRequest ListGroups authorization denial uses generated response" {
@@ -67984,16 +68065,24 @@ test "Broker.handleRequest Heartbeat v4 fences mismatched static instance id" {
 }
 
 test "Broker.handleRequest Heartbeat rejects truncated request" {
+    const Resp = generated.heartbeat_response.HeartbeatResponse;
+
     var broker = Broker.init(testing.allocator, 1, 9092);
     defer broker.deinit();
 
     var buf: [128]u8 = undefined;
     const req_len = buildTestRequest(&buf, 12, 4, 1206, header_mod.requestHeaderVersion(12, 4));
-    try testing.expect(broker.handleRequest(buf[0..req_len]) == null);
+    const response = broker.handleRequest(buf[0..req_len]);
+    try testing.expect(response != null);
+    defer testing.allocator.free(response.?);
+
+    const error_code = try readGeneratedTopLevelErrorCode(Resp, response.?, 12, 4, 1206);
+    try testing.expectEqual(ErrorCode.invalid_request.toInt(), error_code);
 }
 
 test "Broker.handleRequest Heartbeat rejects trailing bytes" {
     const Req = generated.heartbeat_request.HeartbeatRequest;
+    const Resp = generated.heartbeat_response.HeartbeatResponse;
 
     var broker = Broker.init(testing.allocator, 1, 9092);
     defer broker.deinit();
@@ -68009,7 +68098,47 @@ test "Broker.handleRequest Heartbeat rejects trailing bytes" {
     var pos = buildTestRequest(&buf, 12, 4, 1209, header_mod.requestHeaderVersion(12, 4));
     req.serialize(&buf, &pos, 4);
 
-    try expectTrailingByteRejected(&broker, &buf, pos);
+    try testing.expect(pos < buf.len);
+    buf[pos] = 0x7f;
+    const response = broker.handleRequest(buf[0 .. pos + 1]);
+    try testing.expect(response != null);
+    defer testing.allocator.free(response.?);
+
+    const error_code = try readGeneratedTopLevelErrorCode(Resp, response.?, 12, 4, 1209);
+    try testing.expectEqual(ErrorCode.invalid_request.toInt(), error_code);
+}
+
+test "Broker.handleRequest Heartbeat fails closed when response serialization fails" {
+    const Req = generated.heartbeat_request.HeartbeatRequest;
+    const Resp = generated.heartbeat_response.HeartbeatResponse;
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+
+    const req = Req{
+        .group_id = "hb-serialize-fail-group",
+        .generation_id = 1,
+        .member_id = "hb-serialize-fail-member",
+        .group_instance_id = null,
+    };
+
+    var buf: [512]u8 = undefined;
+    var pos = buildTestRequest(&buf, 12, 4, 1210, header_mod.requestHeaderVersion(12, 4));
+    req.serialize(&buf, &pos, 4);
+
+    var failing_allocator = OneShotFailingAllocator.init(testing.allocator, 0);
+    const response_allocator = failing_allocator.allocator();
+    broker.allocator = response_allocator;
+
+    const response = broker.handleRequest(buf[0..pos]);
+    broker.allocator = testing.allocator;
+
+    try testing.expect(failing_allocator.failed);
+    try testing.expect(response != null);
+    defer response_allocator.free(response.?);
+
+    const error_code = try readGeneratedTopLevelErrorCode(Resp, response.?, 12, 4, 1210);
+    try testing.expectEqual(ErrorCode.kafka_storage_error.toInt(), error_code);
 }
 
 test "Broker.handleRequest Heartbeat v4 authorization denial uses generated response" {
