@@ -11206,7 +11206,15 @@ pub const Broker = struct {
             .throttle_time_ms = 0,
             .trim_stream_responses = &.{},
         };
-        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version) orelse {
+            log.warn("TrimStreams error response serialization failed", .{});
+            const storage_resp = Resp{
+                .error_code = ErrorCode.kafka_storage_error.toInt(),
+                .throttle_time_ms = 0,
+                .trim_stream_responses = &.{},
+            };
+            return self.serializeGeneratedResponse(req_header, resp_header_version, &storage_resp, api_version);
+        };
     }
 
     fn handlePrepareS3ObjectAuthorizationError(
@@ -22828,21 +22836,31 @@ pub const Broker = struct {
             responses[i] = .{ .error_code = 0 };
             mutated = true;
         }
+        const resp = Resp{ .error_code = 0, .throttle_time_ms = 0, .trim_stream_responses = responses };
+        const success_response = self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version) orelse {
+            log.warn("TrimStreams response serialization failed before durable mutation", .{});
+            if (mutated) {
+                if (previous_snapshot) |snapshot| self.restoreObjectManagerLocalSnapshot(snapshot);
+            }
+            return self.trimStreamsErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error);
+        };
         if (mutated) {
             self.persistObjectManagerMutationDurably() catch |err| {
                 const err_code = autoMqQuorumErrorCode(err);
+                self.allocator.free(success_response);
                 if (previous_snapshot) |snapshot| self.restoreObjectManagerLocalSnapshot(snapshot);
                 for (responses) |*response| {
                     if (response.error_code == 0) response.error_code = err_code;
                 }
+                const err_resp = Resp{ .error_code = 0, .throttle_time_ms = 0, .trim_stream_responses = responses };
+                return self.serializeGeneratedResponse(req_header, resp_header_version, &err_resp, api_version) orelse {
+                    log.warn("TrimStreams persistence-error response serialization failed", .{});
+                    return self.trimStreamsErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error);
+                };
             };
         }
 
-        const resp = Resp{ .error_code = 0, .throttle_time_ms = 0, .trim_stream_responses = responses };
-        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version) orelse {
-            log.warn("TrimStreams response serialization failed", .{});
-            return self.trimStreamsErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error);
-        };
+        return success_response;
     }
 
     fn handleAutomqRegisterNode(self: *Broker, request_bytes: []const u8, body_start: usize, req_header: *const RequestHeader, api_version: i16, resp_header_version: i16) ?[]u8 {
@@ -53642,6 +53660,37 @@ test "Broker.handleRequest AutomqUpdateGroup does not mutate when success serial
         try expectAutoMqMutationErrorWithFailingAllocator(&broker, buf[0..pos], 602, 0, 6034, 0, ErrorCode.kafka_storage_error);
         try testing.expectEqualStrings("old-link", broker.auto_mq_group_promotions.get("group-demote-response-fail").?.link_id);
     }
+}
+
+test "Broker.handleRequest TrimStreams restores stream when success serialization fails" {
+    const Req = generated.trim_streams_request.TrimStreamsRequest;
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+    const stream = try broker.object_manager.createStream(1);
+    const stream_id = stream.stream_id;
+    broker.object_manager.getStream(stream_id).?.advanceEndOffset(10);
+
+    const items = [_]Req.TrimStreamRequest{.{ .stream_id = @intCast(stream_id), .stream_epoch = 1, .new_start_offset = 5 }};
+    const req = Req{ .node_id = 1, .node_epoch = 1, .trim_stream_requests = &items };
+    var buf: [256]u8 = undefined;
+    var pos = buildTestRequest(&buf, 512, 0, 5122, header_mod.requestHeaderVersion(512, 0));
+    req.serialize(&buf, &pos, 0);
+
+    var failing_allocator = OneShotFailingAllocator.init(testing.allocator, 3);
+    const response_allocator = failing_allocator.allocator();
+    broker.allocator = response_allocator;
+
+    const response = broker.handleRequest(buf[0..pos]);
+
+    try testing.expect(failing_allocator.failed);
+    try testing.expect(response != null);
+    defer response_allocator.free(response.?);
+
+    const error_code = try readAutoMqMutationErrorCode(response.?, 512, 0, 5122);
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.kafka_storage_error)), error_code);
+    try testing.expectEqual(@as(u64, 0), broker.object_manager.getStream(stream_id).?.start_offset);
+    try testing.expectEqual(@as(u64, 10), broker.object_manager.getStream(stream_id).?.end_offset);
 }
 
 test "Broker AutoMQ stream object lifecycle APIs" {

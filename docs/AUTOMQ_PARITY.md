@@ -1009,9 +1009,11 @@ Status: completed for the initial catalog and DeleteGroups slice.
   metadata mutation, and these local metadata mutation paths also reserve
   required copies and map capacity before committing or mutating state,
   returning generated storage errors when materialization fails.
-  Stream/object handlers now also materialize ObjectManager rollback snapshots
-  and S3 object keys before mutation, restore visible state on local mutation
-  or quorum/persistence failures, and return
+  TrimStreams serializes completed responses before durable ObjectManager
+  persistence and restores the local stream snapshot if response serialization
+  fails. Stream/object handlers now also materialize ObjectManager rollback
+  snapshots and S3 object keys before mutation, restore visible state on local
+  mutation or quorum/persistence failures, and return
   generated storage errors instead of dropping responses under allocation
   pressure. Single-node leaders now
   compact these records by appending a full AutoMQ metadata/ObjectManager
