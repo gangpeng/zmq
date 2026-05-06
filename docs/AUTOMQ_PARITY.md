@@ -251,6 +251,8 @@ AddRaftVoter now rejects empty listener sets so committed voters cannot be
 silently omitted from Raft peer wiring, static controller quorum voter strings
 reject duplicate node IDs/endpoints, and startup registers static controller
 endpoints into Raft voter metadata with rollback on allocation failure;
+MetadataClient voter registration now rejects duplicate controller peers and
+rolls back the discovery list when RaftClientPool peer allocation fails;
 DeleteTopics partition cleanup removes known local partition state without heap
 key formatting.
 

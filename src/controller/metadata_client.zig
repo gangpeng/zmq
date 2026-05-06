@@ -102,8 +102,19 @@ pub const MetadataClient = struct {
 
     /// Add a controller voter address. Called during startup before run().
     pub fn addVoter(self: *MetadataClient, node_id: i32, host: []const u8, port: u16) !void {
+        if (node_id < 0 or host.len == 0 or port == 0) return error.InvalidControllerVoter;
+        for (self.voters.items) |existing| {
+            if (existing.node_id == node_id) return error.DuplicateControllerVoter;
+            if (existing.port == port and std.mem.eql(u8, existing.host, host)) {
+                return error.DuplicateControllerVoterEndpoint;
+            }
+        }
+
         try self.voters.append(.{ .node_id = node_id, .host = host, .port = port });
-        try self.controller_pool.addPeer(node_id, host, port);
+        self.controller_pool.addPeer(node_id, host, port) catch |err| {
+            _ = self.voters.orderedRemove(self.voters.items.len - 1);
+            return err;
+        };
     }
 
     /// Set a TLS client context for encrypted connections to the controller.
@@ -386,6 +397,80 @@ pub const MetadataClient = struct {
 // ---------------------------------------------------------------
 
 const testing = std.testing;
+
+test "MetadataClient addVoter rejects duplicate controller peers" {
+    var cached_epoch: i32 = 0;
+    var cached_broker_epoch: i64 = 0;
+    const local_replica_directory_ids: []const [16]u8 = &.{};
+    var is_fenced: bool = false;
+    var last_hb: i64 = 0;
+    var should_stop: bool = false;
+
+    var mc = MetadataClient.init(
+        testing.allocator,
+        100,
+        "localhost",
+        9092,
+        &cached_epoch,
+        &cached_broker_epoch,
+        local_replica_directory_ids,
+        &is_fenced,
+        &last_hb,
+        &should_stop,
+    );
+    defer mc.deinit();
+
+    try mc.addVoter(1, "controller-1", 9093);
+    try testing.expectError(error.DuplicateControllerVoter, mc.addVoter(1, "controller-1-alt", 19093));
+    try testing.expectError(error.DuplicateControllerVoterEndpoint, mc.addVoter(2, "controller-1", 9093));
+    try testing.expectError(error.InvalidControllerVoter, mc.addVoter(-1, "controller-negative", 9093));
+    try testing.expectError(error.InvalidControllerVoter, mc.addVoter(3, "", 9093));
+    try testing.expectError(error.InvalidControllerVoter, mc.addVoter(4, "controller-zero-port", 0));
+
+    try testing.expectEqual(@as(usize, 1), mc.voters.items.len);
+    try testing.expect(mc.controller_pool.getClient(1) != null);
+    try testing.expect(mc.controller_pool.getClient(2) == null);
+}
+
+test "MetadataClient addVoter rolls back when peer allocation fails" {
+    var saw_failure = false;
+    for (0..8) |fail_index| {
+        var cached_epoch: i32 = 0;
+        var cached_broker_epoch: i64 = 0;
+        const local_replica_directory_ids: []const [16]u8 = &.{};
+        var is_fenced: bool = false;
+        var last_hb: i64 = 0;
+        var should_stop: bool = false;
+
+        var failing_allocator = std.testing.FailingAllocator.init(testing.allocator, .{ .fail_index = fail_index });
+        var mc = MetadataClient.init(
+            failing_allocator.allocator(),
+            100,
+            "localhost",
+            9092,
+            &cached_epoch,
+            &cached_broker_epoch,
+            local_replica_directory_ids,
+            &is_fenced,
+            &last_hb,
+            &should_stop,
+        );
+        defer mc.deinit();
+
+        if (mc.addVoter(1, "controller-1", 9093)) {
+            try testing.expect(!failing_allocator.has_induced_failure);
+            try testing.expectEqual(@as(usize, 1), mc.voters.items.len);
+            try testing.expect(mc.controller_pool.getClient(1) != null);
+        } else |err| {
+            try testing.expectEqual(error.OutOfMemory, err);
+            try testing.expect(failing_allocator.has_induced_failure);
+            try testing.expectEqual(@as(usize, 0), mc.voters.items.len);
+            try testing.expect(mc.controller_pool.getClient(1) == null);
+            saw_failure = true;
+        }
+    }
+    try testing.expect(saw_failure);
+}
 
 test "MetadataClient staleness detection fences broker" {
     var cached_epoch: i32 = 0;
