@@ -25428,13 +25428,13 @@ pub const Broker = struct {
 
         if (!validateDescribeClusterRequestFrame(request_bytes, body_start, api_version)) {
             log.warn("Malformed DescribeCluster request", .{});
-            return null;
+            return self.describeClusterErrorResponse(req_header, resp_header_version, api_version, ErrorCode.invalid_request, "Invalid request", 1);
         }
 
         var pos = body_start;
         const req = Req.deserialize(self.allocator, request_bytes, &pos, api_version) catch |err| {
             log.warn("Failed to decode DescribeCluster request: {}", .{err});
-            return null;
+            return self.describeClusterErrorResponse(req_header, resp_header_version, api_version, ErrorCode.invalid_request, "Invalid request", 1);
         };
 
         const endpoint_type = if (api_version >= 1) req.endpoint_type else 1;
@@ -25460,13 +25460,25 @@ pub const Broker = struct {
             .cluster_authorized_operations = if (req.include_cluster_authorized_operations) 0 else std.math.minInt(i32),
         };
 
-        const rh = ResponseHeader{ .correlation_id = req_header.correlation_id };
-        const needed = rh.calcSize(resp_header_version) + resp_body.calcSize(api_version);
-        var buf = self.allocator.alloc(u8, needed) catch return null;
-        var wpos: usize = 0;
-        rh.serialize(buf, &wpos, resp_header_version);
-        resp_body.serialize(buf, &wpos, api_version);
-        return (self.allocator.realloc(buf, wpos) catch buf)[0..wpos];
+        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp_body, api_version) orelse {
+            log.warn("DescribeCluster response serialization failed", .{});
+            return self.describeClusterErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error, "Failed to serialize DescribeCluster response", endpoint_type);
+        };
+    }
+
+    fn describeClusterErrorResponse(self: *Broker, req_header: *const RequestHeader, resp_header_version: i16, api_version: i16, err_code: ErrorCode, message: ?[]const u8, endpoint_type: i8) ?[]u8 {
+        const Resp = generated.describe_cluster_response.DescribeClusterResponse;
+        const resp = Resp{
+            .throttle_time_ms = 0,
+            .error_code = @intFromEnum(err_code),
+            .error_message = message,
+            .endpoint_type = endpoint_type,
+            .cluster_id = if (self.raft_state) |rs| rs.cluster_id else "zmq-cluster",
+            .controller_id = self.node_id,
+            .brokers = &.{},
+            .cluster_authorized_operations = std.math.minInt(i32),
+        };
+        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
     }
 
     fn validateDescribeClusterRequestFrame(buf: []const u8, start_pos: usize, api_version: i16) bool {
@@ -49286,16 +49298,24 @@ test "Broker.handleRequest DescribeCluster rejects malformed endpoint request" {
 }
 
 test "Broker.handleRequest DescribeCluster rejects truncated request" {
+    const Resp = generated.describe_cluster_response.DescribeClusterResponse;
+
     var broker = Broker.init(testing.allocator, 1, 9092);
     defer broker.deinit();
 
     var buf: [128]u8 = undefined;
     const req_len = buildTestRequest(&buf, 60, 1, 6003, header_mod.requestHeaderVersion(60, 1));
-    try testing.expect(broker.handleRequest(buf[0..req_len]) == null);
+    const response = broker.handleRequest(buf[0..req_len]);
+    try testing.expect(response != null);
+    defer testing.allocator.free(response.?);
+
+    const error_code = try readGeneratedTopLevelErrorCode(Resp, response.?, 60, 1, 6003);
+    try testing.expectEqual(ErrorCode.invalid_request.toInt(), error_code);
 }
 
 test "Broker.handleRequest DescribeCluster rejects trailing bytes" {
     const Req = generated.describe_cluster_request.DescribeClusterRequest;
+    const Resp = generated.describe_cluster_response.DescribeClusterResponse;
 
     var broker = Broker.init(testing.allocator, 1, 9092);
     defer broker.deinit();
@@ -49305,7 +49325,39 @@ test "Broker.handleRequest DescribeCluster rejects trailing bytes" {
     var pos = buildTestRequest(&buf, 60, 1, 6005, header_mod.requestHeaderVersion(60, 1));
     req.serialize(&buf, &pos, 1);
 
-    try expectTrailingByteRejected(&broker, buf[0..], pos);
+    try expectTrailingByteRejectedWithGeneratedResponse(Resp, &broker, buf[0..], pos, 60, 1, 6005);
+}
+
+test "Broker.handleRequest DescribeCluster fails closed when response serialization fails" {
+    const Req = generated.describe_cluster_request.DescribeClusterRequest;
+    const Resp = generated.describe_cluster_response.DescribeClusterResponse;
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+    try broker.authorizer.addSuperUser("test-client");
+
+    const req = Req{
+        .include_cluster_authorized_operations = false,
+        .endpoint_type = 1,
+    };
+
+    var buf: [128]u8 = undefined;
+    var pos = buildTestRequest(&buf, 60, 1, 6006, header_mod.requestHeaderVersion(60, 1));
+    req.serialize(&buf, &pos, 1);
+
+    var failing_allocator = OneShotFailingAllocator.init(testing.allocator, 0);
+    const response_allocator = failing_allocator.allocator();
+    broker.allocator = response_allocator;
+
+    const response = broker.handleRequest(buf[0..pos]);
+    broker.allocator = testing.allocator;
+
+    try testing.expect(failing_allocator.failed);
+    try testing.expect(response != null);
+    defer response_allocator.free(response.?);
+
+    const error_code = try readGeneratedTopLevelErrorCode(Resp, response.?, 60, 1, 6006);
+    try testing.expectEqual(ErrorCode.kafka_storage_error.toInt(), error_code);
 }
 
 test "Broker.handleRequest DescribeCluster authorization denial uses generated response" {
