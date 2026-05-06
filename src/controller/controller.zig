@@ -179,7 +179,11 @@ pub const Controller = struct {
         };
         defer self.freeVoteRequest(&req);
 
-        const topics = self.allocator.alloc(TopicResult, req.topics.len) catch return null;
+        const topics = self.allocator.alloc(TopicResult, req.topics.len) catch |err| {
+            log.warn("Vote topic response allocation failed: {}", .{err});
+            const resp = Resp{ .error_code = ErrorCode.kafka_storage_error.toInt(), .topics = &.{}, .node_endpoints = &.{} };
+            return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+        };
         for (topics) |*topic| {
             topic.* = .{ .topic_name = null, .partitions = &.{} };
         }
@@ -189,7 +193,11 @@ pub const Controller = struct {
         }
 
         for (req.topics, 0..) |topic, topic_index| {
-            const partitions = self.allocator.alloc(PartitionResult, topic.partitions.len) catch return null;
+            const partitions = self.allocator.alloc(PartitionResult, topic.partitions.len) catch |err| {
+                log.warn("Vote partition response allocation failed: {}", .{err});
+                const resp = Resp{ .error_code = ErrorCode.kafka_storage_error.toInt(), .topics = &.{}, .node_endpoints = &.{} };
+                return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+            };
             errdefer self.allocator.free(partitions);
 
             for (topic.partitions, 0..) |partition, partition_index| {
@@ -2600,6 +2608,49 @@ test "Controller handleRequest Vote grants to valid candidate" {
     try testing.expectEqual(@as(usize, 1), resp.topics.len);
     try testing.expectEqual(@as(usize, 1), resp.topics[0].partitions.len);
     try testing.expect(resp.topics[0].partitions[0].vote_granted);
+}
+
+test "Controller handleRequest Vote fails closed on response topic materialization failure" {
+    const Req = generated.vote_request.VoteRequest;
+    const Resp = generated.vote_response.VoteResponse;
+
+    var saw_storage_error = false;
+    for (3..6) |fail_index| {
+        var ctrl = Controller.init(testing.allocator, 1, "test-cluster");
+        defer ctrl.deinit();
+        try ctrl.raft_state.addVoter(2);
+
+        var buf: [256]u8 = undefined;
+        var pos = buildTestRequest(&buf, 52, 0, 13, header_mod.requestHeaderVersion(52, 0));
+        const partitions = [_]Req.TopicData.PartitionData{.{
+            .partition_index = 0,
+            .candidate_epoch = 1,
+            .candidate_id = 2,
+            .last_offset_epoch = 0,
+            .last_offset = 0,
+        }};
+        const topics = [_]Req.TopicData{.{ .topic_name = "__cluster_metadata", .partitions = &partitions }};
+        const req = Req{ .cluster_id = null, .topics = &topics };
+        req.serialize(&buf, &pos, 0);
+
+        var failing_allocator = OneShotFailingAllocator.init(testing.allocator, fail_index);
+        const response_allocator = failing_allocator.allocator();
+        ctrl.allocator = response_allocator;
+        const response = ctrl.handleRequest(buf[0..pos]);
+        ctrl.allocator = testing.allocator;
+
+        if (response) |bytes| {
+            defer response_allocator.free(bytes);
+            if (!failing_allocator.failed) continue;
+            const error_code = try readControllerErrorCode(Resp, bytes, 52, 0, 13);
+            if (error_code == ErrorCode.kafka_storage_error.toInt()) {
+                saw_storage_error = true;
+                try testing.expectEqual(@as(i32, 0), ctrl.raft_state.current_epoch);
+                try testing.expectEqual(@as(?i32, null), ctrl.raft_state.voted_for);
+            }
+        }
+    }
+    try testing.expect(saw_storage_error);
 }
 
 test "Controller handleRequest Vote rejects stale epoch" {

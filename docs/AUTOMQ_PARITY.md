@@ -255,6 +255,8 @@ MetadataClient voter registration now rejects duplicate controller peers and
 rolls back the discovery list when RaftClientPool peer allocation fails;
 DescribeQuorum and FetchSnapshot response materialization now fail closed
 without leaking partially built endpoint metadata when allocation fails;
+Vote response topic materialization now fails closed before mutating vote state
+when allocation fails;
 ControllerRegistration, AddRaftVoter, and UpdateRaftVoter endpoint
 materialization now return storage errors without mutating voter state when
 allocation fails;
