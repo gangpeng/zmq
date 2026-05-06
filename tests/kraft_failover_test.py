@@ -44,6 +44,7 @@ PORT_BASE = int(os.environ.get("ZMQ_KRAFT_CONTROLLER_PORT_BASE", "39093"))
 BROKER_PORT = int(os.environ.get("ZMQ_KRAFT_BROKER_PORT", "39092"))
 CLUSTER_ID = f"zmq-kraft-failover-{os.getpid()}-{int(time.time())}"
 ERROR_NONE = 0
+ERROR_UNSUPPORTED_VERSION = 35
 ERROR_UNKNOWN_TOPIC_OR_PARTITION = 3
 ERROR_TOPIC_ALREADY_EXISTS = 36
 ERROR_GROUP_ID_NOT_FOUND = 69
@@ -1533,6 +1534,75 @@ def wait_for_controller_api_versions_checkpoint(
         time.sleep(0.25)
     raise TestError(
         f"Controller ApiVersions did not recover during {label}: {last_error}"
+    )
+
+
+def parse_controller_small_error_response(response, correlation_id, response_name):
+    pos = parse_flexible_response_header(response, correlation_id)
+    error_code, pos = read_i16(response, pos)
+    if pos != len(response):
+        raise TestError(
+            f"{response_name} response trailing bytes: {len(response) - pos}"
+        )
+    return {"error_code": error_code}
+
+
+def controller_small_error_request(port, api_key, api_version, correlation_id):
+    response = flexible_kafka_request(port, api_key, api_version, correlation_id)
+    return parse_controller_small_error_response(
+        response,
+        correlation_id,
+        f"controller api_key={api_key} v={api_version}",
+    )
+
+
+def require_controller_unsupported_response(response, api_key, api_version, label):
+    if response["error_code"] != ERROR_UNSUPPORTED_VERSION:
+        raise TestError(
+            f"controller unsupported response mismatch during {label}: "
+            f"api_key={api_key} api_version={api_version} response={response}"
+        )
+
+
+def wait_for_controller_unsupported_checkpoint(
+    port,
+    state,
+    label,
+    timeout=30,
+):
+    deadline = time.time() + timeout
+    correlation_id = state.get("correlation_id", 9740)
+    unsupported_cases = [
+        (api_key, versions[1] + 1)
+        for api_key, versions in sorted(CONTROLLER_API_VERSIONS.items())
+        if api_key != 18
+    ]
+    unsupported_cases.extend([(71, 0), (72, 0)])
+    last_error = None
+    while time.time() < deadline:
+        try:
+            for index, (api_key, api_version) in enumerate(unsupported_cases):
+                response = controller_small_error_request(
+                    port,
+                    api_key,
+                    api_version,
+                    correlation_id + index,
+                )
+                require_controller_unsupported_response(
+                    response,
+                    api_key,
+                    api_version,
+                    label,
+                )
+            state["correlation_id"] = correlation_id + len(unsupported_cases)
+            return {"cases": unsupported_cases}
+        except Exception as exc:
+            last_error = exc
+        correlation_id += len(unsupported_cases)
+        time.sleep(0.25)
+    raise TestError(
+        f"controller unsupported API probes did not recover during {label}: "
+        f"{last_error}"
     )
 
 
@@ -11042,6 +11112,12 @@ def main():
             controller_api_versions_state,
             "initial leader",
         )
+        controller_unsupported_state = {"correlation_id": 9740}
+        wait_for_controller_unsupported_checkpoint(
+            processes[leader_id]["port"],
+            controller_unsupported_state,
+            "initial leader",
+        )
         describe_quorum_state = {"correlation_id": 9140}
         wait_for_describe_quorum_v2_checkpoint(
             processes[leader_id]["port"],
@@ -11693,6 +11769,11 @@ def main():
                 controller_api_versions_state,
                 "network partition matrix",
             )
+            wait_for_controller_unsupported_checkpoint(
+                processes[leader_id]["port"],
+                controller_unsupported_state,
+                "network partition matrix",
+            )
             wait_for_describe_quorum_v2_checkpoint(
                 processes[leader_id]["port"],
                 ports,
@@ -11846,6 +11927,11 @@ def main():
         wait_for_controller_api_versions_checkpoint(
             processes[replacement_leader]["port"],
             controller_api_versions_state,
+            "controller leader failover",
+        )
+        wait_for_controller_unsupported_checkpoint(
+            processes[replacement_leader]["port"],
+            controller_unsupported_state,
             "controller leader failover",
         )
         wait_for_describe_quorum_v2_checkpoint(
@@ -12039,6 +12125,11 @@ def main():
             controller_api_versions_state,
             "old leader fresh rejoin",
         )
+        wait_for_controller_unsupported_checkpoint(
+            processes[replacement_leader]["port"],
+            controller_unsupported_state,
+            "old leader fresh rejoin",
+        )
         wait_for_describe_quorum_v2_checkpoint(
             processes[replacement_leader]["port"],
             ports,
@@ -12227,6 +12318,11 @@ def main():
             controller_api_versions_state,
             "surviving controller restart",
         )
+        wait_for_controller_unsupported_checkpoint(
+            processes[replacement_leader]["port"],
+            controller_unsupported_state,
+            "surviving controller restart",
+        )
         wait_for_describe_quorum_v2_checkpoint(
             processes[replacement_leader]["port"],
             ports,
@@ -12400,6 +12496,11 @@ def main():
         wait_for_controller_api_versions_checkpoint(
             processes[replacement_leader]["port"],
             controller_api_versions_state,
+            "broker restart",
+        )
+        wait_for_controller_unsupported_checkpoint(
+            processes[replacement_leader]["port"],
+            controller_unsupported_state,
             "broker restart",
         )
         wait_for_describe_quorum_v2_checkpoint(
@@ -12701,6 +12802,7 @@ def main():
             f"describe_quorum_v2_checked=true, "
             f"fetch_snapshot_v1_checked=true, "
             f"controller_api_versions_checked=true, "
+            f"controller_unsupported_checked=true, "
             f"dynamic_raft_voter_negative_checked=true, "
             f"broker_lifecycle_negative_checked=true, "
             f"controller_registration_negative_checked=true, "
@@ -13342,6 +13444,24 @@ def self_test():
             187,
         )
         require_controller_api_versions(controller_api_versions)
+
+        controller_unsupported_fixture = struct.pack(">i", 193)
+        controller_unsupported_fixture += b"\x00"  # response header tagged fields
+        controller_unsupported_fixture += struct.pack(
+            ">h",
+            ERROR_UNSUPPORTED_VERSION,
+        )
+        controller_unsupported = parse_controller_small_error_response(
+            controller_unsupported_fixture,
+            193,
+            "controller unsupported fixture",
+        )
+        require_controller_unsupported_response(
+            controller_unsupported,
+            71,
+            0,
+            "self-test",
+        )
 
         add_voter_fixture = struct.pack(">i", 188)
         add_voter_fixture += b"\x00"  # response header tagged fields
