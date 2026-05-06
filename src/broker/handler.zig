@@ -10481,7 +10481,7 @@ pub const Broker = struct {
         var pos = body_start;
         _ = Req.deserialize(self.allocator, request_bytes, &pos, body_version) catch |err| {
             log.warn("Malformed ApiVersions request: {}", .{err});
-            return null;
+            return self.apiVersionsErrorResponse(req_header, resp_header_version, body_version, ErrorCode.invalid_request.toInt());
         };
 
         const supported = api_support.broker_supported_apis;
@@ -10501,7 +10501,10 @@ pub const Broker = struct {
             }
         }
 
-        const finalized_features = self.buildFinalizedFeatureResponseEntries(body_version) catch return null;
+        const finalized_features = self.buildFinalizedFeatureResponseEntries(body_version) catch |err| {
+            log.warn("ApiVersions finalized feature materialization failed: {}", .{err});
+            return self.apiVersionsErrorResponse(req_header, resp_header_version, body_version, ErrorCode.kafka_storage_error.toInt());
+        };
         defer if (finalized_features.len > 0) self.allocator.free(finalized_features);
 
         const resp_body = ApiVersionsResponse{
@@ -10513,6 +10516,18 @@ pub const Broker = struct {
             .finalized_features = finalized_features,
         };
 
+        return self.serializeResponse(req_header, resp_header_version, &resp_body, body_version);
+    }
+
+    fn apiVersionsErrorResponse(self: *Broker, req_header: *const RequestHeader, resp_header_version: i16, body_version: i16, error_code: i16) ?[]u8 {
+        const resp_body = ApiVersionsResponse{
+            .error_code = error_code,
+            .api_keys = &.{},
+            .throttle_time_ms = 0,
+            .supported_features = &.{},
+            .finalized_features_epoch = -1,
+            .finalized_features = &.{},
+        };
         return self.serializeResponse(req_header, resp_header_version, &resp_body, body_version);
     }
 
@@ -28956,6 +28971,13 @@ fn expectApiVersionsResponseMatchesCatalog(response: []const u8, api_version: i1
     try testing.expectEqual(response.len, rpos);
 }
 
+fn freeDeserializedApiVersionsResponse(resp: *const generated.api_versions_response.ApiVersionsResponse) void {
+    if (resp.api_keys.len > 0) testing.allocator.free(resp.api_keys);
+    if (resp.supported_features.len > 0) testing.allocator.free(resp.supported_features);
+    if (resp.finalized_features.len > 0) testing.allocator.free(resp.finalized_features);
+    if (resp.tagged_fields.len > 0) testing.allocator.free(resp.tagged_fields);
+}
+
 test "Broker internal log replay rejects malformed record batch headers" {
     const rec_batch = protocol.record_batch;
     var broker = Broker.init(testing.allocator, 1, 9092);
@@ -29238,12 +29260,69 @@ test "Broker.handleRequest ApiVersions v4 generated catalog fixture" {
 }
 
 test "Broker.handleRequest ApiVersions v3 rejects truncated request body" {
+    const Resp = generated.api_versions_response.ApiVersionsResponse;
+
     var broker = Broker.init(testing.allocator, 1, 9092);
     defer broker.deinit();
 
     var buf: [128]u8 = undefined;
     const req_len = buildTestRequest(&buf, 18, 3, 105, header_mod.requestHeaderVersion(18, 3));
-    try testing.expect(broker.handleRequest(buf[0..req_len]) == null);
+    const response = broker.handleRequest(buf[0..req_len]);
+    try testing.expect(response != null);
+    defer testing.allocator.free(response.?);
+
+    var rpos: usize = 0;
+    var response_header = try ResponseHeader.deserialize(testing.allocator, response.?, &rpos, header_mod.responseHeaderVersion(18, 3));
+    defer response_header.deinit(testing.allocator);
+    try testing.expectEqual(@as(i32, 105), response_header.correlation_id);
+
+    const resp = try Resp.deserialize(testing.allocator, response.?, &rpos, 3);
+    defer freeDeserializedApiVersionsResponse(&resp);
+    try testing.expectEqual(response.?.len, rpos);
+    try testing.expectEqual(ErrorCode.invalid_request.toInt(), resp.error_code);
+    try testing.expectEqual(@as(usize, 0), resp.api_keys.len);
+}
+
+test "Broker.handleRequest ApiVersions fails closed on finalized feature materialization failure" {
+    const Req = generated.api_versions_request.ApiVersionsRequest;
+    const Resp = generated.api_versions_response.ApiVersionsResponse;
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+    const feature_name = try testing.allocator.dupe(u8, "metadata.version");
+    try broker.finalized_features.put(feature_name, 1);
+    broker.finalized_features_epoch = 0;
+
+    const req = Req{
+        .client_software_name = "zmq",
+        .client_software_version = "0.1.0",
+    };
+    var buf: [512]u8 = undefined;
+    var pos = buildTestRequest(&buf, 18, 3, 106, header_mod.requestHeaderVersion(18, 3));
+    req.serialize(&buf, &pos, 3);
+
+    var failing_allocator = OneShotFailingAllocator.init(testing.allocator, 0);
+    const response_allocator = failing_allocator.allocator();
+    broker.allocator = response_allocator;
+
+    const response = broker.handleRequest(buf[0..pos]);
+    broker.allocator = testing.allocator;
+
+    try testing.expect(failing_allocator.failed);
+    try testing.expect(response != null);
+    defer response_allocator.free(response.?);
+
+    var rpos: usize = 0;
+    var response_header = try ResponseHeader.deserialize(testing.allocator, response.?, &rpos, header_mod.responseHeaderVersion(18, 3));
+    defer response_header.deinit(testing.allocator);
+    try testing.expectEqual(@as(i32, 106), response_header.correlation_id);
+
+    const resp = try Resp.deserialize(testing.allocator, response.?, &rpos, 3);
+    defer freeDeserializedApiVersionsResponse(&resp);
+    try testing.expectEqual(response.?.len, rpos);
+    try testing.expectEqual(ErrorCode.kafka_storage_error.toInt(), resp.error_code);
+    try testing.expectEqual(@as(usize, 0), resp.api_keys.len);
+    try testing.expectEqual(@as(usize, 0), resp.finalized_features.len);
 }
 
 test "Broker.handleRequest Metadata v1 returns generated all-topic response" {
