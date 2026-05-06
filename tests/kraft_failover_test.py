@@ -1056,6 +1056,261 @@ def wait_for_create_partitions_validate_only_checkpoint(
     )
 
 
+def read_tagged_fields(buf, pos):
+    count, pos = read_varint(buf, pos)
+    fields = []
+    seen = set()
+    for _ in range(count):
+        tag, pos = read_varint(buf, pos)
+        size, pos = read_varint(buf, pos)
+        if tag in seen:
+            raise TestError(f"duplicate tagged field {tag}")
+        seen.add(tag)
+        if pos + size > len(buf):
+            raise TestError("buffer underflow while reading tagged field")
+        fields.append((tag, buf[pos : pos + size]))
+        pos += size
+    return fields, pos
+
+
+def parse_update_features_response(response, correlation_id):
+    pos = parse_flexible_response_header(response, correlation_id)
+    throttle_time_ms, pos = read_i32(response, pos)
+    error_code, pos = read_i16(response, pos)
+    error_message, pos = read_compact_string(response, pos)
+    result_count, pos = read_compact_array_len(response, pos)
+    results = []
+    for _ in range(result_count):
+        feature, pos = read_compact_string(response, pos)
+        result_error_code, pos = read_i16(response, pos)
+        result_error_message, pos = read_compact_string(response, pos)
+        pos = skip_tags(response, pos)
+        results.append(
+            {
+                "feature": feature,
+                "error_code": result_error_code,
+                "error_message": result_error_message,
+            }
+        )
+    pos = skip_tags(response, pos)
+    if pos != len(response):
+        raise TestError(
+            f"UpdateFeatures response trailing bytes: {len(response) - pos}"
+        )
+    return {
+        "throttle_time_ms": throttle_time_ms,
+        "error_code": error_code,
+        "error_message": error_message,
+        "results": results,
+    }
+
+
+def update_features(port, feature, max_version_level, validate_only, correlation_id):
+    body = struct.pack(">i", 30000)
+    body += write_compact_array_len(1)
+    body += write_compact_string(feature)
+    body += struct.pack(">h", max_version_level)
+    body += struct.pack(">b", 1)  # upgrade_type=upgrade-only
+    body += b"\x00"  # feature tagged fields
+    body += b"\x01" if validate_only else b"\x00"
+    body += b"\x00"  # request tagged fields
+    response = flexible_kafka_request(port, 57, 1, correlation_id, body)
+    return parse_update_features_response(response, correlation_id)
+
+
+def require_update_features_success(response, feature):
+    if (
+        response["throttle_time_ms"] != 0
+        or response["error_code"] != 0
+        or response["error_message"] is not None
+    ):
+        raise TestError(f"UpdateFeatures top-level mismatch: {response}")
+    results = response["results"]
+    if len(results) != 1 or results[0]["feature"] != feature:
+        raise TestError(f"UpdateFeatures feature mismatch: {response}")
+    if results[0]["error_code"] != 0 or results[0]["error_message"] is not None:
+        raise TestError(f"UpdateFeatures result mismatch: {response}")
+
+
+def parse_api_versions_features_response(response, correlation_id):
+    pos = 0
+    response_correlation_id, pos = read_i32(response, pos)
+    if response_correlation_id != correlation_id:
+        raise TestError(
+            f"ApiVersions correlation mismatch: {response_correlation_id}"
+        )
+    error_code, pos = read_i16(response, pos)
+    api_count, pos = read_compact_array_len(response, pos)
+    apis = []
+    for _ in range(api_count):
+        api_key, pos = read_i16(response, pos)
+        min_version, pos = read_i16(response, pos)
+        max_version, pos = read_i16(response, pos)
+        pos = skip_tags(response, pos)
+        apis.append(
+            {
+                "api_key": api_key,
+                "min_version": min_version,
+                "max_version": max_version,
+            }
+        )
+    throttle_time_ms, pos = read_i32(response, pos)
+
+    supported_features = []
+    finalized_features_epoch = -1
+    finalized_features = []
+    zk_migration_ready = False
+    fields, pos = read_tagged_fields(response, pos)
+    for tag, data in fields:
+        tag_pos = 0
+        if tag == 0:
+            feature_count, tag_pos = read_compact_array_len(data, tag_pos)
+            for _ in range(feature_count):
+                name, tag_pos = read_compact_string(data, tag_pos)
+                min_version, tag_pos = read_i16(data, tag_pos)
+                max_version, tag_pos = read_i16(data, tag_pos)
+                tag_pos = skip_tags(data, tag_pos)
+                supported_features.append(
+                    {
+                        "name": name,
+                        "min_version": min_version,
+                        "max_version": max_version,
+                    }
+                )
+        elif tag == 1:
+            finalized_features_epoch, tag_pos = read_i64(data, tag_pos)
+        elif tag == 2:
+            feature_count, tag_pos = read_compact_array_len(data, tag_pos)
+            for _ in range(feature_count):
+                name, tag_pos = read_compact_string(data, tag_pos)
+                max_version_level, tag_pos = read_i16(data, tag_pos)
+                min_version_level, tag_pos = read_i16(data, tag_pos)
+                tag_pos = skip_tags(data, tag_pos)
+                finalized_features.append(
+                    {
+                        "name": name,
+                        "max_version_level": max_version_level,
+                        "min_version_level": min_version_level,
+                    }
+                )
+        elif tag == 3:
+            zk_migration_ready, tag_pos = read_bool(data, tag_pos)
+        else:
+            tag_pos = len(data)
+        if tag_pos != len(data):
+            raise TestError(
+                f"ApiVersions tagged field {tag} trailing bytes: {len(data) - tag_pos}"
+            )
+
+    if pos != len(response):
+        raise TestError(f"ApiVersions response trailing bytes: {len(response) - pos}")
+    return {
+        "error_code": error_code,
+        "apis": apis,
+        "throttle_time_ms": throttle_time_ms,
+        "supported_features": supported_features,
+        "finalized_features_epoch": finalized_features_epoch,
+        "finalized_features": finalized_features,
+        "zk_migration_ready": zk_migration_ready,
+    }
+
+
+def api_versions_v3(port, correlation_id):
+    body = write_compact_string("kraft-failover-test")
+    body += write_compact_string("1.0")
+    body += b"\x00"  # request tagged fields
+    response = flexible_kafka_request(port, 18, 3, correlation_id, body)
+    return parse_api_versions_features_response(response, correlation_id)
+
+
+def require_finalized_feature_visible(response, feature, max_version_level):
+    if response["throttle_time_ms"] != 0 or response["error_code"] != 0:
+        raise TestError(f"ApiVersions top-level mismatch: {response}")
+    supported = [
+        item
+        for item in response["supported_features"]
+        if item["name"] == feature
+        and item["min_version"] <= max_version_level <= item["max_version"]
+    ]
+    if not supported:
+        raise TestError(f"ApiVersions supported feature missing: {response}")
+    if response["finalized_features_epoch"] < 0:
+        raise TestError(f"ApiVersions finalized epoch missing: {response}")
+    matches = [
+        item for item in response["finalized_features"] if item["name"] == feature
+    ]
+    if len(matches) != 1:
+        raise TestError(f"ApiVersions finalized feature mismatch: {response}")
+    finalized = matches[0]
+    if (
+        finalized["max_version_level"] != max_version_level
+        or finalized["min_version_level"] != max_version_level
+    ):
+        raise TestError(f"ApiVersions finalized level mismatch: {response}")
+
+
+def wait_for_update_features_mutation(
+    port, feature, max_version_level, timeout=30
+):
+    deadline = time.time() + timeout
+    correlation_id = 8780
+    last_error = None
+    while time.time() < deadline:
+        try:
+            response = update_features(
+                port,
+                feature,
+                max_version_level,
+                False,
+                correlation_id,
+            )
+            require_update_features_success(response, feature)
+            correlation_id += 1
+            require_finalized_feature_visible(
+                api_versions_v3(port, correlation_id),
+                feature,
+                max_version_level,
+            )
+            return
+        except Exception as exc:
+            last_error = exc
+        correlation_id += 1
+        time.sleep(0.25)
+    raise TestError(f"UpdateFeatures did not finalize {feature!r}: {last_error}")
+
+
+def wait_for_finalized_features_checkpoint(
+    port, feature, max_version_level, timeout=30
+):
+    deadline = time.time() + timeout
+    correlation_id = 8810
+    last_error = None
+    while time.time() < deadline:
+        try:
+            response = update_features(
+                port,
+                feature,
+                max_version_level,
+                True,
+                correlation_id,
+            )
+            require_update_features_success(response, feature)
+            correlation_id += 1
+            require_finalized_feature_visible(
+                api_versions_v3(port, correlation_id),
+                feature,
+                max_version_level,
+            )
+            return
+        except Exception as exc:
+            last_error = exc
+        correlation_id += 1
+        time.sleep(0.25)
+    raise TestError(
+        f"Finalized feature checkpoint did not recover for {feature!r}: {last_error}"
+    )
+
+
 def parse_alter_client_quotas_response(response, correlation_id):
     pos = parse_flexible_response_header(response, correlation_id)
     throttle_time_ms, pos = read_i32(response, pos)
@@ -8979,6 +9234,8 @@ def main():
         telemetry_metrics = b"\x08\x01"
         delegation_token_owner = "kraft-failover-test"
         delegation_token_lifetime_ms = 60 * 60 * 1000
+        finalized_feature_name = "metadata.version"
+        finalized_feature_level = 1
         kip848_subscription_topic = f"{topic}-kip848-subscription"
         kip848_negative_group_prefix = f"{group}-kip848-negative"
         expected_payloads = []
@@ -9075,6 +9332,13 @@ def main():
                 delegation_token_lifetime_ms,
             )
 
+        def wait_for_finalized_features_probe():
+            wait_for_finalized_features_checkpoint(
+                broker["port"],
+                finalized_feature_name,
+                finalized_feature_level,
+            )
+
         def wait_for_cluster_visibility_probes():
             wait_for_topic_partitions_probe()
             wait_for_create_partitions_probe()
@@ -9082,6 +9346,7 @@ def main():
             wait_for_scram_credentials_probe()
             wait_for_client_telemetry_probe()
             wait_for_delegation_token_probe()
+            wait_for_finalized_features_probe()
             wait_for_describe_configs_checkpoint(
                 broker["port"],
                 topic,
@@ -9134,6 +9399,11 @@ def main():
             broker["port"],
             delegation_token_owner,
             delegation_token_lifetime_ms,
+        )
+        wait_for_update_features_mutation(
+            broker["port"],
+            finalized_feature_name,
+            finalized_feature_level,
         )
         wait_for_cluster_visibility_probes()
         wait_for_offset_commit(broker["port"], group, topic, committed_offset)
@@ -10247,6 +10517,7 @@ def main():
             f"scram_credentials_checked=true, "
             f"client_telemetry_checked=true, "
             f"delegation_tokens_checked=true, "
+            f"finalized_features_checked=true, "
             f"describe_topic_partitions_checked=true, "
             f"describe_configs_checked=true, "
             f"describe_log_dirs_checked=true, "
@@ -10739,6 +11010,50 @@ def self_test():
             "token-id-self-test",
             token_hmac,
         )
+
+        update_features_fixture = struct.pack(">i", 176)
+        update_features_fixture += b"\x00"  # response header tagged fields
+        update_features_fixture += struct.pack(">ih", 0, 0)
+        update_features_fixture += write_compact_string(None)
+        update_features_fixture += write_compact_array_len(1)
+        update_features_fixture += write_compact_string("metadata.version")
+        update_features_fixture += struct.pack(">h", 0)
+        update_features_fixture += write_compact_string(None)
+        update_features_fixture += b"\x00"  # result tagged fields
+        update_features_fixture += b"\x00"  # response tagged fields
+        updated_features = parse_update_features_response(
+            update_features_fixture, 176
+        )
+        require_update_features_success(updated_features, "metadata.version")
+
+        supported_feature_tag = write_compact_array_len(1)
+        supported_feature_tag += write_compact_string("metadata.version")
+        supported_feature_tag += struct.pack(">hh", 1, 1)
+        supported_feature_tag += b"\x00"  # supported feature tagged fields
+        finalized_feature_tag = write_compact_array_len(1)
+        finalized_feature_tag += write_compact_string("metadata.version")
+        finalized_feature_tag += struct.pack(">hh", 1, 1)
+        finalized_feature_tag += b"\x00"  # finalized feature tagged fields
+        api_versions_v3_fixture = struct.pack(">i", 177)
+        api_versions_v3_fixture += struct.pack(">h", 0)
+        api_versions_v3_fixture += write_compact_array_len(1)
+        api_versions_v3_fixture += struct.pack(">hhh", 57, 0, 1)
+        api_versions_v3_fixture += b"\x00"  # ApiVersion tagged fields
+        api_versions_v3_fixture += struct.pack(">i", 0)
+        api_versions_v3_fixture += write_varint(3)
+        api_versions_v3_fixture += write_varint(0)
+        api_versions_v3_fixture += write_varint(len(supported_feature_tag))
+        api_versions_v3_fixture += supported_feature_tag
+        api_versions_v3_fixture += write_varint(1)
+        api_versions_v3_fixture += write_varint(8)
+        api_versions_v3_fixture += struct.pack(">q", 2)
+        api_versions_v3_fixture += write_varint(2)
+        api_versions_v3_fixture += write_varint(len(finalized_feature_tag))
+        api_versions_v3_fixture += finalized_feature_tag
+        api_versions_v3 = parse_api_versions_features_response(
+            api_versions_v3_fixture, 177
+        )
+        require_finalized_feature_visible(api_versions_v3, "metadata.version", 1)
 
         describe_configs_fixture = struct.pack(">i", 166)
         describe_configs_fixture += b"\x00"  # response header tagged fields
