@@ -862,7 +862,9 @@ Status: completed for the initial catalog and DeleteGroups slice.
   broker request validation, ListOffsets, partition-state restore,
   OffsetCommit lag calculation, DeleteRecords trims, marker state updates,
   EndTxn marker LSO cleanup, or log-dir estimates through formatted partition
-  keys; broker tick now enforces each group's configured session timeout
+  keys; AddPartitionsToTxn coordinator allocation failures now return storage
+  errors without advancing empty transactions into ongoing state; broker tick
+  now enforces each group's configured session timeout
   instead of a global timeout;
   S3Client multipart fault tests now cover missing/malformed/XML-unsafe part ETags,
   abort-after-part failure, abort-after-complete failure, and HTTP 200

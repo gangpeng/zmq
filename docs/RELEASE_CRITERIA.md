@@ -42,7 +42,9 @@ single-node demo are not sufficient by themselves.
   ListOffsets, DeleteRecords, OffsetCommit lag calculation, broker request
   validation, partition-state restore, log-dir estimates, and transaction marker
   completion/LSO cleanup must not depend on formatted keys that can miss long
-  but valid topic names. Consumer-group timeout eviction must not silently
+  but valid topic names. Transaction partition-registration allocation failures
+  must be reported as storage errors without advancing empty transactions into
+  ongoing state. Consumer-group timeout eviction must not silently
   keep expired members active because an allocation failed while collecting expired
   member IDs. Raft/controller metadata replication and startup recovery must not
   acknowledge or apply entries that failed local log allocation or persistence,

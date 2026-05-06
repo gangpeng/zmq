@@ -266,20 +266,18 @@ pub const TransactionCoordinator = struct {
         if (txn.producer_epoch != producer_epoch) return @intFromEnum(ErrorCode.invalid_producer_epoch);
 
         // Enforce transaction timeout
-        if (txn.status == .ongoing) {
-            if (transactionTimedOut(txn, monotonicMs())) {
-                txn.status = .prepare_abort;
-                self.dirty = true;
-                return @intFromEnum(ErrorCode.invalid_txn_state);
-            }
-        }
-
-        if (txn.status == .empty) {
-            txn.status = .ongoing;
-            resetTransactionStart(txn);
-        }
-
-        if (txn.status != .ongoing) return @intFromEnum(ErrorCode.invalid_txn_state);
+        const start_transaction = switch (txn.status) {
+            .ongoing => blk: {
+                if (transactionTimedOut(txn, monotonicMs())) {
+                    txn.status = .prepare_abort;
+                    self.dirty = true;
+                    return @intFromEnum(ErrorCode.invalid_txn_state);
+                }
+                break :blk false;
+            },
+            .empty => true,
+            else => return @intFromEnum(ErrorCode.invalid_txn_state),
+        };
 
         // Idempotent: skip if this topic-partition is already registered.
         // NOTE: AutoMQ/Kafka silently accepts duplicate partition adds.
@@ -292,6 +290,10 @@ pub const TransactionCoordinator = struct {
         const topic_copy = try self.allocator.dupe(u8, topic);
         errdefer self.allocator.free(topic_copy);
         try txn.partitions.append(.{ .topic = topic_copy, .partition = partition });
+        if (start_transaction) {
+            txn.status = .ongoing;
+            resetTransactionStart(txn);
+        }
         self.dirty = true;
         return 0;
     }
