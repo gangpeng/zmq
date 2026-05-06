@@ -150,6 +150,25 @@ pub fn parseControllerVoter(raw: []const u8) !ControllerVoter {
     };
 }
 
+pub fn validateControllerVoterSet(alloc: Allocator, voters: []const u8) !void {
+    var parsed = std.array_list.Managed(ControllerVoter).init(alloc);
+    defer parsed.deinit();
+
+    var entries = std.mem.splitScalar(u8, voters, ',');
+    while (entries.next()) |raw_entry| {
+        const voter = try parseControllerVoter(raw_entry);
+        for (parsed.items) |previous| {
+            if (previous.node_id == voter.node_id) return error.DuplicateControllerVoter;
+            if (previous.port == voter.port and std.mem.eql(u8, previous.host, voter.host)) {
+                return error.DuplicateControllerVoterEndpoint;
+            }
+        }
+        try parsed.append(voter);
+    }
+
+    if (parsed.items.len == 0) return error.InvalidControllerVoter;
+}
+
 /// Apply config file properties to BrokerConfig.
 /// Supports the following Kafka-standard properties:
 /// - s3.endpoint.host, s3.endpoint.port, s3.bucket, s3.access.key, s3.secret.key, s3.scheme, s3.region, s3.path.style, s3.tls.ca.file
@@ -341,6 +360,23 @@ test "parseControllerVoter rejects malformed controller quorum entries" {
     for (invalid) |entry| {
         try testing.expectError(error.InvalidControllerVoter, parseControllerVoter(entry));
     }
+}
+
+test "validateControllerVoterSet rejects duplicate controller quorum voters" {
+    try validateControllerVoterSet(testing.allocator, "1@controller-1:9093,2@controller-2:9093");
+
+    try testing.expectError(
+        error.DuplicateControllerVoter,
+        validateControllerVoterSet(testing.allocator, "1@controller-1:9093,1@controller-1-alt:19093"),
+    );
+    try testing.expectError(
+        error.DuplicateControllerVoterEndpoint,
+        validateControllerVoterSet(testing.allocator, "1@controller-1:9093,2@controller-1:9093"),
+    );
+    try testing.expectError(
+        error.InvalidControllerVoter,
+        validateControllerVoterSet(testing.allocator, "1@controller-1:9093,,2@controller-2:9093"),
+    );
 }
 
 test "ConfigFile applies client telemetry export sink" {

@@ -152,6 +152,24 @@ pub const RaftState = struct {
         try self.voters.put(voter_id, .{ .node_id = voter_id });
     }
 
+    /// Register a statically configured controller voter and preserve the
+    /// configured Raft endpoint as voter metadata.
+    pub fn addConfiguredControllerVoter(self: *RaftState, voter_id: i32, host: []const u8, port: u16) !void {
+        if (voter_id < 0 or host.len == 0 or port == 0) return error.InvalidEndpoint;
+
+        const had_voter = self.voters.contains(voter_id);
+        try self.addVoter(voter_id);
+        const endpoints = [_]VoterEndpointView{.{
+            .name = "CONTROLLER",
+            .host = host,
+            .port = port,
+        }};
+        self.updateVoterMetadata(voter_id, [_]u8{0} ** 16, &endpoints, 0, 0) catch |err| {
+            if (!had_voter) self.removeVoter(voter_id);
+            return err;
+        };
+    }
+
     fn freeVoterEndpoints(self: *RaftState, endpoints: []const VoterEndpoint) void {
         for (endpoints) |endpoint| {
             self.allocator.free(endpoint.name);
@@ -1662,6 +1680,38 @@ test "RaftLog append frees copied data when entry allocation fails" {
     try testing.expectError(error.OutOfMemory, raft_log.append(1, "entry-0"));
     try testing.expect(failing_allocator.has_induced_failure);
     try testing.expectEqual(@as(usize, 0), raft_log.length());
+}
+
+test "RaftState addConfiguredControllerVoter records endpoint metadata" {
+    var state = RaftState.init(testing.allocator, 1, "test-cluster");
+    defer state.deinit();
+
+    try state.addConfiguredControllerVoter(2, "controller-2.example", 29093);
+
+    const voter = state.voters.get(2).?;
+    try testing.expectEqual(@as(usize, 1), voter.endpoints.len);
+    try testing.expectEqualStrings("CONTROLLER", voter.endpoints[0].name);
+    try testing.expectEqualStrings("controller-2.example", voter.endpoints[0].host);
+    try testing.expectEqual(@as(u16, 29093), voter.endpoints[0].port);
+}
+
+test "RaftState addConfiguredControllerVoter rolls back allocation failures" {
+    var saw_failure = false;
+    for (0..8) |fail_index| {
+        var failing_allocator = std.testing.FailingAllocator.init(testing.allocator, .{ .fail_index = fail_index });
+        var state = RaftState.init(failing_allocator.allocator(), 1, "test-cluster");
+        defer state.deinit();
+
+        if (state.addConfiguredControllerVoter(2, "controller-2.example", 29093)) {
+            try testing.expect(!failing_allocator.has_induced_failure);
+        } else |err| {
+            try testing.expectEqual(error.OutOfMemory, err);
+            try testing.expect(failing_allocator.has_induced_failure);
+            try testing.expect(!state.voters.contains(2));
+            saw_failure = true;
+        }
+    }
+    try testing.expect(saw_failure);
 }
 
 test "RaftState election" {

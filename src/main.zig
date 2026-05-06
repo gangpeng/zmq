@@ -923,12 +923,14 @@ fn performGracefulShutdown(broker_opt: ?*Broker, controller_opt: ?*Controller) v
 
 fn parseAndRegisterVoters(raft: *RaftState, voters: []const u8, pool: *RaftClientPool) !void {
     // Format: "0@localhost:9092,1@host2:9093"
+    try config_mod.validateControllerVoterSet(raft.allocator, voters);
+
     var parsed_any = false;
     var entries = std.mem.splitScalar(u8, voters, ',');
     while (entries.next()) |raw_entry| {
         const voter = try config_mod.parseControllerVoter(raw_entry);
         parsed_any = true;
-        try raft.addVoter(voter.node_id);
+        try raft.addConfiguredControllerVoter(voter.node_id, voter.host, voter.port);
 
         // Add peer to RaftClientPool (skip self)
         if (voter.node_id != raft.node_id) {
@@ -940,6 +942,8 @@ fn parseAndRegisterVoters(raft: *RaftState, voters: []const u8, pool: *RaftClien
 
 fn parseVotersIntoMetadataClient(mc: *MetadataClient, voters: []const u8) !void {
     // Format: "0@localhost:9093,1@host2:9093"
+    try config_mod.validateControllerVoterSet(mc.allocator, voters);
+
     var parsed_any = false;
     var entries = std.mem.splitScalar(u8, voters, ',');
     while (entries.next()) |raw_entry| {
@@ -954,6 +958,8 @@ fn parseVotersIntoBrokerPeers(brk: *Broker, voters: []const u8, broker_port: u16
     // Static controller voter strings do not carry broker listener ports.
     // Combined-mode Docker/E2E clusters use the same internal broker port on
     // each node, so use the local broker port with the parsed peer host.
+    try config_mod.validateControllerVoterSet(brk.allocator, voters);
+
     var parsed_any = false;
     var entries = std.mem.splitScalar(u8, voters, ',');
     while (entries.next()) |raw_entry| {

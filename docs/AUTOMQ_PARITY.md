@@ -248,8 +248,11 @@ bytes, separately from no-leader quorum state, S3 WAL recovery fails closed when
 a listed WAL object is missing during GET and can retry cleanly, malformed
 epoch-prefixed WAL object keys fence S3 writers instead of being skipped, and
 AddRaftVoter now rejects empty listener sets so committed voters cannot be
-silently omitted from Raft peer wiring; DeleteTopics partition cleanup removes
-known local partition state without heap key formatting.
+silently omitted from Raft peer wiring, static controller quorum voter strings
+reject duplicate node IDs/endpoints, and startup registers static controller
+endpoints into Raft voter metadata with rollback on allocation failure;
+DeleteTopics partition cleanup removes known local partition state without heap
+key formatting.
 
 ## Capability Matrix
 
