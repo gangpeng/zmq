@@ -50,6 +50,7 @@ ERROR_GROUP_ID_NOT_FOUND = 69
 ERROR_SNAPSHOT_NOT_FOUND = 98
 ERROR_RESOURCE_NOT_FOUND = 91
 ERROR_INVALID_UPDATE_VERSION = 95
+ERROR_BROKER_ID_NOT_REGISTERED = 102
 ERROR_UNKNOWN_MEMBER_ID = 25
 ERROR_INVALID_REQUEST = 42
 ERROR_FENCED_MEMBER_EPOCH = 110
@@ -1748,6 +1749,133 @@ def wait_for_dynamic_raft_voter_negative_checkpoint(
         time.sleep(0.25)
     raise TestError(
         f"dynamic Raft voter negative probes did not recover during {label}: "
+        f"{last_error}"
+    )
+
+
+def parse_broker_heartbeat_response(response, correlation_id):
+    pos = parse_flexible_response_header(response, correlation_id)
+    throttle_time_ms, pos = read_i32(response, pos)
+    error_code, pos = read_i16(response, pos)
+    is_caught_up, pos = read_bool(response, pos)
+    is_fenced, pos = read_bool(response, pos)
+    should_shut_down, pos = read_bool(response, pos)
+    pos = skip_tags(response, pos)
+    if pos != len(response):
+        raise TestError(
+            f"BrokerHeartbeat response trailing bytes: {len(response) - pos}"
+        )
+    return {
+        "throttle_time_ms": throttle_time_ms,
+        "error_code": error_code,
+        "is_caught_up": is_caught_up,
+        "is_fenced": is_fenced,
+        "should_shut_down": should_shut_down,
+    }
+
+
+def parse_unregister_broker_response(response, correlation_id):
+    pos = parse_flexible_response_header(response, correlation_id)
+    throttle_time_ms, pos = read_i32(response, pos)
+    error_code, pos = read_i16(response, pos)
+    error_message, pos = read_compact_string(response, pos)
+    pos = skip_tags(response, pos)
+    if pos != len(response):
+        raise TestError(
+            f"UnregisterBroker response trailing bytes: {len(response) - pos}"
+        )
+    return {
+        "throttle_time_ms": throttle_time_ms,
+        "error_code": error_code,
+        "error_message": error_message,
+    }
+
+
+def broker_heartbeat_unknown(port, broker_id, correlation_id):
+    offline_log_dirs_tag = write_compact_array_len(1)
+    offline_log_dirs_tag += raft_voter_directory_id(broker_id)
+
+    body = bytearray()
+    body += struct.pack(">iqq", broker_id, -1, 0)
+    body += b"\x00"  # want_fence=false
+    body += b"\x00"  # want_shut_down=false
+    body += write_varint(1)  # tagged field count
+    body += write_varint(0)  # offline_log_dirs tag
+    body += write_varint(len(offline_log_dirs_tag))
+    body += offline_log_dirs_tag
+    response = flexible_kafka_request(port, 63, 1, correlation_id, bytes(body))
+    return parse_broker_heartbeat_response(response, correlation_id)
+
+
+def unregister_broker_unknown(port, broker_id, correlation_id):
+    body = struct.pack(">i", broker_id)
+    body += b"\x00"  # request tagged fields
+    response = flexible_kafka_request(port, 64, 0, correlation_id, body)
+    return parse_unregister_broker_response(response, correlation_id)
+
+
+def require_broker_lifecycle_negative_response(response, response_name, label):
+    if response["throttle_time_ms"] != 0:
+        raise TestError(
+            f"{response_name} throttle mismatch during {label}: {response}"
+        )
+    if response["error_code"] != ERROR_BROKER_ID_NOT_REGISTERED:
+        raise TestError(
+            f"{response_name} error mismatch during {label}: {response}"
+        )
+
+
+def wait_for_broker_lifecycle_negative_checkpoint(
+    port,
+    state,
+    label,
+    timeout=30,
+):
+    deadline = time.time() + timeout
+    correlation_id = state.get("correlation_id", 9540)
+    broker_id = state.get("broker_id", 60100)
+    last_error = None
+    while time.time() < deadline:
+        try:
+            heartbeat = broker_heartbeat_unknown(port, broker_id, correlation_id)
+            require_broker_lifecycle_negative_response(
+                heartbeat,
+                "BrokerHeartbeat",
+                label,
+            )
+            if (
+                heartbeat["is_caught_up"]
+                or not heartbeat["is_fenced"]
+                or heartbeat["should_shut_down"]
+            ):
+                raise TestError(
+                    f"BrokerHeartbeat unknown broker state mismatch during {label}: "
+                    f"{heartbeat}"
+                )
+
+            unregister = unregister_broker_unknown(
+                port,
+                broker_id,
+                correlation_id + 1,
+            )
+            require_broker_lifecycle_negative_response(
+                unregister,
+                "UnregisterBroker",
+                label,
+            )
+
+            state["correlation_id"] = correlation_id + 2
+            state["broker_id"] = broker_id
+            return {
+                "heartbeat": heartbeat,
+                "unregister": unregister,
+            }
+        except Exception as exc:
+            last_error = exc
+        correlation_id += 2
+        time.sleep(0.25)
+    raise TestError(
+        f"broker lifecycle negative probes did not recover during {label}: "
         f"{last_error}"
     )
 
@@ -10773,6 +10901,12 @@ def main():
             dynamic_voter_state,
             "initial leader",
         )
+        broker_lifecycle_state = {"correlation_id": 9540, "broker_id": 60100}
+        wait_for_broker_lifecycle_negative_checkpoint(
+            processes[leader_id]["port"],
+            broker_lifecycle_state,
+            "initial leader",
+        )
 
         broker = start_broker(tmp, voters)
         wait_for_broker_ready(broker["proc"], broker["port"], broker["log_path"])
@@ -11413,6 +11547,11 @@ def main():
                 dynamic_voter_state,
                 "network partition matrix",
             )
+            wait_for_broker_lifecycle_negative_checkpoint(
+                processes[leader_id]["port"],
+                broker_lifecycle_state,
+                "network partition matrix",
+            )
         wait_for_log_position_checkpoint(
             broker["port"],
             topic,
@@ -11555,6 +11694,11 @@ def main():
             processes[replacement_leader]["port"],
             ports,
             dynamic_voter_state,
+            "controller leader failover",
+        )
+        wait_for_broker_lifecycle_negative_checkpoint(
+            processes[replacement_leader]["port"],
+            broker_lifecycle_state,
             "controller leader failover",
         )
         wait_for_payloads(broker["port"], topic, expected_payloads)
@@ -11737,6 +11881,11 @@ def main():
             dynamic_voter_state,
             "old leader fresh rejoin",
         )
+        wait_for_broker_lifecycle_negative_checkpoint(
+            processes[replacement_leader]["port"],
+            broker_lifecycle_state,
+            "old leader fresh rejoin",
+        )
 
         wait_for_payloads(broker["port"], topic, expected_payloads)
         wait_for_log_position_checkpoint(
@@ -11914,6 +12063,11 @@ def main():
             dynamic_voter_state,
             "surviving controller restart",
         )
+        wait_for_broker_lifecycle_negative_checkpoint(
+            processes[replacement_leader]["port"],
+            broker_lifecycle_state,
+            "surviving controller restart",
+        )
 
         wait_for_payloads(broker["port"], topic, expected_payloads)
         wait_for_log_position_checkpoint(
@@ -12076,6 +12230,11 @@ def main():
             processes[replacement_leader]["port"],
             ports,
             dynamic_voter_state,
+            "broker restart",
+        )
+        wait_for_broker_lifecycle_negative_checkpoint(
+            processes[replacement_leader]["port"],
+            broker_lifecycle_state,
             "broker restart",
         )
         wait_for_payloads(broker["port"], topic, expected_payloads)
@@ -12343,6 +12502,7 @@ def main():
             f"fetch_snapshot_v1_checked=true, "
             f"controller_api_versions_checked=true, "
             f"dynamic_raft_voter_negative_checked=true, "
+            f"broker_lifecycle_negative_checked=true, "
             f"committed_offset={committed_offset}, "
             f"transactions_checked=5, "
             f"transaction_introspection_checked=true, "
@@ -13013,6 +13173,54 @@ def self_test():
             update_voter_response,
             ERROR_INVALID_UPDATE_VERSION,
             "UpdateRaftVoter fixture",
+            "self-test",
+        )
+
+        broker_heartbeat_fixture = struct.pack(">i", 190)
+        broker_heartbeat_fixture += b"\x00"  # response header tagged fields
+        broker_heartbeat_fixture += struct.pack(
+            ">ih???",
+            0,
+            ERROR_BROKER_ID_NOT_REGISTERED,
+            False,
+            True,
+            False,
+        )
+        broker_heartbeat_fixture += b"\x00"  # response tagged fields
+        broker_heartbeat_response = parse_broker_heartbeat_response(
+            broker_heartbeat_fixture,
+            190,
+        )
+        require_broker_lifecycle_negative_response(
+            broker_heartbeat_response,
+            "BrokerHeartbeat fixture",
+            "self-test",
+        )
+        if (
+            broker_heartbeat_response["is_caught_up"]
+            or not broker_heartbeat_response["is_fenced"]
+            or broker_heartbeat_response["should_shut_down"]
+        ):
+            raise TestError(
+                f"BrokerHeartbeat fixture parser failed: {broker_heartbeat_response}"
+            )
+
+        unregister_broker_fixture = struct.pack(">i", 191)
+        unregister_broker_fixture += b"\x00"  # response header tagged fields
+        unregister_broker_fixture += struct.pack(
+            ">ih",
+            0,
+            ERROR_BROKER_ID_NOT_REGISTERED,
+        )
+        unregister_broker_fixture += write_compact_string(None)
+        unregister_broker_fixture += b"\x00"  # response tagged fields
+        unregister_broker_response = parse_unregister_broker_response(
+            unregister_broker_fixture,
+            191,
+        )
+        require_broker_lifecycle_negative_response(
+            unregister_broker_response,
+            "UnregisterBroker fixture",
             "self-test",
         )
 
