@@ -44,6 +44,8 @@ PORT_BASE = int(os.environ.get("ZMQ_KRAFT_CONTROLLER_PORT_BASE", "39093"))
 BROKER_PORT = int(os.environ.get("ZMQ_KRAFT_BROKER_PORT", "39092"))
 CLUSTER_ID = f"zmq-kraft-failover-{os.getpid()}-{int(time.time())}"
 ERROR_GROUP_ID_NOT_FOUND = 69
+ERROR_UNKNOWN_MEMBER_ID = 25
+ERROR_FENCED_MEMBER_EPOCH = 110
 
 
 class TestError(Exception):
@@ -1058,10 +1060,15 @@ def parse_offset_fetch_grouped_response(response, correlation_id):
     return groups
 
 
-def offset_fetch_grouped(port, group_requests, correlation_id, require_stable=False):
+def offset_fetch_grouped(
+    port, group_requests, correlation_id, require_stable=False, api_version=8
+):
     body = bytearray(write_compact_array_len(len(group_requests)))
     for group_request in group_requests:
         body += write_compact_string(group_request["group_id"])
+        if api_version >= 9:
+            body += write_compact_string(group_request.get("member_id"))
+            body += struct.pack(">i", group_request.get("member_epoch", -1))
         topics = group_request.get("topics")
         if topics is None:
             body += b"\x00"  # null topics fetches all committed offsets.
@@ -1075,35 +1082,40 @@ def offset_fetch_grouped(port, group_requests, correlation_id, require_stable=Fa
     body += b"\x01" if require_stable else b"\x00"
     body += b"\x00"  # request tagged fields
 
-    response = flexible_kafka_request(port, 9, 8, correlation_id, bytes(body))
+    response = flexible_kafka_request(port, 9, api_version, correlation_id, bytes(body))
     return parse_offset_fetch_grouped_response(response, correlation_id)
 
 
-def assert_offset_fetch_grouped(port, group_requests, expected_groups, correlation_id):
-    groups = offset_fetch_grouped(port, group_requests, correlation_id)
+def assert_offset_fetch_grouped(
+    port, group_requests, expected_groups, correlation_id, api_version=8
+):
+    groups = offset_fetch_grouped(
+        port, group_requests, correlation_id, api_version=api_version
+    )
+    api_label = f"OffsetFetch v{api_version}"
     if len(groups) != len(expected_groups):
         raise TestError(
-            f"OffsetFetch v8 group count={len(groups)} expected={len(expected_groups)} "
+            f"{api_label} group count={len(groups)} expected={len(expected_groups)} "
             f"groups={groups}"
         )
 
     for group_idx, (group, expected_group) in enumerate(zip(groups, expected_groups)):
         if group["group_id"] != expected_group["group_id"]:
             raise TestError(
-                f"OffsetFetch v8 group[{group_idx}] id={group['group_id']!r} "
+                f"{api_label} group[{group_idx}] id={group['group_id']!r} "
                 f"expected={expected_group['group_id']!r}"
             )
         expected_group_error = expected_group.get("error_code", 0)
         if group["error_code"] != expected_group_error:
             raise TestError(
-                f"OffsetFetch v8 group[{group_idx}] error={group['error_code']} "
+                f"{api_label} group[{group_idx}] error={group['error_code']} "
                 f"expected={expected_group_error} group={group}"
             )
 
         expected_topics = expected_group.get("topics", [])
         if len(group["topics"]) != len(expected_topics):
             raise TestError(
-                f"OffsetFetch v8 group[{group_idx}] topic count={len(group['topics'])} "
+                f"{api_label} group[{group_idx}] topic count={len(group['topics'])} "
                 f"expected={len(expected_topics)} group={group}"
             )
         for topic_idx, (actual_topic, expected_topic) in enumerate(
@@ -1111,13 +1123,13 @@ def assert_offset_fetch_grouped(port, group_requests, expected_groups, correlati
         ):
             if actual_topic["name"] != expected_topic["name"]:
                 raise TestError(
-                    f"OffsetFetch v8 group[{group_idx}] topic[{topic_idx}] "
+                    f"{api_label} group[{group_idx}] topic[{topic_idx}] "
                     f"name={actual_topic['name']!r} expected={expected_topic['name']!r}"
                 )
             expected_partitions = expected_topic.get("partitions", [])
             if len(actual_topic["partitions"]) != len(expected_partitions):
                 raise TestError(
-                    f"OffsetFetch v8 group[{group_idx}] topic[{topic_idx}] "
+                    f"{api_label} group[{group_idx}] topic[{topic_idx}] "
                     f"partition count={len(actual_topic['partitions'])} "
                     f"expected={len(expected_partitions)} topic={actual_topic}"
                 )
@@ -1127,7 +1139,7 @@ def assert_offset_fetch_grouped(port, group_requests, expected_groups, correlati
                 for key in ("partition", "offset", "error_code"):
                     if actual_partition[key] != expected_partition[key]:
                         raise TestError(
-                            f"OffsetFetch v8 group[{group_idx}] topic[{topic_idx}] "
+                            f"{api_label} group[{group_idx}] topic[{topic_idx}] "
                             f"partition[{partition_idx}] {key}={actual_partition[key]} "
                             f"expected={expected_partition[key]} "
                             f"partition={actual_partition}"
@@ -1136,7 +1148,7 @@ def assert_offset_fetch_grouped(port, group_requests, expected_groups, correlati
                     actual_partition["metadata"] != expected_partition["metadata"]
                 ):
                     raise TestError(
-                        f"OffsetFetch v8 group[{group_idx}] topic[{topic_idx}] "
+                        f"{api_label} group[{group_idx}] topic[{topic_idx}] "
                         f"partition[{partition_idx}] metadata="
                         f"{actual_partition['metadata']!r} "
                         f"expected={expected_partition['metadata']!r}"
@@ -1249,6 +1261,92 @@ def wait_for_offset_fetch_grouped_checkpoint(
         correlation_id += 1
         time.sleep(0.25)
     raise TestError(f"OffsetFetch v8 grouped checkpoint did not recover: {last_error}")
+
+
+def wait_for_offset_fetch_v9_member_checkpoint(port, group_state, topic, timeout=30):
+    deadline = time.time() + timeout
+    correlation_id = 8150
+    last_error = None
+    group_id = group_state["group_id"]
+    member_id = group_state["member_id"]
+    member_epoch = group_state["member_epoch"]
+    topic_request = {"name": topic, "partitions": [0]}
+    empty_offset_topic = {
+        "name": topic,
+        "partitions": [
+            {
+                "partition": 0,
+                "offset": -1,
+                "metadata": None,
+                "error_code": 0,
+            }
+        ],
+    }
+    group_requests = [
+        {
+            "group_id": group_id,
+            "member_id": member_id,
+            "member_epoch": member_epoch,
+            "topics": [topic_request],
+        },
+        {
+            "group_id": group_id,
+            "member_id": None,
+            "member_epoch": -1,
+            "topics": [topic_request],
+        },
+        {
+            "group_id": group_id,
+            "member_id": f"{member_id}-missing",
+            "member_epoch": member_epoch,
+            "topics": [topic_request],
+        },
+        {
+            "group_id": group_id,
+            "member_id": member_id,
+            "member_epoch": member_epoch + 1,
+            "topics": [topic_request],
+        },
+    ]
+    expected_groups = [
+        {
+            "group_id": group_id,
+            "topics": [empty_offset_topic],
+        },
+        {
+            "group_id": group_id,
+            "topics": [empty_offset_topic],
+        },
+        {
+            "group_id": group_id,
+            "topics": [],
+            "error_code": ERROR_UNKNOWN_MEMBER_ID,
+        },
+        {
+            "group_id": group_id,
+            "topics": [],
+            "error_code": ERROR_FENCED_MEMBER_EPOCH,
+        },
+    ]
+
+    while time.time() < deadline:
+        try:
+            assert_offset_fetch_grouped(
+                port,
+                group_requests,
+                expected_groups,
+                correlation_id,
+                api_version=9,
+            )
+            return
+        except Exception as exc:
+            last_error = exc
+        correlation_id += 1
+        time.sleep(0.25)
+    raise TestError(
+        f"OffsetFetch v9 member checkpoint did not recover for {group_id!r}: "
+        f"{last_error}"
+    )
 
 
 def parse_offset_delete_response(response, correlation_id, expected_topic):
@@ -4921,6 +5019,11 @@ def main():
             kip848_group_state,
             topic,
         )
+        wait_for_offset_fetch_v9_member_checkpoint(
+            broker["port"],
+            kip848_group_state,
+            topic,
+        )
         wait_for_offset_fetch_grouped_checkpoint(
             broker["port"],
             group,
@@ -4973,6 +5076,11 @@ def main():
         )
         wait_for_consumer_group_heartbeat(broker["port"], kip848_group_state)
         wait_for_kip848_consumer_group_description(
+            broker["port"],
+            kip848_group_state,
+            topic,
+        )
+        wait_for_offset_fetch_v9_member_checkpoint(
             broker["port"],
             kip848_group_state,
             topic,
@@ -5033,6 +5141,11 @@ def main():
         )
         wait_for_consumer_group_heartbeat(broker["port"], kip848_group_state)
         wait_for_kip848_consumer_group_description(
+            broker["port"],
+            kip848_group_state,
+            topic,
+        )
+        wait_for_offset_fetch_v9_member_checkpoint(
             broker["port"],
             kip848_group_state,
             topic,
@@ -5103,6 +5216,11 @@ def main():
         )
         wait_for_consumer_group_heartbeat(broker["port"], kip848_group_state)
         wait_for_kip848_consumer_group_description(
+            broker["port"],
+            kip848_group_state,
+            topic,
+        )
+        wait_for_offset_fetch_v9_member_checkpoint(
             broker["port"],
             kip848_group_state,
             topic,
@@ -5178,6 +5296,11 @@ def main():
         )
         wait_for_consumer_group_heartbeat(broker["port"], kip848_group_state)
         wait_for_kip848_consumer_group_description(
+            broker["port"],
+            kip848_group_state,
+            topic,
+        )
+        wait_for_offset_fetch_v9_member_checkpoint(
             broker["port"],
             kip848_group_state,
             topic,
@@ -5265,6 +5388,11 @@ def main():
         )
         wait_for_consumer_group_heartbeat(broker["port"], kip848_group_state)
         wait_for_kip848_consumer_group_description(
+            broker["port"],
+            kip848_group_state,
+            topic,
+        )
+        wait_for_offset_fetch_v9_member_checkpoint(
             broker["port"],
             kip848_group_state,
             topic,
@@ -5414,6 +5542,7 @@ def main():
             f"find_coordinator_checked=true, "
             f"consumer_group_heartbeat_checked=true, "
             f"kip848_describe_checked=true, "
+            f"offset_fetch_v9_member_checked=true, "
             f"network_partition={network_partition_result}, "
             f"automq_old_leader_fresh_rejoin={automq_result['old_leader_fresh_rejoin']})"
         )
@@ -5549,6 +5678,32 @@ def self_test():
         ):
             raise TestError(
                 f"OffsetFetch v8 grouped fixture parser failed: {grouped_fetch}"
+            )
+        v9_member_fetch_fixture = struct.pack(">i", 244)
+        v9_member_fetch_fixture += b"\x00"  # response header tagged fields
+        v9_member_fetch_fixture += struct.pack(">i", 0)
+        v9_member_fetch_fixture += write_compact_array_len(2)
+        for group_id, error_code in (
+            ("v9-unknown-member-self-test", ERROR_UNKNOWN_MEMBER_ID),
+            ("v9-fenced-member-self-test", ERROR_FENCED_MEMBER_EPOCH),
+        ):
+            v9_member_fetch_fixture += write_compact_string(group_id)
+            v9_member_fetch_fixture += write_compact_array_len(0)
+            v9_member_fetch_fixture += struct.pack(">h", error_code)
+            v9_member_fetch_fixture += b"\x00"  # group tagged fields
+        v9_member_fetch_fixture += b"\x00"  # response tagged fields
+        v9_member_fetch = parse_offset_fetch_grouped_response(
+            v9_member_fetch_fixture, 244
+        )
+        if (
+            len(v9_member_fetch) != 2
+            or v9_member_fetch[0]["error_code"] != ERROR_UNKNOWN_MEMBER_ID
+            or v9_member_fetch[1]["error_code"] != ERROR_FENCED_MEMBER_EPOCH
+            or v9_member_fetch[0]["topics"]
+            or v9_member_fetch[1]["topics"]
+        ):
+            raise TestError(
+                f"OffsetFetch v9 member fixture parser failed: {v9_member_fetch}"
             )
 
         delete_fixture = struct.pack(">ihi", 144, 0, 0)
