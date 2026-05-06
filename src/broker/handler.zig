@@ -22528,23 +22528,13 @@ pub const Broker = struct {
 
         if (!validateAssignReplicasToDirsRequestFrame(request_bytes, body_start)) {
             log.warn("Malformed AssignReplicasToDirs request", .{});
-            const resp = Resp{
-                .throttle_time_ms = 0,
-                .error_code = ErrorCode.invalid_request.toInt(),
-                .directories = &.{},
-            };
-            return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+            return self.assignReplicasToDirsErrorResponse(req_header, resp_header_version, api_version, ErrorCode.invalid_request);
         }
 
         var pos = body_start;
         var req = Req.deserialize(self.allocator, request_bytes, &pos, api_version) catch |err| {
             log.warn("Failed to decode AssignReplicasToDirs request: {}", .{err});
-            const resp = Resp{
-                .throttle_time_ms = 0,
-                .error_code = ErrorCode.invalid_request.toInt(),
-                .directories = &.{},
-            };
-            return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+            return self.assignReplicasToDirsErrorResponse(req_header, resp_header_version, api_version, ErrorCode.invalid_request);
         };
         defer self.freeAssignReplicasToDirsRequest(&req);
 
@@ -22557,12 +22547,25 @@ pub const Broker = struct {
             pending_assignments.deinit();
         }
 
-        const directories = self.buildAssignReplicasToDirsDirectories(req, top_error, &pending_assignments) catch return null;
+        const directories = self.buildAssignReplicasToDirsDirectories(req, top_error, &pending_assignments) catch |err| {
+            log.warn("AssignReplicasToDirs response materialization failed: {}", .{err});
+            return self.assignReplicasToDirsErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error);
+        };
         defer self.freeAssignReplicasToDirsDirectories(directories);
 
         var response_error = top_error;
         if (top_error == .none and pending_assignments.items.len > 0) {
-            var previous_assignments = self.cloneReplicaDirectoryAssignments() catch return null;
+            var previous_assignments = self.cloneReplicaDirectoryAssignments() catch |err| {
+                log.warn("AssignReplicasToDirs assignment snapshot clone failed: {}", .{err});
+                self.markAssignReplicasToDirsStorageError(directories);
+                const resp = Resp{
+                    .throttle_time_ms = 0,
+                    .error_code = ErrorCode.kafka_storage_error.toInt(),
+                    .directories = directories,
+                };
+                return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version) orelse
+                    self.assignReplicasToDirsErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error);
+            };
             defer self.freeReplicaDirectoryAssignmentSnapshot(&previous_assignments);
 
             var mutation_failed = false;
@@ -22600,6 +22603,19 @@ pub const Broker = struct {
             .throttle_time_ms = 0,
             .error_code = response_error.toInt(),
             .directories = directories,
+        };
+        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version) orelse {
+            log.warn("AssignReplicasToDirs response serialization failed", .{});
+            return self.assignReplicasToDirsErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error);
+        };
+    }
+
+    fn assignReplicasToDirsErrorResponse(self: *Broker, req_header: *const RequestHeader, resp_header_version: i16, api_version: i16, err_code: ErrorCode) ?[]u8 {
+        const Resp = generated.assign_replicas_to_dirs_response.AssignReplicasToDirsResponse;
+        const resp = Resp{
+            .throttle_time_ms = 0,
+            .error_code = @intFromEnum(err_code),
+            .directories = &.{},
         };
         return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
     }
@@ -42746,6 +42762,77 @@ test "Broker.handleRequest AssignReplicasToDirs rejects malformed request" {
 
     try testing.expectEqual(response.?.len, rpos);
     try testing.expectEqual(ErrorCode.invalid_request.toInt(), resp.error_code);
+}
+
+test "Broker.handleRequest AssignReplicasToDirs fails closed when response materialization fails" {
+    const Req = generated.assign_replicas_to_dirs_request.AssignReplicasToDirsRequest;
+    const Resp = generated.assign_replicas_to_dirs_response.AssignReplicasToDirsResponse;
+    const DirectoryData = Req.DirectoryData;
+    const TopicData = DirectoryData.TopicData;
+    const PartitionData = TopicData.PartitionData;
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+    try broker.authorizer.addSuperUser("test-client");
+
+    const directory_id = [_]u8{0xe1} ** 16;
+    _ = broker.ensureTopic("assign-dir-materialize-fail-topic");
+    const topic_id = broker.topics.get("assign-dir-materialize-fail-topic").?.topic_id;
+    const partitions = [_]PartitionData{.{ .partition_index = 0 }};
+    const topics = [_]TopicData{.{ .topic_id = topic_id, .partitions = &partitions }};
+    const directories = [_]DirectoryData{.{ .id = directory_id, .topics = &topics }};
+    const req = Req{
+        .broker_id = 1,
+        .broker_epoch = 1,
+        .directories = &directories,
+    };
+
+    var buf: [256]u8 = undefined;
+    var pos = buildTestRequest(&buf, 73, 0, 7312, header_mod.requestHeaderVersion(73, 0));
+    req.serialize(&buf, &pos, 0);
+
+    var failing_allocator = OneShotFailingAllocator.init(testing.allocator, 3);
+    const response_allocator = failing_allocator.allocator();
+    broker.allocator = response_allocator;
+
+    const response = broker.handleRequest(buf[0..pos]);
+    broker.allocator = testing.allocator;
+
+    try testing.expect(failing_allocator.failed);
+    try testing.expect(response != null);
+    defer response_allocator.free(response.?);
+
+    const error_code = try readGeneratedTopLevelErrorCode(Resp, response.?, 73, 0, 7312);
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.kafka_storage_error)), error_code);
+    try testing.expect((try broker.getReplicaDirectoryAssignment(topic_id, 0)) == null);
+}
+
+test "Broker.handleRequest AssignReplicasToDirs fails closed when response serialization fails" {
+    const Req = generated.assign_replicas_to_dirs_request.AssignReplicasToDirsRequest;
+    const Resp = generated.assign_replicas_to_dirs_response.AssignReplicasToDirsResponse;
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+    try broker.authorizer.addSuperUser("test-client");
+
+    const req = Req{ .broker_id = 1, .broker_epoch = 1, .directories = &.{} };
+    var buf: [128]u8 = undefined;
+    var pos = buildTestRequest(&buf, 73, 0, 7313, header_mod.requestHeaderVersion(73, 0));
+    req.serialize(&buf, &pos, 0);
+
+    var failing_allocator = OneShotFailingAllocator.init(testing.allocator, 0);
+    const response_allocator = failing_allocator.allocator();
+    broker.allocator = response_allocator;
+
+    const response = broker.handleRequest(buf[0..pos]);
+    broker.allocator = testing.allocator;
+
+    try testing.expect(failing_allocator.failed);
+    try testing.expect(response != null);
+    defer response_allocator.free(response.?);
+
+    const error_code = try readGeneratedTopLevelErrorCode(Resp, response.?, 73, 0, 7313);
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.kafka_storage_error)), error_code);
 }
 
 test "Broker.handleRequest AssignReplicasToDirs authorization denial uses generated response" {
