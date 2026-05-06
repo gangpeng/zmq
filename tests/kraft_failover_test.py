@@ -999,6 +999,105 @@ def wait_for_describe_configs_checkpoint(port, topic, timeout=30):
     raise TestError(f"DescribeConfigs did not recover for {topic!r}: {last_error}")
 
 
+def parse_describe_log_dirs_response(response, correlation_id):
+    pos = parse_flexible_response_header(response, correlation_id)
+    throttle_time_ms, pos = read_i32(response, pos)
+    error_code, pos = read_i16(response, pos)
+    result_count, pos = read_compact_array_len(response, pos)
+    results = []
+    for _ in range(result_count):
+        result_error, pos = read_i16(response, pos)
+        log_dir, pos = read_compact_string(response, pos)
+        topic_count, pos = read_compact_array_len(response, pos)
+        topics = []
+        for _ in range(topic_count):
+            topic_name, pos = read_compact_string(response, pos)
+            partition_count, pos = read_compact_array_len(response, pos)
+            partitions = []
+            for _ in range(partition_count):
+                partition_index, pos = read_i32(response, pos)
+                partition_size, pos = read_i64(response, pos)
+                offset_lag, pos = read_i64(response, pos)
+                is_future_key, pos = read_bool(response, pos)
+                pos = skip_tags(response, pos)
+                partitions.append(
+                    {
+                        "partition_index": partition_index,
+                        "partition_size": partition_size,
+                        "offset_lag": offset_lag,
+                        "is_future_key": is_future_key,
+                    }
+                )
+            pos = skip_tags(response, pos)
+            topics.append({"name": topic_name, "partitions": partitions})
+        total_bytes, pos = read_i64(response, pos)
+        usable_bytes, pos = read_i64(response, pos)
+        pos = skip_tags(response, pos)
+        results.append(
+            {
+                "error_code": result_error,
+                "log_dir": log_dir,
+                "topics": topics,
+                "total_bytes": total_bytes,
+                "usable_bytes": usable_bytes,
+            }
+        )
+    pos = skip_tags(response, pos)
+    if pos != len(response):
+        raise TestError(f"DescribeLogDirs response trailing bytes: {len(response) - pos}")
+    return {
+        "throttle_time_ms": throttle_time_ms,
+        "error_code": error_code,
+        "results": results,
+    }
+
+
+def describe_log_dirs(port, topic, correlation_id):
+    body = write_compact_array_len(1)
+    body += write_compact_string(topic)
+    body += write_compact_i32_array([0])
+    body += b"\x00"  # topic tagged fields
+    body += b"\x00"  # request tagged fields
+    response = flexible_kafka_request(port, 35, 4, correlation_id, body)
+    return parse_describe_log_dirs_response(response, correlation_id)
+
+
+def wait_for_describe_log_dirs_checkpoint(port, topic, timeout=30):
+    deadline = time.time() + timeout
+    correlation_id = 8550
+    last_error = None
+    while time.time() < deadline:
+        try:
+            response = describe_log_dirs(port, topic, correlation_id)
+            if response["throttle_time_ms"] != 0 or response["error_code"] != 0:
+                raise TestError(f"DescribeLogDirs top-level mismatch: {response}")
+            results = response["results"]
+            if len(results) != 1 or results[0]["error_code"] != 0:
+                raise TestError(f"DescribeLogDirs result mismatch: {response}")
+            result = results[0]
+            if not result["log_dir"]:
+                raise TestError(f"DescribeLogDirs missing log dir: {response}")
+            topics = result["topics"]
+            if len(topics) != 1 or topics[0]["name"] != topic:
+                raise TestError(f"DescribeLogDirs topic mismatch: {response}")
+            partitions = topics[0]["partitions"]
+            if len(partitions) != 1:
+                raise TestError(f"DescribeLogDirs partition count mismatch: {response}")
+            partition = partitions[0]
+            if partition["partition_index"] != 0:
+                raise TestError(f"DescribeLogDirs partition index mismatch: {response}")
+            if partition["partition_size"] < 1:
+                raise TestError(f"DescribeLogDirs partition size mismatch: {response}")
+            if partition["offset_lag"] != 0 or partition["is_future_key"]:
+                raise TestError(f"DescribeLogDirs future/lag mismatch: {response}")
+            return
+        except Exception as exc:
+            last_error = exc
+        correlation_id += 1
+        time.sleep(0.25)
+    raise TestError(f"DescribeLogDirs did not recover for {topic!r}: {last_error}")
+
+
 def parse_nullable_compact_i32_array(buf, pos):
     raw_len, pos = read_varint(buf, pos)
     if raw_len == 0:
@@ -7547,6 +7646,10 @@ def main():
                 broker["port"],
                 topic,
             )
+            wait_for_describe_log_dirs_checkpoint(
+                broker["port"],
+                topic,
+            )
             wait_for_describe_cluster_checkpoint(
                 broker["port"],
                 100,
@@ -8663,6 +8766,7 @@ def main():
             f"delete_records_checked=true, "
             f"describe_topic_partitions_checked=true, "
             f"describe_configs_checked=true, "
+            f"describe_log_dirs_checked=true, "
             f"describe_cluster_checked=true, "
             f"idempotent_producer_fencing=true, "
             f"describe_producers_checked=true, "
@@ -8985,6 +9089,37 @@ def self_test():
         ):
             raise TestError(
                 f"DescribeConfigs fixture parser failed: {described_configs}"
+            )
+
+        describe_log_dirs_fixture = struct.pack(">i", 167)
+        describe_log_dirs_fixture += b"\x00"  # response header tagged fields
+        describe_log_dirs_fixture += struct.pack(">ih", 0, 0)
+        describe_log_dirs_fixture += write_compact_array_len(1)
+        describe_log_dirs_fixture += struct.pack(">h", 0)
+        describe_log_dirs_fixture += write_compact_string("/tmp/zmq-log")
+        describe_log_dirs_fixture += write_compact_array_len(1)
+        describe_log_dirs_fixture += write_compact_string("log-dir-self-test")
+        describe_log_dirs_fixture += write_compact_array_len(1)
+        describe_log_dirs_fixture += struct.pack(">iqq", 0, 7, 0)
+        describe_log_dirs_fixture += b"\x00"  # is_future_key=false
+        describe_log_dirs_fixture += b"\x00"  # partition tagged fields
+        describe_log_dirs_fixture += b"\x00"  # topic tagged fields
+        describe_log_dirs_fixture += struct.pack(">qq", -1, -1)
+        describe_log_dirs_fixture += b"\x00"  # result tagged fields
+        describe_log_dirs_fixture += b"\x00"  # response tagged fields
+        described_log_dirs = parse_describe_log_dirs_response(
+            describe_log_dirs_fixture, 167
+        )
+        if (
+            described_log_dirs["results"][0]["topics"][0]["name"]
+            != "log-dir-self-test"
+            or described_log_dirs["results"][0]["topics"][0]["partitions"][0][
+                "partition_size"
+            ]
+            != 7
+        ):
+            raise TestError(
+                f"DescribeLogDirs fixture parser failed: {described_log_dirs}"
             )
 
         topic_partitions_fixture = struct.pack(">i", 164)
