@@ -676,9 +676,10 @@ Status: completed for the initial catalog and DeleteGroups slice.
   Normal Metadata, ListOffsets, FindCoordinator, JoinGroup, Heartbeat,
   LeaveGroup, SyncGroup, ConsumerGroupHeartbeat, ListGroups, DescribeGroups,
   ConsumerGroupDescribe, ShareGroupDescribe, OffsetFetch, OffsetForLeaderEpoch,
-  DescribeConfigs, DescribeAcls, and DescribeTransactions/ListTransactions
-  request paths now also return generated invalid-request or storage-error
-  responses when client frames are malformed or response
+  DescribeConfigs, DescribeDelegationToken, DescribeAcls, and
+  DescribeTransactions/ListTransactions request paths now also return generated
+  invalid-request or storage-error responses when client frames are malformed or
+  response
   materialization/serialization fails, instead of silently dropping the
   connection. Group membership mutation paths also fail closed when rollback
   snapshots or local assignment/member materialization fail before a response
@@ -753,6 +754,10 @@ Status: completed for the initial catalog and DeleteGroups slice.
   Broker-port DescribeQuorum now uses the same generated storage-error
   fallback for malformed/error and final read-only response serialization
   failures.
+  Broker-port DescribeDelegationToken normal read paths now return generated
+  invalid-request responses for malformed/trailing frames and generated
+  storage-error responses for description materialization or final response
+  serialization failures.
   ListClientMetricsResources now advertises key 74 v0, decodes generated
   flexible requests, rejects malformed frames, returns a default generated
   resource, and lists active client resources for retained telemetry samples.

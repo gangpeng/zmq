@@ -21381,13 +21381,13 @@ pub const Broker = struct {
 
         if (!validateDescribeDelegationTokenRequestFrame(request_bytes, body_start, api_version)) {
             log.warn("Malformed DescribeDelegationToken request", .{});
-            return null;
+            return self.describeDelegationTokenErrorResponse(req_header, resp_header_version, api_version, ErrorCode.invalid_request);
         }
 
         var pos = body_start;
         var req = Req.deserialize(self.allocator, request_bytes, &pos, api_version) catch |err| {
             log.warn("Failed to decode DescribeDelegationToken request: {}", .{err});
-            return null;
+            return self.describeDelegationTokenErrorResponse(req_header, resp_header_version, api_version, ErrorCode.invalid_request);
         };
         defer self.freeDescribeDelegationTokenRequest(&req);
 
@@ -21397,7 +21397,10 @@ pub const Broker = struct {
                 .tokens = &.{},
                 .throttle_time_ms = 0,
             };
-            return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+            return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version) orelse {
+                log.warn("DescribeDelegationToken delegation-token-auth response serialization failed", .{});
+                return self.describeDelegationTokenErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error);
+            };
         }
 
         const now_ms = @import("time_compat").milliTimestamp();
@@ -21405,7 +21408,7 @@ pub const Broker = struct {
 
         const tokens = self.buildDelegationTokenDescriptions(req.owners) catch |err| {
             log.warn("Failed to describe delegation tokens: {}", .{err});
-            return null;
+            return self.describeDelegationTokenErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error);
         };
         defer {
             self.freeDelegationTokenDescriptions(tokens);
@@ -21417,7 +21420,10 @@ pub const Broker = struct {
             .tokens = tokens,
             .throttle_time_ms = 0,
         };
-        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version) orelse {
+            log.warn("DescribeDelegationToken response serialization failed", .{});
+            return self.describeDelegationTokenErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error);
+        };
     }
 
     fn freeCreateDelegationTokenRequest(self: *Broker, req: *generated.create_delegation_token_request.CreateDelegationTokenRequest) void {
@@ -45183,7 +45189,64 @@ test "Broker.handleRequest delegation token authorization denial fails closed wh
     }
 }
 
+test "Broker.handleRequest DescribeDelegationToken fails closed when response materialization fails" {
+    const DescribeReq = generated.describe_delegation_token_request.DescribeDelegationTokenRequest;
+    const DescribeResp = generated.describe_delegation_token_response.DescribeDelegationTokenResponse;
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+    _ = try testCreateDelegationTokenForOwner(&broker, "describe-materialization-fail-owner", 4116);
+
+    const req = DescribeReq{ .owners = null };
+    var buf: [256]u8 = undefined;
+    var pos = buildTestRequest(&buf, 41, 3, 4117, header_mod.requestHeaderVersion(41, 3));
+    req.serialize(&buf, &pos, 3);
+
+    var failing_allocator = OneShotFailingAllocator.init(testing.allocator, 0);
+    const response_allocator = failing_allocator.allocator();
+    broker.allocator = response_allocator;
+
+    const response = broker.handleRequest(buf[0..pos]);
+    broker.allocator = testing.allocator;
+
+    try testing.expect(failing_allocator.failed);
+    try testing.expect(response != null);
+    defer response_allocator.free(response.?);
+
+    const error_code = try readGeneratedTopLevelErrorCode(DescribeResp, response.?, 41, 3, 4117);
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.kafka_storage_error)), error_code);
+}
+
+test "Broker.handleRequest DescribeDelegationToken fails closed when response serialization fails" {
+    const DescribeReq = generated.describe_delegation_token_request.DescribeDelegationTokenRequest;
+    const DescribeResp = generated.describe_delegation_token_response.DescribeDelegationTokenResponse;
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+
+    const req = DescribeReq{ .owners = null };
+    var buf: [256]u8 = undefined;
+    var pos = buildTestRequest(&buf, 41, 3, 4118, header_mod.requestHeaderVersion(41, 3));
+    req.serialize(&buf, &pos, 3);
+
+    var failing_allocator = OneShotFailingAllocator.init(testing.allocator, 0);
+    const response_allocator = failing_allocator.allocator();
+    broker.allocator = response_allocator;
+
+    const response = broker.handleRequest(buf[0..pos]);
+    broker.allocator = testing.allocator;
+
+    try testing.expect(failing_allocator.failed);
+    try testing.expect(response != null);
+    defer response_allocator.free(response.?);
+
+    const error_code = try readGeneratedTopLevelErrorCode(DescribeResp, response.?, 41, 3, 4118);
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.kafka_storage_error)), error_code);
+}
+
 test "Broker.handleRequest delegation token APIs reject truncated request bodies" {
+    const DescribeResp = generated.describe_delegation_token_response.DescribeDelegationTokenResponse;
+
     var broker = Broker.init(testing.allocator, 1, 9092);
     defer broker.deinit();
 
@@ -45191,13 +45254,23 @@ test "Broker.handleRequest delegation token APIs reject truncated request bodies
         .{ .key = 38, .version = 3, .correlation_id = 3823 },
         .{ .key = 39, .version = 2, .correlation_id = 3922 },
         .{ .key = 40, .version = 2, .correlation_id = 4022 },
-        .{ .key = 41, .version = 3, .correlation_id = 4123 },
     };
 
     for (probes) |probe| {
         var buf: [128]u8 = undefined;
         const req_len = buildTestRequest(&buf, probe.key, probe.version, probe.correlation_id, header_mod.requestHeaderVersion(probe.key, probe.version));
         try testing.expect(broker.handleRequest(buf[0..req_len]) == null);
+    }
+
+    {
+        var buf: [128]u8 = undefined;
+        const req_len = buildTestRequest(&buf, 41, 3, 4123, header_mod.requestHeaderVersion(41, 3));
+        const response = broker.handleRequest(buf[0..req_len]);
+        try testing.expect(response != null);
+        defer testing.allocator.free(response.?);
+
+        const error_code = try readGeneratedTopLevelErrorCode(DescribeResp, response.?, 41, 3, 4123);
+        try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.invalid_request)), error_code);
     }
 }
 
@@ -45206,6 +45279,7 @@ test "Broker.handleRequest delegation token APIs reject trailing bytes" {
     const RenewReq = generated.renew_delegation_token_request.RenewDelegationTokenRequest;
     const ExpireReq = generated.expire_delegation_token_request.ExpireDelegationTokenRequest;
     const DescribeReq = generated.describe_delegation_token_request.DescribeDelegationTokenRequest;
+    const DescribeResp = generated.describe_delegation_token_response.DescribeDelegationTokenResponse;
     const hmac = [_]u8{ 9, 10, 11, 12 };
 
     var broker = Broker.init(testing.allocator, 1, 9092);
@@ -45240,7 +45314,7 @@ test "Broker.handleRequest delegation token APIs reject trailing bytes" {
         var buf: [256]u8 = undefined;
         var pos = buildTestRequest(&buf, 41, 3, 4133, header_mod.requestHeaderVersion(41, 3));
         req.serialize(&buf, &pos, 3);
-        try expectTrailingByteRejected(&broker, buf[0..], pos);
+        try expectTrailingByteRejectedWithGeneratedResponse(DescribeResp, &broker, buf[0..], pos, 41, 3, 4133);
     }
 }
 
