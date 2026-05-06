@@ -11788,13 +11788,14 @@ pub const Broker = struct {
     }
 
     fn handleGenericAuthorizationError(self: *Broker, req_header: *const RequestHeader, resp_header_version: i16, err_code: ErrorCode) ?[]u8 {
-        var buf = self.allocator.alloc(u8, 64) catch return null;
-        var wpos: usize = 0;
-        const resp_header = ResponseHeader{ .correlation_id = req_header.correlation_id };
-        resp_header.serialize(buf, &wpos, resp_header_version);
-        ser.writeI16(buf, &wpos, @intFromEnum(err_code));
-        if (resp_header_version >= 1) ser.writeEmptyTaggedFields(buf, &wpos);
-        return (self.allocator.realloc(buf, wpos) catch buf)[0..wpos];
+        return self.serializeSmallErrorResponse(
+            req_header,
+            resp_header_version,
+            err_code,
+            ErrorCode.kafka_storage_error,
+            resp_header_version >= 1,
+            "generic authorization",
+        );
     }
 
     /// Extract the first topic name from a Produce or Fetch request for topic-specific ACL checks.
@@ -24586,38 +24587,74 @@ pub const Broker = struct {
     // ---------------------------------------------------------------
     fn handleUnsupported(self: *Broker, req_header: *const RequestHeader, api_key: i16, resp_header_version: i16) ?[]u8 {
         log.warn("Unsupported API key: {d}", .{api_key});
+        return self.serializeSmallErrorResponse(
+            req_header,
+            resp_header_version,
+            ErrorCode.unsupported_version,
+            ErrorCode.unsupported_version,
+            false,
+            "unsupported API",
+        );
+    }
+
+    fn serializeSmallErrorResponse(
+        self: *Broker,
+        req_header: *const RequestHeader,
+        resp_header_version: i16,
+        err_code: ErrorCode,
+        fallback_code: ErrorCode,
+        include_body_tags: bool,
+        label: []const u8,
+    ) ?[]u8 {
+        return self.serializeSmallErrorResponseDirect(req_header, resp_header_version, err_code, include_body_tags) orelse {
+            log.warn("{s} response serialization failed", .{label});
+            return self.serializeSmallErrorResponseDirect(req_header, resp_header_version, fallback_code, include_body_tags);
+        };
+    }
+
+    fn serializeSmallErrorResponseDirect(
+        self: *Broker,
+        req_header: *const RequestHeader,
+        resp_header_version: i16,
+        err_code: ErrorCode,
+        include_body_tags: bool,
+    ) ?[]u8 {
         const resp_header = ResponseHeader{ .correlation_id = req_header.correlation_id };
         const header_size = resp_header.calcSize(resp_header_version);
-        const buf = self.allocator.alloc(u8, header_size + 2) catch return null;
+        const body_tags_size: usize = if (include_body_tags) 1 else 0;
+        const buf = self.allocator.alloc(u8, header_size + 2 + body_tags_size) catch return null;
         var wpos: usize = 0;
         resp_header.serialize(buf, &wpos, resp_header_version);
-        ser.writeI16(buf, &wpos, 35); // UNSUPPORTED_VERSION
+        ser.writeI16(buf, &wpos, @intFromEnum(err_code));
+        if (include_body_tags) ser.writeEmptyTaggedFields(buf, &wpos);
         return buf[0..wpos];
     }
 
     /// Return a NOT_CONTROLLER error response (error code 41).
     /// Sent when a KRaft API is received on a broker-only node.
     fn handleNotController(self: *Broker, req_header: *const RequestHeader, resp_header_version: i16) ?[]u8 {
-        const resp_header = ResponseHeader{ .correlation_id = req_header.correlation_id };
-        const header_size = resp_header.calcSize(resp_header_version);
-        const buf = self.allocator.alloc(u8, header_size + 2) catch return null;
-        var wpos: usize = 0;
-        resp_header.serialize(buf, &wpos, resp_header_version);
-        ser.writeI16(buf, &wpos, 41); // NOT_CONTROLLER
-        return buf[0..wpos];
+        return self.serializeSmallErrorResponse(
+            req_header,
+            resp_header_version,
+            ErrorCode.not_controller,
+            ErrorCode.not_controller,
+            false,
+            "not-controller",
+        );
     }
 
     /// Return NOT_LEADER_OR_FOLLOWER (error code 6) during graceful shutdown.
     /// Clients receiving this error will refresh metadata and reconnect to another broker,
     /// achieving seamless traffic migration during rolling restarts.
     fn handleShutdownReject(self: *Broker, req_header: *const RequestHeader, resp_header_version: i16) ?[]u8 {
-        const resp_header = ResponseHeader{ .correlation_id = req_header.correlation_id };
-        const header_size = resp_header.calcSize(resp_header_version);
-        const buf = self.allocator.alloc(u8, header_size + 2) catch return null;
-        var wpos: usize = 0;
-        resp_header.serialize(buf, &wpos, resp_header_version);
-        ser.writeI16(buf, &wpos, 6); // NOT_LEADER_OR_FOLLOWER
-        return buf[0..wpos];
+        return self.serializeSmallErrorResponse(
+            req_header,
+            resp_header_version,
+            ErrorCode.not_leader_or_follower,
+            ErrorCode.not_leader_or_follower,
+            false,
+            "shutdown reject",
+        );
     }
 
     // ---------------------------------------------------------------
@@ -30519,6 +30556,14 @@ fn expectTestResponseHeader(response: []const u8, api_key: i16, api_version: i16
     try testing.expectEqual(correlation_id, response_header.correlation_id);
 }
 
+fn expectSmallErrorResponse(response: []const u8, api_key: i16, api_version: i16, correlation_id: i32, error_code: ErrorCode, has_body_tags: bool) !void {
+    var rpos: usize = 0;
+    try expectTestResponseHeader(response, api_key, api_version, correlation_id, &rpos);
+    try testing.expectEqual(@as(i16, @intFromEnum(error_code)), ser.readI16(response, &rpos));
+    if (has_body_tags) try ser.skipTaggedFields(response, &rpos);
+    try testing.expectEqual(response.len, rpos);
+}
+
 fn testHmacSha256(key: []const u8, data: []const u8, out: *[32]u8) void {
     const HmacSha256 = std.crypto.auth.hmac.sha2.HmacSha256;
     HmacSha256.create(out, data, key);
@@ -33799,6 +33844,100 @@ test "Broker.handleRequest unsupported versions bypass SASL pre-auth gate" {
     try testing.expectEqual(@as(i32, 3623), response_header.correlation_id);
     try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.unsupported_version)), ser.readI16(response.?, &rpos));
     try testing.expectEqual(response.?.len, rpos);
+}
+
+test "Broker.handleRequest small unsupported response retries after allocation failure" {
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+
+    const api_key: i16 = 999;
+    const api_version: i16 = 0;
+    var buf: [128]u8 = undefined;
+    const req_len = buildTestRequest(&buf, api_key, api_version, 3624, header_mod.requestHeaderVersion(api_key, api_version));
+
+    var failing_allocator = OneShotFailingAllocator.init(testing.allocator, 0);
+    const response_allocator = failing_allocator.allocator();
+    broker.allocator = response_allocator;
+
+    const response = broker.handleRequest(buf[0..req_len]);
+    broker.allocator = testing.allocator;
+
+    try testing.expect(failing_allocator.failed);
+    try testing.expect(response != null);
+    defer response_allocator.free(response.?);
+    try expectSmallErrorResponse(response.?, api_key, api_version, 3624, ErrorCode.unsupported_version, false);
+}
+
+test "Broker.handleRequest shutdown reject response retries after allocation failure" {
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+    broker.is_shutting_down = true;
+
+    const api_key: i16 = 0;
+    const api_version: i16 = 0;
+    var buf: [128]u8 = undefined;
+    const req_len = buildTestRequest(&buf, api_key, api_version, 3625, header_mod.requestHeaderVersion(api_key, api_version));
+
+    var failing_allocator = OneShotFailingAllocator.init(testing.allocator, 0);
+    const response_allocator = failing_allocator.allocator();
+    broker.allocator = response_allocator;
+
+    const response = broker.handleRequest(buf[0..req_len]);
+    broker.allocator = testing.allocator;
+
+    try testing.expect(failing_allocator.failed);
+    try testing.expect(response != null);
+    defer response_allocator.free(response.?);
+    try expectSmallErrorResponse(response.?, api_key, api_version, 3625, ErrorCode.not_leader_or_follower, false);
+}
+
+test "Broker.handleRequest fenced produce response retries after allocation failure" {
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+    broker.is_fenced_by_controller = true;
+
+    const api_key: i16 = 0;
+    const api_version: i16 = 0;
+    var buf: [128]u8 = undefined;
+    const req_len = buildTestRequest(&buf, api_key, api_version, 3626, header_mod.requestHeaderVersion(api_key, api_version));
+
+    var failing_allocator = OneShotFailingAllocator.init(testing.allocator, 0);
+    const response_allocator = failing_allocator.allocator();
+    broker.allocator = response_allocator;
+
+    const response = broker.handleRequest(buf[0..req_len]);
+    broker.allocator = testing.allocator;
+
+    try testing.expect(failing_allocator.failed);
+    try testing.expect(response != null);
+    defer response_allocator.free(response.?);
+    try expectSmallErrorResponse(response.?, api_key, api_version, 3626, ErrorCode.not_controller, false);
+}
+
+test "Broker.handleGenericAuthorizationError retries with storage error" {
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+
+    const api_key: i16 = 58;
+    const api_version: i16 = 0;
+    const req_header = RequestHeader{
+        .api_key = api_key,
+        .api_version = api_version,
+        .correlation_id = 3627,
+        .client_id = "test-client",
+    };
+
+    var failing_allocator = OneShotFailingAllocator.init(testing.allocator, 0);
+    const response_allocator = failing_allocator.allocator();
+    broker.allocator = response_allocator;
+
+    const response = broker.handleGenericAuthorizationError(&req_header, header_mod.responseHeaderVersion(api_key, api_version), ErrorCode.cluster_authorization_failed);
+    broker.allocator = testing.allocator;
+
+    try testing.expect(failing_allocator.failed);
+    try testing.expect(response != null);
+    defer response_allocator.free(response.?);
+    try expectSmallErrorResponse(response.?, api_key, api_version, 3627, ErrorCode.kafka_storage_error, true);
 }
 
 test "Broker.handleRequest SaslAuthenticate rejects disabled default PLAIN fallback" {
