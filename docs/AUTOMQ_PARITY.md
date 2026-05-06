@@ -644,6 +644,9 @@ Status: completed for the initial catalog and DeleteGroups slice.
   DescribeConfigs and AlterConfigs authorization-denial builders also return
   generated per-resource invalid-request or storage-error entries for malformed
   denied frames and denial response construction failures.
+  Delegation-token authorization-denial builders now also return generated
+  top-level invalid-request or storage-error responses for malformed denied
+  frames and denial response serialization failures.
   ListClientMetricsResources now advertises key 74 v0, decodes generated
   flexible requests, rejects malformed frames, returns a default generated
   resource, and lists active client resources for retained telemetry samples.
