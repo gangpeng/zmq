@@ -14190,13 +14190,13 @@ pub const Broker = struct {
 
         if (!validateJoinGroupRequestFrame(request_bytes, body_start, api_version)) {
             log.warn("Malformed JoinGroup request", .{});
-            return null;
+            return self.joinGroupErrorResponse(req_header, resp_header_version, api_version, ErrorCode.invalid_request);
         }
 
         var pos = body_start;
         var req = Req.deserialize(self.allocator, request_bytes, &pos, api_version) catch |err| {
             log.warn("Failed to decode JoinGroup request: {}", .{err});
-            return null;
+            return self.joinGroupErrorResponse(req_header, resp_header_version, api_version, ErrorCode.invalid_request);
         };
         defer self.freeJoinGroupRequest(&req);
 
@@ -14215,7 +14215,10 @@ pub const Broker = struct {
                 .member_id = req.member_id orelse "",
                 .members = &.{},
             };
-            return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+            return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version) orelse {
+                log.warn("JoinGroup timeout response serialization failed", .{});
+                return self.joinGroupErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error);
+            };
         }
         const protocol_selection = self.selectJoinGroupProtocol(req.group_id orelse "", protocol_type, req);
         if (protocol_selection.error_code != @intFromEnum(ErrorCode.none)) {
@@ -14230,13 +14233,23 @@ pub const Broker = struct {
                 .member_id = req.member_id orelse "",
                 .members = &.{},
             };
-            return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+            return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version) orelse {
+                log.warn("JoinGroup protocol-error response serialization failed", .{});
+                return self.joinGroupErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error);
+            };
         }
 
-        const previous_snapshot = self.encodeConsumerGroupSnapshotRecordValue() catch return null;
+        const previous_snapshot = self.encodeConsumerGroupSnapshotRecordValue() catch |err| {
+            log.warn("JoinGroup rollback snapshot failed for {s}: {}", .{ req.group_id orelse "", err });
+            return self.joinGroupErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error);
+        };
         defer self.allocator.free(previous_snapshot);
 
-        const result = self.groups.joinGroupWithProtocol(req.group_id orelse "", member_id, req.group_instance_id, protocol_type, protocol_selection.name, protocol_selection.metadata, null) catch return null;
+        const result = self.groups.joinGroupWithProtocol(req.group_id orelse "", member_id, req.group_instance_id, protocol_type, protocol_selection.name, protocol_selection.metadata, null) catch |err| {
+            log.warn("JoinGroup local mutation failed for {s}: {}", .{ req.group_id orelse "", err });
+            self.restoreConsumerGroupsAfterFailedMutation(previous_snapshot);
+            return self.joinGroupErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error);
+        };
         if (result.error_code == @intFromEnum(ErrorCode.none)) {
             _ = self.groups.configureGroupTimeouts(req.group_id orelse "", @intCast(req.session_timeout_ms), effectiveJoinGroupRebalanceTimeout(api_version, req.session_timeout_ms, req.rebalance_timeout_ms));
             self.persistConsumerGroupsDurably() catch |err| {
@@ -14253,13 +14266,19 @@ pub const Broker = struct {
                     .member_id = req.member_id orelse "",
                     .members = &.{},
                 };
-                return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+                return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version) orelse {
+                    log.warn("JoinGroup persistence-error response serialization failed", .{});
+                    return self.joinGroupErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error);
+                };
             };
         }
 
         var members: []Resp.JoinGroupResponseMember = &.{};
         if (result.is_leader) {
-            members = self.collectJoinGroupResponseMembers(req.group_id orelse "") catch return null;
+            members = self.collectJoinGroupResponseMembers(req.group_id orelse "") catch |err| {
+                log.warn("JoinGroup response member materialization failed for {s}: {}", .{ req.group_id orelse "", err });
+                return self.joinGroupErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error);
+            };
         }
         defer if (members.len > 0) self.allocator.free(members);
 
@@ -14274,7 +14293,10 @@ pub const Broker = struct {
             .member_id = result.member_id,
             .members = members,
         };
-        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version) orelse {
+            log.warn("JoinGroup response serialization failed", .{});
+            return self.joinGroupErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error);
+        };
     }
 
     fn validateJoinGroupTimeouts(api_version: i16, session_timeout_ms: i32, rebalance_timeout_ms: i32) i16 {
@@ -14405,24 +14427,30 @@ pub const Broker = struct {
 
         if (!validateLeaveGroupRequestFrame(request_bytes, body_start, api_version)) {
             log.warn("Malformed LeaveGroup request", .{});
-            return null;
+            return self.leaveGroupErrorResponse(req_header, resp_header_version, api_version, ErrorCode.invalid_request);
         }
 
         var pos = body_start;
         var req = Req.deserialize(self.allocator, request_bytes, &pos, api_version) catch |err| {
             log.warn("Failed to decode LeaveGroup request: {}", .{err});
-            return null;
+            return self.leaveGroupErrorResponse(req_header, resp_header_version, api_version, ErrorCode.invalid_request);
         };
         defer self.freeLeaveGroupRequest(&req);
 
-        const previous_snapshot = self.encodeConsumerGroupSnapshotRecordValue() catch return null;
+        const previous_snapshot = self.encodeConsumerGroupSnapshotRecordValue() catch |err| {
+            log.warn("LeaveGroup rollback snapshot failed for {s}: {}", .{ req.group_id orelse "", err });
+            return self.leaveGroupErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error);
+        };
         defer self.allocator.free(previous_snapshot);
 
         var top_error: i16 = @intFromEnum(ErrorCode.none);
         var member_responses: []MemberResponse = &.{};
         var mutated = false;
         if (api_version >= 3) {
-            member_responses = self.allocator.alloc(MemberResponse, req.members.len) catch return null;
+            member_responses = self.allocator.alloc(MemberResponse, req.members.len) catch |err| {
+                log.warn("LeaveGroup member response materialization failed for {s}: {}", .{ req.group_id orelse "", err });
+                return self.leaveGroupErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error);
+            };
             for (req.members, 0..) |member, i| {
                 const member_id = member.member_id orelse "";
                 const error_code = self.groups.leaveGroupWithInstanceId(req.group_id orelse "", member_id, nonEmptyStringOrNull(member.group_instance_id));
@@ -14459,7 +14487,10 @@ pub const Broker = struct {
             .error_code = top_error,
             .members = member_responses,
         };
-        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version) orelse {
+            log.warn("LeaveGroup response serialization failed", .{});
+            return self.leaveGroupErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error);
+        };
     }
 
     fn freeLeaveGroupRequest(self: *Broker, req: *generated.leave_group_request.LeaveGroupRequest) void {
@@ -15546,17 +15577,20 @@ pub const Broker = struct {
 
         if (!validateSyncGroupRequestFrame(request_bytes, body_start, api_version)) {
             log.warn("Malformed SyncGroup request", .{});
-            return null;
+            return self.syncGroupErrorResponse(req_header, resp_header_version, api_version, ErrorCode.invalid_request);
         }
 
         var pos = body_start;
         var req = Req.deserialize(self.allocator, request_bytes, &pos, api_version) catch |err| {
             log.warn("Failed to decode SyncGroup request: {}", .{err});
-            return null;
+            return self.syncGroupErrorResponse(req_header, resp_header_version, api_version, ErrorCode.invalid_request);
         };
         defer self.freeSyncGroupRequest(&req);
 
-        const previous_snapshot = self.encodeConsumerGroupSnapshotRecordValue() catch return null;
+        const previous_snapshot = self.encodeConsumerGroupSnapshotRecordValue() catch |err| {
+            log.warn("SyncGroup rollback snapshot failed for {s}: {}", .{ req.group_id orelse "", err });
+            return self.syncGroupErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error);
+        };
         defer self.allocator.free(previous_snapshot);
 
         const sync_protocol = self.selectSyncGroupProtocol(api_version, req.group_id orelse "", req.protocol_type, req.protocol_name);
@@ -15568,12 +15602,18 @@ pub const Broker = struct {
                 .protocol_name = sync_protocol.protocol_name,
                 .assignment = null,
             };
-            return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+            return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version) orelse {
+                log.warn("SyncGroup protocol-error response serialization failed", .{});
+                return self.syncGroupErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error);
+            };
         }
 
         var assignment_buf: []GroupCoord.MemberAssignment = &.{};
         if (req.assignments.len > 0) {
-            assignment_buf = self.allocator.alloc(GroupCoord.MemberAssignment, req.assignments.len) catch return null;
+            assignment_buf = self.allocator.alloc(GroupCoord.MemberAssignment, req.assignments.len) catch |err| {
+                log.warn("SyncGroup assignment materialization failed for {s}: {}", .{ req.group_id orelse "", err });
+                return self.syncGroupErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error);
+            };
             for (req.assignments, 0..) |assignment, idx| {
                 assignment_buf[idx] = .{
                     .member_id = assignment.member_id orelse "",
@@ -15584,12 +15624,18 @@ pub const Broker = struct {
         defer if (assignment_buf.len > 0) self.allocator.free(assignment_buf);
 
         const assignments: ?[]const GroupCoord.MemberAssignment = if (assignment_buf.len > 0) assignment_buf else null;
-        const result = self.groups.syncGroupWithInstanceId(req.group_id orelse "", req.member_id orelse "", nonEmptyStringOrNull(req.group_instance_id), req.generation_id, assignments) catch blk: {
-            break :blk GroupCoord.SyncGroupResult{ .error_code = @intFromEnum(ErrorCode.not_coordinator), .assignment = null };
+        const result = self.groups.syncGroupWithInstanceId(req.group_id orelse "", req.member_id orelse "", nonEmptyStringOrNull(req.group_instance_id), req.generation_id, assignments) catch |err| {
+            log.warn("SyncGroup local mutation failed for {s}: {}", .{ req.group_id orelse "", err });
+            self.restoreConsumerGroupsAfterFailedMutation(previous_snapshot);
+            return self.syncGroupErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error);
         };
         var protocol_mutated = false;
         if (sync_protocol.from_request and result.error_code == @intFromEnum(ErrorCode.none)) {
-            const ensure_result = self.groups.ensureProtocolForGroup(req.group_id orelse "", sync_protocol.protocol_type, sync_protocol.protocol_name) catch return null;
+            const ensure_result = self.groups.ensureProtocolForGroup(req.group_id orelse "", sync_protocol.protocol_type, sync_protocol.protocol_name) catch |err| {
+                log.warn("SyncGroup protocol materialization failed for {s}: {}", .{ req.group_id orelse "", err });
+                self.restoreConsumerGroupsAfterFailedMutation(previous_snapshot);
+                return self.syncGroupErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error);
+            };
             protocol_mutated = ensure_result.mutated;
         }
         if ((assignments != null or protocol_mutated) and result.error_code == @intFromEnum(ErrorCode.none)) {
@@ -15603,7 +15649,10 @@ pub const Broker = struct {
                     .protocol_name = sync_protocol.protocol_name,
                     .assignment = null,
                 };
-                return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+                return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version) orelse {
+                    log.warn("SyncGroup persistence-error response serialization failed", .{});
+                    return self.syncGroupErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error);
+                };
             };
         }
 
@@ -15614,7 +15663,10 @@ pub const Broker = struct {
             .protocol_name = sync_protocol.protocol_name,
             .assignment = result.assignment,
         };
-        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version) orelse {
+            log.warn("SyncGroup response serialization failed", .{});
+            return self.syncGroupErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error);
+        };
     }
 
     const SyncGroupProtocolSelection = struct {
@@ -15849,7 +15901,7 @@ pub const Broker = struct {
                 .heartbeat_interval_ms = 0,
                 .assignment = null,
             };
-            return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+            return self.serializeConsumerGroupHeartbeatResponseOrStorageError(req_header, resp_header_version, api_version, &resp, null, 0);
         }
 
         var pos = body_start;
@@ -15864,13 +15916,13 @@ pub const Broker = struct {
                 .heartbeat_interval_ms = 0,
                 .assignment = null,
             };
-            return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+            return self.serializeConsumerGroupHeartbeatResponseOrStorageError(req_header, resp_header_version, api_version, &resp, null, 0);
         };
         defer self.freeConsumerGroupHeartbeatRequest(&req);
 
         const subscriptions = self.consumerGroupHeartbeatSubscriptions(req.subscribed_topic_names) catch {
             const resp = consumerGroupHeartbeatResponse(ErrorCode.invalid_request.toInt(), "invalid ConsumerGroupHeartbeat subscription", req.member_id, req.member_epoch, 0);
-            return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+            return self.serializeConsumerGroupHeartbeatResponseOrStorageError(req_header, resp_header_version, api_version, &resp, req.member_id, req.member_epoch);
         };
         defer if (subscriptions) |topics| {
             if (topics.len > 0) self.allocator.free(topics);
@@ -15881,14 +15933,14 @@ pub const Broker = struct {
         const owned_partitions_error = self.validateConsumerGroupHeartbeatOwnedPartitions(req.topic_partitions);
         if (owned_partitions_error != ErrorCode.none) {
             const resp = consumerGroupHeartbeatResponse(owned_partitions_error.toInt(), null, req.member_id, req.member_epoch, 0);
-            return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+            return self.serializeConsumerGroupHeartbeatResponseOrStorageError(req_header, resp_header_version, api_version, &resp, req.member_id, req.member_epoch);
         }
 
         const group_id = req.group_id orelse "";
         const requested_assignor = if (req.server_assignor) |value| blk: {
             if (value.len == 0) {
                 const resp = consumerGroupHeartbeatResponse(ErrorCode.invalid_request.toInt(), "empty ConsumerGroupHeartbeat server_assignor", req.member_id, req.member_epoch, 0);
-                return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+                return self.serializeConsumerGroupHeartbeatResponseOrStorageError(req_header, resp_header_version, api_version, &resp, req.member_id, req.member_epoch);
             }
             break :blk value;
         } else null;
@@ -15896,7 +15948,7 @@ pub const Broker = struct {
             const assignor_error = self.validateConsumerGroupHeartbeatAssignor(group_id, server_assignor);
             if (assignor_error != ErrorCode.none) {
                 const resp = consumerGroupHeartbeatResponse(assignor_error.toInt(), null, req.member_id, req.member_epoch, 0);
-                return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+                return self.serializeConsumerGroupHeartbeatResponseOrStorageError(req_header, resp_header_version, api_version, &resp, req.member_id, req.member_epoch);
             }
         }
         const member_id = req.member_id orelse "";
@@ -15906,13 +15958,20 @@ pub const Broker = struct {
         if (req.member_epoch == 0 or req.member_epoch == -2) {
             if (req.member_epoch == -2 and instance_id == null) {
                 const resp = consumerGroupHeartbeatResponse(ErrorCode.invalid_request.toInt(), "static rejoin requires instance_id", req.member_id, req.member_epoch, 0);
-                return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+                return self.serializeConsumerGroupHeartbeatResponseOrStorageError(req_header, resp_header_version, api_version, &resp, req.member_id, req.member_epoch);
             }
 
-            const previous_snapshot = self.encodeConsumerGroupSnapshotRecordValue() catch return null;
+            const previous_snapshot = self.encodeConsumerGroupSnapshotRecordValue() catch |err| {
+                log.warn("ConsumerGroupHeartbeat join rollback snapshot failed for {s}: {}", .{ group_id, err });
+                return self.consumerGroupHeartbeatErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error, null, req.member_id, req.member_epoch);
+            };
             defer self.allocator.free(previous_snapshot);
 
-            const result = self.groups.joinGroupWithProtocol(group_id, nonEmptyStringOrNull(req.member_id), instance_id, "consumer", assignor, null, subscriptions) catch return null;
+            const result = self.groups.joinGroupWithProtocol(group_id, nonEmptyStringOrNull(req.member_id), instance_id, "consumer", assignor, null, subscriptions) catch |err| {
+                log.warn("ConsumerGroupHeartbeat join mutation failed for {s}: {}", .{ group_id, err });
+                self.restoreConsumerGroupsAfterFailedMutation(previous_snapshot);
+                return self.consumerGroupHeartbeatErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error, null, req.member_id, req.member_epoch);
+            };
             var response_member_epoch = result.generation_id;
             if (result.error_code == @intFromEnum(ErrorCode.none)) {
                 if (req.rebalance_timeout_ms > 0) {
@@ -15923,7 +15982,7 @@ pub const Broker = struct {
                         log.warn("ConsumerGroupHeartbeat rack update failed for {s}: {}", .{ group_id, err });
                         self.restoreConsumerGroupsAfterFailedMutation(previous_snapshot);
                         const resp = consumerGroupHeartbeatResponse(ErrorCode.kafka_storage_error.toInt(), null, req.member_id, req.member_epoch, 0);
-                        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+                        return self.serializeConsumerGroupHeartbeatResponseOrStorageError(req_header, resp_header_version, api_version, &resp, req.member_id, req.member_epoch);
                     };
                 }
                 if (subscriptions) |topics| {
@@ -15931,14 +15990,19 @@ pub const Broker = struct {
                         log.warn("ConsumerGroupHeartbeat subscription update failed for {s}: {}", .{ group_id, err });
                         self.restoreConsumerGroupsAfterFailedMutation(previous_snapshot);
                         const resp = consumerGroupHeartbeatResponse(ErrorCode.kafka_storage_error.toInt(), null, req.member_id, req.member_epoch, 0);
-                        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+                        return self.serializeConsumerGroupHeartbeatResponseOrStorageError(req_header, resp_header_version, api_version, &resp, req.member_id, req.member_epoch);
                     };
                 }
-                const assignment_echo_error = self.validateConsumerGroupHeartbeatOwnedAssignment(group_id, result.member_id, req.topic_partitions) catch return null;
+                const assignment_echo_error = self.validateConsumerGroupHeartbeatOwnedAssignment(group_id, result.member_id, req.topic_partitions) catch |err| {
+                    log.warn("ConsumerGroupHeartbeat owned assignment validation failed for {s}: {}", .{ group_id, err });
+                    self.restoreConsumerGroupsAfterFailedMutation(previous_snapshot);
+                    const resp = consumerGroupHeartbeatResponse(ErrorCode.kafka_storage_error.toInt(), null, req.member_id, req.member_epoch, 0);
+                    return self.serializeConsumerGroupHeartbeatResponseOrStorageError(req_header, resp_header_version, api_version, &resp, req.member_id, req.member_epoch);
+                };
                 if (assignment_echo_error != ErrorCode.none) {
                     self.restoreConsumerGroupsAfterFailedMutation(previous_snapshot);
                     const resp = consumerGroupHeartbeatResponse(assignment_echo_error.toInt(), "ConsumerGroupHeartbeat owned partitions do not match assignment", req.member_id, req.member_epoch, 0);
-                    return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+                    return self.serializeConsumerGroupHeartbeatResponseOrStorageError(req_header, resp_header_version, api_version, &resp, req.member_id, req.member_epoch);
                 }
                 if (self.groups.groups.getPtr(group_id)) |group| {
                     response_member_epoch = group.generation_id;
@@ -15949,7 +16013,8 @@ pub const Broker = struct {
                 self.buildConsumerGroupHeartbeatAssignment(group_id, result.member_id) catch |err| {
                     log.warn("Failed to build ConsumerGroupHeartbeat assignment for {s}: {}", .{ group_id, err });
                     self.restoreConsumerGroupsAfterFailedMutation(previous_snapshot);
-                    return null;
+                    const resp = consumerGroupHeartbeatResponse(ErrorCode.kafka_storage_error.toInt(), null, req.member_id, req.member_epoch, 0);
+                    return self.serializeConsumerGroupHeartbeatResponseOrStorageError(req_header, resp_header_version, api_version, &resp, req.member_id, req.member_epoch);
                 }
             else
                 null;
@@ -15959,13 +16024,13 @@ pub const Broker = struct {
                     log.warn("ConsumerGroupHeartbeat assignment snapshot update failed for {s}: {}", .{ group_id, err });
                     self.restoreConsumerGroupsAfterFailedMutation(previous_snapshot);
                     const resp = consumerGroupHeartbeatResponse(ErrorCode.kafka_storage_error.toInt(), null, req.member_id, req.member_epoch, 0);
-                    return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+                    return self.serializeConsumerGroupHeartbeatResponseOrStorageError(req_header, resp_header_version, api_version, &resp, req.member_id, req.member_epoch);
                 };
                 self.persistConsumerGroupsDurably() catch |err| {
                     log.warn("ConsumerGroupHeartbeat join snapshot write failed for {s}: {}", .{ group_id, err });
                     self.restoreConsumerGroupsAfterFailedMutation(previous_snapshot);
                     const resp = consumerGroupHeartbeatResponse(ErrorCode.kafka_storage_error.toInt(), null, req.member_id, req.member_epoch, 0);
-                    return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+                    return self.serializeConsumerGroupHeartbeatResponseOrStorageError(req_header, resp_header_version, api_version, &resp, req.member_id, req.member_epoch);
                 };
             }
 
@@ -15975,11 +16040,14 @@ pub const Broker = struct {
                 0;
             var resp = consumerGroupHeartbeatResponse(result.error_code, null, result.member_id, response_member_epoch, response_heartbeat_interval_ms);
             resp.assignment = assignment;
-            return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+            return self.serializeConsumerGroupHeartbeatResponseOrStorageError(req_header, resp_header_version, api_version, &resp, result.member_id, response_member_epoch);
         }
 
         if (req.member_epoch == -1) {
-            const previous_snapshot = self.encodeConsumerGroupSnapshotRecordValue() catch return null;
+            const previous_snapshot = self.encodeConsumerGroupSnapshotRecordValue() catch |err| {
+                log.warn("ConsumerGroupHeartbeat leave rollback snapshot failed for {s}: {}", .{ group_id, err });
+                return self.consumerGroupHeartbeatErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error, null, req.member_id, req.member_epoch);
+            };
             defer self.allocator.free(previous_snapshot);
 
             const error_code = self.groups.leaveGroupWithInstanceId(group_id, member_id, instance_id);
@@ -15988,26 +16056,30 @@ pub const Broker = struct {
                     log.warn("ConsumerGroupHeartbeat leave snapshot write failed for {s}: {}", .{ group_id, err });
                     self.restoreConsumerGroupsAfterFailedMutation(previous_snapshot);
                     const resp = consumerGroupHeartbeatResponse(ErrorCode.kafka_storage_error.toInt(), null, req.member_id, req.member_epoch, 0);
-                    return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+                    return self.serializeConsumerGroupHeartbeatResponseOrStorageError(req_header, resp_header_version, api_version, &resp, req.member_id, req.member_epoch);
                 };
             }
 
             const resp = consumerGroupHeartbeatResponse(error_code, null, req.member_id, -1, 0);
-            return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+            return self.serializeConsumerGroupHeartbeatResponseOrStorageError(req_header, resp_header_version, api_version, &resp, req.member_id, -1);
         }
 
         if (req.member_epoch < -2) {
             const resp = consumerGroupHeartbeatResponse(ErrorCode.invalid_request.toInt(), "invalid member epoch", req.member_id, req.member_epoch, 0);
-            return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+            return self.serializeConsumerGroupHeartbeatResponseOrStorageError(req_header, resp_header_version, api_version, &resp, req.member_id, req.member_epoch);
         }
 
         const error_code = self.groups.consumerGroupHeartbeat(group_id, member_id, instance_id, req.member_epoch);
         var response_member_epoch = req.member_epoch;
         if (error_code == @intFromEnum(ErrorCode.none)) {
-            const assignment_echo_error = self.validateConsumerGroupHeartbeatOwnedAssignment(group_id, member_id, req.topic_partitions) catch return null;
+            const assignment_echo_error = self.validateConsumerGroupHeartbeatOwnedAssignment(group_id, member_id, req.topic_partitions) catch |err| {
+                log.warn("ConsumerGroupHeartbeat owned assignment validation failed for {s}: {}", .{ group_id, err });
+                const resp = consumerGroupHeartbeatResponse(ErrorCode.kafka_storage_error.toInt(), null, req.member_id, req.member_epoch, 0);
+                return self.serializeConsumerGroupHeartbeatResponseOrStorageError(req_header, resp_header_version, api_version, &resp, req.member_id, req.member_epoch);
+            };
             if (assignment_echo_error != ErrorCode.none) {
                 const resp = consumerGroupHeartbeatResponse(assignment_echo_error.toInt(), "ConsumerGroupHeartbeat owned partitions do not match assignment", req.member_id, req.member_epoch, 0);
-                return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+                return self.serializeConsumerGroupHeartbeatResponseOrStorageError(req_header, resp_header_version, api_version, &resp, req.member_id, req.member_epoch);
             }
         }
 
@@ -16015,7 +16087,10 @@ pub const Broker = struct {
         defer if (assignment) |*owned| self.freeConsumerGroupHeartbeatAssignment(owned);
 
         if (error_code == @intFromEnum(ErrorCode.none)) {
-            const previous_snapshot = self.encodeConsumerGroupSnapshotRecordValue() catch return null;
+            const previous_snapshot = self.encodeConsumerGroupSnapshotRecordValue() catch |err| {
+                log.warn("ConsumerGroupHeartbeat member-metadata rollback snapshot failed for {s}: {}", .{ group_id, err });
+                return self.consumerGroupHeartbeatErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error, null, req.member_id, req.member_epoch);
+            };
             defer self.allocator.free(previous_snapshot);
 
             var changed = false;
@@ -16024,7 +16099,7 @@ pub const Broker = struct {
                     log.warn("ConsumerGroupHeartbeat rack update failed for {s}: {}", .{ group_id, err });
                     self.restoreConsumerGroupsAfterFailedMutation(previous_snapshot);
                     const resp = consumerGroupHeartbeatResponse(ErrorCode.kafka_storage_error.toInt(), null, req.member_id, req.member_epoch, 0);
-                    return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+                    return self.serializeConsumerGroupHeartbeatResponseOrStorageError(req_header, resp_header_version, api_version, &resp, req.member_id, req.member_epoch);
                 }) or changed;
             }
             if (subscriptions) |topics| {
@@ -16032,25 +16107,26 @@ pub const Broker = struct {
                     log.warn("ConsumerGroupHeartbeat subscription update failed for {s}: {}", .{ group_id, err });
                     self.restoreConsumerGroupsAfterFailedMutation(previous_snapshot);
                     const resp = consumerGroupHeartbeatResponse(ErrorCode.kafka_storage_error.toInt(), null, req.member_id, req.member_epoch, 0);
-                    return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+                    return self.serializeConsumerGroupHeartbeatResponseOrStorageError(req_header, resp_header_version, api_version, &resp, req.member_id, req.member_epoch);
                 }) or changed;
             }
             changed = (self.storeConsumerGroupHeartbeatOwnedAssignmentFromRequest(group_id, member_id, req.topic_partitions) catch |err| {
                 log.warn("ConsumerGroupHeartbeat owned assignment update failed for {s}: {}", .{ group_id, err });
                 self.restoreConsumerGroupsAfterFailedMutation(previous_snapshot);
                 const resp = consumerGroupHeartbeatResponse(ErrorCode.kafka_storage_error.toInt(), null, req.member_id, req.member_epoch, 0);
-                return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+                return self.serializeConsumerGroupHeartbeatResponseOrStorageError(req_header, resp_header_version, api_version, &resp, req.member_id, req.member_epoch);
             }) or changed;
             assignment = self.buildConsumerGroupHeartbeatAssignment(group_id, member_id) catch |err| {
                 log.warn("Failed to build ConsumerGroupHeartbeat assignment for {s}: {}", .{ group_id, err });
                 self.restoreConsumerGroupsAfterFailedMutation(previous_snapshot);
-                return null;
+                const resp = consumerGroupHeartbeatResponse(ErrorCode.kafka_storage_error.toInt(), null, req.member_id, req.member_epoch, 0);
+                return self.serializeConsumerGroupHeartbeatResponseOrStorageError(req_header, resp_header_version, api_version, &resp, req.member_id, req.member_epoch);
             };
             changed = (self.storeConsumerGroupHeartbeatGrantedAssignment(group_id, member_id, assignment) catch |err| {
                 log.warn("ConsumerGroupHeartbeat granted assignment update failed for {s}: {}", .{ group_id, err });
                 self.restoreConsumerGroupsAfterFailedMutation(previous_snapshot);
                 const resp = consumerGroupHeartbeatResponse(ErrorCode.kafka_storage_error.toInt(), null, req.member_id, req.member_epoch, 0);
-                return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+                return self.serializeConsumerGroupHeartbeatResponseOrStorageError(req_header, resp_header_version, api_version, &resp, req.member_id, req.member_epoch);
             }) or changed;
 
             if (self.groups.groups.getPtr(group_id)) |group| {
@@ -16061,7 +16137,7 @@ pub const Broker = struct {
                     log.warn("ConsumerGroupHeartbeat member metadata snapshot write failed for {s}: {}", .{ group_id, err });
                     self.restoreConsumerGroupsAfterFailedMutation(previous_snapshot);
                     const resp = consumerGroupHeartbeatResponse(ErrorCode.kafka_storage_error.toInt(), null, req.member_id, req.member_epoch, 0);
-                    return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+                    return self.serializeConsumerGroupHeartbeatResponseOrStorageError(req_header, resp_header_version, api_version, &resp, req.member_id, req.member_epoch);
                 };
             }
         }
@@ -16075,7 +16151,7 @@ pub const Broker = struct {
             .heartbeat_interval_ms = if (error_code == @intFromEnum(ErrorCode.none)) consumer_group_heartbeat_interval_ms else 0,
             .assignment = assignment,
         };
-        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+        return self.serializeConsumerGroupHeartbeatResponseOrStorageError(req_header, resp_header_version, api_version, &resp, req.member_id, response_member_epoch);
     }
 
     const consumer_group_heartbeat_interval_ms: i32 = 3000;
@@ -16089,6 +16165,29 @@ pub const Broker = struct {
             .member_epoch = member_epoch,
             .heartbeat_interval_ms = heartbeat_interval_ms,
             .assignment = null,
+        };
+    }
+
+    fn serializeConsumerGroupHeartbeatResponseOrStorageError(
+        self: *Broker,
+        req_header: *const RequestHeader,
+        resp_header_version: i16,
+        api_version: i16,
+        resp: *const generated.consumer_group_heartbeat_response.ConsumerGroupHeartbeatResponse,
+        fallback_member_id: ?[]const u8,
+        fallback_member_epoch: i32,
+    ) ?[]u8 {
+        return self.serializeGeneratedResponse(req_header, resp_header_version, resp, api_version) orelse {
+            log.warn("ConsumerGroupHeartbeat response serialization failed", .{});
+            return self.consumerGroupHeartbeatErrorResponse(
+                req_header,
+                resp_header_version,
+                api_version,
+                ErrorCode.kafka_storage_error,
+                "Failed to serialize ConsumerGroupHeartbeat response",
+                fallback_member_id,
+                fallback_member_epoch,
+            );
         };
     }
 
@@ -32762,6 +32861,30 @@ fn readGroupCoordinatorAuthorizationErrorCode(response: []const u8, api_key: i16
     }
 }
 
+fn expectGroupCoordinatorErrorWithFailingAllocator(
+    broker: *Broker,
+    request: []const u8,
+    api_key: i16,
+    api_version: i16,
+    correlation_id: i32,
+    fail_index: usize,
+    err_code: ErrorCode,
+) !void {
+    var failing_allocator = OneShotFailingAllocator.init(testing.allocator, fail_index);
+    const response_allocator = failing_allocator.allocator();
+    broker.allocator = response_allocator;
+
+    const response = broker.handleRequest(request);
+    broker.allocator = testing.allocator;
+
+    try testing.expect(failing_allocator.failed);
+    try testing.expect(response != null);
+    defer response_allocator.free(response.?);
+
+    const error_code = try readGroupCoordinatorAuthorizationErrorCode(response.?, api_key, api_version, correlation_id);
+    try testing.expectEqual(@as(i16, @intFromEnum(err_code)), error_code);
+}
+
 fn expectWriteTxnMarkersErrorResponseBytes(broker: *Broker, response: []const u8, api_version: i16, correlation_id: i32, err_code: ErrorCode) !void {
     const Resp = generated.write_txn_markers_response.WriteTxnMarkersResponse;
 
@@ -37358,6 +37481,120 @@ test "Broker.handleRequest group coordinator authorization denial fails closed w
         const error_code = try readGroupCoordinatorAuthorizationErrorCode(response.?, 13, 5, 1317);
         try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.kafka_storage_error)), error_code);
     }
+}
+
+test "Broker.handleRequest normal group coordinator APIs fail closed under allocator failure" {
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+
+    var buf: [1024]u8 = undefined;
+
+    {
+        const Req = generated.join_group_request.JoinGroupRequest;
+        const req = Req{
+            .group_id = "join-normal-serialize-fail",
+            .session_timeout_ms = 30000,
+            .rebalance_timeout_ms = 300000,
+            .member_id = "member",
+            .group_instance_id = null,
+            .protocol_type = "consumer",
+            .protocols = &.{},
+            .reason = "serialize-fail",
+        };
+        var pos = buildTestRequest(&buf, 11, 9, 1117, header_mod.requestHeaderVersion(11, 9));
+        req.serialize(&buf, &pos, 9);
+        try expectGroupCoordinatorErrorWithFailingAllocator(&broker, buf[0..pos], 11, 9, 1117, 0, ErrorCode.kafka_storage_error);
+        try testing.expect(!broker.groups.groups.contains("join-normal-serialize-fail"));
+    }
+
+    {
+        const Req = generated.leave_group_request.LeaveGroupRequest;
+        const req = Req{
+            .group_id = "leave-normal-snapshot-fail",
+            .members = &.{},
+        };
+        var pos = buildTestRequest(&buf, 13, 5, 1318, header_mod.requestHeaderVersion(13, 5));
+        req.serialize(&buf, &pos, 5);
+        try expectGroupCoordinatorErrorWithFailingAllocator(&broker, buf[0..pos], 13, 5, 1318, 0, ErrorCode.kafka_storage_error);
+    }
+
+    {
+        const Req = generated.sync_group_request.SyncGroupRequest;
+        const req = Req{
+            .group_id = "sync-normal-serialize-fail",
+            .generation_id = 1,
+            .member_id = "member",
+            .group_instance_id = null,
+            .protocol_type = null,
+            .protocol_name = "range",
+            .assignments = &.{},
+        };
+        var pos = buildTestRequest(&buf, 14, 5, 1417, header_mod.requestHeaderVersion(14, 5));
+        req.serialize(&buf, &pos, 5);
+        try expectGroupCoordinatorErrorWithFailingAllocator(&broker, buf[0..pos], 14, 5, 1417, 0, ErrorCode.kafka_storage_error);
+    }
+
+    {
+        const Req = generated.consumer_group_heartbeat_request.ConsumerGroupHeartbeatRequest;
+        const Resp = generated.consumer_group_heartbeat_response.ConsumerGroupHeartbeatResponse;
+        const req = Req{
+            .group_id = "consumer-heartbeat-normal-serialize-fail",
+            .member_id = "",
+            .member_epoch = 0,
+            .instance_id = null,
+            .rack_id = null,
+            .rebalance_timeout_ms = 300000,
+            .subscribed_topic_names = null,
+            .server_assignor = "",
+            .topic_partitions = null,
+        };
+        var pos = buildTestRequest(&buf, 68, 0, 6817, header_mod.requestHeaderVersion(68, 0));
+        req.serialize(&buf, &pos, 0);
+
+        var failing_allocator = OneShotFailingAllocator.init(testing.allocator, 0);
+        const response_allocator = failing_allocator.allocator();
+        broker.allocator = response_allocator;
+
+        const response = broker.handleRequest(buf[0..pos]);
+        broker.allocator = testing.allocator;
+
+        try testing.expect(failing_allocator.failed);
+        try testing.expect(response != null);
+        defer response_allocator.free(response.?);
+
+        const error_code = try readGeneratedTopLevelErrorCode(Resp, response.?, 68, 0, 6817);
+        try testing.expectEqual(ErrorCode.kafka_storage_error.toInt(), error_code);
+        try testing.expect(!broker.groups.groups.contains("consumer-heartbeat-normal-serialize-fail"));
+    }
+}
+
+test "Broker.handleRequest JoinGroup fails closed when local materialization fails" {
+    const Req = generated.join_group_request.JoinGroupRequest;
+    const Protocol = Req.JoinGroupRequestProtocol;
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+
+    const protocols = [_]Protocol{.{
+        .name = "range",
+        .metadata = "",
+    }};
+    const req = Req{
+        .group_id = "join-normal-materialize-fail",
+        .session_timeout_ms = 30000,
+        .rebalance_timeout_ms = 300000,
+        .member_id = null,
+        .group_instance_id = null,
+        .protocol_type = "consumer",
+        .protocols = &protocols,
+        .reason = "materialize-fail",
+    };
+    var buf: [1024]u8 = undefined;
+    var pos = buildTestRequest(&buf, 11, 9, 1118, header_mod.requestHeaderVersion(11, 9));
+    req.serialize(&buf, &pos, 9);
+
+    try expectGroupCoordinatorErrorWithFailingAllocator(&broker, buf[0..pos], 11, 9, 1118, 2, ErrorCode.kafka_storage_error);
+    try testing.expect(!broker.groups.groups.contains("join-normal-materialize-fail"));
 }
 
 test "Broker.handleRequest DeleteGroups persists removed offsets" {
@@ -60461,12 +60698,19 @@ test "Broker.handleRequest JoinGroup v9 returns generated response" {
 }
 
 test "Broker.handleRequest JoinGroup rejects truncated request" {
+    const Resp = generated.join_group_response.JoinGroupResponse;
+
     var broker = Broker.init(testing.allocator, 1, 9092);
     defer broker.deinit();
 
     var buf: [128]u8 = undefined;
     const req_len = buildTestRequest(&buf, 11, 9, 1110, header_mod.requestHeaderVersion(11, 9));
-    try testing.expect(broker.handleRequest(buf[0..req_len]) == null);
+    const response = broker.handleRequest(buf[0..req_len]);
+    try testing.expect(response != null);
+    defer testing.allocator.free(response.?);
+
+    const error_code = try readGeneratedTopLevelErrorCode(Resp, response.?, 11, 9, 1110);
+    try testing.expectEqual(ErrorCode.invalid_request.toInt(), error_code);
 }
 
 test "Broker.handleRequest JoinGroup rejects trailing bytes" {
@@ -60495,7 +60739,15 @@ test "Broker.handleRequest JoinGroup rejects trailing bytes" {
     var pos = buildTestRequest(&buf, 11, 9, 1114, header_mod.requestHeaderVersion(11, 9));
     req.serialize(&buf, &pos, 9);
 
-    try expectTrailingByteRejected(&broker, &buf, pos);
+    try expectTrailingByteRejectedWithGeneratedResponse(
+        generated.join_group_response.JoinGroupResponse,
+        &broker,
+        &buf,
+        pos,
+        11,
+        9,
+        1114,
+    );
 }
 
 test "Broker.handleRequest JoinGroup v9 authorization denial uses generated response" {
@@ -60851,12 +61103,19 @@ test "Broker.handleRequest JoinGroup and SyncGroup persist group state across re
 }
 
 test "Broker.handleRequest SyncGroup rejects truncated request" {
+    const Resp = generated.sync_group_response.SyncGroupResponse;
+
     var broker = Broker.init(testing.allocator, 1, 9092);
     defer broker.deinit();
 
     var buf: [128]u8 = undefined;
     const req_len = buildTestRequest(&buf, 14, 5, 1406, header_mod.requestHeaderVersion(14, 5));
-    try testing.expect(broker.handleRequest(buf[0..req_len]) == null);
+    const response = broker.handleRequest(buf[0..req_len]);
+    try testing.expect(response != null);
+    defer testing.allocator.free(response.?);
+
+    const error_code = try readGeneratedTopLevelErrorCode(Resp, response.?, 14, 5, 1406);
+    try testing.expectEqual(ErrorCode.invalid_request.toInt(), error_code);
 }
 
 test "Broker.handleRequest SyncGroup rejects trailing bytes" {
@@ -60884,7 +61143,15 @@ test "Broker.handleRequest SyncGroup rejects trailing bytes" {
     var pos = buildTestRequest(&buf, 14, 5, 1417, header_mod.requestHeaderVersion(14, 5));
     req.serialize(&buf, &pos, 5);
 
-    try expectTrailingByteRejected(&broker, &buf, pos);
+    try expectTrailingByteRejectedWithGeneratedResponse(
+        generated.sync_group_response.SyncGroupResponse,
+        &broker,
+        &buf,
+        pos,
+        14,
+        5,
+        1417,
+    );
 }
 
 test "Broker.handleRequest SyncGroup v5 authorization denial uses generated response" {
@@ -70029,12 +70296,19 @@ test "Broker.handleRequest LeaveGroup v4 authorization denial uses generated res
 }
 
 test "Broker.handleRequest LeaveGroup rejects truncated request" {
+    const Resp = generated.leave_group_response.LeaveGroupResponse;
+
     var broker = Broker.init(testing.allocator, 1, 9092);
     defer broker.deinit();
 
     var buf: [128]u8 = undefined;
     const req_len = buildTestRequest(&buf, 13, 4, 1306, header_mod.requestHeaderVersion(13, 4));
-    try testing.expect(broker.handleRequest(buf[0..req_len]) == null);
+    const response = broker.handleRequest(buf[0..req_len]);
+    try testing.expect(response != null);
+    defer testing.allocator.free(response.?);
+
+    const error_code = try readGeneratedTopLevelErrorCode(Resp, response.?, 13, 4, 1306);
+    try testing.expectEqual(ErrorCode.invalid_request.toInt(), error_code);
 }
 
 test "Broker.handleRequest LeaveGroup rejects trailing bytes" {
@@ -70056,7 +70330,15 @@ test "Broker.handleRequest LeaveGroup rejects trailing bytes" {
     var pos = buildTestRequest(&buf, 13, 4, 1310, header_mod.requestHeaderVersion(13, 4));
     req.serialize(&buf, &pos, 4);
 
-    try expectTrailingByteRejected(&broker, &buf, pos);
+    try expectTrailingByteRejectedWithGeneratedResponse(
+        generated.leave_group_response.LeaveGroupResponse,
+        &broker,
+        &buf,
+        pos,
+        13,
+        4,
+        1310,
+    );
 }
 
 test "Broker kafka_server_api_errors_total is registered" {
