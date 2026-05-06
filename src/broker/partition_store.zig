@@ -253,7 +253,10 @@ pub const PartitionStore = struct {
             }
             if (objectManagerHasS3Key(om, key)) continue;
 
-            const object_data = (try s3.getObject(key)) orelse continue;
+            const object_data = (try s3.getObject(key)) orelse {
+                log.warn("Listed S3 WAL object {s} was missing during recovery", .{key});
+                return error.S3ObjectMissing;
+            };
             defer self.allocator.free(object_data);
 
             var reader = ObjectReader.parse(self.allocator, object_data) catch |err| {
@@ -2101,6 +2104,36 @@ test "PartitionStore S3 WAL recovery fails closed then retries after injected ge
 
     mock_s3.failNextGetObjects(1);
     try testing.expectError(error.InjectedGetFailure, store.recoverS3WalObjects());
+    try testing.expectEqual(@as(usize, 0), object_manager.getStreamSetObjectCount());
+
+    try testing.expectEqual(@as(u64, 1), try store.recoverS3WalObjects());
+    try testing.expectEqual(@as(usize, 1), object_manager.getStreamSetObjectCount());
+}
+
+test "PartitionStore S3 WAL recovery fails closed then retries after listed object miss" {
+    var mock_s3 = MockS3.init(testing.allocator);
+    defer mock_s3.deinit();
+    var s3_storage = S3Storage.initMock(testing.allocator, &mock_s3);
+
+    const stream_id = PartitionStore.hashPartitionKey("s3-listed-miss-topic", 0);
+    {
+        var batcher = S3WalBatcher.init(testing.allocator);
+        defer batcher.deinit();
+
+        try batcher.append(stream_id, 0, "a");
+        try testing.expect(batcher.flushNow(&s3_storage));
+    }
+
+    var object_manager = ObjectManager.init(testing.allocator, 1);
+    defer object_manager.deinit();
+
+    var store = PartitionStore.init(testing.allocator);
+    defer store.deinit();
+    store.s3_storage = s3_storage;
+    store.object_manager = &object_manager;
+
+    mock_s3.missNextGetObjects(1);
+    try testing.expectError(error.S3ObjectMissing, store.recoverS3WalObjects());
     try testing.expectEqual(@as(usize, 0), object_manager.getStreamSetObjectCount());
 
     try testing.expectEqual(@as(u64, 1), try store.recoverS3WalObjects());

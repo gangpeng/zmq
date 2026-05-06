@@ -189,6 +189,7 @@ pub const MetadataClient = struct {
         var resp = try Resp.deserialize(self.allocator, response, &pos, 0);
         defer self.freeDescribeQuorumResponse(&resp);
 
+        if (pos != response.len) return error.MalformedDescribeQuorumResponse;
         if (resp.error_code != 0) return null;
         if (resp.topics.len == 0 or resp.topics[0].partitions.len == 0) return null;
 
@@ -603,6 +604,50 @@ test "MetadataClient parseDescribeQuorumResponse surfaces malformed responses" {
     ser.writeI16(&resp, &wpos, 0);
 
     try testing.expectError(error.BufferUnderflow, mc.parseDescribeQuorumResponse(resp[0..wpos]));
+}
+
+test "MetadataClient parseDescribeQuorumResponse rejects trailing bytes" {
+    const Resp = generated.describe_quorum_response.DescribeQuorumResponse;
+
+    var cached_epoch: i32 = 0;
+    var cached_broker_epoch: i64 = 0;
+    const local_replica_directory_ids: []const [16]u8 = &.{};
+    var is_fenced: bool = false;
+    var last_hb: i64 = 0;
+    var should_stop: bool = false;
+
+    var mc = MetadataClient.init(
+        testing.allocator,
+        100,
+        "localhost",
+        9092,
+        &cached_epoch,
+        &cached_broker_epoch,
+        local_replica_directory_ids,
+        &is_fenced,
+        &last_hb,
+        &should_stop,
+    );
+    defer mc.deinit();
+
+    var resp: [160]u8 = undefined;
+    var wpos: usize = 0;
+    const header = ResponseHeader{ .correlation_id = 1 };
+    header.serialize(&resp, &wpos, header_mod.responseHeaderVersion(55, 0));
+    const partitions = [_]Resp.TopicData.PartitionData{.{
+        .partition_index = 0,
+        .error_code = 0,
+        .leader_id = -1,
+        .leader_epoch = 0,
+        .high_watermark = 0,
+    }};
+    const topics = [_]Resp.TopicData{.{ .topic_name = "__cluster_metadata", .partitions = &partitions }};
+    const body = Resp{ .error_code = 0, .topics = &topics };
+    body.serialize(&resp, &wpos, 0);
+    resp[wpos] = 0;
+    wpos += 1;
+
+    try testing.expectError(error.MalformedDescribeQuorumResponse, mc.parseDescribeQuorumResponse(resp[0..wpos]));
 }
 
 test "MetadataClient setTlsContext propagates to controller pool" {

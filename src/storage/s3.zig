@@ -20,6 +20,7 @@ pub const MockS3 = struct {
     pub const FaultInjection = struct {
         put_failures_remaining: u32 = 0,
         get_failures_remaining: u32 = 0,
+        get_misses_remaining: u32 = 0,
         range_failures_remaining: u32 = 0,
         delete_failures_remaining: u32 = 0,
         list_failures_remaining: u32 = 0,
@@ -54,6 +55,10 @@ pub const MockS3 = struct {
 
     pub fn failNextGetObjects(self: *MockS3, count: u32) void {
         self.faults.get_failures_remaining = count;
+    }
+
+    pub fn missNextGetObjects(self: *MockS3, count: u32) void {
+        self.faults.get_misses_remaining = count;
     }
 
     pub fn failNextRangeReads(self: *MockS3, count: u32) void {
@@ -107,6 +112,7 @@ pub const MockS3 = struct {
     pub fn getObjectOrError(self: *MockS3, key: []const u8) !?[]const u8 {
         self.get_count += 1;
         if (consumeFailure(&self.faults.get_failures_remaining)) return error.InjectedGetFailure;
+        if (consumeFailure(&self.faults.get_misses_remaining)) return null;
         if (self.objects.get(key)) |obj| {
             return obj.data;
         }
@@ -681,6 +687,10 @@ test "MockS3 injected read list and delete failures surface through error-aware 
 
     s3.failNextGetObjects(1);
     try testing.expectError(error.InjectedGetFailure, s3.getObjectOrError("prefix/a"));
+    try testing.expectEqualStrings("alpha", (try s3.getObjectOrError("prefix/a")).?);
+
+    s3.missNextGetObjects(1);
+    try testing.expect((try s3.getObjectOrError("prefix/a")) == null);
     try testing.expectEqualStrings("alpha", (try s3.getObjectOrError("prefix/a")).?);
 
     s3.failNextRangeReads(1);
