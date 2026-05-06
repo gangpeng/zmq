@@ -114,7 +114,7 @@ pub const Controller = struct {
         }
 
         return switch (api_key) {
-            18 => self.handleApiVersions(&req_header, api_version, resp_header_version),
+            18 => self.handleApiVersions(request_bytes, pos, &req_header, api_version, resp_header_version),
             52 => self.handleVote(request_bytes, pos, &req_header, api_version, resp_header_version),
             53 => self.handleBeginQuorumEpoch(request_bytes, pos, &req_header, api_version, resp_header_version),
             54 => self.handleEndQuorumEpoch(request_bytes, pos, &req_header, api_version, resp_header_version),
@@ -135,9 +135,21 @@ pub const Controller = struct {
     // ---------------------------------------------------------------
     // ApiVersions (key 18) — controller-scoped
     // ---------------------------------------------------------------
-    fn handleApiVersions(self: *Controller, req_header: *const RequestHeader, api_version: i16, resp_header_version: i16) ?[]u8 {
+    fn handleApiVersions(self: *Controller, request_bytes: []const u8, body_start: usize, req_header: *const RequestHeader, api_version: i16, resp_header_version: i16) ?[]u8 {
+        const Req = generated.api_versions_request.ApiVersionsRequest;
         const Resp = generated.api_versions_response.ApiVersionsResponse;
+        const body_version: i16 = @min(api_version, 4);
         const supported = api_support.controller_supported_apis;
+
+        var pos = body_start;
+        _ = Req.deserialize(self.allocator, request_bytes, &pos, body_version) catch |err| {
+            log.warn("Malformed controller ApiVersions request: {}", .{err});
+            return self.controllerApiVersionsErrorResponse(req_header, resp_header_version, body_version, ErrorCode.invalid_request.toInt());
+        };
+        if (pos != request_bytes.len) {
+            log.warn("Malformed controller ApiVersions request: trailing bytes ({d})", .{request_bytes.len - pos});
+            return self.controllerApiVersionsErrorResponse(req_header, resp_header_version, body_version, ErrorCode.invalid_request.toInt());
+        }
 
         var api_keys_list: [supported.len]Resp.ApiVersion = undefined;
         for (supported, 0..) |api, i| {
@@ -153,7 +165,23 @@ pub const Controller = struct {
             .api_keys = api_keys_list[0..],
             .throttle_time_ms = 0,
         };
-        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, body_version) orelse {
+            log.warn("Controller ApiVersions response serialization failed", .{});
+            return self.controllerApiVersionsErrorResponse(req_header, resp_header_version, body_version, ErrorCode.kafka_storage_error.toInt());
+        };
+    }
+
+    fn controllerApiVersionsErrorResponse(self: *Controller, req_header: *const RequestHeader, resp_header_version: i16, body_version: i16, error_code: i16) ?[]u8 {
+        const Resp = generated.api_versions_response.ApiVersionsResponse;
+        const resp = Resp{
+            .error_code = error_code,
+            .api_keys = &.{},
+            .throttle_time_ms = 0,
+            .supported_features = &.{},
+            .finalized_features_epoch = -1,
+            .finalized_features = &.{},
+        };
+        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, body_version);
     }
 
     // ---------------------------------------------------------------
@@ -2409,6 +2437,13 @@ fn readControllerErrorCode(
     return resp.error_code;
 }
 
+fn freeDeserializedControllerApiVersionsResponse(resp: *const generated.api_versions_response.ApiVersionsResponse) void {
+    if (resp.api_keys.len > 0) testing.allocator.free(resp.api_keys);
+    if (resp.supported_features.len > 0) testing.allocator.free(resp.supported_features);
+    if (resp.finalized_features.len > 0) testing.allocator.free(resp.finalized_features);
+    if (resp.tagged_fields.len > 0) testing.allocator.free(resp.tagged_fields);
+}
+
 const OneShotFailingAllocator = struct {
     backing: Allocator,
     fail_index: usize,
@@ -2512,6 +2547,101 @@ test "Controller handleRequest ApiVersions returns supported APIs" {
         if (api_key == 82) saw_update_raft_voter = true;
     }
     try testing.expect(saw_update_raft_voter);
+}
+
+test "Controller handleRequest ApiVersions v3 returns supported APIs" {
+    const Req = generated.api_versions_request.ApiVersionsRequest;
+    const Resp = generated.api_versions_response.ApiVersionsResponse;
+
+    var ctrl = Controller.init(testing.allocator, 1, "test-cluster");
+    defer ctrl.deinit();
+
+    var buf: [256]u8 = undefined;
+    var pos = buildTestRequest(&buf, 18, 3, 43, header_mod.requestHeaderVersion(18, 3));
+    const req = Req{
+        .client_software_name = "zmq-controller",
+        .client_software_version = "0.1.0",
+    };
+    req.serialize(&buf, &pos, 3);
+
+    const response = ctrl.handleRequest(buf[0..pos]);
+    try testing.expect(response != null);
+    defer testing.allocator.free(response.?);
+
+    var rpos: usize = 0;
+    var resp_header = try ResponseHeader.deserialize(testing.allocator, response.?, &rpos, header_mod.responseHeaderVersion(18, 3));
+    defer resp_header.deinit(testing.allocator);
+    try testing.expectEqual(@as(i32, 43), resp_header.correlation_id);
+
+    const resp = try Resp.deserialize(testing.allocator, response.?, &rpos, 3);
+    defer freeDeserializedControllerApiVersionsResponse(&resp);
+
+    try testing.expectEqual(response.?.len, rpos);
+    try testing.expectEqual(ErrorCode.none.toInt(), resp.error_code);
+    try testing.expectEqual(api_support.controller_supported_apis.len, resp.api_keys.len);
+    try testing.expectEqual(@as(i32, 0), resp.throttle_time_ms);
+    try testing.expectEqual(@as(usize, 0), resp.supported_features.len);
+    try testing.expectEqual(@as(usize, 0), resp.finalized_features.len);
+    try testing.expectEqual(@as(usize, 0), resp.tagged_fields.len);
+}
+
+test "Controller handleRequest ApiVersions v3 rejects truncated request body" {
+    const Resp = generated.api_versions_response.ApiVersionsResponse;
+
+    var ctrl = Controller.init(testing.allocator, 1, "test-cluster");
+    defer ctrl.deinit();
+
+    var buf: [256]u8 = undefined;
+    const req_len = buildTestRequest(&buf, 18, 3, 44, header_mod.requestHeaderVersion(18, 3));
+
+    const response = ctrl.handleRequest(buf[0..req_len]);
+    try testing.expect(response != null);
+    defer testing.allocator.free(response.?);
+
+    var rpos: usize = 0;
+    var resp_header = try ResponseHeader.deserialize(testing.allocator, response.?, &rpos, header_mod.responseHeaderVersion(18, 3));
+    defer resp_header.deinit(testing.allocator);
+    try testing.expectEqual(@as(i32, 44), resp_header.correlation_id);
+
+    const resp = try Resp.deserialize(testing.allocator, response.?, &rpos, 3);
+    defer freeDeserializedControllerApiVersionsResponse(&resp);
+
+    try testing.expectEqual(response.?.len, rpos);
+    try testing.expectEqual(ErrorCode.invalid_request.toInt(), resp.error_code);
+    try testing.expectEqual(@as(usize, 0), resp.api_keys.len);
+}
+
+test "Controller handleRequest ApiVersions fails closed on response serialization failure" {
+    const Resp = generated.api_versions_response.ApiVersionsResponse;
+
+    var ctrl = Controller.init(testing.allocator, 1, "test-cluster");
+    defer ctrl.deinit();
+
+    var buf: [256]u8 = undefined;
+    const req_len = buildTestRequest(&buf, 18, 0, 45, header_mod.requestHeaderVersion(18, 0));
+
+    var failing_allocator = OneShotFailingAllocator.init(testing.allocator, 0);
+    const response_allocator = failing_allocator.allocator();
+    ctrl.allocator = response_allocator;
+
+    const response = ctrl.handleRequest(buf[0..req_len]);
+    ctrl.allocator = testing.allocator;
+
+    try testing.expect(failing_allocator.failed);
+    try testing.expect(response != null);
+    defer response_allocator.free(response.?);
+
+    var rpos: usize = 0;
+    var resp_header = try ResponseHeader.deserialize(testing.allocator, response.?, &rpos, header_mod.responseHeaderVersion(18, 0));
+    defer resp_header.deinit(testing.allocator);
+    try testing.expectEqual(@as(i32, 45), resp_header.correlation_id);
+
+    const resp = try Resp.deserialize(testing.allocator, response.?, &rpos, 0);
+    defer freeDeserializedControllerApiVersionsResponse(&resp);
+
+    try testing.expectEqual(response.?.len, rpos);
+    try testing.expectEqual(ErrorCode.kafka_storage_error.toInt(), resp.error_code);
+    try testing.expectEqual(@as(usize, 0), resp.api_keys.len);
 }
 
 test "Controller handleRequest unsupported API returns error" {
