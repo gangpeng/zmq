@@ -24528,18 +24528,32 @@ pub const Broker = struct {
 
         if (!validateDescribeAclsRequestFrame(request_bytes, body_start, api_version)) {
             log.warn("Malformed DescribeAcls request", .{});
-            return null;
+            return self.describeAclsErrorResponse(req_header, resp_header_version, api_version, ErrorCode.invalid_request, "Invalid request");
         }
 
         var pos = body_start;
         const req = Req.deserialize(self.allocator, request_bytes, &pos, api_version) catch |err| {
             log.warn("Failed to decode DescribeAcls request: {}", .{err});
-            return null;
+            return self.describeAclsErrorResponse(req_header, resp_header_version, api_version, ErrorCode.invalid_request, "Invalid request");
         };
 
-        const resp = self.describeAclsResponse(req, api_version) catch return null;
+        const resp = self.describeAclsResponse(req, api_version) catch |err| {
+            log.warn("DescribeAcls response materialization failed: {}", .{err});
+            return self.describeAclsErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error, "Failed to materialize ACL response");
+        };
         defer self.freeDescribeAclsResources(resp.resources);
 
+        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+    }
+
+    fn describeAclsErrorResponse(self: *Broker, req_header: *const RequestHeader, resp_header_version: i16, api_version: i16, err_code: ErrorCode, message: ?[]const u8) ?[]u8 {
+        const Resp = generated.describe_acls_response.DescribeAclsResponse;
+        const resp = Resp{
+            .throttle_time_ms = 0,
+            .error_code = @intFromEnum(err_code),
+            .error_message = message,
+            .resources = &.{},
+        };
         return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
     }
 
@@ -35375,16 +35389,31 @@ test "Broker.handleRequest DescribeAcls returns invalid_request for unknown enum
 }
 
 test "Broker.handleRequest DescribeAcls rejects truncated request" {
+    const Resp = generated.describe_acls_response.DescribeAclsResponse;
+
     var broker = Broker.init(testing.allocator, 1, 9092);
     defer broker.deinit();
 
     var buf: [128]u8 = undefined;
     const req_len = buildTestRequest(&buf, 29, 2, 2904, header_mod.requestHeaderVersion(29, 2));
-    try testing.expect(broker.handleRequest(buf[0..req_len]) == null);
+    const response = broker.handleRequest(buf[0..req_len]);
+    try testing.expect(response != null);
+    defer testing.allocator.free(response.?);
+
+    var rpos: usize = 0;
+    var response_header = try ResponseHeader.deserialize(testing.allocator, response.?, &rpos, header_mod.responseHeaderVersion(29, 2));
+    defer response_header.deinit(testing.allocator);
+    try testing.expectEqual(@as(i32, 2904), response_header.correlation_id);
+
+    const resp = try Resp.deserialize(testing.allocator, response.?, &rpos, 2);
+    try testing.expectEqual(response.?.len, rpos);
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.invalid_request)), resp.error_code);
+    try testing.expectEqual(@as(usize, 0), resp.resources.len);
 }
 
 test "Broker.handleRequest DescribeAcls rejects trailing bytes" {
     const Req = generated.describe_acls_request.DescribeAclsRequest;
+    const Resp = generated.describe_acls_response.DescribeAclsResponse;
 
     var broker = Broker.init(testing.allocator, 1, 9092);
     defer broker.deinit();
@@ -35403,7 +35432,52 @@ test "Broker.handleRequest DescribeAcls rejects trailing bytes" {
     var pos = buildTestRequest(&buf, 29, 2, 2906, header_mod.requestHeaderVersion(29, 2));
     req.serialize(&buf, &pos, 2);
 
-    try expectTrailingByteRejected(&broker, buf[0..], pos);
+    try expectTrailingByteRejectedWithGeneratedResponse(Resp, &broker, buf[0..], pos, 29, 2, 2906);
+}
+
+test "Broker.handleRequest DescribeAcls fails closed when response materialization fails" {
+    const Req = generated.describe_acls_request.DescribeAclsRequest;
+    const Resp = generated.describe_acls_response.DescribeAclsResponse;
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+    try broker.authorizer.addSuperUser("test-client");
+    try broker.authorizer.addAcl("User:alice", .topic, "acl-storage-fail-topic", .literal, .read, .allow, "*");
+
+    const req = Req{
+        .resource_type_filter = @intFromEnum(Authorizer.ResourceType.topic),
+        .resource_name_filter = "acl-storage-fail-topic",
+        .pattern_type_filter = @intFromEnum(Authorizer.PatternType.literal),
+        .principal_filter = "User:alice",
+        .host_filter = "*",
+        .operation = @intFromEnum(Authorizer.Operation.read),
+        .permission_type = @intFromEnum(Authorizer.Permission.allow),
+    };
+
+    var buf: [512]u8 = undefined;
+    var pos = buildTestRequest(&buf, 29, 2, 2907, header_mod.requestHeaderVersion(29, 2));
+    req.serialize(&buf, &pos, 2);
+
+    var failing_allocator = OneShotFailingAllocator.init(testing.allocator, 0);
+    const response_allocator = failing_allocator.allocator();
+    broker.allocator = response_allocator;
+
+    const response = broker.handleRequest(buf[0..pos]);
+    broker.allocator = testing.allocator;
+
+    try testing.expect(failing_allocator.failed);
+    try testing.expect(response != null);
+    defer response_allocator.free(response.?);
+
+    var rpos: usize = 0;
+    var response_header = try ResponseHeader.deserialize(testing.allocator, response.?, &rpos, header_mod.responseHeaderVersion(29, 2));
+    defer response_header.deinit(testing.allocator);
+    try testing.expectEqual(@as(i32, 2907), response_header.correlation_id);
+
+    const resp = try Resp.deserialize(testing.allocator, response.?, &rpos, 2);
+    try testing.expectEqual(response.?.len, rpos);
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.kafka_storage_error)), resp.error_code);
+    try testing.expectEqual(@as(usize, 0), resp.resources.len);
 }
 
 test "Broker.handleRequest DescribeAcls authorization denial uses generated response" {
