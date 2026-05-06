@@ -1384,6 +1384,82 @@ def wait_for_assign_replicas_to_dirs_checkpoint(
     raise TestError(f"AssignReplicasToDirs did not recover for {topic!r}: {last_error}")
 
 
+def parse_elect_leaders_response(response, correlation_id):
+    pos = parse_flexible_response_header(response, correlation_id)
+    throttle_time_ms, pos = read_i32(response, pos)
+    error_code, pos = read_i16(response, pos)
+    result_count, pos = read_compact_array_len(response, pos)
+    results = []
+    for _ in range(result_count):
+        topic_name, pos = read_compact_string(response, pos)
+        partition_count, pos = read_compact_array_len(response, pos)
+        partitions = []
+        for _ in range(partition_count):
+            partition_id, pos = read_i32(response, pos)
+            partition_error, pos = read_i16(response, pos)
+            error_message, pos = read_compact_string(response, pos)
+            pos = skip_tags(response, pos)
+            partitions.append(
+                {
+                    "partition_id": partition_id,
+                    "error_code": partition_error,
+                    "error_message": error_message,
+                }
+            )
+        pos = skip_tags(response, pos)
+        results.append({"topic": topic_name, "partitions": partitions})
+    pos = skip_tags(response, pos)
+    if pos != len(response):
+        raise TestError(f"ElectLeaders response trailing bytes: {len(response) - pos}")
+    return {
+        "throttle_time_ms": throttle_time_ms,
+        "error_code": error_code,
+        "results": results,
+    }
+
+
+def elect_leaders(port, topic, correlation_id):
+    body = b"\x00"  # preferred election
+    body += write_compact_array_len(1)
+    body += write_compact_string(topic)
+    body += write_compact_i32_array([0])
+    body += b"\x00"  # topic tagged fields
+    body += struct.pack(">i", 30000)
+    body += b"\x00"  # request tagged fields
+    response = flexible_kafka_request(port, 43, 2, correlation_id, body)
+    return parse_elect_leaders_response(response, correlation_id)
+
+
+def wait_for_elect_leaders_checkpoint(port, topic, timeout=30):
+    deadline = time.time() + timeout
+    correlation_id = 8640
+    last_error = None
+    while time.time() < deadline:
+        try:
+            response = elect_leaders(port, topic, correlation_id)
+            if response["throttle_time_ms"] != 0 or response["error_code"] != 0:
+                raise TestError(f"ElectLeaders top-level mismatch: {response}")
+            results = response["results"]
+            if len(results) != 1 or results[0]["topic"] != topic:
+                raise TestError(f"ElectLeaders topic mismatch: {response}")
+            partitions = results[0]["partitions"]
+            if len(partitions) != 1:
+                raise TestError(f"ElectLeaders partition count mismatch: {response}")
+            partition = partitions[0]
+            if (
+                partition["partition_id"] != 0
+                or partition["error_code"] != 0
+                or partition["error_message"] is not None
+            ):
+                raise TestError(f"ElectLeaders partition mismatch: {response}")
+            return
+        except Exception as exc:
+            last_error = exc
+        correlation_id += 1
+        time.sleep(0.25)
+    raise TestError(f"ElectLeaders did not recover for {topic!r}: {last_error}")
+
+
 def parse_nullable_compact_i32_array(buf, pos):
     raw_len, pos = read_varint(buf, pos)
     if raw_len == 0:
@@ -7952,6 +8028,10 @@ def main():
                 broker["data_dir"],
                 broker["log_path"],
             )
+            wait_for_elect_leaders_checkpoint(
+                broker["port"],
+                topic,
+            )
             wait_for_describe_cluster_checkpoint(
                 broker["port"],
                 100,
@@ -9071,6 +9151,7 @@ def main():
             f"describe_log_dirs_checked=true, "
             f"alter_replica_log_dirs_checked=true, "
             f"assign_replicas_to_dirs_checked=true, "
+            f"elect_leaders_checked=true, "
             f"describe_cluster_checked=true, "
             f"idempotent_producer_fencing=true, "
             f"describe_producers_checked=true, "
@@ -9486,6 +9567,25 @@ def self_test():
             raise TestError(
                 f"AssignReplicasToDirs fixture parser failed: {assigned_dirs}"
             )
+
+        elect_leaders_fixture = struct.pack(">i", 170)
+        elect_leaders_fixture += b"\x00"  # response header tagged fields
+        elect_leaders_fixture += struct.pack(">ih", 0, 0)
+        elect_leaders_fixture += write_compact_array_len(1)
+        elect_leaders_fixture += write_compact_string("elect-self-test")
+        elect_leaders_fixture += write_compact_array_len(1)
+        elect_leaders_fixture += struct.pack(">ih", 0, 0)
+        elect_leaders_fixture += write_compact_string(None)
+        elect_leaders_fixture += b"\x00"  # partition tagged fields
+        elect_leaders_fixture += b"\x00"  # topic tagged fields
+        elect_leaders_fixture += b"\x00"  # response tagged fields
+        elected = parse_elect_leaders_response(elect_leaders_fixture, 170)
+        if (
+            elected["results"][0]["topic"] != "elect-self-test"
+            or elected["results"][0]["partitions"][0]["partition_id"] != 0
+            or elected["results"][0]["partitions"][0]["error_code"] != 0
+        ):
+            raise TestError(f"ElectLeaders fixture parser failed: {elected}")
 
         topic_partitions_fixture = struct.pack(">i", 164)
         topic_partitions_fixture += b"\x00"  # response header tagged fields
