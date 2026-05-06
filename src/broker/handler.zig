@@ -21127,13 +21127,13 @@ pub const Broker = struct {
 
         if (!validateCreateDelegationTokenRequestFrame(request_bytes, body_start, api_version)) {
             log.warn("Malformed CreateDelegationToken request", .{});
-            return null;
+            return self.createDelegationTokenErrorResponse(req_header, resp_header_version, api_version, ErrorCode.invalid_request);
         }
 
         var pos = body_start;
         var req = Req.deserialize(self.allocator, request_bytes, &pos, api_version) catch |err| {
             log.warn("Failed to decode CreateDelegationToken request: {}", .{err});
-            return null;
+            return self.createDelegationTokenErrorResponse(req_header, resp_header_version, api_version, ErrorCode.invalid_request);
         };
         defer self.freeCreateDelegationTokenRequest(&req);
 
@@ -21142,7 +21142,10 @@ pub const Broker = struct {
                 .error_code = @intFromEnum(ErrorCode.delegation_token_request_not_allowed),
                 .throttle_time_ms = 0,
             };
-            return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+            return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version) orelse {
+                log.warn("CreateDelegationToken delegation-token-auth response serialization failed", .{});
+                return self.createDelegationTokenErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error);
+            };
         }
 
         const requester = self.requestPrincipal(req_header);
@@ -21155,12 +21158,15 @@ pub const Broker = struct {
                 .error_code = @intFromEnum(ErrorCode.invalid_principal_type),
                 .throttle_time_ms = 0,
             };
-            return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+            return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version) orelse {
+                log.warn("CreateDelegationToken invalid-principal response serialization failed", .{});
+                return self.createDelegationTokenErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error);
+            };
         }
 
         const previous_snapshot = self.encodeDelegationTokenSnapshotRecordValue() catch |err| {
             log.warn("Failed to capture delegation token snapshot before create: {}", .{err});
-            return null;
+            return self.createDelegationTokenErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error);
         };
         defer self.allocator.free(previous_snapshot);
 
@@ -21171,23 +21177,13 @@ pub const Broker = struct {
                     .error_code = @intFromEnum(ErrorCode.invalid_principal_type),
                     .throttle_time_ms = 0,
                 };
-                return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+                return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version) orelse {
+                    log.warn("CreateDelegationToken invalid-renewer response serialization failed", .{});
+                    return self.createDelegationTokenErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error);
+                };
             }
             log.warn("Failed to create delegation token: {}", .{err});
-            return null;
-        };
-
-        self.persistDelegationTokensDurably() catch |err| {
-            log.warn("Failed to persist created delegation token: {}", .{err});
-            self.restoreDelegationTokensAfterFailedMutation(previous_snapshot);
-            self.persistDelegationTokensLocalDurably() catch |restore_err| {
-                log.warn("Failed to persist restored delegation token metadata: {}", .{restore_err});
-            };
-            const resp = Resp{
-                .error_code = @intFromEnum(ErrorCode.kafka_storage_error),
-                .throttle_time_ms = 0,
-            };
-            return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+            return self.createDelegationTokenErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error);
         };
 
         const resp = Resp{
@@ -21203,7 +21199,33 @@ pub const Broker = struct {
             .hmac = token.hmac,
             .throttle_time_ms = 0,
         };
-        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+        const success_response = self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version) orelse {
+            log.warn("CreateDelegationToken response serialization failed", .{});
+            self.restoreDelegationTokensAfterFailedMutation(previous_snapshot);
+            self.persistDelegationTokensLocalDurably() catch |restore_err| {
+                log.warn("Failed to persist restored delegation token metadata: {}", .{restore_err});
+            };
+            return self.createDelegationTokenErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error);
+        };
+
+        self.persistDelegationTokensDurably() catch |err| {
+            log.warn("Failed to persist created delegation token: {}", .{err});
+            self.restoreDelegationTokensAfterFailedMutation(previous_snapshot);
+            self.persistDelegationTokensLocalDurably() catch |restore_err| {
+                log.warn("Failed to persist restored delegation token metadata: {}", .{restore_err});
+            };
+            self.allocator.free(success_response);
+            const storage_resp = Resp{
+                .error_code = @intFromEnum(ErrorCode.kafka_storage_error),
+                .throttle_time_ms = 0,
+            };
+            return self.serializeGeneratedResponse(req_header, resp_header_version, &storage_resp, api_version) orelse {
+                log.warn("CreateDelegationToken persistence-error response serialization failed", .{});
+                return self.createDelegationTokenErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error);
+            };
+        };
+
+        return success_response;
     }
 
     fn handleRenewDelegationToken(self: *Broker, request_bytes: []const u8, body_start: usize, req_header: *const RequestHeader, api_version: i16, resp_header_version: i16) ?[]u8 {
@@ -21212,13 +21234,13 @@ pub const Broker = struct {
 
         if (!validateRenewDelegationTokenRequestFrame(request_bytes, body_start, api_version)) {
             log.warn("Malformed RenewDelegationToken request", .{});
-            return null;
+            return self.renewDelegationTokenErrorResponse(req_header, resp_header_version, api_version, ErrorCode.invalid_request);
         }
 
         var pos = body_start;
         const req = Req.deserialize(self.allocator, request_bytes, &pos, api_version) catch |err| {
             log.warn("Failed to decode RenewDelegationToken request: {}", .{err});
-            return null;
+            return self.renewDelegationTokenErrorResponse(req_header, resp_header_version, api_version, ErrorCode.invalid_request);
         };
 
         if (self.sessionAuthenticatedViaDelegationToken(req_header)) {
@@ -21227,7 +21249,10 @@ pub const Broker = struct {
                 .expiry_timestamp_ms = 0,
                 .throttle_time_ms = 0,
             };
-            return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+            return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version) orelse {
+                log.warn("RenewDelegationToken delegation-token-auth response serialization failed", .{});
+                return self.renewDelegationTokenErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error);
+            };
         }
 
         const now_ms = @import("time_compat").milliTimestamp();
@@ -21239,7 +21264,10 @@ pub const Broker = struct {
                 .expiry_timestamp_ms = 0,
                 .throttle_time_ms = 0,
             };
-            return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+            return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version) orelse {
+                log.warn("RenewDelegationToken not-found response serialization failed", .{});
+                return self.renewDelegationTokenErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error);
+            };
         };
 
         const requester = self.requestPrincipal(req_header);
@@ -21249,7 +21277,10 @@ pub const Broker = struct {
                 .expiry_timestamp_ms = token.expiry_timestamp_ms,
                 .throttle_time_ms = 0,
             };
-            return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+            return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version) orelse {
+                log.warn("RenewDelegationToken authorization-failed response serialization failed", .{});
+                return self.renewDelegationTokenErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error);
+            };
         }
 
         const requested_period_ms = delegationTokenLifetime(req.renew_period_ms);
@@ -21257,30 +21288,40 @@ pub const Broker = struct {
         const old_expiry_timestamp_ms = token.expiry_timestamp_ms;
         const previous_snapshot = self.encodeDelegationTokenSnapshotRecordValue() catch |err| {
             log.warn("Failed to capture delegation token snapshot before renewal: {}", .{err});
-            return null;
+            return self.renewDelegationTokenErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error);
         };
         defer self.allocator.free(previous_snapshot);
-        token.expiry_timestamp_ms = @min(requested_expiry_ms, token.max_timestamp_ms);
+        const new_expiry_timestamp_ms = @min(requested_expiry_ms, token.max_timestamp_ms);
+        const resp = Resp{
+            .error_code = @intFromEnum(ErrorCode.none),
+            .expiry_timestamp_ms = new_expiry_timestamp_ms,
+            .throttle_time_ms = 0,
+        };
+        const success_response = self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version) orelse {
+            log.warn("RenewDelegationToken response serialization failed", .{});
+            return self.renewDelegationTokenErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error);
+        };
+
+        token.expiry_timestamp_ms = new_expiry_timestamp_ms;
         self.persistDelegationTokensDurably() catch |err| {
             log.warn("Failed to persist renewed delegation token: {}", .{err});
             self.restoreDelegationTokensAfterFailedMutation(previous_snapshot);
             self.persistDelegationTokensLocalDurably() catch |restore_err| {
                 log.warn("Failed to persist restored delegation token metadata: {}", .{restore_err});
             };
-            const resp = Resp{
+            self.allocator.free(success_response);
+            const storage_resp = Resp{
                 .error_code = @intFromEnum(ErrorCode.kafka_storage_error),
                 .expiry_timestamp_ms = old_expiry_timestamp_ms,
                 .throttle_time_ms = 0,
             };
-            return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+            return self.serializeGeneratedResponse(req_header, resp_header_version, &storage_resp, api_version) orelse {
+                log.warn("RenewDelegationToken persistence-error response serialization failed", .{});
+                return self.renewDelegationTokenErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error);
+            };
         };
 
-        const resp = Resp{
-            .error_code = @intFromEnum(ErrorCode.none),
-            .expiry_timestamp_ms = token.expiry_timestamp_ms,
-            .throttle_time_ms = 0,
-        };
-        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+        return success_response;
     }
 
     fn handleExpireDelegationToken(self: *Broker, request_bytes: []const u8, body_start: usize, req_header: *const RequestHeader, api_version: i16, resp_header_version: i16) ?[]u8 {
@@ -21289,13 +21330,13 @@ pub const Broker = struct {
 
         if (!validateExpireDelegationTokenRequestFrame(request_bytes, body_start, api_version)) {
             log.warn("Malformed ExpireDelegationToken request", .{});
-            return null;
+            return self.expireDelegationTokenErrorResponse(req_header, resp_header_version, api_version, ErrorCode.invalid_request);
         }
 
         var pos = body_start;
         const req = Req.deserialize(self.allocator, request_bytes, &pos, api_version) catch |err| {
             log.warn("Failed to decode ExpireDelegationToken request: {}", .{err});
-            return null;
+            return self.expireDelegationTokenErrorResponse(req_header, resp_header_version, api_version, ErrorCode.invalid_request);
         };
 
         if (self.sessionAuthenticatedViaDelegationToken(req_header)) {
@@ -21304,7 +21345,10 @@ pub const Broker = struct {
                 .expiry_timestamp_ms = 0,
                 .throttle_time_ms = 0,
             };
-            return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+            return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version) orelse {
+                log.warn("ExpireDelegationToken delegation-token-auth response serialization failed", .{});
+                return self.expireDelegationTokenErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error);
+            };
         }
 
         const now_ms = @import("time_compat").milliTimestamp();
@@ -21316,7 +21360,10 @@ pub const Broker = struct {
                 .expiry_timestamp_ms = 0,
                 .throttle_time_ms = 0,
             };
-            return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+            return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version) orelse {
+                log.warn("ExpireDelegationToken invalid-hmac response serialization failed", .{});
+                return self.expireDelegationTokenErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error);
+            };
         };
 
         const token = self.delegation_tokens.getPtr(&key_buf) orelse {
@@ -21325,7 +21372,10 @@ pub const Broker = struct {
                 .expiry_timestamp_ms = 0,
                 .throttle_time_ms = 0,
             };
-            return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+            return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version) orelse {
+                log.warn("ExpireDelegationToken not-found response serialization failed", .{});
+                return self.expireDelegationTokenErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error);
+            };
         };
 
         const requester = self.requestPrincipal(req_header);
@@ -21335,7 +21385,10 @@ pub const Broker = struct {
                 .expiry_timestamp_ms = token.expiry_timestamp_ms,
                 .throttle_time_ms = 0,
             };
-            return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+            return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version) orelse {
+                log.warn("ExpireDelegationToken authorization-failed response serialization failed", .{});
+                return self.expireDelegationTokenErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error);
+            };
         }
 
         const expiry_timestamp_ms = if (req.expiry_time_period_ms <= 0)
@@ -21345,9 +21398,19 @@ pub const Broker = struct {
         const old_expiry_timestamp_ms = token.expiry_timestamp_ms;
         const previous_snapshot = self.encodeDelegationTokenSnapshotRecordValue() catch |err| {
             log.warn("Failed to capture delegation token snapshot before expiry: {}", .{err});
-            return null;
+            return self.expireDelegationTokenErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error);
         };
         defer self.allocator.free(previous_snapshot);
+        const resp = Resp{
+            .error_code = @intFromEnum(ErrorCode.none),
+            .expiry_timestamp_ms = expiry_timestamp_ms,
+            .throttle_time_ms = 0,
+        };
+        const success_response = self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version) orelse {
+            log.warn("ExpireDelegationToken response serialization failed", .{});
+            return self.expireDelegationTokenErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error);
+        };
+
         if (expiry_timestamp_ms <= now_ms) {
             self.removeDelegationTokenByKey(&key_buf);
         } else {
@@ -21359,20 +21422,19 @@ pub const Broker = struct {
             self.persistDelegationTokensLocalDurably() catch |restore_err| {
                 log.warn("Failed to persist restored delegation token metadata: {}", .{restore_err});
             };
-            const resp = Resp{
+            self.allocator.free(success_response);
+            const storage_resp = Resp{
                 .error_code = @intFromEnum(ErrorCode.kafka_storage_error),
                 .expiry_timestamp_ms = old_expiry_timestamp_ms,
                 .throttle_time_ms = 0,
             };
-            return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+            return self.serializeGeneratedResponse(req_header, resp_header_version, &storage_resp, api_version) orelse {
+                log.warn("ExpireDelegationToken persistence-error response serialization failed", .{});
+                return self.expireDelegationTokenErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error);
+            };
         };
 
-        const resp = Resp{
-            .error_code = @intFromEnum(ErrorCode.none),
-            .expiry_timestamp_ms = expiry_timestamp_ms,
-            .throttle_time_ms = 0,
-        };
-        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+        return success_response;
     }
 
     fn handleDescribeDelegationToken(self: *Broker, request_bytes: []const u8, body_start: usize, req_header: *const RequestHeader, api_version: i16, resp_header_version: i16) ?[]u8 {
@@ -45244,7 +45306,195 @@ test "Broker.handleRequest DescribeDelegationToken fails closed when response se
     try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.kafka_storage_error)), error_code);
 }
 
+test "Broker.handleRequest delegation token mutations roll back when success response serialization fails" {
+    const CreateReq = generated.create_delegation_token_request.CreateDelegationTokenRequest;
+    const CreateResp = generated.create_delegation_token_response.CreateDelegationTokenResponse;
+    const RenewReq = generated.renew_delegation_token_request.RenewDelegationTokenRequest;
+    const RenewResp = generated.renew_delegation_token_response.RenewDelegationTokenResponse;
+    const ExpireReq = generated.expire_delegation_token_request.ExpireDelegationTokenRequest;
+    const ExpireResp = generated.expire_delegation_token_response.ExpireDelegationTokenResponse;
+    const none = @as(i16, @intFromEnum(ErrorCode.none));
+    const storage_error = @as(i16, @intFromEnum(ErrorCode.kafka_storage_error));
+
+    const create_response_fail_index = blk: {
+        var broker = Broker.init(testing.allocator, 1, 9092);
+        defer broker.deinit();
+
+        const req = CreateReq{
+            .owner_principal_type = "User",
+            .owner_principal_name = "create-response-fail-owner",
+            .renewers = &.{},
+            .max_lifetime_ms = delegation_token_default_lifetime_ms,
+        };
+        var buf: [512]u8 = undefined;
+        var pos = buildTestRequest(&buf, 38, 3, 3816, header_mod.requestHeaderVersion(38, 3));
+        req.serialize(&buf, &pos, 3);
+
+        var counting_allocator = OneShotFailingAllocator.init(testing.allocator, std.math.maxInt(usize));
+        const response_allocator = counting_allocator.allocator();
+        broker.allocator = response_allocator;
+
+        const response = broker.handleRequest(buf[0..pos]);
+        try testing.expect(response != null);
+        defer response_allocator.free(response.?);
+
+        const error_code = try readGeneratedTopLevelErrorCode(CreateResp, response.?, 38, 3, 3816);
+        try testing.expectEqual(none, error_code);
+        try testing.expect(counting_allocator.alloc_index > 0);
+        break :blk counting_allocator.alloc_index - 1;
+    };
+
+    {
+        var broker = Broker.init(testing.allocator, 1, 9092);
+        defer broker.deinit();
+
+        const req = CreateReq{
+            .owner_principal_type = "User",
+            .owner_principal_name = "create-response-fail-owner",
+            .renewers = &.{},
+            .max_lifetime_ms = delegation_token_default_lifetime_ms,
+        };
+        var buf: [512]u8 = undefined;
+        var pos = buildTestRequest(&buf, 38, 3, 3817, header_mod.requestHeaderVersion(38, 3));
+        req.serialize(&buf, &pos, 3);
+
+        var failing_allocator = OneShotFailingAllocator.init(testing.allocator, create_response_fail_index);
+        const response_allocator = failing_allocator.allocator();
+        broker.allocator = response_allocator;
+
+        const response = broker.handleRequest(buf[0..pos]);
+        broker.allocator = testing.allocator;
+
+        try testing.expect(failing_allocator.failed);
+        try testing.expect(response != null);
+        defer response_allocator.free(response.?);
+
+        const error_code = try readGeneratedTopLevelErrorCode(CreateResp, response.?, 38, 3, 3817);
+        try testing.expectEqual(storage_error, error_code);
+        try testing.expectEqual(@as(usize, 0), broker.delegation_tokens.count());
+    }
+
+    const renew_response_fail_index = blk: {
+        var broker = Broker.init(testing.allocator, 1, 9092);
+        defer broker.deinit();
+        const token = try testCreateDelegationTokenForOwner(&broker, "renew-response-fail-owner", 3916);
+
+        const req = RenewReq{
+            .hmac = &token.hmac,
+            .renew_period_ms = delegation_token_default_lifetime_ms,
+        };
+        var buf: [256]u8 = undefined;
+        var pos = buildTestRequest(&buf, 39, 2, 3917, header_mod.requestHeaderVersion(39, 2));
+        req.serialize(&buf, &pos, 2);
+
+        var counting_allocator = OneShotFailingAllocator.init(testing.allocator, std.math.maxInt(usize));
+        const response_allocator = counting_allocator.allocator();
+        broker.allocator = response_allocator;
+
+        const response = broker.handleRequest(buf[0..pos]);
+        try testing.expect(response != null);
+        defer response_allocator.free(response.?);
+
+        const error_code = try readGeneratedTopLevelErrorCode(RenewResp, response.?, 39, 2, 3917);
+        try testing.expectEqual(none, error_code);
+        try testing.expect(counting_allocator.alloc_index > 0);
+        break :blk counting_allocator.alloc_index - 1;
+    };
+
+    {
+        var broker = Broker.init(testing.allocator, 1, 9092);
+        defer broker.deinit();
+        const token = try testCreateDelegationTokenForOwner(&broker, "renew-response-fail-owner", 3918);
+        const original_expiry_timestamp_ms = broker.delegationTokenByHmac(&token.hmac).?.expiry_timestamp_ms;
+
+        const req = RenewReq{
+            .hmac = &token.hmac,
+            .renew_period_ms = delegation_token_default_lifetime_ms,
+        };
+        var buf: [256]u8 = undefined;
+        var pos = buildTestRequest(&buf, 39, 2, 3919, header_mod.requestHeaderVersion(39, 2));
+        req.serialize(&buf, &pos, 2);
+
+        var failing_allocator = OneShotFailingAllocator.init(testing.allocator, renew_response_fail_index);
+        const response_allocator = failing_allocator.allocator();
+        broker.allocator = response_allocator;
+
+        const response = broker.handleRequest(buf[0..pos]);
+        broker.allocator = testing.allocator;
+
+        try testing.expect(failing_allocator.failed);
+        try testing.expect(response != null);
+        defer response_allocator.free(response.?);
+
+        const error_code = try readGeneratedTopLevelErrorCode(RenewResp, response.?, 39, 2, 3919);
+        try testing.expectEqual(storage_error, error_code);
+        try testing.expectEqual(original_expiry_timestamp_ms, broker.delegationTokenByHmac(&token.hmac).?.expiry_timestamp_ms);
+    }
+
+    const expire_response_fail_index = blk: {
+        var broker = Broker.init(testing.allocator, 1, 9092);
+        defer broker.deinit();
+        const token = try testCreateDelegationTokenForOwner(&broker, "expire-response-fail-owner", 4016);
+
+        const req = ExpireReq{
+            .hmac = &token.hmac,
+            .expiry_time_period_ms = 0,
+        };
+        var buf: [256]u8 = undefined;
+        var pos = buildTestRequest(&buf, 40, 2, 4017, header_mod.requestHeaderVersion(40, 2));
+        req.serialize(&buf, &pos, 2);
+
+        var counting_allocator = OneShotFailingAllocator.init(testing.allocator, std.math.maxInt(usize));
+        const response_allocator = counting_allocator.allocator();
+        broker.allocator = response_allocator;
+
+        const response = broker.handleRequest(buf[0..pos]);
+        try testing.expect(response != null);
+        defer response_allocator.free(response.?);
+
+        const error_code = try readGeneratedTopLevelErrorCode(ExpireResp, response.?, 40, 2, 4017);
+        try testing.expectEqual(none, error_code);
+        try testing.expect(counting_allocator.alloc_index > 0);
+        break :blk counting_allocator.alloc_index - 1;
+    };
+
+    {
+        var broker = Broker.init(testing.allocator, 1, 9092);
+        defer broker.deinit();
+        const token = try testCreateDelegationTokenForOwner(&broker, "expire-response-fail-owner", 4018);
+        const original_expiry_timestamp_ms = broker.delegationTokenByHmac(&token.hmac).?.expiry_timestamp_ms;
+
+        const req = ExpireReq{
+            .hmac = &token.hmac,
+            .expiry_time_period_ms = 0,
+        };
+        var buf: [256]u8 = undefined;
+        var pos = buildTestRequest(&buf, 40, 2, 4019, header_mod.requestHeaderVersion(40, 2));
+        req.serialize(&buf, &pos, 2);
+
+        var failing_allocator = OneShotFailingAllocator.init(testing.allocator, expire_response_fail_index);
+        const response_allocator = failing_allocator.allocator();
+        broker.allocator = response_allocator;
+
+        const response = broker.handleRequest(buf[0..pos]);
+        broker.allocator = testing.allocator;
+
+        try testing.expect(failing_allocator.failed);
+        try testing.expect(response != null);
+        defer response_allocator.free(response.?);
+
+        const error_code = try readGeneratedTopLevelErrorCode(ExpireResp, response.?, 40, 2, 4019);
+        try testing.expectEqual(storage_error, error_code);
+        const restored_token = broker.delegationTokenByHmac(&token.hmac);
+        try testing.expect(restored_token != null);
+        try testing.expectEqual(original_expiry_timestamp_ms, restored_token.?.expiry_timestamp_ms);
+    }
+}
+
 test "Broker.handleRequest delegation token APIs reject truncated request bodies" {
+    const CreateResp = generated.create_delegation_token_response.CreateDelegationTokenResponse;
+    const RenewResp = generated.renew_delegation_token_response.RenewDelegationTokenResponse;
+    const ExpireResp = generated.expire_delegation_token_response.ExpireDelegationTokenResponse;
     const DescribeResp = generated.describe_delegation_token_response.DescribeDelegationTokenResponse;
 
     var broker = Broker.init(testing.allocator, 1, 9092);
@@ -45254,30 +45504,34 @@ test "Broker.handleRequest delegation token APIs reject truncated request bodies
         .{ .key = 38, .version = 3, .correlation_id = 3823 },
         .{ .key = 39, .version = 2, .correlation_id = 3922 },
         .{ .key = 40, .version = 2, .correlation_id = 4022 },
+        .{ .key = 41, .version = 3, .correlation_id = 4123 },
     };
 
     for (probes) |probe| {
         var buf: [128]u8 = undefined;
         const req_len = buildTestRequest(&buf, probe.key, probe.version, probe.correlation_id, header_mod.requestHeaderVersion(probe.key, probe.version));
-        try testing.expect(broker.handleRequest(buf[0..req_len]) == null);
-    }
-
-    {
-        var buf: [128]u8 = undefined;
-        const req_len = buildTestRequest(&buf, 41, 3, 4123, header_mod.requestHeaderVersion(41, 3));
         const response = broker.handleRequest(buf[0..req_len]);
         try testing.expect(response != null);
         defer testing.allocator.free(response.?);
 
-        const error_code = try readGeneratedTopLevelErrorCode(DescribeResp, response.?, 41, 3, 4123);
+        const error_code = switch (probe.key) {
+            38 => try readGeneratedTopLevelErrorCode(CreateResp, response.?, probe.key, probe.version, probe.correlation_id),
+            39 => try readGeneratedTopLevelErrorCode(RenewResp, response.?, probe.key, probe.version, probe.correlation_id),
+            40 => try readGeneratedTopLevelErrorCode(ExpireResp, response.?, probe.key, probe.version, probe.correlation_id),
+            41 => try readGeneratedTopLevelErrorCode(DescribeResp, response.?, probe.key, probe.version, probe.correlation_id),
+            else => unreachable,
+        };
         try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.invalid_request)), error_code);
     }
 }
 
 test "Broker.handleRequest delegation token APIs reject trailing bytes" {
     const CreateReq = generated.create_delegation_token_request.CreateDelegationTokenRequest;
+    const CreateResp = generated.create_delegation_token_response.CreateDelegationTokenResponse;
     const RenewReq = generated.renew_delegation_token_request.RenewDelegationTokenRequest;
+    const RenewResp = generated.renew_delegation_token_response.RenewDelegationTokenResponse;
     const ExpireReq = generated.expire_delegation_token_request.ExpireDelegationTokenRequest;
+    const ExpireResp = generated.expire_delegation_token_response.ExpireDelegationTokenResponse;
     const DescribeReq = generated.describe_delegation_token_request.DescribeDelegationTokenRequest;
     const DescribeResp = generated.describe_delegation_token_response.DescribeDelegationTokenResponse;
     const hmac = [_]u8{ 9, 10, 11, 12 };
@@ -45290,7 +45544,7 @@ test "Broker.handleRequest delegation token APIs reject trailing bytes" {
         var buf: [256]u8 = undefined;
         var pos = buildTestRequest(&buf, 38, 3, 3833, header_mod.requestHeaderVersion(38, 3));
         req.serialize(&buf, &pos, 3);
-        try expectTrailingByteRejected(&broker, buf[0..], pos);
+        try expectTrailingByteRejectedWithGeneratedResponse(CreateResp, &broker, buf[0..], pos, 38, 3, 3833);
     }
 
     {
@@ -45298,7 +45552,7 @@ test "Broker.handleRequest delegation token APIs reject trailing bytes" {
         var buf: [256]u8 = undefined;
         var pos = buildTestRequest(&buf, 39, 2, 3932, header_mod.requestHeaderVersion(39, 2));
         req.serialize(&buf, &pos, 2);
-        try expectTrailingByteRejected(&broker, buf[0..], pos);
+        try expectTrailingByteRejectedWithGeneratedResponse(RenewResp, &broker, buf[0..], pos, 39, 2, 3932);
     }
 
     {
@@ -45306,7 +45560,7 @@ test "Broker.handleRequest delegation token APIs reject trailing bytes" {
         var buf: [256]u8 = undefined;
         var pos = buildTestRequest(&buf, 40, 2, 4032, header_mod.requestHeaderVersion(40, 2));
         req.serialize(&buf, &pos, 2);
-        try expectTrailingByteRejected(&broker, buf[0..], pos);
+        try expectTrailingByteRejectedWithGeneratedResponse(ExpireResp, &broker, buf[0..], pos, 40, 2, 4032);
     }
 
     {

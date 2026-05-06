@@ -366,8 +366,10 @@ metadata, missing-token fail-closed responses, expiry removal coverage, and
 local `delegation_tokens.meta` restart persistence plus `__cluster_metadata`
 snapshot replay for shared-storage replacement. Create/renew/expire now roll
 back visible token state when the delegation-token snapshot cannot be written,
-and malformed local `delegation_tokens.meta` rows now fail closed during load
-instead of being skipped.
+return generated storage errors instead of dropped responses when rollback
+snapshots, token materialization, persistence, or success-response
+serialization fail, and malformed local `delegation_tokens.meta` rows now fail
+closed during load instead of being skipped.
 SASL/SCRAM token authentication now accepts `tokenauth=true` client-first
 messages that use the delegation token ID as SCRAM username and the token HMAC
 as the SCRAM secret; successful sessions authenticate as the token owner
@@ -684,6 +686,13 @@ Status: completed for the initial catalog and DeleteGroups slice.
   connection. Group membership mutation paths also fail closed when rollback
   snapshots or local assignment/member materialization fail before a response
   can be produced.
+  Normal delegation-token Create/Renew/Expire paths now return generated
+  invalid-request responses for malformed/trailing frames and generated
+  storage-error responses for rollback snapshot materialization, token
+  materialization, persistence, or response serialization failures. Their
+  success frames are materialized before durable token mutations are
+  acknowledged, and the visible token state is restored if a success response
+  cannot be built.
   Normal AutoMQ read paths for GetKVs, GetOpeningStreams, AutomqGetNodes,
   AutomqGetPartitionSnapshot, DescribeLicense, ExportClusterManifest, and
   DescribeStreams now use the same generated invalid-request/storage-error
