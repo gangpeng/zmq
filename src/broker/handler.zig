@@ -14723,9 +14723,15 @@ pub const Broker = struct {
 
         var group_fetch_all_flags: []const bool = &.{};
         if (api_version >= 8) {
-            group_fetch_all_flags = self.readOffsetFetchGroupFetchAllFlags(request_bytes, body_start, api_version) orelse {
-                log.warn("OffsetFetch grouped fetch-all flag materialization failed", .{});
-                return self.offsetFetchErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error);
+            group_fetch_all_flags = self.readOffsetFetchGroupFetchAllFlags(request_bytes, body_start, api_version) catch |err| switch (err) {
+                error.MalformedRequest => {
+                    log.warn("Malformed OffsetFetch grouped topic selector", .{});
+                    return self.offsetFetchErrorResponse(req_header, resp_header_version, api_version, ErrorCode.invalid_request);
+                },
+                else => {
+                    log.warn("OffsetFetch grouped fetch-all flag materialization failed: {}", .{err});
+                    return self.offsetFetchErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error);
+                },
             };
         }
         defer {
@@ -30389,33 +30395,33 @@ pub const Broker = struct {
         return topics.is_null;
     }
 
-    fn readOffsetFetchGroupFetchAllFlags(self: *Broker, buf: []const u8, start_pos: usize, api_version: i16) ?[]const bool {
+    fn readOffsetFetchGroupFetchAllFlags(self: *Broker, buf: []const u8, start_pos: usize, api_version: i16) ![]const bool {
         var pos = start_pos;
-        const groups = readKafkaArrayHeader(buf, &pos, true) orelse return null;
-        if (groups.is_null) return null;
+        const groups = readKafkaArrayHeader(buf, &pos, true) orelse return error.MalformedRequest;
+        if (groups.is_null) return error.MalformedRequest;
         if (groups.count == 0) return &.{};
 
-        const flags = self.allocator.alloc(bool, groups.count) catch return null;
+        const flags = try self.allocator.alloc(bool, groups.count);
         var success = false;
         defer {
             if (!success) self.allocator.free(flags);
         }
 
         for (0..groups.count) |group_idx| {
-            if (!skipKafkaString(buf, &pos, true)) return null; // group_id
+            if (!skipKafkaString(buf, &pos, true)) return error.MalformedRequest; // group_id
             if (api_version >= 9) {
-                if (!skipKafkaString(buf, &pos, true)) return null; // member_id
-                if (!skipFixedBytes(buf, &pos, 4)) return null; // member_epoch
+                if (!skipKafkaString(buf, &pos, true)) return error.MalformedRequest; // member_id
+                if (!skipFixedBytes(buf, &pos, 4)) return error.MalformedRequest; // member_epoch
             }
 
-            const topics = readKafkaArrayHeader(buf, &pos, true) orelse return null;
+            const topics = readKafkaArrayHeader(buf, &pos, true) orelse return error.MalformedRequest;
             flags[group_idx] = topics.is_null;
-            if (!topics.is_null and !skipOffsetFetchTopics(buf, &pos, true, topics.count)) return null;
-            ser.skipTaggedFields(buf, &pos) catch return null;
+            if (!topics.is_null and !skipOffsetFetchTopics(buf, &pos, true, topics.count)) return error.MalformedRequest;
+            ser.skipTaggedFields(buf, &pos) catch return error.MalformedRequest;
         }
 
-        if (api_version >= 7 and !skipFixedBytes(buf, &pos, 1)) return null; // require_stable
-        ser.skipTaggedFields(buf, &pos) catch return null;
+        if (api_version >= 7 and !skipFixedBytes(buf, &pos, 1)) return error.MalformedRequest; // require_stable
+        ser.skipTaggedFields(buf, &pos) catch return error.MalformedRequest;
 
         success = true;
         return flags;
