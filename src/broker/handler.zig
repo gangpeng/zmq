@@ -20343,24 +20343,33 @@ pub const Broker = struct {
 
         if (!validateAlterConfigsRequestFrame(request_bytes, body_start, api_version)) {
             log.warn("Malformed AlterConfigs request", .{});
-            return null;
+            return self.alterConfigsErrorResponse(req_header, resp_header_version, api_version, ErrorCode.invalid_request, "Invalid request");
         }
 
         var pos = body_start;
         var req = Req.deserialize(self.allocator, request_bytes, &pos, api_version) catch |err| {
             log.warn("Failed to decode AlterConfigs request: {}", .{err});
-            return null;
+            return self.alterConfigsErrorResponse(req_header, resp_header_version, api_version, ErrorCode.invalid_request, "Invalid request");
         };
         defer self.freeAlterConfigsRequest(&req);
 
-        const responses = self.allocator.alloc(ResourceResponse, req.resources.len) catch return null;
+        const responses = self.allocator.alloc(ResourceResponse, req.resources.len) catch |err| {
+            log.warn("AlterConfigs response materialization failed: {}", .{err});
+            return self.alterConfigsErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error, "Failed to materialize AlterConfigs response");
+        };
         defer if (responses.len > 0) self.allocator.free(responses);
 
-        const mutated_resources = self.allocator.alloc(bool, req.resources.len) catch return null;
+        const mutated_resources = self.allocator.alloc(bool, req.resources.len) catch |err| {
+            log.warn("AlterConfigs mutation flag materialization failed: {}", .{err});
+            return self.alterConfigsErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error, "Failed to materialize AlterConfigs mutation state");
+        };
         defer if (mutated_resources.len > 0) self.allocator.free(mutated_resources);
         @memset(mutated_resources, false);
 
-        const previous_snapshot = if (!req.validate_only) self.encodeTopicSnapshotRecordValue() catch return null else null;
+        const previous_snapshot = if (!req.validate_only) self.encodeTopicSnapshotRecordValue() catch |err| {
+            log.warn("AlterConfigs rollback snapshot materialization failed: {}", .{err});
+            return self.alterConfigsErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error, "Failed to materialize AlterConfigs rollback snapshot");
+        } else null;
         defer if (previous_snapshot) |snapshot| self.allocator.free(snapshot);
 
         var mutated = false;
@@ -20392,7 +20401,10 @@ pub const Broker = struct {
                     .throttle_time_ms = 0,
                     .responses = responses,
                 };
-                return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+                return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version) orelse {
+                    log.warn("AlterConfigs snapshot-error response serialization failed", .{});
+                    return self.alterConfigsErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error, "Failed to serialize AlterConfigs response");
+                };
             };
             self.persistTopicAndObjectLocalMetadataDurably() catch |err| {
                 log.warn("Failed to persist AlterConfigs local metadata: {}", .{err});
@@ -20413,7 +20425,10 @@ pub const Broker = struct {
                     .throttle_time_ms = 0,
                     .responses = responses,
                 };
-                return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+                return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version) orelse {
+                    log.warn("AlterConfigs local-persistence-error response serialization failed", .{});
+                    return self.alterConfigsErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error, "Failed to serialize AlterConfigs response");
+                };
             };
         }
 
@@ -20421,7 +20436,10 @@ pub const Broker = struct {
             .throttle_time_ms = 0,
             .responses = responses,
         };
-        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version) orelse {
+            log.warn("AlterConfigs response serialization failed", .{});
+            return self.alterConfigsErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error, "Failed to serialize AlterConfigs response");
+        };
     }
 
     fn freeAlterConfigsRequest(self: *Broker, req: *generated.alter_configs_request.AlterConfigsRequest) void {
@@ -33402,6 +33420,25 @@ fn expectDescribeConfigsErrorResponseBytes(response: []const u8, api_version: i1
     try testing.expectEqual(@as(usize, 0), resp.results[0].configs.len);
 }
 
+fn expectAlterConfigsErrorResponseBytes(response: []const u8, api_version: i16, correlation_id: i32, err_code: ErrorCode) !void {
+    const Resp = generated.alter_configs_response.AlterConfigsResponse;
+
+    var rpos: usize = 0;
+    var response_header = try ResponseHeader.deserialize(testing.allocator, response, &rpos, header_mod.responseHeaderVersion(33, api_version));
+    defer response_header.deinit(testing.allocator);
+    try testing.expectEqual(correlation_id, response_header.correlation_id);
+
+    const resp = try Resp.deserialize(testing.allocator, response, &rpos, api_version);
+    defer if (resp.responses.len > 0) testing.allocator.free(resp.responses);
+
+    try testing.expectEqual(response.len, rpos);
+    try testing.expectEqual(@as(i32, 0), resp.throttle_time_ms);
+    try testing.expectEqual(@as(usize, 1), resp.responses.len);
+    try testing.expectEqual(@as(i16, @intFromEnum(err_code)), resp.responses[0].error_code);
+    try testing.expectEqual(@as(i8, 0), resp.responses[0].resource_type);
+    try testing.expect(resp.responses[0].resource_name == null);
+}
+
 fn expectListOffsetsErrorResponseBytes(response: []const u8, api_version: i16, correlation_id: i32, err_code: ErrorCode) !void {
     const Resp = generated.list_offsets_response.ListOffsetsResponse;
 
@@ -42970,7 +43007,11 @@ test "Broker.handleRequest AlterConfigs rejects truncated request" {
 
     var buf: [128]u8 = undefined;
     const req_len = buildTestRequest(&buf, 33, 2, 3304, header_mod.requestHeaderVersion(33, 2));
-    try testing.expect(broker.handleRequest(buf[0..req_len]) == null);
+    const response = broker.handleRequest(buf[0..req_len]);
+    try testing.expect(response != null);
+    defer testing.allocator.free(response.?);
+
+    try expectAlterConfigsErrorResponseBytes(response.?, 2, 3304, ErrorCode.invalid_request);
 }
 
 test "Broker.handleRequest AlterConfigs rejects trailing bytes" {
@@ -42997,7 +43038,124 @@ test "Broker.handleRequest AlterConfigs rejects trailing bytes" {
     var pos = buildTestRequest(&buf, 33, 2, 3307, header_mod.requestHeaderVersion(33, 2));
     req.serialize(&buf, &pos, 2);
 
-    try expectTrailingByteRejected(&broker, &buf, pos);
+    try testing.expect(pos < buf.len);
+    buf[pos] = 0x7f;
+    const response = broker.handleRequest(buf[0 .. pos + 1]);
+    try testing.expect(response != null);
+    defer testing.allocator.free(response.?);
+
+    try expectAlterConfigsErrorResponseBytes(response.?, 2, 3307, ErrorCode.invalid_request);
+}
+
+test "Broker.handleRequest AlterConfigs fails closed when response materialization fails" {
+    const Req = generated.alter_configs_request.AlterConfigsRequest;
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+    try testing.expect(broker.ensureTopic("alter-cfg-materialize-fail-topic"));
+    const before = broker.topics.get("alter-cfg-materialize-fail-topic").?.config.retention_bytes;
+
+    const configs = [_]Req.AlterConfigsResource.AlterableConfig{.{
+        .name = "retention.bytes",
+        .value = "8192",
+    }};
+    const resources = [_]Req.AlterConfigsResource{.{
+        .resource_type = 2,
+        .resource_name = "alter-cfg-materialize-fail-topic",
+        .configs = &configs,
+    }};
+    const req = Req{
+        .resources = &resources,
+        .validate_only = false,
+    };
+
+    var buf: [512]u8 = undefined;
+    var pos = buildTestRequest(&buf, 33, 2, 3319, header_mod.requestHeaderVersion(33, 2));
+    req.serialize(&buf, &pos, 2);
+
+    var failing_allocator = OneShotFailingAllocator.init(testing.allocator, 2);
+    const response_allocator = failing_allocator.allocator();
+    broker.allocator = response_allocator;
+
+    const response = broker.handleRequest(buf[0..pos]);
+    broker.allocator = testing.allocator;
+
+    try testing.expect(failing_allocator.failed);
+    try testing.expect(response != null);
+    defer response_allocator.free(response.?);
+
+    try expectAlterConfigsErrorResponseBytes(response.?, 2, 3319, ErrorCode.kafka_storage_error);
+    try testing.expectEqual(before, broker.topics.get("alter-cfg-materialize-fail-topic").?.config.retention_bytes);
+}
+
+test "Broker.handleRequest AlterConfigs fails closed when rollback snapshot materialization fails" {
+    const Req = generated.alter_configs_request.AlterConfigsRequest;
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+    try testing.expect(broker.ensureTopic("alter-cfg-snapshot-fail-topic"));
+    const before = broker.topics.get("alter-cfg-snapshot-fail-topic").?.config.retention_bytes;
+
+    const configs = [_]Req.AlterConfigsResource.AlterableConfig{.{
+        .name = "retention.bytes",
+        .value = "8192",
+    }};
+    const resources = [_]Req.AlterConfigsResource{.{
+        .resource_type = 2,
+        .resource_name = "alter-cfg-snapshot-fail-topic",
+        .configs = &configs,
+    }};
+    const req = Req{
+        .resources = &resources,
+        .validate_only = false,
+    };
+
+    var buf: [512]u8 = undefined;
+    var pos = buildTestRequest(&buf, 33, 2, 3320, header_mod.requestHeaderVersion(33, 2));
+    req.serialize(&buf, &pos, 2);
+
+    var failing_allocator = OneShotFailingAllocator.init(testing.allocator, 4);
+    const response_allocator = failing_allocator.allocator();
+    broker.allocator = response_allocator;
+
+    const response = broker.handleRequest(buf[0..pos]);
+    broker.allocator = testing.allocator;
+
+    try testing.expect(failing_allocator.failed);
+    try testing.expect(response != null);
+    defer response_allocator.free(response.?);
+
+    try expectAlterConfigsErrorResponseBytes(response.?, 2, 3320, ErrorCode.kafka_storage_error);
+    try testing.expectEqual(before, broker.topics.get("alter-cfg-snapshot-fail-topic").?.config.retention_bytes);
+}
+
+test "Broker.handleRequest AlterConfigs fails closed when serialization fails" {
+    const Req = generated.alter_configs_request.AlterConfigsRequest;
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+
+    const req = Req{
+        .resources = &.{},
+        .validate_only = true,
+    };
+
+    var buf: [128]u8 = undefined;
+    var pos = buildTestRequest(&buf, 33, 2, 3321, header_mod.requestHeaderVersion(33, 2));
+    req.serialize(&buf, &pos, 2);
+
+    var failing_allocator = OneShotFailingAllocator.init(testing.allocator, 0);
+    const response_allocator = failing_allocator.allocator();
+    broker.allocator = response_allocator;
+
+    const response = broker.handleRequest(buf[0..pos]);
+    broker.allocator = testing.allocator;
+
+    try testing.expect(failing_allocator.failed);
+    try testing.expect(response != null);
+    defer response_allocator.free(response.?);
+
+    try expectAlterConfigsErrorResponseBytes(response.?, 2, 3321, ErrorCode.kafka_storage_error);
 }
 
 test "Broker.handleRequest CreatePartitions v2 returns generated response and expands topic" {
