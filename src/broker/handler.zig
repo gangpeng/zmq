@@ -7193,8 +7193,8 @@ pub const Broker = struct {
 
             for (req.groups) |group_req| {
                 const topics = if (group_req.topics) |requested_topics|
-                    self.buildOffsetFetchGroupAuthorizationTopics(requested_topics, err_code) orelse {
-                        log.warn("OffsetFetch denied grouped topic response allocation failed", .{});
+                    self.buildOffsetFetchGroupAuthorizationTopics(requested_topics, err_code) catch |err| {
+                        log.warn("OffsetFetch denied grouped topic response allocation failed: {}", .{err});
                         return self.offsetFetchErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error);
                     }
                 else
@@ -7219,8 +7219,8 @@ pub const Broker = struct {
         }
 
         const topics = if (req.topics) |requested_topics|
-            self.buildOffsetFetchLegacyRequestedTopics(req.group_id orelse "", requested_topics, err_code) orelse {
-                log.warn("OffsetFetch denied legacy topic response allocation failed", .{});
+            self.buildOffsetFetchLegacyRequestedTopics(req.group_id orelse "", requested_topics, err_code) catch |err| {
+                log.warn("OffsetFetch denied legacy topic response allocation failed: {}", .{err});
                 return self.offsetFetchErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error);
             }
         else
@@ -14770,8 +14770,8 @@ pub const Broker = struct {
                             break :blk &.{};
                         };
                     }
-                    break :blk self.buildOffsetFetchGroupRequestedTopics(group_id, group_req.topics orelse &.{}) orelse {
-                        log.warn("OffsetFetch grouped topic response materialization failed for {s}", .{group_id});
+                    break :blk self.buildOffsetFetchGroupRequestedTopics(group_id, group_req.topics orelse &.{}) catch |err| {
+                        log.warn("OffsetFetch grouped topic response materialization failed for {s}: {}", .{ group_id, err });
                         group_error = ErrorCode.kafka_storage_error;
                         break :blk &.{};
                     };
@@ -14810,8 +14810,8 @@ pub const Broker = struct {
                     return self.offsetFetchErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error);
                 };
             }
-            break :blk self.buildOffsetFetchLegacyRequestedTopics(group_id, req.topics orelse &.{}, if (api_version < 2) group_error else ErrorCode.none) orelse {
-                log.warn("OffsetFetch legacy topic response materialization failed for {s}", .{group_id});
+            break :blk self.buildOffsetFetchLegacyRequestedTopics(group_id, req.topics orelse &.{}, if (api_version < 2) group_error else ErrorCode.none) catch |err| {
+                log.warn("OffsetFetch legacy topic response materialization failed for {s}: {}", .{ group_id, err });
                 return self.offsetFetchErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error);
             };
         };
@@ -14883,13 +14883,13 @@ pub const Broker = struct {
         group_id: []const u8,
         requested_topics: []const generated.offset_fetch_request.OffsetFetchRequest.OffsetFetchRequestTopic,
         partition_error: ErrorCode,
-    ) ?[]const generated.offset_fetch_response.OffsetFetchResponse.OffsetFetchResponseTopic {
+    ) ![]const generated.offset_fetch_response.OffsetFetchResponse.OffsetFetchResponseTopic {
         const TopicResponse = generated.offset_fetch_response.OffsetFetchResponse.OffsetFetchResponseTopic;
         const PartitionResponse = TopicResponse.OffsetFetchResponsePartition;
 
         if (requested_topics.len == 0) return &.{};
 
-        const topics = self.allocator.alloc(TopicResponse, requested_topics.len) catch return null;
+        const topics = try self.allocator.alloc(TopicResponse, requested_topics.len);
         var topics_init: usize = 0;
         var success = false;
         defer {
@@ -14902,7 +14902,7 @@ pub const Broker = struct {
         for (requested_topics) |topic_req| {
             var partitions: []const PartitionResponse = &.{};
             if (topic_req.partition_indexes.len > 0) {
-                const writable = self.allocator.alloc(PartitionResponse, topic_req.partition_indexes.len) catch return null;
+                const writable = try self.allocator.alloc(PartitionResponse, topic_req.partition_indexes.len);
                 var transferred = false;
                 defer {
                     if (!transferred and writable.len > 0) self.allocator.free(writable);
@@ -15009,13 +15009,13 @@ pub const Broker = struct {
         self: *Broker,
         group_id: []const u8,
         requested_topics: []const generated.offset_fetch_request.OffsetFetchRequest.OffsetFetchRequestGroup.OffsetFetchRequestTopics,
-    ) ?[]const generated.offset_fetch_response.OffsetFetchResponse.OffsetFetchResponseGroup.OffsetFetchResponseTopics {
+    ) ![]const generated.offset_fetch_response.OffsetFetchResponse.OffsetFetchResponseGroup.OffsetFetchResponseTopics {
         const TopicResponse = generated.offset_fetch_response.OffsetFetchResponse.OffsetFetchResponseGroup.OffsetFetchResponseTopics;
         const PartitionResponse = TopicResponse.OffsetFetchResponsePartitions;
 
         if (requested_topics.len == 0) return &.{};
 
-        const topics = self.allocator.alloc(TopicResponse, requested_topics.len) catch return null;
+        const topics = try self.allocator.alloc(TopicResponse, requested_topics.len);
         var topics_init: usize = 0;
         var success = false;
         defer {
@@ -15028,7 +15028,7 @@ pub const Broker = struct {
         for (requested_topics) |topic_req| {
             var partitions: []const PartitionResponse = &.{};
             if (topic_req.partition_indexes.len > 0) {
-                const writable = self.allocator.alloc(PartitionResponse, topic_req.partition_indexes.len) catch return null;
+                const writable = try self.allocator.alloc(PartitionResponse, topic_req.partition_indexes.len);
                 var transferred = false;
                 defer {
                     if (!transferred and writable.len > 0) self.allocator.free(writable);
@@ -15064,13 +15064,13 @@ pub const Broker = struct {
         self: *Broker,
         requested_topics: []const generated.offset_fetch_request.OffsetFetchRequest.OffsetFetchRequestGroup.OffsetFetchRequestTopics,
         err_code: ErrorCode,
-    ) ?[]const generated.offset_fetch_response.OffsetFetchResponse.OffsetFetchResponseGroup.OffsetFetchResponseTopics {
+    ) ![]const generated.offset_fetch_response.OffsetFetchResponse.OffsetFetchResponseGroup.OffsetFetchResponseTopics {
         const TopicResponse = generated.offset_fetch_response.OffsetFetchResponse.OffsetFetchResponseGroup.OffsetFetchResponseTopics;
         const PartitionResponse = TopicResponse.OffsetFetchResponsePartitions;
 
         if (requested_topics.len == 0) return &.{};
 
-        const topics = self.allocator.alloc(TopicResponse, requested_topics.len) catch return null;
+        const topics = try self.allocator.alloc(TopicResponse, requested_topics.len);
         var topics_init: usize = 0;
         var success = false;
         defer {
@@ -15083,7 +15083,7 @@ pub const Broker = struct {
         for (requested_topics) |topic_req| {
             var partitions: []const PartitionResponse = &.{};
             if (topic_req.partition_indexes.len > 0) {
-                const writable = self.allocator.alloc(PartitionResponse, topic_req.partition_indexes.len) catch return null;
+                const writable = try self.allocator.alloc(PartitionResponse, topic_req.partition_indexes.len);
                 var transferred = false;
                 defer {
                     if (!transferred and writable.len > 0) self.allocator.free(writable);
@@ -69340,6 +69340,102 @@ test "Broker.handleRequest OffsetFetch fails closed when grouped flag materializ
     defer response_allocator.free(response.?);
 
     try expectOffsetFetchErrorResponseBytes(response.?, 8, 931, ErrorCode.kafka_storage_error);
+}
+
+test "Broker.handleRequest OffsetFetch v7 fails closed when requested topic materialization fails" {
+    const Req = generated.offset_fetch_request.OffsetFetchRequest;
+    const Topic = Req.OffsetFetchRequestTopic;
+
+    for ([_]usize{ 2, 3 }, 0..) |fail_index, case_idx| {
+        var broker = Broker.init(testing.allocator, 1, 9092);
+        defer broker.deinit();
+        try broker.groups.commitOffsetWithMetadata("of-v7-materialize-fail-group", "of-v7-materialize-fail-topic", 0, 10, 1, "stable");
+
+        const partitions = [_]i32{0};
+        const topics = [_]Topic{.{
+            .name = "of-v7-materialize-fail-topic",
+            .partition_indexes = &partitions,
+        }};
+        const req = Req{
+            .group_id = "of-v7-materialize-fail-group",
+            .topics = &topics,
+            .require_stable = false,
+        };
+
+        const correlation_id: i32 = 9340 + @as(i32, @intCast(case_idx));
+        var buf: [512]u8 = undefined;
+        var pos = buildTestRequest(&buf, 9, 7, correlation_id, header_mod.requestHeaderVersion(9, 7));
+        req.serialize(&buf, &pos, 7);
+
+        var failing_allocator = OneShotFailingAllocator.init(testing.allocator, fail_index);
+        const response_allocator = failing_allocator.allocator();
+        broker.allocator = response_allocator;
+
+        const response = broker.handleRequest(buf[0..pos]);
+        broker.allocator = testing.allocator;
+
+        try testing.expect(failing_allocator.failed);
+        try testing.expect(response != null);
+        defer response_allocator.free(response.?);
+
+        try expectOffsetFetchErrorResponseBytes(response.?, 7, correlation_id, ErrorCode.kafka_storage_error);
+    }
+}
+
+test "Broker.handleRequest OffsetFetch v8 fails closed when requested topic materialization fails" {
+    const Req = generated.offset_fetch_request.OffsetFetchRequest;
+    const Resp = generated.offset_fetch_response.OffsetFetchResponse;
+    const Group = Req.OffsetFetchRequestGroup;
+    const Topic = Group.OffsetFetchRequestTopics;
+
+    for ([_]usize{ 5, 6 }, 0..) |fail_index, case_idx| {
+        var broker = Broker.init(testing.allocator, 1, 9092);
+        defer broker.deinit();
+        try broker.groups.commitOffsetWithMetadata("of-v8-materialize-fail-group", "of-v8-materialize-fail-topic", 0, 11, 1, "stable");
+
+        const partitions = [_]i32{0};
+        const topics = [_]Topic{.{
+            .name = "of-v8-materialize-fail-topic",
+            .partition_indexes = &partitions,
+        }};
+        const groups = [_]Group{.{
+            .group_id = "of-v8-materialize-fail-group",
+            .topics = &topics,
+        }};
+        const req = Req{
+            .groups = &groups,
+            .require_stable = false,
+        };
+
+        const correlation_id: i32 = 9342 + @as(i32, @intCast(case_idx));
+        var buf: [512]u8 = undefined;
+        var pos = buildTestRequest(&buf, 9, 8, correlation_id, header_mod.requestHeaderVersion(9, 8));
+        req.serialize(&buf, &pos, 8);
+
+        var failing_allocator = OneShotFailingAllocator.init(testing.allocator, fail_index);
+        const response_allocator = failing_allocator.allocator();
+        broker.allocator = response_allocator;
+
+        const response = broker.handleRequest(buf[0..pos]);
+        broker.allocator = testing.allocator;
+
+        try testing.expect(failing_allocator.failed);
+        try testing.expect(response != null);
+        defer response_allocator.free(response.?);
+
+        var rpos: usize = 0;
+        var response_header = try ResponseHeader.deserialize(testing.allocator, response.?, &rpos, header_mod.responseHeaderVersion(9, 8));
+        defer response_header.deinit(testing.allocator);
+        try testing.expectEqual(correlation_id, response_header.correlation_id);
+
+        const resp = try Resp.deserialize(testing.allocator, response.?, &rpos, 8);
+        defer freeDeserializedOffsetFetchResponse(&resp);
+        try testing.expectEqual(response.?.len, rpos);
+        try testing.expectEqual(@as(usize, 1), resp.groups.len);
+        try testing.expectEqualStrings("of-v8-materialize-fail-group", resp.groups[0].group_id.?);
+        try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.kafka_storage_error)), resp.groups[0].error_code);
+        try testing.expectEqual(@as(usize, 0), resp.groups[0].topics.len);
+    }
 }
 
 test "Broker.handleRequest OffsetFetch v7 fails closed when response serialization fails" {
