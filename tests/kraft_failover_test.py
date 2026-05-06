@@ -243,6 +243,12 @@ def read_i16(buf, pos):
     return struct.unpack_from(">h", buf, pos)[0], pos + 2
 
 
+def read_u16(buf, pos):
+    if pos + 2 > len(buf):
+        raise TestError("buffer underflow while reading u16")
+    return struct.unpack_from(">H", buf, pos)[0], pos + 2
+
+
 def read_i8(buf, pos):
     if pos + 1 > len(buf):
         raise TestError("buffer underflow while reading i8")
@@ -283,6 +289,12 @@ def read_bytes(buf, pos):
     if pos + length > len(buf):
         raise TestError("buffer underflow while reading bytes")
     return buf[pos : pos + length], pos + length
+
+
+def read_uuid(buf, pos):
+    if pos + 16 > len(buf):
+        raise TestError("buffer underflow while reading uuid")
+    return buf[pos : pos + 16], pos + 16
 
 
 def read_compact_string(buf, pos):
@@ -9327,52 +9339,215 @@ def describe_quorum_body():
     return bytes(body)
 
 
-def describe_quorum(port, correlation_id):
-    response = controller_request(port, 55, 0, correlation_id, describe_quorum_body())
+def parse_describe_quorum_response(response, correlation_id, api_version):
     pos = 0
     response_correlation, pos = read_i32(response, pos)
     if response_correlation != correlation_id:
         raise TestError(f"DescribeQuorum correlation mismatch: {response_correlation}")
     pos = skip_tags(response, pos)
     top_error, pos = read_i16(response, pos)
+    top_error_message = None
+    if api_version >= 2:
+        top_error_message, pos = read_compact_string(response, pos)
     if top_error != 0:
-        raise TestError(f"DescribeQuorum top-level error_code={top_error}")
+        raise TestError(
+            f"DescribeQuorum top-level error_code={top_error} "
+            f"message={top_error_message!r}"
+        )
 
     topics_len, pos = read_compact_array_len(response, pos)
     if topics_len == 0:
         raise TestError("DescribeQuorum returned no topics")
-    topic_name, pos = read_compact_string(response, pos)
-    partitions_len, pos = read_compact_array_len(response, pos)
-    if partitions_len == 0:
-        raise TestError(f"DescribeQuorum topic {topic_name!r} returned no partitions")
+    topics = []
+    for _ in range(topics_len):
+        topic_name, pos = read_compact_string(response, pos)
+        partitions_len, pos = read_compact_array_len(response, pos)
+        partitions = []
+        for _ in range(partitions_len):
+            partition_index, pos = read_i32(response, pos)
+            partition_error, pos = read_i16(response, pos)
+            partition_error_message = None
+            if api_version >= 2:
+                partition_error_message, pos = read_compact_string(response, pos)
+            leader_id, pos = read_i32(response, pos)
+            leader_epoch, pos = read_i32(response, pos)
+            high_watermark, pos = read_i64(response, pos)
 
-    partition_index, pos = read_i32(response, pos)
-    partition_error, pos = read_i16(response, pos)
-    leader_id, pos = read_i32(response, pos)
-    leader_epoch, pos = read_i32(response, pos)
-    high_watermark, pos = read_i64(response, pos)
-    voters_len, pos = read_compact_array_len(response, pos)
-    voters = []
-    for _ in range(voters_len):
-        replica_id, pos = read_i32(response, pos)
-        _, pos = read_i64(response, pos)
+            voters_len, pos = read_compact_array_len(response, pos)
+            voters = []
+            for _ in range(voters_len):
+                replica_id, pos = read_i32(response, pos)
+                replica_directory_id = None
+                if api_version >= 2:
+                    replica_directory_id, pos = read_uuid(response, pos)
+                log_end_offset, pos = read_i64(response, pos)
+                last_fetch_timestamp = -1
+                last_caught_up_timestamp = -1
+                if api_version >= 1:
+                    last_fetch_timestamp, pos = read_i64(response, pos)
+                    last_caught_up_timestamp, pos = read_i64(response, pos)
+                pos = skip_tags(response, pos)
+                voters.append(
+                    {
+                        "replica_id": replica_id,
+                        "replica_directory_id": replica_directory_id,
+                        "log_end_offset": log_end_offset,
+                        "last_fetch_timestamp": last_fetch_timestamp,
+                        "last_caught_up_timestamp": last_caught_up_timestamp,
+                    }
+                )
+
+            observers_len, pos = read_compact_array_len(response, pos)
+            observers = []
+            for _ in range(observers_len):
+                replica_id, pos = read_i32(response, pos)
+                replica_directory_id = None
+                if api_version >= 2:
+                    replica_directory_id, pos = read_uuid(response, pos)
+                log_end_offset, pos = read_i64(response, pos)
+                last_fetch_timestamp = -1
+                last_caught_up_timestamp = -1
+                if api_version >= 1:
+                    last_fetch_timestamp, pos = read_i64(response, pos)
+                    last_caught_up_timestamp, pos = read_i64(response, pos)
+                pos = skip_tags(response, pos)
+                observers.append(
+                    {
+                        "replica_id": replica_id,
+                        "replica_directory_id": replica_directory_id,
+                        "log_end_offset": log_end_offset,
+                        "last_fetch_timestamp": last_fetch_timestamp,
+                        "last_caught_up_timestamp": last_caught_up_timestamp,
+                    }
+                )
+
+            pos = skip_tags(response, pos)
+            partitions.append(
+                {
+                    "partition_index": partition_index,
+                    "error_code": partition_error,
+                    "error_message": partition_error_message,
+                    "leader_id": leader_id,
+                    "leader_epoch": leader_epoch,
+                    "high_watermark": high_watermark,
+                    "current_voters": voters,
+                    "observers": observers,
+                }
+            )
         pos = skip_tags(response, pos)
-        voters.append(replica_id)
-    observers_len, pos = read_compact_array_len(response, pos)
-    for _ in range(observers_len):
-        _, pos = read_i32(response, pos)
-        _, pos = read_i64(response, pos)
-        pos = skip_tags(response, pos)
+        topics.append({"name": topic_name, "partitions": partitions})
+
+    nodes = []
+    if api_version >= 2:
+        nodes_len, pos = read_compact_array_len(response, pos)
+        for _ in range(nodes_len):
+            node_id, pos = read_i32(response, pos)
+            listeners_len, pos = read_compact_array_len(response, pos)
+            listeners = []
+            for _ in range(listeners_len):
+                name, pos = read_compact_string(response, pos)
+                host, pos = read_compact_string(response, pos)
+                listener_port, pos = read_u16(response, pos)
+                pos = skip_tags(response, pos)
+                listeners.append(
+                    {"name": name, "host": host, "port": listener_port}
+                )
+            pos = skip_tags(response, pos)
+            nodes.append({"node_id": node_id, "listeners": listeners})
     pos = skip_tags(response, pos)
+    if pos != len(response):
+        raise TestError(
+            f"DescribeQuorum response trailing bytes: {len(response) - pos}"
+        )
+
+    if not topics or not topics[0]["partitions"]:
+        raise TestError("DescribeQuorum returned no partitions")
+    first_partition = topics[0]["partitions"][0]
 
     return {
-        "partition_index": partition_index,
-        "error_code": partition_error,
-        "leader_id": leader_id,
-        "leader_epoch": leader_epoch,
-        "high_watermark": high_watermark,
-        "voters": voters,
+        "top_error_code": top_error,
+        "top_error_message": top_error_message,
+        "error_code": first_partition["error_code"],
+        "error_message": first_partition["error_message"],
+        "topics": topics,
+        "nodes": nodes,
+        "partition_index": first_partition["partition_index"],
+        "partition_error_code": first_partition["error_code"],
+        "leader_id": first_partition["leader_id"],
+        "leader_epoch": first_partition["leader_epoch"],
+        "high_watermark": first_partition["high_watermark"],
+        "voters": [
+            voter["replica_id"] for voter in first_partition["current_voters"]
+        ],
     }
+
+
+def describe_quorum(port, correlation_id):
+    response = controller_request(port, 55, 0, correlation_id, describe_quorum_body())
+    return parse_describe_quorum_response(response, correlation_id, 0)
+
+
+def describe_quorum_v2(port, correlation_id):
+    response = controller_request(port, 55, 2, correlation_id, describe_quorum_body())
+    return parse_describe_quorum_response(response, correlation_id, 2)
+
+
+def wait_for_describe_quorum_v2_checkpoint(
+    port,
+    expected_ports,
+    state,
+    label,
+    timeout=30,
+):
+    expected_node_ids = sorted(expected_ports)
+    deadline = time.time() + timeout
+    correlation_id = state.get("correlation_id", 9140)
+    last_error = None
+    while time.time() < deadline:
+        try:
+            quorum = describe_quorum_v2(port, correlation_id)
+            if quorum["partition_error_code"] != ERROR_NONE:
+                raise TestError(
+                    f"DescribeQuorum v2 partition error during {label}: {quorum}"
+                )
+            if sorted(quorum["voters"]) != expected_node_ids:
+                raise TestError(
+                    f"DescribeQuorum v2 voter set changed during {label}: "
+                    f"{quorum['voters']}"
+                )
+
+            node_ports = {}
+            for node in quorum["nodes"]:
+                controller_listeners = [
+                    listener
+                    for listener in node["listeners"]
+                    if listener["name"] == "CONTROLLER"
+                ]
+                if len(controller_listeners) != 1:
+                    raise TestError(
+                        f"DescribeQuorum v2 node {node['node_id']} listeners "
+                        f"unexpected during {label}: {node['listeners']}"
+                    )
+                listener = controller_listeners[0]
+                if listener["host"] != "127.0.0.1":
+                    raise TestError(
+                        f"DescribeQuorum v2 node {node['node_id']} host "
+                        f"unexpected during {label}: {listener}"
+                    )
+                node_ports[node["node_id"]] = listener["port"]
+            if node_ports != expected_ports:
+                raise TestError(
+                    f"DescribeQuorum v2 endpoints changed during {label}: "
+                    f"expected={expected_ports} actual={node_ports}"
+                )
+
+            state["correlation_id"] = correlation_id + 1
+            return quorum
+        except Exception as exc:
+            last_error = exc
+        correlation_id += 1
+        time.sleep(0.25)
+    raise TestError(f"DescribeQuorum v2 did not recover during {label}: {last_error}")
 
 
 def tail(path, limit=12000):
@@ -10104,6 +10279,13 @@ def main():
             raise TestError(f"discovered leader {leader_id}, expected one of {sorted(processes)}")
         if sorted(initial["voters"]) != [0, 1, 2]:
             raise TestError(f"unexpected voter set from DescribeQuorum: {initial['voters']}")
+        describe_quorum_state = {"correlation_id": 9140}
+        wait_for_describe_quorum_v2_checkpoint(
+            processes[leader_id]["port"],
+            ports,
+            describe_quorum_state,
+            "initial leader",
+        )
 
         broker = start_broker(tmp, voters)
         wait_for_broker_ready(broker["proc"], broker["port"], broker["log_path"])
@@ -10715,6 +10897,12 @@ def main():
         )
         if network_partition_result is not None:
             leader_id, initial = wait_for_leader(processes)
+            wait_for_describe_quorum_v2_checkpoint(
+                processes[leader_id]["port"],
+                ports,
+                describe_quorum_state,
+                "network partition matrix",
+            )
             wait_for_allocate_producer_ids_checkpoint(
                 processes[leader_id]["port"],
                 producer_id_state,
@@ -10835,6 +11023,12 @@ def main():
             raise TestError(f"leader epoch did not advance: before={initial} after={after}")
 
         wait_for_all_alive_to_report(processes, replacement_leader)
+        wait_for_describe_quorum_v2_checkpoint(
+            processes[replacement_leader]["port"],
+            ports,
+            describe_quorum_state,
+            "controller leader failover",
+        )
         wait_for_allocate_producer_ids_checkpoint(
             processes[replacement_leader]["port"],
             producer_id_state,
@@ -10991,6 +11185,12 @@ def main():
                 f"restarted old leader {leader_id} did not rejoin leader "
                 f"{replacement_leader}: {rejoined_quorum}"
             )
+        wait_for_describe_quorum_v2_checkpoint(
+            processes[replacement_leader]["port"],
+            ports,
+            describe_quorum_state,
+            "old leader fresh rejoin",
+        )
         wait_for_allocate_producer_ids_checkpoint(
             processes[replacement_leader]["port"],
             producer_id_state,
@@ -11144,6 +11344,12 @@ def main():
                 f"restarted controller {restart_controller_id} did not rejoin leader "
                 f"{replacement_leader}: {restarted_quorum}"
             )
+        wait_for_describe_quorum_v2_checkpoint(
+            processes[replacement_leader]["port"],
+            ports,
+            describe_quorum_state,
+            "surviving controller restart",
+        )
         wait_for_allocate_producer_ids_checkpoint(
             processes[replacement_leader]["port"],
             producer_id_state,
@@ -11284,6 +11490,12 @@ def main():
         stop_process(broker["proc"])
         broker = start_broker(tmp, voters)
         wait_for_broker_ready(broker["proc"], broker["port"], broker["log_path"])
+        wait_for_describe_quorum_v2_checkpoint(
+            processes[replacement_leader]["port"],
+            ports,
+            describe_quorum_state,
+            "broker restart",
+        )
         wait_for_allocate_producer_ids_checkpoint(
             processes[replacement_leader]["port"],
             producer_id_state,
@@ -11550,6 +11762,7 @@ def main():
             f"reassignment_target={automq_result['reassignment_target']}, "
             f"reassignment_target_offset={automq_result['reassignment_target_offset']}, "
             f"allocate_producer_ids_checked=true, "
+            f"describe_quorum_v2_checked=true, "
             f"committed_offset={committed_offset}, "
             f"transactions_checked=5, "
             f"transaction_introspection_checked=true, "
@@ -12492,6 +12705,54 @@ def self_test():
             deleted_topic_partitions,
             "deleted-dtp-self-test",
         )
+
+        describe_quorum_fixture = struct.pack(">i", 185)
+        describe_quorum_fixture += b"\x00"  # response header tagged fields
+        describe_quorum_fixture += struct.pack(">h", ERROR_NONE)
+        describe_quorum_fixture += write_compact_string(None)
+        describe_quorum_fixture += write_compact_array_len(1)
+        describe_quorum_fixture += write_compact_string("__cluster_metadata")
+        describe_quorum_fixture += write_compact_array_len(1)
+        describe_quorum_fixture += struct.pack(">ih", 0, ERROR_NONE)
+        describe_quorum_fixture += write_compact_string(None)
+        describe_quorum_fixture += struct.pack(">iiq", 1, 7, 42)
+        describe_quorum_fixture += write_compact_array_len(2)
+        for replica_id, port in ((0, 63093), (1, 63094)):
+            describe_quorum_fixture += struct.pack(">i", replica_id)
+            describe_quorum_fixture += bytes([replica_id + 1]) * 16
+            describe_quorum_fixture += struct.pack(">qqq", 42, -1, -1)
+            describe_quorum_fixture += b"\x00"  # voter tagged fields
+        describe_quorum_fixture += write_compact_array_len(0)
+        describe_quorum_fixture += b"\x00"  # partition tagged fields
+        describe_quorum_fixture += b"\x00"  # topic tagged fields
+        describe_quorum_fixture += write_compact_array_len(2)
+        for node_id, port in ((0, 63093), (1, 63094)):
+            describe_quorum_fixture += struct.pack(">i", node_id)
+            describe_quorum_fixture += write_compact_array_len(1)
+            describe_quorum_fixture += write_compact_string("CONTROLLER")
+            describe_quorum_fixture += write_compact_string("127.0.0.1")
+            describe_quorum_fixture += struct.pack(">H", port)
+            describe_quorum_fixture += b"\x00"  # listener tagged fields
+            describe_quorum_fixture += b"\x00"  # node tagged fields
+        describe_quorum_fixture += b"\x00"  # response tagged fields
+        described_quorum = parse_describe_quorum_response(
+            describe_quorum_fixture,
+            185,
+            2,
+        )
+        if (
+            described_quorum["leader_id"] != 1
+            or described_quorum["leader_epoch"] != 7
+            or sorted(described_quorum["voters"]) != [0, 1]
+            or described_quorum["nodes"][1]["listeners"][0]["port"] != 63094
+            or described_quorum["topics"][0]["partitions"][0]["current_voters"][0][
+                "replica_directory_id"
+            ]
+            != bytes([1]) * 16
+        ):
+            raise TestError(
+                f"DescribeQuorum v2 fixture parser failed: {described_quorum}"
+            )
 
         describe_cluster_fixture = struct.pack(">i", 165)
         describe_cluster_fixture += b"\x00"  # response header tagged fields
