@@ -21889,7 +21889,10 @@ pub const Broker = struct {
         var previous_snapshot: ?MetadataPersistence.AutoMqMetadataSnapshot = null;
         defer if (previous_snapshot) |*snapshot| self.persistence.freeAutoMqMetadataSnapshot(snapshot);
         if (self.raft_state == null) {
-            previous_snapshot = self.cloneAutoMqMetadataSnapshot() catch return null;
+            previous_snapshot = self.cloneAutoMqMetadataSnapshot() catch |err| {
+                log.warn("PutKVs rollback snapshot failed: {}", .{err});
+                return self.putKVsErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error);
+            };
         }
         var mutated = false;
         for (req.put_kv_requests, 0..) |item, i| {
@@ -21904,30 +21907,46 @@ pub const Broker = struct {
                     responses[i] = .{ .error_code = errorCode(.duplicate_resource), .value = existing.* };
                     continue;
                 }
+                const value_copy = self.allocator.dupe(u8, value) catch |err| {
+                    log.warn("PutKVs value copy failed: {}", .{err});
+                    responses[i] = .{ .error_code = errorCode(.kafka_storage_error), .value = null };
+                    continue;
+                };
                 self.commitAutoMqPutKvRecord(key, value) catch |err| {
+                    self.allocator.free(value_copy);
                     responses[i] = .{ .error_code = autoMqQuorumErrorCode(err), .value = null };
                     continue;
                 };
-                const value_copy = self.allocator.dupe(u8, value) catch return null;
                 self.allocator.free(existing.*);
                 existing.* = value_copy;
                 responses[i] = .{ .error_code = 0, .value = existing.* };
                 mutated = true;
             } else {
+                const key_copy = self.allocator.dupe(u8, key) catch |err| {
+                    log.warn("PutKVs key copy failed: {}", .{err});
+                    responses[i] = .{ .error_code = errorCode(.kafka_storage_error), .value = null };
+                    continue;
+                };
+                const value_copy = self.allocator.dupe(u8, value) catch |err| {
+                    log.warn("PutKVs value copy failed: {}", .{err});
+                    self.allocator.free(key_copy);
+                    responses[i] = .{ .error_code = errorCode(.kafka_storage_error), .value = null };
+                    continue;
+                };
+                self.auto_mq_kvs.ensureUnusedCapacity(1) catch |err| {
+                    log.warn("PutKVs map capacity reservation failed: {}", .{err});
+                    self.allocator.free(key_copy);
+                    self.allocator.free(value_copy);
+                    responses[i] = .{ .error_code = errorCode(.kafka_storage_error), .value = null };
+                    continue;
+                };
                 self.commitAutoMqPutKvRecord(key, value) catch |err| {
+                    self.allocator.free(key_copy);
+                    self.allocator.free(value_copy);
                     responses[i] = .{ .error_code = autoMqQuorumErrorCode(err), .value = null };
                     continue;
                 };
-                const key_copy = self.allocator.dupe(u8, key) catch return null;
-                const value_copy = self.allocator.dupe(u8, value) catch {
-                    self.allocator.free(key_copy);
-                    return null;
-                };
-                self.auto_mq_kvs.put(key_copy, value_copy) catch {
-                    self.allocator.free(key_copy);
-                    self.allocator.free(value_copy);
-                    return null;
-                };
+                self.auto_mq_kvs.putAssumeCapacity(key_copy, value_copy);
                 responses[i] = .{ .error_code = 0, .value = value_copy };
                 mutated = true;
             }
@@ -21977,7 +21996,10 @@ pub const Broker = struct {
         var previous_snapshot: ?MetadataPersistence.AutoMqMetadataSnapshot = null;
         defer if (previous_snapshot) |*snapshot| self.persistence.freeAutoMqMetadataSnapshot(snapshot);
         if (self.raft_state == null) {
-            previous_snapshot = self.cloneAutoMqMetadataSnapshot() catch return null;
+            previous_snapshot = self.cloneAutoMqMetadataSnapshot() catch |err| {
+                log.warn("DeleteKVs rollback snapshot failed: {}", .{err});
+                return self.deleteKVsErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error);
+            };
         }
         var mutated = false;
         for (req.delete_kv_requests, 0..) |item, i| {
@@ -21987,7 +22009,11 @@ pub const Broker = struct {
                 continue;
             }
             if (self.auto_mq_kvs.get(key)) |existing| {
-                const response_value = arena_alloc.dupe(u8, existing) catch return null;
+                const response_value = arena_alloc.dupe(u8, existing) catch |err| {
+                    log.warn("DeleteKVs response value copy failed: {}", .{err});
+                    responses[i] = .{ .error_code = errorCode(.kafka_storage_error), .value = null };
+                    continue;
+                };
                 self.commitAutoMqDeleteKvRecord(key) catch |err| {
                     responses[i] = .{ .error_code = autoMqQuorumErrorCode(err), .value = null };
                     continue;
@@ -22118,28 +22144,41 @@ pub const Broker = struct {
         }
 
         const wal_config = req.wal_config orelse "";
+        const replacing_existing = self.auto_mq_nodes.contains(req.node_id);
+        const wal_config_copy = self.allocator.dupe(u8, wal_config) catch |err| {
+            log.warn("AutomqRegisterNode WAL config copy failed: {}", .{err});
+            return self.automqRegisterNodeErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error);
+        };
+        if (!replacing_existing) {
+            self.auto_mq_nodes.ensureUnusedCapacity(1) catch |err| {
+                log.warn("AutomqRegisterNode map capacity reservation failed: {}", .{err});
+                self.allocator.free(wal_config_copy);
+                return self.automqRegisterNodeErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error);
+            };
+        }
+        var previous_snapshot: ?MetadataPersistence.AutoMqMetadataSnapshot = null;
+        defer if (previous_snapshot) |*snapshot| self.persistence.freeAutoMqMetadataSnapshot(snapshot);
+        if (self.raft_state == null) {
+            previous_snapshot = self.cloneAutoMqMetadataSnapshot() catch |err| {
+                log.warn("AutomqRegisterNode rollback snapshot failed: {}", .{err});
+                self.allocator.free(wal_config_copy);
+                return self.automqRegisterNodeErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error);
+            };
+        }
         self.commitAutoMqRegisterNodeRecord(req.node_id, req.node_epoch, wal_config) catch |err| {
+            self.allocator.free(wal_config_copy);
             const resp = Resp{ .error_code = autoMqQuorumErrorCode(err), .throttle_time_ms = 0 };
             return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version) orelse {
                 log.warn("AutomqRegisterNode error response serialization failed", .{});
                 return self.automqRegisterNodeErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error);
             };
         };
-        var previous_snapshot: ?MetadataPersistence.AutoMqMetadataSnapshot = null;
-        defer if (previous_snapshot) |*snapshot| self.persistence.freeAutoMqMetadataSnapshot(snapshot);
-        if (self.raft_state == null) {
-            previous_snapshot = self.cloneAutoMqMetadataSnapshot() catch return null;
-        }
-        const wal_config_copy = self.allocator.dupe(u8, wal_config) catch return null;
 
         if (self.auto_mq_nodes.getPtr(req.node_id)) |node| {
             node.deinit(self.allocator);
             node.* = .{ .node_epoch = req.node_epoch, .wal_config = wal_config_copy };
         } else {
-            self.auto_mq_nodes.put(req.node_id, .{ .node_epoch = req.node_epoch, .wal_config = wal_config_copy }) catch {
-                self.allocator.free(wal_config_copy);
-                return null;
-            };
+            self.auto_mq_nodes.putAssumeCapacity(req.node_id, .{ .node_epoch = req.node_epoch, .wal_config = wal_config_copy });
         }
         if (req.node_id >= self.auto_mq_next_node_id) self.auto_mq_next_node_id = req.node_id + 1;
         self.persistAutoMqMetadataAfterMutation() catch |err| {
@@ -22253,8 +22292,26 @@ pub const Broker = struct {
             req.route_epoch
         else
             self.auto_mq_zone_router_epoch;
-        if (req.metadata != null or new_route_epoch != self.auto_mq_zone_router_epoch) {
+        const should_mutate = req.metadata != null or new_route_epoch != self.auto_mq_zone_router_epoch;
+        var metadata_copy: ?[]u8 = null;
+        if (req.metadata) |metadata| {
+            metadata_copy = self.allocator.dupe(u8, metadata) catch |err| {
+                log.warn("AutomqZoneRouter metadata copy failed: {}", .{err});
+                return self.automqZoneRouterErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error);
+            };
+        }
+        var previous_snapshot: ?MetadataPersistence.AutoMqMetadataSnapshot = null;
+        defer if (previous_snapshot) |*snapshot| self.persistence.freeAutoMqMetadataSnapshot(snapshot);
+        if (self.raft_state == null and should_mutate) {
+            previous_snapshot = self.cloneAutoMqMetadataSnapshot() catch |err| {
+                log.warn("AutomqZoneRouter rollback snapshot failed: {}", .{err});
+                if (metadata_copy) |copy| self.allocator.free(copy);
+                return self.automqZoneRouterErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error);
+            };
+        }
+        if (should_mutate) {
             self.commitAutoMqZoneRouterRecord(req.metadata, new_route_epoch) catch |err| {
+                if (metadata_copy) |copy| self.allocator.free(copy);
                 const resp = Resp{ .error_code = autoMqQuorumErrorCode(err), .throttle_time_ms = 0 };
                 return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version) orelse {
                     log.warn("AutomqZoneRouter error response serialization failed", .{});
@@ -22262,15 +22319,9 @@ pub const Broker = struct {
                 };
             };
         }
-        var previous_snapshot: ?MetadataPersistence.AutoMqMetadataSnapshot = null;
-        defer if (previous_snapshot) |*snapshot| self.persistence.freeAutoMqMetadataSnapshot(snapshot);
-        if (self.raft_state == null and (req.metadata != null or new_route_epoch != self.auto_mq_zone_router_epoch)) {
-            previous_snapshot = self.cloneAutoMqMetadataSnapshot() catch return null;
-        }
-        if (req.metadata) |metadata| {
-            const metadata_copy = self.allocator.dupe(u8, metadata) catch return null;
+        if (metadata_copy) |copy| {
             if (self.auto_mq_zone_router_metadata) |old| self.allocator.free(old);
-            self.auto_mq_zone_router_metadata = metadata_copy;
+            self.auto_mq_zone_router_metadata = copy;
             mutated = true;
         }
         if (new_route_epoch != self.auto_mq_zone_router_epoch) {
@@ -22391,19 +22442,27 @@ pub const Broker = struct {
         };
 
         const license = req.license orelse "";
+        const license_copy = self.allocator.dupe(u8, license) catch |err| {
+            log.warn("UpdateLicense license copy failed: {}", .{err});
+            return self.updateLicenseErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error, "Failed to materialize license");
+        };
+        var previous_snapshot: ?MetadataPersistence.AutoMqMetadataSnapshot = null;
+        defer if (previous_snapshot) |*snapshot| self.persistence.freeAutoMqMetadataSnapshot(snapshot);
+        if (self.raft_state == null) {
+            previous_snapshot = self.cloneAutoMqMetadataSnapshot() catch |err| {
+                log.warn("UpdateLicense rollback snapshot failed: {}", .{err});
+                self.allocator.free(license_copy);
+                return self.updateLicenseErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error, "Failed to snapshot AutoMQ metadata");
+            };
+        }
         self.commitAutoMqSetLicenseRecord(license) catch |err| {
+            self.allocator.free(license_copy);
             const resp = Resp{ .error_code = autoMqQuorumErrorCode(err), .throttle_time_ms = 0, .error_message = "metadata quorum unavailable" };
             return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version) orelse {
                 log.warn("UpdateLicense error response serialization failed", .{});
                 return self.updateLicenseErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error, "Failed to serialize error response");
             };
         };
-        var previous_snapshot: ?MetadataPersistence.AutoMqMetadataSnapshot = null;
-        defer if (previous_snapshot) |*snapshot| self.persistence.freeAutoMqMetadataSnapshot(snapshot);
-        if (self.raft_state == null) {
-            previous_snapshot = self.cloneAutoMqMetadataSnapshot() catch return null;
-        }
-        const license_copy = self.allocator.dupe(u8, license) catch return null;
         if (self.auto_mq_license) |old| self.allocator.free(old);
         self.auto_mq_license = license_copy;
         self.persistAutoMqMetadataAfterMutation() catch |err| {
@@ -22490,6 +22549,14 @@ pub const Broker = struct {
 
         const node_id = self.auto_mq_next_node_id;
         const next_node_id = node_id + 1;
+        var previous_snapshot: ?MetadataPersistence.AutoMqMetadataSnapshot = null;
+        defer if (previous_snapshot) |*snapshot| self.persistence.freeAutoMqMetadataSnapshot(snapshot);
+        if (self.raft_state == null) {
+            previous_snapshot = self.cloneAutoMqMetadataSnapshot() catch |err| {
+                log.warn("GetNextNodeId rollback snapshot failed: {}", .{err});
+                return self.getNextNodeIdErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error);
+            };
+        }
         self.commitAutoMqSetNextNodeIdRecord(next_node_id) catch |err| {
             const resp = Resp{ .error_code = autoMqQuorumErrorCode(err), .throttle_time_ms = 0, .node_id = -1 };
             return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version) orelse {
@@ -22497,11 +22564,6 @@ pub const Broker = struct {
                 return self.getNextNodeIdErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error);
             };
         };
-        var previous_snapshot: ?MetadataPersistence.AutoMqMetadataSnapshot = null;
-        defer if (previous_snapshot) |*snapshot| self.persistence.freeAutoMqMetadataSnapshot(snapshot);
-        if (self.raft_state == null) {
-            previous_snapshot = self.cloneAutoMqMetadataSnapshot() catch return null;
-        }
         self.auto_mq_next_node_id = next_node_id;
         self.persistAutoMqMetadataAfterMutation() catch |err| {
             log.warn("GetNextNodeId metadata snapshot write failed: {}", .{err});
@@ -22611,33 +22673,56 @@ pub const Broker = struct {
         var previous_snapshot: ?MetadataPersistence.AutoMqMetadataSnapshot = null;
         defer if (previous_snapshot) |*snapshot| self.persistence.freeAutoMqMetadataSnapshot(snapshot);
         if (req.promoted) {
+            const replacing_existing = self.auto_mq_group_promotions.contains(group_id);
+            const link_copy = self.allocator.dupe(u8, link_id) catch |err| {
+                log.warn("AutomqUpdateGroup link copy failed: {}", .{err});
+                return self.automqUpdateGroupErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error, req.group_id, "Failed to materialize group link");
+            };
+            var group_copy: ?[]u8 = null;
+            if (!replacing_existing) {
+                group_copy = self.allocator.dupe(u8, group_id) catch |err| {
+                    log.warn("AutomqUpdateGroup group copy failed: {}", .{err});
+                    self.allocator.free(link_copy);
+                    return self.automqUpdateGroupErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error, req.group_id, "Failed to materialize group id");
+                };
+                self.auto_mq_group_promotions.ensureUnusedCapacity(1) catch |err| {
+                    log.warn("AutomqUpdateGroup map capacity reservation failed: {}", .{err});
+                    self.allocator.free(link_copy);
+                    self.allocator.free(group_copy.?);
+                    return self.automqUpdateGroupErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error, req.group_id, "Failed to reserve group metadata");
+                };
+            }
+            if (self.raft_state == null) {
+                previous_snapshot = self.cloneAutoMqMetadataSnapshot() catch |err| {
+                    log.warn("AutomqUpdateGroup rollback snapshot failed: {}", .{err});
+                    self.allocator.free(link_copy);
+                    if (group_copy) |copy| self.allocator.free(copy);
+                    return self.automqUpdateGroupErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error, req.group_id, "Failed to snapshot AutoMQ metadata");
+                };
+            }
             self.commitAutoMqUpdateGroupRecord(group_id, link_id, true) catch |err| {
+                self.allocator.free(link_copy);
+                if (group_copy) |copy| self.allocator.free(copy);
                 const resp = Resp{ .group_id = req.group_id, .error_code = autoMqQuorumErrorCode(err), .error_message = "metadata quorum unavailable", .throttle_time_ms = 0 };
                 return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version) orelse {
                     log.warn("AutomqUpdateGroup error response serialization failed", .{});
                     return self.automqUpdateGroupErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error, req.group_id, "Failed to serialize error response");
                 };
             };
-            if (self.raft_state == null) {
-                previous_snapshot = self.cloneAutoMqMetadataSnapshot() catch return null;
-            }
-            const link_copy = self.allocator.dupe(u8, link_id) catch return null;
             if (self.auto_mq_group_promotions.getPtr(group_id)) |existing| {
                 existing.deinit(self.allocator);
                 existing.* = .{ .link_id = link_copy, .promoted = true };
             } else {
-                const group_copy = self.allocator.dupe(u8, group_id) catch {
-                    self.allocator.free(link_copy);
-                    return null;
-                };
-                self.auto_mq_group_promotions.put(group_copy, .{ .link_id = link_copy, .promoted = true }) catch {
-                    self.allocator.free(group_copy);
-                    self.allocator.free(link_copy);
-                    return null;
-                };
+                self.auto_mq_group_promotions.putAssumeCapacity(group_copy.?, .{ .link_id = link_copy, .promoted = true });
             }
             mutated = true;
         } else if (self.auto_mq_group_promotions.contains(group_id)) {
+            if (self.raft_state == null) {
+                previous_snapshot = self.cloneAutoMqMetadataSnapshot() catch |err| {
+                    log.warn("AutomqUpdateGroup rollback snapshot failed: {}", .{err});
+                    return self.automqUpdateGroupErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error, req.group_id, "Failed to snapshot AutoMQ metadata");
+                };
+            }
             self.commitAutoMqUpdateGroupRecord(group_id, "", false) catch |err| {
                 const resp = Resp{ .group_id = req.group_id, .error_code = autoMqQuorumErrorCode(err), .error_message = "metadata quorum unavailable", .throttle_time_ms = 0 };
                 return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version) orelse {
@@ -22645,9 +22730,6 @@ pub const Broker = struct {
                     return self.automqUpdateGroupErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error, req.group_id, "Failed to serialize error response");
                 };
             };
-            if (self.raft_state == null) {
-                previous_snapshot = self.cloneAutoMqMetadataSnapshot() catch return null;
-            }
             const removed = self.auto_mq_group_promotions.fetchRemove(group_id).?;
             self.allocator.free(removed.key);
             var promotion = removed.value;
@@ -49887,6 +49969,93 @@ test "Broker.handleRequest normal AutoMQ mutation APIs fail closed when response
         pos = buildTestRequest(&buf, 602, 0, 6030, header_mod.requestHeaderVersion(602, 0));
         noop_req.serialize(&buf, &pos, 0);
         try expectAutoMqMutationErrorWithFailingAllocator(&broker, buf[0..pos], 602, 0, 6030, 0, ErrorCode.kafka_storage_error);
+    }
+}
+
+test "Broker.handleRequest normal AutoMQ mutations fail closed when local mutation materialization fails" {
+    var buf: [4096]u8 = undefined;
+
+    {
+        var broker = Broker.init(testing.allocator, 1, 9092);
+        defer broker.deinit();
+
+        const Req = generated.put_k_vs_request.PutKVsRequest;
+        const items = [_]Req.PutKVRequest{.{ .key = "put-copy-fail", .value = "value", .overwrite = true }};
+        const req = Req{ .put_kv_requests = &items };
+        var pos = buildTestRequest(&buf, 510, 0, 5111, header_mod.requestHeaderVersion(510, 0));
+        req.serialize(&buf, &pos, 0);
+        try expectAutoMqMutationErrorWithFailingAllocator(&broker, buf[0..pos], 510, 0, 5111, 1, ErrorCode.kafka_storage_error);
+        try testing.expect(broker.auto_mq_kvs.get("put-copy-fail") == null);
+    }
+
+    {
+        var broker = Broker.init(testing.allocator, 1, 9092);
+        defer broker.deinit();
+
+        const Req = generated.automq_register_node_request.AutomqRegisterNodeRequest;
+        const req = Req{ .node_id = 18, .node_epoch = 1, .wal_config = "wal://node-18", .tags = &.{} };
+        var pos = buildTestRequest(&buf, 513, 0, 5140, header_mod.requestHeaderVersion(513, 0));
+        req.serialize(&buf, &pos, 0);
+        try expectAutoMqMutationErrorWithFailingAllocator(&broker, buf[0..pos], 513, 0, 5140, 0, ErrorCode.kafka_storage_error);
+        try testing.expect(broker.auto_mq_nodes.get(18) == null);
+    }
+
+    {
+        var broker = Broker.init(testing.allocator, 1, 9092);
+        defer broker.deinit();
+
+        const Req = generated.automq_zone_router_request.AutomqZoneRouterRequest;
+        const req = Req{ .metadata = "route-data", .route_epoch = 7, .version = 1 };
+        var pos = buildTestRequest(&buf, 515, 1, 5161, header_mod.requestHeaderVersion(515, 1));
+        req.serialize(&buf, &pos, 1);
+        try expectAutoMqMutationErrorWithFailingAllocator(&broker, buf[0..pos], 515, 1, 5161, 0, ErrorCode.kafka_storage_error);
+        try testing.expect(broker.auto_mq_zone_router_metadata == null);
+        try testing.expectEqual(@as(i64, 0), broker.auto_mq_zone_router_epoch);
+    }
+
+    {
+        var broker = Broker.init(testing.allocator, 1, 9092);
+        defer broker.deinit();
+
+        const Req = generated.update_license_request.UpdateLicenseRequest;
+        const req = Req{ .license = "license-data" };
+        var pos = buildTestRequest(&buf, 517, 0, 5179, header_mod.requestHeaderVersion(517, 0));
+        req.serialize(&buf, &pos, 0);
+        try expectAutoMqMutationErrorWithFailingAllocator(&broker, buf[0..pos], 517, 0, 5179, 0, ErrorCode.kafka_storage_error);
+        try testing.expect(broker.auto_mq_license == null);
+    }
+
+    {
+        var broker = Broker.init(testing.allocator, 1, 9092);
+        defer broker.deinit();
+        broker.auto_mq_license = try testing.allocator.dupe(u8, "existing-license");
+        broker.auto_mq_next_node_id = 88;
+
+        const Req = generated.get_next_node_id_request.GetNextNodeIdRequest;
+        const req = Req{ .cluster_id = null };
+        var pos = buildTestRequest(&buf, 600, 0, 6010, header_mod.requestHeaderVersion(600, 0));
+        req.serialize(&buf, &pos, 0);
+        try expectAutoMqMutationErrorWithFailingAllocator(&broker, buf[0..pos], 600, 0, 6010, 0, ErrorCode.kafka_storage_error);
+        try testing.expectEqual(@as(i32, 88), broker.auto_mq_next_node_id);
+    }
+
+    {
+        var broker = Broker.init(testing.allocator, 1, 9092);
+        defer broker.deinit();
+
+        const Req = generated.automq_update_group_request.AutomqUpdateGroupRequest;
+        const promote_req = Req{ .link_id = "link-copy-fail", .group_id = "group-copy-fail", .promoted = true };
+        var pos = buildTestRequest(&buf, 602, 0, 6031, header_mod.requestHeaderVersion(602, 0));
+        promote_req.serialize(&buf, &pos, 0);
+        try expectAutoMqMutationErrorWithFailingAllocator(&broker, buf[0..pos], 602, 0, 6031, 0, ErrorCode.kafka_storage_error);
+        try testing.expect(!broker.auto_mq_group_promotions.contains("group-copy-fail"));
+
+        try broker.updateAutoMqGroupFromRecord("group-demote-fail", "link-demote-fail", true);
+        const demote_req = Req{ .link_id = "", .group_id = "group-demote-fail", .promoted = false };
+        pos = buildTestRequest(&buf, 602, 0, 6032, header_mod.requestHeaderVersion(602, 0));
+        demote_req.serialize(&buf, &pos, 0);
+        try expectAutoMqMutationErrorWithFailingAllocator(&broker, buf[0..pos], 602, 0, 6032, 0, ErrorCode.kafka_storage_error);
+        try testing.expect(broker.auto_mq_group_promotions.contains("group-demote-fail"));
     }
 }
 
