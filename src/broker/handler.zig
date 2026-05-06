@@ -27845,29 +27845,49 @@ pub const Broker = struct {
 
         if (!validateVoteRequestFrame(request_bytes, start_pos, api_version)) {
             log.warn("Malformed Vote request", .{});
-            return null;
+            const resp = Resp{ .error_code = errorCode(.invalid_request), .topics = &.{}, .node_endpoints = &.{} };
+            return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
         }
 
         var pos = start_pos;
         var req = Req.deserialize(self.allocator, request_bytes, &pos, api_version) catch |err| {
             log.warn("Failed to decode Vote request: {}", .{err});
-            return null;
+            const resp = Resp{ .error_code = errorCode(.invalid_request), .topics = &.{}, .node_endpoints = &.{} };
+            return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
         };
         defer self.freeVoteRequest(&req);
 
         const raft = self.raft_state;
-        var topics = std.array_list.Managed(TopicResult).init(self.allocator);
+        var topics: []TopicResult = &.{};
         defer {
-            self.freeVoteResponseTopics(topics.items);
-            topics.deinit();
+            self.freeVoteResponseTopics(topics);
+            if (topics.len > 0) self.allocator.free(topics);
         }
 
         const top_error: i16 = if (raft == null) @intFromEnum(ErrorCode.not_controller) else @intFromEnum(ErrorCode.none);
         if (raft) |rs| {
-            for (req.topics) |topic| {
-                const partitions = self.allocator.alloc(PartitionResult, topic.partitions.len) catch return null;
-                errdefer self.allocator.free(partitions);
+            topics = self.allocator.alloc(TopicResult, req.topics.len) catch |err| {
+                log.warn("Vote topic response allocation failed: {}", .{err});
+                const resp = Resp{ .error_code = errorCode(.kafka_storage_error), .topics = &.{}, .node_endpoints = &.{} };
+                return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+            };
+            for (topics) |*topic| {
+                topic.* = .{ .topic_name = null, .partitions = &.{} };
+            }
 
+            for (req.topics, 0..) |topic, topic_index| {
+                topics[topic_index] = .{ .topic_name = topic.topic_name, .partitions = &.{} };
+                if (topic.partitions.len > 0) {
+                    topics[topic_index].partitions = self.allocator.alloc(PartitionResult, topic.partitions.len) catch |err| {
+                        log.warn("Vote partition response allocation failed: {}", .{err});
+                        const resp = Resp{ .error_code = errorCode(.kafka_storage_error), .topics = &.{}, .node_endpoints = &.{} };
+                        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+                    };
+                }
+            }
+
+            for (req.topics, topics) |topic, *topic_response| {
+                const partitions = @constCast(topic_response.partitions);
                 for (topic.partitions, 0..) |partition, idx| {
                     const last_offset: u64 = if (partition.last_offset < 0) 0 else @intCast(partition.last_offset);
                     const vote_result = rs.handleVoteRequest(
@@ -27890,20 +27910,12 @@ pub const Broker = struct {
                         vote_result.vote_granted,
                     });
                 }
-
-                topics.append(.{
-                    .topic_name = topic.topic_name,
-                    .partitions = partitions,
-                }) catch {
-                    self.allocator.free(partitions);
-                    return null;
-                };
             }
         }
 
         const resp = Resp{
             .error_code = top_error,
-            .topics = topics.items,
+            .topics = topics,
         };
         return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
     }
@@ -28397,6 +28409,56 @@ fn buildTestRequest(buf: []u8, api_key: i16, api_version: i16, correlation_id: i
     return pos;
 }
 
+const OneShotFailingAllocator = struct {
+    backing: Allocator,
+    fail_index: usize,
+    alloc_index: usize = 0,
+    failed: bool = false,
+
+    fn init(backing: Allocator, fail_index: usize) OneShotFailingAllocator {
+        return .{ .backing = backing, .fail_index = fail_index };
+    }
+
+    fn allocator(self: *OneShotFailingAllocator) Allocator {
+        return .{
+            .ptr = self,
+            .vtable = &.{
+                .alloc = alloc,
+                .resize = resize,
+                .remap = remap,
+                .free = free,
+            },
+        };
+    }
+
+    fn alloc(ctx: *anyopaque, len: usize, alignment: std.mem.Alignment, return_address: usize) ?[*]u8 {
+        const self: *OneShotFailingAllocator = @ptrCast(@alignCast(ctx));
+        if (!self.failed and self.alloc_index == self.fail_index) {
+            self.failed = true;
+            self.alloc_index += 1;
+            return null;
+        }
+        const result = self.backing.rawAlloc(len, alignment, return_address) orelse return null;
+        self.alloc_index += 1;
+        return result;
+    }
+
+    fn resize(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, return_address: usize) bool {
+        const self: *OneShotFailingAllocator = @ptrCast(@alignCast(ctx));
+        return self.backing.rawResize(memory, alignment, new_len, return_address);
+    }
+
+    fn remap(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, return_address: usize) ?[*]u8 {
+        const self: *OneShotFailingAllocator = @ptrCast(@alignCast(ctx));
+        return self.backing.rawRemap(memory, alignment, new_len, return_address);
+    }
+
+    fn free(ctx: *anyopaque, old_mem: []u8, alignment: std.mem.Alignment, return_address: usize) void {
+        const self: *OneShotFailingAllocator = @ptrCast(@alignCast(ctx));
+        self.backing.rawFree(old_mem, alignment, return_address);
+    }
+};
+
 fn expectTestResponseHeader(response: []const u8, api_key: i16, api_version: i16, correlation_id: i32, pos: *usize) !void {
     var response_header = try ResponseHeader.deserialize(testing.allocator, response, pos, header_mod.responseHeaderVersion(api_key, api_version));
     defer response_header.deinit(testing.allocator);
@@ -28722,6 +28784,20 @@ fn freeDeserializedVoteResponse(resp: *const generated.vote_response.VoteRespons
     }
     if (resp.topics.len > 0) testing.allocator.free(resp.topics);
     if (resp.node_endpoints.len > 0) testing.allocator.free(resp.node_endpoints);
+}
+
+fn readVoteResponseErrorCode(response: []const u8, api_version: i16, correlation_id: i32) !i16 {
+    const Resp = generated.vote_response.VoteResponse;
+
+    var rpos: usize = 0;
+    var response_header = try ResponseHeader.deserialize(testing.allocator, response, &rpos, header_mod.responseHeaderVersion(52, api_version));
+    defer response_header.deinit(testing.allocator);
+    try testing.expectEqual(correlation_id, response_header.correlation_id);
+
+    const resp = try Resp.deserialize(testing.allocator, response, &rpos, api_version);
+    defer freeDeserializedVoteResponse(&resp);
+    try testing.expectEqual(response.len, rpos);
+    return resp.error_code;
 }
 
 fn freeDeserializedBeginQuorumEpochResponse(resp: *const generated.begin_quorum_epoch_response.BeginQuorumEpochResponse) void {
@@ -48693,6 +48769,52 @@ test "Broker.handleRequest Vote returns request-scoped generated response" {
     try testing.expect(resp.topics[0].partitions[0].vote_granted);
 }
 
+test "Broker.handleRequest Vote fails closed on response materialization failure" {
+    const Req = generated.vote_request.VoteRequest;
+
+    const partitions = [_]Req.TopicData.PartitionData{.{
+        .partition_index = 0,
+        .candidate_epoch = 1,
+        .candidate_id = 7,
+        .last_offset_epoch = 0,
+        .last_offset = 0,
+    }};
+    const topics = [_]Req.TopicData{.{
+        .topic_name = "__cluster_metadata",
+        .partitions = &partitions,
+    }};
+    const req = Req{ .topics = &topics };
+
+    var buf: [1024]u8 = undefined;
+    var pos = buildTestRequest(&buf, 52, 0, 5202, header_mod.requestHeaderVersion(52, 0));
+    req.serialize(&buf, &pos, 0);
+
+    for (2..4) |fail_index| {
+        var raft = RaftState.init(testing.allocator, 5, "vote-oom-cluster");
+        defer raft.deinit();
+
+        var broker = Broker.init(testing.allocator, 5, 19094);
+        defer broker.deinit();
+        broker.raft_state = &raft;
+
+        var failing_allocator = OneShotFailingAllocator.init(testing.allocator, fail_index);
+        const response_allocator = failing_allocator.allocator();
+        broker.allocator = response_allocator;
+
+        const response = broker.handleRequest(buf[0..pos]);
+        broker.allocator = testing.allocator;
+
+        try testing.expect(failing_allocator.failed);
+        try testing.expect(response != null);
+        defer response_allocator.free(response.?);
+
+        const error_code = try readVoteResponseErrorCode(response.?, 0, 5202);
+        try testing.expectEqual(ErrorCode.kafka_storage_error.toInt(), error_code);
+        try testing.expectEqual(@as(i32, 0), raft.current_epoch);
+        try testing.expectEqual(@as(?i32, null), raft.voted_for);
+    }
+}
+
 test "Broker.handleRequest Vote returns generated not-controller responses" {
     const Req = generated.vote_request.VoteRequest;
     const Resp = generated.vote_response.VoteResponse;
@@ -48805,12 +48927,17 @@ test "Broker.handleRequest Vote rejects truncated requests" {
     for (versions, 0..) |version, index| {
         var buf: [128]u8 = undefined;
         const req_len = buildTestRequest(&buf, 52, version, 5220 + @as(i32, @intCast(index)), header_mod.requestHeaderVersion(52, version));
-        try testing.expect(broker.handleRequest(buf[0..req_len]) == null);
+        const response = broker.handleRequest(buf[0..req_len]);
+        try testing.expect(response != null);
+        defer testing.allocator.free(response.?);
+        const error_code = try readVoteResponseErrorCode(response.?, version, 5220 + @as(i32, @intCast(index)));
+        try testing.expectEqual(ErrorCode.invalid_request.toInt(), error_code);
     }
 }
 
 test "Broker.handleRequest Vote rejects trailing bytes" {
     const Req = generated.vote_request.VoteRequest;
+    const Resp = generated.vote_response.VoteResponse;
 
     var broker = Broker.init(testing.allocator, 1, 9092);
     defer broker.deinit();
@@ -48839,7 +48966,7 @@ test "Broker.handleRequest Vote rejects trailing bytes" {
     var pos = buildTestRequest(&buf, 52, 1, 5222, header_mod.requestHeaderVersion(52, 1));
     req.serialize(&buf, &pos, 1);
 
-    try expectTrailingByteRejected(&broker, &buf, pos);
+    try expectTrailingByteRejectedWithGeneratedResponse(Resp, &broker, &buf, pos, 52, 1, 5222);
 }
 
 test "Broker.handleRequest BeginQuorumEpoch returns generated not-controller responses" {
