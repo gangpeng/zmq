@@ -12524,13 +12524,29 @@ pub const Broker = struct {
     }
 
     fn buildListOffsetsPartitionResponse(self: *Broker, topic_name: []const u8, partition_req: generated.list_offsets_request.ListOffsetsRequest.ListOffsetsTopic.ListOffsetsPartition, api_version: i16) !generated.list_offsets_response.ListOffsetsResponse.ListOffsetsTopicResponse.ListOffsetsPartitionResponse {
-        const pkey = try std.fmt.allocPrint(self.allocator, "{s}-{d}", .{ topic_name, partition_req.partition_index });
-        defer self.allocator.free(pkey);
+        if (self.partitionRequestError(topic_name, partition_req.partition_index)) |error_code| {
+            return .{
+                .partition_index = partition_req.partition_index,
+                .error_code = error_code,
+                .old_style_offsets = &.{},
+                .timestamp = -1,
+                .offset = -1,
+                .leader_epoch = -1,
+            };
+        }
 
-        const offset = if (self.store.partitions.get(pkey)) |state|
-            if (partition_req.timestamp == -2) @as(i64, @intCast(state.log_start_offset)) else @as(i64, @intCast(state.high_watermark))
+        const state = self.partitionState(topic_name, partition_req.partition_index) orelse return .{
+            .partition_index = partition_req.partition_index,
+            .error_code = @intFromEnum(ErrorCode.unknown_topic_or_partition),
+            .old_style_offsets = &.{},
+            .timestamp = -1,
+            .offset = -1,
+            .leader_epoch = -1,
+        };
+        const offset = if (partition_req.timestamp == -2)
+            @as(i64, @intCast(state.log_start_offset))
         else
-            0;
+            @as(i64, @intCast(state.high_watermark));
 
         var old_style_offsets: []i64 = &.{};
         if (api_version == 0) {
@@ -18343,12 +18359,7 @@ pub const Broker = struct {
         // Without this, READ_COMMITTED consumers would never see committed data.
         if (marker_error == @intFromEnum(ErrorCode.none)) {
             for (partitions) |tp| {
-                var key_buf: [512]u8 = undefined;
-                const pkey = std.fmt.bufPrint(&key_buf, "{s}-{d}", .{ tp.topic, tp.partition }) catch {
-                    marker_error = @intFromEnum(ErrorCode.kafka_storage_error);
-                    break;
-                };
-                if (self.store.partitions.getPtr(pkey)) |state| {
+                if (self.partitionStatePtr(tp.topic, tp.partition)) |state| {
                     state.first_unstable_txn_offset = null;
                     state.last_stable_offset = state.high_watermark;
                     partition_state_dirty = true;
@@ -45898,6 +45909,39 @@ test "Broker.handleRequest EndTxn v3 returns generated response and completes tr
     try testing.expectEqual(TxnCoordinator.TxnStatus.complete_commit, broker.txn_coordinator.getStatus(init_result.producer_id).?);
 }
 
+test "Broker.writeTxnControlBatches clears LSO for long topic names" {
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+
+    const topic_name = try testing.allocator.alloc(u8, 600);
+    defer testing.allocator.free(topic_name);
+    @memset(topic_name, 't');
+    topic_name[0] = 'e';
+
+    try testing.expect(broker.ensureTopic(topic_name));
+    const before = broker.partitionStatePtr(topic_name, 0) orelse return error.ExpectedPartitionState;
+    before.first_unstable_txn_offset = 0;
+    before.last_stable_offset = 0;
+
+    const partitions = [_]TxnCoordinator.TransactionState.TopicPartition{.{
+        .topic = topic_name,
+        .partition = 0,
+    }};
+    const marker_error = broker.writeTxnControlBatches(42, 0, .commit, &partitions);
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.none)), marker_error);
+
+    const after = broker.partitionStatePtr(topic_name, 0) orelse return error.ExpectedPartitionState;
+    try testing.expectEqual(@as(u64, 1), after.next_offset);
+    try testing.expectEqual(@as(u64, 1), after.high_watermark);
+    try testing.expectEqual(@as(u64, 1), after.last_stable_offset);
+    try testing.expect(after.first_unstable_txn_offset == null);
+
+    const fetched = try broker.store.fetch(topic_name, 0, 0, 1024);
+    defer if (fetched.records.len > 0) testing.allocator.free(@constCast(fetched.records));
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.none)), fetched.error_code);
+    try expectTxnControlRecordType(fetched.records, .commit);
+}
+
 test "Broker.handleRequest EndTxn v4 maps abortable transaction state before marker write" {
     var broker = Broker.init(testing.allocator, 1, 9092);
     defer broker.deinit();
@@ -49616,6 +49660,21 @@ test "Broker.handleRequest DescribeTopicPartitions rejects trailing bytes" {
 // HIGH-priority gap tests: handler wire-protocol round-trips
 // ---------------------------------------------------------------
 
+fn rekeyPartitionForTest(broker: *Broker, topic: []const u8, partition: i32, replacement_key: []const u8) !void {
+    const formatted_key = try std.fmt.allocPrint(testing.allocator, "{s}-{d}", .{ topic, partition });
+    defer testing.allocator.free(formatted_key);
+
+    const removed = broker.store.partitions.fetchRemove(formatted_key) orelse return error.ExpectedPartitionState;
+    var state_owned = true;
+    errdefer if (state_owned) broker.store.allocator.free(removed.value.topic);
+    broker.store.allocator.free(removed.key);
+
+    const key_copy = try broker.store.allocator.dupe(u8, replacement_key);
+    errdefer broker.store.allocator.free(key_copy);
+    try broker.store.partitions.put(key_copy, removed.value);
+    state_owned = false;
+}
+
 test "Broker.handleRequest Fetch v0 returns generated produced data" {
     const Resp = generated.fetch_response.FetchResponse;
 
@@ -50093,6 +50152,114 @@ test "Broker.handleRequest ListOffsets v6 returns generated flexible earliest of
     try testing.expectEqual(@as(usize, 1), resp.topics.len);
     try testing.expectEqual(@as(i64, 0), resp.topics[0].partitions[0].offset);
     try testing.expectEqual(@as(i32, broker.cached_leader_epoch), resp.topics[0].partitions[0].leader_epoch);
+}
+
+test "Broker.handleRequest ListOffsets reports unknown partition instead of offset zero" {
+    const Req = generated.list_offsets_request.ListOffsetsRequest;
+    const Topic = Req.ListOffsetsTopic;
+    const Partition = Topic.ListOffsetsPartition;
+    const Resp = generated.list_offsets_response.ListOffsetsResponse;
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+
+    const partitions = [_]Partition{.{
+        .partition_index = 0,
+        .current_leader_epoch = -1,
+        .timestamp = -1,
+    }};
+    const topics = [_]Topic{.{
+        .name = "lo-missing-topic",
+        .partitions = &partitions,
+    }};
+    const req = Req{
+        .replica_id = -1,
+        .isolation_level = 0,
+        .topics = &topics,
+    };
+
+    var buf: [512]u8 = undefined;
+    var pos = buildTestRequest(&buf, 2, 6, 31, header_mod.requestHeaderVersion(2, 6));
+    req.serialize(&buf, &pos, 6);
+
+    const response = broker.handleRequest(buf[0..pos]);
+    try testing.expect(response != null);
+    defer testing.allocator.free(response.?);
+
+    var rpos: usize = 0;
+    var response_header = try ResponseHeader.deserialize(testing.allocator, response.?, &rpos, header_mod.responseHeaderVersion(2, 6));
+    defer response_header.deinit(testing.allocator);
+    try testing.expectEqual(@as(i32, 31), response_header.correlation_id);
+
+    const resp = try Resp.deserialize(testing.allocator, response.?, &rpos, 6);
+    defer freeDeserializedListOffsetsResponse(&resp);
+
+    try testing.expectEqual(response.?.len, rpos);
+    try testing.expectEqual(@as(usize, 1), resp.topics.len);
+    try testing.expectEqual(@as(usize, 1), resp.topics[0].partitions.len);
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.unknown_topic_or_partition)), resp.topics[0].partitions[0].error_code);
+    try testing.expectEqual(@as(i64, -1), resp.topics[0].partitions[0].offset);
+    try testing.expectEqual(@as(i32, -1), resp.topics[0].partitions[0].leader_epoch);
+}
+
+test "Broker.handleRequest ListOffsets uses partition state metadata lookup" {
+    const Req = generated.list_offsets_request.ListOffsetsRequest;
+    const Topic = Req.ListOffsetsTopic;
+    const Partition = Topic.ListOffsetsPartition;
+    const Resp = generated.list_offsets_response.ListOffsetsResponse;
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+    broker.wireInternalPointers();
+
+    const topic_name = try testing.allocator.alloc(u8, 600);
+    defer testing.allocator.free(topic_name);
+    @memset(topic_name, 't');
+    topic_name[0] = 'l';
+
+    try broker.store.ensurePartition(topic_name, 0);
+    const state = broker.partitionStatePtr(topic_name, 0) orelse return error.ExpectedPartitionState;
+    state.next_offset = 7;
+    state.high_watermark = 7;
+    state.last_stable_offset = 7;
+    try rekeyPartitionForTest(&broker, topic_name, 0, "list-offsets-noncanonical-key");
+
+    const partitions = [_]Partition{.{
+        .partition_index = 0,
+        .current_leader_epoch = -1,
+        .timestamp = -1,
+    }};
+    const topics = [_]Topic{.{
+        .name = topic_name,
+        .partitions = &partitions,
+    }};
+    const req = Req{
+        .replica_id = -1,
+        .isolation_level = 0,
+        .topics = &topics,
+    };
+
+    var buf: [2048]u8 = undefined;
+    var pos = buildTestRequest(&buf, 2, 6, 32, header_mod.requestHeaderVersion(2, 6));
+    req.serialize(&buf, &pos, 6);
+
+    const response = broker.handleRequest(buf[0..pos]);
+    try testing.expect(response != null);
+    defer testing.allocator.free(response.?);
+
+    var rpos: usize = 0;
+    var response_header = try ResponseHeader.deserialize(testing.allocator, response.?, &rpos, header_mod.responseHeaderVersion(2, 6));
+    defer response_header.deinit(testing.allocator);
+    try testing.expectEqual(@as(i32, 32), response_header.correlation_id);
+
+    const resp = try Resp.deserialize(testing.allocator, response.?, &rpos, 6);
+    defer freeDeserializedListOffsetsResponse(&resp);
+
+    try testing.expectEqual(response.?.len, rpos);
+    try testing.expectEqual(@as(usize, 1), resp.topics.len);
+    try testing.expectEqual(@as(usize, 1), resp.topics[0].partitions.len);
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.none)), resp.topics[0].partitions[0].error_code);
+    try testing.expectEqual(@as(i64, 7), resp.topics[0].partitions[0].offset);
 }
 
 test "Broker.handleRequest ListOffsets rejects truncated request" {
