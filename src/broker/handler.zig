@@ -28015,13 +28015,15 @@ pub const Broker = struct {
 
         if (!validateBeginQuorumEpochRequestFrame(request_bytes, start_pos, api_version)) {
             log.warn("Malformed BeginQuorumEpoch request", .{});
-            return null;
+            const resp = Resp{ .error_code = errorCode(.invalid_request), .topics = &.{}, .node_endpoints = &.{} };
+            return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
         }
 
         var pos = start_pos;
         var req = Req.deserialize(self.allocator, request_bytes, &pos, api_version) catch |err| {
             log.warn("Failed to decode BeginQuorumEpoch request: {}", .{err});
-            return null;
+            const resp = Resp{ .error_code = errorCode(.invalid_request), .topics = &.{}, .node_endpoints = &.{} };
+            return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
         };
         defer self.freeBeginQuorumEpochRequest(&req);
 
@@ -28100,13 +28102,15 @@ pub const Broker = struct {
 
         if (!validateEndQuorumEpochRequestFrame(request_bytes, start_pos, api_version)) {
             log.warn("Malformed EndQuorumEpoch request", .{});
-            return null;
+            const resp = Resp{ .error_code = errorCode(.invalid_request), .topics = &.{}, .node_endpoints = &.{} };
+            return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
         }
 
         var pos = start_pos;
         var req = Req.deserialize(self.allocator, request_bytes, &pos, api_version) catch |err| {
             log.warn("Failed to decode EndQuorumEpoch request: {}", .{err});
-            return null;
+            const resp = Resp{ .error_code = errorCode(.invalid_request), .topics = &.{}, .node_endpoints = &.{} };
+            return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
         };
         defer self.freeEndQuorumEpochRequest(&req);
 
@@ -28156,19 +28160,24 @@ pub const Broker = struct {
 
         if (!validateDescribeQuorumRequestFrame(request_bytes, body_start)) {
             log.warn("Malformed DescribeQuorum request", .{});
-            return null;
+            const resp = Resp{ .error_code = errorCode(.invalid_request), .error_message = "Invalid request", .topics = &.{}, .nodes = &.{} };
+            return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
         }
 
         var pos = body_start;
         var req = Req.deserialize(self.allocator, request_bytes, &pos, api_version) catch |err| {
             log.warn("Failed to decode DescribeQuorum request: {}", .{err});
-            return null;
+            const resp = Resp{ .error_code = errorCode(.invalid_request), .error_message = "Invalid request", .topics = &.{}, .nodes = &.{} };
+            return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
         };
         defer self.freeDescribeQuorumRequest(&req);
 
-        const rh = ResponseHeader{ .correlation_id = req_header.correlation_id };
         const raft = self.raft_state;
-        const topics = if (raft) |rs| (self.collectDescribeQuorumTopics(&req, rs, api_version) catch return null) else &.{};
+        const topics = if (raft) |rs| (self.collectDescribeQuorumTopics(&req, rs, api_version) catch |err| {
+            log.warn("DescribeQuorum topic response allocation failed: {}", .{err});
+            const resp = Resp{ .error_code = errorCode(.kafka_storage_error), .error_message = "Failed to materialize quorum topics", .topics = &.{}, .nodes = &.{} };
+            return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+        }) else &.{};
         defer {
             self.freeDescribeQuorumTopics(topics);
             if (topics.len > 0) self.allocator.free(topics);
@@ -28176,7 +28185,11 @@ pub const Broker = struct {
 
         const nodes: []const Node = if (api_version >= 2) blk: {
             const rs = raft orelse break :blk &.{};
-            break :blk self.collectDescribeQuorumNodes(rs) catch return null;
+            break :blk self.collectDescribeQuorumNodes(rs) catch |err| {
+                log.warn("DescribeQuorum node response allocation failed: {}", .{err});
+                const resp = Resp{ .error_code = errorCode(.kafka_storage_error), .error_message = "Failed to materialize quorum nodes", .topics = &.{}, .nodes = &.{} };
+                return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+            };
         } else &.{};
         defer self.freeDescribeQuorumNodes(nodes);
 
@@ -28186,13 +28199,7 @@ pub const Broker = struct {
             .topics = topics,
             .nodes = nodes,
         };
-
-        const needed = rh.calcSize(resp_header_version) + resp_body.calcSize(api_version);
-        var buf = self.allocator.alloc(u8, needed) catch return null;
-        var wpos: usize = 0;
-        rh.serialize(buf, &wpos, resp_header_version);
-        resp_body.serialize(buf, &wpos, api_version);
-        return (self.allocator.realloc(buf, wpos) catch buf)[0..wpos];
+        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp_body, api_version);
     }
 
     fn validateDescribeQuorumRequestFrame(buf: []const u8, start_pos: usize) bool {
@@ -28796,6 +28803,17 @@ fn readVoteResponseErrorCode(response: []const u8, api_version: i16, correlation
 
     const resp = try Resp.deserialize(testing.allocator, response, &rpos, api_version);
     defer freeDeserializedVoteResponse(&resp);
+    try testing.expectEqual(response.len, rpos);
+    return resp.error_code;
+}
+
+fn readGeneratedTopLevelErrorCode(comptime RespType: type, response: []const u8, api_key: i16, api_version: i16, correlation_id: i32) !i16 {
+    var rpos: usize = 0;
+    var response_header = try ResponseHeader.deserialize(testing.allocator, response, &rpos, header_mod.responseHeaderVersion(api_key, api_version));
+    defer response_header.deinit(testing.allocator);
+    try testing.expectEqual(correlation_id, response_header.correlation_id);
+
+    const resp = try RespType.deserialize(testing.allocator, response, &rpos, api_version);
     try testing.expectEqual(response.len, rpos);
     return resp.error_code;
 }
@@ -48649,16 +48667,24 @@ test "Broker.handleRequest DescribeQuorum returns generated not-controller respo
 }
 
 test "Broker.handleRequest DescribeQuorum rejects truncated request" {
+    const Resp = generated.describe_quorum_response.DescribeQuorumResponse;
+
     var broker = Broker.init(testing.allocator, 1, 9092);
     defer broker.deinit();
 
     var buf: [128]u8 = undefined;
     const req_len = buildTestRequest(&buf, 55, 2, 5504, header_mod.requestHeaderVersion(55, 2));
-    try testing.expect(broker.handleRequest(buf[0..req_len]) == null);
+    const response = broker.handleRequest(buf[0..req_len]);
+    try testing.expect(response != null);
+    defer testing.allocator.free(response.?);
+
+    const error_code = try readGeneratedTopLevelErrorCode(Resp, response.?, 55, 2, 5504);
+    try testing.expectEqual(ErrorCode.invalid_request.toInt(), error_code);
 }
 
 test "Broker.handleRequest DescribeQuorum rejects trailing bytes" {
     const Req = generated.describe_quorum_request.DescribeQuorumRequest;
+    const Resp = generated.describe_quorum_response.DescribeQuorumResponse;
 
     var broker = Broker.init(testing.allocator, 1, 9092);
     defer broker.deinit();
@@ -48676,7 +48702,39 @@ test "Broker.handleRequest DescribeQuorum rejects trailing bytes" {
     var pos = buildTestRequest(&buf, 55, 2, 5506, header_mod.requestHeaderVersion(55, 2));
     req.serialize(&buf, &pos, 2);
 
-    try expectTrailingByteRejected(&broker, &buf, pos);
+    try expectTrailingByteRejectedWithGeneratedResponse(Resp, &broker, &buf, pos, 55, 2, 5506);
+}
+
+test "Broker.handleRequest DescribeQuorum fails closed on response materialization failure" {
+    const Req = generated.describe_quorum_request.DescribeQuorumRequest;
+    const Resp = generated.describe_quorum_response.DescribeQuorumResponse;
+
+    var raft = RaftState.init(testing.allocator, 5, "describe-quorum-oom-cluster");
+    defer raft.deinit();
+    try raft.addVoter(5);
+
+    var broker = Broker.init(testing.allocator, 5, 19094);
+    defer broker.deinit();
+    broker.raft_state = &raft;
+
+    const req = Req{};
+    var buf: [512]u8 = undefined;
+    var pos = buildTestRequest(&buf, 55, 2, 5507, header_mod.requestHeaderVersion(55, 2));
+    req.serialize(&buf, &pos, 2);
+
+    var failing_allocator = OneShotFailingAllocator.init(testing.allocator, 0);
+    const response_allocator = failing_allocator.allocator();
+    broker.allocator = response_allocator;
+
+    const response = broker.handleRequest(buf[0..pos]);
+    broker.allocator = testing.allocator;
+
+    try testing.expect(failing_allocator.failed);
+    try testing.expect(response != null);
+    defer response_allocator.free(response.?);
+
+    const error_code = try readGeneratedTopLevelErrorCode(Resp, response.?, 55, 2, 5507);
+    try testing.expectEqual(ErrorCode.kafka_storage_error.toInt(), error_code);
 }
 
 test "Broker.handleRequest DescribeQuorum authorization denial uses generated response" {
@@ -49481,6 +49539,9 @@ test "Broker.handleRequest EndQuorumEpoch authorization denial uses generated re
 }
 
 test "Broker.handleRequest BeginQuorumEpoch and EndQuorumEpoch reject truncated requests" {
+    const BeginResp = generated.begin_quorum_epoch_response.BeginQuorumEpochResponse;
+    const EndResp = generated.end_quorum_epoch_response.EndQuorumEpochResponse;
+
     var broker = Broker.init(testing.allocator, 1, 9092);
     defer broker.deinit();
 
@@ -49498,12 +49559,22 @@ test "Broker.handleRequest BeginQuorumEpoch and EndQuorumEpoch reject truncated 
     for (cases) |case| {
         var buf: [128]u8 = undefined;
         const req_len = buildTestRequest(&buf, case.api_key, case.version, case.correlation_id, header_mod.requestHeaderVersion(case.api_key, case.version));
-        try testing.expect(broker.handleRequest(buf[0..req_len]) == null);
+        const response = broker.handleRequest(buf[0..req_len]);
+        try testing.expect(response != null);
+        defer testing.allocator.free(response.?);
+
+        const error_code = switch (case.api_key) {
+            53 => try readGeneratedTopLevelErrorCode(BeginResp, response.?, case.api_key, case.version, case.correlation_id),
+            54 => try readGeneratedTopLevelErrorCode(EndResp, response.?, case.api_key, case.version, case.correlation_id),
+            else => unreachable,
+        };
+        try testing.expectEqual(ErrorCode.invalid_request.toInt(), error_code);
     }
 }
 
 test "Broker.handleRequest EndQuorumEpoch rejects trailing bytes" {
     const Req = generated.end_quorum_epoch_request.EndQuorumEpochRequest;
+    const Resp = generated.end_quorum_epoch_response.EndQuorumEpochResponse;
 
     var broker = Broker.init(testing.allocator, 1, 9092);
     defer broker.deinit();
@@ -49538,7 +49609,7 @@ test "Broker.handleRequest EndQuorumEpoch rejects trailing bytes" {
     var pos = buildTestRequest(&buf, 54, 1, 5404, header_mod.requestHeaderVersion(54, 1));
     req.serialize(&buf, &pos, 1);
 
-    try expectTrailingByteRejected(&broker, &buf, pos);
+    try expectTrailingByteRejectedWithGeneratedResponse(Resp, &broker, &buf, pos, 54, 1, 5404);
 }
 
 test "Broker.handleRequest ElectLeaders returns requested partition results" {

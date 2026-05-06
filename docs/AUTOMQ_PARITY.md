@@ -260,6 +260,10 @@ when allocation fails;
 broker-side Vote request validation and response materialization now return
 generated fail-closed responses instead of silently closing or mutating state
 after response allocation fails;
+broker-side BeginQuorumEpoch, EndQuorumEpoch, and DescribeQuorum malformed
+request paths now return generated invalid-request responses, and
+DescribeQuorum allocation failures return storage errors instead of silent
+connection closes;
 generated VoteRequest decode now frees partially materialized topic arrays when
 nested allocation fails before handler validation;
 ControllerRegistration, AddRaftVoter, and UpdateRaftVoter endpoint
