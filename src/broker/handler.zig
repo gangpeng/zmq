@@ -13219,19 +13219,22 @@ pub const Broker = struct {
 
         if (!validateProduceRequestFrame(request_bytes, body_start, api_version)) {
             log.warn("Malformed Produce request", .{});
-            return null;
+            return self.produceErrorResponse(req_header, resp_header_version, api_version, ErrorCode.invalid_request, "Invalid request");
         }
 
         var pos = body_start;
         var req = Req.deserialize(self.allocator, request_bytes, &pos, api_version) catch |err| {
             log.warn("Malformed Produce request: {}", .{err});
-            return null;
+            return self.produceErrorResponse(req_header, resp_header_version, api_version, ErrorCode.invalid_request, "Invalid request");
         };
         defer self.freeProduceRequest(&req);
 
         var responses: []TopicResult = &.{};
         if (req.topic_data.len > 0) {
-            responses = self.allocator.alloc(TopicResult, req.topic_data.len) catch return null;
+            responses = self.allocator.alloc(TopicResult, req.topic_data.len) catch |err| {
+                log.warn("Produce response materialization failed: {}", .{err});
+                return self.produceErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error, "Failed to materialize Produce response");
+            };
         }
         var responses_init: usize = 0;
         defer {
@@ -13242,7 +13245,10 @@ pub const Broker = struct {
         var object_metadata_dirty = false;
         var partition_state_dirty = false;
         for (req.topic_data) |topic_req| {
-            responses[responses_init] = self.buildProduceTopicResponse(api_version, req.acks, req.transactional_id, topic_req, &object_metadata_dirty, &partition_state_dirty) catch return null;
+            responses[responses_init] = self.buildProduceTopicResponse(api_version, req.acks, req.transactional_id, topic_req, &object_metadata_dirty, &partition_state_dirty) catch |err| {
+                log.warn("Produce topic response materialization failed: {}", .{err});
+                return self.produceErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error, "Failed to materialize Produce response");
+            };
             responses_init += 1;
         }
 
@@ -13289,7 +13295,10 @@ pub const Broker = struct {
             .responses = responses[0..responses_init],
             .throttle_time_ms = throttle_time_ms,
         };
-        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version) orelse {
+            log.warn("Produce response serialization failed", .{});
+            return self.produceErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error, "Failed to serialize Produce response");
+        };
     }
 
     fn markProduceSuccessfulPartitionsStorageError(self: *Broker, topics: []generated.produce_response.ProduceResponse.TopicProduceResponse) void {
@@ -13741,13 +13750,13 @@ pub const Broker = struct {
 
         if (!validateFetchRequestFrame(request_bytes, body_start, api_version)) {
             log.warn("Malformed Fetch request", .{});
-            return null;
+            return self.fetchErrorResponse(req_header, resp_header_version, api_version, ErrorCode.invalid_request);
         }
 
         var pos = body_start;
         var req = Req.deserialize(self.allocator, request_bytes, &pos, api_version) catch |err| {
             log.warn("Malformed Fetch request: {}", .{err});
-            return null;
+            return self.fetchErrorResponse(req_header, resp_header_version, api_version, ErrorCode.invalid_request);
         };
         defer self.freeFetchRequest(&req);
 
@@ -13768,7 +13777,10 @@ pub const Broker = struct {
 
         var responses: []TopicResult = &.{};
         if (req.topics.len > 0) {
-            responses = self.allocator.alloc(TopicResult, req.topics.len) catch return null;
+            responses = self.allocator.alloc(TopicResult, req.topics.len) catch |err| {
+                log.warn("Fetch response materialization failed: {}", .{err});
+                return self.fetchErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error);
+            };
         }
         var responses_init: usize = 0;
         defer {
@@ -13777,7 +13789,10 @@ pub const Broker = struct {
         }
 
         for (req.topics) |topic| {
-            responses[responses_init] = self.buildFetchTopicResponse(topic, req.isolation_level, api_version) catch return null;
+            responses[responses_init] = self.buildFetchTopicResponse(topic, req.isolation_level, api_version) catch |err| {
+                log.warn("Fetch topic response materialization failed: {}", .{err});
+                return self.fetchErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error);
+            };
             responses_init += 1;
         }
 
@@ -13788,7 +13803,10 @@ pub const Broker = struct {
             .session_id = resp_session_id,
             .responses = responses[0..responses_init],
         };
-        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version) orelse {
+            log.warn("Fetch response serialization failed", .{});
+            return self.fetchErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error);
+        };
     }
 
     fn freeFetchRequest(self: *Broker, req: *const generated.fetch_request.FetchRequest) void {
@@ -33755,6 +33773,52 @@ fn freeDeserializedFetchResponse(resp: *const generated.fetch_response.FetchResp
     if (resp.responses.len > 0) testing.allocator.free(resp.responses);
 }
 
+fn expectProduceErrorResponseBytes(response: []const u8, api_version: i16, correlation_id: i32, err_code: ErrorCode) !void {
+    const Resp = generated.produce_response.ProduceResponse;
+
+    var rpos: usize = 0;
+    var response_header = try ResponseHeader.deserialize(testing.allocator, response, &rpos, header_mod.responseHeaderVersion(0, api_version));
+    defer response_header.deinit(testing.allocator);
+    try testing.expectEqual(correlation_id, response_header.correlation_id);
+
+    const resp = try Resp.deserialize(testing.allocator, response, &rpos, api_version);
+    defer freeDeserializedProduceResponse(&resp);
+
+    try testing.expectEqual(response.len, rpos);
+    try testing.expectEqual(@as(i32, 0), resp.throttle_time_ms);
+    try testing.expectEqual(@as(usize, 1), resp.responses.len);
+    try testing.expectEqualStrings("", resp.responses[0].name.?);
+    try testing.expectEqual(@as(usize, 1), resp.responses[0].partition_responses.len);
+    try testing.expectEqual(@as(i32, -1), resp.responses[0].partition_responses[0].index);
+    try testing.expectEqual(@as(i16, @intFromEnum(err_code)), resp.responses[0].partition_responses[0].error_code);
+    try testing.expectEqual(@as(i64, -1), resp.responses[0].partition_responses[0].base_offset);
+}
+
+fn expectFetchErrorResponseBytes(response: []const u8, api_version: i16, correlation_id: i32, err_code: ErrorCode) !void {
+    const Resp = generated.fetch_response.FetchResponse;
+
+    var rpos: usize = 0;
+    var response_header = try ResponseHeader.deserialize(testing.allocator, response, &rpos, header_mod.responseHeaderVersion(1, api_version));
+    defer response_header.deinit(testing.allocator);
+    try testing.expectEqual(correlation_id, response_header.correlation_id);
+
+    const resp = try Resp.deserialize(testing.allocator, response, &rpos, api_version);
+    defer freeDeserializedFetchResponse(&resp);
+
+    try testing.expectEqual(response.len, rpos);
+    try testing.expectEqual(@as(i32, 0), resp.throttle_time_ms);
+    if (api_version >= 7) {
+        try testing.expectEqual(@as(i16, @intFromEnum(err_code)), resp.error_code);
+        try testing.expectEqual(@as(i32, 0), resp.session_id);
+    }
+    try testing.expectEqual(@as(usize, 1), resp.responses.len);
+    try testing.expectEqualStrings("", resp.responses[0].topic.?);
+    try testing.expectEqual(@as(usize, 1), resp.responses[0].partitions.len);
+    try testing.expectEqual(@as(i32, -1), resp.responses[0].partitions[0].partition_index);
+    try testing.expectEqual(@as(i16, @intFromEnum(err_code)), resp.responses[0].partitions[0].error_code);
+    try testing.expect(resp.responses[0].partitions[0].records == null);
+}
+
 fn expectApiVersionsResponseMatchesCatalog(response: []const u8, api_version: i16, correlation_id: i32) !void {
     const Resp = generated.api_versions_response.ApiVersionsResponse;
     const body_version: i16 = @min(api_version, 4);
@@ -37303,7 +37367,11 @@ test "Broker.handleRequest Produce rejects truncated request" {
 
     var buf: [128]u8 = undefined;
     const req_len = buildTestRequest(&buf, 0, 9, 310, header_mod.requestHeaderVersion(0, 9));
-    try testing.expect(broker.handleRequest(buf[0..req_len]) == null);
+    const response = broker.handleRequest(buf[0..req_len]);
+    try testing.expect(response != null);
+    defer testing.allocator.free(response.?);
+
+    try expectProduceErrorResponseBytes(response.?, 9, 310, ErrorCode.invalid_request);
 }
 
 test "Broker.handleRequest Produce rejects trailing bytes" {
@@ -37334,7 +37402,122 @@ test "Broker.handleRequest Produce rejects trailing bytes" {
     var pos = buildTestRequest(&buf, 0, 9, 320, header_mod.requestHeaderVersion(0, 9));
     req.serialize(&buf, &pos, 9);
 
-    try expectTrailingByteRejected(&broker, &buf, pos);
+    try testing.expect(pos < buf.len);
+    buf[pos] = 0x7f;
+    const response = broker.handleRequest(buf[0 .. pos + 1]);
+    try testing.expect(response != null);
+    defer testing.allocator.free(response.?);
+
+    try expectProduceErrorResponseBytes(response.?, 9, 320, ErrorCode.invalid_request);
+}
+
+test "Broker.handleRequest Produce fails closed when response materialization fails" {
+    const Req = generated.produce_request.ProduceRequest;
+    const Topic = Req.TopicProduceData;
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+
+    const topics = [_]Topic{.{
+        .name = "produce-materialize-fail-topic",
+        .partition_data = &.{},
+    }};
+    const req = Req{
+        .transactional_id = null,
+        .acks = 1,
+        .timeout_ms = 30000,
+        .topic_data = &topics,
+    };
+
+    var buf: [512]u8 = undefined;
+    var pos = buildTestRequest(&buf, 0, 9, 321, header_mod.requestHeaderVersion(0, 9));
+    req.serialize(&buf, &pos, 9);
+
+    var failing_allocator = OneShotFailingAllocator.init(testing.allocator, 1);
+    const response_allocator = failing_allocator.allocator();
+    broker.allocator = response_allocator;
+
+    const response = broker.handleRequest(buf[0..pos]);
+    broker.allocator = testing.allocator;
+
+    defer if (response) |bytes| response_allocator.free(bytes);
+    try testing.expect(failing_allocator.failed);
+    try testing.expect(response != null);
+
+    try expectProduceErrorResponseBytes(response.?, 9, 321, ErrorCode.kafka_storage_error);
+}
+
+test "Broker.handleRequest Produce fails closed when partition response materialization fails" {
+    const Req = generated.produce_request.ProduceRequest;
+    const Topic = Req.TopicProduceData;
+    const Partition = Topic.PartitionProduceData;
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+    try testing.expect(broker.ensureTopic("produce-partition-materialize-fail-topic"));
+
+    const partitions = [_]Partition{.{
+        .index = 0,
+        .records = "produce-partition-materialize-records",
+    }};
+    const topics = [_]Topic{.{
+        .name = "produce-partition-materialize-fail-topic",
+        .partition_data = &partitions,
+    }};
+    const req = Req{
+        .transactional_id = null,
+        .acks = 1,
+        .timeout_ms = 30000,
+        .topic_data = &topics,
+    };
+
+    var buf: [512]u8 = undefined;
+    var pos = buildTestRequest(&buf, 0, 9, 322, header_mod.requestHeaderVersion(0, 9));
+    req.serialize(&buf, &pos, 9);
+
+    var failing_allocator = OneShotFailingAllocator.init(testing.allocator, 3);
+    const response_allocator = failing_allocator.allocator();
+    broker.allocator = response_allocator;
+
+    const response = broker.handleRequest(buf[0..pos]);
+    broker.allocator = testing.allocator;
+
+    defer if (response) |bytes| response_allocator.free(bytes);
+    try testing.expect(failing_allocator.failed);
+    try testing.expect(response != null);
+
+    try expectProduceErrorResponseBytes(response.?, 9, 322, ErrorCode.kafka_storage_error);
+}
+
+test "Broker.handleRequest Produce fails closed when serialization fails" {
+    const Req = generated.produce_request.ProduceRequest;
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+
+    const req = Req{
+        .transactional_id = null,
+        .acks = 1,
+        .timeout_ms = 30000,
+        .topic_data = &.{},
+    };
+
+    var buf: [128]u8 = undefined;
+    var pos = buildTestRequest(&buf, 0, 9, 323, header_mod.requestHeaderVersion(0, 9));
+    req.serialize(&buf, &pos, 9);
+
+    var failing_allocator = OneShotFailingAllocator.init(testing.allocator, 0);
+    const response_allocator = failing_allocator.allocator();
+    broker.allocator = response_allocator;
+
+    const response = broker.handleRequest(buf[0..pos]);
+    broker.allocator = testing.allocator;
+
+    defer if (response) |bytes| response_allocator.free(bytes);
+    try testing.expect(failing_allocator.failed);
+    try testing.expect(response != null);
+
+    try expectProduceErrorResponseBytes(response.?, 9, 323, ErrorCode.kafka_storage_error);
 }
 
 test "Broker.handleRequest ListGroups v4 returns generated filtered groups" {
@@ -61524,7 +61707,11 @@ test "Broker.handleRequest Fetch rejects truncated request" {
 
     var buf: [128]u8 = undefined;
     const req_len = buildTestRequest(&buf, 1, 12, 113, header_mod.requestHeaderVersion(1, 12));
-    try testing.expect(broker.handleRequest(buf[0..req_len]) == null);
+    const response = broker.handleRequest(buf[0..req_len]);
+    try testing.expect(response != null);
+    defer testing.allocator.free(response.?);
+
+    try expectFetchErrorResponseBytes(response.?, 12, 113, ErrorCode.invalid_request);
 }
 
 test "Broker.handleRequest Fetch rejects trailing bytes" {
@@ -61563,7 +61750,140 @@ test "Broker.handleRequest Fetch rejects trailing bytes" {
     var pos = buildTestRequest(&buf, 1, 12, 118, header_mod.requestHeaderVersion(1, 12));
     req.serialize(&buf, &pos, 12);
 
-    try expectTrailingByteRejected(&broker, &buf, pos);
+    try testing.expect(pos < buf.len);
+    buf[pos] = 0x7f;
+    const response = broker.handleRequest(buf[0 .. pos + 1]);
+    try testing.expect(response != null);
+    defer testing.allocator.free(response.?);
+
+    try expectFetchErrorResponseBytes(response.?, 12, 118, ErrorCode.invalid_request);
+}
+
+test "Broker.handleRequest Fetch fails closed when response materialization fails" {
+    const Req = generated.fetch_request.FetchRequest;
+    const Topic = Req.FetchTopic;
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+
+    const topics = [_]Topic{.{
+        .topic = "fetch-materialize-fail-topic",
+        .partitions = &.{},
+    }};
+    const req = Req{
+        .replica_id = -1,
+        .max_wait_ms = 500,
+        .min_bytes = 1,
+        .max_bytes = 1048576,
+        .isolation_level = 0,
+        .session_id = 0,
+        .session_epoch = 0,
+        .topics = &topics,
+        .rack_id = "",
+    };
+
+    var buf: [512]u8 = undefined;
+    var pos = buildTestRequest(&buf, 1, 12, 119, header_mod.requestHeaderVersion(1, 12));
+    req.serialize(&buf, &pos, 12);
+
+    var failing_allocator = OneShotFailingAllocator.init(testing.allocator, 1);
+    const response_allocator = failing_allocator.allocator();
+    broker.allocator = response_allocator;
+
+    const response = broker.handleRequest(buf[0..pos]);
+    broker.allocator = testing.allocator;
+
+    defer if (response) |bytes| response_allocator.free(bytes);
+    try testing.expect(failing_allocator.failed);
+    try testing.expect(response != null);
+
+    try expectFetchErrorResponseBytes(response.?, 12, 119, ErrorCode.kafka_storage_error);
+}
+
+test "Broker.handleRequest Fetch fails closed when partition response materialization fails" {
+    const Req = generated.fetch_request.FetchRequest;
+    const Topic = Req.FetchTopic;
+    const Partition = Topic.FetchPartition;
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+
+    const partitions = [_]Partition{.{
+        .partition = 0,
+        .current_leader_epoch = -1,
+        .fetch_offset = 0,
+        .last_fetched_epoch = -1,
+        .log_start_offset = 0,
+        .partition_max_bytes = 1048576,
+    }};
+    const topics = [_]Topic{.{
+        .topic = "fetch-partition-materialize-fail-topic",
+        .partitions = &partitions,
+    }};
+    const req = Req{
+        .replica_id = -1,
+        .max_wait_ms = 500,
+        .min_bytes = 1,
+        .max_bytes = 1048576,
+        .isolation_level = 0,
+        .session_id = 0,
+        .session_epoch = 0,
+        .topics = &topics,
+        .rack_id = "",
+    };
+
+    var buf: [512]u8 = undefined;
+    var pos = buildTestRequest(&buf, 1, 12, 120, header_mod.requestHeaderVersion(1, 12));
+    req.serialize(&buf, &pos, 12);
+
+    var failing_allocator = OneShotFailingAllocator.init(testing.allocator, 3);
+    const response_allocator = failing_allocator.allocator();
+    broker.allocator = response_allocator;
+
+    const response = broker.handleRequest(buf[0..pos]);
+    broker.allocator = testing.allocator;
+
+    defer if (response) |bytes| response_allocator.free(bytes);
+    try testing.expect(failing_allocator.failed);
+    try testing.expect(response != null);
+
+    try expectFetchErrorResponseBytes(response.?, 12, 120, ErrorCode.kafka_storage_error);
+}
+
+test "Broker.handleRequest Fetch fails closed when serialization fails" {
+    const Req = generated.fetch_request.FetchRequest;
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+
+    const req = Req{
+        .replica_id = -1,
+        .max_wait_ms = 500,
+        .min_bytes = 1,
+        .max_bytes = 1048576,
+        .isolation_level = 0,
+        .session_id = 0,
+        .session_epoch = 0,
+        .topics = &.{},
+        .rack_id = "",
+    };
+
+    var buf: [256]u8 = undefined;
+    var pos = buildTestRequest(&buf, 1, 12, 121, header_mod.requestHeaderVersion(1, 12));
+    req.serialize(&buf, &pos, 12);
+
+    var failing_allocator = OneShotFailingAllocator.init(testing.allocator, 0);
+    const response_allocator = failing_allocator.allocator();
+    broker.allocator = response_allocator;
+
+    const response = broker.handleRequest(buf[0..pos]);
+    broker.allocator = testing.allocator;
+
+    defer if (response) |bytes| response_allocator.free(bytes);
+    try testing.expect(failing_allocator.failed);
+    try testing.expect(response != null);
+
+    try expectFetchErrorResponseBytes(response.?, 12, 121, ErrorCode.kafka_storage_error);
 }
 
 test "Broker.handleRequest ListOffsets v1 returns generated latest offset" {
