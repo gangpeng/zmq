@@ -647,9 +647,10 @@ Status: completed for the initial catalog and DeleteGroups slice.
   Delegation-token authorization-denial builders now also return generated
   top-level invalid-request or storage-error responses for malformed denied
   frames and denial response serialization failures.
-  Vote, BeginQuorumEpoch, and EndQuorumEpoch authorization-denial builders now
-  fail closed with generated invalid-request or storage-error responses when
-  denied quorum frames or denial response construction fail.
+  Vote, BeginQuorumEpoch, EndQuorumEpoch, and DescribeQuorum
+  authorization-denial builders now fail closed with generated invalid-request
+  or storage-error responses when denied quorum frames or denial response
+  construction or serialization fail.
   Transaction authorization-denial builders now also fail closed: malformed
   AddPartitionsToTxn, WriteTxnMarkers, and TxnOffsetCommit denied frames return
   generated invalid-request responses, and InitProducerId,

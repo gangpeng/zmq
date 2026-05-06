@@ -9609,6 +9609,20 @@ pub const Broker = struct {
             .topics = &.{},
             .nodes = &.{},
         };
+        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version) orelse {
+            log.warn("DescribeQuorum denied response serialization failed", .{});
+            return self.describeQuorumErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error, "Failed to serialize DescribeQuorum authorization response");
+        };
+    }
+
+    fn describeQuorumErrorResponse(self: *Broker, req_header: *const RequestHeader, resp_header_version: i16, api_version: i16, err_code: ErrorCode, message: ?[]const u8) ?[]u8 {
+        const Resp = generated.describe_quorum_response.DescribeQuorumResponse;
+        const resp = Resp{
+            .error_code = err_code.toInt(),
+            .error_message = if (api_version >= 2) message else null,
+            .topics = &.{},
+            .nodes = &.{},
+        };
         return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
     }
 
@@ -55736,6 +55750,34 @@ test "Broker.handleRequest DescribeQuorum authorization denial uses generated re
     try testing.expect(resp.error_message != null);
     try testing.expectEqual(@as(usize, 0), resp.topics.len);
     try testing.expectEqual(@as(usize, 0), resp.nodes.len);
+}
+
+test "Broker.handleRequest DescribeQuorum authorization denial fails closed when serialization fails" {
+    const Req = generated.describe_quorum_request.DescribeQuorumRequest;
+    const Resp = generated.describe_quorum_response.DescribeQuorumResponse;
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+    try broker.authorizer.addAcl("other-client", .cluster, "*", .literal, .describe, .allow, "*");
+
+    const req = Req{};
+    var buf: [256]u8 = undefined;
+    var pos = buildTestRequest(&buf, 55, 2, 5508, header_mod.requestHeaderVersion(55, 2));
+    req.serialize(&buf, &pos, 2);
+
+    var failing_allocator = OneShotFailingAllocator.init(testing.allocator, 0);
+    const response_allocator = failing_allocator.allocator();
+    broker.allocator = response_allocator;
+
+    const response = broker.handleRequest(buf[0..pos]);
+    broker.allocator = testing.allocator;
+
+    try testing.expect(failing_allocator.failed);
+    try testing.expect(response != null);
+    defer response_allocator.free(response.?);
+
+    const error_code = try readGeneratedTopLevelErrorCode(Resp, response.?, 55, 2, 5508);
+    try testing.expectEqual(ErrorCode.kafka_storage_error.toInt(), error_code);
 }
 
 test "Broker.handleRequest Vote returns request-scoped generated response" {
