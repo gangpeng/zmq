@@ -1010,6 +1010,247 @@ def wait_for_offset_commit(port, group, topic, expected_offset, timeout=30):
     )
 
 
+def parse_offset_fetch_grouped_response(response, correlation_id):
+    pos = parse_flexible_response_header(response, correlation_id)
+    _, pos = read_i32(response, pos)  # throttle_time_ms
+    group_count, pos = read_compact_array_len(response, pos)
+    groups = []
+    for _ in range(group_count):
+        group_id, pos = read_compact_string(response, pos)
+        topic_count, pos = read_compact_array_len(response, pos)
+        topics = []
+        for _ in range(topic_count):
+            topic_name, pos = read_compact_string(response, pos)
+            partition_count, pos = read_compact_array_len(response, pos)
+            partitions = []
+            for _ in range(partition_count):
+                partition_index, pos = read_i32(response, pos)
+                committed_offset, pos = read_i64(response, pos)
+                committed_leader_epoch, pos = read_i32(response, pos)
+                metadata, pos = read_compact_string(response, pos)
+                error_code, pos = read_i16(response, pos)
+                pos = skip_tags(response, pos)
+                partitions.append(
+                    {
+                        "partition": partition_index,
+                        "offset": committed_offset,
+                        "leader_epoch": committed_leader_epoch,
+                        "metadata": metadata,
+                        "error_code": error_code,
+                    }
+                )
+            pos = skip_tags(response, pos)
+            topics.append({"name": topic_name, "partitions": partitions})
+        error_code, pos = read_i16(response, pos)
+        pos = skip_tags(response, pos)
+        groups.append(
+            {
+                "group_id": group_id,
+                "topics": topics,
+                "error_code": error_code,
+            }
+        )
+    pos = skip_tags(response, pos)
+    if pos != len(response):
+        raise TestError(
+            f"OffsetFetch v8 response trailing bytes: {len(response) - pos}"
+        )
+    return groups
+
+
+def offset_fetch_grouped(port, group_requests, correlation_id, require_stable=False):
+    body = bytearray(write_compact_array_len(len(group_requests)))
+    for group_request in group_requests:
+        body += write_compact_string(group_request["group_id"])
+        topics = group_request.get("topics")
+        if topics is None:
+            body += b"\x00"  # null topics fetches all committed offsets.
+        else:
+            body += write_compact_array_len(len(topics))
+            for topic_request in topics:
+                body += write_compact_string(topic_request["name"])
+                body += write_compact_i32_array(topic_request["partitions"])
+                body += b"\x00"  # topic tagged fields
+        body += b"\x00"  # group tagged fields
+    body += b"\x01" if require_stable else b"\x00"
+    body += b"\x00"  # request tagged fields
+
+    response = flexible_kafka_request(port, 9, 8, correlation_id, bytes(body))
+    return parse_offset_fetch_grouped_response(response, correlation_id)
+
+
+def assert_offset_fetch_grouped(port, group_requests, expected_groups, correlation_id):
+    groups = offset_fetch_grouped(port, group_requests, correlation_id)
+    if len(groups) != len(expected_groups):
+        raise TestError(
+            f"OffsetFetch v8 group count={len(groups)} expected={len(expected_groups)} "
+            f"groups={groups}"
+        )
+
+    for group_idx, (group, expected_group) in enumerate(zip(groups, expected_groups)):
+        if group["group_id"] != expected_group["group_id"]:
+            raise TestError(
+                f"OffsetFetch v8 group[{group_idx}] id={group['group_id']!r} "
+                f"expected={expected_group['group_id']!r}"
+            )
+        expected_group_error = expected_group.get("error_code", 0)
+        if group["error_code"] != expected_group_error:
+            raise TestError(
+                f"OffsetFetch v8 group[{group_idx}] error={group['error_code']} "
+                f"expected={expected_group_error} group={group}"
+            )
+
+        expected_topics = expected_group.get("topics", [])
+        if len(group["topics"]) != len(expected_topics):
+            raise TestError(
+                f"OffsetFetch v8 group[{group_idx}] topic count={len(group['topics'])} "
+                f"expected={len(expected_topics)} group={group}"
+            )
+        for topic_idx, (actual_topic, expected_topic) in enumerate(
+            zip(group["topics"], expected_topics)
+        ):
+            if actual_topic["name"] != expected_topic["name"]:
+                raise TestError(
+                    f"OffsetFetch v8 group[{group_idx}] topic[{topic_idx}] "
+                    f"name={actual_topic['name']!r} expected={expected_topic['name']!r}"
+                )
+            expected_partitions = expected_topic.get("partitions", [])
+            if len(actual_topic["partitions"]) != len(expected_partitions):
+                raise TestError(
+                    f"OffsetFetch v8 group[{group_idx}] topic[{topic_idx}] "
+                    f"partition count={len(actual_topic['partitions'])} "
+                    f"expected={len(expected_partitions)} topic={actual_topic}"
+                )
+            for partition_idx, (actual_partition, expected_partition) in enumerate(
+                zip(actual_topic["partitions"], expected_partitions)
+            ):
+                for key in ("partition", "offset", "error_code"):
+                    if actual_partition[key] != expected_partition[key]:
+                        raise TestError(
+                            f"OffsetFetch v8 group[{group_idx}] topic[{topic_idx}] "
+                            f"partition[{partition_idx}] {key}={actual_partition[key]} "
+                            f"expected={expected_partition[key]} "
+                            f"partition={actual_partition}"
+                        )
+                if "metadata" in expected_partition and (
+                    actual_partition["metadata"] != expected_partition["metadata"]
+                ):
+                    raise TestError(
+                        f"OffsetFetch v8 group[{group_idx}] topic[{topic_idx}] "
+                        f"partition[{partition_idx}] metadata="
+                        f"{actual_partition['metadata']!r} "
+                        f"expected={expected_partition['metadata']!r}"
+                    )
+
+
+def wait_for_offset_fetch_grouped_checkpoint(
+    port,
+    group,
+    topic,
+    committed_offset,
+    offset_delete_group,
+    delete_groups_group,
+    txn_offset_group,
+    txn_offset_committed_offset,
+    timeout=30,
+):
+    deadline = time.time() + timeout
+    correlation_id = 8050
+    last_error = None
+    group_requests = [
+        {
+            "group_id": group,
+            "topics": [{"name": topic, "partitions": [0]}],
+        },
+        {
+            "group_id": group,
+            "topics": None,
+        },
+        {
+            "group_id": offset_delete_group,
+            "topics": [{"name": topic, "partitions": [0]}],
+        },
+        {
+            "group_id": delete_groups_group,
+            "topics": [{"name": topic, "partitions": [0]}],
+        },
+        {
+            "group_id": txn_offset_group,
+            "topics": [{"name": topic, "partitions": [0]}],
+        },
+    ]
+    committed_topic = {
+        "name": topic,
+        "partitions": [
+            {
+                "partition": 0,
+                "offset": committed_offset,
+                "metadata": "kraft-failover",
+                "error_code": 0,
+            }
+        ],
+    }
+    expected_groups = [
+        {
+            "group_id": group,
+            "topics": [committed_topic],
+        },
+        {
+            "group_id": group,
+            "topics": [committed_topic],
+        },
+        {
+            "group_id": offset_delete_group,
+            "topics": [
+                {
+                    "name": topic,
+                    "partitions": [
+                        {
+                            "partition": 0,
+                            "offset": -1,
+                            "metadata": None,
+                            "error_code": 0,
+                        }
+                    ],
+                }
+            ],
+        },
+        {
+            "group_id": delete_groups_group,
+            "topics": [],
+            "error_code": ERROR_GROUP_ID_NOT_FOUND,
+        },
+        {
+            "group_id": txn_offset_group,
+            "topics": [
+                {
+                    "name": topic,
+                    "partitions": [
+                        {
+                            "partition": 0,
+                            "offset": txn_offset_committed_offset,
+                            "metadata": "kraft-failover-txn",
+                            "error_code": 0,
+                        }
+                    ],
+                }
+            ],
+        },
+    ]
+
+    while time.time() < deadline:
+        try:
+            assert_offset_fetch_grouped(
+                port, group_requests, expected_groups, correlation_id
+            )
+            return
+        except Exception as exc:
+            last_error = exc
+        correlation_id += 1
+        time.sleep(0.25)
+    raise TestError(f"OffsetFetch v8 grouped checkpoint did not recover: {last_error}")
+
+
 def parse_offset_delete_response(response, correlation_id, expected_topic):
     pos = 0
     response_correlation, pos = read_i32(response, pos)
@@ -4680,6 +4921,16 @@ def main():
             kip848_group_state,
             topic,
         )
+        wait_for_offset_fetch_grouped_checkpoint(
+            broker["port"],
+            group,
+            topic,
+            committed_offset,
+            offset_delete_group,
+            delete_groups_group,
+            txn_offset_group,
+            txn_offset_committed_offset,
+        )
 
         network_partition_result = run_network_partition_matrix(
             processes, broker, topic, expected_payloads, leader_id
@@ -4693,6 +4944,16 @@ def main():
         )
         wait_for_committed_offset(
             broker["port"], txn_offset_group, topic, txn_offset_committed_offset
+        )
+        wait_for_offset_fetch_grouped_checkpoint(
+            broker["port"],
+            group,
+            topic,
+            committed_offset,
+            offset_delete_group,
+            delete_groups_group,
+            txn_offset_group,
+            txn_offset_committed_offset,
         )
         wait_for_group_heartbeat(broker["port"], offset_delete_group_state)
         wait_for_transaction_introspection(
@@ -4734,6 +4995,16 @@ def main():
         )
         wait_for_committed_offset(
             broker["port"], txn_offset_group, topic, txn_offset_committed_offset
+        )
+        wait_for_offset_fetch_grouped_checkpoint(
+            broker["port"],
+            group,
+            topic,
+            committed_offset,
+            offset_delete_group,
+            delete_groups_group,
+            txn_offset_group,
+            txn_offset_committed_offset,
         )
         wait_for_group_heartbeat(broker["port"], offset_delete_group_state)
         wait_for_transaction_end(broker["port"], txn_offset_txn)
@@ -4804,6 +5075,16 @@ def main():
         wait_for_committed_offset(
             broker["port"], txn_offset_group, topic, txn_offset_committed_offset
         )
+        wait_for_offset_fetch_grouped_checkpoint(
+            broker["port"],
+            group,
+            topic,
+            committed_offset,
+            offset_delete_group,
+            delete_groups_group,
+            txn_offset_group,
+            txn_offset_committed_offset,
+        )
         wait_for_group_heartbeat(broker["port"], offset_delete_group_state)
         wait_for_transaction_introspection(
             broker["port"], controller_failover_txn, "CompleteCommit"
@@ -4868,6 +5149,16 @@ def main():
         )
         wait_for_committed_offset(
             broker["port"], txn_offset_group, topic, txn_offset_committed_offset
+        )
+        wait_for_offset_fetch_grouped_checkpoint(
+            broker["port"],
+            group,
+            topic,
+            committed_offset,
+            offset_delete_group,
+            delete_groups_group,
+            txn_offset_group,
+            txn_offset_committed_offset,
         )
         wait_for_group_heartbeat(broker["port"], offset_delete_group_state)
         wait_for_transaction_introspection(
@@ -4941,6 +5232,16 @@ def main():
         )
         wait_for_committed_offset(
             broker["port"], txn_offset_group, topic, txn_offset_committed_offset
+        )
+        wait_for_offset_fetch_grouped_checkpoint(
+            broker["port"],
+            group,
+            topic,
+            committed_offset,
+            offset_delete_group,
+            delete_groups_group,
+            txn_offset_group,
+            txn_offset_committed_offset,
         )
         wait_for_group_heartbeat(broker["port"], offset_delete_group_state)
         wait_for_transaction_introspection(
@@ -5069,6 +5370,16 @@ def main():
         wait_for_payloads(broker["port"], topic, expected_payloads)
         committed_offset = fifth_offset + 1
         wait_for_offset_commit(broker["port"], group, topic, committed_offset)
+        wait_for_offset_fetch_grouped_checkpoint(
+            broker["port"],
+            group,
+            topic,
+            committed_offset,
+            offset_delete_group,
+            delete_groups_group,
+            txn_offset_group,
+            txn_offset_committed_offset,
+        )
 
         automq_result = run_automq_metadata_failover_scenario(tmp)
 
@@ -5093,6 +5404,7 @@ def main():
             f"transaction_introspection_checked=true, "
             f"transaction_abort_checked=true, "
             f"txn_offset_commit_checked=true, "
+            f"offset_fetch_v8_grouped_checked=true, "
             f"idempotent_producer_fencing=true, "
             f"delete_groups_checked=true, "
             f"classic_group_heartbeats=true, "
@@ -5202,6 +5514,42 @@ def self_test():
             or missing_fetch["error_code"] != ERROR_GROUP_ID_NOT_FOUND
         ):
             raise TestError(f"OffsetFetch error fixture parser failed: {missing_fetch}")
+        grouped_fetch_fixture = struct.pack(">i", 243)
+        grouped_fetch_fixture += b"\x00"  # response header tagged fields
+        grouped_fetch_fixture += struct.pack(">i", 0)
+        grouped_fetch_fixture += write_compact_array_len(2)
+        grouped_fetch_fixture += write_compact_string("grouped-offset-self-test")
+        grouped_fetch_fixture += write_compact_array_len(1)
+        grouped_fetch_fixture += write_compact_string("offset-self-test")
+        grouped_fetch_fixture += write_compact_array_len(1)
+        grouped_fetch_fixture += struct.pack(">iqi", 0, 9, -1)
+        grouped_fetch_fixture += write_compact_string("kraft-failover")
+        grouped_fetch_fixture += struct.pack(">h", 0)
+        grouped_fetch_fixture += b"\x00"  # partition tagged fields
+        grouped_fetch_fixture += b"\x00"  # topic tagged fields
+        grouped_fetch_fixture += struct.pack(">h", 0)
+        grouped_fetch_fixture += b"\x00"  # group tagged fields
+        grouped_fetch_fixture += write_compact_string("missing-grouped-offset-self-test")
+        grouped_fetch_fixture += write_compact_array_len(0)
+        grouped_fetch_fixture += struct.pack(">h", ERROR_GROUP_ID_NOT_FOUND)
+        grouped_fetch_fixture += b"\x00"  # group tagged fields
+        grouped_fetch_fixture += b"\x00"  # response tagged fields
+        grouped_fetch = parse_offset_fetch_grouped_response(
+            grouped_fetch_fixture, 243
+        )
+        if (
+            len(grouped_fetch) != 2
+            or grouped_fetch[0]["group_id"] != "grouped-offset-self-test"
+            or grouped_fetch[0]["topics"][0]["partitions"][0]["offset"] != 9
+            or grouped_fetch[0]["topics"][0]["partitions"][0]["metadata"]
+            != "kraft-failover"
+            or grouped_fetch[1]["group_id"] != "missing-grouped-offset-self-test"
+            or grouped_fetch[1]["topics"]
+            or grouped_fetch[1]["error_code"] != ERROR_GROUP_ID_NOT_FOUND
+        ):
+            raise TestError(
+                f"OffsetFetch v8 grouped fixture parser failed: {grouped_fetch}"
+            )
 
         delete_fixture = struct.pack(">ihi", 144, 0, 0)
         delete_fixture += struct.pack(">i", 1)
