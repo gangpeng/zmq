@@ -257,6 +257,8 @@ DescribeQuorum and FetchSnapshot response materialization now fail closed
 without leaking partially built endpoint metadata when allocation fails;
 Vote response topic materialization now fails closed before mutating vote state
 when allocation fails;
+generated VoteRequest decode now frees partially materialized topic arrays when
+nested allocation fails before handler validation;
 ControllerRegistration, AddRaftVoter, and UpdateRaftVoter endpoint
 materialization now return storage errors without mutating voter state when
 allocation fails;

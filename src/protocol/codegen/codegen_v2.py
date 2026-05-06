@@ -772,6 +772,7 @@ class CodeGen:
                 lines.append(f'{pad}        result.{zig_name} = &.{{}};')
                 lines.append(f'{pad}    }} else {{')
                 lines.append(f'{pad}        const {zig_name}_items = try alloc.alloc({inner}, len);')
+                lines.append(f'{pad}        errdefer alloc.free({zig_name}_items);')
                 lines.append(f'{pad}        for ({zig_name}_items) |*item| {{')
                 lines.append(f'{pad}            item.* = try {inner}.deserialize(alloc, buf, pos, version);')
                 lines.append(f'{pad}        }}')
@@ -783,6 +784,7 @@ class CodeGen:
             else:
                 lines.append(f'{pad}if ({zig_name}_len > 0) {{')
                 lines.append(f'{pad}    const {zig_name}_items = try alloc.alloc({inner}, {zig_name}_len);')
+                lines.append(f'{pad}    errdefer alloc.free({zig_name}_items);')
                 lines.append(f'{pad}    for ({zig_name}_items) |*item| {{')
                 lines.append(f'{pad}        item.* = try {inner}.deserialize(alloc, buf, pos, version);')
                 lines.append(f'{pad}    }}')
@@ -798,12 +800,14 @@ class CodeGen:
                 lines.append(f'{pad}        result.{zig_name} = &.{{}};')
                 lines.append(f'{pad}    }} else {{')
                 lines.append(f'{pad}        const {zig_name}_items = try alloc.alloc({item_type}, len);')
+                lines.append(f'{pad}        errdefer alloc.free({zig_name}_items);')
                 lines.append(f'{pad}        for ({zig_name}_items) |*item| {{')
                 item_pad = pad + '            '
                 close_pad = pad + '        '
             else:
                 lines.append(f'{pad}if ({zig_name}_len > 0) {{')
                 lines.append(f'{pad}    const {zig_name}_items = try alloc.alloc({item_type}, {zig_name}_len);')
+                lines.append(f'{pad}    errdefer alloc.free({zig_name}_items);')
                 lines.append(f'{pad}    for ({zig_name}_items) |*item| {{')
                 item_pad = pad + '        '
                 close_pad = pad + '    '

@@ -86,7 +86,7 @@ pub const VoteRequest = struct {
         /// The topic name.
         /// Versions: 0+
         topic_name: ?[]const u8 = null,
-        /// 
+        ///
         /// Versions: 0+
         partitions: []const PartitionData = &.{},
 
@@ -105,6 +105,7 @@ pub const VoteRequest = struct {
             const partitions_len: usize = (try ser.readCompactArrayLen(buf, pos)) orelse 0;
             if (partitions_len > 0) {
                 const partitions_items = try alloc.alloc(PartitionData, partitions_len);
+                errdefer alloc.free(partitions_items);
                 for (partitions_items) |*item| {
                     item.* = try PartitionData.deserialize(alloc, buf, pos, version);
                 }
@@ -126,13 +127,13 @@ pub const VoteRequest = struct {
         }
     };
 
-    /// 
+    ///
     /// Versions: 0+
     cluster_id: ?[]const u8 = null,
     /// The replica id of the voter receiving the request
     /// Versions: 1+
     voter_id: i32 = -1,
-    /// 
+    ///
     /// Versions: 0+
     topics: []const TopicData = &.{},
 
@@ -157,8 +158,16 @@ pub const VoteRequest = struct {
         const topics_len: usize = (try ser.readCompactArrayLen(buf, pos)) orelse 0;
         if (topics_len > 0) {
             const topics_items = try alloc.alloc(TopicData, topics_len);
+            var topics_init: usize = 0;
+            errdefer {
+                for (topics_items[0..topics_init]) |topic| {
+                    if (topic.partitions.len > 0) alloc.free(topic.partitions);
+                }
+                alloc.free(topics_items);
+            }
             for (topics_items) |*item| {
                 item.* = try TopicData.deserialize(alloc, buf, pos, version);
+                topics_init += 1;
             }
             result.topics = topics_items;
         }

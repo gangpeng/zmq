@@ -2653,6 +2653,42 @@ test "Controller handleRequest Vote fails closed on response topic materializati
     try testing.expect(saw_storage_error);
 }
 
+test "Controller handleRequest Vote request decode failure frees partial generated arrays" {
+    const Req = generated.vote_request.VoteRequest;
+    const Resp = generated.vote_response.VoteResponse;
+
+    var ctrl = Controller.init(testing.allocator, 1, "test-cluster");
+    defer ctrl.deinit();
+    try ctrl.raft_state.addVoter(2);
+
+    var buf: [256]u8 = undefined;
+    var pos = buildTestRequest(&buf, 52, 0, 14, header_mod.requestHeaderVersion(52, 0));
+    const partitions = [_]Req.TopicData.PartitionData{.{
+        .partition_index = 0,
+        .candidate_epoch = 1,
+        .candidate_id = 2,
+        .last_offset_epoch = 0,
+        .last_offset = 0,
+    }};
+    const topics = [_]Req.TopicData{.{ .topic_name = "__cluster_metadata", .partitions = &partitions }};
+    const req = Req{ .cluster_id = null, .topics = &topics };
+    req.serialize(&buf, &pos, 0);
+
+    var failing_allocator = OneShotFailingAllocator.init(testing.allocator, 1);
+    const response_allocator = failing_allocator.allocator();
+    ctrl.allocator = response_allocator;
+    const response = ctrl.handleRequest(buf[0..pos]);
+    ctrl.allocator = testing.allocator;
+
+    try testing.expect(failing_allocator.failed);
+    try testing.expect(response != null);
+    defer response_allocator.free(response.?);
+    const error_code = try readControllerErrorCode(Resp, response.?, 52, 0, 14);
+    try testing.expectEqual(ErrorCode.invalid_request.toInt(), error_code);
+    try testing.expectEqual(@as(i32, 0), ctrl.raft_state.current_epoch);
+    try testing.expectEqual(@as(?i32, null), ctrl.raft_state.voted_for);
+}
+
 test "Controller handleRequest Vote rejects stale epoch" {
     const Req = generated.vote_request.VoteRequest;
     const Resp = generated.vote_response.VoteResponse;
