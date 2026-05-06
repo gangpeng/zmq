@@ -1891,6 +1891,83 @@ def wait_for_consumer_group_description(port, group_state, timeout=30):
     )
 
 
+def parse_list_groups_response(response, correlation_id):
+    pos = parse_flexible_response_header(response, correlation_id)
+    _, pos = read_i32(response, pos)  # throttle_time_ms
+    error_code, pos = read_i16(response, pos)
+    group_count, pos = read_compact_array_len(response, pos)
+    groups = []
+    for _ in range(group_count):
+        group_id, pos = read_compact_string(response, pos)
+        protocol_type, pos = read_compact_string(response, pos)
+        group_state, pos = read_compact_string(response, pos)
+        group_type, pos = read_compact_string(response, pos)
+        pos = skip_tags(response, pos)
+        groups.append(
+            {
+                "group_id": group_id,
+                "protocol_type": protocol_type,
+                "group_state": group_state,
+                "group_type": group_type,
+            }
+        )
+    pos = skip_tags(response, pos)
+    if pos != len(response):
+        raise TestError(f"ListGroups response trailing bytes: {len(response) - pos}")
+    return {"error_code": error_code, "groups": groups}
+
+
+def list_groups(port, states, group_types, correlation_id):
+    body = write_compact_array_len(len(states))
+    for state in states:
+        body += write_compact_string(state)
+    body += write_compact_array_len(len(group_types))
+    for group_type in group_types:
+        body += write_compact_string(group_type)
+    body += b"\x00"  # request tagged fields
+    response = flexible_kafka_request(port, 16, 5, correlation_id, body)
+    return parse_list_groups_response(response, correlation_id)
+
+
+def assert_list_groups_contains(port, group_state, correlation_id):
+    listed = list_groups(port, ["Stable"], ["classic"], correlation_id)
+    if listed["error_code"] != 0:
+        raise TestError(f"ListGroups error_code={listed['error_code']}")
+    matching_group = next(
+        (
+            group
+            for group in listed["groups"]
+            if group["group_id"] == group_state["group_id"]
+        ),
+        None,
+    )
+    if matching_group is None:
+        raise TestError(f"ListGroups missing {group_state['group_id']!r}: {listed}")
+    if matching_group["protocol_type"] != "consumer":
+        raise TestError(f"ListGroups protocol mismatch: {matching_group}")
+    if matching_group["group_state"] != "Stable":
+        raise TestError(f"ListGroups state mismatch: {matching_group}")
+    if matching_group["group_type"] != "classic":
+        raise TestError(f"ListGroups type mismatch: {matching_group}")
+
+
+def wait_for_list_groups(port, group_state, timeout=30):
+    deadline = time.time() + timeout
+    correlation_id = 7500
+    last_error = None
+    while time.time() < deadline:
+        try:
+            assert_list_groups_contains(port, group_state, correlation_id)
+            return
+        except Exception as exc:
+            last_error = exc
+        correlation_id += 1
+        time.sleep(0.25)
+    raise TestError(
+        f"ListGroups did not retain {group_state['group_id']!r}: {last_error}"
+    )
+
+
 def parse_leave_group_response(response, correlation_id):
     pos = 0
     response_correlation, pos = read_i32(response, pos)
@@ -4233,6 +4310,7 @@ def main():
         )
         wait_for_group_description(broker["port"], classic_group_state)
         wait_for_consumer_group_description(broker["port"], classic_group_state)
+        wait_for_list_groups(broker["port"], classic_group_state)
 
         network_partition_result = run_network_partition_matrix(
             processes, broker, topic, expected_payloads, leader_id
@@ -4257,6 +4335,7 @@ def main():
         wait_for_group_heartbeat(broker["port"], classic_group_state)
         wait_for_group_description(broker["port"], classic_group_state)
         wait_for_consumer_group_description(broker["port"], classic_group_state)
+        wait_for_list_groups(broker["port"], classic_group_state)
 
         stop_process(processes[leader_id]["proc"], crash=True)
         replacement_leader, after = wait_for_leader(processes, forbidden_leaders={leader_id})
@@ -4295,6 +4374,7 @@ def main():
         wait_for_group_heartbeat(broker["port"], classic_group_state)
         wait_for_group_description(broker["port"], classic_group_state)
         wait_for_consumer_group_description(broker["port"], classic_group_state)
+        wait_for_list_groups(broker["port"], classic_group_state)
         expected_payloads.append(b"r1")
         second_offset = wait_for_produce(broker["port"], topic, expected_payloads[-1])
         if second_offset <= first_offset:
@@ -4343,6 +4423,7 @@ def main():
         wait_for_group_heartbeat(broker["port"], classic_group_state)
         wait_for_group_description(broker["port"], classic_group_state)
         wait_for_consumer_group_description(broker["port"], classic_group_state)
+        wait_for_list_groups(broker["port"], classic_group_state)
         expected_payloads.append(b"r2")
         third_offset = wait_for_produce(broker["port"], topic, expected_payloads[-1])
         if third_offset <= second_offset:
@@ -4396,6 +4477,7 @@ def main():
         wait_for_group_heartbeat(broker["port"], classic_group_state)
         wait_for_group_description(broker["port"], classic_group_state)
         wait_for_consumer_group_description(broker["port"], classic_group_state)
+        wait_for_list_groups(broker["port"], classic_group_state)
         expected_payloads.append(b"r3")
         fourth_offset = wait_for_produce(
             broker["port"], topic, expected_payloads[-1]
@@ -4461,6 +4543,7 @@ def main():
         wait_for_group_heartbeat(broker["port"], classic_group_state)
         wait_for_group_description(broker["port"], classic_group_state)
         wait_for_consumer_group_description(broker["port"], classic_group_state)
+        wait_for_list_groups(broker["port"], classic_group_state)
         duplicate_idempotent = wait_for_record_batch_result(
             broker["port"],
             idempotent_topic,
@@ -4591,6 +4674,7 @@ def main():
             f"classic_group_heartbeats=true, "
             f"group_describe_checked=true, "
             f"consumer_group_describe_checked=true, "
+            f"list_groups_checked=true, "
             f"network_partition={network_partition_result}, "
             f"automq_old_leader_fresh_rejoin={automq_result['old_leader_fresh_rejoin']})"
         )
@@ -4859,6 +4943,26 @@ def self_test():
             raise TestError(
                 f"ConsumerGroupDescribe fixture parser failed: {consumer_described}"
             )
+
+        list_groups_fixture = struct.pack(">i", 57)
+        list_groups_fixture += b"\x00"  # response header tagged fields
+        list_groups_fixture += struct.pack(">ih", 0, 0)
+        list_groups_fixture += write_compact_array_len(1)
+        list_groups_fixture += write_compact_string("list-groups-self-test")
+        list_groups_fixture += write_compact_string("consumer")
+        list_groups_fixture += write_compact_string("Stable")
+        list_groups_fixture += write_compact_string("classic")
+        list_groups_fixture += b"\x00"  # group tagged fields
+        list_groups_fixture += b"\x00"  # response tagged fields
+        listed_groups = parse_list_groups_response(list_groups_fixture, 57)
+        if (
+            listed_groups["error_code"] != 0
+            or len(listed_groups["groups"]) != 1
+            or listed_groups["groups"][0]["group_id"] != "list-groups-self-test"
+            or listed_groups["groups"][0]["group_state"] != "Stable"
+            or listed_groups["groups"][0]["group_type"] != "classic"
+        ):
+            raise TestError(f"ListGroups fixture parser failed: {listed_groups}")
 
         leave_fixture = struct.pack(">ih", 50, 0)
         parse_leave_group_response(leave_fixture, 50)
