@@ -21615,19 +21615,22 @@ pub const Broker = struct {
 
         if (!validateAlterClientQuotasRequestFrame(request_bytes, body_start, api_version)) {
             log.warn("Malformed AlterClientQuotas request", .{});
-            return null;
+            return self.alterClientQuotasErrorResponse(req_header, resp_header_version, api_version, ErrorCode.invalid_request, "Invalid request");
         }
 
         var pos = body_start;
         var req = Req.deserialize(self.allocator, request_bytes, &pos, api_version) catch |err| {
             log.warn("Failed to decode AlterClientQuotas request: {}", .{err});
-            return null;
+            return self.alterClientQuotasErrorResponse(req_header, resp_header_version, api_version, ErrorCode.invalid_request, "Invalid request");
         };
         defer self.freeAlterClientQuotasRequest(&req);
 
         var responses: []EntryResponse = &.{};
         if (req.entries.len > 0) {
-            responses = self.allocator.alloc(EntryResponse, req.entries.len) catch return null;
+            responses = self.allocator.alloc(EntryResponse, req.entries.len) catch |err| {
+                log.warn("AlterClientQuotas response materialization failed: {}", .{err});
+                return self.alterClientQuotasErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error, "Failed to materialize client quota response");
+            };
         }
         var response_init: usize = 0;
         defer {
@@ -21636,14 +21639,54 @@ pub const Broker = struct {
         }
 
         for (req.entries) |entry| {
-            const outcome = self.applyAlterClientQuotaEntry(entry, req.validate_only) catch return null;
-            responses[response_init] = self.buildAlterClientQuotaResponseEntry(entry, outcome.error_code, outcome.error_message) catch return null;
+            const outcome = self.applyAlterClientQuotaEntry(entry, true) catch |err| blk: {
+                log.warn("AlterClientQuotas validation failed: {}", .{err});
+                break :blk AlterClientQuotaOutcome{
+                    .error_code = @intFromEnum(ErrorCode.kafka_storage_error),
+                    .error_message = "Failed to validate client quota mutation",
+                };
+            };
+            responses[response_init] = self.buildAlterClientQuotaResponseEntry(entry, outcome.error_code, outcome.error_message) catch |err| {
+                log.warn("AlterClientQuotas response-entry materialization failed: {}", .{err});
+                return self.alterClientQuotasErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error, "Failed to materialize client quota response");
+            };
             response_init += 1;
+        }
+
+        if (!req.validate_only) {
+            for (req.entries, 0..) |entry, i| {
+                if (responses[i].error_code != @intFromEnum(ErrorCode.none)) continue;
+                const outcome = self.applyAlterClientQuotaEntry(entry, false) catch |err| {
+                    log.warn("AlterClientQuotas mutation failed: {}", .{err});
+                    responses[i].error_code = @intFromEnum(ErrorCode.kafka_storage_error);
+                    responses[i].error_message = "Failed to apply client quota mutation";
+                    continue;
+                };
+                responses[i].error_code = outcome.error_code;
+                responses[i].error_message = outcome.error_message;
+            }
         }
 
         const resp = Resp{
             .throttle_time_ms = 0,
             .entries = responses[0..response_init],
+        };
+        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version) orelse {
+            log.warn("AlterClientQuotas response serialization failed", .{});
+            return self.alterClientQuotasErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error, "Failed to serialize client quota response");
+        };
+    }
+
+    fn alterClientQuotasErrorResponse(self: *Broker, req_header: *const RequestHeader, resp_header_version: i16, api_version: i16, err_code: ErrorCode, message: ?[]const u8) ?[]u8 {
+        const Resp = generated.alter_client_quotas_response.AlterClientQuotasResponse;
+        const entries = [_]Resp.EntryData{.{
+            .error_code = @intFromEnum(err_code),
+            .error_message = message,
+            .entity = &.{},
+        }};
+        const resp = Resp{
+            .throttle_time_ms = 0,
+            .entries = &entries,
         };
         return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
     }
@@ -29357,6 +29400,25 @@ fn freeDeserializedAlterClientQuotasResponse(resp: *const generated.alter_client
         if (entry.entity.len > 0) testing.allocator.free(entry.entity);
     }
     if (resp.entries.len > 0) testing.allocator.free(resp.entries);
+}
+
+fn expectAlterClientQuotasErrorResponseBytes(response: []const u8, correlation_id: i32, err_code: ErrorCode) !void {
+    const Resp = generated.alter_client_quotas_response.AlterClientQuotasResponse;
+
+    var rpos: usize = 0;
+    var response_header = try ResponseHeader.deserialize(testing.allocator, response, &rpos, header_mod.responseHeaderVersion(49, 1));
+    defer response_header.deinit(testing.allocator);
+    try testing.expectEqual(correlation_id, response_header.correlation_id);
+
+    const resp = try Resp.deserialize(testing.allocator, response, &rpos, 1);
+    defer freeDeserializedAlterClientQuotasResponse(&resp);
+
+    try testing.expectEqual(response.len, rpos);
+    try testing.expectEqual(@as(i32, 0), resp.throttle_time_ms);
+    try testing.expectEqual(@as(usize, 1), resp.entries.len);
+    try testing.expectEqual(@as(i16, @intFromEnum(err_code)), resp.entries[0].error_code);
+    try testing.expect(resp.entries[0].error_message != null);
+    try testing.expectEqual(@as(usize, 0), resp.entries[0].entity.len);
 }
 
 fn freeDeserializedDescribeUserScramCredentialsResponse(resp: *const generated.describe_user_scram_credentials_response.DescribeUserScramCredentialsResponse) void {
@@ -40034,7 +40096,11 @@ test "Broker.handleRequest AlterClientQuotas rejects truncated request" {
 
     var buf: [128]u8 = undefined;
     const req_len = buildTestRequest(&buf, 49, 1, 4903, header_mod.requestHeaderVersion(49, 1));
-    try testing.expect(broker.handleRequest(buf[0..req_len]) == null);
+    const response = broker.handleRequest(buf[0..req_len]);
+    try testing.expect(response != null);
+    defer testing.allocator.free(response.?);
+
+    try expectAlterClientQuotasErrorResponseBytes(response.?, 4903, ErrorCode.invalid_request);
 }
 
 test "Broker.handleRequest AlterClientQuotas rejects trailing bytes" {
@@ -40048,7 +40114,80 @@ test "Broker.handleRequest AlterClientQuotas rejects trailing bytes" {
     var pos = buildTestRequest(&buf, 49, 1, 4907, header_mod.requestHeaderVersion(49, 1));
     req.serialize(&buf, &pos, 1);
 
-    try expectTrailingByteRejected(&broker, buf[0..], pos);
+    try testing.expect(pos < buf.len);
+    buf[pos] = 0x7f;
+    const response = broker.handleRequest(buf[0 .. pos + 1]);
+    try testing.expect(response != null);
+    defer testing.allocator.free(response.?);
+
+    try expectAlterClientQuotasErrorResponseBytes(response.?, 4907, ErrorCode.invalid_request);
+}
+
+test "Broker.handleRequest AlterClientQuotas fails closed when response entry materialization fails" {
+    const Req = generated.alter_client_quotas_request.AlterClientQuotasRequest;
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+    try broker.authorizer.addSuperUser("test-client");
+
+    const entity = [_]Req.EntryData.EntityData{.{
+        .entity_type = "client-id",
+        .entity_name = "quota-materialize-fail-client",
+    }};
+    const ops = [_]Req.EntryData.OpData{.{
+        .key = "producer_byte_rate",
+        .value = 321.0,
+        .remove = false,
+    }};
+    const entries = [_]Req.EntryData{.{
+        .entity = &entity,
+        .ops = &ops,
+    }};
+    const req = Req{ .entries = &entries };
+
+    var buf: [512]u8 = undefined;
+    var pos = buildTestRequest(&buf, 49, 1, 4908, header_mod.requestHeaderVersion(49, 1));
+    req.serialize(&buf, &pos, 1);
+
+    var failing_allocator = OneShotFailingAllocator.init(testing.allocator, 4);
+    const response_allocator = failing_allocator.allocator();
+    broker.allocator = response_allocator;
+
+    const response = broker.handleRequest(buf[0..pos]);
+    broker.allocator = testing.allocator;
+
+    try testing.expect(failing_allocator.failed);
+    try testing.expect(response != null);
+    defer response_allocator.free(response.?);
+
+    try expectAlterClientQuotasErrorResponseBytes(response.?, 4908, ErrorCode.kafka_storage_error);
+    try testing.expect(broker.quota_manager.client_quotas.get("quota-materialize-fail-client") == null);
+}
+
+test "Broker.handleRequest AlterClientQuotas fails closed when response serialization fails" {
+    const Req = generated.alter_client_quotas_request.AlterClientQuotasRequest;
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+    try broker.authorizer.addSuperUser("test-client");
+
+    const req = Req{};
+    var buf: [128]u8 = undefined;
+    var pos = buildTestRequest(&buf, 49, 1, 4909, header_mod.requestHeaderVersion(49, 1));
+    req.serialize(&buf, &pos, 1);
+
+    var failing_allocator = OneShotFailingAllocator.init(testing.allocator, 0);
+    const response_allocator = failing_allocator.allocator();
+    broker.allocator = response_allocator;
+
+    const response = broker.handleRequest(buf[0..pos]);
+    broker.allocator = testing.allocator;
+
+    try testing.expect(failing_allocator.failed);
+    try testing.expect(response != null);
+    defer response_allocator.free(response.?);
+
+    try expectAlterClientQuotasErrorResponseBytes(response.?, 4909, ErrorCode.kafka_storage_error);
 }
 
 test "Broker.handleRequest DescribeUserScramCredentials returns requested SCRAM users" {
