@@ -798,6 +798,93 @@ def wait_for_log_position_checkpoint(
     )
 
 
+def parse_delete_records_response(response, correlation_id):
+    pos = parse_flexible_response_header(response, correlation_id)
+    _, pos = read_i32(response, pos)  # throttle_time_ms
+    topic_count, pos = read_compact_array_len(response, pos)
+    topics = []
+    for _ in range(topic_count):
+        topic_name, pos = read_compact_string(response, pos)
+        partition_count, pos = read_compact_array_len(response, pos)
+        partitions = []
+        for _ in range(partition_count):
+            partition_index, pos = read_i32(response, pos)
+            low_watermark, pos = read_i64(response, pos)
+            error_code, pos = read_i16(response, pos)
+            pos = skip_tags(response, pos)
+            partitions.append(
+                {
+                    "partition_index": partition_index,
+                    "low_watermark": low_watermark,
+                    "error_code": error_code,
+                }
+            )
+        pos = skip_tags(response, pos)
+        topics.append({"name": topic_name, "partitions": partitions})
+    pos = skip_tags(response, pos)
+    if pos != len(response):
+        raise TestError(f"DeleteRecords response trailing bytes: {len(response) - pos}")
+    return topics
+
+
+def delete_records(port, topic, offset, correlation_id):
+    body = write_compact_array_len(1)
+    body += write_compact_string(topic)
+    body += write_compact_array_len(1)
+    body += struct.pack(">iq", 0, offset)
+    body += b"\x00"  # partition tagged fields
+    body += b"\x00"  # topic tagged fields
+    body += struct.pack(">i", 30000)  # timeout_ms
+    body += b"\x00"  # request tagged fields
+    response = flexible_kafka_request(port, 21, 2, correlation_id, body)
+    return parse_delete_records_response(response, correlation_id)
+
+
+def require_single_delete_records_partition(topics, topic):
+    if len(topics) != 1 or topics[0]["name"] != topic:
+        raise TestError(f"DeleteRecords topic mismatch: {topics}")
+    partitions = topics[0]["partitions"]
+    if len(partitions) != 1:
+        raise TestError(f"DeleteRecords partition count mismatch: {topics}")
+    partition = partitions[0]
+    if partition["partition_index"] != 0 or partition["error_code"] != 0:
+        raise TestError(f"DeleteRecords partition error: {topics}")
+    return partition
+
+
+def wait_for_delete_records_checkpoint(
+    port, topic, expected_low_watermark, expected_end_offset, timeout=30
+):
+    deadline = time.time() + timeout
+    correlation_id = 8300
+    last_error = None
+    while time.time() < deadline:
+        try:
+            partition = require_single_delete_records_partition(
+                delete_records(port, topic, expected_low_watermark, correlation_id),
+                topic,
+            )
+            if partition["low_watermark"] != expected_low_watermark:
+                raise TestError(
+                    f"DeleteRecords low watermark={partition} "
+                    f"expected={expected_low_watermark}"
+                )
+            wait_for_log_position_checkpoint(
+                port,
+                topic,
+                expected_low_watermark,
+                expected_end_offset,
+            )
+            return
+        except Exception as exc:
+            last_error = exc
+        correlation_id += 1
+        time.sleep(0.25)
+    raise TestError(
+        f"DeleteRecords did not recover for {topic!r}: {last_error}"
+    )
+
+
 def parse_describe_producers_response(response, correlation_id):
     pos = parse_flexible_response_header(response, correlation_id)
     _, pos = read_i32(response, pos)  # throttle_time_ms
@@ -7025,12 +7112,14 @@ def main():
         txn_offset_group = f"{group}-txn-offset"
         txn_topic = f"{topic}-txn"
         idempotent_topic = f"{topic}-idempotent"
+        delete_records_topic = f"{topic}-delete-records"
         kip848_subscription_topic = f"{topic}-kip848-subscription"
         kip848_negative_group_prefix = f"{group}-kip848-negative"
         expected_payloads = []
         wait_for_topic(broker["port"], topic)
         wait_for_topic(broker["port"], txn_topic)
         wait_for_topic(broker["port"], idempotent_topic)
+        wait_for_topic(broker["port"], delete_records_topic)
         wait_for_topic(broker["port"], kip848_subscription_topic)
         expected_payloads.append(b"r0")
         first_offset = wait_for_produce(broker["port"], topic, expected_payloads[-1])
@@ -7042,6 +7131,33 @@ def main():
             first_offset,
             expected_topic_end_offset(first_offset, expected_payloads),
         )
+        delete_records_first_offset = wait_for_produce(
+            broker["port"],
+            delete_records_topic,
+            b"delete-records-before-trim",
+        )
+        delete_records_second_offset = wait_for_produce(
+            broker["port"],
+            delete_records_topic,
+            b"delete-records-after-trim",
+        )
+        if delete_records_second_offset <= delete_records_first_offset:
+            raise TestError(
+                f"DeleteRecords probe did not advance: "
+                f"{delete_records_second_offset} <= {delete_records_first_offset}"
+            )
+        delete_records_low_watermark = delete_records_first_offset + 1
+        delete_records_end_offset = delete_records_second_offset + 1
+
+        def wait_for_delete_records_probe():
+            wait_for_delete_records_checkpoint(
+                broker["port"],
+                delete_records_topic,
+                delete_records_low_watermark,
+                delete_records_end_offset,
+            )
+
+        wait_for_delete_records_probe()
         wait_for_offset_commit(broker["port"], group, topic, committed_offset)
         offset_delete_group_state = wait_for_group_stable(
             broker["port"],
@@ -7337,6 +7453,7 @@ def main():
             first_offset,
             expected_topic_end_offset(first_offset, expected_payloads),
         )
+        wait_for_delete_records_probe()
         wait_for_committed_offset(broker["port"], group, topic, committed_offset)
         wait_for_committed_offset(broker["port"], offset_delete_group, topic, -1)
         wait_for_committed_offset_error(
@@ -7451,6 +7568,7 @@ def main():
             first_offset,
             expected_topic_end_offset(first_offset, expected_payloads),
         )
+        wait_for_delete_records_probe()
         wait_for_committed_offset(broker["port"], group, topic, committed_offset)
         wait_for_committed_offset(broker["port"], offset_delete_group, topic, -1)
         wait_for_committed_offset_error(
@@ -7569,6 +7687,7 @@ def main():
             first_offset,
             expected_topic_end_offset(first_offset, expected_payloads),
         )
+        wait_for_delete_records_probe()
         wait_for_offset_commit(broker["port"], group, topic, committed_offset)
         post_failover_txn = wait_for_transaction_begin(
             broker["port"],
@@ -7599,6 +7718,7 @@ def main():
             first_offset,
             expected_topic_end_offset(first_offset, expected_payloads),
         )
+        wait_for_delete_records_probe()
         wait_for_committed_offset(broker["port"], group, topic, committed_offset)
         wait_for_committed_offset(broker["port"], offset_delete_group, topic, -1)
         wait_for_committed_offset_error(
@@ -7710,6 +7830,7 @@ def main():
             first_offset,
             expected_topic_end_offset(first_offset, expected_payloads),
         )
+        wait_for_delete_records_probe()
         wait_for_offset_commit(broker["port"], group, topic, committed_offset)
 
         alive = {node_id for node_id, info in processes.items() if info["proc"].poll() is None}
@@ -7743,6 +7864,7 @@ def main():
             first_offset,
             expected_topic_end_offset(first_offset, expected_payloads),
         )
+        wait_for_delete_records_probe()
         wait_for_committed_offset(broker["port"], group, topic, committed_offset)
         wait_for_committed_offset(broker["port"], offset_delete_group, topic, -1)
         wait_for_committed_offset_error(
@@ -7856,6 +7978,7 @@ def main():
             first_offset,
             expected_topic_end_offset(first_offset, expected_payloads),
         )
+        wait_for_delete_records_probe()
         wait_for_offset_commit(broker["port"], group, topic, committed_offset)
         broker_restart_txn = wait_for_transaction_begin(
             broker["port"],
@@ -7873,6 +7996,7 @@ def main():
             first_offset,
             expected_topic_end_offset(first_offset, expected_payloads),
         )
+        wait_for_delete_records_probe()
         wait_for_committed_offset(broker["port"], group, topic, committed_offset)
         wait_for_committed_offset(broker["port"], offset_delete_group, topic, -1)
         wait_for_committed_offset_error(
@@ -8092,6 +8216,7 @@ def main():
             first_offset,
             expected_topic_end_offset(first_offset, expected_payloads),
         )
+        wait_for_delete_records_probe()
         wait_for_offset_commit(broker["port"], group, topic, committed_offset)
         wait_for_offset_fetch_grouped_checkpoint(
             broker["port"],
@@ -8129,6 +8254,7 @@ def main():
             f"txn_offset_commit_checked=true, "
             f"offset_fetch_v8_grouped_checked=true, "
             f"log_position_apis_checked=true, "
+            f"delete_records_checked=true, "
             f"idempotent_producer_fencing=true, "
             f"describe_producers_checked=true, "
             f"delete_groups_checked=true, "
@@ -8389,6 +8515,26 @@ def self_test():
         ):
             raise TestError(
                 f"OffsetForLeaderEpoch fixture parser failed: {epoch_offsets}"
+            )
+
+        delete_records_fixture = struct.pack(">i", 163)
+        delete_records_fixture += b"\x00"  # response header tagged fields
+        delete_records_fixture += struct.pack(">i", 0)
+        delete_records_fixture += write_compact_array_len(1)
+        delete_records_fixture += write_compact_string("delete-records-self-test")
+        delete_records_fixture += write_compact_array_len(1)
+        delete_records_fixture += struct.pack(">iqh", 0, 4, 0)
+        delete_records_fixture += b"\x00"  # partition tagged fields
+        delete_records_fixture += b"\x00"  # topic tagged fields
+        delete_records_fixture += b"\x00"  # response tagged fields
+        deleted_records = parse_delete_records_response(delete_records_fixture, 163)
+        if (
+            deleted_records[0]["name"] != "delete-records-self-test"
+            or deleted_records[0]["partitions"][0]["low_watermark"] != 4
+            or deleted_records[0]["partitions"][0]["error_code"] != 0
+        ):
+            raise TestError(
+                f"DeleteRecords fixture parser failed: {deleted_records}"
             )
 
         describe_producers_fixture = struct.pack(">i", 162)
