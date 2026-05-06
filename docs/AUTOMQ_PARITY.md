@@ -750,6 +750,9 @@ Status: completed for the initial catalog and DeleteGroups slice.
   Read-only controller DescribeQuorum and FetchSnapshot responses now also
   return generated storage-error fallbacks when final response serialization
   fails under allocation pressure.
+  Broker-port DescribeQuorum now uses the same generated storage-error
+  fallback for malformed/error and final read-only response serialization
+  failures.
   ListClientMetricsResources now advertises key 74 v0, decodes generated
   flexible requests, rejects malformed frames, returns a default generated
   resource, and lists active client resources for retained telemetry samples.

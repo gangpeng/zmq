@@ -9623,7 +9623,10 @@ pub const Broker = struct {
             .topics = &.{},
             .nodes = &.{},
         };
-        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version) orelse {
+            log.warn("DescribeQuorum error response serialization failed", .{});
+            return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+        };
     }
 
     fn handleDescribeClusterAuthorizationError(
@@ -31286,23 +31289,20 @@ pub const Broker = struct {
 
         if (!validateDescribeQuorumRequestFrame(request_bytes, body_start)) {
             log.warn("Malformed DescribeQuorum request", .{});
-            const resp = Resp{ .error_code = errorCode(.invalid_request), .error_message = "Invalid request", .topics = &.{}, .nodes = &.{} };
-            return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+            return self.describeQuorumErrorResponse(req_header, resp_header_version, api_version, ErrorCode.invalid_request, "Invalid request");
         }
 
         var pos = body_start;
         var req = Req.deserialize(self.allocator, request_bytes, &pos, api_version) catch |err| {
             log.warn("Failed to decode DescribeQuorum request: {}", .{err});
-            const resp = Resp{ .error_code = errorCode(.invalid_request), .error_message = "Invalid request", .topics = &.{}, .nodes = &.{} };
-            return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+            return self.describeQuorumErrorResponse(req_header, resp_header_version, api_version, ErrorCode.invalid_request, "Invalid request");
         };
         defer self.freeDescribeQuorumRequest(&req);
 
         const raft = self.raft_state;
         const topics = if (raft) |rs| (self.collectDescribeQuorumTopics(&req, rs, api_version) catch |err| {
             log.warn("DescribeQuorum topic response allocation failed: {}", .{err});
-            const resp = Resp{ .error_code = errorCode(.kafka_storage_error), .error_message = "Failed to materialize quorum topics", .topics = &.{}, .nodes = &.{} };
-            return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+            return self.describeQuorumErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error, "Failed to materialize quorum topics");
         }) else &.{};
         defer {
             self.freeDescribeQuorumTopics(topics);
@@ -31313,8 +31313,7 @@ pub const Broker = struct {
             const rs = raft orelse break :blk &.{};
             break :blk self.collectDescribeQuorumNodes(rs) catch |err| {
                 log.warn("DescribeQuorum node response allocation failed: {}", .{err});
-                const resp = Resp{ .error_code = errorCode(.kafka_storage_error), .error_message = "Failed to materialize quorum nodes", .topics = &.{}, .nodes = &.{} };
-                return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+                return self.describeQuorumErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error, "Failed to materialize quorum nodes");
             };
         } else &.{};
         defer self.freeDescribeQuorumNodes(nodes);
@@ -31325,7 +31324,10 @@ pub const Broker = struct {
             .topics = topics,
             .nodes = nodes,
         };
-        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp_body, api_version);
+        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp_body, api_version) orelse {
+            log.warn("DescribeQuorum response serialization failed", .{});
+            return self.describeQuorumErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error, "Failed to serialize quorum response");
+        };
     }
 
     fn validateDescribeQuorumRequestFrame(buf: []const u8, start_pos: usize) bool {
@@ -59606,6 +59608,33 @@ test "Broker.handleRequest DescribeQuorum fails closed on response materializati
     defer response_allocator.free(response.?);
 
     const error_code = try readGeneratedTopLevelErrorCode(Resp, response.?, 55, 2, 5507);
+    try testing.expectEqual(ErrorCode.kafka_storage_error.toInt(), error_code);
+}
+
+test "Broker.handleRequest DescribeQuorum fails closed on response serialization failure" {
+    const Req = generated.describe_quorum_request.DescribeQuorumRequest;
+    const Resp = generated.describe_quorum_response.DescribeQuorumResponse;
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+
+    const req = Req{};
+    var buf: [256]u8 = undefined;
+    var pos = buildTestRequest(&buf, 55, 2, 5509, header_mod.requestHeaderVersion(55, 2));
+    req.serialize(&buf, &pos, 2);
+
+    var failing_allocator = OneShotFailingAllocator.init(testing.allocator, 0);
+    const response_allocator = failing_allocator.allocator();
+    broker.allocator = response_allocator;
+
+    const response = broker.handleRequest(buf[0..pos]);
+    broker.allocator = testing.allocator;
+
+    try testing.expect(failing_allocator.failed);
+    try testing.expect(response != null);
+    defer response_allocator.free(response.?);
+
+    const error_code = try readGeneratedTopLevelErrorCode(Resp, response.?, 55, 2, 5509);
     try testing.expectEqual(ErrorCode.kafka_storage_error.toInt(), error_code);
 }
 
