@@ -21873,12 +21873,18 @@ pub const Broker = struct {
         var arena = std.heap.ArenaAllocator.init(self.allocator);
         defer arena.deinit();
         const arena_alloc = arena.allocator();
-        const req = parseGeneratedRequestStrict(Req, arena_alloc, request_bytes, body_start, api_version) catch {
-            const resp = Resp{ .error_code = errorCode(.invalid_request), .throttle_time_ms = 0 };
-            return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+        const req = parseGeneratedRequestStrict(Req, arena_alloc, request_bytes, body_start, api_version) catch |err| {
+            log.warn("Failed to decode PutKVs request: {}", .{err});
+            return self.putKVsErrorResponse(req_header, resp_header_version, api_version, ErrorCode.invalid_request) orelse {
+                log.warn("PutKVs invalid-request response serialization failed", .{});
+                return self.putKVsErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error);
+            };
         };
 
-        const responses = arena_alloc.alloc(ItemResp, req.put_kv_requests.len) catch return null;
+        const responses = arena_alloc.alloc(ItemResp, req.put_kv_requests.len) catch |err| {
+            log.warn("PutKVs response materialization failed: {}", .{err});
+            return self.putKVsErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error);
+        };
         var response_error: i16 = 0;
         var previous_snapshot: ?MetadataPersistence.AutoMqMetadataSnapshot = null;
         defer if (previous_snapshot) |*snapshot| self.persistence.freeAutoMqMetadataSnapshot(snapshot);
@@ -21941,7 +21947,10 @@ pub const Broker = struct {
         }
 
         const resp = Resp{ .error_code = response_error, .throttle_time_ms = 0, .put_kv_responses = responses };
-        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version) orelse {
+            log.warn("PutKVs response serialization failed", .{});
+            return self.putKVsErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error);
+        };
     }
 
     fn handleDeleteKVs(self: *Broker, request_bytes: []const u8, body_start: usize, req_header: *const RequestHeader, api_version: i16, resp_header_version: i16) ?[]u8 {
@@ -21952,12 +21961,18 @@ pub const Broker = struct {
         var arena = std.heap.ArenaAllocator.init(self.allocator);
         defer arena.deinit();
         const arena_alloc = arena.allocator();
-        const req = parseGeneratedRequestStrict(Req, arena_alloc, request_bytes, body_start, api_version) catch {
-            const resp = Resp{ .error_code = errorCode(.invalid_request), .throttle_time_ms = 0 };
-            return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+        const req = parseGeneratedRequestStrict(Req, arena_alloc, request_bytes, body_start, api_version) catch |err| {
+            log.warn("Failed to decode DeleteKVs request: {}", .{err});
+            return self.deleteKVsErrorResponse(req_header, resp_header_version, api_version, ErrorCode.invalid_request) orelse {
+                log.warn("DeleteKVs invalid-request response serialization failed", .{});
+                return self.deleteKVsErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error);
+            };
         };
 
-        const responses = arena_alloc.alloc(ItemResp, req.delete_kv_requests.len) catch return null;
+        const responses = arena_alloc.alloc(ItemResp, req.delete_kv_requests.len) catch |err| {
+            log.warn("DeleteKVs response materialization failed: {}", .{err});
+            return self.deleteKVsErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error);
+        };
         var response_error: i16 = 0;
         var previous_snapshot: ?MetadataPersistence.AutoMqMetadataSnapshot = null;
         defer if (previous_snapshot) |*snapshot| self.persistence.freeAutoMqMetadataSnapshot(snapshot);
@@ -22001,7 +22016,10 @@ pub const Broker = struct {
         }
 
         const resp = Resp{ .error_code = response_error, .throttle_time_ms = 0, .delete_kv_responses = responses };
-        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version) orelse {
+            log.warn("DeleteKVs response serialization failed", .{});
+            return self.deleteKVsErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error);
+        };
     }
 
     fn handleTrimStreams(self: *Broker, request_bytes: []const u8, body_start: usize, req_header: *const RequestHeader, api_version: i16, resp_header_version: i16) ?[]u8 {
@@ -22012,26 +22030,32 @@ pub const Broker = struct {
         var arena = std.heap.ArenaAllocator.init(self.allocator);
         defer arena.deinit();
         const arena_alloc = arena.allocator();
-        const req = parseGeneratedRequestStrict(Req, arena_alloc, request_bytes, body_start, api_version) catch {
-            const resp = Resp{ .error_code = errorCode(.invalid_request), .throttle_time_ms = 0 };
-            return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+        const req = parseGeneratedRequestStrict(Req, arena_alloc, request_bytes, body_start, api_version) catch |err| {
+            log.warn("Failed to decode TrimStreams request: {}", .{err});
+            return self.trimStreamsErrorResponse(req_header, resp_header_version, api_version, ErrorCode.invalid_request) orelse {
+                log.warn("TrimStreams invalid-request response serialization failed", .{});
+                return self.trimStreamsErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error);
+            };
         };
 
-        const responses = arena_alloc.alloc(ItemResp, req.trim_stream_requests.len) catch return null;
+        const responses = arena_alloc.alloc(ItemResp, req.trim_stream_requests.len) catch |err| {
+            log.warn("TrimStreams response materialization failed: {}", .{err});
+            return self.trimStreamsErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error);
+        };
         if (self.autoMqObjectMutationErrorCode()) |err_code| {
             for (responses) |*response| {
                 response.* = .{ .error_code = err_code };
             }
             const resp = Resp{ .error_code = 0, .throttle_time_ms = 0, .trim_stream_responses = responses };
-            return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+            return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version) orelse {
+                log.warn("TrimStreams response serialization failed", .{});
+                return self.trimStreamsErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error);
+            };
         }
 
         var mutated = false;
         var previous_snapshot: ?ObjectManagerLocalSnapshot = null;
         defer if (previous_snapshot) |*snapshot| self.freeObjectManagerLocalSnapshot(snapshot);
-        if (self.raft_state == null) {
-            previous_snapshot = self.takeObjectManagerLocalSnapshot() catch return null;
-        }
         for (req.trim_stream_requests, 0..) |item, i| {
             const stream_id = i64ToU64(item.stream_id) orelse {
                 responses[i] = .{ .error_code = errorCode(.invalid_request) };
@@ -22041,6 +22065,13 @@ pub const Broker = struct {
                 responses[i] = .{ .error_code = errorCode(.invalid_request) };
                 continue;
             };
+            if (self.raft_state == null and previous_snapshot == null) {
+                previous_snapshot = self.takeObjectManagerLocalSnapshot() catch |err| {
+                    log.warn("TrimStreams ObjectManager rollback snapshot failed: {}", .{err});
+                    responses[i] = .{ .error_code = errorCode(.kafka_storage_error) };
+                    continue;
+                };
+            }
             self.object_manager.trimStream(stream_id, new_start_offset) catch |err| {
                 responses[i] = .{ .error_code = streamErrorCode(err) };
                 continue;
@@ -22059,7 +22090,10 @@ pub const Broker = struct {
         }
 
         const resp = Resp{ .error_code = 0, .throttle_time_ms = 0, .trim_stream_responses = responses };
-        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version) orelse {
+            log.warn("TrimStreams response serialization failed", .{});
+            return self.trimStreamsErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error);
+        };
     }
 
     fn handleAutomqRegisterNode(self: *Broker, request_bytes: []const u8, body_start: usize, req_header: *const RequestHeader, api_version: i16, resp_header_version: i16) ?[]u8 {
@@ -22068,20 +22102,28 @@ pub const Broker = struct {
 
         var arena = std.heap.ArenaAllocator.init(self.allocator);
         defer arena.deinit();
-        const req = parseGeneratedRequestStrict(Req, arena.allocator(), request_bytes, body_start, api_version) catch {
-            const resp = Resp{ .error_code = errorCode(.invalid_request), .throttle_time_ms = 0 };
-            return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+        const req = parseGeneratedRequestStrict(Req, arena.allocator(), request_bytes, body_start, api_version) catch |err| {
+            log.warn("Failed to decode AutomqRegisterNode request: {}", .{err});
+            return self.automqRegisterNodeErrorResponse(req_header, resp_header_version, api_version, ErrorCode.invalid_request) orelse {
+                log.warn("AutomqRegisterNode invalid-request response serialization failed", .{});
+                return self.automqRegisterNodeErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error);
+            };
         };
 
         if (req.node_id < 0 or req.node_id == std.math.maxInt(i32)) {
-            const resp = Resp{ .error_code = errorCode(.invalid_request), .throttle_time_ms = 0 };
-            return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+            return self.automqRegisterNodeErrorResponse(req_header, resp_header_version, api_version, ErrorCode.invalid_request) orelse {
+                log.warn("AutomqRegisterNode invalid-node response serialization failed", .{});
+                return self.automqRegisterNodeErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error);
+            };
         }
 
         const wal_config = req.wal_config orelse "";
         self.commitAutoMqRegisterNodeRecord(req.node_id, req.node_epoch, wal_config) catch |err| {
             const resp = Resp{ .error_code = autoMqQuorumErrorCode(err), .throttle_time_ms = 0 };
-            return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+            return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version) orelse {
+                log.warn("AutomqRegisterNode error response serialization failed", .{});
+                return self.automqRegisterNodeErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error);
+            };
         };
         var previous_snapshot: ?MetadataPersistence.AutoMqMetadataSnapshot = null;
         defer if (previous_snapshot) |*snapshot| self.persistence.freeAutoMqMetadataSnapshot(snapshot);
@@ -22103,12 +22145,14 @@ pub const Broker = struct {
         self.persistAutoMqMetadataAfterMutation() catch |err| {
             log.warn("AutomqRegisterNode metadata snapshot write failed: {}", .{err});
             if (previous_snapshot) |snapshot| self.restoreAutoMqMetadataAfterFailedMutation(snapshot);
-            const resp = Resp{ .error_code = errorCode(.kafka_storage_error), .throttle_time_ms = 0 };
-            return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+            return self.automqRegisterNodeErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error);
         };
 
         const resp = Resp{ .error_code = 0, .throttle_time_ms = 0 };
-        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version) orelse {
+            log.warn("AutomqRegisterNode response serialization failed", .{});
+            return self.automqRegisterNodeErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error);
+        };
     }
 
     fn handleAutomqGetNodes(self: *Broker, request_bytes: []const u8, body_start: usize, req_header: *const RequestHeader, api_version: i16, resp_header_version: i16) ?[]u8 {
@@ -22196,9 +22240,12 @@ pub const Broker = struct {
         var arena = std.heap.ArenaAllocator.init(self.allocator);
         defer arena.deinit();
         const arena_alloc = arena.allocator();
-        const req = parseGeneratedRequestStrict(Req, arena_alloc, request_bytes, body_start, api_version) catch {
-            const resp = Resp{ .error_code = errorCode(.invalid_request), .throttle_time_ms = 0 };
-            return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+        const req = parseGeneratedRequestStrict(Req, arena_alloc, request_bytes, body_start, api_version) catch |err| {
+            log.warn("Failed to decode AutomqZoneRouter request: {}", .{err});
+            return self.automqZoneRouterErrorResponse(req_header, resp_header_version, api_version, ErrorCode.invalid_request) orelse {
+                log.warn("AutomqZoneRouter invalid-request response serialization failed", .{});
+                return self.automqZoneRouterErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error);
+            };
         };
 
         var mutated = false;
@@ -22209,7 +22256,10 @@ pub const Broker = struct {
         if (req.metadata != null or new_route_epoch != self.auto_mq_zone_router_epoch) {
             self.commitAutoMqZoneRouterRecord(req.metadata, new_route_epoch) catch |err| {
                 const resp = Resp{ .error_code = autoMqQuorumErrorCode(err), .throttle_time_ms = 0 };
-                return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+                return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version) orelse {
+                    log.warn("AutomqZoneRouter error response serialization failed", .{});
+                    return self.automqZoneRouterErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error);
+                };
             };
         }
         var previous_snapshot: ?MetadataPersistence.AutoMqMetadataSnapshot = null;
@@ -22238,15 +22288,27 @@ pub const Broker = struct {
 
         if (response_error != 0) {
             const resp = Resp{ .error_code = response_error, .throttle_time_ms = 0, .responses = &.{} };
-            return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+            return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version) orelse {
+                log.warn("AutomqZoneRouter error response serialization failed", .{});
+                return self.automqZoneRouterErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error);
+            };
         }
 
-        const default_route = std.fmt.allocPrint(arena_alloc, "{{\"node_id\":{d},\"epoch\":{d}}}", .{ self.node_id, self.auto_mq_zone_router_epoch }) catch return null;
-        const responses = arena_alloc.alloc(ItemResp, 1) catch return null;
+        const default_route = std.fmt.allocPrint(arena_alloc, "{{\"node_id\":{d},\"epoch\":{d}}}", .{ self.node_id, self.auto_mq_zone_router_epoch }) catch |err| {
+            log.warn("AutomqZoneRouter response materialization failed: {}", .{err});
+            return self.automqZoneRouterErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error);
+        };
+        const responses = arena_alloc.alloc(ItemResp, 1) catch |err| {
+            log.warn("AutomqZoneRouter response materialization failed: {}", .{err});
+            return self.automqZoneRouterErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error);
+        };
         responses[0] = .{ .data = self.auto_mq_zone_router_metadata orelse default_route };
 
         const resp = Resp{ .error_code = 0, .throttle_time_ms = 0, .responses = responses };
-        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version) orelse {
+            log.warn("AutomqZoneRouter response serialization failed", .{});
+            return self.automqZoneRouterErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error);
+        };
     }
 
     fn handleAutomqGetPartitionSnapshot(self: *Broker, request_bytes: []const u8, body_start: usize, req_header: *const RequestHeader, api_version: i16, resp_header_version: i16) ?[]u8 {
@@ -22320,15 +22382,21 @@ pub const Broker = struct {
 
         var arena = std.heap.ArenaAllocator.init(self.allocator);
         defer arena.deinit();
-        const req = parseGeneratedRequestStrict(Req, arena.allocator(), request_bytes, body_start, api_version) catch {
-            const resp = Resp{ .error_code = errorCode(.invalid_request), .throttle_time_ms = 0, .error_message = "invalid request" };
-            return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+        const req = parseGeneratedRequestStrict(Req, arena.allocator(), request_bytes, body_start, api_version) catch |err| {
+            log.warn("Failed to decode UpdateLicense request: {}", .{err});
+            return self.updateLicenseErrorResponse(req_header, resp_header_version, api_version, ErrorCode.invalid_request, "invalid request") orelse {
+                log.warn("UpdateLicense invalid-request response serialization failed", .{});
+                return self.updateLicenseErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error, "Failed to serialize invalid-request response");
+            };
         };
 
         const license = req.license orelse "";
         self.commitAutoMqSetLicenseRecord(license) catch |err| {
             const resp = Resp{ .error_code = autoMqQuorumErrorCode(err), .throttle_time_ms = 0, .error_message = "metadata quorum unavailable" };
-            return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+            return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version) orelse {
+                log.warn("UpdateLicense error response serialization failed", .{});
+                return self.updateLicenseErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error, "Failed to serialize error response");
+            };
         };
         var previous_snapshot: ?MetadataPersistence.AutoMqMetadataSnapshot = null;
         defer if (previous_snapshot) |*snapshot| self.persistence.freeAutoMqMetadataSnapshot(snapshot);
@@ -22341,12 +22409,14 @@ pub const Broker = struct {
         self.persistAutoMqMetadataAfterMutation() catch |err| {
             log.warn("UpdateLicense metadata snapshot write failed: {}", .{err});
             if (previous_snapshot) |snapshot| self.restoreAutoMqMetadataAfterFailedMutation(snapshot);
-            const resp = Resp{ .error_code = errorCode(.kafka_storage_error), .throttle_time_ms = 0, .error_message = "Failed to persist AutoMQ metadata" };
-            return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+            return self.updateLicenseErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error, "Failed to persist AutoMQ metadata");
         };
 
         const resp = Resp{ .error_code = 0, .throttle_time_ms = 0, .error_message = "" };
-        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version) orelse {
+            log.warn("UpdateLicense response serialization failed", .{});
+            return self.updateLicenseErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error, "Failed to serialize response");
+        };
     }
 
     fn handleDescribeLicense(self: *Broker, request_bytes: []const u8, body_start: usize, req_header: *const RequestHeader, api_version: i16, resp_header_version: i16) ?[]u8 {
@@ -22403,21 +22473,29 @@ pub const Broker = struct {
 
         var arena = std.heap.ArenaAllocator.init(self.allocator);
         defer arena.deinit();
-        _ = parseGeneratedRequestStrict(Req, arena.allocator(), request_bytes, body_start, api_version) catch {
-            const resp = Resp{ .error_code = errorCode(.invalid_request), .throttle_time_ms = 0, .node_id = -1 };
-            return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+        _ = parseGeneratedRequestStrict(Req, arena.allocator(), request_bytes, body_start, api_version) catch |err| {
+            log.warn("Failed to decode GetNextNodeId request: {}", .{err});
+            return self.getNextNodeIdErrorResponse(req_header, resp_header_version, api_version, ErrorCode.invalid_request) orelse {
+                log.warn("GetNextNodeId invalid-request response serialization failed", .{});
+                return self.getNextNodeIdErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error);
+            };
         };
 
         if (self.auto_mq_next_node_id == std.math.maxInt(i32)) {
-            const resp = Resp{ .error_code = errorCode(.invalid_request), .throttle_time_ms = 0, .node_id = -1 };
-            return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+            return self.getNextNodeIdErrorResponse(req_header, resp_header_version, api_version, ErrorCode.invalid_request) orelse {
+                log.warn("GetNextNodeId invalid-state response serialization failed", .{});
+                return self.getNextNodeIdErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error);
+            };
         }
 
         const node_id = self.auto_mq_next_node_id;
         const next_node_id = node_id + 1;
         self.commitAutoMqSetNextNodeIdRecord(next_node_id) catch |err| {
             const resp = Resp{ .error_code = autoMqQuorumErrorCode(err), .throttle_time_ms = 0, .node_id = -1 };
-            return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+            return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version) orelse {
+                log.warn("GetNextNodeId error response serialization failed", .{});
+                return self.getNextNodeIdErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error);
+            };
         };
         var previous_snapshot: ?MetadataPersistence.AutoMqMetadataSnapshot = null;
         defer if (previous_snapshot) |*snapshot| self.persistence.freeAutoMqMetadataSnapshot(snapshot);
@@ -22428,11 +22506,13 @@ pub const Broker = struct {
         self.persistAutoMqMetadataAfterMutation() catch |err| {
             log.warn("GetNextNodeId metadata snapshot write failed: {}", .{err});
             if (previous_snapshot) |snapshot| self.restoreAutoMqMetadataAfterFailedMutation(snapshot);
-            const resp = Resp{ .error_code = errorCode(.kafka_storage_error), .throttle_time_ms = 0, .node_id = -1 };
-            return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+            return self.getNextNodeIdErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error);
         };
         const resp = Resp{ .error_code = 0, .throttle_time_ms = 0, .node_id = node_id };
-        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version) orelse {
+            log.warn("GetNextNodeId response serialization failed", .{});
+            return self.getNextNodeIdErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error);
+        };
     }
 
     fn handleDescribeStreams(self: *Broker, request_bytes: []const u8, body_start: usize, req_header: *const RequestHeader, api_version: i16, resp_header_version: i16) ?[]u8 {
@@ -22510,16 +22590,21 @@ pub const Broker = struct {
 
         var arena = std.heap.ArenaAllocator.init(self.allocator);
         defer arena.deinit();
-        const req = parseGeneratedRequestStrict(Req, arena.allocator(), request_bytes, body_start, api_version) catch {
-            const resp = Resp{ .group_id = null, .error_code = errorCode(.invalid_request), .error_message = "invalid request", .throttle_time_ms = 0 };
-            return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+        const req = parseGeneratedRequestStrict(Req, arena.allocator(), request_bytes, body_start, api_version) catch |err| {
+            log.warn("Failed to decode AutomqUpdateGroup request: {}", .{err});
+            return self.automqUpdateGroupErrorResponse(req_header, resp_header_version, api_version, ErrorCode.invalid_request, "", "invalid request") orelse {
+                log.warn("AutomqUpdateGroup invalid-request response serialization failed", .{});
+                return self.automqUpdateGroupErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error, "", "Failed to serialize invalid-request response");
+            };
         };
 
         const group_id = req.group_id orelse "";
         const link_id = req.link_id orelse "";
         if (group_id.len == 0) {
-            const resp = Resp{ .group_id = req.group_id, .error_code = errorCode(.invalid_request), .error_message = "group_id is required", .throttle_time_ms = 0 };
-            return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+            return self.automqUpdateGroupErrorResponse(req_header, resp_header_version, api_version, ErrorCode.invalid_request, req.group_id, "group_id is required") orelse {
+                log.warn("AutomqUpdateGroup invalid-group response serialization failed", .{});
+                return self.automqUpdateGroupErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error, req.group_id, "Failed to serialize invalid-group response");
+            };
         }
 
         var mutated = false;
@@ -22528,7 +22613,10 @@ pub const Broker = struct {
         if (req.promoted) {
             self.commitAutoMqUpdateGroupRecord(group_id, link_id, true) catch |err| {
                 const resp = Resp{ .group_id = req.group_id, .error_code = autoMqQuorumErrorCode(err), .error_message = "metadata quorum unavailable", .throttle_time_ms = 0 };
-                return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+                return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version) orelse {
+                    log.warn("AutomqUpdateGroup error response serialization failed", .{});
+                    return self.automqUpdateGroupErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error, req.group_id, "Failed to serialize error response");
+                };
             };
             if (self.raft_state == null) {
                 previous_snapshot = self.cloneAutoMqMetadataSnapshot() catch return null;
@@ -22552,7 +22640,10 @@ pub const Broker = struct {
         } else if (self.auto_mq_group_promotions.contains(group_id)) {
             self.commitAutoMqUpdateGroupRecord(group_id, "", false) catch |err| {
                 const resp = Resp{ .group_id = req.group_id, .error_code = autoMqQuorumErrorCode(err), .error_message = "metadata quorum unavailable", .throttle_time_ms = 0 };
-                return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+                return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version) orelse {
+                    log.warn("AutomqUpdateGroup error response serialization failed", .{});
+                    return self.automqUpdateGroupErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error, req.group_id, "Failed to serialize error response");
+                };
             };
             if (self.raft_state == null) {
                 previous_snapshot = self.cloneAutoMqMetadataSnapshot() catch return null;
@@ -22575,7 +22666,10 @@ pub const Broker = struct {
         }
 
         const resp = Resp{ .group_id = req.group_id, .error_code = response_error, .error_message = response_error_message, .throttle_time_ms = 0 };
-        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version) orelse {
+            log.warn("AutomqUpdateGroup response serialization failed", .{});
+            return self.automqUpdateGroupErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error, req.group_id, "Failed to serialize response");
+        };
     }
 
     // ---------------------------------------------------------------
@@ -31539,6 +31633,21 @@ fn readAutoMqStreamKvAuthorizationErrorCode(response: []const u8, api_key: i16, 
     };
 }
 
+fn readAutoMqStreamKvMutationFailureCode(comptime RespType: type, comptime responses_field: []const u8, response: []const u8, api_key: i16, api_version: i16, correlation_id: i32) !i16 {
+    var rpos: usize = 0;
+    var response_header = try ResponseHeader.deserialize(testing.allocator, response, &rpos, header_mod.responseHeaderVersion(api_key, api_version));
+    defer response_header.deinit(testing.allocator);
+    try testing.expectEqual(correlation_id, response_header.correlation_id);
+
+    const resp = try RespType.deserialize(testing.allocator, response, &rpos, api_version);
+    defer freeAutoMqStreamObjectKvTopLevelArrays(RespType, &resp);
+    try testing.expectEqual(response.len, rpos);
+    if (resp.error_code != 0) return resp.error_code;
+    const item_responses = @field(resp, responses_field);
+    if (item_responses.len > 0) return item_responses[0].error_code;
+    return resp.error_code;
+}
+
 fn expectAutoMqStreamKvAuthorizationDeniedWithFailingAllocator(
     broker: *Broker,
     request: []const u8,
@@ -31728,6 +31837,40 @@ fn expectAutoMqNormalReadErrorWithFailingAllocator(
     defer response_allocator.free(response.?);
 
     const error_code = try readAutoMqNormalReadErrorCode(response.?, api_key, api_version, correlation_id);
+    try testing.expectEqual(@as(i16, @intFromEnum(err_code)), error_code);
+}
+
+fn readAutoMqMutationErrorCode(response: []const u8, api_key: i16, api_version: i16, correlation_id: i32) !i16 {
+    return switch (api_key) {
+        510 => readAutoMqStreamKvMutationFailureCode(generated.put_k_vs_response.PutKVsResponse, "put_kv_responses", response, api_key, api_version, correlation_id),
+        511 => readAutoMqStreamKvMutationFailureCode(generated.delete_k_vs_response.DeleteKVsResponse, "delete_kv_responses", response, api_key, api_version, correlation_id),
+        512 => readAutoMqStreamKvMutationFailureCode(generated.trim_streams_response.TrimStreamsResponse, "trim_stream_responses", response, api_key, api_version, correlation_id),
+        513, 515, 517, 600, 602 => readAutoMqMetadataAuthorizationErrorCode(response, api_key, api_version, correlation_id),
+        else => error.UnsupportedApiKey,
+    };
+}
+
+fn expectAutoMqMutationErrorWithFailingAllocator(
+    broker: *Broker,
+    request: []const u8,
+    api_key: i16,
+    api_version: i16,
+    correlation_id: i32,
+    fail_index: usize,
+    err_code: ErrorCode,
+) !void {
+    var failing_allocator = OneShotFailingAllocator.init(testing.allocator, fail_index);
+    const response_allocator = failing_allocator.allocator();
+    broker.allocator = response_allocator;
+
+    const response = broker.handleRequest(request);
+    broker.allocator = testing.allocator;
+
+    try testing.expect(response != null);
+    defer response_allocator.free(response.?);
+    try testing.expect(failing_allocator.failed);
+
+    const error_code = try readAutoMqMutationErrorCode(response.?, api_key, api_version, correlation_id);
     try testing.expectEqual(@as(i16, @intFromEnum(err_code)), error_code);
 }
 
@@ -49565,6 +49708,185 @@ test "Broker.handleRequest normal AutoMQ read APIs fail closed when response mat
         var pos = buildTestRequest(&buf, 601, 0, 6019, header_mod.requestHeaderVersion(601, 0));
         req.serialize(&buf, &pos, 0);
         try expectAutoMqNormalReadErrorWithFailingAllocator(&broker, buf[0..pos], 601, 0, 6019, 0, ErrorCode.kafka_storage_error);
+    }
+}
+
+test "Broker.handleRequest normal AutoMQ mutation APIs fail closed when malformed error serialization fails" {
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+
+    var buf: [4096]u8 = undefined;
+
+    {
+        const Req = generated.put_k_vs_request.PutKVsRequest;
+        const req = Req{ .put_kv_requests = &.{} };
+        var pos = buildTestRequest(&buf, 510, 0, 5108, header_mod.requestHeaderVersion(510, 0));
+        req.serialize(&buf, &pos, 0);
+        try testing.expect(pos < buf.len);
+        buf[pos] = 0x7f;
+        try expectAutoMqMutationErrorWithFailingAllocator(&broker, buf[0 .. pos + 1], 510, 0, 5108, 0, ErrorCode.kafka_storage_error);
+    }
+
+    {
+        const Req = generated.delete_k_vs_request.DeleteKVsRequest;
+        const req = Req{ .delete_kv_requests = &.{} };
+        var pos = buildTestRequest(&buf, 511, 0, 5118, header_mod.requestHeaderVersion(511, 0));
+        req.serialize(&buf, &pos, 0);
+        try testing.expect(pos < buf.len);
+        buf[pos] = 0x7f;
+        try expectAutoMqMutationErrorWithFailingAllocator(&broker, buf[0 .. pos + 1], 511, 0, 5118, 0, ErrorCode.kafka_storage_error);
+    }
+
+    {
+        const Req = generated.trim_streams_request.TrimStreamsRequest;
+        const req = Req{ .node_id = 1, .node_epoch = 1, .trim_stream_requests = &.{} };
+        var pos = buildTestRequest(&buf, 512, 0, 5128, header_mod.requestHeaderVersion(512, 0));
+        req.serialize(&buf, &pos, 0);
+        try testing.expect(pos < buf.len);
+        buf[pos] = 0x7f;
+        try expectAutoMqMutationErrorWithFailingAllocator(&broker, buf[0 .. pos + 1], 512, 0, 5128, 0, ErrorCode.kafka_storage_error);
+    }
+
+    {
+        const Req = generated.automq_register_node_request.AutomqRegisterNodeRequest;
+        const req = Req{ .node_id = 8, .node_epoch = 1, .wal_config = "wal://node-8", .tags = &.{} };
+        var pos = buildTestRequest(&buf, 513, 0, 5138, header_mod.requestHeaderVersion(513, 0));
+        req.serialize(&buf, &pos, 0);
+        try testing.expect(pos < buf.len);
+        buf[pos] = 0x7f;
+        try expectAutoMqMutationErrorWithFailingAllocator(&broker, buf[0 .. pos + 1], 513, 0, 5138, 0, ErrorCode.kafka_storage_error);
+    }
+
+    {
+        const Req = generated.automq_zone_router_request.AutomqZoneRouterRequest;
+        const req = Req{ .metadata = null, .route_epoch = 0, .version = 1 };
+        var pos = buildTestRequest(&buf, 515, 1, 5158, header_mod.requestHeaderVersion(515, 1));
+        req.serialize(&buf, &pos, 1);
+        try testing.expect(pos < buf.len);
+        buf[pos] = 0x7f;
+        try expectAutoMqMutationErrorWithFailingAllocator(&broker, buf[0 .. pos + 1], 515, 1, 5158, 0, ErrorCode.kafka_storage_error);
+    }
+
+    {
+        const Req = generated.update_license_request.UpdateLicenseRequest;
+        const req = Req{ .license = null };
+        var pos = buildTestRequest(&buf, 517, 0, 5178, header_mod.requestHeaderVersion(517, 0));
+        req.serialize(&buf, &pos, 0);
+        try testing.expect(pos < buf.len);
+        buf[pos] = 0x7f;
+        try expectAutoMqMutationErrorWithFailingAllocator(&broker, buf[0 .. pos + 1], 517, 0, 5178, 0, ErrorCode.kafka_storage_error);
+    }
+
+    {
+        const Req = generated.get_next_node_id_request.GetNextNodeIdRequest;
+        const req = Req{ .cluster_id = null };
+        var pos = buildTestRequest(&buf, 600, 0, 6008, header_mod.requestHeaderVersion(600, 0));
+        req.serialize(&buf, &pos, 0);
+        try testing.expect(pos < buf.len);
+        buf[pos] = 0x7f;
+        try expectAutoMqMutationErrorWithFailingAllocator(&broker, buf[0 .. pos + 1], 600, 0, 6008, 0, ErrorCode.kafka_storage_error);
+    }
+
+    {
+        const Req = generated.automq_update_group_request.AutomqUpdateGroupRequest;
+        const req = Req{ .link_id = "link-a", .group_id = "group-a", .promoted = true };
+        var pos = buildTestRequest(&buf, 602, 0, 6028, header_mod.requestHeaderVersion(602, 0));
+        req.serialize(&buf, &pos, 0);
+        try testing.expect(pos < buf.len);
+        buf[pos] = 0x7f;
+        try expectAutoMqMutationErrorWithFailingAllocator(&broker, buf[0 .. pos + 1], 602, 0, 6028, 0, ErrorCode.kafka_storage_error);
+    }
+}
+
+test "Broker.handleRequest normal AutoMQ mutation APIs fail closed when response construction fails" {
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+
+    var buf: [4096]u8 = undefined;
+
+    {
+        const Req = generated.put_k_vs_request.PutKVsRequest;
+        const req = Req{ .put_kv_requests = &.{} };
+        var pos = buildTestRequest(&buf, 510, 0, 5109, header_mod.requestHeaderVersion(510, 0));
+        req.serialize(&buf, &pos, 0);
+        try expectAutoMqMutationErrorWithFailingAllocator(&broker, buf[0..pos], 510, 0, 5109, 0, ErrorCode.kafka_storage_error);
+
+        const items = [_]Req.PutKVRequest{.{ .key = "key", .value = "value", .overwrite = true }};
+        const materialization_req = Req{ .put_kv_requests = &items };
+        pos = buildTestRequest(&buf, 510, 0, 5110, header_mod.requestHeaderVersion(510, 0));
+        materialization_req.serialize(&buf, &pos, 0);
+        try expectAutoMqMutationErrorWithFailingAllocator(&broker, buf[0..pos], 510, 0, 5110, 1, ErrorCode.kafka_storage_error);
+    }
+
+    {
+        const Req = generated.delete_k_vs_request.DeleteKVsRequest;
+        const req = Req{ .delete_kv_requests = &.{} };
+        var pos = buildTestRequest(&buf, 511, 0, 5119, header_mod.requestHeaderVersion(511, 0));
+        req.serialize(&buf, &pos, 0);
+        try expectAutoMqMutationErrorWithFailingAllocator(&broker, buf[0..pos], 511, 0, 5119, 0, ErrorCode.kafka_storage_error);
+
+        const items = [_]Req.DeleteKVRequest{.{ .key = "key" }};
+        const materialization_req = Req{ .delete_kv_requests = &items };
+        pos = buildTestRequest(&buf, 511, 0, 5120, header_mod.requestHeaderVersion(511, 0));
+        materialization_req.serialize(&buf, &pos, 0);
+        try expectAutoMqMutationErrorWithFailingAllocator(&broker, buf[0..pos], 511, 0, 5120, 1, ErrorCode.kafka_storage_error);
+    }
+
+    {
+        const Req = generated.trim_streams_request.TrimStreamsRequest;
+        const req = Req{ .node_id = 1, .node_epoch = 1, .trim_stream_requests = &.{} };
+        var pos = buildTestRequest(&buf, 512, 0, 5129, header_mod.requestHeaderVersion(512, 0));
+        req.serialize(&buf, &pos, 0);
+        try expectAutoMqMutationErrorWithFailingAllocator(&broker, buf[0..pos], 512, 0, 5129, 0, ErrorCode.kafka_storage_error);
+
+        const items = [_]Req.TrimStreamRequest{.{ .stream_id = 1, .stream_epoch = 1, .new_start_offset = 1 }};
+        const materialization_req = Req{ .node_id = 1, .node_epoch = 1, .trim_stream_requests = &items };
+        pos = buildTestRequest(&buf, 512, 0, 5130, header_mod.requestHeaderVersion(512, 0));
+        materialization_req.serialize(&buf, &pos, 0);
+        try expectAutoMqMutationErrorWithFailingAllocator(&broker, buf[0..pos], 512, 0, 5130, 1, ErrorCode.kafka_storage_error);
+    }
+
+    {
+        const Req = generated.automq_register_node_request.AutomqRegisterNodeRequest;
+        const req = Req{ .node_id = -1, .node_epoch = 1, .wal_config = "wal://node-8", .tags = &.{} };
+        var pos = buildTestRequest(&buf, 513, 0, 5139, header_mod.requestHeaderVersion(513, 0));
+        req.serialize(&buf, &pos, 0);
+        try expectAutoMqMutationErrorWithFailingAllocator(&broker, buf[0..pos], 513, 0, 5139, 0, ErrorCode.kafka_storage_error);
+    }
+
+    {
+        const Req = generated.automq_zone_router_request.AutomqZoneRouterRequest;
+        const req = Req{ .metadata = null, .route_epoch = 0, .version = 1 };
+        var pos = buildTestRequest(&buf, 515, 1, 5159, header_mod.requestHeaderVersion(515, 1));
+        req.serialize(&buf, &pos, 1);
+        try expectAutoMqMutationErrorWithFailingAllocator(&broker, buf[0..pos], 515, 1, 5159, 0, ErrorCode.kafka_storage_error);
+
+        pos = buildTestRequest(&buf, 515, 1, 5160, header_mod.requestHeaderVersion(515, 1));
+        req.serialize(&buf, &pos, 1);
+        try expectAutoMqMutationErrorWithFailingAllocator(&broker, buf[0..pos], 515, 1, 5160, 1, ErrorCode.kafka_storage_error);
+    }
+
+    {
+        const Req = generated.get_next_node_id_request.GetNextNodeIdRequest;
+        const req = Req{ .cluster_id = null };
+        broker.auto_mq_next_node_id = std.math.maxInt(i32);
+        var pos = buildTestRequest(&buf, 600, 0, 6009, header_mod.requestHeaderVersion(600, 0));
+        req.serialize(&buf, &pos, 0);
+        try expectAutoMqMutationErrorWithFailingAllocator(&broker, buf[0..pos], 600, 0, 6009, 0, ErrorCode.kafka_storage_error);
+        broker.auto_mq_next_node_id = 1;
+    }
+
+    {
+        const Req = generated.automq_update_group_request.AutomqUpdateGroupRequest;
+        const invalid_req = Req{ .link_id = null, .group_id = "", .promoted = false };
+        var pos = buildTestRequest(&buf, 602, 0, 6029, header_mod.requestHeaderVersion(602, 0));
+        invalid_req.serialize(&buf, &pos, 0);
+        try expectAutoMqMutationErrorWithFailingAllocator(&broker, buf[0..pos], 602, 0, 6029, 0, ErrorCode.kafka_storage_error);
+
+        const noop_req = Req{ .link_id = "", .group_id = "group-a", .promoted = false };
+        pos = buildTestRequest(&buf, 602, 0, 6030, header_mod.requestHeaderVersion(602, 0));
+        noop_req.serialize(&buf, &pos, 0);
+        try expectAutoMqMutationErrorWithFailingAllocator(&broker, buf[0..pos], 602, 0, 6030, 0, ErrorCode.kafka_storage_error);
     }
 }
 

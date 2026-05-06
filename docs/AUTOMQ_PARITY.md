@@ -678,6 +678,14 @@ Status: completed for the initial catalog and DeleteGroups slice.
   DescribeStreams now use the same generated invalid-request/storage-error
   fallbacks for malformed frames and response materialization or serialization
   failures.
+  Normal AutoMQ mutation/controller paths for PutKVs, DeleteKVs, TrimStreams,
+  AutomqRegisterNode, AutomqZoneRouter, UpdateLicense, GetNextNodeId, and
+  AutomqUpdateGroup now also use generated invalid-request/storage-error
+  fallbacks when malformed-frame error responses, early response
+  materialization, mutation error responses, or final serialization fail.
+  TrimStreams now delays its local rollback snapshot until a valid trim mutation
+  is about to execute, so empty or invalid no-op requests do not drop responses
+  under allocation pressure.
   Committed-offset authorization-denial builders for OffsetCommit,
   OffsetFetch, and OffsetDelete now also fail closed with generated
   invalid-request or storage-error responses when denied frames are malformed or
