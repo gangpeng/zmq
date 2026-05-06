@@ -1489,6 +1489,169 @@ def wait_for_user_scram_credentials_checkpoint(
     raise TestError(f"SCRAM credential checkpoint did not recover: {last_error}")
 
 
+def parse_get_telemetry_subscriptions_response(response, correlation_id):
+    pos = parse_flexible_response_header(response, correlation_id)
+    throttle_time_ms, pos = read_i32(response, pos)
+    error_code, pos = read_i16(response, pos)
+    if pos + 16 > len(response):
+        raise TestError("buffer underflow while reading client instance id")
+    client_instance_id = response[pos : pos + 16]
+    pos += 16
+    subscription_id, pos = read_i32(response, pos)
+    compression_count, pos = read_compact_array_len(response, pos)
+    accepted_compression_types = []
+    for _ in range(compression_count):
+        compression_type, pos = read_i8(response, pos)
+        accepted_compression_types.append(compression_type)
+    push_interval_ms, pos = read_i32(response, pos)
+    telemetry_max_bytes, pos = read_i32(response, pos)
+    delta_temporality, pos = read_bool(response, pos)
+    metric_count, pos = read_compact_array_len(response, pos)
+    requested_metrics = []
+    for _ in range(metric_count):
+        metric, pos = read_compact_string(response, pos)
+        requested_metrics.append(metric)
+    pos = skip_tags(response, pos)
+    if pos != len(response):
+        raise TestError(
+            f"GetTelemetrySubscriptions response trailing bytes: {len(response) - pos}"
+        )
+    return {
+        "throttle_time_ms": throttle_time_ms,
+        "error_code": error_code,
+        "client_instance_id": client_instance_id,
+        "subscription_id": subscription_id,
+        "accepted_compression_types": accepted_compression_types,
+        "push_interval_ms": push_interval_ms,
+        "telemetry_max_bytes": telemetry_max_bytes,
+        "delta_temporality": delta_temporality,
+        "requested_metrics": requested_metrics,
+    }
+
+
+def get_telemetry_subscriptions(port, client_instance_id, correlation_id):
+    body = client_instance_id
+    body += b"\x00"  # request tagged fields
+    response = flexible_kafka_request(port, 71, 0, correlation_id, body)
+    return parse_get_telemetry_subscriptions_response(response, correlation_id)
+
+
+def require_telemetry_subscription(response, client_instance_id):
+    if response["throttle_time_ms"] != 0 or response["error_code"] != 0:
+        raise TestError(f"GetTelemetrySubscriptions top-level mismatch: {response}")
+    if response["client_instance_id"] != client_instance_id:
+        raise TestError(f"GetTelemetrySubscriptions client id mismatch: {response}")
+    if response["subscription_id"] != 1:
+        raise TestError(f"GetTelemetrySubscriptions subscription mismatch: {response}")
+    if response["accepted_compression_types"] != [0]:
+        raise TestError(f"GetTelemetrySubscriptions compression mismatch: {response}")
+    if response["push_interval_ms"] <= 0 or response["telemetry_max_bytes"] <= 0:
+        raise TestError(f"GetTelemetrySubscriptions limits mismatch: {response}")
+    if response["delta_temporality"]:
+        raise TestError(f"GetTelemetrySubscriptions delta mismatch: {response}")
+    if response["requested_metrics"] != [""]:
+        raise TestError(f"GetTelemetrySubscriptions metrics mismatch: {response}")
+
+
+def parse_push_telemetry_response(response, correlation_id):
+    pos = parse_flexible_response_header(response, correlation_id)
+    throttle_time_ms, pos = read_i32(response, pos)
+    error_code, pos = read_i16(response, pos)
+    pos = skip_tags(response, pos)
+    if pos != len(response):
+        raise TestError(f"PushTelemetry response trailing bytes: {len(response) - pos}")
+    return {"throttle_time_ms": throttle_time_ms, "error_code": error_code}
+
+
+def push_telemetry(port, client_instance_id, subscription_id, metrics, correlation_id):
+    body = client_instance_id
+    body += struct.pack(">i", subscription_id)
+    body += b"\x00"  # terminating=false
+    body += b"\x00"  # compression_type=none
+    body += write_compact_bytes(metrics)
+    body += b"\x00"  # request tagged fields
+    response = flexible_kafka_request(port, 72, 0, correlation_id, body)
+    return parse_push_telemetry_response(response, correlation_id)
+
+
+def require_push_telemetry_success(response):
+    if response["throttle_time_ms"] != 0 or response["error_code"] != 0:
+        raise TestError(f"PushTelemetry mismatch: {response}")
+
+
+def parse_list_client_metrics_resources_response(response, correlation_id):
+    pos = parse_flexible_response_header(response, correlation_id)
+    throttle_time_ms, pos = read_i32(response, pos)
+    error_code, pos = read_i16(response, pos)
+    resource_count, pos = read_compact_array_len(response, pos)
+    resources = []
+    for _ in range(resource_count):
+        name, pos = read_compact_string(response, pos)
+        pos = skip_tags(response, pos)
+        resources.append(name)
+    pos = skip_tags(response, pos)
+    if pos != len(response):
+        raise TestError(
+            f"ListClientMetricsResources response trailing bytes: {len(response) - pos}"
+        )
+    return {
+        "throttle_time_ms": throttle_time_ms,
+        "error_code": error_code,
+        "resources": resources,
+    }
+
+
+def list_client_metrics_resources(port, correlation_id):
+    response = flexible_kafka_request(port, 74, 0, correlation_id, b"\x00")
+    return parse_list_client_metrics_resources_response(response, correlation_id)
+
+
+def require_client_metrics_resources(response, client_instance_id):
+    if response["throttle_time_ms"] != 0 or response["error_code"] != 0:
+        raise TestError(f"ListClientMetricsResources top-level mismatch: {response}")
+    resources = response["resources"]
+    expected_resource = f"client:{client_instance_id.hex()}"
+    if "default" not in resources or expected_resource not in resources:
+        raise TestError(f"ListClientMetricsResources resources mismatch: {response}")
+
+
+def wait_for_client_telemetry_checkpoint(
+    port,
+    client_instance_id,
+    metrics,
+    timeout=30,
+):
+    deadline = time.time() + timeout
+    correlation_id = 8660
+    last_error = None
+    while time.time() < deadline:
+        try:
+            subscription = get_telemetry_subscriptions(
+                port,
+                client_instance_id,
+                correlation_id,
+            )
+            require_telemetry_subscription(subscription, client_instance_id)
+            correlation_id += 1
+            push_response = push_telemetry(
+                port,
+                client_instance_id,
+                subscription["subscription_id"],
+                metrics,
+                correlation_id,
+            )
+            require_push_telemetry_success(push_response)
+            correlation_id += 1
+            resources = list_client_metrics_resources(port, correlation_id)
+            require_client_metrics_resources(resources, client_instance_id)
+            return
+        except Exception as exc:
+            last_error = exc
+        correlation_id += 1
+        time.sleep(0.25)
+    raise TestError(f"Client telemetry checkpoint did not recover: {last_error}")
+
+
 def parse_describe_configs_response(response, correlation_id):
     pos = parse_flexible_response_header(response, correlation_id)
     throttle_time_ms, pos = read_i32(response, pos)
@@ -8545,6 +8708,8 @@ def main():
         scram_iterations = 8192
         scram_salt = bytes([0x11] * 32)
         scram_salted_password = bytes([0x22] * 32)
+        telemetry_client_instance_id = bytes([0x33] * 16)
+        telemetry_metrics = b"\x08\x01"
         kip848_subscription_topic = f"{topic}-kip848-subscription"
         kip848_negative_group_prefix = f"{group}-kip848-negative"
         expected_payloads = []
@@ -8625,11 +8790,19 @@ def main():
                 scram_iterations,
             )
 
+        def wait_for_client_telemetry_probe():
+            wait_for_client_telemetry_checkpoint(
+                broker["port"],
+                telemetry_client_instance_id,
+                telemetry_metrics,
+            )
+
         def wait_for_cluster_visibility_probes():
             wait_for_topic_partitions_probe()
             wait_for_create_partitions_probe()
             wait_for_client_quotas_probe()
             wait_for_scram_credentials_probe()
+            wait_for_client_telemetry_probe()
             wait_for_describe_configs_checkpoint(
                 broker["port"],
                 topic,
@@ -9788,6 +9961,7 @@ def main():
             f"create_partitions_checked=true, "
             f"client_quotas_checked=true, "
             f"scram_credentials_checked=true, "
+            f"client_telemetry_checked=true, "
             f"describe_topic_partitions_checked=true, "
             f"describe_configs_checked=true, "
             f"describe_log_dirs_checked=true, "
@@ -10184,6 +10358,45 @@ def self_test():
             "scram-self-test",
             8192,
         )
+
+        telemetry_client_id = bytes([0x33] * 16)
+        get_telemetry_fixture = struct.pack(">i", 170)
+        get_telemetry_fixture += b"\x00"  # response header tagged fields
+        get_telemetry_fixture += struct.pack(">ih", 0, 0)
+        get_telemetry_fixture += telemetry_client_id
+        get_telemetry_fixture += struct.pack(">i", 1)
+        get_telemetry_fixture += write_compact_array_len(1)
+        get_telemetry_fixture += b"\x00"
+        get_telemetry_fixture += struct.pack(">ii", 60000, 1048576)
+        get_telemetry_fixture += b"\x00"
+        get_telemetry_fixture += write_compact_array_len(1)
+        get_telemetry_fixture += write_compact_string("")
+        get_telemetry_fixture += b"\x00"  # response tagged fields
+        telemetry_subscription = parse_get_telemetry_subscriptions_response(
+            get_telemetry_fixture, 170
+        )
+        require_telemetry_subscription(telemetry_subscription, telemetry_client_id)
+
+        push_telemetry_fixture = struct.pack(">i", 171)
+        push_telemetry_fixture += b"\x00"  # response header tagged fields
+        push_telemetry_fixture += struct.pack(">ih", 0, 0)
+        push_telemetry_fixture += b"\x00"  # response tagged fields
+        pushed_telemetry = parse_push_telemetry_response(push_telemetry_fixture, 171)
+        require_push_telemetry_success(pushed_telemetry)
+
+        list_metrics_fixture = struct.pack(">i", 172)
+        list_metrics_fixture += b"\x00"  # response header tagged fields
+        list_metrics_fixture += struct.pack(">ih", 0, 0)
+        list_metrics_fixture += write_compact_array_len(2)
+        list_metrics_fixture += write_compact_string("default")
+        list_metrics_fixture += b"\x00"  # resource tagged fields
+        list_metrics_fixture += write_compact_string(f"client:{telemetry_client_id.hex()}")
+        list_metrics_fixture += b"\x00"  # resource tagged fields
+        list_metrics_fixture += b"\x00"  # response tagged fields
+        listed_metrics = parse_list_client_metrics_resources_response(
+            list_metrics_fixture, 172
+        )
+        require_client_metrics_resources(listed_metrics, telemetry_client_id)
 
         describe_configs_fixture = struct.pack(">i", 166)
         describe_configs_fixture += b"\x00"  # response header tagged fields

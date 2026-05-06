@@ -38,6 +38,9 @@ operator-facing behavior.
   AlterUserScramCredentials/DescribeUserScramCredentials v0 are live-probed
   with precomputed SCRAM-SHA-256 credential upsertion and exact mechanism and
   iteration visibility.
+  GetTelemetrySubscriptions/PushTelemetry/ListClientMetricsResources v0 are
+  live-probed with a stable client instance id, accepted uncompressed sample,
+  and resource-list visibility.
   Delegation-token APIs 38-41 are advertised with strict
   generated decoding, schema-shaped responses, and broker-local create,
   describe, renew, and expire semantics. Tokens persist across local broker
@@ -308,7 +311,9 @@ dedicated topic with CreatePartitions v2 and validates the expanded partition
 metadata after each transition, mutates/describes a client quota through
 AlterClientQuotas/DescribeClientQuotas v1 while verifying validate-only quota
 requests remain non-mutating, and upserts/describes a SCRAM-SHA-256 user
-through AlterUserScramCredentials/DescribeUserScramCredentials v0.
+through AlterUserScramCredentials/DescribeUserScramCredentials v0. The same
+gate now validates the client telemetry subscription/push/resource APIs through
+each transition with a stable client instance id.
 
 Latest default-suite fail-closed tranche: metadata-client controller discovery
 now surfaces malformed DescribeQuorum responses, including trailing response
