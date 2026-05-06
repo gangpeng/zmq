@@ -124,6 +124,86 @@ def write_compact_i32_array(values):
     return bytes(out)
 
 
+WYHASH_SECRET = (
+    0xA0761D6478BD642F,
+    0xE7037ED1A0B428DB,
+    0x8EBC6AF09C88C6E3,
+    0x589965CC75374CC3,
+)
+UINT64_MASK = (1 << 64) - 1
+
+
+def _wy_read(data, offset, size):
+    return int.from_bytes(data[offset : offset + size], "little")
+
+
+def _wy_mix(a, b):
+    product = (a & UINT64_MASK) * (b & UINT64_MASK)
+    return ((product & UINT64_MASK) ^ (product >> 64)) & UINT64_MASK
+
+
+def wyhash_hash(seed, data):
+    seed &= UINT64_MASK
+    state = [seed ^ _wy_mix(seed ^ WYHASH_SECRET[0], WYHASH_SECRET[1])] * 3
+    length = len(data)
+
+    if length <= 16:
+        if length >= 4:
+            end = length - 4
+            quarter = (length >> 3) << 2
+            a = (_wy_read(data, 0, 4) << 32) | _wy_read(data, quarter, 4)
+            b = (_wy_read(data, end, 4) << 32) | _wy_read(data, end - quarter, 4)
+        elif length > 0:
+            a = (data[0] << 16) | (data[length >> 1] << 8) | data[length - 1]
+            b = 0
+        else:
+            a = 0
+            b = 0
+    else:
+        offset = 0
+        if length >= 48:
+            while offset + 48 < length:
+                for idx in range(3):
+                    a_part = _wy_read(data, offset + 8 * (2 * idx), 8)
+                    b_part = _wy_read(data, offset + 8 * (2 * idx + 1), 8)
+                    state[idx] = _wy_mix(
+                        a_part ^ WYHASH_SECRET[idx + 1],
+                        b_part ^ state[idx],
+                    )
+                offset += 48
+            state[0] = (state[0] ^ state[1] ^ state[2]) & UINT64_MASK
+
+        tail_data = data[offset:]
+        tail_offset = 0
+        while tail_offset + 16 < len(tail_data):
+            state[0] = _wy_mix(
+                _wy_read(tail_data, tail_offset, 8) ^ WYHASH_SECRET[1],
+                _wy_read(tail_data, tail_offset + 8, 8) ^ state[0],
+            )
+            tail_offset += 16
+        a = _wy_read(data, length - 16, 8)
+        b = _wy_read(data, length - 8, 8)
+
+    a ^= WYHASH_SECRET[1]
+    b ^= state[0]
+    product = (a & UINT64_MASK) * (b & UINT64_MASK)
+    a = product & UINT64_MASK
+    b = (product >> 64) & UINT64_MASK
+    return _wy_mix(a ^ WYHASH_SECRET[0] ^ length, b ^ WYHASH_SECRET[1])
+
+
+def derive_replica_directory_id(path):
+    raw = path.encode("utf-8")
+    first = wyhash_hash(0x5A6D715F6C6F6731, raw)
+    second = wyhash_hash(0x5A6D715F6C6F6732, raw)
+    directory_id = bytearray(first.to_bytes(8, "big") + second.to_bytes(8, "big"))
+    directory_id[6] = (directory_id[6] & 0x0F) | 0x40
+    directory_id[8] = (directory_id[8] & 0x3F) | 0x80
+    if all(byte == 0 for byte in directory_id):
+        directory_id[15] = 1
+    return bytes(directory_id)
+
+
 def write_automq_node_tags(tags):
     out = bytearray(write_compact_array_len(len(tags)))
     for key, value in tags:
@@ -1168,6 +1248,140 @@ def wait_for_alter_replica_log_dirs_checkpoint(port, topic, path, timeout=30):
     raise TestError(
         f"AlterReplicaLogDirs did not recover for {topic!r}: {last_error}"
     )
+
+
+def parse_assign_replicas_to_dirs_response(response, correlation_id):
+    pos = parse_flexible_response_header(response, correlation_id)
+    throttle_time_ms, pos = read_i32(response, pos)
+    error_code, pos = read_i16(response, pos)
+    directory_count, pos = read_compact_array_len(response, pos)
+    directories = []
+    for _ in range(directory_count):
+        if pos + 16 > len(response):
+            raise TestError("AssignReplicasToDirs response truncated in directory id")
+        directory_id = response[pos : pos + 16]
+        pos += 16
+        topic_count, pos = read_compact_array_len(response, pos)
+        topics = []
+        for _ in range(topic_count):
+            if pos + 16 > len(response):
+                raise TestError("AssignReplicasToDirs response truncated in topic id")
+            topic_id = response[pos : pos + 16]
+            pos += 16
+            partition_count, pos = read_compact_array_len(response, pos)
+            partitions = []
+            for _ in range(partition_count):
+                partition_index, pos = read_i32(response, pos)
+                partition_error, pos = read_i16(response, pos)
+                pos = skip_tags(response, pos)
+                partitions.append(
+                    {
+                        "partition_index": partition_index,
+                        "error_code": partition_error,
+                    }
+                )
+            pos = skip_tags(response, pos)
+            topics.append({"topic_id": topic_id, "partitions": partitions})
+        pos = skip_tags(response, pos)
+        directories.append({"id": directory_id, "topics": topics})
+    pos = skip_tags(response, pos)
+    if pos != len(response):
+        raise TestError(
+            f"AssignReplicasToDirs response trailing bytes: {len(response) - pos}"
+        )
+    return {
+        "throttle_time_ms": throttle_time_ms,
+        "error_code": error_code,
+        "directories": directories,
+    }
+
+
+def assign_replicas_to_dirs(
+    port, broker_id, broker_epoch, directory_id, topic_id, partition_index, correlation_id
+):
+    body = struct.pack(">iq", broker_id, broker_epoch)
+    body += write_compact_array_len(1)
+    body += directory_id
+    body += write_compact_array_len(1)
+    body += topic_id
+    body += write_compact_array_len(1)
+    body += struct.pack(">i", partition_index)
+    body += b"\x00"  # partition tagged fields
+    body += b"\x00"  # topic tagged fields
+    body += b"\x00"  # directory tagged fields
+    body += b"\x00"  # request tagged fields
+    response = flexible_kafka_request(port, 73, 0, correlation_id, body)
+    return parse_assign_replicas_to_dirs_response(response, correlation_id)
+
+
+def latest_broker_epoch(log_path):
+    marker = "broker_epoch="
+    text = tail(log_path, limit=32000)
+    epoch = None
+    offset = 0
+    while True:
+        idx = text.find(marker, offset)
+        if idx < 0:
+            return epoch
+        start = idx + len(marker)
+        end = start
+        while end < len(text) and text[end].isdigit():
+            end += 1
+        if end > start:
+            epoch = int(text[start:end])
+        offset = end
+
+
+def wait_for_assign_replicas_to_dirs_checkpoint(
+    port, topic, data_dir, log_path, timeout=30
+):
+    deadline = time.time() + timeout
+    correlation_id = 8610
+    directory_id = derive_replica_directory_id(data_dir)
+    last_error = None
+    while time.time() < deadline:
+        try:
+            broker_epoch = latest_broker_epoch(log_path)
+            if broker_epoch is None:
+                raise TestError("broker epoch not yet visible in broker log")
+            topic_response = describe_topic_partitions(port, topic, correlation_id)
+            correlation_id += 1
+            topics = topic_response["topics"]
+            if len(topics) != 1 or topics[0]["name"] != topic:
+                raise TestError(f"AssignReplicasToDirs topic lookup mismatch: {topic_response}")
+            topic_result = topics[0]
+            if topic_result["error_code"] != 0 or len(topic_result["topic_id"]) != 16:
+                raise TestError(f"AssignReplicasToDirs topic lookup error: {topic_response}")
+
+            response = assign_replicas_to_dirs(
+                port,
+                100,
+                broker_epoch,
+                directory_id,
+                topic_result["topic_id"],
+                0,
+                correlation_id,
+            )
+            if response["throttle_time_ms"] != 0 or response["error_code"] != 0:
+                raise TestError(f"AssignReplicasToDirs top-level mismatch: {response}")
+            directories = response["directories"]
+            if len(directories) != 1 or directories[0]["id"] != directory_id:
+                raise TestError(f"AssignReplicasToDirs directory mismatch: {response}")
+            topics = directories[0]["topics"]
+            if len(topics) != 1 or topics[0]["topic_id"] != topic_result["topic_id"]:
+                raise TestError(f"AssignReplicasToDirs response topic mismatch: {response}")
+            partitions = topics[0]["partitions"]
+            if len(partitions) != 1:
+                raise TestError(f"AssignReplicasToDirs partition count mismatch: {response}")
+            partition = partitions[0]
+            if partition["partition_index"] != 0 or partition["error_code"] != 0:
+                raise TestError(f"AssignReplicasToDirs partition error: {response}")
+            return
+        except Exception as exc:
+            last_error = exc
+        correlation_id += 1
+        time.sleep(0.25)
+    raise TestError(f"AssignReplicasToDirs did not recover for {topic!r}: {last_error}")
 
 
 def parse_nullable_compact_i32_array(buf, pos):
@@ -7732,6 +7946,12 @@ def main():
                 topic,
                 broker["data_dir"],
             )
+            wait_for_assign_replicas_to_dirs_checkpoint(
+                broker["port"],
+                topic,
+                broker["data_dir"],
+                broker["log_path"],
+            )
             wait_for_describe_cluster_checkpoint(
                 broker["port"],
                 100,
@@ -8850,6 +9070,7 @@ def main():
             f"describe_configs_checked=true, "
             f"describe_log_dirs_checked=true, "
             f"alter_replica_log_dirs_checked=true, "
+            f"assign_replicas_to_dirs_checked=true, "
             f"describe_cluster_checked=true, "
             f"idempotent_producer_fencing=true, "
             f"describe_producers_checked=true, "
@@ -8893,6 +9114,14 @@ def self_test():
 
     old_env = os.environ.copy()
     try:
+        if wyhash_hash(2, b"abc") != 0x32DD92E4B2915153:
+            raise TestError("wyhash test vector failed")
+        directory_id = derive_replica_directory_id("/tmp/zmq-self-test-dir")
+        if len(directory_id) != 16 or directory_id[6] >> 4 != 4:
+            raise TestError(f"replica directory id derivation failed: {directory_id!r}")
+        if directory_id[8] & 0xC0 != 0x80:
+            raise TestError(f"replica directory variant derivation failed: {directory_id!r}")
+
         os.environ.pop("ZMQ_KRAFT_NETWORK_DOWN", None)
         os.environ.pop("ZMQ_KRAFT_NETWORK_UP", None)
         if network_hooks_configured():
@@ -9225,6 +9454,37 @@ def self_test():
         ):
             raise TestError(
                 f"AlterReplicaLogDirs fixture parser failed: {altered_log_dirs}"
+            )
+
+        assign_dir_id = bytes(range(16))
+        assign_topic_id = bytes(reversed(range(16)))
+        assign_dirs_fixture = struct.pack(">i", 169)
+        assign_dirs_fixture += b"\x00"  # response header tagged fields
+        assign_dirs_fixture += struct.pack(">ih", 0, 0)
+        assign_dirs_fixture += write_compact_array_len(1)
+        assign_dirs_fixture += assign_dir_id
+        assign_dirs_fixture += write_compact_array_len(1)
+        assign_dirs_fixture += assign_topic_id
+        assign_dirs_fixture += write_compact_array_len(1)
+        assign_dirs_fixture += struct.pack(">ih", 0, 0)
+        assign_dirs_fixture += b"\x00"  # partition tagged fields
+        assign_dirs_fixture += b"\x00"  # topic tagged fields
+        assign_dirs_fixture += b"\x00"  # directory tagged fields
+        assign_dirs_fixture += b"\x00"  # response tagged fields
+        assigned_dirs = parse_assign_replicas_to_dirs_response(
+            assign_dirs_fixture, 169
+        )
+        if (
+            assigned_dirs["directories"][0]["id"] != assign_dir_id
+            or assigned_dirs["directories"][0]["topics"][0]["topic_id"]
+            != assign_topic_id
+            or assigned_dirs["directories"][0]["topics"][0]["partitions"][0][
+                "error_code"
+            ]
+            != 0
+        ):
+            raise TestError(
+                f"AssignReplicasToDirs fixture parser failed: {assigned_dirs}"
             )
 
         topic_partitions_fixture = struct.pack(">i", 164)
