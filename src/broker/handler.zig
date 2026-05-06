@@ -22142,13 +22142,13 @@ pub const Broker = struct {
 
         if (!validateGetTelemetrySubscriptionsRequestFrame(request_bytes, body_start)) {
             log.warn("Malformed GetTelemetrySubscriptions request", .{});
-            return null;
+            return self.getTelemetrySubscriptionsErrorResponse(req_header, resp_header_version, api_version, ErrorCode.invalid_request);
         }
 
         var pos = body_start;
         const req = Req.deserialize(self.allocator, request_bytes, &pos, api_version) catch |err| {
             log.warn("Failed to decode GetTelemetrySubscriptions request: {}", .{err});
-            return null;
+            return self.getTelemetrySubscriptionsErrorResponse(req_header, resp_header_version, api_version, ErrorCode.invalid_request);
         };
 
         const accepted_compression_types = [_]i8{0};
@@ -22164,6 +22164,23 @@ pub const Broker = struct {
             .delta_temporality = false,
             .requested_metrics = &requested_metrics,
         };
+        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version) orelse
+            self.getTelemetrySubscriptionsErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error);
+    }
+
+    fn getTelemetrySubscriptionsErrorResponse(self: *Broker, req_header: *const RequestHeader, resp_header_version: i16, api_version: i16, err_code: ErrorCode) ?[]u8 {
+        const Resp = generated.get_telemetry_subscriptions_response.GetTelemetrySubscriptionsResponse;
+        const resp = Resp{
+            .throttle_time_ms = 0,
+            .error_code = @intFromEnum(err_code),
+            .client_instance_id = [_]u8{0} ** 16,
+            .subscription_id = 0,
+            .accepted_compression_types = &.{},
+            .push_interval_ms = 0,
+            .telemetry_max_bytes = 0,
+            .delta_temporality = false,
+            .requested_metrics = &.{},
+        };
         return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
     }
 
@@ -22173,13 +22190,13 @@ pub const Broker = struct {
 
         if (!validatePushTelemetryRequestFrame(request_bytes, body_start)) {
             log.warn("Malformed PushTelemetry request", .{});
-            return null;
+            return self.pushTelemetryErrorResponse(req_header, resp_header_version, api_version, ErrorCode.invalid_request);
         }
 
         var pos = body_start;
         const req = Req.deserialize(self.allocator, request_bytes, &pos, api_version) catch |err| {
             log.warn("Failed to decode PushTelemetry request: {}", .{err});
-            return null;
+            return self.pushTelemetryErrorResponse(req_header, resp_header_version, api_version, ErrorCode.invalid_request);
         };
 
         const metrics_len = if (req.metrics) |metrics| metrics.len else 0;
@@ -22195,17 +22212,22 @@ pub const Broker = struct {
         if (error_code == @intFromEnum(ErrorCode.none)) {
             self.recordClientTelemetry(req.client_instance_id, req.metrics, req.terminating) catch |err| {
                 log.warn("Failed to record/export client telemetry: {}", .{err});
-                const resp = Resp{
-                    .throttle_time_ms = 0,
-                    .error_code = @intFromEnum(ErrorCode.kafka_storage_error),
-                };
-                return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+                return self.pushTelemetryErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error);
             };
         }
 
         const resp = Resp{
             .throttle_time_ms = 0,
             .error_code = error_code,
+        };
+        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+    }
+
+    fn pushTelemetryErrorResponse(self: *Broker, req_header: *const RequestHeader, resp_header_version: i16, api_version: i16, err_code: ErrorCode) ?[]u8 {
+        const Resp = generated.push_telemetry_response.PushTelemetryResponse;
+        const resp = Resp{
+            .throttle_time_ms = 0,
+            .error_code = @intFromEnum(err_code),
         };
         return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
     }
@@ -41093,16 +41115,24 @@ test "Broker.handleRequest GetTelemetrySubscriptions authorization denial uses g
 }
 
 test "Broker.handleRequest GetTelemetrySubscriptions rejects truncated request" {
+    const Resp = generated.get_telemetry_subscriptions_response.GetTelemetrySubscriptionsResponse;
+
     var broker = Broker.init(testing.allocator, 1, 9092);
     defer broker.deinit();
 
     var buf: [128]u8 = undefined;
     const req_len = buildTestRequest(&buf, 71, 0, 7101, header_mod.requestHeaderVersion(71, 0));
-    try testing.expect(broker.handleRequest(buf[0..req_len]) == null);
+    const response = broker.handleRequest(buf[0..req_len]);
+    try testing.expect(response != null);
+    defer testing.allocator.free(response.?);
+
+    const error_code = try readGeneratedTopLevelErrorCode(Resp, response.?, 71, 0, 7101);
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.invalid_request)), error_code);
 }
 
 test "Broker.handleRequest GetTelemetrySubscriptions rejects trailing bytes" {
     const Req = generated.get_telemetry_subscriptions_request.GetTelemetrySubscriptionsRequest;
+    const Resp = generated.get_telemetry_subscriptions_response.GetTelemetrySubscriptionsResponse;
 
     var broker = Broker.init(testing.allocator, 1, 9092);
     defer broker.deinit();
@@ -41113,7 +41143,36 @@ test "Broker.handleRequest GetTelemetrySubscriptions rejects trailing bytes" {
     var pos = buildTestRequest(&buf, 71, 0, 7102, header_mod.requestHeaderVersion(71, 0));
     req.serialize(&buf, &pos, 0);
 
-    try expectTrailingByteRejected(&broker, buf[0..], pos);
+    try expectTrailingByteRejectedWithGeneratedResponse(Resp, &broker, buf[0..], pos, 71, 0, 7102);
+}
+
+test "Broker.handleRequest GetTelemetrySubscriptions fails closed when response serialization fails" {
+    const Req = generated.get_telemetry_subscriptions_request.GetTelemetrySubscriptionsRequest;
+    const Resp = generated.get_telemetry_subscriptions_response.GetTelemetrySubscriptionsResponse;
+
+    var broker = Broker.init(testing.allocator, 7, 9092);
+    defer broker.deinit();
+    try broker.authorizer.addSuperUser("test-client");
+
+    const zero_uuid = [_]u8{0} ** 16;
+    const req = Req{ .client_instance_id = zero_uuid };
+    var buf: [128]u8 = undefined;
+    var pos = buildTestRequest(&buf, 71, 0, 7104, header_mod.requestHeaderVersion(71, 0));
+    req.serialize(&buf, &pos, 0);
+
+    var failing_allocator = OneShotFailingAllocator.init(testing.allocator, 0);
+    const response_allocator = failing_allocator.allocator();
+    broker.allocator = response_allocator;
+
+    const response = broker.handleRequest(buf[0..pos]);
+    broker.allocator = testing.allocator;
+
+    try testing.expect(failing_allocator.failed);
+    try testing.expect(response != null);
+    defer response_allocator.free(response.?);
+
+    const error_code = try readGeneratedTopLevelErrorCode(Resp, response.?, 71, 0, 7104);
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.kafka_storage_error)), error_code);
 }
 
 test "Broker.handleRequest PushTelemetry accepts default subscription" {
@@ -41451,16 +41510,24 @@ test "Broker.handleRequest PushTelemetry authorization denial uses generated res
 }
 
 test "Broker.handleRequest PushTelemetry rejects truncated request" {
+    const Resp = generated.push_telemetry_response.PushTelemetryResponse;
+
     var broker = Broker.init(testing.allocator, 1, 9092);
     defer broker.deinit();
 
     var buf: [128]u8 = undefined;
-    const req_len = buildTestRequest(&buf, 72, 0, 7201, header_mod.requestHeaderVersion(72, 0));
-    try testing.expect(broker.handleRequest(buf[0..req_len]) == null);
+    const req_len = buildTestRequest(&buf, 72, 0, 7204, header_mod.requestHeaderVersion(72, 0));
+    const response = broker.handleRequest(buf[0..req_len]);
+    try testing.expect(response != null);
+    defer testing.allocator.free(response.?);
+
+    const error_code = try readGeneratedTopLevelErrorCode(Resp, response.?, 72, 0, 7204);
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.invalid_request)), error_code);
 }
 
 test "Broker.handleRequest PushTelemetry rejects trailing bytes" {
     const Req = generated.push_telemetry_request.PushTelemetryRequest;
+    const Resp = generated.push_telemetry_response.PushTelemetryResponse;
 
     var broker = Broker.init(testing.allocator, 1, 9092);
     defer broker.deinit();
@@ -41475,10 +41542,10 @@ test "Broker.handleRequest PushTelemetry rejects trailing bytes" {
         .metrics = &metrics,
     };
     var buf: [128]u8 = undefined;
-    var pos = buildTestRequest(&buf, 72, 0, 7202, header_mod.requestHeaderVersion(72, 0));
+    var pos = buildTestRequest(&buf, 72, 0, 7205, header_mod.requestHeaderVersion(72, 0));
     req.serialize(&buf, &pos, 0);
 
-    try expectTrailingByteRejected(&broker, buf[0..], pos);
+    try expectTrailingByteRejectedWithGeneratedResponse(Resp, &broker, buf[0..], pos, 72, 0, 7205);
 }
 
 test "Broker.handleRequest AlterReplicaLogDirs stores local directory assignments" {
