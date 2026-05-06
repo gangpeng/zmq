@@ -52,6 +52,9 @@ operator-facing behavior.
 - AlterUserScramCredentials now pre-serializes successful mutation responses and
   retries generated storage-error responses so allocation pressure cannot change
   SCRAM credential state while returning no response frame.
+- CreateAcls now pre-serializes successful mutation responses and retries
+  generated storage-error responses so allocation pressure cannot add ACLs while
+  returning no response frame.
 - UpdateFeatures now pre-serializes successful mutation responses and retries
   generated storage-error responses so allocation pressure cannot finalize
   feature metadata while returning no response frame.
