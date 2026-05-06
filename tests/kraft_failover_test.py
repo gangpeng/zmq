@@ -48,6 +48,8 @@ ERROR_UNKNOWN_TOPIC_OR_PARTITION = 3
 ERROR_TOPIC_ALREADY_EXISTS = 36
 ERROR_GROUP_ID_NOT_FOUND = 69
 ERROR_SNAPSHOT_NOT_FOUND = 98
+ERROR_RESOURCE_NOT_FOUND = 91
+ERROR_INVALID_UPDATE_VERSION = 95
 ERROR_UNKNOWN_MEMBER_ID = 25
 ERROR_INVALID_REQUEST = 42
 ERROR_FENCED_MEMBER_EPOCH = 110
@@ -1528,6 +1530,225 @@ def wait_for_controller_api_versions_checkpoint(
         time.sleep(0.25)
     raise TestError(
         f"Controller ApiVersions did not recover during {label}: {last_error}"
+    )
+
+
+def raft_voter_directory_id(voter_id):
+    if voter_id < 0:
+        raise TestError(f"invalid negative voter_id={voter_id}")
+    return voter_id.to_bytes(16, "big", signed=False)
+
+
+def write_raft_voter_listener(name, host, port):
+    if port <= 0 or port > 65535:
+        raise TestError(f"invalid raft voter listener port={port}")
+    body = bytearray()
+    body += write_compact_string(name)
+    body += write_compact_string(host)
+    body += struct.pack(">H", port)
+    body += b"\x00"  # listener tagged fields
+    return bytes(body)
+
+
+def parse_raft_voter_response(
+    response,
+    correlation_id,
+    response_name,
+    has_error_message=True,
+):
+    pos = parse_flexible_response_header(response, correlation_id)
+    throttle_time_ms, pos = read_i32(response, pos)
+    error_code, pos = read_i16(response, pos)
+    error_message = None
+    if has_error_message:
+        error_message, pos = read_compact_string(response, pos)
+    pos = skip_tags(response, pos)
+    if pos != len(response):
+        raise TestError(
+            f"{response_name} response trailing bytes: {len(response) - pos}"
+        )
+    return {
+        "throttle_time_ms": throttle_time_ms,
+        "error_code": error_code,
+        "error_message": error_message,
+    }
+
+
+def require_raft_voter_error(response, expected_error_code, response_name, label):
+    if response["throttle_time_ms"] != 0:
+        raise TestError(
+            f"{response_name} throttle mismatch during {label}: {response}"
+        )
+    if response["error_code"] != expected_error_code:
+        raise TestError(
+            f"{response_name} error mismatch during {label}: "
+            f"expected={expected_error_code} response={response}"
+        )
+
+
+def add_raft_voter_empty_listeners(port, voter_id, correlation_id):
+    body = bytearray()
+    body += write_compact_string(CLUSTER_ID)
+    body += struct.pack(">ii", 1000, voter_id)
+    body += raft_voter_directory_id(voter_id)
+    body += write_compact_array_len(0)
+    body += b"\x00"  # request tagged fields
+    response = flexible_kafka_request(port, 80, 0, correlation_id, bytes(body))
+    return parse_raft_voter_response(response, correlation_id, "AddRaftVoter")
+
+
+def remove_raft_voter_unknown(port, voter_id, correlation_id):
+    body = bytearray()
+    body += write_compact_string(CLUSTER_ID)
+    body += struct.pack(">i", voter_id)
+    body += raft_voter_directory_id(voter_id)
+    body += b"\x00"  # request tagged fields
+    response = flexible_kafka_request(port, 81, 0, correlation_id, bytes(body))
+    return parse_raft_voter_response(response, correlation_id, "RemoveRaftVoter")
+
+
+def update_raft_voter(
+    port,
+    voter_id,
+    listener_port,
+    min_supported_version,
+    max_supported_version,
+    correlation_id,
+):
+    body = bytearray()
+    body += write_compact_string(CLUSTER_ID)
+    body += struct.pack(">i", voter_id)
+    body += raft_voter_directory_id(voter_id)
+    body += write_compact_array_len(1)
+    body += write_raft_voter_listener("CONTROLLER", "127.0.0.1", listener_port)
+    body += struct.pack(">hh", min_supported_version, max_supported_version)
+    body += b"\x00"  # KRaftVersionFeature tagged fields
+    body += b"\x00"  # request tagged fields
+    response = flexible_kafka_request(port, 82, 0, correlation_id, bytes(body))
+    return parse_raft_voter_response(
+        response,
+        correlation_id,
+        "UpdateRaftVoter",
+        has_error_message=False,
+    )
+
+
+def require_dynamic_voter_quorum_unchanged(quorum, expected_ports, label):
+    expected_node_ids = sorted(expected_ports)
+    if quorum["partition_error_code"] != ERROR_NONE:
+        raise TestError(
+            f"DescribeQuorum after dynamic voter probes failed during {label}: {quorum}"
+        )
+    if sorted(quorum["voters"]) != expected_node_ids:
+        raise TestError(
+            f"dynamic voter probes changed voter set during {label}: "
+            f"expected={expected_node_ids} quorum={quorum}"
+        )
+    node_ports = {}
+    for node in quorum["nodes"]:
+        controller_listeners = [
+            listener
+            for listener in node["listeners"]
+            if listener["name"] == "CONTROLLER"
+        ]
+        if len(controller_listeners) != 1:
+            raise TestError(
+                f"dynamic voter probes changed node listeners during {label}: "
+                f"{node}"
+            )
+        node_ports[node["node_id"]] = controller_listeners[0]["port"]
+    if node_ports != expected_ports:
+        raise TestError(
+            f"dynamic voter probes changed endpoints during {label}: "
+            f"expected={expected_ports} actual={node_ports}"
+        )
+
+
+def wait_for_dynamic_raft_voter_negative_checkpoint(
+    port,
+    expected_ports,
+    state,
+    label,
+    timeout=30,
+):
+    deadline = time.time() + timeout
+    correlation_id = state.get("correlation_id", 9440)
+    existing_voter_id = sorted(expected_ports)[0]
+    unknown_voter_id = max(expected_ports) + 50000
+    last_error = None
+    while time.time() < deadline:
+        try:
+            add_response = add_raft_voter_empty_listeners(
+                port,
+                unknown_voter_id,
+                correlation_id,
+            )
+            require_raft_voter_error(
+                add_response,
+                ERROR_INVALID_REQUEST,
+                "AddRaftVoter",
+                label,
+            )
+
+            remove_response = remove_raft_voter_unknown(
+                port,
+                unknown_voter_id,
+                correlation_id + 1,
+            )
+            require_raft_voter_error(
+                remove_response,
+                ERROR_RESOURCE_NOT_FOUND,
+                "RemoveRaftVoter",
+                label,
+            )
+
+            update_unknown = update_raft_voter(
+                port,
+                unknown_voter_id,
+                65535,
+                0,
+                0,
+                correlation_id + 2,
+            )
+            require_raft_voter_error(
+                update_unknown,
+                ERROR_RESOURCE_NOT_FOUND,
+                "UpdateRaftVoter unknown voter",
+                label,
+            )
+
+            update_invalid_feature = update_raft_voter(
+                port,
+                existing_voter_id,
+                expected_ports[existing_voter_id],
+                2,
+                1,
+                correlation_id + 3,
+            )
+            require_raft_voter_error(
+                update_invalid_feature,
+                ERROR_INVALID_UPDATE_VERSION,
+                "UpdateRaftVoter invalid feature",
+                label,
+            )
+
+            quorum = describe_quorum_v2(port, correlation_id + 4)
+            require_dynamic_voter_quorum_unchanged(quorum, expected_ports, label)
+            state["correlation_id"] = correlation_id + 5
+            return {
+                "add_empty_listeners": add_response,
+                "remove_unknown": remove_response,
+                "update_unknown": update_unknown,
+                "update_invalid_feature": update_invalid_feature,
+                "quorum": quorum,
+            }
+        except Exception as exc:
+            last_error = exc
+        correlation_id += 5
+        time.sleep(0.25)
+    raise TestError(
+        f"dynamic Raft voter negative probes did not recover during {label}: "
+        f"{last_error}"
     )
 
 
@@ -10545,6 +10766,13 @@ def main():
             fetch_snapshot_state,
             "initial leader",
         )
+        dynamic_voter_state = {"correlation_id": 9440}
+        wait_for_dynamic_raft_voter_negative_checkpoint(
+            processes[leader_id]["port"],
+            ports,
+            dynamic_voter_state,
+            "initial leader",
+        )
 
         broker = start_broker(tmp, voters)
         wait_for_broker_ready(broker["proc"], broker["port"], broker["log_path"])
@@ -11179,6 +11407,12 @@ def main():
                 producer_id_state,
                 "network partition matrix",
             )
+            wait_for_dynamic_raft_voter_negative_checkpoint(
+                processes[leader_id]["port"],
+                ports,
+                dynamic_voter_state,
+                "network partition matrix",
+            )
         wait_for_log_position_checkpoint(
             broker["port"],
             topic,
@@ -11315,6 +11549,12 @@ def main():
         wait_for_allocate_producer_ids_checkpoint(
             processes[replacement_leader]["port"],
             producer_id_state,
+            "controller leader failover",
+        )
+        wait_for_dynamic_raft_voter_negative_checkpoint(
+            processes[replacement_leader]["port"],
+            ports,
+            dynamic_voter_state,
             "controller leader failover",
         )
         wait_for_payloads(broker["port"], topic, expected_payloads)
@@ -11491,6 +11731,12 @@ def main():
             producer_id_state,
             "old leader fresh rejoin",
         )
+        wait_for_dynamic_raft_voter_negative_checkpoint(
+            processes[replacement_leader]["port"],
+            ports,
+            dynamic_voter_state,
+            "old leader fresh rejoin",
+        )
 
         wait_for_payloads(broker["port"], topic, expected_payloads)
         wait_for_log_position_checkpoint(
@@ -11662,6 +11908,12 @@ def main():
             producer_id_state,
             "surviving controller restart",
         )
+        wait_for_dynamic_raft_voter_negative_checkpoint(
+            processes[replacement_leader]["port"],
+            ports,
+            dynamic_voter_state,
+            "surviving controller restart",
+        )
 
         wait_for_payloads(broker["port"], topic, expected_payloads)
         wait_for_log_position_checkpoint(
@@ -11818,6 +12070,12 @@ def main():
         wait_for_allocate_producer_ids_checkpoint(
             processes[replacement_leader]["port"],
             producer_id_state,
+            "broker restart",
+        )
+        wait_for_dynamic_raft_voter_negative_checkpoint(
+            processes[replacement_leader]["port"],
+            ports,
+            dynamic_voter_state,
             "broker restart",
         )
         wait_for_payloads(broker["port"], topic, expected_payloads)
@@ -12084,6 +12342,7 @@ def main():
             f"describe_quorum_v2_checked=true, "
             f"fetch_snapshot_v1_checked=true, "
             f"controller_api_versions_checked=true, "
+            f"dynamic_raft_voter_negative_checked=true, "
             f"committed_offset={committed_offset}, "
             f"transactions_checked=5, "
             f"transaction_introspection_checked=true, "
@@ -12722,6 +12981,40 @@ def self_test():
             187,
         )
         require_controller_api_versions(controller_api_versions)
+
+        add_voter_fixture = struct.pack(">i", 188)
+        add_voter_fixture += b"\x00"  # response header tagged fields
+        add_voter_fixture += struct.pack(">ih", 0, ERROR_INVALID_REQUEST)
+        add_voter_fixture += write_compact_string(None)
+        add_voter_fixture += b"\x00"  # response tagged fields
+        add_voter_response = parse_raft_voter_response(
+            add_voter_fixture,
+            188,
+            "AddRaftVoter",
+        )
+        require_raft_voter_error(
+            add_voter_response,
+            ERROR_INVALID_REQUEST,
+            "AddRaftVoter fixture",
+            "self-test",
+        )
+
+        update_voter_fixture = struct.pack(">i", 189)
+        update_voter_fixture += b"\x00"  # response header tagged fields
+        update_voter_fixture += struct.pack(">ih", 0, ERROR_INVALID_UPDATE_VERSION)
+        update_voter_fixture += b"\x00"  # response tagged fields
+        update_voter_response = parse_raft_voter_response(
+            update_voter_fixture,
+            189,
+            "UpdateRaftVoter",
+            has_error_message=False,
+        )
+        require_raft_voter_error(
+            update_voter_response,
+            ERROR_INVALID_UPDATE_VERSION,
+            "UpdateRaftVoter fixture",
+            "self-test",
+        )
 
         acl_fixture = {
             "resource_type": ACL_RESOURCE_TYPE_TOPIC,
