@@ -25705,19 +25705,22 @@ pub const Broker = struct {
 
         if (!validateDescribeTopicPartitionsRequestFrame(request_bytes, body_start)) {
             log.warn("Malformed DescribeTopicPartitions request", .{});
-            return null;
+            return self.describeTopicPartitionsErrorResponse(req_header, resp_header_version, api_version, ErrorCode.invalid_request);
         }
 
         var pos = body_start;
         var req = Req.deserialize(self.allocator, request_bytes, &pos, api_version) catch |err| {
             log.warn("Failed to decode DescribeTopicPartitions request: {}", .{err});
-            return null;
+            return self.describeTopicPartitionsErrorResponse(req_header, resp_header_version, api_version, ErrorCode.invalid_request);
         };
         defer self.freeDescribeTopicPartitionsRequest(&req);
 
         var topic_responses: []TopicResponse = &.{};
         if (req.topics.len > 0) {
-            topic_responses = self.allocator.alloc(TopicResponse, req.topics.len) catch return null;
+            topic_responses = self.allocator.alloc(TopicResponse, req.topics.len) catch |err| {
+                log.warn("DescribeTopicPartitions topic response allocation failed: {}", .{err});
+                return self.describeTopicPartitionsErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error);
+            };
         }
         var topic_init: usize = 0;
         defer {
@@ -25760,7 +25763,10 @@ pub const Broker = struct {
                 }
 
                 const remaining_limit = partition_limit - emitted_partitions;
-                const build = self.buildDescribeTopicPartitionsTopicResponse(topic_name, topic_req.name, start_partition, remaining_limit) catch return null;
+                const build = self.buildDescribeTopicPartitionsTopicResponse(topic_name, topic_req.name, start_partition, remaining_limit) catch |err| {
+                    log.warn("DescribeTopicPartitions response materialization failed: {}", .{err});
+                    return self.describeTopicPartitionsErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error);
+                };
                 topic_responses[topic_init] = build.topic;
                 topic_init += 1;
                 emitted_partitions += build.emitted_partitions;
@@ -25777,7 +25783,10 @@ pub const Broker = struct {
             .topics = topic_responses[0..topic_init],
             .next_cursor = next_cursor,
         };
-        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version) orelse {
+            log.warn("DescribeTopicPartitions response serialization failed", .{});
+            return self.describeTopicPartitionsErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error);
+        };
     }
 
     const DescribeTopicPartitionsBuildResult = struct {
@@ -25785,6 +25794,26 @@ pub const Broker = struct {
         emitted_partitions: usize,
         next_partition_index: ?i32 = null,
     };
+
+    fn describeTopicPartitionsErrorResponse(self: *Broker, req_header: *const RequestHeader, resp_header_version: i16, api_version: i16, err_code: ErrorCode) ?[]u8 {
+        const Resp = generated.describe_topic_partitions_response.DescribeTopicPartitionsResponse;
+        const TopicResponse = Resp.DescribeTopicPartitionsResponseTopic;
+
+        const topics = [_]TopicResponse{.{
+            .error_code = @intFromEnum(err_code),
+            .name = "",
+            .topic_id = zeroUuid(),
+            .is_internal = false,
+            .partitions = &.{},
+            .topic_authorized_operations = std.math.minInt(i32),
+        }};
+        const resp = Resp{
+            .throttle_time_ms = 0,
+            .topics = &topics,
+            .next_cursor = null,
+        };
+        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+    }
 
     fn freeDescribeTopicPartitionsRequest(self: *Broker, req: *generated.describe_topic_partitions_request.DescribeTopicPartitionsRequest) void {
         if (req.topics.len > 0) self.allocator.free(req.topics);
@@ -29081,6 +29110,28 @@ fn freeDeserializedDescribeTopicPartitionsResponse(resp: *const generated.descri
         if (topic.partitions.len > 0) testing.allocator.free(topic.partitions);
     }
     if (resp.topics.len > 0) testing.allocator.free(resp.topics);
+}
+
+fn expectDescribeTopicPartitionsErrorResponseBytes(response: []const u8, correlation_id: i32, err_code: ErrorCode) !void {
+    const Resp = generated.describe_topic_partitions_response.DescribeTopicPartitionsResponse;
+
+    var rpos: usize = 0;
+    var response_header = try ResponseHeader.deserialize(testing.allocator, response, &rpos, header_mod.responseHeaderVersion(75, 0));
+    defer response_header.deinit(testing.allocator);
+    try testing.expectEqual(correlation_id, response_header.correlation_id);
+
+    const resp = try Resp.deserialize(testing.allocator, response, &rpos, 0);
+    defer freeDeserializedDescribeTopicPartitionsResponse(&resp);
+
+    try testing.expectEqual(response.len, rpos);
+    try testing.expectEqual(@as(i32, 0), resp.throttle_time_ms);
+    try testing.expectEqual(@as(usize, 1), resp.topics.len);
+    try testing.expectEqual(@as(i16, @intFromEnum(err_code)), resp.topics[0].error_code);
+    try testing.expectEqualStrings("", resp.topics[0].name.?);
+    const expected_topic_id = [_]u8{0} ** 16;
+    try testing.expectEqualSlices(u8, &expected_topic_id, &resp.topics[0].topic_id);
+    try testing.expectEqual(@as(usize, 0), resp.topics[0].partitions.len);
+    try testing.expect(resp.next_cursor == null);
 }
 
 fn freeDeserializedDescribeClientQuotasResponse(resp: *const generated.describe_client_quotas_response.DescribeClientQuotasResponse) void {
@@ -51071,7 +51122,11 @@ test "Broker.handleRequest DescribeTopicPartitions rejects truncated request" {
 
     var buf: [128]u8 = undefined;
     const req_len = buildTestRequest(&buf, 75, 0, 7502, header_mod.requestHeaderVersion(75, 0));
-    try testing.expect(broker.handleRequest(buf[0..req_len]) == null);
+    const response = broker.handleRequest(buf[0..req_len]);
+    try testing.expect(response != null);
+    defer testing.allocator.free(response.?);
+
+    try expectDescribeTopicPartitionsErrorResponseBytes(response.?, 7502, ErrorCode.invalid_request);
 }
 
 test "Broker.handleRequest DescribeTopicPartitions rejects trailing bytes" {
@@ -51090,7 +51145,44 @@ test "Broker.handleRequest DescribeTopicPartitions rejects trailing bytes" {
     var pos = buildTestRequest(&buf, 75, 0, 7503, header_mod.requestHeaderVersion(75, 0));
     req.serialize(&buf, &pos, 0);
 
-    try expectTrailingByteRejected(&broker, &buf, pos);
+    try testing.expect(pos < buf.len);
+    buf[pos] = 0x7f;
+    const response = broker.handleRequest(buf[0 .. pos + 1]);
+    try testing.expect(response != null);
+    defer testing.allocator.free(response.?);
+
+    try expectDescribeTopicPartitionsErrorResponseBytes(response.?, 7503, ErrorCode.invalid_request);
+}
+
+test "Broker.handleRequest DescribeTopicPartitions fails closed when response materialization fails" {
+    const Req = generated.describe_topic_partitions_request.DescribeTopicPartitionsRequest;
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+    try broker.authorizer.addSuperUser("test-client");
+
+    const topics = [_]Req.TopicRequest{.{ .name = "dtp-storage-fail-topic" }};
+    const req = Req{
+        .topics = &topics,
+        .response_partition_limit = 1,
+    };
+
+    var buf: [256]u8 = undefined;
+    var pos = buildTestRequest(&buf, 75, 0, 7504, header_mod.requestHeaderVersion(75, 0));
+    req.serialize(&buf, &pos, 0);
+
+    var failing_allocator = OneShotFailingAllocator.init(testing.allocator, 1);
+    const response_allocator = failing_allocator.allocator();
+    broker.allocator = response_allocator;
+
+    const response = broker.handleRequest(buf[0..pos]);
+    broker.allocator = testing.allocator;
+
+    try testing.expect(failing_allocator.failed);
+    try testing.expect(response != null);
+    defer response_allocator.free(response.?);
+
+    try expectDescribeTopicPartitionsErrorResponseBytes(response.?, 7504, ErrorCode.kafka_storage_error);
 }
 
 // ---------------------------------------------------------------
