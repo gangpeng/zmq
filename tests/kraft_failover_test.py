@@ -635,6 +635,109 @@ def wait_for_record_batch_result(port, topic, record_batch, expected_error, time
     )
 
 
+def parse_describe_producers_response(response, correlation_id):
+    pos = parse_flexible_response_header(response, correlation_id)
+    _, pos = read_i32(response, pos)  # throttle_time_ms
+    topic_count, pos = read_compact_array_len(response, pos)
+    topics = []
+    for _ in range(topic_count):
+        topic_name, pos = read_compact_string(response, pos)
+        partition_count, pos = read_compact_array_len(response, pos)
+        partitions = []
+        for _ in range(partition_count):
+            partition_index, pos = read_i32(response, pos)
+            error_code, pos = read_i16(response, pos)
+            error_message, pos = read_compact_string(response, pos)
+            producer_count, pos = read_compact_array_len(response, pos)
+            active_producers = []
+            for _ in range(producer_count):
+                producer_id, pos = read_i64(response, pos)
+                producer_epoch, pos = read_i32(response, pos)
+                last_sequence, pos = read_i32(response, pos)
+                last_timestamp, pos = read_i64(response, pos)
+                coordinator_epoch, pos = read_i32(response, pos)
+                current_txn_start_offset, pos = read_i64(response, pos)
+                pos = skip_tags(response, pos)
+                active_producers.append(
+                    {
+                        "producer_id": producer_id,
+                        "producer_epoch": producer_epoch,
+                        "last_sequence": last_sequence,
+                        "last_timestamp": last_timestamp,
+                        "coordinator_epoch": coordinator_epoch,
+                        "current_txn_start_offset": current_txn_start_offset,
+                    }
+                )
+            pos = skip_tags(response, pos)
+            partitions.append(
+                {
+                    "partition_index": partition_index,
+                    "error_code": error_code,
+                    "error_message": error_message,
+                    "active_producers": active_producers,
+                }
+            )
+        pos = skip_tags(response, pos)
+        topics.append({"name": topic_name, "partitions": partitions})
+    pos = skip_tags(response, pos)
+    if pos != len(response):
+        raise TestError(
+            f"DescribeProducers response trailing bytes: {len(response) - pos}"
+        )
+    return topics
+
+
+def describe_producers(port, topic, correlation_id):
+    body = write_compact_array_len(1)
+    body += write_compact_string(topic)
+    body += write_compact_i32_array([0])
+    body += b"\x00"  # topic tagged fields
+    body += b"\x00"  # request tagged fields
+    response = flexible_kafka_request(port, 61, 0, correlation_id, body)
+    return parse_describe_producers_response(response, correlation_id)
+
+
+def wait_for_describe_producers_checkpoint(
+    port, topic, identity, min_last_sequence, timeout=30
+):
+    deadline = time.time() + timeout
+    correlation_id = 8150
+    last_error = None
+    while time.time() < deadline:
+        try:
+            topics = describe_producers(port, topic, correlation_id)
+            if len(topics) != 1 or topics[0]["name"] != topic:
+                raise TestError(f"DescribeProducers topic mismatch: {topics}")
+            partitions = topics[0]["partitions"]
+            if len(partitions) != 1:
+                raise TestError(f"DescribeProducers partition count mismatch: {topics}")
+            partition = partitions[0]
+            if partition["partition_index"] != 0 or partition["error_code"] != 0:
+                raise TestError(f"DescribeProducers partition error: {topics}")
+            producer = next(
+                (
+                    item
+                    for item in partition["active_producers"]
+                    if item["producer_id"] == identity["producer_id"]
+                ),
+                None,
+            )
+            if producer is None:
+                raise TestError(f"DescribeProducers missing producer: {topics}")
+            if producer["producer_epoch"] != identity["producer_epoch"]:
+                raise TestError(f"DescribeProducers epoch mismatch: {topics}")
+            if producer["last_sequence"] < min_last_sequence:
+                raise TestError(f"DescribeProducers sequence mismatch: {topics}")
+            return
+        except Exception as exc:
+            last_error = exc
+        correlation_id += 1
+        time.sleep(0.25)
+    raise TestError(
+        f"DescribeProducers did not recover for {topic!r}: {last_error}"
+    )
+
+
 def wait_for_produce_error(port, topic, payload, expected_error, timeout=30):
     deadline = time.time() + timeout
     correlation_id = 4300
@@ -6807,6 +6910,34 @@ def main():
             broker["port"],
             idempotent_transactional_id,
         )
+        idempotent_payload_0 = b"idempotent-seq-0"
+        idempotent_payload_1 = b"idempotent-seq-1"
+        idempotent_stale_payload = b"idempotent-stale-epoch"
+        idempotent_batch_0 = build_record_batch(
+            idempotent_payload_0,
+            idempotent_identity["producer_id"],
+            idempotent_identity["producer_epoch"],
+            0,
+        )
+        idempotent_first = wait_for_record_batch_result(
+            broker["port"],
+            idempotent_topic,
+            idempotent_batch_0,
+            0,
+        )
+        if idempotent_first["base_offset"] < 0:
+            raise TestError(f"initial idempotent produce returned {idempotent_first}")
+        wait_for_payload_counts(
+            broker["port"],
+            idempotent_topic,
+            {idempotent_payload_0: 1},
+        )
+        wait_for_describe_producers_checkpoint(
+            broker["port"],
+            idempotent_topic,
+            idempotent_identity,
+            0,
+        )
         controller_failover_txn = wait_for_transaction_begin(
             broker["port"],
             f"{group}-controller-failover",
@@ -6995,6 +7126,12 @@ def main():
             broker["port"],
             deleted_share_state_probe,
         )
+        wait_for_describe_producers_checkpoint(
+            broker["port"],
+            idempotent_topic,
+            idempotent_identity,
+            0,
+        )
         wait_for_offset_commit_v9_member_checkpoint(
             broker["port"],
             kip848_group_state,
@@ -7101,6 +7238,12 @@ def main():
         wait_for_share_state_deleted_checkpoint(
             broker["port"],
             deleted_share_state_probe,
+        )
+        wait_for_describe_producers_checkpoint(
+            broker["port"],
+            idempotent_topic,
+            idempotent_identity,
+            0,
         )
         wait_for_offset_commit_v9_member_checkpoint(
             broker["port"],
@@ -7212,6 +7355,12 @@ def main():
         wait_for_share_state_deleted_checkpoint(
             broker["port"],
             deleted_share_state_probe,
+        )
+        wait_for_describe_producers_checkpoint(
+            broker["port"],
+            idempotent_topic,
+            idempotent_identity,
+            0,
         )
         wait_for_offset_commit_v9_member_checkpoint(
             broker["port"],
@@ -7333,6 +7482,12 @@ def main():
         wait_for_share_state_deleted_checkpoint(
             broker["port"],
             deleted_share_state_probe,
+        )
+        wait_for_describe_producers_checkpoint(
+            broker["port"],
+            idempotent_topic,
+            idempotent_identity,
+            0,
         )
         wait_for_offset_commit_v9_member_checkpoint(
             broker["port"],
@@ -7460,6 +7615,12 @@ def main():
             broker["port"],
             deleted_share_state_probe,
         )
+        wait_for_describe_producers_checkpoint(
+            broker["port"],
+            idempotent_topic,
+            idempotent_identity,
+            0,
+        )
         wait_for_offset_commit_v9_member_checkpoint(
             broker["port"],
             kip848_group_state,
@@ -7489,28 +7650,6 @@ def main():
             broker["port"],
             f"{group}-broker-restart",
             txn_topic,
-        )
-        idempotent_payload_0 = b"idempotent-seq-0"
-        idempotent_payload_1 = b"idempotent-seq-1"
-        idempotent_stale_payload = b"idempotent-stale-epoch"
-        idempotent_batch_0 = build_record_batch(
-            idempotent_payload_0,
-            idempotent_identity["producer_id"],
-            idempotent_identity["producer_epoch"],
-            0,
-        )
-        idempotent_first = wait_for_record_batch_result(
-            broker["port"],
-            idempotent_topic,
-            idempotent_batch_0,
-            0,
-        )
-        if idempotent_first["base_offset"] < 0:
-            raise TestError(f"initial idempotent produce returned {idempotent_first}")
-        wait_for_payload_counts(
-            broker["port"],
-            idempotent_topic,
-            {idempotent_payload_0: 1},
         )
 
         stop_process(broker["proc"])
@@ -7598,6 +7737,12 @@ def main():
             broker["port"],
             deleted_share_state_probe,
         )
+        wait_for_describe_producers_checkpoint(
+            broker["port"],
+            idempotent_topic,
+            idempotent_identity,
+            0,
+        )
         wait_for_offset_commit_v9_member_checkpoint(
             broker["port"],
             kip848_group_state,
@@ -7648,6 +7793,12 @@ def main():
             broker["port"],
             idempotent_topic,
             {idempotent_payload_0: 1, idempotent_payload_1: 1},
+        )
+        wait_for_describe_producers_checkpoint(
+            broker["port"],
+            idempotent_topic,
+            idempotent_identity,
+            1,
         )
         bumped_identity = wait_for_init_producer_id(
             broker["port"],
@@ -7702,6 +7853,12 @@ def main():
                 b"idempotent-next-epoch": 1,
             },
         )
+        wait_for_describe_producers_checkpoint(
+            broker["port"],
+            idempotent_topic,
+            bumped_identity,
+            0,
+        )
         expected_payloads.append(b"r4")
         fifth_offset = wait_for_produce(
             broker["port"], topic, expected_payloads[-1]
@@ -7749,6 +7906,7 @@ def main():
             f"txn_offset_commit_checked=true, "
             f"offset_fetch_v8_grouped_checked=true, "
             f"idempotent_producer_fencing=true, "
+            f"describe_producers_checked=true, "
             f"delete_groups_checked=true, "
             f"classic_group_heartbeats=true, "
             f"group_describe_checked=true, "
@@ -7968,6 +8126,38 @@ def self_test():
         identity = parse_init_producer_id_response(init_fixture, 44)
         if identity["producer_id"] != 1000 or identity["producer_epoch"] != 0:
             raise TestError(f"InitProducerId fixture parser failed: {identity}")
+
+        describe_producers_fixture = struct.pack(">i", 162)
+        describe_producers_fixture += b"\x00"  # response header tagged fields
+        describe_producers_fixture += struct.pack(">i", 0)
+        describe_producers_fixture += write_compact_array_len(1)
+        describe_producers_fixture += write_compact_string("producer-self-test")
+        describe_producers_fixture += write_compact_array_len(1)
+        describe_producers_fixture += struct.pack(">ih", 0, 0)
+        describe_producers_fixture += write_compact_string(None)
+        describe_producers_fixture += write_compact_array_len(1)
+        describe_producers_fixture += struct.pack(">qiiqiq", 1000, 0, 7, -1, 0, -1)
+        describe_producers_fixture += b"\x00"  # producer tagged fields
+        describe_producers_fixture += b"\x00"  # partition tagged fields
+        describe_producers_fixture += b"\x00"  # topic tagged fields
+        describe_producers_fixture += b"\x00"  # response tagged fields
+        described_producers = parse_describe_producers_response(
+            describe_producers_fixture, 162
+        )
+        if (
+            described_producers[0]["name"] != "producer-self-test"
+            or described_producers[0]["partitions"][0]["active_producers"][0][
+                "producer_id"
+            ]
+            != 1000
+            or described_producers[0]["partitions"][0]["active_producers"][0][
+                "last_sequence"
+            ]
+            != 7
+        ):
+            raise TestError(
+                f"DescribeProducers fixture parser failed: {described_producers}"
+            )
 
         add_txn_fixture = struct.pack(">ii", 45, 0)
         add_txn_fixture += struct.pack(">i", 1)
