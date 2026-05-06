@@ -13901,19 +13901,22 @@ pub const Broker = struct {
 
         if (!validateListOffsetsRequestFrame(request_bytes, body_start, api_version)) {
             log.warn("Malformed ListOffsets request", .{});
-            return null;
+            return self.listOffsetsErrorResponse(req_header, resp_header_version, api_version, ErrorCode.invalid_request);
         }
 
         var pos = body_start;
         var req = Req.deserialize(self.allocator, request_bytes, &pos, api_version) catch |err| {
             log.warn("Malformed ListOffsets request: {}", .{err});
-            return null;
+            return self.listOffsetsErrorResponse(req_header, resp_header_version, api_version, ErrorCode.invalid_request);
         };
         defer self.freeListOffsetsRequest(&req);
 
         var topics: []TopicResult = &.{};
         if (req.topics.len > 0) {
-            topics = self.allocator.alloc(TopicResult, req.topics.len) catch return null;
+            topics = self.allocator.alloc(TopicResult, req.topics.len) catch |err| {
+                log.warn("ListOffsets topic response allocation failed: {}", .{err});
+                return self.listOffsetsErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error);
+            };
         }
         var topics_init: usize = 0;
         defer {
@@ -13922,7 +13925,10 @@ pub const Broker = struct {
         }
 
         for (req.topics) |topic| {
-            topics[topics_init] = self.buildListOffsetsTopicResponse(topic, api_version) catch return null;
+            topics[topics_init] = self.buildListOffsetsTopicResponse(topic, api_version) catch |err| {
+                log.warn("ListOffsets response materialization failed: {}", .{err});
+                return self.listOffsetsErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error);
+            };
             topics_init += 1;
         }
 
@@ -13930,7 +13936,10 @@ pub const Broker = struct {
             .throttle_time_ms = 0,
             .topics = topics[0..topics_init],
         };
-        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version) orelse {
+            log.warn("ListOffsets response serialization failed", .{});
+            return self.listOffsetsErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error);
+        };
     }
 
     fn freeListOffsetsRequest(self: *Broker, req: *const generated.list_offsets_request.ListOffsetsRequest) void {
@@ -19186,19 +19195,22 @@ pub const Broker = struct {
 
         if (!validateDescribeConfigsRequestFrame(request_bytes, body_start, api_version)) {
             log.warn("Malformed DescribeConfigs request", .{});
-            return null;
+            return self.describeConfigsErrorResponse(req_header, resp_header_version, api_version, ErrorCode.invalid_request, "Invalid request");
         }
 
         var pos = body_start;
         var req = Req.deserialize(self.allocator, request_bytes, &pos, api_version) catch |err| {
             log.warn("Malformed DescribeConfigs request: {}", .{err});
-            return null;
+            return self.describeConfigsErrorResponse(req_header, resp_header_version, api_version, ErrorCode.invalid_request, "Invalid request");
         };
         defer self.freeDescribeConfigsRequest(&req);
 
         var results: []DescribeConfigsResult = &.{};
         if (req.resources.len > 0) {
-            results = self.allocator.alloc(DescribeConfigsResult, req.resources.len) catch return null;
+            results = self.allocator.alloc(DescribeConfigsResult, req.resources.len) catch |err| {
+                log.warn("DescribeConfigs result allocation failed: {}", .{err});
+                return self.describeConfigsErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error, "Failed to materialize DescribeConfigs response");
+            };
         }
         var results_init: usize = 0;
         defer {
@@ -19207,7 +19219,10 @@ pub const Broker = struct {
         }
 
         for (req.resources) |resource| {
-            results[results_init] = self.buildDescribeConfigsResult(resource, req.include_documentation) catch return null;
+            results[results_init] = self.buildDescribeConfigsResult(resource, req.include_documentation) catch |err| {
+                log.warn("DescribeConfigs response materialization failed: {}", .{err});
+                return self.describeConfigsErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error, "Failed to materialize DescribeConfigs response");
+            };
             results_init += 1;
         }
 
@@ -19215,7 +19230,10 @@ pub const Broker = struct {
             .throttle_time_ms = 0,
             .results = results[0..results_init],
         };
-        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version) orelse {
+            log.warn("DescribeConfigs response serialization failed", .{});
+            return self.describeConfigsErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error, "Failed to serialize DescribeConfigs response");
+        };
     }
 
     fn freeDescribeConfigsRequest(self: *Broker, req: *const DescribeConfigsRequest) void {
@@ -32171,6 +32189,41 @@ fn freeDeserializedListOffsetsResponse(resp: *const generated.list_offsets_respo
         if (topic.partitions.len > 0) testing.allocator.free(topic.partitions);
     }
     if (resp.topics.len > 0) testing.allocator.free(resp.topics);
+}
+
+fn expectDescribeConfigsErrorResponseBytes(response: []const u8, api_version: i16, correlation_id: i32, err_code: ErrorCode) !void {
+    const Resp = generated.describe_configs_response.DescribeConfigsResponse;
+
+    var rpos: usize = 0;
+    var response_header = try ResponseHeader.deserialize(testing.allocator, response, &rpos, header_mod.responseHeaderVersion(32, api_version));
+    defer response_header.deinit(testing.allocator);
+    try testing.expectEqual(correlation_id, response_header.correlation_id);
+
+    const resp = try Resp.deserialize(testing.allocator, response, &rpos, api_version);
+    defer freeDeserializedDescribeConfigsResponse(&resp);
+
+    try testing.expectEqual(response.len, rpos);
+    try testing.expectEqual(@as(usize, 1), resp.results.len);
+    try testing.expectEqual(@as(i16, @intFromEnum(err_code)), resp.results[0].error_code);
+    try testing.expectEqual(@as(usize, 0), resp.results[0].configs.len);
+}
+
+fn expectListOffsetsErrorResponseBytes(response: []const u8, api_version: i16, correlation_id: i32, err_code: ErrorCode) !void {
+    const Resp = generated.list_offsets_response.ListOffsetsResponse;
+
+    var rpos: usize = 0;
+    var response_header = try ResponseHeader.deserialize(testing.allocator, response, &rpos, header_mod.responseHeaderVersion(2, api_version));
+    defer response_header.deinit(testing.allocator);
+    try testing.expectEqual(correlation_id, response_header.correlation_id);
+
+    const resp = try Resp.deserialize(testing.allocator, response, &rpos, api_version);
+    defer freeDeserializedListOffsetsResponse(&resp);
+
+    try testing.expectEqual(response.len, rpos);
+    try testing.expectEqual(@as(usize, 1), resp.topics.len);
+    try testing.expectEqual(@as(usize, 1), resp.topics[0].partitions.len);
+    try testing.expectEqual(@as(i16, @intFromEnum(err_code)), resp.topics[0].partitions[0].error_code);
+    try testing.expectEqual(@as(i32, -1), resp.topics[0].partitions[0].partition_index);
 }
 
 fn freeDeserializedMetadataResponse(resp: *const generated.metadata_response.MetadataResponse) void {
@@ -58663,7 +58716,11 @@ test "Broker.handleRequest ListOffsets rejects truncated request" {
 
     var buf: [128]u8 = undefined;
     const req_len = buildTestRequest(&buf, 2, 6, 27, header_mod.requestHeaderVersion(2, 6));
-    try testing.expect(broker.handleRequest(buf[0..req_len]) == null);
+    const response = broker.handleRequest(buf[0..req_len]);
+    try testing.expect(response != null);
+    defer testing.allocator.free(response.?);
+
+    try expectListOffsetsErrorResponseBytes(response.?, 6, 27, ErrorCode.invalid_request);
 }
 
 test "Broker.handleRequest ListOffsets rejects trailing bytes" {
@@ -58693,7 +58750,84 @@ test "Broker.handleRequest ListOffsets rejects trailing bytes" {
     var pos = buildTestRequest(&buf, 2, 6, 29, header_mod.requestHeaderVersion(2, 6));
     req.serialize(&buf, &pos, 6);
 
-    try expectTrailingByteRejected(&broker, &buf, pos);
+    try testing.expect(pos < buf.len);
+    buf[pos] = 0x7f;
+    const response = broker.handleRequest(buf[0 .. pos + 1]);
+    try testing.expect(response != null);
+    defer testing.allocator.free(response.?);
+
+    try expectListOffsetsErrorResponseBytes(response.?, 6, 29, ErrorCode.invalid_request);
+}
+
+test "Broker.handleRequest ListOffsets fails closed when response materialization fails" {
+    const Req = generated.list_offsets_request.ListOffsetsRequest;
+    const Topic = Req.ListOffsetsTopic;
+    const Partition = Topic.ListOffsetsPartition;
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+
+    const partitions = [_]Partition{.{
+        .partition_index = 0,
+        .current_leader_epoch = -1,
+        .timestamp = -1,
+    }};
+    const topics = [_]Topic{.{
+        .name = "lo-materialize-fail",
+        .partitions = &partitions,
+    }};
+    const req = Req{
+        .replica_id = -1,
+        .isolation_level = 0,
+        .topics = &topics,
+    };
+
+    var buf: [512]u8 = undefined;
+    var pos = buildTestRequest(&buf, 2, 6, 2106, header_mod.requestHeaderVersion(2, 6));
+    req.serialize(&buf, &pos, 6);
+
+    var failing_allocator = OneShotFailingAllocator.init(testing.allocator, 2);
+    const response_allocator = failing_allocator.allocator();
+    broker.allocator = response_allocator;
+
+    const response = broker.handleRequest(buf[0..pos]);
+    broker.allocator = testing.allocator;
+
+    try testing.expect(failing_allocator.failed);
+    try testing.expect(response != null);
+    defer response_allocator.free(response.?);
+
+    try expectListOffsetsErrorResponseBytes(response.?, 6, 2106, ErrorCode.kafka_storage_error);
+}
+
+test "Broker.handleRequest ListOffsets fails closed when response serialization fails" {
+    const Req = generated.list_offsets_request.ListOffsetsRequest;
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+
+    const req = Req{
+        .replica_id = -1,
+        .isolation_level = 0,
+        .topics = &.{},
+    };
+
+    var buf: [128]u8 = undefined;
+    var pos = buildTestRequest(&buf, 2, 6, 2107, header_mod.requestHeaderVersion(2, 6));
+    req.serialize(&buf, &pos, 6);
+
+    var failing_allocator = OneShotFailingAllocator.init(testing.allocator, 0);
+    const response_allocator = failing_allocator.allocator();
+    broker.allocator = response_allocator;
+
+    const response = broker.handleRequest(buf[0..pos]);
+    broker.allocator = testing.allocator;
+
+    try testing.expect(failing_allocator.failed);
+    try testing.expect(response != null);
+    defer response_allocator.free(response.?);
+
+    try expectListOffsetsErrorResponseBytes(response.?, 6, 2107, ErrorCode.kafka_storage_error);
 }
 
 test "Broker.handleRequest ListOffsets authorization denial uses generated response" {
@@ -67615,7 +67749,11 @@ test "Broker.handleRequest DescribeConfigs rejects truncated request" {
 
     var buf: [128]u8 = undefined;
     const req_len = buildTestRequest(&buf, 32, 4, 3205, header_mod.requestHeaderVersion(32, 4));
-    try testing.expect(broker.handleRequest(buf[0..req_len]) == null);
+    const response = broker.handleRequest(buf[0..req_len]);
+    try testing.expect(response != null);
+    defer testing.allocator.free(response.?);
+
+    try expectDescribeConfigsErrorResponseBytes(response.?, 4, 3205, ErrorCode.invalid_request);
 }
 
 test "Broker.handleRequest DescribeConfigs rejects trailing bytes" {
@@ -67641,7 +67779,79 @@ test "Broker.handleRequest DescribeConfigs rejects trailing bytes" {
     var pos = buildTestRequest(&buf, 32, 4, 3208, header_mod.requestHeaderVersion(32, 4));
     req.serialize(&buf, &pos, 4);
 
-    try expectTrailingByteRejected(&broker, &buf, pos);
+    try testing.expect(pos < buf.len);
+    buf[pos] = 0x7f;
+    const response = broker.handleRequest(buf[0 .. pos + 1]);
+    try testing.expect(response != null);
+    defer testing.allocator.free(response.?);
+
+    try expectDescribeConfigsErrorResponseBytes(response.?, 4, 3208, ErrorCode.invalid_request);
+}
+
+test "Broker.handleRequest DescribeConfigs fails closed when response materialization fails" {
+    const Req = generated.describe_configs_request.DescribeConfigsRequest;
+    const Resource = Req.DescribeConfigsResource;
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+
+    const resources = [_]Resource{.{
+        .resource_type = 2,
+        .resource_name = "cfg-materialize-fail",
+        .configuration_keys = &.{},
+    }};
+    const req = Req{
+        .resources = &resources,
+        .include_synonyms = true,
+        .include_documentation = true,
+    };
+
+    var buf: [256]u8 = undefined;
+    var pos = buildTestRequest(&buf, 32, 4, 3211, header_mod.requestHeaderVersion(32, 4));
+    req.serialize(&buf, &pos, 4);
+
+    var failing_allocator = OneShotFailingAllocator.init(testing.allocator, 1);
+    const response_allocator = failing_allocator.allocator();
+    broker.allocator = response_allocator;
+
+    const response = broker.handleRequest(buf[0..pos]);
+    broker.allocator = testing.allocator;
+
+    try testing.expect(failing_allocator.failed);
+    try testing.expect(response != null);
+    defer response_allocator.free(response.?);
+
+    try expectDescribeConfigsErrorResponseBytes(response.?, 4, 3211, ErrorCode.kafka_storage_error);
+}
+
+test "Broker.handleRequest DescribeConfigs fails closed when response serialization fails" {
+    const Req = generated.describe_configs_request.DescribeConfigsRequest;
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+
+    const req = Req{
+        .resources = &.{},
+        .include_synonyms = true,
+        .include_documentation = true,
+    };
+
+    var buf: [128]u8 = undefined;
+    var pos = buildTestRequest(&buf, 32, 4, 3212, header_mod.requestHeaderVersion(32, 4));
+    req.serialize(&buf, &pos, 4);
+
+    var failing_allocator = OneShotFailingAllocator.init(testing.allocator, 0);
+    const response_allocator = failing_allocator.allocator();
+    broker.allocator = response_allocator;
+
+    const response = broker.handleRequest(buf[0..pos]);
+    broker.allocator = testing.allocator;
+
+    try testing.expect(failing_allocator.failed);
+    try testing.expect(response != null);
+    defer response_allocator.free(response.?);
+
+    try expectDescribeConfigsErrorResponseBytes(response.?, 4, 3212, ErrorCode.kafka_storage_error);
 }
 
 test "Broker handleRequest Heartbeat (key=12)" {
