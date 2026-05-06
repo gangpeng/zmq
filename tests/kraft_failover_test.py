@@ -885,6 +885,120 @@ def wait_for_delete_records_checkpoint(
     )
 
 
+def parse_describe_configs_response(response, correlation_id):
+    pos = parse_flexible_response_header(response, correlation_id)
+    throttle_time_ms, pos = read_i32(response, pos)
+    result_count, pos = read_compact_array_len(response, pos)
+    results = []
+    for _ in range(result_count):
+        error_code, pos = read_i16(response, pos)
+        error_message, pos = read_compact_string(response, pos)
+        resource_type, pos = read_i8(response, pos)
+        resource_name, pos = read_compact_string(response, pos)
+        config_count, pos = read_compact_array_len(response, pos)
+        configs = []
+        for _ in range(config_count):
+            name, pos = read_compact_string(response, pos)
+            value, pos = read_compact_string(response, pos)
+            read_only, pos = read_bool(response, pos)
+            config_source, pos = read_i8(response, pos)
+            is_sensitive, pos = read_bool(response, pos)
+            synonym_count, pos = read_compact_array_len(response, pos)
+            synonyms = []
+            for _ in range(synonym_count):
+                synonym_name, pos = read_compact_string(response, pos)
+                synonym_value, pos = read_compact_string(response, pos)
+                synonym_source, pos = read_i8(response, pos)
+                pos = skip_tags(response, pos)
+                synonyms.append(
+                    {
+                        "name": synonym_name,
+                        "value": synonym_value,
+                        "source": synonym_source,
+                    }
+                )
+            config_type, pos = read_i8(response, pos)
+            documentation, pos = read_compact_string(response, pos)
+            pos = skip_tags(response, pos)
+            configs.append(
+                {
+                    "name": name,
+                    "value": value,
+                    "read_only": read_only,
+                    "config_source": config_source,
+                    "is_sensitive": is_sensitive,
+                    "synonyms": synonyms,
+                    "config_type": config_type,
+                    "documentation": documentation,
+                }
+            )
+        pos = skip_tags(response, pos)
+        results.append(
+            {
+                "error_code": error_code,
+                "error_message": error_message,
+                "resource_type": resource_type,
+                "resource_name": resource_name,
+                "configs": configs,
+            }
+        )
+    pos = skip_tags(response, pos)
+    if pos != len(response):
+        raise TestError(f"DescribeConfigs response trailing bytes: {len(response) - pos}")
+    return {"throttle_time_ms": throttle_time_ms, "results": results}
+
+
+def describe_topic_configs(port, topic, correlation_id):
+    body = write_compact_array_len(1)
+    body += struct.pack(">b", 2)  # resource_type=TOPIC
+    body += write_compact_string(topic)
+    body += write_compact_array_len(2)
+    body += write_compact_string("cleanup.policy")
+    body += write_compact_string("min.insync.replicas")
+    body += b"\x00"  # resource tagged fields
+    body += b"\x00"  # include_synonyms=false
+    body += b"\x01"  # include_documentation=true
+    body += b"\x00"  # request tagged fields
+    response = flexible_kafka_request(port, 32, 4, correlation_id, body)
+    return parse_describe_configs_response(response, correlation_id)
+
+
+def wait_for_describe_configs_checkpoint(port, topic, timeout=30):
+    deadline = time.time() + timeout
+    correlation_id = 8450
+    last_error = None
+    while time.time() < deadline:
+        try:
+            response = describe_topic_configs(port, topic, correlation_id)
+            results = response["results"]
+            if response["throttle_time_ms"] != 0:
+                raise TestError(f"DescribeConfigs throttle mismatch: {response}")
+            if len(results) != 1:
+                raise TestError(f"DescribeConfigs result count mismatch: {response}")
+            result = results[0]
+            if (
+                result["error_code"] != 0
+                or result["resource_type"] != 2
+                or result["resource_name"] != topic
+            ):
+                raise TestError(f"DescribeConfigs resource mismatch: {response}")
+            configs = {item["name"]: item for item in result["configs"]}
+            cleanup = configs.get("cleanup.policy")
+            min_isr = configs.get("min.insync.replicas")
+            if cleanup is None or cleanup["value"] != "delete":
+                raise TestError(f"DescribeConfigs cleanup mismatch: {response}")
+            if min_isr is None or min_isr["value"] != "1":
+                raise TestError(f"DescribeConfigs min ISR mismatch: {response}")
+            if cleanup["documentation"] is None or min_isr["documentation"] is None:
+                raise TestError(f"DescribeConfigs documentation missing: {response}")
+            return
+        except Exception as exc:
+            last_error = exc
+        correlation_id += 1
+        time.sleep(0.25)
+    raise TestError(f"DescribeConfigs did not recover for {topic!r}: {last_error}")
+
+
 def parse_nullable_compact_i32_array(buf, pos):
     raw_len, pos = read_varint(buf, pos)
     if raw_len == 0:
@@ -7429,6 +7543,10 @@ def main():
 
         def wait_for_cluster_visibility_probes():
             wait_for_topic_partitions_probe()
+            wait_for_describe_configs_checkpoint(
+                broker["port"],
+                topic,
+            )
             wait_for_describe_cluster_checkpoint(
                 broker["port"],
                 100,
@@ -8544,6 +8662,7 @@ def main():
             f"log_position_apis_checked=true, "
             f"delete_records_checked=true, "
             f"describe_topic_partitions_checked=true, "
+            f"describe_configs_checked=true, "
             f"describe_cluster_checked=true, "
             f"idempotent_producer_fencing=true, "
             f"describe_producers_checked=true, "
@@ -8825,6 +8944,47 @@ def self_test():
         ):
             raise TestError(
                 f"DeleteRecords fixture parser failed: {deleted_records}"
+            )
+
+        describe_configs_fixture = struct.pack(">i", 166)
+        describe_configs_fixture += b"\x00"  # response header tagged fields
+        describe_configs_fixture += struct.pack(">i", 0)
+        describe_configs_fixture += write_compact_array_len(1)
+        describe_configs_fixture += struct.pack(">h", 0)
+        describe_configs_fixture += write_compact_string(None)
+        describe_configs_fixture += b"\x02"  # resource_type=TOPIC
+        describe_configs_fixture += write_compact_string("cfg-self-test")
+        describe_configs_fixture += write_compact_array_len(2)
+        describe_configs_fixture += write_compact_string("cleanup.policy")
+        describe_configs_fixture += write_compact_string("delete")
+        describe_configs_fixture += b"\x00"  # read_only=false
+        describe_configs_fixture += b"\x05"  # config_source=DEFAULT_CONFIG
+        describe_configs_fixture += b"\x00"  # is_sensitive=false
+        describe_configs_fixture += write_compact_array_len(0)
+        describe_configs_fixture += b"\x06"  # config_type=LIST
+        describe_configs_fixture += write_compact_string("Cleanup policy")
+        describe_configs_fixture += b"\x00"  # config tagged fields
+        describe_configs_fixture += write_compact_string("min.insync.replicas")
+        describe_configs_fixture += write_compact_string("1")
+        describe_configs_fixture += b"\x00"  # read_only=false
+        describe_configs_fixture += b"\x05"  # config_source=DEFAULT_CONFIG
+        describe_configs_fixture += b"\x00"  # is_sensitive=false
+        describe_configs_fixture += write_compact_array_len(0)
+        describe_configs_fixture += b"\x02"  # config_type=INT
+        describe_configs_fixture += write_compact_string("Minimum ISR")
+        describe_configs_fixture += b"\x00"  # config tagged fields
+        describe_configs_fixture += b"\x00"  # result tagged fields
+        describe_configs_fixture += b"\x00"  # response tagged fields
+        described_configs = parse_describe_configs_response(
+            describe_configs_fixture, 166
+        )
+        if (
+            described_configs["results"][0]["resource_name"] != "cfg-self-test"
+            or described_configs["results"][0]["configs"][0]["value"] != "delete"
+            or described_configs["results"][0]["configs"][1]["value"] != "1"
+        ):
+            raise TestError(
+                f"DescribeConfigs fixture parser failed: {described_configs}"
             )
 
         topic_partitions_fixture = struct.pack(">i", 164)
