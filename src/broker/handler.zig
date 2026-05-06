@@ -293,12 +293,23 @@ pub const Broker = struct {
     };
 
     pub const AutoMqNodeMetadata = struct {
+        pub const Tag = struct {
+            key: []u8,
+            value: []u8,
+        };
+
         node_epoch: i64,
         wal_config: []u8,
         state: []const u8 = "ACTIVE",
+        tags: []Tag = &.{},
 
         pub fn deinit(self: *AutoMqNodeMetadata, alloc: Allocator) void {
             alloc.free(self.wal_config);
+            for (self.tags) |tag| {
+                alloc.free(tag.key);
+                alloc.free(tag.value);
+            }
+            if (self.tags.len > 0) alloc.free(self.tags);
         }
     };
 
@@ -2494,11 +2505,14 @@ pub const Broker = struct {
         for (snapshot.nodes) |entry| {
             if (entry.node_id < 0) continue;
             const wal_config_copy = try self.allocator.dupe(u8, entry.wal_config);
+            errdefer self.allocator.free(wal_config_copy);
+            const tag_copies = try self.cloneAutoMqNodeTagsFromSnapshot(entry.tags);
+            errdefer self.freeAutoMqNodeTags(tag_copies);
             self.auto_mq_nodes.put(entry.node_id, .{
                 .node_epoch = entry.node_epoch,
                 .wal_config = wal_config_copy,
+                .tags = tag_copies,
             }) catch |err| {
-                self.allocator.free(wal_config_copy);
                 return err;
             };
             if (entry.node_id < std.math.maxInt(i32) and entry.node_id >= self.auto_mq_next_node_id) {
@@ -2565,18 +2579,24 @@ pub const Broker = struct {
 
         var nodes = std.array_list.Managed(MetadataPersistence.AutoMqNodeEntry).init(self.allocator);
         errdefer {
-            for (nodes.items) |entry| self.allocator.free(entry.wal_config);
+            for (nodes.items) |entry| {
+                self.allocator.free(entry.wal_config);
+                self.freeAutoMqNodeSnapshotTags(entry.tags);
+            }
             nodes.deinit();
         }
         var node_it = self.auto_mq_nodes.iterator();
         while (node_it.next()) |entry| {
             const wal_config = try self.allocator.dupe(u8, entry.value_ptr.wal_config);
+            errdefer self.allocator.free(wal_config);
+            const tags = try self.cloneAutoMqNodeTagsForSnapshot(entry.value_ptr.tags);
+            errdefer self.freeAutoMqNodeSnapshotTags(tags);
             nodes.append(.{
                 .node_id = entry.key_ptr.*,
                 .node_epoch = entry.value_ptr.node_epoch,
                 .wal_config = wal_config,
+                .tags = tags,
             }) catch |err| {
-                self.allocator.free(wal_config);
                 return err;
             };
         }
@@ -12233,6 +12253,7 @@ pub const Broker = struct {
         set_next_node_id = 6,
         update_group = 7,
         full_snapshot = 8,
+        full_snapshot_v2 = 9,
     };
 
     fn autoMqRecordKindFromByte(byte: u8) !AutoMqMetadataRecordKind {
@@ -12245,6 +12266,7 @@ pub const Broker = struct {
             6 => .set_next_node_id,
             7 => .update_group,
             8 => .full_snapshot,
+            9 => .full_snapshot_v2,
             else => error.InvalidAutoMqMetadataRecord,
         };
     }
@@ -12339,6 +12361,58 @@ pub const Broker = struct {
         return bytes;
     }
 
+    fn autoMqNodeTagsRecordSize(tags: []const AutoMqNodeMetadata.Tag) !usize {
+        var size: usize = 4;
+        for (tags) |tag| {
+            size = try checkedAddSize(size, try autoMqBytesFieldSize(tag.key));
+            size = try checkedAddSize(size, try autoMqBytesFieldSize(tag.value));
+        }
+        return size;
+    }
+
+    fn writeAutoMqNodeTagsRecord(buf: []u8, pos: *usize, tags: []const AutoMqNodeMetadata.Tag) !void {
+        if (tags.len > std.math.maxInt(u32)) return error.RecordTooLarge;
+        writeRecordU32(buf, pos, @intCast(tags.len));
+        for (tags) |tag| {
+            try writeRecordBytes(buf, pos, tag.key);
+            try writeRecordBytes(buf, pos, tag.value);
+        }
+    }
+
+    fn readAutoMqNodeTagsRecord(self: *Broker, data: []const u8, pos: *usize) ![]AutoMqNodeMetadata.Tag {
+        const tag_count: usize = @intCast(try readRecordU32(data, pos));
+        if (tag_count == 0) return &.{};
+        const tags = try self.allocator.alloc(AutoMqNodeMetadata.Tag, tag_count);
+        var copied: usize = 0;
+        errdefer {
+            for (tags[0..copied]) |tag| {
+                self.allocator.free(tag.key);
+                self.allocator.free(tag.value);
+            }
+            self.allocator.free(tags);
+        }
+        var i: usize = 0;
+        while (i < tag_count) : (i += 1) {
+            const key = try readRecordBytes(data, pos);
+            const value = try readRecordBytes(data, pos);
+            const key_copy = try self.allocator.dupe(u8, key);
+            errdefer self.allocator.free(key_copy);
+            const value_copy = try self.allocator.dupe(u8, value);
+            tags[i] = .{ .key = key_copy, .value = value_copy };
+            copied += 1;
+        }
+        return tags;
+    }
+
+    fn skipAutoMqNodeTagsRecord(data: []const u8, pos: *usize) !void {
+        const tag_count = try readRecordU32(data, pos);
+        var i: u32 = 0;
+        while (i < tag_count) : (i += 1) {
+            _ = try readRecordBytes(data, pos);
+            _ = try readRecordBytes(data, pos);
+        }
+    }
+
     fn isAutoMqMetadataRecord(data: []const u8) bool {
         return data.len >= auto_mq_metadata_record_magic.len and
             std.mem.eql(u8, data[0..auto_mq_metadata_record_magic.len], auto_mq_metadata_record_magic);
@@ -12369,14 +12443,20 @@ pub const Broker = struct {
         return record.buf;
     }
 
-    fn buildAutoMqRegisterNodeRecord(self: *Broker, node_id: i32, node_epoch: i64, wal_config: []const u8) ![]u8 {
-        const payload_len = try checkedAddSize(12, try autoMqBytesFieldSize(wal_config));
+    fn buildAutoMqRegisterNodeRecordWithTags(self: *Broker, node_id: i32, node_epoch: i64, wal_config: []const u8, tags: []const AutoMqNodeMetadata.Tag) ![]u8 {
+        var payload_len = try checkedAddSize(12, try autoMqBytesFieldSize(wal_config));
+        payload_len = try checkedAddSize(payload_len, try autoMqNodeTagsRecordSize(tags));
         var record = try self.allocAutoMqMetadataRecord(.register_node, payload_len);
         writeRecordI32(record.buf, &record.pos, node_id);
         writeRecordI64(record.buf, &record.pos, node_epoch);
         try writeRecordBytes(record.buf, &record.pos, wal_config);
+        try writeAutoMqNodeTagsRecord(record.buf, &record.pos, tags);
         std.debug.assert(record.pos == record.buf.len);
         return record.buf;
+    }
+
+    fn buildAutoMqRegisterNodeRecord(self: *Broker, node_id: i32, node_epoch: i64, wal_config: []const u8) ![]u8 {
+        return self.buildAutoMqRegisterNodeRecordWithTags(node_id, node_epoch, wal_config, &.{});
     }
 
     fn buildAutoMqSetLicenseRecord(self: *Broker, license: []const u8) ![]u8 {
@@ -12433,6 +12513,7 @@ pub const Broker = struct {
         while (node_it.next()) |entry| {
             payload_len = try checkedAddSize(payload_len, 12);
             payload_len = try checkedAddSize(payload_len, try autoMqBytesFieldSize(entry.value_ptr.wal_config));
+            payload_len = try checkedAddSize(payload_len, try autoMqNodeTagsRecordSize(entry.value_ptr.tags));
         }
 
         payload_len = try checkedAddSize(payload_len, 4); // group count
@@ -12460,7 +12541,7 @@ pub const Broker = struct {
         const prepared_snapshot = try self.object_manager.prepared_registry.serialize(self.allocator);
         defer self.allocator.free(prepared_snapshot);
 
-        var record = try self.allocAutoMqMetadataRecord(.full_snapshot, try self.autoMqFullSnapshotPayloadSize(object_snapshot, prepared_snapshot));
+        var record = try self.allocAutoMqMetadataRecord(.full_snapshot_v2, try self.autoMqFullSnapshotPayloadSize(object_snapshot, prepared_snapshot));
         writeRecordI32(record.buf, &record.pos, self.auto_mq_next_node_id);
         writeRecordI64(record.buf, &record.pos, self.auto_mq_zone_router_epoch);
 
@@ -12482,6 +12563,7 @@ pub const Broker = struct {
             writeRecordI32(record.buf, &record.pos, entry.key_ptr.*);
             writeRecordI64(record.buf, &record.pos, entry.value_ptr.node_epoch);
             try writeRecordBytes(record.buf, &record.pos, entry.value_ptr.wal_config);
+            try writeAutoMqNodeTagsRecord(record.buf, &record.pos, entry.value_ptr.tags);
         }
 
         writeRecordU32(record.buf, &record.pos, self.auto_mq_group_promotions.count());
@@ -12601,10 +12683,14 @@ pub const Broker = struct {
         try self.commitAutoMqMetadataRecord(record);
     }
 
-    fn commitAutoMqRegisterNodeRecord(self: *Broker, node_id: i32, node_epoch: i64, wal_config: []const u8) !void {
-        const record = try self.buildAutoMqRegisterNodeRecord(node_id, node_epoch, wal_config);
+    fn commitAutoMqRegisterNodeRecordWithTags(self: *Broker, node_id: i32, node_epoch: i64, wal_config: []const u8, tags: []const AutoMqNodeMetadata.Tag) !void {
+        const record = try self.buildAutoMqRegisterNodeRecordWithTags(node_id, node_epoch, wal_config, tags);
         defer self.allocator.free(record);
         try self.commitAutoMqMetadataRecord(record);
+    }
+
+    fn commitAutoMqRegisterNodeRecord(self: *Broker, node_id: i32, node_epoch: i64, wal_config: []const u8) !void {
+        try self.commitAutoMqRegisterNodeRecordWithTags(node_id, node_epoch, wal_config, &.{});
     }
 
     fn commitAutoMqSetLicenseRecord(self: *Broker, license: []const u8) !void {
@@ -12661,18 +12747,24 @@ pub const Broker = struct {
         }
     }
 
-    fn registerAutoMqNodeFromRecord(self: *Broker, node_id: i32, node_epoch: i64, wal_config: []const u8) !void {
+    fn registerAutoMqNodeFromRecordWithTags(self: *Broker, node_id: i32, node_epoch: i64, wal_config: []const u8, tags: []const AutoMqNodeMetadata.Tag) !void {
         if (node_id < 0 or node_id == std.math.maxInt(i32)) return error.InvalidAutoMqMetadataRecord;
         const wal_config_copy = try self.allocator.dupe(u8, wal_config);
         errdefer self.allocator.free(wal_config_copy);
+        const tag_copies = try self.cloneAutoMqNodeTags(tags);
+        errdefer self.freeAutoMqNodeTags(tag_copies);
 
         if (self.auto_mq_nodes.getPtr(node_id)) |node| {
             node.deinit(self.allocator);
-            node.* = .{ .node_epoch = node_epoch, .wal_config = wal_config_copy };
+            node.* = .{ .node_epoch = node_epoch, .wal_config = wal_config_copy, .tags = tag_copies };
         } else {
-            try self.auto_mq_nodes.put(node_id, .{ .node_epoch = node_epoch, .wal_config = wal_config_copy });
+            try self.auto_mq_nodes.put(node_id, .{ .node_epoch = node_epoch, .wal_config = wal_config_copy, .tags = tag_copies });
         }
         if (node_id >= self.auto_mq_next_node_id) self.auto_mq_next_node_id = node_id + 1;
+    }
+
+    fn registerAutoMqNodeFromRecord(self: *Broker, node_id: i32, node_epoch: i64, wal_config: []const u8) !void {
+        try self.registerAutoMqNodeFromRecordWithTags(node_id, node_epoch, wal_config, &.{});
     }
 
     fn setAutoMqLicenseFromRecord(self: *Broker, license: []const u8) !void {
@@ -12717,7 +12809,7 @@ pub const Broker = struct {
         }
     }
 
-    fn applyAutoMqFullSnapshotRecord(self: *Broker, data: []const u8, pos: *usize) !void {
+    fn applyAutoMqFullSnapshotRecord(self: *Broker, data: []const u8, pos: *usize, with_node_tags: bool) !void {
         const next_node_id = try readRecordI32(data, pos);
         const zone_router_epoch = try readRecordI64(data, pos);
 
@@ -12741,6 +12833,7 @@ pub const Broker = struct {
             _ = try readRecordI32(data, pos);
             _ = try readRecordI64(data, pos);
             _ = try readRecordBytes(data, pos);
+            if (with_node_tags) try skipAutoMqNodeTagsRecord(data, pos);
         }
 
         const group_count = try readRecordU32(data, pos);
@@ -12788,7 +12881,9 @@ pub const Broker = struct {
             const node_id = try readRecordI32(data, pos);
             const node_epoch = try readRecordI64(data, pos);
             const wal_config = try readRecordBytes(data, pos);
-            try self.registerAutoMqNodeFromRecord(node_id, node_epoch, wal_config);
+            const tags: []AutoMqNodeMetadata.Tag = if (with_node_tags) try self.readAutoMqNodeTagsRecord(data, pos) else &.{};
+            defer self.freeAutoMqNodeTags(tags);
+            try self.registerAutoMqNodeFromRecordWithTags(node_id, node_epoch, wal_config, tags);
         }
 
         pos.* = group_start;
@@ -12833,8 +12928,10 @@ pub const Broker = struct {
                 const node_id = try readRecordI32(data, &pos);
                 const node_epoch = try readRecordI64(data, &pos);
                 const wal_config = try readRecordBytes(data, &pos);
+                const tags: []AutoMqNodeMetadata.Tag = if (pos < data.len) try self.readAutoMqNodeTagsRecord(data, &pos) else &.{};
+                defer self.freeAutoMqNodeTags(tags);
                 if (pos != data.len) return error.InvalidAutoMqMetadataRecord;
-                try self.registerAutoMqNodeFromRecord(node_id, node_epoch, wal_config);
+                try self.registerAutoMqNodeFromRecordWithTags(node_id, node_epoch, wal_config, tags);
             },
             .set_license => {
                 const license = try readRecordBytes(data, &pos);
@@ -12861,7 +12958,10 @@ pub const Broker = struct {
                 try self.updateAutoMqGroupFromRecord(group_id, link_id, promoted);
             },
             .full_snapshot => {
-                try self.applyAutoMqFullSnapshotRecord(data, &pos);
+                try self.applyAutoMqFullSnapshotRecord(data, &pos, false);
+            },
+            .full_snapshot_v2 => {
+                try self.applyAutoMqFullSnapshotRecord(data, &pos, true);
             },
         }
     }
@@ -13154,6 +13254,121 @@ pub const Broker = struct {
             if (stream.node_id == node_id and stream.state == .opened) return true;
         }
         return false;
+    }
+
+    fn freeAutoMqNodeTags(self: *Broker, tags: []AutoMqNodeMetadata.Tag) void {
+        for (tags) |tag| {
+            self.allocator.free(tag.key);
+            self.allocator.free(tag.value);
+        }
+        if (tags.len > 0) self.allocator.free(tags);
+    }
+
+    fn cloneAutoMqNodeTags(self: *Broker, tags: []const AutoMqNodeMetadata.Tag) ![]AutoMqNodeMetadata.Tag {
+        if (tags.len == 0) return &.{};
+        const copies = try self.allocator.alloc(AutoMqNodeMetadata.Tag, tags.len);
+        var copied: usize = 0;
+        errdefer {
+            for (copies[0..copied]) |tag| {
+                self.allocator.free(tag.key);
+                self.allocator.free(tag.value);
+            }
+            self.allocator.free(copies);
+        }
+        for (tags, 0..) |tag, idx| {
+            const key_copy = try self.allocator.dupe(u8, tag.key);
+            errdefer self.allocator.free(key_copy);
+            const value_copy = try self.allocator.dupe(u8, tag.value);
+            copies[idx] = .{ .key = key_copy, .value = value_copy };
+            copied += 1;
+        }
+        return copies;
+    }
+
+    fn cloneAutoMqNodeTagsFromRegisterRequest(self: *Broker, tags: []const generated.automq_register_node_request.AutomqRegisterNodeRequest.Tag) ![]AutoMqNodeMetadata.Tag {
+        if (tags.len == 0) return &.{};
+        const copies = try self.allocator.alloc(AutoMqNodeMetadata.Tag, tags.len);
+        var copied: usize = 0;
+        errdefer {
+            for (copies[0..copied]) |tag| {
+                self.allocator.free(tag.key);
+                self.allocator.free(tag.value);
+            }
+            self.allocator.free(copies);
+        }
+        for (tags, 0..) |tag, idx| {
+            const key = tag.key orelse "";
+            const value = tag.value orelse "";
+            const key_copy = try self.allocator.dupe(u8, key);
+            errdefer self.allocator.free(key_copy);
+            const value_copy = try self.allocator.dupe(u8, value);
+            copies[idx] = .{ .key = key_copy, .value = value_copy };
+            copied += 1;
+        }
+        return copies;
+    }
+
+    fn cloneAutoMqNodeTagsFromSnapshot(self: *Broker, tags: []const MetadataPersistence.AutoMqNodeTagEntry) ![]AutoMqNodeMetadata.Tag {
+        if (tags.len == 0) return &.{};
+        const copies = try self.allocator.alloc(AutoMqNodeMetadata.Tag, tags.len);
+        var copied: usize = 0;
+        errdefer {
+            for (copies[0..copied]) |tag| {
+                self.allocator.free(tag.key);
+                self.allocator.free(tag.value);
+            }
+            self.allocator.free(copies);
+        }
+        for (tags, 0..) |tag, idx| {
+            const key_copy = try self.allocator.dupe(u8, tag.key);
+            errdefer self.allocator.free(key_copy);
+            const value_copy = try self.allocator.dupe(u8, tag.value);
+            copies[idx] = .{ .key = key_copy, .value = value_copy };
+            copied += 1;
+        }
+        return copies;
+    }
+
+    fn cloneAutoMqNodeTagsForSnapshot(self: *Broker, tags: []const AutoMqNodeMetadata.Tag) ![]MetadataPersistence.AutoMqNodeTagEntry {
+        if (tags.len == 0) return &.{};
+        const copies = try self.allocator.alloc(MetadataPersistence.AutoMqNodeTagEntry, tags.len);
+        var copied: usize = 0;
+        errdefer {
+            for (copies[0..copied]) |tag| {
+                self.allocator.free(tag.key);
+                self.allocator.free(tag.value);
+            }
+            self.allocator.free(copies);
+        }
+        for (tags, 0..) |tag, idx| {
+            const key_copy = try self.allocator.dupe(u8, tag.key);
+            errdefer self.allocator.free(key_copy);
+            const value_copy = try self.allocator.dupe(u8, tag.value);
+            copies[idx] = .{ .key = key_copy, .value = value_copy };
+            copied += 1;
+        }
+        return copies;
+    }
+
+    fn freeAutoMqNodeSnapshotTags(self: *Broker, tags: []MetadataPersistence.AutoMqNodeTagEntry) void {
+        for (tags) |tag| {
+            self.allocator.free(tag.key);
+            self.allocator.free(tag.value);
+        }
+        if (tags.len > 0) self.allocator.free(tags);
+    }
+
+    fn materializeAutoMqNodeResponseTags(
+        arena_alloc: Allocator,
+        tags: []const AutoMqNodeMetadata.Tag,
+    ) ![]generated.automq_get_nodes_response.AutomqGetNodesResponse.NodeMetadata.Tag {
+        const ResponseTag = generated.automq_get_nodes_response.AutomqGetNodesResponse.NodeMetadata.Tag;
+        if (tags.len == 0) return &.{};
+        const response_tags = try arena_alloc.alloc(ResponseTag, tags.len);
+        for (tags, 0..) |tag, idx| {
+            response_tags[idx] = .{ .key = tag.key, .value = tag.value };
+        }
+        return response_tags;
     }
 
     fn findTopicPartitionForStream(self: *Broker, stream_id: u64) ?struct { topic_id: [16]u8, topic_name: []const u8, partition_index: i32 } {
@@ -23071,10 +23286,16 @@ pub const Broker = struct {
             log.warn("AutomqRegisterNode WAL config copy failed: {}", .{err});
             return self.automqRegisterNodeErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error);
         };
+        const tag_copies = self.cloneAutoMqNodeTagsFromRegisterRequest(req.tags) catch |err| {
+            log.warn("AutomqRegisterNode tag copy failed: {}", .{err});
+            self.allocator.free(wal_config_copy);
+            return self.automqRegisterNodeErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error);
+        };
         if (!replacing_existing) {
             self.auto_mq_nodes.ensureUnusedCapacity(1) catch |err| {
                 log.warn("AutomqRegisterNode map capacity reservation failed: {}", .{err});
                 self.allocator.free(wal_config_copy);
+                self.freeAutoMqNodeTags(tag_copies);
                 return self.automqRegisterNodeErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error);
             };
         }
@@ -23082,6 +23303,7 @@ pub const Broker = struct {
         const success_response = self.serializeGeneratedResponse(req_header, resp_header_version, &success_resp, api_version) orelse {
             log.warn("AutomqRegisterNode response serialization failed before mutation", .{});
             self.allocator.free(wal_config_copy);
+            self.freeAutoMqNodeTags(tag_copies);
             return self.automqRegisterNodeErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error);
         };
         var previous_snapshot: ?MetadataPersistence.AutoMqMetadataSnapshot = null;
@@ -23090,12 +23312,14 @@ pub const Broker = struct {
             previous_snapshot = self.cloneAutoMqMetadataSnapshot() catch |err| {
                 log.warn("AutomqRegisterNode rollback snapshot failed: {}", .{err});
                 self.allocator.free(wal_config_copy);
+                self.freeAutoMqNodeTags(tag_copies);
                 self.allocator.free(success_response);
                 return self.automqRegisterNodeErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error);
             };
         }
-        self.commitAutoMqRegisterNodeRecord(req.node_id, req.node_epoch, wal_config) catch |err| {
+        self.commitAutoMqRegisterNodeRecordWithTags(req.node_id, req.node_epoch, wal_config, tag_copies) catch |err| {
             self.allocator.free(wal_config_copy);
+            self.freeAutoMqNodeTags(tag_copies);
             self.allocator.free(success_response);
             const resp = Resp{ .error_code = autoMqQuorumErrorCode(err), .throttle_time_ms = 0 };
             return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version) orelse {
@@ -23106,9 +23330,9 @@ pub const Broker = struct {
 
         if (self.auto_mq_nodes.getPtr(req.node_id)) |node| {
             node.deinit(self.allocator);
-            node.* = .{ .node_epoch = req.node_epoch, .wal_config = wal_config_copy };
+            node.* = .{ .node_epoch = req.node_epoch, .wal_config = wal_config_copy, .tags = tag_copies };
         } else {
-            self.auto_mq_nodes.putAssumeCapacity(req.node_id, .{ .node_epoch = req.node_epoch, .wal_config = wal_config_copy });
+            self.auto_mq_nodes.putAssumeCapacity(req.node_id, .{ .node_epoch = req.node_epoch, .wal_config = wal_config_copy, .tags = tag_copies });
         }
         if (req.node_id >= self.auto_mq_next_node_id) self.auto_mq_next_node_id = req.node_id + 1;
         self.persistAutoMqMetadataAfterMutation() catch |err| {
@@ -23140,12 +23364,17 @@ pub const Broker = struct {
         if (req.node_ids.len == 0) {
             var it = self.auto_mq_nodes.iterator();
             while (it.next()) |entry| {
+                const response_tags = materializeAutoMqNodeResponseTags(arena_alloc, entry.value_ptr.tags) catch |err| {
+                    log.warn("AutomqGetNodes response materialization failed: {}", .{err});
+                    return self.automqGetNodesErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error);
+                };
                 nodes.append(.{
                     .node_id = entry.key_ptr.*,
                     .node_epoch = entry.value_ptr.node_epoch,
                     .wal_config = entry.value_ptr.wal_config,
                     .state = entry.value_ptr.state,
                     .has_opening_streams = self.hasOpeningStreamsForNode(entry.key_ptr.*),
+                    .tags = response_tags,
                 }) catch |err| {
                     log.warn("AutomqGetNodes response materialization failed: {}", .{err});
                     return self.automqGetNodesErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error);
@@ -23158,6 +23387,7 @@ pub const Broker = struct {
                     .wal_config = "local",
                     .state = "ACTIVE",
                     .has_opening_streams = self.hasOpeningStreamsForNode(self.node_id),
+                    .tags = &.{},
                 }) catch |err| {
                     log.warn("AutomqGetNodes response materialization failed: {}", .{err});
                     return self.automqGetNodesErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error);
@@ -23166,12 +23396,17 @@ pub const Broker = struct {
         } else {
             for (req.node_ids) |node_id| {
                 if (self.auto_mq_nodes.get(node_id)) |node| {
+                    const response_tags = materializeAutoMqNodeResponseTags(arena_alloc, node.tags) catch |err| {
+                        log.warn("AutomqGetNodes response materialization failed: {}", .{err});
+                        return self.automqGetNodesErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error);
+                    };
                     nodes.append(.{
                         .node_id = node_id,
                         .node_epoch = node.node_epoch,
                         .wal_config = node.wal_config,
                         .state = node.state,
                         .has_opening_streams = self.hasOpeningStreamsForNode(node_id),
+                        .tags = response_tags,
                     }) catch |err| {
                         log.warn("AutomqGetNodes response materialization failed: {}", .{err});
                         return self.automqGetNodesErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error);
@@ -23183,6 +23418,7 @@ pub const Broker = struct {
                         .wal_config = "local",
                         .state = "ACTIVE",
                         .has_opening_streams = self.hasOpeningStreamsForNode(self.node_id),
+                        .tags = &.{},
                     }) catch |err| {
                         log.warn("AutomqGetNodes response materialization failed: {}", .{err});
                         return self.automqGetNodesErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error);
@@ -54836,7 +55072,13 @@ test "Broker AutoMQ metadata mutation APIs roll back when local persistence fail
         for (owned_responses.items) |owned_response| testing.allocator.free(owned_response);
         owned_responses.deinit();
     }
-    try broker.registerAutoMqNodeFromRecord(7, 3, "wal://old");
+    var old_node_tag_key = [_]u8{ 'r', 'a', 'c', 'k' };
+    var old_node_tag_value = [_]u8{ 'o', 'l', 'd' };
+    const old_node_tags = [_]Broker.AutoMqNodeMetadata.Tag{.{
+        .key = old_node_tag_key[0..],
+        .value = old_node_tag_value[0..],
+    }};
+    try broker.registerAutoMqNodeFromRecordWithTags(7, 3, "wal://old", &old_node_tags);
     broker.setAutoMqNextNodeIdFromRecord(10);
     try broker.setAutoMqZoneRouterFromRecord("old-route", 3);
     try broker.setAutoMqLicenseFromRecord("old-license");
@@ -54844,7 +55086,11 @@ test "Broker AutoMQ metadata mutation APIs roll back when local persistence fail
 
     var buf: [1024]u8 = undefined;
     var pos = buildTestRequest(&buf, 513, 0, 5131, header_mod.requestHeaderVersion(513, 0));
-    const register_req = RegisterReq{ .node_id = 7, .node_epoch = 4, .wal_config = "wal://new" };
+    const register_tags = [_]RegisterReq.Tag{.{
+        .key = "rack",
+        .value = "new",
+    }};
+    const register_req = RegisterReq{ .node_id = 7, .node_epoch = 4, .wal_config = "wal://new", .tags = &register_tags };
     register_req.serialize(&buf, &pos, 0);
     var response = broker.handleRequest(buf[0..pos]);
     try testing.expect(response != null);
@@ -54860,6 +55106,9 @@ test "Broker AutoMQ metadata mutation APIs roll back when local persistence fail
     const node = broker.auto_mq_nodes.get(7).?;
     try testing.expectEqual(@as(i64, 3), node.node_epoch);
     try testing.expectEqualStrings("wal://old", node.wal_config);
+    try testing.expectEqual(@as(usize, 1), node.tags.len);
+    try testing.expectEqualStrings("rack", node.tags[0].key);
+    try testing.expectEqualStrings("old", node.tags[0].value);
     try testing.expectEqual(@as(i32, 10), broker.auto_mq_next_node_id);
 
     pos = buildTestRequest(&buf, 600, 0, 6001, header_mod.requestHeaderVersion(600, 0));
@@ -54974,7 +55223,11 @@ test "Broker AutoMQ node license and manifest APIs" {
 
     var buf: [2048]u8 = undefined;
     var pos = buildTestRequest(&buf, 513, 0, 5130, 2);
-    const register_req = RegisterReq{ .node_id = 7, .node_epoch = 3, .wal_config = "wal://node-7" };
+    const register_tags = [_]RegisterReq.Tag{
+        .{ .key = "rack", .value = "az-a" },
+        .{ .key = "role", .value = "broker" },
+    };
+    const register_req = RegisterReq{ .node_id = 7, .node_epoch = 3, .wal_config = "wal://node-7", .tags = &register_tags };
     register_req.serialize(&buf, &pos, 0);
     var response = broker.handleRequest(buf[0..pos]);
     try testing.expect(response != null);
@@ -54996,10 +55249,20 @@ test "Broker AutoMQ node license and manifest APIs" {
     var get_nodes_header = try ResponseHeader.deserialize(testing.allocator, response.?, &rpos, 1);
     defer get_nodes_header.deinit(testing.allocator);
     const get_nodes_resp = try GetNodesResp.deserialize(testing.allocator, response.?, &rpos, 0);
-    defer testing.allocator.free(get_nodes_resp.nodes);
+    defer {
+        for (get_nodes_resp.nodes) |node_resp| {
+            if (node_resp.tags.len > 0) testing.allocator.free(node_resp.tags);
+        }
+        testing.allocator.free(get_nodes_resp.nodes);
+    }
     try testing.expectEqual(@as(usize, 1), get_nodes_resp.nodes.len);
     try testing.expectEqual(@as(i32, 7), get_nodes_resp.nodes[0].node_id);
     try testing.expectEqualStrings("wal://node-7", get_nodes_resp.nodes[0].wal_config.?);
+    try testing.expectEqual(@as(usize, 2), get_nodes_resp.nodes[0].tags.len);
+    try testing.expectEqualStrings("rack", get_nodes_resp.nodes[0].tags[0].key.?);
+    try testing.expectEqualStrings("az-a", get_nodes_resp.nodes[0].tags[0].value.?);
+    try testing.expectEqualStrings("role", get_nodes_resp.nodes[0].tags[1].key.?);
+    try testing.expectEqualStrings("broker", get_nodes_resp.nodes[0].tags[1].value.?);
 
     pos = buildTestRequest(&buf, 600, 0, 6000, 2);
     const next_node_req = NextNodeReq{ .cluster_id = "zmq-cluster" };
@@ -55262,7 +55525,11 @@ test "Broker restores AutoMQ metadata after restart" {
         try owned_responses.append(response.?);
 
         pos = buildTestRequest(&buf, 513, 0, 5130, 2);
-        const register_req = RegisterReq{ .node_id = 7, .node_epoch = 3, .wal_config = "wal://node-7" };
+        const register_tags = [_]RegisterReq.Tag{.{
+            .key = "rack",
+            .value = "az-a",
+        }};
+        const register_req = RegisterReq{ .node_id = 7, .node_epoch = 3, .wal_config = "wal://node-7", .tags = &register_tags };
         register_req.serialize(&buf, &pos, 0);
         response = broker.handleRequest(buf[0..pos]);
         try testing.expect(response != null);
@@ -55306,6 +55573,9 @@ test "Broker restores AutoMQ metadata after restart" {
         const node = broker.auto_mq_nodes.get(7).?;
         try testing.expectEqual(@as(i64, 3), node.node_epoch);
         try testing.expectEqualStrings("wal://node-7", node.wal_config);
+        try testing.expectEqual(@as(usize, 1), node.tags.len);
+        try testing.expectEqualStrings("rack", node.tags[0].key);
+        try testing.expectEqualStrings("az-a", node.tags[0].value);
         try testing.expectEqual(@as(i32, 9), broker.auto_mq_next_node_id);
         try testing.expectEqualStrings("test-license", broker.auto_mq_license.?);
         try testing.expectEqualStrings("route-data", broker.auto_mq_zone_router_metadata.?);
@@ -55352,7 +55622,11 @@ test "Broker replays committed AutoMQ metadata quorum records" {
         try owned_responses.append(response.?);
 
         pos = buildTestRequest(&buf, 513, 0, 7130, 2);
-        const register_req = RegisterReq{ .node_id = 7, .node_epoch = 3, .wal_config = "wal://node-7" };
+        const register_tags = [_]RegisterReq.Tag{.{
+            .key = "rack",
+            .value = "az-a",
+        }};
+        const register_req = RegisterReq{ .node_id = 7, .node_epoch = 3, .wal_config = "wal://node-7", .tags = &register_tags };
         register_req.serialize(&buf, &pos, 0);
         response = broker.handleRequest(buf[0..pos]);
         try testing.expect(response != null);
@@ -55400,6 +55674,9 @@ test "Broker replays committed AutoMQ metadata quorum records" {
         const node = broker.auto_mq_nodes.get(7).?;
         try testing.expectEqual(@as(i64, 3), node.node_epoch);
         try testing.expectEqualStrings("wal://node-7", node.wal_config);
+        try testing.expectEqual(@as(usize, 1), node.tags.len);
+        try testing.expectEqualStrings("rack", node.tags[0].key);
+        try testing.expectEqualStrings("az-a", node.tags[0].value);
         try testing.expectEqual(@as(i32, 9), broker.auto_mq_next_node_id);
         try testing.expectEqualStrings("test-license", broker.auto_mq_license.?);
         try testing.expectEqualStrings("route-data", broker.auto_mq_zone_router_metadata.?);
@@ -55428,8 +55705,14 @@ test "Broker compacts AutoMQ quorum metadata into replayable full snapshot" {
 
         try broker.commitAutoMqPutKvRecord("alpha", "beta");
         try broker.putAutoMqKvFromRecord("alpha", "beta");
-        try broker.commitAutoMqRegisterNodeRecord(7, 3, "wal://node-7");
-        try broker.registerAutoMqNodeFromRecord(7, 3, "wal://node-7");
+        var node_tag_key = [_]u8{ 'r', 'a', 'c', 'k' };
+        var node_tag_value = [_]u8{ 'a', 'z', '-', 'a' };
+        const node_tags = [_]Broker.AutoMqNodeMetadata.Tag{.{
+            .key = node_tag_key[0..],
+            .value = node_tag_value[0..],
+        }};
+        try broker.commitAutoMqRegisterNodeRecordWithTags(7, 3, "wal://node-7", &node_tags);
+        try broker.registerAutoMqNodeFromRecordWithTags(7, 3, "wal://node-7", &node_tags);
         try broker.commitAutoMqZoneRouterRecord("route-data", 4);
         try broker.setAutoMqZoneRouterFromRecord("route-data", 4);
         try broker.commitAutoMqSetLicenseRecord("test-license");
@@ -55466,6 +55749,9 @@ test "Broker compacts AutoMQ quorum metadata into replayable full snapshot" {
         const node = broker.auto_mq_nodes.get(7).?;
         try testing.expectEqual(@as(i64, 3), node.node_epoch);
         try testing.expectEqualStrings("wal://node-7", node.wal_config);
+        try testing.expectEqual(@as(usize, 1), node.tags.len);
+        try testing.expectEqualStrings("rack", node.tags[0].key);
+        try testing.expectEqualStrings("az-a", node.tags[0].value);
         try testing.expectEqual(@as(i32, 9), broker.auto_mq_next_node_id);
         try testing.expectEqualStrings("test-license", broker.auto_mq_license.?);
         try testing.expectEqualStrings("route-data", broker.auto_mq_zone_router_metadata.?);

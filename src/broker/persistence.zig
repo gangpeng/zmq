@@ -47,10 +47,16 @@ pub const MetadataPersistence = struct {
         value: []u8,
     };
 
+    pub const AutoMqNodeTagEntry = struct {
+        key: []u8,
+        value: []u8,
+    };
+
     pub const AutoMqNodeEntry = struct {
         node_id: i32,
         node_epoch: i64,
         wal_config: []u8,
+        tags: []AutoMqNodeTagEntry = &.{},
     };
 
     pub const AutoMqGroupPromotionEntry = struct {
@@ -232,9 +238,18 @@ pub const MetadataPersistence = struct {
         if (entries.len > 0) allocator.free(entries);
     }
 
+    fn freeAutoMqNodeTags(allocator: Allocator, tags: []AutoMqNodeTagEntry) void {
+        for (tags) |tag| {
+            allocator.free(tag.key);
+            allocator.free(tag.value);
+        }
+        if (tags.len > 0) allocator.free(tags);
+    }
+
     fn freeAutoMqNodeEntries(allocator: Allocator, entries: []AutoMqNodeEntry) void {
         for (entries) |entry| {
             allocator.free(entry.wal_config);
+            freeAutoMqNodeTags(allocator, entry.tags);
         }
         if (entries.len > 0) allocator.free(entries);
     }
@@ -2180,7 +2195,7 @@ pub const MetadataPersistence = struct {
         defer file.close();
         const writer = file.writer();
 
-        try writer.print("version\t1\n", .{});
+        try writer.print("version\t2\n", .{});
         try writer.print("next_node_id\t{d}\n", .{next_node_id});
         try writer.print("zone_router_epoch\t{d}\n", .{zone_router_epoch});
         if (license) |value| {
@@ -2207,6 +2222,17 @@ pub const MetadataPersistence = struct {
         while (node_it.next()) |entry| {
             try writer.print("node\t{d}\t{d}\t", .{ entry.key_ptr.*, entry.value_ptr.node_epoch });
             try writeHex(file, entry.value_ptr.wal_config);
+            if (@hasField(@TypeOf(entry.value_ptr.*), "tags")) {
+                try writer.print("\t{d}", .{entry.value_ptr.tags.len});
+                for (entry.value_ptr.tags) |tag_entry| {
+                    try file.writeAll("\t");
+                    try writeHex(file, tag_entry.key);
+                    try file.writeAll("\t");
+                    try writeHex(file, tag_entry.value);
+                }
+            } else {
+                try file.writeAll("\t0");
+            }
             try file.writeAll("\n");
         }
 
@@ -2240,6 +2266,7 @@ pub const MetadataPersistence = struct {
         const content = try file.readToEndAlloc(self.allocator, 4 * 1024 * 1024);
         defer self.allocator.free(content);
 
+        var snapshot_version: u8 = 1;
         var next_node_id: i32 = 1;
         var zone_router_epoch: i64 = 0;
         var license: ?[]u8 = null;
@@ -2257,7 +2284,10 @@ pub const MetadataPersistence = struct {
                 self.allocator.free(entry.key);
                 self.allocator.free(entry.value);
             }
-            for (nodes.items) |entry| self.allocator.free(entry.wal_config);
+            for (nodes.items) |entry| {
+                self.allocator.free(entry.wal_config);
+                freeAutoMqNodeTags(self.allocator, entry.tags);
+            }
             for (group_promotions.items) |entry| {
                 self.allocator.free(entry.group_id);
                 self.allocator.free(entry.link_id);
@@ -2275,7 +2305,8 @@ pub const MetadataPersistence = struct {
                 const value = fields.next() orelse return error.InvalidAutoMqMetadataSnapshot;
                 if (fields.next() != null) return error.InvalidAutoMqMetadataSnapshot;
                 const version = try parseIntForSnapshot(u8, value, error.InvalidAutoMqMetadataSnapshot);
-                if (version != 1) return error.InvalidAutoMqMetadataSnapshot;
+                if (version == 0 or version > 2) return error.InvalidAutoMqMetadataSnapshot;
+                snapshot_version = version;
             } else if (std.mem.eql(u8, tag, "next_node_id")) {
                 const value = fields.next() orelse return error.InvalidAutoMqMetadataSnapshot;
                 if (fields.next() != null) return error.InvalidAutoMqMetadataSnapshot;
@@ -2311,12 +2342,40 @@ pub const MetadataPersistence = struct {
                 const node_id_str = fields.next() orelse return error.InvalidAutoMqMetadataSnapshot;
                 const node_epoch_str = fields.next() orelse return error.InvalidAutoMqMetadataSnapshot;
                 const wal_config_hex = fields.next() orelse return error.InvalidAutoMqMetadataSnapshot;
-                if (fields.next() != null) return error.InvalidAutoMqMetadataSnapshot;
                 const node_id = try parseIntForSnapshot(i32, node_id_str, error.InvalidAutoMqMetadataSnapshot);
                 const node_epoch = try parseIntForSnapshot(i64, node_epoch_str, error.InvalidAutoMqMetadataSnapshot);
                 const wal_config = try decodeHexAllocForSnapshot(self.allocator, wal_config_hex, error.InvalidAutoMqMetadataSnapshot);
                 errdefer self.allocator.free(wal_config);
-                nodes.append(.{ .node_id = node_id, .node_epoch = node_epoch, .wal_config = wal_config }) catch |err| {
+                var tags = std.array_list.Managed(AutoMqNodeTagEntry).init(self.allocator);
+                defer tags.deinit();
+                errdefer {
+                    for (tags.items) |entry| {
+                        self.allocator.free(entry.key);
+                        self.allocator.free(entry.value);
+                    }
+                }
+                if (snapshot_version >= 2) {
+                    const tag_count_str = fields.next() orelse return error.InvalidAutoMqMetadataSnapshot;
+                    const tag_count = try parseIntForSnapshot(usize, tag_count_str, error.InvalidAutoMqMetadataSnapshot);
+                    var tag_index: usize = 0;
+                    while (tag_index < tag_count) : (tag_index += 1) {
+                        const key_hex = fields.next() orelse return error.InvalidAutoMqMetadataSnapshot;
+                        const value_hex = fields.next() orelse return error.InvalidAutoMqMetadataSnapshot;
+                        const key = try decodeHexAllocForSnapshot(self.allocator, key_hex, error.InvalidAutoMqMetadataSnapshot);
+                        errdefer self.allocator.free(key);
+                        const value = try decodeHexAllocForSnapshot(self.allocator, value_hex, error.InvalidAutoMqMetadataSnapshot);
+                        errdefer self.allocator.free(value);
+                        tags.append(.{ .key = key, .value = value }) catch |err| {
+                            return err;
+                        };
+                    }
+                    if (fields.next() != null) return error.InvalidAutoMqMetadataSnapshot;
+                } else if (fields.next() != null) {
+                    return error.InvalidAutoMqMetadataSnapshot;
+                }
+                const tag_slice = try tags.toOwnedSlice();
+                errdefer freeAutoMqNodeTags(self.allocator, tag_slice);
+                nodes.append(.{ .node_id = node_id, .node_epoch = node_epoch, .wal_config = wal_config, .tags = tag_slice }) catch |err| {
                     return err;
                 };
             } else if (std.mem.eql(u8, tag, "group")) {
@@ -3030,12 +3089,19 @@ test "MetadataPersistence save and load AutoMQ metadata round-trip" {
     try kvs.put("alpha\tkey", "beta\nvalue\x00tail");
 
     const Node = struct {
+        const Tag = struct {
+            key: []const u8,
+            value: []const u8,
+        };
+
         node_epoch: i64,
         wal_config: []const u8,
+        tags: []const Tag = &.{},
     };
     var nodes = std.AutoHashMap(i32, Node).init(testing.allocator);
     defer nodes.deinit();
-    try nodes.put(7, .{ .node_epoch = 3, .wal_config = "wal://node-7\tcfg" });
+    const node_tags = [_]Node.Tag{.{ .key = "zone\tkey", .value = "zone\nvalue" }};
+    try nodes.put(7, .{ .node_epoch = 3, .wal_config = "wal://node-7\tcfg", .tags = &node_tags });
 
     const GroupPromotion = struct {
         link_id: []const u8,
@@ -3069,6 +3135,9 @@ test "MetadataPersistence save and load AutoMQ metadata round-trip" {
     try testing.expectEqual(@as(i32, 7), snapshot.nodes[0].node_id);
     try testing.expectEqual(@as(i64, 3), snapshot.nodes[0].node_epoch);
     try testing.expectEqualStrings("wal://node-7\tcfg", snapshot.nodes[0].wal_config);
+    try testing.expectEqual(@as(usize, 1), snapshot.nodes[0].tags.len);
+    try testing.expectEqualStrings("zone\tkey", snapshot.nodes[0].tags[0].key);
+    try testing.expectEqualStrings("zone\nvalue", snapshot.nodes[0].tags[0].value);
     try testing.expectEqual(@as(usize, 1), snapshot.group_promotions.len);
     try testing.expectEqualStrings("group\nA", snapshot.group_promotions[0].group_id);
     try testing.expectEqualStrings("link\tA", snapshot.group_promotions[0].link_id);
