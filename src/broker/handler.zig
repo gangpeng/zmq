@@ -16883,27 +16883,20 @@ pub const Broker = struct {
 
         if (!validateShareGroupDescribeRequestFrame(request_bytes, body_start)) {
             log.warn("Malformed ShareGroupDescribe request", .{});
-            const groups = [_]Resp.DescribedGroup{shareGroupDescribeError(null, ErrorCode.invalid_request, "malformed ShareGroupDescribe request", false)};
-            const resp = Resp{
-                .throttle_time_ms = 0,
-                .groups = &groups,
-            };
-            return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+            return self.shareGroupDescribeErrorResponse(req_header, resp_header_version, api_version, ErrorCode.invalid_request, "malformed ShareGroupDescribe request", false);
         }
 
         var pos = body_start;
         var req = Req.deserialize(self.allocator, request_bytes, &pos, api_version) catch |err| {
             log.warn("Failed to decode ShareGroupDescribe request: {}", .{err});
-            const groups = [_]Resp.DescribedGroup{shareGroupDescribeError(null, ErrorCode.invalid_request, "malformed ShareGroupDescribe request", false)};
-            const resp = Resp{
-                .throttle_time_ms = 0,
-                .groups = &groups,
-            };
-            return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+            return self.shareGroupDescribeErrorResponse(req_header, resp_header_version, api_version, ErrorCode.invalid_request, "malformed ShareGroupDescribe request", false);
         };
         defer self.freeShareGroupDescribeRequest(&req);
 
-        const groups = self.collectShareGroupDescriptions(req) catch return null;
+        const groups = self.collectShareGroupDescriptions(req) catch |err| {
+            log.warn("ShareGroupDescribe response materialization failed: {}", .{err});
+            return self.shareGroupDescribeErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error, "Failed to build ShareGroupDescribe response", req.include_authorized_operations);
+        };
         defer {
             self.freeShareGroupDescriptions(groups);
             if (groups.len > 0) self.allocator.free(groups);
@@ -16913,7 +16906,10 @@ pub const Broker = struct {
             .throttle_time_ms = 0,
             .groups = groups,
         };
-        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version) orelse {
+            log.warn("ShareGroupDescribe response serialization failed", .{});
+            return self.shareGroupDescribeErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error, "Failed to serialize ShareGroupDescribe response", req.include_authorized_operations);
+        };
     }
 
     fn freeShareGroupDescribeRequest(self: *Broker, req: *generated.share_group_describe_request.ShareGroupDescribeRequest) void {
@@ -31073,6 +31069,24 @@ fn freeDeserializedShareGroupDescribeResponse(resp: *const generated.share_group
         if (group.members.len > 0) testing.allocator.free(group.members);
     }
     if (resp.groups.len > 0) testing.allocator.free(resp.groups);
+}
+
+fn expectShareGroupDescribeErrorResponseBytes(response: []const u8, correlation_id: i32, err_code: ErrorCode) !void {
+    const Resp = generated.share_group_describe_response.ShareGroupDescribeResponse;
+
+    var rpos: usize = 0;
+    var response_header = try ResponseHeader.deserialize(testing.allocator, response, &rpos, header_mod.responseHeaderVersion(77, 0));
+    defer response_header.deinit(testing.allocator);
+    try testing.expectEqual(correlation_id, response_header.correlation_id);
+
+    const resp = try Resp.deserialize(testing.allocator, response, &rpos, 0);
+    defer freeDeserializedShareGroupDescribeResponse(&resp);
+
+    try testing.expectEqual(response.len, rpos);
+    try testing.expectEqual(@as(i32, 0), resp.throttle_time_ms);
+    try testing.expectEqual(@as(usize, 1), resp.groups.len);
+    try testing.expectEqual(@as(i16, @intFromEnum(err_code)), resp.groups[0].error_code);
+    try testing.expectEqual(@as(usize, 0), resp.groups[0].members.len);
 }
 
 fn freeDeserializedInitializeShareGroupStateResponse(resp: *const generated.initialize_share_group_state_response.InitializeShareGroupStateResponse) void {
@@ -61538,6 +61552,65 @@ test "Broker.handleRequest ShareGroupDescribe rejects malformed request" {
     try testing.expectEqual(response.?.len, rpos);
     try testing.expectEqual(@as(usize, 1), resp.groups.len);
     try testing.expectEqual(ErrorCode.invalid_request.toInt(), resp.groups[0].error_code);
+}
+
+test "Broker.handleRequest ShareGroupDescribe fails closed when response materialization fails" {
+    const Req = generated.share_group_describe_request.ShareGroupDescribeRequest;
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+
+    const group_ids = [_]?[]const u8{"share-desc-materialize-fail"};
+    const req = Req{
+        .group_ids = &group_ids,
+        .include_authorized_operations = true,
+    };
+
+    var buf: [256]u8 = undefined;
+    var pos = buildTestRequest(&buf, 77, 0, 7702, header_mod.requestHeaderVersion(77, 0));
+    req.serialize(&buf, &pos, 0);
+
+    var failing_allocator = OneShotFailingAllocator.init(testing.allocator, 1);
+    const response_allocator = failing_allocator.allocator();
+    broker.allocator = response_allocator;
+
+    const response = broker.handleRequest(buf[0..pos]);
+    broker.allocator = testing.allocator;
+
+    try testing.expect(failing_allocator.failed);
+    try testing.expect(response != null);
+    defer response_allocator.free(response.?);
+
+    try expectShareGroupDescribeErrorResponseBytes(response.?, 7702, ErrorCode.kafka_storage_error);
+}
+
+test "Broker.handleRequest ShareGroupDescribe fails closed when response serialization fails" {
+    const Req = generated.share_group_describe_request.ShareGroupDescribeRequest;
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+
+    const req = Req{
+        .group_ids = &.{},
+        .include_authorized_operations = true,
+    };
+
+    var buf: [128]u8 = undefined;
+    var pos = buildTestRequest(&buf, 77, 0, 7703, header_mod.requestHeaderVersion(77, 0));
+    req.serialize(&buf, &pos, 0);
+
+    var failing_allocator = OneShotFailingAllocator.init(testing.allocator, 0);
+    const response_allocator = failing_allocator.allocator();
+    broker.allocator = response_allocator;
+
+    const response = broker.handleRequest(buf[0..pos]);
+    broker.allocator = testing.allocator;
+
+    try testing.expect(failing_allocator.failed);
+    try testing.expect(response != null);
+    defer response_allocator.free(response.?);
+
+    try expectShareGroupDescribeErrorResponseBytes(response.?, 7703, ErrorCode.kafka_storage_error);
 }
 
 test "Broker.handleRequest share group APIs authorization denial uses generated responses" {
