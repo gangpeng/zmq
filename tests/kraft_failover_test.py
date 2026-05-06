@@ -119,6 +119,15 @@ def write_compact_i32_array(values):
     return bytes(out)
 
 
+def write_automq_node_tags(tags):
+    out = bytearray(write_compact_array_len(len(tags)))
+    for key, value in tags:
+        out += write_compact_string(key)
+        out += write_compact_string(value)
+        out += b"\x00"  # tag tagged fields
+    return bytes(out)
+
+
 def read_exact(sock, size):
     data = bytearray()
     while len(data) < size:
@@ -1723,10 +1732,11 @@ def automq_describe_stream(port, stream_id, correlation_id):
     raise TestError(f"DescribeStreams did not include stream_id={stream_id}; streams={streams}")
 
 
-def automq_register_node(port, node_id, node_epoch, wal_config, correlation_id):
+def automq_register_node(port, node_id, node_epoch, wal_config, correlation_id, tags=None):
+    tags = tags or []
     body = struct.pack(">iq", node_id, node_epoch)
     body += write_compact_string(wal_config)
-    body += write_compact_array_len(0)  # tags
+    body += write_automq_node_tags(tags)
     body += b"\x00"  # request tagged fields
 
     response = automq_request(port, 513, correlation_id, body, timeout=15)
@@ -1738,12 +1748,7 @@ def automq_register_node(port, node_id, node_epoch, wal_config, correlation_id):
         raise TestError(f"AutomqRegisterNode error_code={error_code}")
 
 
-def automq_get_node(port, node_id, correlation_id):
-    body = write_compact_array_len(1)
-    body += struct.pack(">i", node_id)
-    body += b"\x00"  # request tagged fields
-
-    response = automq_request(port, 514, correlation_id, body)
+def parse_automq_get_nodes_response(response, correlation_id):
     pos = parse_flexible_response_header(response, correlation_id)
     error_code, pos = read_i16(response, pos)
     _, pos = read_i32(response, pos)  # throttle_time_ms
@@ -1758,9 +1763,11 @@ def automq_get_node(port, node_id, correlation_id):
         state, pos = read_compact_string(response, pos)
         has_opening_streams, pos = read_bool(response, pos)
         tag_count, pos = read_compact_array_len(response, pos)
+        tags = []
         for _ in range(tag_count):
-            _, pos = read_compact_string(response, pos)
-            _, pos = read_compact_string(response, pos)
+            tag_key, pos = read_compact_string(response, pos)
+            tag_value, pos = read_compact_string(response, pos)
+            tags.append((tag_key, tag_value))
             pos = skip_tags(response, pos)
         pos = skip_tags(response, pos)
         nodes.append(
@@ -1770,9 +1777,24 @@ def automq_get_node(port, node_id, correlation_id):
                 "wal_config": wal_config,
                 "state": state,
                 "has_opening_streams": has_opening_streams,
+                "tags": tags,
             }
         )
     pos = skip_tags(response, pos)
+    if pos != len(response):
+        raise TestError(
+            f"AutomqGetNodes response has trailing bytes: pos={pos} len={len(response)}"
+        )
+    return nodes
+
+
+def automq_get_node(port, node_id, correlation_id):
+    body = write_compact_array_len(1)
+    body += struct.pack(">i", node_id)
+    body += b"\x00"  # request tagged fields
+
+    response = automq_request(port, 514, correlation_id, body)
+    nodes = parse_automq_get_nodes_response(response, correlation_id)
     for node in nodes:
         if node["node_id"] == node_id:
             return node
@@ -2308,13 +2330,15 @@ def wait_for_automq_opening_stream_missing(port, node_id, stream_id, timeout=45)
     )
 
 
-def wait_for_automq_register_node(port, node_id, node_epoch, wal_config, timeout=45):
+def wait_for_automq_register_node(
+    port, node_id, node_epoch, wal_config, tags=None, timeout=45
+):
     deadline = time.time() + timeout
     correlation_id = 11000
     last_error = None
     while time.time() < deadline:
         try:
-            automq_register_node(port, node_id, node_epoch, wal_config, correlation_id)
+            automq_register_node(port, node_id, node_epoch, wal_config, correlation_id, tags=tags)
             return
         except Exception as exc:
             last_error = exc
@@ -2323,7 +2347,9 @@ def wait_for_automq_register_node(port, node_id, node_epoch, wal_config, timeout
     raise TestError(f"AutoMQ RegisterNode did not succeed within {timeout}s: {last_error}")
 
 
-def wait_for_automq_node(port, node_id, expected_epoch, expected_wal_config, timeout=45):
+def wait_for_automq_node(
+    port, node_id, expected_epoch, expected_wal_config, expected_tags=None, timeout=45
+):
     deadline = time.time() + timeout
     correlation_id = 12000
     last_error = None
@@ -2334,6 +2360,7 @@ def wait_for_automq_node(port, node_id, expected_epoch, expected_wal_config, tim
             if (
                 last_node["node_epoch"] == expected_epoch
                 and last_node["wal_config"] == expected_wal_config
+                and (expected_tags is None or last_node["tags"] == list(expected_tags))
             ):
                 return last_node
         except Exception as exc:
@@ -2913,17 +2940,23 @@ def run_automq_metadata_failover_scenario(tmp):
         registered_node_id = 700 + leader_id
         registered_node_epoch = 42
         registered_wal_config = f"wal://automq-node-{registered_node_id}"
+        registered_node_tags = [
+            ("rack", f"rack-{leader_id}"),
+            ("zone", "primary"),
+        ]
         wait_for_automq_register_node(
             leader_broker_port,
             registered_node_id,
             registered_node_epoch,
             registered_wal_config,
+            tags=registered_node_tags,
         )
         wait_for_automq_node(
             leader_broker_port,
             registered_node_id,
             registered_node_epoch,
             registered_wal_config,
+            expected_tags=registered_node_tags,
         )
 
         license_value = f"license-{os.getpid()}-{int(time.time())}"
@@ -2962,6 +2995,7 @@ def run_automq_metadata_failover_scenario(tmp):
                 registered_node_id,
                 registered_node_epoch,
                 registered_wal_config,
+                expected_tags=registered_node_tags,
             )
             wait_for_automq_license(info["broker_port"], license_value)
 
@@ -2995,6 +3029,7 @@ def run_automq_metadata_failover_scenario(tmp):
             registered_node_id,
             registered_node_epoch,
             registered_wal_config,
+            expected_tags=registered_node_tags,
         )
         wait_for_automq_license(replacement_broker_port, license_value)
         wait_for_automq_next_node_id(
@@ -3150,6 +3185,7 @@ def run_automq_metadata_failover_scenario(tmp):
             registered_node_id,
             registered_node_epoch,
             registered_wal_config,
+            expected_tags=registered_node_tags,
         )
         wait_for_automq_license(processes[leader_id]["broker_port"], license_value)
 
@@ -3647,6 +3683,32 @@ def self_test():
         )
         if produce_v9["error_code"] != 47 or produce_v9["base_offset"] != -1:
             raise TestError(f"Produce v9 fixture parser failed: {produce_v9}")
+
+        automq_nodes_fixture = struct.pack(">i", 51)
+        automq_nodes_fixture += b"\x00"  # response header tagged fields
+        automq_nodes_fixture += struct.pack(">hi", 0, 0)
+        automq_nodes_fixture += write_compact_array_len(1)
+        automq_nodes_fixture += struct.pack(">iq", 7, 42)
+        automq_nodes_fixture += write_compact_string("wal://fixture-node")
+        automq_nodes_fixture += write_compact_string("ACTIVE")
+        automq_nodes_fixture += b"\x01"
+        automq_nodes_fixture += write_automq_node_tags(
+            [("rack", "az-a"), ("role", "broker")]
+        )
+        automq_nodes_fixture += b"\x00"  # node tagged fields
+        automq_nodes_fixture += b"\x00"  # response tagged fields
+        automq_nodes = parse_automq_get_nodes_response(automq_nodes_fixture, 51)
+        if automq_nodes != [
+            {
+                "node_id": 7,
+                "node_epoch": 42,
+                "wal_config": "wal://fixture-node",
+                "state": "ACTIVE",
+                "has_opening_streams": True,
+                "tags": [("rack", "az-a"), ("role", "broker")],
+            }
+        ]:
+            raise TestError(f"AutomqGetNodes tag fixture parser failed: {automq_nodes}")
 
         print("ok: KRaft failover harness self-test")
         return 0

@@ -280,8 +280,9 @@ epochs.
 
 Latest default-suite AutoMQ metadata tranche: node registration tags now round-trip
 from AutomqRegisterNode into AutomqGetNodes and survive local metadata restart,
-local rollback snapshots, committed quorum replay, and compacted full-snapshot-v2
-records.
+local rollback snapshots, committed quorum replay, compacted full-snapshot-v2
+records, and the KRaft failover harness now registers and validates node tags in
+its AutoMQ metadata scenario.
 
 Latest default-suite fail-closed tranche: metadata-client controller discovery
 now surfaces malformed DescribeQuorum responses, including trailing response
@@ -1269,8 +1270,8 @@ Status: completed for the initial catalog and DeleteGroups slice.
   produce after each transition, and broker fetch/read-after-transition checks
   for all acknowledged records. The same gate also starts a three-node combined
   controller+broker quorum and verifies AutoMQ KV put/get/delete, zone router,
-  node registry, license, node-id allocator, group promote/demote, stream
-  create/prepare/commit/open/close/trim/delete metadata, stream-set object
+  node registry including tags, license, node-id allocator, group promote/demote,
+  stream create/prepare/commit/open/close/trim/delete metadata, stream-set object
   commit, manifest stream/group-count probes, and partition-snapshot protocol
   smoke survive controller leader kill, replacement-leader mutation, and
   old-leader restart/rejoin; broker-side AutoMQ AppendEntries now applies
