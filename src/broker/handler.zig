@@ -14540,35 +14540,35 @@ pub const Broker = struct {
 
         if (!validateOffsetCommitRequestFrame(request_bytes, body_start, api_version)) {
             log.warn("Malformed OffsetCommit request", .{});
-            return null;
+            return self.offsetCommitErrorResponse(req_header, resp_header_version, api_version, ErrorCode.invalid_request);
         }
 
         var pos = body_start;
         var req = Req.deserialize(self.allocator, request_bytes, &pos, api_version) catch |err| {
             log.warn("Failed to decode OffsetCommit request: {}", .{err});
-            return null;
+            return self.offsetCommitErrorResponse(req_header, resp_header_version, api_version, ErrorCode.invalid_request);
         };
         defer self.freeOffsetCommitRequest(&req);
 
-        const topics = self.allocator.alloc(TopicResponse, req.topics.len) catch return null;
-        var topics_init: usize = 0;
+        const topics = self.materializeOffsetCommitResponseTopics(&req) catch |err| {
+            log.warn("OffsetCommit response materialization failed: {}", .{err});
+            return self.offsetCommitErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error);
+        };
         defer {
-            self.freeOffsetCommitTopics(topics[0..topics_init]);
+            self.freeOffsetCommitTopics(topics);
             if (topics.len > 0) self.allocator.free(topics);
         }
 
         const group_id = req.group_id orelse "";
         const group_error = self.validateOffsetCommitGroup(api_version, group_id, req.generation_id_or_member_epoch, req.member_id, req.group_instance_id);
-        var previous_offsets = self.cloneCommittedOffsets() catch return null;
+        var previous_offsets = self.cloneCommittedOffsets() catch |err| {
+            log.warn("OffsetCommit rollback snapshot materialization failed: {}", .{err});
+            return self.offsetCommitErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error);
+        };
         defer self.freeCommittedOffsetSnapshot(&previous_offsets);
         var mutated = false;
-        for (req.topics) |topic_req| {
-            const partitions = self.allocator.alloc(PartitionResponse, topic_req.partitions.len) catch return null;
-            var transferred = false;
-            defer {
-                if (!transferred and partitions.len > 0) self.allocator.free(partitions);
-            }
-
+        for (req.topics, topics) |topic_req, *topic_resp| {
+            const partitions: []PartitionResponse = @constCast(topic_resp.partitions);
             const topic_name = topic_req.name orelse "";
             for (topic_req.partitions, 0..) |partition_req, partition_idx| {
                 const partition_id = partition_req.partition_index;
@@ -14607,20 +14607,13 @@ pub const Broker = struct {
                     .error_code = error_code,
                 };
             }
-
-            topics[topics_init] = .{
-                .name = topic_req.name,
-                .partitions = partitions,
-            };
-            topics_init += 1;
-            transferred = true;
         }
 
         if (mutated) {
             self.persistOffsetsDurably() catch |err| {
                 log.warn("OffsetCommit offset snapshot write failed: {}", .{err});
                 self.restoreCommittedOffsetSnapshot(&previous_offsets);
-                for (topics[0..topics_init]) |*topic| {
+                for (topics) |*topic| {
                     const partitions: []PartitionResponse = @constCast(topic.partitions);
                     for (partitions) |*partition| {
                         if (partition.error_code == @intFromEnum(ErrorCode.none)) {
@@ -14633,9 +14626,12 @@ pub const Broker = struct {
 
         const resp = Resp{
             .throttle_time_ms = 0,
-            .topics = topics[0..topics_init],
+            .topics = topics,
         };
-        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version) orelse {
+            log.warn("OffsetCommit response serialization failed", .{});
+            return self.offsetCommitErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error);
+        };
     }
 
     fn freeOffsetCommitRequest(self: *Broker, req: *generated.offset_commit_request.OffsetCommitRequest) void {
@@ -14649,6 +14645,41 @@ pub const Broker = struct {
         for (topics) |topic| {
             if (topic.partitions.len > 0) self.allocator.free(topic.partitions);
         }
+    }
+
+    fn materializeOffsetCommitResponseTopics(self: *Broker, req: *const generated.offset_commit_request.OffsetCommitRequest) ![]generated.offset_commit_response.OffsetCommitResponse.OffsetCommitResponseTopic {
+        const TopicResponse = generated.offset_commit_response.OffsetCommitResponse.OffsetCommitResponseTopic;
+        const PartitionResponse = TopicResponse.OffsetCommitResponsePartition;
+
+        if (req.topics.len == 0) return &.{};
+
+        const topics = try self.allocator.alloc(TopicResponse, req.topics.len);
+        var topics_init: usize = 0;
+        errdefer {
+            self.freeOffsetCommitTopics(topics[0..topics_init]);
+            self.allocator.free(topics);
+        }
+
+        for (req.topics) |topic_req| {
+            var partitions: []PartitionResponse = &.{};
+            if (topic_req.partitions.len > 0) {
+                partitions = try self.allocator.alloc(PartitionResponse, topic_req.partitions.len);
+                for (topic_req.partitions, 0..) |partition_req, partition_idx| {
+                    partitions[partition_idx] = .{
+                        .partition_index = partition_req.partition_index,
+                        .error_code = @intFromEnum(ErrorCode.kafka_storage_error),
+                    };
+                }
+            }
+
+            topics[topics_init] = .{
+                .name = topic_req.name,
+                .partitions = partitions,
+            };
+            topics_init += 1;
+        }
+
+        return topics;
     }
 
     // ---------------------------------------------------------------
@@ -19233,13 +19264,15 @@ pub const Broker = struct {
 
         if (!validateInitProducerIdRequestFrame(request_bytes, body_start, api_version)) {
             log.warn("Malformed InitProducerId request", .{});
-            return null;
+            return self.initProducerIdErrorResponse(req_header, resp_header_version, api_version, ErrorCode.invalid_request) orelse
+                self.initProducerIdErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error);
         }
 
         var pos = body_start;
         const req = Req.deserialize(self.allocator, request_bytes, &pos, api_version) catch |err| {
             log.warn("Failed to decode InitProducerId request: {}", .{err});
-            return null;
+            return self.initProducerIdErrorResponse(req_header, resp_header_version, api_version, ErrorCode.invalid_request) orelse
+                self.initProducerIdErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error);
         };
 
         if (self.validateInitProducerIdAbortableState(api_version, req.transactional_id, req.transaction_timeout_ms, req.producer_id, req.producer_epoch)) {
@@ -19249,13 +19282,23 @@ pub const Broker = struct {
                 .producer_id = -1,
                 .producer_epoch = -1,
             };
-            return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+            return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version) orelse {
+                log.warn("InitProducerId abortable response serialization failed", .{});
+                return self.initProducerIdErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error);
+            };
         }
 
-        const previous_snapshot = self.encodeTransactionSnapshotRecordValue() catch return null;
+        const previous_snapshot = self.encodeTransactionSnapshotRecordValue() catch |err| {
+            log.warn("InitProducerId rollback snapshot materialization failed: {}", .{err});
+            return self.initProducerIdErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error);
+        };
         defer self.allocator.free(previous_snapshot);
 
-        const result = self.txn_coordinator.initProducerIdForRequestWithTimeout(req.transactional_id, req.transaction_timeout_ms, req.producer_id, req.producer_epoch) catch return null;
+        const result = self.txn_coordinator.initProducerIdForRequestWithTimeout(req.transactional_id, req.transaction_timeout_ms, req.producer_id, req.producer_epoch) catch |err| {
+            log.warn("InitProducerId local mutation failed for {s}: {}", .{ req.transactional_id orelse "", err });
+            self.restoreTransactionsAfterFailedMutation(previous_snapshot);
+            return self.initProducerIdErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error);
+        };
         if (result.error_code == @intFromEnum(ErrorCode.none)) {
             self.persistTransactionsIfDirtyDurably() catch |err| {
                 log.warn("InitProducerId transaction snapshot write failed for {s}: {}", .{ req.transactional_id orelse "", err });
@@ -19266,7 +19309,10 @@ pub const Broker = struct {
                     .producer_id = -1,
                     .producer_epoch = -1,
                 };
-                return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+                return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version) orelse {
+                    log.warn("InitProducerId storage-error response serialization failed", .{});
+                    return self.initProducerIdErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error);
+                };
             };
             _ = self.fenceProducerSequencesForEpoch(result.producer_id, result.producer_epoch);
             self.persistProducerSequencesIfDirtyDurably() catch |err| {
@@ -19277,7 +19323,10 @@ pub const Broker = struct {
                     .producer_id = -1,
                     .producer_epoch = -1,
                 };
-                return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+                return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version) orelse {
+                    log.warn("InitProducerId sequence storage-error response serialization failed", .{});
+                    return self.initProducerIdErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error);
+                };
             };
         } else {
             self.persistTransactionsIfDirty();
@@ -19288,7 +19337,10 @@ pub const Broker = struct {
             .producer_id = result.producer_id,
             .producer_epoch = result.producer_epoch,
         };
-        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version) orelse {
+            log.warn("InitProducerId response serialization failed", .{});
+            return self.initProducerIdErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error);
+        };
     }
 
     fn validateInitProducerIdAbortableState(self: *const Broker, api_version: i16, transactional_id: ?[]const u8, transaction_timeout_ms: i32, producer_id: i64, producer_epoch: i16) bool {
@@ -19728,21 +19780,29 @@ pub const Broker = struct {
 
         if (!validateAddPartitionsToTxnRequestFrame(request_bytes, body_start, api_version)) {
             log.warn("Malformed AddPartitionsToTxn request", .{});
-            return null;
+            return self.addPartitionsToTxnErrorResponse(req_header, resp_header_version, api_version, ErrorCode.invalid_request) orelse
+                self.addPartitionsToTxnErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error);
         }
 
         var pos = body_start;
         var req = Req.deserialize(self.allocator, request_bytes, &pos, api_version) catch |err| {
             log.warn("Failed to decode AddPartitionsToTxn request: {}", .{err});
-            return null;
+            return self.addPartitionsToTxnErrorResponse(req_header, resp_header_version, api_version, ErrorCode.invalid_request) orelse
+                self.addPartitionsToTxnErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error);
         };
         defer self.freeAddPartitionsToTxnRequest(&req);
 
         if (api_version >= 4) {
-            const previous_snapshot = self.encodeTransactionSnapshotRecordValue() catch return null;
+            const previous_snapshot = self.encodeTransactionSnapshotRecordValue() catch |err| {
+                log.warn("AddPartitionsToTxn rollback snapshot materialization failed: {}", .{err});
+                return self.addPartitionsToTxnErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error);
+            };
             defer self.allocator.free(previous_snapshot);
 
-            const txn_results = self.allocator.alloc(TxnResult, req.transactions.len) catch return null;
+            const txn_results = self.allocator.alloc(TxnResult, req.transactions.len) catch |err| {
+                log.warn("AddPartitionsToTxn transaction response allocation failed: {}", .{err});
+                return self.addPartitionsToTxnErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error);
+            };
             var txn_results_init: usize = 0;
             defer {
                 self.freeAddPartitionsToTxnResults(txn_results[0..txn_results_init]);
@@ -19758,7 +19818,11 @@ pub const Broker = struct {
                     txn_req.verify_only,
                     transaction_error,
                     txn_req.topics,
-                ) catch return null;
+                ) catch |err| {
+                    log.warn("AddPartitionsToTxn response materialization failed: {}", .{err});
+                    self.restoreTransactionsAfterFailedMutation(previous_snapshot);
+                    return self.addPartitionsToTxnErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error);
+                };
                 var transferred = false;
                 defer {
                     if (!transferred) {
@@ -19789,12 +19853,21 @@ pub const Broker = struct {
                     .error_code = @intFromEnum(ErrorCode.kafka_storage_error),
                     .results_by_transaction = txn_results[0..txn_results_init],
                 };
-                return self.serializeGeneratedResponse(req_header, resp_header_version, &storage_resp, api_version);
+                return self.serializeGeneratedResponse(req_header, resp_header_version, &storage_resp, api_version) orelse {
+                    log.warn("AddPartitionsToTxn storage-error response serialization failed", .{});
+                    return self.addPartitionsToTxnErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error);
+                };
             };
-            return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+            return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version) orelse {
+                log.warn("AddPartitionsToTxn response serialization failed", .{});
+                return self.addPartitionsToTxnErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error);
+            };
         }
 
-        const previous_snapshot = self.encodeTransactionSnapshotRecordValue() catch return null;
+        const previous_snapshot = self.encodeTransactionSnapshotRecordValue() catch |err| {
+            log.warn("AddPartitionsToTxn rollback snapshot materialization failed: {}", .{err});
+            return self.addPartitionsToTxnErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error);
+        };
         defer self.allocator.free(previous_snapshot);
 
         const topic_results = self.buildAddPartitionsToTxnTopicResults(
@@ -19804,7 +19877,11 @@ pub const Broker = struct {
             false,
             @intFromEnum(ErrorCode.none),
             req.v3_and_below_topics,
-        ) catch return null;
+        ) catch |err| {
+            log.warn("AddPartitionsToTxn legacy response materialization failed: {}", .{err});
+            self.restoreTransactionsAfterFailedMutation(previous_snapshot);
+            return self.addPartitionsToTxnErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error);
+        };
         defer {
             self.freeAddPartitionsToTxnTopicResults(topic_results);
             if (topic_results.len > 0) self.allocator.free(topic_results);
@@ -19819,7 +19896,10 @@ pub const Broker = struct {
             self.restoreTransactionsAfterFailedMutation(previous_snapshot);
             markAddPartitionsToTxnTopicResultsStorageError(topic_results);
         };
-        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version) orelse {
+            log.warn("AddPartitionsToTxn legacy response serialization failed", .{});
+            return self.addPartitionsToTxnErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error);
+        };
     }
 
     fn buildAddPartitionsToTxnTopicResults(
@@ -20023,13 +20103,15 @@ pub const Broker = struct {
 
         if (!validateEndTxnRequestFrame(request_bytes, body_start, api_version)) {
             log.warn("Malformed EndTxn request", .{});
-            return null;
+            return self.endTxnErrorResponse(req_header, resp_header_version, api_version, ErrorCode.invalid_request) orelse
+                self.endTxnErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error);
         }
 
         var pos = body_start;
         const req = Req.deserialize(self.allocator, request_bytes, &pos, api_version) catch |err| {
             log.warn("Failed to decode EndTxn request: {}", .{err});
-            return null;
+            return self.endTxnErrorResponse(req_header, resp_header_version, api_version, ErrorCode.invalid_request) orelse
+                self.endTxnErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error);
         };
 
         const identity_error = self.validateTransactionalProducerIdentity(req.transactional_id, req.producer_id, req.producer_epoch);
@@ -20038,7 +20120,10 @@ pub const Broker = struct {
                 .throttle_time_ms = 0,
                 .error_code = identity_error,
             };
-            return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+            return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version) orelse {
+                log.warn("EndTxn identity-error response serialization failed", .{});
+                return self.endTxnErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error);
+            };
         }
 
         const state_error = self.validateEndTxnState(api_version, req.producer_id, req.committed);
@@ -20047,10 +20132,16 @@ pub const Broker = struct {
                 .throttle_time_ms = 0,
                 .error_code = state_error,
             };
-            return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+            return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version) orelse {
+                log.warn("EndTxn state-error response serialization failed", .{});
+                return self.endTxnErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error);
+            };
         }
 
-        const previous_snapshot = self.encodeTransactionSnapshotRecordValue() catch return null;
+        const previous_snapshot = self.encodeTransactionSnapshotRecordValue() catch |err| {
+            log.warn("EndTxn rollback snapshot materialization failed: {}", .{err});
+            return self.endTxnErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error);
+        };
         defer self.allocator.free(previous_snapshot);
 
         if (self.store.s3_wal_mode) {
@@ -20068,7 +20159,10 @@ pub const Broker = struct {
                 .throttle_time_ms = 0,
                 .error_code = marker_error,
             };
-            return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+            return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version) orelse {
+                log.warn("EndTxn marker-error response serialization failed", .{});
+                return self.endTxnErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error);
+            };
         }
 
         const error_code = self.txn_coordinator.endTxnComplete(req.producer_id, req.producer_epoch, req.committed);
@@ -20080,7 +20174,10 @@ pub const Broker = struct {
                     .throttle_time_ms = 0,
                     .error_code = @intFromEnum(ErrorCode.kafka_storage_error),
                 };
-                return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+                return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version) orelse {
+                    log.warn("EndTxn storage-error response serialization failed", .{});
+                    return self.endTxnErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error);
+                };
             };
         } else {
             self.persistTransactionsIfDirty();
@@ -20090,7 +20187,10 @@ pub const Broker = struct {
             .throttle_time_ms = 0,
             .error_code = error_code,
         };
-        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version) orelse {
+            log.warn("EndTxn response serialization failed", .{});
+            return self.endTxnErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error);
+        };
     }
 
     fn handleEndTxnS3Wal(
@@ -20132,7 +20232,10 @@ pub const Broker = struct {
                         .throttle_time_ms = 0,
                         .error_code = write_result.error_code,
                     };
-                    return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+                    return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version) orelse {
+                        log.warn("EndTxn S3 WAL marker-error response serialization failed", .{});
+                        return self.endTxnErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error);
+                    };
                 }
             }
         }
@@ -20146,7 +20249,10 @@ pub const Broker = struct {
                     .throttle_time_ms = 0,
                     .error_code = @intFromEnum(ErrorCode.kafka_storage_error),
                 };
-                return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+                return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version) orelse {
+                    log.warn("EndTxn S3 WAL snapshot-error response serialization failed", .{});
+                    return self.endTxnErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error);
+                };
             };
 
             self.flushPendingTxnMarkerS3WalWrites(pending_writes.items) catch |err| {
@@ -20156,7 +20262,10 @@ pub const Broker = struct {
                     .throttle_time_ms = 0,
                     .error_code = @intFromEnum(ErrorCode.kafka_storage_error),
                 };
-                return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+                return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version) orelse {
+                    log.warn("EndTxn S3 WAL flush-error response serialization failed", .{});
+                    return self.endTxnErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error);
+                };
             };
 
             self.applyCommittedTxnMarkerS3WalWrites(pending_writes.items);
@@ -20173,7 +20282,10 @@ pub const Broker = struct {
                     .throttle_time_ms = 0,
                     .error_code = @intFromEnum(ErrorCode.kafka_storage_error),
                 };
-                return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+                return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version) orelse {
+                    log.warn("EndTxn S3 WAL local-checkpoint-error response serialization failed", .{});
+                    return self.endTxnErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error);
+                };
             }
             self.txn_coordinator.dirty = false;
         } else {
@@ -20184,7 +20296,10 @@ pub const Broker = struct {
             .throttle_time_ms = 0,
             .error_code = error_code,
         };
-        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version) orelse {
+            log.warn("EndTxn S3 WAL response serialization failed", .{});
+            return self.endTxnErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error);
+        };
     }
 
     // ---------------------------------------------------------------
@@ -21225,13 +21340,15 @@ pub const Broker = struct {
 
         if (!validateAddOffsetsToTxnRequestFrame(request_bytes, body_start, api_version)) {
             log.warn("Malformed AddOffsetsToTxn request", .{});
-            return null;
+            return self.addOffsetsToTxnErrorResponse(req_header, resp_header_version, api_version, ErrorCode.invalid_request) orelse
+                self.addOffsetsToTxnErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error);
         }
 
         var pos = body_start;
         const req = Req.deserialize(self.allocator, request_bytes, &pos, api_version) catch |err| {
             log.warn("Failed to decode AddOffsetsToTxn request: {}", .{err});
-            return null;
+            return self.addOffsetsToTxnErrorResponse(req_header, resp_header_version, api_version, ErrorCode.invalid_request) orelse
+                self.addOffsetsToTxnErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error);
         };
         const group_id = req.group_id orelse "";
 
@@ -21239,7 +21356,10 @@ pub const Broker = struct {
 
         var error_code = self.validateAddOffsetsToTxnState(req.transactional_id, req.producer_id, req.producer_epoch, group_id, target_partition);
         if (error_code == @intFromEnum(ErrorCode.none)) {
-            const previous_snapshot = self.encodeTransactionSnapshotRecordValue() catch return null;
+            const previous_snapshot = self.encodeTransactionSnapshotRecordValue() catch |err| {
+                log.warn("AddOffsetsToTxn rollback snapshot materialization failed: {}", .{err});
+                return self.addOffsetsToTxnErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error);
+            };
             defer self.allocator.free(previous_snapshot);
 
             // Add __consumer_offsets partition to the transaction only after all
@@ -21249,7 +21369,11 @@ pub const Broker = struct {
                 req.producer_epoch,
                 "__consumer_offsets",
                 target_partition,
-            ) catch @intFromEnum(ErrorCode.kafka_storage_error);
+            ) catch |err| blk: {
+                log.warn("AddOffsetsToTxn local mutation failed for {s}: {}", .{ req.transactional_id orelse "", err });
+                self.restoreTransactionsAfterFailedMutation(previous_snapshot);
+                break :blk @intFromEnum(ErrorCode.kafka_storage_error);
+            };
             error_code = self.mapTransactionAbortableError(api_version, req.producer_id, error_code);
             if (error_code == @intFromEnum(ErrorCode.none)) {
                 self.persistTransactionsIfDirtyDurably() catch |err| {
@@ -21266,7 +21390,10 @@ pub const Broker = struct {
             .throttle_time_ms = 0,
             .error_code = error_code,
         };
-        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version) orelse {
+            log.warn("AddOffsetsToTxn response serialization failed", .{});
+            return self.addOffsetsToTxnErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error);
+        };
     }
 
     fn validateAddOffsetsToTxnState(self: *Broker, transactional_id: ?[]const u8, producer_id: i64, producer_epoch: i16, group_id: []const u8, offsets_partition: i32) i16 {
@@ -21319,32 +21446,83 @@ pub const Broker = struct {
     // DeleteGroups (key 42)
     // ---------------------------------------------------------------
     fn handleDeleteGroups(self: *Broker, request_bytes: []const u8, body_start: usize, req_header: *const RequestHeader, api_version: i16, resp_header_version: i16) ?[]u8 {
+        const Req = generated.delete_groups_request.DeleteGroupsRequest;
+        const Resp = generated.delete_groups_response.DeleteGroupsResponse;
+        const Result = Resp.DeletableGroupResult;
+
         if (!validateDeleteGroupsRequestFrame(request_bytes, body_start, api_version)) {
             log.warn("Malformed DeleteGroups request", .{});
-            return null;
+            return self.deleteGroupsErrorResponse(req_header, resp_header_version, api_version, ErrorCode.invalid_request);
         }
 
         var pos = body_start;
-        const flexible = api_version >= 2;
-        const num_groups = if (flexible)
-            (ser.readCompactArrayLen(request_bytes, &pos) catch return null) orelse 0
-        else
-            (ser.readArrayLen(request_bytes, &pos) catch return null) orelse 0;
+        const req = Req.deserialize(self.allocator, request_bytes, &pos, api_version) catch |err| {
+            log.warn("Failed to decode DeleteGroups request: {}", .{err});
+            return self.deleteGroupsErrorResponse(req_header, resp_header_version, api_version, ErrorCode.invalid_request);
+        };
+        defer if (req.groups_names.len > 0) self.allocator.free(req.groups_names);
 
-        var results = std.array_list.Managed(DeleteGroupsResponse.DeletableGroupResult).init(self.allocator);
-        defer results.deinit();
+        var results: []Result = &.{};
+        if (req.groups_names.len > 0) {
+            results = self.allocator.alloc(Result, req.groups_names.len) catch |err| {
+                log.warn("DeleteGroups response materialization failed: {}", .{err});
+                return self.deleteGroupsErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error);
+            };
+            for (req.groups_names, results) |group_id_opt, *result| {
+                result.* = .{
+                    .group_id = group_id_opt orelse "",
+                    .error_code = @intFromEnum(ErrorCode.kafka_storage_error),
+                };
+            }
+        }
+        defer if (results.len > 0) self.allocator.free(results);
 
-        const previous_snapshot = self.encodeConsumerGroupSnapshotRecordValue() catch return null;
-        defer self.allocator.free(previous_snapshot);
+        if (req.groups_names.len == 0) {
+            const resp = Resp{
+                .throttle_time_ms = 0,
+                .results = results,
+            };
+            return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version) orelse {
+                log.warn("DeleteGroups empty response serialization failed", .{});
+                return self.deleteGroupsErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error);
+            };
+        }
+
+        const previous_group_snapshot = self.encodeConsumerGroupSnapshotRecordValue() catch |err| {
+            log.warn("DeleteGroups consumer-group rollback snapshot materialization failed: {}", .{err});
+            const resp = Resp{
+                .throttle_time_ms = 0,
+                .results = results,
+            };
+            return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version) orelse
+                self.deleteGroupsErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error);
+        };
+        defer self.allocator.free(previous_group_snapshot);
+
+        var previous_offsets = self.cloneCommittedOffsets() catch |err| {
+            log.warn("DeleteGroups committed-offset rollback snapshot materialization failed: {}", .{err});
+            const resp = Resp{
+                .throttle_time_ms = 0,
+                .results = results,
+            };
+            return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version) orelse
+                self.deleteGroupsErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error);
+        };
+        defer self.freeCommittedOffsetSnapshot(&previous_offsets);
+
+        var removed_share_sessions = std.array_list.Managed(RemovedShareGroupSession).init(self.allocator);
+        defer {
+            self.freeRemovedShareGroupSessions(removed_share_sessions.items);
+            removed_share_sessions.deinit();
+        }
+
+        var mutation_failed = false;
+        var sessions_removed = false;
 
         var offsets_mutated = false;
         var groups_mutated = false;
-        for (0..num_groups) |_| {
-            const group_id = if (flexible)
-                (ser.readCompactString(request_bytes, &pos) catch return null) orelse ""
-            else
-                (ser.readString(request_bytes, &pos) catch return null) orelse "";
-
+        for (req.groups_names, results) |group_id_opt, *result| {
+            const group_id = group_id_opt orelse "";
             var delete_error = self.groups.deleteGroupError(group_id);
             if (delete_error == ErrorCode.none) {
                 const deleted_offsets = self.writeOffsetDeleteRecordsForGroup(group_id) catch |err| blk: {
@@ -21360,23 +21538,20 @@ pub const Broker = struct {
                     }
                 }
             }
-            results.append(.{ .group_id = group_id, .error_code = @intFromEnum(delete_error) }) catch return null;
+            result.error_code = @intFromEnum(delete_error);
         }
 
-        if (flexible) ser.skipTaggedFields(request_bytes, &pos) catch return null;
-        if (offsets_mutated) self.persistOffsets();
-        if (groups_mutated) {
-            var removed_share_sessions = std.array_list.Managed(RemovedShareGroupSession).init(self.allocator);
-            defer {
-                self.freeRemovedShareGroupSessions(removed_share_sessions.items);
-                removed_share_sessions.deinit();
-            }
+        if (offsets_mutated) {
+            self.persistOffsetsDurably() catch |err| {
+                mutation_failed = true;
+                log.warn("DeleteGroups offset snapshot write failed: {}", .{err});
+            };
+        }
 
-            var sessions_removed = false;
-            var mutation_failed = false;
-            var groups_snapshot_persisted = false;
-            for (results.items) |result| {
-                if (result.error_code == @intFromEnum(ErrorCode.none)) {
+        if (groups_mutated) {
+            if (!mutation_failed) {
+                for (results) |result| {
+                    if (result.error_code != @intFromEnum(ErrorCode.none)) continue;
                     if (result.group_id) |deleted_group_id| {
                         sessions_removed = (self.removeShareGroupSessionsForGroup(deleted_group_id, &removed_share_sessions) catch |err| blk: {
                             mutation_failed = true;
@@ -21392,9 +21567,6 @@ pub const Broker = struct {
                     mutation_failed = true;
                     log.warn("DeleteGroups consumer-group snapshot write failed: {}", .{err});
                 };
-                if (!mutation_failed) {
-                    groups_snapshot_persisted = true;
-                }
             }
 
             if (!mutation_failed and sessions_removed) {
@@ -21407,35 +21579,40 @@ pub const Broker = struct {
             if (mutation_failed) {
                 self.restoreRemovedShareGroupSessions(removed_share_sessions.items);
                 removed_share_sessions.clearRetainingCapacity();
-                self.restoreConsumerGroupsAfterFailedMutation(previous_snapshot);
-                if (groups_snapshot_persisted) {
-                    self.persistConsumerGroupsDurably() catch |restore_err| {
-                        log.warn("Failed to persist restored DeleteGroups rollback snapshot: {}", .{restore_err});
-                    };
-                }
-                for (results.items) |*result| {
-                    if (result.error_code == @intFromEnum(ErrorCode.none)) {
-                        result.error_code = @intFromEnum(ErrorCode.kafka_storage_error);
-                    }
-                }
+                self.restoreConsumerGroupsAfterFailedMutation(previous_group_snapshot);
             } else {
                 self.freeRemovedShareGroupSessions(removed_share_sessions.items);
                 removed_share_sessions.clearRetainingCapacity();
             }
         }
 
-        const resp_body = DeleteGroupsResponse{
+        if (mutation_failed) {
+            if (offsets_mutated) {
+                self.restoreCommittedOffsetSnapshot(&previous_offsets);
+                self.persistOffsetsDurably() catch |restore_err| {
+                    log.warn("Failed to persist restored DeleteGroups offset rollback snapshot: {}", .{restore_err});
+                };
+            }
+            if (groups_mutated) {
+                self.persistConsumerGroupsDurably() catch |restore_err| {
+                    log.warn("Failed to persist restored DeleteGroups consumer-group rollback snapshot: {}", .{restore_err});
+                };
+            }
+            for (results) |*result| {
+                if (result.error_code == @intFromEnum(ErrorCode.none)) {
+                    result.error_code = @intFromEnum(ErrorCode.kafka_storage_error);
+                }
+            }
+        }
+
+        const resp = Resp{
             .throttle_time_ms = 0,
-            .results = results.items,
+            .results = results,
         };
-        const body_version: i16 = @min(api_version, 2);
-        const resp_header = ResponseHeader{ .correlation_id = req_header.correlation_id };
-        const total_size = resp_header.calcSize(resp_header_version) + resp_body.calcSize(body_version);
-        const buf = self.allocator.alloc(u8, total_size) catch return null;
-        var wpos: usize = 0;
-        resp_header.serialize(buf, &wpos, resp_header_version);
-        resp_body.serialize(buf, &wpos, body_version);
-        return buf[0..wpos];
+        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version) orelse {
+            log.warn("DeleteGroups response serialization failed", .{});
+            return self.deleteGroupsErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error);
+        };
     }
 
     // ---------------------------------------------------------------
@@ -26457,36 +26634,37 @@ pub const Broker = struct {
 
         if (!validateTxnOffsetCommitRequestFrame(request_bytes, body_start, api_version)) {
             log.warn("Malformed TxnOffsetCommit request", .{});
-            return null;
+            return self.txnOffsetCommitErrorResponse(req_header, resp_header_version, api_version, ErrorCode.invalid_request);
         }
 
         var pos = body_start;
         var req = Req.deserialize(self.allocator, request_bytes, &pos, api_version) catch |err| {
             log.warn("Failed to decode TxnOffsetCommit request: {}", .{err});
-            return null;
+            return self.txnOffsetCommitErrorResponse(req_header, resp_header_version, api_version, ErrorCode.invalid_request);
         };
         defer self.freeTxnOffsetCommitRequest(&req);
 
         const group_id = req.group_id orelse "";
         const txn_error = self.validateTxnOffsetCommitState(api_version, req.transactional_id, req.producer_id, req.producer_epoch, group_id);
         const group_error = self.validateOffsetCommitGroup(api_version, group_id, req.generation_id, req.member_id, req.group_instance_id);
-        var previous_offsets = self.cloneCommittedOffsets() catch return null;
-        defer self.freeCommittedOffsetSnapshot(&previous_offsets);
-        const topics = self.allocator.alloc(TopicResponse, req.topics.len) catch return null;
-        var topics_init: usize = 0;
+        const topics = self.materializeTxnOffsetCommitResponseTopics(&req) catch |err| {
+            log.warn("TxnOffsetCommit response materialization failed: {}", .{err});
+            return self.txnOffsetCommitErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error);
+        };
         defer {
-            self.freeTxnOffsetCommitTopics(topics[0..topics_init]);
+            self.freeTxnOffsetCommitTopics(topics);
             if (topics.len > 0) self.allocator.free(topics);
         }
 
-        var mutated = false;
-        for (req.topics) |topic_req| {
-            const partitions = self.allocator.alloc(PartitionResponse, topic_req.partitions.len) catch return null;
-            var transferred = false;
-            defer {
-                if (!transferred and partitions.len > 0) self.allocator.free(partitions);
-            }
+        var previous_offsets = self.cloneCommittedOffsets() catch |err| {
+            log.warn("TxnOffsetCommit rollback snapshot materialization failed: {}", .{err});
+            return self.txnOffsetCommitErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error);
+        };
+        defer self.freeCommittedOffsetSnapshot(&previous_offsets);
 
+        var mutated = false;
+        for (req.topics, topics) |topic_req, *topic_resp| {
+            const partitions: []PartitionResponse = @constCast(topic_resp.partitions);
             const topic = topic_req.name orelse "";
             for (topic_req.partitions, 0..) |partition_req, partition_idx| {
                 const error_code: i16 = blk: {
@@ -26514,20 +26692,13 @@ pub const Broker = struct {
                     .error_code = error_code,
                 };
             }
-
-            topics[topics_init] = .{
-                .name = topic_req.name,
-                .partitions = partitions,
-            };
-            topics_init += 1;
-            transferred = true;
         }
 
         if (mutated) {
             self.persistOffsetsDurably() catch |err| {
                 log.warn("TxnOffsetCommit offset snapshot write failed: {}", .{err});
                 self.restoreCommittedOffsetSnapshot(&previous_offsets);
-                for (topics[0..topics_init]) |*topic| {
+                for (topics) |*topic| {
                     const partitions: []PartitionResponse = @constCast(topic.partitions);
                     for (partitions) |*partition| {
                         if (partition.error_code == @intFromEnum(ErrorCode.none)) {
@@ -26540,9 +26711,12 @@ pub const Broker = struct {
 
         const resp = Resp{
             .throttle_time_ms = 0,
-            .topics = topics[0..topics_init],
+            .topics = topics,
         };
-        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version) orelse {
+            log.warn("TxnOffsetCommit response serialization failed", .{});
+            return self.txnOffsetCommitErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error);
+        };
     }
 
     fn freeTxnOffsetCommitRequest(self: *Broker, req: *generated.txn_offset_commit_request.TxnOffsetCommitRequest) void {
@@ -26556,6 +26730,41 @@ pub const Broker = struct {
         for (topics) |topic| {
             if (topic.partitions.len > 0) self.allocator.free(topic.partitions);
         }
+    }
+
+    fn materializeTxnOffsetCommitResponseTopics(self: *Broker, req: *const generated.txn_offset_commit_request.TxnOffsetCommitRequest) ![]generated.txn_offset_commit_response.TxnOffsetCommitResponse.TxnOffsetCommitResponseTopic {
+        const TopicResponse = generated.txn_offset_commit_response.TxnOffsetCommitResponse.TxnOffsetCommitResponseTopic;
+        const PartitionResponse = TopicResponse.TxnOffsetCommitResponsePartition;
+
+        if (req.topics.len == 0) return &.{};
+
+        const topics = try self.allocator.alloc(TopicResponse, req.topics.len);
+        var topics_init: usize = 0;
+        errdefer {
+            self.freeTxnOffsetCommitTopics(topics[0..topics_init]);
+            self.allocator.free(topics);
+        }
+
+        for (req.topics) |topic_req| {
+            var partitions: []PartitionResponse = &.{};
+            if (topic_req.partitions.len > 0) {
+                partitions = try self.allocator.alloc(PartitionResponse, topic_req.partitions.len);
+                for (topic_req.partitions, 0..) |partition_req, partition_idx| {
+                    partitions[partition_idx] = .{
+                        .partition_index = partition_req.partition_index,
+                        .error_code = @intFromEnum(ErrorCode.kafka_storage_error),
+                    };
+                }
+            }
+
+            topics[topics_init] = .{
+                .name = topic_req.name,
+                .partitions = partitions,
+            };
+            topics_init += 1;
+        }
+
+        return topics;
     }
 
     // ---------------------------------------------------------------
@@ -32908,6 +33117,29 @@ fn expectWriteTxnMarkersErrorResponseBytes(broker: *Broker, response: []const u8
     try testing.expectEqual(@as(i16, @intFromEnum(err_code)), resp.markers[0].topics[0].partitions[0].error_code);
 }
 
+fn expectOffsetCommitErrorResponseBytes(broker: *Broker, response: []const u8, api_version: i16, correlation_id: i32, err_code: ErrorCode) !void {
+    const Resp = generated.offset_commit_response.OffsetCommitResponse;
+
+    var rpos: usize = 0;
+    var response_header = try ResponseHeader.deserialize(testing.allocator, response, &rpos, header_mod.responseHeaderVersion(8, api_version));
+    defer response_header.deinit(testing.allocator);
+    try testing.expectEqual(correlation_id, response_header.correlation_id);
+
+    const resp = try Resp.deserialize(testing.allocator, response, &rpos, api_version);
+    defer {
+        broker.freeOffsetCommitTopics(resp.topics);
+        if (resp.topics.len > 0) testing.allocator.free(resp.topics);
+    }
+    try testing.expectEqual(response.len, rpos);
+    try testing.expectEqual(@as(i32, 0), resp.throttle_time_ms);
+    try testing.expectEqual(@as(usize, 1), resp.topics.len);
+    try testing.expect(resp.topics[0].name != null);
+    try testing.expectEqualStrings("", resp.topics[0].name.?);
+    try testing.expectEqual(@as(usize, 1), resp.topics[0].partitions.len);
+    try testing.expectEqual(@as(i32, -1), resp.topics[0].partitions[0].partition_index);
+    try testing.expectEqual(@as(i16, @intFromEnum(err_code)), resp.topics[0].partitions[0].error_code);
+}
+
 fn expectTxnOffsetCommitErrorResponseBytes(broker: *Broker, response: []const u8, api_version: i16, correlation_id: i32, err_code: ErrorCode) !void {
     const Resp = generated.txn_offset_commit_response.TxnOffsetCommitResponse;
 
@@ -37124,6 +37356,7 @@ test "Broker.handleRequest DeleteGroups rolls back share session cleanup persist
 
 test "Broker.handleRequest DeleteGroups rejects trailing bytes" {
     const Req = generated.delete_groups_request.DeleteGroupsRequest;
+    const Resp = generated.delete_groups_response.DeleteGroupsResponse;
 
     var broker = Broker.init(testing.allocator, 1, 9092);
     defer broker.deinit();
@@ -37134,7 +37367,20 @@ test "Broker.handleRequest DeleteGroups rejects trailing bytes" {
     var pos = buildTestRequest(&buf, 42, 2, 4207, header_mod.requestHeaderVersion(42, 2));
     req.serialize(&buf, &pos, 2);
 
-    try expectTrailingByteRejected(&broker, buf[0..], pos);
+    try testing.expect(pos < buf.len);
+    buf[pos] = 0x7f;
+    const response = broker.handleRequest(buf[0 .. pos + 1]);
+    try testing.expect(response != null);
+    defer testing.allocator.free(response.?);
+
+    var rpos: usize = 0;
+    try expectTestResponseHeader(response.?, 42, 2, 4207, &rpos);
+    const resp = try Resp.deserialize(testing.allocator, response.?, &rpos, 2);
+    defer if (resp.results.len > 0) testing.allocator.free(resp.results);
+    try testing.expectEqual(response.?.len, rpos);
+    try testing.expectEqual(@as(usize, 1), resp.results.len);
+    try testing.expect(resp.results[0].group_id == null);
+    try testing.expectEqual(ErrorCode.invalid_request.toInt(), resp.results[0].error_code);
 }
 
 test "Broker.handleRequest DeleteGroups authorization denial uses generated response" {
@@ -37729,7 +37975,7 @@ test "Broker.handleRequest DeleteGroups restores group when lifecycle snapshot S
     try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.kafka_storage_error)), resp.results[0].error_code);
     const group = broker.groups.groups.getPtr("delete-groups-snapshot-fail").?;
     try testing.expectEqual(ConsumerGroup.GroupState.empty, group.state);
-    try testing.expectEqual(object_count_before, mock_s3.objectCount());
+    try testing.expectEqual(object_count_before + 1, mock_s3.objectCount());
 }
 
 test "Broker.handleRequest DeleteGroups tombstones offsets for S3 replacement replay" {
@@ -40471,7 +40717,11 @@ test "Broker.handleRequest TxnOffsetCommit rejects truncated request" {
 
     var buf: [128]u8 = undefined;
     const req_len = buildTestRequest(&buf, 28, 3, 2804, header_mod.requestHeaderVersion(28, 3));
-    try testing.expect(broker.handleRequest(buf[0..req_len]) == null);
+    const response = broker.handleRequest(buf[0..req_len]);
+    try testing.expect(response != null);
+    defer testing.allocator.free(response.?);
+
+    try expectTxnOffsetCommitErrorResponseBytes(&broker, response.?, 3, 2804, ErrorCode.invalid_request);
 }
 
 test "Broker.handleRequest TxnOffsetCommit rejects trailing bytes" {
@@ -40505,7 +40755,13 @@ test "Broker.handleRequest TxnOffsetCommit rejects trailing bytes" {
     var pos = buildTestRequest(&buf, 28, 3, 2815, header_mod.requestHeaderVersion(28, 3));
     req.serialize(&buf, &pos, 3);
 
-    try expectTrailingByteRejected(&broker, buf[0..], pos);
+    try testing.expect(pos < buf.len);
+    buf[pos] = 0x7f;
+    const response = broker.handleRequest(buf[0 .. pos + 1]);
+    try testing.expect(response != null);
+    defer testing.allocator.free(response.?);
+
+    try expectTxnOffsetCommitErrorResponseBytes(&broker, response.?, 3, 2815, ErrorCode.invalid_request);
 }
 
 test "Broker.handleRequest TxnOffsetCommit authorization denial uses generated response" {
@@ -53775,16 +54031,24 @@ test "Broker.handleRequest InitProducerId persists producer allocation" {
 }
 
 test "Broker.handleRequest InitProducerId rejects truncated request" {
+    const Resp = generated.init_producer_id_response.InitProducerIdResponse;
+
     var broker = Broker.init(testing.allocator, 1, 9092);
     defer broker.deinit();
 
     var buf: [128]u8 = undefined;
     const req_len = buildTestRequest(&buf, 22, 4, 2205, header_mod.requestHeaderVersion(22, 4));
-    try testing.expect(broker.handleRequest(buf[0..req_len]) == null);
+    const response = broker.handleRequest(buf[0..req_len]);
+    try testing.expect(response != null);
+    defer testing.allocator.free(response.?);
+
+    const error_code = try readGeneratedTopLevelErrorCode(Resp, response.?, 22, 4, 2205);
+    try testing.expectEqual(ErrorCode.invalid_request.toInt(), error_code);
 }
 
 test "Broker.handleRequest InitProducerId rejects trailing bytes" {
     const Req = generated.init_producer_id_request.InitProducerIdRequest;
+    const Resp = generated.init_producer_id_response.InitProducerIdResponse;
 
     var broker = Broker.init(testing.allocator, 1, 9092);
     defer broker.deinit();
@@ -53800,7 +54064,7 @@ test "Broker.handleRequest InitProducerId rejects trailing bytes" {
     var pos = buildTestRequest(&buf, 22, 4, 2208, header_mod.requestHeaderVersion(22, 4));
     req.serialize(&buf, &pos, 4);
 
-    try expectTrailingByteRejected(&broker, buf[0..], pos);
+    try expectTrailingByteRejectedWithGeneratedResponse(Resp, &broker, buf[0..], pos, 22, 4, 2208);
 }
 
 test "Broker.handleRequest InitProducerId authorization denial uses generated response" {
@@ -54305,16 +54569,24 @@ test "Broker.handleRequest AddPartitionsToTxn persists registered partitions" {
 }
 
 test "Broker.handleRequest AddPartitionsToTxn rejects truncated request" {
+    const Resp = generated.add_partitions_to_txn_response.AddPartitionsToTxnResponse;
+
     var broker = Broker.init(testing.allocator, 1, 9092);
     defer broker.deinit();
 
     var buf: [128]u8 = undefined;
     const req_len = buildTestRequest(&buf, 24, 4, 2405, header_mod.requestHeaderVersion(24, 4));
-    try testing.expect(broker.handleRequest(buf[0..req_len]) == null);
+    const response = broker.handleRequest(buf[0..req_len]);
+    try testing.expect(response != null);
+    defer testing.allocator.free(response.?);
+
+    const error_code = try readGeneratedTopLevelErrorCode(Resp, response.?, 24, 4, 2405);
+    try testing.expectEqual(ErrorCode.invalid_request.toInt(), error_code);
 }
 
 test "Broker.handleRequest AddPartitionsToTxn rejects trailing bytes" {
     const Req = generated.add_partitions_to_txn_request.AddPartitionsToTxnRequest;
+    const Resp = generated.add_partitions_to_txn_response.AddPartitionsToTxnResponse;
     const Topic = generated.add_partitions_to_txn_request.AddPartitionsToTxnTopic;
     const Txn = Req.AddPartitionsToTxnTransaction;
 
@@ -54339,7 +54611,7 @@ test "Broker.handleRequest AddPartitionsToTxn rejects trailing bytes" {
     var pos = buildTestRequest(&buf, 24, 4, 2412, header_mod.requestHeaderVersion(24, 4));
     req.serialize(&buf, &pos, 4);
 
-    try expectTrailingByteRejected(&broker, buf[0..], pos);
+    try expectTrailingByteRejectedWithGeneratedResponse(Resp, &broker, buf[0..], pos, 24, 4, 2412);
 }
 
 test "Broker.handleRequest AddPartitionsToTxn v4 authorization denial uses generated response" {
@@ -54762,16 +55034,24 @@ test "Broker.handleRequest AddOffsetsToTxn v4 maps abortable transaction state" 
 }
 
 test "Broker.handleRequest AddOffsetsToTxn rejects truncated request" {
+    const Resp = generated.add_offsets_to_txn_response.AddOffsetsToTxnResponse;
+
     var broker = Broker.init(testing.allocator, 1, 9092);
     defer broker.deinit();
 
     var buf: [128]u8 = undefined;
     const req_len = buildTestRequest(&buf, 25, 3, 2504, header_mod.requestHeaderVersion(25, 3));
-    try testing.expect(broker.handleRequest(buf[0..req_len]) == null);
+    const response = broker.handleRequest(buf[0..req_len]);
+    try testing.expect(response != null);
+    defer testing.allocator.free(response.?);
+
+    const error_code = try readGeneratedTopLevelErrorCode(Resp, response.?, 25, 3, 2504);
+    try testing.expectEqual(ErrorCode.invalid_request.toInt(), error_code);
 }
 
 test "Broker.handleRequest AddOffsetsToTxn rejects trailing bytes" {
     const Req = generated.add_offsets_to_txn_request.AddOffsetsToTxnRequest;
+    const Resp = generated.add_offsets_to_txn_response.AddOffsetsToTxnResponse;
 
     var broker = Broker.init(testing.allocator, 1, 9092);
     defer broker.deinit();
@@ -54787,7 +55067,7 @@ test "Broker.handleRequest AddOffsetsToTxn rejects trailing bytes" {
     var pos = buildTestRequest(&buf, 25, 3, 2510, header_mod.requestHeaderVersion(25, 3));
     req.serialize(&buf, &pos, 3);
 
-    try expectTrailingByteRejected(&broker, buf[0..], pos);
+    try expectTrailingByteRejectedWithGeneratedResponse(Resp, &broker, buf[0..], pos, 25, 3, 2510);
 }
 
 test "Broker.handleRequest AddOffsetsToTxn authorization denial uses generated response" {
@@ -55276,16 +55556,24 @@ test "Broker.handleRequest EndTxn rejects transaction with unknown partition" {
 }
 
 test "Broker.handleRequest EndTxn rejects truncated request" {
+    const Resp = generated.end_txn_response.EndTxnResponse;
+
     var broker = Broker.init(testing.allocator, 1, 9092);
     defer broker.deinit();
 
     var buf: [128]u8 = undefined;
     const req_len = buildTestRequest(&buf, 26, 3, 2604, header_mod.requestHeaderVersion(26, 3));
-    try testing.expect(broker.handleRequest(buf[0..req_len]) == null);
+    const response = broker.handleRequest(buf[0..req_len]);
+    try testing.expect(response != null);
+    defer testing.allocator.free(response.?);
+
+    const error_code = try readGeneratedTopLevelErrorCode(Resp, response.?, 26, 3, 2604);
+    try testing.expectEqual(ErrorCode.invalid_request.toInt(), error_code);
 }
 
 test "Broker.handleRequest EndTxn rejects trailing bytes" {
     const Req = generated.end_txn_request.EndTxnRequest;
+    const Resp = generated.end_txn_response.EndTxnResponse;
 
     var broker = Broker.init(testing.allocator, 1, 9092);
     defer broker.deinit();
@@ -55301,7 +55589,7 @@ test "Broker.handleRequest EndTxn rejects trailing bytes" {
     var pos = buildTestRequest(&buf, 26, 3, 2609, header_mod.requestHeaderVersion(26, 3));
     req.serialize(&buf, &pos, 3);
 
-    try expectTrailingByteRejected(&broker, buf[0..], pos);
+    try expectTrailingByteRejectedWithGeneratedResponse(Resp, &broker, buf[0..], pos, 26, 3, 2609);
 }
 
 test "Broker.handleRequest EndTxn authorization denial uses generated response" {
@@ -66075,7 +66363,11 @@ test "Broker.handleRequest OffsetCommit rejects truncated request" {
 
     var buf: [128]u8 = undefined;
     const req_len = buildTestRequest(&buf, 8, 8, 809, header_mod.requestHeaderVersion(8, 8));
-    try testing.expect(broker.handleRequest(buf[0..req_len]) == null);
+    const response = broker.handleRequest(buf[0..req_len]);
+    try testing.expect(response != null);
+    defer testing.allocator.free(response.?);
+
+    try expectOffsetCommitErrorResponseBytes(&broker, response.?, 8, 809, ErrorCode.invalid_request);
 }
 
 test "Broker.handleRequest OffsetCommit rejects trailing bytes" {
@@ -66108,7 +66400,13 @@ test "Broker.handleRequest OffsetCommit rejects trailing bytes" {
     var pos = buildTestRequest(&buf, 8, 8, 830, header_mod.requestHeaderVersion(8, 8));
     req.serialize(&buf, &pos, 8);
 
-    try expectTrailingByteRejected(&broker, &buf, pos);
+    try testing.expect(pos < buf.len);
+    buf[pos] = 0x7f;
+    const response = broker.handleRequest(buf[0 .. pos + 1]);
+    try testing.expect(response != null);
+    defer testing.allocator.free(response.?);
+
+    try expectOffsetCommitErrorResponseBytes(&broker, response.?, 8, 830, ErrorCode.invalid_request);
 }
 
 test "Broker.handleRequest OffsetCommit authorization denial uses generated response" {

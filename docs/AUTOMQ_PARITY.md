@@ -62,6 +62,13 @@ operator-facing behavior.
   Internal compacted-topic log compaction now fails closed on cache allocation
   failures and malformed Kafka record-batch headers instead of skipping corrupt
   internal batches.
+  Stateful coordinator mutation APIs now fail closed on malformed frames,
+  response materialization failures, rollback snapshot failures, and final
+  serialization failures across committed-offset commits, transactional
+  coordinator mutations, TxnOffsetCommit, and DeleteGroups. These paths
+  pre-materialize response state before local mutation and restore transaction,
+  group, and committed-offset snapshots on persistence failures so stateless
+  broker replacement does not observe partially applied coordinator state.
   Broker-owned internal log replay for `__cluster_metadata`,
   `__consumer_offsets`, and `__transaction_state` now rejects malformed headers,
   truncated records, trailing bytes, null internal record keys, and invalid
