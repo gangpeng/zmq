@@ -2233,6 +2233,94 @@ def wait_for_consumer_group_heartbeat(port, group_state, timeout=30):
     )
 
 
+def assert_kip848_consumer_group_description(port, group_state, topic, correlation_id):
+    described = consumer_group_describe(port, group_state["group_id"], correlation_id)
+    if described["error_code"] != 0:
+        raise TestError(
+            f"KIP-848 ConsumerGroupDescribe {group_state['group_id']!r} "
+            f"error_code={described['error_code']} "
+            f"message={described['error_message']!r}"
+        )
+    if described["group_state"] not in ("PreparingRebalance", "Stable"):
+        raise TestError(f"KIP-848 ConsumerGroupDescribe state={described['group_state']!r}")
+    if described["group_epoch"] != group_state["member_epoch"]:
+        raise TestError(
+            f"KIP-848 ConsumerGroupDescribe group_epoch={described['group_epoch']} "
+            f"expected={group_state['member_epoch']}"
+        )
+    if described["assignment_epoch"] != group_state["member_epoch"]:
+        raise TestError(
+            f"KIP-848 ConsumerGroupDescribe assignment_epoch="
+            f"{described['assignment_epoch']} expected={group_state['member_epoch']}"
+        )
+    if described["assignor_name"] != "range":
+        raise TestError(f"KIP-848 ConsumerGroupDescribe assignor mismatch: {described}")
+    matching_member = next(
+        (
+            member
+            for member in described["members"]
+            if member["member_id"] == group_state["member_id"]
+        ),
+        None,
+    )
+    if matching_member is None:
+        raise TestError(f"KIP-848 ConsumerGroupDescribe missing member: {described}")
+    if matching_member["member_epoch"] != group_state["member_epoch"]:
+        raise TestError(
+            f"KIP-848 ConsumerGroupDescribe member_epoch="
+            f"{matching_member['member_epoch']} expected={group_state['member_epoch']}"
+        )
+    if topic not in matching_member["subscribed_topics"]:
+        raise TestError(
+            f"KIP-848 ConsumerGroupDescribe subscriptions mismatch: {matching_member}"
+        )
+    for assignment_name in ("assignment", "target_assignment"):
+        assignment = matching_member[assignment_name]
+        matching_topic = next(
+            (
+                described_topic
+                for described_topic in assignment["topic_partitions"]
+                if described_topic["topic_id"] == group_state["topic_id"]
+            ),
+            None,
+        )
+        if matching_topic is None:
+            raise TestError(
+                f"KIP-848 ConsumerGroupDescribe missing {assignment_name}: "
+                f"{matching_member}"
+            )
+        if matching_topic["topic_name"] != topic:
+            raise TestError(
+                f"KIP-848 ConsumerGroupDescribe topic name mismatch: {matching_topic}"
+            )
+        if matching_topic["partitions"] != [0]:
+            raise TestError(
+                f"KIP-848 ConsumerGroupDescribe partitions mismatch: {matching_topic}"
+            )
+
+
+def wait_for_kip848_consumer_group_description(
+    port, group_state, topic, timeout=30
+):
+    deadline = time.time() + timeout
+    correlation_id = 7900
+    last_error = None
+    while time.time() < deadline:
+        try:
+            assert_kip848_consumer_group_description(
+                port, group_state, topic, correlation_id
+            )
+            return
+        except Exception as exc:
+            last_error = exc
+        correlation_id += 1
+        time.sleep(0.25)
+    raise TestError(
+        f"KIP-848 ConsumerGroupDescribe did not recover for "
+        f"{group_state['group_id']!r}: {last_error}"
+    )
+
+
 def parse_leave_group_response(response, correlation_id):
     pos = 0
     response_correlation, pos = read_i32(response, pos)
@@ -4587,6 +4675,11 @@ def main():
             topic,
         )
         wait_for_consumer_group_heartbeat(broker["port"], kip848_group_state)
+        wait_for_kip848_consumer_group_description(
+            broker["port"],
+            kip848_group_state,
+            topic,
+        )
 
         network_partition_result = run_network_partition_matrix(
             processes, broker, topic, expected_payloads, leader_id
@@ -4618,6 +4711,11 @@ def main():
             controller_failover_txn["transactional_id"],
         )
         wait_for_consumer_group_heartbeat(broker["port"], kip848_group_state)
+        wait_for_kip848_consumer_group_description(
+            broker["port"],
+            kip848_group_state,
+            topic,
+        )
 
         stop_process(processes[leader_id]["proc"], crash=True)
         replacement_leader, after = wait_for_leader(processes, forbidden_leaders={leader_id})
@@ -4663,6 +4761,11 @@ def main():
             controller_failover_txn["transactional_id"],
         )
         wait_for_consumer_group_heartbeat(broker["port"], kip848_group_state)
+        wait_for_kip848_consumer_group_description(
+            broker["port"],
+            kip848_group_state,
+            topic,
+        )
         expected_payloads.append(b"r1")
         second_offset = wait_for_produce(broker["port"], topic, expected_payloads[-1])
         if second_offset <= first_offset:
@@ -4718,6 +4821,11 @@ def main():
             controller_failover_txn["transactional_id"],
         )
         wait_for_consumer_group_heartbeat(broker["port"], kip848_group_state)
+        wait_for_kip848_consumer_group_description(
+            broker["port"],
+            kip848_group_state,
+            topic,
+        )
         expected_payloads.append(b"r2")
         third_offset = wait_for_produce(broker["port"], topic, expected_payloads[-1])
         if third_offset <= second_offset:
@@ -4778,6 +4886,11 @@ def main():
             controller_failover_txn["transactional_id"],
         )
         wait_for_consumer_group_heartbeat(broker["port"], kip848_group_state)
+        wait_for_kip848_consumer_group_description(
+            broker["port"],
+            kip848_group_state,
+            topic,
+        )
         expected_payloads.append(b"r3")
         fourth_offset = wait_for_produce(
             broker["port"], topic, expected_payloads[-1]
@@ -4850,6 +4963,11 @@ def main():
             controller_failover_txn["transactional_id"],
         )
         wait_for_consumer_group_heartbeat(broker["port"], kip848_group_state)
+        wait_for_kip848_consumer_group_description(
+            broker["port"],
+            kip848_group_state,
+            topic,
+        )
         duplicate_idempotent = wait_for_record_batch_result(
             broker["port"],
             idempotent_topic,
@@ -4983,6 +5101,7 @@ def main():
             f"list_groups_checked=true, "
             f"find_coordinator_checked=true, "
             f"consumer_group_heartbeat_checked=true, "
+            f"kip848_describe_checked=true, "
             f"network_partition={network_partition_result}, "
             f"automq_old_leader_fresh_rejoin={automq_result['old_leader_fresh_rejoin']})"
         )
@@ -5208,6 +5327,7 @@ def self_test():
         ):
             raise TestError(f"DescribeGroups fixture parser failed: {described_groups}")
 
+        consumer_describe_topic_id = bytes(reversed(range(16)))
         consumer_group_describe_fixture = struct.pack(">i", 56)
         consumer_group_describe_fixture += b"\x00"  # response header tagged fields
         consumer_group_describe_fixture += struct.pack(">i", 0)
@@ -5227,11 +5347,20 @@ def self_test():
         consumer_group_describe_fixture += struct.pack(">i", 3)
         consumer_group_describe_fixture += write_compact_string("zmq-client")
         consumer_group_describe_fixture += write_compact_string("/127.0.0.1")
-        consumer_group_describe_fixture += write_compact_array_len(0)
+        consumer_group_describe_fixture += write_compact_array_len(1)
+        consumer_group_describe_fixture += write_compact_string("describe-topic")
         consumer_group_describe_fixture += write_compact_string(None)
-        consumer_group_describe_fixture += write_compact_array_len(0)
+        consumer_group_describe_fixture += write_compact_array_len(1)
+        consumer_group_describe_fixture += consumer_describe_topic_id
+        consumer_group_describe_fixture += write_compact_string("describe-topic")
+        consumer_group_describe_fixture += write_compact_i32_array([0])
+        consumer_group_describe_fixture += b"\x00"  # assignment topic tagged fields
         consumer_group_describe_fixture += b"\x00"  # assignment tagged fields
-        consumer_group_describe_fixture += write_compact_array_len(0)
+        consumer_group_describe_fixture += write_compact_array_len(1)
+        consumer_group_describe_fixture += consumer_describe_topic_id
+        consumer_group_describe_fixture += write_compact_string("describe-topic")
+        consumer_group_describe_fixture += write_compact_i32_array([0])
+        consumer_group_describe_fixture += b"\x00"  # target assignment topic tagged fields
         consumer_group_describe_fixture += b"\x00"  # target assignment tagged fields
         consumer_group_describe_fixture += b"\x00"  # member tagged fields
         consumer_group_describe_fixture += struct.pack(">i", -2147483648)
@@ -5247,6 +5376,16 @@ def self_test():
             or consumer_described[0]["group_epoch"] != 3
             or consumer_described[0]["assignor_name"] != "range"
             or consumer_described[0]["members"][0]["member_epoch"] != 3
+            or consumer_described[0]["members"][0]["subscribed_topics"]
+            != ["describe-topic"]
+            or consumer_described[0]["members"][0]["assignment"]["topic_partitions"][0][
+                "topic_id"
+            ]
+            != consumer_describe_topic_id
+            or consumer_described[0]["members"][0]["assignment"]["topic_partitions"][0][
+                "partitions"
+            ]
+            != [0]
         ):
             raise TestError(
                 f"ConsumerGroupDescribe fixture parser failed: {consumer_described}"
