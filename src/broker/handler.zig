@@ -7944,7 +7944,19 @@ pub const Broker = struct {
             .throttle_time_ms = 0,
             .filter_results = &filter_results,
         };
-        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version) orelse {
+            log.warn("DeleteAcls error response serialization failed", .{});
+            const storage_results = [_]FilterResult{.{
+                .error_code = @intFromEnum(ErrorCode.kafka_storage_error),
+                .error_message = "Failed to serialize DeleteAcls response",
+                .matching_acls = &.{},
+            }};
+            const storage_resp = Resp{
+                .throttle_time_ms = 0,
+                .filter_results = &storage_results,
+            };
+            return self.serializeGeneratedResponse(req_header, resp_header_version, &storage_resp, api_version);
+        };
     }
 
     fn handleDescribeLogDirsAuthorizationError(
@@ -28026,11 +28038,17 @@ pub const Broker = struct {
             if (filter_results.len > 0) self.allocator.free(filter_results);
         }
 
+        var initial_snapshot: ?[]u8 = null;
+        defer if (initial_snapshot) |snapshot| self.allocator.free(snapshot);
+        var mutation_succeeded = false;
         for (req.filters) |filter| {
-            filter_results[filter_results_init] = self.deleteAclsFilterResult(filter, api_version) catch |err| {
+            filter_results[filter_results_init] = self.deleteAclsFilterResult(filter, api_version, &initial_snapshot) catch |err| {
                 log.warn("DeleteAcls result materialization failed: {}", .{err});
                 return self.deleteAclsErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error, "Failed to build DeleteAcls response");
             };
+            if (filter_results[filter_results_init].error_code == @intFromEnum(ErrorCode.none) and filter_results[filter_results_init].matching_acls.len > 0) {
+                mutation_succeeded = true;
+            }
             filter_results_init += 1;
         }
 
@@ -28040,6 +28058,17 @@ pub const Broker = struct {
         };
         return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version) orelse {
             log.warn("DeleteAcls response serialization failed", .{});
+            if (mutation_succeeded) {
+                if (initial_snapshot) |snapshot| {
+                    self.restoreAclsAfterFailedMutation(snapshot);
+                    self.persistAclsDurably() catch |persist_err| {
+                        log.warn("Failed to persist restored ACL metadata after DeleteAcls response serialization failure: {}", .{persist_err});
+                    };
+                    self.writeAclSnapshotRecord() catch |snapshot_err| {
+                        log.warn("Failed to append restored ACL snapshot after DeleteAcls response serialization failure: {}", .{snapshot_err});
+                    };
+                }
+            }
             return self.deleteAclsErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error, "Failed to serialize DeleteAcls response");
         };
     }
@@ -28048,7 +28077,12 @@ pub const Broker = struct {
         if (req.filters.len > 0) self.allocator.free(req.filters);
     }
 
-    fn deleteAclsFilterResult(self: *Broker, filter: generated.delete_acls_request.DeleteAclsRequest.DeleteAclsFilter, api_version: i16) !generated.delete_acls_response.DeleteAclsResponse.DeleteAclsFilterResult {
+    fn deleteAclsFilterResult(
+        self: *Broker,
+        filter: generated.delete_acls_request.DeleteAclsRequest.DeleteAclsFilter,
+        api_version: i16,
+        initial_snapshot: *?[]u8,
+    ) !generated.delete_acls_response.DeleteAclsResponse.DeleteAclsFilterResult {
         const resource_type = aclResourceType(filter.resource_type_filter) orelse return invalidDeleteAclsFilterResult("Invalid ACL resource type");
         const pattern_type = aclPatternType(if (api_version >= 1) filter.pattern_type_filter else @intFromEnum(Authorizer.PatternType.literal)) orelse return invalidDeleteAclsFilterResult("Invalid ACL pattern type");
         const operation = aclOperation(filter.operation) orelse return invalidDeleteAclsFilterResult("Invalid ACL operation");
@@ -28076,6 +28110,13 @@ pub const Broker = struct {
             };
         }
 
+        if (initial_snapshot.* == null) {
+            initial_snapshot.* = self.encodeAclSnapshotRecordValue() catch |err| {
+                log.warn("DeleteAcls initial rollback snapshot materialization failed: {}", .{err});
+                matching_acls_owned = false;
+                return storageDeleteAclsFilterResult("Failed to snapshot ACL metadata", matching_acls);
+            };
+        }
         const previous_snapshot = self.encodeAclSnapshotRecordValue() catch |err| {
             log.warn("DeleteAcls rollback snapshot materialization failed: {}", .{err});
             matching_acls_owned = false;
@@ -42874,6 +42915,77 @@ test "Broker.handleRequest DeleteAcls fails closed when response serialization f
 
     const error_code = try readAclAuthorizationErrorCode(response.?, 31, 2, 3112);
     try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.kafka_storage_error)), error_code);
+}
+
+test "Broker.handleRequest DeleteAcls rolls back when success serialization fails" {
+    const Req = generated.delete_acls_request.DeleteAclsRequest;
+    const none = @as(i16, @intFromEnum(ErrorCode.none));
+    const storage_error = @as(i16, @intFromEnum(ErrorCode.kafka_storage_error));
+
+    const filters = [_]Req.DeleteAclsFilter{.{
+        .resource_type_filter = @intFromEnum(Authorizer.ResourceType.topic),
+        .resource_name_filter = "acl-delete-success-serialization-fail",
+        .pattern_type_filter = @intFromEnum(Authorizer.PatternType.literal),
+        .principal_filter = "User:delete-success-serialization-fail",
+        .host_filter = "*",
+        .operation = @intFromEnum(Authorizer.Operation.read),
+        .permission_type = @intFromEnum(Authorizer.Permission.allow),
+    }};
+    const req = Req{ .filters = &filters };
+
+    const response_fail_index = blk: {
+        var broker = Broker.init(testing.allocator, 1, 9092);
+        defer broker.deinit();
+        try broker.authorizer.addSuperUser("test-client");
+        try broker.authorizer.addAcl("User:delete-success-serialization-fail", .topic, "acl-delete-success-serialization-fail", .literal, .read, .allow, "*");
+
+        var buf: [512]u8 = undefined;
+        var pos = buildTestRequest(&buf, 31, 2, 3113, header_mod.requestHeaderVersion(31, 2));
+        req.serialize(&buf, &pos, 2);
+
+        var counting_allocator = OneShotFailingAllocator.init(testing.allocator, std.math.maxInt(usize));
+        const response_allocator = counting_allocator.allocator();
+        broker.allocator = response_allocator;
+
+        const response = broker.handleRequest(buf[0..pos]);
+        broker.allocator = testing.allocator;
+
+        try testing.expect(response != null);
+        defer response_allocator.free(response.?);
+
+        const error_code = try readAclAuthorizationErrorCode(response.?, 31, 2, 3113);
+        try testing.expectEqual(none, error_code);
+        try testing.expectEqual(@as(usize, 0), broker.authorizer.aclCount());
+        try testing.expect(counting_allocator.alloc_index > 0);
+        break :blk counting_allocator.alloc_index - 1;
+    };
+
+    {
+        var broker = Broker.init(testing.allocator, 1, 9092);
+        defer broker.deinit();
+        try broker.authorizer.addSuperUser("test-client");
+        try broker.authorizer.addAcl("User:delete-success-serialization-fail", .topic, "acl-delete-success-serialization-fail", .literal, .read, .allow, "*");
+
+        var buf: [512]u8 = undefined;
+        var pos = buildTestRequest(&buf, 31, 2, 3114, header_mod.requestHeaderVersion(31, 2));
+        req.serialize(&buf, &pos, 2);
+
+        var failing_allocator = OneShotFailingAllocator.init(testing.allocator, response_fail_index);
+        const response_allocator = failing_allocator.allocator();
+        broker.allocator = response_allocator;
+
+        const response = broker.handleRequest(buf[0..pos]);
+        broker.allocator = testing.allocator;
+
+        try testing.expect(failing_allocator.failed);
+        try testing.expect(response != null);
+        defer response_allocator.free(response.?);
+
+        const error_code = try readAclAuthorizationErrorCode(response.?, 31, 2, 3114);
+        try testing.expectEqual(storage_error, error_code);
+        try testing.expectEqual(@as(usize, 1), broker.authorizer.aclCount());
+        try testing.expectEqual(Authorizer.AuthResult.allowed, broker.authorizer.authorize("User:delete-success-serialization-fail", .topic, "acl-delete-success-serialization-fail", .read));
+    }
 }
 
 test "Broker.handleRequest DeleteAcls authorization denial uses generated response" {

@@ -55,6 +55,9 @@ operator-facing behavior.
 - CreateAcls now pre-serializes successful mutation responses and retries
   generated storage-error responses so allocation pressure cannot add ACLs while
   returning no response frame.
+- DeleteAcls now restores the pre-delete ACL snapshot and retries generated
+  storage-error responses when allocation pressure prevents the success response
+  from being serialized.
 - UpdateLicense now pre-serializes successful mutation responses and retries
   generated storage-error responses so allocation pressure cannot change visible
   AutoMQ license metadata while returning no response frame.
@@ -604,8 +607,8 @@ Status: completed for the initial catalog and DeleteGroups slice.
   DescribeAcls/CreateAcls/DeleteAcls now use generated schemas, reject malformed
   frames, validate enum fields, write full ACL snapshots to `__cluster_metadata`
   for broker replacement replay, fail closed and roll back local ACL visibility
-  when local or shared snapshot writes fail, and return generated ACL
-  resources/results.
+  when local or shared snapshot writes fail, restore DeleteAcls visibility when
+  final success serialization fails, and return generated ACL resources/results.
   CreateTopics, AlterConfigs, and IncrementalAlterConfigs now validate common
   supported topic config values against temporary configs before mutating local
   topic state, including positive `max.message.bytes`, positive
