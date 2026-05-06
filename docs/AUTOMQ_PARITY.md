@@ -279,6 +279,9 @@ errors instead of silent connection closes;
 ListTransactions malformed frames now return generated invalid-request
 responses, and unknown-state/transaction-state materialization failures now
 surface storage errors instead of silent connection closes;
+DescribeTransactions malformed frames now return generated invalid-request
+responses, and transaction-state materialization failures now surface storage
+errors instead of silent connection closes;
 generated VoteRequest decode now frees partially materialized topic arrays when
 nested allocation fails before handler validation;
 ControllerRegistration, AddRaftVoter, and UpdateRaftVoter endpoint

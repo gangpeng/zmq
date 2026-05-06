@@ -24189,17 +24189,20 @@ pub const Broker = struct {
 
         if (!validateDescribeTransactionsRequestFrame(request_bytes, body_start)) {
             log.warn("Malformed DescribeTransactions request", .{});
-            return null;
+            return self.describeTransactionsErrorResponse(req_header, resp_header_version, api_version, ErrorCode.invalid_request);
         }
 
         var pos = body_start;
         var req = Req.deserialize(self.allocator, request_bytes, &pos, api_version) catch |err| {
             log.warn("Failed to decode DescribeTransactions request: {}", .{err});
-            return null;
+            return self.describeTransactionsErrorResponse(req_header, resp_header_version, api_version, ErrorCode.invalid_request);
         };
         defer self.freeDescribeTransactionsRequest(&req);
 
-        const transaction_states = self.collectDescribedTransactions(req) catch return null;
+        const transaction_states = self.collectDescribedTransactions(req) catch |err| {
+            log.warn("DescribeTransactions state materialization failed: {}", .{err});
+            return self.describeTransactionsErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error);
+        };
         defer {
             self.freeDescribedTransactionStates(transaction_states);
             if (transaction_states.len > 0) self.allocator.free(transaction_states);
@@ -24208,6 +24211,25 @@ pub const Broker = struct {
         const resp = Resp{
             .throttle_time_ms = 0,
             .transaction_states = transaction_states,
+        };
+        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+    }
+
+    fn describeTransactionsErrorResponse(self: *Broker, req_header: *const RequestHeader, resp_header_version: i16, api_version: i16, err_code: ErrorCode) ?[]u8 {
+        const Resp = generated.describe_transactions_response.DescribeTransactionsResponse;
+        const transaction_states = [_]Resp.TransactionState{.{
+            .error_code = @intFromEnum(err_code),
+            .transactional_id = "",
+            .transaction_state = "Dead",
+            .transaction_timeout_ms = 0,
+            .transaction_start_time_ms = -1,
+            .producer_id = -1,
+            .producer_epoch = -1,
+            .topics = &.{},
+        }};
+        const resp = Resp{
+            .throttle_time_ms = 0,
+            .transaction_states = &transaction_states,
         };
         return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
     }
@@ -28818,6 +28840,30 @@ fn freeDeserializedDescribeTransactionsResponse(resp: *const generated.describe_
         if (state.topics.len > 0) testing.allocator.free(state.topics);
     }
     if (resp.transaction_states.len > 0) testing.allocator.free(resp.transaction_states);
+}
+
+fn expectDescribeTransactionsErrorResponseBytes(response: []const u8, correlation_id: i32, err_code: ErrorCode) !void {
+    const Resp = generated.describe_transactions_response.DescribeTransactionsResponse;
+
+    var rpos: usize = 0;
+    var response_header = try ResponseHeader.deserialize(testing.allocator, response, &rpos, header_mod.responseHeaderVersion(65, 0));
+    defer response_header.deinit(testing.allocator);
+    try testing.expectEqual(correlation_id, response_header.correlation_id);
+
+    const resp = try Resp.deserialize(testing.allocator, response, &rpos, 0);
+    defer freeDeserializedDescribeTransactionsResponse(&resp);
+
+    try testing.expectEqual(response.len, rpos);
+    try testing.expectEqual(@as(i32, 0), resp.throttle_time_ms);
+    try testing.expectEqual(@as(usize, 1), resp.transaction_states.len);
+    try testing.expectEqual(@as(i16, @intFromEnum(err_code)), resp.transaction_states[0].error_code);
+    try testing.expectEqualStrings("", resp.transaction_states[0].transactional_id.?);
+    try testing.expectEqualStrings("Dead", resp.transaction_states[0].transaction_state.?);
+    try testing.expectEqual(@as(i32, 0), resp.transaction_states[0].transaction_timeout_ms);
+    try testing.expectEqual(@as(i64, -1), resp.transaction_states[0].transaction_start_time_ms);
+    try testing.expectEqual(@as(i64, -1), resp.transaction_states[0].producer_id);
+    try testing.expectEqual(@as(i16, -1), resp.transaction_states[0].producer_epoch);
+    try testing.expectEqual(@as(usize, 0), resp.transaction_states[0].topics.len);
 }
 
 fn freeDeserializedConsumerGroupDescribeResponse(resp: *const generated.consumer_group_describe_response.ConsumerGroupDescribeResponse) void {
@@ -34350,7 +34396,11 @@ test "Broker.handleRequest DescribeTransactions rejects truncated request" {
 
     var buf: [128]u8 = undefined;
     const req_len = buildTestRequest(&buf, 65, 0, 6502, header_mod.requestHeaderVersion(65, 0));
-    try testing.expect(broker.handleRequest(buf[0..req_len]) == null);
+    const response = broker.handleRequest(buf[0..req_len]);
+    try testing.expect(response != null);
+    defer testing.allocator.free(response.?);
+
+    try expectDescribeTransactionsErrorResponseBytes(response.?, 6502, ErrorCode.invalid_request);
 }
 
 test "Broker.handleRequest DescribeTransactions rejects trailing bytes" {
@@ -34366,7 +34416,40 @@ test "Broker.handleRequest DescribeTransactions rejects trailing bytes" {
     var pos = buildTestRequest(&buf, 65, 0, 6504, header_mod.requestHeaderVersion(65, 0));
     req.serialize(&buf, &pos, 0);
 
-    try expectTrailingByteRejected(&broker, &buf, pos);
+    try testing.expect(pos < buf.len);
+    buf[pos] = 0x7f;
+    const response = broker.handleRequest(buf[0 .. pos + 1]);
+    try testing.expect(response != null);
+    defer testing.allocator.free(response.?);
+
+    try expectDescribeTransactionsErrorResponseBytes(response.?, 6504, ErrorCode.invalid_request);
+}
+
+test "Broker.handleRequest DescribeTransactions fails closed when state materialization fails" {
+    const Req = generated.describe_transactions_request.DescribeTransactionsRequest;
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+
+    const transactional_ids = [_]?[]const u8{"describe-storage-fail-txn"};
+    const req = Req{ .transactional_ids = &transactional_ids };
+
+    var buf: [256]u8 = undefined;
+    var pos = buildTestRequest(&buf, 65, 0, 6505, header_mod.requestHeaderVersion(65, 0));
+    req.serialize(&buf, &pos, 0);
+
+    var failing_allocator = OneShotFailingAllocator.init(testing.allocator, 1);
+    const response_allocator = failing_allocator.allocator();
+    broker.allocator = response_allocator;
+
+    const response = broker.handleRequest(buf[0..pos]);
+    broker.allocator = testing.allocator;
+
+    try testing.expect(failing_allocator.failed);
+    try testing.expect(response != null);
+    defer response_allocator.free(response.?);
+
+    try expectDescribeTransactionsErrorResponseBytes(response.?, 6505, ErrorCode.kafka_storage_error);
 }
 
 fn initTxnOffsetCommitForTest(broker: *Broker, transactional_id: []const u8, group_id: []const u8) !TxnCoordinator.InitProducerIdResult {
