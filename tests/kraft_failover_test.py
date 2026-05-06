@@ -3246,6 +3246,316 @@ def wait_for_kip848_negative_checkpoint(port, group_prefix, topic):
     wait_for_consumer_group_heartbeat_negative_joins(port, group_prefix, topic)
 
 
+def parse_share_group_heartbeat_response(response, correlation_id):
+    return parse_consumer_group_heartbeat_response(response, correlation_id)
+
+
+def share_group_heartbeat(
+    port,
+    group_id,
+    member_id,
+    member_epoch,
+    correlation_id,
+    subscribed_topics=None,
+    rack_id=None,
+):
+    body = write_compact_string(group_id)
+    body += write_compact_string(member_id)
+    body += struct.pack(">i", member_epoch)
+    body += write_compact_string(rack_id)
+    if subscribed_topics is None:
+        body += b"\x00"
+    else:
+        body += write_compact_array_len(len(subscribed_topics))
+        for subscribed_topic in subscribed_topics:
+            body += write_compact_string(subscribed_topic)
+    body += b"\x00"  # request tagged fields
+    response = flexible_kafka_request(port, 76, 0, correlation_id, body)
+    return parse_share_group_heartbeat_response(response, correlation_id)
+
+
+def assert_share_group_heartbeat_assignment(response, group_state):
+    if response["error_code"] != 0:
+        raise TestError(
+            f"ShareGroupHeartbeat {group_state['group_id']!r} error_code="
+            f"{response['error_code']} message={response['error_message']!r}"
+        )
+    if response["member_id"] != group_state["member_id"]:
+        raise TestError(f"ShareGroupHeartbeat member mismatch: {response}")
+    if response["member_epoch"] < group_state["member_epoch"]:
+        raise TestError(f"ShareGroupHeartbeat epoch regressed: {response}")
+    if response["heartbeat_interval_ms"] != 3000:
+        raise TestError(f"ShareGroupHeartbeat interval mismatch: {response}")
+    assignment = response["assignment"]
+    if assignment is None:
+        raise TestError(f"ShareGroupHeartbeat missing assignment: {response}")
+    matching_topic = next(
+        (
+            topic
+            for topic in assignment["topic_partitions"]
+            if topic["topic_id"] == group_state["topic_id"]
+        ),
+        None,
+    )
+    if matching_topic is None:
+        raise TestError(f"ShareGroupHeartbeat missing topic assignment: {response}")
+    if matching_topic["partitions"] != [0]:
+        raise TestError(f"ShareGroupHeartbeat partition mismatch: {response}")
+    group_state["member_epoch"] = response["member_epoch"]
+
+
+def wait_for_share_group_heartbeat_join(port, group_id, topic, timeout=30):
+    deadline = time.time() + timeout
+    correlation_id = 7940
+    member_id = f"{group_id}-member"
+    last_error = None
+    while time.time() < deadline:
+        try:
+            response = share_group_heartbeat(
+                port,
+                group_id,
+                member_id,
+                0,
+                correlation_id,
+                subscribed_topics=[topic],
+            )
+            if response["error_code"] != 0:
+                raise TestError(
+                    f"ShareGroupHeartbeat join error_code={response['error_code']} "
+                    f"message={response['error_message']!r}"
+                )
+            assignment = response["assignment"]
+            if assignment is None or not assignment["topic_partitions"]:
+                raise TestError(f"ShareGroupHeartbeat join missing assignment: {response}")
+            topic_assignment = assignment["topic_partitions"][0]
+            group_state = {
+                "group_id": group_id,
+                "member_id": response["member_id"],
+                "member_epoch": response["member_epoch"],
+                "topic_id": topic_assignment["topic_id"],
+            }
+            assert_share_group_heartbeat_assignment(response, group_state)
+            return group_state
+        except Exception as exc:
+            last_error = exc
+        correlation_id += 1
+        time.sleep(0.25)
+    raise TestError(f"ShareGroupHeartbeat group {group_id!r} did not join: {last_error}")
+
+
+def wait_for_share_group_heartbeat(port, group_state, timeout=30):
+    deadline = time.time() + timeout
+    correlation_id = 7950
+    last_error = None
+    while time.time() < deadline:
+        try:
+            response = share_group_heartbeat(
+                port,
+                group_state["group_id"],
+                group_state["member_id"],
+                group_state["member_epoch"],
+                correlation_id,
+            )
+            assert_share_group_heartbeat_assignment(response, group_state)
+            return
+        except Exception as exc:
+            last_error = exc
+        correlation_id += 1
+        time.sleep(0.25)
+    raise TestError(
+        f"ShareGroupHeartbeat did not recover for "
+        f"{group_state['group_id']!r}: {last_error}"
+    )
+
+
+def wait_for_share_group_heartbeat_rack_update(
+    port, group_state, rack_id, timeout=30
+):
+    deadline = time.time() + timeout
+    correlation_id = 7960
+    last_error = None
+    while time.time() < deadline:
+        try:
+            response = share_group_heartbeat(
+                port,
+                group_state["group_id"],
+                group_state["member_id"],
+                group_state["member_epoch"],
+                correlation_id,
+                rack_id=rack_id,
+            )
+            assert_share_group_heartbeat_assignment(response, group_state)
+            group_state["rack_id"] = rack_id
+            return
+        except Exception as exc:
+            last_error = exc
+        correlation_id += 1
+        time.sleep(0.25)
+    raise TestError(
+        f"ShareGroupHeartbeat rack update did not recover for "
+        f"{group_state['group_id']!r}: {last_error}"
+    )
+
+
+def parse_share_group_describe_response(response, correlation_id):
+    pos = parse_flexible_response_header(response, correlation_id)
+    _, pos = read_i32(response, pos)  # throttle_time_ms
+    group_count, pos = read_compact_array_len(response, pos)
+    groups = []
+    for _ in range(group_count):
+        error_code, pos = read_i16(response, pos)
+        error_message, pos = read_compact_string(response, pos)
+        group_id, pos = read_compact_string(response, pos)
+        group_state, pos = read_compact_string(response, pos)
+        group_epoch, pos = read_i32(response, pos)
+        assignment_epoch, pos = read_i32(response, pos)
+        assignor_name, pos = read_compact_string(response, pos)
+        member_count, pos = read_compact_array_len(response, pos)
+        members = []
+        for _ in range(member_count):
+            member_id, pos = read_compact_string(response, pos)
+            rack_id, pos = read_compact_string(response, pos)
+            member_epoch, pos = read_i32(response, pos)
+            client_id, pos = read_compact_string(response, pos)
+            client_host, pos = read_compact_string(response, pos)
+            subscribed_count, pos = read_compact_array_len(response, pos)
+            subscribed_topics = []
+            for _ in range(subscribed_count):
+                topic_name, pos = read_compact_string(response, pos)
+                subscribed_topics.append(topic_name)
+            assignment, pos = parse_consumer_group_assignment(response, pos)
+            pos = skip_tags(response, pos)
+            members.append(
+                {
+                    "member_id": member_id,
+                    "rack_id": rack_id,
+                    "member_epoch": member_epoch,
+                    "client_id": client_id,
+                    "client_host": client_host,
+                    "subscribed_topics": subscribed_topics,
+                    "assignment": assignment,
+                }
+            )
+        authorized_operations, pos = read_i32(response, pos)
+        pos = skip_tags(response, pos)
+        groups.append(
+            {
+                "error_code": error_code,
+                "error_message": error_message,
+                "group_id": group_id,
+                "group_state": group_state,
+                "group_epoch": group_epoch,
+                "assignment_epoch": assignment_epoch,
+                "assignor_name": assignor_name,
+                "members": members,
+                "authorized_operations": authorized_operations,
+            }
+        )
+    pos = skip_tags(response, pos)
+    if pos != len(response):
+        raise TestError(
+            f"ShareGroupDescribe response trailing bytes: {len(response) - pos}"
+        )
+    return groups
+
+
+def share_group_describe(port, group_id, correlation_id):
+    body = write_compact_array_len(1)
+    body += write_compact_string(group_id)
+    body += b"\x00"  # include_authorized_operations=false
+    body += b"\x00"  # request tagged fields
+    response = flexible_kafka_request(port, 77, 0, correlation_id, body)
+    groups = parse_share_group_describe_response(response, correlation_id)
+    if len(groups) != 1:
+        raise TestError(f"ShareGroupDescribe count={len(groups)}")
+    return groups[0]
+
+
+def assert_share_group_description(port, group_state, topic, correlation_id):
+    described = share_group_describe(port, group_state["group_id"], correlation_id)
+    if described["error_code"] != 0:
+        raise TestError(
+            f"ShareGroupDescribe {group_state['group_id']!r} "
+            f"error_code={described['error_code']} "
+            f"message={described['error_message']!r}"
+        )
+    if described["group_state"] != "Stable":
+        raise TestError(f"ShareGroupDescribe state={described['group_state']!r}")
+    if described["group_epoch"] != group_state["member_epoch"]:
+        raise TestError(
+            f"ShareGroupDescribe group_epoch={described['group_epoch']} "
+            f"expected={group_state['member_epoch']}"
+        )
+    if described["assignment_epoch"] != group_state["member_epoch"]:
+        raise TestError(
+            f"ShareGroupDescribe assignment_epoch={described['assignment_epoch']} "
+            f"expected={group_state['member_epoch']}"
+        )
+    if described["assignor_name"] != "range":
+        raise TestError(f"ShareGroupDescribe assignor mismatch: {described}")
+    matching_member = next(
+        (
+            member
+            for member in described["members"]
+            if member["member_id"] == group_state["member_id"]
+        ),
+        None,
+    )
+    if matching_member is None:
+        raise TestError(f"ShareGroupDescribe missing member: {described}")
+    if matching_member["member_epoch"] != group_state["member_epoch"]:
+        raise TestError(
+            f"ShareGroupDescribe member_epoch={matching_member['member_epoch']} "
+            f"expected={group_state['member_epoch']}"
+        )
+    if group_state.get("rack_id") is not None:
+        if matching_member["rack_id"] != group_state["rack_id"]:
+            raise TestError(
+                f"ShareGroupDescribe rack_id={matching_member['rack_id']!r} "
+                f"expected={group_state['rack_id']!r}"
+            )
+    if topic not in matching_member["subscribed_topics"]:
+        raise TestError(f"ShareGroupDescribe subscriptions mismatch: {matching_member}")
+    assignment = matching_member["assignment"]
+    matching_topic = next(
+        (
+            described_topic
+            for described_topic in assignment["topic_partitions"]
+            if described_topic["topic_id"] == group_state["topic_id"]
+        ),
+        None,
+    )
+    if matching_topic is None:
+        raise TestError(f"ShareGroupDescribe missing assignment: {matching_member}")
+    if matching_topic["topic_name"] != topic:
+        raise TestError(f"ShareGroupDescribe topic name mismatch: {matching_topic}")
+    if matching_topic["partitions"] != [0]:
+        raise TestError(f"ShareGroupDescribe partitions mismatch: {matching_topic}")
+
+
+def wait_for_share_group_description(port, group_state, topic, timeout=30):
+    deadline = time.time() + timeout
+    correlation_id = 7970
+    last_error = None
+    while time.time() < deadline:
+        try:
+            assert_share_group_description(port, group_state, topic, correlation_id)
+            return
+        except Exception as exc:
+            last_error = exc
+        correlation_id += 1
+        time.sleep(0.25)
+    raise TestError(
+        f"ShareGroupDescribe did not recover for "
+        f"{group_state['group_id']!r}: {last_error}"
+    )
+
+
+def wait_for_share_group_checkpoint(port, group_state, topic):
+    wait_for_share_group_heartbeat(port, group_state)
+    wait_for_share_group_description(port, group_state, topic)
+
+
 def parse_leave_group_response(response, correlation_id):
     pos = 0
     response_correlation, pos = read_i32(response, pos)
@@ -5640,9 +5950,24 @@ def main():
             kip848_subscription_group_state,
             kip848_subscription_topic,
         )
+        share_group_state = wait_for_share_group_heartbeat_join(
+            broker["port"],
+            f"{group}-share",
+            topic,
+        )
+        wait_for_share_group_heartbeat_rack_update(
+            broker["port"],
+            share_group_state,
+            "rack-share-failover",
+        )
         wait_for_kip848_negative_checkpoint(
             broker["port"],
             kip848_negative_group_prefix,
+            topic,
+        )
+        wait_for_share_group_checkpoint(
+            broker["port"],
+            share_group_state,
             topic,
         )
         wait_for_offset_commit_v9_member_checkpoint(
@@ -5701,6 +6026,11 @@ def main():
         wait_for_kip848_negative_checkpoint(
             broker["port"],
             kip848_negative_group_prefix,
+            topic,
+        )
+        wait_for_share_group_checkpoint(
+            broker["port"],
+            share_group_state,
             topic,
         )
         wait_for_offset_commit_v9_member_checkpoint(
@@ -5790,6 +6120,11 @@ def main():
         wait_for_kip848_negative_checkpoint(
             broker["port"],
             kip848_negative_group_prefix,
+            topic,
+        )
+        wait_for_share_group_checkpoint(
+            broker["port"],
+            share_group_state,
             topic,
         )
         wait_for_offset_commit_v9_member_checkpoint(
@@ -5883,6 +6218,11 @@ def main():
         wait_for_kip848_negative_checkpoint(
             broker["port"],
             kip848_negative_group_prefix,
+            topic,
+        )
+        wait_for_share_group_checkpoint(
+            broker["port"],
+            share_group_state,
             topic,
         )
         wait_for_offset_commit_v9_member_checkpoint(
@@ -5986,6 +6326,11 @@ def main():
         wait_for_kip848_negative_checkpoint(
             broker["port"],
             kip848_negative_group_prefix,
+            topic,
+        )
+        wait_for_share_group_checkpoint(
+            broker["port"],
+            share_group_state,
             topic,
         )
         wait_for_offset_commit_v9_member_checkpoint(
@@ -6094,6 +6439,11 @@ def main():
         wait_for_kip848_negative_checkpoint(
             broker["port"],
             kip848_negative_group_prefix,
+            topic,
+        )
+        wait_for_share_group_checkpoint(
+            broker["port"],
+            share_group_state,
             topic,
         )
         wait_for_offset_commit_v9_member_checkpoint(
@@ -6214,6 +6564,11 @@ def main():
         wait_for_kip848_negative_checkpoint(
             broker["port"],
             kip848_negative_group_prefix,
+            topic,
+        )
+        wait_for_share_group_checkpoint(
+            broker["port"],
+            share_group_state,
             topic,
         )
         wait_for_offset_commit_v9_member_checkpoint(
@@ -6373,6 +6728,8 @@ def main():
             f"consumer_group_describe_checked=true, "
             f"list_groups_checked=true, "
             f"find_coordinator_checked=true, "
+            f"share_group_heartbeat_checked=true, "
+            f"share_group_describe_checked=true, "
             f"consumer_group_heartbeat_checked=true, "
             f"kip848_describe_checked=true, "
             f"kip848_rejoin_checked=true, "
@@ -6826,6 +7183,66 @@ def self_test():
         ):
             raise TestError(
                 f"ConsumerGroupHeartbeat fixture parser failed: {heartbeat}"
+            )
+
+        share_heartbeat = parse_share_group_heartbeat_response(
+            consumer_group_heartbeat_fixture, 59
+        )
+        if (
+            share_heartbeat["error_code"] != 0
+            or share_heartbeat["member_id"] != "kip848-member"
+            or share_heartbeat["assignment"]["topic_partitions"][0]["partitions"]
+            != [0]
+        ):
+            raise TestError(
+                f"ShareGroupHeartbeat fixture parser failed: {share_heartbeat}"
+            )
+
+        share_describe_topic_id = bytes(range(16, 32))
+        share_group_describe_fixture = struct.pack(">i", 156)
+        share_group_describe_fixture += b"\x00"  # response header tagged fields
+        share_group_describe_fixture += struct.pack(">i", 0)
+        share_group_describe_fixture += write_compact_array_len(1)
+        share_group_describe_fixture += struct.pack(">h", 0)
+        share_group_describe_fixture += write_compact_string(None)
+        share_group_describe_fixture += write_compact_string("share-describe-self-test")
+        share_group_describe_fixture += write_compact_string("Stable")
+        share_group_describe_fixture += struct.pack(">ii", 2, 2)
+        share_group_describe_fixture += write_compact_string("range")
+        share_group_describe_fixture += write_compact_array_len(1)
+        share_group_describe_fixture += write_compact_string("share-member-1")
+        share_group_describe_fixture += write_compact_string("rack-share")
+        share_group_describe_fixture += struct.pack(">i", 2)
+        share_group_describe_fixture += write_compact_string("zmq-client")
+        share_group_describe_fixture += write_compact_string("/127.0.0.1")
+        share_group_describe_fixture += write_compact_array_len(1)
+        share_group_describe_fixture += write_compact_string("share-topic")
+        share_group_describe_fixture += write_compact_array_len(1)
+        share_group_describe_fixture += share_describe_topic_id
+        share_group_describe_fixture += write_compact_string("share-topic")
+        share_group_describe_fixture += write_compact_i32_array([0])
+        share_group_describe_fixture += b"\x00"  # assignment topic tagged fields
+        share_group_describe_fixture += b"\x00"  # assignment tagged fields
+        share_group_describe_fixture += b"\x00"  # member tagged fields
+        share_group_describe_fixture += struct.pack(">i", -2147483648)
+        share_group_describe_fixture += b"\x00"  # group tagged fields
+        share_group_describe_fixture += b"\x00"  # response tagged fields
+        share_described = parse_share_group_describe_response(
+            share_group_describe_fixture, 156
+        )
+        if (
+            len(share_described) != 1
+            or share_described[0]["group_id"] != "share-describe-self-test"
+            or share_described[0]["members"][0]["rack_id"] != "rack-share"
+            or share_described[0]["members"][0]["subscribed_topics"]
+            != ["share-topic"]
+            or share_described[0]["members"][0]["assignment"]["topic_partitions"][0][
+                "topic_id"
+            ]
+            != share_describe_topic_id
+        ):
+            raise TestError(
+                f"ShareGroupDescribe fixture parser failed: {share_described}"
             )
 
         leave_fixture = struct.pack(">ih", 50, 0)
