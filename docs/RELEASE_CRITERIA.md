@@ -22,7 +22,9 @@ single-node demo are not sufficient by themselves.
   ObjectManager metadata before deleting old S3 objects or else roll back or
   track uploaded replacements for retry cleanup. Coordinator offset
   enumerations and persisted offset restore must not silently skip malformed
-  keys that belong to the requested group. Internal compacted-topic
+  keys that belong to the requested group, and internal committed-offset replay
+  must fail closed on malformed values for parseable offset keys. Internal
+  compacted-topic
   compaction must fail closed on cache allocation and malformed record-batch
   parser errors, and broker-owned internal log replay must reject malformed
   record-batch headers, truncated records, and trailing bytes instead of partial

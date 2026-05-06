@@ -3310,7 +3310,7 @@ pub const Broker = struct {
         return value;
     }
 
-    fn decodeOffsetCommitRecordValue(value: []const u8) ?DecodedOffsetCommitRecord {
+    fn decodeOffsetCommitRecordValue(value: []const u8) !DecodedOffsetCommitRecord {
         if (value.len == 8) {
             return .{
                 .offset = std.mem.readInt(i64, value[0..8], .big),
@@ -3318,8 +3318,8 @@ pub const Broker = struct {
                 .metadata = null,
             };
         }
-        if (value.len < offset_commit_record_value_magic.len + 8 + 4 + 1 + 4) return null;
-        if (!std.mem.eql(u8, value[0..offset_commit_record_value_magic.len], offset_commit_record_value_magic)) return null;
+        if (value.len < offset_commit_record_value_magic.len + 8 + 4 + 1 + 4) return error.MalformedOffsetCommitRecord;
+        if (!std.mem.eql(u8, value[0..offset_commit_record_value_magic.len], offset_commit_record_value_magic)) return error.MalformedOffsetCommitRecord;
 
         var pos: usize = offset_commit_record_value_magic.len;
         const offset = std.mem.readInt(i64, value[pos..][0..8], .big);
@@ -3330,7 +3330,8 @@ pub const Broker = struct {
         pos += 1;
         const metadata_len = std.mem.readInt(u32, value[pos..][0..4], .big);
         pos += 4;
-        if (pos + metadata_len != value.len) return null;
+        if (pos + metadata_len != value.len) return error.MalformedOffsetCommitRecord;
+        if (!has_metadata and metadata_len != 0) return error.MalformedOffsetCommitRecord;
         const metadata: ?[]const u8 = if (has_metadata) value[pos .. pos + metadata_len] else null;
         return .{
             .offset = offset,
@@ -5689,7 +5690,7 @@ pub const Broker = struct {
             _ = try self.groups.deleteCommittedOffset(parts.group_id, parts.topic, parts.partition);
             return .offset_record;
         };
-        const decoded = decodeOffsetCommitRecordValue(commit_value) orelse return .none;
+        const decoded = try decodeOffsetCommitRecordValue(commit_value);
 
         try self.groups.commitOffsetWithMetadata(
             parts.group_id,
@@ -28873,6 +28874,27 @@ test "Broker internal log replay rejects trailing bytes" {
     try testing.expectError(error.MalformedInternalRecordBatch, broker.applyClusterMetadataRecordBatches("tail"));
     try testing.expectError(error.MalformedInternalRecordBatch, broker.applyConsumerOffsetRecordBatches("tail"));
     try testing.expectError(error.MalformedInternalRecordBatch, broker.applyTransactionStateRecordBatches("tail"));
+}
+
+test "Broker internal log replay rejects malformed committed offset values" {
+    const rec_batch = protocol.record_batch;
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+
+    const key = "replay-bad-offset-value-group:replay-bad-offset-value-topic:0";
+    const bad_value = "bad";
+    const records = [_]rec_batch.Record{.{
+        .offset_delta = 0,
+        .key = key,
+        .value = bad_value,
+    }};
+    const now = @import("time_compat").milliTimestamp();
+    const batch = try rec_batch.buildRecordBatch(testing.allocator, 0, &records, -1, -1, -1, now, now, 0);
+    defer testing.allocator.free(batch);
+
+    try testing.expectError(error.MalformedOffsetCommitRecord, broker.applyConsumerOffsetRecordBatches(batch));
+    try testing.expect((try broker.groups.fetchOffset("replay-bad-offset-value-group", "replay-bad-offset-value-topic", 0)) == null);
 }
 
 test "Broker.ensureTopic rolls back when partition state creation fails" {

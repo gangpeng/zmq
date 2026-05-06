@@ -55,7 +55,9 @@ operator-facing behavior.
   keys instead of skipping them, and preserves valid topic names that contain
   colons. All-topic committed-offset enumeration now also fails closed when a
   matching in-memory coordinator key is malformed, while still preserving valid
-  topic names that contain colons.
+  topic names that contain colons. Internal `__consumer_offsets` replay now
+  fails closed on malformed committed-offset values for parseable offset keys
+  instead of silently omitting those offsets during rebuild.
   Internal compacted-topic log compaction now fails closed on cache allocation
   failures and malformed Kafka record-batch headers instead of skipping corrupt
   internal batches.
