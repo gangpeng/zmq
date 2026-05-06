@@ -11519,7 +11519,11 @@ pub const Broker = struct {
     fn automqRegisterNodeErrorResponse(self: *Broker, req_header: *const RequestHeader, resp_header_version: i16, api_version: i16, err_code: ErrorCode) ?[]u8 {
         const Resp = generated.automq_register_node_response.AutomqRegisterNodeResponse;
         const resp = Resp{ .error_code = err_code.toInt(), .throttle_time_ms = 0 };
-        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version) orelse {
+            log.warn("AutomqRegisterNode error response serialization failed", .{});
+            const storage_resp = Resp{ .error_code = ErrorCode.kafka_storage_error.toInt(), .throttle_time_ms = 0 };
+            return self.serializeGeneratedResponse(req_header, resp_header_version, &storage_resp, api_version);
+        };
     }
 
     fn handleAutomqGetNodesAuthorizationError(
@@ -22862,17 +22866,25 @@ pub const Broker = struct {
                 return self.automqRegisterNodeErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error);
             };
         }
+        const success_resp = Resp{ .error_code = 0, .throttle_time_ms = 0 };
+        const success_response = self.serializeGeneratedResponse(req_header, resp_header_version, &success_resp, api_version) orelse {
+            log.warn("AutomqRegisterNode response serialization failed before mutation", .{});
+            self.allocator.free(wal_config_copy);
+            return self.automqRegisterNodeErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error);
+        };
         var previous_snapshot: ?MetadataPersistence.AutoMqMetadataSnapshot = null;
         defer if (previous_snapshot) |*snapshot| self.persistence.freeAutoMqMetadataSnapshot(snapshot);
         if (self.raft_state == null) {
             previous_snapshot = self.cloneAutoMqMetadataSnapshot() catch |err| {
                 log.warn("AutomqRegisterNode rollback snapshot failed: {}", .{err});
                 self.allocator.free(wal_config_copy);
+                self.allocator.free(success_response);
                 return self.automqRegisterNodeErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error);
             };
         }
         self.commitAutoMqRegisterNodeRecord(req.node_id, req.node_epoch, wal_config) catch |err| {
             self.allocator.free(wal_config_copy);
+            self.allocator.free(success_response);
             const resp = Resp{ .error_code = autoMqQuorumErrorCode(err), .throttle_time_ms = 0 };
             return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version) orelse {
                 log.warn("AutomqRegisterNode error response serialization failed", .{});
@@ -22890,14 +22902,11 @@ pub const Broker = struct {
         self.persistAutoMqMetadataAfterMutation() catch |err| {
             log.warn("AutomqRegisterNode metadata snapshot write failed: {}", .{err});
             if (previous_snapshot) |snapshot| self.restoreAutoMqMetadataAfterFailedMutation(snapshot);
+            self.allocator.free(success_response);
             return self.automqRegisterNodeErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error);
         };
 
-        const resp = Resp{ .error_code = 0, .throttle_time_ms = 0 };
-        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version) orelse {
-            log.warn("AutomqRegisterNode response serialization failed", .{});
-            return self.automqRegisterNodeErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error);
-        };
+        return success_response;
     }
 
     fn handleAutomqGetNodes(self: *Broker, request_bytes: []const u8, body_start: usize, req_header: *const RequestHeader, api_version: i16, resp_header_version: i16) ?[]u8 {
@@ -53539,6 +53548,26 @@ test "Broker.handleRequest GetNextNodeId does not advance when success serializa
 
     try expectAutoMqMutationErrorWithFailingAllocator(&broker, buf[0..pos], 600, 0, 6011, 0, ErrorCode.kafka_storage_error);
     try testing.expectEqual(@as(i32, 88), broker.auto_mq_next_node_id);
+}
+
+test "Broker.handleRequest AutomqRegisterNode does not replace node when success serialization fails" {
+    const Req = generated.automq_register_node_request.AutomqRegisterNodeRequest;
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+    try broker.registerAutoMqNodeFromRecord(18, 1, "wal://old");
+    broker.auto_mq_next_node_id = 22;
+
+    const req = Req{ .node_id = 18, .node_epoch = 2, .wal_config = "wal://new", .tags = &.{} };
+    var buf: [256]u8 = undefined;
+    var pos = buildTestRequest(&buf, 513, 0, 5141, header_mod.requestHeaderVersion(513, 0));
+    req.serialize(&buf, &pos, 0);
+
+    try expectAutoMqMutationErrorWithFailingAllocator(&broker, buf[0..pos], 513, 0, 5141, 1, ErrorCode.kafka_storage_error);
+    const node = broker.auto_mq_nodes.get(18).?;
+    try testing.expectEqual(@as(i64, 1), node.node_epoch);
+    try testing.expectEqualStrings("wal://old", node.wal_config);
+    try testing.expectEqual(@as(i32, 22), broker.auto_mq_next_node_id);
 }
 
 test "Broker AutoMQ stream object lifecycle APIs" {
