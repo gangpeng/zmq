@@ -1296,6 +1296,21 @@ pub const Broker = struct {
         const topic_count = self.topics.count();
         const partition_count = self.brokerPartitionCount();
         const leader_partition_count = self.brokerLocalLeaderPartitionCount();
+        var active_broker_count: usize = 0;
+        var fenced_broker_count: usize = 0;
+        if (self.controller_rebalance_brokers.items.len > 0) {
+            for (self.controller_rebalance_brokers.items) |broker_node| {
+                if (broker_node.fenced) {
+                    fenced_broker_count += 1;
+                } else {
+                    active_broker_count += 1;
+                }
+            }
+        } else if (self.is_fenced_by_controller) {
+            fenced_broker_count = 1;
+        } else if (!self.is_shutting_down) {
+            active_broker_count = 1;
+        }
         const active_controller_count: f64 = if (self.raft_state) |raft|
             if (raft.role == .leader) 1.0 else 0.0
         else
@@ -1316,6 +1331,8 @@ pub const Broker = struct {
         // covers cross-broker topic state.
         self.metrics.setGauge("kafka_controller_kafkacontroller_globaltopiccount", @floatFromInt(topic_count));
         self.metrics.setGauge("kafka_controller_kafkacontroller_globalpartitioncount", @floatFromInt(partition_count));
+        self.metrics.setGauge("kafka_controller_kafkacontroller_activebrokercount", @floatFromInt(active_broker_count));
+        self.metrics.setGauge("kafka_controller_kafkacontroller_fencedbrokercount", @floatFromInt(fenced_broker_count));
         self.metrics.setGauge("kafka_controller_kafkacontroller_offlinepartitionscount", 0.0);
         self.metrics.setGauge("kafka_controller_kafkacontroller_preferredreplicaimbalancecount", 0.0);
         self.metrics.setGauge("kafka_log_logmanager_offlinelogdirectorycount", 0.0);
@@ -76026,6 +76043,8 @@ test "Broker tick exports AutoMQ-compatible broker gauges" {
     try testing.expectEqual(@as(f64, 0.0), broker.metrics.gauges.get("kafka_controller_kafkacontroller_activecontrollercount").?.value);
     try testing.expectEqual(@as(f64, 2.0), broker.metrics.gauges.get("kafka_controller_kafkacontroller_globaltopiccount").?.value);
     try testing.expectEqual(@as(f64, 4.0), broker.metrics.gauges.get("kafka_controller_kafkacontroller_globalpartitioncount").?.value);
+    try testing.expectEqual(@as(f64, 1.0), broker.metrics.gauges.get("kafka_controller_kafkacontroller_activebrokercount").?.value);
+    try testing.expectEqual(@as(f64, 0.0), broker.metrics.gauges.get("kafka_controller_kafkacontroller_fencedbrokercount").?.value);
     try testing.expectEqual(@as(f64, 0.0), broker.metrics.gauges.get("kafka_controller_kafkacontroller_offlinepartitionscount").?.value);
     try testing.expectEqual(@as(f64, 0.0), broker.metrics.gauges.get("kafka_controller_kafkacontroller_preferredreplicaimbalancecount").?.value);
     try testing.expectEqual(@as(f64, 0.0), broker.metrics.gauges.get("kafka_log_logmanager_offlinelogdirectorycount").?.value);
@@ -76036,6 +76055,37 @@ test "Broker tick exports AutoMQ-compatible broker gauges" {
     try testing.expectEqual(@as(f64, 0.0), broker.metrics.gauges.get("kafka_network_requestchannel_responsequeuesize").?.value);
     try testing.expectEqual(@as(f64, 1.0), broker.metrics.labeled_gauges.get("kafka_server_delayedoperationpurgatory_purgatorysize{delayed_operation=\"Fetch\"}").?.value);
     try testing.expectEqual(@as(f64, 0.0), broker.metrics.labeled_gauges.get("kafka_server_delayedoperationpurgatory_purgatorysize{delayed_operation=\"Produce\"}").?.value);
+}
+
+test "Broker tick exports controller broker liveness gauges" {
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+
+    const brokers = [_]AutoBalancer.BrokerNode{
+        .{ .node_id = 1, .rack = "rack-a", .fenced = false },
+        .{ .node_id = 2, .rack = "rack-a", .fenced = true },
+        .{ .node_id = 3, .rack = "rack-b", .fenced = false },
+    };
+    const loads = [_]AutoBalancer.PartitionLoad{.{
+        .topic = "controller-live-topic",
+        .partition_id = 0,
+        .bytes_in_rate = 1.0,
+        .bytes_out_rate = 1.0,
+        .leader_node = 1,
+    }};
+    try broker.setControllerAwareRebalanceInputs(&brokers, &loads);
+
+    broker.tick();
+
+    try testing.expectEqual(@as(f64, 2.0), broker.metrics.gauges.get("kafka_controller_kafkacontroller_activebrokercount").?.value);
+    try testing.expectEqual(@as(f64, 1.0), broker.metrics.gauges.get("kafka_controller_kafkacontroller_fencedbrokercount").?.value);
+
+    broker.clearControllerAwareRebalanceInputs();
+    broker.is_fenced_by_controller = true;
+    broker.tick();
+
+    try testing.expectEqual(@as(f64, 0.0), broker.metrics.gauges.get("kafka_controller_kafkacontroller_activebrokercount").?.value);
+    try testing.expectEqual(@as(f64, 1.0), broker.metrics.gauges.get("kafka_controller_kafkacontroller_fencedbrokercount").?.value);
 }
 
 test "Broker client telemetry metrics are registered" {

@@ -57,6 +57,24 @@ groups:
           summary: No ZMQ controller is reporting active-controller status.
           description: Controller failover or registration may be stalled.
 
+      - alert: ZMQNoActiveBroker
+        expr: kafka_controller_kafkacontroller_activebrokercount < 1
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: No ZMQ broker is reporting active-broker status.
+          description: Controller-observed broker liveness has no unfenced broker available for client traffic.
+
+      - alert: ZMQFencedBrokers
+        expr: kafka_controller_kafkacontroller_fencedbrokercount > 0
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: ZMQ controller reports fenced brokers.
+          description: Fenced brokers cannot accept produce traffic and may indicate heartbeat, disk, or controller fencing issues.
+
       - alert: ZMQBrokerNotRunning
         expr: kafka_server_kafkaserver_brokerstate != 3
         for: 1m

@@ -42,6 +42,8 @@ pub fn registerBrokerMetrics(registry: *MetricRegistry) !void {
     try registry.registerGauge("kafka_controller_kafkacontroller_activecontrollercount", "JMX-compatible active controller count");
     try registry.registerGauge("kafka_controller_kafkacontroller_globaltopiccount", "JMX-compatible cluster-wide topic count observed by the controller");
     try registry.registerGauge("kafka_controller_kafkacontroller_globalpartitioncount", "JMX-compatible cluster-wide partition count observed by the controller");
+    try registry.registerGauge("kafka_controller_kafkacontroller_activebrokercount", "JMX-compatible active broker count observed by the controller");
+    try registry.registerGauge("kafka_controller_kafkacontroller_fencedbrokercount", "JMX-compatible fenced broker count observed by the controller");
     try registry.registerGauge("kafka_controller_kafkacontroller_offlinepartitionscount", "JMX-compatible offline partition count observed by the controller");
     try registry.registerGauge("kafka_controller_kafkacontroller_preferredreplicaimbalancecount", "JMX-compatible count of partitions whose current leader is not the preferred replica");
     try registry.registerGauge("kafka_log_logmanager_offlinelogdirectorycount", "JMX-compatible offline log directory count");
@@ -244,6 +246,8 @@ test "registerBrokerMetrics" {
     try testing.expect(registry.gauges.contains("kafka_controller_kafkacontroller_activecontrollercount"));
     try testing.expect(registry.gauges.contains("kafka_controller_kafkacontroller_globaltopiccount"));
     try testing.expect(registry.gauges.contains("kafka_controller_kafkacontroller_globalpartitioncount"));
+    try testing.expect(registry.gauges.contains("kafka_controller_kafkacontroller_activebrokercount"));
+    try testing.expect(registry.gauges.contains("kafka_controller_kafkacontroller_fencedbrokercount"));
     try testing.expect(registry.gauges.contains("kafka_controller_kafkacontroller_offlinepartitionscount"));
     try testing.expect(registry.gauges.contains("kafka_controller_kafkacontroller_preferredreplicaimbalancecount"));
     try testing.expect(registry.gauges.contains("kafka_log_logmanager_offlinelogdirectorycount"));
@@ -312,6 +316,8 @@ test "registerBrokerMetrics new JMX gauges export with HELP and TYPE" {
     try registerBrokerMetrics(&registry);
     registry.setGauge("kafka_controller_kafkacontroller_globaltopiccount", 7.0);
     registry.setGauge("kafka_controller_kafkacontroller_globalpartitioncount", 21.0);
+    registry.setGauge("kafka_controller_kafkacontroller_activebrokercount", 3.0);
+    registry.setGauge("kafka_controller_kafkacontroller_fencedbrokercount", 1.0);
     registry.setGauge("kafka_controller_kafkacontroller_offlinepartitionscount", 0.0);
     registry.setGauge("kafka_controller_kafkacontroller_preferredreplicaimbalancecount", 0.0);
     registry.setGauge("kafka_log_logmanager_offlinelogdirectorycount", 0.0);
@@ -325,6 +331,8 @@ test "registerBrokerMetrics new JMX gauges export with HELP and TYPE" {
         "# TYPE kafka_controller_kafkacontroller_globaltopiccount gauge",
         "kafka_controller_kafkacontroller_globaltopiccount 7",
         "kafka_controller_kafkacontroller_globalpartitioncount 21",
+        "kafka_controller_kafkacontroller_activebrokercount 3",
+        "kafka_controller_kafkacontroller_fencedbrokercount 1",
         "kafka_controller_kafkacontroller_offlinepartitionscount 0",
         "kafka_controller_kafkacontroller_preferredreplicaimbalancecount 0",
         "kafka_log_logmanager_offlinelogdirectorycount 0",

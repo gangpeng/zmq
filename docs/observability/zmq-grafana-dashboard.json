@@ -403,6 +403,14 @@
           "legendFormat": "active controllers"
         },
         {
+          "expr": "kafka_controller_kafkacontroller_activebrokercount",
+          "legendFormat": "active brokers"
+        },
+        {
+          "expr": "kafka_controller_kafkacontroller_fencedbrokercount",
+          "legendFormat": "fenced brokers"
+        },
+        {
           "expr": "kafka_server_replicamanager_partitioncount",
           "legendFormat": "partitions"
         },
