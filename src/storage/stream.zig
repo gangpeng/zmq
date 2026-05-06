@@ -114,14 +114,14 @@ pub const Stream = struct {
 
     /// Open the stream with a new epoch. Creates an initial range.
     pub fn open(self: *Stream, epoch: u64) !void {
-        self.epoch = epoch;
-        self.state = .opened;
         try self.ranges.append(.{
             .epoch = epoch,
             .start_offset = self.end_offset,
             .end_offset = self.end_offset,
             .node_id = self.node_id,
         });
+        self.epoch = epoch;
+        self.state = .opened;
     }
 
     /// Close the stream. Finalizes the current range.
@@ -336,8 +336,9 @@ pub const ObjectManager = struct {
     /// Create a new stream with an auto-allocated stream_id.
     pub fn createStream(self: *ObjectManager, node_id: i32) !*Stream {
         const stream_id = self.next_object_id;
-        self.next_object_id += 1;
-        return self.createStreamWithId(stream_id, node_id);
+        const stream = try self.createStreamWithId(stream_id, node_id);
+        self.next_object_id = stream_id + 1;
+        return stream;
     }
 
     /// Create a new stream with a specific stream_id.
@@ -492,18 +493,41 @@ pub const ObjectManager = struct {
     /// The caller should later call commitStreamObject/commitStreamSetObject
     /// to transition the object to committed state.
     pub fn prepareObject(self: *ObjectManager) u64 {
-        const object_id = self.allocateObjectId();
-        self.prepared_registry.trackPrepared(object_id);
+        return self.prepareObjectFallible() catch |err| {
+            log.warn("Failed to track prepared object with allocated ID: {}", .{err});
+            return self.allocateObjectId();
+        };
+    }
+
+    pub fn prepareObjectFallible(self: *ObjectManager) !u64 {
+        const object_id = self.next_object_id;
+        try self.prepared_registry.trackPreparedFallible(object_id);
+        self.next_object_id = object_id + 1;
         return object_id;
     }
 
     pub fn prepareObjectWithTtl(self: *ObjectManager, ttl_ms: i64) u64 {
-        return self.prepareObjectWithTtlAt(ttl_ms, @import("time_compat").milliTimestamp());
+        return self.prepareObjectWithTtlFallible(ttl_ms) catch |err| {
+            log.warn("Failed to track prepared object with TTL: {}", .{err});
+            return self.allocateObjectId();
+        };
+    }
+
+    pub fn prepareObjectWithTtlFallible(self: *ObjectManager, ttl_ms: i64) !u64 {
+        return self.prepareObjectWithTtlAtFallible(ttl_ms, @import("time_compat").milliTimestamp());
     }
 
     pub fn prepareObjectWithTtlAt(self: *ObjectManager, ttl_ms: i64, now_ms: i64) u64 {
-        const object_id = self.allocateObjectId();
-        self.prepared_registry.trackPreparedWithTtlAt(object_id, now_ms, ttl_ms);
+        return self.prepareObjectWithTtlAtFallible(ttl_ms, now_ms) catch |err| {
+            log.warn("Failed to track prepared object with TTL: {}", .{err});
+            return self.allocateObjectId();
+        };
+    }
+
+    pub fn prepareObjectWithTtlAtFallible(self: *ObjectManager, ttl_ms: i64, now_ms: i64) !u64 {
+        const object_id = self.next_object_id;
+        try self.prepared_registry.trackPreparedWithTtlAtFallible(object_id, now_ms, ttl_ms);
+        self.next_object_id = object_id + 1;
         return object_id;
     }
 
@@ -1601,8 +1625,16 @@ pub const PreparedObjectRegistry = struct {
         self.trackPreparedAt(object_id, wallClockMs());
     }
 
+    pub fn trackPreparedFallible(self: *PreparedObjectRegistry, object_id: u64) !void {
+        try self.trackPreparedAtFallible(object_id, wallClockMs());
+    }
+
     pub fn trackPreparedWithTtl(self: *PreparedObjectRegistry, object_id: u64, ttl_ms: i64) void {
         self.trackPreparedWithTtlAt(object_id, wallClockMs(), ttl_ms);
+    }
+
+    pub fn trackPreparedWithTtlFallible(self: *PreparedObjectRegistry, object_id: u64, ttl_ms: i64) !void {
+        try self.trackPreparedWithTtlAtFallible(object_id, wallClockMs(), ttl_ms);
     }
 
     /// Register a newly prepared object with an explicit timestamp for testability.
@@ -1610,14 +1642,22 @@ pub const PreparedObjectRegistry = struct {
         self.trackPreparedWithTtlAt(object_id, now_ms, 0);
     }
 
+    pub fn trackPreparedAtFallible(self: *PreparedObjectRegistry, object_id: u64, now_ms: i64) !void {
+        try self.trackPreparedWithTtlAtFallible(object_id, now_ms, 0);
+    }
+
     pub fn trackPreparedWithTtlAt(self: *PreparedObjectRegistry, object_id: u64, now_ms: i64, ttl_ms: i64) void {
-        self.current.put(object_id, .{
+        self.trackPreparedWithTtlAtFallible(object_id, now_ms, ttl_ms) catch |err| {
+            log.warn("Failed to track prepared object {d}: {}", .{ object_id, err });
+        };
+    }
+
+    pub fn trackPreparedWithTtlAtFallible(self: *PreparedObjectRegistry, object_id: u64, now_ms: i64, ttl_ms: i64) !void {
+        try self.current.put(object_id, .{
             .object_id = object_id,
             .prepared_at_ms = now_ms,
             .expires_at_ms = expiryFromTtl(now_ms, ttl_ms),
-        }) catch |err| {
-            log.warn("Failed to track prepared object {d}: {}", .{ object_id, err });
-        };
+        });
     }
 
     /// Remove a prepared object from both buffers (called when committed or expired).
@@ -1935,6 +1975,19 @@ test "Stream close" {
     try testing.expectEqual(@as(u64, 100), stream.ranges.items[0].end_offset);
 }
 
+test "Stream open does not mutate when range materialization fails" {
+    var failing_allocator = std.testing.FailingAllocator.init(testing.allocator, .{ .fail_index = 0 });
+    var stream = Stream.init(failing_allocator.allocator(), 100, 0);
+    defer stream.deinit();
+    stream.state = .closed;
+
+    try testing.expectError(error.OutOfMemory, stream.open(2));
+    try testing.expect(failing_allocator.has_induced_failure);
+    try testing.expectEqual(StreamState.closed, stream.state);
+    try testing.expectEqual(@as(u64, 1), stream.epoch);
+    try testing.expectEqual(@as(usize, 0), stream.ranges.items.len);
+}
+
 test "StreamSetObject isSingleStream" {
     var ranges = std.array_list.Managed(StreamOffsetRange).init(testing.allocator);
     defer ranges.deinit();
@@ -2002,6 +2055,28 @@ test "ObjectManager createStream" {
     try testing.expectEqual(@as(u64, 100), s2.?.stream_id);
 
     try testing.expect(om.getStream(999) == null);
+}
+
+test "ObjectManager createStream does not advance ID when materialization fails" {
+    var failing_allocator = std.testing.FailingAllocator.init(testing.allocator, .{ .fail_index = 0 });
+    var om = ObjectManager.init(failing_allocator.allocator(), 0);
+    defer om.deinit();
+
+    try testing.expectError(error.OutOfMemory, om.createStream(1));
+    try testing.expect(failing_allocator.has_induced_failure);
+    try testing.expectEqual(@as(u64, 1), om.next_object_id);
+    try testing.expectEqual(@as(usize, 0), om.streamCount());
+}
+
+test "ObjectManager fallible prepare does not advance ID when tracking fails" {
+    var failing_allocator = std.testing.FailingAllocator.init(testing.allocator, .{ .fail_index = 0 });
+    var om = ObjectManager.init(failing_allocator.allocator(), 0);
+    defer om.deinit();
+
+    try testing.expectError(error.OutOfMemory, om.prepareObjectWithTtlFallible(60_000));
+    try testing.expect(failing_allocator.has_induced_failure);
+    try testing.expectEqual(@as(u64, 1), om.next_object_id);
+    try testing.expectEqual(@as(usize, 0), om.prepared_registry.count());
 }
 
 test "ObjectManager commitStreamSetObject and getObjects" {
