@@ -1159,6 +1159,10 @@ pub const S3WalBatcher = struct {
         };
     }
 
+    fn isEpochWalObjectKey(key: []const u8) bool {
+        return std.mem.startsWith(u8, key, "wal/epoch-");
+    }
+
     fn StorageChild(comptime T: type) type {
         return switch (@typeInfo(T)) {
             .pointer => |ptr| ptr.child,
@@ -1194,7 +1198,14 @@ pub const S3WalBatcher = struct {
         }
 
         for (keys) |key| {
-            const parsed = parseObjectKey(key) orelse continue;
+            const parsed = parseObjectKey(key) orelse {
+                if (isEpochWalObjectKey(key)) {
+                    self.is_fenced = true;
+                    log.warn("S3 WAL epoch fence check rejected malformed object key: {s}", .{key});
+                    return true;
+                }
+                continue;
+            };
             if (parsed.epoch > self.wal_epoch) {
                 self.is_fenced = true;
                 log.warn("S3 WAL stale writer fenced: current={d} observed={d}", .{ self.wal_epoch, parsed.epoch });
@@ -1532,6 +1543,25 @@ test "S3WalBatcher flushNow fences stale epoch observed in storage" {
     try testing.expectEqual(@as(usize, 1), stale_owner.pendingCount());
     try testing.expectEqual(@as(u64, 0), stale_owner.batch_upload_count);
     try testing.expectEqual(@as(u64, 1), stale_owner.batch_upload_failures);
+    try testing.expectEqual(@as(usize, 1), mock_s3.objectCount());
+}
+
+test "S3WalBatcher flushNow fences malformed epoch object key" {
+    const MockS3 = @import("s3.zig").MockS3;
+
+    var mock_s3 = MockS3.init(testing.allocator);
+    defer mock_s3.deinit();
+    try mock_s3.putObject("wal/epoch-not-a-number/bulk/0000000001", "ambiguous-wal-key");
+
+    var batcher = S3WalBatcher.init(testing.allocator);
+    defer batcher.deinit();
+    try batcher.append(1, 0, "record-a");
+
+    try testing.expect(!batcher.flushNow(&mock_s3));
+    try testing.expect(batcher.is_fenced);
+    try testing.expectEqual(@as(usize, 1), batcher.pendingCount());
+    try testing.expectEqual(@as(u64, 0), batcher.batch_upload_count);
+    try testing.expectEqual(@as(u64, 1), batcher.batch_upload_failures);
     try testing.expectEqual(@as(usize, 1), mock_s3.objectCount());
 }
 
