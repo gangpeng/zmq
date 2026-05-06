@@ -16789,37 +16789,25 @@ pub const Broker = struct {
 
         if (!validateShareGroupHeartbeatRequestFrame(request_bytes, body_start)) {
             log.warn("Malformed ShareGroupHeartbeat request", .{});
-            const resp = Resp{
-                .throttle_time_ms = 0,
-                .error_code = ErrorCode.invalid_request.toInt(),
-                .error_message = "malformed ShareGroupHeartbeat request",
-                .member_id = null,
-                .member_epoch = 0,
-                .heartbeat_interval_ms = 0,
-                .assignment = null,
-            };
-            return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+            const resp = shareGroupHeartbeatResponse(ErrorCode.invalid_request.toInt(), "malformed ShareGroupHeartbeat request", null, 0, 0);
+            return self.serializeShareGroupHeartbeatResponseOrStorageError(req_header, resp_header_version, api_version, &resp, null, 0);
         }
 
         var pos = body_start;
         var req = Req.deserialize(self.allocator, request_bytes, &pos, api_version) catch |err| {
             log.warn("Failed to decode ShareGroupHeartbeat request: {}", .{err});
-            const resp = Resp{
-                .throttle_time_ms = 0,
-                .error_code = ErrorCode.invalid_request.toInt(),
-                .error_message = "malformed ShareGroupHeartbeat request",
-                .member_id = null,
-                .member_epoch = 0,
-                .heartbeat_interval_ms = 0,
-                .assignment = null,
-            };
-            return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+            const resp = shareGroupHeartbeatResponse(ErrorCode.invalid_request.toInt(), "malformed ShareGroupHeartbeat request", null, 0, 0);
+            return self.serializeShareGroupHeartbeatResponseOrStorageError(req_header, resp_header_version, api_version, &resp, null, 0);
         };
         defer self.freeShareGroupHeartbeatRequest(&req);
 
-        const subscriptions = self.consumerGroupHeartbeatSubscriptions(req.subscribed_topic_names) catch {
-            const resp = shareGroupHeartbeatResponse(ErrorCode.invalid_request.toInt(), "invalid ShareGroupHeartbeat subscription", req.member_id, req.member_epoch, 0);
-            return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+        const subscriptions = self.consumerGroupHeartbeatSubscriptions(req.subscribed_topic_names) catch |err| {
+            if (err == error.InvalidRequest) {
+                const resp = shareGroupHeartbeatResponse(ErrorCode.invalid_request.toInt(), "invalid ShareGroupHeartbeat subscription", req.member_id, req.member_epoch, 0);
+                return self.serializeShareGroupHeartbeatResponseOrStorageError(req_header, resp_header_version, api_version, &resp, req.member_id, req.member_epoch);
+            }
+            log.warn("ShareGroupHeartbeat subscription materialization failed: {}", .{err});
+            return self.shareGroupHeartbeatErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error, "Failed to materialize ShareGroupHeartbeat subscriptions", req.member_id, req.member_epoch);
         };
         defer if (subscriptions) |topics| {
             if (topics.len > 0) self.allocator.free(topics);
@@ -16829,40 +16817,46 @@ pub const Broker = struct {
         const member_id = req.member_id orelse "";
 
         if (req.member_epoch == 0) {
-            const previous_snapshot = self.encodeConsumerGroupSnapshotRecordValue() catch return null;
+            const previous_snapshot = self.encodeConsumerGroupSnapshotRecordValue() catch |err| {
+                log.warn("ShareGroupHeartbeat join rollback snapshot failed for {s}: {}", .{ group_id, err });
+                return self.shareGroupHeartbeatErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error, null, req.member_id, req.member_epoch);
+            };
             defer self.allocator.free(previous_snapshot);
 
-            const result = self.groups.joinGroupWithProtocol(group_id, nonEmptyStringOrNull(req.member_id), null, "share", "range", null, subscriptions) catch return null;
+            const result = self.groups.joinGroupWithProtocol(group_id, nonEmptyStringOrNull(req.member_id), null, "share", "range", null, subscriptions) catch |err| {
+                log.warn("ShareGroupHeartbeat join mutation failed for {s}: {}", .{ group_id, err });
+                self.restoreConsumerGroupsAfterFailedMutation(previous_snapshot);
+                return self.shareGroupHeartbeatErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error, null, req.member_id, req.member_epoch);
+            };
             var response_member_epoch = result.generation_id;
+            var assignment: ?Resp.Assignment = null;
+            defer if (assignment) |*owned| self.freeShareGroupHeartbeatAssignment(owned);
             if (result.error_code == @intFromEnum(ErrorCode.none)) {
                 if (req.rack_id) |rack| {
                     _ = self.groups.updateMemberRackIfChanged(group_id, result.member_id, rack) catch |err| {
                         log.warn("ShareGroupHeartbeat rack update failed for {s}: {}", .{ group_id, err });
                         self.restoreConsumerGroupsAfterFailedMutation(previous_snapshot);
                         const resp = shareGroupHeartbeatResponse(ErrorCode.kafka_storage_error.toInt(), null, req.member_id, req.member_epoch, 0);
-                        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+                        return self.serializeShareGroupHeartbeatResponseOrStorageError(req_header, resp_header_version, api_version, &resp, req.member_id, req.member_epoch);
                     };
                 }
                 _ = self.markShareGroupStable(group_id);
                 if (self.groups.groups.getPtr(group_id)) |group| {
                     response_member_epoch = group.generation_id;
                 }
+                assignment = self.buildShareGroupHeartbeatAssignment(group_id, result.member_id) catch |err| {
+                    log.warn("Failed to build ShareGroupHeartbeat assignment for {s}: {}", .{ group_id, err });
+                    self.restoreConsumerGroupsAfterFailedMutation(previous_snapshot);
+                    const resp = shareGroupHeartbeatResponse(ErrorCode.kafka_storage_error.toInt(), null, req.member_id, req.member_epoch, 0);
+                    return self.serializeShareGroupHeartbeatResponseOrStorageError(req_header, resp_header_version, api_version, &resp, req.member_id, req.member_epoch);
+                };
                 self.persistConsumerGroupsDurably() catch |err| {
                     log.warn("ShareGroupHeartbeat join snapshot write failed for {s}: {}", .{ group_id, err });
                     self.restoreConsumerGroupsAfterFailedMutation(previous_snapshot);
                     const resp = shareGroupHeartbeatResponse(ErrorCode.kafka_storage_error.toInt(), null, req.member_id, req.member_epoch, 0);
-                    return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+                    return self.serializeShareGroupHeartbeatResponseOrStorageError(req_header, resp_header_version, api_version, &resp, req.member_id, req.member_epoch);
                 };
             }
-
-            var assignment = if (result.error_code == @intFromEnum(ErrorCode.none))
-                self.buildShareGroupHeartbeatAssignment(group_id, result.member_id) catch |err| blk: {
-                    log.warn("Failed to build ShareGroupHeartbeat assignment for {s}: {}", .{ group_id, err });
-                    break :blk null;
-                }
-            else
-                null;
-            defer if (assignment) |*owned| self.freeShareGroupHeartbeatAssignment(owned);
 
             var resp = shareGroupHeartbeatResponse(
                 result.error_code,
@@ -16872,11 +16866,14 @@ pub const Broker = struct {
                 if (result.error_code == @intFromEnum(ErrorCode.none)) share_group_heartbeat_interval_ms else 0,
             );
             resp.assignment = assignment;
-            return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+            return self.serializeShareGroupHeartbeatResponseOrStorageError(req_header, resp_header_version, api_version, &resp, resp.member_id, resp.member_epoch);
         }
 
         if (req.member_epoch == -1) {
-            const previous_snapshot = self.encodeConsumerGroupSnapshotRecordValue() catch return null;
+            const previous_snapshot = self.encodeConsumerGroupSnapshotRecordValue() catch |err| {
+                log.warn("ShareGroupHeartbeat leave rollback snapshot failed for {s}: {}", .{ group_id, err });
+                return self.shareGroupHeartbeatErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error, null, req.member_id, req.member_epoch);
+            };
             defer self.allocator.free(previous_snapshot);
 
             const protocol_error = self.validateShareGroupProtocol(group_id);
@@ -16889,7 +16886,7 @@ pub const Broker = struct {
                     log.warn("ShareGroupHeartbeat leave snapshot write failed for {s}: {}", .{ group_id, err });
                     self.restoreConsumerGroupsAfterFailedMutation(previous_snapshot);
                     const resp = shareGroupHeartbeatResponse(ErrorCode.kafka_storage_error.toInt(), null, req.member_id, req.member_epoch, 0);
-                    return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+                    return self.serializeShareGroupHeartbeatResponseOrStorageError(req_header, resp_header_version, api_version, &resp, req.member_id, req.member_epoch);
                 };
                 _ = self.clearShareGroupSession(group_id, member_id) catch |err| {
                     log.warn("ShareGroupHeartbeat session cleanup failed for {s}/{s}: {}", .{ group_id, member_id, err });
@@ -16898,17 +16895,17 @@ pub const Broker = struct {
                         log.err("Failed to persist restored ShareGroupHeartbeat leave rollback for {s}: {}", .{ group_id, restore_err });
                     };
                     const resp = shareGroupHeartbeatResponse(ErrorCode.kafka_storage_error.toInt(), null, req.member_id, req.member_epoch, 0);
-                    return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+                    return self.serializeShareGroupHeartbeatResponseOrStorageError(req_header, resp_header_version, api_version, &resp, req.member_id, req.member_epoch);
                 };
             }
 
             const resp = shareGroupHeartbeatResponse(error_code, null, req.member_id, -1, 0);
-            return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+            return self.serializeShareGroupHeartbeatResponseOrStorageError(req_header, resp_header_version, api_version, &resp, req.member_id, -1);
         }
 
         if (req.member_epoch < -1) {
             const resp = shareGroupHeartbeatResponse(ErrorCode.invalid_request.toInt(), "invalid member epoch", req.member_id, req.member_epoch, 0);
-            return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+            return self.serializeShareGroupHeartbeatResponseOrStorageError(req_header, resp_header_version, api_version, &resp, req.member_id, req.member_epoch);
         }
 
         const protocol_error = self.validateShareGroupProtocol(group_id);
@@ -16917,8 +16914,13 @@ pub const Broker = struct {
         else
             protocol_error.toInt();
         var response_member_epoch = req.member_epoch;
+        var assignment: ?Resp.Assignment = null;
+        defer if (assignment) |*owned| self.freeShareGroupHeartbeatAssignment(owned);
         if (error_code == @intFromEnum(ErrorCode.none) and (subscriptions != null or req.rack_id != null)) {
-            const previous_snapshot = self.encodeConsumerGroupSnapshotRecordValue() catch return null;
+            const previous_snapshot = self.encodeConsumerGroupSnapshotRecordValue() catch |err| {
+                log.warn("ShareGroupHeartbeat member-metadata rollback snapshot failed for {s}: {}", .{ group_id, err });
+                return self.shareGroupHeartbeatErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error, null, req.member_id, req.member_epoch);
+            };
             defer self.allocator.free(previous_snapshot);
 
             var changed = false;
@@ -16927,7 +16929,7 @@ pub const Broker = struct {
                     log.warn("ShareGroupHeartbeat rack update failed for {s}: {}", .{ group_id, err });
                     self.restoreConsumerGroupsAfterFailedMutation(previous_snapshot);
                     const resp = shareGroupHeartbeatResponse(ErrorCode.kafka_storage_error.toInt(), null, req.member_id, req.member_epoch, 0);
-                    return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+                    return self.serializeShareGroupHeartbeatResponseOrStorageError(req_header, resp_header_version, api_version, &resp, req.member_id, req.member_epoch);
                 }) or changed;
             }
             if (subscriptions) |topics| {
@@ -16935,7 +16937,7 @@ pub const Broker = struct {
                     log.warn("ShareGroupHeartbeat subscription update failed for {s}: {}", .{ group_id, err });
                     self.restoreConsumerGroupsAfterFailedMutation(previous_snapshot);
                     const resp = shareGroupHeartbeatResponse(ErrorCode.kafka_storage_error.toInt(), null, req.member_id, req.member_epoch, 0);
-                    return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+                    return self.serializeShareGroupHeartbeatResponseOrStorageError(req_header, resp_header_version, api_version, &resp, req.member_id, req.member_epoch);
                 }) or changed;
             }
             changed = self.markShareGroupStable(group_id) or changed;
@@ -16943,23 +16945,27 @@ pub const Broker = struct {
                 if (self.groups.groups.getPtr(group_id)) |group| {
                     response_member_epoch = group.generation_id;
                 }
+                assignment = self.buildShareGroupHeartbeatAssignment(group_id, member_id) catch |err| {
+                    log.warn("Failed to build ShareGroupHeartbeat assignment for {s}: {}", .{ group_id, err });
+                    self.restoreConsumerGroupsAfterFailedMutation(previous_snapshot);
+                    const resp = shareGroupHeartbeatResponse(ErrorCode.kafka_storage_error.toInt(), null, req.member_id, req.member_epoch, 0);
+                    return self.serializeShareGroupHeartbeatResponseOrStorageError(req_header, resp_header_version, api_version, &resp, req.member_id, req.member_epoch);
+                };
                 self.persistConsumerGroupsDurably() catch |err| {
                     log.warn("ShareGroupHeartbeat member metadata snapshot write failed for {s}: {}", .{ group_id, err });
                     self.restoreConsumerGroupsAfterFailedMutation(previous_snapshot);
                     const resp = shareGroupHeartbeatResponse(ErrorCode.kafka_storage_error.toInt(), null, req.member_id, req.member_epoch, 0);
-                    return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+                    return self.serializeShareGroupHeartbeatResponseOrStorageError(req_header, resp_header_version, api_version, &resp, req.member_id, req.member_epoch);
                 };
             }
         }
 
-        var assignment = if (error_code == @intFromEnum(ErrorCode.none))
-            self.buildShareGroupHeartbeatAssignment(group_id, member_id) catch |err| blk: {
+        if (error_code == @intFromEnum(ErrorCode.none) and assignment == null) {
+            assignment = self.buildShareGroupHeartbeatAssignment(group_id, member_id) catch |err| {
                 log.warn("Failed to build ShareGroupHeartbeat assignment for {s}: {}", .{ group_id, err });
-                break :blk null;
-            }
-        else
-            null;
-        defer if (assignment) |*owned| self.freeShareGroupHeartbeatAssignment(owned);
+                return self.shareGroupHeartbeatErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error, null, req.member_id, req.member_epoch);
+            };
+        }
 
         var resp = shareGroupHeartbeatResponse(
             error_code,
@@ -16969,7 +16975,7 @@ pub const Broker = struct {
             if (error_code == @intFromEnum(ErrorCode.none)) share_group_heartbeat_interval_ms else 0,
         );
         resp.assignment = assignment;
-        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+        return self.serializeShareGroupHeartbeatResponseOrStorageError(req_header, resp_header_version, api_version, &resp, req.member_id, response_member_epoch);
     }
 
     const share_group_heartbeat_interval_ms: i32 = 3000;
@@ -16983,6 +16989,29 @@ pub const Broker = struct {
             .member_epoch = member_epoch,
             .heartbeat_interval_ms = heartbeat_interval_ms,
             .assignment = null,
+        };
+    }
+
+    fn serializeShareGroupHeartbeatResponseOrStorageError(
+        self: *Broker,
+        req_header: *const RequestHeader,
+        resp_header_version: i16,
+        api_version: i16,
+        resp: *const generated.share_group_heartbeat_response.ShareGroupHeartbeatResponse,
+        fallback_member_id: ?[]const u8,
+        fallback_member_epoch: i32,
+    ) ?[]u8 {
+        return self.serializeGeneratedResponse(req_header, resp_header_version, resp, api_version) orelse {
+            log.warn("ShareGroupHeartbeat response serialization failed", .{});
+            return self.shareGroupHeartbeatErrorResponse(
+                req_header,
+                resp_header_version,
+                api_version,
+                ErrorCode.kafka_storage_error,
+                "Failed to serialize ShareGroupHeartbeat response",
+                fallback_member_id,
+                fallback_member_epoch,
+            );
         };
     }
 
@@ -32059,6 +32088,23 @@ fn freeDeserializedShareGroupHeartbeatResponse(resp: *const generated.share_grou
         }
         if (assignment.topic_partitions.len > 0) testing.allocator.free(assignment.topic_partitions);
     }
+}
+
+fn expectShareGroupHeartbeatErrorResponseBytes(response: []const u8, correlation_id: i32, err_code: ErrorCode) !void {
+    const Resp = generated.share_group_heartbeat_response.ShareGroupHeartbeatResponse;
+
+    var rpos: usize = 0;
+    var response_header = try ResponseHeader.deserialize(testing.allocator, response, &rpos, header_mod.responseHeaderVersion(76, 0));
+    defer response_header.deinit(testing.allocator);
+    try testing.expectEqual(correlation_id, response_header.correlation_id);
+
+    const resp = try Resp.deserialize(testing.allocator, response, &rpos, 0);
+    defer freeDeserializedShareGroupHeartbeatResponse(&resp);
+
+    try testing.expectEqual(response.len, rpos);
+    try testing.expectEqual(@as(i32, 0), resp.throttle_time_ms);
+    try testing.expectEqual(@as(i16, @intFromEnum(err_code)), resp.error_code);
+    try testing.expect(resp.assignment == null);
 }
 
 fn freeDeserializedShareGroupDescribeResponse(resp: *const generated.share_group_describe_response.ShareGroupDescribeResponse) void {
@@ -64514,6 +64560,178 @@ test "Broker.handleRequest ShareGroupHeartbeat rejects malformed request" {
     try testing.expectEqual(ErrorCode.invalid_request.toInt(), resp.error_code);
     try testing.expectEqualStrings("malformed ShareGroupHeartbeat request", resp.error_message.?);
     try testing.expect(resp.assignment == null);
+}
+
+test "Broker.handleRequest ShareGroupHeartbeat fails closed when join snapshot materialization fails" {
+    const Req = generated.share_group_heartbeat_request.ShareGroupHeartbeatRequest;
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+
+    const req = Req{
+        .group_id = "share-heartbeat-join-snapshot-oom-group",
+        .member_id = "share-member",
+        .member_epoch = 0,
+    };
+
+    var buf: [256]u8 = undefined;
+    var pos = buildTestRequest(&buf, 76, 0, 7611, header_mod.requestHeaderVersion(76, 0));
+    req.serialize(&buf, &pos, 0);
+
+    var failing_allocator = OneShotFailingAllocator.init(testing.allocator, 0);
+    const response_allocator = failing_allocator.allocator();
+    broker.allocator = response_allocator;
+
+    const response = broker.handleRequest(buf[0..pos]);
+    broker.allocator = testing.allocator;
+
+    defer if (response) |bytes| response_allocator.free(bytes);
+    try testing.expect(failing_allocator.failed);
+    try testing.expect(response != null);
+    try expectShareGroupHeartbeatErrorResponseBytes(response.?, 7611, ErrorCode.kafka_storage_error);
+    try testing.expect(!broker.groups.groups.contains("share-heartbeat-join-snapshot-oom-group"));
+}
+
+test "Broker.handleRequest ShareGroupHeartbeat fails closed when member update snapshot materialization fails" {
+    const Req = generated.share_group_heartbeat_request.ShareGroupHeartbeatRequest;
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+
+    const subscriptions = [_][]const u8{};
+    const joined = try broker.groups.joinGroupWithProtocol("share-heartbeat-update-snapshot-oom-group", "share-member", null, "share", "range", null, &subscriptions);
+    try testing.expectEqual(ErrorCode.none.toInt(), joined.error_code);
+    try testing.expect(broker.markShareGroupStable("share-heartbeat-update-snapshot-oom-group"));
+    _ = try broker.groups.updateMemberRackIfChanged("share-heartbeat-update-snapshot-oom-group", "share-member", "rack-a");
+
+    const req = Req{
+        .group_id = "share-heartbeat-update-snapshot-oom-group",
+        .member_id = "share-member",
+        .member_epoch = joined.generation_id,
+        .rack_id = "rack-b",
+    };
+
+    var buf: [256]u8 = undefined;
+    var pos = buildTestRequest(&buf, 76, 0, 7612, header_mod.requestHeaderVersion(76, 0));
+    req.serialize(&buf, &pos, 0);
+
+    var failing_allocator = OneShotFailingAllocator.init(testing.allocator, 0);
+    const response_allocator = failing_allocator.allocator();
+    broker.allocator = response_allocator;
+
+    const response = broker.handleRequest(buf[0..pos]);
+    broker.allocator = testing.allocator;
+
+    defer if (response) |bytes| response_allocator.free(bytes);
+    try testing.expect(failing_allocator.failed);
+    try testing.expect(response != null);
+    try expectShareGroupHeartbeatErrorResponseBytes(response.?, 7612, ErrorCode.kafka_storage_error);
+
+    const group = broker.groups.groups.getPtr("share-heartbeat-update-snapshot-oom-group") orelse return error.ExpectedShareGroup;
+    const member = group.members.getPtr("share-member") orelse return error.ExpectedShareMember;
+    try testing.expectEqualStrings("rack-a", member.rack_id.?);
+}
+
+test "Broker.handleRequest ShareGroupHeartbeat fails closed when assignment materialization fails" {
+    const Req = generated.share_group_heartbeat_request.ShareGroupHeartbeatRequest;
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+    try testing.expect(broker.ensureTopic("share-heartbeat-assignment-oom-topic"));
+
+    const subscriptions = [_][]const u8{"share-heartbeat-assignment-oom-topic"};
+    const joined = try broker.groups.joinGroupWithProtocol("share-heartbeat-assignment-oom-group", "share-member", null, "share", "range", null, &subscriptions);
+    try testing.expectEqual(ErrorCode.none.toInt(), joined.error_code);
+    try testing.expect(broker.markShareGroupStable("share-heartbeat-assignment-oom-group"));
+
+    const req = Req{
+        .group_id = "share-heartbeat-assignment-oom-group",
+        .member_id = "share-member",
+        .member_epoch = joined.generation_id,
+    };
+
+    var buf: [256]u8 = undefined;
+    var pos = buildTestRequest(&buf, 76, 0, 7613, header_mod.requestHeaderVersion(76, 0));
+    req.serialize(&buf, &pos, 0);
+
+    var failing_allocator = OneShotFailingAllocator.init(testing.allocator, 0);
+    const response_allocator = failing_allocator.allocator();
+    broker.allocator = response_allocator;
+
+    const response = broker.handleRequest(buf[0..pos]);
+    broker.allocator = testing.allocator;
+
+    defer if (response) |bytes| response_allocator.free(bytes);
+    try testing.expect(failing_allocator.failed);
+    try testing.expect(response != null);
+    try expectShareGroupHeartbeatErrorResponseBytes(response.?, 7613, ErrorCode.kafka_storage_error);
+    try testing.expect(broker.groups.groups.contains("share-heartbeat-assignment-oom-group"));
+}
+
+test "Broker.handleRequest ShareGroupHeartbeat fails closed when leave snapshot materialization fails" {
+    const Req = generated.share_group_heartbeat_request.ShareGroupHeartbeatRequest;
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+
+    const subscriptions = [_][]const u8{};
+    const joined = try broker.groups.joinGroupWithProtocol("share-heartbeat-leave-snapshot-oom-group", "share-member", null, "share", "range", null, &subscriptions);
+    try testing.expectEqual(ErrorCode.none.toInt(), joined.error_code);
+    try testing.expect(broker.markShareGroupStable("share-heartbeat-leave-snapshot-oom-group"));
+
+    const req = Req{
+        .group_id = "share-heartbeat-leave-snapshot-oom-group",
+        .member_id = "share-member",
+        .member_epoch = -1,
+    };
+
+    var buf: [256]u8 = undefined;
+    var pos = buildTestRequest(&buf, 76, 0, 7614, header_mod.requestHeaderVersion(76, 0));
+    req.serialize(&buf, &pos, 0);
+
+    var failing_allocator = OneShotFailingAllocator.init(testing.allocator, 0);
+    const response_allocator = failing_allocator.allocator();
+    broker.allocator = response_allocator;
+
+    const response = broker.handleRequest(buf[0..pos]);
+    broker.allocator = testing.allocator;
+
+    defer if (response) |bytes| response_allocator.free(bytes);
+    try testing.expect(failing_allocator.failed);
+    try testing.expect(response != null);
+    try expectShareGroupHeartbeatErrorResponseBytes(response.?, 7614, ErrorCode.kafka_storage_error);
+
+    const group = broker.groups.groups.getPtr("share-heartbeat-leave-snapshot-oom-group") orelse return error.ExpectedShareGroup;
+    try testing.expect(group.members.contains("share-member"));
+}
+
+test "Broker.handleRequest ShareGroupHeartbeat fails closed when response serialization fails" {
+    const Req = generated.share_group_heartbeat_request.ShareGroupHeartbeatRequest;
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+
+    const req = Req{
+        .group_id = "share-heartbeat-serialization-oom-group",
+        .member_id = "share-member",
+        .member_epoch = -2,
+    };
+
+    var buf: [256]u8 = undefined;
+    var pos = buildTestRequest(&buf, 76, 0, 7615, header_mod.requestHeaderVersion(76, 0));
+    req.serialize(&buf, &pos, 0);
+
+    var failing_allocator = OneShotFailingAllocator.init(testing.allocator, 0);
+    const response_allocator = failing_allocator.allocator();
+    broker.allocator = response_allocator;
+
+    const response = broker.handleRequest(buf[0..pos]);
+    broker.allocator = testing.allocator;
+
+    defer if (response) |bytes| response_allocator.free(bytes);
+    try testing.expect(failing_allocator.failed);
+    try testing.expect(response != null);
+    try expectShareGroupHeartbeatErrorResponseBytes(response.?, 7615, ErrorCode.kafka_storage_error);
 }
 
 test "Broker.handleRequest ShareGroupHeartbeat leave rolls back when session cleanup persistence fails" {
