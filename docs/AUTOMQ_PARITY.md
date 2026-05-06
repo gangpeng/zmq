@@ -667,10 +667,11 @@ Status: completed for the initial catalog and DeleteGroups slice.
   with generated invalid-request or storage-error responses when denied frames
   are malformed or denial response construction fails.
   Normal ListOffsets, ListGroups, DescribeGroups, ConsumerGroupDescribe,
-  Heartbeat, and DescribeConfigs request paths now also return generated
-  invalid-request or storage-error responses when client frames are malformed
-  or response materialization/serialization fails, instead of silently dropping
-  the connection.
+  Heartbeat, DescribeConfigs, DescribeTransactions, and ListTransactions
+  request paths now also return generated invalid-request or storage-error
+  responses when client frames are malformed or response
+  materialization/serialization fails, instead of silently dropping the
+  connection.
   Committed-offset authorization-denial builders for OffsetCommit,
   OffsetFetch, and OffsetDelete now also fail closed with generated
   invalid-request or storage-error responses when denied frames are malformed or

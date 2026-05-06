@@ -26032,7 +26032,10 @@ pub const Broker = struct {
             .throttle_time_ms = 0,
             .transaction_states = transaction_states,
         };
-        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version) orelse {
+            log.warn("DescribeTransactions response serialization failed", .{});
+            return self.describeTransactionsErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error);
+        };
     }
 
     fn describeTransactionsErrorResponse(self: *Broker, req_header: *const RequestHeader, resp_header_version: i16, api_version: i16, err_code: ErrorCode) ?[]u8 {
@@ -26228,7 +26231,10 @@ pub const Broker = struct {
             .unknown_state_filters = unknown_state_filters,
             .transaction_states = transaction_states,
         };
-        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version) orelse {
+            log.warn("ListTransactions response serialization failed", .{});
+            return self.listTransactionsErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error);
+        };
     }
 
     fn listTransactionsErrorResponse(self: *Broker, req_header: *const RequestHeader, resp_header_version: i16, api_version: i16, err_code: ErrorCode) ?[]u8 {
@@ -38356,6 +38362,33 @@ test "Broker.handleRequest ListTransactions fails closed when unknown-state mate
     try testing.expectEqual(@as(usize, 0), resp.transaction_states.len);
 }
 
+test "Broker.handleRequest ListTransactions fails closed when response serialization fails" {
+    const Req = generated.list_transactions_request.ListTransactionsRequest;
+    const Resp = generated.list_transactions_response.ListTransactionsResponse;
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+
+    const req = Req{};
+    var buf: [128]u8 = undefined;
+    var pos = buildTestRequest(&buf, 66, 1, 6606, header_mod.requestHeaderVersion(66, 1));
+    req.serialize(&buf, &pos, 1);
+
+    var failing_allocator = OneShotFailingAllocator.init(testing.allocator, 0);
+    const response_allocator = failing_allocator.allocator();
+    broker.allocator = response_allocator;
+
+    const response = broker.handleRequest(buf[0..pos]);
+    broker.allocator = testing.allocator;
+
+    try testing.expect(failing_allocator.failed);
+    try testing.expect(response != null);
+    defer response_allocator.free(response.?);
+
+    const error_code = try readGeneratedTopLevelErrorCode(Resp, response.?, 66, 1, 6606);
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.kafka_storage_error)), error_code);
+}
+
 test "Broker.handleRequest ListTransactions authorization denial uses generated response" {
     const Req = generated.list_transactions_request.ListTransactionsRequest;
     const Resp = generated.list_transactions_response.ListTransactionsResponse;
@@ -38749,6 +38782,31 @@ test "Broker.handleRequest DescribeTransactions fails closed when state material
     defer response_allocator.free(response.?);
 
     try expectDescribeTransactionsErrorResponseBytes(response.?, 6505, ErrorCode.kafka_storage_error);
+}
+
+test "Broker.handleRequest DescribeTransactions fails closed when response serialization fails" {
+    const Req = generated.describe_transactions_request.DescribeTransactionsRequest;
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+
+    const req = Req{ .transactional_ids = &.{} };
+    var buf: [128]u8 = undefined;
+    var pos = buildTestRequest(&buf, 65, 0, 6506, header_mod.requestHeaderVersion(65, 0));
+    req.serialize(&buf, &pos, 0);
+
+    var failing_allocator = OneShotFailingAllocator.init(testing.allocator, 0);
+    const response_allocator = failing_allocator.allocator();
+    broker.allocator = response_allocator;
+
+    const response = broker.handleRequest(buf[0..pos]);
+    broker.allocator = testing.allocator;
+
+    try testing.expect(failing_allocator.failed);
+    try testing.expect(response != null);
+    defer response_allocator.free(response.?);
+
+    try expectDescribeTransactionsErrorResponseBytes(response.?, 6506, ErrorCode.kafka_storage_error);
 }
 
 fn initTxnOffsetCommitForTest(broker: *Broker, transactional_id: []const u8, group_id: []const u8) !TxnCoordinator.InitProducerIdResult {
