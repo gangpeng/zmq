@@ -965,6 +965,91 @@ def wait_for_delete_records_checkpoint(
     )
 
 
+def parse_create_partitions_response(response, correlation_id):
+    pos = parse_flexible_response_header(response, correlation_id)
+    throttle_time_ms, pos = read_i32(response, pos)
+    result_count, pos = read_compact_array_len(response, pos)
+    results = []
+    for _ in range(result_count):
+        topic_name, pos = read_compact_string(response, pos)
+        error_code, pos = read_i16(response, pos)
+        error_message, pos = read_compact_string(response, pos)
+        pos = skip_tags(response, pos)
+        results.append(
+            {
+                "name": topic_name,
+                "error_code": error_code,
+                "error_message": error_message,
+            }
+        )
+    pos = skip_tags(response, pos)
+    if pos != len(response):
+        raise TestError(
+            f"CreatePartitions response trailing bytes: {len(response) - pos}"
+        )
+    return {"throttle_time_ms": throttle_time_ms, "results": results}
+
+
+def create_partitions(port, topic, count, validate_only, correlation_id):
+    body = write_compact_array_len(1)
+    body += write_compact_string(topic)
+    body += struct.pack(">i", count)
+    body += b"\x00"  # null assignments
+    body += b"\x00"  # topic tagged fields
+    body += struct.pack(">i", 30000)
+    body += b"\x01" if validate_only else b"\x00"
+    body += b"\x00"  # request tagged fields
+    response = flexible_kafka_request(port, 37, 2, correlation_id, body)
+    return parse_create_partitions_response(response, correlation_id)
+
+
+def require_create_partitions_success(response, topic):
+    if response["throttle_time_ms"] != 0:
+        raise TestError(f"CreatePartitions throttle mismatch: {response}")
+    results = response["results"]
+    if len(results) != 1 or results[0]["name"] != topic:
+        raise TestError(f"CreatePartitions topic mismatch: {response}")
+    result = results[0]
+    if result["error_code"] != 0 or result["error_message"] is not None:
+        raise TestError(f"CreatePartitions result mismatch: {response}")
+
+
+def wait_for_create_partitions_mutation(port, topic, count, timeout=30):
+    deadline = time.time() + timeout
+    correlation_id = 8330
+    last_error = None
+    while time.time() < deadline:
+        try:
+            response = create_partitions(port, topic, count, False, correlation_id)
+            require_create_partitions_success(response, topic)
+            return
+        except Exception as exc:
+            last_error = exc
+        correlation_id += 1
+        time.sleep(0.25)
+    raise TestError(f"CreatePartitions did not expand {topic!r}: {last_error}")
+
+
+def wait_for_create_partitions_validate_only_checkpoint(
+    port, topic, count, timeout=30
+):
+    deadline = time.time() + timeout
+    correlation_id = 8360
+    last_error = None
+    while time.time() < deadline:
+        try:
+            response = create_partitions(port, topic, count, True, correlation_id)
+            require_create_partitions_success(response, topic)
+            return
+        except Exception as exc:
+            last_error = exc
+        correlation_id += 1
+        time.sleep(0.25)
+    raise TestError(
+        f"CreatePartitions validate-only did not recover for {topic!r}: {last_error}"
+    )
+
+
 def parse_describe_configs_response(response, correlation_id):
     pos = parse_flexible_response_header(response, correlation_id)
     throttle_time_ms, pos = read_i32(response, pos)
@@ -1596,6 +1681,54 @@ def wait_for_describe_topic_partitions_checkpoint(
         time.sleep(0.25)
     raise TestError(
         f"DescribeTopicPartitions did not recover for {topic!r}: {last_error}"
+    )
+
+
+def wait_for_describe_topic_partitions_count_checkpoint(
+    port, topic, expected_leader_id, expected_partition_count, timeout=30
+):
+    deadline = time.time() + timeout
+    correlation_id = 8425
+    last_error = None
+    while time.time() < deadline:
+        try:
+            response = describe_topic_partitions(port, topic, correlation_id)
+            topics = response["topics"]
+            if response["next_cursor"] is not None:
+                raise TestError(f"DescribeTopicPartitions unexpected cursor: {response}")
+            if len(topics) != 1 or topics[0]["name"] != topic:
+                raise TestError(f"DescribeTopicPartitions topic mismatch: {response}")
+            topic_result = topics[0]
+            if topic_result["error_code"] != 0:
+                raise TestError(f"DescribeTopicPartitions topic error: {response}")
+            partitions = topic_result["partitions"]
+            if len(partitions) != expected_partition_count:
+                raise TestError(
+                    f"DescribeTopicPartitions partition count mismatch: {response}"
+                )
+            seen = set()
+            for partition in partitions:
+                if partition["error_code"] != 0:
+                    raise TestError(f"DescribeTopicPartitions partition error: {response}")
+                if partition["leader_id"] != expected_leader_id:
+                    raise TestError(
+                        f"DescribeTopicPartitions leader={partition} "
+                        f"expected={expected_leader_id}"
+                    )
+                if expected_leader_id not in partition["replica_nodes"]:
+                    raise TestError(f"DescribeTopicPartitions replicas={response}")
+                if expected_leader_id not in partition["isr_nodes"]:
+                    raise TestError(f"DescribeTopicPartitions isr={response}")
+                seen.add(partition["partition_index"])
+            if seen != set(range(expected_partition_count)):
+                raise TestError(f"DescribeTopicPartitions indexes={seen}: {response}")
+            return
+        except Exception as exc:
+            last_error = exc
+        correlation_id += 1
+        time.sleep(0.25)
+    raise TestError(
+        f"DescribeTopicPartitions count did not recover for {topic!r}: {last_error}"
     )
 
 
@@ -7956,6 +8089,7 @@ def main():
         txn_topic = f"{topic}-txn"
         idempotent_topic = f"{topic}-idempotent"
         delete_records_topic = f"{topic}-delete-records"
+        create_partitions_topic = f"{topic}-create-partitions"
         kip848_subscription_topic = f"{topic}-kip848-subscription"
         kip848_negative_group_prefix = f"{group}-kip848-negative"
         expected_payloads = []
@@ -7963,6 +8097,7 @@ def main():
         wait_for_topic(broker["port"], txn_topic)
         wait_for_topic(broker["port"], idempotent_topic)
         wait_for_topic(broker["port"], delete_records_topic)
+        wait_for_topic(broker["port"], create_partitions_topic)
         wait_for_topic(broker["port"], kip848_subscription_topic)
         expected_payloads.append(b"r0")
         first_offset = wait_for_produce(broker["port"], topic, expected_payloads[-1])
@@ -8007,8 +8142,22 @@ def main():
                 100,
             )
 
+        def wait_for_create_partitions_probe():
+            wait_for_create_partitions_validate_only_checkpoint(
+                broker["port"],
+                create_partitions_topic,
+                3,
+            )
+            wait_for_describe_topic_partitions_count_checkpoint(
+                broker["port"],
+                create_partitions_topic,
+                100,
+                2,
+            )
+
         def wait_for_cluster_visibility_probes():
             wait_for_topic_partitions_probe()
+            wait_for_create_partitions_probe()
             wait_for_describe_configs_checkpoint(
                 broker["port"],
                 topic,
@@ -8038,8 +8187,14 @@ def main():
                 CLUSTER_ID,
             )
 
-        wait_for_cluster_visibility_probes()
+        wait_for_topic_partitions_probe()
         wait_for_delete_records_probe()
+        wait_for_create_partitions_mutation(
+            broker["port"],
+            create_partitions_topic,
+            2,
+        )
+        wait_for_cluster_visibility_probes()
         wait_for_offset_commit(broker["port"], group, topic, committed_offset)
         offset_delete_group_state = wait_for_group_stable(
             broker["port"],
@@ -9146,6 +9301,7 @@ def main():
             f"offset_fetch_v8_grouped_checked=true, "
             f"log_position_apis_checked=true, "
             f"delete_records_checked=true, "
+            f"create_partitions_checked=true, "
             f"describe_topic_partitions_checked=true, "
             f"describe_configs_checked=true, "
             f"describe_log_dirs_checked=true, "
@@ -9441,6 +9597,27 @@ def self_test():
         ):
             raise TestError(
                 f"DeleteRecords fixture parser failed: {deleted_records}"
+            )
+
+        create_partitions_fixture = struct.pack(">i", 165)
+        create_partitions_fixture += b"\x00"  # response header tagged fields
+        create_partitions_fixture += struct.pack(">i", 0)
+        create_partitions_fixture += write_compact_array_len(1)
+        create_partitions_fixture += write_compact_string("create-parts-self-test")
+        create_partitions_fixture += struct.pack(">h", 0)
+        create_partitions_fixture += write_compact_string(None)
+        create_partitions_fixture += b"\x00"  # topic tagged fields
+        create_partitions_fixture += b"\x00"  # response tagged fields
+        created_partitions = parse_create_partitions_response(
+            create_partitions_fixture, 165
+        )
+        if (
+            created_partitions["results"][0]["name"] != "create-parts-self-test"
+            or created_partitions["results"][0]["error_code"] != 0
+            or created_partitions["results"][0]["error_message"] is not None
+        ):
+            raise TestError(
+                f"CreatePartitions fixture parser failed: {created_partitions}"
             )
 
         describe_configs_fixture = struct.pack(">i", 166)
