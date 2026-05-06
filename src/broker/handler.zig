@@ -21440,21 +21440,23 @@ pub const Broker = struct {
 
         if (!validateDescribeClientQuotasRequestFrame(request_bytes, body_start, api_version)) {
             log.warn("Malformed DescribeClientQuotas request", .{});
-            return null;
+            return self.describeClientQuotasErrorResponse(req_header, resp_header_version, api_version, ErrorCode.invalid_request, "Invalid request");
         }
 
         var pos = body_start;
         var req = Req.deserialize(self.allocator, request_bytes, &pos, api_version) catch |err| {
             log.warn("Failed to decode DescribeClientQuotas request: {}", .{err});
-            return null;
+            return self.describeClientQuotasErrorResponse(req_header, resp_header_version, api_version, ErrorCode.invalid_request, "Invalid request");
         };
         defer self.freeDescribeClientQuotasRequest(&req);
 
         const request_error = describeClientQuotasRequestError(req);
-        const entries: ?[]const Resp.EntryData = if (request_error == @intFromEnum(ErrorCode.none))
-            (self.collectDescribeClientQuotaEntries(req) catch return null)
-        else
-            null;
+        const entries: ?[]const Resp.EntryData = if (request_error == @intFromEnum(ErrorCode.none)) blk: {
+            break :blk self.collectDescribeClientQuotaEntries(req) catch |err| {
+                log.warn("DescribeClientQuotas response materialization failed: {}", .{err});
+                return self.describeClientQuotasErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error, "Failed to materialize client quota response");
+            };
+        } else null;
         defer if (entries) |response_entries| {
             if (response_entries.len > 0) self.freeDescribeClientQuotaEntries(response_entries);
         };
@@ -21464,6 +21466,17 @@ pub const Broker = struct {
             .error_code = request_error,
             .error_message = if (request_error == @intFromEnum(ErrorCode.none)) null else "Invalid client quota filter",
             .entries = entries,
+        };
+        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+    }
+
+    fn describeClientQuotasErrorResponse(self: *Broker, req_header: *const RequestHeader, resp_header_version: i16, api_version: i16, err_code: ErrorCode, message: ?[]const u8) ?[]u8 {
+        const Resp = generated.describe_client_quotas_response.DescribeClientQuotasResponse;
+        const resp = Resp{
+            .throttle_time_ms = 0,
+            .error_code = @intFromEnum(err_code),
+            .error_message = message,
+            .entries = null,
         };
         return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
     }
@@ -39304,16 +39317,34 @@ test "Broker.handleRequest DescribeClientQuotas rejects invalid match type" {
 }
 
 test "Broker.handleRequest DescribeClientQuotas rejects truncated request" {
+    const Resp = generated.describe_client_quotas_response.DescribeClientQuotasResponse;
+
     var broker = Broker.init(testing.allocator, 1, 9092);
     defer broker.deinit();
 
     var buf: [128]u8 = undefined;
     const req_len = buildTestRequest(&buf, 48, 1, 4803, header_mod.requestHeaderVersion(48, 1));
-    try testing.expect(broker.handleRequest(buf[0..req_len]) == null);
+    const response = broker.handleRequest(buf[0..req_len]);
+    try testing.expect(response != null);
+    defer testing.allocator.free(response.?);
+
+    var rpos: usize = 0;
+    var response_header = try ResponseHeader.deserialize(testing.allocator, response.?, &rpos, header_mod.responseHeaderVersion(48, 1));
+    defer response_header.deinit(testing.allocator);
+    try testing.expectEqual(@as(i32, 4803), response_header.correlation_id);
+
+    const resp = try Resp.deserialize(testing.allocator, response.?, &rpos, 1);
+    defer freeDeserializedDescribeClientQuotasResponse(&resp);
+
+    try testing.expectEqual(response.?.len, rpos);
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.invalid_request)), resp.error_code);
+    try testing.expect(resp.error_message != null);
+    try testing.expect(resp.entries == null);
 }
 
 test "Broker.handleRequest DescribeClientQuotas rejects trailing bytes" {
     const Req = generated.describe_client_quotas_request.DescribeClientQuotasRequest;
+    const Resp = generated.describe_client_quotas_response.DescribeClientQuotasResponse;
 
     var broker = Broker.init(testing.allocator, 1, 9092);
     defer broker.deinit();
@@ -39323,7 +39354,46 @@ test "Broker.handleRequest DescribeClientQuotas rejects trailing bytes" {
     var pos = buildTestRequest(&buf, 48, 1, 4805, header_mod.requestHeaderVersion(48, 1));
     req.serialize(&buf, &pos, 1);
 
-    try expectTrailingByteRejected(&broker, buf[0..], pos);
+    try expectTrailingByteRejectedWithGeneratedResponse(Resp, &broker, buf[0..], pos, 48, 1, 4805);
+}
+
+test "Broker.handleRequest DescribeClientQuotas fails closed when response materialization fails" {
+    const Req = generated.describe_client_quotas_request.DescribeClientQuotasRequest;
+    const Resp = generated.describe_client_quotas_response.DescribeClientQuotasResponse;
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+    try broker.authorizer.addSuperUser("test-client");
+    broker.quota_manager.setDefaults(1000.0, 0.0, 0.0);
+
+    const req = Req{};
+    var buf: [128]u8 = undefined;
+    var pos = buildTestRequest(&buf, 48, 1, 4806, header_mod.requestHeaderVersion(48, 1));
+    req.serialize(&buf, &pos, 1);
+
+    var failing_allocator = OneShotFailingAllocator.init(testing.allocator, 0);
+    const response_allocator = failing_allocator.allocator();
+    broker.allocator = response_allocator;
+
+    const response = broker.handleRequest(buf[0..pos]);
+    broker.allocator = testing.allocator;
+
+    try testing.expect(failing_allocator.failed);
+    try testing.expect(response != null);
+    defer response_allocator.free(response.?);
+
+    var rpos: usize = 0;
+    var response_header = try ResponseHeader.deserialize(testing.allocator, response.?, &rpos, header_mod.responseHeaderVersion(48, 1));
+    defer response_header.deinit(testing.allocator);
+    try testing.expectEqual(@as(i32, 4806), response_header.correlation_id);
+
+    const resp = try Resp.deserialize(testing.allocator, response.?, &rpos, 1);
+    defer freeDeserializedDescribeClientQuotasResponse(&resp);
+
+    try testing.expectEqual(response.?.len, rpos);
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.kafka_storage_error)), resp.error_code);
+    try testing.expect(resp.error_message != null);
+    try testing.expect(resp.entries == null);
 }
 
 test "Broker.handleRequest AlterClientQuotas v1 mutates quotas and DescribeClientQuotas reads them" {
