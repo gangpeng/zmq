@@ -635,6 +635,169 @@ def wait_for_record_batch_result(port, topic, record_batch, expected_error, time
     )
 
 
+def expected_topic_end_offset(first_offset, payloads):
+    return first_offset + len(payloads)
+
+
+def parse_list_offsets_response(response, correlation_id):
+    pos = parse_flexible_response_header(response, correlation_id)
+    _, pos = read_i32(response, pos)  # throttle_time_ms
+    topic_count, pos = read_compact_array_len(response, pos)
+    topics = []
+    for _ in range(topic_count):
+        topic_name, pos = read_compact_string(response, pos)
+        partition_count, pos = read_compact_array_len(response, pos)
+        partitions = []
+        for _ in range(partition_count):
+            partition_index, pos = read_i32(response, pos)
+            error_code, pos = read_i16(response, pos)
+            timestamp, pos = read_i64(response, pos)
+            offset, pos = read_i64(response, pos)
+            leader_epoch, pos = read_i32(response, pos)
+            pos = skip_tags(response, pos)
+            partitions.append(
+                {
+                    "partition_index": partition_index,
+                    "error_code": error_code,
+                    "timestamp": timestamp,
+                    "offset": offset,
+                    "leader_epoch": leader_epoch,
+                }
+            )
+        pos = skip_tags(response, pos)
+        topics.append({"name": topic_name, "partitions": partitions})
+    pos = skip_tags(response, pos)
+    if pos != len(response):
+        raise TestError(f"ListOffsets response trailing bytes: {len(response) - pos}")
+    return topics
+
+
+def list_offsets(port, topic, timestamp, correlation_id):
+    body = struct.pack(">i", -1)  # replica_id
+    body += struct.pack(">b", 0)  # isolation_level=read_uncommitted
+    body += write_compact_array_len(1)
+    body += write_compact_string(topic)
+    body += write_compact_array_len(1)
+    body += struct.pack(">iiq", 0, -1, timestamp)
+    body += b"\x00"  # partition tagged fields
+    body += b"\x00"  # topic tagged fields
+    body += b"\x00"  # request tagged fields
+    response = flexible_kafka_request(port, 2, 6, correlation_id, body)
+    return parse_list_offsets_response(response, correlation_id)
+
+
+def parse_offset_for_leader_epoch_response(response, correlation_id):
+    pos = parse_flexible_response_header(response, correlation_id)
+    _, pos = read_i32(response, pos)  # throttle_time_ms
+    topic_count, pos = read_compact_array_len(response, pos)
+    topics = []
+    for _ in range(topic_count):
+        topic_name, pos = read_compact_string(response, pos)
+        partition_count, pos = read_compact_array_len(response, pos)
+        partitions = []
+        for _ in range(partition_count):
+            error_code, pos = read_i16(response, pos)
+            partition, pos = read_i32(response, pos)
+            leader_epoch, pos = read_i32(response, pos)
+            end_offset, pos = read_i64(response, pos)
+            pos = skip_tags(response, pos)
+            partitions.append(
+                {
+                    "partition": partition,
+                    "error_code": error_code,
+                    "leader_epoch": leader_epoch,
+                    "end_offset": end_offset,
+                }
+            )
+        pos = skip_tags(response, pos)
+        topics.append({"name": topic_name, "partitions": partitions})
+    pos = skip_tags(response, pos)
+    if pos != len(response):
+        raise TestError(
+            f"OffsetForLeaderEpoch response trailing bytes: {len(response) - pos}"
+        )
+    return topics
+
+
+def offset_for_leader_epoch(port, topic, correlation_id):
+    body = struct.pack(">i", -1)  # replica_id
+    body += write_compact_array_len(1)
+    body += write_compact_string(topic)
+    body += write_compact_array_len(1)
+    body += struct.pack(">iii", 0, -1, 0)  # partition, current epoch, lookup epoch
+    body += b"\x00"  # partition tagged fields
+    body += b"\x00"  # topic tagged fields
+    body += b"\x00"  # request tagged fields
+    response = flexible_kafka_request(port, 23, 4, correlation_id, body)
+    return parse_offset_for_leader_epoch_response(response, correlation_id)
+
+
+def require_single_list_offsets_partition(topics, topic):
+    if len(topics) != 1 or topics[0]["name"] != topic:
+        raise TestError(f"ListOffsets topic mismatch: {topics}")
+    partitions = topics[0]["partitions"]
+    if len(partitions) != 1:
+        raise TestError(f"ListOffsets partition count mismatch: {topics}")
+    partition = partitions[0]
+    if partition["partition_index"] != 0 or partition["error_code"] != 0:
+        raise TestError(f"ListOffsets partition error: {topics}")
+    return partition
+
+
+def require_single_offset_for_leader_epoch_partition(topics, topic):
+    if len(topics) != 1 or topics[0]["name"] != topic:
+        raise TestError(f"OffsetForLeaderEpoch topic mismatch: {topics}")
+    partitions = topics[0]["partitions"]
+    if len(partitions) != 1:
+        raise TestError(f"OffsetForLeaderEpoch partition count mismatch: {topics}")
+    partition = partitions[0]
+    if partition["partition"] != 0 or partition["error_code"] != 0:
+        raise TestError(f"OffsetForLeaderEpoch partition error: {topics}")
+    return partition
+
+
+def wait_for_log_position_checkpoint(
+    port, topic, expected_start_offset, expected_end_offset, timeout=30
+):
+    deadline = time.time() + timeout
+    correlation_id = 8200
+    last_error = None
+    while time.time() < deadline:
+        try:
+            earliest = require_single_list_offsets_partition(
+                list_offsets(port, topic, -2, correlation_id),
+                topic,
+            )
+            latest = require_single_list_offsets_partition(
+                list_offsets(port, topic, -1, correlation_id + 1),
+                topic,
+            )
+            epoch = require_single_offset_for_leader_epoch_partition(
+                offset_for_leader_epoch(port, topic, correlation_id + 2),
+                topic,
+            )
+            if earliest["offset"] != expected_start_offset:
+                raise TestError(
+                    f"ListOffsets earliest={earliest} expected={expected_start_offset}"
+                )
+            if latest["offset"] != expected_end_offset:
+                raise TestError(
+                    f"ListOffsets latest={latest} expected={expected_end_offset}"
+                )
+            if epoch["end_offset"] != expected_end_offset:
+                raise TestError(
+                    f"OffsetForLeaderEpoch end={epoch} expected={expected_end_offset}"
+                )
+            return
+        except Exception as exc:
+            last_error = exc
+        correlation_id += 3
+        time.sleep(0.25)
+    raise TestError(
+        f"log position APIs did not recover for {topic!r}: {last_error}"
+    )
+
+
 def parse_describe_producers_response(response, correlation_id):
     pos = parse_flexible_response_header(response, correlation_id)
     _, pos = read_i32(response, pos)  # throttle_time_ms
@@ -6873,6 +7036,12 @@ def main():
         first_offset = wait_for_produce(broker["port"], topic, expected_payloads[-1])
         committed_offset = first_offset + 1
         wait_for_payloads(broker["port"], topic, expected_payloads)
+        wait_for_log_position_checkpoint(
+            broker["port"],
+            topic,
+            first_offset,
+            expected_topic_end_offset(first_offset, expected_payloads),
+        )
         wait_for_offset_commit(broker["port"], group, topic, committed_offset)
         offset_delete_group_state = wait_for_group_stable(
             broker["port"],
@@ -7162,6 +7331,12 @@ def main():
         )
         if network_partition_result is not None:
             leader_id, initial = wait_for_leader(processes)
+        wait_for_log_position_checkpoint(
+            broker["port"],
+            topic,
+            first_offset,
+            expected_topic_end_offset(first_offset, expected_payloads),
+        )
         wait_for_committed_offset(broker["port"], group, topic, committed_offset)
         wait_for_committed_offset(broker["port"], offset_delete_group, topic, -1)
         wait_for_committed_offset_error(
@@ -7270,6 +7445,12 @@ def main():
 
         wait_for_all_alive_to_report(processes, replacement_leader)
         wait_for_payloads(broker["port"], topic, expected_payloads)
+        wait_for_log_position_checkpoint(
+            broker["port"],
+            topic,
+            first_offset,
+            expected_topic_end_offset(first_offset, expected_payloads),
+        )
         wait_for_committed_offset(broker["port"], group, topic, committed_offset)
         wait_for_committed_offset(broker["port"], offset_delete_group, topic, -1)
         wait_for_committed_offset_error(
@@ -7382,6 +7563,12 @@ def main():
             raise TestError(f"broker did not continue after failover: {second_offset} <= {first_offset}")
         wait_for_payloads(broker["port"], topic, expected_payloads)
         committed_offset = second_offset + 1
+        wait_for_log_position_checkpoint(
+            broker["port"],
+            topic,
+            first_offset,
+            expected_topic_end_offset(first_offset, expected_payloads),
+        )
         wait_for_offset_commit(broker["port"], group, topic, committed_offset)
         post_failover_txn = wait_for_transaction_begin(
             broker["port"],
@@ -7406,6 +7593,12 @@ def main():
             )
 
         wait_for_payloads(broker["port"], topic, expected_payloads)
+        wait_for_log_position_checkpoint(
+            broker["port"],
+            topic,
+            first_offset,
+            expected_topic_end_offset(first_offset, expected_payloads),
+        )
         wait_for_committed_offset(broker["port"], group, topic, committed_offset)
         wait_for_committed_offset(broker["port"], offset_delete_group, topic, -1)
         wait_for_committed_offset_error(
@@ -7511,6 +7704,12 @@ def main():
             )
         wait_for_payloads(broker["port"], topic, expected_payloads)
         committed_offset = third_offset + 1
+        wait_for_log_position_checkpoint(
+            broker["port"],
+            topic,
+            first_offset,
+            expected_topic_end_offset(first_offset, expected_payloads),
+        )
         wait_for_offset_commit(broker["port"], group, topic, committed_offset)
 
         alive = {node_id for node_id, info in processes.items() if info["proc"].poll() is None}
@@ -7538,6 +7737,12 @@ def main():
             )
 
         wait_for_payloads(broker["port"], topic, expected_payloads)
+        wait_for_log_position_checkpoint(
+            broker["port"],
+            topic,
+            first_offset,
+            expected_topic_end_offset(first_offset, expected_payloads),
+        )
         wait_for_committed_offset(broker["port"], group, topic, committed_offset)
         wait_for_committed_offset(broker["port"], offset_delete_group, topic, -1)
         wait_for_committed_offset_error(
@@ -7645,6 +7850,12 @@ def main():
             )
         wait_for_payloads(broker["port"], topic, expected_payloads)
         committed_offset = fourth_offset + 1
+        wait_for_log_position_checkpoint(
+            broker["port"],
+            topic,
+            first_offset,
+            expected_topic_end_offset(first_offset, expected_payloads),
+        )
         wait_for_offset_commit(broker["port"], group, topic, committed_offset)
         broker_restart_txn = wait_for_transaction_begin(
             broker["port"],
@@ -7656,6 +7867,12 @@ def main():
         broker = start_broker(tmp, voters)
         wait_for_broker_ready(broker["proc"], broker["port"], broker["log_path"])
         wait_for_payloads(broker["port"], topic, expected_payloads)
+        wait_for_log_position_checkpoint(
+            broker["port"],
+            topic,
+            first_offset,
+            expected_topic_end_offset(first_offset, expected_payloads),
+        )
         wait_for_committed_offset(broker["port"], group, topic, committed_offset)
         wait_for_committed_offset(broker["port"], offset_delete_group, topic, -1)
         wait_for_committed_offset_error(
@@ -7869,6 +8086,12 @@ def main():
             )
         wait_for_payloads(broker["port"], topic, expected_payloads)
         committed_offset = fifth_offset + 1
+        wait_for_log_position_checkpoint(
+            broker["port"],
+            topic,
+            first_offset,
+            expected_topic_end_offset(first_offset, expected_payloads),
+        )
         wait_for_offset_commit(broker["port"], group, topic, committed_offset)
         wait_for_offset_fetch_grouped_checkpoint(
             broker["port"],
@@ -7905,6 +8128,7 @@ def main():
             f"transaction_abort_checked=true, "
             f"txn_offset_commit_checked=true, "
             f"offset_fetch_v8_grouped_checked=true, "
+            f"log_position_apis_checked=true, "
             f"idempotent_producer_fencing=true, "
             f"describe_producers_checked=true, "
             f"delete_groups_checked=true, "
@@ -8126,6 +8350,46 @@ def self_test():
         identity = parse_init_producer_id_response(init_fixture, 44)
         if identity["producer_id"] != 1000 or identity["producer_epoch"] != 0:
             raise TestError(f"InitProducerId fixture parser failed: {identity}")
+
+        list_offsets_fixture = struct.pack(">i", 160)
+        list_offsets_fixture += b"\x00"  # response header tagged fields
+        list_offsets_fixture += struct.pack(">i", 0)
+        list_offsets_fixture += write_compact_array_len(1)
+        list_offsets_fixture += write_compact_string("offset-self-test")
+        list_offsets_fixture += write_compact_array_len(1)
+        list_offsets_fixture += struct.pack(">ihqqi", 0, 0, -1, 5, 3)
+        list_offsets_fixture += b"\x00"  # partition tagged fields
+        list_offsets_fixture += b"\x00"  # topic tagged fields
+        list_offsets_fixture += b"\x00"  # response tagged fields
+        listed_offsets = parse_list_offsets_response(list_offsets_fixture, 160)
+        if (
+            listed_offsets[0]["name"] != "offset-self-test"
+            or listed_offsets[0]["partitions"][0]["offset"] != 5
+            or listed_offsets[0]["partitions"][0]["leader_epoch"] != 3
+        ):
+            raise TestError(f"ListOffsets fixture parser failed: {listed_offsets}")
+
+        leader_epoch_fixture = struct.pack(">i", 161)
+        leader_epoch_fixture += b"\x00"  # response header tagged fields
+        leader_epoch_fixture += struct.pack(">i", 0)
+        leader_epoch_fixture += write_compact_array_len(1)
+        leader_epoch_fixture += write_compact_string("epoch-self-test")
+        leader_epoch_fixture += write_compact_array_len(1)
+        leader_epoch_fixture += struct.pack(">hiiq", 0, 0, 3, 5)
+        leader_epoch_fixture += b"\x00"  # partition tagged fields
+        leader_epoch_fixture += b"\x00"  # topic tagged fields
+        leader_epoch_fixture += b"\x00"  # response tagged fields
+        epoch_offsets = parse_offset_for_leader_epoch_response(
+            leader_epoch_fixture, 161
+        )
+        if (
+            epoch_offsets[0]["name"] != "epoch-self-test"
+            or epoch_offsets[0]["partitions"][0]["end_offset"] != 5
+            or epoch_offsets[0]["partitions"][0]["leader_epoch"] != 3
+        ):
+            raise TestError(
+                f"OffsetForLeaderEpoch fixture parser failed: {epoch_offsets}"
+            )
 
         describe_producers_fixture = struct.pack(">i", 162)
         describe_producers_fixture += b"\x00"  # response header tagged fields
