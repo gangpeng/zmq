@@ -43,6 +43,7 @@ ZMQ_BIN = os.environ.get("ZMQ_BIN", "./zig-out/bin/zmq")
 PORT_BASE = int(os.environ.get("ZMQ_KRAFT_CONTROLLER_PORT_BASE", "39093"))
 BROKER_PORT = int(os.environ.get("ZMQ_KRAFT_BROKER_PORT", "39092"))
 CLUSTER_ID = f"zmq-kraft-failover-{os.getpid()}-{int(time.time())}"
+ERROR_GROUP_ID_NOT_FOUND = 69
 
 
 class TestError(Exception):
@@ -864,7 +865,7 @@ def commit_offset(port, group, topic, offset, correlation_id):
         raise TestError(f"OffsetCommit error_code={error_code}")
 
 
-def parse_offset_fetch_response(response, correlation_id, expected_topic):
+def parse_offset_fetch_response_status(response, correlation_id, expected_topic):
     pos = 0
     response_correlation, pos = read_i32(response, pos)
     if response_correlation != correlation_id:
@@ -880,9 +881,24 @@ def parse_offset_fetch_response(response, correlation_id, expected_topic):
     committed, pos = read_i64(response, pos)
     metadata, pos = read_string(response, pos)
     error_code, pos = read_i16(response, pos)
-    if partition != 0 or error_code != 0:
-        raise TestError(f"OffsetFetch partition={partition} error_code={error_code}")
-    return {"offset": committed, "metadata": metadata}
+    return {
+        "partition": partition,
+        "offset": committed,
+        "metadata": metadata,
+        "error_code": error_code,
+    }
+
+
+def parse_offset_fetch_response(response, correlation_id, expected_topic):
+    result = parse_offset_fetch_response_status(
+        response, correlation_id, expected_topic
+    )
+    if result["partition"] != 0 or result["error_code"] != 0:
+        raise TestError(
+            f"OffsetFetch partition={result['partition']} "
+            f"error_code={result['error_code']}"
+        )
+    return result
 
 
 def fetch_committed_offset(port, group, topic, correlation_id):
@@ -894,6 +910,17 @@ def fetch_committed_offset(port, group, topic, correlation_id):
 
     response = controller_request(port, 9, 1, correlation_id, body)
     return parse_offset_fetch_response(response, correlation_id, topic)["offset"]
+
+
+def fetch_committed_offset_status(port, group, topic, correlation_id):
+    body = write_string(group)
+    body += struct.pack(">i", 1)  # topics
+    body += write_string(topic)
+    body += struct.pack(">i", 1)  # partitions
+    body += struct.pack(">i", 0)
+
+    response = controller_request(port, 9, 1, correlation_id, body)
+    return parse_offset_fetch_response_status(response, correlation_id, topic)
 
 
 def wait_for_committed_offset(port, group, topic, expected_offset, timeout=30):
@@ -913,6 +940,35 @@ def wait_for_committed_offset(port, group, topic, expected_offset, timeout=30):
     raise TestError(
         f"committed offset did not converge: expected={expected_offset} "
         f"last_offset={last_offset} last_error={last_error}"
+    )
+
+
+def wait_for_committed_offset_error(
+    port, group, topic, expected_error, expected_offset=-1, timeout=30
+):
+    deadline = time.time() + timeout
+    correlation_id = 6250
+    last_result = None
+    last_error = None
+    while time.time() < deadline:
+        try:
+            last_result = fetch_committed_offset_status(
+                port, group, topic, correlation_id
+            )
+            if (
+                last_result["partition"] == 0
+                and last_result["offset"] == expected_offset
+                and last_result["error_code"] == expected_error
+            ):
+                return last_result
+        except Exception as exc:
+            last_error = exc
+        correlation_id += 1
+        time.sleep(0.25)
+    raise TestError(
+        f"committed offset error did not converge: expected_error={expected_error} "
+        f"expected_offset={expected_offset} last_result={last_result} "
+        f"last_error={last_error}"
     )
 
 
@@ -1246,6 +1302,26 @@ def heartbeat_group(port, group_state, correlation_id):
     parse_heartbeat_response(response, correlation_id)
 
 
+def parse_leave_group_response(response, correlation_id):
+    pos = 0
+    response_correlation, pos = read_i32(response, pos)
+    if response_correlation != correlation_id:
+        raise TestError(f"LeaveGroup correlation mismatch: {response_correlation}")
+    error_code, pos = read_i16(response, pos)
+    if pos != len(response):
+        raise TestError(f"LeaveGroup response trailing bytes: {len(response) - pos}")
+    if error_code != 0:
+        raise TestError(f"LeaveGroup error_code={error_code}")
+
+
+def leave_group(port, group_state, correlation_id):
+    body = write_string(group_state["group_id"])
+    body += write_string(group_state["member_id"])
+
+    response = controller_request(port, 13, 0, correlation_id, body)
+    parse_leave_group_response(response, correlation_id)
+
+
 def wait_for_group_stable(port, group_id, timeout=30):
     deadline = time.time() + timeout
     correlation_id = 6700
@@ -1278,6 +1354,58 @@ def wait_for_group_heartbeat(port, group_state, timeout=30):
     raise TestError(
         f"consumer group {group_state['group_id']!r} heartbeat did not recover: {last_error}"
     )
+
+
+def parse_delete_groups_response(response, correlation_id, expected_group):
+    pos = 0
+    response_correlation, pos = read_i32(response, pos)
+    if response_correlation != correlation_id:
+        raise TestError(f"DeleteGroups correlation mismatch: {response_correlation}")
+    _, pos = read_i32(response, pos)  # throttle_time_ms
+    results, pos = read_i32(response, pos)
+    if results != 1:
+        raise TestError(f"DeleteGroups result count={results}")
+    group_id, pos = read_string(response, pos)
+    error_code, pos = read_i16(response, pos)
+    if pos != len(response):
+        raise TestError(f"DeleteGroups response trailing bytes: {len(response) - pos}")
+    if group_id != expected_group:
+        raise TestError(f"DeleteGroups group={group_id!r}")
+    return error_code
+
+
+def delete_group(port, group, correlation_id):
+    body = struct.pack(">i", 1)
+    body += write_string(group)
+
+    response = controller_request(port, 42, 0, correlation_id, body)
+    error_code = parse_delete_groups_response(response, correlation_id, group)
+    if error_code != 0:
+        raise TestError(f"DeleteGroups error_code={error_code}")
+
+
+def wait_for_group_delete(port, group, topic, timeout=30):
+    deadline = time.time() + timeout
+    correlation_id = 6950
+    deleted = False
+    last_error = None
+    while time.time() < deadline:
+        try:
+            if not deleted:
+                delete_group(port, group, correlation_id)
+                deleted = True
+            return wait_for_committed_offset_error(
+                port,
+                group,
+                topic,
+                ERROR_GROUP_ID_NOT_FOUND,
+                timeout=max(1, int(deadline - time.time())),
+            )
+        except Exception as exc:
+            last_error = exc
+        correlation_id += 1
+        time.sleep(0.25)
+    raise TestError(f"DeleteGroups did not delete {group!r}: {last_error}")
 
 
 def network_hooks_configured():
@@ -3445,6 +3573,7 @@ def main():
         topic = f"kraft-failover-{os.getpid()}-{int(time.time())}"
         group = f"kraft-failover-group-{os.getpid()}-{int(time.time())}"
         offset_delete_group = f"{group}-offset-delete"
+        delete_groups_group = f"{group}-delete-groups"
         txn_topic = f"{topic}-txn"
         idempotent_topic = f"{topic}-idempotent"
         expected_payloads = []
@@ -3467,6 +3596,18 @@ def main():
             committed_offset,
         )
         wait_for_offset_delete(broker["port"], offset_delete_group, topic)
+        delete_groups_state = wait_for_group_stable(
+            broker["port"],
+            delete_groups_group,
+        )
+        leave_group(broker["port"], delete_groups_state, 6850)
+        wait_for_offset_commit(
+            broker["port"],
+            delete_groups_group,
+            topic,
+            committed_offset,
+        )
+        wait_for_group_delete(broker["port"], delete_groups_group, topic)
         idempotent_transactional_id = f"{group}-idempotent"
         idempotent_identity = wait_for_init_producer_id(
             broker["port"],
@@ -3489,6 +3630,9 @@ def main():
             leader_id, initial = wait_for_leader(processes)
         wait_for_committed_offset(broker["port"], group, topic, committed_offset)
         wait_for_committed_offset(broker["port"], offset_delete_group, topic, -1)
+        wait_for_committed_offset_error(
+            broker["port"], delete_groups_group, topic, ERROR_GROUP_ID_NOT_FOUND
+        )
         wait_for_group_heartbeat(broker["port"], offset_delete_group_state)
         wait_for_group_heartbeat(broker["port"], classic_group_state)
 
@@ -3504,6 +3648,9 @@ def main():
         wait_for_payloads(broker["port"], topic, expected_payloads)
         wait_for_committed_offset(broker["port"], group, topic, committed_offset)
         wait_for_committed_offset(broker["port"], offset_delete_group, topic, -1)
+        wait_for_committed_offset_error(
+            broker["port"], delete_groups_group, topic, ERROR_GROUP_ID_NOT_FOUND
+        )
         wait_for_group_heartbeat(broker["port"], offset_delete_group_state)
         wait_for_transaction_end(broker["port"], controller_failover_txn)
         wait_for_group_heartbeat(broker["port"], classic_group_state)
@@ -3539,6 +3686,9 @@ def main():
         wait_for_payloads(broker["port"], topic, expected_payloads)
         wait_for_committed_offset(broker["port"], group, topic, committed_offset)
         wait_for_committed_offset(broker["port"], offset_delete_group, topic, -1)
+        wait_for_committed_offset_error(
+            broker["port"], delete_groups_group, topic, ERROR_GROUP_ID_NOT_FOUND
+        )
         wait_for_group_heartbeat(broker["port"], offset_delete_group_state)
         wait_for_group_heartbeat(broker["port"], classic_group_state)
         expected_payloads.append(b"r2")
@@ -3578,6 +3728,9 @@ def main():
         wait_for_payloads(broker["port"], topic, expected_payloads)
         wait_for_committed_offset(broker["port"], group, topic, committed_offset)
         wait_for_committed_offset(broker["port"], offset_delete_group, topic, -1)
+        wait_for_committed_offset_error(
+            broker["port"], delete_groups_group, topic, ERROR_GROUP_ID_NOT_FOUND
+        )
         wait_for_group_heartbeat(broker["port"], offset_delete_group_state)
         wait_for_group_heartbeat(broker["port"], classic_group_state)
         expected_payloads.append(b"r3")
@@ -3625,6 +3778,9 @@ def main():
         wait_for_payloads(broker["port"], topic, expected_payloads)
         wait_for_committed_offset(broker["port"], group, topic, committed_offset)
         wait_for_committed_offset(broker["port"], offset_delete_group, topic, -1)
+        wait_for_committed_offset_error(
+            broker["port"], delete_groups_group, topic, ERROR_GROUP_ID_NOT_FOUND
+        )
         wait_for_group_heartbeat(broker["port"], offset_delete_group_state)
         wait_for_transaction_end(broker["port"], broker_restart_txn)
         wait_for_group_heartbeat(broker["port"], classic_group_state)
@@ -3751,6 +3907,7 @@ def main():
             f"committed_offset={committed_offset}, "
             f"transactions_checked=3, "
             f"idempotent_producer_fencing=true, "
+            f"delete_groups_checked=true, "
             f"classic_group_heartbeats=true, "
             f"network_partition={network_partition_result}, "
             f"automq_old_leader_fresh_rejoin={automq_result['old_leader_fresh_rejoin']})"
@@ -3838,6 +3995,20 @@ def self_test():
         fetched = parse_offset_fetch_response(fetch_fixture, 43, "offset-self-test")
         if fetched["offset"] != 7 or fetched["metadata"] != "kraft-failover":
             raise TestError(f"OffsetFetch fixture parser failed: {fetched}")
+        missing_fetch_fixture = struct.pack(">i", 143)
+        missing_fetch_fixture += struct.pack(">i", 1)
+        missing_fetch_fixture += write_string("offset-missing-self-test")
+        missing_fetch_fixture += struct.pack(">iiq", 1, 0, -1)
+        missing_fetch_fixture += write_string("")
+        missing_fetch_fixture += struct.pack(">h", ERROR_GROUP_ID_NOT_FOUND)
+        missing_fetch = parse_offset_fetch_response_status(
+            missing_fetch_fixture, 143, "offset-missing-self-test"
+        )
+        if (
+            missing_fetch["offset"] != -1
+            or missing_fetch["error_code"] != ERROR_GROUP_ID_NOT_FOUND
+        ):
+            raise TestError(f"OffsetFetch error fixture parser failed: {missing_fetch}")
 
         delete_fixture = struct.pack(">ihi", 144, 0, 0)
         delete_fixture += struct.pack(">i", 1)
@@ -3845,6 +4016,13 @@ def self_test():
         delete_fixture += struct.pack(">iih", 1, 0, 0)
         if parse_offset_delete_response(delete_fixture, 144, "offset-delete-self-test") != 0:
             raise TestError("OffsetDelete fixture parser failed")
+
+        delete_groups_fixture = struct.pack(">ii", 145, 0)
+        delete_groups_fixture += struct.pack(">i", 1)
+        delete_groups_fixture += write_string("delete-groups-self-test")
+        delete_groups_fixture += struct.pack(">h", 0)
+        if parse_delete_groups_response(delete_groups_fixture, 145, "delete-groups-self-test") != 0:
+            raise TestError("DeleteGroups fixture parser failed")
 
         init_fixture = struct.pack(">iihqh", 44, 0, 0, 1000, 0)
         identity = parse_init_producer_id_response(init_fixture, 44)
@@ -3878,6 +4056,9 @@ def self_test():
 
         heartbeat_fixture = struct.pack(">ih", 49, 0)
         parse_heartbeat_response(heartbeat_fixture, 49)
+
+        leave_fixture = struct.pack(">ih", 50, 0)
+        parse_leave_group_response(leave_fixture, 50)
 
         batch_fixture = build_record_batch(
             b"idempotent-fixture",
