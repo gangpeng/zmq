@@ -23463,15 +23463,24 @@ pub const Broker = struct {
 
         if (!validateOffsetDeleteRequestFrame(request_bytes, body_start)) {
             log.warn("Malformed OffsetDelete request", .{});
-            return null;
+            return self.offsetDeleteErrorResponse(req_header, resp_header_version, api_version, ErrorCode.invalid_request);
         }
 
         var pos = body_start;
         var req = Req.deserialize(self.allocator, request_bytes, &pos, api_version) catch |err| {
             log.warn("Failed to decode OffsetDelete request: {}", .{err});
-            return null;
+            return self.offsetDeleteErrorResponse(req_header, resp_header_version, api_version, ErrorCode.invalid_request);
         };
         defer self.freeOffsetDeleteRequest(&req);
+
+        const topics = self.materializeOffsetDeleteResponseTopics(&req) catch |err| {
+            log.warn("OffsetDelete response materialization failed: {}", .{err});
+            return self.offsetDeleteErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error);
+        };
+        defer {
+            self.freeOffsetDeleteResponseTopics(topics);
+            if (topics.len > 0) self.allocator.free(topics);
+        }
 
         const group_id = req.group_id orelse "";
         const group_error: ErrorCode = if (group_id.len == 0)
@@ -23480,16 +23489,15 @@ pub const Broker = struct {
             ErrorCode.none
         else
             ErrorCode.group_id_not_found;
-        var previous_offsets = self.cloneCommittedOffsets() catch return null;
+        var previous_offsets = self.cloneCommittedOffsets() catch |err| {
+            log.warn("OffsetDelete rollback snapshot materialization failed: {}", .{err});
+            return self.offsetDeleteErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error);
+        };
         defer self.freeCommittedOffsetSnapshot(&previous_offsets);
-        var topics = self.allocator.alloc(TopicResult, req.topics.len) catch return null;
-        defer {
-            self.freeOffsetDeleteResponseTopics(topics);
-            if (topics.len > 0) self.allocator.free(topics);
-        }
 
         var mutated = false;
-        for (req.topics, 0..) |topic, topic_index| {
+        for (req.topics, topics) |topic, *topic_resp| {
+            const partitions: []PartitionResult = @constCast(topic_resp.partitions);
             const topic_name = topic.name orelse "";
             const topic_error: ErrorCode = if (group_error != ErrorCode.none)
                 group_error
@@ -23497,8 +23505,6 @@ pub const Broker = struct {
                 ErrorCode.group_subscribed_to_topic
             else
                 ErrorCode.none;
-            const partitions = self.allocator.alloc(PartitionResult, topic.partitions.len) catch return null;
-            errdefer self.allocator.free(partitions);
 
             for (topic.partitions, 0..) |partition, partition_index| {
                 const partition_error: ErrorCode = if (topic_error != ErrorCode.none)
@@ -23543,11 +23549,6 @@ pub const Broker = struct {
                     .error_code = @intFromEnum(partition_error),
                 };
             }
-
-            topics[topic_index] = .{
-                .name = topic.name,
-                .partitions = partitions,
-            };
         }
 
         if (mutated) {
@@ -23570,7 +23571,10 @@ pub const Broker = struct {
             .throttle_time_ms = 0,
             .topics = topics,
         };
-        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version) orelse {
+            log.warn("OffsetDelete response serialization failed", .{});
+            return self.offsetDeleteErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error);
+        };
     }
 
     fn freeOffsetDeleteRequest(self: *Broker, req: *generated.offset_delete_request.OffsetDeleteRequest) void {
@@ -23584,6 +23588,41 @@ pub const Broker = struct {
         for (topics) |topic| {
             if (topic.partitions.len > 0) self.allocator.free(topic.partitions);
         }
+    }
+
+    fn materializeOffsetDeleteResponseTopics(self: *Broker, req: *const generated.offset_delete_request.OffsetDeleteRequest) ![]generated.offset_delete_response.OffsetDeleteResponse.OffsetDeleteResponseTopic {
+        const TopicResult = generated.offset_delete_response.OffsetDeleteResponse.OffsetDeleteResponseTopic;
+        const PartitionResult = TopicResult.OffsetDeleteResponsePartition;
+
+        if (req.topics.len == 0) return &.{};
+
+        const topics = try self.allocator.alloc(TopicResult, req.topics.len);
+        var topics_init: usize = 0;
+        errdefer {
+            self.freeOffsetDeleteResponseTopics(topics[0..topics_init]);
+            self.allocator.free(topics);
+        }
+
+        for (req.topics) |topic_req| {
+            var partitions: []PartitionResult = &.{};
+            if (topic_req.partitions.len > 0) {
+                partitions = try self.allocator.alloc(PartitionResult, topic_req.partitions.len);
+                for (topic_req.partitions, 0..) |partition_req, partition_idx| {
+                    partitions[partition_idx] = .{
+                        .partition_index = partition_req.partition_index,
+                        .error_code = @intFromEnum(ErrorCode.kafka_storage_error),
+                    };
+                }
+            }
+
+            topics[topics_init] = .{
+                .name = topic_req.name,
+                .partitions = partitions,
+            };
+            topics_init += 1;
+        }
+
+        return topics;
     }
 
     // ---------------------------------------------------------------
@@ -32805,6 +32844,27 @@ fn freeDeserializedOffsetDeleteResponse(resp: *const generated.offset_delete_res
         if (topic.partitions.len > 0) testing.allocator.free(topic.partitions);
     }
     if (resp.topics.len > 0) testing.allocator.free(resp.topics);
+}
+
+fn expectOffsetDeleteErrorResponseBytes(response: []const u8, correlation_id: i32, err_code: ErrorCode) !void {
+    const Resp = generated.offset_delete_response.OffsetDeleteResponse;
+
+    var rpos: usize = 0;
+    var response_header = try ResponseHeader.deserialize(testing.allocator, response, &rpos, header_mod.responseHeaderVersion(47, 0));
+    defer response_header.deinit(testing.allocator);
+    try testing.expectEqual(correlation_id, response_header.correlation_id);
+
+    const resp = try Resp.deserialize(testing.allocator, response, &rpos, 0);
+    defer freeDeserializedOffsetDeleteResponse(&resp);
+
+    try testing.expectEqual(response.len, rpos);
+    try testing.expectEqual(@as(i32, 0), resp.throttle_time_ms);
+    try testing.expectEqual(@as(i16, @intFromEnum(err_code)), resp.error_code);
+    try testing.expectEqual(@as(usize, 1), resp.topics.len);
+    try testing.expectEqualStrings("", resp.topics[0].name.?);
+    try testing.expectEqual(@as(usize, 1), resp.topics[0].partitions.len);
+    try testing.expectEqual(@as(i32, -1), resp.topics[0].partitions[0].partition_index);
+    try testing.expectEqual(@as(i16, @intFromEnum(err_code)), resp.topics[0].partitions[0].error_code);
 }
 
 fn readCommittedOffsetAuthorizationErrorCode(response: []const u8, api_key: i16, api_version: i16, correlation_id: i32) !i16 {
@@ -45161,7 +45221,11 @@ test "Broker.handleRequest OffsetDelete rejects truncated request" {
 
     var buf: [128]u8 = undefined;
     const req_len = buildTestRequest(&buf, 47, 0, 4701, header_mod.requestHeaderVersion(47, 0));
-    try testing.expect(broker.handleRequest(buf[0..req_len]) == null);
+    const response = broker.handleRequest(buf[0..req_len]);
+    try testing.expect(response != null);
+    defer testing.allocator.free(response.?);
+
+    try expectOffsetDeleteErrorResponseBytes(response.?, 4701, ErrorCode.invalid_request);
 }
 
 test "Broker.handleRequest OffsetDelete rejects trailing bytes" {
@@ -45186,7 +45250,113 @@ test "Broker.handleRequest OffsetDelete rejects trailing bytes" {
     var pos = buildTestRequest(&buf, 47, 0, 4709, header_mod.requestHeaderVersion(47, 0));
     req.serialize(&buf, &pos, 0);
 
-    try expectTrailingByteRejected(&broker, buf[0..], pos);
+    try testing.expect(pos < buf.len);
+    buf[pos] = 0x7f;
+    const response = broker.handleRequest(buf[0 .. pos + 1]);
+    try testing.expect(response != null);
+    defer testing.allocator.free(response.?);
+
+    try expectOffsetDeleteErrorResponseBytes(response.?, 4709, ErrorCode.invalid_request);
+}
+
+test "Broker.handleRequest OffsetDelete fails closed when response materialization fails" {
+    const Req = generated.offset_delete_request.OffsetDeleteRequest;
+    const Partition = Req.OffsetDeleteRequestTopic.OffsetDeleteRequestPartition;
+    const Topic = Req.OffsetDeleteRequestTopic;
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+
+    const partitions = [_]Partition{.{
+        .partition_index = 0,
+    }};
+    const topics = [_]Topic{.{
+        .name = "offset-delete-oom-topic",
+        .partitions = &partitions,
+    }};
+    const req = Req{
+        .group_id = "offset-delete-oom-group",
+        .topics = &topics,
+    };
+
+    var buf: [512]u8 = undefined;
+    var pos = buildTestRequest(&buf, 47, 0, 4710, header_mod.requestHeaderVersion(47, 0));
+    req.serialize(&buf, &pos, 0);
+
+    for ([_]usize{ 2, 3 }) |fail_index| {
+        var failing_allocator = OneShotFailingAllocator.init(testing.allocator, fail_index);
+        const response_allocator = failing_allocator.allocator();
+        broker.allocator = response_allocator;
+
+        const response = broker.handleRequest(buf[0..pos]);
+        broker.allocator = testing.allocator;
+
+        try testing.expect(failing_allocator.failed);
+        try testing.expect(response != null);
+        defer response_allocator.free(response.?);
+
+        try expectOffsetDeleteErrorResponseBytes(response.?, 4710, ErrorCode.kafka_storage_error);
+    }
+}
+
+test "Broker.handleRequest OffsetDelete fails closed when rollback snapshot materialization fails" {
+    const Req = generated.offset_delete_request.OffsetDeleteRequest;
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+    try broker.groups.commitOffset("offset-delete-snapshot-fail-group", "offset-delete-snapshot-fail-topic", 0, 42);
+
+    const req = Req{
+        .group_id = "offset-delete-snapshot-fail-group",
+        .topics = &.{},
+    };
+
+    var buf: [256]u8 = undefined;
+    var pos = buildTestRequest(&buf, 47, 0, 4711, header_mod.requestHeaderVersion(47, 0));
+    req.serialize(&buf, &pos, 0);
+
+    var failing_allocator = OneShotFailingAllocator.init(testing.allocator, 0);
+    const response_allocator = failing_allocator.allocator();
+    broker.allocator = response_allocator;
+
+    const response = broker.handleRequest(buf[0..pos]);
+    broker.allocator = testing.allocator;
+
+    try testing.expect(failing_allocator.failed);
+    try testing.expect(response != null);
+    defer response_allocator.free(response.?);
+
+    try expectOffsetDeleteErrorResponseBytes(response.?, 4711, ErrorCode.kafka_storage_error);
+    try testing.expectEqual(@as(?i64, 42), try broker.groups.fetchOffset("offset-delete-snapshot-fail-group", "offset-delete-snapshot-fail-topic", 0));
+}
+
+test "Broker.handleRequest OffsetDelete fails closed when response serialization fails" {
+    const Req = generated.offset_delete_request.OffsetDeleteRequest;
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+
+    const req = Req{
+        .group_id = "offset-delete-serialize-fail-group",
+        .topics = &.{},
+    };
+
+    var buf: [256]u8 = undefined;
+    var pos = buildTestRequest(&buf, 47, 0, 4712, header_mod.requestHeaderVersion(47, 0));
+    req.serialize(&buf, &pos, 0);
+
+    var failing_allocator = OneShotFailingAllocator.init(testing.allocator, 0);
+    const response_allocator = failing_allocator.allocator();
+    broker.allocator = response_allocator;
+
+    const response = broker.handleRequest(buf[0..pos]);
+    broker.allocator = testing.allocator;
+
+    try testing.expect(failing_allocator.failed);
+    try testing.expect(response != null);
+    defer response_allocator.free(response.?);
+
+    try expectOffsetDeleteErrorResponseBytes(response.?, 4712, ErrorCode.kafka_storage_error);
 }
 
 test "Broker.handleRequest OffsetDelete authorization denial uses generated response" {
