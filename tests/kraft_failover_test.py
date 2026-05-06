@@ -1263,7 +1263,136 @@ def wait_for_offset_fetch_grouped_checkpoint(
     raise TestError(f"OffsetFetch v8 grouped checkpoint did not recover: {last_error}")
 
 
-def wait_for_offset_fetch_v9_member_checkpoint(port, group_state, topic, timeout=30):
+def parse_offset_commit_flexible_response(response, correlation_id, expected_topic):
+    pos = parse_flexible_response_header(response, correlation_id)
+    _, pos = read_i32(response, pos)  # throttle_time_ms
+    topic_count, pos = read_compact_array_len(response, pos)
+    if topic_count != 1:
+        raise TestError(f"OffsetCommit v9 topic response count={topic_count}")
+    topic_name, pos = read_compact_string(response, pos)
+    partition_count, pos = read_compact_array_len(response, pos)
+    if topic_name != expected_topic or partition_count != 1:
+        raise TestError(
+            f"OffsetCommit v9 topic={topic_name!r} partitions={partition_count}"
+        )
+    partition_index, pos = read_i32(response, pos)
+    error_code, pos = read_i16(response, pos)
+    pos = skip_tags(response, pos)
+    pos = skip_tags(response, pos)
+    pos = skip_tags(response, pos)
+    if pos != len(response):
+        raise TestError(
+            f"OffsetCommit v9 response trailing bytes: {len(response) - pos}"
+        )
+    if partition_index != 0:
+        raise TestError(
+            f"OffsetCommit v9 partition={partition_index} error_code={error_code}"
+        )
+    return error_code
+
+
+def offset_commit_v9(
+    port,
+    group_id,
+    member_id,
+    member_epoch,
+    topic,
+    offset,
+    metadata,
+    correlation_id,
+):
+    body = bytearray()
+    body += write_compact_string(group_id)
+    body += struct.pack(">i", member_epoch)
+    body += write_compact_string(member_id)
+    body += write_compact_string(None)  # group_instance_id
+    body += write_compact_array_len(1)
+    body += write_compact_string(topic)
+    body += write_compact_array_len(1)
+    body += struct.pack(">iqi", 0, offset, -1)
+    body += write_compact_string(metadata)
+    body += b"\x00"  # partition tagged fields
+    body += b"\x00"  # topic tagged fields
+    body += b"\x00"  # request tagged fields
+
+    response = flexible_kafka_request(port, 8, 9, correlation_id, bytes(body))
+    return parse_offset_commit_flexible_response(response, correlation_id, topic)
+
+
+def wait_for_offset_commit_v9_member_checkpoint(
+    port,
+    group_state,
+    topic,
+    expected_offset,
+    expected_metadata,
+    timeout=30,
+):
+    deadline = time.time() + timeout
+    correlation_id = 8250
+    last_error = None
+    group_id = group_state["group_id"]
+    member_id = group_state["member_id"]
+    member_epoch = group_state["member_epoch"]
+
+    while time.time() < deadline:
+        try:
+            valid_error = offset_commit_v9(
+                port,
+                group_id,
+                member_id,
+                member_epoch,
+                topic,
+                expected_offset,
+                expected_metadata,
+                correlation_id,
+            )
+            if valid_error != 0:
+                raise TestError(f"OffsetCommit v9 valid member error={valid_error}")
+            missing_error = offset_commit_v9(
+                port,
+                group_id,
+                f"{member_id}-missing",
+                member_epoch,
+                topic,
+                expected_offset + 100,
+                "missing-kip848-member",
+                correlation_id + 1,
+            )
+            if missing_error != ERROR_UNKNOWN_MEMBER_ID:
+                raise TestError(
+                    f"OffsetCommit v9 missing member error={missing_error}"
+                )
+            stale_error = offset_commit_v9(
+                port,
+                group_id,
+                member_id,
+                member_epoch + 1,
+                topic,
+                expected_offset + 200,
+                "stale-kip848-member-epoch",
+                correlation_id + 2,
+            )
+            if stale_error != ERROR_FENCED_MEMBER_EPOCH:
+                raise TestError(f"OffsetCommit v9 stale epoch error={stale_error}")
+            return
+        except Exception as exc:
+            last_error = exc
+        correlation_id += 3
+        time.sleep(0.25)
+    raise TestError(
+        f"OffsetCommit v9 member checkpoint did not recover for {group_id!r}: "
+        f"{last_error}"
+    )
+
+
+def wait_for_offset_fetch_v9_member_checkpoint(
+    port,
+    group_state,
+    topic,
+    expected_offset=-1,
+    expected_metadata=None,
+    timeout=30,
+):
     deadline = time.time() + timeout
     correlation_id = 8150
     last_error = None
@@ -1276,8 +1405,8 @@ def wait_for_offset_fetch_v9_member_checkpoint(port, group_state, topic, timeout
         "partitions": [
             {
                 "partition": 0,
-                "offset": -1,
-                "metadata": None,
+                "offset": expected_offset,
+                "metadata": expected_metadata,
                 "error_code": 0,
             }
         ],
@@ -5013,16 +5142,27 @@ def main():
             f"{group}-kip848",
             topic,
         )
+        kip848_committed_offset = committed_offset
+        kip848_offset_metadata = "kraft-failover-kip848"
         wait_for_consumer_group_heartbeat(broker["port"], kip848_group_state)
         wait_for_kip848_consumer_group_description(
             broker["port"],
             kip848_group_state,
             topic,
         )
+        wait_for_offset_commit_v9_member_checkpoint(
+            broker["port"],
+            kip848_group_state,
+            topic,
+            kip848_committed_offset,
+            kip848_offset_metadata,
+        )
         wait_for_offset_fetch_v9_member_checkpoint(
             broker["port"],
             kip848_group_state,
             topic,
+            kip848_committed_offset,
+            kip848_offset_metadata,
         )
         wait_for_offset_fetch_grouped_checkpoint(
             broker["port"],
@@ -5080,10 +5220,19 @@ def main():
             kip848_group_state,
             topic,
         )
+        wait_for_offset_commit_v9_member_checkpoint(
+            broker["port"],
+            kip848_group_state,
+            topic,
+            kip848_committed_offset,
+            kip848_offset_metadata,
+        )
         wait_for_offset_fetch_v9_member_checkpoint(
             broker["port"],
             kip848_group_state,
             topic,
+            kip848_committed_offset,
+            kip848_offset_metadata,
         )
 
         stop_process(processes[leader_id]["proc"], crash=True)
@@ -5145,10 +5294,19 @@ def main():
             kip848_group_state,
             topic,
         )
+        wait_for_offset_commit_v9_member_checkpoint(
+            broker["port"],
+            kip848_group_state,
+            topic,
+            kip848_committed_offset,
+            kip848_offset_metadata,
+        )
         wait_for_offset_fetch_v9_member_checkpoint(
             broker["port"],
             kip848_group_state,
             topic,
+            kip848_committed_offset,
+            kip848_offset_metadata,
         )
         expected_payloads.append(b"r1")
         second_offset = wait_for_produce(broker["port"], topic, expected_payloads[-1])
@@ -5220,10 +5378,19 @@ def main():
             kip848_group_state,
             topic,
         )
+        wait_for_offset_commit_v9_member_checkpoint(
+            broker["port"],
+            kip848_group_state,
+            topic,
+            kip848_committed_offset,
+            kip848_offset_metadata,
+        )
         wait_for_offset_fetch_v9_member_checkpoint(
             broker["port"],
             kip848_group_state,
             topic,
+            kip848_committed_offset,
+            kip848_offset_metadata,
         )
         expected_payloads.append(b"r2")
         third_offset = wait_for_produce(broker["port"], topic, expected_payloads[-1])
@@ -5300,10 +5467,19 @@ def main():
             kip848_group_state,
             topic,
         )
+        wait_for_offset_commit_v9_member_checkpoint(
+            broker["port"],
+            kip848_group_state,
+            topic,
+            kip848_committed_offset,
+            kip848_offset_metadata,
+        )
         wait_for_offset_fetch_v9_member_checkpoint(
             broker["port"],
             kip848_group_state,
             topic,
+            kip848_committed_offset,
+            kip848_offset_metadata,
         )
         expected_payloads.append(b"r3")
         fourth_offset = wait_for_produce(
@@ -5392,10 +5568,19 @@ def main():
             kip848_group_state,
             topic,
         )
+        wait_for_offset_commit_v9_member_checkpoint(
+            broker["port"],
+            kip848_group_state,
+            topic,
+            kip848_committed_offset,
+            kip848_offset_metadata,
+        )
         wait_for_offset_fetch_v9_member_checkpoint(
             broker["port"],
             kip848_group_state,
             topic,
+            kip848_committed_offset,
+            kip848_offset_metadata,
         )
         duplicate_idempotent = wait_for_record_batch_result(
             broker["port"],
@@ -5542,6 +5727,7 @@ def main():
             f"find_coordinator_checked=true, "
             f"consumer_group_heartbeat_checked=true, "
             f"kip848_describe_checked=true, "
+            f"offset_commit_v9_member_checked=true, "
             f"offset_fetch_v9_member_checked=true, "
             f"network_partition={network_partition_result}, "
             f"automq_old_leader_fresh_rejoin={automq_result['old_leader_fresh_rejoin']})"
@@ -5619,6 +5805,23 @@ def self_test():
         commit_fixture += struct.pack(">iih", 1, 0, 0)
         if parse_offset_commit_response(commit_fixture, 42, "offset-self-test") != 0:
             raise TestError("OffsetCommit fixture parser failed")
+        commit_v9_fixture = struct.pack(">i", 242)
+        commit_v9_fixture += b"\x00"  # response header tagged fields
+        commit_v9_fixture += struct.pack(">i", 0)
+        commit_v9_fixture += write_compact_array_len(1)
+        commit_v9_fixture += write_compact_string("offset-v9-self-test")
+        commit_v9_fixture += write_compact_array_len(1)
+        commit_v9_fixture += struct.pack(">ih", 0, ERROR_FENCED_MEMBER_EPOCH)
+        commit_v9_fixture += b"\x00"  # partition tagged fields
+        commit_v9_fixture += b"\x00"  # topic tagged fields
+        commit_v9_fixture += b"\x00"  # response tagged fields
+        if (
+            parse_offset_commit_flexible_response(
+                commit_v9_fixture, 242, "offset-v9-self-test"
+            )
+            != ERROR_FENCED_MEMBER_EPOCH
+        ):
+            raise TestError("OffsetCommit v9 fixture parser failed")
 
         fetch_fixture = struct.pack(">i", 43)
         fetch_fixture += struct.pack(">i", 1)
