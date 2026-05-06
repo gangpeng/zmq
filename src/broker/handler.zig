@@ -55345,6 +55345,39 @@ test "Broker AutoMQ node license and manifest APIs" {
     try testing.expectEqualStrings("role", get_nodes_resp.nodes[0].tags[1].key.?);
     try testing.expectEqualStrings("broker", get_nodes_resp.nodes[0].tags[1].value.?);
 
+    pos = buildTestRequest(&buf, 513, 0, 5131, 2);
+    const clear_register_req = RegisterReq{ .node_id = 7, .node_epoch = 4, .wal_config = "wal://node-7", .tags = &.{} };
+    clear_register_req.serialize(&buf, &pos, 0);
+    response = broker.handleRequest(buf[0..pos]);
+    try testing.expect(response != null);
+    try owned_responses.append(response.?);
+    rpos = 0;
+    var clear_register_header = try ResponseHeader.deserialize(testing.allocator, response.?, &rpos, 1);
+    defer clear_register_header.deinit(testing.allocator);
+    const clear_register_resp = try RegisterResp.deserialize(testing.allocator, response.?, &rpos, 0);
+    try testing.expectEqual(@as(i16, 0), clear_register_resp.error_code);
+
+    pos = buildTestRequest(&buf, 514, 0, 5141, 2);
+    get_nodes_req.serialize(&buf, &pos, 0);
+    response = broker.handleRequest(buf[0..pos]);
+    try testing.expect(response != null);
+    try owned_responses.append(response.?);
+    rpos = 0;
+    var clear_get_nodes_header = try ResponseHeader.deserialize(testing.allocator, response.?, &rpos, 1);
+    defer clear_get_nodes_header.deinit(testing.allocator);
+    const clear_get_nodes_resp = try GetNodesResp.deserialize(testing.allocator, response.?, &rpos, 0);
+    defer {
+        for (clear_get_nodes_resp.nodes) |node_resp| {
+            if (node_resp.tags.len > 0) testing.allocator.free(node_resp.tags);
+        }
+        testing.allocator.free(clear_get_nodes_resp.nodes);
+    }
+    try testing.expectEqual(@as(usize, 1), clear_get_nodes_resp.nodes.len);
+    try testing.expectEqual(@as(i32, 7), clear_get_nodes_resp.nodes[0].node_id);
+    try testing.expectEqual(@as(i64, 4), clear_get_nodes_resp.nodes[0].node_epoch);
+    try testing.expectEqualStrings("wal://node-7", clear_get_nodes_resp.nodes[0].wal_config.?);
+    try testing.expectEqual(@as(usize, 0), clear_get_nodes_resp.nodes[0].tags.len);
+
     pos = buildTestRequest(&buf, 600, 0, 6000, 2);
     const next_node_req = NextNodeReq{ .cluster_id = "zmq-cluster" };
     next_node_req.serialize(&buf, &pos, 0);
