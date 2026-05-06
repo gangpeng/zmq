@@ -262,6 +262,21 @@ def controller_request(port, api_key, api_version, correlation_id, body=b"", tim
         return read_exact(sock, response_size)
 
 
+def flexible_kafka_request(port, api_key, api_version, correlation_id, body=b"", timeout=5):
+    header = struct.pack(">hhi", api_key, api_version, correlation_id)
+    header += write_compact_string("kraft-failover-test")
+    header += b"\x00"
+    frame_body = header + body
+
+    with socket.create_connection(("127.0.0.1", port), timeout=timeout) as sock:
+        sock.settimeout(timeout)
+        sock.sendall(struct.pack(">I", len(frame_body)) + frame_body)
+        response_size = struct.unpack(">I", read_exact(sock, 4))[0]
+        if response_size <= 0 or response_size > 1024 * 1024:
+            raise TestError(f"invalid flexible response frame size {response_size}")
+        return read_exact(sock, response_size)
+
+
 def automq_request(port, api_key, correlation_id, body=b"", timeout=10, api_version=0):
     header = struct.pack(">hhi", api_key, api_version, correlation_id)
     header += write_compact_string("automq-failover-test")
@@ -1326,6 +1341,180 @@ def wait_for_offset_transaction_begin(
         time.sleep(0.25)
     raise TestError(
         f"transactional offset commit {transactional_id!r} did not begin: {last_error}"
+    )
+
+
+def parse_list_transactions_response(response, correlation_id):
+    pos = parse_flexible_response_header(response, correlation_id)
+    _, pos = read_i32(response, pos)  # throttle_time_ms
+    error_code, pos = read_i16(response, pos)
+    unknown_filters_count, pos = read_compact_array_len(response, pos)
+    unknown_filters = []
+    for _ in range(unknown_filters_count):
+        value, pos = read_compact_string(response, pos)
+        unknown_filters.append(value)
+    transaction_count, pos = read_compact_array_len(response, pos)
+    transactions = []
+    for _ in range(transaction_count):
+        transactional_id, pos = read_compact_string(response, pos)
+        producer_id, pos = read_i64(response, pos)
+        transaction_state, pos = read_compact_string(response, pos)
+        pos = skip_tags(response, pos)
+        transactions.append(
+            {
+                "transactional_id": transactional_id,
+                "producer_id": producer_id,
+                "transaction_state": transaction_state,
+            }
+        )
+    pos = skip_tags(response, pos)
+    if pos != len(response):
+        raise TestError(
+            f"ListTransactions response trailing bytes: {len(response) - pos}"
+        )
+    if error_code != 0:
+        raise TestError(f"ListTransactions error_code={error_code}")
+    if unknown_filters:
+        raise TestError(f"ListTransactions unknown filters={unknown_filters!r}")
+    return transactions
+
+
+def list_transactions(port, producer_id, state, correlation_id):
+    body = write_compact_array_len(1)
+    body += write_compact_string(state)
+    body += write_compact_array_len(1)
+    body += struct.pack(">q", producer_id)
+    body += struct.pack(">q", -1)  # duration_filter
+    body += b"\x00"  # request tagged fields
+
+    response = flexible_kafka_request(port, 66, 1, correlation_id, body)
+    return parse_list_transactions_response(response, correlation_id)
+
+
+def parse_describe_transactions_response(response, correlation_id):
+    pos = parse_flexible_response_header(response, correlation_id)
+    _, pos = read_i32(response, pos)  # throttle_time_ms
+    transaction_count, pos = read_compact_array_len(response, pos)
+    transactions = []
+    for _ in range(transaction_count):
+        error_code, pos = read_i16(response, pos)
+        transactional_id, pos = read_compact_string(response, pos)
+        transaction_state, pos = read_compact_string(response, pos)
+        transaction_timeout_ms, pos = read_i32(response, pos)
+        transaction_start_time_ms, pos = read_i64(response, pos)
+        producer_id, pos = read_i64(response, pos)
+        producer_epoch, pos = read_i16(response, pos)
+        topic_count, pos = read_compact_array_len(response, pos)
+        topics = []
+        for _ in range(topic_count):
+            topic_name, pos = read_compact_string(response, pos)
+            partitions, pos = read_compact_i32_array(response, pos)
+            pos = skip_tags(response, pos)
+            topics.append({"topic": topic_name, "partitions": partitions})
+        pos = skip_tags(response, pos)
+        transactions.append(
+            {
+                "error_code": error_code,
+                "transactional_id": transactional_id,
+                "transaction_state": transaction_state,
+                "transaction_timeout_ms": transaction_timeout_ms,
+                "transaction_start_time_ms": transaction_start_time_ms,
+                "producer_id": producer_id,
+                "producer_epoch": producer_epoch,
+                "topics": topics,
+            }
+        )
+    pos = skip_tags(response, pos)
+    if pos != len(response):
+        raise TestError(
+            f"DescribeTransactions response trailing bytes: {len(response) - pos}"
+        )
+    return transactions
+
+
+def describe_transaction(port, transactional_id, correlation_id):
+    body = write_compact_array_len(1)
+    body += write_compact_string(transactional_id)
+    body += b"\x00"  # request tagged fields
+
+    response = flexible_kafka_request(port, 65, 0, correlation_id, body)
+    transactions = parse_describe_transactions_response(response, correlation_id)
+    if len(transactions) != 1:
+        raise TestError(f"DescribeTransactions count={len(transactions)}")
+    return transactions[0]
+
+
+def assert_transaction_introspection(port, txn, expected_state, expected_topic, correlation_id):
+    described = describe_transaction(port, txn["transactional_id"], correlation_id)
+    if described["error_code"] != 0:
+        raise TestError(
+            f"DescribeTransactions {txn['transactional_id']!r} error_code="
+            f"{described['error_code']}"
+        )
+    if described["producer_id"] != txn["producer_id"]:
+        raise TestError(
+            f"DescribeTransactions producer_id={described['producer_id']} "
+            f"expected={txn['producer_id']}"
+        )
+    if described["producer_epoch"] != txn["producer_epoch"]:
+        raise TestError(
+            f"DescribeTransactions producer_epoch={described['producer_epoch']} "
+            f"expected={txn['producer_epoch']}"
+        )
+    if described["transaction_state"] != expected_state:
+        raise TestError(
+            f"DescribeTransactions state={described['transaction_state']!r} "
+            f"expected={expected_state!r}"
+        )
+    if expected_topic is not None:
+        matching_topic = next(
+            (topic for topic in described["topics"] if topic["topic"] == expected_topic),
+            None,
+        )
+        if matching_topic is None or 0 not in matching_topic["partitions"]:
+            raise TestError(
+                f"DescribeTransactions missing topic {expected_topic!r}: {described}"
+            )
+
+    listed = list_transactions(
+        port,
+        txn["producer_id"],
+        expected_state,
+        correlation_id + 1,
+    )
+    matching = [
+        item
+        for item in listed
+        if item["transactional_id"] == txn["transactional_id"]
+        and item["producer_id"] == txn["producer_id"]
+        and item["transaction_state"] == expected_state
+    ]
+    if not matching:
+        raise TestError(
+            f"ListTransactions missing {txn['transactional_id']!r} "
+            f"state={expected_state!r}: {listed}"
+        )
+
+
+def wait_for_transaction_introspection(
+    port, txn, expected_state, expected_topic=None, timeout=30
+):
+    deadline = time.time() + timeout
+    correlation_id = 7200
+    last_error = None
+    while time.time() < deadline:
+        try:
+            assert_transaction_introspection(
+                port, txn, expected_state, expected_topic, correlation_id
+            )
+            return
+        except Exception as exc:
+            last_error = exc
+        correlation_id += 2
+        time.sleep(0.25)
+    raise TestError(
+        f"transaction introspection {txn['transactional_id']!r} did not reach "
+        f"{expected_state!r}: {last_error}"
     )
 
 
@@ -3770,6 +3959,9 @@ def main():
             f"{group}-controller-failover",
             txn_topic,
         )
+        wait_for_transaction_introspection(
+            broker["port"], controller_failover_txn, "Ongoing", txn_topic
+        )
         classic_group_state = wait_for_group_stable(
             broker["port"],
             f"{group}-classic",
@@ -3789,6 +3981,9 @@ def main():
             broker["port"], txn_offset_group, topic, txn_offset_committed_offset
         )
         wait_for_group_heartbeat(broker["port"], offset_delete_group_state)
+        wait_for_transaction_introspection(
+            broker["port"], controller_failover_txn, "Ongoing", txn_topic
+        )
         wait_for_group_heartbeat(broker["port"], classic_group_state)
 
         stop_process(processes[leader_id]["proc"], crash=True)
@@ -3811,7 +4006,13 @@ def main():
         )
         wait_for_group_heartbeat(broker["port"], offset_delete_group_state)
         wait_for_transaction_end(broker["port"], txn_offset_txn)
+        wait_for_transaction_introspection(
+            broker["port"], controller_failover_txn, "Ongoing", txn_topic
+        )
         wait_for_transaction_end(broker["port"], controller_failover_txn)
+        wait_for_transaction_introspection(
+            broker["port"], controller_failover_txn, "CompleteCommit"
+        )
         wait_for_group_heartbeat(broker["port"], classic_group_state)
         expected_payloads.append(b"r1")
         second_offset = wait_for_produce(broker["port"], topic, expected_payloads[-1])
@@ -3852,6 +4053,9 @@ def main():
             broker["port"], txn_offset_group, topic, txn_offset_committed_offset
         )
         wait_for_group_heartbeat(broker["port"], offset_delete_group_state)
+        wait_for_transaction_introspection(
+            broker["port"], controller_failover_txn, "CompleteCommit"
+        )
         wait_for_group_heartbeat(broker["port"], classic_group_state)
         expected_payloads.append(b"r2")
         third_offset = wait_for_produce(broker["port"], topic, expected_payloads[-1])
@@ -3897,6 +4101,9 @@ def main():
             broker["port"], txn_offset_group, topic, txn_offset_committed_offset
         )
         wait_for_group_heartbeat(broker["port"], offset_delete_group_state)
+        wait_for_transaction_introspection(
+            broker["port"], controller_failover_txn, "CompleteCommit"
+        )
         wait_for_group_heartbeat(broker["port"], classic_group_state)
         expected_payloads.append(b"r3")
         fourth_offset = wait_for_produce(
@@ -3950,6 +4157,12 @@ def main():
             broker["port"], txn_offset_group, topic, txn_offset_committed_offset
         )
         wait_for_group_heartbeat(broker["port"], offset_delete_group_state)
+        wait_for_transaction_introspection(
+            broker["port"], controller_failover_txn, "CompleteCommit"
+        )
+        wait_for_transaction_introspection(
+            broker["port"], broker_restart_txn, "Ongoing", txn_topic
+        )
         wait_for_transaction_end(broker["port"], broker_restart_txn)
         wait_for_group_heartbeat(broker["port"], classic_group_state)
         duplicate_idempotent = wait_for_record_batch_result(
@@ -4074,6 +4287,7 @@ def main():
             f"reassignment_target_offset={automq_result['reassignment_target_offset']}, "
             f"committed_offset={committed_offset}, "
             f"transactions_checked=4, "
+            f"transaction_introspection_checked=true, "
             f"txn_offset_commit_checked=true, "
             f"idempotent_producer_fencing=true, "
             f"delete_groups_checked=true, "
@@ -4212,6 +4426,50 @@ def self_test():
         txn_offset_fixture += write_string("txn-offset-self-test")
         txn_offset_fixture += struct.pack(">iih", 1, 0, 0)
         parse_txn_offset_commit_response(txn_offset_fixture, 52, "txn-offset-self-test")
+
+        list_txn_fixture = struct.pack(">i", 53)
+        list_txn_fixture += b"\x00"  # response header tagged fields
+        list_txn_fixture += struct.pack(">ih", 0, 0)
+        list_txn_fixture += write_compact_array_len(0)
+        list_txn_fixture += write_compact_array_len(1)
+        list_txn_fixture += write_compact_string("introspection-self-test")
+        list_txn_fixture += struct.pack(">q", 1001)
+        list_txn_fixture += write_compact_string("Ongoing")
+        list_txn_fixture += b"\x00"  # transaction tagged fields
+        list_txn_fixture += b"\x00"  # response tagged fields
+        listed = parse_list_transactions_response(list_txn_fixture, 53)
+        if (
+            len(listed) != 1
+            or listed[0]["transactional_id"] != "introspection-self-test"
+            or listed[0]["producer_id"] != 1001
+            or listed[0]["transaction_state"] != "Ongoing"
+        ):
+            raise TestError(f"ListTransactions fixture parser failed: {listed}")
+
+        describe_txn_fixture = struct.pack(">i", 54)
+        describe_txn_fixture += b"\x00"  # response header tagged fields
+        describe_txn_fixture += struct.pack(">i", 0)
+        describe_txn_fixture += write_compact_array_len(1)
+        describe_txn_fixture += struct.pack(">h", 0)
+        describe_txn_fixture += write_compact_string("introspection-self-test")
+        describe_txn_fixture += write_compact_string("Ongoing")
+        describe_txn_fixture += struct.pack(">iqqh", 60000, 123456, 1001, 0)
+        describe_txn_fixture += write_compact_array_len(1)
+        describe_txn_fixture += write_compact_string("introspection-topic")
+        describe_txn_fixture += write_compact_i32_array([0])
+        describe_txn_fixture += b"\x00"  # topic tagged fields
+        describe_txn_fixture += b"\x00"  # transaction tagged fields
+        describe_txn_fixture += b"\x00"  # response tagged fields
+        described = parse_describe_transactions_response(describe_txn_fixture, 54)
+        if (
+            len(described) != 1
+            or described[0]["transactional_id"] != "introspection-self-test"
+            or described[0]["producer_id"] != 1001
+            or described[0]["transaction_state"] != "Ongoing"
+            or described[0]["topics"][0]["topic"] != "introspection-topic"
+            or described[0]["topics"][0]["partitions"] != [0]
+        ):
+            raise TestError(f"DescribeTransactions fixture parser failed: {described}")
 
         end_txn_fixture = struct.pack(">iih", 46, 0, 0)
         parse_end_txn_response(end_txn_fixture, 46)
