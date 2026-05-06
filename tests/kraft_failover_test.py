@@ -251,6 +251,12 @@ def read_i64(buf, pos):
     return struct.unpack_from(">q", buf, pos)[0], pos + 8
 
 
+def read_f64(buf, pos):
+    if pos + 8 > len(buf):
+        raise TestError("buffer underflow while reading f64")
+    return struct.unpack_from(">d", buf, pos)[0], pos + 8
+
+
 def read_string(buf, pos):
     length, pos = read_i16(buf, pos)
     if length < 0:
@@ -1048,6 +1054,236 @@ def wait_for_create_partitions_validate_only_checkpoint(
     raise TestError(
         f"CreatePartitions validate-only did not recover for {topic!r}: {last_error}"
     )
+
+
+def parse_alter_client_quotas_response(response, correlation_id):
+    pos = parse_flexible_response_header(response, correlation_id)
+    throttle_time_ms, pos = read_i32(response, pos)
+    entry_count, pos = read_compact_array_len(response, pos)
+    entries = []
+    for _ in range(entry_count):
+        error_code, pos = read_i16(response, pos)
+        error_message, pos = read_compact_string(response, pos)
+        entity_count, pos = read_compact_array_len(response, pos)
+        entity = []
+        for _ in range(entity_count):
+            entity_type, pos = read_compact_string(response, pos)
+            entity_name, pos = read_compact_string(response, pos)
+            pos = skip_tags(response, pos)
+            entity.append(
+                {
+                    "entity_type": entity_type,
+                    "entity_name": entity_name,
+                }
+            )
+        pos = skip_tags(response, pos)
+        entries.append(
+            {
+                "error_code": error_code,
+                "error_message": error_message,
+                "entity": entity,
+            }
+        )
+    pos = skip_tags(response, pos)
+    if pos != len(response):
+        raise TestError(
+            f"AlterClientQuotas response trailing bytes: {len(response) - pos}"
+        )
+    return {"throttle_time_ms": throttle_time_ms, "entries": entries}
+
+
+def alter_client_quotas(port, client_id, quota_ops, validate_only, correlation_id):
+    body = write_compact_array_len(1)
+    body += write_compact_array_len(1)
+    body += write_compact_string("client-id")
+    body += write_compact_string(client_id)
+    body += b"\x00"  # entity tagged fields
+    body += write_compact_array_len(len(quota_ops))
+    for key, value, remove in quota_ops:
+        body += write_compact_string(key)
+        body += struct.pack(">d", value)
+        body += b"\x01" if remove else b"\x00"
+        body += b"\x00"  # op tagged fields
+    body += b"\x00"  # entry tagged fields
+    body += b"\x01" if validate_only else b"\x00"
+    body += b"\x00"  # request tagged fields
+    response = flexible_kafka_request(port, 49, 1, correlation_id, body)
+    return parse_alter_client_quotas_response(response, correlation_id)
+
+
+def require_alter_client_quota_success(response, client_id):
+    if response["throttle_time_ms"] != 0:
+        raise TestError(f"AlterClientQuotas throttle mismatch: {response}")
+    entries = response["entries"]
+    if len(entries) != 1:
+        raise TestError(f"AlterClientQuotas entry count mismatch: {response}")
+    entry = entries[0]
+    if entry["error_code"] != 0 or entry["error_message"] is not None:
+        raise TestError(f"AlterClientQuotas entry mismatch: {response}")
+    entity = entry["entity"]
+    if (
+        len(entity) != 1
+        or entity[0]["entity_type"] != "client-id"
+        or entity[0]["entity_name"] != client_id
+    ):
+        raise TestError(f"AlterClientQuotas entity mismatch: {response}")
+
+
+def wait_for_alter_client_quotas_mutation(port, client_id, quota_ops, timeout=30):
+    deadline = time.time() + timeout
+    correlation_id = 8500
+    last_error = None
+    while time.time() < deadline:
+        try:
+            response = alter_client_quotas(
+                port,
+                client_id,
+                quota_ops,
+                False,
+                correlation_id,
+            )
+            require_alter_client_quota_success(response, client_id)
+            return
+        except Exception as exc:
+            last_error = exc
+        correlation_id += 1
+        time.sleep(0.25)
+    raise TestError(f"AlterClientQuotas did not mutate {client_id!r}: {last_error}")
+
+
+def parse_describe_client_quotas_response(response, correlation_id):
+    pos = parse_flexible_response_header(response, correlation_id)
+    throttle_time_ms, pos = read_i32(response, pos)
+    error_code, pos = read_i16(response, pos)
+    error_message, pos = read_compact_string(response, pos)
+    entry_count, pos = read_compact_array_len(response, pos)
+    entries = []
+    for _ in range(entry_count):
+        entity_count, pos = read_compact_array_len(response, pos)
+        entity = []
+        for _ in range(entity_count):
+            entity_type, pos = read_compact_string(response, pos)
+            entity_name, pos = read_compact_string(response, pos)
+            pos = skip_tags(response, pos)
+            entity.append(
+                {
+                    "entity_type": entity_type,
+                    "entity_name": entity_name,
+                }
+            )
+        value_count, pos = read_compact_array_len(response, pos)
+        values = []
+        for _ in range(value_count):
+            key, pos = read_compact_string(response, pos)
+            value, pos = read_f64(response, pos)
+            pos = skip_tags(response, pos)
+            values.append({"key": key, "value": value})
+        pos = skip_tags(response, pos)
+        entries.append({"entity": entity, "values": values})
+    pos = skip_tags(response, pos)
+    if pos != len(response):
+        raise TestError(
+            f"DescribeClientQuotas response trailing bytes: {len(response) - pos}"
+        )
+    return {
+        "throttle_time_ms": throttle_time_ms,
+        "error_code": error_code,
+        "error_message": error_message,
+        "entries": entries,
+    }
+
+
+def describe_client_quotas(port, client_id, correlation_id):
+    body = write_compact_array_len(1)
+    body += write_compact_string("client-id")
+    body += b"\x00"  # exact name match
+    body += write_compact_string(client_id)
+    body += b"\x00"  # component tagged fields
+    body += b"\x01"  # strict
+    body += b"\x00"  # request tagged fields
+    response = flexible_kafka_request(port, 48, 1, correlation_id, body)
+    return parse_describe_client_quotas_response(response, correlation_id)
+
+
+def require_describe_client_quota_values(response, client_id, expected_values):
+    if (
+        response["throttle_time_ms"] != 0
+        or response["error_code"] != 0
+        or response["error_message"] is not None
+    ):
+        raise TestError(f"DescribeClientQuotas top-level mismatch: {response}")
+    entries = response["entries"]
+    if len(entries) != 1:
+        raise TestError(f"DescribeClientQuotas entry count mismatch: {response}")
+    entity = entries[0]["entity"]
+    if (
+        len(entity) != 1
+        or entity[0]["entity_type"] != "client-id"
+        or entity[0]["entity_name"] != client_id
+    ):
+        raise TestError(f"DescribeClientQuotas entity mismatch: {response}")
+    values = {item["key"]: item["value"] for item in entries[0]["values"]}
+    if set(values) != set(expected_values):
+        raise TestError(f"DescribeClientQuotas value keys mismatch: {response}")
+    for key, expected in expected_values.items():
+        if abs(values[key] - expected) > 0.000001:
+            raise TestError(
+                f"DescribeClientQuotas value mismatch for {key}: "
+                f"{values[key]} != {expected}"
+            )
+
+
+def require_describe_client_quota_absent(response):
+    if (
+        response["throttle_time_ms"] != 0
+        or response["error_code"] != 0
+        or response["error_message"] is not None
+    ):
+        raise TestError(f"DescribeClientQuotas empty top-level mismatch: {response}")
+    if response["entries"]:
+        raise TestError(f"DescribeClientQuotas expected no entries: {response}")
+
+
+def wait_for_client_quotas_checkpoint(
+    port,
+    client_id,
+    expected_values,
+    validate_only_client_id,
+    timeout=30,
+):
+    deadline = time.time() + timeout
+    correlation_id = 8540
+    last_error = None
+    validate_only_ops = [("producer_byte_rate", 9876.0, False)]
+    while time.time() < deadline:
+        try:
+            response = describe_client_quotas(port, client_id, correlation_id)
+            require_describe_client_quota_values(response, client_id, expected_values)
+            correlation_id += 1
+            validate_response = alter_client_quotas(
+                port,
+                validate_only_client_id,
+                validate_only_ops,
+                True,
+                correlation_id,
+            )
+            require_alter_client_quota_success(
+                validate_response,
+                validate_only_client_id,
+            )
+            correlation_id += 1
+            absent_response = describe_client_quotas(
+                port,
+                validate_only_client_id,
+                correlation_id,
+            )
+            require_describe_client_quota_absent(absent_response)
+            return
+        except Exception as exc:
+            last_error = exc
+        correlation_id += 1
+        time.sleep(0.25)
+    raise TestError(f"Client quota checkpoint did not recover: {last_error}")
 
 
 def parse_describe_configs_response(response, correlation_id):
@@ -8090,6 +8326,18 @@ def main():
         idempotent_topic = f"{topic}-idempotent"
         delete_records_topic = f"{topic}-delete-records"
         create_partitions_topic = f"{topic}-create-partitions"
+        quota_client_id = f"{group}-quota-client"
+        validate_only_quota_client_id = f"{group}-quota-validate-only"
+        quota_values = {
+            "producer_byte_rate": 1234.0,
+            "consumer_byte_rate": 4321.0,
+            "request_percentage": 12.5,
+        }
+        quota_ops = [
+            ("producer_byte_rate", quota_values["producer_byte_rate"], False),
+            ("consumer_byte_rate", quota_values["consumer_byte_rate"], False),
+            ("request_percentage", quota_values["request_percentage"], False),
+        ]
         kip848_subscription_topic = f"{topic}-kip848-subscription"
         kip848_negative_group_prefix = f"{group}-kip848-negative"
         expected_payloads = []
@@ -8155,9 +8403,18 @@ def main():
                 2,
             )
 
+        def wait_for_client_quotas_probe():
+            wait_for_client_quotas_checkpoint(
+                broker["port"],
+                quota_client_id,
+                quota_values,
+                validate_only_quota_client_id,
+            )
+
         def wait_for_cluster_visibility_probes():
             wait_for_topic_partitions_probe()
             wait_for_create_partitions_probe()
+            wait_for_client_quotas_probe()
             wait_for_describe_configs_checkpoint(
                 broker["port"],
                 topic,
@@ -8193,6 +8450,11 @@ def main():
             broker["port"],
             create_partitions_topic,
             2,
+        )
+        wait_for_alter_client_quotas_mutation(
+            broker["port"],
+            quota_client_id,
+            quota_ops,
         )
         wait_for_cluster_visibility_probes()
         wait_for_offset_commit(broker["port"], group, topic, committed_offset)
@@ -9302,6 +9564,7 @@ def main():
             f"log_position_apis_checked=true, "
             f"delete_records_checked=true, "
             f"create_partitions_checked=true, "
+            f"client_quotas_checked=true, "
             f"describe_topic_partitions_checked=true, "
             f"describe_configs_checked=true, "
             f"describe_log_dirs_checked=true, "
@@ -9619,6 +9882,48 @@ def self_test():
             raise TestError(
                 f"CreatePartitions fixture parser failed: {created_partitions}"
             )
+
+        alter_quota_fixture = struct.pack(">i", 166)
+        alter_quota_fixture += b"\x00"  # response header tagged fields
+        alter_quota_fixture += struct.pack(">i", 0)
+        alter_quota_fixture += write_compact_array_len(1)
+        alter_quota_fixture += struct.pack(">h", 0)
+        alter_quota_fixture += write_compact_string(None)
+        alter_quota_fixture += write_compact_array_len(1)
+        alter_quota_fixture += write_compact_string("client-id")
+        alter_quota_fixture += write_compact_string("quota-self-test")
+        alter_quota_fixture += b"\x00"  # entity tagged fields
+        alter_quota_fixture += b"\x00"  # entry tagged fields
+        alter_quota_fixture += b"\x00"  # response tagged fields
+        altered_quota = parse_alter_client_quotas_response(alter_quota_fixture, 166)
+        require_alter_client_quota_success(altered_quota, "quota-self-test")
+
+        describe_quota_fixture = struct.pack(">i", 167)
+        describe_quota_fixture += b"\x00"  # response header tagged fields
+        describe_quota_fixture += struct.pack(">ih", 0, 0)
+        describe_quota_fixture += write_compact_string(None)
+        describe_quota_fixture += write_compact_array_len(1)
+        describe_quota_fixture += write_compact_array_len(1)
+        describe_quota_fixture += write_compact_string("client-id")
+        describe_quota_fixture += write_compact_string("quota-self-test")
+        describe_quota_fixture += b"\x00"  # entity tagged fields
+        describe_quota_fixture += write_compact_array_len(2)
+        describe_quota_fixture += write_compact_string("producer_byte_rate")
+        describe_quota_fixture += struct.pack(">d", 1234.0)
+        describe_quota_fixture += b"\x00"  # value tagged fields
+        describe_quota_fixture += write_compact_string("consumer_byte_rate")
+        describe_quota_fixture += struct.pack(">d", 4321.0)
+        describe_quota_fixture += b"\x00"  # value tagged fields
+        describe_quota_fixture += b"\x00"  # entry tagged fields
+        describe_quota_fixture += b"\x00"  # response tagged fields
+        described_quota = parse_describe_client_quotas_response(
+            describe_quota_fixture, 167
+        )
+        require_describe_client_quota_values(
+            described_quota,
+            "quota-self-test",
+            {"producer_byte_rate": 1234.0, "consumer_byte_rate": 4321.0},
+        )
 
         describe_configs_fixture = struct.pack(">i", 166)
         describe_configs_fixture += b"\x00"  # response header tagged fields
