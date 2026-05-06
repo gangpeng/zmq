@@ -236,6 +236,11 @@ after fresh-dir replacement, skip stale local share files when shared snapshots
 exist, and roll back failed shared snapshot writes before exposing session
 epochs.
 
+Latest default-suite fail-closed tranche: metadata-client controller discovery
+now surfaces malformed DescribeQuorum responses separately from no-leader
+quorum state, and DeleteTopics partition cleanup removes known local partition
+state without heap key formatting.
+
 ## Capability Matrix
 
 | Area | Current status | Required to call complete |

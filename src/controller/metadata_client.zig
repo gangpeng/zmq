@@ -149,7 +149,11 @@ pub const MetadataClient = struct {
                 if (self.controller_pool.sendDescribeQuorum(voter.node_id)) |response| {
                     defer self.allocator.free(response);
                     // Parse the DescribeQuorum response to find leader_id and leader_epoch
-                    if (self.parseDescribeQuorumResponse(response)) |info| {
+                    const maybe_info = self.parseDescribeQuorumResponse(response) catch |err| {
+                        log.warn("Malformed DescribeQuorum response from controller {d}: {}", .{ voter.node_id, err });
+                        continue;
+                    };
+                    if (maybe_info) |info| {
                         self.leader_id = info.leader_id;
                         self.cached_leader_epoch.* = info.leader_epoch;
                         log.info("Discovered controller leader: node {d} epoch {d}", .{
@@ -175,14 +179,14 @@ pub const MetadataClient = struct {
         leader_epoch: i32,
     };
 
-    fn parseDescribeQuorumResponse(self: *MetadataClient, response: []const u8) ?QuorumInfo {
+    fn parseDescribeQuorumResponse(self: *MetadataClient, response: []const u8) !?QuorumInfo {
         const Resp = generated.describe_quorum_response.DescribeQuorumResponse;
 
         var pos: usize = 0;
-        var header = ResponseHeader.deserialize(self.allocator, response, &pos, header_mod.responseHeaderVersion(55, 0)) catch return null;
+        var header = try ResponseHeader.deserialize(self.allocator, response, &pos, header_mod.responseHeaderVersion(55, 0));
         defer header.deinit(self.allocator);
 
-        var resp = Resp.deserialize(self.allocator, response, &pos, 0) catch return null;
+        var resp = try Resp.deserialize(self.allocator, response, &pos, 0);
         defer self.freeDescribeQuorumResponse(&resp);
 
         if (resp.error_code != 0) return null;
@@ -520,7 +524,7 @@ test "MetadataClient parseDescribeQuorumResponse valid" {
     const body = Resp{ .error_code = 0, .topics = &topics };
     body.serialize(&resp, &wpos, 0);
 
-    const info = mc.parseDescribeQuorumResponse(resp[0..wpos]);
+    const info = try mc.parseDescribeQuorumResponse(resp[0..wpos]);
     try testing.expect(info != null);
     try testing.expectEqual(@as(i32, 2), info.?.leader_id);
     try testing.expectEqual(@as(i32, 7), info.?.leader_epoch);
@@ -566,8 +570,39 @@ test "MetadataClient parseDescribeQuorumResponse no leader" {
     const body = Resp{ .error_code = 0, .topics = &topics };
     body.serialize(&resp, &wpos, 0);
 
-    const info = mc.parseDescribeQuorumResponse(resp[0..wpos]);
+    const info = try mc.parseDescribeQuorumResponse(resp[0..wpos]);
     try testing.expect(info == null);
+}
+
+test "MetadataClient parseDescribeQuorumResponse surfaces malformed responses" {
+    var cached_epoch: i32 = 0;
+    var cached_broker_epoch: i64 = 0;
+    const local_replica_directory_ids: []const [16]u8 = &.{};
+    var is_fenced: bool = false;
+    var last_hb: i64 = 0;
+    var should_stop: bool = false;
+
+    var mc = MetadataClient.init(
+        testing.allocator,
+        100,
+        "localhost",
+        9092,
+        &cached_epoch,
+        &cached_broker_epoch,
+        local_replica_directory_ids,
+        &is_fenced,
+        &last_hb,
+        &should_stop,
+    );
+    defer mc.deinit();
+
+    var resp: [16]u8 = undefined;
+    var wpos: usize = 0;
+    const header = ResponseHeader{ .correlation_id = 1 };
+    header.serialize(&resp, &wpos, header_mod.responseHeaderVersion(55, 0));
+    ser.writeI16(&resp, &wpos, 0);
+
+    try testing.expectError(error.BufferUnderflow, mc.parseDescribeQuorumResponse(resp[0..wpos]));
 }
 
 test "MetadataClient setTlsContext propagates to controller pool" {

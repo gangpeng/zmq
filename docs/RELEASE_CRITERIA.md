@@ -35,8 +35,9 @@ single-node demo are not sufficient by themselves.
   cannot be rebuilt. Filesystem WAL cleanup and retention must surface segment
   deletion failures and retain segment metadata for retry. Topic creation must
   fail closed and roll back visible topic metadata when local partition-state
-  allocation or failover ownership tracking fails. Consumer-group timeout
-  eviction must not silently keep
+  allocation or failover ownership tracking fails, and DeleteTopics partition
+  cleanup must not depend on heap allocation to remove already-known local
+  state. Consumer-group timeout eviction must not silently keep
   expired members active because an allocation failed while collecting expired
   member IDs. Raft/controller metadata replication and startup recovery must not
   acknowledge or apply entries that failed local log allocation or persistence,
@@ -64,6 +65,8 @@ single-node demo are not sufficient by themselves.
   scale in/out, and rack-aware/autobalancer convergence. Controller quorum voter
   configuration must fail closed on malformed entries instead of silently
   shrinking or miswiring the controller, metadata-client, or broker peer sets.
+  Metadata-client controller discovery must distinguish malformed
+  DescribeQuorum responses from a legitimate no-leader response.
   Startup configuration must fail closed on unreadable config files, malformed
   cluster identity/listener integers, negative node IDs, invalid `process.roles`,
   missing CLI flag values, and unknown CLI arguments. Stale Raft peer cleanup

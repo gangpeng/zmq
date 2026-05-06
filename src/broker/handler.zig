@@ -4088,20 +4088,38 @@ pub const Broker = struct {
         }
     }
 
+    fn removeStoredPartitionState(self: *Broker, topic_name: []const u8, partition_index: i32) bool {
+        var key_to_remove: ?[]const u8 = null;
+        var it = self.store.partitions.iterator();
+        while (it.next()) |entry| {
+            const state = entry.value_ptr;
+            if (state.partition_id == partition_index and std.mem.eql(u8, state.topic, topic_name)) {
+                key_to_remove = entry.key_ptr.*;
+                break;
+            }
+        }
+
+        const key = key_to_remove orelse return false;
+        if (self.store.partitions.fetchRemove(key)) |removed| {
+            self.store.allocator.free(removed.value.topic);
+            self.store.allocator.free(removed.key);
+            return true;
+        }
+        return false;
+    }
+
     fn removeTopicPartitionRange(self: *Broker, topic_name: []const u8, start_partition: i32, end_partition: i32) void {
         if (end_partition <= start_partition) return;
         self.untrackTopicPartitionRange(topic_name, start_partition, end_partition);
         for (@as(usize, @intCast(start_partition))..@as(usize, @intCast(end_partition))) |pi| {
             const partition_index: i32 = @intCast(pi);
             const stream_id = PartitionStore.hashPartitionKey(topic_name, partition_index);
-            self.object_manager.deleteStream(stream_id) catch {};
-
-            const pkey = std.fmt.allocPrint(self.allocator, "{s}-{d}", .{ topic_name, partition_index }) catch continue;
-            defer self.allocator.free(pkey);
-            if (self.store.partitions.fetchRemove(pkey)) |removed| {
-                self.allocator.free(removed.value.topic);
-                self.allocator.free(removed.key);
-            }
+            self.object_manager.deleteStream(stream_id) catch |err| {
+                if (err != error.StreamNotFound) {
+                    log.warn("Failed to delete ObjectManager stream for {s}-{d}: {}", .{ topic_name, partition_index, err });
+                }
+            };
+            _ = self.removeStoredPartitionState(topic_name, partition_index);
         }
     }
 
@@ -57078,6 +57096,35 @@ test "Broker.handleRequest DeleteTopics v6 deletes by topic id and returns gener
     try testing.expectEqualSlices(u8, &topic_id, &resp.responses[0].topic_id);
     try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.none)), resp.responses[0].error_code);
     try testing.expect(!broker.topics.contains("dt-v6-topic"));
+}
+
+test "Broker removeTopicPartitionRange does not need broker allocator for cleanup" {
+    const topic_name = "dt-cleanup-no-alloc-topic";
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+    broker.wireInternalPointers();
+
+    try broker.store.ensurePartition(topic_name, 0);
+    try broker.failover_controller.registerNode(1);
+    try broker.failover_controller.registerPartitionOwner(topic_name, 0, 1);
+
+    const stream_id = PartitionStore.hashPartitionKey(topic_name, 0);
+    try testing.expect(broker.object_manager.getStream(stream_id) != null);
+    try testing.expect(broker.store.partitions.contains("dt-cleanup-no-alloc-topic-0"));
+    try testing.expectEqual(@as(?i32, 1), broker.failover_controller.findPartitionOwner(topic_name, 0));
+
+    const original_allocator = broker.allocator;
+    var failing_allocator = std.testing.FailingAllocator.init(testing.allocator, .{ .fail_index = 0 });
+    broker.allocator = failing_allocator.allocator();
+    defer broker.allocator = original_allocator;
+
+    broker.removeTopicPartitionRange(topic_name, 0, 1);
+
+    try testing.expect(!failing_allocator.has_induced_failure);
+    try testing.expect(broker.object_manager.getStream(stream_id) == null);
+    try testing.expect(!broker.store.partitions.contains("dt-cleanup-no-alloc-topic-0"));
+    try testing.expect(broker.failover_controller.findPartitionOwner(topic_name, 0) == null);
 }
 
 test "Broker.handleRequest DeleteTopics authorization denial uses generated response" {
