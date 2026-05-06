@@ -5531,8 +5531,8 @@ pub const Broker = struct {
                 var record_pos: usize = rec_batch.BATCH_HEADER_SIZE;
                 for (0..record_count) |_| {
                     const record = try rec_batch.parseRecord(batch, &record_pos);
-                    const key = record.key orelse continue;
-                    const value = record.value orelse continue;
+                    const key = record.key orelse return error.MalformedInternalRecordBatch;
+                    const value = record.value orelse return error.MalformedInternalRecordBatch;
                     switch (try self.applyClusterMetadataRecord(key, value)) {
                         .none => {},
                         .topic_snapshot => restored.topic_snapshots += 1,
@@ -5658,7 +5658,7 @@ pub const Broker = struct {
                 var record_pos: usize = rec_batch.BATCH_HEADER_SIZE;
                 for (0..record_count) |_| {
                     const record = try rec_batch.parseRecord(batch, &record_pos);
-                    const key = record.key orelse continue;
+                    const key = record.key orelse return error.MalformedInternalRecordBatch;
                     switch (try self.applyConsumerOffsetRecord(key, record.value)) {
                         .none => {},
                         .offset_record => restored.offset_records += 1,
@@ -5677,11 +5677,11 @@ pub const Broker = struct {
 
     fn applyConsumerOffsetRecord(self: *Broker, key: []const u8, value: ?[]const u8) !ConsumerOffsetsReplayKind {
         if (std.mem.eql(u8, key, consumer_group_snapshot_record_key)) {
-            try self.applyConsumerGroupSnapshotRecord(value orelse return .none);
+            try self.applyConsumerGroupSnapshotRecord(value orelse return error.MalformedInternalRecordBatch);
             return .consumer_group_snapshot;
         }
         if (std.mem.eql(u8, key, share_group_data_snapshot_record_key)) {
-            try self.applyShareGroupDataSnapshotRecord(value orelse return .none);
+            try self.applyShareGroupDataSnapshotRecord(value orelse return error.MalformedInternalRecordBatch);
             return .share_group_data_snapshot;
         }
 
@@ -5733,8 +5733,8 @@ pub const Broker = struct {
                 var record_pos: usize = rec_batch.BATCH_HEADER_SIZE;
                 for (0..record_count) |_| {
                     const record = try rec_batch.parseRecord(batch, &record_pos);
-                    const key = record.key orelse continue;
-                    const value = record.value orelse continue;
+                    const key = record.key orelse return error.MalformedInternalRecordBatch;
+                    const value = record.value orelse return error.MalformedInternalRecordBatch;
                     if (try self.applyTransactionStateRecord(key, value)) restored += 1;
                 }
                 if (record_pos != batch.len) return error.MalformedInternalRecordBatch;
@@ -28895,6 +28895,53 @@ test "Broker internal log replay rejects malformed committed offset values" {
 
     try testing.expectError(error.MalformedOffsetCommitRecord, broker.applyConsumerOffsetRecordBatches(batch));
     try testing.expect((try broker.groups.fetchOffset("replay-bad-offset-value-group", "replay-bad-offset-value-topic", 0)) == null);
+}
+
+test "Broker internal log replay rejects null keys and invalid snapshot tombstones" {
+    const rec_batch = protocol.record_batch;
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+
+    const now = @import("time_compat").milliTimestamp();
+    const unkeyed_records = [_]rec_batch.Record{.{
+        .offset_delta = 0,
+        .key = null,
+        .value = "value",
+    }};
+    const unkeyed_batch = try rec_batch.buildRecordBatch(testing.allocator, 0, &unkeyed_records, -1, -1, -1, now, now, 0);
+    defer testing.allocator.free(unkeyed_batch);
+
+    try testing.expectError(error.MalformedInternalRecordBatch, broker.applyClusterMetadataRecordBatches(unkeyed_batch));
+    try testing.expectError(error.MalformedInternalRecordBatch, broker.applyConsumerOffsetRecordBatches(unkeyed_batch));
+    try testing.expectError(error.MalformedInternalRecordBatch, broker.applyTransactionStateRecordBatches(unkeyed_batch));
+
+    const cluster_tombstone_records = [_]rec_batch.Record{.{
+        .offset_delta = 0,
+        .key = topic_snapshot_record_key,
+        .value = null,
+    }};
+    const cluster_tombstone_batch = try rec_batch.buildRecordBatch(testing.allocator, 0, &cluster_tombstone_records, -1, -1, -1, now, now, 0);
+    defer testing.allocator.free(cluster_tombstone_batch);
+    try testing.expectError(error.MalformedInternalRecordBatch, broker.applyClusterMetadataRecordBatches(cluster_tombstone_batch));
+
+    const group_snapshot_tombstone_records = [_]rec_batch.Record{.{
+        .offset_delta = 0,
+        .key = consumer_group_snapshot_record_key,
+        .value = null,
+    }};
+    const group_snapshot_tombstone_batch = try rec_batch.buildRecordBatch(testing.allocator, 0, &group_snapshot_tombstone_records, -1, -1, -1, now, now, 0);
+    defer testing.allocator.free(group_snapshot_tombstone_batch);
+    try testing.expectError(error.MalformedInternalRecordBatch, broker.applyConsumerOffsetRecordBatches(group_snapshot_tombstone_batch));
+
+    const transaction_tombstone_records = [_]rec_batch.Record{.{
+        .offset_delta = 0,
+        .key = transaction_snapshot_record_key,
+        .value = null,
+    }};
+    const transaction_tombstone_batch = try rec_batch.buildRecordBatch(testing.allocator, 0, &transaction_tombstone_records, -1, -1, -1, now, now, 0);
+    defer testing.allocator.free(transaction_tombstone_batch);
+    try testing.expectError(error.MalformedInternalRecordBatch, broker.applyTransactionStateRecordBatches(transaction_tombstone_batch));
 }
 
 test "Broker.ensureTopic rolls back when partition state creation fails" {

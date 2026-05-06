@@ -63,8 +63,8 @@ operator-facing behavior.
   internal batches.
   Broker-owned internal log replay for `__cluster_metadata`,
   `__consumer_offsets`, and `__transaction_state` now rejects malformed headers,
-  truncated records, and trailing bytes instead of returning partial replay
-  success.
+  truncated records, trailing bytes, null internal record keys, and invalid
+  snapshot tombstones instead of returning partial replay success.
   Produce requests with full-size malformed Kafka record-batch headers or
   invalid batch-length envelopes now return `CORRUPT_MESSAGE` without
   appending data.

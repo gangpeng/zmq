@@ -24,11 +24,11 @@ single-node demo are not sufficient by themselves.
   enumerations and persisted offset restore must not silently skip malformed
   keys that belong to the requested group, and internal committed-offset replay
   must fail closed on malformed values for parseable offset keys. Internal
-  compacted-topic
-  compaction must fail closed on cache allocation and malformed record-batch
-  parser errors, and broker-owned internal log replay must reject malformed
-  record-batch headers, truncated records, and trailing bytes instead of partial
-  replay. Produce must reject full-size malformed Kafka record-batch headers and
+  compacted-topic compaction must fail closed on cache allocation and malformed
+  record-batch parser errors, and broker-owned internal log replay must reject malformed
+  record-batch headers, truncated records, trailing bytes, and records missing
+  required internal keys or values instead of partial replay. Produce must reject
+  full-size malformed Kafka record-batch headers and
   invalid batch-length envelopes before append, and idempotent Produce must
   reserve producer-sequence state before append so reservation failures do not
   acknowledge data with stale deduplication state. Producer-sequence recovery
