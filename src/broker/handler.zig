@@ -26124,49 +26124,43 @@ pub const Broker = struct {
 
         if (!validateWriteTxnMarkersRequestFrame(request_bytes, body_start, api_version)) {
             log.warn("Malformed WriteTxnMarkers request", .{});
-            return null;
+            return self.writeTxnMarkersErrorResponse(req_header, resp_header_version, api_version, ErrorCode.invalid_request);
         }
 
         var pos = body_start;
         var req = Req.deserialize(self.allocator, request_bytes, &pos, api_version) catch |err| {
             log.warn("Failed to decode WriteTxnMarkers request: {}", .{err});
-            return null;
+            return self.writeTxnMarkersErrorResponse(req_header, resp_header_version, api_version, ErrorCode.invalid_request);
         };
         defer self.freeWriteTxnMarkersRequest(&req);
 
-        const markers = self.allocator.alloc(MarkerResult, req.markers.len) catch return null;
-        var markers_init: usize = 0;
+        const markers = self.materializeWriteTxnMarkersResults(&req) catch |err| {
+            log.warn("WriteTxnMarkers response materialization failed: {}", .{err});
+            return self.writeTxnMarkersErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error);
+        };
         defer {
-            self.freeWriteTxnMarkersResults(markers[0..markers_init]);
+            self.freeWriteTxnMarkersResults(markers);
             if (markers.len > 0) self.allocator.free(markers);
         }
 
         var partition_state_dirty = false;
-        const previous_snapshot = self.encodeTransactionSnapshotRecordValue() catch return null;
+        const previous_snapshot = self.encodeTransactionSnapshotRecordValue() catch |err| {
+            log.warn("WriteTxnMarkers rollback snapshot materialization failed: {}", .{err});
+            return self.writeTxnMarkersErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error);
+        };
         defer self.allocator.free(previous_snapshot);
 
         if (self.store.s3_wal_mode) {
-            return self.handleWriteTxnMarkersS3Wal(&req, req_header, api_version, resp_header_version, markers, &markers_init, previous_snapshot);
+            return self.handleWriteTxnMarkersS3Wal(&req, req_header, api_version, resp_header_version, markers, previous_snapshot);
         }
 
-        for (req.markers) |marker| {
-            const topics = self.allocator.alloc(TopicResult, marker.topics.len) catch return null;
-            var topics_init: usize = 0;
-            var topics_transferred = false;
+        for (req.markers, markers) |marker, *marker_resp| {
+            const topics: []TopicResult = @constCast(marker_resp.topics);
             const marker_validation_error = self.validateLocalWriteTxnMarkerState(marker);
             var marker_has_partition_error = marker_validation_error != @intFromEnum(ErrorCode.none);
-            defer {
-                if (!topics_transferred) {
-                    self.freeWriteTxnMarkerTopicResults(topics[0..topics_init]);
-                    if (topics.len > 0) self.allocator.free(topics);
-                }
-            }
 
-            for (marker.topics) |topic_req| {
-                const partitions = self.allocator.alloc(PartitionResult, topic_req.partition_indexes.len) catch return null;
-                var partitions_transferred = false;
-                defer if (!partitions_transferred and partitions.len > 0) self.allocator.free(partitions);
-
+            for (marker.topics, topics) |topic_req, *topic_resp| {
+                const partitions: []PartitionResult = @constCast(topic_resp.partitions);
                 const topic = topic_req.name orelse "";
                 for (topic_req.partition_indexes, 0..) |partition_index, partition_idx| {
                     const write_result: TxnMarkerPartitionWriteResult = if (marker_validation_error == @intFromEnum(ErrorCode.none))
@@ -26180,35 +26174,21 @@ pub const Broker = struct {
                     if (write_result.mutated) partition_state_dirty = true;
                     if (write_result.error_code != @intFromEnum(ErrorCode.none)) marker_has_partition_error = true;
                 }
-
-                topics[topics_init] = .{
-                    .name = topic_req.name,
-                    .partitions = partitions,
-                };
-                topics_init += 1;
-                partitions_transferred = true;
             }
 
             if (!marker_has_partition_error) {
                 const coordinator_error = self.completeLocalWriteTxnMarkerState(marker.producer_id);
                 if (coordinator_error != @intFromEnum(ErrorCode.none)) {
-                    applyWriteTxnMarkerError(topics[0..topics_init], coordinator_error);
+                    applyWriteTxnMarkerError(topics, coordinator_error);
                 }
             }
-
-            markers[markers_init] = .{
-                .producer_id = marker.producer_id,
-                .topics = topics[0..topics_init],
-            };
-            markers_init += 1;
-            topics_transferred = true;
         }
 
         var local_marker_persistence_failed = false;
         if (partition_state_dirty) {
             self.persistPartitionAndObjectLocalMetadataDurably("WriteTxnMarkers") catch {
                 self.restoreTransactionsAfterFailedMutation(previous_snapshot);
-                for (markers[0..markers_init]) |*marker| {
+                for (markers) |*marker| {
                     applyWriteTxnMarkerError(marker.topics, @intFromEnum(ErrorCode.kafka_storage_error));
                 }
                 local_marker_persistence_failed = true;
@@ -26218,14 +26198,87 @@ pub const Broker = struct {
             self.persistTransactionsIfDirtyDurably() catch |err| {
                 log.warn("WriteTxnMarkers transaction snapshot write failed: {}", .{err});
                 self.restoreTransactionsAfterFailedMutation(previous_snapshot);
-                for (markers[0..markers_init]) |*marker| {
+                for (markers) |*marker| {
                     applyWriteTxnMarkerError(marker.topics, @intFromEnum(ErrorCode.kafka_storage_error));
                 }
             };
         }
 
-        const resp = Resp{ .markers = markers[0..markers_init] };
-        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+        return self.serializeWriteTxnMarkersResponseOrStorageError(req_header, resp_header_version, api_version, markers);
+    }
+
+    fn materializeWriteTxnMarkersResults(self: *Broker, req: *const generated.write_txn_markers_request.WriteTxnMarkersRequest) ![]generated.write_txn_markers_response.WriteTxnMarkersResponse.WritableTxnMarkerResult {
+        const MarkerResult = generated.write_txn_markers_response.WriteTxnMarkersResponse.WritableTxnMarkerResult;
+
+        if (req.markers.len == 0) return &.{};
+
+        const markers = try self.allocator.alloc(MarkerResult, req.markers.len);
+        var markers_init: usize = 0;
+        errdefer {
+            self.freeWriteTxnMarkersResults(markers[0..markers_init]);
+            self.allocator.free(markers);
+        }
+
+        for (req.markers) |marker_req| {
+            const topics = try self.materializeWriteTxnMarkerTopicResults(marker_req);
+            markers[markers_init] = .{
+                .producer_id = marker_req.producer_id,
+                .topics = topics,
+            };
+            markers_init += 1;
+        }
+
+        return markers;
+    }
+
+    fn materializeWriteTxnMarkerTopicResults(self: *Broker, marker: generated.write_txn_markers_request.WriteTxnMarkersRequest.WritableTxnMarker) ![]generated.write_txn_markers_response.WriteTxnMarkersResponse.WritableTxnMarkerResult.WritableTxnMarkerTopicResult {
+        const TopicResult = generated.write_txn_markers_response.WriteTxnMarkersResponse.WritableTxnMarkerResult.WritableTxnMarkerTopicResult;
+        const PartitionResult = TopicResult.WritableTxnMarkerPartitionResult;
+
+        if (marker.topics.len == 0) return &.{};
+
+        const topics = try self.allocator.alloc(TopicResult, marker.topics.len);
+        var topics_init: usize = 0;
+        errdefer {
+            self.freeWriteTxnMarkerTopicResults(topics[0..topics_init]);
+            self.allocator.free(topics);
+        }
+
+        for (marker.topics) |topic_req| {
+            var partitions: []PartitionResult = &.{};
+            if (topic_req.partition_indexes.len > 0) {
+                partitions = try self.allocator.alloc(PartitionResult, topic_req.partition_indexes.len);
+                for (topic_req.partition_indexes, 0..) |partition_index, partition_idx| {
+                    partitions[partition_idx] = .{
+                        .partition_index = partition_index,
+                        .error_code = @intFromEnum(ErrorCode.kafka_storage_error),
+                    };
+                }
+            }
+
+            topics[topics_init] = .{
+                .name = topic_req.name,
+                .partitions = partitions,
+            };
+            topics_init += 1;
+        }
+
+        return topics;
+    }
+
+    fn serializeWriteTxnMarkersResponseOrStorageError(
+        self: *Broker,
+        req_header: *const RequestHeader,
+        resp_header_version: i16,
+        api_version: i16,
+        markers: []const generated.write_txn_markers_response.WriteTxnMarkersResponse.WritableTxnMarkerResult,
+    ) ?[]u8 {
+        const Resp = generated.write_txn_markers_response.WriteTxnMarkersResponse;
+        const resp = Resp{ .markers = markers };
+        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version) orelse {
+            log.warn("WriteTxnMarkers response serialization failed", .{});
+            return self.writeTxnMarkersErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error);
+        };
     }
 
     fn freeWriteTxnMarkersRequest(self: *Broker, req: *generated.write_txn_markers_request.WriteTxnMarkersRequest) void {
@@ -26268,7 +26321,6 @@ pub const Broker = struct {
         api_version: i16,
         resp_header_version: i16,
         markers: []generated.write_txn_markers_response.WriteTxnMarkersResponse.WritableTxnMarkerResult,
-        markers_init: *usize,
         previous_snapshot: []const u8,
     ) ?[]u8 {
         const Resp = generated.write_txn_markers_response.WriteTxnMarkersResponse;
@@ -26289,24 +26341,13 @@ pub const Broker = struct {
 
         var coordinator_state_dirty = false;
 
-        for (req.markers) |marker| {
-            const topics = self.allocator.alloc(TopicResult, marker.topics.len) catch return null;
-            var topics_init: usize = 0;
-            var topics_transferred = false;
+        for (req.markers, markers) |marker, *marker_resp| {
+            const topics: []TopicResult = @constCast(marker_resp.topics);
             const marker_validation_error = self.validateLocalWriteTxnMarkerState(marker);
             var marker_has_partition_error = marker_validation_error != @intFromEnum(ErrorCode.none);
-            defer {
-                if (!topics_transferred) {
-                    self.freeWriteTxnMarkerTopicResults(topics[0..topics_init]);
-                    if (topics.len > 0) self.allocator.free(topics);
-                }
-            }
 
-            for (marker.topics) |topic_req| {
-                const partitions = self.allocator.alloc(PartitionResult, topic_req.partition_indexes.len) catch return null;
-                var partitions_transferred = false;
-                defer if (!partitions_transferred and partitions.len > 0) self.allocator.free(partitions);
-
+            for (marker.topics, topics) |topic_req, *topic_resp| {
+                const partitions: []PartitionResult = @constCast(topic_resp.partitions);
                 const topic = topic_req.name orelse "";
                 for (topic_req.partition_indexes, 0..) |partition_index, partition_idx| {
                     const write_result: TxnMarkerPartitionWriteResult = if (marker_validation_error == @intFromEnum(ErrorCode.none))
@@ -26319,41 +26360,26 @@ pub const Broker = struct {
                     };
                     if (write_result.error_code != @intFromEnum(ErrorCode.none)) marker_has_partition_error = true;
                 }
-
-                topics[topics_init] = .{
-                    .name = topic_req.name,
-                    .partitions = partitions,
-                };
-                topics_init += 1;
-                partitions_transferred = true;
             }
 
             if (!marker_has_partition_error) {
                 const coordinator_error = self.completeLocalWriteTxnMarkerState(marker.producer_id);
                 if (coordinator_error != @intFromEnum(ErrorCode.none)) {
-                    applyWriteTxnMarkerError(topics[0..topics_init], coordinator_error);
+                    applyWriteTxnMarkerError(topics, coordinator_error);
                 } else {
                     coordinator_state_dirty = true;
                 }
             }
-
-            markers[markers_init.*] = .{
-                .producer_id = marker.producer_id,
-                .topics = topics[0..topics_init],
-            };
-            markers_init.* += 1;
-            topics_transferred = true;
         }
 
         if (coordinator_state_dirty) {
             self.planTransactionSnapshotS3WalWrite(&provisional_offsets, &pending_writes) catch |err| {
                 log.warn("WriteTxnMarkers transaction snapshot build failed: {}", .{err});
                 self.restoreTransactionsAfterFailedMutation(previous_snapshot);
-                for (markers[0..markers_init.*]) |*marker| {
+                for (markers) |*marker| {
                     applyWriteTxnMarkerError(marker.topics, @intFromEnum(ErrorCode.kafka_storage_error));
                 }
-                const resp = Resp{ .markers = markers[0..markers_init.*] };
-                return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+                return self.serializeWriteTxnMarkersResponseOrStorageError(req_header, resp_header_version, api_version, markers);
             };
         }
 
@@ -26361,38 +26387,34 @@ pub const Broker = struct {
             self.flushPendingTxnMarkerS3WalWrites(pending_writes.items) catch |err| {
                 log.warn("WriteTxnMarkers atomic S3 WAL flush failed: {}", .{err});
                 if (coordinator_state_dirty) self.restoreTransactionsAfterFailedMutation(previous_snapshot);
-                for (markers[0..markers_init.*]) |*marker| {
+                for (markers) |*marker| {
                     applyWriteTxnMarkerError(marker.topics, @intFromEnum(ErrorCode.kafka_storage_error));
                 }
-                const resp = Resp{ .markers = markers[0..markers_init.*] };
-                return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+                return self.serializeWriteTxnMarkersResponseOrStorageError(req_header, resp_header_version, api_version, markers);
             };
 
             self.applyCommittedTxnMarkerS3WalWrites(pending_writes.items);
             self.persistPartitionAndObjectLocalMetadataDurably("WriteTxnMarkers S3 WAL marker") catch |err| {
                 log.warn("WriteTxnMarkers local marker metadata persistence failed after S3 WAL flush: {}", .{err});
-                for (markers[0..markers_init.*]) |*marker| {
+                for (markers) |*marker| {
                     applyWriteTxnMarkerError(marker.topics, @intFromEnum(ErrorCode.kafka_storage_error));
                 }
-                const resp = Resp{ .markers = markers[0..markers_init.*] };
-                return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+                return self.serializeWriteTxnMarkersResponseOrStorageError(req_header, resp_header_version, api_version, markers);
             };
         }
 
         if (coordinator_state_dirty) {
             self.persistence.saveTransactions(&self.txn_coordinator) catch |err| {
                 log.warn("Failed to persist transaction state after atomic WriteTxnMarkers S3 WAL flush: {}", .{err});
-                for (markers[0..markers_init.*]) |*marker| {
+                for (markers) |*marker| {
                     applyWriteTxnMarkerError(marker.topics, @intFromEnum(ErrorCode.kafka_storage_error));
                 }
-                const resp = Resp{ .markers = markers[0..markers_init.*] };
-                return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+                return self.serializeWriteTxnMarkersResponseOrStorageError(req_header, resp_header_version, api_version, markers);
             };
             self.txn_coordinator.dirty = false;
         }
 
-        const resp = Resp{ .markers = markers[0..markers_init.*] };
-        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+        return self.serializeWriteTxnMarkersResponseOrStorageError(req_header, resp_header_version, api_version, markers);
     }
 
     fn planTxnMarkerS3WalPartition(
@@ -39251,7 +39273,11 @@ test "Broker.handleRequest WriteTxnMarkers rejects truncated request" {
 
     var buf: [128]u8 = undefined;
     const req_len = buildTestRequest(&buf, 27, 1, 2702, header_mod.requestHeaderVersion(27, 1));
-    try testing.expect(broker.handleRequest(buf[0..req_len]) == null);
+    const response = broker.handleRequest(buf[0..req_len]);
+    try testing.expect(response != null);
+    defer testing.allocator.free(response.?);
+
+    try expectWriteTxnMarkersErrorResponseBytes(&broker, response.?, 1, 2702, ErrorCode.invalid_request);
 }
 
 test "Broker.handleRequest WriteTxnMarkers rejects trailing bytes" {
@@ -39278,7 +39304,13 @@ test "Broker.handleRequest WriteTxnMarkers rejects trailing bytes" {
     var pos = buildTestRequest(&buf, 27, 1, 2715, header_mod.requestHeaderVersion(27, 1));
     req.serialize(&buf, &pos, 1);
 
-    try expectTrailingByteRejected(&broker, buf[0..], pos);
+    try testing.expect(pos < buf.len);
+    buf[pos] = 0x7f;
+    const response = broker.handleRequest(buf[0 .. pos + 1]);
+    try testing.expect(response != null);
+    defer testing.allocator.free(response.?);
+
+    try expectWriteTxnMarkersErrorResponseBytes(&broker, response.?, 1, 2715, ErrorCode.invalid_request);
 }
 
 test "Broker.handleRequest WriteTxnMarkers authorization denial uses generated response" {
