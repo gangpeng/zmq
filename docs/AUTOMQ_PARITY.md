@@ -692,7 +692,9 @@ Status: completed for the initial catalog and DeleteGroups slice.
   materialization, persistence, or response serialization failures. Their
   success frames are materialized before durable token mutations are
   acknowledged, and the visible token state is restored if a success response
-  cannot be built.
+  cannot be built. Delegation-token generated error helpers now also retry with
+  storage-error frames if an invalid-request or storage-error response
+  allocation fails transiently.
   Normal AutoMQ read paths for GetKVs, GetOpeningStreams, AutomqGetNodes,
   AutomqGetPartitionSnapshot, DescribeLicense, ExportClusterManifest, and
   DescribeStreams now use the same generated invalid-request/storage-error

@@ -8105,7 +8105,14 @@ pub const Broker = struct {
             .error_code = @intFromEnum(err_code),
             .throttle_time_ms = 0,
         };
-        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version) orelse {
+            log.warn("CreateDelegationToken error response serialization failed", .{});
+            const storage_resp = Resp{
+                .error_code = @intFromEnum(ErrorCode.kafka_storage_error),
+                .throttle_time_ms = 0,
+            };
+            return self.serializeGeneratedResponse(req_header, resp_header_version, &storage_resp, api_version);
+        };
     }
 
     fn handleRenewDelegationTokenAuthorizationError(
@@ -8149,7 +8156,15 @@ pub const Broker = struct {
             .expiry_timestamp_ms = 0,
             .throttle_time_ms = 0,
         };
-        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version) orelse {
+            log.warn("RenewDelegationToken error response serialization failed", .{});
+            const storage_resp = Resp{
+                .error_code = @intFromEnum(ErrorCode.kafka_storage_error),
+                .expiry_timestamp_ms = 0,
+                .throttle_time_ms = 0,
+            };
+            return self.serializeGeneratedResponse(req_header, resp_header_version, &storage_resp, api_version);
+        };
     }
 
     fn handleExpireDelegationTokenAuthorizationError(
@@ -8193,7 +8208,15 @@ pub const Broker = struct {
             .expiry_timestamp_ms = 0,
             .throttle_time_ms = 0,
         };
-        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version) orelse {
+            log.warn("ExpireDelegationToken error response serialization failed", .{});
+            const storage_resp = Resp{
+                .error_code = @intFromEnum(ErrorCode.kafka_storage_error),
+                .expiry_timestamp_ms = 0,
+                .throttle_time_ms = 0,
+            };
+            return self.serializeGeneratedResponse(req_header, resp_header_version, &storage_resp, api_version);
+        };
     }
 
     fn handleDescribeDelegationTokenAuthorizationError(
@@ -8238,7 +8261,15 @@ pub const Broker = struct {
             .tokens = &.{},
             .throttle_time_ms = 0,
         };
-        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version) orelse {
+            log.warn("DescribeDelegationToken error response serialization failed", .{});
+            const storage_resp = Resp{
+                .error_code = @intFromEnum(ErrorCode.kafka_storage_error),
+                .tokens = &.{},
+                .throttle_time_ms = 0,
+            };
+            return self.serializeGeneratedResponse(req_header, resp_header_version, &storage_resp, api_version);
+        };
     }
 
     fn handleElectLeadersAuthorizationError(
@@ -45488,6 +45519,49 @@ test "Broker.handleRequest delegation token mutations roll back when success res
         const restored_token = broker.delegationTokenByHmac(&token.hmac);
         try testing.expect(restored_token != null);
         try testing.expectEqual(original_expiry_timestamp_ms, restored_token.?.expiry_timestamp_ms);
+    }
+}
+
+test "Broker.handleRequest delegation token malformed responses recover from serialization failure" {
+    const CreateResp = generated.create_delegation_token_response.CreateDelegationTokenResponse;
+    const RenewResp = generated.renew_delegation_token_response.RenewDelegationTokenResponse;
+    const ExpireResp = generated.expire_delegation_token_response.ExpireDelegationTokenResponse;
+    const DescribeResp = generated.describe_delegation_token_response.DescribeDelegationTokenResponse;
+    const storage_error = @as(i16, @intFromEnum(ErrorCode.kafka_storage_error));
+
+    const probes = [_]struct { key: i16, version: i16, correlation_id: i32 }{
+        .{ .key = 38, .version = 3, .correlation_id = 3824 },
+        .{ .key = 39, .version = 2, .correlation_id = 3924 },
+        .{ .key = 40, .version = 2, .correlation_id = 4024 },
+        .{ .key = 41, .version = 3, .correlation_id = 4124 },
+    };
+
+    for (probes) |probe| {
+        var broker = Broker.init(testing.allocator, 1, 9092);
+        defer broker.deinit();
+
+        var buf: [128]u8 = undefined;
+        const req_len = buildTestRequest(&buf, probe.key, probe.version, probe.correlation_id, header_mod.requestHeaderVersion(probe.key, probe.version));
+
+        var failing_allocator = OneShotFailingAllocator.init(testing.allocator, 0);
+        const response_allocator = failing_allocator.allocator();
+        broker.allocator = response_allocator;
+
+        const response = broker.handleRequest(buf[0..req_len]);
+        broker.allocator = testing.allocator;
+
+        try testing.expect(failing_allocator.failed);
+        try testing.expect(response != null);
+        defer response_allocator.free(response.?);
+
+        const error_code = switch (probe.key) {
+            38 => try readGeneratedTopLevelErrorCode(CreateResp, response.?, probe.key, probe.version, probe.correlation_id),
+            39 => try readGeneratedTopLevelErrorCode(RenewResp, response.?, probe.key, probe.version, probe.correlation_id),
+            40 => try readGeneratedTopLevelErrorCode(ExpireResp, response.?, probe.key, probe.version, probe.correlation_id),
+            41 => try readGeneratedTopLevelErrorCode(DescribeResp, response.?, probe.key, probe.version, probe.correlation_id),
+            else => unreachable,
+        };
+        try testing.expectEqual(storage_error, error_code);
     }
 }
 
