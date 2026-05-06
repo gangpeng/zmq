@@ -7010,19 +7010,22 @@ pub const Broker = struct {
 
         if (!validateDeleteGroupsRequestFrame(request_bytes, body_start, api_version)) {
             log.warn("Malformed denied DeleteGroups request", .{});
-            return null;
+            return self.deleteGroupsErrorResponse(req_header, resp_header_version, api_version, ErrorCode.invalid_request);
         }
 
         var pos = body_start;
         const req = Req.deserialize(self.allocator, request_bytes, &pos, api_version) catch |err| {
             log.warn("Failed to decode denied DeleteGroups request: {}", .{err});
-            return null;
+            return self.deleteGroupsErrorResponse(req_header, resp_header_version, api_version, ErrorCode.invalid_request);
         };
         defer if (req.groups_names.len > 0) self.allocator.free(req.groups_names);
 
         var results: []Result = &.{};
         if (req.groups_names.len > 0) {
-            results = self.allocator.alloc(Result, req.groups_names.len) catch return null;
+            results = self.allocator.alloc(Result, req.groups_names.len) catch |err| {
+                log.warn("DeleteGroups denied response allocation failed: {}", .{err});
+                return self.deleteGroupsErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error);
+            };
         }
         defer if (results.len > 0) self.allocator.free(results);
 
@@ -7036,6 +7039,23 @@ pub const Broker = struct {
         const resp = Resp{
             .throttle_time_ms = 0,
             .results = results,
+        };
+        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version) orelse {
+            log.warn("DeleteGroups denied response serialization failed", .{});
+            return self.deleteGroupsErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error);
+        };
+    }
+
+    fn deleteGroupsErrorResponse(self: *Broker, req_header: *const RequestHeader, resp_header_version: i16, api_version: i16, err_code: ErrorCode) ?[]u8 {
+        const Resp = generated.delete_groups_response.DeleteGroupsResponse;
+        const Result = Resp.DeletableGroupResult;
+        const results = [_]Result{.{
+            .group_id = null,
+            .error_code = @intFromEnum(err_code),
+        }};
+        const resp = Resp{
+            .throttle_time_ms = 0,
+            .results = &results,
         };
         return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
     }
@@ -7122,19 +7142,22 @@ pub const Broker = struct {
 
         if (!validateFindCoordinatorRequestFrame(request_bytes, body_start, api_version)) {
             log.warn("Malformed denied FindCoordinator request", .{});
-            return null;
+            return self.findCoordinatorErrorResponse(req_header, resp_header_version, api_version, ErrorCode.invalid_request, "Invalid request");
         }
 
         var pos = body_start;
         var req = Req.deserialize(self.allocator, request_bytes, &pos, api_version) catch |err| {
             log.warn("Failed to decode denied FindCoordinator request: {}", .{err});
-            return null;
+            return self.findCoordinatorErrorResponse(req_header, resp_header_version, api_version, ErrorCode.invalid_request, "Invalid request");
         };
         defer self.freeFindCoordinatorRequest(&req);
 
         var coordinators: []Coordinator = &.{};
         if (api_version >= 4 and req.coordinator_keys.len > 0) {
-            coordinators = self.allocator.alloc(Coordinator, req.coordinator_keys.len) catch return null;
+            coordinators = self.allocator.alloc(Coordinator, req.coordinator_keys.len) catch |err| {
+                log.warn("FindCoordinator denied response allocation failed: {}", .{err});
+                return self.findCoordinatorErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error, "Failed to materialize coordinator authorization response");
+            };
             for (req.coordinator_keys, 0..) |key, idx| {
                 coordinators[idx] = .{
                     .key = key,
@@ -7157,7 +7180,10 @@ pub const Broker = struct {
             .port = -1,
             .coordinators = coordinators,
         };
-        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version) orelse {
+            log.warn("FindCoordinator denied response serialization failed", .{});
+            return self.findCoordinatorErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error, "Failed to serialize coordinator authorization response");
+        };
     }
 
     fn handleJoinGroupAuthorizationError(
@@ -7174,13 +7200,13 @@ pub const Broker = struct {
 
         if (!validateJoinGroupRequestFrame(request_bytes, body_start, api_version)) {
             log.warn("Malformed denied JoinGroup request", .{});
-            return null;
+            return self.joinGroupErrorResponse(req_header, resp_header_version, api_version, ErrorCode.invalid_request);
         }
 
         var pos = body_start;
         var req = Req.deserialize(self.allocator, request_bytes, &pos, api_version) catch |err| {
             log.warn("Failed to decode denied JoinGroup request: {}", .{err});
-            return null;
+            return self.joinGroupErrorResponse(req_header, resp_header_version, api_version, ErrorCode.invalid_request);
         };
         defer self.freeJoinGroupRequest(&req);
 
@@ -7194,6 +7220,25 @@ pub const Broker = struct {
             .leader = "",
             .skip_assignment = false,
             .member_id = req.member_id orelse "",
+            .members = &.{},
+        };
+        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version) orelse {
+            log.warn("JoinGroup denied response serialization failed", .{});
+            return self.joinGroupErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error);
+        };
+    }
+
+    fn joinGroupErrorResponse(self: *Broker, req_header: *const RequestHeader, resp_header_version: i16, api_version: i16, err_code: ErrorCode) ?[]u8 {
+        const Resp = generated.join_group_response.JoinGroupResponse;
+        const resp = Resp{
+            .throttle_time_ms = 0,
+            .error_code = @intFromEnum(err_code),
+            .generation_id = -1,
+            .protocol_type = "",
+            .protocol_name = "",
+            .leader = "",
+            .skip_assignment = false,
+            .member_id = "",
             .members = &.{},
         };
         return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
@@ -7212,9 +7257,21 @@ pub const Broker = struct {
 
         if (!validateHeartbeatRequestFrame(request_bytes, body_start, api_version)) {
             log.warn("Malformed denied Heartbeat request", .{});
-            return null;
+            return self.heartbeatErrorResponse(req_header, resp_header_version, api_version, ErrorCode.invalid_request);
         }
 
+        const resp = Resp{
+            .throttle_time_ms = 0,
+            .error_code = @intFromEnum(err_code),
+        };
+        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version) orelse {
+            log.warn("Heartbeat denied response serialization failed", .{});
+            return self.heartbeatErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error);
+        };
+    }
+
+    fn heartbeatErrorResponse(self: *Broker, req_header: *const RequestHeader, resp_header_version: i16, api_version: i16, err_code: ErrorCode) ?[]u8 {
+        const Resp = generated.heartbeat_response.HeartbeatResponse;
         const resp = Resp{
             .throttle_time_ms = 0,
             .error_code = @intFromEnum(err_code),
@@ -7237,19 +7294,22 @@ pub const Broker = struct {
 
         if (!validateLeaveGroupRequestFrame(request_bytes, body_start, api_version)) {
             log.warn("Malformed denied LeaveGroup request", .{});
-            return null;
+            return self.leaveGroupErrorResponse(req_header, resp_header_version, api_version, ErrorCode.invalid_request);
         }
 
         var pos = body_start;
         var req = Req.deserialize(self.allocator, request_bytes, &pos, api_version) catch |err| {
             log.warn("Failed to decode denied LeaveGroup request: {}", .{err});
-            return null;
+            return self.leaveGroupErrorResponse(req_header, resp_header_version, api_version, ErrorCode.invalid_request);
         };
         defer self.freeLeaveGroupRequest(&req);
 
         var members: []MemberResponse = &.{};
         if (api_version >= 3 and req.members.len > 0) {
-            members = self.allocator.alloc(MemberResponse, req.members.len) catch return null;
+            members = self.allocator.alloc(MemberResponse, req.members.len) catch |err| {
+                log.warn("LeaveGroup denied response allocation failed: {}", .{err});
+                return self.leaveGroupErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error);
+            };
             for (req.members, 0..) |member, idx| {
                 members[idx] = .{
                     .member_id = member.member_id,
@@ -7264,6 +7324,19 @@ pub const Broker = struct {
             .throttle_time_ms = 0,
             .error_code = @intFromEnum(err_code),
             .members = members,
+        };
+        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version) orelse {
+            log.warn("LeaveGroup denied response serialization failed", .{});
+            return self.leaveGroupErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error);
+        };
+    }
+
+    fn leaveGroupErrorResponse(self: *Broker, req_header: *const RequestHeader, resp_header_version: i16, api_version: i16, err_code: ErrorCode) ?[]u8 {
+        const Resp = generated.leave_group_response.LeaveGroupResponse;
+        const resp = Resp{
+            .throttle_time_ms = 0,
+            .error_code = @intFromEnum(err_code),
+            .members = &.{},
         };
         return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
     }
@@ -7282,13 +7355,13 @@ pub const Broker = struct {
 
         if (!validateSyncGroupRequestFrame(request_bytes, body_start, api_version)) {
             log.warn("Malformed denied SyncGroup request", .{});
-            return null;
+            return self.syncGroupErrorResponse(req_header, resp_header_version, api_version, ErrorCode.invalid_request);
         }
 
         var pos = body_start;
         var req = Req.deserialize(self.allocator, request_bytes, &pos, api_version) catch |err| {
             log.warn("Failed to decode denied SyncGroup request: {}", .{err});
-            return null;
+            return self.syncGroupErrorResponse(req_header, resp_header_version, api_version, ErrorCode.invalid_request);
         };
         defer self.freeSyncGroupRequest(&req);
 
@@ -7297,6 +7370,21 @@ pub const Broker = struct {
             .error_code = @intFromEnum(err_code),
             .protocol_type = req.protocol_type orelse "",
             .protocol_name = req.protocol_name orelse "",
+            .assignment = null,
+        };
+        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version) orelse {
+            log.warn("SyncGroup denied response serialization failed", .{});
+            return self.syncGroupErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error);
+        };
+    }
+
+    fn syncGroupErrorResponse(self: *Broker, req_header: *const RequestHeader, resp_header_version: i16, api_version: i16, err_code: ErrorCode) ?[]u8 {
+        const Resp = generated.sync_group_response.SyncGroupResponse;
+        const resp = Resp{
+            .throttle_time_ms = 0,
+            .error_code = @intFromEnum(err_code),
+            .protocol_type = "",
+            .protocol_name = "",
             .assignment = null,
         };
         return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
@@ -7317,19 +7405,22 @@ pub const Broker = struct {
 
         if (!validateDescribeGroupsRequestFrame(request_bytes, body_start, api_version)) {
             log.warn("Malformed denied DescribeGroups request", .{});
-            return null;
+            return self.describeGroupsErrorResponse(req_header, resp_header_version, api_version, ErrorCode.invalid_request);
         }
 
         var pos = body_start;
         var req = Req.deserialize(self.allocator, request_bytes, &pos, api_version) catch |err| {
             log.warn("Failed to decode denied DescribeGroups request: {}", .{err});
-            return null;
+            return self.describeGroupsErrorResponse(req_header, resp_header_version, api_version, ErrorCode.invalid_request);
         };
         defer self.freeDescribeGroupsRequest(&req);
 
         var groups: []DescribedGroup = &.{};
         if (req.groups.len > 0) {
-            groups = self.allocator.alloc(DescribedGroup, req.groups.len) catch return null;
+            groups = self.allocator.alloc(DescribedGroup, req.groups.len) catch |err| {
+                log.warn("DescribeGroups denied response allocation failed: {}", .{err});
+                return self.describeGroupsErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error);
+            };
         }
         defer if (groups.len > 0) self.allocator.free(groups);
 
@@ -7349,10 +7440,45 @@ pub const Broker = struct {
             .throttle_time_ms = 0,
             .groups = groups,
         };
+        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version) orelse {
+            log.warn("DescribeGroups denied response serialization failed", .{});
+            return self.describeGroupsErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error);
+        };
+    }
+
+    fn describeGroupsErrorResponse(self: *Broker, req_header: *const RequestHeader, resp_header_version: i16, api_version: i16, err_code: ErrorCode) ?[]u8 {
+        const Resp = generated.describe_groups_response.DescribeGroupsResponse;
+        const DescribedGroup = Resp.DescribedGroup;
+        const groups = [_]DescribedGroup{.{
+            .error_code = @intFromEnum(err_code),
+            .group_id = null,
+            .group_state = "",
+            .protocol_type = "",
+            .protocol_data = "",
+            .members = &.{},
+            .authorized_operations = describeGroupsAuthorizedOps(false),
+        }};
+        const resp = Resp{
+            .throttle_time_ms = 0,
+            .groups = &groups,
+        };
         return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
     }
 
     fn handleListGroupsAuthorizationError(self: *Broker, req_header: *const RequestHeader, api_version: i16, resp_header_version: i16, err_code: ErrorCode) ?[]u8 {
+        const Resp = generated.list_groups_response.ListGroupsResponse;
+        const resp = Resp{
+            .throttle_time_ms = 0,
+            .error_code = @intFromEnum(err_code),
+            .groups = &.{},
+        };
+        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version) orelse {
+            log.warn("ListGroups denied response serialization failed", .{});
+            return self.listGroupsErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error);
+        };
+    }
+
+    fn listGroupsErrorResponse(self: *Broker, req_header: *const RequestHeader, resp_header_version: i16, api_version: i16, err_code: ErrorCode) ?[]u8 {
         const Resp = generated.list_groups_response.ListGroupsResponse;
         const resp = Resp{
             .throttle_time_ms = 0,
@@ -30039,6 +30165,77 @@ fn readGeneratedTopLevelErrorCode(comptime RespType: type, response: []const u8,
     return resp.error_code;
 }
 
+fn readGroupCoordinatorAuthorizationErrorCode(response: []const u8, api_key: i16, api_version: i16, correlation_id: i32) !i16 {
+    var rpos: usize = 0;
+    var response_header = try ResponseHeader.deserialize(testing.allocator, response, &rpos, header_mod.responseHeaderVersion(api_key, api_version));
+    defer response_header.deinit(testing.allocator);
+    try testing.expectEqual(correlation_id, response_header.correlation_id);
+
+    switch (api_key) {
+        10 => {
+            const Resp = generated.find_coordinator_response.FindCoordinatorResponse;
+            const resp = try Resp.deserialize(testing.allocator, response, &rpos, api_version);
+            defer if (resp.coordinators.len > 0) testing.allocator.free(resp.coordinators);
+            try testing.expectEqual(response.len, rpos);
+            if (api_version >= 4) {
+                try testing.expectEqual(@as(usize, 1), resp.coordinators.len);
+                return resp.coordinators[0].error_code;
+            }
+            return resp.error_code;
+        },
+        11 => {
+            const Resp = generated.join_group_response.JoinGroupResponse;
+            const resp = try Resp.deserialize(testing.allocator, response, &rpos, api_version);
+            defer if (resp.members.len > 0) testing.allocator.free(resp.members);
+            try testing.expectEqual(response.len, rpos);
+            return resp.error_code;
+        },
+        12 => {
+            const Resp = generated.heartbeat_response.HeartbeatResponse;
+            const resp = try Resp.deserialize(testing.allocator, response, &rpos, api_version);
+            try testing.expectEqual(response.len, rpos);
+            return resp.error_code;
+        },
+        13 => {
+            const Resp = generated.leave_group_response.LeaveGroupResponse;
+            const resp = try Resp.deserialize(testing.allocator, response, &rpos, api_version);
+            defer if (resp.members.len > 0) testing.allocator.free(resp.members);
+            try testing.expectEqual(response.len, rpos);
+            return resp.error_code;
+        },
+        14 => {
+            const Resp = generated.sync_group_response.SyncGroupResponse;
+            const resp = try Resp.deserialize(testing.allocator, response, &rpos, api_version);
+            try testing.expectEqual(response.len, rpos);
+            return resp.error_code;
+        },
+        15 => {
+            const Resp = generated.describe_groups_response.DescribeGroupsResponse;
+            const resp = try Resp.deserialize(testing.allocator, response, &rpos, api_version);
+            defer if (resp.groups.len > 0) testing.allocator.free(resp.groups);
+            try testing.expectEqual(response.len, rpos);
+            try testing.expectEqual(@as(usize, 1), resp.groups.len);
+            return resp.groups[0].error_code;
+        },
+        16 => {
+            const Resp = generated.list_groups_response.ListGroupsResponse;
+            const resp = try Resp.deserialize(testing.allocator, response, &rpos, api_version);
+            defer if (resp.groups.len > 0) testing.allocator.free(resp.groups);
+            try testing.expectEqual(response.len, rpos);
+            return resp.error_code;
+        },
+        42 => {
+            const Resp = generated.delete_groups_response.DeleteGroupsResponse;
+            const resp = try Resp.deserialize(testing.allocator, response, &rpos, api_version);
+            defer if (resp.results.len > 0) testing.allocator.free(resp.results);
+            try testing.expectEqual(response.len, rpos);
+            try testing.expectEqual(@as(usize, 1), resp.results.len);
+            return resp.results[0].error_code;
+        },
+        else => return error.UnsupportedApiKey,
+    }
+}
+
 fn expectWriteTxnMarkersErrorResponseBytes(broker: *Broker, response: []const u8, api_version: i16, correlation_id: i32, err_code: ErrorCode) !void {
     const Resp = generated.write_txn_markers_response.WriteTxnMarkersResponse;
 
@@ -33952,6 +34149,311 @@ test "Broker.handleRequest DeleteGroups authorization denial uses generated resp
     try testing.expectEqualStrings("delete-denied-missing", resp.results[1].group_id.?);
     try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.group_authorization_failed)), resp.results[1].error_code);
     try testing.expectEqual(@as(usize, 1), broker.groups.groupCount());
+}
+
+test "Broker.handleRequest group coordinator authorization denial rejects malformed requests" {
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+    try broker.authorizer.addAcl("other-client", .group, "*", .literal, .read, .allow, "*");
+    try broker.authorizer.addAcl("other-client", .group, "*", .literal, .describe, .allow, "*");
+    try broker.authorizer.addAcl("other-client", .group, "*", .literal, .delete, .allow, "*");
+
+    const cases = [_]struct {
+        api_key: i16,
+        api_version: i16,
+        correlation_id: i32,
+    }{
+        .{ .api_key = 10, .api_version = 4, .correlation_id = 1015 },
+        .{ .api_key = 11, .api_version = 9, .correlation_id = 1115 },
+        .{ .api_key = 12, .api_version = 4, .correlation_id = 1215 },
+        .{ .api_key = 13, .api_version = 5, .correlation_id = 1315 },
+        .{ .api_key = 14, .api_version = 5, .correlation_id = 1415 },
+        .{ .api_key = 15, .api_version = 5, .correlation_id = 1515 },
+        .{ .api_key = 42, .api_version = 2, .correlation_id = 4215 },
+    };
+
+    for (cases) |case| {
+        var buf: [128]u8 = undefined;
+        const req_len = buildTestRequest(&buf, case.api_key, case.api_version, case.correlation_id, header_mod.requestHeaderVersion(case.api_key, case.api_version));
+
+        const response = broker.handleRequest(buf[0..req_len]);
+        try testing.expect(response != null);
+        defer testing.allocator.free(response.?);
+
+        const error_code = try readGroupCoordinatorAuthorizationErrorCode(response.?, case.api_key, case.api_version, case.correlation_id);
+        try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.invalid_request)), error_code);
+    }
+}
+
+test "Broker.handleRequest group coordinator authorization denial fails closed when serialization fails" {
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+    try broker.authorizer.addAcl("other-client", .group, "*", .literal, .read, .allow, "*");
+    try broker.authorizer.addAcl("other-client", .group, "*", .literal, .describe, .allow, "*");
+    try broker.authorizer.addAcl("other-client", .group, "*", .literal, .delete, .allow, "*");
+
+    {
+        const Req = generated.list_groups_request.ListGroupsRequest;
+        const req = Req{ .states_filter = &.{}, .types_filter = &.{} };
+        var buf: [128]u8 = undefined;
+        var pos = buildTestRequest(&buf, 16, 5, 1611, header_mod.requestHeaderVersion(16, 5));
+        req.serialize(&buf, &pos, 5);
+
+        var failing_allocator = OneShotFailingAllocator.init(testing.allocator, 0);
+        const response_allocator = failing_allocator.allocator();
+        broker.allocator = response_allocator;
+
+        const response = broker.handleRequest(buf[0..pos]);
+        broker.allocator = testing.allocator;
+
+        try testing.expect(failing_allocator.failed);
+        try testing.expect(response != null);
+        defer response_allocator.free(response.?);
+
+        const error_code = try readGroupCoordinatorAuthorizationErrorCode(response.?, 16, 5, 1611);
+        try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.kafka_storage_error)), error_code);
+    }
+
+    {
+        const Req = generated.find_coordinator_request.FindCoordinatorRequest;
+        const req = Req{ .key_type = 0, .coordinator_keys = &.{} };
+        var buf: [128]u8 = undefined;
+        var pos = buildTestRequest(&buf, 10, 4, 1016, header_mod.requestHeaderVersion(10, 4));
+        req.serialize(&buf, &pos, 4);
+
+        var failing_allocator = OneShotFailingAllocator.init(testing.allocator, 0);
+        const response_allocator = failing_allocator.allocator();
+        broker.allocator = response_allocator;
+
+        const response = broker.handleRequest(buf[0..pos]);
+        broker.allocator = testing.allocator;
+
+        try testing.expect(failing_allocator.failed);
+        try testing.expect(response != null);
+        defer response_allocator.free(response.?);
+
+        const error_code = try readGroupCoordinatorAuthorizationErrorCode(response.?, 10, 4, 1016);
+        try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.kafka_storage_error)), error_code);
+    }
+
+    {
+        const Req = generated.join_group_request.JoinGroupRequest;
+        const req = Req{
+            .group_id = "join-auth-denied-serialize-fail",
+            .session_timeout_ms = 30000,
+            .rebalance_timeout_ms = 300000,
+            .member_id = "member",
+            .group_instance_id = null,
+            .protocol_type = "consumer",
+            .protocols = &.{},
+            .reason = "serialize-fail",
+        };
+        var buf: [512]u8 = undefined;
+        var pos = buildTestRequest(&buf, 11, 9, 1116, header_mod.requestHeaderVersion(11, 9));
+        req.serialize(&buf, &pos, 9);
+
+        var failing_allocator = OneShotFailingAllocator.init(testing.allocator, 0);
+        const response_allocator = failing_allocator.allocator();
+        broker.allocator = response_allocator;
+
+        const response = broker.handleRequest(buf[0..pos]);
+        broker.allocator = testing.allocator;
+
+        try testing.expect(failing_allocator.failed);
+        try testing.expect(response != null);
+        defer response_allocator.free(response.?);
+
+        const error_code = try readGroupCoordinatorAuthorizationErrorCode(response.?, 11, 9, 1116);
+        try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.kafka_storage_error)), error_code);
+    }
+
+    {
+        const Req = generated.heartbeat_request.HeartbeatRequest;
+        const req = Req{
+            .group_id = "heartbeat-auth-denied-serialize-fail",
+            .generation_id = 1,
+            .member_id = "member",
+            .group_instance_id = null,
+        };
+        var buf: [256]u8 = undefined;
+        var pos = buildTestRequest(&buf, 12, 4, 1216, header_mod.requestHeaderVersion(12, 4));
+        req.serialize(&buf, &pos, 4);
+
+        var failing_allocator = OneShotFailingAllocator.init(testing.allocator, 0);
+        const response_allocator = failing_allocator.allocator();
+        broker.allocator = response_allocator;
+
+        const response = broker.handleRequest(buf[0..pos]);
+        broker.allocator = testing.allocator;
+
+        try testing.expect(failing_allocator.failed);
+        try testing.expect(response != null);
+        defer response_allocator.free(response.?);
+
+        const error_code = try readGroupCoordinatorAuthorizationErrorCode(response.?, 12, 4, 1216);
+        try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.kafka_storage_error)), error_code);
+    }
+
+    {
+        const Req = generated.leave_group_request.LeaveGroupRequest;
+        const req = Req{
+            .group_id = "leave-auth-denied-serialize-fail",
+            .members = &.{},
+        };
+        var buf: [256]u8 = undefined;
+        var pos = buildTestRequest(&buf, 13, 5, 1316, header_mod.requestHeaderVersion(13, 5));
+        req.serialize(&buf, &pos, 5);
+
+        var failing_allocator = OneShotFailingAllocator.init(testing.allocator, 0);
+        const response_allocator = failing_allocator.allocator();
+        broker.allocator = response_allocator;
+
+        const response = broker.handleRequest(buf[0..pos]);
+        broker.allocator = testing.allocator;
+
+        try testing.expect(failing_allocator.failed);
+        try testing.expect(response != null);
+        defer response_allocator.free(response.?);
+
+        const error_code = try readGroupCoordinatorAuthorizationErrorCode(response.?, 13, 5, 1316);
+        try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.kafka_storage_error)), error_code);
+    }
+
+    {
+        const Req = generated.sync_group_request.SyncGroupRequest;
+        const req = Req{
+            .group_id = "sync-auth-denied-serialize-fail",
+            .generation_id = 1,
+            .member_id = "member",
+            .group_instance_id = null,
+            .protocol_type = "consumer",
+            .protocol_name = "range",
+            .assignments = &.{},
+        };
+        var buf: [512]u8 = undefined;
+        var pos = buildTestRequest(&buf, 14, 5, 1416, header_mod.requestHeaderVersion(14, 5));
+        req.serialize(&buf, &pos, 5);
+
+        var failing_allocator = OneShotFailingAllocator.init(testing.allocator, 0);
+        const response_allocator = failing_allocator.allocator();
+        broker.allocator = response_allocator;
+
+        const response = broker.handleRequest(buf[0..pos]);
+        broker.allocator = testing.allocator;
+
+        try testing.expect(failing_allocator.failed);
+        try testing.expect(response != null);
+        defer response_allocator.free(response.?);
+
+        const error_code = try readGroupCoordinatorAuthorizationErrorCode(response.?, 14, 5, 1416);
+        try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.kafka_storage_error)), error_code);
+    }
+
+    {
+        const Req = generated.describe_groups_request.DescribeGroupsRequest;
+        const req = Req{ .groups = &.{}, .include_authorized_operations = false };
+        var buf: [128]u8 = undefined;
+        var pos = buildTestRequest(&buf, 15, 5, 1516, header_mod.requestHeaderVersion(15, 5));
+        req.serialize(&buf, &pos, 5);
+
+        var failing_allocator = OneShotFailingAllocator.init(testing.allocator, 0);
+        const response_allocator = failing_allocator.allocator();
+        broker.allocator = response_allocator;
+
+        const response = broker.handleRequest(buf[0..pos]);
+        broker.allocator = testing.allocator;
+
+        try testing.expect(failing_allocator.failed);
+        try testing.expect(response != null);
+        defer response_allocator.free(response.?);
+
+        const error_code = try readGroupCoordinatorAuthorizationErrorCode(response.?, 15, 5, 1516);
+        try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.kafka_storage_error)), error_code);
+    }
+
+    {
+        const Req = generated.delete_groups_request.DeleteGroupsRequest;
+        const req = Req{ .groups_names = &.{} };
+        var buf: [128]u8 = undefined;
+        var pos = buildTestRequest(&buf, 42, 2, 4216, header_mod.requestHeaderVersion(42, 2));
+        req.serialize(&buf, &pos, 2);
+
+        var failing_allocator = OneShotFailingAllocator.init(testing.allocator, 0);
+        const response_allocator = failing_allocator.allocator();
+        broker.allocator = response_allocator;
+
+        const response = broker.handleRequest(buf[0..pos]);
+        broker.allocator = testing.allocator;
+
+        try testing.expect(failing_allocator.failed);
+        try testing.expect(response != null);
+        defer response_allocator.free(response.?);
+
+        const error_code = try readGroupCoordinatorAuthorizationErrorCode(response.?, 42, 2, 4216);
+        try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.kafka_storage_error)), error_code);
+    }
+}
+
+test "Broker.handleRequest group coordinator authorization denial fails closed when response construction fails" {
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+    try broker.authorizer.addAcl("other-client", .group, "*", .literal, .read, .allow, "*");
+    try broker.authorizer.addAcl("other-client", .group, "*", .literal, .describe, .allow, "*");
+    try broker.authorizer.addAcl("other-client", .group, "*", .literal, .delete, .allow, "*");
+
+    {
+        const Req = generated.delete_groups_request.DeleteGroupsRequest;
+        const group_names = [_]?[]const u8{"delete-auth-denied-oom"};
+        const req = Req{ .groups_names = &group_names };
+        var buf: [256]u8 = undefined;
+        var pos = buildTestRequest(&buf, 42, 2, 4217, header_mod.requestHeaderVersion(42, 2));
+        req.serialize(&buf, &pos, 2);
+
+        var failing_allocator = OneShotFailingAllocator.init(testing.allocator, 1);
+        const response_allocator = failing_allocator.allocator();
+        broker.allocator = response_allocator;
+
+        const response = broker.handleRequest(buf[0..pos]);
+        broker.allocator = testing.allocator;
+
+        try testing.expect(failing_allocator.failed);
+        try testing.expect(response != null);
+        defer response_allocator.free(response.?);
+
+        const error_code = try readGroupCoordinatorAuthorizationErrorCode(response.?, 42, 2, 4217);
+        try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.kafka_storage_error)), error_code);
+    }
+
+    {
+        const Req = generated.leave_group_request.LeaveGroupRequest;
+        const Member = Req.MemberIdentity;
+        const members = [_]Member{.{
+            .member_id = "member",
+            .group_instance_id = null,
+            .reason = "oom",
+        }};
+        const req = Req{
+            .group_id = "leave-auth-denied-oom",
+            .members = &members,
+        };
+        var buf: [512]u8 = undefined;
+        var pos = buildTestRequest(&buf, 13, 5, 1317, header_mod.requestHeaderVersion(13, 5));
+        req.serialize(&buf, &pos, 5);
+
+        var failing_allocator = OneShotFailingAllocator.init(testing.allocator, 1);
+        const response_allocator = failing_allocator.allocator();
+        broker.allocator = response_allocator;
+
+        const response = broker.handleRequest(buf[0..pos]);
+        broker.allocator = testing.allocator;
+
+        try testing.expect(failing_allocator.failed);
+        try testing.expect(response != null);
+        defer response_allocator.free(response.?);
+
+        const error_code = try readGroupCoordinatorAuthorizationErrorCode(response.?, 13, 5, 1317);
+        try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.kafka_storage_error)), error_code);
+    }
 }
 
 test "Broker.handleRequest DeleteGroups persists removed offsets" {

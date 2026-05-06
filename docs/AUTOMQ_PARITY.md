@@ -656,6 +656,11 @@ Status: completed for the initial catalog and DeleteGroups slice.
   AddPartitionsToTxn, AddOffsetsToTxn, EndTxn, WriteTxnMarkers, and
   TxnOffsetCommit denial response materialization or serialization failures
   return generated storage-error responses.
+  Group/coordinator authorization-denial builders for FindCoordinator,
+  JoinGroup, Heartbeat, LeaveGroup, SyncGroup, DescribeGroups, ListGroups, and
+  DeleteGroups now also fail closed with generated invalid-request or
+  storage-error responses when denied frames are malformed or denial response
+  construction fails.
   ListClientMetricsResources now advertises key 74 v0, decodes generated
   flexible requests, rejects malformed frames, returns a default generated
   resource, and lists active client resources for retained telemetry samples.
