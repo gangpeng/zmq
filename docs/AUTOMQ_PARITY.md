@@ -676,6 +676,10 @@ Status: completed for the initial catalog and DeleteGroups slice.
   DeleteAcls now fail closed on serialization failures, and the mutation APIs
   also return generated invalid-request/storage-error responses for malformed
   denied frames or denial response construction failures.
+  Group/share authorization-denial builders for ConsumerGroupDescribe,
+  ShareGroupDescribe, and the share-state APIs now return generated
+  invalid-request/storage-error fallbacks for malformed denied frames and
+  denial response materialization or serialization failures.
   ListClientMetricsResources now advertises key 74 v0, decodes generated
   flexible requests, rejects malformed frames, returns a default generated
   resource, and lists active client resources for retained telemetry samples.

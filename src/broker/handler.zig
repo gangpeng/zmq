@@ -9713,19 +9713,22 @@ pub const Broker = struct {
 
         if (!validateConsumerGroupDescribeRequestFrame(request_bytes, body_start)) {
             log.warn("Malformed denied ConsumerGroupDescribe request", .{});
-            return null;
+            return self.consumerGroupDescribeErrorResponse(req_header, resp_header_version, api_version, ErrorCode.invalid_request, "malformed ConsumerGroupDescribe request", false);
         }
 
         var pos = body_start;
         var req = Req.deserialize(self.allocator, request_bytes, &pos, api_version) catch |err| {
             log.warn("Failed to decode denied ConsumerGroupDescribe request: {}", .{err});
-            return null;
+            return self.consumerGroupDescribeErrorResponse(req_header, resp_header_version, api_version, ErrorCode.invalid_request, "malformed ConsumerGroupDescribe request", false);
         };
         defer self.freeConsumerGroupDescribeRequest(&req);
 
         var groups: []DescribedGroup = &.{};
         if (req.group_ids.len > 0) {
-            groups = self.allocator.alloc(DescribedGroup, req.group_ids.len) catch return null;
+            groups = self.allocator.alloc(DescribedGroup, req.group_ids.len) catch |err| {
+                log.warn("ConsumerGroupDescribe denied response allocation failed: {}", .{err});
+                return self.consumerGroupDescribeErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error, "Failed to build ConsumerGroupDescribe authorization response", req.include_authorized_operations);
+            };
         }
         defer if (groups.len > 0) self.allocator.free(groups);
 
@@ -9746,6 +9749,27 @@ pub const Broker = struct {
         const resp = Resp{
             .throttle_time_ms = 0,
             .groups = groups,
+        };
+        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version) orelse {
+            log.warn("ConsumerGroupDescribe denied response serialization failed", .{});
+            return self.consumerGroupDescribeErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error, "Failed to serialize ConsumerGroupDescribe authorization response", req.include_authorized_operations);
+        };
+    }
+
+    fn consumerGroupDescribeErrorResponse(
+        self: *Broker,
+        req_header: *const RequestHeader,
+        resp_header_version: i16,
+        api_version: i16,
+        err_code: ErrorCode,
+        message: ?[]const u8,
+        include_authorized_operations: bool,
+    ) ?[]u8 {
+        const Resp = generated.consumer_group_describe_response.ConsumerGroupDescribeResponse;
+        const groups = [_]Resp.DescribedGroup{consumerGroupDescribeError(null, err_code, message, include_authorized_operations)};
+        const resp = Resp{
+            .throttle_time_ms = 0,
+            .groups = &groups,
         };
         return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
     }
@@ -9819,23 +9843,22 @@ pub const Broker = struct {
 
         if (!validateShareGroupDescribeRequestFrame(request_bytes, body_start)) {
             log.warn("Malformed denied ShareGroupDescribe request", .{});
-            const groups = [_]DescribedGroup{shareGroupDescribeError(null, ErrorCode.invalid_request, "malformed ShareGroupDescribe request", false)};
-            const resp = Resp{ .throttle_time_ms = 0, .groups = &groups };
-            return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+            return self.shareGroupDescribeErrorResponse(req_header, resp_header_version, api_version, ErrorCode.invalid_request, "malformed ShareGroupDescribe request", false);
         }
 
         var pos = body_start;
         var req = Req.deserialize(self.allocator, request_bytes, &pos, api_version) catch |err| {
             log.warn("Failed to decode denied ShareGroupDescribe request: {}", .{err});
-            const groups = [_]DescribedGroup{shareGroupDescribeError(null, ErrorCode.invalid_request, "malformed ShareGroupDescribe request", false)};
-            const resp = Resp{ .throttle_time_ms = 0, .groups = &groups };
-            return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+            return self.shareGroupDescribeErrorResponse(req_header, resp_header_version, api_version, ErrorCode.invalid_request, "malformed ShareGroupDescribe request", false);
         };
         defer self.freeShareGroupDescribeRequest(&req);
 
         var groups: []DescribedGroup = &.{};
         if (req.group_ids.len > 0) {
-            groups = self.allocator.alloc(DescribedGroup, req.group_ids.len) catch return null;
+            groups = self.allocator.alloc(DescribedGroup, req.group_ids.len) catch |err| {
+                log.warn("ShareGroupDescribe denied response allocation failed: {}", .{err});
+                return self.shareGroupDescribeErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error, "Failed to build ShareGroupDescribe authorization response", req.include_authorized_operations);
+            };
         }
         defer if (groups.len > 0) self.allocator.free(groups);
 
@@ -9854,6 +9877,27 @@ pub const Broker = struct {
         }
 
         const resp = Resp{ .throttle_time_ms = 0, .groups = groups };
+        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version) orelse {
+            log.warn("ShareGroupDescribe denied response serialization failed", .{});
+            return self.shareGroupDescribeErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error, "Failed to serialize ShareGroupDescribe authorization response", req.include_authorized_operations);
+        };
+    }
+
+    fn shareGroupDescribeErrorResponse(
+        self: *Broker,
+        req_header: *const RequestHeader,
+        resp_header_version: i16,
+        api_version: i16,
+        err_code: ErrorCode,
+        message: ?[]const u8,
+        include_authorized_operations: bool,
+    ) ?[]u8 {
+        const Resp = generated.share_group_describe_response.ShareGroupDescribeResponse;
+        const groups = [_]Resp.DescribedGroup{shareGroupDescribeError(null, err_code, message, include_authorized_operations)};
+        const resp = Resp{
+            .throttle_time_ms = 0,
+            .groups = &groups,
+        };
         return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
     }
 
@@ -9967,40 +10011,41 @@ pub const Broker = struct {
 
         if (!validateInitializeShareGroupStateRequestFrame(request_bytes, body_start)) {
             log.warn("Malformed denied InitializeShareGroupState request", .{});
-            const partitions = [_]Resp.InitializeStateResult.PartitionResult{.{
-                .partition = -1,
-                .error_code = ErrorCode.invalid_request.toInt(),
-                .error_message = "malformed InitializeShareGroupState request",
-            }};
-            const results = [_]Resp.InitializeStateResult{.{
-                .topic_id = [_]u8{0} ** 16,
-                .partitions = &partitions,
-            }};
-            const resp = Resp{ .results = &results };
-            return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+            return self.initializeShareGroupStateErrorResponse(req_header, resp_header_version, api_version, ErrorCode.invalid_request, "malformed InitializeShareGroupState request");
         }
 
         var pos = body_start;
         var req = Req.deserialize(self.allocator, request_bytes, &pos, api_version) catch |err| {
             log.warn("Failed to decode denied InitializeShareGroupState request: {}", .{err});
-            const partitions = [_]Resp.InitializeStateResult.PartitionResult{.{
-                .partition = -1,
-                .error_code = ErrorCode.invalid_request.toInt(),
-                .error_message = "malformed InitializeShareGroupState request",
-            }};
-            const results = [_]Resp.InitializeStateResult{.{
-                .topic_id = [_]u8{0} ** 16,
-                .partitions = &partitions,
-            }};
-            const resp = Resp{ .results = &results };
-            return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+            return self.initializeShareGroupStateErrorResponse(req_header, resp_header_version, api_version, ErrorCode.invalid_request, "malformed InitializeShareGroupState request");
         };
         defer self.freeInitializeShareGroupStateRequest(&req);
 
-        const results = self.buildInitializeShareGroupStateAuthorizationResults(req, err_code) catch return null;
+        const results = self.buildInitializeShareGroupStateAuthorizationResults(req, err_code) catch |err| {
+            log.warn("InitializeShareGroupState denied response materialization failed: {}", .{err});
+            return self.initializeShareGroupStateErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error, "Failed to build InitializeShareGroupState authorization response");
+        };
         defer self.freeInitializeShareGroupStateResults(results);
 
         const resp = Resp{ .results = results };
+        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version) orelse {
+            log.warn("InitializeShareGroupState denied response serialization failed", .{});
+            return self.initializeShareGroupStateErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error, "Failed to serialize InitializeShareGroupState authorization response");
+        };
+    }
+
+    fn initializeShareGroupStateErrorResponse(self: *Broker, req_header: *const RequestHeader, resp_header_version: i16, api_version: i16, err_code: ErrorCode, message: ?[]const u8) ?[]u8 {
+        const Resp = generated.initialize_share_group_state_response.InitializeShareGroupStateResponse;
+        const partitions = [_]Resp.InitializeStateResult.PartitionResult{.{
+            .partition = -1,
+            .error_code = err_code.toInt(),
+            .error_message = message,
+        }};
+        const results = [_]Resp.InitializeStateResult{.{
+            .topic_id = [_]u8{0} ** 16,
+            .partitions = &partitions,
+        }};
+        const resp = Resp{ .results = &results };
         return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
     }
 
@@ -10057,46 +10102,44 @@ pub const Broker = struct {
 
         if (!validateReadShareGroupStateRequestFrame(request_bytes, body_start)) {
             log.warn("Malformed denied ReadShareGroupState request", .{});
-            const partitions = [_]Resp.ReadStateResult.PartitionResult{.{
-                .partition = -1,
-                .error_code = ErrorCode.invalid_request.toInt(),
-                .error_message = "malformed ReadShareGroupState request",
-                .state_epoch = 0,
-                .start_offset = -1,
-                .state_batches = &.{},
-            }};
-            const results = [_]Resp.ReadStateResult{.{
-                .topic_id = [_]u8{0} ** 16,
-                .partitions = &partitions,
-            }};
-            const resp = Resp{ .results = &results };
-            return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+            return self.readShareGroupStateErrorResponse(req_header, resp_header_version, api_version, ErrorCode.invalid_request, "malformed ReadShareGroupState request");
         }
 
         var pos = body_start;
         var req = Req.deserialize(self.allocator, request_bytes, &pos, api_version) catch |err| {
             log.warn("Failed to decode denied ReadShareGroupState request: {}", .{err});
-            const partitions = [_]Resp.ReadStateResult.PartitionResult{.{
-                .partition = -1,
-                .error_code = ErrorCode.invalid_request.toInt(),
-                .error_message = "malformed ReadShareGroupState request",
-                .state_epoch = 0,
-                .start_offset = -1,
-                .state_batches = &.{},
-            }};
-            const results = [_]Resp.ReadStateResult{.{
-                .topic_id = [_]u8{0} ** 16,
-                .partitions = &partitions,
-            }};
-            const resp = Resp{ .results = &results };
-            return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+            return self.readShareGroupStateErrorResponse(req_header, resp_header_version, api_version, ErrorCode.invalid_request, "malformed ReadShareGroupState request");
         };
         defer self.freeReadShareGroupStateRequest(&req);
 
-        const results = self.buildReadShareGroupStateAuthorizationResults(req, err_code) catch return null;
+        const results = self.buildReadShareGroupStateAuthorizationResults(req, err_code) catch |err| {
+            log.warn("ReadShareGroupState denied response materialization failed: {}", .{err});
+            return self.readShareGroupStateErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error, "Failed to build ReadShareGroupState authorization response");
+        };
         defer self.freeReadShareGroupStateResults(results);
 
         const resp = Resp{ .results = results };
+        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version) orelse {
+            log.warn("ReadShareGroupState denied response serialization failed", .{});
+            return self.readShareGroupStateErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error, "Failed to serialize ReadShareGroupState authorization response");
+        };
+    }
+
+    fn readShareGroupStateErrorResponse(self: *Broker, req_header: *const RequestHeader, resp_header_version: i16, api_version: i16, err_code: ErrorCode, message: ?[]const u8) ?[]u8 {
+        const Resp = generated.read_share_group_state_response.ReadShareGroupStateResponse;
+        const partitions = [_]Resp.ReadStateResult.PartitionResult{.{
+            .partition = -1,
+            .error_code = err_code.toInt(),
+            .error_message = message,
+            .state_epoch = 0,
+            .start_offset = -1,
+            .state_batches = &.{},
+        }};
+        const results = [_]Resp.ReadStateResult{.{
+            .topic_id = [_]u8{0} ** 16,
+            .partitions = &partitions,
+        }};
+        const resp = Resp{ .results = &results };
         return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
     }
 
@@ -10156,40 +10199,41 @@ pub const Broker = struct {
 
         if (!validateWriteShareGroupStateRequestFrame(request_bytes, body_start)) {
             log.warn("Malformed denied WriteShareGroupState request", .{});
-            const partitions = [_]Resp.WriteStateResult.PartitionResult{.{
-                .partition = -1,
-                .error_code = ErrorCode.invalid_request.toInt(),
-                .error_message = "malformed WriteShareGroupState request",
-            }};
-            const results = [_]Resp.WriteStateResult{.{
-                .topic_id = [_]u8{0} ** 16,
-                .partitions = &partitions,
-            }};
-            const resp = Resp{ .results = &results };
-            return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+            return self.writeShareGroupStateErrorResponse(req_header, resp_header_version, api_version, ErrorCode.invalid_request, "malformed WriteShareGroupState request");
         }
 
         var pos = body_start;
         var req = Req.deserialize(self.allocator, request_bytes, &pos, api_version) catch |err| {
             log.warn("Failed to decode denied WriteShareGroupState request: {}", .{err});
-            const partitions = [_]Resp.WriteStateResult.PartitionResult{.{
-                .partition = -1,
-                .error_code = ErrorCode.invalid_request.toInt(),
-                .error_message = "malformed WriteShareGroupState request",
-            }};
-            const results = [_]Resp.WriteStateResult{.{
-                .topic_id = [_]u8{0} ** 16,
-                .partitions = &partitions,
-            }};
-            const resp = Resp{ .results = &results };
-            return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+            return self.writeShareGroupStateErrorResponse(req_header, resp_header_version, api_version, ErrorCode.invalid_request, "malformed WriteShareGroupState request");
         };
         defer self.freeWriteShareGroupStateRequest(&req);
 
-        const results = self.buildWriteShareGroupStateAuthorizationResults(req, err_code) catch return null;
+        const results = self.buildWriteShareGroupStateAuthorizationResults(req, err_code) catch |err| {
+            log.warn("WriteShareGroupState denied response materialization failed: {}", .{err});
+            return self.writeShareGroupStateErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error, "Failed to build WriteShareGroupState authorization response");
+        };
         defer self.freeWriteShareGroupStateResults(results);
 
         const resp = Resp{ .results = results };
+        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version) orelse {
+            log.warn("WriteShareGroupState denied response serialization failed", .{});
+            return self.writeShareGroupStateErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error, "Failed to serialize WriteShareGroupState authorization response");
+        };
+    }
+
+    fn writeShareGroupStateErrorResponse(self: *Broker, req_header: *const RequestHeader, resp_header_version: i16, api_version: i16, err_code: ErrorCode, message: ?[]const u8) ?[]u8 {
+        const Resp = generated.write_share_group_state_response.WriteShareGroupStateResponse;
+        const partitions = [_]Resp.WriteStateResult.PartitionResult{.{
+            .partition = -1,
+            .error_code = err_code.toInt(),
+            .error_message = message,
+        }};
+        const results = [_]Resp.WriteStateResult{.{
+            .topic_id = [_]u8{0} ** 16,
+            .partitions = &partitions,
+        }};
+        const resp = Resp{ .results = &results };
         return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
     }
 
@@ -10246,40 +10290,41 @@ pub const Broker = struct {
 
         if (!validateDeleteShareGroupStateRequestFrame(request_bytes, body_start)) {
             log.warn("Malformed denied DeleteShareGroupState request", .{});
-            const partitions = [_]Resp.DeleteStateResult.PartitionResult{.{
-                .partition = -1,
-                .error_code = ErrorCode.invalid_request.toInt(),
-                .error_message = "malformed DeleteShareGroupState request",
-            }};
-            const results = [_]Resp.DeleteStateResult{.{
-                .topic_id = [_]u8{0} ** 16,
-                .partitions = &partitions,
-            }};
-            const resp = Resp{ .results = &results };
-            return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+            return self.deleteShareGroupStateErrorResponse(req_header, resp_header_version, api_version, ErrorCode.invalid_request, "malformed DeleteShareGroupState request");
         }
 
         var pos = body_start;
         var req = Req.deserialize(self.allocator, request_bytes, &pos, api_version) catch |err| {
             log.warn("Failed to decode denied DeleteShareGroupState request: {}", .{err});
-            const partitions = [_]Resp.DeleteStateResult.PartitionResult{.{
-                .partition = -1,
-                .error_code = ErrorCode.invalid_request.toInt(),
-                .error_message = "malformed DeleteShareGroupState request",
-            }};
-            const results = [_]Resp.DeleteStateResult{.{
-                .topic_id = [_]u8{0} ** 16,
-                .partitions = &partitions,
-            }};
-            const resp = Resp{ .results = &results };
-            return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+            return self.deleteShareGroupStateErrorResponse(req_header, resp_header_version, api_version, ErrorCode.invalid_request, "malformed DeleteShareGroupState request");
         };
         defer self.freeDeleteShareGroupStateRequest(&req);
 
-        const results = self.buildDeleteShareGroupStateAuthorizationResults(req, err_code) catch return null;
+        const results = self.buildDeleteShareGroupStateAuthorizationResults(req, err_code) catch |err| {
+            log.warn("DeleteShareGroupState denied response materialization failed: {}", .{err});
+            return self.deleteShareGroupStateErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error, "Failed to build DeleteShareGroupState authorization response");
+        };
         defer self.freeDeleteShareGroupStateResults(results);
 
         const resp = Resp{ .results = results };
+        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version) orelse {
+            log.warn("DeleteShareGroupState denied response serialization failed", .{});
+            return self.deleteShareGroupStateErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error, "Failed to serialize DeleteShareGroupState authorization response");
+        };
+    }
+
+    fn deleteShareGroupStateErrorResponse(self: *Broker, req_header: *const RequestHeader, resp_header_version: i16, api_version: i16, err_code: ErrorCode, message: ?[]const u8) ?[]u8 {
+        const Resp = generated.delete_share_group_state_response.DeleteShareGroupStateResponse;
+        const partitions = [_]Resp.DeleteStateResult.PartitionResult{.{
+            .partition = -1,
+            .error_code = err_code.toInt(),
+            .error_message = message,
+        }};
+        const results = [_]Resp.DeleteStateResult{.{
+            .topic_id = [_]u8{0} ** 16,
+            .partitions = &partitions,
+        }};
+        const resp = Resp{ .results = &results };
         return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
     }
 
@@ -10336,44 +10381,43 @@ pub const Broker = struct {
 
         if (!validateReadShareGroupStateSummaryRequestFrame(request_bytes, body_start)) {
             log.warn("Malformed denied ReadShareGroupStateSummary request", .{});
-            const partitions = [_]Resp.ReadStateSummaryResult.PartitionResult{.{
-                .partition = -1,
-                .error_code = ErrorCode.invalid_request.toInt(),
-                .error_message = "malformed ReadShareGroupStateSummary request",
-                .state_epoch = 0,
-                .start_offset = -1,
-            }};
-            const results = [_]Resp.ReadStateSummaryResult{.{
-                .topic_id = [_]u8{0} ** 16,
-                .partitions = &partitions,
-            }};
-            const resp = Resp{ .results = &results };
-            return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+            return self.readShareGroupStateSummaryErrorResponse(req_header, resp_header_version, api_version, ErrorCode.invalid_request, "malformed ReadShareGroupStateSummary request");
         }
 
         var pos = body_start;
         var req = Req.deserialize(self.allocator, request_bytes, &pos, api_version) catch |err| {
             log.warn("Failed to decode denied ReadShareGroupStateSummary request: {}", .{err});
-            const partitions = [_]Resp.ReadStateSummaryResult.PartitionResult{.{
-                .partition = -1,
-                .error_code = ErrorCode.invalid_request.toInt(),
-                .error_message = "malformed ReadShareGroupStateSummary request",
-                .state_epoch = 0,
-                .start_offset = -1,
-            }};
-            const results = [_]Resp.ReadStateSummaryResult{.{
-                .topic_id = [_]u8{0} ** 16,
-                .partitions = &partitions,
-            }};
-            const resp = Resp{ .results = &results };
-            return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+            return self.readShareGroupStateSummaryErrorResponse(req_header, resp_header_version, api_version, ErrorCode.invalid_request, "malformed ReadShareGroupStateSummary request");
         };
         defer self.freeReadShareGroupStateSummaryRequest(&req);
 
-        const results = self.buildReadShareGroupStateSummaryAuthorizationResults(req, err_code) catch return null;
+        const results = self.buildReadShareGroupStateSummaryAuthorizationResults(req, err_code) catch |err| {
+            log.warn("ReadShareGroupStateSummary denied response materialization failed: {}", .{err});
+            return self.readShareGroupStateSummaryErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error, "Failed to build ReadShareGroupStateSummary authorization response");
+        };
         defer self.freeReadShareGroupStateSummaryResults(results);
 
         const resp = Resp{ .results = results };
+        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version) orelse {
+            log.warn("ReadShareGroupStateSummary denied response serialization failed", .{});
+            return self.readShareGroupStateSummaryErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error, "Failed to serialize ReadShareGroupStateSummary authorization response");
+        };
+    }
+
+    fn readShareGroupStateSummaryErrorResponse(self: *Broker, req_header: *const RequestHeader, resp_header_version: i16, api_version: i16, err_code: ErrorCode, message: ?[]const u8) ?[]u8 {
+        const Resp = generated.read_share_group_state_summary_response.ReadShareGroupStateSummaryResponse;
+        const partitions = [_]Resp.ReadStateSummaryResult.PartitionResult{.{
+            .partition = -1,
+            .error_code = err_code.toInt(),
+            .error_message = message,
+            .state_epoch = 0,
+            .start_offset = -1,
+        }};
+        const results = [_]Resp.ReadStateSummaryResult{.{
+            .topic_id = [_]u8{0} ** 16,
+            .partitions = &partitions,
+        }};
+        const resp = Resp{ .results = &results };
         return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
     }
 
@@ -18193,27 +18237,10 @@ pub const Broker = struct {
         return groups;
     }
 
-    fn describeConsumerGroup(self: *Broker, group_id: []const u8, include_authorized_operations: bool) !generated.consumer_group_describe_response.ConsumerGroupDescribeResponse.DescribedGroup {
-        if (group_id.len == 0) {
-            return .{
-                .error_code = @intFromEnum(ErrorCode.invalid_group_id),
-                .error_message = "invalid group id",
-                .group_id = group_id,
-                .group_state = "",
-                .group_epoch = 0,
-                .assignment_epoch = 0,
-                .assignor_name = "",
-                .members = &.{},
-                .authorized_operations = describeGroupsAuthorizedOps(include_authorized_operations),
-            };
-        }
-
-        if (self.groups.groups.getPtr(group_id)) |group| {
-            return self.describeExistingConsumerGroup(group, include_authorized_operations);
-        }
+    fn consumerGroupDescribeError(group_id: ?[]const u8, error_code: ErrorCode, error_message: ?[]const u8, include_authorized_operations: bool) generated.consumer_group_describe_response.ConsumerGroupDescribeResponse.DescribedGroup {
         return .{
-            .error_code = @intFromEnum(ErrorCode.group_id_not_found),
-            .error_message = null,
+            .error_code = error_code.toInt(),
+            .error_message = error_message,
             .group_id = group_id,
             .group_state = "",
             .group_epoch = 0,
@@ -18222,6 +18249,17 @@ pub const Broker = struct {
             .members = &.{},
             .authorized_operations = describeGroupsAuthorizedOps(include_authorized_operations),
         };
+    }
+
+    fn describeConsumerGroup(self: *Broker, group_id: []const u8, include_authorized_operations: bool) !generated.consumer_group_describe_response.ConsumerGroupDescribeResponse.DescribedGroup {
+        if (group_id.len == 0) {
+            return consumerGroupDescribeError(group_id, ErrorCode.invalid_group_id, "invalid group id", include_authorized_operations);
+        }
+
+        if (self.groups.groups.getPtr(group_id)) |group| {
+            return self.describeExistingConsumerGroup(group, include_authorized_operations);
+        }
+        return consumerGroupDescribeError(group_id, ErrorCode.group_id_not_found, null, include_authorized_operations);
     }
 
     fn describeExistingConsumerGroup(self: *Broker, group: *const @import("group_coordinator.zig").ConsumerGroup, include_authorized_operations: bool) !generated.consumer_group_describe_response.ConsumerGroupDescribeResponse.DescribedGroup {
@@ -30385,6 +30423,182 @@ fn freeDeserializedShareGroupDescribeResponse(resp: *const generated.share_group
         if (group.members.len > 0) testing.allocator.free(group.members);
     }
     if (resp.groups.len > 0) testing.allocator.free(resp.groups);
+}
+
+fn freeDeserializedInitializeShareGroupStateResponse(resp: *const generated.initialize_share_group_state_response.InitializeShareGroupStateResponse) void {
+    for (resp.results) |result| {
+        if (result.partitions.len > 0) testing.allocator.free(result.partitions);
+    }
+    if (resp.results.len > 0) testing.allocator.free(resp.results);
+}
+
+fn freeDeserializedReadShareGroupStateResponse(resp: *const generated.read_share_group_state_response.ReadShareGroupStateResponse) void {
+    for (resp.results) |result| {
+        for (result.partitions) |partition| {
+            if (partition.state_batches.len > 0) testing.allocator.free(partition.state_batches);
+        }
+        if (result.partitions.len > 0) testing.allocator.free(result.partitions);
+    }
+    if (resp.results.len > 0) testing.allocator.free(resp.results);
+}
+
+fn freeDeserializedWriteShareGroupStateResponse(resp: *const generated.write_share_group_state_response.WriteShareGroupStateResponse) void {
+    for (resp.results) |result| {
+        if (result.partitions.len > 0) testing.allocator.free(result.partitions);
+    }
+    if (resp.results.len > 0) testing.allocator.free(resp.results);
+}
+
+fn freeDeserializedDeleteShareGroupStateResponse(resp: *const generated.delete_share_group_state_response.DeleteShareGroupStateResponse) void {
+    for (resp.results) |result| {
+        if (result.partitions.len > 0) testing.allocator.free(result.partitions);
+    }
+    if (resp.results.len > 0) testing.allocator.free(resp.results);
+}
+
+fn freeDeserializedReadShareGroupStateSummaryResponse(resp: *const generated.read_share_group_state_summary_response.ReadShareGroupStateSummaryResponse) void {
+    for (resp.results) |result| {
+        if (result.partitions.len > 0) testing.allocator.free(result.partitions);
+    }
+    if (resp.results.len > 0) testing.allocator.free(resp.results);
+}
+
+fn addGroupDescribeAuthorizationAcls(broker: *Broker) !void {
+    try broker.authorizer.addAcl("other-client", .group, "*", .literal, .describe, .allow, "*");
+}
+
+fn readGroupDescribeAuthorizationErrorCode(response: []const u8, api_key: i16, correlation_id: i32) !i16 {
+    var rpos: usize = 0;
+    var response_header = try ResponseHeader.deserialize(testing.allocator, response, &rpos, header_mod.responseHeaderVersion(api_key, 0));
+    defer response_header.deinit(testing.allocator);
+    try testing.expectEqual(correlation_id, response_header.correlation_id);
+
+    switch (api_key) {
+        69 => {
+            const Resp = generated.consumer_group_describe_response.ConsumerGroupDescribeResponse;
+            const resp = try Resp.deserialize(testing.allocator, response, &rpos, 0);
+            defer freeDeserializedConsumerGroupDescribeResponse(&resp);
+            try testing.expectEqual(response.len, rpos);
+            try testing.expect(resp.groups.len > 0);
+            return resp.groups[0].error_code;
+        },
+        77 => {
+            const Resp = generated.share_group_describe_response.ShareGroupDescribeResponse;
+            const resp = try Resp.deserialize(testing.allocator, response, &rpos, 0);
+            defer freeDeserializedShareGroupDescribeResponse(&resp);
+            try testing.expectEqual(response.len, rpos);
+            try testing.expect(resp.groups.len > 0);
+            return resp.groups[0].error_code;
+        },
+        else => return error.UnsupportedApiKey,
+    }
+}
+
+fn expectGroupDescribeAuthorizationDeniedWithFailingAllocator(
+    broker: *Broker,
+    request: []const u8,
+    api_key: i16,
+    correlation_id: i32,
+    fail_index: usize,
+    err_code: ErrorCode,
+) !void {
+    var failing_allocator = OneShotFailingAllocator.init(testing.allocator, fail_index);
+    const response_allocator = failing_allocator.allocator();
+    broker.allocator = response_allocator;
+
+    const response = broker.handleRequest(request);
+    broker.allocator = testing.allocator;
+
+    try testing.expect(failing_allocator.failed);
+    try testing.expect(response != null);
+    defer response_allocator.free(response.?);
+
+    const error_code = try readGroupDescribeAuthorizationErrorCode(response.?, api_key, correlation_id);
+    try testing.expectEqual(@as(i16, @intFromEnum(err_code)), error_code);
+}
+
+fn addShareStateAuthorizationAcls(broker: *Broker) !void {
+    try broker.authorizer.addAcl("other-client", .group, "*", .literal, .alter, .allow, "*");
+    try broker.authorizer.addAcl("other-client", .group, "*", .literal, .describe, .allow, "*");
+}
+
+fn readShareStateAuthorizationErrorCode(response: []const u8, api_key: i16, correlation_id: i32) !i16 {
+    var rpos: usize = 0;
+    var response_header = try ResponseHeader.deserialize(testing.allocator, response, &rpos, header_mod.responseHeaderVersion(api_key, 0));
+    defer response_header.deinit(testing.allocator);
+    try testing.expectEqual(correlation_id, response_header.correlation_id);
+
+    switch (api_key) {
+        83 => {
+            const Resp = generated.initialize_share_group_state_response.InitializeShareGroupStateResponse;
+            const resp = try Resp.deserialize(testing.allocator, response, &rpos, 0);
+            defer freeDeserializedInitializeShareGroupStateResponse(&resp);
+            try testing.expectEqual(response.len, rpos);
+            try testing.expect(resp.results.len > 0);
+            try testing.expect(resp.results[0].partitions.len > 0);
+            return resp.results[0].partitions[0].error_code;
+        },
+        84 => {
+            const Resp = generated.read_share_group_state_response.ReadShareGroupStateResponse;
+            const resp = try Resp.deserialize(testing.allocator, response, &rpos, 0);
+            defer freeDeserializedReadShareGroupStateResponse(&resp);
+            try testing.expectEqual(response.len, rpos);
+            try testing.expect(resp.results.len > 0);
+            try testing.expect(resp.results[0].partitions.len > 0);
+            return resp.results[0].partitions[0].error_code;
+        },
+        85 => {
+            const Resp = generated.write_share_group_state_response.WriteShareGroupStateResponse;
+            const resp = try Resp.deserialize(testing.allocator, response, &rpos, 0);
+            defer freeDeserializedWriteShareGroupStateResponse(&resp);
+            try testing.expectEqual(response.len, rpos);
+            try testing.expect(resp.results.len > 0);
+            try testing.expect(resp.results[0].partitions.len > 0);
+            return resp.results[0].partitions[0].error_code;
+        },
+        86 => {
+            const Resp = generated.delete_share_group_state_response.DeleteShareGroupStateResponse;
+            const resp = try Resp.deserialize(testing.allocator, response, &rpos, 0);
+            defer freeDeserializedDeleteShareGroupStateResponse(&resp);
+            try testing.expectEqual(response.len, rpos);
+            try testing.expect(resp.results.len > 0);
+            try testing.expect(resp.results[0].partitions.len > 0);
+            return resp.results[0].partitions[0].error_code;
+        },
+        87 => {
+            const Resp = generated.read_share_group_state_summary_response.ReadShareGroupStateSummaryResponse;
+            const resp = try Resp.deserialize(testing.allocator, response, &rpos, 0);
+            defer freeDeserializedReadShareGroupStateSummaryResponse(&resp);
+            try testing.expectEqual(response.len, rpos);
+            try testing.expect(resp.results.len > 0);
+            try testing.expect(resp.results[0].partitions.len > 0);
+            return resp.results[0].partitions[0].error_code;
+        },
+        else => return error.UnsupportedApiKey,
+    }
+}
+
+fn expectShareStateAuthorizationDeniedWithFailingAllocator(
+    broker: *Broker,
+    request: []const u8,
+    api_key: i16,
+    correlation_id: i32,
+    fail_index: usize,
+    err_code: ErrorCode,
+) !void {
+    var failing_allocator = OneShotFailingAllocator.init(testing.allocator, fail_index);
+    const response_allocator = failing_allocator.allocator();
+    broker.allocator = response_allocator;
+
+    const response = broker.handleRequest(request);
+    broker.allocator = testing.allocator;
+
+    try testing.expect(failing_allocator.failed);
+    try testing.expect(response != null);
+    defer response_allocator.free(response.?);
+
+    const error_code = try readShareStateAuthorizationErrorCode(response.?, api_key, correlation_id);
+    try testing.expectEqual(@as(i16, @intFromEnum(err_code)), error_code);
 }
 
 fn freeDeserializedDescribeTopicPartitionsResponse(resp: *const generated.describe_topic_partitions_response.DescribeTopicPartitionsResponse) void {
@@ -61263,6 +61477,164 @@ test "Broker.handleRequest share state APIs authorization denial uses generated 
     try testing.expectEqual(@as(i64, -1), summary_resp.results[0].partitions[0].start_offset);
 }
 
+test "Broker.handleRequest share state authorization denial rejects malformed requests" {
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+    try addShareStateAuthorizationAcls(&broker);
+
+    const cases = [_]struct {
+        api_key: i16,
+        correlation_id: i32,
+        group_id: []const u8,
+    }{
+        .{ .api_key = 83, .correlation_id = 8304, .group_id = "share-init-denied-group" },
+        .{ .api_key = 84, .correlation_id = 8403, .group_id = "share-read-denied-group" },
+        .{ .api_key = 85, .correlation_id = 8505, .group_id = "share-write-denied-group" },
+        .{ .api_key = 86, .correlation_id = 8604, .group_id = "share-delete-denied-group" },
+        .{ .api_key = 87, .correlation_id = 8703, .group_id = "share-summary-denied-group" },
+    };
+
+    for (cases) |case| {
+        var buf: [128]u8 = undefined;
+        var pos = buildTestRequest(&buf, case.api_key, 0, case.correlation_id, header_mod.requestHeaderVersion(case.api_key, 0));
+        ser.writeCompactString(&buf, &pos, case.group_id); // missing topics and tagged fields
+
+        const response = broker.handleRequest(buf[0..pos]);
+        try testing.expect(response != null);
+        defer testing.allocator.free(response.?);
+
+        const error_code = try readShareStateAuthorizationErrorCode(response.?, case.api_key, case.correlation_id);
+        try testing.expectEqual(ErrorCode.invalid_request.toInt(), error_code);
+    }
+}
+
+test "Broker.handleRequest share state authorization denial fails closed on allocator failures" {
+    const InitReq = generated.initialize_share_group_state_request.InitializeShareGroupStateRequest;
+    const ReadReq = generated.read_share_group_state_request.ReadShareGroupStateRequest;
+    const WriteReq = generated.write_share_group_state_request.WriteShareGroupStateRequest;
+    const DeleteReq = generated.delete_share_group_state_request.DeleteShareGroupStateRequest;
+    const SummaryReq = generated.read_share_group_state_summary_request.ReadShareGroupStateSummaryRequest;
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+    try addShareStateAuthorizationAcls(&broker);
+
+    const topic_id = [_]u8{0x6b} ** 16;
+
+    {
+        const empty_req = InitReq{ .group_id = "share-init-denied-group", .topics = &.{} };
+        var empty_buf: [128]u8 = undefined;
+        var empty_pos = buildTestRequest(&empty_buf, 83, 0, 8305, header_mod.requestHeaderVersion(83, 0));
+        empty_req.serialize(&empty_buf, &empty_pos, 0);
+        try expectShareStateAuthorizationDeniedWithFailingAllocator(&broker, empty_buf[0..empty_pos], 83, 8305, 0, ErrorCode.kafka_storage_error);
+
+        const partitions = [_]InitReq.InitializeStateData.PartitionData{.{
+            .partition = 3,
+            .state_epoch = 1,
+            .start_offset = 9,
+        }};
+        const topics = [_]InitReq.InitializeStateData{.{
+            .topic_id = topic_id,
+            .partitions = &partitions,
+        }};
+        const req = InitReq{ .group_id = "share-init-denied-group", .topics = &topics };
+        var buf: [256]u8 = undefined;
+        var pos = buildTestRequest(&buf, 83, 0, 8306, header_mod.requestHeaderVersion(83, 0));
+        req.serialize(&buf, &pos, 0);
+        try expectShareStateAuthorizationDeniedWithFailingAllocator(&broker, buf[0..pos], 83, 8306, 2, ErrorCode.kafka_storage_error);
+    }
+
+    {
+        const empty_req = ReadReq{ .group_id = "share-read-denied-group", .topics = &.{} };
+        var empty_buf: [128]u8 = undefined;
+        var empty_pos = buildTestRequest(&empty_buf, 84, 0, 8404, header_mod.requestHeaderVersion(84, 0));
+        empty_req.serialize(&empty_buf, &empty_pos, 0);
+        try expectShareStateAuthorizationDeniedWithFailingAllocator(&broker, empty_buf[0..empty_pos], 84, 8404, 0, ErrorCode.kafka_storage_error);
+
+        const partitions = [_]ReadReq.ReadStateData.PartitionData{.{
+            .partition = 4,
+            .leader_epoch = 2,
+        }};
+        const topics = [_]ReadReq.ReadStateData{.{
+            .topic_id = topic_id,
+            .partitions = &partitions,
+        }};
+        const req = ReadReq{ .group_id = "share-read-denied-group", .topics = &topics };
+        var buf: [256]u8 = undefined;
+        var pos = buildTestRequest(&buf, 84, 0, 8405, header_mod.requestHeaderVersion(84, 0));
+        req.serialize(&buf, &pos, 0);
+        try expectShareStateAuthorizationDeniedWithFailingAllocator(&broker, buf[0..pos], 84, 8405, 2, ErrorCode.kafka_storage_error);
+    }
+
+    {
+        const empty_req = WriteReq{ .group_id = "share-write-denied-group", .topics = &.{} };
+        var empty_buf: [128]u8 = undefined;
+        var empty_pos = buildTestRequest(&empty_buf, 85, 0, 8506, header_mod.requestHeaderVersion(85, 0));
+        empty_req.serialize(&empty_buf, &empty_pos, 0);
+        try expectShareStateAuthorizationDeniedWithFailingAllocator(&broker, empty_buf[0..empty_pos], 85, 8506, 0, ErrorCode.kafka_storage_error);
+
+        const partitions = [_]WriteReq.WriteStateData.PartitionData{.{
+            .partition = 5,
+            .state_epoch = 2,
+            .leader_epoch = 2,
+            .start_offset = 11,
+            .state_batches = &.{},
+        }};
+        const topics = [_]WriteReq.WriteStateData{.{
+            .topic_id = topic_id,
+            .partitions = &partitions,
+        }};
+        const req = WriteReq{ .group_id = "share-write-denied-group", .topics = &topics };
+        var buf: [256]u8 = undefined;
+        var pos = buildTestRequest(&buf, 85, 0, 8507, header_mod.requestHeaderVersion(85, 0));
+        req.serialize(&buf, &pos, 0);
+        try expectShareStateAuthorizationDeniedWithFailingAllocator(&broker, buf[0..pos], 85, 8507, 2, ErrorCode.kafka_storage_error);
+    }
+
+    {
+        const empty_req = DeleteReq{ .group_id = "share-delete-denied-group", .topics = &.{} };
+        var empty_buf: [128]u8 = undefined;
+        var empty_pos = buildTestRequest(&empty_buf, 86, 0, 8605, header_mod.requestHeaderVersion(86, 0));
+        empty_req.serialize(&empty_buf, &empty_pos, 0);
+        try expectShareStateAuthorizationDeniedWithFailingAllocator(&broker, empty_buf[0..empty_pos], 86, 8605, 0, ErrorCode.kafka_storage_error);
+
+        const partitions = [_]DeleteReq.DeleteStateData.PartitionData{.{
+            .partition = 6,
+        }};
+        const topics = [_]DeleteReq.DeleteStateData{.{
+            .topic_id = topic_id,
+            .partitions = &partitions,
+        }};
+        const req = DeleteReq{ .group_id = "share-delete-denied-group", .topics = &topics };
+        var buf: [256]u8 = undefined;
+        var pos = buildTestRequest(&buf, 86, 0, 8606, header_mod.requestHeaderVersion(86, 0));
+        req.serialize(&buf, &pos, 0);
+        try expectShareStateAuthorizationDeniedWithFailingAllocator(&broker, buf[0..pos], 86, 8606, 2, ErrorCode.kafka_storage_error);
+    }
+
+    {
+        const empty_req = SummaryReq{ .group_id = "share-summary-denied-group", .topics = &.{} };
+        var empty_buf: [128]u8 = undefined;
+        var empty_pos = buildTestRequest(&empty_buf, 87, 0, 8704, header_mod.requestHeaderVersion(87, 0));
+        empty_req.serialize(&empty_buf, &empty_pos, 0);
+        try expectShareStateAuthorizationDeniedWithFailingAllocator(&broker, empty_buf[0..empty_pos], 87, 8704, 0, ErrorCode.kafka_storage_error);
+
+        const partitions = [_]SummaryReq.ReadStateSummaryData.PartitionData{.{
+            .partition = 7,
+            .leader_epoch = 2,
+        }};
+        const topics = [_]SummaryReq.ReadStateSummaryData{.{
+            .topic_id = topic_id,
+            .partitions = &partitions,
+        }};
+        const req = SummaryReq{ .group_id = "share-summary-denied-group", .topics = &topics };
+        var buf: [256]u8 = undefined;
+        var pos = buildTestRequest(&buf, 87, 0, 8705, header_mod.requestHeaderVersion(87, 0));
+        req.serialize(&buf, &pos, 0);
+        try expectShareStateAuthorizationDeniedWithFailingAllocator(&broker, buf[0..pos], 87, 8705, 2, ErrorCode.kafka_storage_error);
+    }
+}
+
 test "Broker.handleRequest ConsumerGroupDescribe v0 returns generated group state" {
     const Req = generated.consumer_group_describe_request.ConsumerGroupDescribeRequest;
     const Resp = generated.consumer_group_describe_response.ConsumerGroupDescribeResponse;
@@ -61385,6 +61757,95 @@ test "Broker.handleRequest ConsumerGroupDescribe authorization denial uses gener
     try testing.expectEqual(@as(i32, 0), resp.groups[0].authorized_operations);
     try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.group_authorization_failed)), resp.groups[1].error_code);
     try testing.expectEqualStrings("cgd-denied-other", resp.groups[1].group_id.?);
+}
+
+test "Broker.handleRequest group describe authorization denial rejects malformed requests" {
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+    try addGroupDescribeAuthorizationAcls(&broker);
+
+    {
+        var buf: [128]u8 = undefined;
+        var pos = buildTestRequest(&buf, 69, 0, 6903, header_mod.requestHeaderVersion(69, 0));
+        ser.writeCompactArrayLen(&buf, &pos, 1);
+        ser.writeCompactString(&buf, &pos, "cgd-denied-group"); // missing include_authorized_operations and tagged fields
+
+        const response = broker.handleRequest(buf[0..pos]);
+        try testing.expect(response != null);
+        defer testing.allocator.free(response.?);
+
+        const error_code = try readGroupDescribeAuthorizationErrorCode(response.?, 69, 6903);
+        try testing.expectEqual(ErrorCode.invalid_request.toInt(), error_code);
+    }
+
+    {
+        var buf: [128]u8 = undefined;
+        var pos = buildTestRequest(&buf, 77, 0, 7703, header_mod.requestHeaderVersion(77, 0));
+        ser.writeCompactArrayLen(&buf, &pos, 1);
+        ser.writeCompactString(&buf, &pos, "share-denied-group"); // missing include_authorized_operations and tagged fields
+
+        const response = broker.handleRequest(buf[0..pos]);
+        try testing.expect(response != null);
+        defer testing.allocator.free(response.?);
+
+        const error_code = try readGroupDescribeAuthorizationErrorCode(response.?, 77, 7703);
+        try testing.expectEqual(ErrorCode.invalid_request.toInt(), error_code);
+    }
+}
+
+test "Broker.handleRequest group describe authorization denial fails closed on allocator failures" {
+    const ConsumerReq = generated.consumer_group_describe_request.ConsumerGroupDescribeRequest;
+    const ShareReq = generated.share_group_describe_request.ShareGroupDescribeRequest;
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+    try addGroupDescribeAuthorizationAcls(&broker);
+
+    {
+        const req = ConsumerReq{
+            .group_ids = &.{},
+            .include_authorized_operations = false,
+        };
+        var buf: [128]u8 = undefined;
+        var pos = buildTestRequest(&buf, 69, 0, 6904, header_mod.requestHeaderVersion(69, 0));
+        req.serialize(&buf, &pos, 0);
+        try expectGroupDescribeAuthorizationDeniedWithFailingAllocator(&broker, buf[0..pos], 69, 6904, 0, ErrorCode.kafka_storage_error);
+    }
+
+    {
+        const group_ids = [_]?[]const u8{"cgd-denied-group"};
+        const req = ConsumerReq{
+            .group_ids = &group_ids,
+            .include_authorized_operations = false,
+        };
+        var buf: [128]u8 = undefined;
+        var pos = buildTestRequest(&buf, 69, 0, 6905, header_mod.requestHeaderVersion(69, 0));
+        req.serialize(&buf, &pos, 0);
+        try expectGroupDescribeAuthorizationDeniedWithFailingAllocator(&broker, buf[0..pos], 69, 6905, 1, ErrorCode.kafka_storage_error);
+    }
+
+    {
+        const req = ShareReq{
+            .group_ids = &.{},
+            .include_authorized_operations = false,
+        };
+        var buf: [128]u8 = undefined;
+        var pos = buildTestRequest(&buf, 77, 0, 7704, header_mod.requestHeaderVersion(77, 0));
+        req.serialize(&buf, &pos, 0);
+        try expectGroupDescribeAuthorizationDeniedWithFailingAllocator(&broker, buf[0..pos], 77, 7704, 0, ErrorCode.kafka_storage_error);
+    }
+
+    {
+        const group_ids = [_]?[]const u8{"share-denied-group"};
+        const req = ShareReq{
+            .group_ids = &group_ids,
+            .include_authorized_operations = false,
+        };
+        var buf: [128]u8 = undefined;
+        var pos = buildTestRequest(&buf, 77, 0, 7705, header_mod.requestHeaderVersion(77, 0));
+        req.serialize(&buf, &pos, 0);
+        try expectGroupDescribeAuthorizationDeniedWithFailingAllocator(&broker, buf[0..pos], 77, 7705, 1, ErrorCode.kafka_storage_error);
+    }
 }
 
 test "Broker.handleRequest OffsetCommit and OffsetFetch round-trip" {
