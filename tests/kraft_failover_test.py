@@ -51,6 +51,8 @@ ERROR_SNAPSHOT_NOT_FOUND = 98
 ERROR_RESOURCE_NOT_FOUND = 91
 ERROR_INVALID_UPDATE_VERSION = 95
 ERROR_BROKER_ID_NOT_REGISTERED = 102
+ERROR_UNKNOWN_CONTROLLER_ID = 116
+ERROR_INVALID_REGISTRATION = 119
 ERROR_UNKNOWN_MEMBER_ID = 25
 ERROR_INVALID_REQUEST = 42
 ERROR_FENCED_MEMBER_EPOCH = 110
@@ -1876,6 +1878,167 @@ def wait_for_broker_lifecycle_negative_checkpoint(
         time.sleep(0.25)
     raise TestError(
         f"broker lifecycle negative probes did not recover during {label}: "
+        f"{last_error}"
+    )
+
+
+def write_controller_registration_listener(name, host, port, security_protocol=0):
+    if port < 0 or port > 65535:
+        raise TestError(f"invalid controller listener port={port}")
+    body = bytearray()
+    body += write_compact_string(name)
+    body += write_compact_string(host)
+    body += struct.pack(">Hh", port, security_protocol)
+    body += b"\x00"  # listener tagged fields
+    return bytes(body)
+
+
+def write_controller_registration_feature(name, min_version, max_version):
+    body = bytearray()
+    body += write_compact_string(name)
+    body += struct.pack(">hh", min_version, max_version)
+    body += b"\x00"  # feature tagged fields
+    return bytes(body)
+
+
+def parse_controller_registration_response(response, correlation_id):
+    pos = parse_flexible_response_header(response, correlation_id)
+    throttle_time_ms, pos = read_i32(response, pos)
+    error_code, pos = read_i16(response, pos)
+    error_message, pos = read_compact_string(response, pos)
+    pos = skip_tags(response, pos)
+    if pos != len(response):
+        raise TestError(
+            f"ControllerRegistration response trailing bytes: {len(response) - pos}"
+        )
+    return {
+        "throttle_time_ms": throttle_time_ms,
+        "error_code": error_code,
+        "error_message": error_message,
+    }
+
+
+def controller_registration(
+    port,
+    controller_id,
+    listener_host,
+    listener_port,
+    features,
+    correlation_id,
+):
+    body = bytearray()
+    body += struct.pack(">i", controller_id)
+    body += raft_voter_directory_id(controller_id + 1)
+    body += b"\x00"  # zk_migration_ready=false
+    body += write_compact_array_len(1)
+    body += write_controller_registration_listener(
+        "CONTROLLER",
+        listener_host,
+        listener_port,
+    )
+    body += write_compact_array_len(len(features))
+    for feature in features:
+        body += write_controller_registration_feature(
+            feature["name"],
+            feature["min_version"],
+            feature["max_version"],
+        )
+    body += b"\x00"  # request tagged fields
+    response = flexible_kafka_request(port, 70, 0, correlation_id, bytes(body))
+    return parse_controller_registration_response(response, correlation_id)
+
+
+def require_controller_registration_error(
+    response,
+    expected_error_code,
+    response_name,
+    label,
+):
+    if response["throttle_time_ms"] != 0:
+        raise TestError(
+            f"{response_name} throttle mismatch during {label}: {response}"
+        )
+    if response["error_code"] != expected_error_code:
+        raise TestError(
+            f"{response_name} error mismatch during {label}: "
+            f"expected={expected_error_code} response={response}"
+        )
+
+
+def wait_for_controller_registration_negative_checkpoint(
+    port,
+    expected_ports,
+    state,
+    label,
+    timeout=30,
+):
+    deadline = time.time() + timeout
+    correlation_id = state.get("correlation_id", 9640)
+    existing_controller_id = sorted(expected_ports)[0]
+    unknown_controller_id = max(expected_ports) + 60100
+    last_error = None
+    while time.time() < deadline:
+        try:
+            unknown = controller_registration(
+                port,
+                unknown_controller_id,
+                "127.0.0.1",
+                65535,
+                [],
+                correlation_id,
+            )
+            require_controller_registration_error(
+                unknown,
+                ERROR_UNKNOWN_CONTROLLER_ID,
+                "ControllerRegistration unknown controller",
+                label,
+            )
+
+            invalid_feature = controller_registration(
+                port,
+                existing_controller_id,
+                "127.0.0.1",
+                expected_ports[existing_controller_id],
+                [{"name": "kraft.version", "min_version": 2, "max_version": 1}],
+                correlation_id + 1,
+            )
+            require_controller_registration_error(
+                invalid_feature,
+                ERROR_INVALID_REGISTRATION,
+                "ControllerRegistration invalid feature",
+                label,
+            )
+
+            invalid_listener = controller_registration(
+                port,
+                existing_controller_id,
+                "",
+                expected_ports[existing_controller_id],
+                [],
+                correlation_id + 2,
+            )
+            require_controller_registration_error(
+                invalid_listener,
+                ERROR_INVALID_REGISTRATION,
+                "ControllerRegistration invalid listener",
+                label,
+            )
+
+            quorum = describe_quorum_v2(port, correlation_id + 3)
+            require_dynamic_voter_quorum_unchanged(quorum, expected_ports, label)
+            state["correlation_id"] = correlation_id + 4
+            return {
+                "unknown": unknown,
+                "invalid_feature": invalid_feature,
+                "invalid_listener": invalid_listener,
+                "quorum": quorum,
+            }
+        except Exception as exc:
+            last_error = exc
+        correlation_id += 4
+        time.sleep(0.25)
+    raise TestError(
+        f"controller registration negative probes did not recover during {label}: "
         f"{last_error}"
     )
 
@@ -10907,6 +11070,13 @@ def main():
             broker_lifecycle_state,
             "initial leader",
         )
+        controller_registration_state = {"correlation_id": 9640}
+        wait_for_controller_registration_negative_checkpoint(
+            processes[leader_id]["port"],
+            ports,
+            controller_registration_state,
+            "initial leader",
+        )
 
         broker = start_broker(tmp, voters)
         wait_for_broker_ready(broker["proc"], broker["port"], broker["log_path"])
@@ -11552,6 +11722,12 @@ def main():
                 broker_lifecycle_state,
                 "network partition matrix",
             )
+            wait_for_controller_registration_negative_checkpoint(
+                processes[leader_id]["port"],
+                ports,
+                controller_registration_state,
+                "network partition matrix",
+            )
         wait_for_log_position_checkpoint(
             broker["port"],
             topic,
@@ -11699,6 +11875,12 @@ def main():
         wait_for_broker_lifecycle_negative_checkpoint(
             processes[replacement_leader]["port"],
             broker_lifecycle_state,
+            "controller leader failover",
+        )
+        wait_for_controller_registration_negative_checkpoint(
+            processes[replacement_leader]["port"],
+            ports,
+            controller_registration_state,
             "controller leader failover",
         )
         wait_for_payloads(broker["port"], topic, expected_payloads)
@@ -11886,6 +12068,12 @@ def main():
             broker_lifecycle_state,
             "old leader fresh rejoin",
         )
+        wait_for_controller_registration_negative_checkpoint(
+            processes[replacement_leader]["port"],
+            ports,
+            controller_registration_state,
+            "old leader fresh rejoin",
+        )
 
         wait_for_payloads(broker["port"], topic, expected_payloads)
         wait_for_log_position_checkpoint(
@@ -12068,6 +12256,12 @@ def main():
             broker_lifecycle_state,
             "surviving controller restart",
         )
+        wait_for_controller_registration_negative_checkpoint(
+            processes[replacement_leader]["port"],
+            ports,
+            controller_registration_state,
+            "surviving controller restart",
+        )
 
         wait_for_payloads(broker["port"], topic, expected_payloads)
         wait_for_log_position_checkpoint(
@@ -12235,6 +12429,12 @@ def main():
         wait_for_broker_lifecycle_negative_checkpoint(
             processes[replacement_leader]["port"],
             broker_lifecycle_state,
+            "broker restart",
+        )
+        wait_for_controller_registration_negative_checkpoint(
+            processes[replacement_leader]["port"],
+            ports,
+            controller_registration_state,
             "broker restart",
         )
         wait_for_payloads(broker["port"], topic, expected_payloads)
@@ -12503,6 +12703,7 @@ def main():
             f"controller_api_versions_checked=true, "
             f"dynamic_raft_voter_negative_checked=true, "
             f"broker_lifecycle_negative_checked=true, "
+            f"controller_registration_negative_checked=true, "
             f"committed_offset={committed_offset}, "
             f"transactions_checked=5, "
             f"transaction_introspection_checked=true, "
@@ -13221,6 +13422,26 @@ def self_test():
         require_broker_lifecycle_negative_response(
             unregister_broker_response,
             "UnregisterBroker fixture",
+            "self-test",
+        )
+
+        controller_registration_fixture = struct.pack(">i", 192)
+        controller_registration_fixture += b"\x00"  # response header tagged fields
+        controller_registration_fixture += struct.pack(
+            ">ih",
+            0,
+            ERROR_UNKNOWN_CONTROLLER_ID,
+        )
+        controller_registration_fixture += write_compact_string(None)
+        controller_registration_fixture += b"\x00"  # response tagged fields
+        controller_registration_response = parse_controller_registration_response(
+            controller_registration_fixture,
+            192,
+        )
+        require_controller_registration_error(
+            controller_registration_response,
+            ERROR_UNKNOWN_CONTROLLER_ID,
+            "ControllerRegistration fixture",
             "self-test",
         )
 
