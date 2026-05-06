@@ -144,6 +144,9 @@ pub const Broker = struct {
     default_replication_factor: i16,
     /// Hostname advertised to clients in metadata responses.
     advertised_host: []const u8,
+    /// Cluster ID advertised to clients when this broker is not sharing a
+    /// controller RaftState in-process.
+    cluster_id: []const u8,
     /// Raft consensus state. Non-null when this node has the controller role.
     /// Null in broker-only mode (metadata comes from the controller via MetadataClient).
     raft_state: ?*RaftState = null,
@@ -489,6 +492,7 @@ pub const Broker = struct {
         default_num_partitions: i32 = 1,
         default_replication_factor: i16 = 1,
         advertised_host: []const u8 = "localhost",
+        cluster_id: []const u8 = "zmq-cluster",
         /// message.max.bytes — maximum record batch size (default 1MB)
         message_max_bytes: i32 = 1048576,
         /// log.retention.ms — retention time in ms (default 7 days, -1 = unlimited)
@@ -696,6 +700,7 @@ pub const Broker = struct {
             .default_num_partitions = config.default_num_partitions,
             .default_replication_factor = config.default_replication_factor,
             .advertised_host = config.advertised_host,
+            .cluster_id = config.cluster_id,
             .authorizer = Authorizer.init(alloc),
             .sasl_authenticator = SaslPlainAuthenticator.init(alloc),
             .scram_authenticator = ScramSha256Authenticator.init(alloc),
@@ -796,6 +801,10 @@ pub const Broker = struct {
         self.raft_state = raft;
         // Wire metrics into the Raft state for consensus observability
         raft.metrics = &self.metrics;
+    }
+
+    fn effectiveClusterId(self: *const Broker) []const u8 {
+        return if (self.raft_state) |rs| rs.cluster_id else self.cluster_id;
     }
 
     fn clearBrokerPeers(self: *Broker) void {
@@ -6398,7 +6407,7 @@ pub const Broker = struct {
         const resp = Resp{
             .throttle_time_ms = 0,
             .brokers = &.{},
-            .cluster_id = "zmq-cluster",
+            .cluster_id = self.effectiveClusterId(),
             .controller_id = -1,
             .topics = topics,
             .cluster_authorized_operations = std.math.minInt(i32),
@@ -9741,7 +9750,7 @@ pub const Broker = struct {
             .error_code = @intFromEnum(err_code),
             .error_message = "Not authorized",
             .endpoint_type = 1,
-            .cluster_id = if (self.raft_state) |rs| rs.cluster_id else "zmq-cluster",
+            .cluster_id = self.effectiveClusterId(),
             .controller_id = self.node_id,
             .brokers = &.{},
             .cluster_authorized_operations = std.math.minInt(i32),
@@ -13503,7 +13512,7 @@ pub const Broker = struct {
         const resp = Resp{
             .throttle_time_ms = 0,
             .brokers = &brokers,
-            .cluster_id = "zmq-cluster",
+            .cluster_id = self.effectiveClusterId(),
             .controller_id = self.node_id,
             .topics = topics[0..topics_init],
         };
@@ -13527,7 +13536,7 @@ pub const Broker = struct {
         const resp = Resp{
             .throttle_time_ms = 0,
             .brokers = &.{},
-            .cluster_id = "zmq-cluster",
+            .cluster_id = self.effectiveClusterId(),
             .controller_id = -1,
             .topics = &topics,
             .cluster_authorized_operations = std.math.minInt(i32),
@@ -23740,7 +23749,8 @@ pub const Broker = struct {
             return self.exportClusterManifestErrorResponse(req_header, resp_header_version, api_version, ErrorCode.invalid_request);
         };
 
-        const manifest = std.fmt.allocPrint(arena_alloc, "{{\"cluster_id\":\"zmq-cluster\",\"node_id\":{d},\"topics\":{d},\"streams\":{d},\"nodes\":{d},\"groups\":{d}}}", .{
+        const manifest = std.fmt.allocPrint(arena_alloc, "{{\"cluster_id\":\"{s}\",\"node_id\":{d},\"topics\":{d},\"streams\":{d},\"nodes\":{d},\"groups\":{d}}}", .{
+            self.effectiveClusterId(),
             self.node_id,
             self.topics.count(),
             self.object_manager.streamCount(),
@@ -29269,7 +29279,7 @@ pub const Broker = struct {
             .error_code = endpoint_error,
             .error_message = null,
             .endpoint_type = endpoint_type,
-            .cluster_id = if (self.raft_state) |rs| rs.cluster_id else "zmq-cluster",
+            .cluster_id = self.effectiveClusterId(),
             .controller_id = self.node_id,
             .brokers = if (endpoint_error == 0) &brokers else &.{},
             .cluster_authorized_operations = if (req.include_cluster_authorized_operations) 0 else std.math.minInt(i32),
@@ -29288,7 +29298,7 @@ pub const Broker = struct {
             .error_code = @intFromEnum(err_code),
             .error_message = message,
             .endpoint_type = endpoint_type,
-            .cluster_id = if (self.raft_state) |rs| rs.cluster_id else "zmq-cluster",
+            .cluster_id = self.effectiveClusterId(),
             .controller_id = self.node_id,
             .brokers = &.{},
             .cluster_authorized_operations = std.math.minInt(i32),
@@ -61505,7 +61515,9 @@ test "Broker.handleRequest DescribeCluster uses generated endpoint-scoped respon
     const Req = generated.describe_cluster_request.DescribeClusterRequest;
     const Resp = generated.describe_cluster_response.DescribeClusterResponse;
 
-    var broker = Broker.init(testing.allocator, 7, 19092);
+    var broker = Broker.initWithConfig(testing.allocator, 7, 19092, .{
+        .cluster_id = "broker-cluster",
+    });
     defer broker.deinit();
     broker.advertised_host = "broker.example";
 
@@ -61532,7 +61544,7 @@ test "Broker.handleRequest DescribeCluster uses generated endpoint-scoped respon
 
     try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.none)), resp.error_code);
     try testing.expectEqual(@as(i8, 2), resp.endpoint_type);
-    try testing.expectEqualStrings("zmq-cluster", resp.cluster_id.?);
+    try testing.expectEqualStrings("broker-cluster", resp.cluster_id.?);
     try testing.expectEqual(@as(i32, 7), resp.controller_id);
     try testing.expectEqual(@as(i32, std.math.minInt(i32)), resp.cluster_authorized_operations);
     try testing.expectEqual(@as(usize, 1), resp.brokers.len);

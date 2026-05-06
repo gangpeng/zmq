@@ -574,6 +574,7 @@ pub fn main(init: std.process.Init) !void {
             .s3_path_style = s3_path_style,
             .s3_tls_ca_file = s3_tls_ca_file,
             .advertised_host = advertised_host,
+            .cluster_id = cluster_id,
             .s3_wal_batch_size = s3_wal_batch_size,
             .s3_wal_flush_interval_ms = s3_wal_flush_interval,
             .s3_wal_flush_mode = wal_flush_mode,

@@ -1024,6 +1024,130 @@ def wait_for_describe_topic_partitions_checkpoint(
     )
 
 
+def parse_describe_cluster_response(response, correlation_id):
+    pos = parse_flexible_response_header(response, correlation_id)
+    throttle_time_ms, pos = read_i32(response, pos)
+    error_code, pos = read_i16(response, pos)
+    error_message, pos = read_compact_string(response, pos)
+    endpoint_type, pos = read_i8(response, pos)
+    cluster_id, pos = read_compact_string(response, pos)
+    controller_id, pos = read_i32(response, pos)
+    broker_count, pos = read_compact_array_len(response, pos)
+    brokers = []
+    for _ in range(broker_count):
+        broker_id, pos = read_i32(response, pos)
+        host, pos = read_compact_string(response, pos)
+        broker_port, pos = read_i32(response, pos)
+        rack, pos = read_compact_string(response, pos)
+        pos = skip_tags(response, pos)
+        brokers.append(
+            {
+                "broker_id": broker_id,
+                "host": host,
+                "port": broker_port,
+                "rack": rack,
+            }
+        )
+    cluster_authorized_operations, pos = read_i32(response, pos)
+    pos = skip_tags(response, pos)
+    if pos != len(response):
+        raise TestError(f"DescribeCluster response trailing bytes: {len(response) - pos}")
+    return {
+        "throttle_time_ms": throttle_time_ms,
+        "error_code": error_code,
+        "error_message": error_message,
+        "endpoint_type": endpoint_type,
+        "cluster_id": cluster_id,
+        "controller_id": controller_id,
+        "brokers": brokers,
+        "cluster_authorized_operations": cluster_authorized_operations,
+    }
+
+
+def describe_cluster(
+    port, endpoint_type, include_cluster_authorized_operations, correlation_id
+):
+    body = b"\x01" if include_cluster_authorized_operations else b"\x00"
+    body += struct.pack(">b", endpoint_type)
+    body += b"\x00"  # request tagged fields
+    response = flexible_kafka_request(port, 60, 1, correlation_id, body)
+    return parse_describe_cluster_response(response, correlation_id)
+
+
+def require_describe_cluster_checkpoint(
+    response,
+    expected_endpoint_type,
+    expected_node_id,
+    expected_port,
+    expected_cluster_id,
+    expected_authorized_operations,
+):
+    if response["error_code"] != 0:
+        raise TestError(f"DescribeCluster error response: {response}")
+    if response["endpoint_type"] != expected_endpoint_type:
+        raise TestError(
+            f"DescribeCluster endpoint={response} expected={expected_endpoint_type}"
+        )
+    if response["cluster_id"] != expected_cluster_id:
+        raise TestError(
+            f"DescribeCluster cluster_id={response} expected={expected_cluster_id!r}"
+        )
+    if response["controller_id"] != expected_node_id:
+        raise TestError(
+            f"DescribeCluster controller_id={response} expected={expected_node_id}"
+        )
+    if response["cluster_authorized_operations"] != expected_authorized_operations:
+        raise TestError(
+            f"DescribeCluster authorized ops={response} "
+            f"expected={expected_authorized_operations}"
+        )
+    brokers = response["brokers"]
+    if len(brokers) != 1:
+        raise TestError(f"DescribeCluster broker count mismatch: {response}")
+    broker = brokers[0]
+    if (
+        broker["broker_id"] != expected_node_id
+        or broker["host"] != "localhost"
+        or broker["port"] != expected_port
+        or broker["rack"] is not None
+    ):
+        raise TestError(f"DescribeCluster broker mismatch: {response}")
+
+
+def wait_for_describe_cluster_checkpoint(
+    port, expected_node_id, expected_cluster_id, timeout=30
+):
+    deadline = time.time() + timeout
+    correlation_id = 8500
+    last_error = None
+    while time.time() < deadline:
+        try:
+            broker_response = describe_cluster(port, 1, False, correlation_id)
+            require_describe_cluster_checkpoint(
+                broker_response,
+                1,
+                expected_node_id,
+                port,
+                expected_cluster_id,
+                -2147483648,
+            )
+            controller_response = describe_cluster(port, 2, True, correlation_id + 1)
+            require_describe_cluster_checkpoint(
+                controller_response,
+                2,
+                expected_node_id,
+                port,
+                expected_cluster_id,
+                0,
+            )
+            return
+        except Exception as exc:
+            last_error = exc
+        correlation_id += 2
+        time.sleep(0.25)
+    raise TestError(f"DescribeCluster did not recover: {last_error}")
+
+
 def parse_describe_producers_response(response, correlation_id):
     pos = parse_flexible_response_header(response, correlation_id)
     _, pos = read_i32(response, pos)  # throttle_time_ms
@@ -7303,7 +7427,15 @@ def main():
                 100,
             )
 
-        wait_for_topic_partitions_probe()
+        def wait_for_cluster_visibility_probes():
+            wait_for_topic_partitions_probe()
+            wait_for_describe_cluster_checkpoint(
+                broker["port"],
+                100,
+                CLUSTER_ID,
+            )
+
+        wait_for_cluster_visibility_probes()
         wait_for_delete_records_probe()
         wait_for_offset_commit(broker["port"], group, topic, committed_offset)
         offset_delete_group_state = wait_for_group_stable(
@@ -7601,7 +7733,7 @@ def main():
             expected_topic_end_offset(first_offset, expected_payloads),
         )
         wait_for_delete_records_probe()
-        wait_for_topic_partitions_probe()
+        wait_for_cluster_visibility_probes()
         wait_for_committed_offset(broker["port"], group, topic, committed_offset)
         wait_for_committed_offset(broker["port"], offset_delete_group, topic, -1)
         wait_for_committed_offset_error(
@@ -7717,7 +7849,7 @@ def main():
             expected_topic_end_offset(first_offset, expected_payloads),
         )
         wait_for_delete_records_probe()
-        wait_for_topic_partitions_probe()
+        wait_for_cluster_visibility_probes()
         wait_for_committed_offset(broker["port"], group, topic, committed_offset)
         wait_for_committed_offset(broker["port"], offset_delete_group, topic, -1)
         wait_for_committed_offset_error(
@@ -7837,7 +7969,7 @@ def main():
             expected_topic_end_offset(first_offset, expected_payloads),
         )
         wait_for_delete_records_probe()
-        wait_for_topic_partitions_probe()
+        wait_for_cluster_visibility_probes()
         wait_for_offset_commit(broker["port"], group, topic, committed_offset)
         post_failover_txn = wait_for_transaction_begin(
             broker["port"],
@@ -7869,7 +8001,7 @@ def main():
             expected_topic_end_offset(first_offset, expected_payloads),
         )
         wait_for_delete_records_probe()
-        wait_for_topic_partitions_probe()
+        wait_for_cluster_visibility_probes()
         wait_for_committed_offset(broker["port"], group, topic, committed_offset)
         wait_for_committed_offset(broker["port"], offset_delete_group, topic, -1)
         wait_for_committed_offset_error(
@@ -7982,7 +8114,7 @@ def main():
             expected_topic_end_offset(first_offset, expected_payloads),
         )
         wait_for_delete_records_probe()
-        wait_for_topic_partitions_probe()
+        wait_for_cluster_visibility_probes()
         wait_for_offset_commit(broker["port"], group, topic, committed_offset)
 
         alive = {node_id for node_id, info in processes.items() if info["proc"].poll() is None}
@@ -8017,7 +8149,7 @@ def main():
             expected_topic_end_offset(first_offset, expected_payloads),
         )
         wait_for_delete_records_probe()
-        wait_for_topic_partitions_probe()
+        wait_for_cluster_visibility_probes()
         wait_for_committed_offset(broker["port"], group, topic, committed_offset)
         wait_for_committed_offset(broker["port"], offset_delete_group, topic, -1)
         wait_for_committed_offset_error(
@@ -8132,7 +8264,7 @@ def main():
             expected_topic_end_offset(first_offset, expected_payloads),
         )
         wait_for_delete_records_probe()
-        wait_for_topic_partitions_probe()
+        wait_for_cluster_visibility_probes()
         wait_for_offset_commit(broker["port"], group, topic, committed_offset)
         broker_restart_txn = wait_for_transaction_begin(
             broker["port"],
@@ -8151,7 +8283,7 @@ def main():
             expected_topic_end_offset(first_offset, expected_payloads),
         )
         wait_for_delete_records_probe()
-        wait_for_topic_partitions_probe()
+        wait_for_cluster_visibility_probes()
         wait_for_committed_offset(broker["port"], group, topic, committed_offset)
         wait_for_committed_offset(broker["port"], offset_delete_group, topic, -1)
         wait_for_committed_offset_error(
@@ -8372,7 +8504,7 @@ def main():
             expected_topic_end_offset(first_offset, expected_payloads),
         )
         wait_for_delete_records_probe()
-        wait_for_topic_partitions_probe()
+        wait_for_cluster_visibility_probes()
         wait_for_offset_commit(broker["port"], group, topic, committed_offset)
         wait_for_offset_fetch_grouped_checkpoint(
             broker["port"],
@@ -8412,6 +8544,7 @@ def main():
             f"log_position_apis_checked=true, "
             f"delete_records_checked=true, "
             f"describe_topic_partitions_checked=true, "
+            f"describe_cluster_checked=true, "
             f"idempotent_producer_fencing=true, "
             f"describe_producers_checked=true, "
             f"delete_groups_checked=true, "
@@ -8726,6 +8859,35 @@ def self_test():
         ):
             raise TestError(
                 f"DescribeTopicPartitions fixture parser failed: {topic_partitions}"
+            )
+
+        describe_cluster_fixture = struct.pack(">i", 165)
+        describe_cluster_fixture += b"\x00"  # response header tagged fields
+        describe_cluster_fixture += struct.pack(">ih", 0, 0)
+        describe_cluster_fixture += write_compact_string(None)
+        describe_cluster_fixture += b"\x02"  # endpoint_type=controllers
+        describe_cluster_fixture += write_compact_string("cluster-self-test")
+        describe_cluster_fixture += struct.pack(">i", 100)
+        describe_cluster_fixture += write_compact_array_len(1)
+        describe_cluster_fixture += struct.pack(">i", 100)
+        describe_cluster_fixture += write_compact_string("localhost")
+        describe_cluster_fixture += struct.pack(">i", 39092)
+        describe_cluster_fixture += write_compact_string(None)
+        describe_cluster_fixture += b"\x00"  # broker tagged fields
+        describe_cluster_fixture += struct.pack(">i", 0)
+        describe_cluster_fixture += b"\x00"  # response tagged fields
+        described_cluster = parse_describe_cluster_response(
+            describe_cluster_fixture, 165
+        )
+        if (
+            described_cluster["endpoint_type"] != 2
+            or described_cluster["cluster_id"] != "cluster-self-test"
+            or described_cluster["controller_id"] != 100
+            or described_cluster["brokers"][0]["port"] != 39092
+            or described_cluster["cluster_authorized_operations"] != 0
+        ):
+            raise TestError(
+                f"DescribeCluster fixture parser failed: {described_cluster}"
             )
 
         describe_producers_fixture = struct.pack(">i", 162)

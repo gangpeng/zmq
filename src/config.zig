@@ -176,6 +176,7 @@ pub fn validateControllerVoterSet(alloc: Allocator, voters: []const u8) !void {
 /// - num.partitions (default partition count for auto-created topics)
 /// - default.replication.factor
 /// - auto.create.topics.enable
+/// - cluster.id
 /// - advertised.listeners (host extraction)
 pub fn applyConfig(config: *@import("broker").Broker.BrokerConfig, cfg: *const ConfigFile) void {
     if (cfg.getString("s3.endpoint.host")) |h| config.s3_endpoint_host = h;
@@ -199,6 +200,7 @@ pub fn applyConfig(config: *@import("broker").Broker.BrokerConfig, cfg: *const C
     config.default_num_partitions = cfg.getInt(i32, "num.partitions", config.default_num_partitions);
     config.default_replication_factor = cfg.getInt(i16, "default.replication.factor", config.default_replication_factor);
     config.auto_create_topics = cfg.getBool("auto.create.topics.enable", config.auto_create_topics);
+    if (cfg.getString("cluster.id")) |id| config.cluster_id = id;
     if (cfg.getString("advertised.host.name")) |h| config.advertised_host = h;
 
     // Apply S3 WAL and cache configuration from properties file
