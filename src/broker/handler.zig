@@ -11722,7 +11722,7 @@ pub const Broker = struct {
         return self.failover_controller.findPartitionOwner(topic_name, partition_index) orelse self.node_id;
     }
 
-    fn partitionRequestError(self: *const Broker, topic_name: []const u8, partition_index: i32) ?i16 {
+    fn partitionRequestError(self: *Broker, topic_name: []const u8, partition_index: i32) ?i16 {
         if (self.topics.get(topic_name)) |topic_info| {
             if (partition_index < 0 or partition_index >= topic_info.num_partitions) {
                 return @intFromEnum(ErrorCode.unknown_topic_or_partition);
@@ -11737,10 +11737,8 @@ pub const Broker = struct {
         return @intFromEnum(ErrorCode.unknown_topic_or_partition);
     }
 
-    fn storePartitionExists(self: *const Broker, topic_name: []const u8, partition_index: i32) bool {
-        var key_buf: [256]u8 = undefined;
-        const key = std.fmt.bufPrint(&key_buf, "{s}-{d}", .{ topic_name, partition_index }) catch return false;
-        return self.store.partitions.contains(key);
+    fn storePartitionExists(self: *Broker, topic_name: []const u8, partition_index: i32) bool {
+        return self.partitionStatePtr(topic_name, partition_index) != null;
     }
 
     // ---------------------------------------------------------------
@@ -33102,6 +33100,23 @@ test "Broker transaction marker state update handles long topic names" {
     try testing.expectEqual(@as(u64, 5), after.high_watermark);
     try testing.expectEqual(@as(u64, 5), after.last_stable_offset);
     try testing.expect(after.first_unstable_txn_offset == null);
+}
+
+test "Broker partition request fallback handles max-length store topic names" {
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+    broker.wireInternalPointers();
+
+    const topic_name = try testing.allocator.alloc(u8, 249);
+    defer testing.allocator.free(topic_name);
+    @memset(topic_name, 't');
+    topic_name[0] = 'p';
+
+    const partition_index: i32 = std.math.maxInt(i32);
+    try broker.store.ensurePartition(topic_name, partition_index);
+
+    try testing.expect(broker.storePartitionExists(topic_name, partition_index));
+    try testing.expect(broker.partitionRequestError(topic_name, partition_index) == null);
 }
 
 test "Broker.handleRequest WriteTxnMarkers reports storage error when S3 local transaction checkpoint fails" {
