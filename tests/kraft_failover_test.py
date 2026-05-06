@@ -2946,6 +2946,7 @@ def run_automq_metadata_failover_scenario(tmp):
             ("purpose", "failover"),
             ("phase", "reopened"),
         ]
+        stream_tags_cleared = []
         stream_id = wait_for_automq_create_stream(
             leader_broker_port,
             leader_id,
@@ -2997,6 +2998,8 @@ def run_automq_metadata_failover_scenario(tmp):
             ("rack", f"rack-{leader_id}"),
             ("zone", "primary"),
         ]
+        registered_node_tags_cleared = []
+        registered_node_epoch_after = registered_node_epoch
         wait_for_automq_register_node(
             leader_broker_port,
             registered_node_id,
@@ -3105,6 +3108,21 @@ def run_automq_metadata_failover_scenario(tmp):
             replacement_broker_port,
             cluster_id,
             expected_node_id=first_allocated_node_id + 1,
+        )
+        registered_node_epoch_after = registered_node_epoch + 1
+        wait_for_automq_register_node(
+            replacement_broker_port,
+            registered_node_id,
+            registered_node_epoch_after,
+            registered_wal_config,
+            tags=registered_node_tags_cleared,
+        )
+        wait_for_automq_node(
+            replacement_broker_port,
+            registered_node_id,
+            registered_node_epoch_after,
+            registered_wal_config,
+            expected_tags=registered_node_tags_cleared,
         )
 
         value_after = b"after-controller-failover"
@@ -3220,6 +3238,30 @@ def run_automq_metadata_failover_scenario(tmp):
             expected_start_offset=5,
             expected_end_offset=20,
         )
+        wait_for_automq_open_stream(
+            replacement_broker_port,
+            stream_owner_node_id,
+            stream_id,
+            2,
+            tags=stream_tags_cleared,
+        )
+        wait_for_automq_stream(
+            replacement_broker_port,
+            stream_id,
+            "OPENED",
+            2,
+            5,
+            20,
+            expected_tags=stream_tags_cleared,
+        )
+        wait_for_automq_opening_stream(
+            replacement_broker_port,
+            stream_owner_node_id,
+            stream_id,
+            expected_epoch=2,
+            expected_start_offset=5,
+            expected_end_offset=20,
+        )
         wait_for_automq_delete_stream(
             replacement_broker_port,
             stream_owner_node_id,
@@ -3265,7 +3307,7 @@ def run_automq_metadata_failover_scenario(tmp):
             2,
             5,
             20,
-            expected_tags=stream_tags_after,
+            expected_tags=stream_tags_cleared,
         )
         wait_for_automq_opening_stream(
             processes[leader_id]["broker_port"],
@@ -3286,9 +3328,9 @@ def run_automq_metadata_failover_scenario(tmp):
         wait_for_automq_node(
             processes[leader_id]["broker_port"],
             registered_node_id,
-            registered_node_epoch,
+            registered_node_epoch_after,
             registered_wal_config,
-            expected_tags=registered_node_tags,
+            expected_tags=registered_node_tags_cleared,
         )
         wait_for_automq_license(processes[leader_id]["broker_port"], license_value)
 
