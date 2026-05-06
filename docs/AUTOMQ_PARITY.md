@@ -291,6 +291,9 @@ instead of silent connection closes;
 DescribeClientQuotas malformed frames now return generated invalid-request
 responses, and quota-entry materialization failures now surface storage errors
 instead of silent connection closes;
+DescribeUserScramCredentials malformed frames now return generated
+invalid-request responses, and result materialization failures now surface
+storage errors instead of silent connection closes;
 DescribeCluster malformed frames now return generated invalid-request responses,
 and response serialization failures now surface storage errors instead of silent
 connection closes;
