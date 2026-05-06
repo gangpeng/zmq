@@ -24485,18 +24485,29 @@ pub const Broker = struct {
 
         var response_error = ErrorCode.none;
         var response_error_message: ?[]const u8 = null;
-        if (has_successful_mutation and !req.validate_only) {
+        var success_response: ?[]u8 = null;
+        if (has_successful_mutation and !req.validate_only) mutation: {
+            const success_resp = Resp{
+                .throttle_time_ms = 0,
+                .error_code = ErrorCode.none.toInt(),
+                .error_message = null,
+                .results = results,
+            };
+            success_response = self.serializeGeneratedResponse(req_header, resp_header_version, &success_resp, api_version) orelse {
+                log.warn("UpdateFeatures response serialization failed before mutation", .{});
+                return self.updateFeaturesErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error, "Failed to serialize UpdateFeatures response");
+            };
+
             var previous_snapshot = self.cloneFinalizedFeatureLocalSnapshot() catch |err| {
                 log.warn("UpdateFeatures finalized feature snapshot clone failed: {}", .{err});
+                if (success_response) |response| {
+                    self.allocator.free(response);
+                    success_response = null;
+                }
                 self.markUpdateFeaturesStorageError(results);
-                const resp = Resp{
-                    .throttle_time_ms = 0,
-                    .error_code = ErrorCode.kafka_storage_error.toInt(),
-                    .error_message = "Failed to persist finalized feature metadata",
-                    .results = results,
-                };
-                return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version) orelse
-                    self.updateFeaturesErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error, "Failed to serialize UpdateFeatures response");
+                response_error = ErrorCode.kafka_storage_error;
+                response_error_message = "Failed to persist finalized feature metadata";
+                break :mutation;
             };
             defer self.freeFinalizedFeatureLocalSnapshot(&previous_snapshot);
 
@@ -24545,6 +24556,10 @@ pub const Broker = struct {
             .error_message = response_error_message,
             .results = results,
         };
+        if (success_response) |response| {
+            if (response_error == ErrorCode.none) return response;
+            self.allocator.free(response);
+        }
         return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version) orelse
             self.updateFeaturesErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error, "Failed to serialize UpdateFeatures response");
     }
@@ -24557,7 +24572,16 @@ pub const Broker = struct {
             .error_message = message,
             .results = &.{},
         };
-        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version) orelse {
+            log.warn("UpdateFeatures error response serialization failed", .{});
+            const storage_resp = Resp{
+                .throttle_time_ms = 0,
+                .error_code = @intFromEnum(ErrorCode.kafka_storage_error),
+                .error_message = "Failed to serialize UpdateFeatures response",
+                .results = &.{},
+            };
+            return self.serializeGeneratedResponse(req_header, resp_header_version, &storage_resp, api_version);
+        };
     }
 
     fn freeUpdateFeaturesRequest(self: *Broker, req: *generated.update_features_request.UpdateFeaturesRequest) void {
@@ -49429,6 +49453,30 @@ test "Broker.handleRequest UpdateFeatures rejects truncated request" {
     try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.invalid_request)), error_code);
 }
 
+test "Broker.handleRequest UpdateFeatures malformed request retries generated storage error response" {
+    const Resp = generated.update_features_response.UpdateFeaturesResponse;
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+
+    var buf: [128]u8 = undefined;
+    const req_len = buildTestRequest(&buf, 57, 1, 5721, header_mod.requestHeaderVersion(57, 1));
+
+    var failing_allocator = OneShotFailingAllocator.init(testing.allocator, 0);
+    const response_allocator = failing_allocator.allocator();
+    broker.allocator = response_allocator;
+
+    const response = broker.handleRequest(buf[0..req_len]);
+    broker.allocator = testing.allocator;
+
+    try testing.expect(failing_allocator.failed);
+    try testing.expect(response != null);
+    defer response_allocator.free(response.?);
+
+    const error_code = try readGeneratedTopLevelErrorCode(Resp, response.?, 57, 1, 5721);
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.kafka_storage_error)), error_code);
+}
+
 test "Broker.handleRequest UpdateFeatures rejects trailing bytes" {
     const Req = generated.update_features_request.UpdateFeaturesRequest;
     const Resp = generated.update_features_response.UpdateFeaturesResponse;
@@ -49505,6 +49553,41 @@ test "Broker.handleRequest UpdateFeatures fails closed when response serializati
 
     const error_code = try readGeneratedTopLevelErrorCode(Resp, response.?, 57, 1, 5719);
     try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.kafka_storage_error)), error_code);
+}
+
+test "Broker.handleRequest UpdateFeatures does not mutate when success serialization fails" {
+    const Req = generated.update_features_request.UpdateFeaturesRequest;
+    const Resp = generated.update_features_response.UpdateFeaturesResponse;
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+
+    const updates = [_]Req.FeatureUpdateKey{.{
+        .feature = "metadata.version",
+        .max_version_level = 1,
+        .upgrade_type = 1,
+    }};
+    const req = Req{ .feature_updates = &updates };
+
+    var buf: [512]u8 = undefined;
+    var pos = buildTestRequest(&buf, 57, 1, 5722, header_mod.requestHeaderVersion(57, 1));
+    req.serialize(&buf, &pos, 1);
+
+    var failing_allocator = OneShotFailingAllocator.init(testing.allocator, 2);
+    const response_allocator = failing_allocator.allocator();
+    broker.allocator = response_allocator;
+
+    const response = broker.handleRequest(buf[0..pos]);
+    broker.allocator = testing.allocator;
+
+    try testing.expect(failing_allocator.failed);
+    try testing.expect(response != null);
+    defer response_allocator.free(response.?);
+
+    const error_code = try readGeneratedTopLevelErrorCode(Resp, response.?, 57, 1, 5722);
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.kafka_storage_error)), error_code);
+    try testing.expect(broker.finalized_features.get("metadata.version") == null);
+    try testing.expectEqual(@as(i64, -1), broker.finalized_features_epoch);
 }
 
 test "Broker.handleRequest GetTelemetrySubscriptions returns default subscription" {
