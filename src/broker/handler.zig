@@ -13371,6 +13371,31 @@ pub const Broker = struct {
         return response_tags;
     }
 
+    fn materializeRequestStreamTags(arena_alloc: Allocator, tags: anytype) ![]storage.stream.StreamTag {
+        if (tags.len == 0) return &.{};
+        const stream_tags = try arena_alloc.alloc(storage.stream.StreamTag, tags.len);
+        for (tags, 0..) |tag, idx| {
+            stream_tags[idx] = .{
+                .key = tag.key orelse "",
+                .value = tag.value orelse "",
+            };
+        }
+        return stream_tags;
+    }
+
+    fn materializeDescribeStreamTags(
+        arena_alloc: Allocator,
+        tags: []const storage.stream.StreamTag,
+    ) ![]generated.describe_streams_response.DescribeStreamsResponse.StreamMetadata.Tag {
+        const ResponseTag = generated.describe_streams_response.DescribeStreamsResponse.StreamMetadata.Tag;
+        if (tags.len == 0) return &.{};
+        const response_tags = try arena_alloc.alloc(ResponseTag, tags.len);
+        for (tags, 0..) |tag, idx| {
+            response_tags[idx] = .{ .key = tag.key, .value = tag.value };
+        }
+        return response_tags;
+    }
+
     fn findTopicPartitionForStream(self: *Broker, stream_id: u64) ?struct { topic_id: [16]u8, topic_name: []const u8, partition_index: i32 } {
         var topic_it = self.topics.iterator();
         while (topic_it.next()) |entry| {
@@ -22248,7 +22273,12 @@ pub const Broker = struct {
         }
         for (req.create_stream_requests, 0..) |item, i| {
             const owner_node = if (item.node_id != 0) item.node_id else if (req.node_id != 0) req.node_id else self.node_id;
-            const stream = self.object_manager.createStream(owner_node) catch |err| {
+            const stream_tags = materializeRequestStreamTags(arena_alloc, item.tags) catch |err| {
+                log.warn("CreateStreams tag materialization failed: {}", .{err});
+                responses[i] = .{ .error_code = errorCode(.kafka_storage_error), .stream_id = -1 };
+                continue;
+            };
+            const stream = self.object_manager.createStreamWithTags(owner_node, stream_tags) catch |err| {
                 responses[i] = .{ .error_code = streamErrorCode(err), .stream_id = -1 };
                 continue;
             };
@@ -22332,10 +22362,22 @@ pub const Broker = struct {
                 continue;
             };
             const requested_epoch: u64 = @intCast(@max(item.stream_epoch, 0));
-            self.object_manager.openStream(stream_id, requested_epoch) catch |err| {
-                responses[i] = .{ .error_code = streamErrorCode(err), .start_offset = -1, .next_offset = -1 };
-                continue;
-            };
+            if (api_version >= 1 and item.tags.len > 0) {
+                const stream_tags = materializeRequestStreamTags(arena_alloc, item.tags) catch |err| {
+                    log.warn("OpenStreams tag materialization failed: {}", .{err});
+                    responses[i] = .{ .error_code = errorCode(.kafka_storage_error), .start_offset = -1, .next_offset = -1 };
+                    continue;
+                };
+                self.object_manager.openStreamWithTags(stream_id, requested_epoch, stream_tags) catch |err| {
+                    responses[i] = .{ .error_code = streamErrorCode(err), .start_offset = -1, .next_offset = -1 };
+                    continue;
+                };
+            } else {
+                self.object_manager.openStream(stream_id, requested_epoch) catch |err| {
+                    responses[i] = .{ .error_code = streamErrorCode(err), .start_offset = -1, .next_offset = -1 };
+                    continue;
+                };
+            }
             const stream = self.object_manager.getStream(stream_id).?;
             responses[i] = .{
                 .error_code = 0,
@@ -23800,6 +23842,10 @@ pub const Broker = struct {
         for (stream_ids.items) |stream_id| {
             const stream = self.object_manager.getStream(stream_id) orelse continue;
             const mapping = self.findTopicPartitionForStream(stream_id);
+            const tags = materializeDescribeStreamTags(arena_alloc, stream.tags) catch |err| {
+                log.warn("DescribeStreams tag materialization failed: {}", .{err});
+                return self.describeStreamsErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error);
+            };
             metadata.append(.{
                 .stream_id = u64ToI64(stream.stream_id),
                 .node_id = stream.node_id,
@@ -23810,6 +23856,7 @@ pub const Broker = struct {
                 .epoch = u64ToI64(stream.epoch),
                 .start_offset = u64ToI64(stream.start_offset),
                 .end_offset = u64ToI64(stream.end_offset),
+                .tags = tags,
             }) catch |err| {
                 log.warn("DescribeStreams response materialization failed: {}", .{err});
                 return self.describeStreamsErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error);
@@ -34158,6 +34205,13 @@ fn freeDeserializedCreateTopicsResponse(resp: *const generated.create_topics_res
         }
     }
     if (resp.topics.len > 0) testing.allocator.free(resp.topics);
+}
+
+fn freeDeserializedDescribeStreamsResponse(resp: *const generated.describe_streams_response.DescribeStreamsResponse) void {
+    for (resp.stream_metadata_list) |metadata| {
+        if (metadata.tags.len > 0) testing.allocator.free(metadata.tags);
+    }
+    if (resp.stream_metadata_list.len > 0) testing.allocator.free(resp.stream_metadata_list);
 }
 
 fn expectCreateTopicsErrorResponseBytes(response: []const u8, api_version: i16, correlation_id: i32, err_code: ErrorCode) !void {
@@ -54389,6 +54443,8 @@ test "Broker AutoMQ stream object lifecycle APIs" {
     const PrepareResp = generated.prepare_s3_object_response.PrepareS3ObjectResponse;
     const CommitReq = generated.commit_stream_object_request.CommitStreamObjectRequest;
     const CommitResp = generated.commit_stream_object_response.CommitStreamObjectResponse;
+    const DescribeReq = generated.describe_streams_request.DescribeStreamsRequest;
+    const DescribeResp = generated.describe_streams_response.DescribeStreamsResponse;
     const TrimReq = generated.trim_streams_request.TrimStreamsRequest;
     const TrimResp = generated.trim_streams_response.TrimStreamsResponse;
     const CloseReq = generated.close_streams_request.CloseStreamsRequest;
@@ -54397,10 +54453,14 @@ test "Broker AutoMQ stream object lifecycle APIs" {
     const DeleteResp = generated.delete_streams_response.DeleteStreamsResponse;
 
     var buf: [2048]u8 = undefined;
-    var pos = buildTestRequest(&buf, 501, 0, 5010, 2);
-    const create_items = [_]CreateReq.CreateStreamRequest{.{ .node_id = 1 }};
+    var pos = buildTestRequest(&buf, 501, 1, 5010, 2);
+    const create_tags = [_]CreateReq.CreateStreamRequest.Tag{
+        .{ .key = "rack", .value = "az-a" },
+        .{ .key = "role", .value = "leader" },
+    };
+    const create_items = [_]CreateReq.CreateStreamRequest{.{ .node_id = 1, .tags = &create_tags }};
     const create_req = CreateReq{ .node_id = 1, .node_epoch = 1, .create_stream_requests = &create_items };
-    create_req.serialize(&buf, &pos, 0);
+    create_req.serialize(&buf, &pos, 1);
     var response = broker.handleRequest(buf[0..pos]);
     try testing.expect(response != null);
     try owned_responses.append(response.?);
@@ -54408,13 +54468,34 @@ test "Broker AutoMQ stream object lifecycle APIs" {
     var rpos: usize = 0;
     var create_header = try ResponseHeader.deserialize(testing.allocator, response.?, &rpos, 1);
     defer create_header.deinit(testing.allocator);
-    const create_resp = try CreateResp.deserialize(testing.allocator, response.?, &rpos, 0);
+    const create_resp = try CreateResp.deserialize(testing.allocator, response.?, &rpos, 1);
     defer testing.allocator.free(create_resp.create_stream_responses);
     try testing.expectEqual(@as(i16, 0), create_resp.error_code);
     try testing.expectEqual(@as(usize, 1), create_resp.create_stream_responses.len);
     const stream_id = create_resp.create_stream_responses[0].stream_id;
     try testing.expect(stream_id > 0);
     try testing.expectEqual(@as(usize, 1), broker.object_manager.streamCount());
+
+    pos = buildTestRequest(&buf, 601, 0, 6011, 2);
+    const describe_req = DescribeReq{ .topic_partitions = &.{}, .node_id = -1, .stream_id = stream_id };
+    describe_req.serialize(&buf, &pos, 0);
+    response = broker.handleRequest(buf[0..pos]);
+    try testing.expect(response != null);
+    try owned_responses.append(response.?);
+
+    rpos = 0;
+    var describe_header = try ResponseHeader.deserialize(testing.allocator, response.?, &rpos, 1);
+    defer describe_header.deinit(testing.allocator);
+    const describe_resp = try DescribeResp.deserialize(testing.allocator, response.?, &rpos, 0);
+    defer freeDeserializedDescribeStreamsResponse(&describe_resp);
+    try testing.expectEqual(response.?.len, rpos);
+    try testing.expectEqual(@as(i16, 0), describe_resp.error_code);
+    try testing.expectEqual(@as(usize, 1), describe_resp.stream_metadata_list.len);
+    try testing.expectEqual(@as(usize, 2), describe_resp.stream_metadata_list[0].tags.len);
+    try testing.expectEqualStrings("rack", describe_resp.stream_metadata_list[0].tags[0].key.?);
+    try testing.expectEqualStrings("az-a", describe_resp.stream_metadata_list[0].tags[0].value.?);
+    try testing.expectEqualStrings("role", describe_resp.stream_metadata_list[0].tags[1].key.?);
+    try testing.expectEqualStrings("leader", describe_resp.stream_metadata_list[0].tags[1].value.?);
 
     pos = buildTestRequest(&buf, 505, 0, 5050, 2);
     const prepare_req = PrepareReq{ .node_id = 1, .prepared_count = 1, .time_to_live_in_ms = 60_000 };
@@ -55345,7 +55426,11 @@ test "Broker AutoMQ router snapshot describe and group APIs" {
 
     var buf: [4096]u8 = undefined;
     var pos = buildTestRequest(&buf, 502, 1, 5020, 2);
-    const open_items = [_]OpenReq.OpenStreamRequest{.{ .stream_id = stream_id, .stream_epoch = 1 }};
+    const open_tags = [_]OpenReq.OpenStreamRequest.Tag{.{
+        .key = "phase",
+        .value = "open",
+    }};
+    const open_items = [_]OpenReq.OpenStreamRequest{.{ .stream_id = stream_id, .stream_epoch = 1, .tags = &open_tags }};
     const open_req = OpenReq{ .node_id = 1, .node_epoch = 1, .open_stream_requests = &open_items };
     open_req.serialize(&buf, &pos, 1);
     var response = broker.handleRequest(buf[0..pos]);
@@ -55414,9 +55499,12 @@ test "Broker AutoMQ router snapshot describe and group APIs" {
     var describe_header = try ResponseHeader.deserialize(testing.allocator, response.?, &rpos, 1);
     defer describe_header.deinit(testing.allocator);
     const describe_resp = try DescribeResp.deserialize(testing.allocator, response.?, &rpos, 0);
-    defer testing.allocator.free(describe_resp.stream_metadata_list);
+    defer freeDeserializedDescribeStreamsResponse(&describe_resp);
     try testing.expectEqual(@as(usize, 1), describe_resp.stream_metadata_list.len);
     try testing.expectEqual(stream_id, describe_resp.stream_metadata_list[0].stream_id);
+    try testing.expectEqual(@as(usize, 1), describe_resp.stream_metadata_list[0].tags.len);
+    try testing.expectEqualStrings("phase", describe_resp.stream_metadata_list[0].tags[0].key.?);
+    try testing.expectEqualStrings("open", describe_resp.stream_metadata_list[0].tags[0].value.?);
 
     pos = buildTestRequest(&buf, 515, 1, 5150, 2);
     const zone_req = ZoneReq{ .metadata = "route-data", .route_epoch = 4, .version = 1 };
@@ -55722,7 +55810,11 @@ test "Broker compacts AutoMQ quorum metadata into replayable full snapshot" {
         try broker.commitAutoMqUpdateGroupRecord("group-a", "link-a", true);
         try broker.updateAutoMqGroupFromRecord("group-a", "link-a", true);
 
-        const stream = try broker.object_manager.createStream(1);
+        const stream_tags = [_]storage.stream.StreamTag{.{
+            .key = "quorum",
+            .value = "snapshot",
+        }};
+        const stream = try broker.object_manager.createStreamWithTags(1, &stream_tags);
         stream_id = stream.stream_id;
         committed_object_id = broker.object_manager.prepareObject();
         try broker.object_manager.commitStreamObject(committed_object_id, stream_id, 0, 10, "so/1/0-10", 128);
@@ -55762,6 +55854,9 @@ test "Broker compacts AutoMQ quorum metadata into replayable full snapshot" {
 
         const restored_stream = broker.object_manager.getStream(stream_id).?;
         try testing.expectEqual(@as(u64, 10), restored_stream.end_offset);
+        try testing.expectEqual(@as(usize, 1), restored_stream.tags.len);
+        try testing.expectEqualStrings("quorum", restored_stream.tags[0].key);
+        try testing.expectEqualStrings("snapshot", restored_stream.tags[0].value);
         const restored_object = broker.object_manager.stream_objects.get(committed_object_id).?;
         try testing.expectEqual(stream_id, restored_object.stream_id);
         try testing.expectEqual(@as(u64, 10), restored_object.end_offset);
@@ -55837,10 +55932,14 @@ test "Broker restores AutoMQ stream object snapshot after restart" {
         }
 
         var buf: [4096]u8 = undefined;
-        var pos = buildTestRequest(&buf, 501, 0, 5010, 2);
-        const create_items = [_]CreateReq.CreateStreamRequest{.{ .node_id = 1 }};
+        var pos = buildTestRequest(&buf, 501, 1, 5010, 2);
+        const create_tags = [_]CreateReq.CreateStreamRequest.Tag{.{
+            .key = "restore",
+            .value = "local",
+        }};
+        const create_items = [_]CreateReq.CreateStreamRequest{.{ .node_id = 1, .tags = &create_tags }};
         const create_req = CreateReq{ .node_id = 1, .node_epoch = 1, .create_stream_requests = &create_items };
-        create_req.serialize(&buf, &pos, 0);
+        create_req.serialize(&buf, &pos, 1);
         var response = broker.handleRequest(buf[0..pos]);
         try testing.expect(response != null);
         try owned_responses.append(response.?);
@@ -55848,7 +55947,7 @@ test "Broker restores AutoMQ stream object snapshot after restart" {
         var rpos: usize = 0;
         var create_header = try ResponseHeader.deserialize(testing.allocator, response.?, &rpos, 1);
         defer create_header.deinit(testing.allocator);
-        const create_resp = try CreateResp.deserialize(testing.allocator, response.?, &rpos, 0);
+        const create_resp = try CreateResp.deserialize(testing.allocator, response.?, &rpos, 1);
         defer testing.allocator.free(create_resp.create_stream_responses);
         try testing.expectEqual(@as(i16, 0), create_resp.error_code);
         stream_id = create_resp.create_stream_responses[0].stream_id;
@@ -55918,6 +56017,9 @@ test "Broker restores AutoMQ stream object snapshot after restart" {
         const restored_stream = broker.object_manager.getStream(@intCast(stream_id)).?;
         try testing.expectEqual(@as(u64, 5), restored_stream.start_offset);
         try testing.expectEqual(@as(u64, 10), restored_stream.end_offset);
+        try testing.expectEqual(@as(usize, 1), restored_stream.tags.len);
+        try testing.expectEqualStrings("restore", restored_stream.tags[0].key);
+        try testing.expectEqualStrings("local", restored_stream.tags[0].value);
 
         const restored_so = broker.object_manager.stream_objects.get(@intCast(committed_object_id)).?;
         try testing.expectEqual(@as(u64, @intCast(stream_id)), restored_so.stream_id);
@@ -62350,7 +62452,11 @@ test "Broker replays replicated AutoMQ object metadata AppendEntries payload" {
 
     var source = Broker.init(testing.allocator, 1, 19094);
     defer source.deinit();
-    const stream = try source.object_manager.createStream(1);
+    const stream_tags = [_]storage.stream.StreamTag{.{
+        .key = "replicated",
+        .value = "append",
+    }};
+    const stream = try source.object_manager.createStreamWithTags(1, &stream_tags);
     const stream_id = stream.stream_id;
     const committed_object_id = source.object_manager.prepareObject();
     try source.object_manager.commitStreamObject(committed_object_id, stream_id, 0, 10, "so/1/0-10", 128);
@@ -62382,6 +62488,9 @@ test "Broker replays replicated AutoMQ object metadata AppendEntries payload" {
 
     const restored_stream = follower.object_manager.getStream(stream_id).?;
     try testing.expectEqual(@as(u64, 10), restored_stream.end_offset);
+    try testing.expectEqual(@as(usize, 1), restored_stream.tags.len);
+    try testing.expectEqualStrings("replicated", restored_stream.tags[0].key);
+    try testing.expectEqualStrings("append", restored_stream.tags[0].value);
     const restored_object = follower.object_manager.stream_objects.get(committed_object_id).?;
     try testing.expectEqual(stream_id, restored_object.stream_id);
     try testing.expectEqual(@as(u64, 10), restored_object.end_offset);
@@ -62415,7 +62524,11 @@ test "Broker replays replicated AutoMQ state after follower promotion" {
     const group_record = try source.buildAutoMqUpdateGroupRecord("group-a", "link-a", true);
     defer source.allocator.free(group_record);
 
-    const stream = try source.object_manager.createStream(1);
+    const failover_stream_tags = [_]storage.stream.StreamTag{.{
+        .key = "replicated",
+        .value = "promotion",
+    }};
+    const stream = try source.object_manager.createStreamWithTags(1, &failover_stream_tags);
     const stream_id = stream.stream_id;
     const committed_object_id = source.object_manager.prepareObject();
     try source.object_manager.commitStreamObject(committed_object_id, stream_id, 0, 10, "so/1/0-10", 128);
@@ -62480,6 +62593,9 @@ test "Broker replays replicated AutoMQ state after follower promotion" {
 
         const restored_stream = promoted.object_manager.getStream(stream_id).?;
         try testing.expectEqual(@as(u64, 10), restored_stream.end_offset);
+        try testing.expectEqual(@as(usize, 1), restored_stream.tags.len);
+        try testing.expectEqualStrings("replicated", restored_stream.tags[0].key);
+        try testing.expectEqualStrings("promotion", restored_stream.tags[0].value);
         const restored_object = promoted.object_manager.stream_objects.get(committed_object_id).?;
         try testing.expectEqual(stream_id, restored_object.stream_id);
 

@@ -128,6 +128,10 @@ def write_automq_node_tags(tags):
     return bytes(out)
 
 
+def write_automq_stream_tags(tags):
+    return write_automq_node_tags(tags)
+
+
 def read_exact(sock, size):
     data = bytearray()
     while len(data) < size:
@@ -1461,14 +1465,20 @@ def automq_delete_kv(port, key, correlation_id):
     return value
 
 
-def automq_create_stream(port, node_id, correlation_id):
+def automq_create_stream(port, node_id, correlation_id, tags=None):
+    api_version = 1 if tags is not None else 0
+    tags = tags or []
     body = struct.pack(">iq", node_id, 1)
     body += write_compact_array_len(1)
     body += struct.pack(">i", node_id)
+    if api_version >= 1:
+        body += write_automq_stream_tags(tags)
     body += b"\x00"  # item tagged fields
     body += b"\x00"  # request tagged fields
 
-    response = automq_request(port, 501, correlation_id, body, timeout=15)
+    response = automq_request(
+        port, 501, correlation_id, body, timeout=15, api_version=api_version
+    )
     pos = parse_flexible_response_header(response, correlation_id)
     top_error, pos = read_i16(response, pos)
     _, pos = read_i32(response, pos)  # throttle_time_ms
@@ -1486,14 +1496,20 @@ def automq_create_stream(port, node_id, correlation_id):
     return stream_id
 
 
-def automq_open_stream(port, node_id, stream_id, stream_epoch, correlation_id):
+def automq_open_stream(port, node_id, stream_id, stream_epoch, correlation_id, tags=None):
+    api_version = 1 if tags is not None else 0
+    tags = tags or []
     body = struct.pack(">iq", node_id, 1)
     body += write_compact_array_len(1)
     body += struct.pack(">qq", stream_id, stream_epoch)
+    if api_version >= 1:
+        body += write_automq_stream_tags(tags)
     body += b"\x00"  # item tagged fields
     body += b"\x00"  # request tagged fields
 
-    response = automq_request(port, 502, correlation_id, body, timeout=15)
+    response = automq_request(
+        port, 502, correlation_id, body, timeout=15, api_version=api_version
+    )
     pos = parse_flexible_response_header(response, correlation_id)
     top_error, pos = read_i16(response, pos)
     _, pos = read_i32(response, pos)  # throttle_time_ms
@@ -1681,13 +1697,7 @@ def automq_single_stream_error_response(port, api_key, correlation_id, body, api
         raise TestError(f"{api_name} item_error={item_error}")
 
 
-def automq_describe_stream(port, stream_id, correlation_id):
-    body = write_compact_array_len(0)  # topic_partitions
-    body += struct.pack(">i", -1)  # node_id
-    body += struct.pack(">q", stream_id)
-    body += b"\x00"  # request tagged fields
-
-    response = automq_request(port, 601, correlation_id, body)
+def parse_automq_describe_stream_response(response, correlation_id, stream_id):
     pos = parse_flexible_response_header(response, correlation_id)
     top_error, pos = read_i16(response, pos)
     _, pos = read_i32(response, pos)  # throttle_time_ms
@@ -1709,9 +1719,11 @@ def automq_describe_stream(port, stream_id, correlation_id):
         start_offset, pos = read_i64(response, pos)
         end_offset, pos = read_i64(response, pos)
         tag_count, pos = read_compact_array_len(response, pos)
+        tags = []
         for _ in range(tag_count):
-            _, pos = read_compact_string(response, pos)
-            _, pos = read_compact_string(response, pos)
+            tag_key, pos = read_compact_string(response, pos)
+            tag_value, pos = read_compact_string(response, pos)
+            tags.append((tag_key, tag_value))
             pos = skip_tags(response, pos)
         pos = skip_tags(response, pos)
         streams.append(
@@ -1723,13 +1735,28 @@ def automq_describe_stream(port, stream_id, correlation_id):
                 "epoch": epoch,
                 "start_offset": start_offset,
                 "end_offset": end_offset,
+                "tags": tags,
             }
         )
     pos = skip_tags(response, pos)
+    if pos != len(response):
+        raise TestError(
+            f"DescribeStreams response has trailing bytes: pos={pos} len={len(response)}"
+        )
     for stream in streams:
         if stream["stream_id"] == stream_id:
             return stream
     raise TestError(f"DescribeStreams did not include stream_id={stream_id}; streams={streams}")
+
+
+def automq_describe_stream(port, stream_id, correlation_id):
+    body = write_compact_array_len(0)  # topic_partitions
+    body += struct.pack(">i", -1)  # node_id
+    body += struct.pack(">q", stream_id)
+    body += b"\x00"  # request tagged fields
+
+    response = automq_request(port, 601, correlation_id, body)
+    return parse_automq_describe_stream_response(response, correlation_id, stream_id)
 
 
 def automq_register_node(port, node_id, node_epoch, wal_config, correlation_id, tags=None):
@@ -2048,13 +2075,13 @@ def wait_for_automq_delete_kv(port, key, expected_value, timeout=45):
     )
 
 
-def wait_for_automq_create_stream(port, node_id, timeout=45):
+def wait_for_automq_create_stream(port, node_id, tags=None, timeout=45):
     deadline = time.time() + timeout
     correlation_id = 9000
     last_error = None
     while time.time() < deadline:
         try:
-            return automq_create_stream(port, node_id, correlation_id)
+            return automq_create_stream(port, node_id, correlation_id, tags=tags)
         except Exception as exc:
             last_error = exc
             correlation_id += 1
@@ -2062,13 +2089,17 @@ def wait_for_automq_create_stream(port, node_id, timeout=45):
     raise TestError(f"AutoMQ CreateStreams did not succeed within {timeout}s: {last_error}")
 
 
-def wait_for_automq_open_stream(port, node_id, stream_id, stream_epoch, timeout=45):
+def wait_for_automq_open_stream(
+    port, node_id, stream_id, stream_epoch, tags=None, timeout=45
+):
     deadline = time.time() + timeout
     correlation_id = 9300
     last_error = None
     while time.time() < deadline:
         try:
-            return automq_open_stream(port, node_id, stream_id, stream_epoch, correlation_id)
+            return automq_open_stream(
+                port, node_id, stream_id, stream_epoch, correlation_id, tags=tags
+            )
         except Exception as exc:
             last_error = exc
             correlation_id += 1
@@ -2165,6 +2196,7 @@ def wait_for_automq_stream(
     expected_epoch=None,
     expected_start_offset=None,
     expected_end_offset=None,
+    expected_tags=None,
     timeout=45,
 ):
     deadline = time.time() + timeout
@@ -2184,6 +2216,7 @@ def wait_for_automq_stream(
                     or stream["start_offset"] == expected_start_offset
                 )
                 and (expected_end_offset is None or stream["end_offset"] == expected_end_offset)
+                and (expected_tags is None or stream["tags"] == list(expected_tags))
             ):
                 return stream
         except Exception as exc:
@@ -2905,7 +2938,19 @@ def run_automq_metadata_failover_scenario(tmp):
         wait_for_automq_manifest_groups(leader_broker_port, 1)
 
         stream_owner_node_id = leader_id
-        stream_id = wait_for_automq_create_stream(leader_broker_port, leader_id)
+        stream_tags_before = [
+            ("purpose", "failover"),
+            ("owner", f"node-{leader_id}"),
+        ]
+        stream_tags_after = [
+            ("purpose", "failover"),
+            ("phase", "reopened"),
+        ]
+        stream_id = wait_for_automq_create_stream(
+            leader_broker_port,
+            leader_id,
+            tags=stream_tags_before,
+        )
         stream_object_id = wait_for_automq_prepare_s3_object(
             leader_broker_port,
             stream_owner_node_id,
@@ -2919,7 +2964,15 @@ def run_automq_metadata_failover_scenario(tmp):
             10,
             1,
         )
-        wait_for_automq_stream(leader_broker_port, stream_id, "OPENED", 1, 0, 10)
+        wait_for_automq_stream(
+            leader_broker_port,
+            stream_id,
+            "OPENED",
+            1,
+            0,
+            10,
+            expected_tags=stream_tags_before,
+        )
         wait_for_automq_opening_stream(
             leader_broker_port,
             stream_owner_node_id,
@@ -2978,7 +3031,15 @@ def run_automq_metadata_failover_scenario(tmp):
             wait_for_automq_kv(info["broker_port"], delete_key, delete_value)
             wait_for_automq_zone_router(info["broker_port"], zone_router_before)
             wait_for_automq_manifest_groups(info["broker_port"], 1)
-            wait_for_automq_stream(info["broker_port"], stream_id, "OPENED", 1, 0, 10)
+            wait_for_automq_stream(
+                info["broker_port"],
+                stream_id,
+                "OPENED",
+                1,
+                0,
+                10,
+                expected_tags=stream_tags_before,
+            )
             wait_for_automq_opening_stream(
                 info["broker_port"],
                 stream_owner_node_id,
@@ -3012,7 +3073,15 @@ def run_automq_metadata_failover_scenario(tmp):
         wait_for_automq_kv(replacement_broker_port, delete_key, delete_value)
         wait_for_automq_zone_router(replacement_broker_port, zone_router_before)
         wait_for_automq_manifest_groups(replacement_broker_port, 1)
-        wait_for_automq_stream(replacement_broker_port, stream_id, "OPENED", 1, 0, 10)
+        wait_for_automq_stream(
+            replacement_broker_port,
+            stream_id,
+            "OPENED",
+            1,
+            0,
+            10,
+            expected_tags=stream_tags_before,
+        )
         wait_for_automq_opening_stream(
             replacement_broker_port,
             stream_owner_node_id,
@@ -3072,7 +3141,15 @@ def run_automq_metadata_failover_scenario(tmp):
             20,
             1,
         )
-        wait_for_automq_stream(replacement_broker_port, stream_id, "OPENED", 1, 0, 20)
+        wait_for_automq_stream(
+            replacement_broker_port,
+            stream_id,
+            "OPENED",
+            1,
+            0,
+            20,
+            expected_tags=stream_tags_before,
+        )
         wait_for_automq_opening_stream(
             replacement_broker_port,
             stream_owner_node_id,
@@ -3089,7 +3166,15 @@ def run_automq_metadata_failover_scenario(tmp):
             stream_id,
             1,
         )
-        wait_for_automq_stream(replacement_broker_port, stream_id, "CLOSED", 1, 0, 20)
+        wait_for_automq_stream(
+            replacement_broker_port,
+            stream_id,
+            "CLOSED",
+            1,
+            0,
+            20,
+            expected_tags=stream_tags_before,
+        )
         wait_for_automq_opening_stream_missing(
             replacement_broker_port,
             stream_owner_node_id,
@@ -3100,8 +3185,17 @@ def run_automq_metadata_failover_scenario(tmp):
             stream_owner_node_id,
             stream_id,
             2,
+            tags=stream_tags_after,
         )
-        wait_for_automq_stream(replacement_broker_port, stream_id, "OPENED", 2, 0, 20)
+        wait_for_automq_stream(
+            replacement_broker_port,
+            stream_id,
+            "OPENED",
+            2,
+            0,
+            20,
+            expected_tags=stream_tags_after,
+        )
         wait_for_automq_trim_stream(
             replacement_broker_port,
             stream_owner_node_id,
@@ -3109,7 +3203,15 @@ def run_automq_metadata_failover_scenario(tmp):
             2,
             5,
         )
-        wait_for_automq_stream(replacement_broker_port, stream_id, "OPENED", 2, 5, 20)
+        wait_for_automq_stream(
+            replacement_broker_port,
+            stream_id,
+            "OPENED",
+            2,
+            5,
+            20,
+            expected_tags=stream_tags_after,
+        )
         wait_for_automq_opening_stream(
             replacement_broker_port,
             stream_owner_node_id,
@@ -3163,6 +3265,7 @@ def run_automq_metadata_failover_scenario(tmp):
             2,
             5,
             20,
+            expected_tags=stream_tags_after,
         )
         wait_for_automq_opening_stream(
             processes[leader_id]["broker_port"],
@@ -3709,6 +3812,30 @@ def self_test():
             }
         ]:
             raise TestError(f"AutomqGetNodes tag fixture parser failed: {automq_nodes}")
+
+        describe_stream_id = 1234
+        describe_stream_tags = [("purpose", "self-test"), ("phase", "parser")]
+        describe_stream_fixture = struct.pack(">i", 52)
+        describe_stream_fixture += b"\x00"  # response header tagged fields
+        describe_stream_fixture += struct.pack(">hi", 0, 0)
+        describe_stream_fixture += write_compact_array_len(1)
+        describe_stream_fixture += struct.pack(">qi", describe_stream_id, 7)
+        describe_stream_fixture += write_compact_string("OPENED")
+        describe_stream_fixture += b"\x00" * 16
+        describe_stream_fixture += write_compact_string(None)
+        describe_stream_fixture += struct.pack(">iqqq", -1, 2, 5, 20)
+        describe_stream_fixture += write_automq_stream_tags(describe_stream_tags)
+        describe_stream_fixture += b"\x00"  # stream metadata tagged fields
+        describe_stream_fixture += b"\x00"  # response tagged fields
+        described_stream = parse_automq_describe_stream_response(
+            describe_stream_fixture,
+            52,
+            describe_stream_id,
+        )
+        if described_stream["tags"] != describe_stream_tags:
+            raise TestError(
+                f"DescribeStreams tag fixture parser failed: {described_stream}"
+            )
 
         print("ok: KRaft failover harness self-test")
         return 0

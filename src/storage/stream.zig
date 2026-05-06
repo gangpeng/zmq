@@ -44,6 +44,11 @@ pub const StreamRange = struct {
     node_id: i32,
 };
 
+pub const StreamTag = struct {
+    key: []const u8,
+    value: []const u8,
+};
+
 /// A Stream is the metadata abstraction for a partition's data in S3.
 /// Each Kafka partition maps to one Stream (via hashPartitionKey).
 ///
@@ -59,6 +64,7 @@ pub const Stream = struct {
     state: StreamState = .opened,
     node_id: i32,
     ranges: std.array_list.Managed(StreamRange),
+    tags: []const StreamTag = &.{},
     allocator: Allocator,
 
     pub fn init(allocator: Allocator, stream_id: u64, node_id: i32) Stream {
@@ -71,7 +77,47 @@ pub const Stream = struct {
     }
 
     pub fn deinit(self: *Stream) void {
+        freeStreamTags(self.allocator, self.tags);
         self.ranges.deinit();
+    }
+
+    fn freeStreamTags(allocator: Allocator, tags: []const StreamTag) void {
+        for (tags) |tag| {
+            allocator.free(tag.key);
+            allocator.free(tag.value);
+        }
+        if (tags.len > 0) allocator.free(tags);
+    }
+
+    fn cloneStreamTags(allocator: Allocator, tags: []const StreamTag) ![]StreamTag {
+        if (tags.len == 0) return &.{};
+        const copies = try allocator.alloc(StreamTag, tags.len);
+        var copied: usize = 0;
+        errdefer {
+            for (copies[0..copied]) |tag| {
+                allocator.free(tag.key);
+                allocator.free(tag.value);
+            }
+            allocator.free(copies);
+        }
+        for (tags, 0..) |tag, idx| {
+            const key_copy = try allocator.dupe(u8, tag.key);
+            errdefer allocator.free(key_copy);
+            const value_copy = try allocator.dupe(u8, tag.value);
+            copies[idx] = .{ .key = key_copy, .value = value_copy };
+            copied += 1;
+        }
+        return copies;
+    }
+
+    fn replaceTagsOwned(self: *Stream, tags: []StreamTag) void {
+        freeStreamTags(self.allocator, self.tags);
+        self.tags = tags;
+    }
+
+    pub fn setTags(self: *Stream, tags: []const StreamTag) !void {
+        const copies = try cloneStreamTags(self.allocator, tags);
+        self.replaceTagsOwned(copies);
     }
 
     /// Called when ownership transfers to a new broker.
@@ -335,18 +381,27 @@ pub const ObjectManager = struct {
 
     /// Create a new stream with an auto-allocated stream_id.
     pub fn createStream(self: *ObjectManager, node_id: i32) !*Stream {
+        return self.createStreamWithTags(node_id, &.{});
+    }
+
+    pub fn createStreamWithTags(self: *ObjectManager, node_id: i32, tags: []const StreamTag) !*Stream {
         const stream_id = self.next_object_id;
-        const stream = try self.createStreamWithId(stream_id, node_id);
+        const stream = try self.createStreamWithIdAndTags(stream_id, node_id, tags);
         self.next_object_id = stream_id + 1;
         return stream;
     }
 
     /// Create a new stream with a specific stream_id.
     pub fn createStreamWithId(self: *ObjectManager, stream_id: u64, node_id: i32) !*Stream {
+        return self.createStreamWithIdAndTags(stream_id, node_id, &.{});
+    }
+
+    pub fn createStreamWithIdAndTags(self: *ObjectManager, stream_id: u64, node_id: i32, tags: []const StreamTag) !*Stream {
         if (self.streams.contains(stream_id)) return error.DuplicateStream;
 
         var stream = Stream.init(self.allocator, stream_id, node_id);
         errdefer stream.deinit();
+        try stream.setTags(tags);
         // Create the initial range
         try stream.ranges.append(.{
             .epoch = stream.epoch,
@@ -370,6 +425,17 @@ pub const ObjectManager = struct {
         if (epoch < stream.epoch) return error.StaleStreamEpoch;
         if (stream.state == .opened and epoch == stream.epoch) return;
         try stream.open(epoch);
+    }
+
+    pub fn openStreamWithTags(self: *ObjectManager, stream_id: u64, epoch: u64, tags: []const StreamTag) !void {
+        const stream = self.streams.getPtr(stream_id) orelse return error.StreamNotFound;
+        const tag_copies = try Stream.cloneStreamTags(self.allocator, tags);
+        errdefer Stream.freeStreamTags(self.allocator, tag_copies);
+        if (epoch < stream.epoch) return error.StaleStreamEpoch;
+        if (!(stream.state == .opened and epoch == stream.epoch)) {
+            try stream.open(epoch);
+        }
+        stream.replaceTagsOwned(tag_copies);
     }
 
     /// Close a stream.
@@ -1075,7 +1141,8 @@ pub const ObjectManager = struct {
     /// Forward compatibility: loadSnapshot rejects unknown versions.
     /// v1: initial format
     /// v2: added S3ObjectState (u8) and state_changed_ms (i64) to SO and SSO
-    const SNAPSHOT_VERSION: u8 = 2;
+    /// v3: added stream tags to stream metadata
+    const SNAPSHOT_VERSION: u8 = 3;
 
     /// Serialize all ObjectManager state (streams, SOs, SSOs, orphaned keys) to
     /// a binary buffer suitable for writing to disk. The caller owns the returned
@@ -1094,6 +1161,12 @@ pub const ObjectManager = struct {
     ///     [8 bytes] end_offset (u64)
     ///     [1 byte]  state (u8: 0=opened, 1=closed)
     ///     [4 bytes] node_id (i32)
+    ///     [4 bytes] tag_count (u32) [v3+]
+    ///     For each tag:
+    ///       [2 bytes] key_len (u16)
+    ///       [key_len] key bytes
+    ///       [2 bytes] value_len (u16)
+    ///       [value_len] value bytes
     ///     [4 bytes] range_count (u32)
     ///     For each range:
     ///       [8 bytes] epoch (u64)
@@ -1148,6 +1221,11 @@ pub const ObjectManager = struct {
         while (stream_it.next()) |entry| {
             const s = entry.value_ptr;
             size += 8 + 8 + 8 + 8 + 1 + 4; // fixed fields
+            size += 4; // tag_count
+            for (s.tags) |tag| {
+                if (tag.key.len > std.math.maxInt(u16) or tag.value.len > std.math.maxInt(u16)) return error.SnapshotTooLarge;
+                size += 2 + tag.key.len + 2 + tag.value.len;
+            }
             size += 4; // range_count
             size += s.ranges.items.len * (8 + 8 + 8 + 4); // ranges
         }
@@ -1204,6 +1282,17 @@ pub const ObjectManager = struct {
             buf[pos] = @intFromEnum(s.state);
             pos += 1;
             writeI32(buf, &pos, s.node_id);
+            if (s.tags.len > std.math.maxInt(u32)) return error.SnapshotTooLarge;
+            writeU32(buf, &pos, @intCast(s.tags.len));
+            for (s.tags) |tag| {
+                if (tag.key.len > std.math.maxInt(u16) or tag.value.len > std.math.maxInt(u16)) return error.SnapshotTooLarge;
+                writeU16(buf, &pos, @intCast(tag.key.len));
+                @memcpy(buf[pos .. pos + tag.key.len], tag.key);
+                pos += tag.key.len;
+                writeU16(buf, &pos, @intCast(tag.value.len));
+                @memcpy(buf[pos .. pos + tag.value.len], tag.value);
+                pos += tag.value.len;
+            }
             writeU32(buf, &pos, @intCast(s.ranges.items.len));
             for (s.ranges.items) |r| {
                 writeU64(buf, &pos, r.epoch);
@@ -1268,6 +1357,38 @@ pub const ObjectManager = struct {
         return buf;
     }
 
+    fn readStreamTagsFromSnapshot(self: *ObjectManager, data: []const u8, pos: *usize) ![]StreamTag {
+        const tag_count = readU32(data, pos) orelse return error.CorruptSnapshot;
+        if (tag_count == 0) return &.{};
+        const tags = try self.allocator.alloc(StreamTag, tag_count);
+        var copied: usize = 0;
+        errdefer {
+            for (tags[0..copied]) |tag| {
+                self.allocator.free(tag.key);
+                self.allocator.free(tag.value);
+            }
+            self.allocator.free(tags);
+        }
+
+        var i: usize = 0;
+        while (i < tag_count) : (i += 1) {
+            const key_len = readU16(data, pos) orelse return error.CorruptSnapshot;
+            if (pos.* + key_len > data.len) return error.CorruptSnapshot;
+            const key_copy = try self.allocator.dupe(u8, data[pos.* .. pos.* + key_len]);
+            pos.* += key_len;
+            errdefer self.allocator.free(key_copy);
+
+            const value_len = readU16(data, pos) orelse return error.CorruptSnapshot;
+            if (pos.* + value_len > data.len) return error.CorruptSnapshot;
+            const value_copy = try self.allocator.dupe(u8, data[pos.* .. pos.* + value_len]);
+            pos.* += value_len;
+
+            tags[i] = .{ .key = key_copy, .value = value_copy };
+            copied += 1;
+        }
+        return tags;
+    }
+
     /// Restore ObjectManager state from a snapshot buffer produced by takeSnapshot().
     /// Also returns any persisted orphaned keys. The caller owns the returned slice
     /// and each key within it (allocated with self.allocator).
@@ -1279,10 +1400,10 @@ pub const ObjectManager = struct {
 
         var pos: usize = 0;
 
-        // Version check — accept v1 (legacy) and v2 (with lifecycle state)
+        // Version check — accept v1/v2 legacy snapshots and v3 stream tags
         const version = data[pos];
         pos += 1;
-        if (version != 1 and version != 2) return error.UnsupportedSnapshotVersion;
+        if (version != 1 and version != 2 and version != 3) return error.UnsupportedSnapshotVersion;
 
         // next_object_id, next_order_id
         self.next_object_id = readU64(data, &pos) orelse return error.CorruptSnapshot;
@@ -1302,10 +1423,14 @@ pub const ObjectManager = struct {
             if (state_byte > 1) return error.CorruptSnapshot;
             const state: StreamState = @enumFromInt(state_byte);
             const node_id = readI32(data, &pos) orelse return error.CorruptSnapshot;
+            const tags: []const StreamTag = if (version >= 3) try self.readStreamTagsFromSnapshot(data, &pos) else &.{};
+            var tags_moved = false;
+            errdefer if (!tags_moved) Stream.freeStreamTags(self.allocator, tags);
             const range_count = readU32(data, &pos) orelse return error.CorruptSnapshot;
 
             var ranges = std.array_list.Managed(StreamRange).init(self.allocator);
-            errdefer ranges.deinit();
+            var ranges_moved = false;
+            errdefer if (!ranges_moved) ranges.deinit();
             var ri: u32 = 0;
             while (ri < range_count) : (ri += 1) {
                 const r_epoch = readU64(data, &pos) orelse return error.CorruptSnapshot;
@@ -1320,6 +1445,8 @@ pub const ObjectManager = struct {
                 });
             }
 
+            tags_moved = true;
+            ranges_moved = true;
             const stream = Stream{
                 .stream_id = stream_id,
                 .epoch = epoch,
@@ -1328,7 +1455,13 @@ pub const ObjectManager = struct {
                 .state = state,
                 .node_id = node_id,
                 .ranges = ranges,
+                .tags = tags,
                 .allocator = self.allocator,
+            };
+            var stream_moved = false;
+            errdefer if (!stream_moved) {
+                var cleanup_stream = stream;
+                cleanup_stream.deinit();
             };
             // If the stream ID already exists, clean up the old entry first
             if (self.streams.fetchRemove(stream_id)) |old| {
@@ -1336,6 +1469,7 @@ pub const ObjectManager = struct {
                 old_stream.deinit();
             }
             try self.streams.put(stream_id, stream);
+            stream_moved = true;
         }
 
         // --- StreamObjects ---
@@ -2407,7 +2541,7 @@ test "ObjectManager snapshot roundtrip — empty state" {
 
     // Verify version byte is present
     try testing.expect(snap.len >= 1);
-    try testing.expectEqual(@as(u8, 2), snap[0]);
+    try testing.expectEqual(@as(u8, 3), snap[0]);
 
     // Load into a fresh ObjectManager
     var om2 = ObjectManager.init(testing.allocator, 0);
@@ -2428,6 +2562,11 @@ test "ObjectManager snapshot roundtrip — streams with ranges" {
 
     // Create streams with various states
     const s1 = try om.createStreamWithId(10, 1);
+    const stream_tags = [_]StreamTag{
+        .{ .key = "rack", .value = "az-a" },
+        .{ .key = "role", .value = "leader" },
+    };
+    try s1.setTags(&stream_tags);
     s1.advanceEndOffset(500);
     s1.trim(50);
     try s1.transferOwnership(2); // bumps epoch to 2, new range
@@ -2464,6 +2603,11 @@ test "ObjectManager snapshot roundtrip — streams with ranges" {
     try testing.expectEqual(@as(u64, 2), rs1.ranges.items[1].epoch);
     try testing.expectEqual(@as(i32, 2), rs1.ranges.items[1].node_id);
     try testing.expectEqual(@as(u64, 500), rs1.ranges.items[1].start_offset);
+    try testing.expectEqual(@as(usize, 2), rs1.tags.len);
+    try testing.expectEqualStrings("rack", rs1.tags[0].key);
+    try testing.expectEqualStrings("az-a", rs1.tags[0].value);
+    try testing.expectEqualStrings("role", rs1.tags[1].key);
+    try testing.expectEqualStrings("leader", rs1.tags[1].value);
 
     // Verify stream 20
     const rs2 = om2.getStream(20).?;
@@ -2471,6 +2615,42 @@ test "ObjectManager snapshot roundtrip — streams with ranges" {
     try testing.expectEqual(StreamState.closed, rs2.state);
     try testing.expectEqual(@as(i32, 3), rs2.node_id);
     try testing.expectEqual(@as(u64, 200), rs2.end_offset);
+    try testing.expectEqual(@as(usize, 0), rs2.tags.len);
+}
+
+test "ObjectManager snapshot roundtrip — legacy stream snapshots default to empty tags" {
+    var buf: [128]u8 = undefined;
+    var pos: usize = 0;
+    buf[pos] = 2;
+    pos += 1;
+    ObjectManager.writeU64(&buf, &pos, 42); // next_object_id
+    ObjectManager.writeU64(&buf, &pos, 1); // next_order_id
+    ObjectManager.writeU32(&buf, &pos, 1); // stream_count
+    ObjectManager.writeU64(&buf, &pos, 10); // stream_id
+    ObjectManager.writeU64(&buf, &pos, 1); // epoch
+    ObjectManager.writeU64(&buf, &pos, 0); // start_offset
+    ObjectManager.writeU64(&buf, &pos, 5); // end_offset
+    buf[pos] = @intFromEnum(StreamState.opened);
+    pos += 1;
+    ObjectManager.writeI32(&buf, &pos, 7); // node_id
+    ObjectManager.writeU32(&buf, &pos, 1); // range_count
+    ObjectManager.writeU64(&buf, &pos, 1); // range epoch
+    ObjectManager.writeU64(&buf, &pos, 0); // range start
+    ObjectManager.writeU64(&buf, &pos, 5); // range end
+    ObjectManager.writeI32(&buf, &pos, 7); // range node
+    ObjectManager.writeU32(&buf, &pos, 0); // stream object count
+    ObjectManager.writeU32(&buf, &pos, 0); // stream-set object count
+    ObjectManager.writeU32(&buf, &pos, 0); // orphan count
+
+    var om = ObjectManager.init(testing.allocator, 0);
+    defer om.deinit();
+    const orphans = try om.loadSnapshot(buf[0..pos]);
+    defer testing.allocator.free(orphans);
+
+    const stream = om.getStream(10).?;
+    try testing.expectEqual(@as(u64, 5), stream.end_offset);
+    try testing.expectEqual(@as(i32, 7), stream.node_id);
+    try testing.expectEqual(@as(usize, 0), stream.tags.len);
 }
 
 test "ObjectManager snapshot roundtrip — stream objects and stream set objects" {
@@ -2610,8 +2790,8 @@ test "ObjectManager snapshot — corrupt data detected" {
     // Version 0 is unsupported
     try testing.expectError(error.UnsupportedSnapshotVersion, om.loadSnapshot(&[_]u8{0}));
 
-    // Version 3 is unsupported
-    try testing.expectError(error.UnsupportedSnapshotVersion, om.loadSnapshot(&[_]u8{3}));
+    // Version 4 is unsupported
+    try testing.expectError(error.UnsupportedSnapshotVersion, om.loadSnapshot(&[_]u8{4}));
 
     // Valid header but truncated after next_object_id (missing next_order_id + rest)
     var truncated: [9]u8 = undefined;
@@ -2739,7 +2919,7 @@ test "ObjectManager snapshot — version header present" {
     defer testing.allocator.free(snap);
 
     // First byte must be the version
-    try testing.expectEqual(@as(u8, 2), snap[0]);
+    try testing.expectEqual(@as(u8, 3), snap[0]);
 
     // Minimum size: version(1) + next_object_id(8) + next_order_id(8) +
     // stream_count(4) + so_count(4) + sso_count(4) + orphan_count(4) = 33
