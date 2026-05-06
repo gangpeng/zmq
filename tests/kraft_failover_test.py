@@ -153,6 +153,12 @@ def read_i16(buf, pos):
     return struct.unpack_from(">h", buf, pos)[0], pos + 2
 
 
+def read_i8(buf, pos):
+    if pos + 1 > len(buf):
+        raise TestError("buffer underflow while reading i8")
+    return struct.unpack_from(">b", buf, pos)[0], pos + 1
+
+
 def read_i32(buf, pos):
     if pos + 4 > len(buf):
         raise TestError("buffer underflow while reading i32")
@@ -4002,6 +4008,482 @@ def wait_for_share_acknowledge_session_checkpoint(port, group_state, timeout=30)
     )
 
 
+def write_share_state_topics(topic_partitions, partition_writer):
+    out = bytearray(write_compact_array_len(len(topic_partitions)))
+    for topic in topic_partitions:
+        topic_id = topic["topic_id"]
+        if len(topic_id) != 16:
+            raise TestError(f"invalid share-state topic id length {len(topic_id)}")
+        out += topic_id
+        partitions = topic.get("partitions", [])
+        out += write_compact_array_len(len(partitions))
+        for partition in partitions:
+            out += partition_writer(partition)
+            out += b"\x00"  # partition tagged fields
+        out += b"\x00"  # topic tagged fields
+    return bytes(out)
+
+
+def write_initialize_share_group_state_topics(topic_partitions):
+    def write_partition(partition):
+        return struct.pack(
+            ">iiq",
+            partition.get("partition", 0),
+            partition["state_epoch"],
+            partition["start_offset"],
+        )
+
+    return write_share_state_topics(topic_partitions, write_partition)
+
+
+def write_read_share_group_state_topics(topic_partitions):
+    def write_partition(partition):
+        return struct.pack(
+            ">ii",
+            partition.get("partition", 0),
+            partition.get("leader_epoch", 0),
+        )
+
+    return write_share_state_topics(topic_partitions, write_partition)
+
+
+def write_write_share_group_state_topics(topic_partitions):
+    def write_partition(partition):
+        out = bytearray(
+            struct.pack(
+                ">iiiq",
+                partition.get("partition", 0),
+                partition["state_epoch"],
+                partition.get("leader_epoch", 0),
+                partition["start_offset"],
+            )
+        )
+        state_batches = partition.get("state_batches", [])
+        out += write_compact_array_len(len(state_batches))
+        for batch in state_batches:
+            out += struct.pack(
+                ">qqbh",
+                batch["first_offset"],
+                batch["last_offset"],
+                batch["delivery_state"],
+                batch["delivery_count"],
+            )
+            out += b"\x00"  # state batch tagged fields
+        return bytes(out)
+
+    return write_share_state_topics(topic_partitions, write_partition)
+
+
+def write_delete_share_group_state_topics(topic_partitions):
+    def write_partition(partition):
+        return struct.pack(">i", partition.get("partition", 0))
+
+    return write_share_state_topics(topic_partitions, write_partition)
+
+
+def parse_share_state_result_response(response, correlation_id, response_name):
+    pos = parse_flexible_response_header(response, correlation_id)
+    result_count, pos = read_compact_array_len(response, pos)
+    results = []
+    for _ in range(result_count):
+        if pos + 16 > len(response):
+            raise TestError(
+                f"buffer underflow while reading {response_name} topic id"
+            )
+        topic_id = response[pos : pos + 16]
+        pos += 16
+        partition_count, pos = read_compact_array_len(response, pos)
+        partitions = []
+        for _ in range(partition_count):
+            partition, pos = read_i32(response, pos)
+            error_code, pos = read_i16(response, pos)
+            error_message, pos = read_compact_string(response, pos)
+            pos = skip_tags(response, pos)
+            partitions.append(
+                {
+                    "partition": partition,
+                    "error_code": error_code,
+                    "error_message": error_message,
+                }
+            )
+        pos = skip_tags(response, pos)
+        results.append({"topic_id": topic_id, "partitions": partitions})
+    pos = skip_tags(response, pos)
+    if pos != len(response):
+        raise TestError(
+            f"{response_name} response trailing bytes: {len(response) - pos}"
+        )
+    return results
+
+
+def parse_read_share_group_state_response(response, correlation_id):
+    pos = parse_flexible_response_header(response, correlation_id)
+    result_count, pos = read_compact_array_len(response, pos)
+    results = []
+    for _ in range(result_count):
+        if pos + 16 > len(response):
+            raise TestError("buffer underflow while reading ReadShareGroupState topic id")
+        topic_id = response[pos : pos + 16]
+        pos += 16
+        partition_count, pos = read_compact_array_len(response, pos)
+        partitions = []
+        for _ in range(partition_count):
+            partition, pos = read_i32(response, pos)
+            error_code, pos = read_i16(response, pos)
+            error_message, pos = read_compact_string(response, pos)
+            state_epoch, pos = read_i32(response, pos)
+            start_offset, pos = read_i64(response, pos)
+            batch_count, pos = read_compact_array_len(response, pos)
+            state_batches = []
+            for _ in range(batch_count):
+                first_offset, pos = read_i64(response, pos)
+                last_offset, pos = read_i64(response, pos)
+                delivery_state, pos = read_i8(response, pos)
+                delivery_count, pos = read_i16(response, pos)
+                pos = skip_tags(response, pos)
+                state_batches.append(
+                    {
+                        "first_offset": first_offset,
+                        "last_offset": last_offset,
+                        "delivery_state": delivery_state,
+                        "delivery_count": delivery_count,
+                    }
+                )
+            pos = skip_tags(response, pos)
+            partitions.append(
+                {
+                    "partition": partition,
+                    "error_code": error_code,
+                    "error_message": error_message,
+                    "state_epoch": state_epoch,
+                    "start_offset": start_offset,
+                    "state_batches": state_batches,
+                }
+            )
+        pos = skip_tags(response, pos)
+        results.append({"topic_id": topic_id, "partitions": partitions})
+    pos = skip_tags(response, pos)
+    if pos != len(response):
+        raise TestError(
+            f"ReadShareGroupState response trailing bytes: {len(response) - pos}"
+        )
+    return results
+
+
+def parse_read_share_group_state_summary_response(response, correlation_id):
+    pos = parse_flexible_response_header(response, correlation_id)
+    result_count, pos = read_compact_array_len(response, pos)
+    results = []
+    for _ in range(result_count):
+        if pos + 16 > len(response):
+            raise TestError(
+                "buffer underflow while reading ReadShareGroupStateSummary topic id"
+            )
+        topic_id = response[pos : pos + 16]
+        pos += 16
+        partition_count, pos = read_compact_array_len(response, pos)
+        partitions = []
+        for _ in range(partition_count):
+            partition, pos = read_i32(response, pos)
+            error_code, pos = read_i16(response, pos)
+            error_message, pos = read_compact_string(response, pos)
+            state_epoch, pos = read_i32(response, pos)
+            start_offset, pos = read_i64(response, pos)
+            pos = skip_tags(response, pos)
+            partitions.append(
+                {
+                    "partition": partition,
+                    "error_code": error_code,
+                    "error_message": error_message,
+                    "state_epoch": state_epoch,
+                    "start_offset": start_offset,
+                }
+            )
+        pos = skip_tags(response, pos)
+        results.append({"topic_id": topic_id, "partitions": partitions})
+    pos = skip_tags(response, pos)
+    if pos != len(response):
+        raise TestError(
+            f"ReadShareGroupStateSummary response trailing bytes: "
+            f"{len(response) - pos}"
+        )
+    return results
+
+
+def share_state_single_topic(state, partition):
+    return [{"topic_id": state["topic_id"], "partitions": [partition]}]
+
+
+def initialize_share_group_state(port, state, correlation_id):
+    body = write_compact_string(state["group_id"])
+    body += write_initialize_share_group_state_topics(
+        share_state_single_topic(
+            state,
+            {
+                "partition": state["partition"],
+                "state_epoch": state["state_epoch"],
+                "start_offset": state["start_offset"],
+            },
+        )
+    )
+    body += b"\x00"  # request tagged fields
+    response = flexible_kafka_request(port, 83, 0, correlation_id, body)
+    return parse_share_state_result_response(
+        response, correlation_id, "InitializeShareGroupState"
+    )
+
+
+def read_share_group_state(port, state, correlation_id):
+    body = write_compact_string(state["group_id"])
+    body += write_read_share_group_state_topics(
+        share_state_single_topic(
+            state,
+            {"partition": state["partition"], "leader_epoch": 0},
+        )
+    )
+    body += b"\x00"  # request tagged fields
+    response = flexible_kafka_request(port, 84, 0, correlation_id, body)
+    return parse_read_share_group_state_response(response, correlation_id)
+
+
+def write_share_group_state(port, state, correlation_id):
+    body = write_compact_string(state["group_id"])
+    body += write_write_share_group_state_topics(
+        share_state_single_topic(
+            state,
+            {
+                "partition": state["partition"],
+                "state_epoch": state["state_epoch"],
+                "leader_epoch": 0,
+                "start_offset": state["start_offset"],
+                "state_batches": state.get("state_batches", []),
+            },
+        )
+    )
+    body += b"\x00"  # request tagged fields
+    response = flexible_kafka_request(port, 85, 0, correlation_id, body)
+    return parse_share_state_result_response(
+        response, correlation_id, "WriteShareGroupState"
+    )
+
+
+def delete_share_group_state(port, state, correlation_id):
+    body = write_compact_string(state["group_id"])
+    body += write_delete_share_group_state_topics(
+        share_state_single_topic(state, {"partition": state["partition"]})
+    )
+    body += b"\x00"  # request tagged fields
+    response = flexible_kafka_request(port, 86, 0, correlation_id, body)
+    return parse_share_state_result_response(
+        response, correlation_id, "DeleteShareGroupState"
+    )
+
+
+def read_share_group_state_summary(port, state, correlation_id):
+    body = write_compact_string(state["group_id"])
+    body += write_read_share_group_state_topics(
+        share_state_single_topic(
+            state,
+            {"partition": state["partition"], "leader_epoch": 0},
+        )
+    )
+    body += b"\x00"  # request tagged fields
+    response = flexible_kafka_request(port, 87, 0, correlation_id, body)
+    return parse_read_share_group_state_summary_response(response, correlation_id)
+
+
+def assert_share_state_partition_result(results, state, response_name):
+    if len(results) != 1:
+        raise TestError(f"{response_name} topic count mismatch: {results}")
+    topic = results[0]
+    if topic["topic_id"] != state["topic_id"]:
+        raise TestError(f"{response_name} topic id mismatch: {results}")
+    if len(topic["partitions"]) != 1:
+        raise TestError(f"{response_name} partition count mismatch: {results}")
+    partition = topic["partitions"][0]
+    if partition["partition"] != state["partition"]:
+        raise TestError(f"{response_name} partition mismatch: {results}")
+    if partition["error_code"] != 0:
+        raise TestError(f"{response_name} partition error: {results}")
+    return partition
+
+
+def wait_for_share_state_initialized(port, state, timeout=30):
+    deadline = time.time() + timeout
+    correlation_id = 8100
+    last_error = None
+    while time.time() < deadline:
+        try:
+            results = initialize_share_group_state(port, state, correlation_id)
+            assert_share_state_partition_result(
+                results, state, "InitializeShareGroupState"
+            )
+            return
+        except Exception as exc:
+            last_error = exc
+        correlation_id += 1
+        time.sleep(0.25)
+    raise TestError(
+        f"InitializeShareGroupState did not recover for "
+        f"{state['group_id']!r}: {last_error}"
+    )
+
+
+def wait_for_share_state_written(port, state, timeout=30):
+    deadline = time.time() + timeout
+    correlation_id = 8110
+    last_error = None
+    while time.time() < deadline:
+        try:
+            results = write_share_group_state(port, state, correlation_id)
+            assert_share_state_partition_result(
+                results, state, "WriteShareGroupState"
+            )
+            return
+        except Exception as exc:
+            last_error = exc
+        correlation_id += 1
+        time.sleep(0.25)
+    raise TestError(
+        f"WriteShareGroupState did not recover for "
+        f"{state['group_id']!r}: {last_error}"
+    )
+
+
+def wait_for_share_state_read_checkpoint(port, state, timeout=30):
+    deadline = time.time() + timeout
+    correlation_id = 8120
+    last_error = None
+    while time.time() < deadline:
+        try:
+            results = read_share_group_state(port, state, correlation_id)
+            partition = assert_share_state_partition_result(
+                results, state, "ReadShareGroupState"
+            )
+            if partition["state_epoch"] != state["state_epoch"]:
+                raise TestError(f"ReadShareGroupState epoch mismatch: {results}")
+            if partition["start_offset"] != state["start_offset"]:
+                raise TestError(f"ReadShareGroupState start offset mismatch: {results}")
+            if partition["state_batches"] != state.get("state_batches", []):
+                raise TestError(f"ReadShareGroupState batches mismatch: {results}")
+            return
+        except Exception as exc:
+            last_error = exc
+        correlation_id += 1
+        time.sleep(0.25)
+    raise TestError(
+        f"ReadShareGroupState did not recover for "
+        f"{state['group_id']!r}: {last_error}"
+    )
+
+
+def wait_for_share_state_summary_checkpoint(port, state, timeout=30):
+    deadline = time.time() + timeout
+    correlation_id = 8130
+    last_error = None
+    while time.time() < deadline:
+        try:
+            results = read_share_group_state_summary(port, state, correlation_id)
+            partition = assert_share_state_partition_result(
+                results, state, "ReadShareGroupStateSummary"
+            )
+            if partition["state_epoch"] != state["state_epoch"]:
+                raise TestError(
+                    f"ReadShareGroupStateSummary epoch mismatch: {results}"
+                )
+            if partition["start_offset"] != state["start_offset"]:
+                raise TestError(
+                    f"ReadShareGroupStateSummary start offset mismatch: {results}"
+                )
+            return
+        except Exception as exc:
+            last_error = exc
+        correlation_id += 1
+        time.sleep(0.25)
+    raise TestError(
+        f"ReadShareGroupStateSummary did not recover for "
+        f"{state['group_id']!r}: {last_error}"
+    )
+
+
+def wait_for_share_state_deleted(port, state, timeout=30):
+    deadline = time.time() + timeout
+    correlation_id = 8140
+    last_error = None
+    while time.time() < deadline:
+        try:
+            results = delete_share_group_state(port, state, correlation_id)
+            assert_share_state_partition_result(results, state, "DeleteShareGroupState")
+            return
+        except Exception as exc:
+            last_error = exc
+        correlation_id += 1
+        time.sleep(0.25)
+    raise TestError(
+        f"DeleteShareGroupState did not recover for "
+        f"{state['group_id']!r}: {last_error}"
+    )
+
+
+def wait_for_share_state_checkpoint(port, state):
+    wait_for_share_state_read_checkpoint(port, state)
+    wait_for_share_state_summary_checkpoint(port, state)
+
+
+def wait_for_share_state_deleted_checkpoint(port, state, timeout=30):
+    deleted_state = dict(state)
+    deleted_state["state_epoch"] = 0
+    deleted_state["start_offset"] = -1
+    deleted_state["state_batches"] = []
+    wait_for_share_state_read_checkpoint(port, deleted_state, timeout=timeout)
+    wait_for_share_state_summary_checkpoint(port, deleted_state, timeout=timeout)
+
+
+def wait_for_share_state_live_probe(port, group_id, topic_id, first_offset):
+    initialized_state = {
+        "group_id": group_id,
+        "topic_id": topic_id,
+        "partition": 0,
+        "state_epoch": 1,
+        "start_offset": first_offset,
+        "state_batches": [],
+    }
+    written_state = {
+        "group_id": group_id,
+        "topic_id": topic_id,
+        "partition": 0,
+        "state_epoch": 2,
+        "start_offset": first_offset + 1,
+        "state_batches": [
+            {
+                "first_offset": first_offset,
+                "last_offset": first_offset,
+                "delivery_state": 2,
+                "delivery_count": 1,
+            }
+        ],
+    }
+    wait_for_share_state_initialized(port, initialized_state)
+    wait_for_share_state_written(port, written_state)
+    wait_for_share_state_checkpoint(port, written_state)
+    return written_state
+
+
+def wait_for_deleted_share_state_live_probe(port, group_id, topic_id, first_offset):
+    state = {
+        "group_id": group_id,
+        "topic_id": topic_id,
+        "partition": 0,
+        "state_epoch": 1,
+        "start_offset": first_offset,
+        "state_batches": [],
+    }
+    wait_for_share_state_initialized(port, state)
+    wait_for_share_state_deleted(port, state)
+    wait_for_share_state_deleted_checkpoint(port, state)
+    return state
+
+
 def parse_leave_group_response(response, correlation_id):
     pos = 0
     response_correlation, pos = read_i32(response, pos)
@@ -6425,6 +6907,18 @@ def main():
             broker["port"],
             share_group_state,
         )
+        share_state_probe = wait_for_share_state_live_probe(
+            broker["port"],
+            f"{group}-share-state",
+            share_group_state["topic_id"],
+            first_offset,
+        )
+        deleted_share_state_probe = wait_for_deleted_share_state_live_probe(
+            broker["port"],
+            f"{group}-share-state-deleted",
+            share_group_state["topic_id"],
+            first_offset,
+        )
         wait_for_offset_commit_v9_member_checkpoint(
             broker["port"],
             kip848_group_state,
@@ -6495,6 +6989,11 @@ def main():
         wait_for_share_acknowledge_session_checkpoint(
             broker["port"],
             share_group_state,
+        )
+        wait_for_share_state_checkpoint(broker["port"], share_state_probe)
+        wait_for_share_state_deleted_checkpoint(
+            broker["port"],
+            deleted_share_state_probe,
         )
         wait_for_offset_commit_v9_member_checkpoint(
             broker["port"],
@@ -6597,6 +7096,11 @@ def main():
         wait_for_share_acknowledge_session_checkpoint(
             broker["port"],
             share_group_state,
+        )
+        wait_for_share_state_checkpoint(broker["port"], share_state_probe)
+        wait_for_share_state_deleted_checkpoint(
+            broker["port"],
+            deleted_share_state_probe,
         )
         wait_for_offset_commit_v9_member_checkpoint(
             broker["port"],
@@ -6703,6 +7207,11 @@ def main():
         wait_for_share_acknowledge_session_checkpoint(
             broker["port"],
             share_group_state,
+        )
+        wait_for_share_state_checkpoint(broker["port"], share_state_probe)
+        wait_for_share_state_deleted_checkpoint(
+            broker["port"],
+            deleted_share_state_probe,
         )
         wait_for_offset_commit_v9_member_checkpoint(
             broker["port"],
@@ -6819,6 +7328,11 @@ def main():
         wait_for_share_acknowledge_session_checkpoint(
             broker["port"],
             share_group_state,
+        )
+        wait_for_share_state_checkpoint(broker["port"], share_state_probe)
+        wait_for_share_state_deleted_checkpoint(
+            broker["port"],
+            deleted_share_state_probe,
         )
         wait_for_offset_commit_v9_member_checkpoint(
             broker["port"],
@@ -6940,6 +7454,11 @@ def main():
         wait_for_share_acknowledge_session_checkpoint(
             broker["port"],
             share_group_state,
+        )
+        wait_for_share_state_checkpoint(broker["port"], share_state_probe)
+        wait_for_share_state_deleted_checkpoint(
+            broker["port"],
+            deleted_share_state_probe,
         )
         wait_for_offset_commit_v9_member_checkpoint(
             broker["port"],
@@ -7073,6 +7592,11 @@ def main():
         wait_for_share_acknowledge_session_checkpoint(
             broker["port"],
             share_group_state,
+        )
+        wait_for_share_state_checkpoint(broker["port"], share_state_probe)
+        wait_for_share_state_deleted_checkpoint(
+            broker["port"],
+            deleted_share_state_probe,
         )
         wait_for_offset_commit_v9_member_checkpoint(
             broker["port"],
@@ -7235,6 +7759,7 @@ def main():
             f"share_group_describe_checked=true, "
             f"share_fetch_session_checked=true, "
             f"share_acknowledge_checked=true, "
+            f"share_state_apis_checked=true, "
             f"consumer_group_heartbeat_checked=true, "
             f"kip848_describe_checked=true, "
             f"kip848_rejoin_checked=true, "
@@ -7806,6 +8331,80 @@ def self_test():
             or share_acked["responses"][0]["partitions"][0]["error_code"] != 0
         ):
             raise TestError(f"ShareAcknowledge fixture parser failed: {share_acked}")
+
+        share_state_result_fixture = struct.pack(">i", 159)
+        share_state_result_fixture += b"\x00"  # response header tagged fields
+        share_state_result_fixture += write_compact_array_len(1)
+        share_state_result_fixture += share_describe_topic_id
+        share_state_result_fixture += write_compact_array_len(1)
+        share_state_result_fixture += struct.pack(">ih", 0, 0)
+        share_state_result_fixture += write_compact_string(None)
+        share_state_result_fixture += b"\x00"  # partition tagged fields
+        share_state_result_fixture += b"\x00"  # topic tagged fields
+        share_state_result_fixture += b"\x00"  # response tagged fields
+        share_state_result = parse_share_state_result_response(
+            share_state_result_fixture, 159, "InitializeShareGroupState"
+        )
+        if (
+            share_state_result[0]["topic_id"] != share_describe_topic_id
+            or share_state_result[0]["partitions"][0]["partition"] != 0
+            or share_state_result[0]["partitions"][0]["error_code"] != 0
+        ):
+            raise TestError(
+                f"Share state result fixture parser failed: {share_state_result}"
+            )
+
+        share_state_read_fixture = struct.pack(">i", 160)
+        share_state_read_fixture += b"\x00"  # response header tagged fields
+        share_state_read_fixture += write_compact_array_len(1)
+        share_state_read_fixture += share_describe_topic_id
+        share_state_read_fixture += write_compact_array_len(1)
+        share_state_read_fixture += struct.pack(">ih", 0, 0)
+        share_state_read_fixture += write_compact_string(None)
+        share_state_read_fixture += struct.pack(">iq", 2, 1)
+        share_state_read_fixture += write_compact_array_len(1)
+        share_state_read_fixture += struct.pack(">qqbh", 0, 0, 2, 1)
+        share_state_read_fixture += b"\x00"  # state batch tagged fields
+        share_state_read_fixture += b"\x00"  # partition tagged fields
+        share_state_read_fixture += b"\x00"  # topic tagged fields
+        share_state_read_fixture += b"\x00"  # response tagged fields
+        share_state_read = parse_read_share_group_state_response(
+            share_state_read_fixture, 160
+        )
+        if (
+            share_state_read[0]["partitions"][0]["state_epoch"] != 2
+            or share_state_read[0]["partitions"][0]["start_offset"] != 1
+            or share_state_read[0]["partitions"][0]["state_batches"][0][
+                "delivery_state"
+            ]
+            != 2
+        ):
+            raise TestError(
+                f"ReadShareGroupState fixture parser failed: {share_state_read}"
+            )
+
+        share_state_summary_fixture = struct.pack(">i", 161)
+        share_state_summary_fixture += b"\x00"  # response header tagged fields
+        share_state_summary_fixture += write_compact_array_len(1)
+        share_state_summary_fixture += share_describe_topic_id
+        share_state_summary_fixture += write_compact_array_len(1)
+        share_state_summary_fixture += struct.pack(">ih", 0, 0)
+        share_state_summary_fixture += write_compact_string(None)
+        share_state_summary_fixture += struct.pack(">iq", 2, 1)
+        share_state_summary_fixture += b"\x00"  # partition tagged fields
+        share_state_summary_fixture += b"\x00"  # topic tagged fields
+        share_state_summary_fixture += b"\x00"  # response tagged fields
+        share_state_summary = parse_read_share_group_state_summary_response(
+            share_state_summary_fixture, 161
+        )
+        if (
+            share_state_summary[0]["partitions"][0]["state_epoch"] != 2
+            or share_state_summary[0]["partitions"][0]["start_offset"] != 1
+        ):
+            raise TestError(
+                f"ReadShareGroupStateSummary fixture parser failed: "
+                f"{share_state_summary}"
+            )
 
         leave_fixture = struct.pack(">ih", 50, 0)
         parse_leave_group_response(leave_fixture, 50)
