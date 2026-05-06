@@ -11587,7 +11587,11 @@ pub const Broker = struct {
     fn automqZoneRouterErrorResponse(self: *Broker, req_header: *const RequestHeader, resp_header_version: i16, api_version: i16, err_code: ErrorCode) ?[]u8 {
         const Resp = generated.automq_zone_router_response.AutomqZoneRouterResponse;
         const resp = Resp{ .error_code = err_code.toInt(), .throttle_time_ms = 0, .responses = &.{} };
-        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version) orelse {
+            log.warn("AutomqZoneRouter error response serialization failed", .{});
+            const storage_resp = Resp{ .error_code = ErrorCode.kafka_storage_error.toInt(), .throttle_time_ms = 0, .responses = &.{} };
+            return self.serializeGeneratedResponse(req_header, resp_header_version, &storage_resp, api_version);
+        };
     }
 
     fn handleAutomqGetPartitionSnapshotAuthorizationError(
@@ -23015,25 +23019,47 @@ pub const Broker = struct {
                 return self.automqZoneRouterErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error);
             };
         }
+        const default_route = if (metadata_copy == null and self.auto_mq_zone_router_metadata == null)
+            std.fmt.allocPrint(arena_alloc, "{{\"node_id\":{d},\"epoch\":{d}}}", .{ self.node_id, new_route_epoch }) catch |err| {
+                log.warn("AutomqZoneRouter response materialization failed: {}", .{err});
+                if (metadata_copy) |copy| self.allocator.free(copy);
+                return self.automqZoneRouterErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error);
+            }
+        else
+            "";
+        const responses = arena_alloc.alloc(ItemResp, 1) catch |err| {
+            log.warn("AutomqZoneRouter response materialization failed: {}", .{err});
+            if (metadata_copy) |copy| self.allocator.free(copy);
+            return self.automqZoneRouterErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error);
+        };
+        responses[0] = .{ .data = metadata_copy orelse self.auto_mq_zone_router_metadata orelse default_route };
+        const success_resp = Resp{ .error_code = 0, .throttle_time_ms = 0, .responses = responses };
+        const success_response = self.serializeGeneratedResponse(req_header, resp_header_version, &success_resp, api_version) orelse {
+            log.warn("AutomqZoneRouter response serialization failed before mutation", .{});
+            if (metadata_copy) |copy| self.allocator.free(copy);
+            return self.automqZoneRouterErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error);
+        };
+        if (!should_mutate) return success_response;
+
         var previous_snapshot: ?MetadataPersistence.AutoMqMetadataSnapshot = null;
         defer if (previous_snapshot) |*snapshot| self.persistence.freeAutoMqMetadataSnapshot(snapshot);
-        if (self.raft_state == null and should_mutate) {
+        if (self.raft_state == null) {
             previous_snapshot = self.cloneAutoMqMetadataSnapshot() catch |err| {
                 log.warn("AutomqZoneRouter rollback snapshot failed: {}", .{err});
                 if (metadata_copy) |copy| self.allocator.free(copy);
+                self.allocator.free(success_response);
                 return self.automqZoneRouterErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error);
             };
         }
-        if (should_mutate) {
-            self.commitAutoMqZoneRouterRecord(req.metadata, new_route_epoch) catch |err| {
-                if (metadata_copy) |copy| self.allocator.free(copy);
-                const resp = Resp{ .error_code = autoMqQuorumErrorCode(err), .throttle_time_ms = 0 };
-                return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version) orelse {
-                    log.warn("AutomqZoneRouter error response serialization failed", .{});
-                    return self.automqZoneRouterErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error);
-                };
+        self.commitAutoMqZoneRouterRecord(req.metadata, new_route_epoch) catch |err| {
+            if (metadata_copy) |copy| self.allocator.free(copy);
+            self.allocator.free(success_response);
+            const resp = Resp{ .error_code = autoMqQuorumErrorCode(err), .throttle_time_ms = 0 };
+            return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version) orelse {
+                log.warn("AutomqZoneRouter error response serialization failed", .{});
+                return self.automqZoneRouterErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error);
             };
-        }
+        };
         if (metadata_copy) |copy| {
             if (self.auto_mq_zone_router_metadata) |old| self.allocator.free(old);
             self.auto_mq_zone_router_metadata = copy;
@@ -23053,28 +23079,11 @@ pub const Broker = struct {
         }
 
         if (response_error != 0) {
-            const resp = Resp{ .error_code = response_error, .throttle_time_ms = 0, .responses = &.{} };
-            return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version) orelse {
-                log.warn("AutomqZoneRouter error response serialization failed", .{});
-                return self.automqZoneRouterErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error);
-            };
+            self.allocator.free(success_response);
+            return self.automqZoneRouterErrorResponse(req_header, resp_header_version, api_version, ErrorCode.fromInt(response_error));
         }
 
-        const default_route = std.fmt.allocPrint(arena_alloc, "{{\"node_id\":{d},\"epoch\":{d}}}", .{ self.node_id, self.auto_mq_zone_router_epoch }) catch |err| {
-            log.warn("AutomqZoneRouter response materialization failed: {}", .{err});
-            return self.automqZoneRouterErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error);
-        };
-        const responses = arena_alloc.alloc(ItemResp, 1) catch |err| {
-            log.warn("AutomqZoneRouter response materialization failed: {}", .{err});
-            return self.automqZoneRouterErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error);
-        };
-        responses[0] = .{ .data = self.auto_mq_zone_router_metadata orelse default_route };
-
-        const resp = Resp{ .error_code = 0, .throttle_time_ms = 0, .responses = responses };
-        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version) orelse {
-            log.warn("AutomqZoneRouter response serialization failed", .{});
-            return self.automqZoneRouterErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error);
-        };
+        return success_response;
     }
 
     fn handleAutomqGetPartitionSnapshot(self: *Broker, request_bytes: []const u8, body_start: usize, req_header: *const RequestHeader, api_version: i16, resp_header_version: i16) ?[]u8 {
@@ -53568,6 +53577,23 @@ test "Broker.handleRequest AutomqRegisterNode does not replace node when success
     try testing.expectEqual(@as(i64, 1), node.node_epoch);
     try testing.expectEqualStrings("wal://old", node.wal_config);
     try testing.expectEqual(@as(i32, 22), broker.auto_mq_next_node_id);
+}
+
+test "Broker.handleRequest AutomqZoneRouter does not replace route when success serialization fails" {
+    const Req = generated.automq_zone_router_request.AutomqZoneRouterRequest;
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+    try broker.setAutoMqZoneRouterFromRecord("old-route", 7);
+
+    const req = Req{ .metadata = "new-route", .route_epoch = 8, .version = 1 };
+    var buf: [256]u8 = undefined;
+    var pos = buildTestRequest(&buf, 515, 1, 5162, header_mod.requestHeaderVersion(515, 1));
+    req.serialize(&buf, &pos, 1);
+
+    try expectAutoMqMutationErrorWithFailingAllocator(&broker, buf[0..pos], 515, 1, 5162, 2, ErrorCode.kafka_storage_error);
+    try testing.expectEqualStrings("old-route", broker.auto_mq_zone_router_metadata.?);
+    try testing.expectEqual(@as(i64, 7), broker.auto_mq_zone_router_epoch);
 }
 
 test "Broker AutoMQ stream object lifecycle APIs" {
