@@ -46,6 +46,9 @@ operator-facing behavior.
 - AlterClientQuotas now also pre-serializes successful mutation responses and
   retries generated storage-error responses so allocation pressure cannot
   apply quota state while returning no response frame.
+- DescribeClientQuotas and DescribeUserScramCredentials generated error
+  responses now also retry as storage errors after transient response
+  allocation failures.
 - S3 WAL/object storage paths exist, but full AutoMQ S3Stream lifecycle
   compatibility, crash recovery, fencing, and cross-provider validation are
   incomplete. Stream/object metadata now has local file snapshot/restart

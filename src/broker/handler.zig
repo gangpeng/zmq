@@ -23893,7 +23893,16 @@ pub const Broker = struct {
             .error_message = message,
             .entries = null,
         };
-        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version) orelse {
+            log.warn("DescribeClientQuotas error response serialization failed", .{});
+            const storage_resp = Resp{
+                .throttle_time_ms = 0,
+                .error_code = @intFromEnum(ErrorCode.kafka_storage_error),
+                .error_message = "Failed to serialize client quota response",
+                .entries = null,
+            };
+            return self.serializeGeneratedResponse(req_header, resp_header_version, &storage_resp, api_version);
+        };
     }
 
     fn freeDescribeClientQuotasRequest(self: *Broker, req: *generated.describe_client_quotas_request.DescribeClientQuotasRequest) void {
@@ -24379,7 +24388,16 @@ pub const Broker = struct {
             .error_message = message,
             .results = &.{},
         };
-        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version) orelse {
+            log.warn("DescribeUserScramCredentials error response serialization failed", .{});
+            const storage_resp = Resp{
+                .throttle_time_ms = 0,
+                .error_code = @intFromEnum(ErrorCode.kafka_storage_error),
+                .error_message = "Failed to serialize SCRAM credential response",
+                .results = &.{},
+            };
+            return self.serializeGeneratedResponse(req_header, resp_header_version, &storage_resp, api_version);
+        };
     }
 
     fn freeDescribeUserScramCredentialsRequest(self: *Broker, req: *generated.describe_user_scram_credentials_request.DescribeUserScramCredentialsRequest) void {
@@ -47336,6 +47354,30 @@ test "Broker.handleRequest DescribeClientQuotas rejects truncated request" {
     try testing.expect(resp.entries == null);
 }
 
+test "Broker.handleRequest DescribeClientQuotas malformed request retries storage error after response serialization failure" {
+    const Resp = generated.describe_client_quotas_response.DescribeClientQuotasResponse;
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+
+    var buf: [128]u8 = undefined;
+    const req_len = buildTestRequest(&buf, 48, 1, 4816, header_mod.requestHeaderVersion(48, 1));
+
+    var failing_allocator = OneShotFailingAllocator.init(testing.allocator, 0);
+    const response_allocator = failing_allocator.allocator();
+    broker.allocator = response_allocator;
+
+    const response = broker.handleRequest(buf[0..req_len]);
+    broker.allocator = testing.allocator;
+
+    try testing.expect(failing_allocator.failed);
+    try testing.expect(response != null);
+    defer response_allocator.free(response.?);
+
+    const error_code = try readGeneratedTopLevelErrorCode(Resp, response.?, 48, 1, 4816);
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.kafka_storage_error)), error_code);
+}
+
 test "Broker.handleRequest DescribeClientQuotas rejects trailing bytes" {
     const Req = generated.describe_client_quotas_request.DescribeClientQuotasRequest;
     const Resp = generated.describe_client_quotas_response.DescribeClientQuotasResponse;
@@ -48234,6 +48276,30 @@ test "Broker.handleRequest DescribeUserScramCredentials rejects truncated reques
     try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.invalid_request)), resp.error_code);
     try testing.expect(resp.error_message != null);
     try testing.expectEqual(@as(usize, 0), resp.results.len);
+}
+
+test "Broker.handleRequest DescribeUserScramCredentials malformed request retries storage error after response serialization failure" {
+    const Resp = generated.describe_user_scram_credentials_response.DescribeUserScramCredentialsResponse;
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+
+    var buf: [128]u8 = undefined;
+    const req_len = buildTestRequest(&buf, 50, 0, 5009, header_mod.requestHeaderVersion(50, 0));
+
+    var failing_allocator = OneShotFailingAllocator.init(testing.allocator, 0);
+    const response_allocator = failing_allocator.allocator();
+    broker.allocator = response_allocator;
+
+    const response = broker.handleRequest(buf[0..req_len]);
+    broker.allocator = testing.allocator;
+
+    try testing.expect(failing_allocator.failed);
+    try testing.expect(response != null);
+    defer response_allocator.free(response.?);
+
+    const error_code = try readGeneratedTopLevelErrorCode(Resp, response.?, 50, 0, 5009);
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.kafka_storage_error)), error_code);
 }
 
 test "Broker.handleRequest DescribeUserScramCredentials rejects trailing bytes" {
