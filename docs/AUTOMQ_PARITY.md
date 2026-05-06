@@ -84,6 +84,9 @@ operator-facing behavior.
   visible topic metadata when partition-state allocation or local failover
   ownership tracking fails instead of advertising a topic without local
   partition state or owner metadata.
+  Failover and reassignment ownership transfers now reserve target bookkeeping
+  before removing the prior owner, so allocation pressure cannot leave a
+  partition ownerless.
   Consumer-group session-timeout eviction no longer allocates while scanning
   expired members, so allocation pressure cannot silently leave timed-out
   members active or suppress the required rebalance. Controller broker-heartbeat

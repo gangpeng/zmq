@@ -206,17 +206,21 @@ pub const FailoverController = struct {
     /// Updates metadata so partition.leader = target, partition.isr = [target].
     pub fn reassignPartition(self: *FailoverController, partition: PartitionId, target: i32) !void {
         const topic_copy = try self.allocator.dupe(u8, partition.topic);
-        errdefer self.allocator.free(topic_copy);
+        var topic_copy_owned = true;
+        errdefer if (topic_copy_owned) self.allocator.free(topic_copy);
 
         try self.registerNode(target);
+        const target_state = self.known_nodes.getPtr(target) orelse return error.UnknownFailoverTarget;
+        try target_state.owned_partitions.ensureUnusedCapacity(1);
+
         self.removePartitionOwnership(topic_copy, partition.partition);
 
-        const target_state = self.known_nodes.getPtr(target) orelse return error.UnknownFailoverTarget;
-        try target_state.owned_partitions.append(.{
+        target_state.owned_partitions.appendAssumeCapacity(.{
             .topic = topic_copy,
             .partition = partition.partition,
             .owns_topic = true,
         });
+        topic_copy_owned = false;
         log.info("Reassigning {s}-{d} to node {d}", .{ topic_copy, partition.partition, target });
     }
 
@@ -370,6 +374,24 @@ test "FailoverController explicit reassignment replaces stale ownership" {
     try fc.reassignPartition(.{ .topic = "topic-b", .partition = 0 }, 0);
     try testing.expectEqual(@as(?i32, 0), fc.findPartitionOwner("topic-b", 0));
     try testing.expectEqual(@as(usize, 1), fc.nodePartitionCount(0));
+}
+
+test "FailoverController preserves owner when reassignment bookkeeping allocation fails" {
+    var fc = FailoverController.init(testing.allocator, 0);
+    defer fc.deinit();
+
+    try fc.registerNode(1);
+    try fc.registerPartitionOwner("topic-oom", 0, 1);
+    try testing.expectEqual(@as(?i32, 1), fc.findPartitionOwner("topic-oom", 0));
+
+    var failing_allocator = std.testing.FailingAllocator.init(testing.allocator, .{ .fail_index = 1 });
+    fc.allocator = failing_allocator.allocator();
+
+    try testing.expectError(error.OutOfMemory, fc.reassignPartition(.{ .topic = "topic-oom", .partition = 0 }, 2));
+    try testing.expect(failing_allocator.has_induced_failure);
+    try testing.expectEqual(@as(?i32, 1), fc.findPartitionOwner("topic-oom", 0));
+    try testing.expectEqual(@as(usize, 1), fc.nodePartitionCount(1));
+    try testing.expectEqual(@as(usize, 0), fc.nodePartitionCount(2));
 }
 
 test "FailoverController reassignment tolerates stored topic slice" {
