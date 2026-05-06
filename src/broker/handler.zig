@@ -7019,22 +7019,26 @@ pub const Broker = struct {
         const Resp = generated.offset_commit_response.OffsetCommitResponse;
         const TopicResponse = Resp.OffsetCommitResponseTopic;
         const PartitionResponse = TopicResponse.OffsetCommitResponsePartition;
+        const err_i16 = @intFromEnum(err_code);
 
         if (!validateOffsetCommitRequestFrame(request_bytes, body_start, api_version)) {
             log.warn("Malformed denied OffsetCommit request", .{});
-            return null;
+            return self.offsetCommitErrorResponse(req_header, resp_header_version, api_version, ErrorCode.invalid_request);
         }
 
         var pos = body_start;
         var req = Req.deserialize(self.allocator, request_bytes, &pos, api_version) catch |err| {
             log.warn("Failed to decode denied OffsetCommit request: {}", .{err});
-            return null;
+            return self.offsetCommitErrorResponse(req_header, resp_header_version, api_version, ErrorCode.invalid_request);
         };
         defer self.freeOffsetCommitRequest(&req);
 
         var topics: []TopicResponse = &.{};
         if (req.topics.len > 0) {
-            topics = self.allocator.alloc(TopicResponse, req.topics.len) catch return null;
+            topics = self.allocator.alloc(TopicResponse, req.topics.len) catch |err| {
+                log.warn("OffsetCommit denied topic response allocation failed: {}", .{err});
+                return self.offsetCommitErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error);
+            };
         }
         var topics_init: usize = 0;
         defer {
@@ -7045,7 +7049,10 @@ pub const Broker = struct {
         for (req.topics) |topic_req| {
             var partitions: []PartitionResponse = &.{};
             if (topic_req.partitions.len > 0) {
-                partitions = self.allocator.alloc(PartitionResponse, topic_req.partitions.len) catch return null;
+                partitions = self.allocator.alloc(PartitionResponse, topic_req.partitions.len) catch |err| {
+                    log.warn("OffsetCommit denied partition response allocation failed: {}", .{err});
+                    return self.offsetCommitErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error);
+                };
             }
             var transferred = false;
             defer if (!transferred and partitions.len > 0) self.allocator.free(partitions);
@@ -7053,7 +7060,7 @@ pub const Broker = struct {
             for (topic_req.partitions, 0..) |partition_req, partition_idx| {
                 partitions[partition_idx] = .{
                     .partition_index = partition_req.partition_index,
-                    .error_code = @intFromEnum(err_code),
+                    .error_code = err_i16,
                 };
             }
 
@@ -7068,6 +7075,28 @@ pub const Broker = struct {
         const resp = Resp{
             .throttle_time_ms = 0,
             .topics = topics[0..topics_init],
+        };
+        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version) orelse {
+            log.warn("OffsetCommit denied response serialization failed", .{});
+            return self.offsetCommitErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error);
+        };
+    }
+
+    fn offsetCommitErrorResponse(self: *Broker, req_header: *const RequestHeader, resp_header_version: i16, api_version: i16, err_code: ErrorCode) ?[]u8 {
+        const Resp = generated.offset_commit_response.OffsetCommitResponse;
+        const TopicResponse = Resp.OffsetCommitResponseTopic;
+        const PartitionResponse = TopicResponse.OffsetCommitResponsePartition;
+        const partitions = [_]PartitionResponse{.{
+            .partition_index = -1,
+            .error_code = @intFromEnum(err_code),
+        }};
+        const topics = [_]TopicResponse{.{
+            .name = "",
+            .partitions = &partitions,
+        }};
+        const resp = Resp{
+            .throttle_time_ms = 0,
+            .topics = &topics,
         };
         return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
     }
@@ -7087,20 +7116,23 @@ pub const Broker = struct {
 
         if (!validateOffsetFetchRequestFrame(request_bytes, body_start, api_version)) {
             log.warn("Malformed denied OffsetFetch request", .{});
-            return null;
+            return self.offsetFetchErrorResponse(req_header, resp_header_version, api_version, ErrorCode.invalid_request);
         }
 
         var pos = body_start;
         var req = Req.deserialize(self.allocator, request_bytes, &pos, api_version) catch |err| {
             log.warn("Failed to decode denied OffsetFetch request: {}", .{err});
-            return null;
+            return self.offsetFetchErrorResponse(req_header, resp_header_version, api_version, ErrorCode.invalid_request);
         };
         defer self.freeOffsetFetchRequest(&req);
 
         if (api_version >= 8) {
             var groups: []GroupResponse = &.{};
             if (req.groups.len > 0) {
-                groups = self.allocator.alloc(GroupResponse, req.groups.len) catch return null;
+                groups = self.allocator.alloc(GroupResponse, req.groups.len) catch |err| {
+                    log.warn("OffsetFetch denied group response allocation failed: {}", .{err});
+                    return self.offsetFetchErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error);
+                };
             }
             var groups_init: usize = 0;
             defer {
@@ -7110,7 +7142,10 @@ pub const Broker = struct {
 
             for (req.groups) |group_req| {
                 const topics = if (group_req.topics) |requested_topics|
-                    self.buildOffsetFetchGroupAuthorizationTopics(requested_topics, err_code) orelse return null
+                    self.buildOffsetFetchGroupAuthorizationTopics(requested_topics, err_code) orelse {
+                        log.warn("OffsetFetch denied grouped topic response allocation failed", .{});
+                        return self.offsetFetchErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error);
+                    }
                 else
                     &.{};
 
@@ -7126,11 +7161,17 @@ pub const Broker = struct {
                 .throttle_time_ms = 0,
                 .groups = groups[0..groups_init],
             };
-            return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+            return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version) orelse {
+                log.warn("OffsetFetch denied grouped response serialization failed", .{});
+                return self.offsetFetchErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error);
+            };
         }
 
         const topics = if (req.topics) |requested_topics|
-            self.buildOffsetFetchLegacyRequestedTopics(req.group_id orelse "", requested_topics, err_code) orelse return null
+            self.buildOffsetFetchLegacyRequestedTopics(req.group_id orelse "", requested_topics, err_code) orelse {
+                log.warn("OffsetFetch denied legacy topic response allocation failed", .{});
+                return self.offsetFetchErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error);
+            }
         else
             &.{};
         defer self.freeOffsetFetchLegacyTopics(topics);
@@ -7138,6 +7179,46 @@ pub const Broker = struct {
         const resp = Resp{
             .throttle_time_ms = 0,
             .topics = topics,
+            .error_code = @intFromEnum(err_code),
+        };
+        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version) orelse {
+            log.warn("OffsetFetch denied legacy response serialization failed", .{});
+            return self.offsetFetchErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error);
+        };
+    }
+
+    fn offsetFetchErrorResponse(self: *Broker, req_header: *const RequestHeader, resp_header_version: i16, api_version: i16, err_code: ErrorCode) ?[]u8 {
+        const Resp = generated.offset_fetch_response.OffsetFetchResponse;
+        if (api_version >= 8) {
+            const GroupResponse = Resp.OffsetFetchResponseGroup;
+            const groups = [_]GroupResponse{.{
+                .group_id = null,
+                .topics = &.{},
+                .error_code = @intFromEnum(err_code),
+            }};
+            const resp = Resp{
+                .throttle_time_ms = 0,
+                .groups = &groups,
+            };
+            return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+        }
+
+        const TopicResponse = Resp.OffsetFetchResponseTopic;
+        const PartitionResponse = TopicResponse.OffsetFetchResponsePartition;
+        const partitions = [_]PartitionResponse{.{
+            .partition_index = -1,
+            .committed_offset = -1,
+            .committed_leader_epoch = -1,
+            .metadata = null,
+            .error_code = @intFromEnum(err_code),
+        }};
+        const topics = [_]TopicResponse{.{
+            .name = "",
+            .partitions = &partitions,
+        }};
+        const resp = Resp{
+            .throttle_time_ms = 0,
+            .topics = &topics,
             .error_code = @intFromEnum(err_code),
         };
         return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
@@ -7221,22 +7302,26 @@ pub const Broker = struct {
         const Resp = generated.offset_delete_response.OffsetDeleteResponse;
         const TopicResult = Resp.OffsetDeleteResponseTopic;
         const PartitionResult = TopicResult.OffsetDeleteResponsePartition;
+        const err_i16 = @intFromEnum(err_code);
 
         if (!validateOffsetDeleteRequestFrame(request_bytes, body_start)) {
             log.warn("Malformed denied OffsetDelete request", .{});
-            return null;
+            return self.offsetDeleteErrorResponse(req_header, resp_header_version, api_version, ErrorCode.invalid_request);
         }
 
         var pos = body_start;
         var req = Req.deserialize(self.allocator, request_bytes, &pos, api_version) catch |err| {
             log.warn("Failed to decode denied OffsetDelete request: {}", .{err});
-            return null;
+            return self.offsetDeleteErrorResponse(req_header, resp_header_version, api_version, ErrorCode.invalid_request);
         };
         defer self.freeOffsetDeleteRequest(&req);
 
         var topics: []TopicResult = &.{};
         if (req.topics.len > 0) {
-            topics = self.allocator.alloc(TopicResult, req.topics.len) catch return null;
+            topics = self.allocator.alloc(TopicResult, req.topics.len) catch |err| {
+                log.warn("OffsetDelete denied topic response allocation failed: {}", .{err});
+                return self.offsetDeleteErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error);
+            };
         }
         var topics_init: usize = 0;
         defer {
@@ -7247,7 +7332,10 @@ pub const Broker = struct {
         for (req.topics) |topic_req| {
             var partitions: []PartitionResult = &.{};
             if (topic_req.partitions.len > 0) {
-                partitions = self.allocator.alloc(PartitionResult, topic_req.partitions.len) catch return null;
+                partitions = self.allocator.alloc(PartitionResult, topic_req.partitions.len) catch |err| {
+                    log.warn("OffsetDelete denied partition response allocation failed: {}", .{err});
+                    return self.offsetDeleteErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error);
+                };
             }
             var transferred = false;
             defer if (!transferred and partitions.len > 0) self.allocator.free(partitions);
@@ -7255,7 +7343,7 @@ pub const Broker = struct {
             for (topic_req.partitions, 0..) |partition_req, partition_idx| {
                 partitions[partition_idx] = .{
                     .partition_index = partition_req.partition_index,
-                    .error_code = @intFromEnum(err_code),
+                    .error_code = err_i16,
                 };
             }
 
@@ -7271,6 +7359,29 @@ pub const Broker = struct {
             .error_code = @intFromEnum(err_code),
             .throttle_time_ms = 0,
             .topics = topics[0..topics_init],
+        };
+        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version) orelse {
+            log.warn("OffsetDelete denied response serialization failed", .{});
+            return self.offsetDeleteErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error);
+        };
+    }
+
+    fn offsetDeleteErrorResponse(self: *Broker, req_header: *const RequestHeader, resp_header_version: i16, api_version: i16, err_code: ErrorCode) ?[]u8 {
+        const Resp = generated.offset_delete_response.OffsetDeleteResponse;
+        const TopicResult = Resp.OffsetDeleteResponseTopic;
+        const PartitionResult = TopicResult.OffsetDeleteResponsePartition;
+        const partitions = [_]PartitionResult{.{
+            .partition_index = -1,
+            .error_code = @intFromEnum(err_code),
+        }};
+        const topics = [_]TopicResult{.{
+            .name = "",
+            .partitions = &partitions,
+        }};
+        const resp = Resp{
+            .error_code = @intFromEnum(err_code),
+            .throttle_time_ms = 0,
+            .topics = &topics,
         };
         return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
     }
@@ -30416,6 +30527,105 @@ fn expectTopicDataAuthorizationDeniedWithFailingAllocator(
     defer response_allocator.free(response.?);
 
     const error_code = try readTopicDataAuthorizationErrorCode(response.?, api_key, api_version, correlation_id);
+    try testing.expectEqual(@as(i16, @intFromEnum(err_code)), error_code);
+}
+
+fn addCommittedOffsetAuthorizationAcls(broker: *Broker) !void {
+    try broker.authorizer.addAcl("other-client", .group, "*", .literal, .read, .allow, "*");
+    try broker.authorizer.addAcl("other-client", .group, "*", .literal, .describe, .allow, "*");
+    try broker.authorizer.addAcl("other-client", .group, "*", .literal, .delete, .allow, "*");
+}
+
+fn freeDeserializedOffsetCommitResponse(resp: *const generated.offset_commit_response.OffsetCommitResponse) void {
+    for (resp.topics) |topic| {
+        if (topic.partitions.len > 0) testing.allocator.free(topic.partitions);
+    }
+    if (resp.topics.len > 0) testing.allocator.free(resp.topics);
+}
+
+fn freeDeserializedOffsetFetchResponse(resp: *const generated.offset_fetch_response.OffsetFetchResponse) void {
+    for (resp.topics) |topic| {
+        if (topic.partitions.len > 0) testing.allocator.free(topic.partitions);
+    }
+    if (resp.topics.len > 0) testing.allocator.free(resp.topics);
+
+    for (resp.groups) |group| {
+        for (group.topics) |topic| {
+            if (topic.partitions.len > 0) testing.allocator.free(topic.partitions);
+        }
+        if (group.topics.len > 0) testing.allocator.free(group.topics);
+    }
+    if (resp.groups.len > 0) testing.allocator.free(resp.groups);
+}
+
+fn freeDeserializedOffsetDeleteResponse(resp: *const generated.offset_delete_response.OffsetDeleteResponse) void {
+    for (resp.topics) |topic| {
+        if (topic.partitions.len > 0) testing.allocator.free(topic.partitions);
+    }
+    if (resp.topics.len > 0) testing.allocator.free(resp.topics);
+}
+
+fn readCommittedOffsetAuthorizationErrorCode(response: []const u8, api_key: i16, api_version: i16, correlation_id: i32) !i16 {
+    var rpos: usize = 0;
+    var response_header = try ResponseHeader.deserialize(testing.allocator, response, &rpos, header_mod.responseHeaderVersion(api_key, api_version));
+    defer response_header.deinit(testing.allocator);
+    try testing.expectEqual(correlation_id, response_header.correlation_id);
+
+    switch (api_key) {
+        8 => {
+            const Resp = generated.offset_commit_response.OffsetCommitResponse;
+            const resp = try Resp.deserialize(testing.allocator, response, &rpos, api_version);
+            defer freeDeserializedOffsetCommitResponse(&resp);
+            try testing.expectEqual(response.len, rpos);
+            try testing.expectEqual(@as(usize, 1), resp.topics.len);
+            try testing.expectEqual(@as(usize, 1), resp.topics[0].partitions.len);
+            return resp.topics[0].partitions[0].error_code;
+        },
+        9 => {
+            const Resp = generated.offset_fetch_response.OffsetFetchResponse;
+            const resp = try Resp.deserialize(testing.allocator, response, &rpos, api_version);
+            defer freeDeserializedOffsetFetchResponse(&resp);
+            try testing.expectEqual(response.len, rpos);
+            if (api_version >= 8) {
+                try testing.expectEqual(@as(usize, 1), resp.groups.len);
+                return resp.groups[0].error_code;
+            }
+            try testing.expectEqual(@as(usize, 1), resp.topics.len);
+            try testing.expectEqual(@as(usize, 1), resp.topics[0].partitions.len);
+            return resp.topics[0].partitions[0].error_code;
+        },
+        47 => {
+            const Resp = generated.offset_delete_response.OffsetDeleteResponse;
+            const resp = try Resp.deserialize(testing.allocator, response, &rpos, api_version);
+            defer freeDeserializedOffsetDeleteResponse(&resp);
+            try testing.expectEqual(response.len, rpos);
+            return resp.error_code;
+        },
+        else => return error.UnsupportedApiKey,
+    }
+}
+
+fn expectCommittedOffsetAuthorizationDeniedWithFailingAllocator(
+    broker: *Broker,
+    request: []const u8,
+    api_key: i16,
+    api_version: i16,
+    correlation_id: i32,
+    fail_index: usize,
+    err_code: ErrorCode,
+) !void {
+    var failing_allocator = OneShotFailingAllocator.init(testing.allocator, fail_index);
+    const response_allocator = failing_allocator.allocator();
+    broker.allocator = response_allocator;
+
+    const response = broker.handleRequest(request);
+    broker.allocator = testing.allocator;
+
+    try testing.expect(failing_allocator.failed);
+    try testing.expect(response != null);
+    defer response_allocator.free(response.?);
+
+    const error_code = try readCommittedOffsetAuthorizationErrorCode(response.?, api_key, api_version, correlation_id);
     try testing.expectEqual(@as(i16, @intFromEnum(err_code)), error_code);
 }
 
@@ -62416,6 +62626,202 @@ test "Broker.handleRequest OffsetFetch v8 authorization denial uses generated re
     try testing.expectEqualStrings("of-v8-denied-group-b", resp.groups[1].group_id.?);
     try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.group_authorization_failed)), resp.groups[1].error_code);
     try testing.expectEqual(@as(usize, 0), resp.groups[1].topics.len);
+}
+
+test "Broker.handleRequest committed-offset authorization denial rejects malformed requests" {
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+    try addCommittedOffsetAuthorizationAcls(&broker);
+
+    const cases = [_]struct {
+        api_key: i16,
+        api_version: i16,
+        correlation_id: i32,
+    }{
+        .{ .api_key = 8, .api_version = 8, .correlation_id = 831 },
+        .{ .api_key = 9, .api_version = 7, .correlation_id = 932 },
+        .{ .api_key = 9, .api_version = 8, .correlation_id = 933 },
+        .{ .api_key = 47, .api_version = 0, .correlation_id = 4731 },
+    };
+
+    for (cases) |case| {
+        var buf: [128]u8 = undefined;
+        const req_len = buildTestRequest(&buf, case.api_key, case.api_version, case.correlation_id, header_mod.requestHeaderVersion(case.api_key, case.api_version));
+
+        const response = broker.handleRequest(buf[0..req_len]);
+        try testing.expect(response != null);
+        defer testing.allocator.free(response.?);
+
+        const error_code = try readCommittedOffsetAuthorizationErrorCode(response.?, case.api_key, case.api_version, case.correlation_id);
+        try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.invalid_request)), error_code);
+    }
+}
+
+test "Broker.handleRequest committed-offset authorization denial fails closed when serialization fails" {
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+    try addCommittedOffsetAuthorizationAcls(&broker);
+
+    {
+        const Req = generated.offset_commit_request.OffsetCommitRequest;
+        const req = Req{
+            .group_id = "oc-denied-serialize-fail-group",
+            .generation_id_or_member_epoch = -1,
+            .member_id = "",
+            .group_instance_id = null,
+            .topics = &.{},
+        };
+        var buf: [512]u8 = undefined;
+        var pos = buildTestRequest(&buf, 8, 8, 832, header_mod.requestHeaderVersion(8, 8));
+        req.serialize(&buf, &pos, 8);
+
+        try expectCommittedOffsetAuthorizationDeniedWithFailingAllocator(&broker, buf[0..pos], 8, 8, 832, 0, ErrorCode.kafka_storage_error);
+    }
+
+    {
+        const Req = generated.offset_fetch_request.OffsetFetchRequest;
+        const req = Req{
+            .group_id = "of-v7-denied-serialize-fail-group",
+            .topics = &.{},
+            .require_stable = false,
+        };
+        var buf: [512]u8 = undefined;
+        var pos = buildTestRequest(&buf, 9, 7, 934, header_mod.requestHeaderVersion(9, 7));
+        req.serialize(&buf, &pos, 7);
+
+        try expectCommittedOffsetAuthorizationDeniedWithFailingAllocator(&broker, buf[0..pos], 9, 7, 934, 0, ErrorCode.kafka_storage_error);
+    }
+
+    {
+        const Req = generated.offset_fetch_request.OffsetFetchRequest;
+        const req = Req{
+            .groups = &.{},
+            .require_stable = false,
+        };
+        var buf: [512]u8 = undefined;
+        var pos = buildTestRequest(&buf, 9, 8, 935, header_mod.requestHeaderVersion(9, 8));
+        req.serialize(&buf, &pos, 8);
+
+        try expectCommittedOffsetAuthorizationDeniedWithFailingAllocator(&broker, buf[0..pos], 9, 8, 935, 0, ErrorCode.kafka_storage_error);
+    }
+
+    {
+        const Req = generated.offset_delete_request.OffsetDeleteRequest;
+        const req = Req{
+            .group_id = "od-denied-serialize-fail-group",
+            .topics = &.{},
+        };
+        var buf: [512]u8 = undefined;
+        var pos = buildTestRequest(&buf, 47, 0, 4732, header_mod.requestHeaderVersion(47, 0));
+        req.serialize(&buf, &pos, 0);
+
+        try expectCommittedOffsetAuthorizationDeniedWithFailingAllocator(&broker, buf[0..pos], 47, 0, 4732, 0, ErrorCode.kafka_storage_error);
+    }
+}
+
+test "Broker.handleRequest committed-offset authorization denial fails closed when response construction fails" {
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+    try addCommittedOffsetAuthorizationAcls(&broker);
+
+    {
+        const Req = generated.offset_commit_request.OffsetCommitRequest;
+        const Partition = Req.OffsetCommitRequestTopic.OffsetCommitRequestPartition;
+        const Topic = Req.OffsetCommitRequestTopic;
+        const partitions = [_]Partition{.{
+            .partition_index = 0,
+            .committed_offset = 10,
+            .committed_leader_epoch = 1,
+            .committed_metadata = "oc-denied-oom",
+        }};
+        const topics = [_]Topic{.{
+            .name = "oc-denied-oom-topic",
+            .partitions = &partitions,
+        }};
+        const req = Req{
+            .group_id = "oc-denied-oom-group",
+            .generation_id_or_member_epoch = -1,
+            .member_id = "",
+            .group_instance_id = null,
+            .topics = &topics,
+        };
+        var buf: [512]u8 = undefined;
+        var pos = buildTestRequest(&buf, 8, 8, 833, header_mod.requestHeaderVersion(8, 8));
+        req.serialize(&buf, &pos, 8);
+
+        try expectCommittedOffsetAuthorizationDeniedWithFailingAllocator(&broker, buf[0..pos], 8, 8, 833, 2, ErrorCode.kafka_storage_error);
+        try expectCommittedOffsetAuthorizationDeniedWithFailingAllocator(&broker, buf[0..pos], 8, 8, 833, 3, ErrorCode.kafka_storage_error);
+    }
+
+    {
+        const Req = generated.offset_fetch_request.OffsetFetchRequest;
+        const Topic = Req.OffsetFetchRequestTopic;
+        const partitions = [_]i32{0};
+        const topics = [_]Topic{.{
+            .name = "of-v7-denied-oom-topic",
+            .partition_indexes = &partitions,
+        }};
+        const req = Req{
+            .group_id = "of-v7-denied-oom-group",
+            .topics = &topics,
+            .require_stable = false,
+        };
+        var buf: [512]u8 = undefined;
+        var pos = buildTestRequest(&buf, 9, 7, 936, header_mod.requestHeaderVersion(9, 7));
+        req.serialize(&buf, &pos, 7);
+
+        try expectCommittedOffsetAuthorizationDeniedWithFailingAllocator(&broker, buf[0..pos], 9, 7, 936, 2, ErrorCode.kafka_storage_error);
+        try expectCommittedOffsetAuthorizationDeniedWithFailingAllocator(&broker, buf[0..pos], 9, 7, 936, 3, ErrorCode.kafka_storage_error);
+    }
+
+    {
+        const Req = generated.offset_fetch_request.OffsetFetchRequest;
+        const Group = Req.OffsetFetchRequestGroup;
+        const Topic = Group.OffsetFetchRequestTopics;
+        const partitions = [_]i32{0};
+        const topics = [_]Topic{.{
+            .name = "of-v8-denied-oom-topic",
+            .partition_indexes = &partitions,
+        }};
+        const groups = [_]Group{.{
+            .group_id = "of-v8-denied-oom-group",
+            .topics = &topics,
+        }};
+        const req = Req{
+            .groups = &groups,
+            .require_stable = false,
+        };
+        var buf: [512]u8 = undefined;
+        var pos = buildTestRequest(&buf, 9, 8, 937, header_mod.requestHeaderVersion(9, 8));
+        req.serialize(&buf, &pos, 8);
+
+        try expectCommittedOffsetAuthorizationDeniedWithFailingAllocator(&broker, buf[0..pos], 9, 8, 937, 3, ErrorCode.kafka_storage_error);
+        try expectCommittedOffsetAuthorizationDeniedWithFailingAllocator(&broker, buf[0..pos], 9, 8, 937, 4, ErrorCode.kafka_storage_error);
+        try expectCommittedOffsetAuthorizationDeniedWithFailingAllocator(&broker, buf[0..pos], 9, 8, 937, 5, ErrorCode.kafka_storage_error);
+    }
+
+    {
+        const Req = generated.offset_delete_request.OffsetDeleteRequest;
+        const Partition = Req.OffsetDeleteRequestTopic.OffsetDeleteRequestPartition;
+        const Topic = Req.OffsetDeleteRequestTopic;
+        const partitions = [_]Partition{.{
+            .partition_index = 0,
+        }};
+        const topics = [_]Topic{.{
+            .name = "od-denied-oom-topic",
+            .partitions = &partitions,
+        }};
+        const req = Req{
+            .group_id = "od-denied-oom-group",
+            .topics = &topics,
+        };
+        var buf: [512]u8 = undefined;
+        var pos = buildTestRequest(&buf, 47, 0, 4733, header_mod.requestHeaderVersion(47, 0));
+        req.serialize(&buf, &pos, 0);
+
+        try expectCommittedOffsetAuthorizationDeniedWithFailingAllocator(&broker, buf[0..pos], 47, 0, 4733, 2, ErrorCode.kafka_storage_error);
+        try expectCommittedOffsetAuthorizationDeniedWithFailingAllocator(&broker, buf[0..pos], 47, 0, 4733, 3, ErrorCode.kafka_storage_error);
+    }
 }
 
 test "Broker.handleRequest CreateTopics (key=19) creates topic" {
