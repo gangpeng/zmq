@@ -7816,19 +7816,22 @@ pub const Broker = struct {
 
         if (!validateDescribeConfigsRequestFrame(request_bytes, body_start, api_version)) {
             log.warn("Malformed denied DescribeConfigs request", .{});
-            return null;
+            return self.describeConfigsErrorResponse(req_header, resp_header_version, api_version, ErrorCode.invalid_request, "Invalid request");
         }
 
         var pos = body_start;
         var req = Req.deserialize(self.allocator, request_bytes, &pos, api_version) catch |err| {
             log.warn("Failed to decode denied DescribeConfigs request: {}", .{err});
-            return null;
+            return self.describeConfigsErrorResponse(req_header, resp_header_version, api_version, ErrorCode.invalid_request, "Invalid request");
         };
         defer self.freeDescribeConfigsRequest(&req);
 
         var results: []Result = &.{};
         if (req.resources.len > 0) {
-            results = self.allocator.alloc(Result, req.resources.len) catch return null;
+            results = self.allocator.alloc(Result, req.resources.len) catch |err| {
+                log.warn("DescribeConfigs denied response materialization failed: {}", .{err});
+                return self.describeConfigsErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error, "Failed to materialize DescribeConfigs authorization response");
+            };
         }
         defer if (results.len > 0) self.allocator.free(results);
 
@@ -7845,6 +7848,26 @@ pub const Broker = struct {
         const resp = Resp{
             .throttle_time_ms = 0,
             .results = results,
+        };
+        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version) orelse {
+            log.warn("DescribeConfigs denied response serialization failed", .{});
+            return self.describeConfigsErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error, "Failed to serialize DescribeConfigs authorization response");
+        };
+    }
+
+    fn describeConfigsErrorResponse(self: *Broker, req_header: *const RequestHeader, resp_header_version: i16, api_version: i16, err_code: ErrorCode, message: ?[]const u8) ?[]u8 {
+        const Resp = generated.describe_configs_response.DescribeConfigsResponse;
+        const Result = Resp.DescribeConfigsResult;
+        const results = [_]Result{.{
+            .error_code = @intFromEnum(err_code),
+            .error_message = message,
+            .resource_type = 0,
+            .resource_name = null,
+            .configs = &.{},
+        }};
+        const resp = Resp{
+            .throttle_time_ms = 0,
+            .results = &results,
         };
         return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
     }
@@ -7864,19 +7887,22 @@ pub const Broker = struct {
 
         if (!validateAlterConfigsRequestFrame(request_bytes, body_start, api_version)) {
             log.warn("Malformed denied AlterConfigs request", .{});
-            return null;
+            return self.alterConfigsErrorResponse(req_header, resp_header_version, api_version, ErrorCode.invalid_request, "Invalid request");
         }
 
         var pos = body_start;
         var req = Req.deserialize(self.allocator, request_bytes, &pos, api_version) catch |err| {
             log.warn("Failed to decode denied AlterConfigs request: {}", .{err});
-            return null;
+            return self.alterConfigsErrorResponse(req_header, resp_header_version, api_version, ErrorCode.invalid_request, "Invalid request");
         };
         defer self.freeAlterConfigsRequest(&req);
 
         var responses: []ResourceResponse = &.{};
         if (req.resources.len > 0) {
-            responses = self.allocator.alloc(ResourceResponse, req.resources.len) catch return null;
+            responses = self.allocator.alloc(ResourceResponse, req.resources.len) catch |err| {
+                log.warn("AlterConfigs denied response materialization failed: {}", .{err});
+                return self.alterConfigsErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error, "Failed to materialize AlterConfigs authorization response");
+            };
         }
         defer if (responses.len > 0) self.allocator.free(responses);
 
@@ -7892,6 +7918,25 @@ pub const Broker = struct {
         const resp = Resp{
             .throttle_time_ms = 0,
             .responses = responses,
+        };
+        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version) orelse {
+            log.warn("AlterConfigs denied response serialization failed", .{});
+            return self.alterConfigsErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error, "Failed to serialize AlterConfigs authorization response");
+        };
+    }
+
+    fn alterConfigsErrorResponse(self: *Broker, req_header: *const RequestHeader, resp_header_version: i16, api_version: i16, err_code: ErrorCode, message: ?[]const u8) ?[]u8 {
+        const Resp = generated.alter_configs_response.AlterConfigsResponse;
+        const ResourceResponse = Resp.AlterConfigsResourceResponse;
+        const responses = [_]ResourceResponse{.{
+            .error_code = @intFromEnum(err_code),
+            .error_message = message,
+            .resource_type = 0,
+            .resource_name = null,
+        }};
+        const resp = Resp{
+            .throttle_time_ms = 0,
+            .responses = &responses,
         };
         return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
     }
@@ -37221,6 +37266,121 @@ test "Broker.handleRequest AlterConfigs authorization denial uses generated resp
     try testing.expectEqual(before, broker.topics.get("alter-cfg-denied-topic").?.config.min_insync_replicas);
 }
 
+test "Broker.handleRequest AlterConfigs authorization denial rejects malformed request" {
+    const Resp = generated.alter_configs_response.AlterConfigsResponse;
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+    try broker.authorizer.addAcl("other-client", .cluster, "*", .literal, .alter, .allow, "*");
+
+    var buf: [128]u8 = undefined;
+    const req_len = buildTestRequest(&buf, 33, 2, 3316, header_mod.requestHeaderVersion(33, 2));
+
+    const response = broker.handleRequest(buf[0..req_len]);
+    try testing.expect(response != null);
+    defer testing.allocator.free(response.?);
+
+    var rpos: usize = 0;
+    var response_header = try ResponseHeader.deserialize(testing.allocator, response.?, &rpos, header_mod.responseHeaderVersion(33, 2));
+    defer response_header.deinit(testing.allocator);
+    try testing.expectEqual(@as(i32, 3316), response_header.correlation_id);
+
+    const resp = try Resp.deserialize(testing.allocator, response.?, &rpos, 2);
+    defer if (resp.responses.len > 0) testing.allocator.free(resp.responses);
+
+    try testing.expectEqual(response.?.len, rpos);
+    try testing.expectEqual(@as(usize, 1), resp.responses.len);
+    try testing.expect(resp.responses[0].resource_name == null);
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.invalid_request)), resp.responses[0].error_code);
+}
+
+test "Broker.handleRequest AlterConfigs authorization denial fails closed when response materialization fails" {
+    const Req = generated.alter_configs_request.AlterConfigsRequest;
+    const Resp = generated.alter_configs_response.AlterConfigsResponse;
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+    try broker.authorizer.addAcl("other-client", .cluster, "*", .literal, .alter, .allow, "*");
+
+    const resources = [_]Req.AlterConfigsResource{.{
+        .resource_type = 2,
+        .resource_name = "alter-cfg-denied-materialize-fail",
+        .configs = &.{},
+    }};
+    const req = Req{
+        .resources = &resources,
+        .validate_only = false,
+    };
+
+    var buf: [256]u8 = undefined;
+    var pos = buildTestRequest(&buf, 33, 2, 3317, header_mod.requestHeaderVersion(33, 2));
+    req.serialize(&buf, &pos, 2);
+
+    var failing_allocator = OneShotFailingAllocator.init(testing.allocator, 1);
+    const response_allocator = failing_allocator.allocator();
+    broker.allocator = response_allocator;
+
+    const response = broker.handleRequest(buf[0..pos]);
+    broker.allocator = testing.allocator;
+
+    try testing.expect(failing_allocator.failed);
+    try testing.expect(response != null);
+    defer response_allocator.free(response.?);
+
+    var rpos: usize = 0;
+    var response_header = try ResponseHeader.deserialize(testing.allocator, response.?, &rpos, header_mod.responseHeaderVersion(33, 2));
+    defer response_header.deinit(testing.allocator);
+    try testing.expectEqual(@as(i32, 3317), response_header.correlation_id);
+
+    const resp = try Resp.deserialize(testing.allocator, response.?, &rpos, 2);
+    defer if (resp.responses.len > 0) testing.allocator.free(resp.responses);
+
+    try testing.expectEqual(response.?.len, rpos);
+    try testing.expectEqual(@as(usize, 1), resp.responses.len);
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.kafka_storage_error)), resp.responses[0].error_code);
+}
+
+test "Broker.handleRequest AlterConfigs authorization denial fails closed when serialization fails" {
+    const Req = generated.alter_configs_request.AlterConfigsRequest;
+    const Resp = generated.alter_configs_response.AlterConfigsResponse;
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+    try broker.authorizer.addAcl("other-client", .cluster, "*", .literal, .alter, .allow, "*");
+
+    const req = Req{
+        .resources = &.{},
+        .validate_only = false,
+    };
+
+    var buf: [128]u8 = undefined;
+    var pos = buildTestRequest(&buf, 33, 2, 3318, header_mod.requestHeaderVersion(33, 2));
+    req.serialize(&buf, &pos, 2);
+
+    var failing_allocator = OneShotFailingAllocator.init(testing.allocator, 0);
+    const response_allocator = failing_allocator.allocator();
+    broker.allocator = response_allocator;
+
+    const response = broker.handleRequest(buf[0..pos]);
+    broker.allocator = testing.allocator;
+
+    try testing.expect(failing_allocator.failed);
+    try testing.expect(response != null);
+    defer response_allocator.free(response.?);
+
+    var rpos: usize = 0;
+    var response_header = try ResponseHeader.deserialize(testing.allocator, response.?, &rpos, header_mod.responseHeaderVersion(33, 2));
+    defer response_header.deinit(testing.allocator);
+    try testing.expectEqual(@as(i32, 3318), response_header.correlation_id);
+
+    const resp = try Resp.deserialize(testing.allocator, response.?, &rpos, 2);
+    defer if (resp.responses.len > 0) testing.allocator.free(resp.responses);
+
+    try testing.expectEqual(response.?.len, rpos);
+    try testing.expectEqual(@as(usize, 1), resp.responses.len);
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.kafka_storage_error)), resp.responses[0].error_code);
+}
+
 test "Broker.handleRequest AlterConfigs validate_only does not mutate" {
     const Req = generated.alter_configs_request.AlterConfigsRequest;
     const Resp = generated.alter_configs_response.AlterConfigsResponse;
@@ -62448,6 +62608,124 @@ test "Broker.handleRequest DescribeConfigs authorization denial uses generated r
     try testing.expectEqual(@as(i8, 2), resp.results[0].resource_type);
     try testing.expectEqualStrings("cfg-denied-topic", resp.results[0].resource_name.?);
     try testing.expectEqual(@as(usize, 0), resp.results[0].configs.len);
+}
+
+test "Broker.handleRequest DescribeConfigs authorization denial rejects malformed request" {
+    const Resp = generated.describe_configs_response.DescribeConfigsResponse;
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+    try broker.authorizer.addAcl("other-client", .cluster, "*", .literal, .describe, .allow, "*");
+
+    var buf: [128]u8 = undefined;
+    const req_len = buildTestRequest(&buf, 32, 4, 3208, header_mod.requestHeaderVersion(32, 4));
+
+    const response = broker.handleRequest(buf[0..req_len]);
+    try testing.expect(response != null);
+    defer testing.allocator.free(response.?);
+
+    var rpos: usize = 0;
+    var response_header = try ResponseHeader.deserialize(testing.allocator, response.?, &rpos, header_mod.responseHeaderVersion(32, 4));
+    defer response_header.deinit(testing.allocator);
+    try testing.expectEqual(@as(i32, 3208), response_header.correlation_id);
+
+    const resp = try Resp.deserialize(testing.allocator, response.?, &rpos, 4);
+    defer freeDeserializedDescribeConfigsResponse(&resp);
+
+    try testing.expectEqual(response.?.len, rpos);
+    try testing.expectEqual(@as(usize, 1), resp.results.len);
+    try testing.expect(resp.results[0].resource_name == null);
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.invalid_request)), resp.results[0].error_code);
+}
+
+test "Broker.handleRequest DescribeConfigs authorization denial fails closed when response materialization fails" {
+    const Req = generated.describe_configs_request.DescribeConfigsRequest;
+    const Resource = Req.DescribeConfigsResource;
+    const Resp = generated.describe_configs_response.DescribeConfigsResponse;
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+    try broker.authorizer.addAcl("other-client", .cluster, "*", .literal, .describe, .allow, "*");
+
+    const resources = [_]Resource{.{
+        .resource_type = 2,
+        .resource_name = "cfg-denied-materialize-fail",
+        .configuration_keys = &.{},
+    }};
+    const req = Req{
+        .resources = &resources,
+        .include_synonyms = true,
+        .include_documentation = true,
+    };
+
+    var buf: [256]u8 = undefined;
+    var pos = buildTestRequest(&buf, 32, 4, 3209, header_mod.requestHeaderVersion(32, 4));
+    req.serialize(&buf, &pos, 4);
+
+    var failing_allocator = OneShotFailingAllocator.init(testing.allocator, 1);
+    const response_allocator = failing_allocator.allocator();
+    broker.allocator = response_allocator;
+
+    const response = broker.handleRequest(buf[0..pos]);
+    broker.allocator = testing.allocator;
+
+    try testing.expect(failing_allocator.failed);
+    try testing.expect(response != null);
+    defer response_allocator.free(response.?);
+
+    var rpos: usize = 0;
+    var response_header = try ResponseHeader.deserialize(testing.allocator, response.?, &rpos, header_mod.responseHeaderVersion(32, 4));
+    defer response_header.deinit(testing.allocator);
+    try testing.expectEqual(@as(i32, 3209), response_header.correlation_id);
+
+    const resp = try Resp.deserialize(testing.allocator, response.?, &rpos, 4);
+    defer freeDeserializedDescribeConfigsResponse(&resp);
+
+    try testing.expectEqual(response.?.len, rpos);
+    try testing.expectEqual(@as(usize, 1), resp.results.len);
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.kafka_storage_error)), resp.results[0].error_code);
+}
+
+test "Broker.handleRequest DescribeConfigs authorization denial fails closed when serialization fails" {
+    const Req = generated.describe_configs_request.DescribeConfigsRequest;
+    const Resp = generated.describe_configs_response.DescribeConfigsResponse;
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+    try broker.authorizer.addAcl("other-client", .cluster, "*", .literal, .describe, .allow, "*");
+
+    const req = Req{
+        .resources = &.{},
+        .include_synonyms = true,
+        .include_documentation = true,
+    };
+
+    var buf: [128]u8 = undefined;
+    var pos = buildTestRequest(&buf, 32, 4, 3210, header_mod.requestHeaderVersion(32, 4));
+    req.serialize(&buf, &pos, 4);
+
+    var failing_allocator = OneShotFailingAllocator.init(testing.allocator, 0);
+    const response_allocator = failing_allocator.allocator();
+    broker.allocator = response_allocator;
+
+    const response = broker.handleRequest(buf[0..pos]);
+    broker.allocator = testing.allocator;
+
+    try testing.expect(failing_allocator.failed);
+    try testing.expect(response != null);
+    defer response_allocator.free(response.?);
+
+    var rpos: usize = 0;
+    var response_header = try ResponseHeader.deserialize(testing.allocator, response.?, &rpos, header_mod.responseHeaderVersion(32, 4));
+    defer response_header.deinit(testing.allocator);
+    try testing.expectEqual(@as(i32, 3210), response_header.correlation_id);
+
+    const resp = try Resp.deserialize(testing.allocator, response.?, &rpos, 4);
+    defer freeDeserializedDescribeConfigsResponse(&resp);
+
+    try testing.expectEqual(response.?.len, rpos);
+    try testing.expectEqual(@as(usize, 1), resp.results.len);
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.kafka_storage_error)), resp.results[0].error_code);
 }
 
 test "Broker.handleRequest DescribeConfigs distinguishes null and empty configuration keys" {
