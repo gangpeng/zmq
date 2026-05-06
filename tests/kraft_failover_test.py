@@ -10192,6 +10192,47 @@ def wait_for_describe_quorum_v2_checkpoint(
     raise TestError(f"DescribeQuorum v2 did not recover during {label}: {last_error}")
 
 
+def wait_for_all_describe_quorum_v2_checkpoint(
+    processes,
+    expected_ports,
+    expected_leader_id,
+    state,
+    label,
+    timeout=30,
+):
+    deadline = time.time() + timeout
+    correlation_id = state.get("correlation_id", 9840)
+    last_error = None
+    while time.time() < deadline:
+        try:
+            checked = {}
+            for node_id, info in sorted(processes.items()):
+                if info["proc"].poll() is not None:
+                    continue
+                quorum = describe_quorum_v2(info["port"], correlation_id)
+                correlation_id += 1
+                require_dynamic_voter_quorum_unchanged(quorum, expected_ports, label)
+                if quorum["leader_id"] != expected_leader_id:
+                    raise TestError(
+                        f"DescribeQuorum v2 node {node_id} reported leader "
+                        f"{quorum['leader_id']} during {label}, "
+                        f"expected {expected_leader_id}: {quorum}"
+                    )
+                checked[node_id] = quorum["leader_id"]
+            if not checked:
+                raise TestError(f"no live controllers to probe during {label}")
+            state["correlation_id"] = correlation_id
+            return checked
+        except Exception as exc:
+            last_error = exc
+        correlation_id += 1
+        time.sleep(0.25)
+    raise TestError(
+        f"all-controller DescribeQuorum v2 did not recover during {label}: "
+        f"{last_error}"
+    )
+
+
 def fetch_snapshot_v1_body(end_offset, epoch, position):
     body = bytearray()
     body += struct.pack(">ii", 100, 128)  # replica_id, max_bytes
@@ -11125,6 +11166,14 @@ def main():
             describe_quorum_state,
             "initial leader",
         )
+        all_describe_quorum_state = {"correlation_id": 9840}
+        wait_for_all_describe_quorum_v2_checkpoint(
+            processes,
+            ports,
+            leader_id,
+            all_describe_quorum_state,
+            "initial leader",
+        )
         fetch_snapshot_state = {"correlation_id": 9240}
         wait_for_fetch_snapshot_checkpoint(
             processes[leader_id]["port"],
@@ -11780,6 +11829,13 @@ def main():
                 describe_quorum_state,
                 "network partition matrix",
             )
+            wait_for_all_describe_quorum_v2_checkpoint(
+                processes,
+                ports,
+                leader_id,
+                all_describe_quorum_state,
+                "network partition matrix",
+            )
             wait_for_fetch_snapshot_checkpoint(
                 processes[leader_id]["port"],
                 leader_id,
@@ -11938,6 +11994,13 @@ def main():
             processes[replacement_leader]["port"],
             ports,
             describe_quorum_state,
+            "controller leader failover",
+        )
+        wait_for_all_describe_quorum_v2_checkpoint(
+            processes,
+            ports,
+            replacement_leader,
+            all_describe_quorum_state,
             "controller leader failover",
         )
         wait_for_fetch_snapshot_checkpoint(
@@ -12136,6 +12199,13 @@ def main():
             describe_quorum_state,
             "old leader fresh rejoin",
         )
+        wait_for_all_describe_quorum_v2_checkpoint(
+            processes,
+            ports,
+            replacement_leader,
+            all_describe_quorum_state,
+            "old leader fresh rejoin",
+        )
         wait_for_fetch_snapshot_checkpoint(
             processes[replacement_leader]["port"],
             replacement_leader,
@@ -12329,6 +12399,13 @@ def main():
             describe_quorum_state,
             "surviving controller restart",
         )
+        wait_for_all_describe_quorum_v2_checkpoint(
+            processes,
+            ports,
+            replacement_leader,
+            all_describe_quorum_state,
+            "surviving controller restart",
+        )
         wait_for_fetch_snapshot_checkpoint(
             processes[replacement_leader]["port"],
             replacement_leader,
@@ -12507,6 +12584,13 @@ def main():
             processes[replacement_leader]["port"],
             ports,
             describe_quorum_state,
+            "broker restart",
+        )
+        wait_for_all_describe_quorum_v2_checkpoint(
+            processes,
+            ports,
+            replacement_leader,
+            all_describe_quorum_state,
             "broker restart",
         )
         wait_for_fetch_snapshot_checkpoint(
@@ -12804,6 +12888,7 @@ def main():
             f"controller_api_versions_checked=true, "
             f"controller_unsupported_checked=true, "
             f"dynamic_raft_voter_negative_checked=true, "
+            f"all_controller_describe_quorum_v2_checked=true, "
             f"broker_lifecycle_negative_checked=true, "
             f"controller_registration_negative_checked=true, "
             f"committed_offset={committed_offset}, "
