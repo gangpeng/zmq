@@ -19607,13 +19607,13 @@ pub const Broker = struct {
 
         if (!validateDeleteRecordsRequestFrame(request_bytes, body_start, api_version)) {
             log.warn("Malformed DeleteRecords request", .{});
-            return null;
+            return self.deleteRecordsErrorResponse(req_header, resp_header_version, api_version, ErrorCode.invalid_request);
         }
 
         var pos = body_start;
         var req = Req.deserialize(self.allocator, request_bytes, &pos, api_version) catch |err| {
             log.warn("Malformed DeleteRecords request: {}", .{err});
-            return null;
+            return self.deleteRecordsErrorResponse(req_header, resp_header_version, api_version, ErrorCode.invalid_request);
         };
         defer self.freeDeleteRecordsRequest(&req);
 
@@ -19621,59 +19621,51 @@ pub const Broker = struct {
         for (req.topics) |topic_req| {
             total_requested_partitions += topic_req.partitions.len;
         }
-        const mutated_partitions = self.allocator.alloc(bool, total_requested_partitions) catch return null;
+        const mutated_partitions = self.allocator.alloc(bool, total_requested_partitions) catch |err| {
+            log.warn("DeleteRecords mutation flag materialization failed: {}", .{err});
+            return self.deleteRecordsErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error);
+        };
         defer if (mutated_partitions.len > 0) self.allocator.free(mutated_partitions);
         @memset(mutated_partitions, false);
 
-        var previous_partition_states = self.clonePartitionStateSnapshot() catch return null;
-        defer self.freePartitionStateSnapshot(&previous_partition_states);
-        var previous_object_snapshot: ?ObjectManagerLocalSnapshot = self.takeObjectManagerLocalSnapshot() catch return null;
-        defer if (previous_object_snapshot) |*snapshot| self.freeObjectManagerLocalSnapshot(snapshot);
-
-        var topics: []TopicResult = &.{};
-        if (req.topics.len > 0) {
-            topics = self.allocator.alloc(TopicResult, req.topics.len) catch return null;
-        }
-        var topics_init: usize = 0;
-        var mutated = false;
-        var requested_partition_index: usize = 0;
+        const topics = self.materializeDeleteRecordsResponseTopics(&req) catch |err| {
+            log.warn("DeleteRecords response materialization failed: {}", .{err});
+            return self.deleteRecordsErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error);
+        };
         defer {
-            self.freeDeleteRecordsResponseTopics(topics[0..topics_init]);
+            self.freeDeleteRecordsResponseTopics(topics);
             if (topics.len > 0) self.allocator.free(topics);
         }
 
-        for (req.topics) |topic_req| {
-            var partitions: []const PartitionResult = &.{};
-            if (topic_req.partitions.len > 0) {
-                const writable = self.allocator.alloc(PartitionResult, topic_req.partitions.len) catch return null;
-                var transferred = false;
-                defer {
-                    if (!transferred and writable.len > 0) self.allocator.free(writable);
-                }
+        var previous_partition_states = self.clonePartitionStateSnapshot() catch |err| {
+            log.warn("DeleteRecords partition rollback snapshot materialization failed: {}", .{err});
+            return self.deleteRecordsErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error);
+        };
+        defer self.freePartitionStateSnapshot(&previous_partition_states);
+        var previous_object_snapshot: ?ObjectManagerLocalSnapshot = self.takeObjectManagerLocalSnapshot() catch |err| {
+            log.warn("DeleteRecords object rollback snapshot materialization failed: {}", .{err});
+            return self.deleteRecordsErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error);
+        };
+        defer if (previous_object_snapshot) |*snapshot| self.freeObjectManagerLocalSnapshot(snapshot);
 
-                const topic_name = topic_req.name orelse "";
-                for (topic_req.partitions, 0..) |partition_req, partition_idx| {
-                    const trim_result = self.trimDeleteRecordsPartition(topic_name, partition_req.partition_index, partition_req.offset);
-                    if (trim_result.mutated) {
-                        mutated = true;
-                        mutated_partitions[requested_partition_index] = true;
-                    }
-                    writable[partition_idx] = .{
-                        .partition_index = partition_req.partition_index,
-                        .low_watermark = trim_result.low_watermark,
-                        .error_code = trim_result.error_code,
-                    };
-                    requested_partition_index += 1;
+        var mutated = false;
+        var requested_partition_index: usize = 0;
+        for (req.topics, topics) |topic_req, *topic_resp| {
+            const partitions: []PartitionResult = @constCast(topic_resp.partitions);
+            const topic_name = topic_req.name orelse "";
+            for (topic_req.partitions, 0..) |partition_req, partition_idx| {
+                const trim_result = self.trimDeleteRecordsPartition(topic_name, partition_req.partition_index, partition_req.offset);
+                if (trim_result.mutated) {
+                    mutated = true;
+                    mutated_partitions[requested_partition_index] = true;
                 }
-                partitions = writable;
-                transferred = true;
+                partitions[partition_idx] = .{
+                    .partition_index = partition_req.partition_index,
+                    .low_watermark = trim_result.low_watermark,
+                    .error_code = trim_result.error_code,
+                };
+                requested_partition_index += 1;
             }
-
-            topics[topics_init] = .{
-                .name = topic_req.name,
-                .partitions = partitions,
-            };
-            topics_init += 1;
         }
 
         if (mutated) {
@@ -19698,7 +19690,7 @@ pub const Broker = struct {
                 };
 
                 var flag_index: usize = 0;
-                for (topics[0..topics_init]) |*topic| {
+                for (topics) |*topic| {
                     const partitions: []PartitionResult = @constCast(topic.partitions);
                     for (partitions) |*partition| {
                         if (mutated_partitions[flag_index] and partition.error_code == @intFromEnum(ErrorCode.none)) {
@@ -19713,9 +19705,12 @@ pub const Broker = struct {
 
         const resp = Resp{
             .throttle_time_ms = 0,
-            .topics = topics[0..topics_init],
+            .topics = topics,
         };
-        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version) orelse {
+            log.warn("DeleteRecords response serialization failed", .{});
+            return self.deleteRecordsErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error);
+        };
     }
 
     const DeleteRecordsTrimResult = struct {
@@ -19735,6 +19730,42 @@ pub const Broker = struct {
         for (topics) |topic| {
             if (topic.partitions.len > 0) self.allocator.free(topic.partitions);
         }
+    }
+
+    fn materializeDeleteRecordsResponseTopics(self: *Broker, req: *const generated.delete_records_request.DeleteRecordsRequest) ![]generated.delete_records_response.DeleteRecordsResponse.DeleteRecordsTopicResult {
+        const TopicResult = generated.delete_records_response.DeleteRecordsResponse.DeleteRecordsTopicResult;
+        const PartitionResult = TopicResult.DeleteRecordsPartitionResult;
+
+        if (req.topics.len == 0) return &.{};
+
+        const topics = try self.allocator.alloc(TopicResult, req.topics.len);
+        var topics_init: usize = 0;
+        errdefer {
+            self.freeDeleteRecordsResponseTopics(topics[0..topics_init]);
+            self.allocator.free(topics);
+        }
+
+        for (req.topics) |topic_req| {
+            var partitions: []PartitionResult = &.{};
+            if (topic_req.partitions.len > 0) {
+                partitions = try self.allocator.alloc(PartitionResult, topic_req.partitions.len);
+                for (topic_req.partitions, 0..) |partition_req, partition_idx| {
+                    partitions[partition_idx] = .{
+                        .partition_index = partition_req.partition_index,
+                        .low_watermark = -1,
+                        .error_code = @intFromEnum(ErrorCode.kafka_storage_error),
+                    };
+                }
+            }
+
+            topics[topics_init] = .{
+                .name = topic_req.name,
+                .partitions = partitions,
+            };
+            topics_init += 1;
+        }
+
+        return topics;
     }
 
     fn trimDeleteRecordsPartition(self: *Broker, topic: []const u8, partition: i32, delete_offset: i64) DeleteRecordsTrimResult {
@@ -33387,6 +33418,34 @@ fn expectListOffsetsErrorResponseBytes(response: []const u8, api_version: i16, c
     try testing.expectEqual(@as(usize, 1), resp.topics[0].partitions.len);
     try testing.expectEqual(@as(i16, @intFromEnum(err_code)), resp.topics[0].partitions[0].error_code);
     try testing.expectEqual(@as(i32, -1), resp.topics[0].partitions[0].partition_index);
+}
+
+fn freeDeserializedDeleteRecordsResponse(resp: *const generated.delete_records_response.DeleteRecordsResponse) void {
+    for (resp.topics) |topic| {
+        if (topic.partitions.len > 0) testing.allocator.free(topic.partitions);
+    }
+    if (resp.topics.len > 0) testing.allocator.free(resp.topics);
+}
+
+fn expectDeleteRecordsErrorResponseBytes(response: []const u8, api_version: i16, correlation_id: i32, err_code: ErrorCode) !void {
+    const Resp = generated.delete_records_response.DeleteRecordsResponse;
+
+    var rpos: usize = 0;
+    var response_header = try ResponseHeader.deserialize(testing.allocator, response, &rpos, header_mod.responseHeaderVersion(21, api_version));
+    defer response_header.deinit(testing.allocator);
+    try testing.expectEqual(correlation_id, response_header.correlation_id);
+
+    const resp = try Resp.deserialize(testing.allocator, response, &rpos, api_version);
+    defer freeDeserializedDeleteRecordsResponse(&resp);
+
+    try testing.expectEqual(response.len, rpos);
+    try testing.expectEqual(@as(i32, 0), resp.throttle_time_ms);
+    try testing.expectEqual(@as(usize, 1), resp.topics.len);
+    try testing.expectEqualStrings("", resp.topics[0].name.?);
+    try testing.expectEqual(@as(usize, 1), resp.topics[0].partitions.len);
+    try testing.expectEqual(@as(i32, -1), resp.topics[0].partitions[0].partition_index);
+    try testing.expectEqual(@as(i64, -1), resp.topics[0].partitions[0].low_watermark);
+    try testing.expectEqual(@as(i16, @intFromEnum(err_code)), resp.topics[0].partitions[0].error_code);
 }
 
 fn freeDeserializedMetadataResponse(resp: *const generated.metadata_response.MetadataResponse) void {
@@ -70110,7 +70169,11 @@ test "Broker.handleRequest DeleteRecords rejects truncated request" {
 
     var buf: [128]u8 = undefined;
     const req_len = buildTestRequest(&buf, 21, 2, 2103, header_mod.requestHeaderVersion(21, 2));
-    try testing.expect(broker.handleRequest(buf[0..req_len]) == null);
+    const response = broker.handleRequest(buf[0..req_len]);
+    try testing.expect(response != null);
+    defer testing.allocator.free(response.?);
+
+    try expectDeleteRecordsErrorResponseBytes(response.?, 2, 2103, ErrorCode.invalid_request);
 }
 
 test "Broker.handleRequest DeleteRecords rejects trailing bytes" {
@@ -70138,7 +70201,96 @@ test "Broker.handleRequest DeleteRecords rejects trailing bytes" {
     var pos = buildTestRequest(&buf, 21, 2, 2105, header_mod.requestHeaderVersion(21, 2));
     req.serialize(&buf, &pos, 2);
 
-    try expectTrailingByteRejected(&broker, &buf, pos);
+    try testing.expect(pos < buf.len);
+    buf[pos] = 0x7f;
+    const response = broker.handleRequest(buf[0 .. pos + 1]);
+    try testing.expect(response != null);
+    defer testing.allocator.free(response.?);
+
+    try expectDeleteRecordsErrorResponseBytes(response.?, 2, 2105, ErrorCode.invalid_request);
+}
+
+test "Broker.handleRequest DeleteRecords fails closed when response materialization fails" {
+    const Req = generated.delete_records_request.DeleteRecordsRequest;
+    const Topic = Req.DeleteRecordsTopic;
+    const Partition = Topic.DeleteRecordsPartition;
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+
+    const partitions = [_]Partition{.{
+        .partition_index = 0,
+        .offset = 5,
+    }};
+    const topics = [_]Topic{.{
+        .name = "dr-oom-topic",
+        .partitions = &partitions,
+    }};
+    const req = Req{
+        .topics = &topics,
+        .timeout_ms = 30000,
+    };
+
+    var buf: [512]u8 = undefined;
+    var pos = buildTestRequest(&buf, 21, 2, 2110, header_mod.requestHeaderVersion(21, 2));
+    req.serialize(&buf, &pos, 2);
+
+    for ([_]usize{ 2, 3, 4 }) |fail_index| {
+        var failing_allocator = OneShotFailingAllocator.init(testing.allocator, fail_index);
+        const response_allocator = failing_allocator.allocator();
+        broker.allocator = response_allocator;
+
+        const response = broker.handleRequest(buf[0..pos]);
+        broker.allocator = testing.allocator;
+
+        try testing.expect(failing_allocator.failed);
+        try testing.expect(response != null);
+        defer response_allocator.free(response.?);
+
+        try expectDeleteRecordsErrorResponseBytes(response.?, 2, 2110, ErrorCode.kafka_storage_error);
+    }
+}
+
+test "Broker.handleRequest DeleteRecords fails closed when rollback snapshot materialization fails" {
+    const Req = generated.delete_records_request.DeleteRecordsRequest;
+    const Topic = Req.DeleteRecordsTopic;
+    const Partition = Topic.DeleteRecordsPartition;
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+    try testing.expect(broker.ensureTopic("dr-snapshot-oom-topic"));
+
+    const partitions = [_]Partition{.{
+        .partition_index = 0,
+        .offset = 1,
+    }};
+    const topics = [_]Topic{.{
+        .name = "dr-snapshot-oom-topic",
+        .partitions = &partitions,
+    }};
+    const req = Req{
+        .topics = &topics,
+        .timeout_ms = 30000,
+    };
+
+    var buf: [512]u8 = undefined;
+    var pos = buildTestRequest(&buf, 21, 2, 2111, header_mod.requestHeaderVersion(21, 2));
+    req.serialize(&buf, &pos, 2);
+
+    var failing_allocator = OneShotFailingAllocator.init(testing.allocator, 5);
+    const response_allocator = failing_allocator.allocator();
+    broker.allocator = response_allocator;
+
+    const response = broker.handleRequest(buf[0..pos]);
+    broker.allocator = testing.allocator;
+
+    try testing.expect(failing_allocator.failed);
+    try testing.expect(response != null);
+    defer response_allocator.free(response.?);
+
+    try expectDeleteRecordsErrorResponseBytes(response.?, 2, 2111, ErrorCode.kafka_storage_error);
+    const state = broker.partitionStatePtr("dr-snapshot-oom-topic", 0) orelse return error.ExpectedPartitionState;
+    try testing.expectEqual(@as(u64, 0), state.log_start_offset);
 }
 
 test "Broker.handleRequest DeleteRecords authorization denial uses generated response" {
