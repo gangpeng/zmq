@@ -2701,6 +2701,137 @@ def wait_for_consumer_group_heartbeat(port, group_state, timeout=30):
     )
 
 
+def wait_for_consumer_group_heartbeat_leave(port, group_state, timeout=30):
+    deadline = time.time() + timeout
+    correlation_id = 7850
+    last_error = None
+    while time.time() < deadline:
+        try:
+            response = consumer_group_heartbeat(
+                port,
+                group_state["group_id"],
+                group_state["member_id"],
+                -1,
+                correlation_id,
+            )
+            if response["error_code"] != 0:
+                raise TestError(
+                    f"ConsumerGroupHeartbeat leave error_code="
+                    f"{response['error_code']} message={response['error_message']!r}"
+                )
+            if response["member_id"] != group_state["member_id"]:
+                raise TestError(
+                    f"ConsumerGroupHeartbeat leave member mismatch: {response}"
+                )
+            if response["member_epoch"] != -1:
+                raise TestError(
+                    f"ConsumerGroupHeartbeat leave epoch mismatch: {response}"
+                )
+            if response["heartbeat_interval_ms"] != 0 or response["assignment"] is not None:
+                raise TestError(
+                    f"ConsumerGroupHeartbeat leave returned active state: {response}"
+                )
+            return
+        except Exception as exc:
+            last_error = exc
+        correlation_id += 1
+        time.sleep(0.25)
+    raise TestError(
+        f"ConsumerGroupHeartbeat leave did not recover for "
+        f"{group_state['group_id']!r}: {last_error}"
+    )
+
+
+def wait_for_consumer_group_heartbeat_unknown_member(port, group_state, timeout=30):
+    deadline = time.time() + timeout
+    correlation_id = 7875
+    last_error = None
+    while time.time() < deadline:
+        try:
+            response = consumer_group_heartbeat(
+                port,
+                group_state["group_id"],
+                group_state["member_id"],
+                group_state["member_epoch"],
+                correlation_id,
+            )
+            if response["error_code"] != ERROR_UNKNOWN_MEMBER_ID:
+                raise TestError(
+                    f"ConsumerGroupHeartbeat old member error="
+                    f"{response['error_code']} response={response}"
+                )
+            if response["member_id"] != group_state["member_id"]:
+                raise TestError(
+                    f"ConsumerGroupHeartbeat old member id mismatch: {response}"
+                )
+            if response["heartbeat_interval_ms"] != 0 or response["assignment"] is not None:
+                raise TestError(
+                    f"ConsumerGroupHeartbeat old member returned active state: {response}"
+                )
+            return
+        except Exception as exc:
+            last_error = exc
+        correlation_id += 1
+        time.sleep(0.25)
+    raise TestError(
+        f"ConsumerGroupHeartbeat old member did not fence for "
+        f"{group_state['group_id']!r}: {last_error}"
+    )
+
+
+def wait_for_consumer_group_heartbeat_rejoin(
+    port, group_state, topic, timeout=30
+):
+    deadline = time.time() + timeout
+    correlation_id = 7890
+    last_error = None
+    while time.time() < deadline:
+        try:
+            response = consumer_group_heartbeat(
+                port,
+                group_state["group_id"],
+                group_state["member_id"],
+                0,
+                correlation_id,
+                subscribed_topics=[topic],
+                server_assignor="range",
+            )
+            if response["error_code"] != 0:
+                raise TestError(
+                    f"ConsumerGroupHeartbeat rejoin error_code="
+                    f"{response['error_code']} message={response['error_message']!r}"
+                )
+            if response["member_id"] != group_state["member_id"]:
+                raise TestError(
+                    f"ConsumerGroupHeartbeat rejoin member mismatch: {response}"
+                )
+            if response["member_epoch"] <= group_state["member_epoch"]:
+                raise TestError(
+                    f"ConsumerGroupHeartbeat rejoin epoch did not advance: "
+                    f"{response}"
+                )
+            assignment = response["assignment"]
+            if assignment is None or not assignment["topic_partitions"]:
+                raise TestError(f"ConsumerGroupHeartbeat rejoin missing assignment: {response}")
+            topic_assignment = assignment["topic_partitions"][0]
+            rejoined_state = {
+                "group_id": group_state["group_id"],
+                "member_id": response["member_id"],
+                "member_epoch": response["member_epoch"],
+                "topic_id": topic_assignment["topic_id"],
+            }
+            assert_consumer_group_heartbeat_assignment(response, rejoined_state)
+            return rejoined_state
+        except Exception as exc:
+            last_error = exc
+        correlation_id += 1
+        time.sleep(0.25)
+    raise TestError(
+        f"ConsumerGroupHeartbeat rejoin did not recover for "
+        f"{group_state['group_id']!r}: {last_error}"
+    )
+
+
 def assert_kip848_consumer_group_description(port, group_state, topic, correlation_id):
     described = consumer_group_describe(port, group_state["group_id"], correlation_id)
     if described["error_code"] != 0:
@@ -5164,6 +5295,40 @@ def main():
             kip848_committed_offset,
             kip848_offset_metadata,
         )
+        old_kip848_group_state = dict(kip848_group_state)
+        wait_for_consumer_group_heartbeat_leave(
+            broker["port"],
+            old_kip848_group_state,
+        )
+        wait_for_consumer_group_heartbeat_unknown_member(
+            broker["port"],
+            old_kip848_group_state,
+        )
+        kip848_group_state = wait_for_consumer_group_heartbeat_rejoin(
+            broker["port"],
+            old_kip848_group_state,
+            topic,
+        )
+        wait_for_consumer_group_heartbeat(broker["port"], kip848_group_state)
+        wait_for_kip848_consumer_group_description(
+            broker["port"],
+            kip848_group_state,
+            topic,
+        )
+        wait_for_offset_commit_v9_member_checkpoint(
+            broker["port"],
+            kip848_group_state,
+            topic,
+            kip848_committed_offset,
+            kip848_offset_metadata,
+        )
+        wait_for_offset_fetch_v9_member_checkpoint(
+            broker["port"],
+            kip848_group_state,
+            topic,
+            kip848_committed_offset,
+            kip848_offset_metadata,
+        )
         wait_for_offset_fetch_grouped_checkpoint(
             broker["port"],
             group,
@@ -5727,6 +5892,7 @@ def main():
             f"find_coordinator_checked=true, "
             f"consumer_group_heartbeat_checked=true, "
             f"kip848_describe_checked=true, "
+            f"kip848_rejoin_checked=true, "
             f"offset_commit_v9_member_checked=true, "
             f"offset_fetch_v9_member_checked=true, "
             f"network_partition={network_partition_result}, "
