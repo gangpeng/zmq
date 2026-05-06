@@ -747,6 +747,9 @@ Status: completed for the initial catalog and DeleteGroups slice.
   Controller ApiVersions now decodes generated request bodies, rejects
   malformed flexible frames, and returns generated storage-error responses when
   catalog response materialization fails.
+  Read-only controller DescribeQuorum and FetchSnapshot responses now also
+  return generated storage-error fallbacks when final response serialization
+  fails under allocation pressure.
   ListClientMetricsResources now advertises key 74 v0, decodes generated
   flexible requests, rejects malformed frames, returns a default generated
   resource, and lists active client resources for retained telemetry samples.

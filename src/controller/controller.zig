@@ -500,22 +500,19 @@ pub const Controller = struct {
         var pos = start_pos;
         var req = Req.deserialize(self.allocator, request_bytes, &pos, api_version) catch |err| {
             log.warn("Failed to decode DescribeQuorum request: {}", .{err});
-            const resp = Resp{ .error_code = ErrorCode.invalid_request.toInt(), .topics = &.{} };
-            return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+            return self.describeQuorumErrorResponse(req_header, resp_header_version, api_version, ErrorCode.invalid_request.toInt(), "DescribeQuorum invalid-request");
         };
         defer self.freeDescribeQuorumRequest(&req);
 
         if (pos != request_bytes.len) {
             log.warn("DescribeQuorum request has {d} trailing bytes", .{request_bytes.len - pos});
-            const resp = Resp{ .error_code = ErrorCode.invalid_request.toInt(), .topics = &.{} };
-            return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+            return self.describeQuorumErrorResponse(req_header, resp_header_version, api_version, ErrorCode.invalid_request.toInt(), "DescribeQuorum invalid-request");
         }
 
         const voter_count = self.raft_state.quorumSize();
         const voters = self.allocator.alloc(ReplicaState, voter_count) catch |err| {
             log.warn("DescribeQuorum voter state allocation failed: {}", .{err});
-            const resp = Resp{ .error_code = ErrorCode.kafka_storage_error.toInt(), .topics = &.{}, .nodes = &.{} };
-            return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+            return self.describeQuorumErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error.toInt(), "DescribeQuorum storage-error");
         };
         defer self.allocator.free(voters);
 
@@ -533,16 +530,14 @@ pub const Controller = struct {
 
         const nodes: []const Node = if (api_version >= 2) self.collectDescribeQuorumNodes() catch |err| {
             log.warn("DescribeQuorum node endpoint allocation failed: {}", .{err});
-            const resp = Resp{ .error_code = ErrorCode.kafka_storage_error.toInt(), .topics = &.{}, .nodes = &.{} };
-            return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+            return self.describeQuorumErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error.toInt(), "DescribeQuorum storage-error");
         } else &.{};
         defer self.freeDescribeQuorumNodes(nodes);
 
         const requested_topics = if (req.topics.len == 0) 1 else req.topics.len;
         const topics = self.allocator.alloc(Topic, requested_topics) catch |err| {
             log.warn("DescribeQuorum topic response allocation failed: {}", .{err});
-            const resp = Resp{ .error_code = ErrorCode.kafka_storage_error.toInt(), .topics = &.{}, .nodes = &.{} };
-            return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+            return self.describeQuorumErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error.toInt(), "DescribeQuorum storage-error");
         };
         for (topics) |*topic| {
             topic.* = .{ .topic_name = null, .partitions = &.{} };
@@ -557,8 +552,7 @@ pub const Controller = struct {
         if (req.topics.len == 0) {
             const partitions = self.allocator.alloc(Partition, 1) catch |err| {
                 log.warn("DescribeQuorum default partition response allocation failed: {}", .{err});
-                const resp = Resp{ .error_code = ErrorCode.kafka_storage_error.toInt(), .topics = &.{}, .nodes = &.{} };
-                return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+                return self.describeQuorumErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error.toInt(), "DescribeQuorum storage-error");
             };
             partitions[0] = self.describeQuorumPartition(0, voters, api_version);
             topics[0] = .{
@@ -570,8 +564,7 @@ pub const Controller = struct {
                 const partition_count = if (topic_req.partitions.len == 0) 1 else topic_req.partitions.len;
                 const partitions = self.allocator.alloc(Partition, partition_count) catch |err| {
                     log.warn("DescribeQuorum partition response allocation failed: {}", .{err});
-                    const resp = Resp{ .error_code = ErrorCode.kafka_storage_error.toInt(), .topics = &.{}, .nodes = &.{} };
-                    return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+                    return self.describeQuorumErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error.toInt(), "DescribeQuorum storage-error");
                 };
                 if (topic_req.partitions.len == 0) {
                     partitions[0] = self.describeQuorumPartition(0, voters, api_version);
@@ -592,7 +585,24 @@ pub const Controller = struct {
             .topics = topics,
             .nodes = nodes,
         };
-        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version) orelse {
+            log.warn("DescribeQuorum response serialization failed", .{});
+            return self.describeQuorumErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error.toInt(), "DescribeQuorum storage-error");
+        };
+    }
+
+    fn describeQuorumErrorResponse(self: *Controller, req_header: *const RequestHeader, resp_header_version: i16, api_version: i16, error_code: i16, label: []const u8) ?[]u8 {
+        const Resp = generated.describe_quorum_response.DescribeQuorumResponse;
+        const resp = Resp{
+            .error_code = error_code,
+            .error_message = null,
+            .topics = &.{},
+            .nodes = &.{},
+        };
+        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version) orelse {
+            log.warn("{s} response serialization failed", .{label});
+            return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+        };
     }
 
     fn collectDescribeQuorumNodes(self: *Controller) ![]const generated.describe_quorum_response.DescribeQuorumResponse.Node {
@@ -666,22 +676,19 @@ pub const Controller = struct {
 
         if (!validateFetchSnapshotRequestFrame(request_bytes, start_pos)) {
             log.warn("Malformed FetchSnapshot request", .{});
-            const resp = Resp{ .error_code = ErrorCode.invalid_request.toInt(), .topics = &.{} };
-            return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+            return self.fetchSnapshotErrorResponse(req_header, resp_header_version, api_version, ErrorCode.invalid_request.toInt(), "FetchSnapshot invalid-request");
         }
 
         var pos = start_pos;
         var req = Req.deserialize(self.allocator, request_bytes, &pos, api_version) catch |err| {
             log.warn("Failed to decode FetchSnapshot request: {}", .{err});
-            const resp = Resp{ .error_code = ErrorCode.invalid_request.toInt(), .topics = &.{} };
-            return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+            return self.fetchSnapshotErrorResponse(req_header, resp_header_version, api_version, ErrorCode.invalid_request.toInt(), "FetchSnapshot invalid-request");
         };
         defer self.freeFetchSnapshotRequest(&req);
 
         const topics = self.buildFetchSnapshotTopics(&req, api_version) catch |err| {
             log.warn("FetchSnapshot topic response allocation failed: {}", .{err});
-            const resp = Resp{ .throttle_time_ms = 0, .error_code = ErrorCode.kafka_storage_error.toInt(), .topics = &.{}, .node_endpoints = &.{} };
-            return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+            return self.fetchSnapshotErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error.toInt(), "FetchSnapshot storage-error");
         };
         defer {
             self.freeFetchSnapshotTopics(topics);
@@ -689,8 +696,7 @@ pub const Controller = struct {
         }
         const node_endpoints = self.collectFetchSnapshotNodeEndpoints(api_version) catch |err| {
             log.warn("FetchSnapshot leader endpoint allocation failed: {}", .{err});
-            const resp = Resp{ .throttle_time_ms = 0, .error_code = ErrorCode.kafka_storage_error.toInt(), .topics = &.{}, .node_endpoints = &.{} };
-            return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+            return self.fetchSnapshotErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error.toInt(), "FetchSnapshot storage-error");
         };
         defer if (node_endpoints.len > 0) self.allocator.free(node_endpoints);
 
@@ -700,7 +706,24 @@ pub const Controller = struct {
             .topics = topics,
             .node_endpoints = node_endpoints,
         };
-        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version) orelse {
+            log.warn("FetchSnapshot response serialization failed", .{});
+            return self.fetchSnapshotErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error.toInt(), "FetchSnapshot storage-error");
+        };
+    }
+
+    fn fetchSnapshotErrorResponse(self: *Controller, req_header: *const RequestHeader, resp_header_version: i16, api_version: i16, error_code: i16, label: []const u8) ?[]u8 {
+        const Resp = generated.fetch_snapshot_response.FetchSnapshotResponse;
+        const resp = Resp{
+            .throttle_time_ms = 0,
+            .error_code = error_code,
+            .topics = &.{},
+            .node_endpoints = &.{},
+        };
+        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version) orelse {
+            log.warn("{s} response serialization failed", .{label});
+            return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+        };
     }
 
     fn buildFetchSnapshotTopics(self: *Controller, req: *const generated.fetch_snapshot_request.FetchSnapshotRequest, api_version: i16) ![]generated.fetch_snapshot_response.FetchSnapshotResponse.TopicSnapshot {
@@ -3186,6 +3209,34 @@ test "Controller handleRequest DescribeQuorum v2 fails closed on response materi
     try testing.expect(saw_materialization_failure);
 }
 
+test "Controller handleRequest DescribeQuorum fails closed on response serialization failure" {
+    const Req = generated.describe_quorum_request.DescribeQuorumRequest;
+    const Resp = generated.describe_quorum_response.DescribeQuorumResponse;
+
+    var ctrl = Controller.init(testing.allocator, 1, "test-cluster");
+    defer ctrl.deinit();
+    try ctrl.raft_state.addVoter(1);
+
+    var buf: [128]u8 = undefined;
+    var pos = buildTestRequest(&buf, 55, 0, 5504, header_mod.requestHeaderVersion(55, 0));
+    const req = Req{ .topics = &.{} };
+    req.serialize(&buf, &pos, 0);
+
+    var failing_allocator = OneShotFailingAllocator.init(testing.allocator, 3);
+    const response_allocator = failing_allocator.allocator();
+    ctrl.allocator = response_allocator;
+
+    const response = ctrl.handleRequest(buf[0..pos]);
+    ctrl.allocator = testing.allocator;
+
+    try testing.expect(failing_allocator.failed);
+    try testing.expect(response != null);
+    defer response_allocator.free(response.?);
+
+    const error_code = try readControllerErrorCode(Resp, response.?, 55, 0, 5504);
+    try testing.expectEqual(ErrorCode.kafka_storage_error.toInt(), error_code);
+}
+
 test "Controller handleRequest FetchSnapshot returns snapshot not found" {
     const Req = generated.fetch_snapshot_request.FetchSnapshotRequest;
     const Resp = generated.fetch_snapshot_response.FetchSnapshotResponse;
@@ -3348,6 +3399,37 @@ test "Controller handleRequest FetchSnapshot v1 fails closed on response materia
         }
     }
     try testing.expect(saw_materialization_failure);
+}
+
+test "Controller handleRequest FetchSnapshot fails closed on response serialization failure" {
+    const Req = generated.fetch_snapshot_request.FetchSnapshotRequest;
+    const Resp = generated.fetch_snapshot_response.FetchSnapshotResponse;
+
+    var ctrl = Controller.init(testing.allocator, 1, "test-cluster");
+    defer ctrl.deinit();
+
+    var buf: [128]u8 = undefined;
+    var pos = buildTestRequest(&buf, 59, 0, 5904, header_mod.requestHeaderVersion(59, 0));
+    const req = Req{
+        .replica_id = -1,
+        .max_bytes = 1024,
+        .topics = &.{},
+    };
+    req.serialize(&buf, &pos, 0);
+
+    var failing_allocator = OneShotFailingAllocator.init(testing.allocator, 0);
+    const response_allocator = failing_allocator.allocator();
+    ctrl.allocator = response_allocator;
+
+    const response = ctrl.handleRequest(buf[0..pos]);
+    ctrl.allocator = testing.allocator;
+
+    try testing.expect(failing_allocator.failed);
+    try testing.expect(response != null);
+    defer response_allocator.free(response.?);
+
+    const error_code = try readControllerErrorCode(Resp, response.?, 59, 0, 5904);
+    try testing.expectEqual(ErrorCode.kafka_storage_error.toInt(), error_code);
 }
 
 test "Controller handleRequest FetchSnapshot returns compacted controller snapshot bytes" {
