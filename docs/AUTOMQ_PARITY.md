@@ -680,6 +680,9 @@ Status: completed for the initial catalog and DeleteGroups slice.
   ShareGroupDescribe, and the share-state APIs now return generated
   invalid-request/storage-error fallbacks for malformed denied frames and
   denial response materialization or serialization failures.
+  ConsumerGroupHeartbeat, ShareGroupHeartbeat, ShareFetch, and
+  ShareAcknowledge authorization-denial builders now also recover from denied
+  response serialization failures with generated storage-error responses.
   AutoMQ stream/object/KV authorization-denial builders for
   Create/Open/Close/Delete/TrimStreams, PrepareS3Object,
   CommitStreamSetObject, CommitStreamObject, GetOpeningStreams, and

@@ -9658,31 +9658,13 @@ pub const Broker = struct {
 
         if (!validateConsumerGroupHeartbeatRequestFrame(request_bytes, body_start)) {
             log.warn("Malformed denied ConsumerGroupHeartbeat request", .{});
-            const resp = Resp{
-                .throttle_time_ms = 0,
-                .error_code = ErrorCode.invalid_request.toInt(),
-                .error_message = "malformed ConsumerGroupHeartbeat request",
-                .member_id = null,
-                .member_epoch = 0,
-                .heartbeat_interval_ms = 0,
-                .assignment = null,
-            };
-            return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+            return self.consumerGroupHeartbeatErrorResponse(req_header, resp_header_version, api_version, ErrorCode.invalid_request, "malformed ConsumerGroupHeartbeat request", null, 0);
         }
 
         var pos = body_start;
         var req = Req.deserialize(self.allocator, request_bytes, &pos, api_version) catch |err| {
             log.warn("Failed to decode denied ConsumerGroupHeartbeat request: {}", .{err});
-            const resp = Resp{
-                .throttle_time_ms = 0,
-                .error_code = ErrorCode.invalid_request.toInt(),
-                .error_message = "malformed ConsumerGroupHeartbeat request",
-                .member_id = null,
-                .member_epoch = 0,
-                .heartbeat_interval_ms = 0,
-                .assignment = null,
-            };
-            return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+            return self.consumerGroupHeartbeatErrorResponse(req_header, resp_header_version, api_version, ErrorCode.invalid_request, "malformed ConsumerGroupHeartbeat request", null, 0);
         };
         defer self.freeConsumerGroupHeartbeatRequest(&req);
 
@@ -9692,6 +9674,32 @@ pub const Broker = struct {
             .error_message = "Not authorized",
             .member_id = req.member_id,
             .member_epoch = req.member_epoch,
+            .heartbeat_interval_ms = 0,
+            .assignment = null,
+        };
+        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version) orelse {
+            log.warn("ConsumerGroupHeartbeat denied response serialization failed", .{});
+            return self.consumerGroupHeartbeatErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error, "Failed to serialize ConsumerGroupHeartbeat authorization response", req.member_id, req.member_epoch);
+        };
+    }
+
+    fn consumerGroupHeartbeatErrorResponse(
+        self: *Broker,
+        req_header: *const RequestHeader,
+        resp_header_version: i16,
+        api_version: i16,
+        err_code: ErrorCode,
+        message: ?[]const u8,
+        member_id: ?[]const u8,
+        member_epoch: i32,
+    ) ?[]u8 {
+        const Resp = generated.consumer_group_heartbeat_response.ConsumerGroupHeartbeatResponse;
+        const resp = Resp{
+            .throttle_time_ms = 0,
+            .error_code = err_code.toInt(),
+            .error_message = message,
+            .member_id = member_id,
+            .member_epoch = member_epoch,
             .heartbeat_interval_ms = 0,
             .assignment = null,
         };
@@ -9788,31 +9796,13 @@ pub const Broker = struct {
 
         if (!validateShareGroupHeartbeatRequestFrame(request_bytes, body_start)) {
             log.warn("Malformed denied ShareGroupHeartbeat request", .{});
-            const resp = Resp{
-                .throttle_time_ms = 0,
-                .error_code = ErrorCode.invalid_request.toInt(),
-                .error_message = "malformed ShareGroupHeartbeat request",
-                .member_id = null,
-                .member_epoch = 0,
-                .heartbeat_interval_ms = 0,
-                .assignment = null,
-            };
-            return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+            return self.shareGroupHeartbeatErrorResponse(req_header, resp_header_version, api_version, ErrorCode.invalid_request, "malformed ShareGroupHeartbeat request", null, 0);
         }
 
         var pos = body_start;
         var req = Req.deserialize(self.allocator, request_bytes, &pos, api_version) catch |err| {
             log.warn("Failed to decode denied ShareGroupHeartbeat request: {}", .{err});
-            const resp = Resp{
-                .throttle_time_ms = 0,
-                .error_code = ErrorCode.invalid_request.toInt(),
-                .error_message = "malformed ShareGroupHeartbeat request",
-                .member_id = null,
-                .member_epoch = 0,
-                .heartbeat_interval_ms = 0,
-                .assignment = null,
-            };
-            return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+            return self.shareGroupHeartbeatErrorResponse(req_header, resp_header_version, api_version, ErrorCode.invalid_request, "malformed ShareGroupHeartbeat request", null, 0);
         };
         defer self.freeShareGroupHeartbeatRequest(&req);
 
@@ -9822,6 +9812,32 @@ pub const Broker = struct {
             .error_message = "Not authorized",
             .member_id = req.member_id,
             .member_epoch = req.member_epoch,
+            .heartbeat_interval_ms = 0,
+            .assignment = null,
+        };
+        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version) orelse {
+            log.warn("ShareGroupHeartbeat denied response serialization failed", .{});
+            return self.shareGroupHeartbeatErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error, "Failed to serialize ShareGroupHeartbeat authorization response", req.member_id, req.member_epoch);
+        };
+    }
+
+    fn shareGroupHeartbeatErrorResponse(
+        self: *Broker,
+        req_header: *const RequestHeader,
+        resp_header_version: i16,
+        api_version: i16,
+        err_code: ErrorCode,
+        message: ?[]const u8,
+        member_id: ?[]const u8,
+        member_epoch: i32,
+    ) ?[]u8 {
+        const Resp = generated.share_group_heartbeat_response.ShareGroupHeartbeatResponse;
+        const resp = Resp{
+            .throttle_time_ms = 0,
+            .error_code = err_code.toInt(),
+            .error_message = message,
+            .member_id = member_id,
+            .member_epoch = member_epoch,
             .heartbeat_interval_ms = 0,
             .assignment = null,
         };
@@ -9911,38 +9927,39 @@ pub const Broker = struct {
         err_code: ErrorCode,
     ) ?[]u8 {
         const Req = generated.share_fetch_request.ShareFetchRequest;
-        const Resp = generated.share_fetch_response.ShareFetchResponse;
 
         if (!validateShareFetchRequestFrame(request_bytes, body_start)) {
             log.warn("Malformed denied ShareFetch request", .{});
-            const resp = Resp{
-                .throttle_time_ms = 0,
-                .error_code = ErrorCode.invalid_request.toInt(),
-                .error_message = "malformed ShareFetch request",
-                .responses = &.{},
-                .node_endpoints = &.{},
-            };
-            return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+            return self.shareFetchErrorResponse(req_header, resp_header_version, api_version, ErrorCode.invalid_request, "malformed ShareFetch request");
         }
 
         var pos = body_start;
         var req = Req.deserialize(self.allocator, request_bytes, &pos, api_version) catch |err| {
             log.warn("Failed to decode denied ShareFetch request: {}", .{err});
-            const resp = Resp{
-                .throttle_time_ms = 0,
-                .error_code = ErrorCode.invalid_request.toInt(),
-                .error_message = "malformed ShareFetch request",
-                .responses = &.{},
-                .node_endpoints = &.{},
-            };
-            return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+            return self.shareFetchErrorResponse(req_header, resp_header_version, api_version, ErrorCode.invalid_request, "malformed ShareFetch request");
         };
         defer self.freeShareFetchRequest(&req);
 
+        const Resp = generated.share_fetch_response.ShareFetchResponse;
         const resp = Resp{
             .throttle_time_ms = 0,
             .error_code = @intFromEnum(err_code),
             .error_message = "Not authorized",
+            .responses = &.{},
+            .node_endpoints = &.{},
+        };
+        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version) orelse {
+            log.warn("ShareFetch denied response serialization failed", .{});
+            return self.shareFetchErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error, "Failed to serialize ShareFetch authorization response");
+        };
+    }
+
+    fn shareFetchErrorResponse(self: *Broker, req_header: *const RequestHeader, resp_header_version: i16, api_version: i16, err_code: ErrorCode, message: ?[]const u8) ?[]u8 {
+        const Resp = generated.share_fetch_response.ShareFetchResponse;
+        const resp = Resp{
+            .throttle_time_ms = 0,
+            .error_code = err_code.toInt(),
+            .error_message = message,
             .responses = &.{},
             .node_endpoints = &.{},
         };
@@ -9959,38 +9976,39 @@ pub const Broker = struct {
         err_code: ErrorCode,
     ) ?[]u8 {
         const Req = generated.share_acknowledge_request.ShareAcknowledgeRequest;
-        const Resp = generated.share_acknowledge_response.ShareAcknowledgeResponse;
 
         if (!validateShareAcknowledgeRequestFrame(request_bytes, body_start)) {
             log.warn("Malformed denied ShareAcknowledge request", .{});
-            const resp = Resp{
-                .throttle_time_ms = 0,
-                .error_code = ErrorCode.invalid_request.toInt(),
-                .error_message = "malformed ShareAcknowledge request",
-                .responses = &.{},
-                .node_endpoints = &.{},
-            };
-            return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+            return self.shareAcknowledgeErrorResponse(req_header, resp_header_version, api_version, ErrorCode.invalid_request, "malformed ShareAcknowledge request");
         }
 
         var pos = body_start;
         var req = Req.deserialize(self.allocator, request_bytes, &pos, api_version) catch |err| {
             log.warn("Failed to decode denied ShareAcknowledge request: {}", .{err});
-            const resp = Resp{
-                .throttle_time_ms = 0,
-                .error_code = ErrorCode.invalid_request.toInt(),
-                .error_message = "malformed ShareAcknowledge request",
-                .responses = &.{},
-                .node_endpoints = &.{},
-            };
-            return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+            return self.shareAcknowledgeErrorResponse(req_header, resp_header_version, api_version, ErrorCode.invalid_request, "malformed ShareAcknowledge request");
         };
         defer self.freeShareAcknowledgeRequest(&req);
 
+        const Resp = generated.share_acknowledge_response.ShareAcknowledgeResponse;
         const resp = Resp{
             .throttle_time_ms = 0,
             .error_code = @intFromEnum(err_code),
             .error_message = "Not authorized",
+            .responses = &.{},
+            .node_endpoints = &.{},
+        };
+        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version) orelse {
+            log.warn("ShareAcknowledge denied response serialization failed", .{});
+            return self.shareAcknowledgeErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error, "Failed to serialize ShareAcknowledge authorization response");
+        };
+    }
+
+    fn shareAcknowledgeErrorResponse(self: *Broker, req_header: *const RequestHeader, resp_header_version: i16, api_version: i16, err_code: ErrorCode, message: ?[]const u8) ?[]u8 {
+        const Resp = generated.share_acknowledge_response.ShareAcknowledgeResponse;
+        const resp = Resp{
+            .throttle_time_ms = 0,
+            .error_code = err_code.toInt(),
+            .error_message = message,
             .responses = &.{},
             .node_endpoints = &.{},
         };
@@ -60625,6 +60643,128 @@ test "Broker.handleRequest share group APIs authorization denial uses generated 
     try testing.expectEqualStrings("Not authorized", ack_resp.error_message.?);
     try testing.expectEqual(@as(usize, 0), ack_resp.responses.len);
     try testing.expectEqual(@as(usize, 0), ack_resp.node_endpoints.len);
+}
+
+test "Broker.handleRequest group and share session authorization denial fails closed when serialization fails" {
+    const ConsumerHeartbeatReq = generated.consumer_group_heartbeat_request.ConsumerGroupHeartbeatRequest;
+    const ConsumerHeartbeatResp = generated.consumer_group_heartbeat_response.ConsumerGroupHeartbeatResponse;
+    const ShareHeartbeatReq = generated.share_group_heartbeat_request.ShareGroupHeartbeatRequest;
+    const ShareHeartbeatResp = generated.share_group_heartbeat_response.ShareGroupHeartbeatResponse;
+    const FetchReq = generated.share_fetch_request.ShareFetchRequest;
+    const FetchResp = generated.share_fetch_response.ShareFetchResponse;
+    const AckReq = generated.share_acknowledge_request.ShareAcknowledgeRequest;
+    const AckResp = generated.share_acknowledge_response.ShareAcknowledgeResponse;
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+    try broker.authorizer.addAcl("other-client", .group, "*", .literal, .read, .allow, "*");
+
+    {
+        const req = ConsumerHeartbeatReq{
+            .group_id = "consumer-auth-fail-group",
+            .member_id = "consumer-auth-fail-member",
+            .member_epoch = 3,
+            .rebalance_timeout_ms = -1,
+        };
+        var buf: [256]u8 = undefined;
+        var pos = buildTestRequest(&buf, 68, 0, 6810, header_mod.requestHeaderVersion(68, 0));
+        req.serialize(&buf, &pos, 0);
+
+        var failing_allocator = OneShotFailingAllocator.init(testing.allocator, 0);
+        const response_allocator = failing_allocator.allocator();
+        broker.allocator = response_allocator;
+
+        const response = broker.handleRequest(buf[0..pos]);
+        broker.allocator = testing.allocator;
+
+        try testing.expect(failing_allocator.failed);
+        try testing.expect(response != null);
+        defer response_allocator.free(response.?);
+
+        const error_code = try readGeneratedTopLevelErrorCode(ConsumerHeartbeatResp, response.?, 68, 0, 6810);
+        try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.kafka_storage_error)), error_code);
+    }
+
+    {
+        const req = ShareHeartbeatReq{
+            .group_id = "share-heartbeat-auth-fail-group",
+            .member_id = "share-heartbeat-auth-fail-member",
+            .member_epoch = 3,
+        };
+        var buf: [256]u8 = undefined;
+        var pos = buildTestRequest(&buf, 76, 0, 7610, header_mod.requestHeaderVersion(76, 0));
+        req.serialize(&buf, &pos, 0);
+
+        var failing_allocator = OneShotFailingAllocator.init(testing.allocator, 0);
+        const response_allocator = failing_allocator.allocator();
+        broker.allocator = response_allocator;
+
+        const response = broker.handleRequest(buf[0..pos]);
+        broker.allocator = testing.allocator;
+
+        try testing.expect(failing_allocator.failed);
+        try testing.expect(response != null);
+        defer response_allocator.free(response.?);
+
+        const error_code = try readGeneratedTopLevelErrorCode(ShareHeartbeatResp, response.?, 76, 0, 7610);
+        try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.kafka_storage_error)), error_code);
+    }
+
+    {
+        const req = FetchReq{
+            .group_id = "share-fetch-auth-fail-group",
+            .member_id = "share-fetch-auth-fail-member",
+            .share_session_epoch = 0,
+            .max_wait_ms = 1,
+            .min_bytes = 0,
+            .max_bytes = 1024,
+            .topics = &.{},
+            .forgotten_topics_data = &.{},
+        };
+        var buf: [256]u8 = undefined;
+        var pos = buildTestRequest(&buf, 78, 0, 7810, header_mod.requestHeaderVersion(78, 0));
+        req.serialize(&buf, &pos, 0);
+
+        var failing_allocator = OneShotFailingAllocator.init(testing.allocator, 0);
+        const response_allocator = failing_allocator.allocator();
+        broker.allocator = response_allocator;
+
+        const response = broker.handleRequest(buf[0..pos]);
+        broker.allocator = testing.allocator;
+
+        try testing.expect(failing_allocator.failed);
+        try testing.expect(response != null);
+        defer response_allocator.free(response.?);
+
+        const error_code = try readGeneratedTopLevelErrorCode(FetchResp, response.?, 78, 0, 7810);
+        try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.kafka_storage_error)), error_code);
+    }
+
+    {
+        const req = AckReq{
+            .group_id = "share-ack-auth-fail-group",
+            .member_id = "share-ack-auth-fail-member",
+            .share_session_epoch = 1,
+            .topics = &.{},
+        };
+        var buf: [256]u8 = undefined;
+        var pos = buildTestRequest(&buf, 79, 0, 7910, header_mod.requestHeaderVersion(79, 0));
+        req.serialize(&buf, &pos, 0);
+
+        var failing_allocator = OneShotFailingAllocator.init(testing.allocator, 0);
+        const response_allocator = failing_allocator.allocator();
+        broker.allocator = response_allocator;
+
+        const response = broker.handleRequest(buf[0..pos]);
+        broker.allocator = testing.allocator;
+
+        try testing.expect(failing_allocator.failed);
+        try testing.expect(response != null);
+        defer response_allocator.free(response.?);
+
+        const error_code = try readGeneratedTopLevelErrorCode(AckResp, response.?, 79, 0, 7910);
+        try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.kafka_storage_error)), error_code);
+    }
 }
 
 test "Broker.handleRequest ShareFetch opens local session and fetches records" {
