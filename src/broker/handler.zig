@@ -24358,20 +24358,26 @@ pub const Broker = struct {
 
         if (!validateListTransactionsRequestFrame(request_bytes, body_start, api_version)) {
             log.warn("Malformed ListTransactions request", .{});
-            return null;
+            return self.listTransactionsErrorResponse(req_header, resp_header_version, api_version, ErrorCode.invalid_request);
         }
 
         var pos = body_start;
         var req = Req.deserialize(self.allocator, request_bytes, &pos, api_version) catch |err| {
             log.warn("Failed to decode ListTransactions request: {}", .{err});
-            return null;
+            return self.listTransactionsErrorResponse(req_header, resp_header_version, api_version, ErrorCode.invalid_request);
         };
         defer self.freeListTransactionsRequest(&req);
 
-        const unknown_state_filters = self.collectUnknownTransactionStateFilters(req.state_filters) catch return null;
+        const unknown_state_filters = self.collectUnknownTransactionStateFilters(req.state_filters) catch |err| {
+            log.warn("ListTransactions unknown state filter materialization failed: {}", .{err});
+            return self.listTransactionsErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error);
+        };
         defer if (unknown_state_filters.len > 0) self.allocator.free(unknown_state_filters);
 
-        const transaction_states = self.collectListedTransactions(req) catch return null;
+        const transaction_states = self.collectListedTransactions(req) catch |err| {
+            log.warn("ListTransactions state materialization failed: {}", .{err});
+            return self.listTransactionsErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error);
+        };
         defer if (transaction_states.len > 0) self.allocator.free(transaction_states);
 
         const resp = Resp{
@@ -24379,6 +24385,17 @@ pub const Broker = struct {
             .error_code = @intFromEnum(ErrorCode.none),
             .unknown_state_filters = unknown_state_filters,
             .transaction_states = transaction_states,
+        };
+        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+    }
+
+    fn listTransactionsErrorResponse(self: *Broker, req_header: *const RequestHeader, resp_header_version: i16, api_version: i16, err_code: ErrorCode) ?[]u8 {
+        const Resp = generated.list_transactions_response.ListTransactionsResponse;
+        const resp = Resp{
+            .throttle_time_ms = 0,
+            .error_code = @intFromEnum(err_code),
+            .unknown_state_filters = &.{},
+            .transaction_states = &.{},
         };
         return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
     }
@@ -34023,16 +34040,32 @@ test "Broker.handleRequest ListTransactions v1 filters transaction state and pro
 }
 
 test "Broker.handleRequest ListTransactions rejects truncated request" {
+    const Resp = generated.list_transactions_response.ListTransactionsResponse;
+
     var broker = Broker.init(testing.allocator, 1, 9092);
     defer broker.deinit();
 
     var buf: [128]u8 = undefined;
     const req_len = buildTestRequest(&buf, 66, 1, 6602, header_mod.requestHeaderVersion(66, 1));
-    try testing.expect(broker.handleRequest(buf[0..req_len]) == null);
+    const response = broker.handleRequest(buf[0..req_len]);
+    try testing.expect(response != null);
+    defer testing.allocator.free(response.?);
+
+    var rpos: usize = 0;
+    var response_header = try ResponseHeader.deserialize(testing.allocator, response.?, &rpos, header_mod.responseHeaderVersion(66, 1));
+    defer response_header.deinit(testing.allocator);
+    try testing.expectEqual(@as(i32, 6602), response_header.correlation_id);
+
+    const resp = try Resp.deserialize(testing.allocator, response.?, &rpos, 1);
+    try testing.expectEqual(response.?.len, rpos);
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.invalid_request)), resp.error_code);
+    try testing.expectEqual(@as(usize, 0), resp.unknown_state_filters.len);
+    try testing.expectEqual(@as(usize, 0), resp.transaction_states.len);
 }
 
 test "Broker.handleRequest ListTransactions rejects trailing bytes" {
     const Req = generated.list_transactions_request.ListTransactionsRequest;
+    const Resp = generated.list_transactions_response.ListTransactionsResponse;
 
     var broker = Broker.init(testing.allocator, 1, 9092);
     defer broker.deinit();
@@ -34049,7 +34082,48 @@ test "Broker.handleRequest ListTransactions rejects trailing bytes" {
     var pos = buildTestRequest(&buf, 66, 1, 6604, header_mod.requestHeaderVersion(66, 1));
     req.serialize(&buf, &pos, 1);
 
-    try expectTrailingByteRejected(&broker, &buf, pos);
+    try expectTrailingByteRejectedWithGeneratedResponse(Resp, &broker, &buf, pos, 66, 1, 6604);
+}
+
+test "Broker.handleRequest ListTransactions fails closed when unknown-state materialization fails" {
+    const Req = generated.list_transactions_request.ListTransactionsRequest;
+    const Resp = generated.list_transactions_response.ListTransactionsResponse;
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+
+    const state_filters = [_]?[]const u8{"BogusTxnState"};
+    const req = Req{
+        .state_filters = &state_filters,
+        .producer_id_filters = &.{},
+        .duration_filter = -1,
+    };
+
+    var buf: [256]u8 = undefined;
+    var pos = buildTestRequest(&buf, 66, 1, 6605, header_mod.requestHeaderVersion(66, 1));
+    req.serialize(&buf, &pos, 1);
+
+    var failing_allocator = OneShotFailingAllocator.init(testing.allocator, 1);
+    const response_allocator = failing_allocator.allocator();
+    broker.allocator = response_allocator;
+
+    const response = broker.handleRequest(buf[0..pos]);
+    broker.allocator = testing.allocator;
+
+    try testing.expect(failing_allocator.failed);
+    try testing.expect(response != null);
+    defer response_allocator.free(response.?);
+
+    var rpos: usize = 0;
+    var response_header = try ResponseHeader.deserialize(testing.allocator, response.?, &rpos, header_mod.responseHeaderVersion(66, 1));
+    defer response_header.deinit(testing.allocator);
+    try testing.expectEqual(@as(i32, 6605), response_header.correlation_id);
+
+    const resp = try Resp.deserialize(testing.allocator, response.?, &rpos, 1);
+    try testing.expectEqual(response.?.len, rpos);
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.kafka_storage_error)), resp.error_code);
+    try testing.expectEqual(@as(usize, 0), resp.unknown_state_filters.len);
+    try testing.expectEqual(@as(usize, 0), resp.transaction_states.len);
 }
 
 test "Broker.handleRequest ListTransactions authorization denial uses generated response" {
