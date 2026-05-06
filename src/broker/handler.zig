@@ -7523,19 +7523,22 @@ pub const Broker = struct {
 
         if (!validateCreatePartitionsRequestFrame(request_bytes, body_start, api_version)) {
             log.warn("Malformed denied CreatePartitions request", .{});
-            return null;
+            return self.createPartitionsErrorResponse(req_header, resp_header_version, api_version, ErrorCode.invalid_request, "Invalid request");
         }
 
         var pos = body_start;
         var req = Req.deserialize(self.allocator, request_bytes, &pos, api_version) catch |err| {
             log.warn("Failed to decode denied CreatePartitions request: {}", .{err});
-            return null;
+            return self.createPartitionsErrorResponse(req_header, resp_header_version, api_version, ErrorCode.invalid_request, "Invalid request");
         };
         defer self.freeCreatePartitionsRequest(&req);
 
         var results: []TopicResult = &.{};
         if (req.topics.len > 0) {
-            results = self.allocator.alloc(TopicResult, req.topics.len) catch return null;
+            results = self.allocator.alloc(TopicResult, req.topics.len) catch |err| {
+                log.warn("CreatePartitions denied response materialization failed: {}", .{err});
+                return self.createPartitionsErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error, "Failed to materialize CreatePartitions authorization response");
+            };
         }
         defer if (results.len > 0) self.allocator.free(results);
 
@@ -7550,6 +7553,24 @@ pub const Broker = struct {
         const resp = Resp{
             .throttle_time_ms = 0,
             .results = results,
+        };
+        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version) orelse {
+            log.warn("CreatePartitions denied response serialization failed", .{});
+            return self.createPartitionsErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error, "Failed to serialize CreatePartitions authorization response");
+        };
+    }
+
+    fn createPartitionsErrorResponse(self: *Broker, req_header: *const RequestHeader, resp_header_version: i16, api_version: i16, err_code: ErrorCode, message: ?[]const u8) ?[]u8 {
+        const Resp = generated.create_partitions_response.CreatePartitionsResponse;
+        const TopicResult = Resp.CreatePartitionsTopicResult;
+        const results = [_]TopicResult{.{
+            .name = null,
+            .error_code = @intFromEnum(err_code),
+            .error_message = message,
+        }};
+        const resp = Resp{
+            .throttle_time_ms = 0,
+            .results = &results,
         };
         return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
     }
@@ -7890,19 +7911,22 @@ pub const Broker = struct {
 
         if (!validateIncrementalAlterConfigsRequestFrame(request_bytes, body_start, api_version)) {
             log.warn("Malformed denied IncrementalAlterConfigs request", .{});
-            return null;
+            return self.incrementalAlterConfigsErrorResponse(req_header, resp_header_version, api_version, ErrorCode.invalid_request, "Invalid request");
         }
 
         var pos = body_start;
         var req = Req.deserialize(self.allocator, request_bytes, &pos, api_version) catch |err| {
             log.warn("Failed to decode denied IncrementalAlterConfigs request: {}", .{err});
-            return null;
+            return self.incrementalAlterConfigsErrorResponse(req_header, resp_header_version, api_version, ErrorCode.invalid_request, "Invalid request");
         };
         defer self.freeIncrementalAlterConfigsRequest(&req);
 
         var responses: []ResourceResponse = &.{};
         if (req.resources.len > 0) {
-            responses = self.allocator.alloc(ResourceResponse, req.resources.len) catch return null;
+            responses = self.allocator.alloc(ResourceResponse, req.resources.len) catch |err| {
+                log.warn("IncrementalAlterConfigs denied response materialization failed: {}", .{err});
+                return self.incrementalAlterConfigsErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error, "Failed to materialize IncrementalAlterConfigs authorization response");
+            };
         }
         defer if (responses.len > 0) self.allocator.free(responses);
 
@@ -7918,6 +7942,25 @@ pub const Broker = struct {
         const resp = Resp{
             .throttle_time_ms = 0,
             .responses = responses,
+        };
+        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version) orelse {
+            log.warn("IncrementalAlterConfigs denied response serialization failed", .{});
+            return self.incrementalAlterConfigsErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error, "Failed to serialize IncrementalAlterConfigs authorization response");
+        };
+    }
+
+    fn incrementalAlterConfigsErrorResponse(self: *Broker, req_header: *const RequestHeader, resp_header_version: i16, api_version: i16, err_code: ErrorCode, message: ?[]const u8) ?[]u8 {
+        const Resp = generated.incremental_alter_configs_response.IncrementalAlterConfigsResponse;
+        const ResourceResponse = Resp.AlterConfigsResourceResponse;
+        const responses = [_]ResourceResponse{.{
+            .error_code = @intFromEnum(err_code),
+            .error_message = message,
+            .resource_type = 0,
+            .resource_name = null,
+        }};
+        const resp = Resp{
+            .throttle_time_ms = 0,
+            .responses = &responses,
         };
         return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
     }
@@ -37590,6 +37633,123 @@ test "Broker.handleRequest CreatePartitions authorization denial uses generated 
     try testing.expect(!broker.store.partitions.contains("create-partitions-denied-topic-1"));
 }
 
+test "Broker.handleRequest CreatePartitions authorization denial rejects malformed request" {
+    const Resp = generated.create_partitions_response.CreatePartitionsResponse;
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+    try broker.authorizer.addAcl("other-client", .cluster, "*", .literal, .create, .allow, "*");
+
+    var buf: [128]u8 = undefined;
+    const req_len = buildTestRequest(&buf, 37, 2, 3713, header_mod.requestHeaderVersion(37, 2));
+
+    const response = broker.handleRequest(buf[0..req_len]);
+    try testing.expect(response != null);
+    defer testing.allocator.free(response.?);
+
+    var rpos: usize = 0;
+    var response_header = try ResponseHeader.deserialize(testing.allocator, response.?, &rpos, header_mod.responseHeaderVersion(37, 2));
+    defer response_header.deinit(testing.allocator);
+    try testing.expectEqual(@as(i32, 3713), response_header.correlation_id);
+
+    const resp = try Resp.deserialize(testing.allocator, response.?, &rpos, 2);
+    defer if (resp.results.len > 0) testing.allocator.free(resp.results);
+
+    try testing.expectEqual(response.?.len, rpos);
+    try testing.expectEqual(@as(usize, 1), resp.results.len);
+    try testing.expect(resp.results[0].name == null);
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.invalid_request)), resp.results[0].error_code);
+}
+
+test "Broker.handleRequest CreatePartitions authorization denial fails closed when response materialization fails" {
+    const Req = generated.create_partitions_request.CreatePartitionsRequest;
+    const Resp = generated.create_partitions_response.CreatePartitionsResponse;
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+    try broker.authorizer.addAcl("other-client", .cluster, "*", .literal, .create, .allow, "*");
+
+    const topics = [_]Req.CreatePartitionsTopic{.{
+        .name = "create-partitions-denied-materialize-fail",
+        .count = 2,
+        .assignments = null,
+    }};
+    const req = Req{
+        .topics = &topics,
+        .timeout_ms = 30000,
+        .validate_only = false,
+    };
+
+    var buf: [256]u8 = undefined;
+    var pos = buildTestRequest(&buf, 37, 2, 3714, header_mod.requestHeaderVersion(37, 2));
+    req.serialize(&buf, &pos, 2);
+
+    var failing_allocator = OneShotFailingAllocator.init(testing.allocator, 1);
+    const response_allocator = failing_allocator.allocator();
+    broker.allocator = response_allocator;
+
+    const response = broker.handleRequest(buf[0..pos]);
+    broker.allocator = testing.allocator;
+
+    try testing.expect(failing_allocator.failed);
+    try testing.expect(response != null);
+    defer response_allocator.free(response.?);
+
+    var rpos: usize = 0;
+    var response_header = try ResponseHeader.deserialize(testing.allocator, response.?, &rpos, header_mod.responseHeaderVersion(37, 2));
+    defer response_header.deinit(testing.allocator);
+    try testing.expectEqual(@as(i32, 3714), response_header.correlation_id);
+
+    const resp = try Resp.deserialize(testing.allocator, response.?, &rpos, 2);
+    defer if (resp.results.len > 0) testing.allocator.free(resp.results);
+
+    try testing.expectEqual(response.?.len, rpos);
+    try testing.expectEqual(@as(usize, 1), resp.results.len);
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.kafka_storage_error)), resp.results[0].error_code);
+}
+
+test "Broker.handleRequest CreatePartitions authorization denial fails closed when serialization fails" {
+    const Req = generated.create_partitions_request.CreatePartitionsRequest;
+    const Resp = generated.create_partitions_response.CreatePartitionsResponse;
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+    try broker.authorizer.addAcl("other-client", .cluster, "*", .literal, .create, .allow, "*");
+
+    const req = Req{
+        .topics = &.{},
+        .timeout_ms = 30000,
+        .validate_only = false,
+    };
+
+    var buf: [128]u8 = undefined;
+    var pos = buildTestRequest(&buf, 37, 2, 3715, header_mod.requestHeaderVersion(37, 2));
+    req.serialize(&buf, &pos, 2);
+
+    var failing_allocator = OneShotFailingAllocator.init(testing.allocator, 0);
+    const response_allocator = failing_allocator.allocator();
+    broker.allocator = response_allocator;
+
+    const response = broker.handleRequest(buf[0..pos]);
+    broker.allocator = testing.allocator;
+
+    try testing.expect(failing_allocator.failed);
+    try testing.expect(response != null);
+    defer response_allocator.free(response.?);
+
+    var rpos: usize = 0;
+    var response_header = try ResponseHeader.deserialize(testing.allocator, response.?, &rpos, header_mod.responseHeaderVersion(37, 2));
+    defer response_header.deinit(testing.allocator);
+    try testing.expectEqual(@as(i32, 3715), response_header.correlation_id);
+
+    const resp = try Resp.deserialize(testing.allocator, response.?, &rpos, 2);
+    defer if (resp.results.len > 0) testing.allocator.free(resp.results);
+
+    try testing.expectEqual(response.?.len, rpos);
+    try testing.expectEqual(@as(usize, 1), resp.results.len);
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.kafka_storage_error)), resp.results[0].error_code);
+}
+
 test "Broker.handleRequest CreatePartitions rejects explicit empty assignments" {
     const Req = generated.create_partitions_request.CreatePartitionsRequest;
     const Resp = generated.create_partitions_response.CreatePartitionsResponse;
@@ -38909,6 +39069,121 @@ test "Broker.handleRequest IncrementalAlterConfigs authorization denial uses gen
     try testing.expectEqual(@as(i8, 2), resp.responses[0].resource_type);
     try testing.expectEqualStrings("inc-cfg-denied-topic", resp.responses[0].resource_name.?);
     try testing.expectEqual(before, broker.topics.get("inc-cfg-denied-topic").?.config.retention_ms);
+}
+
+test "Broker.handleRequest IncrementalAlterConfigs authorization denial rejects malformed request" {
+    const Resp = generated.incremental_alter_configs_response.IncrementalAlterConfigsResponse;
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+    try broker.authorizer.addAcl("other-client", .cluster, "*", .literal, .alter, .allow, "*");
+
+    var buf: [128]u8 = undefined;
+    const req_len = buildTestRequest(&buf, 44, 1, 4415, header_mod.requestHeaderVersion(44, 1));
+
+    const response = broker.handleRequest(buf[0..req_len]);
+    try testing.expect(response != null);
+    defer testing.allocator.free(response.?);
+
+    var rpos: usize = 0;
+    var response_header = try ResponseHeader.deserialize(testing.allocator, response.?, &rpos, header_mod.responseHeaderVersion(44, 1));
+    defer response_header.deinit(testing.allocator);
+    try testing.expectEqual(@as(i32, 4415), response_header.correlation_id);
+
+    const resp = try Resp.deserialize(testing.allocator, response.?, &rpos, 1);
+    defer if (resp.responses.len > 0) testing.allocator.free(resp.responses);
+
+    try testing.expectEqual(response.?.len, rpos);
+    try testing.expectEqual(@as(usize, 1), resp.responses.len);
+    try testing.expect(resp.responses[0].resource_name == null);
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.invalid_request)), resp.responses[0].error_code);
+}
+
+test "Broker.handleRequest IncrementalAlterConfigs authorization denial fails closed when response materialization fails" {
+    const Req = generated.incremental_alter_configs_request.IncrementalAlterConfigsRequest;
+    const Resp = generated.incremental_alter_configs_response.IncrementalAlterConfigsResponse;
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+    try broker.authorizer.addAcl("other-client", .cluster, "*", .literal, .alter, .allow, "*");
+
+    const resources = [_]Req.AlterConfigsResource{.{
+        .resource_type = 2,
+        .resource_name = "inc-cfg-denied-materialize-fail",
+        .configs = &.{},
+    }};
+    const req = Req{
+        .resources = &resources,
+        .validate_only = false,
+    };
+
+    var buf: [256]u8 = undefined;
+    var pos = buildTestRequest(&buf, 44, 1, 4416, header_mod.requestHeaderVersion(44, 1));
+    req.serialize(&buf, &pos, 1);
+
+    var failing_allocator = OneShotFailingAllocator.init(testing.allocator, 1);
+    const response_allocator = failing_allocator.allocator();
+    broker.allocator = response_allocator;
+
+    const response = broker.handleRequest(buf[0..pos]);
+    broker.allocator = testing.allocator;
+
+    try testing.expect(failing_allocator.failed);
+    try testing.expect(response != null);
+    defer response_allocator.free(response.?);
+
+    var rpos: usize = 0;
+    var response_header = try ResponseHeader.deserialize(testing.allocator, response.?, &rpos, header_mod.responseHeaderVersion(44, 1));
+    defer response_header.deinit(testing.allocator);
+    try testing.expectEqual(@as(i32, 4416), response_header.correlation_id);
+
+    const resp = try Resp.deserialize(testing.allocator, response.?, &rpos, 1);
+    defer if (resp.responses.len > 0) testing.allocator.free(resp.responses);
+
+    try testing.expectEqual(response.?.len, rpos);
+    try testing.expectEqual(@as(usize, 1), resp.responses.len);
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.kafka_storage_error)), resp.responses[0].error_code);
+}
+
+test "Broker.handleRequest IncrementalAlterConfigs authorization denial fails closed when serialization fails" {
+    const Req = generated.incremental_alter_configs_request.IncrementalAlterConfigsRequest;
+    const Resp = generated.incremental_alter_configs_response.IncrementalAlterConfigsResponse;
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+    try broker.authorizer.addAcl("other-client", .cluster, "*", .literal, .alter, .allow, "*");
+
+    const req = Req{
+        .resources = &.{},
+        .validate_only = false,
+    };
+
+    var buf: [128]u8 = undefined;
+    var pos = buildTestRequest(&buf, 44, 1, 4417, header_mod.requestHeaderVersion(44, 1));
+    req.serialize(&buf, &pos, 1);
+
+    var failing_allocator = OneShotFailingAllocator.init(testing.allocator, 0);
+    const response_allocator = failing_allocator.allocator();
+    broker.allocator = response_allocator;
+
+    const response = broker.handleRequest(buf[0..pos]);
+    broker.allocator = testing.allocator;
+
+    try testing.expect(failing_allocator.failed);
+    try testing.expect(response != null);
+    defer response_allocator.free(response.?);
+
+    var rpos: usize = 0;
+    var response_header = try ResponseHeader.deserialize(testing.allocator, response.?, &rpos, header_mod.responseHeaderVersion(44, 1));
+    defer response_header.deinit(testing.allocator);
+    try testing.expectEqual(@as(i32, 4417), response_header.correlation_id);
+
+    const resp = try Resp.deserialize(testing.allocator, response.?, &rpos, 1);
+    defer if (resp.responses.len > 0) testing.allocator.free(resp.responses);
+
+    try testing.expectEqual(response.?.len, rpos);
+    try testing.expectEqual(@as(usize, 1), resp.responses.len);
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.kafka_storage_error)), resp.responses[0].error_code);
 }
 
 test "Broker.handleRequest IncrementalAlterConfigs validate_only does not mutate" {

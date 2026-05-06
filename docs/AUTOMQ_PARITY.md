@@ -638,6 +638,9 @@ Status: completed for the initial catalog and DeleteGroups slice.
   DescribeLogDirs and ElectLeaders authorization-denial builders now also
   return generated invalid-request or storage-error responses when denied
   frames are malformed or denial response materialization/serialization fails.
+  CreatePartitions and IncrementalAlterConfigs authorization-denial builders
+  now do the same, using generated per-resource error entries when the denied
+  request cannot be trusted or the denial response cannot be built.
   ListClientMetricsResources now advertises key 74 v0, decodes generated
   flexible requests, rejects malformed frames, returns a default generated
   resource, and lists active client resources for retained telemetry samples.
