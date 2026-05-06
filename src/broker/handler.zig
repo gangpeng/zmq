@@ -11449,7 +11449,15 @@ pub const Broker = struct {
             .throttle_time_ms = 0,
             .put_kv_responses = &.{},
         };
-        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version) orelse {
+            log.warn("PutKVs error response serialization failed", .{});
+            const storage_resp = Resp{
+                .error_code = ErrorCode.kafka_storage_error.toInt(),
+                .throttle_time_ms = 0,
+                .put_kv_responses = &.{},
+            };
+            return self.serializeGeneratedResponse(req_header, resp_header_version, &storage_resp, api_version);
+        };
     }
 
     fn handleDeleteKVsAuthorizationError(
@@ -11495,7 +11503,15 @@ pub const Broker = struct {
             .throttle_time_ms = 0,
             .delete_kv_responses = &.{},
         };
-        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version) orelse {
+            log.warn("DeleteKVs error response serialization failed", .{});
+            const storage_resp = Resp{
+                .error_code = ErrorCode.kafka_storage_error.toInt(),
+                .throttle_time_ms = 0,
+                .delete_kv_responses = &.{},
+            };
+            return self.serializeGeneratedResponse(req_header, resp_header_version, &storage_resp, api_version);
+        };
     }
 
     fn handleAutomqRegisterNodeAuthorizationError(
@@ -22616,7 +22632,6 @@ pub const Broker = struct {
             log.warn("PutKVs response materialization failed: {}", .{err});
             return self.putKVsErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error);
         };
-        var response_error: i16 = 0;
         var previous_snapshot: ?MetadataPersistence.AutoMqMetadataSnapshot = null;
         defer if (previous_snapshot) |*snapshot| self.persistence.freeAutoMqMetadataSnapshot(snapshot);
         if (self.raft_state == null) {
@@ -22682,25 +22697,34 @@ pub const Broker = struct {
                 mutated = true;
             }
         }
+        const resp = Resp{ .error_code = 0, .throttle_time_ms = 0, .put_kv_responses = responses };
+        const success_response = self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version) orelse {
+            log.warn("PutKVs response serialization failed before durable mutation", .{});
+            if (mutated) {
+                if (previous_snapshot) |snapshot| self.restoreAutoMqMetadataAfterFailedMutation(snapshot);
+            }
+            return self.putKVsErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error);
+        };
         if (mutated) {
             self.persistAutoMqMetadataAfterMutation() catch |err| {
                 log.warn("PutKVs AutoMQ metadata snapshot write failed: {}", .{err});
+                self.allocator.free(success_response);
                 if (previous_snapshot) |snapshot| self.restoreAutoMqMetadataAfterFailedMutation(snapshot);
-                response_error = errorCode(.kafka_storage_error);
                 for (responses) |*response| {
                     if (response.error_code == 0) {
                         response.error_code = errorCode(.kafka_storage_error);
                         response.value = null;
                     }
                 }
+                const err_resp = Resp{ .error_code = errorCode(.kafka_storage_error), .throttle_time_ms = 0, .put_kv_responses = responses };
+                return self.serializeGeneratedResponse(req_header, resp_header_version, &err_resp, api_version) orelse {
+                    log.warn("PutKVs persistence-error response serialization failed", .{});
+                    return self.putKVsErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error);
+                };
             };
         }
 
-        const resp = Resp{ .error_code = response_error, .throttle_time_ms = 0, .put_kv_responses = responses };
-        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version) orelse {
-            log.warn("PutKVs response serialization failed", .{});
-            return self.putKVsErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error);
-        };
+        return success_response;
     }
 
     fn handleDeleteKVs(self: *Broker, request_bytes: []const u8, body_start: usize, req_header: *const RequestHeader, api_version: i16, resp_header_version: i16) ?[]u8 {
@@ -22723,7 +22747,6 @@ pub const Broker = struct {
             log.warn("DeleteKVs response materialization failed: {}", .{err});
             return self.deleteKVsErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error);
         };
-        var response_error: i16 = 0;
         var previous_snapshot: ?MetadataPersistence.AutoMqMetadataSnapshot = null;
         defer if (previous_snapshot) |*snapshot| self.persistence.freeAutoMqMetadataSnapshot(snapshot);
         if (self.raft_state == null) {
@@ -22758,25 +22781,34 @@ pub const Broker = struct {
                 responses[i] = .{ .error_code = errorCode(.resource_not_found), .value = null };
             }
         }
+        const resp = Resp{ .error_code = 0, .throttle_time_ms = 0, .delete_kv_responses = responses };
+        const success_response = self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version) orelse {
+            log.warn("DeleteKVs response serialization failed before durable mutation", .{});
+            if (mutated) {
+                if (previous_snapshot) |snapshot| self.restoreAutoMqMetadataAfterFailedMutation(snapshot);
+            }
+            return self.deleteKVsErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error);
+        };
         if (mutated) {
             self.persistAutoMqMetadataAfterMutation() catch |err| {
                 log.warn("DeleteKVs AutoMQ metadata snapshot write failed: {}", .{err});
+                self.allocator.free(success_response);
                 if (previous_snapshot) |snapshot| self.restoreAutoMqMetadataAfterFailedMutation(snapshot);
-                response_error = errorCode(.kafka_storage_error);
                 for (responses) |*response| {
                     if (response.error_code == 0) {
                         response.error_code = errorCode(.kafka_storage_error);
                         response.value = null;
                     }
                 }
+                const err_resp = Resp{ .error_code = errorCode(.kafka_storage_error), .throttle_time_ms = 0, .delete_kv_responses = responses };
+                return self.serializeGeneratedResponse(req_header, resp_header_version, &err_resp, api_version) orelse {
+                    log.warn("DeleteKVs persistence-error response serialization failed", .{});
+                    return self.deleteKVsErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error);
+                };
             };
         }
 
-        const resp = Resp{ .error_code = response_error, .throttle_time_ms = 0, .delete_kv_responses = responses };
-        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version) orelse {
-            log.warn("DeleteKVs response serialization failed", .{});
-            return self.deleteKVsErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error);
-        };
+        return success_response;
     }
 
     fn handleTrimStreams(self: *Broker, request_bytes: []const u8, body_start: usize, req_header: *const RequestHeader, api_version: i16, resp_header_version: i16) ?[]u8 {
@@ -53691,6 +53723,41 @@ test "Broker.handleRequest TrimStreams restores stream when success serializatio
     try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.kafka_storage_error)), error_code);
     try testing.expectEqual(@as(u64, 0), broker.object_manager.getStream(stream_id).?.start_offset);
     try testing.expectEqual(@as(u64, 10), broker.object_manager.getStream(stream_id).?.end_offset);
+}
+
+test "Broker.handleRequest AutoMQ KV mutations restore state when success serialization fails" {
+    {
+        const Req = generated.put_k_vs_request.PutKVsRequest;
+
+        var broker = Broker.init(testing.allocator, 1, 9092);
+        defer broker.deinit();
+
+        const items = [_]Req.PutKVRequest{.{ .key = "put-response-fail", .value = "new-value", .overwrite = true }};
+        const req = Req{ .put_kv_requests = &items };
+        var buf: [256]u8 = undefined;
+        var pos = buildTestRequest(&buf, 510, 0, 5112, header_mod.requestHeaderVersion(510, 0));
+        req.serialize(&buf, &pos, 0);
+
+        try expectAutoMqMutationErrorWithFailingAllocator(&broker, buf[0..pos], 510, 0, 5112, 4, ErrorCode.kafka_storage_error);
+        try testing.expect(!broker.auto_mq_kvs.contains("put-response-fail"));
+    }
+
+    {
+        const Req = generated.delete_k_vs_request.DeleteKVsRequest;
+
+        var broker = Broker.init(testing.allocator, 1, 9092);
+        defer broker.deinit();
+        try broker.putAutoMqKvFromRecord("delete-response-fail", "old-value");
+
+        const items = [_]Req.DeleteKVRequest{.{ .key = "delete-response-fail" }};
+        const req = Req{ .delete_kv_requests = &items };
+        var buf: [256]u8 = undefined;
+        var pos = buildTestRequest(&buf, 511, 0, 5121, header_mod.requestHeaderVersion(511, 0));
+        req.serialize(&buf, &pos, 0);
+
+        try expectAutoMqMutationErrorWithFailingAllocator(&broker, buf[0..pos], 511, 0, 5121, 4, ErrorCode.kafka_storage_error);
+        try testing.expectEqualStrings("old-value", broker.auto_mq_kvs.get("delete-response-fail").?);
+    }
 }
 
 test "Broker AutoMQ stream object lifecycle APIs" {

@@ -1004,6 +1004,8 @@ Status: completed for the initial catalog and DeleteGroups slice.
   PutKVs/DeleteKVs, AutomqRegisterNode, AutomqZoneRouter, UpdateLicense,
   GetNextNodeId, and AutomqUpdateGroup now use a durable AutoMQ metadata
   snapshot boundary and roll back visible metadata changes when that write
+  fails. PutKVs/DeleteKVs serialize completed responses before local metadata
+  persistence and restore the local metadata snapshot if response serialization
   fails. AutomqRegisterNode, AutomqZoneRouter, UpdateLicense, GetNextNodeId,
   and AutomqUpdateGroup materialize success frames before visible local
   metadata mutation, and these local metadata mutation paths also reserve
