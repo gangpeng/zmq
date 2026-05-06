@@ -18175,41 +18175,27 @@ pub const Broker = struct {
 
         if (!validateInitializeShareGroupStateRequestFrame(request_bytes, body_start)) {
             log.warn("Malformed InitializeShareGroupState request", .{});
-            const partitions = [_]Resp.InitializeStateResult.PartitionResult{.{
-                .partition = -1,
-                .error_code = ErrorCode.invalid_request.toInt(),
-                .error_message = "malformed InitializeShareGroupState request",
-            }};
-            const results = [_]Resp.InitializeStateResult{.{
-                .topic_id = [_]u8{0} ** 16,
-                .partitions = &partitions,
-            }};
-            const resp = Resp{ .results = &results };
-            return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+            return self.initializeShareGroupStateErrorResponse(req_header, resp_header_version, api_version, ErrorCode.invalid_request, "malformed InitializeShareGroupState request");
         }
 
         var pos = body_start;
         var req = Req.deserialize(self.allocator, request_bytes, &pos, api_version) catch |err| {
             log.warn("Failed to decode InitializeShareGroupState request: {}", .{err});
-            const partitions = [_]Resp.InitializeStateResult.PartitionResult{.{
-                .partition = -1,
-                .error_code = ErrorCode.invalid_request.toInt(),
-                .error_message = "malformed InitializeShareGroupState request",
-            }};
-            const results = [_]Resp.InitializeStateResult{.{
-                .topic_id = [_]u8{0} ** 16,
-                .partitions = &partitions,
-            }};
-            const resp = Resp{ .results = &results };
-            return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+            return self.initializeShareGroupStateErrorResponse(req_header, resp_header_version, api_version, ErrorCode.invalid_request, "malformed InitializeShareGroupState request");
         };
         defer self.freeInitializeShareGroupStateRequest(&req);
 
-        const results = self.buildInitializeShareGroupStateResults(req) catch return null;
+        const results = self.buildInitializeShareGroupStateResults(req) catch |err| {
+            log.warn("InitializeShareGroupState response materialization failed: {}", .{err});
+            return self.initializeShareGroupStateErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error, "Failed to materialize InitializeShareGroupState response");
+        };
         defer self.freeInitializeShareGroupStateResults(results);
 
         const resp = Resp{ .results = results };
-        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version) orelse {
+            log.warn("InitializeShareGroupState response serialization failed", .{});
+            return self.initializeShareGroupStateErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error, "Failed to serialize InitializeShareGroupState response");
+        };
     }
 
     fn buildInitializeShareGroupStateResults(
@@ -18293,47 +18279,27 @@ pub const Broker = struct {
 
         if (!validateReadShareGroupStateRequestFrame(request_bytes, body_start)) {
             log.warn("Malformed ReadShareGroupState request", .{});
-            const partitions = [_]Resp.ReadStateResult.PartitionResult{.{
-                .partition = -1,
-                .error_code = ErrorCode.invalid_request.toInt(),
-                .error_message = "malformed ReadShareGroupState request",
-                .state_epoch = 0,
-                .start_offset = -1,
-                .state_batches = &.{},
-            }};
-            const results = [_]Resp.ReadStateResult{.{
-                .topic_id = [_]u8{0} ** 16,
-                .partitions = &partitions,
-            }};
-            const resp = Resp{ .results = &results };
-            return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+            return self.readShareGroupStateErrorResponse(req_header, resp_header_version, api_version, ErrorCode.invalid_request, "malformed ReadShareGroupState request");
         }
 
         var pos = body_start;
         var req = Req.deserialize(self.allocator, request_bytes, &pos, api_version) catch |err| {
             log.warn("Failed to decode ReadShareGroupState request: {}", .{err});
-            const partitions = [_]Resp.ReadStateResult.PartitionResult{.{
-                .partition = -1,
-                .error_code = ErrorCode.invalid_request.toInt(),
-                .error_message = "malformed ReadShareGroupState request",
-                .state_epoch = 0,
-                .start_offset = -1,
-                .state_batches = &.{},
-            }};
-            const results = [_]Resp.ReadStateResult{.{
-                .topic_id = [_]u8{0} ** 16,
-                .partitions = &partitions,
-            }};
-            const resp = Resp{ .results = &results };
-            return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+            return self.readShareGroupStateErrorResponse(req_header, resp_header_version, api_version, ErrorCode.invalid_request, "malformed ReadShareGroupState request");
         };
         defer self.freeReadShareGroupStateRequest(&req);
 
-        const results = self.buildReadShareGroupStateResults(req) catch return null;
+        const results = self.buildReadShareGroupStateResults(req) catch |err| {
+            log.warn("ReadShareGroupState response materialization failed: {}", .{err});
+            return self.readShareGroupStateErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error, "Failed to materialize ReadShareGroupState response");
+        };
         defer self.freeReadShareGroupStateResults(results);
 
         const resp = Resp{ .results = results };
-        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version) orelse {
+            log.warn("ReadShareGroupState response serialization failed", .{});
+            return self.readShareGroupStateErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error, "Failed to serialize ReadShareGroupState response");
+        };
     }
 
     fn buildReadShareGroupStateResults(
@@ -18424,41 +18390,27 @@ pub const Broker = struct {
 
         if (!validateWriteShareGroupStateRequestFrame(request_bytes, body_start)) {
             log.warn("Malformed WriteShareGroupState request", .{});
-            const partitions = [_]Resp.WriteStateResult.PartitionResult{.{
-                .partition = -1,
-                .error_code = ErrorCode.invalid_request.toInt(),
-                .error_message = "malformed WriteShareGroupState request",
-            }};
-            const results = [_]Resp.WriteStateResult{.{
-                .topic_id = [_]u8{0} ** 16,
-                .partitions = &partitions,
-            }};
-            const resp = Resp{ .results = &results };
-            return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+            return self.writeShareGroupStateErrorResponse(req_header, resp_header_version, api_version, ErrorCode.invalid_request, "malformed WriteShareGroupState request");
         }
 
         var pos = body_start;
         var req = Req.deserialize(self.allocator, request_bytes, &pos, api_version) catch |err| {
             log.warn("Failed to decode WriteShareGroupState request: {}", .{err});
-            const partitions = [_]Resp.WriteStateResult.PartitionResult{.{
-                .partition = -1,
-                .error_code = ErrorCode.invalid_request.toInt(),
-                .error_message = "malformed WriteShareGroupState request",
-            }};
-            const results = [_]Resp.WriteStateResult{.{
-                .topic_id = [_]u8{0} ** 16,
-                .partitions = &partitions,
-            }};
-            const resp = Resp{ .results = &results };
-            return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+            return self.writeShareGroupStateErrorResponse(req_header, resp_header_version, api_version, ErrorCode.invalid_request, "malformed WriteShareGroupState request");
         };
         defer self.freeWriteShareGroupStateRequest(&req);
 
-        const results = self.buildWriteShareGroupStateResults(req) catch return null;
+        const results = self.buildWriteShareGroupStateResults(req) catch |err| {
+            log.warn("WriteShareGroupState response materialization failed: {}", .{err});
+            return self.writeShareGroupStateErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error, "Failed to materialize WriteShareGroupState response");
+        };
         defer self.freeWriteShareGroupStateResults(results);
 
         const resp = Resp{ .results = results };
-        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version) orelse {
+            log.warn("WriteShareGroupState response serialization failed", .{});
+            return self.writeShareGroupStateErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error, "Failed to serialize WriteShareGroupState response");
+        };
     }
 
     fn buildWriteShareGroupStateResults(
@@ -18559,41 +18511,27 @@ pub const Broker = struct {
 
         if (!validateDeleteShareGroupStateRequestFrame(request_bytes, body_start)) {
             log.warn("Malformed DeleteShareGroupState request", .{});
-            const partitions = [_]Resp.DeleteStateResult.PartitionResult{.{
-                .partition = -1,
-                .error_code = ErrorCode.invalid_request.toInt(),
-                .error_message = "malformed DeleteShareGroupState request",
-            }};
-            const results = [_]Resp.DeleteStateResult{.{
-                .topic_id = [_]u8{0} ** 16,
-                .partitions = &partitions,
-            }};
-            const resp = Resp{ .results = &results };
-            return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+            return self.deleteShareGroupStateErrorResponse(req_header, resp_header_version, api_version, ErrorCode.invalid_request, "malformed DeleteShareGroupState request");
         }
 
         var pos = body_start;
         var req = Req.deserialize(self.allocator, request_bytes, &pos, api_version) catch |err| {
             log.warn("Failed to decode DeleteShareGroupState request: {}", .{err});
-            const partitions = [_]Resp.DeleteStateResult.PartitionResult{.{
-                .partition = -1,
-                .error_code = ErrorCode.invalid_request.toInt(),
-                .error_message = "malformed DeleteShareGroupState request",
-            }};
-            const results = [_]Resp.DeleteStateResult{.{
-                .topic_id = [_]u8{0} ** 16,
-                .partitions = &partitions,
-            }};
-            const resp = Resp{ .results = &results };
-            return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+            return self.deleteShareGroupStateErrorResponse(req_header, resp_header_version, api_version, ErrorCode.invalid_request, "malformed DeleteShareGroupState request");
         };
         defer self.freeDeleteShareGroupStateRequest(&req);
 
-        const results = self.buildDeleteShareGroupStateResults(req) catch return null;
+        const results = self.buildDeleteShareGroupStateResults(req) catch |err| {
+            log.warn("DeleteShareGroupState response materialization failed: {}", .{err});
+            return self.deleteShareGroupStateErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error, "Failed to materialize DeleteShareGroupState response");
+        };
         defer self.freeDeleteShareGroupStateResults(results);
 
         const resp = Resp{ .results = results };
-        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version) orelse {
+            log.warn("DeleteShareGroupState response serialization failed", .{});
+            return self.deleteShareGroupStateErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error, "Failed to serialize DeleteShareGroupState response");
+        };
     }
 
     fn buildDeleteShareGroupStateResults(
@@ -18669,45 +18607,27 @@ pub const Broker = struct {
 
         if (!validateReadShareGroupStateSummaryRequestFrame(request_bytes, body_start)) {
             log.warn("Malformed ReadShareGroupStateSummary request", .{});
-            const partitions = [_]Resp.ReadStateSummaryResult.PartitionResult{.{
-                .partition = -1,
-                .error_code = ErrorCode.invalid_request.toInt(),
-                .error_message = "malformed ReadShareGroupStateSummary request",
-                .state_epoch = 0,
-                .start_offset = -1,
-            }};
-            const results = [_]Resp.ReadStateSummaryResult{.{
-                .topic_id = [_]u8{0} ** 16,
-                .partitions = &partitions,
-            }};
-            const resp = Resp{ .results = &results };
-            return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+            return self.readShareGroupStateSummaryErrorResponse(req_header, resp_header_version, api_version, ErrorCode.invalid_request, "malformed ReadShareGroupStateSummary request");
         }
 
         var pos = body_start;
         var req = Req.deserialize(self.allocator, request_bytes, &pos, api_version) catch |err| {
             log.warn("Failed to decode ReadShareGroupStateSummary request: {}", .{err});
-            const partitions = [_]Resp.ReadStateSummaryResult.PartitionResult{.{
-                .partition = -1,
-                .error_code = ErrorCode.invalid_request.toInt(),
-                .error_message = "malformed ReadShareGroupStateSummary request",
-                .state_epoch = 0,
-                .start_offset = -1,
-            }};
-            const results = [_]Resp.ReadStateSummaryResult{.{
-                .topic_id = [_]u8{0} ** 16,
-                .partitions = &partitions,
-            }};
-            const resp = Resp{ .results = &results };
-            return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+            return self.readShareGroupStateSummaryErrorResponse(req_header, resp_header_version, api_version, ErrorCode.invalid_request, "malformed ReadShareGroupStateSummary request");
         };
         defer self.freeReadShareGroupStateSummaryRequest(&req);
 
-        const results = self.buildReadShareGroupStateSummaryResults(req) catch return null;
+        const results = self.buildReadShareGroupStateSummaryResults(req) catch |err| {
+            log.warn("ReadShareGroupStateSummary response materialization failed: {}", .{err});
+            return self.readShareGroupStateSummaryErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error, "Failed to materialize ReadShareGroupStateSummary response");
+        };
         defer self.freeReadShareGroupStateSummaryResults(results);
 
         const resp = Resp{ .results = results };
-        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version) orelse {
+            log.warn("ReadShareGroupStateSummary response serialization failed", .{});
+            return self.readShareGroupStateSummaryErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error, "Failed to serialize ReadShareGroupStateSummary response");
+        };
     }
 
     fn buildReadShareGroupStateSummaryResults(
@@ -32347,6 +32267,33 @@ fn readShareStateAuthorizationErrorCode(response: []const u8, api_key: i16, corr
         },
         else => return error.UnsupportedApiKey,
     }
+}
+
+fn expectShareStateErrorResponseBytes(response: []const u8, api_key: i16, correlation_id: i32, err_code: ErrorCode) !void {
+    const error_code = try readShareStateAuthorizationErrorCode(response, api_key, correlation_id);
+    try testing.expectEqual(@as(i16, @intFromEnum(err_code)), error_code);
+}
+
+fn expectShareStateResponseWithFailingAllocator(
+    broker: *Broker,
+    request: []const u8,
+    api_key: i16,
+    correlation_id: i32,
+    fail_index: usize,
+    err_code: ErrorCode,
+) !void {
+    var failing_allocator = OneShotFailingAllocator.init(testing.allocator, fail_index);
+    const response_allocator = failing_allocator.allocator();
+    broker.allocator = response_allocator;
+
+    const response = broker.handleRequest(request);
+    broker.allocator = testing.allocator;
+
+    try testing.expect(failing_allocator.failed);
+    try testing.expect(response != null);
+    defer response_allocator.free(response.?);
+
+    try expectShareStateErrorResponseBytes(response.?, api_key, correlation_id, err_code);
 }
 
 fn expectShareStateAuthorizationDeniedWithFailingAllocator(
@@ -66901,6 +66848,153 @@ test "Broker.handleRequest ReadShareGroupStateSummary rejects malformed request"
     try testing.expectEqual(@as(usize, 1), resp.results[0].partitions.len);
     try testing.expectEqual(@as(i32, -1), resp.results[0].partitions[0].partition);
     try testing.expectEqual(ErrorCode.invalid_request.toInt(), resp.results[0].partitions[0].error_code);
+}
+
+test "Broker.handleRequest share state APIs fail closed when response materialization fails" {
+    const InitReq = generated.initialize_share_group_state_request.InitializeShareGroupStateRequest;
+    const ReadReq = generated.read_share_group_state_request.ReadShareGroupStateRequest;
+    const WriteReq = generated.write_share_group_state_request.WriteShareGroupStateRequest;
+    const DeleteReq = generated.delete_share_group_state_request.DeleteShareGroupStateRequest;
+    const SummaryReq = generated.read_share_group_state_summary_request.ReadShareGroupStateSummaryRequest;
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+
+    const topic_id = [_]u8{0x7c} ** 16;
+
+    {
+        const partitions = [_]InitReq.InitializeStateData.PartitionData{.{
+            .partition = 3,
+            .state_epoch = 1,
+            .start_offset = 9,
+        }};
+        const topics = [_]InitReq.InitializeStateData{.{
+            .topic_id = topic_id,
+            .partitions = &partitions,
+        }};
+        const req = InitReq{ .group_id = "share-init-materialize-fail-group", .topics = &topics };
+        var buf: [256]u8 = undefined;
+        var pos = buildTestRequest(&buf, 83, 0, 8311, header_mod.requestHeaderVersion(83, 0));
+        req.serialize(&buf, &pos, 0);
+        try expectShareStateResponseWithFailingAllocator(&broker, buf[0..pos], 83, 8311, 2, ErrorCode.kafka_storage_error);
+    }
+
+    {
+        const partitions = [_]ReadReq.ReadStateData.PartitionData{.{
+            .partition = 4,
+            .leader_epoch = 2,
+        }};
+        const topics = [_]ReadReq.ReadStateData{.{
+            .topic_id = topic_id,
+            .partitions = &partitions,
+        }};
+        const req = ReadReq{ .group_id = "share-read-materialize-fail-group", .topics = &topics };
+        var buf: [256]u8 = undefined;
+        var pos = buildTestRequest(&buf, 84, 0, 8411, header_mod.requestHeaderVersion(84, 0));
+        req.serialize(&buf, &pos, 0);
+        try expectShareStateResponseWithFailingAllocator(&broker, buf[0..pos], 84, 8411, 2, ErrorCode.kafka_storage_error);
+    }
+
+    {
+        const partitions = [_]WriteReq.WriteStateData.PartitionData{.{
+            .partition = 5,
+            .state_epoch = 2,
+            .leader_epoch = 2,
+            .start_offset = 11,
+            .state_batches = &.{},
+        }};
+        const topics = [_]WriteReq.WriteStateData{.{
+            .topic_id = topic_id,
+            .partitions = &partitions,
+        }};
+        const req = WriteReq{ .group_id = "share-write-materialize-fail-group", .topics = &topics };
+        var buf: [256]u8 = undefined;
+        var pos = buildTestRequest(&buf, 85, 0, 8511, header_mod.requestHeaderVersion(85, 0));
+        req.serialize(&buf, &pos, 0);
+        try expectShareStateResponseWithFailingAllocator(&broker, buf[0..pos], 85, 8511, 2, ErrorCode.kafka_storage_error);
+    }
+
+    {
+        const partitions = [_]DeleteReq.DeleteStateData.PartitionData{.{
+            .partition = 6,
+        }};
+        const topics = [_]DeleteReq.DeleteStateData{.{
+            .topic_id = topic_id,
+            .partitions = &partitions,
+        }};
+        const req = DeleteReq{ .group_id = "share-delete-materialize-fail-group", .topics = &topics };
+        var buf: [256]u8 = undefined;
+        var pos = buildTestRequest(&buf, 86, 0, 8611, header_mod.requestHeaderVersion(86, 0));
+        req.serialize(&buf, &pos, 0);
+        try expectShareStateResponseWithFailingAllocator(&broker, buf[0..pos], 86, 8611, 2, ErrorCode.kafka_storage_error);
+    }
+
+    {
+        const partitions = [_]SummaryReq.ReadStateSummaryData.PartitionData{.{
+            .partition = 7,
+            .leader_epoch = 2,
+        }};
+        const topics = [_]SummaryReq.ReadStateSummaryData{.{
+            .topic_id = topic_id,
+            .partitions = &partitions,
+        }};
+        const req = SummaryReq{ .group_id = "share-summary-materialize-fail-group", .topics = &topics };
+        var buf: [256]u8 = undefined;
+        var pos = buildTestRequest(&buf, 87, 0, 8711, header_mod.requestHeaderVersion(87, 0));
+        req.serialize(&buf, &pos, 0);
+        try expectShareStateResponseWithFailingAllocator(&broker, buf[0..pos], 87, 8711, 2, ErrorCode.kafka_storage_error);
+    }
+}
+
+test "Broker.handleRequest share state APIs fail closed when response serialization fails" {
+    const InitReq = generated.initialize_share_group_state_request.InitializeShareGroupStateRequest;
+    const ReadReq = generated.read_share_group_state_request.ReadShareGroupStateRequest;
+    const WriteReq = generated.write_share_group_state_request.WriteShareGroupStateRequest;
+    const DeleteReq = generated.delete_share_group_state_request.DeleteShareGroupStateRequest;
+    const SummaryReq = generated.read_share_group_state_summary_request.ReadShareGroupStateSummaryRequest;
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+
+    {
+        const req = InitReq{ .group_id = "share-init-serialize-fail-group", .topics = &.{} };
+        var buf: [128]u8 = undefined;
+        var pos = buildTestRequest(&buf, 83, 0, 8312, header_mod.requestHeaderVersion(83, 0));
+        req.serialize(&buf, &pos, 0);
+        try expectShareStateResponseWithFailingAllocator(&broker, buf[0..pos], 83, 8312, 0, ErrorCode.kafka_storage_error);
+    }
+
+    {
+        const req = ReadReq{ .group_id = "share-read-serialize-fail-group", .topics = &.{} };
+        var buf: [128]u8 = undefined;
+        var pos = buildTestRequest(&buf, 84, 0, 8412, header_mod.requestHeaderVersion(84, 0));
+        req.serialize(&buf, &pos, 0);
+        try expectShareStateResponseWithFailingAllocator(&broker, buf[0..pos], 84, 8412, 0, ErrorCode.kafka_storage_error);
+    }
+
+    {
+        const req = WriteReq{ .group_id = "share-write-serialize-fail-group", .topics = &.{} };
+        var buf: [128]u8 = undefined;
+        var pos = buildTestRequest(&buf, 85, 0, 8512, header_mod.requestHeaderVersion(85, 0));
+        req.serialize(&buf, &pos, 0);
+        try expectShareStateResponseWithFailingAllocator(&broker, buf[0..pos], 85, 8512, 0, ErrorCode.kafka_storage_error);
+    }
+
+    {
+        const req = DeleteReq{ .group_id = "share-delete-serialize-fail-group", .topics = &.{} };
+        var buf: [128]u8 = undefined;
+        var pos = buildTestRequest(&buf, 86, 0, 8612, header_mod.requestHeaderVersion(86, 0));
+        req.serialize(&buf, &pos, 0);
+        try expectShareStateResponseWithFailingAllocator(&broker, buf[0..pos], 86, 8612, 0, ErrorCode.kafka_storage_error);
+    }
+
+    {
+        const req = SummaryReq{ .group_id = "share-summary-serialize-fail-group", .topics = &.{} };
+        var buf: [128]u8 = undefined;
+        var pos = buildTestRequest(&buf, 87, 0, 8712, header_mod.requestHeaderVersion(87, 0));
+        req.serialize(&buf, &pos, 0);
+        try expectShareStateResponseWithFailingAllocator(&broker, buf[0..pos], 87, 8712, 0, ErrorCode.kafka_storage_error);
+    }
 }
 
 test "Broker.handleRequest share state APIs authorization denial uses generated responses" {
