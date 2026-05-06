@@ -25309,7 +25309,10 @@ pub const Broker = struct {
             .throttle_time_ms = 0,
             .topics = topics[0..topics_init],
         };
-        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version) orelse {
+            log.warn("OffsetForLeaderEpoch response serialization failed", .{});
+            return self.offsetForLeaderEpochErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error);
+        };
     }
 
     fn offsetForLeaderEpochErrorResponse(self: *Broker, req_header: *const RequestHeader, resp_header_version: i16, api_version: i16, err_code: ErrorCode) ?[]u8 {
@@ -37140,6 +37143,46 @@ test "Broker.handleRequest OffsetForLeaderEpoch fails closed when topic response
     defer response_allocator.free(response.?);
 
     try expectOffsetForLeaderEpochErrorResponseBytes(response.?, 4, 2308, ErrorCode.kafka_storage_error);
+}
+
+test "Broker.handleRequest OffsetForLeaderEpoch fails closed when response serialization fails" {
+    const Req = generated.offset_for_leader_epoch_request.OffsetForLeaderEpochRequest;
+    const Topic = Req.OffsetForLeaderTopic;
+    const Partition = Topic.OffsetForLeaderPartition;
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+
+    const partitions = [_]Partition{.{
+        .partition = 0,
+        .current_leader_epoch = -1,
+        .leader_epoch = 0,
+    }};
+    const topics = [_]Topic{.{
+        .topic = "leader-epoch-serialize-fail-topic",
+        .partitions = &partitions,
+    }};
+    const req = Req{
+        .replica_id = -1,
+        .topics = &topics,
+    };
+
+    var buf: [512]u8 = undefined;
+    var pos = buildTestRequest(&buf, 23, 4, 2309, header_mod.requestHeaderVersion(23, 4));
+    req.serialize(&buf, &pos, 4);
+
+    var failing_allocator = OneShotFailingAllocator.init(testing.allocator, 4);
+    const response_allocator = failing_allocator.allocator();
+    broker.allocator = response_allocator;
+
+    const response = broker.handleRequest(buf[0..pos]);
+    broker.allocator = testing.allocator;
+
+    try testing.expect(failing_allocator.failed);
+    try testing.expect(response != null);
+    defer response_allocator.free(response.?);
+
+    try expectOffsetForLeaderEpochErrorResponseBytes(response.?, 4, 2309, ErrorCode.kafka_storage_error);
 }
 
 test "Broker.handleRequest OffsetForLeaderEpoch authorization denial uses generated response" {
