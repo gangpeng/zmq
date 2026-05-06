@@ -11415,12 +11415,21 @@ pub const Broker = struct {
 
         var arena = std.heap.ArenaAllocator.init(self.allocator);
         defer arena.deinit();
-        _ = parseGeneratedRequest(Req, arena.allocator(), request_bytes, body_start, api_version) catch |err| {
+        _ = parseGeneratedRequestStrict(Req, arena.allocator(), request_bytes, body_start, api_version) catch |err| {
             log.warn("Failed to decode denied AutomqRegisterNode request: {}", .{err});
-            return null;
+            return self.automqRegisterNodeErrorResponse(req_header, resp_header_version, api_version, ErrorCode.invalid_request);
         };
 
         const resp = Resp{ .error_code = @intFromEnum(err_code), .throttle_time_ms = 0 };
+        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version) orelse {
+            log.warn("AutomqRegisterNode denied response serialization failed", .{});
+            return self.automqRegisterNodeErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error);
+        };
+    }
+
+    fn automqRegisterNodeErrorResponse(self: *Broker, req_header: *const RequestHeader, resp_header_version: i16, api_version: i16, err_code: ErrorCode) ?[]u8 {
+        const Resp = generated.automq_register_node_response.AutomqRegisterNodeResponse;
+        const resp = Resp{ .error_code = err_code.toInt(), .throttle_time_ms = 0 };
         return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
     }
 
@@ -11438,12 +11447,21 @@ pub const Broker = struct {
 
         var arena = std.heap.ArenaAllocator.init(self.allocator);
         defer arena.deinit();
-        _ = parseGeneratedRequest(Req, arena.allocator(), request_bytes, body_start, api_version) catch |err| {
+        _ = parseGeneratedRequestStrict(Req, arena.allocator(), request_bytes, body_start, api_version) catch |err| {
             log.warn("Failed to decode denied AutomqGetNodes request: {}", .{err});
-            return null;
+            return self.automqGetNodesErrorResponse(req_header, resp_header_version, api_version, ErrorCode.invalid_request);
         };
 
         const resp = Resp{ .error_code = @intFromEnum(err_code), .throttle_time_ms = 0, .nodes = &.{} };
+        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version) orelse {
+            log.warn("AutomqGetNodes denied response serialization failed", .{});
+            return self.automqGetNodesErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error);
+        };
+    }
+
+    fn automqGetNodesErrorResponse(self: *Broker, req_header: *const RequestHeader, resp_header_version: i16, api_version: i16, err_code: ErrorCode) ?[]u8 {
+        const Resp = generated.automq_get_nodes_response.AutomqGetNodesResponse;
+        const resp = Resp{ .error_code = err_code.toInt(), .throttle_time_ms = 0, .nodes = &.{} };
         return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
     }
 
@@ -11461,12 +11479,21 @@ pub const Broker = struct {
 
         var arena = std.heap.ArenaAllocator.init(self.allocator);
         defer arena.deinit();
-        _ = parseGeneratedRequest(Req, arena.allocator(), request_bytes, body_start, api_version) catch |err| {
+        _ = parseGeneratedRequestStrict(Req, arena.allocator(), request_bytes, body_start, api_version) catch |err| {
             log.warn("Failed to decode denied AutomqZoneRouter request: {}", .{err});
-            return null;
+            return self.automqZoneRouterErrorResponse(req_header, resp_header_version, api_version, ErrorCode.invalid_request);
         };
 
         const resp = Resp{ .error_code = @intFromEnum(err_code), .throttle_time_ms = 0, .responses = &.{} };
+        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version) orelse {
+            log.warn("AutomqZoneRouter denied response serialization failed", .{});
+            return self.automqZoneRouterErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error);
+        };
+    }
+
+    fn automqZoneRouterErrorResponse(self: *Broker, req_header: *const RequestHeader, resp_header_version: i16, api_version: i16, err_code: ErrorCode) ?[]u8 {
+        const Resp = generated.automq_zone_router_response.AutomqZoneRouterResponse;
+        const resp = Resp{ .error_code = err_code.toInt(), .throttle_time_ms = 0, .responses = &.{} };
         return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
     }
 
@@ -11484,9 +11511,9 @@ pub const Broker = struct {
 
         var arena = std.heap.ArenaAllocator.init(self.allocator);
         defer arena.deinit();
-        const req = parseGeneratedRequest(Req, arena.allocator(), request_bytes, body_start, api_version) catch |err| {
+        const req = parseGeneratedRequestStrict(Req, arena.allocator(), request_bytes, body_start, api_version) catch |err| {
             log.warn("Failed to decode denied AutomqGetPartitionSnapshot request: {}", .{err});
-            return null;
+            return self.automqGetPartitionSnapshotErrorResponse(req_header, resp_header_version, api_version, ErrorCode.invalid_request, -1, -1);
         };
 
         const resp = Resp{
@@ -11494,6 +11521,32 @@ pub const Broker = struct {
             .throttle_time_ms = 0,
             .session_id = req.session_id,
             .session_epoch = req.session_epoch,
+            .topics = &.{},
+            .confirm_wal_end_offset = null,
+            .confirm_wal_config = null,
+            .confirm_wal_delta_data = null,
+        };
+        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version) orelse {
+            log.warn("AutomqGetPartitionSnapshot denied response serialization failed", .{});
+            return self.automqGetPartitionSnapshotErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error, req.session_id, req.session_epoch);
+        };
+    }
+
+    fn automqGetPartitionSnapshotErrorResponse(
+        self: *Broker,
+        req_header: *const RequestHeader,
+        resp_header_version: i16,
+        api_version: i16,
+        err_code: ErrorCode,
+        session_id: i32,
+        session_epoch: i32,
+    ) ?[]u8 {
+        const Resp = generated.automq_get_partition_snapshot_response.AutomqGetPartitionSnapshotResponse;
+        const resp = Resp{
+            .error_code = err_code.toInt(),
+            .throttle_time_ms = 0,
+            .session_id = session_id,
+            .session_epoch = session_epoch,
             .topics = &.{},
             .confirm_wal_end_offset = null,
             .confirm_wal_config = null,
@@ -11516,12 +11569,21 @@ pub const Broker = struct {
 
         var arena = std.heap.ArenaAllocator.init(self.allocator);
         defer arena.deinit();
-        _ = parseGeneratedRequest(Req, arena.allocator(), request_bytes, body_start, api_version) catch |err| {
+        _ = parseGeneratedRequestStrict(Req, arena.allocator(), request_bytes, body_start, api_version) catch |err| {
             log.warn("Failed to decode denied UpdateLicense request: {}", .{err});
-            return null;
+            return self.updateLicenseErrorResponse(req_header, resp_header_version, api_version, ErrorCode.invalid_request, "Invalid request");
         };
 
         const resp = Resp{ .error_code = @intFromEnum(err_code), .throttle_time_ms = 0, .error_message = "Not authorized" };
+        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version) orelse {
+            log.warn("UpdateLicense denied response serialization failed", .{});
+            return self.updateLicenseErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error, "Failed to serialize authorization response");
+        };
+    }
+
+    fn updateLicenseErrorResponse(self: *Broker, req_header: *const RequestHeader, resp_header_version: i16, api_version: i16, err_code: ErrorCode, message: ?[]const u8) ?[]u8 {
+        const Resp = generated.update_license_response.UpdateLicenseResponse;
+        const resp = Resp{ .error_code = err_code.toInt(), .throttle_time_ms = 0, .error_message = message };
         return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
     }
 
@@ -11539,12 +11601,21 @@ pub const Broker = struct {
 
         var arena = std.heap.ArenaAllocator.init(self.allocator);
         defer arena.deinit();
-        _ = parseGeneratedRequest(Req, arena.allocator(), request_bytes, body_start, api_version) catch |err| {
+        _ = parseGeneratedRequestStrict(Req, arena.allocator(), request_bytes, body_start, api_version) catch |err| {
             log.warn("Failed to decode denied DescribeLicense request: {}", .{err});
-            return null;
+            return self.describeLicenseErrorResponse(req_header, resp_header_version, api_version, ErrorCode.invalid_request, "Invalid request");
         };
 
         const resp = Resp{ .error_code = @intFromEnum(err_code), .throttle_time_ms = 0, .error_message = "Not authorized", .license = "" };
+        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version) orelse {
+            log.warn("DescribeLicense denied response serialization failed", .{});
+            return self.describeLicenseErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error, "Failed to serialize authorization response");
+        };
+    }
+
+    fn describeLicenseErrorResponse(self: *Broker, req_header: *const RequestHeader, resp_header_version: i16, api_version: i16, err_code: ErrorCode, message: ?[]const u8) ?[]u8 {
+        const Resp = generated.describe_license_response.DescribeLicenseResponse;
+        const resp = Resp{ .error_code = err_code.toInt(), .throttle_time_ms = 0, .error_message = message, .license = "" };
         return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
     }
 
@@ -11562,12 +11633,21 @@ pub const Broker = struct {
 
         var arena = std.heap.ArenaAllocator.init(self.allocator);
         defer arena.deinit();
-        _ = parseGeneratedRequest(Req, arena.allocator(), request_bytes, body_start, api_version) catch |err| {
+        _ = parseGeneratedRequestStrict(Req, arena.allocator(), request_bytes, body_start, api_version) catch |err| {
             log.warn("Failed to decode denied ExportClusterManifest request: {}", .{err});
-            return null;
+            return self.exportClusterManifestErrorResponse(req_header, resp_header_version, api_version, ErrorCode.invalid_request);
         };
 
         const resp = Resp{ .error_code = @intFromEnum(err_code), .throttle_time_ms = 0, .manifest = "" };
+        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version) orelse {
+            log.warn("ExportClusterManifest denied response serialization failed", .{});
+            return self.exportClusterManifestErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error);
+        };
+    }
+
+    fn exportClusterManifestErrorResponse(self: *Broker, req_header: *const RequestHeader, resp_header_version: i16, api_version: i16, err_code: ErrorCode) ?[]u8 {
+        const Resp = generated.export_cluster_manifest_response.ExportClusterManifestResponse;
+        const resp = Resp{ .error_code = err_code.toInt(), .throttle_time_ms = 0, .manifest = "" };
         return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
     }
 
@@ -11585,12 +11665,21 @@ pub const Broker = struct {
 
         var arena = std.heap.ArenaAllocator.init(self.allocator);
         defer arena.deinit();
-        _ = parseGeneratedRequest(Req, arena.allocator(), request_bytes, body_start, api_version) catch |err| {
+        _ = parseGeneratedRequestStrict(Req, arena.allocator(), request_bytes, body_start, api_version) catch |err| {
             log.warn("Failed to decode denied GetNextNodeId request: {}", .{err});
-            return null;
+            return self.getNextNodeIdErrorResponse(req_header, resp_header_version, api_version, ErrorCode.invalid_request);
         };
 
         const resp = Resp{ .error_code = @intFromEnum(err_code), .throttle_time_ms = 0, .node_id = -1 };
+        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version) orelse {
+            log.warn("GetNextNodeId denied response serialization failed", .{});
+            return self.getNextNodeIdErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error);
+        };
+    }
+
+    fn getNextNodeIdErrorResponse(self: *Broker, req_header: *const RequestHeader, resp_header_version: i16, api_version: i16, err_code: ErrorCode) ?[]u8 {
+        const Resp = generated.get_next_node_id_response.GetNextNodeIdResponse;
+        const resp = Resp{ .error_code = err_code.toInt(), .throttle_time_ms = 0, .node_id = -1 };
         return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
     }
 
@@ -11608,12 +11697,21 @@ pub const Broker = struct {
 
         var arena = std.heap.ArenaAllocator.init(self.allocator);
         defer arena.deinit();
-        _ = parseGeneratedRequest(Req, arena.allocator(), request_bytes, body_start, api_version) catch |err| {
+        _ = parseGeneratedRequestStrict(Req, arena.allocator(), request_bytes, body_start, api_version) catch |err| {
             log.warn("Failed to decode denied DescribeStreams request: {}", .{err});
-            return null;
+            return self.describeStreamsErrorResponse(req_header, resp_header_version, api_version, ErrorCode.invalid_request);
         };
 
         const resp = Resp{ .error_code = @intFromEnum(err_code), .throttle_time_ms = 0, .stream_metadata_list = &.{} };
+        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version) orelse {
+            log.warn("DescribeStreams denied response serialization failed", .{});
+            return self.describeStreamsErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error);
+        };
+    }
+
+    fn describeStreamsErrorResponse(self: *Broker, req_header: *const RequestHeader, resp_header_version: i16, api_version: i16, err_code: ErrorCode) ?[]u8 {
+        const Resp = generated.describe_streams_response.DescribeStreamsResponse;
+        const resp = Resp{ .error_code = err_code.toInt(), .throttle_time_ms = 0, .stream_metadata_list = &.{} };
         return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
     }
 
@@ -11631,12 +11729,29 @@ pub const Broker = struct {
 
         var arena = std.heap.ArenaAllocator.init(self.allocator);
         defer arena.deinit();
-        const req = parseGeneratedRequest(Req, arena.allocator(), request_bytes, body_start, api_version) catch |err| {
+        const req = parseGeneratedRequestStrict(Req, arena.allocator(), request_bytes, body_start, api_version) catch |err| {
             log.warn("Failed to decode denied AutomqUpdateGroup request: {}", .{err});
-            return null;
+            return self.automqUpdateGroupErrorResponse(req_header, resp_header_version, api_version, ErrorCode.invalid_request, "", "Invalid request");
         };
 
         const resp = Resp{ .group_id = req.group_id, .error_code = @intFromEnum(err_code), .error_message = "Not authorized", .throttle_time_ms = 0 };
+        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version) orelse {
+            log.warn("AutomqUpdateGroup denied response serialization failed", .{});
+            return self.automqUpdateGroupErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error, req.group_id, "Failed to serialize authorization response");
+        };
+    }
+
+    fn automqUpdateGroupErrorResponse(
+        self: *Broker,
+        req_header: *const RequestHeader,
+        resp_header_version: i16,
+        api_version: i16,
+        err_code: ErrorCode,
+        group_id: ?[]const u8,
+        message: ?[]const u8,
+    ) ?[]u8 {
+        const Resp = generated.automq_update_group_response.AutomqUpdateGroupResponse;
+        const resp = Resp{ .group_id = group_id, .error_code = err_code.toInt(), .error_message = message, .throttle_time_ms = 0 };
         return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
     }
 
@@ -31029,6 +31144,138 @@ fn expectAutoMqStreamKvAuthorizationDeniedWithFailingAllocator(
     try testing.expectEqual(@as(i16, @intFromEnum(err_code)), error_code);
 }
 
+const AutoMqMetadataAuthorizationProbe = struct {
+    api_key: i16,
+    api_version: i16,
+    correlation_id: i32,
+};
+
+fn buildAutoMqMetadataAuthorizationRequest(buf: []u8, probe: AutoMqMetadataAuthorizationProbe) ![]const u8 {
+    var pos = buildTestRequest(buf, probe.api_key, probe.api_version, probe.correlation_id, header_mod.requestHeaderVersion(probe.api_key, probe.api_version));
+
+    switch (probe.api_key) {
+        513 => {
+            const Req = generated.automq_register_node_request.AutomqRegisterNodeRequest;
+            const req = Req{ .node_id = 8, .node_epoch = 1, .wal_config = "wal://node-8", .tags = &.{} };
+            req.serialize(buf, &pos, probe.api_version);
+        },
+        514 => {
+            const Req = generated.automq_get_nodes_request.AutomqGetNodesRequest;
+            const req = Req{ .node_ids = &.{} };
+            req.serialize(buf, &pos, probe.api_version);
+        },
+        515 => {
+            const Req = generated.automq_zone_router_request.AutomqZoneRouterRequest;
+            const req = Req{ .metadata = "route-data", .route_epoch = 4, .version = 1 };
+            req.serialize(buf, &pos, probe.api_version);
+        },
+        516 => {
+            const Req = generated.automq_get_partition_snapshot_request.AutomqGetPartitionSnapshotRequest;
+            const req = Req{ .session_id = 99, .session_epoch = 4, .request_commit = false, .version = 2 };
+            req.serialize(buf, &pos, probe.api_version);
+        },
+        517 => {
+            const Req = generated.update_license_request.UpdateLicenseRequest;
+            const req = Req{ .license = "secret-license" };
+            req.serialize(buf, &pos, probe.api_version);
+        },
+        518 => {
+            const Req = generated.describe_license_request.DescribeLicenseRequest;
+            const req = Req{};
+            req.serialize(buf, &pos, probe.api_version);
+        },
+        519 => {
+            const Req = generated.export_cluster_manifest_request.ExportClusterManifestRequest;
+            const req = Req{};
+            req.serialize(buf, &pos, probe.api_version);
+        },
+        600 => {
+            const Req = generated.get_next_node_id_request.GetNextNodeIdRequest;
+            const req = Req{ .cluster_id = "zmq-cluster" };
+            req.serialize(buf, &pos, probe.api_version);
+        },
+        601 => {
+            const Req = generated.describe_streams_request.DescribeStreamsRequest;
+            const req = Req{ .topic_partitions = &.{}, .node_id = -1, .stream_id = 1 };
+            req.serialize(buf, &pos, probe.api_version);
+        },
+        602 => {
+            const Req = generated.automq_update_group_request.AutomqUpdateGroupRequest;
+            const req = Req{ .link_id = "link-a", .group_id = "group-a", .promoted = true };
+            req.serialize(buf, &pos, probe.api_version);
+        },
+        else => return error.UnsupportedApiKey,
+    }
+
+    return buf[0..pos];
+}
+
+fn readAutoMqMetadataTopLevelErrorCode(comptime RespType: type, response: []const u8, api_key: i16, api_version: i16, correlation_id: i32) !i16 {
+    var rpos: usize = 0;
+    var response_header = try ResponseHeader.deserialize(testing.allocator, response, &rpos, header_mod.responseHeaderVersion(api_key, api_version));
+    defer response_header.deinit(testing.allocator);
+    try testing.expectEqual(correlation_id, response_header.correlation_id);
+
+    const resp = try RespType.deserialize(testing.allocator, response, &rpos, api_version);
+    defer freeAutoMqMetadataTopLevelArrays(RespType, &resp);
+    try testing.expectEqual(response.len, rpos);
+    return resp.error_code;
+}
+
+fn freeAutoMqMetadataTopLevelArrays(comptime RespType: type, resp: *const RespType) void {
+    inline for (.{
+        "nodes",
+        "responses",
+        "topics",
+        "stream_metadata_list",
+    }) |field_name| {
+        if (@hasField(RespType, field_name)) {
+            const items = @field(resp.*, field_name);
+            if (items.len > 0) testing.allocator.free(items);
+        }
+    }
+}
+
+fn readAutoMqMetadataAuthorizationErrorCode(response: []const u8, api_key: i16, api_version: i16, correlation_id: i32) !i16 {
+    return switch (api_key) {
+        513 => readAutoMqMetadataTopLevelErrorCode(generated.automq_register_node_response.AutomqRegisterNodeResponse, response, api_key, api_version, correlation_id),
+        514 => readAutoMqMetadataTopLevelErrorCode(generated.automq_get_nodes_response.AutomqGetNodesResponse, response, api_key, api_version, correlation_id),
+        515 => readAutoMqMetadataTopLevelErrorCode(generated.automq_zone_router_response.AutomqZoneRouterResponse, response, api_key, api_version, correlation_id),
+        516 => readAutoMqMetadataTopLevelErrorCode(generated.automq_get_partition_snapshot_response.AutomqGetPartitionSnapshotResponse, response, api_key, api_version, correlation_id),
+        517 => readAutoMqMetadataTopLevelErrorCode(generated.update_license_response.UpdateLicenseResponse, response, api_key, api_version, correlation_id),
+        518 => readAutoMqMetadataTopLevelErrorCode(generated.describe_license_response.DescribeLicenseResponse, response, api_key, api_version, correlation_id),
+        519 => readAutoMqMetadataTopLevelErrorCode(generated.export_cluster_manifest_response.ExportClusterManifestResponse, response, api_key, api_version, correlation_id),
+        600 => readAutoMqMetadataTopLevelErrorCode(generated.get_next_node_id_response.GetNextNodeIdResponse, response, api_key, api_version, correlation_id),
+        601 => readAutoMqMetadataTopLevelErrorCode(generated.describe_streams_response.DescribeStreamsResponse, response, api_key, api_version, correlation_id),
+        602 => readAutoMqMetadataTopLevelErrorCode(generated.automq_update_group_response.AutomqUpdateGroupResponse, response, api_key, api_version, correlation_id),
+        else => error.UnsupportedApiKey,
+    };
+}
+
+fn expectAutoMqMetadataAuthorizationDeniedWithFailingAllocator(
+    broker: *Broker,
+    request: []const u8,
+    api_key: i16,
+    api_version: i16,
+    correlation_id: i32,
+    fail_index: usize,
+    err_code: ErrorCode,
+) !void {
+    var failing_allocator = OneShotFailingAllocator.init(testing.allocator, fail_index);
+    const response_allocator = failing_allocator.allocator();
+    broker.allocator = response_allocator;
+
+    const response = broker.handleRequest(request);
+    broker.allocator = testing.allocator;
+
+    try testing.expect(failing_allocator.failed);
+    try testing.expect(response != null);
+    defer response_allocator.free(response.?);
+
+    const error_code = try readAutoMqMetadataAuthorizationErrorCode(response.?, api_key, api_version, correlation_id);
+    try testing.expectEqual(@as(i16, @intFromEnum(err_code)), error_code);
+}
+
 fn freeDeserializedDescribeTopicPartitionsResponse(resp: *const generated.describe_topic_partitions_response.DescribeTopicPartitionsResponse) void {
     for (resp.topics) |topic| {
         for (topic.partitions) |partition| {
@@ -48156,6 +48403,72 @@ test "Broker.handleRequest remaining AutoMQ extension authorization denial uses 
     try testing.expectEqual(denied, update_group_resp.error_code);
     try testing.expectEqualStrings("Not authorized", update_group_resp.error_message.?);
     try testing.expectEqual(@as(u32, 0), broker.auto_mq_group_promotions.count());
+}
+
+test "Broker.handleRequest remaining AutoMQ extension authorization denial rejects malformed requests" {
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+    try addAutoMqExtensionAuthorizationAcls(&broker);
+
+    const probes = [_]AutoMqMetadataAuthorizationProbe{
+        .{ .api_key = 513, .api_version = 0, .correlation_id = 5135 },
+        .{ .api_key = 514, .api_version = 0, .correlation_id = 5145 },
+        .{ .api_key = 515, .api_version = 1, .correlation_id = 5155 },
+        .{ .api_key = 516, .api_version = 2, .correlation_id = 5165 },
+        .{ .api_key = 517, .api_version = 0, .correlation_id = 5175 },
+        .{ .api_key = 518, .api_version = 0, .correlation_id = 5185 },
+        .{ .api_key = 519, .api_version = 0, .correlation_id = 5195 },
+        .{ .api_key = 600, .api_version = 0, .correlation_id = 6005 },
+        .{ .api_key = 601, .api_version = 0, .correlation_id = 6015 },
+        .{ .api_key = 602, .api_version = 0, .correlation_id = 6025 },
+    };
+
+    for (probes) |probe| {
+        var buf: [4096]u8 = undefined;
+        const request = try buildAutoMqMetadataAuthorizationRequest(&buf, probe);
+        try testing.expect(request.len < buf.len);
+        buf[request.len] = 0x7f;
+
+        const response = broker.handleRequest(buf[0 .. request.len + 1]);
+        try testing.expect(response != null);
+        defer testing.allocator.free(response.?);
+
+        const error_code = try readAutoMqMetadataAuthorizationErrorCode(response.?, probe.api_key, probe.api_version, probe.correlation_id);
+        try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.invalid_request)), error_code);
+    }
+}
+
+test "Broker.handleRequest remaining AutoMQ extension authorization denial fails closed when serialization fails" {
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+    try addAutoMqExtensionAuthorizationAcls(&broker);
+
+    const probes = [_]AutoMqMetadataAuthorizationProbe{
+        .{ .api_key = 513, .api_version = 0, .correlation_id = 5136 },
+        .{ .api_key = 514, .api_version = 0, .correlation_id = 5146 },
+        .{ .api_key = 515, .api_version = 1, .correlation_id = 5156 },
+        .{ .api_key = 516, .api_version = 2, .correlation_id = 5166 },
+        .{ .api_key = 517, .api_version = 0, .correlation_id = 5176 },
+        .{ .api_key = 518, .api_version = 0, .correlation_id = 5186 },
+        .{ .api_key = 519, .api_version = 0, .correlation_id = 5196 },
+        .{ .api_key = 600, .api_version = 0, .correlation_id = 6006 },
+        .{ .api_key = 601, .api_version = 0, .correlation_id = 6016 },
+        .{ .api_key = 602, .api_version = 0, .correlation_id = 6026 },
+    };
+
+    for (probes) |probe| {
+        var buf: [4096]u8 = undefined;
+        const request = try buildAutoMqMetadataAuthorizationRequest(&buf, probe);
+        try expectAutoMqMetadataAuthorizationDeniedWithFailingAllocator(
+            &broker,
+            request,
+            probe.api_key,
+            probe.api_version,
+            probe.correlation_id,
+            0,
+            ErrorCode.kafka_storage_error,
+        );
+    }
 }
 
 test "Broker AutoMQ stream object lifecycle APIs" {

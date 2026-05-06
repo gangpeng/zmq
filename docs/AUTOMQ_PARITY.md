@@ -685,6 +685,12 @@ Status: completed for the initial catalog and DeleteGroups slice.
   CommitStreamSetObject, CommitStreamObject, GetOpeningStreams, and
   Get/Put/DeleteKVs now do the same for malformed denied frames and denial
   response materialization or serialization failures.
+  AutoMQ metadata/controller extension authorization-denial builders for
+  AutomqRegisterNode/GetNodes/ZoneRouter/GetPartitionSnapshot,
+  Update/DescribeLicense, ExportClusterManifest, GetNextNodeId,
+  DescribeStreams, and AutomqUpdateGroup now also return generated
+  invalid-request/storage-error fallbacks for malformed denied frames and
+  denial response serialization failures.
   ListClientMetricsResources now advertises key 74 v0, decodes generated
   flexible requests, rejects malformed frames, returns a default generated
   resource, and lists active client resources for retained telemetry samples.
