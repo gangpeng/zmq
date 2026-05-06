@@ -41,6 +41,8 @@ operator-facing behavior.
   GetTelemetrySubscriptions/PushTelemetry/ListClientMetricsResources v0 are
   live-probed with a stable client instance id, accepted uncompressed sample,
   and resource-list visibility.
+  Create/Renew/Expire/DescribeDelegationToken are live-probed with a durable
+  token owned by the harness client and exact token-id/HMAC visibility.
   Delegation-token APIs 38-41 are advertised with strict
   generated decoding, schema-shaped responses, and broker-local create,
   describe, renew, and expire semantics. Tokens persist across local broker
@@ -313,7 +315,9 @@ AlterClientQuotas/DescribeClientQuotas v1 while verifying validate-only quota
 requests remain non-mutating, and upserts/describes a SCRAM-SHA-256 user
 through AlterUserScramCredentials/DescribeUserScramCredentials v0. The same
 gate now validates the client telemetry subscription/push/resource APIs through
-each transition with a stable client instance id.
+each transition with a stable client instance id, and validates delegation-token
+create/renew/non-immediate-expire/describe continuity using the issued token id
+and HMAC.
 
 Latest default-suite fail-closed tranche: metadata-client controller discovery
 now surfaces malformed DescribeQuorum responses, including trailing response

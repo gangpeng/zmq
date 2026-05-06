@@ -1652,6 +1652,273 @@ def wait_for_client_telemetry_checkpoint(
     raise TestError(f"Client telemetry checkpoint did not recover: {last_error}")
 
 
+def parse_create_delegation_token_response(response, correlation_id):
+    pos = parse_flexible_response_header(response, correlation_id)
+    error_code, pos = read_i16(response, pos)
+    principal_type, pos = read_compact_string(response, pos)
+    principal_name, pos = read_compact_string(response, pos)
+    requester_principal_type, pos = read_compact_string(response, pos)
+    requester_principal_name, pos = read_compact_string(response, pos)
+    issue_timestamp_ms, pos = read_i64(response, pos)
+    expiry_timestamp_ms, pos = read_i64(response, pos)
+    max_timestamp_ms, pos = read_i64(response, pos)
+    token_id, pos = read_compact_string(response, pos)
+    hmac, pos = read_compact_bytes(response, pos)
+    throttle_time_ms, pos = read_i32(response, pos)
+    pos = skip_tags(response, pos)
+    if pos != len(response):
+        raise TestError(
+            f"CreateDelegationToken response trailing bytes: {len(response) - pos}"
+        )
+    return {
+        "error_code": error_code,
+        "principal_type": principal_type,
+        "principal_name": principal_name,
+        "requester_principal_type": requester_principal_type,
+        "requester_principal_name": requester_principal_name,
+        "issue_timestamp_ms": issue_timestamp_ms,
+        "expiry_timestamp_ms": expiry_timestamp_ms,
+        "max_timestamp_ms": max_timestamp_ms,
+        "token_id": token_id,
+        "hmac": hmac,
+        "throttle_time_ms": throttle_time_ms,
+    }
+
+
+def create_delegation_token(port, max_lifetime_ms, correlation_id):
+    body = write_compact_string(None)  # owner_principal_type=request principal
+    body += write_compact_string(None)  # owner_principal_name=request principal
+    body += write_compact_array_len(0)
+    body += struct.pack(">q", max_lifetime_ms)
+    body += b"\x00"  # request tagged fields
+    response = flexible_kafka_request(port, 38, 3, correlation_id, body)
+    return parse_create_delegation_token_response(response, correlation_id)
+
+
+def require_create_delegation_token_success(response, owner_name):
+    if response["throttle_time_ms"] != 0 or response["error_code"] != 0:
+        raise TestError(f"CreateDelegationToken top-level mismatch: {response}")
+    if response["principal_type"] != "User" or response["principal_name"] != owner_name:
+        raise TestError(f"CreateDelegationToken owner mismatch: {response}")
+    if (
+        response["requester_principal_type"] != "User"
+        or response["requester_principal_name"] != owner_name
+    ):
+        raise TestError(f"CreateDelegationToken requester mismatch: {response}")
+    if not response["token_id"] or len(response["hmac"] or b"") != 32:
+        raise TestError(f"CreateDelegationToken token material mismatch: {response}")
+    if not (
+        response["issue_timestamp_ms"]
+        <= response["expiry_timestamp_ms"]
+        <= response["max_timestamp_ms"]
+    ):
+        raise TestError(f"CreateDelegationToken timestamp mismatch: {response}")
+
+
+def wait_for_create_delegation_token(port, owner_name, max_lifetime_ms, timeout=30):
+    deadline = time.time() + timeout
+    correlation_id = 8700
+    last_error = None
+    while time.time() < deadline:
+        try:
+            response = create_delegation_token(
+                port,
+                max_lifetime_ms,
+                correlation_id,
+            )
+            require_create_delegation_token_success(response, owner_name)
+            return response
+        except Exception as exc:
+            last_error = exc
+        correlation_id += 1
+        time.sleep(0.25)
+    raise TestError(f"CreateDelegationToken did not create token: {last_error}")
+
+
+def parse_delegation_token_lifecycle_response(response, correlation_id, label):
+    pos = parse_flexible_response_header(response, correlation_id)
+    error_code, pos = read_i16(response, pos)
+    expiry_timestamp_ms, pos = read_i64(response, pos)
+    throttle_time_ms, pos = read_i32(response, pos)
+    pos = skip_tags(response, pos)
+    if pos != len(response):
+        raise TestError(f"{label} response trailing bytes: {len(response) - pos}")
+    return {
+        "error_code": error_code,
+        "expiry_timestamp_ms": expiry_timestamp_ms,
+        "throttle_time_ms": throttle_time_ms,
+    }
+
+
+def renew_delegation_token(port, hmac, renew_period_ms, correlation_id):
+    body = write_compact_bytes(hmac)
+    body += struct.pack(">q", renew_period_ms)
+    body += b"\x00"  # request tagged fields
+    response = flexible_kafka_request(port, 39, 2, correlation_id, body)
+    return parse_delegation_token_lifecycle_response(
+        response,
+        correlation_id,
+        "RenewDelegationToken",
+    )
+
+
+def expire_delegation_token(port, hmac, expiry_period_ms, correlation_id):
+    body = write_compact_bytes(hmac)
+    body += struct.pack(">q", expiry_period_ms)
+    body += b"\x00"  # request tagged fields
+    response = flexible_kafka_request(port, 40, 2, correlation_id, body)
+    return parse_delegation_token_lifecycle_response(
+        response,
+        correlation_id,
+        "ExpireDelegationToken",
+    )
+
+
+def require_delegation_token_lifecycle_success(response, label):
+    if response["throttle_time_ms"] != 0 or response["error_code"] != 0:
+        raise TestError(f"{label} mismatch: {response}")
+    if response["expiry_timestamp_ms"] <= 0:
+        raise TestError(f"{label} expiry mismatch: {response}")
+
+
+def parse_describe_delegation_token_response(response, correlation_id):
+    pos = parse_flexible_response_header(response, correlation_id)
+    error_code, pos = read_i16(response, pos)
+    token_count, pos = read_compact_array_len(response, pos)
+    tokens = []
+    for _ in range(token_count):
+        principal_type, pos = read_compact_string(response, pos)
+        principal_name, pos = read_compact_string(response, pos)
+        requester_principal_type, pos = read_compact_string(response, pos)
+        requester_principal_name, pos = read_compact_string(response, pos)
+        issue_timestamp, pos = read_i64(response, pos)
+        expiry_timestamp, pos = read_i64(response, pos)
+        max_timestamp, pos = read_i64(response, pos)
+        token_id, pos = read_compact_string(response, pos)
+        hmac, pos = read_compact_bytes(response, pos)
+        renewer_count, pos = read_compact_array_len(response, pos)
+        renewers = []
+        for _ in range(renewer_count):
+            renewer_type, pos = read_compact_string(response, pos)
+            renewer_name, pos = read_compact_string(response, pos)
+            pos = skip_tags(response, pos)
+            renewers.append(
+                {
+                    "principal_type": renewer_type,
+                    "principal_name": renewer_name,
+                }
+            )
+        pos = skip_tags(response, pos)
+        tokens.append(
+            {
+                "principal_type": principal_type,
+                "principal_name": principal_name,
+                "requester_principal_type": requester_principal_type,
+                "requester_principal_name": requester_principal_name,
+                "issue_timestamp": issue_timestamp,
+                "expiry_timestamp": expiry_timestamp,
+                "max_timestamp": max_timestamp,
+                "token_id": token_id,
+                "hmac": hmac,
+                "renewers": renewers,
+            }
+        )
+    throttle_time_ms, pos = read_i32(response, pos)
+    pos = skip_tags(response, pos)
+    if pos != len(response):
+        raise TestError(
+            f"DescribeDelegationToken response trailing bytes: {len(response) - pos}"
+        )
+    return {
+        "error_code": error_code,
+        "tokens": tokens,
+        "throttle_time_ms": throttle_time_ms,
+    }
+
+
+def describe_delegation_token(port, owner_name, correlation_id):
+    body = write_compact_array_len(1)
+    body += write_compact_string("User")
+    body += write_compact_string(owner_name)
+    body += b"\x00"  # owner tagged fields
+    body += b"\x00"  # request tagged fields
+    response = flexible_kafka_request(port, 41, 3, correlation_id, body)
+    return parse_describe_delegation_token_response(response, correlation_id)
+
+
+def require_delegation_token_visible(response, owner_name, token_id, hmac):
+    if response["throttle_time_ms"] != 0 or response["error_code"] != 0:
+        raise TestError(f"DescribeDelegationToken top-level mismatch: {response}")
+    matches = [
+        token
+        for token in response["tokens"]
+        if token["token_id"] == token_id and token["hmac"] == hmac
+    ]
+    if len(matches) != 1:
+        raise TestError(f"DescribeDelegationToken token mismatch: {response}")
+    token = matches[0]
+    if token["principal_type"] != "User" or token["principal_name"] != owner_name:
+        raise TestError(f"DescribeDelegationToken owner mismatch: {response}")
+    if (
+        token["requester_principal_type"] != "User"
+        or token["requester_principal_name"] != owner_name
+    ):
+        raise TestError(f"DescribeDelegationToken requester mismatch: {response}")
+    if token["renewers"]:
+        raise TestError(f"DescribeDelegationToken renewer mismatch: {response}")
+    if not (
+        token["issue_timestamp"]
+        <= token["expiry_timestamp"]
+        <= token["max_timestamp"]
+    ):
+        raise TestError(f"DescribeDelegationToken timestamp mismatch: {response}")
+
+
+def wait_for_delegation_token_checkpoint(
+    port,
+    owner_name,
+    token_id,
+    hmac,
+    lifetime_ms,
+    timeout=30,
+):
+    deadline = time.time() + timeout
+    correlation_id = 8740
+    last_error = None
+    while time.time() < deadline:
+        try:
+            renewed = renew_delegation_token(
+                port,
+                hmac,
+                lifetime_ms,
+                correlation_id,
+            )
+            require_delegation_token_lifecycle_success(
+                renewed,
+                "RenewDelegationToken",
+            )
+            correlation_id += 1
+            expiry = expire_delegation_token(
+                port,
+                hmac,
+                lifetime_ms,
+                correlation_id,
+            )
+            require_delegation_token_lifecycle_success(
+                expiry,
+                "ExpireDelegationToken",
+            )
+            correlation_id += 1
+            described = describe_delegation_token(port, owner_name, correlation_id)
+            require_delegation_token_visible(described, owner_name, token_id, hmac)
+            return
+        except Exception as exc:
+            last_error = exc
+        correlation_id += 1
+        time.sleep(0.25)
+    raise TestError(f"Delegation token checkpoint did not recover: {last_error}")
+
+
 def parse_describe_configs_response(response, correlation_id):
     pos = parse_flexible_response_header(response, correlation_id)
     throttle_time_ms, pos = read_i32(response, pos)
@@ -8710,6 +8977,8 @@ def main():
         scram_salted_password = bytes([0x22] * 32)
         telemetry_client_instance_id = bytes([0x33] * 16)
         telemetry_metrics = b"\x08\x01"
+        delegation_token_owner = "kraft-failover-test"
+        delegation_token_lifetime_ms = 60 * 60 * 1000
         kip848_subscription_topic = f"{topic}-kip848-subscription"
         kip848_negative_group_prefix = f"{group}-kip848-negative"
         expected_payloads = []
@@ -8797,12 +9066,22 @@ def main():
                 telemetry_metrics,
             )
 
+        def wait_for_delegation_token_probe():
+            wait_for_delegation_token_checkpoint(
+                broker["port"],
+                delegation_token_owner,
+                delegation_token["token_id"],
+                delegation_token["hmac"],
+                delegation_token_lifetime_ms,
+            )
+
         def wait_for_cluster_visibility_probes():
             wait_for_topic_partitions_probe()
             wait_for_create_partitions_probe()
             wait_for_client_quotas_probe()
             wait_for_scram_credentials_probe()
             wait_for_client_telemetry_probe()
+            wait_for_delegation_token_probe()
             wait_for_describe_configs_checkpoint(
                 broker["port"],
                 topic,
@@ -8850,6 +9129,11 @@ def main():
             scram_salt,
             scram_salted_password,
             scram_iterations,
+        )
+        delegation_token = wait_for_create_delegation_token(
+            broker["port"],
+            delegation_token_owner,
+            delegation_token_lifetime_ms,
         )
         wait_for_cluster_visibility_probes()
         wait_for_offset_commit(broker["port"], group, topic, committed_offset)
@@ -9962,6 +10246,7 @@ def main():
             f"client_quotas_checked=true, "
             f"scram_credentials_checked=true, "
             f"client_telemetry_checked=true, "
+            f"delegation_tokens_checked=true, "
             f"describe_topic_partitions_checked=true, "
             f"describe_configs_checked=true, "
             f"describe_log_dirs_checked=true, "
@@ -10397,6 +10682,63 @@ def self_test():
             list_metrics_fixture, 172
         )
         require_client_metrics_resources(listed_metrics, telemetry_client_id)
+
+        token_hmac = bytes([0x44] * 32)
+        create_token_fixture = struct.pack(">i", 173)
+        create_token_fixture += b"\x00"  # response header tagged fields
+        create_token_fixture += struct.pack(">h", 0)
+        create_token_fixture += write_compact_string("User")
+        create_token_fixture += write_compact_string("token-self-test")
+        create_token_fixture += write_compact_string("User")
+        create_token_fixture += write_compact_string("token-self-test")
+        create_token_fixture += struct.pack(">qqq", 1000, 2000, 2000)
+        create_token_fixture += write_compact_string("token-id-self-test")
+        create_token_fixture += write_compact_bytes(token_hmac)
+        create_token_fixture += struct.pack(">i", 0)
+        create_token_fixture += b"\x00"  # response tagged fields
+        created_token = parse_create_delegation_token_response(
+            create_token_fixture, 173
+        )
+        require_create_delegation_token_success(created_token, "token-self-test")
+
+        renew_token_fixture = struct.pack(">i", 174)
+        renew_token_fixture += b"\x00"  # response header tagged fields
+        renew_token_fixture += struct.pack(">hqi", 0, 2000, 0)
+        renew_token_fixture += b"\x00"  # response tagged fields
+        renewed_token = parse_delegation_token_lifecycle_response(
+            renew_token_fixture,
+            174,
+            "RenewDelegationToken",
+        )
+        require_delegation_token_lifecycle_success(
+            renewed_token,
+            "RenewDelegationToken",
+        )
+
+        describe_token_fixture = struct.pack(">i", 175)
+        describe_token_fixture += b"\x00"  # response header tagged fields
+        describe_token_fixture += struct.pack(">h", 0)
+        describe_token_fixture += write_compact_array_len(1)
+        describe_token_fixture += write_compact_string("User")
+        describe_token_fixture += write_compact_string("token-self-test")
+        describe_token_fixture += write_compact_string("User")
+        describe_token_fixture += write_compact_string("token-self-test")
+        describe_token_fixture += struct.pack(">qqq", 1000, 2000, 2000)
+        describe_token_fixture += write_compact_string("token-id-self-test")
+        describe_token_fixture += write_compact_bytes(token_hmac)
+        describe_token_fixture += write_compact_array_len(0)
+        describe_token_fixture += b"\x00"  # token tagged fields
+        describe_token_fixture += struct.pack(">i", 0)
+        describe_token_fixture += b"\x00"  # response tagged fields
+        described_token = parse_describe_delegation_token_response(
+            describe_token_fixture, 175
+        )
+        require_delegation_token_visible(
+            described_token,
+            "token-self-test",
+            "token-id-self-test",
+            token_hmac,
+        )
 
         describe_configs_fixture = struct.pack(">i", 166)
         describe_configs_fixture += b"\x00"  # response header tagged fields
