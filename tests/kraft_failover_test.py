@@ -1098,6 +1098,78 @@ def wait_for_describe_log_dirs_checkpoint(port, topic, timeout=30):
     raise TestError(f"DescribeLogDirs did not recover for {topic!r}: {last_error}")
 
 
+def parse_alter_replica_log_dirs_response(response, correlation_id):
+    pos = parse_flexible_response_header(response, correlation_id)
+    throttle_time_ms, pos = read_i32(response, pos)
+    topic_count, pos = read_compact_array_len(response, pos)
+    topics = []
+    for _ in range(topic_count):
+        topic_name, pos = read_compact_string(response, pos)
+        partition_count, pos = read_compact_array_len(response, pos)
+        partitions = []
+        for _ in range(partition_count):
+            partition_index, pos = read_i32(response, pos)
+            error_code, pos = read_i16(response, pos)
+            pos = skip_tags(response, pos)
+            partitions.append(
+                {
+                    "partition_index": partition_index,
+                    "error_code": error_code,
+                }
+            )
+        pos = skip_tags(response, pos)
+        topics.append({"name": topic_name, "partitions": partitions})
+    pos = skip_tags(response, pos)
+    if pos != len(response):
+        raise TestError(
+            f"AlterReplicaLogDirs response trailing bytes: {len(response) - pos}"
+        )
+    return {"throttle_time_ms": throttle_time_ms, "topics": topics}
+
+
+def alter_replica_log_dirs(port, topic, path, correlation_id):
+    body = write_compact_array_len(1)
+    body += write_compact_string(path)
+    body += write_compact_array_len(1)
+    body += write_compact_string(topic)
+    body += write_compact_i32_array([0])
+    body += b"\x00"  # topic tagged fields
+    body += b"\x00"  # dir tagged fields
+    body += b"\x00"  # request tagged fields
+    response = flexible_kafka_request(port, 34, 2, correlation_id, body)
+    return parse_alter_replica_log_dirs_response(response, correlation_id)
+
+
+def wait_for_alter_replica_log_dirs_checkpoint(port, topic, path, timeout=30):
+    deadline = time.time() + timeout
+    correlation_id = 8580
+    last_error = None
+    while time.time() < deadline:
+        try:
+            response = alter_replica_log_dirs(port, topic, path, correlation_id)
+            if response["throttle_time_ms"] != 0:
+                raise TestError(f"AlterReplicaLogDirs throttle mismatch: {response}")
+            topics = response["topics"]
+            if len(topics) != 1 or topics[0]["name"] != topic:
+                raise TestError(f"AlterReplicaLogDirs topic mismatch: {response}")
+            partitions = topics[0]["partitions"]
+            if len(partitions) != 1:
+                raise TestError(
+                    f"AlterReplicaLogDirs partition count mismatch: {response}"
+                )
+            partition = partitions[0]
+            if partition["partition_index"] != 0 or partition["error_code"] != 0:
+                raise TestError(f"AlterReplicaLogDirs partition error: {response}")
+            return
+        except Exception as exc:
+            last_error = exc
+        correlation_id += 1
+        time.sleep(0.25)
+    raise TestError(
+        f"AlterReplicaLogDirs did not recover for {topic!r}: {last_error}"
+    )
+
+
 def parse_nullable_compact_i32_array(buf, pos):
     raw_len, pos = read_varint(buf, pos)
     if raw_len == 0:
@@ -6997,7 +7069,12 @@ def start_broker(tmp, voters):
     ]
     proc = subprocess.Popen(args, stdout=log_file, stderr=subprocess.STDOUT)
     proc._zmq_log_file = log_file
-    return {"proc": proc, "port": BROKER_PORT, "log_path": log_path}
+    return {
+        "proc": proc,
+        "port": BROKER_PORT,
+        "log_path": log_path,
+        "data_dir": data_dir,
+    }
 
 
 def start_combined_node(tmp, node_id, controller_port, broker_port, voters):
@@ -7649,6 +7726,11 @@ def main():
             wait_for_describe_log_dirs_checkpoint(
                 broker["port"],
                 topic,
+            )
+            wait_for_alter_replica_log_dirs_checkpoint(
+                broker["port"],
+                topic,
+                broker["data_dir"],
             )
             wait_for_describe_cluster_checkpoint(
                 broker["port"],
@@ -8767,6 +8849,7 @@ def main():
             f"describe_topic_partitions_checked=true, "
             f"describe_configs_checked=true, "
             f"describe_log_dirs_checked=true, "
+            f"alter_replica_log_dirs_checked=true, "
             f"describe_cluster_checked=true, "
             f"idempotent_producer_fencing=true, "
             f"describe_producers_checked=true, "
@@ -9120,6 +9203,28 @@ def self_test():
         ):
             raise TestError(
                 f"DescribeLogDirs fixture parser failed: {described_log_dirs}"
+            )
+
+        alter_log_dirs_fixture = struct.pack(">i", 168)
+        alter_log_dirs_fixture += b"\x00"  # response header tagged fields
+        alter_log_dirs_fixture += struct.pack(">i", 0)
+        alter_log_dirs_fixture += write_compact_array_len(1)
+        alter_log_dirs_fixture += write_compact_string("alter-log-dir-self-test")
+        alter_log_dirs_fixture += write_compact_array_len(1)
+        alter_log_dirs_fixture += struct.pack(">ih", 0, 0)
+        alter_log_dirs_fixture += b"\x00"  # partition tagged fields
+        alter_log_dirs_fixture += b"\x00"  # topic tagged fields
+        alter_log_dirs_fixture += b"\x00"  # response tagged fields
+        altered_log_dirs = parse_alter_replica_log_dirs_response(
+            alter_log_dirs_fixture, 168
+        )
+        if (
+            altered_log_dirs["topics"][0]["name"] != "alter-log-dir-self-test"
+            or altered_log_dirs["topics"][0]["partitions"][0]["partition_index"] != 0
+            or altered_log_dirs["topics"][0]["partitions"][0]["error_code"] != 0
+        ):
+            raise TestError(
+                f"AlterReplicaLogDirs fixture parser failed: {altered_log_dirs}"
             )
 
         topic_partitions_fixture = struct.pack(">i", 164)
