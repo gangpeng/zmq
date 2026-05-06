@@ -45,6 +45,7 @@ BROKER_PORT = int(os.environ.get("ZMQ_KRAFT_BROKER_PORT", "39092"))
 CLUSTER_ID = f"zmq-kraft-failover-{os.getpid()}-{int(time.time())}"
 ERROR_NONE = 0
 ERROR_UNKNOWN_TOPIC_OR_PARTITION = 3
+ERROR_TOPIC_ALREADY_EXISTS = 36
 ERROR_GROUP_ID_NOT_FOUND = 69
 ERROR_UNKNOWN_MEMBER_ID = 25
 ERROR_INVALID_REQUEST = 42
@@ -584,6 +585,110 @@ def require_delete_topics_result(response, topic, expected_error_codes, label):
         or item["error_message"] is not None
     ):
         raise TestError(f"{label} result mismatch: {response}")
+
+
+def parse_create_topics_response(response, correlation_id):
+    pos = parse_flexible_response_header(response, correlation_id)
+    throttle_time_ms, pos = read_i32(response, pos)
+    topic_count, pos = read_compact_array_len(response, pos)
+    topics = []
+    for _ in range(topic_count):
+        name, pos = read_compact_string(response, pos)
+        if pos + 16 > len(response):
+            raise TestError("buffer underflow while reading CreateTopics topic id")
+        topic_id = response[pos : pos + 16]
+        pos += 16
+        error_code, pos = read_i16(response, pos)
+        error_message, pos = read_compact_string(response, pos)
+        num_partitions, pos = read_i32(response, pos)
+        replication_factor, pos = read_i16(response, pos)
+        config_count, pos = read_compact_array_len(response, pos)
+        configs = []
+        for _ in range(config_count):
+            config_name, pos = read_compact_string(response, pos)
+            config_value, pos = read_compact_string(response, pos)
+            read_only, pos = read_bool(response, pos)
+            config_source, pos = read_i8(response, pos)
+            is_sensitive, pos = read_bool(response, pos)
+            pos = skip_tags(response, pos)
+            configs.append(
+                {
+                    "name": config_name,
+                    "value": config_value,
+                    "read_only": read_only,
+                    "config_source": config_source,
+                    "is_sensitive": is_sensitive,
+                }
+            )
+        pos = skip_tags(response, pos)
+        topics.append(
+            {
+                "name": name,
+                "topic_id": topic_id,
+                "error_code": error_code,
+                "error_message": error_message,
+                "num_partitions": num_partitions,
+                "replication_factor": replication_factor,
+                "configs": configs,
+            }
+        )
+    pos = skip_tags(response, pos)
+    if pos != len(response):
+        raise TestError(f"CreateTopics response trailing bytes: {len(response) - pos}")
+    return {"throttle_time_ms": throttle_time_ms, "topics": topics}
+
+
+def create_topic_with_configs(
+    port,
+    topic,
+    partition_count,
+    replication_factor,
+    configs,
+    validate_only,
+    correlation_id,
+):
+    body = write_compact_array_len(1)
+    body += write_compact_string(topic)
+    body += struct.pack(">ih", partition_count, replication_factor)
+    body += write_compact_array_len(0)  # assignments
+    body += write_compact_array_len(len(configs))
+    for name, value in configs:
+        body += write_compact_string(name)
+        body += write_compact_string(value)
+        body += b"\x00"  # config tagged fields
+    body += b"\x00"  # topic tagged fields
+    body += struct.pack(">i", 30000)  # timeout_ms
+    body += b"\x01" if validate_only else b"\x00"
+    body += b"\x00"  # request tagged fields
+    response = flexible_kafka_request(port, 19, 7, correlation_id, body)
+    return parse_create_topics_response(response, correlation_id)
+
+
+def require_create_topics_result(
+    response,
+    topic,
+    partition_count,
+    replication_factor,
+    expected_error_codes,
+    label,
+):
+    if isinstance(expected_error_codes, int):
+        expected_error_codes = (expected_error_codes,)
+    if response["throttle_time_ms"] != 0:
+        raise TestError(f"{label} throttle mismatch: {response}")
+    topics = response["topics"]
+    if len(topics) != 1:
+        raise TestError(f"{label} topic count mismatch: {response}")
+    item = topics[0]
+    if (
+        item["name"] != topic
+        or item["error_code"] not in expected_error_codes
+        or item["num_partitions"] != partition_count
+        or item["replication_factor"] != replication_factor
+    ):
+        raise TestError(f"{label} result mismatch: {response}")
+    if item["error_code"] == ERROR_NONE and item["error_message"] is not None:
+        raise TestError(f"{label} unexpected error message: {response}")
 
 
 def produce(port, topic, payload, correlation_id):
@@ -2858,6 +2963,103 @@ def wait_for_config_admin_checkpoint(
         time.sleep(0.25)
     raise TestError(
         f"Config admin checkpoint did not recover for {topic!r}: {last_error}"
+    )
+
+
+def wait_for_create_topics_seed(
+    port,
+    topic,
+    configs,
+    expected_values,
+    timeout=30,
+):
+    deadline = time.time() + timeout
+    correlation_id = 8990
+    last_error = None
+    while time.time() < deadline:
+        try:
+            created = create_topic_with_configs(
+                port,
+                topic,
+                1,
+                1,
+                configs,
+                False,
+                correlation_id,
+            )
+            require_create_topics_result(
+                created,
+                topic,
+                1,
+                1,
+                (ERROR_NONE, ERROR_TOPIC_ALREADY_EXISTS),
+                "CreateTopics",
+            )
+            described = describe_topic_selected_configs(
+                port,
+                topic,
+                list(expected_values.keys()),
+                correlation_id + 1,
+            )
+            require_topic_config_values(described, topic, expected_values)
+            return
+        except Exception as exc:
+            last_error = exc
+        correlation_id += 2
+        time.sleep(0.25)
+    raise TestError(f"CreateTopics seed did not recover for {topic!r}: {last_error}")
+
+
+def wait_for_create_topics_checkpoint(
+    port,
+    topic,
+    configs,
+    expected_values,
+    validate_only_topic,
+    timeout=30,
+):
+    deadline = time.time() + timeout
+    correlation_id = 9020
+    last_error = None
+    while time.time() < deadline:
+        try:
+            described = describe_topic_selected_configs(
+                port,
+                topic,
+                list(expected_values.keys()),
+                correlation_id,
+            )
+            require_topic_config_values(described, topic, expected_values)
+            created = create_topic_with_configs(
+                port,
+                validate_only_topic,
+                1,
+                1,
+                configs,
+                True,
+                correlation_id + 1,
+            )
+            require_create_topics_result(
+                created,
+                validate_only_topic,
+                1,
+                1,
+                ERROR_NONE,
+                "CreateTopics validate-only",
+            )
+            validate_only_described = describe_topic_partitions(
+                port,
+                validate_only_topic,
+                correlation_id + 2,
+            )
+            require_deleted_topic_absent(validate_only_described, validate_only_topic)
+            return
+        except Exception as exc:
+            last_error = exc
+        correlation_id += 3
+        time.sleep(0.25)
+    raise TestError(
+        f"CreateTopics checkpoint did not recover for {topic!r}: {last_error}"
     )
 
 
@@ -9848,6 +10050,8 @@ def main():
         idempotent_topic = f"{topic}-idempotent"
         delete_records_topic = f"{topic}-delete-records"
         delete_topics_topic = f"{topic}-delete-topics"
+        create_topics_topic = f"{topic}-create-topics"
+        create_topics_validate_only_topic = f"{topic}-create-topics-validate-only"
         create_partitions_topic = f"{topic}-create-partitions"
         config_admin_topic = f"{topic}-config-admin"
         quota_client_id = f"{group}-quota-client"
@@ -9903,6 +10107,18 @@ def main():
             "cleanup.policy": "compact,delete",
             "min.insync.replicas": "1",
             "segment.bytes": "262144",
+        }
+        create_topics_configs = [
+            ("cleanup.policy", "compact"),
+            ("min.insync.replicas", "1"),
+            ("segment.bytes", "393216"),
+            ("compression.type", "lz4"),
+        ]
+        create_topics_config_values = {
+            "cleanup.policy": "compact",
+            "min.insync.replicas": "1",
+            "segment.bytes": "393216",
+            "compression.type": "lz4",
         }
         kip848_subscription_topic = f"{topic}-kip848-subscription"
         kip848_negative_group_prefix = f"{group}-kip848-negative"
@@ -9960,6 +10176,15 @@ def main():
             wait_for_deleted_topic_checkpoint(
                 broker["port"],
                 delete_topics_topic,
+            )
+
+        def wait_for_create_topics_probe():
+            wait_for_create_topics_checkpoint(
+                broker["port"],
+                create_topics_topic,
+                create_topics_configs,
+                create_topics_config_values,
+                create_topics_validate_only_topic,
             )
 
         def wait_for_topic_partitions_probe():
@@ -10039,6 +10264,7 @@ def main():
         def wait_for_cluster_visibility_probes():
             wait_for_topic_partitions_probe()
             wait_for_delete_topics_probe()
+            wait_for_create_topics_probe()
             wait_for_create_partitions_probe()
             wait_for_client_quotas_probe()
             wait_for_scram_credentials_probe()
@@ -10081,6 +10307,12 @@ def main():
         wait_for_delete_topics_seed(
             broker["port"],
             delete_topics_topic,
+        )
+        wait_for_create_topics_seed(
+            broker["port"],
+            create_topics_topic,
+            create_topics_configs,
+            create_topics_config_values,
         )
         wait_for_create_partitions_mutation(
             broker["port"],
@@ -11229,6 +11461,7 @@ def main():
             f"log_position_apis_checked=true, "
             f"delete_records_checked=true, "
             f"delete_topics_checked=true, "
+            f"create_topics_checked=true, "
             f"create_partitions_checked=true, "
             f"client_quotas_checked=true, "
             f"scram_credentials_checked=true, "
@@ -11486,6 +11719,36 @@ def self_test():
             ERROR_NONE,
             "DeleteTopics fixture",
         )
+
+        create_topics_fixture = struct.pack(">i", 147)
+        create_topics_fixture += b"\x00"  # response header tagged fields
+        create_topics_fixture += struct.pack(">i", 0)
+        create_topics_fixture += write_compact_array_len(1)
+        create_topics_fixture += write_compact_string("create-topics-self-test")
+        create_topics_fixture += bytes(range(16))
+        create_topics_fixture += struct.pack(">h", ERROR_NONE)
+        create_topics_fixture += write_compact_string(None)
+        create_topics_fixture += struct.pack(">ih", 1, 1)
+        create_topics_fixture += write_compact_array_len(1)
+        create_topics_fixture += write_compact_string("cleanup.policy")
+        create_topics_fixture += write_compact_string("compact")
+        create_topics_fixture += b"\x00"  # read_only=false
+        create_topics_fixture += struct.pack(">b", 5)
+        create_topics_fixture += b"\x00"  # is_sensitive=false
+        create_topics_fixture += b"\x00"  # config tagged fields
+        create_topics_fixture += b"\x00"  # topic tagged fields
+        create_topics_fixture += b"\x00"  # response tagged fields
+        created_topics = parse_create_topics_response(create_topics_fixture, 147)
+        require_create_topics_result(
+            created_topics,
+            "create-topics-self-test",
+            1,
+            1,
+            ERROR_NONE,
+            "CreateTopics fixture",
+        )
+        if created_topics["topics"][0]["configs"][0]["value"] != "compact":
+            raise TestError(f"CreateTopics fixture parser failed: {created_topics}")
 
         init_fixture = struct.pack(">iihqh", 44, 0, 0, 1000, 0)
         identity = parse_init_producer_id_response(init_fixture, 44)
