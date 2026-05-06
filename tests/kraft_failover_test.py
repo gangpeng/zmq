@@ -2053,6 +2053,186 @@ def wait_for_coordinator_discovery(
     )
 
 
+def parse_consumer_group_heartbeat_assignment(response, pos):
+    topic_count, pos = read_compact_array_len(response, pos)
+    topics = []
+    for _ in range(topic_count):
+        if pos + 16 > len(response):
+            raise TestError("buffer underflow while reading heartbeat topic id")
+        topic_id = response[pos : pos + 16]
+        pos += 16
+        partitions, pos = read_compact_i32_array(response, pos)
+        pos = skip_tags(response, pos)
+        topics.append({"topic_id": topic_id, "partitions": partitions})
+    pos = skip_tags(response, pos)
+    return {"topic_partitions": topics}, pos
+
+
+def parse_consumer_group_heartbeat_response(response, correlation_id):
+    pos = parse_flexible_response_header(response, correlation_id)
+    _, pos = read_i32(response, pos)  # throttle_time_ms
+    error_code, pos = read_i16(response, pos)
+    error_message, pos = read_compact_string(response, pos)
+    member_id, pos = read_compact_string(response, pos)
+    member_epoch, pos = read_i32(response, pos)
+    heartbeat_interval_ms, pos = read_i32(response, pos)
+    assignment_present, pos = read_varint(response, pos)
+    assignment = None
+    if assignment_present != 0:
+        assignment, pos = parse_consumer_group_heartbeat_assignment(response, pos)
+    pos = skip_tags(response, pos)
+    if pos != len(response):
+        raise TestError(
+            f"ConsumerGroupHeartbeat response trailing bytes: {len(response) - pos}"
+        )
+    return {
+        "error_code": error_code,
+        "error_message": error_message,
+        "member_id": member_id,
+        "member_epoch": member_epoch,
+        "heartbeat_interval_ms": heartbeat_interval_ms,
+        "assignment": assignment,
+    }
+
+
+def write_consumer_group_heartbeat_topic_partitions(topic_partitions):
+    if topic_partitions is None:
+        return b"\x00"
+    out = bytearray(write_compact_array_len(len(topic_partitions)))
+    for topic in topic_partitions:
+        topic_id = topic["topic_id"]
+        if len(topic_id) != 16:
+            raise TestError(f"invalid heartbeat topic id length {len(topic_id)}")
+        out += topic_id
+        out += write_compact_i32_array(topic["partitions"])
+        out += b"\x00"  # topic tagged fields
+    return bytes(out)
+
+
+def consumer_group_heartbeat(
+    port,
+    group_id,
+    member_id,
+    member_epoch,
+    correlation_id,
+    subscribed_topics=None,
+    server_assignor=None,
+    topic_partitions=None,
+):
+    body = write_compact_string(group_id)
+    body += write_compact_string(member_id)
+    body += struct.pack(">i", member_epoch)
+    body += write_compact_string(None)  # instance_id
+    body += write_compact_string(None)  # rack_id
+    body += struct.pack(">i", 30000 if member_epoch == 0 else -1)
+    if subscribed_topics is None:
+        body += b"\x00"
+    else:
+        body += write_compact_array_len(len(subscribed_topics))
+        for subscribed_topic in subscribed_topics:
+            body += write_compact_string(subscribed_topic)
+    body += write_compact_string(server_assignor)
+    body += write_consumer_group_heartbeat_topic_partitions(topic_partitions)
+    body += b"\x00"  # request tagged fields
+    response = flexible_kafka_request(port, 68, 0, correlation_id, body)
+    return parse_consumer_group_heartbeat_response(response, correlation_id)
+
+
+def assert_consumer_group_heartbeat_assignment(response, group_state):
+    if response["error_code"] != 0:
+        raise TestError(
+            f"ConsumerGroupHeartbeat {group_state['group_id']!r} error_code="
+            f"{response['error_code']} message={response['error_message']!r}"
+        )
+    if response["member_id"] != group_state["member_id"]:
+        raise TestError(f"ConsumerGroupHeartbeat member mismatch: {response}")
+    if response["member_epoch"] < group_state["member_epoch"]:
+        raise TestError(f"ConsumerGroupHeartbeat epoch regressed: {response}")
+    if response["heartbeat_interval_ms"] != 3000:
+        raise TestError(f"ConsumerGroupHeartbeat interval mismatch: {response}")
+    assignment = response["assignment"]
+    if assignment is None:
+        raise TestError(f"ConsumerGroupHeartbeat missing assignment: {response}")
+    matching_topic = next(
+        (
+            topic
+            for topic in assignment["topic_partitions"]
+            if topic["topic_id"] == group_state["topic_id"]
+        ),
+        None,
+    )
+    if matching_topic is None:
+        raise TestError(f"ConsumerGroupHeartbeat missing topic assignment: {response}")
+    if matching_topic["partitions"] != [0]:
+        raise TestError(f"ConsumerGroupHeartbeat partition mismatch: {response}")
+    group_state["member_epoch"] = response["member_epoch"]
+
+
+def wait_for_consumer_group_heartbeat_join(port, group_id, topic, timeout=30):
+    deadline = time.time() + timeout
+    correlation_id = 7700
+    member_id = f"{group_id}-member"
+    last_error = None
+    while time.time() < deadline:
+        try:
+            response = consumer_group_heartbeat(
+                port,
+                group_id,
+                member_id,
+                0,
+                correlation_id,
+                subscribed_topics=[topic],
+                server_assignor="range",
+            )
+            if response["error_code"] != 0:
+                raise TestError(
+                    f"join error_code={response['error_code']} "
+                    f"message={response['error_message']!r}"
+                )
+            assignment = response["assignment"]
+            if assignment is None or not assignment["topic_partitions"]:
+                raise TestError(f"join missing assignment: {response}")
+            topic_assignment = assignment["topic_partitions"][0]
+            group_state = {
+                "group_id": group_id,
+                "member_id": response["member_id"],
+                "member_epoch": response["member_epoch"],
+                "topic_id": topic_assignment["topic_id"],
+            }
+            assert_consumer_group_heartbeat_assignment(response, group_state)
+            return group_state
+        except Exception as exc:
+            last_error = exc
+        correlation_id += 1
+        time.sleep(0.25)
+    raise TestError(f"ConsumerGroupHeartbeat group {group_id!r} did not join: {last_error}")
+
+
+def wait_for_consumer_group_heartbeat(port, group_state, timeout=30):
+    deadline = time.time() + timeout
+    correlation_id = 7800
+    last_error = None
+    while time.time() < deadline:
+        try:
+            response = consumer_group_heartbeat(
+                port,
+                group_state["group_id"],
+                group_state["member_id"],
+                group_state["member_epoch"],
+                correlation_id,
+            )
+            assert_consumer_group_heartbeat_assignment(response, group_state)
+            return
+        except Exception as exc:
+            last_error = exc
+        correlation_id += 1
+        time.sleep(0.25)
+    raise TestError(
+        f"ConsumerGroupHeartbeat did not recover for "
+        f"{group_state['group_id']!r}: {last_error}"
+    )
+
+
 def parse_leave_group_response(response, correlation_id):
     pos = 0
     response_correlation, pos = read_i32(response, pos)
@@ -4401,6 +4581,12 @@ def main():
             classic_group_state["group_id"],
             controller_failover_txn["transactional_id"],
         )
+        kip848_group_state = wait_for_consumer_group_heartbeat_join(
+            broker["port"],
+            f"{group}-kip848",
+            topic,
+        )
+        wait_for_consumer_group_heartbeat(broker["port"], kip848_group_state)
 
         network_partition_result = run_network_partition_matrix(
             processes, broker, topic, expected_payloads, leader_id
@@ -4431,6 +4617,7 @@ def main():
             classic_group_state["group_id"],
             controller_failover_txn["transactional_id"],
         )
+        wait_for_consumer_group_heartbeat(broker["port"], kip848_group_state)
 
         stop_process(processes[leader_id]["proc"], crash=True)
         replacement_leader, after = wait_for_leader(processes, forbidden_leaders={leader_id})
@@ -4475,6 +4662,7 @@ def main():
             classic_group_state["group_id"],
             controller_failover_txn["transactional_id"],
         )
+        wait_for_consumer_group_heartbeat(broker["port"], kip848_group_state)
         expected_payloads.append(b"r1")
         second_offset = wait_for_produce(broker["port"], topic, expected_payloads[-1])
         if second_offset <= first_offset:
@@ -4529,6 +4717,7 @@ def main():
             classic_group_state["group_id"],
             controller_failover_txn["transactional_id"],
         )
+        wait_for_consumer_group_heartbeat(broker["port"], kip848_group_state)
         expected_payloads.append(b"r2")
         third_offset = wait_for_produce(broker["port"], topic, expected_payloads[-1])
         if third_offset <= second_offset:
@@ -4588,6 +4777,7 @@ def main():
             classic_group_state["group_id"],
             controller_failover_txn["transactional_id"],
         )
+        wait_for_consumer_group_heartbeat(broker["port"], kip848_group_state)
         expected_payloads.append(b"r3")
         fourth_offset = wait_for_produce(
             broker["port"], topic, expected_payloads[-1]
@@ -4659,6 +4849,7 @@ def main():
             classic_group_state["group_id"],
             controller_failover_txn["transactional_id"],
         )
+        wait_for_consumer_group_heartbeat(broker["port"], kip848_group_state)
         duplicate_idempotent = wait_for_record_batch_result(
             broker["port"],
             idempotent_topic,
@@ -4791,6 +4982,7 @@ def main():
             f"consumer_group_describe_checked=true, "
             f"list_groups_checked=true, "
             f"find_coordinator_checked=true, "
+            f"consumer_group_heartbeat_checked=true, "
             f"network_partition={network_partition_result}, "
             f"automq_old_leader_fresh_rejoin={automq_result['old_leader_fresh_rejoin']})"
         )
@@ -5106,6 +5298,36 @@ def self_test():
             or coordinators[1]["error_code"] != 0
         ):
             raise TestError(f"FindCoordinator fixture parser failed: {coordinators}")
+
+        heartbeat_topic_id = bytes(range(16))
+        consumer_group_heartbeat_fixture = struct.pack(">i", 59)
+        consumer_group_heartbeat_fixture += b"\x00"  # response header tagged fields
+        consumer_group_heartbeat_fixture += struct.pack(">ih", 0, 0)
+        consumer_group_heartbeat_fixture += write_compact_string(None)
+        consumer_group_heartbeat_fixture += write_compact_string("kip848-member")
+        consumer_group_heartbeat_fixture += struct.pack(">ii", 1, 3000)
+        consumer_group_heartbeat_fixture += write_varint(1)  # assignment present
+        consumer_group_heartbeat_fixture += write_compact_array_len(1)
+        consumer_group_heartbeat_fixture += heartbeat_topic_id
+        consumer_group_heartbeat_fixture += write_compact_i32_array([0])
+        consumer_group_heartbeat_fixture += b"\x00"  # topic tagged fields
+        consumer_group_heartbeat_fixture += b"\x00"  # assignment tagged fields
+        consumer_group_heartbeat_fixture += b"\x00"  # response tagged fields
+        heartbeat = parse_consumer_group_heartbeat_response(
+            consumer_group_heartbeat_fixture, 59
+        )
+        if (
+            heartbeat["error_code"] != 0
+            or heartbeat["member_id"] != "kip848-member"
+            or heartbeat["member_epoch"] != 1
+            or heartbeat["heartbeat_interval_ms"] != 3000
+            or heartbeat["assignment"]["topic_partitions"][0]["topic_id"]
+            != heartbeat_topic_id
+            or heartbeat["assignment"]["topic_partitions"][0]["partitions"] != [0]
+        ):
+            raise TestError(
+                f"ConsumerGroupHeartbeat fixture parser failed: {heartbeat}"
+            )
 
         leave_fixture = struct.pack(">ih", 50, 0)
         parse_leave_group_response(leave_fixture, 50)
