@@ -23290,24 +23290,33 @@ pub const Broker = struct {
 
         if (!validateIncrementalAlterConfigsRequestFrame(request_bytes, body_start, api_version)) {
             log.warn("Malformed IncrementalAlterConfigs request", .{});
-            return null;
+            return self.incrementalAlterConfigsErrorResponse(req_header, resp_header_version, api_version, ErrorCode.invalid_request, "Invalid request");
         }
 
         var pos = body_start;
         var req = Req.deserialize(self.allocator, request_bytes, &pos, api_version) catch |err| {
             log.warn("Failed to decode IncrementalAlterConfigs request: {}", .{err});
-            return null;
+            return self.incrementalAlterConfigsErrorResponse(req_header, resp_header_version, api_version, ErrorCode.invalid_request, "Invalid request");
         };
         defer self.freeIncrementalAlterConfigsRequest(&req);
 
-        const responses = self.allocator.alloc(ResourceResponse, req.resources.len) catch return null;
+        const responses = self.allocator.alloc(ResourceResponse, req.resources.len) catch |err| {
+            log.warn("IncrementalAlterConfigs response materialization failed: {}", .{err});
+            return self.incrementalAlterConfigsErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error, "Failed to materialize IncrementalAlterConfigs response");
+        };
         defer if (responses.len > 0) self.allocator.free(responses);
 
-        const mutated_resources = self.allocator.alloc(bool, req.resources.len) catch return null;
+        const mutated_resources = self.allocator.alloc(bool, req.resources.len) catch |err| {
+            log.warn("IncrementalAlterConfigs mutation flag materialization failed: {}", .{err});
+            return self.incrementalAlterConfigsErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error, "Failed to materialize IncrementalAlterConfigs mutation state");
+        };
         defer if (mutated_resources.len > 0) self.allocator.free(mutated_resources);
         @memset(mutated_resources, false);
 
-        const previous_snapshot = if (!req.validate_only) self.encodeTopicSnapshotRecordValue() catch return null else null;
+        const previous_snapshot = if (!req.validate_only) self.encodeTopicSnapshotRecordValue() catch |err| {
+            log.warn("IncrementalAlterConfigs rollback snapshot materialization failed: {}", .{err});
+            return self.incrementalAlterConfigsErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error, "Failed to materialize IncrementalAlterConfigs rollback snapshot");
+        } else null;
         defer if (previous_snapshot) |snapshot| self.allocator.free(snapshot);
 
         var mutated = false;
@@ -23339,7 +23348,10 @@ pub const Broker = struct {
                     .throttle_time_ms = 0,
                     .responses = responses,
                 };
-                return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+                return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version) orelse {
+                    log.warn("IncrementalAlterConfigs snapshot-error response serialization failed", .{});
+                    return self.incrementalAlterConfigsErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error, "Failed to serialize IncrementalAlterConfigs response");
+                };
             };
             self.persistTopicAndObjectLocalMetadataDurably() catch |err| {
                 log.warn("Failed to persist IncrementalAlterConfigs local metadata: {}", .{err});
@@ -23360,7 +23372,10 @@ pub const Broker = struct {
                     .throttle_time_ms = 0,
                     .responses = responses,
                 };
-                return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+                return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version) orelse {
+                    log.warn("IncrementalAlterConfigs local-persistence-error response serialization failed", .{});
+                    return self.incrementalAlterConfigsErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error, "Failed to serialize IncrementalAlterConfigs response");
+                };
             };
         }
 
@@ -23368,7 +23383,10 @@ pub const Broker = struct {
             .throttle_time_ms = 0,
             .responses = responses,
         };
-        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version) orelse {
+            log.warn("IncrementalAlterConfigs response serialization failed", .{});
+            return self.incrementalAlterConfigsErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error, "Failed to serialize IncrementalAlterConfigs response");
+        };
     }
 
     fn freeIncrementalAlterConfigsRequest(self: *Broker, req: *generated.incremental_alter_configs_request.IncrementalAlterConfigsRequest) void {
@@ -33425,6 +33443,25 @@ fn expectAlterConfigsErrorResponseBytes(response: []const u8, api_version: i16, 
 
     var rpos: usize = 0;
     var response_header = try ResponseHeader.deserialize(testing.allocator, response, &rpos, header_mod.responseHeaderVersion(33, api_version));
+    defer response_header.deinit(testing.allocator);
+    try testing.expectEqual(correlation_id, response_header.correlation_id);
+
+    const resp = try Resp.deserialize(testing.allocator, response, &rpos, api_version);
+    defer if (resp.responses.len > 0) testing.allocator.free(resp.responses);
+
+    try testing.expectEqual(response.len, rpos);
+    try testing.expectEqual(@as(i32, 0), resp.throttle_time_ms);
+    try testing.expectEqual(@as(usize, 1), resp.responses.len);
+    try testing.expectEqual(@as(i16, @intFromEnum(err_code)), resp.responses[0].error_code);
+    try testing.expectEqual(@as(i8, 0), resp.responses[0].resource_type);
+    try testing.expect(resp.responses[0].resource_name == null);
+}
+
+fn expectIncrementalAlterConfigsErrorResponseBytes(response: []const u8, api_version: i16, correlation_id: i32, err_code: ErrorCode) !void {
+    const Resp = generated.incremental_alter_configs_response.IncrementalAlterConfigsResponse;
+
+    var rpos: usize = 0;
+    var response_header = try ResponseHeader.deserialize(testing.allocator, response, &rpos, header_mod.responseHeaderVersion(44, api_version));
     defer response_header.deinit(testing.allocator);
     try testing.expectEqual(correlation_id, response_header.correlation_id);
 
@@ -45218,7 +45255,11 @@ test "Broker.handleRequest IncrementalAlterConfigs rejects truncated request" {
 
     var buf: [128]u8 = undefined;
     const req_len = buildTestRequest(&buf, 44, 1, 4404, header_mod.requestHeaderVersion(44, 1));
-    try testing.expect(broker.handleRequest(buf[0..req_len]) == null);
+    const response = broker.handleRequest(buf[0..req_len]);
+    try testing.expect(response != null);
+    defer testing.allocator.free(response.?);
+
+    try expectIncrementalAlterConfigsErrorResponseBytes(response.?, 1, 4404, ErrorCode.invalid_request);
 }
 
 test "Broker.handleRequest IncrementalAlterConfigs rejects trailing bytes" {
@@ -45243,10 +45284,129 @@ test "Broker.handleRequest IncrementalAlterConfigs rejects trailing bytes" {
     };
 
     var buf: [512]u8 = undefined;
-    var pos = buildTestRequest(&buf, 44, 1, 4406, header_mod.requestHeaderVersion(44, 1));
+    var pos = buildTestRequest(&buf, 44, 1, 4418, header_mod.requestHeaderVersion(44, 1));
     req.serialize(&buf, &pos, 1);
 
-    try expectTrailingByteRejected(&broker, &buf, pos);
+    try testing.expect(pos < buf.len);
+    buf[pos] = 0x7f;
+    const response = broker.handleRequest(buf[0 .. pos + 1]);
+    try testing.expect(response != null);
+    defer testing.allocator.free(response.?);
+
+    try expectIncrementalAlterConfigsErrorResponseBytes(response.?, 1, 4418, ErrorCode.invalid_request);
+}
+
+test "Broker.handleRequest IncrementalAlterConfigs fails closed when response materialization fails" {
+    const Req = generated.incremental_alter_configs_request.IncrementalAlterConfigsRequest;
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+    try testing.expect(broker.ensureTopic("inc-cfg-materialize-fail-topic"));
+    const before = broker.topics.get("inc-cfg-materialize-fail-topic").?.config.max_message_bytes;
+
+    const configs = [_]Req.AlterConfigsResource.AlterableConfig{.{
+        .name = "max.message.bytes",
+        .config_operation = 0,
+        .value = "4096",
+    }};
+    const resources = [_]Req.AlterConfigsResource{.{
+        .resource_type = 2,
+        .resource_name = "inc-cfg-materialize-fail-topic",
+        .configs = &configs,
+    }};
+    const req = Req{
+        .resources = &resources,
+        .validate_only = false,
+    };
+
+    var buf: [512]u8 = undefined;
+    var pos = buildTestRequest(&buf, 44, 1, 4419, header_mod.requestHeaderVersion(44, 1));
+    req.serialize(&buf, &pos, 1);
+
+    var failing_allocator = OneShotFailingAllocator.init(testing.allocator, 2);
+    const response_allocator = failing_allocator.allocator();
+    broker.allocator = response_allocator;
+
+    const response = broker.handleRequest(buf[0..pos]);
+    broker.allocator = testing.allocator;
+
+    try testing.expect(failing_allocator.failed);
+    try testing.expect(response != null);
+    defer response_allocator.free(response.?);
+
+    try expectIncrementalAlterConfigsErrorResponseBytes(response.?, 1, 4419, ErrorCode.kafka_storage_error);
+    try testing.expectEqual(before, broker.topics.get("inc-cfg-materialize-fail-topic").?.config.max_message_bytes);
+}
+
+test "Broker.handleRequest IncrementalAlterConfigs fails closed when rollback snapshot materialization fails" {
+    const Req = generated.incremental_alter_configs_request.IncrementalAlterConfigsRequest;
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+    try testing.expect(broker.ensureTopic("inc-cfg-snapshot-fail-topic"));
+    const before = broker.topics.get("inc-cfg-snapshot-fail-topic").?.config.max_message_bytes;
+
+    const configs = [_]Req.AlterConfigsResource.AlterableConfig{.{
+        .name = "max.message.bytes",
+        .config_operation = 0,
+        .value = "4096",
+    }};
+    const resources = [_]Req.AlterConfigsResource{.{
+        .resource_type = 2,
+        .resource_name = "inc-cfg-snapshot-fail-topic",
+        .configs = &configs,
+    }};
+    const req = Req{
+        .resources = &resources,
+        .validate_only = false,
+    };
+
+    var buf: [512]u8 = undefined;
+    var pos = buildTestRequest(&buf, 44, 1, 4420, header_mod.requestHeaderVersion(44, 1));
+    req.serialize(&buf, &pos, 1);
+
+    var failing_allocator = OneShotFailingAllocator.init(testing.allocator, 4);
+    const response_allocator = failing_allocator.allocator();
+    broker.allocator = response_allocator;
+
+    const response = broker.handleRequest(buf[0..pos]);
+    broker.allocator = testing.allocator;
+
+    try testing.expect(failing_allocator.failed);
+    try testing.expect(response != null);
+    defer response_allocator.free(response.?);
+
+    try expectIncrementalAlterConfigsErrorResponseBytes(response.?, 1, 4420, ErrorCode.kafka_storage_error);
+    try testing.expectEqual(before, broker.topics.get("inc-cfg-snapshot-fail-topic").?.config.max_message_bytes);
+}
+
+test "Broker.handleRequest IncrementalAlterConfigs fails closed when serialization fails" {
+    const Req = generated.incremental_alter_configs_request.IncrementalAlterConfigsRequest;
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+
+    const req = Req{
+        .resources = &.{},
+        .validate_only = true,
+    };
+
+    var buf: [128]u8 = undefined;
+    var pos = buildTestRequest(&buf, 44, 1, 4421, header_mod.requestHeaderVersion(44, 1));
+    req.serialize(&buf, &pos, 1);
+
+    var failing_allocator = OneShotFailingAllocator.init(testing.allocator, 0);
+    const response_allocator = failing_allocator.allocator();
+    broker.allocator = response_allocator;
+
+    const response = broker.handleRequest(buf[0..pos]);
+    broker.allocator = testing.allocator;
+
+    try testing.expect(failing_allocator.failed);
+    try testing.expect(response != null);
+    defer response_allocator.free(response.?);
+
+    try expectIncrementalAlterConfigsErrorResponseBytes(response.?, 1, 4421, ErrorCode.kafka_storage_error);
 }
 
 test "Broker.handleRequest OffsetDelete returns generated response and deletes offsets" {
