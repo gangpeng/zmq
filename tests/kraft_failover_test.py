@@ -47,6 +47,7 @@ ERROR_NONE = 0
 ERROR_UNKNOWN_TOPIC_OR_PARTITION = 3
 ERROR_TOPIC_ALREADY_EXISTS = 36
 ERROR_GROUP_ID_NOT_FOUND = 69
+ERROR_SNAPSHOT_NOT_FOUND = 98
 ERROR_UNKNOWN_MEMBER_ID = 25
 ERROR_INVALID_REQUEST = 42
 ERROR_FENCED_MEMBER_EPOCH = 110
@@ -9550,6 +9551,191 @@ def wait_for_describe_quorum_v2_checkpoint(
     raise TestError(f"DescribeQuorum v2 did not recover during {label}: {last_error}")
 
 
+def fetch_snapshot_v1_body(end_offset, epoch, position):
+    body = bytearray()
+    body += struct.pack(">ii", 100, 128)  # replica_id, max_bytes
+    body += write_compact_array_len(1)
+    body += write_compact_string("__cluster_metadata")
+    body += write_compact_array_len(1)
+    body += struct.pack(">iiqi", 0, -1, end_offset, epoch)
+    body += b"\x00"  # snapshot_id tagged fields
+    body += struct.pack(">q", position)
+    body += b"\x00"  # partition tagged fields
+    body += b"\x00"  # topic tagged fields
+    body += b"\x00"  # request tagged fields
+    return bytes(body)
+
+
+def parse_current_leader_tag(data):
+    pos = 0
+    leader_id, pos = read_i32(data, pos)
+    leader_epoch, pos = read_i32(data, pos)
+    pos = skip_tags(data, pos)
+    if pos != len(data):
+        raise TestError(
+            f"FetchSnapshot current_leader tag trailing bytes: {len(data) - pos}"
+        )
+    return {"leader_id": leader_id, "leader_epoch": leader_epoch}
+
+
+def parse_fetch_snapshot_node_endpoints_tag(data):
+    pos = 0
+    endpoint_count, pos = read_compact_array_len(data, pos)
+    endpoints = []
+    for _ in range(endpoint_count):
+        node_id, pos = read_i32(data, pos)
+        host, pos = read_compact_string(data, pos)
+        endpoint_port, pos = read_u16(data, pos)
+        pos = skip_tags(data, pos)
+        endpoints.append({"node_id": node_id, "host": host, "port": endpoint_port})
+    if pos != len(data):
+        raise TestError(
+            f"FetchSnapshot node_endpoints tag trailing bytes: {len(data) - pos}"
+        )
+    return endpoints
+
+
+def parse_fetch_snapshot_response(response, correlation_id):
+    pos = parse_flexible_response_header(response, correlation_id)
+    throttle_time_ms, pos = read_i32(response, pos)
+    error_code, pos = read_i16(response, pos)
+    topic_count, pos = read_compact_array_len(response, pos)
+    topics = []
+    for _ in range(topic_count):
+        topic_name, pos = read_compact_string(response, pos)
+        partition_count, pos = read_compact_array_len(response, pos)
+        partitions = []
+        for _ in range(partition_count):
+            partition_index, pos = read_i32(response, pos)
+            partition_error, pos = read_i16(response, pos)
+            snapshot_end_offset, pos = read_i64(response, pos)
+            snapshot_epoch, pos = read_i32(response, pos)
+            pos = skip_tags(response, pos)
+            size, pos = read_i64(response, pos)
+            position, pos = read_i64(response, pos)
+            records, pos = read_compact_bytes(response, pos)
+            current_leader = None
+            fields, pos = read_tagged_fields(response, pos)
+            for tag, data in fields:
+                if tag == 0:
+                    current_leader = parse_current_leader_tag(data)
+            partitions.append(
+                {
+                    "partition_index": partition_index,
+                    "error_code": partition_error,
+                    "snapshot_end_offset": snapshot_end_offset,
+                    "snapshot_epoch": snapshot_epoch,
+                    "size": size,
+                    "position": position,
+                    "records": records,
+                    "current_leader": current_leader,
+                }
+            )
+        pos = skip_tags(response, pos)
+        topics.append({"name": topic_name, "partitions": partitions})
+
+    node_endpoints = []
+    fields, pos = read_tagged_fields(response, pos)
+    for tag, data in fields:
+        if tag == 0:
+            node_endpoints = parse_fetch_snapshot_node_endpoints_tag(data)
+    if pos != len(response):
+        raise TestError(
+            f"FetchSnapshot response trailing bytes: {len(response) - pos}"
+        )
+    return {
+        "throttle_time_ms": throttle_time_ms,
+        "error_code": error_code,
+        "topics": topics,
+        "node_endpoints": node_endpoints,
+    }
+
+
+def fetch_snapshot_v1(port, end_offset, epoch, position, correlation_id):
+    response = flexible_kafka_request(
+        port,
+        59,
+        1,
+        correlation_id,
+        fetch_snapshot_v1_body(end_offset, epoch, position),
+    )
+    return parse_fetch_snapshot_response(response, correlation_id)
+
+
+def wait_for_fetch_snapshot_checkpoint(
+    port,
+    expected_leader_id,
+    expected_leader_port,
+    state,
+    label,
+    timeout=30,
+):
+    deadline = time.time() + timeout
+    correlation_id = state.get("correlation_id", 9240)
+    snapshot_end_offset = 987654321
+    snapshot_epoch = 77
+    snapshot_position = 12
+    last_error = None
+    while time.time() < deadline:
+        try:
+            response = fetch_snapshot_v1(
+                port,
+                snapshot_end_offset,
+                snapshot_epoch,
+                snapshot_position,
+                correlation_id,
+            )
+            if (
+                response["throttle_time_ms"] != 0
+                or response["error_code"] != ERROR_NONE
+                or len(response["topics"]) != 1
+                or response["topics"][0]["name"] != "__cluster_metadata"
+                or len(response["topics"][0]["partitions"]) != 1
+            ):
+                raise TestError(f"FetchSnapshot v1 invalid response: {response}")
+            partition = response["topics"][0]["partitions"][0]
+            if (
+                partition["partition_index"] != 0
+                or partition["error_code"] != ERROR_SNAPSHOT_NOT_FOUND
+                or partition["snapshot_end_offset"] != snapshot_end_offset
+                or partition["snapshot_epoch"] != snapshot_epoch
+                or partition["position"] != snapshot_position
+                or partition["records"] is not None
+            ):
+                raise TestError(
+                    f"FetchSnapshot v1 unexpected partition during {label}: "
+                    f"{partition}"
+                )
+            current_leader = partition["current_leader"]
+            if (
+                current_leader is None
+                or current_leader["leader_id"] != expected_leader_id
+                or current_leader["leader_epoch"] < 0
+            ):
+                raise TestError(
+                    f"FetchSnapshot v1 leader tag mismatch during {label}: "
+                    f"{current_leader}"
+                )
+            if response["node_endpoints"] != [
+                {
+                    "node_id": expected_leader_id,
+                    "host": "127.0.0.1",
+                    "port": expected_leader_port,
+                }
+            ]:
+                raise TestError(
+                    f"FetchSnapshot v1 endpoint mismatch during {label}: "
+                    f"{response['node_endpoints']}"
+                )
+            state["correlation_id"] = correlation_id + 1
+            return response
+        except Exception as exc:
+            last_error = exc
+        correlation_id += 1
+        time.sleep(0.25)
+    raise TestError(f"FetchSnapshot v1 did not recover during {label}: {last_error}")
+
+
 def tail(path, limit=12000):
     try:
         with open(path, "rb") as f:
@@ -10286,6 +10472,14 @@ def main():
             describe_quorum_state,
             "initial leader",
         )
+        fetch_snapshot_state = {"correlation_id": 9240}
+        wait_for_fetch_snapshot_checkpoint(
+            processes[leader_id]["port"],
+            leader_id,
+            ports[leader_id],
+            fetch_snapshot_state,
+            "initial leader",
+        )
 
         broker = start_broker(tmp, voters)
         wait_for_broker_ready(broker["proc"], broker["port"], broker["log_path"])
@@ -10903,6 +11097,13 @@ def main():
                 describe_quorum_state,
                 "network partition matrix",
             )
+            wait_for_fetch_snapshot_checkpoint(
+                processes[leader_id]["port"],
+                leader_id,
+                ports[leader_id],
+                fetch_snapshot_state,
+                "network partition matrix",
+            )
             wait_for_allocate_producer_ids_checkpoint(
                 processes[leader_id]["port"],
                 producer_id_state,
@@ -11027,6 +11228,13 @@ def main():
             processes[replacement_leader]["port"],
             ports,
             describe_quorum_state,
+            "controller leader failover",
+        )
+        wait_for_fetch_snapshot_checkpoint(
+            processes[replacement_leader]["port"],
+            replacement_leader,
+            ports[replacement_leader],
+            fetch_snapshot_state,
             "controller leader failover",
         )
         wait_for_allocate_producer_ids_checkpoint(
@@ -11191,6 +11399,13 @@ def main():
             describe_quorum_state,
             "old leader fresh rejoin",
         )
+        wait_for_fetch_snapshot_checkpoint(
+            processes[replacement_leader]["port"],
+            replacement_leader,
+            ports[replacement_leader],
+            fetch_snapshot_state,
+            "old leader fresh rejoin",
+        )
         wait_for_allocate_producer_ids_checkpoint(
             processes[replacement_leader]["port"],
             producer_id_state,
@@ -11350,6 +11565,13 @@ def main():
             describe_quorum_state,
             "surviving controller restart",
         )
+        wait_for_fetch_snapshot_checkpoint(
+            processes[replacement_leader]["port"],
+            replacement_leader,
+            ports[replacement_leader],
+            fetch_snapshot_state,
+            "surviving controller restart",
+        )
         wait_for_allocate_producer_ids_checkpoint(
             processes[replacement_leader]["port"],
             producer_id_state,
@@ -11494,6 +11716,13 @@ def main():
             processes[replacement_leader]["port"],
             ports,
             describe_quorum_state,
+            "broker restart",
+        )
+        wait_for_fetch_snapshot_checkpoint(
+            processes[replacement_leader]["port"],
+            replacement_leader,
+            ports[replacement_leader],
+            fetch_snapshot_state,
             "broker restart",
         )
         wait_for_allocate_producer_ids_checkpoint(
@@ -11763,6 +11992,7 @@ def main():
             f"reassignment_target_offset={automq_result['reassignment_target_offset']}, "
             f"allocate_producer_ids_checked=true, "
             f"describe_quorum_v2_checked=true, "
+            f"fetch_snapshot_v1_checked=true, "
             f"committed_offset={committed_offset}, "
             f"transactions_checked=5, "
             f"transaction_introspection_checked=true, "
@@ -12752,6 +12982,50 @@ def self_test():
         ):
             raise TestError(
                 f"DescribeQuorum v2 fixture parser failed: {described_quorum}"
+            )
+
+        fetch_snapshot_fixture = struct.pack(">i", 186)
+        fetch_snapshot_fixture += b"\x00"  # response header tagged fields
+        fetch_snapshot_fixture += struct.pack(">ih", 0, ERROR_NONE)
+        fetch_snapshot_fixture += write_compact_array_len(1)
+        fetch_snapshot_fixture += write_compact_string("__cluster_metadata")
+        fetch_snapshot_fixture += write_compact_array_len(1)
+        fetch_snapshot_fixture += struct.pack(">ihqi", 0, ERROR_SNAPSHOT_NOT_FOUND, 7, 2)
+        fetch_snapshot_fixture += b"\x00"  # snapshot_id tagged fields
+        fetch_snapshot_fixture += struct.pack(">qq", 0, 12)
+        fetch_snapshot_fixture += write_compact_bytes(None)
+        current_leader_tag = struct.pack(">ii", 1, 3) + b"\x00"
+        fetch_snapshot_fixture += write_varint(1)
+        fetch_snapshot_fixture += write_varint(0)
+        fetch_snapshot_fixture += write_varint(len(current_leader_tag))
+        fetch_snapshot_fixture += current_leader_tag
+        fetch_snapshot_fixture += b"\x00"  # topic tagged fields
+        node_endpoints_tag = bytearray()
+        node_endpoints_tag += write_compact_array_len(1)
+        node_endpoints_tag += struct.pack(">i", 1)
+        node_endpoints_tag += write_compact_string("127.0.0.1")
+        node_endpoints_tag += struct.pack(">H", 63094)
+        node_endpoints_tag += b"\x00"  # node endpoint tagged fields
+        fetch_snapshot_fixture += write_varint(1)
+        fetch_snapshot_fixture += write_varint(0)
+        fetch_snapshot_fixture += write_varint(len(node_endpoints_tag))
+        fetch_snapshot_fixture += node_endpoints_tag
+        fetched_snapshot = parse_fetch_snapshot_response(
+            fetch_snapshot_fixture,
+            186,
+        )
+        if (
+            fetched_snapshot["error_code"] != ERROR_NONE
+            or fetched_snapshot["topics"][0]["partitions"][0]["error_code"]
+            != ERROR_SNAPSHOT_NOT_FOUND
+            or fetched_snapshot["topics"][0]["partitions"][0]["current_leader"][
+                "leader_id"
+            ]
+            != 1
+            or fetched_snapshot["node_endpoints"][0]["port"] != 63094
+        ):
+            raise TestError(
+                f"FetchSnapshot v1 fixture parser failed: {fetched_snapshot}"
             )
 
         describe_cluster_fixture = struct.pack(">i", 165)
