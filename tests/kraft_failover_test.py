@@ -1968,6 +1968,91 @@ def wait_for_list_groups(port, group_state, timeout=30):
     )
 
 
+def parse_find_coordinator_response(response, correlation_id):
+    pos = parse_flexible_response_header(response, correlation_id)
+    _, pos = read_i32(response, pos)  # throttle_time_ms
+    coordinator_count, pos = read_compact_array_len(response, pos)
+    coordinators = []
+    for _ in range(coordinator_count):
+        key, pos = read_compact_string(response, pos)
+        node_id, pos = read_i32(response, pos)
+        host, pos = read_compact_string(response, pos)
+        coordinator_port, pos = read_i32(response, pos)
+        error_code, pos = read_i16(response, pos)
+        error_message, pos = read_compact_string(response, pos)
+        pos = skip_tags(response, pos)
+        coordinators.append(
+            {
+                "key": key,
+                "node_id": node_id,
+                "host": host,
+                "port": coordinator_port,
+                "error_code": error_code,
+                "error_message": error_message,
+            }
+        )
+    pos = skip_tags(response, pos)
+    if pos != len(response):
+        raise TestError(
+            f"FindCoordinator response trailing bytes: {len(response) - pos}"
+        )
+    return coordinators
+
+
+def find_coordinator(port, coordinator_key, key_type, correlation_id):
+    body = struct.pack(">b", key_type)
+    body += write_compact_array_len(1)
+    body += write_compact_string(coordinator_key)
+    body += b"\x00"  # request tagged fields
+    response = flexible_kafka_request(port, 10, 4, correlation_id, body)
+    coordinators = parse_find_coordinator_response(response, correlation_id)
+    if len(coordinators) != 1:
+        raise TestError(f"FindCoordinator count={len(coordinators)}")
+    return coordinators[0]
+
+
+def assert_coordinator(port, coordinator_key, key_type, correlation_id):
+    coordinator = find_coordinator(port, coordinator_key, key_type, correlation_id)
+    if coordinator["key"] != coordinator_key:
+        raise TestError(
+            f"FindCoordinator key mismatch: expected={coordinator_key!r} "
+            f"got={coordinator['key']!r}"
+        )
+    if coordinator["error_code"] != 0:
+        raise TestError(
+            f"FindCoordinator {coordinator_key!r} key_type={key_type} "
+            f"error_code={coordinator['error_code']} "
+            f"message={coordinator['error_message']!r}"
+        )
+    if coordinator["node_id"] != 100:
+        raise TestError(f"FindCoordinator node mismatch: {coordinator}")
+    if coordinator["host"] != "localhost":
+        raise TestError(f"FindCoordinator host mismatch: {coordinator}")
+    if coordinator["port"] != BROKER_PORT:
+        raise TestError(f"FindCoordinator port mismatch: {coordinator}")
+
+
+def wait_for_coordinator_discovery(
+    port, group_id, transactional_id, timeout=30
+):
+    deadline = time.time() + timeout
+    correlation_id = 7600
+    last_error = None
+    while time.time() < deadline:
+        try:
+            assert_coordinator(port, group_id, 0, correlation_id)
+            assert_coordinator(port, transactional_id, 1, correlation_id + 1)
+            return
+        except Exception as exc:
+            last_error = exc
+        correlation_id += 2
+        time.sleep(0.25)
+    raise TestError(
+        f"FindCoordinator did not recover for group={group_id!r} "
+        f"transactional_id={transactional_id!r}: {last_error}"
+    )
+
+
 def parse_leave_group_response(response, correlation_id):
     pos = 0
     response_correlation, pos = read_i32(response, pos)
@@ -4311,6 +4396,11 @@ def main():
         wait_for_group_description(broker["port"], classic_group_state)
         wait_for_consumer_group_description(broker["port"], classic_group_state)
         wait_for_list_groups(broker["port"], classic_group_state)
+        wait_for_coordinator_discovery(
+            broker["port"],
+            classic_group_state["group_id"],
+            controller_failover_txn["transactional_id"],
+        )
 
         network_partition_result = run_network_partition_matrix(
             processes, broker, topic, expected_payloads, leader_id
@@ -4336,6 +4426,11 @@ def main():
         wait_for_group_description(broker["port"], classic_group_state)
         wait_for_consumer_group_description(broker["port"], classic_group_state)
         wait_for_list_groups(broker["port"], classic_group_state)
+        wait_for_coordinator_discovery(
+            broker["port"],
+            classic_group_state["group_id"],
+            controller_failover_txn["transactional_id"],
+        )
 
         stop_process(processes[leader_id]["proc"], crash=True)
         replacement_leader, after = wait_for_leader(processes, forbidden_leaders={leader_id})
@@ -4375,6 +4470,11 @@ def main():
         wait_for_group_description(broker["port"], classic_group_state)
         wait_for_consumer_group_description(broker["port"], classic_group_state)
         wait_for_list_groups(broker["port"], classic_group_state)
+        wait_for_coordinator_discovery(
+            broker["port"],
+            classic_group_state["group_id"],
+            controller_failover_txn["transactional_id"],
+        )
         expected_payloads.append(b"r1")
         second_offset = wait_for_produce(broker["port"], topic, expected_payloads[-1])
         if second_offset <= first_offset:
@@ -4424,6 +4524,11 @@ def main():
         wait_for_group_description(broker["port"], classic_group_state)
         wait_for_consumer_group_description(broker["port"], classic_group_state)
         wait_for_list_groups(broker["port"], classic_group_state)
+        wait_for_coordinator_discovery(
+            broker["port"],
+            classic_group_state["group_id"],
+            controller_failover_txn["transactional_id"],
+        )
         expected_payloads.append(b"r2")
         third_offset = wait_for_produce(broker["port"], topic, expected_payloads[-1])
         if third_offset <= second_offset:
@@ -4478,6 +4583,11 @@ def main():
         wait_for_group_description(broker["port"], classic_group_state)
         wait_for_consumer_group_description(broker["port"], classic_group_state)
         wait_for_list_groups(broker["port"], classic_group_state)
+        wait_for_coordinator_discovery(
+            broker["port"],
+            classic_group_state["group_id"],
+            controller_failover_txn["transactional_id"],
+        )
         expected_payloads.append(b"r3")
         fourth_offset = wait_for_produce(
             broker["port"], topic, expected_payloads[-1]
@@ -4544,6 +4654,11 @@ def main():
         wait_for_group_description(broker["port"], classic_group_state)
         wait_for_consumer_group_description(broker["port"], classic_group_state)
         wait_for_list_groups(broker["port"], classic_group_state)
+        wait_for_coordinator_discovery(
+            broker["port"],
+            classic_group_state["group_id"],
+            controller_failover_txn["transactional_id"],
+        )
         duplicate_idempotent = wait_for_record_batch_result(
             broker["port"],
             idempotent_topic,
@@ -4675,6 +4790,7 @@ def main():
             f"group_describe_checked=true, "
             f"consumer_group_describe_checked=true, "
             f"list_groups_checked=true, "
+            f"find_coordinator_checked=true, "
             f"network_partition={network_partition_result}, "
             f"automq_old_leader_fresh_rejoin={automq_result['old_leader_fresh_rejoin']})"
         )
@@ -4963,6 +5079,33 @@ def self_test():
             or listed_groups["groups"][0]["group_type"] != "classic"
         ):
             raise TestError(f"ListGroups fixture parser failed: {listed_groups}")
+
+        find_coordinator_fixture = struct.pack(">i", 58)
+        find_coordinator_fixture += b"\x00"  # response header tagged fields
+        find_coordinator_fixture += struct.pack(">i", 0)
+        find_coordinator_fixture += write_compact_array_len(2)
+        for coordinator_key in (
+            "find-coordinator-group-self-test",
+            "find-coordinator-txn-self-test",
+        ):
+            find_coordinator_fixture += write_compact_string(coordinator_key)
+            find_coordinator_fixture += struct.pack(">i", 100)
+            find_coordinator_fixture += write_compact_string("localhost")
+            find_coordinator_fixture += struct.pack(">ih", BROKER_PORT, 0)
+            find_coordinator_fixture += write_compact_string(None)
+            find_coordinator_fixture += b"\x00"  # coordinator tagged fields
+        find_coordinator_fixture += b"\x00"  # response tagged fields
+        coordinators = parse_find_coordinator_response(find_coordinator_fixture, 58)
+        if (
+            len(coordinators) != 2
+            or coordinators[0]["key"] != "find-coordinator-group-self-test"
+            or coordinators[0]["node_id"] != 100
+            or coordinators[0]["host"] != "localhost"
+            or coordinators[0]["port"] != BROKER_PORT
+            or coordinators[1]["key"] != "find-coordinator-txn-self-test"
+            or coordinators[1]["error_code"] != 0
+        ):
+            raise TestError(f"FindCoordinator fixture parser failed: {coordinators}")
 
         leave_fixture = struct.pack(">ih", 50, 0)
         parse_leave_group_response(leave_fixture, 50)
