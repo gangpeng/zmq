@@ -476,7 +476,11 @@ pub const Controller = struct {
         }
 
         const voter_count = self.raft_state.quorumSize();
-        const voters = self.allocator.alloc(ReplicaState, voter_count) catch return null;
+        const voters = self.allocator.alloc(ReplicaState, voter_count) catch |err| {
+            log.warn("DescribeQuorum voter state allocation failed: {}", .{err});
+            const resp = Resp{ .error_code = ErrorCode.kafka_storage_error.toInt(), .topics = &.{}, .nodes = &.{} };
+            return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+        };
         defer self.allocator.free(voters);
 
         var voter_index: usize = 0;
@@ -491,11 +495,19 @@ pub const Controller = struct {
             };
         }
 
-        const nodes: []const Node = if (api_version >= 2) self.collectDescribeQuorumNodes() catch return null else &.{};
+        const nodes: []const Node = if (api_version >= 2) self.collectDescribeQuorumNodes() catch |err| {
+            log.warn("DescribeQuorum node endpoint allocation failed: {}", .{err});
+            const resp = Resp{ .error_code = ErrorCode.kafka_storage_error.toInt(), .topics = &.{}, .nodes = &.{} };
+            return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+        } else &.{};
         defer self.freeDescribeQuorumNodes(nodes);
 
         const requested_topics = if (req.topics.len == 0) 1 else req.topics.len;
-        const topics = self.allocator.alloc(Topic, requested_topics) catch return null;
+        const topics = self.allocator.alloc(Topic, requested_topics) catch |err| {
+            log.warn("DescribeQuorum topic response allocation failed: {}", .{err});
+            const resp = Resp{ .error_code = ErrorCode.kafka_storage_error.toInt(), .topics = &.{}, .nodes = &.{} };
+            return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+        };
         for (topics) |*topic| {
             topic.* = .{ .topic_name = null, .partitions = &.{} };
         }
@@ -507,7 +519,11 @@ pub const Controller = struct {
         }
 
         if (req.topics.len == 0) {
-            const partitions = self.allocator.alloc(Partition, 1) catch return null;
+            const partitions = self.allocator.alloc(Partition, 1) catch |err| {
+                log.warn("DescribeQuorum default partition response allocation failed: {}", .{err});
+                const resp = Resp{ .error_code = ErrorCode.kafka_storage_error.toInt(), .topics = &.{}, .nodes = &.{} };
+                return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+            };
             partitions[0] = self.describeQuorumPartition(0, voters, api_version);
             topics[0] = .{
                 .topic_name = "__cluster_metadata",
@@ -516,7 +532,11 @@ pub const Controller = struct {
         } else {
             for (req.topics, 0..) |topic_req, topic_index| {
                 const partition_count = if (topic_req.partitions.len == 0) 1 else topic_req.partitions.len;
-                const partitions = self.allocator.alloc(Partition, partition_count) catch return null;
+                const partitions = self.allocator.alloc(Partition, partition_count) catch |err| {
+                    log.warn("DescribeQuorum partition response allocation failed: {}", .{err});
+                    const resp = Resp{ .error_code = ErrorCode.kafka_storage_error.toInt(), .topics = &.{}, .nodes = &.{} };
+                    return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+                };
                 if (topic_req.partitions.len == 0) {
                     partitions[0] = self.describeQuorumPartition(0, voters, api_version);
                 } else {
@@ -545,7 +565,12 @@ pub const Controller = struct {
 
         const nodes = try self.allocator.alloc(Node, self.raft_state.voters.count());
         var initialized: usize = 0;
-        errdefer self.freeDescribeQuorumNodes(nodes[0..initialized]);
+        errdefer {
+            for (nodes[0..initialized]) |node| {
+                if (node.listeners.len > 0) self.allocator.free(@constCast(node.listeners));
+            }
+            self.allocator.free(nodes);
+        }
 
         var it = self.raft_state.voters.iterator();
         while (it.next()) |entry| {
@@ -617,12 +642,20 @@ pub const Controller = struct {
         };
         defer self.freeFetchSnapshotRequest(&req);
 
-        const topics = self.buildFetchSnapshotTopics(&req, api_version) catch return null;
+        const topics = self.buildFetchSnapshotTopics(&req, api_version) catch |err| {
+            log.warn("FetchSnapshot topic response allocation failed: {}", .{err});
+            const resp = Resp{ .throttle_time_ms = 0, .error_code = ErrorCode.kafka_storage_error.toInt(), .topics = &.{}, .node_endpoints = &.{} };
+            return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+        };
         defer {
             self.freeFetchSnapshotTopics(topics);
             if (topics.len > 0) self.allocator.free(topics);
         }
-        const node_endpoints = self.collectFetchSnapshotNodeEndpoints(api_version) catch return null;
+        const node_endpoints = self.collectFetchSnapshotNodeEndpoints(api_version) catch |err| {
+            log.warn("FetchSnapshot leader endpoint allocation failed: {}", .{err});
+            const resp = Resp{ .throttle_time_ms = 0, .error_code = ErrorCode.kafka_storage_error.toInt(), .topics = &.{}, .node_endpoints = &.{} };
+            return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+        };
         defer if (node_endpoints.len > 0) self.allocator.free(node_endpoints);
 
         const resp = Resp{
@@ -2758,6 +2791,68 @@ test "Controller handleRequest DescribeQuorum v2 returns voter node endpoints" {
     try testing.expectEqualSlices(u8, &directory_id, &resp.topics[0].partitions[0].current_voters[0].replica_directory_id);
 }
 
+test "Controller handleRequest DescribeQuorum v2 fails closed on response materialization failure" {
+    const DescribeReq = generated.describe_quorum_request.DescribeQuorumRequest;
+    const DescribeResp = generated.describe_quorum_response.DescribeQuorumResponse;
+
+    var saw_materialization_failure = false;
+    for (2..12) |fail_index| {
+        var ctrl = Controller.init(testing.allocator, 1, "test-cluster");
+        defer ctrl.deinit();
+        try makeTestControllerLeader(&ctrl);
+        _ = try installTestControllerEndpoint(&ctrl, 31, "controller-describe-fail.example", 19793);
+
+        var buf: [256]u8 = undefined;
+        var pos = buildTestRequest(&buf, 55, 2, 5503, header_mod.requestHeaderVersion(55, 2));
+        const req = DescribeReq{};
+        req.serialize(&buf, &pos, 2);
+
+        var failing_allocator = std.testing.FailingAllocator.init(testing.allocator, .{ .fail_index = fail_index });
+        const response_allocator = failing_allocator.allocator();
+        ctrl.allocator = response_allocator;
+        const response = ctrl.handleRequest(buf[0..pos]);
+        ctrl.allocator = testing.allocator;
+
+        if (response) |bytes| {
+            defer response_allocator.free(bytes);
+
+            var rpos: usize = 0;
+            var resp_header = try ResponseHeader.deserialize(testing.allocator, bytes, &rpos, header_mod.responseHeaderVersion(55, 2));
+            defer resp_header.deinit(testing.allocator);
+            try testing.expectEqual(@as(i32, 5503), resp_header.correlation_id);
+
+            const resp = try DescribeResp.deserialize(testing.allocator, bytes, &rpos, 2);
+            defer {
+                for (resp.topics) |topic| {
+                    for (topic.partitions) |partition| {
+                        if (partition.current_voters.len > 0) testing.allocator.free(partition.current_voters);
+                        if (partition.observers.len > 0) testing.allocator.free(partition.observers);
+                    }
+                    if (topic.partitions.len > 0) testing.allocator.free(topic.partitions);
+                }
+                if (resp.topics.len > 0) testing.allocator.free(resp.topics);
+                for (resp.nodes) |node| {
+                    if (node.listeners.len > 0) testing.allocator.free(node.listeners);
+                }
+                if (resp.nodes.len > 0) testing.allocator.free(resp.nodes);
+            }
+
+            if (failing_allocator.has_induced_failure) {
+                saw_materialization_failure = true;
+                if (resp.error_code == ErrorCode.kafka_storage_error.toInt()) {
+                    continue;
+                } else {
+                    try testing.expectEqual(ErrorCode.none.toInt(), resp.error_code);
+                    try testing.expectEqual(@as(usize, 1), resp.nodes.len);
+                }
+            }
+        } else if (failing_allocator.has_induced_failure) {
+            saw_materialization_failure = true;
+        }
+    }
+    try testing.expect(saw_materialization_failure);
+}
+
 test "Controller handleRequest FetchSnapshot returns snapshot not found" {
     const Req = generated.fetch_snapshot_request.FetchSnapshotRequest;
     const Resp = generated.fetch_snapshot_response.FetchSnapshotResponse;
@@ -2861,6 +2956,65 @@ test "Controller handleRequest FetchSnapshot v1 returns current leader endpoint 
     try testing.expectEqual(@as(i32, 1), resp.node_endpoints[0].node_id);
     try testing.expectEqualStrings("controller-1.example", resp.node_endpoints[0].host.?);
     try testing.expectEqual(@as(u16, 19093), resp.node_endpoints[0].port);
+}
+
+test "Controller handleRequest FetchSnapshot v1 fails closed on response materialization failure" {
+    const Req = generated.fetch_snapshot_request.FetchSnapshotRequest;
+    const Resp = generated.fetch_snapshot_response.FetchSnapshotResponse;
+
+    var saw_materialization_failure = false;
+    for (2..12) |fail_index| {
+        var ctrl = Controller.init(testing.allocator, 1, "test-cluster");
+        defer ctrl.deinit();
+        try makeTestControllerLeader(&ctrl);
+        _ = try installTestControllerEndpoint(&ctrl, 32, "controller-fetch-fail.example", 19893);
+
+        const snapshot_id = Req.TopicSnapshot.PartitionSnapshot.SnapshotId{ .end_offset = 7, .epoch = 2 };
+        const partitions = [_]Req.TopicSnapshot.PartitionSnapshot{.{
+            .partition = 0,
+            .current_leader_epoch = -1,
+            .snapshot_id = snapshot_id,
+            .position = 12,
+            .replica_directory_id = [_]u8{4} ** 16,
+        }};
+        const topics = [_]Req.TopicSnapshot{.{ .name = "__cluster_metadata", .partitions = &partitions }};
+        const req = Req{ .replica_id = 2, .max_bytes = 1024, .topics = &topics };
+
+        var buf: [512]u8 = undefined;
+        var pos = buildTestRequest(&buf, 59, 1, 5903, header_mod.requestHeaderVersion(59, 1));
+        req.serialize(&buf, &pos, 1);
+
+        var failing_allocator = std.testing.FailingAllocator.init(testing.allocator, .{ .fail_index = fail_index });
+        const response_allocator = failing_allocator.allocator();
+        ctrl.allocator = response_allocator;
+        const response = ctrl.handleRequest(buf[0..pos]);
+        ctrl.allocator = testing.allocator;
+
+        if (response) |bytes| {
+            defer response_allocator.free(bytes);
+
+            var rpos: usize = 0;
+            var resp_header = try ResponseHeader.deserialize(testing.allocator, bytes, &rpos, header_mod.responseHeaderVersion(59, 1));
+            defer resp_header.deinit(testing.allocator);
+            try testing.expectEqual(@as(i32, 5903), resp_header.correlation_id);
+
+            const resp = try Resp.deserialize(testing.allocator, bytes, &rpos, 1);
+            defer freeDeserializedFetchSnapshotResponse(&resp);
+
+            if (failing_allocator.has_induced_failure) {
+                saw_materialization_failure = true;
+                if (resp.error_code == ErrorCode.kafka_storage_error.toInt()) {
+                    continue;
+                } else {
+                    try testing.expectEqual(ErrorCode.none.toInt(), resp.error_code);
+                    try testing.expectEqual(@as(usize, 1), resp.node_endpoints.len);
+                }
+            }
+        } else if (failing_allocator.has_induced_failure) {
+            saw_materialization_failure = true;
+        }
+    }
+    try testing.expect(saw_materialization_failure);
 }
 
 test "Controller handleRequest FetchSnapshot returns compacted controller snapshot bytes" {

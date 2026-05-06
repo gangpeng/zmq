@@ -253,6 +253,8 @@ reject duplicate node IDs/endpoints, and startup registers static controller
 endpoints into Raft voter metadata with rollback on allocation failure;
 MetadataClient voter registration now rejects duplicate controller peers and
 rolls back the discovery list when RaftClientPool peer allocation fails;
+DescribeQuorum and FetchSnapshot response materialization now fail closed
+without leaking partially built endpoint metadata when allocation fails;
 DeleteTopics partition cleanup removes known local partition state without heap
 key formatting.
 
