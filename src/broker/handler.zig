@@ -7895,20 +7895,23 @@ pub const Broker = struct {
 
         if (!validateAlterPartitionReassignmentsRequestFrame(request_bytes, body_start)) {
             log.warn("Malformed denied AlterPartitionReassignments request", .{});
-            return null;
+            return self.alterPartitionReassignmentsErrorResponse(req_header, resp_header_version, api_version, ErrorCode.invalid_request, "Invalid request");
         }
 
         var pos = body_start;
         var req = Req.deserialize(self.allocator, request_bytes, &pos, api_version) catch |err| {
             log.warn("Failed to decode denied AlterPartitionReassignments request: {}", .{err});
-            return null;
+            return self.alterPartitionReassignmentsErrorResponse(req_header, resp_header_version, api_version, ErrorCode.invalid_request, "Invalid request");
         };
         defer self.freeAlterPartitionReassignmentsRequest(&req);
 
         var responses: []TopicResponse = &.{};
         var responses_init: usize = 0;
         if (req.topics.len > 0) {
-            responses = self.allocator.alloc(TopicResponse, req.topics.len) catch return null;
+            responses = self.allocator.alloc(TopicResponse, req.topics.len) catch |err| {
+                log.warn("AlterPartitionReassignments denied response materialization failed: {}", .{err});
+                return self.alterPartitionReassignmentsErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error, "Failed to materialize reassignment authorization response");
+            };
         }
         defer {
             for (responses[0..responses_init]) |response| {
@@ -7920,7 +7923,10 @@ pub const Broker = struct {
         for (req.topics, 0..) |topic, idx| {
             var partitions: []PartitionResponse = &.{};
             if (topic.partitions.len > 0) {
-                partitions = self.allocator.alloc(PartitionResponse, topic.partitions.len) catch return null;
+                partitions = self.allocator.alloc(PartitionResponse, topic.partitions.len) catch |err| {
+                    log.warn("AlterPartitionReassignments denied partition response materialization failed: {}", .{err});
+                    return self.alterPartitionReassignmentsErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error, "Failed to materialize reassignment authorization response");
+                };
             }
             for (topic.partitions, 0..) |partition, partition_idx| {
                 partitions[partition_idx] = .{
@@ -7941,6 +7947,20 @@ pub const Broker = struct {
             .error_code = @intFromEnum(err_code),
             .error_message = "Not authorized",
             .responses = responses,
+        };
+        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version) orelse {
+            log.warn("AlterPartitionReassignments denied response serialization failed", .{});
+            return self.alterPartitionReassignmentsErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error, "Failed to serialize reassignment authorization response");
+        };
+    }
+
+    fn alterPartitionReassignmentsErrorResponse(self: *Broker, req_header: *const RequestHeader, resp_header_version: i16, api_version: i16, err_code: ErrorCode, message: ?[]const u8) ?[]u8 {
+        const Resp = generated.alter_partition_reassignments_response.AlterPartitionReassignmentsResponse;
+        const resp = Resp{
+            .throttle_time_ms = 0,
+            .error_code = @intFromEnum(err_code),
+            .error_message = message,
+            .responses = &.{},
         };
         return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
     }
@@ -9728,26 +9748,37 @@ pub const Broker = struct {
 
         if (!validateAlterReplicaLogDirsRequestFrame(request_bytes, body_start, api_version)) {
             log.warn("Malformed denied AlterReplicaLogDirs request", .{});
-            return null;
+            return self.alterReplicaLogDirsErrorResponse(req_header, resp_header_version, api_version, ErrorCode.invalid_request);
         }
 
         var pos = body_start;
         var req = Req.deserialize(self.allocator, request_bytes, &pos, api_version) catch |err| {
             log.warn("Failed to decode denied AlterReplicaLogDirs request: {}", .{err});
-            return null;
+            return self.alterReplicaLogDirsErrorResponse(req_header, resp_header_version, api_version, ErrorCode.invalid_request);
         };
         defer self.freeAlterReplicaLogDirsRequest(&req);
 
         var pending_assignments = std.array_list.Managed(PendingReplicaDirectoryAssignment).init(self.allocator);
-        defer pending_assignments.deinit();
-        const results = self.buildAlterReplicaLogDirsResults(req, err_code, &pending_assignments) catch return null;
+        defer {
+            for (pending_assignments.items) |assignment| {
+                if (assignment.key.len > 0) self.allocator.free(assignment.key);
+            }
+            pending_assignments.deinit();
+        }
+        const results = self.buildAlterReplicaLogDirsResults(req, err_code, &pending_assignments) catch |err| {
+            log.warn("AlterReplicaLogDirs denied response materialization failed: {}", .{err});
+            return self.alterReplicaLogDirsErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error);
+        };
         defer self.freeAlterReplicaLogDirsResults(results);
 
         const resp = Resp{
             .throttle_time_ms = 0,
             .results = results,
         };
-        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version) orelse {
+            log.warn("AlterReplicaLogDirs denied response serialization failed", .{});
+            return self.alterReplicaLogDirsErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error);
+        };
     }
 
     fn handleAssignReplicasToDirsAuthorizationError(
@@ -9764,19 +9795,27 @@ pub const Broker = struct {
 
         if (!validateAssignReplicasToDirsRequestFrame(request_bytes, body_start)) {
             log.warn("Malformed denied AssignReplicasToDirs request", .{});
-            return null;
+            return self.assignReplicasToDirsErrorResponse(req_header, resp_header_version, api_version, ErrorCode.invalid_request);
         }
 
         var pos = body_start;
         var req = Req.deserialize(self.allocator, request_bytes, &pos, api_version) catch |err| {
             log.warn("Failed to decode denied AssignReplicasToDirs request: {}", .{err});
-            return null;
+            return self.assignReplicasToDirsErrorResponse(req_header, resp_header_version, api_version, ErrorCode.invalid_request);
         };
         defer self.freeAssignReplicasToDirsRequest(&req);
 
         var pending_assignments = std.array_list.Managed(PendingReplicaDirectoryAssignment).init(self.allocator);
-        defer pending_assignments.deinit();
-        const directories = self.buildAssignReplicasToDirsDirectories(req, err_code, &pending_assignments) catch return null;
+        defer {
+            for (pending_assignments.items) |assignment| {
+                if (assignment.key.len > 0) self.allocator.free(assignment.key);
+            }
+            pending_assignments.deinit();
+        }
+        const directories = self.buildAssignReplicasToDirsDirectories(req, err_code, &pending_assignments) catch |err| {
+            log.warn("AssignReplicasToDirs denied response materialization failed: {}", .{err});
+            return self.assignReplicasToDirsErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error);
+        };
         defer self.freeAssignReplicasToDirsDirectories(directories);
 
         const resp = Resp{
@@ -9784,7 +9823,10 @@ pub const Broker = struct {
             .error_code = err_code.toInt(),
             .directories = directories,
         };
-        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version) orelse {
+            log.warn("AssignReplicasToDirs denied response serialization failed", .{});
+            return self.assignReplicasToDirsErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error);
+        };
     }
 
     fn handleListClientMetricsResourcesAuthorizationError(
@@ -42452,6 +42494,87 @@ test "Broker.handleRequest AlterReplicaLogDirs authorization denial uses generat
     try testing.expect((try broker.getReplicaDirectoryAssignment(topic_id, 0)) == null);
 }
 
+test "Broker.handleRequest AlterReplicaLogDirs authorization denial rejects malformed request" {
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+    try broker.authorizer.addAcl("other-client", .cluster, "*", .literal, .alter, .allow, "*");
+
+    var buf: [128]u8 = undefined;
+    const req_len = buildTestRequest(&buf, 34, 2, 3406, header_mod.requestHeaderVersion(34, 2));
+
+    const response = broker.handleRequest(buf[0..req_len]);
+    try testing.expect(response != null);
+    defer testing.allocator.free(response.?);
+
+    try expectAlterReplicaLogDirsErrorResponseBytes(response.?, 2, 3406, ErrorCode.invalid_request);
+}
+
+test "Broker.handleRequest AlterReplicaLogDirs authorization denial fails closed when response materialization fails" {
+    const Req = generated.alter_replica_log_dirs_request.AlterReplicaLogDirsRequest;
+    const Dir = Req.AlterReplicaLogDir;
+    const Topic = Dir.AlterReplicaLogDirTopic;
+
+    const dir_path = "/tmp/zmq-alter-replica-dir-denied-materialize-fail";
+    var directory_ids = Broker.deriveReplicaDirectoryIds(dir_path);
+    var broker = Broker.initWithConfig(testing.allocator, 1, 9092, .{ .replica_directory_ids = directory_ids.slice() });
+    defer broker.deinit();
+    try broker.authorizer.addAcl("other-client", .cluster, "*", .literal, .alter, .allow, "*");
+
+    _ = broker.ensureTopic("alter-replica-log-dirs-denied-materialize-fail-topic");
+    const topic_id = broker.topics.get("alter-replica-log-dirs-denied-materialize-fail-topic").?.topic_id;
+    const partitions = [_]i32{0};
+    const topics = [_]Topic{.{
+        .name = "alter-replica-log-dirs-denied-materialize-fail-topic",
+        .partitions = &partitions,
+    }};
+    const dirs = [_]Dir{.{ .path = dir_path, .topics = &topics }};
+    const req = Req{ .dirs = &dirs };
+
+    var buf: [512]u8 = undefined;
+    var pos = buildTestRequest(&buf, 34, 2, 3407, header_mod.requestHeaderVersion(34, 2));
+    req.serialize(&buf, &pos, 2);
+
+    var failing_allocator = OneShotFailingAllocator.init(testing.allocator, 3);
+    const response_allocator = failing_allocator.allocator();
+    broker.allocator = response_allocator;
+
+    const response = broker.handleRequest(buf[0..pos]);
+    broker.allocator = testing.allocator;
+
+    try testing.expect(failing_allocator.failed);
+    try testing.expect(response != null);
+    defer response_allocator.free(response.?);
+
+    try expectAlterReplicaLogDirsErrorResponseBytes(response.?, 2, 3407, ErrorCode.kafka_storage_error);
+    try testing.expect((try broker.getReplicaDirectoryAssignment(topic_id, 0)) == null);
+}
+
+test "Broker.handleRequest AlterReplicaLogDirs authorization denial fails closed when serialization fails" {
+    const Req = generated.alter_replica_log_dirs_request.AlterReplicaLogDirsRequest;
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+    try broker.authorizer.addAcl("other-client", .cluster, "*", .literal, .alter, .allow, "*");
+
+    const req = Req{ .dirs = &.{} };
+    var buf: [128]u8 = undefined;
+    var pos = buildTestRequest(&buf, 34, 2, 3408, header_mod.requestHeaderVersion(34, 2));
+    req.serialize(&buf, &pos, 2);
+
+    var failing_allocator = OneShotFailingAllocator.init(testing.allocator, 0);
+    const response_allocator = failing_allocator.allocator();
+    broker.allocator = response_allocator;
+
+    const response = broker.handleRequest(buf[0..pos]);
+    broker.allocator = testing.allocator;
+
+    try testing.expect(failing_allocator.failed);
+    try testing.expect(response != null);
+    defer response_allocator.free(response.?);
+
+    try expectAlterReplicaLogDirsErrorResponseBytes(response.?, 2, 3408, ErrorCode.kafka_storage_error);
+}
+
 test "Broker.handleRequest AlterReplicaLogDirs rejects truncated request" {
     var broker = Broker.init(testing.allocator, 1, 9092);
     defer broker.deinit();
@@ -43413,6 +43536,96 @@ test "Broker.handleRequest AssignReplicasToDirs authorization denial uses genera
     try testing.expectEqual(@as(usize, 1), resp.directories.len);
     try testing.expectEqual(ErrorCode.cluster_authorization_failed.toInt(), resp.directories[0].topics[0].partitions[0].error_code);
     try testing.expect((try broker.getReplicaDirectoryAssignment(topic_id, 0)) == null);
+}
+
+test "Broker.handleRequest AssignReplicasToDirs authorization denial rejects malformed request" {
+    const Resp = generated.assign_replicas_to_dirs_response.AssignReplicasToDirsResponse;
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+    try broker.authorizer.addAcl("other-client", .cluster, "*", .literal, .alter, .allow, "*");
+
+    var buf: [128]u8 = undefined;
+    var pos = buildTestRequest(&buf, 73, 0, 7314, header_mod.requestHeaderVersion(73, 0));
+    ser.writeI32(&buf, &pos, 1);
+
+    const response = broker.handleRequest(buf[0..pos]);
+    try testing.expect(response != null);
+    defer testing.allocator.free(response.?);
+
+    const error_code = try readGeneratedTopLevelErrorCode(Resp, response.?, 73, 0, 7314);
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.invalid_request)), error_code);
+}
+
+test "Broker.handleRequest AssignReplicasToDirs authorization denial fails closed when response materialization fails" {
+    const Req = generated.assign_replicas_to_dirs_request.AssignReplicasToDirsRequest;
+    const Resp = generated.assign_replicas_to_dirs_response.AssignReplicasToDirsResponse;
+    const DirectoryData = Req.DirectoryData;
+    const TopicData = DirectoryData.TopicData;
+    const PartitionData = TopicData.PartitionData;
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+    try broker.authorizer.addAcl("other-client", .cluster, "*", .literal, .alter, .allow, "*");
+
+    const directory_id = [_]u8{0xd7} ** 16;
+    _ = broker.ensureTopic("assign-dir-denied-materialize-fail-topic");
+    const topic_id = broker.topics.get("assign-dir-denied-materialize-fail-topic").?.topic_id;
+    const partitions = [_]PartitionData{.{ .partition_index = 0 }};
+    const topics = [_]TopicData{.{ .topic_id = topic_id, .partitions = &partitions }};
+    const directories = [_]DirectoryData{.{ .id = directory_id, .topics = &topics }};
+    const req = Req{
+        .broker_id = 1,
+        .broker_epoch = 1,
+        .directories = &directories,
+    };
+
+    var buf: [256]u8 = undefined;
+    var pos = buildTestRequest(&buf, 73, 0, 7315, header_mod.requestHeaderVersion(73, 0));
+    req.serialize(&buf, &pos, 0);
+
+    var failing_allocator = OneShotFailingAllocator.init(testing.allocator, 3);
+    const response_allocator = failing_allocator.allocator();
+    broker.allocator = response_allocator;
+
+    const response = broker.handleRequest(buf[0..pos]);
+    broker.allocator = testing.allocator;
+
+    try testing.expect(failing_allocator.failed);
+    try testing.expect(response != null);
+    defer response_allocator.free(response.?);
+
+    const error_code = try readGeneratedTopLevelErrorCode(Resp, response.?, 73, 0, 7315);
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.kafka_storage_error)), error_code);
+    try testing.expect((try broker.getReplicaDirectoryAssignment(topic_id, 0)) == null);
+}
+
+test "Broker.handleRequest AssignReplicasToDirs authorization denial fails closed when serialization fails" {
+    const Req = generated.assign_replicas_to_dirs_request.AssignReplicasToDirsRequest;
+    const Resp = generated.assign_replicas_to_dirs_response.AssignReplicasToDirsResponse;
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+    try broker.authorizer.addAcl("other-client", .cluster, "*", .literal, .alter, .allow, "*");
+
+    const req = Req{ .broker_id = 1, .broker_epoch = 1, .directories = &.{} };
+    var buf: [128]u8 = undefined;
+    var pos = buildTestRequest(&buf, 73, 0, 7316, header_mod.requestHeaderVersion(73, 0));
+    req.serialize(&buf, &pos, 0);
+
+    var failing_allocator = OneShotFailingAllocator.init(testing.allocator, 0);
+    const response_allocator = failing_allocator.allocator();
+    broker.allocator = response_allocator;
+
+    const response = broker.handleRequest(buf[0..pos]);
+    broker.allocator = testing.allocator;
+
+    try testing.expect(failing_allocator.failed);
+    try testing.expect(response != null);
+    defer response_allocator.free(response.?);
+
+    const error_code = try readGeneratedTopLevelErrorCode(Resp, response.?, 73, 0, 7316);
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.kafka_storage_error)), error_code);
 }
 
 test "Broker.handleRequest ListClientMetricsResources returns collected client resources" {
@@ -49154,6 +49367,99 @@ test "Broker.handleRequest AlterPartitionReassignments authorization denial uses
     try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.cluster_authorization_failed)), resp.responses[0].partitions[0].error_code);
     try testing.expectEqualStrings("Not authorized", resp.responses[0].partitions[0].error_message.?);
     try testing.expectEqual(@as(u32, 0), broker.partition_reassignments.count());
+}
+
+test "Broker.handleRequest AlterPartitionReassignments authorization denial rejects malformed request" {
+    const Resp = generated.alter_partition_reassignments_response.AlterPartitionReassignmentsResponse;
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+    try broker.authorizer.addAcl("other-client", .cluster, "*", .literal, .alter, .allow, "*");
+
+    var buf: [128]u8 = undefined;
+    const req_len = buildTestRequest(&buf, 45, 0, 4517, header_mod.requestHeaderVersion(45, 0));
+
+    const response = broker.handleRequest(buf[0..req_len]);
+    try testing.expect(response != null);
+    defer testing.allocator.free(response.?);
+
+    const error_code = try readGeneratedTopLevelErrorCode(Resp, response.?, 45, 0, 4517);
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.invalid_request)), error_code);
+}
+
+test "Broker.handleRequest AlterPartitionReassignments authorization denial fails closed when response materialization fails" {
+    const Req = generated.alter_partition_reassignments_request.AlterPartitionReassignmentsRequest;
+    const Resp = generated.alter_partition_reassignments_response.AlterPartitionReassignmentsResponse;
+    const PartitionReq = Req.ReassignableTopic.ReassignablePartition;
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+    try testing.expect(broker.ensureTopic("reassign-denied-materialize-fail"));
+    try broker.authorizer.addAcl("other-client", .cluster, "*", .literal, .alter, .allow, "*");
+
+    const partitions = [_]PartitionReq{.{
+        .partition_index = 0,
+        .replicas = null,
+    }};
+    const topics = [_]Req.ReassignableTopic{.{
+        .name = "reassign-denied-materialize-fail",
+        .partitions = &partitions,
+    }};
+    const req = Req{
+        .timeout_ms = 1000,
+        .topics = &topics,
+    };
+
+    var buf: [512]u8 = undefined;
+    var pos = buildTestRequest(&buf, 45, 0, 4518, header_mod.requestHeaderVersion(45, 0));
+    req.serialize(&buf, &pos, 0);
+
+    var failing_allocator = OneShotFailingAllocator.init(testing.allocator, 2);
+    const response_allocator = failing_allocator.allocator();
+    broker.allocator = response_allocator;
+
+    const response = broker.handleRequest(buf[0..pos]);
+    broker.allocator = testing.allocator;
+
+    try testing.expect(failing_allocator.failed);
+    try testing.expect(response != null);
+    defer response_allocator.free(response.?);
+
+    const error_code = try readGeneratedTopLevelErrorCode(Resp, response.?, 45, 0, 4518);
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.kafka_storage_error)), error_code);
+    try testing.expectEqual(@as(u32, 0), broker.partition_reassignments.count());
+}
+
+test "Broker.handleRequest AlterPartitionReassignments authorization denial fails closed when serialization fails" {
+    const Req = generated.alter_partition_reassignments_request.AlterPartitionReassignmentsRequest;
+    const Resp = generated.alter_partition_reassignments_response.AlterPartitionReassignmentsResponse;
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+    try broker.authorizer.addAcl("other-client", .cluster, "*", .literal, .alter, .allow, "*");
+
+    const req = Req{
+        .timeout_ms = 1000,
+        .topics = &.{},
+    };
+
+    var buf: [128]u8 = undefined;
+    var pos = buildTestRequest(&buf, 45, 0, 4519, header_mod.requestHeaderVersion(45, 0));
+    req.serialize(&buf, &pos, 0);
+
+    var failing_allocator = OneShotFailingAllocator.init(testing.allocator, 0);
+    const response_allocator = failing_allocator.allocator();
+    broker.allocator = response_allocator;
+
+    const response = broker.handleRequest(buf[0..pos]);
+    broker.allocator = testing.allocator;
+
+    try testing.expect(failing_allocator.failed);
+    try testing.expect(response != null);
+    defer response_allocator.free(response.?);
+
+    const error_code = try readGeneratedTopLevelErrorCode(Resp, response.?, 45, 0, 4519);
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.kafka_storage_error)), error_code);
 }
 
 test "Broker.handleRequest ListPartitionReassignments decodes request and returns no ongoing reassignments" {

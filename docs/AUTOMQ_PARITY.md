@@ -623,6 +623,10 @@ Status: completed for the initial catalog and DeleteGroups slice.
   UpdateFeatures and ListPartitionReassignments authorization-denial builders
   now do the same for malformed denied frames and response construction
   failures.
+  AlterReplicaLogDirs, AlterPartitionReassignments, and AssignReplicasToDirs
+  authorization-denial builders now also return generated invalid-request or
+  storage-error responses instead of dropping denied connections when malformed
+  frames or response construction failures are encountered.
   ListClientMetricsResources now advertises key 74 v0, decodes generated
   flexible requests, rejects malformed frames, returns a default generated
   resource, and lists active client resources for retained telemetry samples.
