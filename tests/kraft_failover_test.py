@@ -2586,12 +2586,13 @@ def consumer_group_heartbeat(
     subscribed_topics=None,
     server_assignor=None,
     topic_partitions=None,
+    rack_id=None,
 ):
     body = write_compact_string(group_id)
     body += write_compact_string(member_id)
     body += struct.pack(">i", member_epoch)
     body += write_compact_string(None)  # instance_id
-    body += write_compact_string(None)  # rack_id
+    body += write_compact_string(rack_id)
     body += struct.pack(">i", 30000 if member_epoch == 0 else -1)
     if subscribed_topics is None:
         body += b"\x00"
@@ -2697,6 +2698,35 @@ def wait_for_consumer_group_heartbeat(port, group_state, timeout=30):
         time.sleep(0.25)
     raise TestError(
         f"ConsumerGroupHeartbeat did not recover for "
+        f"{group_state['group_id']!r}: {last_error}"
+    )
+
+
+def wait_for_consumer_group_heartbeat_rack_update(
+    port, group_state, rack_id, timeout=30
+):
+    deadline = time.time() + timeout
+    correlation_id = 7830
+    last_error = None
+    while time.time() < deadline:
+        try:
+            response = consumer_group_heartbeat(
+                port,
+                group_state["group_id"],
+                group_state["member_id"],
+                group_state["member_epoch"],
+                correlation_id,
+                rack_id=rack_id,
+            )
+            assert_consumer_group_heartbeat_assignment(response, group_state)
+            group_state["rack_id"] = rack_id
+            return
+        except Exception as exc:
+            last_error = exc
+        correlation_id += 1
+        time.sleep(0.25)
+    raise TestError(
+        f"ConsumerGroupHeartbeat rack update did not recover for "
         f"{group_state['group_id']!r}: {last_error}"
     )
 
@@ -2869,6 +2899,12 @@ def assert_kip848_consumer_group_description(port, group_state, topic, correlati
             f"KIP-848 ConsumerGroupDescribe member_epoch="
             f"{matching_member['member_epoch']} expected={group_state['member_epoch']}"
         )
+    if group_state.get("rack_id") is not None:
+        if matching_member["rack_id"] != group_state["rack_id"]:
+            raise TestError(
+                f"KIP-848 ConsumerGroupDescribe rack_id="
+                f"{matching_member['rack_id']!r} expected={group_state['rack_id']!r}"
+            )
     if topic not in matching_member["subscribed_topics"]:
         raise TestError(
             f"KIP-848 ConsumerGroupDescribe subscriptions mismatch: {matching_member}"
@@ -5310,6 +5346,11 @@ def main():
             topic,
         )
         wait_for_consumer_group_heartbeat(broker["port"], kip848_group_state)
+        wait_for_consumer_group_heartbeat_rack_update(
+            broker["port"],
+            kip848_group_state,
+            "rack-kip848-failover",
+        )
         wait_for_kip848_consumer_group_description(
             broker["port"],
             kip848_group_state,
@@ -5893,6 +5934,7 @@ def main():
             f"consumer_group_heartbeat_checked=true, "
             f"kip848_describe_checked=true, "
             f"kip848_rejoin_checked=true, "
+            f"kip848_rack_checked=true, "
             f"offset_commit_v9_member_checked=true, "
             f"offset_fetch_v9_member_checked=true, "
             f"network_partition={network_partition_result}, "
