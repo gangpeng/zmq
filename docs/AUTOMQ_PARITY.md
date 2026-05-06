@@ -61,6 +61,9 @@ operator-facing behavior.
 - UpdateLicense now pre-serializes successful mutation responses and retries
   generated storage-error responses so allocation pressure cannot change visible
   AutoMQ license metadata while returning no response frame.
+- GetNextNodeId now pre-serializes successful mutation responses and retries
+  generated storage-error responses so allocation pressure cannot advance the
+  AutoMQ node-id cursor while returning no response frame.
 - UpdateFeatures now pre-serializes successful mutation responses and retries
   generated storage-error responses so allocation pressure cannot finalize
   feature metadata while returning no response frame.
