@@ -285,6 +285,9 @@ errors instead of silent connection closes;
 DescribeAcls malformed frames now return generated invalid-request responses,
 and ACL response materialization failures now surface storage errors instead of
 silent connection closes;
+DescribeLogDirs malformed frames now return generated invalid-request responses,
+and log-directory response materialization failures now surface storage errors
+instead of silent connection closes;
 generated VoteRequest decode now frees partially materialized topic arrays when
 nested allocation fails before handler validation;
 ControllerRegistration, AddRaftVoter, and UpdateRaftVoter endpoint

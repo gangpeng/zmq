@@ -25026,16 +25026,15 @@ pub const Broker = struct {
         var pos = body_start;
         var req = Req.deserialize(self.allocator, request_bytes, &pos, api_version) catch |err| {
             log.warn("Failed to decode DescribeLogDirs request: {}", .{err});
-            return null;
+            return self.describeLogDirsErrorResponse(req_header, resp_header_version, api_version, ErrorCode.invalid_request);
         };
         defer self.freeDescribeLogDirsRequest(&req);
 
         if (pos != request_bytes.len) {
             log.warn("DescribeLogDirs request has {d} trailing bytes", .{request_bytes.len - pos});
-            return null;
+            return self.describeLogDirsErrorResponse(req_header, resp_header_version, api_version, ErrorCode.invalid_request);
         }
 
-        const rh = ResponseHeader{ .correlation_id = req_header.correlation_id };
         const local_dirs = self.localReplicaDirectoryIds();
         var allocated_results: []Result = &.{};
         var allocated_log_dirs: [][]const u8 = &.{};
@@ -25057,7 +25056,10 @@ pub const Broker = struct {
         var single_result: [1]Result = undefined;
         const results: []const Result = if (local_dirs.len <= 1) blk: {
             const log_dir = if (self.store.data_dir) |d| d else "/data/automq";
-            single_topics = self.collectDescribeLogDirsTopics(&req) catch return null;
+            single_topics = self.collectDescribeLogDirsTopics(&req) catch |err| {
+                log.warn("DescribeLogDirs topic materialization failed: {}", .{err});
+                return self.describeLogDirsErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error);
+            };
             single_result[0] = .{
                 .error_code = @intFromEnum(ErrorCode.none),
                 .log_dir = log_dir,
@@ -25067,15 +25069,27 @@ pub const Broker = struct {
             };
             break :blk single_result[0..1];
         } else blk: {
-            allocated_results = self.allocator.alloc(Result, local_dirs.len) catch return null;
+            allocated_results = self.allocator.alloc(Result, local_dirs.len) catch |err| {
+                log.warn("DescribeLogDirs result allocation failed: {}", .{err});
+                return self.describeLogDirsErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error);
+            };
             @memset(allocated_results, .{});
-            allocated_log_dirs = self.allocator.alloc([]const u8, local_dirs.len) catch return null;
+            allocated_log_dirs = self.allocator.alloc([]const u8, local_dirs.len) catch |err| {
+                log.warn("DescribeLogDirs log-dir allocation failed: {}", .{err});
+                return self.describeLogDirsErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error);
+            };
             @memset(allocated_log_dirs, &.{});
 
             for (local_dirs, 0..) |directory_id, idx| {
-                const log_dir_name = self.replicaDirectoryLogDirName(directory_id) catch return null;
+                const log_dir_name = self.replicaDirectoryLogDirName(directory_id) catch |err| {
+                    log.warn("DescribeLogDirs log-dir name materialization failed: {}", .{err});
+                    return self.describeLogDirsErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error);
+                };
                 allocated_log_dirs[idx] = log_dir_name;
-                const topics = self.collectDescribeLogDirsTopicsForDirectory(&req, directory_id) catch return null;
+                const topics = self.collectDescribeLogDirsTopicsForDirectory(&req, directory_id) catch |err| {
+                    log.warn("DescribeLogDirs directory topic materialization failed: {}", .{err});
+                    return self.describeLogDirsErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error);
+                };
                 allocated_results[idx] = .{
                     .error_code = @intFromEnum(ErrorCode.none),
                     .log_dir = log_dir_name,
@@ -25091,18 +25105,36 @@ pub const Broker = struct {
             .error_code = @intFromEnum(ErrorCode.none),
             .results = results,
         };
-
-        const needed = rh.calcSize(resp_header_version) + resp_body.calcSize(api_version);
-        var buf = self.allocator.alloc(u8, needed) catch return null;
-        var wpos: usize = 0;
-        rh.serialize(buf, &wpos, resp_header_version);
-        resp_body.serialize(buf, &wpos, api_version);
+        const response = self.serializeGeneratedResponse(req_header, resp_header_version, &resp_body, api_version) orelse {
+            log.warn("DescribeLogDirs response serialization failed", .{});
+            return self.describeLogDirsErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error);
+        };
         if (local_dirs.len <= 1) {
             self.freeDescribeLogDirsTopics(single_topics);
             if (single_topics.len > 0) self.allocator.free(single_topics);
             single_topics = &.{};
         }
-        return (self.allocator.realloc(buf, wpos) catch buf)[0..wpos];
+        return response;
+    }
+
+    fn describeLogDirsErrorResponse(self: *Broker, req_header: *const RequestHeader, resp_header_version: i16, api_version: i16, err_code: ErrorCode) ?[]u8 {
+        const Resp = generated.describe_log_dirs_response.DescribeLogDirsResponse;
+        const Result = Resp.DescribeLogDirsResult;
+
+        const log_dir = if (self.store.data_dir) |dir| dir else "/data/automq";
+        const results = [_]Result{.{
+            .error_code = @intFromEnum(err_code),
+            .log_dir = log_dir,
+            .topics = &.{},
+            .total_bytes = -1,
+            .usable_bytes = -1,
+        }};
+        const resp = Resp{
+            .throttle_time_ms = 0,
+            .error_code = @intFromEnum(err_code),
+            .results = &results,
+        };
+        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
     }
 
     fn freeDescribeLogDirsRequest(self: *Broker, req: *generated.describe_log_dirs_request.DescribeLogDirsRequest) void {
@@ -28854,6 +28886,38 @@ fn freeDeserializedDescribeTransactionsResponse(resp: *const generated.describe_
         if (state.topics.len > 0) testing.allocator.free(state.topics);
     }
     if (resp.transaction_states.len > 0) testing.allocator.free(resp.transaction_states);
+}
+
+fn freeDeserializedDescribeLogDirsResponse(resp: *const generated.describe_log_dirs_response.DescribeLogDirsResponse) void {
+    for (resp.results) |result| {
+        for (result.topics) |topic| {
+            if (topic.partitions.len > 0) testing.allocator.free(topic.partitions);
+        }
+        if (result.topics.len > 0) testing.allocator.free(result.topics);
+    }
+    if (resp.results.len > 0) testing.allocator.free(resp.results);
+}
+
+fn expectDescribeLogDirsErrorResponseBytes(response: []const u8, api_version: i16, correlation_id: i32, err_code: ErrorCode) !void {
+    const Resp = generated.describe_log_dirs_response.DescribeLogDirsResponse;
+
+    var rpos: usize = 0;
+    var response_header = try ResponseHeader.deserialize(testing.allocator, response, &rpos, header_mod.responseHeaderVersion(35, api_version));
+    defer response_header.deinit(testing.allocator);
+    try testing.expectEqual(correlation_id, response_header.correlation_id);
+
+    const resp = try Resp.deserialize(testing.allocator, response, &rpos, api_version);
+    defer freeDeserializedDescribeLogDirsResponse(&resp);
+
+    try testing.expectEqual(response.len, rpos);
+    try testing.expectEqual(@as(i32, 0), resp.throttle_time_ms);
+    if (api_version >= 3) {
+        try testing.expectEqual(@as(i16, @intFromEnum(err_code)), resp.error_code);
+    }
+    try testing.expectEqual(@as(usize, 1), resp.results.len);
+    try testing.expectEqual(@as(i16, @intFromEnum(err_code)), resp.results[0].error_code);
+    try testing.expect(resp.results[0].log_dir != null);
+    try testing.expectEqual(@as(usize, 0), resp.results[0].topics.len);
 }
 
 fn expectDescribeTransactionsErrorResponseBytes(response: []const u8, correlation_id: i32, err_code: ErrorCode) !void {
@@ -47675,8 +47739,61 @@ test "Broker.handleRequest DescribeLogDirs rejects truncated request" {
     defer broker.deinit();
 
     var buf: [128]u8 = undefined;
-    const req_len = buildTestRequest(&buf, 35, 2, 3503, header_mod.requestHeaderVersion(35, 2));
-    try testing.expect(broker.handleRequest(buf[0..req_len]) == null);
+    const req_len = buildTestRequest(&buf, 35, 4, 3503, header_mod.requestHeaderVersion(35, 4));
+    const response = broker.handleRequest(buf[0..req_len]);
+    try testing.expect(response != null);
+    defer testing.allocator.free(response.?);
+
+    try expectDescribeLogDirsErrorResponseBytes(response.?, 4, 3503, ErrorCode.invalid_request);
+}
+
+test "Broker.handleRequest DescribeLogDirs rejects trailing bytes" {
+    const Req = generated.describe_log_dirs_request.DescribeLogDirsRequest;
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+
+    const req = Req{ .topics = &.{} };
+
+    var buf: [128]u8 = undefined;
+    var pos = buildTestRequest(&buf, 35, 4, 3506, header_mod.requestHeaderVersion(35, 4));
+    req.serialize(&buf, &pos, 4);
+
+    try testing.expect(pos < buf.len);
+    buf[pos] = 0x7f;
+    const response = broker.handleRequest(buf[0 .. pos + 1]);
+    try testing.expect(response != null);
+    defer testing.allocator.free(response.?);
+
+    try expectDescribeLogDirsErrorResponseBytes(response.?, 4, 3506, ErrorCode.invalid_request);
+}
+
+test "Broker.handleRequest DescribeLogDirs fails closed when response materialization fails" {
+    const Req = generated.describe_log_dirs_request.DescribeLogDirsRequest;
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+    try broker.authorizer.addSuperUser("test-client");
+    try testing.expect(broker.ensureTopic("log-dir-storage-fail-topic"));
+
+    const req = Req{ .topics = null };
+
+    var buf: [128]u8 = undefined;
+    var pos = buildTestRequest(&buf, 35, 4, 3507, header_mod.requestHeaderVersion(35, 4));
+    req.serialize(&buf, &pos, 4);
+
+    var failing_allocator = OneShotFailingAllocator.init(testing.allocator, 0);
+    const response_allocator = failing_allocator.allocator();
+    broker.allocator = response_allocator;
+
+    const response = broker.handleRequest(buf[0..pos]);
+    broker.allocator = testing.allocator;
+
+    try testing.expect(failing_allocator.failed);
+    try testing.expect(response != null);
+    defer response_allocator.free(response.?);
+
+    try expectDescribeLogDirsErrorResponseBytes(response.?, 4, 3507, ErrorCode.kafka_storage_error);
 }
 
 test "Broker.handleRequest AlterPartitionReassignments returns request-scoped single-node results" {
