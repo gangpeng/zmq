@@ -22267,13 +22267,13 @@ pub const Broker = struct {
 
         if (!validateAlterReplicaLogDirsRequestFrame(request_bytes, body_start, api_version)) {
             log.warn("Malformed AlterReplicaLogDirs request", .{});
-            return null;
+            return self.alterReplicaLogDirsErrorResponse(req_header, resp_header_version, api_version, ErrorCode.invalid_request);
         }
 
         var pos = body_start;
         var req = Req.deserialize(self.allocator, request_bytes, &pos, api_version) catch |err| {
             log.warn("Failed to decode AlterReplicaLogDirs request: {}", .{err});
-            return null;
+            return self.alterReplicaLogDirsErrorResponse(req_header, resp_header_version, api_version, ErrorCode.invalid_request);
         };
         defer self.freeAlterReplicaLogDirsRequest(&req);
 
@@ -22285,11 +22285,23 @@ pub const Broker = struct {
             pending_assignments.deinit();
         }
 
-        const results = self.buildAlterReplicaLogDirsResults(req, null, &pending_assignments) catch return null;
+        const results = self.buildAlterReplicaLogDirsResults(req, null, &pending_assignments) catch |err| {
+            log.warn("AlterReplicaLogDirs response materialization failed: {}", .{err});
+            return self.alterReplicaLogDirsErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error);
+        };
         defer self.freeAlterReplicaLogDirsResults(results);
 
         if (pending_assignments.items.len > 0) {
-            var previous_assignments = self.cloneReplicaDirectoryAssignments() catch return null;
+            var previous_assignments = self.cloneReplicaDirectoryAssignments() catch |err| {
+                log.warn("AlterReplicaLogDirs assignment snapshot clone failed: {}", .{err});
+                markAlterReplicaLogDirsStorageError(results);
+                const resp = Resp{
+                    .throttle_time_ms = 0,
+                    .results = results,
+                };
+                return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version) orelse
+                    self.alterReplicaLogDirsErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error);
+            };
             defer self.freeReplicaDirectoryAssignmentSnapshot(&previous_assignments);
 
             var mutation_failed = false;
@@ -22325,6 +22337,29 @@ pub const Broker = struct {
         const resp = Resp{
             .throttle_time_ms = 0,
             .results = results,
+        };
+        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version) orelse {
+            log.warn("AlterReplicaLogDirs response serialization failed", .{});
+            return self.alterReplicaLogDirsErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error);
+        };
+    }
+
+    fn alterReplicaLogDirsErrorResponse(self: *Broker, req_header: *const RequestHeader, resp_header_version: i16, api_version: i16, err_code: ErrorCode) ?[]u8 {
+        const Resp = generated.alter_replica_log_dirs_response.AlterReplicaLogDirsResponse;
+        const TopicResult = Resp.AlterReplicaLogDirTopicResult;
+        const PartitionResult = TopicResult.AlterReplicaLogDirPartitionResult;
+
+        const partitions = [_]PartitionResult{.{
+            .partition_index = -1,
+            .error_code = @intFromEnum(err_code),
+        }};
+        const results = [_]TopicResult{.{
+            .topic_name = "",
+            .partitions = &partitions,
+        }};
+        const resp = Resp{
+            .throttle_time_ms = 0,
+            .results = &results,
         };
         return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
     }
@@ -29090,6 +29125,33 @@ fn expectDescribeLogDirsErrorResponseBytes(response: []const u8, api_version: i1
     try testing.expectEqual(@as(i16, @intFromEnum(err_code)), resp.results[0].error_code);
     try testing.expect(resp.results[0].log_dir != null);
     try testing.expectEqual(@as(usize, 0), resp.results[0].topics.len);
+}
+
+fn freeDeserializedAlterReplicaLogDirsResponse(resp: *const generated.alter_replica_log_dirs_response.AlterReplicaLogDirsResponse) void {
+    for (resp.results) |result| {
+        if (result.partitions.len > 0) testing.allocator.free(result.partitions);
+    }
+    if (resp.results.len > 0) testing.allocator.free(resp.results);
+}
+
+fn expectAlterReplicaLogDirsErrorResponseBytes(response: []const u8, api_version: i16, correlation_id: i32, err_code: ErrorCode) !void {
+    const Resp = generated.alter_replica_log_dirs_response.AlterReplicaLogDirsResponse;
+
+    var rpos: usize = 0;
+    var response_header = try ResponseHeader.deserialize(testing.allocator, response, &rpos, header_mod.responseHeaderVersion(34, api_version));
+    defer response_header.deinit(testing.allocator);
+    try testing.expectEqual(correlation_id, response_header.correlation_id);
+
+    const resp = try Resp.deserialize(testing.allocator, response, &rpos, api_version);
+    defer freeDeserializedAlterReplicaLogDirsResponse(&resp);
+
+    try testing.expectEqual(response.len, rpos);
+    try testing.expectEqual(@as(i32, 0), resp.throttle_time_ms);
+    try testing.expectEqual(@as(usize, 1), resp.results.len);
+    try testing.expectEqualStrings("", resp.results[0].topic_name.?);
+    try testing.expectEqual(@as(usize, 1), resp.results[0].partitions.len);
+    try testing.expectEqual(@as(i32, -1), resp.results[0].partitions[0].partition_index);
+    try testing.expectEqual(@as(i16, @intFromEnum(err_code)), resp.results[0].partitions[0].error_code);
 }
 
 fn freeDeserializedDescribeProducersResponse(resp: *const generated.describe_producers_response.DescribeProducersResponse) void {
@@ -41846,6 +41908,83 @@ test "Broker.handleRequest AlterReplicaLogDirs authorization denial uses generat
     try testing.expectEqual(@as(usize, 1), resp.results.len);
     try testing.expectEqual(ErrorCode.cluster_authorization_failed.toInt(), resp.results[0].partitions[0].error_code);
     try testing.expect((try broker.getReplicaDirectoryAssignment(topic_id, 0)) == null);
+}
+
+test "Broker.handleRequest AlterReplicaLogDirs rejects truncated request" {
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+
+    var buf: [128]u8 = undefined;
+    const req_len = buildTestRequest(&buf, 34, 2, 3403, header_mod.requestHeaderVersion(34, 2));
+    const response = broker.handleRequest(buf[0..req_len]);
+    try testing.expect(response != null);
+    defer testing.allocator.free(response.?);
+
+    try expectAlterReplicaLogDirsErrorResponseBytes(response.?, 2, 3403, ErrorCode.invalid_request);
+}
+
+test "Broker.handleRequest AlterReplicaLogDirs fails closed when response materialization fails" {
+    const Req = generated.alter_replica_log_dirs_request.AlterReplicaLogDirsRequest;
+    const Dir = Req.AlterReplicaLogDir;
+    const Topic = Dir.AlterReplicaLogDirTopic;
+
+    const dir_path = "/tmp/zmq-alter-replica-dir-materialize-fail";
+    var directory_ids = Broker.deriveReplicaDirectoryIds(dir_path);
+    var broker = Broker.initWithConfig(testing.allocator, 1, 9092, .{ .replica_directory_ids = directory_ids.slice() });
+    defer broker.deinit();
+    try broker.authorizer.addSuperUser("test-client");
+
+    _ = broker.ensureTopic("alter-replica-log-dirs-materialize-fail-topic");
+    const partitions = [_]i32{0};
+    const topics = [_]Topic{.{
+        .name = "alter-replica-log-dirs-materialize-fail-topic",
+        .partitions = &partitions,
+    }};
+    const dirs = [_]Dir{.{ .path = dir_path, .topics = &topics }};
+    const req = Req{ .dirs = &dirs };
+
+    var buf: [512]u8 = undefined;
+    var pos = buildTestRequest(&buf, 34, 2, 3404, header_mod.requestHeaderVersion(34, 2));
+    req.serialize(&buf, &pos, 2);
+
+    var failing_allocator = OneShotFailingAllocator.init(testing.allocator, 3);
+    const response_allocator = failing_allocator.allocator();
+    broker.allocator = response_allocator;
+
+    const response = broker.handleRequest(buf[0..pos]);
+    broker.allocator = testing.allocator;
+
+    try testing.expect(failing_allocator.failed);
+    try testing.expect(response != null);
+    defer response_allocator.free(response.?);
+
+    try expectAlterReplicaLogDirsErrorResponseBytes(response.?, 2, 3404, ErrorCode.kafka_storage_error);
+}
+
+test "Broker.handleRequest AlterReplicaLogDirs fails closed when response serialization fails" {
+    const Req = generated.alter_replica_log_dirs_request.AlterReplicaLogDirsRequest;
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+    try broker.authorizer.addSuperUser("test-client");
+
+    const req = Req{ .dirs = &.{} };
+    var buf: [128]u8 = undefined;
+    var pos = buildTestRequest(&buf, 34, 2, 3405, header_mod.requestHeaderVersion(34, 2));
+    req.serialize(&buf, &pos, 2);
+
+    var failing_allocator = OneShotFailingAllocator.init(testing.allocator, 0);
+    const response_allocator = failing_allocator.allocator();
+    broker.allocator = response_allocator;
+
+    const response = broker.handleRequest(buf[0..pos]);
+    broker.allocator = testing.allocator;
+
+    try testing.expect(failing_allocator.failed);
+    try testing.expect(response != null);
+    defer response_allocator.free(response.?);
+
+    try expectAlterReplicaLogDirsErrorResponseBytes(response.?, 2, 3405, ErrorCode.kafka_storage_error);
 }
 
 test "Broker.handleRequest AssignReplicasToDirs stores local directory assignments" {
@@ -61710,7 +61849,13 @@ test "Broker.handleRequest AlterReplicaLogDirs rejects trailing bytes" {
     var pos = buildTestRequest(&buf, 34, 2, 9403, header_mod.requestHeaderVersion(34, 2));
     req.serialize(&buf, &pos, 2);
 
-    try expectTrailingByteRejected(&broker, buf[0..], pos);
+    try testing.expect(pos < buf.len);
+    buf[pos] = 0x7f;
+    const response = broker.handleRequest(buf[0 .. pos + 1]);
+    try testing.expect(response != null);
+    defer testing.allocator.free(response.?);
+
+    try expectAlterReplicaLogDirsErrorResponseBytes(response.?, 2, 9403, ErrorCode.invalid_request);
 }
 
 test "Broker.handleRequest AssignReplicasToDirs rejects trailing bytes" {
