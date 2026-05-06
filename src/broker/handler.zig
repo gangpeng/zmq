@@ -15198,48 +15198,49 @@ pub const Broker = struct {
 
         if (!validateCreateTopicsRequestFrame(request_bytes, body_start, api_version)) {
             log.warn("Malformed CreateTopics request", .{});
-            return null;
+            return self.createTopicsErrorResponse(req_header, resp_header_version, api_version, ErrorCode.invalid_request, "Invalid request");
         }
 
         var pos = body_start;
         var req = Req.deserialize(self.allocator, request_bytes, &pos, api_version) catch |err| {
             log.warn("Malformed CreateTopics request: {}", .{err});
-            return null;
+            return self.createTopicsErrorResponse(req_header, resp_header_version, api_version, ErrorCode.invalid_request, "Invalid request");
         };
         defer self.freeCreateTopicsRequest(&req);
 
         var topics: []TopicResult = &.{};
         if (req.topics.len > 0) {
-            topics = self.allocator.alloc(TopicResult, req.topics.len) catch return null;
+            topics = self.allocator.alloc(TopicResult, req.topics.len) catch |err| {
+                log.warn("CreateTopics response materialization failed: {}", .{err});
+                return self.createTopicsErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error, "Failed to materialize CreateTopics response");
+            };
         }
+        defer if (topics.len > 0) self.allocator.free(topics);
+
         var topics_init: usize = 0;
         var created_any = false;
         var created_partition_reassignments = false;
         var created_topics: []bool = &.{};
         if (req.topics.len > 0) {
-            created_topics = self.allocator.alloc(bool, req.topics.len) catch {
-                if (topics.len > 0) self.allocator.free(topics);
-                return null;
+            created_topics = self.allocator.alloc(bool, req.topics.len) catch |err| {
+                log.warn("CreateTopics mutation flag materialization failed: {}", .{err});
+                return self.createTopicsErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error, "Failed to materialize CreateTopics mutation state");
             };
             @memset(created_topics, false);
         }
-        const previous_snapshot = if (!req.validate_only) self.encodeTopicSnapshotRecordValue() catch {
-            if (created_topics.len > 0) self.allocator.free(created_topics);
-            if (topics.len > 0) self.allocator.free(topics);
-            return null;
+        defer if (created_topics.len > 0) self.allocator.free(created_topics);
+
+        const previous_snapshot = if (!req.validate_only) self.encodeTopicSnapshotRecordValue() catch |err| {
+            log.warn("CreateTopics topic rollback snapshot materialization failed: {}", .{err});
+            return self.createTopicsErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error, "Failed to materialize CreateTopics rollback snapshot");
         } else null;
-        const previous_reassignment_snapshot = if (!req.validate_only) self.encodePartitionReassignmentSnapshotRecordValue() catch {
-            if (previous_snapshot) |snapshot| self.allocator.free(snapshot);
-            if (created_topics.len > 0) self.allocator.free(created_topics);
-            if (topics.len > 0) self.allocator.free(topics);
-            return null;
+        defer if (previous_snapshot) |snapshot| self.allocator.free(snapshot);
+
+        const previous_reassignment_snapshot = if (!req.validate_only) self.encodePartitionReassignmentSnapshotRecordValue() catch |err| {
+            log.warn("CreateTopics reassignment rollback snapshot materialization failed: {}", .{err});
+            return self.createTopicsErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error, "Failed to materialize CreateTopics reassignment rollback snapshot");
         } else null;
-        defer {
-            if (previous_snapshot) |snapshot| self.allocator.free(snapshot);
-            if (previous_reassignment_snapshot) |snapshot| self.allocator.free(snapshot);
-            if (created_topics.len > 0) self.allocator.free(created_topics);
-            if (topics.len > 0) self.allocator.free(topics);
-        }
+        defer if (previous_reassignment_snapshot) |snapshot| self.allocator.free(snapshot);
 
         for (req.topics, 0..) |topic_req, topic_index| {
             const topic_name = topic_req.name orelse "";
@@ -15271,39 +15272,55 @@ pub const Broker = struct {
                 error_code = config_validation.error_code;
                 error_message = config_validation.error_message;
             } else if (!req.validate_only) {
-                const name_copy = self.allocator.dupe(u8, topic_name) catch return null;
-                const key_copy = self.allocator.dupe(u8, topic_name) catch {
-                    self.allocator.free(name_copy);
-                    return null;
-                };
-                self.topics.put(key_copy, .{
-                    .name = name_copy,
-                    .num_partitions = actual_partitions,
-                    .replication_factor = actual_rf,
-                    .topic_id = TopicInfo.generateTopicId(),
-                    .config = topic_config,
-                }) catch {
-                    self.allocator.free(key_copy);
-                    self.allocator.free(name_copy);
-                    return null;
-                };
-
-                const has_non_local_assignment = self.applyCreateTopicInitialAssignments(topic_name, &topic_req, actual_partitions) catch |err| blk: {
-                    log.warn("Failed to create partition metadata for topic {s}: {}", .{ topic_name, err });
-                    self.removeTopicPartitionRange(topic_name, 0, actual_partitions);
-                    _ = self.clearPartitionReassignmentsForTopic(topic_name);
-                    if (self.topics.fetchRemove(topic_name)) |removed| {
-                        self.freeTopicMapEntry(removed);
-                    }
+                const name_copy = self.allocator.dupe(u8, topic_name) catch |err| blk: {
+                    log.warn("CreateTopics topic-name materialization failed for {s}: {}", .{ topic_name, err });
                     error_code = @intFromEnum(ErrorCode.kafka_storage_error);
-                    error_message = "Failed to create partition metadata";
-                    break :blk false;
+                    error_message = "Failed to materialize topic metadata";
+                    break :blk null;
                 };
+                if (name_copy) |owned_name| {
+                    const key_copy = self.allocator.dupe(u8, topic_name) catch |err| blk: {
+                        log.warn("CreateTopics topic-key materialization failed for {s}: {}", .{ topic_name, err });
+                        self.allocator.free(owned_name);
+                        error_code = @intFromEnum(ErrorCode.kafka_storage_error);
+                        error_message = "Failed to materialize topic metadata";
+                        break :blk null;
+                    };
+                    if (key_copy) |owned_key| {
+                        self.topics.put(owned_key, .{
+                            .name = owned_name,
+                            .num_partitions = actual_partitions,
+                            .replication_factor = actual_rf,
+                            .topic_id = TopicInfo.generateTopicId(),
+                            .config = topic_config,
+                        }) catch |err| {
+                            log.warn("CreateTopics topic map insertion failed for {s}: {}", .{ topic_name, err });
+                            self.allocator.free(owned_key);
+                            self.allocator.free(owned_name);
+                            error_code = @intFromEnum(ErrorCode.kafka_storage_error);
+                            error_message = "Failed to materialize topic metadata";
+                        };
+                    }
+                }
+
                 if (error_code == @intFromEnum(ErrorCode.none)) {
-                    log.info("Created topic '{s}' ({d} partitions)", .{ topic_name, actual_partitions });
-                    created_any = true;
-                    if (has_non_local_assignment) created_partition_reassignments = true;
-                    created_topics[topic_index] = true;
+                    const has_non_local_assignment = self.applyCreateTopicInitialAssignments(topic_name, &topic_req, actual_partitions) catch |err| blk: {
+                        log.warn("Failed to create partition metadata for topic {s}: {}", .{ topic_name, err });
+                        self.removeTopicPartitionRange(topic_name, 0, actual_partitions);
+                        _ = self.clearPartitionReassignmentsForTopic(topic_name);
+                        if (self.topics.fetchRemove(topic_name)) |removed| {
+                            self.freeTopicMapEntry(removed);
+                        }
+                        error_code = @intFromEnum(ErrorCode.kafka_storage_error);
+                        error_message = "Failed to create partition metadata";
+                        break :blk false;
+                    };
+                    if (error_code == @intFromEnum(ErrorCode.none)) {
+                        log.info("Created topic '{s}' ({d} partitions)", .{ topic_name, actual_partitions });
+                        created_any = true;
+                        if (has_non_local_assignment) created_partition_reassignments = true;
+                        created_topics[topic_index] = true;
+                    }
                 }
             }
 
@@ -15346,7 +15363,10 @@ pub const Broker = struct {
                     .throttle_time_ms = 0,
                     .topics = topics[0..topics_init],
                 };
-                return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+                return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version) orelse {
+                    log.warn("CreateTopics snapshot-error response serialization failed", .{});
+                    return self.createTopicsErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error, "Failed to serialize CreateTopics response");
+                };
             };
             if (created_partition_reassignments) {
                 self.persistPartitionReassignmentsDurably() catch |err| {
@@ -15379,7 +15399,10 @@ pub const Broker = struct {
                         .throttle_time_ms = 0,
                         .topics = topics[0..topics_init],
                     };
-                    return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+                    return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version) orelse {
+                        log.warn("CreateTopics reassignment-persistence-error response serialization failed", .{});
+                        return self.createTopicsErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error, "Failed to serialize CreateTopics response");
+                    };
                 };
             }
             self.persistTopicAndObjectLocalMetadataDurably() catch |err| {
@@ -15412,7 +15435,10 @@ pub const Broker = struct {
                     .throttle_time_ms = 0,
                     .topics = topics[0..topics_init],
                 };
-                return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+                return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version) orelse {
+                    log.warn("CreateTopics local-persistence-error response serialization failed", .{});
+                    return self.createTopicsErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error, "Failed to serialize CreateTopics response");
+                };
             };
         }
 
@@ -15420,7 +15446,10 @@ pub const Broker = struct {
             .throttle_time_ms = 0,
             .topics = topics[0..topics_init],
         };
-        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version) orelse {
+            log.warn("CreateTopics response serialization failed", .{});
+            return self.createTopicsErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error, "Failed to serialize CreateTopics response");
+        };
     }
 
     fn freeCreateTopicsRequest(self: *Broker, req: *const generated.create_topics_request.CreateTopicsRequest) void {
@@ -33092,6 +33121,24 @@ fn freeDeserializedCreateTopicsResponse(resp: *const generated.create_topics_res
     if (resp.topics.len > 0) testing.allocator.free(resp.topics);
 }
 
+fn expectCreateTopicsErrorResponseBytes(response: []const u8, api_version: i16, correlation_id: i32, err_code: ErrorCode) !void {
+    const Resp = generated.create_topics_response.CreateTopicsResponse;
+
+    var rpos: usize = 0;
+    var response_header = try ResponseHeader.deserialize(testing.allocator, response, &rpos, header_mod.responseHeaderVersion(19, api_version));
+    defer response_header.deinit(testing.allocator);
+    try testing.expectEqual(correlation_id, response_header.correlation_id);
+
+    const resp = try Resp.deserialize(testing.allocator, response, &rpos, api_version);
+    defer freeDeserializedCreateTopicsResponse(&resp);
+
+    try testing.expectEqual(response.len, rpos);
+    try testing.expectEqual(@as(i32, 0), resp.throttle_time_ms);
+    try testing.expectEqual(@as(usize, 1), resp.topics.len);
+    try testing.expectEqual(@as(i16, @intFromEnum(err_code)), resp.topics[0].error_code);
+    try testing.expectEqualStrings("", resp.topics[0].name.?);
+}
+
 fn readTopicAdminAuthorizationErrorCode(response: []const u8, api_key: i16, api_version: i16, correlation_id: i32) !i16 {
     var rpos: usize = 0;
     var response_header = try ResponseHeader.deserialize(testing.allocator, response, &rpos, header_mod.responseHeaderVersion(api_key, api_version));
@@ -38583,9 +38630,9 @@ test "Broker.handleRequest OffsetForLeaderEpoch fails closed when response seria
     const response = broker.handleRequest(buf[0..pos]);
     broker.allocator = testing.allocator;
 
+    defer if (response) |bytes| response_allocator.free(bytes);
     try testing.expect(failing_allocator.failed);
     try testing.expect(response != null);
-    defer response_allocator.free(response.?);
 
     try expectOffsetForLeaderEpochErrorResponseBytes(response.?, 4, 2309, ErrorCode.kafka_storage_error);
 }
@@ -69468,7 +69515,11 @@ test "Broker.handleRequest CreateTopics rejects truncated request" {
 
     var buf: [128]u8 = undefined;
     const req_len = buildTestRequest(&buf, 19, 7, 1908, header_mod.requestHeaderVersion(19, 7));
-    try testing.expect(broker.handleRequest(buf[0..req_len]) == null);
+    const response = broker.handleRequest(buf[0..req_len]);
+    try testing.expect(response != null);
+    defer testing.allocator.free(response.?);
+
+    try expectCreateTopicsErrorResponseBytes(response.?, 7, 1908, ErrorCode.invalid_request);
 }
 
 test "Broker.handleRequest CreateTopics rejects trailing bytes" {
@@ -69493,7 +69544,240 @@ test "Broker.handleRequest CreateTopics rejects trailing bytes" {
     var pos = buildTestRequest(&buf, 19, 7, 1928, header_mod.requestHeaderVersion(19, 7));
     req.serialize(&buf, &pos, 7);
 
-    try expectTrailingByteRejected(&broker, &buf, pos);
+    try testing.expect(pos < buf.len);
+    buf[pos] = 0x7f;
+    const response = broker.handleRequest(buf[0 .. pos + 1]);
+    try testing.expect(response != null);
+    defer testing.allocator.free(response.?);
+
+    try expectCreateTopicsErrorResponseBytes(response.?, 7, 1928, ErrorCode.invalid_request);
+}
+
+test "Broker.handleRequest CreateTopics fails closed when response materialization fails" {
+    const Req = generated.create_topics_request.CreateTopicsRequest;
+    const Topic = Req.CreatableTopic;
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+
+    const topics = [_]Topic{.{
+        .name = "ct-materialize-fail-topic",
+        .num_partitions = 1,
+        .replication_factor = 1,
+    }};
+    const req = Req{
+        .topics = &topics,
+        .timeout_ms = 30000,
+        .validate_only = false,
+    };
+
+    var buf: [512]u8 = undefined;
+    var pos = buildTestRequest(&buf, 19, 7, 1932, header_mod.requestHeaderVersion(19, 7));
+    req.serialize(&buf, &pos, 7);
+
+    var failing_allocator = OneShotFailingAllocator.init(testing.allocator, 1);
+    const response_allocator = failing_allocator.allocator();
+    broker.allocator = response_allocator;
+
+    const response = broker.handleRequest(buf[0..pos]);
+    broker.allocator = testing.allocator;
+
+    try testing.expect(failing_allocator.failed);
+    try testing.expect(response != null);
+    defer response_allocator.free(response.?);
+
+    try expectCreateTopicsErrorResponseBytes(response.?, 7, 1932, ErrorCode.kafka_storage_error);
+    try testing.expect(!broker.topics.contains("ct-materialize-fail-topic"));
+}
+
+test "Broker.handleRequest CreateTopics fails closed when mutation flag materialization fails" {
+    const Req = generated.create_topics_request.CreateTopicsRequest;
+    const Topic = Req.CreatableTopic;
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+
+    const topics = [_]Topic{.{
+        .name = "ct-mutation-fail-topic",
+        .num_partitions = 1,
+        .replication_factor = 1,
+    }};
+    const req = Req{
+        .topics = &topics,
+        .timeout_ms = 30000,
+        .validate_only = false,
+    };
+
+    var buf: [512]u8 = undefined;
+    var pos = buildTestRequest(&buf, 19, 7, 1933, header_mod.requestHeaderVersion(19, 7));
+    req.serialize(&buf, &pos, 7);
+
+    var failing_allocator = OneShotFailingAllocator.init(testing.allocator, 2);
+    const response_allocator = failing_allocator.allocator();
+    broker.allocator = response_allocator;
+
+    const response = broker.handleRequest(buf[0..pos]);
+    broker.allocator = testing.allocator;
+
+    try testing.expect(failing_allocator.failed);
+    try testing.expect(response != null);
+    defer response_allocator.free(response.?);
+
+    try expectCreateTopicsErrorResponseBytes(response.?, 7, 1933, ErrorCode.kafka_storage_error);
+    try testing.expect(!broker.topics.contains("ct-mutation-fail-topic"));
+}
+
+test "Broker.handleRequest CreateTopics fails closed when topic rollback snapshot materialization fails" {
+    const Req = generated.create_topics_request.CreateTopicsRequest;
+    const Topic = Req.CreatableTopic;
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+
+    const topics = [_]Topic{.{
+        .name = "ct-topic-snapshot-fail-topic",
+        .num_partitions = 1,
+        .replication_factor = 1,
+    }};
+    const req = Req{
+        .topics = &topics,
+        .timeout_ms = 30000,
+        .validate_only = false,
+    };
+
+    var buf: [512]u8 = undefined;
+    var pos = buildTestRequest(&buf, 19, 7, 1934, header_mod.requestHeaderVersion(19, 7));
+    req.serialize(&buf, &pos, 7);
+
+    var failing_allocator = OneShotFailingAllocator.init(testing.allocator, 3);
+    const response_allocator = failing_allocator.allocator();
+    broker.allocator = response_allocator;
+
+    const response = broker.handleRequest(buf[0..pos]);
+    broker.allocator = testing.allocator;
+
+    try testing.expect(failing_allocator.failed);
+    try testing.expect(response != null);
+    defer response_allocator.free(response.?);
+
+    try expectCreateTopicsErrorResponseBytes(response.?, 7, 1934, ErrorCode.kafka_storage_error);
+    try testing.expect(!broker.topics.contains("ct-topic-snapshot-fail-topic"));
+}
+
+test "Broker.handleRequest CreateTopics fails closed when reassignment rollback snapshot materialization fails" {
+    const Req = generated.create_topics_request.CreateTopicsRequest;
+    const Topic = Req.CreatableTopic;
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+
+    const topics = [_]Topic{.{
+        .name = "ct-reassignment-snapshot-fail-topic",
+        .num_partitions = 1,
+        .replication_factor = 1,
+    }};
+    const req = Req{
+        .topics = &topics,
+        .timeout_ms = 30000,
+        .validate_only = false,
+    };
+
+    var buf: [512]u8 = undefined;
+    var pos = buildTestRequest(&buf, 19, 7, 1935, header_mod.requestHeaderVersion(19, 7));
+    req.serialize(&buf, &pos, 7);
+
+    var failing_allocator = OneShotFailingAllocator.init(testing.allocator, 4);
+    const response_allocator = failing_allocator.allocator();
+    broker.allocator = response_allocator;
+
+    const response = broker.handleRequest(buf[0..pos]);
+    broker.allocator = testing.allocator;
+
+    try testing.expect(failing_allocator.failed);
+    try testing.expect(response != null);
+    defer response_allocator.free(response.?);
+
+    try expectCreateTopicsErrorResponseBytes(response.?, 7, 1935, ErrorCode.kafka_storage_error);
+    try testing.expect(!broker.topics.contains("ct-reassignment-snapshot-fail-topic"));
+}
+
+test "Broker.handleRequest CreateTopics returns topic error when topic metadata materialization fails" {
+    const Req = generated.create_topics_request.CreateTopicsRequest;
+    const Resp = generated.create_topics_response.CreateTopicsResponse;
+    const Topic = Req.CreatableTopic;
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+
+    const topics = [_]Topic{.{
+        .name = "ct-name-materialize-fail-topic",
+        .num_partitions = 1,
+        .replication_factor = 1,
+    }};
+    const req = Req{
+        .topics = &topics,
+        .timeout_ms = 30000,
+        .validate_only = false,
+    };
+
+    var buf: [512]u8 = undefined;
+    var pos = buildTestRequest(&buf, 19, 7, 1936, header_mod.requestHeaderVersion(19, 7));
+    req.serialize(&buf, &pos, 7);
+
+    var failing_allocator = OneShotFailingAllocator.init(testing.allocator, 7);
+    const response_allocator = failing_allocator.allocator();
+    broker.allocator = response_allocator;
+
+    const response = broker.handleRequest(buf[0..pos]);
+    broker.allocator = testing.allocator;
+
+    try testing.expect(failing_allocator.failed);
+    try testing.expect(response != null);
+    defer response_allocator.free(response.?);
+
+    var rpos: usize = 0;
+    var response_header = try ResponseHeader.deserialize(testing.allocator, response.?, &rpos, header_mod.responseHeaderVersion(19, 7));
+    defer response_header.deinit(testing.allocator);
+    try testing.expectEqual(@as(i32, 1936), response_header.correlation_id);
+
+    const resp = try Resp.deserialize(testing.allocator, response.?, &rpos, 7);
+    defer freeDeserializedCreateTopicsResponse(&resp);
+
+    try testing.expectEqual(response.?.len, rpos);
+    try testing.expectEqual(@as(usize, 1), resp.topics.len);
+    try testing.expectEqualStrings("ct-name-materialize-fail-topic", resp.topics[0].name.?);
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.kafka_storage_error)), resp.topics[0].error_code);
+    try testing.expect(!broker.topics.contains("ct-name-materialize-fail-topic"));
+}
+
+test "Broker.handleRequest CreateTopics fails closed when serialization fails" {
+    const Req = generated.create_topics_request.CreateTopicsRequest;
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+
+    const req = Req{
+        .topics = &.{},
+        .timeout_ms = 30000,
+        .validate_only = true,
+    };
+
+    var buf: [128]u8 = undefined;
+    var pos = buildTestRequest(&buf, 19, 7, 1937, header_mod.requestHeaderVersion(19, 7));
+    req.serialize(&buf, &pos, 7);
+
+    var failing_allocator = OneShotFailingAllocator.init(testing.allocator, 0);
+    const response_allocator = failing_allocator.allocator();
+    broker.allocator = response_allocator;
+
+    const response = broker.handleRequest(buf[0..pos]);
+    broker.allocator = testing.allocator;
+
+    try testing.expect(failing_allocator.failed);
+    try testing.expect(response != null);
+    defer response_allocator.free(response.?);
+
+    try expectCreateTopicsErrorResponseBytes(response.?, 7, 1937, ErrorCode.kafka_storage_error);
 }
 
 test "Broker.handleRequest AddPartitionsToTxn (key=24) after InitProducerId" {
