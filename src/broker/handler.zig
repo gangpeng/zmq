@@ -2961,10 +2961,7 @@ pub const Broker = struct {
 
             try self.store.ensurePartition(entry.topic, entry.partition_id);
 
-            const pkey = try std.fmt.allocPrint(self.allocator, "{s}-{d}", .{ entry.topic, entry.partition_id });
-            defer self.allocator.free(pkey);
-
-            if (self.store.partitions.getPtr(pkey)) |state| {
+            if (self.partitionStatePtr(entry.topic, entry.partition_id)) |state| {
                 state.next_offset = entry.next_offset;
                 state.log_start_offset = @min(entry.log_start_offset, state.next_offset);
                 state.high_watermark = @min(@max(entry.high_watermark, state.log_start_offset), state.next_offset);
@@ -4203,9 +4200,7 @@ pub const Broker = struct {
             if (!self.topicPartitionExists(entry.topic, entry.partition_id)) continue;
             try self.store.ensurePartition(entry.topic, entry.partition_id);
 
-            const pkey = try std.fmt.allocPrint(self.allocator, "{s}-{d}", .{ entry.topic, entry.partition_id });
-            defer self.allocator.free(pkey);
-            const state = self.store.partitions.getPtr(pkey) orelse continue;
+            const state = self.partitionStatePtr(entry.topic, entry.partition_id) orelse continue;
             const stream_id = PartitionStore.hashPartitionKey(entry.topic, entry.partition_id);
             const restored_stream = self.object_manager.getStream(stream_id);
             if (restored_stream) |stream| {
@@ -13030,9 +13025,7 @@ pub const Broker = struct {
 
                 // Look up the log end offset (next_offset) for lag computation
                 const leo: ?i64 = blk: {
-                    const stream_key = std.fmt.allocPrint(self.allocator, "{s}-{d}", .{ topic_name, partition_id }) catch break :blk null;
-                    defer self.allocator.free(stream_key);
-                    if (self.store.partitions.getPtr(stream_key)) |state| {
+                    if (self.partitionStatePtr(topic_name, partition_id)) |state| {
                         break :blk @intCast(state.next_offset);
                     }
                     break :blk null;
@@ -18043,16 +18036,7 @@ pub const Broker = struct {
             };
         }
 
-        const pkey = std.fmt.allocPrint(self.allocator, "{s}-{d}", .{ topic, partition }) catch {
-            return .{
-                .low_watermark = -1,
-                .error_code = @intFromEnum(ErrorCode.kafka_storage_error),
-                .mutated = false,
-            };
-        };
-        defer self.allocator.free(pkey);
-
-        const state = self.store.partitions.getPtr(pkey) orelse return .{
+        const state = self.partitionStatePtr(topic, partition) orelse return .{
             .low_watermark = -1,
             .error_code = @intFromEnum(ErrorCode.unknown_topic_or_partition),
             .mutated = false,
@@ -43487,6 +43471,21 @@ test "Broker restores AutoMQ stream object snapshot after restart" {
     }
 }
 
+fn rekeyPartitionForTest(broker: *Broker, topic: []const u8, partition: i32, replacement_key: []const u8) !void {
+    const formatted_key = try std.fmt.allocPrint(testing.allocator, "{s}-{d}", .{ topic, partition });
+    defer testing.allocator.free(formatted_key);
+
+    const removed = broker.store.partitions.fetchRemove(formatted_key) orelse return error.ExpectedPartitionState;
+    var state_owned = true;
+    errdefer if (state_owned) broker.store.allocator.free(removed.value.topic);
+    broker.store.allocator.free(removed.key);
+
+    const key_copy = try broker.store.allocator.dupe(u8, replacement_key);
+    errdefer broker.store.allocator.free(key_copy);
+    try broker.store.partitions.put(key_copy, removed.value);
+    state_owned = false;
+}
+
 test "Broker restores partition state after restart" {
     const fs = @import("fs_compat");
     const tmp_dir = "/tmp/zmq-partition-state-restart-test";
@@ -43618,6 +43617,59 @@ test "Broker clamps invalid restored partition state invariants" {
     const stream = broker.object_manager.getStream(stream_id).?;
     try testing.expectEqual(@as(u64, 8), stream.start_offset);
     try testing.expectEqual(@as(u64, 10), stream.end_offset);
+}
+
+test "Broker restorePartitionStates uses partition state metadata lookup" {
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+
+    try testing.expect(broker.ensureTopic("restore-state-lookup-topic"));
+    try rekeyPartitionForTest(&broker, "restore-state-lookup-topic", 0, "restore-state-noncanonical-key");
+
+    const topic = try testing.allocator.dupe(u8, "restore-state-lookup-topic");
+    defer testing.allocator.free(topic);
+    const entries = [_]MetadataPersistence.PartitionStateEntry{.{
+        .topic = topic,
+        .partition_id = 0,
+        .next_offset = 6,
+        .log_start_offset = 2,
+        .high_watermark = 5,
+        .last_stable_offset = 5,
+        .first_unstable_txn_offset = null,
+    }};
+
+    try broker.restorePartitionStates(&entries);
+
+    const state = broker.partitionState("restore-state-lookup-topic", 0) orelse return error.ExpectedPartitionState;
+    try testing.expectEqual(@as(u64, 6), state.next_offset);
+    try testing.expectEqual(@as(u64, 2), state.log_start_offset);
+    try testing.expectEqual(@as(u64, 5), state.high_watermark);
+    try testing.expectEqual(@as(u64, 5), state.last_stable_offset);
+}
+
+test "Broker restorePartitionStateSnapshotRecord uses partition state metadata lookup" {
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+
+    try testing.expect(broker.ensureTopic("shared-pstate-lookup-topic"));
+    const state = broker.partitionStatePtr("shared-pstate-lookup-topic", 0) orelse return error.ExpectedPartitionState;
+    state.next_offset = 4;
+    state.high_watermark = 4;
+    state.last_stable_offset = 4;
+    state.log_start_offset = 2;
+
+    const snapshot = try broker.encodePartitionStateSnapshotRecordValue();
+    defer testing.allocator.free(snapshot);
+
+    state.log_start_offset = 0;
+    try rekeyPartitionForTest(&broker, "shared-pstate-lookup-topic", 0, "shared-pstate-noncanonical-key");
+    try broker.restorePartitionStateSnapshotRecord(snapshot);
+
+    const restored = broker.partitionState("shared-pstate-lookup-topic", 0) orelse return error.ExpectedPartitionState;
+    try testing.expectEqual(@as(u64, 4), restored.next_offset);
+    try testing.expectEqual(@as(u64, 2), restored.log_start_offset);
+    try testing.expectEqual(@as(u64, 4), restored.high_watermark);
+    try testing.expectEqual(@as(u64, 4), restored.last_stable_offset);
 }
 
 test "Broker restorePartitionStates propagates partition storage rebuild failures" {
@@ -49660,21 +49712,6 @@ test "Broker.handleRequest DescribeTopicPartitions rejects trailing bytes" {
 // HIGH-priority gap tests: handler wire-protocol round-trips
 // ---------------------------------------------------------------
 
-fn rekeyPartitionForTest(broker: *Broker, topic: []const u8, partition: i32, replacement_key: []const u8) !void {
-    const formatted_key = try std.fmt.allocPrint(testing.allocator, "{s}-{d}", .{ topic, partition });
-    defer testing.allocator.free(formatted_key);
-
-    const removed = broker.store.partitions.fetchRemove(formatted_key) orelse return error.ExpectedPartitionState;
-    var state_owned = true;
-    errdefer if (state_owned) broker.store.allocator.free(removed.value.topic);
-    broker.store.allocator.free(removed.key);
-
-    const key_copy = try broker.store.allocator.dupe(u8, replacement_key);
-    errdefer broker.store.allocator.free(key_copy);
-    try broker.store.partitions.put(key_copy, removed.value);
-    state_owned = false;
-}
-
 test "Broker.handleRequest Fetch v0 returns generated produced data" {
     const Resp = generated.fetch_response.FetchResponse;
 
@@ -54621,6 +54658,67 @@ test "Broker.handleRequest OffsetCommit v8 returns generated response and commit
     try testing.expectEqualStrings("generated-meta", committed_record.?.metadata.?);
 }
 
+test "Broker.handleRequest OffsetCommit computes lag from partition state metadata lookup" {
+    const Req = generated.offset_commit_request.OffsetCommitRequest;
+    const Resp = generated.offset_commit_response.OffsetCommitResponse;
+    const Topic = Req.OffsetCommitRequestTopic;
+    const Partition = Topic.OffsetCommitRequestPartition;
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+    try testing.expect(broker.ensureTopic("oc-lag-lookup-topic"));
+    const state = broker.partitionStatePtr("oc-lag-lookup-topic", 0) orelse return error.ExpectedPartitionState;
+    state.next_offset = 10;
+    state.high_watermark = 10;
+    state.last_stable_offset = 10;
+    try rekeyPartitionForTest(&broker, "oc-lag-lookup-topic", 0, "oc-lag-noncanonical-key");
+
+    const joined = try broker.groups.joinGroup("oc-lag-lookup-group", null, "consumer", null);
+    const partitions = [_]Partition{.{
+        .partition_index = 0,
+        .committed_offset = 4,
+        .committed_leader_epoch = -1,
+        .committed_metadata = "lag-meta",
+    }};
+    const topics = [_]Topic{.{
+        .name = "oc-lag-lookup-topic",
+        .partitions = &partitions,
+    }};
+    const req = Req{
+        .group_id = "oc-lag-lookup-group",
+        .generation_id_or_member_epoch = joined.generation_id,
+        .member_id = joined.member_id,
+        .group_instance_id = null,
+        .topics = &topics,
+    };
+
+    var buf: [512]u8 = undefined;
+    var pos = buildTestRequest(&buf, 8, 8, 809, header_mod.requestHeaderVersion(8, 8));
+    req.serialize(&buf, &pos, 8);
+
+    const response = broker.handleRequest(buf[0..pos]);
+    try testing.expect(response != null);
+    defer testing.allocator.free(response.?);
+
+    var rpos: usize = 0;
+    var response_header = try ResponseHeader.deserialize(testing.allocator, response.?, &rpos, header_mod.responseHeaderVersion(8, 8));
+    defer response_header.deinit(testing.allocator);
+    try testing.expectEqual(@as(i32, 809), response_header.correlation_id);
+
+    const resp = try Resp.deserialize(testing.allocator, response.?, &rpos, 8);
+    defer {
+        for (resp.topics) |topic| {
+            if (topic.partitions.len > 0) testing.allocator.free(topic.partitions);
+        }
+        if (resp.topics.len > 0) testing.allocator.free(resp.topics);
+    }
+    try testing.expectEqual(response.?.len, rpos);
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.none)), resp.topics[0].partitions[0].error_code);
+
+    const lag_key = "kafka_consumer_lag{group=\"oc-lag-lookup-group\",topic=\"oc-lag-lookup-topic\",partition=\"0\"}";
+    try testing.expectEqual(@as(f64, 6.0), broker.metrics.labeled_gauges.get(lag_key).?.value);
+}
+
 test "Broker.handleRequest OffsetCommit rejects unknown topic partitions without committing offsets" {
     const Req = generated.offset_commit_request.OffsetCommitRequest;
     const Resp = generated.offset_commit_response.OffsetCommitResponse;
@@ -57807,6 +57905,61 @@ test "Broker.handleRequest DeleteRecords v2 returns generated response and trims
     const pkey = try std.fmt.allocPrint(testing.allocator, "{s}-{d}", .{ "dr-generated-topic", 0 });
     defer testing.allocator.free(pkey);
     try testing.expectEqual(@as(u64, 5), broker.store.partitions.getPtr(pkey).?.log_start_offset);
+}
+
+test "Broker.handleRequest DeleteRecords uses partition state metadata lookup" {
+    const Req = generated.delete_records_request.DeleteRecordsRequest;
+    const Resp = generated.delete_records_response.DeleteRecordsResponse;
+    const Topic = Req.DeleteRecordsTopic;
+    const Partition = Topic.DeleteRecordsPartition;
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+
+    try testing.expect(broker.ensureTopic("dr-lookup-topic"));
+    const state = broker.partitionStatePtr("dr-lookup-topic", 0) orelse return error.ExpectedPartitionState;
+    state.next_offset = 5;
+    state.high_watermark = 5;
+    state.last_stable_offset = 5;
+    try rekeyPartitionForTest(&broker, "dr-lookup-topic", 0, "dr-lookup-noncanonical-key");
+
+    const partitions = [_]Partition{.{
+        .partition_index = 0,
+        .offset = 2,
+    }};
+    const topics = [_]Topic{.{
+        .name = "dr-lookup-topic",
+        .partitions = &partitions,
+    }};
+    const req = Req{
+        .topics = &topics,
+        .timeout_ms = 30000,
+    };
+
+    var buf: [512]u8 = undefined;
+    var pos = buildTestRequest(&buf, 21, 2, 2122, header_mod.requestHeaderVersion(21, 2));
+    req.serialize(&buf, &pos, 2);
+
+    const response = broker.handleRequest(buf[0..pos]);
+    try testing.expect(response != null);
+    defer testing.allocator.free(response.?);
+
+    var rpos: usize = 0;
+    var response_header = try ResponseHeader.deserialize(testing.allocator, response.?, &rpos, header_mod.responseHeaderVersion(21, 2));
+    defer response_header.deinit(testing.allocator);
+    try testing.expectEqual(@as(i32, 2122), response_header.correlation_id);
+
+    const resp = try Resp.deserialize(testing.allocator, response.?, &rpos, 2);
+    defer {
+        broker.freeDeleteRecordsResponseTopics(resp.topics);
+        if (resp.topics.len > 0) testing.allocator.free(resp.topics);
+    }
+    try testing.expectEqual(response.?.len, rpos);
+    try testing.expectEqual(@as(i64, 2), resp.topics[0].partitions[0].low_watermark);
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.none)), resp.topics[0].partitions[0].error_code);
+
+    const restored = broker.partitionState("dr-lookup-topic", 0) orelse return error.ExpectedPartitionState;
+    try testing.expectEqual(@as(u64, 2), restored.log_start_offset);
 }
 
 test "Broker restores DeleteRecords trim from S3 cluster metadata log" {
