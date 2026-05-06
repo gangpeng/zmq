@@ -3962,6 +3962,14 @@ def main():
         wait_for_transaction_introspection(
             broker["port"], controller_failover_txn, "Ongoing", txn_topic
         )
+        abort_failover_txn = wait_for_transaction_begin(
+            broker["port"],
+            f"{group}-abort-failover",
+            txn_topic,
+        )
+        wait_for_transaction_introspection(
+            broker["port"], abort_failover_txn, "Ongoing", txn_topic
+        )
         classic_group_state = wait_for_group_stable(
             broker["port"],
             f"{group}-classic",
@@ -3983,6 +3991,9 @@ def main():
         wait_for_group_heartbeat(broker["port"], offset_delete_group_state)
         wait_for_transaction_introspection(
             broker["port"], controller_failover_txn, "Ongoing", txn_topic
+        )
+        wait_for_transaction_introspection(
+            broker["port"], abort_failover_txn, "Ongoing", txn_topic
         )
         wait_for_group_heartbeat(broker["port"], classic_group_state)
 
@@ -4008,6 +4019,13 @@ def main():
         wait_for_transaction_end(broker["port"], txn_offset_txn)
         wait_for_transaction_introspection(
             broker["port"], controller_failover_txn, "Ongoing", txn_topic
+        )
+        wait_for_transaction_introspection(
+            broker["port"], abort_failover_txn, "Ongoing", txn_topic
+        )
+        wait_for_transaction_end(broker["port"], abort_failover_txn, committed=False)
+        wait_for_transaction_introspection(
+            broker["port"], abort_failover_txn, "CompleteAbort"
         )
         wait_for_transaction_end(broker["port"], controller_failover_txn)
         wait_for_transaction_introspection(
@@ -4056,6 +4074,9 @@ def main():
         wait_for_transaction_introspection(
             broker["port"], controller_failover_txn, "CompleteCommit"
         )
+        wait_for_transaction_introspection(
+            broker["port"], abort_failover_txn, "CompleteAbort"
+        )
         wait_for_group_heartbeat(broker["port"], classic_group_state)
         expected_payloads.append(b"r2")
         third_offset = wait_for_produce(broker["port"], topic, expected_payloads[-1])
@@ -4103,6 +4124,9 @@ def main():
         wait_for_group_heartbeat(broker["port"], offset_delete_group_state)
         wait_for_transaction_introspection(
             broker["port"], controller_failover_txn, "CompleteCommit"
+        )
+        wait_for_transaction_introspection(
+            broker["port"], abort_failover_txn, "CompleteAbort"
         )
         wait_for_group_heartbeat(broker["port"], classic_group_state)
         expected_payloads.append(b"r3")
@@ -4159,6 +4183,9 @@ def main():
         wait_for_group_heartbeat(broker["port"], offset_delete_group_state)
         wait_for_transaction_introspection(
             broker["port"], controller_failover_txn, "CompleteCommit"
+        )
+        wait_for_transaction_introspection(
+            broker["port"], abort_failover_txn, "CompleteAbort"
         )
         wait_for_transaction_introspection(
             broker["port"], broker_restart_txn, "Ongoing", txn_topic
@@ -4286,8 +4313,9 @@ def main():
             f"reassignment_target={automq_result['reassignment_target']}, "
             f"reassignment_target_offset={automq_result['reassignment_target_offset']}, "
             f"committed_offset={committed_offset}, "
-            f"transactions_checked=4, "
+            f"transactions_checked=5, "
             f"transaction_introspection_checked=true, "
+            f"transaction_abort_checked=true, "
             f"txn_offset_commit_checked=true, "
             f"idempotent_producer_fencing=true, "
             f"delete_groups_checked=true, "
