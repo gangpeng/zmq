@@ -11661,7 +11661,11 @@ pub const Broker = struct {
     fn updateLicenseErrorResponse(self: *Broker, req_header: *const RequestHeader, resp_header_version: i16, api_version: i16, err_code: ErrorCode, message: ?[]const u8) ?[]u8 {
         const Resp = generated.update_license_response.UpdateLicenseResponse;
         const resp = Resp{ .error_code = err_code.toInt(), .throttle_time_ms = 0, .error_message = message };
-        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version) orelse {
+            log.warn("UpdateLicense error response serialization failed", .{});
+            const storage_resp = Resp{ .error_code = ErrorCode.kafka_storage_error.toInt(), .throttle_time_ms = 0, .error_message = "Failed to serialize UpdateLicense response" };
+            return self.serializeGeneratedResponse(req_header, resp_header_version, &storage_resp, api_version);
+        };
     }
 
     fn handleDescribeLicenseAuthorizationError(
@@ -23132,17 +23136,25 @@ pub const Broker = struct {
             log.warn("UpdateLicense license copy failed: {}", .{err});
             return self.updateLicenseErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error, "Failed to materialize license");
         };
+        const success_resp = Resp{ .error_code = 0, .throttle_time_ms = 0, .error_message = "" };
+        const success_response = self.serializeGeneratedResponse(req_header, resp_header_version, &success_resp, api_version) orelse {
+            log.warn("UpdateLicense response serialization failed before mutation", .{});
+            self.allocator.free(license_copy);
+            return self.updateLicenseErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error, "Failed to serialize response");
+        };
         var previous_snapshot: ?MetadataPersistence.AutoMqMetadataSnapshot = null;
         defer if (previous_snapshot) |*snapshot| self.persistence.freeAutoMqMetadataSnapshot(snapshot);
         if (self.raft_state == null) {
             previous_snapshot = self.cloneAutoMqMetadataSnapshot() catch |err| {
                 log.warn("UpdateLicense rollback snapshot failed: {}", .{err});
                 self.allocator.free(license_copy);
+                self.allocator.free(success_response);
                 return self.updateLicenseErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error, "Failed to snapshot AutoMQ metadata");
             };
         }
         self.commitAutoMqSetLicenseRecord(license) catch |err| {
             self.allocator.free(license_copy);
+            self.allocator.free(success_response);
             const resp = Resp{ .error_code = autoMqQuorumErrorCode(err), .throttle_time_ms = 0, .error_message = "metadata quorum unavailable" };
             return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version) orelse {
                 log.warn("UpdateLicense error response serialization failed", .{});
@@ -23154,14 +23166,11 @@ pub const Broker = struct {
         self.persistAutoMqMetadataAfterMutation() catch |err| {
             log.warn("UpdateLicense metadata snapshot write failed: {}", .{err});
             if (previous_snapshot) |snapshot| self.restoreAutoMqMetadataAfterFailedMutation(snapshot);
+            self.allocator.free(success_response);
             return self.updateLicenseErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error, "Failed to persist AutoMQ metadata");
         };
 
-        const resp = Resp{ .error_code = 0, .throttle_time_ms = 0, .error_message = "" };
-        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version) orelse {
-            log.warn("UpdateLicense response serialization failed", .{});
-            return self.updateLicenseErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error, "Failed to serialize response");
-        };
+        return success_response;
     }
 
     fn handleDescribeLicense(self: *Broker, request_bytes: []const u8, body_start: usize, req_header: *const RequestHeader, api_version: i16, resp_header_version: i16) ?[]u8 {
@@ -53378,6 +53387,22 @@ test "Broker.handleRequest normal AutoMQ mutations fail closed when local mutati
         try expectAutoMqMutationErrorWithFailingAllocator(&broker, buf[0..pos], 602, 0, 6032, 0, ErrorCode.kafka_storage_error);
         try testing.expect(broker.auto_mq_group_promotions.contains("group-demote-fail"));
     }
+}
+
+test "Broker.handleRequest UpdateLicense does not mutate when success serialization fails" {
+    const Req = generated.update_license_request.UpdateLicenseRequest;
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+    broker.auto_mq_license = try testing.allocator.dupe(u8, "existing-license");
+
+    const req = Req{ .license = "new-license" };
+    var buf: [256]u8 = undefined;
+    var pos = buildTestRequest(&buf, 517, 0, 5181, header_mod.requestHeaderVersion(517, 0));
+    req.serialize(&buf, &pos, 0);
+
+    try expectAutoMqMutationErrorWithFailingAllocator(&broker, buf[0..pos], 517, 0, 5181, 1, ErrorCode.kafka_storage_error);
+    try testing.expectEqualStrings("existing-license", broker.auto_mq_license.?);
 }
 
 test "Broker AutoMQ stream object lifecycle APIs" {
