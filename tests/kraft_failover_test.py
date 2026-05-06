@@ -885,6 +885,145 @@ def wait_for_delete_records_checkpoint(
     )
 
 
+def parse_nullable_compact_i32_array(buf, pos):
+    raw_len, pos = read_varint(buf, pos)
+    if raw_len == 0:
+        return None, pos
+    values = []
+    for _ in range(raw_len - 1):
+        value, pos = read_i32(buf, pos)
+        values.append(value)
+    return values, pos
+
+
+def parse_describe_topic_partitions_response(response, correlation_id):
+    pos = parse_flexible_response_header(response, correlation_id)
+    _, pos = read_i32(response, pos)  # throttle_time_ms
+    topic_count, pos = read_compact_array_len(response, pos)
+    topics = []
+    for _ in range(topic_count):
+        error_code, pos = read_i16(response, pos)
+        topic_name, pos = read_compact_string(response, pos)
+        if pos + 16 > len(response):
+            raise TestError("buffer underflow while reading topic uuid")
+        topic_id = response[pos : pos + 16]
+        pos += 16
+        is_internal, pos = read_bool(response, pos)
+        partition_count, pos = read_compact_array_len(response, pos)
+        partitions = []
+        for _ in range(partition_count):
+            partition_error, pos = read_i16(response, pos)
+            partition_index, pos = read_i32(response, pos)
+            leader_id, pos = read_i32(response, pos)
+            leader_epoch, pos = read_i32(response, pos)
+            replica_nodes, pos = read_compact_i32_array(response, pos)
+            isr_nodes, pos = read_compact_i32_array(response, pos)
+            eligible_leader_replicas, pos = parse_nullable_compact_i32_array(
+                response, pos
+            )
+            last_known_elr, pos = parse_nullable_compact_i32_array(response, pos)
+            offline_replicas, pos = read_compact_i32_array(response, pos)
+            pos = skip_tags(response, pos)
+            partitions.append(
+                {
+                    "error_code": partition_error,
+                    "partition_index": partition_index,
+                    "leader_id": leader_id,
+                    "leader_epoch": leader_epoch,
+                    "replica_nodes": replica_nodes,
+                    "isr_nodes": isr_nodes,
+                    "eligible_leader_replicas": eligible_leader_replicas,
+                    "last_known_elr": last_known_elr,
+                    "offline_replicas": offline_replicas,
+                }
+            )
+        topic_authorized_operations, pos = read_i32(response, pos)
+        pos = skip_tags(response, pos)
+        topics.append(
+            {
+                "error_code": error_code,
+                "name": topic_name,
+                "topic_id": topic_id,
+                "is_internal": is_internal,
+                "partitions": partitions,
+                "topic_authorized_operations": topic_authorized_operations,
+            }
+        )
+    cursor_present, pos = read_varint(response, pos)
+    next_cursor = None
+    if cursor_present != 0:
+        cursor_topic, pos = read_compact_string(response, pos)
+        cursor_partition, pos = read_i32(response, pos)
+        pos = skip_tags(response, pos)
+        next_cursor = {
+            "topic_name": cursor_topic,
+            "partition_index": cursor_partition,
+        }
+    pos = skip_tags(response, pos)
+    if pos != len(response):
+        raise TestError(
+            f"DescribeTopicPartitions response trailing bytes: {len(response) - pos}"
+        )
+    return {"topics": topics, "next_cursor": next_cursor}
+
+
+def describe_topic_partitions(port, topic, correlation_id):
+    body = write_compact_array_len(1)
+    body += write_compact_string(topic)
+    body += b"\x00"  # topic tagged fields
+    body += struct.pack(">i", 10)  # response_partition_limit
+    body += b"\x00"  # null cursor
+    body += b"\x00"  # request tagged fields
+    response = flexible_kafka_request(port, 75, 0, correlation_id, body)
+    return parse_describe_topic_partitions_response(response, correlation_id)
+
+
+def wait_for_describe_topic_partitions_checkpoint(
+    port, topic, expected_leader_id, timeout=30
+):
+    deadline = time.time() + timeout
+    correlation_id = 8400
+    last_error = None
+    while time.time() < deadline:
+        try:
+            response = describe_topic_partitions(port, topic, correlation_id)
+            topics = response["topics"]
+            if response["next_cursor"] is not None:
+                raise TestError(f"DescribeTopicPartitions unexpected cursor: {response}")
+            if len(topics) != 1 or topics[0]["name"] != topic:
+                raise TestError(f"DescribeTopicPartitions topic mismatch: {response}")
+            topic_result = topics[0]
+            if topic_result["error_code"] != 0:
+                raise TestError(f"DescribeTopicPartitions topic error: {response}")
+            partitions = topic_result["partitions"]
+            if len(partitions) != 1:
+                raise TestError(
+                    f"DescribeTopicPartitions partition count mismatch: {response}"
+                )
+            partition = partitions[0]
+            if partition["partition_index"] != 0 or partition["error_code"] != 0:
+                raise TestError(
+                    f"DescribeTopicPartitions partition error: {response}"
+                )
+            if partition["leader_id"] != expected_leader_id:
+                raise TestError(
+                    f"DescribeTopicPartitions leader={partition} "
+                    f"expected={expected_leader_id}"
+                )
+            if expected_leader_id not in partition["replica_nodes"]:
+                raise TestError(f"DescribeTopicPartitions replicas={response}")
+            if expected_leader_id not in partition["isr_nodes"]:
+                raise TestError(f"DescribeTopicPartitions isr={response}")
+            return
+        except Exception as exc:
+            last_error = exc
+        correlation_id += 1
+        time.sleep(0.25)
+    raise TestError(
+        f"DescribeTopicPartitions did not recover for {topic!r}: {last_error}"
+    )
+
+
 def parse_describe_producers_response(response, correlation_id):
     pos = parse_flexible_response_header(response, correlation_id)
     _, pos = read_i32(response, pos)  # throttle_time_ms
@@ -7157,6 +7296,14 @@ def main():
                 delete_records_end_offset,
             )
 
+        def wait_for_topic_partitions_probe():
+            wait_for_describe_topic_partitions_checkpoint(
+                broker["port"],
+                topic,
+                100,
+            )
+
+        wait_for_topic_partitions_probe()
         wait_for_delete_records_probe()
         wait_for_offset_commit(broker["port"], group, topic, committed_offset)
         offset_delete_group_state = wait_for_group_stable(
@@ -7454,6 +7601,7 @@ def main():
             expected_topic_end_offset(first_offset, expected_payloads),
         )
         wait_for_delete_records_probe()
+        wait_for_topic_partitions_probe()
         wait_for_committed_offset(broker["port"], group, topic, committed_offset)
         wait_for_committed_offset(broker["port"], offset_delete_group, topic, -1)
         wait_for_committed_offset_error(
@@ -7569,6 +7717,7 @@ def main():
             expected_topic_end_offset(first_offset, expected_payloads),
         )
         wait_for_delete_records_probe()
+        wait_for_topic_partitions_probe()
         wait_for_committed_offset(broker["port"], group, topic, committed_offset)
         wait_for_committed_offset(broker["port"], offset_delete_group, topic, -1)
         wait_for_committed_offset_error(
@@ -7688,6 +7837,7 @@ def main():
             expected_topic_end_offset(first_offset, expected_payloads),
         )
         wait_for_delete_records_probe()
+        wait_for_topic_partitions_probe()
         wait_for_offset_commit(broker["port"], group, topic, committed_offset)
         post_failover_txn = wait_for_transaction_begin(
             broker["port"],
@@ -7719,6 +7869,7 @@ def main():
             expected_topic_end_offset(first_offset, expected_payloads),
         )
         wait_for_delete_records_probe()
+        wait_for_topic_partitions_probe()
         wait_for_committed_offset(broker["port"], group, topic, committed_offset)
         wait_for_committed_offset(broker["port"], offset_delete_group, topic, -1)
         wait_for_committed_offset_error(
@@ -7831,6 +7982,7 @@ def main():
             expected_topic_end_offset(first_offset, expected_payloads),
         )
         wait_for_delete_records_probe()
+        wait_for_topic_partitions_probe()
         wait_for_offset_commit(broker["port"], group, topic, committed_offset)
 
         alive = {node_id for node_id, info in processes.items() if info["proc"].poll() is None}
@@ -7865,6 +8017,7 @@ def main():
             expected_topic_end_offset(first_offset, expected_payloads),
         )
         wait_for_delete_records_probe()
+        wait_for_topic_partitions_probe()
         wait_for_committed_offset(broker["port"], group, topic, committed_offset)
         wait_for_committed_offset(broker["port"], offset_delete_group, topic, -1)
         wait_for_committed_offset_error(
@@ -7979,6 +8132,7 @@ def main():
             expected_topic_end_offset(first_offset, expected_payloads),
         )
         wait_for_delete_records_probe()
+        wait_for_topic_partitions_probe()
         wait_for_offset_commit(broker["port"], group, topic, committed_offset)
         broker_restart_txn = wait_for_transaction_begin(
             broker["port"],
@@ -7997,6 +8151,7 @@ def main():
             expected_topic_end_offset(first_offset, expected_payloads),
         )
         wait_for_delete_records_probe()
+        wait_for_topic_partitions_probe()
         wait_for_committed_offset(broker["port"], group, topic, committed_offset)
         wait_for_committed_offset(broker["port"], offset_delete_group, topic, -1)
         wait_for_committed_offset_error(
@@ -8217,6 +8372,7 @@ def main():
             expected_topic_end_offset(first_offset, expected_payloads),
         )
         wait_for_delete_records_probe()
+        wait_for_topic_partitions_probe()
         wait_for_offset_commit(broker["port"], group, topic, committed_offset)
         wait_for_offset_fetch_grouped_checkpoint(
             broker["port"],
@@ -8255,6 +8411,7 @@ def main():
             f"offset_fetch_v8_grouped_checked=true, "
             f"log_position_apis_checked=true, "
             f"delete_records_checked=true, "
+            f"describe_topic_partitions_checked=true, "
             f"idempotent_producer_fencing=true, "
             f"describe_producers_checked=true, "
             f"delete_groups_checked=true, "
@@ -8535,6 +8692,40 @@ def self_test():
         ):
             raise TestError(
                 f"DeleteRecords fixture parser failed: {deleted_records}"
+            )
+
+        topic_partitions_fixture = struct.pack(">i", 164)
+        topic_partitions_fixture += b"\x00"  # response header tagged fields
+        topic_partitions_fixture += struct.pack(">i", 0)
+        topic_partitions_fixture += write_compact_array_len(1)
+        topic_partitions_fixture += struct.pack(">h", 0)
+        topic_partitions_fixture += write_compact_string("dtp-self-test")
+        topic_partitions_fixture += bytes(range(16))
+        topic_partitions_fixture += b"\x00"  # is_internal=false
+        topic_partitions_fixture += write_compact_array_len(1)
+        topic_partitions_fixture += struct.pack(">hiii", 0, 0, 100, 3)
+        topic_partitions_fixture += write_compact_i32_array([100])
+        topic_partitions_fixture += write_compact_i32_array([100])
+        topic_partitions_fixture += b"\x00"  # eligible_leader_replicas=null
+        topic_partitions_fixture += b"\x00"  # last_known_elr=null
+        topic_partitions_fixture += write_compact_i32_array([])
+        topic_partitions_fixture += b"\x00"  # partition tagged fields
+        topic_partitions_fixture += struct.pack(">i", -2147483648)
+        topic_partitions_fixture += b"\x00"  # topic tagged fields
+        topic_partitions_fixture += b"\x00"  # next_cursor=null
+        topic_partitions_fixture += b"\x00"  # response tagged fields
+        topic_partitions = parse_describe_topic_partitions_response(
+            topic_partitions_fixture, 164
+        )
+        if (
+            topic_partitions["topics"][0]["name"] != "dtp-self-test"
+            or topic_partitions["topics"][0]["partitions"][0]["leader_id"] != 100
+            or topic_partitions["topics"][0]["partitions"][0]["replica_nodes"]
+            != [100]
+            or topic_partitions["next_cursor"] is not None
+        ):
+            raise TestError(
+                f"DescribeTopicPartitions fixture parser failed: {topic_partitions}"
             )
 
         describe_producers_fixture = struct.pack(">i", 162)
