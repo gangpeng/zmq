@@ -1530,7 +1530,11 @@ pub const Controller = struct {
             return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
         }
 
-        const endpoint_views = self.allocator.alloc(RaftState.VoterEndpointView, req.listeners.len) catch return null;
+        const endpoint_views = self.allocator.alloc(RaftState.VoterEndpointView, req.listeners.len) catch |err| {
+            log.warn("AddRaftVoter endpoint materialization failed for voter {d}: {}", .{ req.voter_id, err });
+            const resp = Resp{ .throttle_time_ms = 0, .error_code = ErrorCode.kafka_storage_error.toInt(), .error_message = null };
+            return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+        };
         for (req.listeners, 0..) |listener, index| {
             const name = listener.name orelse {
                 self.allocator.free(endpoint_views);
@@ -1561,8 +1565,9 @@ pub const Controller = struct {
                 error.ConfigChangePending => ErrorCode.concurrent_transactions.toInt(),
                 error.VoterAlreadyExists => ErrorCode.duplicate_resource.toInt(),
                 error.InvalidEndpoint, error.MessageTooLarge => ErrorCode.invalid_request.toInt(),
-                else => ErrorCode.invalid_request.toInt(),
+                else => ErrorCode.kafka_storage_error.toInt(),
             };
+            log.warn("AddRaftVoter proposal failed for voter {d}: {}", .{ req.voter_id, err });
             const resp = Resp{ .error_code = error_code, .error_message = null };
             return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
         };
@@ -1661,7 +1666,11 @@ pub const Controller = struct {
             return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
         }
 
-        const endpoint_views = self.allocator.alloc(RaftState.VoterEndpointView, req.listeners.len) catch return null;
+        const endpoint_views = self.allocator.alloc(RaftState.VoterEndpointView, req.listeners.len) catch |err| {
+            log.warn("UpdateRaftVoter endpoint materialization failed for voter {d}: {}", .{ req.voter_id, err });
+            const resp = Resp{ .throttle_time_ms = 0, .error_code = ErrorCode.kafka_storage_error.toInt() };
+            return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+        };
         defer self.allocator.free(endpoint_views);
         for (req.listeners, 0..) |listener, index| {
             const name = listener.name orelse {
@@ -1696,8 +1705,9 @@ pub const Controller = struct {
                 error.VoterNotFound => ErrorCode.resource_not_found.toInt(),
                 error.InvalidUpdateVersion => ErrorCode.invalid_update_version.toInt(),
                 error.InvalidEndpoint, error.MessageTooLarge => ErrorCode.invalid_request.toInt(),
-                else => ErrorCode.invalid_request.toInt(),
+                else => ErrorCode.kafka_storage_error.toInt(),
             };
+            log.warn("UpdateRaftVoter proposal failed for voter {d}: {}", .{ req.voter_id, err });
             const resp = Resp{ .throttle_time_ms = 0, .error_code = error_code };
             return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
         };
@@ -1822,7 +1832,11 @@ pub const Controller = struct {
             }
         }
 
-        const endpoint_views = self.allocator.alloc(RaftState.VoterEndpointView, req.listeners.len) catch return null;
+        const endpoint_views = self.allocator.alloc(RaftState.VoterEndpointView, req.listeners.len) catch |err| {
+            log.warn("ControllerRegistration endpoint materialization failed for controller {d}: {}", .{ req.controller_id, err });
+            const resp = Resp{ .throttle_time_ms = 0, .error_code = ErrorCode.kafka_storage_error.toInt(), .error_message = null };
+            return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+        };
         defer self.allocator.free(endpoint_views);
         for (req.listeners, 0..) |listener, index| {
             const name = listener.name orelse {
@@ -1856,8 +1870,9 @@ pub const Controller = struct {
                 error.ConfigChangePending => ErrorCode.concurrent_transactions.toInt(),
                 error.VoterNotFound => ErrorCode.unknown_controller_id.toInt(),
                 error.InvalidUpdateVersion, error.InvalidEndpoint, error.MessageTooLarge => ErrorCode.invalid_registration.toInt(),
-                else => ErrorCode.invalid_registration.toInt(),
+                else => ErrorCode.kafka_storage_error.toInt(),
             };
+            log.warn("ControllerRegistration voter update failed for controller {d}: {}", .{ req.controller_id, err });
             const resp = Resp{ .throttle_time_ms = 0, .error_code = error_code, .error_message = null };
             return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
         };
@@ -2363,6 +2378,72 @@ fn expectNoSuccessfulEndpointDrop(
 
     return failing_allocator.has_induced_failure;
 }
+
+fn readControllerErrorCode(
+    comptime Resp: type,
+    bytes: []const u8,
+    api_key: i16,
+    api_version: i16,
+    correlation_id: i32,
+) !i16 {
+    var rpos: usize = 0;
+    var resp_header = try ResponseHeader.deserialize(testing.allocator, bytes, &rpos, header_mod.responseHeaderVersion(api_key, api_version));
+    defer resp_header.deinit(testing.allocator);
+    try testing.expectEqual(correlation_id, resp_header.correlation_id);
+
+    const resp = try Resp.deserialize(testing.allocator, bytes, &rpos, api_version);
+    return resp.error_code;
+}
+
+const OneShotFailingAllocator = struct {
+    backing: Allocator,
+    fail_index: usize,
+    alloc_index: usize = 0,
+    failed: bool = false,
+
+    fn init(backing: Allocator, fail_index: usize) OneShotFailingAllocator {
+        return .{ .backing = backing, .fail_index = fail_index };
+    }
+
+    fn allocator(self: *OneShotFailingAllocator) Allocator {
+        return .{
+            .ptr = self,
+            .vtable = &.{
+                .alloc = alloc,
+                .resize = resize,
+                .remap = remap,
+                .free = free,
+            },
+        };
+    }
+
+    fn alloc(ctx: *anyopaque, len: usize, alignment: std.mem.Alignment, return_address: usize) ?[*]u8 {
+        const self: *OneShotFailingAllocator = @ptrCast(@alignCast(ctx));
+        if (!self.failed and self.alloc_index == self.fail_index) {
+            self.failed = true;
+            self.alloc_index += 1;
+            return null;
+        }
+        const result = self.backing.rawAlloc(len, alignment, return_address) orelse return null;
+        self.alloc_index += 1;
+        return result;
+    }
+
+    fn resize(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, return_address: usize) bool {
+        const self: *OneShotFailingAllocator = @ptrCast(@alignCast(ctx));
+        return self.backing.rawResize(memory, alignment, new_len, return_address);
+    }
+
+    fn remap(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, return_address: usize) ?[*]u8 {
+        const self: *OneShotFailingAllocator = @ptrCast(@alignCast(ctx));
+        return self.backing.rawRemap(memory, alignment, new_len, return_address);
+    }
+
+    fn free(ctx: *anyopaque, old_mem: []u8, alignment: std.mem.Alignment, return_address: usize) void {
+        const self: *OneShotFailingAllocator = @ptrCast(@alignCast(ctx));
+        self.backing.rawFree(old_mem, alignment, return_address);
+    }
+};
 
 test "Controller init and deinit" {
     var ctrl = Controller.init(testing.allocator, 1, "test-cluster");
@@ -3992,6 +4073,49 @@ test "Controller handleRequest ControllerRegistration rejects invalid listeners"
     try testing.expect(!ctrl.raft_state.pending_config_change);
 }
 
+test "Controller handleRequest ControllerRegistration fails closed on endpoint materialization failure" {
+    const Req = generated.controller_registration_request.ControllerRegistrationRequest;
+    const Resp = generated.controller_registration_response.ControllerRegistrationResponse;
+
+    var saw_storage_error = false;
+    for (0..8) |fail_index| {
+        var ctrl = Controller.init(testing.allocator, 1, "test-cluster");
+        defer ctrl.deinit();
+        try makeTestControllerLeader(&ctrl);
+
+        const listeners = [_]Req.Listener{.{
+            .name = "CONTROLLER",
+            .host = "controller-registration-oom.example",
+            .port = 9093,
+            .security_protocol = 0,
+        }};
+        var buf: [512]u8 = undefined;
+        var pos = buildTestRequest(&buf, 70, 0, 7006, header_mod.requestHeaderVersion(70, 0));
+        const req = Req{
+            .controller_id = 1,
+            .listeners = &listeners,
+            .features = &.{},
+        };
+        req.serialize(&buf, &pos, 0);
+
+        var failing_allocator = OneShotFailingAllocator.init(testing.allocator, fail_index);
+        const response_allocator = failing_allocator.allocator();
+        ctrl.allocator = response_allocator;
+        const response = ctrl.handleRequest(buf[0..pos]);
+        ctrl.allocator = testing.allocator;
+
+        if (response) |bytes| {
+            defer response_allocator.free(bytes);
+            const error_code = try readControllerErrorCode(Resp, bytes, 70, 0, 7006);
+            if (failing_allocator.failed and error_code == ErrorCode.kafka_storage_error.toInt()) {
+                saw_storage_error = true;
+                try testing.expect(!ctrl.raft_state.pending_config_change);
+            }
+        }
+    }
+    try testing.expect(saw_storage_error);
+}
+
 test "Controller handleRequest ControllerRegistration rejects malformed request" {
     const Resp = generated.controller_registration_response.ControllerRegistrationResponse;
 
@@ -4088,6 +4212,51 @@ test "Controller handleRequest AddRaftVoter rejects empty listeners" {
     try testing.expectEqual(ErrorCode.invalid_request.toInt(), resp.error_code);
     try testing.expect(!ctrl.raft_state.pending_config_change);
     try testing.expect(!ctrl.raft_state.voters.contains(2));
+}
+
+test "Controller handleRequest AddRaftVoter fails closed on endpoint materialization failure" {
+    const Req = generated.add_raft_voter_request.AddRaftVoterRequest;
+    const Resp = generated.add_raft_voter_response.AddRaftVoterResponse;
+
+    var saw_storage_error = false;
+    for (0..8) |fail_index| {
+        var ctrl = Controller.init(testing.allocator, 1, "test-cluster");
+        defer ctrl.deinit();
+        try makeTestControllerLeader(&ctrl);
+
+        const listeners = [_]Req.Listener{.{
+            .name = "CONTROLLER",
+            .host = "controller-oom.example",
+            .port = 29093,
+        }};
+        var buf: [256]u8 = undefined;
+        var pos = buildTestRequest(&buf, 80, 0, 8004, header_mod.requestHeaderVersion(80, 0));
+        const req = Req{
+            .cluster_id = "test-cluster",
+            .timeout_ms = 1000,
+            .voter_id = 2,
+            .voter_directory_id = [_]u8{2} ** 16,
+            .listeners = &listeners,
+        };
+        req.serialize(&buf, &pos, 0);
+
+        var failing_allocator = OneShotFailingAllocator.init(testing.allocator, fail_index);
+        const response_allocator = failing_allocator.allocator();
+        ctrl.allocator = response_allocator;
+        const response = ctrl.handleRequest(buf[0..pos]);
+        ctrl.allocator = testing.allocator;
+
+        if (response) |bytes| {
+            defer response_allocator.free(bytes);
+            const error_code = try readControllerErrorCode(Resp, bytes, 80, 0, 8004);
+            if (failing_allocator.failed and error_code == ErrorCode.kafka_storage_error.toInt()) {
+                saw_storage_error = true;
+                try testing.expect(!ctrl.raft_state.pending_config_change);
+                try testing.expect(!ctrl.raft_state.voters.contains(2));
+            }
+        }
+    }
+    try testing.expect(saw_storage_error);
 }
 
 test "Controller handleRequest AddRaftVoter persists listener metadata after commit" {
@@ -4260,6 +4429,50 @@ test "Controller handleRequest UpdateRaftVoter proposes endpoint update" {
     try testing.expectEqualStrings("CONTROLLER", voter.endpoints[0].name);
     try testing.expectEqualStrings("127.0.0.1", voter.endpoints[0].host);
     try testing.expectEqual(@as(u16, 9093), voter.endpoints[0].port);
+}
+
+test "Controller handleRequest UpdateRaftVoter fails closed on endpoint materialization failure" {
+    const Req = generated.update_raft_voter_request.UpdateRaftVoterRequest;
+    const Resp = generated.update_raft_voter_response.UpdateRaftVoterResponse;
+
+    var saw_storage_error = false;
+    for (0..8) |fail_index| {
+        var ctrl = Controller.init(testing.allocator, 1, "test-cluster");
+        defer ctrl.deinit();
+        try makeTestControllerLeader(&ctrl);
+
+        const listeners = [_]Req.Listener{.{
+            .name = "CONTROLLER",
+            .host = "controller-update-oom.example",
+            .port = 9093,
+        }};
+        var buf: [256]u8 = undefined;
+        var pos = buildTestRequest(&buf, 82, 0, 8205, header_mod.requestHeaderVersion(82, 0));
+        const req = Req{
+            .cluster_id = "test-cluster",
+            .voter_id = 1,
+            .voter_directory_id = [_]u8{1} ** 16,
+            .listeners = &listeners,
+            .k_raft_version_feature = .{ .min_supported_version = 0, .max_supported_version = 0 },
+        };
+        req.serialize(&buf, &pos, 0);
+
+        var failing_allocator = OneShotFailingAllocator.init(testing.allocator, fail_index);
+        const response_allocator = failing_allocator.allocator();
+        ctrl.allocator = response_allocator;
+        const response = ctrl.handleRequest(buf[0..pos]);
+        ctrl.allocator = testing.allocator;
+
+        if (response) |bytes| {
+            defer response_allocator.free(bytes);
+            const error_code = try readControllerErrorCode(Resp, bytes, 82, 0, 8205);
+            if (failing_allocator.failed and error_code == ErrorCode.kafka_storage_error.toInt()) {
+                saw_storage_error = true;
+                try testing.expect(!ctrl.raft_state.pending_config_change);
+            }
+        }
+    }
+    try testing.expect(saw_storage_error);
 }
 
 test "Controller handleRequest UpdateRaftVoter rejects non-leader unknown voter and invalid feature" {
