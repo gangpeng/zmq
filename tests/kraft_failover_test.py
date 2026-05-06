@@ -2749,6 +2749,40 @@ def wait_for_consumer_group_heartbeat(port, group_state, timeout=30):
     )
 
 
+def wait_for_consumer_group_heartbeat_owned_assignment(
+    port, group_state, timeout=30
+):
+    deadline = time.time() + timeout
+    correlation_id = 7810
+    last_error = None
+    owned = [
+        {
+            "topic_id": group_state["topic_id"],
+            "partitions": [0],
+        }
+    ]
+    while time.time() < deadline:
+        try:
+            response = consumer_group_heartbeat(
+                port,
+                group_state["group_id"],
+                group_state["member_id"],
+                group_state["member_epoch"],
+                correlation_id,
+                topic_partitions=owned,
+            )
+            assert_consumer_group_heartbeat_assignment(response, group_state)
+            return
+        except Exception as exc:
+            last_error = exc
+        correlation_id += 1
+        time.sleep(0.25)
+    raise TestError(
+        f"ConsumerGroupHeartbeat owned assignment did not recover for "
+        f"{group_state['group_id']!r}: {last_error}"
+    )
+
+
 def wait_for_consumer_group_heartbeat_static_rejoin(
     port, group_state, timeout=30
 ):
@@ -5412,6 +5446,10 @@ def main():
         kip848_committed_offset = committed_offset
         kip848_offset_metadata = "kraft-failover-kip848"
         wait_for_consumer_group_heartbeat(broker["port"], kip848_group_state)
+        wait_for_consumer_group_heartbeat_owned_assignment(
+            broker["port"],
+            kip848_group_state,
+        )
         wait_for_kip848_consumer_group_description(
             broker["port"],
             kip848_group_state,
@@ -5457,6 +5495,10 @@ def main():
             topic,
         )
         wait_for_consumer_group_heartbeat(broker["port"], kip848_group_state)
+        wait_for_consumer_group_heartbeat_owned_assignment(
+            broker["port"],
+            kip848_group_state,
+        )
         wait_for_consumer_group_heartbeat_rack_update(
             broker["port"],
             kip848_group_state,
@@ -5537,6 +5579,10 @@ def main():
             controller_failover_txn["transactional_id"],
         )
         wait_for_consumer_group_heartbeat(broker["port"], kip848_group_state)
+        wait_for_consumer_group_heartbeat_owned_assignment(
+            broker["port"],
+            kip848_group_state,
+        )
         wait_for_kip848_consumer_group_description(
             broker["port"],
             kip848_group_state,
@@ -5616,6 +5662,10 @@ def main():
             controller_failover_txn["transactional_id"],
         )
         wait_for_consumer_group_heartbeat(broker["port"], kip848_group_state)
+        wait_for_consumer_group_heartbeat_owned_assignment(
+            broker["port"],
+            kip848_group_state,
+        )
         wait_for_kip848_consumer_group_description(
             broker["port"],
             kip848_group_state,
@@ -5705,6 +5755,10 @@ def main():
             controller_failover_txn["transactional_id"],
         )
         wait_for_consumer_group_heartbeat(broker["port"], kip848_group_state)
+        wait_for_consumer_group_heartbeat_owned_assignment(
+            broker["port"],
+            kip848_group_state,
+        )
         wait_for_kip848_consumer_group_description(
             broker["port"],
             kip848_group_state,
@@ -5799,6 +5853,10 @@ def main():
             controller_failover_txn["transactional_id"],
         )
         wait_for_consumer_group_heartbeat(broker["port"], kip848_group_state)
+        wait_for_consumer_group_heartbeat_owned_assignment(
+            broker["port"],
+            kip848_group_state,
+        )
         wait_for_kip848_consumer_group_description(
             broker["port"],
             kip848_group_state,
@@ -5905,6 +5963,10 @@ def main():
             controller_failover_txn["transactional_id"],
         )
         wait_for_consumer_group_heartbeat(broker["port"], kip848_group_state)
+        wait_for_consumer_group_heartbeat_owned_assignment(
+            broker["port"],
+            kip848_group_state,
+        )
         wait_for_kip848_consumer_group_description(
             broker["port"],
             kip848_group_state,
@@ -6076,6 +6138,7 @@ def main():
             f"kip848_describe_checked=true, "
             f"kip848_rejoin_checked=true, "
             f"kip848_rack_checked=true, "
+            f"kip848_owned_assignment_checked=true, "
             f"kip848_static_rejoin_checked=true, "
             f"offset_commit_v9_member_checked=true, "
             f"offset_fetch_v9_member_checked=true, "
