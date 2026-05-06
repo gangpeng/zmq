@@ -18992,66 +18992,75 @@ pub const Broker = struct {
 
         if (!validateDeleteTopicsRequestFrame(request_bytes, body_start, api_version)) {
             log.warn("Malformed DeleteTopics request", .{});
-            return null;
+            return self.deleteTopicsErrorResponse(req_header, resp_header_version, api_version, ErrorCode.invalid_request, "Invalid request");
         }
 
         var pos = body_start;
         var req = Req.deserialize(self.allocator, request_bytes, &pos, api_version) catch |err| {
             log.warn("Malformed DeleteTopics request: {}", .{err});
-            return null;
+            return self.deleteTopicsErrorResponse(req_header, resp_header_version, api_version, ErrorCode.invalid_request, "Invalid request");
         };
         defer self.freeDeleteTopicsRequest(&req);
 
         const response_count = if (api_version >= 6) req.topics.len else req.topic_names.len;
         var responses: []TopicResult = &.{};
         if (response_count > 0) {
-            responses = self.allocator.alloc(TopicResult, response_count) catch return null;
-        }
-        var delete_outcomes: []DeleteTopicOutcome = &.{};
-        if (response_count > 0) {
-            delete_outcomes = self.allocator.alloc(DeleteTopicOutcome, response_count) catch {
-                if (responses.len > 0) self.allocator.free(responses);
-                return null;
+            responses = self.allocator.alloc(TopicResult, response_count) catch |err| {
+                log.warn("DeleteTopics response materialization failed: {}", .{err});
+                return self.deleteTopicsErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error, "Failed to materialize DeleteTopics response");
             };
         }
+        defer if (responses.len > 0) self.allocator.free(responses);
+
+        var delete_outcomes: []DeleteTopicOutcome = &.{};
+        if (response_count > 0) {
+            delete_outcomes = self.allocator.alloc(DeleteTopicOutcome, response_count) catch |err| {
+                log.warn("DeleteTopics mutation outcome materialization failed: {}", .{err});
+                return self.deleteTopicsErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error, "Failed to materialize DeleteTopics mutation state");
+            };
+        }
+        defer if (delete_outcomes.len > 0) self.allocator.free(delete_outcomes);
+
         var owned_response_names: []?[]u8 = &.{};
         if (response_count > 0) {
-            owned_response_names = self.allocator.alloc(?[]u8, response_count) catch {
-                if (delete_outcomes.len > 0) self.allocator.free(delete_outcomes);
-                self.allocator.free(responses);
-                return null;
+            owned_response_names = self.allocator.alloc(?[]u8, response_count) catch |err| {
+                log.warn("DeleteTopics response-name tracking materialization failed: {}", .{err});
+                return self.deleteTopicsErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error, "Failed to materialize DeleteTopics response names");
             };
             @memset(owned_response_names, null);
         }
-
-        var responses_init: usize = 0;
-        var deleted_any = false;
-        const previous_snapshot = self.encodeTopicSnapshotRecordValue() catch {
-            if (owned_response_names.len > 0) self.allocator.free(owned_response_names);
-            if (delete_outcomes.len > 0) self.allocator.free(delete_outcomes);
-            if (responses.len > 0) self.allocator.free(responses);
-            return null;
-        };
         defer {
-            self.allocator.free(previous_snapshot);
             for (owned_response_names) |maybe_name| {
                 if (maybe_name) |name| self.allocator.free(name);
             }
             if (owned_response_names.len > 0) self.allocator.free(owned_response_names);
-            if (delete_outcomes.len > 0) self.allocator.free(delete_outcomes);
-            if (responses.len > 0) self.allocator.free(responses);
         }
 
         if (api_version >= 6) {
-            for (req.topics) |topic_req| {
-                var response_name = topic_req.name;
-                if (response_name == null) {
+            for (req.topics, 0..) |topic_req, topic_idx| {
+                if (topic_req.name == null) {
                     if (self.findTopicNameById(topic_req.topic_id)) |found_name| {
-                        const name_copy = self.allocator.dupe(u8, found_name) catch return null;
-                        owned_response_names[responses_init] = name_copy;
-                        response_name = name_copy;
+                        const name_copy = self.allocator.dupe(u8, found_name) catch |err| {
+                            log.warn("DeleteTopics response name materialization failed: {}", .{err});
+                            return self.deleteTopicsErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error, "Failed to materialize DeleteTopics response name");
+                        };
+                        owned_response_names[topic_idx] = name_copy;
                     }
                 }
+            }
+        }
+
+        var responses_init: usize = 0;
+        var deleted_any = false;
+        const previous_snapshot = self.encodeTopicSnapshotRecordValue() catch |err| {
+            log.warn("DeleteTopics rollback snapshot materialization failed: {}", .{err});
+            return self.deleteTopicsErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error, "Failed to materialize DeleteTopics rollback snapshot");
+        };
+        defer self.allocator.free(previous_snapshot);
+
+        if (api_version >= 6) {
+            for (req.topics) |topic_req| {
+                const response_name = topic_req.name orelse owned_response_names[responses_init];
 
                 const topic_name = response_name orelse "";
                 const outcome = if (topic_name.len > 0)
@@ -19104,7 +19113,10 @@ pub const Broker = struct {
                     .throttle_time_ms = 0,
                     .responses = responses[0..responses_init],
                 };
-                return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+                return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version) orelse {
+                    log.warn("DeleteTopics snapshot-error response serialization failed", .{});
+                    return self.deleteTopicsErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error, "Failed to serialize DeleteTopics response");
+                };
             };
             for (responses[0..responses_init], delete_outcomes[0..responses_init]) |response, outcome| {
                 if (outcome.deleted) {
@@ -19127,7 +19139,10 @@ pub const Broker = struct {
             .throttle_time_ms = 0,
             .responses = responses[0..responses_init],
         };
-        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version) orelse {
+            log.warn("DeleteTopics response serialization failed", .{});
+            return self.deleteTopicsErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error, "Failed to serialize DeleteTopics response");
+        };
     }
 
     const DeleteTopicOutcome = struct {
@@ -33514,6 +33529,24 @@ fn expectCreatePartitionsErrorResponseBytes(response: []const u8, api_version: i
     try testing.expectEqual(@as(usize, 1), resp.results.len);
     try testing.expectEqual(@as(i16, @intFromEnum(err_code)), resp.results[0].error_code);
     try testing.expect(resp.results[0].name == null);
+}
+
+fn expectDeleteTopicsErrorResponseBytes(response: []const u8, api_version: i16, correlation_id: i32, err_code: ErrorCode) !void {
+    const Resp = generated.delete_topics_response.DeleteTopicsResponse;
+
+    var rpos: usize = 0;
+    var response_header = try ResponseHeader.deserialize(testing.allocator, response, &rpos, header_mod.responseHeaderVersion(20, api_version));
+    defer response_header.deinit(testing.allocator);
+    try testing.expectEqual(correlation_id, response_header.correlation_id);
+
+    const resp = try Resp.deserialize(testing.allocator, response, &rpos, api_version);
+    defer if (resp.responses.len > 0) testing.allocator.free(resp.responses);
+
+    try testing.expectEqual(response.len, rpos);
+    if (api_version >= 1) try testing.expectEqual(@as(i32, 0), resp.throttle_time_ms);
+    try testing.expectEqual(@as(usize, 1), resp.responses.len);
+    try testing.expectEqual(@as(i16, @intFromEnum(err_code)), resp.responses[0].error_code);
+    try testing.expectEqualStrings("", resp.responses[0].name.?);
 }
 
 fn expectListOffsetsErrorResponseBytes(response: []const u8, api_version: i16, correlation_id: i32, err_code: ErrorCode) !void {
@@ -70360,7 +70393,11 @@ test "Broker.handleRequest DeleteTopics rejects truncated request" {
 
     var buf: [128]u8 = undefined;
     const req_len = buildTestRequest(&buf, 20, 6, 2007, header_mod.requestHeaderVersion(20, 6));
-    try testing.expect(broker.handleRequest(buf[0..req_len]) == null);
+    const response = broker.handleRequest(buf[0..req_len]);
+    try testing.expect(response != null);
+    defer testing.allocator.free(response.?);
+
+    try expectDeleteTopicsErrorResponseBytes(response.?, 6, 2007, ErrorCode.invalid_request);
 }
 
 test "Broker.handleRequest DeleteTopics rejects trailing bytes" {
@@ -70385,7 +70422,227 @@ test "Broker.handleRequest DeleteTopics rejects trailing bytes" {
     var pos = buildTestRequest(&buf, 20, 6, 2009, header_mod.requestHeaderVersion(20, 6));
     req.serialize(&buf, &pos, 6);
 
-    try expectTrailingByteRejected(&broker, &buf, pos);
+    try testing.expect(pos < buf.len);
+    buf[pos] = 0x7f;
+    const response = broker.handleRequest(buf[0 .. pos + 1]);
+    try testing.expect(response != null);
+    defer testing.allocator.free(response.?);
+
+    try expectDeleteTopicsErrorResponseBytes(response.?, 6, 2009, ErrorCode.invalid_request);
+}
+
+test "Broker.handleRequest DeleteTopics fails closed when response materialization fails" {
+    const Req = generated.delete_topics_request.DeleteTopicsRequest;
+    const Topic = Req.DeleteTopicState;
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+    try testing.expect(broker.ensureTopic("dt-materialize-fail-topic"));
+    const topic_id = broker.topics.get("dt-materialize-fail-topic").?.topic_id;
+
+    const topics = [_]Topic{.{
+        .name = "dt-materialize-fail-topic",
+        .topic_id = topic_id,
+    }};
+    const req = Req{
+        .topics = &topics,
+        .timeout_ms = 30000,
+    };
+
+    var buf: [512]u8 = undefined;
+    var pos = buildTestRequest(&buf, 20, 6, 2020, header_mod.requestHeaderVersion(20, 6));
+    req.serialize(&buf, &pos, 6);
+
+    var failing_allocator = OneShotFailingAllocator.init(testing.allocator, 1);
+    const response_allocator = failing_allocator.allocator();
+    broker.allocator = response_allocator;
+
+    const response = broker.handleRequest(buf[0..pos]);
+    broker.allocator = testing.allocator;
+
+    try testing.expect(failing_allocator.failed);
+    try testing.expect(response != null);
+    defer response_allocator.free(response.?);
+
+    try expectDeleteTopicsErrorResponseBytes(response.?, 6, 2020, ErrorCode.kafka_storage_error);
+    try testing.expect(broker.topics.contains("dt-materialize-fail-topic"));
+}
+
+test "Broker.handleRequest DeleteTopics fails closed when mutation state materialization fails" {
+    const Req = generated.delete_topics_request.DeleteTopicsRequest;
+    const Topic = Req.DeleteTopicState;
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+    try testing.expect(broker.ensureTopic("dt-mutation-fail-topic"));
+    const topic_id = broker.topics.get("dt-mutation-fail-topic").?.topic_id;
+
+    const topics = [_]Topic{.{
+        .name = "dt-mutation-fail-topic",
+        .topic_id = topic_id,
+    }};
+    const req = Req{
+        .topics = &topics,
+        .timeout_ms = 30000,
+    };
+
+    var buf: [512]u8 = undefined;
+    var pos = buildTestRequest(&buf, 20, 6, 2021, header_mod.requestHeaderVersion(20, 6));
+    req.serialize(&buf, &pos, 6);
+
+    var failing_allocator = OneShotFailingAllocator.init(testing.allocator, 2);
+    const response_allocator = failing_allocator.allocator();
+    broker.allocator = response_allocator;
+
+    const response = broker.handleRequest(buf[0..pos]);
+    broker.allocator = testing.allocator;
+
+    try testing.expect(failing_allocator.failed);
+    try testing.expect(response != null);
+    defer response_allocator.free(response.?);
+
+    try expectDeleteTopicsErrorResponseBytes(response.?, 6, 2021, ErrorCode.kafka_storage_error);
+    try testing.expect(broker.topics.contains("dt-mutation-fail-topic"));
+}
+
+test "Broker.handleRequest DeleteTopics fails closed when response-name tracking materialization fails" {
+    const Req = generated.delete_topics_request.DeleteTopicsRequest;
+    const Topic = Req.DeleteTopicState;
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+    try testing.expect(broker.ensureTopic("dt-name-tracking-fail-topic"));
+    const topic_id = broker.topics.get("dt-name-tracking-fail-topic").?.topic_id;
+
+    const topics = [_]Topic{.{
+        .name = "dt-name-tracking-fail-topic",
+        .topic_id = topic_id,
+    }};
+    const req = Req{
+        .topics = &topics,
+        .timeout_ms = 30000,
+    };
+
+    var buf: [512]u8 = undefined;
+    var pos = buildTestRequest(&buf, 20, 6, 2022, header_mod.requestHeaderVersion(20, 6));
+    req.serialize(&buf, &pos, 6);
+
+    var failing_allocator = OneShotFailingAllocator.init(testing.allocator, 3);
+    const response_allocator = failing_allocator.allocator();
+    broker.allocator = response_allocator;
+
+    const response = broker.handleRequest(buf[0..pos]);
+    broker.allocator = testing.allocator;
+
+    try testing.expect(failing_allocator.failed);
+    try testing.expect(response != null);
+    defer response_allocator.free(response.?);
+
+    try expectDeleteTopicsErrorResponseBytes(response.?, 6, 2022, ErrorCode.kafka_storage_error);
+    try testing.expect(broker.topics.contains("dt-name-tracking-fail-topic"));
+}
+
+test "Broker.handleRequest DeleteTopics fails closed when topic-id response name materialization fails" {
+    const Req = generated.delete_topics_request.DeleteTopicsRequest;
+    const Topic = Req.DeleteTopicState;
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+    try testing.expect(broker.ensureTopic("dt-id-name-fail-topic"));
+    const topic_id = broker.topics.get("dt-id-name-fail-topic").?.topic_id;
+
+    const topics = [_]Topic{.{
+        .name = null,
+        .topic_id = topic_id,
+    }};
+    const req = Req{
+        .topics = &topics,
+        .timeout_ms = 30000,
+    };
+
+    var buf: [512]u8 = undefined;
+    var pos = buildTestRequest(&buf, 20, 6, 2023, header_mod.requestHeaderVersion(20, 6));
+    req.serialize(&buf, &pos, 6);
+
+    var failing_allocator = OneShotFailingAllocator.init(testing.allocator, 4);
+    const response_allocator = failing_allocator.allocator();
+    broker.allocator = response_allocator;
+
+    const response = broker.handleRequest(buf[0..pos]);
+    broker.allocator = testing.allocator;
+
+    try testing.expect(failing_allocator.failed);
+    try testing.expect(response != null);
+    defer response_allocator.free(response.?);
+
+    try expectDeleteTopicsErrorResponseBytes(response.?, 6, 2023, ErrorCode.kafka_storage_error);
+    try testing.expect(broker.topics.contains("dt-id-name-fail-topic"));
+}
+
+test "Broker.handleRequest DeleteTopics fails closed when rollback snapshot materialization fails" {
+    const Req = generated.delete_topics_request.DeleteTopicsRequest;
+    const Topic = Req.DeleteTopicState;
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+    try testing.expect(broker.ensureTopic("dt-snapshot-fail-topic"));
+    const topic_id = broker.topics.get("dt-snapshot-fail-topic").?.topic_id;
+
+    const topics = [_]Topic{.{
+        .name = "dt-snapshot-fail-topic",
+        .topic_id = topic_id,
+    }};
+    const req = Req{
+        .topics = &topics,
+        .timeout_ms = 30000,
+    };
+
+    var buf: [512]u8 = undefined;
+    var pos = buildTestRequest(&buf, 20, 6, 2024, header_mod.requestHeaderVersion(20, 6));
+    req.serialize(&buf, &pos, 6);
+
+    var failing_allocator = OneShotFailingAllocator.init(testing.allocator, 4);
+    const response_allocator = failing_allocator.allocator();
+    broker.allocator = response_allocator;
+
+    const response = broker.handleRequest(buf[0..pos]);
+    broker.allocator = testing.allocator;
+
+    try testing.expect(failing_allocator.failed);
+    try testing.expect(response != null);
+    defer response_allocator.free(response.?);
+
+    try expectDeleteTopicsErrorResponseBytes(response.?, 6, 2024, ErrorCode.kafka_storage_error);
+    try testing.expect(broker.topics.contains("dt-snapshot-fail-topic"));
+}
+
+test "Broker.handleRequest DeleteTopics fails closed when serialization fails" {
+    const Req = generated.delete_topics_request.DeleteTopicsRequest;
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+
+    const req = Req{
+        .topics = &.{},
+        .timeout_ms = 30000,
+    };
+
+    var buf: [128]u8 = undefined;
+    var pos = buildTestRequest(&buf, 20, 6, 2025, header_mod.requestHeaderVersion(20, 6));
+    req.serialize(&buf, &pos, 6);
+
+    var failing_allocator = OneShotFailingAllocator.init(testing.allocator, 1);
+    const response_allocator = failing_allocator.allocator();
+    broker.allocator = response_allocator;
+
+    const response = broker.handleRequest(buf[0..pos]);
+    broker.allocator = testing.allocator;
+
+    try testing.expect(failing_allocator.failed);
+    try testing.expect(response != null);
+    defer response_allocator.free(response.?);
+
+    try expectDeleteTopicsErrorResponseBytes(response.?, 6, 2025, ErrorCode.kafka_storage_error);
 }
 
 test "Broker.handleRequest DeleteRecords v2 returns generated response and trims partition" {
