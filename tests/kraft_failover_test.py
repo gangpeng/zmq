@@ -691,6 +691,72 @@ def require_create_topics_result(
         raise TestError(f"{label} unexpected error message: {response}")
 
 
+def parse_allocate_producer_ids_response(response, correlation_id):
+    pos = parse_flexible_response_header(response, correlation_id)
+    throttle_time_ms, pos = read_i32(response, pos)
+    error_code, pos = read_i16(response, pos)
+    producer_id_start, pos = read_i64(response, pos)
+    producer_id_len, pos = read_i32(response, pos)
+    pos = skip_tags(response, pos)
+    if pos != len(response):
+        raise TestError(
+            f"AllocateProducerIds response trailing bytes: {len(response) - pos}"
+        )
+    return {
+        "throttle_time_ms": throttle_time_ms,
+        "error_code": error_code,
+        "producer_id_start": producer_id_start,
+        "producer_id_len": producer_id_len,
+    }
+
+
+def allocate_producer_ids(port, broker_id, broker_epoch, correlation_id):
+    body = struct.pack(">iq", broker_id, broker_epoch)
+    body += b"\x00"  # request tagged fields
+    response = flexible_kafka_request(port, 67, 0, correlation_id, body)
+    return parse_allocate_producer_ids_response(response, correlation_id)
+
+
+def wait_for_allocate_producer_ids_checkpoint(
+    port,
+    state,
+    label,
+    timeout=30,
+):
+    deadline = time.time() + timeout
+    correlation_id = state.get("correlation_id", 9040)
+    last_error = None
+    while time.time() < deadline:
+        try:
+            allocated = allocate_producer_ids(port, 100, -1, correlation_id)
+            if (
+                allocated["throttle_time_ms"] != 0
+                or allocated["error_code"] != ERROR_NONE
+                or allocated["producer_id_start"] < 0
+                or allocated["producer_id_len"] <= 0
+            ):
+                raise TestError(f"AllocateProducerIds invalid response: {allocated}")
+            previous_next = state.get("next_producer_id")
+            if (
+                previous_next is not None
+                and allocated["producer_id_start"] < previous_next
+            ):
+                raise TestError(
+                    f"AllocateProducerIds reused PID range during {label}: "
+                    f"previous_next={previous_next} response={allocated}"
+                )
+            state["next_producer_id"] = (
+                allocated["producer_id_start"] + allocated["producer_id_len"]
+            )
+            state["correlation_id"] = correlation_id + 1
+            return allocated
+        except Exception as exc:
+            last_error = exc
+        correlation_id += 1
+        time.sleep(0.25)
+    raise TestError(f"AllocateProducerIds did not recover during {label}: {last_error}")
+
+
 def produce(port, topic, payload, correlation_id):
     body = struct.pack(">h", 1)  # acks
     body += struct.pack(">i", 30000)
@@ -10041,6 +10107,12 @@ def main():
 
         broker = start_broker(tmp, voters)
         wait_for_broker_ready(broker["proc"], broker["port"], broker["log_path"])
+        producer_id_state = {"correlation_id": 9040}
+        wait_for_allocate_producer_ids_checkpoint(
+            processes[leader_id]["port"],
+            producer_id_state,
+            "initial leader",
+        )
         topic = f"kraft-failover-{os.getpid()}-{int(time.time())}"
         group = f"kraft-failover-group-{os.getpid()}-{int(time.time())}"
         offset_delete_group = f"{group}-offset-delete"
@@ -10643,6 +10715,11 @@ def main():
         )
         if network_partition_result is not None:
             leader_id, initial = wait_for_leader(processes)
+            wait_for_allocate_producer_ids_checkpoint(
+                processes[leader_id]["port"],
+                producer_id_state,
+                "network partition matrix",
+            )
         wait_for_log_position_checkpoint(
             broker["port"],
             topic,
@@ -10758,6 +10835,11 @@ def main():
             raise TestError(f"leader epoch did not advance: before={initial} after={after}")
 
         wait_for_all_alive_to_report(processes, replacement_leader)
+        wait_for_allocate_producer_ids_checkpoint(
+            processes[replacement_leader]["port"],
+            producer_id_state,
+            "controller leader failover",
+        )
         wait_for_payloads(broker["port"], topic, expected_payloads)
         wait_for_log_position_checkpoint(
             broker["port"],
@@ -10909,6 +10991,11 @@ def main():
                 f"restarted old leader {leader_id} did not rejoin leader "
                 f"{replacement_leader}: {rejoined_quorum}"
             )
+        wait_for_allocate_producer_ids_checkpoint(
+            processes[replacement_leader]["port"],
+            producer_id_state,
+            "old leader fresh rejoin",
+        )
 
         wait_for_payloads(broker["port"], topic, expected_payloads)
         wait_for_log_position_checkpoint(
@@ -11057,6 +11144,11 @@ def main():
                 f"restarted controller {restart_controller_id} did not rejoin leader "
                 f"{replacement_leader}: {restarted_quorum}"
             )
+        wait_for_allocate_producer_ids_checkpoint(
+            processes[replacement_leader]["port"],
+            producer_id_state,
+            "surviving controller restart",
+        )
 
         wait_for_payloads(broker["port"], topic, expected_payloads)
         wait_for_log_position_checkpoint(
@@ -11192,6 +11284,11 @@ def main():
         stop_process(broker["proc"])
         broker = start_broker(tmp, voters)
         wait_for_broker_ready(broker["proc"], broker["port"], broker["log_path"])
+        wait_for_allocate_producer_ids_checkpoint(
+            processes[replacement_leader]["port"],
+            producer_id_state,
+            "broker restart",
+        )
         wait_for_payloads(broker["port"], topic, expected_payloads)
         wait_for_log_position_checkpoint(
             broker["port"],
@@ -11452,6 +11549,7 @@ def main():
             f"reassignment_topic={automq_result['reassignment_topic']}, "
             f"reassignment_target={automq_result['reassignment_target']}, "
             f"reassignment_target_offset={automq_result['reassignment_target_offset']}, "
+            f"allocate_producer_ids_checked=true, "
             f"committed_offset={committed_offset}, "
             f"transactions_checked=5, "
             f"transaction_introspection_checked=true, "
@@ -11749,6 +11847,23 @@ def self_test():
         )
         if created_topics["topics"][0]["configs"][0]["value"] != "compact":
             raise TestError(f"CreateTopics fixture parser failed: {created_topics}")
+
+        allocate_pids_fixture = struct.pack(">i", 148)
+        allocate_pids_fixture += b"\x00"  # response header tagged fields
+        allocate_pids_fixture += struct.pack(">ihqi", 0, ERROR_NONE, 5000, 1000)
+        allocate_pids_fixture += b"\x00"  # response tagged fields
+        allocated_pids = parse_allocate_producer_ids_response(
+            allocate_pids_fixture,
+            148,
+        )
+        if (
+            allocated_pids["producer_id_start"] != 5000
+            or allocated_pids["producer_id_len"] != 1000
+            or allocated_pids["error_code"] != ERROR_NONE
+        ):
+            raise TestError(
+                f"AllocateProducerIds fixture parser failed: {allocated_pids}"
+            )
 
         init_fixture = struct.pack(">iihqh", 44, 0, 0, 1000, 0)
         identity = parse_init_producer_id_response(init_fixture, 44)
