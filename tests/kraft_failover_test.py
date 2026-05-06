@@ -2587,11 +2587,12 @@ def consumer_group_heartbeat(
     server_assignor=None,
     topic_partitions=None,
     rack_id=None,
+    instance_id=None,
 ):
     body = write_compact_string(group_id)
     body += write_compact_string(member_id)
     body += struct.pack(">i", member_epoch)
-    body += write_compact_string(None)  # instance_id
+    body += write_compact_string(instance_id)
     body += write_compact_string(rack_id)
     body += struct.pack(">i", 30000 if member_epoch == 0 else -1)
     if subscribed_topics is None:
@@ -2677,6 +2678,52 @@ def wait_for_consumer_group_heartbeat_join(port, group_id, topic, timeout=30):
     raise TestError(f"ConsumerGroupHeartbeat group {group_id!r} did not join: {last_error}")
 
 
+def wait_for_consumer_group_heartbeat_static_join(
+    port, group_id, topic, instance_id, timeout=30
+):
+    deadline = time.time() + timeout
+    correlation_id = 7750
+    member_id = f"{group_id}-member"
+    last_error = None
+    while time.time() < deadline:
+        try:
+            response = consumer_group_heartbeat(
+                port,
+                group_id,
+                member_id,
+                0,
+                correlation_id,
+                subscribed_topics=[topic],
+                server_assignor="range",
+                instance_id=instance_id,
+            )
+            if response["error_code"] != 0:
+                raise TestError(
+                    f"static join error_code={response['error_code']} "
+                    f"message={response['error_message']!r}"
+                )
+            assignment = response["assignment"]
+            if assignment is None or not assignment["topic_partitions"]:
+                raise TestError(f"static join missing assignment: {response}")
+            topic_assignment = assignment["topic_partitions"][0]
+            group_state = {
+                "group_id": group_id,
+                "member_id": response["member_id"],
+                "member_epoch": response["member_epoch"],
+                "topic_id": topic_assignment["topic_id"],
+                "instance_id": instance_id,
+            }
+            assert_consumer_group_heartbeat_assignment(response, group_state)
+            return group_state
+        except Exception as exc:
+            last_error = exc
+        correlation_id += 1
+        time.sleep(0.25)
+    raise TestError(
+        f"ConsumerGroupHeartbeat static group {group_id!r} did not join: {last_error}"
+    )
+
+
 def wait_for_consumer_group_heartbeat(port, group_state, timeout=30):
     deadline = time.time() + timeout
     correlation_id = 7800
@@ -2698,6 +2745,47 @@ def wait_for_consumer_group_heartbeat(port, group_state, timeout=30):
         time.sleep(0.25)
     raise TestError(
         f"ConsumerGroupHeartbeat did not recover for "
+        f"{group_state['group_id']!r}: {last_error}"
+    )
+
+
+def wait_for_consumer_group_heartbeat_static_rejoin(
+    port, group_state, timeout=30
+):
+    deadline = time.time() + timeout
+    correlation_id = 7820
+    last_error = None
+    while time.time() < deadline:
+        try:
+            response = consumer_group_heartbeat(
+                port,
+                group_state["group_id"],
+                "",
+                -2,
+                correlation_id,
+                instance_id=group_state["instance_id"],
+            )
+            if response["error_code"] != 0:
+                raise TestError(
+                    f"ConsumerGroupHeartbeat static rejoin error_code="
+                    f"{response['error_code']} message={response['error_message']!r}"
+                )
+            if response["member_id"] != group_state["member_id"]:
+                raise TestError(
+                    f"ConsumerGroupHeartbeat static rejoin member mismatch: {response}"
+                )
+            if response["member_epoch"] != group_state["member_epoch"]:
+                raise TestError(
+                    f"ConsumerGroupHeartbeat static rejoin epoch mismatch: {response}"
+                )
+            assert_consumer_group_heartbeat_assignment(response, group_state)
+            return
+        except Exception as exc:
+            last_error = exc
+        correlation_id += 1
+        time.sleep(0.25)
+    raise TestError(
+        f"ConsumerGroupHeartbeat static rejoin did not recover for "
         f"{group_state['group_id']!r}: {last_error}"
     )
 
@@ -2899,6 +2987,13 @@ def assert_kip848_consumer_group_description(port, group_state, topic, correlati
             f"KIP-848 ConsumerGroupDescribe member_epoch="
             f"{matching_member['member_epoch']} expected={group_state['member_epoch']}"
         )
+    if group_state.get("instance_id") is not None:
+        if matching_member["instance_id"] != group_state["instance_id"]:
+            raise TestError(
+                f"KIP-848 ConsumerGroupDescribe instance_id="
+                f"{matching_member['instance_id']!r} "
+                f"expected={group_state['instance_id']!r}"
+            )
     if group_state.get("rack_id") is not None:
         if matching_member["rack_id"] != group_state["rack_id"]:
             raise TestError(
@@ -2954,6 +3049,11 @@ def wait_for_kip848_consumer_group_description(
         f"KIP-848 ConsumerGroupDescribe did not recover for "
         f"{group_state['group_id']!r}: {last_error}"
     )
+
+
+def wait_for_kip848_static_member_checkpoint(port, group_state, topic):
+    wait_for_consumer_group_heartbeat_static_rejoin(port, group_state)
+    wait_for_kip848_consumer_group_description(port, group_state, topic)
 
 
 def parse_leave_group_response(response, correlation_id):
@@ -5317,6 +5417,17 @@ def main():
             kip848_group_state,
             topic,
         )
+        kip848_static_group_state = wait_for_consumer_group_heartbeat_static_join(
+            broker["port"],
+            f"{group}-kip848-static",
+            topic,
+            "instance-kip848-failover",
+        )
+        wait_for_kip848_static_member_checkpoint(
+            broker["port"],
+            kip848_static_group_state,
+            topic,
+        )
         wait_for_offset_commit_v9_member_checkpoint(
             broker["port"],
             kip848_group_state,
@@ -5354,6 +5465,11 @@ def main():
         wait_for_kip848_consumer_group_description(
             broker["port"],
             kip848_group_state,
+            topic,
+        )
+        wait_for_kip848_static_member_checkpoint(
+            broker["port"],
+            kip848_static_group_state,
             topic,
         )
         wait_for_offset_commit_v9_member_checkpoint(
@@ -5424,6 +5540,11 @@ def main():
         wait_for_kip848_consumer_group_description(
             broker["port"],
             kip848_group_state,
+            topic,
+        )
+        wait_for_kip848_static_member_checkpoint(
+            broker["port"],
+            kip848_static_group_state,
             topic,
         )
         wait_for_offset_commit_v9_member_checkpoint(
@@ -5498,6 +5619,11 @@ def main():
         wait_for_kip848_consumer_group_description(
             broker["port"],
             kip848_group_state,
+            topic,
+        )
+        wait_for_kip848_static_member_checkpoint(
+            broker["port"],
+            kip848_static_group_state,
             topic,
         )
         wait_for_offset_commit_v9_member_checkpoint(
@@ -5582,6 +5708,11 @@ def main():
         wait_for_kip848_consumer_group_description(
             broker["port"],
             kip848_group_state,
+            topic,
+        )
+        wait_for_kip848_static_member_checkpoint(
+            broker["port"],
+            kip848_static_group_state,
             topic,
         )
         wait_for_offset_commit_v9_member_checkpoint(
@@ -5671,6 +5802,11 @@ def main():
         wait_for_kip848_consumer_group_description(
             broker["port"],
             kip848_group_state,
+            topic,
+        )
+        wait_for_kip848_static_member_checkpoint(
+            broker["port"],
+            kip848_static_group_state,
             topic,
         )
         wait_for_offset_commit_v9_member_checkpoint(
@@ -5772,6 +5908,11 @@ def main():
         wait_for_kip848_consumer_group_description(
             broker["port"],
             kip848_group_state,
+            topic,
+        )
+        wait_for_kip848_static_member_checkpoint(
+            broker["port"],
+            kip848_static_group_state,
             topic,
         )
         wait_for_offset_commit_v9_member_checkpoint(
@@ -5935,6 +6076,7 @@ def main():
             f"kip848_describe_checked=true, "
             f"kip848_rejoin_checked=true, "
             f"kip848_rack_checked=true, "
+            f"kip848_static_rejoin_checked=true, "
             f"offset_commit_v9_member_checked=true, "
             f"offset_fetch_v9_member_checked=true, "
             f"network_partition={network_partition_result}, "
