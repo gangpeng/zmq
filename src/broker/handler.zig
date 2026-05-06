@@ -11412,7 +11412,15 @@ pub const Broker = struct {
             .throttle_time_ms = 0,
             .stream_metadata_list = &.{},
         };
-        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version) orelse {
+            log.warn("GetOpeningStreams error response serialization failed", .{});
+            const storage_resp = Resp{
+                .error_code = ErrorCode.kafka_storage_error.toInt(),
+                .throttle_time_ms = 0,
+                .stream_metadata_list = &.{},
+            };
+            return self.serializeGeneratedResponse(req_header, resp_header_version, &storage_resp, api_version);
+        };
     }
 
     fn handleGetKVsAuthorizationError(
@@ -11458,7 +11466,15 @@ pub const Broker = struct {
             .throttle_time_ms = 0,
             .get_kv_responses = &.{},
         };
-        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version) orelse {
+            log.warn("GetKVs error response serialization failed", .{});
+            const storage_resp = Resp{
+                .error_code = ErrorCode.kafka_storage_error.toInt(),
+                .throttle_time_ms = 0,
+                .get_kv_responses = &.{},
+            };
+            return self.serializeGeneratedResponse(req_header, resp_header_version, &storage_resp, api_version);
+        };
     }
 
     fn handlePutKVsAuthorizationError(
@@ -11634,7 +11650,11 @@ pub const Broker = struct {
     fn automqGetNodesErrorResponse(self: *Broker, req_header: *const RequestHeader, resp_header_version: i16, api_version: i16, err_code: ErrorCode) ?[]u8 {
         const Resp = generated.automq_get_nodes_response.AutomqGetNodesResponse;
         const resp = Resp{ .error_code = err_code.toInt(), .throttle_time_ms = 0, .nodes = &.{} };
-        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version) orelse {
+            log.warn("AutomqGetNodes error response serialization failed", .{});
+            const storage_resp = Resp{ .error_code = ErrorCode.kafka_storage_error.toInt(), .throttle_time_ms = 0, .nodes = &.{} };
+            return self.serializeGeneratedResponse(req_header, resp_header_version, &storage_resp, api_version);
+        };
     }
 
     fn handleAutomqZoneRouterAuthorizationError(
@@ -11728,7 +11748,20 @@ pub const Broker = struct {
             .confirm_wal_config = null,
             .confirm_wal_delta_data = null,
         };
-        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version) orelse {
+            log.warn("AutomqGetPartitionSnapshot error response serialization failed", .{});
+            const storage_resp = Resp{
+                .error_code = ErrorCode.kafka_storage_error.toInt(),
+                .throttle_time_ms = 0,
+                .session_id = session_id,
+                .session_epoch = session_epoch,
+                .topics = &.{},
+                .confirm_wal_end_offset = null,
+                .confirm_wal_config = null,
+                .confirm_wal_delta_data = null,
+            };
+            return self.serializeGeneratedResponse(req_header, resp_header_version, &storage_resp, api_version);
+        };
     }
 
     fn handleUpdateLicenseAuthorizationError(
@@ -11796,7 +11829,11 @@ pub const Broker = struct {
     fn describeLicenseErrorResponse(self: *Broker, req_header: *const RequestHeader, resp_header_version: i16, api_version: i16, err_code: ErrorCode, message: ?[]const u8) ?[]u8 {
         const Resp = generated.describe_license_response.DescribeLicenseResponse;
         const resp = Resp{ .error_code = err_code.toInt(), .throttle_time_ms = 0, .error_message = message, .license = "" };
-        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version) orelse {
+            log.warn("DescribeLicense error response serialization failed", .{});
+            const storage_resp = Resp{ .error_code = ErrorCode.kafka_storage_error.toInt(), .throttle_time_ms = 0, .error_message = "Failed to serialize DescribeLicense response", .license = "" };
+            return self.serializeGeneratedResponse(req_header, resp_header_version, &storage_resp, api_version);
+        };
     }
 
     fn handleExportClusterManifestAuthorizationError(
@@ -11828,7 +11865,11 @@ pub const Broker = struct {
     fn exportClusterManifestErrorResponse(self: *Broker, req_header: *const RequestHeader, resp_header_version: i16, api_version: i16, err_code: ErrorCode) ?[]u8 {
         const Resp = generated.export_cluster_manifest_response.ExportClusterManifestResponse;
         const resp = Resp{ .error_code = err_code.toInt(), .throttle_time_ms = 0, .manifest = "" };
-        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version) orelse {
+            log.warn("ExportClusterManifest error response serialization failed", .{});
+            const storage_resp = Resp{ .error_code = ErrorCode.kafka_storage_error.toInt(), .throttle_time_ms = 0, .manifest = "" };
+            return self.serializeGeneratedResponse(req_header, resp_header_version, &storage_resp, api_version);
+        };
     }
 
     fn handleGetNextNodeIdAuthorizationError(
@@ -11896,7 +11937,11 @@ pub const Broker = struct {
     fn describeStreamsErrorResponse(self: *Broker, req_header: *const RequestHeader, resp_header_version: i16, api_version: i16, err_code: ErrorCode) ?[]u8 {
         const Resp = generated.describe_streams_response.DescribeStreamsResponse;
         const resp = Resp{ .error_code = err_code.toInt(), .throttle_time_ms = 0, .stream_metadata_list = &.{} };
-        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version) orelse {
+            log.warn("DescribeStreams error response serialization failed", .{});
+            const storage_resp = Resp{ .error_code = ErrorCode.kafka_storage_error.toInt(), .throttle_time_ms = 0, .stream_metadata_list = &.{} };
+            return self.serializeGeneratedResponse(req_header, resp_header_version, &storage_resp, api_version);
+        };
     }
 
     fn handleAutomqUpdateGroupAuthorizationError(
@@ -53350,6 +53395,38 @@ test "Broker.handleRequest normal AutoMQ read APIs fail closed when response mat
         var pos = buildTestRequest(&buf, 601, 0, 6019, header_mod.requestHeaderVersion(601, 0));
         req.serialize(&buf, &pos, 0);
         try expectAutoMqNormalReadErrorWithFailingAllocator(&broker, buf[0..pos], 601, 0, 6019, 0, ErrorCode.kafka_storage_error);
+    }
+}
+
+test "Broker.handleRequest normal AutoMQ read APIs fail closed when malformed error serialization fails" {
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+
+    var buf: [4096]u8 = undefined;
+
+    const stream_read_probes = [_]AutoMqStreamObjectKvAuthorizationProbe{
+        .{ .api_key = 508, .api_version = 0, .correlation_id = 5089 },
+        .{ .api_key = 509, .api_version = 0, .correlation_id = 50910 },
+    };
+    for (stream_read_probes) |probe| {
+        const request = try buildAutoMqStreamObjectKvEmptyAuthorizationRequest(&buf, probe);
+        try testing.expect(request.len < buf.len);
+        buf[request.len] = 0x7f;
+        try expectAutoMqNormalReadErrorWithFailingAllocator(&broker, buf[0 .. request.len + 1], probe.api_key, probe.api_version, probe.correlation_id, 0, ErrorCode.kafka_storage_error);
+    }
+
+    const metadata_read_probes = [_]AutoMqMetadataAuthorizationProbe{
+        .{ .api_key = 514, .api_version = 0, .correlation_id = 51410 },
+        .{ .api_key = 516, .api_version = 2, .correlation_id = 51610 },
+        .{ .api_key = 518, .api_version = 0, .correlation_id = 51810 },
+        .{ .api_key = 519, .api_version = 0, .correlation_id = 51910 },
+        .{ .api_key = 601, .api_version = 0, .correlation_id = 60110 },
+    };
+    for (metadata_read_probes) |probe| {
+        const request = try buildAutoMqMetadataAuthorizationRequest(&buf, probe);
+        try testing.expect(request.len < buf.len);
+        buf[request.len] = 0x7f;
+        try expectAutoMqNormalReadErrorWithFailingAllocator(&broker, buf[0 .. request.len + 1], probe.api_key, probe.api_version, probe.correlation_id, 0, ErrorCode.kafka_storage_error);
     }
 }
 

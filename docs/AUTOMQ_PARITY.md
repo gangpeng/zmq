@@ -728,7 +728,8 @@ Status: completed for the initial catalog and DeleteGroups slice.
   AutomqGetPartitionSnapshot, DescribeLicense, ExportClusterManifest, and
   DescribeStreams now use the same generated invalid-request/storage-error
   fallbacks for malformed frames and response materialization or serialization
-  failures.
+  failures, and their read-only error helpers retry generated storage-error
+  frames when the initial fallback response serialization allocation fails.
   Normal AutoMQ stream/object mutation paths for CreateStreams, OpenStreams,
   CloseStreams, DeleteStreams, PrepareS3Object, CommitStreamSetObject, and
   CommitStreamObject now also return generated storage errors when response
