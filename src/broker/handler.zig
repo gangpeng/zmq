@@ -7992,13 +7992,13 @@ pub const Broker = struct {
 
         if (!validateDescribeClientQuotasRequestFrame(request_bytes, body_start, api_version)) {
             log.warn("Malformed denied DescribeClientQuotas request", .{});
-            return null;
+            return self.describeClientQuotasErrorResponse(req_header, resp_header_version, api_version, ErrorCode.invalid_request, "Invalid request");
         }
 
         var pos = body_start;
         var req = Req.deserialize(self.allocator, request_bytes, &pos, api_version) catch |err| {
             log.warn("Failed to decode denied DescribeClientQuotas request: {}", .{err});
-            return null;
+            return self.describeClientQuotasErrorResponse(req_header, resp_header_version, api_version, ErrorCode.invalid_request, "Invalid request");
         };
         defer self.freeDescribeClientQuotasRequest(&req);
 
@@ -8008,7 +8008,10 @@ pub const Broker = struct {
             .error_message = "Not authorized",
             .entries = null,
         };
-        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version) orelse {
+            log.warn("DescribeClientQuotas denied response serialization failed", .{});
+            return self.describeClientQuotasErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error, "Failed to serialize client quota authorization response");
+        };
     }
 
     fn handleAlterClientQuotasAuthorizationError(
@@ -8026,19 +8029,22 @@ pub const Broker = struct {
 
         if (!validateAlterClientQuotasRequestFrame(request_bytes, body_start, api_version)) {
             log.warn("Malformed denied AlterClientQuotas request", .{});
-            return null;
+            return self.alterClientQuotasErrorResponse(req_header, resp_header_version, api_version, ErrorCode.invalid_request, "Invalid request");
         }
 
         var pos = body_start;
         var req = Req.deserialize(self.allocator, request_bytes, &pos, api_version) catch |err| {
             log.warn("Failed to decode denied AlterClientQuotas request: {}", .{err});
-            return null;
+            return self.alterClientQuotasErrorResponse(req_header, resp_header_version, api_version, ErrorCode.invalid_request, "Invalid request");
         };
         defer self.freeAlterClientQuotasRequest(&req);
 
         var entries: []EntryResponse = &.{};
         if (req.entries.len > 0) {
-            entries = self.allocator.alloc(EntryResponse, req.entries.len) catch return null;
+            entries = self.allocator.alloc(EntryResponse, req.entries.len) catch |err| {
+                log.warn("AlterClientQuotas denied response materialization failed: {}", .{err});
+                return self.alterClientQuotasErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error, "Failed to materialize client quota authorization response");
+            };
         }
         var entries_init: usize = 0;
         defer {
@@ -8047,7 +8053,10 @@ pub const Broker = struct {
         }
 
         for (req.entries) |entry| {
-            entries[entries_init] = self.buildAlterClientQuotaResponseEntry(entry, @intFromEnum(err_code), "Not authorized") catch return null;
+            entries[entries_init] = self.buildAlterClientQuotaResponseEntry(entry, @intFromEnum(err_code), "Not authorized") catch |err| {
+                log.warn("AlterClientQuotas denied response-entry materialization failed: {}", .{err});
+                return self.alterClientQuotasErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error, "Failed to materialize client quota authorization response");
+            };
             entries_init += 1;
         }
 
@@ -8055,7 +8064,10 @@ pub const Broker = struct {
             .throttle_time_ms = 0,
             .entries = entries[0..entries_init],
         };
-        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version) orelse {
+            log.warn("AlterClientQuotas denied response serialization failed", .{});
+            return self.alterClientQuotasErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error, "Failed to serialize client quota authorization response");
+        };
     }
 
     fn handleDescribeUserScramCredentialsAuthorizationError(
@@ -8073,20 +8085,23 @@ pub const Broker = struct {
 
         if (!validateDescribeUserScramCredentialsRequestFrame(request_bytes, body_start)) {
             log.warn("Malformed denied DescribeUserScramCredentials request", .{});
-            return null;
+            return self.describeUserScramCredentialsErrorResponse(req_header, resp_header_version, api_version, ErrorCode.invalid_request, "Invalid request");
         }
 
         var pos = body_start;
         var req = Req.deserialize(self.allocator, request_bytes, &pos, api_version) catch |err| {
             log.warn("Failed to decode denied DescribeUserScramCredentials request: {}", .{err});
-            return null;
+            return self.describeUserScramCredentialsErrorResponse(req_header, resp_header_version, api_version, ErrorCode.invalid_request, "Invalid request");
         };
         defer self.freeDescribeUserScramCredentialsRequest(&req);
 
         const requested_users = req.users orelse &.{};
         var results: []Result = &.{};
         if (requested_users.len > 0) {
-            results = self.allocator.alloc(Result, requested_users.len) catch return null;
+            results = self.allocator.alloc(Result, requested_users.len) catch |err| {
+                log.warn("DescribeUserScramCredentials denied response materialization failed: {}", .{err});
+                return self.describeUserScramCredentialsErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error, "Failed to materialize SCRAM credential authorization response");
+            };
         }
         defer if (results.len > 0) self.allocator.free(results);
 
@@ -8105,7 +8120,10 @@ pub const Broker = struct {
             .error_message = "Not authorized",
             .results = results,
         };
-        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version) orelse {
+            log.warn("DescribeUserScramCredentials denied response serialization failed", .{});
+            return self.describeUserScramCredentialsErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error, "Failed to serialize SCRAM credential authorization response");
+        };
     }
 
     fn handleAlterUserScramCredentialsAuthorizationError(
@@ -8123,20 +8141,23 @@ pub const Broker = struct {
 
         if (!validateAlterUserScramCredentialsRequestFrame(request_bytes, body_start)) {
             log.warn("Malformed denied AlterUserScramCredentials request", .{});
-            return null;
+            return self.alterUserScramCredentialsErrorResponse(req_header, resp_header_version, api_version, ErrorCode.invalid_request, "Invalid request");
         }
 
         var pos = body_start;
         var req = Req.deserialize(self.allocator, request_bytes, &pos, api_version) catch |err| {
             log.warn("Failed to decode denied AlterUserScramCredentials request: {}", .{err});
-            return null;
+            return self.alterUserScramCredentialsErrorResponse(req_header, resp_header_version, api_version, ErrorCode.invalid_request, "Invalid request");
         };
         defer self.freeAlterUserScramCredentialsRequest(&req);
 
         const result_count = req.deletions.len + req.upsertions.len;
         var results: []Result = &.{};
         if (result_count > 0) {
-            results = self.allocator.alloc(Result, result_count) catch return null;
+            results = self.allocator.alloc(Result, result_count) catch |err| {
+                log.warn("AlterUserScramCredentials denied response materialization failed: {}", .{err});
+                return self.alterUserScramCredentialsErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error, "Failed to materialize SCRAM credential authorization response");
+            };
         }
         defer if (results.len > 0) self.allocator.free(results);
 
@@ -8162,7 +8183,10 @@ pub const Broker = struct {
             .throttle_time_ms = 0,
             .results = results,
         };
-        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version) orelse {
+            log.warn("AlterUserScramCredentials denied response serialization failed", .{});
+            return self.alterUserScramCredentialsErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error, "Failed to serialize SCRAM credential authorization response");
+        };
     }
 
     fn handleVoteAuthorizationError(
@@ -39560,6 +39584,34 @@ test "Broker.handleRequest DescribeClientQuotas authorization denial uses genera
     try testing.expect(resp.entries == null);
 }
 
+test "Broker.handleRequest DescribeClientQuotas authorization denial fails closed when serialization fails" {
+    const Req = generated.describe_client_quotas_request.DescribeClientQuotasRequest;
+    const Resp = generated.describe_client_quotas_response.DescribeClientQuotasResponse;
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+    try broker.authorizer.addAcl("other-client", .cluster, "*", .literal, .describe, .allow, "*");
+
+    const req = Req{};
+    var buf: [128]u8 = undefined;
+    var pos = buildTestRequest(&buf, 48, 1, 4815, header_mod.requestHeaderVersion(48, 1));
+    req.serialize(&buf, &pos, 1);
+
+    var failing_allocator = OneShotFailingAllocator.init(testing.allocator, 0);
+    const response_allocator = failing_allocator.allocator();
+    broker.allocator = response_allocator;
+
+    const response = broker.handleRequest(buf[0..pos]);
+    broker.allocator = testing.allocator;
+
+    try testing.expect(failing_allocator.failed);
+    try testing.expect(response != null);
+    defer response_allocator.free(response.?);
+
+    const error_code = try readGeneratedTopLevelErrorCode(Resp, response.?, 48, 1, 4815);
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.kafka_storage_error)), error_code);
+}
+
 test "Broker.handleRequest DescribeClientQuotas rejects invalid match type" {
     const Req = generated.describe_client_quotas_request.DescribeClientQuotasRequest;
     const Resp = generated.describe_client_quotas_response.DescribeClientQuotasResponse;
@@ -39881,6 +39933,47 @@ test "Broker.handleRequest AlterClientQuotas authorization denial uses generated
     try testing.expectEqualStrings("client-id", resp.entries[0].entity[0].entity_type.?);
     try testing.expectEqualStrings("quota-denied-client", resp.entries[0].entity[0].entity_name.?);
     try testing.expect(broker.quota_manager.client_quotas.get("quota-denied-client") == null);
+}
+
+test "Broker.handleRequest AlterClientQuotas authorization denial fails closed when response materialization fails" {
+    const Req = generated.alter_client_quotas_request.AlterClientQuotasRequest;
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+    try broker.authorizer.addAcl("other-client", .cluster, "*", .literal, .alter, .allow, "*");
+
+    const entity = [_]Req.EntryData.EntityData{.{
+        .entity_type = "client-id",
+        .entity_name = "quota-denied-materialize-fail",
+    }};
+    const ops = [_]Req.EntryData.OpData{.{
+        .key = "producer_byte_rate",
+        .value = 999.0,
+        .remove = false,
+    }};
+    const entries = [_]Req.EntryData{.{
+        .entity = &entity,
+        .ops = &ops,
+    }};
+    const req = Req{ .entries = &entries };
+
+    var buf: [512]u8 = undefined;
+    var pos = buildTestRequest(&buf, 49, 1, 4915, header_mod.requestHeaderVersion(49, 1));
+    req.serialize(&buf, &pos, 1);
+
+    var failing_allocator = OneShotFailingAllocator.init(testing.allocator, 4);
+    const response_allocator = failing_allocator.allocator();
+    broker.allocator = response_allocator;
+
+    const response = broker.handleRequest(buf[0..pos]);
+    broker.allocator = testing.allocator;
+
+    try testing.expect(failing_allocator.failed);
+    try testing.expect(response != null);
+    defer response_allocator.free(response.?);
+
+    try expectAlterClientQuotasErrorResponseBytes(response.?, 4915, ErrorCode.kafka_storage_error);
+    try testing.expect(broker.quota_manager.client_quotas.get("quota-denied-materialize-fail") == null);
 }
 
 test "Broker restores client quotas from S3 cluster metadata log" {
@@ -40306,6 +40399,38 @@ test "Broker.handleRequest DescribeUserScramCredentials authorization denial use
     try testing.expectEqual(@as(usize, 0), resp.results[0].credential_infos.len);
 }
 
+test "Broker.handleRequest DescribeUserScramCredentials authorization denial fails closed when response materialization fails" {
+    const Req = generated.describe_user_scram_credentials_request.DescribeUserScramCredentialsRequest;
+    const Resp = generated.describe_user_scram_credentials_response.DescribeUserScramCredentialsResponse;
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+    try broker.authorizer.addAcl("other-client", .cluster, "*", .literal, .describe, .allow, "*");
+
+    const users = [_]Req.UserName{.{
+        .name = "scram-denied-materialize-fail",
+    }};
+    const req = Req{ .users = &users };
+
+    var buf: [512]u8 = undefined;
+    var pos = buildTestRequest(&buf, 50, 0, 5015, header_mod.requestHeaderVersion(50, 0));
+    req.serialize(&buf, &pos, 0);
+
+    var failing_allocator = OneShotFailingAllocator.init(testing.allocator, 1);
+    const response_allocator = failing_allocator.allocator();
+    broker.allocator = response_allocator;
+
+    const response = broker.handleRequest(buf[0..pos]);
+    broker.allocator = testing.allocator;
+
+    try testing.expect(failing_allocator.failed);
+    try testing.expect(response != null);
+    defer response_allocator.free(response.?);
+
+    const error_code = try readGeneratedTopLevelErrorCode(Resp, response.?, 50, 0, 5015);
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.kafka_storage_error)), error_code);
+}
+
 test "Broker.handleRequest DescribeUserScramCredentials null and empty users describe all" {
     const Req = generated.describe_user_scram_credentials_request.DescribeUserScramCredentialsRequest;
     const Resp = generated.describe_user_scram_credentials_response.DescribeUserScramCredentialsResponse;
@@ -40578,6 +40703,43 @@ test "Broker.handleRequest AlterUserScramCredentials authorization denial uses g
     try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.cluster_authorization_failed)), resp.results[0].error_code);
     try testing.expectEqualStrings("Not authorized", resp.results[0].error_message.?);
     try testing.expect(broker.scram_authenticator.getCredential("scram-denied-user") == null);
+}
+
+test "Broker.handleRequest AlterUserScramCredentials authorization denial fails closed when response materialization fails" {
+    const Req = generated.alter_user_scram_credentials_request.AlterUserScramCredentialsRequest;
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+    try broker.authorizer.addAcl("other-client", .cluster, "*", .literal, .alter, .allow, "*");
+
+    const salt = [_]u8{1} ** 32;
+    const salted_password = [_]u8{2} ** 32;
+    const upsertions = [_]Req.ScramCredentialUpsertion{.{
+        .name = "scram-denied-materialize-fail",
+        .mechanism = 1,
+        .iterations = 4096,
+        .salt = &salt,
+        .salted_password = &salted_password,
+    }};
+    const req = Req{ .upsertions = &upsertions };
+
+    var buf: [512]u8 = undefined;
+    var pos = buildTestRequest(&buf, 51, 0, 5115, header_mod.requestHeaderVersion(51, 0));
+    req.serialize(&buf, &pos, 0);
+
+    var failing_allocator = OneShotFailingAllocator.init(testing.allocator, 1);
+    const response_allocator = failing_allocator.allocator();
+    broker.allocator = response_allocator;
+
+    const response = broker.handleRequest(buf[0..pos]);
+    broker.allocator = testing.allocator;
+
+    try testing.expect(failing_allocator.failed);
+    try testing.expect(response != null);
+    defer response_allocator.free(response.?);
+
+    try expectAlterUserScramCredentialsErrorResponseBytes(response.?, 5115, ErrorCode.kafka_storage_error);
+    try testing.expect(broker.scram_authenticator.getCredential("scram-denied-materialize-fail") == null);
 }
 
 test "Broker.handleRequest AlterUserScramCredentials deletes SCRAM user" {

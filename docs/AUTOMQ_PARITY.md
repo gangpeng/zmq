@@ -617,6 +617,9 @@ Status: completed for the initial catalog and DeleteGroups slice.
   full credential snapshots to `__cluster_metadata` for broker replacement
   replay, and rolls back local credential visibility when the shared snapshot
   write fails.
+  Quota and SCRAM admin authorization-denial builders now also return generated
+  invalid-request or storage-error responses when denied request frames are
+  malformed or response construction fails.
   ListClientMetricsResources now advertises key 74 v0, decodes generated
   flexible requests, rejects malformed frames, returns a default generated
   resource, and lists active client resources for retained telemetry samples.
