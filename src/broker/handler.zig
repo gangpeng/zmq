@@ -24068,24 +24068,51 @@ pub const Broker = struct {
             response_init += 1;
         }
 
+        const resp = Resp{
+            .throttle_time_ms = 0,
+            .entries = responses[0..response_init],
+        };
+
+        var success_response: ?[]u8 = null;
+        var mutation_failed = false;
         if (!req.validate_only) {
+            var has_successful_mutation = false;
+            for (responses[0..response_init]) |response| {
+                if (response.error_code == @intFromEnum(ErrorCode.none)) {
+                    has_successful_mutation = true;
+                    break;
+                }
+            }
+            if (has_successful_mutation) {
+                success_response = self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version) orelse {
+                    log.warn("AlterClientQuotas response serialization failed before mutation", .{});
+                    return self.alterClientQuotasErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error, "Failed to serialize client quota response");
+                };
+            }
+
             for (req.entries, 0..) |entry, i| {
                 if (responses[i].error_code != @intFromEnum(ErrorCode.none)) continue;
                 const outcome = self.applyAlterClientQuotaEntry(entry, false) catch |err| {
                     log.warn("AlterClientQuotas mutation failed: {}", .{err});
                     responses[i].error_code = @intFromEnum(ErrorCode.kafka_storage_error);
                     responses[i].error_message = "Failed to apply client quota mutation";
+                    mutation_failed = true;
                     continue;
                 };
                 responses[i].error_code = outcome.error_code;
                 responses[i].error_message = outcome.error_message;
+                if (outcome.error_code != @intFromEnum(ErrorCode.none)) {
+                    mutation_failed = true;
+                }
+            }
+
+            if (success_response) |response| {
+                if (!mutation_failed) return response;
+                self.allocator.free(response);
+                success_response = null;
             }
         }
 
-        const resp = Resp{
-            .throttle_time_ms = 0,
-            .entries = responses[0..response_init],
-        };
         return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version) orelse {
             log.warn("AlterClientQuotas response serialization failed", .{});
             return self.alterClientQuotasErrorResponse(req_header, resp_header_version, api_version, ErrorCode.kafka_storage_error, "Failed to serialize client quota response");
@@ -24103,7 +24130,19 @@ pub const Broker = struct {
             .throttle_time_ms = 0,
             .entries = &entries,
         };
-        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version) orelse {
+            log.warn("AlterClientQuotas error response serialization failed", .{});
+            const storage_entries = [_]Resp.EntryData{.{
+                .error_code = @intFromEnum(ErrorCode.kafka_storage_error),
+                .error_message = "Failed to serialize client quota response",
+                .entity = &.{},
+            }};
+            const storage_resp = Resp{
+                .throttle_time_ms = 0,
+                .entries = &storage_entries,
+            };
+            return self.serializeGeneratedResponse(req_header, resp_header_version, &storage_resp, api_version);
+        };
     }
 
     const AlterClientQuotaOutcome = struct {
@@ -47850,6 +47889,27 @@ test "Broker.handleRequest AlterClientQuotas rejects truncated request" {
     try expectAlterClientQuotasErrorResponseBytes(response.?, 4903, ErrorCode.invalid_request);
 }
 
+test "Broker.handleRequest AlterClientQuotas malformed request retries storage error after response serialization failure" {
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+
+    var buf: [128]u8 = undefined;
+    const req_len = buildTestRequest(&buf, 49, 1, 4916, header_mod.requestHeaderVersion(49, 1));
+
+    var failing_allocator = OneShotFailingAllocator.init(testing.allocator, 0);
+    const response_allocator = failing_allocator.allocator();
+    broker.allocator = response_allocator;
+
+    const response = broker.handleRequest(buf[0..req_len]);
+    broker.allocator = testing.allocator;
+
+    try testing.expect(failing_allocator.failed);
+    try testing.expect(response != null);
+    defer response_allocator.free(response.?);
+
+    try expectAlterClientQuotasErrorResponseBytes(response.?, 4916, ErrorCode.kafka_storage_error);
+}
+
 test "Broker.handleRequest AlterClientQuotas rejects trailing bytes" {
     const Req = generated.alter_client_quotas_request.AlterClientQuotasRequest;
 
@@ -47935,6 +47995,47 @@ test "Broker.handleRequest AlterClientQuotas fails closed when response serializ
     defer response_allocator.free(response.?);
 
     try expectAlterClientQuotasErrorResponseBytes(response.?, 4909, ErrorCode.kafka_storage_error);
+}
+
+test "Broker.handleRequest AlterClientQuotas fails closed before mutation when response serialization fails" {
+    const Req = generated.alter_client_quotas_request.AlterClientQuotasRequest;
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+    try broker.authorizer.addSuperUser("test-client");
+
+    const entity = [_]Req.EntryData.EntityData{.{
+        .entity_type = "client-id",
+        .entity_name = "quota-serialize-fail-client",
+    }};
+    const ops = [_]Req.EntryData.OpData{.{
+        .key = "producer_byte_rate",
+        .value = 321.0,
+        .remove = false,
+    }};
+    const entries = [_]Req.EntryData{.{
+        .entity = &entity,
+        .ops = &ops,
+    }};
+    const req = Req{ .entries = &entries };
+
+    var buf: [512]u8 = undefined;
+    var pos = buildTestRequest(&buf, 49, 1, 4910, header_mod.requestHeaderVersion(49, 1));
+    req.serialize(&buf, &pos, 1);
+
+    var failing_allocator = OneShotFailingAllocator.init(testing.allocator, 5);
+    const response_allocator = failing_allocator.allocator();
+    broker.allocator = response_allocator;
+
+    const response = broker.handleRequest(buf[0..pos]);
+    broker.allocator = testing.allocator;
+
+    try testing.expect(failing_allocator.failed);
+    try testing.expect(response != null);
+    defer response_allocator.free(response.?);
+
+    try expectAlterClientQuotasErrorResponseBytes(response.?, 4910, ErrorCode.kafka_storage_error);
+    try testing.expect(broker.quota_manager.client_quotas.get("quota-serialize-fail-client") == null);
 }
 
 test "Broker.handleRequest DescribeUserScramCredentials returns requested SCRAM users" {
