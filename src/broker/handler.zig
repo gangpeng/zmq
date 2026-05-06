@@ -25450,7 +25450,15 @@ pub const Broker = struct {
             .error_code = @intFromEnum(err_code),
             .client_metrics_resources = &.{},
         };
-        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version);
+        return self.serializeGeneratedResponse(req_header, resp_header_version, &resp, api_version) orelse {
+            log.warn("ListClientMetricsResources error response serialization failed", .{});
+            const storage_resp = Resp{
+                .throttle_time_ms = 0,
+                .error_code = @intFromEnum(ErrorCode.kafka_storage_error),
+                .client_metrics_resources = &.{},
+            };
+            return self.serializeGeneratedResponse(req_header, resp_header_version, &storage_resp, api_version);
+        };
     }
 
     fn buildClientMetricsResources(self: *Broker) ![]generated.list_client_metrics_resources_response.ListClientMetricsResourcesResponse.ClientMetricsResource {
@@ -51505,6 +51513,30 @@ test "Broker.handleRequest ListClientMetricsResources rejects truncated request"
 
     const error_code = try readGeneratedTopLevelErrorCode(Resp, response.?, 74, 0, 7401);
     try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.invalid_request)), error_code);
+}
+
+test "Broker.handleRequest ListClientMetricsResources malformed request retries storage error after response serialization failure" {
+    const Resp = generated.list_client_metrics_resources_response.ListClientMetricsResourcesResponse;
+
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+
+    var buf: [128]u8 = undefined;
+    const req_len = buildTestRequest(&buf, 74, 0, 7417, header_mod.requestHeaderVersion(74, 0));
+
+    var failing_allocator = OneShotFailingAllocator.init(testing.allocator, 0);
+    const response_allocator = failing_allocator.allocator();
+    broker.allocator = response_allocator;
+
+    const response = broker.handleRequest(buf[0..req_len]);
+    broker.allocator = testing.allocator;
+
+    try testing.expect(failing_allocator.failed);
+    try testing.expect(response != null);
+    defer response_allocator.free(response.?);
+
+    const error_code = try readGeneratedTopLevelErrorCode(Resp, response.?, 74, 0, 7417);
+    try testing.expectEqual(@as(i16, @intFromEnum(ErrorCode.kafka_storage_error)), error_code);
 }
 
 test "Broker.handleRequest ListClientMetricsResources rejects trailing bytes" {

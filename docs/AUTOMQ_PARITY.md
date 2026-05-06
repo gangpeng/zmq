@@ -38,10 +38,11 @@ operator-facing behavior.
   closed on bad proofs, expires token-authenticated sessions before later Kafka
   requests, and rejects delegation-token lifecycle APIs from token-authenticated
   sessions.
-- Client telemetry subscription/push APIs now retry generated storage-error
-  responses after transient response-allocation failures, and PushTelemetry
-  pre-serializes success responses before recording/exporting telemetry so
-  allocation pressure cannot acknowledge telemetry with no response frame.
+- Client telemetry subscription/push and client-metrics resource APIs now retry
+  generated storage-error responses after transient response-allocation
+  failures, and PushTelemetry pre-serializes success responses before
+  recording/exporting telemetry so allocation pressure cannot acknowledge
+  telemetry with no response frame.
 - S3 WAL/object storage paths exist, but full AutoMQ S3Stream lifecycle
   compatibility, crash recovery, fencing, and cross-provider validation are
   incomplete. Stream/object metadata now has local file snapshot/restart
