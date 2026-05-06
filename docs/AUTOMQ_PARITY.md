@@ -857,8 +857,10 @@ Status: completed for the initial catalog and DeleteGroups slice.
   flush marker control batches and the updated transaction snapshot in one
   shared WAL object before advancing local state. EndTxn/WriteTxnMarkers marker
   paths now return storage errors when post-marker local partition-state,
-  ObjectManager, or transaction checkpoints cannot be written; broker tick now
-  enforces each group's configured session timeout instead of a global timeout;
+  ObjectManager, or transaction checkpoints cannot be written, and long valid
+  topic names no longer bypass marker state updates or log-dir estimates through
+  fixed-size formatted partition keys; broker tick now enforces each group's
+  configured session timeout instead of a global timeout;
   S3Client multipart fault tests now cover missing/malformed/XML-unsafe part ETags,
   abort-after-part failure, abort-after-complete failure, and HTTP 200
   CompleteMultipartUpload responses carrying embedded XML errors; a gated

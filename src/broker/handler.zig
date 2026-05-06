@@ -23410,9 +23410,17 @@ pub const Broker = struct {
     }
 
     fn partitionState(self: *Broker, topic: []const u8, partition_index: i32) ?PartitionStore.PartitionState {
-        var key_buf: [512]u8 = undefined;
-        const key = std.fmt.bufPrint(&key_buf, "{s}-{d}", .{ topic, partition_index }) catch return null;
-        return self.store.partitions.get(key);
+        const state = self.partitionStatePtr(topic, partition_index) orelse return null;
+        return state.*;
+    }
+
+    fn partitionStatePtr(self: *Broker, topic: []const u8, partition_index: i32) ?*PartitionStore.PartitionState {
+        var it = self.store.partitions.iterator();
+        while (it.next()) |entry| {
+            const state = entry.value_ptr;
+            if (state.partition_id == partition_index and std.mem.eql(u8, state.topic, topic)) return state;
+        }
+        return null;
     }
 
     // ---------------------------------------------------------------
@@ -23842,9 +23850,7 @@ pub const Broker = struct {
                 log.warn("Failed to hot-cache committed WriteTxnMarkers S3 WAL entry for {s}-{d}: {}", .{ write.topic, write.partition_index, err });
             };
 
-            var key_buf: [512]u8 = undefined;
-            const key = std.fmt.bufPrint(&key_buf, "{s}-{d}", .{ write.topic, write.partition_index }) catch continue;
-            if (self.store.partitions.getPtr(key)) |pstate| {
+            if (self.partitionStatePtr(write.topic, write.partition_index)) |pstate| {
                 const next_offset = write.base_offset + write.record_count;
                 if (next_offset > pstate.next_offset) pstate.next_offset = next_offset;
                 if (pstate.high_watermark < pstate.next_offset) pstate.high_watermark = pstate.next_offset;
@@ -23899,9 +23905,7 @@ pub const Broker = struct {
             return .{ .error_code = @intFromEnum(ErrorCode.kafka_storage_error) };
         };
 
-        var key_buf: [512]u8 = undefined;
-        const key = std.fmt.bufPrint(&key_buf, "{s}-{d}", .{ topic, partition_index }) catch return .{ .error_code = @intFromEnum(ErrorCode.none), .mutated = true };
-        if (self.store.partitions.getPtr(key)) |pstate| {
+        if (self.partitionStatePtr(topic, partition_index)) |pstate| {
             pstate.first_unstable_txn_offset = null;
             pstate.last_stable_offset = pstate.high_watermark;
         }
@@ -25047,9 +25051,7 @@ pub const Broker = struct {
         }
         if (cached_bytes > 0) return clampU64ToI64(cached_bytes);
 
-        var key_buf: [256]u8 = undefined;
-        const key = std.fmt.bufPrint(&key_buf, "{s}-{d}", .{ topic_name, partition_index }) catch return 0;
-        if (self.store.partitions.get(key)) |state| {
+        if (self.partitionState(topic_name, partition_index)) |state| {
             return clampU64ToI64(state.next_offset);
         }
         return 0;
@@ -33061,6 +33063,45 @@ test "Broker.handleRequest WriteTxnMarkers S3 WAL commits marker and transaction
     try testing.expectEqual(@as(u64, 1), state.high_watermark);
     try testing.expectEqual(@as(u64, 1), state.last_stable_offset);
     try testing.expect(state.first_unstable_txn_offset == null);
+}
+
+test "Broker transaction marker state update handles long topic names" {
+    var broker = Broker.init(testing.allocator, 1, 9092);
+    defer broker.deinit();
+    broker.wireInternalPointers();
+
+    const topic_name = try testing.allocator.alloc(u8, 600);
+    defer testing.allocator.free(topic_name);
+    @memset(topic_name, 't');
+    topic_name[0] = 'l';
+
+    try broker.store.ensurePartition(topic_name, 0);
+    const before = broker.partitionStatePtr(topic_name, 0) orelse return error.ExpectedPartitionState;
+    before.next_offset = 4;
+    before.high_watermark = 4;
+    before.last_stable_offset = 2;
+    before.first_unstable_txn_offset = 2;
+
+    try testing.expect(broker.partitionState(topic_name, 0) != null);
+    try testing.expectEqual(@as(i64, 4), broker.estimateLogDirPartitionSize(topic_name, 0));
+
+    var marker_data = "marker".*;
+    const writes = [_]Broker.PendingTxnMarkerS3WalWrite{.{
+        .topic = topic_name,
+        .partition_index = 0,
+        .stream_id = PartitionStore.hashPartitionKey(topic_name, 0),
+        .base_offset = 4,
+        .record_count = 1,
+        .data = marker_data[0..],
+        .clear_unstable = true,
+    }};
+    broker.applyCommittedTxnMarkerS3WalWrites(&writes);
+
+    const after = broker.partitionState(topic_name, 0).?;
+    try testing.expectEqual(@as(u64, 5), after.next_offset);
+    try testing.expectEqual(@as(u64, 5), after.high_watermark);
+    try testing.expectEqual(@as(u64, 5), after.last_stable_offset);
+    try testing.expect(after.first_unstable_txn_offset == null);
 }
 
 test "Broker.handleRequest WriteTxnMarkers reports storage error when S3 local transaction checkpoint fails" {
