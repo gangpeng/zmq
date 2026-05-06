@@ -1286,6 +1286,209 @@ def wait_for_client_quotas_checkpoint(
     raise TestError(f"Client quota checkpoint did not recover: {last_error}")
 
 
+def parse_alter_user_scram_credentials_response(response, correlation_id):
+    pos = parse_flexible_response_header(response, correlation_id)
+    throttle_time_ms, pos = read_i32(response, pos)
+    result_count, pos = read_compact_array_len(response, pos)
+    results = []
+    for _ in range(result_count):
+        user, pos = read_compact_string(response, pos)
+        error_code, pos = read_i16(response, pos)
+        error_message, pos = read_compact_string(response, pos)
+        pos = skip_tags(response, pos)
+        results.append(
+            {
+                "user": user,
+                "error_code": error_code,
+                "error_message": error_message,
+            }
+        )
+    pos = skip_tags(response, pos)
+    if pos != len(response):
+        raise TestError(
+            f"AlterUserScramCredentials response trailing bytes: {len(response) - pos}"
+        )
+    return {"throttle_time_ms": throttle_time_ms, "results": results}
+
+
+def alter_user_scram_credentials_upsert(
+    port,
+    user,
+    salt,
+    salted_password,
+    iterations,
+    correlation_id,
+):
+    body = write_compact_array_len(0)
+    body += write_compact_array_len(1)
+    body += write_compact_string(user)
+    body += b"\x01"  # SCRAM-SHA-256
+    body += struct.pack(">i", iterations)
+    body += write_compact_bytes(salt)
+    body += write_compact_bytes(salted_password)
+    body += b"\x00"  # upsertion tagged fields
+    body += b"\x00"  # request tagged fields
+    response = flexible_kafka_request(port, 51, 0, correlation_id, body)
+    return parse_alter_user_scram_credentials_response(response, correlation_id)
+
+
+def require_alter_user_scram_credentials_success(response, user):
+    if response["throttle_time_ms"] != 0:
+        raise TestError(f"AlterUserScramCredentials throttle mismatch: {response}")
+    results = response["results"]
+    if len(results) != 1:
+        raise TestError(f"AlterUserScramCredentials result count mismatch: {response}")
+    result = results[0]
+    if result["user"] != user:
+        raise TestError(f"AlterUserScramCredentials user mismatch: {response}")
+    if result["error_code"] != 0 or result["error_message"] is not None:
+        raise TestError(f"AlterUserScramCredentials result mismatch: {response}")
+
+
+def wait_for_alter_user_scram_credentials_upsert(
+    port,
+    user,
+    salt,
+    salted_password,
+    iterations,
+    timeout=30,
+):
+    deadline = time.time() + timeout
+    correlation_id = 8580
+    last_error = None
+    while time.time() < deadline:
+        try:
+            response = alter_user_scram_credentials_upsert(
+                port,
+                user,
+                salt,
+                salted_password,
+                iterations,
+                correlation_id,
+            )
+            require_alter_user_scram_credentials_success(response, user)
+            return
+        except Exception as exc:
+            last_error = exc
+        correlation_id += 1
+        time.sleep(0.25)
+    raise TestError(
+        f"AlterUserScramCredentials did not upsert {user!r}: {last_error}"
+    )
+
+
+def parse_describe_user_scram_credentials_response(response, correlation_id):
+    pos = parse_flexible_response_header(response, correlation_id)
+    throttle_time_ms, pos = read_i32(response, pos)
+    error_code, pos = read_i16(response, pos)
+    error_message, pos = read_compact_string(response, pos)
+    result_count, pos = read_compact_array_len(response, pos)
+    results = []
+    for _ in range(result_count):
+        user, pos = read_compact_string(response, pos)
+        user_error_code, pos = read_i16(response, pos)
+        user_error_message, pos = read_compact_string(response, pos)
+        credential_count, pos = read_compact_array_len(response, pos)
+        credential_infos = []
+        for _ in range(credential_count):
+            mechanism, pos = read_i8(response, pos)
+            iterations, pos = read_i32(response, pos)
+            pos = skip_tags(response, pos)
+            credential_infos.append(
+                {
+                    "mechanism": mechanism,
+                    "iterations": iterations,
+                }
+            )
+        pos = skip_tags(response, pos)
+        results.append(
+            {
+                "user": user,
+                "error_code": user_error_code,
+                "error_message": user_error_message,
+                "credential_infos": credential_infos,
+            }
+        )
+    pos = skip_tags(response, pos)
+    if pos != len(response):
+        raise TestError(
+            f"DescribeUserScramCredentials response trailing bytes: "
+            f"{len(response) - pos}"
+        )
+    return {
+        "throttle_time_ms": throttle_time_ms,
+        "error_code": error_code,
+        "error_message": error_message,
+        "results": results,
+    }
+
+
+def describe_user_scram_credentials(port, user, correlation_id):
+    body = write_compact_array_len(1)
+    body += write_compact_string(user)
+    body += b"\x00"  # user tagged fields
+    body += b"\x00"  # request tagged fields
+    response = flexible_kafka_request(port, 50, 0, correlation_id, body)
+    return parse_describe_user_scram_credentials_response(response, correlation_id)
+
+
+def require_describe_user_scram_credentials(
+    response,
+    user,
+    expected_iterations,
+):
+    if (
+        response["throttle_time_ms"] != 0
+        or response["error_code"] != 0
+        or response["error_message"] is not None
+    ):
+        raise TestError(
+            f"DescribeUserScramCredentials top-level mismatch: {response}"
+        )
+    results = response["results"]
+    if len(results) != 1:
+        raise TestError(
+            f"DescribeUserScramCredentials result count mismatch: {response}"
+        )
+    result = results[0]
+    if (
+        result["user"] != user
+        or result["error_code"] != 0
+        or result["error_message"] is not None
+    ):
+        raise TestError(f"DescribeUserScramCredentials result mismatch: {response}")
+    credential_infos = result["credential_infos"]
+    if credential_infos != [{"mechanism": 1, "iterations": expected_iterations}]:
+        raise TestError(
+            f"DescribeUserScramCredentials credential mismatch: {response}"
+        )
+
+
+def wait_for_user_scram_credentials_checkpoint(
+    port,
+    user,
+    expected_iterations,
+    timeout=30,
+):
+    deadline = time.time() + timeout
+    correlation_id = 8620
+    last_error = None
+    while time.time() < deadline:
+        try:
+            response = describe_user_scram_credentials(port, user, correlation_id)
+            require_describe_user_scram_credentials(
+                response,
+                user,
+                expected_iterations,
+            )
+            return
+        except Exception as exc:
+            last_error = exc
+        correlation_id += 1
+        time.sleep(0.25)
+    raise TestError(f"SCRAM credential checkpoint did not recover: {last_error}")
+
+
 def parse_describe_configs_response(response, correlation_id):
     pos = parse_flexible_response_header(response, correlation_id)
     throttle_time_ms, pos = read_i32(response, pos)
@@ -8338,6 +8541,10 @@ def main():
             ("consumer_byte_rate", quota_values["consumer_byte_rate"], False),
             ("request_percentage", quota_values["request_percentage"], False),
         ]
+        scram_user = f"{group}-scram-user"
+        scram_iterations = 8192
+        scram_salt = bytes([0x11] * 32)
+        scram_salted_password = bytes([0x22] * 32)
         kip848_subscription_topic = f"{topic}-kip848-subscription"
         kip848_negative_group_prefix = f"{group}-kip848-negative"
         expected_payloads = []
@@ -8411,10 +8618,18 @@ def main():
                 validate_only_quota_client_id,
             )
 
+        def wait_for_scram_credentials_probe():
+            wait_for_user_scram_credentials_checkpoint(
+                broker["port"],
+                scram_user,
+                scram_iterations,
+            )
+
         def wait_for_cluster_visibility_probes():
             wait_for_topic_partitions_probe()
             wait_for_create_partitions_probe()
             wait_for_client_quotas_probe()
+            wait_for_scram_credentials_probe()
             wait_for_describe_configs_checkpoint(
                 broker["port"],
                 topic,
@@ -8455,6 +8670,13 @@ def main():
             broker["port"],
             quota_client_id,
             quota_ops,
+        )
+        wait_for_alter_user_scram_credentials_upsert(
+            broker["port"],
+            scram_user,
+            scram_salt,
+            scram_salted_password,
+            scram_iterations,
         )
         wait_for_cluster_visibility_probes()
         wait_for_offset_commit(broker["port"], group, topic, committed_offset)
@@ -9565,6 +9787,7 @@ def main():
             f"delete_records_checked=true, "
             f"create_partitions_checked=true, "
             f"client_quotas_checked=true, "
+            f"scram_credentials_checked=true, "
             f"describe_topic_partitions_checked=true, "
             f"describe_configs_checked=true, "
             f"describe_log_dirs_checked=true, "
@@ -9923,6 +10146,43 @@ def self_test():
             described_quota,
             "quota-self-test",
             {"producer_byte_rate": 1234.0, "consumer_byte_rate": 4321.0},
+        )
+
+        alter_scram_fixture = struct.pack(">i", 168)
+        alter_scram_fixture += b"\x00"  # response header tagged fields
+        alter_scram_fixture += struct.pack(">i", 0)
+        alter_scram_fixture += write_compact_array_len(1)
+        alter_scram_fixture += write_compact_string("scram-self-test")
+        alter_scram_fixture += struct.pack(">h", 0)
+        alter_scram_fixture += write_compact_string(None)
+        alter_scram_fixture += b"\x00"  # result tagged fields
+        alter_scram_fixture += b"\x00"  # response tagged fields
+        altered_scram = parse_alter_user_scram_credentials_response(
+            alter_scram_fixture, 168
+        )
+        require_alter_user_scram_credentials_success(altered_scram, "scram-self-test")
+
+        describe_scram_fixture = struct.pack(">i", 169)
+        describe_scram_fixture += b"\x00"  # response header tagged fields
+        describe_scram_fixture += struct.pack(">ih", 0, 0)
+        describe_scram_fixture += write_compact_string(None)
+        describe_scram_fixture += write_compact_array_len(1)
+        describe_scram_fixture += write_compact_string("scram-self-test")
+        describe_scram_fixture += struct.pack(">h", 0)
+        describe_scram_fixture += write_compact_string(None)
+        describe_scram_fixture += write_compact_array_len(1)
+        describe_scram_fixture += b"\x01"
+        describe_scram_fixture += struct.pack(">i", 8192)
+        describe_scram_fixture += b"\x00"  # credential tagged fields
+        describe_scram_fixture += b"\x00"  # result tagged fields
+        describe_scram_fixture += b"\x00"  # response tagged fields
+        described_scram = parse_describe_user_scram_credentials_response(
+            describe_scram_fixture, 169
+        )
+        require_describe_user_scram_credentials(
+            described_scram,
+            "scram-self-test",
+            8192,
         )
 
         describe_configs_fixture = struct.pack(">i", 166)

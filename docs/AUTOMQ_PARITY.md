@@ -35,6 +35,9 @@ operator-facing behavior.
   plus repeat validate-only checks and topic metadata verification.
   AlterClientQuotas/DescribeClientQuotas v1 are live-probed with a real client
   quota mutation plus repeat validate-only checks and exact quota visibility.
+  AlterUserScramCredentials/DescribeUserScramCredentials v0 are live-probed
+  with precomputed SCRAM-SHA-256 credential upsertion and exact mechanism and
+  iteration visibility.
   Delegation-token APIs 38-41 are advertised with strict
   generated decoding, schema-shaped responses, and broker-local create,
   describe, renew, and expire semantics. Tokens persist across local broker
@@ -302,9 +305,10 @@ AlterReplicaLogDirs v2 plus AssignReplicasToDirs v0 partition directory
 mutations plus ElectLeaders v2 preferred-election responses through controller
 failover, controller restarts, and broker restart. The same gate now expands a
 dedicated topic with CreatePartitions v2 and validates the expanded partition
-metadata after each transition, and mutates/describes a client quota through
+metadata after each transition, mutates/describes a client quota through
 AlterClientQuotas/DescribeClientQuotas v1 while verifying validate-only quota
-requests remain non-mutating.
+requests remain non-mutating, and upserts/describes a SCRAM-SHA-256 user
+through AlterUserScramCredentials/DescribeUserScramCredentials v0.
 
 Latest default-suite fail-closed tranche: metadata-client controller discovery
 now surfaces malformed DescribeQuorum responses, including trailing response
