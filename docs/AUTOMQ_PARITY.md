@@ -672,6 +672,10 @@ Status: completed for the initial catalog and DeleteGroups slice.
   Topic-admin authorization-denial builders for ApiVersions, CreateTopics, and
   DeleteTopics now do the same for malformed denied frames and denial response
   materialization or serialization failures.
+  ACL authorization-denial builders for DescribeAcls, CreateAcls, and
+  DeleteAcls now fail closed on serialization failures, and the mutation APIs
+  also return generated invalid-request/storage-error responses for malformed
+  denied frames or denial response construction failures.
   ListClientMetricsResources now advertises key 74 v0, decodes generated
   flexible requests, rejects malformed frames, returns a default generated
   resource, and lists active client resources for retained telemetry samples.
